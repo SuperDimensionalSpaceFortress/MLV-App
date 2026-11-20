@@ -565,7 +565,8 @@ function Invoke-PinnedPayloadInstall {
 # while held the entry cannot be renamed, unlinked or rewritten). The reparse test reads the attributes of THAT handle
 # (GetFileInformationByHandle), never of the path, so a swap between the open and the check cannot pass. An ANCESTOR reparse
 # point (adversary 2c649ed9-A1: a junction retargeted after the hold) is refused by comparing the handle's own resolved path
-# (GetFinalPathNameByHandleW) with the requested pathname (8.3 expanded); a plain ancestor of a held file cannot be renamed or
+# (GetFinalPathNameByHandleW) with the requested pathname spelled from its own directory entries (8.3 expanded, stored case;
+# root case-insensitive, every component below it ordinal: adversary d0ae83d6-A1); a plain ancestor of a held file cannot be renamed or
 # made a reparse point while the hold is open. Any failure is a typed code (add-type-failed, open-failed, info-failed,
 # reparse-point, reparse-ancestor, not-a-disk-file, stream-failed) and never a fallback.
 $script:PinnedNoFollowTypeName = 'MlvReleaseAdmission.PinnedNoFollowOpen'
@@ -620,8 +621,30 @@ namespace MlvReleaseAdmission {
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern uint GetFinalPathNameByHandleW(SafeFileHandle hFile, System.Text.StringBuilder lpszFilePath, uint cchFilePath, uint dwFlags);
 
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct Win32FindData {
+            public uint FileAttributes;
+            public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+            public uint FileSizeHigh;
+            public uint FileSizeLow;
+            public uint Reserved0;
+            public uint Reserved1;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+            public string FileName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 14)]
+            public string AlternateFileName;
+        }
+
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern uint GetLongPathNameW(string lpszShortPath, System.Text.StringBuilder lpszLongPath, uint cchBuffer);
+        private static extern IntPtr FindFirstFileW(string lpFileName, out Win32FindData lpFindFileData);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool FindClose(IntPtr hFindFile);
+
+        private static readonly IntPtr InvalidHandleValue = new IntPtr(-1);
 
         private static string Win32Text(int error) {
             return new Win32Exception(error).Message + " (win32 " + error + ")";
@@ -647,17 +670,38 @@ namespace MlvReleaseAdmission {
             return WithoutLongPrefix(buffer.ToString());
         }
 
-        // The requested pathname with every 8.3 component expanded; GetLongPathNameW never resolves a reparse point.
-        private static string LongPath(string path, out int error) {
+        private static string WithLongPrefix(string path) {
+            if (path.StartsWith(@"\\", StringComparison.Ordinal)) { return @"\\?\UNC\" + path.Substring(2); }
+            return @"\\?\" + path;
+        }
+
+        // Adversary d0ae83d6-A1: the requested pathname spelled by the ON-DISK name of every component below the root. Each
+        // component's name is read from its own directory entry (FindFirstFileW returns the entry, never what it points to), so
+        // 8.3 aliases expand and the case is the stored case. GetLongPathNameW was not used: it keeps the caller's case for some
+        // components, which in a case-sensitive directory let a junction PIN pass as the real folder pin.
+        public static string OnDiskPath(string fullPath, out string root, out int error) {
             error = 0;
-            System.Text.StringBuilder buffer = new System.Text.StringBuilder(1024);
-            uint length = GetLongPathNameW(path, buffer, (uint)buffer.Capacity);
-            if (length >= (uint)buffer.Capacity) {
-                buffer = new System.Text.StringBuilder((int)length + 1);
-                length = GetLongPathNameW(path, buffer, (uint)buffer.Capacity);
+            root = Path.GetPathRoot(fullPath);
+            if (string.IsNullOrEmpty(root) || fullPath.IndexOfAny(new char[] { '*', '?' }) >= 0) { error = 123; return null; }
+            string built = root.TrimEnd('\\');
+            foreach (string part in fullPath.Substring(root.Length).Split(new char[] { '\\' }, StringSplitOptions.RemoveEmptyEntries)) {
+                Win32FindData data;
+                IntPtr find = FindFirstFileW(WithLongPrefix(built + "\\" + part), out data);
+                if (find == InvalidHandleValue) { error = Marshal.GetLastWin32Error(); return null; }
+                FindClose(find);
+                if (string.IsNullOrEmpty(data.FileName)) { error = 2; return null; }
+                built = built + "\\" + data.FileName;
             }
-            if (length == 0 || length >= (uint)buffer.Capacity) { error = Marshal.GetLastWin32Error(); return null; }
-            return WithoutLongPrefix(buffer.ToString());
+            return built;
+        }
+
+        // Same file entry by name: the volume root (drive letter or \\server\share) compares case-insensitively, every component
+        // below it ORDINALLY, because a case-sensitive directory can hold two entries that differ only in case.
+        public static bool SamePathname(string held, string requested, string requestedRoot) {
+            string heldRoot = Path.GetPathRoot(held);
+            if (string.IsNullOrEmpty(heldRoot)) { return false; }
+            if (!string.Equals(heldRoot.TrimEnd('\\'), requestedRoot.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) { return false; }
+            return string.Equals(held.Substring(heldRoot.TrimEnd('\\').Length), requested.Substring(requestedRoot.TrimEnd('\\').Length), StringComparison.Ordinal);
         }
 
         public static PinnedOpenResult Open(string path) {
@@ -691,7 +735,8 @@ namespace MlvReleaseAdmission {
                 // Adversary 2c649ed9-A1: FILE_FLAG_OPEN_REPARSE_POINT covers only the FINAL component; an ancestor junction or
                 // directory link is still traversed, and that link (unlike a plain ancestor of a held file, which NTFS will not
                 // rename) can be retargeted while the file is held. The handle's own resolved path must therefore BE the requested
-                // pathname (8.3 components expanded): any reparse traversal, subst or mapped drive differs and is refused.
+                // pathname as its directory entries spell it (OnDiskPath; compared by SamePathname): any reparse traversal, subst
+                // or mapped drive differs and is refused.
                 int pathError;
                 string held = HandlePath(handle, out pathError);
                 if (held == null) {
@@ -699,13 +744,14 @@ namespace MlvReleaseAdmission {
                     result.Detail = "the held file's path could not be read: " + Win32Text(pathError);
                     return result;
                 }
-                string requested = LongPath(WithoutLongPrefix(Path.GetFullPath(path)), out pathError);
+                string requestedRoot;
+                string requested = OnDiskPath(Path.GetFullPath(WithoutLongPrefix(path)), out requestedRoot, out pathError);
                 if (requested == null) {
                     result.Code = "info-failed";
-                    result.Detail = "the requested pathname could not be expanded: " + Win32Text(pathError);
+                    result.Detail = "the requested pathname could not be spelled from its directory entries: " + Win32Text(pathError);
                     return result;
                 }
-                if (!string.Equals(held, requested, StringComparison.OrdinalIgnoreCase)) {
+                if (!SamePathname(held, requested, requestedRoot)) {
                     result.Code = "reparse-ancestor";
                     result.Detail = "the held file is " + held + ", not the requested pathname " + requested
                         + " (a directory on the way is a junction, link, mount point or substituted drive)";

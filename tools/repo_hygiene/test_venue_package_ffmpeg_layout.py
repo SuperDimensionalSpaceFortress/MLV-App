@@ -362,8 +362,15 @@ class ScriptsInstallUnconditionallyTests(unittest.TestCase):
         self.assertIn('result.Code = "reparse-point";', text)
         # adversary 2c649ed9-A1: an ancestor reparse point is refused by the handle's own resolved path, never a path-based walk.
         self.assertIn("uint length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Capacity, 0);", text)
-        self.assertIn("if (!string.Equals(held, requested, StringComparison.OrdinalIgnoreCase)) {", text)
+        self.assertIn("if (!SamePathname(held, requested, requestedRoot)) {", text)
         self.assertIn('result.Code = "reparse-ancestor";', text)
+        # adversary d0ae83d6-A1: below the root the comparison is ordinal over on-disk names (a case-sensitive directory can hold
+        # a junction PIN beside the real pin), and the requested spelling never comes from GetLongPathNameW (it keeps caller case).
+        same = text[text.index("public static bool SamePathname("):]
+        same = same[: same.index("\n        }\n")]
+        self.assertIn("requested.Substring(requestedRoot.TrimEnd('\\\\').Length), StringComparison.Ordinal);", same)
+        self.assertNotIn("extern uint GetLongPathNameW", text)
+        self.assertIn("IntPtr find = FindFirstFileW(WithLongPrefix(built + \"\\\\\" + part), out data);", text)
         self.assertNotRegex(text, r"\[System\.IO\.File\]::Open\(", "no publication check may fall back to a link-following open")
         for name in ("Open-PinnedFileHold", "Test-PinnedZipMember"):
             body = text[text.index(f"function {name} {{"):]
@@ -1192,6 +1199,55 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         self.assertTrue(result["zipReason"].startswith("reparse-ancestor: "), result)
         self.assertTrue(result["real"], result)
         self.assertTrue(result["realZip"], result)
+
+    def test_the_pathname_comparison_is_ordinal_below_the_root(self) -> None:
+        # adversary d0ae83d6-A1: with NTFS case sensitivity on C:\case, PIN (a junction) and pin (the real folder) differ only in case;
+        # an OrdinalIgnoreCase comparison passed the junction. Below the root the comparison is ordinal over on-disk names; the drive
+        # letter or \\server\share stays case-insensitive. A caller's own lowercase spelling of a real path still holds (control).
+        payload = b"MZ pinned ffmpeg bytes" * 100
+        real = self.tmp / "MixedCase" / "Inner"
+        real.mkdir(parents=True)
+        (real / "FFmpeg.EXE").write_bytes(payload)
+        lowered = str(self.tmp / "mixedcase" / "inner" / "ffmpeg.exe")
+        lowered = lowered[0].lower() + lowered[1:]
+        result = self._ps(
+            "$h = Open-PinnedFileHold -Path $env:FFX_LOWER -ExpectedSha256 $env:FFX_SHA -ExpectedBytes ([long]$env:FFX_LEN)\n"
+            "if ($h.stream) { $h.stream.Dispose() }\n"
+            "$t = [MlvReleaseAdmission.PinnedNoFollowOpen]\n"
+            "[ordered]@{ ok = $h.ok; reason = $h.reason;"
+            " caseOnly = $t::SamePathname('C:\\case\\pin\\d0ae83d69070\\ffmpeg.exe', 'C:\\case\\PIN\\d0ae83d69070\\ffmpeg.exe', 'C:\\');"
+            " leafCase = $t::SamePathname('C:\\case\\pin\\ffmpeg.exe', 'C:\\case\\pin\\FFMPEG.exe', 'C:\\');"
+            " driveCase = $t::SamePathname('C:\\case\\pin\\ffmpeg.exe', 'c:\\case\\pin\\ffmpeg.exe', 'c:\\');"
+            " uncCase = $t::SamePathname('\\\\Srv\\Share\\pin\\ffmpeg.exe', '\\\\srv\\share\\pin\\ffmpeg.exe', '\\\\srv\\share');"
+            " uncDeep = $t::SamePathname('\\\\srv\\share\\pin\\ffmpeg.exe', '\\\\srv\\share\\PIN\\ffmpeg.exe', '\\\\srv\\share') } | ConvertTo-Json -Compress\n",
+            FFX_LOWER=lowered, FFX_SHA=hashlib.sha256(payload).hexdigest(), FFX_LEN=str(len(payload)))
+        self.assertEqual(result, {"ok": True, "reason": "", "caseOnly": False, "leafCase": False, "driveCase": True,
+                                  "uncCase": True, "uncDeep": False}, result)
+
+    def test_a_junction_differing_only_in_case_in_a_case_sensitive_folder_is_never_held(self) -> None:
+        # adversary d0ae83d6-A1 end to end: needs per-directory case sensitivity (fsutil setCaseSensitiveInfo), which an account
+        # without it cannot enable; the comparison test above and the source pin cover it there.
+        payload = b"MZ pinned ffmpeg bytes" * 100
+        case = self.tmp / "case"
+        case.mkdir()
+        flag = subprocess.run(["fsutil.exe", "file", "setCaseSensitiveInfo", str(case), "enable"], capture_output=True, text=True)
+        probe = subprocess.run(["fsutil.exe", "file", "queryCaseSensitiveInfo", str(case)], capture_output=True, text=True)
+        if flag.returncode != 0 or "is enabled" not in probe.stdout:
+            self.skipTest(f"per-directory case sensitivity cannot be enabled here: {(flag.stdout + flag.stderr).strip()}")
+        (case / "pin" / "d0ae83d69070").mkdir(parents=True)
+        (case / "pin" / "d0ae83d69070" / "ffmpeg.exe").write_bytes(payload)
+        result = self._ps(
+            "$null = New-Item -ItemType Junction -Path $env:FFX_UPPER -Target $env:FFX_PIN\n"
+            "$h = Open-PinnedFileHold -Path (Join-Path $env:FFX_UPPER 'd0ae83d69070\\ffmpeg.exe') -ExpectedSha256 $env:FFX_SHA -ExpectedBytes ([long]$env:FFX_LEN)\n"
+            "if ($h.stream) { $h.stream.Dispose() }\n"
+            "$real = Open-PinnedFileHold -Path (Join-Path $env:FFX_PIN 'd0ae83d69070\\ffmpeg.exe') -ExpectedSha256 $env:FFX_SHA -ExpectedBytes ([long]$env:FFX_LEN)\n"
+            "if ($real.stream) { $real.stream.Dispose() }\n"
+            "[System.IO.Directory]::Delete($env:FFX_UPPER)\n"
+            "[ordered]@{ ok = $h.ok; reason = $h.reason; real = $real.ok } | ConvertTo-Json -Compress\n",
+            FFX_UPPER=str(case / "PIN"), FFX_PIN=str(case / "pin"), FFX_SHA=hashlib.sha256(payload).hexdigest(), FFX_LEN=str(len(payload)))
+        self.assertFalse(result["ok"], result)
+        self.assertTrue(result["reason"].startswith("reparse-ancestor: "), result)
+        self.assertTrue(result["real"], result)
 
     def test_while_held_the_entry_cannot_be_renamed_unlinked_or_overwritten(self) -> None:
         # sol r8 B1: the held handle must BE the pathname's file entry, and FILE_SHARE_READ alone keeps that entry in place: a rename,
