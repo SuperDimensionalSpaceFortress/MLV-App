@@ -1023,15 +1023,15 @@ All workflows live under `.github/workflows/`.
 ### 14.1 What actually blocks a merge
 
 `tests.yml` reports more check runs than there are required checks: the hygiene suite
-runs as `Repo Hygiene Python ubuntu shard N/4` and `Repo Hygiene Python windows shard N/9`
-jobs (shards 1-8 run the unittest classes, shard 9 the tail steps), plus a `Repo Hygiene Python windows lane containment` job that runs
-`tests/coordination/test_lane_containment.py` in parallel (windows shard 9 ignores that
+runs as `Repo Hygiene Python ubuntu shard N/4` and `Repo Hygiene Python windows shard N/8`
+jobs, plus a `Repo Hygiene Python windows lane containment` job that runs
+`tests/coordination/test_lane_containment.py` in parallel (windows shard 8 ignores that
 file, so it is collected in exactly one job), a `Repo Hygiene Python windows coordination heavy`
 job that runs the four slowest coordination test files (`test_doctrine_outbox.py`, `_concerns.py`,
-`_hooks.py` and `test_retire_lane_worktree.py`, about 14 min hosted) in parallel (windows shard 9
+`_hooks.py` and `test_retire_lane_worktree.py`, about 14 min hosted) in parallel (windows shard 8
 ignores those files too), a `Repo Hygiene Python windows guardrails heavy` job that runs
 `tools/coordination/test_coordination_guardrails.py` and `tests/coordination/test_build_guard.py`
-(about 21-23 min hosted; shard 9 no longer names the first and ignores the second), and the product oracles as
+(about 21-23 min hosted; shard 8 no longer names the first and ignores the second), and the product oracles as
 `Windows Product Oracles part N/3` jobs (none required by name); an aggregator per
 required name needs every one of its shards (the windows one also the containment,
 coordination heavy and guardrails heavy jobs) and
