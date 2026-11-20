@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path, PurePosixPath
@@ -445,22 +446,37 @@ class HelperBehaviourTests(unittest.TestCase):
     def _row(pid: int, parent: int, utc: str) -> str:
         return f"[pscustomobject]@{{ id = {pid}; parentId = {parent}; startUtc = [datetime]::Parse('{utc}').ToUniversalTime() }}"
 
-    def _stop(self, kill: str, wait: str, before: str = "@()", after: str = "@()") -> dict:
-        # The process table is injected (before the kill, then every later listing), so no real process with these ids is consulted.
+    def _stop(self, kill: str, wait: str, before: str = "@()", after: str = "@()", *, root_start: str | None = "2026-11-19T10:00:00Z",
+              prelude: str = "", env: dict | None = None) -> dict:
+        # The process table is injected (before the kill, then every later listing). The fake root is pid 4242; its handle-read creation
+        # time is root_start (None = the handle cannot read it). Fake ids are not multiples of 4, so no real Windows pid can match one.
         module = str(HELPER_MODULE).replace("'", "''")
+        start = "" if root_start is None else f"; StartTime = [datetime]::Parse('{root_start}').ToUniversalTime()"
         script = (
-            f"$m = Import-Module '{module}' -Force -PassThru\n"
+            prelude
+            + f"$m = Import-Module '{module}' -Force -PassThru\n"
             "$global:ffxListings = 0\n"
             f"$table = {{ $global:ffxListings++; if ($global:ffxListings -eq 1) {{ {before} }} else {{ {after} }} }}\n"
-            "$fake = [pscustomobject]@{ Id = 4242 }\n"
+            f"$fake = [pscustomobject]@{{ Id = 4242{start} }}\n"
             f"$fake | Add-Member -MemberType ScriptMethod -Name Kill -Value {{ {kill} }}\n"
             f"$fake | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {{ {wait} }}\n"
-            "$r = & $m { param($p, $t) Stop-PinnedPayloadChild -Process $p -ProcessTable $t } $fake $table\n"
+            "$r = & $m { param($p, $t) Stop-PinnedPayloadChild -Process $p -ProcessTable $t -ConfirmMs 1500 } $fake $table\n"
             "$r | ConvertTo-Json -Compress\n"
         )
-        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True,
+                              timeout=120, env=dict(os.environ, **(env or {})))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return json.loads(proc.stdout)
+
+    def _unrelated_process(self) -> subprocess.Popen:
+        # A real process outside the tree under test; the stop must never kill it.
+        bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        self.addCleanup(lambda: (bystander.kill(), bystander.wait()))
+        return bystander
+
+    # The bystander's row, with its REAL creation time read through its own handle in the test script, so a per-pid identity check passes.
+    _BYSTANDER_ROW = ("[pscustomobject]@{ id = [int]$env:FFX_U; parentId = 4242; startUtc = $global:ffxU }")
+    _BYSTANDER_PRELUDE = "$global:ffxU = ([System.Diagnostics.Process]::GetProcessById([int]$env:FFX_U).StartTime.ToUniversalTime())\n"
 
     def test_a_kill_that_throws_and_a_wait_that_fails_are_reported_unconfirmed(self) -> None:
         # adversary 32bf39a9-A3: Kill(true) threw Win32Exception(5) and the confirming wait returned false; both were discarded.
@@ -476,40 +492,51 @@ class HelperBehaviourTests(unittest.TestCase):
         self.assertTrue(stop["exited"], stop)
         self.assertFalse(stop["confirmed"], stop)
         self.assertIn("descendant", stop["killError"])
-        clean = self._stop("$null", "$true")
+        clean = self._stop("$null", "$true", before=f"@({self._row(4242, 1, '2026-11-19T10:00:00Z')})")
         self.assertTrue(clean["confirmed"], clean)
 
     def test_a_descendant_kill_true_missed_across_the_dst_fold_leaves_the_kill_unconfirmed(self) -> None:
         # adversary b5fce5a9-A1: py.exe started 06:59:59Z and its extractor 07:00:01Z on 2026-11-01 (the Central fall-back fold), so by
         # LOCAL time the child is older than its parent and Kill($true) leaves it running; the root's exit then read as confirmed.
-        root = self._row(4242, 1, "2026-11-01T06:59:59Z")
+        fold = "2026-11-01T06:59:59Z"
+        root = self._row(4242, 1, fold)
         child = self._row(5151, 4242, "2026-11-01T07:00:01Z")
-        missed = self._stop("$null", "$true", before=f"@({root}, {child})", after=f"@({child})")
+        missed = self._stop("$null", "$true", before=f"@({root}, {child})", after=f"@({child})", root_start=fold)
         self.assertFalse(missed["confirmed"], missed)
         self.assertIn("5151 still running", missed["killError"])
         # the extractor's own child outlives a dead intermediate: still found through the listing taken while the root was alive.
         leaf = self._row(6262, 5151, "2026-11-01T07:00:03Z")
-        orphaned = self._stop("$null", "$true", before=f"@({root}, {child}, {leaf})", after=f"@({leaf})")
+        orphaned = self._stop("$null", "$true", before=f"@({root}, {child}, {leaf})", after=f"@({leaf})", root_start=fold)
         self.assertFalse(orphaned["confirmed"], orphaned)
         self.assertIn("6262 still running", orphaned["killError"])
-        # an older process holding a reused parent id is not the root's descendant; a tree that is gone after the kill is confirmed.
+        # adversary 0f5308ad-A3 (r6): an "older" row on the root's parent id may be an older process holding a reused parent id OR the
+        # root's real child after a backward clock step; only the wall clock tells them apart, so it is counted, never placed outside.
         older = self._row(7373, 4242, "2026-11-01T06:00:00Z")
-        gone = self._stop("$null", "$true", before=f"@({root}, {child}, {older})", after=f"@({older})")
+        ambiguous = self._stop("$null", "$true", before=f"@({root}, {child}, {older})", after=f"@({older})", root_start=fold)
+        self.assertFalse(ambiguous["confirmed"], ambiguous)
+        self.assertIn("7373 still running", ambiguous["killError"])
+        # a tree that is gone after the kill is confirmed.
+        gone = self._stop("$null", "$true", before=f"@({root}, {child})", after="@()", root_start=fold)
         self.assertTrue(gone["confirmed"], gone)
         # a listing that fails is never read as an empty tree.
-        unlisted = self._stop("$null", "$true", before="throw 'simulated Win32_Process access denied'")
+        unlisted = self._stop("$null", "$true", before="throw 'simulated Win32_Process access denied'", root_start=fold)
         self.assertFalse(unlisted["confirmed"], unlisted)
         self.assertIn("simulated Win32_Process access denied", unlisted["killError"])
 
     def test_a_reused_member_id_never_adopts_the_replacements_children(self) -> None:
-        # adversary 183fe59d-A1: child 5151 exited between the listings and an unrelated process took id 5151 (parent 9000) and
-        # started 6262. Neither is this tree's: the kill is confirmed and neither is counted (nor, being unproven, killed).
+        # adversary 183fe59d-A1: child 5151 exited between the listings and an unrelated process took id 5151 (parent 9000). The
+        # replacement itself (another creation time) is not this tree's and is not counted.
         root = self._row(4242, 1, "2026-11-19T10:00:00Z")
         child = self._row(5151, 4242, "2026-11-19T10:00:01Z")
         replacement = self._row(5151, 9000, "2026-11-19T10:00:03Z")
+        alone = self._stop("$null", "$true", before=f"@({root}, {child})", after=f"@({replacement})")
+        self.assertTrue(alone["confirmed"], alone)
+        # adversary 0f5308ad-A3 (r6): a row on 5151's parent id whose creation time reads after the replacement's is placed outside the tree
+        # only by the wall clock (a step back makes the original 5151's late child read that way), so it is counted, never killed.
         its_child = self._row(6262, 5151, "2026-11-19T10:00:04Z")
         reused = self._stop("$null", "$true", before=f"@({root}, {child})", after=f"@({replacement}, {its_child})")
-        self.assertTrue(reused["confirmed"], reused)
+        self.assertFalse(reused["confirmed"], reused)
+        self.assertIn("6262 still running", reused["killError"])
         # a child the ORIGINAL 5151 started before the id was reused is still this tree's.
         late_replacement = self._row(5151, 9000, "2026-11-19T10:00:05Z")
         ours = self._row(6262, 5151, "2026-11-19T10:00:02Z")
@@ -517,17 +544,113 @@ class HelperBehaviourTests(unittest.TestCase):
         self.assertFalse(orphan["confirmed"], orphan)
         self.assertIn("6262 still running", orphan["killError"])
 
+    def test_a_row_whose_identity_and_ancestry_came_from_different_reads_is_never_killed(self) -> None:
+        # adversary 0f5308ad-A1/A2 (r6): child 5151 of the root exited and an unrelated process U took its pid between the parent-id read
+        # and the start-time read, so the listing joined the root's parent id to U's real creation time. U must stay alive (no per-pid
+        # kill is ever made from a listing) and, still listed with that identity, it leaves the kill unconfirmed.
+        bystander = self._unrelated_process()
+        root = self._row(4242, 1, "2020-01-01T00:00:00Z")
+        stop = self._stop("$null", "$true", before=f"@({root}, {self._BYSTANDER_ROW})", after=f"@({self._BYSTANDER_ROW})",
+                          root_start="2020-01-01T00:00:00Z", prelude=self._BYSTANDER_PRELUDE, env={"FFX_U": str(bystander.pid)})
+        self.assertIsNone(bystander.poll(), "an unrelated process was killed on a listing's word")
+        self.assertFalse(stop["confirmed"], stop)
+        self.assertIn(f"{bystander.pid} still running", stop["killError"])
+
+    def test_a_root_missing_from_the_listing_or_on_a_reused_pid_proves_no_tree(self) -> None:
+        # key3 r5 B1: the root exited between the timeout and the listing, and a live OLDER process U carries the root's pid as a stale
+        # parent id. With no root row the tree is unproven: nothing is adopted or killed and the kill is unconfirmed.
+        bystander = self._unrelated_process()
+        missing = self._stop("$null", "$true", before=f"@({self._BYSTANDER_ROW})", after=f"@({self._BYSTANDER_ROW})",
+                             root_start="2099-01-01T00:00:00Z", prelude=self._BYSTANDER_PRELUDE, env={"FFX_U": str(bystander.pid)})
+        self.assertIsNone(bystander.poll(), "an unrelated process was killed on a stale parent id")
+        self.assertFalse(missing["confirmed"], missing)
+        self.assertIn("not in the listing", missing["killError"])
+        # key3 r5 sibling psm1:108: the root's pid was reused by Z (another creation time than the handle's); Z's child is not adopted.
+        z_root = self._row(4242, 1, "2026-11-19T10:00:07Z")
+        z_child = self._row(6363, 4242, "2026-11-19T10:00:08Z")
+        reused = self._stop("$null", "$true", before=f"@({z_root}, {z_child})", after="@()")
+        self.assertFalse(reused["confirmed"], reused)
+        self.assertIn("not in the listing", reused["killError"])
+
+    def test_a_backward_clock_step_never_confirms_a_surviving_child(self) -> None:
+        # adversary 0f5308ad-A3: the root started 10:00:05Z, the clock was stepped back 10 s and its real child started 09:59:55.1Z.
+        # Kill($true) misses it; ordering by creation time must not place it outside the tree, so the kill stays unconfirmed.
+        root = self._row(4242, 1, "2026-11-19T10:00:05Z")
+        child = self._row(5151, 4242, "2026-11-19T09:59:55.1Z")
+        stop = self._stop("$null", "$true", before=f"@({root}, {child})", after=f"@({child})", root_start="2026-11-19T10:00:05Z")
+        self.assertFalse(stop["confirmed"], stop)
+        self.assertIn("5151 still running", stop["killError"])
+
+    def test_a_creation_time_that_cannot_be_read_never_proves_anything(self) -> None:
+        # r6 property 1: the root's creation time is read through its own handle; unreadable, the listing cannot prove its tree.
+        root = self._row(4242, 1, "2026-11-19T10:00:00Z")
+        unread = self._stop("$null", "$true", before=f"@({root})", after="@()", root_start=None)
+        self.assertFalse(unread["confirmed"], unread)
+        self.assertIn("creation time could not be read", unread["killError"])
+        # a still-listed row on the root's parent id whose creation time cannot be read is counted, never placed outside.
+        unknown = "[pscustomobject]@{ id = 5151; parentId = 4242; startUtc = $null }"
+        counted = self._stop("$null", "$true", before=f"@({root}, {unknown})", after=f"@({unknown})")
+        self.assertFalse(counted["confirmed"], counted)
+        self.assertIn("5151 still running", counted["killError"])
+
+    def test_a_real_tree_is_killed_and_confirmed_through_the_real_listing(self) -> None:
+        # r6: the identity rule must still prove a REAL root (handle creation time == listing creation time) and confirm a real tree
+        # gone, or every real timeout would read unconfirmed and never reconcile.
+        module = str(HELPER_MODULE).replace("'", "''")
+        spawner = "import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']); time.sleep(120)"
+        script = (
+            f"$m = Import-Module '{module}' -Force -PassThru\n"
+            "$psi = [System.Diagnostics.ProcessStartInfo]::new($env:FFX_PY)\n"
+            "[void]$psi.ArgumentList.Add('-c'); [void]$psi.ArgumentList.Add($env:FFX_SPAWNER)\n"
+            "$psi.UseShellExecute = $false\n"
+            "$p = [System.Diagnostics.Process]::Start($psi)\n"
+            "$deadline = [System.Diagnostics.Stopwatch]::StartNew()\n"
+            "do { [System.Threading.Thread]::Sleep(100); $kids = @(Get-CimInstance -ClassName Win32_Process -Filter \"ParentProcessId = $($p.Id)\") } "
+            "while (-not $kids.Count -and $deadline.ElapsedMilliseconds -lt 20000)\n"
+            "$r = & $m { param($q) Stop-PinnedPayloadChild -Process $q } $p\n"
+            "$alive = @($kids | Where-Object { $k = $_; try { $h = [System.Diagnostics.Process]::GetProcessById([int]$k.ProcessId); $h.Dispose(); $true } catch { $false } })\n"
+            "[ordered]@{ kids = $kids.Count; confirmed = $r.confirmed; killError = $r.killError; alive = $alive.Count } | ConvertTo-Json -Compress\n"
+        )
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True,
+                              timeout=120, env=dict(os.environ, FFX_PY=sys.executable, FFX_SPAWNER=spawner))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads(proc.stdout)
+        self.assertEqual(result["kids"], 1, result)
+        self.assertTrue(result["confirmed"], result)
+        self.assertEqual(result["alive"], 0, result)
+
+    def test_the_stop_kills_only_through_the_roots_handle_and_times_with_one_stopwatch(self) -> None:
+        # r6 properties 1 and 2 at the source: the listing is ONE Win32_Process query carrying pid, parent id and creation time (no
+        # GetProcesses join), the only kill is Kill($true) through the held root handle (no per-pid open), and every wait comes from one
+        # monotonic Stopwatch (no wall-clock reading).
+        text = HELPER_MODULE.read_text(encoding="utf-8")
+        table = re.search(r"function Get-PinnedPayloadProcessTable \{.*?\n\}", text, re.S).group(0)
+        self.assertIn("CreationDate", table)
+        self.assertIn("-OperationTimeoutSec", table)
+        self.assertNotIn("GetProcesses", table)
+        stop = re.search(r"function Stop-PinnedPayloadChild \{.*?\n\}", text, re.S).group(0)
+        self.assertNotIn("GetProcessById", stop)
+        self.assertEqual(re.findall(r"\.Kill\(", stop), [".Kill("])
+        self.assertIn("$Process.Kill($true)", stop)
+        self.assertIn("[System.Diagnostics.Stopwatch]::StartNew()", stop)
+        for wall in ("Get-Date", "::Now", "::UtcNow"):
+            self.assertNotIn(wall, stop)
+        self.assertNotRegex(stop, r"WaitForExit\(\$ConfirmMs\)")
+
     def test_the_real_process_table_lists_this_process_with_its_parent_and_a_utc_start(self) -> None:
         module = str(HELPER_MODULE).replace("'", "''")
         script = (
             f"$m = Import-Module '{module}' -Force -PassThru\n"
             "$row = @(& $m { Get-PinnedPayloadProcessTable } | Where-Object { $_.id -eq $PID })[0]\n"
-            "[ordered]@{ parent = $row.parentId; kind = [string]$row.startUtc.Kind } | ConvertTo-Json -Compress\n"
+            # r6: the listing's creation time must equal the one read through this process's own handle (to the microsecond, the CIM
+            # precision), or no real root could ever be proven and every timeout would read unconfirmed.
+            "$own = [System.Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().Ticks\n"
+            "[ordered]@{ parent = $row.parentId; kind = [string]$row.startUtc.Kind; same = ($row.startUtc.Ticks -eq ($own - ($own % 10))) } | ConvertTo-Json -Compress\n"
         )
         proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         result = json.loads(proc.stdout)
-        self.assertEqual(result, {"parent": os.getpid(), "kind": "Utc"})
+        self.assertEqual(result, {"parent": os.getpid(), "kind": "Utc", "same": True})
 
     def test_a_path_that_is_not_fully_qualified_is_refused_before_any_child(self) -> None:
         for bad in ("relative\\out", "C:drive-relative", "\\rooted-no-drive"):

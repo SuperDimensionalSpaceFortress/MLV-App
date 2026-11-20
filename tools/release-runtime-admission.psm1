@@ -34,56 +34,89 @@ function Test-ReviewedReleaseRuntimeExtraName {
 
 # Adversary b5fce5a9-A1: Kill($true) finds descendants by comparing LOCAL start times, so a child started just after a DST
 # fall-back fold reads as older than its parent and is left running while the root's exit reads as confirmed. The tree is
-# therefore also derived here from parent ids and UTC start times. Rows: { id; parentId; startUtc } (startUtc $null = unknown).
+# therefore also derived here from parent ids and creation times. Rows: { id; parentId; startUtc } (startUtc $null = unknown).
+# Adversary 0f5308ad-A1 (r6): ONE Win32_Process query reads each row's pid, parent id AND creation time from the same snapshot. The
+# earlier join of a parent-id read with a later GetProcesses start-time read, by pid, let a pid reused between the two reads inherit a
+# stale parent. startUtc is the UTC creation time cut to whole microseconds (the CIM datetime's precision), so it compares equal to the
+# same process's creation time read through its own handle (ConvertTo-PinnedPayloadCreationTicks). The query is bounded.
 function Get-PinnedPayloadProcessTable {
-    $parents = @{}
-    foreach ($row in @(Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId -ErrorAction Stop)) {
-        $parents[[int]$row.ProcessId] = [int]$row.ParentProcessId
-    }
-    foreach ($process in [System.Diagnostics.Process]::GetProcesses()) {
-        $startUtc = $null
-        try { $startUtc = $process.StartTime.ToUniversalTime() } catch { $startUtc = $null }
-        if ($parents.ContainsKey($process.Id)) { [pscustomobject]@{ id = $process.Id; parentId = $parents[$process.Id]; startUtc = $startUtc } }
-        $process.Dispose()
+    foreach ($row in @(Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, CreationDate -OperationTimeoutSec 30 -ErrorAction Stop)) {
+        $ticks = ConvertTo-PinnedPayloadCreationTicks $row.CreationDate
+        [pscustomobject]@{ id = [int]$row.ProcessId; parentId = [int]$row.ParentProcessId; startUtc = if ($null -eq $ticks) { $null } else { [datetime]::new($ticks, [System.DateTimeKind]::Utc) } }
     }
 }
 
-# Adds to Members (id -> startUtc) every row that descends from a member: its parent id is a member's and it did not start before
-# that member (UTC; an older process holds a reused parent id). An unknown start on either side counts as a descendant (fail closed).
-# Returns the rows that are, or descend from, a member and are still listed: a member with an equal or unknown start counts.
-function Get-PinnedPayloadTreeRows {
-    param([object[]]$Table, [hashtable]$Members)
-    $rows = @()
-    foreach ($row in $Table) {
-        if ($Members.ContainsKey([int]$row.id)) {
-            $known = $Members[[int]$row.id]
-            if ($null -eq $known -or $null -eq $row.startUtc -or $row.startUtc -eq $known) { $rows += $row }
+# A creation time as UTC ticks cut to whole microseconds; $null when it is not a readable time. Identity (pid + this value) is compared
+# for EQUALITY only; it is never used to order two processes.
+function ConvertTo-PinnedPayloadCreationTicks {
+    param($Value)
+    if ($Value -isnot [datetime]) { return $null }
+    $ticks = $Value.ToUniversalTime().Ticks
+    return [long]($ticks - ($ticks % 10))
+}
+
+# The tree as ONE listing proves it (r6 property 1). The root joins only as the row on its pid whose creation time equals the one read
+# through the root's own handle; with no such row nothing is proven (key3 r5 B1: a root that already exited, or a pid reused by another
+# process, must not lend its id to a stale parent id). A row joins as a member only when its parent is a member IN THIS SAME LISTING and
+# its own creation time is readable and not earlier than that parent's. A row on a member's id that is unreadable or earlier (an older
+# process holding a reused parent id, or the root's real child after a backward clock step: adversary 0f5308ad-A3) is not a member; the
+# survivor count below still counts it, since only a wall clock could place it outside. Returns { rootListed; members (id -> ticks) }.
+function Get-PinnedPayloadTree {
+    param([object[]]$Table, [int]$RootId, $RootTicks)
+    $members = @{}
+    if ($null -ne $RootTicks) {
+        foreach ($row in $Table) {
+            if ([int]$row.id -eq $RootId -and (ConvertTo-PinnedPayloadCreationTicks $row.startUtc) -eq [long]$RootTicks) { $members[$RootId] = [long]$RootTicks }
         }
     }
-    # Adversary 183fe59d-A1: a member that exited may have its id reused. Children started at or after the replacement's start are
-    # the replacement's, never this tree's.
-    $listedStart = @{}
-    foreach ($row in $Table) { $listedStart[[int]$row.id] = $row.startUtc }
+    if (-not $members.Count) { return [pscustomobject]@{ rootListed = $false; members = $members } }
     $queue = [System.Collections.Generic.Queue[int]]::new()
-    foreach ($id in @($Members.Keys)) { $queue.Enqueue([int]$id) }
+    $queue.Enqueue($RootId)
     while ($queue.Count) {
         $parent = $queue.Dequeue()
-        $parentStart = $Members[$parent]
-        $replacedAt = $null
-        if ($null -ne $parentStart -and $listedStart.ContainsKey($parent) -and $null -ne $listedStart[$parent] -and $listedStart[$parent] -ne $parentStart) {
-            $replacedAt = $listedStart[$parent]
-        }
         foreach ($row in $Table) {
             $id = [int]$row.id
-            if ([int]$row.parentId -ne $parent -or $Members.ContainsKey($id)) { continue }
-            if ($null -ne $parentStart -and $null -ne $row.startUtc -and $row.startUtc -lt $parentStart) { continue }
-            if ($null -ne $replacedAt -and $null -ne $row.startUtc -and $row.startUtc -ge $replacedAt) { continue }
-            $Members[$id] = $row.startUtc
-            $rows += $row
+            if ([int]$row.parentId -ne $parent -or $id -eq $parent -or $members.ContainsKey($id)) { continue }
+            $ticks = ConvertTo-PinnedPayloadCreationTicks $row.startUtc
+            if ($null -eq $ticks -or $ticks -lt $members[$parent]) { continue }
+            $members[$id] = $ticks
             $queue.Enqueue($id)
         }
     }
-    return $rows
+    return [pscustomobject]@{ rootListed = $true; members = $members }
+}
+
+# Every row of ONE later listing that may still be this tree's (r6 property 2: no wall-clock ordering ever places a row outside):
+# a member still listed with its own creation time, or with one that cannot be read; then, transitively, every row whose parent id is a
+# member's or an already counted row's, whatever its creation time (a child started after the first listing, a row the first listing
+# could not place, or a child of a process that reused a member's id: no clock-free fact tells them apart). A row on a member's id with
+# a DIFFERENT readable creation time is another process (183fe59d-A1) and is not itself counted.
+function Get-PinnedPayloadSurvivors {
+    param([object[]]$Table, [hashtable]$Members)
+    $survivors = [System.Collections.Generic.List[object]]::new()
+    $counted = [System.Collections.Generic.HashSet[int]]::new()
+    $parents = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($id in @($Members.Keys)) { [void]$parents.Add([int]$id) }
+    foreach ($row in $Table) {
+        $id = [int]$row.id
+        if (-not $Members.ContainsKey($id)) { continue }
+        $ticks = ConvertTo-PinnedPayloadCreationTicks $row.startUtc
+        if ($null -eq $ticks -or $ticks -eq $Members[$id]) { if ($counted.Add($id)) { $survivors.Add($row) } }
+    }
+    do {
+        $grew = $false
+        foreach ($row in $Table) {
+            $id = [int]$row.id
+            if ($counted.Contains($id) -or $id -eq [int]$row.parentId) { continue }
+            if ($parents.Contains([int]$row.parentId) -or $counted.Contains([int]$row.parentId)) {
+                [void]$counted.Add($id)
+                $survivors.Add($row)
+                $grew = $true
+            }
+        }
+    } while ($grew)
+    # Unrolled on purpose: the caller wraps the output in @(), so an empty result is an empty array, never one empty element.
+    return $survivors.ToArray()
 }
 
 # Kills a timed-out child's whole tree and reports whether its exit was SEEN; a Kill that throws (access
@@ -99,37 +132,42 @@ function Stop-PinnedPayloadChild {
 
         [scriptblock]$ProcessTable = { Get-PinnedPayloadProcessTable }
     )
-    # The tree as it stands while the root is alive (adversary b5fce5a9-A1): a listing that fails leaves the kill unconfirmed.
+    # One monotonic clock bounds every wait of this stop (r6 property 2); no wall-clock reading decides anything here.
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    # The root's identity is read through the handle this caller holds, never from a listing (key3 r5 B1, psm1:108 sibling).
     $treeError = ''
+    $rootTicks = $null
+    try { $rootTicks = ConvertTo-PinnedPayloadCreationTicks $Process.StartTime } catch { $rootTicks = $null }
     $members = @{}
-    try {
-        $before = @(& $ProcessTable)
-        $rootRow = @($before | Where-Object { [int]$_.id -eq [int]$Process.Id })
-        $members[[int]$Process.Id] = if ($rootRow.Count) { $rootRow[0].startUtc } else { $null }
-        $null = Get-PinnedPayloadTreeRows -Table $before -Members $members
-    } catch { $treeError = "the process tree could not be listed before the kill: $($_.Exception.Message)" }
-    $provenBeforeKill = $members.Clone()
+    if ($null -eq $rootTicks) {
+        $treeError = "the root's creation time could not be read through its handle, so no listing can prove its tree"
+    } else {
+        # The tree as ONE listing proves it while the root is alive (adversary b5fce5a9-A1, 0f5308ad-A1): a listing that fails, or one
+        # without the root's own row, leaves the kill unconfirmed.
+        try {
+            $tree = Get-PinnedPayloadTree -Table @(& $ProcessTable) -RootId ([int]$Process.Id) -RootTicks $rootTicks
+            $members = $tree.members
+            if (-not $tree.rootListed) { $treeError = "pid $($Process.Id) with its own creation time is not in the listing taken before the kill, so its tree is unproven" }
+        } catch { $treeError = "the process tree could not be listed before the kill: $($_.Exception.Message)" }
+    }
+    # The ONLY kill: Kill($true) through the root's own held handle. Nothing is ever killed by a pid read from a listing (adversary
+    # 0f5308ad-A1/A2: a listing can join one process's parent id to another's identity, and an open by pid can reach a replacement); a
+    # descendant Kill($true) misses is counted below and leaves the kill unconfirmed, so no recovery runs while it may live.
     $killError = ''
     try { $null = $Process.Kill($true) } catch { $killError = $_.Exception.Message }
     $exited = $false
-    try { $exited = [bool]$Process.WaitForExit($ConfirmMs) } catch { if (-not $killError) { $killError = "the exit could not be awaited: $($_.Exception.Message)" } }
+    try { $exited = [bool]$Process.WaitForExit([int][math]::Max(0, $ConfirmMs - $clock.ElapsedMilliseconds)) } catch { if (-not $killError) { $killError = "the exit could not be awaited: $($_.Exception.Message)" } }
     if (-not $treeError) {
         try {
-            # A descendant still listed after Kill($true) is ended by id only when the listing taken while the root was alive
-            # proved it (same id and UTC start) and its start still matches: a reused id or a process first seen after the kill
-            # is never killed (adversary 183fe59d-A1). Any one still listed after that leaves the tree unconfirmed.
-            foreach ($row in @(Get-PinnedPayloadTreeRows -Table @(& $ProcessTable) -Members $members)) {
-                $id = [int]$row.id
-                if ($id -eq [int]$Process.Id -or -not $provenBeforeKill.ContainsKey($id) -or $null -eq $row.startUtc -or $null -eq $provenBeforeKill[$id] -or $row.startUtc -ne $provenBeforeKill[$id]) { continue }
-                try {
-                    $survivor = [System.Diagnostics.Process]::GetProcessById([int]$row.id)
-                    try {
-                        if ($survivor.StartTime.ToUniversalTime() -eq $row.startUtc) { $survivor.Kill(); $null = $survivor.WaitForExit($ConfirmMs) }
-                    } finally { $survivor.Dispose() }
-                } catch { $null = $_ }
+            # Re-listed until nothing that may be the tree's is listed or the one budget is spent (a terminated process can stay
+            # listed for a moment); whatever is still listed then leaves the tree unconfirmed.
+            while ($true) {
+                $left = @(Get-PinnedPayloadSurvivors -Table @(& $ProcessTable) -Members $members)
+                $remaining = $ConfirmMs - $clock.ElapsedMilliseconds
+                if (-not $left.Count -or $remaining -le 0) { break }
+                [System.Threading.Thread]::Sleep([int][math]::Min(100, $remaining))
             }
-            $left = @(Get-PinnedPayloadTreeRows -Table @(& $ProcessTable) -Members $members)
-            if ($left.Count) { $treeError = "descendant pid(s) $(@($left | ForEach-Object { $_.id }) -join ', ') still running after the tree kill" }
+            if ($left.Count) { $treeError = "pid(s) $(@($left | ForEach-Object { $_.id }) -join ', ') still running after the tree kill (a member, or a row on a member's parent id that no clock-free fact places outside the tree)" }
         } catch { $treeError = "the process tree could not be listed after the kill: $($_.Exception.Message)" }
     }
     if ($treeError) { $killError = if ($killError) { "$killError; $treeError" } else { $treeError } }
