@@ -1556,8 +1556,8 @@ class CdngStageContainmentGateTests(unittest.TestCase):
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         self.assertEqual(table_vs_export_problems(got, derived), [])
         # (negative control: the base's pre_dualiso_fix row, and a scaled-path window on any row, are refused; adversary r1 A1: so is a row widened to the whole worker)
-        for name, extra, replace in (("llrawproc_pre_dualiso_fix", ["llrawproc.c:5014-5463", "llrawproc.c:6606-7076"], False),
-                                     ("llrawproc_dual_iso", ["llrawproc.c:6890-6954"], False), ("llrawproc_dual_iso", ["llrawproc.c:5014-6329"], True)):
+        for name, extra, replace in (("llrawproc_pre_dualiso_fix", ["llrawproc.c:5221-5670", "llrawproc.c:6813-7283"], False),
+                                     ("llrawproc_dual_iso", ["llrawproc.c:7097-7161"], False), ("llrawproc_dual_iso", ["llrawproc.c:5221-6536"], True)):
             with self.subTest(mutant=name, extra=extra):
                 mutant = json.loads(json.dumps(got))
                 for r in mutant:
@@ -1600,7 +1600,7 @@ class CdngStageContainmentGateTests(unittest.TestCase):
         def row(t: list, name: str) -> dict:
             return next(r for r in t if r["name"] == name)
         mutants = {
-            "dual_iso across the refine lock": lambda t: row(t, "llrawproc_dual_iso").__setitem__("windows", ["llrawproc.c:5560-6219"]),
+            "dual_iso across the refine lock": lambda t: row(t, "llrawproc_dual_iso").__setitem__("windows", ["llrawproc.c:5767-6426"]),
             "pre_dualiso_fix parent": lambda t: row(t, "llrawproc_pre_dualiso_fix").__setitem__("parent", "unmeasured"),
             "extra contains": lambda t: row(t, "llrawproc_dual_iso").__setitem__("contains", ["llrawproc_publish_lock"]),
             "token window": lambda t: row(t, "llrawproc_dual_iso").__setitem__("windows", row(t, "llrawproc_dual_iso")["windows"] + ["dng.c#raw_read"]),
