@@ -7397,6 +7397,12 @@ void RenderFrameThread::drawFrame( int slotIndex,
         recon_worker_split::copyWorkerSplit( preservedGpuPlaybackReconTextureTelemetry,
                                              slot.stageTimingTelemetry );
     }
+    else
+    {
+        // a render that ran its own recon: the worker's spans (taken for a recon this frame did not use) are not this frame's
+        slot.traceStamps.configureMs = playback_present_trace::kUnknownMs;
+        slot.traceStamps.h2dMs = playback_present_trace::kUnknownMs;
+    }
 
     slot.processedFrame8Active =
         m_pMlvObject && m_pMlvObject->current_processed_frame_8bit_active;

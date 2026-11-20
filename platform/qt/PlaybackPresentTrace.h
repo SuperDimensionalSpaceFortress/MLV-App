@@ -42,11 +42,13 @@ struct StageStamps
     double reconEndS = 0.0;     // recon worker finished
     double renderStartS = 0.0;  // render thread began this frame
     double drawBeginS = 0.0;    // the GUI thread began drawing it (drawFrameReady's display start)
-    // The recon WORKER's own dual-ISO configure and async-H2D upload spans, in ms (durations, not stamps; kUnknownMs = not
-    // taken). The worker takes them on its own thread from the slot telemetry it has just written. They matter only when the
-    // render thread CONSUMED that recon (workerSplit): then the frame JSON's unprefixed keys are the render thread's own
-    // last-run record and can describe an older frame (adversary a7085920 A1), so the present uses these instead.
-    double configureMs = kUnknownMs;
+    // Durations in ms (not stamps; kUnknownMs = nobody measured it for THIS frame). The frame JSON's unprefixed configure and
+    // H2D keys are the render thread's own last-run record, which can describe an older frame (adversary a7085920 A1,
+    // 81c5805c A1/A2), so the trace never reads them for H2D, only from a source that measured it for this frame:
+    //  - the recon WORKER, on its own thread, from the slot telemetry it has just written (configure and H2D);
+    //  - the GUI presenter, from the backend call it just made for this frame (H2D), which replaces the worker's value;
+    //  - the presenter's frame-id mismatch, which resets H2D to unknown (the retained buffer belonged to another frame).
+    double configureMs = kUnknownMs;   // used only when workerSplit; any other frame keeps the caller's read of its own telemetry
     double h2dMs = kUnknownMs;
     bool workerSplit = false;   // set by the render thread when it consumed the worker's recon for this frame
 };
@@ -117,13 +119,11 @@ struct Row
         reMs = ms( s.reconEndS );
         rndMs = ms( s.renderStartS );
         drawBeginMs = ms( s.drawBeginS );
-        // A frame that consumed the worker's recon takes the worker's spans (unknown when it took none, never a stale
-        // value); any other frame keeps what the caller read from the frame's own telemetry.
-        if( s.workerSplit )
-        {
-            configureMs = s.configureMs;
-            h2dMs = s.h2dMs;
-        }
+        // H2D always comes from the stamps (unknown when no source measured it for this frame, never a stale value).
+        // Configure follows the worker's span for a frame that consumed the worker's recon; any other frame keeps what the
+        // caller read from the frame's own telemetry.
+        h2dMs = s.h2dMs;
+        if( s.workerSplit ) configureMs = s.configureMs;
     }
 
     /*! True when the stamps that are known never run backwards along request .. present (1 = ordered). */

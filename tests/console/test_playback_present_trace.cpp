@@ -375,16 +375,32 @@ TEST(PlaybackPresentTraceStages, ARealMinusOneMsStampStillTakesPartInTheOrderChe
     ASSERT_TRUE(trace.row(1).stagesOrdered());
 }
 
-TEST(PlaybackPresentTraceStages, AFrameThatRanItsOwnReconLeavesTheSpansForTheFramesOwnTelemetry)
+TEST(PlaybackPresentTraceStages, AFrameThatRanItsOwnReconKeepsTheCallersConfigureAndNeverTakesAStaleH2d)
 {
     playback_present_trace::StageStamps s = stagesFrom(1.0);   // workerSplit stays false
     s.configureMs = 6.1;                                       // ignored: not this frame's recon
     Row r;
     r.configureMs = 2.5;   // the caller's read of the frame's own JSON
-    r.h2dMs = 0.7;
+    r.h2dMs = 0.7;         // whatever a last-run-record read would have left
     r.setStages(s);
     ASSERT_NEAR(2.5, r.configureMs, 1e-9);
-    ASSERT_NEAR(0.7, r.h2dMs, 1e-9);
+    ASSERT_NEAR(playback_present_trace::kUnknownMs, r.h2dMs, 0.0);   // nobody measured it for this frame
+}
+
+// adversary 81c5805c A2: the GUI presenter's own backend call measured the upload for this frame; the stamps carry it even
+// for a frame that consumed the worker's recon (whose worker span stays unknown).
+TEST(PlaybackPresentTraceStages, ThePresentersOwnH2dMeasurementIsTheFramesH2d)
+{
+    playback_present_trace::StageStamps s = stagesFrom(1.0);
+    s.workerSplit = true;   // the worker took no H2D span
+    s.h2dMs = 0.4;          // the presenter wrote this one
+    Row r;
+    r.setStages(s);
+    ASSERT_NEAR(0.4, r.h2dMs, 1e-9);
+    // and an unmeasured frame reports unknown, never a 0.0 that would read as "measured, free"
+    Row u;
+    u.setStages(stagesFrom(1.0));
+    ASSERT_NEAR(playback_present_trace::kUnknownMs, u.h2dMs, 0.0);
 }
 
 TEST(PlaybackPresentTraceWiring, TheWorkersSpansAreCapturedOnItsOwnThreadAndMarkTheFrameWhenItsReconIsConsumed)
@@ -407,6 +423,14 @@ TEST(PlaybackPresentTraceWiring, TheWorkersSpansAreCapturedOnItsOwnThreadAndMark
         "    {\n"
         "        // PLAYBACK-TRACE-LOWOVERHEAD-1: the present trace reads the worker's configure/H2D spans for this frame\n"
         "        slot.traceStamps.workerSplit = true;\n")));
+    // a render that ran its own recon drops the worker's spans (they describe a recon this frame did not use)
+    ASSERT_EQ(1, render.count(QStringLiteral(
+        "    else\n"
+        "    {\n"
+        "        // a render that ran its own recon: the worker's spans (taken for a recon this frame did not use) are not this frame's\n"
+        "        slot.traceStamps.configureMs = playback_present_trace::kUnknownMs;\n"
+        "        slot.traceStamps.h2dMs = playback_present_trace::kUnknownMs;\n"
+        "    }\n")));
 }
 
 TEST(PlaybackPresentTraceWiring, EveryStageHookIsOneGuardedStoreOnAKnownThread)
@@ -453,13 +477,15 @@ TEST(PlaybackPresentTraceWiring, TheWindowSwitchesTheStageHooksWithTheRecorderAn
     // recon (a frame that consumed the worker's recon carries the worker's spans in the stamps, and its JSON keys are stale)
     ASSERT_EQ(1, source.count(QStringLiteral("            traceRow.setStages( readyFrame.traceStamps );\n")));
     ASSERT_EQ(1, source.count(QStringLiteral(
-        "            if( !readyFrame.traceStamps.workerSplit )\n"
-        "            {\n"
-        "                if( timing.contains( QStringLiteral(\"llrawproc_dual_iso_split_configure_ms\") ) )\n"
-        "                    traceRow.configureMs = telemetryDoubleValue( timing, \"llrawproc_dual_iso_split_configure_ms\" );\n"
-        "                if( timing.contains( QStringLiteral(\"gpu_playback_recon_async_h2d_upload_ms\") ) )\n"
-        "                    traceRow.h2dMs = telemetryDoubleValue( timing, \"gpu_playback_recon_async_h2d_upload_ms\" );\n"
-        "            }\n")));
+        "            if( !readyFrame.traceStamps.workerSplit\n"
+        "             && timing.contains( QStringLiteral(\"llrawproc_dual_iso_split_configure_ms\") ) )\n"
+        "                traceRow.configureMs = telemetryDoubleValue( timing, \"llrawproc_dual_iso_split_configure_ms\" );\n")));
+    // H2D is never read back from the frame JSON by the trace; the presenter that measured it sets it, or resets it
+    ASSERT_FALSE(source.contains(QStringLiteral("traceRow.h2dMs = telemetryDoubleValue")));
+    ASSERT_EQ(1, source.count(QStringLiteral(
+        "            readyFrame.traceStamps.h2dMs = texturePresentTiming.preupload.upload_ms;\n")));
+    ASSERT_EQ(1, source.count(QStringLiteral(
+        "            readyFrame.traceStamps.h2dMs = playback_present_trace::kUnknownMs;\n")));
     // the dump walks the ring oldest-first and says how many rows the ring overwrote
     ASSERT_TRUE(source.contains(QStringLiteral("m_playbackPresentTrace.row( i )")));
     ASSERT_TRUE(source.contains(QStringLiteral("m_playbackPresentTrace.dropped()")));
