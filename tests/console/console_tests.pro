@@ -123,7 +123,9 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_scale_label.cpp \
     $$REPO_ROOT/tests/console/test_visual_capture_source_difference.cpp \
     $$REPO_ROOT/tests/console/test_viewer_idle_wiring.cpp \
-    $$REPO_ROOT/tests/console/test_viewer_idle_policy.cpp
+    $$REPO_ROOT/tests/console/test_viewer_idle_policy.cpp \
+    $$REPO_ROOT/tests/console/test_fullscreen_control_bar_policy.cpp \
+    $$REPO_ROOT/tests/console/test_fullscreen_control_bar_wiring.cpp
 
 HEADERS += \
     $$REPO_ROOT/platform/qt/FpmNameValidator.h \
@@ -203,7 +205,8 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/GpuFieldTelemetryCore.h \
     $$REPO_ROOT/platform/qt/GpuDeviceLossBreakerCore.h \
     $$REPO_ROOT/platform/qt/VisualCaptureSourceDifference.h \
-    $$REPO_ROOT/platform/qt/VisualCaptureSourceGuard.h
+    $$REPO_ROOT/platform/qt/VisualCaptureSourceGuard.h \
+    $$REPO_ROOT/platform/qt/FullscreenControlBarPolicy.h
 
 win32{
     WINDOWS_TEST_RUNTIME_DEPLOY = $$relative_path($$REPO_ROOT/tools/testing/deploy-windows-test-runtime.ps1, $$OUT_PWD)

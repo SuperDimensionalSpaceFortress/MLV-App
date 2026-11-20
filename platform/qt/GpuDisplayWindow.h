@@ -35,6 +35,7 @@
 #include "GpuPreviewProcessing.h"
 #include "GpuWindowSwapTelemetry.h"
 #include "PlaybackWarmOutputReusePolicy.h"
+#include "FullscreenControlBarPolicy.h"   // PLAYER-FULLSCREEN-CONTROL-BAR-1: the bar's Presenter member
 #include "../../src/mlv/llrawproc/llrawproc.h"
 #include <array>
 #include <cstddef>
@@ -243,6 +244,17 @@ public:
     static void resetSwapTelemetry(quint64 sessionId);
     static GpuWindowSwapTelemetrySnapshot swapTelemetrySnapshot(void);
 
+    /* PLAYER-FULLSCREEN-CONTROL-BAR-1: the fullscreen control bar paintGL() draws over the bottom of the frame
+     * (drawControlBar). shown/feed as MainWindow's idle clock and feed decide; a feed is ignored while hidden. While
+     * playing no update() is asked for (the next frame's paint draws the change); while paused one is. GUI-thread
+     * only; false when no window is active. */
+    static bool setControlBarStateIfActive(bool shown, const fullscreen_bar::Feed &feed, qint64 nowMs);
+    /* The bar layout on the active window's framebuffer as paintGL() would draw it now (device pixels; empty when
+     * no window is active). */
+    static fullscreen_bar::Layout controlBarLayoutIfActive(void);
+    /* The active window's bar raster and upload counts (zero when no window is active). */
+    static void controlBarCountersIfActive(int *rasterCount, int *uploadCount);
+
     explicit GpuDisplayWindow(QWindow *parent = nullptr);
     ~GpuDisplayWindow() override;
 
@@ -378,6 +390,8 @@ private:
     void cleanupGLResources(void);
     /* LOOK-FULLSCREEN-PARITY-1: composites the cached look label over the frame just drawn. */
     void drawLookLabel(int fbw, int fbh);
+    /* PLAYER-FULLSCREEN-CONTROL-BAR-1: draws the cached bar quad and the playhead; returns at once when hidden. */
+    void drawControlBar(int fbw, int fbh);
 
     QOpenGLShaderProgram *m_program;
     // Shared with GpuDisplayViewport (GpuPreviewProcessing.h): the display shader +
@@ -455,6 +469,12 @@ private:
 
     // PLAYER-GL-WINDOW-INPUT-PARITY-1 r2: see lastPaintedPicture(); written only by paintGL().
     PaintedPicture m_lastPaintedPicture;
+
+    // PLAYER-FULLSCREEN-CONTROL-BAR-1: the bar (see setControlBarStateIfActive). The image and texture are rebuilt
+    // only as the Presenter says (size or play state: whole bar; timecode string: its cell, into the same texture).
+    fullscreen_bar::Presenter m_controlBar;
+    QImage m_controlBarImage;
+    QOpenGLTexture *m_controlBarTexture = nullptr;
 
     // Swap telemetry (see resetSwapTelemetry()/swapTelemetrySnapshot()/noteRealSwap()).
     // The session id/active-state live at file scope in the .cpp, not here -- see the

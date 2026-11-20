@@ -1539,6 +1539,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include "GpuDebayer.h"
 #include "GpuDisplayViewport.h"
 #include "GpuDisplayWindow.h"
+#include "FullscreenControlBar.h"   // PLAYER-FULLSCREEN-CONTROL-BAR-1
 #include "GpuWindowViewerInputForwarder.h"
 #include "ViewerDoubleClickFilter.h"
 #include "GpuFieldTelemetry.h"
@@ -2376,6 +2377,11 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     connect( ui->actionWhiteBalancePicker, &QAction::toggled, this, [this]( bool ) { viewerIdleRestore(); } );
     connect( ui->toolButtonBadPixelsSearchMethodEdit, &QAbstractButton::toggled, this, [this]( bool ) { viewerIdleRestore(); } );
     connect( ui->toolButtonGradientPaint, &QAbstractButton::toggled, this, [this]( bool ) { viewerIdleRestore(); } );
+    //PLAYER-FULLSCREEN-CONTROL-BAR-1: the CPU viewer's bar, a hidden child of the view (not its viewport); it shows
+    //and hides only on the idle clock above (viewerIdleApplyShown), with no timer of its own
+    m_fullscreenBarWidget = new FullscreenControlBarWidget( ui->graphicsView );
+    m_fullscreenBarWidget->setInputHook( [this]( const fullscreen_bar::Layout &layout, QEvent *event, const QPointF &devicePos )
+                                         { fullscreenBarInput( layout, event, devicePos, true ); } );
 
     //Set bools for draw rules
     m_dontDraw = true;
@@ -2642,6 +2648,8 @@ MainWindow::~MainWindow()
 #ifdef Q_OS_WIN
     viewer_idle::win_hook::remove();   // PLAYER-CURSOR-AUTOHIDE-1 r2: closed while still fullscreen
 #endif
+    // PLAYER-FULLSCREEN-CONTROL-BAR-1: the bar's one summary line, unless a fullscreen exit already emitted it
+    if( !m_fullscreenBarSummaryEmitted ) fullscreenBarEmitSummary();
     killTimer( m_timerId );
     killTimer( m_timerCacheId );
     // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r2: join the due wake's wait thread and drop its window and native
@@ -3707,12 +3715,13 @@ viewer_idle::Inputs MainWindow::viewerIdleInputs( void ) const
                 || ui->toolButtonBadPixelsSearchMethodEdit->isChecked()
                 || ui->toolButtonGradientPaint->isChecked();
     in.popupOrModalOpen = QApplication::activePopupWidget() || QApplication::activeModalWidget();
+    in.overlayHeld = fullscreenBarHeld();   // PLAYER-FULLSCREEN-CONTROL-BAR-1: hover or a seek drag holds bar and cursor
     return in;
 }
 
 void MainWindow::viewerIdleRestore( void )
 {
-    if( m_viewerIdle.forceShown() ) m_viewerCursorHider.restore( viewerIdleSurfaces() );
+    if( m_viewerIdle.forceShown() ) viewerIdleApplyShown( true, false );
     if( m_viewerIdle.fullscreen() )
     {
         m_viewerIdlePointer.seed( QCursor::pos() );
@@ -3731,6 +3740,10 @@ void MainWindow::viewerIdleFullscreenChanged( bool on )
         m_viewerIdle.setFullscreen( true, m_viewerIdleClock.elapsed() );
         m_viewerIdleHaveLast = false;
         m_viewerIdlePointer.seed( QCursor::pos() );
+        // PLAYER-FULLSCREEN-CONTROL-BAR-1: the bar stays hidden at entry; a move must first leave this position
+        m_fullscreenBarEntryPos = QCursor::pos();
+        m_fullscreenBarSawMove = false;
+        m_fullscreenBarSummaryEmitted = false;
 #ifdef Q_OS_WIN
         // Adversary r1 pass 3 A1: the witness that survives Qt deferring input in an excluded wait.
         viewer_idle::win_hook::install();
@@ -3743,8 +3756,14 @@ void MainWindow::viewerIdleFullscreenChanged( bool on )
 #ifdef Q_OS_WIN
         viewer_idle::win_hook::remove();
 #endif
-        if( m_viewerIdle.forceShown() ) m_viewerCursorHider.restore( viewerIdleSurfaces() );
+        const bool wasFullscreen = m_viewerIdle.fullscreen();
+        if( m_viewerIdle.forceShown() ) viewerIdleApplyShown( true, false );
         m_viewerIdle.setFullscreen( false, m_viewerIdleClock.elapsed() );
+        // PLAYER-FULLSCREEN-CONTROL-BAR-1: never shown outside fullscreen; one summary line per fullscreen session
+        fullscreenBarSetShown( false );
+        // The drag ends; a press the bar took (its Exit) keeps its release, which the GL route still swallows.
+        m_fullscreenBarInput.seekDrag = false;
+        if( wasFullscreen ) fullscreenBarEmitSummary();
     }
 }
 
@@ -3805,11 +3824,12 @@ void MainWindow::viewerIdleTimeout( void )
     switch( m_viewerIdle.onTimeout( in, m_viewerIdleClock.elapsed(), viewer_idle::kIdleHideMs(), &ms, viewer_idle::kPointerPollMs() ) )
     {
     case viewer_idle::Tick::Hide:
-        m_viewerCursorHider.hide( viewerIdleSurfaces() );
+        viewerIdleApplyShown( false, false );   // cursor and bar together
         m_viewerIdleTimer->start( ms );   // keep watching the pointer while hidden
         break;
     case viewer_idle::Tick::Show:
-        m_viewerCursorHider.restore( viewerIdleSurfaces() );
+        // The bar comes back only for real movement, not for a gate that failed (a popup, a modal, deactivation).
+        viewerIdleApplyShown( true, in.pointerMoved );
         m_viewerIdleTimer->start( ms );
         break;
     case viewer_idle::Tick::Rearm:
@@ -3837,9 +3857,183 @@ void MainWindow::viewerIdleNoteEvent( QObject *watched, QEvent *event )
         // Delivered: the hook's sighting of it is not new movement; the history is marked again (r11, pass 15 A1).
         viewer_idle::win_hook::noteDelivered();
 #endif
-        if( m_viewerIdle.noteActivity( m_viewerIdleClock.elapsed() ) ) m_viewerCursorHider.restore( viewerIdleSurfaces() );
+        // PLAYER-FULLSCREEN-CONTROL-BAR-1: activity shows the bar too (not a move still at the entry position)
+        const bool wasHidden = m_viewerIdle.noteActivity( m_viewerIdleClock.elapsed() );
+        if( wasHidden || !fullscreenBarShown() )
+        {
+            viewerIdleApplyShown( true, fullscreen_bar::activityShowsBar( event->type(), &m_fullscreenBarSawMove,
+                                                                           m_fullscreenBarEntryPos, QCursor::pos() ) );
+        }
         if( !m_viewerIdleTimer->isActive() ) m_viewerIdleTimer->start( viewer_idle::kPointerPollMs() );
     }
+}
+
+// PLAYER-FULLSCREEN-CONTROL-BAR-1: the fullscreen control bar rides #855's one idle clock. The cursor and the bar show
+// and hide together here; the bar shows only for real activity (byActivity), never outside fullscreen, and a gate that
+// forces the cursor back (popup, modal, deactivation) leaves a hidden bar hidden.
+void MainWindow::viewerIdleApplyShown( bool shown, bool byActivity )
+{
+    if( shown ) m_viewerCursorHider.restore( viewerIdleSurfaces() );
+    else m_viewerCursorHider.hide( viewerIdleSurfaces() );
+    fullscreenBarSetShown( m_viewerIdle.fullscreen() && shown && ( byActivity || fullscreenBarShown() ) );
+}
+
+bool MainWindow::fullscreenBarShown( void ) const
+{
+    return m_fullscreenBarWidget && m_fullscreenBarWidget->presenter().shown();
+}
+
+// Shown: the per-frame feed (position, timecode, play state) is connected and fed once. Hidden: it is disconnected,
+// so a hidden bar costs nothing per frame (no slot runs, no raster, no upload).
+void MainWindow::fullscreenBarSetShown( bool shown )
+{
+    if( !m_fullscreenBarWidget || shown == fullscreenBarShown() ) return;
+    const qint64 now = m_viewerIdleClock.elapsed();
+    if( shown )
+    {
+        m_fullscreenBarWidget->setBarShown( true, now );
+        m_fullscreenBarSliderFeed = connect( ui->horizontalSliderPosition, &QSlider::valueChanged, this, [this]( int ) { fullscreenBarFeed(); } );
+        m_fullscreenBarPlayFeed = connect( ui->actionPlay, &QAction::toggled, this, [this]( bool ) { fullscreenBarFeed(); } );
+        m_fullscreenBarFrameFeed = true;   // drawFrameNumberLabel: each presented frame
+        fullscreenBarFeed();
+    }
+    else
+    {
+        disconnect( m_fullscreenBarSliderFeed );
+        disconnect( m_fullscreenBarPlayFeed );
+        m_fullscreenBarFrameFeed = false;
+        m_fullscreenBarWidget->setBarShown( false, now );
+        fullscreen_bar::Feed feed = m_fullscreenBarWidget->presenter().feed();
+        feed.playing = ui->actionPlay->isChecked();
+        GpuDisplayWindow::setControlBarStateIfActive( false, feed, now );
+    }
+}
+
+// frameIndex: the frame just presented (drawFrameNumberLabel), or -1 for the slider's position.
+void MainWindow::fullscreenBarFeed( int frameIndex )
+{
+    if( !m_fullscreenBarWidget ) return;
+    const QSlider *slider = ui->horizontalSliderPosition;
+    const int frame = qBound( slider->minimum(), frameIndex >= 0 ? frameIndex : slider->value(), slider->maximum() );
+    fullscreen_bar::Feed feed;
+    feed.frame = frame - slider->minimum();
+    feed.totalFrames = slider->maximum() - slider->minimum() + 1;
+    feed.playing = ui->actionPlay->isChecked();
+    feed.timecode = ( m_fileLoaded && m_pTimeCodeImage )
+                  ? m_pTimeCodeImage->getTimeCodeFromFps( uint32_t( qMax( 0, frame ) ), float( getFramerate() ) )
+                  : QStringLiteral( "--:--:--:--" );
+    m_fullscreenBarWidget->setFeed( feed );
+    GpuDisplayWindow::setControlBarStateIfActive( true, feed, m_viewerIdleClock.elapsed() );
+}
+
+// Held (viewer_idle::Inputs::overlayHeld): a seek drag, or the pointer over the shown bar on either display path.
+bool MainWindow::fullscreenBarHeld( void ) const
+{
+    // A drag needs the button down now: a release the bar never saw cannot hold it.
+    if( m_fullscreenBarInput.seekDrag && ( QApplication::mouseButtons() & Qt::LeftButton ) ) return true;
+    if( !fullscreenBarShown() ) return false;
+    const QPoint global = QCursor::pos();
+    if( m_fullscreenBarWidget->containsGlobal( global ) ) return true;
+    QWindow *gl = GpuDisplayWindow::activeWindow();
+    if( !gl || !gl->isVisible() ) return false;
+    const QPointF device = QPointF( gl->mapFromGlobal( global ) ) * gl->devicePixelRatio();
+    return fullscreen_bar::hitTest( GpuDisplayWindow::controlBarLayoutIfActive(), device ) != fullscreen_bar::Part::None;
+}
+
+// One mouse event on the bar, either display path: the CPU widget hands over every event it gets (fromWidget); the GL
+// window's events are claimed here first. The actions are the existing ones: the same actions the menu and toolbar
+// trigger, and the slider seek the Goto actions use.
+bool MainWindow::fullscreenBarInput( const fullscreen_bar::Layout &layout, QEvent *event, const QPointF &devicePos, bool fromWidget )
+{
+    Qt::MouseButton button = Qt::NoButton;
+    Qt::MouseButtons buttons = Qt::NoButton;
+    if( const QMouseEvent *mouse = dynamic_cast<const QMouseEvent *>( event ) )
+    {
+        button = mouse->button();
+        buttons = mouse->buttons();
+    }
+    else if( const QWheelEvent *wheel = dynamic_cast<const QWheelEvent *>( event ) )
+    {
+        buttons = wheel->buttons();
+    }
+    const fullscreen_bar::Part part = fullscreen_bar::hitTest( layout, devicePos );
+    fullscreen_bar::Action action = fullscreen_bar::Action::None;
+    if( fromWidget ) action = fullscreen_bar::onMouse( &m_fullscreenBarInput, event->type(), button, buttons, part );
+    else if( !fullscreen_bar::route( &m_fullscreenBarInput, fullscreenBarShown(), event->type(), button, buttons, part, &action ) ) return false;
+    switch( action )
+    {
+    case fullscreen_bar::Action::TogglePlay: ui->actionPlay->trigger(); break;
+    case fullscreen_bar::Action::PrevFrame: ui->actionPreviousFrame->trigger(); break;
+    case fullscreen_bar::Action::NextFrame: ui->actionNextFrame->trigger(); break;
+    case fullscreen_bar::Action::ExitFullscreen: ui->actionFullscreen->trigger(); break;
+    case fullscreen_bar::Action::Seek:
+    {
+        QSlider *slider = ui->horizontalSliderPosition;
+        const int total = slider->maximum() - slider->minimum() + 1;
+        slider->setValue( slider->minimum() + fullscreen_bar::seekFrameAt( layout, devicePos.x(), total ) );
+        break;
+    }
+    case fullscreen_bar::Action::None:
+        break;
+    }
+    return true;
+}
+
+// The GL window's mouse events on the shown bar (or the bar's own press/drag), routed before the viewer's double-click
+// toggle, picker, bad-pixel edit and pan see them. The idle clock still notes them. Anything else costs one type test.
+bool MainWindow::fullscreenBarRouteGpuEvent( QObject *watched, QEvent *event )
+{
+    QPointF local;
+    switch( event->type() )
+    {
+    case QEvent::MouseButtonPress:
+    case QEvent::MouseButtonRelease:
+    case QEvent::MouseButtonDblClick:
+    case QEvent::MouseMove:
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+        local = static_cast<QMouseEvent *>( event )->position();
+#else
+        local = static_cast<QMouseEvent *>( event )->localPos();
+#endif
+        break;
+    case QEvent::Wheel:
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+        local = static_cast<QWheelEvent *>( event )->position();
+#else
+        local = static_cast<QWheelEvent *>( event )->posF();
+#endif
+        break;
+    default:
+        return false;
+    }
+    if( !fullscreenBarShown() && !m_fullscreenBarInput.pressOwned && !m_fullscreenBarInput.seekDrag ) return false;
+    QWindow *gl = GpuDisplayWindow::activeWindow();
+    if( !gl || watched != gl ) return false;
+    if( !fullscreenBarInput( GpuDisplayWindow::controlBarLayoutIfActive(), event, local * gl->devicePixelRatio(), false ) ) return false;
+    viewerIdleNoteEvent( watched, event );
+    return true;
+}
+
+void MainWindow::fullscreenBarEmitSummary( void )
+{
+    int gpuRaster = 0;
+    int gpuUpload = 0;
+    GpuDisplayWindow::controlBarCountersIfActive( &gpuRaster, &gpuUpload );
+    const qint64 now = m_viewerIdleClock.isValid() ? m_viewerIdleClock.elapsed() : 0;
+    int raster = gpuRaster;
+    int upload = gpuUpload;
+    qint64 shownMs = 0;
+    int shows = 0;
+    if( m_fullscreenBarWidget )
+    {
+        const fullscreen_bar::Presenter &p = m_fullscreenBarWidget->presenter();
+        raster += p.rasterCount();
+        upload += p.uploadCount();
+        shownMs = p.shownMs( now );
+        shows = p.shows();
+    }
+    qInfo().noquote() << fullscreen_bar::summaryLine( raster, upload, shownMs, shows );
+    m_fullscreenBarSummaryEmitted = true;
 }
 
 //Disable WBPicker if picture is left and if mouse is clicked somewhere else
@@ -3848,6 +4042,9 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
     Q_UNUSED( watched );
     // Application filter: the first event dispatched after a dispatcher wait ends that wait.
     endGuiPresentIdleWait();
+    //PLAYER-FULLSCREEN-CONTROL-BAR-1: a mouse event on the shown fullscreen bar (GL path) is the bar's alone, so a
+    //double-click on it never toggles fullscreen and a press never reaches the picker, bad-pixel edit or pan
+    if( fullscreenBarRouteGpuEvent( watched, event ) ) return true;
     //PLAYER-DOUBLECLICK-FULLSCREEN-1: a left double-click on the viewer (either display path) toggles fullscreen, once, and is swallowed
     if( viewer_dblclick::filterEvent( m_viewerDoubleClickGate, watched, event, ui->graphicsView->viewport(),
                                       GpuDisplayWindow::activeWindow(), [this]( const QObject *target, const QPointF &pos ) { return viewerDoubleClickState( target, pos ); } ) )
@@ -21826,6 +22023,9 @@ void MainWindow::drawFrameNumberLabel( int frameIndex )
     {
         m_pFrameNumber->setText( tr( "Frame 0/0" ) );
     }
+    // PLAYER-FULLSCREEN-CONTROL-BAR-1: every presented frame reaches the shown bar here (drop-frame playback moves the
+    // slider with its signals blocked, so valueChanged alone would freeze the bar while playing). Hidden: one bool test.
+    if( m_fullscreenBarFrameFeed ) fullscreenBarFeed( frameIndex );
 }
 
 void MainWindow::updateTimeCodeLabelForFrame( int frameIndex )

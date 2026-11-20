@@ -717,6 +717,10 @@ private slots:
     void viewerCursorAutohide_positionSampleAtThePollCapSeesABriefAwayAndBack();
     void dualIsoPlaybackPolicyKeepsExplicitPreviewAndPlaybackOverrideSeparate();
     void dualIsoPatternMappingKeepsUiAndCoreConventionsAligned();
+    // PLAYER-FULLSCREEN-CONTROL-BAR-1: the CPU viewer's fullscreen control bar.
+    void fullscreenControlBar_moveShowsTheBarAndHiddenCostsNothing();
+    void fullscreenControlBar_doubleClickOnTheBarKeepsFullscreen();
+    void fullscreenControlBar_exitClickLeavesFullscreen();
     // PLAYER-DOUBLECLICK-FULLSCREEN-1
     void viewerDoubleClick_viewportTogglesOnceAndIsSwallowed();
     void viewerDoubleClick_glWindowTogglesOnce();
@@ -6193,6 +6197,211 @@ void GuiSmokeTest::viewerDoubleClick_firstPressOutsideTheViewerStartsAnUnarmedRe
         QVERIFY(!f.fullscreen.isChecked());
         QCOMPARE(f.viewport.doubleClicks, 1);
     }
+}
+
+// PLAYER-FULLSCREEN-CONTROL-BAR-1: the CPU viewer's bar widget in a fullscreen top-level, driven the way MainWindow
+// drives it: an application filter notes mouse activity on #855's idle clock and shows the bar (not for a move still
+// at the entry position), and the bar's input hook maps its events through the same fullscreen_bar policy. "view"
+// stands in for ui->graphicsView; a double-click that reaches it toggles fullscreen, as the viewer's does.
+#include "../../platform/qt/FullscreenControlBar.h"
+
+namespace
+{
+
+class FullscreenTogglingView : public QWidget
+{
+public:
+    int doubleClicks = 0;
+
+protected:
+    void mouseDoubleClickEvent(QMouseEvent *event) override
+    {
+        ++doubleClicks;
+        QWidget *top = window();
+        if (top->isFullScreen()) top->showNormal();
+        else top->showFullScreen();
+        event->accept();
+    }
+};
+
+class FullscreenBarFixture : public QObject
+{
+public:
+    FullscreenBarFixture()
+    {
+        host.resize(960, 540);
+        auto *layout = new QVBoxLayout(&host);
+        layout->setContentsMargins(0, 0, 0, 0);
+        view = new FullscreenTogglingView;
+        layout->addWidget(view);
+        viewport = new QWidget(view);
+        viewport->setMouseTracking(true);
+        bar = new FullscreenControlBarWidget(view);
+        bar->setInputHook([this](const fullscreen_bar::Layout &l, QEvent *event, const QPointF &devicePos) {
+            const QMouseEvent *mouse = dynamic_cast<const QMouseEvent *>(event);
+            const Qt::MouseButton button = mouse ? mouse->button() : Qt::NoButton;
+            const Qt::MouseButtons buttons = mouse ? mouse->buttons() : Qt::MouseButtons(Qt::NoButton);
+            switch (fullscreen_bar::onMouse(&input, event->type(), button, buttons, fullscreen_bar::hitTest(l, devicePos))) {
+            case fullscreen_bar::Action::ExitFullscreen: ++exits; host.showNormal(); break;
+            case fullscreen_bar::Action::TogglePlay: ++plays; break;
+            case fullscreen_bar::Action::Seek: lastSeek = fullscreen_bar::seekFrameAt(l, devicePos.x(), 600); break;
+            default: break;
+            }
+        });
+        clock.start();
+        qApp->installEventFilter(this);
+    }
+    ~FullscreenBarFixture() override { qApp->removeEventFilter(this); }
+
+    void enterFullscreen()
+    {
+        host.showFullScreen();
+        QVERIFY(QTest::qWaitForWindowExposed(&host));
+        QTRY_VERIFY(host.isFullScreen());
+        viewport->setGeometry(view->rect());
+        idle.setFullscreen(true, clock.elapsed());
+        entryPos = QCursor::pos();
+        sawMove = false;
+        haveLast = false;
+    }
+
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        Q_UNUSED(watched);
+        if (idle.fullscreen() && viewer_idle::eventIsActivity(event, &lastGlobal, &haveLast)) {
+            idle.noteActivity(clock.elapsed());
+            if (fullscreen_bar::activityShowsBar(event->type(), &sawMove, entryPos, QCursor::pos())) {
+                bar->setBarShown(true, clock.elapsed());
+            }
+        }
+        return QObject::eventFilter(watched, event);
+    }
+
+    // A point on a bar part, in the bar widget's own coordinates (device pixel ratio 1 in this test).
+    QPoint onPart(const QRect &deviceRect) const { return deviceRect.center() - bar->pos(); }
+
+    QWidget host;
+    FullscreenTogglingView *view = nullptr;
+    QWidget *viewport = nullptr;
+    FullscreenControlBarWidget *bar = nullptr;
+    viewer_idle::Controller idle;
+    QElapsedTimer clock;
+    QPoint entryPos;
+    bool sawMove = false;
+    QPointF lastGlobal;
+    bool haveLast = false;
+    fullscreen_bar::InputState input;
+    int exits = 0;
+    int plays = 0;
+    int lastSeek = -1;
+};
+
+void sendBarMouse(QWidget *target, QEvent::Type type, const QPoint &pos, Qt::MouseButton button = Qt::LeftButton)
+{
+    const QPointF global = target->mapToGlobal(QPointF(pos));
+    const Qt::MouseButtons buttons = (type == QEvent::MouseButtonRelease || type == QEvent::MouseMove)
+        ? Qt::MouseButtons(Qt::NoButton) : Qt::MouseButtons(button);
+    QMouseEvent event(type, QPointF(pos), global, type == QEvent::MouseMove ? Qt::NoButton : button, buttons, Qt::NoModifier);
+    QCoreApplication::sendEvent(target, &event);
+}
+
+} // namespace
+
+void GuiSmokeTest::fullscreenControlBar_moveShowsTheBarAndHiddenCostsNothing()
+{
+    FullscreenBarFixture f;
+    f.enterFullscreen();
+    QVERIFY(!f.bar->isVisible());
+
+    // Hidden: 600 feeds (one per frame of playback) neither show nor rasterise anything.
+    for (int i = 0; i < 600; ++i) {
+        fullscreen_bar::Feed feed;
+        feed.frame = i;
+        feed.totalFrames = 600;
+        feed.playing = true;
+        feed.timecode = QStringLiteral("00:00:%1").arg(i, 2, 10, QLatin1Char('0'));
+        f.bar->setFeed(feed);
+    }
+    QCoreApplication::processEvents();
+    QVERIFY(!f.bar->isVisible());
+    QCOMPARE(f.bar->presenter().rasterCount(), 0);
+    QCOMPARE(f.bar->presenter().uploadCount(), 0);
+
+    // A move still at the entry position (Windows synthesizes one) does not show it.
+    const QPoint centre = f.viewport->rect().center();
+    QCursor::setPos(f.entryPos);
+    sendBarMouse(f.viewport, QEvent::MouseMove, centre);
+    QVERIFY(!f.bar->isVisible());
+
+    // A real move shows it, at the bottom of the view, above the viewport.
+    QCursor::setPos(f.entryPos + QPoint(40, 0));
+    sendBarMouse(f.viewport, QEvent::MouseMove, centre + QPoint(40, 0));
+    QVERIFY(f.bar->isVisible());
+    const fullscreen_bar::Layout l = f.bar->viewLayout();
+    QCOMPARE(f.bar->geometry().bottom(), f.view->rect().bottom());
+    QCOMPARE(f.bar->width(), f.view->width());
+    QCOMPARE(f.bar->height(), l.bar.height());
+    QCOMPARE(f.view->childAt(QPoint(f.view->width() / 2, f.view->height() - 2)), static_cast<QWidget *>(f.bar));
+    QVERIFY(f.bar->testAttribute(Qt::WA_OpaquePaintEvent));
+
+    // Shown: the first paint rasterises once; another paint with nothing changed reuses it.
+    fullscreen_bar::Feed feed;
+    feed.totalFrames = 600;
+    feed.timecode = QStringLiteral("00:00:00:00");
+    f.bar->setFeed(feed);
+    f.bar->grab();
+    QCOMPARE(f.bar->presenter().rasterCount(), 1);
+    QCOMPARE(f.bar->presenter().uploadCount(), 1);
+    f.bar->grab();
+    QCOMPARE(f.bar->presenter().rasterCount(), 1);
+
+    // The seek column seeks.
+    sendBarMouse(f.bar, QEvent::MouseButtonPress, f.onPart(l.seek));
+    sendBarMouse(f.bar, QEvent::MouseButtonRelease, f.onPart(l.seek));
+    QVERIFY(f.lastSeek > 0 && f.lastSeek < 599);
+}
+
+void GuiSmokeTest::fullscreenControlBar_doubleClickOnTheBarKeepsFullscreen()
+{
+    FullscreenBarFixture f;
+    f.enterFullscreen();
+    QCursor::setPos(f.entryPos + QPoint(40, 0));
+    sendBarMouse(f.viewport, QEvent::MouseMove, f.viewport->rect().center());
+    QVERIFY(f.bar->isVisible());
+    const fullscreen_bar::Layout l = f.bar->viewLayout();
+
+    // On the timecode (no action), on Play, and on the bare seek column: taken by the bar, never the view's toggle.
+    for (const QRect &part : { l.timecode, l.play, l.seek }) {
+        sendBarMouse(f.bar, QEvent::MouseButtonPress, f.onPart(part));
+        sendBarMouse(f.bar, QEvent::MouseButtonRelease, f.onPart(part));
+        sendBarMouse(f.bar, QEvent::MouseButtonDblClick, f.onPart(part));
+        sendBarMouse(f.bar, QEvent::MouseButtonRelease, f.onPart(part));
+        QCoreApplication::processEvents();
+        QVERIFY(f.host.isFullScreen());
+        QCOMPARE(f.view->doubleClicks, 0);
+    }
+    QCOMPARE(f.plays, 2);   // the press and Qt's second press (the double-click) on Play
+
+    // Control: the same double-click on the view itself does toggle.
+    sendBarMouse(f.view, QEvent::MouseButtonDblClick, QPoint(f.view->width() / 2, 10));
+    QCOMPARE(f.view->doubleClicks, 1);
+    QTRY_VERIFY(!f.host.isFullScreen());
+}
+
+void GuiSmokeTest::fullscreenControlBar_exitClickLeavesFullscreen()
+{
+    FullscreenBarFixture f;
+    f.enterFullscreen();
+    QCursor::setPos(f.entryPos + QPoint(40, 0));
+    sendBarMouse(f.viewport, QEvent::MouseMove, f.viewport->rect().center());
+    QVERIFY(f.bar->isVisible());
+    const fullscreen_bar::Layout l = f.bar->viewLayout();
+    sendBarMouse(f.bar, QEvent::MouseButtonPress, f.onPart(l.exit));
+    QCOMPARE(f.exits, 1);
+    QTRY_VERIFY(!f.host.isFullScreen());
+    sendBarMouse(f.bar, QEvent::MouseButtonRelease, f.onPart(l.exit));
+    QCOMPARE(f.exits, 1);
+    QCOMPARE(f.view->doubleClicks, 0);
 }
 
 int main(int argc, char ** argv)
