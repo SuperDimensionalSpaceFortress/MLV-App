@@ -484,17 +484,77 @@ class GeneratorTests(_GeneratorCase):
         self.assertNotIn("MANIFEST_ROOT_NOT_AN_OBJECT", self.emitted())
 
     def test_an_on_job_whose_agent_root_lies_inside_an_outbox_is_refused_and_an_off_job_is_not(self) -> None:
-        # adversary A1 on 01ba7f33: the staging directory is under <AgentRoot>\work, which is only "outside every outbox" if the root is not inside one
+        # adversary A1 on 01ba7f33: the staging directory is under <AgentRoot>\work, which is only "outside every outbox" if the root is not inside one.
+        # r6: the venue-table equality check refuses these first in production; the outbox string rule is the SECOND NET, reached under -OfflineTestMode
+        # (the one seam that lets an 'on' job name a root the table does not hold).
         for label, root in (("nested", r"C:\mlvtmp\mlv-agent\outbox\nested-agent"), ("top", r"C:\outbox"), ("cased", r"C:\mlvtmp\mlv-agent\OutBox"), ("last", r"C:\mlvtmp\agent\outbox")):
             with self.subTest(root=root):
-                proc, out = self.generate(f"recon-outbox-{label}", "-GpuPlaybackRecon", "on", "-AgentRoot", root)
+                proc, out = self.generate(f"recon-outbox-{label}", "-OfflineTestMode", "-GpuPlaybackRecon", "on", "-AgentRoot", root)
                 self.refused(proc, "REFERENCE_FRAME_GPU_RECON_AGENTROOT_IN_OUTBOX")
                 self.assertFalse(out.exists(), "a refused job wrote a file")
         for label, root in (("off", r"C:\mlvtmp\mlv-agent\outbox\nested-agent"), ("neighbour", r"C:\mlvtmp\outboxes\agent")):
             with self.subTest(allowed=root):
-                extra = ("-AgentRoot", root) if label == "off" else ("-GpuPlaybackRecon", "on", "-AgentRoot", root)
+                extra = ("-AgentRoot", root) if label == "off" else ("-OfflineTestMode", "-GpuPlaybackRecon", "on", "-AgentRoot", root)
                 proc, _out = self.generate(f"recon-outbox-ok-{label}", *extra)
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    # --- r6 (hub ruling, option a): an 'on' job's agent root EQUALS the committed venue table's agentRoot ------------------------------------------
+    # Three adversary passes found three spellings of one class ("the agent root is inside an outbox": array root, outbox\nested, trailing-dot
+    # `outbox.`), because a string rule describes what a path LOOKS like and Windows has more spellings of one directory than any rule lists (trailing
+    # dot or space, 8.3 names, case). An equality check against the committed table names the one root an 'on' job may stage under, so every spelling
+    # of "somewhere else" is the same refusal and none needs its own rule.
+    NOT_VENUE_ROOT = "REFERENCE_FRAME_GPU_RECON_AGENTROOT_NOT_VENUE_ROOT"
+
+    def test_an_on_job_must_name_the_committed_venue_agent_root_whatever_the_spelling_of_the_other_root(self) -> None:
+        for label, root in (
+            ("nested", r"C:\mlvtmp\mlv-agent\outbox\nested-agent"),     # pass 7
+            ("dotcomponent", r"C:\mlvtmp\mlv-agent\outbox.\rf"),        # pass 8 (trailing-dot component)
+            ("dotlast", r"C:\mlvtmp\mlv-agent\outbox."),                # trailing dot, last component
+            ("spacecomponent", r"C:\mlvtmp\mlv-agent\outbox \rf"),      # trailing space
+            ("outboxtop", r"C:\mlvtmp\mlv-agent\outbox"),               # the outbox itself (the array-root pass's directory)
+            ("short83", r"C:\mlvtmp\mlv-agent\OUTBOX~1\rf"),            # an 8.3-shaped name
+            ("shortroot", r"C:\MLVTMP~1\mlv-agent"),                    # an 8.3 spelling of the table's own root
+            ("caseonly", r"C:\mlvtmp\MLV-AGENT"),                       # a case-only difference
+            ("subdir", r"C:\mlvtmp\mlv-agent\sub"),                     # a child of the table root
+            ("parent", "C:\\mlvtmp"),                                   # a parent of the table root
+            ("doubleslash", "C:\\mlvtmp\\\\mlv-agent"),                # a doubled separator inside
+            ("otherven", r"G:\Temp\mlv-gpu-profile\agent"),             # the OTHER venue's root, on a bachelor job
+            ("elsewhere", r"C:\elsewhere"),
+        ):
+            with self.subTest(root=root):
+                proc, out = self.generate(f"recon-notvenue-{label}", "-GpuPlaybackRecon", "on", "-AgentRoot", root)
+                self.refused(proc, self.NOT_VENUE_ROOT)
+                self.assertFalse(out.exists(), "a refused job wrote a file")
+
+    def test_an_on_job_on_the_venue_root_is_accepted_with_or_without_a_trailing_separator_and_an_off_job_names_any_root(self) -> None:
+        for label, root in (("exact", r"C:\mlvtmp\mlv-agent"), ("trailing", "C:\\mlvtmp\\mlv-agent\\"), ("trailing2", "C:\\mlvtmp\\mlv-agent\\\\")):
+            with self.subTest(root=root):
+                proc, _out = self.generate(f"recon-venue-ok-{label}", "-GpuPlaybackRecon", "on", "-AgentRoot", root)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        proc, _out = self.generate("recon-venue-ok-default", "-GpuPlaybackRecon", "on")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        ultra, _out = self.generate("recon-venue-ok-ultra", "-GpuPlaybackRecon", "on", "-Venue", "ultra-magnus", "-AgentRoot", r"G:\Temp\mlv-gpu-profile\agent")
+        self.assertEqual(ultra.returncode, 0, ultra.stdout + ultra.stderr)
+        crossed, _out = self.generate("recon-venue-crossed", "-GpuPlaybackRecon", "on", "-Venue", "ultra-magnus", "-AgentRoot", r"C:\mlvtmp\mlv-agent")
+        self.refused(crossed, self.NOT_VENUE_ROOT)
+        off, _out = self.generate("recon-venue-off", "-AgentRoot", r"C:\elsewhere")
+        self.assertEqual(off.returncode, 0, off.stdout + off.stderr)
+
+    def test_the_offline_test_seam_is_the_only_way_an_on_job_names_a_root_the_table_does_not_hold(self) -> None:
+        proc, out = self.generate("recon-seam", "-OfflineTestMode", "-GpuPlaybackRecon", "on", "-AgentRoot", r"C:\elsewhere")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("ADMISSION=offline-test", proc.stdout)
+        # the seam does not widen the second net: an outbox root is still refused under it
+        bad, _out = self.generate("recon-seam-outbox", "-OfflineTestMode", "-GpuPlaybackRecon", "on", "-AgentRoot", r"C:\elsewhere\outbox\rf")
+        self.refused(bad, "REFERENCE_FRAME_GPU_RECON_AGENTROOT_IN_OUTBOX")
+        # no new switch: the generator's own parameter block holds the one switch it had
+        text = GENERATOR.read_text(encoding="utf-8")
+        params = text[text.index("[CmdletBinding()]"):text.index("$ErrorActionPreference = 'Stop'")]
+        self.assertEqual(re.findall(r"\[switch\]\$(\w+)", params), ["OfflineTestMode"], "the seam must be the existing -OfflineTestMode, not a new switch")
+
+    def test_the_recon_equality_rule_is_documented_in_the_generator_header(self) -> None:
+        header = GENERATOR.read_text(encoding="utf-8").split("[CmdletBinding()]", 1)[0]
+        self.assertIn("REFERENCE_FRAME_GPU_RECON_AGENTROOT_NOT_VENUE_ROOT", header)
 
     def test_a_recon_value_other_than_off_or_on_is_refused_with_a_typed_code_and_no_job_is_written(self) -> None:
         for label, value in (("yes", "yes"), ("upper", "ON"), ("one", "1"), ("empty", "")):
@@ -584,9 +644,12 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
             template_root = self.tmp / f"agent-template-{len(cache)}"
             template_root.mkdir()
             out = self.tmp / f"template-{len(cache)}.job.ps1"
+            # r6: an 'on' job may only be generated for the committed venue table's agent root (and a job generated under -OfflineTestMode refuses to run),
+            # so an 'on' template takes the table's root by default and the swap below re-points the one line, exactly as it does for an 'off' template.
+            root_args = () if ("-GpuPlaybackRecon", "on") == tuple(generator_args[:2]) else ("-AgentRoot", str(template_root))
             gen = _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(GENERATOR),
                         "-SourceCommit", self.head, "-BuildManifestSha256", manifest_sha, "-ClipId", clip_id, "-RepoRoot", str(self.repo),
-                        "-OutFile", str(out), "-AgentRoot", str(template_root), *generator_args])
+                        "-OutFile", str(out), *root_args, *generator_args])
             self.assertEqual(gen.returncode, 0, gen.stdout + gen.stderr)
             cache[key] = out.read_text(encoding="utf-8")
         job, count = re.subn(r"(?m)^\$AgentRoot = '[^']*'$", lambda _m: f"$AgentRoot = '{self.agent}'", cache[key])

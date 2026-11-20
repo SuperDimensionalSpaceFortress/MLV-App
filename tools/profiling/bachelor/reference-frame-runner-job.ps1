@@ -74,7 +74,9 @@
 # canonical output-budget gate. 'on' hands the capture, in the ONE -ExtraEnv hashtable beside the profile's quality mode, MLVAPP_GPU_PLAYBACK_RECON=1,
 # MLVAPP_GPU_PLAYBACK_RECON_BACKEND=cuda and MLVAPP_GPU_PLAYBACK_RECON_DLL=<the igpu_recon_cuda.dll the job deployed beside the staged exe>
 # (the names and values playback-attr-3-cuda-job.ps1 gives its speed legs). Any other value is refused (REFERENCE_FRAME_GPU_PLAYBACK_RECON_INVALID), and an
-# 'on' job whose agent root has an 'outbox' path component is refused (REFERENCE_FRAME_GPU_RECON_AGENTROOT_IN_OUTBOX): it stages under <root>\work.
+# 'on' job whose -AgentRoot is not the committed venue table's agentRoot for its -Venue is refused (REFERENCE_FRAME_GPU_RECON_AGENTROOT_NOT_VENUE_ROOT; exact ordinal
+# compare after trimming trailing '\' only; only -OfflineTestMode may name another root), because it stages under <root>\work and a root inside an outbox would be indexed.
+# A root with an 'outbox' path component stays refused as a second net (REFERENCE_FRAME_GPU_RECON_AGENTROOT_IN_OUTBOX; reachable under -OfflineTestMode only).
 # 'on' is part of the job identity (so a GPU-recon job never shares a work tree or an outbox with a CPU one) and result.json records it as
 # captureParameters.gpuPlaybackRecon. 'on' REQUESTS the GPU recon; it does not prove it ran (a venue environment that suppresses CUDA, such as
 # MLVAPP_GPU_FAULT_INJECT, or any fallback leaves the capture on the CPU), so an 'on' job accepts the capture as a candidate only when the app's own
@@ -293,6 +295,12 @@ foreach ($n in @($names.exeName, $names.reconName, $names.packageZipName, $names
 $venueEntry = $table.venues.PSObject.Properties[$Venue].Value
 if ([string]::IsNullOrWhiteSpace($AgentRoot)) { $AgentRoot = [string]$venueEntry.agentRoot }
 if ($AgentRoot -notmatch '^[A-Za-z]:\\[A-Za-z0-9 _.~\\-]+$') { throw 'REFERENCE_FRAME_AGENTROOT_INVALID -AgentRoot contains characters outside the allowlist' }
+# r6 (hub ruling, option a; adversary passes 6-8 each found another spelling of "the agent root is inside an outbox"): an 'on' job's agent root must EQUAL the committed
+# venue table's agentRoot for the venue it is for. The comparison is exact and ordinal ('-cne', so a case-only difference is refused) after trimming only trailing '\' from both
+# sides: no GetFullPath, because normalisation is what makes two spellings of one directory compare equal, and the table is the one root that is KNOWN not to be an outbox.
+# The only way to name another root is -OfflineTestMode (the existing seam; a job generated under it refuses to run on any host, so it is never evidence).
+# An 'off' job is not affected: it keeps the base's behaviour for any allowlisted root.
+if ($GpuPlaybackRecon -ceq 'on' -and -not $OfflineTestMode -and $AgentRoot.TrimEnd('\') -cne ([string]$venueEntry.agentRoot).TrimEnd('\')) { Stop-Refused 'REFERENCE_FRAME_GPU_RECON_AGENTROOT_NOT_VENUE_ROOT' }
 # r5 (adversary A1 on 01ba7f33): an 'on' job stages its capture under <AgentRoot>\work, "outside every outbox" only if the agent root is not itself inside one. A reader
 # that walks an outbox recursively would index a staging directory nested in it before the job has proven the recon, so that root is refused for an 'on' job.
 if ($GpuPlaybackRecon -ceq 'on' -and $AgentRoot -match '(?i)(^|\\)outbox(\\|$)') { Stop-Refused 'REFERENCE_FRAME_GPU_RECON_AGENTROOT_IN_OUTBOX' }
