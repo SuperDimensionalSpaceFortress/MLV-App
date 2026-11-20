@@ -18,6 +18,10 @@
 # or has been unparseable for more than a writer needs (unreadable); the next waiter removes it (Request-VenueClaim reports it in .staleTickets) and the line
 # moves up. A chain that releases its claim on GATE_BUSY keeps its ticket (it does not go to the back of the line) for a bounded number of cycles
 # (Invoke-VenueChain.ps1 -TicketKeepMax); Remove-VenueTicket ends it.
+# READINESS (VENUE-FIFO-TICKET-BEFORE-PRECLAIM-1). A ticket has a phase. The caller's own request always refreshes its ticket to 'waiting' (ready). A holder that cannot take the
+# claim yet (a lease batch waiting out Bachelor's lease cooldown or 3 h budget, Invoke-VenueLeaseBatch.ps1) sets phase 'cooldown' (New-VenueTicket -Phase, Update-VenueTicket -Phase):
+# the claim goes to the oldest live ticket that is not in 'cooldown', so a waiter that is not ready keeps its place but never blocks a ready one, and when it turns ready it is again
+# ahead of every later arrival (2026-11-20: a later batch took the claim 09:25:10Z ahead of one that had waited since 08:17:03Z, because lease batches took no ticket).
 # BACK-COMPAT: the claim file, its name and its CreateNew semantics are unchanged, and Request-VenueClaim called WITHOUT -UseTicket / -Ticket is the old
 # one-shot attempt. Ticketing orders ONLY ticket holders: a legacy (ticketless) chain still takes any free claim (it can win a race against the line), and a
 # ticket holder never waits on a legacy waiter (nothing ticketless is ever in the line), so the two kinds cannot deadlock; they only share the claim.
@@ -217,7 +221,7 @@ function New-VenueTicket {
     [pscustomobject]@{ name; path; nonce; venue; runDir; ownerPid; createdUtc }
     #>
     param([Parameter(Mandatory)][string]$Venue, [Parameter(Mandatory)][string]$RunDir, [string]$Purpose = '', [ValidateRange(1, 86400)][int]$StaleAfterSec = 90,
-        [string]$ClaimDir = '', [int]$OwnerPid = $PID, $NowUtc = $null)
+        [string]$ClaimDir = '', [int]$OwnerPid = $PID, $NowUtc = $null, [ValidateSet('waiting', 'cooldown')][string]$Phase = 'waiting')
     $dir = Get-VenueTicketDir -Venue $Venue -ClaimDir $ClaimDir
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     $ownerStart = Get-VenueProcessStartUtc $OwnerPid
@@ -229,7 +233,7 @@ function New-VenueTicket {
         $fields = [ordered]@{
             schema = $script:TicketSchema; venue = $Venue; ownerPid = $OwnerPid; ownerCreatedUtc = $ownerStart.ToString('o'); host = $env:COMPUTERNAME
             runDir = $RunDir; purpose = $Purpose; createdUtc = $now.ToString('o'); heartbeatUtc = $now.ToString('o'); staleAfterSec = $StaleAfterSec
-            phase = 'waiting'; nonce = [guid]::NewGuid().ToString('N')
+            phase = $Phase; nonce = [guid]::NewGuid().ToString('N')
         }
         $bytes = ConvertTo-VenueTicketBytes $fields
         try {
@@ -386,7 +390,10 @@ function Request-VenueClaim {
     $live = @($line | Where-Object { $_.state -cne 'STALE' })
     $mine = @($live | Where-Object { $_.name -ceq $t.name })
     $position = $(if ($mine.Count -gt 0) { [int]$mine[0].position } else { 0 })
-    if ($position -ne 1) {
+    # VENUE-FIFO-TICKET-BEFORE-PRECLAIM-1: the head is the oldest live ticket that is READY. A ticket in phase 'cooldown' (its holder is waiting out Bachelor's lease cooldown or budget and
+    # cannot take the claim yet) keeps its place but never blocks a ready waiter behind it; the caller's own ticket was just refreshed to 'waiting', so it is always ready.
+    $head = @($live | Where-Object { $_.name -ceq $t.name -or [string]$_.ticket.phase -cne 'cooldown' } | Select-Object -First 1)
+    if ($head.Count -eq 0 -or $head[0].name -cne $t.name) {
         $seen = Get-VenueClaim -Venue $Venue -ClaimDir $ClaimDir
         return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $seen.claim; path = $seen.path; broken = @(); ticket = $t; queue = $live; position = $position; staleTickets = @($removed) }
     }
