@@ -664,6 +664,7 @@ static void llrawproc_gpu_playback_public_state_from_dualiso(
     out->fullres_curve = state->fullres_curve;
     out->randn05 = state->randn05;
     out->apply_dither = state->apply_dither;
+    out->lut_generation = state->lut_generation;
 }
 
 static int llrawproc_gpu_playback_dualiso_state_from_public(
@@ -698,6 +699,7 @@ static int llrawproc_gpu_playback_dualiso_state_from_public(
     out->fullres_curve = state->fullres_curve;
     out->randn05 = state->randn05;
     out->apply_dither = state->apply_dither;
+    out->lut_generation = state->lut_generation;
     return 1;
 }
 
@@ -856,6 +858,7 @@ typedef struct
     int apply_dither;
     double ev_correction;
     double dark_noise;
+    uint64_t lut_generation;   /* sol r6 B3: the contents behind the pointers above (llrpGpuPlaybackReconState_t) */
 } llrawprocGpuReconLutsKey_t;
 
 typedef struct
@@ -1451,6 +1454,11 @@ uint64_t llrpFakeGpuBackendReleaseCallsForTesting(void)
 }
 
 static igpu_recon_luts_t g_llrawproc_fake_gpu_backend_luts = {0};
+/* DUALISO-CONFIGURE-CACHE-1 test-only: what the fake "device" holds, as entry 0 of each table at its latest
+ * set_luts (0 raw2ev, 1 ev2raw, 2 mix_curve, 3 fullres_curve, 4 randn05). Entry 0 only: some fixtures pass
+ * one-element tables. A pointer compare cannot tell an in-place content change from none. */
+static int g_llrawproc_fake_gpu_backend_lut_shadow_valid[5];
+static double g_llrawproc_fake_gpu_backend_lut_shadow[5];
 
 static int llrawproc_fake_gpu_backend_set_luts(igpu_recon_backend * b,
                                                const igpu_recon_luts_t * luts)
@@ -1462,7 +1470,22 @@ static int llrawproc_fake_gpu_backend_set_luts(igpu_recon_backend * b,
     if(luts->mix_curve) g_llrawproc_fake_gpu_backend_luts.mix_curve = luts->mix_curve;
     if(luts->fullres_curve) g_llrawproc_fake_gpu_backend_luts.fullres_curve = luts->fullres_curve;
     if(luts->randn05) g_llrawproc_fake_gpu_backend_luts.randn05 = luts->randn05;
+    if(luts->raw2ev) { g_llrawproc_fake_gpu_backend_lut_shadow_valid[0] = 1; g_llrawproc_fake_gpu_backend_lut_shadow[0] = luts->raw2ev[0]; }
+    if(luts->ev2raw) { g_llrawproc_fake_gpu_backend_lut_shadow_valid[1] = 1; g_llrawproc_fake_gpu_backend_lut_shadow[1] = luts->ev2raw[0]; }
+    if(luts->mix_curve) { g_llrawproc_fake_gpu_backend_lut_shadow_valid[2] = 1; g_llrawproc_fake_gpu_backend_lut_shadow[2] = luts->mix_curve[0]; }
+    if(luts->fullres_curve) { g_llrawproc_fake_gpu_backend_lut_shadow_valid[3] = 1; g_llrawproc_fake_gpu_backend_lut_shadow[3] = luts->fullres_curve[0]; }
+    if(luts->randn05) { g_llrawproc_fake_gpu_backend_lut_shadow_valid[4] = 1; g_llrawproc_fake_gpu_backend_lut_shadow[4] = luts->randn05[0]; }
     return 0;
+}
+
+/* DUALISO-CONFIGURE-CACHE-1 test-only: entry 0 of table `which` (see above) as the fake's latest set_luts took it.
+ * Returns 0 when that table was never uploaded since the fake was installed. */
+int llrpFakeGpuBackendDeviceLutEntryForTesting(int which, double * value);
+int llrpFakeGpuBackendDeviceLutEntryForTesting(int which, double * value)
+{
+    if(which < 0 || which > 4 || !g_llrawproc_fake_gpu_backend_lut_shadow_valid[which]) return 0;
+    if(value) *value = g_llrawproc_fake_gpu_backend_lut_shadow[which];
+    return 1;
 }
 
 static void llrawproc_fake_gpu_backend_dump_blob(const char * dir, const char * name,
@@ -1885,6 +1908,8 @@ int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install)
     g_llrawproc_fake_gpu_backend_last_device_height = 0;
     memset(&g_llrawproc_fake_gpu_backend_clip, 0, sizeof(g_llrawproc_fake_gpu_backend_clip));
     memset(&g_llrawproc_fake_gpu_backend_luts, 0, sizeof(g_llrawproc_fake_gpu_backend_luts));
+    memset(g_llrawproc_fake_gpu_backend_lut_shadow_valid, 0, sizeof(g_llrawproc_fake_gpu_backend_lut_shadow_valid));
+    memset(g_llrawproc_fake_gpu_backend_lut_shadow, 0, sizeof(g_llrawproc_fake_gpu_backend_lut_shadow));
     memset(&g_llrawproc_fake_gpu_backend_last_status, 0, sizeof(g_llrawproc_fake_gpu_backend_last_status));
     g_llrawproc_fake_gpu_backend_next_token = 1;
     g_llrawproc_fake_gpu_backend_in_use_count = 0;
@@ -2777,6 +2802,7 @@ static void llrawproc_gpu_recon_luts_key_from_state(
     key->apply_dither = state->apply_dither;
     key->ev_correction = state->ev_correction;
     key->dark_noise = state->dark_noise;
+    key->lut_generation = state->lut_generation;
 }
 
 /* CUDA-RECON-DUALISO-TIMER-SPLIT-1 (adversary r1 A1): a run_backend call refused

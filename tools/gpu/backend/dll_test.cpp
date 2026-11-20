@@ -38,6 +38,7 @@
 #include <GL/gl.h>
 
 #include "igpu_recon.h"
+#include "iso_pattern_alternate.h"
 
 extern "C" {
 __declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001;
@@ -493,7 +494,11 @@ int main(int argc, char** argv)
             printf("[dll_test] set_iso_pattern: export absent (older DLL), skipped\n");
         } else {
             const int truth[4] = { clip.is_bright[0], clip.is_bright[1], clip.is_bright[2], clip.is_bright[3] };
-            const int other[4] = { truth[2], truth[3], truth[0], truth[1] };   /* the opposite phase */
+            /* The opposite phase (a half swap) when that differs from the truth; for a truth that is its own
+             * half swap (1,0,1,0 / 0,1,0,1 / 0,0,0,0 / 1,1,1,1) the complement instead. iso_pattern_alternate.h. */
+            int other[4] = { 0, 0, 0, 0 };
+            const int alt_is_half_swap = dll_test_alternate_is_half_swap(truth);
+            (void)dll_test_pick_alternate_iso_pattern(truth, other);
             const int bad[4]   = { 1, 2, 0, 0 };
             uint16_t* alt = (uint16_t*)malloc(n * sizeof(uint16_t));
             uint16_t* back = (uint16_t*)malloc(n * sizeof(uint16_t));
@@ -513,11 +518,22 @@ int main(int argc, char** argv)
             }
             const int differs = memcmp(alt, result, n * sizeof(uint16_t)) != 0;
             const int identical = memcmp(back, result, n * sizeof(uint16_t)) == 0;
-            printf("[dll_test] set_iso_pattern: opposite pattern changes output=%d  restored pattern byte-identical to set_clip result=%d\n",
-                   differs, identical);
-            if (!differs || !identical) {
+            printf("[dll_test] set_iso_pattern: alternate %d,%d,%d,%d (%s) changes output=%d  restored pattern byte-identical to set_clip result=%d\n",
+                   other[0], other[1], other[2], other[3], alt_is_half_swap ? "half swap" : "complement", differs, identical);
+            /* The restore comparison is the parity check and always counts. The "the run consumes the pattern"
+             * check needs an alternate the kernel can tell apart: a half swap always was one; the complement of a
+             * degenerate truth may produce identical pixels without the setter being at fault, so there an
+             * unchanged output is reported with its reason and not failed. */
+            if (!identical) {
                 fprintf(stderr, "[dll_test] set_iso_pattern equivalence FAILED\n");
                 return 4;
+            }
+            if (!differs) {
+                if (alt_is_half_swap) {
+                    fprintf(stderr, "[dll_test] set_iso_pattern equivalence FAILED\n");
+                    return 4;
+                }
+                printf("[dll_test] set_iso_pattern: SKIPPED the output-changes check, reason=complement-of-a-half-swap-invariant-pattern-left-the-output-unchanged\n");
             }
             free(alt);
             free(back);

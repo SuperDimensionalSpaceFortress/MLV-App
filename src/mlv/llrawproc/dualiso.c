@@ -78,6 +78,45 @@ static int g_dualiso_final_blend_probe_mode_cache = INT_MIN;
 static inline float * build_fullres_curve_float(dualiso_full20bit_scratch_t * scratch, int black);
 static inline double * build_fullres_curve_float_as_double(dualiso_full20bit_scratch_t * scratch, int black);
 
+/* DUALISO-CONFIGURE-CACHE-1 (sol r6 B3): LUT generation stamps. The GPU backend skips a LUT upload when the table
+ * pointers and levels match what it holds; a table rewritten at the same address would pass that test. Every writer of
+ * the four uploaded tables takes a fresh, process-unique stamp from here as it starts the rewrite, and
+ * dualiso_gpu_lut_generation() folds the stamps behind a recon state into state->lut_generation. The writers are:
+ *   ev_raw2ev / ev2raw_0  ensure_scratch_ev_lut (the rebuild branch)          -> scratch->ev_lut_generation
+ *   mix_curve[slot]       select_mix_curve_cache_slot (the slot is claimed)   -> scratch->mix_curve_generation[slot]
+ *   fullres curve         build_fullres_curve_float_as_double (the rebuild)   -> scratch->fullres_curve_float_as_double_generation
+ *   randn05_cache         fast_randn_init                                      -> g_dualiso_randn05_generation
+ * A new writer of any of them must stamp too. */
+static pthread_mutex_t g_dualiso_lut_stamp_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_dualiso_lut_stamp_counter = 0;
+static uint64_t g_dualiso_randn05_generation = 0;
+
+static uint64_t dualiso_next_lut_stamp(void)
+{
+    pthread_mutex_lock(&g_dualiso_lut_stamp_mutex);
+    const uint64_t stamp = ++g_dualiso_lut_stamp_counter;
+    pthread_mutex_unlock(&g_dualiso_lut_stamp_mutex);
+    return stamp;
+}
+
+/* The stamps behind a state built on `scratch` with `mix_curve` (a slot of scratch->mix_curve), folded into one value.
+ * Never 0 (0 means "the builder keeps no stamp"). */
+static uint64_t dualiso_gpu_lut_generation(const dualiso_full20bit_scratch_t * scratch, const double * mix_curve)
+{
+    uint64_t mix_stamp = 0;
+    if(!scratch) return 1;
+    for(int slot = 0; slot < DUALISO_MIX_CURVE_CACHE_SLOTS; ++slot)
+    {
+        if(mix_curve && scratch->mix_curve[slot] == mix_curve) mix_stamp = scratch->mix_curve_generation[slot];
+    }
+    uint64_t h = 1469598103934665603ull;
+    h = (h ^ scratch->ev_lut_generation) * 1099511628211ull;
+    h = (h ^ mix_stamp) * 1099511628211ull;
+    h = (h ^ scratch->fullres_curve_float_as_double_generation) * 1099511628211ull;
+    h = (h ^ g_dualiso_randn05_generation) * 1099511628211ull;
+    return h ? h : 1;
+}
+
 enum
 {
     DUALISO_GLOBAL_MIX_CURVE_CACHE_SLOTS = 4
@@ -2029,6 +2068,7 @@ static float randn05_cache[1024];
 void fast_randn_init()
 {
     int i;
+    g_dualiso_randn05_generation = dualiso_next_lut_stamp();
     for (i = 0; i < 1024; i++)
     {
         randn05_cache[i] = RANDN / 2;
@@ -2890,6 +2930,7 @@ static int ensure_scratch_ev_lut(dualiso_full20bit_scratch_t * scratch,
         || scratch->ev_lut_white != white
         || !scratch->ev_lut_float_valid)
     {
+        scratch->ev_lut_generation = dualiso_next_lut_stamp();
         build_ev2raw_lut(raw2ev, ev2raw_0, black, white);
         #pragma omp parallel for
         for (int i = 0; i < (int)DUALISO_RAW2EV_LUT_COUNT; i++)
@@ -3034,6 +3075,7 @@ static inline double * build_fullres_curve_float_as_double(dualiso_full20bit_scr
     if(!fullres_curve_fd || !fullres_curve_f) return NULL;
 
     scratch->fullres_curve_float_as_double_valid = 0;
+    scratch->fullres_curve_float_as_double_generation = dualiso_next_lut_stamp();
     #pragma omp parallel for
     for(int i = 0; i < 1<<20; i++)
     {
@@ -5735,6 +5777,7 @@ static inline double * select_mix_curve_cache_slot(dualiso_full20bit_scratch_t *
 
     scratch->mix_curve_valid[selected_slot] = 0;
     scratch->mix_curve_float_valid[selected_slot] = 0;
+    scratch->mix_curve_generation[selected_slot] = dualiso_next_lut_stamp();
     scratch->mix_curve_last_used[selected_slot] = scratch->mix_curve_use_counter;
     scratch->mix_curve_last_black[selected_slot] = black;
     scratch->mix_curve_last_white[selected_slot] = white;
@@ -6833,6 +6876,7 @@ static void dualiso_debug_publish_gpu_recon_state(int ret,
     state.fullres_curve = fullres_curve;
     state.randn05 = final_blend_fused_to_16bit ? randn05_cache : NULL;
     state.apply_dither = final_blend_fused_to_16bit != 0;
+    state.lut_generation = dualiso_gpu_lut_generation(scratch, mix_curve);
 
     g_dualiso_last_gpu_recon_state = state;
 }
@@ -7438,6 +7482,7 @@ int diso_prepare_gpu_recon_state(struct raw_info raw_info,
     state->fullres_curve = fullres_curve;
     state->apply_dither = dualiso_final_blend_will_fuse_to_16bit(fullres_mesh_guard);
     state->randn05 = state->apply_dither ? randn05_cache : NULL;
+    state->lut_generation = dualiso_gpu_lut_generation(scratch, mix_curve);
 
     g_dualiso_full20bit_timing.valid = 1;
     DUALISO_GPU_PREP_RETURN(1);

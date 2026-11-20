@@ -670,3 +670,186 @@ TEST(DualIsoGpuConfigureCache, TheFirstFrameAfterADeviceLossIsAFullSetClipSetLut
         ASSERT_EQ(0, lastFlag);
     }
 }
+
+// ---- LUT contents that change in place (sol r6 B3) -------------------------------------------------------------
+// The cache key holds the LUT POINTERS, so a table rewritten at the same address was invisible to it, and a frame
+// that also moved the ISO pattern skipped an upload the pre-cache code made. The state now carries lut_generation,
+// which every writer of those tables changes; the backend uploads again when it moves.
+
+extern "C" int llrpFakeGpuBackendDeviceLutEntryForTesting(int which, double * value);
+
+#include "../../tools/gpu/backend/iso_pattern_alternate.h"
+
+namespace
+{
+
+const char * const kLutNames[5] = { "raw2ev", "ev2raw", "mix_curve", "fullres_curve", "randn05" };
+
+llrpGpuPlaybackReconState_t stateOnLive(ConfigureLuts & live, uint64_t frame, uint64_t generation)
+{
+    llrpGpuPlaybackReconState_t s = configureState(frame);
+    s.raw2ev = live.raw2ev;
+    s.ev2raw = live.ev2raw;
+    s.mix_curve = live.mix;
+    s.fullres_curve = live.fullres;
+    s.randn05 = live.randn;
+    s.lut_generation = generation;
+    return s;
+}
+
+void rewriteInPlace(ConfigureLuts & live, int which)
+{
+    switch (which)
+    {
+    case 0: live.raw2ev[0] = 11; break;
+    case 1: live.ev2raw[0] = 12; break;
+    case 2: live.mix[0] = 0.5; break;
+    case 3: live.fullres[0] = 0.25; break;
+    case 4: live.randn[0] = 0.125f; break;
+    }
+}
+
+double expectedEntry(int which)
+{
+    static const double v[5] = { 11.0, 12.0, 0.5, 0.25, 0.125 };
+    return v[which];
+}
+
+// One key row: table `which` rewritten at the same address while the ISO pattern moves.
+void inPlaceLutChangeRow(int which)
+{
+    std::printf("[dualiso-configure-cache] in-place rewrite of %s with a pattern change\n", kLutNames[which]);
+    FakeBackendScope scope;
+    ConfigureLuts live;
+    int ok = 0;
+    (void)configureWorkOf(stateOnLive(live, 1, 7), &ok);
+    ASSERT_EQ(1, ok);
+    double before = -1.0;
+    ASSERT_EQ(1, llrpFakeGpuBackendDeviceLutEntryForTesting(which, &before));
+    ASSERT_EQ(0.0, before);
+
+    // the control: the pattern moves, nothing was rewritten -> still no upload (INV-1 stays)
+    llrpGpuPlaybackReconState_t moved = stateOnLive(live, 2, 7);
+    setPattern(moved, 1, 0, 0, 1);
+    Counts d = configureWorkOf(moved, &ok);
+    ASSERT_EQ(1, ok);
+    ASSERT_EQ(0u, d.setClip);
+    ASSERT_EQ(0u, d.setLuts);
+
+    // the writer rewrites the table in place and stamps the state; the pattern moves back in the same frame
+    rewriteInPlace(live, which);
+    llrpGpuPlaybackReconState_t s = stateOnLive(live, 3, 8);
+    setPattern(s, 1, 1, 0, 0);
+    d = configureWorkOf(s, &ok);
+    ASSERT_EQ(1, ok);
+    ASSERT_EQ(0u, d.setClip);
+    ASSERT_EQ(1u, d.setLuts);
+    double after = -1.0;
+    ASSERT_EQ(1, llrpFakeGpuBackendDeviceLutEntryForTesting(which, &after));
+    ASSERT_EQ(expectedEntry(which), after);
+
+    // and the next frame under the same stamp is quiet again
+    d = configureWorkOf(stateOnLive(live, 4, 8), &ok);
+    ASSERT_EQ(1, ok);
+    ASSERT_EQ(0u, d.setClip);
+    ASSERT_EQ(0u, d.setLuts);
+}
+
+} // namespace
+
+TEST(DualIsoGpuConfigureCache, AnInPlaceRewriteOfRaw2evWithAPatternChangeUploadsTheNewContents)
+{
+    inPlaceLutChangeRow(0);
+}
+
+TEST(DualIsoGpuConfigureCache, AnInPlaceRewriteOfEv2rawWithAPatternChangeUploadsTheNewContents)
+{
+    inPlaceLutChangeRow(1);
+}
+
+TEST(DualIsoGpuConfigureCache, AnInPlaceRewriteOfTheMixCurveWithAPatternChangeUploadsTheNewContents)
+{
+    inPlaceLutChangeRow(2);
+}
+
+TEST(DualIsoGpuConfigureCache, AnInPlaceRewriteOfTheFullresCurveWithAPatternChangeUploadsTheNewContents)
+{
+    inPlaceLutChangeRow(3);
+}
+
+TEST(DualIsoGpuConfigureCache, AnInPlaceRewriteOfRandn05WithAPatternChangeUploadsTheNewContents)
+{
+    inPlaceLutChangeRow(4);
+}
+
+// A rewrite with no pattern change is the same key row: the stamp alone forces one set_luts and no set_clip.
+TEST(DualIsoGpuConfigureCache, AnInPlaceRewriteWithoutAPatternChangeAlsoUploadsTheNewContents)
+{
+    FakeBackendScope scope;
+    ConfigureLuts live;
+    int ok = 0;
+    (void)configureWorkOf(stateOnLive(live, 1, 7), &ok);
+    ASSERT_EQ(1, ok);
+    for (int which = 0; which < 5; ++which)
+    {
+        rewriteInPlace(live, which);
+        const Counts d = configureWorkOf(stateOnLive(live, uint64_t(2 + which), uint64_t(8 + which)), &ok);
+        ASSERT_EQ(1, ok);
+        ASSERT_EQ(0u, d.setClip);
+        ASSERT_EQ(1u, d.setLuts);
+        double after = -1.0;
+        ASSERT_EQ(1, llrpFakeGpuBackendDeviceLutEntryForTesting(which, &after));
+        ASSERT_EQ(expectedEntry(which), after);
+    }
+}
+
+// ---- the DLL harness's alternate pattern (sol r6 B1) ------------------------------------------------------------
+// dll_test.cpp feeds igpu_recon_set_iso_pattern an alternate pattern and expects the output to change. For a truth
+// pattern that equals its own half-swap (1,0,1,0 / 0,1,0,1 / 0,0,0,0 / 1,1,1,1) the alternate was the truth itself,
+// the output could not differ, and a correct backend was failed. Every binary pattern must get an alternate that
+// differs from it.
+namespace
+{
+
+int alternateDiffers(int a, int b, int c, int d)
+{
+    const int truth[4] = { a, b, c, d };
+    int other[4] = { -1, -1, -1, -1 };
+    const int differs = dll_test_pick_alternate_iso_pattern(truth, other);
+    const int reallyDiffers = (other[0] != truth[0] || other[1] != truth[1] || other[2] != truth[2]
+                               || other[3] != truth[3]) ? 1 : 0;
+    std::printf("[dualiso-configure-cache] harness alternate for %d,%d,%d,%d is %d,%d,%d,%d (reports differs=%d)\n",
+                a, b, c, d, other[0], other[1], other[2], other[3], differs);
+    // the helper must tell the truth about what it picked, and what it picked must be a binary pattern
+    for (int k = 0; k < 4; ++k) ASSERT_TRUE(other[k] == 0 || other[k] == 1);
+    ASSERT_EQ(reallyDiffers, differs);
+    return reallyDiffers;
+}
+
+} // namespace
+
+TEST(DualIsoGpuConfigureCache, TheHarnessAlternateDiffersFromTheTruthForTheAlternatingPattern1010)
+{
+    ASSERT_EQ(1, alternateDiffers(1, 0, 1, 0));
+}
+
+TEST(DualIsoGpuConfigureCache, TheHarnessAlternateDiffersFromTheTruthForTheAlternatingPattern0101)
+{
+    ASSERT_EQ(1, alternateDiffers(0, 1, 0, 1));
+}
+
+TEST(DualIsoGpuConfigureCache, TheHarnessAlternateDiffersFromTheTruthForTheUniformPattern1111)
+{
+    ASSERT_EQ(1, alternateDiffers(1, 1, 1, 1));
+}
+
+TEST(DualIsoGpuConfigureCache, TheHarnessAlternateDiffersFromTheTruthForTheUniformPattern0000)
+{
+    ASSERT_EQ(1, alternateDiffers(0, 0, 0, 0));
+}
+
+TEST(DualIsoGpuConfigureCache, TheHarnessAlternateDiffersFromTheTruthForEveryBinaryPattern)
+{
+    for (int m = 0; m < 16; ++m)
+        ASSERT_EQ(1, alternateDiffers(m & 1, (m >> 1) & 1, (m >> 2) & 1, (m >> 3) & 1));
+}

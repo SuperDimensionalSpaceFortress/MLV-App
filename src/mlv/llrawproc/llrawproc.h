@@ -125,6 +125,11 @@ typedef struct
      * bridged the two and left async H2D permanently disarmed. See
      * .claude-state/project-memory/async-h2d-frameid-crosses-a-subsystem-boundary-20260905.md. */
     uint64_t frame_id;
+    /* DUALISO-CONFIGURE-CACHE-1 (sol r6 B3): a stamp that changes whenever the CONTENTS behind raw2ev, ev2raw,
+     * mix_curve or fullres_curve are rewritten. The backend skips a LUT upload only when pointers, levels and this
+     * stamp all match; a writer that rewrites a table in place MUST give the state a new stamp. 0 = the builder
+     * keeps no stamp (its tables are immutable while referenced), so only the pointers distinguish them. */
+    uint64_t lut_generation;
 } llrpGpuPlaybackReconState_t;
 
 typedef struct
