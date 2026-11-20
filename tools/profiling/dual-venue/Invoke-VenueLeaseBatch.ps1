@@ -94,9 +94,6 @@
 #         hashing to the manifest's digests (-VerifyArtifacts; BUILD_ARTIFACT_MISSING / BUILD_ARTIFACT_MISMATCH). One bad item refuses the whole plan on stderr,
 #         BATCH_USAGE LEG_PLAN_REFUSED reason=<BAD_ITEM_SHAPE | BAD_SOURCE_COMMIT | BAD_MANIFEST_SHA256 | BAD_BACKEND | BAD_ARM | LEG_SPEC_MISSING | BUILD_NOT_STAGED |
 #         BUILD_MANIFEST_MISMATCH | BUILD_ARTIFACT_MISSING | BUILD_ARTIFACT_MISMATCH | SHARE_UNREACHABLE | LEG_SPEC_INVALID | BAD_PURPOSE | FPS_AB_HEAVY_ARM | FPS_AB_UNKNOWN_ARM> item=<n> (or LEG_PLAN_UNREADABLE | LEG_PLAN_INVALID), exit 2: nothing is submitted, so no lease ever fails
-#         BENCH-LIGHT-ARM-GAIN-GATES-1: the plan object may declare "purpose": "fps-ab" (its legs are compared on presented fps) or "stage-attribution" (stage metrics only). An fps-ab plan is refused
-#         FPS_AB_HEAVY_ARM when any leg's spec runs the HEAVY telemetry arm (generatorArgs.telemetryArm; a HEAVY leg's fps measures the per-frame logger) and FPS_AB_UNKNOWN_ARM when a spec names
-#         no arm; any other purpose is BAD_PURPOSE. leg-plan.json records the purpose and each leg's derived telemetryArm (tools\profiling\FpsArmGate.psm1).
 #         halfway on a build. A spec that is not a mlv-app/dual-venue-leg/v1 spec, does not list the item's backend, or has a field Invoke-VenueLeg casts or validates
 #         (playSeconds, visualCapture and its opt-out reason, scaleFactor, acceptedEffectiveScale) it would throw on, is refused here (LEG_SPEC_INVALID, BAD_BACKEND)
 #         because Invoke-VenueLeg would throw on it only after the lease is open.
@@ -115,6 +112,9 @@
 #         given up on, goes to stderr only: showing batch.log is no input would read the inputs again with no bound. Each read keeps its 30 s, and the claim, gate and open checks refuse on their first as before; only the claim check that follows an unfinished pass is cut to the deadline.
 #         A SHARE_UNREACHABLE from any of these checks says guardReads(sec): what each read took ('+' = still running when given up on; start = the worker's own start, nothing read yet) and
 #         claimWaitBefore=yes|no (waitedSec: first denied poll to the grant, or to now while still denied).
+#         BENCH-LIGHT-ARM-GAIN-GATES-1: the plan object may declare "purpose": "fps-ab" (its legs are compared on presented fps) or "stage-attribution" (stage metrics only). An fps-ab plan is refused
+#         FPS_AB_HEAVY_ARM when any leg's spec runs the HEAVY telemetry arm (generatorArgs.telemetryArm; a HEAVY leg's fps measures the per-frame logger) and FPS_AB_UNKNOWN_ARM when a spec names
+#         no arm; any other purpose is BAD_PURPOSE. leg-plan.json records the purpose and each leg's derived telemetryArm (tools\profiling\FpsArmGate.psm1).
 #      b. The legs run in plan order (-PlanOrder AsGiven), or with the arms INTERLEAVED, A B A B (-PlanOrder Interleave, Get-VenueInterleavedLegPlan), so lease
 #         position and venue heat fall on every arm alike. Per-leg budget, re-check, claim loss and deadline handling are the scalar form's, leg by leg.
 #      c. Each leg process gets its own -SourceCommit / -BuildManifestSha256 / -Backend; each batch leg row and run result carries name, arm, backend, sourceCommit

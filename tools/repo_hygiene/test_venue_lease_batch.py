@@ -3560,6 +3560,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # the validated, ordered plan is kept beside the receipts
         kept = json.loads((self.run_dir / "leg-plan.json").read_text(encoding="utf-8"))
         self.assertEqual([x["arm"] for x in kept["legs"]], ["A", "B", "A", "B"])
+        # BENCH-LIGHT-ARM-GAIN-GATES-1: every leg states its derived telemetry arm (these fixture specs name none: UNKNOWN) and the plan its purpose (undeclared: null)
+        self.assertEqual([x["telemetryArm"] for x in kept["legs"]], ["UNKNOWN"] * 4)
+        self.assertIsNone(kept["purpose"])
         self.assertEqual(sorted((s["sourceCommit"], s["state"]) for s in kept["builds"]), [(a, "STAGED"), (b, "STAGED")])
 
     def test_the_plan_runs_as_given_without_the_interleave_option(self) -> None:

@@ -101,6 +101,11 @@ class ArmClassifierTests(_Probe):
     def arm(self, expr: str) -> str:
         return self.ok(f"Write-Host ('ARM=' + ({expr}).arm)").strip()
 
+    def arms(self, exprs: list[str]) -> list[str]:
+        # one pwsh launch for many cases (each launch costs a second or more on a shared host and the shard budget counts it)
+        body = "".join(f"Write-Host ('ARM=' + ({e}).arm)\n" for e in exprs)
+        return self.ok(body).split()
+
     def test_heavy_switch_spec_is_heavy(self) -> None:
         self.assertEqual(self.arm(f"Get-FpsArmFromLegSpec ({SPEC_HEAVY})"), "ARM=HEAVY")
 
@@ -109,16 +114,13 @@ class ArmClassifierTests(_Probe):
 
     def test_spec_missing_the_inputs_is_unknown(self) -> None:
         # the generator's own default for an absent telemetryArm is HEAVY (playback-attr-3-cuda-job.ps1 -TelemetryArm), which is not proof of LIGHT either
-        for expr in (SPEC_NO_ARM, "[pscustomobject]@{ legType = 'speed' }", "[pscustomobject]@{ }", "$null",
-                     "[pscustomobject]@{ legType = 'export'; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' } }"):
-            with self.subTest(spec=expr):
-                self.assertEqual(self.arm(f"Get-FpsArmFromLegSpec ({expr})"), "ARM=UNKNOWN")
+        specs = (SPEC_NO_ARM, "[pscustomobject]@{ legType = 'speed' }", "[pscustomobject]@{ }", "$null",
+                 "[pscustomobject]@{ legType = 'export'; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' } }")
+        self.assertEqual(self.arms([f"Get-FpsArmFromLegSpec ({s})" for s in specs]), ["ARM=UNKNOWN"] * len(specs))
 
     def test_a_malformed_arm_value_is_unknown(self) -> None:
-        for value in ("light", "MEDIUM", "", "LIGHT "):
-            with self.subTest(value=value):
-                spec = f"[pscustomobject]@{{ legType = 'speed'; generatorArgs = [pscustomobject]@{{ telemetryArm = '{value}' }} }}"
-                self.assertEqual(self.arm(f"Get-FpsArmFromLegSpec ({spec})"), "ARM=UNKNOWN")
+        specs = [f"[pscustomobject]@{{ legType = 'speed'; generatorArgs = [pscustomobject]@{{ telemetryArm = '{v}' }} }}" for v in ("light", "MEDIUM", "", "LIGHT ")]
+        self.assertEqual(self.arms([f"Get-FpsArmFromLegSpec ({s})" for s in specs]), ["ARM=UNKNOWN"] * len(specs))
 
     def test_the_committed_spec_corpus_classifies_by_its_own_field(self) -> None:
         specs = sorted(LEGS_DIR.glob("*.json"))
@@ -164,9 +166,8 @@ class ArmClassifierTests(_Probe):
             "[pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1' }": "HEAVY",
             "[ordered]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = 'true' }": "LIGHT",
         }
-        for expr, want in cases.items():
-            with self.subTest(env=expr):
-                self.assertEqual(self.arm(f"Get-FpsArmFromEnvironment ({expr})"), f"ARM={want}")
+        got = self.arms([f"Get-FpsArmFromEnvironment ({expr})" for expr in cases])
+        self.assertEqual(dict(zip(cases, got)), {expr: f"ARM={want}" for expr, want in cases.items()})
 
 
 @requires_pwsh
@@ -176,6 +177,10 @@ class PairVerdictTests(_Probe):
     def verdict(self, baseline: str, candidate: str) -> dict:
         out = self.ok(f"$v = Get-FpsPairVerdict -Baseline {baseline} -Candidate {candidate}\n$v | ConvertTo-Json -Compress")
         return json.loads(out.strip().splitlines()[-1])
+
+    def verdicts(self, pairs: list[tuple[str, str]]) -> list[dict]:
+        body = "".join(f"(Get-FpsPairVerdict -Baseline {b} -Candidate {c}) | ConvertTo-Json -Compress\n" for b, c in pairs)
+        return [json.loads(line) for line in self.ok(body).splitlines() if line.startswith("{")]
 
     def test_two_light_legs_are_allowed(self) -> None:
         v = self.verdict("'LIGHT'", "'LIGHT'")
@@ -189,20 +194,16 @@ class PairVerdictTests(_Probe):
         self.assertTrue(v["stageMetricsAllowed"])
 
     def test_a_mixed_light_heavy_pair_is_refused_either_way_round(self) -> None:
-        for b, c in (("'LIGHT'", "'HEAVY'"), ("'HEAVY'", "'LIGHT'")):
-            with self.subTest(baseline=b, candidate=c):
-                v = self.verdict(b, c)
-                self.assertFalse(v["allowed"])
-                self.assertEqual(v["reason"], HEAVY_REASON)
-                self.assertIn("mixed", v["detail"])
-                self.assertTrue(v["stageMetricsAllowed"])
+        for v in self.verdicts([("'LIGHT'", "'HEAVY'"), ("'HEAVY'", "'LIGHT'")]):
+            self.assertFalse(v["allowed"])
+            self.assertEqual(v["reason"], HEAVY_REASON)
+            self.assertIn("mixed", v["detail"])
+            self.assertTrue(v["stageMetricsAllowed"])
 
     def test_an_unknown_leg_is_refused_like_heavy(self) -> None:
-        for b, c in (("'LIGHT'", "$null"), ("$null", "'LIGHT'"), ("'LIGHT'", "'light'"), ("'UNKNOWN'", "'UNKNOWN'")):
-            with self.subTest(baseline=b, candidate=c):
-                v = self.verdict(b, c)
-                self.assertFalse(v["allowed"])
-                self.assertEqual(v["reason"], UNKNOWN_REASON)
+        for v in self.verdicts([("'LIGHT'", "$null"), ("$null", "'LIGHT'"), ("'LIGHT'", "'light'"), ("'UNKNOWN'", "'UNKNOWN'")]):
+            self.assertFalse(v["allowed"])
+            self.assertEqual(v["reason"], UNKNOWN_REASON)
 
     def test_heavy_outranks_unknown_in_the_typed_reason(self) -> None:
         self.assertEqual(self.verdict("'HEAVY'", "$null")["reason"], HEAVY_REASON)
