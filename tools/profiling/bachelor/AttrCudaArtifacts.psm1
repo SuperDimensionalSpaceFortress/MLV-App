@@ -5062,10 +5062,17 @@ function Get-AttrCudaProcessTreeSnapshot {
     scan throws, the root is not in it, or a row whose parent is a member has no readable pid or creation time. Never throws.
     -Processes is the test seam: the rows of the scan (ProcessId, ParentProcessId, CreationDate).
     #>
-    param([Parameter(Mandatory = $true)][int]$RootProcessId, [object[]]$Processes, [ValidateRange(1, 120)][int]$OperationTimeoutSec = 20)
+    param([Parameter(Mandatory = $true)][int]$RootProcessId, [object[]]$Processes, [ValidateRange(1, 120)][int]$OperationTimeoutSec = 20, [int64]$NowTicks)
     $unknown = { param([string]$Why) [pscustomobject]@{ ok = $false; rootProcessId = [int64]$RootProcessId; rootCreationTicks = $null; members = @(); error = $Why } }
     try {
         $rows = if ($PSBoundParameters.ContainsKey('Processes')) { @($Processes) } else { @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec $OperationTimeoutSec -ErrorAction Stop) }
+        # r5b fix (adversary A1 on 2420b65f): a creation time AHEAD of the clock (beyond 10 s of skew) proves the clock was stepped back after that process started, so the
+        # creation-time ordering the orphan classification below relies on is untrustworthy: the tree is unknown (fail closed), never classified by a rolled-back clock.
+        # -NowTicks is the test seam; the check is inline because VenueChain and DualVenueRunner embed this function alone, by name.
+        $nowTicks = $(if ($PSBoundParameters.ContainsKey('NowTicks')) { [int64]$NowTicks } else { [datetime]::UtcNow.Ticks })
+        foreach ($row in $rows) {
+            if ($null -ne $row -and $null -ne $row.CreationDate -and ([datetime]$row.CreationDate).ToUniversalTime().Ticks -gt ($nowTicks + 100000000L)) { return (& $unknown "clock-stepped-back pid=$($row.ProcessId)") }
+        }
         $byParent = @{}
         $rootTicks = $null
         foreach ($row in $rows) {
@@ -5158,16 +5165,18 @@ function Wait-AttrCudaProcessTreeGone {
     [pscustomobject]@{ confirmed; survivors; error }: confirmed is $true only when the snapshot's ok is the boolean $true and a scan that ended inside -WaitMs showed
     no survivor. Anything else is $false (fail closed). Never throws. -Scan is the test seam: a scriptblock returning the rows of one scan.
     #>
-    param([Parameter(Mandatory = $true)][AllowNull()]$Snapshot, [ValidateRange(0, 600000)][int]$WaitMs = 15000, [scriptblock]$Scan)
+    param([Parameter(Mandatory = $true)][AllowNull()]$Snapshot, [ValidateRange(0, 600000)][int]$WaitMs = 15000, [scriptblock]$Scan, [int64]$NowTicks)
     # r3 fix 2 (adversary A2 advisory on 6b788356): every snapshot field is read through PSObject.Properties, so a snapshot missing one (under strict mode) is an
-    # unknown tree, never a throw.
+    # unknown tree, never a throw. r5b fix (adversary A4 on 2420b65f): a property getter that throws is read inside the same guard.
     $snapProps = $null
-    if ($null -ne $Snapshot) { $snapProps = $Snapshot.PSObject.Properties }
-    $snapOk = ($null -ne $snapProps) -and ($null -ne $snapProps['ok']) -and ($snapProps['ok'].Value -is [bool]) -and [bool]$snapProps['ok'].Value
-    if (-not $snapOk -or $null -eq $snapProps['rootProcessId'] -or $null -eq $snapProps['rootProcessId'].Value -or $null -eq $snapProps['rootCreationTicks'] -or $null -eq $snapProps['rootCreationTicks'].Value) {
-        $why = $(if ($null -eq $Snapshot) { 'no snapshot' } elseif ($null -ne $snapProps -and $null -ne $snapProps['error']) { [string]$snapProps['error'].Value } else { 'snapshot fields missing' })
-        return [pscustomobject]@{ confirmed = $false; survivors = @(); error = "tree-unknown: $why" }
-    }
+    try {
+        if ($null -ne $Snapshot) { $snapProps = $Snapshot.PSObject.Properties }
+        $snapOk = ($null -ne $snapProps) -and ($null -ne $snapProps['ok']) -and ($snapProps['ok'].Value -is [bool]) -and [bool]$snapProps['ok'].Value
+        if (-not $snapOk -or $null -eq $snapProps['rootProcessId'] -or $null -eq $snapProps['rootProcessId'].Value -or $null -eq $snapProps['rootCreationTicks'] -or $null -eq $snapProps['rootCreationTicks'].Value) {
+            $why = $(if ($null -eq $Snapshot) { 'no snapshot' } elseif ($null -ne $snapProps -and $null -ne $snapProps['error']) { [string]$snapProps['error'].Value } else { 'snapshot fields missing' })
+            return [pscustomobject]@{ confirmed = $false; survivors = @(); error = "tree-unknown: $why" }
+        }
+    } catch { return [pscustomobject]@{ confirmed = $false; survivors = @(); error = "tree-unknown: unreadable snapshot" } }
     # r1 fix 2 (adversary A3 advisory on 348c4357): a snapshot whose identities do not convert is an unknown tree, never a throw.
     $recorded = @{}
     $known = @{}
@@ -5188,6 +5197,14 @@ function Wait-AttrCudaProcessTreeGone {
         try {
             $leftSec = [int][Math]::Max(1, [Math]::Floor(($WaitMs - $clock.ElapsedMilliseconds) / 1000.0))
             $rows = if ($null -ne $Scan) { @(& $Scan) } else { @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec $leftSec -ErrorAction Stop) }
+            # r5b fix (adversary A2 on 2420b65f): a creation time AHEAD of the clock (beyond 10 s of skew) proves the clock was stepped back after that process started; the
+            # creation-time ordering of the climb below is then untrustworthy, so the kill is UNCONFIRMED (fail closed), whatever the other rows show.
+            $nowTicks = $(if ($PSBoundParameters.ContainsKey('NowTicks')) { [int64]$NowTicks } else { [datetime]::UtcNow.Ticks })
+            foreach ($futureRow in $rows) {
+                if ($null -ne $futureRow -and $null -ne $futureRow.CreationDate -and ([datetime]$futureRow.CreationDate).ToUniversalTime().Ticks -gt ($nowTicks + 100000000L)) {
+                    return [pscustomobject]@{ confirmed = $false; survivors = @($survivors); error = "clock-stepped-back pid=$($futureRow.ProcessId)" }
+                }
+            }
             $byParent = @{}
             $rowTicks = @{}
             $rowParent = @{}

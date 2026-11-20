@@ -2447,6 +2447,38 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         self.assertFalse(got["noErr"], got)
         self.assertIn("tree-unknown", got["noErrWhy"])
 
+    def test_r5b_a_clock_stepped_back_makes_the_tree_unknown_and_the_kill_unconfirmed(self) -> None:
+        """r5b, adversary A1 and A2 on 2420b65f, plus advisory A4. A1: the clock is stepped back an hour after the root (T) and member 201 started, and a pre-snapshot
+        orphan 203 (parent 202 already gone) reads OLDER than the root; the old code classified it as an outsider and confirmed the kill while it lived. A creation time
+        ahead of the clock proves the step, so the snapshot is unknown. A2: the same on the wait side, with a reused parent pid. Controls: a normal clock, and a skew
+        inside the 10 s tolerance, change nothing. A4: a snapshot whose property getter throws is an unknown tree, never a throw."""
+        got = self.snapshot_and_wait(
+            "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
+            "$rows = @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 203 202 $t.AddHours(-1).AddSeconds(4)), (Row 600 4 $t.AddHours(-2))))\n"
+            "$back = $t.AddHours(-1).AddMinutes(10).Ticks\n"
+            "$a1 = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes $rows -NowTicks $back\n"
+            "$a1Control = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes $rows -NowTicks $t.AddMinutes(5).Ticks\n"
+            "$skew = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes $rows -NowTicks $t.AddSeconds(-5).Ticks\n"
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 600 4 $t.AddHours(-2)))) -NowTicks $t.AddMinutes(5).Ticks\n"
+            "$scan = { @($sys + @((Row 600 4 $t.AddHours(-2)), (Row 202 600 $t.AddMinutes(-1)), (Row 203 202 $t.AddSeconds(4)))) }\n"
+            "$a2 = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan $scan -NowTicks $t.AddMinutes(-1).AddSeconds(30).Ticks\n"
+            "$a2Control = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 201 100 $t.AddSeconds(1)))) } -NowTicks $t.AddMinutes(5).Ticks\n"
+            "$getter = [pscustomobject]@{ rootProcessId = 100; rootCreationTicks = 1; members = @(); error = $null }\n"
+            "Add-Member -InputObject $getter -MemberType ScriptProperty -Name ok -Value { throw 'snapshot getter failed' }\n"
+            "$a4 = Wait-AttrCudaProcessTreeGone -Snapshot $getter -WaitMs 1200 -Scan { @() }\n"
+            "[ordered]@{ a1 = $a1.ok; a1Why = $a1.error; a1Control = $a1Control.ok; skew = $skew.ok; a2 = $a2.confirmed; a2Why = $a2.error; a2Control = $a2Control.confirmed;\n"
+            "            a2ControlSurvivors = @($a2Control.survivors); a4 = $a4.confirmed; a4Why = $a4.error } | ConvertTo-Json -Compress")
+        self.assertFalse(got["a1"], f"a creation time ahead of the clock means a stepped-back clock: the tree is unknown: {got}")
+        self.assertIn("clock-stepped-back", got["a1Why"], got)
+        self.assertTrue(got["a1Control"], f"a normal clock changes nothing: {got}")
+        self.assertTrue(got["skew"], f"a skew inside the 10 s tolerance is not a step: {got}")
+        self.assertFalse(got["a2"], f"a live descendant is never confirmed gone on a stepped-back clock: {got}")
+        self.assertIn("clock-stepped-back", got["a2Why"], got)
+        self.assertFalse(got["a2Control"], f"a normal clock still names the live recorded member 201 as a survivor: {got}")
+        self.assertEqual(got["a2ControlSurvivors"], [201], got)
+        self.assertFalse(got["a4"], got)
+        self.assertIn("tree-unknown", got["a4Why"], got)
+
     def test_r3_a_new_child_on_a_reused_member_pid_is_a_survivor(self) -> None:
         """r3, adversary A2 on 4d69f211. Old member 201 exits; the root starts a NEW child that reuses pid 201 (another creation time). It is not the recorded identity,
         but its parent is the root, so the walk adopts it: identity is (pid, creation time), and a recorded pid number never hides a new process."""
