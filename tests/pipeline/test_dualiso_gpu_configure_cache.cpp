@@ -18,6 +18,8 @@
 
 extern "C" int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install);
 extern "C" int llrpResetGpuExportBackendForTesting(void);
+extern "C" int llrpSetFakeGpuBackendIsoPatternSymbolForTesting(int present);
+extern "C" void llrpFakeGpuBackendIsoPatternStateForTesting(uint64_t * set_calls, int * last_run_is_bright4);
 extern "C" void llrpFakeGpuBackendReducedIsoNotchStateForTesting(int * last_run_flag,
                                                                  uint64_t * runs_with_notch,
                                                                  uint64_t * runs_without_notch,
@@ -144,7 +146,7 @@ TEST(DualIsoGpuConfigureCache, AMovingIsoPatternDoesNotReuploadTheLuts)
 {
     FakeBackendScope scope;
     int ok = 0;
-    ASSERT_EQ(0u, configureWorkOf(configureState(1), &ok).setClip - 1u);
+    (void)configureWorkOf(configureState(1), &ok);
     ASSERT_EQ(1, ok);
     for (int i = 0; i < 6; ++i)
     {
@@ -247,4 +249,138 @@ TEST(DualIsoGpuConfigureCache, ARecreatedBackendIsConfiguredInFullAgain)
     ASSERT_EQ(1, ok);
     ASSERT_EQ(1u, d.setClip);
     ASSERT_EQ(1u, d.setLuts);
+}
+
+// ---- the pattern-only configure (igpu_recon_set_iso_pattern) --------------------------------------------------
+
+namespace
+{
+
+void setPattern(llrpGpuPlaybackReconState_t & s, int a, int b, int c, int d)
+{
+    s.is_bright[0] = a;
+    s.is_bright[1] = b;
+    s.is_bright[2] = c;
+    s.is_bright[3] = d;
+}
+
+struct PatternState
+{
+    uint64_t setCalls;
+    int lastRun[4];
+};
+
+PatternState patternState()
+{
+    PatternState p = {};
+    llrpFakeGpuBackendIsoPatternStateForTesting(&p.setCalls, p.lastRun);
+    return p;
+}
+
+} // namespace
+
+// With the export present, a pattern-only change costs one set_iso_pattern and no set_clip or set_luts, and the
+// backend's next run sees exactly the pattern that frame asked for (the pixels depend on it).
+TEST(DualIsoGpuConfigureCache, APatternOnlyChangeIsOneSetIsoPatternAndTheRunSeesThatPattern)
+{
+    FakeBackendScope scope;
+    int ok = 0;
+    llrpGpuPlaybackReconState_t s = configureState(1);
+    setPattern(s, 1, 1, 0, 0);
+    (void)configureWorkOf(s, &ok);
+    ASSERT_EQ(1, ok);
+    ASSERT_EQ(1, patternState().lastRun[0]);
+    ASSERT_EQ(0, patternState().lastRun[3]);
+    const int patterns[3][4] = { { 1, 0, 0, 1 }, { 0, 0, 1, 1 }, { 1, 1, 0, 0 } };
+    for (int i = 0; i < 3; ++i)
+    {
+        llrpGpuPlaybackReconState_t t = configureState(uint64_t(2 + i));
+        setPattern(t, patterns[i][0], patterns[i][1], patterns[i][2], patterns[i][3]);
+        const uint64_t patternBefore = llrpGpuPlaybackReconSetIsoPatternCount();
+        const Counts d = configureWorkOf(t, &ok);
+        ASSERT_EQ(1, ok);
+        ASSERT_EQ(0u, d.setClip);
+        ASSERT_EQ(0u, d.setLuts);
+        ASSERT_EQ(patternBefore + 1, llrpGpuPlaybackReconSetIsoPatternCount());
+        const PatternState p = patternState();
+        for (int k = 0; k < 4; ++k) ASSERT_EQ(patterns[i][k], p.lastRun[k]);
+        // the same pattern again is quiet
+        const uint64_t patternAfter = llrpGpuPlaybackReconSetIsoPatternCount();
+        const Counts again = configureWorkOf(t, &ok);
+        ASSERT_EQ(1, ok);
+        ASSERT_EQ(0u, again.setClip);
+        ASSERT_EQ(0u, again.setLuts);
+        ASSERT_EQ(patternAfter, llrpGpuPlaybackReconSetIsoPatternCount());
+    }
+}
+
+// A DLL without the export (an older build) takes the old set_clip for a pattern change, keeps the pattern right,
+// and still does not re-upload the LUTs.
+TEST(DualIsoGpuConfigureCache, ADllWithoutSetIsoPatternFallsBackToSetClipAndKeepsTheLuts)
+{
+    FakeBackendScope scope;
+    int ok = 0;
+    ASSERT_EQ(1, llrpSetFakeGpuBackendIsoPatternSymbolForTesting(0));
+    llrpGpuPlaybackReconState_t s = configureState(1);
+    setPattern(s, 1, 1, 0, 0);
+    (void)configureWorkOf(s, &ok);
+    ASSERT_EQ(1, ok);
+    llrpGpuPlaybackReconState_t t = configureState(2);
+    setPattern(t, 0, 1, 1, 0);
+    const uint64_t patternBefore = llrpGpuPlaybackReconSetIsoPatternCount();
+    const Counts d = configureWorkOf(t, &ok);
+    ASSERT_EQ(1, ok);
+    ASSERT_EQ(1u, d.setClip);
+    ASSERT_EQ(0u, d.setLuts);
+    ASSERT_EQ(patternBefore, llrpGpuPlaybackReconSetIsoPatternCount());
+    const PatternState p = patternState();
+    ASSERT_EQ(0, p.lastRun[0]);
+    ASSERT_EQ(1, p.lastRun[1]);
+    ASSERT_EQ(1, p.lastRun[2]);
+    ASSERT_EQ(0, p.lastRun[3]);
+}
+
+// A pattern change that arrives together with a geometry change is a set_clip (+ set_luts), never the pattern-only
+// call, and leaves the backend holding the new pattern.
+TEST(DualIsoGpuConfigureCache, AGeometryChangeWithANewPatternIsAFullSetClip)
+{
+    FakeBackendScope scope;
+    int ok = 0;
+    llrpGpuPlaybackReconState_t s = configureState(1);
+    setPattern(s, 1, 1, 0, 0);
+    (void)configureWorkOf(s, &ok);
+    ASSERT_EQ(1, ok);
+    llrpGpuPlaybackReconState_t t = configureState(2);
+    t.black_level = 64;
+    setPattern(t, 0, 0, 1, 1);
+    const uint64_t patternBefore = llrpGpuPlaybackReconSetIsoPatternCount();
+    const Counts d = configureWorkOf(t, &ok);
+    ASSERT_EQ(1, ok);
+    ASSERT_EQ(1u, d.setClip);
+    ASSERT_EQ(1u, d.setLuts);
+    ASSERT_EQ(patternBefore, llrpGpuPlaybackReconSetIsoPatternCount());
+    ASSERT_EQ(1, patternState().lastRun[2]);
+    ASSERT_EQ(1, patternState().lastRun[3]);
+}
+
+// The pattern the key holds is the one last SENT: alternating A, B, A, B sends on every change and never otherwise.
+TEST(DualIsoGpuConfigureCache, AnAlternatingPatternIsSentWheneverItChangesAndNeverOtherwise)
+{
+    FakeBackendScope scope;
+    int ok = 0;
+    uint64_t sends = 0;
+    for (int i = 0; i < 8; ++i)
+    {
+        llrpGpuPlaybackReconState_t s = configureState(uint64_t(1 + i));
+        if (i & 1) setPattern(s, 1, 0, 0, 1);
+        else setPattern(s, 1, 1, 0, 0);
+        const uint64_t before = llrpGpuPlaybackReconSetIsoPatternCount();
+        const Counts d = configureWorkOf(s, &ok);
+        ASSERT_EQ(1, ok);
+        sends += llrpGpuPlaybackReconSetIsoPatternCount() - before;
+        ASSERT_EQ(i == 0 ? 1u : 0u, d.setClip);
+        ASSERT_EQ(i == 0 ? 1u : 0u, d.setLuts);
+        ASSERT_EQ((i & 1) ? 0 : 1, patternState().lastRun[1]);
+    }
+    ASSERT_EQ(7u, sends);   // frames 1..7 each differ from the frame before
 }

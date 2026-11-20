@@ -480,6 +480,50 @@ int main(int argc, char** argv)
         printf("[dll_test] wrote CPU16 result to %s\n", dump_path.c_str());
     }
 
+    /* ---- 4b. DUALISO-CONFIGURE-CACHE-1: the optional pattern-only configure ----
+     * igpu_recon_set_iso_pattern stores the ISO pattern without a set_clip. A different
+     * pattern must change the output (the run consumes it), and restoring the true pattern
+     * through the same call must reproduce the set_clip result byte for byte. A value outside
+     * {0,1} is refused and leaves the pattern as it was. A DLL without the export skips this. */
+    {
+        typedef int (*pfn_set_iso_pattern)(igpu_recon_backend*, const int*);
+        pfn_set_iso_pattern f_pattern = (pfn_set_iso_pattern)
+            GetProcAddress(dll, "igpu_recon_set_iso_pattern");
+        if (!f_pattern) {
+            printf("[dll_test] set_iso_pattern: export absent (older DLL), skipped\n");
+        } else {
+            const int truth[4] = { clip.is_bright[0], clip.is_bright[1], clip.is_bright[2], clip.is_bright[3] };
+            const int other[4] = { truth[2], truth[3], truth[0], truth[1] };   /* the opposite phase */
+            const int bad[4]   = { 1, 2, 0, 0 };
+            uint16_t* alt = (uint16_t*)malloc(n * sizeof(uint16_t));
+            uint16_t* back = (uint16_t*)malloc(n * sizeof(uint16_t));
+            memset(alt, 0, n * sizeof(uint16_t));
+            memset(back, 0, n * sizeof(uint16_t));
+            if (f_pattern(b, bad) == 0) {
+                fprintf(stderr, "[dll_test] set_iso_pattern accepted a value outside {0,1}\n");
+                return 4;
+            }
+            if (f_pattern(b, other) != 0 || f_run(b, &frame, h_in, IGPU_OUT_CPU16, alt, 0) != 0) {
+                fprintf(stderr, "[dll_test] set_iso_pattern(other)/run failed\n");
+                return 4;
+            }
+            if (f_pattern(b, truth) != 0 || f_run(b, &frame, h_in, IGPU_OUT_CPU16, back, 0) != 0) {
+                fprintf(stderr, "[dll_test] set_iso_pattern(truth)/run failed\n");
+                return 4;
+            }
+            const int differs = memcmp(alt, result, n * sizeof(uint16_t)) != 0;
+            const int identical = memcmp(back, result, n * sizeof(uint16_t)) == 0;
+            printf("[dll_test] set_iso_pattern: opposite pattern changes output=%d  restored pattern byte-identical to set_clip result=%d\n",
+                   differs, identical);
+            if (!differs || !identical) {
+                fprintf(stderr, "[dll_test] set_iso_pattern equivalence FAILED\n");
+                return 4;
+            }
+            free(alt);
+            free(back);
+        }
+    }
+
     /* ---- 5. timing ---- */
     igpu_recon_timing_t t;
     if (f_timing(b, &t) == 0) {

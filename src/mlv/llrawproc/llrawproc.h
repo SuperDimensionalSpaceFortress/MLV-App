@@ -358,6 +358,10 @@ int llrpGpuPlaybackReconReducedIsoNotchAvailable(void);
 /* Cumulative igpu_recon_set_clip / set_luts calls made by the C seam. */
 uint64_t llrpGpuPlaybackReconSetClipCount(void);
 uint64_t llrpGpuPlaybackReconSetLutsCount(void);
+/* DUALISO-CONFIGURE-CACHE-1: cumulative igpu_recon_set_iso_pattern calls (the pattern-only configure that
+ * replaces a set_clip + set_luts when only the ISO pattern moved). Additive; the two counts above keep
+ * their meaning. */
+uint64_t llrpGpuPlaybackReconSetIsoPatternCount(void);
 /* One line per set_clip / set_luts event (frame, wall ms, dims), emitted after
  * the backend mutex is released. NULL uninstalls. */
 typedef void (*llrpGpuReconEventLogger_t)(const char * line);
