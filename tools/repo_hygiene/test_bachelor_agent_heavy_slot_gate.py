@@ -77,6 +77,14 @@ def _fifo_constant_ms(name: str) -> int:
     return int(match.group(1))
 
 
+CAPTURE_IO_MAX_MS = _fifo_constant_ms("CaptureIoMaxMs")  # the largest bound the helpers accept; the bound every ACCEPT arm uses (see CAPTURE_ACCEPT_BOUND_MS)
+# CI-FLAKE-HEAVY-SLOT-GATE-PLAIN-TASK-CLEANUP-5S-1: a case that asserts a SUCCESS (a finished task, a clean cleanup, the text read back) is
+# measured against the helper's bound from the call's clock, and the worker process it hands the factory to must start its answer, write it
+# and END inside that bound. A typed 5 s therefore made the verdict a statement about the runner (hosted `windows unittest heavy 7/14`,
+# run 44725973056: "capture cleanup abandoned after 5 s: C:\x\a.txt" on a loaded runner). Every accept arm of BoundedCaptureIoTests passes
+# this bound, the largest the helper permits, so the bound cannot elapse inside a unit test; the cases that assert a TIMEOUT keep their small
+# typed bounds, because there the bound is the thing under test.
+CAPTURE_ACCEPT_BOUND_MS = CAPTURE_IO_MAX_MS
 CAPTURE_WORKER_START_MS = _fifo_constant_ms("CaptureWorkerStartMs")  # a worker may take this long to be ready, before the step's clock
 CAPTURE_WORKER_KILL_MS = _fifo_constant_ms("CaptureWorkerKillMs")  # teardown: each of the job, group and tree kills
 CAPTURE_WORKER_REAP_MS = _fifo_constant_ms("CaptureWorkerReapMs")  # teardown: the reap, and the scratch directory removal
@@ -1590,7 +1598,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertIsInstance(caught, AssertionError, repr(caught))
         self.assertIn("stalled-cleanup-case exceeded its 3 s wall-clock bound", str(caught))
         self.assertIn(f"capture cleanup abandoned after 0.3 s: {self._leftover}", str(caught))
-        self.assertLess(elapsed, 10, "the stalled removal held the verdict back")
+        self.assertLess(elapsed, max_run_bounded_sec(3) + CLEANUP_MARGIN_SEC, "the stalled removal held the verdict back")  # derived, never a typed 10 s
 
     def test_a_stalled_capture_cleanup_after_a_clean_run_returns_the_result_and_warns(self) -> None:
         # The run itself succeeded, so its result is returned; the abandoned removal is reported as a warning, not raised.
@@ -1610,7 +1618,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
         finally:
             release.set()
         self.assertEqual((result[0], result[1].strip()), (0, "ok"))
-        self.assertLess(time.monotonic() - started, 30)
+        self.assertLess(time.monotonic() - started, max_run_bounded_sec(60) + CLEANUP_MARGIN_SEC)  # derived, never a typed 30 s
         self.assertTrue(any("capture cleanup abandoned after 0.3 s" in str(w.message) and "clean-run-case" in str(w.message)
                             for w in recorded), [str(w.message) for w in recorded])
 
@@ -1781,7 +1789,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
             caught = self._run_with_capture_close(lambda: release.wait(60), close_bound=0.3)
         finally:
             release.set()
-        self.assertLess(time.monotonic() - started, 30)
+        self.assertLess(time.monotonic() - started, max_run_bounded_sec(3) + CLEANUP_MARGIN_SEC)  # derived, never a typed 30 s
         self.assertIsInstance(caught, AssertionError, repr(caught))
         self.assertIn("close-case exceeded its 3 s wall-clock bound", str(caught))
         self.assertIn("capture close abandoned after 0.3 s", str(caught))
@@ -2061,9 +2069,9 @@ class BoundedCaptureIoTests(unittest.TestCase):
                   "function Start-CaptureWorker { Start-Sleep -Milliseconds 2000; & $real }\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
                   "$f = { param($p) [Threading.Tasks.Task]::FromResult('ok') }\n"
-                  "$r = Read-CapturedResult $p 5000 $f; Write-Output ('ONE|' + $r.Ok + '|' + $r.Text)\n"
-                  "$r = Read-CapturedResult $p 5000 $f; Write-Output ('TWO|' + $r.Ok + '|' + $r.Text)\n"
-                  "$r = Read-CapturedResult $p 5000 $f; Write-Output ('THREE|' + $r.Ok + '|' + $r.Text)\n")
+                  "$r = Read-CapturedResult $p 60000 $f; Write-Output ('ONE|' + $r.Ok + '|' + $r.Text)\n"
+                  "$r = Read-CapturedResult $p 60000 $f; Write-Output ('TWO|' + $r.Ok + '|' + $r.Text)\n"
+                  "$r = Read-CapturedResult $p 60000 $f; Write-Output ('THREE|' + $r.Ok + '|' + $r.Text)\n")
         base = 4
         started = time.monotonic()
         with mock.patch(f"{__name__}.PWSH_SCRIPT_BASE_SEC", base):
@@ -2112,9 +2120,9 @@ class BoundedCaptureIoTests(unittest.TestCase):
                   "$r = Read-CapturedResult $p 50 $slowText\n"
                   "Write-Output ('LATE-READ|' + $r.Ok + '|' + $r.Text)\n"
                   "Write-Output ('LATE-DEL|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 50 $slowDel))\n"
-                  "$r = Read-CapturedResult $p 5000 $fastText\n"
+                  "$r = Read-CapturedResult $p 60000 $fastText\n"
                   "Write-Output ('FAST-READ|' + $r.Ok + '|' + $r.Text)\n"
-                  "Write-Output ('FAST-DEL|[' + (Remove-CaptureFiles @('C:\\x\\a.txt') 5000 $fastDel) + ']')\n")
+                  "Write-Output ('FAST-DEL|[' + (Remove-CaptureFiles @('C:\\x\\a.txt') 60000 $fastDel) + ']')\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("LATE-READ|False|<read timed out: a.txt not readable within 50 ms>", proc.stdout)
@@ -2136,9 +2144,9 @@ class BoundedCaptureIoTests(unittest.TestCase):
                   "$r = Read-CapturedResult $p 100 $slow\n"
                   "Write-Output ('SLOW-READ|' + $r.Ok + '|' + $r.Text)\n"
                   "Write-Output ('SLOW-DEL|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 100 $slow))\n"
-                  "$r = Read-CapturedResult $p 5000 $slow\n"
+                  "$r = Read-CapturedResult $p 60000 $slow\n"
                   "Write-Output ('INSIDE-READ|' + $r.Ok + '|' + $r.Text)\n"
-                  "Write-Output ('INSIDE-DEL|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 5000 $slow))\n")
+                  "Write-Output ('INSIDE-DEL|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 60000 $slow))\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("SLOW-READ|False|<read timed out: a.txt not readable within 100 ms>", proc.stdout)
@@ -2160,26 +2168,105 @@ class BoundedCaptureIoTests(unittest.TestCase):
                 offenders.append(name)
         self.assertEqual(offenders, [], "a leaf-asserting test feeds Read-Captured* a drive-letter literal; use a Join-Path temp path")
 
+    @staticmethod
+    def _plain_task_script(bound_ms: int, factory_delay_ms: int = 0) -> str:
+        """The plain-completed-task arms at `bound_ms`. `factory_delay_ms` is the forced-slow seam: every factory spends that long before it
+        hands back its task, the way a loaded runner spends it starting the worker and finishing the call."""
+        slow = f"Start-Sleep -Milliseconds {factory_delay_ms}; " if factory_delay_ms else ""
+        return (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                f"$plain = {{ param($p) {slow}[Threading.Tasks.Task]::CompletedTask }}\n"
+                f"$ran = {{ param($p) {slow}[Threading.Tasks.Task]::Delay(1) }}\n"
+                f"Write-Output ('PLAIN-DEL|[' + (Remove-CaptureFiles @('C:\\x\\a.txt') {bound_ms} $plain) + ']')\n"
+                f"Write-Output ('RUN-DEL|[' + (Remove-CaptureFiles @('C:\\x\\a.txt') {bound_ms} $ran) + ']')\n"
+                f"$r = Read-CapturedResult 'C:\\x\\a.txt' {bound_ms} $plain\n"
+                "Write-Output ('PLAIN-READ|' + $r.Ok + '|[' + $r.Text + ']')\n"
+                f"$r = Read-CapturedResult 'C:\\x\\a.txt' {bound_ms} $ran\n"
+                "Write-Output ('RUN-READ|' + $r.Ok + '|[' + $r.Text + ']')\n")
+
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_an_accepted_plain_completed_task_has_no_result_so_no_false_cleanup_problem_and_no_fabricated_text(self) -> None:
         # sol r9 B2: a plain [Task]::CompletedTask exposes the runtime type System.Threading.Tasks.VoidTaskResult as its Result. A non-generic
         # Task has no result: cleanup reports no problem and the reader returns empty text, never the type name.
-        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
-                  "$plain = { param($p) [Threading.Tasks.Task]::CompletedTask }\n"
-                  "$ran = { param($p) [Threading.Tasks.Task]::Delay(1) }\n"
-                  "Write-Output ('PLAIN-DEL|[' + (Remove-CaptureFiles @('C:\\x\\a.txt') 5000 $plain) + ']')\n"
-                  "Write-Output ('RUN-DEL|[' + (Remove-CaptureFiles @('C:\\x\\a.txt') 5000 $ran) + ']')\n"
-                  "$r = Read-CapturedResult 'C:\\x\\a.txt' 5000 $plain\n"
-                  "Write-Output ('PLAIN-READ|' + $r.Ok + '|[' + $r.Text + ']')\n"
-                  "$r = Read-CapturedResult 'C:\\x\\a.txt' 5000 $ran\n"
-                  "Write-Output ('RUN-READ|' + $r.Ok + '|[' + $r.Text + ']')\n")
-        proc = self._pwsh(script)
+        # CI-FLAKE-HEAVY-SLOT-GATE-PLAIN-TASK-CLEANUP-5S-1: an ACCEPT arm, so it runs at CAPTURE_ACCEPT_BOUND_MS (see its comment).
+        proc = self._pwsh(self._plain_task_script(CAPTURE_ACCEPT_BOUND_MS))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertNotIn("VoidTaskResult", proc.stdout)
         self.assertIn("PLAIN-DEL|[]", proc.stdout)
         self.assertIn("RUN-DEL|[]", proc.stdout)
         self.assertIn("PLAIN-READ|True|[]", proc.stdout)
         self.assertIn("RUN-READ|True|[]", proc.stdout)
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_the_plain_task_arms_pass_under_a_forced_slow_seam_only_because_their_bound_cannot_elapse(self) -> None:
+        # CI-FLAKE-HEAVY-SLOT-GATE-PLAIN-TASK-CLEANUP-5S-1 RED/GREEN, without a real wait of a second: every factory is forced to spend 400 ms
+        # (a loaded runner's start/finish latency, scaled down). Under a bound that latency can exceed (300 ms, the shape of the old typed 5 s on
+        # a slow enough runner) the arms are ABANDONED, so the success the accept test asserts was a statement about the runner; under the
+        # accept bound the same slow seam still yields every clean verdict.
+        slow_ms = 400
+        self.assertLess(slow_ms, 1000, "a case in this class never performs a real wait of a second")
+        red = self._pwsh(self._plain_task_script(300, factory_delay_ms=slow_ms))
+        self.assertEqual(red.returncode, 0, red.stdout + red.stderr)
+        self.assertIn("PLAIN-DEL|[capture cleanup abandoned after 0.3 s: C:\\x\\a.txt]", red.stdout, "the slow seam must really be able to trip a small bound")
+        self.assertIn("PLAIN-READ|False|[<read timed out: a.txt not readable within 300 ms>]", red.stdout)
+        green = self._pwsh(self._plain_task_script(CAPTURE_ACCEPT_BOUND_MS, factory_delay_ms=slow_ms))
+        self.assertEqual(green.returncode, 0, green.stdout + green.stderr)
+        for row in ("PLAIN-DEL|[]", "RUN-DEL|[]", "PLAIN-READ|True|[]", "RUN-READ|True|[]"):
+            self.assertIn(row, green.stdout)
+
+    def test_no_accept_arm_of_the_bounded_capture_io_cases_carries_a_wall_clock_dependent_bound(self) -> None:
+        # CI-FLAKE-HEAVY-SLOT-GATE-PLAIN-TASK-CLEANUP-5S-1 guard, source pin (every OS). In this class a bound of a second or more on a
+        # Read-Captured* / Remove-CaptureFiles call is an ACCEPT arm (a success is asserted against it) and must be CAPTURE_ACCEPT_BOUND_MS: a
+        # typed 5 s / 10 s / 20 s lets a loaded runner turn the success into an abandonment. The timeout cases use bounds under a second.
+        # And no case of the class performs a real wait of a second or more: a Start-Sleep / Thread.Sleep / Task.Delay / time.sleep literal of
+        # 1000 ms or more is allowed only where it is never waited out (a factory killed at its small bound, a hang killed at its budget, a
+        # deliberately slow worker start) and is named in _ALLOWED_LONG_SLEEPS with the reason.
+        source = Path(__file__).read_text(encoding="utf-8")
+        start = source.index("class BoundedCaptureIoTests(")
+        body = source[start:source.index("\nclass BoundedCleanupTests(")]
+        bounds = []
+        for chunk in re.split(r"\n    (?:@[^\n]*\n    )*def ", body):
+            name = chunk.split("(", 1)[0]
+            if name.startswith("test_no_accept_arm_of_the_bounded_capture_io_cases"):
+                continue
+            for match in re.finditer(r"(?:Read-Captured(?:Result|Text)|Remove-CaptureFiles)\b([^\n]*)", chunk):
+                for number in re.findall(r"(?<![\w$.])(\d+)(?![\w.])", match.group(1)):
+                    if 1000 <= int(number) <= MAX_DECLARED_BOUND_MS and int(number) != CAPTURE_ACCEPT_BOUND_MS and name not in self._LONG_BOUND_EXEMPT:
+                        bounds.append(f"{name}: {number}")
+        self.assertEqual(bounds, [], f"an accept arm passes a typed bound other than CAPTURE_ACCEPT_BOUND_MS ({CAPTURE_ACCEPT_BOUND_MS})")
+        waits = []
+        for chunk in re.split(r"\n    (?:@[^\n]*\n    )*def ", body):
+            name = chunk.split("(", 1)[0]
+            if name.startswith("test_no_accept_arm_of_the_bounded_capture_io_cases") or name in self._ALLOWED_LONG_SLEEPS:
+                continue
+            for line in chunk.splitlines():
+                if line.lstrip().startswith("#"):
+                    continue
+                for match in re.finditer(r"Start-Sleep\s+-Milliseconds\s+(\d+)|Start-Sleep\s+-Seconds\s+(\d+)|Sleep\((\d+)\)|Task\]::Delay\((\d+)\)|time\.sleep\(([\d.]+)\)", line):
+                    ms, sec, thread_ms, delay_ms, py_sec = match.groups()
+                    millis = (int(ms) if ms else int(sec) * 1000 if sec else int(thread_ms) if thread_ms else int(delay_ms) if delay_ms else float(py_sec) * 1000)
+                    if millis >= 1000 and "$sw.ElapsedMilliseconds -lt" not in line:
+                        waits.append(f"{name}: {line.strip()[:90]}")
+        self.assertEqual(waits, [], "a BoundedCaptureIoTests case waits a second or more for real; name it in _ALLOWED_LONG_SLEEPS with why it is never waited out")
+
+    # Cases that legitimately carry a sleep literal of a second or more, because it is never waited out: the worker is killed at the case's small
+    # bound, or the hang is killed at its budget (the reason is the case's own comment). A case NOT listed here may not add one.
+    _ALLOWED_LONG_SLEEPS = frozenset({
+        "test_r16_c1_a_script_whose_permitted_slow_worker_starts_outlast_the_old_fixed_cap_still_passes",  # the scaled slow-start case: its 2 s start delay IS the subject
+        "test_r16_c1_a_genuine_hang_still_fails_by_case_name_at_the_budget",  # a 600 s sleep killed at a 3 s budget
+        "test_a_synchronous_factory_or_result_conversion_that_outlasts_the_bound_returns_the_named_timeout_inside_a_generous_ceiling",  # Sleep(ceiling+slack) killed at a 50 ms bound
+        "test_a_factory_that_never_returns_still_gets_the_named_timeout_and_the_process_still_exits",  # Sleep(Infinite) killed at a 200 ms bound
+        "test_a_result_conversion_that_never_returns_still_gets_the_named_timeout_and_the_process_still_exits",
+        # a 600 s sleeper the factory starts so the teardown has a descendant to reap; the case polls until it is gone and never waits it out
+        "test_a_process_orphaned_by_an_ended_intermediate_still_ends_with_the_worker",
+        "test_a_process_the_factory_started_ends_with_the_worker_even_when_the_worker_ended_first",
+        "_run_worker_driver",
+    })
+    # Cases whose long literal is not an accept arm's bound: the budget arithmetic feeds the text of a call to a PURE function (nothing runs),
+    # and the orphan case needs a 40 s bound that outlasts its own 30 s factory wait (the accept bound would also do, but it is not a flake).
+    _LONG_BOUND_EXEMPT = frozenset({
+        "test_r16_c1_the_whole_script_budget_is_derived_from_the_calls_the_script_makes",
+        "test_a_process_orphaned_by_an_ended_intermediate_still_ends_with_the_worker",
+    })
 
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_a_task_that_derives_from_task_of_string_keeps_its_result_in_both_callers(self) -> None:
@@ -2195,12 +2282,12 @@ class BoundedCaptureIoTests(unittest.TestCase):
                   "$plain = { param($p) [Threading.Tasks.Task]::FromResult('payload') }\n"
                   "$plainDel = { param($p) [Threading.Tasks.Task]::FromResult('still present: a.txt') }\n"
                   "Write-Output ('DERIVED-TYPE|' + (& $derived $p).GetType().IsGenericType)\n"
-                  "$r = Read-CapturedResult $p 5000 $derived\n"
+                  "$r = Read-CapturedResult $p 60000 $derived\n"
                   "Write-Output ('DERIVED-READ|' + $r.Ok + '|' + $r.Text)\n"
-                  "Write-Output ('DERIVED-DEL|' + (Remove-CaptureFiles @($p) 5000 $derivedDel))\n"
-                  "$r = Read-CapturedResult $p 5000 $plain\n"
+                  "Write-Output ('DERIVED-DEL|' + (Remove-CaptureFiles @($p) 60000 $derivedDel))\n"
+                  "$r = Read-CapturedResult $p 60000 $plain\n"
                   "Write-Output ('PLAIN-READ|' + $r.Ok + '|' + $r.Text)\n"
-                  "Write-Output ('PLAIN-DEL|' + (Remove-CaptureFiles @($p) 5000 $plainDel))\n")
+                  "Write-Output ('PLAIN-DEL|' + (Remove-CaptureFiles @($p) 60000 $plainDel))\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("DERIVED-TYPE|False", proc.stdout, "the repro must really be a non-generic runtime type")
@@ -2306,11 +2393,11 @@ class BoundedCaptureIoTests(unittest.TestCase):
                   "  $make = '[string]::new([char[]]@(' + $units + '))'\n"
                   "  $ok = [scriptblock]::Create('param($p) [Threading.Tasks.Task]::FromResult(' + $make + ')')\n"
                   "  $bad = [scriptblock]::Create('param($p) throw ' + $make)\n"
-                  "  $r = Read-CapturedResult $p 10000 $ok\n"
+                  "  $r = Read-CapturedResult $p 60000 $ok\n"
                   "  Write-Output (\"TEXT|$i|\" + ($r.Ok -and $r.Text -ceq $t))\n"
-                  "  $r = Read-CapturedResult $p 10000 $bad\n"
+                  "  $r = Read-CapturedResult $p 60000 $bad\n"
                   "  Write-Output (\"ERROR|$i|\" + ((-not $r.Ok) -and $r.Text -ceq \"<read failed: $t>\"))\n"
-                  "  Write-Output (\"NOTE|$i|\" + ((Remove-CaptureFiles @($p) 10000 $ok) -ceq \"capture cleanup incomplete: $t\"))\n"
+                  "  Write-Output (\"NOTE|$i|\" + ((Remove-CaptureFiles @($p) 60000 $ok) -ceq \"capture cleanup incomplete: $t\"))\n"
                   "  $i++\n"
                   "}\n")
         proc = self._pwsh(script, repeat=6)  # the loop runs the six texts: 18 worker calls in all
@@ -2326,10 +2413,10 @@ class BoundedCaptureIoTests(unittest.TestCase):
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
                   "$shape = { param($x) [Threading.Tasks.Task]::FromResult('type=' + $x.GetType().FullName + ' n=' + @($x).Count + ' items=' + ($x -join '|')) }\n"
                   "$none = { param($x) [Threading.Tasks.Task]::FromResult('null=' + ($null -eq $x) + ' type=' + $(if ($null -ne $x) { $x.GetType().FullName })) }\n"
-                  "Write-Output ('ONE|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 5000 $shape))\n"
-                  "Write-Output ('TWO|' + (Remove-CaptureFiles @('C:\\x\\a.txt', 'C:\\x\\b.txt') 5000 $shape))\n"
-                  "Write-Output ('EMPTY|' + (Remove-CaptureFiles @() 5000 $none))\n"
-                  "Write-Output ('SCALAR|' + (Read-CapturedResult $p 5000 $shape).Text)\n")
+                  "Write-Output ('ONE|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 60000 $shape))\n"
+                  "Write-Output ('TWO|' + (Remove-CaptureFiles @('C:\\x\\a.txt', 'C:\\x\\b.txt') 60000 $shape))\n"
+                  "Write-Output ('EMPTY|' + (Remove-CaptureFiles @() 60000 $none))\n"
+                  "Write-Output ('SCALAR|' + (Read-CapturedResult $p 60000 $shape).Text)\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("ONE|capture cleanup incomplete: type=System.String[] n=1 items=C:\\x\\a.txt", proc.stdout)
@@ -2343,7 +2430,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
         script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
                   "$probe = { param($x) [Threading.Tasks.Task]::FromResult('null0=' + ($null -eq $x[0]) + ' empty1=' + ($x[1] -ceq '') + ' n=' + $x.Count) }\n"
                   "$paths = [string[]]::new(2); $paths[1] = ''\n"
-                  "Write-Output ('NULLS|' + (Remove-CaptureFiles $paths 5000 $probe))\n")
+                  "Write-Output ('NULLS|' + (Remove-CaptureFiles $paths 60000 $probe))\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("NULLS|capture cleanup incomplete: null0=True empty1=True n=2", proc.stdout)
@@ -2398,9 +2485,9 @@ class BoundedCaptureIoTests(unittest.TestCase):
                       "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
                       "$throwing = " + spawner(pid_files[0], "throw 'factory exploded'") + "\n"
                       "$finishing = " + spawner(pid_files[1], "[Threading.Tasks.Task]::FromResult('')") + "\n"
-                      "$r = Read-CapturedResult $p 20000 $throwing\n"
+                      "$r = Read-CapturedResult $p 60000 $throwing\n"
                       "Write-Output ('THROW-READ|' + $r.Ok + '|' + $r.Text)\n"
-                      "Write-Output ('FINISH-DEL|[' + (Remove-CaptureFiles @($p) 20000 $finishing) + ']')\n"
+                      "Write-Output ('FINISH-DEL|[' + (Remove-CaptureFiles @($p) 60000 $finishing) + ']')\n"
                       "foreach ($f in @(" + ", ".join("'" + f.replace("'", "''") + "'" for f in pid_files) + ")) {\n"
                       "  $id = [int][IO.File]::ReadAllText($f); $sw = [Diagnostics.Stopwatch]::StartNew()\n"
                       "  while ($null -ne (Get-Process -Id $id -ErrorAction SilentlyContinue) -and $sw.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 100 }\n"
@@ -2432,15 +2519,15 @@ class BoundedCaptureIoTests(unittest.TestCase):
                   "$callerClass = { param($p) if ($null -eq $callerOnly) { throw 'the caller scope is not visible in the worker' }; [Threading.Tasks.Task]::FromResult('x') }\n"
                   "$noType = { param($p) [NoSuchTypeAnywhere12]::new(); [Threading.Tasks.Task]::FromResult('x') }\n"
                   "$boom = { param($p) throw 'factory exploded' }\n"
-                  "$r = Read-CapturedResult $p 5000 $callerClass\n"
+                  "$r = Read-CapturedResult $p 60000 $callerClass\n"
                   "Write-Output ('CLASS-READ|' + $r.Ok + '|' + $r.Text)\n"
-                  "Write-Output ('CLASS-DEL|' + (Remove-CaptureFiles @($p) 5000 $callerClass))\n"
-                  "$r = Read-CapturedResult $p 5000 $noType\n"
+                  "Write-Output ('CLASS-DEL|' + (Remove-CaptureFiles @($p) 60000 $callerClass))\n"
+                  "$r = Read-CapturedResult $p 60000 $noType\n"
                   "Write-Output ('NOTYPE-READ|' + $r.Ok + '|' + $r.Text)\n"
-                  "Write-Output ('NOTYPE-DEL|' + (Remove-CaptureFiles @($p) 5000 $noType))\n"
-                  "$r = Read-CapturedResult $p 5000 $boom\n"
+                  "Write-Output ('NOTYPE-DEL|' + (Remove-CaptureFiles @($p) 60000 $noType))\n"
+                  "$r = Read-CapturedResult $p 60000 $boom\n"
                   "Write-Output ('BOOM-READ|' + $r.Ok + '|' + $r.Text)\n"
-                  "Write-Output ('BOOM-DEL|' + (Remove-CaptureFiles @($p) 5000 $boom))\n")
+                  "Write-Output ('BOOM-DEL|' + (Remove-CaptureFiles @($p) 60000 $boom))\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("CLASS-READ|False|<read failed: the caller scope is not visible in the worker>", proc.stdout)
