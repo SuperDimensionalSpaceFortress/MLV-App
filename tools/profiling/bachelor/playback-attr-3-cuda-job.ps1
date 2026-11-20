@@ -8049,6 +8049,25 @@ function Get-ClocksPowerClockCheck($Clk1, $Clk2, [int]$IntervalMs, [int64]$Freq)
     } catch { return $null }
 }
 
+# r7: the observed cadence of a sampler's rows: @{ n; minMs; medianMs; maxMs } over the gaps between adjacent stamps (n = rows - 1), 1 decimal; the text
+# UNAVAILABLE(fewer-than-two-rows) when there is no gap. It is what the GPU gap test judges against AND what both summaries disclose (rowGapMs), so a refused
+# window still says what cadence the stamps had. The median of an even count adds the halves (no overflow).
+function Get-ClocksPowerRowGapStats($Rows) {
+    try {
+        $gaps = [Collections.Generic.List[double]]::new()
+        $prev = $null
+        foreach ($row in @($Rows)) {
+            if ($null -ne $prev) { $gaps.Add([double](($row.utc - $prev).TotalMilliseconds)) }
+            $prev = $row.utc
+        }
+        if ($gaps.Count -eq 0) { return 'UNAVAILABLE(fewer-than-two-rows)' }
+        $s = @($gaps | Sort-Object)
+        $mid = [int][math]::Floor($s.Count / 2)
+        $med = $(if ($s.Count % 2 -eq 1) { $s[$mid] } else { ($s[$mid - 1] / 2.0) + ($s[$mid] / 2.0) })
+        return [ordered]@{ n = $s.Count; minMs = [math]::Round($s[0], 1); medianMs = [math]::Round($med, 1); maxMs = [math]::Round($s[$s.Count - 1], 1) }
+    } catch { return 'UNAVAILABLE(row-gaps-failed)' }
+}
+
 # adversary ebfb3c2b A1: the clock verdict for a window's rows, since neither nvidia-smi nor typeperf is a process that reads a monotonic clock beside the
 # wall clock (the util sampler's witness is its pwsh child). $null = the stamps are trusted; sample-clock-unwitnessed = no usable $ClockCheck
 # (@{ intervalMs; netStepMs }: the sampler's interval and the job's net wall-vs-monotonic step over the sampling span); sample-clock-unverified =
@@ -8062,9 +8081,17 @@ function Get-ClocksPowerClockWhy($Rows, $ClockCheck, [bool]$IsCpu = $false) {
         if ($null -eq $interval -or $null -eq $net -or $interval -is [string] -or $net -is [string]) { return 'sample-clock-unwitnessed' }
         $interval = [double]$interval; $net = [double]$net
         if ([double]::IsNaN($interval) -or [double]::IsInfinity($interval) -or $interval -le 0 -or [double]::IsNaN($net) -or [double]::IsInfinity($net)) { return 'sample-clock-unwitnessed' }
-        if ([Math]::Abs($net) -gt 250) { return 'sample-clock-unverified' }
+        # adversary c11fb3d0 A1: a capture's monotonic stamp is the MIDPOINT of its bracket, so the net step is only known to within the bracket: the width
+        # (absent = 0, the older checks) is added to the bound
+        $width = 0.0
+        try { $cw = $ClockCheck['captureWidthMs']; if ($null -ne $cw -and $cw -isnot [string] -and -not [double]::IsNaN([double]$cw) -and -not [double]::IsInfinity([double]$cw) -and [double]$cw -gt 0) { $width = [double]$cw } } catch { }
+        if (([Math]::Abs($net) + $width) -gt 250) { return 'sample-clock-unverified' }
         if (-not (Test-UtilSampleClockSteady $Rows)) { return 'sample-clock-unverified' }
         $nominal = $(if ($IsCpu) { [Math]::Ceiling($interval / 1000.0) * 1000.0 } else { $interval })
+        # r7: nvidia-smi -lms does not keep its interval on the venue (about 1.8 s a row at -lms 1000: 51 GPU rows against 93-94 CPU rows in the same legs), so
+        # with three or more gaps the GPU rows are judged against their OBSERVED median gap; a gap off that median, a stamp that does not rise and a net step
+        # still refuse. Fewer gaps have no observed cadence and keep the nominal interval. typeperf keeps its nominal (whole seconds).
+        if (-not $IsCpu) { $gs = Get-ClocksPowerRowGapStats $Rows; if ($gs -is [System.Collections.IDictionary] -and $gs['n'] -ge 3) { $nominal = [double]$gs['medianMs'] } }
         $tolerance = [Math]::Max(200.0, 0.4 * $nominal)
         $prev = $null
         foreach ($row in @($Rows)) {
@@ -8081,7 +8108,7 @@ function Get-ClocksPowerClockWhy($Rows, $ClockCheck, [bool]$IsCpu = $false) {
 # with no verified clock is unavailable(sample-clock-unwitnessed | sample-clock-unverified).
 function Get-ClocksPowerGpuSummary($Parsed, $Start, $Window, $Stop = $null, $ClockCheck = $null) {
     $none = 'UNAVAILABLE(start-not-reached)'
-    $s = [ordered]@{ status = 'unavailable(start-not-reached)'; samples = 0; samplesTotal = 0; smClockMhz = $none; grClockMhz = $none; memClockMhz = $none; powerW = $none; powerLimitW = $none; tempC = $none; throttleReasonsUnion = $none; limitFlagsUnion = $none }
+    $s = [ordered]@{ status = 'unavailable(start-not-reached)'; samples = 0; samplesTotal = 0; rowGapMs = $none; smClockMhz = $none; grClockMhz = $none; memClockMhz = $none; powerW = $none; powerLimitW = $none; tempC = $none; throttleReasonsUnion = $none; limitFlagsUnion = $none }
     $fail = { param($status, $why) $s.status = $status; foreach ($k in 'smClockMhz', 'grClockMhz', 'memClockMhz', 'powerW', 'powerLimitW', 'tempC', 'throttleReasonsUnion', 'limitFlagsUnion') { $s[$k] = "UNAVAILABLE($why)" }; $s }
     try {
         if ($null -eq $Start) { return $s }
@@ -8091,6 +8118,7 @@ function Get-ClocksPowerGpuSummary($Parsed, $Start, $Window, $Stop = $null, $Clo
         if ($null -ne $Stop -and -not $Stop.stopped -and $Stop.why -cne 'not-started') { return (& $fail 'unavailable(nvidia-smi-stop-failed)' 'nvidia-smi-stop-failed') }
         if ($null -eq $Parsed) { return (& $fail 'unavailable(gpu-clocks-missing)' 'gpu-clocks-missing') }
         $s.samplesTotal = $Parsed.rows.Count
+        $s.rowGapMs = Get-ClocksPowerRowGapStats $Parsed.rows
         if ($Parsed.why) { return (& $fail "unavailable($($Parsed.why))" $Parsed.why) }
         if ($null -ne $Window) { $clockWhy = Get-ClocksPowerClockWhy $Parsed.rows $ClockCheck $false; if ($clockWhy) { return (& $fail "unavailable($clockWhy)" $clockWhy) } }
         $in = @(Select-UtilSampleWindowRows $Parsed.rows $Window)
@@ -8122,7 +8150,7 @@ function Get-ClocksPowerGpuSummary($Parsed, $Start, $Window, $Stop = $null, $Clo
 # optional (UNAVAILABLE(<reason>) text when the host has none: $Start.pkgReason, else energy-meter-counter-absent).
 function Get-ClocksPowerCpuSummary($Parsed, $Start, $Window, $Stop = $null, $ClockCheck = $null) {
     $none = 'UNAVAILABLE(start-not-reached)'
-    $s = [ordered]@{ status = 'unavailable(start-not-reached)'; samples = 0; samplesTotal = 0; perfPct = $none; nominalMhz = $none; effectiveMhz = $none; pkgPowerW = $none }
+    $s = [ordered]@{ status = 'unavailable(start-not-reached)'; samples = 0; samplesTotal = 0; rowGapMs = $none; perfPct = $none; nominalMhz = $none; effectiveMhz = $none; pkgPowerW = $none }
     $fail = { param($status, $why) $s.status = $status; foreach ($k in 'perfPct', 'nominalMhz', 'effectiveMhz', 'pkgPowerW') { $s[$k] = "UNAVAILABLE($why)" }; $s }
     try {
         if ($null -eq $Start) { return $s }
@@ -8131,6 +8159,7 @@ function Get-ClocksPowerCpuSummary($Parsed, $Start, $Window, $Stop = $null, $Clo
         if ($null -ne $Stop -and -not $Stop.stopped -and $Stop.why -cne 'not-started') { return (& $fail 'unavailable(typeperf-stop-failed)' 'typeperf-stop-failed') }
         if ($null -eq $Parsed) { return (& $fail 'unavailable(cpu-clocks-missing)' 'cpu-clocks-missing') }
         $s.samplesTotal = $Parsed.rows.Count
+        $s.rowGapMs = Get-ClocksPowerRowGapStats $Parsed.rows
         if ($Parsed.why) { return (& $fail "unavailable($($Parsed.why))" $Parsed.why) }
         if ($null -ne $Window) { $clockWhy = Get-ClocksPowerClockWhy $Parsed.rows $ClockCheck $true; if ($clockWhy) { return (& $fail "unavailable($clockWhy)" $clockWhy) } }
         # typeperf rows are interval values: a row counts only when its whole interval lies inside the window (adversary de9ca8e7 A1)
@@ -8198,13 +8227,24 @@ function Get-ClocksPowerPlatform {
     try {
         $pcPath = [string]$env:SystemRoot + '\System32\powercfg.exe'
         $pc = Invoke-ClocksPowerBounded $pcPath '/getactivescheme' 4000
-        if ($pc.timedOut) { $p.powerPlan = 'UNAVAILABLE(powercfg-timeout)' }
+        if ($pc.survived) { $p.powerPlan = 'UNAVAILABLE(powercfg-survivor)' }
+        elseif ($pc.timedOut) { $p.powerPlan = 'UNAVAILABLE(powercfg-timeout)' }
         elseif (-not $pc.ok) { $p.powerPlan = 'UNAVAILABLE(powercfg-failed)' }
         else { $p.powerPlan = ConvertFrom-ClocksPowerPowerCfg (($pc.lines) -join "`n") }
     } catch { $p.powerPlan = 'UNAVAILABLE(powercfg-failed)' }
     try { $p.acState = Get-ClocksPowerAcState @(Get-CimInstance -ClassName Win32_Battery -OperationTimeoutSec 4 -ErrorAction Stop) } catch { $p.acState = 'UNAVAILABLE(battery-cim-failed)' }
     try { $p.display = ConvertFrom-ClocksPowerDisplay @(Get-CimInstance -ClassName Win32_VideoController -OperationTimeoutSec 4 -ErrorAction Stop) } catch { $p.display = 'UNAVAILABLE(display-cim-failed)' }
     $p
+}
+
+# adversary c11fb3d0 A2: true when a pre-launch child (the power-plan read, the Energy Meter listing) was still running after its kill. The job then starts NEITHER
+# sampler: a child that cannot be killed would perturb the measured leg. $Platform is Get-ClocksPowerPlatform's result, $List Get-ClocksPowerCounterList's.
+function Test-ClocksPowerPreflightSurvivor($Platform, $List) {
+    try {
+        if ($null -ne $Platform -and $Platform -is [System.Collections.IDictionary] -and [string]$Platform['powerPlan'] -ceq 'UNAVAILABLE(powercfg-survivor)') { return $true }
+        if ($null -ne $List -and $List -is [System.Collections.IDictionary] -and [string]$List['why'] -ceq 'energy-meter-enumeration-survivor') { return $true }
+        return $false
+    } catch { return $false }
 }
 
 # `typeperf -qx "Energy Meter"` lines -> the one RAPL package power counter. pkgPath $null with reason energy-meter-counter-absent (the host has no
@@ -8223,11 +8263,12 @@ function Resolve-ClocksPowerTypeperf {
 }
 
 # The Energy Meter counter paths this host lists (one short typeperf call, before the measured launch); an empty list when typeperf says nothing
-function Get-ClocksPowerCounterList([string]$TypeperfPath, [int]$TimeoutMs = 4000, [string]$Arguments = '-qx "Energy Meter"') {
+function Get-ClocksPowerCounterList([string]$TypeperfPath, [int]$TimeoutMs = 4000, [string]$Arguments = '-qx "Energy Meter"', [scriptblock]$KillAction = $null) {
     $r = [ordered]@{ lines = @(); why = $null }
     if ([string]::IsNullOrEmpty($TypeperfPath)) { return $r }
-    $x = Invoke-ClocksPowerBounded $TypeperfPath $Arguments $TimeoutMs
-    if ($x.timedOut) { $r.why = 'energy-meter-enumeration-timeout' }
+    $x = Invoke-ClocksPowerBounded $TypeperfPath $Arguments $TimeoutMs $KillAction
+    if ($x.survived) { $r.why = 'energy-meter-enumeration-survivor' }
+    elseif ($x.timedOut) { $r.why = 'energy-meter-enumeration-timeout' }
     elseif (-not $x.ok) { $r.why = 'energy-meter-enumeration-failed' }
     else { $r.lines = @($x.lines) }
     $r
@@ -8236,19 +8277,27 @@ function Get-ClocksPowerCounterList([string]$TypeperfPath, [int]$TimeoutMs = 400
 # adversary de9ca8e7 A2: one short external read, bounded. The tool runs in its own process; when it has not exited inside $TimeoutMs it is killed and the
 # result is timedOut (never waited for). ok = the tool ran to its exit; lines = its stdout. A tool that cannot start is ok=false, timedOut=false. This is the
 # ONLY Process.Start in the clocks helpers besides the two sampler starters, and it is for the pre-launch reads (powercfg, the Energy Meter listing).
-function Invoke-ClocksPowerBounded([string]$Path, [string]$Arguments, [int]$TimeoutMs) {
-    $r = [ordered]@{ ok = $false; timedOut = $false; lines = @() }
+function Invoke-ClocksPowerBounded([string]$Path, [string]$Arguments, [int]$TimeoutMs, [scriptblock]$KillAction = $null) {
+    $r = [ordered]@{ ok = $false; timedOut = $false; survived = $false; pid = $null; lines = @() }
     $p = $null
     try {
         $psi = [Diagnostics.ProcessStartInfo]::new($Path, $Arguments)
         $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
         $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
         $p = [Diagnostics.Process]::Start($psi)
+        $r.pid = $p.Id
         $outTask = $p.StandardOutput.ReadToEndAsync(); $errTask = $p.StandardError.ReadToEndAsync()
         if (-not $p.WaitForExit($TimeoutMs)) {
             $r.timedOut = $true
-            try { $p.Kill() } catch { }
+            # adversary c11fb3d0 A2: the tree is killed, then the process; one 2 s wait after the kills (it is in the job-time budget); a child that is STILL
+            # running is reported (survived), never hidden: the job starts no sampler beside it. $KillAction is a test seam (it replaces both kills).
+            if ($null -ne $KillAction) { try { & $KillAction $p } catch { } }
+            else {
+                try { $p.Kill($true) } catch { }
+                try { if (-not $p.HasExited) { $p.Kill() } } catch { }
+            }
             try { [void]$p.WaitForExit(2000) } catch { }
+            try { $r.survived = (-not $p.HasExited) } catch { $r.survived = $true }
             return $r
         }
         [void]$outTask.Wait(2000); [void]$errTask.Wait(2000)
@@ -8322,10 +8371,14 @@ function Get-ClocksPowerRawFileName([bool]$Published, [string]$Name) {
 function Read-ClocksPowerSource([string]$Path, $Start, $StopSide) {
     try {
         if ($null -eq $Start -or -not $Start.owned -or $null -eq $StopSide -or -not $StopSide.stopped) { return $null }
-        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
-        $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+        # adversary c11fb3d0 A3: the bytes come from the job's OWN held handle (opened on the file the job created, sharing read/write but not delete, so the
+        # name cannot be replaced while it is open), never from a second open of $Path: a failed read can be retried on the same handle and cannot read a
+        # file somebody put at the path. No hold (never created, already released) = nothing to read. $Path is only the name the hold is on.
+        $fs = $Start.hold
+        if ($null -eq $fs -or -not $fs.CanRead -or -not $fs.CanSeek) { return $null }
         $bytes = $null
-        try { $ms = [IO.MemoryStream]::new(); $fs.CopyTo($ms); $bytes = $ms.ToArray() } finally { $fs.Dispose() }
+        $fs.Position = 0
+        $ms = [IO.MemoryStream]::new(); $fs.CopyTo($ms); $bytes = $ms.ToArray()
         $h = [Security.Cryptography.SHA256]::Create()
         $hex = $null
         try { $hex = ([BitConverter]::ToString($h.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant() } finally { $h.Dispose() }
@@ -8572,7 +8625,7 @@ if ($clocksPowerEmit) {
     $cwOpen = '# BENCH-CLOCKS-POWER-LOG-1 >>>'
     $cwClose = '# BENCH-CLOCKS-POWER-LOG-1 <<<'
     $cwEol = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
-    $cwFunctions = Get-CorePartitionFunctionSource @(${function:Resolve-UtilSampleNvidiaSmi}, ${function:Get-UtilSampleDgpuState}, ${function:New-UtilSampleOwnedFile}, ${function:Start-UtilSampleGpu}, ${function:Stop-UtilSampleProcess}, ${function:Read-UtilSampleText}, ${function:Split-UtilSampleLines}, ${function:Get-UtilSamplePlayWindow}, ${function:Select-UtilSampleWindowRows}, ${function:Get-UtilSampleHostZone}, ${function:Resolve-UtilSampleCaptureZone}, ${function:Test-UtilSampleClockSteady}, ${function:Invoke-ClocksPowerBounded}, ${function:Get-ClocksPowerNetStepMs}, ${function:Get-ClocksPowerClockCapture}, ${function:Get-ClocksPowerClockCheck}, ${function:Get-ClocksPowerClockWhy}, ${function:Get-ClocksPowerThrottleNames},${function:Get-ClocksPowerSeries}, ${function:ConvertFrom-ClocksPowerGpuRow}, ${function:ConvertFrom-ClocksPowerGpuCsv}, ${function:ConvertFrom-ClocksPowerCpuCsv}, ${function:Get-ClocksPowerGpuSummary}, ${function:Get-ClocksPowerCpuSummary}, ${function:ConvertFrom-ClocksPowerPowerCfg}, ${function:Get-ClocksPowerAcState}, ${function:ConvertFrom-ClocksPowerDisplay}, ${function:Get-ClocksPowerPlatform}, ${function:Resolve-ClocksPowerCounters}, ${function:Resolve-ClocksPowerTypeperf}, ${function:Get-ClocksPowerCounterList}, ${function:Invoke-ClocksPowerDStateBounded}, ${function:Get-ClocksPowerRawFileName}, ${function:Read-ClocksPowerSource}, ${function:Test-ClocksPowerPublishedCopy}, ${function:Close-ClocksPowerHold},${function:Start-ClocksPowerGpu}, ${function:Start-ClocksPowerCpu}, ${function:Stop-ClocksPowerAll}, ${function:Get-ClocksPowerBlock}) "`n"
+    $cwFunctions = Get-CorePartitionFunctionSource @(${function:Resolve-UtilSampleNvidiaSmi}, ${function:Get-UtilSampleDgpuState}, ${function:New-UtilSampleOwnedFile}, ${function:Start-UtilSampleGpu}, ${function:Stop-UtilSampleProcess}, ${function:Read-UtilSampleText}, ${function:Split-UtilSampleLines}, ${function:Get-UtilSamplePlayWindow}, ${function:Select-UtilSampleWindowRows}, ${function:Get-UtilSampleHostZone}, ${function:Resolve-UtilSampleCaptureZone}, ${function:Test-UtilSampleClockSteady}, ${function:Invoke-ClocksPowerBounded}, ${function:Get-ClocksPowerNetStepMs}, ${function:Get-ClocksPowerClockCapture}, ${function:Get-ClocksPowerClockCheck}, ${function:Get-ClocksPowerRowGapStats}, ${function:Get-ClocksPowerClockWhy}, ${function:Test-ClocksPowerPreflightSurvivor}, ${function:Get-ClocksPowerThrottleNames},${function:Get-ClocksPowerSeries}, ${function:ConvertFrom-ClocksPowerGpuRow}, ${function:ConvertFrom-ClocksPowerGpuCsv}, ${function:ConvertFrom-ClocksPowerCpuCsv}, ${function:Get-ClocksPowerGpuSummary}, ${function:Get-ClocksPowerCpuSummary}, ${function:ConvertFrom-ClocksPowerPowerCfg}, ${function:Get-ClocksPowerAcState}, ${function:ConvertFrom-ClocksPowerDisplay}, ${function:Get-ClocksPowerPlatform}, ${function:Resolve-ClocksPowerCounters}, ${function:Resolve-ClocksPowerTypeperf}, ${function:Get-ClocksPowerCounterList}, ${function:Invoke-ClocksPowerDStateBounded}, ${function:Get-ClocksPowerRawFileName}, ${function:Read-ClocksPowerSource}, ${function:Test-ClocksPowerPublishedCopy}, ${function:Close-ClocksPowerHold},${function:Start-ClocksPowerGpu}, ${function:Start-ClocksPowerCpu}, ${function:Stop-ClocksPowerAll}, ${function:Get-ClocksPowerBlock}) "`n"
     $cwLaunchLine = "Write-JobTrace 'step smoke-launch start (app launch + load + playback)'"
     $cwDoneLine = 'Write-JobTrace "step smoke-launch done rc=$smokeRc"'
     $cwStart = $cwOpen + "`n" + $cwFunctions + "`n" + "`$clocksPowerBackend = '$(([string]$Backend).ToLowerInvariant())'`n`$clocksPowerIntervalMs = [int]$ClocksPowerIntervalMs`n`$clocksPowerWarmup = `$$(if ([bool]$ClocksPowerWarmup) { 'true' } else { 'false' })`n" + @'
@@ -8599,7 +8652,7 @@ $clocksPowerClk2 = $null
 function Publish-ClocksPowerFiles {
     try {
         if (-not $script:clocksPowerGpuPublished) {
-            if ($null -eq $script:clocksPowerGpuRead -and $null -ne $clocksPowerStopRecord) { $script:clocksPowerGpuRead = Read-ClocksPowerSource $clocksPowerGpuStart.csvPath $clocksPowerGpuStart $clocksPowerStopRecord.gpu; Close-ClocksPowerHold $clocksPowerGpuStart $clocksPowerStopRecord.gpu }
+            if ($null -eq $script:clocksPowerGpuRead -and $null -ne $clocksPowerStopRecord) { $script:clocksPowerGpuRead = Read-ClocksPowerSource $clocksPowerGpuStart.csvPath $clocksPowerGpuStart $clocksPowerStopRecord.gpu; if ($null -ne $script:clocksPowerGpuRead) { Close-ClocksPowerHold $clocksPowerGpuStart $clocksPowerStopRecord.gpu } }
             if ($null -ne $script:clocksPowerGpuRead) {
                 $clocksPowerGpuDest = Join-Path $Pub 'gpu-clocks.csv'
                 [void](Publish-AttrCudaFileCopy -Source $clocksPowerGpuStart.csvPath -Destination $clocksPowerGpuDest)
@@ -8609,7 +8662,7 @@ function Publish-ClocksPowerFiles {
     } catch { Write-JobTrace "step clocks-power publish file=gpu-clocks.csv error=$([string]$_.CategoryInfo.Reason)" }
     try {
         if (-not $script:clocksPowerCpuPublished) {
-            if ($null -eq $script:clocksPowerCpuRead -and $null -ne $clocksPowerStopRecord) { $script:clocksPowerCpuRead = Read-ClocksPowerSource $clocksPowerCpuCsv $clocksPowerCpuStart $clocksPowerStopRecord.cpu; Close-ClocksPowerHold $clocksPowerCpuStart $clocksPowerStopRecord.cpu }
+            if ($null -eq $script:clocksPowerCpuRead -and $null -ne $clocksPowerStopRecord) { $script:clocksPowerCpuRead = Read-ClocksPowerSource $clocksPowerCpuCsv $clocksPowerCpuStart $clocksPowerStopRecord.cpu; if ($null -ne $script:clocksPowerCpuRead) { Close-ClocksPowerHold $clocksPowerCpuStart $clocksPowerStopRecord.cpu } }
             if ($null -ne $script:clocksPowerCpuRead) {
                 $clocksPowerCpuDest = Join-Path $Pub 'cpu-clocks.csv'
                 [void](Publish-AttrCudaFileCopy -Source $clocksPowerCpuCsv -Destination $clocksPowerCpuDest)
@@ -8624,19 +8677,34 @@ try { $clocksPowerZoneAtStart = Get-UtilSampleHostZone } catch { }
 try { $clocksPowerPlatform = Get-ClocksPowerPlatform } catch { }
 # adversary ebfb3c2b A1 / 841c00e1 A1 / 16901aea A2: the first of two bracketed (wall, monotonic) captures, taken BEFORE either sampler starts (a step between a
 # sampler's first row and a later capture would be in neither span); the second is taken after both are stopped, so the net step spans every row they wrote
-try { $clocksPowerClk1 = Get-ClocksPowerClockCapture } catch { }
-try { $clocksPowerGpuStart = Start-ClocksPowerGpu $clocksPowerBackend (Resolve-UtilSampleNvidiaSmi) $clocksPowerGpuCsv ${function:Get-UtilSampleDgpuState} $clocksPowerIntervalMs } catch { }
+$clocksPowerTypeperf = ''; $clocksPowerList = $null; $clocksPowerPkg = [ordered]@{ pkgPath = $null; reason = 'energy-meter-counter-absent' }
+$clocksPowerListRead = $false
+# adversary c11fb3d0 A2: the Energy Meter listing is a pre-launch child like the power-plan read, so it is read BEFORE the first clock capture and the sampler
+# starts; a pre-launch child that survived its kill means neither sampler starts (it could not be killed, so it would perturb the measured leg)
 try {
     $clocksPowerTypeperf = Resolve-ClocksPowerTypeperf
     $clocksPowerList = Get-ClocksPowerCounterList $clocksPowerTypeperf
     $clocksPowerPkg = Resolve-ClocksPowerCounters $clocksPowerList.lines
     if ($clocksPowerList.why) { $clocksPowerPkg = [ordered]@{ pkgPath = $null; reason = $clocksPowerList.why } }
-    $clocksPowerCounters = @('\Processor Information(_Total)\% Processor Performance', '\Processor Information(_Total)\Processor Frequency')
-    if ($null -ne $clocksPowerPkg.pkgPath) { $clocksPowerCounters += [string]$clocksPowerPkg.pkgPath }
-    $clocksPowerCpuStart = Start-ClocksPowerCpu $clocksPowerTypeperf $clocksPowerCpuCsv $clocksPowerIntervalMs $clocksPowerCounters
-    $clocksPowerCpuStart['pkgReason'] = $clocksPowerPkg.reason
+    $clocksPowerListRead = $true
 } catch { }
-Write-JobTrace "step clocks-power start gpu=$($clocksPowerGpuStart.status) gpuReason=$($clocksPowerGpuStart.reason) gpuPid=$($clocksPowerGpuStart.pid) dState=$($clocksPowerGpuStart.dState) throttleField=$($clocksPowerGpuStart.throttleField) cpu=$($clocksPowerCpuStart.status) cpuReason=$($clocksPowerCpuStart.reason) cpuPid=$($clocksPowerCpuStart.pid) pkgReason=$($clocksPowerCpuStart.pkgReason) intervalMs=$clocksPowerIntervalMs warmup=$clocksPowerWarmup"
+$clocksPowerPreflightSurvivor = $false
+try { $clocksPowerPreflightSurvivor = [bool](Test-ClocksPowerPreflightSurvivor $clocksPowerPlatform $clocksPowerList) } catch { }
+try { $clocksPowerClk1 = Get-ClocksPowerClockCapture } catch { }
+if ($clocksPowerPreflightSurvivor) {
+    $clocksPowerGpuStart = [ordered]@{ status = 'unavailable'; reason = 'preflight-child-survived'; why = $null; proc = $null; pid = $null; startTicks = $null; dState = $null; wakeDisclosure = $null; owned = $false; hold = $null; csvPath = $clocksPowerGpuCsv; throttleField = $null }
+    $clocksPowerCpuStart = [ordered]@{ status = 'unavailable'; reason = 'preflight-child-survived'; why = $null; proc = $null; pid = $null; owned = $false; hold = $null; csvPath = $clocksPowerCpuCsv; pkgReason = $null }
+} else {
+    try { $clocksPowerGpuStart = Start-ClocksPowerGpu $clocksPowerBackend (Resolve-UtilSampleNvidiaSmi) $clocksPowerGpuCsv ${function:Get-UtilSampleDgpuState} $clocksPowerIntervalMs } catch { }
+    try {
+        if (-not $clocksPowerListRead) { throw 'the Energy Meter listing did not run' }
+        $clocksPowerCounters = @('\Processor Information(_Total)\% Processor Performance', '\Processor Information(_Total)\Processor Frequency')
+        if ($null -ne $clocksPowerPkg.pkgPath) { $clocksPowerCounters += [string]$clocksPowerPkg.pkgPath }
+        $clocksPowerCpuStart = Start-ClocksPowerCpu $clocksPowerTypeperf $clocksPowerCpuCsv $clocksPowerIntervalMs $clocksPowerCounters
+        $clocksPowerCpuStart['pkgReason'] = $clocksPowerPkg.reason
+    } catch { }
+}
+Write-JobTrace "step clocks-power start gpu=$($clocksPowerGpuStart.status) gpuReason=$($clocksPowerGpuStart.reason) gpuPid=$($clocksPowerGpuStart.pid) dState=$($clocksPowerGpuStart.dState) throttleField=$($clocksPowerGpuStart.throttleField) cpu=$($clocksPowerCpuStart.status) cpuReason=$($clocksPowerCpuStart.reason) cpuPid=$($clocksPowerCpuStart.pid) pkgReason=$($clocksPowerCpuStart.pkgReason) preflightSurvivor=$clocksPowerPreflightSurvivor intervalMs=$clocksPowerIntervalMs warmup=$clocksPowerWarmup"
 '@ + "`n" + $cwClose + "`n"
     $text = Edit-ClocksPowerText $text ($cwLaunchLine + "`n") ($cwStart + $cwLaunchLine + "`n") 'start the clocks/power samplers before the measured launch at'
     $cwStop = $cwOpen + "`n" + @'
@@ -8656,10 +8724,11 @@ try { $clocksPowerClk2 = Get-ClocksPowerClockCapture } catch { }
 # A3: the files are published FIRST, and the block names only a file whose copy succeeded and matches (a refused copy is a trace line and rawFile says so)
 try {
     if ($null -ne $clocksPowerStopRecord) {
+        # adversary c11fb3d0 A3: a hold is released only after a read that worked; a failed read leaves it for the retry (the outer finally's), on the same handle
         $clocksPowerGpuRead = Read-ClocksPowerSource $clocksPowerGpuStart.csvPath $clocksPowerGpuStart $clocksPowerStopRecord.gpu
-        Close-ClocksPowerHold $clocksPowerGpuStart $clocksPowerStopRecord.gpu
+        if ($null -ne $clocksPowerGpuRead) { Close-ClocksPowerHold $clocksPowerGpuStart $clocksPowerStopRecord.gpu }
         $clocksPowerCpuRead = Read-ClocksPowerSource $clocksPowerCpuCsv $clocksPowerCpuStart $clocksPowerStopRecord.cpu
-        Close-ClocksPowerHold $clocksPowerCpuStart $clocksPowerStopRecord.cpu
+        if ($null -ne $clocksPowerCpuRead) { Close-ClocksPowerHold $clocksPowerCpuStart $clocksPowerStopRecord.cpu }
     }
 } catch { }
 Publish-ClocksPowerFiles
@@ -8712,12 +8781,12 @@ Write-JobTrace "step clocks-power summary status=$($clocksPowerBlock['status']) 
     }
 '@ + "`n    $cwClose`n"
     $text = Edit-ClocksPowerText $text $cwFinallyAnchor ($cwFinally + $cwFinallyAnchor) 'stop and publish the clocks/power samplers in the outer finally at'
-    # the worst path (adversary de9ca8e7 A2 and 841c00e1 A2: every pre-launch read is bounded, so this sum is a real bound): the start's five bounded reads
-    # (powercfg, Win32_Battery, Win32_VideoController, typeperf -qx and the dGPU PnP read: 4 s each = 20 s) plus the nvidia-smi argument-check wait (1.2 s), up to
-    # 10 ms x 5 clock-capture retries (negligible), region 2 (each side a kill and a 5 s wait) 10 s, and the outer finally's two more retries (20 s) = 51.2 s,
-    # so 55 s
-    $timeBudget['clocksPowerSec'] = 55
-    $timeBudget['jobTimeoutSec'] = [int]($timeBudget.jobTimeoutSec + 55)
+    # the worst path (adversary de9ca8e7 A2, 841c00e1 A2 and c11fb3d0 A2: every pre-launch read is bounded, so this sum is a real bound): the start's five
+    # bounded reads (powercfg, Win32_Battery, Win32_VideoController, typeperf -qx and the dGPU PnP read: 4 s each = 20 s) plus the 2 s kill wait after each of the
+    # two that run a child (powercfg, typeperf -qx: 4 s), plus the nvidia-smi argument-check wait (1.2 s), up to 10 ms x 5 clock-capture retries (negligible),
+    # region 2 (each side a kill and a 5 s wait) 10 s, and the outer finally's two more retries (20 s) = 55.2 s, so 60 s
+    $timeBudget['clocksPowerSec'] = 60
+    $timeBudget['jobTimeoutSec'] = [int]($timeBudget.jobTimeoutSec + 60)
 }
 
 $outDir = Split-Path -Parent $OutFile

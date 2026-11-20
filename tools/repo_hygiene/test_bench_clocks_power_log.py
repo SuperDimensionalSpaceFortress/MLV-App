@@ -245,6 +245,18 @@ class ClocksPowerGeneratorTests(unittest.TestCase):
         self.assertIsNotNone(stop)
         self.assertNotIn("Dispose", stop.group(0), "the names stay held past the stop; Close-ClocksPowerHold releases them after the one read")
 
+    def test_r7_a2_the_job_decides_on_a_surviving_pre_launch_child_before_either_sampler_starts(self) -> None:
+        text = lf(self.job("cp-cuda"))
+        body = "\n".join(region_re(OPEN, CLOSE).findall(text))
+        guard = body.index("Test-ClocksPowerPreflightSurvivor $clocksPowerPlatform")
+        self.assertEqual(len(re.findall(r"(?m)^function Test-ClocksPowerPreflightSurvivor\b", text)), 1)
+        self.assertEqual(len(re.findall(r"(?m)^function Get-ClocksPowerRowGapStats\b", text)), 1)
+        self.assertIn("preflight-child-survived", body)
+        self.assertLess(body.index("$clocksPowerList = Get-ClocksPowerCounterList"), guard, "the Energy Meter listing is a pre-launch child too")
+        self.assertLess(guard, body.index("$clocksPowerClk1 = Get-ClocksPowerClockCapture"), "decided before the first capture")
+        self.assertLess(guard, body.index("$clocksPowerGpuStart = Start-ClocksPowerGpu $clocksPowerBackend"), "decided before nvidia-smi starts")
+        self.assertLess(guard, body.index("$clocksPowerCpuStart = Start-ClocksPowerCpu"), "and before typeperf starts")
+
     def test_r6_a2_the_dgpu_pnp_read_is_bounded_on_the_clocks_path(self) -> None:
         text = lf(self.job("cp-cuda"))
         self.assertEqual(len(re.findall(r"(?m)^function Invoke-ClocksPowerDStateBounded\b", text)), 1)
@@ -750,11 +762,12 @@ $r['a3Block'] = @{ gpu = $blk.gpu.rawFile; cpu = $blk.cpu.rawFile }
 # A3 (pass 4, adversary 16901aea): the ONE read of a sampler CSV, and the proof that a published copy is those bytes
 $srcPath = Join-Path $env:CP_TMP 'src.csv'
 [IO.File]::WriteAllText($srcPath, "a,b`r`n1,2`r`n", [Text.UTF8Encoding]::new($true))
-$owned = @{ owned = $true }; $stopped = @{ stopped = $true }
+$srcHold = [IO.File]::Open($srcPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+$owned = @{ owned = $true; hold = $srcHold }; $stopped = @{ stopped = $true }
 $rd = Read-ClocksPowerSource $srcPath $owned $stopped
 $r['a3Read'] = T { @{ text = $rd.text; shaIsFile = ($rd.sha256 -ceq (Get-FileHash -LiteralPath $srcPath -Algorithm SHA256).Hash.ToLowerInvariant()); bytesIsFile = ($rd.bytes -eq (Get-Item -LiteralPath $srcPath).Length) } }
-$r['a3ReadRefused'] = @(($null -eq (Read-ClocksPowerSource $srcPath @{ owned = $false } $stopped)), ($null -eq (Read-ClocksPowerSource $srcPath $owned @{ stopped = $false })),
-    ($null -eq (Read-ClocksPowerSource $srcPath $owned $null)), ($null -eq (Read-ClocksPowerSource $srcPath $null $stopped)), ($null -eq (Read-ClocksPowerSource (Join-Path $env:CP_TMP 'no-such.csv') $owned $stopped)))
+$r['a3ReadRefused'] = @(($null -eq (Read-ClocksPowerSource $srcPath @{ owned = $false; hold = $srcHold } $stopped)), ($null -eq (Read-ClocksPowerSource $srcPath $owned @{ stopped = $false })),
+    ($null -eq (Read-ClocksPowerSource $srcPath $owned $null)), ($null -eq (Read-ClocksPowerSource $srcPath $null $stopped)), ($null -eq (Read-ClocksPowerSource $srcPath @{ owned = $true } $stopped)))
 $dstPath = Join-Path $env:CP_TMP 'dst.csv'
 Copy-Item -LiteralPath $srcPath -Destination $dstPath -Force
 $same = Test-ClocksPowerPublishedCopy $dstPath $rd
@@ -825,7 +838,7 @@ class ClocksPowerPassThreeTests(unittest.TestCase):
 
     def test_r6b_a3_one_read_of_a_sampler_csv_feeds_both_the_summary_and_the_published_copy_check(self) -> None:
         self.assertEqual(self.r["a3Read"], {"text": "a,b\r\n1,2\r\n", "shaIsFile": True, "bytesIsFile": True}, "UTF-8 decoded with the BOM dropped; the hash and the length are the file's")
-        self.assertEqual(self.r["a3ReadRefused"], [True] * 5, "not owned, writer not stopped, no stop record, no start record, absent: nothing is read")
+        self.assertEqual(self.r["a3ReadRefused"], [True] * 5, "not owned, writer not stopped, no stop record, no start record, no hold: nothing is read")
         self.assertEqual(self.r["a3Copy"], {"same": True, "differs": False, "noRead": False, "missing": False},
                          "a copy that hashes differently from the bytes the summary was parsed from is not published")
 
@@ -838,6 +851,191 @@ class ClocksPowerPassThreeTests(unittest.TestCase):
     def test_r6b_a3_the_names_stay_held_until_the_caller_has_read_them(self) -> None:
         self.assertEqual(self.r["a3Hold"], {"heldWhileRunning": True, "releasedWhenStopped": True})
         self.assertTrue(self.r["a3HoldNotStarted"])
+
+
+# r7 (hub ruling 2026-11-20): the GPU witness refused EVERY window on the venue (r5 ON legs: 51 GPU rows against 93-94 CPU rows in the same legs, so the
+# sampler cycles at about 1.8 s a row while the nominal interval is 1 s, and every adjacent gap broke max(200 ms, 0.4 x nominal)). The GPU gap test now
+# judges the gaps against the OBSERVED median gap (a non-rising stamp, a gap over 10 s and a net clock step still refuse), and both summaries disclose the
+# observed gaps (rowGapMs) so the cause is provable from summary.json on every run, a refused window included. Three cheap fixes of adversary pass 5:
+#   A1  the net-step bound adds the capture width (a capture's monotonic stamp is the midpoint of its bracket): |net| + width > 250 refuses;
+#   A2  a pre-launch child that survives the kill is reported (survived), typed (powercfg-survivor / energy-meter-enumeration-survivor), and the job starts
+#       neither sampler beside it (unavailable(preflight-child-survived)); the kill waits are in the job-time budget (60 s);
+#   A3  a CSV is read from the job's own held handle (no second path-based open), and the hold is closed only after a read that worked.
+DRIVER_R7 = r"""
+function J($v) { $v | ConvertTo-Json -Depth 8 -Compress }
+function T($sb) { try { & $sb } catch { 'ERR: ' + $_.Exception.Message } }
+function St($o) { if ($o -is [string]) { $o } else { [string]$o.status } }
+$r = [ordered]@{}
+$cst = [TimeZoneInfo]::FindSystemTimeZoneById('Central Standard Time')
+$running = [ordered]@{ status = 'running'; reason = $null }
+$inv = [Globalization.CultureInfo]::InvariantCulture
+function GpuAt([double[]]$secs) {
+    $t = ''
+    foreach ($s in $secs) { $t += ("2026/11/01 08:00:{0}, 1500, 1500, 6000, 50.00, 80.00, 60, 0x0000000000000000`n" -f $s.ToString('00.000', $inv)) }
+    ConvertFrom-ClocksPowerGpuCsv $t $cst
+}
+function CpuAt([double[]]$secs) {
+    $t = "`"(PDH-CSV 4.0) (Central Standard Time)(360)`",`"\\B\Processor Information(_Total)\% Processor Performance`",`"\\B\Processor Information(_Total)\Processor Frequency`"`n"
+    foreach ($s in $secs) { $t += ("`"11/01/2026 08:00:{0}`",`"100.0`",`"2000.0`"`n" -f $s.ToString('00.000', $inv)) }
+    ConvertFrom-ClocksPowerCpuCsv $t $cst
+}
+function Chk($interval, $net, $width) { $c = [ordered]@{ intervalMs = $interval; netStepMs = $net }; if ($null -ne $width) { $c['captureWidthMs'] = $width }; $c }
+$win = [ordered]@{ startUtc = [DateTime]::new(2026, 11, 1, 14, 0, 3, 0, [DateTimeKind]::Utc); endUtc = [DateTime]::new(2026, 11, 1, 14, 0, 50, 0, [DateTimeKind]::Utc); clockWhy = $null }
+# the measured venue cadence: nominal 1000 ms, a row about every 1.8 s (gaps 1.9, 1.9, 1.6 s repeating)
+$cad = @(); for ($k = 0; $k -lt 30; $k++) { $cad += (0.1 + 1.8 * $k + (($k % 3) - 1) * 0.1) }
+$g18 = T { Get-ClocksPowerGpuSummary (GpuAt $cad) $running $win $null (Chk 1000 0 5) }
+$r['cad18'] = @{ status = St $g18; samples = $g18.samples; total = $g18.samplesTotal; gaps = $g18.rowGapMs }
+$bent = @($cad | ForEach-Object -Begin { $i = 0 } -Process { $v = $_; if ($i -ge 15) { $v = $v - 0.8 }; $i++; $v })
+$big = @($cad | ForEach-Object -Begin { $i = 0 } -Process { $v = $_; if ($i -ge 15) { $v = $v + 2.4 }; $i++; $v })
+$back = @($cad | ForEach-Object -Begin { $i = 0 } -Process { $v = $_; if ($i -eq 10) { $v = $cad[8] - 0.05 }; $i++; $v })
+$gb = T { Get-ClocksPowerGpuSummary (GpuAt $bent) $running $win $null (Chk 1000 0 5) }
+$r['cad18Bent'] = @{ status = St $gb; gaps = $gb.rowGapMs }
+$r['cad18Big'] = St (T { Get-ClocksPowerGpuSummary (GpuAt $big) $running $win $null (Chk 1000 0 5) })
+$r['cad18Back'] = St (T { Get-ClocksPowerGpuSummary (GpuAt $back) $running $win $null (Chk 1000 0 5) })
+$r['cad18Net'] = St (T { Get-ClocksPowerGpuSummary (GpuAt $cad) $running $win $null (Chk 1000 600 5) })
+$r['cad18TwoGaps'] = St (T { Get-ClocksPowerGpuSummary (GpuAt @($cad[0], $cad[1], $cad[2])) $running $win $null (Chk 1000 0 5) })
+$r['cad18ThreeGaps'] = St (T { Get-ClocksPowerGpuSummary (GpuAt @($cad[0], $cad[1], $cad[2], $cad[3])) $running $win $null (Chk 1000 0 5) })
+$r['cad18Cpu'] = St (T { Get-ClocksPowerCpuSummary (CpuAt $cad) $running $win $null (Chk 1000 0 5) })
+$c1 = T { $s = Get-ClocksPowerCpuSummary (CpuAt @(10, 11, 12, 13, 14)) $running $win $null (Chk 1000 0 5); @{ status = St $s; gaps = $s.rowGapMs } }
+$r['cpuGaps'] = $c1
+$r['gapsOneRow'] = T { (Get-ClocksPowerGpuSummary (GpuAt @(10)) $running $win $null (Chk 1000 0 5)).rowGapMs }
+$r['gapsNotStarted'] = T { (Get-ClocksPowerGpuSummary $null $null $win).rowGapMs }
+$r['gapStats'] = T { Get-ClocksPowerRowGapStats (GpuAt @(10, 11, 13, 16)).rows }
+# A1: a persistent +260 ms step read as 240 by the midpoints, with 20 ms brackets
+$f = [int64]10000000
+$w1 = [int64]639307728000200000
+$steady5 = (GpuAt @(18.1, 23.1, 28.1, 33.1)).rows
+function Clk([int64]$wallDeltaTicks, [double]$width) { Get-ClocksPowerClockCheck @($w1, [int64]100000, $width) @(($w1 + $wallDeltaTicks), [int64]300100000, $width) 5000 $f }
+$r['a1Adv'] = T { Get-ClocksPowerClockWhy $steady5 (Clk 302400000 20.0) }
+$r['a1AdvNeg'] = T { Get-ClocksPowerClockWhy $steady5 (Clk 297600000 20.0) }
+$r['a1Boundary'] = T { Get-ClocksPowerClockWhy $steady5 (Clk 302450000 5.0) }
+$r['a1Over'] = T { Get-ClocksPowerClockWhy $steady5 (Clk 302460000 5.0) }
+$r['a1NoWidth250'] = T { Get-ClocksPowerClockWhy $steady5 (Chk 5000 250 $null) }
+$r['a1NoWidth251'] = T { Get-ClocksPowerClockWhy $steady5 (Chk 5000 251 $null) }
+$r['a1ShapeAdv'] = T { $c = Clk 302400000 20.0; @{ net = $c.netStepMs; width = $c.captureWidthMs } }
+# A2: a tool that survives its kill
+$ping = Join-Path $env:SystemRoot 'System32\ping.exe'
+$sv = T { Invoke-ClocksPowerBounded $ping '-n 30 127.0.0.1' 800 { param($p) throw 'kill refused' } }
+$r['a2Survivor'] = T { @{ timedOut = $sv.timedOut; survived = $sv.survived; hasPid = ([int]$sv.pid -gt 0) } }
+try { if ([int]$sv.pid -gt 0) { Stop-Process -Id ([int]$sv.pid) -Force -ErrorAction SilentlyContinue } } catch { }
+$kd = T { Invoke-ClocksPowerBounded $ping '-n 30 127.0.0.1' 800 }
+$r['a2Killed'] = T { @{ timedOut = $kd.timedOut; survived = $kd.survived } }
+$qk = T { Invoke-ClocksPowerBounded $ping '-n 1 127.0.0.1' 15000 }
+$r['a2Quick'] = T { @{ ok = $qk.ok; timedOut = $qk.timedOut; survived = $qk.survived } }
+$cl = T { Get-ClocksPowerCounterList $ping 800 '-n 30 127.0.0.1' { param($p) throw 'kill refused' } }
+$r['a2List'] = T { @{ lines = @($cl.lines).Count; why = $cl.why } }
+$r['a2Preflight'] = T { @((Test-ClocksPowerPreflightSurvivor @{ powerPlan = 'UNAVAILABLE(powercfg-survivor)' } @{ why = $null }), (Test-ClocksPowerPreflightSurvivor @{ powerPlan = 'UNAVAILABLE(powercfg-timeout)' } @{ why = 'energy-meter-enumeration-survivor' }),
+    (Test-ClocksPowerPreflightSurvivor @{ powerPlan = 'UNAVAILABLE(powercfg-timeout)' } @{ why = 'energy-meter-enumeration-timeout' }), (Test-ClocksPowerPreflightSurvivor $null $null), (Test-ClocksPowerPreflightSurvivor @{ powerPlan = [ordered]@{ name = 'Balanced'; guid = 'x' } } @{ why = $null })) }
+# A3: the bytes come from the held handle, never from the path
+$p3 = Join-Path $env:CP_TMP 'a3-held.csv'
+$foreign = Join-Path $env:CP_TMP 'a3-foreign.csv'
+[IO.File]::WriteAllText($p3, "orig,1`r`n", [Text.UTF8Encoding]::new($false))
+[IO.File]::WriteAllText($foreign, "foreign,9`r`n", [Text.UTF8Encoding]::new($false))
+$hold = [IO.File]::Open($p3, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+$st = [ordered]@{ owned = $true; hold = $hold }; $stopped = @{ stopped = $true }
+$rd = Read-ClocksPowerSource $foreign $st $stopped
+$r['a3FromHold'] = T { @{ text = $rd.text; bytes = $rd.bytes; shaIsOrig = ($rd.sha256 -ceq (Get-FileHash -LiteralPath $p3 -Algorithm SHA256).Hash.ToLowerInvariant()) } }
+$r['a3NoHold'] = ($null -eq (Read-ClocksPowerSource $foreign ([ordered]@{ owned = $true; hold = $null }) $stopped))
+$closed = [IO.File]::Open($p3, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite); $closed.Dispose()
+$r['a3ClosedHold'] = ($null -eq (Read-ClocksPowerSource $foreign ([ordered]@{ owned = $true; hold = $closed }) $stopped))
+# a failed first read leaves the hold open, the path cannot be replaced meanwhile, and the retry reads the same handle
+$lk = [IO.File]::Open($p3, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)
+$lk.Lock(0, 4)
+$first = Read-ClocksPowerSource $p3 $st $stopped
+$r['a3First'] = ($null -eq $first)
+$r['a3HoldCanReadAfterFail'] = $hold.CanRead
+$replaced = $true
+try { Move-Item -LiteralPath $foreign -Destination $p3 -Force -ErrorAction Stop } catch { $replaced = $false }
+$r['a3Replaced'] = $replaced
+$lk.Unlock(0, 4); $lk.Dispose()
+$second = Read-ClocksPowerSource $p3 $st $stopped
+$r['a3Second'] = T { @{ text = $second.text } }
+$hold.Dispose()
+J $r
+"""
+
+
+@requires_windows_pwsh
+class ClocksPowerRoundSevenTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="clocks-power-r7-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        script = Path(cls._tmp.name) / "driver.ps1"
+        script.write_text(LIFT + DRIVER_R7, encoding="utf-8")
+        proc = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_TMP": cls._tmp.name})
+        cls.raw = proc
+        cls.r = json.loads(proc.stdout.strip().splitlines()[-1]) if proc.returncode == 0 and proc.stdout.strip() else None
+        cls.text = lf(GENERATOR.read_text(encoding="utf-8"))
+
+    def setUp(self) -> None:
+        self.assertIsNotNone(self.r, f"the lifted helpers did not run: {self.raw.stdout[-3000:]}{self.raw.stderr[-3000:]}")
+
+    def test_r7_gpu_rows_at_the_measured_1_8_s_cadence_are_judged_against_their_own_median_gap(self) -> None:
+        g = self.r["cad18"]
+        self.assertEqual((g["status"], g["total"]), ("ok", 30), "30 rows at about 1.8 s against a 1000 ms nominal: the venue's measured cadence is not a clock excursion")
+        self.assertGreaterEqual(g["samples"], 20)
+        self.assertEqual((g["gaps"]["n"], g["gaps"]["minMs"], g["gaps"]["medianMs"], g["gaps"]["maxMs"]), (29, 1600.0, 1900.0, 1900.0))
+        self.assertEqual(self.r["cad18Cpu"], "unavailable(sample-clock-unverified)", "the CPU side keeps its nominal-interval rule (typeperf -si is whole seconds)")
+
+    def test_r7_an_excursion_a_gap_a_backwards_stamp_and_a_net_step_still_refuse_at_that_cadence(self) -> None:
+        self.assertEqual(self.r["cad18Bent"]["status"], "unavailable(sample-clock-unverified)", "one 0.8 s gap among 1.9 s gaps is off the median by 1.1 s (> 0.76 s)")
+        self.assertEqual(self.r["cad18Big"], "unavailable(sample-clock-unverified)")
+        self.assertEqual(self.r["cad18Back"], "unavailable(sample-clock-unverified)", "a stamp that does not rise")
+        self.assertEqual(self.r["cad18Net"], "unavailable(sample-clock-unverified)", "a 600 ms net step")
+        self.assertEqual(self.r["cad18TwoGaps"], "unavailable(sample-clock-unverified)", "fewer than three gaps have no observed cadence: the nominal interval judges them")
+        self.assertEqual(self.r["cad18ThreeGaps"], "ok", "three gaps are the first with an observed median")
+
+    def test_r7_both_summaries_disclose_the_observed_row_gaps_even_when_the_window_is_refused(self) -> None:
+        self.assertEqual(self.r["cad18Bent"]["gaps"]["n"], 29)
+        self.assertEqual(self.r["cad18Bent"]["gaps"]["minMs"], 800.0, "the refused window still carries what the stamps said")
+        self.assertEqual(self.r["cpuGaps"], {"status": "ok", "gaps": {"n": 4, "minMs": 1000.0, "medianMs": 1000.0, "maxMs": 1000.0}})
+        self.assertEqual(self.r["gapsOneRow"], "UNAVAILABLE(fewer-than-two-rows)")
+        self.assertEqual(self.r["gapsNotStarted"], "UNAVAILABLE(start-not-reached)")
+        self.assertEqual(self.r["gapStats"], {"n": 3, "minMs": 1000.0, "medianMs": 2000.0, "maxMs": 3000.0})
+
+    def test_r7_a1_the_net_step_bound_includes_the_capture_width(self) -> None:
+        self.assertEqual(self.r["a1ShapeAdv"], {"net": 240.0, "width": 20.0})
+        self.assertEqual(self.r["a1Adv"], "sample-clock-unverified", "the adversary input: net 240 with 20 ms brackets reads as 260 against a real +260 ms step")
+        self.assertEqual(self.r["a1AdvNeg"], "sample-clock-unverified", "either sign")
+        self.assertIsNone(self.r["a1Boundary"], "net 245 + width 5 is 250, the bound itself")
+        self.assertEqual(self.r["a1Over"], "sample-clock-unverified")
+        self.assertIsNone(self.r["a1NoWidth250"], "no width is width 0: the older 250 stays ok")
+        self.assertEqual(self.r["a1NoWidth251"], "sample-clock-unverified")
+
+    def test_r7_a2_a_tool_that_survives_the_kill_is_reported_and_typed(self) -> None:
+        self.assertEqual(self.r["a2Survivor"], {"timedOut": True, "survived": True, "hasPid": True})
+        self.assertEqual(self.r["a2Killed"], {"timedOut": True, "survived": False}, "an ordinary kill leaves no survivor")
+        self.assertEqual(self.r["a2Quick"], {"ok": True, "timedOut": False, "survived": False})
+        self.assertEqual(self.r["a2List"], {"lines": 0, "why": "energy-meter-enumeration-survivor"})
+        self.assertEqual(self.r["a2Preflight"], [True, True, False, False, False])
+
+    def test_r7_a2_the_job_starts_neither_sampler_beside_a_survivor_and_budgets_the_kill_waits(self) -> None:
+        bounded = re.search(r"(?ms)^function Invoke-ClocksPowerBounded\b.*?^}", self.text)
+        self.assertIsNotNone(bounded)
+        self.assertIn("Kill($true)", bounded.group(0), "the tree is killed, then the process")
+        platform = re.search(r"(?ms)^function Get-ClocksPowerPlatform\b.*?^}", self.text)
+        self.assertIsNotNone(platform)
+        self.assertIn("UNAVAILABLE(powercfg-survivor)", platform.group(0))
+        self.assertEqual(len(re.findall(r"(?m)^function Test-ClocksPowerPreflightSurvivor\b", self.text)), 1)
+        self.assertEqual(self.text.count("${function:Test-ClocksPowerPreflightSurvivor}"), 1, "the job carries the helper")
+        self.assertEqual(self.text.count("${function:Get-ClocksPowerRowGapStats}"), 1, "the job carries the gap helper")
+        self.assertIn("$timeBudget['clocksPowerSec'] = 60", self.text)
+
+    def test_r7_a3_a_csv_is_read_from_the_held_handle_never_from_the_path(self) -> None:
+        self.assertEqual(self.r["a3FromHold"], {"text": "orig,1\r\n", "bytes": 8, "shaIsOrig": True}, "the path argument names a foreign file: the bytes are the hold's")
+        self.assertTrue(self.r["a3NoHold"], "no hold: nothing is read, whatever the path holds")
+        self.assertTrue(self.r["a3ClosedHold"], "a released hold is not a source")
+        self.assertTrue(self.r["a3First"], "a byte-range lock makes the first read fail")
+        self.assertTrue(self.r["a3HoldCanReadAfterFail"], "a failed read leaves the hold open")
+        self.assertFalse(self.r["a3Replaced"], "the held name cannot be replaced while the hold is open")
+        self.assertEqual(self.r["a3Second"], {"text": "orig,1\r\n"}, "the retry reads the same handle and gets the original bytes")
+
+    def test_r7_a3_the_hold_is_closed_only_after_a_read_that_worked(self) -> None:
+        sites = [ln.strip() for ln in self.text.splitlines() if "Close-ClocksPowerHold $clocksPower" in ln]
+        self.assertGreaterEqual(len(sites), 4, "two in the metrics region, two in Publish-ClocksPowerFiles")
+        for ln in sites:
+            self.assertRegex(ln, r"if \(\$null -ne \$(?:script:)?clocksPower(?:Gpu|Cpu)Read\) \{ Close-ClocksPowerHold ", ln)
 
 
 @requires_windows_pwsh
