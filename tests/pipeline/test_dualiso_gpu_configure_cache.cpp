@@ -20,6 +20,10 @@ extern "C" int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install);
 extern "C" int llrpResetGpuExportBackendForTesting(void);
 extern "C" int llrpSetFakeGpuBackendIsoPatternSymbolForTesting(int present);
 extern "C" void llrpFakeGpuBackendIsoPatternStateForTesting(uint64_t * set_calls, int * last_run_is_bright4);
+extern "C" int llrpFakeGpuBackendLastRunStateForTesting(int * width, int * height, int * black, int * white,
+                                                         int * is_bright4, const void ** raw2ev, const void ** ev2raw,
+                                                         const void ** mix, const void ** fullres, const void ** randn,
+                                                         int * notch);
 extern "C" void llrpFakeGpuBackendReducedIsoNotchStateForTesting(int * last_run_flag,
                                                                  uint64_t * runs_with_notch,
                                                                  uint64_t * runs_without_notch,
@@ -383,4 +387,86 @@ TEST(DualIsoGpuConfigureCache, AnAlternatingPatternIsSentWheneverItChangesAndNev
         ASSERT_EQ((i & 1) ? 0 : 1, patternState().lastRun[1]);
     }
     ASSERT_EQ(7u, sends);   // frames 1..7 each differ from the frame before
+}
+
+// The model check behind "pixels identical to MASTER": whatever the cache skips, the state the backend RUNS under
+// (dims, levels, ISO pattern, LUT pointers, notch) is, on every one of 600 frames, exactly the state that frame's
+// inputs describe. A random walk over the four ISO patterns with occasional level, LUT-set and dims changes, run both
+// with the export present and with it absent (an older DLL).
+namespace
+{
+
+struct Lcg
+{
+    uint32_t s;
+    uint32_t next()
+    {
+        s = s * 1664525u + 1013904223u;
+        return s >> 8;
+    }
+};
+
+void checkEveryRunSawItsFramesState(bool exportPresent)
+{
+    FakeBackendScope scope;
+    if (!exportPresent) ASSERT_EQ(1, llrpSetFakeGpuBackendIsoPatternSymbolForTesting(0));
+    const int patterns[4][4] = { { 1, 1, 0, 0 }, { 1, 0, 0, 1 }, { 0, 0, 1, 1 }, { 0, 1, 1, 0 } };
+    Lcg rng = { 12345u };
+    int black = 100;
+    int width = 4;
+    const ConfigureLuts * luts = &g_luts;
+    uint64_t quietFrames = 0;
+    for (int frame = 0; frame < 600; ++frame)
+    {
+        const uint32_t r = rng.next();
+        const int pattern = int(r & 3u);
+        if ((r >> 4) % 23u == 0u) black = (black == 100) ? 64 : 100;
+        if ((r >> 9) % 31u == 0u) luts = (luts == &g_luts) ? &g_lutsAlt : &g_luts;
+        if ((r >> 14) % 47u == 0u) width = (width == 4) ? 8 : 4;
+        llrpGpuPlaybackReconState_t s = configureState(uint64_t(frame), width, 4);
+        s.black_level = black;
+        setPattern(s, patterns[pattern][0], patterns[pattern][1], patterns[pattern][2], patterns[pattern][3]);
+        s.raw2ev = luts->raw2ev;
+        s.ev2raw = luts->ev2raw;
+        s.mix_curve = luts->mix;
+        s.fullres_curve = luts->fullres;
+        s.randn05 = luts->randn;
+        int ok = 0;
+        const Counts d = configureWorkOf(s, &ok);
+        ASSERT_EQ(1, ok);
+        if (d.setClip == 0u && d.setLuts == 0u && d.notchSets == 0u) ++quietFrames;
+        int w = 0, h = 0, bl = 0, wh = 0, notch = -1;
+        int seen[4] = { -1, -1, -1, -1 };
+        const void * raw2ev = nullptr;
+        const void * ev2raw = nullptr;
+        const void * mix = nullptr;
+        const void * fullres = nullptr;
+        const void * randn = nullptr;
+        ASSERT_EQ(1, llrpFakeGpuBackendLastRunStateForTesting(&w, &h, &bl, &wh, seen, &raw2ev, &ev2raw, &mix,
+                                                               &fullres, &randn, &notch));
+        ASSERT_EQ(width, w);
+        ASSERT_EQ(4, h);
+        ASSERT_EQ(black, bl);
+        ASSERT_EQ(65535, wh);
+        for (int k = 0; k < 4; ++k) ASSERT_EQ(patterns[pattern][k], seen[k]);
+        ASSERT_TRUE(raw2ev == luts->raw2ev);
+        ASSERT_TRUE(ev2raw == luts->ev2raw);
+        ASSERT_TRUE(mix == luts->mix);
+        ASSERT_TRUE(fullres == luts->fullres);
+        ASSERT_TRUE(randn == luts->randn);
+        ASSERT_EQ(0, notch);
+    }
+    ASSERT_TRUE(quietFrames > 0u);   // the walk repeats a pattern often enough that skipping really happened
+}
+
+} // namespace
+
+TEST(DualIsoGpuConfigureCache, EveryRunExecutesUnderExactlyItsFramesStateWithTheExportPresent)
+{
+    checkEveryRunSawItsFramesState(true);
+}
+
+TEST(DualIsoGpuConfigureCache, EveryRunExecutesUnderExactlyItsFramesStateWithTheExportAbsent)
+{
+    checkEveryRunSawItsFramesState(false);
 }

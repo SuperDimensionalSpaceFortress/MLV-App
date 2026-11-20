@@ -1260,6 +1260,10 @@ static uint64_t g_llrawproc_fake_gpu_backend_notch_set_calls = 0;
 /* DUALISO-CONFIGURE-CACHE-1: set_iso_pattern calls, and the pattern the latest run saw. */
 static uint64_t g_llrawproc_fake_gpu_backend_pattern_set_calls = 0;
 static int g_llrawproc_fake_gpu_backend_last_run_is_bright[4] = {-1, -1, -1, -1};
+/* The whole configured state (clip, LUT pointers, notch) the latest run executed under. */
+static igpu_recon_clip_t g_llrawproc_fake_gpu_backend_last_run_clip = {0};
+static igpu_recon_luts_t g_llrawproc_fake_gpu_backend_last_run_luts = {0};
+static int g_llrawproc_fake_gpu_backend_last_run_state_valid = 0;
 /* GPU-FIELD-TELEMETRY-1: the fake's igpu_recon_take_cuda_error queues (one per
  * channel, each code handed out once, as igpu_cuda_error_slot.h does), and a
  * one-shot run failure a test injects (rc 0 = none armed). */
@@ -1550,6 +1554,9 @@ static int llrawproc_fake_gpu_backend_run(igpu_recon_backend * b,
     memcpy(g_llrawproc_fake_gpu_backend_last_run_is_bright,
            g_llrawproc_fake_gpu_backend_clip.is_bright,
            sizeof(g_llrawproc_fake_gpu_backend_last_run_is_bright));
+    g_llrawproc_fake_gpu_backend_last_run_clip = g_llrawproc_fake_gpu_backend_clip;
+    g_llrawproc_fake_gpu_backend_last_run_luts = g_llrawproc_fake_gpu_backend_luts;
+    g_llrawproc_fake_gpu_backend_last_run_state_valid = 1;
     if(g_llrawproc_fake_gpu_backend_reduced_iso_notch == 1)
         ++g_llrawproc_fake_gpu_backend_runs_with_notch;
     else
@@ -1889,6 +1896,11 @@ int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install)
     g_llrawproc_fake_gpu_backend_notch_set_calls = 0;
     g_llrawproc_fake_gpu_backend_pattern_set_calls = 0;
     memset(g_llrawproc_fake_gpu_backend_last_run_is_bright, 0xff, sizeof(g_llrawproc_fake_gpu_backend_last_run_is_bright));
+    memset(&g_llrawproc_fake_gpu_backend_last_run_clip, 0, sizeof(g_llrawproc_fake_gpu_backend_last_run_clip));
+    memset(&g_llrawproc_fake_gpu_backend_last_run_luts, 0, sizeof(g_llrawproc_fake_gpu_backend_last_run_luts));
+    g_llrawproc_fake_gpu_backend_last_run_state_valid = 0;
+    memset(&g_llrawproc_fake_gpu_backend_luts, 0, sizeof(g_llrawproc_fake_gpu_backend_luts));
+    memset(&g_llrawproc_fake_gpu_backend_clip, 0, sizeof(g_llrawproc_fake_gpu_backend_clip));
     memset(g_llrawproc_fake_gpu_backend_cuda_errors, 0, sizeof(g_llrawproc_fake_gpu_backend_cuda_errors));
     g_llrawproc_fake_gpu_backend_cuda_error_pending[0] = 0;
     g_llrawproc_fake_gpu_backend_cuda_error_pending[1] = 0;
@@ -2044,6 +2056,32 @@ void llrpFakeGpuBackendIsoPatternStateForTesting(uint64_t * set_calls, int * las
     if(last_run_is_bright4)
         memcpy(last_run_is_bright4, g_llrawproc_fake_gpu_backend_last_run_is_bright,
                sizeof(g_llrawproc_fake_gpu_backend_last_run_is_bright));
+}
+
+/* DUALISO-CONFIGURE-CACHE-1 test-only: the whole backend state the fake's latest run executed under: the clip it
+ * held (dims, levels, ISO pattern), the LUT pointers it held and its notch flag. Returns 0 before any run. */
+int llrpFakeGpuBackendLastRunStateForTesting(int * width, int * height, int * black, int * white,
+                                             int * is_bright4, const void ** raw2ev, const void ** ev2raw,
+                                             const void ** mix, const void ** fullres, const void ** randn,
+                                             int * notch);
+int llrpFakeGpuBackendLastRunStateForTesting(int * width, int * height, int * black, int * white,
+                                             int * is_bright4, const void ** raw2ev, const void ** ev2raw,
+                                             const void ** mix, const void ** fullres, const void ** randn,
+                                             int * notch)
+{
+    if(!g_llrawproc_fake_gpu_backend_last_run_state_valid) return 0;
+    if(width) *width = g_llrawproc_fake_gpu_backend_last_run_clip.width;
+    if(height) *height = g_llrawproc_fake_gpu_backend_last_run_clip.height;
+    if(black) *black = g_llrawproc_fake_gpu_backend_last_run_clip.black_level;
+    if(white) *white = g_llrawproc_fake_gpu_backend_last_run_clip.white_level;
+    if(is_bright4) memcpy(is_bright4, g_llrawproc_fake_gpu_backend_last_run_clip.is_bright, 4 * sizeof(int));
+    if(raw2ev) *raw2ev = g_llrawproc_fake_gpu_backend_last_run_luts.raw2ev;
+    if(ev2raw) *ev2raw = g_llrawproc_fake_gpu_backend_last_run_luts.ev2raw;
+    if(mix) *mix = g_llrawproc_fake_gpu_backend_last_run_luts.mix_curve;
+    if(fullres) *fullres = g_llrawproc_fake_gpu_backend_last_run_luts.fullres_curve;
+    if(randn) *randn = g_llrawproc_fake_gpu_backend_last_run_luts.randn05;
+    if(notch) *notch = g_llrawproc_fake_gpu_backend_reduced_iso_notch;
+    return 1;
 }
 
 /* Test-only: the notch flag the most recent fake run saw (-1 before any run),
