@@ -382,6 +382,66 @@ class GeneratorTests(_GeneratorCase):
         # the one capture invocation runs the script out of the verified bundle, never a copy found on the venue
         self.assertIn("$bundleCapture = Join-Path $BundleDir 'capture-reference-frame.ps1'", job)
 
+    # --- REFERENCE-FRAME-GPU-PLAYBACK-RECON-ARG-1: a capture with GPU playback recon ON, chosen by a generator parameter ---------------------------
+    # The gate profiles live in tools/gates/output-budget.json, whose validator (tools/gates/output_budget.py) accepts exactly the eight profile
+    # keys it knows and requires every (clip, profile) pair, so a profile cannot carry the setting without changing the canonical gate. The
+    # setting is therefore a parameter of this generator, composed with any profile, and (like -Seconds) part of the job's identity.
+    RECON_ENV_NAMES = ("MLVAPP_GPU_PLAYBACK_RECON", "MLVAPP_GPU_PLAYBACK_RECON_BACKEND", "MLVAPP_GPU_PLAYBACK_RECON_DLL")
+
+    @staticmethod
+    def capture_block(job: str) -> str:
+        invocation = next(line.strip() for line in job.splitlines() if line.strip().startswith("$captureCommand =") and "-Exe" in line)
+        return job[job.index(invocation):job.index("$captureOutput =")]
+
+    @staticmethod
+    def identity_sha(job: str) -> str:
+        found = re.findall(r"(?m)^\$JobIdentitySha256 = '([0-9a-f]{64})'$", job)
+        assert len(found) == 1, found
+        return found[0]
+
+    def generate_job(self, name: str, *extra: str) -> str:
+        proc, out = self.generate(name, *extra)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return out.read_text(encoding="utf-8")
+
+    def test_gpu_playback_recon_on_emits_the_recon_env_at_the_capture_call(self) -> None:
+        job = self.generate_job("recon-on", "-GpuPlaybackRecon", "on")
+        self.assertIn("$GpuPlaybackRecon = 'on'", job)
+        block = self.capture_block(job)
+        for name in self.RECON_ENV_NAMES:
+            self.assertIn(name, block, f"{name} does not reach the capture command")
+        self.assertIn("MLVAPP_GPU_PLAYBACK_RECON = '1'", block)
+        self.assertIn("MLVAPP_GPU_PLAYBACK_RECON_BACKEND = 'cuda'", block)
+        # the DLL is the one the job deployed beside the exe, never a path typed by the caller
+        self.assertIn("$reconDll", block)
+        # the profile's own quality mode still rides the same -ExtraEnv (the capture script takes ONE hashtable)
+        self.assertIn("MLVAPP_PLAYBACK_QUALITY_MODE", block)
+        self.assertEqual(block.count("-ExtraEnv"), 1, block)
+
+    def test_the_default_is_off_and_emits_no_recon_text_at_all(self) -> None:
+        default = self.emitted()
+        explicit_off = self.generate_job("recon-off", "-GpuPlaybackRecon", "off")
+        self.assertEqual(default, explicit_off, "an explicit 'off' is not the default job")
+        self.assertNotIn("GpuPlaybackRecon", default)
+        self.assertNotIn("MLVAPP_GPU_PLAYBACK_RECON", default)
+        self.assertIn("MLVAPP_PLAYBACK_QUALITY_MODE = '$QualityMode'", self.capture_block(default))
+
+    def test_the_job_identity_differs_between_recon_on_and_off(self) -> None:
+        off = self.emitted()
+        on = self.generate_job("recon-on-ident", "-GpuPlaybackRecon", "on")
+        self.assertNotEqual(self.identity_sha(on), self.identity_sha(off))
+        self.assertNotEqual(self.job_id(on), self.job_id(off), "a GPU-recon job shares a work tree and an outbox name with a CPU one")
+
+    def test_a_recon_on_job_records_the_setting_in_result_json(self) -> None:
+        on = self.generate_job("recon-on-result", "-GpuPlaybackRecon", "on")
+        self.assertRegex(on, r"captureParameters = \[ordered\]@\{[^}\r\n]*gpuPlaybackRecon = \$GpuPlaybackRecon")
+
+    def test_a_recon_value_other_than_off_or_on_is_refused_with_a_typed_code_and_no_job_is_written(self) -> None:
+        for label, value in (("yes", "yes"), ("upper", "ON"), ("one", "1"), ("empty", "")):
+            proc, out = self.generate(f"recon-bad-{label}", "-GpuPlaybackRecon", value)
+            self.refused(proc, "REFERENCE_FRAME_GPU_PLAYBACK_RECON_INVALID")
+            self.assertFalse(out.exists(), f"{value!r}: a refused value left a job behind")
+
     def test_the_job_acts_on_the_capture_exit_code_and_never_calls_the_candidate_reviewed(self) -> None:
         job = self.emitted()
         self.assertRegex(job, r"\$captureRc\s*=\s*\$LASTEXITCODE[\s\S]*?\$captureRc\s+-ne\s+0")
@@ -451,7 +511,7 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         path.write_text(json.dumps(manifest), encoding="utf-8")
         return hashlib.sha256(path.read_bytes()).hexdigest()
 
-    def job_for_this_agent(self, manifest_sha: str, name: str, clip_id: str = CLIP_ID) -> Path:
+    def job_for_this_agent(self, manifest_sha: str, name: str, clip_id: str = CLIP_ID, generator_args: tuple[str, ...] = ()) -> Path:
         """The emitted job for this test's own agent root, written to `<name>.job.ps1`.
 
         The generator is a pure function of (commit, manifest sha, clip) plus the agent root it bakes into ONE line, `$AgentRoot = '...'`. Every
@@ -459,14 +519,14 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         -- with an -AgentRoot of its own, so its substitution and allowlist are exercised for real -- and each test re-points that single line at
         its own root. The swap asserts the anchor is unique, so a generator that moved or doubled the line fails loudly here."""
         cache = type(self)._emission_by_inputs
-        key = (manifest_sha, clip_id)
+        key = (manifest_sha, clip_id, generator_args)
         if key not in cache:
             template_root = self.tmp / f"agent-template-{len(cache)}"
             template_root.mkdir()
             out = self.tmp / f"template-{len(cache)}.job.ps1"
             gen = _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(GENERATOR),
                         "-SourceCommit", self.head, "-BuildManifestSha256", manifest_sha, "-ClipId", clip_id, "-RepoRoot", str(self.repo),
-                        "-OutFile", str(out), "-AgentRoot", str(template_root)])
+                        "-OutFile", str(out), "-AgentRoot", str(template_root), *generator_args])
             self.assertEqual(gen.returncode, 0, gen.stdout + gen.stderr)
             cache[key] = out.read_text(encoding="utf-8")
         job, count = re.subn(r"(?m)^\$AgentRoot = '[^']*'$", lambda _m: f"$AgentRoot = '{self.agent}'", cache[key])
@@ -568,7 +628,8 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
 
     # --- F-01 footage-path-disclosure: a SUCCESSFUL capture publishes nothing that names the owner's part path ---------------------------------
     def run_stand_in_capture(self, name: str, edit: tuple[str, str] | None = None,
-                             more_edits: tuple[tuple[str, str], ...] = ()) -> tuple[subprocess.CompletedProcess, Path, Path, str, Path, str]:
+                             more_edits: tuple[tuple[str, str], ...] = (), generator_args: tuple[str, ...] = (),
+                             env_probe: Path | None = None) -> tuple[subprocess.CompletedProcess, Path, Path, str, Path, str]:
         """The emitted job run end to end against a stand-in app; returns (ran, outbox, part, part sha256, the app's argv file, the path marker)."""
         marker = "OWNERREALPATHMARKERq7z3"
         owner_dir = self.tmp / f"{marker}-dir"
@@ -577,7 +638,7 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         part_bytes = part.read_bytes()
         part_sha = hashlib.sha256(part_bytes).hexdigest()
         sha = self.stage_build()
-        gen_out = self.job_for_this_agent(sha, name)
+        gen_out = self.job_for_this_agent(sha, name, generator_args=generator_args)
         app_dir = self.tmp / "stand-in-app"
         app_dir.mkdir(exist_ok=True)
         log_template = app_dir / "app.log.template"
@@ -592,6 +653,11 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         job = gen_out.read_text(encoding="utf-8")
         job, count = re.subn(r"(?m)^\$OwnerPartsJson = '.*'$", lambda _m: f"$OwnerPartsJson = '{parts}'", job)
         self.assertEqual(count, 1)
+        if env_probe is not None:
+            # a wrapper in front of the stand-in that records the MLVAPP_GPU_PLAYBACK_RECON* environment the app would have been launched with
+            probe = app_dir / "env-probe.cmd"
+            probe.write_text(f'@echo off\r\nset MLVAPP_GPU_PLAYBACK_RECON> "{env_probe}"\r\ncall "{fake}" %*\r\nexit /b %errorlevel%\r\n', encoding="ascii")
+            fake = probe
         self.assertEqual(job.count("-Exe '$exePath'"), 1, "the capture's -Exe anchor moved: this fixture is stale")
         job = job.replace("-Exe '$exePath'", f"-Exe '{fake}'")
         for anchor, injected in (() if edit is None else (edit,)) + tuple(more_edits):
@@ -642,6 +708,40 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         # 3. the original is untouched, and the job removed its view entry when it closed the workspace
         self.assertEqual(hashlib.sha256(part.read_bytes()).hexdigest(), part_sha)
         self.assertEqual([p.name for p in (work / "owner-clip").iterdir()], [], "a view entry outlived the job")
+
+    # --- REFERENCE-FRAME-GPU-PLAYBACK-RECON-ARG-1: the recon setting, run end to end against the stand-in app --------------------------------------
+    def probed_env(self, probe: Path) -> dict[str, str]:
+        pairs = (line.split("=", 1) for line in probe.read_text(encoding="utf-8", errors="replace").splitlines() if "=" in line)
+        return {key: value for key, value in pairs}
+
+    def test_a_recon_on_job_launches_the_app_with_the_recon_env_and_records_it_in_result_json(self) -> None:
+        probe = self.tmp / "recon-on-env.txt"
+        ran, pub, _part, _sha, _args, _marker = self.run_stand_in_capture("reconon", generator_args=("-GpuPlaybackRecon", "on"), env_probe=probe)
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+        env = self.probed_env(probe)
+        self.assertEqual(env.get("MLVAPP_GPU_PLAYBACK_RECON"), "1", env)
+        self.assertEqual(env.get("MLVAPP_GPU_PLAYBACK_RECON_BACKEND"), "cuda", env)
+        work = next((self.agent / "work").glob("reference-frame-*"))
+        dll = env.get("MLVAPP_GPU_PLAYBACK_RECON_DLL", "")
+        self.assertEqual(Path(dll).name, "igpu_recon_cuda.dll", env)
+        self.assertTrue(Path(dll).is_file(), f"the DLL the app is told to load does not exist: {dll}")
+        self.assertIn(str(work), dll, "the DLL is not the one the job deployed under its own work directory")
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual(result["captureParameters"]["gpuPlaybackRecon"], "on")
+        manifest = json.loads((pub / "capture" / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
+        applied = manifest["settings"]["envApplied"]
+        self.assertIn("MLVAPP_GPU_PLAYBACK_RECON", applied)
+        self.assertIn("MLVAPP_PLAYBACK_QUALITY_MODE", applied, "the profile's quality mode was lost when the recon env joined it")
+
+    def test_a_default_job_launches_the_app_with_no_recon_env_and_result_json_names_no_recon_setting(self) -> None:
+        probe = self.tmp / "recon-off-env.txt"
+        ran, pub, _part, _sha, _args, _marker = self.run_stand_in_capture("reconoff", env_probe=probe)
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+        self.assertEqual(self.probed_env(probe), {}, "a default job passed a recon variable to the app")
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertNotIn("gpuPlaybackRecon", result["captureParameters"])
+        manifest = json.loads((pub / "capture" / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual([name for name in manifest["settings"]["envApplied"] if name.startswith("MLVAPP_GPU_PLAYBACK_RECON")], [])
 
     # --- r4 (CoS 81b6c553 P2): the emitted job itself refuses a receipt profile, before anything is written or launched ---------------------------
     def test_an_emitted_job_carrying_a_receipt_profile_refuses_before_anything_is_written_or_launched(self) -> None:

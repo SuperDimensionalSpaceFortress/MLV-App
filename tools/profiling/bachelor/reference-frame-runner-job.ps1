@@ -67,6 +67,17 @@
 # layer can be written the manifest is moved out of the candidate name (numbered .INVALID target); that last resort is best effort too: if the move
 # throws (CANDIDATE_NOT_QUARANTINED, result.json candidateQuarantined=false) the manifest keeps the candidate name, and the job still exits 225.
 #
+# GPU PLAYBACK RECON IS A GENERATOR PARAMETER, NOT A PROFILE FIELD (REFERENCE-FRAME-GPU-PLAYBACK-RECON-ARG-1). -GpuPlaybackRecon off|on
+# (default off) makes the capture run with the CUDA playback recon the speed legs use, so a pixel-parity compare of two builds can cover the GPU
+# path. It is a parameter because the profiles in tools/gates/output-budget.json cannot carry it: tools/gates/output_budget.py accepts exactly
+# the eight profile keys it knows (exact_keys) and requires every (clip, profile) pair, so a ninth key or a new profile would change the
+# canonical output-budget gate. 'on' hands the capture, in the ONE -ExtraEnv hashtable beside the profile's quality mode, MLVAPP_GPU_PLAYBACK_RECON=1,
+# MLVAPP_GPU_PLAYBACK_RECON_BACKEND=cuda and MLVAPP_GPU_PLAYBACK_RECON_DLL=<the igpu_recon_cuda.dll the job deployed beside the staged exe>
+# (the names and values playback-attr-3-cuda-job.ps1 gives its speed legs). Any other value is refused (REFERENCE_FRAME_GPU_PLAYBACK_RECON_INVALID).
+# 'on' is part of the job identity (so a GPU-recon job never shares a work tree or an outbox with a CPU one) and result.json records it as
+# captureParameters.gpuPlaybackRecon. 'off' emits NO recon text at all: the job text, the identity digest and result.json are byte-for-byte the
+# ones this generator produced before the parameter existed (the template tokens below expand to nothing), so an absent key means off.
+#
 # NOT COVERED HERE (named, not hidden): no display wake and no PresentMon. If the venue's display is asleep the capture fails
 # visibly (typed, non-zero) rather than producing a frame; the live run is OUTPUT-BUDGET-KNOWN-GOOD-PROPOSAL-2.
 #
@@ -103,6 +114,9 @@ param(
     # capture-reference-frame.ps1's own -Seconds (its fail-closed timeout) and -PresentedFrames (-1 = auto: the smallest N that plays the floor).
     [ValidateRange(10, 3600)][int]$Seconds = 30,
     [ValidateRange(-1, 100000)][int]$PresentedFrames = -1,
+    # 'on' runs the capture with the CUDA GPU playback recon enabled (header: GPU PLAYBACK RECON IS A GENERATOR PARAMETER). Checked below, not by
+    # ValidateSet, so a bad value is a typed refusal (exit 21) and not a parameter-binding error.
+    [string]$GpuPlaybackRecon = 'off',
     # Default: the venue table's agentRoot.
     [string]$AgentRoot = '',
     [string]$RepoRoot = '',
@@ -127,6 +141,8 @@ function Stop-Refused([string]$Code) {
     Write-Output "RESULT=REFERENCE_FRAME_JOB_REFUSED CODE=$Code"
     exit 21
 }
+
+if ($GpuPlaybackRecon -cnotin @('off', 'on')) { Stop-Refused 'REFERENCE_FRAME_GPU_PLAYBACK_RECON_INVALID' }
 
 $dvDir = Join-Path $PSScriptRoot '..\dual-venue'
 Import-Module (Join-Path $dvDir 'DualVenueRunner.psm1') -Force
@@ -270,12 +286,15 @@ if ([string]::IsNullOrWhiteSpace($AgentRoot)) { $AgentRoot = [string]$venueEntry
 if ($AgentRoot -notmatch '^[A-Za-z]:\\[A-Za-z0-9 _.~\\-]+$') { throw 'REFERENCE_FRAME_AGENTROOT_INVALID -AgentRoot contains characters outside the allowlist' }
 
 # The job's identity is its effective configuration (header: THE JOB'S IDENTITY IS ITS EFFECTIVE CONFIGURATION).
-$identityText = @(
+$identityLines = @(
     'mlvapp.reference-frame-job-identity.v1', "source=$SourceCommit", "buildManifestSha256=$BuildManifestSha256", "venue=$Venue", "clip=$ClipId",
     "parts=$(@($ownerParts | ForEach-Object { $_.sha256 }) -join ',')", "bundle=$bundleDigest", "gateProfile=$GateProfile", "gateSpecSha256=$specSha256",
     "startFrame=$gateStartFrame", "disableLookAssist=$disableLookAssistLiteral", "playbackProcessing=$gateProcessing", "qualityMode=$gateQualityMode",
     "seconds=$Seconds", "presentedFrames=$PresentedFrames"
-) -join "`n"
+)
+# GPU playback recon joins the identity only when it is on, so every 'off' job keeps the id it always had and an 'on' job can never share a work tree or an outbox with one.
+if ($GpuPlaybackRecon -ceq 'on') { $identityLines += 'gpuPlaybackRecon=on' }
+$identityText = $identityLines -join "`n"
 $jobIdentitySha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($identityText))).ToLowerInvariant()
 $jobId = "reference-frame-$($SourceCommit.Substring(0,12))-$ClipId-$($jobIdentitySha256.Substring(0,12))"
 [void](Assert-AttrCudaSafeArtifactName -Name $jobId)
@@ -324,6 +343,28 @@ $embeddedFunctions = $embeddedFunctions + "`r`n`r`n" + (Get-AttrCudaEmbeddedFunc
     'Close-AttrCudaOwnerFootageWorkspace'
 ))
 
+# --- GPU playback recon fragments (header: GPU PLAYBACK RECON IS A GENERATOR PARAMETER) ---------------------------------------------------
+# Three template tokens, each EMPTY (or, for the ExtraEnv line, today's own line) when off, so an 'off' job is byte-identical to what this
+# generator emitted before the parameter existed.
+$reconDeclaration = ''
+$reconResultParameter = ''
+# today's line, verbatim: the profile's quality mode is the only -ExtraEnv entry
+$captureExtraEnv = @'
+if ($QualityMode -ne '') { $captureCommand += " -ExtraEnv @{ MLVAPP_PLAYBACK_QUALITY_MODE = '$QualityMode' }" }
+'@.TrimEnd()
+if ($GpuPlaybackRecon -ceq 'on') {
+    $reconDeclaration = "`$GpuPlaybackRecon = 'on'`r`n"
+    $reconResultParameter = '; gpuPlaybackRecon = $GpuPlaybackRecon'
+    # The capture script takes ONE -ExtraEnv hashtable, so the recon variables and the profile's quality mode are built into it together. The names
+    # and values are the speed legs' (playback-attr-3-cuda-job.ps1); the DLL is the one this job deployed beside the staged exe ($reconDll).
+    $captureExtraEnv = @'
+$reconDllLiteral = $reconDll.Replace("'", "''")
+        $extraEnvPairs = @("MLVAPP_GPU_PLAYBACK_RECON = '1'", "MLVAPP_GPU_PLAYBACK_RECON_BACKEND = 'cuda'", "MLVAPP_GPU_PLAYBACK_RECON_DLL = '$reconDllLiteral'")
+        if ($QualityMode -ne '') { $extraEnvPairs = @("MLVAPP_PLAYBACK_QUALITY_MODE = '$QualityMode'") + $extraEnvPairs }
+        $captureCommand += " -ExtraEnv @{ $($extraEnvPairs -join '; ') }"
+'@.TrimEnd()
+}
+
 # --- job body template (placeholders are substituted below, in one pass) -----------------------------------------------------------
 $template = @'
 # -VerifyOnly runs the read-only prefix (name safety, base64 decode, hash for every bundle file) and exits WITHOUT creating
@@ -347,7 +388,7 @@ $StartFrame = __START_FRAME__
 $PlaybackProcessing = '__PLAYBACK_PROCESSING__'
 $QualityMode = '__QUALITY_MODE__'
 $DisableLookAssist = __DISABLE_LOOK_ASSIST__
-$Seconds = __SECONDS__
+__GPU_RECON_DECLARATION__$Seconds = __SECONDS__
 $PresentedFrames = __PRESENTED_FRAMES__
 $ExeName = '__EXE_NAME__'
 $ReconName = '__RECON_NAME__'
@@ -592,7 +633,7 @@ try {
         if ($DisableLookAssist) { $captureCommand += ' -DisableLookAssist' }
         if ($PlaybackProcessing -ne '') { $captureCommand += " -PlaybackProcessing $PlaybackProcessing" }
         if ($PresentedFrames -ge 0) { $captureCommand += " -PresentedFrames $PresentedFrames" }
-        if ($QualityMode -ne '') { $captureCommand += " -ExtraEnv @{ MLVAPP_PLAYBACK_QUALITY_MODE = '$QualityMode' }" }
+        __CAPTURE_EXTRA_ENV__
         # FAIL CLOSED: a statement-terminating error inside the capture command (a parameter that does not bind, say) leaves $LASTEXITCODE null,
         # and `exit $null` is exit 0 -- a capture that never ran must never read as one that passed. 70 = the capture command produced no exit code.
         $captureCommand += '; if ($null -eq $LASTEXITCODE) { exit 70 }; exit $LASTEXITCODE'
@@ -677,7 +718,7 @@ try { [void](Publish-AttrCudaText -Path (Join-Path $Pub 'result.json') -Value ((
     admission = [ordered]@{ mode = $AdmissionMode; consentKind = $ConsentKind }
     gateProfile = [ordered]@{ id = $GateProfileId; specSha256 = $GateSpecSha256; startFrame = $StartFrame; disableLookAssist = $DisableLookAssist; playbackProcessing = $PlaybackProcessing; qualityMode = $QualityMode }
     bundle = @($BundleEntries | ForEach-Object { [ordered]@{ name = $_.name; sha256 = $_.sha256 } })
-    captureParameters = [ordered]@{ seconds = $Seconds; presentedFrames = $PresentedFrames }
+    captureParameters = [ordered]@{ seconds = $Seconds; presentedFrames = $PresentedFrames__GPU_RECON_RESULT_PARAMETER__ }
     exeSha256 = $artifactHashes['exe']; candidateSha256 = $candidateSha256; candidateInvalidated = $candidateInvalidated
     candidateInvalidMarker = $candidateInvalidMarker; candidateQuarantined = $candidateQuarantined
     clipParts = @($verifiedParts | ForEach-Object { [ordered]@{ index = $_.index; length = $_.length; sha256 = $_.sha256 } })
@@ -715,6 +756,9 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     PLAYBACK_PROCESSING = $gateProcessing
     QUALITY_MODE = $gateQualityMode
     DISABLE_LOOK_ASSIST = $disableLookAssistLiteral
+    GPU_RECON_DECLARATION = $reconDeclaration
+    CAPTURE_EXTRA_ENV = $captureExtraEnv
+    GPU_RECON_RESULT_PARAMETER = $reconResultParameter
     SECONDS = [string]$Seconds
     PRESENTED_FRAMES = [string]$PresentedFrames
     EXE_NAME = $names.exeName
@@ -728,7 +772,8 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
 })
 [IO.File]::WriteAllText($OutFile, $text, [Text.UTF8Encoding]::new($false))
 
-Write-Output "RESULT=REFERENCE_FRAME_JOB_EMITTED SOURCE=$SourceCommit TOOLS=$ToolsCommit CLIP=$ClipId VENUE=$Venue GATE_PROFILE=$GateProfile START_FRAME=$gateStartFrame ADMISSION=$admissionMode BUNDLE_DIGEST=$bundleDigest JOB=$OutFile"
+$reconEmitNote = if ($GpuPlaybackRecon -ceq 'on') { ' GPU_PLAYBACK_RECON=on' } else { '' }
+Write-Output "RESULT=REFERENCE_FRAME_JOB_EMITTED SOURCE=$SourceCommit TOOLS=$ToolsCommit CLIP=$ClipId VENUE=$Venue GATE_PROFILE=$GateProfile START_FRAME=$gateStartFrame ADMISSION=$admissionMode BUNDLE_DIGEST=$bundleDigest$reconEmitNote JOB=$OutFile"
 
 [pscustomobject]@{
     jobFile = $OutFile
@@ -740,6 +785,7 @@ Write-Output "RESULT=REFERENCE_FRAME_JOB_EMITTED SOURCE=$SourceCommit TOOLS=$Too
     venue = $Venue
     gateProfile = $GateProfile
     startFrame = $gateStartFrame
+    gpuPlaybackRecon = $GpuPlaybackRecon
     bundleDigest = $bundleDigest
     files = @($closure | ForEach-Object { [ordered]@{ name = $_.name; sha256 = $_.sha256 } })
     agentRoot = $AgentRoot
