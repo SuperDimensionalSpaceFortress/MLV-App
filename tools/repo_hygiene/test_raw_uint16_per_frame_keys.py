@@ -10,6 +10,7 @@ The start line also logs MLVAPP_RAW_UINT16_PREFETCH_DECODERS, the lever's K knob
 existing MLVAPP_DISABLE_RAW_UINT16_PREFETCH.
 """
 from pathlib import Path
+import re
 import unittest
 
 
@@ -93,6 +94,29 @@ class RawUint16PerFrameKeysTests(unittest.TestCase):
         render = (ROOT / "platform/qt/RenderFrameThread.cpp").read_text(encoding="utf-8")
         for key in ("raw_uint16_lj92_precision", "raw_uint16_lj92_max_ssss"):
             self.assertIn('QStringLiteral("' + key + '")', render)
+
+    def test_worker_decoded_frame_reports_the_workers_lj92_layout_not_the_render_threads(self) -> None:
+        """LJ92-PRED1-FAST-PATH-1 r8 (adversary A1, introduced): drawFrame runs on the render thread, where the
+        raw-uint16 thread-locals read 0 / -1 for a frame a DecodeWorker decoded. The record already takes the
+        worker's timings when rawFromWorker; every lj92 layout / split getter must take the worker's snapshot the
+        same way, or a worker-decoded frame reports its worker timings beside a cleared layout (precision 0,
+        max SSSS -1). Each getMlvLastRawUint16Lj92* read must be a rawFromWorker ternary, and the capture helper
+        must read the same getter."""
+        render = (ROOT / "platform/qt/RenderFrameThread.cpp").read_text(encoding="utf-8")
+        capture_start = render.index("void captureRawUint16DecodeTelemetry(")
+        capture_end = render.index("\n}\n", capture_start)
+        capture_body = render[capture_start:capture_end]
+        getters = sorted(set(re.findall(r"getMlvLastRawUint16Lj92\w+\(\)", render)))
+        self.assertGreaterEqual(len(getters), 20, "the lj92 getter family disappeared from the render thread")
+        for getter in getters:
+            self.assertIn(getter, capture_body, getter + " is not captured on the DecodeWorker")
+            for match in re.finditer(re.escape(getter), render):
+                if capture_start <= match.start() < capture_end:
+                    continue
+                statement_start = render.rindex(";", 0, match.start()) + 1
+                self.assertIn(
+                    "rawFromWorker", render[statement_start:match.start()],
+                    getter + " is read from the render thread's thread-local even when the worker decoded the frame")
 
     def test_gpu_frame_record_appends_the_keys(self) -> None:
         statement = _statement_containing(self.source, '"playback_smoke.gpu_frame ', "qInfo()")

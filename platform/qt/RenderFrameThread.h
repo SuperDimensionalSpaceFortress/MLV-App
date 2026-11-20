@@ -563,6 +563,35 @@ private:
             double decompressExecuteMs = 0.0;
             double unpackMs = 0.0;
             double copyMs = 0.0;
+            /* LJ92-PRED1-FAST-PATH-1 r8 (adversary A1): the lj92 layout and split thread-locals of the frame the
+             * worker decoded (predictor, precision, largest SSSS, component counts, fast-path / split flags and
+             * the split timings). Read on the render thread they are cleared for a worker-decoded frame. */
+            int lj92Pred6SplitActive = 0;
+            int lj92Pred6SplitRequested = 0;
+            int lj92GenericSplitActive = 0;
+            int lj92GenericSplitRequested = 0;
+            int lj92Pred1FastPathActive = 0;
+            int lj92Pred1FastPathMeasurementRequested = 0;
+            int lj92Pred1FastPathMeasurementActive = 0;
+            int lj92Pred1FastPathEligible = 0;
+            int lj92ScanComponentCount = 0;
+            int lj92WriteLength = 0;
+            int lj92ExpectedWriteLength = 0;
+            int lj92SkipLength = 0;
+            int lj92LinearizeActive = 0;
+            int lj92ComponentCount = 0;
+            int lj92Predictor = 0;
+            int lj92Precision = 0;
+            int lj92MaxSsss = -1;
+            double lj92Pred6TotalMs = 0.0;
+            double lj92Pred6BitstreamMs = 0.0;
+            double lj92Pred6PredictorMs = 0.0;
+            double lj92GenericTotalMs = 0.0;
+            double lj92GenericBitstreamMs = 0.0;
+            double lj92GenericPredictorMs = 0.0;
+            double lj92Pred1FastPathTotalMs = 0.0;
+            double lj92Pred1FastPathBitstreamMs = 0.0;
+            double lj92Pred1FastPathPredictorMs = 0.0;
         };
         RawUint16DecodeTelemetry rawDecodeTelemetry;
         GpuPlaybackReconTextureState gpuPlaybackReconTextureState;

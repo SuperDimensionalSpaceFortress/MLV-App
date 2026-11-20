@@ -331,6 +331,32 @@ void captureRawUint16DecodeTelemetry( RawUint16DecodeTelemetry &raw, double rawU
     raw.decompressExecuteMs = getMlvLastRawUint16DecompressExecuteMilliseconds();
     raw.unpackMs = getMlvLastRawUint16UnpackMilliseconds();
     raw.copyMs = getMlvLastRawUint16CopyMilliseconds();
+    raw.lj92Pred6SplitActive = getMlvLastRawUint16Lj92Pred6SplitActive();
+    raw.lj92Pred6SplitRequested = getMlvLastRawUint16Lj92Pred6SplitRequested();
+    raw.lj92GenericSplitActive = getMlvLastRawUint16Lj92GenericSplitActive();
+    raw.lj92GenericSplitRequested = getMlvLastRawUint16Lj92GenericSplitRequested();
+    raw.lj92Pred1FastPathActive = getMlvLastRawUint16Lj92Pred1FastPathActive();
+    raw.lj92Pred1FastPathMeasurementRequested = getMlvLastRawUint16Lj92Pred1FastPathMeasurementRequested();
+    raw.lj92Pred1FastPathMeasurementActive = getMlvLastRawUint16Lj92Pred1FastPathMeasurementActive();
+    raw.lj92Pred1FastPathEligible = getMlvLastRawUint16Lj92Pred1FastPathEligible();
+    raw.lj92ScanComponentCount = getMlvLastRawUint16Lj92ScanComponentCount();
+    raw.lj92WriteLength = getMlvLastRawUint16Lj92WriteLength();
+    raw.lj92ExpectedWriteLength = getMlvLastRawUint16Lj92ExpectedWriteLength();
+    raw.lj92SkipLength = getMlvLastRawUint16Lj92SkipLength();
+    raw.lj92LinearizeActive = getMlvLastRawUint16Lj92LinearizeActive();
+    raw.lj92ComponentCount = getMlvLastRawUint16Lj92ComponentCount();
+    raw.lj92Predictor = getMlvLastRawUint16Lj92Predictor();
+    raw.lj92Precision = getMlvLastRawUint16Lj92Precision();
+    raw.lj92MaxSsss = getMlvLastRawUint16Lj92MaxSsss();
+    raw.lj92Pred6TotalMs = getMlvLastRawUint16Lj92Pred6TotalMilliseconds();
+    raw.lj92Pred6BitstreamMs = getMlvLastRawUint16Lj92Pred6BitstreamMilliseconds();
+    raw.lj92Pred6PredictorMs = getMlvLastRawUint16Lj92Pred6PredictorMilliseconds();
+    raw.lj92GenericTotalMs = getMlvLastRawUint16Lj92GenericTotalMilliseconds();
+    raw.lj92GenericBitstreamMs = getMlvLastRawUint16Lj92GenericBitstreamMilliseconds();
+    raw.lj92GenericPredictorMs = getMlvLastRawUint16Lj92GenericPredictorMilliseconds();
+    raw.lj92Pred1FastPathTotalMs = getMlvLastRawUint16Lj92Pred1FastPathTotalMilliseconds();
+    raw.lj92Pred1FastPathBitstreamMs = getMlvLastRawUint16Lj92Pred1FastPathBitstreamMilliseconds();
+    raw.lj92Pred1FastPathPredictorMs = getMlvLastRawUint16Lj92Pred1FastPathPredictorMilliseconds();
 }
 
 /* CUDA-RECON-DUALISO-TIMER-SPLIT-1: where the dual_iso stage timer's time goes on
@@ -6465,58 +6491,64 @@ void RenderFrameThread::drawFrame( int slotIndex,
         ? workerRawTelemetry.frameLj92Ms : getMlvLastRawUint16FrameLj92Milliseconds();
     const double rawUint16InflightWaitMs = rawFromWorker
         ? workerRawTelemetry.inflightWaitMs : getMlvLastRawUint16InflightWaitMilliseconds();
-    const int rawUint16Lj92Pred6SplitActive =
-        getMlvLastRawUint16Lj92Pred6SplitActive();
-    const int rawUint16Lj92Pred6SplitRequested =
-        getMlvLastRawUint16Lj92Pred6SplitRequested();
-    const int rawUint16Lj92GenericSplitActive =
-        getMlvLastRawUint16Lj92GenericSplitActive();
-    const int rawUint16Lj92GenericSplitRequested =
-        getMlvLastRawUint16Lj92GenericSplitRequested();
-    const int rawUint16Lj92Pred1FastPathActive =
-        getMlvLastRawUint16Lj92Pred1FastPathActive();
-    const int rawUint16Lj92Pred1FastPathMeasurementRequested =
-        getMlvLastRawUint16Lj92Pred1FastPathMeasurementRequested();
-    const int rawUint16Lj92Pred1FastPathMeasurementActive =
-        getMlvLastRawUint16Lj92Pred1FastPathMeasurementActive();
-    const int rawUint16Lj92Pred1FastPathEligible =
-        getMlvLastRawUint16Lj92Pred1FastPathEligible();
-    const int rawUint16Lj92ScanComponentCount =
-        getMlvLastRawUint16Lj92ScanComponentCount();
-    const int rawUint16Lj92WriteLength =
-        getMlvLastRawUint16Lj92WriteLength();
-    const int rawUint16Lj92ExpectedWriteLength =
-        getMlvLastRawUint16Lj92ExpectedWriteLength();
-    const int rawUint16Lj92SkipLength =
-        getMlvLastRawUint16Lj92SkipLength();
-    const int rawUint16Lj92LinearizeActive =
-        getMlvLastRawUint16Lj92LinearizeActive();
-    const int rawUint16Lj92ComponentCount =
-        getMlvLastRawUint16Lj92ComponentCount();
-    const int rawUint16Lj92Predictor =
-        getMlvLastRawUint16Lj92Predictor();
-    const int rawUint16Lj92Precision =
-        getMlvLastRawUint16Lj92Precision();
-    const int rawUint16Lj92MaxSsss =
-        getMlvLastRawUint16Lj92MaxSsss();
-    const double rawUint16Lj92Pred6TotalMs =
-        getMlvLastRawUint16Lj92Pred6TotalMilliseconds();
-    const double rawUint16Lj92Pred6BitstreamMs =
-        getMlvLastRawUint16Lj92Pred6BitstreamMilliseconds();
-    const double rawUint16Lj92Pred6PredictorMs =
-        getMlvLastRawUint16Lj92Pred6PredictorMilliseconds();
-    const double rawUint16Lj92GenericTotalMs =
-        getMlvLastRawUint16Lj92GenericTotalMilliseconds();
-    const double rawUint16Lj92GenericBitstreamMs =
-        getMlvLastRawUint16Lj92GenericBitstreamMilliseconds();
-    const double rawUint16Lj92GenericPredictorMs =
-        getMlvLastRawUint16Lj92GenericPredictorMilliseconds();
-    const double rawUint16Lj92Pred1FastPathTotalMs =
-        getMlvLastRawUint16Lj92Pred1FastPathTotalMilliseconds();
-    const double rawUint16Lj92Pred1FastPathBitstreamMs =
-        getMlvLastRawUint16Lj92Pred1FastPathBitstreamMilliseconds();
-    const double rawUint16Lj92Pred1FastPathPredictorMs =
-        getMlvLastRawUint16Lj92Pred1FastPathPredictorMilliseconds();
+    /* LJ92-PRED1-FAST-PATH-1 r8 (adversary A1): the lj92 layout / split values of a worker-decoded frame come from
+     * the worker's snapshot, like the timings above; the render thread's thread-locals are cleared for it. */
+    const int rawUint16Lj92Pred6SplitActive = rawFromWorker
+        ? workerRawTelemetry.lj92Pred6SplitActive : getMlvLastRawUint16Lj92Pred6SplitActive();
+    const int rawUint16Lj92Pred6SplitRequested = rawFromWorker
+        ? workerRawTelemetry.lj92Pred6SplitRequested : getMlvLastRawUint16Lj92Pred6SplitRequested();
+    const int rawUint16Lj92GenericSplitActive = rawFromWorker
+        ? workerRawTelemetry.lj92GenericSplitActive : getMlvLastRawUint16Lj92GenericSplitActive();
+    const int rawUint16Lj92GenericSplitRequested = rawFromWorker
+        ? workerRawTelemetry.lj92GenericSplitRequested : getMlvLastRawUint16Lj92GenericSplitRequested();
+    const int rawUint16Lj92Pred1FastPathActive = rawFromWorker
+        ? workerRawTelemetry.lj92Pred1FastPathActive : getMlvLastRawUint16Lj92Pred1FastPathActive();
+    const int rawUint16Lj92Pred1FastPathMeasurementRequested = rawFromWorker
+        ? workerRawTelemetry.lj92Pred1FastPathMeasurementRequested
+        : getMlvLastRawUint16Lj92Pred1FastPathMeasurementRequested();
+    const int rawUint16Lj92Pred1FastPathMeasurementActive = rawFromWorker
+        ? workerRawTelemetry.lj92Pred1FastPathMeasurementActive
+        : getMlvLastRawUint16Lj92Pred1FastPathMeasurementActive();
+    const int rawUint16Lj92Pred1FastPathEligible = rawFromWorker
+        ? workerRawTelemetry.lj92Pred1FastPathEligible : getMlvLastRawUint16Lj92Pred1FastPathEligible();
+    const int rawUint16Lj92ScanComponentCount = rawFromWorker
+        ? workerRawTelemetry.lj92ScanComponentCount : getMlvLastRawUint16Lj92ScanComponentCount();
+    const int rawUint16Lj92WriteLength = rawFromWorker
+        ? workerRawTelemetry.lj92WriteLength : getMlvLastRawUint16Lj92WriteLength();
+    const int rawUint16Lj92ExpectedWriteLength = rawFromWorker
+        ? workerRawTelemetry.lj92ExpectedWriteLength : getMlvLastRawUint16Lj92ExpectedWriteLength();
+    const int rawUint16Lj92SkipLength = rawFromWorker
+        ? workerRawTelemetry.lj92SkipLength : getMlvLastRawUint16Lj92SkipLength();
+    const int rawUint16Lj92LinearizeActive = rawFromWorker
+        ? workerRawTelemetry.lj92LinearizeActive : getMlvLastRawUint16Lj92LinearizeActive();
+    const int rawUint16Lj92ComponentCount = rawFromWorker
+        ? workerRawTelemetry.lj92ComponentCount : getMlvLastRawUint16Lj92ComponentCount();
+    const int rawUint16Lj92Predictor = rawFromWorker
+        ? workerRawTelemetry.lj92Predictor : getMlvLastRawUint16Lj92Predictor();
+    const int rawUint16Lj92Precision = rawFromWorker
+        ? workerRawTelemetry.lj92Precision : getMlvLastRawUint16Lj92Precision();
+    const int rawUint16Lj92MaxSsss = rawFromWorker
+        ? workerRawTelemetry.lj92MaxSsss : getMlvLastRawUint16Lj92MaxSsss();
+    const double rawUint16Lj92Pred6TotalMs = rawFromWorker
+        ? workerRawTelemetry.lj92Pred6TotalMs : getMlvLastRawUint16Lj92Pred6TotalMilliseconds();
+    const double rawUint16Lj92Pred6BitstreamMs = rawFromWorker
+        ? workerRawTelemetry.lj92Pred6BitstreamMs : getMlvLastRawUint16Lj92Pred6BitstreamMilliseconds();
+    const double rawUint16Lj92Pred6PredictorMs = rawFromWorker
+        ? workerRawTelemetry.lj92Pred6PredictorMs : getMlvLastRawUint16Lj92Pred6PredictorMilliseconds();
+    const double rawUint16Lj92GenericTotalMs = rawFromWorker
+        ? workerRawTelemetry.lj92GenericTotalMs : getMlvLastRawUint16Lj92GenericTotalMilliseconds();
+    const double rawUint16Lj92GenericBitstreamMs = rawFromWorker
+        ? workerRawTelemetry.lj92GenericBitstreamMs : getMlvLastRawUint16Lj92GenericBitstreamMilliseconds();
+    const double rawUint16Lj92GenericPredictorMs = rawFromWorker
+        ? workerRawTelemetry.lj92GenericPredictorMs : getMlvLastRawUint16Lj92GenericPredictorMilliseconds();
+    const double rawUint16Lj92Pred1FastPathTotalMs = rawFromWorker
+        ? workerRawTelemetry.lj92Pred1FastPathTotalMs : getMlvLastRawUint16Lj92Pred1FastPathTotalMilliseconds();
+    const double rawUint16Lj92Pred1FastPathBitstreamMs = rawFromWorker
+        ? workerRawTelemetry.lj92Pred1FastPathBitstreamMs
+        : getMlvLastRawUint16Lj92Pred1FastPathBitstreamMilliseconds();
+    const double rawUint16Lj92Pred1FastPathPredictorMs = rawFromWorker
+        ? workerRawTelemetry.lj92Pred1FastPathPredictorMs
+        : getMlvLastRawUint16Lj92Pred1FastPathPredictorMilliseconds();
     const double rawUint16UnpackMs = rawFromWorker
         ? workerRawTelemetry.unpackMs : getMlvLastRawUint16UnpackMilliseconds();
     const double rawUint16CopyMs = rawFromWorker
