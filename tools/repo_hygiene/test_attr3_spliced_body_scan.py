@@ -351,7 +351,8 @@ _allow("ConvertFrom-GuiSmokeDisplayLog", _IN_MEMORY, ("R1", "New-Object System.C
 _allow("Find-AttrCudaFailedSmokeDisplayLog", _IN_MEMORY, ("R1", "New-Object System.Collections.Generic.List[string]", 1))
 _allow("Get-AttrCudaEligibilityVerdict", _LOCAL_BLOCK, ("R3", "& $read", 8))
 # EXPORT-KILL-DESCENDANT-CONFIRM-1 r2: $unknown is the body's own `{ param([string]$Why) [pscustomobject]@{ ... } }` (defined on its first line, a pure object builder).
-_allow("Get-AttrCudaProcessTreeSnapshot", _LOCAL_BLOCK, ("R3", "& $unknown", 4))
+# r6b: 5 calls; r5b (e75704ae) added the fifth, the clock-stepped-back return (a row created ahead of the clock).
+_allow("Get-AttrCudaProcessTreeSnapshot", _LOCAL_BLOCK, ("R3", "& $unknown", 5))
 _allow("Wait-AttrCudaProcessTreeGone",
        "test-only seam: runs the caller's -Scan block (a stand-in for the Win32_Process scan) only when a test passed one; production passes none and reads Get-CimInstance, a read-only query",
        ("R3", "& $Scan", 1))
