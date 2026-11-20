@@ -631,6 +631,22 @@ TEST(ViewerIdlePolicy, MoveHistoryMarkSeesAnExcursionAfterTheMarkAndNothingElse)
     viewer_idle::MoveHistoryMark q;
     q.mark(approach, 2);
     ASSERT_FALSE(q.leftSinceMark(approach, 2, 500, 500));
+    // r11 (adversary pass 16 A1): a one-point mark, then an excursion inside the mark's own quantum. The marked copy
+    // lines up at 0 and at 2; the marked point is the older one, so 2 wins and the excursion counts. The r6 search
+    // took the nearest line-up (0) and missed it (RED).
+    const viewer_idle::HistoryPoint onePoint[] = {hp(500, 500, 1000)};
+    viewer_idle::MoveHistoryMark one;
+    one.mark(onePoint, 1);
+    const viewer_idle::HistoryPoint repeatInQuantum[] = {hp(500, 500, 1000), hp(510, 500, 1000), hp(500, 500, 1000)};
+    ASSERT_TRUE(one.leftSinceMark(repeatInQuantum, 3, 500, 500));
+    // The same repeat already inside the mark (before it) is not newer: it lines up whole at 1, not counted.
+    const viewer_idle::HistoryPoint repeatMarked[] = {hp(500, 500, 1000), hp(510, 500, 1000), hp(500, 500, 1000)};
+    viewer_idle::MoveHistoryMark three;
+    three.mark(repeatMarked, 3);
+    const viewer_idle::HistoryPoint synthesizedAfter[] = {hp(500, 500, 1016), hp(500, 500, 1000), hp(510, 500, 1000),
+                                                          hp(500, 500, 1000)};
+    ASSERT_FALSE(three.leftSinceMark(synthesizedAfter, 4, 500, 500));
+    ASSERT_FALSE(three.leftSinceMark(repeatMarked, 3, 500, 500));
     // A negative (left monitor) excursion counts like any other.
     const viewer_idle::HistoryPoint negative[] = {hp(500, 500, 1200), hp(-20, 500, 1100), hp(500, 500, 1000),
                                                   hp(490, 500, 990)};

@@ -286,13 +286,21 @@ public:
     {
         if( !marked() || !newestFirst || n <= 0 ) return false;
         if( n > kMaxPoints ) n = kMaxPoints;
+        // r11 (adversary pass 16 A1): points inside one time-stamp quantum can repeat, so the marked copy can line up
+        // at more than one place: mark [(500,500,1000)], new list [(500,500,1000), (510,500,1000), (500,500,1000)]
+        // lines up at 0 and at 2. The marked points are the OLDER ones, so where the whole marked copy fits, the
+        // largest such place wins (2: the excursion is newer). Only when it fits nowhere whole (its tail scrolled out)
+        // is a partial line-up taken, the nearest first, as before. A wrong pick can only be a repeat inside the
+        // mark's own quantum and errs toward movement (one more idle period), never toward missing it.
         int newer = -1;
-        for( int k = 0; k < n && newer < 0; ++k )
+        const int lastWhole = n - m_count;   // the largest k at which the whole marked copy fits
+        for( int k = lastWhole; k >= 0 && newer < 0; --k )
         {
-            const int overlap = qMin( n - k, m_count );
-            bool lines = true;
-            for( int j = 0; j < overlap && lines; ++j ) lines = newestFirst[k + j] == m_points[j];
-            if( lines ) newer = k;
+            if( linesUpAt( newestFirst, n, k ) ) newer = k;
+        }
+        for( int k = qMax( 0, lastWhole + 1 ); k < n && newer < 0; ++k )
+        {
+            if( linesUpAt( newestFirst, n, k ) ) newer = k;
         }
         if( newer < 0 ) newer = n;   // the marked copy scrolled out: every point is newer
         for( int i = 0; i < newer; ++i )
@@ -303,6 +311,17 @@ public:
     }
 
 private:
+    /*! \brief True iff the marked copy (as much of it as fits) equals the list from k on. */
+    bool linesUpAt( const HistoryPoint *newestFirst, int n, int k ) const
+    {
+        const int overlap = qMin( n - k, m_count );
+        for( int j = 0; j < overlap; ++j )
+        {
+            if( !( newestFirst[k + j] == m_points[j] ) ) return false;
+        }
+        return true;
+    }
+
     HistoryPoint m_points[kMaxPoints];
     int m_count = 0;
 };
