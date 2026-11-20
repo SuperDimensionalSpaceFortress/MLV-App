@@ -2594,6 +2594,9 @@ if ($cfg.engine -eq 'claude') {
             )
         }
     }
+    # LANE-AUTO-MEMORY-OFF-1: headless lanes never use Claude Code auto memory (the NA-7 machine-memory deny class).
+    # Settings key only (hub decision 2026-11-20T10:50Z); honored through --settings, measured 2026-11-20T13:03Z.
+    $settingsObj.autoMemoryEnabled = $false
     if (-not $AllowBulkReads) {
         $denyRules = @(
             'Read(**/gpu-lane-impl-review-sync.md)',
