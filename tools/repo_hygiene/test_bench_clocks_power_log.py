@@ -3,12 +3,13 @@
 WHAT IS PINNED
   * C1 byte identity, from this tree only: a copy of the generator with its one seam ($clocksPowerEmit) turned off emits, given -ClocksPower, the job
     without it, and a job without -ClocksPower carries no sampler text; stripping the bracketed regions gives the plain job back, with or without -UtilSample;
-  * C2 presence: the five bracketed regions are there exactly once each, start ONE nvidia-smi process and ONE typeperf process per leg (never a process per
-    sample: the only Process.Start calls are the two Start- helpers, outside any loop), and start after the pre-launch PresentMon stop sites;
+  * C2 presence: the five bracketed regions are there exactly once each, start ONE typeperf process per leg (never a process per sample: the only
+    Process.Start calls are Start-ClocksPowerCpu and the bounded pre-launch read, outside any loop), and start after the pre-launch PresentMon stop sites;
+    r10: no GPU (nvidia-smi) collection at all, and the block says `gpu: not collected (BENCH-GPU-CLOCKS-FLUSH-1)`;
   * C3 anchors: a template that lost the measured launch line (or its done line) is the typed DUAL_VENUE_CLOCKS_POWER_ANCHOR_MISSING refusal;
-  * C4 the pure parsers and summaries ([N/A] never zero, a torn last row, rows outside the Play window, hex throttle masks, host-local time to UTC, a
+  * C4 the pure parser and summary ([N/A] never zero, a torn last row, rows outside the Play window, host-local time to UTC, a
     typeperf header read by counter name, a blank counter read), lifted from the generator by AST;
-  * C5 fail open: a missing nvidia-smi, a missing typeperf, a source that is not on the host and a platform read that throws each give a typed
+  * C5 fail open: a missing typeperf, a source that is not on the host and a platform read that throws each give a typed
     UNAVAILABLE(reason) and never throw, never zero;
   * C6 forwarding: Invoke-VenueLeg passes ClocksPower only for a JSON true, never for "true", false or absent, and the interval only as an integer;
   * C7 schema: generatorArgs.clocksPower is a boolean and clocksPowerIntervalMs a bounded integer; the boolean list the runner guards matches the schema.
@@ -53,9 +54,6 @@ CUDA_SHAPE = ["-Backend", "cuda", "-ScaleFactor", "1", "-ExpectedScaleRequest", 
               "-CpuQuiescenceThresholdPercent", "95", "-ForceLookAssist", "-LookPaceLeg", "-LookFlavor", "cinematic", "-SwapInterval", "0",
               "-Unpaced", "-PresentTrace"]
 CPU_SHAPE = ["-Backend", "cpu", *CUDA_SHAPE[2:]]
-# the job builds the nvidia-smi command line at run time from the throttle field name (a driver may rename it), so the query is pinned in its pieces
-GPU_QUERY = "--query-gpu=timestamp,clocks.gr,clocks.sm,clocks.mem,power.draw,enforced.power.limit,temperature.gpu,"
-GPU_FORMAT = " --format=csv,noheader,nounits -i 0 -lms "
 
 
 def region_re(open_: str, close: str) -> re.Pattern[str]:
@@ -144,23 +142,20 @@ class ClocksPowerGeneratorTests(unittest.TestCase):
         both = strip_regions(self.job("us-cp-cuda"), (OPEN, CLOSE))
         self.assertEqual(both, lf(self.job("us-cuda")), "the two samplers share the launch anchors but never each other's text")
 
-    def test_c2_five_regions_one_process_each_and_the_right_query(self) -> None:
+    def test_c2_five_regions_one_process_and_no_gpu_sampler(self) -> None:
         text = lf(self.job("cp-cuda"))
         self.assertEqual(len(region_re(OPEN, CLOSE).findall(text)), REGIONS)
         self.assertEqual(text.count(OPEN), REGIONS)
         self.assertEqual(text.count(CLOSE), REGIONS)
-        self.assertEqual(text.count(GPU_QUERY), 1, "one nvidia-smi query, with the clocks/power/limit fields")
-        self.assertEqual(text.count(GPU_FORMAT + "' + [string][int]$IntervalMs"), 1, "the interval is the job's $clocksPowerIntervalMs, not the util sampler's fixed 250")
-        self.assertIn("'clocks_throttle_reasons.active'", text)
-        self.assertIn("'clocks_event_reasons.active'", text, "the renamed-field retry")
-        self.assertGreaterEqual(text.count("gpu-clocks.csv"), 1)
+        for token in ("nvidia-smi", "--query-gpu", "gpu-clocks.csv", "Start-UtilSampleGpu", "Start-ClocksPowerGpu", "clocksPowerGpu"):
+            self.assertNotIn(token, text, f"the -ClocksPower job starts no GPU sampler and carries no GPU text: {token}")
         self.assertGreaterEqual(text.count("cpu-clocks.csv"), 1)
-        # one sampler process per leg: Process.Start only inside the two Start- helpers (each called once), never in a loop
+        # one sampler process per leg: Process.Start only inside Start-ClocksPowerCpu (called once) and the bounded pre-launch read, never in a loop
         body = "\n".join(region_re(OPEN, CLOSE).findall(text))
-        self.assertEqual(len(re.findall(r"\[Diagnostics\.Process\]::Start\(", body)), 3, "Start-UtilSampleGpu's nvidia-smi, Start-ClocksPowerCpu's typeperf, and Invoke-ClocksPowerBounded's one short read (adversary de9ca8e7 A2), nothing else")
-        self.assertEqual(len(re.findall(r"Start-ClocksPowerGpu \$clocksPowerBackend", body)), 1)
+        self.assertEqual(len(re.findall(r"\[Diagnostics\.Process\]::Start\(", body)), 2, "Start-ClocksPowerCpu's typeperf and Invoke-ClocksPowerBounded's one short read (adversary de9ca8e7 A2), nothing else")
         self.assertEqual(len(re.findall(r"Start-ClocksPowerCpu ", body)), 1)
-        self.assertNotRegex(body, r"(?is)\b(?:foreach|while|for)\b[^{]*\{[^}]*Start-(?:ClocksPower|UtilSample)(?:Gpu|Cpu)")
+        self.assertNotRegex(body, r"(?is)\b(?:foreach|while|for)\b[^{]*\{[^}]*Start-ClocksPowerCpu")
+        self.assertIn("step clocks-power start gpu=not-collected", text)
         # starts before the measured launch and after the keep-alive / session-locked PresentMon stop sites, stops right after the done line
         launch = text.index(LAUNCH_LINE)
         first_open = text.index(OPEN)
@@ -190,7 +185,7 @@ class ClocksPowerGeneratorTests(unittest.TestCase):
         # the (UtcNow, monotonic) pair is read at the end of the start region and again at the start of the stop region
         self.assertGreaterEqual(len(re.findall(r"\[(?:System\.)?Diagnostics\.Stopwatch\]::GetTimestamp\(\)", body)), 2, "two (wall, monotonic) captures bracket the window")
         self.assertIn("Get-ClocksPowerNetStepMs", body)
-        for summary, parsed in (("Get-ClocksPowerGpuSummary", "$clocksPowerGpuParsed"), ("Get-ClocksPowerCpuSummary", "$clocksPowerCpuParsed")):
+        for summary, parsed in (("Get-ClocksPowerCpuSummary", "$clocksPowerCpuParsed"),):
             calls = [ln for ln in body.splitlines() if re.search(r"\b" + summary + r"\b", ln) and parsed in ln]
             self.assertEqual(len(calls), 1, f"{summary} is called once with the parsed rows")
             self.assertTrue(calls[0].rstrip().endswith("$clocksPowerClockCheck"), f"{summary} gets the clock check as its 5th argument: {calls[0].strip()}")
@@ -223,24 +218,22 @@ class ClocksPowerGeneratorTests(unittest.TestCase):
         text = lf(self.job("cp-cuda"))
         body = "\n".join(region_re(OPEN, CLOSE).findall(text))
         c1 = body.index("$clocksPowerClk1 = Get-ClocksPowerClockCapture")
-        self.assertLess(c1, body.index("Start-ClocksPowerGpu $clocksPowerBackend"), "before nvidia-smi starts")
         self.assertLess(c1, body.index("Start-ClocksPowerCpu $clocksPowerTypeperf"), "before typeperf starts")
         c2 = body.index("$clocksPowerClk2 = Get-ClocksPowerClockCapture")
-        self.assertGreater(c2, body.index("Stop-ClocksPowerAll $clocksPowerGpuStart"), "after both samplers are stopped")
+        self.assertGreater(c2, body.index("Stop-ClocksPowerAll $clocksPowerCpuStart"), "after the sampler is stopped")
         self.assertLess(c2, body.index("Get-UtilSamplePlayWindow $rawLog"), "and before the metrics region reads anything")
 
     def test_r6b_a3_the_job_reads_each_csv_once_parses_that_read_and_proves_the_copy(self) -> None:
         text = lf(self.job("cp-cuda"))
         metrics = [r for r in region_re(OPEN, CLOSE).findall(text) if "step clocks-power summary" in r][0]
         self.assertLess(metrics.index("Read-ClocksPowerSource"), metrics.index("Publish-ClocksPowerFiles"), "read first, then publish")
-        self.assertLess(metrics.index("Publish-ClocksPowerFiles"), metrics.index("ConvertFrom-ClocksPowerGpuCsv"))
-        self.assertNotIn("Read-UtilSampleText", metrics, "the summaries parse the one read, never a second read of the path")
-        self.assertIn("ConvertFrom-ClocksPowerGpuCsv $clocksPowerGpuText", metrics)
+        self.assertLess(metrics.index("Publish-ClocksPowerFiles"), metrics.index("ConvertFrom-ClocksPowerCpuCsv"))
+        self.assertNotIn("Read-UtilSampleText", metrics, "the summary parses the one read, never a second read of the path")
         self.assertIn("ConvertFrom-ClocksPowerCpuCsv $clocksPowerCpuText", metrics)
         publish = re.search(r"(?ms)^function Publish-ClocksPowerFiles\b.*?^}", text)
         self.assertIsNotNone(publish)
-        self.assertEqual(publish.group(0).count("Test-ClocksPowerPublishedCopy"), 2, "each side's copy is proved against its own read")
-        self.assertEqual(publish.group(0).count("published-copy-differs"), 2)
+        self.assertEqual(publish.group(0).count("Test-ClocksPowerPublishedCopy"), 1, "the copy is proved against its own read")
+        self.assertEqual(publish.group(0).count("published-copy-differs"), 1)
         stop = re.search(r"(?ms)^function Stop-ClocksPowerAll\b.*?^}", text)
         self.assertIsNotNone(stop)
         self.assertNotIn("Dispose", stop.group(0), "the names stay held past the stop; Close-ClocksPowerHold releases them after the one read")
@@ -252,17 +245,9 @@ class ClocksPowerGeneratorTests(unittest.TestCase):
         self.assertEqual(len(re.findall(r"(?m)^function Test-ClocksPowerPreflightSurvivor\b", text)), 1)
         self.assertEqual(len(re.findall(r"(?m)^function Get-ClocksPowerRowGapStats\b", text)), 1)
         self.assertIn("preflight-child-survived", body)
-        self.assertLess(body.index("$clocksPowerList = Get-ClocksPowerCounterList"), guard, "the Energy Meter listing is a pre-launch child too")
+        self.assertLess(body.index("$clocksPowerList = Get-ClocksPowerPreLaunchList"), guard, "the Energy Meter listing is a pre-launch child too")
         self.assertLess(guard, body.index("$clocksPowerClk1 = Get-ClocksPowerClockCapture"), "decided before the first capture")
-        self.assertLess(guard, body.index("$clocksPowerGpuStart = Start-ClocksPowerGpu $clocksPowerBackend"), "decided before nvidia-smi starts")
         self.assertLess(guard, body.index("$clocksPowerCpuStart = Start-ClocksPowerCpu"), "and before typeperf starts")
-
-    def test_r6_a2_the_dgpu_pnp_read_is_bounded_on_the_clocks_path(self) -> None:
-        text = lf(self.job("cp-cuda"))
-        self.assertEqual(len(re.findall(r"(?m)^function Invoke-ClocksPowerDStateBounded\b", text)), 1)
-        m = re.search(r"(?ms)^function Start-ClocksPowerGpu\b.*?^}", text)
-        self.assertIsNotNone(m)
-        self.assertIn("Invoke-ClocksPowerDStateBounded", m.group(0), "Start-ClocksPowerGpu reads the D-state through the bounded call, never & $DState directly")
 
     def test_r6_a3_the_files_are_published_before_the_block_names_them(self) -> None:
         text = lf(self.job("cp-cuda"))
@@ -273,15 +258,9 @@ class ClocksPowerGeneratorTests(unittest.TestCase):
         calls = [ln for ln in metrics.splitlines() if "= Get-ClocksPowerBlock" in ln]
         self.assertEqual(len(calls), 2)
         for ln in calls:
-            self.assertTrue(ln.rstrip().endswith("$clocksPowerGpuFile $clocksPowerCpuFile"), ln.strip())
-            self.assertNotIn("'gpu-clocks.csv'", ln)
-        self.assertIn("Get-ClocksPowerRawFileName $clocksPowerGpuPublished 'gpu-clocks.csv'", metrics)
+            self.assertTrue(ln.rstrip().endswith("$clocksPowerIntervalMs $clocksPowerCpuFile"), ln.strip())
+            self.assertNotIn("'cpu-clocks.csv'", ln)
         self.assertIn("Get-ClocksPowerRawFileName $clocksPowerCpuPublished 'cpu-clocks.csv'", metrics)
-
-    def test_c2_a_non_cuda_leg_keeps_the_wake_rule_and_a_cuda_leg_discloses_it(self) -> None:
-        text = lf(self.job("cp-cpu"))
-        self.assertIn("$clocksPowerBackend = 'cpu'", text)
-        self.assertIn("$clocksPowerBackend = 'cuda'", lf(self.job("cp-cuda")))
 
     def test_c3_a_template_without_the_launch_or_done_line_is_a_typed_refusal(self) -> None:
         for key in ("no-launch", "no-done"):
@@ -318,28 +297,7 @@ function J($v) { $v | ConvertTo-Json -Depth 8 -Compress }
 $ws = [DateTime]::new(2026, 11, 1, 14, 0, 0, 0, [DateTimeKind]::Utc); $we = $ws.AddMilliseconds(800)
 $win = [ordered]@{ startUtc = $ws; endUtc = $we; clockWhy = $null }
 $running = [ordered]@{ status = 'running'; reason = $null }
-$gpuText = "2026/11/01 08:00:00.000, 1500, 1500, 6000, 50.00, 80.00, 60, 0x0000000000000000`n2026/11/01 08:00:00.250, 1400, 1400, 6000, 55.00, 80.00, 61, 0x0000000000000004`n" +
-           "2026/11/01 08:00:00.500, [N/A], 1300, 6000, [N/A], 80.00, 62, 0x0000000000000001`n2026/11/01 08:00:00.750, 1200, 1200, 6000, 60.00, 80.00, 63, 0x0000000000000024`n" +
-           "2026/11/01 08:00:01.000, 300, 300, 405, 10.00, 80.00, 50, 0x0000000000000040`n2026/11/01 08:00:01.2"
-$g = ConvertFrom-ClocksPowerGpuCsv $gpuText $cst
-$r['gpuParse'] = @{ rows = $g.rows.Count; torn = $g.tornTail; why = $g.why; firstUtc = $g.rows[0].utc.ToString('o'); naGr = ($null -eq $g.rows[2].grMhz); naPower = ($null -eq $g.rows[2].powerW); mask3 = [int64]$g.rows[3].throttleMask }
-$ckGpu = [ordered]@{ intervalMs = 250; netStepMs = 0 }
 $ckCpu = [ordered]@{ intervalMs = 1000; netStepMs = 0 }
-$gs = Get-ClocksPowerGpuSummary $g $running $win $null $ckGpu
-$r['gpuWin'] = $gs
-$gn = Get-ClocksPowerGpuSummary $g $running $null
-$r['gpuNoWin'] = @{ status = $gn.status; samples = $gn.samples; total = $gn.samplesTotal; limit = $gn.limitFlagsUnion }
-$r['gpuAmbiguous'] = (Get-ClocksPowerGpuSummary (ConvertFrom-ClocksPowerGpuCsv "2026/11/01 08:00:00.000, 1, 1, 1, 1.0, 1.0, 1, 0x0`n2026/11/01 08:00:00.000, 2, 2, 2, 2.0, 2.0, 2, 0x0`n" $cst) $running $win).status
-$r['gpuEmpty'] = (Get-ClocksPowerGpuSummary (ConvertFrom-ClocksPowerGpuCsv '' $cst) $running $win).status
-$r['gpuMissingFile'] = (Get-ClocksPowerGpuSummary (ConvertFrom-ClocksPowerGpuCsv $null $cst) $running $win).status
-$r['gpuGarbage'] = (Get-ClocksPowerGpuSummary (ConvertFrom-ClocksPowerGpuCsv "garbage`nmore garbage`n" $cst) $running $win).status
-$r['gpuSkipped'] = (Get-ClocksPowerGpuSummary $g ([ordered]@{ status = 'skipped_wake_risk'; reason = 'dgpu-D3' }) $win).status
-$r['gpuStartFailed'] = (Get-ClocksPowerGpuSummary $g ([ordered]@{ status = 'unavailable'; reason = 'nvidia-smi-missing' }) $win).status
-$r['gpuEarlyExit'] = (Get-ClocksPowerGpuSummary $g $running $win ([ordered]@{ stopped = $true; exitedBeforeStop = $true; why = $null })).status
-$allna = Get-ClocksPowerGpuSummary (ConvertFrom-ClocksPowerGpuCsv "2026/11/01 08:00:00.100, [N/A], [N/A], [N/A], [N/A], [N/A], [N/A], [N/A]`n" $cst) $running $win $null $ckGpu
-$r['gpuAllNa'] = @{ status = $allna.status; sm = $allna.smClockMhz; power = $allna.powerW; reasons = $allna.throttleReasonsUnion }
-$r['gpuSummerUtc'] = (ConvertFrom-ClocksPowerGpuCsv "2026/07/01 08:00:00.000, 1, 1, 1, 1.0, 1.0, 1, 0x0`n" $cst).rows[0].utc.ToString('o')
-$r['throttleNames'] = @{ zero = @(Get-ClocksPowerThrottleNames 0).Count; idle = (Get-ClocksPowerThrottleNames 1) -join ','; pcap = (Get-ClocksPowerThrottleNames 4) -join ','; all = (Get-ClocksPowerThrottleNames 0x1FF).Count; unknown = (Get-ClocksPowerThrottleNames 0x8000) -join ','; unknown62 = (Get-ClocksPowerThrottleNames 0x4000000000000000) -join ','; unknown63 = (Get-ClocksPowerThrottleNames ([int64]::MinValue)) -join ',' }
 $cpuText = "`"(PDH-CSV 4.0) (Central Standard Time)(360)`",`"\\BACHELOR\Processor Information(_Total)\% Processor Performance`",`"\\BACHELOR\Processor Information(_Total)\Processor Frequency`",`"\\BACHELOR\Energy Meter(RAPL_Package0_PKG)\Power`"`n" +
            "`"11/01/2026 08:00:00.000`",`"100.000000`",`"2000.000000`",`"15000.000000`"`n`"11/01/2026 08:00:01.000`",`"150.000000`",`"2000.000000`",`"30000.000000`"`n" +
            "`"11/01/2026 08:00:02.000`",`"200.000000`",`"2000.000000`",`"45000.000000`"`n`"11/01/2026 08:00:03.000`",`" `",`"2000.000000`",`"45000.000000`"`n" +
@@ -363,10 +321,10 @@ $r['seriesEven'] = $ser
 $r['seriesEmpty'] = Get-ClocksPowerSeries @($null, $null) 'all-not-supported'
 $r['seriesBig'] = Get-ClocksPowerSeries @(1e308, 1e308) 'x'
 $r['seriesOne'] = Get-ClocksPowerSeries @(7) 'x'
-$blk = Get-ClocksPowerBlock $gs $cs ([ordered]@{ powerPlan = 'UNAVAILABLE(powercfg-failed)'; acState = 'ac'; display = 'UNAVAILABLE(cim-failed)' }) $win $true 1000 'gpu-clocks.csv' 'cpu-clocks.csv'
+$blk = Get-ClocksPowerBlock $cs ([ordered]@{ powerPlan = 'UNAVAILABLE(powercfg-failed)'; acState = 'ac'; display = 'UNAVAILABLE(cim-failed)' }) $win $true 1000 'cpu-clocks.csv'
 $r['block'] = $blk
-$r['blockNone'] = Get-ClocksPowerBlock $null $null $null $null $false 1000 'gpu-clocks.csv' 'cpu-clocks.csv'
-$r['blockNoWindow'] = (Get-ClocksPowerBlock $gn $np $null $null $false 1000 'gpu-clocks.csv' 'cpu-clocks.csv').status
+$r['blockNone'] = Get-ClocksPowerBlock $null $null $null $false 1000 'cpu-clocks.csv'
+$r['blockNoWindow'] = (Get-ClocksPowerBlock $np $null $null $false 1000 'cpu-clocks.csv').status
 $cnt = Resolve-ClocksPowerCounters @('Energy Meter(RAPL_Package0_CORE)\Power', 'Energy Meter(RAPL_Package0_PKG)\Power', 'Energy Meter(RAPL_Package0_PKG)\Energy', 'Energy Meter(RAPL_Package0_DRAM)\Power')
 $r['counters'] = $cnt
 $r['countersNone'] = Resolve-ClocksPowerCounters @()
@@ -386,8 +344,6 @@ $r['display'] = ConvertFrom-ClocksPowerDisplay @(@{ Name = 'NVIDIA GeForce RTX 3
 $r['displayNone'] = ConvertFrom-ClocksPowerDisplay @()
 $plat = Get-ClocksPowerPlatform
 $r['platformKeys'] = @($plat.Keys)
-$sg = Start-ClocksPowerGpu 'cuda' '' (Join-Path $env:CP_TMP 'g.csv') { @{ state = 'D0'; reason = $null } } 1000 'clocks_throttle_reasons.active'
-$r['startGpuMissing'] = @{ status = $sg.status; reason = $sg.reason; proc = ($null -eq $sg.proc) }
 $sc = Start-ClocksPowerCpu (Join-Path $env:CP_TMP 'no-such-typeperf.exe') (Join-Path $env:CP_TMP 'c.csv') 1000 @('\Processor Information(_Total)\% Processor Performance')
 $r['startCpuMissing'] = @{ status = $sc.status; reason = $sc.reason; proc = ($null -eq $sc.proc) }
 $sc2 = Start-ClocksPowerCpu 'typeperf.exe' (Join-Path $env:CP_TMP 'c2.csv') 1000 @()
@@ -410,46 +366,6 @@ class ClocksPowerPureHelperTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.assertIsNotNone(self.r, f"the lifted helpers did not run: {self.raw.stdout[-3000:]}{self.raw.stderr[-3000:]}")
-
-    def test_c4_gpu_rows_na_is_null_never_zero_hex_mask_torn_tail_and_local_time(self) -> None:
-        self.assertEqual(self.r["gpuParse"], {"rows": 5, "torn": True, "why": None, "firstUtc": "2026-11-01T14:00:00.0000000Z", "naGr": True,
-                                              "naPower": True, "mask3": 36})
-        self.assertEqual(self.r["gpuSummerUtc"], "2026-07-01T13:00:00.0000000Z", "host-local daylight time converts with its own offset")
-
-    def test_c4_gpu_window_statistics_min_median_max_and_the_throttle_union(self) -> None:
-        g = self.r["gpuWin"]
-        self.assertEqual((g["status"], g["samples"], g["samplesTotal"]), ("ok", 4, 5))
-        self.assertEqual(g["smClockMhz"], {"n": 4, "min": 1200.0, "median": 1350.0, "max": 1500.0})
-        self.assertEqual(g["grClockMhz"], {"n": 3, "min": 1200.0, "median": 1400.0, "max": 1500.0}, "an [N/A] clock is left out, not counted as 0")
-        self.assertEqual(g["powerW"], {"n": 3, "min": 50.0, "median": 55.0, "max": 60.0})
-        self.assertEqual(g["powerLimitW"], {"n": 4, "min": 80.0, "median": 80.0, "max": 80.0})
-        self.assertEqual(g["tempC"], {"n": 4, "min": 60.0, "median": 61.5, "max": 63.0})
-        self.assertEqual(sorted(g["throttleReasonsUnion"]), ["GpuIdle", "SwPowerCap", "SwThermalSlowdown"], "HwThermalSlowdown was set only OUTSIDE the window")
-        self.assertEqual(sorted(g["limitFlagsUnion"]), ["SwPowerCap", "SwThermalSlowdown"], "idle is a reason but not a limit")
-        no_win = self.r["gpuNoWin"]
-        self.assertEqual((no_win["status"], no_win["samples"], no_win["total"]), ("partial(no_window)", 5, 5))
-        self.assertIn("HwThermalSlowdown", no_win["limit"], "with no window every row counts, and the status says so")
-
-    def test_c4_gpu_typed_unavailable(self) -> None:
-        self.assertEqual(self.r["gpuAmbiguous"], "unavailable(nvidia-smi-ambiguous)")
-        self.assertEqual(self.r["gpuEmpty"], "unavailable(nvidia-smi-no-rows)")
-        self.assertEqual(self.r["gpuMissingFile"], "unavailable(gpu-clocks-missing)")
-        self.assertEqual(self.r["gpuGarbage"], "unavailable(nvidia-smi-unparseable)")
-        self.assertEqual(self.r["gpuSkipped"], "skipped_wake_risk")
-        self.assertEqual(self.r["gpuStartFailed"], "unavailable(nvidia-smi-missing)")
-        self.assertEqual(self.r["gpuEarlyExit"], "unavailable(nvidia-smi-exited-early)")
-        na = self.r["gpuAllNa"]
-        self.assertTrue(na["status"].startswith("unavailable("), na)
-        for key in ("sm", "power"):
-            self.assertIsInstance(na[key], str, "an unsupported field is UNAVAILABLE(reason) text, never a number")
-            self.assertTrue(na[key].startswith("UNAVAILABLE("), na)
-
-    def test_c4_throttle_bit_names(self) -> None:
-        t = self.r["throttleNames"]
-        self.assertEqual((t["zero"], t["idle"], t["pcap"], t["all"]), (0, "GpuIdle", "SwPowerCap", 9))
-        self.assertEqual(t["unknown"], "Unknown0x8000", "a bit the table does not know is named, never dropped")
-        self.assertEqual(t["unknown62"], "Unknown0x4000000000000000", "adversary A2: bit 62 is named, not dropped by an off-by-two loop bound")
-        self.assertEqual(t["unknown63"], "Unknown0x8000000000000000", "adversary A2: bit 63 (the sign bit) is named too")
 
     def test_c4_cpu_rows_header_mapping_effective_clock_and_package_power(self) -> None:
         p = self.r["cpuParse"]
@@ -484,9 +400,9 @@ class ClocksPowerPureHelperTests(unittest.TestCase):
         self.assertEqual(b["window"]["startUtc"], "2026-11-01T14:00:00.0000000Z")
         self.assertEqual(b["platform"]["acState"], "ac")
         self.assertEqual(b["platform"]["powerPlan"], "UNAVAILABLE(powercfg-failed)")
-        self.assertEqual(b["gpu"]["rawFile"], "gpu-clocks.csv")
         self.assertEqual(b["cpu"]["rawFile"], "cpu-clocks.csv")
-        self.assertEqual(b["gpu"]["smClockMhz"]["median"], 1350.0)
+        self.assertEqual(b["gpu"], "not collected (BENCH-GPU-CLOCKS-FLUSH-1)")
+        self.assertEqual(b["cpu"]["effectiveMhz"]["median"], 3500.0)
         none = self.r["blockNone"]
         self.assertEqual(none["status"], "unavailable")
         self.assertTrue(none["reason"], "a typed reason")
@@ -514,8 +430,7 @@ class ClocksPowerPureHelperTests(unittest.TestCase):
         self.assertEqual(self.r["displayNone"], "UNAVAILABLE(no-active-display-mode)")
         self.assertEqual(sorted(self.r["platformKeys"]), ["acState", "display", "powerPlan"])
 
-    def test_c5_a_missing_nvidia_smi_or_typeperf_starts_nothing_and_is_typed(self) -> None:
-        self.assertEqual(self.r["startGpuMissing"], {"status": "unavailable", "reason": "nvidia-smi-missing", "proc": True})
+    def test_c5_a_missing_typeperf_starts_nothing_and_is_typed(self) -> None:
         self.assertEqual(self.r["startCpuMissing"], {"status": "unavailable", "reason": "typeperf-missing", "proc": True})
         self.assertEqual(self.r["startCpuNoCounters"], {"status": "unavailable", "reason": "no-counters", "proc": True})
 
@@ -535,11 +450,6 @@ $r = [ordered]@{}
 $running = [ordered]@{ status = 'running'; reason = $null }
 $ws = [DateTime]::new(2026, 11, 1, 14, 0, 17, 0, [DateTimeKind]::Utc)
 $win = [ordered]@{ startUtc = $ws; endUtc = $ws.AddSeconds(6); clockWhy = $null }
-function Gpu([string[]]$stamps) {
-    $t = ''
-    foreach ($s in $stamps) { $t += "2026/11/01 08:00:$s, 1500, 1500, 6000, 50.00, 80.00, 60, 0x0000000000000000`n" }
-    ConvertFrom-ClocksPowerGpuCsv $t $cst
-}
 function Cpu([string[]]$stamps) {
     $t = "`"(PDH-CSV 4.0) (Central Standard Time)(360)`",`"\\B\Processor Information(_Total)\% Processor Performance`",`"\\B\Processor Information(_Total)\Processor Frequency`",`"\\B\Energy Meter(RAPL_Package0_PKG)\Power`"`n"
     foreach ($s in $stamps) { $t += "`"11/01/2026 08:00:$s`",`"150.0`",`"2000.0`",`"30000.0`"`n" }
@@ -548,18 +458,6 @@ function Cpu([string[]]$stamps) {
 function Chk($interval, $net) { [ordered]@{ intervalMs = $interval; netStepMs = $net } }
 $adv = @('18.100', '19.100', '19.600', '21.100')
 $steady = @('18.100', '19.110', '20.090', '21.100')
-$r['gpuAdv'] = St (T { Get-ClocksPowerGpuSummary (Gpu $adv) $running $win $null (Chk 1000 0) })
-$r['gpuSteady'] = T { $s = Get-ClocksPowerGpuSummary (Gpu $steady) $running $win $null (Chk 1000 0); @{ status = St $s; samples = $s.samples } }
-$r['gpuNet600'] = St (T { Get-ClocksPowerGpuSummary (Gpu $steady) $running $win $null (Chk 1000 600) })
-$r['gpuNetNeg600'] = St (T { Get-ClocksPowerGpuSummary (Gpu $steady) $running $win $null (Chk 1000 ([double]-600)) })
-$r['gpuNet250'] = St (T { Get-ClocksPowerGpuSummary (Gpu $steady) $running $win $null (Chk 1000 250) })
-$r['gpuNet251'] = St (T { Get-ClocksPowerGpuSummary (Gpu $steady) $running $win $null (Chk 1000 251) })
-$r['gpuNullCheck'] = St (T { Get-ClocksPowerGpuSummary (Gpu $steady) $running $win $null $null })
-$r['gpuNoNetStep'] = St (T { Get-ClocksPowerGpuSummary (Gpu $steady) $running $win $null ([ordered]@{ intervalMs = 1000 }) })
-$r['gpuNullNetStep'] = St (T { Get-ClocksPowerGpuSummary (Gpu $steady) $running $win $null (Chk 1000 $null) })
-$r['gpuNoWindowNullCheck'] = St (T { Get-ClocksPowerGpuSummary (Gpu $steady) $running $null $null $null })
-$r['gpuFast250'] = St (T { Get-ClocksPowerGpuSummary (Gpu @('18.000', '18.250', '18.500', '18.750')) $running $win $null (Chk 250 0) })
-$r['gpuFast250Gap600'] = St (T { Get-ClocksPowerGpuSummary (Gpu @('18.000', '18.250', '18.850', '19.100')) $running $win $null (Chk 250 0) })
 $r['cpuAdv'] = St (T { Get-ClocksPowerCpuSummary (Cpu $adv) $running $win $null (Chk 1000 0) })
 # adversary de9ca8e7 A1: performance 50 % at second 0, 75 % at second 1, 100 % from second 2 on, frequency 2000 throughout, a row at every second 0..21,
 # the Play window 0.5 s .. 20.5 s. Row 1 is the interval (0 s, 1 s] that straddles the window start, so it is not Play and must not pull the minimum to 1500
@@ -577,12 +475,12 @@ $r['cpuNullCheck'] = St (T { Get-ClocksPowerCpuSummary (Cpu $steady) $running $w
 $r['cpuNoWindowNullCheck'] = St (T { Get-ClocksPowerCpuSummary (Cpu $steady) $running $null $null $null })
 $r['cpuInterval250OneSecondRows'] = St (T { Get-ClocksPowerCpuSummary (Cpu $steady) $running $win $null (Chk 250 0) })
 $r['cpuInterval500HalfSecondGaps'] = St (T { Get-ClocksPowerCpuSummary (Cpu @('18.000', '18.500', '19.000', '19.500')) $running $win $null (Chk 500 0) })
-$r['whyOk'] = T { Get-ClocksPowerClockWhy (Gpu $steady).rows (Chk 1000 0) }
-$r['whyAdv'] = T { Get-ClocksPowerClockWhy (Gpu $adv).rows (Chk 1000 0) }
-$r['whyNull'] = T { Get-ClocksPowerClockWhy (Gpu $steady).rows $null }
-$r['whyBadInterval'] = T { Get-ClocksPowerClockWhy (Gpu $steady).rows (Chk 0 0) }
-$r['whyOneRow'] = T { Get-ClocksPowerClockWhy (Gpu @('18.100')).rows (Chk 1000 0) }
-$r['whyBackwards'] = T { Get-ClocksPowerClockWhy (Gpu @('19.100', '18.100')).rows (Chk 1000 0) }
+$r['whyOk'] = T { Get-ClocksPowerClockWhy (Cpu $steady).rows (Chk 1000 0) }
+$r['whyAdv'] = T { Get-ClocksPowerClockWhy (Cpu $adv).rows (Chk 1000 0) }
+$r['whyNull'] = T { Get-ClocksPowerClockWhy (Cpu $steady).rows $null }
+$r['whyBadInterval'] = T { Get-ClocksPowerClockWhy (Cpu $steady).rows (Chk 0 0) }
+$r['whyOneRow'] = T { Get-ClocksPowerClockWhy (Cpu @('18.100')).rows (Chk 1000 0) }
+$r['whyBackwards'] = T { Get-ClocksPowerClockWhy (Cpu @('19.100', '18.100')).rows (Chk 1000 0) }
 $r['netStep0'] = T { Get-ClocksPowerNetStepMs 0 0 100000000 10000 1000 }
 $r['netStepFwd'] = T { Get-ClocksPowerNetStepMs 0 0 106000000 10000 1000 }
 $r['netStepBack'] = T { Get-ClocksPowerNetStepMs 0 0 97000000 10000 1000 }
@@ -605,10 +503,6 @@ class ClocksPowerClockWitnessTests(unittest.TestCase):
     def setUp(self) -> None:
         self.assertIsNotNone(self.r, f"the lifted helpers did not run: {self.raw.stdout[-3000:]}{self.raw.stderr[-3000:]}")
 
-    def test_a1_gpu_rows_a_clock_excursion_bent_are_unverified_not_ok(self) -> None:
-        self.assertEqual(self.r["gpuAdv"], "unavailable(sample-clock-unverified)", "the adversary input: 18.100 / 19.100 / 19.600 / 21.100 against 1000 ms")
-        self.assertEqual(self.r["gpuFast250Gap600"], "unavailable(sample-clock-unverified)", "a 600 ms gap against a 250 ms interval is off by 350 ms (> max(200, 100))")
-
     def test_a1_cpu_rows_a_clock_excursion_bent_are_unverified_not_ok(self) -> None:
         self.assertEqual(self.r["cpuAdv"], "unavailable(sample-clock-unverified)", "the CPU analog")
 
@@ -619,20 +513,14 @@ class ClocksPowerClockWitnessTests(unittest.TestCase):
                          "a row's interval starts at the previous row's stamp; the first row has no known start")
 
     def test_a1_a_net_wall_vs_monotonic_step_over_250_ms_is_unverified_either_way(self) -> None:
-        for key in ("gpuNet600", "gpuNetNeg600", "gpuNet251", "cpuNet600"):
-            self.assertEqual(self.r[key], "unavailable(sample-clock-unverified)", key)
-        self.assertEqual(self.r["gpuNet250"], "ok", "250 ms is the bound itself: only a step OVER it refuses")
+        self.assertEqual(self.r["cpuNet600"], "unavailable(sample-clock-unverified)")
 
     def test_a1_a_window_with_no_usable_check_is_unwitnessed(self) -> None:
-        for key in ("gpuNullCheck", "gpuNoNetStep", "gpuNullNetStep", "cpuNullCheck"):
-            self.assertEqual(self.r[key], "unavailable(sample-clock-unwitnessed)", key)
-        for key in ("gpuNoWindowNullCheck", "cpuNoWindowNullCheck"):
-            self.assertEqual(self.r[key], "partial(no_window)", f"{key}: with no window nothing is cut by stamp, so no witness is asked for")
+        self.assertEqual(self.r["cpuNullCheck"], "unavailable(sample-clock-unwitnessed)")
+        self.assertEqual(self.r["cpuNoWindowNullCheck"], "partial(no_window)", "with no window nothing is cut by stamp, so no witness is asked for")
 
     def test_a1_a_steady_stream_with_a_clock_check_stays_ok(self) -> None:
-        self.assertEqual(self.r["gpuSteady"], {"status": "ok", "samples": 4})
         self.assertEqual(self.r["cpuSteady"], {"status": "ok", "samples": 3}, "typeperf rows are interval rows: the first row (no known start) is not counted")
-        self.assertEqual(self.r["gpuFast250"], "ok")
         self.assertEqual(self.r["cpuInterval250OneSecondRows"], "ok", "typeperf -si is whole seconds: the CPU nominal is the interval rounded UP, so 250 ms means 1 s")
         self.assertEqual(self.r["cpuInterval500HalfSecondGaps"], "unavailable(sample-clock-unverified)", "typeperf cannot sample at 500 ms: half-second gaps are not its cadence")
 
@@ -707,9 +595,8 @@ class ClocksPowerBoundedCallTests(unittest.TestCase):
 #   A1  the (wall, monotonic) capture pair was read as two separate statements, so a deschedule between them skews that capture and can cancel a persistent
 #       wall step: netStepMs came out 0 while the host clock had stepped -600 ms, and a row sampled after Play was counted in the Play window. Each capture is
 #       now BRACKETED (monotonic, wall, monotonic): its monotonic stamp is the midpoint and its width is the bracket; a width over 25 ms is no witness.
-#   A2  the dGPU PnP read (Get-PnpDevice / Get-PnpDeviceProperty) ran synchronously and unbounded inside the pre-launch reads, so the "50 s allowance" bounded
-#       nothing: it is now run in its own runspace and abandoned at 4 s (pnp-read-timeout), like every other pre-launch read.
-#   A3  the block named gpu-clocks.csv / cpu-clocks.csv as rawFile whether or not the copy happened (a Pub name that is an empty directory refuses the copy):
+#   A2  (the dGPU PnP read; r10 removed the GPU collection, and its tests, with it)
+#   A3  the block named cpu-clocks.csv (and, before r10, gpu-clocks.csv) as rawFile whether or not the copy happened (a Pub name that is an empty directory refuses the copy):
 #       the files are published BEFORE the block is built, and rawFile names a file only when its copy succeeded (UNAVAILABLE(not-published) otherwise).
 DRIVER_R6 = r"""
 function J($v) { $v | ConvertTo-Json -Depth 8 -Compress }
@@ -718,23 +605,21 @@ function St($o) { if ($o -is [string]) { $o } else { [string]$o.status } }
 $r = [ordered]@{}
 $utc = [TimeZoneInfo]::Utc
 $running = [ordered]@{ status = 'running'; reason = $null }
-# the adversary's rows: a 5 s interval, UTC stamps, the post-Play row at 21.700 carries a limit bit (mask 0x40)
-$t = ''
-foreach ($row in @(@('02.300', '0x0000000000000000'), @('06.700', '0x0000000000000000'), @('11.700', '0x0000000000000000'), @('16.700', '0x0000000000000000'), @('21.700', '0x0000000000000040'), @('26.700', '0x0000000000000000'))) {
-    $t += "2026/11/01 12:00:$($row[0]), 1500, 1500, 6000, 50.00, 80.00, 60, $($row[1])`n"
-}
-$parsed = ConvertFrom-ClocksPowerGpuCsv $t $utc
+# the adversary's rows (r10: typeperf rows, the CPU half is all there is): a 5 s interval, UTC stamps, the rows at 21.700 and 26.700 reach past Play
+$t = "`"(PDH-CSV 4.0) (UTC)(0)`",`"\\B\Processor Information(_Total)\% Processor Performance`",`"\\B\Processor Information(_Total)\Processor Frequency`"`n"
+foreach ($s in @('02.300', '06.700', '11.700', '16.700', '21.700', '26.700')) { $t += "`"11/01/2026 12:00:$s`",`"100.0`",`"2000.0`"`n" }
+$parsed = ConvertFrom-ClocksPowerCpuCsv $t $utc
 $win = [ordered]@{ startUtc = [DateTime]::new(2026, 11, 1, 12, 0, 2, 0, [DateTimeKind]::Utc); endUtc = [DateTime]::new(2026, 11, 1, 12, 0, 22, 0, [DateTimeKind]::Utc); clockWhy = $null }
 $f = [int64]10000000
 $wall1 = [int64]639307512000000000
 # A1: the first capture's wall read came 600 ms after its monotonic read (a deschedule); the wall clock then stepped -600 ms and stayed there
 $descheduled = Get-ClocksPowerClockCheck @($wall1, [int64]6000000, 600.0) @([int64]639307512294000000, [int64]300000000, 0.0) 5000 $f
-$r['a1Descheduled'] = St (T { Get-ClocksPowerGpuSummary $parsed $running $win $null $descheduled })
+$r['a1Descheduled'] = St (T { Get-ClocksPowerCpuSummary $parsed $running $win $null $descheduled })
 $r['a1DescheduledCheckNull'] = ($null -eq $descheduled)
 $stepped = Get-ClocksPowerClockCheck @($wall1, [int64]6000000, 0.0) @([int64]639307512288000000, [int64]300000000, 0.0) 5000 $f
-$r['a1TightStep'] = St (T { Get-ClocksPowerGpuSummary $parsed $running $win $null $stepped })
+$r['a1TightStep'] = St (T { Get-ClocksPowerCpuSummary $parsed $running $win $null $stepped })
 $steady = Get-ClocksPowerClockCheck @($wall1, [int64]6000000, 5.0) @([int64]639307512294000000, [int64]300000000, 5.0) 5000 $f
-$r['a1TightSteady'] = St (T { Get-ClocksPowerGpuSummary $parsed $running $win $null $steady })
+$r['a1TightSteady'] = St (T { Get-ClocksPowerCpuSummary $parsed $running $win $null $steady })
 $r['a1SteadyShape'] = @{ interval = $steady.intervalMs; net = $steady.netStepMs; width = $steady.captureWidthMs }
 $r['a1Wide25'] = ($null -ne (Get-ClocksPowerClockCheck @($wall1, [int64]6000000, 25.0) @([int64]639307512294000000, [int64]300000000, 25.0) 5000 $f))
 $r['a1Wide25p1'] = ($null -ne (Get-ClocksPowerClockCheck @($wall1, [int64]6000000, 25.1) @([int64]639307512294000000, [int64]300000000, 0.0) 5000 $f))
@@ -744,21 +629,10 @@ $s0 = [Diagnostics.Stopwatch]::GetTimestamp()
 $c = T { Get-ClocksPowerClockCapture }
 $s1 = [Diagnostics.Stopwatch]::GetTimestamp()
 $r['a1Capture'] = T { @{ n = @($c).Count; inBracket = ($c[1] -ge $s0 -and $c[1] -le $s1); wallNear = ([Math]::Abs([DateTime]::UtcNow.Ticks - [int64]$c[0]) -lt 100000000); width = ($c[2] -ge 0 -and $c[2] -lt 1000) } }
-# A2: a PnP read that returns after 20 s is abandoned at 4 s, and nvidia-smi is not started
-$sw = [Diagnostics.Stopwatch]::StartNew()
-$slow = T { Start-ClocksPowerGpu 'cuda' '' (Join-Path $env:CP_TMP 'g-slow.csv') { Start-Sleep -Seconds 20; @{ state = 'D0'; reason = $null } } 1000 'clocks_throttle_reasons.active' }
-$r['a2Ms'] = $sw.ElapsedMilliseconds
-$r['a2Slow'] = T { @{ status = $slow.status; reason = $slow.reason; proc = ($null -eq $slow.proc) } }
-$absent = T { Start-ClocksPowerGpu 'cuda' '' (Join-Path $env:CP_TMP 'g-absent.csv') { @{ state = 'absent'; reason = 'no-dgpu' } } 1000 'clocks_throttle_reasons.active' }
-$r['a2Absent'] = T { @{ status = $absent.status; reason = $absent.reason } }
-$thrown = T { Start-ClocksPowerGpu 'cuda' '' (Join-Path $env:CP_TMP 'g-throw.csv') { throw 'pnp exploded' } 1000 'clocks_throttle_reasons.active' }
-$r['a2Thrown'] = T { @{ status = $thrown.status; reason = $thrown.reason } }
-$real = T { Invoke-ClocksPowerDStateBounded ${function:Get-UtilSampleDgpuState} 30000 }
-$r['a2Real'] = T { @{ hasState = ($real.ContainsKey('state')); hasReason = ($real.ContainsKey('reason')); notTimeout = ($real.reason -cne 'pnp-read-timeout') } }
 # A3: a file is named only when its copy succeeded
-$r['a3Names'] = @{ published = (Get-ClocksPowerRawFileName $true 'gpu-clocks.csv'); notPublished = (Get-ClocksPowerRawFileName $false 'gpu-clocks.csv') }
-$blk = Get-ClocksPowerBlock $null $null $null $null $false 1000 (Get-ClocksPowerRawFileName $false 'gpu-clocks.csv') (Get-ClocksPowerRawFileName $true 'cpu-clocks.csv')
-$r['a3Block'] = @{ gpu = $blk.gpu.rawFile; cpu = $blk.cpu.rawFile }
+$r['a3Names'] = @{ published = (Get-ClocksPowerRawFileName $true 'cpu-clocks.csv'); notPublished = (Get-ClocksPowerRawFileName $false 'cpu-clocks.csv') }
+$blk = Get-ClocksPowerBlock $null $null $null $false 1000 (Get-ClocksPowerRawFileName $false 'cpu-clocks.csv')
+$r['a3Block'] = @{ cpu = $blk.cpu.rawFile }
 # A3 (pass 4, adversary 16901aea): the ONE read of a sampler CSV, and the proof that a published copy is those bytes
 $srcPath = Join-Path $env:CP_TMP 'src.csv'
 [IO.File]::WriteAllText($srcPath, "a,b`r`n1,2`r`n", [Text.UTF8Encoding]::new($true))
@@ -823,18 +697,9 @@ class ClocksPowerPassThreeTests(unittest.TestCase):
     def test_a1_the_capture_is_bracketed_by_two_monotonic_reads(self) -> None:
         self.assertEqual(self.r["a1Capture"], {"n": 3, "inBracket": True, "wallNear": True, "width": True})
 
-    def test_a2_a_pnp_read_that_never_returns_is_abandoned_and_typed(self) -> None:
-        self.assertEqual(self.r["a2Slow"], {"status": "unavailable", "reason": "pnp-read-timeout", "proc": True})
-        self.assertLess(self.r["a2Ms"], 16000, "a 20 s read bounded at 8 s returns in seconds, not at the read's pace")
-
-    def test_a2_a_quick_or_failing_pnp_read_keeps_its_own_result(self) -> None:
-        self.assertEqual(self.r["a2Absent"], {"status": "unavailable", "reason": "no-dgpu"})
-        self.assertEqual(self.r["a2Thrown"], {"status": "unavailable", "reason": "pnp-read-failed"})
-        self.assertEqual(self.r["a2Real"], {"hasState": True, "hasReason": True, "notTimeout": True})
-
     def test_a3_rawfile_names_a_file_only_when_its_copy_succeeded(self) -> None:
-        self.assertEqual(self.r["a3Names"], {"published": "gpu-clocks.csv", "notPublished": "UNAVAILABLE(not-published)"})
-        self.assertEqual(self.r["a3Block"], {"gpu": "UNAVAILABLE(not-published)", "cpu": "cpu-clocks.csv"})
+        self.assertEqual(self.r["a3Names"], {"published": "cpu-clocks.csv", "notPublished": "UNAVAILABLE(not-published)"})
+        self.assertEqual(self.r["a3Block"], {"cpu": "UNAVAILABLE(not-published)"})
 
     def test_r6b_a3_one_read_of_a_sampler_csv_feeds_both_the_summary_and_the_published_copy_check(self) -> None:
         self.assertEqual(self.r["a3Read"], {"text": "a,b\r\n1,2\r\n", "shaIsFile": True, "bytesIsFile": True}, "UTF-8 decoded with the BOM dropped; the hash and the length are the file's")
@@ -853,10 +718,8 @@ class ClocksPowerPassThreeTests(unittest.TestCase):
         self.assertTrue(self.r["a3HoldNotStarted"])
 
 
-# r7 (hub ruling 2026-11-20): the GPU witness refused EVERY window on the venue (r5 ON legs: 51 GPU rows against 93-94 CPU rows in the same legs, so the
-# sampler cycles at about 1.8 s a row while the nominal interval is 1 s, and every adjacent gap broke max(200 ms, 0.4 x nominal)). The GPU gap test now
-# judges the gaps against the OBSERVED median gap (a non-rising stamp, a gap over 10 s and a net clock step still refuse), and both summaries disclose the
-# observed gaps (rowGapMs) so the cause is provable from summary.json on every run, a refused window included. Three cheap fixes of adversary pass 5:
+# r7 (hub ruling 2026-11-20): the summary discloses the observed gaps (rowGapMs) so the cause is provable from summary.json on every run, a refused
+# window included (r10: the GPU cadence tests left with the GPU collection). Three cheap fixes of adversary pass 5:
 #   A1  the net-step bound adds the capture width (a capture's monotonic stamp is the midpoint of its bracket): |net| + width > 250 refuses;
 #   A2  a pre-launch child that survives the kill is reported (survived), typed (powercfg-survivor / energy-meter-enumeration-survivor), and the job starts
 #       neither sampler beside it (unavailable(preflight-child-survived)); the kill waits are in the job-time budget (60 s);
@@ -869,11 +732,6 @@ $r = [ordered]@{}
 $cst = [TimeZoneInfo]::FindSystemTimeZoneById('Central Standard Time')
 $running = [ordered]@{ status = 'running'; reason = $null }
 $inv = [Globalization.CultureInfo]::InvariantCulture
-function GpuAt([double[]]$secs) {
-    $t = ''
-    foreach ($s in $secs) { $t += ("2026/11/01 08:00:{0}, 1500, 1500, 6000, 50.00, 80.00, 60, 0x0000000000000000`n" -f $s.ToString('00.000', $inv)) }
-    ConvertFrom-ClocksPowerGpuCsv $t $cst
-}
 function CpuAt([double[]]$secs) {
     $t = "`"(PDH-CSV 4.0) (Central Standard Time)(360)`",`"\\B\Processor Information(_Total)\% Processor Performance`",`"\\B\Processor Information(_Total)\Processor Frequency`"`n"
     foreach ($s in $secs) { $t += ("`"11/01/2026 08:00:{0}`",`"100.0`",`"2000.0`"`n" -f $s.ToString('00.000', $inv)) }
@@ -881,30 +739,15 @@ function CpuAt([double[]]$secs) {
 }
 function Chk($interval, $net, $width) { $c = [ordered]@{ intervalMs = $interval; netStepMs = $net }; if ($null -ne $width) { $c['captureWidthMs'] = $width }; $c }
 $win = [ordered]@{ startUtc = [DateTime]::new(2026, 11, 1, 14, 0, 3, 0, [DateTimeKind]::Utc); endUtc = [DateTime]::new(2026, 11, 1, 14, 0, 50, 0, [DateTimeKind]::Utc); clockWhy = $null }
-# the measured venue cadence: nominal 1000 ms, a row about every 1.8 s (gaps 1.9, 1.9, 1.6 s repeating)
-$cad = @(); for ($k = 0; $k -lt 30; $k++) { $cad += (0.1 + 1.8 * $k + (($k % 3) - 1) * 0.1) }
-$g18 = T { Get-ClocksPowerGpuSummary (GpuAt $cad) $running $win $null (Chk 1000 0 5) }
-$r['cad18'] = @{ status = St $g18; samples = $g18.samples; total = $g18.samplesTotal; gaps = $g18.rowGapMs }
-$bent = @($cad | ForEach-Object -Begin { $i = 0 } -Process { $v = $_; if ($i -ge 15) { $v = $v - 0.8 }; $i++; $v })
-$big = @($cad | ForEach-Object -Begin { $i = 0 } -Process { $v = $_; if ($i -ge 15) { $v = $v + 2.4 }; $i++; $v })
-$back = @($cad | ForEach-Object -Begin { $i = 0 } -Process { $v = $_; if ($i -eq 10) { $v = $cad[8] - 0.05 }; $i++; $v })
-$gb = T { Get-ClocksPowerGpuSummary (GpuAt $bent) $running $win $null (Chk 1000 0 5) }
-$r['cad18Bent'] = @{ status = St $gb; gaps = $gb.rowGapMs }
-$r['cad18Big'] = St (T { Get-ClocksPowerGpuSummary (GpuAt $big) $running $win $null (Chk 1000 0 5) })
-$r['cad18Back'] = St (T { Get-ClocksPowerGpuSummary (GpuAt $back) $running $win $null (Chk 1000 0 5) })
-$r['cad18Net'] = St (T { Get-ClocksPowerGpuSummary (GpuAt $cad) $running $win $null (Chk 1000 600 5) })
-$r['cad18TwoGaps'] = St (T { Get-ClocksPowerGpuSummary (GpuAt @($cad[0], $cad[1], $cad[2])) $running $win $null (Chk 1000 0 5) })
-$r['cad18ThreeGaps'] = St (T { Get-ClocksPowerGpuSummary (GpuAt @($cad[0], $cad[1], $cad[2], $cad[3])) $running $win $null (Chk 1000 0 5) })
-$r['cad18Cpu'] = St (T { Get-ClocksPowerCpuSummary (CpuAt $cad) $running $win $null (Chk 1000 0 5) })
 $c1 = T { $s = Get-ClocksPowerCpuSummary (CpuAt @(10, 11, 12, 13, 14)) $running $win $null (Chk 1000 0 5); @{ status = St $s; gaps = $s.rowGapMs } }
 $r['cpuGaps'] = $c1
-$r['gapsOneRow'] = T { (Get-ClocksPowerGpuSummary (GpuAt @(10)) $running $win $null (Chk 1000 0 5)).rowGapMs }
-$r['gapsNotStarted'] = T { (Get-ClocksPowerGpuSummary $null $null $win).rowGapMs }
-$r['gapStats'] = T { Get-ClocksPowerRowGapStats (GpuAt @(10, 11, 13, 16)).rows }
+$r['gapsOneRow'] = T { (Get-ClocksPowerCpuSummary (CpuAt @(10)) $running $win $null (Chk 1000 0 5)).rowGapMs }
+$r['gapsNotStarted'] = T { (Get-ClocksPowerCpuSummary $null $null $win).rowGapMs }
+$r['gapStats'] = T { Get-ClocksPowerRowGapStats (CpuAt @(10, 11, 13, 16)).rows }
 # A1: a persistent +260 ms step read as 240 by the midpoints, with 20 ms brackets
 $f = [int64]10000000
 $w1 = [int64]639307728000200000
-$steady5 = (GpuAt @(18.1, 23.1, 28.1, 33.1)).rows
+$steady5 = (CpuAt @(18.1, 23.1, 28.1, 33.1)).rows
 function Clk([int64]$wallDeltaTicks, [double]$width) { Get-ClocksPowerClockCheck @($w1, [int64]100000, $width) @(($w1 + $wallDeltaTicks), [int64]300100000, $width) 5000 $f }
 $r['a1Adv'] = T { Get-ClocksPowerClockWhy $steady5 (Clk 302400000 20.0) }
 $r['a1AdvNeg'] = T { Get-ClocksPowerClockWhy $steady5 (Clk 297600000 20.0) }
@@ -971,24 +814,7 @@ class ClocksPowerRoundSevenTests(unittest.TestCase):
     def setUp(self) -> None:
         self.assertIsNotNone(self.r, f"the lifted helpers did not run: {self.raw.stdout[-3000:]}{self.raw.stderr[-3000:]}")
 
-    def test_r7_gpu_rows_at_the_measured_1_8_s_cadence_are_judged_against_their_own_median_gap(self) -> None:
-        g = self.r["cad18"]
-        self.assertEqual((g["status"], g["total"]), ("ok", 30), "30 rows at about 1.8 s against a 1000 ms nominal: the venue's measured cadence is not a clock excursion")
-        self.assertGreaterEqual(g["samples"], 20)
-        self.assertEqual((g["gaps"]["n"], g["gaps"]["minMs"], g["gaps"]["medianMs"], g["gaps"]["maxMs"]), (29, 1600.0, 1900.0, 1900.0))
-        self.assertEqual(self.r["cad18Cpu"], "unavailable(sample-clock-unverified)", "the CPU side keeps its nominal-interval rule (typeperf -si is whole seconds)")
-
-    def test_r7_an_excursion_a_gap_a_backwards_stamp_and_a_net_step_still_refuse_at_that_cadence(self) -> None:
-        self.assertEqual(self.r["cad18Bent"]["status"], "unavailable(sample-clock-unverified)", "one 0.8 s gap among 1.9 s gaps is off the median by 1.1 s (> 0.76 s)")
-        self.assertEqual(self.r["cad18Big"], "unavailable(sample-clock-unverified)")
-        self.assertEqual(self.r["cad18Back"], "unavailable(sample-clock-unverified)", "a stamp that does not rise")
-        self.assertEqual(self.r["cad18Net"], "unavailable(sample-clock-unverified)", "a 600 ms net step")
-        self.assertEqual(self.r["cad18TwoGaps"], "unavailable(sample-clock-unverified)", "fewer than three gaps have no observed cadence: the nominal interval judges them")
-        self.assertEqual(self.r["cad18ThreeGaps"], "ok", "three gaps are the first with an observed median")
-
-    def test_r7_both_summaries_disclose_the_observed_row_gaps_even_when_the_window_is_refused(self) -> None:
-        self.assertEqual(self.r["cad18Bent"]["gaps"]["n"], 29)
-        self.assertEqual(self.r["cad18Bent"]["gaps"]["minMs"], 800.0, "the refused window still carries what the stamps said")
+    def test_r7_the_cpu_summary_discloses_the_observed_row_gaps(self) -> None:
         self.assertEqual(self.r["cpuGaps"], {"status": "ok", "gaps": {"n": 4, "minMs": 1000.0, "medianMs": 1000.0, "maxMs": 1000.0}})
         self.assertEqual(self.r["gapsOneRow"], "UNAVAILABLE(fewer-than-two-rows)")
         self.assertEqual(self.r["gapsNotStarted"], "UNAVAILABLE(start-not-reached)")
@@ -1040,125 +866,76 @@ class ClocksPowerRoundSevenTests(unittest.TestCase):
 
     def test_r7_a3_the_hold_is_closed_only_after_a_read_that_worked(self) -> None:
         sites = [ln.strip() for ln in self.text.splitlines() if "Close-ClocksPowerHold $clocksPower" in ln]
-        self.assertGreaterEqual(len(sites), 4, "two in the metrics region, two in Publish-ClocksPowerFiles")
+        self.assertGreaterEqual(len(sites), 2, "one in the metrics region, one in Publish-ClocksPowerFiles")
         for ln in sites:
-            self.assertRegex(ln, r"if \(\$null -ne \$(?:script:)?clocksPower(?:Gpu|Cpu)Read\) \{ Close-ClocksPowerHold ", ln)
+            self.assertRegex(ln, r"if \(\$null -ne \$(?:script:)?clocksPowerCpuRead\) \{ Close-ClocksPowerHold ", ln)
 
 
-# Round 8 (DESCOPE, hub ruling 2026-11-20T15:50Z): the GPU half is an ADVISORY disclosure. On the venue the GPU witness refused every window (0 of 51
-# samples in r5 and r7), so the GPU block can never set clocksPowerStatus, never names itself in the reason and never gates a leg; the status
-# reflects the CPU half only. The GPU raw file stays published (it is the evidence BENCH-GPU-CLOCKS-FLUSH-1 needs).
-DRIVER_R8 = r"""
+# Round 10 (SCOPE CUT, hub ruling 2026-11-20T18:25Z): the GPU (nvidia-smi) clocks/power collection LEAVES this PR (card BENCH-GPU-CLOCKS-FLUSH-1 owns it:
+# the venue never produced an accepted GPU sample, 0 of 51, and 5 of the 13 adversary majors of passes 3-8 were GPU-only). The block says
+# `gpu: not collected (BENCH-GPU-CLOCKS-FLUSH-1)` in one field; Start-UtilSampleGpu is master's bytes again; no gpu sampler process is started. And ONE
+# pre-launch deadline for the CPU half (adversary 0fe206f2 A1): past it the CPU half records `skipped: pre-launch deadline` and the leg runs unchanged.
+GPU_NOT_COLLECTED = "not collected (BENCH-GPU-CLOCKS-FLUSH-1)"
+START_UTIL_SAMPLE_GPU_MASTER_SHA256 = "46ee16dcd9031912da54b1a6b9254f63a693e116b222553eeb2ec17cfcec27b5"  # master 4e306d0d0, LF-normalised function text
+
+DRIVER_R10 = r"""
 function J($v) { $v | ConvertTo-Json -Depth 8 -Compress }
 function T($sb) { try { & $sb } catch { 'ERR: ' + $_.Exception.Message } }
 $r = [ordered]@{}
 $cst = [TimeZoneInfo]::FindSystemTimeZoneById('Central Standard Time')
 $running = [ordered]@{ status = 'running'; reason = $null }
-$inv = [Globalization.CultureInfo]::InvariantCulture
-function GpuAt([double[]]$secs) {
-    $t = ''
-    foreach ($s in $secs) { $t += ("2026/11/01 08:00:{0}, 1500, 1500, 6000, 50.00, 80.00, 60, 0x0000000000000000`n" -f $s.ToString('00.000', $inv)) }
-    ConvertFrom-ClocksPowerGpuCsv $t $cst
-}
-function CpuAt([double[]]$secs) {
-    $t = "`"(PDH-CSV 4.0) (Central Standard Time)(360)`",`"\\B\Processor Information(_Total)\% Processor Performance`",`"\\B\Processor Information(_Total)\Processor Frequency`"`n"
-    foreach ($s in $secs) { $t += ("`"11/01/2026 08:00:{0}`",`"100.0`",`"2000.0`"`n" -f $s.ToString('00.000', $inv)) }
-    ConvertFrom-ClocksPowerCpuCsv $t $cst
-}
-function Chk($interval, $net, $width) { $c = [ordered]@{ intervalMs = $interval; netStepMs = $net }; if ($null -ne $width) { $c['captureWidthMs'] = $width }; $c }
 $win = [ordered]@{ startUtc = [DateTime]::new(2026, 11, 1, 14, 0, 3, 0, [DateTimeKind]::Utc); endUtc = [DateTime]::new(2026, 11, 1, 14, 0, 50, 0, [DateTimeKind]::Utc); clockWhy = $null }
 $plat = [ordered]@{ powerPlan = 'Balanced'; acState = 'ac'; display = 'x' }
-# a GPU window the witness refuses: a row every 1.0 s with ONE 1.55 s gap (the venue's measured shape, 0 of 51 samples)
-$gpuSecs = @(); $t0 = 0.1; for ($k = 0; $k -lt 51; $k++) { $gpuSecs += $t0; $t0 += $(if ($k -eq 25) { 1.55 } else { 1.0 }) }
-$gpuBad = T { Get-ClocksPowerGpuSummary (GpuAt $gpuSecs) $running $win $null (Chk 1000 0 5) }
-$gpuOk = T { Get-ClocksPowerGpuSummary (GpuAt @(10, 11, 12, 13, 14)) $running $win $null (Chk 1000 0 5) }
-$cpuOk = T { Get-ClocksPowerCpuSummary (CpuAt @(10, 11, 12, 13, 14)) $running $win $null (Chk 1000 0 5) }
-$cpuNoWin = T { Get-ClocksPowerCpuSummary (CpuAt @(10, 11, 12, 13, 14)) $running $null }
-$cpuDead = T { Get-ClocksPowerCpuSummary $null ([ordered]@{ status = 'unavailable'; reason = 'typeperf-missing' }) $win }
-$r['gpuBadStatus'] = $gpuBad.status
-$r['cpuOkStatus'] = $cpuOk.status
-$r['cpuDeadStatus'] = $cpuDead.status
-$r['cpuNoWinStatus'] = $cpuNoWin.status
-$b1 = T { Get-ClocksPowerBlock $gpuBad $cpuOk $plat $win $false 1000 'gpu-clocks.csv' 'cpu-clocks.csv' }
-$r['refusedGpuCpuOk'] = T { @{ status = $b1.status; reason = $b1.reason; gpuStatus = $b1.gpu.status; advisory = $b1.gpu.advisory; why = [string]$b1.gpu.advisoryReason; gaps = $b1.gpu.rowGapMs; raw = $b1.gpu.rawFile; samples = $b1.gpu.samples; total = $b1.gpu.samplesTotal; cpuAdvisory = ($b1.cpu.Contains('advisory')) } }
-$b2 = T { Get-ClocksPowerBlock $gpuOk $cpuDead $plat $win $false 1000 'gpu-clocks.csv' 'cpu-clocks.csv' }
-$r['gpuOkCpuDead'] = T { @{ status = $b2.status; reason = [string]$b2.reason; advisory = $b2.gpu.advisory } }
-$b3 = T { Get-ClocksPowerBlock $null $cpuOk $plat $null $false 1000 'gpu-clocks.csv' 'cpu-clocks.csv' }
-$r['gpuNullCpuOkNoWindow'] = T { @{ status = $b3.status; reason = [string]$b3.reason; advisory = $b3.gpu.advisory } }
-$b4 = T { Get-ClocksPowerBlock $gpuBad $cpuNoWin $plat $win $false 1000 'gpu-clocks.csv' 'cpu-clocks.csv' }
-$r['cpuPartial'] = T { @{ status = $b4.status; reason = [string]$b4.reason } }
-$b5 = T { Get-ClocksPowerBlock $gpuOk $cpuOk $plat $win $false 1000 'gpu-clocks.csv' 'cpu-clocks.csv' }
-$r['bothOk'] = T { @{ status = $b5.status; reason = $b5.reason; advisory = $b5.gpu.advisory } }
-$b6 = T { Get-ClocksPowerBlock $null $null $null $null $false 1000 'gpu-clocks.csv' 'cpu-clocks.csv' }
-$r['noneAtAll'] = T { @{ status = $b6.status; reason = [string]$b6.reason; advisory = $b6.gpu.advisory } }
-# adversary ade3c7d5 A1: the GPU sampler's executable comes from two fixed local paths, never from a PATH walk (a slow share on PATH cost one
-# synchronous Test-Path per entry before any telemetry deadline was checked)
-$nvRoot = Join-Path $env:CP_TMP 'nv'
-$nvSys = Join-Path $nvRoot 'sysroot'; $nvPf = Join-Path $nvRoot 'pf'; $nvPath = Join-Path $nvRoot 'pathdir'
-foreach ($d in @((Join-Path $nvSys 'System32'), (Join-Path $nvPf 'NVIDIA Corporation\NVSMI'), $nvPath)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
-$nvSysExe = Join-Path $nvSys 'System32\nvidia-smi.exe'; $nvPfExe = Join-Path $nvPf 'NVIDIA Corporation\NVSMI\nvidia-smi.exe'
-[IO.File]::WriteAllText((Join-Path $nvPath 'nvidia-smi.exe'), 'x')
-$oldSys = $env:SystemRoot; $oldPf = $env:ProgramFiles; $oldPath = $env:PATH
+$inv = [Globalization.CultureInfo]::InvariantCulture
+$t = "`"(PDH-CSV 4.0) (Central Standard Time)(360)`",`"\\B\Processor Information(_Total)\% Processor Performance`",`"\\B\Processor Information(_Total)\Processor Frequency`"`n"
+foreach ($s in @(10, 11, 12, 13, 14)) { $t += ("`"11/01/2026 08:00:{0}.000`",`"100.0`",`"2000.0`"`n" -f $s) }
+$cpuOk = T { Get-ClocksPowerCpuSummary (ConvertFrom-ClocksPowerCpuCsv $t $cst) $running $win $null ([ordered]@{ intervalMs = 1000; netStepMs = 0; captureWidthMs = 5 }) }
+$b = T { Get-ClocksPowerBlock $cpuOk $plat $win $false 1000 'cpu-clocks.csv' }
+$r['block'] = T { @{ status = $b.status; reason = $b.reason; gpu = $b.gpu; keys = @($b.Keys); cpuRaw = $b.cpu.rawFile } }
+$bn = T { Get-ClocksPowerBlock $null $null $null $false 1000 'UNAVAILABLE(not-published)' }
+$r['blockNone'] = T { @{ status = $bn.status; gpu = $bn.gpu } }
+$skipped = T { Get-ClocksPowerCpuSummary $null ([ordered]@{ status = 'unavailable'; reason = 'skipped: pre-launch deadline' }) $win }
+$bs = T { Get-ClocksPowerBlock $skipped $plat $win $false 1000 'UNAVAILABLE(not-published)' }
+$r['blockSkipped'] = T { @{ status = $bs.status; reason = [string]$bs.reason; gpu = $bs.gpu; cpuStatus = $bs.cpu.status } }
+$cpuNoWin = T { Get-ClocksPowerCpuSummary (ConvertFrom-ClocksPowerCpuCsv $t $cst) $running $null }
+$bw = T { Get-ClocksPowerBlock $cpuNoWin $plat $null $false 1000 'cpu-clocks.csv' }
+$r['blockNoWindow'] = T { @{ status = $bw.status; reason = [string]$bw.reason } }
+# the pre-launch deadline: ONE stopwatch at entry, every step reads what is left of it
+$w = [Diagnostics.Stopwatch]::StartNew()
+$r['leftFresh'] = T { [int](Get-ClocksPowerPreLaunchLeftMs $w 20000) }
+$r['leftPast'] = T { [int](Get-ClocksPowerPreLaunchLeftMs $w 0) }
+$ping = Join-Path ([Environment]::SystemDirectory) 'ping.exe'
+$w2 = [Diagnostics.Stopwatch]::StartNew()
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$stalled = T { Get-ClocksPowerPreLaunchList $ping $w2 900 '-n 30 127.0.0.1' }
+$r['stalledMs'] = $sw.ElapsedMilliseconds
+$r['stalled'] = T { @{ lines = @($stalled.lines).Count; why = $stalled.why; past = $stalled.pastDeadline } }
+$w3 = [Diagnostics.Stopwatch]::StartNew(); Start-Sleep -Milliseconds 60
+$sw.Restart()
+$past = T { Get-ClocksPowerPreLaunchList $ping $w3 10 '-n 30 127.0.0.1' }
+$r['pastMs'] = $sw.ElapsedMilliseconds
+$r['past'] = T { @{ lines = @($past.lines).Count; why = $past.why; past = $past.pastDeadline } }
+# the system directory comes from the OS, never from an inherited environment variable (a SystemRoot on a slow share was the adversary's input)
+$oldSys = $env:SystemRoot
 try {
-    $env:SystemRoot = $nvSys; $env:ProgramFiles = $nvPf; $env:PATH = $nvPath
-    $r['nvOnlyOnPath'] = T { Resolve-ClocksPowerNvidiaSmi }
-    [IO.File]::WriteAllText($nvPfExe, 'x')
-    $r['nvNvsmi'] = T { (Resolve-ClocksPowerNvidiaSmi) -ceq $nvPfExe }
-    [IO.File]::WriteAllText($nvSysExe, 'x')
-    $r['nvSystem32First'] = T { (Resolve-ClocksPowerNvidiaSmi) -ceq $nvSysExe }
-    $env:SystemRoot = '\\slow-share-a\win'; $env:ProgramFiles = '\\slow-share-b\pf'
-    $sw = [Diagnostics.Stopwatch]::StartNew()
-    $r['nvUnc'] = T { Resolve-ClocksPowerNvidiaSmi }
-    $r['nvUncFast'] = ($sw.ElapsedMilliseconds -lt 2000)
-    # adversary 83a64d80 A1: the class is "a root that is not on a local fixed drive", not only a leading backslash: a provider-qualified UNC and a
-    # drive letter that is not a fixed disk (a mapped share, a missing drive) are skipped too
-    $env:SystemRoot = 'FileSystem::\\slow-share-a\win'; $env:ProgramFiles = 'Microsoft.PowerShell.Core\FileSystem::\\slow-share-b\pf'
-    $r['nvProviderUnc'] = T { Resolve-ClocksPowerNvidiaSmi }
-    # a provider-qualified root that DOES hold the file (a local one, so the test never waits on a network): HEAD found it, the fix refuses the form
-    $env:SystemRoot = 'FileSystem::' + $nvSys; $env:ProgramFiles = ''
-    $r['nvProviderQualifiedLocal'] = T { Resolve-ClocksPowerNvidiaSmi }
-    $missing = ''
-    foreach ($ch in [char[]]'ZYXWVUTSRQPONMLKJIHGFED') { if (@([IO.DriveInfo]::GetDrives() | Where-Object { $_.Name.StartsWith([string]$ch) }).Count -eq 0) { $missing = [string]$ch; break } }
-    $r['nvMissingLetter'] = $missing
-    $env:SystemRoot = ($missing + ':\Windows'); $env:ProgramFiles = ($missing + ':\Program Files')
-    $r['nvNotFixedDrive'] = T { Resolve-ClocksPowerNvidiaSmi }
-    $env:SystemRoot = ''; $env:ProgramFiles = ''
-    $r['nvBlank'] = T { Resolve-ClocksPowerNvidiaSmi }
-    # adversary 83a64d80 A1 residual (CoS G3): a junction (a reparse point) under a fixed-drive root can point anywhere, so a root, or any segment walked to reach
-    # nvidia-smi, that carries ReparsePoint is refused exactly like a missing file. Each junction points at a local folder that DOES hold the file, so HEAD (which
-    # never looked at attributes) found it through the junction and the fix must not.
-    $jRoot = Join-Path $nvRoot 'junc'
-    New-Item -ItemType Directory -Force -Path $jRoot | Out-Null
-    $jSys = Join-Path $jRoot 'sysroot-link'
-    New-Item -ItemType Junction -Path $jSys -Target $nvSys | Out-Null
-    $jPf = Join-Path $jRoot 'pf-link'
-    New-Item -ItemType Junction -Path $jPf -Target $nvPf | Out-Null
-    $jLeafParent = Join-Path $jRoot 'pf-leaf\NVIDIA Corporation'
-    New-Item -ItemType Directory -Force -Path $jLeafParent | Out-Null
-    New-Item -ItemType Junction -Path (Join-Path $jLeafParent 'NVSMI') -Target (Join-Path $nvPf 'NVIDIA Corporation\NVSMI') | Out-Null
-    $r['nvJunctionBuilt'] = ((Test-Path -LiteralPath (Join-Path $jSys 'System32\nvidia-smi.exe') -PathType Leaf) -and (Test-Path -LiteralPath (Join-Path $jPf 'NVIDIA Corporation\NVSMI\nvidia-smi.exe') -PathType Leaf) -and (Test-Path -LiteralPath (Join-Path $jLeafParent 'NVSMI\nvidia-smi.exe') -PathType Leaf) -and (([IO.File]::GetAttributes($jSys) -band [IO.FileAttributes]::ReparsePoint) -ne 0))
-    $env:SystemRoot = $jSys; $env:ProgramFiles = ''
-    $r['nvJunctionMidSegment'] = T { Resolve-ClocksPowerNvidiaSmi }
-    $env:SystemRoot = ''; $env:ProgramFiles = $jPf
-    $r['nvJunctionMidSegmentPf'] = T { Resolve-ClocksPowerNvidiaSmi }
-    $env:SystemRoot = ''; $env:ProgramFiles = (Join-Path $jRoot 'pf-leaf')
-    $r['nvJunctionLastSegment'] = T { Resolve-ClocksPowerNvidiaSmi }
-    # the refused root falls through to the next candidate, exactly as a missing file does
-    $env:SystemRoot = $jSys; $env:ProgramFiles = $nvPf
-    $r['nvJunctionFallsThrough'] = T { (Resolve-ClocksPowerNvidiaSmi) -ceq $nvPfExe }
-} finally { $env:SystemRoot = $oldSys; $env:ProgramFiles = $oldPf; $env:PATH = $oldPath }
+    $env:SystemRoot = '\\slow-share-a\win'
+    $sw.Restart()
+    $r['typeperfUncEnv'] = T { Resolve-ClocksPowerTypeperf }
+    $r['typeperfUncEnvMs'] = $sw.ElapsedMilliseconds
+} finally { $env:SystemRoot = $oldSys }
+$r['typeperfExpected'] = (Join-Path ([Environment]::SystemDirectory) 'typeperf.exe')
 J $r
 """
 
 
 @requires_windows_pwsh
-class ClocksPowerRoundEightTests(unittest.TestCase):
+class ClocksPowerRoundTenTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls._tmp = tempfile.TemporaryDirectory(prefix="clocks-power-r8-")
+        cls._tmp = tempfile.TemporaryDirectory(prefix="clocks-power-r10-")
         cls.addClassCleanup(cls._tmp.cleanup)
         script = Path(cls._tmp.name) / "driver.ps1"
-        script.write_text(LIFT + DRIVER_R8, encoding="utf-8")
+        script.write_text(LIFT + DRIVER_R10, encoding="utf-8")
         proc = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_TMP": cls._tmp.name})
         cls.raw = proc
         cls.r = json.loads(proc.stdout.strip().splitlines()[-1]) if proc.returncode == 0 and proc.stdout.strip() else None
@@ -1167,82 +944,64 @@ class ClocksPowerRoundEightTests(unittest.TestCase):
     def setUp(self) -> None:
         self.assertIsNotNone(self.r, f"the lifted helpers did not run: {self.raw.stdout[-3000:]}{self.raw.stderr[-3000:]}")
 
-    def test_r8_the_fixture_shapes_are_what_the_tests_say_they_are(self) -> None:
-        self.assertEqual(self.r["gpuBadStatus"], "unavailable(sample-clock-unverified)", "one 1.55 s gap among 1.0 s gaps: the venue's refusal shape")
-        self.assertEqual(self.r["cpuOkStatus"], "ok")
-        self.assertTrue(self.r["cpuDeadStatus"].startswith("unavailable("), self.r["cpuDeadStatus"])
-        self.assertEqual(self.r["cpuNoWinStatus"], "partial(no_window)")
+    def test_r10_the_output_says_gpu_not_collected_in_one_field(self) -> None:
+        b = self.r["block"]
+        self.assertEqual(b["gpu"], GPU_NOT_COLLECTED)
+        self.assertEqual((b["status"], b["reason"]), ("ok", None), "the CPU half alone decides the status")
+        self.assertEqual(b["cpuRaw"], "cpu-clocks.csv")
+        self.assertEqual(self.r["blockNone"]["gpu"], GPU_NOT_COLLECTED, "a block with nothing else still says it")
+        self.assertNotIn("gpu-clocks", json.dumps(b), "no raw GPU file is named")
 
-    def test_r8_a_refused_gpu_witness_never_sets_the_status_or_the_reason(self) -> None:
-        b = self.r["refusedGpuCpuOk"]
-        self.assertEqual((b["status"], b["reason"]), ("ok", None), "the CPU half is usable with a window: the block is ok, the GPU refusal is not a gate")
-        self.assertEqual(b["gpuStatus"], "unavailable(sample-clock-unverified)", "the GPU summary still says what happened")
-        self.assertEqual(b["samples"], 0)
+    def test_r10_the_status_is_the_cpu_halfs_and_a_skipped_cpu_half_is_typed(self) -> None:
+        self.assertEqual(self.r["blockSkipped"], {"status": "unavailable", "reason": "cpu=unavailable(skipped: pre-launch deadline)", "gpu": GPU_NOT_COLLECTED,
+                                                  "cpuStatus": "unavailable(skipped: pre-launch deadline)"})
+        self.assertEqual(self.r["blockNoWindow"], {"status": "partial", "reason": "cpu=partial(no_window)+window=no_window"})
 
-    def test_r8_the_gpu_block_is_marked_advisory_with_its_reason_and_row_gaps(self) -> None:
-        b = self.r["refusedGpuCpuOk"]
-        self.assertIs(b["advisory"], True)
-        self.assertIn("BENCH-GPU-CLOCKS-FLUSH-1", b["why"])
-        self.assertIn("never sets clocksPowerStatus", b["why"])
-        self.assertEqual(b["gaps"]["n"], 50, "the rowGapMs disclosure survives the descope")
-        self.assertEqual(b["gaps"]["maxMs"], 1550.0)
-        self.assertEqual(b["raw"], "gpu-clocks.csv", "the raw GPU file stays published: it is the evidence the follow-up card needs")
-        self.assertFalse(b["cpuAdvisory"], "only the GPU half is advisory")
-        for key in ("gpuOkCpuDead", "gpuNullCpuOkNoWindow", "bothOk", "noneAtAll"):
-            self.assertIs(self.r[key]["advisory"], True, key + ": the flag is on every GPU block, whatever its status")
+    def test_r10_no_gpu_sampler_is_started_and_the_job_carries_no_gpu_collection(self) -> None:
+        for name in ("Resolve-ClocksPowerNvidiaSmi", "Start-ClocksPowerGpu", "Invoke-ClocksPowerDStateBounded", "Get-ClocksPowerGpuSummary", "ConvertFrom-ClocksPowerGpuCsv",
+                     "ConvertFrom-ClocksPowerGpuRow", "Get-ClocksPowerThrottleNames"):
+            self.assertNotIn(name, self.text, f"{name} left this PR (BENCH-GPU-CLOCKS-FLUSH-1 owns it)")
+        self.assertNotIn("gpu-clocks.csv", self.text)
+        self.assertNotIn("clocks_throttle_reasons", self.text)
+        self.assertNotIn("--query-gpu=timestamp,clocks.gr", self.text)
+        self.assertNotIn("QueryArgs", self.text, "Start-UtilSampleGpu has no caller-supplied query any more")
+        spliced = re.search(r"(?ms)\$cwFunctions = Get-CorePartitionFunctionSource @\((.*?)\) \"`n\"", self.text)
+        self.assertIsNotNone(spliced)
+        for name in ("Start-UtilSampleGpu", "Resolve-UtilSampleNvidiaSmi", "Get-UtilSampleDgpuState"):
+            self.assertNotIn("${function:" + name + "}", spliced.group(1), f"the clocks job does not carry {name}")
 
-    def test_r8_the_status_reflects_the_cpu_half_only(self) -> None:
-        self.assertEqual(self.r["gpuOkCpuDead"]["status"], "unavailable", "a healthy GPU does not rescue a dead CPU half")
-        self.assertTrue(self.r["gpuOkCpuDead"]["reason"].startswith("cpu=unavailable("), self.r["gpuOkCpuDead"])
-        self.assertNotIn("gpu=", self.r["gpuOkCpuDead"]["reason"])
-        self.assertEqual(self.r["gpuNullCpuOkNoWindow"], {"status": "partial", "reason": "window=no_window", "advisory": True})
-        self.assertEqual(self.r["cpuPartial"], {"status": "partial", "reason": "cpu=partial(no_window)"})
-        self.assertEqual(self.r["bothOk"], {"status": "ok", "reason": None, "advisory": True})
-        n = self.r["noneAtAll"]
-        self.assertEqual(n["status"], "unavailable")
-        self.assertNotIn("gpu=", n["reason"])
-        self.assertIn("cpu=", n["reason"])
-
-    def test_r8_a1_the_gpu_sampler_finds_nvidia_smi_in_two_local_paths_and_never_walks_path(self) -> None:
-        self.assertEqual(self.r["nvOnlyOnPath"], "", "an nvidia-smi on PATH only is not found: PATH is never walked")
-        self.assertIs(self.r["nvNvsmi"], True, "the NVSMI folder is the second candidate")
-        self.assertIs(self.r["nvSystem32First"], True, "System32 wins")
-        self.assertEqual(self.r["nvUnc"], "", "a UNC root is skipped, not probed")
-        self.assertIs(self.r["nvUncFast"], True)
-        self.assertEqual(self.r["nvBlank"], "", "a blank root is skipped")
-        self.assertEqual(self.r["nvProviderUnc"], "", "a provider-qualified UNC root does not start with a backslash and is still skipped")
-        self.assertEqual(self.r["nvProviderQualifiedLocal"], "", "a provider-qualified root is refused even when it names a local folder that holds the file")
-        self.assertNotEqual(self.r["nvMissingLetter"], "", "the fixture needs one drive letter this host does not have")
-        self.assertEqual(self.r["nvNotFixedDrive"], "", "only a root on a local fixed drive is probed (a mapped share or an absent drive is not)")
-
-    def test_r9_g3_a_reparse_point_under_a_fixed_drive_root_is_refused(self) -> None:
-        self.assertIs(self.r["nvJunctionBuilt"], True, "the fixture needs three junctions that really reach a nvidia-smi.exe")
-        self.assertEqual(self.r["nvJunctionMidSegment"], "", "a junction on the way to System32 is refused")
-        self.assertEqual(self.r["nvJunctionMidSegmentPf"], "", "a junction on the way to the NVSMI folder is refused")
-        self.assertEqual(self.r["nvJunctionLastSegment"], "", "a junction as the last segment of the root is refused")
-        self.assertIs(self.r["nvJunctionFallsThrough"], True, "a refused root falls through to the next candidate, as a missing file does")
-        fn = re.search(r"(?ms)^function Resolve-ClocksPowerNvidiaSmi\b.*?^}", self.text)
+    def test_r10_start_util_sample_gpu_is_masters_bytes(self) -> None:
+        import hashlib
+        fn = re.search(r"(?ms)^function Start-UtilSampleGpu\b.*?^}", self.text)
         self.assertIsNotNone(fn)
-        self.assertIn("ReparsePoint", fn.group(0))
+        self.assertEqual(hashlib.sha256(fn.group(0).encode("utf-8")).hexdigest(), START_UTIL_SAMPLE_GPU_MASTER_SHA256,
+                         "the util sampler's Start-UtilSampleGpu must be byte-identical to master (4e306d0d0)")
 
-    def test_r8_a1_the_clocks_call_site_uses_the_local_resolver_and_the_job_carries_it(self) -> None:
-        sites = [ln for ln in self.text.splitlines() if "Start-ClocksPowerGpu $clocksPowerBackend" in ln]
-        self.assertEqual(len(sites), 1)
-        self.assertIn("(Resolve-ClocksPowerNvidiaSmi)", sites[0])
-        self.assertNotIn("Resolve-UtilSampleNvidiaSmi", sites[0], "the util sampler's resolver walks PATH")
-        self.assertEqual(self.text.count("${function:Resolve-ClocksPowerNvidiaSmi}"), 1, "the job carries the helper")
-        fn = re.search(r"(?ms)^function Resolve-ClocksPowerNvidiaSmi\b.*?^}", self.text)
-        self.assertIsNotNone(fn)
-        self.assertNotIn("env:PATH", fn.group(0))
-        self.assertIn("[IO.DriveType]::Fixed", fn.group(0), "a mapped share (Network) and an absent drive are not local fixed disks")
-        self.assertIn("DriveInfo", fn.group(0))
+    def test_r10_one_pre_launch_deadline_cuts_a_stalled_probe(self) -> None:
+        self.assertGreater(self.r["leftFresh"], 15000)
+        self.assertEqual(self.r["leftPast"], 0)
+        s = self.r["stalled"]
+        self.assertEqual((s["lines"], s["why"], s["past"]), (0, "energy-meter-enumeration-timeout", False), "a 30 s probe is cut at what is left of the deadline")
+        self.assertLess(self.r["stalledMs"], 8000)
+        p = self.r["past"]
+        self.assertEqual((p["lines"], p["why"], p["past"]), (0, "pre-launch-deadline", True), "past the deadline nothing is started")
+        self.assertLess(self.r["pastMs"], 1500, "no process is started once the deadline has passed")
 
-    def test_r8_the_block_function_never_reads_the_gpu_status(self) -> None:
-        block = re.search(r"(?ms)^function Get-ClocksPowerBlock\b.*?^}", self.text)
-        self.assertIsNotNone(block)
-        body = block.group(0)
-        self.assertNotIn("$Gpu.status", body, "the GPU summary's status is copied into the block as a disclosure and read nowhere")
-        self.assertNotIn("gpuUsable", body)
+    def test_r10_the_cpu_half_is_skipped_past_the_deadline_and_the_job_reads_one_stopwatch(self) -> None:
+        self.assertIn("'skipped: pre-launch deadline'", self.text)
+        job = re.search(r"(?ms)\$cwStart = \$cwOpen.*?'@ \+ \"`n\" \+ \$cwClose", self.text)
+        self.assertIsNotNone(job)
+        self.assertEqual(len(re.findall(r"\[Diagnostics\.Stopwatch\]::StartNew\(\)", job.group(0))), 1, "ONE deadline stopwatch at the entry of the clocks-power start")
+        self.assertLess(job.group(0).index("[Diagnostics.Stopwatch]::StartNew()"), job.group(0).index("Get-ClocksPowerPlatform"), "taken before the first pre-launch read")
+
+    def test_r10_the_system_directory_comes_from_the_os_not_from_an_environment_variable(self) -> None:
+        self.assertEqual(self.r["typeperfUncEnv"], self.r["typeperfExpected"], "an inherited SystemRoot on a share is not consulted")
+        self.assertLess(self.r["typeperfUncEnvMs"], 2000)
+        for fname in ("Resolve-ClocksPowerTypeperf", "Get-ClocksPowerPlatform"):
+            fn = re.search(r"(?ms)^function " + fname + r"\b.*?^}", self.text)
+            self.assertIsNotNone(fn, fname)
+            self.assertNotIn("env:SystemRoot", fn.group(0), fname)
+            self.assertIn("[Environment]::SystemDirectory", fn.group(0), fname)
 
 
 @requires_windows_pwsh
