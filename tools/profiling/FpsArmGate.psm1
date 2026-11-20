@@ -30,7 +30,8 @@ $script:FpsArmKnownBenignEnv = [System.Collections.Generic.HashSet[string]]::new
     'MLVAPP_RAW_UINT16_PREFETCH_DECODERS', 'MLVAPP_DISABLE_RAW_UINT16_PREFETCH', 'MLVAPP_DISABLE_PLAY_START_PREROLL', 'MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH',
     'MLVAPP_DISABLE_AVX2_INTRIN_DIRECT8', 'MLVAPP_ENABLE_AVX2_INTRIN_DIRECT8', 'MLVAPP_DISABLE_SH_CURVE_INDEX_MASK', 'MLVAPP_ENABLE_SH_CURVE_INDEX_MASK', 'MLVAPP_ENABLE_DUAL_ISO_FAST_X4_IN_HQ',
     'MLVAPP_GPU_PLAYBACK_RECON', 'MLVAPP_GPU_PLAYBACK_RECON_BACKEND', 'MLVAPP_GPU_PLAYBACK_RECON_DLL', 'MLVAPP_GPU_PLAYBACK_RECON_RETAIN_DEVICE_OUTPUT',
-    'MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT', 'MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT_SAMPLE_EVERY',
+    # MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT is NOT here (adversary pass 4 A2): it is a per-frame observer (see the observer list). Its SAMPLE_EVERY is inert without it and stays benign.
+    'MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT_SAMPLE_EVERY',
     'MLVAPP_GPU_TEX_NR_ACQUIRE_LATEST_READY', 'MLVAPP_GPU_TEX_NR_IMMEDIATE_DRAIN_MAX', 'MLVAPP_GPU_TEX_NR_IMMEDIATE_DRAIN_READY',
     'MLVAPP_EXPERIMENTAL_GPU_AMAZE_TEXTURE_PRESENT', 'MLVAPP_EXPERIMENTAL_GPU_PLAYBACK_RECON_TEXTURE_PRESENT',
     'MLVAPP_CUDA_AMAZE_LIVE_DIRECT_RGBA_STORE', 'MLVAPP_CUDA_AMAZE_LIVE_FAST_LAUNCH_CHECKS', 'MLVAPP_CUDA_AMAZE_LIVE_TILE_STREAMS',
@@ -64,6 +65,9 @@ $script:FpsObserverControls = @(
     New-FpsObserver 'interactive-trace' -EnvVar 'MLVAPP_INTERACTIVE_TRACE' -Severity 'HEAVY'
     New-FpsObserver 'overlap-trace' -EnvVar 'MLVAPP_GPU_TEX_NR_OVERLAP_TRACE' -Severity 'HEAVY'
     New-FpsObserver 'viewport-present-diag' -EnvVar 'MLVAPP_VIEWPORT_PRESENT_DIAG' -Severity 'HEAVY'
+    # the GL-vs-CPU-oracle parity check: a GL texture readback, SHA256 hashing and a full CPU recon replay per presented frame (MainWindow.cpp:404-409 and :421-428 name it "very heavy ...
+    # collapses an AMaZE playback run to a few fps"; RenderFrameThread.cpp:696-702 reads it the same way: set and not "0"), so it is a flag
+    New-FpsObserver 'recon-output-validation' -EnvVar 'MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT' -Severity 'HEAVY'
     New-FpsObserver 'phase3-stage-csv' -EnvVar 'MLVAPP_PHASE3_TEL_PATH' -Kind 'value' -Severity 'HEAVY'
     New-FpsObserver 'stage-timing-file' -EnvVar 'MLVAPP_STAGE_TIMING_FILE' -Kind 'value'
     New-FpsObserver 'perf-field-log-path' -EnvVar 'MLVAPP_PERF_FIELD_LOG_PATH' -Kind 'value'
@@ -80,11 +84,22 @@ $script:FpsObserverEnvNames = [System.Collections.Generic.HashSet[string]]::new(
 
 function Get-FpsObserverControls { $script:FpsObserverControls }
 
+function Test-FaHasProp {
+    # Is the key PRESENT (a null value counts as present)? The venue leg forwards a key by `.PSObject.Properties['key']`, i.e. by presence, so absent and null are different inputs.
+    param([AllowNull()]$Object, [Parameter(Mandatory)][string]$Name)
+    if ($null -eq $Object) { return $false }
+    if ($Object -is [System.Collections.IDictionary]) { return [bool]$Object.Contains($Name) }
+    $null -ne $Object.PSObject.Properties[$Name]
+}
+
 function Test-FpsSpecObserverOn {
-    # Is this control's generatorArgs-style value ON? $null (absent or JSON null) is off. 'threshold': only a negative number is off. 'bool': only exactly $false is off.
-    param([Parameter(Mandatory)]$Control, [AllowNull()]$Value)
-    if ($null -eq $Value) { return $false }
+    # Is this control ON, by the way the venue leg forwards it? Absent is off. 'threshold' (cudaLaunchTimingMinMs, Invoke-VenueLeg.ps1:538 `[double]` cast, the job's `-ge 0`): a PRESENT key
+    # is on whatever it holds, a null (cast to 0) included, unless it is a negative number. 'bool': a null value is the forwarder's $false (`[bool]$null`, `-is [bool]`); only a
+    # present value other than exactly $false or null is on.
+    param([Parameter(Mandatory)]$Control, [bool]$Present, [AllowNull()]$Value)
+    if (-not $Present) { return $false }
     if ($Control.specKind -ceq 'threshold') { return -not (($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) -and $Value -lt 0) }
+    if ($null -eq $Value) { return $false }
     -not ($Value -is [bool] -and -not $Value)
 }
 
@@ -94,9 +109,31 @@ function Get-FpsSpecObserverOn {
     if ($null -eq $Container -or $Container -is [string] -or $Container -is [System.ValueType]) { return $null }
     foreach ($c in $script:FpsObserverControls) {
         if (-not $c.specKey) { continue }
-        if (Test-FpsSpecObserverOn $c (Get-FaProp $Container $c.specKey)) { return $c }
+        if (Test-FpsSpecObserverOn $c (Test-FaHasProp $Container $c.specKey) (Get-FaProp $Container $c.specKey)) { return $c }
     }
     $null
+}
+
+function Get-FpsArmFromLegRecord {
+    <#
+    .SYNOPSIS
+    The arm of one leg from a RECORD the gain/cost readers hold (a saved A/B summary leg, a machine-perf record leg): its `telemetryArm` (an arm word, or the arm object a smoke summary
+    carries) judged together with the observer controls the record carries (adversary pass 4 A3: a reader that projected only the arm word let a record with utilSample set pass as LIGHT).
+    A non-LIGHT arm is returned as it is; a LIGHT one that records an enabled observer, directly or under its generatorArgs, is UNKNOWN. No record is UNKNOWN.
+    #>
+    param([AllowNull()]$Leg)
+    if ($null -eq $Leg -or $Leg -is [string] -or $Leg -is [System.ValueType]) { return New-FpsArm 'UNKNOWN' 'record' 'no-leg-record' }
+    $field = Get-FaProp $Leg 'telemetryArm'
+    $name = ConvertTo-FpsArmName $field
+    if ($name -cne 'LIGHT') {
+        if ($null -ne $field -and $field -isnot [string] -and $null -ne (Get-FaProp $field 'arm')) { return $field }
+        return New-FpsArm $name 'record' $(if ($name -ceq 'UNKNOWN') { 'record-carries-no-usable-telemetryArm' } else { 'telemetryArm=' + $name })
+    }
+    $observer = Get-FpsSpecObserverOn $Leg
+    if ($null -eq $observer) { $observer = Get-FpsSpecObserverOn (Get-FaProp $Leg 'generatorArgs') }
+    if ($null -ne $observer) { return New-FpsArm 'UNKNOWN' 'record' "telemetryArm=LIGHT but the record carries $($observer.specKey) enabled ($($observer.id))" }
+    if ($field -isnot [string]) { return $field }
+    New-FpsArm 'LIGHT' 'record' 'telemetryArm=LIGHT'
 }
 
 $script:FpsArmHeavyReason = 'fps-verdict-refused:heavy-arm'
@@ -393,4 +430,4 @@ function Get-FpsLegPlanRefusal {
     @('', 0, '')
 }
 
-Export-ModuleMember -Function Get-FpsObserverControls, Get-FaProp, New-FpsArm, ConvertTo-FpsArmName, Get-FpsArmFromLegSpec, Get-FpsArmFromJobResult, Get-FpsArm, Test-FpsEnvFlagOn, ConvertTo-FpsEnvMap, Get-FpsArmFromEnvironment, Get-FpsArmFromLaunch, Get-FpsPairVerdict, Get-FpsArmsVerdict, Get-FpsLegPlanRefusal
+Export-ModuleMember -Function Get-FpsObserverControls, Get-FpsArmFromLegRecord, Get-FaProp, New-FpsArm, ConvertTo-FpsArmName, Get-FpsArmFromLegSpec, Get-FpsArmFromJobResult, Get-FpsArm, Test-FpsEnvFlagOn, ConvertTo-FpsEnvMap, Get-FpsArmFromEnvironment, Get-FpsArmFromLaunch, Get-FpsPairVerdict, Get-FpsArmsVerdict, Get-FpsLegPlanRefusal

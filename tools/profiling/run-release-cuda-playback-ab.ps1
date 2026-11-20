@@ -347,11 +347,12 @@ function Get-PlaybackAbFpsVerdict {
         [switch]$SeparateCandidateSpeedRun
     )
 
-    $baselineArm = Get-FaProp $BaselineSummary "telemetryArm"
-    $candidate = Get-FpsPairVerdict -Baseline $baselineArm -Candidate (Get-FaProp $CandidateSummary "telemetryArm") -BaselineName "baseline" -CandidateName "candidate"
+    # the whole leg record is judged, not its arm word alone: a LIGHT leg that records an enabled observer control is UNKNOWN (Get-FpsArmFromLegRecord, adversary pass 4 A3)
+    $baselineArm = Get-FpsArmFromLegRecord $BaselineSummary
+    $candidate = Get-FpsPairVerdict -Baseline $baselineArm -Candidate (Get-FpsArmFromLegRecord $CandidateSummary) -BaselineName "baseline" -CandidateName "candidate"
     $candidateSpeed = $null
     if ($SeparateCandidateSpeedRun) {
-        $candidateSpeed = Get-FpsPairVerdict -Baseline $baselineArm -Candidate (Get-FaProp $CandidateSpeedSummary "telemetryArm") -BaselineName "baseline" -CandidateName "candidate-speed"
+        $candidateSpeed = Get-FpsPairVerdict -Baseline $baselineArm -Candidate (Get-FpsArmFromLegRecord $CandidateSpeedSummary) -BaselineName "baseline" -CandidateName "candidate-speed"
     }
     $refused = @(@($candidate, $candidateSpeed) | Where-Object { $null -ne $_ -and -not $_.allowed })
     [pscustomobject]@{

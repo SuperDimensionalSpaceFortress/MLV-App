@@ -697,8 +697,8 @@ else {
     # pair, or a leg that records no arm (UNKNOWN: a packet written before this gate) is refused: no fps-delta diagnostic and no presented / GUI fps delta line below; the
     # stage lines (intervals, render totals) stay.
     $playbackAbFpsArmVerdict = Get-FpsPairVerdict `
-        -Baseline (Get-FaProp $playbackAb.baseline "telemetryArm") `
-        -Candidate (Get-FaProp $playbackAbCandidateLeg "telemetryArm") `
+        -Baseline (Get-FpsArmFromLegRecord $playbackAb.baseline) `
+        -Candidate (Get-FpsArmFromLegRecord $playbackAbCandidateLeg) `
         -BaselineName "baseline" `
         -CandidateName $playbackAbComparisonBasis
     $playbackAbFpsArmRefusal = [pscustomobject]@{

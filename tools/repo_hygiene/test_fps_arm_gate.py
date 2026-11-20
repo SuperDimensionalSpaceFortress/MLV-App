@@ -472,6 +472,19 @@ class CudaPlaybackAbFpsGateTests(_Probe):
         self.assertEqual(r["verdict"]["reason"], UNKNOWN_REASON)
         self.assertIsNone(r["compare"]["presentedFps"]["deltaPercent"])
 
+    def test_a_light_leg_that_records_an_enabled_observer_is_refused(self) -> None:
+        # r2 pass 4 A3: the reader projected only telemetryArm, so a LIGHT leg whose record also carries utilSample (or any observer key) still compared on fps
+        with_observer = "[pscustomobject]@{ telemetryArm = 'LIGHT'; utilSample = $true; presentedFps = 55.0; avgQueueWaitMs = 5.0; avgDrawTotalMs = 12.0 }"
+        r = self.run_ab(self.leg("LIGHT", 50.0, 5.0), with_observer)
+        self.assertFalse(r["verdict"]["allowed"])
+        self.assertEqual(r["verdict"]["reason"], UNKNOWN_REASON)
+        self.assertIsNone(r["compare"]["presentedFps"]["deltaPercent"])
+        out = self.ok(f"$b = {self.leg('LIGHT', 50.0, 5.0)}\n$c = {self.leg('LIGHT', 51.0, 5.0)}\n$s = {with_observer}\n"
+                      "(Get-PlaybackAbFpsVerdict -BaselineSummary $b -CandidateSummary $c -CandidateSpeedSummary $s -SeparateCandidateSpeedRun) | ConvertTo-Json -Depth 6 -Compress")
+        v = json.loads(out.strip().splitlines()[-1])
+        self.assertTrue(v["candidate"]["allowed"])
+        self.assertFalse(v["candidateSpeed"]["allowed"], "the separate speed run is judged on its whole record too")
+
     def test_the_separate_speed_run_is_judged_on_its_own_pair(self) -> None:
         out = self.ok(f"$b = {self.leg('LIGHT', 50.0, 5.0)}\n$c = {self.leg('LIGHT', 51.0, 5.0)}\n$s = {self.leg('HEAVY', 44.0, 5.0)}\n"
                       "$v = Get-PlaybackAbFpsVerdict -BaselineSummary $b -CandidateSummary $c -CandidateSpeedSummary $s -SeparateCandidateSpeedRun\n"
@@ -597,6 +610,19 @@ class CompareMachinePerfFpsGateTests(_Probe):
         self.assertIsNone(r["playback_fps_delta_pct"])
         self.assertEqual(r["playback_fps_arm_verdict"], UNKNOWN_REASON)
 
+    def test_a_light_record_that_carries_an_enabled_observer_is_refused(self) -> None:
+        # r2 pass 4 A3: the adversary's record (candidate carries utilSample = true) published deltaPercent 100 and the cached optimization
+        def with_extra(extra: str) -> str:
+            return self.record("LIGHT", "LIGHT").replace("candidate = [pscustomobject]@{ telemetryArm = 'LIGHT'; ", f"candidate = [pscustomobject]@{{ telemetryArm = 'LIGHT'; {extra}")
+        for extra in ("utilSample = $true; ", "cudaLaunchTimingMinMs = 0; ", "corePartitionTelemetry = $true; ", "generatorArgs = [pscustomobject]@{ firstPresentCapture = $true }; "):
+            with self.subTest(extra=extra):
+                r = self.row(with_extra(extra))
+                self.assertIsNone(r["playback_fps_delta_pct"])
+                self.assertEqual(r["playback_fps_arm_verdict"], UNKNOWN_REASON)
+                self.assertEqual(r["dominant_bottleneck"], "fps-arm-refused")
+        ok = self.row(with_extra("utilSample = $false; "))
+        self.assertEqual(ok["playback_fps_delta_pct"], 100.0)
+
     def test_a_record_that_names_no_arm_is_unknown_and_refused_even_if_it_carries_a_cached_allowed_verdict(self) -> None:
         for with_verdict in (False, True):
             with self.subTest(cached_verdict=with_verdict):
@@ -698,7 +724,7 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
         # the improvement diagnostic is behind the arm refusal
         self.assertRegex(source, r"-not \$playbackAbHostLoadProvisional -and\s+-not \$playbackAbFpsArmRefusal\.refused -and")
 
-    def run_summarizer_block(self, baseline_arm: str, candidate_arm: str, analysis: str = "$null") -> list[str]:
+    def run_summarizer_block(self, baseline_arm: str, candidate_arm: str, analysis: str = "$null", candidate_extra: str = "") -> list[str]:
         tmp = Path(tempfile.mkdtemp(prefix="fps-arm-summ-"))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         source = SUMMARIZER_SCRIPT.read_text(encoding="utf-8")
@@ -713,7 +739,7 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
             "$ErrorActionPreference = 'Stop'\n" f"Import-Module '{MODULE}' -Force\n" + funcs +
             "\n$playbackAbComparisonBasis = 'candidate'\n"
             f"$playbackAb = [pscustomobject]@{{ analysis = {analysis}; baseline = [pscustomobject]@{{ telemetryArm = '{baseline_arm}'; hostLoadProvisional = $false; hostLoadState = 'quiet' }}; "
-            f"candidate = [pscustomobject]@{{ telemetryArm = '{candidate_arm}'; hostLoadProvisional = $false; hostLoadState = 'quiet' }} }}\n"
+            f"candidate = [pscustomobject]@{{ telemetryArm = '{candidate_arm}'; {candidate_extra}hostLoadProvisional = $false; hostLoadState = 'quiet' }} }}\n"
             "$playbackAbSpeedCompare = [pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 50; candidate = 49; delta = -1; deltaPercent = -2 }; "
             "guiStatusFps = [pscustomobject]@{ baseline = 50; candidate = 49; delta = -1; deltaPercent = -2 }; "
             "avgPresentIntervalMs = [pscustomobject]@{ baseline = 20; candidate = 21; delta = 1; deltaPercent = 5 }; "
@@ -754,6 +780,16 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
         body = _extract_functions(DNG_SMOKE_SCRIPT, ["Get-PlaybackAbProofSummary"])
         self.assertIn("fpsVerdict = $Summary.fpsVerdict", body)
         self.assertIn("Get-PlaybackAbProofSummary", source)
+
+    def test_a_light_leg_that_records_an_enabled_observer_is_refused_here_too(self) -> None:
+        # r2 pass 4 A3: the summarizer projected only the arm word, so a candidate record with utilSample set passed as LIGHT
+        text = "\n".join(self.run_summarizer_block("LIGHT", "LIGHT", candidate_extra="utilSample = $true; "))
+        self.assertIn("DIAG=PLAYBACK_AB_FPS_ARM_REFUSED", text)
+        self.assertIn(UNKNOWN_REASON, text)
+        self.assertNotIn("PLAYBACK_PRESENTED_FPS_NOT_IMPROVED", text)
+        self.assertNotIn("presented FPS: CPU", text)
+        off = "\n".join(self.run_summarizer_block("LIGHT", "LIGHT", candidate_extra="utilSample = $false; "))
+        self.assertNotIn("PLAYBACK_AB_FPS_ARM_REFUSED", off)
 
     def test_a_refused_pair_labels_the_section_refused_not_pass(self) -> None:
         # r2 advisory A4 (summarize-local-cuda-proof.ps1:761): the section verdict read PASS although its fps comparison was refused
@@ -838,6 +874,60 @@ class ObserverControlTests(_Probe):
             f"Get-FpsArmFromLegSpec ({_spec(presentTrace='$true')})": "LIGHT",             # in-memory trace, written after the Play (PlaybackPresentTrace.h)
             f"Get-FpsArmFromLegSpec ({_spec(corePartitionTelemetry=chr(39) + 'false' + chr(39))})": "UNKNOWN",   # the forwarder's [bool]'false' is $true
         })
+
+    def test_a_present_but_null_threshold_is_on_because_the_forwarder_casts_null_to_zero(self) -> None:
+        # r2 pass 4 A1: Invoke-VenueLeg.ps1:538 forwards by PRESENCE and casts [double]$null to 0, and the job's `-ge 0` then starts the per-launch logger
+        adversary = ('{"schema":"mlv-app/dual-venue-leg/v1","card":"TEST","legId":"fx","legType":"speed","clipId":"C1","backends":["cpu","cuda"],"scaleFactor":1,'
+                     '"generatorArgs":{"telemetryArm":"LIGHT","cudaLaunchTimingMinMs":null}}')
+        self.check({
+            f"Get-FpsArmFromLegSpec (ConvertFrom-Json '{adversary}')": "UNKNOWN",
+            f"Get-FpsArmFromLegSpec ({_spec(cudaLaunchTimingMinMs='$null')})": "UNKNOWN",
+            f"Get-FpsArmFromLegSpec ({_spec(cudaLaunchTimingMinMs='$false')})": "UNKNOWN",   # [double]$false is 0
+            f"Get-FpsArmFromLegSpec ({_spec(corePartitionTelemetry='$null')})": "LIGHT",      # a bool key's [bool]$null is false: absent and null agree
+            f"Get-FpsArmFromLegSpec ({_spec(utilSample='$null')})": "LIGHT",
+            "Get-FpsArmFromJobResult (ConvertFrom-Json '{\"telemetryArm\":\"LIGHT\",\"cudaLaunchTimingMinMs\":null}')": "UNKNOWN",
+        })
+
+    def test_the_recon_output_validation_flag_is_a_per_frame_observer(self) -> None:
+        # r2 pass 4 A2: MainWindow.cpp:404-409 / RenderFrameThread.cpp:696-702 (set and not "0") run a GL readback, SHA256 and a CPU recon replay per presented frame
+        def env(*pairs: str) -> str:
+            return "Get-FpsArmFromEnvironment @(" + LIGHT_ENV + "," + ",".join(f"'{p}'" for p in pairs) + ")"
+        adversary = ("[pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1'; MLVAPP_GPU_PLAYBACK_RECON = '1'; "
+                     "MLVAPP_EXPERIMENTAL_GPU_PLAYBACK_RECON_TEXTURE_PRESENT = '1'; MLVAPP_EXPERIMENTAL_GPU_AMAZE_TEXTURE_PRESENT = '1'; "
+                     "MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT = '1'; MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT_SAMPLE_EVERY = '1' }")
+        self.check({
+            f"Get-FpsArmFromEnvironment ({adversary})": "HEAVY",
+            env("MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT=1"): "HEAVY",
+            env("MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT=true"): "HEAVY",
+            env("MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT=0"): "LIGHT",                 # the speed leg of run-release-cuda-playback-ab.ps1:1378
+            env("MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT=0", "MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT_SAMPLE_EVERY=4"): "LIGHT",   # inert without the flag
+            env("MLVAPP_GPU_PLAYBACK_RECON=1", "MLVAPP_EXPERIMENTAL_GPU_PLAYBACK_RECON_TEXTURE_PRESENT=1", "MLVAPP_EXPERIMENTAL_GPU_AMAZE_TEXTURE_PRESENT=1"): "LIGHT",   # a route, not an observer
+            env("MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG=1"): "LIGHT",                # deduped to one line per session (playback-attr-3-cuda-job.ps1:268-277)
+        })
+
+    def test_the_record_helper_judges_the_whole_leg_not_its_arm_word(self) -> None:
+        self.check({
+            "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = 'LIGHT' })": "LIGHT",
+            "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = 'LIGHT'; utilSample = $true })": "UNKNOWN",
+            "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = 'LIGHT'; generatorArgs = [pscustomobject]@{ cudaLaunchTimingMinMs = 0 } })": "UNKNOWN",
+            "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = 'HEAVY'; utilSample = $true })": "HEAVY",
+            "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = (New-FpsArm 'LIGHT' 'environment' 'x') })": "LIGHT",
+            "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = (New-FpsArm 'LIGHT' 'environment' 'x'); firstPresentCapture = $true })": "UNKNOWN",
+            "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = (New-FpsArm 'HEAVY' 'environment' 'x') })": "HEAVY",
+            "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = @('LIGHT') })": "UNKNOWN",
+            "Get-FpsArmFromLegRecord ([pscustomobject]@{ sourceCommit = 'x' })": "UNKNOWN",
+            "Get-FpsArmFromLegRecord $null": "UNKNOWN",
+        })
+
+    def test_no_reader_projects_the_arm_word_out_of_a_leg_record(self) -> None:
+        # The class guard for A3: a gain/cost reader hands Get-FpsPairVerdict the arm of the WHOLE leg record (Get-FpsArmFromLegRecord), never `Get-FaProp <leg> "telemetryArm"`,
+        # which drops the observer fields the record carries.
+        offenders = []
+        for script in sorted(PROFILING.glob("*.ps1")):
+            for number, line in enumerate(script.read_text(encoding="utf-8").splitlines(), start=1):
+                if re.search(r"Get-FaProp\s+[^\r\n]*[\"']telemetryArm[\"']", line) and not line.lstrip().startswith("#"):
+                    offenders.append(f"{script.name}:{number}")
+        self.assertEqual(offenders, [], "use Get-FpsArmFromLegRecord <leg> so the leg's observer fields are judged with its arm")
 
     def test_the_adversary_input_for_a2_gets_no_fps_ab_approval_with_or_without_a_result(self) -> None:
         spec = _spec(cudaLaunchTimingMinMs="0")

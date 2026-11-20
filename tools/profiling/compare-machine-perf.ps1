@@ -495,8 +495,8 @@ function Get-PlaybackAbFpsArmRefusal {
     # absent candidateSpeed there is UNKNOWN (a null leg), never a fall-back to the ordinary candidate (adversary A6).
     $candidateLeg = if ($Record.speedCompare) { $Record.candidateSpeed } else { $Record.candidate }
     $verdict = Get-FpsPairVerdict `
-        -Baseline (Get-FaProp $Record.baseline "telemetryArm") `
-        -Candidate (Get-FaProp $candidateLeg "telemetryArm")
+        -Baseline (Get-FpsArmFromLegRecord $Record.baseline) `
+        -Candidate (Get-FpsArmFromLegRecord $candidateLeg)
     [pscustomobject]@{
         refused = (-not $verdict.allowed)
         reason = [string]$verdict.reason
