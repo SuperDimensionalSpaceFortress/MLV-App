@@ -631,10 +631,14 @@ def test_editing_settings_json_also_wires_lane_no_background_hook(fixture_tree):
     assert hook_entry["command"]==q["authority"]["backgroundGateInterpreterPath"]
 
 
-# LANE-AUTO-MEMORY-OFF-1 r2: a headless lane never uses Claude Code auto memory. The key goes in
+# LANE-AUTO-MEMORY-OFF-1 r2: a headless lane should not use Claude Code auto memory. The key goes in
 # the per-lane settings file (settings key ONLY -- no environment variable, NA-3). Measured r1:
 # the key is honored through --settings. Every Claude-engine lane writes it, whatever its
 # read/edit/bulk-read posture, and the hook and deny rules beside it stay intact.
+# LIMIT (r5): these tests pin what the launcher WRITES, not the effective memory state. The generated
+# settings turn auto memory off unless the launching environment already carries the inherited
+# auto-memory override variable with a value that forces it on. This launcher does not clear that
+# variable (NA-3) and no current launcher sets it, so the guarantee covers the default case only.
 def test_claude_lane_settings_json_turns_auto_memory_off(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal")
     r=run_lane(cmd,env)
