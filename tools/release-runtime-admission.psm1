@@ -563,8 +563,11 @@ function Invoke-PinnedPayloadInstall {
 # The one open used by both publication checks below is therefore CreateFileW with FILE_FLAG_OPEN_REPARSE_POINT (never
 # follows a final reparse point), GENERIC_READ and share mode FILE_SHARE_READ only (no FILE_SHARE_DELETE, no FILE_SHARE_WRITE:
 # while held the entry cannot be renamed, unlinked or rewritten). The reparse test reads the attributes of THAT handle
-# (GetFileInformationByHandle), never of the path, so a swap between the open and the check cannot pass. Any failure is a
-# typed code (add-type-failed, open-failed, info-failed, reparse-point, not-a-disk-file, stream-failed) and never a fallback.
+# (GetFileInformationByHandle), never of the path, so a swap between the open and the check cannot pass. An ANCESTOR reparse
+# point (adversary 2c649ed9-A1: a junction retargeted after the hold) is refused by comparing the handle's own resolved path
+# (GetFinalPathNameByHandleW) with the requested pathname (8.3 expanded); a plain ancestor of a held file cannot be renamed or
+# made a reparse point while the hold is open. Any failure is a typed code (add-type-failed, open-failed, info-failed,
+# reparse-point, reparse-ancestor, not-a-disk-file, stream-failed) and never a fallback.
 $script:PinnedNoFollowTypeName = 'MlvReleaseAdmission.PinnedNoFollowOpen'
 $script:PinnedNoFollowSource = @'
 using System;
@@ -614,8 +617,47 @@ namespace MlvReleaseAdmission {
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern uint GetFileType(SafeFileHandle hFile);
 
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetFinalPathNameByHandleW(SafeFileHandle hFile, System.Text.StringBuilder lpszFilePath, uint cchFilePath, uint dwFlags);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetLongPathNameW(string lpszShortPath, System.Text.StringBuilder lpszLongPath, uint cchBuffer);
+
         private static string Win32Text(int error) {
             return new Win32Exception(error).Message + " (win32 " + error + ")";
+        }
+
+        // \\?\UNC\server\share\x -> \\server\share\x ; \\?\C:\x -> C:\x
+        private static string WithoutLongPrefix(string path) {
+            if (path.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)) { return @"\\" + path.Substring(8); }
+            if (path.StartsWith(@"\\?\", StringComparison.Ordinal)) { return path.Substring(4); }
+            return path;
+        }
+
+        // FILE_NAME_NORMALIZED | VOLUME_NAME_DOS = 0: the path of the file the HANDLE is open on, every reparse point resolved.
+        private static string HandlePath(SafeFileHandle handle, out int error) {
+            error = 0;
+            System.Text.StringBuilder buffer = new System.Text.StringBuilder(1024);
+            uint length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Capacity, 0);
+            if (length >= (uint)buffer.Capacity) {
+                buffer = new System.Text.StringBuilder((int)length + 1);
+                length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Capacity, 0);
+            }
+            if (length == 0 || length >= (uint)buffer.Capacity) { error = Marshal.GetLastWin32Error(); return null; }
+            return WithoutLongPrefix(buffer.ToString());
+        }
+
+        // The requested pathname with every 8.3 component expanded; GetLongPathNameW never resolves a reparse point.
+        private static string LongPath(string path, out int error) {
+            error = 0;
+            System.Text.StringBuilder buffer = new System.Text.StringBuilder(1024);
+            uint length = GetLongPathNameW(path, buffer, (uint)buffer.Capacity);
+            if (length >= (uint)buffer.Capacity) {
+                buffer = new System.Text.StringBuilder((int)length + 1);
+                length = GetLongPathNameW(path, buffer, (uint)buffer.Capacity);
+            }
+            if (length == 0 || length >= (uint)buffer.Capacity) { error = Marshal.GetLastWin32Error(); return null; }
+            return WithoutLongPrefix(buffer.ToString());
         }
 
         public static PinnedOpenResult Open(string path) {
@@ -644,6 +686,29 @@ namespace MlvReleaseAdmission {
                 if ((info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 || GetFileType(handle) != FILE_TYPE_DISK) {
                     result.Code = "not-a-disk-file";
                     result.Detail = "the pathname is not a regular file on disk";
+                    return result;
+                }
+                // Adversary 2c649ed9-A1: FILE_FLAG_OPEN_REPARSE_POINT covers only the FINAL component; an ancestor junction or
+                // directory link is still traversed, and that link (unlike a plain ancestor of a held file, which NTFS will not
+                // rename) can be retargeted while the file is held. The handle's own resolved path must therefore BE the requested
+                // pathname (8.3 components expanded): any reparse traversal, subst or mapped drive differs and is refused.
+                int pathError;
+                string held = HandlePath(handle, out pathError);
+                if (held == null) {
+                    result.Code = "info-failed";
+                    result.Detail = "the held file's path could not be read: " + Win32Text(pathError);
+                    return result;
+                }
+                string requested = LongPath(WithoutLongPrefix(Path.GetFullPath(path)), out pathError);
+                if (requested == null) {
+                    result.Code = "info-failed";
+                    result.Detail = "the requested pathname could not be expanded: " + Win32Text(pathError);
+                    return result;
+                }
+                if (!string.Equals(held, requested, StringComparison.OrdinalIgnoreCase)) {
+                    result.Code = "reparse-ancestor";
+                    result.Detail = "the held file is " + held + ", not the requested pathname " + requested
+                        + " (a directory on the way is a junction, link, mount point or substituted drive)";
                     return result;
                 }
                 try {

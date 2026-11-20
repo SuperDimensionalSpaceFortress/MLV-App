@@ -360,6 +360,10 @@ class ScriptsInstallUnconditionallyTests(unittest.TestCase):
         self.assertIn("if (!GetFileInformationByHandle(handle, out info)) {", text)
         self.assertIn("if ((info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {", text)
         self.assertIn('result.Code = "reparse-point";', text)
+        # adversary 2c649ed9-A1: an ancestor reparse point is refused by the handle's own resolved path, never a path-based walk.
+        self.assertIn("uint length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Capacity, 0);", text)
+        self.assertIn("if (!string.Equals(held, requested, StringComparison.OrdinalIgnoreCase)) {", text)
+        self.assertIn('result.Code = "reparse-ancestor";', text)
         self.assertNotRegex(text, r"\[System\.IO\.File\]::Open\(", "no publication check may fall back to a link-following open")
         for name in ("Open-PinnedFileHold", "Test-PinnedZipMember"):
             body = text[text.index(f"function {name} {{"):]
@@ -1152,11 +1156,51 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         self.assertTrue(result["zipReason"].startswith("reparse-point: "), result)
         self.assertTrue(result["real"], "the regular file the link pointed at still holds (control)")
 
+    def test_a_junction_on_the_way_to_the_pinned_bytes_is_never_held(self) -> None:
+        # adversary 2c649ed9-A1: FILE_FLAG_OPEN_REPARSE_POINT covers only the final component. published\<sha> was a junction to good\,
+        # the hold verified good\ffmpeg.exe, and the junction (not held) was then retargeted to bad\ holding MZwrong, so the manifest
+        # landed beside the wrong bytes. A hold or zip check whose path crosses a junction is refused (reason reparse-ancestor).
+        payload = b"MZ pinned ffmpeg bytes" * 100
+        good = self.tmp / "good"
+        good.mkdir()
+        (good / "ffmpeg.exe").write_bytes(payload)
+        self._zip("good/package.zip", {"MLVApp.exe": b"exe", "ffmpeg.exe": payload})
+        published = self.tmp / "published"
+        published.mkdir()
+        junction = published / "2c649ed9a139"
+        result = self._ps(
+            "$null = New-Item -ItemType Junction -Path $env:FFX_JUNCTION -Target $env:FFX_GOOD\n"
+            "$h = Open-PinnedFileHold -Path (Join-Path $env:FFX_JUNCTION 'ffmpeg.exe') -ExpectedSha256 $env:FFX_SHA -ExpectedBytes ([long]$env:FFX_LEN)\n"
+            "$junctionRemovable = $false\n"
+            "try { [System.IO.Directory]::Delete($env:FFX_JUNCTION); $junctionRemovable = $true } catch { }\n"
+            "if ($h.stream) { $h.stream.Dispose() }\n"
+            "if (-not $junctionRemovable) { [System.IO.Directory]::Delete($env:FFX_JUNCTION) }\n"
+            "$null = New-Item -ItemType Junction -Path $env:FFX_JUNCTION -Target $env:FFX_GOOD\n"
+            "$z = Test-PinnedZipMember -ZipPath (Join-Path $env:FFX_JUNCTION 'package.zip') -MemberName 'ffmpeg.exe' -ExpectedSha256 $env:FFX_SHA -ExpectedBytes ([long]$env:FFX_LEN)\n"
+            "[System.IO.Directory]::Delete($env:FFX_JUNCTION)\n"
+            "$real = Open-PinnedFileHold -Path (Join-Path $env:FFX_GOOD 'ffmpeg.exe') -ExpectedSha256 $env:FFX_SHA -ExpectedBytes ([long]$env:FFX_LEN)\n"
+            "if ($real.stream) { $real.stream.Dispose() }\n"
+            "$realZip = Test-PinnedZipMember -ZipPath (Join-Path $env:FFX_GOOD 'package.zip') -MemberName 'ffmpeg.exe' -ExpectedSha256 $env:FFX_SHA -ExpectedBytes ([long]$env:FFX_LEN)\n"
+            "[ordered]@{ ok = $h.ok; reason = $h.reason; streamNull = ($null -eq $h.stream); junctionRemovable = $junctionRemovable;"
+            " zip = $z.ok; zipReason = $z.reason; real = $real.ok; realReason = $real.reason; realZip = $realZip.ok } | ConvertTo-Json -Compress\n",
+            FFX_JUNCTION=str(junction), FFX_GOOD=str(good), FFX_SHA=hashlib.sha256(payload).hexdigest(), FFX_LEN=str(len(payload)))
+        self.assertFalse(result["ok"], result)
+        self.assertTrue(result["reason"].startswith("reparse-ancestor: "), result)
+        self.assertTrue(result["streamNull"], "a refused hold must not leak an open handle")
+        self.assertTrue(result["junctionRemovable"], "the junction itself is never held, which is why it is refused")
+        self.assertFalse(result["zip"], result)
+        self.assertTrue(result["zipReason"].startswith("reparse-ancestor: "), result)
+        self.assertTrue(result["real"], result)
+        self.assertTrue(result["realZip"], result)
+
     def test_while_held_the_entry_cannot_be_renamed_unlinked_or_overwritten(self) -> None:
         # sol r8 B1: the held handle must BE the pathname's file entry, and FILE_SHARE_READ alone keeps that entry in place: a rename,
         # an unlink and an overwrite of the held path all fail until the hold is released; the bytes are unchanged afterwards.
+        # adversary 2c649ed9-A1: a plain ANCESTOR of the held file cannot be renamed either, so no junction can take its place.
         payload = b"MZ pinned ffmpeg bytes" * 100
-        target = self.tmp / "ffmpeg.exe"
+        out = self.tmp / "out"
+        out.mkdir()
+        target = out / "ffmpeg.exe"
         target.write_bytes(payload)
         result = self._ps(
             "$h = Open-PinnedFileHold -Path $env:FFX_FILE -ExpectedSha256 $env:FFX_SHA -ExpectedBytes ([long]$env:FFX_LEN)\n"
@@ -1164,11 +1208,12 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
             "try { [System.IO.File]::Move($env:FFX_FILE, $env:FFX_FILE + '.moved'); $refused.rename = $false } catch { $refused.rename = $true }\n"
             "try { [System.IO.File]::Delete($env:FFX_FILE); $refused.unlink = $false } catch { $refused.unlink = $true }\n"
             "try { [System.IO.File]::WriteAllBytes($env:FFX_FILE, [byte[]][char[]]'MZwrong'); $refused.overwrite = $false } catch { $refused.overwrite = $true }\n"
+            "try { [System.IO.Directory]::Move($env:FFX_OUT, $env:FFX_OUT + '-moved'); $refused.parentRename = $false } catch { $refused.parentRename = $true }\n"
             "if ($h.stream) { $h.stream.Dispose() }\n"
             "[ordered]@{ ok = $h.ok; reason = $h.reason; refused = $refused; moved = (Test-Path -LiteralPath ($env:FFX_FILE + '.moved')) } | ConvertTo-Json -Compress\n",
-            FFX_FILE=str(target), FFX_SHA=hashlib.sha256(payload).hexdigest(), FFX_LEN=str(len(payload)))
+            FFX_FILE=str(target), FFX_OUT=str(out), FFX_SHA=hashlib.sha256(payload).hexdigest(), FFX_LEN=str(len(payload)))
         self.assertTrue(result["ok"], result)
-        self.assertEqual(result["refused"], {"rename": True, "unlink": True, "overwrite": True}, result)
+        self.assertEqual(result["refused"], {"rename": True, "unlink": True, "overwrite": True, "parentRename": True}, result)
         self.assertFalse(result["moved"], result)
         self.assertEqual(target.read_bytes(), payload)
 
