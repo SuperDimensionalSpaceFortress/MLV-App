@@ -273,6 +273,9 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in HFR_NATIVE_S1_LEGS if rel not in
 # EXPORT-VENUE-LEG-1: the four export legs (two clips x CDNG lossless / ProRes); test_dual_venue_export_leg pins their shape.
 EXPORT_VENUE_LEGS = tuple(f"legs/m16-{clip}-export-{fmt}.json" for clip in ("1243", "1456") for fmt in ("cdng-lossless", "prores"))
 SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in EXPORT_VENUE_LEGS if rel not in SHIPPED_LEGS))
+# LJ92-PRED1-FAST-PATH-1 r3: the per-frame lj92 layout probe, one cpu s1 Look Assist leg per clip (LegSpecSchemaTests pins the shape and the applied-flavor gate).
+LJ92_LAYOUT_LEGS = tuple(f"legs/m16-{clip}-lj92-layout-cpu-s1.json" for clip in ("1243", "1457"))
+SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in LJ92_LAYOUT_LEGS if rel not in SHIPPED_LEGS))
 assert len(set(SHIPPED_LEGS)) == len(SHIPPED_LEGS), "a shipped leg is listed twice"
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
@@ -8183,6 +8186,11 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "CPU-S1-RECON-CHAIN-ATTRIBUTION-1":   # the Look Assist on arms of the chain attribution (the classic arm l never reaches this chain)
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-chainattr-(c|p|t12)-fullscreen-s1$", path.name)
+            elif spec["card"] == "LJ92-PRED1-FAST-PATH-1":   # the lj92 layout probe legs: cpu s1 Look Assist, one per clip, gated on the applied flavor like every flavored leg
+                self.assertIn("legs/" + path.name, LJ92_LAYOUT_LEGS, path.name)
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertEqual((spec["legType"], spec["backends"], spec["scaleFactor"], spec["displayMode"]), ("speed", ["cpu"], 1, "fullscreen"), path.name)
+                self.assertIs(spec["generatorArgs"].get("forceLookAssist"), True, path.name)
             elif spec["card"] == "HFR-NATIVE-60FPS-FULLRES-1":   # the Look Assist ON control of the native s1 pair (its -nola twin is classic)
                 self.assert_hfr_native_s1_flavored_leg(spec, path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)

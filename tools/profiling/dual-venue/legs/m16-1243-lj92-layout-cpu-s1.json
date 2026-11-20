@@ -15,12 +15,14 @@
   "criteria": {
     "acceptance": {
       "cpu": [
-        { "metric": "lookAssistForced", "op": "eq", "value": true }
+        { "metric": "lookAssistForced", "op": "eq", "value": true },
+        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" }
       ]
     },
     "supplementary": {
       "cpu": [
-        { "metric": "lookAssistForced", "op": "eq", "value": true }
+        { "metric": "lookAssistForced", "op": "eq", "value": true },
+        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" }
       ]
     }
   }
