@@ -52,6 +52,8 @@ public:
     void setFeed( const fullscreen_bar::Feed &feed );
 
     const fullscreen_bar::Presenter &presenter( void ) const { return m_presenter; }
+    /*! \brief Starts a fullscreen session on the bar's counters (Presenter::beginSession). */
+    void beginSession( qint64 nowMs ) { m_presenter.beginSession( nowMs ); }
     /*! \brief The layout on the whole view, device pixels. */
     fullscreen_bar::Layout viewLayout( void ) const;
     /*! \brief True iff the bar is shown and the global position lies on it. */

@@ -18,9 +18,12 @@ QString readRepoFile(const QString & relativePath)
     const QString path = repo_file_path(relativePath);
     ASSERT_FALSE(path.isEmpty());
     QFile file(path);
-    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) return QString();
+    // Adversary 7b56cecd/A2: an unreadable file fails here, so no absence assertion (C6) can pass on empty text.
+    ASSERT_TRUE(file.open(QIODevice::ReadOnly | QIODevice::Text));
     QTextStream stream(&file);
-    return stream.readAll();
+    const QString text = stream.readAll();
+    ASSERT_FALSE(text.isEmpty());
+    return text;
 }
 
 // The body of one function, from its definition to its closing brace in column 0.
@@ -258,10 +261,30 @@ TEST(FullscreenControlBarWiring, FeedConnectedOnlyWhileShownAndSummaryOnExit)
     const QString set = functionBodyToBrace(source, QStringLiteral("void MainWindow::fullscreenBarSetShown( bool shown )"));
     ASSERT_FALSE(set.isEmpty());
     ASSERT_TRUE(set.contains(QStringLiteral("m_fullscreenBarSliderFeed = connect( ui->horizontalSliderPosition, &QSlider::valueChanged")));
-    ASSERT_TRUE(set.contains(QStringLiteral("m_fullscreenBarPlayFeed = connect( ui->actionPlay, &QAction::toggled")));
     ASSERT_TRUE(set.contains(QStringLiteral("disconnect( m_fullscreenBarSliderFeed );")));
-    ASSERT_TRUE(set.contains(QStringLiteral("disconnect( m_fullscreenBarPlayFeed );")));
     ASSERT_EQ(1, int(source.count(QStringLiteral("&QSlider::valueChanged, this, [this]( int ) { fullscreenBarFeed(); }"))));
+    // r3 W1 (hosted CI 44773031416): no connect on the Play action (app_play_scan.py reviews every use of it but
+    // isChecked()). The play glyph is read through isChecked() in fullscreenBarFeed, and a flip with no frame to present
+    // (a pause) is re-fed by the idle clock's tick, which runs every poll period in fullscreen, shown or hidden.
+    ASSERT_EQ(0, int(source.count(QStringLiteral("connect( ui->actionPlay"))));
+    ASSERT_EQ(0, int(source.count(QStringLiteral("m_fullscreenBarPlayFeed"))));
+    ASSERT_EQ(0, int(readRepoFile(QStringLiteral("platform/qt/MainWindow.h")).count(QStringLiteral("m_fullscreenBarPlayFeed"))));
+    const QString sync = functionBodyToBrace(source, QStringLiteral("void MainWindow::fullscreenBarSyncPlayState( void )"));
+    ASSERT_FALSE(sync.isEmpty());
+    ASSERT_TRUE(sync.contains(QStringLiteral(
+        "fullscreen_bar::playStateStale( m_fullscreenBarWidget->presenter(), ui->actionPlay->isChecked() ) )")));
+    ASSERT_TRUE(sync.contains(QStringLiteral("fullscreenBarFeed();")));
+    const QString tick = functionBodyToBrace(source, QStringLiteral("void MainWindow::viewerIdleTimeout( void )"));
+    const int syncAt = tick.indexOf(QStringLiteral("fullscreenBarSyncPlayState();"));
+    ASSERT_TRUE(syncAt > tick.indexOf(QStringLiteral("case viewer_idle::Tick::None:")));
+    ASSERT_EQ(1, int(tick.count(QStringLiteral("fullscreenBarSyncPlayState();"))));
+    ASSERT_TRUE(readRepoFile(QStringLiteral("platform/qt/ViewerIdlePolicy.h")).contains(
+        QStringLiteral("inline constexpr int kPointerPollMs() { return 50; }")));
+    // The bar's own Play button repaints its glyph at once.
+    ASSERT_EQ(1, int(source.count(QStringLiteral(
+        "case fullscreen_bar::Action::TogglePlay: ui->actionPlay->trigger(); fullscreenBarSyncPlayState(); break;"))));
+    const QString feedBody = functionBodyToBrace(source, QStringLiteral("void MainWindow::fullscreenBarFeed( int frameIndex )"));
+    ASSERT_TRUE(feedBody.contains(QStringLiteral("feed.playing = ui->actionPlay->isChecked();")));
     // Drop-frame playback moves the slider with its signals blocked: each presented frame is fed through
     // drawFrameNumberLabel instead, behind a flag that is set only while the bar is shown.
     const int showAt = set.indexOf(QStringLiteral("m_fullscreenBarFrameFeed = true;"));
@@ -284,6 +307,40 @@ TEST(FullscreenControlBarWiring, FeedConnectedOnlyWhileShownAndSummaryOnExit)
     ASSERT_TRUE(dtor.contains(QStringLiteral("if( !m_fullscreenBarSummaryEmitted ) fullscreenBarEmitSummary();")));
     const QString policy = readRepoFile(QStringLiteral("platform/qt/FullscreenControlBarPolicy.h"));
     ASSERT_TRUE(policy.contains(QStringLiteral("control_bar.summary raster=%1 upload=%2 shown_ms=%3 shows=%4")));
+}
+
+// C7 (r3, CoS pr-875 advisory): control_bar.summary is per fullscreen session. Entry begins a session on both surfaces;
+// the summary reads only the session counters, never a lifetime total.
+TEST(FullscreenControlBarWiring, SummaryReportsTheSessionNotTheLifetime)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString changed = functionBodyToBrace(source, QStringLiteral("void MainWindow::viewerIdleFullscreenChanged( bool on )"));
+    ASSERT_FALSE(changed.isEmpty());
+    const int elseAt = changed.indexOf(QStringLiteral("\n    else\n"));
+    ASSERT_TRUE(elseAt > 0);
+    const int cpuBegin = changed.indexOf(QStringLiteral("m_fullscreenBarWidget->beginSession( sessionStartMs );"));
+    const int gpuBegin = changed.indexOf(QStringLiteral("GpuDisplayWindow::controlBarBeginSessionIfActive( sessionStartMs );"));
+    ASSERT_TRUE(cpuBegin > 0);
+    ASSERT_TRUE(gpuBegin > 0);
+    ASSERT_TRUE(cpuBegin < elseAt);
+    ASSERT_TRUE(gpuBegin < elseAt);
+    ASSERT_EQ(1, int(source.count(QStringLiteral("beginSession("))));
+    ASSERT_EQ(1, int(source.count(QStringLiteral("controlBarBeginSessionIfActive("))));
+
+    const QString summary = functionBodyToBrace(source, QStringLiteral("void MainWindow::fullscreenBarEmitSummary( void )"));
+    ASSERT_FALSE(summary.isEmpty());
+    ASSERT_TRUE(summary.contains(QStringLiteral("m_fullscreenBarWidget->presenter().session( now )")));
+    ASSERT_TRUE(summary.contains(QStringLiteral("GpuDisplayWindow::controlBarSessionIfActive( now );")));
+    ASSERT_TRUE(summary.contains(QStringLiteral("fullscreen_bar::sessionSummaryLine( cpu, gpu )")));
+    const char *lifetime[] = { "rasterCount()", "uploadCount()", "shows()", "shownMs(", "counters(", "controlBarCountersIfActive" };
+    for (const char *read : lifetime) ASSERT_FALSE(summary.contains(QString::fromLatin1(read)));
+    ASSERT_EQ(0, int(source.count(QStringLiteral("controlBarCountersIfActive"))));
+
+    const QString gpu = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const QString gpuSession = functionBodyToBrace(gpu, QStringLiteral("fullscreen_bar::Counters GpuDisplayWindow::controlBarSessionIfActive(qint64 nowMs)"));
+    ASSERT_TRUE(gpuSession.contains(QStringLiteral("win->m_controlBar.session(nowMs)")));
+    const QString gpuBeginBody = functionBodyToBrace(gpu, QStringLiteral("void GpuDisplayWindow::controlBarBeginSessionIfActive(qint64 nowMs)"));
+    ASSERT_TRUE(gpuBeginBody.contains(QStringLiteral("win->m_controlBar.beginSession(nowMs);")));
 }
 
 // C5: the CPU bar is a child of the view itself (scrollContentsBy scrolls viewport children), opaque, and takes every

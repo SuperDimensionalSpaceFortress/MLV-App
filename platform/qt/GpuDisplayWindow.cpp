@@ -2761,9 +2761,15 @@ fullscreen_bar::Layout GpuDisplayWindow::controlBarLayoutIfActive()
     return fullscreen_bar::layoutFor(QSize(static_cast<int>(win->width() * dpr), static_cast<int>(win->height() * dpr)));
 }
 
-void GpuDisplayWindow::controlBarCountersIfActive(int *rasterCount, int *uploadCount)
+void GpuDisplayWindow::controlBarBeginSessionIfActive(qint64 nowMs)
 {
     GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
-    if ( rasterCount ) *rasterCount = win ? win->m_controlBar.rasterCount() : 0;
-    if ( uploadCount ) *uploadCount = win ? win->m_controlBar.uploadCount() : 0;
+    if ( !win || QThread::currentThread() != win->thread() ) return;
+    win->m_controlBar.beginSession(nowMs);
+}
+
+fullscreen_bar::Counters GpuDisplayWindow::controlBarSessionIfActive(qint64 nowMs)
+{
+    GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
+    return win ? win->m_controlBar.session(nowMs) : fullscreen_bar::Counters();
 }

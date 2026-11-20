@@ -363,6 +363,94 @@ TEST(FullscreenControlBarPolicy, SeekFrameAtClamps)
     ASSERT_TRUE(fullscreen_bar::summaryLine(0, 0, 0, 0) == QStringLiteral("control_bar.summary raster=0 upload=0 shown_ms=0 shows=0"));
 }
 
+// CoS pr-875 advisory (r3): control_bar.summary is per fullscreen session. Two consecutive sessions on both surfaces
+// (as MainWindow::viewerIdleFullscreenChanged begins each and fullscreenBarEmitSummary reports it); the second has no
+// show, so its summary is all zero: no earlier session's rasters, uploads, shown time or shows leak into it.
+TEST(FullscreenControlBarPolicy, SummaryIsPerSessionASecondSessionWithNoShowIsAllZero)
+{
+    Rig cpu;
+    Rig gpu;
+    // Session 1: shown, playing frames drawn on both surfaces, hidden by the idle clock, then fullscreen exits.
+    cpu.enter(0);
+    cpu.bar.beginSession(0);
+    gpu.bar.beginSession(0);
+    cpu.activity(100);
+    gpu.bar.show(100);
+    for (int i = 0; i < 48; ++i)
+    {
+        cpu.feed(i, true);
+        cpu.draw();
+        gpu.feed(i, true);
+        gpu.draw();
+    }
+    cpu.tick(allPass(), 100 + viewer_idle::kIdleHideMs());
+    gpu.bar.hide(100 + viewer_idle::kIdleHideMs());
+    const qint64 exit1 = 5000;
+    const fullscreen_bar::Counters c1 = cpu.bar.session(exit1);
+    const fullscreen_bar::Counters g1 = gpu.bar.session(exit1);
+    ASSERT_TRUE(c1.raster > 0);
+    ASSERT_TRUE(g1.raster > 0);
+    ASSERT_EQ(1, c1.shows);
+    ASSERT_EQ(qint64(viewer_idle::kIdleHideMs()), c1.shownMs);
+    ASSERT_TRUE(fullscreen_bar::sessionSummaryLine(c1, g1) == fullscreen_bar::summaryLine(
+        c1.raster + g1.raster, c1.upload + g1.upload, qint64(viewer_idle::kIdleHideMs()), 1));
+
+    cpu.idle.setFullscreen(false, exit1);
+    // Session 2: entered again, the pointer never moves, the clip keeps playing (feeds and draws while hidden), exit.
+    cpu.enter(10000);
+    cpu.bar.beginSession(10000);
+    gpu.bar.beginSession(10000);
+    for (int i = 48; i < 600; ++i)
+    {
+        cpu.feed(i, true);
+        cpu.draw();
+        gpu.feed(i, true);
+        gpu.draw();
+    }
+    const fullscreen_bar::Counters c2 = cpu.bar.session(20000);
+    const fullscreen_bar::Counters g2 = gpu.bar.session(20000);
+    ASSERT_TRUE(fullscreen_bar::sessionSummaryLine(c2, g2)
+                == QStringLiteral("control_bar.summary raster=0 upload=0 shown_ms=0 shows=0"));
+    // The lifetime counters still hold session 1's work: only the summary is per session.
+    ASSERT_EQ(c1.raster, cpu.bar.rasterCount());
+    ASSERT_EQ(1, cpu.bar.shows());
+}
+
+// A session begun while the bar is shown counts only the shown time after its start.
+TEST(FullscreenControlBarPolicy, SessionShownTimeStartsAtTheSessionStart)
+{
+    fullscreen_bar::Presenter bar;
+    bar.show(1000);
+    bar.beginSession(1500);
+    ASSERT_EQ(qint64(500), bar.session(2000).shownMs);
+    ASSERT_EQ(0, bar.session(2000).shows);
+    bar.hide(2500);
+    ASSERT_EQ(qint64(1000), bar.session(9000).shownMs);
+    ASSERT_EQ(qint64(1500), bar.shownMs(9000));
+}
+
+// W1 (r3): the bar never connects to the Play action; the idle clock's tick re-feeds a shown bar whose play glyph no
+// longer matches isChecked() (a pause presents no frame), and a hidden bar is never stale.
+TEST(FullscreenControlBarPolicy, PlayStateStaleOnlyWhileShownAndDifferent)
+{
+    Rig rig;
+    rig.enter(0);
+    ASSERT_FALSE(fullscreen_bar::playStateStale(rig.bar, true));   // hidden
+    rig.activity(100);
+    rig.feed(10, true);
+    ASSERT_FALSE(fullscreen_bar::playStateStale(rig.bar, true));
+    ASSERT_TRUE(fullscreen_bar::playStateStale(rig.bar, false));    // paused, glyph still says playing
+    rig.draw();
+    const int rasters = rig.bar.rasterCount();
+    rig.feed(10, false);                                             // the tick's re-feed
+    ASSERT_FALSE(fullscreen_bar::playStateStale(rig.bar, false));
+    ASSERT_EQ(int(fullscreen_bar::Raster::Full), int(rig.bar.rasterFor(rig.barSize)));   // the glyph repaints
+    rig.draw();
+    ASSERT_EQ(rasters + 1, rig.bar.rasterCount());
+    rig.bar.hide(200);
+    ASSERT_FALSE(fullscreen_bar::playStateStale(rig.bar, true));
+}
+
 // Adversary r1 pass 2 A1: a QWindow (the GL path) receives a native double-click as Press, Release,
 // Press(MouseEventCreatedDoubleClick), DblClick, Release; a widget (the CPU bar) as Press, Release, DblClick, Release
 // (QWidgetWindow drops the flagged press, QTBUG-25831). Each physical click acts once on both paths: Next steps twice,

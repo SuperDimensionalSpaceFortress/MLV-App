@@ -942,13 +942,13 @@ private:
     bool fullscreenBarShown( void ) const;
     void fullscreenBarSetShown( bool shown );
     void fullscreenBarFeed( int frameIndex = -1 );
+    void fullscreenBarSyncPlayState( void );
     bool fullscreenBarHeld( void ) const;
     bool fullscreenBarInput( const fullscreen_bar::Layout &layout, QEvent *event, const QPointF &devicePos, bool fromWidget );
     bool fullscreenBarRouteGpuEvent( QObject *watched, QEvent *event );
     void fullscreenBarEmitSummary( void );
     FullscreenControlBarWidget *m_fullscreenBarWidget = nullptr;
     QMetaObject::Connection m_fullscreenBarSliderFeed;
-    QMetaObject::Connection m_fullscreenBarPlayFeed;
     bool m_fullscreenBarFrameFeed = false;   // true only while shown: drawFrameNumberLabel feeds each presented frame
     fullscreen_bar::InputState m_fullscreenBarInput;
     QPoint m_fullscreenBarEntryPos;

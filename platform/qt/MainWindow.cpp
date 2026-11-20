@@ -3744,6 +3744,10 @@ void MainWindow::viewerIdleFullscreenChanged( bool on )
         m_fullscreenBarEntryPos = QCursor::pos();
         m_fullscreenBarSawMove = false;
         m_fullscreenBarSummaryEmitted = false;
+        // The summary at exit counts this session only, on both surfaces (CoS pr-875: no earlier session's work).
+        const qint64 sessionStartMs = m_viewerIdleClock.elapsed();
+        if( m_fullscreenBarWidget ) m_fullscreenBarWidget->beginSession( sessionStartMs );
+        GpuDisplayWindow::controlBarBeginSessionIfActive( sessionStartMs );
 #ifdef Q_OS_WIN
         // Adversary r1 pass 3 A1: the witness that survives Qt deferring input in an excluded wait.
         viewer_idle::win_hook::install();
@@ -3847,6 +3851,8 @@ void MainWindow::viewerIdleTimeout( void )
     case viewer_idle::Tick::None:
         break;
     }
+    // A play/pause flip with no frame to present (a pause) repaints the shown bar's glyph on this tick.
+    fullscreenBarSyncPlayState();
 }
 
 void MainWindow::viewerIdleNoteEvent( QObject *watched, QEvent *event )
@@ -3894,8 +3900,9 @@ bool MainWindow::fullscreenBarShown( void ) const
     return m_fullscreenBarWidget && m_fullscreenBarWidget->presenter().shown();
 }
 
-// Shown: the per-frame feed (position, timecode, play state) is connected and fed once. Hidden: it is disconnected,
-// so a hidden bar costs nothing per frame (no slot runs, no raster, no upload).
+// Shown: the per-frame feed (position, timecode) is connected and fed once. Hidden: it is disconnected, so a hidden bar
+// costs nothing per frame (no slot runs, no raster, no upload). The play state is read, never connected: a flip while
+// playing is fed by the next presented frame, and a pause by the idle clock's next tick (fullscreenBarSyncPlayState).
 void MainWindow::fullscreenBarSetShown( bool shown )
 {
     if( !m_fullscreenBarWidget || shown == fullscreenBarShown() ) return;
@@ -3904,14 +3911,12 @@ void MainWindow::fullscreenBarSetShown( bool shown )
     {
         m_fullscreenBarWidget->setBarShown( true, now );
         m_fullscreenBarSliderFeed = connect( ui->horizontalSliderPosition, &QSlider::valueChanged, this, [this]( int ) { fullscreenBarFeed(); } );
-        m_fullscreenBarPlayFeed = connect( ui->actionPlay, &QAction::toggled, this, [this]( bool ) { fullscreenBarFeed(); } );
         m_fullscreenBarFrameFeed = true;   // drawFrameNumberLabel: each presented frame
         fullscreenBarFeed();
     }
     else
     {
         disconnect( m_fullscreenBarSliderFeed );
-        disconnect( m_fullscreenBarPlayFeed );
         m_fullscreenBarFrameFeed = false;
         m_fullscreenBarWidget->setBarShown( false, now );
         fullscreen_bar::Feed feed = m_fullscreenBarWidget->presenter().feed();
@@ -3935,6 +3940,14 @@ void MainWindow::fullscreenBarFeed( int frameIndex )
                   : QStringLiteral( "--:--:--:--" );
     m_fullscreenBarWidget->setFeed( feed );
     GpuDisplayWindow::setControlBarStateIfActive( true, feed, m_viewerIdleClock.elapsed() );
+}
+
+// The shown bar's play glyph follows the Play action without a connect on it (app_play_scan.py reviews every use of the
+// action but isChecked()): re-fed when it no longer matches. Hidden: one bool test.
+void MainWindow::fullscreenBarSyncPlayState( void )
+{
+    if( m_fullscreenBarWidget && fullscreen_bar::playStateStale( m_fullscreenBarWidget->presenter(), ui->actionPlay->isChecked() ) )
+        fullscreenBarFeed();
 }
 
 // Held (viewer_idle::Inputs::overlayHeld): a seek drag, or the pointer over the shown bar on either display path.
@@ -3981,7 +3994,7 @@ bool MainWindow::fullscreenBarInput( const fullscreen_bar::Layout &layout, QEven
     action = fullscreen_bar::actionOf( action, event->type(), pressCreatedDoubleClick );   // the double-click acts, not its press
     switch( action )
     {
-    case fullscreen_bar::Action::TogglePlay: ui->actionPlay->trigger(); break;
+    case fullscreen_bar::Action::TogglePlay: ui->actionPlay->trigger(); fullscreenBarSyncPlayState(); break;
     case fullscreen_bar::Action::PrevFrame: ui->actionPreviousFrame->trigger(); break;
     case fullscreen_bar::Action::NextFrame: ui->actionNextFrame->trigger(); break;
     case fullscreen_bar::Action::ExitFullscreen: ui->actionFullscreen->trigger(); break;
@@ -4041,25 +4054,15 @@ bool MainWindow::fullscreenBarRouteGpuEvent( QObject *watched, QEvent *event )
     return true;
 }
 
+// One fullscreen session's counters (CoS pr-875): what each surface did since viewerIdleFullscreenChanged( true ) began
+// the session, never a lifetime total, so a session with no show reports raster=0 upload=0 shown_ms=0 shows=0.
 void MainWindow::fullscreenBarEmitSummary( void )
 {
-    int gpuRaster = 0;
-    int gpuUpload = 0;
-    GpuDisplayWindow::controlBarCountersIfActive( &gpuRaster, &gpuUpload );
     const qint64 now = m_viewerIdleClock.isValid() ? m_viewerIdleClock.elapsed() : 0;
-    int raster = gpuRaster;
-    int upload = gpuUpload;
-    qint64 shownMs = 0;
-    int shows = 0;
-    if( m_fullscreenBarWidget )
-    {
-        const fullscreen_bar::Presenter &p = m_fullscreenBarWidget->presenter();
-        raster += p.rasterCount();
-        upload += p.uploadCount();
-        shownMs = p.shownMs( now );
-        shows = p.shows();
-    }
-    qInfo().noquote() << fullscreen_bar::summaryLine( raster, upload, shownMs, shows );
+    const fullscreen_bar::Counters cpu = m_fullscreenBarWidget ? m_fullscreenBarWidget->presenter().session( now )
+                                                               : fullscreen_bar::Counters();
+    const fullscreen_bar::Counters gpu = GpuDisplayWindow::controlBarSessionIfActive( now );
+    qInfo().noquote() << fullscreen_bar::sessionSummaryLine( cpu, gpu );
     m_fullscreenBarSummaryEmitted = true;
 }
 

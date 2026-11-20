@@ -302,6 +302,25 @@ inline bool operator!=( const Feed &a, const Feed &b ) { return !( a == b ); }
 /*! \brief What the next draw must rasterise. */
 enum class Raster { None, Full, Timecode };
 
+/*! \brief The counters control_bar.summary reports: rasters, uploads, time shown (ms) and shows. */
+struct Counters
+{
+    int raster = 0;
+    int upload = 0;
+    qint64 shownMs = 0;
+    int shows = 0;
+};
+
+inline Counters operator-( const Counters &a, const Counters &b )
+{
+    Counters c;
+    c.raster = a.raster - b.raster;
+    c.upload = a.upload - b.upload;
+    c.shownMs = a.shownMs - b.shownMs;
+    c.shows = a.shows - b.shows;
+    return c;
+}
+
 /*! \brief One surface's bar state: shown or not, the latest feed, and the raster cache key. Counts every raster and
  *         upload the surface reports, every show, and the time shown (milliseconds on the caller's clock). */
 class Presenter
@@ -381,7 +400,26 @@ public:
         return m_shownMsTotal + ( m_shown && nowMs > m_shownSince ? nowMs - m_shownSince : 0 );
     }
 
+    /*! \brief The lifetime counters at nowMs. */
+    Counters counters( qint64 nowMs ) const
+    {
+        Counters c;
+        c.raster = m_rasterCount;
+        c.upload = m_uploadCount;
+        c.shownMs = shownMs( nowMs );
+        c.shows = m_shows;
+        return c;
+    }
+
+    /*! \brief Starts a fullscreen session (CoS pr-875 advisory): session() counts from here, so one session's summary
+     *         never carries an earlier session's shows, rasters, uploads or shown time. */
+    void beginSession( qint64 nowMs ) { m_sessionBase = counters( nowMs ); }
+
+    /*! \brief What this surface did since the last beginSession() (everything, before the first). */
+    Counters session( qint64 nowMs ) const { return counters( nowMs ) - m_sessionBase; }
+
 private:
+    Counters m_sessionBase;
     bool m_shown = false;
     qint64 m_shownSince = 0;
     qint64 m_shownMsTotal = 0;
@@ -400,6 +438,21 @@ inline QString summaryLine( int raster, int upload, qint64 shownMs, int shows )
 {
     return QStringLiteral( "control_bar.summary raster=%1 upload=%2 shown_ms=%3 shows=%4" )
         .arg( raster ).arg( upload ).arg( shownMs ).arg( shows );
+}
+
+/*! \brief The summary of one fullscreen session: the CPU bar's session counters plus the GL bar's rasters and uploads
+ *         (both surfaces show and hide together, so shown time and shows are the CPU bar's). */
+inline QString sessionSummaryLine( const Counters &cpu, const Counters &gpu )
+{
+    return summaryLine( cpu.raster + gpu.raster, cpu.upload + gpu.upload, cpu.shownMs, cpu.shows );
+}
+
+/*! \brief True iff the shown bar's play glyph no longer matches the Play action. The bar reads the Play action only
+ *         through isChecked() (no connect on it, app_play_scan.py): a flip while playing is fed by the next presented
+ *         frame; a flip with no frame to present (a pause) is caught by the idle clock's next tick. */
+inline bool playStateStale( const Presenter &p, bool playingNow )
+{
+    return p.shown() && p.feed().playing != playingNow;
 }
 
 } // namespace fullscreen_bar

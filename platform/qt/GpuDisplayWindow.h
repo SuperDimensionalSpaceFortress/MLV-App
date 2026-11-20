@@ -252,8 +252,12 @@ public:
     /* The bar layout on the active window's framebuffer as paintGL() would draw it now (device pixels; empty when
      * no window is active). */
     static fullscreen_bar::Layout controlBarLayoutIfActive(void);
-    /* The active window's bar raster and upload counts (zero when no window is active). */
-    static void controlBarCountersIfActive(int *rasterCount, int *uploadCount);
+    /* Starts a fullscreen session on the active window's bar counters (Presenter::beginSession). A window created
+     * later starts at zero, so all its work is in that session. GUI-thread only; a no-op when no window is active. */
+    static void controlBarBeginSessionIfActive(qint64 nowMs);
+    /* What the active window's bar did since its last controlBarBeginSessionIfActive (all zero when no window is
+     * active). Bound: a window replaced during a session takes its own counts with it. */
+    static fullscreen_bar::Counters controlBarSessionIfActive(qint64 nowMs);
 
     explicit GpuDisplayWindow(QWindow *parent = nullptr);
     ~GpuDisplayWindow() override;
