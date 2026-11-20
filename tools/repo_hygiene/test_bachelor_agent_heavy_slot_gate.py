@@ -2164,7 +2164,8 @@ class BoundedCaptureIoTests(unittest.TestCase):
             name = chunk.split("(", 1)[0]
             if name.startswith("test_a_test_that_asserts_a_leaf_name"):
                 continue
-            if "<read timed out: " in chunk and re.search(r"Read-Captured(?:Result|Text) '[A-Za-z]:\\\\", chunk):
+            # adversary r1 A1: _plain_task_script builds the reads whose timeout text the forced-slow case asserts, so it is leaf-asserting too.
+            if ("<read timed out: " in chunk or name == "_plain_task_script") and re.search(r"Read-Captured(?:Result|Text) '[A-Za-z]:\\\\", chunk):
                 offenders.append(name)
         self.assertEqual(offenders, [], "a leaf-asserting test feeds Read-Captured* a drive-letter literal; use a Join-Path temp path")
 
@@ -2173,14 +2174,17 @@ class BoundedCaptureIoTests(unittest.TestCase):
         """The plain-completed-task arms at `bound_ms`. `factory_delay_ms` is the forced-slow seam: every factory spends that long before it
         hands back its task, the way a loaded runner spends it starting the worker and finishing the call."""
         slow = f"Start-Sleep -Milliseconds {factory_delay_ms}; " if factory_delay_ms else ""
+        # The reads take a NATIVE path (Join-Path): the reader names the leaf with GetFileName, which is 'a.txt' for 'C:\x\a.txt' on Windows but
+        # the whole literal on Linux (the r11 leaf-name rule), and the forced-slow case asserts that leaf in its timeout text.
         return (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
                 f"$plain = {{ param($p) {slow}[Threading.Tasks.Task]::CompletedTask }}\n"
                 f"$ran = {{ param($p) {slow}[Threading.Tasks.Task]::Delay(1) }}\n"
                 f"Write-Output ('PLAIN-DEL|[' + (Remove-CaptureFiles @('C:\\x\\a.txt') {bound_ms} $plain) + ']')\n"
                 f"Write-Output ('RUN-DEL|[' + (Remove-CaptureFiles @('C:\\x\\a.txt') {bound_ms} $ran) + ']')\n"
-                f"$r = Read-CapturedResult 'C:\\x\\a.txt' {bound_ms} $plain\n"
+                f"$r = Read-CapturedResult $p {bound_ms} $plain\n"
                 "Write-Output ('PLAIN-READ|' + $r.Ok + '|[' + $r.Text + ']')\n"
-                f"$r = Read-CapturedResult 'C:\\x\\a.txt' {bound_ms} $ran\n"
+                f"$r = Read-CapturedResult $p {bound_ms} $ran\n"
                 "Write-Output ('RUN-READ|' + $r.Ok + '|[' + $r.Text + ']')\n")
 
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
@@ -2228,8 +2232,9 @@ class BoundedCaptureIoTests(unittest.TestCase):
             name = chunk.split("(", 1)[0]
             if name.startswith("test_no_accept_arm_of_the_bounded_capture_io_cases"):
                 continue
-            for match in re.finditer(r"(?:Read-Captured(?:Result|Text)|Remove-CaptureFiles)\b([^\n]*)", chunk):
-                for number in re.findall(r"(?<![\w$.])(\d+)(?![\w.])", match.group(1)):
+            # PowerShell command names are case-insensitive; a generator call (_plain_task_script) carries its bound as a Python argument.
+            for match in re.finditer(r"(?i)(?:Read-Captured(?:Result|Text)|Remove-CaptureFiles)\b([^\n]*)|_plain_task_script\(([^\n]*)", chunk):
+                for number in re.findall(r"(?<![\w$.])(\d+)(?![\w.])", match.group(1) or match.group(2)):
                     if 1000 <= int(number) <= MAX_DECLARED_BOUND_MS and int(number) != CAPTURE_ACCEPT_BOUND_MS and name not in self._LONG_BOUND_EXEMPT:
                         bounds.append(f"{name}: {number}")
         self.assertEqual(bounds, [], f"an accept arm passes a typed bound other than CAPTURE_ACCEPT_BOUND_MS ({CAPTURE_ACCEPT_BOUND_MS})")
@@ -2241,9 +2246,11 @@ class BoundedCaptureIoTests(unittest.TestCase):
             for line in chunk.splitlines():
                 if line.lstrip().startswith("#"):
                     continue
-                for match in re.finditer(r"Start-Sleep\s+-Milliseconds\s+(\d+)|Start-Sleep\s+-Seconds\s+(\d+)|Sleep\((\d+)\)|Task\]::Delay\((\d+)\)|time\.sleep\(([\d.]+)\)", line):
-                    ms, sec, thread_ms, delay_ms, py_sec = match.groups()
-                    millis = (int(ms) if ms else int(sec) * 1000 if sec else int(thread_ms) if thread_ms else int(delay_ms) if delay_ms else float(py_sec) * 1000)
+                for match in re.finditer(r"(?i)Start-Sleep\s+-Milliseconds\s+(\d+)|Start-Sleep\s+-Seconds\s+(\d+)|Sleep\((\d+)\)|Task\]::Delay\((\d+)\)|time\.sleep\(([\d.]+)\)"
+                                         r"|factory_delay_ms=(\d+)", line):
+                    ms, sec, thread_ms, delay_ms, py_sec, seam_ms = match.groups()
+                    millis = (int(ms) if ms else int(sec) * 1000 if sec else int(thread_ms) if thread_ms else int(delay_ms) if delay_ms
+                              else int(seam_ms) if seam_ms else float(py_sec) * 1000)
                     if millis >= 1000 and "$sw.ElapsedMilliseconds -lt" not in line:
                         waits.append(f"{name}: {line.strip()[:90]}")
         self.assertEqual(waits, [], "a BoundedCaptureIoTests case waits a second or more for real; name it in _ALLOWED_LONG_SLEEPS with why it is never waited out")
