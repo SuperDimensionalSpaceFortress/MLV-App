@@ -708,6 +708,7 @@ private slots:
     void viewerCursorAutohide_deferredAwayAndBackMoveRestoresOnBothSurfaces();
     void viewerCursorAutohide_coalescedAwayAndBackRestoresOnBothSurfaces();
     void viewerCursorAutohide_ownHideSameSpotMoveDoesNotReshow();
+    void viewerCursorAutohide_periodicFullHistoryExcursionRestoresAndQuietStaysHidden();
     void viewerCursorAutohide_queuedSynthesizedSamePositionMoveStaysHidden();
     void viewerCursorAutohide_fullscreenLeftWithoutTheActionStopsTheIdleMachinery();
     void viewerCursorAutohide_nativeFullscreenReentryRestartsTheIdleMachinery();
@@ -3124,6 +3125,65 @@ void GuiSmokeTest::viewerCursorAutohide_ownHideSameSpotMoveDoesNotReshow()
     QCOMPARE( viewport.cursor().shape(), Qt::BlankCursor );
     QVERIFY( harness.hidden() );
     harness.leaveFullscreen();
+}
+
+// G11b (r12, sol r11 B1): sol's periodic full history. P=(500,500,1000), Q=(510,500,1000), H=[P,Q] x 32 newest first;
+// one more Q,P excursion leaves the identical list and ONE coalesced WM_MOUSEMOVE at P. Liveness first: with H in the
+// history and no message the cursor hides and no Show tick follows. Then the excursion: a Show tick that restores both
+// viewer surfaces (106a1819 judged the identical list as no movement and stayed hidden).
+void GuiSmokeTest::viewerCursorAutohide_periodicFullHistoryExcursionRestoresAndQuietStaysHidden()
+{
+    QWidget viewport;
+    viewport.resize( 64, 48 );
+    viewport.setCursor( Qt::OpenHandCursor );
+    viewport.show();
+    QWindow gl;
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    surfaces.glWindow = &gl;
+
+    viewer_idle::win_hook::HistoryReader saved = viewer_idle::win_hook::historyReader();
+    viewer_idle::win_hook::historyReader() = viewerIdleScriptedHistory;
+    ViewerIdleHarness harness( surfaces, 40 );
+    harness.pollMs = 10;
+    harness.markHistory = true;
+    qApp->installEventFilter( &harness );
+    auto cleanup = qScopeGuard( [&harness, saved]() {
+        qApp->removeEventFilter( &harness );
+        viewer_idle::win_hook::remove();
+        viewer_idle::win_hook::historyReader() = saved;
+    } );
+    const QPoint start( 500, 500 );
+    MOUSEHOOKSTRUCT back = {};
+    back.pt.x = start.x();
+    back.pt.y = start.y();
+    for( int i = 0; i < viewer_idle::MoveHistoryMark::kMaxPoints; ++i )
+        g_viewerIdleScript[i] = ( i % 2 ) == 0 ? viewerIdlePoint( 500, 500, 1000 ) : viewerIdlePoint( 510, 500, 1000 );
+    g_viewerIdleScriptCount = viewer_idle::MoveHistoryMark::kMaxPoints;
+
+    harness.enterFullscreen();
+    QVERIFY( harness.hookInstalled );
+    QMouseEvent rest = viewerIdleMove( start );
+    QCoreApplication::sendEvent( &viewport, &rest );
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+    viewer_idle::win_hook::witness().seed( start );
+
+    // Liveness: H stays, no message: no Show tick at all over many poll periods.
+    const int showsQuiet = harness.shows;
+    QTest::qWait( 300 );
+    QCOMPARE( harness.shows, showsQuiet );
+    QVERIFY( harness.hidden() );
+
+    // The excursion: identical list, one coalesced move at start.
+    const int showsBefore = harness.shows;
+    viewer_idle::win_hook::proc( HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>( &back ) );
+    QTRY_VERIFY_WITH_TIMEOUT( harness.shows > showsBefore, 1000 );
+    QCOMPARE( harness.shownViewportShape, Qt::OpenHandCursor );
+    QVERIFY( harness.shownGlShape != Qt::BlankCursor );
+    QVERIFY( !harness.shownHidden );
+    harness.leaveFullscreen();
+    QVERIFY( !viewer_idle::win_hook::installed() );
 }
 
 namespace

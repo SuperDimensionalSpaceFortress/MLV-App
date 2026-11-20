@@ -249,7 +249,9 @@ inline bool operator==( const HistoryPoint &a, const HistoryPoint &b )
  * newer than the mark are the ones in front of the first place where the marked copy lines up with the new
  * list (newest first, every overlapping point equal, x, y and time). The move is real movement iff one of
  * those newer points is at another position than the move. If the marked copy no longer lines up anywhere
- * (more new points than the history holds), any point at another position counts.
+ * (more new points than the history holds), any point at another position counts. r12 (sol r11 B1): when the marked
+ * copy lines up at more than one place (a periodic history), the list cannot say which, so the place that makes the
+ * most points newer wins: an ambiguous history never concludes "no movement" for a move message that is really there.
  *
  * r7 (key B1, opus H1): the tick's mark is also its look at the queue (QueueLook): ONE history read is judged
  * against the previous mark and then becomes the new mark, and the queue status is read after it. The hook runs
@@ -292,8 +294,26 @@ public:
         // largest such place wins (2: the excursion is newer). Only when it fits nowhere whole (its tail scrolled out)
         // is a partial line-up taken, the nearest first, as before. A wrong pick can only be a repeat inside the
         // mark's own quantum and errs toward movement (one more idle period), never toward missing it.
+        // r12 (sol r11 B1): a FULL history (kMaxPoints) scrolls, so the marked copy may also line up partially (its
+        // tail scrolled out) at a place where it fits nowhere whole. In a periodic full history, mark H=[P,Q]x32, one
+        // more Q,P excursion yields [P,Q]+H[0:62] == H: whole at 0 (no excursion) and partial at 2, 4, ..., 62 (the
+        // excursion). The list alone cannot tell them apart, so an ambiguous line-up never concludes "no movement":
+        // when the list is full, the largest line-up, whole or partial, wins (prefixes nest, so it is movement iff any
+        // line-up says so). The second signal that a crafted history cannot fake is the move message itself: every
+        // caller asks only for a move it holds (the hook for a retrieved same-position WM_MOUSEMOVE,
+        // ViewerMouseRetrievalHook.h proc; the tick only when a move is queued, queuedMouseIsActivity). A quiet pointer
+        // sends no message, so a periodic history still hides on time; a synthesized same-position move in a periodic
+        // full history counts as movement (errs toward showing). A list shorter than kMaxPoints cannot have scrolled,
+        // so there only whole line-ups count, as before.
         int newer = -1;
         const int lastWhole = n - m_count;   // the largest k at which the whole marked copy fits
+        if( n >= kMaxPoints )
+        {
+            for( int k = n - 1; k >= 0 && newer < 0; --k )
+            {
+                if( linesUpAt( newestFirst, n, k ) ) newer = k;
+            }
+        }
         for( int k = lastWhole; k >= 0 && newer < 0; --k )
         {
             if( linesUpAt( newestFirst, n, k ) ) newer = k;
