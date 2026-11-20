@@ -169,10 +169,12 @@ _INT_LITERAL = re.compile(
 #       A comment, a line break or a splice between the accessor and the name, a bare name, a macro
 #       alias and a using-declaration all reach it (adversary r1 A1 on 792b6c2e); or
 #   (3) the lexer does not read the text, or cannot trust where its tokens and literals end, and,
-#       with NULs dropped (a UTF-16 file) or read as whitespace (GCC), every splice joined (a NUL
-#       before the break included; `??/` both joined and not) and every universal-character-name decoded
-#       (`\uXXXX`, `\UXXXXXXXX`, `\u{...}`, `\N{...}`), a flipped or flip token stands anywhere in it,
-#       comments and literals included.
+#       with NULs dropped (a UTF-16 file) or read as whitespace (GCC), `??/` read as a backslash and
+#       not, every splice joined (a NUL before the break included), and with no escape decoded or
+#       every universal-character-name decoded (`\uXXXX`, `\UXXXXXXXX`, `\u{...}`, `\N{...}`), a
+#       flipped or flip token stands anywhere in it, comments and literals included. Decoding never
+#       deletes text: an escape that names no character stays as it is, and a `\N{...}` span holds
+#       character-name characters only, so it cannot cross a comment or literal end (r3, fable r2 B1).
 # Every file git can carry under the roots is read, whatever its suffix or content: tracked, and
 # untracked but not ignored (adversary r1 A2 on 792b6c2e: a suffix allowlist skipped the .cc files
 # MLVApp.pro compiles; pass 2 A1, A2 on 54e0a825: a doc/build-file filter was beaten by an #include
@@ -186,8 +188,11 @@ _INT_LITERAL = re.compile(
 # guarded or not.
 QT69_MEMBER_USE = re.compile(r"(?:\.|->|::)[ \t]*(?:flipped|flip)\b")
 QT69_NAME = re.compile(r"\b(?:flipped|flip)\b")
-TRIGRAPH_SPLICE = re.compile(r"\?\?/[ \t\f\v]*\n")
-UCN = re.compile(r"\\(?:u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|u\{([0-9A-Fa-f]+)\}|N\{([^}\n]*)\})")
+# r3 (fable r2 B1 on 956d41f8): an escape is decoded only where its whole span could be one escape to
+# a compiler. A character name holds letters, digits, space, `-` and `_` only, so a `\N{...}` span can
+# never cross the `*/`, quote, `)"` or line break that ends a comment or a literal; the old `[^}\n]*`
+# ran from a `\N{` in a comment to a `}` in a later one and swallowed the call between.
+UCN = re.compile(r"\\(?:u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|u\{([0-9A-Fa-f]+)\}|N\{([0-9A-Za-z _-]+)\})")
 TRIPWIRE_ROOTS = ("platform/qt", "src")
 # Rule 3 inputs (r2, adversary r1 pass 3 A1 on e6717ff8: rule 2 lexed a text whose token ends it
 # could not trust). In the raw text, and again with every splice joined: a control byte, a trigraph,
@@ -205,14 +210,16 @@ TOKEN_BOUNDARY_KINDS = frozenset(("dollar", "non-ascii", "digit-separator", "dig
 
 
 def _decode_ucn(match: re.Match) -> str:
+    """The character an escape names, or the escape's own text when it names none: a compiler reads
+    no character there either, so decoding never deletes text (r3, fable r2 B1)."""
     digits = match.group(1) or match.group(2) or match.group(3)
     if digits:
         value = int(digits, 16)
-        return chr(value) if value < 0x110000 else "?"
+        return chr(value) if value < 0x110000 else match.group(0)
     try:
         return unicodedata.lookup(match.group(4))
     except KeyError:
-        return "?"
+        return match.group(0)
 
 
 def _lf_only(text: str) -> str:
@@ -222,15 +229,19 @@ def _lf_only(text: str) -> str:
 def _rule3_views(text: str) -> list[str]:
     """Each way a compiler can read the raw text that rule 3 searches (r2, adversary r2 pass 1 A1 on
     c541efac): a NUL dropped (a UTF-16 file) and a NUL read as whitespace, as GCC reads it (dropped,
-    `flipped\\0EMPTY` was one identifier); a `??/` splice joined and not joined (GCC and Clang join it
-    only with -trigraphs); every backslash-newline splice joined and every UCN decoded in each. NULs
-    go before CR, LF and CRLF are read as line ends (adversary r2 pass 2 A1 on 1c3a909d: a UTF-16
-    CRLF, `\\r\\0\\n\\0`, read first as two line breaks, left `fl\\nipped` after a splice)."""
+    `flipped\\0EMPTY` was one identifier); every `??/` read as a backslash and not (GCC and Clang
+    read it so only with -trigraphs; it then also spells a UCN's backslash: r3); every
+    backslash-newline splice joined in each, and each kept both undecoded and with every UCN
+    decoded (r3, fable r2 B1: only the decoded form was kept, so a decoding that deleted code hid
+    the name from every check). NULs go before CR, LF and CRLF are read as line ends (adversary r2
+    pass 2 A1 on 1c3a909d: a UTF-16 CRLF, `\\r\\0\\n\\0`, read first as two line breaks, left
+    `fl\\nipped` after a splice)."""
     views = []
     for nul in ("", " "):
-        spliced = SPLICE.sub("", _lf_only(text.replace("\x00", nul)))
-        for view in (TRIGRAPH_SPLICE.sub("", spliced), spliced):
-            views.append(UCN.sub(_decode_ucn, view))
+        lf = _lf_only(text.replace("\x00", nul))
+        for form in (lf.replace("??/", "\\"), lf):
+            spliced = SPLICE.sub("", form)
+            views.extend((spliced, UCN.sub(_decode_ucn, spliced)))
     return views
 
 
@@ -239,6 +250,8 @@ def _reaches_qt69_name(text: str) -> bool:
         return True
     views = _rule3_views(text)
     text = _lf_only(text)
+    # The views include the undecoded spliced text rule 2 lexes (r3, fable r2 B1: the pre-check read
+    # only decoded views, so a decoding that deleted the call skipped rules 2 and 3 alike).
     if not any("flip" in view for view in views):
         return False  # no rule can fire, so only such a text is lexed
     spliced = SPLICE.sub("", text)
@@ -666,6 +679,30 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
         # A UTF-16 text with only a longer name is still not flagged.
         text = "auto r = image.flippedCopy();\r\n".encode("utf-16").decode("utf-8", errors="replace")
         self.assertEqual(files_needing_scan({"f": text}), set())
+
+    def test_ucn_decoding_never_deletes_text_a_compiler_reads_as_code(self) -> None:
+        # fable r2 B1 (956d41f8): `\N{([^}\n]*)}` ran over comments and literals, so a `\N{` in a comment
+        # and a `}` later on the line swallowed the call between them; the failed name lookup became
+        # `?`, no view held `flip`, and the pre-check returned False before rule 2 or rule 3. A compiler
+        # decodes neither: it sees image.flipped(Qt::Vertical). Fable's two inputs (rule 2, and rule 3
+        # after a raw string), the phase 1 raw-string and escaped-backslash forms, a UCN-spelled name
+        # inside the swallowed span (an undecoded view alone misses it), with a lookup that fails on
+        # the whole span, and a `??/` that spells a UCN's backslash under -trigraphs.
+        call = "auto r = image . /**/ flipped(Qt::Vertical);"
+        for text in ("/* \\N{ */ " + call + " /* } */\n",
+                     'auto s = R"(x)"; /* \\N{ */ ' + call + " /* } */\n",
+                     'const char *a = R"(\\N{)"; QImage r = image./**/flipped(Qt::Vertical); const char *b = "}";\n',
+                     'auto s = "\\\\N{"; QImage r = image./**/flipped(Qt::Vertical); auto t = "}";\n',
+                     "/* \\N{ */ auto r = img.fl\\u0069pped(Qt::Vertical); /* } */\n",
+                     "/* \\N{ */ auto r = img.fl\\u0069pped(); /* LATIN } */\n",
+                     "auto p = img.fl??/u0069pped();\n", "auto p = img.fl??/N{LATIN SMALL LETTER I}pped();\n"):
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), {"f"})
+        # A well-formed escape is still decoded, and a name the decoding joins to a letter is not one.
+        for text in ('auto s = R"(\\N{LATIN SMALL LETTER A})"; auto r = x; // flippedCopy\n',
+                     "/* \\N{ */ auto r = img.fl\\u0069ppedCopy(); /* } */\n", "auto p = \\u00e9flipped;\n"):
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), set())
 
     def test_a_digit_separator_in_code_is_refused(self) -> None:
         # r2 sibling of adversary r1 pass 3 A1: the Qt 5 Linux kit compiles C++11 (MLVApp.pro:176),
