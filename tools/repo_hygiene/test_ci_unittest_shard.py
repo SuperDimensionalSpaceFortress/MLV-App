@@ -217,16 +217,93 @@ def _windows_shard_job() -> str:
     return _workflow_job(WINDOWS_SHARD_JOB)
 
 
+def _shard_commands(job: str) -> list[str]:
+    """Every non-comment line of ``job`` that runs the shard tool."""
+    return [
+        line.strip()
+        for line in job.splitlines()
+        if "tools.repo_hygiene.ci_unittest_shard" in line and not line.strip().startswith("#")
+    ]
+
+
+def _of_values(command: str) -> list[int | str]:
+    """Every ``--of`` value on one command line, in order, the way argparse reads them.
+
+    argparse accepts ``--of N``, ``--of=N`` and any unique prefix of the option (``--o N``), and a
+    later occurrence overrides an earlier one; ``int`` takes ``+8`` and a padded `` 8``. Quotes are
+    dropped and runs of blanks or tabs count as one separator. A value that is not an integer (a
+    ``${{ ... }}`` expression) is kept as its text, so it can never equal a pinned count.
+    """
+    tokens = [token for token in re.split(r"[\s=]+", command.replace('"', "").replace("'", "")) if token]
+    values: list[int | str] = []
+    for index, token in enumerate(tokens):
+        if len(token) >= 3 and "--of".startswith(token):
+            raw = tokens[index + 1] if index + 1 < len(tokens) else ""
+            try:
+                values.append(int(raw))
+            except ValueError:
+                values.append(raw)
+    return values
+
+
+def _run_step_of(job: str) -> int:
+    """The ``--of`` the job's shard run step ends up with (the last one, as argparse reads it)."""
+    runs = [command for command in _shard_commands(job) if "--shard" in command]
+    values = _of_values(runs[-1]) if runs else []
+    assert values and isinstance(values[-1], int), runs
+    return values[-1]
+
+
+def _matrix_keys(job: str) -> list[str] | None:
+    """The keys of the job's ``strategy.matrix`` (``include`` and ``exclude`` would show here)."""
+    lines = job.splitlines()
+    start = next((index for index, line in enumerate(lines) if line == "      matrix:"), None)
+    if start is None:
+        return None
+    keys: list[str] = []
+    for line in lines[start + 1 :]:
+        if line.strip() and not line.startswith("        "):
+            break
+        found = re.match(r"^        ([A-Za-z_][\w-]*):", line)
+        if found:
+            keys.append(found.group(1))
+    return keys
+
+
+def _windows_count_problems(light_job: str, heavy_job: str, heavy_parts: int) -> list[str]:
+    """Where the windows workflow and the heavy set disagree with the pinned counts (empty: they agree)."""
+    problems: list[str] = []
+    commands = _shard_commands(light_job)
+    if not commands:
+        problems.append("the windows shard job runs no ci_unittest_shard step")
+    for command in commands:
+        if _of_values(command) != [WINDOWS_LIGHT_SHARDS]:
+            problems.append(f"not exactly one --of {WINDOWS_LIGHT_SHARDS}: {command}")
+    for label, job, key, expected in (
+        ("light", light_job, "shard", list(range(1, WINDOWS_LIGHT_SHARDS + 2))),
+        ("heavy", heavy_job, "part", list(range(1, WINDOWS_HEAVY_PARTS + 1))),
+    ):
+        if _matrix_keys(job) != [key]:
+            problems.append(f"{label} matrix keys are {_matrix_keys(job)}, not just [{key!r}]")
+        if re.search(r"(?m)^\s*(?:include|exclude)\s*:", job):
+            problems.append(f"{label} job carries a matrix include/exclude")
+        listed = re.search(rf"(?m)^        {key}: \[([0-9, ]+)\]$", job)
+        if listed is None or [int(n) for n in listed.group(1).split(",")] != expected:
+            problems.append(f"{label} matrix {key} list is not {expected[0]}..{expected[-1]}")
+    if heavy_parts != WINDOWS_HEAVY_PARTS:
+        problems.append(f"the heavy set runs {heavy_parts} parts, not {WINDOWS_HEAVY_PARTS}")
+    return problems
+
+
 class ShardDurationBudgetTests(unittest.TestCase):
     def test_every_windows_unittest_shard_is_expected_within_the_cap_share(self) -> None:
         job = _windows_shard_job()
         cap = re.search(r"(?m)^    timeout-minutes: (\d+)$", job)
-        of = re.search(r"ci_unittest_shard --profile windows --of (\d+) --shard", job)
+        of = _run_step_of(job)
         self.assertIsNotNone(cap)
-        self.assertIsNotNone(of)
         budget = int(cap.group(1)) * 60 * CAP_SHARE
         weights = shard.load_weights("windows")
-        buckets, _heavy = shard.plan_buckets(_COUNTS, "windows", int(of.group(1)))
+        buckets, _heavy = shard.plan_buckets(_COUNTS, "windows", of)
         expected = [
             SETUP_SECONDS + sum(shard.unit_weight(key, _COUNTS[key], weights) for key in bucket)
             for bucket in buckets
@@ -235,7 +312,7 @@ class ShardDurationBudgetTests(unittest.TestCase):
             self.assertLessEqual(
                 seconds,
                 budget,
-                f"windows shard {index}/{of.group(1)} is expected at {seconds:.0f} s, over "
+                f"windows shard {index}/{of} is expected at {seconds:.0f} s, over "
                 f"{CAP_SHARE:.0%} of its {cap.group(1)} min cap ({budget:.0f} s); re-derive "
                 "ci_unittest_shard_weights.json from fresh hosted logs or add shards",
             )
@@ -243,19 +320,18 @@ class ShardDurationBudgetTests(unittest.TestCase):
     def test_every_windows_unittest_shard_keeps_headroom_under_the_cap_share(self) -> None:
         job = _windows_shard_job()
         cap = re.search(r"(?m)^    timeout-minutes: (\d+)$", job)
-        of = re.search(r"ci_unittest_shard --profile windows --of (\d+) --shard", job)
+        of = _run_step_of(job)
         self.assertIsNotNone(cap)
-        self.assertIsNotNone(of)
         budget = int(cap.group(1)) * 60 * CAP_SHARE
         limit = budget * MAX_CAP_SHARE_USED
         weights = shard.load_weights("windows")
-        buckets, _heavy = shard.plan_buckets(_COUNTS, "windows", int(of.group(1)))
+        buckets, _heavy = shard.plan_buckets(_COUNTS, "windows", of)
         for index, bucket in enumerate(buckets, start=1):
             seconds = SETUP_SECONDS + sum(shard.unit_weight(key, _COUNTS[key], weights) for key in bucket)
             self.assertLessEqual(
                 seconds,
                 limit,
-                f"windows shard {index}/{of.group(1)} is expected at {seconds:.1f} s, "
+                f"windows shard {index}/{of} is expected at {seconds:.1f} s, "
                 f"{seconds / budget:.1%} of its cap share ({budget:.0f} s); the limit is "
                 f"{MAX_CAP_SHARE_USED:.0%} ({limit:.0f} s) so new tests have headroom; move a measured "
                 "class into ci_unittest_heavy_set.json or re-derive the weights from hosted logs",
@@ -285,22 +361,58 @@ class ShardDurationBudgetTests(unittest.TestCase):
         # A future count change is caught here: the workflow's `--of` (partition proof and run step),
         # its light shard matrix (the light shards plus the one tail shard), its heavy matrix and the
         # heavy set's parts must all agree with the constants above, so one cannot move without the others.
-        job = _windows_shard_job()
-        # Every `--of` of the job, in either spelling (`--of 7` or `--of=7`), counting a later override
-        # on the same command line, which argparse would honour over the first.
-        ofs = {int(n) for n in re.findall(r"--of[ =](\d+)", job)}
-        self.assertEqual(ofs, {WINDOWS_LIGHT_SHARDS})
-        matrix = re.search(r"(?m)^        shard: \[([0-9, ]+)\]$", job)
-        self.assertIsNotNone(matrix)
-        self.assertEqual(
-            [int(n) for n in matrix.group(1).split(",")], list(range(1, WINDOWS_LIGHT_SHARDS + 2))
+        problems = _windows_count_problems(
+            _windows_shard_job(), _workflow_job(WINDOWS_HEAVY_JOB), shard.load_heavy_set("windows")[1]
         )
-        self.assertEqual(shard.load_heavy_set("windows")[1], WINDOWS_HEAVY_PARTS)
-        heavy_matrix = re.search(r"(?m)^        part: \[([0-9, ]+)\]$", _workflow_job(WINDOWS_HEAVY_JOB))
+        self.assertEqual(problems, [])
+
+    def test_the_count_pin_fails_on_every_way_to_run_other_than_the_pinned_counts(self) -> None:
+        # CI-WINDOWS-UNITTEST-SHARD-HEADROOM-3 r2 (adversary A1, A2): the pin reads the workflow the way
+        # argparse and GitHub do, so each of these edits of the real jobs must leave a problem behind.
+        light = _windows_shard_job()
+        heavy = _workflow_job(WINDOWS_HEAVY_JOB)
+        parts = shard.load_heavy_set("windows")[1]
+        self.assertEqual(_windows_count_problems(light, heavy, parts), [])
+        run = "--of 7 --shard ${{ matrix.shard }}"
+        self.assertIn(run, light)
+        light_mutations = {
+            "later --of override, quoted": run + ' --of "8"',
+            "later --of override, bare": run + " --of 8",
+            "later --of=N override": run + " --of=8",
+            "later signed --of override": run + " --of=+8",
+            "later --of with a tab": run + " --of\t8",
+            "later abbreviated --o override": run + " --o 8",
+            "the count itself changed": "--of 8 --shard ${{ matrix.shard }}",
+            "double blank before the count": "--of  8 --shard ${{ matrix.shard }}",
+            "the count from an expression": "--of ${{ matrix.of }} --shard ${{ matrix.shard }}",
+        }
+        for label, replacement in light_mutations.items():
+            with self.subTest(light=label):
+                self.assertNotEqual(
+                    _windows_count_problems(light.replace(run, replacement), heavy, parts), []
+                )
+        matrix = "        shard: [1, 2, 3, 4, 5, 6, 7, 8]"
+        heavy_matrix = re.search(r"(?m)^        part: \[[0-9, ]+\]$", heavy)
+        self.assertIn(matrix, light)
         self.assertIsNotNone(heavy_matrix)
-        self.assertEqual(
-            [int(n) for n in heavy_matrix.group(1).split(",")], list(range(1, WINDOWS_HEAVY_PARTS + 1))
-        )
+        matrix_mutations = {
+            "light exclude": (light.replace(matrix, matrix + "\n        exclude:\n          - shard: 7"), heavy),
+            "light include": (light.replace(matrix, matrix + "\n        include:\n          - shard: 9"), heavy),
+            "light shard dropped": (light.replace(matrix, "        shard: [1, 2, 3, 4, 5, 6, 7]"), heavy),
+            "heavy exclude": (
+                light,
+                heavy.replace(heavy_matrix.group(0), heavy_matrix.group(0) + f"\n        exclude:\n          - part: {parts}"),
+            ),
+            "heavy include": (
+                light,
+                heavy.replace(heavy_matrix.group(0), heavy_matrix.group(0) + "\n        include:\n          - part: 99"),
+            ),
+            "heavy part dropped": (light, heavy.replace(heavy_matrix.group(0), "        part: [1, 2, 3]")),
+        }
+        for label, (changed_light, changed_heavy) in matrix_mutations.items():
+            with self.subTest(matrix=label):
+                self.assertNotEqual(_windows_count_problems(changed_light, changed_heavy, parts), [])
+        self.assertNotEqual(_windows_count_problems(light, heavy, parts + 1), [])
 
     def test_the_expected_time_budget_stays_at_the_original_24_minutes(self) -> None:
         # Raising the job cap 40 -> 50 must not buy a looser per-shard budget: the share
