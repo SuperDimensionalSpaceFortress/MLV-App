@@ -757,8 +757,10 @@ if ($playbackAb -and $playbackAbSpeedCompare) {
         $playbackSpeedEvidence += "suggested_optimization=$($playbackAb.analysis.suggestedOptimization)"
     }
 }
+# BENCH-LIGHT-ARM-GAIN-GATES-1 r2 (adversary advisory A4): the label never reads PASS for a section whose presented-fps comparison the arm gate refused. `passed` is unchanged (the stage proof
+# itself passed), so the overall status keeps its meaning; BLOCKED still outranks REFUSED.
 $playbackAbVerdict = New-SectionVerdict `
-    -Status $(if ($playbackAbBlockers.Count -eq 0) { "PASS" } else { "BLOCKED" }) `
+    -Status $(if ($playbackAbBlockers.Count -ne 0) { "BLOCKED" } elseif ($null -ne $playbackAbFpsArmRefusal -and $playbackAbFpsArmRefusal.refused) { "REFUSED" } else { "PASS" }) `
     -Passed ($playbackAbBlockers.Count -eq 0) `
     -Evidence $playbackSpeedEvidence `
     -Blockers @($playbackAbBlockers)

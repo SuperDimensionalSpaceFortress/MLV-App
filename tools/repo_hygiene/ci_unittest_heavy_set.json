@@ -48,6 +48,7 @@
         "tools.repo_hygiene.test_fps_arm_gate.LeaseBatchPlanCheckerTests",
         "tools.repo_hygiene.test_fps_arm_gate.LegPlanRuleTests",
         "tools.repo_hygiene.test_fps_arm_gate.LocalProofSummarizerFpsGateTests",
+        "tools.repo_hygiene.test_fps_arm_gate.ObserverControlTests",
         "tools.repo_hygiene.test_fps_arm_gate.PairVerdictTests",
         "tools.repo_hygiene.test_gui_smoke_process_timeout_bound.AWindowThatCannotRunOutByTheLimitMakesNoSilenceVerdict",
         "tools.repo_hygiene.test_gui_smoke_process_timeout_bound.AnExitSeenByTheWaitItselfAfterTheDeadlineIsATimeout",

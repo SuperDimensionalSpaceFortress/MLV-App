@@ -33,8 +33,71 @@ $script:FpsArmKnownBenignEnv = [System.Collections.Generic.HashSet[string]]::new
     'MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT', 'MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT_SAMPLE_EVERY',
     'MLVAPP_GPU_TEX_NR_ACQUIRE_LATEST_READY', 'MLVAPP_GPU_TEX_NR_IMMEDIATE_DRAIN_MAX', 'MLVAPP_GPU_TEX_NR_IMMEDIATE_DRAIN_READY',
     'MLVAPP_EXPERIMENTAL_GPU_AMAZE_TEXTURE_PRESENT', 'MLVAPP_EXPERIMENTAL_GPU_PLAYBACK_RECON_TEXTURE_PRESENT',
-    'MLVAPP_CUDA_AMAZE_LIVE_DIRECT_RGBA_STORE', 'MLVAPP_CUDA_AMAZE_LIVE_FAST_LAUNCH_CHECKS', 'MLVAPP_CUDA_AMAZE_LIVE_TILE_STREAMS'
+    'MLVAPP_CUDA_AMAZE_LIVE_DIRECT_RGBA_STORE', 'MLVAPP_CUDA_AMAZE_LIVE_FAST_LAUNCH_CHECKS', 'MLVAPP_CUDA_AMAZE_LIVE_TILE_STREAMS',
+    # The per-present trace (generatorArgs.presentTrace) is NOT an observer here: it keeps its rows in memory and writes them after the Play stops, "so the trace never writes inside the timed window"
+    # (platform/qt/PlaybackPresentTrace.h:9-12), and the shipped LIGHT headroom legs are built on it. The spec classifier agrees (presentTrace is not on the observer list).
+    'MLVAPP_PLAYBACK_PRESENT_TRACE'
 ), [StringComparer]::OrdinalIgnoreCase)
+
+# THE OBSERVER CONTROLS: one list, read by all three classifiers (env, spec, result) -- adversary pass 3 A1 and A2 were one defect, two classifiers keeping their own lists. A LIGHT proof
+# excludes every control here. Per control:
+#   id        a short name for the reason text
+#   specKey   the leg spec's generatorArgs key that turns it on ('' = no spec key: an env-only diagnostic)
+#   specKind  'bool' (on unless exactly $false / null: the forwarder's [bool] cast reads the string 'false' as $true) or 'threshold' (a number; on for any value but a negative one,
+#             because the job's `-ge 0` is what starts the per-launch logger, so 0 is ON). Anything else present is read toward ON.
+#   envVar    the environment variable the job / app reads ('' = none: the control is a helper process the environment cannot show)
+#   kind      how the CONSUMER reads the variable, read from its source: 'flag' = on unless exactly "0" (StageTiming.h:74, MainWindow.cpp:185-186; "" reads toward on, as for every flag),
+#             'value' = DATA, on whenever it is non-empty, "0" included (a file name: RenderFrameThread.cpp:60-62 opens MLVAPP_PHASE3_TEL_PATH, StageTiming.h:87-90 opens
+#             MLVAPP_STAGE_TIMING_FILE, GpuDisplayWindow.cpp:146 dumps into MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR; a threshold: MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS=0 is zero ms).
+#   severity  what the env classifier answers when it is on: HEAVY (a per-frame stage / timeline logger) or UNKNOWN (an observer the arm word does not describe)
+# The generator forwards more generatorArgs keys than these; test_every_generator_arg_the_venue_leg_forwards_is_classified makes each new one name itself observer or not.
+function New-FpsObserver {
+    param([string]$Id, [string]$SpecKey = '', [string]$SpecKind = '', [string]$EnvVar = '', [string]$Kind = 'flag', [string]$Severity = 'UNKNOWN')
+    [pscustomobject]@{ id = $Id; specKey = $SpecKey; specKind = $SpecKind; envVar = $EnvVar; kind = $Kind; severity = $Severity }
+}
+$script:FpsObserverControls = @(
+    New-FpsObserver 'smoke-timeline' -EnvVar 'MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY' -Severity 'HEAVY'
+    New-FpsObserver 'detailed-timeline' -EnvVar 'MLVAPP_PLAYBACK_DETAILED_TIMELINE_TELEMETRY' -Severity 'HEAVY'
+    New-FpsObserver 'stage-timing' -EnvVar 'MLVAPP_STAGE_TIMING' -Severity 'HEAVY'
+    New-FpsObserver 'perf-field-log' -EnvVar 'MLVAPP_PERF_FIELD_LOG' -Severity 'HEAVY'
+    New-FpsObserver 'rbf-detail-timing' -EnvVar 'MLVAPP_PLAYBACK_RBF_DETAIL_TIMING' -Severity 'HEAVY'
+    New-FpsObserver 'interactive-trace' -EnvVar 'MLVAPP_INTERACTIVE_TRACE' -Severity 'HEAVY'
+    New-FpsObserver 'overlap-trace' -EnvVar 'MLVAPP_GPU_TEX_NR_OVERLAP_TRACE' -Severity 'HEAVY'
+    New-FpsObserver 'viewport-present-diag' -EnvVar 'MLVAPP_VIEWPORT_PRESENT_DIAG' -Severity 'HEAVY'
+    New-FpsObserver 'phase3-stage-csv' -EnvVar 'MLVAPP_PHASE3_TEL_PATH' -Kind 'value' -Severity 'HEAVY'
+    New-FpsObserver 'stage-timing-file' -EnvVar 'MLVAPP_STAGE_TIMING_FILE' -Kind 'value'
+    New-FpsObserver 'perf-field-log-path' -EnvVar 'MLVAPP_PERF_FIELD_LOG_PATH' -Kind 'value'
+    New-FpsObserver 'perf-field-log-dir' -EnvVar 'MLVAPP_PERF_FIELD_LOG_DIR' -Kind 'value'
+    New-FpsObserver 'cuda-launch-timing' -SpecKey 'cudaLaunchTimingMinMs' -SpecKind 'threshold' -EnvVar 'MLVAPP_CUDA_LAUNCH_TIMING'
+    New-FpsObserver 'cuda-launch-timing-min-ms' -EnvVar 'MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS' -Kind 'value'
+    New-FpsObserver 'core-partition-telemetry' -SpecKey 'corePartitionTelemetry' -SpecKind 'bool'
+    New-FpsObserver 'util-sample' -SpecKey 'utilSample' -SpecKind 'bool'
+    New-FpsObserver 'first-present-capture' -SpecKey 'firstPresentCapture' -SpecKind 'bool' -EnvVar 'MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE'
+    New-FpsObserver 'warm-reuse-miss-dump' -SpecKey 'warmReuseMissDump' -SpecKind 'bool' -EnvVar 'MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR' -Kind 'value'
+)
+
+$script:FpsObserverEnvNames = [System.Collections.Generic.HashSet[string]]::new([string[]]@($script:FpsObserverControls | Where-Object { $_.envVar } | ForEach-Object { $_.envVar }), [StringComparer]::OrdinalIgnoreCase)
+
+function Get-FpsObserverControls { $script:FpsObserverControls }
+
+function Test-FpsSpecObserverOn {
+    # Is this control's generatorArgs-style value ON? $null (absent or JSON null) is off. 'threshold': only a negative number is off. 'bool': only exactly $false is off.
+    param([Parameter(Mandatory)]$Control, [AllowNull()]$Value)
+    if ($null -eq $Value) { return $false }
+    if ($Control.specKind -ceq 'threshold') { return -not (($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) -and $Value -lt 0) }
+    -not ($Value -is [bool] -and -not $Value)
+}
+
+function Get-FpsSpecObserverOn {
+    # The first observer control a spec's generatorArgs (or a result carrying the same keys, directly or under its own generatorArgs) switches on, else $null.
+    param([AllowNull()]$Container)
+    if ($null -eq $Container -or $Container -is [string] -or $Container -is [System.ValueType]) { return $null }
+    foreach ($c in $script:FpsObserverControls) {
+        if (-not $c.specKey) { continue }
+        if (Test-FpsSpecObserverOn $c (Get-FaProp $Container $c.specKey)) { return $c }
+    }
+    $null
+}
 
 $script:FpsArmHeavyReason = 'fps-verdict-refused:heavy-arm'
 $script:FpsArmUnknownReason = 'fps-verdict-refused:unknown-arm'
@@ -78,7 +141,12 @@ function Get-FpsArmFromLegSpec {
     $ga = Get-FaProp $Spec 'generatorArgs'
     $arm = Get-FaProp $ga 'telemetryArm'
     if ($null -eq $arm) { return New-FpsArm 'UNKNOWN' 'spec' 'telemetryArm-absent (the generator default is HEAVY)' }
-    if ($arm -is [string] -and $arm -ceq 'LIGHT') { return New-FpsArm 'LIGHT' 'spec' 'generatorArgs.telemetryArm=LIGHT' }
+    if ($arm -is [string] -and $arm -ceq 'LIGHT') {
+        # the arm word says LIGHT, but a spec that also switches on an observer control the job forwards (a per-launch logger, a sampler) is not proof of it (adversary pass 3 A2)
+        $observer = Get-FpsSpecObserverOn $ga
+        if ($null -ne $observer) { return New-FpsArm 'UNKNOWN' 'spec' "generatorArgs.telemetryArm=LIGHT but generatorArgs.$($observer.specKey) enables an observer ($($observer.id)) inside the timed window" }
+        return New-FpsArm 'LIGHT' 'spec' 'generatorArgs.telemetryArm=LIGHT'
+    }
     if ($arm -is [string] -and $arm -ceq 'HEAVY') { return New-FpsArm 'HEAVY' 'spec' 'generatorArgs.telemetryArm=HEAVY' }
     New-FpsArm 'UNKNOWN' 'spec' 'telemetryArm-invalid (not LIGHT or HEAVY)'
 }
@@ -93,7 +161,13 @@ function Get-FpsArmFromJobResult {
     if ($null -eq $Result -or $Result -is [string] -or $Result -is [System.ValueType]) { return New-FpsArm 'UNKNOWN' 'result' 'no-result' }
     $arm = Get-FaProp $Result 'telemetryArm'
     if ($null -eq $arm) { return New-FpsArm 'UNKNOWN' 'result' 'result-carries-no-telemetryArm' }
-    if ($arm -is [string] -and $arm -ceq 'LIGHT') { return New-FpsArm 'LIGHT' 'result' 'telemetryArm=LIGHT' }
+    if ($arm -is [string] -and $arm -ceq 'LIGHT') {
+        # a result that records an enabled observer control (the same keys as a spec, at its top level or under its generatorArgs) is not LIGHT either (adversary pass 3 A2)
+        $observer = Get-FpsSpecObserverOn $Result
+        if ($null -eq $observer) { $observer = Get-FpsSpecObserverOn (Get-FaProp $Result 'generatorArgs') }
+        if ($null -ne $observer) { return New-FpsArm 'UNKNOWN' 'result' "telemetryArm=LIGHT but the result records $($observer.specKey) enabled ($($observer.id))" }
+        return New-FpsArm 'LIGHT' 'result' 'telemetryArm=LIGHT'
+    }
     if ($arm -is [string] -and $arm -ceq 'HEAVY') { return New-FpsArm 'HEAVY' 'result' 'telemetryArm=HEAVY' }
     New-FpsArm 'UNKNOWN' 'result' 'telemetryArm-invalid (not LIGHT or HEAVY)'
 }
@@ -124,6 +198,14 @@ function Test-FpsEnvFlagOn {
     param([AllowNull()]$Value)
     if ($null -eq $Value) { return $false }
     ([string]$Value) -cne '0'
+}
+
+function Test-FpsEnvVarOn {
+    # Is an environment variable ON, by the rule of its consumer? kind 'value' (a path, a file name, a threshold: DATA) is on whenever it is non-empty, because "0" is a file name or a zero
+    # threshold, not off (adversary pass 3 A1); kind 'flag' follows Test-FpsEnvFlagOn.
+    param([string]$Kind, [AllowNull()]$Value)
+    if ($Kind -ceq 'value') { return (-not [string]::IsNullOrEmpty([string]$Value)) }
+    Test-FpsEnvFlagOn $Value
 }
 
 function ConvertTo-FpsEnvMap {
@@ -179,14 +261,23 @@ function Get-FpsArmFromEnvironment {
             if ($a -imatch '^(--?|/)stage-log([=:]|$)') { return New-FpsArm 'HEAVY' 'environment' "the launch passed $($a.Split('=')[0]) (the stage logger)" }
         }
     }
-    foreach ($k in @('MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY', 'MLVAPP_PLAYBACK_DETAILED_TIMELINE_TELEMETRY', 'MLVAPP_STAGE_TIMING', 'MLVAPP_PERF_FIELD_LOG', 'MLVAPP_PLAYBACK_RBF_DETAIL_TIMING',
-            'MLVAPP_INTERACTIVE_TRACE', 'MLVAPP_GPU_TEX_NR_OVERLAP_TRACE', 'MLVAPP_PHASE3_TEL_PATH', 'MLVAPP_VIEWPORT_PRESENT_DIAG')) {
-        if ($map.ContainsKey($k) -and (Test-FpsEnvFlagOn $map[$k])) { return New-FpsArm 'HEAVY' 'environment' "$k is on" }
+    # The observer list is shared with the spec and result classifiers; each variable is read by ITS consumer's rule (adversary pass 3 A1): a flag is on unless exactly "0", a value (a file
+    # name, a threshold) is on whenever it is non-empty, "0" included. HEAVY outranks UNKNOWN.
+    $unknownObserver = $null
+    foreach ($c in $script:FpsObserverControls) {
+        if (-not $c.envVar -or -not $map.ContainsKey($c.envVar)) { continue }
+        if (-not (Test-FpsEnvVarOn $c.kind $map[$c.envVar])) { continue }
+        if ($c.severity -ceq 'HEAVY') { return New-FpsArm 'HEAVY' 'environment' "$($c.envVar) is on ($($c.id))" }
+        if ($null -eq $unknownObserver) { $unknownObserver = $c }
     }
+    if ($null -ne $unknownObserver) { return New-FpsArm 'UNKNOWN' 'environment' "$($unknownObserver.envVar) is set ($($unknownObserver.id)): an observer control a LIGHT proof excludes" }
     # LIGHT is PROVEN only against a closed list: the app has more per-frame diagnostics than any denylist here names (adversary A1: overlap trace, interactive trace, phase-3 telemetry
-    # path, viewport present diagnostic, ...). Any other MLVAPP_* variable that is set (not exactly "0") is a control this reading does not know, so the arm is UNKNOWN, not LIGHT.
+    # path, viewport present diagnostic, ...). Any other MLVAPP_* variable that is set is a control this reading does not know, so the arm is UNKNOWN, not LIGHT. A name ending _PATH, _FILE or
+    # _DIR holds a path, so it is set whenever it is non-empty; any other is a flag, set unless exactly "0".
     foreach ($name in $map.Keys) {
-        if ($name -imatch '^MLVAPP_' -and -not $script:FpsArmKnownBenignEnv.Contains($name) -and (Test-FpsEnvFlagOn $map[$name])) {
+        $kind = if ($name -imatch '_(PATH|FILE|DIR)$') { 'value' } else { 'flag' }
+        # a listed observer was judged above by its own rule (and found off); it is not a stranger
+        if ($name -imatch '^MLVAPP_' -and -not $script:FpsArmKnownBenignEnv.Contains($name) -and -not $script:FpsObserverEnvNames.Contains($name) -and (Test-FpsEnvVarOn $kind $map[$name])) {
             return New-FpsArm 'UNKNOWN' 'environment' "$name is an MLVAPP_* control this gate does not recognise (it may enable a per-frame diagnostic)"
         }
     }
@@ -302,4 +393,4 @@ function Get-FpsLegPlanRefusal {
     @('', 0, '')
 }
 
-Export-ModuleMember -Function Get-FaProp, New-FpsArm, ConvertTo-FpsArmName, Get-FpsArmFromLegSpec, Get-FpsArmFromJobResult, Get-FpsArm, Test-FpsEnvFlagOn, ConvertTo-FpsEnvMap, Get-FpsArmFromEnvironment, Get-FpsArmFromLaunch, Get-FpsPairVerdict, Get-FpsArmsVerdict, Get-FpsLegPlanRefusal
+Export-ModuleMember -Function Get-FpsObserverControls, Get-FaProp, New-FpsArm, ConvertTo-FpsArmName, Get-FpsArmFromLegSpec, Get-FpsArmFromJobResult, Get-FpsArm, Test-FpsEnvFlagOn, ConvertTo-FpsEnvMap, Get-FpsArmFromEnvironment, Get-FpsArmFromLaunch, Get-FpsPairVerdict, Get-FpsArmsVerdict, Get-FpsLegPlanRefusal
