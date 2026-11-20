@@ -149,7 +149,9 @@ class ArmClassifierTests(_Probe):
 
     def test_a_recorded_result_that_carries_the_arm_classifies_by_it(self) -> None:
         self.assertEqual(self.arm("Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'HEAVY' })"), "ARM=HEAVY")
-        self.assertEqual(self.arm("Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT' })"), "ARM=LIGHT")
+        # r2 pass 5 A2: a result that records no observer controls cannot prove there were none (provenance.json carries telemetryArm only), so alone it is UNKNOWN
+        self.assertEqual(self.arm("Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT' })"), "ARM=UNKNOWN")
+        self.assertEqual(self.arm("Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT'; observerControls = [pscustomobject]@{ utilSample = $false } })"), "ARM=LIGHT")
         self.assertEqual(self.arm("Get-FpsArmFromJobResult ([pscustomobject]@{ sourceCommit = 'x' })"), "ARM=UNKNOWN")
         self.assertEqual(self.arm("Get-FpsArmFromJobResult $null"), "ARM=UNKNOWN")
 
@@ -157,7 +159,8 @@ class ArmClassifierTests(_Probe):
         self.assertEqual(self.arm(f"Get-FpsArm -Spec ({SPEC_LIGHT}) -Result ([pscustomobject]@{{ telemetryArm = 'LIGHT' }})"), "ARM=LIGHT")
         self.assertEqual(self.arm(f"Get-FpsArm -Spec ({SPEC_LIGHT}) -Result ([pscustomobject]@{{ telemetryArm = 'HEAVY' }})"), "ARM=UNKNOWN")
         self.assertEqual(self.arm(f"Get-FpsArm -Spec ({SPEC_HEAVY}) -Result ([pscustomobject]@{{ telemetryArm = 'LIGHT' }})"), "ARM=UNKNOWN")
-        self.assertEqual(self.arm("Get-FpsArm -Spec $null -Result ([pscustomobject]@{ telemetryArm = 'LIGHT' })"), "ARM=LIGHT")
+        self.assertEqual(self.arm("Get-FpsArm -Spec $null -Result ([pscustomobject]@{ telemetryArm = 'LIGHT' })"), "ARM=UNKNOWN")
+        self.assertEqual(self.arm("Get-FpsArm -Spec $null -Result ([pscustomobject]@{ telemetryArm = 'LIGHT'; observerControls = [pscustomobject]@{ cudaLaunchTimingMinMs = -1 } })"), "ARM=LIGHT")
         self.assertEqual(self.arm("Get-FpsArm -Spec $null -Result $null"), "ARM=UNKNOWN")
 
     def test_launch_environment_follows_the_apps_frame_log_rule(self) -> None:
@@ -186,9 +189,11 @@ class ArmClassifierTests(_Probe):
             "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_GPU_TEX_NR_OVERLAP_TRACE=1')": "HEAVY",
             "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_INTERACTIVE_TRACE=1')": "HEAVY",
             "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_PHASE3_TEL_PATH=C:\\Temp\\stages.csv')": "HEAVY",
-            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_VIEWPORT_PRESENT_DIAG=1')": "HEAVY",
+            # r2 pass 5 A2: the venue job puts MLVAPP_VIEWPORT_PRESENT_DIAG=1 in the environment of BOTH arms (playback-attr-3-cuda-job.ps1:3061), so it is the standing baseline of a LIGHT leg, not a discriminator
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_VIEWPORT_PRESENT_DIAG=1')": "LIGHT",
             "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_A_NEW_DIAGNOSTIC_NOBODY_LISTED=1')": "UNKNOWN",
-            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_A_NEW_DIAGNOSTIC_NOBODY_LISTED=0')": "LIGHT",
+            # r2 pass 5 A1: "0" is not proof of OFF for a variable nobody listed (the native mode parsers read 0 as a mode), so any presence is UNKNOWN
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_A_NEW_DIAGNOSTIC_NOBODY_LISTED=0')": "UNKNOWN",
             "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG=1','MLVAPP_PLAYBACK_QUALITY_MODE=phase3_hq','OTHER_VAR=1')": "LIGHT",
             "@('MLVAPP_A_NEW_DIAGNOSTIC_NOBODY_LISTED=1')": "UNKNOWN",
             # adversary pass 2 A2: no Unicode trimming of the opt-out (the native readers trim ASCII only); any whitespace or non-ASCII text is UNKNOWN
@@ -844,7 +849,7 @@ class ObserverControlTests(_Probe):
             env("MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR=0"): "UNKNOWN",
             env("MLVAPP_A_NEW_DIAGNOSTIC_DUMP_DIR=0"): "UNKNOWN",           # any unlisted *_PATH / *_FILE / *_DIR is a path
             env("MLVAPP_A_NEW_DIAGNOSTIC_FILE=0"): "UNKNOWN",
-            env("MLVAPP_A_NEW_DIAGNOSTIC_DUMP_DIR="): "LIGHT",
+            env("MLVAPP_A_NEW_DIAGNOSTIC_DUMP_DIR="): "UNKNOWN",             # an empty value is still a set variable (qEnvironmentVariableIsSet); only a LISTED consumer is known to read it as off
             env("MLVAPP_CRASH_FORENSICS_LOG_DIR=C:\\Temp\\forensics"): "LIGHT",  # configuration, on the closed benign list
             env("MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS=0"): "UNKNOWN",          # a threshold of zero ms is a value, not an off switch
             env("MLVAPP_PLAYBACK_PRESENT_TRACE=1"): "LIGHT",                # the in-memory trace is on the benign list, matching the spec classifier (presentTrace)
@@ -917,6 +922,53 @@ class ObserverControlTests(_Probe):
             "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = @('LIGHT') })": "UNKNOWN",
             "Get-FpsArmFromLegRecord ([pscustomobject]@{ sourceCommit = 'x' })": "UNKNOWN",
             "Get-FpsArmFromLegRecord $null": "UNKNOWN",
+        })
+
+    def test_an_unlisted_variable_is_unknown_whatever_its_value(self) -> None:
+        # r2 pass 5 A1: MLVAPP_PROCESSING_CORE_COLOR_MAIN_PRELUDE_WB_PROBE=0 is a MODE (raw_processing.c:346 processing_parse_probe_mode: mode 0 enables the probe timing); the dual-iso
+        # probes read their value the same way (dualiso.c:304, :396). "0" is only proof of off for a consumer this module lists.
+        def env(*pairs: str) -> str:
+            return "Get-FpsArmFromEnvironment @(" + LIGHT_ENV + "," + ",".join(f"'{p}'" for p in pairs) + ")"
+        self.check({
+            env("MLVAPP_PROCESSING_CORE_COLOR_MAIN_PRELUDE_WB_PROBE=0"): "UNKNOWN",   # the adversary's input
+            env("MLVAPP_PROCESSING_CORE_COLOR_MAIN_PRELUDE_WB_PROBE=1"): "UNKNOWN",
+            env("MLVAPP_PROCESSING_CORE_COLOR_MAIN_PRELUDE_WB_PROBE="): "UNKNOWN",
+            env("MLVAPP_SHADOWS_HIGHLIGHTS_PROBE=0"): "UNKNOWN",
+            env("MLVAPP_DUALISO_MIX_CHROMA_PROBE=0"): "UNKNOWN",
+            env("MLVAPP_DUALISO_FULL20_FINAL_BLEND_PROBE=0"): "UNKNOWN",
+            env("mlvapp_dualiso_mix_halfres_probe=0"): "UNKNOWN",
+            env("NOT_AN_MLVAPP_VARIABLE=0", "QT_OPENGL=desktop"): "LIGHT",             # only the MLVAPP_ namespace is the app's own control surface
+        })
+
+    def test_every_variable_the_job_generator_emits_is_classified(self) -> None:
+        # r2 pass 5 A2: the spec classifier said LIGHT for a leg whose job adds MLVAPP_VIEWPORT_PRESENT_DIAG=1, which the env classifier called HEAVY. The class guard: each MLVAPP_* name
+        # the generator itself writes is either on the observer list (not LIGHT when set) or a standing configuration the closed benign list holds (LIGHT), so the classifiers cannot disagree
+        # about the generator's own environment. The two arm switches are the arm itself.
+        job = (PROFILING / "bachelor" / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8")
+        names = sorted(set(re.findall(r"MLVAPP_[A-Z0-9_]+(?==)", job)) - {"MLVAPP_PLAYBACK_SMOKE_TELEMETRY", "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG"})
+        self.assertGreater(len(names), 30)
+        body = ("$observerEnv = @(Get-FpsObserverControls | Where-Object { $_.envVar } | ForEach-Object { $_.envVar })\n"
+                f"foreach ($n in @({','.join(repr(n) for n in names)})) {{\n"
+                f"  $arm = (Get-FpsArmFromEnvironment @({LIGHT_ENV}, ($n + '=1'))).arm\n"
+                "  Write-Host ('ROW=' + $n + '|' + $arm + '|' + ($observerEnv -contains $n))\n}\n")
+        wrong = []
+        for line in self.ok(body).splitlines():
+            if line.startswith("ROW="):
+                name, arm, is_observer = line[4:].split("|")
+                if (is_observer == "True") == (arm == "LIGHT"):
+                    wrong.append(f"{name}: arm={arm} observer={is_observer}")
+        self.assertEqual(wrong, [], "classify each name the generator emits: add it to the observer list or to FpsArmKnownBenignEnv")
+
+    def test_a_result_that_records_observer_controls_is_judged_on_them(self) -> None:
+        self.check({
+            "Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT'; observerControls = [pscustomobject]@{ utilSample = $true } })": "UNKNOWN",
+            "Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT'; observerControls = [pscustomobject]@{ cudaLaunchTimingMinMs = 0 } })": "UNKNOWN",
+            "Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT'; observerControls = [pscustomobject]@{ cudaLaunchTimingMinMs = -1; utilSample = $false } })": "LIGHT",
+            # the adversary's result-only input: provenance of a valid -TelemetryArm LIGHT -UtilSample job carries the arm word and no observer record
+            "Get-FpsArmFromJobResult (ConvertFrom-Json '{\"rangeHeadSha\":\"x\",\"telemetryArm\":\"LIGHT\"}')": "UNKNOWN",
+            # a spec supplies the observer record, so a bare LIGHT result under a clean LIGHT spec still agrees
+            f"Get-FpsArm -Spec ({_spec()}) -Result ([pscustomobject]@{{ telemetryArm = 'LIGHT' }})": "LIGHT",
+            f"Get-FpsArm -Spec ({_spec(utilSample='$true')}) -Result ([pscustomobject]@{{ telemetryArm = 'LIGHT' }})": "UNKNOWN",
         })
 
     def test_no_reader_projects_the_arm_word_out_of_a_leg_record(self) -> None:
