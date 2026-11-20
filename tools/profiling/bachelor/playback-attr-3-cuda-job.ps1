@@ -511,6 +511,14 @@ param(
     # scalars. FAIL OPEN: never an exit code or a verdict. Absent: the emitted job is the text it was before this parameter.
     [switch]$UtilSample,
 
+    # BENCH-CLOCKS-POWER-LOG-1: an opt-in per-leg clocks / power / limit-flag log around the MEASURED smoke launch: ONE nvidia-smi (clocks, power, limit, throttle
+    # bitmask) and ONE native typeperf (CPU effective clock, package power where the host has it) for the window, never a process per sample and no pwsh
+    # sampler child, published as gpu-clocks.csv / cpu-clocks.csv plus the summary.json clocksPower block. FAIL OPEN: never an exit code or a verdict.
+    # Absent: the emitted job is the text it was before these parameters. -ClocksPowerWarmup marks the leg a warm-up leg (samples kept, flagged).
+    [switch]$ClocksPower,
+    [ValidateRange(250, 5000)][int]$ClocksPowerIntervalMs = 1000,
+    [switch]$ClocksPowerWarmup,
+
     # VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1: the app's playback worker-thread cap for the run, forwarded as the smoke runner's EXISTING -Threads <n> (the
     # runner sets MLVAPP_PLAYBACK_MAX_THREADS=<n> for the app and records playbackMaxThreads in its result.json). 0 (the default) passes nothing: the
     # emitted job is the text it was before this parameter.
@@ -7089,7 +7097,7 @@ function Get-UtilSampleDgpuState {
 
 # WAKE RULE: a cuda leg always starts nvidia-smi (and says it can wake the dGPU before the app does); any other leg reads the D-state first ($DState)
 # and starts it only in D0, else skipped_wake_risk with the state's reason and no process. Status running | skipped_wake_risk | unavailable.
-function Start-UtilSampleGpu([string]$Backend, [string]$SmiPath, [string]$CsvPath, $DState) {
+function Start-UtilSampleGpu([string]$Backend, [string]$SmiPath, [string]$CsvPath, $DState, [string]$QueryArgs = '') {
     $r = [ordered]@{ status = 'unavailable'; reason = $null; why = $null; proc = $null; pid = $null; startTicks = $null; dState = $null; wakeDisclosure = $null; owned = $false; hold = $null }
     try {
         # adversary 9d648094 A5: the backend is compared lower-cased (a 'CUDA' leg is a cuda leg); A4: the PnP record is read on every backend, so
@@ -7117,7 +7125,10 @@ function Start-UtilSampleGpu([string]$Backend, [string]$SmiPath, [string]$CsvPat
         $own = New-UtilSampleOwnedFile $CsvPath
         if ($null -eq $own.hold) { $r.reason = "gpu-util-$($own.reason)"; $r.why = $own.why; return $r }
         $r.hold = $own.hold; $r.owned = $true
-        $psi =[Diagnostics.ProcessStartInfo]::new($SmiPath, ('--query-gpu=timestamp,utilization.gpu,utilization.memory,clocks.sm,pstate,power.draw --format=csv,noheader,nounits -i 0 -lms 250 -f "' + $CsvPath + '"'))
+        # a caller's $QueryArgs (its own query and interval) replaces the util query text; the wake rule, the owned file and the -f stay this function's
+        $smiQuery = '--query-gpu=timestamp,utilization.gpu,utilization.memory,clocks.sm,pstate,power.draw --format=csv,noheader,nounits -i 0 -lms 250'
+        if (-not [string]::IsNullOrEmpty($QueryArgs)) { $smiQuery = $QueryArgs }
+        $psi =[Diagnostics.ProcessStartInfo]::new($SmiPath, ($smiQuery + ' -f "' + $CsvPath + '"'))
         $psi.UseShellExecute = $false
         $psi.CreateNoWindow = $true
         $p = [Diagnostics.Process]::Start($psi)
@@ -7858,6 +7869,350 @@ function Get-UtilSampleScalars($Gpu, $Cpu, [bool]$HasWindow) {
     $o
 }
 
+# --- BENCH-CLOCKS-POWER-LOG-1: per-leg clocks / power / limit-flag sampler helpers ---------------------------------
+# Spliced verbatim into a -ClocksPower job (Get-CorePartitionFunctionSource); test_bench_clocks_power_log lifts them from this file by AST (*ClocksPower*).
+# COST DESIGN (why this is not the -UtilSample sampler): ONE nvidia-smi process for the window (a native loop, -lms <n>, default 1000 ms, never one per
+# sample) and ONE native typeperf process for the CPU counters (no pwsh child, no per-poll Get-Process / CPU-time snapshots, no BelowNormal pwsh loop that
+# competes with the playback threads for a core). The Windows counters need no admin right and no driver. A source the host does not have is
+# UNAVAILABLE(reason) text, never 0. FAIL OPEN: nothing here throws out of the job, sets an exit code or touches a verdict.
+
+# A throttle-reason mask (the nvidia-smi clocks_throttle_reasons bitmask, NVML nvmlClocksThrottleReason*) -> its reason names; a bit the table does not
+# know is named Unknown0x<hex>, never dropped.
+function Get-ClocksPowerThrottleNames([int64]$Mask) {
+    # parallel arrays, not a dictionary keyed by the bit: an integer key on an ordered dictionary reads as a POSITION
+    $bitValues = @(1, 2, 4, 8, 16, 32, 64, 128, 256)
+    $bitNames = @('GpuIdle', 'ApplicationsClocksSetting', 'SwPowerCap', 'HwSlowdown', 'SyncBoost', 'SwThermalSlowdown', 'HwThermalSlowdown', 'HwPowerBrakeSlowdown', 'DisplayClockSetting')
+    $names = [Collections.Generic.List[string]]::new()
+    $known = [int64]0
+    for ($j = 0; $j -lt $bitValues.Count; $j++) {
+        $b = [int64]$bitValues[$j]
+        $known = $known -bor $b
+        if (($Mask -band $b) -ne 0) { $names.Add([string]$bitNames[$j]) }
+    }
+    $rest = $Mask -band (-bnot $known)
+    for ($i = 0; $i -lt 62 -and $rest -ne 0; $i++) {
+        $b = [int64]1 -shl $i
+        if (($rest -band $b) -ne 0) { $names.Add('Unknown0x{0:X}' -f $b); $rest = $rest -band (-bnot $b) }
+    }
+    $names.ToArray()
+}
+
+# n / min / median / max (3 decimals) of the non-null values; 'UNAVAILABLE(<reason>)' text when there is none (never 0).
+function Get-ClocksPowerSeries($Values, [string]$MissingReason) {
+    $v = @($Values | Where-Object { $null -ne $_ } | ForEach-Object { [double]$_ } | Where-Object { -not [double]::IsNaN($_) -and -not [double]::IsInfinity($_) })
+    if ($v.Count -eq 0) { return ('UNAVAILABLE(' + $MissingReason + ')') }
+    $s = @($v | Sort-Object)
+    $mid = [int][math]::Floor($s.Count / 2)
+    $med = $(if ($s.Count % 2 -eq 1) { $s[$mid] } else { ($s[$mid - 1] + $s[$mid]) / 2.0 })
+    [ordered]@{ n = $s.Count; min = [math]::Round($s[0], 3); median = [math]::Round($med, 3); max = [math]::Round($s[$s.Count - 1], 3) }
+}
+
+# One nvidia-smi row (timestamp, clocks.gr, clocks.sm, clocks.mem, power.draw, enforced.power.limit, temperature.gpu, the throttle bitmask;
+# csv,noheader,nounits). The timestamp is host-local wall time and becomes UTC through $Zone (an invalid or repeated local time is unparseable).
+# A bracketed field ([N/A], [Not Supported]) is $null, never 0. The mask is 0x-hex. $null when it is not a row.
+function ConvertFrom-ClocksPowerGpuRow([string]$Line, [TimeZoneInfo]$Zone) {
+    $f = @($Line.Split(',') | ForEach-Object { $_.Trim() })
+    if ($f.Count -ne 8) { return $null }
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $local = [DateTime]::MinValue
+    if (-not [DateTime]::TryParseExact($f[0], [string[]]@('yyyy/MM/dd HH:mm:ss.fff', 'yyyy/MM/dd HH:mm:ss'), $inv, [Globalization.DateTimeStyles]::None, [ref]$local)) { return $null }
+    $local = [DateTime]::SpecifyKind($local, [DateTimeKind]::Unspecified)
+    try { if ($Zone.IsAmbiguousTime($local)) { return $null } } catch { return $null }
+    $utc = $null
+    try { $utc = [TimeZoneInfo]::ConvertTimeToUtc($local, $Zone) } catch { return $null }
+    $n = @{}
+    foreach ($i in 1..6) {
+        $v = 0.0
+        if ($f[$i] -match '^\[.*\]$') { $n[$i] = $null }
+        elseif ([double]::TryParse($f[$i], [Globalization.NumberStyles]::Float, $inv, [ref]$v) -and -not [double]::IsNaN($v) -and -not [double]::IsInfinity($v)) { $n[$i] = $v }
+        else { return $null }
+    }
+    $mask = $null
+    if ($f[7] -match '^\[.*\]$') { $mask = $null }
+    elseif ($f[7] -match '^0[xX]([0-9a-fA-F]{1,16})$') { try { $mask = [Convert]::ToInt64($Matches[1], 16) } catch { return $null } }
+    else { return $null }
+    [ordered]@{ stamp = $f[0]; utc = $utc; grMhz = $n[1]; smMhz = $n[2]; memMhz = $n[3]; powerW = $n[4]; powerLimitW = $n[5]; tempC = $n[6]; throttleMask = $mask }
+}
+
+# gpu-clocks.csv text -> its rows. why: gpu-clocks-missing ($null text), nvidia-smi-no-rows, nvidia-smi-unparseable (no row parses),
+# nvidia-smi-ambiguous (two rows share a timestamp: more than one GPU answered, and no row can be bound to the one checked).
+function ConvertFrom-ClocksPowerGpuCsv($Text, [TimeZoneInfo]$Zone) {
+    $r = [ordered]@{ rows = [Collections.Generic.List[object]]::new(); lines = 0; unparseable = 0; tornTail = $false; why = $null }
+    if ($null -eq $Text) { $r.why = 'gpu-clocks-missing'; return $r }
+    $sp = Split-UtilSampleLines ([string]$Text) { param($l) $null -ne (ConvertFrom-ClocksPowerGpuRow $l $Zone) }
+    $r.tornTail = $sp.torn
+    $seen = @{}
+    foreach ($l in $sp.lines) {
+        $r.lines++
+        $row = ConvertFrom-ClocksPowerGpuRow $l $Zone
+        if ($null -eq $row) { $r.unparseable++; continue }
+        if ($seen.ContainsKey($row.stamp)) { $r.why = 'nvidia-smi-ambiguous' }
+        $seen[$row.stamp] = 1
+        $r.rows.Add($row)
+    }
+    if (-not $r.why) { if ($r.lines -eq 0) { $r.why = 'nvidia-smi-no-rows' } elseif ($r.rows.Count -eq 0) { $r.why = 'nvidia-smi-unparseable' } }
+    $r
+}
+
+# typeperf's CSV: a header of quoted counter paths ('"(PDH-CSV 4.0) (zone)(bias)","\\HOST\Processor Information(_Total)\% Processor Performance",...') and one
+# quoted row per sample ('"MM/dd/yyyy HH:mm:ss.fff","100.000000",...'; a counter that failed a read is a blank " "). Columns are bound by counter NAME.
+# Effective clock (derived, disclosed as such) = Processor Frequency x % Processor Performance / 100. Package power: the Energy Meter RAPL package
+# counter reads milliwatts, so W = raw / 1000. why: cpu-clocks-missing, typeperf-no-rows, typeperf-unparseable (no header, or neither clock counter named).
+function ConvertFrom-ClocksPowerCpuCsv($Text, [TimeZoneInfo]$Zone) {
+    $r = [ordered]@{ rows = [Collections.Generic.List[object]]::new(); lines = 0; unparseable = 0; tornTail = $false; why = $null; hasPkgPower = $false }
+    if ($null -eq $Text) { $r.why = 'cpu-clocks-missing'; return $r }
+    $sp = Split-UtilSampleLines ([string]$Text) { param($l) $l -match '^"[^"]*"(,"[^"]*")+$' }
+    $r.tornTail = $sp.torn
+    $all = @($sp.lines)
+    if ($all.Count -eq 0) { $r.why = 'typeperf-no-rows'; return $r }
+    if (-not $all[0].StartsWith('"(PDH-CSV')) { $r.why = 'typeperf-unparseable'; return $r }
+    $hdr = @([regex]::Matches($all[0], '"([^"]*)"') | ForEach-Object { $_.Groups[1].Value })
+    $iPerf = -1; $iFreq = -1; $iPkg = -1
+    for ($i = 1; $i -lt $hdr.Count; $i++) {
+        if ($hdr[$i] -match '\\% Processor Performance$') { $iPerf = $i }
+        elseif ($hdr[$i] -match '\\Processor Frequency$') { $iFreq = $i }
+        elseif ($hdr[$i] -match '\\Energy Meter\(RAPL_Package\d+_PKG\)\\Power$') { $iPkg = $i }
+    }
+    if ($iPerf -lt 0 -and $iFreq -lt 0) { $r.why = 'typeperf-unparseable'; return $r }
+    $r.hasPkgPower = ($iPkg -ge 0)
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $num = { param($f, $i) $x = 0.0; if ($i -ge 0 -and $i -lt $f.Count -and [double]::TryParse($f[$i].Trim(), [Globalization.NumberStyles]::Float, $inv, [ref]$x) -and -not [double]::IsNaN($x) -and -not [double]::IsInfinity($x)) { $x } else { $null } }
+    for ($k = 1; $k -lt $all.Count; $k++) {
+        $r.lines++
+        $f = @([regex]::Matches($all[$k], '"([^"]*)"') | ForEach-Object { $_.Groups[1].Value })
+        $local = [DateTime]::MinValue
+        if ($f.Count -ne $hdr.Count -or -not [DateTime]::TryParseExact($f[0], [string[]]@('MM/dd/yyyy HH:mm:ss.fff', 'MM/dd/yyyy HH:mm:ss'), $inv, [Globalization.DateTimeStyles]::None, [ref]$local)) { $r.unparseable++; continue }
+        $local = [DateTime]::SpecifyKind($local, [DateTimeKind]::Unspecified)
+        $utc = $null
+        try { if ($Zone.IsAmbiguousTime($local)) { $r.unparseable++; continue }; $utc = [TimeZoneInfo]::ConvertTimeToUtc($local, $Zone) } catch { $r.unparseable++; continue }
+        $perf = & $num $f $iPerf; $freq = & $num $f $iFreq; $raw = & $num $f $iPkg
+        $eff = $null
+        if ($null -ne $perf -and $null -ne $freq) { $eff = [math]::Round($freq * $perf / 100.0, 3) }
+        $pkg = $null
+        if ($null -ne $raw) { $pkg = [math]::Round($raw / 1000.0, 3) }
+        $r.rows.Add([ordered]@{ stamp = $f[0]; utc = $utc; perfPct = $perf; nominalMhz = $freq; effectiveMhz = $eff; pkgPowerW = $pkg })
+    }
+    if ($r.rows.Count -eq 0) { $r.why = $(if ($r.lines -eq 0) { 'typeperf-no-rows' } else { 'typeperf-unparseable' }) }
+    $r
+}
+
+# gpu summary: status ok | partial(no_window) | skipped_wake_risk | unavailable(<token>). Per-metric n/min/median/max over the rows inside the Play window
+# (stamp rule: Select-UtilSampleWindowRows), the union of throttle reasons and of LIMIT flags seen in it. $Stop with exitedBeforeStop is
+# unavailable(nvidia-smi-exited-early): a sampler that died mid-window leaves rows that do not cover it.
+function Get-ClocksPowerGpuSummary($Parsed, $Start, $Window, $Stop = $null) {
+    $none = 'UNAVAILABLE(start-not-reached)'
+    $s = [ordered]@{ status = 'unavailable(start-not-reached)'; samples = 0; samplesTotal = 0; smClockMhz = $none; grClockMhz = $none; memClockMhz = $none; powerW = $none; powerLimitW = $none; tempC = $none; throttleReasonsUnion = $none; limitFlagsUnion = $none }
+    $fail = { param($status, $why) $s.status = $status; foreach ($k in 'smClockMhz', 'grClockMhz', 'memClockMhz', 'powerW', 'powerLimitW', 'tempC', 'throttleReasonsUnion', 'limitFlagsUnion') { $s[$k] = "UNAVAILABLE($why)" }; $s }
+    try {
+        if ($null -eq $Start) { return $s }
+        if ($Start.status -ceq 'skipped_wake_risk') { return (& $fail 'skipped_wake_risk' 'skipped_wake_risk') }
+        if ($Start.status -cne 'running') { $w = $(if ($Start.reason) { [string]$Start.reason } else { 'start-failed' }); return (& $fail "unavailable($w)" $w) }
+        if ($null -ne $Stop -and $Stop.exitedBeforeStop) { return (& $fail 'unavailable(nvidia-smi-exited-early)' 'nvidia-smi-exited-early') }
+        if ($null -ne $Stop -and -not $Stop.stopped -and $Stop.why -cne 'not-started') { return (& $fail 'unavailable(nvidia-smi-stop-failed)' 'nvidia-smi-stop-failed') }
+        if ($null -eq $Parsed) { return (& $fail 'unavailable(gpu-clocks-missing)' 'gpu-clocks-missing') }
+        $s.samplesTotal = $Parsed.rows.Count
+        if ($Parsed.why) { return (& $fail "unavailable($($Parsed.why))" $Parsed.why) }
+        if ($null -ne $Window -and -not (Test-UtilSampleClockSteady $Parsed.rows)) { return (& $fail 'unavailable(sample-clock-unverified)' 'sample-clock-unverified') }
+        $in = @(Select-UtilSampleWindowRows $Parsed.rows $Window)
+        $s.samples = $in.Count
+        if ($in.Count -eq 0) { return (& $fail 'unavailable(no-rows-in-window)' 'no-rows-in-window') }
+        $s.status = $(if ($null -ne $Window) { 'ok' } else { 'partial(no_window)' })
+        $s.smClockMhz = Get-ClocksPowerSeries @($in | ForEach-Object { $_.smMhz }) 'not-supported'
+        $s.grClockMhz = Get-ClocksPowerSeries @($in | ForEach-Object { $_.grMhz }) 'not-supported'
+        $s.memClockMhz = Get-ClocksPowerSeries @($in | ForEach-Object { $_.memMhz }) 'not-supported'
+        $s.powerW = Get-ClocksPowerSeries @($in | ForEach-Object { $_.powerW }) 'not-supported'
+        $s.powerLimitW = Get-ClocksPowerSeries @($in | ForEach-Object { $_.powerLimitW }) 'not-supported'
+        $s.tempC = Get-ClocksPowerSeries @($in | ForEach-Object { $_.tempC }) 'not-supported'
+        $masks = @($in | Where-Object { $null -ne $_.throttleMask } | ForEach-Object { [int64]$_.throttleMask })
+        if ($masks.Count -eq 0) { $s.throttleReasonsUnion = 'UNAVAILABLE(not-supported)'; $s.limitFlagsUnion = 'UNAVAILABLE(not-supported)' }
+        else {
+            $u = [int64]0
+            foreach ($m in $masks) { $u = $u -bor $m }
+            $names = @(Get-ClocksPowerThrottleNames $u)
+            $s.throttleReasonsUnion = $names
+            $s.limitFlagsUnion = @($names | Where-Object { @('SwPowerCap', 'HwSlowdown', 'SwThermalSlowdown', 'HwThermalSlowdown', 'HwPowerBrakeSlowdown') -contains $_ })
+        }
+        $metricKeys = 'smClockMhz', 'grClockMhz', 'memClockMhz', 'powerW', 'powerLimitW', 'tempC'
+        if (@($metricKeys | Where-Object { $s[$_] -is [string] }).Count -eq $metricKeys.Count -and $masks.Count -eq 0) { $s.status = 'unavailable(not-supported)' }
+    } catch { $s.status = 'unavailable(summary-failed)' }
+    $s
+}
+
+# cpu summary: status ok | partial(no_window) | unavailable(<token>). The effective clock needs both clock counters; the package-power counter is
+# optional (UNAVAILABLE(<reason>) text when the host has none: $Start.pkgReason, else energy-meter-counter-absent).
+function Get-ClocksPowerCpuSummary($Parsed, $Start, $Window, $Stop = $null) {
+    $none = 'UNAVAILABLE(start-not-reached)'
+    $s = [ordered]@{ status = 'unavailable(start-not-reached)'; samples = 0; samplesTotal = 0; perfPct = $none; nominalMhz = $none; effectiveMhz = $none; pkgPowerW = $none }
+    $fail = { param($status, $why) $s.status = $status; foreach ($k in 'perfPct', 'nominalMhz', 'effectiveMhz', 'pkgPowerW') { $s[$k] = "UNAVAILABLE($why)" }; $s }
+    try {
+        if ($null -eq $Start) { return $s }
+        if ($Start.status -cne 'running') { $w = $(if ($Start.reason) { [string]$Start.reason } else { 'start-failed' }); return (& $fail "unavailable($w)" $w) }
+        if ($null -ne $Stop -and $Stop.exitedBeforeStop) { return (& $fail 'unavailable(typeperf-exited-early)' 'typeperf-exited-early') }
+        if ($null -ne $Stop -and -not $Stop.stopped -and $Stop.why -cne 'not-started') { return (& $fail 'unavailable(typeperf-stop-failed)' 'typeperf-stop-failed') }
+        if ($null -eq $Parsed) { return (& $fail 'unavailable(cpu-clocks-missing)' 'cpu-clocks-missing') }
+        $s.samplesTotal = $Parsed.rows.Count
+        if ($Parsed.why) { return (& $fail "unavailable($($Parsed.why))" $Parsed.why) }
+        if ($null -ne $Window -and -not (Test-UtilSampleClockSteady $Parsed.rows)) { return (& $fail 'unavailable(sample-clock-unverified)' 'sample-clock-unverified') }
+        $in = @(Select-UtilSampleWindowRows $Parsed.rows $Window)
+        $s.samples = $in.Count
+        if ($in.Count -eq 0) { return (& $fail 'unavailable(no-rows-in-window)' 'no-rows-in-window') }
+        $s.status = $(if ($null -ne $Window) { 'ok' } else { 'partial(no_window)' })
+        $s.perfPct = Get-ClocksPowerSeries @($in | ForEach-Object { $_.perfPct }) 'no-valid-reads'
+        $s.nominalMhz = Get-ClocksPowerSeries @($in | ForEach-Object { $_.nominalMhz }) 'no-valid-reads'
+        $s.effectiveMhz = Get-ClocksPowerSeries @($in | ForEach-Object { $_.effectiveMhz }) 'no-valid-reads'
+        if ($Parsed.hasPkgPower) { $s.pkgPowerW = Get-ClocksPowerSeries @($in | ForEach-Object { $_.pkgPowerW }) 'no-valid-reads' }
+        else { $s.pkgPowerW = 'UNAVAILABLE(' + $(if ($Start.Contains('pkgReason') -and $Start.pkgReason) { [string]$Start.pkgReason } else { 'energy-meter-counter-absent' }) + ')' }
+        if ($s.effectiveMhz -is [string] -and $s.perfPct -is [string]) { $s.status = 'unavailable(no-valid-reads)' }
+    } catch { $s.status = 'unavailable(summary-failed)' }
+    $s
+}
+
+# powercfg /getactivescheme -> the plan's name and guid, or UNAVAILABLE(powercfg-unparseable)
+function ConvertFrom-ClocksPowerPowerCfg([string]$Text) {
+    $m = [regex]::Match([string]$Text, 'Power Scheme GUID:\s*([0-9a-fA-F-]{36})\s+\((.+?)\)')
+    if (-not $m.Success) { return 'UNAVAILABLE(powercfg-unparseable)' }
+    [ordered]@{ name = $m.Groups[2].Value.Trim(); guid = $m.Groups[1].Value.ToLowerInvariant() }
+}
+
+# Win32_Battery records -> 'ac' | 'battery' | UNAVAILABLE(reason). BatteryStatus: 1 discharging, 4 low, 5 critical = battery; 2 AC, 3 charged,
+# 6-9 charging, 11 partly charged = on AC; any other value is named, never guessed. No battery record (a desktop) is its own reason.
+function Get-ClocksPowerAcState($Batteries) {
+    $b = @($Batteries)
+    if ($b.Count -eq 0) { return 'UNAVAILABLE(no-battery-record)' }
+    $ac = $false; $bat = $false; $other = $null
+    foreach ($x in $b) {
+        $st = $null
+        try { $st = [int]$x.BatteryStatus } catch { $other = 'unreadable'; continue }
+        if (@(2, 3, 6, 7, 8, 9, 11) -contains $st) { $ac = $true }
+        elseif (@(1, 4, 5) -contains $st) { $bat = $true }
+        else { $other = [string]$st }
+    }
+    if ($ac -and -not $bat) { return 'ac' }
+    if ($bat -and -not $ac) { return 'battery' }
+    if ($ac -and $bat) { return 'UNAVAILABLE(battery-status-conflict)' }
+    'UNAVAILABLE(battery-status-' + $other + ')'
+}
+
+# Win32_VideoController rows -> the adapters that have a current display mode (resolution and refresh rate), or UNAVAILABLE(no-active-display-mode)
+function ConvertFrom-ClocksPowerDisplay($Controllers) {
+    $out = [Collections.Generic.List[object]]::new()
+    foreach ($c in @($Controllers)) {
+        try {
+            if ($null -ne $c.CurrentHorizontalResolution -and $null -ne $c.CurrentVerticalResolution) {
+                $out.Add([ordered]@{ adapter = [string]$c.Name; width = [int]$c.CurrentHorizontalResolution; height = [int]$c.CurrentVerticalResolution; refreshHz = $(if ($null -ne $c.CurrentRefreshRate) { [int]$c.CurrentRefreshRate } else { $null }) })
+            }
+        } catch { }
+    }
+    if ($out.Count -eq 0) { return 'UNAVAILABLE(no-active-display-mode)' }
+    , @($out)
+}
+
+# Once per leg, before the measured launch (never inside the window): power plan, AC state, display mode. Each read is its own try.
+function Get-ClocksPowerPlatform {
+    $p = [ordered]@{ powerPlan = 'UNAVAILABLE(not-read)'; acState = 'UNAVAILABLE(not-read)'; display = 'UNAVAILABLE(not-read)' }
+    try { $p.powerPlan = ConvertFrom-ClocksPowerPowerCfg ((& powercfg.exe /getactivescheme 2>&1 | ForEach-Object { [string]$_ }) -join "`n") } catch { $p.powerPlan = 'UNAVAILABLE(powercfg-failed)' }
+    try { $p.acState = Get-ClocksPowerAcState @(Get-CimInstance -ClassName Win32_Battery -ErrorAction Stop) } catch { $p.acState = 'UNAVAILABLE(battery-cim-failed)' }
+    try { $p.display = ConvertFrom-ClocksPowerDisplay @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop) } catch { $p.display = 'UNAVAILABLE(display-cim-failed)' }
+    $p
+}
+
+# `typeperf -qx "Energy Meter"` lines -> the one RAPL package power counter. pkgPath $null with reason energy-meter-counter-absent (the host has no
+# Energy Meter object / no package instance) or energy-meter-ambiguous (two packages: no one counter is the CPU's package power).
+function Resolve-ClocksPowerCounters($Lines) {
+    $hits = @(@($Lines) | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -match '^\\?Energy Meter\(RAPL_Package\d+_PKG\)\\Power$' } | Sort-Object -Unique)
+    if ($hits.Count -eq 0) { return [ordered]@{ pkgPath = $null; reason = 'energy-meter-counter-absent' } }
+    if ($hits.Count -gt 1) { return [ordered]@{ pkgPath = $null; reason = 'energy-meter-ambiguous' } }
+    [ordered]@{ pkgPath = [string]$hits[0]; reason = $null }
+}
+
+# typeperf.exe in System32, '' when absent
+function Resolve-ClocksPowerTypeperf {
+    try { if (-not [string]::IsNullOrWhiteSpace([string]$env:SystemRoot)) { $p = [string]$env:SystemRoot + '\System32\typeperf.exe'; if (Test-Path -LiteralPath $p -PathType Leaf) { return $p } } } catch { }
+    ''
+}
+
+# The Energy Meter counter paths this host lists (one short typeperf call, before the measured launch); an empty list when typeperf says nothing
+function Get-ClocksPowerCounterList([string]$TypeperfPath) {
+    try { if (-not [string]::IsNullOrEmpty($TypeperfPath)) { return , @(& $TypeperfPath -qx 'Energy Meter' 2>&1 | ForEach-Object { [string]$_ }) } } catch { }
+    , @()
+}
+
+# ONE nvidia-smi for the window. The wake rule and the -f ownership are Start-UtilSampleGpu's. The throttle field is clocks_throttle_reasons.active; a
+# driver that renamed it exits at once on the argument check, so a process that is gone inside 1.2 s is started once more with clocks_event_reasons.active
+# (on a second file name: the first one is held). csvPath is the file the running process writes.
+function Start-ClocksPowerGpu([string]$Backend, [string]$SmiPath, [string]$CsvPath, $DState, [int]$IntervalMs, [string]$ThrottleField = 'clocks_throttle_reasons.active') {
+    $q = '--query-gpu=timestamp,clocks.gr,clocks.sm,clocks.mem,power.draw,enforced.power.limit,temperature.gpu,' + $ThrottleField + ' --format=csv,noheader,nounits -i 0 -lms ' + [string][int]$IntervalMs
+    $r = Start-UtilSampleGpu $Backend $SmiPath $CsvPath $DState $q
+    $r['csvPath'] = $CsvPath
+    $r['throttleField'] = $ThrottleField
+    try {
+        if ($r.status -ceq 'running' -and $null -ne $r.proc -and $r.proc.WaitForExit(1200) -and $ThrottleField -ceq 'clocks_throttle_reasons.active') {
+            try { if ($null -ne $r.hold) { $r.hold.Dispose() } } catch { }
+            return (Start-ClocksPowerGpu $Backend $SmiPath ($CsvPath + '.event-reasons') $DState $IntervalMs 'clocks_event_reasons.active')
+        }
+    } catch { }
+    $r
+}
+
+# ONE typeperf for the window (a native process: no pwsh, no per-poll process). $Counters are full counter paths; typeperf rounds the interval up to
+# whole seconds (minimum 1). Status running | unavailable (typeperf-missing, no-counters, cpu-clocks-occupied, typeperf-failed).
+function Start-ClocksPowerCpu([string]$TypeperfPath, [string]$CsvPath, [int]$IntervalMs, $Counters) {
+    $r = [ordered]@{ status = 'unavailable'; reason = $null; why = $null; proc = $null; pid = $null; owned = $false; hold = $null; csvPath = $CsvPath; pkgReason = $null }
+    try {
+        if (@($Counters).Count -eq 0) { $r.reason = 'no-counters'; return $r }
+        if ([string]::IsNullOrEmpty($TypeperfPath) -or -not (Test-Path -LiteralPath $TypeperfPath -PathType Leaf)) { $r.reason = 'typeperf-missing'; return $r }
+        $own = New-UtilSampleOwnedFile $CsvPath
+        if ($null -eq $own.hold) { $r.reason = "cpu-clocks-$($own.reason)"; $r.why = $own.why; return $r }
+        $r.hold = $own.hold; $r.owned = $true
+        $si = [math]::Max(1, [int][math]::Ceiling($IntervalMs / 1000.0))
+        $psi = [Diagnostics.ProcessStartInfo]::new($TypeperfPath, ((@($Counters | ForEach-Object { '"' + [string]$_ + '"' }) -join ' ') + ' -si ' + $si + ' -o "' + $CsvPath + '" -y'))
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $p = [Diagnostics.Process]::Start($psi)
+        $r.proc = $p; $r.pid = $p.Id; $r.status = 'running'
+        try { $p.PriorityClass = [Diagnostics.ProcessPriorityClass]::BelowNormal } catch { }
+    } catch { $r.status = 'unavailable'; $r.reason = 'typeperf-failed'; $r.why = ([string]$_.Exception.Message -replace '\s+', ' ') }
+    $r
+}
+
+# Both samplers: each process by its own handle (that pid only), killed (neither ever exits by itself), bounded by $WaitMs; a name held since the
+# start is released once its writer is stopped. $Prev is an earlier stop record (the outer finally's retry): a side it shows stopped is kept as it was.
+function Stop-ClocksPowerAll($GpuStart, $CpuStart, [int]$WaitMs, $Prev = $null) {
+    $r = [ordered]@{ gpu = $null; cpu = $null }
+    try { if ($null -ne $Prev -and $null -ne $Prev.gpu -and $Prev.gpu.stopped) { $r.gpu = $Prev.gpu } } catch { }
+    try { if ($null -ne $Prev -and $null -ne $Prev.cpu -and $Prev.cpu.stopped) { $r.cpu = $Prev.cpu } } catch { }
+    if ($null -eq $r.gpu) { $r.gpu = Stop-UtilSampleProcess $(if ($null -ne $GpuStart) { $GpuStart.proc }) $WaitMs $true }
+    if ($null -eq $r.cpu) { $r.cpu = Stop-UtilSampleProcess $(if ($null -ne $CpuStart) { $CpuStart.proc }) $WaitMs $true }
+    try { if ($null -ne $GpuStart -and $null -ne $GpuStart.hold -and ($r.gpu.stopped -or $r.gpu.why -ceq 'not-started')) { $GpuStart.hold.Dispose() } } catch { }
+    try { if ($null -ne $CpuStart -and $null -ne $CpuStart.hold -and ($r.cpu.stopped -or $r.cpu.why -ceq 'not-started')) { $CpuStart.hold.Dispose() } } catch { }
+    $r
+}
+
+# The summary.json block. status ok (both sides usable, with a Play window; a skipped_wake_risk GPU side is a designed outcome and counts as usable),
+# partial (one side usable, or no window), unavailable (neither). reason names every side that is not ok ('+'-joined). warmup marks a warm-up leg:
+# its samples are kept and published like any other. rawFile names the published CSV.
+function Get-ClocksPowerBlock($Gpu, $Cpu, $Platform, $Window, [bool]$Warmup, [int]$IntervalMs, [string]$GpuFile, [string]$CpuFile) {
+    if ($null -eq $Gpu) { $Gpu = Get-ClocksPowerGpuSummary $null $null $null }
+    if ($null -eq $Cpu) { $Cpu = Get-ClocksPowerCpuSummary $null $null $null }
+    if ($null -eq $Platform) { $Platform = [ordered]@{ powerPlan = 'UNAVAILABLE(not-read)'; acState = 'UNAVAILABLE(not-read)'; display = 'UNAVAILABLE(not-read)' } }
+    $gpuUsable = ($Gpu.status -ceq 'ok' -or $Gpu.status -ceq 'skipped_wake_risk')
+    $cpuUsable = ($Cpu.status -ceq 'ok')
+    $hasWindow = ($null -ne $Window)
+    $status = 'unavailable'
+    if ($gpuUsable -and $cpuUsable) { $status = $(if ($hasWindow) { 'ok' } else { 'partial' }) }
+    elseif ($gpuUsable -or $cpuUsable -or $Gpu.status -like 'partial*' -or $Cpu.status -like 'partial*') { $status = 'partial' }
+    $why = [Collections.Generic.List[string]]::new()
+    if ($Gpu.status -cne 'ok') { $why.Add('gpu=' + $Gpu.status) }
+    if ($Cpu.status -cne 'ok') { $why.Add('cpu=' + $Cpu.status) }
+    if (-not $hasWindow) { $why.Add('window=no_window') }
+    $win = $null
+    if ($hasWindow) { $win = [ordered]@{ startUtc = $Window.startUtc.ToString('o'); endUtc = $Window.endUtc.ToString('o') } }
+    $g = [ordered]@{}; foreach ($k in $Gpu.Keys) { $g[$k] = $Gpu[$k] }; $g['rawFile'] = $GpuFile
+    $c = [ordered]@{}; foreach ($k in $Cpu.Keys) { $c[$k] = $Cpu[$k] }; $c['rawFile'] = $CpuFile
+    $c['effectiveMhzNote'] = 'derived: Processor Frequency x % Processor Performance / 100'
+    [ordered]@{ status = $status; reason = $(if ($why.Count -gt 0) { $why -join '+' } else { $null }); warmup = $Warmup; intervalMs = $IntervalMs; windowStatus = $(if ($hasWindow) { 'ok' } else { 'no_window' }); window = $win; platform = $Platform; gpu = $g; cpu = $c }
+}
+
 # A typed refusal when a sampler anchor is not exactly one site of the expanded text (Edit-DualVenueTemplate's EOL rule).
 function Edit-UtilSampleText([string]$Text, [string]$Old, [string]$New, [string]$Purpose) {
     $eol = if ($Text.Contains("`r`n")) { "`r`n" } else { "`n" }
@@ -7995,6 +8350,125 @@ Write-JobTrace "step util-sample summary status=$($utilSampleScalars['utilSample
     # fable r4 hardening: the worst stop path, not the usual one: region 2 (gpu kill + 5 s wait; cpu 5 s wait, kill, 5 s wait) is 15 s, and the
     # outer finally retries that twice more when a side is still running (30 s)
     $timeBudget['utilSampleSec'] = 45
+    $timeBudget['jobTimeoutSec'] = [int]($timeBudget.jobTimeoutSec + 45)
+}
+
+# A typed refusal when a clocks/power anchor is not exactly one site of the expanded text (the util sampler's EOL rule, this feature's own token).
+function Edit-ClocksPowerText([string]$Text, [string]$Old, [string]$New, [string]$Purpose) {
+    $eol = if ($Text.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $oldText = [regex]::Replace($Old, "\r?\n", $eol)
+    $newText = [regex]::Replace($New, "\r?\n", $eol)
+    $first = $Text.IndexOf($oldText, [StringComparison]::Ordinal)
+    if ($first -lt 0 -or $Text.IndexOf($oldText, $first + 1, [StringComparison]::Ordinal) -ge 0) { throw "DUAL_VENUE_CLOCKS_POWER_ANCHOR_MISSING the job template has no single site to $Purpose" }
+    $Text.Substring(0, $first) + $newText + $Text.Substring($first + $oldText.Length)
+}
+
+# BENCH-CLOCKS-POWER-LOG-1: a -ClocksPower leg gains five bracketed regions, on the expanded text and only when asked, so every other job is the text it
+# always was. Each anchor must be exactly one site (DUAL_VENUE_CLOCKS_POWER_ANCHOR_MISSING otherwise), the same five places the util sampler uses:
+#   1. right before the MEASURED smoke launch line: the once-per-leg platform read (power plan, AC state, display mode), then ONE nvidia-smi and ONE typeperf;
+#   2. right after that launch's done line: stop both (Stop-ClocksPowerAll);
+#   3. before the SUCCESS summary: the Play-window statistics, then both CSVs published beside presentmon.csv (once);
+#   4. two summary keys (clocksPowerStatus, clocksPower) after the summary's cpuFrames line;
+#   5. at the top of the job's outer finally: every exit that did not reach (3) stops whatever still runs and publishes the CSVs.
+# FAIL OPEN: no region throws out, sets an exit code or touches a verdict. $clocksPowerEmit is the ONE seam -ClocksPower reaches the job through:
+# test_bench_clocks_power_log turns it off in a copy of the generator and requires the job without -ClocksPower.
+$clocksPowerEmit = [bool]$ClocksPower
+if ($clocksPowerEmit) {
+    $cwOpen = '# BENCH-CLOCKS-POWER-LOG-1 >>>'
+    $cwClose = '# BENCH-CLOCKS-POWER-LOG-1 <<<'
+    $cwEol = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $cwFunctions = Get-CorePartitionFunctionSource @(${function:Resolve-UtilSampleNvidiaSmi}, ${function:Get-UtilSampleDgpuState}, ${function:New-UtilSampleOwnedFile}, ${function:Start-UtilSampleGpu}, ${function:Stop-UtilSampleProcess}, ${function:Read-UtilSampleText}, ${function:Split-UtilSampleLines}, ${function:Get-UtilSamplePlayWindow}, ${function:Select-UtilSampleWindowRows}, ${function:Get-UtilSampleHostZone}, ${function:Resolve-UtilSampleCaptureZone}, ${function:Test-UtilSampleClockSteady}, ${function:Get-ClocksPowerThrottleNames}, ${function:Get-ClocksPowerSeries}, ${function:ConvertFrom-ClocksPowerGpuRow}, ${function:ConvertFrom-ClocksPowerGpuCsv}, ${function:ConvertFrom-ClocksPowerCpuCsv}, ${function:Get-ClocksPowerGpuSummary}, ${function:Get-ClocksPowerCpuSummary}, ${function:ConvertFrom-ClocksPowerPowerCfg}, ${function:Get-ClocksPowerAcState}, ${function:ConvertFrom-ClocksPowerDisplay}, ${function:Get-ClocksPowerPlatform}, ${function:Resolve-ClocksPowerCounters}, ${function:Resolve-ClocksPowerTypeperf}, ${function:Get-ClocksPowerCounterList}, ${function:Start-ClocksPowerGpu}, ${function:Start-ClocksPowerCpu}, ${function:Stop-ClocksPowerAll}, ${function:Get-ClocksPowerBlock}) "`n"
+    $cwLaunchLine = "Write-JobTrace 'step smoke-launch start (app launch + load + playback)'"
+    $cwDoneLine = 'Write-JobTrace "step smoke-launch done rc=$smokeRc"'
+    $cwStart = $cwOpen + "`n" + $cwFunctions + "`n" + "`$clocksPowerBackend = '$(([string]$Backend).ToLowerInvariant())'`n`$clocksPowerIntervalMs = [int]$ClocksPowerIntervalMs`n`$clocksPowerWarmup = `$$(if ([bool]$ClocksPowerWarmup) { 'true' } else { 'false' })`n" + @'
+$clocksPowerGpuCsv = Join-Path $legOut 'gpu-clocks.csv'
+$clocksPowerCpuCsv = Join-Path $legOut 'cpu-clocks.csv'
+$clocksPowerGpuStart = [ordered]@{ status = 'unavailable'; reason = 'start-threw'; proc = $null; pid = $null; owned = $false; hold = $null; csvPath = $clocksPowerGpuCsv }
+$clocksPowerCpuStart = [ordered]@{ status = 'unavailable'; reason = 'start-threw'; proc = $null; pid = $null; owned = $false; hold = $null; csvPath = $clocksPowerCpuCsv; pkgReason = $null }
+$clocksPowerPlatform = $null
+$clocksPowerStopped = $false
+$clocksPowerStopRecord = $null
+$clocksPowerGpuPublished = $false
+$clocksPowerCpuPublished = $false
+$clocksPowerBlock = $null
+$clocksPowerZoneAtStart = $null
+$clocksPowerZoneAtStop = $null
+# Both CSVs beside presentmon.csv, each once, at the first site (the success summary, else the outer finally) where it is the job's own (a file this job
+# created and whose writer is stopped); a flag is set only after its copy succeeded, so a copy that failed is tried again by the finally's call.
+function Publish-ClocksPowerFiles {
+    try { if (-not $script:clocksPowerGpuPublished -and $clocksPowerGpuStart.owned -and $null -ne $clocksPowerStopRecord -and $clocksPowerStopRecord.gpu.stopped -and (Test-Path -LiteralPath $clocksPowerGpuStart.csvPath -PathType Leaf)) { [void](Publish-AttrCudaFileCopy -Source $clocksPowerGpuStart.csvPath -Destination (Join-Path $Pub 'gpu-clocks.csv')); $script:clocksPowerGpuPublished = $true } } catch { Write-JobTrace "step clocks-power publish file=gpu-clocks.csv error=$([string]$_.CategoryInfo.Reason)" }
+    try { if (-not $script:clocksPowerCpuPublished -and $clocksPowerCpuStart.owned -and $null -ne $clocksPowerStopRecord -and $clocksPowerStopRecord.cpu.stopped -and (Test-Path -LiteralPath $clocksPowerCpuCsv -PathType Leaf)) { [void](Publish-AttrCudaFileCopy -Source $clocksPowerCpuCsv -Destination (Join-Path $Pub 'cpu-clocks.csv')); $script:clocksPowerCpuPublished = $true } } catch { Write-JobTrace "step clocks-power publish file=cpu-clocks.csv error=$([string]$_.CategoryInfo.Reason)" }
+}
+# the host zone both tools stamp in, read before they start (and again at the stop)
+try { $clocksPowerZoneAtStart = Get-UtilSampleHostZone } catch { }
+# once per leg, before the measured launch: power plan, AC state, display mode
+try { $clocksPowerPlatform = Get-ClocksPowerPlatform } catch { }
+try { $clocksPowerGpuStart = Start-ClocksPowerGpu $clocksPowerBackend (Resolve-UtilSampleNvidiaSmi) $clocksPowerGpuCsv ${function:Get-UtilSampleDgpuState} $clocksPowerIntervalMs } catch { }
+try {
+    $clocksPowerTypeperf = Resolve-ClocksPowerTypeperf
+    $clocksPowerPkg = Resolve-ClocksPowerCounters (Get-ClocksPowerCounterList $clocksPowerTypeperf)
+    $clocksPowerCounters = @('\Processor Information(_Total)\% Processor Performance', '\Processor Information(_Total)\Processor Frequency')
+    if ($null -ne $clocksPowerPkg.pkgPath) { $clocksPowerCounters += [string]$clocksPowerPkg.pkgPath }
+    $clocksPowerCpuStart = Start-ClocksPowerCpu $clocksPowerTypeperf $clocksPowerCpuCsv $clocksPowerIntervalMs $clocksPowerCounters
+    $clocksPowerCpuStart['pkgReason'] = $clocksPowerPkg.reason
+} catch { }
+Write-JobTrace "step clocks-power start gpu=$($clocksPowerGpuStart.status) gpuReason=$($clocksPowerGpuStart.reason) gpuPid=$($clocksPowerGpuStart.pid) dState=$($clocksPowerGpuStart.dState) throttleField=$($clocksPowerGpuStart.throttleField) cpu=$($clocksPowerCpuStart.status) cpuReason=$($clocksPowerCpuStart.reason) cpuPid=$($clocksPowerCpuStart.pid) pkgReason=$($clocksPowerCpuStart.pkgReason) intervalMs=$clocksPowerIntervalMs warmup=$clocksPowerWarmup"
+'@ + "`n" + $cwClose + "`n"
+    $text = Edit-ClocksPowerText $text ($cwLaunchLine + "`n") ($cwStart + $cwLaunchLine + "`n") 'start the clocks/power samplers before the measured launch at'
+    $cwStop = $cwOpen + "`n" + @'
+try {
+    $clocksPowerStopRecord = Stop-ClocksPowerAll $clocksPowerGpuStart $clocksPowerCpuStart 5000
+    $clocksPowerStopped = (($clocksPowerStopRecord.gpu.stopped -or $clocksPowerStopRecord.gpu.why -ceq 'not-started') -and ($clocksPowerStopRecord.cpu.stopped -or $clocksPowerStopRecord.cpu.why -ceq 'not-started'))
+    try { $clocksPowerZoneAtStop = Get-UtilSampleHostZone } catch { }
+    Write-JobTrace "step clocks-power stop site=smoke-launch-done gpuStopped=$($clocksPowerStopRecord.gpu.stopped) gpuKilled=$($clocksPowerStopRecord.gpu.killed) cpuStopped=$($clocksPowerStopRecord.cpu.stopped) cpuKilled=$($clocksPowerStopRecord.cpu.killed)"
+} catch { Write-JobTrace "step clocks-power stop site=smoke-launch-done error=$([string]$_.CategoryInfo.Reason)" }
+'@ + "`n" + $cwClose + "`n"
+    $text = Edit-ClocksPowerText $text ($cwDoneLine + "`n") ($cwDoneLine + "`n" + $cwStop) 'stop the clocks/power samplers after the measured launch at'
+    $cwMetricsAnchor = '# A SUCCESS summary.json, which the failure paths above all write but the success path did not:'
+    $cwMetrics = $cwOpen + "`n" + @'
+try {
+    $clocksPowerWindow = Get-UtilSamplePlayWindow $rawLog
+    $clocksPowerStopGpu = $null; $clocksPowerStopCpu = $null
+    if ($null -ne $clocksPowerStopRecord) { $clocksPowerStopGpu = $clocksPowerStopRecord.gpu; $clocksPowerStopCpu = $clocksPowerStopRecord.cpu }
+    # both tools stamp host-local time: the rows are read in the zone they were stamped in (unchanged between the start and the stop), never the zone now
+    $clocksPowerZone = Resolve-UtilSampleCaptureZone $clocksPowerZoneAtStart $clocksPowerZoneAtStop
+    $clocksPowerTz = $(if ($null -ne $clocksPowerZone.zone) { $clocksPowerZone.zone } else { [TimeZoneInfo]::Utc })
+    $clocksPowerGpuParsed = ConvertFrom-ClocksPowerGpuCsv (Read-UtilSampleText $clocksPowerGpuStart.csvPath) $clocksPowerTz
+    $clocksPowerCpuParsed = ConvertFrom-ClocksPowerCpuCsv (Read-UtilSampleText $clocksPowerCpuCsv) $clocksPowerTz
+    if ($clocksPowerZone.why) { $clocksPowerGpuParsed.why = $clocksPowerZone.why; $clocksPowerCpuParsed.why = $clocksPowerZone.why }
+    $clocksPowerGpu = Get-ClocksPowerGpuSummary $clocksPowerGpuParsed $clocksPowerGpuStart $clocksPowerWindow $clocksPowerStopGpu
+    $clocksPowerCpu = Get-ClocksPowerCpuSummary $clocksPowerCpuParsed $clocksPowerCpuStart $clocksPowerWindow $clocksPowerStopCpu
+    $clocksPowerBlock = Get-ClocksPowerBlock $clocksPowerGpu $clocksPowerCpu $clocksPowerPlatform $clocksPowerWindow $clocksPowerWarmup $clocksPowerIntervalMs 'gpu-clocks.csv' 'cpu-clocks.csv'
+} catch { }
+if ($null -eq $clocksPowerBlock) { $clocksPowerBlock = Get-ClocksPowerBlock $null $null $clocksPowerPlatform $null $clocksPowerWarmup $clocksPowerIntervalMs 'gpu-clocks.csv' 'cpu-clocks.csv' }
+Publish-ClocksPowerFiles
+Write-JobTrace "step clocks-power summary status=$($clocksPowerBlock['status']) reason=$($clocksPowerBlock['reason']) gpuRows=$($clocksPowerBlock['gpu']['samples'])/$($clocksPowerBlock['gpu']['samplesTotal']) cpuRows=$($clocksPowerBlock['cpu']['samples'])/$($clocksPowerBlock['cpu']['samplesTotal'])"
+'@ + "`n" + $cwClose + "`n"
+    $text = Edit-ClocksPowerText $text $cwMetricsAnchor ($cwMetrics + $cwMetricsAnchor) 'compute the clocks/power block before the success summary at'
+    $cwMetricsAt = $text.IndexOf($cwMetricsAnchor, [StringComparison]::Ordinal)
+    $cwKeysAnchor = '    cpuFrames = $gpuSummary.cpuFrames' + $cwEol
+    $cwKeysAt = $text.IndexOf($cwKeysAnchor, $cwMetricsAt, [StringComparison]::Ordinal)
+    if ($cwKeysAt -lt 0) { throw 'DUAL_VENUE_CLOCKS_POWER_ANCHOR_MISSING the success summary has no cpuFrames line to put the clocks/power block after' }
+    $cwKeyLines = @("    $cwOpen", '    clocksPowerStatus = $clocksPowerBlock[''status'']', '    clocksPower = $clocksPowerBlock', "    $cwClose")
+    $text = $text.Substring(0, $cwKeysAt + $cwKeysAnchor.Length) + (($cwKeyLines -join $cwEol) + $cwEol) + $text.Substring($cwKeysAt + $cwKeysAnchor.Length)
+    $cwFinallyAnchor = "    if (`$OwnerClipDir) {`n        Close-AttrCudaOwnerFootageWorkspace -Handles `$ownerViewHandles -Views @(`$ownerViews)`n"
+    $cwFinally = "    $cwOpen`n" + @'
+    if (Test-Path -LiteralPath 'variable:clocksPowerStopped') {
+        try {
+            # a stop that left a sampler running (a Kill that threw) is retried here, up to twice, on every exit
+            for ($clocksPowerTry = 0; -not $clocksPowerStopped -and $clocksPowerTry -lt 2; $clocksPowerTry++) {
+                $clocksPowerStopRecord = Stop-ClocksPowerAll $clocksPowerGpuStart $clocksPowerCpuStart 5000 $clocksPowerStopRecord
+                $clocksPowerStopped = (($clocksPowerStopRecord.gpu.stopped -or $clocksPowerStopRecord.gpu.why -ceq 'not-started') -and ($clocksPowerStopRecord.cpu.stopped -or $clocksPowerStopRecord.cpu.why -ceq 'not-started'))
+                Write-JobTrace "step clocks-power stop site=finally try=$clocksPowerTry gpuStopped=$($clocksPowerStopRecord.gpu.stopped) cpuStopped=$($clocksPowerStopRecord.cpu.stopped)"
+            }
+            Publish-ClocksPowerFiles
+        } catch { Write-JobTrace "step clocks-power finally error=$([string]$_.CategoryInfo.Reason)" }
+    }
+'@ + "`n    $cwClose`n"
+    $text = Edit-ClocksPowerText $text $cwFinallyAnchor ($cwFinally + $cwFinallyAnchor) 'stop and publish the clocks/power samplers in the outer finally at'
+    # the worst stop path: region 2 (each side a kill and a 5 s wait) is 10 s, and the outer finally retries it twice more (20 s), plus the start's 1.2 s
+    # nvidia-smi argument-check wait and the Energy Meter counter listing: 45 s, as the util sampler budgets
+    $timeBudget['clocksPowerSec'] = 45
     $timeBudget['jobTimeoutSec'] = [int]($timeBudget.jobTimeoutSec + 45)
 }
 
