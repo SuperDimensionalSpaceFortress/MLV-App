@@ -66,6 +66,8 @@ int lj92_get_last_pred1_fast_path_active(void);
 int lj92_get_last_pred1_fast_path_measurement_requested(void);
 int lj92_get_last_pred1_fast_path_measurement_active(void);
 int lj92_get_last_pred1_fast_path_eligible(void);
+/* Largest SSSS (Huffman symbol value) in the table of the last lj92_decode on this thread; -1 before one. */
+int lj92_get_last_huff_max_ssss(void);
 int lj92_get_last_scan_component_count(void);
 int lj92_get_last_write_length(void);
 int lj92_get_last_expected_write_length(void);

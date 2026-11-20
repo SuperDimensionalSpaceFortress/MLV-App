@@ -72,6 +72,8 @@ static MLV_STAGE_THREAD_LOCAL int g_mlv_last_raw_uint16_lj92_skip_length = 0;
 static MLV_STAGE_THREAD_LOCAL int g_mlv_last_raw_uint16_lj92_linearize_active = 0;
 static MLV_STAGE_THREAD_LOCAL int g_mlv_last_raw_uint16_lj92_component_count = 0;
 static MLV_STAGE_THREAD_LOCAL int g_mlv_last_raw_uint16_lj92_predictor = -1;
+static MLV_STAGE_THREAD_LOCAL int g_mlv_last_raw_uint16_lj92_precision = 0;
+static MLV_STAGE_THREAD_LOCAL int g_mlv_last_raw_uint16_lj92_max_ssss = -1;
 static MLV_STAGE_THREAD_LOCAL double g_mlv_last_raw_uint16_lj92_pred6_total_ms = 0.0;
 static MLV_STAGE_THREAD_LOCAL double g_mlv_last_raw_uint16_lj92_pred6_bitstream_ms = 0.0;
 static MLV_STAGE_THREAD_LOCAL double g_mlv_last_raw_uint16_lj92_pred6_predictor_ms = 0.0;
@@ -177,6 +179,8 @@ static uint64_t file_get_pos(FILE *stream)
     X(int, g_mlv_last_raw_uint16_lj92_linearize_active, 0) \
     X(int, g_mlv_last_raw_uint16_lj92_component_count, 0) \
     X(int, g_mlv_last_raw_uint16_lj92_predictor, -1) \
+    X(int, g_mlv_last_raw_uint16_lj92_precision, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_max_ssss, -1) \
     X(double, g_mlv_last_raw_uint16_lj92_pred6_total_ms, 0.0) \
     X(double, g_mlv_last_raw_uint16_lj92_pred6_bitstream_ms, 0.0) \
     X(double, g_mlv_last_raw_uint16_lj92_pred6_predictor_ms, 0.0) \
@@ -3811,6 +3815,8 @@ static int getMlvRawFrameUint16Direct(mlvObject_t * video, uint64_t frameIndex, 
     g_mlv_last_raw_uint16_lj92_linearize_active = 0;
     g_mlv_last_raw_uint16_lj92_component_count = 0;
     g_mlv_last_raw_uint16_lj92_predictor = -1;
+    g_mlv_last_raw_uint16_lj92_precision = 0;
+    g_mlv_last_raw_uint16_lj92_max_ssss = -1;
     g_mlv_last_raw_uint16_lj92_pred6_total_ms = 0.0;
     g_mlv_last_raw_uint16_lj92_pred6_bitstream_ms = 0.0;
     g_mlv_last_raw_uint16_lj92_pred6_predictor_ms = 0.0;
@@ -4047,6 +4053,9 @@ static int getMlvRawFrameUint16Direct(mlvObject_t * video, uint64_t frameIndex, 
                     lj92_get_last_component_count();
                 g_mlv_last_raw_uint16_lj92_predictor =
                     lj92_get_last_predictor();
+                g_mlv_last_raw_uint16_lj92_precision = bitdepth; /* SOF3 precision, checked equal to the RAWI depth above */
+                g_mlv_last_raw_uint16_lj92_max_ssss =
+                    lj92_get_last_huff_max_ssss();
                 g_mlv_last_raw_uint16_lj92_pred6_total_ms =
                     lj92_get_last_pred6_total_ms();
                 g_mlv_last_raw_uint16_lj92_pred6_bitstream_ms =
@@ -4581,6 +4590,8 @@ int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * un
         g_mlv_last_raw_uint16_lj92_linearize_active = 0;
         g_mlv_last_raw_uint16_lj92_component_count = 0;
         g_mlv_last_raw_uint16_lj92_predictor = -1;
+        g_mlv_last_raw_uint16_lj92_precision = 0;
+        g_mlv_last_raw_uint16_lj92_max_ssss = -1;
         g_mlv_last_raw_uint16_lj92_pred6_total_ms = 0.0;
         g_mlv_last_raw_uint16_lj92_pred6_bitstream_ms = 0.0;
         g_mlv_last_raw_uint16_lj92_pred6_predictor_ms = 0.0;
@@ -9565,6 +9576,16 @@ int getMlvLastRawUint16Lj92ComponentCount(void)
 int getMlvLastRawUint16Lj92Predictor(void)
 {
     return g_mlv_last_raw_uint16_lj92_predictor;
+}
+
+int getMlvLastRawUint16Lj92Precision(void)
+{
+    return g_mlv_last_raw_uint16_lj92_precision;
+}
+
+int getMlvLastRawUint16Lj92MaxSsss(void)
+{
+    return g_mlv_last_raw_uint16_lj92_max_ssss;
 }
 
 double getMlvLastRawUint16Lj92Pred6TotalMilliseconds(void)

@@ -415,6 +415,8 @@ int getMlvLastRawUint16Lj92SkipLength(void);
 int getMlvLastRawUint16Lj92LinearizeActive(void);
 int getMlvLastRawUint16Lj92ComponentCount(void);
 int getMlvLastRawUint16Lj92Predictor(void);
+int getMlvLastRawUint16Lj92Precision(void);
+int getMlvLastRawUint16Lj92MaxSsss(void);
 double getMlvLastRawUint16Lj92Pred6TotalMilliseconds(void);
 double getMlvLastRawUint16Lj92Pred6BitstreamMilliseconds(void);
 double getMlvLastRawUint16Lj92Pred6PredictorMilliseconds(void);

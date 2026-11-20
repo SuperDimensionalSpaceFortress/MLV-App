@@ -57,6 +57,7 @@ static MLV_STAGE_THREAD_LOCAL int g_lj92_last_skip_length = 0;
 static MLV_STAGE_THREAD_LOCAL int g_lj92_last_linearize_active = 0;
 static MLV_STAGE_THREAD_LOCAL int g_lj92_last_component_count = 0;
 static MLV_STAGE_THREAD_LOCAL int g_lj92_last_predictor = -1;
+static MLV_STAGE_THREAD_LOCAL int g_lj92_last_huff_max_ssss = -1;
 static MLV_STAGE_THREAD_LOCAL double g_lj92_last_pred6_total_ms = 0.0;
 static MLV_STAGE_THREAD_LOCAL double g_lj92_last_pred6_bitstream_ms = 0.0;
 static MLV_STAGE_THREAD_LOCAL double g_lj92_last_pred6_predictor_ms = 0.0;
@@ -97,6 +98,7 @@ typedef struct _ljp {
 #else
     u32* hufflut;
     int huffbits;
+    int huffmaxssss; // Largest SSSS (symbol value) in the table
 #endif
     // Parse state
     int cnt;
@@ -339,6 +341,13 @@ static int parseHuff(ljp* self) {
      * from uninitialised memory; it can decode nothing, so it is refused. */
     if (maxbits == 0) return LJ92_ERROR_CORRUPT;
     self->huffbits = maxbits;
+    /* LJ92-PRED1-FAST-PATH-1 r3: the largest symbol value (SSSS) the table names, read back as telemetry. The symbols
+     * are inside the payload (checked above). */
+    int maxssss = 0;
+    for (int sym = 0; sym < symbols; sym++) {
+        if (huffvals[sym] > maxssss) maxssss = huffvals[sym];
+    }
+    self->huffmaxssss = maxssss;
     /* Now fill the lut */
     u32* hufflut = malloc((1<<maxbits) * sizeof(u32));
     if (hufflut == NULL) return LJ92_ERROR_NO_MEMORY;
@@ -621,6 +630,7 @@ static void lj92_reset_last_pred6_timing(void)
     g_lj92_last_linearize_active = 0;
     g_lj92_last_component_count = 0;
     g_lj92_last_predictor = -1;
+    g_lj92_last_huff_max_ssss = -1;
     g_lj92_last_pred6_total_ms = 0.0;
     g_lj92_last_pred6_bitstream_ms = 0.0;
     g_lj92_last_pred6_predictor_ms = 0.0;
@@ -1011,6 +1021,9 @@ static int parseScan(ljp* self) {
     g_lj92_last_linearize_active = self->linearize != NULL;
     g_lj92_last_component_count = self->components;
     g_lj92_last_predictor = pred;
+#ifndef SLOW_HUFF
+    g_lj92_last_huff_max_ssss = self->huffmaxssss;
+#endif
     if (pred<0 || pred>7) return ret;
     g_lj92_last_pred1_fast_path_eligible =
         lj92_can_use_pred1_fast_path(self,
@@ -1310,6 +1323,10 @@ int lj92_get_last_pred1_fast_path_measurement_requested(void) {
 
 int lj92_get_last_pred1_fast_path_measurement_active(void) {
     return g_lj92_last_pred1_fast_path_measurement_active;
+}
+
+int lj92_get_last_huff_max_ssss(void) {
+    return g_lj92_last_huff_max_ssss;
 }
 
 int lj92_get_last_pred1_fast_path_eligible(void) {

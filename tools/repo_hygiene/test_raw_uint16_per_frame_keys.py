@@ -22,6 +22,15 @@ PER_FRAME_KEYS = (
     "raw_uint16_frame_lj92_ms",
     "raw_uint16_inflight_wait_ms",
 )
+LAYOUT_KEYS = (
+    "raw_uint16_lj92_predictor",
+    "raw_uint16_lj92_precision",
+    "raw_uint16_lj92_max_ssss",
+    "raw_uint16_lj92_component_count",
+    "raw_uint16_lj92_scan_component_count",
+    "raw_uint16_lj92_pred1_fast_path_eligible",
+    "raw_uint16_lj92_pred1_fast_path_active",
+)
 
 
 def _statement_end(text: str, start: int) -> int:
@@ -71,6 +80,19 @@ class RawUint16PerFrameKeysTests(unittest.TestCase):
         for key in PER_FRAME_KEYS:
             self.assertIn(" " + key + "=%", definition)
             self.assertIn('"' + key + '"', definition, "value must come from the frame's timing map")
+
+    def test_shared_string_carries_the_lj92_layout_keys(self) -> None:
+        """LJ92-PRED1-FAST-PATH-1 r3: the layout of the decoded frame is read off the per-frame record, so a real
+        clip's predictor, precision, largest SSSS and component counts show without a separate probe."""
+        definition = self._shared_definition()
+        for key in LAYOUT_KEYS:
+            self.assertIn(" " + key + "=%", definition)
+            self.assertIn('"' + key + '"', definition, "value must come from the frame's timing map")
+
+    def test_render_thread_publishes_the_new_layout_keys(self) -> None:
+        render = (ROOT / "platform/qt/RenderFrameThread.cpp").read_text(encoding="utf-8")
+        for key in ("raw_uint16_lj92_precision", "raw_uint16_lj92_max_ssss"):
+            self.assertIn('QStringLiteral("' + key + '")', render)
 
     def test_gpu_frame_record_appends_the_keys(self) -> None:
         statement = _statement_containing(self.source, '"playback_smoke.gpu_frame ', "qInfo()")

@@ -6495,6 +6495,10 @@ void RenderFrameThread::drawFrame( int slotIndex,
         getMlvLastRawUint16Lj92ComponentCount();
     const int rawUint16Lj92Predictor =
         getMlvLastRawUint16Lj92Predictor();
+    const int rawUint16Lj92Precision =
+        getMlvLastRawUint16Lj92Precision();
+    const int rawUint16Lj92MaxSsss =
+        getMlvLastRawUint16Lj92MaxSsss();
     const double rawUint16Lj92Pred6TotalMs =
         getMlvLastRawUint16Lj92Pred6TotalMilliseconds();
     const double rawUint16Lj92Pred6BitstreamMs =
@@ -6739,6 +6743,10 @@ void RenderFrameThread::drawFrame( int slotIndex,
                                       rawUint16Lj92LinearizeActive != 0 );
     slot.stageTimingTelemetry.insert( QStringLiteral("raw_uint16_lj92_predictor"),
                                       rawUint16Lj92Predictor );
+    slot.stageTimingTelemetry.insert( QStringLiteral("raw_uint16_lj92_precision"),
+                                      rawUint16Lj92Precision );
+    slot.stageTimingTelemetry.insert( QStringLiteral("raw_uint16_lj92_max_ssss"),
+                                      rawUint16Lj92MaxSsss );
     slot.stageTimingTelemetry.insert( QStringLiteral("raw_uint16_lj92_pred6_total_ms"),
                                       rawUint16Lj92Pred6TotalMs );
     slot.stageTimingTelemetry.insert( QStringLiteral("raw_uint16_lj92_pred6_bitstream_ms"),
