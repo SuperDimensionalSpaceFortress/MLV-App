@@ -6257,7 +6257,15 @@ public:
             if (event->type() == QEvent::Wheel
                 && !fullscreen_bar::claims(input, bar->presenter().shown(), event->type(), button, buttons, part)) return false;
             switch (fullscreen_bar::onMouse(&input, event->type(), button, buttons, part)) {
-            case fullscreen_bar::Action::ExitFullscreen: ++exits; host.showNormal(); break;
+            case fullscreen_bar::Action::ExitFullscreen:
+                // As MainWindow::viewerIdleFullscreenChanged( false ): the idle clock leaves fullscreen, the bar hides
+                // and the drag ends (adversary r2 pass 2 A3, advisory).
+                ++exits;
+                idle.setFullscreen(false, clock.elapsed());
+                bar->setBarShown(false, clock.elapsed());
+                input.seekDrag = false;
+                host.showNormal();
+                break;
             case fullscreen_bar::Action::TogglePlay: ++plays; break;
             case fullscreen_bar::Action::Seek: lastSeek = fullscreen_bar::seekFrameAt(l, devicePos.x(), 600); break;
             default: break;
@@ -6290,7 +6298,9 @@ public:
         }
         if (idle.fullscreen() && viewer_idle::eventIsActivity(event, &lastGlobal, &haveLast)) {
             idle.noteActivity(clock.elapsed());
-            if (fullscreen_bar::activityShowsBar(event->type(), &sawMove, entryPos, QCursor::pos())) {
+            // The event's own position (eventIsActivity just stored it), as MainWindow::viewerIdleNoteEvent; not the
+            // cursor's now (adversary r2 pass 2 A2, advisory).
+            if (fullscreen_bar::activityShowsBar(event->type(), &sawMove, entryPos, lastGlobal.toPoint())) {
                 bar->setBarShown(true, clock.elapsed());
             }
         }
@@ -6354,15 +6364,15 @@ void GuiSmokeTest::fullscreenControlBar_moveShowsTheBarAndHiddenCostsNothing()
     QCOMPARE(f.bar->presenter().rasterCount(), 0);
     QCOMPARE(f.bar->presenter().uploadCount(), 0);
 
-    // A move still at the entry position (Windows synthesizes one) does not show it.
-    const QPoint centre = f.viewport->rect().center();
-    QCursor::setPos(f.entryPos);
-    sendBarMouse(f.viewport, QEvent::MouseMove, centre);
+    // A move still at the entry position (Windows synthesizes one) does not show it. Judged at the event's own
+    // position, as MainWindow does; the cursor's now is elsewhere.
+    const QPoint atEntry = f.viewport->mapFromGlobal(f.entryPos);
+    QCursor::setPos(f.entryPos + QPoint(40, 0));
+    sendBarMouse(f.viewport, QEvent::MouseMove, atEntry);
     QVERIFY(!f.bar->isVisible());
 
     // A real move shows it, at the bottom of the view, above the viewport.
-    QCursor::setPos(f.entryPos + QPoint(40, 0));
-    sendBarMouse(f.viewport, QEvent::MouseMove, centre + QPoint(40, 0));
+    sendBarMouse(f.viewport, QEvent::MouseMove, atEntry + QPoint(40, 0));
     QVERIFY(f.bar->isVisible());
     const fullscreen_bar::Layout l = f.bar->viewLayout();
     QCOMPARE(f.bar->geometry().bottom(), f.view->rect().bottom());
@@ -6393,7 +6403,7 @@ void GuiSmokeTest::fullscreenControlBar_doubleClickOnTheBarKeepsFullscreen()
     FullscreenBarFixture f;
     f.enterFullscreen();
     QCursor::setPos(f.entryPos + QPoint(40, 0));
-    sendBarMouse(f.viewport, QEvent::MouseMove, f.viewport->rect().center());
+    sendBarMouse(f.viewport, QEvent::MouseMove, f.viewport->mapFromGlobal(f.entryPos) + QPoint(40, 0));
     QVERIFY(f.bar->isVisible());
     const fullscreen_bar::Layout l = f.bar->viewLayout();
 
@@ -6420,15 +6430,20 @@ void GuiSmokeTest::fullscreenControlBar_exitClickLeavesFullscreen()
     FullscreenBarFixture f;
     f.enterFullscreen();
     QCursor::setPos(f.entryPos + QPoint(40, 0));
-    sendBarMouse(f.viewport, QEvent::MouseMove, f.viewport->rect().center());
+    sendBarMouse(f.viewport, QEvent::MouseMove, f.viewport->mapFromGlobal(f.entryPos) + QPoint(40, 0));
     QVERIFY(f.bar->isVisible());
     const fullscreen_bar::Layout l = f.bar->viewLayout();
     sendBarMouse(f.bar, QEvent::MouseButtonPress, f.onPart(l.exit));
     QCOMPARE(f.exits, 1);
     QTRY_VERIFY(!f.host.isFullScreen());
+    // Leaving fullscreen tears the bar down with the idle clock (adversary r2 pass 2 A3, advisory).
+    QVERIFY(!f.idle.fullscreen());
+    QVERIFY(!f.bar->presenter().shown());
+    QVERIFY(!f.bar->isVisible());
     sendBarMouse(f.bar, QEvent::MouseButtonRelease, f.onPart(l.exit));
     QCOMPARE(f.exits, 1);
     QCOMPARE(f.view->doubleClicks, 0);
+    QVERIFY(f.input.owned == Qt::NoButton);
 }
 
 // Adversary r1 pass 3 A2: after a device-pixel-ratio change the view saw no Resize for, the widget's geometry lags the
@@ -6440,7 +6455,7 @@ void GuiSmokeTest::fullscreenControlBar_clickHitsWhatIsPaintedWhenTheGeometryLag
     FullscreenBarFixture f;
     f.enterFullscreen();
     QCursor::setPos(f.entryPos + QPoint(40, 0));
-    sendBarMouse(f.viewport, QEvent::MouseMove, f.viewport->rect().center());
+    sendBarMouse(f.viewport, QEvent::MouseMove, f.viewport->mapFromGlobal(f.entryPos) + QPoint(40, 0));
     QVERIFY(f.bar->isVisible());
     const fullscreen_bar::Layout l = f.bar->viewLayout();
     const QRect current = f.bar->geometry();
@@ -6472,7 +6487,7 @@ void GuiSmokeTest::fullscreenControlBar_wheelDuringAForeignGestureReachesTheView
     FullscreenBarFixture f;
     f.enterFullscreen();
     QCursor::setPos(f.entryPos + QPoint(40, 0));
-    sendBarMouse(f.viewport, QEvent::MouseMove, f.viewport->rect().center());
+    sendBarMouse(f.viewport, QEvent::MouseMove, f.viewport->mapFromGlobal(f.entryPos) + QPoint(40, 0));
     QVERIFY(f.bar->isVisible());
     const fullscreen_bar::Layout l = f.bar->viewLayout();
     sendBarWheel(f.bar, f.onPart(l.timecode), Qt::NoButton);

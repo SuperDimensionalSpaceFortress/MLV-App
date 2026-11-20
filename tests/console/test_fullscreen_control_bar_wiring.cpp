@@ -222,10 +222,19 @@ TEST(FullscreenControlBarWiring, OneIdleClockNoSecondTimer)
     const QString rearm = timeout.mid(rearmAt, timeout.indexOf(QStringLiteral("break;"), rearmAt) - rearmAt);
     ASSERT_TRUE(rearm.contains(QStringLiteral("if( in.pointerMoved && !fullscreenBarShown() ) viewerIdleApplyShown( true, true );")));
     ASSERT_FALSE(rearm.contains(QStringLiteral("QCursor::pos()")));
-    // Adversary r1 pass 4 A3: a witnessed move counts as having left the entry position on every tick, whether or not
-    // the bar is shown (set before the tick is decided), so a later return to the entry position shows a hidden bar.
+    // Adversary r1 pass 4 A3: a sampled position change counts as having left the entry position on every tick,
+    // whether or not the bar is shown (set before the tick is decided), so a later return to the entry position shows
+    // a hidden bar. r2 pass 2 A1: latched from the sample ALONE, before the hook witness and the queue look, which also
+    // report a button or wheel (activity, not movement).
+    const int sampleAt = timeout.indexOf(QStringLiteral("in.pointerMoved = m_viewerIdlePointer.moved( QCursor::pos() );"));
     const int sawAt = timeout.indexOf(QStringLiteral("if( in.pointerMoved ) m_fullscreenBarSawMove = true;"));
-    ASSERT_TRUE(sawAt > timeout.indexOf(QStringLiteral("in.pointerMoved = m_viewerIdlePointer.moved( QCursor::pos() );")));
+    ASSERT_TRUE(sampleAt > 0);
+    ASSERT_TRUE(sawAt > sampleAt);
+    const QString between = timeout.mid(sampleAt, sawAt - sampleAt);
+    ASSERT_FALSE(between.contains(QStringLiteral("in.pointerMoved = true;")));
+    ASSERT_FALSE(between.contains(QStringLiteral("win_hook::")));
+    ASSERT_TRUE(sawAt < timeout.indexOf(QStringLiteral("if( viewer_idle::win_hook::witness().take() ) in.pointerMoved = true;")));
+    ASSERT_TRUE(sawAt < timeout.indexOf(QStringLiteral("if( viewer_idle::win_hook::lookAtQueue() ) in.pointerMoved = true;")));
     ASSERT_TRUE(sawAt < timeout.indexOf(QStringLiteral("switch( m_viewerIdle.onTimeout(")));
     ASSERT_EQ(1, int(source.count(QStringLiteral("m_fullscreenBarSawMove = true;"))));
     // A delivered move is judged at its own position, not the cursor's now (a deferred move delivered after the

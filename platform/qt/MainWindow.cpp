@@ -3803,6 +3803,10 @@ void MainWindow::viewerIdleTimeout( void )
     // An input-excluded wait runs this timer but delivers no mouse event: the OS pointer position is the witness. It
     // is a logical QPoint, so a held move of less than one logical pixel is not seen by it (r4 bound, PointerWatch).
     in.pointerMoved = m_viewerIdlePointer.moved( QCursor::pos() );
+    // A sampled change of the pointer's position is real movement, whichever tick it lands on and whether the bar is
+    // shown: it counts as having left the entry position (adversary r1 pass 4 A3). Only this sample: the hook witness
+    // and the queue look below also report a button or wheel, which is activity but not movement (r2 pass 2 A1).
+    if( in.pointerMoved ) m_fullscreenBarSawMove = true;
 #ifdef Q_OS_WIN
     // A move away and back between two ticks leaves the sampled position unchanged. Qt's excluded wait takes
     // the WM_MOUSEMOVE off this (GUI) thread's queue into its own deferred queue, so the queue status alone
@@ -3818,9 +3822,6 @@ void MainWindow::viewerIdleTimeout( void )
     // r6 pass 9 A1: no hook (SetWindowsHookExW failed) means no witness for deferred input: a gate, never hide.
     in.witnessMissing = !viewer_idle::win_hook::installed();
 #endif
-    // A witnessed move is real movement (seeded at entry; synthesized same-position moves told apart), whichever tick
-    // it lands on and whether the bar is shown: it counts as having left the entry position (adversary r1 pass 4 A3).
-    if( in.pointerMoved ) m_fullscreenBarSawMove = true;
     // r3 (adversary r1 pass 4 A1): off Windows the sample above is the only witness, so every rearm is capped at
     // one poll period. Bound (pass 5 A1): an away-and-back that lies entirely between two samples (a late tick
     // widens the gap) is seen only when the wait delivers its events; on Windows the hook sees it when it is taken.
