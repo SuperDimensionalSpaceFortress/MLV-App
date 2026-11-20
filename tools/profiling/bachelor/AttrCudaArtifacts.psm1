@@ -1903,6 +1903,43 @@ function Get-AttrCudaLegTimeBudget {
     }
 }
 
+function Get-AttrCudaLegHardLimitAllowanceMs {
+    <#
+    .SYNOPSIS
+    The -LegHardLimitAllowanceMs an owner-input leg forwards to run-release-gui-smoke.ps1 so the runner's leg-derived hard deadline keeps the size-derived
+    app read allowance Get-AttrCudaLegTimeBudget accepted the leg with. GENERATOR-side (not embedded in any job).
+    .DESCRIPTION
+    VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r8 (sol r6 B-04). The runner's hard limit is its own derived leg budget plus a setup/teardown allowance (its
+    default 120 s), capped by -ProcessTimeoutMs; the derived leg budget carries no time to LOAD an owner input, so a 24 GiB input accepted with a 1152 s
+    app read allowance was killed at 307 s. The allowance is the runner's own setup/teardown default plus the read allowance, held to the runner's
+    3 600 000 ms ceiling (its -LegHardLimitAllowanceMs range). A leg with no app read allowance (a fixture) returns 0: the runner keeps its own default.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][ValidateRange(0, 100000)][int]$AppReadAllowanceSec,
+        [ValidateRange(0, 3600000)][int64]$SetupTeardownAllowanceMs = 120000
+    )
+    if ($AppReadAllowanceSec -le 0) { return [int64]0 }
+    [int64][math]::Min(3600000, $SetupTeardownAllowanceMs + 1000 * [int64]$AppReadAllowanceSec)
+}
+
+function Get-AttrCudaLegHardLimitArgs {
+    <#
+    .SYNOPSIS
+    The text appended after -ProcessTimeoutMs in the job's runner command: ' -LegHardLimitAllowanceMs N' when the runner committed at -SourceCommit declares the
+    parameter and the leg has an app read allowance, else '' (a runner without the parameter would reject it and the leg would die at launch). GENERATOR-side.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][bool]$RunnerAcceptsAllowance,
+        [Parameter(Mandatory = $true)][ValidateRange(0, 100000)][int]$AppReadAllowanceSec
+    )
+    if (-not $RunnerAcceptsAllowance) { return '' }
+    $allowanceMs = Get-AttrCudaLegHardLimitAllowanceMs -AppReadAllowanceSec $AppReadAllowanceSec
+    if ($allowanceMs -le 0) { return '' }
+    " -LegHardLimitAllowanceMs $allowanceMs"
+}
+
 function Add-AttrCudaTraceLine {
     <#
     .SYNOPSIS
@@ -8213,6 +8250,8 @@ Export-ModuleMember -Function `
     Get-AttrCudaClosureDirectoryMismatch, `
     Assert-AttrCudaNonOverwritingFileSlot, `
     Get-AttrCudaLegTimeBudget, `
+    Get-AttrCudaLegHardLimitAllowanceMs, `
+    Get-AttrCudaLegHardLimitArgs, `
     Add-AttrCudaTraceLine, `
     Get-AttrCudaFileSha256Blocks, `
     Read-AttrCudaBase64Payload, `
