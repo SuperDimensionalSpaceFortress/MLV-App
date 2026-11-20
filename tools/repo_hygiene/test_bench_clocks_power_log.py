@@ -206,6 +206,37 @@ class ClocksPowerGeneratorTests(unittest.TestCase):
             self.assertIn("-OperationTimeoutSec", ln, f"a CIM query that can wait forever: {ln.strip()}")
         self.assertGreaterEqual(len(re.findall(r"Invoke-ClocksPowerBounded [\$']", body)), 2, "powercfg and the Energy Meter listing each go through it")
 
+    def test_r6_a1_the_job_takes_bracketed_captures_and_builds_the_check_from_them(self) -> None:
+        text = lf(self.job("cp-cuda"))
+        body = "\n".join(region_re(OPEN, CLOSE).findall(text))
+        self.assertEqual(len(re.findall(r"(?m)^function Get-ClocksPowerClockCapture\b", text)), 1)
+        self.assertEqual(len(re.findall(r"(?m)^function Get-ClocksPowerClockCheck\b", text)), 1)
+        self.assertEqual(len(re.findall(r"\$clocksPowerClk1 = Get-ClocksPowerClockCapture\b", body)), 1)
+        self.assertEqual(len(re.findall(r"\$clocksPowerClk2 = Get-ClocksPowerClockCapture\b", body)), 1)
+        self.assertEqual(len(re.findall(r"Get-ClocksPowerClockCheck \$clocksPowerClk1 \$clocksPowerClk2 ", body)), 1)
+        self.assertNotRegex(body, r"@\(\[DateTime\]::UtcNow\.Ticks, \[Diagnostics\.Stopwatch\]::GetTimestamp\(\)\)", "an unbracketed (wall, monotonic) pair: a deschedule between the two reads skews the capture")
+
+    def test_r6_a2_the_dgpu_pnp_read_is_bounded_on_the_clocks_path(self) -> None:
+        text = lf(self.job("cp-cuda"))
+        self.assertEqual(len(re.findall(r"(?m)^function Invoke-ClocksPowerDStateBounded\b", text)), 1)
+        m = re.search(r"(?ms)^function Start-ClocksPowerGpu\b.*?^}", text)
+        self.assertIsNotNone(m)
+        self.assertIn("Invoke-ClocksPowerDStateBounded", m.group(0), "Start-ClocksPowerGpu reads the D-state through the bounded call, never & $DState directly")
+
+    def test_r6_a3_the_files_are_published_before_the_block_names_them(self) -> None:
+        text = lf(self.job("cp-cuda"))
+        regions = [r for r in region_re(OPEN, CLOSE).findall(text) if "step clocks-power summary" in r]
+        self.assertEqual(len(regions), 1)
+        metrics = regions[0]
+        self.assertLess(metrics.index("Publish-ClocksPowerFiles"), metrics.index("Get-ClocksPowerBlock"), "publish first, then name what was published")
+        calls = [ln for ln in metrics.splitlines() if "= Get-ClocksPowerBlock" in ln]
+        self.assertEqual(len(calls), 2)
+        for ln in calls:
+            self.assertTrue(ln.rstrip().endswith("$clocksPowerGpuFile $clocksPowerCpuFile"), ln.strip())
+            self.assertNotIn("'gpu-clocks.csv'", ln)
+        self.assertIn("Get-ClocksPowerRawFileName $clocksPowerGpuPublished 'gpu-clocks.csv'", metrics)
+        self.assertIn("Get-ClocksPowerRawFileName $clocksPowerCpuPublished 'cpu-clocks.csv'", metrics)
+
     def test_c2_a_non_cuda_leg_keeps_the_wake_rule_and_a_cuda_leg_discloses_it(self) -> None:
         text = lf(self.job("cp-cpu"))
         self.assertIn("$clocksPowerBackend = 'cpu'", text)
@@ -629,6 +660,111 @@ class ClocksPowerBoundedCallTests(unittest.TestCase):
         self.assertEqual(self.r["listNone"], {"lines": 0, "why": None}, "no typeperf path: nothing to list, and the start has its own typed reason")
         self.assertEqual(self.r["listMissing"], {"lines": 0, "why": "energy-meter-enumeration-failed"})
         self.assertEqual(self.r["listOk"], {"hasLines": True, "why": None})
+
+
+# adversary 841c00e1 (pass 3; each finding is introduced, major):
+#   A1  the (wall, monotonic) capture pair was read as two separate statements, so a deschedule between them skews that capture and can cancel a persistent
+#       wall step: netStepMs came out 0 while the host clock had stepped -600 ms, and a row sampled after Play was counted in the Play window. Each capture is
+#       now BRACKETED (monotonic, wall, monotonic): its monotonic stamp is the midpoint and its width is the bracket; a width over 25 ms is no witness.
+#   A2  the dGPU PnP read (Get-PnpDevice / Get-PnpDeviceProperty) ran synchronously and unbounded inside the pre-launch reads, so the "50 s allowance" bounded
+#       nothing: it is now run in its own runspace and abandoned at 4 s (pnp-read-timeout), like every other pre-launch read.
+#   A3  the block named gpu-clocks.csv / cpu-clocks.csv as rawFile whether or not the copy happened (a Pub name that is an empty directory refuses the copy):
+#       the files are published BEFORE the block is built, and rawFile names a file only when its copy succeeded (UNAVAILABLE(not-published) otherwise).
+DRIVER_R6 = r"""
+function J($v) { $v | ConvertTo-Json -Depth 8 -Compress }
+function T($sb) { try { & $sb } catch { 'ERR: ' + $_.Exception.Message } }
+function St($o) { if ($o -is [string]) { $o } else { [string]$o.status } }
+$r = [ordered]@{}
+$utc = [TimeZoneInfo]::Utc
+$running = [ordered]@{ status = 'running'; reason = $null }
+# the adversary's rows: a 5 s interval, UTC stamps, the post-Play row at 21.700 carries a limit bit (mask 0x40)
+$t = ''
+foreach ($row in @(@('02.300', '0x0000000000000000'), @('06.700', '0x0000000000000000'), @('11.700', '0x0000000000000000'), @('16.700', '0x0000000000000000'), @('21.700', '0x0000000000000040'), @('26.700', '0x0000000000000000'))) {
+    $t += "2026/11/01 12:00:$($row[0]), 1500, 1500, 6000, 50.00, 80.00, 60, $($row[1])`n"
+}
+$parsed = ConvertFrom-ClocksPowerGpuCsv $t $utc
+$win = [ordered]@{ startUtc = [DateTime]::new(2026, 11, 1, 12, 0, 2, 0, [DateTimeKind]::Utc); endUtc = [DateTime]::new(2026, 11, 1, 12, 0, 22, 0, [DateTimeKind]::Utc); clockWhy = $null }
+$f = [int64]10000000
+$wall1 = [int64]639307512000000000
+# A1: the first capture's wall read came 600 ms after its monotonic read (a deschedule); the wall clock then stepped -600 ms and stayed there
+$descheduled = Get-ClocksPowerClockCheck @($wall1, [int64]6000000, 600.0) @([int64]639307512294000000, [int64]300000000, 0.0) 5000 $f
+$r['a1Descheduled'] = St (T { Get-ClocksPowerGpuSummary $parsed $running $win $null $descheduled })
+$r['a1DescheduledCheckNull'] = ($null -eq $descheduled)
+$stepped = Get-ClocksPowerClockCheck @($wall1, [int64]6000000, 0.0) @([int64]639307512288000000, [int64]300000000, 0.0) 5000 $f
+$r['a1TightStep'] = St (T { Get-ClocksPowerGpuSummary $parsed $running $win $null $stepped })
+$steady = Get-ClocksPowerClockCheck @($wall1, [int64]6000000, 5.0) @([int64]639307512294000000, [int64]300000000, 5.0) 5000 $f
+$r['a1TightSteady'] = St (T { Get-ClocksPowerGpuSummary $parsed $running $win $null $steady })
+$r['a1SteadyShape'] = @{ interval = $steady.intervalMs; net = $steady.netStepMs; width = $steady.captureWidthMs }
+$r['a1Wide25'] = ($null -ne (Get-ClocksPowerClockCheck @($wall1, [int64]6000000, 25.0) @([int64]639307512294000000, [int64]300000000, 25.0) 5000 $f))
+$r['a1Wide25p1'] = ($null -ne (Get-ClocksPowerClockCheck @($wall1, [int64]6000000, 25.1) @([int64]639307512294000000, [int64]300000000, 0.0) 5000 $f))
+$r['a1SecondWide'] = ($null -ne (Get-ClocksPowerClockCheck @($wall1, [int64]6000000, 0.0) @([int64]639307512294000000, [int64]300000000, 600.0) 5000 $f))
+$r['a1Missing'] = @(($null -eq (Get-ClocksPowerClockCheck $null $null 5000 $f)), ($null -eq (Get-ClocksPowerClockCheck @($wall1, [int64]6000000) @($wall1, [int64]6000000) 5000 $f)), ($null -eq (Get-ClocksPowerClockCheck @($wall1, [int64]6000000, 0.0) @($wall1, [int64]6000000, 0.0) 5000 0)))
+$s0 = [Diagnostics.Stopwatch]::GetTimestamp()
+$c = T { Get-ClocksPowerClockCapture }
+$s1 = [Diagnostics.Stopwatch]::GetTimestamp()
+$r['a1Capture'] = T { @{ n = @($c).Count; inBracket = ($c[1] -ge $s0 -and $c[1] -le $s1); wallNear = ([Math]::Abs([DateTime]::UtcNow.Ticks - [int64]$c[0]) -lt 100000000); width = ($c[2] -ge 0 -and $c[2] -lt 1000) } }
+# A2: a PnP read that returns after 20 s is abandoned at 4 s, and nvidia-smi is not started
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$slow = T { Start-ClocksPowerGpu 'cuda' '' (Join-Path $env:CP_TMP 'g-slow.csv') { Start-Sleep -Seconds 20; @{ state = 'D0'; reason = $null } } 1000 'clocks_throttle_reasons.active' }
+$r['a2Ms'] = $sw.ElapsedMilliseconds
+$r['a2Slow'] = T { @{ status = $slow.status; reason = $slow.reason; proc = ($null -eq $slow.proc) } }
+$absent = T { Start-ClocksPowerGpu 'cuda' '' (Join-Path $env:CP_TMP 'g-absent.csv') { @{ state = 'absent'; reason = 'no-dgpu' } } 1000 'clocks_throttle_reasons.active' }
+$r['a2Absent'] = T { @{ status = $absent.status; reason = $absent.reason } }
+$thrown = T { Start-ClocksPowerGpu 'cuda' '' (Join-Path $env:CP_TMP 'g-throw.csv') { throw 'pnp exploded' } 1000 'clocks_throttle_reasons.active' }
+$r['a2Thrown'] = T { @{ status = $thrown.status; reason = $thrown.reason } }
+$real = T { Invoke-ClocksPowerDStateBounded ${function:Get-UtilSampleDgpuState} 30000 }
+$r['a2Real'] = T { @{ hasState = ($real.ContainsKey('state')); hasReason = ($real.ContainsKey('reason')); notTimeout = ($real.reason -cne 'pnp-read-timeout') } }
+# A3: a file is named only when its copy succeeded
+$r['a3Names'] = @{ published = (Get-ClocksPowerRawFileName $true 'gpu-clocks.csv'); notPublished = (Get-ClocksPowerRawFileName $false 'gpu-clocks.csv') }
+$blk = Get-ClocksPowerBlock $null $null $null $null $false 1000 (Get-ClocksPowerRawFileName $false 'gpu-clocks.csv') (Get-ClocksPowerRawFileName $true 'cpu-clocks.csv')
+$r['a3Block'] = @{ gpu = $blk.gpu.rawFile; cpu = $blk.cpu.rawFile }
+J $r
+"""
+
+
+@requires_windows_pwsh
+class ClocksPowerPassThreeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="clocks-power-r6-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        script = Path(cls._tmp.name) / "driver.ps1"
+        script.write_text(LIFT + DRIVER_R6, encoding="utf-8")
+        proc = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_TMP": cls._tmp.name})
+        cls.raw = proc
+        cls.r = json.loads(proc.stdout.strip().splitlines()[-1]) if proc.returncode == 0 and proc.stdout.strip() else None
+
+    def setUp(self) -> None:
+        self.assertIsNotNone(self.r, f"the lifted helpers did not run: {self.raw.stdout[-3000:]}{self.raw.stderr[-3000:]}")
+
+    def test_a1_a_wide_capture_bracket_is_no_witness_so_a_descheduled_capture_cannot_hide_a_step(self) -> None:
+        self.assertTrue(self.r["a1DescheduledCheckNull"], "the adversary input: a 600 ms bracket on the first capture")
+        self.assertEqual(self.r["a1Descheduled"], "unavailable(sample-clock-unwitnessed)", "the post-Play 21.700 row (a limit bit) must not reach an ok Play union")
+        self.assertEqual(self.r["a1SecondWide"], False, "either capture")
+        self.assertEqual(self.r["a1Wide25"], True, "25 ms is the bound itself, the util sampler's step limit")
+        self.assertEqual(self.r["a1Wide25p1"], False)
+        self.assertEqual(self.r["a1Missing"], [True, True, True], "no capture, a capture with no width, a non-positive frequency: no check")
+
+    def test_a1_tight_brackets_still_see_a_step_and_a_steady_host_stays_ok(self) -> None:
+        self.assertEqual(self.r["a1TightStep"], "unavailable(sample-clock-unverified)", "a -600 ms step with tight captures is the net-step rule")
+        self.assertEqual(self.r["a1TightSteady"], "ok")
+        self.assertEqual(self.r["a1SteadyShape"], {"interval": 5000, "net": 0.0, "width": 5.0})
+
+    def test_a1_the_capture_is_bracketed_by_two_monotonic_reads(self) -> None:
+        self.assertEqual(self.r["a1Capture"], {"n": 3, "inBracket": True, "wallNear": True, "width": True})
+
+    def test_a2_a_pnp_read_that_never_returns_is_abandoned_and_typed(self) -> None:
+        self.assertEqual(self.r["a2Slow"], {"status": "unavailable", "reason": "pnp-read-timeout", "proc": True})
+        self.assertLess(self.r["a2Ms"], 12000, "a 20 s read bounded at 4 s returns in seconds, not at the read's pace")
+
+    def test_a2_a_quick_or_failing_pnp_read_keeps_its_own_result(self) -> None:
+        self.assertEqual(self.r["a2Absent"], {"status": "unavailable", "reason": "no-dgpu"})
+        self.assertEqual(self.r["a2Thrown"], {"status": "unavailable", "reason": "pnp-read-failed"})
+        self.assertEqual(self.r["a2Real"], {"hasState": True, "hasReason": True, "notTimeout": True})
+
+    def test_a3_rawfile_names_a_file_only_when_its_copy_succeeded(self) -> None:
+        self.assertEqual(self.r["a3Names"], {"published": "gpu-clocks.csv", "notPublished": "UNAVAILABLE(not-published)"})
+        self.assertEqual(self.r["a3Block"], {"gpu": "UNAVAILABLE(not-published)", "cpu": "cpu-clocks.csv"})
 
 
 @requires_windows_pwsh
