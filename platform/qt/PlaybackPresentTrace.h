@@ -70,7 +70,9 @@ struct Row
     int position = 0;             // timeline (slider) position at the present
     double presentMs = 0.0;       // the present was recorded (notePlaybackSmokePresentedFrame)
     double intervalMs = 0.0;      // since the previous present (0 for the first)
-    double readyMs = -1.0;        // the render thread emitted this frame ready
+    double readyMs = -1.0;        // the render thread emitted this frame ready (input: absolute ms, -1 = not known)
+    bool readyKnown = false;      // set by notePresent from the INPUT (an absolute stage-clock time is never negative); the
+                                  // rebased readyMs may be any value, -1.0 included, so the value cannot say it
     double uiLatencyMs = 0.0;     // ready emit -> drawFrameReady picked it up (GUI thread)
     double drawMs = 0.0;          // drawFrameReady total
     double renderMs = 0.0;        // render work
@@ -116,9 +118,9 @@ struct Row
     /*! True when the stamps that are known never run backwards along request .. present (1 = ordered). */
     bool stagesOrdered() const
     {
-        // readyMs alone uses -1 for unknown; every other stamp is unknown only at kUnknownMs, so a real rebased -1 ms stamp
-        // still takes part (adversary a7085920 A2)
-        const double ready = readyMs == -1.0 ? kUnknownMs : readyMs;
+        // Unknown is kUnknownMs for the stage stamps and the flag for ready: no value a real rebased stamp can take (-1.0
+        // included) means "unknown" (adversary a7085920 A2, sol r3 B1). A row that did not pass notePresent has no ready.
+        const double ready = readyKnown ? readyMs : kUnknownMs;
         const double chain[] = { reqMs, dqMs, dsMs, deMs, rsMs, reMs, rndMs, ready, drawBeginMs, presentMs };
         double last = kUnknownMs;
         for( double t : chain )
@@ -150,9 +152,13 @@ public:
         m_ring.assign( expectedRows > 0 ? expectedRows : 1, Row() );
         m_total = 0;
         m_pending = Row();
-        m_lastTickMs = -1.0;
-        m_lastPresentMs = -1.0;
-        m_lastPresentEndMs = -1.0;
+        // "have a previous ..." is a flag, never a value a real (possibly negative) rebased time could equal
+        m_haveTick = false;
+        m_havePresent = false;
+        m_havePresentEnd = false;
+        m_lastTickMs = 0.0;
+        m_lastPresentMs = 0.0;
+        m_lastPresentEndMs = 0.0;
     }
 
     void end() { m_active = false; }
@@ -162,9 +168,10 @@ public:
     {
         if( !active() ) return;
         const double t = nowMs - m_originMs;
-        const double since = m_lastTickMs >= 0.0 ? m_lastTickMs : m_lastPresentMs;
-        if( since >= 0.0 && t - since > m_pending.maxTickGapMs ) m_pending.maxTickGapMs = t - since;
+        const double since = m_haveTick ? m_lastTickMs : m_lastPresentMs;
+        if( ( m_haveTick || m_havePresent ) && t - since > m_pending.maxTickGapMs ) m_pending.maxTickGapMs = t - since;
         m_lastTickMs = t;
+        m_haveTick = true;
         ++m_pending.ticks;
         if( busy ) ++m_pending.busyTicks;
         if( predictive ) ++m_pending.predictiveTicks;
@@ -198,12 +205,13 @@ public:
     {
         if( !active() ) return;
         row.presentMs -= m_originMs;
-        if( row.readyMs >= 0.0 ) row.readyMs -= m_originMs;
+        row.readyKnown = row.readyMs >= 0.0;   // the input is an absolute time (never negative); -1 = not known
+        if( row.readyKnown ) row.readyMs -= m_originMs;
         for( double *stage : { &row.reqMs, &row.dqMs, &row.dsMs, &row.deMs, &row.rsMs, &row.reMs, &row.rndMs,
                                &row.drawBeginMs } )
             if( *stage > kUnknownMs / 2.0 ) *stage -= m_originMs;   // a stage may precede the Play's start: it stays negative
-        row.intervalMs = m_lastPresentMs >= 0.0 ? row.presentMs - m_lastPresentMs : 0.0;
-        row.prevEndMs = m_lastPresentEndMs;
+        row.intervalMs = m_havePresent ? row.presentMs - m_lastPresentMs : 0.0;
+        row.prevEndMs = m_havePresentEnd ? m_lastPresentEndMs : -1.0;   // the column's documented "none yet"
         row.ticks = m_pending.ticks;
         row.busyTicks = m_pending.busyTicks;
         row.predictiveTicks = m_pending.predictiveTicks;
@@ -218,7 +226,8 @@ public:
         ++m_total;
         m_pending = Row();
         m_lastPresentMs = row.presentMs;
-        m_lastTickMs = -1.0;
+        m_havePresent = true;
+        m_haveTick = false;
     }
 
     /*! The present's GUI work (presentPlaybackPreparedFrame) returned at \a nowMs. */
@@ -226,6 +235,7 @@ public:
     {
         if( !active() ) return;
         m_lastPresentEndMs = nowMs - m_originMs;
+        m_havePresentEnd = true;
     }
 
     /*! The rows kept (at most the ring's size), oldest first: row(0) is the present numbered firstIndex(). */
@@ -265,9 +275,12 @@ private:
     bool m_enabled = false;
     bool m_active = false;
     double m_originMs = 0.0;
-    double m_lastTickMs = -1.0;
-    double m_lastPresentMs = -1.0;
-    double m_lastPresentEndMs = -1.0;
+    bool m_haveTick = false;
+    bool m_havePresent = false;
+    bool m_havePresentEnd = false;
+    double m_lastTickMs = 0.0;
+    double m_lastPresentMs = 0.0;
+    double m_lastPresentEndMs = 0.0;
     Row m_pending;
     std::vector<Row> m_ring;   // fixed slots, sized once in begin()
     size_t m_total = 0;        // presents recorded; slot = m_total % m_ring.size()

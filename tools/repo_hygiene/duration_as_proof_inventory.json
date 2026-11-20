@@ -2095,42 +2095,22 @@
     },
     {
       "path": "platform/qt/PlaybackPresentTrace.h",
-      "anchor": "const double since = m_lastTickMs >= 0.0 ? m_lastTickMs : m_lastPresentMs ;",
-      "class": "value_fallback_select",
-      "clock": "qpc_stage_clock",
-      "justification": "PLAYBACK-STARTUP-CATCHUP-BURST-1 r7 opt-in present trace: -1 is the 'no tick yet since the last present' sentinel, so the tick-gap baseline falls back to the previous present's time. Picks which timestamp a diagnostic gap is measured from; never decides whether anything ran.",
-      "lines": [
-        82
-      ]
-    },
-    {
-      "path": "platform/qt/PlaybackPresentTrace.h",
       "anchor": "const auto ms = [ ] ( double seconds ) { return seconds > 0.0 ? seconds * 1000.0 : kUnknownMs ; } ;",
       "class": "value_fallback_select",
       "clock": "qpc_stage_clock",
       "justification": "PLAYBACK-TRACE-LOWOVERHEAD-1 present trace stage stamps: the parameter is an ABSOLUTE stage-clock timestamp (mlv_stage_timing_now seconds), not a duration, and 0 is the 'never stamped' sentinel; the lambda converts a stamped value to ms and keeps an unstamped one as the unknown marker. A data-validity filter on a diagnostic column; which frames exist and whether a stage ran is decided by the pipeline, never by this compare.",
       "lines": [
-        104
+        107
       ]
     },
     {
       "path": "platform/qt/PlaybackPresentTrace.h",
-      "anchor": "if ( row . readyMs >= 0.0 ) row . readyMs -= m_originMs ;",
+      "anchor": "row . readyKnown = row . readyMs >= 0.0 ;",
       "class": "value_fallback_select",
       "clock": "qpc_stage_clock",
-      "justification": "PLAYBACK-STARTUP-CATCHUP-BURST-1 r7 present trace: a ready time of -1 is the 'unknown' sentinel and is kept as -1 instead of being shifted to the Play origin. A data-validity filter on a diagnostic row, not a run-proof.",
+      "justification": "PLAYBACK-TRACE-LOWOVERHEAD-1 r4 present trace: the input readyMs is an ABSOLUTE stage-clock time (never negative) and -1 means 'not known'; the compare records that as the readyKnown flag, so the rebased value (which may be -1.0 or any negative) never has to double as the unknown marker. A data-validity filter on a diagnostic row, not a run-proof.",
       "lines": [
-        118
-      ]
-    },
-    {
-      "path": "platform/qt/PlaybackPresentTrace.h",
-      "anchor": "row . intervalMs = m_lastPresentMs >= 0.0 ? row . presentMs - m_lastPresentMs : 0.0 ;",
-      "class": "value_fallback_select",
-      "clock": "qpc_stage_clock",
-      "justification": "PLAYBACK-STARTUP-CATCHUP-BURST-1 r7 present trace: the first row of a Play has no previous present (sentinel -1), so its interval is reported as 0. Which rows exist is decided by the presents themselves; the compare only fills a diagnostic column.",
-      "lines": [
-        119
+        208
       ]
     },
     {

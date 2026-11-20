@@ -343,6 +343,69 @@ TEST(PlaybackPresentTraceStages, ARealMinusOneMsStampStillTakesPartInTheOrderChe
     ASSERT_TRUE(trace.row(1).stagesOrdered());
 }
 
+// r4 (sol r3 B1, HUB RULING 2026-11-20T16:00Z): "unknown" is never a value a real stamp can take. A known ready time that
+// rebases to exactly -1.0 ms is a stamp like any other and takes part in the order check.
+TEST(PlaybackPresentTraceStages, AKnownReadyTimeThatRebasesToMinusOneMsStillTakesPartInTheOrderCheck)
+{
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(1000.0, 4);
+    playback_present_trace::StageStamps s;
+    s.renderStartS = 0.9995;   // rnd = -0.5 ms
+    s.drawBeginS = 1.001;      // draw_begin = +1 ms
+    Row r;
+    r.setStages(s);
+    r.readyMs = 999.0;         // known, absolute: rebases to exactly -1.0 ms, BEFORE rnd
+    r.presentMs = 1002.0;
+    trace.notePresent(r);
+    ASSERT_NEAR(-1.0, trace.row(0).readyMs, 1e-9);
+    ASSERT_FALSE(trace.row(0).stagesOrdered());
+    const std::string line = Recorder::formatRow(0, trace.row(0));
+    ASSERT_TRUE(line.size() > 2 && line.compare(line.size() - 2, 2, ",0") == 0);   // stage_ok=0
+    // the same -1.0 ms ready stamp in order (rnd before it) is ordered, and an unknown ready is still skipped
+    Row ordered;
+    playback_present_trace::StageStamps s2;
+    s2.renderStartS = 0.998;   // rnd = -2.0 ms
+    s2.drawBeginS = 1.001;
+    ordered.setStages(s2);
+    ordered.readyMs = 999.0;
+    ordered.presentMs = 1002.0;
+    trace.notePresent(ordered);
+    ASSERT_TRUE(trace.row(1).stagesOrdered());
+    Row unknownReady;
+    unknownReady.setStages(s);
+    unknownReady.readyMs = -1.0;
+    unknownReady.presentMs = 1002.0;
+    trace.notePresent(unknownReady);
+    ASSERT_TRUE(trace.row(2).stagesOrdered());
+}
+
+// r4: the recorder's own "have a previous ..." state is a flag, not a value a real time can take. A tick and a present that
+// land exactly 1 ms before the Play's origin (-1.0) are real previous events.
+TEST(PlaybackPresentTraceStages, APreviousTickOrPresentAtMinusOneMsIsStillAPreviousEvent)
+{
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(1000.0, 8);
+    trace.noteTick(999.0, false, false);    // -1.0
+    trace.noteTick(1009.0, false, false);   // +9.0: the gap to the previous tick is 10 ms
+    Row first;
+    first.presentMs = 999.0;                // rebases to -1.0
+    trace.notePresent(first);
+    Row second;
+    second.presentMs = 1010.0;
+    trace.notePresent(second);
+    ASSERT_NEAR(10.0, trace.row(0).maxTickGapMs, 1e-9);
+    ASSERT_NEAR(11.0, trace.row(1).intervalMs, 1e-9);   // since the present at -1.0, not 0
+    // a present end at -1.0 is carried to the next row as a value
+    trace.begin(1000.0, 8);
+    trace.notePresentEnd(999.0);
+    Row third;
+    third.presentMs = 1010.0;
+    trace.notePresent(third);
+    ASSERT_NEAR(-1.0, trace.row(0).prevEndMs, 1e-9);
+}
+
 // r3 (adversary 81c5805c A1/A2, HUB RULING 2026-11-20T11:30Z): the LIGHT trace has no configure or H2D column, and no code
 // path derives a per-frame span from the backend's last-run preupload status. Pinned at the three places that did.
 TEST(PlaybackPresentTraceWiring, NoConfigureOrH2dSpanIsCapturedOrWrittenForTheLightTrace)
