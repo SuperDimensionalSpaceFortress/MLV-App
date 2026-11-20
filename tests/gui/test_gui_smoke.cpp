@@ -721,6 +721,8 @@ private slots:
     void fullscreenControlBar_moveShowsTheBarAndHiddenCostsNothing();
     void fullscreenControlBar_doubleClickOnTheBarKeepsFullscreen();
     void fullscreenControlBar_exitClickLeavesFullscreen();
+    void fullscreenControlBar_clickHitsWhatIsPaintedWhenTheGeometryLags();
+    void fullscreenControlBar_wheelDuringAForeignGestureReachesTheView();
     // PLAYER-DOUBLECLICK-FULLSCREEN-1
     void viewerDoubleClick_viewportTogglesOnceAndIsSwallowed();
     void viewerDoubleClick_glWindowTogglesOnce();
@@ -6212,8 +6214,15 @@ class FullscreenTogglingView : public QWidget
 {
 public:
     int doubleClicks = 0;
+    int wheels = 0;
 
 protected:
+    void wheelEvent(QWheelEvent *event) override
+    {
+        ++wheels;
+        event->accept();
+    }
+
     void mouseDoubleClickEvent(QMouseEvent *event) override
     {
         ++doubleClicks;
@@ -6239,14 +6248,21 @@ public:
         bar = new FullscreenControlBarWidget(view);
         bar->setInputHook([this](const fullscreen_bar::Layout &l, QEvent *event, const QPointF &devicePos) {
             const QMouseEvent *mouse = dynamic_cast<const QMouseEvent *>(event);
+            const QWheelEvent *wheel = dynamic_cast<const QWheelEvent *>(event);
             const Qt::MouseButton button = mouse ? mouse->button() : Qt::NoButton;
-            const Qt::MouseButtons buttons = mouse ? mouse->buttons() : Qt::MouseButtons(Qt::NoButton);
-            switch (fullscreen_bar::onMouse(&input, event->type(), button, buttons, fullscreen_bar::hitTest(l, devicePos))) {
+            const Qt::MouseButtons buttons = mouse ? mouse->buttons()
+                                           : wheel ? wheel->buttons() : Qt::MouseButtons(Qt::NoButton);
+            const fullscreen_bar::Part part = fullscreen_bar::hitTest(l, devicePos);
+            // As MainWindow::fullscreenBarInput: a wheel during a gesture begun elsewhere is not the bar's.
+            if (event->type() == QEvent::Wheel
+                && !fullscreen_bar::claims(input, bar->presenter().shown(), event->type(), button, buttons, part)) return false;
+            switch (fullscreen_bar::onMouse(&input, event->type(), button, buttons, part)) {
             case fullscreen_bar::Action::ExitFullscreen: ++exits; host.showNormal(); break;
             case fullscreen_bar::Action::TogglePlay: ++plays; break;
             case fullscreen_bar::Action::Seek: lastSeek = fullscreen_bar::seekFrameAt(l, devicePos.x(), 600); break;
             default: break;
             }
+            return true;
         });
         clock.start();
         qApp->installEventFilter(this);
@@ -6302,6 +6318,13 @@ void sendBarMouse(QWidget *target, QEvent::Type type, const QPoint &pos, Qt::Mou
     const Qt::MouseButtons buttons = (type == QEvent::MouseButtonRelease || type == QEvent::MouseMove)
         ? Qt::MouseButtons(Qt::NoButton) : Qt::MouseButtons(button);
     QMouseEvent event(type, QPointF(pos), global, type == QEvent::MouseMove ? Qt::NoButton : button, buttons, Qt::NoModifier);
+    QCoreApplication::sendEvent(target, &event);
+}
+
+void sendBarWheel(QWidget *target, const QPoint &pos, Qt::MouseButtons buttons)
+{
+    const QPointF global = target->mapToGlobal(QPointF(pos));
+    QWheelEvent event(QPointF(pos), global, QPoint(), QPoint(0, 120), buttons, Qt::NoModifier, Qt::NoScrollPhase, false);
     QCoreApplication::sendEvent(target, &event);
 }
 
@@ -6402,6 +6425,56 @@ void GuiSmokeTest::fullscreenControlBar_exitClickLeavesFullscreen()
     sendBarMouse(f.bar, QEvent::MouseButtonRelease, f.onPart(l.exit));
     QCOMPARE(f.exits, 1);
     QCOMPARE(f.view->doubleClicks, 0);
+}
+
+// Adversary r1 pass 3 A2: after a device-pixel-ratio change the view saw no Resize for, the widget's geometry lags the
+// layout it paints (2560x1440 at 1 -> 2: height 80/top 1360 kept, where 60/1380 is right), and a click on the painted
+// Play hit-tested None. Stand-in for the ratio change (the offscreen ratio is fixed at 1): the same layout with the
+// widget one bar height higher. A click maps through the painted layout, and a screen or ratio change re-follows.
+void GuiSmokeTest::fullscreenControlBar_clickHitsWhatIsPaintedWhenTheGeometryLags()
+{
+    FullscreenBarFixture f;
+    f.enterFullscreen();
+    QCursor::setPos(f.entryPos + QPoint(40, 0));
+    sendBarMouse(f.viewport, QEvent::MouseMove, f.viewport->rect().center());
+    QVERIFY(f.bar->isVisible());
+    const fullscreen_bar::Layout l = f.bar->viewLayout();
+    const QRect current = f.bar->geometry();
+    f.bar->setGeometry(current.translated(0, -current.height()));
+
+    // The pixmap sits at the widget's origin: a click on the painted Play plays.
+    const QPoint onPlay = l.play.center() - l.bar.topLeft();
+    sendBarMouse(f.bar, QEvent::MouseButtonPress, onPlay);
+    sendBarMouse(f.bar, QEvent::MouseButtonRelease, onPlay);
+    QCOMPARE(f.plays, 1);
+
+    // A move to another screen re-follows the view (every Qt), and a ratio change on the same screen (Qt 6.6+).
+    QEvent screenChange(QEvent::ScreenChangeInternal);
+    QCoreApplication::sendEvent(f.view, &screenChange);
+    QCOMPARE(f.bar->geometry(), current);
+#if QT_VERSION >= QT_VERSION_CHECK(6, 6, 0)
+    f.bar->setGeometry(current.translated(0, -current.height()));
+    QEvent ratioChange(QEvent::DevicePixelRatioChange);
+    QCoreApplication::sendEvent(f.view, &ratioChange);
+    QCOMPARE(f.bar->geometry(), current);
+#endif
+}
+
+// Adversary r1 pass 3 A3, the CPU sibling: the widget gets a wheel by position even while a gesture begun on the
+// viewer holds a button (Qt grabs only mouse events). That wheel is the gesture's and reaches the view; with no
+// foreign button held the bar keeps it (the viewer never zooms under the bar).
+void GuiSmokeTest::fullscreenControlBar_wheelDuringAForeignGestureReachesTheView()
+{
+    FullscreenBarFixture f;
+    f.enterFullscreen();
+    QCursor::setPos(f.entryPos + QPoint(40, 0));
+    sendBarMouse(f.viewport, QEvent::MouseMove, f.viewport->rect().center());
+    QVERIFY(f.bar->isVisible());
+    const fullscreen_bar::Layout l = f.bar->viewLayout();
+    sendBarWheel(f.bar, f.onPart(l.timecode), Qt::NoButton);
+    QCOMPARE(f.view->wheels, 0);
+    sendBarWheel(f.bar, f.onPart(l.timecode), Qt::RightButton);
+    QCOMPARE(f.view->wheels, 1);
 }
 
 int main(int argc, char ** argv)

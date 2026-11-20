@@ -6,9 +6,11 @@
  * The CPU bar is a child of the QGraphicsView itself, never of its viewport: GraphicsZoomView::scrollContentsBy
  * scrolls viewport children. It is opaque (WA_OpaquePaintEvent, WA_NoSystemBackground) and paints one cached
  * QPixmap, so its repaint never makes the viewport repaint under it (a partial GraphicsZoomView::paintEvent would
- * credit a pending frame). It takes every mouse press, release, double-click, move and wheel
- * (WA_NoMousePropagation), so a double-click on it never reaches the viewer's fullscreen toggle. Hidden is hide():
- * no paint at all. No Q_OBJECT (no moc).
+ * credit a pending frame). It takes every mouse press, release, double-click and move (WA_NoMousePropagation), so a
+ * double-click on it never reaches the viewer's fullscreen toggle, and every wheel except one during a gesture begun
+ * elsewhere, which it hands to the viewport. Its geometry follows the view on a resize and on a device-pixel-ratio
+ * or screen change, and a position on it maps to the viewer through the layout it paints. Hidden is hide(): no paint
+ * at all. No Q_OBJECT (no moc).
  */
 
 #ifndef FULLSCREENCONTROLBAR_H
@@ -35,8 +37,10 @@ QColor fullscreenControlBarPlayheadColor( void );
 class FullscreenControlBarWidget : public QWidget
 {
 public:
-    /*! \brief A mouse event on the bar, with the layout and the device-pixel position on the whole viewer. */
-    using InputHook = std::function<void( const fullscreen_bar::Layout &layout, QEvent *event, const QPointF &devicePos )>;
+    /*! \brief A mouse event on the bar, with the layout and the device-pixel position on the whole viewer. Returns
+     *         whether the bar takes it. A wheel it does not take (a button pressed elsewhere is held) is handed to the
+     *         view's viewport, as it would reach it with no bar; every other event stays the bar's. */
+    using InputHook = std::function<bool( const fullscreen_bar::Layout &layout, QEvent *event, const QPointF &devicePos )>;
 
     explicit FullscreenControlBarWidget( QWidget *view );
 
@@ -64,7 +68,8 @@ protected:
 
 private:
     void followView( void );
-    void route( QEvent *event, const QPointF &localPos );
+    bool route( QEvent *event, const QPointF &localPos );
+    void forwardWheelToView( QWheelEvent *event );
 
     QWidget *m_view;
     fullscreen_bar::Presenter m_presenter;

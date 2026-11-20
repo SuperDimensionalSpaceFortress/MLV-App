@@ -257,22 +257,22 @@ TEST(FullscreenControlBarPolicy, HitTestClaimsDoubleClickInsideBar)
     // it, and never while hidden.
     fullscreen_bar::InputState s;
     const fullscreen_bar::Part inside = fullscreen_bar::hitTest(l, onTimecode);
-    ASSERT_TRUE(fullscreen_bar::claims(s, true, QEvent::MouseButtonDblClick, Qt::LeftButton, inside));
-    ASSERT_TRUE(fullscreen_bar::claims(s, true, QEvent::MouseButtonDblClick, Qt::LeftButton, fullscreen_bar::Part::Exit));
-    ASSERT_FALSE(fullscreen_bar::claims(s, true, QEvent::MouseButtonDblClick, Qt::LeftButton, fullscreen_bar::hitTest(l, above)));
-    ASSERT_FALSE(fullscreen_bar::claims(s, false, QEvent::MouseButtonDblClick, Qt::LeftButton, inside));
-    ASSERT_TRUE(fullscreen_bar::claims(s, true, QEvent::Wheel, Qt::NoButton, inside));
-    ASSERT_TRUE(fullscreen_bar::claims(s, true, QEvent::MouseMove, Qt::NoButton, inside));
+    ASSERT_TRUE(fullscreen_bar::claims(s, true, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::LeftButton, inside));
+    ASSERT_TRUE(fullscreen_bar::claims(s, true, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::LeftButton, fullscreen_bar::Part::Exit));
+    ASSERT_FALSE(fullscreen_bar::claims(s, true, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::LeftButton, fullscreen_bar::hitTest(l, above)));
+    ASSERT_FALSE(fullscreen_bar::claims(s, false, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::LeftButton, inside));
+    ASSERT_TRUE(fullscreen_bar::claims(s, true, QEvent::Wheel, Qt::NoButton, Qt::NoButton, inside));
+    ASSERT_TRUE(fullscreen_bar::claims(s, true, QEvent::MouseMove, Qt::NoButton, Qt::NoButton, inside));
     // A viewer drag crossing the bar keeps its moves and its release.
-    ASSERT_FALSE(fullscreen_bar::claims(s, true, QEvent::MouseMove, Qt::LeftButton, inside));
-    ASSERT_FALSE(fullscreen_bar::claims(s, true, QEvent::MouseButtonRelease, Qt::NoButton, inside));
+    ASSERT_FALSE(fullscreen_bar::claims(s, true, QEvent::MouseMove, Qt::NoButton, Qt::LeftButton, inside));
+    ASSERT_FALSE(fullscreen_bar::claims(s, true, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoButton, inside));
 
     // A double-click on Exit exits once (the first press already did; Qt sends the second press as the double-click).
     ASSERT_EQ(int(fullscreen_bar::Action::ExitFullscreen),
               int(fullscreen_bar::onMouse(&s, QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton, fullscreen_bar::Part::Exit)));
     ASSERT_TRUE(s.owned != Qt::NoButton);
     // Its release is the bar's wherever it lands.
-    ASSERT_TRUE(fullscreen_bar::claims(s, false, QEvent::MouseButtonRelease, Qt::NoButton, fullscreen_bar::Part::None));
+    ASSERT_TRUE(fullscreen_bar::claims(s, false, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoButton, fullscreen_bar::Part::None));
     ASSERT_EQ(int(fullscreen_bar::Action::None),
               int(fullscreen_bar::onMouse(&s, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoButton, fullscreen_bar::Part::None)));
     ASSERT_FALSE(s.owned != Qt::NoButton);
@@ -288,7 +288,7 @@ TEST(FullscreenControlBarPolicy, HitTestClaimsDoubleClickInsideBar)
     ASSERT_EQ(int(fullscreen_bar::Action::Seek),
               int(fullscreen_bar::onMouse(&s, QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton, fullscreen_bar::Part::Seek)));
     ASSERT_TRUE(s.seekDrag);
-    ASSERT_TRUE(fullscreen_bar::claims(s, true, QEvent::MouseMove, Qt::LeftButton, fullscreen_bar::Part::None));
+    ASSERT_TRUE(fullscreen_bar::claims(s, true, QEvent::MouseMove, Qt::NoButton, Qt::LeftButton, fullscreen_bar::Part::None));
     ASSERT_EQ(int(fullscreen_bar::Action::Seek),
               int(fullscreen_bar::onMouse(&s, QEvent::MouseMove, Qt::NoButton, Qt::LeftButton, fullscreen_bar::Part::None)));
     fullscreen_bar::onMouse(&s, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoButton, fullscreen_bar::Part::None);
@@ -430,11 +430,69 @@ TEST(FullscreenControlBarPolicy, ForeignButtonGestureKeepsItsRelease)
     ASSERT_FALSE(fullscreen_bar::route(&s, true, QEvent::MouseButtonPress, Qt::RightButton, both, fullscreen_bar::Part::None, &a));
     ASSERT_TRUE(s.owned == Qt::MouseButtons(Qt::LeftButton));
     // Right released, Left still held: the viewer's. Left released, Right still held: the bar's.
-    ASSERT_FALSE(fullscreen_bar::claims(s, true, QEvent::MouseButtonRelease, Qt::LeftButton, fullscreen_bar::Part::None));
-    ASSERT_TRUE(fullscreen_bar::claims(s, true, QEvent::MouseButtonRelease, Qt::RightButton, fullscreen_bar::Part::None));
+    ASSERT_FALSE(fullscreen_bar::claims(s, true, QEvent::MouseButtonRelease, Qt::RightButton, Qt::LeftButton, fullscreen_bar::Part::None));
+    ASSERT_TRUE(fullscreen_bar::claims(s, true, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::RightButton, fullscreen_bar::Part::None));
     ASSERT_FALSE(fullscreen_bar::route(&s, true, QEvent::MouseButtonRelease, Qt::RightButton, Qt::LeftButton, fullscreen_bar::Part::None, &a));
     ASSERT_TRUE(fullscreen_bar::route(&s, true, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoButton, fullscreen_bar::Part::Play, &a));
     ASSERT_TRUE(s.owned == Qt::NoButton);
+}
+
+// Adversary r1 pass 3 A3 (route only, so it builds against 3b6f3c16 for the RED proof). Shape 1: the bar took a left
+// press on Play; the viewer took a right press; both held, the pointer moves over Play; the left release is lost (the
+// grab broke) with no move after it; then a left press on Play arrives with Left|Right held and the stale Left still
+// owned. The right gesture is the viewer's, so that press is too: no TogglePlay, and the stale Left is settled.
+// Shape 2: a wheel on the shown bar while a button the bar did not take is held belongs to that gesture.
+TEST(FullscreenControlBarPolicy, StaleOwnershipNeverClaimsDuringAForeignGesture)
+{
+    fullscreen_bar::InputState s;
+    fullscreen_bar::Action a = fullscreen_bar::Action::None;
+    const Qt::MouseButtons both = Qt::LeftButton | Qt::RightButton;
+    ASSERT_TRUE(fullscreen_bar::route(&s, true, QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton, fullscreen_bar::Part::Play, &a));
+    ASSERT_EQ(int(fullscreen_bar::Action::TogglePlay), int(a));
+    ASSERT_FALSE(fullscreen_bar::route(&s, true, QEvent::MouseButtonPress, Qt::RightButton, both, fullscreen_bar::Part::None, &a));
+    ASSERT_FALSE(fullscreen_bar::route(&s, true, QEvent::MouseMove, Qt::NoButton, both, fullscreen_bar::Part::Play, &a));
+    // (The left release is lost here.) The re-press of Left with Right held:
+    ASSERT_FALSE(fullscreen_bar::route(&s, true, QEvent::MouseButtonPress, Qt::LeftButton, both, fullscreen_bar::Part::Play, &a));
+    ASSERT_EQ(int(fullscreen_bar::Action::None), int(a));
+    ASSERT_TRUE(s.owned == Qt::NoButton);
+    // The same with a double-click in place of the re-press.
+    fullscreen_bar::InputState d;
+    ASSERT_TRUE(fullscreen_bar::route(&d, true, QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton, fullscreen_bar::Part::Next, &a));
+    ASSERT_FALSE(fullscreen_bar::route(&d, true, QEvent::MouseButtonPress, Qt::RightButton, both, fullscreen_bar::Part::None, &a));
+    ASSERT_FALSE(fullscreen_bar::route(&d, true, QEvent::MouseButtonDblClick, Qt::LeftButton, both, fullscreen_bar::Part::Next, &a));
+    ASSERT_EQ(int(fullscreen_bar::Action::None), int(a));
+    ASSERT_TRUE(d.owned == Qt::NoButton);
+    // Every other held button the bar's own: still taken (the bar took Right on Play, then Left on Play).
+    fullscreen_bar::InputState o;
+    ASSERT_TRUE(fullscreen_bar::route(&o, true, QEvent::MouseButtonPress, Qt::RightButton, Qt::RightButton, fullscreen_bar::Part::Play, &a));
+    ASSERT_TRUE(fullscreen_bar::route(&o, true, QEvent::MouseButtonPress, Qt::LeftButton, both, fullscreen_bar::Part::Play, &a));
+    ASSERT_EQ(int(fullscreen_bar::Action::TogglePlay), int(a));
+    // A stale owned Left re-pressed alone (its release lost, nothing else held) is the bar's again on its own merits.
+    ASSERT_TRUE(fullscreen_bar::route(&o, true, QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton, fullscreen_bar::Part::Play, &a));
+    ASSERT_EQ(int(fullscreen_bar::Action::TogglePlay), int(a));
+
+    // Shape 2: a wheel inside the shown bar with a foreign Right held is the viewer's; with nothing held, or only a
+    // button the bar took, it is the bar's.
+    fullscreen_bar::InputState w;
+    ASSERT_FALSE(fullscreen_bar::route(&w, true, QEvent::Wheel, Qt::NoButton, Qt::RightButton, fullscreen_bar::Part::Play, &a));
+    ASSERT_FALSE(fullscreen_bar::route(&w, true, QEvent::Wheel, Qt::NoButton, both, fullscreen_bar::Part::Timecode, &a));
+    ASSERT_TRUE(fullscreen_bar::route(&w, true, QEvent::Wheel, Qt::NoButton, Qt::NoButton, fullscreen_bar::Part::Play, &a));
+    ASSERT_TRUE(fullscreen_bar::route(&w, true, QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton, fullscreen_bar::Part::Seek, &a));
+    ASSERT_TRUE(fullscreen_bar::route(&w, true, QEvent::Wheel, Qt::NoButton, Qt::LeftButton, fullscreen_bar::Part::Seek, &a));
+    ASSERT_EQ(int(fullscreen_bar::Action::None), int(a));
+}
+
+// Adversary r1 pass 3 A4 (advisory): buttons are the bar's height tall, and square only on a surface at least 4x the
+// bar height wide; narrower, each is a quarter of the surface wide.
+TEST(FullscreenControlBarPolicy, ButtonsAreSquareOnlyOnASurfaceFourBarHeightsWide)
+{
+    const fullscreen_bar::Layout wide = fullscreen_bar::layoutFor(QSize(1920, 1080));
+    ASSERT_EQ(60, wide.bar.height());
+    for (const QRect &b : { wide.play, wide.prev, wide.next, wide.exit }) ASSERT_TRUE(b.size() == QSize(60, 60));
+    const fullscreen_bar::Layout exact = fullscreen_bar::layoutFor(QSize(240, 1080));
+    ASSERT_TRUE(exact.play.size() == QSize(60, 60));
+    const fullscreen_bar::Layout narrow = fullscreen_bar::layoutFor(QSize(200, 1080));
+    for (const QRect &b : { narrow.play, narrow.prev, narrow.next, narrow.exit }) ASSERT_TRUE(b.size() == QSize(50, 60));
 }
 
 // Adversary r1 pass 1 A3: a seek column narrower than the marker (a tall narrow surface) and a surface shorter than

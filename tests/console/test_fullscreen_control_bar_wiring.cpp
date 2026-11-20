@@ -139,12 +139,16 @@ TEST(FullscreenControlBarWiring, PaintGlDrawsTheBarAfterTheLookLabelAndTeardownD
     const QString draw = functionBodyToBrace(source, QStringLiteral("void GpuDisplayWindow::drawControlBar(int fbw, int fbh)"));
     ASSERT_FALSE(draw.isEmpty());
     ASSERT_TRUE(firstStatement(draw) == QStringLiteral("if ( !m_controlBar.shown() ) return;"));
-    // While playing no update() is asked for a bar change.
+    // Adversary r1 pass 3 A1: a change of the bar's SHOWN state asks for one paint even while playing (a hide must not
+    // wait for the next frame, and a show and hide between two paints must be seen); a feed-only change (position,
+    // timecode) while playing asks for none: the next frame's paint draws it.
     const QString state = functionBodyToBrace(source,
         QStringLiteral("bool GpuDisplayWindow::setControlBarStateIfActive(bool shown, const fullscreen_bar::Feed &feed, qint64 nowMs)"));
     ASSERT_FALSE(state.isEmpty());
     ASSERT_EQ(1, int(state.count(QStringLiteral("update()"))));
-    ASSERT_TRUE(state.contains(QStringLiteral("&& !feed.playing ) win->update();")));
+    ASSERT_EQ(1, int(state.count(QStringLiteral("if ( changedShown || ( changedFeed && !feed.playing ) ) win->update();"))));
+    ASSERT_TRUE(state.contains(QStringLiteral("const bool changedShown = shown ? win->m_controlBar.show(nowMs) : win->m_controlBar.hide(nowMs);")));
+    ASSERT_TRUE(state.contains(QStringLiteral("const bool changedFeed = win->m_controlBar.noteFeed(feed);")));
 
     // The spec named it releaseGlResources; in this file the context teardown is cleanupGLResources.
     const QString cleanup = functionBodyToBrace(source, QStringLiteral("void GpuDisplayWindow::cleanupGLResources()"));
@@ -279,6 +283,38 @@ TEST(FullscreenControlBarWiring, CpuBarIsAnOpaqueChildOfTheViewNotItsViewport)
         "if( !m_pixmap.isNull() && !qFuzzyCompare( m_pixmap.devicePixelRatio(), dpr ) ) m_presenter.dropRaster();"));
     ASSERT_TRUE(dropAt > 0);
     ASSERT_TRUE(dropAt < paint.indexOf(QStringLiteral("m_presenter.rasterFor( l.bar.size() );")));
+
+    // Adversary r1 pass 3 A2: a ratio or screen change the view saw no Resize for re-follows the view, and a position
+    // on the widget maps to the viewer through the painted layout (pixmap at the widget's origin), never through pos().
+    const QString changes = functionBodyToBrace(widget, QStringLiteral("bool viewGeometryChanges( QEvent::Type type )"));
+    ASSERT_FALSE(changes.isEmpty());
+    ASSERT_TRUE(changes.contains(QStringLiteral("case QEvent::Resize:")));
+    ASSERT_TRUE(changes.contains(QStringLiteral("case QEvent::ScreenChangeInternal:")));
+    ASSERT_TRUE(changes.contains(QStringLiteral(
+        "#if QT_VERSION >= QT_VERSION_CHECK(6, 6, 0)\n    case QEvent::DevicePixelRatioChange:\n#endif")));
+    const QString filter = functionBodyToBrace(widget, QStringLiteral("bool FullscreenControlBarWidget::eventFilter( QObject *watched, QEvent *event )"));
+    ASSERT_TRUE(filter.contains(QStringLiteral("if( watched == m_view && m_presenter.shown() && viewGeometryChanges( event->type() ) )")));
+    ASSERT_TRUE(filter.contains(QStringLiteral("followView();")));
+    const QString route = functionBodyToBrace(widget, QStringLiteral("bool FullscreenControlBarWidget::route( QEvent *event, const QPointF &localPos )"));
+    ASSERT_TRUE(route.contains(QStringLiteral("return m_input( l, event, QPointF( l.bar.topLeft() ) + localPos * dpr );")));
+    ASSERT_FALSE(route.contains(QStringLiteral("pos()")));
+
+    // Adversary r1 pass 3 A3, CPU sibling: a wheel the bar does not take (a gesture begun elsewhere is held) goes back
+    // to the viewport; MainWindow decides it with the GL path's claim.
+    const QString wheel = functionBodyToBrace(widget, QStringLiteral("void FullscreenControlBarWidget::wheelEvent( QWheelEvent *event )"));
+    ASSERT_TRUE(wheel.contains(QStringLiteral("if( !route( event, localPosOf( event ) ) ) forwardWheelToView( event );")));
+    const QString forward = functionBodyToBrace(widget, QStringLiteral("void FullscreenControlBarWidget::forwardWheelToView( QWheelEvent *event )"));
+    ASSERT_TRUE(forward.contains(QStringLiteral("target = area->viewport();")));
+    ASSERT_TRUE(forward.contains(QStringLiteral("QCoreApplication::sendEvent( target, &copy );")));
+    ASSERT_EQ(1, int(source.count(QStringLiteral("{ return fullscreenBarInput( layout, event, devicePos, true ); } );"))));
+    const QString input = functionBodyToBrace(source,
+        QStringLiteral("bool MainWindow::fullscreenBarInput( const fullscreen_bar::Layout &layout, QEvent *event, const QPointF &devicePos, bool fromWidget )"));
+    const int gateAt = input.indexOf(QStringLiteral(
+        "&& !fullscreen_bar::claims( m_fullscreenBarInput, fullscreenBarShown(), event->type(), button, buttons, part ) ) return false;"));
+    const int wheelIfAt = input.indexOf(QStringLiteral("if( fromWidget && event->type() == QEvent::Wheel"));
+    ASSERT_TRUE(wheelIfAt > 0);
+    ASSERT_TRUE(gateAt > wheelIfAt);
+    ASSERT_TRUE(gateAt < input.indexOf(QStringLiteral("if( fromWidget ) action = fullscreen_bar::onMouse(")));
 }
 
 // C6: the functions open PR #834 (and #857) own carry no bar code.

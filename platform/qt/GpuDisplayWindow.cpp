@@ -2745,8 +2745,10 @@ bool GpuDisplayWindow::setControlBarStateIfActive(bool shown, const fullscreen_b
     if ( !win || QThread::currentThread() != win->thread() ) return false;
     const bool changedShown = shown ? win->m_controlBar.show(nowMs) : win->m_controlBar.hide(nowMs);
     const bool changedFeed = win->m_controlBar.noteFeed(feed);   // a no-op while hidden
-    // While playing the next frame's paint draws the change; while paused one paint is asked for.
-    if ( ( changedShown || changedFeed ) && !feed.playing ) win->update();
+    // A show or hide asks for one paint even while playing (adversary r1 pass 3 A1): the next frame's paint may be far
+    // off (a slow decode, a stall), and a show and hide both between two paints would never be seen. A feed-only
+    // change (position, timecode, play state) while playing is drawn by the next frame's paint; paused, one paint.
+    if ( changedShown || ( changedFeed && !feed.playing ) ) win->update();
     return true;
 }
 

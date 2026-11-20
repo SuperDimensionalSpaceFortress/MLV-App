@@ -59,9 +59,10 @@ struct Layout
     int pad = 0;
 };
 
-/*! \brief The layout for a surface of fbDevicePx. Empty (bar.isEmpty()) for an empty surface. Buttons are square
- *         (bar height). From the left: Play, Prev, Next, the seek column; from the right: Exit, then the timecode.
- *         On a surface too narrow for a seek column the seek rects stay empty. */
+/*! \brief The layout for a surface of fbDevicePx. Empty (bar.isEmpty()) for an empty surface. Buttons are the bar's
+ *         height tall; they are square (bar height wide) only when the surface is at least 4x the bar height wide,
+ *         otherwise each is a quarter of the surface width wide. From the left: Play, Prev, Next, the seek column; from
+ *         the right: Exit, then the timecode. On a surface too narrow for a seek column the seek rects stay empty. */
 inline Layout layoutFor( const QSize &fbDevicePx )
 {
     Layout l;
@@ -162,28 +163,32 @@ struct InputState
     bool seekDrag = false;
 };
 
-/*! \brief Held buttons the bar did not take: at most one (the button of this very press) means no other gesture is
- *         in progress. */
-inline bool noForeignGesture( const InputState &s, Qt::MouseButtons buttons )
+/*! \brief The held buttons that belong to a gesture begun elsewhere: every held button other than this event's own
+ *         button (a press's; NoButton for a wheel) that the bar did not take. The event's own button never counts as
+ *         the bar's: a press of a button the bar still owns means its release was lost, so that stale ownership is no
+ *         evidence the other held buttons are the bar's (adversary r1 pass 3 A3). */
+inline Qt::MouseButtons foreignButtons( const InputState &s, Qt::MouseButton button, Qt::MouseButtons buttons )
 {
-    const uint foreign = uint( buttons & ~s.owned );
-    return ( foreign & ( foreign - 1u ) ) == 0u;
+    return buttons & ~Qt::MouseButtons( button ) & ~s.owned;
 }
 
-/*! \brief Whether the bar takes this event (the viewer then never sees it). part is hitTest at the event position.
- *         Press, double-click and wheel: the shown bar takes them inside it, unless a button pressed elsewhere is
- *         still held (that gesture keeps every event). Move: during the bar's seek drag, while only buttons the bar
- *         took are held, or inside the shown bar when no button is held (a viewer drag that crosses the bar keeps its
- *         moves). Release: iff a button the bar took is no longer held, so a press elsewhere is always released
- *         elsewhere. */
-inline bool claims( const InputState &s, bool shown, QEvent::Type type, Qt::MouseButtons buttons, Part part )
+/*! \brief Whether the bar takes this event (the viewer then never sees it). button is the event's own button (a
+ *         press's, a release's; NoButton for a move or wheel); part is hitTest at the event position. Press and
+ *         double-click: the shown bar takes them inside it only if every OTHER held button is one the bar took (a
+ *         gesture begun elsewhere keeps every event). Wheel: inside the shown bar only with no button held that the bar
+ *         did not take. Move: during the bar's seek drag, while only buttons the bar took are held, or inside the shown
+ *         bar when no button is held (a viewer drag that crosses the bar keeps its moves). Release: iff a button the
+ *         bar took is no longer held, so a press elsewhere is always released elsewhere. */
+inline bool claims( const InputState &s, bool shown, QEvent::Type type, Qt::MouseButton button, Qt::MouseButtons buttons,
+                    Part part )
 {
     switch( type )
     {
     case QEvent::MouseButtonPress:
     case QEvent::MouseButtonDblClick:
+        return shown && part != Part::None && foreignButtons( s, button, buttons ) == Qt::NoButton;
     case QEvent::Wheel:
-        return shown && part != Part::None && noForeignGesture( s, buttons );
+        return shown && part != Part::None && foreignButtons( s, Qt::NoButton, buttons ) == Qt::NoButton;
     case QEvent::MouseMove:
         if( s.seekDrag ) return true;
         if( s.owned != Qt::NoButton && ( buttons & ~s.owned ) == Qt::NoButton ) return true;
@@ -245,10 +250,11 @@ inline Action actionOf( Action action, QEvent::Type type, bool pressCreatedDoubl
 }
 
 /*! \brief One mouse event the GL path's filter may give the bar: settles stale state, then claims() and onMouse().
- *         Stale state first: a move with no button held means no press is in progress (a release the bar never saw,
- *         e.g. after the window changed under it), and a press or double-click the bar does not take starts someone
- *         else's gesture. Either clears that ownership (per button) and seekDrag, so a lost release can never make the bar take the
- *         viewer's later drags or hold the bar shown. Returns whether the bar took the event; *action is its action. */
+ *         Stale state first: an owned button no longer held (on a press or move) was released where the bar never
+ *         saw it (e.g. after the window changed under it), and a press or double-click of a button the bar still owns
+ *         means that button's release was lost. Either clears that ownership (per button) and seekDrag, so a lost
+ *         release can never make the bar take the viewer's later gestures or hold the bar shown. Returns whether the
+ *         bar took the event; *action is its action. */
 inline bool route( InputState *s, bool shown, QEvent::Type type, Qt::MouseButton button, Qt::MouseButtons buttons, Part part,
                    Action *action )
 {
@@ -260,16 +266,14 @@ inline bool route( InputState *s, bool shown, QEvent::Type type, Qt::MouseButton
         s->owned &= buttons;
         if( !( buttons & Qt::LeftButton ) ) s->seekDrag = false;
     }
-    if( !claims( *s, shown, type, buttons, part ) )
+    // An owned button pressed again: its own release was lost. That ownership is settled before the claim is judged
+    // (adversary r1 pass 3 A3), so the new press is the bar's again only on its own merits.
+    if( press && ( s->owned & button ) )
     {
-        // An owned button pressed again for someone else: its own release was lost.
-        if( press && ( s->owned & button ) )
-        {
-            s->owned &= ~Qt::MouseButtons( button );
-            if( button == Qt::LeftButton ) s->seekDrag = false;
-        }
-        return false;
+        s->owned &= ~Qt::MouseButtons( button );
+        if( button == Qt::LeftButton ) s->seekDrag = false;
     }
+    if( !claims( *s, shown, type, button, buttons, part ) ) return false;
     *action = onMouse( s, type, button, buttons, part );
     return true;
 }

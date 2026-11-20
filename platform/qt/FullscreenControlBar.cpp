@@ -5,7 +5,9 @@
 
 #include "FullscreenControlBar.h"
 
+#include <QAbstractScrollArea>
 #include <QColor>
+#include <QCoreApplication>
 #include <QFont>
 #include <QFontDatabase>
 #include <QMouseEvent>
@@ -110,10 +112,29 @@ void paintTimecodeCell( QPainter &p, const QRect &cell, const QString &timecode,
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
 QPointF localPosOf( const QMouseEvent *e ) { return e->position(); }
 QPointF localPosOf( const QWheelEvent *e ) { return e->position(); }
+QPointF globalPosOf( const QWheelEvent *e ) { return e->globalPosition(); }
 #else
 QPointF localPosOf( const QMouseEvent *e ) { return e->localPos(); }
 QPointF localPosOf( const QWheelEvent *e ) { return e->posF(); }
+QPointF globalPosOf( const QWheelEvent *e ) { return e->globalPosF(); }
 #endif
+
+// The view's events after which its device-pixel size may differ with no Resize (adversary r1 pass 3 A2): a ratio
+// change on the same screen (Qt 6.6 and later) and a move to another screen (every version).
+bool viewGeometryChanges( QEvent::Type type )
+{
+    switch( type )
+    {
+    case QEvent::Resize:
+    case QEvent::ScreenChangeInternal:
+#if QT_VERSION >= QT_VERSION_CHECK(6, 6, 0)
+    case QEvent::DevicePixelRatioChange:
+#endif
+        return true;
+    default:
+        return false;
+    }
+}
 
 } // namespace
 
@@ -212,7 +233,11 @@ void FullscreenControlBarWidget::setFeed( const fullscreen_bar::Feed &feed )
 
 bool FullscreenControlBarWidget::eventFilter( QObject *watched, QEvent *event )
 {
-    if( watched == m_view && event->type() == QEvent::Resize && m_presenter.shown() ) followView();
+    if( watched == m_view && m_presenter.shown() && viewGeometryChanges( event->type() ) )
+    {
+        followView();
+        update();   // the raster is keyed on the device-pixel size; paintEvent drops one made at another ratio
+    }
     return QWidget::eventFilter( watched, event );
 }
 
@@ -257,16 +282,36 @@ void FullscreenControlBarWidget::paintEvent( QPaintEvent *event )
     }
 }
 
-void FullscreenControlBarWidget::route( QEvent *event, const QPointF &localPos )
+// A position on the widget maps to the viewer through the layout paintEvent drew: the bar's pixmap sits at the widget's
+// origin, so widget-local p is device l.bar.topLeft() + p * dpr. Not through pos(): the widget's geometry can lag the
+// layout (a ratio change the view saw no Resize for), and the clicks must hit what is on screen (adversary r1 pass 3 A2).
+bool FullscreenControlBarWidget::route( QEvent *event, const QPointF &localPos )
 {
     event->accept();
-    if( !m_input ) return;
+    if( !m_input ) return true;
     const qreal dpr = devicePixelRatioF();
-    m_input( viewLayout(), event, ( localPos + QPointF( pos() ) ) * dpr );
+    const fullscreen_bar::Layout l = viewLayout();
+    return m_input( l, event, QPointF( l.bar.topLeft() ) + localPos * dpr );
+}
+
+// A wheel over the bar during a gesture begun elsewhere is that gesture's (adversary r1 pass 3 A3, the CPU sibling of
+// the GL claim): the viewport gets it, at the same global position, as it would with no bar.
+void FullscreenControlBarWidget::forwardWheelToView( QWheelEvent *event )
+{
+    QWidget *target = m_view;
+    if( QAbstractScrollArea *area = qobject_cast<QAbstractScrollArea *>( m_view ) ) target = area->viewport();
+    if( !target ) return;
+    const QPointF global = globalPosOf( event );
+    QWheelEvent copy( QPointF( target->mapFromGlobal( global.toPoint() ) ), global, event->pixelDelta(), event->angleDelta(),
+                      event->buttons(), event->modifiers(), event->phase(), event->inverted() );
+    QCoreApplication::sendEvent( target, &copy );
 }
 
 void FullscreenControlBarWidget::mousePressEvent( QMouseEvent *event ) { route( event, localPosOf( event ) ); }
 void FullscreenControlBarWidget::mouseReleaseEvent( QMouseEvent *event ) { route( event, localPosOf( event ) ); }
 void FullscreenControlBarWidget::mouseDoubleClickEvent( QMouseEvent *event ) { route( event, localPosOf( event ) ); }
 void FullscreenControlBarWidget::mouseMoveEvent( QMouseEvent *event ) { route( event, localPosOf( event ) ); }
-void FullscreenControlBarWidget::wheelEvent( QWheelEvent *event ) { route( event, localPosOf( event ) ); }
+void FullscreenControlBarWidget::wheelEvent( QWheelEvent *event )
+{
+    if( !route( event, localPosOf( event ) ) ) forwardWheelToView( event );
+}

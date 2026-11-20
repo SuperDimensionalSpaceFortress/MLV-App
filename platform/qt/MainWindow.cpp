@@ -2381,7 +2381,7 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     //and hides only on the idle clock above (viewerIdleApplyShown), with no timer of its own
     m_fullscreenBarWidget = new FullscreenControlBarWidget( ui->graphicsView );
     m_fullscreenBarWidget->setInputHook( [this]( const fullscreen_bar::Layout &layout, QEvent *event, const QPointF &devicePos )
-                                         { fullscreenBarInput( layout, event, devicePos, true ); } );
+                                         { return fullscreenBarInput( layout, event, devicePos, true ); } );
 
     //Set bools for draw rules
     m_dontDraw = true;
@@ -3971,6 +3971,11 @@ bool MainWindow::fullscreenBarInput( const fullscreen_bar::Layout &layout, QEven
     }
     const fullscreen_bar::Part part = fullscreen_bar::hitTest( layout, devicePos );
     fullscreen_bar::Action action = fullscreen_bar::Action::None;
+    // The widget gets a wheel by position even during a gesture begun on the viewer (Qt grabs only mouse events): the
+    // same claim as the GL path decides, and a wheel the bar does not take goes back to the viewport (adversary r1
+    // pass 3 A3, CPU sibling).
+    if( fromWidget && event->type() == QEvent::Wheel
+     && !fullscreen_bar::claims( m_fullscreenBarInput, fullscreenBarShown(), event->type(), button, buttons, part ) ) return false;
     if( fromWidget ) action = fullscreen_bar::onMouse( &m_fullscreenBarInput, event->type(), button, buttons, part );
     else if( !fullscreen_bar::route( &m_fullscreenBarInput, fullscreenBarShown(), event->type(), button, buttons, part, &action ) ) return false;
     action = fullscreen_bar::actionOf( action, event->type(), pressCreatedDoubleClick );   // the double-click acts, not its press
