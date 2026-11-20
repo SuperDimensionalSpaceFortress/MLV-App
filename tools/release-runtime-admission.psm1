@@ -558,9 +558,137 @@ function Invoke-PinnedPayloadInstall {
 # Adversary ae560106-A1: a delete or a rewrite of the installed ffmpeg.exe after its readback reached the zip or the manifest
 # unnoticed. These two checks read the bytes AT the point of publication. Neither throws; the caller reads .ok.
 
-# Opens Path for reading with FileShare.Read (no writer and no delete can open it while it is held), hashes it through that
-# handle and compares size and sha256. On ok the OPEN stream is returned in .stream: the caller writes its record while
-# holding it and disposes it afterwards, so the file the record describes cannot change in between.
+# PR 862 r9 (sol r8 B1 / adversary efddecf6-A1): File.Open follows a symbolic link, so the held handle was the link's TARGET
+# while the pathname stayed replaceable (delete the link, write MZwrong at the path, and the manifest kept the pinned digest).
+# The one open used by both publication checks below is therefore CreateFileW with FILE_FLAG_OPEN_REPARSE_POINT (never
+# follows a final reparse point), GENERIC_READ and share mode FILE_SHARE_READ only (no FILE_SHARE_DELETE, no FILE_SHARE_WRITE:
+# while held the entry cannot be renamed, unlinked or rewritten). The reparse test reads the attributes of THAT handle
+# (GetFileInformationByHandle), never of the path, so a swap between the open and the check cannot pass. Any failure is a
+# typed code (add-type-failed, open-failed, info-failed, reparse-point, not-a-disk-file, stream-failed) and never a fallback.
+$script:PinnedNoFollowTypeName = 'MlvReleaseAdmission.PinnedNoFollowOpen'
+$script:PinnedNoFollowSource = @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace MlvReleaseAdmission {
+    public sealed class PinnedOpenResult {
+        public FileStream Stream;
+        public string Code = "";
+        public string Detail = "";
+    }
+
+    public static class PinnedNoFollowOpen {
+        public const uint GENERIC_READ = 0x80000000;
+        public const uint FILE_SHARE_READ = 0x00000001;
+        public const uint OPEN_EXISTING = 3;
+        public const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+        public const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
+        public const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400;
+        public const uint FILE_TYPE_DISK = 0x0001;
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct ByHandleFileInformation {
+            public uint FileAttributes;
+            public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+            public uint VolumeSerialNumber;
+            public uint FileSizeHigh;
+            public uint FileSizeLow;
+            public uint NumberOfLinks;
+            public uint FileIndexHigh;
+            public uint FileIndexLow;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes,
+            uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetFileInformationByHandle(SafeFileHandle hFile, out ByHandleFileInformation lpFileInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint GetFileType(SafeFileHandle hFile);
+
+        private static string Win32Text(int error) {
+            return new Win32Exception(error).Message + " (win32 " + error + ")";
+        }
+
+        public static PinnedOpenResult Open(string path) {
+            PinnedOpenResult result = new PinnedOpenResult();
+            SafeFileHandle handle = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+            if (handle == null || handle.IsInvalid) {
+                int error = Marshal.GetLastWin32Error();
+                if (handle != null) { handle.Dispose(); }
+                result.Code = "open-failed";
+                result.Detail = Win32Text(error);
+                return result;
+            }
+            bool keep = false;
+            try {
+                ByHandleFileInformation info;
+                if (!GetFileInformationByHandle(handle, out info)) {
+                    result.Code = "info-failed";
+                    result.Detail = Win32Text(Marshal.GetLastWin32Error());
+                    return result;
+                }
+                if ((info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                    result.Code = "reparse-point";
+                    result.Detail = "the pathname is a reparse point (a symbolic link or junction), so no handle on it is the pathname's own file";
+                    return result;
+                }
+                if ((info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 || GetFileType(handle) != FILE_TYPE_DISK) {
+                    result.Code = "not-a-disk-file";
+                    result.Detail = "the pathname is not a regular file on disk";
+                    return result;
+                }
+                try {
+                    result.Stream = new FileStream(handle, FileAccess.Read);
+                } catch (Exception ex) {
+                    result.Code = "stream-failed";
+                    result.Detail = ex.Message;
+                    return result;
+                }
+                keep = true;
+                return result;
+            } finally {
+                if (!keep) { handle.Dispose(); }
+            }
+        }
+    }
+}
+'@
+
+# The one shared open of both publication checks. Returns @{ stream; code; detail }; stream is $null whenever code is set.
+function Open-PinnedNoFollowStream {
+    param([Parameter(Mandatory)][string]$LiteralPath)
+    try {
+        if (-not ($script:PinnedNoFollowTypeName -as [type])) {
+            Add-Type -TypeDefinition $script:PinnedNoFollowSource -Language CSharp -ErrorAction Stop
+        }
+    } catch {
+        return [pscustomobject]@{ stream = $null; code = 'add-type-failed'; detail = $_.Exception.Message }
+    }
+    try {
+        $opened = [MlvReleaseAdmission.PinnedNoFollowOpen]::Open($LiteralPath)
+    } catch {
+        return [pscustomobject]@{ stream = $null; code = 'open-failed'; detail = $_.Exception.Message }
+    }
+    if ($opened.Code) {
+        if ($opened.Stream) { $opened.Stream.Dispose() }
+        return [pscustomobject]@{ stream = $null; code = [string]$opened.Code; detail = [string]$opened.Detail }
+    }
+    return [pscustomobject]@{ stream = $opened.Stream; code = ''; detail = '' }
+}
+
+# Opens Path through Open-PinnedNoFollowStream (the pathname's own file entry, never a link target; no writer, no rename and no
+# delete can open it while it is held), hashes it through that handle and compares size and sha256. On ok the OPEN stream is
+# returned in .stream: the caller writes its record while holding it and disposes it afterwards, so the file the record
+# describes, AT THAT PATHNAME, cannot change in between. A refused open gives .reason '<code>: <path> could not be opened ...'.
 function Open-PinnedFileHold {
     [CmdletBinding()]
     param(
@@ -584,7 +712,12 @@ function Open-PinnedFileHold {
         # A relative path means the PowerShell location, as it does for the cmdlets that installed and read the file; .NET alone
         # would resolve it against the process directory (adversary 78d626ed-A2).
         $Path = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($Path)
-        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        $open = Open-PinnedNoFollowStream -LiteralPath $Path
+        if (-not $open.stream) {
+            $hold.reason = "$($open.code): $Path could not be opened and hashed: $($open.detail)"
+            return [pscustomobject]$hold
+        }
+        $stream = $open.stream
         $hold.bytes = [long]$stream.Length
         $hold.sha256 = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant()
     } catch {
@@ -603,7 +736,7 @@ function Open-PinnedFileHold {
 }
 
 # Proves a published zip carries exactly one root entry MemberName whose bytes are the recorded ones. The zip is opened once
-# with FileShare.Read; the whole-file sha256 (.zipSha256) and the entry check read that same handle, so the hash the caller
+# through Open-PinnedNoFollowStream (a reparse point is refused; FILE_SHARE_READ only); the whole-file sha256 (.zipSha256) and the entry check read that same handle, so the hash the caller
 # publishes describes the very bytes whose entry was verified.
 function Test-PinnedZipMember {
     [CmdletBinding()]
@@ -632,7 +765,13 @@ function Test-PinnedZipMember {
         Add-Type -AssemblyName System.IO.Compression
         # Relative = the PowerShell location, as for Compress-Archive that wrote it (adversary 78d626ed-A2).
         $ZipPath = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($ZipPath)
-        $stream = [System.IO.File]::Open($ZipPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        # PR 862 r9 (sol r8 B1 sibling): the same no-follow, FILE_SHARE_READ-only open as Open-PinnedFileHold.
+        $open = Open-PinnedNoFollowStream -LiteralPath $ZipPath
+        if (-not $open.stream) {
+            $check.reason = "$($open.code): $ZipPath could not be read as a zip: $($open.detail)"
+            return [pscustomobject]$check
+        }
+        $stream = $open.stream
         $check.zipSha256 = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant()
         $null = $stream.Seek(0, [System.IO.SeekOrigin]::Begin)
         $zip = [System.IO.Compression.ZipArchive]::new($stream, [System.IO.Compression.ZipArchiveMode]::Read, $true)

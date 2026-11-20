@@ -287,6 +287,8 @@ $manifest = [ordered]@{
 # Adversary ae560106-A1: a delete or rewrite of ffmpeg.exe after the readback above (the launch probe runs in between) left the
 # manifest claiming a deploy that was gone. Re-read and re-hash it immediately before the manifest, and HOLD it open (FileShare.Read:
 # no writer, no delete) until build-manifest.json is written, so the deploy.ffmpegExe record describes the file in the artifact.
+# PR 862 r9 (sol r8 B1): the hold opens the pathname itself and refuses a symbolic link or junction (reason reparse-point), so the
+# held handle is the file entry at $ffmpegExePath, which can be neither renamed, unlinked nor rewritten until it is released.
 $ffmpegHold = Open-PinnedFileHold -Path $ffmpegExePath -ExpectedSha256 $deploy.ffmpegExe.sha256 -ExpectedBytes $deploy.ffmpegExe.bytes
 if (-not $ffmpegHold.ok) {
     Write-Host "FAIL: ffmpeg.exe changed before build-manifest.json was written: $($ffmpegHold.reason)" -ForegroundColor Red

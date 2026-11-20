@@ -348,6 +348,25 @@ class ScriptsInstallUnconditionallyTests(unittest.TestCase):
         self.assertRegex(block, r"if \(-not \$ffmpegHold\.ok\) \{\n[^\n]*\n\s*exit 9\n\}")
         self.assertRegex(block, r"\} finally \{\n\s*\$ffmpegHold\.stream\.Dispose\(\)\n\}")
 
+    def test_both_publication_checks_open_the_pathname_itself_never_a_link_target(self) -> None:
+        # sol r8 B1 / adversary efddecf6-A1: File.Open(..., FileShare.Read) followed a symbolic link, so the hold was on the link's
+        # target while the pathname stayed replaceable. One shared no-follow open (FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ
+        # only) serves both checks; the reparse test reads the HANDLE's attributes, so an open-then-swap cannot pass.
+        text = _normalised(HELPER_MODULE)
+        self.assertIn("public const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;", text)
+        self.assertIn("public const uint FILE_SHARE_READ = 0x00000001;", text)
+        self.assertIn("public const uint GENERIC_READ = 0x80000000;", text)
+        self.assertEqual(text.count("CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero)"), 1)
+        self.assertIn("if (!GetFileInformationByHandle(handle, out info)) {", text)
+        self.assertIn("if ((info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {", text)
+        self.assertIn('result.Code = "reparse-point";', text)
+        self.assertNotRegex(text, r"\[System\.IO\.File\]::Open\(", "no publication check may fall back to a link-following open")
+        for name in ("Open-PinnedFileHold", "Test-PinnedZipMember"):
+            body = text[text.index(f"function {name} {{"):]
+            body = body[: body.index("\n}\n")]
+            self.assertEqual(body.count("Open-PinnedNoFollowStream -LiteralPath $"), 1, name)
+        self.assertNotIn("Open-PinnedNoFollowStream,", text[text.index("Export-ModuleMember"):], "the shared open stays private")
+
     def test_an_install_into_another_folder_is_refused_by_the_guard(self) -> None:
         # adversary 32bf39a9-A4: (Join-Path $releaseDir 'other') passed the substring check; the exact pin must refuse it.
         text = ASSEMBLER.read_text(encoding="utf-8")
@@ -1092,6 +1111,66 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
             FFX_FILE=str(target), FFX_SHA=sha)
         self.assertFalse(result["ok"])
         self.assertIn("could not be opened", result["reason"])
+
+    def _symlink_or_skip(self, link: Path, target: Path) -> None:
+        try:
+            os.symlink(target, link)
+        except OSError as exc:
+            self.skipTest(f"this account cannot create a file symbolic link ({exc}); the source pin covers the open flags")
+
+    def test_a_symbolic_link_to_the_pinned_bytes_is_never_held(self) -> None:
+        # sol r8 B1 trace: the verified file is moved to pin\ffmpeg.exe and the output pathname becomes a symbolic link to it. The old
+        # hold followed the link, verified the pinned bytes and returned ok=true; the link was then deleted and MZwrong written at the
+        # pathname while the manifest kept the pinned digest. The hold must refuse the link itself (reason reparse-point).
+        payload = b"MZ pinned ffmpeg bytes" * 100
+        pin = self.tmp / "pin"
+        out = self.tmp / "out"
+        pin.mkdir()
+        out.mkdir()
+        (pin / "ffmpeg.exe").write_bytes(payload)
+        link = out / "ffmpeg.exe"
+        self._symlink_or_skip(link, pin / "ffmpeg.exe")
+        good = self._zip("linked-target.zip", {"MLVApp.exe": b"exe", "ffmpeg.exe": payload})
+        zip_link = out / "package.zip"
+        self._symlink_or_skip(zip_link, good)
+        result = self._ps(
+            "$h = Open-PinnedFileHold -Path $env:FFX_LINK -ExpectedSha256 $env:FFX_SHA -ExpectedBytes ([long]$env:FFX_LEN)\n"
+            "$linkDeleteRefused = $false\n"
+            "try { [System.IO.File]::Delete($env:FFX_LINK) } catch { $linkDeleteRefused = $true }\n"
+            "if ($h.stream) { $h.stream.Dispose() }\n"
+            "$z = Test-PinnedZipMember -ZipPath $env:FFX_ZIPLINK -MemberName 'ffmpeg.exe' -ExpectedSha256 $env:FFX_SHA -ExpectedBytes ([long]$env:FFX_LEN)\n"
+            "$real = Open-PinnedFileHold -Path $env:FFX_REAL -ExpectedSha256 $env:FFX_SHA -ExpectedBytes ([long]$env:FFX_LEN)\n"
+            "if ($real.stream) { $real.stream.Dispose() }\n"
+            "[ordered]@{ ok = $h.ok; reason = $h.reason; streamNull = ($null -eq $h.stream); linkDeleteRefused = $linkDeleteRefused;"
+            " zip = $z.ok; zipReason = $z.reason; real = $real.ok } | ConvertTo-Json -Compress\n",
+            FFX_LINK=str(link), FFX_ZIPLINK=str(zip_link), FFX_REAL=str(pin / "ffmpeg.exe"),
+            FFX_SHA=hashlib.sha256(payload).hexdigest(), FFX_LEN=str(len(payload)))
+        self.assertFalse(result["ok"], result)
+        self.assertTrue(result["reason"].startswith("reparse-point: "), result)
+        self.assertTrue(result["streamNull"], "a refused hold must not leak an open handle")
+        self.assertFalse(result["zip"], result)
+        self.assertTrue(result["zipReason"].startswith("reparse-point: "), result)
+        self.assertTrue(result["real"], "the regular file the link pointed at still holds (control)")
+
+    def test_while_held_the_entry_cannot_be_renamed_unlinked_or_overwritten(self) -> None:
+        # sol r8 B1: the held handle must BE the pathname's file entry, and FILE_SHARE_READ alone keeps that entry in place: a rename,
+        # an unlink and an overwrite of the held path all fail until the hold is released; the bytes are unchanged afterwards.
+        payload = b"MZ pinned ffmpeg bytes" * 100
+        target = self.tmp / "ffmpeg.exe"
+        target.write_bytes(payload)
+        result = self._ps(
+            "$h = Open-PinnedFileHold -Path $env:FFX_FILE -ExpectedSha256 $env:FFX_SHA -ExpectedBytes ([long]$env:FFX_LEN)\n"
+            "$refused = [ordered]@{}\n"
+            "try { [System.IO.File]::Move($env:FFX_FILE, $env:FFX_FILE + '.moved'); $refused.rename = $false } catch { $refused.rename = $true }\n"
+            "try { [System.IO.File]::Delete($env:FFX_FILE); $refused.unlink = $false } catch { $refused.unlink = $true }\n"
+            "try { [System.IO.File]::WriteAllBytes($env:FFX_FILE, [byte[]][char[]]'MZwrong'); $refused.overwrite = $false } catch { $refused.overwrite = $true }\n"
+            "if ($h.stream) { $h.stream.Dispose() }\n"
+            "[ordered]@{ ok = $h.ok; reason = $h.reason; refused = $refused; moved = (Test-Path -LiteralPath ($env:FFX_FILE + '.moved')) } | ConvertTo-Json -Compress\n",
+            FFX_FILE=str(target), FFX_SHA=hashlib.sha256(payload).hexdigest(), FFX_LEN=str(len(payload)))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["refused"], {"rename": True, "unlink": True, "overwrite": True}, result)
+        self.assertFalse(result["moved"], result)
+        self.assertEqual(target.read_bytes(), payload)
 
 
 class RecordOnlyInstallTests(unittest.TestCase):
