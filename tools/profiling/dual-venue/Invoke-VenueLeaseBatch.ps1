@@ -2239,6 +2239,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     foreach ($ck in $capsReceipt.Keys) { $b[$ck] = $capsReceipt[$ck] }
     $openLeaseUnnamed = $false   # r5 (adversary r4 pass 3 A1): this batch's open carried a leaseBatch that is not one object (the finally charges it open-lease-unnamed)
     $script:batchTicket = $null
+    $script:TicketOn = -not $NoTicket   # one script-scope switch for every ticket step; the claim loop is also lifted out and run on its own by test_venue_lease_batch.py, where it is unset (ticketless, as before)
     # (0) CAPS b and c: wait out the cooldown after the last lease and the 3 h budget BEFORE the claim, so the venue is never held through either.
     $bw = Get-VenueLeaseBudgetWait -Leases @($leases) -NowUtc ([DateTime]::UtcNow) -CapSec $LeaseCapSec -CooldownSec $LeaseCooldownSec -WindowSec $LeaseBudgetWindowSec -BudgetSec $LeaseBudgetSec
     $b.preOpenWait = [ordered]@{ reason = $bw.reason; waitSec = $bw.waitSec; usedSec = $bw.usedSec; budgetRoomSec = $bw.budgetRoomSec; openUtc = $bw.openUtc.ToString('o'); lastLeaseEndUtc = $(if ($bw.lastEndUtc) { $bw.lastEndUtc.ToString('o') }) }
@@ -2255,7 +2256,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         LogBest "BATCH_WAIT batch=$batchNo reason=$($bw.reason) waitSec=$($bw.waitSec) usedSec=$($bw.usedSec) capSec=$LeaseCapSec budgetSec=$LeaseBudgetSec windowSec=$LeaseBudgetWindowSec cooldownSec=$LeaseCooldownSec (Bachelor's lease caps; not a failure, no claim held)"
         # VENUE-FIFO-TICKET-BEFORE-PRECLAIM-1: the place in the venue's line is taken NOW, before the wait, as a not-ready ticket (phase cooldown: it never blocks a ready waiter and keeps its
         # place). It outlives the wait by 120 s; the claim loop below refreshes it to ready on its first request.
-        if (-not $NoTicket) {
+        if ($script:TicketOn) {
             try {
                 $script:batchTicket = New-VenueTicket -Venue $Venue -RunDir $RunDir -Purpose "$Purpose batch $batchNo" -StaleAfterSec ([int][Math]::Min(86400.0, [Math]::Ceiling([double]$bw.waitSec) + 120)) -ClaimDir $ClaimDir -Phase cooldown
                 LogBest "TICKET_TAKEN batch=$batchNo ticket=$($script:batchTicket.name) phase=cooldown (before the $($bw.reason) wait of $($bw.waitSec) s; the claim is asked for after it)"
@@ -2276,11 +2277,11 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         $grantedOnRetry = $unfinished -gt 0
         try {
             # VENUE-FIFO-TICKET-BEFORE-PRECLAIM-1: every request carries the batch's ticket (taken here on the first one when the batch had no wait before it), so the claim goes to the oldest ready ticket
-            $ticketArgs = $(if ($NoTicket) { @{} } else { @{ UseTicket = $true; Ticket = $script:batchTicket; TicketStaleAfterSec = $ticketStaleSec } })
+            $ticketArgs = $(if ($script:TicketOn) { @{ UseTicket = $true; Ticket = $script:batchTicket; TicketStaleAfterSec = $ticketStaleSec } } else { @{} })
             $req = $(if ($unfinished -gt 0) { Invoke-ClaimRetryRequest -DeadlineUtc $deadline -RequestArgs (@{ Venue = $Venue; RunDir = $RunDir; Purpose = "$Purpose batch $batchNo"; TtlSec = $ClaimTtlSec; ClaimDir = $ClaimDir } + $ticketArgs) }
                 else { Request-VenueClaim -Venue $Venue -RunDir $RunDir -Purpose "$Purpose batch $batchNo" -TtlSec $ClaimTtlSec -ClaimDir $ClaimDir @ticketArgs })
             # the line for it is written only once the guard below has vouched for where batch.log is (no write before a read vouched for the input's location), never here
-            if (-not $NoTicket -and $null -ne $req.PSObject.Properties['ticket'] -and $null -ne $req.ticket) {
+            if ($script:TicketOn -and $null -ne $req.PSObject.Properties['ticket'] -and $null -ne $req.ticket) {
                 if ($null -eq $script:batchTicket) { $ticketNote = "TICKET_TAKEN batch=$batchNo ticket=$($req.ticket.name) phase=waiting position=$($req.position)/$(@($req.queue).Count)" }
                 elseif ($script:batchTicket.name -cne $req.ticket.name) { $ticketNote = "TICKET_RETAKEN batch=$batchNo ticket=$($req.ticket.name) (the earlier one was removed from under this batch: back of the line) position=$($req.position)/$(@($req.queue).Count)" }
                 $script:batchTicket = $req.ticket
@@ -2355,7 +2356,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             $unfinished = 0; $noAnswers = 0
         }
         if ($hit) {
-            Close-BatchTicket 'input-guard-refusal' -Quiet
+            if ($script:batchTicket) { Close-BatchTicket 'input-guard-refusal' -Quiet }
             if ($req.granted) { try { [void]$(if ($grantedOnRetry) { Invoke-ClaimRetryRelease $deadline $req.claim.nonce } else { Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir }) } catch { } }
             # r3 (opus r2b H3): once a batch receipt exists, this refusal ends the run like any other stop: the summary (receiptPersistFailures included) is printed before the typed
             # exit 2. A location hit turns the write suppression on first (Test-OpenOutputAlias's rule): the refused input may be batch.log itself, so nothing more goes into -RunDir.
@@ -2380,7 +2381,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             if ([DateTime]::UtcNow.AddSeconds($ClaimPollSec) -ge $deadline) { break }
             continue
         }
-        if ($req.granted) { Close-BatchTicket 'claim-granted'; $claim = $req.claim; break }   # the claim itself now keeps the line behind this batch waiting
+        if ($req.granted) { if ($script:batchTicket) { Close-BatchTicket 'claim-granted' }; $claim = $req.claim; break }   # the claim itself now keeps the line behind this batch waiting
         $holder = $(if ($req.claim) { "pid=$($req.claim.ownerPid) runDir=$($req.claim.runDir) purpose=$($req.claim.purpose)" } else { $req.state })
         if ($holder -cne $lastHolder) { LogBest "CLAIM_HELD batch=$batchNo state=$($req.state) holder $holder -> wait$(if ($script:batchTicket -and $null -ne $req.PSObject.Properties['position']) { " position=$($req.position)/$(@($req.queue).Count)" })"; $lastHolder = $holder }
         if ([DateTime]::UtcNow.AddSeconds($ClaimPollSec) -ge $deadline) { break }
@@ -2389,7 +2390,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         if ([DateTime]::UtcNow -ge $deadline) { break }
     }
     if ($null -eq $claim) {
-        Close-BatchTicket 'deadline-claim-held'
+        if ($script:batchTicket) { Close-BatchTicket 'deadline-claim-held' }
         $b.endReason = 'DEADLINE'; $b.endDetail = 'claim-held'; Set-Stop 'DEADLINE' 3
         LogBest "BATCH_END batch=$batchNo token=$token reason=DEADLINE detail=claim-held"   # r7 (sol r6b): the line is tried before the receipt snapshots logWriteFailures
         $b.logWriteFailures = $script:logWriteFailures; Write-BatchReceipt $b
