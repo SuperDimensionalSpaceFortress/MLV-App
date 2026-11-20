@@ -73,7 +73,8 @@
 # the eight profile keys it knows (exact_keys) and requires every (clip, profile) pair, so a ninth key or a new profile would change the
 # canonical output-budget gate. 'on' hands the capture, in the ONE -ExtraEnv hashtable beside the profile's quality mode, MLVAPP_GPU_PLAYBACK_RECON=1,
 # MLVAPP_GPU_PLAYBACK_RECON_BACKEND=cuda and MLVAPP_GPU_PLAYBACK_RECON_DLL=<the igpu_recon_cuda.dll the job deployed beside the staged exe>
-# (the names and values playback-attr-3-cuda-job.ps1 gives its speed legs). Any other value is refused (REFERENCE_FRAME_GPU_PLAYBACK_RECON_INVALID).
+# (the names and values playback-attr-3-cuda-job.ps1 gives its speed legs). Any other value is refused (REFERENCE_FRAME_GPU_PLAYBACK_RECON_INVALID), and an
+# 'on' job whose agent root has an 'outbox' path component is refused (REFERENCE_FRAME_GPU_RECON_AGENTROOT_IN_OUTBOX): it stages under <root>\work.
 # 'on' is part of the job identity (so a GPU-recon job never shares a work tree or an outbox with a CPU one) and result.json records it as
 # captureParameters.gpuPlaybackRecon. 'on' REQUESTS the GPU recon; it does not prove it ran (a venue environment that suppresses CUDA, such as
 # MLVAPP_GPU_FAULT_INJECT, or any fallback leaves the capture on the CPU), so an 'on' job accepts the capture as a candidate only when the app's own
@@ -292,6 +293,9 @@ foreach ($n in @($names.exeName, $names.reconName, $names.packageZipName, $names
 $venueEntry = $table.venues.PSObject.Properties[$Venue].Value
 if ([string]::IsNullOrWhiteSpace($AgentRoot)) { $AgentRoot = [string]$venueEntry.agentRoot }
 if ($AgentRoot -notmatch '^[A-Za-z]:\\[A-Za-z0-9 _.~\\-]+$') { throw 'REFERENCE_FRAME_AGENTROOT_INVALID -AgentRoot contains characters outside the allowlist' }
+# r5 (adversary A1 on 01ba7f33): an 'on' job stages its capture under <AgentRoot>\work, "outside every outbox" only if the agent root is not itself inside one. A reader
+# that walks an outbox recursively would index a staging directory nested in it before the job has proven the recon, so that root is refused for an 'on' job.
+if ($GpuPlaybackRecon -ceq 'on' -and $AgentRoot -match '(?i)(^|\\)outbox(\\|$)') { Stop-Refused 'REFERENCE_FRAME_GPU_RECON_AGENTROOT_IN_OUTBOX' }
 
 # The job's identity is its effective configuration (header: THE JOB'S IDENTITY IS ITS EFFECTIVE CONFIGURATION).
 $identityLines = @(
@@ -361,6 +365,7 @@ $reconResultEvidence = ''
 $reconPublish = ''
 $reconStage = ''
 $reconRelease = ''
+$reconObjectRoot = ''
 # today's line, verbatim: the profile's quality mode is the only -ExtraEnv entry
 $captureExtraEnv = @'
 if ($QualityMode -ne '') { $captureCommand += " -ExtraEnv @{ MLVAPP_PLAYBACK_QUALITY_MODE = '$QualityMode' }" }
@@ -372,6 +377,9 @@ if ($GpuPlaybackRecon -ceq 'on') {
     # r4 (key blocker B1): the capture runs in a staging directory under the job's own work tree, never under the outbox, so a capture whose GPU recon was
     # not proven cannot be indexed by a reader whatever later step fails (the voiding layers and result.json are all best effort).
     $reconStage = "`r`n        `$captureOut = Join-Path `$Work 'capture-staging'"
+    # r5 (adversary A1 on ac80ede1): the 225 path's stamp needs an object-root manifest too (the recon block's own stamp carries the same guard inline). Only
+    # an 'on' job emits it, so an 'off' job stays byte-identical to the base; the 225 path on an 'off' job is the base's and is not changed by this card.
+    $reconObjectRoot = "`r`n        if (`$candidateDoc -isnot [System.Management.Automation.PSCustomObject]) { throw 'MANIFEST_ROOT_NOT_AN_OBJECT' }"
     $reconRelease = @'
 # GPU PLAYBACK RECON (r4, key blocker B1): the capture ran in $Work\capture-staging, outside every outbox, so it is not indexable by construction. It is
 # released into $Pub\capture only when a reader may see it: it is a candidate (the recon is proven and the views are intact), or it is voided (a layer
@@ -841,9 +849,7 @@ if ($viewsChanged -and (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
         Say "CANDIDATE_MARKER_NOT_WRITTEN $($_.Exception.Message)"
     }
     try {
-        $candidateDoc = [IO.File]::ReadAllText($candidatePath) | ConvertFrom-Json
-        # the stamp is only a stamp on an object root (see the same guard in the GPU recon block)
-        if ($candidateDoc -isnot [System.Management.Automation.PSCustomObject]) { throw 'MANIFEST_ROOT_NOT_AN_OBJECT' }
+        $candidateDoc = [IO.File]::ReadAllText($candidatePath) | ConvertFrom-Json__GPU_RECON_OBJECT_ROOT__
         $candidateDoc | Add-Member -NotePropertyName status -NotePropertyValue 'invalid' -Force
         $candidateDoc | Add-Member -NotePropertyName invalid -NotePropertyValue $true -Force
         $candidateDoc | Add-Member -NotePropertyName invalid_reasons -NotePropertyValue $candidateInvalidReasons -Force
@@ -922,6 +928,7 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     GPU_RECON_PUBLISH = $reconPublish
     GPU_RECON_STAGE = $reconStage
     GPU_RECON_RELEASE = $reconRelease
+    GPU_RECON_OBJECT_ROOT = $reconObjectRoot
     SECONDS = [string]$Seconds
     PRESENTED_FRAMES = [string]$PresentedFrames
     EXE_NAME = $names.exeName

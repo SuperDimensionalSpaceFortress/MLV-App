@@ -437,7 +437,9 @@ class GeneratorTests(_GeneratorCase):
                      "if ($captureRc -ne 0 -and ($captureRc -lt 1 -or $captureRc -gt 199)) { $captureRc = 199 }\n$viewsChanged = ($captureRc -eq 0 -and -not $viewsIntactAfterCapture)\n",
                      "$candidateInvalidMarker = $null\n$candidateQuarantined = $null\nif ($viewsChanged -and (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {\n",
                      "captureParameters = [ordered]@{ seconds = $Seconds; presentedFrames = $PresentedFrames }\n",
-                     "footageView = [ordered]@{ mode = $ownerViewMode; intactAfterCapture = $viewsIntactAfterCapture }\n    stagedOnHost = "):
+                     "footageView = [ordered]@{ mode = $ownerViewMode; intactAfterCapture = $viewsIntactAfterCapture }\n    stagedOnHost = ",
+                     # r5: the 225 path's parse and stamp lines (the object-root guard is an 'on'-only token between them)
+                     "$candidateDoc = [IO.File]::ReadAllText($candidatePath) | ConvertFrom-Json\n        $candidateDoc | Add-Member -NotePropertyName status -NotePropertyValue 'invalid' -Force\n"):
             with self.subTest(seam=seam[:60]):
                 self.assertIn(seam, default)
 
@@ -472,6 +474,27 @@ class GeneratorTests(_GeneratorCase):
         self.assertIn(r"$reconRecordStart = '^(?:\[[^\]]*\] ){0,3}'", on)
         self.assertIn(r"[regex]::Match($reconLine, $reconRecordStart + 'playback_smoke\.summary session=([0-9]+) ')", on)
         self.assertIn(r"[regex]::Match($reconLine, $reconRecordStart + 'playback_smoke\.gpu_summary session=' + $reconSession + ' (?<rest>.*)$')", on)
+
+    def test_the_object_root_guard_is_emitted_for_both_stamps_of_an_on_job_and_for_neither_of_an_off_job(self) -> None:
+        # adversary A1 on ac80ede1 / A2 on 01ba7f33: the guard is an 'on'-only fragment, so the default job's text is the base's
+        on = self.generate_job("recon-on-objroot", "-GpuPlaybackRecon", "on")
+        self.assertEqual(on.count("MANIFEST_ROOT_NOT_AN_OBJECT"), 2, "the 228 stamp and the 225 stamp each need the guard")
+        self.assertIn("$candidateDoc -isnot [System.Management.Automation.PSCustomObject]", on)
+        self.assertIn("$reconDoc -isnot [System.Management.Automation.PSCustomObject]", on)
+        self.assertNotIn("MANIFEST_ROOT_NOT_AN_OBJECT", self.emitted())
+
+    def test_an_on_job_whose_agent_root_lies_inside_an_outbox_is_refused_and_an_off_job_is_not(self) -> None:
+        # adversary A1 on 01ba7f33: the staging directory is under <AgentRoot>\work, which is only "outside every outbox" if the root is not inside one
+        for label, root in (("nested", r"C:\mlvtmp\mlv-agent\outbox\nested-agent"), ("top", r"C:\outbox"), ("cased", r"C:\mlvtmp\mlv-agent\OutBox"), ("last", r"C:\mlvtmp\agent\outbox")):
+            with self.subTest(root=root):
+                proc, out = self.generate(f"recon-outbox-{label}", "-GpuPlaybackRecon", "on", "-AgentRoot", root)
+                self.refused(proc, "REFERENCE_FRAME_GPU_RECON_AGENTROOT_IN_OUTBOX")
+                self.assertFalse(out.exists(), "a refused job wrote a file")
+        for label, root in (("off", r"C:\mlvtmp\mlv-agent\outbox\nested-agent"), ("neighbour", r"C:\mlvtmp\outboxes\agent")):
+            with self.subTest(allowed=root):
+                extra = ("-AgentRoot", root) if label == "off" else ("-GpuPlaybackRecon", "on", "-AgentRoot", root)
+                proc, _out = self.generate(f"recon-outbox-ok-{label}", *extra)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
     def test_a_recon_value_other_than_off_or_on_is_refused_with_a_typed_code_and_no_job_is_written(self) -> None:
         for label, value in (("yes", "yes"), ("upper", "ON"), ("one", "1"), ("empty", "")):
@@ -1015,8 +1038,9 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assert_no_candidate_anywhere_in_the_outbox()
 
     def test_the_225_sibling_a_view_changed_capture_with_an_array_root_manifest_and_no_marker_or_result_is_not_indexable(self) -> None:
-        # the 225 sibling (pre-existing code, same pattern), on a default (no -GpuPlaybackRecon) job: the capture is written straight into the outbox
-        ran, *_ = self.run_stand_in_capture("a1-array225", edit=self.VIEW_CHANGED,
+        # the 225 sibling on an 'on' job (the recon is proven, so only the view change voids it). An 'off' job's 225 path is the base's, byte for byte, and is not
+        # changed by this card (test_the_default_job_keeps_the_exact_text_around_every_recon_seam pins its text).
+        ran, *_ = self.run_stand_in_capture("a1-array225", generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line(), edit=self.VIEW_CHANGED,
                                             more_edits=(self.CANDIDATE_MANIFEST_ARRAY_ROOT, self.MARKER_PUBLISH_FAILS, self.FALLBACK_RESULT_NOT_WRITTEN, self.RESULT_PUBLISH_FAILS))
         self.assertIn("CANDIDATE_NOT_INVALIDATED", ran.stdout, "the stamp claimed to land on a manifest whose root is not an object")
         self.assert_no_candidate_anywhere_in_the_outbox()
