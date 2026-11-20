@@ -741,10 +741,12 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         return {key: value for key, value in pairs}
 
     @staticmethod
-    def gpu_summary_line(session: object = 0, cpu: object = 0, recon: object = 480, texture_readback: object = 0, texture_no_readback: object = 0) -> str:
-        """The app's playback_smoke.gpu_summary record (MainWindow.cpp prints exactly these fields), after the stand-in's summary line (session=0)."""
+    def gpu_summary_line(session: object = 0, cpu: object = 0, recon: object = 480, texture_readback: object = 0, texture_no_readback: object = 0,
+                         suffix: str = "") -> str:
+        """The app's playback_smoke.gpu_summary record (MainWindow.cpp prints exactly these fields), after the stand-in's summary line (session=0).
+        suffix is whatever the log's message pattern appends after the six fields (for example a source location)."""
         return (f"t2 playback_smoke.gpu_summary session={session} cpu_frames={cpu} gpu_preview_frames=0 gpu_recon_readback_frames={recon} "
-                f"gpu_texture_readback_frames={texture_readback} gpu_texture_no_readback_frames={texture_no_readback}\n")
+                f"gpu_texture_readback_frames={texture_readback} gpu_texture_no_readback_frames={texture_no_readback}{suffix}\n")
 
     def test_a_recon_on_job_launches_the_app_with_the_recon_env_and_records_it_in_result_json(self) -> None:
         probe = self.tmp / "recon-on-env.txt"
@@ -803,6 +805,26 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         for label, bad in (("hex", "0x0"), ("empty", ""), ("null", "null")):
             with self.subTest(label):
                 self.assert_recon_not_proven(f"recon-bad-{label}", self.gpu_summary_line(cpu=bad), "COUNTER_NOT_NUMERIC")
+
+    # --- adversary A1 on bdf4b3a5 (pass 2, introduced major): a trailing source-location suffix must never overwrite the app's own counters ----------
+    FAKE_LOCATION_SUFFIX = " (C:/build cpu_frames=0 gpu_recon_readback_frames=480 x/platform/qt/MainWindow.cpp:31715)"
+
+    def test_a_recon_on_capture_whose_log_line_carries_counter_lookalikes_after_the_real_fields_is_not_a_candidate(self) -> None:
+        # the adversary's input: the real counters say 480 CPU frames and no GPU frame; a location suffix then spells 'cpu_frames=0 ... =480'
+        self.assert_recon_not_proven("recon-suffix-overwrite", self.gpu_summary_line(cpu=480, recon=0, suffix=self.FAKE_LOCATION_SUFFIX), "CPU_FRAMES_NONZERO")
+
+    def test_a_recon_on_capture_whose_counter_run_repeats_a_counter_is_not_a_candidate(self) -> None:
+        # the same class without a separating token: a repeated key inside the contiguous key=value run is ambiguous, so it is unproven (never last-wins)
+        self.assert_recon_not_proven("recon-duplicate-counter", self.gpu_summary_line(cpu=480, recon=0, suffix=" cpu_frames=0 gpu_recon_readback_frames=480"),
+                                     "COUNTER_DUPLICATE")
+
+    def test_a_recon_on_capture_with_the_real_counters_and_a_trailing_source_location_is_still_a_candidate(self) -> None:
+        # the gate must not turn a harmless suffix into a false refusal: the location here carries no counter-shaped token
+        ran, pub, *_ = self.run_stand_in_capture("recon-suffix-ok", generator_args=("-GpuPlaybackRecon", "on"),
+                                                 app_log_extra=self.gpu_summary_line(suffix=" (C:/build x/platform/qt/MainWindow.cpp:31715)"))
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["status"], result["gpuReconEvidence"]["cpuFrames"], result["gpuReconEvidence"]["reconFrames"]), ("candidate-unreviewed", 0, 480))
 
     def test_a_default_job_does_not_read_the_gpu_summary_and_still_passes_with_cpu_frames(self) -> None:
         # off = CPU reconstruction is legitimate: the evidence gate belongs to 'on' only

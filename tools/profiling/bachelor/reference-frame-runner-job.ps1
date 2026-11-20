@@ -382,14 +382,24 @@ if ($captureRc -eq 0) {
         if ($null -eq $reconSession) { throw 'SUMMARY_LINE_ABSENT' }
         $reconEvidence.session = $reconSession
         $reconFields = $null
+        $reconDuplicate = ''
         foreach ($reconLine in $reconLogLines) {
             $reconMatch = [regex]::Match($reconLine, 'playback_smoke\.gpu_summary session=' + $reconSession + ' (?<rest>.*)$')
             if ($reconMatch.Success) {
+                # Only the contiguous run of key=value tokens right after the session is the app's record. Whatever the log's message pattern appends after it
+                # (a source location, which can itself spell counter-shaped text) is never read, and a key repeated inside the run is ambiguous: unproven, never last-wins.
                 $reconFields = @{}
-                foreach ($reconPair in [regex]::Matches($reconMatch.Groups['rest'].Value, '([A-Za-z0-9_]+)=(\S*)')) { $reconFields[$reconPair.Groups[1].Value] = $reconPair.Groups[2].Value }
+                $reconDuplicate = ''
+                foreach ($reconToken in ($reconMatch.Groups['rest'].Value -split '\s+')) {
+                    $reconPair = [regex]::Match($reconToken, '^([A-Za-z0-9_]+)=(\S*)$')
+                    if (-not $reconPair.Success) { break }
+                    if ($reconFields.ContainsKey($reconPair.Groups[1].Value)) { $reconDuplicate = $reconPair.Groups[1].Value; break }
+                    $reconFields[$reconPair.Groups[1].Value] = $reconPair.Groups[2].Value
+                }
             }
         }
         if ($null -eq $reconFields) { throw 'GPU_SUMMARY_ABSENT' }
+        if ($reconDuplicate -ne '') { throw "COUNTER_DUPLICATE $reconDuplicate" }
         $reconCounts = @{}
         foreach ($reconKey in 'cpu_frames', 'gpu_recon_readback_frames', 'gpu_texture_readback_frames', 'gpu_texture_no_readback_frames') {
             if (-not $reconFields.ContainsKey($reconKey)) { throw "COUNTER_ABSENT $reconKey" }
