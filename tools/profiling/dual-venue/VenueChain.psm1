@@ -233,7 +233,7 @@ function New-VenueTicket {
         $fields = [ordered]@{
             schema = $script:TicketSchema; venue = $Venue; ownerPid = $OwnerPid; ownerCreatedUtc = $ownerStart.ToString('o'); host = $env:COMPUTERNAME
             runDir = $RunDir; purpose = $Purpose; createdUtc = $now.ToString('o'); heartbeatUtc = $now.ToString('o'); staleAfterSec = $StaleAfterSec
-            phase = $Phase; nonce = [guid]::NewGuid().ToString('N')
+            phase = $Phase.ToLowerInvariant(); nonce = [guid]::NewGuid().ToString('N')   # ValidateSet is case-insensitive: one stored spelling
         }
         $bytes = ConvertTo-VenueTicketBytes $fields
         try {
@@ -392,7 +392,7 @@ function Request-VenueClaim {
     $position = $(if ($mine.Count -gt 0) { [int]$mine[0].position } else { 0 })
     # VENUE-FIFO-TICKET-BEFORE-PRECLAIM-1: the head is the oldest live ticket that is READY. A ticket in phase 'cooldown' (its holder is waiting out Bachelor's lease cooldown or budget and
     # cannot take the claim yet) keeps its place but never blocks a ready waiter behind it; the caller's own ticket was just refreshed to 'waiting', so it is always ready.
-    $head = @($live | Where-Object { $_.name -ceq $t.name -or [string]$_.ticket.phase -cne 'cooldown' } | Select-Object -First 1)
+    $head = @($live | Where-Object { $_.name -ceq $t.name -or [string]$_.ticket.phase -ine 'cooldown' } | Select-Object -First 1)   # -ine: a ticket written with any spelling of cooldown is still not ready
     if ($head.Count -eq 0 -or $head[0].name -cne $t.name) {
         $seen = Get-VenueClaim -Venue $Venue -ClaimDir $ClaimDir
         return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $seen.claim; path = $seen.path; broken = @(); ticket = $t; queue = $live; position = $position; staleTickets = @($removed) }

@@ -1004,7 +1004,7 @@ class VenueLeaseBatchFifoTests(unittest.TestCase):
             raise AssertionError(f"scenario failed ({r.returncode}):\n{r.stdout}\n{r.stderr}")
         return json.loads([l for l in r.stdout.splitlines() if l.strip()][-1])
 
-    def start_batch(self, name: str, claim_poll: int) -> subprocess.Popen:
+    def start_batch(self, name: str, claim_poll: int, specs: str = "", extra: tuple = (), cooldown: str = "0", **env: str) -> subprocess.Popen:
         run_dir, share = self.case / f"run-{name}", self.case / f"share-{name}"
         share.mkdir()
         (share / "cancel").mkdir()
@@ -1012,10 +1012,11 @@ class VenueLeaseBatchFifoTests(unittest.TestCase):
         e = dict(os.environ)
         e.update({"FAKE_EVENTS": str(self.case / f"events-{name}.log"), "FAKE_SHARE": str(share), "FAKE_CLAIM_PATH": str(self.claim_path), "FAKE_LEG_ROOT": str(self.case / f"root-{name}"),
                   "FAKE_CAPS_EVENTS": str(self.case / f"caps-{name}.log")})
-        args = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(LEASE_RUNNER), "-LegSpec", str(self.spec), "-RunDir", str(run_dir), "-SourceCommit", "a" * 40,
+        e.update(env)
+        args = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(LEASE_RUNNER), "-LegSpec", specs or str(self.spec), "-RunDir", str(run_dir), "-SourceCommit", "a" * 40,
                 "-BuildManifestSha256", "b" * 64, "-ClaimDir", str(self.claims), "-QuietScript", str(self.tmp / "fake-quiet.ps1"), "-LegScript", str(self.tmp / "fake-leg.ps1"),
                 "-UmRunScript", str(self.tmp / "fake-umrun.ps1"), "-AgentShare", str(share), "-LegBudgetSec", "60", "-LeaseMarginSec", "0", "-ClaimPollSec", str(claim_poll),
-                "-RecheckSec", "1", "-LeaseCooldownSec", "0", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=200))]
+                "-RecheckSec", "1", "-LeaseCooldownSec", cooldown, "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=200)), *extra]
         out_path = self.case / f"stdout-{name}.txt"
         with open(out_path, "w", encoding="utf-8") as out_file:
             p = subprocess.Popen(args, stdout=out_file, stderr=subprocess.STDOUT, text=True, env=e)
@@ -1092,6 +1093,54 @@ $relA = Release-VenueClaim -Venue bachelor -Nonce $a1.claim.nonce -ClaimDir $d
         self.assertEqual(r["phaseAfter"], "waiting", "a request refreshes the caller's ticket to ready")
         self.assertEqual((r["c1"], r["c1Granted"]), ("QUEUED", False), "C arrived after A and A is now ready ahead of it: C waits behind A")
         self.assertEqual(r["relA"], "RELEASED")
+
+    CASE_SPELLING = """
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d -Phase COOLDOWN -StaleAfterSec 600
+Start-Sleep -Milliseconds 30
+$B = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$phaseA = (Get-VenueTickets -Venue bachelor -ClaimDir $d | Where-Object { $_.ticket.runDir -eq 'run-A' }).ticket.phase
+$b1 = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $B
+[pscustomobject]@{ phaseA = $phaseA; b1 = $b1.state; b1Granted = [bool]$b1.granted } | ConvertTo-Json -Compress
+"""
+
+    def test_a_cooldown_phase_in_any_letter_case_is_stored_as_cooldown_and_never_blocks_a_ready_waiter(self) -> None:
+        # adversary A2 (r3 pass 1): ValidateSet accepts COOLDOWN and kept it, the case-sensitive readiness test then took the not-ready ticket for the ready head, and B was QUEUED behind it
+        r = self.ps(self.CASE_SPELLING)
+        self.assertEqual(r["phaseA"], "cooldown", "the phase is stored in its one spelling")
+        self.assertEqual((r["b1"], r["b1Granted"]), ("TAKEN", True), "a cooldown ticket, however spelled, never blocks a ready waiter behind it")
+
+    def test_a_cooldown_ticket_is_kept_alive_by_a_heartbeat_not_a_lifetime_as_long_as_the_wait(self) -> None:
+        # adversary A3 (r3 pass 1): the ticket lived waitSec + 120 s, clamped to 86400 s, so a 172800 s cooldown (2880 min) let a ready waiter reap the live holder's ticket mid-wait
+        # and the holder came back behind it. Now the lifetime is short and the wait refreshes the heartbeat (-TicketBeatSec).
+        spec_b = self.tmp / "fx-b.json"
+        spec_b.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "card": "TEST-CARD", "legId": "fx-b", "backends": ["cpu", "cuda"], "scaleFactor": 1}), encoding="utf-8")
+        p = self.start_batch("W", claim_poll=1, specs=f"{self.spec},{spec_b}", extra=("-TicketBeatSec", "1"), cooldown="14", FAKE_LEASE_REMAIN="70,2700", FAKE_LEG_REMAIN="50,2600")
+        self.wait_for(lambda: "BATCH_WAIT batch=2" in self.batch_log(p), "batch 2 waiting out the cooldown")
+        def ticket() -> dict:
+            files = list(self.ticket_dir.glob("*.ticket.json")) if self.ticket_dir.exists() else []
+            self.assertEqual(len(files), 1, f"one cooldown ticket expected, found {files}\n{self.batch_log(p)}")
+            return json.loads(files[0].read_text(encoding="utf-8"))
+        t1 = ticket()
+        self.assertEqual(t1["phase"], "cooldown")
+        self.assertLessEqual(t1["staleAfterSec"], 900, "the ticket's lifetime must not grow with the wait")
+        time.sleep(4.0)
+        t2 = ticket()
+        self.assertNotEqual(t1["heartbeatUtc"], t2["heartbeatUtc"], "the wait refreshed no heartbeat: a long cooldown outlives its ticket")
+        p.wait(timeout=180)
+
+    def test_the_ticket_is_never_removed_by_unbounded_io_on_a_deadline_bound_path(self) -> None:
+        # adversary A1 (r3 pass 1): Close-BatchTicket ran Remove-VenueTicket inline in the input-guard refusal and the DEADLINE break, ahead of the bounded release and the typed refusal;
+        # a claim folder that stalls held them past -DeadlineUtc. Those paths leave the ticket to be reaped as dead-pid (the process ends right after); the grant path removes it bounded.
+        import re
+        run = LEASE_RUNNER.read_text(encoding="utf-8")
+        func = re.search(r"function Close-BatchTicket.*?\n}\n", run, re.S)
+        self.assertIsNotNone(func)
+        self.assertIn("Invoke-VenueBoundedRead", func.group(0), "the ticket removal is not bounded")
+        self.assertNotRegex(func.group(0), r"Remove-VenueTicket \$t\)\s*\}\s*catch", "the ticket is removed inline")
+        hit_block = run[run.index("        if ($hit) {"):run.index("        if ($hit) {") + 700]
+        self.assertNotIn("Close-BatchTicket", hit_block, "the input-guard refusal removes the ticket inline")
+        dl_block = run[run.index("    if ($null -eq $claim) {"):run.index("    if ($null -eq $claim) {") + 400]
+        self.assertNotIn("Close-BatchTicket", dl_block, "the DEADLINE break removes the ticket inline")
 
     def test_the_lease_batch_header_documents_the_ticket(self) -> None:
         run = LEASE_RUNNER.read_text(encoding="utf-8")
