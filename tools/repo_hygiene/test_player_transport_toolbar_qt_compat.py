@@ -169,6 +169,8 @@ _INT_LITERAL = re.compile(
 #       A comment, a line break or a splice between the accessor and the name, a bare name, a macro
 #       alias and a using-declaration all reach it (adversary r1 A1 on 792b6c2e); or
 #   (3) the lexer does not read the text, or cannot trust where its tokens and literals end, and,
+#       as it is and (when it has a NUL) read as UTF-16 and UTF-32 of either byte order, so a source
+#       U+0000 is told from the encoding's zero bytes (r3, adversary r3 pass 6 A1),
 #       with NULs dropped (a UTF-16 file) or read as whitespace (GCC), `??/` read as a backslash and
 #       not, every splice joined (a NUL before the break included), and with no escape decoded or
 #       every universal-character-name decoded (`\uXXXX`, `\UXXXXXXXX`, `\u{...}`, `\N{...}`), a
@@ -183,9 +185,10 @@ _INT_LITERAL = re.compile(
 # NON-PROMISE: it is a tripwire for the Qt 6.9 QImage names only. A name assembled by a token paste
 # (`##`) or by a macro defined in another file is not seen (the strict scanner refuses a paste in the
 # scoped files); a file outside platform/qt and src, and a git-ignored one (a PR cannot carry it; a
-# force-added file is tracked and read), are not read; a source charset other than UTF-8, or UTF-16
-# holding ASCII, is not decoded. It is the strict scanner, not this tripwire, that judges a use
-# guarded or not.
+# force-added file is tracked and read), are not read; a source charset other than UTF-8, UTF-16 and
+# UTF-32 (both byte orders; rule 3 reads a text with a NUL in each, r3) is not decoded, and no
+# compiler's identifier-character table is modelled. It is the strict scanner, not this tripwire,
+# that judges a use guarded or not.
 QT69_MEMBER_USE = re.compile(r"(?:\.|->|::)[ \t]*(?:flipped|flip)\b")
 QT69_NAME = re.compile(r"\b(?:flipped|flip)\b")
 # r3 (fable r2 B1 on 956d41f8): an escape is decoded only where its whole span could be one escape to
@@ -235,14 +238,65 @@ def _rule3_views(text: str) -> list[str]:
     decoded (r3, fable r2 B1: only the decoded form was kept, so a decoding that deleted code hid
     the name from every check). NULs go before CR, LF and CRLF are read as line ends (adversary r2
     pass 2 A1 on 1c3a909d: a UTF-16 CRLF, `\\r\\0\\n\\0`, read first as two line breaks, left
-    `fl\\nipped` after a splice)."""
+    `fl\\nipped` after a splice). A text with a NUL is also read as each wide charset first, so a
+    source U+0000 is told from the encoding's zero bytes (adversary r3 pass 6 A1 on e47e4787: a
+    UTF-16 `flipped\\0EMPTY` read with every zero byte dropped or spaced held no name)."""
     views = []
-    for nul in ("", " "):
-        lf = _lf_only(text.replace("\x00", nul))
-        for form in (lf.replace("??/", "\\"), lf):
-            spliced = SPLICE.sub("", form)
-            views.extend((spliced, UCN.sub(_decode_ucn, spliced)))
+    for source in (text, *_wide_charset_texts(text)):
+        for nul in ("", " "):
+            lf = _lf_only(source.replace("\x00", nul))
+            for form in (lf.replace("??/", "\\"), lf):
+                spliced = SPLICE.sub("", form)
+                views.extend((spliced, UCN.sub(_decode_ucn, spliced)))
     return views
+
+
+WIDE_CHARSETS = ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
+# Where a view can differ from the text with its NULs dropped or spaced: a `??/`, a backslash that a
+# dropped NUL may join to a UCN's u, U or N, and a splice (a NUL counts as whitespace before its line
+# break). A wide reading with none of them and no `flip` once its NULs are dropped can put no name in
+# any view, so its views are not built: a binary under the roots reads as UTF-16 noise.
+WIDE_VIEW_NEEDED = re.compile(r"\?\?/|\\\x00*[uUN]|\\[ \t\f\v\x00]*[\r\n]")
+
+
+def _wide_bytes_prefilter() -> re.Pattern:
+    """The same four forms, and `flip` with U+0000s between its letters, as raw bytes in UTF-16 and
+    UTF-32 of either byte order, before any decoding: an ASCII character is the 16-bit unit `c\\0`
+    (little-endian) or `\\0c` (big-endian) in all four, and a U+0000 is zero units. Decoding a
+    tracked 38 MB archive four ways took 2.5 s for nothing, and these unit sequences do not occur
+    in compressed bytes."""
+    alternatives = []
+    nul_units = rb"(?:\x00\x00)*"
+    for little in (True, False):
+        def unit(cls: bytes, little: bool = little) -> bytes:
+            return cls + rb"\x00" if little else rb"\x00" + cls
+        alternatives += [
+            nul_units.join(unit(c) for c in (b"f", b"l", b"i", b"p")),
+            nul_units.join(unit(c) for c in (rb"\?", rb"\?", b"/")),
+            unit(rb"\\") + nul_units + unit(b"[uUN]"),
+            unit(rb"\\") + rb"(?:" + unit(rb"[\x00 \t\x0b\x0c]") + rb")*" + unit(rb"[\r\n]"),
+        ]
+    return re.compile(b"|".join(alternatives))
+
+
+WIDE_BYTES_NEEDED = _wide_bytes_prefilter()
+
+
+def _wide_charset_texts(text: str) -> list[str]:
+    """`text`'s bytes read as UTF-16 and UTF-32 in both byte orders, when it has a NUL (an ASCII
+    character in a wide charset always does); a reading is dropped when no view of it can hold a
+    name (WIDE_BYTES_NEEDED, WIDE_VIEW_NEEDED). The bytes are exact for a text read with
+    surrogateescape (_tripwire_texts); a lossy decode can shift the code units after a bad byte."""
+    if "\x00" not in text:
+        return []
+    try:
+        data = text.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        data = text.encode("utf-8", "surrogatepass")
+    if not WIDE_BYTES_NEEDED.search(data):
+        return []
+    readings = (data.decode(charset, errors="replace") for charset in WIDE_CHARSETS)
+    return [wide for wide in readings if "flip" in wide.replace("\x00", "") or WIDE_VIEW_NEEDED.search(wide)]
 
 
 def _reaches_qt69_name(text: str) -> bool:
@@ -294,7 +348,8 @@ def _tripwire_paths(root: Path) -> list[Path]:
 
 
 def _tripwire_texts(root: Path = ROOT) -> dict[str, str]:
-    return {str(path): path.read_bytes().decode("utf-8", errors="replace") for path in _tripwire_paths(root)}
+    # surrogateescape keeps the bytes exact, so a wide-charset reading stays aligned (adversary r3 pass 6 A1).
+    return {str(path): path.read_bytes().decode("utf-8", errors="surrogateescape") for path in _tripwire_paths(root)}
 
 
 def _pp_int(token: str) -> int | None:
@@ -680,6 +735,33 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
         text = "auto r = image.flippedCopy();\r\n".encode("utf-16").decode("utf-8", errors="replace")
         self.assertEqual(files_needing_scan({"f": text}), set())
 
+    def test_rule_3_decodes_a_wide_charset_before_it_reads_a_source_nul(self) -> None:
+        # adversary r3 pass 6 A1 (e47e4787): a UTF-16 source holding a real U+0000 (`flipped\0EMPTY`) was
+        # read only with every zero byte dropped (`flippedEMPTY`) or read as a space (`f l i p p e d`), so
+        # neither view held the name. GCC with -finput-charset=UTF-16LE decodes the charset first and then
+        # reads the U+0000 as whitespace. Its input, both names, both byte orders and a BOM, and UTF-32.
+        for head in ("flipped", "flip"):
+            source = f"#define EMPTY\n#define QT69_READBACK(image) image . /**/ {head}\x00EMPTY(Qt::Vertical)\n"
+            for encoding in ("utf-16-le", "utf-16-be", "utf-16", "utf-32-le", "utf-32-be", "utf-32"):
+                text = source.encode(encoding).decode("utf-8", errors="replace")
+                with self.subTest(name=head, encoding=encoding):
+                    self.assertEqual(files_needing_scan({"platform/qt/Qt69Readback.h": text}),
+                                     {"platform/qt/Qt69Readback.h"})
+        # Each route the byte prefilter (WIDE_BYTES_NEEDED) lets through, with the U+0000 after the name:
+        # a UCN, a splice with a U+0000 (whitespace to GCC) before its CRLF, and a `??/` splice.
+        for spelled in ("fl\\u0069pped", "fl\\\x00\r\nipped", "fl??/\nipped"):
+            source = f"auto r = image . /**/ {spelled}\x00EMPTY(Qt::Vertical);\n"
+            for encoding in ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"):
+                text = source.encode(encoding).decode("utf-8", errors="replace")
+                with self.subTest(spelled=spelled, encoding=encoding):
+                    self.assertEqual(files_needing_scan({"f": text}), {"f"})
+        # A wide text with only a longer name is still not flagged.
+        for source in ("auto r = image.flippedCopy\x00X();\n", "auto r = image.unflipped();\n"):
+            for encoding in ("utf-16-le", "utf-32-be"):
+                text = source.encode(encoding).decode("utf-8", errors="replace")
+                with self.subTest(source=source, encoding=encoding):
+                    self.assertEqual(files_needing_scan({"f": text}), set())
+
     def test_ucn_decoding_never_deletes_text_a_compiler_reads_as_code(self) -> None:
         # fable r2 B1 (956d41f8): `\N{([^}\n]*)}` ran over comments and literals, so a `\N{` in a comment
         # and a `}` later on the line swallowed the call between them; the failed name lookup became
@@ -747,6 +829,11 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
             "platform/qt/Makefile": b"GpuDisplayWindow.o: C:\\Users\\x\\flipper.cpp\n",
             "src/k/nul.txt": b"x();\x00 auto f = flipped;\n",
             "src/k/icon.png": b"\x89PNG\x00\x01flipX\x00",
+            # adversary r3 pass 6 A1: a UTF-16 header with a source U+0000 after the name. U+82E2 is the
+            # bytes E2 82, a cut UTF-8 sequence that a lossy decode turns into one U+FFFD; the file is
+            # read byte-exact, so its UTF-16 code units stay aligned.
+            "src/k/wide.h": ("// 苢\n#define EMPTY\nauto r = image . /**/ flipped\x00EMPTY(Qt::Vertical);\n"
+                             ).encode("utf-16-le"),
         }
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -756,7 +843,7 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
             texts = _tripwire_texts(root)
             self.assertEqual(sorted(texts), sorted(str(root / name) for name in files))
             expected = ("platform/qt/qt69-readback.txt", "platform/qt/qt69-inner.txt",
-                        "platform/qt/Makefile.qt69.cpp", "src/k/nul.txt")
+                        "platform/qt/Makefile.qt69.cpp", "src/k/nul.txt", "src/k/wide.h")
             self.assertEqual(files_needing_scan(texts), {str(root / name) for name in expected})
 
     def test_scanner_flags_the_09077b0d_shape(self) -> None:
