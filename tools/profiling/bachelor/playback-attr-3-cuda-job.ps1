@@ -8439,26 +8439,28 @@ function Stop-ClocksPowerAll($GpuStart, $CpuStart, [int]$WaitMs, $Prev = $null) 
     $r
 }
 
-# The summary.json block. status ok (both sides usable, with a Play window; a skipped_wake_risk GPU side is a designed outcome and counts as usable),
-# partial (one side usable, or no window), unavailable (neither). reason names every side that is not ok ('+'-joined). warmup marks a warm-up leg:
-# its samples are kept and published like any other. rawFile names the published CSV.
+# The summary.json block. BENCH-CLOCKS-POWER-LOG-1 r8 DESCOPE: the status reflects the CPU half ONLY. The GPU half is an ADVISORY disclosure (gpu.advisory
+# true, gpu.advisoryReason): on the venue its witness refused every window (0 of 51 samples in r5 and r7), so it can never set the status, name itself in
+# the reason, or gate a leg. status ok (CPU usable, with a Play window), partial (CPU partial, or CPU usable with no window), unavailable (CPU not
+# usable). reason names the CPU side when it is not ok and a missing window ('+'-joined). warmup marks a warm-up leg: its samples are kept and
+# published like any other. rawFile names the published CSV (the GPU raw file stays published: it is the evidence BENCH-GPU-CLOCKS-FLUSH-1 needs).
 function Get-ClocksPowerBlock($Gpu, $Cpu, $Platform, $Window, [bool]$Warmup, [int]$IntervalMs, [string]$GpuFile, [string]$CpuFile) {
     if ($null -eq $Gpu) { $Gpu = Get-ClocksPowerGpuSummary $null $null $null }
     if ($null -eq $Cpu) { $Cpu = Get-ClocksPowerCpuSummary $null $null $null }
     if ($null -eq $Platform) { $Platform = [ordered]@{ powerPlan = 'UNAVAILABLE(not-read)'; acState = 'UNAVAILABLE(not-read)'; display = 'UNAVAILABLE(not-read)' } }
-    $gpuUsable = ($Gpu.status -ceq 'ok' -or $Gpu.status -ceq 'skipped_wake_risk')
     $cpuUsable = ($Cpu.status -ceq 'ok')
     $hasWindow = ($null -ne $Window)
     $status = 'unavailable'
-    if ($gpuUsable -and $cpuUsable) { $status = $(if ($hasWindow) { 'ok' } else { 'partial' }) }
-    elseif ($gpuUsable -or $cpuUsable -or $Gpu.status -like 'partial*' -or $Cpu.status -like 'partial*') { $status = 'partial' }
+    if ($cpuUsable) { $status = $(if ($hasWindow) { 'ok' } else { 'partial' }) }
+    elseif ($Cpu.status -like 'partial*') { $status = 'partial' }
     $why = [Collections.Generic.List[string]]::new()
-    if ($Gpu.status -cne 'ok') { $why.Add('gpu=' + $Gpu.status) }
     if ($Cpu.status -cne 'ok') { $why.Add('cpu=' + $Cpu.status) }
     if (-not $hasWindow) { $why.Add('window=no_window') }
     $win = $null
     if ($hasWindow) { $win = [ordered]@{ startUtc = $Window.startUtc.ToString('o'); endUtc = $Window.endUtc.ToString('o') } }
     $g = [ordered]@{}; foreach ($k in $Gpu.Keys) { $g[$k] = $Gpu[$k] }; $g['rawFile'] = $GpuFile
+    $g['advisory'] = $true
+    $g['advisoryReason'] = 'GPU clocks/power is disclosure only: the GPU witness refused every window on the venue (0 of 51 samples in r5 and r7); this block never sets clocksPowerStatus or gates a leg (follow-up BENCH-GPU-CLOCKS-FLUSH-1)'
     $c = [ordered]@{}; foreach ($k in $Cpu.Keys) { $c[$k] = $Cpu[$k] }; $c['rawFile'] = $CpuFile
     $c['effectiveMhzNote'] = 'derived: Processor Frequency x % Processor Performance / 100'
     [ordered]@{ status = $status; reason = $(if ($why.Count -gt 0) { $why -join '+' } else { $null }); warmup = $Warmup; intervalMs = $IntervalMs; windowStatus = $(if ($hasWindow) { 'ok' } else { 'no_window' }); window = $win; platform = $Platform; gpu = $g; cpu = $c }

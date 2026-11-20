@@ -1045,6 +1045,116 @@ class ClocksPowerRoundSevenTests(unittest.TestCase):
             self.assertRegex(ln, r"if \(\$null -ne \$(?:script:)?clocksPower(?:Gpu|Cpu)Read\) \{ Close-ClocksPowerHold ", ln)
 
 
+# Round 8 (DESCOPE, hub ruling 2026-11-20T15:50Z): the GPU half is an ADVISORY disclosure. On the venue the GPU witness refused every window (0 of 51
+# samples in r5 and r7), so the GPU block can never set clocksPowerStatus, never names itself in the reason and never gates a leg; the status
+# reflects the CPU half only. The GPU raw file stays published (it is the evidence BENCH-GPU-CLOCKS-FLUSH-1 needs).
+DRIVER_R8 = r"""
+function J($v) { $v | ConvertTo-Json -Depth 8 -Compress }
+function T($sb) { try { & $sb } catch { 'ERR: ' + $_.Exception.Message } }
+$r = [ordered]@{}
+$cst = [TimeZoneInfo]::FindSystemTimeZoneById('Central Standard Time')
+$running = [ordered]@{ status = 'running'; reason = $null }
+$inv = [Globalization.CultureInfo]::InvariantCulture
+function GpuAt([double[]]$secs) {
+    $t = ''
+    foreach ($s in $secs) { $t += ("2026/11/01 08:00:{0}, 1500, 1500, 6000, 50.00, 80.00, 60, 0x0000000000000000`n" -f $s.ToString('00.000', $inv)) }
+    ConvertFrom-ClocksPowerGpuCsv $t $cst
+}
+function CpuAt([double[]]$secs) {
+    $t = "`"(PDH-CSV 4.0) (Central Standard Time)(360)`",`"\\B\Processor Information(_Total)\% Processor Performance`",`"\\B\Processor Information(_Total)\Processor Frequency`"`n"
+    foreach ($s in $secs) { $t += ("`"11/01/2026 08:00:{0}`",`"100.0`",`"2000.0`"`n" -f $s.ToString('00.000', $inv)) }
+    ConvertFrom-ClocksPowerCpuCsv $t $cst
+}
+function Chk($interval, $net, $width) { $c = [ordered]@{ intervalMs = $interval; netStepMs = $net }; if ($null -ne $width) { $c['captureWidthMs'] = $width }; $c }
+$win = [ordered]@{ startUtc = [DateTime]::new(2026, 11, 1, 14, 0, 3, 0, [DateTimeKind]::Utc); endUtc = [DateTime]::new(2026, 11, 1, 14, 0, 50, 0, [DateTimeKind]::Utc); clockWhy = $null }
+$plat = [ordered]@{ powerPlan = 'Balanced'; acState = 'ac'; display = 'x' }
+# a GPU window the witness refuses: a row every 1.0 s with ONE 1.55 s gap (the venue's measured shape, 0 of 51 samples)
+$gpuSecs = @(); $t0 = 0.1; for ($k = 0; $k -lt 51; $k++) { $gpuSecs += $t0; $t0 += $(if ($k -eq 25) { 1.55 } else { 1.0 }) }
+$gpuBad = T { Get-ClocksPowerGpuSummary (GpuAt $gpuSecs) $running $win $null (Chk 1000 0 5) }
+$gpuOk = T { Get-ClocksPowerGpuSummary (GpuAt @(10, 11, 12, 13, 14)) $running $win $null (Chk 1000 0 5) }
+$cpuOk = T { Get-ClocksPowerCpuSummary (CpuAt @(10, 11, 12, 13, 14)) $running $win $null (Chk 1000 0 5) }
+$cpuNoWin = T { Get-ClocksPowerCpuSummary (CpuAt @(10, 11, 12, 13, 14)) $running $null }
+$cpuDead = T { Get-ClocksPowerCpuSummary $null ([ordered]@{ status = 'unavailable'; reason = 'typeperf-missing' }) $win }
+$r['gpuBadStatus'] = $gpuBad.status
+$r['cpuOkStatus'] = $cpuOk.status
+$r['cpuDeadStatus'] = $cpuDead.status
+$r['cpuNoWinStatus'] = $cpuNoWin.status
+$b1 = T { Get-ClocksPowerBlock $gpuBad $cpuOk $plat $win $false 1000 'gpu-clocks.csv' 'cpu-clocks.csv' }
+$r['refusedGpuCpuOk'] = T { @{ status = $b1.status; reason = $b1.reason; gpuStatus = $b1.gpu.status; advisory = $b1.gpu.advisory; why = [string]$b1.gpu.advisoryReason; gaps = $b1.gpu.rowGapMs; raw = $b1.gpu.rawFile; samples = $b1.gpu.samples; total = $b1.gpu.samplesTotal; cpuAdvisory = ($b1.cpu.Contains('advisory')) } }
+$b2 = T { Get-ClocksPowerBlock $gpuOk $cpuDead $plat $win $false 1000 'gpu-clocks.csv' 'cpu-clocks.csv' }
+$r['gpuOkCpuDead'] = T { @{ status = $b2.status; reason = [string]$b2.reason; advisory = $b2.gpu.advisory } }
+$b3 = T { Get-ClocksPowerBlock $null $cpuOk $plat $null $false 1000 'gpu-clocks.csv' 'cpu-clocks.csv' }
+$r['gpuNullCpuOkNoWindow'] = T { @{ status = $b3.status; reason = [string]$b3.reason; advisory = $b3.gpu.advisory } }
+$b4 = T { Get-ClocksPowerBlock $gpuBad $cpuNoWin $plat $win $false 1000 'gpu-clocks.csv' 'cpu-clocks.csv' }
+$r['cpuPartial'] = T { @{ status = $b4.status; reason = [string]$b4.reason } }
+$b5 = T { Get-ClocksPowerBlock $gpuOk $cpuOk $plat $win $false 1000 'gpu-clocks.csv' 'cpu-clocks.csv' }
+$r['bothOk'] = T { @{ status = $b5.status; reason = $b5.reason; advisory = $b5.gpu.advisory } }
+$b6 = T { Get-ClocksPowerBlock $null $null $null $null $false 1000 'gpu-clocks.csv' 'cpu-clocks.csv' }
+$r['noneAtAll'] = T { @{ status = $b6.status; reason = [string]$b6.reason; advisory = $b6.gpu.advisory } }
+J $r
+"""
+
+
+@requires_windows_pwsh
+class ClocksPowerRoundEightTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="clocks-power-r8-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        script = Path(cls._tmp.name) / "driver.ps1"
+        script.write_text(LIFT + DRIVER_R8, encoding="utf-8")
+        proc = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_TMP": cls._tmp.name})
+        cls.raw = proc
+        cls.r = json.loads(proc.stdout.strip().splitlines()[-1]) if proc.returncode == 0 and proc.stdout.strip() else None
+        cls.text = lf(GENERATOR.read_text(encoding="utf-8"))
+
+    def setUp(self) -> None:
+        self.assertIsNotNone(self.r, f"the lifted helpers did not run: {self.raw.stdout[-3000:]}{self.raw.stderr[-3000:]}")
+
+    def test_r8_the_fixture_shapes_are_what_the_tests_say_they_are(self) -> None:
+        self.assertEqual(self.r["gpuBadStatus"], "unavailable(sample-clock-unverified)", "one 1.55 s gap among 1.0 s gaps: the venue's refusal shape")
+        self.assertEqual(self.r["cpuOkStatus"], "ok")
+        self.assertTrue(self.r["cpuDeadStatus"].startswith("unavailable("), self.r["cpuDeadStatus"])
+        self.assertEqual(self.r["cpuNoWinStatus"], "partial(no_window)")
+
+    def test_r8_a_refused_gpu_witness_never_sets_the_status_or_the_reason(self) -> None:
+        b = self.r["refusedGpuCpuOk"]
+        self.assertEqual((b["status"], b["reason"]), ("ok", None), "the CPU half is usable with a window: the block is ok, the GPU refusal is not a gate")
+        self.assertEqual(b["gpuStatus"], "unavailable(sample-clock-unverified)", "the GPU summary still says what happened")
+        self.assertEqual(b["samples"], 0)
+
+    def test_r8_the_gpu_block_is_marked_advisory_with_its_reason_and_row_gaps(self) -> None:
+        b = self.r["refusedGpuCpuOk"]
+        self.assertIs(b["advisory"], True)
+        self.assertIn("BENCH-GPU-CLOCKS-FLUSH-1", b["why"])
+        self.assertIn("never sets clocksPowerStatus", b["why"])
+        self.assertEqual(b["gaps"]["n"], 50, "the rowGapMs disclosure survives the descope")
+        self.assertEqual(b["gaps"]["maxMs"], 1550.0)
+        self.assertEqual(b["raw"], "gpu-clocks.csv", "the raw GPU file stays published: it is the evidence the follow-up card needs")
+        self.assertFalse(b["cpuAdvisory"], "only the GPU half is advisory")
+        for key in ("gpuOkCpuDead", "gpuNullCpuOkNoWindow", "bothOk", "noneAtAll"):
+            self.assertIs(self.r[key]["advisory"], True, key + ": the flag is on every GPU block, whatever its status")
+
+    def test_r8_the_status_reflects_the_cpu_half_only(self) -> None:
+        self.assertEqual(self.r["gpuOkCpuDead"]["status"], "unavailable", "a healthy GPU does not rescue a dead CPU half")
+        self.assertTrue(self.r["gpuOkCpuDead"]["reason"].startswith("cpu=unavailable("), self.r["gpuOkCpuDead"])
+        self.assertNotIn("gpu=", self.r["gpuOkCpuDead"]["reason"])
+        self.assertEqual(self.r["gpuNullCpuOkNoWindow"], {"status": "partial", "reason": "window=no_window", "advisory": True})
+        self.assertEqual(self.r["cpuPartial"], {"status": "partial", "reason": "cpu=partial(no_window)"})
+        self.assertEqual(self.r["bothOk"], {"status": "ok", "reason": None, "advisory": True})
+        n = self.r["noneAtAll"]
+        self.assertEqual(n["status"], "unavailable")
+        self.assertNotIn("gpu=", n["reason"])
+        self.assertIn("cpu=", n["reason"])
+
+    def test_r8_the_block_function_never_reads_the_gpu_status(self) -> None:
+        block = re.search(r"(?ms)^function Get-ClocksPowerBlock\b.*?^}", self.text)
+        self.assertIsNotNone(block)
+        body = block.group(0)
+        self.assertNotIn("$Gpu.status", body, "the GPU summary's status is copied into the block as a disclosure and read nowhere")
+        self.assertNotIn("gpuUsable", body)
+
+
 @requires_windows_pwsh
 class ClocksPowerRunnerMappingTests(RunnerHarness, unittest.TestCase):
     def setUp(self) -> None:
