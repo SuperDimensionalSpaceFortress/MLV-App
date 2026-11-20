@@ -825,7 +825,7 @@ class ClocksPowerPassThreeTests(unittest.TestCase):
 
     def test_a2_a_pnp_read_that_never_returns_is_abandoned_and_typed(self) -> None:
         self.assertEqual(self.r["a2Slow"], {"status": "unavailable", "reason": "pnp-read-timeout", "proc": True})
-        self.assertLess(self.r["a2Ms"], 12000, "a 20 s read bounded at 4 s returns in seconds, not at the read's pace")
+        self.assertLess(self.r["a2Ms"], 16000, "a 20 s read bounded at 8 s returns in seconds, not at the read's pace")
 
     def test_a2_a_quick_or_failing_pnp_read_keeps_its_own_result(self) -> None:
         self.assertEqual(self.r["a2Absent"], {"status": "unavailable", "reason": "no-dgpu"})
@@ -1021,6 +1021,13 @@ class ClocksPowerRoundSevenTests(unittest.TestCase):
         self.assertEqual(self.text.count("${function:Test-ClocksPowerPreflightSurvivor}"), 1, "the job carries the helper")
         self.assertEqual(self.text.count("${function:Get-ClocksPowerRowGapStats}"), 1, "the job carries the gap helper")
         self.assertIn("$timeBudget['clocksPowerSec'] = 60", self.text)
+
+    def test_r7_the_generator_names_no_engine_type_the_publish_write_scan_reads_as_a_session_carrier(self) -> None:
+        """r6 added an in-process runspace for the dGPU read, and a powershell or scriptblock type token anywhere in the generator makes the splice scan
+        (attr3_publish_write_scan.ps1, Test-TreeNamesSessionCarrier) treat every unfoldable member name as a session-state reach: five tests of
+        test_attr3_spliced_body_scan.py went red (110 passed on the base). The scan's own pattern is mirrored here."""
+        hits = re.findall(r"(?i)\[(?:[a-z_][a-z0-9_]*\.)*(?:runspace|runspacefactory|powershell|sessionstate|sessionstateproxy|psvariable|psvariableintrinsics|engineintrinsics|psmoduleinfo|commandinfo|functioninfo|scriptblock|pshost|pscmdlet)\]", self.text)
+        self.assertEqual(hits, [], "an engine type token in the generator trips the splice scan's unproven-binding")
 
     def test_r7_a3_a_csv_is_read_from_the_held_handle_never_from_the_path(self) -> None:
         self.assertEqual(self.r["a3FromHold"], {"text": "orig,1\r\n", "bytes": 8, "shaIsOrig": True}, "the path argument names a foreign file: the bytes are the hold's")

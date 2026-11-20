@@ -4449,11 +4449,6 @@ UNRESOLVED_EXECUTED_SITES = {
         ("-ExecutionPolicy Bypass -Command $cmd 1>",
          "BACHELOR-CORE-PARTITION-AB-1: the same smoke launch inside the bracketed replacement the generator emits (only with "
          "-CorePartitionTelemetry), wrapped in a try / finally; the same synchronous venue-side child"),
-        ("[void]$ps.AddScript([string]$DState)",
-         "BENCH-CLOCKS-POWER-LOG-1 r6 (adversary 841c00e1 A2; census A1 on 16901aea): Invoke-ClocksPowerDStateBounded runs the dGPU power-state read on a "
-         "worker runspace it abandons at 4 s (the PnP queries have no deadline of their own). $DState is a scriptblock its caller hands in: the only "
-         "production caller (Start-ClocksPowerGpu, from the emitted job) passes ${function:Get-UtilSampleDgpuState}, this file's own function, whose body is "
-         "Get-PnpDevice / Get-PnpDeviceProperty reads that the AST scans as code and none of which launches a process; the unit tests pass a { } stub literal"),
     ],
     "tools/profiling/bachelor/reference-frame-runner-job.ps1": [
         ("-Command $captureCommand",

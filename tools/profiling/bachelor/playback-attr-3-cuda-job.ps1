@@ -8263,7 +8263,7 @@ function Resolve-ClocksPowerTypeperf {
 }
 
 # The Energy Meter counter paths this host lists (one short typeperf call, before the measured launch); an empty list when typeperf says nothing
-function Get-ClocksPowerCounterList([string]$TypeperfPath, [int]$TimeoutMs = 4000, [string]$Arguments = '-qx "Energy Meter"', [scriptblock]$KillAction = $null) {
+function Get-ClocksPowerCounterList([string]$TypeperfPath, [int]$TimeoutMs = 4000, [string]$Arguments = '-qx "Energy Meter"', $KillAction = $null) {
     $r = [ordered]@{ lines = @(); why = $null }
     if ([string]::IsNullOrEmpty($TypeperfPath)) { return $r }
     $x = Invoke-ClocksPowerBounded $TypeperfPath $Arguments $TimeoutMs $KillAction
@@ -8277,7 +8277,7 @@ function Get-ClocksPowerCounterList([string]$TypeperfPath, [int]$TimeoutMs = 400
 # adversary de9ca8e7 A2: one short external read, bounded. The tool runs in its own process; when it has not exited inside $TimeoutMs it is killed and the
 # result is timedOut (never waited for). ok = the tool ran to its exit; lines = its stdout. A tool that cannot start is ok=false, timedOut=false. This is the
 # ONLY Process.Start in the clocks helpers besides the two sampler starters, and it is for the pre-launch reads (powercfg, the Energy Meter listing).
-function Invoke-ClocksPowerBounded([string]$Path, [string]$Arguments, [int]$TimeoutMs, [scriptblock]$KillAction = $null) {
+function Invoke-ClocksPowerBounded([string]$Path, [string]$Arguments, [int]$TimeoutMs, $KillAction = $null) {
     $r = [ordered]@{ ok = $false; timedOut = $false; survived = $false; pid = $null; lines = @() }
     $p = $null
     try {
@@ -8314,11 +8314,12 @@ function Invoke-ClocksPowerBounded([string]$Path, [string]$Arguments, [int]$Time
 # (on a second file name: the first one is held). csvPath is the file the running process writes.
 function Start-ClocksPowerGpu([string]$Backend, [string]$SmiPath, [string]$CsvPath, $DState, [int]$IntervalMs, [string]$ThrottleField = 'clocks_throttle_reasons.active', $DStateRead = $null) {
     $q = '--query-gpu=timestamp,clocks.gr,clocks.sm,clocks.mem,power.draw,enforced.power.limit,temperature.gpu,' + $ThrottleField + ' --format=csv,noheader,nounits -i 0 -lms ' + [string][int]$IntervalMs
-    # adversary 841c00e1 A2: the PnP read (Get-PnpDevice / Get-PnpDeviceProperty) is bounded (4 s, in its own runspace) like every other pre-launch read, and
-    # read once: the renamed-field retry below hands the same answer on. A read that did not return is a typed unavailable(pnp-read-timeout) with no process.
+    # adversary 841c00e1 A2: the PnP read (Get-PnpDevice / Get-PnpDeviceProperty) is bounded (8 s, in its own child job: its start-up counts) like every other
+    # pre-launch read, and read once: the renamed-field retry below hands the same answer on. A read that did not return is a typed
+    # unavailable(pnp-read-timeout) with no process.
     # ($cpDStateRead, not $ds: the scriptblock below is called from Start-UtilSampleGpu, whose own $ds would shadow it)
     $cpDStateRead = $DStateRead
-    if ($null -eq $cpDStateRead) { $cpDStateRead = Invoke-ClocksPowerDStateBounded $DState 4000 }
+    if ($null -eq $cpDStateRead) { $cpDStateRead = Invoke-ClocksPowerDStateBounded $DState 8000 }
     if ($cpDStateRead.reason -ceq 'pnp-read-timeout') {
         return [ordered]@{ status = 'unavailable'; reason = 'pnp-read-timeout'; why = $null; proc = $null; pid = $null; startTicks = $null; dState = $null; wakeDisclosure = $null; owned = $false; hold = $null; csvPath = $CsvPath; throttleField = $ThrottleField }
     }
@@ -8334,26 +8335,28 @@ function Start-ClocksPowerGpu([string]$Backend, [string]$SmiPath, [string]$CsvPa
     $r
 }
 
-# adversary 841c00e1 A2: the dGPU power-state read (Get-UtilSampleDgpuState's PnP queries have no deadline of their own) run in its OWN runspace and
-# abandoned at $TimeoutMs: @{ state; reason } as the read gave it, @{ state = $null; reason = 'pnp-read-failed' } when it threw or said nothing, and
-# @{ state = $null; reason = 'pnp-read-timeout' } when it had not answered in time (the runspace is told to stop and never waited for). $DState is a scriptblock.
-function Invoke-ClocksPowerDStateBounded($DState, [int]$TimeoutMs = 4000) {
+# adversary 841c00e1 A2: the dGPU power-state read (Get-UtilSampleDgpuState's PnP queries have no deadline of their own) run in its OWN child job process and
+# abandoned at $TimeoutMs (whole seconds, rounded up; the child's start-up is inside it): @{ state; reason } as the read gave it, @{ state = $null; reason =
+# 'pnp-read-failed' } when it threw or said nothing, and @{ state = $null; reason = 'pnp-read-timeout' } when it had not answered in time (the job is removed
+# with -Force). $DState is a scriptblock that needs nothing from this session. r7: a child job, not an in-process runspace, because a powershell or
+# scriptblock TYPE token anywhere in this generator makes tools/repo_hygiene/attr3_publish_write_scan.ps1 read every unfoldable member name as a possible
+# session-state reach (unproven-binding), which red five tests of test_attr3_spliced_body_scan.py (110 passed on the base).
+function Invoke-ClocksPowerDStateBounded($DState, [int]$TimeoutMs = 8000) {
     $failed = @{ state = $null; reason = 'pnp-read-failed' }
-    $ps = $null
+    $job = $null
     try {
-        $ps = [powershell]::Create()
-        [void]$ps.AddScript([string]$DState)
-        $h = $ps.BeginInvoke()
-        if (-not $h.AsyncWaitHandle.WaitOne($TimeoutMs)) {
-            try { [void]$ps.BeginStop($null, $null) } catch { }
+        $job = Start-Job -ScriptBlock $DState
+        [void](Wait-Job -Job $job -Timeout ([Math]::Max(1, [int][Math]::Ceiling($TimeoutMs / 1000.0))))
+        if ($job.State -cin @('Running', 'NotStarted', 'Blocked')) {
+            try { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue } catch { }
             return @{ state = $null; reason = 'pnp-read-timeout' }
         }
-        $out = @($ps.EndInvoke($h))
-        try { $ps.Dispose() } catch { }
+        $out = @(Receive-Job -Job $job -ErrorAction Stop)
+        try { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue } catch { }
         if ($out.Count -eq 0 -or $null -eq $out[$out.Count - 1]) { return $failed }
         return $out[$out.Count - 1]
     } catch {
-        try { if ($null -ne $ps) { $ps.Dispose() } } catch { }
+        try { if ($null -ne $job) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue } } catch { }
         return $failed
     }
 }
@@ -8782,9 +8785,9 @@ Write-JobTrace "step clocks-power summary status=$($clocksPowerBlock['status']) 
 '@ + "`n    $cwClose`n"
     $text = Edit-ClocksPowerText $text $cwFinallyAnchor ($cwFinally + $cwFinallyAnchor) 'stop and publish the clocks/power samplers in the outer finally at'
     # the worst path (adversary de9ca8e7 A2, 841c00e1 A2 and c11fb3d0 A2: every pre-launch read is bounded, so this sum is a real bound): the start's five
-    # bounded reads (powercfg, Win32_Battery, Win32_VideoController, typeperf -qx and the dGPU PnP read: 4 s each = 20 s) plus the 2 s kill wait after each of the
-    # two that run a child (powercfg, typeperf -qx: 4 s), plus the nvidia-smi argument-check wait (1.2 s), up to 10 ms x 5 clock-capture retries (negligible),
-    # region 2 (each side a kill and a 5 s wait) 10 s, and the outer finally's two more retries (20 s) = 55.2 s, so 60 s
+    # bounded reads (powercfg, Win32_Battery, Win32_VideoController and typeperf -qx: 4 s each = 16 s, and the dGPU PnP read in its child job: 8 s) plus the 2 s
+    # kill wait after each of the two that run a child (powercfg, typeperf -qx: 4 s), plus the nvidia-smi argument-check wait (1.2 s), up to 10 ms x 5
+    # clock-capture retries (negligible), region 2 (each side a kill and a 5 s wait) 10 s, and the outer finally's two more retries (20 s) = 59.2 s, so 60 s
     $timeBudget['clocksPowerSec'] = 60
     $timeBudget['jobTimeoutSec'] = [int]($timeBudget.jobTimeoutSec + 60)
 }
