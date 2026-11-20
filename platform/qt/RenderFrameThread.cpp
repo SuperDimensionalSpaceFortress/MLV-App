@@ -817,6 +817,8 @@ makeGpuPlaybackReconTextureLutKey( const llrpGpuPlaybackReconState_t &source,
     }
     key.applyDither = source.apply_dither != 0;
     key.processingGeneration = processingGeneration;
+    /* adversary r7 A1: tables rewritten in place keep their addresses, so the stamp is part of the key. */
+    key.lutGeneration = source.lut_generation;
     return key;
 }
 
@@ -987,6 +989,7 @@ bool assignGpuPlaybackReconTextureState(
     destination.applyDither = source.apply_dither != 0;
     destination.processingGeneration = processingGeneration;
     destination.frameId = source.frame_id;
+    destination.lutGeneration = source.lut_generation;
     return true;
 }
 

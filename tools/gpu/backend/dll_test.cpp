@@ -482,9 +482,10 @@ int main(int argc, char** argv)
     }
 
     /* ---- 4b. DUALISO-CONFIGURE-CACHE-1: the optional pattern-only configure ----
-     * igpu_recon_set_iso_pattern stores the ISO pattern without a set_clip. A different
-     * pattern must change the output (the run consumes it), and restoring the true pattern
-     * through the same call must reproduce the set_clip result byte for byte. A value outside
+     * igpu_recon_set_iso_pattern stores the ISO pattern without a set_clip. An alternate
+     * pattern through it must reproduce, byte for byte, the set_clip result for that pattern,
+     * and restoring the true pattern through the same call must reproduce the set_clip result
+     * of the truth (the pattern-sensitive vectors thereby also prove the run consumes it). A value outside
      * {0,1} is refused and leaves the pattern as it was. A DLL without the export skips this. */
     {
         typedef int (*pfn_set_iso_pattern)(igpu_recon_backend*, const int*);
@@ -501,8 +502,10 @@ int main(int argc, char** argv)
             (void)dll_test_pick_alternate_iso_pattern(truth, other);
             const int bad[4]   = { 1, 2, 0, 0 };
             uint16_t* alt = (uint16_t*)malloc(n * sizeof(uint16_t));
+            uint16_t* alt_ref = (uint16_t*)malloc(n * sizeof(uint16_t));
             uint16_t* back = (uint16_t*)malloc(n * sizeof(uint16_t));
             memset(alt, 0, n * sizeof(uint16_t));
+            memset(alt_ref, 0, n * sizeof(uint16_t));
             memset(back, 0, n * sizeof(uint16_t));
             if (f_pattern(b, bad) == 0) {
                 fprintf(stderr, "[dll_test] set_iso_pattern accepted a value outside {0,1}\n");
@@ -512,30 +515,37 @@ int main(int argc, char** argv)
                 fprintf(stderr, "[dll_test] set_iso_pattern(other)/run failed\n");
                 return 4;
             }
+            /* The reference for the alternate pattern is the full set_clip path with that pattern. */
+            igpu_recon_clip_t clip_alt = clip;
+            for (int k = 0; k < 4; ++k) clip_alt.is_bright[k] = other[k];
+            if (f_set_clip(b, &clip_alt) != 0 || f_run(b, &frame, h_in, IGPU_OUT_CPU16, alt_ref, 0) != 0) {
+                fprintf(stderr, "[dll_test] set_clip(alternate)/run failed\n");
+                return 4;
+            }
             if (f_pattern(b, truth) != 0 || f_run(b, &frame, h_in, IGPU_OUT_CPU16, back, 0) != 0) {
                 fprintf(stderr, "[dll_test] set_iso_pattern(truth)/run failed\n");
                 return 4;
             }
             const int differs = memcmp(alt, result, n * sizeof(uint16_t)) != 0;
+            const int alt_matches_set_clip = memcmp(alt, alt_ref, n * sizeof(uint16_t)) == 0;
             const int identical = memcmp(back, result, n * sizeof(uint16_t)) == 0;
-            printf("[dll_test] set_iso_pattern: alternate %d,%d,%d,%d (%s) changes output=%d  restored pattern byte-identical to set_clip result=%d\n",
-                   other[0], other[1], other[2], other[3], alt_is_half_swap ? "half swap" : "complement", differs, identical);
-            /* The restore comparison is the parity check and always counts. The "the run consumes the pattern"
-             * check needs an alternate the kernel can tell apart: a half swap always was one; the complement of a
-             * degenerate truth may produce identical pixels without the setter being at fault, so there an
-             * unchanged output is reported with its reason and not failed. */
-            if (!identical) {
+            printf("[dll_test] set_iso_pattern: alternate %d,%d,%d,%d (%s) changes output=%d  alternate byte-identical to the set_clip result for it=%d  restored pattern byte-identical to set_clip result=%d\n",
+                   other[0], other[1], other[2], other[3], alt_is_half_swap ? "half swap" : "complement", differs,
+                   alt_matches_set_clip, identical);
+            /* The parity checks that always count: the pattern-only configure must reproduce, byte for byte, what
+             * the full set_clip path gives for the alternate pattern AND for the restored true pattern. A setter
+             * that ignored the pattern fails the first whenever the vector is sensitive to the pattern. Whether
+             * the alternate's output differs from the truth's depends on the vector (an all-zero input gives the
+             * same pixels for any pattern), so a missing difference is reported, not failed. */
+            if (!alt_matches_set_clip || !identical) {
                 fprintf(stderr, "[dll_test] set_iso_pattern equivalence FAILED\n");
                 return 4;
             }
             if (!differs) {
-                if (alt_is_half_swap) {
-                    fprintf(stderr, "[dll_test] set_iso_pattern equivalence FAILED\n");
-                    return 4;
-                }
-                printf("[dll_test] set_iso_pattern: SKIPPED the output-changes check, reason=complement-of-a-half-swap-invariant-pattern-left-the-output-unchanged\n");
+                printf("[dll_test] set_iso_pattern: NOTE the alternate pattern left the pixels unchanged, reason=the-test-vector-is-insensitive-to-the-ISO-pattern (parity with set_clip held)\n");
             }
             free(alt);
+            free(alt_ref);
             free(back);
         }
     }

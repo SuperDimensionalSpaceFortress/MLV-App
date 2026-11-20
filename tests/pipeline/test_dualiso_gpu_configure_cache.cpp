@@ -7,8 +7,14 @@
 // and 1439 set_luts events (set_clip success forced set_luts): configure_ms p50 5.85 ms of a 12.15 ms llrawproc. The clip
 // width/height/levels are constant; only the ISO pattern (is_bright[4]) moves, and the backend re-pushes it on every run.
 #include "../common/minitest.h"
+#include "../common/repo_paths.h"
 #include "../../src/mlv/llrawproc/llrawproc.h"
 
+#include <QByteArray>
+#include <QFile>
+#include <QString>
+
+#include <string>
 #include <windows.h>
 
 #include <cstdint>
@@ -801,6 +807,62 @@ TEST(DualIsoGpuConfigureCache, AnInPlaceRewriteWithoutAPatternChangeAlsoUploadsT
         ASSERT_EQ(1, llrpFakeGpuBackendDeviceLutEntryForTesting(which, &after));
         ASSERT_EQ(expectedEntry(which), after);
     }
+}
+
+// ---- the stamp must survive the Qt presentation path (adversary r7 A1) -----------------------------------------
+// RenderFrameThread copies the prepared state's tables into an immutable snapshot (its own cache, keyed by the SOURCE
+// table pointers), and MainWindow rebuilds the public state from that snapshot. A key that ignored the stamp there
+// would serve a stale snapshot for tables rewritten in place, and a fresh snapshot allocated at a freed one's address
+// would look unchanged to the backend. Those two files are not linked into the test binaries, so the wiring is pinned
+// on their text (whitespace-insensitive), the way the console wiring tests pin theirs.
+namespace
+{
+
+std::string squeezedSource(const char * relativePath)
+{
+    QFile file(repo_file_path(QString::fromLatin1(relativePath)));
+    if (!file.open(QIODevice::ReadOnly)) return std::string();
+    const QByteArray bytes = file.readAll();
+    std::string out;
+    for (int i = 0; i < bytes.size(); ++i)
+    {
+        const char c = bytes.at(i);
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n') out.push_back(c);
+    }
+    return out;
+}
+
+bool has(const std::string & text, const char * needle)
+{
+    return text.find(needle) != std::string::npos;
+}
+
+} // namespace
+
+TEST(DualIsoGpuConfigureCache, TheTextureSnapshotKeyAndStateCarryTheLutGeneration)
+{
+    const std::string header = squeezedSource("platform/qt/RenderFrameThread.h");
+    ASSERT_TRUE(!header.empty());
+    // the snapshot cache key holds it and compares it (a stale snapshot is never served for rewritten tables)
+    ASSERT_TRUE(has(header, "structLutSnapshotKey{"));
+    ASSERT_TRUE(has(header, "&&lutGeneration==other.lutGeneration"));
+    // one member in the snapshot cache key, one in the texture state the presenter reads
+    size_t members = 0;
+    for (size_t at = header.find("uint64_tlutGeneration=0;"); at != std::string::npos;
+         at = header.find("uint64_tlutGeneration=0;", at + 1))
+        ++members;
+    ASSERT_EQ(size_t(2), members);
+}
+
+TEST(DualIsoGpuConfigureCache, TheSnapshotBuilderAndThePresenterCopyTheLutGenerationFromTheSourceState)
+{
+    const std::string source = squeezedSource("platform/qt/RenderFrameThread.cpp");
+    ASSERT_TRUE(!source.empty());
+    ASSERT_TRUE(has(source, "key.lutGeneration=source.lut_generation;"));
+    ASSERT_TRUE(has(source, "destination.lutGeneration=source.lut_generation;"));
+    const std::string mainWindow = squeezedSource("platform/qt/MainWindow.cpp");
+    ASSERT_TRUE(!mainWindow.empty());
+    ASSERT_TRUE(has(mainWindow, "destination->lut_generation=source.lutGeneration;"));
 }
 
 // ---- the DLL harness's alternate pattern (sol r6 B1) ------------------------------------------------------------
