@@ -2305,9 +2305,15 @@ void RenderFrameThread::decodeFrameForWorker( const DecodeQueueEntry &entry )
             getMlvRawFrameUint16( m_pMlvObject,
                                   entry.request.frameNumber,
                                   slot.rawImage16.data() ) == 0;
-        /* PLAYBACK-LJ92-DECODE-THROUGHPUT-1: these thread-locals live on THIS thread; drawFrame reads the snapshot. */
-        captureRawUint16DecodeTelemetry( slot.rawDecodeTelemetry,
-                                         ( mlv_stage_timing_now() - rawStart ) * 1000.0 );
+        /* PLAYBACK-LJ92-DECODE-THROUGHPUT-1: these thread-locals live on THIS thread; drawFrame reads the snapshot.
+         * LJ92-PRED1-FAST-PATH-1 r12 (adversary r11 A1): the snapshot is valid only for a decode that produced this
+         * frame. A failed acquisition leaves it invalid, so drawFrame (which may retry the decode on the render
+         * thread) reads the thread-locals of the decode that did produce the presented frame. */
+        if( slot.reconProvenance.acquisitionSucceeded )
+        {
+            captureRawUint16DecodeTelemetry( slot.rawDecodeTelemetry,
+                                             ( mlv_stage_timing_now() - rawStart ) * 1000.0 );
+        }
     }
     const double decodeEndStageTime = mlv_stage_timing_now();
     if( playbackSmokeTimelineTelemetryEnabled() )

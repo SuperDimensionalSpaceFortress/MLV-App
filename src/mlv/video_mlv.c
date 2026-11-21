@@ -3725,6 +3725,43 @@ static int getMlvRawFrameUint16Direct(mlvObject_t * video, uint64_t frameIndex, 
 
     mlv_raw_uint16_count_decode_for_testing(frameIndex);
 
+    /* LJ92-PRED1-FAST-PATH-1 r12 (adversary r11 A1): the per-decode telemetry, the lj92 layout included, is reset
+     * FIRST, ahead of the DNG return, the input-capacity refusals and the raw-frame malloc return, so a decode that
+     * fails early reports the reset sentinels and never the previous frame's layout (a layout is valid only for the
+     * decode that produced it). */
+    g_mlv_last_raw_uint16_disk_read_ms = 0.0;
+    g_mlv_last_raw_uint16_decompress_ms = 0.0;
+    g_mlv_last_raw_uint16_decompress_prepare_ms = 0.0;
+    g_mlv_last_raw_uint16_decompress_execute_ms = 0.0;
+    g_mlv_last_raw_uint16_lj92_pred6_split_active = 0;
+    g_mlv_last_raw_uint16_lj92_pred6_split_requested = 0;
+    g_mlv_last_raw_uint16_lj92_generic_split_active = 0;
+    g_mlv_last_raw_uint16_lj92_generic_split_requested = 0;
+    g_mlv_last_raw_uint16_lj92_pred1_fast_path_active = 0;
+    g_mlv_last_raw_uint16_lj92_pred1_fast_path_measurement_requested = 0;
+    g_mlv_last_raw_uint16_lj92_pred1_fast_path_measurement_active = 0;
+    g_mlv_last_raw_uint16_lj92_pred1_fast_path_eligible = 0;
+    g_mlv_last_raw_uint16_lj92_scan_component_count = 0;
+    g_mlv_last_raw_uint16_lj92_write_length = 0;
+    g_mlv_last_raw_uint16_lj92_expected_write_length = 0;
+    g_mlv_last_raw_uint16_lj92_skip_length = 0;
+    g_mlv_last_raw_uint16_lj92_linearize_active = 0;
+    g_mlv_last_raw_uint16_lj92_component_count = 0;
+    g_mlv_last_raw_uint16_lj92_predictor = -1;
+    g_mlv_last_raw_uint16_lj92_precision = 0;
+    g_mlv_last_raw_uint16_lj92_max_ssss = -1;
+    g_mlv_last_raw_uint16_lj92_pred6_total_ms = 0.0;
+    g_mlv_last_raw_uint16_lj92_pred6_bitstream_ms = 0.0;
+    g_mlv_last_raw_uint16_lj92_pred6_predictor_ms = 0.0;
+    g_mlv_last_raw_uint16_lj92_generic_total_ms = 0.0;
+    g_mlv_last_raw_uint16_lj92_generic_bitstream_ms = 0.0;
+    g_mlv_last_raw_uint16_lj92_generic_predictor_ms = 0.0;
+    g_mlv_last_raw_uint16_lj92_pred1_fast_path_total_ms = 0.0;
+    g_mlv_last_raw_uint16_lj92_pred1_fast_path_bitstream_ms = 0.0;
+    g_mlv_last_raw_uint16_lj92_pred1_fast_path_predictor_ms = 0.0;
+    g_mlv_last_raw_uint16_unpack_ms = 0.0;
+    g_mlv_last_raw_uint16_copy_ms = 0.0;
+
     /* CinemaDNG folder source: there is no MLV/mcraw file[chunk] container.
      * Each frame is its own .dng file. Decode the requested frame's bayer
      * payload directly into unpackedFrame (uncompressed bit-unpack OR LJ92,
@@ -3795,39 +3832,6 @@ static int getMlvRawFrameUint16Direct(mlvObject_t * video, uint64_t frameIndex, 
      * every read is bounded by the retained allocation capacity. */
     uint8_t * raw_frame = (uint8_t *)malloc(raw_frame_capacity);
     if(!raw_frame) return 1;
-
-    g_mlv_last_raw_uint16_disk_read_ms = 0.0;
-    g_mlv_last_raw_uint16_decompress_ms = 0.0;
-    g_mlv_last_raw_uint16_decompress_prepare_ms = 0.0;
-    g_mlv_last_raw_uint16_decompress_execute_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred6_split_active = 0;
-    g_mlv_last_raw_uint16_lj92_pred6_split_requested = 0;
-    g_mlv_last_raw_uint16_lj92_generic_split_active = 0;
-    g_mlv_last_raw_uint16_lj92_generic_split_requested = 0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_active = 0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_measurement_requested = 0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_measurement_active = 0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_eligible = 0;
-    g_mlv_last_raw_uint16_lj92_scan_component_count = 0;
-    g_mlv_last_raw_uint16_lj92_write_length = 0;
-    g_mlv_last_raw_uint16_lj92_expected_write_length = 0;
-    g_mlv_last_raw_uint16_lj92_skip_length = 0;
-    g_mlv_last_raw_uint16_lj92_linearize_active = 0;
-    g_mlv_last_raw_uint16_lj92_component_count = 0;
-    g_mlv_last_raw_uint16_lj92_predictor = -1;
-    g_mlv_last_raw_uint16_lj92_precision = 0;
-    g_mlv_last_raw_uint16_lj92_max_ssss = -1;
-    g_mlv_last_raw_uint16_lj92_pred6_total_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred6_bitstream_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred6_predictor_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_generic_total_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_generic_bitstream_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_generic_predictor_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_total_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_bitstream_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_predictor_ms = 0.0;
-    g_mlv_last_raw_uint16_unpack_ms = 0.0;
-    g_mlv_last_raw_uint16_copy_ms = 0.0;
 
     FILE * file = video->file[chunk];
 

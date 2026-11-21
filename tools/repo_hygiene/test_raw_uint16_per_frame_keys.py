@@ -120,6 +120,32 @@ class RawUint16PerFrameKeysTests(unittest.TestCase):
                     "rawFromWorker", render[statement_start:match.start()],
                     getter + " is read from the render thread's thread-local even when the worker decoded the frame")
 
+    def test_worker_snapshot_is_marked_valid_only_for_a_successful_acquisition(self) -> None:
+        """LJ92-PRED1-FAST-PATH-1 r12 (adversary r11 A1, introduced major): the DecodeWorker captured its thread-locals
+        whether or not getMlvRawFrameUint16 succeeded and marked the snapshot valid, so a failed acquisition handed the
+        previous frame's layout to drawFrame as this frame's (rawFromWorker), even when the render thread then
+        retried and decoded the frame itself. A snapshot is valid only for the decode that produced it."""
+        render = (ROOT / "platform/qt/RenderFrameThread.cpp").read_text(encoding="utf-8")
+        assignment = render.index("slot.reconProvenance.acquisitionSucceeded =\n            getMlvRawFrameUint16(")
+        capture = render.index("captureRawUint16DecodeTelemetry( slot.rawDecodeTelemetry,", assignment)
+        between = render[_statement_end(render, assignment) + 1:capture]
+        self.assertRegex(
+            between, r"if\s*\(\s*slot\.reconProvenance\.acquisitionSucceeded\s*\)",
+            "the worker snapshot must be taken only when the acquisition succeeded")
+
+    def test_every_early_return_of_the_raw_decode_follows_the_layout_reset(self) -> None:
+        """LJ92-PRED1-FAST-PATH-1 r12 (adversary r11 A1 siblings video_mlv.c:3775/3791/3796): the layout getters read
+        the last decode on the thread, so the reset sits at the top of getMlvRawFrameUint16Direct, ahead of the DNG
+        return, the input-capacity refusals and the raw-frame malloc return, or a failed decode keeps the previous
+        frame's layout."""
+        source = (ROOT / "src/mlv/video_mlv.c").read_text(encoding="utf-8")
+        start = source.index("static int getMlvRawFrameUint16Direct(mlvObject_t * video, uint64_t frameIndex, "
+                             "uint16_t * unpackedFrame)\n{")
+        first_return = source.index("return ", start)
+        reset = source.find("g_mlv_last_raw_uint16_lj92_predictor = -1;", start)
+        self.assertNotEqual(reset, -1)
+        self.assertLess(reset, first_return, "a decode that returns early must not keep the previous layout")
+
     def test_gpu_frame_record_appends_the_keys(self) -> None:
         statement = _statement_containing(self.source, '"playback_smoke.gpu_frame ', "qInfo()")
         self.assertIn("+ " + SHARED_KEYS, statement)

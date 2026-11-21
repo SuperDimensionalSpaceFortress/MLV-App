@@ -19,3 +19,40 @@ TEST(Lj92Pred1Reader, U64ReaderMatchesLegacyReaderOnFixturesAndSyntheticStreams)
     ASSERT_TRUE(!root.isEmpty());
     ASSERT_EQ(run_selftest(root.toStdString(), 20261120u), 0);
 }
+
+// LJ92-PRED1-FAST-PATH-1 r12 (adversary r11 A1, introduced major): the layout getters describe the LAST decode on the calling
+// thread, so a decode that fails before the layout reset (an encoded frame_size the input-capacity check refuses; the raw-frame
+// malloc failure and the DNG-folder return sit on the same side of the reset) used to leave the previous frame's predictor,
+// precision and category maximum in place for a worker to snapshot as the failed frame's. A layout is valid only for the decode
+// that produced it: after a failed decode every getter reads its reset sentinel.
+#include "mlv_pipeline_fixture.h"
+
+TEST(Lj92LayoutSnapshot, AFailedDecodeReportsTheResetSentinelsNotThePreviousFramesLayout)
+{
+    MlvPipelineFixture fixture;
+    QString error_message;
+    ASSERT_TRUE(fixture.openTinyDualIso(&error_message));
+    mlvObject_t *video = fixture.video();
+    ASSERT_TRUE(video != nullptr);
+    ASSERT_TRUE((video->MLVI.videoClass & MLV_VIDEO_CLASS_FLAG_LJ92) != 0);
+    ASSERT_TRUE(getMlvFrames(video) >= 2);
+
+    const size_t words = static_cast<size_t>(fixture.width()) * static_cast<size_t>(fixture.height());
+    std::vector<uint16_t> frame(words);
+    ASSERT_EQ(0, getMlvRawFrameUint16Uncached(video, 0, frame.data()));
+    ASSERT_TRUE(getMlvLastRawUint16Lj92Predictor() >= 0);
+    ASSERT_TRUE(getMlvLastRawUint16Lj92Precision() > 0);
+    ASSERT_TRUE(getMlvLastRawUint16Lj92MaxSsss() >= 0);
+    ASSERT_TRUE(getMlvLastRawUint16Lj92ComponentCount() > 0);
+
+    const uint32_t original = video->video_index[1].frame_size;
+    video->video_index[1].frame_size = 0x7FFFFFFFu;   // above pixels * 3 + 200: mlvRawFrameInputCapacity refuses it
+    const int status = getMlvRawFrameUint16Uncached(video, 1, frame.data());
+    video->video_index[1].frame_size = original;
+
+    ASSERT_TRUE(status != 0);
+    ASSERT_EQ(-1, getMlvLastRawUint16Lj92Predictor());
+    ASSERT_EQ(0, getMlvLastRawUint16Lj92Precision());
+    ASSERT_EQ(-1, getMlvLastRawUint16Lj92MaxSsss());
+    ASSERT_EQ(0, getMlvLastRawUint16Lj92ComponentCount());
+}
