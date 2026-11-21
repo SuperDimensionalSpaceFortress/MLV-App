@@ -452,6 +452,13 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
     which export never accrues, so any value published for it is held inside `llrawproc` with the rest. A test re-derives the table from the C sources by call-site
     reachability. (r18 had made these checks advisory while the table carried the scaled-path windows; `containmentAdvisory` stays in the evidence and in
     `receipt.export` as an always-empty array.)
+  * **CDNG llrawproc total containment (`EXPORT-CDNG-TOTAL-CONTAINMENT-1`, Dot I5 on #838).** `llrawproc_ms` (the producer's bracket around the llrawproc call, which is the
+    published `llrawprocTotal`) is held on **every successful frame**, not on the means alone: inside `producer_frame_ms` (`EXPORT_STAGE_CONTAINMENT_MISMATCH`, so one frame's
+    130 ms beside 63 ms of producer work is `INVALID` though the 30-frame mean is not), and the seven timed `llrawproc_*` children plus `llrawproc_other_ms` (the worker's own
+    total, `dng.c` `llrawproc_other = max(0, total - timed children)`) inside it. Its own typed reason is `EXPORT_STAGE_SUM_MISMATCH`: children past the total on a frame, or the
+    mean total past the mean of that sum (the bracket's entry and exit time is outside the worker's clock, so that direction is judged on the means, where one preempted frame averages
+    out). Same tolerance as every pair (5 % + 1 ms). A frame with no `llrawproc_ms`, or without all eight figures, is not judged for the sum (a stage the app did not run is permitted
+    absent). Writer, receipt re-derivation and the reader share `Get-DvExportEvidence`, so all three apply it under empty and shipped criteria.
   * ProRes: the denominator is the mean `processed16_total`, the timed per-frame work. The top-level stages are `debayered_frame` and `processing`.
     `raw_uint16` and `llrawproc` nest inside `debayered_frame`. The batch's `DONE elapsed` starts before the clip opens and also times finish, verify and
     probe, so it is never a denominator. `batchWallPerFrameMs` and `untimedPerFrameMs` (wall per frame minus `processed16_total`: open, pipe write,
