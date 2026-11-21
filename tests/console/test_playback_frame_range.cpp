@@ -4341,3 +4341,119 @@ TEST( PlaybackMeasuredLoopExit, StalledOrSkippedPresentsAfterTheReachedNeverPlay
     }
     ASSERT_EQ( 3, checked );
 }
+
+// r4 (Grok G4 on c5a5d488 = adversary pass 3 A1 on 38c05d4b, reopened by the revert of 6e9145fb): a simulated measured-play
+// loop that tracks WHICH source frame each present shows. Paced timeline from source frame `start`: at poll ms the playhead is
+// on start + ms / 10 and consumed = ms / 10 + 1 (the start frame included). `lag` frames are in flight: source frame k presents
+// at ( k - start + lag ) * 10 ms, in order, except the one `dropped` frame, which never presents (a drop-frame tick that skips
+// it). The present-path stop is modelled as MainWindow.cpp does it: once presented >= target, the source frames are consumed
+// and Play is still checked, Play stops on THAT present (the slider is pinned to its frame). The loop's stop is the wired
+// predicate; the run's success is the strict exit-11 check, judged on pinnedCapturePresentedCount.
+namespace measured_loop_r4
+{
+using playback_frame_range::PlayStopState;
+struct PinnedEnd { int64_t presented = 0; int64_t lastFrame = -1; int64_t consumed = 0; int64_t ms = 0;
+                   PlayStopState state = PlayStopState::Continue; bool playRunning = true; int64_t observed = 0; bool success = false; };
+constexpr int64_t kSafetyMs = 35000;
+inline PinnedEnd run( int64_t start, int64_t target, int64_t required, int64_t lag, int64_t dropped )
+{
+    PinnedEnd e;
+    bool playRunning = true;
+    int64_t presented = 0, lastFrame = -1, consumed = 0, next = start;
+    for( int64_t ms = 0;; ms += 10 )
+    {
+        if( playRunning )
+        {
+            consumed = ms / 10 + 1;
+            const int64_t dueLast = start + ms / 10 - lag;
+            for( ; playRunning && next <= dueLast; ++next )
+            {
+                if( next == dropped ) continue;
+                ++presented;
+                lastFrame = next;
+                if( target > 0 && presented >= target && consumed >= required ) playRunning = false;   // the present stop
+            }
+        }
+        const PlayStopState s = playback_frame_range::evaluatePlayStop( consumed, required, playRunning, ms, kSafetyMs );
+        if( playback_frame_range::measuredPlayLoopShouldStop( s, false, target, presented, required, playRunning, consumed ) )
+        {
+            e.presented = presented; e.lastFrame = lastFrame; e.consumed = consumed; e.ms = ms; e.state = s;
+            e.playRunning = playRunning;
+            e.observed = playback_frame_range::pinnedCapturePresentedCount( presented, lastFrame, start, required );
+            e.success = target > 0 && e.observed == target;
+            return e;
+        }
+    }
+}
+}
+
+// G4: ONE dropped present after the first Reached, on the Paced timeline. The frames still in flight at the Reached are the
+// last `lag` frames of the admitted window; dropping any one of them leaves the count one short, the wait (correctly) keeps
+// Play running, and the first source frame PAST the window (start + required) completes the count and stops Play. The loop
+// must never report success on that: the run ends by the not-met path (exit 11, observed = target - 1). The count-only rule
+// (c5a5d488's strict check) passed it -- the silent wrong frame where master failed loudly with exit 11. Also adversary pass
+// 3 A1's own input (frame 100 dropped long before the Reached), two window starts (0 and 240), and the no-drop controls.
+TEST( PlaybackMeasuredLoopExit, ADroppedPresentAfterTheReachedIsNeverMadeUpByAFramePastTheAdmittedWindow )
+{
+    using namespace measured_loop_r4;
+    using playback_frame_range::kMeasuredPlayMaxFramesInFlight;
+    static constexpr int64_t kTarget = 600, kRequired = 600;
+    int dropAfterReached = 0, dropBeforeReached = 0, controls = 0;
+    for( const int64_t start : { int64_t( 0 ), int64_t( 240 ) } )
+    {
+        const int64_t windowLast = start + kRequired - 1;
+        for( int64_t lag = 0; lag <= 6; ++lag )
+        {
+            // the control: nothing dropped, the count completes on the window's last frame, and that is a success
+            const PinnedEnd ok = run( start, kTarget, kRequired, lag, -1 );
+            ASSERT_TRUE( ok.success );
+            ASSERT_EQ( kTarget, ok.observed );
+            ASSERT_EQ( windowLast, ok.lastFrame );
+            ASSERT_TRUE( ok.state == PlayStopState::Reached );
+            ++controls;
+            // the drops: each frame still in flight at the first Reached (lag of them), then pass 3 A1's frame 100
+            std::vector<int64_t> drops;
+            for( int64_t k = windowLast - lag + 1; k <= windowLast; ++k ) drops.push_back( k );
+            drops.push_back( start + 100 );
+            for( const int64_t dropped : drops )
+            {
+                const PinnedEnd e = run( start, kTarget, kRequired, lag, dropped );
+                ASSERT_EQ( kTarget, e.presented );                    // the raw count did reach N ...
+                ASSERT_EQ( windowLast + 1, e.lastFrame );              // ... on the first source frame past the window
+                ASSERT_TRUE( e.lastFrame >= start + kRequired );
+                ASSERT_TRUE( e.presented == kTarget );                 // so the count-only rule (c5a5d488) called it a success
+                ASSERT_TRUE( !e.success );                             // never a success: the not-met path, exit 11
+                ASSERT_EQ( kTarget - 1, e.observed );                  // `not met; target=600 observed=599`
+                ASSERT_TRUE( e.state == PlayStopState::Reached );
+                ASSERT_TRUE( !e.playRunning );
+                ASSERT_TRUE( e.consumed - kRequired < kMeasuredPlayMaxFramesInFlight );   // the wait did see it (the defect's path)
+                ASSERT_TRUE( e.ms <= kSafetyMs );
+                if( dropped == start + 100 ) ++dropBeforeReached; else ++dropAfterReached;
+            }
+        }
+    }
+    ASSERT_EQ( 2 * ( 1 + 2 + 3 + 4 + 5 + 6 ), dropAfterReached );
+    ASSERT_EQ( 14, dropBeforeReached );
+    ASSERT_EQ( 14, controls );
+
+    // Grok's witness: the wait itself still runs on (the predicate is not the guard) ...
+    for( int64_t c = 600; c <= 615; ++c )
+        ASSERT_TRUE( !playback_frame_range::measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 599, 600, true, c ) );
+    // ... and a present of ANY source frame from 600 to 615 that completes the count is not the pinned capture
+    for( int64_t frame = 600; frame <= 615; ++frame )
+        ASSERT_EQ( 599, playback_frame_range::pinnedCapturePresentedCount( 600, frame, 0, 600 ) );
+    ASSERT_EQ( 600, playback_frame_range::pinnedCapturePresentedCount( 600, 599, 0, 600 ) );
+    // the window has a LOWER bound too, and a seek during the wait moves neither end (adversary pass 4 A4 / A5 on 6e9145fb):
+    // A4: window 0..599, a forward seek to 700 during the wait: 700 is past the window, whatever highWater became
+    ASSERT_EQ( 599, playback_frame_range::pinnedCapturePresentedCount( 600, 700, 0, 600 ) );
+    // A5: window 240..839 (start 240, 600 required): a backward seek's 120 is below it, 839 is its last frame, 840 is past it
+    ASSERT_EQ( 599, playback_frame_range::pinnedCapturePresentedCount( 600, 120, 240, 600 ) );
+    ASSERT_EQ( 599, playback_frame_range::pinnedCapturePresentedCount( 600, 239, 240, 600 ) );
+    ASSERT_EQ( 600, playback_frame_range::pinnedCapturePresentedCount( 600, 240, 240, 600 ) );
+    ASSERT_EQ( 600, playback_frame_range::pinnedCapturePresentedCount( 600, 839, 240, 600 ) );
+    ASSERT_EQ( 599, playback_frame_range::pinnedCapturePresentedCount( 600, 840, 240, 600 ) );
+    ASSERT_EQ( 599, playback_frame_range::pinnedCapturePresentedCount( 600, 1040, 240, 600 ) );
+    // no admitted window (nothing was admitted) or nothing presented: the count alone, as before
+    ASSERT_EQ( 600, playback_frame_range::pinnedCapturePresentedCount( 600, 9000, 0, 0 ) );
+    ASSERT_EQ( 0, playback_frame_range::pinnedCapturePresentedCount( 0, -1, 0, 600 ) );
+}

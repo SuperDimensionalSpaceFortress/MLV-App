@@ -1309,6 +1309,15 @@ inline bool measuredPlayLoopShouldStop( PlayStopState state, bool stressPending,
     return false;
 }
 
+// REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r4 (Grok G4 / adversary pass 3 A1 on 38c05d4b): the presented count a
+// frame-pinned capture is judged on (the strict presented == target check, exit 11). RED stub: the count alone.
+inline int64_t pinnedCapturePresentedCount( int64_t presentedFrames, int64_t lastPresentedFrame,
+                                            int64_t windowStartFrame, int64_t requiredSourceFrames )
+{
+    (void)lastPresentedFrame; (void)windowStartFrame; (void)requiredSourceFrames;
+    return presentedFrames;
+}
+
 inline const char *playStopFailureReason( PlayStopState state )
 {
     switch( state )
