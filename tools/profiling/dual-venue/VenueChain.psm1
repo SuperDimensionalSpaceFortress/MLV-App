@@ -151,7 +151,9 @@ function Remove-VenueClaimIfUnchanged {
     for ($attempt = 1; $attempt -le 5; $attempt++) {
         if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return 'ABSENT' }
         $fs = $null
-        try { $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Delete) } catch { Start-Sleep -Milliseconds (50 * $attempt); continue }
+        # r11 (sol r10 B2): no sleep after the LAST attempt. It was followed by nothing but the BUSY answer, so a call that found the file held answered at 750 ms (opens at 0, 50, 150, 300, 500) when its last
+        # open was at 500 ms: the late grant's release (reserve 0.75 s) took that one answer as the end of the reserve and gave up on a reader that let go at 650 ms. It now answers BUSY right after its last open (500 ms).
+        try { $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Delete) } catch { if ($attempt -lt 5) { Start-Sleep -Milliseconds (50 * $attempt) }; continue }
         try {
             $sr = [IO.StreamReader]::new($fs, [Text.UTF8Encoding]::new($false), $false, 4096, $true)
             $text = $sr.ReadToEnd(); $sr.Dispose()
