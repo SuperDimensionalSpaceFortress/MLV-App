@@ -5928,6 +5928,42 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 for row in rows:
                     self.assertEqual(row, f"expect={want} read={want}", out)
 
+    def test_bench_light_arm_a7_two_plan_items_that_share_a_spec_path_never_judge_different_bytes_of_it(self) -> None:
+        # BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary A7 on 245e26de): the judged digest was kept one per spec PATH, so item B's reads of changed bytes overwrote item A's digest and A's
+        # leg ran (bound to B's digest) on bytes its recorded arm never described. The stand-in budget child rewrites the shared spec after item 1's budget read, so item 2 judges other
+        # bytes of the same path. The batch must refuse the whole plan (typed SPEC_CHANGED_BETWEEN_PLAN_ITEMS, item 2) before any claim, lease or leg. Control: an unchanged shared spec is
+        # not refused for this reason.
+        fake = self.case / "fake-export-budget-a7.ps1"
+        fake.write_text("param([switch]$PreflightBudgetOnly, [string]$ClipId, [string]$Format, [int]$MaxFrames, [long]$DescribeTimeBudgetBytes = -1)\n"
+                        "if ($MaxFrames -gt 19000) { throw \"DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED $MaxFrames frames of $ClipId need a job timeout past the agent's cap\" }\n"
+                        "if ($env:FAKE_MUTATE_SPEC) { Copy-Item -LiteralPath $env:FAKE_MUTATE_FROM -Destination $env:FAKE_MUTATE_SPEC -Force }\n"
+                        "[pscustomobject]@{ jobTimeoutSec = 1 }\n", encoding="utf-8")
+        doc = json.loads((DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"))
+        doc["export"]["maxFrames"] = 480
+        judged_text = json.dumps(doc)
+        doc["export"]["maxFrames"] = 600
+        changed = self.case / "export-a7-changed.json"
+        changed.write_text(json.dumps(doc), encoding="utf-8")
+        spec = self.case / "export-a7.json"
+
+        def reset() -> None:
+            for p in (self.events, self.leg_args, self.claim_path):
+                p.unlink(missing_ok=True)
+            shutil.rmtree(self.run_dir, ignore_errors=True)
+            spec.write_text(judged_text, encoding="utf-8")
+        reset()
+        plan = self.write_plan([self.item(spec, "A", self.commit_a), self.item(spec, "B", self.commit_a)])
+        r = self.run_plan(plan, "-ExportBudgetScript", str(fake), FAKE_MUTATE_SPEC=str(spec), FAKE_MUTATE_FROM=str(changed))
+        out = r.stdout[-3000:] + r.stderr[-3000:]
+        self.assertIn('"maxFrames": 600', spec.read_text(encoding="utf-8"), "the stand-in did not change the spec, so the test proves nothing. " + out)
+        self.assertEqual([k for k in self.kinds() if k.startswith("LEG")], [], "a leg ran on a spec its plan item's recorded arm did not describe. " + out)
+        self.assertFalse((self.run_dir / "batches.jsonl").exists(), "a lease was opened on two items that judged different bytes of one spec. " + out)
+        self.assertEqual(r.returncode, 2, out)
+        self.assertIn("LEG_PLAN_REFUSED reason=SPEC_CHANGED_BETWEEN_PLAN_ITEMS item=2 ", r.stderr, out)
+        reset()
+        r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a), self.item(spec, "B", self.commit_a)]), "-ExportBudgetScript", str(fake))
+        self.assertNotIn("SPEC_CHANGED_BETWEEN_PLAN_ITEMS", r.stderr, "control: an unchanged shared spec. " + r.stdout[-3000:] + r.stderr[-3000:])
+
     def test_r19_b1_the_leg_refuses_spec_bytes_that_are_not_the_ones_the_budget_judged(self) -> None:
         # r19 (sol r18 B1, the dispatch site Invoke-VenueLeg.ps1:225): the bytes the LEG reads are the bytes run, so the leg compares them with -ExpectSpecSha256 and throws
         # DVE_LEG_SPEC_CHANGED before it generates or submits anything. Structural: the parameter, the comparison right after the one read, and the batch passing it at the launch.

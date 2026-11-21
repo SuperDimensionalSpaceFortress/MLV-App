@@ -326,8 +326,11 @@ function Get-FpsArmFromJobResult {
     The arm a RECORDED venue result carries: an object with a `telemetryArm` field (the job's provenance.json or evidence-manifest.json, both written from the arm that actually ran).
     UNKNOWN when the object is absent or carries no / an invalid field.
     #>
-    # -ObserversFromSpec: the caller judges the observer controls from the leg SPEC (Get-FpsArm with both inputs), so a result that records none is not refused for that alone.
-    param([AllowNull()]$Result, [switch]$ObserversFromSpec)
+    # -ObserversFromSpec <spec>: the caller judges the observer controls from the leg SPEC (Get-FpsArm with both inputs), so a result that records none is not refused for that alone.
+    # r6 (adversary A13): it carries the spec itself, not a bare switch, so the override cannot be claimed with no spec behind it: a bare switch is a binding error, and a null, a scalar or a
+    # boolean is no spec (the result's LIGHT word is then UNKNOWN as without the override).
+    param([AllowNull()]$Result, [AllowNull()]$ObserversFromSpec)
+    $specGiven = ($null -ne $ObserversFromSpec -and $ObserversFromSpec -isnot [string] -and $ObserversFromSpec -isnot [System.ValueType])
     if ($null -eq $Result -or $Result -is [string] -or $Result -is [System.ValueType]) { return New-FpsArm 'UNKNOWN' 'result' 'no-result' }
     $arm = Get-FaProp $Result 'telemetryArm'
     if ($null -eq $arm) { return New-FpsArm 'UNKNOWN' 'result' 'result-carries-no-telemetryArm' }
@@ -352,7 +355,7 @@ function Get-FpsArmFromJobResult {
         # the job's provenance.json / evidence-manifest.json carry the arm WORD and no observer record, so a result alone cannot prove that no sampler or per-launch logger ran (adversary pass 5
         # A2): without a recorded observer list (or a spec to judge them from) a LIGHT word is UNKNOWN
         $recorded = Test-FpsRecordHasObserverEvidence $Result
-        if (-not $recorded -and -not $ObserversFromSpec) { return New-FpsArm 'UNKNOWN' 'result' 'telemetryArm=LIGHT but the result records no observer controls (provenance carries the arm word only); judge it with its leg spec' }
+        if (-not $recorded -and -not $specGiven) { return New-FpsArm 'UNKNOWN' 'result' 'telemetryArm=LIGHT but the result records no observer controls (provenance carries the arm word only); judge it with its leg spec' }
         return New-FpsArm 'LIGHT' 'result' 'telemetryArm=LIGHT'
     }
     if (Test-FaTextEq $arm 'HEAVY') { return New-FpsArm 'HEAVY' 'result' 'telemetryArm=HEAVY' }
@@ -366,7 +369,7 @@ function Get-FpsArm {
     HEAVY spec, or the reverse, is UNKNOWN: the spec is not what ran, or the result is not this leg's). Neither -> UNKNOWN.
     #>
     param([AllowNull()]$Spec, [AllowNull()]$Result)
-    $fromResult = if ($null -ne $Result) { Get-FpsArmFromJobResult $Result -ObserversFromSpec:($null -ne $Spec) } else { $null }
+    $fromResult = if ($null -ne $Result) { Get-FpsArmFromJobResult $Result -ObserversFromSpec $Spec } else { $null }
     $fromSpec = if ($null -ne $Spec) { Get-FpsArmFromLegSpec $Spec } else { $null }
     if ($null -eq $fromResult -and $null -eq $fromSpec) { return New-FpsArm 'UNKNOWN' 'none' 'neither a spec nor a result was given' }
     if ($null -eq $fromSpec) { return $fromResult }

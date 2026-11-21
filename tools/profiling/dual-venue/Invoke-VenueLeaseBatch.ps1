@@ -1554,6 +1554,20 @@ function Get-ScalarLegShapeRefusal([string]$Path) {
     $(if ($null -ne $refusal) { [string]$refusal } else { '' })
 }
 
+function Get-SpecPathJudgedConflict([hashtable]$Seen, [string]$Path) {
+    # BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary A7, on 245e26de): the judged digests are kept one per spec PATH ($script:SpecBudgetSha256), so two plan items that share a path
+    # overwrote each other's: item A's arm was read from the bytes it judged, then the file changed, item B judged the new bytes, and A's leg ran (bound to B's digest) on bytes its recorded
+    # arm never described. A path is judged ONCE per run: the first item (or scalar entry) to pass the shape and budget checks records the digest in $Seen, and any later entry whose own
+    # judged digest for the same path differs is the typed refusal below (fail closed; no claim, lease or leg). Returns '' when this path's digest is new or unchanged.
+    $now = [string]$script:SpecBudgetSha256[$Path]
+    if ($Seen.ContainsKey($Path) -and [string]$Seen[$Path] -cne $now) {
+        return "'$Path' cannot be run: two entries of this run name the same leg spec and judged different bytes of it (sha256 $($Seen[$Path]), then $(if ($now) { $now } else { 'none recorded' })); one recorded arm and one leg binding must describe one set of bytes, so no claim or lease is taken"
+    }
+    $Seen[$Path] = $now
+    ''
+}
+$specJudgedOnce = @{}
+
 # The planned legs: name, spec path, backend ('' = whatever the spec lists). Same naming as Invoke-VenueChain.
 $plan = [System.Collections.Generic.List[object]]::new()
 $planRecord = $null
@@ -1598,6 +1612,8 @@ if ($legPlanMode) {
             if ($specRefusal[0]) { Stop-PlanRefused $specRefusal[0] $n $specRefusal[1] }
             $budgetRefusal = Get-ExportBudgetRefusal $path   # r8 (adversary r7 A3): an export window the agent's job cap refuses is refused HERE, before any claim or lease
             if ($budgetRefusal[0]) { Stop-PlanRefused $budgetRefusal[0] $n $budgetRefusal[1] }
+            $judgedConflict = Get-SpecPathJudgedConflict $specJudgedOnce $path   # r6 (adversary A7): one judged digest per spec path
+            if ($judgedConflict) { Stop-PlanRefused 'SPEC_CHANGED_BETWEEN_PLAN_ITEMS' $n $judgedConflict }
             $items.Add([pscustomobject]@{ item = $n; legId = (Get-LegSpecId $path); spec = $path; backend = $be.ToLowerInvariant(); arm = $arm; sourceCommit = $sc.ToLowerInvariant(); buildManifestSha256 = $ms.ToLowerInvariant()
                     telemetryArm = (Get-LegSpecTelemetryArm $path).arm })
         }
@@ -1663,6 +1679,8 @@ if ($legPlanMode) {
         if ($shapeRefusal) { Stop-Usage "LEG_SPEC_INVALID '$($e.specPath)' cannot be run: $shapeRefusal" }
         $budgetRefusal = Get-ExportBudgetRefusal ([string]$e.specPath)   # r8 (adversary r7 A3): before the lease, as -LegPlan does
         if ($budgetRefusal[0]) { Stop-Usage "$($budgetRefusal[0]) $($budgetRefusal[1])" }
+        $judgedConflict = Get-SpecPathJudgedConflict $specJudgedOnce ([string]$e.specPath)   # r6 (adversary A7 sibling): one judged digest per spec path
+        if ($judgedConflict) { Stop-Usage "SPEC_CHANGED_BETWEEN_PLAN_ITEMS $judgedConflict" }
         $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend })
     }
 } else {
@@ -1680,6 +1698,8 @@ if ($legPlanMode) {
         if ($shapeRefusal) { Stop-Usage "LEG_SPEC_INVALID '$path' cannot be run: $shapeRefusal" }
         $budgetRefusal = Get-ExportBudgetRefusal $path   # r8 (adversary r7 A3): before any claim or lease, as -LegPlan does
         if ($budgetRefusal[0]) { Stop-Usage "$($budgetRefusal[0]) $($budgetRefusal[1])" }
+        $judgedConflict = Get-SpecPathJudgedConflict $specJudgedOnce $path   # r6 (adversary A7 sibling): one judged digest per spec path
+        if ($judgedConflict) { Stop-Usage "SPEC_CHANGED_BETWEEN_PLAN_ITEMS $judgedConflict" }
         $legId = Get-LegSpecId $path
         for ($r = 1; $r -le $Repeats; $r++) {
             $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f ($plan.Count + 1), $legId, $(if ($Backend) { $Backend } else { 'spec' })); spec = $path; backend = $(if ($Backend) { $Backend } else { '' }) })

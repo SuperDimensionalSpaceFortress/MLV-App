@@ -124,6 +124,28 @@ class ArmClassifierTests(_Probe):
         body = "".join(f"Write-Host ('ARM=' + ({e}).arm)\n" for e in exprs)
         return self.ok(body).split()
 
+    def test_a_result_only_light_word_is_never_light_through_the_observers_from_spec_override(self) -> None:
+        # BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary A13): -ObserversFromSpec was a bare caller-supplied switch, so a result that records no observer list was admitted as LIGHT with no spec at all.
+        # The override now carries the spec the caller judged the observers from: a bare switch, a null, a scalar or a boolean (no spec) is refused (a binding error or UNKNOWN), never LIGHT;
+        # a real spec object still admits a result that records no observer list (Get-FpsArm passes it).
+        out = self.ok(
+            "$r = [pscustomobject]@{ telemetryArm = 'LIGHT' }\n"
+            "$spec = [pscustomobject]@{ legType = 'speed'; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' } }\n"
+            "foreach ($case in @('BARE', 'NULL', 'TRUE', 'TEXT', 'SPEC')) {\n"
+            "    try {\n"
+            "        $a = switch ($case) {\n"
+            "            'BARE' { Get-FpsArmFromJobResult $r -ObserversFromSpec }\n"
+            "            'NULL' { Get-FpsArmFromJobResult $r -ObserversFromSpec $null }\n"
+            "            'TRUE' { Get-FpsArmFromJobResult $r -ObserversFromSpec $true }\n"
+            "            'TEXT' { Get-FpsArmFromJobResult $r -ObserversFromSpec 'spec' }\n"
+            "            'SPEC' { Get-FpsArmFromJobResult $r -ObserversFromSpec $spec }\n"
+            "        }\n"
+            "        Write-Host ($case + '=' + $a.arm)\n"
+            "    } catch { Write-Host ($case + '=REFUSED') }\n"
+            "}\n"
+            "Write-Host ('BOTH=' + (Get-FpsArm $spec $r).arm)\n")
+        self.assertEqual(out.split(), ["BARE=REFUSED", "NULL=UNKNOWN", "TRUE=UNKNOWN", "TEXT=UNKNOWN", "SPEC=LIGHT", "BOTH=LIGHT"])
+
     def test_heavy_switch_spec_is_heavy(self) -> None:
         self.assertEqual(self.arm(f"Get-FpsArmFromLegSpec ({SPEC_HEAVY})"), "ARM=HEAVY")
 
@@ -577,7 +599,7 @@ class CudaPlaybackAbRequireImprovementBlockTests(_Probe):
     """G1: -RequireCandidateImprovesPresentedFps is an fps verdict; it refuses, typed, when the pair is not LIGHT/LIGHT, and never reports a fake regression."""
 
     script = CUDA_AB_SCRIPT
-    functions = ["Convert-ToNullableDouble", "Get-PlaybackAbFpsVerdict"]
+    functions = ["Convert-ToNullableDouble", "Get-PlaybackAbFpsVerdict", "Get-SmokeSummaryTelemetryArm"]
 
     def run_block(self, baseline: str, candidate: str, fps_b: float, fps_c: float) -> list[str]:
         source = CUDA_AB_SCRIPT.read_text(encoding="utf-8")
@@ -611,6 +633,37 @@ class CudaPlaybackAbRequireImprovementBlockTests(_Probe):
         self.assertIn("candidate-presented-fps-not-improved baseline=10 candidate=9", regress)
         # and a HEAVY speed run is still refused, typed
         self.assertIn(HEAVY_REASON, self.run_separate("LIGHT", "HEAVY", 20.0))
+
+    def test_a_leg_the_wrapper_itself_launches_is_heavy_and_refused_with_the_typed_reason(self) -> None:
+        # BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary A4 on 245e26de; HUB RULING: the wrapper's recorded leg is not changed in this card, a venue run owns that): the wrapper's baseline and
+        # speed environment lists carry no MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG, and every smoke it generates sets FrameTelemetry = $true, so its own legs record the HEAVY launch.
+        # This feeds the wrapper's REAL env lists (spliced from its source) through the REAL recorder (Get-SmokeSummaryTelemetryArm on the launch block the smoke would record) and the
+        # REAL fps verdict and require-improvement block: the pair is refused with the typed reason and "not evaluated", never a fake regression ("not-improved") and never a gain.
+        source = CUDA_AB_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("FrameTelemetry = `$true", source, "the wrapper's generated smoke turns the per-frame telemetry on")
+        baseline_env = _extract_block(source, "$baselineEnv = @(", ")", trailing_lines=0)
+        speed_env = _extract_block(source, "$candidateSpeedEnv = @(", ")", trailing_lines=0)
+        block = _extract_block(source, "if ($RequireCandidateImprovesPresentedFps) {", "candidate-presented-fps-not-improved baseline=$baselineFps candidate=$candidateFps", trailing_lines=3)
+        out = self.ok(
+            baseline_env + speed_env +
+            "function New-WrapperLeg([string[]]$EnvList, [double]$Fps) {\n"
+            "    $environment = [ordered]@{}\n"
+            "    foreach ($kv in $EnvList) { $k, $v = $kv -split '=', 2; $environment[$k] = $v }\n"
+            "    $environment['MLVAPP_PLAYBACK_SMOKE_TELEMETRY'] = '1'   # FrameTelemetry = $true in the generated smoke (run-release-gui-smoke.ps1: launchEnv)\n"
+            "    $json = [pscustomobject]@{ launch = [pscustomobject]@{ environment = [pscustomobject]$environment; arguments = @() } }\n"
+            "    [pscustomobject]@{ telemetryArm = (Get-SmokeSummaryTelemetryArm -Json $json); launch = $json.launch; presentedFps = $Fps; hostLoadProvisional = $false }\n"
+            "}\n"
+            "$baselineSummary = New-WrapperLeg $baselineEnv 10.0\n$candidateSummary = New-WrapperLeg $candidateSpeedEnv 20.0\n$candidateSpeedSummary = $null\n"
+            "Write-Host ('ARM=' + $baselineSummary.telemetryArm.arm + ',' + $candidateSummary.telemetryArm.arm)\n"
+            "$SeparateCandidateSpeedRun = $false\n$RequireCandidateImprovesPresentedFps = $true\n$proofFailures = @()\n"
+            "$fpsVerdict = Get-PlaybackAbFpsVerdict -BaselineSummary $baselineSummary -CandidateSummary $candidateSummary -CandidateSpeedSummary $candidateSpeedSummary\n"
+            "Write-Host ('ALLOWED=' + $fpsVerdict.allowed + ' REASON=' + $fpsVerdict.reason)\n"
+            + block + "\nforeach ($f in $proofFailures) { Write-Host ('FAIL=' + $f) }\nWrite-Host ('COUNT=' + @($proofFailures).Count)\n")
+        self.assertIn("ARM=HEAVY,HEAVY", out, "the wrapper's own legs record the HEAVY launch (this is the open successor BENCH-WRAPPER-LIGHT-ENV-1)")
+        self.assertIn(f"ALLOWED=False REASON={HEAVY_REASON}", out)
+        self.assertIn("candidate-presented-fps-improvement-not-evaluated", out)
+        self.assertNotIn("candidate-presented-fps-not-improved", out, "a HEAVY pair is never reported as a regression either")
+        self.assertIn("COUNT=1", out, "the requirement fails closed: one proof failure, no verdict from the numbers")
 
     def test_heavy_legs_get_the_typed_refusal_not_a_regression_line(self) -> None:
         lines = self.run_block("'HEAVY'", "'HEAVY'", 40.0, 30.0)
