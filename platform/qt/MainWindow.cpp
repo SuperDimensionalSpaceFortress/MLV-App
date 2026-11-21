@@ -11224,11 +11224,13 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             }
         }
         measuredState = programmaticPlayState( playbackClock.elapsed(), measuredSafetyMs );
-        if( measuredState == playback_frame_range::PlayStopState::SafetyTimeout
-         || measuredState == playback_frame_range::PlayStopState::EndedEarly
-         || measuredState == playback_frame_range::PlayStopState::PaceTooSlow
-         || ( measuredState == playback_frame_range::PlayStopState::Reached
-              && !( options.exerciseClipLifecycleStress && !stressAttempted ) ) )
+        // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1: a frame-pinned capture waits for its presented count (the present path
+        // stops Play at exactly N); the timeout, early-end and pace stops are unchanged, and so is an unpinned play.
+        // r3: the wait ends once the timeline is more than kMeasuredPlayMaxFramesInFlight past the admitted window.
+        if( playback_frame_range::measuredPlayLoopShouldStop(
+                measuredState, options.exerciseClipLifecycleStress && !stressAttempted,
+                m_playbackSmokeTargetPresentedFrames, m_playbackSmokePresentedFrames,
+                m_playRequiredSourceFrames, ui->actionPlay->isChecked(), m_sourceAdvance.consumed() ) )
         {
             break;
         }
@@ -11338,12 +11340,23 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         contactSheetEndFrame = contactSheetLoopCutOutFrame;
     }
 
+    // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r4 (Grok G4; adversary pass 6 A1/A2): the pinned capture is met only when every
+    // present was inside the admitted window [counter start, start + required - 1] and there were exactly N of them
+    // (pinnedCaptureObservedFrames). A dropped window frame made up by a frame past the window, a seek out of the window and back,
+    // or a raw count above N ends here, on the unchanged not-met message, never a success. An all-inside run is judged as before.
+    const int64_t pinnedObservedFrames = playback_frame_range::pinnedCaptureObservedFrames(
+        m_playbackSmokeTargetPresentedFrames, m_playbackSmokePresentedFrames, m_playbackSmokeWindowPresentedFrames );
     if( m_playbackSmokeTargetPresentedFrames > 0
-     && m_playbackSmokePresentedFrames != m_playbackSmokeTargetPresentedFrames )
+     && pinnedObservedFrames != m_playbackSmokeTargetPresentedFrames )
     {
         err << "[GUI-SMOKE] ERROR: exact presented-frame target was not met; target="
             << m_playbackSmokeTargetPresentedFrames
-            << " observed=" << m_playbackSmokePresentedFrames << ".\n";
+            << " observed=" << static_cast<qlonglong>( pinnedObservedFrames ) << ".\n";
+        if( m_playbackSmokeWindowPresentedFrames != m_playbackSmokePresentedFrames )
+            err << "[GUI-SMOKE] " << ( m_playbackSmokePresentedFrames - m_playbackSmokeWindowPresentedFrames ) << " of "
+                << m_playbackSmokePresentedFrames << " presents showed a source frame outside the admitted window starting at frame "
+                << static_cast<qlonglong>( m_sourceAdvance.startFrame ) << " (last presented frame "
+                << m_playbackSmokeLastPresentedFrame << "); they do not count.\n";
         return 11;
     }
 
@@ -27943,6 +27956,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeStartQualityMode = m_playbackQualityMode;
     m_playbackSmokeStartWorkerThreads = mlvappEffectivePlaybackWorkerThreadCount();
     m_playbackSmokePresentedFrames = 0;
+    m_playbackSmokeWindowPresentedFrames = 0;
     m_playbackSmokeParityMatchCount = 0;
     m_playbackSmokeFirstPresentedFrame = -1;
     m_playbackSmokeLastPresentedFrame = -1;
@@ -28466,6 +28480,11 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     m_playbackSmokeLastPresentedTime = now;
     m_playbackSmokeLastPresentedFrame = static_cast<int>( displayFrame );
     ++m_playbackSmokePresentedFrames;
+    // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r4: the presents inside the admitted window, which the pinned capture is judged on
+    // (runGuiPlaybackSmoke's exit-11 check). consumed() > 0 is the counter's armed state (consumed() is 0 only while unarmed).
+    const bool presentInsideAdmittedWindow = playback_frame_range::sourceFrameInsideAdmittedWindow(
+        static_cast<int64_t>( displayFrame ), m_sourceAdvance.consumed() > 0, m_sourceAdvance.startFrame, m_playRequiredSourceFrames );
+    if( presentInsideAdmittedWindow ) ++m_playbackSmokeWindowPresentedFrames;
     const auto avgSmokeMs = [this]( double sum ) -> double
     {
         return m_playbackSmokePresentedFrames > 0

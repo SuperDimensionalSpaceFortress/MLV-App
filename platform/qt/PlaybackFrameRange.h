@@ -1262,6 +1262,84 @@ inline PlayStopState evaluatePlayStop( int64_t consumed, int64_t required, bool 
     return PlayStopState::Continue;
 }
 
+// REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1: does the gui-smoke measured-play loop END on this observation? Pure.
+// A timeline Reached (the source frames were consumed) is seen BEFORE the frames still in flight have presented, so a
+// frame-pinned capture (targetPresentedFrames > 0) that broke on it stopped 2 to 3 frames short and failed the strict
+// presented == target check (exit 11, 0 frames written). While target > 0 and presented < target a Reached therefore does
+// NOT end the loop: the presented-count stop (the present path stops Play at exactly N) ends it. SafetyTimeout, EndedEarly
+// and PaceTooSlow still end it at once -- SafetyTimeout above all, so the wall-clock net still bounds the loop (Reached past
+// the deadline is already SafetyTimeout in evaluatePlayStop); a Continue is not a stop (the caller polls again).
+// target == 0 (an unpinned play) is exactly the previous decision.
+// stressPending: the clip-lifecycle stress has not run yet, so a Reached must wait for it (its own, older reason).
+// Two limits keep the wait to the case it is for (adversary pass on 7f0f6d58, A2 and A3):
+//  - requiredSourceFrames (the admitted window, MainWindow m_playRequiredSourceFrames): the loop waits only while the
+//    pinned count fits the admitted window (target <= required). A target beyond it (--seconds shorter than N / fps) was
+//    never reachable inside the admitted window; it keeps today's decision, the exit-11 mismatch, and never plays on past it.
+//  - playStillRunning (Play is still checked): presents can still arrive only while Play runs. A Play that already ended
+//    (the cut-out stop, the engine's own end) with the count short is the terminal exit-11 mismatch, not a 55 s wait for a
+//    count that is frozen and then a PLAY_SAFETY_TIMEOUT.
+// r3 (Grok G1(b) on ee8f00bc): a third limit. consumedSourceFrames (m_sourceAdvance.consumed()) is how far the timeline has
+// run. The wait is for the frames that were already IN FLIGHT at the Reached, and the render pipeline cannot hold more than
+// kMeasuredPlayMaxFramesInFlight of them, so the loop waits only while the timeline is fewer than that many source frames
+// past the admitted window (it stops at the observation that sees it that far past). Presents that stall or skip (drops) while Play still runs on a paced timeline end the wait there: the
+// exit-11 mismatch, as before this card, and never a Play that runs on past the window to the safety timeout, or that
+// makes up dropped presents with source frames from outside the pinned window. A timeline that holds at the window (the
+// unpaced isolated hold in playbackHandling) never trips it; that wait is bounded by the SafetyTimeout above.
+// RenderFrameThread::kMaxFrameSlotCount (12) + RenderFrameThread::kRenderRequestQueueDepth (4); both are private there.
+constexpr int64_t kMeasuredPlayMaxFramesInFlight = 16;
+inline bool measuredPlayLoopShouldStop( PlayStopState state, bool stressPending,
+                                        int64_t targetPresentedFrames, int64_t presentedFrames,
+                                        int64_t requiredSourceFrames, bool playStillRunning,
+                                        int64_t consumedSourceFrames )
+{
+    switch( state )
+    {
+    case PlayStopState::SafetyTimeout:
+    case PlayStopState::EndedEarly:
+    case PlayStopState::PaceTooSlow:
+        return true;
+    case PlayStopState::Reached:
+        if( stressPending ) return false;
+        return !( targetPresentedFrames > 0 && presentedFrames < targetPresentedFrames
+                  && targetPresentedFrames <= requiredSourceFrames && playStillRunning
+                  && consumedSourceFrames - requiredSourceFrames < kMeasuredPlayMaxFramesInFlight );
+    case PlayStopState::Continue:
+        break;
+    }
+    return false;
+}
+
+// REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r4 (Grok G4 / adversary pass 3 A1 on 38c05d4b): the presented count a
+// frame-pinned capture is judged on (the strict presented == target check, exit 11). Pure.
+// A count cannot tell a frame still in flight from a DROPPED one, so the Reached wait above may let the timeline run on and a
+// source frame PAST the admitted window complete the count (the present path then stops Play on it). A present from outside the
+// admitted window is not part of the pinned capture, so the present path ALSO counts the presents whose source frame lies inside
+// the window (sourceFrameInsideAdmittedWindow; MainWindow m_playbackSmokeWindowPresentedFrames), and the capture is met only when
+// EVERY present was inside the window and there were exactly target of them. Any present from outside the window -- the frame
+// that completed the count, or one in the middle (a seek out and back, adversary pass 6 A2 on bcac2010) -- and any raw count
+// above the target (pass 6 A1) end by the not-met path (exit 11, the unchanged `not met; target=N observed=M`), never a success.
+// The admitted window is [windowStartFrame, windowStartFrame + requiredSourceFrames - 1]: the counter's start frame (fixed when
+// the measured Play armed it; a later begin is ignored) and the admitted requirement (fixed at admission). Both are fixed before
+// the first present and NOTHING during the wait moves them -- unlike highWater, which a seek rebases (adversary pass 4 A4 on
+// 6e9145fb) -- and the window has a lower bound, so a backward seek's frame below it is outside too (pass 4 A5).
+// No admitted window (requiredSourceFrames <= 0) or an unarmed counter: nothing is inside (fail closed).
+inline bool sourceFrameInsideAdmittedWindow( int64_t sourceFrame, bool counterArmed, int64_t windowStartFrame,
+                                             int64_t requiredSourceFrames )
+{
+    // frame - start is computed only once frame >= start, so no inclusive end is formed (no overflow; pass 6 A8)
+    return counterArmed && requiredSourceFrames > 0 && sourceFrame >= windowStartFrame
+        && sourceFrame - windowStartFrame < requiredSourceFrames;
+}
+// The `observed` the strict check compares with the target: equal to it only when presented == windowPresented == target.
+// All presents inside the window: the raw count, exactly as before this card. Otherwise the window count, unless that alone
+// would equal the target (out-of-window presents on top of N in-window ones): then the raw count, which is above it.
+inline int64_t pinnedCaptureObservedFrames( int64_t targetPresentedFrames, int64_t presentedFrames,
+                                            int64_t windowPresentedFrames )
+{
+    if( windowPresentedFrames == presentedFrames ) return presentedFrames;
+    return windowPresentedFrames == targetPresentedFrames ? presentedFrames : windowPresentedFrames;
+}
+
 inline const char *playStopFailureReason( PlayStopState state )
 {
     switch( state )
