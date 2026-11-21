@@ -1368,6 +1368,26 @@ function Get-DvPlaybackProblems {
     $reasons.ToArray()
 }
 
+function Get-DvLj92LayoutRowCount {
+    <#
+    .SYNOPSIS
+    LJ92-PRED1-FAST-PATH-1 r12 (adversary r11 A3): how many of the MEASURED session's per-frame records (`playback_smoke.cpu_frame` / `playback_smoke.gpu_frame`,
+    the two emitters that carry the `raw_uint16_lj92_*` layout keys) report a decoded layout: `raw_uint16_lj92_predictor=<n>` with n >= 0 (-1 is the reset
+    sentinel of a decode that failed or never ran). Read from the run log's record bodies, so a LIGHT-arm leg (no per-frame rows) reads 0 and a key inside a
+    quoted span or a build path supplies none. $null when the measured session is unknown: the criterion then fails with its typed reason, never passes.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$LogText, [AllowNull()][AllowEmptyString()][string]$Session)
+    if ([string]::IsNullOrEmpty($LogText) -or [string]::IsNullOrEmpty($Session)) { return $null }
+    $rs = $script:DvRecordStart
+    $count = 0
+    foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
+        if ($line -cmatch ($rs + 'playback_smoke\.(?:cpu|gpu)_frame session=(?<s>[0-9]+) ') -and $Matches['s'] -ceq $Session) {
+            if ($line -cmatch ' raw_uint16_lj92_predictor=[0-9]+(?: |$)') { $count++ }
+        }
+    }
+    return $count
+}
+
 function Get-DvPlaybackEvidence {
     <#
     .SYNOPSIS
@@ -1428,6 +1448,8 @@ function Get-DvPlaybackEvidence {
         # r30 (Dot D2 on 71104385): how many times the painted frames stepped backward (a seek back; the conform line's backward). Get-DvCriteriaMetrics
         # judges no frozen tail across one: engine_target is the engine's high-water, not its final target. $null when the line does not carry it.
         conformBackward = (ConvertTo-DvInt64 $conformFields['backward'])
+        # LJ92-PRED1-FAST-PATH-1 r12 (adversary r11 A3): the measured session's per-frame records that report an lj92 layout; the layout legs gate on >= 1 (Get-DvCriteriaMetrics).
+        lj92LayoutRows = (Get-DvLj92LayoutRowCount -LogText $LogText -Session $(if ($null -ne $parsed.session) { [string]$parsed.session } else { $null }))
         fpsOverride = (ConvertTo-DvInt64 $f['fps_override'])
         wrapped = $(if ($null -eq $wrappedField) { $null } else { $wrappedField -ne 0 })
         wrapCount = (ConvertTo-DvInt64 $f['wrap_count'])
@@ -6325,6 +6347,13 @@ function Get-DvCriteriaMetrics {
         }
         elseif ($m.Contains("${name}CouldNotCheck")) { $m.Remove("${name}CouldNotCheck") }
     }
+    # LJ92-PRED1-FAST-PATH-1 r12 (adversary r11 A3): lj92LayoutRows is the number of the measured session's per-frame records that report an lj92 layout, re-derived
+    # from the run log (Get-DvLj92LayoutRowCount); a summary.json key of the same name is never trusted. A playback block that did not count (no block, or an unknown
+    # measured session) leaves it absent with a typed CouldNotCheck, so a criterion naming it FAILS.
+    $lj92Rows = $(if ($null -ne $Playback) { Get-DvProp $Playback 'lj92LayoutRows' } else { $null })
+    $m['lj92LayoutRows'] = $lj92Rows
+    if ($null -eq $lj92Rows) { $m['lj92LayoutRowsCouldNotCheck'] = $(if ($null -eq $Playback) { 'no playback block was derived from the run log' } else { 'the run log names no readable measured session, so its per-frame lj92 layout records cannot be counted' }) }
+    elseif ($m.Contains('lj92LayoutRowsCouldNotCheck')) { $m.Remove('lj92LayoutRowsCouldNotCheck') }
     # HFR-NATIVE-60FPS-FULLRES-1 r28 fix iteration 1 (adversary A2 on e052947c): a frozen presentation tail never passes. max_jump and source_fps are
     # measured between the first and the LAST presented frame, so a run that stops presenting at frame 1400 while the engine (the debt cap skipping)
     # reaches 1499 reads max_jump=1, source_fps=24. The conform line's source_advanced is what the presented frames covered; when the engine's

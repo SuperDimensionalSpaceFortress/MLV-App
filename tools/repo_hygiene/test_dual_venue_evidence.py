@@ -18469,5 +18469,89 @@ class TeamPartitionEvidenceTests(unittest.TestCase):
                 self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
 
 
+# LJ92-PRED1-FAST-PATH-1 r12 (adversary r11 A3, introduced major): the per-frame lj92 layout rows are the product of the two layout legs, but both legs
+# gated only on the look values, so a HEAVY leg that recorded no `raw_uint16_lj92_*` row at all still passed. Both roles of both specs now need at least
+# one measured-session row that reports a layout (a non-negative predictor), re-derived from the run log by Get-DvPlaybackEvidence -> Get-DvCriteriaMetrics,
+# the one chain Invoke-VenueLeg and the receipt verifier share.
+LJ92_LAYOUT_ROWS_CRITERION = {"metric": "lj92LayoutRows", "op": "ge", "value": 1}
+
+
+@requires_windows_pwsh
+class Lj92LayoutLegsRequireLayoutRowsTests(unittest.TestCase):
+    CLIP = "M16-1243"
+
+    @staticmethod
+    def log(frame_rows: list[str]) -> str:
+        return "\n".join([
+            "playback_smoke.measured_session id=3",
+            *[f"playback_smoke.frame session=3 index={i} prep_region_total_ms=1 prep_region_unattributed_ms=0" for i in range(1, 11)],
+            *frame_rows,
+            conformed_summary_line()]) + "\n"
+
+    @staticmethod
+    def layout_row(index: int, session: str = "3", predictor: str = "1", emitter: str = "cpu_frame") -> str:
+        return (f"playback_smoke.{emitter} session={session} index={index} raw_uint16_ms=9.000 raw_uint16_source=0 raw_uint16_frame_lj92_ms=8.000"
+                f" raw_uint16_inflight_wait_ms=0.000 raw_uint16_lj92_predictor={predictor} raw_uint16_lj92_precision=14 raw_uint16_lj92_max_ssss=12"
+                " raw_uint16_lj92_component_count=2 raw_uint16_lj92_scan_component_count=2 raw_uint16_lj92_pred1_fast_path_eligible=1"
+                " raw_uint16_lj92_pred1_fast_path_active=1")
+
+    def judge(self, log: str) -> list[dict]:
+        sha = hashlib.sha256(log.encode("utf-8")).hexdigest()
+        script = (
+            "$summary = [pscustomobject]@{ sourceFrames = [pscustomobject]@{ sourceAdvanced = 1499; requiredSourceFrames = 1499; failures = @() }; fixtureRehearsal = $false;"
+            " clipId = $env:DVE_CLIP; lookAssistForced = $true; gpuFramesTotal = 0; lookFlavorReported = 'cinematic' }\n"
+            "$manifest = [pscustomobject]@{ smokeRunLog = [pscustomobject]@{ runNonce = $env:DVE_NONCE; sha256 = $env:DVE_SHA } }\n"
+            "$result = [pscustomobject]@{ evidence = [pscustomobject]@{ runNonce = $env:DVE_NONCE; runLogSnapshot = [pscustomobject]@{ sha256 = $env:DVE_SHA } } }\n"
+            "$out = foreach ($rel in ($env:DVE_SPECS -split ';')) {\n"
+            "  $spec = Get-Content -Raw -LiteralPath (Join-Path $env:DVE_DV $rel) | ConvertFrom-Json\n"
+            "  $pb = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ResultJson $result -LogText $env:DVE_LOG -LogSha256 $env:DVE_SHA"
+            " -ExpectedClipId $env:DVE_CLIP\n"
+            "  $m = Get-DvCriteriaMetrics -Metrics (Get-DvVerbatimMetrics -Summary $summary -EvidenceManifest $manifest) -Playback $pb\n"
+            "  foreach ($role in 'acceptance', 'supplementary') {\n"
+            "    $v = Test-DvCriteria -Criteria $spec.criteria.$role.cpu -Metrics $m\n"
+            "    [ordered]@{ spec = $rel; role = $role; pass = $v.pass; failures = @($v.failures); rows = $m.lj92LayoutRows }\n"
+            "  }\n"
+            "}\n"
+            "ConvertTo-Json -InputObject @($out) -Compress -Depth 5")
+        proc, out = run_pwsh_json(script, DVE_LOG=log, DVE_SHA=sha, DVE_NONCE=NONCE, DVE_CLIP=self.CLIP, DVE_DV=str(DV), DVE_SPECS=";".join(LJ92_LAYOUT_LEGS))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), 2 * len(LJ92_LAYOUT_LEGS), out)
+        return out
+
+    def test_both_roles_of_both_layout_specs_name_the_layout_row_criterion(self) -> None:
+        for rel in LJ92_LAYOUT_LEGS:
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            for role in ("acceptance", "supplementary"):
+                with self.subTest(spec=rel, role=role):
+                    self.assertIn(LJ92_LAYOUT_ROWS_CRITERION, spec["criteria"][role]["cpu"])
+
+    def test_a_heavy_leg_with_ten_generic_rows_and_no_layout_row_fails(self) -> None:
+        """The finding's input: scale, look and ten measured-session generic frame rows held, zero cpu_frame / gpu_frame rows with lj92 fields."""
+        for row in self.judge(self.log([])):
+            with self.subTest(spec=row["spec"], role=row["role"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual([f.split(" ")[0] for f in row["failures"]], ["lj92LayoutRows"], row)
+                self.assertEqual(row["rows"], 0, row)
+
+    def test_a_row_of_another_session_or_one_without_a_layout_does_not_count(self) -> None:
+        cases = {
+            "another session's row": [self.layout_row(1, session="4")],
+            "a sentinel predictor (the decode failed)": [self.layout_row(1, predictor="-1")],
+            "a frame row of the wrong kind": [self.layout_row(1, emitter="frame")],
+        }
+        for name, rows in cases.items():
+            for row in self.judge(self.log(rows)):
+                with self.subTest(case=name, spec=row["spec"], role=row["role"]):
+                    self.assertFalse(row["pass"], row)
+                    self.assertEqual(row["rows"], 0, row)
+
+    def test_a_measured_session_layout_row_from_either_emitter_passes(self) -> None:
+        for emitter in ("cpu_frame", "gpu_frame"):
+            for row in self.judge(self.log([self.layout_row(1, emitter=emitter)])):
+                with self.subTest(emitter=emitter, spec=row["spec"], role=row["role"]):
+                    self.assertTrue(row["pass"], row)
+                    self.assertEqual(row["rows"], 1, row)
+
+
 if __name__ == "__main__":
     unittest.main()

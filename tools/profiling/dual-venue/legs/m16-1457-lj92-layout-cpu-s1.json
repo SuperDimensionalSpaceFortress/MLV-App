@@ -16,13 +16,15 @@
     "acceptance": {
       "cpu": [
         { "metric": "lookAssistForced", "op": "eq", "value": true },
-        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" }
+        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" },
+        { "metric": "lj92LayoutRows", "op": "ge", "value": 1 }
       ]
     },
     "supplementary": {
       "cpu": [
         { "metric": "lookAssistForced", "op": "eq", "value": true },
-        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" }
+        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" },
+        { "metric": "lj92LayoutRows", "op": "ge", "value": 1 }
       ]
     }
   }
