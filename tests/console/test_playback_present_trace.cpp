@@ -826,6 +826,87 @@ TEST(PlaybackPresentTraceWiring, TheWindowSwitchesTheStageHooksWithTheRecorderAn
     ASSERT_TRUE(source.contains(QStringLiteral("m_playbackPresentTrace.dropped()")));
 }
 
+// r10 (sol r9 A1, INV-1 "stage timestamps name the sampled event"): the rnd column is render_start, the clock value the
+// render thread takes AFTER drawFrame's prologue and the same one HEAVY logs as render_thread_start_stage_time. The render
+// column is (ready - render_start), so ready - rnd == render on EVERY row. A row that is not that is a mislabelled stamp.
+TEST(PlaybackPresentTraceStages, ReadyMinusRndIsTheRenderWorkOnEveryRowOfAFixture)
+{
+    StampGateScope on(true);
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(1000.0, 16);
+    // five frames: render_start (absolute stage-clock seconds), the render work in ms, then ready = render_start + work
+    const double renderStartS[5] = { 1.012, 1.062, 1.101, 1.3333, 1.5 };
+    const double renderWorkMs[5] = { 4.0, 4.0, 11.25, 0.5, 33.125 };
+    for (int i = 0; i < 5; ++i)
+    {
+        playback_present_trace::StageStamps stamps = stagesFrom(renderStartS[i] - 0.021);
+        stamps.renderStartS = renderStartS[i];
+        Row row;
+        row.frame = i + 1;
+        row.presentMs = renderStartS[i] * 1000.0 + renderWorkMs[i] + 8.0;
+        row.readyMs = renderStartS[i] * 1000.0 + renderWorkMs[i];
+        row.renderMs = renderWorkMs[i];
+        row.setStages(stamps);
+        trace.notePresent(row);
+    }
+    ASSERT_EQ(5u, trace.size());
+    for (size_t i = 0; i < trace.size(); ++i)
+    {
+        const Row &r = trace.row(i);
+        ASSERT_NEAR(r.renderMs, r.readyMs - r.rndMs, 1.0e-6);
+    }
+    // the identity comes from these two reads and nothing else: render_start is stored where it is read, and the render work
+    // is (ready emit - render_start), so neither clock read moved
+    const QString render = sourceOf(QStringLiteral("platform/qt/RenderFrameThread.cpp"));
+    ASSERT_EQ(1, render.count(QStringLiteral(
+        "    const double render_start = mlv_stage_timing_now();\n"
+        "    playback_present_trace::stamp( slot.traceStamps.renderStartS, render_start );\n")));
+    ASSERT_EQ(1, render.count(QStringLiteral("    const double renderThreadWorkMs = (renderThreadEndStageTime - render_start) * 1000.0;\n")));
+    ASSERT_EQ(1, render.count(QStringLiteral("    const double decodeQueueStageTime = mlv_stage_timing_now();\n    FrameSlot &slot = m_frameSlots[slotIndex];\n")));
+    ASSERT_EQ(1, render.count(QStringLiteral("    request.requestStageTime = mlv_stage_timing_now();\n")));
+}
+
+// r10 (sol r9 A1): each column's documentation names the point actually stamped, so a reader never takes it for another
+// event. The StageStamps field and the Row column of a stage carry the same statement. Nearest mechanical pin the header allows.
+TEST(PlaybackPresentTraceWiring, EachStampColumnsDocNamesTheSiteThatStampsIt)
+{
+    const QString header = sourceOf(QStringLiteral("platform/qt/PlaybackPresentTrace.h"));
+    const auto lineWith = [&header](const QString &needle) -> QString
+    {
+        const QStringList lines = header.split(QLatin1Char('\n'));
+        QString found;
+        int hits = 0;
+        for (const QString &line : lines)
+        {
+            if (line.contains(needle)) { found = line; ++hits; }
+        }
+        return hits == 1 ? found : QString();
+    };
+    const QString reqField = lineWith(QStringLiteral("double requestS = 0.0;"));
+    const QString dqField = lineWith(QStringLiteral("double decodeQueueS = 0.0;"));
+    const QString rndField = lineWith(QStringLiteral("double renderStartS = 0.0;"));
+    const QString reqColumn = lineWith(QStringLiteral("double reqMs = kUnknownMs;"));
+    const QString dqColumn = lineWith(QStringLiteral("double dqMs = kUnknownMs;"));
+    const QString rndColumn = lineWith(QStringLiteral("double rndMs = kUnknownMs;"));
+    for (const QString &line : { reqField, dqField, rndField, reqColumn, dqColumn, rndColumn })
+        ASSERT_FALSE(line.isEmpty());
+    // req: after the m_mutex wait in renderFrame, where the request clock value is taken
+    for (const QString &line : { reqField, reqColumn })
+        ASSERT_TRUE(line.contains(QStringLiteral("after the m_mutex wait")));
+    // dq: the decode-queue function-entry sample, taken before the slot is set up
+    for (const QString &line : { dqField, dqColumn })
+        ASSERT_TRUE(line.contains(QStringLiteral("decode-queue function-entry sample")));
+    // rnd: render_start, after drawFrame's prologue; the value HEAVY logs as render_thread_start_stage_time
+    for (const QString &line : { rndField, rndColumn })
+    {
+        ASSERT_TRUE(line.contains(QStringLiteral("render_start")));
+        ASSERT_TRUE(line.contains(QStringLiteral("after drawFrame's prologue")));
+    }
+    ASSERT_TRUE(header.contains(QStringLiteral("render_thread_start_stage_time")));
+    ASSERT_TRUE(header.contains(QStringLiteral("ready - rnd == render")));
+}
+
 TEST(PlaybackPresentTraceWiring, ReadOnceFromTheEnvironmentAndEveryHookIsGuarded)
 {
     const QString source = mainWindowSource();

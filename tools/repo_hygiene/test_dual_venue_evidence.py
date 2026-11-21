@@ -907,6 +907,21 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
                         "the mapping must sit outside the forceLookAssist branch")
 
+    def test_a_leg_without_the_present_trace_sets_the_apps_env_to_zero_explicitly(self) -> None:
+        """PLAYBACK-TRACE-LOWOVERHEAD-1 r10 (sol r9 A2): the smoke runner builds the app's environment from its OWN process environment plus the job's list, so an inherited
+        MLVAPP_PLAYBACK_PRESENT_TRACE=1 would leave the OFF arm of the overhead pair tracing. Every job without -PresentTrace names the flag at its OFF value, in one bracketed
+        region at the same env-list site the ON arm's '=1' uses (the pattern HEAVY-FRAME-LOG-1 uses); a job with -PresentTrace carries the '=1' and no '=0'."""
+        for name, extra in (("cuda", []), ("cpu", ["-Backend", "cpu"]), ("sheet", ["-ContactSheet", "-ContactSheetFrames", "4"])):
+            plain = self.generate(GENERATOR, f"pt0-{name}.job.ps1", extra).read_text(encoding="utf-8").replace("\r\n", "\n")
+            self.assertEqual(plain.count("'MLVAPP_PLAYBACK_PRESENT_TRACE=0',\n"), 1, name)
+            self.assertNotIn("'MLVAPP_PLAYBACK_PRESENT_TRACE=1',", plain, name)
+            self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n    # PRESENT-TRACE-OFF-ARM-1 >>>\n", plain, name)
+            self.assertEqual(self.strip_regions(plain)[1]["present-trace-off"], 1, name)
+            on = self.generate(GENERATOR, f"pt1-{name}.job.ps1", [*extra, "-PresentTrace"]).read_text(encoding="utf-8").replace("\r\n", "\n")
+            self.assertEqual(on.count("'MLVAPP_PLAYBACK_PRESENT_TRACE=1',\n"), 1, name)
+            self.assertNotIn("MLVAPP_PLAYBACK_PRESENT_TRACE=0", on, name)
+            self.assertEqual(self.strip_regions(on)[1]["present-trace-off"], 0, name)
+
     def test_the_util_sample_mapping_is_armed_only_by_a_json_true(self) -> None:
         """CUDA-HEADROOM-UTIL-SAMPLER-1: the runner maps generatorArgs.utilSample to the generator's -UtilSample only when it is a JSON true (the
         strict -is [bool] form; a string "true" is not true), for any leg, outside the forceLookAssist branch. The job text it gates is pinned in
@@ -6030,6 +6045,56 @@ class UnpacedEvidenceTests(unittest.TestCase):
         self.assertIn('if ($unpacedVerdict.blocks) { $invalid.Add("UNPACED_NOT_HONOURED:', module)
         roles = json.loads((DV / "venues.json").read_text(encoding="utf-8"))["roles"]
         self.assertEqual(roles["CUDA-HEADROOM-1"], {"bachelor": "acceptance", "ultra-magnus": "supplementary"})
+
+
+@requires_windows_pwsh
+class PresentTraceArmEvidenceTests(unittest.TestCase):
+    """PLAYBACK-TRACE-LOWOVERHEAD-1 r10 (sol r9 A2), FAIL CLOSED: the overhead gate compares a trace-OFF arm with a trace-ON arm, so an OFF leg whose run log holds ANY
+    playback_smoke.present_trace record (row or header: the app had the trace on) and an ON leg with NO row for the measured session are not a valid pair. Read from the
+    app's own log, never from the spec or the launcher's env block."""
+
+    OFF = {"generatorArgs": {}}
+    ON = {"generatorArgs": {"presentTrace": True}}
+    HEADER = "playback_smoke.present_trace_header session={s} rows=2 dropped=0 cols=i,frame,pos,t"
+    ROW = "playback_smoke.present_trace session={s} row=0,1,1,10.000,0.000,5.000"
+
+    def verdict(self, spec: dict, log: str) -> dict:
+        proc, out = run_pwsh_json("$s = $env:DVE_SPEC | ConvertFrom-Json\n(Get-DvPresentTraceEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress",
+                                  DVE_SPEC=json.dumps(spec), DVE_LOG=log)
+        self.assertIsNotNone(out, proc.stderr)
+        return out
+
+    @staticmethod
+    def log(*extra: str) -> str:
+        return "\n".join(["playback_smoke.measured_session id=3", "playback_smoke.summary session=3 reason=reached presented_frames=600", *extra]) + "\n"
+
+    def test_a_clean_pair_is_honoured(self) -> None:
+        off = self.verdict(self.OFF, self.log())
+        self.assertEqual((off["verdict"], off["blocks"], off["rows"]), ("OFF_CLEAN", False, 0))
+        rows = [self.HEADER.format(s=3), self.ROW.format(s=3), self.ROW.format(s=3)]
+        on = self.verdict(self.ON, self.log(*rows))
+        self.assertEqual((on["verdict"], on["blocks"], on["rows"]), ("ON_TRACED", False, 2))
+
+    def test_an_off_leg_with_any_trace_record_fails_with_a_named_reason(self) -> None:
+        for spec in (self.OFF, {}, {"generatorArgs": {"presentTrace": False}}):
+            for lines in ([self.ROW.format(s=3)], [self.HEADER.format(s=3)], [self.ROW.format(s=2)]):   # a row, the bare header, a warm-up session's row
+                v = self.verdict(spec, self.log(*lines))
+                self.assertEqual((v["verdict"], v["blocks"]), ("OFF_ARM_TRACED", True), (spec, lines))
+                self.assertIn("present_trace", v["reason"])
+
+    def test_an_on_leg_with_no_row_for_the_measured_session_fails_with_a_named_reason(self) -> None:
+        for lines in ([], [self.HEADER.format(s=3)], [self.ROW.format(s=2)]):   # nothing, a header with no row, a row of another session only
+            v = self.verdict(self.ON, self.log(*lines))
+            self.assertEqual((v["verdict"], v["blocks"]), ("ON_ARM_NOT_TRACED", True), lines)
+            self.assertIn("present_trace", v["reason"])
+
+    def test_the_writer_and_the_validator_both_judge_it(self) -> None:
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("$presentTraceVerdict = Get-DvPresentTraceEvidence -Spec $spec -LogText $ev.logText", module)
+        self.assertIn('if ($presentTraceVerdict.blocks) { $invalid.Add("PRESENT_TRACE_NOT_HONOURED:', module)
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("$presentTraceVerdict = Get-DvPresentTraceEvidence -Spec $spec -LogText $runLogText", runner)
+        self.assertIn("PRESENT_TRACE_NOT_HONOURED: $($presentTraceVerdict.reason)", runner)
 
 
 @requires_windows_pwsh
