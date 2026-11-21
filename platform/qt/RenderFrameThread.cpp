@@ -4203,9 +4203,10 @@ void RenderFrameThread::drawFrame( int slotIndex,
     /* PLAYBACK-TRACE-LOWOVERHEAD-1 r1: the workers' present-trace stamps survive resetMetadata, but only for the frame they
      * belong to: a slot that did not come through the decode queue holds an older frame's stamps (or none). */
     const playback_present_trace::StageStamps preservedTraceStamps =
-        reconQueuedRequestSerial == m_activeFrameRequestSerial
-            ? slot.traceStamps
-            : playback_present_trace::StageStamps();
+        playback_present_trace::stampsForRender( slot.traceStamps,
+                                                 reconQueuedRequestSerial,
+                                                 m_activeFrameRequestSerial,
+                                                 m_activeFrameRequestStageTime );
     /* PLAYBACK-LJ92-DECODE-THROUGHPUT-1: a frame the DecodeWorker decoded reports the worker's snapshot; the
      * render-thread thread-locals describe it only when this thread decoded the frame itself (runSerial).
      * CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: an inline reduced recon snapshots its own decode here too. */

@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -63,6 +64,20 @@ inline void setStampsEnabled( bool on ) { stampGate().store( on, std::memory_ord
 inline void stamp( double &destination, double nowSeconds )
 {
     if( stampsEnabled() ) destination = nowSeconds;
+}
+
+/*! The stage stamps a frame slot carries into its render (RenderFrameThread::drawFrame, render thread, before resetMetadata).
+ *  The workers' stamps survive only for the frame they belong to: the slot came through the decode queue for THIS request
+ *  (\a slotQueuedSerial == \a activeSerial). A slot that did not holds an older frame's stamps (or none), and they are dropped.
+ *  r8 (sol r7 B2): a frame no worker queued (the inline render, runSerial) still carries its request stamp: when no worker took
+ *  it, it comes from the active request's own clock value \a activeRequestStageTimeS, the value queueDecodeRequestLocked stamps
+ *  for a queued frame. With the trace off nothing is stamped. */
+inline StageStamps stampsForRender( const StageStamps &slotStamps, uint64_t slotQueuedSerial, uint64_t activeSerial,
+                                    double activeRequestStageTimeS )
+{
+    StageStamps stamps = slotQueuedSerial == activeSerial ? slotStamps : StageStamps();
+    if( !( stamps.requestS > 0.0 ) ) stamp( stamps.requestS, activeRequestStageTimeS );
+    return stamps;
 }
 
 /*! One presented frame. Times are ms since the Play's smoke start; -1 is unknown (stage stamps: kUnknownMs). */
@@ -265,7 +280,8 @@ public:
                 *chain[i] = i == Row::kReadyIndex ? -1.0 : kUnknownMs;   // each column's documented "unknown"
         }
         const bool presentKnown = ( row.knownMask >> Row::kPresentIndex ) & 1u;
-        // An unknown present (NaN, infinite) leaves the interval and tick-gap history on the last KNOWN present.
+        // An unknown present (NaN, infinite) is not an event the timer can be measured from: the interval stays on the last KNOWN
+        // present, and the tick history is kept (r8, sol r7 B1), so the next gap is tick-to-tick.
         row.intervalMs = ( presentKnown && m_havePresent ) ? row.presentMs - m_lastPresentMs : 0.0;
         row.prevEndMs = m_havePresentEnd ? m_lastPresentEndMs : -1.0;   // the column's documented "none yet"
         row.ticks = m_pending.ticks;
@@ -285,8 +301,8 @@ public:
         {
             m_lastPresentMs = row.presentMs;
             m_havePresent = true;
+            m_haveTick = false;   // only a KNOWN present restarts the tick history (the next gap is present -> first tick)
         }
-        m_haveTick = false;
     }
 
     /*! The present's GUI work (presentPlaybackPreparedFrame) returned at \a nowMs. */

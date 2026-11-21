@@ -641,6 +641,122 @@ TEST(PlaybackPresentTraceStages, ANonFinitePresentIsUnknownAndTheNextRowKeepsIts
     ASSERT_TRUE(std::isfinite(trace.row(1).intervalMs));
 }
 
+// r8 (sol r7 B1): an unknown present is not an event the timer can measure from, so it never clears the tick history. sol's
+// catalogue row: present(10) tick(20) present(unknown) tick(30) present(50) -> the last row's max_tick_gap is 10 ms, the gap
+// between the two consecutive VALID ticks; and the same row without the first known present -> 10 ms too (not 0).
+TEST(PlaybackPresentTraceStages, AnUnknownPresentKeepsTheTickHistorySoTheGapIsBetweenTheValidTicks)
+{
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    for (const bool knownFirst : { true, false })
+    {
+        for (const double bad : { nan, inf, -inf })
+        {
+            Recorder trace;
+            trace.setEnabled(true);
+            trace.begin(0.0, 8);
+            if (knownFirst)
+            {
+                Row first;
+                first.presentMs = 10.0;
+                trace.notePresent(first);
+            }
+            trace.noteTick(20.0, false, false);
+            Row unknown;
+            unknown.presentMs = bad;
+            trace.notePresent(unknown);
+            trace.noteTick(30.0, false, false);
+            Row next;
+            next.presentMs = 50.0;
+            trace.notePresent(next);
+            const size_t last = trace.size() - 1;
+            ASSERT_NEAR(10.0, trace.row(last).maxTickGapMs, 1e-9);
+            ASSERT_EQ(1, trace.row(last).ticks);
+            // the unknown present's own row: present 10 -> tick 20 when that present is known, else no earlier event
+            ASSERT_NEAR(knownFirst ? 10.0 : 0.0, trace.row(last - 1).maxTickGapMs, 1e-9);
+        }
+    }
+    // A KNOWN present still restarts the gap from itself: present(10) tick(20) present(25) tick(30) present(50) -> 5 ms.
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(0.0, 8);
+    Row a;
+    a.presentMs = 10.0;
+    trace.notePresent(a);
+    trace.noteTick(20.0, false, false);
+    Row b;
+    b.presentMs = 25.0;
+    trace.notePresent(b);
+    trace.noteTick(30.0, false, false);
+    Row c;
+    c.presentMs = 50.0;
+    trace.notePresent(c);
+    ASSERT_NEAR(5.0, trace.row(2).maxTickGapMs, 1e-9);
+}
+
+// r8 (sol r7 B2): a frame no worker queued (the inline render of Fast quality with Phase3Mode Disabled, and runSerial) still
+// carries its own request stamp: drawFrame takes it from the active request's clock value, the same value
+// queueDecodeRequestLocked stamps for a queued frame. Driven through the helper drawFrame calls, then through the recorder.
+TEST(PlaybackPresentTraceStages, AFrameNoWorkerQueuedStillCarriesItsOwnRequestStamp)
+{
+    StampGateScope on(true);
+    // the slot was last queued for request 41, so its stamps are that frame's; this frame is request 42, requested at 1.0015 s
+    const playback_present_trace::StageStamps stale = stagesFrom(0.500);
+    playback_present_trace::StageStamps s = playback_present_trace::stampsForRender(stale, 41, 42, 1.0015);
+    ASSERT_NEAR(1.0015, s.requestS, 1e-12);
+    // the slot-serial guard: none of request 41's stamps rides with request 42
+    ASSERT_NEAR(0.0, s.decodeQueueS, 0.0);
+    ASSERT_NEAR(0.0, s.decodeStartS, 0.0);
+    ASSERT_NEAR(0.0, s.decodeEndS, 0.0);
+    ASSERT_NEAR(0.0, s.reconStartS, 0.0);
+    ASSERT_NEAR(0.0, s.reconEndS, 0.0);
+    ASSERT_NEAR(0.0, s.renderStartS, 0.0);
+    ASSERT_NEAR(0.0, s.drawBeginS, 0.0);
+    // the render thread stamps its start, the frame is presented, and the row's req is a real time, not the unknown marker
+    playback_present_trace::stamp(s.renderStartS, 1.0100);
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(1000.0, 4);
+    Row row;
+    row.setStages(s);
+    row.readyMs = 1012.0;
+    row.presentMs = 1020.0;
+    trace.notePresent(row);
+    ASSERT_NEAR(1.5, trace.row(0).reqMs, 1e-6);
+    ASSERT_NEAR(playback_present_trace::kUnknownMs, trace.row(0).dqMs, 0.0);
+    ASSERT_NEAR(10.0, trace.row(0).rndMs, 1e-6);
+    ASSERT_TRUE(trace.row(0).stagesOrdered());
+    // a slot never used before (serial 0) on the inline route: same answer
+    const playback_present_trace::StageStamps fresh =
+        playback_present_trace::stampsForRender(playback_present_trace::StageStamps(), 0, 7, 2.25);
+    ASSERT_NEAR(2.25, fresh.requestS, 1e-12);
+}
+
+// r8: a queued frame keeps every stamp its workers took, including the request stamp queueDecodeRequestLocked took.
+TEST(PlaybackPresentTraceStages, AQueuedFrameKeepsItsOwnWorkerStamps)
+{
+    StampGateScope on(true);
+    const playback_present_trace::StageStamps mine = stagesFrom(1.001);
+    const playback_present_trace::StageStamps s = playback_present_trace::stampsForRender(mine, 42, 42, 1.001);
+    ASSERT_NEAR(mine.requestS, s.requestS, 0.0);
+    ASSERT_NEAR(mine.decodeQueueS, s.decodeQueueS, 0.0);
+    ASSERT_NEAR(mine.decodeStartS, s.decodeStartS, 0.0);
+    ASSERT_NEAR(mine.decodeEndS, s.decodeEndS, 0.0);
+    ASSERT_NEAR(mine.reconStartS, s.reconStartS, 0.0);
+    ASSERT_NEAR(mine.reconEndS, s.reconEndS, 0.0);
+    ASSERT_NEAR(mine.renderStartS, s.renderStartS, 0.0);
+    ASSERT_NEAR(mine.drawBeginS, s.drawBeginS, 0.0);
+}
+
+// r8: with the trace off the render-side helper takes no request stamp (the hook stays a no-op).
+TEST(PlaybackPresentTraceStages, WithTheSwitchOffTheRenderSideTakesNoRequestStamp)
+{
+    StampGateScope off(false);
+    const playback_present_trace::StageStamps s =
+        playback_present_trace::stampsForRender(playback_present_trace::StageStamps(), 41, 42, 1.0015);
+    ASSERT_NEAR(0.0, s.requestS, 0.0);
+}
+
 // r3 (adversary 81c5805c A1/A2, HUB RULING 2026-11-20T11:30Z): the LIGHT trace has no configure or H2D column, and no code
 // path derives a per-frame span from the backend's last-run preupload status. Pinned at the three places that did.
 TEST(PlaybackPresentTraceWiring, NoConfigureOrH2dSpanIsCapturedOrWrittenForTheLightTrace)
@@ -675,10 +791,13 @@ TEST(PlaybackPresentTraceWiring, EveryStageHookIsOneGuardedStoreOnAKnownThread)
     ASSERT_EQ(1, render.count(QStringLiteral(
         "    slot.resetMetadata();\n"
         "    slot.traceStamps = preservedTraceStamps;\n")));
+    // r8: through the one helper (behaviour pinned by AFrameNoWorkerQueuedStillCarriesItsOwnRequestStamp), fed this frame's
+    // serial and its request clock value
     ASSERT_EQ(1, render.count(QStringLiteral(
-        "        reconQueuedRequestSerial == m_activeFrameRequestSerial\n"
-        "            ? slot.traceStamps\n"
-        "            : playback_present_trace::StageStamps();\n")));
+        "        playback_present_trace::stampsForRender( slot.traceStamps,\n"
+        "                                                 reconQueuedRequestSerial,\n"
+        "                                                 m_activeFrameRequestSerial,\n"
+        "                                                 m_activeFrameRequestStageTime );\n")));
     // the one clock read the LIGHT path did not have is taken only when the trace is on
     ASSERT_EQ(1, render.count(QStringLiteral(
         "    if( playback_present_trace::stampsEnabled() )\n"
