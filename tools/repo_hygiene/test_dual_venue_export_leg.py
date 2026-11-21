@@ -65,6 +65,7 @@ def cdng_profile(frames: int, dual_iso_ms: float = 30.0, success: bool = True, b
         stage["raw_read_ms"] = 4.0
         stage["llrawproc_dual_iso_ms"] = dual_iso_ms
         stage["llrawproc_ms"] = 40.0   # r8: the llrawproc total contains its llrawproc_* children (the 30 ms dual-ISO one included)
+        stage["llrawproc_other_ms"] = 4.0   # EXPORT-CDNG-TOTAL-CONTAINMENT-1: dng.c:579-604 sets other = total - the seven timed children (6 x 1 + 30 = 36), so 36 + 4 = the 40 ms total
         stage["dng_compress_encode_ms"] = 10.0
         stage["producer_frame_ms"] = 62.0 + (i % 3)   # r11: the 19 producer stages below total 60 ms, so producer_frame (which contains them all) is at least that
         row = {"clip": "view-0", "frame_index": i, "raw_input_state": "x", "raw_output_state": "y", "success": success and i >= failed}
@@ -956,8 +957,8 @@ class ExportEvidenceTests(unittest.TestCase):
             profiles.append(profile({"producer_frame_ms": 100.0, "llrawproc_ms": 100.0, child: 80.0, "llrawproc_dual_iso_ms": 1.0, "llrawproc_other_ms": 19.0, "llrawproc_publish_lock_ms": 80.0}))
             profiles.append(profile({"producer_frame_ms": 100.0, child: 80.0, "llrawproc_dual_iso_ms": 1.0, "llrawproc_other_ms": 19.0, "llrawproc_publish_lock_ms": 80.0}, drop_total=True))
         refine = profile({"producer_frame_ms": 100.0, "llrawproc_ms": 100.0, "llrawproc_dark_frame_ms": 80.0, "llrawproc_dual_iso_ms": 1.0, "llrawproc_other_ms": 19.0, "llrawproc_dualiso_refine_lock_ms": 80.0})
-        control = profile({"producer_frame_ms": 120.0, "llrawproc_ms": 100.0, "llrawproc_dark_frame_ms": 20.0, "llrawproc_dual_iso_ms": 1.0, "llrawproc_other_ms": 69.0,
-                           "llrawproc_publish_lock_ms": 10.0, "llrawproc_dualiso_refine_lock_ms": 10.0, "llrawproc_shared_lock_ms": 20.0})   # (r17: pass17 A1, see the r13 control)
+        control = profile({"producer_frame_ms": 120.0, "llrawproc_ms": 100.0, "llrawproc_dark_frame_ms": 20.0, "llrawproc_dual_iso_ms": 1.0, "llrawproc_other_ms": 79.0,
+                           "llrawproc_publish_lock_ms": 10.0, "llrawproc_dualiso_refine_lock_ms": 10.0, "llrawproc_shared_lock_ms": 20.0})   # (r17: pass17 A1, see the r13 control; EXPORT-CDNG-TOTAL-CONTAINMENT-1: other = total 100 - the 21 ms of timed children, as dng.c:579-604 writes it)
         proc, got = evidence_cases([cdng_case(dualIsoExpected=True, profile=p, criteria=[]) for p in profiles + [refine, control]])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         for i in range(len(profiles) + 1):
@@ -1448,6 +1449,94 @@ def table_vs_export_problems(table: list, derived: dict) -> list:
     return problems
 
 
+def cdng_total_profile(build_id: str = BUILD_ID, zero: bool = False, set_rows: dict | None = None, per_frame: dict | None = None, drop: tuple = (), drop_llrawproc: bool = False) -> str:
+    """EXPORT-CDNG-TOTAL-CONTAINMENT-1: a 30-frame CDNG profile. zero: every producer and llrawproc stage 0 first (the boundary cases). set_rows: fields set on every frame.
+    per_frame: frame position -> fields set on that frame only. drop: fields removed from every frame. drop_llrawproc: no llrawproc stage at all (the required dual-ISO field stays, at 0)."""
+    doc = json.loads(cdng_profile(30, dual_iso_ms=0.0 if zero else 30.0, build_id=build_id))
+    for r in doc["frames"]:
+        if zero:
+            for k in CDNG_STAGES:
+                if k not in ("writer_queue_wait_ms", "writer_completion_lag_ms", "disk_write_ms"):
+                    r[k] = 0.0
+        if drop_llrawproc:
+            for k in [k for k in r if k.startswith("llrawproc") and k != "llrawproc_dual_iso_ms"]:
+                del r[k]
+            r["llrawproc_dual_iso_ms"] = 0.0
+        r.update(set_rows or {})
+        for k in drop:
+            r.pop(k, None)
+    for i, fields in (per_frame or {}).items():
+        doc["frames"][i].update(fields)
+    return json.dumps(doc)
+
+
+CONTAINMENT = "EXPORT_STAGE_CONTAINMENT_MISMATCH"
+SUM_MISMATCH = "EXPORT_STAGE_SUM_MISMATCH"
+# (name, cdng_total_profile arguments, the typed reason, text the problem must name). Dot I5 (#838 ask 6967301971): ONLY llrawproc_ms changes (40 -> 900) beside producer frames of 62 / 63 / 64 ms.
+TOTAL_CONTAINMENT_BAD = (
+    ("dot_i5_only_the_total_changes_40_to_900", dict(set_rows={"llrawproc_ms": 900.0}), CONTAINMENT, "llrawproc"),
+    # a single frame's total past its producer frame (130 ms in 63 ms) that the 30-frame mean (43 ms) hides; its other_ms is its remainder, so only the aggregate-parent pair can see it
+    ("one_frame_total_past_its_producer_frame_the_mean_hides", dict(per_frame={7: {"llrawproc_ms": 130.0, "llrawproc_other_ms": 94.0}}), CONTAINMENT, "frame_index 7"),
+    # a total inside producer_frame (60 of 63 ms) that the llrawproc children (7 timed 36 + other 4 = 40 ms) do not hold
+    ("total_inside_producer_frame_but_past_its_children", dict(set_rows={"llrawproc_ms": 60.0}), SUM_MISMATCH, "llrawproc_ms"),
+    # the children's own sum past the bracket that contains them on ONE frame (110 ms of children inside a 40 ms total): nesting is violated on that frame, whatever the mean says
+    ("one_frame_children_past_the_total_the_mean_hides", dict(per_frame={7: {"llrawproc_dual_iso_ms": 100.0}}), SUM_MISMATCH, "frame_index 7"),
+    # tolerance is 5 % + 1 ms: against a 100 ms parent (or 100 ms of children) 106.0 is the last honest figure
+    ("pair_just_above_tolerance", dict(zero=True, set_rows={"producer_frame_ms": 100.0, "llrawproc_ms": 106.5, "llrawproc_dual_iso_ms": 100.0, "llrawproc_other_ms": 6.5}), CONTAINMENT, "llrawproc_ms"),
+    ("sum_just_above_tolerance", dict(zero=True, set_rows={"producer_frame_ms": 120.0, "llrawproc_ms": 106.5, "llrawproc_dual_iso_ms": 100.0}), SUM_MISMATCH, "llrawproc_ms"),
+    # a systematic gap, not a hiccup: the bracket 20 ms past its children on 5 of 30 frames (more than a tenth of them)
+    ("bracket_past_its_children_on_a_sixth_of_the_frames", dict(per_frame={i: {"llrawproc_ms": 60.0} for i in range(5)}), SUM_MISMATCH, "llrawproc_ms"),
+    # adversary A4 (pre-existing, in scope): the worker's own total (llrawproc_total_ms, dng.c:588) is the exact identity other = max(0, total - timed children), so a total of 900 ms
+    # beside 40 ms of children is a forged field whatever llrawproc_ms says
+    ("worker_total_past_its_children_on_one_frame", dict(per_frame={7: {"llrawproc_total_ms": 900.0}}), SUM_MISMATCH, "llrawproc_total_ms"),
+)
+TOTAL_CONTAINMENT_CONTROLS = (
+    ("normal", dict(), {}),
+    ("total_absent_children_present", dict(drop=("llrawproc_ms",)), {}),
+    ("other_absent_the_sum_cannot_be_derived", dict(drop=("llrawproc_other_ms",)), {}),
+    ("one_frame_total_inside_both_parents", dict(per_frame={7: {"llrawproc_ms": 60.0, "llrawproc_other_ms": 24.0}}), {}),
+    # a bracket longer than its children on ONE frame (60 ms beside 40 ms of children) is bracket entry/exit time the worker's clock does not see: judged on the means, which one frame does not move
+    ("one_frame_bracket_longer_than_its_children_is_the_means_to_judge", dict(per_frame={7: {"llrawproc_ms": 60.0}}), {}),
+    # adversary A1: ONE scheduler pause outside the worker clock (100 ms in the bracket and the producer, none in the children) must not void correct evidence: the mean moves by 3.3 ms
+    ("one_scheduler_pause_outside_the_worker_clock", dict(per_frame={7: {"llrawproc_ms": 140.0, "producer_frame_ms": 163.0}}), {}),
+    # adversary A2: equality at 5 % + 1 ms is accepted when the figures are decimals the binary product lands a hair under (40.00046 * 1.05 + 1 = 43.000482999999996 < 43.000483)
+    ("pair_at_tolerance_with_decimal_figures", dict(zero=True, set_rows={"producer_frame_ms": 40.00046, "llrawproc_ms": 43.000483, "llrawproc_dual_iso_ms": 43.000483}), {}),
+    ("sum_at_tolerance_with_decimal_figures", dict(zero=True, set_rows={"producer_frame_ms": 120.0, "llrawproc_ms": 32.50021, "llrawproc_dual_iso_ms": 30.0002}), {}),
+    ("worker_total_agrees_with_its_children", dict(set_rows={"llrawproc_total_ms": 40.0}), {}),
+    ("pair_at_tolerance", dict(zero=True, set_rows={"producer_frame_ms": 100.0, "llrawproc_ms": 106.0, "llrawproc_dual_iso_ms": 100.0, "llrawproc_other_ms": 6.0}), {}),
+    ("sum_at_tolerance", dict(zero=True, set_rows={"producer_frame_ms": 120.0, "llrawproc_ms": 106.0, "llrawproc_dual_iso_ms": 100.0}), {}),
+    # a clip with no llrawproc stage at all (permitted absence: the app ran none of it) stays valid
+    ("no_llrawproc_stage_at_all", dict(drop_llrawproc=True), dict(dualIsoExpected=False, criteria=[{"metric": "framesExported", "op": "eq", "value": 30},
+                                                                                                    {"metric": "exportFramesFailed", "op": "eq", "value": 0},
+                                                                                                    {"metric": "profileFramesSucceeded", "op": "eq", "value": 30}])),
+)
+
+
+@requires_windows_pwsh
+class CdngTotalContainmentTests(unittest.TestCase):
+    """EXPORT-CDNG-TOTAL-CONTAINMENT-1 (Dot I5-EXPORT-CDNG-TOTAL-CONTAINMENT on #838, ask 6967301971): the llrawproc TOTAL is held inside producer_frame on every frame and
+    agrees with the llrawproc children it is the sum of, under empty and shipped criteria. The writer and the receipt re-derivation read the same reader (ExportRunnerTests)."""
+
+    def test_the_total_is_held_inside_producer_frame_and_agrees_with_its_children_under_empty_and_shipped_criteria(self) -> None:
+        cases = []
+        for _name, kw, _code, _needle in TOTAL_CONTAINMENT_BAD:
+            cases.append(cdng_case(profile=cdng_total_profile(**kw), criteria=[]))
+            cases.append(cdng_case(profile=cdng_total_profile(**kw)))
+        for _name, kw, over in TOTAL_CONTAINMENT_CONTROLS:
+            cases.append(cdng_case(profile=cdng_total_profile(**kw), **over))
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for n, (name, _kw, code, needle) in enumerate(TOTAL_CONTAINMENT_BAD):
+            for which, row in (("empty criteria", got[2 * n]), ("shipped criteria", got[2 * n + 1])):
+                with self.subTest(case=name, criteria=which):
+                    self.assertEqual(row["outcome"], "INVALID", row)
+                    self.assertTrue(any(p.startswith(code + ": ") and needle in p for p in row["problems"]), row)
+        for n, (name, _kw, _over) in enumerate(TOTAL_CONTAINMENT_CONTROLS):
+            row = got[2 * len(TOTAL_CONTAINMENT_BAD) + n]
+            with self.subTest(control=name):
+                self.assertEqual((row["problems"], row["outcome"]), ([], "PASS"), row)
+
+
 @requires_windows_pwsh
 class CdngStageContainmentGateTests(unittest.TestCase):
     """EXPORT-CDNG-STAGE-CONTAINMENT-1 (split from EXPORT-VENUE-LEG-1 / #838 by the hub STOP RULE of 2026-11-18T17:26:25Z): the six members #838 found one round at a time, each
@@ -1502,7 +1591,7 @@ class CdngStageContainmentGateTests(unittest.TestCase):
             row = {"producer_frame_ms": 100.0, child: 80.0, "llrawproc_dual_iso_ms": 1.0, "llrawproc_other_ms": 19.0, "llrawproc_publish_lock_ms": 80.0, "llrawproc_shared_lock_ms": 80.0}
             bad += [cdng_zero_profile({**row, "llrawproc_ms": 100.0}), cdng_zero_profile(row, drop_total=True)]
         got = self.run_cases(bad + [cdng_zero_profile({"producer_frame_ms": 120.0, "llrawproc_ms": 100.0, "llrawproc_dark_frame_ms": 20.0, "llrawproc_dual_iso_ms": 1.0,
-                                                       "llrawproc_other_ms": 69.0, "llrawproc_publish_lock_ms": 10.0, "llrawproc_dualiso_refine_lock_ms": 10.0,
+                                                       "llrawproc_other_ms": 79.0, "llrawproc_publish_lock_ms": 10.0, "llrawproc_dualiso_refine_lock_ms": 10.0,
                                                        "llrawproc_shared_lock_ms": 20.0})])
         for i in range(len(bad)):
             with self.subTest(case=i):
@@ -1633,7 +1722,7 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
 
     def write_export_artifacts(self, frames: int, profile: bool = True, venue: str = "bachelor", fmt: str = "cdng-lossless",
                                exported: int | None = None, result: str = "EXPORT_CAPTURED", observed_venue: str | None = None, stage: str | None = None,
-                               source_commit: str | None = None, manifest: str | None = None) -> None:
+                               source_commit: str | None = None, manifest: str | None = None, profile_text: str | None = None) -> None:
         a = self.artifacts
         if a.exists():
             shutil.rmtree(a)
@@ -1651,7 +1740,7 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
             (a / "output-manifest.json").write_text(output_manifest(1, "mov"), encoding="utf-8")
             return
         if profile:
-            (a / "export-profile.json").write_text(cdng_profile(frames, build_id=source_commit or self.sha), encoding="utf-8")
+            (a / "export-profile.json").write_text(cdng_profile(frames, build_id=source_commit or self.sha) if profile_text is None else profile_text, encoding="utf-8")
         (a / "output-manifest.json").write_text(output_manifest(exported) if manifest is None else manifest, encoding="utf-8")
 
     def validate(self, receipt: dict, spec: Path, dv: Path = DV, evidence_dir: str = "") -> dict:
@@ -1897,6 +1986,49 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
                     # an absent or matching nested stage changes the stage table, so the receipt's own table no longer equals the re-derived one: still never a PASS
                     # that verifies as the ORIGINAL receipt; the point here is that the reader itself raises no window problem
                     self.assertFalse(any("EXPORT_STAGE_WINDOW_MISMATCH" in x for x in got["reasons"]), got)
+
+    def test_i5_the_llrawproc_total_is_held_inside_producer_frame_and_its_children_at_write_and_in_the_receipt_rederivation(self) -> None:
+        """Dot I5-EXPORT-CDNG-TOTAL-CONTAINMENT (#838 ask 6967301971) through the WRITER (Invoke-VenueLeg) and the receipt VALIDATOR (Test-DvReceiptValid), each mutating ONLY the
+        llrawproc total (or one frame's): a typed INVALID at write time (never PASS), and a good receipt whose hashed export-profile.json is rewritten to that profile (every sha256
+        claim updated to match) does not verify. A matching profile and a permitted absent total verify, written by the writer and re-derived by the validator."""
+        spec = self.export_spec(maxframes=30)
+        bad = [b for b in TOTAL_CONTAINMENT_BAD if b[0] in ("dot_i5_only_the_total_changes_40_to_900", "one_frame_total_past_its_producer_frame_the_mean_hides",
+                                                             "total_inside_producer_frame_but_past_its_children", "one_frame_children_past_the_total_the_mean_hides")]
+        self.assertEqual(len(bad), 4)
+        controls = {"normal": cdng_total_profile(self.sha), "total_absent": cdng_total_profile(self.sha, drop=("llrawproc_ms",))}
+        for name, text in controls.items():
+            with self.subTest(control=name, via="writer"):
+                self.write_export_artifacts(30, profile_text=text)
+                proc, receipt, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
+                self.assertIsNotNone(receipt, proc.stdout[-3000:] + proc.stderr[-3000:])
+                self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+                self.assertEqual(self.validate(receipt, spec)["status"], "VERIFIED_OFFLINE_TEST")
+        for name, kw, code, needle in bad:
+            with self.subTest(case=name, via="writer"):
+                self.write_export_artifacts(30, profile_text=cdng_total_profile(self.sha, **kw))
+                proc, receipt, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
+                self.assertIsNotNone(receipt, proc.stdout[-3000:] + proc.stderr[-3000:])
+                self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+                self.assertIn(code, receipt["outcomeDetail"])
+        # the validator: a good receipt, its hashed profile rewritten, the claim updated to match
+        self.write_export_artifacts(30)
+        proc, good, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
+        self.assertIsNotNone(good, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(good["outcome"], "PASS", good["outcomeDetail"])
+        evdir = Path(good["evidence"]["localEvidenceDir"])
+        for name, kw, code, needle in bad:
+            with self.subTest(case=name, via="validator"):
+                work = self.tmp / f"ev-i5-{name}"
+                if work.exists():
+                    shutil.rmtree(work)
+                shutil.copytree(evdir, work)
+                raw = cdng_total_profile(self.sha, **kw).encode("utf-8")
+                (work / "export" / "export-profile.json").write_bytes(raw)
+                r = json.loads(json.dumps(good))
+                r["export"]["files"]["export-profile.json"] = hashlib.sha256(raw).hexdigest()
+                got = self.validate(r, spec, evidence_dir=str(work))
+                self.assertEqual(got["status"], "INVALID", got)
+                self.assertTrue(any(code in x for x in got["reasons"]), got)
 
     def test_a_profile_missing_on_a_captured_run_is_invalid(self) -> None:
         spec = self.export_spec(maxframes=30)
