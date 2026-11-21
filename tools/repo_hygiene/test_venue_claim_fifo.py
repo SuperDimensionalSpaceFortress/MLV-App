@@ -1392,7 +1392,7 @@ $beat = Receive-Job $job -Wait -AutoRemoveJob
         self.assertEqual((r["beat"], r["exists"]), ("OK", True))
 
     SEAM_A3 = """
-$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d -OwnerPid @@S@@
 Start-Sleep -Milliseconds 30
 $B = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
 $job = Start-Job -ArgumentList $A.path, '@@MARK@@' -ScriptBlock { param($p, $mark) $fs = [IO.File]::Open($p, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None); [IO.File]::WriteAllText($mark, '1'); Start-Sleep -Milliseconds 800; $fs.Dispose() }
@@ -1407,7 +1407,7 @@ Receive-Job $job -Wait -AutoRemoveJob | Out-Null
         # r7 adversary A3: an older READY ticket whose file was busy for a moment (no parsed phase) was skipped by the head filter and the younger waiter took the free claim. A busy older ticket is
         # read again for a short bound first; one still unreadable after it stays "phase unknown, not ready" (test_a_ticket_being_rewritten_whose_phase_cannot_be_read pins that: a ticket held for good must not block the line).
         mark = self.case / "seam-a3-mark.txt"
-        r = self.ps(self.SEAM_A3.replace("@@MARK@@", str(mark)))
+        r = self.ps(self.SEAM_A3.replace("@@S@@", str(self.sleeper().pid)).replace("@@MARK@@", str(mark)))   # A belongs to another process: a ticket of this process never blocks its owner (r8 rule 1)
         self.assertEqual((r["state"], r["granted"]), ("QUEUED", False), f"the younger waiter passed an older ready ticket that was only briefly unreadable: {r}")
 
     def test_an_already_ready_waiter_whose_heartbeat_rename_is_refused_still_tries_the_claim(self) -> None:
@@ -1561,7 +1561,7 @@ foreach ($shape in @('null', 'missing', 'trailing-space', 'other', 'array', 'sof
         return copy_with_siblings(MODULE, Path(tempfile.mkdtemp(prefix="seam-", dir=self.case)), text)
 
     SEAM_A2B = """
-$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d -Phase cooldown -StaleAfterSec 600
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d -Phase cooldown -StaleAfterSec 600 -OwnerPid @@S@@
 Start-Sleep -Milliseconds 30
 $B = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
 $job = Start-Job -ArgumentList $B, $d, '@@SEAMMOD@@', '@@MARK@@' -ScriptBlock { param($B, $d, $m, $mark) $env:SEAM_MARK = $mark; Import-Module $m -Force -DisableNameChecking; Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $B }
@@ -1579,7 +1579,7 @@ $r = Receive-Job $job -Wait -AutoRemoveJob
         # r7 pass 1 A2 (blocker): the census made after a grant had no re-read of a briefly unreadable older ticket, so it skipped A (no parsed phase) and kept the grant that A is owed.
         mark = self.case / "seam-a2b-mark.txt"
         mod = self.seam_module("    $r = Invoke-VenueClaimAttempt @attemptArgs\n", "    [IO.File]::WriteAllText($env:SEAM_MARK, '1'); Start-Sleep -Milliseconds 2500\n    $r = Invoke-VenueClaimAttempt @attemptArgs\n")
-        r = self.ps(self.SEAM_A2B.replace("@@SEAMMOD@@", str(mod)).replace("@@MARK@@", str(mark)))
+        r = self.ps(self.SEAM_A2B.replace("@@S@@", str(self.sleeper().pid)).replace("@@SEAMMOD@@", str(mod)).replace("@@MARK@@", str(mark)))   # A belongs to another process (r8 rule 1)
         self.assertEqual((r["state"], r["granted"], r["claimExists"]), ("QUEUED", False, False), f"the grant was kept although the older ticket was ready (its file only busy for a moment): {r}")
 
     SEAM_A3B = """

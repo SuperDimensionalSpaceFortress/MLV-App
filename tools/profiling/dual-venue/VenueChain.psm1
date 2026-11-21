@@ -402,7 +402,7 @@ function Write-VenueTicketAtomic {
     # The temp name does not end in .ticket.json, so Get-VenueTickets never lists it. Throws when the rename is refused (a handle without FileShare.Delete): Update-VenueTicket retries it
     # (five attempts, then returns BUSY), and Request-VenueClaim retries a BUSY for up to 2 s, then returns QUEUED with a TICKET_PHASE_BUSY note. A process that dies between the CreateNew and the
     # rename leaves its temp behind: Remove-VenueOrphanTicketTemps reaps those older than 5 minutes in Request-VenueClaim's stale sweep.
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][byte[]]$Bytes, [Diagnostics.Stopwatch]$Clock = $null, [ValidateRange(0, 3600)][double]$BudgetSec = 0)
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][byte[]]$Bytes, [Diagnostics.Stopwatch]$Clock = $null, [ValidateRange(0.0, 3600.0)][double]$BudgetSec = 0)
     $tmp = $Path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
     try {
         # r8 rule 6: the budget is asked before the temp is written too, not only before the rename (a rename already running cannot be cut short: that half is the platform's)
@@ -460,7 +460,7 @@ function Update-VenueTicket {
     Request-VenueClaim retries BUSY for up to 2 s and then answers QUEUED (note TICKET_PHASE_BUSY); the lease batch's cooldown heartbeat retakes on LOST and logs TICKET_HEARTBEAT_MISSED on BUSY;
     the chain's probing/supplementary phase sets log TICKET_PHASE_<result> on LOST or BUSY.
     #>
-    param([Parameter(Mandatory)]$Ticket, [ValidateSet('', 'waiting', 'cooldown', 'probing', 'supplementary')][string]$Phase = '', [int]$StaleAfterSec = 0, $NowUtc = $null, [ValidateRange(0, 3600)][double]$BudgetSec = 0)   # r8 rule 6: 0 (none) through 3600 s; NaN, a negative and Infinity are refused at binding. Every phase a caller passes (the chain runner sets probing and supplementary; the lease batch cooldown; a request waiting). ValidateSet is case-insensitive: stored lower-case below, as New-VenueTicket does. -BudgetSec (adversary A6, 0 = none): no attempt starts, and no back-off sleeps, past this many seconds (a monotonic clock), so a caller's bound is a bound
+    param([Parameter(Mandatory)]$Ticket, [ValidateSet('', 'waiting', 'cooldown', 'probing', 'supplementary')][string]$Phase = '', [int]$StaleAfterSec = 0, $NowUtc = $null, [ValidateRange(0.0, 3600.0)][double]$BudgetSec = 0)   # r8 rule 6: 0 (none) through 3600 s; NaN, a negative and Infinity are refused at binding. Every phase a caller passes (the chain runner sets probing and supplementary; the lease batch cooldown; a request waiting). ValidateSet is case-insensitive: stored lower-case below, as New-VenueTicket does. -BudgetSec (adversary A6, 0 = none): no attempt starts, and no back-off sleeps, past this many seconds (a monotonic clock), so a caller's bound is a bound
     $now = Resolve-VenueNow $NowUtc
     $clock = [Diagnostics.Stopwatch]::StartNew()
     for ($attempt = 1; $attempt -le 5; $attempt++) {
