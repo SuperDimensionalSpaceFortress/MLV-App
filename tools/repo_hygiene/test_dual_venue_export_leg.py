@@ -1488,6 +1488,11 @@ TOTAL_CONTAINMENT_BAD = (
     # r2 (opus H3 / fable H4): the tenth-rule boundary (4 of 30 refused, 3 of 30 a control) and a whole frame's worker total BELOW its children (the second disjunct of the identity)
     ("bracket_past_its_children_on_four_of_thirty_frames", dict(per_frame={i: {"llrawproc_ms": 60.0} for i in range(4)}), SUM_MISMATCH, "llrawproc_ms"),
     ("worker_total_below_its_children_on_one_frame", dict(per_frame={7: {"llrawproc_total_ms": 10.0}}), SUM_MISMATCH, "llrawproc_total_ms"),
+    # r2 fix 1 A4 (adversary pass on 62dff0fa): the worker is the call the llrawproc_ms bracket wraps (dng.c:2619), so a worker total past the bracket (and past producer_frame_ms when the bracket is
+    # absent) is outside the work that contains it, whether the remainder is omitted (36 ms of present children cannot refute 900), or all eight figures are present and agree with the worker (41 / 44)
+    ("a4_worker_total_past_the_bracket_other_omitted", dict(drop=("llrawproc_other_ms",), per_frame={7: {"llrawproc_total_ms": 900.0}}), CONTAINMENT, "frame_index 7"),
+    ("a4_worker_total_past_the_bracket_agreeing_with_its_children", dict(per_frame={7: {"llrawproc_other_ms": 5.0, "llrawproc_total_ms": 44.0}}), CONTAINMENT, "frame_index 7"),
+    ("a4_worker_total_past_producer_frame_bracket_absent", dict(drop=("llrawproc_other_ms", "llrawproc_ms"), per_frame={7: {"llrawproc_total_ms": 900.0}}), CONTAINMENT, "frame_index 7"),
     # a systematic gap, not a hiccup: the bracket 20 ms past its children on 5 of 30 frames (more than a tenth of them)
     ("bracket_past_its_children_on_a_sixth_of_the_frames", dict(per_frame={i: {"llrawproc_ms": 60.0} for i in range(5)}), SUM_MISMATCH, "llrawproc_ms"),
     # adversary A4 (pre-existing, in scope): the worker's own total (llrawproc_total_ms, dng.c:588) is the exact identity other = max(0, total - timed children), so a total of 900 ms
@@ -1524,6 +1529,18 @@ TOTAL_CONTAINMENT_CONTROLS = (
     ("pair_at_tolerance_with_decimal_figures", dict(zero=True, set_rows={"producer_frame_ms": 40.00046, "llrawproc_ms": 43.000483, "llrawproc_dual_iso_ms": 43.000483}), {}),
     ("sum_at_tolerance_with_decimal_figures", dict(zero=True, set_rows={"producer_frame_ms": 120.0, "llrawproc_ms": 32.50021, "llrawproc_dual_iso_ms": 30.0002}), {}),
     ("worker_total_agrees_with_its_children", dict(set_rows={"llrawproc_total_ms": 40.0}), {}),
+    # r2 fix 1 A4 control: the worker total at the bracket's own tolerance (43 ms inside a 40 ms bracket, children 36 + other 7 = 43) is inside it
+    ("worker_total_at_the_bracket_tolerance", dict(per_frame={7: {"llrawproc_other_ms": 7.0, "llrawproc_total_ms": 43.0}}), {}),
+    # r2 fix 1 A2 (adversary pass on 62dff0fa): a figure exactly at the decimal limit is accepted at HIGH MAGNITUDE too, where a binary double product is several ulps (3.7e-9 ms at 2e7) past the
+    # decimal: 20000000.00038 * 1.05 + 1 = 21000001.000399 on every frame, and the mean of 30 such figures. The batch elapsed is long enough that the wall is not what is held.
+    ("every_frame_at_the_decimal_limit_at_high_magnitude",
+     dict(zero=True, set_rows={"producer_frame_ms": 20000000.00038, "llrawproc_ms": 21000001.000399, "llrawproc_dual_iso_ms": 21000001.000399}),
+     dict(batch=batch_log(30, elapsed=1000000.0))),
+    # r2 fix 1 A3: the wall gate has the same published-precision slack as every pair: 29 frames at the wall's limit (3.3333 ms/frame * 1.05 + 1 = 4.5) and one 9 nanoseconds over it is a mean 0.3 ns past the limit
+    # (below the 6-decimal precision the figures are written at), which the means rounded to that precision accepted and an unrounded comparison refused
+    ("wall_gate_mean_a_sub_precision_hair_past_the_limit",
+     dict(zero=True, set_rows={"producer_frame_ms": 4.5, "llrawproc_ms": 1.0, "llrawproc_dual_iso_ms": 1.0}, per_frame={0: {"producer_frame_ms": 4.500009}}),
+     dict(batch=batch_log(30, elapsed=0.1))),
     # r2 B2 controls: the lower bound only judges what is PRESENT: children inside the bracket and the worker total with the remainder omitted stay valid
     ("other_omitted_worker_total_agrees_with_the_present_children", dict(drop=("llrawproc_other_ms",), set_rows={"llrawproc_total_ms": 40.0}), {}),
     ("other_omitted_present_children_just_inside_the_tolerance", dict(zero=True, drop=("llrawproc_other_ms",), set_rows={"producer_frame_ms": 120.0, "llrawproc_ms": 106.0, "llrawproc_dual_iso_ms": 100.0}), {}),
@@ -1564,6 +1581,20 @@ class CdngTotalContainmentTests(unittest.TestCase):
             row = got[2 * len(TOTAL_CONTAINMENT_BAD) + n]
             with self.subTest(control=name):
                 self.assertEqual((row["problems"], row["outcome"]), ([], "PASS"), row)
+
+    def test_a_timing_that_is_a_json_object_with_a_getType_key_is_a_typed_record_problem_not_a_throw(self) -> None:
+        """r2 fix 1 A1 (adversary pass on 62dff0fa): a JSON OBJECT {"GetType": null} where a timing belongs made the schema's own diagnostic (`$Value.GetType().Name`) throw, so the writer recorded
+        RUNNER_ERROR and a direct receipt re-derivation threw. A present value of any shape, on the worker total or on any other timing field, is typed EXPORT_RECORD_INVALID. Kept apart from the
+        table test: a throw loses every case of its run."""
+        hostile = {"GetType": None}
+        fields = ("llrawproc_total_ms", "raw_read_ms", "producer_frame_ms", "llrawproc_ms")
+        proc, got = evidence_cases([cdng_case(profile=cdng_total_profile(per_frame={7: {f: hostile}}), criteria=[]) for f in fields]
+                                   + [cdng_case(profile=cdng_total_profile(per_frame={7: {"llrawproc_total_ms": {"GetType": "x"}}}), criteria=[])])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for f, row in zip(fields + ("llrawproc_total_ms",), got):
+            with self.subTest(field=f):
+                self.assertEqual(row["outcome"], "INVALID", row)
+                self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID: ") and f in p for p in row["problems"]), row)
 
     def test_the_rendered_path_gates_read_unrounded_means_so_a_log_at_the_tolerance_is_not_rejected(self) -> None:
         """r2 B3 (sol r1 INV-5), the rendered sibling of the CDNG case: 29 frames of processed16_total 40 / debayered_frame 43 (processing 0) and one frame a hair inside the 5 % + 1 ms
