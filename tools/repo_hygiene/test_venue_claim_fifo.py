@@ -1984,7 +1984,19 @@ Wait-Job $job | Out-Null; Remove-Job $job -Force
         self.assertFalse(r["read"], f"a lock attempt started after the budget ended and went on to read the ticket: {r}")
         self.assertEqual(r["result"], "BUSY", r)
 
-    # ---- r9: the adversary pass on de591425 (the fix iteration: A4, A5) ----
+    # ---- r9: the adversary pass on de591425 (the fix iteration: A4, A5, A7) ----
+
+    def test_r9_a7_a_late_grant_whose_release_was_refused_is_not_logged_as_let_go(self) -> None:
+        # r9 A7: the late-grant branch discarded the release's answer and always logged "let go": a reader of the claim file refuses the release (BUSY) and the claim still named the batch. A source-level test
+        # (the branch needs a grant after -DeadlineUtc plus a reader holding the claim file; the answer's handling is what changed): the answer is kept, retried inline, and "let go" is logged only for a release.
+        run = LEASE_RUNNER.read_text(encoding="utf-8")
+        at = run.index("$lateGrant = ")
+        block = run[at:at + 2600]
+        self.assertIn("$lateAnswer = [string]$(", block, "the late grant's release answer is discarded")
+        self.assertIn("-le 5; $lateTry++", block, "the inline release of a late grant is not retried")
+        self.assertIn("if ($lateAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { LogBest \"CLAIM_LATE_GRANT batch=$batchNo", block, "'let go' must be conditional on a release answer")
+        self.assertIn("CLAIM_LATE_GRANT_NOT_RELEASED", block, "a refused release must be logged as not released")
+        self.assertNotIn("[void]$(if ($grantedOnRetry)", block, "the release answer is still thrown away with [void]")
 
     def test_r9_a4_a_phase_with_a_character_the_culture_compare_ignores_is_refused_not_stored(self) -> None:
         # r9 A4: [ValidateSet('waiting', 'cooldown')] compares with the current culture and ignores U+00AD / U+200D, so 'wait<U+00AD>ing' bound and was stored with the extra character: a ticket no ordinal reader

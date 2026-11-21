@@ -261,6 +261,14 @@ function Get-VenueTicketDir {
 
 function ConvertTo-VenueTicketBytes($Fields) { [Text.UTF8Encoding]::new($false).GetBytes(($Fields | ConvertTo-Json -Compress) + "`n") }
 
+function ConvertTo-VenueTicketPhase {
+    # r9 (adversary r9 A4): ValidateSet compares with the current culture and ignores characters such as U+00AD, U+200D and U+0000, so 'wait<U+00AD>ing' bound as a valid phase and was STORED with the extra
+    # character, a spelling no ordinal reader knows as ready. The stored value is the canonical lower-case word the set names, matched ORDINALLY (case-insensitive only); anything else is refused like a failed binding.
+    param([AllowEmptyString()][string]$Phase, [Parameter(Mandatory)][string[]]$Allowed)
+    foreach ($candidate in $Allowed) { if ([string]::Equals($Phase, $candidate, [StringComparison]::OrdinalIgnoreCase)) { return $candidate } }
+    throw "VENUE_CLAIM_USAGE the ticket phase '$Phase' is not one of: $($Allowed -join ', ')"
+}
+
 function New-VenueTicket {
     <#
     .SYNOPSIS
@@ -270,6 +278,7 @@ function New-VenueTicket {
     #>
     param([Parameter(Mandatory)][string]$Venue, [Parameter(Mandatory)][string]$RunDir, [string]$Purpose = '', [ValidateRange(1, 86400)][int]$StaleAfterSec = 90,
         [string]$ClaimDir = '', [int]$OwnerPid = $PID, $NowUtc = $null, [ValidateSet('waiting', 'cooldown')][string]$Phase = 'waiting')
+    $storedPhase = ConvertTo-VenueTicketPhase $Phase @('waiting', 'cooldown')   # r9 A4: before any file work
     $dir = Get-VenueTicketDir -Venue $Venue -ClaimDir $ClaimDir
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     $ownerStart = Get-VenueProcessStartUtc $OwnerPid
@@ -281,7 +290,7 @@ function New-VenueTicket {
         $fields = [ordered]@{
             schema = $script:TicketSchema; venue = $Venue; ownerPid = $OwnerPid; ownerCreatedUtc = $ownerStart.ToString('o'); host = $env:COMPUTERNAME
             runDir = $RunDir; purpose = $Purpose; createdUtc = $now.ToString('o'); heartbeatUtc = $now.ToString('o'); staleAfterSec = $StaleAfterSec
-            phase = $Phase.ToLowerInvariant(); nonce = [guid]::NewGuid().ToString('N')   # ValidateSet is case-insensitive: one stored spelling
+            phase = $storedPhase; nonce = [guid]::NewGuid().ToString('N')   # ValidateSet is case-insensitive and culture-aware: the stored spelling is the canonical word (ConvertTo-VenueTicketPhase)
         }
         $bytes = ConvertTo-VenueTicketBytes $fields
         $made = $false
@@ -461,6 +470,7 @@ function Update-VenueTicket {
     the chain's probing/supplementary phase sets log TICKET_PHASE_<result> on LOST or BUSY.
     #>
     param([Parameter(Mandatory)]$Ticket, [ValidateSet('', 'waiting', 'cooldown', 'probing', 'supplementary')][string]$Phase = '', [int]$StaleAfterSec = 0, $NowUtc = $null, [ValidateRange(0.0, 3600.0)][double]$BudgetSec = 0)   # r8 rule 6: 0 (none) through 3600 s; NaN, a negative and Infinity are refused at binding. Every phase a caller passes (the chain runner sets probing and supplementary; the lease batch cooldown; a request waiting). ValidateSet is case-insensitive: stored lower-case below, as New-VenueTicket does. -BudgetSec (adversary A6, 0 = none): no attempt starts, and no back-off sleeps, past this many seconds (a monotonic clock), so a caller's bound is a bound
+    $storedPhase = if ($Phase) { ConvertTo-VenueTicketPhase $Phase @('waiting', 'cooldown', 'probing', 'supplementary') } else { '' }   # r9 A4: the canonical word, matched ordinally
     $now = Resolve-VenueNow $NowUtc
     $clock = [Diagnostics.Stopwatch]::StartNew()
     for ($attempt = 1; $attempt -le 5; $attempt++) {
@@ -469,11 +479,13 @@ function Update-VenueTicket {
         # adversary A2: the nonce check and the rename are one critical section under the ticket directory's lock, which every remover of a ticket (Remove-VenueTicket, the reaper) takes too. A File.Move over an ABSENT
         # name creates it (a rename-over also fails while ANY handle is open on the destination, measured, so no read handle can be held across it), so without the lock a ticket removed between the check and the rename came back.
         if (-not (Test-Path -LiteralPath $Ticket.path -PathType Leaf)) { return 'LOST' }   # no lock for a ticket that is not there
+        if ($BudgetSec -gt 0 -and $clock.Elapsed.TotalSeconds -ge $BudgetSec) { break }   # r9 A5: asked again after the path check (a slow share can spend the whole budget in it): no lock attempt starts past the budget
         $lock = Enter-VenueTicketLock -TicketPath $Ticket.path -TimeoutMs $(if ($BudgetSec -gt 0) { [int][Math]::Max(1.0, [Math]::Min(1000.0, ($BudgetSec - $clock.Elapsed.TotalSeconds) * 1000.0)) } else { 1000 })
         if ($null -eq $lock) { continue }
         try {
             if ($BudgetSec -gt 0 -and $clock.Elapsed.TotalSeconds -ge $BudgetSec) { continue }   # r8 rule 6: asked again with the lock taken, before the read (the lock can be won late)
             if (-not (Test-Path -LiteralPath $Ticket.path -PathType Leaf)) { return 'LOST' }
+            if ($BudgetSec -gt 0 -and $clock.Elapsed.TotalSeconds -ge $BudgetSec) { continue }   # r9 A5: and once more after this path check, before the read handle is opened
             $text = $null
             $fs = $null
             try {
@@ -487,7 +499,7 @@ function Update-VenueTicket {
             $fields = [ordered]@{
                 schema = [string]$j.schema; venue = [string]$j.venue; ownerPid = [int]$j.ownerPid; ownerCreatedUtc = (ConvertTo-VenueUtc $j.ownerCreatedUtc).ToString('o'); host = [string]$j.host
                 runDir = [string]$j.runDir; purpose = [string]$j.purpose; createdUtc = (ConvertTo-VenueUtc $j.createdUtc).ToString('o'); heartbeatUtc = $now.ToString('o')
-                staleAfterSec = $(if ($StaleAfterSec -gt 0) { $StaleAfterSec } else { [int]$j.staleAfterSec }); phase = $(if ($Phase) { $Phase.ToLowerInvariant() } else { [string]$j.phase }); nonce = [string]$j.nonce
+                staleAfterSec = $(if ($StaleAfterSec -gt 0) { $StaleAfterSec } else { [int]$j.staleAfterSec }); phase = $(if ($storedPhase) { $storedPhase } else { [string]$j.phase }); nonce = [string]$j.nonce
             }
             try { Write-VenueTicketAtomic -Path $Ticket.path -Bytes (ConvertTo-VenueTicketBytes $fields) -Clock $clock -BudgetSec $BudgetSec }   # r7 A6: the budget is asked once more right before the publish
             catch { if (-not (Test-Path -LiteralPath $Ticket.path -PathType Leaf)) { return 'LOST' }; continue }

@@ -2384,8 +2384,16 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         # before the guard, and the batch ends DEADLINE (no claim held) like every other deadline stop.
         $lateGrant = $req.granted -and [DateTime]::UtcNow -ge $deadline
         if ($lateGrant) {
-            try { [void]$(if ($grantedOnRetry) { Invoke-ClaimRetryRelease $deadline $req.claim.nonce } else { Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir }) } catch { }
-            LogBest "CLAIM_LATE_GRANT batch=$batchNo (the claim was granted at or after the deadline: let go, not used)"
+            # r9 (adversary r9 A7): the release's answer was discarded and "let go" logged whatever it was: a reader holding the claim file refuses a release (BUSY), so the claim still named this batch. The inline release is
+            # retried (a few short tries, as the ticket give-back is) and the line says what happened; a retry-granted claim keeps its single bounded release (Invoke-ClaimRetryRelease).
+            $lateAnswer = ''
+            for ($lateTry = 1; $lateTry -le 5; $lateTry++) {
+                try { $lateAnswer = [string]$(if ($grantedOnRetry) { Invoke-ClaimRetryRelease $deadline $req.claim.nonce } else { Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir }) } catch { $lateAnswer = 'ERROR' }
+                if ($grantedOnRetry -or $lateAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { break }
+                Start-Sleep -Milliseconds (100 * $lateTry)
+            }
+            if ($lateAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { LogBest "CLAIM_LATE_GRANT batch=$batchNo (the claim was granted at or after the deadline: let go, not used)" }
+            else { LogBest "CLAIM_LATE_GRANT_NOT_RELEASED batch=$batchNo answer=$lateAnswer (the claim was granted at or after the deadline and is NOT known to be let go: it still names this batch until its expiry or its owner's exit)" }
             break
         }
         # r11 (sol r10 blocker 3): the preflight guard ran before this wait, which can be long, and an alias to an output can appear in it. The same guard runs again after every attempt,
