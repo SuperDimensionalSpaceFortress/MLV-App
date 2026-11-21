@@ -31,7 +31,13 @@ param(
     # an owner clip id only: an export leg never runs a fixture (the fixtures are 2 and 16 frames)
     [ValidatePattern('^[A-Za-z]\d{2}-\d{3,4}\z')][string]$ClipId,
     [ValidateSet('bachelor', 'ultra-magnus')][string]$Venue = 'bachelor',
-    [ValidateSet('cpu')][string]$Backend = 'cpu',
+    # DUALISO-CONFIGURE-CACHE-1 r11: 'cuda' runs the CDNG export with the app's own GPU export recon (MLVAPP_GPU_EXPORT) so a bench lane can compare two builds' CUDA export output frame by
+    # frame. 'cpu' stays the default and the job it emits behaves exactly as before. 'cuda' needs -Format cdng-lossless (the GPU export is a CDNG path).
+    [ValidateSet('cpu', 'cuda')][string]$Backend = 'cpu',
+    # which GPU export mode a 'cuda' job runs: trusted (the GPU buffer is the exported frame) or shadow (the CPU result is exported, the GPU buffer is compared to it). Only with -Backend cuda.
+    [ValidateSet('trusted', 'shadow')][string]$GpuExportMode = 'trusted',
+    # publish frame-digests.json (one record per exported DNG: file sha256, payload sha256, metadata sha256) BEFORE the exported frames are deleted. cdng-lossless only. No pixel data is published.
+    [switch]$DigestOutputs,
     [ValidateSet('cdng-lossless', 'prores')][string]$Format,
     [ValidateRange(24, 100000)][int]$MaxFrames = 0,
     [string]$ReceiptPath,
@@ -81,6 +87,9 @@ $ReconName = '__RECON_NAME__'
 $BasePackageZip = '__BASE_PACKAGE_ZIP__'
 $BasePackageExeName = 'MLVApp.exe'
 $Format = '__FORMAT__'
+$Backend = '__BACKEND__'
+$GpuExportMode = '__GPU_EXPORT_MODE__'
+$DigestOutputs = __DIGEST_OUTPUTS__
 $MaxFrames = __MAX_FRAMES__
 $DualIsoExpected = __DUAL_ISO_EXPECTED__
 $ReceiptBase64 = '__RECEIPT_BASE64__'
@@ -105,12 +114,144 @@ __SHARED_FUNCTIONS__
 # ------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 foreach ($check in @(@{ path = $Root; label = 'Root' }, @{ path = $Work; label = 'Work' }, @{ path = $Pub; label = 'Pub' })) { Assert-UnderMlvTmp $check.path $check.label }
-Write-JobTrace "export job start id=$JobId commit=$($SourceCommit.Substring(0,12)) clip=$ClipId format=$Format maxFrames=$MaxFrames"
+Write-JobTrace "export job start id=$JobId commit=$($SourceCommit.Substring(0,12)) clip=$ClipId format=$Format backend=$Backend maxFrames=$MaxFrames"
+
+function Get-GpuExportEvidence {
+    # DUALISO-CONFIGURE-CACHE-1 r11: the CUDA export run is evidence only when the app's OWN per-frame GPU export counts (export-profile.json) say every exported frame went through
+    # the GPU export in the requested mode. trusted: attempted = replaced = trusted = exported and nothing skipped. shadow (the CPU frame is exported, the GPU buffer is memcmp-compared
+    # and replaces it only when equal): attempted = replaced = exported (zero mismatches), trusted = 0, nothing skipped. A missing or non-integer count is a problem, never a pass.
+    param([string]$ProfileText, [string]$Mode, $Exported)
+    $problems = [System.Collections.Generic.List[string]]::new()
+    $counts = [ordered]@{ attempted = $null; replaced = $null; trusted = $null; skipped = $null; frameCount = $null; exported = $Exported; mode = $Mode; mismatches = $null }
+    $profile = $null
+    try { $profile = $ProfileText | ConvertFrom-Json -ErrorAction Stop } catch { $profile = $null }
+    if ($null -eq $profile) { $problems.Add('GPU_EVIDENCE_PROFILE_UNREADABLE export-profile.json is absent or not JSON'); return [pscustomobject]@{ ok = $false; problems = @($problems); counts = $counts } }
+    foreach ($pair in @(@('attempted', 'gpu_export_attempted_frames'), @('replaced', 'gpu_export_replaced_frames'), @('trusted', 'gpu_export_trusted_frames'),
+                        @('skipped', 'gpu_export_skipped_frames'), @('frameCount', 'frame_count'))) {
+        $raw = $profile.PSObject.Properties[$pair[1]]
+        $parsed = [int64]0
+        $valid = $false
+        if ($null -ne $raw -and ($raw.Value -is [int] -or $raw.Value -is [long])) { $parsed = [int64]$raw.Value; $valid = ($parsed -ge 0) }
+        if (-not $valid) { $problems.Add("GPU_EVIDENCE_COUNT_MISSING $($pair[1]) is absent or not a non-negative integer"); continue }
+        $counts[$pair[0]] = $parsed
+    }
+    if ($null -eq $Exported) { $problems.Add('GPU_EVIDENCE_EXPORTED_UNKNOWN the batch log gave no exported count') }
+    if ($problems.Count -eq 0) {
+        $n = [int64]$Exported
+        if ($n -le 0) { $problems.Add("GPU_EVIDENCE_NO_FRAMES exported=$n") }
+        if ($counts.frameCount -ne $n) { $problems.Add("GPU_EVIDENCE_FRAME_COUNT frame_count=$($counts.frameCount) exported=$n") }
+        if ($counts.attempted -ne $n) { $problems.Add("GPU_EVIDENCE_ATTEMPTED attempted=$($counts.attempted) exported=$n") }
+        if ($counts.replaced -ne $n) { $problems.Add("GPU_EVIDENCE_REPLACED replaced=$($counts.replaced) exported=$n") }
+        if ($counts.skipped -ne 0) { $problems.Add("GPU_EVIDENCE_SKIPPED skipped=$($counts.skipped)") }
+        if ($Mode -eq 'trusted') { if ($counts.trusted -ne $n) { $problems.Add("GPU_EVIDENCE_TRUSTED trusted=$($counts.trusted) exported=$n") } }
+        elseif ($Mode -eq 'shadow') { if ($counts.trusted -ne 0) { $problems.Add("GPU_EVIDENCE_TRUSTED_IN_SHADOW trusted=$($counts.trusted)") } }
+        else { $problems.Add("GPU_EVIDENCE_MODE_UNKNOWN mode=$Mode") }
+        $counts.mismatches = $counts.attempted - $counts.replaced
+    }
+    [pscustomobject]@{ ok = ($problems.Count -eq 0); problems = @($problems); counts = $counts }
+}
+
+function Get-DngPayloadDigest {
+    # DUALISO-CONFIGURE-CACHE-1 r11: the digests one exported CDNG frame is compared by. The DNG is a classic TIFF; the pixel data is the strip (or tile) bytes of its largest IFD (the main
+    # image, found through IFD0, the IFD chain and the SubIFDs). payloadSha256 hashes those bytes in strip order: the decoder is a pure function of the lossless-JPEG payload, so equal
+    # payloads decode to equal pixels. metaSha256 hashes the rest of the file (headers, tags, the other IFDs and their data), so a metadata-only difference is visible and separate.
+    # sha256 is the whole file. Nothing but hex digests and sizes leaves the job.
+    param([Parameter(Mandatory)][string]$Path)
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $length = [int64]$bytes.Length
+    if ($length -lt 8) { throw 'DNG_DIGEST_TOO_SHORT the file is shorter than a TIFF header' }
+    $le = $true
+    if ($bytes[0] -eq 0x49 -and $bytes[1] -eq 0x49) { $le = $true } elseif ($bytes[0] -eq 0x4D -and $bytes[1] -eq 0x4D) { $le = $false } else { throw 'DNG_DIGEST_NOT_TIFF no byte-order mark' }
+    $u16 = {
+        param([int64]$o)
+        if ($o -lt 0 -or $o + 2 -gt $length) { throw 'DNG_DIGEST_TRUNCATED a read past the end of the file' }
+        if ($le) { [int64]$bytes[$o] + 256 * [int64]$bytes[$o + 1] } else { 256 * [int64]$bytes[$o] + [int64]$bytes[$o + 1] }
+    }
+    $u32 = {
+        param([int64]$o)
+        if ($o -lt 0 -or $o + 4 -gt $length) { throw 'DNG_DIGEST_TRUNCATED a read past the end of the file' }
+        if ($le) { [int64]$bytes[$o] + 256 * [int64]$bytes[$o + 1] + 65536 * [int64]$bytes[$o + 2] + 16777216 * [int64]$bytes[$o + 3] }
+        else { 16777216 * [int64]$bytes[$o] + 65536 * [int64]$bytes[$o + 1] + 256 * [int64]$bytes[$o + 2] + [int64]$bytes[$o + 3] }
+    }
+    if ((& $u16 2) -ne 42) { throw 'DNG_DIGEST_NOT_CLASSIC_TIFF the TIFF magic is not 42 (BigTIFF is not handled)' }
+    $readValues = {
+        param([int64]$entryOffset)
+        $type = & $u16 ($entryOffset + 2)
+        $count = & $u32 ($entryOffset + 4)
+        $size = switch ($type) { 1 { 1 } 3 { 2 } 4 { 4 } 13 { 4 } default { throw "DNG_DIGEST_VALUE_TYPE type=$type" } }
+        if ($count -gt 4000000) { throw "DNG_DIGEST_VALUE_COUNT count=$count" }
+        $total = [int64]$size * $count
+        $base = if ($total -le 4) { $entryOffset + 8 } else { & $u32 ($entryOffset + 8) }
+        if ($base + $total -gt $length) { throw 'DNG_DIGEST_TRUNCATED a value array runs past the end of the file' }
+        $values = [int64[]]::new([int]$count)
+        for ($i = 0; $i -lt $count; $i++) {
+            $values[$i] = switch ($size) { 1 { [int64]$bytes[$base + $i] } 2 { & $u16 ($base + 2 * $i) } default { & $u32 ($base + 4 * $i) } }
+        }
+        , $values
+    }
+    $ifds = [System.Collections.Generic.List[object]]::new()
+    $queue = [System.Collections.Generic.Queue[int64]]::new()
+    $seen = [System.Collections.Generic.HashSet[int64]]::new()
+    $queue.Enqueue((& $u32 4))
+    while ($queue.Count -gt 0) {
+        $ifdOffset = $queue.Dequeue()
+        if ($ifdOffset -eq 0 -or -not $seen.Add($ifdOffset)) { continue }
+        if ($seen.Count -gt 64) { throw 'DNG_DIGEST_IFD_LIMIT more than 64 IFDs' }
+        $entryCount = & $u16 $ifdOffset
+        $tags = @{}
+        for ($i = 0; $i -lt $entryCount; $i++) { $entryOffset = $ifdOffset + 2 + 12 * $i; $tags[[int](& $u16 $entryOffset)] = $entryOffset }
+        $next = & $u32 ($ifdOffset + 2 + 12 * $entryCount)
+        if ($next -ne 0) { $queue.Enqueue($next) }
+        if ($tags.ContainsKey(330)) { foreach ($sub in (& $readValues $tags[330])) { $queue.Enqueue([int64]$sub) } }
+        $offsetTag = 273; $countTag = 279
+        if ($tags.ContainsKey(324)) { $offsetTag = 324; $countTag = 325 }
+        $ranges = [System.Collections.Generic.List[object]]::new()
+        $payloadBytes = [int64]0
+        if ($tags.ContainsKey($offsetTag) -and $tags.ContainsKey($countTag)) {
+            $offsets = & $readValues $tags[$offsetTag]
+            $counts = & $readValues $tags[$countTag]
+            if ($offsets.Length -ne $counts.Length) { throw 'DNG_DIGEST_STRIP_MISMATCH strip offsets and byte counts differ in length' }
+            for ($i = 0; $i -lt $offsets.Length; $i++) {
+                if ($offsets[$i] -lt 0 -or $counts[$i] -lt 0 -or $offsets[$i] + $counts[$i] -gt $length) { throw 'DNG_DIGEST_TRUNCATED a strip runs past the end of the file' }
+                [void]$ranges.Add([pscustomobject]@{ offset = [int64]$offsets[$i]; count = [int64]$counts[$i] })
+                $payloadBytes += [int64]$counts[$i]
+            }
+        }
+        $compression = if ($tags.ContainsKey(259)) { @(& $readValues $tags[259])[0] } else { $null }
+        [void]$ifds.Add([pscustomobject]@{ ranges = $ranges; payloadBytes = $payloadBytes; compression = $compression })
+    }
+    $main = $null
+    foreach ($candidate in $ifds) { if ($null -eq $main -or $candidate.payloadBytes -gt $main.payloadBytes) { $main = $candidate } }
+    if ($null -eq $main -or $main.payloadBytes -le 0) { throw 'DNG_DIGEST_NO_PAYLOAD no IFD carries strip or tile data' }
+    $toHex = { param($h) ([BitConverter]::ToString($h) -replace '-', '').ToLowerInvariant() }
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try { $fileSha = & $toHex $hasher.ComputeHash($bytes) } finally { $hasher.Dispose() }
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        foreach ($r in $main.ranges) { if ($r.count -gt 0) { [void]$hasher.TransformBlock($bytes, [int]$r.offset, [int]$r.count, $null, 0) } }
+        [void]$hasher.TransformFinalBlock([byte[]]::new(0), 0, 0)
+        $payloadSha = & $toHex $hasher.Hash
+    } finally { $hasher.Dispose() }
+    $sorted = @($main.ranges | Where-Object { $_.count -gt 0 } | Sort-Object { $_.offset })
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $cursor = [int64]0
+        foreach ($r in $sorted) {
+            if ($r.offset -lt $cursor) { throw 'DNG_DIGEST_OVERLAP two strips overlap' }
+            if ($r.offset -gt $cursor) { [void]$hasher.TransformBlock($bytes, [int]$cursor, [int]($r.offset - $cursor), $null, 0) }
+            $cursor = $r.offset + $r.count
+        }
+        if ($cursor -lt $length) { [void]$hasher.TransformBlock($bytes, [int]$cursor, [int]($length - $cursor), $null, 0) }
+        [void]$hasher.TransformFinalBlock([byte[]]::new(0), 0, 0)
+        $metaSha = & $toHex $hasher.Hash
+    } finally { $hasher.Dispose() }
+    [ordered]@{ bytes = $length; sha256 = $fileSha; payloadSha256 = $payloadSha; payloadBytes = $main.payloadBytes; metaSha256 = $metaSha; compression = $main.compression; ifdCount = $ifds.Count; stripCount = $main.ranges.Count }
+}
 
 function Write-ExportSummary([string]$Result, $Extra) {
     $s = [ordered]@{
         schema = 'export-stage-job.v1'; result = $Result; legType = 'export'; format = $Format; maxFrames = $MaxFrames; dualIsoExpected = $DualIsoExpected
-        clipId = $ClipId; backend = 'cpu'; declaredVenue = $DeclaredVenue; venue = (Get-AttrCudaMeasurementVenue); sourceCommit = $SourceCommit
+        clipId = $ClipId; backend = $Backend; declaredVenue = $DeclaredVenue; venue = (Get-AttrCudaMeasurementVenue); sourceCommit = $SourceCommit
         buildManifestSha256 = $BuildManifestSha256; receiptSha256 = $ReceiptSha256; fixtureRehearsal = $false; artifactRoot = $Pub
     }
     if ($null -ne $Extra) { foreach ($k in @($Extra.Keys)) { $s[$k] = $Extra[$k] } }
@@ -315,6 +456,14 @@ try {
     $psi.Environment['QT_QPA_PLATFORM'] = 'windows'
     $psi.Environment['QT_QPA_PLATFORM_PLUGIN_PATH'] = (Join-Path $pkgDir 'platforms')
     $psi.Environment['QT_PLUGIN_PATH'] = $pkgDir
+    if ($Backend -eq 'cuda') {
+        # r11: the variable set of run-release-cdng-export-profile.ps1 (-EnableGpuExport): the staged, hash-verified recon DLL, the cuda backend, and TRUSTED only in trusted mode.
+        # The scrub above has already removed whatever the agent's environment carried, so nothing inherited reaches the app.
+        $psi.Environment['MLVAPP_GPU_EXPORT'] = '1'
+        $psi.Environment['MLVAPP_GPU_EXPORT_DLL'] = $reconDll
+        $psi.Environment['MLVAPP_GPU_EXPORT_BACKEND'] = 'cuda'
+        if ($GpuExportMode -eq 'trusted') { $psi.Environment['MLVAPP_GPU_EXPORT_TRUSTED'] = '1' }
+    }
     if ($Format -eq 'cdng-lossless') {
         $psi.Environment['MLVAPP_EXPORT_STAGE_PROFILER'] = '1'
         $psi.Environment['MLVAPP_EXPORT_STAGE_PROFILE_FILE'] = $profilePath
@@ -363,6 +512,24 @@ try {
         $manifest.first = [ordered]@{ name = $outputs[0].Name; bytes = $outputs[0].Length; sha256 = (Get-AttrCudaFileSha256Blocks -Path $outputs[0].FullName -TracePath $Trace -Label 'output-first').sha256 }
         $manifest.last = [ordered]@{ name = $outputs[-1].Name; bytes = $outputs[-1].Length; sha256 = (Get-AttrCudaFileSha256Blocks -Path $outputs[-1].FullName -TracePath $Trace -Label 'output-last').sha256 }
     }
+    # r11: per-frame digests, computed and PUBLISHED before the exported frames are deleted below (the frames never leave the venue; only hex digests and sizes do). A run that timed out has
+    # a partial, changing output and is digested never.
+    $digestRecords = $null; $digestError = $null; $frameDigestsSha256 = $null
+    if ($DigestOutputs -and $Format -eq 'cdng-lossless' -and -not $timedOut -and $outputs.Count -gt 0) {
+        try {
+            $digestRecords = [System.Collections.Generic.List[object]]::new()
+            foreach ($dng in $outputs) {
+                $digest = Get-DngPayloadDigest -Path $dng.FullName
+                $record = [ordered]@{ name = $dng.Name }
+                foreach ($k in $digest.Keys) { $record[$k] = $digest[$k] }
+                [void]$digestRecords.Add($record)
+            }
+            $digestPath = Join-Path $Pub 'frame-digests.json'
+            Save-Json ([ordered]@{ schema = 'export-frame-digests.v1'; clipId = $ClipId; sourceCommit = $SourceCommit; backend = $Backend; gpuExportMode = $(if ($Backend -eq 'cuda') { $GpuExportMode } else { $null })
+                                   maxFrames = $MaxFrames; count = $digestRecords.Count; frames = @($digestRecords) }) $digestPath
+            $frameDigestsSha256 = Get-Sha $digestPath 'frame-digests-hash'
+        } catch { $digestError = [string]$_.Exception.Message; $digestRecords = $null; Write-JobTrace "step export digest error=$([string]$_.CategoryInfo.Reason)" }
+    }
     $outputAgrees = if ($Format -eq 'cdng-lossless') { $null -ne $exported -and $outputs.Count -eq $exported } else { $outputs.Count -eq 1 -and $verified.Count -eq 1 -and $null -ne $exported -and [int64]$verified[0].Groups['n'].Value -eq $exported }
     $result = $(if ($timedOut -and -not $killConfirmed) { 'EXPORT_KILL_UNCONFIRMED' }
         elseif ($timedOut) { 'EXPORT_TIMEOUT' }
@@ -373,7 +540,17 @@ try {
         elseif (-not $stagePresent) { 'EXPORT_PROFILE_ABSENT' }
         elseif (-not $outputAgrees) { 'EXPORT_OUTPUT_MISMATCH' }
         else { 'EXPORT_CAPTURED' })
-    $exitFor = @{ EXPORT_CAPTURED = 0; EXPORT_TIMEOUT = 40; EXPORT_NO_FRAMES = 41; EXPORT_FRAMES_SHORT = 42; EXPORT_PROFILE_ABSENT = 43; EXPORT_OUTPUT_MISMATCH = 44; EXPORT_EXIT_NONZERO = 46; EXPORT_KILL_UNCONFIRMED = 48 }
+    $exitFor = @{ EXPORT_CAPTURED = 0; EXPORT_TIMEOUT = 40; EXPORT_NO_FRAMES = 41; EXPORT_FRAMES_SHORT = 42; EXPORT_PROFILE_ABSENT = 43; EXPORT_OUTPUT_MISMATCH = 44; EXPORT_EXIT_NONZERO = 46; EXPORT_KILL_UNCONFIRMED = 48
+                  EXPORT_GPU_EVIDENCE_FAILED = 49; EXPORT_DIGEST_FAILED = 50 }
+    # r11: a CUDA run counts only when the app's own counts say every exported frame went through the GPU export in the requested mode (fail closed), and a digest run only when every
+    # exported frame has its record.
+    $gpuEvidence = $null
+    if ($Backend -eq 'cuda' -and $result -ceq 'EXPORT_CAPTURED') {
+        $profileText = try { [IO.File]::ReadAllText($profilePath) } catch { '' }
+        $gpuEvidence = Get-GpuExportEvidence -ProfileText $profileText -Mode $GpuExportMode -Exported $exported
+        if (-not $gpuEvidence.ok) { $result = 'EXPORT_GPU_EVIDENCE_FAILED' }
+    }
+    if ($DigestOutputs -and $result -ceq 'EXPORT_CAPTURED' -and ($null -ne $digestError -or $null -eq $digestRecords -or $digestRecords.Count -ne $exported)) { $result = 'EXPORT_DIGEST_FAILED' }
 
     # --- publish ONLY the records; then delete the exported footage from the venue-local work dir -------------------------------------------------------------------
     $manifest.deleted = $(try { Remove-ExportOutput } catch { Write-JobTrace "export output delete error=$([string]$_.CategoryInfo.Reason)"; $false })   # a locked survivor makes this false, never a missing terminal
@@ -384,10 +561,13 @@ try {
     # Any other terminal keeps the write fatal: a run that cannot publish its summary must not report a result it did not record.)
     $evidenceBestEffort = ($timedOut -and -not $killConfirmed)
     try { Save-Json $manifest (Join-Path $Pub 'output-manifest.json') } catch { if (-not $evidenceBestEffort) { throw }; Write-JobTrace "step export manifest write error=$([string]$_.CategoryInfo.Reason)" }
+    $summaryExtra = @{}
+    if ($Backend -eq 'cuda') { $summaryExtra['gpuExportMode'] = $GpuExportMode; $summaryExtra['gpuExportEvidence'] = $gpuEvidence }
+    if ($DigestOutputs) { $summaryExtra['digestOutputs'] = $true; $summaryExtra['digestCount'] = $(if ($null -ne $digestRecords) { $digestRecords.Count } else { 0 }); $summaryExtra['frameDigestsSha256'] = $frameDigestsSha256; $summaryExtra['digestError'] = $digestError }
     try {
-        Write-ExportSummary $result @{ appExitCode = $appExitCode; timedOut = $timedOut; killConfirmed = $killConfirmed;exportWallSeconds = [math]::Round($exportWatch.Elapsed.TotalSeconds, 3); exportTimeoutSec = $ExportTimeoutSec
+        Write-ExportSummary $result (@{ appExitCode = $appExitCode; timedOut = $timedOut; killConfirmed = $killConfirmed;exportWallSeconds = [math]::Round($exportWatch.Elapsed.TotalSeconds, 3); exportTimeoutSec = $ExportTimeoutSec
                                        framesExported = $exported; outputCount = $outputs.Count; outputsDeleted = $manifest.deleted; ffmpegPresent = $ffmpegPresent
-                                       executableSha256 = $manifestHashes['exe']; cpuQuiescence = $quiescence; lengthGate = $lengthGateRecord; mlvappEnvScrubbed = @($mlvappEnvScrubbed) }
+                                       executableSha256 = $manifestHashes['exe']; cpuQuiescence = $quiescence; lengthGate = $lengthGateRecord; mlvappEnvScrubbed = @($mlvappEnvScrubbed) } + $summaryExtra)
     } catch { if (-not $evidenceBestEffort) { throw }; Write-JobTrace "step export summary write error=$([string]$_.CategoryInfo.Reason)" }
     Write-Output "RESULT=$result FRAMES=$exported ARTIFACTS=$Pub"
     exit $exitFor[$result]
@@ -486,6 +666,10 @@ foreach ($needed in $(if ($PreflightBudgetOnly) { @('ClipId', 'Format') } else {
     if ([string]::IsNullOrWhiteSpace([string](Get-Variable -Name $needed -ValueOnly))) { throw "DUAL_VENUE_EXPORT_ARG_MISSING -$needed is required" }
 }
 if ($MaxFrames -lt 24) { throw 'DUAL_VENUE_EXPORT_ARG_MISSING -MaxFrames is required (24..100000)' }
+# r11: the CUDA export and the digests are CDNG-only, and the GPU mode means something only on a cuda job; each is refused here, before any job is written.
+if ($Backend -eq 'cuda' -and $Format -ne 'cdng-lossless') { throw 'DUAL_VENUE_EXPORT_CUDA_FORMAT -Backend cuda requires -Format cdng-lossless (the GPU export is a CDNG path)' }
+if ($DigestOutputs -and $Format -ne 'cdng-lossless') { throw 'DUAL_VENUE_EXPORT_DIGEST_FORMAT -DigestOutputs requires -Format cdng-lossless (the digests are over exported DNG frames)' }
+if ($Backend -ne 'cuda' -and $PSBoundParameters.ContainsKey('GpuExportMode')) { throw 'DUAL_VENUE_EXPORT_GPU_MODE_BACKEND -GpuExportMode applies only with -Backend cuda' }
 if (-not $PreflightBudgetOnly -and -not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) { throw 'DUAL_VENUE_EXPORT_RECEIPT_ABSENT -ReceiptPath names no file' }
 if ([string]::IsNullOrWhiteSpace($RepoRoot)) { $RepoRoot = Join-Path $PSScriptRoot '..\..\..' }
 try { $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path } catch { throw 'DUAL_VENUE_EXPORT_REPOROOT_INVALID -RepoRoot does not resolve to an existing path' }
@@ -551,6 +735,9 @@ $tokens = [ordered]@{
     RECON_NAME = "igpu_recon_cuda-playback-attr-3-cuda-$short.dll"
     BASE_PACKAGE_ZIP = "MLVApp-playback-attr-3-cuda-$short-pkg.zip"
     FORMAT = $Format
+    BACKEND = $Backend
+    GPU_EXPORT_MODE = $GpuExportMode
+    DIGEST_OUTPUTS = $(if ($DigestOutputs) { '$true' } else { '$false' })
     MAX_FRAMES = [string]$MaxFrames
     DUAL_ISO_EXPECTED = $(if ($DualIsoExpected) { '$true' } else { '$false' })
     RECEIPT_BASE64 = [Convert]::ToBase64String($receiptBytes)
@@ -595,7 +782,9 @@ $clipContentSha256 = if ($partShas.Count -eq 1) { $partShas[0] } else {
     playSeconds = $PlaySeconds
     fixtureRehearsal = $false
     venue = $Venue
-    backend = 'cpu'
+    backend = $Backend
+    gpuExportMode = $(if ($Backend -eq 'cuda') { $GpuExportMode } else { $null })
+    digestOutputs = [bool]$DigestOutputs
     format = $Format
     maxFrames = $MaxFrames
     dualIsoExpected = $DualIsoExpected

@@ -23,6 +23,7 @@ import hashlib
 import json
 import re
 import shutil
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -2149,10 +2150,11 @@ class ExportJobGeneratorTests(unittest.TestCase):
         self.assertEqual(got["errors"], [], got)
         self.assertEqual(sorted(got["shared"]), sorted(["Assert-UnderMlvTmp", "Save-Json", "Write-JobTrace", "Get-Sha", "Get-Mean"]))
 
-    def test_the_generator_refuses_a_non_cpu_backend_and_a_bad_format(self) -> None:
+    def test_the_generator_refuses_an_unknown_backend_and_a_bad_format(self) -> None:
+        """r11: 'cuda' is a backend now (ExportCudaAndDigestTests); an unknown one is still refused."""
         with tempfile.TemporaryDirectory() as d:
             out = Path(d) / "j.job.ps1"
-            for flag, value in (("-Backend", "cuda"), ("-Format", "h264")):
+            for flag, value in (("-Backend", "gpu"), ("-Format", "h264")):
                 args = ["-File", str(EXPORT_JOB), "-SourceCommit", "e" * 40, "-BuildManifestSha256", "ab" * 32, "-ClipId", "M16-1243", "-Venue", "bachelor",
                         "-Backend", "cpu", "-Format", "prores", "-MaxFrames", "480", "-ReceiptPath", str(out), "-PlaySeconds", "20", "-OutFile", str(out)]
                 args[args.index(flag) + 1] = value
@@ -2192,6 +2194,230 @@ class ExportJobGeneratorTests(unittest.TestCase):
             self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("DUAL_VENUE_EXPORT_ARG_MISSING -ExpectReceiptSha256", proc.stdout + proc.stderr)
             self.assertFalse(out.exists())
+
+
+# --- DUALISO-CONFIGURE-CACHE-1 r11: the CUDA export option, its fail-closed GPU counts and the per-frame digests ------------------------------------------------------------
+
+def build_synthetic_dng(endian: str, strips: list[bytes], tiled: bool = False, thumb: bytes = b"thumbnail-pixels", note: bytes = b"meta-note-A\x00") -> tuple[bytes, list[tuple[int, int]]]:
+    """A minimal classic TIFF shaped like a DNG: IFD0 holds a small thumbnail strip, an ImageDescription and one SubIFD; the SubIFD is the main image (compression 7, lossless JPEG,
+    several strips or tiles). Returns the bytes and the (offset, length) of each main-image strip."""
+    e = "<" if endian == "little" else ">"
+    entry = lambda tag, typ, count, value: struct.pack(e + "HHI", tag, typ, count) + value  # noqa: E731
+    short = lambda v: struct.pack(e + "HH", v, 0)  # noqa: E731
+    long_ = lambda v: struct.pack(e + "I", v)  # noqa: E731
+    ifd0_off = 8
+    ifd0_size = 2 + 5 * 12 + 4
+    thumb_off = ifd0_off + ifd0_size
+    note_off = thumb_off + len(thumb)
+    main_off = note_off + len(note)
+    main_size = 2 + 3 * 12 + 4
+    n = len(strips)
+    offs_off = main_off + main_size
+    cnts_off = offs_off + 4 * n
+    data_off = cnts_off + 4 * n
+    positions, cursor = [], data_off
+    for s in strips:
+        positions.append((cursor, len(s)))
+        cursor += len(s)
+    offset_tag, count_tag = (324, 325) if tiled else (273, 279)
+    ifd0 = (struct.pack(e + "H", 5)
+            + entry(259, 3, 1, short(1)) + entry(270, 2, len(note), long_(note_off)) + entry(273, 4, 1, long_(thumb_off))
+            + entry(279, 4, 1, long_(len(thumb))) + entry(330, 4, 1, long_(main_off)) + long_(0))
+    main = (struct.pack(e + "H", 3)
+            + entry(259, 3, 1, short(7)) + entry(offset_tag, 4, n, long_(offs_off)) + entry(count_tag, 4, n, long_(cnts_off)) + long_(0))
+    body = b"".join(struct.pack(e + "I", o) for o, _ in positions) + b"".join(struct.pack(e + "I", c) for _, c in positions)
+    blob = (b"II" if endian == "little" else b"MM") + struct.pack(e + "HI", 42, ifd0_off) + ifd0 + thumb + note + main + body + b"".join(strips)
+    assert len(ifd0) == ifd0_size and len(main) == main_size
+    return blob, positions
+
+
+def expected_digest(blob: bytes, positions: list[tuple[int, int]]) -> dict:
+    payload = b"".join(blob[o:o + c] for o, c in positions)
+    meta, cursor = b"", 0
+    for o, c in sorted(positions):
+        meta += blob[cursor:o]
+        cursor = o + c
+    meta += blob[cursor:]
+    return {"bytes": len(blob), "sha256": hashlib.sha256(blob).hexdigest(), "payloadSha256": hashlib.sha256(payload).hexdigest(),
+            "payloadBytes": len(payload), "metaSha256": hashlib.sha256(meta).hexdigest(), "compression": 7}
+
+
+def template_function(name: str) -> str:
+    proc = run_pwsh(["-Command", f"$d = & '{EXPORT_JOB}' -DescribeTemplate; $d.template"])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    m = re.search(r"(?ms)^function " + re.escape(name) + r"\b.*?^\}", proc.stdout)
+    assert m, f"the template defines no {name}"
+    return m.group(0)
+
+
+@requires_windows_pwsh
+class ExportCudaAndDigestTests(unittest.TestCase):
+    TEMPLATE: str = ""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        proc = run_pwsh(["-Command", f"$d = & '{EXPORT_JOB}' -DescribeTemplate; $d.template"])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        cls.TEMPLATE = proc.stdout
+
+    def test_the_emitted_job_parses_for_every_backend_mode_and_digest_choice(self) -> None:
+        for backend, mode, digest in (("cpu", "trusted", "$false"), ("cuda", "trusted", "$true"), ("cuda", "shadow", "$true"), ("cuda", "trusted", "$false")):
+            with self.subTest(backend=backend, mode=mode, digest=digest):
+                text = self.TEMPLATE
+                for token, value in (("__BACKEND__", backend), ("__GPU_EXPORT_MODE__", mode), ("__DIGEST_OUTPUTS__", digest), ("__MAX_FRAMES__", "96"),
+                                     ("__DUAL_ISO_EXPECTED__", "$true"), ("__PLAY_SECONDS__", "20"), ("__EXPORT_TIMEOUT_SEC__", "900"), ("__CPU_QUIESCENCE_THRESHOLD_PERCENT__", "20")):
+                    text = text.replace(token, value)
+                text = re.sub(r"__[A-Z0-9_]+__", "x", text)
+                with tempfile.TemporaryDirectory() as d:
+                    job = Path(d) / "job.ps1"
+                    job.write_text(text, encoding="utf-8")
+                    proc = run_pwsh(["-Command", f"$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile('{job}', [ref]$null, [ref]$e); @($e).Count; @($e | ForEach-Object Message)"])
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertEqual(proc.stdout.split()[0], "0", proc.stdout)
+
+    def test_the_cuda_environment_follows_the_scrub_and_trusted_is_set_only_in_trusted_mode(self) -> None:
+        t = self.TEMPLATE
+        scrub = t.index("$psi.Environment.Keys")
+        block = t.index("if ($Backend -eq 'cuda') {", scrub)
+        self.assertGreater(block, scrub, "the CUDA variables are set after the inherited MLVAPP_* scrub")
+        end = t.index("if ($Format -eq 'cdng-lossless') {", block)
+        body = t[block:end]
+        for needle in ("$psi.Environment['MLVAPP_GPU_EXPORT'] = '1'", "$psi.Environment['MLVAPP_GPU_EXPORT_DLL'] = $reconDll", "$psi.Environment['MLVAPP_GPU_EXPORT_BACKEND'] = 'cuda'"):
+            self.assertIn(needle, body)
+        self.assertRegex(body, r"if \(\$GpuExportMode -eq 'trusted'\) \{ \$psi\.Environment\['MLVAPP_GPU_EXPORT_TRUSTED'\] = '1' \}")
+        self.assertEqual(body.count("MLVAPP_GPU_EXPORT_TRUSTED"), 1, "trusted is set in exactly one place, under the trusted-mode guard")
+        self.assertEqual(t.count("$psi.Environment['MLVAPP_GPU_EXPORT"), 4, "the four GPU export variables are set only in that block")
+        self.assertNotIn("backend = 'cpu'", t, "the summary names the backend the job ran, not a literal")
+        self.assertIn("backend = $Backend", t)
+
+    def test_digests_are_published_before_the_exported_frames_are_deleted_and_the_counts_decide_the_result(self) -> None:
+        t = self.TEMPLATE
+        digest = t.index("Get-DngPayloadDigest -Path $dng.FullName")
+        publish = t.index("'frame-digests.json'")
+        delete = t.index("$manifest.deleted = $(try { Remove-ExportOutput }")
+        self.assertLess(digest, delete)
+        self.assertLess(publish, delete, "frame-digests.json is written before the DNGs are deleted")
+        evidence = t.index("$gpuEvidence = Get-GpuExportEvidence")
+        classified = t.index("$result = $(if ($timedOut")
+        self.assertLess(classified, evidence)
+        self.assertLess(evidence, delete)
+        self.assertIn("EXPORT_GPU_EVIDENCE_FAILED = 49", t)
+        self.assertIn("EXPORT_DIGEST_FAILED = 50", t)
+        self.assertRegex(t, r"if \(\$Backend -eq 'cuda' -and \$result -ceq 'EXPORT_CAPTURED'\)", "the GPU counts are read only for a cuda job that would otherwise be a capture")
+        self.assertNotRegex(t, r"Publish-AttrCudaFileCopy -Source \$dng", "an exported DNG is never published")
+
+    def test_the_generator_refuses_cuda_without_lossless_cdng_digests_without_cdng_and_a_gpu_mode_on_cpu(self) -> None:
+        base = ["-File", str(EXPORT_JOB), "-SourceCommit", "e" * 40, "-BuildManifestSha256", "ab" * 32, "-ClipId", "M16-1243", "-Venue", "bachelor", "-MaxFrames", "96",
+                "-PlaySeconds", "20", "-ExpectReceiptSha256", "cd" * 32]
+        cases = (
+            (["-Backend", "cuda", "-Format", "prores"], "DUAL_VENUE_EXPORT_CUDA_FORMAT"),
+            (["-Backend", "cpu", "-Format", "prores", "-DigestOutputs"], "DUAL_VENUE_EXPORT_DIGEST_FORMAT"),
+            (["-Backend", "cpu", "-Format", "cdng-lossless", "-GpuExportMode", "shadow"], "DUAL_VENUE_EXPORT_GPU_MODE_BACKEND"),
+            (["-Backend", "cpu", "-Format", "cdng-lossless", "-GpuExportMode", "trusted"], "DUAL_VENUE_EXPORT_GPU_MODE_BACKEND"),
+        )
+        for extra, token in cases:
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as d:
+                out = Path(d) / "j.job.ps1"
+                proc = run_pwsh([*base, *extra, "-ReceiptPath", str(out), "-OutFile", str(out)])
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn(token, proc.stdout + proc.stderr)
+                self.assertFalse(out.exists())
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "j.job.ps1"
+            proc = run_pwsh([*base, "-Backend", "cuda", "-Format", "cdng-lossless", "-GpuExportMode", "both", "-ReceiptPath", str(out), "-OutFile", str(out)])
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("GpuExportMode", proc.stdout + proc.stderr)
+
+    def test_gpu_evidence_is_read_from_the_apps_own_counts_and_fails_closed(self) -> None:
+        good_trusted = {"gpu_export_attempted_frames": 96, "gpu_export_replaced_frames": 96, "gpu_export_trusted_frames": 96, "gpu_export_skipped_frames": 0, "frame_count": 96}
+        cases = [
+            ("trusted complete", "trusted", good_trusted, 96, True, []),
+            ("trusted: one frame not trusted", "trusted", {**good_trusted, "gpu_export_trusted_frames": 95}, 96, False, ["GPU_EVIDENCE_TRUSTED"]),
+            ("trusted: one frame not replaced", "trusted", {**good_trusted, "gpu_export_replaced_frames": 95}, 96, False, ["GPU_EVIDENCE_REPLACED"]),
+            ("trusted: one frame not attempted", "trusted", {**good_trusted, "gpu_export_attempted_frames": 95}, 96, False, ["GPU_EVIDENCE_ATTEMPTED"]),
+            ("trusted: a skip", "trusted", {**good_trusted, "gpu_export_skipped_frames": 1}, 96, False, ["GPU_EVIDENCE_SKIPPED"]),
+            ("trusted: counts for another frame total", "trusted", good_trusted, 97, False, ["GPU_EVIDENCE_ATTEMPTED"]),
+            ("trusted: frame_count differs", "trusted", {**good_trusted, "frame_count": 95}, 96, False, ["GPU_EVIDENCE_FRAME_COUNT"]),
+            ("shadow complete", "shadow", {**good_trusted, "gpu_export_trusted_frames": 0}, 96, True, []),
+            ("shadow: six mismatches", "shadow", {**good_trusted, "gpu_export_trusted_frames": 0, "gpu_export_replaced_frames": 90}, 96, False, ["GPU_EVIDENCE_REPLACED"]),
+            ("shadow: a trusted frame", "shadow", good_trusted, 96, False, ["GPU_EVIDENCE_TRUSTED_IN_SHADOW"]),
+            ("a count is absent", "trusted", {k: v for k, v in good_trusted.items() if k != "gpu_export_trusted_frames"}, 96, False, ["GPU_EVIDENCE_COUNT_MISSING"]),
+            ("a count is a string", "trusted", {**good_trusted, "gpu_export_trusted_frames": "96"}, 96, False, ["GPU_EVIDENCE_COUNT_MISSING"]),
+            ("a count is fractional", "trusted", {**good_trusted, "gpu_export_trusted_frames": 95.5}, 96, False, ["GPU_EVIDENCE_COUNT_MISSING"]),
+            ("a count is negative", "trusted", {**good_trusted, "gpu_export_skipped_frames": -1}, 96, False, ["GPU_EVIDENCE_COUNT_MISSING"]),
+            ("nothing exported", "trusted", {k: 0 for k in good_trusted}, 0, False, ["GPU_EVIDENCE_NO_FRAMES"]),
+            ("exported unknown", "trusted", good_trusted, None, False, ["GPU_EVIDENCE_EXPORTED_UNKNOWN"]),
+            ("unknown mode", "both", good_trusted, 96, False, ["GPU_EVIDENCE_MODE_UNKNOWN"]),
+            ("profile not JSON", "trusted", "not json", 96, False, ["GPU_EVIDENCE_PROFILE_UNREADABLE"]),
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            script = Path(d) / "evidence.ps1"
+            cases_json = Path(d) / "cases.json"
+            cases_json.write_text(json.dumps([{"name": n, "mode": m, "profile": p if isinstance(p, str) else json.dumps(p), "exported": x} for n, m, p, x, _, _ in cases]), encoding="utf-8")
+            script.write_text(template_function("Get-GpuExportEvidence") + "\n"
+                              "$out = foreach ($c in (Get-Content -LiteralPath $args[0] -Raw | ConvertFrom-Json)) {\n"
+                              "  $r = Get-GpuExportEvidence -ProfileText $c.profile -Mode $c.mode -Exported $c.exported\n"
+                              "  [ordered]@{ name = $c.name; ok = $r.ok; problems = @($r.problems); mismatches = $r.counts.mismatches }\n"
+                              "}\n"
+                              "ConvertTo-Json -InputObject @($out) -Compress -Depth 5\n", encoding="utf-8")
+            proc = run_pwsh(["-File", str(script), str(cases_json)])
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            got = {r["name"]: r for r in json.loads(proc.stdout)}
+        for name, _mode, _profile, _exported, ok, tokens in cases:
+            with self.subTest(case=name):
+                self.assertEqual(got[name]["ok"], ok, got[name])
+                joined = " ".join(got[name]["problems"])
+                for token in tokens:
+                    self.assertIn(token, joined)
+        self.assertEqual(got["shadow: six mismatches"]["mismatches"], 6, "shadow mismatches are attempted - replaced")
+
+    def test_the_dng_digest_hashes_the_main_images_payload_apart_from_everything_else(self) -> None:
+        cases = {
+            "little-strips": build_synthetic_dng("little", [b"\x11" * 97, b"\x22" * 64, b"\x33" * 71]),
+            "big-strips": build_synthetic_dng("big", [b"\x44" * 90, b"\x55" * 33]),
+            "little-tiles": build_synthetic_dng("little", [b"\x66" * 80, b"\x77" * 80], tiled=True),
+        }
+        with tempfile.TemporaryDirectory() as d:
+            for name, (blob, _) in cases.items():
+                (Path(d) / f"{name}.dng").write_bytes(blob)
+            # a metadata-only difference (the ImageDescription bytes) and a payload-only difference (one byte of the first strip)
+            blob, positions = cases["little-strips"]
+            note_at = blob.index(b"meta-note-A")
+            meta_changed = blob[:note_at] + b"meta-note-B" + blob[note_at + 11:]
+            payload_changed = bytearray(blob)
+            payload_changed[positions[0][0] + 5] ^= 0xFF
+            (Path(d) / "meta-changed.dng").write_bytes(meta_changed)
+            (Path(d) / "payload-changed.dng").write_bytes(bytes(payload_changed))
+            (Path(d) / "truncated.dng").write_bytes(blob[:positions[1][0] + 3])
+            (Path(d) / "not-tiff.dng").write_bytes(b"this is not a tiff file at all")
+            script = Path(d).parent / (Path(d).name + "-digest.ps1")
+            try:
+                script.write_text(template_function("Get-DngPayloadDigest") + "\n"
+                                  "$out = [ordered]@{}\n"
+                                  "foreach ($f in Get-ChildItem -LiteralPath $args[0] -Filter *.dng) {\n"
+                                  "  try { $out[$f.BaseName] = Get-DngPayloadDigest -Path $f.FullName } catch { $out[$f.BaseName] = [ordered]@{ error = [string]$_.Exception.Message } }\n"
+                                  "}\n"
+                                  "$out | ConvertTo-Json -Compress -Depth 5\n", encoding="utf-8")
+                proc = run_pwsh(["-File", str(script), d])
+            finally:
+                script.unlink(missing_ok=True)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            got = json.loads(proc.stdout)
+        for name, (blob, positions) in cases.items():
+            with self.subTest(file=name):
+                want = expected_digest(blob, positions)
+                for key, value in want.items():
+                    self.assertEqual(got[name][key], value, f"{name}.{key}")
+                self.assertEqual(got[name]["ifdCount"], 2)
+                self.assertEqual(got[name]["stripCount"], len(positions))
+        base = got["little-strips"]
+        self.assertEqual(got["meta-changed"]["payloadSha256"], base["payloadSha256"], "a metadata-only difference leaves the payload digest alone")
+        self.assertNotEqual(got["meta-changed"]["metaSha256"], base["metaSha256"])
+        self.assertNotEqual(got["meta-changed"]["sha256"], base["sha256"])
+        self.assertNotEqual(got["payload-changed"]["payloadSha256"], base["payloadSha256"], "one changed payload byte changes the payload digest")
+        self.assertEqual(got["payload-changed"]["metaSha256"], base["metaSha256"], "and leaves the metadata digest alone")
+        self.assertIn("DNG_DIGEST_TRUNCATED", got["truncated"]["error"])
+        self.assertIn("DNG_DIGEST_NOT_TIFF", got["not-tiff"]["error"])
 
 
 if __name__ == "__main__":
