@@ -307,9 +307,19 @@ class ScriptsInstallUnconditionallyTests(unittest.TestCase):
         self.assertIn("its root was killed (root-only kill) and its process tree was seen gone", body)
         self.assertNotIn("its process tree was killed", body)
         self.assertIn("$probeStopUnconfirmed = ($probeTimedOut -and -not $probeKillConfirmed)", release)
-        self.assertRegex(release, r"\} elseif \(\$probeStopUnconfirmed\) \{\n\s*Write-Host \"FAIL: launch probe timed out")
-        self.assertIn("if ($probeStopUnconfirmed) { exit 10 }", release)
+        self.assertRegex(release, r"\} elseif \(\$probeStopUnconfirmed\) \{\n(?:\s*#[^\n]*\n)*\s*Write-Host \"FAIL: launch probe timed out")
         self.assertIn("10=the launch probe timed out and its stop was NOT confirmed", release)
+        # adversary a7bf472f-A2: exit 10 is IMMEDIATE in that FAIL branch, so neither the ffmpeg hold (exit 9) nor a manifest write that
+        # throws can end the script first with another code.
+        branch = re.search(r"\} elseif \(\$probeStopUnconfirmed\) \{\n(.*?)\n\} elseif", release, re.S)
+        self.assertIsNotNone(branch, "the unconfirmed-stop branch is gone")
+        self.assertRegex(branch.group(1), r"\n\s*exit 10$")
+        statements = [m.start() for m in re.finditer(r"(?m)^\s*exit 10\s*$", release)]
+        self.assertEqual(len(statements), 1, "exactly one exit 10 statement")
+        self.assertLess(statements[0], release.index("$ffmpegHold = Open-PinnedFileHold"))
+        # adversary a7bf472f-A5 (advisory, in scope): [uint32] of a negative NTSTATUS threw before exit 8; the status is formatted as an int.
+        self.assertNotIn("[uint32]$probeExit", release)
+        self.assertIn("-f ([int]$probeExit)", release)
 
     def test_the_helper_runs_the_extractor_with_verify_installed_bounded(self) -> None:
         text = _normalised(HELPER_MODULE)
@@ -1011,6 +1021,16 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         self.assertIn("name one extracted path", result["reason"])
         good = self._zip("good-tree.zip", {"MLVApp.exe": b"exe", "ffmpeg.exe": payload, "pixel_maps/": b"", "pixel_maps/a.fpm": b"a"})
         self.assertTrue(self._check_zip(good, payload)["ok"], "a canonical tree with a directory entry passes")
+        # adversary a7bf472f-A4: ffmpeg.exe/child.txt makes ffmpeg.exe an (implicit) directory on extraction, so the root ffmpeg.exe entry
+        # cannot be written there. A file entry and any entry below it name one path as both a file and a directory: refused in either
+        # order, in any case, member or not.
+        for label, members in (("dir-first", {"MLVApp.exe": b"exe", "ffmpeg.exe/child.txt": b"x", "ffmpeg.exe": payload}),
+                               ("file-first", {"MLVApp.exe": b"exe", "ffmpeg.exe": payload, "FFMPEG.EXE/child.txt": b"x"}),
+                               ("other", {"ffmpeg.exe": payload, "pixel_maps": b"f", "pixel_maps/a/b.fpm": b"a"})):
+            with self.subTest(collision=label):
+                result = self._check_zip(self._zip(f"collide-{label}.zip", members), payload)
+                self.assertFalse(result["ok"], result)
+                self.assertIn("as both a file and a directory", result["reason"])
 
     MINE = "0123456789abcdef0123456789abcdef"
     OTHER = "fedcba9876543210fedcba9876543210"
@@ -1079,6 +1099,45 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         self._assert_backup_reported(result, mine / "ffmpeg.exe")
         self.assertEqual((other / "ffmpeg.exe").read_bytes(), b"Q-OLD")
 
+    def test_recovery_refuses_an_output_folder_retargeted_after_the_start(self) -> None:
+        # adversary a7bf472f-A7: OutputDir current was a junction to A, the extractor moved OLD into A's transaction, the stop confirmed,
+        # and current was retargeted to B before recovery. Recovery re-resolved the spelling, found nothing in B and still said
+        # "transaction reconciled". The folder's identity is bound before the child starts; recovery refuses a different folder, and a
+        # transaction that is not found is said to be not found.
+        a = self.tmp / "A"
+        b = self.tmp / "B"
+        backup = a / f".vendored-payload-transaction-{self.MINE}"
+        backup.mkdir(parents=True)
+        (backup / "ffmpeg.exe").write_bytes(b"OLD")
+        b.mkdir()
+        current = self.tmp / "current"
+        call = "& $m { param($o, $t, $s) Complete-PinnedPayloadTimeoutRecovery -OutputDir $o -TransactionId $t -StartIdentity $s }"
+        result = self._ps(
+            "$null = New-Item -ItemType Junction -Path $env:FFX_CUR -Target $env:FFX_A\n"
+            "$start = & $m { param($o) Get-PinnedDirectoryIdentity -LiteralPath $o } $env:FFX_CUR\n"
+            "[System.IO.Directory]::Delete($env:FFX_CUR)\n"
+            "$null = New-Item -ItemType Junction -Path $env:FFX_CUR -Target $env:FFX_B\n"
+            f"$moved = {call} $env:FFX_CUR $env:FFX_TX $start\n"
+            "$backupKept = Test-Path -LiteralPath (Join-Path $env:FFX_A \".vendored-payload-transaction-$($env:FFX_TX)\\ffmpeg.exe\")\n"
+            "[System.IO.Directory]::Delete($env:FFX_CUR)\n"
+            "$null = New-Item -ItemType Junction -Path $env:FFX_CUR -Target $env:FFX_A\n"
+            f"$same = {call} $env:FFX_CUR $env:FFX_TX $start\n"
+            "[System.IO.Directory]::Delete($env:FFX_CUR)\n"
+            f"$none = {call} $env:FFX_B $env:FFX_TX $null\n"
+            "[ordered]@{ start = [string]$start; moved = $moved.text; movedRestored = @($moved.restored).Count; backupKept = $backupKept;"
+            " same = $same.text; sameRestored = @($same.restored); none = $none.text } | ConvertTo-Json -Compress\n",
+            FFX_CUR=str(current), FFX_A=str(a), FFX_B=str(b), FFX_TX=self.MINE)
+        self.assertTrue(result["start"], result)
+        self.assertIn("is no longer the folder the install started with", result["moved"])
+        self.assertNotIn("reconciled: restored", result["moved"])
+        self.assertEqual(result["movedRestored"], 0, result)
+        self.assertTrue(result["backupKept"], result)
+        self.assertIn("transaction reconciled: restored [ffmpeg.exe]", result["same"])
+        self.assertEqual(result["sameRestored"], ["ffmpeg.exe"], result)
+        self.assertEqual((a / "ffmpeg.exe").read_bytes(), b"OLD")
+        self.assertIn("no transaction folder", result["none"])
+        self.assertNotIn("reconciled", result["none"])
+
     def test_a_transaction_that_cannot_be_listed_is_an_error_never_silence(self) -> None:
         # adversary 78d626ed-A3: a backup listing that failed (ListDirectory denied) was dropped by SilentlyContinue and recovery
         # said "reconciled" with nothing restored. Get-ChildItem is shadowed by a global function that throws like a denied listing.
@@ -1126,13 +1185,19 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         self.assertIn("'--transaction-id', $transactionId,", body, "the child must be told the transaction folder the recovery opens")
         self.assertNotIn("preexistingTransactions", body, "recovery is by exact id, never by which folders look new")
         branch = body[body.index("if ($result.timedOut) {"): body.index("if ($result.exitCode -ne 0) {")]
-        self.assertRegex(branch, r"if \(\$result\.killConfirmed\) \{\n\s*\$restore = Restore-PinnedPayloadTransaction -OutputDir \$OutputDir -TransactionId \$transactionId\n")
+        # adversary a7bf472f-A7: the recovery is bound to the output folder's identity taken before the child started.
+        self.assertRegex(branch, r"if \(\$result\.killConfirmed\) \{\n\s*\$recovery = Complete-PinnedPayloadTimeoutRecovery -OutputDir \$OutputDir "
+                                 r"-TransactionId \$transactionId -StartIdentity \$outputIdentity\n")
+        self.assertLess(body.index("$outputIdentity = Get-PinnedDirectoryIdentity -LiteralPath $OutputDir"),
+                        body.index("[System.Diagnostics.Process]::Start($psi)"))
+        recovery = re.search(r"function Complete-PinnedPayloadTimeoutRecovery \{.*?\n\}", text, re.S).group(0)
+        self.assertEqual(recovery.count("Restore-PinnedPayloadTransaction -OutputDir $OutputDir -TransactionId $TransactionId"), 1)
         self.assertIn("was NOT reconciled", branch)
         # PR 862 r10 re-baseline: killConfirmed is the ROOT-ONLY stop's confirmation (the root killed, the tree seen gone); there is no
         # recovery after an unconfirmed stop: no second kill, no retry, no restore.
         self.assertIn("its root was killed (root-only kill) and its process tree was seen gone", branch)
         self.assertEqual(branch.count("Stop-PinnedPayloadChild"), 0, "no second stop or kill in the timeout branch")
-        self.assertEqual(branch.count("Restore-PinnedPayloadTransaction"), 1)
+        self.assertEqual(branch.count("Restore-PinnedPayloadTransaction"), 0, "the branch restores only through the identity-bound recovery")
         restore =text[text.index("function Restore-PinnedPayloadTransaction {"): text.index(f"function {HELPER} {{")]
         self.assertNotRegex(restore, r"Remove-Item|::Delete\(", "the reconciliation only moves files back, it never deletes")
         self.assertNotRegex(restore, r"::Move\(.*\$true\)", "a backup is never moved over a destination (adversary 32501f50-A1)")

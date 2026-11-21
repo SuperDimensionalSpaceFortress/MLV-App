@@ -268,9 +268,14 @@ $launchProbe = [ordered]@{
     statusDllNotFound = ($probeExit -eq -1073741515)
 }
 if ($probeDllFailure) {
-    Write-Host ("FAIL: artifact is NOT self-contained -- launch probe exited 0x{0:X8} (DLL load failure)" -f ([uint32]$probeExit)) -ForegroundColor Red
+    # Adversary a7bf472f-A5: an NTSTATUS such as 0xC0000135 is a NEGATIVE Int32, which [uint32] refuses (it threw before exit 8); the
+    # X8 format of the Int32 itself prints its two's-complement hex.
+    Write-Host ("FAIL: artifact is NOT self-contained -- launch probe exited 0x{0:X8} (DLL load failure)" -f ([int]$probeExit)) -ForegroundColor Red
 } elseif ($probeStopUnconfirmed) {
+    # Adversary a7bf472f-A2: exit 10 is IMMEDIATE, so neither the ffmpeg hold below (exit 9) nor a manifest write that throws can end
+    # the script first with another code.
     Write-Host "FAIL: launch probe timed out after 30s and its stop was NOT confirmed (root-only kill; pid $($p.Id) or a descendant may still run$(if ($probeKillError) { ": $probeKillError" })); exit 10, nothing recovered" -ForegroundColor Red
+    exit 10
 } elseif ($probeTimedOut) {
     Write-Host "WARN: launch probe timed out after 30s (root killed, tree seen gone); could not confirm self-contained launch" -ForegroundColor Yellow
 } elseif ($probeExit -ne 0) {
@@ -308,4 +313,3 @@ Write-Host "OK -> $destExe" -ForegroundColor Green
 Write-Host "    embedded-SHA==HEAD: $shaOk ; self-contained: $($deploy.selfContained) ; manifest written"
 if (-not $shaOk) { exit 6 }
 if ($probeDllFailure) { exit 8 }
-if ($probeStopUnconfirmed) { exit 10 }

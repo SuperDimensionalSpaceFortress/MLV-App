@@ -465,6 +465,8 @@ function Invoke-PinnedPayloadInstall {
 
     # Adversary 500e2892-A1: the listing taken before the child exists is what places a process outside its tree on a timeout.
     $baseline = Get-PinnedPayloadBaseline
+    # Adversary a7bf472f-A7: the output folder's identity before the child starts, so a timeout recovery restores into THAT folder only.
+    $outputIdentity = Get-PinnedDirectoryIdentity -LiteralPath $OutputDir
     try {
         $process = [System.Diagnostics.Process]::Start($psi)
     } catch {
@@ -499,9 +501,9 @@ function Invoke-PinnedPayloadInstall {
         # the replacement bypasses the Python rollback and leaves the destination missing. Once the kill is CONFIRMED (no child can
         # still move files) the originals are put back; with an unconfirmed kill nothing is touched, since the child may still run.
         if ($result.killConfirmed) {
-            $restore = Restore-PinnedPayloadTransaction -OutputDir $OutputDir -TransactionId $transactionId
-            $result.transactionRestored = @($restore.restored)
-            $result.reason += "; transaction reconciled: restored [$(@($restore.restored) -join ', ')]$(if (@($restore.errors).Count) { ", errors [$(@($restore.errors) -join '; ')]" })"
+            $recovery = Complete-PinnedPayloadTimeoutRecovery -OutputDir $OutputDir -TransactionId $transactionId -StartIdentity $outputIdentity
+            $result.transactionRestored = @($recovery.restored)
+            $result.reason += "; $($recovery.text)"
         } else {
             $result.reason += '; its transaction was NOT reconciled (the extractor may still be running)'
         }
@@ -709,6 +711,28 @@ namespace MlvReleaseAdmission {
             return string.Equals(held.Substring(heldRoot.TrimEnd('\\').Length), requested.Substring(requestedRoot.TrimEnd('\\').Length), StringComparison.Ordinal);
         }
 
+        // Adversary a7bf472f-A7: the identity (volume serial and file index) of the directory a pathname resolves to NOW, every reparse
+        // point followed; null with detail when it cannot be opened or is not a directory. Opened for attributes only, sharing all.
+        public static string DirectoryIdentity(string path, out string detail) {
+            detail = "";
+            SafeFileHandle handle = CreateFileW(path, 0x80 /* FILE_READ_ATTRIBUTES */, 0x7 /* read, write, delete */, IntPtr.Zero, OPEN_EXISTING,
+                0x02000000 /* FILE_FLAG_BACKUP_SEMANTICS */, IntPtr.Zero);
+            if (handle == null || handle.IsInvalid) {
+                int error = Marshal.GetLastWin32Error();
+                if (handle != null) { handle.Dispose(); }
+                detail = Win32Text(error);
+                return null;
+            }
+            try {
+                ByHandleFileInformation info;
+                if (!GetFileInformationByHandle(handle, out info)) { detail = Win32Text(Marshal.GetLastWin32Error()); return null; }
+                if ((info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) { detail = "not a directory"; return null; }
+                return info.VolumeSerialNumber.ToString("x8") + ":" + info.FileIndexHigh.ToString("x8") + info.FileIndexLow.ToString("x8");
+            } finally {
+                handle.Dispose();
+            }
+        }
+
         public static PinnedOpenResult Open(string path) {
             PinnedOpenResult result = new PinnedOpenResult();
             SafeFileHandle handle = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
@@ -799,6 +823,45 @@ function Open-PinnedNoFollowStream {
         return [pscustomobject]@{ stream = $null; code = [string]$opened.Code; detail = [string]$opened.Detail }
     }
     return [pscustomobject]@{ stream = $opened.Stream; code = ''; detail = '' }
+}
+
+# Adversary a7bf472f-A7: the identity ('<volume>:<file index>') of the folder LiteralPath resolves to now, or $null when it is absent or
+# cannot be read. Never throws.
+function Get-PinnedDirectoryIdentity {
+    param([Parameter(Mandatory)][string]$LiteralPath)
+    try {
+        if (-not ($script:PinnedNoFollowTypeName -as [type])) {
+            Add-Type -TypeDefinition $script:PinnedNoFollowSource -Language CSharp -ErrorAction Stop
+        }
+        $detail = ''
+        return [MlvReleaseAdmission.PinnedNoFollowOpen]::DirectoryIdentity($LiteralPath, [ref]$detail)
+    } catch {
+        return $null
+    }
+}
+
+# Adversary a7bf472f-A7: the recovery after a CONFIRMED stop, bound to the output folder the install started with. StartIdentity is
+# Get-PinnedDirectoryIdentity of OutputDir taken before the child started ($null: the folder did not exist then). When the folder
+# OutputDir names now is another one (a junction on the way was retargeted), nothing is restored and the text says so; a transaction
+# folder that is not found is said to be not found, never "reconciled". Never throws; returns { restored; text }.
+function Complete-PinnedPayloadTimeoutRecovery {
+    param(
+        [Parameter(Mandatory)][string]$OutputDir,
+        [Parameter(Mandatory)][string]$TransactionId,
+        [AllowNull()][AllowEmptyString()][string]$StartIdentity
+    )
+    if ($StartIdentity) {
+        $now = Get-PinnedDirectoryIdentity -LiteralPath $OutputDir
+        if ($now -cne $StartIdentity) {
+            return [pscustomobject]@{ restored = @(); text = "its transaction was NOT reconciled: $OutputDir is no longer the folder the install started with (identity $StartIdentity, now $(if ($now) { $now } else { 'unreadable' })), so nothing was restored" }
+        }
+    }
+    $restore = Restore-PinnedPayloadTransaction -OutputDir $OutputDir -TransactionId $TransactionId
+    $errors = if (@($restore.errors).Count) { ", errors [$(@($restore.errors) -join '; ')]" } else { '' }
+    if (-not $restore.found) {
+        return [pscustomobject]@{ restored = @(); text = "no transaction folder .vendored-payload-transaction-$TransactionId was found in $OutputDir; nothing restored$errors" }
+    }
+    return [pscustomobject]@{ restored = @($restore.restored); text = "transaction reconciled: restored [$(@($restore.restored) -join ', ')]$errors" }
 }
 
 # Opens Path through Open-PinnedNoFollowStream (the pathname's own file entry, never a link target; no writer, no rename and no
@@ -898,6 +961,11 @@ function Test-PinnedZipMember {
         # "exactly one entry named MemberName" mean the extracted file is that entry.
         $entries = @()
         $seen = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+        # Adversary a7bf472f-A4: an entry BELOW a path (ffmpeg.exe/child.txt) makes that path a directory on extraction, so a file entry
+        # at the same path (the root ffmpeg.exe) cannot be written. Every file entry's path and every ancestor folder any entry implies
+        # are kept (case-insensitive), and a path that is both a file and a folder is refused in either order.
+        $filePaths = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $folderPaths = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
         foreach ($entry in $zip.Entries) {
             $raw = [string]$entry.FullName
             $name = $raw.Replace('\', '/')
@@ -913,6 +981,22 @@ function Test-PinnedZipMember {
                 return [pscustomobject]$check
             }
             $seen[$path] = $raw
+            $segments = $path.Split('/')
+            for ($i = 1; $i -lt $segments.Count; $i++) {
+                $folder = $segments[0..($i - 1)] -join '/'
+                if ($filePaths.ContainsKey($folder)) {
+                    $check.reason = "$ZipPath entries '$($filePaths[$folder])' and '$raw' name one path as both a file and a directory"
+                    return [pscustomobject]$check
+                }
+                if (-not $folderPaths.ContainsKey($folder)) { $folderPaths[$folder] = $raw }
+            }
+            if (-not $isDirectory) {
+                if ($folderPaths.ContainsKey($path)) {
+                    $check.reason = "$ZipPath entries '$($folderPaths[$path])' and '$raw' name one path as both a file and a directory"
+                    return [pscustomobject]$check
+                }
+                $filePaths[$path] = $raw
+            }
             if (-not $isDirectory -and [string]::Equals($path, $MemberName, [StringComparison]::OrdinalIgnoreCase)) { $entries += $entry }
         }
         if ($entries.Count -ne 1) {
