@@ -638,20 +638,92 @@ function Test-ProcessIdentityMatch {
 }
 
 function Get-DescendantProcessIdentities {
-    # BACHELOR-LEASE-RENEW-MARGIN-1 r1: -OnEach runs before every CIM query of the walk. The job monitor passes its quiet-lease
-    # renew tick, because this walk (two CIM queries per descendant) is the slow step of a monitor slice under a heavy leg's
-    # load: a renew due mid-walk starts mid-walk, not one whole slice later. It must never wait for a renew to finish (its only waits are
+    # AGENT-JOB-MONITOR-CIM-WALK-1 r1: ONE Win32_Process snapshot per walk. The walk used to issue two CIM queries per descendant (the
+    # children of each node, then each child's own identity: 2N+1 for N descendants), every monitor slice; on Bachelor that kept the WmiPrvSE
+    # host at 0.673 cores on average and 2-3.65 cores inside job windows (hub ruling 2026-11-20T21:56:16Z). Now the process table is read
+    # once, with only the five properties an identity needs, and the parent -> children map and every identity are built from that one
+    # snapshot: same objects, same field names and formats as Get-ProcessIdentity, same depth-first order (a node's descendants, then the node).
+    # Identity checks are unchanged: each identity carries startUtc/startEpochMs/imagePath, and every consumer still re-checks them
+    # (Test-ProcessIdentityMatch) before it stops a pid, so a pid reused after the snapshot is refused exactly as before. A pid seen twice in
+    # one walk (a parent cycle formed by pid reuse inside the snapshot) is visited once, and the root is never its own descendant.
+    # An unreadable process table gives an empty walk, as the per-node queries (-ErrorAction SilentlyContinue) did.
+    # BACHELOR-LEASE-RENEW-MARGIN-1 r1: -OnEach runs before the snapshot and once after it. The job monitor passes its quiet-lease
+    # renew tick, so a renew due while the walk starts is started before the snapshot read, and one that fell due during it is started
+    # (and one that exited is collected) before the walk returns. It must never wait for a renew to finish (its only waits are
     # bounded: a collected renew's output reads, about 4 s, and the lease sidecar read's retries); nothing it returns is kept.
-    # It ticks only BETWEEN queries: one CIM query that alone outlasts the cadence still delays a due renew until it returns.
+    # It ticks only BETWEEN the walk's steps: one snapshot query that alone outlasts the cadence still delays a due renew until it returns.
     param([Parameter(Mandatory = $true)][int]$ParentProcessId, [scriptblock]$OnEach = $null)
 
     if ($null -ne $OnEach) { $null = & $OnEach }
-    $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$ParentProcessId" -ErrorAction SilentlyContinue)
-    foreach ($child in $children) {
-        $childProcessId = [int]$child.ProcessId
-        Get-DescendantProcessIdentities -ParentProcessId $childProcessId -OnEach $OnEach
-        if ($null -ne $OnEach) { $null = & $OnEach }
-        Get-ProcessIdentity -ProcessId $childProcessId
+    $all = @()
+    try { $all = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, CreationDate, ExecutablePath, CommandLine -ErrorAction Stop) }
+    catch { $all = @() }
+    if ($null -ne $OnEach) { $null = & $OnEach }
+
+    # parent pid -> its rows, in the snapshot's order (the order the per-parent query returned them in).
+    $byParent = New-Object 'System.Collections.Generic.Dictionary[int,System.Collections.Generic.List[object]]'
+    foreach ($row in $all) {
+        try {
+            if ($null -eq $row -or $null -eq $row.ProcessId -or $null -eq $row.ParentProcessId) { continue }
+            $parentKey = [int]$row.ParentProcessId
+            $list = $null
+            if (-not $byParent.TryGetValue($parentKey, [ref]$list)) {
+                $list = New-Object 'System.Collections.Generic.List[object]'
+                $byParent[$parentKey] = $list
+            }
+            $list.Add($row)
+        }
+        catch { continue }
+    }
+
+    # The same identity Get-ProcessIdentity builds from one row (a row that cannot be converted reads as not existing).
+    $identityOf = {
+        param($process)
+        $identityPid = [int]$process.ProcessId
+        try {
+            $startUtc = $null
+            if ($process.CreationDate) {
+                $startUtc = ([DateTime]$process.CreationDate).ToUniversalTime().ToString("o")
+            }
+            $startEpochMs = $null
+            if ($startUtc) {
+                $startEpochMs = [DateTimeOffset]::Parse($startUtc).ToUnixTimeMilliseconds()
+            }
+            [pscustomobject]@{
+                exists       = $true
+                processId    = $identityPid
+                startUtc     = $startUtc
+                startEpochMs = $startEpochMs
+                imagePath    = $process.ExecutablePath
+                commandLine  = $process.CommandLine
+            }
+        }
+        catch {
+            [pscustomobject]@{ exists = $false; processId = $identityPid; startUtc = $null; startEpochMs = $null; imagePath = $null; commandLine = $null }
+        }
+    }
+
+    # Depth-first, a node's descendants before the node itself (post-order), without recursion.
+    $visited = New-Object 'System.Collections.Generic.HashSet[int]'
+    [void]$visited.Add($ParentProcessId)
+    $stack = New-Object 'System.Collections.Generic.Stack[object]'
+    $rootKids = $null
+    if ($byParent.TryGetValue($ParentProcessId, [ref]$rootKids)) { $stack.Push(@{ kids = $rootKids; next = 0; self = $null }) }
+    while ($stack.Count -gt 0) {
+        $frame = $stack.Peek()
+        if ($frame.next -lt $frame.kids.Count) {
+            $child = $frame.kids[$frame.next]
+            $frame.next = $frame.next + 1
+            $childProcessId = [int]$child.ProcessId
+            if (-not $visited.Add($childProcessId)) { continue }
+            $grandKids = $null
+            if ($byParent.TryGetValue($childProcessId, [ref]$grandKids)) { $stack.Push(@{ kids = $grandKids; next = 0; self = $child }) }
+            else { & $identityOf $child }
+        }
+        else {
+            [void]$stack.Pop()
+            if ($null -ne $frame.self) { & $identityOf $frame.self }
+        }
     }
 }
 

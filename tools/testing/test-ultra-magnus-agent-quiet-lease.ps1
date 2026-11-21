@@ -1199,7 +1199,7 @@ try {
         'lapse-end-timing-pure', 'lease-seam-pid-cleanup', 'lease-start-post-start-failure', 'lease-start-post-start-cleanup-throws', 'fake-flag-unreadable',
         'lease-seam-command-mode', 'lease-seam-wrapper-host', 'fixture-census-probe-error', 'fake-release-readable-deadline', 'fake-release-unreadable-then-readable-deadline',
         'fake-release-unreadable-deadline', 'lease-seam-unowned-never-killed', 'fake-release-absent-after-deadline', 'fake-release-absent-before-deadline',
-        'lease-seam-census-self-pid', 'renew-slow-monitor-slice', 'renew-gap-clock-step', 'renew-gap-round-up',
+        'lease-seam-census-self-pid', 'renew-slow-monitor-slice', 'cim-walk-snapshot', 'cim-walk-cycle', 'cim-walk-live-parity', 'renew-gap-clock-step', 'renew-gap-round-up',
         'renew-collect-after-slow-slice', 'renew-stale-still-demotes', 'renew-gap-dst-fallback', 'renew-exit-stamp-transient-step', 'renew-exit-stamp-dst',
         'renew-exit-stamp-late-known-limit', 'renew-gap-reverted-step-known-limit', 'renew-gap-reverted-step-base-neighbour',
         'renew-call-start-before-process-start', 'renew-gap-prestart-stall-no-false-stop', 'renew-gap-reverted-step-record-wall-demotes',
@@ -5780,6 +5780,8 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
     # it does not under-read the gap between the fake heavy-slot.py's renew records, and the monitor loop passes the tick into its walk.
     # (r4: the reverted wall step that CAN make it under-read is the pinned known limit renew-gap-reverted-step-known-limit.)
     # RED on fork/master a7278cbd: cadence 60 s, one tick per slice, gap measured to the collection -> about two slices (150+ s).
+    # AGENT-JOB-MONITOR-CIM-WALK-1 r1: the 70-90 s slices above were nine CIM steps of a per-node walk; the walk is now one snapshot query, so the
+    # model is a slow single query (35-65 s slices); see the comment at the slice loop.
     if (Test-Case 'renew-slow-monitor-slice') {
         $rsSaved = @{ q = $script:QuietLease; w = $script:QuietLeaseWaiting; b = $script:LeaseBatch }
         try {
@@ -5792,10 +5794,11 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 function Get-Date { return $script:RsNow }
                 function Step-RsClock([double]$Sec) { $script:RsNow = $script:RsNow.AddSeconds($Sec) }
                 function Get-CimInstance {
-                    [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter)
+                    # AGENT-JOB-MONITOR-CIM-WALK-1 r1: the walk reads ONE snapshot of the process table (-Property, no -Filter), so the slice's whole
+                    # modelled cost is this one query: the worst case, a single query that alone takes the slice's 65-85 s.
+                    [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter, [string[]]$Property)
                     Step-RsClock $script:RsOpCost
-                    if ($Filter -ceq 'ParentProcessId=4000') { return @(4001, 4002, 4003, 4004 | ForEach-Object { [pscustomobject]@{ ProcessId = $_ } }) }
-                    return @()
+                    return @(4001, 4002, 4003, 4004 | ForEach-Object { [pscustomobject]@{ ProcessId = [uint32]$_; ParentProcessId = [uint32]4000; CreationDate = $null; ExecutablePath = 'C:\x.exe'; CommandLine = 'x' } })
                 }
                 function Get-ProcessIdentity { param([int]$ProcessId) Step-RsClock $script:RsOpCost; return [pscustomobject]@{ exists = $true; processId = $ProcessId; startEpochMs = 1 } }
                 function Start-HeavySlotCli {
@@ -5817,10 +5820,13 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 $script:QuietLease = $lease; $script:QuietLeaseWaiting = $null; $script:LeaseBatch = $null
                 $hasOnEach = (Get-Command Get-DescendantProcessIdentities).Parameters.ContainsKey('OnEach')
                 $slices = [System.Collections.Generic.List[object]]::new()
-                # Slice lengths (walk + 5 s wait): 70-90 s, the 90 s ones twice; 9 clock steps per walk (5 CIM queries, 4 identities).
-                foreach ($target in @(70, 90, 80, 75, 90, 85, 72, 88)) {
+                # Slice lengths (walk + 5 s wait): 35-65 s. AGENT-JOB-MONITOR-CIM-WALK-1 r1: the base walk spent 70-90 s per slice in 9 CIM steps under a heavy
+                # leg, ticking between each. The walk is now ONE snapshot query: here a query of 30-60 s (3-7x one old step; the measured one is ~0.1 s), and a
+                # renew can start only at the walk's two ticks and the slice's own tick, so one query that alone outlasts the cadence (a 90 s slice: gap 95 s)
+                # is the pinned limit named in Get-DescendantProcessIdentities, not something this case can hold under 90 s.
+                foreach ($target in @(35, 65, 50, 40, 65, 55, 38, 60)) {
                     $sliceStart = Get-Date
-                    $script:RsOpCost = ($target - 5) / 9.0
+                    $script:RsOpCost = ($target - 5) / 1.0
                     $walk = if ($hasOnEach) { @(Get-DescendantProcessIdentities -ParentProcessId 4000 -OnEach { Invoke-QuietLeaseRenewTick }) } else { @(Get-DescendantProcessIdentities -ParentProcessId 4000) }
                     Invoke-QuietLeaseRenewTick
                     $gap = Get-QuietLeaseRenewOkGapSec -Lease $lease
@@ -5837,9 +5843,9 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         }
         finally { $script:QuietLease = $rsSaved.q; $script:QuietLeaseWaiting = $rsSaved.w; $script:LeaseBatch = $rsSaved.b }
         $rsTxt = $rsOut | ConvertTo-Json -Depth 5 -Compress
-        Assert-True (@($rsOut.slices | Where-Object { $_.sliceSec -lt 70 -or $_.sliceSec -gt 90 }).Count -eq 0) "renew-slow-monitor-slice: every modelled monitor slice takes 70-90 s: $rsTxt"
+        Assert-True (@($rsOut.slices | Where-Object { $_.sliceSec -lt 35 -or $_.sliceSec -gt 65 }).Count -eq 0) "renew-slow-monitor-slice: every modelled monitor slice takes 35-65 s: $rsTxt"
         Assert-True ($rsOut.failures -eq 0 -and $rsOut.slow -eq 0 -and $rsOut.ok -ge 1) "renew-slow-monitor-slice: the renews succeed (late is the only fault modelled): $rsTxt"
-        Assert-True ($rsOut.okMaxGapSec -lt 90 -and $rsOut.checkMaxGapSec -lt 90) "renew-slow-monitor-slice: with 70-90 s monitor slices the gap between SUCCESSFUL renews stays < 90 s (stale limit $($script:LeaseRenewStaleSec) s); measured okMaxGapSec=$($rsOut.okMaxGapSec) checkMaxGapSec=$($rsOut.checkMaxGapSec): $rsTxt"
+        Assert-True ($rsOut.okMaxGapSec -lt 90 -and $rsOut.checkMaxGapSec -lt 90) "renew-slow-monitor-slice: with 35-65 s monitor slices (one snapshot query of 30-60 s) the gap between SUCCESSFUL renews stays < 90 s (stale limit $($script:LeaseRenewStaleSec) s); measured okMaxGapSec=$($rsOut.okMaxGapSec) checkMaxGapSec=$($rsOut.checkMaxGapSec): $rsTxt"
         Assert-True ($rsOut.okMaxGapSec + 0.05 -ge $rsOut.recordMaxGapSec) "renew-slow-monitor-slice: with no clock step, the agent's measured gap does not under-read heavy-slot.py's gap between renew records (okMaxGapSec=$($rsOut.okMaxGapSec) recordMaxGapSec=$($rsOut.recordMaxGapSec))"
         # Pass 2 A3: matched against the REAL monitor loop (the while loop over $jobProcess in Invoke-QueuedJob's AST, comments excluded), so a
         # comment carrying the call, or the call anywhere else, does not satisfy it.
@@ -5892,6 +5898,148 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True ($rsArgCalls.Count -eq 7 -and @($rsArgCalls[0..5] | Where-Object { & $rsIsWired $_ }).Count -eq 0 -and (& $rsIsWired $rsArgCalls[6])) "renew-slow-monitor-slice: the wiring guard refuses a tick given an argument (`$(throw 'skip'), a splat, a switch, a value) or a redirection, and a backgrounded walk (pass 12 A2), and accepts the bare shipped form: calls=$($rsArgCalls.Count) wired=$(@($rsArgCalls | ForEach-Object { [bool](& $rsIsWired $_) }) -join ',')"
         Assert-True ([int]$paramDefaults['LeaseRenewSec'] -le 30) "renew-slow-monitor-slice: the agent's default LeaseRenewSec is at most a quarter of the 120 s stale limit (got $($paramDefaults['LeaseRenewSec']))"
         $results.renewSlowMonitorSlice = $rsOut
+    }
+    # ------------------------------------------------------------ AGENT-JOB-MONITOR-CIM-WALK-1 r1: one process snapshot per descendant walk
+    # Bachelor's WmiPrvSE host averaged 0.673 cores over 9.3 days and peaked at 2-3.65 cores inside job windows (hub ruling 2026-11-20T21:56:16Z),
+    # timed with the job monitor's descendant walk: two Win32_Process CIM queries per descendant (one for the children, one for each child's
+    # identity), every monitor slice. Here the REAL Get-DescendantProcessIdentities runs against a fake process table behind a counting
+    # Get-CimInstance stand-in. Asserted: (1) at most TWO CIM queries per walk and none of them a per-pid -Filter query; (2) the walk's output is
+    # identical, field for field and in depth-first order, to the legacy per-node walk (reproduced here) over the same table; (3) -OnEach fires
+    # before the snapshot and once after it; (4) an unreadable process table yields an empty walk, never a throw, as the legacy walk did.
+    # RED on fork/master ce80f515: 2N+1 queries (19 for the 9-descendant tree below).
+    if (Test-Case 'cim-walk-snapshot') {
+        $cwOut = & {
+            $script:CwLog = [System.Collections.Generic.List[string]]::new()
+            $script:CwTable = @()
+            $script:CwFail = $false
+            $cwBase = [datetime]::new(2026, 11, 20, 12, 0, 0, [DateTimeKind]::Local)
+            function New-CwProc([int]$Id, [int]$Parent, [int]$Sec, [string]$Image, [string]$Cmd) {
+                [pscustomobject]@{ ProcessId = [uint32]$Id; ParentProcessId = [uint32]$Parent; CreationDate = $cwBase.AddSeconds($Sec).AddMilliseconds(123); ExecutablePath = $Image; CommandLine = $Cmd }
+            }
+            function Get-CimInstance {
+                [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter, [string[]]$Property)
+                $script:CwLog.Add("cim|$ClassName|$Filter")
+                if ($script:CwFail) { Write-Error 'simulated CIM failure'; return }
+                $rows = @($script:CwTable)
+                if ($Filter -match '^ParentProcessId=(\d+)$') { $n = [int]$Matches[1]; return @($rows | Where-Object { [int]$_.ParentProcessId -eq $n }) }
+                if ($Filter -match '^ProcessId=(\d+)$') { $n = [int]$Matches[1]; return @($rows | Where-Object { [int]$_.ProcessId -eq $n }) }
+                return $rows
+            }
+            function Get-LegacyDescendants {
+                param([int]$ParentProcessId)
+                $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$ParentProcessId" -ErrorAction SilentlyContinue)
+                foreach ($child in $children) {
+                    $childProcessId = [int]$child.ProcessId
+                    Get-LegacyDescendants -ParentProcessId $childProcessId
+                    Get-ProcessIdentity -ProcessId $childProcessId
+                }
+            }
+            # root 7000 -> 7001..7003 -> two grandchildren each; table order interleaves the levels and unrelated processes.
+            $script:CwTable = @(
+                (New-CwProc 4 0 0 $null $null), (New-CwProc 8000 1 1 'C:\other\a.exe' 'a.exe'), (New-CwProc 7000 1 2 'C:\Program Files\PowerShell\7\pwsh.exe' 'pwsh.exe -File job.ps1'),
+                (New-CwProc 7021 7002 9 'C:\tools\ffmpeg.exe' 'ffmpeg.exe -i "a b.mov" out.mp4'), (New-CwProc 7001 7000 3 'C:\Windows\System32\cmd.exe' 'cmd.exe /c x'),
+                (New-CwProc 7011 7001 4 'C:\tools\mlvapp.exe' 'mlvapp.exe --batch'), (New-CwProc 8001 8000 5 'C:\other\b.exe' $null), (New-CwProc 7002 7000 6 'C:\Windows\System32\cmd.exe' 'cmd.exe /c y'),
+                (New-CwProc 7012 7001 7 $null $null), (New-CwProc 7003 7000 8 'C:\Windows\System32\cmd.exe' 'cmd.exe /c z'), (New-CwProc 7022 7002 10 'C:\tools\ffmpeg.exe' 'ffmpeg.exe -i q'),
+                (New-CwProc 7031 7003 11 'C:\tools\mlvapp.exe' 'mlvapp.exe'), (New-CwProc 7032 7003 12 'C:\tools\mlvapp.exe' 'mlvapp.exe 2')
+            )
+            $script:CwLog.Clear()
+            $legacy = @(Get-LegacyDescendants -ParentProcessId 7000)
+            $legacyQueries = @($script:CwLog | Where-Object { $_ -like 'cim|*' }).Count
+            $script:CwLog.Clear()
+            $walk = @(Get-DescendantProcessIdentities -ParentProcessId 7000 -OnEach { $script:CwLog.Add('onEach') })
+            $walkLog = @($script:CwLog)
+            $script:CwLog.Clear()
+            $noOnEach = @(Get-DescendantProcessIdentities -ParentProcessId 7000)
+            $noOnEachQueries = @($script:CwLog | Where-Object { $_ -like 'cim|*' }).Count
+            $script:CwLog.Clear()
+            $script:CwFail = $true
+            $failErr = $null
+            $failWalk = @()
+            try { $failWalk = @(Get-DescendantProcessIdentities -ParentProcessId 7000 -ErrorAction SilentlyContinue) } catch { $failErr = $_.Exception.Message }
+            $script:CwFail = $false
+            $script:CwLog.Clear()
+            $leaf = @(Get-DescendantProcessIdentities -ParentProcessId 7011)
+            [pscustomobject]@{
+                legacyCount = $legacy.Count; legacyQueries = $legacyQueries
+                walkCount = $walk.Count; walkLog = $walkLog; walkJson = ($walk | ConvertTo-Json -Depth 4 -Compress); legacyJson = ($legacy | ConvertTo-Json -Depth 4 -Compress)
+                walkIds = (@($walk | ForEach-Object { [int]$_.processId }) -join ','); legacyIds = (@($legacy | ForEach-Object { [int]$_.processId }) -join ',')
+                noOnEachCount = $noOnEach.Count; noOnEachQueries = $noOnEachQueries; failCount = $failWalk.Count; failErr = $failErr; leafCount = $leaf.Count
+            }
+        }
+        $cwQueries = @($cwOut.walkLog | Where-Object { $_ -like 'cim|*' })
+        $cwTxt = $cwOut | ConvertTo-Json -Depth 4 -Compress
+        Assert-True ($cwOut.legacyCount -eq 9 -and $cwOut.legacyIds -eq '7011,7012,7001,7021,7022,7002,7031,7032,7003') "cim-walk-snapshot: the reference (legacy) walk over the 9-descendant fixture reads depth-first, children after their descendants: $cwTxt"
+        Assert-True ($cwOut.legacyQueries -eq 19) "cim-walk-snapshot: the legacy reference issues 2N+1 = 19 queries for N=9 (the fixture models what the base agent does): $cwTxt"
+        Assert-True ($cwQueries.Count -le 2) "cim-walk-snapshot: a descendant walk over a 9-descendant tree issues at most 2 CIM queries (got $($cwQueries.Count): $($cwQueries -join ' ; '))"
+        Assert-True (@($cwQueries | Where-Object { $_ -match '\|(Parent)?ProcessId=' }).Count -eq 0) "cim-walk-snapshot: no per-pid -Filter query is issued by the walk: $($cwQueries -join ' ; ')"
+        Assert-True ($cwOut.noOnEachQueries -le 2) "cim-walk-snapshot: the walk without -OnEach also issues at most 2 queries (got $($cwOut.noOnEachQueries))"
+        Assert-True ($cwOut.walkCount -eq 9 -and $cwOut.walkIds -eq $cwOut.legacyIds) "cim-walk-snapshot: the walk returns the same descendants in the same depth-first order as the legacy walk: walk=[$($cwOut.walkIds)] legacy=[$($cwOut.legacyIds)]"
+        Assert-True ($cwOut.walkJson -ceq $cwOut.legacyJson) "cim-walk-snapshot: every identity field (exists, processId, startUtc, startEpochMs, imagePath, commandLine) equals the legacy walk's: walk=$($cwOut.walkJson) legacy=$($cwOut.legacyJson)"
+        $cwFirstCim = [Array]::IndexOf(@($cwOut.walkLog), @($cwQueries)[0])
+        $cwLastCim = [Array]::LastIndexOf(@($cwOut.walkLog), @($cwQueries)[-1])
+        $cwOnEachBefore = @(@($cwOut.walkLog)[0..([Math]::Max(0, $cwFirstCim))] | Where-Object { $_ -eq 'onEach' }).Count
+        $cwOnEachAfter = @(@($cwOut.walkLog)[$cwLastCim..(@($cwOut.walkLog).Count - 1)] | Where-Object { $_ -eq 'onEach' }).Count
+        Assert-True ($cwOnEachBefore -ge 1 -and $cwOnEachAfter -ge 1) "cim-walk-snapshot: -OnEach fires before the snapshot and at least once after it (before=$cwOnEachBefore after=$cwOnEachAfter): $($cwOut.walkLog -join ' ; ')"
+        Assert-True ($cwOut.failCount -eq 0 -and $null -eq $cwOut.failErr) "cim-walk-snapshot: an unreadable process table gives an empty walk and no throw (count=$($cwOut.failCount) err=$($cwOut.failErr))"
+        Assert-True ($cwOut.leafCount -eq 0) "cim-walk-snapshot: a pid with no children walks to nothing (got $($cwOut.leafCount))"
+        $results.cimWalkSnapshot = $cwOut
+    }
+    # A parent cycle in ONE snapshot (a pid reused between a child's creation and the table read can point a parent's ParentProcessId back at its
+    # own descendant) must end the walk, and the root is never reported as its own descendant. The legacy walk had no such guard; it is NOT run
+    # against the base agent (its unbounded recursion would end this process), so there is no RED for this case: it guards the new code only.
+    if (Test-Case 'cim-walk-cycle') {
+        $cyOut = & {
+            $cwBase = [datetime]::new(2026, 11, 20, 12, 0, 0, [DateTimeKind]::Local)
+            function New-CwProc([int]$Id, [int]$Parent, [int]$Sec) { [pscustomobject]@{ ProcessId = [uint32]$Id; ParentProcessId = [uint32]$Parent; CreationDate = $cwBase.AddSeconds($Sec); ExecutablePath = 'C:\x.exe'; CommandLine = 'x' } }
+            $script:CyTable = @((New-CwProc 9000 9002 1), (New-CwProc 9001 9000 2), (New-CwProc 9002 9001 3), (New-CwProc 0 0 0))
+            function Get-CimInstance { [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter, [string[]]$Property) return @($script:CyTable) }
+            $cyWalk = @(Get-DescendantProcessIdentities -ParentProcessId 9000)
+            $idle = @(Get-DescendantProcessIdentities -ParentProcessId 0)
+            [pscustomobject]@{ ids = (@($cyWalk | ForEach-Object { [int]$_.processId }) -join ','); idleIds = (@($idle | ForEach-Object { [int]$_.processId }) -join ',') }
+        }
+        Assert-True ($cyOut.ids -eq '9002,9001') "cim-walk-cycle: a 9000 -> 9001 -> 9002 -> 9000 parent cycle ends, lists each other process once and never the root: ids=[$($cyOut.ids)]"
+        Assert-True ($cyOut.idleIds -eq '') "cim-walk-cycle: pid 0 (its own parent in the table) is not reported as a descendant of itself: ids=[$($cyOut.idleIds)]"
+        $results.cimWalkCycle = $cyOut
+    }
+    # The same comparison on a LIVE tree (real Get-CimInstance, real processes): cmd.exe -> cmd.exe -> ping.exe. The legacy walk is reproduced
+    # here; the agent's walk must return the same set of (processId, startUtc, imagePath). Retried (3 times) against a helper process (conhost.exe)
+    # appearing between the two walks; the tree is stopped afterwards.
+    if (Test-Case 'cim-walk-live-parity') {
+        $lvOut = & {
+            function Get-LegacyDescendants {
+                param([int]$ParentProcessId)
+                $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$ParentProcessId" -ErrorAction SilentlyContinue)
+                foreach ($child in $children) {
+                    $childProcessId = [int]$child.ProcessId
+                    Get-LegacyDescendants -ParentProcessId $childProcessId
+                    Get-ProcessIdentity -ProcessId $childProcessId
+                }
+            }
+            $cmdExe = Join-Path $env:SystemRoot 'System32\cmd.exe'
+            $psiL = [Diagnostics.ProcessStartInfo]::new($cmdExe)
+            foreach ($a in @('/c', 'cmd.exe /c ping.exe -n 120 127.0.0.1 >nul')) { [void]$psiL.ArgumentList.Add($a) }
+            $psiL.UseShellExecute = $false; $psiL.CreateNoWindow = $true
+            $root = Register-OwnedChild ([Diagnostics.Process]::Start($psiL))   # owned: the suite's own sweep ends it if this case dies early
+            $attempts = 0; $legacyKeys = @(); $newKeys = @(); $same = $false
+            try {
+                for ($attempts = 1; $attempts -le 3 -and -not $same; $attempts++) {
+                    $deadline = [DateTime]::UtcNow.AddSeconds(20)
+                    do { $legacy = @(Get-LegacyDescendants -ParentProcessId $root.Id); if (@($legacy | Where-Object { $_.exists -and $_.imagePath -match 'ping\.exe$' }).Count -ge 1) { break }; Start-Sleep -Milliseconds 300 } while ([DateTime]::UtcNow -lt $deadline)
+                    $new = @(Get-DescendantProcessIdentities -ParentProcessId $root.Id)
+                    $legacy = @(Get-LegacyDescendants -ParentProcessId $root.Id)
+                    $legacyKeys = @($legacy | Where-Object { $_.exists } | ForEach-Object { "$($_.processId)|$($_.startUtc)|$($_.imagePath)" } | Sort-Object)
+                    $newKeys = @($new | Where-Object { $_.exists } | ForEach-Object { "$($_.processId)|$($_.startUtc)|$($_.imagePath)" } | Sort-Object)
+                    $same = ($legacyKeys.Count -gt 0 -and ($legacyKeys -join "`n") -ceq ($newKeys -join "`n"))
+                }
+            }
+            finally {
+                foreach ($d in @(Get-LegacyDescendants -ParentProcessId $root.Id)) { Stop-Process -Id ([int]$d.processId) -Force -ErrorAction SilentlyContinue }
+                Stop-Process -Id $root.Id -Force -ErrorAction SilentlyContinue
+            }
+            [pscustomobject]@{ same = $same; attempts = ($attempts - 1); legacyKeys = $legacyKeys; newKeys = $newKeys }
+        }
+        Assert-True ($lvOut.same) "cim-walk-live-parity: the walk returns the same (processId, startUtc, imagePath) set as the legacy per-node walk on a live cmd -> cmd -> ping tree: $($lvOut | ConvertTo-Json -Depth 4 -Compress)"
+        $results.cimWalkLiveParity = $lvOut
     }
     # BACHELOR-LEASE-RENEW-MARGIN-1 r1, adversary pass 1 on 41ffc7fa (both introduced, major): the agent's successful-renew gap must not read
     # shorter than heavy-slot.py's on these inputs (r4: a wall step reverted between two agent samples is the one it can miss, the pinned known
@@ -5975,7 +6123,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 function Get-AgentMonotonicSec { return $script:RcMono }
                 function Step-RcClock([double]$Sec) { $script:RcNowUtc = $script:RcNowUtc.AddSeconds($Sec); $script:RcMono += $Sec }
                 function Get-CimInstance {
-                    [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter)
+                    [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter, [string[]]$Property)   # AGENT-JOB-MONITOR-CIM-WALK-1: the walk's snapshot passes -Property
                     Step-RcClock $script:RcQuery
                     $script:RcNowUtc = $script:RcNowUtc.AddSeconds($script:RcWallStep); $script:RcWallStep = 0
                     return @()
