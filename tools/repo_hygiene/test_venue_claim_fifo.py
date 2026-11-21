@@ -173,8 +173,10 @@ $b3 = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $B
     def test_mutation_without_the_head_check_the_younger_waiter_wins(self) -> None:
         text = MODULE.read_text(encoding="utf-8")
         anchor = "if ($head.Count -eq 0 -or $head[0].name -cne $t.name) {"   # the head check: only the oldest READY live ticket may try the claim
+        after = "if ($headAfter.Count -gt 0 -and $headAfter[0].name -cne $t.name) {"   # r7 A1: the same check made again after a grant (the claim given back when an older ready ticket is ahead): the mutant has neither
         self.assertEqual(text.count(anchor), 1, "mutation anchor moved")
-        mut = copy_with_siblings(MODULE, Path(tempfile.mkdtemp(prefix="mut-", dir=self.case)), text.replace(anchor, "if ($false) {"))
+        self.assertEqual(text.count(after), 1, "mutation anchor (after a grant) moved")
+        mut = copy_with_siblings(MODULE, Path(tempfile.mkdtemp(prefix="mut-", dir=self.case)), text.replace(anchor, "if ($false) {").replace(after, "if ($false) {"))
         r = self.ps(self.A_FIRST, module=mut)
         self.assertTrue(r["b1Granted"], "the mutant must reproduce the race: the younger waiter that polls first takes the claim")
 
@@ -1469,9 +1471,9 @@ $A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d
 Start-Sleep -Milliseconds 30
 $B = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
 $out = [ordered]@{}
-foreach ($shape in @('null', 'missing', 'trailing-space', 'other')) {
+foreach ($shape in @('null', 'missing', 'trailing-space', 'other', 'array', 'soft-hyphen')) {
   $text = [IO.File]::ReadAllText($A.path)
-  $new = switch ($shape) { 'null' { $text -replace '"phase":"waiting"', '"phase":null' } 'missing' { $text -replace ',"phase":"waiting"', '' } 'trailing-space' { $text -replace '"phase":"waiting"', '"phase":"cooldown "' } default { $text -replace '"phase":"waiting"', '"phase":"later"' } }
+  $new = switch ($shape) { 'null' { $text -replace '"phase":"waiting"', '"phase":null' } 'missing' { $text -replace ',"phase":"waiting"', '' } 'trailing-space' { $text -replace '"phase":"waiting"', '"phase":"cooldown "' } 'array' { $text -replace '"phase":"waiting"', '"phase":["waiting"]' } 'soft-hyphen' { $text -replace '"phase":"waiting"', '"phase":"wait­ing"' } default { $text -replace '"phase":"waiting"', '"phase":"later"' } }
   [IO.File]::WriteAllText($A.path, $new)
   $r = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $B
   $out[$shape] = [string]$r.state
@@ -1484,7 +1486,8 @@ foreach ($shape in @('null', 'missing', 'trailing-space', 'other')) {
     def test_a_ticket_whose_stored_phase_is_not_a_known_ready_phase_does_not_block_a_ready_waiter(self) -> None:
         # r7 adversary A13 (advisory): the readiness filter excluded only the string cooldown, so a null, missing or unknown stored phase counted as ready and blocked the line.
         r = self.ps(self.UNKNOWN_PHASE)
-        self.assertEqual(r, {"null": "TAKEN", "missing": "TAKEN", "trailing-space": "TAKEN", "other": "TAKEN"}, "an unknown phase counted as ready")
+        # r7 A10: also a phase that is an array of the ready one, or the ready one with a soft hyphen inside (culture-aware comparison called it equal)
+        self.assertEqual(r, {"null": "TAKEN", "missing": "TAKEN", "trailing-space": "TAKEN", "other": "TAKEN", "array": "TAKEN", "soft-hyphen": "TAKEN"}, "an unknown phase counted as ready")
 
     def test_the_cooldown_wait_is_measured_on_a_monotonic_clock_and_no_claim_request_starts_past_the_deadline(self) -> None:
         # r7 adversary A7: the wait and its heartbeat cadence differenced the wall clock ([DateTime]::UtcNow - $waitEndUtc), so a runner clock step of +1600 s ended a 1800 s cooldown early (the claim
@@ -1493,7 +1496,7 @@ foreach ($shape in @('null', 'missing', 'trailing-space', 'other')) {
         wait = run[run.index("$beatStaleSec = "):run.index("# (1) the claim, once per batch")]
         self.assertIn("$waitClock = [Diagnostics.Stopwatch]::StartNew()", wait, "the wait is not measured on a monotonic clock")
         self.assertNotIn("$waitEndUtc", wait, "the wait end is still a wall-clock instant")
-        self.assertNotRegex(wait, r"\[DateTime\]::UtcNow\s*-\s*\$|\$[A-Za-z]+\s*-\s*\[DateTime\]::UtcNow", "a wall-clock difference measures the wait")
+        self.assertNotRegex(wait, r"\[DateTime\]::UtcNow\s*-\s*\$|\$(?!deadline)[A-Za-z]+\s*-\s*\[DateTime\]::UtcNow", "a wall-clock difference measures the wait (only the absolute -DeadlineUtc is compared with it)")
         self.assertRegex(wait, r"if \(\[DateTime\]::UtcNow -ge \$deadline\) \{\s*\$b\.endReason = 'DEADLINE'", "no deadline check after the wait and its ticket work")
         mod = MODULE.read_text(encoding="utf-8")
         flip = mod[mod.index("$flipClock = "):mod.index("if ($flip -ceq 'LOST')")]
@@ -1532,11 +1535,195 @@ foreach ($shape in @('null', 'missing', 'trailing-space', 'other')) {
     def test_the_claim_keeper_is_stopped_at_once_when_a_refusal_was_recorded_before_it_started(self) -> None:
         # r7 adversary A8: Enable-WriteSuppression stops a keeper only when $script:keeperLive; the TICKET_TAKEN log (before the keeper) and the TICKET_ENDED log (before keeperLive was set) can find an
         # output alias, so the keeper then started (or ran) with the refusal recorded and rewrote the claim in place until the finally. keeperLive is now set before the ticket log, and a refusal already on stops the keeper at once.
+        # r7 A11: and with a refusal already recorded no keeper is started at all (a started one could renew the claim once before any check)
         run = LEASE_RUNNER.read_text(encoding="utf-8")
-        start = run.index("$claimKeeper = Start-VenueClaimKeeper")
+        start = run.index("if ($script:RunOutputAliased) {\n        $claimKeeper = $null")
         region = run[start:start + 1800]
+        self.assertLess(region.index("$claimKeeper = Start-VenueClaimKeeper"), region.index("$script:keeperLive = $true"))
         self.assertLess(region.index("$script:keeperLive = $true"), region.index("Close-BatchTicket 'claim-granted'"), "keeperLive is set after the ticket log that can find the alias")
-        self.assertRegex(region, r"if \(\$script:RunOutputAliased\) \{[^\n]*Stop-VenueKeeper -Keeper \$claimKeeper", "a refusal recorded before the keeper started does not stop it")
+        self.assertLess(region.index("$script:RunOutputAliased"), region.index("$claimKeeper = Start-VenueClaimKeeper"), "the keeper is started before the recorded refusal is asked")
+        self.assertEqual(run.count("Start-VenueClaimKeeper -Venue"), 1, "a second keeper start site")
+
+    # ---- r7, second iteration: the adversary pass on 7786b1d3 (A1 .. A15, A17) ----
+
+    def seam_text(self, *pairs: tuple[str, str]) -> Path:
+        text = MODULE.read_text(encoding="utf-8")
+        for anchor, replacement in pairs:
+            self.assertEqual(text.count(anchor), 1, f"seam anchor moved: {anchor!r}")
+            text = text.replace(anchor, replacement)
+        return copy_with_siblings(MODULE, Path(tempfile.mkdtemp(prefix="seam-", dir=self.case)), text)
+
+    SEAM_A2B = """
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d -Phase cooldown -StaleAfterSec 600
+Start-Sleep -Milliseconds 30
+$B = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$job = Start-Job -ArgumentList $B, $d, '@@SEAMMOD@@', '@@MARK@@' -ScriptBlock { param($B, $d, $m, $mark) $env:SEAM_MARK = $mark; Import-Module $m -Force -DisableNameChecking; Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $B }
+$t0 = [DateTime]::UtcNow
+while (-not (Test-Path -LiteralPath '@@MARK@@') -and ([DateTime]::UtcNow - $t0).TotalSeconds -lt 60) { Start-Sleep -Milliseconds 50 }
+$flip = Update-VenueTicket -Ticket $A -Phase 'waiting'
+$fs = [IO.File]::Open($A.path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+Start-Sleep -Milliseconds 3000
+$fs.Dispose()
+$r = Receive-Job $job -Wait -AutoRemoveJob
+[pscustomobject]@{ flip = $flip; state = [string]$r.state; granted = [bool]$r.granted; claimExists = (Test-Path -LiteralPath (Join-Path $d 'bachelor.claim.json')) } | ConvertTo-Json -Compress
+"""
+
+    def test_an_older_ticket_that_became_ready_is_found_even_when_its_file_is_busy_at_the_check_after_a_grant(self) -> None:
+        # r7 pass 1 A2 (blocker): the census made after a grant had no re-read of a briefly unreadable older ticket, so it skipped A (no parsed phase) and kept the grant that A is owed.
+        mark = self.case / "seam-a2b-mark.txt"
+        mod = self.seam_module("    $r = Invoke-VenueClaimAttempt @attemptArgs\n", "    [IO.File]::WriteAllText($env:SEAM_MARK, '1'); Start-Sleep -Milliseconds 2500\n    $r = Invoke-VenueClaimAttempt @attemptArgs\n")
+        r = self.ps(self.SEAM_A2B.replace("@@SEAMMOD@@", str(mod)).replace("@@MARK@@", str(mark)))
+        self.assertEqual((r["state"], r["granted"], r["claimExists"]), ("QUEUED", False, False), f"the grant was kept although the older ticket was ready (its file only busy for a moment): {r}")
+
+    SEAM_A3B = """
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d -Phase cooldown -StaleAfterSec 600
+Start-Sleep -Milliseconds 30
+$B = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$job = Start-Job -ArgumentList $B, $d, '@@SEAMMOD@@', '@@MARK@@' -ScriptBlock { param($B, $d, $m, $mark) $env:SEAM_MARK = $mark; Import-Module $m -Force -DisableNameChecking; Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $B }
+$t0 = [DateTime]::UtcNow
+while (-not (Test-Path -LiteralPath '@@MARK@@') -and ([DateTime]::UtcNow - $t0).TotalSeconds -lt 60) { Start-Sleep -Milliseconds 50 }
+$flip = Update-VenueTicket -Ticket $A -Phase 'waiting'
+$cp = Join-Path $d 'bachelor.claim.json'
+$hold = $null
+while ($null -eq $hold -and ([DateTime]::UtcNow - $t0).TotalSeconds -lt 60) { try { $hold = [IO.File]::Open($cp, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read) } catch { Start-Sleep -Milliseconds 2 } }
+Start-Sleep -Milliseconds 9000
+$hold.Dispose()
+$r = Receive-Job $job -Wait -AutoRemoveJob
+$claim = $null; if (Test-Path -LiteralPath $cp) { $claim = (Get-Content -LiteralPath $cp -Raw | ConvertFrom-Json).nonce }
+[pscustomobject]@{ flip = $flip; state = [string]$r.state; granted = [bool]$r.granted; claimExists = [bool]$claim; ours = ($claim -and $r.claim -and $claim -ceq $r.claim.nonce) } | ConvertTo-Json -Compress
+"""
+
+    def test_a_grant_that_cannot_be_given_back_is_kept_not_leaked_as_a_queued_answer(self) -> None:
+        # r7 pass 1 A3 (blocker): the give-back's answer was discarded, so a reader of the claim file that refused the release left the claim naming B while B was told QUEUED (and nobody owned its nonce).
+        mark = self.case / "seam-a3b-mark.txt"
+        # the seam keeps the claim standing for 1.5 s after its creation (so the observer reliably opens it) and the observer holds it for 9 s, longer than every give-back attempt together
+        mod = self.seam_module("    $r = Invoke-VenueClaimAttempt @attemptArgs\n", "    [IO.File]::WriteAllText($env:SEAM_MARK, '1'); Start-Sleep -Milliseconds 2500\n    $r = Invoke-VenueClaimAttempt @attemptArgs\n    if ($r.granted) { Start-Sleep -Milliseconds 1500 }\n")
+        r = self.ps(self.SEAM_A3B.replace("@@SEAMMOD@@", str(mod)).replace("@@MARK@@", str(mark)))
+        self.assertEqual((r["state"], r["granted"], r["ours"]), ("TAKEN", True, True), f"a claim that could not be given back was not handed over (a QUEUED answer while the claim still names this owner leaks it): {r}")
+
+    LOCK_JOB = """
+Set-Location -LiteralPath '@@CASE@@'
+$job = Start-Job -ArgumentList '@@MOD@@', '@@ABS@@', '@@MARK@@' -ScriptBlock { param($m, $abs, $mark) Import-Module $m -Force -DisableNameChecking; $got = & (Get-Module VenueChain) { param($p) $l = Enter-VenueTicketLock -TicketPath $p -TimeoutMs 400; $ok = ($null -ne $l); Exit-VenueTicketLock $l; $ok } $abs; [IO.File]::WriteAllText($mark, [string]$got) }
+$held = & (Get-Module VenueChain) { param($p) Enter-VenueTicketLock -TicketPath $p -TimeoutMs 500 } '.\\claims\\bachelor.tickets\\x.ticket.json'
+Wait-Job $job | Out-Null; Receive-Job $job | Out-Null; Remove-Job $job
+& (Get-Module VenueChain) { param($l) Exit-VenueTicketLock $l } $held
+[pscustomobject]@{ held = ($null -ne $held); otherGotIt = ([IO.File]::ReadAllText('@@MARK@@') -eq 'True') } | ConvertTo-Json -Compress
+"""
+
+    def test_the_ticket_lock_is_the_same_for_a_relative_and_an_absolute_spelling_of_the_claim_folder(self) -> None:
+        # r7 pass 1 A4 (blocker): the mutex was keyed on the spelling of the directory, so a heartbeat given a relative ClaimDir and a reaper that spells it absolutely (FileInfo.FullName) did not exclude each other.
+        mark = self.case / "lock-mark.txt"
+        absolute = self.claims / "bachelor.tickets" / "x.ticket.json"
+        (self.case / "claims").mkdir(exist_ok=True)
+        script = self.LOCK_JOB.replace("@@CASE@@", str(self.case)).replace("@@MOD@@", str(MODULE)).replace("@@ABS@@", str(absolute)).replace("@@MARK@@", str(mark))
+        r = self.ps(script)
+        self.assertTrue(r["held"], "the first spelling did not get the lock")
+        self.assertFalse(r["otherGotIt"], "the other spelling of the same folder got the lock too: the two do not exclude each other")
+
+    SEAM_A6B = """
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d -Phase cooldown -StaleAfterSec 600
+$r = Update-VenueTicket -Ticket $A -Phase 'waiting' -BudgetSec 0.3
+$phase = (Get-Content -LiteralPath $A.path -Raw | ConvertFrom-Json).phase
+[pscustomobject]@{ result = [string]$r; phase = $phase } | ConvertTo-Json -Compress
+"""
+
+    def test_an_update_whose_budget_ended_during_the_temp_write_publishes_nothing(self) -> None:
+        # r7 pass 1 A6: the budget was sampled before the lock and not again, so a slow temp write ended with a publish after the budget (a flip that landed at 2.5 s of a 2 s request).
+        mod = self.seam_text(("try { $fs.Write($Bytes, 0, $Bytes.Length); $fs.Flush($true) } finally { $fs.Dispose() }", "Start-Sleep -Milliseconds 600; try { $fs.Write($Bytes, 0, $Bytes.Length); $fs.Flush($true) } finally { $fs.Dispose() }"))
+        r = self.ps(self.SEAM_A6B, module=mod)
+        self.assertEqual((r["result"], r["phase"]), ("BUSY", "cooldown"), f"the update published after its budget: {r}")
+        self.assertIn("[Math]::Floor", MODULE.read_text(encoding="utf-8")[MODULE.read_text(encoding="utf-8").index("function Get-VenueBackoffMs"):][:700], "the back-off is cast ([int]0.6 is 1), not floored")
+
+    ADOPT = """
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -Purpose 'P batch 1' -ClaimDir $d -Phase cooldown -StaleAfterSec 600
+Start-Sleep -Milliseconds 30
+$B = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$r = Request-VenueClaim -Venue bachelor -RunDir 'run-A' -Purpose 'P batch 1' -ClaimDir $d -UseTicket
+$files = @(Get-ChildItem -LiteralPath (Split-Path -Parent $A.path) -File | ForEach-Object { $_.Name }).Count
+$phase = (Get-Content -LiteralPath $A.path -Raw | ConvertFrom-Json).phase
+[pscustomobject]@{ adopted = ($r.ticket.name -ceq $A.name); state = [string]$r.state; files = $files; phase = $phase } | ConvertTo-Json -Compress
+"""
+
+    def test_a_ticket_this_owner_already_made_for_this_run_is_taken_over_not_queued_behind_by_a_second_one(self) -> None:
+        # r7 pass 1 A7: the batch gave up on the creating call (5 s) after the ticket file was written, kept no reference, and its first claim request made a SECOND, later ticket: it queued behind a younger waiter
+        # and behind itself. A request with no ticket now takes over the owner's own live ticket for the same run directory and purpose.
+        r = self.ps(self.ADOPT)
+        self.assertTrue(r["adopted"], f"a second ticket was made beside the owner's own: {r}")
+        self.assertEqual((r["files"], r["phase"], r["state"]), (2, "waiting", "TAKEN"), r)
+
+    SEAM_A9B = """
+$job = Start-Job -ArgumentList '@@SEAMMOD@@', $d, '@@MARK@@' -ScriptBlock { param($m, $d, $mark) $env:SEAM_MARK = $mark; Import-Module $m -Force -DisableNameChecking; $A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d; $A.name }
+$t0 = [DateTime]::UtcNow
+while (-not (Test-Path -LiteralPath '@@MARK@@') -and ([DateTime]::UtcNow - $t0).TotalSeconds -lt 60) { Start-Sleep -Milliseconds 10 }
+$ticketFile = @(Get-ChildItem -LiteralPath (Join-Path $d 'bachelor.tickets') -Filter '*.ticket.json' -File)[0].FullName
+$hold = [IO.File]::Open($ticketFile, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+Start-Sleep -Milliseconds 700
+$hold.Dispose()
+$name = Receive-Job $job -Wait -AutoRemoveJob
+$files = @(Get-ChildItem -LiteralPath (Join-Path $d 'bachelor.tickets') -File | ForEach-Object { $_.Name })
+[pscustomobject]@{ files = $files.Count; returned = [string]$name; returnedExists = ($files -contains [string]$name) } | ConvertTo-Json -Compress
+"""
+
+    def test_a_ticket_whose_write_failed_is_taken_back_even_when_a_reader_holds_it_for_a_moment(self) -> None:
+        # r7 pass 1 A9: the rollback's delete was tried once and its failure swallowed, so a reader holding the half-made file left it standing beside the next tick's ticket (a batch queued behind itself).
+        mod = self.seam_text(("try { $fs.Write($bytes, 0, $bytes.Length); $fs.Flush($true) } finally { $fs.Dispose() }\n        } catch {",
+                              "try { $fs.Write($bytes, 0, $bytes.Length); if (-not $script:SeamFlushed) { $script:SeamFlushed = $true; throw 'flush boom' }; $fs.Flush($true) } finally { $fs.Dispose() }\n        } catch { if ($made -and $env:SEAM_MARK -and -not (Test-Path -LiteralPath $env:SEAM_MARK)) { [IO.File]::WriteAllText($env:SEAM_MARK, '1'); Start-Sleep -Milliseconds 300 }"))
+        r = self.ps(self.SEAM_A9B.replace("@@SEAMMOD@@", str(mod)).replace("@@MARK@@", str(self.case / "seam-a9b-mark.txt")))
+        self.assertEqual(r["files"], 1, f"the failed first ticket stayed beside the next one: {r}")
+        self.assertTrue(r["returnedExists"], r)
+
+    def test_a_ticket_dated_far_in_the_past_does_not_break_the_listing_or_cost_a_grant(self) -> None:
+        # r7 pass 1 A12 (and A17): the age of a ticket dated 1900 overflowed [int], and a file named with a 19-digit tick above Int64.MaxValue overflowed [int64]: either threw out of the census, after a claim was already granted.
+        r = self.ps("""
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d -NowUtc '1900-01-01T00:00:00Z'
+$dir = Split-Path -Parent $A.path
+[IO.File]::WriteAllText((Join-Path $dir '9999999999999999999-p1-1.ticket.json'), '')
+$threw = ''; $rows = 0
+try { $rows = @(Get-VenueTickets -Venue bachelor -ClaimDir $d).Count } catch { $threw = $_.Exception.Message -replace '\\s+', ' ' }
+$B = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$g = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $B
+[pscustomobject]@{ threw = $threw; rows = $rows; state = [string]$g.state; granted = [bool]$g.granted } | ConvertTo-Json -Compress
+""")
+        self.assertEqual(r["threw"], "", "the ticket listing threw")
+        self.assertEqual((r["state"], r["granted"]), ("TAKEN", True), r)
+
+    SWEEP_LOCK = """
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d
+$dir = Split-Path -Parent $A.path
+$tmp = Join-Path $dir ($A.name + '.' + ('c' * 32) + '.tmp')
+[IO.File]::WriteAllText($tmp, 'x')
+(Get-Item -LiteralPath $tmp).LastWriteTimeUtc = [DateTime]::UtcNow.AddMinutes(-10)
+$job = Start-Job -ArgumentList '@@MOD@@', $A.path, '@@MARK@@' -ScriptBlock { param($m, $p, $mark) Import-Module $m -Force -DisableNameChecking; $l = & (Get-Module VenueChain) { param($p) Enter-VenueTicketLock -TicketPath $p -TimeoutMs 1000 } $p; [IO.File]::WriteAllText($mark, '1'); Start-Sleep -Milliseconds 2500; & (Get-Module VenueChain) { param($l) Exit-VenueTicketLock $l } $l }
+$t0 = [DateTime]::UtcNow
+while (-not (Test-Path -LiteralPath '@@MARK@@') -and ([DateTime]::UtcNow - $t0).TotalSeconds -lt 60) { Start-Sleep -Milliseconds 20 }
+& (Get-Module VenueChain) { param($d) Remove-VenueOrphanTicketTemps -Venue bachelor -ClaimDir $d } $d
+$keptWhileHeld = Test-Path -LiteralPath $tmp
+Wait-Job $job | Out-Null; Remove-Job $job -Force
+& (Get-Module VenueChain) { param($d) Remove-VenueOrphanTicketTemps -Venue bachelor -ClaimDir $d } $d
+[pscustomobject]@{ keptWhileHeld = $keptWhileHeld; goneAfter = -not (Test-Path -LiteralPath $tmp) } | ConvertTo-Json -Compress
+"""
+
+    def test_the_orphan_temp_sweep_leaves_a_temp_alone_while_a_publisher_holds_the_ticket_lock(self) -> None:
+        # r7 pass 1 A14: the sweep judged a temp by its age alone, so a live heartbeat paused (or a wall clock stepped) between its temp and its rename lost its temp, and its update ended BUSY.
+        r = self.ps(self.SWEEP_LOCK.replace("@@MOD@@", str(MODULE)).replace("@@MARK@@", str(self.case / "sweep-mark.txt")))
+        self.assertTrue(r["keptWhileHeld"], "the sweep deleted a temp while a publisher held the ticket lock")
+        self.assertTrue(r["goneAfter"], "the sweep no longer reaps a real orphan once the lock is free")
+
+    def test_the_lease_batch_ticket_calls_keep_clear_of_the_deadline_and_a_failed_end_is_tried_again(self) -> None:
+        # r7 pass 1 A5: a ticket call (a 5 s worker) is started only with more than 6 s left before -DeadlineUtc (creation, heartbeat and retake). A8: a ticket whose end was BUSY or unanswered is kept and ended again at the next batch.
+        run = LEASE_RUNNER.read_text(encoding="utf-8")
+        wait = run[run.index("$beatStaleSec = "):run.index("# (1) the claim, once per batch")]
+        self.assertEqual(wait.count("($deadline - [DateTime]::UtcNow).TotalSeconds -gt 6.0") + wait.count("($deadline - [DateTime]::UtcNow).TotalSeconds -le 6.0"), 3, "a ticket call in the wait is not guarded by the room before the deadline")
+        close = run[run.index("function Close-BatchTicket"):run.index("function Invoke-BatchTicketCall")]
+        self.assertIn("-cnotin @('REMOVED', 'ABSENT', 'CHANGED')", close, "the reference is dropped whatever the end's answer was")
+        self.assertIn("Close-BatchTicket 'leftover'", run, "a ticket that could not be ended is never tried again")
+
+    def test_a_ticket_phase_log_line_that_cannot_be_written_never_stops_the_chain(self) -> None:
+        # r7 pass 1 A15: the new TICKET_PHASE_* and note log lines went through L, which throws when the chain log cannot be appended to (the pre-claim probe then never ran).
+        chain = (DV / "Invoke-VenueChain.ps1").read_text(encoding="utf-8")
+        for line in chain.splitlines():
+            if 'L "TICKET_PHASE_$pf' in line or 'L "$($req.note)' in line:
+                self.assertIn("try { L ", line, f"an unguarded log line: {line.strip()[:120]}")
 
     def test_the_cooldown_wait_is_anchored_before_the_ticket_work_and_every_ticket_call_is_bounded(self) -> None:
         # adversary pass 2 A1 + A4: the wait end was measured after the ticket was created (so slow ticket I/O pushed the claim request past -DeadlineUtc), and creation and the heartbeat
