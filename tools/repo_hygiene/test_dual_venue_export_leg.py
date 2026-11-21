@@ -1472,6 +1472,7 @@ def cdng_total_profile(build_id: str = BUILD_ID, zero: bool = False, set_rows: d
 
 CONTAINMENT = "EXPORT_STAGE_CONTAINMENT_MISMATCH"
 SUM_MISMATCH = "EXPORT_STAGE_SUM_MISMATCH"
+RECORD_INVALID = "EXPORT_RECORD_INVALID"
 # (name, cdng_total_profile arguments, the typed reason, text the problem must name). Dot I5 (#838 ask 6967301971): ONLY llrawproc_ms changes (40 -> 900) beside producer frames of 62 / 63 / 64 ms.
 TOTAL_CONTAINMENT_BAD = (
     ("dot_i5_only_the_total_changes_40_to_900", dict(set_rows={"llrawproc_ms": 900.0}), CONTAINMENT, "llrawproc"),
@@ -1489,6 +1490,21 @@ TOTAL_CONTAINMENT_BAD = (
     # adversary A4 (pre-existing, in scope): the worker's own total (llrawproc_total_ms, dng.c:588) is the exact identity other = max(0, total - timed children), so a total of 900 ms
     # beside 40 ms of children is a forged field whatever llrawproc_ms says
     ("worker_total_past_its_children_on_one_frame", dict(per_frame={7: {"llrawproc_total_ms": 900.0}}), SUM_MISMATCH, "llrawproc_total_ms"),
+    # EXPORT-CDNG-TOTAL-CONTAINMENT-1 r2 B1 (sol r1 INV-4): a PRESENT worker total that is not a conforming timing is a typed record problem, never "absent" (each read PASS on 29b664c2)
+    ("worker_total_is_a_string", dict(per_frame={7: {"llrawproc_total_ms": "900"}}), RECORD_INVALID, "llrawproc_total_ms"),
+    ("worker_total_is_null", dict(per_frame={7: {"llrawproc_total_ms": None}}), RECORD_INVALID, "llrawproc_total_ms"),
+    ("worker_total_is_an_array", dict(per_frame={7: {"llrawproc_total_ms": [900]}}), RECORD_INVALID, "llrawproc_total_ms"),
+    ("worker_total_is_past_the_ceiling", dict(per_frame={7: {"llrawproc_total_ms": 86400001}}), RECORD_INVALID, "llrawproc_total_ms"),
+    ("worker_total_is_negative", dict(per_frame={7: {"llrawproc_total_ms": -1.0}}), RECORD_INVALID, "llrawproc_total_ms"),
+    ("worker_total_is_a_boolean", dict(per_frame={7: {"llrawproc_total_ms": True}}), RECORD_INVALID, "llrawproc_total_ms"),
+    # B2 (sol r1 INV-2): llrawproc_other_ms omitted throughout, so the sum is not derivable, but the children that ARE present (36 ms + a 100 ms dual-ISO on frame 7 = 106 ms) are a lower bound
+    # that a 40 ms bracket (and a 40 ms worker total) cannot hold
+    ("other_omitted_one_frame_children_lower_bound_past_the_total", dict(drop=("llrawproc_other_ms",), per_frame={7: {"llrawproc_dual_iso_ms": 100.0}}), SUM_MISMATCH, "frame_index 7"),
+    ("other_omitted_children_lower_bound_past_the_worker_total", dict(drop=("llrawproc_other_ms", "llrawproc_ms"), per_frame={7: {"llrawproc_dual_iso_ms": 100.0, "llrawproc_total_ms": 40.0}}),
+     SUM_MISMATCH, "llrawproc_total_ms"),
+    ("other_omitted_worker_total_below_the_present_children", dict(drop=("llrawproc_other_ms",), per_frame={7: {"llrawproc_total_ms": 10.0}}), SUM_MISMATCH, "llrawproc_total_ms"),
+    # a second child omitted too: the lower bound is still of what is present
+    ("two_children_omitted_the_rest_past_the_total", dict(drop=("llrawproc_other_ms", "llrawproc_dark_frame_ms"), per_frame={7: {"llrawproc_dual_iso_ms": 100.0}}), SUM_MISMATCH, "frame_index 7"),
 )
 TOTAL_CONTAINMENT_CONTROLS = (
     ("normal", dict(), {}),
@@ -1503,6 +1519,14 @@ TOTAL_CONTAINMENT_CONTROLS = (
     ("pair_at_tolerance_with_decimal_figures", dict(zero=True, set_rows={"producer_frame_ms": 40.00046, "llrawproc_ms": 43.000483, "llrawproc_dual_iso_ms": 43.000483}), {}),
     ("sum_at_tolerance_with_decimal_figures", dict(zero=True, set_rows={"producer_frame_ms": 120.0, "llrawproc_ms": 32.50021, "llrawproc_dual_iso_ms": 30.0002}), {}),
     ("worker_total_agrees_with_its_children", dict(set_rows={"llrawproc_total_ms": 40.0}), {}),
+    # r2 B2 controls: the lower bound only judges what is PRESENT: children inside the bracket and the worker total with the remainder omitted stay valid
+    ("other_omitted_worker_total_agrees_with_the_present_children", dict(drop=("llrawproc_other_ms",), set_rows={"llrawproc_total_ms": 40.0}), {}),
+    ("other_omitted_present_children_just_inside_the_tolerance", dict(zero=True, drop=("llrawproc_other_ms",), set_rows={"producer_frame_ms": 120.0, "llrawproc_ms": 106.0, "llrawproc_dual_iso_ms": 100.0}), {}),
+    # r2 B3 (sol r1 INV-5): 29 frames at the documented 5 % + 1 ms tolerance (producer 40, bracket 43, children 43) and one frame a hair inside it: the means (40.0000093, 43.0000098) sit AT the
+    # tolerance; rounded to 6 places before the gate (40.000009 -> 43.00000945 < 43.00001) they read INVALID on 29b664c2
+    ("every_frame_at_the_tolerance_the_rounded_means_must_not_reject",
+     dict(zero=True, set_rows={"producer_frame_ms": 40.0, "llrawproc_ms": 43.0, "llrawproc_dual_iso_ms": 43.0},
+          per_frame={0: {"producer_frame_ms": 40.00028, "llrawproc_ms": 43.000294, "llrawproc_dual_iso_ms": 43.000294}}), {}),
     ("pair_at_tolerance", dict(zero=True, set_rows={"producer_frame_ms": 100.0, "llrawproc_ms": 106.0, "llrawproc_dual_iso_ms": 100.0, "llrawproc_other_ms": 6.0}), {}),
     ("sum_at_tolerance", dict(zero=True, set_rows={"producer_frame_ms": 120.0, "llrawproc_ms": 106.0, "llrawproc_dual_iso_ms": 100.0}), {}),
     # a clip with no llrawproc stage at all (permitted absence: the app ran none of it) stays valid
@@ -1535,6 +1559,24 @@ class CdngTotalContainmentTests(unittest.TestCase):
             row = got[2 * len(TOTAL_CONTAINMENT_BAD) + n]
             with self.subTest(control=name):
                 self.assertEqual((row["problems"], row["outcome"]), ([], "PASS"), row)
+
+    def test_the_rendered_path_gates_read_unrounded_means_so_a_log_at_the_tolerance_is_not_rejected(self) -> None:
+        """r2 B3 (sol r1 INV-5), the rendered sibling of the CDNG case: 29 frames of processed16_total 40 / debayered_frame 43 (processing 0) and one frame a hair inside the 5 % + 1 ms
+        tolerance. The means (40.0000093, 43.0000098) are AT the tolerance; rounded to 6 places before the gate they read EXPORT_STAGE_CONTAINMENT_MISMATCH. One frame genuinely past it is
+        still refused."""
+        def log(first_p16: float, first_deb: float, rest_deb: float = 43.0) -> str:
+            out = []
+            for i in range(30):
+                p16, deb = (first_p16, first_deb) if i == 0 else (40.0, rest_deb)
+                for name, ms in (("raw_uint16_disk_read", 3.0), ("raw_uint16_decompress", 5.0), ("raw_uint16", 9.0), ("llrawproc", 20.0), ("debayered_frame", deb), ("processing", 0.0), ("processed16_total", p16)):
+                    out.append(f"[mlv-stage-timing] frame={i} stage={name} ms={ms:.6f}")
+            return "\n".join(out) + "\n"
+        proc, got = evidence_cases([prores_case(stage=log(40.00028, 43.000294)), prores_case(stage=log(40.0, 43.5, rest_deb=43.5))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual((got[0]["problems"], got[0]["outcome"]), ([], "PASS"), got[0])
+        # (control: every frame past the tolerance, a mean of 43.5 beside 40, is still refused)
+        self.assertEqual(got[1]["outcome"], "INVALID", got[1])
+        self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p for p in got[1]["problems"]), got[1])
 
 
 @requires_windows_pwsh
@@ -1993,8 +2035,9 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
         claim updated to match) does not verify. A matching profile and a permitted absent total verify, written by the writer and re-derived by the validator."""
         spec = self.export_spec(maxframes=30)
         bad = [b for b in TOTAL_CONTAINMENT_BAD if b[0] in ("dot_i5_only_the_total_changes_40_to_900", "one_frame_total_past_its_producer_frame_the_mean_hides",
-                                                             "total_inside_producer_frame_but_past_its_children", "one_frame_children_past_the_total_the_mean_hides")]
-        self.assertEqual(len(bad), 4)
+                                                             "total_inside_producer_frame_but_past_its_children", "one_frame_children_past_the_total_the_mean_hides",
+                                                             "worker_total_is_a_string", "other_omitted_one_frame_children_lower_bound_past_the_total")]   # (r2 B1, B2: the same reader at write and re-derivation)
+        self.assertEqual(len(bad), 6)
         controls = {"normal": cdng_total_profile(self.sha), "total_absent": cdng_total_profile(self.sha, drop=("llrawproc_ms",))}
         for name, text in controls.items():
             with self.subTest(control=name, via="writer"):
