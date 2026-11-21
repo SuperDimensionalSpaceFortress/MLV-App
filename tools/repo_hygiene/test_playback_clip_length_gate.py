@@ -3147,8 +3147,14 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
                                  "measuredPlayLoopShouldStop( measuredState == playback_frame_range::PlayStopState::EndedEarly "
                                  "? playback_frame_range::PlayStopState::Continue : measuredState,"),
             "the measured loop stops on a timeline Reached before the pinned presented count": self._mutated_re(
-                r"m_playbackSmokeTargetPresentedFrames,\s*m_playbackSmokePresentedFrames\s*\)\s*\)\s*\{\s*break;",
-                "0, 0 ) ) { break;"),
+                r"m_playbackSmokeTargetPresentedFrames,\s*m_playbackSmokePresentedFrames,\s*m_playRequiredSourceFrames,\s*ui->actionPlay->isChecked\(\)\s*\)\s*\)\s*\{\s*break;",
+                "0, 0, 0, false ) ) { break;"),
+            # adversary A2/A3 on 7f0f6d58: the loop is told the admitted window and whether Play still runs
+            "the measured loop is no longer told the admitted window": self._mutated_re(
+                r"m_playbackSmokePresentedFrames,\s*m_playRequiredSourceFrames,", "m_playbackSmokePresentedFrames, INT64_MAX,"),
+            "the measured loop is no longer told whether Play still runs": self._mutated_re(
+                r"m_playRequiredSourceFrames,\s*ui->actionPlay->isChecked\(\)\s*\)\s*\)\s*\{\s*break;",
+                "m_playRequiredSourceFrames, true ) ) { break;"),
             # the engine counts, the gate paces, the stop waits
             "the presented-frames stop no longer waits for the source frames": self._mutated_re(
                 r"\n\s*&& programmaticPlayConsumed\(\)\s*// ENFORCE-3: N presented frames[^\n]*", ""),

@@ -11228,7 +11228,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         // stops Play at exactly N); the timeout, early-end and pace stops are unchanged, and so is an unpinned play.
         if( playback_frame_range::measuredPlayLoopShouldStop(
                 measuredState, options.exerciseClipLifecycleStress && !stressAttempted,
-                m_playbackSmokeTargetPresentedFrames, m_playbackSmokePresentedFrames ) )
+                m_playbackSmokeTargetPresentedFrames, m_playbackSmokePresentedFrames,
+                m_playRequiredSourceFrames, ui->actionPlay->isChecked() ) )
         {
             break;
         }

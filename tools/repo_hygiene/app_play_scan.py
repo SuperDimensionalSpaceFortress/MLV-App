@@ -148,7 +148,8 @@ PINNED_STOP_STATEMENTS = {
         # Reached waits for its presented count; the timeout, early-end and pace stops, and an unpinned play, are unchanged).
         "if( playback_frame_range::measuredPlayLoopShouldStop( measuredState, "
         "options.exerciseClipLifecycleStress && !stressAttempted, "
-        "m_playbackSmokeTargetPresentedFrames, m_playbackSmokePresentedFrames ) ) { break; }",
+        "m_playbackSmokeTargetPresentedFrames, m_playbackSmokePresentedFrames, "
+        "m_playRequiredSourceFrames, ui->actionPlay->isChecked() ) ) { break; }",
         "if( measuredState != playback_frame_range::PlayStopState::Reached ) { "
         "m_playbackSmokeFullscreenLossLatchArmed = false; programmaticStop( \"gui-smoke-measured-early-end\" );",
         "&& programmaticPlayConsumed() && ( playbackClock.elapsed() >= qMax( 0, options.stressSwitchAtMs ) "

@@ -1266,12 +1266,21 @@ inline PlayStopState evaluatePlayStop( int64_t consumed, int64_t required, bool 
 // A timeline Reached (the source frames were consumed) is seen BEFORE the frames still in flight have presented, so a
 // frame-pinned capture (targetPresentedFrames > 0) that broke on it stopped 2 to 3 frames short and failed the strict
 // presented == target check (exit 11, 0 frames written). While target > 0 and presented < target a Reached therefore does
-// NOT end the loop: the presented-count stop (the present path stops Play at exactly N) ends it. Every other state still
-// ends it at once -- SafetyTimeout above all, so the wall-clock net still bounds the loop (Reached past the deadline is
-// already SafetyTimeout in evaluatePlayStop). target == 0 (an unpinned play) is exactly the previous decision.
+// NOT end the loop: the presented-count stop (the present path stops Play at exactly N) ends it. SafetyTimeout, EndedEarly
+// and PaceTooSlow still end it at once -- SafetyTimeout above all, so the wall-clock net still bounds the loop (Reached past
+// the deadline is already SafetyTimeout in evaluatePlayStop); a Continue is not a stop (the caller polls again).
+// target == 0 (an unpinned play) is exactly the previous decision.
 // stressPending: the clip-lifecycle stress has not run yet, so a Reached must wait for it (its own, older reason).
+// Two limits keep the wait to the case it is for (adversary pass on 7f0f6d58, A2 and A3):
+//  - requiredSourceFrames (the admitted window, MainWindow m_playRequiredSourceFrames): the loop waits only while the
+//    pinned count fits the admitted window (target <= required). A target beyond it (--seconds shorter than N / fps) was
+//    never reachable inside the admitted window; it keeps today's decision, the exit-11 mismatch, and never plays on past it.
+//  - playStillRunning (Play is still checked): presents can still arrive only while Play runs. A Play that already ended
+//    (the cut-out stop, the engine's own end) with the count short is the terminal exit-11 mismatch, not a 55 s wait for a
+//    count that is frozen and then a PLAY_SAFETY_TIMEOUT.
 inline bool measuredPlayLoopShouldStop( PlayStopState state, bool stressPending,
-                                        int64_t targetPresentedFrames, int64_t presentedFrames )
+                                        int64_t targetPresentedFrames, int64_t presentedFrames,
+                                        int64_t requiredSourceFrames, bool playStillRunning )
 {
     switch( state )
     {
@@ -1281,7 +1290,8 @@ inline bool measuredPlayLoopShouldStop( PlayStopState state, bool stressPending,
         return true;
     case PlayStopState::Reached:
         if( stressPending ) return false;
-        return !( targetPresentedFrames > 0 && presentedFrames < targetPresentedFrames );
+        return !( targetPresentedFrames > 0 && presentedFrames < targetPresentedFrames
+                  && targetPresentedFrames <= requiredSourceFrames && playStillRunning );
     case PlayStopState::Continue:
         break;
     }

@@ -4092,31 +4092,64 @@ TEST( PlaybackMeasuredLoopExit, ReachedWaitsForThePresentedCountOfAFramePinnedCa
 {
     using playback_frame_range::PlayStopState;
     using playback_frame_range::measuredPlayLoopShouldStop;
+    // Arguments: ( state, stressPending, target, presented, requiredSourceFrames, playStillRunning ). A pinned capture's
+    // admitted window is 600 source frames here (required == target), the shape the capture script requests.
     // (Reached, target 600, presented 598) -> continue: the defect (master broke here, exit 11 with 0 frames written)
-    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 598 ) );
-    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 597 ) );
-    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 0 ) );
+    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 598, 600, true ) );
+    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 597, 600, true ) );
+    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 0, 600, true ) );
     // (Reached, 600, 600) -> stop: exactly N
-    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 600 ) );
+    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 600, 600, true ) );
+    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 600, 600, false ) );
     // (not Reached, 600, 600) -> stop: the presented-count stop stopped Play at N before the source frames were consumed,
     // which evaluatePlayStop types EndedEarly; and a Continue (Play still running) is never a stop on its own.
-    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::EndedEarly, false, 600, 600 ) );
-    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Continue, false, 600, 600 ) );
-    // target 0 (an unpinned play) with Reached -> stop, whatever the presented count: unchanged
+    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::EndedEarly, false, 600, 600, 600, false ) );
+    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Continue, false, 600, 600, 600, true ) );
+    // target 0 (an unpinned play) with Reached -> stop, whatever the presented count, window or run state: unchanged
     for( const int64_t presented : { int64_t( 0 ), int64_t( 1 ), int64_t( 598 ), int64_t( 600 ), int64_t( 1000 ) } )
-        ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 0, presented ) );
+        for( const int64_t required : { int64_t( 0 ), int64_t( 480 ), int64_t( 600 ) } )
+            for( const bool running : { false, true } )
+                ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 0, presented, required, running ) );
     // the timeout -> stop, pinned or not, short of the target or not: the safety net still bounds the loop
     for( const int64_t target : { int64_t( 0 ), int64_t( 600 ) } )
         for( const int64_t presented : { int64_t( 0 ), int64_t( 598 ), int64_t( 600 ) } )
-        {
-            ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::SafetyTimeout, false, target, presented ) );
-            ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::EndedEarly, false, target, presented ) );
-            ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::PaceTooSlow, false, target, presented ) );
-        }
+            for( const bool running : { false, true } )
+            {
+                ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::SafetyTimeout, false, target, presented, 600, running ) );
+                ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::EndedEarly, false, target, presented, 600, running ) );
+                ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::PaceTooSlow, false, target, presented, 600, running ) );
+            }
     // the clip-lifecycle stress still holds a Reached back, pinned or not; the other stops are not held back
-    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Reached, true, 0, 0 ) );
-    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Reached, true, 600, 600 ) );
-    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::SafetyTimeout, true, 600, 598 ) );
+    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Reached, true, 0, 0, 600, true ) );
+    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Reached, true, 600, 600, 600, true ) );
+    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::SafetyTimeout, true, 600, 598, 600, true ) );
+}
+
+// adversary A2 (7f0f6d58): a pinned target beyond the admitted window (--seconds shorter than N / fps: 20 s at 24 fps admits 480
+// source frames, the target is 600) was never reachable inside the window; the loop keeps today's decision (stop at the Reached,
+// the exit-11 mismatch) and never plays on past the admitted window. The wait is only for a target the window covers.
+TEST( PlaybackMeasuredLoopExit, ATargetBeyondTheAdmittedWindowStopsAtTheReachedAsBefore )
+{
+    using playback_frame_range::PlayStopState;
+    using playback_frame_range::measuredPlayLoopShouldStop;
+    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 480, 480, true ) );
+    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 478, 480, true ) );
+    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 601, 598, 600, true ) );
+    // the window covers the target (required >= target): the wait applies
+    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 598, 601, true ) );
+    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Reached, false, 480, 478, 480, true ) );
+}
+
+// adversary A3 (7f0f6d58): presents can only still arrive while Play runs. A Play that already ended (the cut-out stop) with the
+// count short is the terminal exit-11 mismatch at once, not a wait for a frozen count that ends as PLAY_SAFETY_TIMEOUT (exit 14).
+TEST( PlaybackMeasuredLoopExit, APlayThatAlreadyEndedWithAShortCountStopsAtOnce )
+{
+    using playback_frame_range::PlayStopState;
+    using playback_frame_range::measuredPlayLoopShouldStop;
+    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 480, 479, 480, false ) );
+    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 0, 600, false ) );
+    // while Play still runs the same observation waits
+    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Reached, false, 480, 479, 480, true ) );
 }
 
 TEST( PlaybackMeasuredLoopExit, TheLoopOutlastsATimelineReachedAndEndsAtExactlyNOrTheSafetyTimeout )
@@ -4124,7 +4157,9 @@ TEST( PlaybackMeasuredLoopExit, TheLoopOutlastsATimelineReachedAndEndsAtExactlyN
     using playback_frame_range::PlayStopState;
     // The real decision (evaluatePlayStop) feeding the predicate, with 3 frames still in flight when the timeline
     // consumes its 600th source frame. The old loop (break on Reached) ends at 598; the new one ends at 600.
-    const int64_t kTarget = 600, kRequired = 600, kSafetyMs = 35000;
+    // static constexpr: std::min binds these by reference, which would ODR-use an automatic local inside the captureless
+    // lambda below (ill-formed; adversary A1 on 7f0f6d58). A static has no capture to need.
+    static constexpr int64_t kTarget = 600, kRequired = 600, kSafetyMs = 35000;
     auto run = []( int64_t target, int64_t firstPresentMs, bool oldRule, int64_t *endedAtMs ) -> int64_t
     {
         int64_t presented = 0;
@@ -4134,7 +4169,7 @@ TEST( PlaybackMeasuredLoopExit, TheLoopOutlastsATimelineReachedAndEndsAtExactlyN
             presented = ms < firstPresentMs ? 0 : std::min<int64_t>( kRequired, ( ms - firstPresentMs ) / 10 + 1 );   // lags
             const PlayStopState s = playback_frame_range::evaluatePlayStop( consumed, kRequired, true, ms, kSafetyMs );
             const bool stop = oldRule ? ( s != PlayStopState::Continue )
-                                      : playback_frame_range::measuredPlayLoopShouldStop( s, false, target, presented );
+                                      : playback_frame_range::measuredPlayLoopShouldStop( s, false, target, presented, kRequired, true );
             if( stop ) { *endedAtMs = ms; return presented; }
         }
     };
@@ -4150,5 +4185,5 @@ TEST( PlaybackMeasuredLoopExit, TheLoopOutlastsATimelineReachedAndEndsAtExactlyN
     // a pinned target that is never presented (the present path never fires) ends at the SAFETY TIMEOUT, never a hang:
     // evaluatePlayStop turns a Reached seen past the deadline into SafetyTimeout, which the predicate always stops on.
     ASSERT_TRUE( playback_frame_range::evaluatePlayStop( 600, kRequired, true, kSafetyMs + 1, kSafetyMs ) == PlayStopState::SafetyTimeout );
-    ASSERT_TRUE( playback_frame_range::measuredPlayLoopShouldStop( PlayStopState::SafetyTimeout, false, kTarget, 598 ) );
+    ASSERT_TRUE( playback_frame_range::measuredPlayLoopShouldStop( PlayStopState::SafetyTimeout, false, kTarget, 598, kRequired, true ) );
 }
