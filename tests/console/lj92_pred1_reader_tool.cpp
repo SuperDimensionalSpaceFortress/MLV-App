@@ -83,13 +83,15 @@ uint32_t rd32(const Bytes & b, size_t at) { return (uint32_t)b[at] | ((uint32_t)
 
 // The VIDF payloads that start with the lossless-JPEG start-of-image marker. Block: type[4] size[4] ts[8] then VIDF:
 // frameNumber[4] cropX[2] cropY[2] panX[2] panY[2] frameSpace[4]; the payload follows frameSpace bytes of padding.
-void collect_lj92_payloads(const Bytes & file, std::vector<Bytes> & frames)
+// r2d adversary pass 3 (A4): returns true only when the block walk reached the end of the file, so a damaged or cut file is
+// distinguishable from a complete one (a partial walk used to look like a smaller workload).
+bool collect_lj92_payloads(const Bytes & file, std::vector<Bytes> & frames)
 {
     size_t pos = 0;
     while (pos + 16 <= file.size())
     {
         const uint32_t size = rd32(file, pos + 4);
-        if (size < 16 || pos + size > file.size()) break;
+        if (size < 16 || pos + size > file.size()) return false;
         if (std::memcmp(&file[pos], "VIDF", 4) == 0 && size >= 32)
         {
             const uint32_t space = rd32(file, pos + 28);
@@ -99,6 +101,7 @@ void collect_lj92_payloads(const Bytes & file, std::vector<Bytes> & frames)
         }
         pos += size;
     }
+    return pos == file.size();
 }
 
 // ---------------------------------------------------------------------------------------------------- decode helper
@@ -559,6 +562,7 @@ void check_getters(Counters & c)
 }
 
 void check_bench_options(Counters & c);   // S3 checks, defined with the option parser below
+void check_scale_core(Counters & c);      // adversary pass 3 checks, defined after run_scale
 
 int run_selftest(const std::string & root, unsigned seed)
 {
@@ -569,13 +573,14 @@ int run_selftest(const std::string & root, unsigned seed)
     check_oracle_flags_unchecked_refusal(c);
     check_getters(c);
     check_bench_options(c);
+    check_scale_core(c);
     int fixture_frames = 0;
     for (const char * fixture : kFixtures)
     {
         Bytes file;
         if (root.empty() || !read_file(root + "/" + fixture, file)) { std::fprintf(stderr, "NOTE: fixture %s not readable under root '%s'\n", fixture, root.c_str()); c.fail(std::string("fixture unreadable: ") + fixture); continue; }
         std::vector<Bytes> frames;
-        collect_lj92_payloads(file, frames);
+        if (!collect_lj92_payloads(file, frames)) c.fail(std::string("fixture block walk stopped before the end of the file (damaged or cut): ") + fixture);
         if (frames.empty()) { c.fail(std::string("fixture holds no lossless frame: ") + fixture); continue; }
         for (size_t i = 0; i < frames.size(); i++)
         {
@@ -626,12 +631,14 @@ double percentile(std::vector<double> v, double p)
 
 bool load_frames(const std::string & root, std::vector<Bytes> & frames, std::vector<std::string> & origin)
 {
+    // r2d adversary pass 3 (A4): the workload is the WHOLE declared fixture set. A fixture that cannot be read, or whose block
+    // walk stops before the end of the file, refuses the run instead of shrinking it.
     for (const char * fixture : kFixtures)
     {
         Bytes file;
-        if (!read_file(root + "/" + fixture, file)) continue;
+        if (!read_file(root + "/" + fixture, file)) { std::fprintf(stderr, "fixture unreadable: %s/%s\n", root.c_str(), fixture); return false; }
         std::vector<Bytes> got;
-        collect_lj92_payloads(file, got);
+        if (!collect_lj92_payloads(file, got)) { std::fprintf(stderr, "fixture block walk stopped before the end of the file (damaged or cut): %s\n", fixture); return false; }
         for (auto & g : got) { frames.push_back(std::move(g)); origin.push_back(fixture); }
     }
     return !frames.empty();
@@ -770,6 +777,91 @@ int run_bench(const std::string & root, int iters)
 
 // ---------------------------------------------------------------------------------------------------- worker scaling
 
+// r2d adversary pass 3 (A1, A2, A3). One worker-count x reader run. Returns 0 and fills row, or 3 (reason on stderr) when the
+// run did not measure the reader it is labelled with. Nothing is printed here: run_scale prints only after EVERY run passed.
+struct ScaleRow
+{
+    int workers = 0;
+    bool legacy = false;
+    size_t frames = 0;
+    double aggregate_mps = 0.0, p50_ms = 0.0, p95_ms = 0.0;
+};
+
+int scale_measure(const std::vector<Bytes> & frames, const std::vector<size_t> & pick, int workers, bool legacy, double seconds, ScaleRow & row)
+{
+    std::atomic<bool> go(false);
+    std::atomic<int> refused(0);   // set by the first worker whose decode failed or ran the wrong route
+    std::atomic<int> ready(0);     // workers that have opened their frames; the clock starts once all of them have
+    std::atomic<double> start_ms(0.0);
+    std::vector<std::vector<double>> lat((size_t)workers);
+    std::vector<double> samples_done((size_t)workers, 0.0);
+    std::vector<double> end_ms((size_t)workers, 0.0);
+    std::vector<std::thread> threads;
+    for (int w = 0; w < workers; w++)
+    {
+        threads.emplace_back([&, w]() {
+            // RAM-resident payload copies and a private decoder and output buffer per worker; no file I/O inside the timed loop
+            std::vector<Opened> own(pick.size());
+            bool opened_all = true;
+            for (size_t k = 0; k < pick.size(); k++) if (!open_frame(own[k], frames[pick[k]])) opened_all = false;
+            if (!opened_all) { int none = 0; if (refused.compare_exchange_strong(none, 1)) std::fprintf(stderr, "scale refused (worker %d): a fixture frame did not open\n", w); }
+            ready.fetch_add(1);
+            while (!go.load()) std::this_thread::yield();
+            const double start = start_ms.load();   // ONE start for every worker, so the aggregate interval is the one they all ran in
+            size_t k = (size_t)w;
+            double done = 0.0;
+            // at least one decode per worker (a budget the clock has already passed still measures a frame), so no worker
+            // reports an empty run
+            do
+            {
+                if (refused.load() != 0) break;
+                Opened & o = own[k % own.size()];
+                Route r;
+                const double ms = time_decode(o, legacy, r);
+                std::string why;
+                if (ms < 0) why = "the decode failed";
+                else if (!(why = route_problem(r, legacy)).empty()) {}
+                else if (r.measurement_active) why = "the measurement route is active, so the total is not the production loop's";
+                if (!why.empty())
+                {
+                    int none = 0;
+                    if (refused.compare_exchange_strong(none, 2))
+                        std::fprintf(stderr, "scale refused (worker %d, %s reader): %s\n", w, legacy ? "legacy" : "new", why.c_str());
+                    break;
+                }
+                lat[(size_t)w].push_back(ms); done += (double)o.out.size();
+                k++;
+            } while (now_ms() - start < seconds * 1000.0);
+            end_ms[(size_t)w] = now_ms();
+            samples_done[(size_t)w] = done;
+            for (auto & o : own) if (o.handle) lj92_close(o.handle);
+        });
+    }
+    while (ready.load() < workers) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    start_ms.store(now_ms());
+    go.store(true);
+    for (auto & t : threads) t.join();
+    if (refused.load() != 0) return 3;
+    std::vector<double> all;
+    double total = 0.0, last_end = 0.0;
+    for (int w = 0; w < workers; w++)
+    {
+        if (lat[(size_t)w].empty()) { std::fprintf(stderr, "scale refused (worker %d): it completed no decode\n", w); return 3; }
+        all.insert(all.end(), lat[(size_t)w].begin(), lat[(size_t)w].end());
+        total += samples_done[(size_t)w];
+        last_end = std::max(last_end, end_ms[(size_t)w]);
+    }
+    const double window = last_end - start_ms.load();   // milliseconds, from the one common start to the last worker's end
+    if (!(window > 0.0)) { std::fprintf(stderr, "scale refused: the measured interval is empty\n"); return 3; }
+    row.workers = workers;
+    row.legacy = legacy;
+    row.frames = all.size();
+    row.aggregate_mps = total / 1e6 / (window / 1000.0);
+    row.p50_ms = percentile(all, 0.5);
+    row.p95_ms = percentile(all, 0.95);
+    return 0;
+}
+
 int run_scale(const std::string & root, double seconds)
 {
     std::vector<Bytes> frames;
@@ -779,65 +871,20 @@ int run_scale(const std::string & root, double seconds)
     const size_t want = std::min<size_t>(frames.size(), 24);
     for (size_t k = 0; k < want; k++) pick.push_back(k * frames.size() / want);
     const int worker_counts[] = { 1, 2, 4, 8 };
-    std::printf("SCALE hardware_threads=%u frames_in_ring=%zu seconds_per_run=%.1f\n", std::thread::hardware_concurrency(), pick.size(), seconds);
+    std::vector<ScaleRow> rows;
     for (int workers : worker_counts)
     {
         for (int mode = 0; mode < 2; mode++)
         {
-            const bool legacy = mode == 0;
-            std::atomic<bool> go(false);
-            std::atomic<int> refused(0);   // r2d (sol r1 S3): set by the first worker whose decode failed or ran the wrong route
-            std::vector<std::vector<double>> lat((size_t)workers);
-            std::vector<double> samples_done((size_t)workers, 0.0);
-            std::vector<double> wall((size_t)workers, 0.0);
-            std::vector<std::thread> threads;
-            for (int w = 0; w < workers; w++)
-            {
-                threads.emplace_back([&, w]() {
-                    // RAM-resident payload copies and a private decoder and output buffer per worker; no file I/O inside the timed loop
-                    std::vector<Opened> own(pick.size());
-                    bool opened_all = true;
-                    for (size_t k = 0; k < pick.size(); k++) if (!open_frame(own[k], frames[pick[k]])) opened_all = false;
-                    if (!opened_all) { int none = 0; if (refused.compare_exchange_strong(none, 1)) std::fprintf(stderr, "scale refused (worker %d): a fixture frame did not open\n", w); }
-                    while (!go.load()) std::this_thread::yield();
-                    const double start = now_ms();
-                    size_t k = (size_t)w;
-                    double done = 0.0;
-                    while (refused.load() == 0 && now_ms() - start < seconds * 1000.0)
-                    {
-                        Opened & o = own[k % own.size()];
-                        Route r;
-                        const double ms = time_decode(o, legacy, r);
-                        std::string why;
-                        if (ms < 0) why = "the decode failed";
-                        else if (!(why = route_problem(r, legacy)).empty()) {}
-                        else if (r.measurement_active) why = "the measurement route is active, so the total is not the production loop's";
-                        if (!why.empty())
-                        {
-                            int none = 0;
-                            if (refused.compare_exchange_strong(none, 2))
-                                std::fprintf(stderr, "scale refused (worker %d, %s reader): %s\n", w, legacy ? "legacy" : "new", why.c_str());
-                            break;
-                        }
-                        lat[(size_t)w].push_back(ms); done += (double)o.out.size();
-                        k++;
-                    }
-                    wall[(size_t)w] = now_ms() - start;
-                    samples_done[(size_t)w] = done;
-                    for (auto & o : own) if (o.handle) lj92_close(o.handle);
-                });
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(300));
-            go.store(true);
-            for (auto & t : threads) t.join();
-            if (refused.load() != 0) return 3;   // no SCALE_RESULT line for a run that did not measure its labelled reader
-            std::vector<double> all;
-            double total = 0.0, longest = 0.0;
-            for (int w = 0; w < workers; w++) { all.insert(all.end(), lat[(size_t)w].begin(), lat[(size_t)w].end()); total += samples_done[(size_t)w]; longest = std::max(longest, wall[(size_t)w]); }
-            std::printf("SCALE_RESULT workers=%d reader=%s frames=%zu aggregate_MPs=%.1f latency_p50_ms=%.4f latency_p95_ms=%.4f\n", workers, legacy ? "legacy" : "new",
-                        all.size(), total / 1e6 / (longest / 1000.0), percentile(all, 0.5), percentile(all, 0.95));
+            ScaleRow row;
+            if (scale_measure(frames, pick, workers, mode == 0, seconds, row) != 0) return 3;   // not one SCALE line for a refused invocation
+            rows.push_back(row);
         }
     }
+    std::printf("SCALE hardware_threads=%u frames_in_ring=%zu seconds_per_run=%g\n", std::thread::hardware_concurrency(), pick.size(), seconds);
+    for (const ScaleRow & r : rows)
+        std::printf("SCALE_RESULT workers=%d reader=%s frames=%zu aggregate_MPs=%.1f latency_p50_ms=%.4f latency_p95_ms=%.4f\n", r.workers, r.legacy ? "legacy" : "new",
+                    r.frames, r.aggregate_mps, r.p50_ms, r.p95_ms);
     return 0;
 }
 
@@ -870,7 +917,7 @@ bool parse_uint_arg(const char * s, unsigned long long lo, unsigned long long hi
 bool parse_seconds_arg(const char * s, double & out)
 {
     if (s == nullptr || *s == 0) return false;
-    for (const char * p = s; *p; p++) if (!std::strchr("0123456789.eE+-", *p)) return false;
+    for (const char * p = s; *p; p++) if (!std::strchr("0123456789.", *p)) return false;   // a plain decimal: no sign, no exponent, no hex
     char * end = nullptr;
     const double v = std::strtod(s, &end);
     if (end == s || *end != 0 || !std::isfinite(v) || v <= 0.0 || v > 3600.0) return false;
@@ -894,7 +941,11 @@ int parse_args(const std::vector<std::string> & argv, Args & args, std::string &
         if (i + 1 >= argv.size()) { err = "option " + a + " needs a value"; return 2; }
         const char * v = argv[++i].c_str();
         unsigned long long n = 0;
-        if (a == "--root") args.root = v;
+        if (a == "--root")
+        {
+            if (*v == 0) { err = "--root wants a non-empty directory"; return 2; }   // an empty root would silently mean "search upward"
+            args.root = v;
+        }
         else if (a == "--seed")
         {
             if (!parse_uint_arg(v, 0ull, 0xFFFFFFFFull, n)) { err = "--seed wants an integer 0..4294967295, got '" + std::string(v) + "'"; return 2; }
@@ -929,6 +980,10 @@ void check_bench_options(Counters & c)
         { "seconds 0.5", { "--scale", "--seconds", "0.5" }, true },
         { "seconds 3600", { "--scale", "--seconds", "3600" }, true },
         { "seconds 1e308", { "--scale", "--seconds", "1e308" }, false },
+        { "seconds 1e0", { "--scale", "--seconds", "1e0" }, false },
+        { "seconds +1", { "--scale", "--seconds", "+1" }, false },
+        { "seconds 1.5", { "--scale", "--seconds", "1.5" }, true },
+        { "empty root", { "--bench", "--root", "" }, false },
         { "seconds 3601", { "--scale", "--seconds", "3601" }, false },
         { "seconds nan", { "--scale", "--seconds", "nan" }, false },
         { "seconds inf", { "--scale", "--seconds", "inf" }, false },
@@ -964,6 +1019,64 @@ void check_bench_options(Counters & c)
         c.checks++;
         if (route_problem(t.r, t.legacy).empty() != t.ok) c.fail(std::string("route: '") + t.label + "' was " + (t.ok ? "refused" : "accepted"));
     }
+}
+
+// Adversary pass 3 (A1, A2, A4), run in memory on small synthetic frames.
+void check_scale_core(Counters & c)
+{
+    std::mt19937 rng(11);
+    const Table good = make_table(range_set(0, 14), 10, rng);
+    const Table over = make_table(range_set(0, 17), 12, rng);   // names SSSS 17: the default reader declines it and stays legacy
+    std::vector<uint16_t> picture;
+    std::vector<Bytes> frames;
+    frames.push_back(encode_picture(good, 64, 32, 14, 1, rng, 0, picture));
+    frames.push_back(encode_picture(good, 64, 32, 14, 1, rng, 1, picture));
+
+    // A1: a budget the clock has already passed still measures one decode per worker, never an empty SCALE_RESULT
+    for (int workers : { 1, 3 })
+    {
+        for (int mode = 0; mode < 2; mode++)
+        {
+            ScaleRow row;
+            c.checks++;
+            const std::string label = "scale: tiny budget, workers=" + std::to_string(workers) + (mode == 0 ? " legacy" : " new");
+            if (scale_measure(frames, { 0, 1 }, workers, mode == 0, 1e-12, row) != 0) c.fail(label + " was refused");
+            else if (row.frames < (size_t)workers || !(row.aggregate_mps > 0.0)) c.fail(label + " reported an empty result");
+        }
+    }
+
+    // A2: a ring holding a frame the u64 reader declines refuses the NEW arm (the caller prints nothing for a refusal); the
+    // legacy arm on the same ring is fine
+    std::vector<Bytes> mixed = frames;
+    mixed.push_back(encode_picture(over, 64, 32, 14, 1, rng, 0, picture));
+    ScaleRow row;
+    c.checks++;
+    if (scale_measure(mixed, { 0, 1, 2 }, 2, false, 0.01, row) != 3) c.fail("scale: a new arm that fell back to the legacy reader was not refused");
+    c.checks++;
+    if (scale_measure(mixed, { 0, 1, 2 }, 2, true, 0.01, row) != 0) c.fail("scale: the legacy arm on the same ring was refused");
+
+    // A4: a block walk that stops before the end of the file is reported, not taken as a smaller workload
+    auto put32 = [](Bytes & b, uint32_t v) { for (int i = 0; i < 4; i++) b.push_back((uint8_t)(v >> (8 * i))); };
+    Bytes whole;
+    whole.insert(whole.end(), { 'V', 'I', 'D', 'F' });
+    put32(whole, 36);                                       // block size: 32 header bytes + a 4-byte payload
+    whole.insert(whole.end(), 24, 0);                       // timestamp, frame number, crop, pan, frameSpace = 0
+    whole.insert(whole.end(), { 0xFF, 0xD8, 0xFF, 0xD9 });
+    std::vector<Bytes> got;
+    c.checks++;
+    if (!collect_lj92_payloads(whole, got) || got.size() != 1) c.fail("fixture walk: a complete one-block file was not taken whole");
+    Bytes cut_block(whole);
+    cut_block.insert(cut_block.end(), { 'V', 'I', 'D', 'F' });
+    put32(cut_block, 32);                                   // declares 32 bytes, only the 8 written
+    cut_block.insert(cut_block.end(), 8, 0);
+    got.clear();
+    c.checks++;
+    if (collect_lj92_payloads(cut_block, got)) c.fail("fixture walk: a cut-off trailing block was reported as a complete walk");
+    Bytes stray(whole);
+    stray.insert(stray.end(), 3, 0);
+    got.clear();
+    c.checks++;
+    if (collect_lj92_payloads(stray, got)) c.fail("fixture walk: trailing bytes after the last block were reported as a complete walk");
 }
 
 } // namespace
