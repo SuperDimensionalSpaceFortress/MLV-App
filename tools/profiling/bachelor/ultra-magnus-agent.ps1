@@ -663,22 +663,34 @@ function Get-DescendantProcessIdentities {
     # (and one that exited is collected) before the walk returns. It must never wait for a renew to finish (its only waits are
     # bounded: a collected renew's output reads, about 4 s, and the lease sidecar read's retries); nothing it returns is kept.
     # It ticks only BETWEEN the walk's steps: one snapshot query that alone outlasts the cadence still delays a due renew until it returns.
-    param([Parameter(Mandatory = $true)][int]$ParentProcessId, [scriptblock]$OnEach = $null)
+    # r3 (adversary pass 3 A1, Grok G1): -RootStartEpochMs is the root's RECORDED start (the marker's childStartEpochMs, the verified identity
+    # Stop-ProcessTree holds, the lease identity). When given it is ALWAYS the root's creation time for the stale-edge rule, whatever the snapshot
+    # holds: a partial snapshot taken after the root exited (its own row is absent, or was cut off) still walks the root's children, and a row for
+    # the root's pid with a different start is another process (the pid was reused), never the root. That replaced the r2 second, filtered read of
+    # the root's row. Rows created at or after such a reusing process are ITS children, not the exited root's, and are not walked.
+    # r3 (pass 2 A2): -TimeoutSec bounds the snapshot (clamped to 1..30 s); the monitor passes the time left to its deadline.
+    # r3 (Grok G3, pass 3 A4): the record is built in a local and published to $script:LastDescendantWalk ONCE, at the end, so a walk nested in
+    # -OnEach (the lease owner check) cannot overwrite the outer walk's record; the snapshot-failure log limiter is per root pid for the same reason.
+    param([Parameter(Mandatory = $true)][int]$ParentProcessId, [scriptblock]$OnEach = $null, $RootStartEpochMs = $null, [int]$TimeoutSec = 30)
 
+    $snapshotTimeoutSec = [Math]::Min(30, [Math]::Max(1, $TimeoutSec))
+    $script:LastDescendantWalk = $null   # a walk that ends early never leaves an earlier walk's record behind
     if ($null -ne $OnEach) { $null = & $OnEach }
     $all = New-Object 'System.Collections.Generic.List[object]'
     $snapshotError = $null
-    $script:LastDescendantWalk = [pscustomobject]@{ ok = $true; partial = $false; rows = 0; why = $null; rootPid = $ParentProcessId }
+    $walkRecord = [pscustomobject]@{ ok = $true; partial = $false; rows = 0; why = $null; rootPid = $ParentProcessId }
     # -ErrorAction Stop turns a non-terminating provider error into a terminating one AT the point it is raised, and the pipeline has already
-    # handed every earlier row to the collector, so those rows survive the catch. The bound is 30 s: far above the measured ~0.1 s, and no longer
-    # than the 30 s the lease snapshot probes are given.
-    try { Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, CreationDate, ExecutablePath, CommandLine -OperationTimeoutSec 30 -ErrorAction Stop | ForEach-Object { [void]$all.Add($_) } }
+    # handed every earlier row to the collector, so those rows survive the catch. The bound is at most 30 s: far above the measured ~0.1 s, and no
+    # longer than the 30 s the lease snapshot probes are given.
+    try { Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, CreationDate, ExecutablePath, CommandLine -OperationTimeoutSec $snapshotTimeoutSec -ErrorAction Stop | ForEach-Object { [void]$all.Add($_) } }
     catch { $snapshotError = ([string]$_.Exception.Message) -replace '\s*[\r\n]+\s*', ' ' }   # one physical log line (adversary A10)
     if ($null -ne $snapshotError) {
-        $script:LastDescendantWalk = [pscustomobject]@{ ok = $false; partial = ($all.Count -gt 0); rows = $all.Count; why = $snapshotError; rootPid = $ParentProcessId }
+        $walkRecord = [pscustomobject]@{ ok = $false; partial = ($all.Count -gt 0); rows = $all.Count; why = $snapshotError; rootPid = $ParentProcessId }
         $nowTs = [System.Diagnostics.Stopwatch]::GetTimestamp()
-        if ($null -eq $script:DescendantWalkFailLogTs -or (($nowTs - [int64]$script:DescendantWalkFailLogTs) / [double][System.Diagnostics.Stopwatch]::Frequency) -ge 60) {
-            $script:DescendantWalkFailLogTs = $nowTs
+        if ($null -eq $script:DescendantWalkFailLogTs -or $script:DescendantWalkFailLogTs -isnot [hashtable] -or $script:DescendantWalkFailLogTs.Count -gt 256) { $script:DescendantWalkFailLogTs = @{} }
+        $lastFailTs = $script:DescendantWalkFailLogTs[$ParentProcessId]
+        if ($null -eq $lastFailTs -or (($nowTs - [int64]$lastFailTs) / [double][System.Diagnostics.Stopwatch]::Frequency) -ge 60) {
+            $script:DescendantWalkFailLogTs[$ParentProcessId] = $nowTs
             Add-AgentLogLine "descendant-walk: snapshot $(if ($all.Count -gt 0) { 'partial' } else { 'failed' }) pid=$ParentProcessId rows=$($all.Count) why=[$snapshotError]; $(if ($all.Count -gt 0) { 'the rows it returned are walked' } else { 'the walk is empty' })"
         }
     }
@@ -688,21 +700,19 @@ function Get-DescendantProcessIdentities {
         try { if ($null -ne $row -and $null -ne $row.ProcessId -and $row.CreationDate) { $createdAt[[int]$row.ProcessId] = ([DateTime]$row.CreationDate).ToUniversalTime() } }
         catch { continue }
     }
-    # r2 (adversary A3): a snapshot that failed AFTER returning rows but BEFORE the root's own row has no creation time to compare the root's
-    # children with, and a stale edge would pass. Only then (a walk that is already recorded as partial, so the one-query rule is the success
-    # path's) the root's own row is read once, filtered, with a 10 s -OperationTimeoutSec (adversary pass 2 A2: never unbounded), BEFORE the
-    # closing -OnEach tick so no read follows the last tick. If that cannot be read either, the root's children cannot be checked for pid reuse
-    # and are not walked (the walk record says so).
-    $rootUnverified = $false
-    if ($null -ne $snapshotError -and $all.Count -gt 0 -and -not $createdAt.ContainsKey($ParentProcessId)) {
-        $rootRow = $null
-        try { $rootRow = Get-CimInstance Win32_Process -Filter "ProcessId=$ParentProcessId" -Property ProcessId, CreationDate -OperationTimeoutSec 10 -ErrorAction Stop | Select-Object -First 1 } catch { $rootRow = $null }
-        if ($null -eq $rootRow) { $rootUnverified = $true }
-        elseif ($rootRow.CreationDate) {
-            # (a live root row with no readable start cannot be compared and is kept, as in a complete snapshot)
-            try { $createdAt[$ParentProcessId] = ([DateTime]$rootRow.CreationDate).ToUniversalTime() } catch { $rootUnverified = $true }
+    # The root's creation time is the RECORDED start when one is given (see the header). A snapshot row for the root's pid whose start is not the
+    # recorded one (beyond the 2 s the identity checks tolerate) is a process that took the pid after the root exited.
+    $rootReusedAt = $null
+    $recordedRootStart = $null
+    if ($null -ne $RootStartEpochMs) {
+        try { $recordedRootStart = [DateTimeOffset]::FromUnixTimeMilliseconds([Int64]$RootStartEpochMs).UtcDateTime } catch { $recordedRootStart = $null }
+    }
+    if ($null -ne $recordedRootStart) {
+        $rowStart = $null
+        if ($createdAt.TryGetValue($ParentProcessId, [ref]$rowStart) -and $null -ne $rowStart) {
+            if (-not (Test-EpochMillisClose -ActualEpochMs ([DateTimeOffset]::new($rowStart).ToUnixTimeMilliseconds()) -ExpectedEpochMs $RootStartEpochMs)) { $rootReusedAt = $rowStart }
         }
-        if ($rootUnverified) { $script:LastDescendantWalk.why = "$($script:LastDescendantWalk.why); the root's own row was not in the partial snapshot and could not be read, so its children were not walked" }
+        $createdAt[$ParentProcessId] = $recordedRootStart
     }
     if ($null -ne $OnEach) { $null = & $OnEach }
 
@@ -754,14 +764,20 @@ function Get-DescendantProcessIdentities {
     [void]$visited.Add($ParentProcessId)
     $stack = New-Object 'System.Collections.Generic.Stack[object]'
     $skipped = New-Object 'System.Collections.Generic.List[int]'   # rows skipped as created before their listed parent (recorded for the kill paths)
+    $foreign = New-Object 'System.Collections.Generic.List[int]'   # rows created at or after a process that reused the exited root's pid: that process's children
     $rootKids = $null
-    if (-not $rootUnverified -and $byParent.TryGetValue($ParentProcessId, [ref]$rootKids)) { $stack.Push(@{ kids = $rootKids; next = 0; self = $null }) }
+    if ($byParent.TryGetValue($ParentProcessId, [ref]$rootKids)) { $stack.Push(@{ kids = $rootKids; next = 0; self = $null }) }
     while ($stack.Count -gt 0) {
         $frame = $stack.Peek()
         if ($frame.next -lt $frame.kids.Count) {
             $child = $frame.kids[$frame.next]
             $frame.next = $frame.next + 1
             $childProcessId = [int]$child.ProcessId
+            # r3 (Grok G1): a child of the root's pid that was created at or after the process now holding that pid belongs to THAT process.
+            if ($null -ne $rootReusedAt -and [int]$child.ParentProcessId -eq $ParentProcessId) {
+                $foreignCreated = $null
+                if ($createdAt.TryGetValue($childProcessId, [ref]$foreignCreated) -and $null -ne $foreignCreated -and $foreignCreated -ge $rootReusedAt) { [void]$foreign.Add($childProcessId); continue }
+            }
             # r2 (sol 1, fable H1): created BEFORE the parent row it names = a stale edge (the parent's pid was reused), not a descendant.
             $parentCreated = $null; $childCreated = $null
             if ($createdAt.TryGetValue([int]$child.ParentProcessId, [ref]$parentCreated) -and $createdAt.TryGetValue($childProcessId, [ref]$childCreated) -and $null -ne $parentCreated -and $null -ne $childCreated -and $childCreated -lt $parentCreated) {
@@ -786,7 +802,11 @@ function Get-DescendantProcessIdentities {
             if ($null -ne $frame.self) { & $identityOf $frame.self }
         }
     }
-    $script:LastDescendantWalk | Add-Member -NotePropertyName skipped -NotePropertyValue @($skipped) -Force
+    if ($foreign.Count -gt 0) {
+        Add-AgentLogLine "descendant-walk: root pid=$ParentProcessId was reused by a process created $($rootReusedAt.ToString('o')) (recorded start $($recordedRootStart.ToString('o'))); rows created after it are its own children and were not walked: pids=$(@($foreign) -join ',')"
+    }
+    $walkRecord | Add-Member -NotePropertyName skipped -NotePropertyValue @($skipped) -Force
+    $script:LastDescendantWalk = $walkRecord   # published once, here (r3 Grok G3)
 }
 
 function Stop-ProcessTree {
@@ -807,7 +827,8 @@ function Stop-ProcessTree {
         return @()
     }
     $identities = @(
-        @(Get-DescendantProcessIdentities -ParentProcessId $RootProcessId)
+        # r3 (adversary pass 3 A1, Grok G1): the walk is anchored to the start of the root this stop just verified, not to whatever row the snapshot holds.
+        @(Get-DescendantProcessIdentities -ParentProcessId $RootProcessId -RootStartEpochMs $rootMatch.identity.startEpochMs)
         $rootMatch.identity
     )
     $walkState = $script:LastDescendantWalk
@@ -3809,13 +3830,17 @@ function Test-QuietLeaseOwnerPid {
     # interpreter as a child, and heavy-slot.py prints its own os.getpid()). Returns @{ ok; why }.
     param([Parameter(Mandatory = $true)]$Lease, [Parameter(Mandatory = $true)][int]$OwnerPid)
     if ($OwnerPid -eq $Lease.pid) { return [pscustomobject]@{ ok = $true; why = "wrapper pid" } }
-    $kids = @(Get-DescendantProcessIdentities -ParentProcessId $Lease.pid | Where-Object { $_.exists -and [int]$_.processId -eq $OwnerPid })
+    $kids = @(Get-DescendantProcessIdentities -ParentProcessId $Lease.pid -RootStartEpochMs $Lease.identity.startEpochMs | Where-Object { $_.exists -and [int]$_.processId -eq $OwnerPid })
     if ($kids.Count -gt 0) {
         # AGENT-JOB-MONITOR-CIM-WALK-1 r2 (adversary A2): the walk's identity is a row of one snapshot, which an owner that exited while the snapshot
         # was read still appears in. This answer is cached by the caller, so the owner itself is read once more (one filtered query, on this
         # rare path only) before it is called a live child, as the per-child identity reads of the old walk did.
+        # r3 (adversary pass 3 A3): Test-ProcessIdentityMatch accepts a start within 2 s, which a replacement process that took the pid 1.5 s later
+        # passes, so the re-read must ALSO carry the snapshot row's exact start string (both are ToUniversalTime().ToString("o") of one CreationDate).
         $ownerNow = Test-ProcessIdentityMatch -ProcessId $OwnerPid -ExpectedStartUtc $kids[0].startUtc -ExpectedStartEpochMs $kids[0].startEpochMs -ExpectedImagePath $kids[0].imagePath
-        if ($ownerNow.matches) { return [pscustomobject]@{ ok = $true; why = "child of wrapper pid $($Lease.pid)" } }
+        $ownerSameStart = ([string]$ownerNow.identity.startUtc -ceq [string]$kids[0].startUtc)
+        if ($ownerNow.matches -and $ownerSameStart) { return [pscustomobject]@{ ok = $true; why = "child of wrapper pid $($Lease.pid)" } }
+        if ($ownerNow.matches) { $ownerNow = [pscustomobject]@{ reason = "start-mismatch-exact (a different process created within 2 s of the snapshot row)" } }
         return [pscustomobject]@{ ok = $false; why = "lease active line names pid $OwnerPid, a child of the request wrapper (pid $($Lease.pid)) in the process snapshot that is no longer the same running process ($($ownerNow.reason))" }
     }
     return [pscustomobject]@{ ok = $false; why = "lease active line names pid $OwnerPid, which is neither the request wrapper (pid $($Lease.pid)) nor its child" }
@@ -4983,7 +5008,10 @@ function Invoke-QueuedJob {
             # BACHELOR-LEASE-RENEW-MARGIN-1 r1: the renew tick also runs inside this walk (before the one snapshot query and once after it),
             # the slow step of a slice under a heavy leg, so a renew due as the walk starts is started (and one that exited is collected)
             # there, not a slice later.
-            foreach ($descendant in @(Get-DescendantProcessIdentities -ParentProcessId $jobProcess.Id -OnEach { Invoke-QuietLeaseRenewTick })) {
+            # r3 (adversary pass 3 A1, A2): anchored to the child's recorded start, and the snapshot is bounded by the time left to the deadline
+            # (ceiling, at least 1 s; the walk clamps it to 1..30), so it cannot outlast the deadline by more than about a second.
+            $walkLeftSec = [Math]::Max(1, [int][Math]::Ceiling(($deadline - (Get-Date)).TotalSeconds))
+            foreach ($descendant in @(Get-DescendantProcessIdentities -ParentProcessId $jobProcess.Id -RootStartEpochMs $marker.childStartEpochMs -TimeoutSec $walkLeftSec -OnEach { Invoke-QuietLeaseRenewTick })) {
                 if ($descendant.exists) {
                     $trackedDescendants["$($descendant.processId):$($descendant.startEpochMs)"] = $descendant
                 }
@@ -5032,9 +5060,22 @@ function Invoke-QueuedJob {
         }
         elseif ($jobProcess.HasExited) {
             $exit = $jobProcess.ExitCode
-            foreach ($descendant in @(Get-DescendantProcessIdentities -ParentProcessId $jobProcess.Id)) {
+            foreach ($descendant in @(Get-DescendantProcessIdentities -ParentProcessId $jobProcess.Id -RootStartEpochMs $marker.childStartEpochMs)) {
                 if ($descendant.exists) {
                     $trackedDescendants["$($descendant.processId):$($descendant.startEpochMs)"] = $descendant
+                }
+            }
+            # r3 (adversary pass 3 A1): an incomplete post-exit census is written into the job's err file, never dropped: descendants it did not
+            # list may still hold the job's pipes or run on.
+            $postExitWalk = $script:LastDescendantWalk
+            if ($null -ne $postExitWalk -and $postExitWalk.rootPid -eq $jobProcess.Id) {
+                if (-not $postExitWalk.ok) {
+                    "post-exit descendant census $(if ($postExitWalk.partial) { 'PARTIAL' } else { 'FAILED' }) ($($postExitWalk.why)): only the descendants found in the $($postExitWalk.rows) process rows it returned (and those tracked during the run) were stopped; descendants it did not list may still be running" |
+                        Add-Content -Encoding ASCII $errFile
+                }
+                if (@($postExitWalk.skipped).Count -gt 0) {
+                    "post-exit descendant census SKIPPED pids=$(@($postExitWalk.skipped) -join ',') (created before their listed parent: a reused parent pid, or a backward clock step, in which case they are still running)" |
+                        Add-Content -Encoding ASCII $errFile
                 }
             }
             $killedProcessIds = @(Stop-VerifiedProcessIdentities -Identities @($trackedDescendants.Values))
