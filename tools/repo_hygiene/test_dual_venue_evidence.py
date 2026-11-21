@@ -664,6 +664,23 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     def test_the_other_existing_switches_are_still_byte_identical(self) -> None:
         self.assertByteIdenticalToBaseline("switches", ["-ContactSheet", "-ContactSheetFrames", "4", "-TelemetryArm", "LIGHT", "-DisablePaintPerSubmit"])
 
+    def test_only_a_light_job_carries_the_inherited_mlvapp_clear_and_it_sits_inside_the_pinned_region(self) -> None:
+        # BENCH-LIGHT-ARM-GAIN-GATES-1 r8 (adversary r6 A2): a LIGHT job removes every inherited MLVAPP_* variable it does not set itself. The code is a generator-level edit (the publish-write
+        # scan's R4 allowlist reads the default text and does not admit the environment members it needs: hosted CI 44871081341 failed PublishWriteScanTests on the r6 form), emitted only into a LIGHT
+        # job and only inside the existing LIGHT-ARM-PRESENT-DIAG-1 region, so the pinned region count and the byte identity of every other job are unchanged.
+        marker = "LIGHT-LEG-INHERITED-MLVAPP-CLEAR-1 >>>"
+        light = lf(self.generate(GENERATOR, "light-clear.job.ps1", ["-TelemetryArm", "LIGHT"]).read_text(encoding="utf-8"))
+        heavy = lf(self.generate(GENERATOR, "heavy-clear.job.ps1", ["-TelemetryArm", "HEAVY"]).read_text(encoding="utf-8"))
+        default = lf(self.generate(GENERATOR, "default-clear.job.ps1", []).read_text(encoding="utf-8"))
+        self.assertEqual(light.count(marker), 1)
+        self.assertEqual((heavy.count(marker), default.count(marker)), (0, 0))
+        self.assertLess(light.index(self.LIGHT_ARM_PRESENT_DIAG_OPEN), light.index(marker))
+        self.assertLess(light.index(marker), light.index(self.LIGHT_ARM_PRESENT_DIAG_CLOSE))
+        for text in (light, heavy, default):
+            self.assertEqual(text.count(self.LIGHT_ARM_PRESENT_DIAG_OPEN), self.LIGHT_ARM_PRESENT_DIAG_REGIONS)
+        self.assertIn("[Environment]::SetEnvironmentVariable($inheritedVariable, [NullString]::Value)", light)
+        self.assertNotIn("SetEnvironmentVariable($inheritedVariable", default)
+
     def test_a_longer_play_window_is_still_byte_identical(self) -> None:
         self.assertByteIdenticalToBaseline("playseconds", ["-PlaySeconds", "30"])
 

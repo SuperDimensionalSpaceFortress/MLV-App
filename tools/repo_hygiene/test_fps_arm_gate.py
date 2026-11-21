@@ -1504,19 +1504,19 @@ class ObserverControlTests(_Probe):
         # hard-coded list cannot be complete, so a LIGHT leg removes EVERY inherited MLVAPP_* variable of its own process that the job does not itself set for the leg (the names in $envs), and
         # nothing else: another arm keeps them, a name the job sets keeps its inherited value (the explicit override replaces it), the hub fixture flag (read by the runner, not the app) and a
         # non-MLVAPP name are untouched.
+        # The clear is a generator-level edit emitted ONLY into a LIGHT job (the publish-write scan's R4 allowlist reads the default text and does not admit the environment members it needs; the
+        # emission itself is pinned in test_dual_venue_evidence.GeneratorByteIdentityAndVariantTests). Here its code, extracted between its own markers, runs against a polluted environment.
         job = (PROFILING / "bachelor" / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8")
-        region = job.split("# LIGHT-ARM-PRESENT-DIAG-1 >>>", 1)[1].split("# LIGHT-ARM-PRESENT-DIAG-1 <<<", 1)[0]
+        region = job.split("# LIGHT-LEG-INHERITED-MLVAPP-CLEAR-1 >>>", 1)[1].split("# LIGHT-LEG-INHERITED-MLVAPP-CLEAR-1 <<<", 1)[0]
         for name in ("MLVAPP_STAGE_TIMING", "MLVAPP_PERF_FIELD_LOG_DIR", "MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE", "MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR"):
             self.assertNotIn(name, region, f"the region keeps no hard-coded observer name list ({name})")
-        body = "".join(
-            f"$TelemetryArm = '{arm}'; $envs = @('MLVAPP_PLAYBACK_QUALITY_MODE=phase3_hq', 'QT_OPENGL=desktop'); $env:MLVAPP_GPU_TEX_NR_READY_BACKLOG_TELEMETRY = '1'; $env:MLVAPP_STAGE_TIMING = '1'; "
-            "$env:mlvapp_viewport_present_diag = 'on'; $env:MLVAPP_PLAYBACK_QUALITY_MODE = 'inherited'; $env:MLVAPP_HUB_PLAYBACK_CI_FIXTURE = 'CI_FIXTURE_ONLY'; $env:NOT_THE_APP = 'x'\n"
-            f"{region}\n"
-            f"Write-Host ('R={arm}|' + [bool]$env:MLVAPP_GPU_TEX_NR_READY_BACKLOG_TELEMETRY + '|' + [bool]$env:MLVAPP_STAGE_TIMING + '|' + [bool]$env:MLVAPP_VIEWPORT_PRESENT_DIAG + '|' + "
-            "[string]$env:MLVAPP_PLAYBACK_QUALITY_MODE + '|' + [bool]$env:MLVAPP_HUB_PLAYBACK_CI_FIXTURE + '|' + [bool]$env:NOT_THE_APP)\n"
-            for arm in ("LIGHT", "HEAVY", ""))
+        body = ("$envs = @('MLVAPP_PLAYBACK_QUALITY_MODE=phase3_hq', 'QT_OPENGL=desktop'); $env:MLVAPP_GPU_TEX_NR_READY_BACKLOG_TELEMETRY = '1'; $env:MLVAPP_STAGE_TIMING = '1'; "
+                "$env:mlvapp_viewport_present_diag = 'on'; $env:MLVAPP_PLAYBACK_QUALITY_MODE = 'inherited'; $env:MLVAPP_HUB_PLAYBACK_CI_FIXTURE = 'CI_FIXTURE_ONLY'; $env:NOT_THE_APP = 'x'\n"
+                f"{region}\n"
+                "Write-Host ('R=' + [bool]$env:MLVAPP_GPU_TEX_NR_READY_BACKLOG_TELEMETRY + '|' + [bool]$env:MLVAPP_STAGE_TIMING + '|' + [bool]$env:MLVAPP_VIEWPORT_PRESENT_DIAG + '|' + "
+                "[string]$env:MLVAPP_PLAYBACK_QUALITY_MODE + '|' + [bool]$env:MLVAPP_HUB_PLAYBACK_CI_FIXTURE + '|' + [bool]$env:NOT_THE_APP)\n")
         rows = [line for line in self.ok(body).splitlines() if line.startswith("R=")]
-        self.assertEqual(rows, ["R=LIGHT|False|False|False|inherited|True|True", "R=HEAVY|True|True|True|inherited|True|True", "R=|True|True|True|inherited|True|True"])
+        self.assertEqual(rows, ["R=False|False|False|inherited|True|True"])
 
     def test_a_flag_or_arm_word_carrying_a_zero_width_character_is_not_the_plain_one(self) -> None:
         # r5 (adversary A1): PowerShell's -ceq / -cne / -cin ignore U+00AD and the zero-width characters, so 'LIGHT'+U+00AD read as LIGHT and ('0'+U+00AD) as the zero the native reader

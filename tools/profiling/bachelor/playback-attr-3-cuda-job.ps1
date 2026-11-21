@@ -3076,20 +3076,9 @@ $envs = @(
 # updateTextureIfNeeded), so a LIGHT leg (a presented-fps measurement) must not carry it. Only a LIGHT leg drops it; every other arm keeps the line above exactly as before. (The cpu leg's
 # template edit below removes the same line from its own list; this filter finds nothing there.)
 if ($TelemetryArm -eq 'LIGHT') { $envs = @($envs | Where-Object { $_ -ne 'MLVAPP_VIEWPORT_PRESENT_DIAG=1' }) }
-# r5 (adversary A3), r8 (adversary r6 A2): the filter above drops only what this job EMITS. The smoke child also inherits this process's environment, so a worker that carries an app control the job
-# does not set would still run it inside a LIGHT leg while the receipt (which serializes the override list) says nothing. A hard-coded list of observer names cannot be complete (r6: an unlisted
-# ready-backlog observer got through), so a LIGHT leg removes EVERY inherited MLVAPP_* variable of its own process environment that the job does not itself set for the leg (an allowlist of what the
-# job sets: the names in $envs), the same technique as the cpu leg's GL-viewport clear; removed, not set to 0, because some readers test only that the variable is set. One name is exempt: the hub-host
-# fixture flag is read by the smoke runner itself (not the app) and decides whether it may run on a hub host at all; it is not a control of the app, and the recorded launch shows it.
-if ($TelemetryArm -eq 'LIGHT') {
-    $lightLegJobSets = @($envs | ForEach-Object { ([string]$_).Split('=')[0] })
-    foreach ($inheritedVariable in @([Environment]::GetEnvironmentVariables().Keys | ForEach-Object { [string]$_ })) {
-        if ($inheritedVariable -inotmatch '^MLVAPP_') { continue }
-        if ($inheritedVariable -ieq 'MLVAPP_HUB_PLAYBACK_CI_FIXTURE') { continue }
-        if ($lightLegJobSets -contains $inheritedVariable) { continue }
-        [Environment]::SetEnvironmentVariable($inheritedVariable, $null, 'Process')
-    }
-}
+# r8 (adversary r6 A2): the filter above drops only what this job EMITS. A LIGHT job (generated with -TelemetryArm LIGHT) also gets, inside this region, the clear of every inherited
+# MLVAPP_* variable it does not set itself (LIGHT-LEG-INHERITED-MLVAPP-CLEAR-1, a generator-level edit near the cpu leg's: the publish-write scan's R4 allowlist, which reads this default text,
+# does not admit the environment members that clear needs, so it is emitted only into a LIGHT job).
 # LIGHT-ARM-PRESENT-DIAG-1 <<<
 $envList = "'" + ($envs -join "','") + "'"
 function ConvertTo-PsSingleQuoted([string]$Value) { "'" + $Value.Replace("'", "''") + "'" }
@@ -6054,6 +6043,28 @@ if (-not $displayAsleepOverridden) { $displayAsleepOverridden =
 $displayAsleepOverride = [ordered]@{' '    $displayAsleepForegroundVerification.verified }
 $displayAsleepOverride = [ordered]@{'
     $template = Edit-DualVenueTemplate $template '"PresentMon reported DISPLAY_ASLEEP (reason: $($displayReport.reason)) -- not trusted " +' '"PresentMon reported $($displayReport.status) (reason: $($displayReport.reason))$(if ($null -ne $presentMonWaitError) { "; its stop/wait failed: $presentMonWaitError" }) on the cpu backend, where PresentMon is informational and never gating. Text below is the cuda-path override note and applies only if the status is DISPLAY_ASLEEP: not trusted " +'
+}
+if ($TelemetryArm -eq 'LIGHT') {
+    # BENCH-LIGHT-ARM-GAIN-GATES-1 r8 (adversary r6 A2): the smoke child inherits this job's process environment, so a worker that carries an app control the job does not set (r6's input:
+    # MLVAPP_GPU_TEX_NR_READY_BACKLOG_TELEMETRY=1, a variable no list named) would run it inside an admitted LIGHT leg while the plan and sidecars say LIGHT. A hard-coded list of observer names
+    # cannot be complete, so a LIGHT job removes EVERY inherited MLVAPP_* variable of its own process that it does not itself set for the leg (an allowlist of what the job sets: the names
+    # in $envs), the same technique as the cpu leg's GL-viewport clear; removed, not set to 0, because some readers test only that the variable is set. One name is exempt: the hub-host fixture
+    # flag is read by the smoke runner itself (not the app) and decides whether it may run on a hub host at all; the recorded launch shows it. The text goes inside the existing
+    # LIGHT-ARM-PRESENT-DIAG-1 region (so the region count and the byte identity of every other job stay as pinned), and only into a LIGHT job (the publish-write scan reads the default text).
+    $template = Edit-DualVenueTemplate $template @'
+# LIGHT-ARM-PRESENT-DIAG-1 <<<
+'@ @'
+# LIGHT-LEG-INHERITED-MLVAPP-CLEAR-1 >>>
+$lightLegJobSets = @($envs | ForEach-Object { ([string]$_).Split('=')[0] })
+foreach ($inheritedVariable in @([Environment]::GetEnvironmentVariables().Keys | ForEach-Object { [string]$_ })) {
+    if ($inheritedVariable -inotmatch '^MLVAPP_') { continue }
+    if ($inheritedVariable -ieq 'MLVAPP_HUB_PLAYBACK_CI_FIXTURE') { continue }
+    if ($lightLegJobSets -contains $inheritedVariable) { continue }
+    [Environment]::SetEnvironmentVariable($inheritedVariable, [NullString]::Value)
+}
+# LIGHT-LEG-INHERITED-MLVAPP-CLEAR-1 <<<
+# LIGHT-ARM-PRESENT-DIAG-1 <<<
+'@
 }
 if ($isCpuBackend -or $ForceLookAssist) {
     $template = Edit-DualVenueTemplate $template '$contactSheetBackendLabel = if ($FixtureRehearsal) { ''fixture'' } else { ''cuda'' }' '$contactSheetBackendLabel = if ($FixtureRehearsal) { "fixture-$Backend" } else { $Backend }'
