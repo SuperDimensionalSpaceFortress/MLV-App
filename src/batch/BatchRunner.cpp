@@ -391,6 +391,23 @@ int BatchRunner::exportRenderedVideoFile(
     /* ---- Receipt -> pipeline, the same call the CDNG runner makes ------- */
     ReceiptApplier::applyToMlv( receipt, mlvObject, processingObject );
 
+    /* Look Assist, in the same state and on the same clip-wide anchor frame CDNG analyses
+     * (exportSingleFile), so both routes reach the same verdict. CDNG carries the grade as
+     * DNG metadata; a rendered frame shows only processing-object state, so the grade
+     * Look Assist wrote into the receipt is pushed into the processing object too. Off
+     * (receipt or MLVAPP_NO_LOOK_ASSIST) returns false and nothing more is pushed. */
+    const bool lookAssistApplied = ReceiptApplier::applyHeadlessLookAssist(
+        receipt, mlvObject, processingObject,
+        CdngSequenceExport::lookAssistAnalysisFrameIndex( cutIn, cutIn ) );
+    if( lookAssistApplied )
+    {
+        ReceiptApplier::applyLookAssistGradeToProcessing( receipt, processingObject );
+        resetMlvCache( mlvObject );
+        resetMlvCachedFrame( mlvObject );
+        BatchLogger::out(QStringLiteral("[BATCH] RENDER_LOOK applied=true exposure=%1 contrast=%2\n")
+            .arg( receipt->exposure() ).arg( receipt->contrast() ));
+    }
+
     /* Debayer. ReceiptApplier does not set it because CDNG writes Bayer data and never
      * debayers; a rendered export does, so this mirrors the receipt-driven branch of
      * MainWindow::startExportPipe verbatim. (The GUI's m_exportDebayerMode override has

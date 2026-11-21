@@ -42,6 +42,15 @@ public:
                                         uint32_t analysisFrame,
                                         bool masterScenePass = false);
 
+    /* Pushes the grade applyHeadlessLookAssist wrote into the receipt (exposure, contrast, pivot, vibrance, shadows,
+     * highlights and, when it is not the default, the gradation curve) into the processing object, mapped the way the
+     * app's slider handlers map them (MainWindow.cpp on_horizontalSlider*_valueChanged; curve channels Y = 0, R = 1,
+     * G = 2, B = 3, as the Curves widget pushes them). CDNG carries the grade as DNG metadata; a rendered frame shows
+     * only processing-object state, so a rendered export calls this after applyHeadlessLookAssist returned true. White
+     * balance is not touched (applyHeadlessLookAssist already set it). Null-safe. */
+    static void applyLookAssistGradeToProcessing(ReceiptSettings *receipt,
+                                                 processingObject_t *processingObject);
+
     /* The clip's recorded (as-shot) white balance as the app's temperature / tint controls
      * (tint in receipt units), decoded by WBAL.wb_mode: kelvin only in WB_KELVIN, the wbgain_* neutral
      * only in WB_CUSTOM (DNG sequences), presets mapped to their kelvin, default 6000 K. The ONE

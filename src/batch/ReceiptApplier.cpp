@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 namespace
 {
@@ -1232,6 +1233,38 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
         .arg( lookAssistFlavorName( flavor ) ) );
 
     return true;
+}
+
+void ReceiptApplier::applyLookAssistGradeToProcessing(ReceiptSettings *receipt,
+                                                      processingObject_t *processingObject)
+{
+    if( !receipt || !processingObject ) return;
+
+    processingSetExposureStops( processingObject, receipt->exposure() / 100.0 + 1.2 );
+    processingSetSimpleContrast( processingObject, receipt->contrast() / 100.0 );
+    processingSetPivot( processingObject, receipt->pivot() / 100.0 );
+    processingSetVibrance( processingObject,
+                           std::pow( ( receipt->vibrance() + 100 ) / 200.0 * 2.0, std::log( 3.6 ) / std::log( 2.0 ) ) );
+    processingSetShadows( processingObject, receipt->shadows() * 1.5 / 100.0 );
+    processingSetHighlights( processingObject, receipt->highlights() * 1.5 / 100.0 );
+
+    // A default curve is left alone, so a grade without one renders exactly as before.
+    const QString curve = receipt->gradationCurve();
+    if( lookassist::lookAssistIsDefaultGradationCurve( curve ) ) return;
+    std::vector<lookassist::LookAssistGradationPoint> lines[4];
+    lookassist::lookAssistParseGradationCurve( curve, lines );
+    for( int channel = 0; channel < 4; ++channel )
+    {
+        // Copies: the spline helper nudges equal x values in place, as it does on the widget's own arrays.
+        std::vector<float> xs, ys;
+        for( const lookassist::LookAssistGradationPoint &point : lines[channel] )
+        {
+            xs.push_back( point.x );
+            ys.push_back( point.y );
+        }
+        processingSetGCurve( processingObject, static_cast<int>( xs.size() ), xs.data(), ys.data(),
+                             static_cast<uint8_t>( channel ) );
+    }
 }
 
 

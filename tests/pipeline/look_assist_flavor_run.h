@@ -1,16 +1,14 @@
 // LOOK-ASSIST-FLAVORS-1: one headless Look Assist run over a tracked fixture frame, as comparable values.
 //
-// Only API master already had is used (applyHeadlessLookAssist, applyReceipt, renderFrame8), so this header
-// compiles against fork/master b5751928 too: the Classic baseline file was dumped from an UNCHANGED master tree
-// with it. Tracked fixture clips only.
+// The Classic baseline file was dumped from an UNCHANGED fork/master b5751928 tree with this header, when it used only
+// API master already had (applyHeadlessLookAssist, applyReceipt, renderFrame8). EXPORT-PRORES-LOOK-ASSIST-1 moved the
+// gradeLikeGui slider mapping into ReceiptApplier::applyLookAssistGradeToProcessing, unchanged; the baseline rows are
+// rendered with gradeLikeGui = false, which never reaches it. Tracked fixture clips only.
 #ifndef LOOK_ASSIST_FLAVOR_RUN_H
 #define LOOK_ASSIST_FLAVOR_RUN_H
 
 #include "../common/repo_paths.h"
 #include "mlv_pipeline_fixture.h"
-#ifdef LOOK_FLAVOR_RUN_HAS_FILM_GRADE
-#include "look_assist_gradation_curve.h"
-#endif
 
 #include "../../platform/qt/ReceiptSettings.h"
 #include "../../src/batch/BatchLogger.h"
@@ -117,22 +115,11 @@ inline Run run( const FixtureCase &fixtureCase, bool lookAssist, bool gradeLikeG
         .arg( receipt.tint() ).arg( receipt.vibrance() ).arg( receipt.shadows() ).arg( receipt.highlights() )
         .arg( receipt.chromaSmooth() );
 
+    // ... and the gradation curve the way the Curves widget pushes it, when Look Assist laid one (the Film grade): a
+    // default curve is left alone, so Classic and Cinematic render exactly as before. EXPORT-PRORES-LOOK-ASSIST-1: the
+    // one definition of this mapping is the product helper a rendered batch export calls.
     if( gradeLikeGui )
-    {
-        processingObject_t *proc = fixture.processing();
-        processingSetExposureStops( proc, receipt.exposure() / 100.0 + 1.2 );
-        processingSetSimpleContrast( proc, receipt.contrast() / 100.0 );
-        processingSetPivot( proc, receipt.pivot() / 100.0 );
-        processingSetVibrance( proc, std::pow( ( receipt.vibrance() + 100 ) / 200.0 * 2.0, std::log( 3.6 ) / std::log( 2.0 ) ) );
-        processingSetShadows( proc, receipt.shadows() * 1.5 / 100.0 );
-        processingSetHighlights( proc, receipt.highlights() * 1.5 / 100.0 );
-#ifdef LOOK_FLAVOR_RUN_HAS_FILM_GRADE   // defined by the flavor test; master has no Film grade
-        // ... and the gradation curve the way the Curves widget pushes it, when Look Assist laid one (the Film grade):
-        // a default curve is left alone, so Classic and Cinematic render exactly as before.
-        if( !lookassist::lookAssistIsDefaultGradationCurve( receipt.gradationCurve() ) )
-            lookAssistTestApplyGradationCurve( proc, receipt.gradationCurve() );
-#endif
-    }
+        ReceiptApplier::applyLookAssistGradeToProcessing( &receipt, fixture.processing() );
     resetMlvCache( fixture.video() );
     resetMlvCachedFrame( fixture.video() );
     out.rgb = fixture.renderFrame8( static_cast<uint64_t>( fixtureCase.frame ) );

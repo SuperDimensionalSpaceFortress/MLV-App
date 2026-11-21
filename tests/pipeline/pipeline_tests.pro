@@ -155,6 +155,7 @@ SOURCES += \
     $$REPO_ROOT/tests/pipeline/test_repo_root_pin.cpp \
     $$REPO_ROOT/tests/pipeline/test_look_assist_fixture_neutral_probe.cpp \
     $$REPO_ROOT/tests/pipeline/test_look_assist_flavors.cpp \
+    $$REPO_ROOT/tests/pipeline/test_export_rendered_look_assist_grade.cpp \
     $$REPO_ROOT/tests/pipeline/test_sh_frame_state_proxy.cpp \
     $$REPO_ROOT/tests/pipeline/test_look_assist_analysis_render_race.cpp \
     $$REPO_ROOT/tests/pipeline/test_look_assist_analysis_thread_identity.cpp \
