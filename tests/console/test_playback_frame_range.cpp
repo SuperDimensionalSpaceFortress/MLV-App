@@ -4348,18 +4348,19 @@ TEST( PlaybackMeasuredLoopExit, StalledOrSkippedPresentsAfterTheReachedNeverPlay
 // at ( k - start + lag ) * 10 ms, in order, except the one `dropped` frame, which never presents (a drop-frame tick that skips
 // it). The present-path stop is modelled as MainWindow.cpp does it: once presented >= target, the source frames are consumed
 // and Play is still checked, Play stops on THAT present (the slider is pinned to its frame). The loop's stop is the wired
-// predicate; the run's success is the strict exit-11 check, judged on pinnedCapturePresentedCount.
+// predicate; the run's success is the strict exit-11 check, judged on pinnedCaptureObservedFrames with the in-window count the
+// present path keeps (sourceFrameInsideAdmittedWindow).
 namespace measured_loop_r4
 {
 using playback_frame_range::PlayStopState;
-struct PinnedEnd { int64_t presented = 0; int64_t lastFrame = -1; int64_t consumed = 0; int64_t ms = 0;
+struct PinnedEnd { int64_t presented = 0; int64_t windowPresented = 0; int64_t lastFrame = -1; int64_t consumed = 0; int64_t ms = 0;
                    PlayStopState state = PlayStopState::Continue; bool playRunning = true; int64_t observed = 0; bool success = false; };
 constexpr int64_t kSafetyMs = 35000;
 inline PinnedEnd run( int64_t start, int64_t target, int64_t required, int64_t lag, int64_t dropped )
 {
     PinnedEnd e;
     bool playRunning = true;
-    int64_t presented = 0, lastFrame = -1, consumed = 0, next = start;
+    int64_t presented = 0, windowPresented = 0, lastFrame = -1, consumed = 0, next = start;
     for( int64_t ms = 0;; ms += 10 )
     {
         if( playRunning )
@@ -4370,6 +4371,7 @@ inline PinnedEnd run( int64_t start, int64_t target, int64_t required, int64_t l
             {
                 if( next == dropped ) continue;
                 ++presented;
+                if( playback_frame_range::sourceFrameInsideAdmittedWindow( next, true, start, required ) ) ++windowPresented;
                 lastFrame = next;
                 if( target > 0 && presented >= target && consumed >= required ) playRunning = false;   // the present stop
             }
@@ -4377,9 +4379,9 @@ inline PinnedEnd run( int64_t start, int64_t target, int64_t required, int64_t l
         const PlayStopState s = playback_frame_range::evaluatePlayStop( consumed, required, playRunning, ms, kSafetyMs );
         if( playback_frame_range::measuredPlayLoopShouldStop( s, false, target, presented, required, playRunning, consumed ) )
         {
-            e.presented = presented; e.lastFrame = lastFrame; e.consumed = consumed; e.ms = ms; e.state = s;
-            e.playRunning = playRunning;
-            e.observed = playback_frame_range::pinnedCapturePresentedCount( presented, lastFrame, start, required );
+            e.presented = presented; e.windowPresented = windowPresented; e.lastFrame = lastFrame; e.consumed = consumed; e.ms = ms;
+            e.state = s; e.playRunning = playRunning;
+            e.observed = playback_frame_range::pinnedCaptureObservedFrames( target, presented, windowPresented );
             e.success = target > 0 && e.observed == target;
             return e;
         }
@@ -4439,21 +4441,107 @@ TEST( PlaybackMeasuredLoopExit, ADroppedPresentAfterTheReachedIsNeverMadeUpByAFr
     // Grok's witness: the wait itself still runs on (the predicate is not the guard) ...
     for( int64_t c = 600; c <= 615; ++c )
         ASSERT_TRUE( !playback_frame_range::measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 599, 600, true, c ) );
-    // ... and a present of ANY source frame from 600 to 615 that completes the count is not the pinned capture
+    // ... and a present of ANY source frame from 600 to 615 is outside the 0..599 window, so it never counts toward the capture
     for( int64_t frame = 600; frame <= 615; ++frame )
-        ASSERT_EQ( 599, playback_frame_range::pinnedCapturePresentedCount( 600, frame, 0, 600 ) );
-    ASSERT_EQ( 600, playback_frame_range::pinnedCapturePresentedCount( 600, 599, 0, 600 ) );
+        ASSERT_TRUE( !playback_frame_range::sourceFrameInsideAdmittedWindow( frame, true, 0, 600 ) );
+    ASSERT_TRUE( playback_frame_range::sourceFrameInsideAdmittedWindow( 599, true, 0, 600 ) );
+    ASSERT_TRUE( playback_frame_range::sourceFrameInsideAdmittedWindow( 0, true, 0, 600 ) );
     // the window has a LOWER bound too, and a seek during the wait moves neither end (adversary pass 4 A4 / A5 on 6e9145fb):
     // A4: window 0..599, a forward seek to 700 during the wait: 700 is past the window, whatever highWater became
-    ASSERT_EQ( 599, playback_frame_range::pinnedCapturePresentedCount( 600, 700, 0, 600 ) );
+    ASSERT_TRUE( !playback_frame_range::sourceFrameInsideAdmittedWindow( 700, true, 0, 600 ) );
     // A5: window 240..839 (start 240, 600 required): a backward seek's 120 is below it, 839 is its last frame, 840 is past it
-    ASSERT_EQ( 599, playback_frame_range::pinnedCapturePresentedCount( 600, 120, 240, 600 ) );
-    ASSERT_EQ( 599, playback_frame_range::pinnedCapturePresentedCount( 600, 239, 240, 600 ) );
-    ASSERT_EQ( 600, playback_frame_range::pinnedCapturePresentedCount( 600, 240, 240, 600 ) );
-    ASSERT_EQ( 600, playback_frame_range::pinnedCapturePresentedCount( 600, 839, 240, 600 ) );
-    ASSERT_EQ( 599, playback_frame_range::pinnedCapturePresentedCount( 600, 840, 240, 600 ) );
-    ASSERT_EQ( 599, playback_frame_range::pinnedCapturePresentedCount( 600, 1040, 240, 600 ) );
-    // no admitted window (nothing was admitted) or nothing presented: the count alone, as before
-    ASSERT_EQ( 600, playback_frame_range::pinnedCapturePresentedCount( 600, 9000, 0, 0 ) );
-    ASSERT_EQ( 0, playback_frame_range::pinnedCapturePresentedCount( 0, -1, 0, 600 ) );
+    ASSERT_TRUE( !playback_frame_range::sourceFrameInsideAdmittedWindow( 120, true, 240, 600 ) );
+    ASSERT_TRUE( !playback_frame_range::sourceFrameInsideAdmittedWindow( 239, true, 240, 600 ) );
+    ASSERT_TRUE( playback_frame_range::sourceFrameInsideAdmittedWindow( 240, true, 240, 600 ) );
+    ASSERT_TRUE( playback_frame_range::sourceFrameInsideAdmittedWindow( 839, true, 240, 600 ) );
+    ASSERT_TRUE( !playback_frame_range::sourceFrameInsideAdmittedWindow( 840, true, 240, 600 ) );
+    // no admitted window, or an unarmed counter: nothing is inside (fail closed)
+    ASSERT_TRUE( !playback_frame_range::sourceFrameInsideAdmittedWindow( 10, true, 0, 0 ) );
+    ASSERT_TRUE( !playback_frame_range::sourceFrameInsideAdmittedWindow( 10, false, 0, 600 ) );
+    // pass 6 A8 (minor): no inclusive end is formed, so a window near INT64_MAX does not overflow
+    const int64_t nearMax = std::numeric_limits<int64_t>::max() - 10;
+    ASSERT_TRUE( playback_frame_range::sourceFrameInsideAdmittedWindow( std::numeric_limits<int64_t>::max(), true, nearMax, 600 ) );
+    ASSERT_TRUE( !playback_frame_range::sourceFrameInsideAdmittedWindow( std::numeric_limits<int64_t>::max(), true, 0, 600 ) );
+}
+
+// Adversary pass 6 on bcac2010 (A1, A2; both major, introduced by bcac2010's rule, which judged only the LAST present: a
+// completing present outside the window made the count read one short, nothing else). A present sequence is folded the way the
+// present path counts it (raw count, in-window count, last frame) and judged by pinnedCaptureObservedFrames. Each A-item input
+// is RED on bcac2010's rule (modelled in-test as lastOnlyRule) and GREEN on the in-window count.
+namespace measured_loop_r4
+{
+struct Fold { int64_t presented = 0; int64_t windowPresented = 0; int64_t last = -1; };
+inline Fold fold( const std::vector<int64_t> &frames, int64_t start, int64_t required )
+{
+    Fold f;
+    for( const int64_t frame : frames )
+    {
+        ++f.presented;
+        if( playback_frame_range::sourceFrameInsideAdmittedWindow( frame, true, start, required ) ) ++f.windowPresented;
+        f.last = frame;
+    }
+    return f;
+}
+inline std::vector<int64_t> framesFromTo( int64_t first, int64_t last )
+{
+    std::vector<int64_t> v;
+    for( int64_t k = first; k <= last; ++k ) v.push_back( k );
+    return v;
+}
+// bcac2010's rule: the raw count, less one when the LAST present lay outside [start, start + required - 1]
+inline int64_t lastOnlyRule( const Fold &f, int64_t start, int64_t required )
+{
+    return ( f.last < start || f.last > start + required - 1 ) ? f.presented - 1 : f.presented;
+}
+}
+TEST( PlaybackMeasuredLoopExit, ASeekOutOfTheWindowOrARawCountAboveNIsNeverThePinnedCapture )
+{
+    using namespace measured_loop_r4;
+    using playback_frame_range::pinnedCaptureObservedFrames;
+    static constexpr int64_t kTarget = 600, kRequired = 600;
+    // A1: frames 0..598 (599 presents), a backward seek presents 100, then frame 700 completes the stop: raw 601
+    std::vector<int64_t> a1 = framesFromTo( 0, 598 );
+    a1.push_back( 100 );
+    a1.push_back( 700 );
+    const Fold f1 = fold( a1, 0, kRequired );
+    ASSERT_EQ( 601, f1.presented );
+    ASSERT_EQ( 600, f1.windowPresented );
+    ASSERT_EQ( kTarget, lastOnlyRule( f1, 0, kRequired ) );                              // RED on bcac2010: a success
+    ASSERT_TRUE( pinnedCaptureObservedFrames( kTarget, f1.presented, f1.windowPresented ) != kTarget );
+    ASSERT_EQ( 601, pinnedCaptureObservedFrames( kTarget, f1.presented, f1.windowPresented ) );   // `observed=601`, as master
+    // A2: frames 0..596 (597), a seek presents 700, then back: 598 and 599 complete the count. raw 600, last 599 (inside)
+    std::vector<int64_t> a2 = framesFromTo( 0, 596 );
+    a2.push_back( 700 );
+    a2.push_back( 598 );
+    a2.push_back( 599 );
+    const Fold f2 = fold( a2, 0, kRequired );
+    ASSERT_EQ( 600, f2.presented );
+    ASSERT_EQ( 599, f2.windowPresented );
+    ASSERT_EQ( 599, f2.last );
+    ASSERT_EQ( kTarget, lastOnlyRule( f2, 0, kRequired ) );                              // RED on bcac2010: a success
+    ASSERT_EQ( 599, pinnedCaptureObservedFrames( kTarget, f2.presented, f2.windowPresented ) );   // `observed=599`
+    // the same two shapes on an offset window 240..839
+    std::vector<int64_t> a2Offset = framesFromTo( 240, 836 );
+    a2Offset.push_back( 120 );
+    a2Offset.push_back( 838 );
+    a2Offset.push_back( 839 );
+    const Fold f3 = fold( a2Offset, 240, kRequired );
+    ASSERT_EQ( 600, f3.presented );
+    ASSERT_TRUE( pinnedCaptureObservedFrames( kTarget, f3.presented, f3.windowPresented ) != kTarget );
+    // controls: every present inside the window is judged exactly as before this card (the raw count)
+    const Fold ok = fold( framesFromTo( 0, 599 ), 0, kRequired );
+    ASSERT_EQ( kTarget, pinnedCaptureObservedFrames( kTarget, ok.presented, ok.windowPresented ) );
+    std::vector<int64_t> repaint = framesFromTo( 0, 599 );
+    repaint.push_back( 599 );                                                            // a repaint inside: raw 601, all inside
+    const Fold rp = fold( repaint, 0, kRequired );
+    ASSERT_EQ( 601, pinnedCaptureObservedFrames( kTarget, rp.presented, rp.windowPresented ) );
+    const Fold shortRun = fold( framesFromTo( 0, 597 ), 0, kRequired );
+    ASSERT_EQ( 598, pinnedCaptureObservedFrames( kTarget, shortRun.presented, shortRun.windowPresented ) );
+    // the pure rule: equal to the target only when presented == windowPresented == target
+    for( int64_t presented = 595; presented <= 605; ++presented )
+        for( int64_t windowPresented = 590; windowPresented <= presented; ++windowPresented )
+        {
+            const bool met = pinnedCaptureObservedFrames( kTarget, presented, windowPresented ) == kTarget;
+            ASSERT_EQ( presented == kTarget && windowPresented == kTarget, met );
+        }
 }

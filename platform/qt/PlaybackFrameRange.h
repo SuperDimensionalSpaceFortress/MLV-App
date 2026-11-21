@@ -1312,22 +1312,32 @@ inline bool measuredPlayLoopShouldStop( PlayStopState state, bool stressPending,
 // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r4 (Grok G4 / adversary pass 3 A1 on 38c05d4b): the presented count a
 // frame-pinned capture is judged on (the strict presented == target check, exit 11). Pure.
 // A count cannot tell a frame still in flight from a DROPPED one, so the Reached wait above may let the timeline run on and a
-// source frame PAST the admitted window complete the count (the present path then stops Play on it). That present is not the
-// pinned capture: it does not count, so the count it completed reads one short and the run ends by the not-met path (exit 11,
-// `not met; target=N observed=N-1`), never a success on an out-of-window frame.
+// source frame PAST the admitted window complete the count (the present path then stops Play on it). A present from outside the
+// admitted window is not part of the pinned capture, so the present path ALSO counts the presents whose source frame lies inside
+// the window (sourceFrameInsideAdmittedWindow; MainWindow m_playbackSmokeWindowPresentedFrames), and the capture is met only when
+// EVERY present was inside the window and there were exactly target of them. Any present from outside the window -- the frame
+// that completed the count, or one in the middle (a seek out and back, adversary pass 6 A2 on bcac2010) -- and any raw count
+// above the target (pass 6 A1) end by the not-met path (exit 11, the unchanged `not met; target=N observed=M`), never a success.
 // The admitted window is [windowStartFrame, windowStartFrame + requiredSourceFrames - 1]: the counter's start frame (fixed when
 // the measured Play armed it; a later begin is ignored) and the admitted requirement (fixed at admission). Both are fixed before
-// the first Reached and NOTHING during the wait moves them -- unlike highWater, which a seek rebases (adversary pass 4 A4 on
-// 6e9145fb) -- and the window has a lower bound, so a backward seek's frame is outside it too (pass 4 A5).
-// lastPresentedFrame is the frame of the present that completed the count (MainWindow m_playbackSmokeLastPresentedFrame, the
-// frame the present-path stop pins the slider to). No window (requiredSourceFrames <= 0) or nothing presented: the count alone.
-inline int64_t pinnedCapturePresentedCount( int64_t presentedFrames, int64_t lastPresentedFrame,
-                                            int64_t windowStartFrame, int64_t requiredSourceFrames )
+// the first present and NOTHING during the wait moves them -- unlike highWater, which a seek rebases (adversary pass 4 A4 on
+// 6e9145fb) -- and the window has a lower bound, so a backward seek's frame below it is outside too (pass 4 A5).
+// No admitted window (requiredSourceFrames <= 0) or an unarmed counter: nothing is inside (fail closed).
+inline bool sourceFrameInsideAdmittedWindow( int64_t sourceFrame, bool counterArmed, int64_t windowStartFrame,
+                                             int64_t requiredSourceFrames )
 {
-    if( requiredSourceFrames <= 0 || presentedFrames <= 0 ) return presentedFrames;
-    const int64_t windowLastFrame = windowStartFrame + requiredSourceFrames - 1;
-    if( lastPresentedFrame < windowStartFrame || lastPresentedFrame > windowLastFrame ) return presentedFrames - 1;
-    return presentedFrames;
+    // frame - start is computed only once frame >= start, so no inclusive end is formed (no overflow; pass 6 A8)
+    return counterArmed && requiredSourceFrames > 0 && sourceFrame >= windowStartFrame
+        && sourceFrame - windowStartFrame < requiredSourceFrames;
+}
+// The `observed` the strict check compares with the target: equal to it only when presented == windowPresented == target.
+// All presents inside the window: the raw count, exactly as before this card. Otherwise the window count, unless that alone
+// would equal the target (out-of-window presents on top of N in-window ones): then the raw count, which is above it.
+inline int64_t pinnedCaptureObservedFrames( int64_t targetPresentedFrames, int64_t presentedFrames,
+                                            int64_t windowPresentedFrames )
+{
+    if( windowPresentedFrames == presentedFrames ) return presentedFrames;
+    return windowPresentedFrames == targetPresentedFrames ? presentedFrames : windowPresentedFrames;
 }
 
 inline const char *playStopFailureReason( PlayStopState state )

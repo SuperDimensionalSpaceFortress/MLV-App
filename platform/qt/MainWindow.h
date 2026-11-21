@@ -1311,6 +1311,8 @@ private:
     int m_playbackSmokeStartQualityMode = 0;
     int m_playbackSmokeStartWorkerThreads = 0;
     int m_playbackSmokePresentedFrames = 0;
+    // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r4: of those, the presents whose source frame is inside the admitted window
+    int m_playbackSmokeWindowPresentedFrames = 0;
     int m_playbackSmokeParityMatchCount = 0;
     int m_playbackSmokeTargetPresentedFrames = 0;
     int m_playbackSmokeFirstPresentedFrame = -1;
