@@ -8,7 +8,7 @@
   "backends": ["cpu"],
   "scaleFactor": 1,
   "displayMode": "fullscreen",
-  "generatorArgs": { "telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "forceLookAssist": true, "lookFlavor": "cinematic", "rawPrefetchDecoders": 0 },
+  "generatorArgs": { "telemetryArm": "HEAVY", "cpuQuiescenceThresholdPercent": 95, "forceLookAssist": true, "lookFlavor": "cinematic", "rawPrefetchDecoders": 0 },
   "visualCapture": false,
   "visualCaptureOptOutReason": "layout probe: the per-frame lj92 layout keys are the product, no window captures are read",
   "timeouts": { "queueWaitSec": 900, "extraClaimedWaitSec": 600 },

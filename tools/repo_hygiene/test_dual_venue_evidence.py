@@ -8191,6 +8191,10 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertEqual((spec["legType"], spec["backends"], spec["scaleFactor"], spec["displayMode"]), ("speed", ["cpu"], 1, "fullscreen"), path.name)
                 self.assertIs(spec["generatorArgs"].get("forceLookAssist"), True, path.name)
+                # r11 (adversary A1): the per-frame lj92 layout rows ARE the product of these legs; a LIGHT arm sets
+                # MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1, which skips both per-frame emitters, so a LIGHT layout leg
+                # can pass its other gates with zero layout rows. Only HEAVY keeps them.
+                self.assertEqual(spec["generatorArgs"].get("telemetryArm"), "HEAVY", path.name)
             elif spec["card"] == "HFR-NATIVE-60FPS-FULLRES-1":   # the Look Assist ON control of the native s1 pair (its -nola twin is classic)
                 self.assert_hfr_native_s1_flavored_leg(spec, path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
