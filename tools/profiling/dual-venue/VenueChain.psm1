@@ -641,6 +641,12 @@ function Request-VenueClaim {
     }
     $now = Resolve-VenueNow $NowUtc
     $t = $Ticket
+    # TAIL-1 A13: a claim a give-back could not let go of (the ticket names its nonce) is let go of FIRST, before the ticket work and before any new attempt, so it never stays behind a QUEUED answer. An answer that leaves it
+    # standing (BUSY again) keeps the name for the next poll.
+    if ($null -ne $t -and $null -ne $t.PSObject.Properties['pendingReleaseNonce'] -and [string]$t.pendingReleaseNonce) {
+        $pendingAnswer = ''; try { $pendingAnswer = [string](Release-VenueClaim -Venue $Venue -Nonce ([string]$t.pendingReleaseNonce) -ClaimDir $ClaimDir -MaxAttempts 3) } catch { $pendingAnswer = 'ERROR' }
+        if ($pendingAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { $t.pendingReleaseNonce = '' }
+    }
     # r7 adversary A7: one place in the line per owner. A ticket this owner already made for this same run and purpose, whose creating call was given up on by the caller after the file was written (so the
     # caller holds no reference to it), is taken over here instead of being queued behind by a second, later ticket of the same owner. It then goes through the same flip to waiting as any ticket.
     if ($null -eq $t) { $t = Find-VenueOwnTicket -Venue $Venue -ClaimDir $ClaimDir -RunDir $RunDir -Purpose $Purpose -OwnerPid $OwnerPid -NowUtc $now }
@@ -713,6 +719,13 @@ function Request-VenueClaim {
                     $myAfter = @($after | Where-Object { $_.name -ceq $t.name })
                     return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $(if ($seen) { $seen.claim }); path = $r.path; broken = @($r.broken); ticket = $t; queue = $after; position = $(if ($myAfter.Count -gt 0) { [int]$myAfter[0].position } else { $position }); staleTickets = @($removed); note = '' }
                 }
+                # TAIL-1 A13 (= #878 sol r10 B1; replaces r7 A3's "kept as a grant"): five BUSY give-backs did not let go, and handing the claim over would hand a caller a claim owed to an OLDER ready ticket. The answer is QUEUED;
+                # the claim that could not be given back is named on the ticket (pendingReleaseNonce), so it is not leaked, and the next poll made with this ticket lets go of it before anything else (the top of this function).
+                $t | Add-Member -NotePropertyName pendingReleaseNonce -NotePropertyValue ([string]$r.claim.nonce) -Force
+                $seenBusy = $null; try { $seenBusy = Get-VenueClaim -Venue $Venue -ClaimDir $ClaimDir } catch { $seenBusy = $null }
+                $myBusy = @($after | Where-Object { $_.name -ceq $t.name })
+                return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $(if ($seenBusy) { $seenBusy.claim }); path = $r.path; broken = @($r.broken); ticket = $t; queue = $after; position = $(if ($myBusy.Count -gt 0) { [int]$myBusy[0].position } else { $position }); staleTickets = @($removed)
+                    note = "CLAIM_GIVE_BACK_BUSY ticket=$($t.name) (the claim was granted behind an older ready ticket and could not be given back in 5 tries; queued, the next poll lets go of it)" }
             }
         } catch { $null = $_ }
         # r7 pass 2 A2: the census above can take long (a slow claim folder) and a short claim can expire meanwhile and be replaced: a grant that is more than 2 s old is checked to still name this owner before it
