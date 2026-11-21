@@ -524,6 +524,11 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     HEAVY_FRAME_LOG_OPEN = "HEAVY-FRAME-LOG-1 >>>"
     HEAVY_FRAME_LOG_CLOSE = "HEAVY-FRAME-LOG-1 <<<"
     HEAVY_FRAME_LOG_REGIONS = 1
+    # PLAYBACK-TRACE-LOWOVERHEAD-1 r10 (sol r9 A2): the one OFF-arm environment entry (MLVAPP_PLAYBACK_PRESENT_TRACE=0) and its comment, so an inherited =1 cannot leave the
+    # trace-OFF arm of the overhead pair tracing. One region in every job that is not generated with -PresentTrace (cuda and cpu), just before the env list's anchor line.
+    PRESENT_TRACE_OFF_OPEN = "PRESENT-TRACE-OFF-ARM-1 >>>"
+    PRESENT_TRACE_OFF_CLOSE = "PRESENT-TRACE-OFF-ARM-1 <<<"
+    PRESENT_TRACE_OFF_REGIONS = 1
     # PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1 r6: the r5 cpu block (the GL viewport/window env clear plus the Processed8 route gate and its summary fields) is three
     # regions in every cpu job (the env-clear edit, the route-gate edit, the summary-field edit); a cuda job carries none, and no baseline commit carries any.
     CPU_GL_ENV_CLEAR_OPEN = "PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 >>>"
@@ -592,6 +597,7 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                     "hfr-conform-oracles": (cls.HFR_CONFORM_OPEN, cls.HFR_CONFORM_CLOSE),
                     "hfr-10s-floor": (cls.HFR_10S_OPEN, cls.HFR_10S_CLOSE),
                     "heavy-frame-log": (cls.HEAVY_FRAME_LOG_OPEN, cls.HEAVY_FRAME_LOG_CLOSE),
+                    "present-trace-off": (cls.PRESENT_TRACE_OFF_OPEN, cls.PRESENT_TRACE_OFF_CLOSE),
                     "cpu-gl-env-clear": (cls.CPU_GL_ENV_CLEAR_OPEN, cls.CPU_GL_ENV_CLEAR_CLOSE),
                     "pm-internal-gap": (cls.PM_INTERNAL_GAP_OPEN, cls.PM_INTERNAL_GAP_CLOSE),
                     "session-anchor": (cls.SESSION_ANCHOR_OPEN, cls.SESSION_ANCHOR_CLOSE),
@@ -649,6 +655,7 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(old_counts["hfr-10s-floor"], 0, "the baseline predates the owner's HFR 10 s amendment")
         self.assertEqual(new_counts["heavy-frame-log"], self.HEAVY_FRAME_LOG_REGIONS, "the default (HEAVY) job carries exactly the pinned number of bracketed HEAVY-FRAME-LOG-1 regions")
         self.assertEqual(old_counts["heavy-frame-log"], 0, "the baseline predates the HEAVY frame-log opt-out")
+        self.assertEqual((new_counts["present-trace-off"], old_counts["present-trace-off"]), (self.PRESENT_TRACE_OFF_REGIONS, 0), "the default (no -PresentTrace) job carries exactly the pinned number of bracketed PRESENT-TRACE-OFF-ARM-1 regions; the baseline predates them")
         self.assertEqual((new_counts["cpu-gl-env-clear"], old_counts["cpu-gl-env-clear"]), (0, 0), "a cuda job carries no cpu GL-viewport env-clear region, and neither does the baseline")
         self.assertEqual((new_counts["pm-internal-gap"], old_counts["pm-internal-gap"]), (self.PM_INTERNAL_GAP_REGIONS, 0), "the default job carries exactly the pinned number of bracketed PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 regions; the baseline predates them")
         self.assertEqual((new_counts["session-anchor"], old_counts["session-anchor"]), (self.SESSION_ANCHOR_REGIONS, 0), "the default job carries exactly the pinned number of bracketed SESSION-ANCHOR-1 regions; the baseline predates them")
@@ -894,13 +901,16 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         """PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: -PresentTrace adds MLVAPP_PLAYBACK_PRESENT_TRACE=1 to the app's env list; absent, the job is
         the text it was. The runner maps a leg's generatorArgs.presentTrace true for any leg."""
         plain = self.generate(GENERATOR, "pt-plain.job.ps1", []).read_text(encoding="utf-8").replace("\r\n", "\n")
-        self.assertNotIn("MLVAPP_PLAYBACK_PRESENT_TRACE", plain)
+        # r10 (sol r9 A2), forced companion: the plain job no longer names no flag; it names the OFF value in its one bracketed PRESENT-TRACE-OFF-ARM-1 region
+        self.assertNotIn("MLVAPP_PLAYBACK_PRESENT_TRACE=1", plain)
+        off_region = "    # PRESENT-TRACE-OFF-ARM-1 >>>\n    'MLVAPP_PLAYBACK_PRESENT_TRACE=0',\n    # PRESENT-TRACE-OFF-ARM-1 <<<\n"
+        self.assertEqual(plain.count(off_region), 1)
         job = self.generate(GENERATOR, "pt-on.job.ps1", ["-PresentTrace"])
         self.assertEqual(self.parse_errors(job), 0)
         text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
         line = "    'MLVAPP_PLAYBACK_PRESENT_TRACE=1',\n"
         self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, text)
-        self.assertEqual(text.replace(line, ""), plain, "the flag is the only difference from the plain job")
+        self.assertEqual(text.replace(line, ""), plain.replace(off_region, ""), "the flag (ON: '=1', OFF: the '=0' region) is the only difference from the plain job")
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
         mapping = "if ($spec.generatorArgs.PSObject.Properties['presentTrace'] -and [bool]$spec.generatorArgs.presentTrace) { $gen['PresentTrace'] = $true }"
         self.assertIn(mapping, runner)
@@ -915,7 +925,7 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
             plain = self.generate(GENERATOR, f"pt0-{name}.job.ps1", extra).read_text(encoding="utf-8").replace("\r\n", "\n")
             self.assertEqual(plain.count("'MLVAPP_PLAYBACK_PRESENT_TRACE=0',\n"), 1, name)
             self.assertNotIn("'MLVAPP_PLAYBACK_PRESENT_TRACE=1',", plain, name)
-            self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n    # PRESENT-TRACE-OFF-ARM-1 >>>\n", plain, name)
+            self.assertIn("    # PRESENT-TRACE-OFF-ARM-1 >>>\n    'MLVAPP_PLAYBACK_PRESENT_TRACE=0',\n    # PRESENT-TRACE-OFF-ARM-1 <<<\n    'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n", plain, name)
             self.assertEqual(self.strip_regions(plain)[1]["present-trace-off"], 1, name)
             on = self.generate(GENERATOR, f"pt1-{name}.job.ps1", [*extra, "-PresentTrace"]).read_text(encoding="utf-8").replace("\r\n", "\n")
             self.assertEqual(on.count("'MLVAPP_PLAYBACK_PRESENT_TRACE=1',\n"), 1, name)
@@ -9216,6 +9226,9 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 # PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1 r2's region: in the new job only (the base predates the HEAVY frame-log opt-out).
                 self.assertEqual((new_counts.pop("heavy-frame-log"), old_counts.pop("heavy-frame-log")),
                                  (GeneratorByteIdentityAndVariantTests.HEAVY_FRAME_LOG_REGIONS, 0), name)
+                # PLAYBACK-TRACE-LOWOVERHEAD-1 r10's OFF-arm region: in every new job without -PresentTrace (cuda and cpu), never in the base.
+                self.assertEqual((new_counts.pop("present-trace-off"), old_counts.pop("present-trace-off")),
+                                 (GeneratorByteIdentityAndVariantTests.PRESENT_TRACE_OFF_REGIONS, 0), name)
                 # PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1 r6: the r5 cpu block is in every cpu job (its three bracketed regions) and in no cuda job; the base predates it.
                 self.assertEqual((new_counts.pop("cpu-gl-env-clear"), old_counts.pop("cpu-gl-env-clear")),
                                  (GeneratorByteIdentityAndVariantTests.CPU_GL_ENV_CLEAR_REGIONS if name.startswith("cpu") else 0, 0), name)

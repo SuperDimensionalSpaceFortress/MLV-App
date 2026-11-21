@@ -37,13 +37,15 @@ constexpr double kUnknownMs = -1.0e9;
  *  thread's mutex, so the fields need no atomics and no lock of their own. Nothing here allocates or formats. */
 struct StageStamps
 {
-    double requestS = 0.0;      // the frame was requested
-    double decodeQueueS = 0.0;  // queued for the decode worker
+    // r10 (sol r9 A1, INV-1 "stage timestamps name the sampled event"): requestS, decodeQueueS and renderStartS say which sample they hold. The clock reads are
+    // where they always were; only the statement of the point each one is taken at changed.
+    double requestS = 0.0;      // the request: sampled in renderFrame after the m_mutex wait (the request's own clock value, RenderRequest::requestStageTime)
+    double decodeQueueS = 0.0;  // the decode-queue function-entry sample: taken on entry to queueDecodeRequestLocked, BEFORE the slot is set up (not the enqueue instant)
     double decodeStartS = 0.0;  // decode worker began
     double decodeEndS = 0.0;    // decode worker finished
     double reconStartS = 0.0;   // recon worker began
     double reconEndS = 0.0;     // recon worker finished
-    double renderStartS = 0.0;  // render thread began this frame
+    double renderStartS = 0.0;  // render_start, after drawFrame's prologue: the value HEAVY logs as render_thread_start_stage_time (ready - rnd == render)
     double drawBeginS = 0.0;    // the GUI thread began drawing it (drawFrameReady's display start)
     // r3 (adversary 81c5805c A1/A2, HUB RULING 2026-11-20T11:30Z): the LIGHT trace carries STAMPS only. A per-frame configure or
     // H2D span would come from the backend's last-run preupload status, whose lifetime is wrong at the source (a stale value
@@ -107,13 +109,13 @@ struct Row
     int audioSyncs = 0;           // audio re-syncs applied since the previous present
     // PLAYBACK-TRACE-LOWOVERHEAD-1 r1: this frame's stage stamps (ms since the Play's start; kUnknownMs when not taken).
     // readyMs, presentMs and prevEndMs above complete the chain request .. present.
-    double reqMs = kUnknownMs;        // requested
-    double dqMs = kUnknownMs;         // queued for decode
+    double reqMs = kUnknownMs;        // request: sampled after the m_mutex wait in renderFrame
+    double dqMs = kUnknownMs;         // the decode-queue function-entry sample (queueDecodeRequestLocked entry, before the slot is set up)
     double dsMs = kUnknownMs;         // decode began
     double deMs = kUnknownMs;         // decode ended
     double rsMs = kUnknownMs;         // recon began
     double reMs = kUnknownMs;         // recon ended
-    double rndMs = kUnknownMs;        // render thread began
+    double rndMs = kUnknownMs;        // render_start, after drawFrame's prologue (HEAVY's render_thread_start_stage_time; ready - rnd == render)
     double drawBeginMs = kUnknownMs;  // GUI draw began
 
     /*! Which of the ten chain stamps (request .. present, bit i = chain position i) this row KNOWS. Set in ONE place,

@@ -1109,6 +1109,15 @@ if ($outcome -in @('PASS', 'FAIL') -and $unpacedVerdict.blocks) {
     $detail = "INVALID: the job result was $outcome ($detail) but UNPACED_NOT_HONOURED: $($unpacedVerdict.reason). A paced run is no throughput measurement"
     $outcome = 'INVALID'
 }
+# PLAYBACK-TRACE-LOWOVERHEAD-1 r10 (sol r9 A2), FAIL CLOSED: the overhead gate pairs a trace-OFF leg with a trace-ON leg, so an OFF leg whose run log holds ANY
+# playback_smoke.present_trace record (an inherited MLVAPP_PLAYBACK_PRESENT_TRACE reached it) and an ON leg with no row for the measured session are not arms of the pair:
+# a typed INVALID with the named reason, never a PASS or FAIL. Test-DvReceiptValid re-derives it from the hashed run log.
+$presentTraceVerdict = Get-DvPresentTraceEvidence -Spec $spec -LogText $runLogText
+if ($presentTraceVerdict.requested -or $presentTraceVerdict.blocks) { $receipt['presentTrace'] = [ordered]@{ requested = $presentTraceVerdict.requested; rows = $presentTraceVerdict.rows; measuredRows = $presentTraceVerdict.measuredRows; verdict = $presentTraceVerdict.verdict } }
+if ($outcome -in @('PASS', 'FAIL') -and $presentTraceVerdict.blocks) {
+    $detail = "INVALID: the job result was $outcome ($detail) but PRESENT_TRACE_NOT_HONOURED: $($presentTraceVerdict.reason). A leg whose trace state is not the one it names is no arm of the overhead pair"
+    $outcome = 'INVALID'
+}
 # VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1, FAIL CLOSED: a leg that asks for a worker-thread cap of n counts only when the measured session's own worker count and the
 # job's proof fields all say n; a mismatch or an unreadable count is a typed INVALID, never a PASS or FAIL. A leg that does not ask for it is INVALID only under an inherited thread-count variable.
 $workerThreadsVerdict = Get-DvWorkerThreadsEvidence -Spec $spec -LogText $runLogText -Summary $summary
