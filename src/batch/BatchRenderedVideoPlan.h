@@ -1564,9 +1564,23 @@ batchRenderedVideoFfmpegBinaryPlanFromCurrentEnvironment(
     const QString & requestedExecutable = QString())
 ;
 
-/* Preflight: a PATH hit, or a resolvedExecutable that still exists. */
+/* Preflight: a PATH hit, or a resolvedExecutable that is (still) a regular file. */
 bool batchRenderedVideoFfmpegBinaryPlanUsableAtPreflight(
     const BatchRenderedVideoFfmpegBinaryPlan & plan)
+;
+
+/* Where the lookup actually searched: "app-dir", "app-dir,PATH" or "PATH". */
+QString batchRenderedVideoFfmpegBinaryPlanSearchedLocations(
+    const BatchRenderedVideoFfmpegBinaryPlan & plan)
+;
+
+/* The optional ffprobe used to enrich output verification: the probe plan's hit if it is
+ * still a non-empty file; for a stale app-dir hit, PATH (via resolver); then a non-empty
+ * ffprobe beside the resolved ffmpeg. Empty = not available. */
+QString batchRenderedVideoOptionalMediaProbeExecutable(
+    const BatchRenderedVideoMediaProbeBinaryPlan & probePlan,
+    const BatchRenderedVideoFfmpegBinaryPlan & ffmpegPlan,
+    const BatchRenderedVideoExecutableResolver & resolver)
 ;
 
 BatchRenderedVideoMediaProbeBinaryPlan

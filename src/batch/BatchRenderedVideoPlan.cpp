@@ -3739,7 +3739,60 @@ bool batchRenderedVideoFfmpegBinaryPlanUsableAtPreflight(
     /* A PATH hit is trusted as before. Anything else -- an app-dir hit, an explicit path, a
      * name nothing resolved -- must still exist when preflight runs, so a selection that
      * vanished after the lookup is a usage error (exit 2), never a failed spawn (A4). */
-    return plan.foundOnPath || QFileInfo::exists(plan.resolvedExecutable);
+    return plan.foundOnPath || QFileInfo(plan.resolvedExecutable).isFile();
+}
+
+QString batchRenderedVideoFfmpegBinaryPlanSearchedLocations(
+    const BatchRenderedVideoFfmpegBinaryPlan & plan)
+{
+    if( plan.appDirSearchAttempted && !plan.pathSearchAttempted )
+        return QStringLiteral("app-dir");
+    if( plan.appDirSearchAttempted )
+        return QStringLiteral("app-dir,PATH");
+    return QStringLiteral("PATH");
+}
+
+namespace
+{
+bool batchRenderedVideoUsableProbeFile(const QString & path)
+{
+    if( path.isEmpty() )
+        return false;
+    const QFileInfo info(path);
+    return info.isFile() && info.size() > 0;
+}
+} /* anonymous namespace */
+
+QString batchRenderedVideoOptionalMediaProbeExecutable(
+    const BatchRenderedVideoMediaProbeBinaryPlan & probePlan,
+    const BatchRenderedVideoFfmpegBinaryPlan & ffmpegPlan,
+    const BatchRenderedVideoExecutableResolver & resolver)
+{
+    /* 1. The plan's own hit, re-checked now: it may have vanished since the lookup. */
+    if( ( probePlan.foundInAppDir || probePlan.foundOnPath )
+     && batchRenderedVideoUsableProbeFile(probePlan.resolvedExecutable) )
+        return QDir::cleanPath(probePlan.resolvedExecutable);
+
+    /* 2. An app-dir hit short-circuited the PATH search: a stale one gets it now. */
+    if( probePlan.foundInAppDir && resolver )
+    {
+        const QString pathHit = resolver(probePlan.requestedExecutable, QStringList());
+        if( batchRenderedVideoUsableProbeFile(pathHit) )
+            return QDir::cleanPath(pathHit);
+    }
+
+    /* 3. Beside the resolved ffmpeg (the two ship together in standard distributions). An
+     * empty placeholder is not a probe. */
+    const QString siblingDir = QFileInfo(ffmpegPlan.resolvedExecutable).absolutePath();
+    if( siblingDir.isEmpty() )
+        return QString();
+    for( const QString & candidate : QStringList{ siblingDir + QStringLiteral("/ffprobe.exe"),
+                                                  siblingDir + QStringLiteral("/ffprobe") } )
+    {
+        if( batchRenderedVideoUsableProbeFile(candidate) )
+            return QDir::cleanPath(QFileInfo(candidate).absoluteFilePath());
+    }
+    return QString();
 }
 
 BatchRenderedVideoMediaProbeBinaryPlan
