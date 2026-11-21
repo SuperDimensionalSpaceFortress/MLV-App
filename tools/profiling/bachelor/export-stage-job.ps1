@@ -47,6 +47,13 @@ param(
     # r8 (adversary r7 A3): resolve the clip and print the job's time budget (or throw its typed DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED refusal), then stop: no receipt, build,
     # git or output file is read. The lease batch calls this BEFORE any claim or lease, so a window the agent would refuse is refused where no lease is spent on it.
     [switch]$PreflightBudgetOnly,
+    # EXPORT-DEBAYER-QUALITY-1: the leg spec's export.quality as compact JSON (Invoke-VenueLeg passes it; empty = no quality pass). Prores only.
+    [string]$QualityJson = '',
+    # adversary r1 A1: with -PreflightBudgetOnly or -DescribeTimeBudgetBytes, judge the budget WITH the quality pass (the lease batch passes it for a leg whose spec carries
+    # export.quality). A generation run needs no switch: a -QualityJson adds the same term.
+    [switch]$QualityBudget,
+    # test seam (adversary r1 pass 2 A4): print the <debayer> / <cutIn> a quality leg would bake from this receipt (or throw the typed refusal), then stop
+    [string]$DescribeQualityReceiptPath = '',
     [string]$OutFile,
     [string]$RepoRoot = '',
     [string]$VenueTablePath = ''
@@ -57,6 +64,10 @@ $PlaybackGenerator = Join-Path $PSScriptRoot 'playback-attr-3-cuda-job.ps1'
 $LengthGatePath = Join-Path $PSScriptRoot '..\gui-smoke-length-gate.ps1'
 $ArtifactsModule = Join-Path $PSScriptRoot 'AttrCudaArtifacts.psm1'
 $OwnerFootageModule = Join-Path $PSScriptRoot 'AttrCudaOwnerFootage.psm1'
+# EXPORT-DEBAYER-QUALITY-1: the venue-side metric script, embedded inline (base64) with its sha256 baked at generation
+$QualityScriptPath = Join-Path $PSScriptRoot '..\dual-venue\debayer_quality.py'
+# the metric's wait inside the job (baked into the template as __QUALITY_METRIC_TIMEOUT_SEC__) and the time budget's quality term read this ONE value
+$QualityMetricTimeoutSec = 1800
 # The job-side conventions the playback job template defines, extracted from that template (never re-typed here).
 $SharedTemplateFunctions = @('Assert-UnderMlvTmp', 'Save-Json', 'Write-JobTrace', 'Get-Sha', 'Get-Mean')
 # The AttrCuda helpers the job calls directly; their callees are added by closure below.
@@ -90,6 +101,15 @@ $PlaySeconds = __PLAY_SECONDS__
 $ExportTimeoutSec = __EXPORT_TIMEOUT_SEC__
 $DeclaredVenue = '__DECLARED_VENUE__'
 $cpuThresholdPercent = __CPU_QUIESCENCE_THRESHOLD_PERCENT__
+# EXPORT-DEBAYER-QUALITY-1: the leg's export.quality (compact JSON; empty = no quality pass) and the metric script, carried inline with its baked sha256
+$QualityJson = '__QUALITY_JSON__'
+$QualityScriptBase64 = '__QUALITY_SCRIPT_BASE64__'
+$QualityScriptSha256 = '__QUALITY_SCRIPT_SHA256__'
+$QualityRunFrames = 24
+$QualityMetricTimeoutSec = __QUALITY_METRIC_TIMEOUT_SEC__
+$QualityPythonProbeTimeoutSec = 30
+$QualityReceiptDebayer = __QUALITY_RECEIPT_DEBAYER__
+$QualityCutIn = __QUALITY_CUT_IN__
 $Root = '__AGENT_ROOT__'
 $Cache = Join-Path $Root 'cache'
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -146,6 +166,137 @@ function Remove-ExportOutput {
     # journalled fresh root (New-AttrCudaOwnedRoot), so the delete is by proof (Remove-AttrCudaTree), never a recursive pathname delete.
     $sweep = Remove-AttrCudaTree -TrustedRoot '__SCRATCH_ROOT__' -Path $outDir -OwnedJournal $OwnerJournal
     [bool]($sweep.TreeRemoved -and @($sweep.Left).Count -eq 0)
+}
+
+# EXPORT-DEBAYER-QUALITY-1: the quality pass's capture and output dirs are journalled fresh roots too, deleted by the same proof (never a pathname delete).
+$qualityCaptureDir = $null
+$qualityOutDir = $null
+function Remove-QualityCapture {
+    $ok = $true
+    foreach ($d in @($script:qualityCaptureDir, $script:qualityOutDir)) {
+        if ([string]::IsNullOrEmpty($d)) { continue }
+        $sweep = Remove-AttrCudaTree -TrustedRoot '__SCRATCH_ROOT__' -Path $d -OwnedJournal $OwnerJournal
+        if (-not ($sweep.TreeRemoved -and @($sweep.Left).Count -eq 0)) { $ok = $false }
+    }
+    $ok
+}
+
+function Get-QualityBytesSha256([byte[]]$Bytes) {
+    $h = [System.Security.Cryptography.SHA256]::Create()
+    try { ([BitConverter]::ToString($h.ComputeHash($Bytes)) -replace '-', '').ToLowerInvariant() } finally { $h.Dispose() }
+}
+
+function Remove-QualityPythonEnvironment([Diagnostics.ProcessStartInfo]$Psi) {
+    # no PYTHON* variable of the venue's reaches the probe or the metric (-I already ignores them; this also covers PYTHONHOME and the launcher's PY_PYTHON*)
+    foreach ($k in @($Psi.Environment.Keys | Where-Object { $_ -like 'PYTHON*' -or $_ -like 'PY_PYTHON*' })) { [void]$Psi.Environment.Remove($k) }
+}
+
+function Find-QualityPython {
+    # adversary r1 pass 2 A6: the playback generator's resolver runs `python.exe -c` with no bound and no isolation, so a venue's sitecustomize or PYTHONPATH could hold
+    # the job past its budget before the summary went out. Each candidate is probed -I, scrubbed of PYTHON*, under $QualityPythonProbeTimeoutSec, killed with its tree at
+    # the bound; two candidates fit the quality term's 120 s margin. $null when neither answers 3.
+    $cands = @()
+    $python = Get-Command python.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $python) { $cands += [pscustomobject]@{ Exe = $python.Source; PrefixArgs = @() } }
+    $launcher = Get-Command py.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $launcher) { $cands += [pscustomobject]@{ Exe = $launcher.Source; PrefixArgs = @('-3') } }
+    foreach ($c in $cands) {
+        $probeArgs = @($c.PrefixArgs) + @('-I', '-c', 'import sys; print(sys.version_info[0])')
+        $psi = [Diagnostics.ProcessStartInfo]::new($c.Exe, (($probeArgs | ForEach-Object { ConvertTo-AttrCudaQuotedProcessArgument ([string]$_) }) -join ' '))
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.WorkingDirectory = $Work
+        Remove-QualityPythonEnvironment $psi
+        try { $p = [Diagnostics.Process]::Start($psi) } catch { continue }
+        $out = $p.StandardOutput.ReadToEndAsync(); [void]$p.StandardError.ReadToEndAsync()
+        if (-not $p.WaitForExit([int]($QualityPythonProbeTimeoutSec * 1000))) {
+            try { $p.Kill($true) } catch { }; [void]$p.WaitForExit(10000)
+            Write-JobTrace "step quality python probe timed out exe=$([IO.Path]::GetFileName($c.Exe))"
+            continue
+        }
+        if ($p.ExitCode -eq 0 -and ([string]$out.Result).Trim() -ceq '3') { return $c }
+    }
+    $null
+}
+
+function Invoke-ExportQualityPass {
+    # The UNTIMED quality pass: the timed run's argv with --max-frames 24 and the pipeline-stage capture on, then debayer_quality.py ON THE VENUE. Returns nothing;
+    # it fills $Record (result, pythonPresent, frames, appExitCode, wallSeconds, qualitySha256, detail). The timed run's result is never changed here.
+    param($Record, $Quality, [string]$ClipPath, [string]$ReceiptLocal, [string]$FfmpegPath, [string]$ExePath, [string]$PkgDir)
+    # 1. the metric script: decoded and verified against its baked sha256 BEFORE a byte of it is written or run
+    $scriptBytes = [Convert]::FromBase64String($QualityScriptBase64)
+    if ((Get-QualityBytesSha256 $scriptBytes) -cne $QualityScriptSha256) { $Record.result = 'EXPORT_QUALITY_SCRIPT_MISMATCH'; return }
+    # 2. Python 3 on the venue: python.exe, else the py launcher pinned to -3, each probe BOUNDED and isolated (Find-QualityPython); absent = VENUE_TOOLING (the timed
+    #    export result stands)
+    $py = Find-QualityPython
+    $Record.pythonPresent = ($null -ne $py)
+    if ($null -eq $py) { $Record.result = 'EXPORT_QUALITY_TOOLING_ABSENT'; return }
+    # 3. the absolute frame indices: the batch's own cut-in semantics (BatchRunner.cpp: cutIn 0 reads as 1; the render loop runs frameIndex = cutIn - 1 .. cutOut - 1, and the
+    #    capture hooks label each buffer with that zero-based frameIndex). ReceiptSettings defaults cutIn to 1, so a receipt with no <cutIn> starts at frame 0.
+    #    (adversary r1 pass 2 A4: the cut-in is read ONCE, by the generator, from the receipt bytes it verified, in their one canonical form, and baked here)
+    $cutIn = [int64]$QualityCutIn
+    if ($cutIn -eq 0) { $cutIn = 1 }
+    $frames = @($Quality.captureOffsets | ForEach-Object { [int64]$_ + $cutIn - 1 })
+    $Record.frames = $frames
+    $script:qualityCaptureDir = (New-AttrCudaOwnedRoot -TrustedRoot '__SCRATCH_ROOT__' -Path (Join-Path $Work 'quality-capture') -OwnedJournal $OwnerJournal).Path
+    $script:qualityOutDir = (New-AttrCudaOwnedRoot -TrustedRoot '__SCRATCH_ROOT__' -Path (Join-Path $Work 'quality-out') -OwnedJournal $OwnerJournal).Path
+    $qLog = Join-Path $Work 'quality-batch.log'
+    $qArgs = @('--batch', '-i', $ClipPath, '-o', $script:qualityOutDir, '-r', $ReceiptLocal, '--export-format', 'rendered', '--rendered-codec', 'prores', '--rendered-container', 'mov',
+               '--rendered-ffmpeg', $FfmpegPath, '--max-frames', [string]$QualityRunFrames, '--log', $qLog)
+    $qpsi = [Diagnostics.ProcessStartInfo]::new($ExePath, (($qArgs | ForEach-Object { ConvertTo-AttrCudaQuotedProcessArgument $_ }) -join ' '))
+    $qpsi.UseShellExecute = $false
+    $qpsi.CreateNoWindow = $true
+    $qpsi.WorkingDirectory = $PkgDir
+    foreach ($envKey in @($qpsi.Environment.Keys | Where-Object { $_ -like 'MLVAPP_*' })) { [void]$qpsi.Environment.Remove($envKey) }
+    $qpsi.Environment['QT_QPA_PLATFORM'] = 'windows'
+    $qpsi.Environment['QT_QPA_PLATFORM_PLUGIN_PATH'] = (Join-Path $PkgDir 'platforms')
+    $qpsi.Environment['QT_PLUGIN_PATH'] = $PkgDir
+    # the capture variables are set HERE ONLY: the timed run above never sees them
+    $qpsi.Environment['MLVAPP_PIPELINE_CAPTURE_DIR'] = $script:qualityCaptureDir
+    $qpsi.Environment['MLVAPP_PIPELINE_CAPTURE_LABEL'] = 'q'
+    $qpsi.Environment['MLVAPP_PIPELINE_CAPTURE_FRAMES'] = ($frames -join ',')
+    Write-JobTrace "step quality-run start frames=$($frames -join ',')"
+    $qWatch = [Diagnostics.Stopwatch]::StartNew()
+    $qApp = [Diagnostics.Process]::Start($qpsi)
+    $qTimedOut = -not $qApp.WaitForExit([int]($ExportTimeoutSec * 1000))
+    if ($qTimedOut) { try { $qApp.Kill($true) } catch { try { $qApp.Kill() } catch { } }; [void]$qApp.WaitForExit(30000) }
+    $qWatch.Stop()
+    $Record.wallSeconds = [math]::Round($qWatch.Elapsed.TotalSeconds, 3)
+    $Record.appExitCode = if ($qTimedOut) { $null } else { $qApp.ExitCode }
+    Write-JobTrace "step quality-run done timedOut=$qTimedOut exit=$($Record.appExitCode)"
+    if ($qTimedOut -or $qApp.ExitCode -ne 0) { $Record.result = 'EXPORT_QUALITY_RUN_FAILED'; $Record.detail = $(if ($qTimedOut) { 'the quality run timed out' } else { "the quality run exited $($qApp.ExitCode)" }); return }
+    # 4. the metric, on the venue. The script is written into the job's work dir, re-verified on disk, then run with -I (isolated: no script-dir or cwd imports).
+    $scriptLocal = Join-Path $Work 'debayer_quality.py'
+    [void](Publish-AttrCudaBytes -Path $scriptLocal -Bytes $scriptBytes -OwnedJournal $OwnerJournal)
+    if ((Get-QualityBytesSha256 ([IO.File]::ReadAllBytes($scriptLocal))) -cne $QualityScriptSha256) { $Record.result = 'EXPORT_QUALITY_SCRIPT_MISMATCH'; return }
+    $qualityLocal = Join-Path $Work 'quality.json'
+    $mArgs = @($py.PrefixArgs) + @('-I', $scriptLocal, 'measure', '--capture-dir', $script:qualityCaptureDir, '--label', 'q', '--frames', ($frames -join ','),
+              '--offsets', (@($Quality.captureOffsets) -join ','), '--stages', (@($Quality.stages) -join ','), '--tile-size', [string]$Quality.tileSize,
+              '--tiles-per-class', [string]$Quality.tilesPerClass, '--clip', $ClipPath, '--receipt-debayer', [string]$Record.receiptDebayer, '--out', $qualityLocal)
+    $mpsi = [Diagnostics.ProcessStartInfo]::new($py.Exe, (($mArgs | ForEach-Object { ConvertTo-AttrCudaQuotedProcessArgument ([string]$_) }) -join ' '))
+    $mpsi.UseShellExecute = $false
+    $mpsi.CreateNoWindow = $true
+    $mpsi.RedirectStandardOutput = $true
+    $mpsi.WorkingDirectory = $Work
+    Remove-QualityPythonEnvironment $mpsi
+    $mApp = [Diagnostics.Process]::Start($mpsi)
+    $mOutTask = $mApp.StandardOutput.ReadToEndAsync()
+    $mTimedOut = -not $mApp.WaitForExit([int]($QualityMetricTimeoutSec * 1000))
+    if ($mTimedOut) { try { $mApp.Kill($true) } catch { }; [void]$mApp.WaitForExit(30000); $Record.result = 'EXPORT_QUALITY_METRIC_FAILED'; $Record.detail = 'the metric timed out'; return }
+    $mOut = [string]$mOutTask.Result
+    $token = [regex]::Match($mOut, '(?m)^QUALITY_RESULT=([A-Z0-9_]+)\r?$')
+    $tok = if ($token.Success) { $token.Groups[1].Value } else { 'EXPORT_QUALITY_METRIC_FAILED' }
+    Write-JobTrace "step quality-metric done exit=$($mApp.ExitCode) result=$tok"
+    if ($tok -ceq 'QUALITY_CAPTURED' -and $mApp.ExitCode -eq 0 -and (Test-Path -LiteralPath $qualityLocal -PathType Leaf)) {
+        $qBytes = [IO.File]::ReadAllBytes($qualityLocal)
+        [void](Publish-AttrCudaBytes -Path (Join-Path $Pub 'quality.json') -Bytes $qBytes)
+        $Record.qualitySha256 = Get-QualityBytesSha256 $qBytes
+        $Record.result = 'QUALITY_CAPTURED'
+    } else {
+        $Record.result = $(if ($tok -cin @('EXPORT_QUALITY_CAPTURE_ABSENT', 'EXPORT_QUALITY_CLIP_PROBE_FAILED', 'EXPORT_QUALITY_TILES_SHORT')) { $tok } else { 'EXPORT_QUALITY_METRIC_FAILED' })
+    }
 }
 
 try {
@@ -383,17 +534,37 @@ try {
     # cost RESULT=EXPORT_KILL_UNCONFIRMED and exit 48. On that terminal the two records are best effort: the failure is traced, the typed RESULT line and the exit code still go out.
     # Any other terminal keeps the write fatal: a run that cannot publish its summary must not report a result it did not record.)
     $evidenceBestEffort = ($timedOut -and -not $killConfirmed)
+    # --- EXPORT-DEBAYER-QUALITY-1: the UNTIMED quality pass, AFTER the timed run is classified, published and its output deleted (so exportWallSeconds and stage-timing.log
+    # never carry a capture write). It runs only on a captured timed run; its own result never changes the timed RESULT. The captures and the quality run's .mov are
+    # deleted by proof whatever happened; captureDeleted=false makes the leg INVALID (EXPORT_CAPTURE_NOT_DELETED) in the runner.
+    $qualityRecord = $null
+    if (-not [string]::IsNullOrEmpty($QualityJson)) {
+        $quality = $QualityJson | ConvertFrom-Json
+        # (adversary r1 pass 2 A4: the receipt's debayer as the generator read it from the verified bytes, in the one canonical form the app reads the same way)
+        $qualityRecord = [ordered]@{ requested = $true; result = 'EXPORT_QUALITY_SKIPPED'; receiptDebayer = $QualityReceiptDebayer
+                                     captureOffsets = @($quality.captureOffsets); frames = @(); runFrames = $QualityRunFrames; appExitCode = $null; wallSeconds = $null; pythonPresent = $null
+                                     scriptSha256 = $QualityScriptSha256; qualitySha256 = $null; captureDeleted = $true; detail = $null }
+        if ($result -ceq 'EXPORT_CAPTURED' -and $null -ne $qualityRecord.receiptDebayer) {
+            try { Invoke-ExportQualityPass -Record $qualityRecord -Quality $quality -ClipPath $clipPath -ReceiptLocal $receiptLocal -FfmpegPath $ffmpegPath -ExePath $exePath -PkgDir $pkgDir }
+            catch { $qualityRecord.result = 'EXPORT_QUALITY_RUN_FAILED'; $qualityRecord.detail = "quality pass error=$([string]$_.CategoryInfo.Reason)"; Write-JobTrace "step quality error=$([string]$_.CategoryInfo.Reason)" }
+            $qualityRecord.captureDeleted = $(try { Remove-QualityCapture } catch { Write-JobTrace "quality capture delete error=$([string]$_.CategoryInfo.Reason)"; $false })
+        } elseif ($null -eq $qualityRecord.receiptDebayer) { $qualityRecord.detail = 'the carried receipt has no <debayer> value' }
+        Write-JobTrace "step quality done result=$($qualityRecord.result) captureDeleted=$($qualityRecord.captureDeleted)"
+    }
     try { Save-Json $manifest (Join-Path $Pub 'output-manifest.json') } catch { if (-not $evidenceBestEffort) { throw }; Write-JobTrace "step export manifest write error=$([string]$_.CategoryInfo.Reason)" }
     try {
-        Write-ExportSummary $result @{ appExitCode = $appExitCode; timedOut = $timedOut; killConfirmed = $killConfirmed;exportWallSeconds = [math]::Round($exportWatch.Elapsed.TotalSeconds, 3); exportTimeoutSec = $ExportTimeoutSec
+        $summaryExtra = @{ appExitCode = $appExitCode; timedOut = $timedOut; killConfirmed = $killConfirmed;exportWallSeconds = [math]::Round($exportWatch.Elapsed.TotalSeconds, 3); exportTimeoutSec = $ExportTimeoutSec
                                        framesExported = $exported; outputCount = $outputs.Count; outputsDeleted = $manifest.deleted; ffmpegPresent = $ffmpegPresent
                                        executableSha256 = $manifestHashes['exe']; cpuQuiescence = $quiescence; lengthGate = $lengthGateRecord; mlvappEnvScrubbed = @($mlvappEnvScrubbed) }
+        if ($null -ne $qualityRecord) { $summaryExtra['quality'] = $qualityRecord }
+        Write-ExportSummary $result $summaryExtra
     } catch { if (-not $evidenceBestEffort) { throw }; Write-JobTrace "step export summary write error=$([string]$_.CategoryInfo.Reason)" }
     Write-Output "RESULT=$result FRAMES=$exported ARTIFACTS=$Pub"
     exit $exitFor[$result]
 } finally {
     if ($OwnerClipDir) { Close-AttrCudaOwnerFootageWorkspace -Handles $ownerViewHandles -Views @($ownerViews) }
     try { [void](Remove-ExportOutput) } catch { Write-JobTrace "export output cleanup error=$([string]$_.CategoryInfo.Reason)" }
+    try { [void](Remove-QualityCapture) } catch { Write-JobTrace "quality capture cleanup error=$([string]$_.CategoryInfo.Reason)" }
     try { [void](Remove-AttrCudaTree -TrustedRoot '__SCRATCH_ROOT__' -Path $pkgRoot -OwnedJournal $OwnerJournal) } catch { Write-JobTrace "package cleanup error=$([string]$_.CategoryInfo.Reason)" }
 }
 '@
@@ -454,7 +625,9 @@ function Get-ExportJobTimeBudget {
     # ($UmRunMaxJobTimeoutSec); Invoke-VenueLeg adds $RunnerSubmitMarginSec to recommendedJobTimeoutSec before it submits. A window whose budget passes that is REFUSED
     # here with a typed reason, before any lease is spent -- never clamped, because an export cut short by a smaller wait is not the export that was asked for. The sums
     # are int64 so no out-of-range figure throws an untyped cast.
-    param([int64]$ClipBytes, [int]$Frames)
+    # EXPORT-DEBAYER-QUALITY-1 (adversary r1 A1): -Quality adds the quality pass (one more export wait of the same bound, which the job reuses, the metric's
+    # $QualityMetricTimeoutSec and a 120 s margin) BEFORE the cap check, so the preflight that refuses a window before a lease judges the same total the job submits.
+    param([int64]$ClipBytes, [int]$Frames, [switch]$Quality)
     $UmRunMaxJobTimeoutSec = [int64]86400
     $RunnerSubmitMarginSec = [int64]120
     Import-Module $ArtifactsModule -Force
@@ -464,21 +637,60 @@ function Get-ExportJobTimeBudget {
     $exportTimeoutSec = [int64]([Math]::Max(900, 4 * [int64]$Frames)) + $identityReadSec
     $quiescenceSec = [int64](3 * 12 + 30)
     $jobTimeoutSec = $identityReadSec + $quiescenceSec + $exportTimeoutSec + 600
+    $qualitySec = [int64]0
+    if ($Quality) { $qualitySec = $exportTimeoutSec + [int64]$QualityMetricTimeoutSec + 120; $jobTimeoutSec += $qualitySec }
     if ($jobTimeoutSec + $RunnerSubmitMarginSec -gt $UmRunMaxJobTimeoutSec) {
-        throw "DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED $Frames frames of a $ClipBytes-byte clip need a job timeout of $jobTimeoutSec s ($($jobTimeoutSec + $RunnerSubmitMarginSec) s submitted), past the agent's $UmRunMaxJobTimeoutSec s cap; export a shorter window"
+        throw "DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED $Frames frames of a $ClipBytes-byte clip need a job timeout of $jobTimeoutSec s ($($jobTimeoutSec + $RunnerSubmitMarginSec) s submitted$(if ($Quality) { ", $qualitySec s of it the quality pass" })), past the agent's $UmRunMaxJobTimeoutSec s cap; export a shorter window"
     }
-    [pscustomobject]@{ identityReadSec = [int]$identityReadSec; exportTimeoutSec = [int]$exportTimeoutSec; quiescenceSec = [int]$quiescenceSec; jobTimeoutSec = [int]$jobTimeoutSec }
+    [pscustomobject]@{ identityReadSec = [int]$identityReadSec; exportTimeoutSec = [int]$exportTimeoutSec; quiescenceSec = [int]$quiescenceSec; qualitySec = [int]$qualitySec; jobTimeoutSec = [int]$jobTimeoutSec }
+}
+function Get-ExportQualityReceiptFields([byte[]]$ReceiptBytes) {
+    # adversary r1 pass 2 A4: the quality pass labels its debayer and places its capture frames from the receipt's <debayer> and <cutIn>. The app reads them with
+    # QXmlStreamReader + QString::toInt (ReceiptLoader.cpp:798-810), which skips comments, accepts a sign and lets a later element win; a regex over the text does none
+    # of that. So a quality leg's receipt must hold them in the ONE form both readings agree on: no comment, CDATA section or DOCTYPE/ENTITY declaration anywhere
+    # (any of them can hide or forge an element), exactly one <debayer>N</debayer> (N 0..8) and at most one <cutIn>N</cutIn> (N unsigned digits). Every start tag of
+    # either name must be that exact form, so an entity or character reference, a sign or whitespace inside the value is refused too (a `&lt;` elsewhere, e.g. in
+    # <transferFunction>, is ordinary XML and stays). Anything else is refused typed; nothing is guessed.
+    $t = [Text.Encoding]::UTF8.GetString($ReceiptBytes)
+    if ($t -match '<!--|<!\[CDATA\[|<!DOCTYPE|<!ENTITY') { throw 'DUAL_VENUE_EXPORT_QUALITY_INVALID the batch receipt carries a comment, CDATA section or DOCTYPE/ENTITY declaration, so its <debayer> and <cutIn> are not read one way; a quality leg needs the plain form' }
+    $dAll = [regex]::Matches($t, '<debayer[\s/>]'); $dVal = [regex]::Matches($t, '<debayer>([0-8])</debayer>')
+    if ($dAll.Count -ne 1 -or $dVal.Count -ne 1) { throw 'DUAL_VENUE_EXPORT_QUALITY_INVALID the batch receipt does not hold exactly one <debayer>N</debayer> (N 0..8)' }
+    $cAll = [regex]::Matches($t, '<cutIn[\s/>]'); $cVal = [regex]::Matches($t, '<cutIn>([0-9]{1,9})</cutIn>')
+    if ($cAll.Count -gt 1 -or $cAll.Count -ne $cVal.Count) { throw 'DUAL_VENUE_EXPORT_QUALITY_INVALID the batch receipt does not hold at most one <cutIn>N</cutIn> (N unsigned digits)' }
+    [pscustomobject]@{ debayer = [int]$dVal[0].Groups[1].Value; cutIn = $(if ($cVal.Count -eq 1) { [int64]$cVal[0].Groups[1].Value } else { [int64]1 }) }
+}
+if (-not [string]::IsNullOrEmpty($DescribeQualityReceiptPath)) {
+    return (Get-ExportQualityReceiptFields -ReceiptBytes ([IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $DescribeQualityReceiptPath).Path)))
 }
 if ($DescribeTimeBudgetBytes -ge 0) {
     if ($MaxFrames -lt 24) { throw 'DUAL_VENUE_EXPORT_ARG_MISSING -MaxFrames is required (24..100000)' }
-    return (Get-ExportJobTimeBudget -ClipBytes $DescribeTimeBudgetBytes -Frames $MaxFrames)
+    return (Get-ExportJobTimeBudget -ClipBytes $DescribeTimeBudgetBytes -Frames $MaxFrames -Quality:$QualityBudget)
 }
 
 $ast = Get-PlaybackGeneratorAst
 $sharedText = Get-SharedTemplateFunctionText -Ast $ast
 $embedding = Get-ExportEmbedding -SharedText $sharedText
+# (adversary r1 pass 2 A6: the job probes Python with its own bounded, isolated Find-QualityPython; the playback resolver's unbounded probe is not carried)
+$embeddedNames = @($embedding.names)
+$unresolvedNames = @($embedding.unresolved)
+$qualityScriptBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $QualityScriptPath).Path)
+$qualityScriptHasher = [System.Security.Cryptography.SHA256]::Create()
+try { $qualityScriptSha256 = ([BitConverter]::ToString($qualityScriptHasher.ComputeHash($qualityScriptBytes)) -replace '-', '').ToLowerInvariant() } finally { $qualityScriptHasher.Dispose() }
 if ($DescribeTemplate) {
-    return [pscustomobject]@{ template = $template; embedded = @($embedding.names); unresolved = @($embedding.unresolved); shared = $SharedTemplateFunctions; lengthGateEmbedded = $template.Contains('__LENGTH_GATE_BASE64__') }
+    return [pscustomobject]@{ template = $template; embedded = @($embeddedNames); unresolved = @($unresolvedNames); shared = $SharedTemplateFunctions; lengthGateEmbedded = $template.Contains('__LENGTH_GATE_BASE64__')
+                              qualityScriptSha256 = $qualityScriptSha256; pythonProbeBounded = $template.Contains('function Find-QualityPython') }
+}
+# EXPORT-DEBAYER-QUALITY-1: -QualityJson is the leg's export.quality (DualVenueRunner Get-DvExportQualityShapeRefusal refused every bad shape before this); refused again here,
+# typed, so a direct caller cannot emit a quality pass on a CDNG export or past the capture harness's 64 frames.
+$qualityObject = $null
+if (-not [string]::IsNullOrWhiteSpace($QualityJson)) {
+    # adversary r1 A5: case-insensitive, like the ValidateSet that admitted it and the job's own `$Format -eq 'prores'` (a -Format ProRes is a prores export)
+    if ($Format -ne 'prores') { throw 'DUAL_VENUE_EXPORT_QUALITY_INVALID -QualityJson is for a prores export only' }
+    try { $qualityObject = $QualityJson | ConvertFrom-Json -ErrorAction Stop } catch { throw 'DUAL_VENUE_EXPORT_QUALITY_INVALID -QualityJson does not parse' }
+    $qOffsets = @($qualityObject.captureOffsets)
+    if ($qOffsets.Count -lt 1 -or $qOffsets.Count -gt 64) { throw 'DUAL_VENUE_EXPORT_QUALITY_INVALID captureOffsets must hold 1 to 64 frames (more than 64 capture frames is refused)' }
+    foreach ($o in $qOffsets) { if (-not ($o -is [long] -or $o -is [int]) -or $o -lt 0 -or $o -gt 23) { throw 'DUAL_VENUE_EXPORT_QUALITY_INVALID captureOffsets entries must be 0..23 (the quality run exports 24 frames)' } }
+    $QualityJson = ($qualityObject | ConvertTo-Json -Compress -Depth 4)
 }
 
 # --- generation ------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -519,7 +731,7 @@ if ($PreflightBudgetOnly) {
     if ($MaxFrames -lt 24) { throw 'DUAL_VENUE_EXPORT_ARG_MISSING -MaxFrames is required (24..100000)' }
     $preflightBytes = [int64]0
     foreach ($p in $ownerParts) { $preflightBytes += [int64]$p.length }
-    return (Get-ExportJobTimeBudget -ClipBytes $preflightBytes -Frames $MaxFrames)   # the same function, the same refusal the generation below makes
+    return (Get-ExportJobTimeBudget -ClipBytes $preflightBytes -Frames $MaxFrames -Quality:($QualityBudget -or $null -ne $qualityObject))   # the same function, the same refusal the generation below makes
 }
 
 # r20 (adversary pass 24 A2): the batch receipt is read ONCE, here (after the preflight's return: r8 A3, that mode reads no receipt), before git or the job text; these bytes are
@@ -531,13 +743,17 @@ if (-not $PreflightBudgetOnly) {
     try { $receiptSha256 = ([BitConverter]::ToString($hasher.ComputeHash($receiptBytes)) -replace '-', '').ToLowerInvariant() } finally { $hasher.Dispose() }
     if ($receiptSha256 -cne $ExpectReceiptSha256) { throw "DUAL_VENUE_EXPORT_RECEIPT_CHANGED the batch receipt read from -ReceiptPath hashes to $receiptSha256, not the $ExpectReceiptSha256 the leg spec commits (export.receiptSha256); no job is written" }
 }
+# EXPORT-DEBAYER-QUALITY-1 (adversary r1 pass 2 A4): a quality leg's debayer label and cut-in, read once from these verified bytes and baked into the job
+$qualityReceipt = $null
+if ($null -ne $qualityObject -and -not $PreflightBudgetOnly) { $qualityReceipt = Get-ExportQualityReceiptFields -ReceiptBytes $receiptBytes }
 
 & git -C $RepoRoot cat-file -e "$SourceCommit^{commit}" 2>$null
 if ($LASTEXITCODE -ne 0) { throw 'DUAL_VENUE_EXPORT_SOURCE_COMMIT_UNKNOWN -SourceCommit is not a commit known to the local repo' }
 
 $clipBytes = [int64]0
 foreach ($p in $ownerParts) { $clipBytes += [int64]$p.length }
-$timeBudget = Get-ExportJobTimeBudget -ClipBytes $clipBytes -Frames $MaxFrames
+# EXPORT-DEBAYER-QUALITY-1 (adversary r1 A1): the quality pass's term (one more export wait, the metric's bound) is inside the budget, before its cap check
+$timeBudget = Get-ExportJobTimeBudget -ClipBytes $clipBytes -Frames $MaxFrames -Quality:($null -ne $qualityObject)
 $exportTimeoutSec = $timeBudget.exportTimeoutSec
 $jobTimeoutSec = $timeBudget.jobTimeoutSec
 
@@ -564,6 +780,12 @@ $tokens = [ordered]@{
     SCRATCH_ROOT = $scratchRoot
     EMBEDDED_FUNCTIONS = $embedding.text
     SHARED_FUNCTIONS = $sharedText
+    QUALITY_JSON = $(if ($null -ne $qualityObject) { $QualityJson.Replace("'", "''") } else { '' })
+    QUALITY_SCRIPT_BASE64 = $(if ($null -ne $qualityObject) { [Convert]::ToBase64String($qualityScriptBytes) } else { '' })
+    QUALITY_SCRIPT_SHA256 = $(if ($null -ne $qualityObject) { $qualityScriptSha256 } else { '' })
+    QUALITY_METRIC_TIMEOUT_SEC = [string]$QualityMetricTimeoutSec
+    QUALITY_RECEIPT_DEBAYER = $(if ($null -ne $qualityReceipt) { [string]$qualityReceipt.debayer } else { '$null' })
+    QUALITY_CUT_IN = $(if ($null -ne $qualityReceipt) { [string]$qualityReceipt.cutIn } else { '1' })
 }
 # (one pass: a substituted value is never rescanned; the embedded and shared texts carry __SCRATCH_ROOT__ themselves, so they are expanded first)
 $tokens.EMBEDDED_FUNCTIONS = $embedding.text
@@ -603,5 +825,5 @@ $clipContentSha256 = if ($partShas.Count -eq 1) { $partShas[0] } else {
     exportTimeoutSec = $exportTimeoutSec
     recommendedJobTimeoutSec = $jobTimeoutSec
     smokeRunnerClosureDirName = $null
-    embedded = @($embedding.names)
+    embedded = @($embeddedNames)
 }
