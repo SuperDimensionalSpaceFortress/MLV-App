@@ -1268,7 +1268,7 @@ def derive_export_timer_windows(dng_text: str, llr_text: str) -> dict:
 
     The root is dng.c's one llrawproc entry call (apply_llrawproc_locked, dng.c:103). Reachability is the call graph over llrawproc.c's function definitions from that
     entry; integer literals the entry passes bind the callee's parameters, and an `if (<param>)` block whose parameter is bound to 0 is dead (dng.c -> applyLLRawProcObject ->
-    applyLLRawProcObjectWorker(..., NULL, 0), llrawproc.c:6411-6413, so the stop_before_dual_iso block at :5461-5472 never runs on export). An accrual site is a write of a timer
+    applyLLRawProcObjectWorker(..., NULL, 0), llrawproc.c:6649-6652, so the stop_before_dual_iso block at :5699-5710 never runs on export). An accrual site is a write of a timer
     global (or of the worker's local accumulator) from `(<now or end> - <start>)`; its window is <start's last assignment line>..<the accrual line>. A write of one timer from
     another (`g_shared += g_refine`) is a CONTAINS relation. Returns the reachable live function line spans, the windows per row, the contains relations, the call lines
     per function, and any accrual write the derivation could not read (each one is a failure: a site the guard cannot see is not a site it vouches for)."""
@@ -1360,7 +1360,7 @@ def derive_export_timer_windows(dng_text: str, llr_text: str) -> dict:
         ln = line_of(uw, m.start())
         if m.start() not in handled and live(ln) and not is_directive(ln):
             unread.append(f"llrawproc.c:{ln}: {m.group(1)} is used in a way this derivation cannot read: {uw_lines[ln - 1].strip()}")
-    # (a macro whose body names a timer -- the LLRP_LAST_RUN_TIMING X-macro, :7181 -- or names such a macro, writes the timers wherever it is EXPANDED: an expansion in
+    # (a macro whose body names a timer -- the LLRP_LAST_RUN_TIMING X-macro, :7419 -- or names such a macro, writes the timers wherever it is EXPANDED: an expansion in
     # export-reachable code is a write this derivation cannot read)
     defs = [(m.group(1), m.group(2)) for m in re.finditer(r"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)(.*)$", uw, re.M)]
     tainted = {n for n, body in defs if re.search(r"(?<![\w.>])(" + alt + r")(?!\w)", body)}
@@ -1556,8 +1556,8 @@ class CdngStageContainmentGateTests(unittest.TestCase):
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         self.assertEqual(table_vs_export_problems(got, derived), [])
         # (negative control: the base's pre_dualiso_fix row, and a scaled-path window on any row, are refused; adversary r1 A1: so is a row widened to the whole worker)
-        for name, extra, replace in (("llrawproc_pre_dualiso_fix", ["llrawproc.c:5221-5670", "llrawproc.c:6813-7283"], False),
-                                     ("llrawproc_dual_iso", ["llrawproc.c:7097-7161"], False), ("llrawproc_dual_iso", ["llrawproc.c:5221-6536"], True)):
+        for name, extra, replace in (("llrawproc_pre_dualiso_fix", ["llrawproc.c:5226-5675", "llrawproc.c:6818-7288"], False),
+                                     ("llrawproc_dual_iso", ["llrawproc.c:7102-7166"], False), ("llrawproc_dual_iso", ["llrawproc.c:5226-6541"], True)):
             with self.subTest(mutant=name, extra=extra):
                 mutant = json.loads(json.dumps(got))
                 for r in mutant:
@@ -1578,7 +1578,7 @@ class CdngStageContainmentGateTests(unittest.TestCase):
                 mutated = derive_export_timer_windows(dng, llr.replace(anchor, anchor + " " + spelling))
                 self.assertTrue(mutated["unread"] or "llrawproc_pre_dualiso_fix" in mutated["windows"], spelling)
         # (pass 2 A2: the worker's local accumulators too, by pointer and by a macro that names one; and an X-macro naming the timers expanded on the export path)
-        local_anchor = "double chroma_smooth_ms = 0.0;"   # (its FIRST occurrence is the worker's declaration, llrawproc.c:5063; the second is the scaled path's)
+        local_anchor = "double chroma_smooth_ms = 0.0;"   # (its FIRST occurrence is the worker's declaration, llrawproc.c:5301; the second is the scaled path's)
         self.assertLess(llr.index(local_anchor), llr.index("void applyLLRawProcObject(mlvObject_t"))
         for spelling in ("double *q = &dark_frame_ms; *q = 80.0;", "SET_TIMER(dual_iso_ms, 80.0);"):
             with self.subTest(local=spelling):
@@ -1600,7 +1600,7 @@ class CdngStageContainmentGateTests(unittest.TestCase):
         def row(t: list, name: str) -> dict:
             return next(r for r in t if r["name"] == name)
         mutants = {
-            "dual_iso across the refine lock": lambda t: row(t, "llrawproc_dual_iso").__setitem__("windows", ["llrawproc.c:5767-6426"]),
+            "dual_iso across the refine lock": lambda t: row(t, "llrawproc_dual_iso").__setitem__("windows", ["llrawproc.c:5772-6431"]),
             "pre_dualiso_fix parent": lambda t: row(t, "llrawproc_pre_dualiso_fix").__setitem__("parent", "unmeasured"),
             "extra contains": lambda t: row(t, "llrawproc_dual_iso").__setitem__("contains", ["llrawproc_publish_lock"]),
             "token window": lambda t: row(t, "llrawproc_dual_iso").__setitem__("windows", row(t, "llrawproc_dual_iso")["windows"] + ["dng.c#raw_read"]),
