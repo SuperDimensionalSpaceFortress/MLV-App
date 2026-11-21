@@ -98,8 +98,8 @@ typedef struct _ljp {
 #else
     u32* hufflut;
     int huffbits;
-    int huffmaxssss; // Largest SSSS (symbol value) in the table; gates the u64 pred-1 reader
 #endif
+    int huffmaxssss; // Largest SSSS (symbol value) in the table; gates the u64 pred-1 reader (both table layouts)
     // Parse state
     int cnt;
     u32 b;
@@ -207,6 +207,19 @@ static int parseHuff(ljp* self) {
     int symbols = 0;
     for (int level = 1; level <= 16; level++) symbols += bits[level];
     if (symbols > self->datalen - self->ix - 19) return ret;
+    /* LJ92-PRED1-FAST-PATH-1 r3: the u64 pred-1 reader refills once per sample to >= 32 bits, which covers a
+     * symbol only while code length (<= 16) + extra bits (SSSS <= 15; 16 carries none) fits. A table naming any
+     * larger SSSS stays on the legacy reader, whose behaviour there is undefined. The symbols are inside the
+     * payload (checked above). r2c (sol r1 S4): scanned here, above the table-build split, so a SLOW_HUFF build
+     * stamps the same max symbol for the getter (it was left at -1 there). */
+    {
+        const u8* const symbol_values = &self->data[self->ix + 19];
+        int maxssss = 0;
+        for (int sym = 0; sym < symbols; sym++) {
+            if (symbol_values[sym] > maxssss) maxssss = symbol_values[sym];
+        }
+        self->huffmaxssss = maxssss;
+    }
 #ifdef SLOW_HUFF
     u8* huffval = calloc(hufflen - 19,sizeof(u8));
     if (huffval == NULL) return LJ92_ERROR_NO_MEMORY;
@@ -341,15 +354,6 @@ static int parseHuff(ljp* self) {
      * from uninitialised memory; it can decode nothing, so it is refused. */
     if (maxbits == 0) return LJ92_ERROR_CORRUPT;
     self->huffbits = maxbits;
-    /* LJ92-PRED1-FAST-PATH-1 r3: the u64 pred-1 reader refills once per sample to >= 32 bits, which covers a
-     * symbol only while code length (<= 16) + extra bits (SSSS <= 15; 16 carries none) fits. A table naming any
-     * larger SSSS stays on the legacy reader, whose behaviour there is undefined. The symbols are inside the
-     * payload (checked above). */
-    int maxssss = 0;
-    for (int sym = 0; sym < symbols; sym++) {
-        if (huffvals[sym] > maxssss) maxssss = huffvals[sym];
-    }
-    self->huffmaxssss = maxssss;
     /* Now fill the lut */
     u32* hufflut = malloc((1<<maxbits) * sizeof(u32));
     if (hufflut == NULL) return LJ92_ERROR_NO_MEMORY;
@@ -677,6 +681,23 @@ static LJ92_ALWAYS_INLINE int lj92_pred1_nextdiff(const u8* data, int datalen, c
 #define LJ92_PRED1_HUFFBITS(self) ((self)->huffbits)
 #endif
 
+#ifndef SLOW_HUFF
+/* r2c (sol r1 S1): the legacy reader consumes the compressed input a byte at a time and the output is written behind
+ * it, so a caller that decodes into a buffer overlapping the compressed input (lj92_decode documents no such
+ * restriction) gets a defined result there. The u64 reader loads up to 8 bytes ahead of the byte it credits, so it reads
+ * bytes the output has already overwritten. An output range [image, image + writelen*2) that intersects the input range
+ * [data, data + datalen) therefore stays on the legacy reader. One test here covers both wrappers. */
+static int lj92_pred1_output_overlaps_input(const ljp* self)
+{
+    if (self->writelen <= 0 || self->datalen <= 0) return 0;
+    const uintptr_t out_lo = (uintptr_t)self->image;
+    const uintptr_t out_hi = out_lo + (uintptr_t)self->writelen * sizeof(u16);
+    const uintptr_t in_lo = (uintptr_t)self->data;
+    const uintptr_t in_hi = in_lo + (uintptr_t)self->datalen;
+    return out_lo < in_hi && in_lo < out_hi;
+}
+#endif
+
 static int lj92_pred1_u64_reader_eligible(const ljp* self)
 {
 #ifdef SLOW_HUFF
@@ -684,7 +705,7 @@ static int lj92_pred1_u64_reader_eligible(const ljp* self)
     return 0;
 #else
     return !g_lj92_force_legacy_pred1_reader && self->hufflut != NULL && self->huffbits >= 1 && self->huffbits <= 16
-        && self->huffmaxssss <= 16;
+        && self->huffmaxssss <= 16 && !lj92_pred1_output_overlaps_input(self);
 #endif
 }
 
@@ -838,7 +859,6 @@ static LJ92_ALWAYS_INLINE int parseScanPred1FastMeasuredImpl(ljp* self, const in
     if (diff_buffer == NULL) {
         return parseScanPred1Fast(self);
     }
-    g_lj92_last_pred1_u64_reader_active = use_u64;
 
     const double total_start = mlv_stage_timing_now();
     double bitstream_ms = 0.0;
@@ -882,8 +902,12 @@ static LJ92_ALWAYS_INLINE int parseScanPred1FastMeasuredImpl(ljp* self, const in
         out += row_stride;
     }
 
-    lj92_commit_last_pred1_fast_path_timing(1,
-                                            1,
+    /* r2c (sol r1 S4): the reader report is stamped after the loop, and only for a scan that decoded a sample. A
+     * 1x0 picture runs no reader; before, it reported the previous route. */
+    const int decoded_sample = row_stride > 0 && height > 0;
+    g_lj92_last_pred1_u64_reader_active = use_u64 && decoded_sample;
+    lj92_commit_last_pred1_fast_path_timing(decoded_sample,
+                                            decoded_sample,
                                             (mlv_stage_timing_now() - total_start) * 1000.0,
                                             bitstream_ms,
                                             predictor_ms);
@@ -914,7 +938,6 @@ static LJ92_ALWAYS_INLINE int parseScanPred1FastImpl(ljp* self, const int use_u6
     const int datalen = self->datalen;
     const u32* const hufflut = LJ92_PRED1_HUFFLUT(self);
     const int huffbits = LJ92_PRED1_HUFFBITS(self);
-    g_lj92_last_pred1_u64_reader_active = use_u64;
 
     const int width = self->x;
     const int height = self->y;
@@ -956,7 +979,10 @@ static LJ92_ALWAYS_INLINE int parseScanPred1FastImpl(ljp* self, const int use_u6
         out += row_stride;
     }
 
-    lj92_commit_last_pred1_fast_path_timing(1, 0, 0.0, 0.0, 0.0);
+    /* r2c (sol r1 S4): stamped after the loop, only for a scan that decoded a sample (see the measured twin). */
+    const int decoded_sample = row_stride > 0 && height > 0;
+    g_lj92_last_pred1_u64_reader_active = use_u64 && decoded_sample;
+    lj92_commit_last_pred1_fast_path_timing(decoded_sample, 0, 0.0, 0.0, 0.0);
     self->ix = ix;
     self->cnt = cnt;
     self->b = use_u64 ? (u32)acc : b; /* write-only after the scan */
@@ -1169,9 +1195,7 @@ static int parseScan(ljp* self) {
     g_lj92_last_linearize_active = self->linearize != NULL;
     g_lj92_last_component_count = self->components;
     g_lj92_last_predictor = pred;
-#ifndef SLOW_HUFF
     g_lj92_last_huff_max_ssss = self->huffmaxssss;
-#endif
     if (pred<0 || pred>7) return ret;
     g_lj92_last_pred1_fast_path_eligible =
         lj92_can_use_pred1_fast_path(self,
@@ -1434,8 +1458,10 @@ int lj92_decode(lj92 lj,
                 uint16_t* linearize,int linearizeLength) {
     int ret = LJ92_ERROR_NONE;
     ljp* self = lj;
-    if (self == NULL) return LJ92_ERROR_BAD_HANDLE;
+    /* r2c (sol r1 S4): every decode starts from a clean report, including one refused for its handle; before, a NULL
+     * handle left the previous decode's route standing for the getters. */
     lj92_reset_last_pred6_timing();
+    if (self == NULL) return LJ92_ERROR_BAD_HANDLE;
     self->image = target;
     self->writelen = writeLength;
     self->skiplen = skipLength;

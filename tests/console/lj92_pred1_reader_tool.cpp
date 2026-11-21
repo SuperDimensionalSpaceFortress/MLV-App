@@ -133,7 +133,7 @@ DecodeInfo decode_copy(const Bytes & stream, bool legacy)
 
 struct Counters
 {
-    int checks = 0, failures = 0;
+    int checks = 0, failures = 0, refusals = 0;
     void fail(const std::string & what)
     {
         failures++;
@@ -142,13 +142,21 @@ struct Counters
 };
 
 // Legacy and default reader must agree exactly; expect_u64 says whether the default decode must have taken the u64 reader.
-void compare_readers(Counters & c, const std::string & label, const Bytes & stream, int expect_u64, const std::vector<uint16_t> * expected = nullptr)
+// r2c (sol r1 S2): a case whose two readers both refuse to open compared nothing. It is a failure unless the caller says
+// the case may be refused (a truncated or corrupted stream); a permitted refusal is counted apart from the checks.
+void compare_readers(Counters & c, const std::string & label, const Bytes & stream, int expect_u64, const std::vector<uint16_t> * expected = nullptr, bool may_refuse = false)
 {
     const DecodeInfo legacy = decode_copy(stream, true);
     const DecodeInfo fresh = decode_copy(stream, false);
+    if (legacy.open_ret != fresh.open_ret) { c.checks++; c.fail(label + ": open differs"); return; }
+    if (legacy.open_ret != LJ92_ERROR_NONE)
+    {
+        if (may_refuse) { c.refusals++; return; }
+        c.checks++;
+        c.fail(label + ": both readers refuse to open a stream this case needs decoded, so nothing was compared");
+        return;
+    }
     c.checks++;
-    if (legacy.open_ret != fresh.open_ret) { c.fail(label + ": open differs"); return; }
-    if (legacy.open_ret != LJ92_ERROR_NONE) return;
     if (legacy.ret != fresh.ret) { c.fail(label + ": decode return differs"); return; }
     if (legacy.samples != fresh.samples) { c.fail(label + ": decoded samples differ"); return; }
     if (legacy.u64_active != 0) c.fail(label + ": forced-legacy decode reports the u64 reader");
