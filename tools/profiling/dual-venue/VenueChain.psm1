@@ -310,9 +310,11 @@ function Get-VenueTickets {
         foreach ($file in @(Get-ChildItem -LiteralPath $dir -Filter '*.ticket.json' -File -ErrorAction SilentlyContinue)) {
             $m = $script:TicketNameRx.Match($file.Name)
             if (-not $m.Success) { continue }
+            $keys = $null
+            try { $keys = @([decimal]$m.Groups[1].Value, [decimal]$m.Groups[2].Value, [decimal]$m.Groups[3].Value) } catch { continue }   # a name whose number is past any decimal is no ticket of ours (pass 2 A7): skipped, never a throw out of the census
             $f = Read-VenueClaimFile $file.FullName -ShareDelete
             if (-not $f.exists) { continue }
-            $row = [ordered]@{ name = $file.Name; path = $file.FullName; key = [decimal]$m.Groups[1].Value; pidKey = [decimal]$m.Groups[2].Value; startKey = [decimal]$m.Groups[3].Value; state = 'LIVE'; reason = $null; text = $f.text; ticket = $null; position = 0; ageSec = $null; heartbeatAgeSec = $null }
+            $row = [ordered]@{ name = $file.Name; path = $file.FullName; key = $keys[0]; pidKey = $keys[1]; startKey = $keys[2]; state = 'LIVE'; reason = $null; text = $f.text; ticket = $null; position = 0; ageSec = $null; heartbeatAgeSec = $null }
             if ($f.busy) { $row.state = 'BUSY' }
             else {
                 $t = $null
@@ -428,34 +430,34 @@ function Update-VenueTicket {
 }
 
 function Enter-VenueTicketLock {
-    # adversary A2: one machine-wide named mutex per ticket directory (the directory's full path, lower-cased and hashed), held only for a ticket's nonce-check-and-publish and for a ticket's removal. Returns the mutex
-    # once owned, or $null when it could not be taken in -TimeoutMs (the caller then answers BUSY and retries). A holder that died abandons it: the OS hands it to the next waiter. Global\ so lanes in
-    # different sessions share it; where Global\ cannot be created, Local\. Acquired and released inside one function call (a mutex is owned by a thread).
-    # r7 A4: keyed on the ticket file's directory as an ABSOLUTE path, resolved the way PowerShell resolves it (a relative or dot-dot ClaimDir, which the reaper's FileInfo.FullName spells absolutely, hashes the same).
+    # adversary A2: one lock per ticket directory, held only for a ticket's nonce-check-and-publish, for a ticket's removal and for the orphan-temp sweep. Returns the lock once owned, or $null when it could not be
+    # taken in -TimeoutMs (the caller then answers BUSY and retries).
+    # r7 A4 + pass 2 A3: the lock is an EXCLUSIVELY OPENED FILE (<ticket dir>\.ticket.lock, FileMode.OpenOrCreate, FileShare.None), never a name: the file system decides what is the same directory, so a relative, dot-dot or
+    # junction spelling of the claim folder all reach the one lock file (a named mutex keyed on the path's spelling did not). A holder that dies releases it with its process; the file is left in place and never listed
+    # (it is neither *.ticket.json nor a ticket temp). Works across sessions and over a shared claim folder. The directory must exist (a ticket is in it).
     param([Parameter(Mandatory)][string]$TicketPath, [int]$TimeoutMs = 1000)
     $dir = $null
     try { $dir = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($TicketPath))) } catch { $dir = $null }
-    if ([string]::IsNullOrEmpty($dir)) { $dir = [string]$TicketPath }
-    $key = [BitConverter]::ToString([Security.Cryptography.SHA1]::HashData([Text.Encoding]::UTF8.GetBytes($dir.TrimEnd('\').ToLowerInvariant()))).Replace('-', '')
-    $m = $null
-    foreach ($prefix in @('Global\', 'Local\')) { try { $m = [Threading.Mutex]::new($false, "${prefix}MLV-VenueTicket-$key"); break } catch { $m = $null } }
-    if ($null -eq $m) { return $null }
-    $owned = $false
-    try { $owned = $m.WaitOne($TimeoutMs) } catch [Threading.AbandonedMutexException] { $owned = $true } catch { $owned = $false }
-    if (-not $owned) { $m.Dispose(); return $null }
-    $m
+    if ([string]::IsNullOrEmpty($dir) -or -not (Test-Path -LiteralPath $dir -PathType Container)) { return $null }
+    $lockPath = Join-Path $dir '.ticket.lock'
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        try { return [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+        catch { if ($clock.Elapsed.TotalMilliseconds -ge $TimeoutMs) { return $null } }
+        Start-Sleep -Milliseconds 15
+    }
 }
 
 function Exit-VenueTicketLock($Lock) {
     if ($null -eq $Lock) { return }
-    try { $Lock.ReleaseMutex() } catch { $null = $_ }
-    $Lock.Dispose()
+    try { $Lock.Dispose() } catch { $null = $_ }
 }
 
 function Remove-VenueTicketFile {
     # adversary A2: the one way a ticket file is removed (the owner's Remove-VenueTicket and the reaper in Request-VenueClaim): under the ticket directory's lock, so a heartbeat between its nonce
     # check and its rename cannot bring the ticket back. Same answers as Remove-VenueClaimIfUnchanged (REMOVED | CHANGED | ABSENT | BUSY); BUSY also when the lock was not free in 1 s.
     param([Parameter(Mandatory)][string]$Path, [string]$ExpectedText = $null, [string]$ExpectedNonce = '')
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return 'ABSENT' }
     $lock = Enter-VenueTicketLock -TicketPath $Path -TimeoutMs 1000
     if ($null -eq $lock) { return 'BUSY' }
     try { Remove-VenueClaimIfUnchanged -Path $Path -ExpectedText $ExpectedText -ExpectedNonce $ExpectedNonce } finally { Exit-VenueTicketLock $lock }
@@ -587,6 +589,7 @@ function Request-VenueClaim {
         # from that stale snapshot is given back when the line NOW has an older ready ticket ahead of ours, so "ready first in line" holds when the claim frees. The older one asks again at its next poll.
         # r7 A3: the give-back is retried (a reader of the claim file refuses a release), and a claim that cannot be given back is KEPT as a grant (it still names this owner; a QUEUED answer would leak it).
         # r7 A12: a census that cannot be made (any throw) never costs a granted claim: the base returned the grant without one.
+        $grantClock = [Diagnostics.Stopwatch]::StartNew()
         try {
             $after = @(Get-VenueSettledLive -Venue $Venue -ClaimDir $ClaimDir -NowUtc $now -MyName $t.name)
             $headAfter = @(Select-VenueHead -Live $after -MyName $t.name)
@@ -603,6 +606,14 @@ function Request-VenueClaim {
                 }
             }
         } catch { $null = $_ }
+        # r7 pass 2 A2: the census above can take long (a slow claim folder) and a short claim can expire meanwhile and be replaced: a grant that is more than 2 s old is checked to still name this owner before it
+        # is handed over; one that does not is answered QUEUED with the holder's claim, never as a grant with an obsolete nonce.
+        if ($grantClock.Elapsed.TotalSeconds -gt 2.0) {
+            $own = $null; try { $own = Get-VenueClaim -Venue $Venue -ClaimDir $ClaimDir } catch { $own = $null }
+            if ($null -ne $own -and ($own.state -cne 'LIVE' -or [string]$own.claim.nonce -cne [string]$r.claim.nonce)) {
+                return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $own.claim; path = $r.path; broken = @($r.broken); ticket = $t; queue = $live; position = $position; staleTickets = @($removed); note = '' }
+            }
+        }
     }
     $r | Add-Member -NotePropertyName ticket -NotePropertyValue $t -PassThru | Add-Member -NotePropertyName queue -NotePropertyValue $live -PassThru |
         Add-Member -NotePropertyName position -NotePropertyValue $position -PassThru | Add-Member -NotePropertyName staleTickets -NotePropertyValue @($removed) -PassThru | Add-Member -NotePropertyName note -NotePropertyValue '' -PassThru

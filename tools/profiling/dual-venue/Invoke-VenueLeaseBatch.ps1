@@ -845,11 +845,27 @@ function Close-BatchTicket([string]$Why) {
         $r = Invoke-BatchTicketCall '[string](Remove-VenueTicket $a.t)' @{ t = $t }
         if ($r.answered) { [string]@($r.value)[-1] } else { "NO_ANSWER ($($r.error))" }
     } catch { "ERROR $($_.Exception.Message -replace '\s+', ' ')" }
-    # r7 A8: the reference is dropped only once the ticket is known gone (REMOVED, ABSENT) or no longer ours (CHANGED). BUSY (a reader held the file), no answer or an error keep it, so the end is tried again
-    # at the next batch's start (the top of the batch loop) and a ready ticket is not left standing in the line after the claim is released.
+    # r7 A8 / pass 2 A1: a ticket is known gone only on REMOVED, ABSENT (or CHANGED: no longer ours). BUSY (a reader held the file), no answer or an error leave it standing in the line, ready: it is put on
+    # $script:strandedTickets and its end is tried again at every later step (Invoke-StrandedTicketRetry: the top of the batch loop, each slice of a cooldown wait, each claim poll), so it is never discarded
+    # with the batch's reference and never queues the next batch behind its own earlier ticket.
     $kept = $res -cnotin @('REMOVED', 'ABSENT', 'CHANGED')
-    if (-not $kept) { $script:batchTicket = $null }
-    LogBest "TICKET_ENDED batch=$batchNo why=$Why result=$res$(if ($kept) { ' (kept: the end is tried again at the next batch)' })"
+    $script:batchTicket = $null
+    if ($kept) { $script:strandedTickets.Add($t) }
+    LogBest "TICKET_ENDED batch=$batchNo why=$Why result=$res$(if ($kept) { ' (not confirmed gone: tried again at every later step)' })"
+}
+
+$script:strandedTickets = [System.Collections.Generic.List[object]]::new()
+function Invoke-StrandedTicketRetry([string]$Why) {
+    # pass 2 A1: ends again each ticket whose end was not confirmed (Close-BatchTicket). Each call is the same bounded worker; started only with more than 6 s left before -DeadlineUtc (A5's rule). Best effort.
+    if ($script:strandedTickets.Count -eq 0) { return }
+    if (($deadline - [DateTime]::UtcNow).TotalSeconds -le 6.0) { return }
+    foreach ($st in @($script:strandedTickets)) {
+        $res = try {
+            $r = Invoke-BatchTicketCall '[string](Remove-VenueTicket $a.t)' @{ t = $st }
+            if ($r.answered) { [string]@($r.value)[-1] } else { "NO_ANSWER ($($r.error))" }
+        } catch { "ERROR $($_.Exception.Message -replace '\s+', ' ')" }
+        if ($res -cin @('REMOVED', 'ABSENT', 'CHANGED')) { [void]$script:strandedTickets.Remove($st); LogBest "TICKET_ENDED batch=$batchNo why=$Why result=$res (a ticket whose earlier end was not confirmed)" }
+    }
 }
 
 function Invoke-BatchTicketCall([string]$Body, [hashtable]$Argument, [double]$Sec = 5) {
@@ -2256,7 +2272,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     }
     foreach ($ck in $capsReceipt.Keys) { $b[$ck] = $capsReceipt[$ck] }
     $openLeaseUnnamed = $false   # r5 (adversary r4 pass 3 A1): this batch's open carried a leaseBatch that is not one object (the finally charges it open-lease-unnamed)
-    if ($script:batchTicket) { Close-BatchTicket 'leftover' }   # r7 A8: an earlier batch's ticket whose end was BUSY or unanswered is ended again before this batch takes its own place
+    Invoke-StrandedTicketRetry 'next-batch'   # r7 A8 / pass 2 A1: an earlier batch's ticket whose end was BUSY or unanswered is ended again before this batch takes its own place
     $script:batchTicket = $null
     $script:TicketOn = -not $NoTicket   # one script-scope switch for every ticket step; the claim loop is also lifted out and run on its own by test_venue_lease_batch.py, where it is unset (ticketless, as before)
     # (0) CAPS b and c: wait out the cooldown after the last lease and the 3 h budget BEFORE the claim, so the venue is never held through either.
@@ -2298,6 +2314,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 Start-Sleep -Seconds ([int][Math]::Ceiling([Math]::Min([double]$leftSec, [double]$TicketBeatSec)))
                 if ($waitClock.Elapsed.TotalSeconds -ge [double]$bw.waitSec) { break }
                 if (($deadline - [DateTime]::UtcNow).TotalSeconds -le 6.0) { continue }   # r7 A5: no ticket call that could outlast the deadline (the wait goes on; the claim request refreshes the ticket)
+                Invoke-StrandedTicketRetry 'cooldown-wait'
                 # the heartbeat's answer is read: LOST (the ticket was reaped, e.g. after a long write lock) is retaken at once so the holder is not out of the line until its wait ends; BUSY or no answer is tried again next slice
                 $hb = Invoke-BatchTicketCall '[string](Update-VenueTicket -Ticket $a.t -Phase cooldown -StaleAfterSec $a.s)' @{ t = $script:batchTicket; s = $beatStaleSec }
                 $hbRes = $(if ($hb.answered) { [string]@($hb.value)[-1] } else { 'NO_ANSWER' })
@@ -2443,6 +2460,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         $holder = $(if ($req.claim) { "pid=$($req.claim.ownerPid) runDir=$($req.claim.runDir) purpose=$($req.claim.purpose)" } else { $req.state })
         if ($holder -cne $lastHolder) { LogBest "CLAIM_HELD batch=$batchNo state=$($req.state) holder $holder -> wait$(if ($script:batchTicket -and $null -ne $req.PSObject.Properties['position']) { " position=$($req.position)/$(@($req.queue).Count)" })"; $lastHolder = $holder }
         if ([DateTime]::UtcNow.AddSeconds($ClaimPollSec) -ge $deadline) { break }
+        Invoke-StrandedTicketRetry 'claim-wait'
         Start-Sleep -Seconds $ClaimPollSec
         # r3 (sol r2 B-01 class sweep): a wakeup that came late starts no request after the deadline. This poll's pass answered, so DEADLINE's line and receipt may write.
         if ([DateTime]::UtcNow -ge $deadline) { break }
