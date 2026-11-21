@@ -442,7 +442,7 @@ param(
     [ValidateRange(-1, 10000)][double]$CudaLaunchTimingMinMs = -1,
 
     # PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the app's opt-in per-present playback trace (MLVAPP_PLAYBACK_PRESENT_TRACE=1; its rows
-    # land in the run log after the Play stops). Absent: nothing is set and the emitted job is the text it was before this parameter.
+    # land in the run log after the Play stops). Absent (r10): the emitted job names MLVAPP_PLAYBACK_PRESENT_TRACE=0 explicitly in its one bracketed PRESENT-TRACE-OFF-ARM-1 region, so an inherited =1 cannot reach the app; present, it names =1 and no =0.
     [switch]$PresentTrace,
 
     # PLAYBACK-STARTUP-WAIT-PREWARM-1: the app's opt-in first-present identity capture (MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE=1: the paused start

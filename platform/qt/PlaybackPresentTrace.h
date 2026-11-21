@@ -41,10 +41,10 @@ struct StageStamps
     // where they always were; only the statement of the point each one is taken at changed.
     double requestS = 0.0;      // the request: sampled in renderFrame after the m_mutex wait (the request's own clock value, RenderRequest::requestStageTime)
     double decodeQueueS = 0.0;  // the decode-queue function-entry sample: taken on entry to queueDecodeRequestLocked, BEFORE the slot is set up (not the enqueue instant)
-    double decodeStartS = 0.0;  // decode worker began
-    double decodeEndS = 0.0;    // decode worker finished
-    double reconStartS = 0.0;   // recon worker began
-    double reconEndS = 0.0;     // recon worker finished
+    double decodeStartS = 0.0;  // the decode-start sample: on entry to decodeFrameForWorker, after the worker took the queue entry
+    double decodeEndS = 0.0;    // the decode-end sample: right after the raw decode (getMlvRawFrameUint16) returned, before the slot-state transition
+    double reconStartS = 0.0;   // the recon-start sample: in reconFrameForWorker AFTER the OpenMP team setup and the warm/slot checks (team setup is before it)
+    double reconEndS = 0.0;     // the recon-end sample: at the tail of reconFrameForWorker, after the ProcessReady transition (taken only with the trace on)
     double renderStartS = 0.0;  // render_start, after drawFrame's prologue: the value HEAVY logs as render_thread_start_stage_time (ready - rnd == render)
     double drawBeginS = 0.0;    // the GUI thread began drawing it (drawFrameReady's display start)
     // r3 (adversary 81c5805c A1/A2, HUB RULING 2026-11-20T11:30Z): the LIGHT trace carries STAMPS only. A per-frame configure or
@@ -111,10 +111,10 @@ struct Row
     // readyMs, presentMs and prevEndMs above complete the chain request .. present.
     double reqMs = kUnknownMs;        // request: sampled after the m_mutex wait in renderFrame
     double dqMs = kUnknownMs;         // the decode-queue function-entry sample (queueDecodeRequestLocked entry, before the slot is set up)
-    double dsMs = kUnknownMs;         // decode began
-    double deMs = kUnknownMs;         // decode ended
-    double rsMs = kUnknownMs;         // recon began
-    double reMs = kUnknownMs;         // recon ended
+    double dsMs = kUnknownMs;         // the decode-start sample (decodeFrameForWorker entry, after the queue take)
+    double deMs = kUnknownMs;         // the decode-end sample (right after the raw decode returned)
+    double rsMs = kUnknownMs;         // the recon-start sample (reconFrameForWorker, after the OpenMP team setup)
+    double reMs = kUnknownMs;         // the recon-end sample (reconFrameForWorker tail, after the ProcessReady transition)
     double rndMs = kUnknownMs;        // render_start, after drawFrame's prologue (HEAVY's render_thread_start_stage_time; ready - rnd == render)
     double drawBeginMs = kUnknownMs;  // GUI draw began
 

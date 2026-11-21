@@ -1625,6 +1625,9 @@ function Get-DvUnpacedEvidence {
     [ordered]@{ requested = $requested; active = $active; dropFrame = $dropFrame; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
 }
 
+# PlaybackPresentTrace.h Recorder::header(): the columns of one present_trace row (a test pins this number to the app's own header string)
+$script:DvPresentTraceRowFields = 31
+
 function Get-DvPresentTraceEvidence {
     <#
     .SYNOPSIS
@@ -1642,18 +1645,39 @@ function Get-DvPresentTraceEvidence {
     $rows = 0
     $measuredRows = 0
     $headers = 0
+    $records = 0
     if (-not [string]::IsNullOrEmpty($LogText)) {
-        $measuredSession = (Get-DvSmokeSummaryFields -LogText $LogText).session
-        # the record only where it starts the record body (Get-DvLogRecordBodies), so a build path or a quoted span naming the marker is no record
-        $rowPattern = $script:DvRecordStart + 'playback_smoke\.present_trace session=(?<s>\d+) row='
+        $bodies =Get-DvLogRecordBodies -LogText $LogText
+        # r10 adversary pass A2: the measured session is the one the app's OWN `playback_smoke.measured_session id=<n>` marker names, never the summary fallback
+        # (Get-DvSmokeSummaryFields takes the FIRST summary line when the marker is absent, so another Play's rows could honour the arm). No marker, a malformed one, or
+        # a session the summary reader picked differently: the measured session is unknown, so an ON arm has no measured row (fail closed).
+        $markerId = $null
+        foreach ($body in $bodies) {
+            if ([regex]::IsMatch($body, ($script:DvRecordStart + 'playback_smoke\.measured_session(?!' + $script:DvNameChar + ')'), $script:DvCi)) {
+                $mm = [regex]::Match($body, ($script:DvRecordStart + 'playback_smoke\.measured_session id=(?<s>[0-9]+)\s*$'), $script:DvCi)
+                if ($mm.Success) { $markerId = $mm.Groups['s'].Value }
+                break
+            }
+        }
+        $summarySession = (Get-DvSmokeSummaryFields -LogText $LogText).session
+        if ($null -ne $markerId -and [string]$summarySession -ceq $markerId) { $measuredSession = $markerId }
+        # the record only where it starts the record body (Get-DvLogRecordBodies), so a build path or a quoted span naming the marker is no record. r10 adversary pass A1:
+        # a ROW is the whole record: `row=` and exactly $script:DvPresentTraceRowFields comma-separated numbers to the end of the body (a bare `row=`, a payload cut short or
+        # trailing text is no row), so an empty or truncated record never honours an ON arm. The field count is pinned to the app's header by test.
+        $number = '-?(?:[0-9]+(?:\.[0-9]+)?|nan|inf)'
+        $rowPattern = $script:DvRecordStart + 'playback_smoke\.present_trace session=(?<s>[0-9]+) row=' + $number + '(?:,' + $number + '){' + ($script:DvPresentTraceRowFields - 1) + '}$'
         $headerPattern = $script:DvRecordStart + 'playback_smoke\.present_trace_header session=\d+(\s|$)'
-        foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
+        # the OFF side is judged the other way round: ANY record that starts with the marker (a row of any payload, a header, a malformed or truncated one) is the app
+        # saying the trace was on, so a bare `row=` still fails an OFF arm
+        $anyPattern = $script:DvRecordStart + 'playback_smoke\.present_trace(?:_header)?(?!' + $script:DvNameChar + ')'
+        foreach ($line in $bodies) {
             $m = [regex]::Match($line, $rowPattern, $script:DvCi)
             if ($m.Success) {
                 $rows++
                 if ($null -ne $measuredSession -and $m.Groups['s'].Value -ceq [string]$measuredSession) { $measuredRows++ }
             }
             elseif ([regex]::IsMatch($line, $headerPattern, $script:DvCi)) { $headers++ }
+            if ([regex]::IsMatch($line, $anyPattern, $script:DvCi)) { $records++ }
         }
     }
     $verdict = $null
@@ -1665,12 +1689,12 @@ function Get-DvPresentTraceEvidence {
             $reason = 'the leg asks for the present trace but the run log holds no playback_smoke.present_trace row for the measured session, so the trace-ON arm of the pair did not trace'
         }
     }
-    elseif ($rows -gt 0 -or $headers -gt 0) {
+    elseif ($records -gt 0) {
         $verdict = 'OFF_ARM_TRACED'
-        $reason = "the leg does not ask for the present trace but the run log holds $rows playback_smoke.present_trace row(s) and $headers header(s), so the trace-OFF arm of the pair had the trace on (an inherited MLVAPP_PLAYBACK_PRESENT_TRACE)"
+        $reason = "the leg does not ask for the present trace but the run log holds $records playback_smoke.present_trace record(s) ($rows row(s), $headers header(s)), so the trace-OFF arm of the pair had the trace on (an inherited MLVAPP_PLAYBACK_PRESENT_TRACE)"
     }
     else { $verdict = 'OFF_CLEAN' }
-    [ordered]@{ requested = $requested; rows = $rows; measuredRows = $measuredRows; headers = $headers; verdict = $verdict; reason = $reason; blocks = ($verdict -cin @('OFF_ARM_TRACED', 'ON_ARM_NOT_TRACED')) }
+    [ordered]@{ requested = $requested; rows = $rows; measuredRows = $measuredRows; headers = $headers; records = $records; verdict = $verdict; reason = $reason; blocks = ($verdict -cin @('OFF_ARM_TRACED', 'ON_ARM_NOT_TRACED')) }
 }
 
 function Get-DvLookLabelEvidence {
@@ -5641,6 +5665,14 @@ function Test-DvReceiptValid {
             # PLAYBACK-TRACE-LOWOVERHEAD-1 r10 (sol r9 A2): the trace-OFF / trace-ON arms of the overhead pair must really differ (Get-DvPresentTraceEvidence).
             $presentTraceVerdict = Get-DvPresentTraceEvidence -Spec $spec -LogText $ev.logText
             if ($presentTraceVerdict.blocks) { $invalid.Add("PRESENT_TRACE_NOT_HONOURED: $($presentTraceVerdict.reason); a leg whose trace state is not the one it names is no arm of the overhead pair") }
+            # r10 adversary pass A3: a receipt that CARRIES a presentTrace block must carry the one the hashed log derives (the writer records it only for a leg that asks for the
+            # trace or one that blocks); a receipt that predates the block carries none and keeps the classification it had.
+            $storedPresentTrace = Get-DvProp $Receipt 'presentTrace'
+            if ($null -ne $storedPresentTrace) {
+                foreach ($f in @('requested', 'rows', 'measuredRows', 'verdict')) {
+                    if (-not (Test-DvJsonEquivalent (Get-DvProp $storedPresentTrace $f) $presentTraceVerdict[$f])) { $invalid.Add("PRESENT_TRACE_NOT_FROM_EVIDENCE: presentTrace.$f is not what the hashed run log and the committed leg spec derive") }
+                }
+            }
             # VENUE-NATIVE-LEG-LOOKLEG-LABEL-1 r1: a receipt that CLAIMS the look ran (lookAssistOn true) must be backed by the hashed evidence -- the app's own run log says
             # look_assist_enabled=1, the hashed summary.json says the look was forced and the flavor the app reported is the one requested, and lookAssistFlavor is that flavor.
             # Only the claim is re-derived (a receipt that predates the field, or says false, claims nothing); the leg TYPE binding above is untouched.
