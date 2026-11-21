@@ -1310,11 +1310,23 @@ inline bool measuredPlayLoopShouldStop( PlayStopState state, bool stressPending,
 }
 
 // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r4 (Grok G4 / adversary pass 3 A1 on 38c05d4b): the presented count a
-// frame-pinned capture is judged on (the strict presented == target check, exit 11). RED stub: the count alone.
+// frame-pinned capture is judged on (the strict presented == target check, exit 11). Pure.
+// A count cannot tell a frame still in flight from a DROPPED one, so the Reached wait above may let the timeline run on and a
+// source frame PAST the admitted window complete the count (the present path then stops Play on it). That present is not the
+// pinned capture: it does not count, so the count it completed reads one short and the run ends by the not-met path (exit 11,
+// `not met; target=N observed=N-1`), never a success on an out-of-window frame.
+// The admitted window is [windowStartFrame, windowStartFrame + requiredSourceFrames - 1]: the counter's start frame (fixed when
+// the measured Play armed it; a later begin is ignored) and the admitted requirement (fixed at admission). Both are fixed before
+// the first Reached and NOTHING during the wait moves them -- unlike highWater, which a seek rebases (adversary pass 4 A4 on
+// 6e9145fb) -- and the window has a lower bound, so a backward seek's frame is outside it too (pass 4 A5).
+// lastPresentedFrame is the frame of the present that completed the count (MainWindow m_playbackSmokeLastPresentedFrame, the
+// frame the present-path stop pins the slider to). No window (requiredSourceFrames <= 0) or nothing presented: the count alone.
 inline int64_t pinnedCapturePresentedCount( int64_t presentedFrames, int64_t lastPresentedFrame,
                                             int64_t windowStartFrame, int64_t requiredSourceFrames )
 {
-    (void)lastPresentedFrame; (void)windowStartFrame; (void)requiredSourceFrames;
+    if( requiredSourceFrames <= 0 || presentedFrames <= 0 ) return presentedFrames;
+    const int64_t windowLastFrame = windowStartFrame + requiredSourceFrames - 1;
+    if( lastPresentedFrame < windowStartFrame || lastPresentedFrame > windowLastFrame ) return presentedFrames - 1;
     return presentedFrames;
 }
 

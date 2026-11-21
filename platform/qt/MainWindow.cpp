@@ -11340,12 +11340,25 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         contactSheetEndFrame = contactSheetLoopCutOutFrame;
     }
 
+    // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r4 (Grok G4): the count is judged with the frame that completed it. A present
+    // from outside the admitted window [counter start, start + required - 1] does not count (pinnedCapturePresentedCount), so a
+    // dropped window frame made up by a frame past the window ends here, on the unchanged not-met message, never a success.
+    const int64_t pinnedPresentedFrames = playback_frame_range::pinnedCapturePresentedCount(
+        m_playbackSmokePresentedFrames, m_playbackSmokeLastPresentedFrame,
+        m_sourceAdvance.startFrame, m_playRequiredSourceFrames );
     if( m_playbackSmokeTargetPresentedFrames > 0
-     && m_playbackSmokePresentedFrames != m_playbackSmokeTargetPresentedFrames )
+     && pinnedPresentedFrames != m_playbackSmokeTargetPresentedFrames )
     {
         err << "[GUI-SMOKE] ERROR: exact presented-frame target was not met; target="
             << m_playbackSmokeTargetPresentedFrames
-            << " observed=" << m_playbackSmokePresentedFrames << ".\n";
+            << " observed=" << static_cast<qlonglong>( pinnedPresentedFrames ) << ".\n";
+        if( pinnedPresentedFrames != m_playbackSmokePresentedFrames )
+        {
+            const int64_t admittedWindowFirst = m_sourceAdvance.startFrame;
+            err << "[GUI-SMOKE] the present that completed the count showed source frame " << m_playbackSmokeLastPresentedFrame
+                << ", outside the admitted window " << static_cast<qlonglong>( admittedWindowFirst ) << ".."
+                << static_cast<qlonglong>( admittedWindowFirst + m_playRequiredSourceFrames - 1 ) << "; it does not count.\n";
+        }
         return 11;
     }
 
