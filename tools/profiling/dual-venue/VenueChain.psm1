@@ -809,6 +809,36 @@ function Release-VenueClaim {
     }
 }
 
+function Invoke-VenueLateRelease {
+    <#
+    .SYNOPSIS
+    VENUE-FIFO-ADVERSARY-TAIL-1: the release of a claim granted at or after -DeadlineUtc, as ONE seam (the retry loop, and the one final single-open probe at the end of the reserve), so a sweep can drive it
+    with an injected clock. -Call is { param([int]$MaxAttempts, [double]$TimeoutSec) } and answers RELEASED | ABSENT | NOT_OURS | BUSY | NO_ANSWER | ERROR; -Clock answers the seconds since the retry began;
+    -Sleep takes milliseconds. Returns @{ answer; tries; probed; endSec }.
+    #>
+    param([Parameter(Mandatory)][string]$Venue, [Parameter(Mandatory)][string]$Nonce, [string]$ClaimDir = '', [double]$BoundSec = 0.75, [scriptblock]$Call = $null, [scriptblock]$Clock = $null, [scriptblock]$Sleep = $null)
+    $released = @('RELEASED', 'ABSENT', 'NOT_OURS')
+    if ($null -eq $Call) { $Call = { param([int]$MaxAttempts, [double]$TimeoutSec) Release-VenueClaim -Venue $Venue -Nonce $Nonce -ClaimDir $ClaimDir -MaxAttempts $MaxAttempts }.GetNewClosure() }
+    if ($null -eq $Clock) { $sw = [Diagnostics.Stopwatch]::StartNew(); $Clock = { $sw.Elapsed.TotalSeconds }.GetNewClosure() }
+    if ($null -eq $Sleep) { $Sleep = { param([int]$Ms) Start-Sleep -Milliseconds $Ms } }
+    $answer = ''; $tries = 0; $probed = $false
+    for ($try = 1; $try -le 5; $try++) {
+        # r10 (adversary A1): the clock is asked again after the sleep: one clamped to the end of the reserve (or woken late) must not start a try, which would run a whole release call past it
+        if ($try -gt 1 -and (& $Clock) -ge $BoundSec) { break }
+        $tries++
+        try { $answer = [string](& $Call 5 0.0) } catch { $answer = 'ERROR' }
+        if ($answer -cin $released) { break }
+        $left = $BoundSec - (& $Clock)
+        if ($try -ge 5 -or $left -le 0) { break }
+        & $Sleep ([int][Math]::Ceiling([Math]::Min([double](100 * $try), [double]($left * 1000))))   # rounded UP: a sleep cut short by the cast would wake just before the bound and start a try inside it
+    }
+    if ($answer -cnotin $released) {
+        $probed = $true
+        try { $answer = [string](& $Call 1 0.0) } catch { $answer = 'ERROR' }
+    }
+    [pscustomobject]@{ answer = $answer; tries = $tries; probed = $probed; endSec = (& $Clock) }
+}
+
 function ConvertFrom-VenueGateLog {
     <#
     .SYNOPSIS
@@ -2052,7 +2082,7 @@ function Get-VenueDriverScriptMissing {
     return ''
 }
 
-Export-ModuleMember -Function New-VenueCapsProbeId, Get-VenueDriverScriptMissing, Get-VenueMainRoot, Get-VenueClaimPath, Get-VenueClaim, Get-VenueClaimStaleReason, Request-VenueClaim, Release-VenueClaim,
+Export-ModuleMember -Function New-VenueCapsProbeId, Get-VenueDriverScriptMissing, Get-VenueMainRoot, Get-VenueClaimPath, Get-VenueClaim, Get-VenueClaimStaleReason, Request-VenueClaim, Release-VenueClaim, Invoke-VenueLateRelease,
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
     Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueStagedArtifactNames, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,

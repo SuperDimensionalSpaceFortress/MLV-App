@@ -2025,7 +2025,7 @@ $hold.Dispose()
 [pscustomobject]@{ held = $true; sawRelease = ($null -ne $entry); closedAfterMs = [int]$sw.Elapsed.TotalMilliseconds } | ConvertTo-Json -Compress
 """
 
-    def late_grant_scenario(self, hold: bool, deadline_sec: float = 20.0, release_seam: bool = False, observe_close_ms: int = 0, slow_full_call_ms: int = 0) -> dict:
+    def late_grant_scenario(self, hold: bool, deadline_sec: float = 20.0, release_seam: bool = False, observe_close_ms: int = 0, slow_full_call_ms: int = 0, stall_sec: int = 0) -> dict:
         # A real lease batch whose claim is GRANTED AFTER -DeadlineUtc: a copy of VenueChain.psm1 keeps the granted claim standing until 0.2 s past the deadline (the seam, nothing else changed), so the
         # batch takes the late-grant branch. With hold=True a reader (FileShare.Read, no Delete) holds the claim file from the grant until the batch has logged what it did, so every release is refused (BUSY).
         import shutil
@@ -2044,6 +2044,11 @@ $hold.Dispose()
             # reserve, deterministically); r11 pass 1: the final single-open probe (-MaxAttempts 1) answers BUSY at once, so the claim is never released and the NOT_RELEASED line is what is asserted
             self.assertEqual(text.count(rel_anchor), 1, "release seam anchor moved")
             text = text.replace(rel_anchor, "    if ($env:SEAM_RELEASE_LOG) { " + log_call + "; if ($MaxAttempts -gt 1) { Start-Sleep -Milliseconds 650 }; return 'BUSY' }\n" + rel_anchor)
+            env["SEAM_RELEASE_LOG"] = str(self.case / "release-calls.log")
+        elif stall_sec:
+            # VENUE-FIFO-ADVERSARY-TAIL-1 (pass 11 A1, Grok G15/A1b): EVERY Release-VenueClaim call (the full ones and the final probe) never returns inside the test's window: it sleeps stall_sec and answers BUSY.
+            self.assertEqual(text.count(rel_anchor), 1, "release seam anchor moved")
+            text = text.replace(rel_anchor, "    if ($env:SEAM_RELEASE_LOG) { " + log_call + "; Start-Sleep -Seconds %d; return 'BUSY' }\n" % stall_sec + rel_anchor)
             env["SEAM_RELEASE_LOG"] = str(self.case / "release-calls.log")
         elif observe_close_ms:
             # r11 B2: the same log line at the start of every Release-VenueClaim call. Nothing else changed (the call runs as it ships), unless slow_full_call_ms is given (r11 pass 1 A1): then a FULL call
@@ -2069,8 +2074,9 @@ $hold.Dispose()
             holder = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(f)], capture_output=True, text=True, timeout=150)
             self.assertEqual(holder.returncode, 0, f"the claim-file holder failed:\n{holder.stdout}\n{holder.stderr}")
         p.wait(timeout=150)
+        endUtc = datetime.now(timezone.utc)
         out = Path(p.out_path).read_text(encoding="utf-8", errors="replace")   # type: ignore[attr-defined]
-        r = {"log": self.batch_log(p), "out": out, "deadline": deadline, "claimLeft": self.claim_path.exists(), "exit": p.returncode,
+        r = {"log": self.batch_log(p), "out": out, "deadline": deadline, "endUtc": endUtc, "claimLeft": self.claim_path.exists(), "exit": p.returncode,
              "releaseCalls": [l for l in Path(env["SEAM_RELEASE_LOG"]).read_text(encoding="utf-8").splitlines() if l.strip()] if "SEAM_RELEASE_LOG" in env and Path(env["SEAM_RELEASE_LOG"]).exists() else []}
         if holder is not None:
             r["holder"] = json.loads([l for l in holder.stdout.splitlines() if l.strip()][-1])
@@ -2153,6 +2159,59 @@ $hold.Dispose()
         self.assertTrue(any("CLAIM_LATE_GRANT batch=" in l and "let go" in l for l in lines), f"a released late grant was not logged as let go: {lines}")
         self.assertFalse(any("NOT_RELEASED" in l for l in lines), f"a released late grant was logged as not released: {lines}")
         self.assertFalse(r["claimLeft"], "the late grant's claim was left behind")
+
+    LATE_RELEASE_SWEEP = """
+# VENUE-FIFO-ADVERSARY-TAIL-1 (Grok G18, TIMING-BOUND-SWEEP-TEST-BEFORE-LEGS-1): the late grant's release is driven with an INJECTED clock (no real sleep). A reader holds the claim file and lets go at L ms;
+# a full release call lasts D ms (its opens spread over the call, the last one 20 ms before its answer) and answers BUSY unless an open falls at or after L; the single-open probe takes one open and ~0 ms.
+# A call given a time limit (-TimeoutSec > 0) is cut at it: NO_ANSWER, and only the opens before the cut counted.
+$cells = [System.Collections.Generic.List[object]]::new()
+foreach ($D in @(0, 500, 680, 750)) {
+  foreach ($step in 0..40) {
+    $L = $step * 25
+    $global:vt = 0.0; $global:released = $false; $global:calls = 0
+    $call = {
+      param([int]$MaxAttempts, [double]$TimeoutSec)
+      $global:calls++
+      $start = $global:vt
+      $dur = $(if ($MaxAttempts -le 1) { 0.0 } else { $D / 1000.0 })
+      $offsets = $(if ($MaxAttempts -le 1) { @(0.0) } elseif ($D -le 0) { @(0.0) } else { @(0.0, 0.05, 0.15, 0.3, [Math]::Max(0.0, $dur - 0.02)) })
+      $cut = $(if ($TimeoutSec -gt 0) { $TimeoutSec } else { [double]::PositiveInfinity })
+      foreach ($o in $offsets) {
+        if ($o -ge $cut) { break }
+        if ($o -gt $dur) { continue }
+        if (($start + $o) * 1000.0 -ge $L) { $global:released = $true; $global:vt = $start + $o; return 'RELEASED' }
+      }
+      if ($dur -gt $cut) { $global:vt = $start + $cut; return 'NO_ANSWER' }
+      $global:vt = $start + $dur
+      return 'BUSY'
+    }
+    $r = Invoke-VenueLateRelease -Venue bachelor -Nonce 'n' -ClaimDir $d -BoundSec 0.75 -Call $call -Clock { $global:vt } -Sleep { param([int]$Ms) $global:vt += $Ms / 1000.0 }
+    $cells.Add([pscustomobject]@{ d = $D; l = $L; released = $global:released; answer = $r.answer; end = [Math]::Round($global:vt, 4); tries = $r.tries; probed = $r.probed })
+  }
+}
+@{ cells = $cells } | ConvertTo-Json -Depth 4 -Compress
+"""
+
+    def test_tail1_timing_sweep_the_late_grants_claim_is_released_whenever_the_reader_lets_go_before_the_bound(self) -> None:
+        # Grok G18 sweep: reader let-go 0..1000 ms in 25 ms steps x full-call durations fast-BUSY, 500, 680, 750 ms (164 cells), injected clock. (1) a reader that lets go BEFORE the 0.75 s bound
+        # never leaves the claim behind; (2) the retry ends within the bound plus one call plus the probe (0.05 s tolerance for the probe).
+        r = self.ps(self.LATE_RELEASE_SWEEP)
+        cells = r["cells"]
+        self.assertEqual(len(cells), 164, len(cells))
+        left_behind = [c for c in cells if c["l"] < 750 and not c["released"]]
+        self.assertEqual(left_behind, [], f"{len(left_behind)} of {len(cells)} cells left the claim behind although the reader let go before the bound: {left_behind[:8]}")
+        too_long = [c for c in cells if c["end"] > 0.75 + c["d"] / 1000.0 + 0.05]
+        self.assertEqual(too_long, [], f"{len(too_long)} cells ended later than the bound plus one call plus the probe: {too_long[:8]}")
+
+    def test_tail1_a1_a_release_call_that_never_returns_cannot_hold_the_batch_past_its_bound(self) -> None:
+        # pass 11 A1 / G15 / A1b: one bounded worker/timeout seam covers the in-flight call AND the final probe. The seam makes EVERY Release-VenueClaim call sleep 25 s: the batch must still end DEADLINE
+        # inside the bound: the 0.2 s the seam holds the grant, the 0.75 s reserve, one call (<= 0.8 s), the probe (<= 0.5 s) and 3 s for process start-up of the worker and exit = 5.25 s past -DeadlineUtc.
+        # The unbounded inline call held the batch 25 s (and the probe another 25 s).
+        r = self.late_grant_scenario(hold=False, stall_sec=25)
+        past = (r["endUtc"] - r["deadline"]).total_seconds()
+        self.assertLess(past, 5.25, f"the batch ended {past:.1f} s past -DeadlineUtc with a release call that never returns (bound 5.25 s): {r['releaseCalls']}\n{r['log']}")
+        self.assertTrue(any("CLAIM_LATE_GRANT_NOT_RELEASED" in l for l in r["log"].splitlines()), f"a release that never answered must be logged as not released:\n{r['log']}")
+        self.assertEqual(r["exit"], 3, f"the batch must still end DEADLINE (exit 3):\n{r['log']}\n{r['out']}")
 
     def test_r9_a4_a_phase_with_a_character_the_culture_compare_ignores_is_refused_not_stored(self) -> None:
         # r9 A4: [ValidateSet('waiting', 'cooldown')] compares with the current culture and ignores U+00AD / U+200D, so 'wait<U+00AD>ing' bound and was stored with the extra character: a ticket no ordinal reader

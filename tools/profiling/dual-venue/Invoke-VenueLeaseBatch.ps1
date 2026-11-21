@@ -2395,21 +2395,11 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             # a reader that lets go at 0.70 s). So when the loop ends without a release, ONE final probe is made at the end of the reserve: Release-VenueClaim -MaxAttempts 1, a single open with no sleep. It is
             # a probe, not a further retry (the A1 rule of r10 stands: no whole release call starts once the reserve is spent). Worst case past -DeadlineUtc: a try that begins just before the bound
             # (0.75 s less one tick) and runs its 0.5 s = about 1.25 s, plus the one open of the probe and the log line. A claim granted on a retry has its own single bounded release and no probe.
+            # VENUE-FIFO-ADVERSARY-TAIL-1: the retry loop and the final probe are ONE seam now (VenueChain's Invoke-VenueLateRelease), so a sweep drives them with an injected clock.
             $lateAnswer = ''
-            $lateClock = [Diagnostics.Stopwatch]::StartNew()
             $lateBoundSec = [double]($script:ClaimRetryRequestReserveSec - $script:ClaimRetryRefusalTailSec)
-            for ($lateTry = 1; $lateTry -le 5; $lateTry++) {
-                # r10 (adversary A1): the clock is asked again after the sleep: one clamped to the end of the reserve (or woken late) must not start a try, which would run a whole release call past it
-                if ($lateTry -gt 1 -and $lateClock.Elapsed.TotalSeconds -ge $lateBoundSec) { break }
-                try { $lateAnswer = [string]$(if ($grantedOnRetry) { Invoke-ClaimRetryRelease $deadline $req.claim.nonce } else { Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir }) } catch { $lateAnswer = 'ERROR' }
-                if ($grantedOnRetry -or $lateAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { break }
-                $lateLeftSec = $lateBoundSec - $lateClock.Elapsed.TotalSeconds
-                if ($lateTry -ge 5 -or $lateLeftSec -le 0) { break }
-                Start-Sleep -Milliseconds ([int][Math]::Ceiling([Math]::Min([double](100 * $lateTry), [double]($lateLeftSec * 1000))))   # rounded UP: a sleep cut short by the cast would wake just before the bound and start a try inside it
-            }
-            if (-not $grantedOnRetry -and $lateAnswer -cnotin @('RELEASED', 'ABSENT', 'NOT_OURS')) {
-                try { $lateAnswer = [string](Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir -MaxAttempts 1) } catch { $lateAnswer = 'ERROR' }
-            }
+            if ($grantedOnRetry) { try { $lateAnswer = [string](Invoke-ClaimRetryRelease $deadline $req.claim.nonce) } catch { $lateAnswer = 'ERROR' } }
+            else { $lateAnswer = [string](Invoke-VenueLateRelease -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir -BoundSec $lateBoundSec).answer }
             if ($lateAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { LogBest "CLAIM_LATE_GRANT batch=$batchNo (the claim was granted at or after the deadline: let go, not used)" }
             else { LogBest "CLAIM_LATE_GRANT_NOT_RELEASED batch=$batchNo answer=$lateAnswer (the claim was granted at or after the deadline and is NOT known to be let go: it still names this batch until its expiry or its owner's exit)" }
             break
