@@ -34,8 +34,9 @@ function New-FpsAllow {
     [pscustomobject]@{ name = $Name; form = $Form; rule = $Rule; required = [bool]$Required }
 }
 # ARGUMENTS: tools/profiling/run-release-gui-smoke.ps1 builds the list (line numbers are in that file); the job's own command line is playback-attr-3-cuda-job.ps1:3092.
+# PRODUCER ALIASES used by the row comments below: job = playback-attr-3-cuda-job.ps1, runner = run-release-gui-smoke.ps1 (a trailing row comment names a file by alias only, so the exit-code consumer scan sees each file once, here).
 $script:FpsLightArgs = @(
-    New-FpsAllow '--gui-smoke-playback' 'bare' '' -Required            # run-release-gui-smoke.ps1:1481 (required: the runner always emits :1481-1503 below)
+    New-FpsAllow '--gui-smoke-playback' 'bare' '' -Required            # runner:1481 (required: the runner always emits :1481-1503 below)
     New-FpsAllow '--input' 'next' 'text' -Required                      # :1482
     New-FpsAllow '--seconds' 'next' 'num' -Required                     # :1483
     New-FpsAllow '--start-frame' 'next' 'int' -Required                 # :1487
@@ -46,7 +47,7 @@ $script:FpsLightArgs = @(
     New-FpsAllow '--settle-cpu-stable-ms' 'next' 'int' -Required        # :1501
     New-FpsAllow '--settle-cpu-max-ms' 'next' 'int' -Required           # :1502
     New-FpsAllow '--receipt' 'next' 'text'                              # :1510
-    New-FpsAllow '--scope' 'next' 'exact:none'                          # :1513, the job passes -Scope none (playback-attr-3-cuda-job.ps1:3092)
+    New-FpsAllow '--scope' 'next' 'exact:none'                          # :1513, the job passes -Scope none (job:3092; producer cite, alias table in header)
     New-FpsAllow '--playback-debayer' 'eq' 'word'                       # :1516
     New-FpsAllow '--playback-processing' 'eq' 'word'                    # :1519
     New-FpsAllow '--gpu-preview-processing' 'eq' 'word'                 # :1522
@@ -54,39 +55,39 @@ $script:FpsLightArgs = @(
     New-FpsAllow '--gpu-amaze-debayer' 'eq' 'word'                      # :1528
     New-FpsAllow '--gpu-amaze-texture-present' 'bare' ''                # :1531
     New-FpsAllow '--no-look-assist' 'bare' ''                           # :1534
-    New-FpsAllow '--display-prefer' 'eq' 'text'                         # :1641 (the job forwards -DisplayPrefer, playback-attr-3-cuda-job.ps1:3105)
+    New-FpsAllow '--display-prefer' 'eq' 'text'                         # :1641 (the job forwards -DisplayPrefer, job:3105; producer cite, alias table in header)
 )
 # ENVIRONMENT (MLVAPP_* only; any other name is not the app's control surface). Names compare ignoring case (the Windows environment does).
 $script:FpsLightEnv = @(
-    New-FpsAllow 'MLVAPP_PLAYBACK_SMOKE_TELEMETRY' 'env' 'exact:1'                     # run-release-gui-smoke.ps1:1693, playback-attr-3-cuda-job.ps1:3027
-    New-FpsAllow 'MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG' 'env' 'oneof:1|0' # playback-attr-3-cuda-job.ps1:3028 (1 = LIGHT); 0 is the HEAVY arm's value (:3039)
-    New-FpsAllow 'MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG' 'env' 'exact:1'          # playback-attr-3-cuda-job.ps1:3029
-    New-FpsAllow 'MLVAPP_CRASH_FORENSICS_LOG_DIR' 'env' 'text' -Required               # run-release-gui-smoke.ps1:1695 and :1717 (every launch sets it)
-    New-FpsAllow 'MLVAPP_PLAYBACK_MAX_THREADS' 'env' 'int'                             # run-release-gui-smoke.ps1:1690
-    New-FpsAllow 'MLVAPP_PLAYBACK_QUALITY_MODE' 'env' 'exact:phase3_hq'                # playback-attr-3-cuda-job.ps1:3049
-    New-FpsAllow 'MLVAPP_PLAYBACK_PHASE3_UNATTENDED' 'env' 'exact:1'                   # run-release-gui-smoke.ps1:1700, playback-attr-3-cuda-job.ps1:3053
-    New-FpsAllow 'MLVAPP_PLAYBACK_SCALE_FACTOR' 'env' 'int'                            # run-release-gui-smoke.ps1:1703
-    New-FpsAllow 'MLVAPP_PLAYBACK_PREFER_HQ_MEAN23' 'env' 'exact:1'                    # run-release-gui-smoke.ps1:1706
-    New-FpsAllow 'MLVAPP_PLAY_PACE_MODE' 'env' 'exact:informational'                   # run-release-gui-smoke.ps1:1719 (gui-smoke-length-gate.ps1:960)
-    New-FpsAllow 'MLVAPP_PLAYBACK_AGGRESSIVE_PREVIEW' 'env' 'exact:0'                  # playback-attr-3-cuda-job.ps1:3050
-    New-FpsAllow 'MLVAPP_PLAYBACK_PREVIEW_MODE' 'env' 'exact:sharp_smooth'             # playback-attr-3-cuda-job.ps1:3051
-    New-FpsAllow 'MLVAPP_GPU_PLAYBACK_RECON' 'env' 'exact:1'                           # playback-attr-3-cuda-job.ps1:3054
-    New-FpsAllow 'MLVAPP_GPU_PLAYBACK_RECON_BACKEND' 'env' 'exact:cuda'                # playback-attr-3-cuda-job.ps1:3055
-    New-FpsAllow 'MLVAPP_GPU_PLAYBACK_RECON_DLL' 'env' 'text'                          # playback-attr-3-cuda-job.ps1:3056
-    New-FpsAllow 'MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D' 'env' 'exact:0'                 # playback-attr-3-cuda-job.ps1:3057
-    New-FpsAllow 'MLVAPP_EXPERIMENTAL_GPU_PROCESSING' 'env' 'exact:1'                  # playback-attr-3-cuda-job.ps1:3058
-    New-FpsAllow 'MLVAPP_EXPERIMENTAL_GPU_AMAZE_DEBAYER' 'env' 'exact:1'               # playback-attr-3-cuda-job.ps1:3059
-    New-FpsAllow 'MLVAPP_EXPERIMENTAL_GL_WINDOW_VIEWPORT' 'env' 'exact:1'              # playback-attr-3-cuda-job.ps1:3060
-    New-FpsAllow 'MLVAPP_EXPERIMENTAL_GPU_PLAYBACK_RECON_TEXTURE_PRESENT' 'env' 'exact:1'  # playback-attr-3-cuda-job.ps1:3062
-    New-FpsAllow 'MLVAPP_EXPERIMENTAL_GPU_AMAZE_TEXTURE_PRESENT' 'env' 'exact:1'       # playback-attr-3-cuda-job.ps1:3063
-    New-FpsAllow 'MLVAPP_GPU_PLAYBACK_RECON_RETAIN_DEVICE_OUTPUT' 'env' 'exact:1'      # playback-attr-3-cuda-job.ps1:3064
-    New-FpsAllow 'MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT' 'env' 'exact:0'                  # playback-attr-3-cuda-job.ps1:3069
-    New-FpsAllow 'MLVAPP_SWAP_INTERVAL' 'env' 'oneof:0|1'                              # playback-attr-3-cuda-job.ps1:6319 (-SwapInterval is [ValidateRange(-1, 1)], -1 sets nothing)
-    New-FpsAllow 'MLVAPP_PLAYBACK_CONFORM' 'env' 'oneof:0|1'                           # playback-attr-3-cuda-job.ps1:6330
-    New-FpsAllow 'MLVAPP_PLAYBACK_PRESENT_TRACE' 'env' 'exact:1'                       # playback-attr-3-cuda-job.ps1:6353 (in-memory trace, written after the Play: PlaybackPresentTrace.h:9-12)
-    New-FpsAllow 'MLVAPP_PLAYBACK_UNPACED' 'env' 'exact:1'                             # playback-attr-3-cuda-job.ps1:6531
-    New-FpsAllow 'MLVAPP_AUTOMATION_SETTINGS_DIR' 'env' 'text'                         # playback-attr-3-cuda-job.ps1:6392
-    New-FpsAllow 'MLVAPP_LOOK_ASSIST_FLAVOR' 'env' 'word'                              # playback-attr-3-cuda-job.ps1:6092
+    New-FpsAllow 'MLVAPP_PLAYBACK_SMOKE_TELEMETRY' 'env' 'exact:1'                     # runner:1693, job:3027  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG' 'env' 'oneof:1|0' # job:3028 (1 = LIGHT); 0 is the HEAVY arm's value (:3039)  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG' 'env' 'exact:1'          # job:3029  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_CRASH_FORENSICS_LOG_DIR' 'env' 'text' -Required               # runner:1695 and :1717 (every launch sets it)  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_PLAYBACK_MAX_THREADS' 'env' 'int'                             # runner:1690  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_PLAYBACK_QUALITY_MODE' 'env' 'exact:phase3_hq'                # job:3049  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_PLAYBACK_PHASE3_UNATTENDED' 'env' 'exact:1'                   # runner:1700, job:3053  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_PLAYBACK_SCALE_FACTOR' 'env' 'int'                            # runner:1703  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_PLAYBACK_PREFER_HQ_MEAN23' 'env' 'exact:1'                    # runner:1706  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_PLAY_PACE_MODE' 'env' 'exact:informational'                   # runner:1719 (gui-smoke-length-gate.ps1:960)
+    New-FpsAllow 'MLVAPP_PLAYBACK_AGGRESSIVE_PREVIEW' 'env' 'exact:0'                  # job:3050  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_PLAYBACK_PREVIEW_MODE' 'env' 'exact:sharp_smooth'             # job:3051  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_GPU_PLAYBACK_RECON' 'env' 'exact:1'                           # job:3054  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_GPU_PLAYBACK_RECON_BACKEND' 'env' 'exact:cuda'                # job:3055  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_GPU_PLAYBACK_RECON_DLL' 'env' 'text'                          # job:3056  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D' 'env' 'exact:0'                 # job:3057  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_EXPERIMENTAL_GPU_PROCESSING' 'env' 'exact:1'                  # job:3058  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_EXPERIMENTAL_GPU_AMAZE_DEBAYER' 'env' 'exact:1'               # job:3059  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_EXPERIMENTAL_GL_WINDOW_VIEWPORT' 'env' 'exact:1'              # job:3060  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_EXPERIMENTAL_GPU_PLAYBACK_RECON_TEXTURE_PRESENT' 'env' 'exact:1'  # job:3062  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_EXPERIMENTAL_GPU_AMAZE_TEXTURE_PRESENT' 'env' 'exact:1'       # job:3063  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_GPU_PLAYBACK_RECON_RETAIN_DEVICE_OUTPUT' 'env' 'exact:1'      # job:3064  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT' 'env' 'exact:0'                  # job:3069  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_SWAP_INTERVAL' 'env' 'oneof:0|1'                              # job:6319 (-SwapInterval is [ValidateRange(-1, 1)], -1 sets nothing)  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_PLAYBACK_CONFORM' 'env' 'oneof:0|1'                           # job:6330  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_PLAYBACK_PRESENT_TRACE' 'env' 'exact:1'                       # job:6353 (in-memory trace, written after the Play: PlaybackPresentTrace.h:9-12)  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_PLAYBACK_UNPACED' 'env' 'exact:1'                             # job:6531  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_AUTOMATION_SETTINGS_DIR' 'env' 'text'                         # job:6392  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_LOOK_ASSIST_FLAVOR' 'env' 'word'                              # job:6092  (producer cite, alias table in header)
 )
 $script:FpsLightArgIndex = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
 foreach ($row in $script:FpsLightArgs) { $script:FpsLightArgIndex[$row.name] = $row }
