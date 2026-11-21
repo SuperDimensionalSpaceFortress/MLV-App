@@ -273,6 +273,11 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in HFR_NATIVE_S1_LEGS if rel not in
 # EXPORT-VENUE-LEG-1: the four export legs (two clips x CDNG lossless / ProRes); test_dual_venue_export_leg pins their shape.
 EXPORT_VENUE_LEGS = tuple(f"legs/m16-{clip}-export-{fmt}.json" for clip in ("1243", "1456") for fmt in ("cdng-lossless", "prores"))
 SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in EXPORT_VENUE_LEGS if rel not in SHIPPED_LEGS))
+# PLAYBACK-TRACE-LOWOVERHEAD-1 r8: the present-trace ON twins of the overhead gate's two legs (trace OFF vs ON on ONE build), keyed to the OFF leg each
+# twins; legId, card and generatorArgs.presentTrace true are the only differences (the classifier branch for this card pins it).
+PRESENT_TRACE_OVERHEAD_LEGS = {"legs/m16-1457-native-fullscreen-s1-ptrace.json": "legs/m16-1457-native-fullscreen-s1.json",
+                               "legs/m16-1243-pace-cinematic-fullscreen-s1-ptrace.json": "legs/m16-1243-pace-cinematic-fullscreen-s1.json"}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *PRESENT_TRACE_OVERHEAD_LEGS)
 assert len(set(SHIPPED_LEGS)) == len(SHIPPED_LEGS), "a shipped leg is listed twice"
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
@@ -519,6 +524,11 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     HEAVY_FRAME_LOG_OPEN = "HEAVY-FRAME-LOG-1 >>>"
     HEAVY_FRAME_LOG_CLOSE = "HEAVY-FRAME-LOG-1 <<<"
     HEAVY_FRAME_LOG_REGIONS = 1
+    # PLAYBACK-TRACE-LOWOVERHEAD-1 r10 (sol r9 A2): the one OFF-arm environment entry (MLVAPP_PLAYBACK_PRESENT_TRACE=0) and its comment, so an inherited =1 cannot leave the
+    # trace-OFF arm of the overhead pair tracing. One region in every job that is not generated with -PresentTrace (cuda and cpu), just before the env list's anchor line.
+    PRESENT_TRACE_OFF_OPEN = "PRESENT-TRACE-OFF-ARM-1 >>>"
+    PRESENT_TRACE_OFF_CLOSE = "PRESENT-TRACE-OFF-ARM-1 <<<"
+    PRESENT_TRACE_OFF_REGIONS = 1
     # PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1 r6: the r5 cpu block (the GL viewport/window env clear plus the Processed8 route gate and its summary fields) is three
     # regions in every cpu job (the env-clear edit, the route-gate edit, the summary-field edit); a cuda job carries none, and no baseline commit carries any.
     CPU_GL_ENV_CLEAR_OPEN = "PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 >>>"
@@ -587,6 +597,7 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                     "hfr-conform-oracles": (cls.HFR_CONFORM_OPEN, cls.HFR_CONFORM_CLOSE),
                     "hfr-10s-floor": (cls.HFR_10S_OPEN, cls.HFR_10S_CLOSE),
                     "heavy-frame-log": (cls.HEAVY_FRAME_LOG_OPEN, cls.HEAVY_FRAME_LOG_CLOSE),
+                    "present-trace-off": (cls.PRESENT_TRACE_OFF_OPEN, cls.PRESENT_TRACE_OFF_CLOSE),
                     "cpu-gl-env-clear": (cls.CPU_GL_ENV_CLEAR_OPEN, cls.CPU_GL_ENV_CLEAR_CLOSE),
                     "pm-internal-gap": (cls.PM_INTERNAL_GAP_OPEN, cls.PM_INTERNAL_GAP_CLOSE),
                     "session-anchor": (cls.SESSION_ANCHOR_OPEN, cls.SESSION_ANCHOR_CLOSE),
@@ -644,6 +655,7 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(old_counts["hfr-10s-floor"], 0, "the baseline predates the owner's HFR 10 s amendment")
         self.assertEqual(new_counts["heavy-frame-log"], self.HEAVY_FRAME_LOG_REGIONS, "the default (HEAVY) job carries exactly the pinned number of bracketed HEAVY-FRAME-LOG-1 regions")
         self.assertEqual(old_counts["heavy-frame-log"], 0, "the baseline predates the HEAVY frame-log opt-out")
+        self.assertEqual((new_counts["present-trace-off"], old_counts["present-trace-off"]), (self.PRESENT_TRACE_OFF_REGIONS, 0), "the default (no -PresentTrace) job carries exactly the pinned number of bracketed PRESENT-TRACE-OFF-ARM-1 regions; the baseline predates them")
         self.assertEqual((new_counts["cpu-gl-env-clear"], old_counts["cpu-gl-env-clear"]), (0, 0), "a cuda job carries no cpu GL-viewport env-clear region, and neither does the baseline")
         self.assertEqual((new_counts["pm-internal-gap"], old_counts["pm-internal-gap"]), (self.PM_INTERNAL_GAP_REGIONS, 0), "the default job carries exactly the pinned number of bracketed PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 regions; the baseline predates them")
         self.assertEqual((new_counts["session-anchor"], old_counts["session-anchor"]), (self.SESSION_ANCHOR_REGIONS, 0), "the default job carries exactly the pinned number of bracketed SESSION-ANCHOR-1 regions; the baseline predates them")
@@ -886,21 +898,39 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertRegex(GENERATOR.read_text(encoding="utf-8"), r"\[ValidateSet\('', 'on', 'off', IgnoreCase = \$false\)\]\s+\[string\]\$PlaybackConform = ''")
 
     def test_the_present_trace_reaches_the_apps_env_only_when_asked(self) -> None:
-        """PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: -PresentTrace adds MLVAPP_PLAYBACK_PRESENT_TRACE=1 to the app's env list; absent, the job is
-        the text it was. The runner maps a leg's generatorArgs.presentTrace true for any leg."""
+        """PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: -PresentTrace adds MLVAPP_PLAYBACK_PRESENT_TRACE=1 to the app's env list; absent (r10), the job names the OFF value
+        '=0' in its one bracketed PRESENT-TRACE-OFF-ARM-1 region and nothing else differs. The runner maps a leg's generatorArgs.presentTrace true for any leg."""
         plain = self.generate(GENERATOR, "pt-plain.job.ps1", []).read_text(encoding="utf-8").replace("\r\n", "\n")
-        self.assertNotIn("MLVAPP_PLAYBACK_PRESENT_TRACE", plain)
+        # r10 (sol r9 A2), forced companion: the plain job no longer names no flag; it names the OFF value in its one bracketed PRESENT-TRACE-OFF-ARM-1 region
+        self.assertNotIn("MLVAPP_PLAYBACK_PRESENT_TRACE=1", plain)
+        off_region = "    # PRESENT-TRACE-OFF-ARM-1 >>>\n    'MLVAPP_PLAYBACK_PRESENT_TRACE=0',\n    # PRESENT-TRACE-OFF-ARM-1 <<<\n"
+        self.assertEqual(plain.count(off_region), 1)
         job = self.generate(GENERATOR, "pt-on.job.ps1", ["-PresentTrace"])
         self.assertEqual(self.parse_errors(job), 0)
         text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
         line = "    'MLVAPP_PLAYBACK_PRESENT_TRACE=1',\n"
         self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, text)
-        self.assertEqual(text.replace(line, ""), plain, "the flag is the only difference from the plain job")
+        self.assertEqual(text.replace(line, ""), plain.replace(off_region, ""), "the flag (ON: '=1', OFF: the '=0' region) is the only difference from the plain job")
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
         mapping = "if ($spec.generatorArgs.PSObject.Properties['presentTrace'] -and [bool]$spec.generatorArgs.presentTrace) { $gen['PresentTrace'] = $true }"
         self.assertIn(mapping, runner)
         self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
                         "the mapping must sit outside the forceLookAssist branch")
+
+    def test_a_leg_without_the_present_trace_sets_the_apps_env_to_zero_explicitly(self) -> None:
+        """PLAYBACK-TRACE-LOWOVERHEAD-1 r10 (sol r9 A2): the smoke runner builds the app's environment from its OWN process environment plus the job's list, so an inherited
+        MLVAPP_PLAYBACK_PRESENT_TRACE=1 would leave the OFF arm of the overhead pair tracing. Every job without -PresentTrace names the flag at its OFF value, in one bracketed
+        region at the same env-list site the ON arm's '=1' uses (the pattern HEAVY-FRAME-LOG-1 uses); a job with -PresentTrace carries the '=1' and no '=0'."""
+        for name, extra in (("cuda", []), ("cpu", ["-Backend", "cpu"]), ("sheet", ["-ContactSheet", "-ContactSheetFrames", "4"])):
+            plain = self.generate(GENERATOR, f"pt0-{name}.job.ps1", extra).read_text(encoding="utf-8").replace("\r\n", "\n")
+            self.assertEqual(plain.count("'MLVAPP_PLAYBACK_PRESENT_TRACE=0',\n"), 1, name)
+            self.assertNotIn("'MLVAPP_PLAYBACK_PRESENT_TRACE=1',", plain, name)
+            self.assertIn("    # PRESENT-TRACE-OFF-ARM-1 >>>\n    'MLVAPP_PLAYBACK_PRESENT_TRACE=0',\n    # PRESENT-TRACE-OFF-ARM-1 <<<\n    'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n", plain, name)
+            self.assertEqual(self.strip_regions(plain)[1]["present-trace-off"], 1, name)
+            on = self.generate(GENERATOR, f"pt1-{name}.job.ps1", [*extra, "-PresentTrace"]).read_text(encoding="utf-8").replace("\r\n", "\n")
+            self.assertEqual(on.count("'MLVAPP_PLAYBACK_PRESENT_TRACE=1',\n"), 1, name)
+            self.assertNotIn("MLVAPP_PLAYBACK_PRESENT_TRACE=0", on, name)
+            self.assertEqual(self.strip_regions(on)[1]["present-trace-off"], 0, name)
 
     def test_the_util_sample_mapping_is_armed_only_by_a_json_true(self) -> None:
         """CUDA-HEADROOM-UTIL-SAMPLER-1: the runner maps generatorArgs.utilSample to the generator's -UtilSample only when it is a JSON true (the
@@ -6028,6 +6058,100 @@ class UnpacedEvidenceTests(unittest.TestCase):
 
 
 @requires_windows_pwsh
+class PresentTraceArmEvidenceTests(unittest.TestCase):
+    """PLAYBACK-TRACE-LOWOVERHEAD-1 r10 (sol r9 A2), FAIL CLOSED: the overhead gate compares a trace-OFF arm with a trace-ON arm, so an OFF leg whose run log holds ANY
+    playback_smoke.present_trace record (row or header: the app had the trace on) and an ON leg with NO row for the measured session are not a valid pair. Read from the
+    app's own log, never from the spec or the launcher's env block."""
+
+    OFF = {"generatorArgs": {}}
+    ON = {"generatorArgs": {"presentTrace": True}}
+    HEADER = "playback_smoke.present_trace_header session={s} rows=2 dropped=0 cols=i,frame,pos,t"
+    # one complete row, the shape PlaybackPresentTrace.h formatRow prints (one number per header column)
+    PAYLOAD = "0,1,1,10.000,0.000,5.000,1.000,2.000,3.000,0.000,0.000,0.0000,-1.000,0,0,0,0.000,0,0.0000,-1.000,0,0,1.000,2.000,2.000,2.000,2.000,2.000,2.000,6.000,1"
+    ROW = "playback_smoke.present_trace session={s} row=" + PAYLOAD
+
+    def test_the_row_shape_is_the_apps_header_shape(self) -> None:
+        """r10 adversary pass A1: the row a leg is judged on is exactly one number per column of the app's own header, so a column appended to the header must be appended
+        here (DvPresentTraceRowFields) too, and the fixture payload above is that shape."""
+        source = (ROOT / "platform" / "qt" / "PlaybackPresentTrace.h").read_text(encoding="utf-8")
+        match = re.search(r"static const char \*header\(\)\s*\{\s*return ((?:\s*\"[^\"]*\")+)\s*;", source)
+        self.assertIsNotNone(match)
+        columns = "".join(re.findall(r'"([^"]*)"', match.group(1))).split(",")
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn(f"$script:DvPresentTraceRowFields = {len(columns)}\n", module.replace("\r\n", "\n"))
+        self.assertEqual(len(self.PAYLOAD.split(",")), len(columns))
+
+    def test_a_malformed_or_truncated_row_never_honours_an_on_arm_and_still_fails_an_off_arm(self) -> None:
+        """r10 adversary pass A1: `row=` with no payload, a payload cut short, trailing text and a Qt location cut are no row. ON: no row, blocks. OFF: the record is still the
+        app saying the trace was on, so it still blocks."""
+        bad = ["playback_smoke.present_trace session=3 row=", self.ROW.format(s=3) + "garbage", self.ROW.format(s=3).rsplit(",", 1)[0],
+               "playback_smoke.present_trace session=3 row=0 (C:/Build !/MainWindow.cpp:"]
+        for line in bad:
+            on = self.verdict(self.ON, self.log(line))
+            self.assertEqual((on["verdict"], on["blocks"], on["measuredRows"]), ("ON_ARM_NOT_TRACED", True, 0), line)
+            off = self.verdict(self.OFF, self.log(line))
+            self.assertEqual((off["verdict"], off["blocks"]), ("OFF_ARM_TRACED", True), line)
+
+    def test_a_row_of_another_play_never_honours_an_on_arm_when_the_measured_marker_is_missing(self) -> None:
+        """r10 adversary pass A2: the measured session is the one the app's measured_session marker names. With no marker the summary reader falls back to the FIRST summary
+        (session 2 here), and that must not let another Play's row honour the arm."""
+        log = "\n".join(["interaction_trace event=automation.pacing_isolated settings_store=run_scoped",
+                         "playback_smoke.summary session=2 reason=play-stop presented_frames=600", self.ROW.format(s=2),
+                         "playback_smoke.summary session=3 reason=play-stop presented_frames=600"]) + "\n"
+        v = self.verdict(self.ON, log)
+        self.assertEqual((v["verdict"], v["blocks"]), ("ON_ARM_NOT_TRACED", True))
+        marked = self.verdict(self.ON, log.replace("interaction_trace", "playback_smoke.measured_session id=2\ninteraction_trace", 1))
+        self.assertEqual((marked["verdict"], marked["blocks"]), ("ON_TRACED", False), "the app's own marker naming session 2 makes session 2 the measured one")
+
+    def test_the_validator_compares_a_stored_trace_block_with_the_one_the_log_derives(self) -> None:
+        """r10 adversary pass A3: a receipt's presentTrace block is re-derived; a contradictory one is INVALID (PRESENT_TRACE_NOT_FROM_EVIDENCE)."""
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("$storedPresentTrace = Get-DvProp $Receipt 'presentTrace'", module)
+        self.assertIn("foreach ($f in @('requested', 'rows', 'measuredRows', 'verdict')) {", module)
+        self.assertIn('$invalid.Add("PRESENT_TRACE_NOT_FROM_EVIDENCE: presentTrace.$f is not what the hashed run log and the committed leg spec derive")', module)
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("rows = $presentTraceVerdict.rows; measuredRows = $presentTraceVerdict.measuredRows; verdict = $presentTraceVerdict.verdict", runner)
+
+    def verdict(self, spec: dict, log: str) -> dict:
+        proc, out = run_pwsh_json("$s = $env:DVE_SPEC | ConvertFrom-Json\n(Get-DvPresentTraceEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress",
+                                  DVE_SPEC=json.dumps(spec), DVE_LOG=log)
+        self.assertIsNotNone(out, proc.stderr)
+        return out
+
+    @staticmethod
+    def log(*extra: str) -> str:
+        return "\n".join(["playback_smoke.measured_session id=3", "playback_smoke.summary session=3 reason=reached presented_frames=600", *extra]) + "\n"
+
+    def test_a_clean_pair_is_honoured(self) -> None:
+        off = self.verdict(self.OFF, self.log())
+        self.assertEqual((off["verdict"], off["blocks"], off["rows"]), ("OFF_CLEAN", False, 0))
+        rows = [self.HEADER.format(s=3), self.ROW.format(s=3), self.ROW.format(s=3)]
+        on = self.verdict(self.ON, self.log(*rows))
+        self.assertEqual((on["verdict"], on["blocks"], on["rows"]), ("ON_TRACED", False, 2))
+
+    def test_an_off_leg_with_any_trace_record_fails_with_a_named_reason(self) -> None:
+        for spec in (self.OFF, {}, {"generatorArgs": {"presentTrace": False}}):
+            for lines in ([self.ROW.format(s=3)], [self.HEADER.format(s=3)], [self.ROW.format(s=2)]):   # a row, the bare header, a warm-up session's row
+                v = self.verdict(spec, self.log(*lines))
+                self.assertEqual((v["verdict"], v["blocks"]), ("OFF_ARM_TRACED", True), (spec, lines))
+                self.assertIn("present_trace", v["reason"])
+
+    def test_an_on_leg_with_no_row_for_the_measured_session_fails_with_a_named_reason(self) -> None:
+        for lines in ([], [self.HEADER.format(s=3)], [self.ROW.format(s=2)]):   # nothing, a header with no row, a row of another session only
+            v = self.verdict(self.ON, self.log(*lines))
+            self.assertEqual((v["verdict"], v["blocks"]), ("ON_ARM_NOT_TRACED", True), lines)
+            self.assertIn("present_trace", v["reason"])
+
+    def test_the_writer_and_the_validator_both_judge_it(self) -> None:
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("$presentTraceVerdict = Get-DvPresentTraceEvidence -Spec $spec -LogText $ev.logText", module)
+        self.assertIn('if ($presentTraceVerdict.blocks) { $invalid.Add("PRESENT_TRACE_NOT_HONOURED:', module)
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("$presentTraceVerdict = Get-DvPresentTraceEvidence -Spec $spec -LogText $runLogText", runner)
+        self.assertIn("PRESENT_TRACE_NOT_HONOURED: $($presentTraceVerdict.reason)", runner)
+
+
+@requires_windows_pwsh
 class LookLabelEvidenceTests(unittest.TestCase):
     """LOOK-FULLSCREEN-PARITY-1: the receipt's lookLabel block is read from the app's own gui_smoke.look_label line; lookLabelShown only when a surface shows the
     expected, non-empty text."""
@@ -8185,6 +8309,17 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertRegex(spec["legId"], r"^m16-1243-chainattr-(c|p|t12)-fullscreen-s1$", path.name)
             elif spec["card"] == "HFR-NATIVE-60FPS-FULLRES-1":   # the Look Assist ON control of the native s1 pair (its -nola twin is classic)
                 self.assert_hfr_native_s1_flavored_leg(spec, path.name)
+            elif spec["card"] == "PLAYBACK-TRACE-LOWOVERHEAD-1":   # the trace-ON twins of the overhead gate (PRESENT_TRACE_OVERHEAD_LEGS)
+                rel = "legs/" + path.name
+                self.assertIn(rel, PRESENT_TRACE_OVERHEAD_LEGS, path.name)
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"-ptrace$", path.name)
+                # the twin is its OFF leg except legId, card and presentTrace true
+                source = json.loads((DV / PRESENT_TRACE_OVERHEAD_LEGS[rel]).read_text(encoding="utf-8"))
+                self.assertNotIn("presentTrace", source["generatorArgs"], PRESENT_TRACE_OVERHEAD_LEGS[rel])
+                source["legId"], source["card"] = spec["legId"], spec["card"]
+                source["generatorArgs"] = dict(source["generatorArgs"], presentTrace=True)
+                self.assertEqual(spec, source, path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
                 self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}", f"m16-1243-look-scale2-{flavor}-agxoff"), path.name)
                 self.assertEqual(spec["legId"], path.stem, path.name)
@@ -9135,6 +9270,9 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 # PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1 r2's region: in the new job only (the base predates the HEAVY frame-log opt-out).
                 self.assertEqual((new_counts.pop("heavy-frame-log"), old_counts.pop("heavy-frame-log")),
                                  (GeneratorByteIdentityAndVariantTests.HEAVY_FRAME_LOG_REGIONS, 0), name)
+                # PLAYBACK-TRACE-LOWOVERHEAD-1 r10's OFF-arm region: in every new job without -PresentTrace (cuda and cpu), never in the base.
+                self.assertEqual((new_counts.pop("present-trace-off"), old_counts.pop("present-trace-off")),
+                                 (GeneratorByteIdentityAndVariantTests.PRESENT_TRACE_OFF_REGIONS, 0), name)
                 # PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1 r6: the r5 cpu block is in every cpu job (its three bracketed regions) and in no cuda job; the base predates it.
                 self.assertEqual((new_counts.pop("cpu-gl-env-clear"), old_counts.pop("cpu-gl-env-clear")),
                                  (GeneratorByteIdentityAndVariantTests.CPU_GL_ENV_CLEAR_REGIONS if name.startswith("cpu") else 0, 0), name)

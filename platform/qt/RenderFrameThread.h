@@ -18,6 +18,7 @@
 #include "Debayered16ReconReusePolicy.h"
 #include "Phase3Mode.h"
 #include "PlaybackDecodeRenderOverlap.h"
+#include "PlaybackPresentTrace.h"
 #include "PlaybackReconWarmRun.h"
 #include "PlaybackScaling.h"
 
@@ -275,6 +276,8 @@ public:
         double dualIsoEvCorrection = 0.0;
         int dualIsoBlackDelta = 0;
         QJsonObject stageTimingTelemetry;
+        // PLAYBACK-TRACE-LOWOVERHEAD-1 r1: the worker stage stamps for the present trace (plain doubles; all 0 when the trace is off)
+        playback_present_trace::StageStamps traceStamps;
     };
 
     struct PresentationPreparationOptions
@@ -584,6 +587,9 @@ private:
         double dualIsoEvCorrection = 0.0;
         int dualIsoBlackDelta = 0;
         QJsonObject stageTimingTelemetry;
+        // PLAYBACK-TRACE-LOWOVERHEAD-1 r1: one writer per field (the thread that owns the slot at that stage); the slot's
+        // hand-over between stages is under m_mutex. The process stage's resetMetadata() keeps it (see renderFrame).
+        playback_present_trace::StageStamps traceStamps;
         RenderRequest queuedRequest;
 
         void resetMetadata( void )
@@ -646,6 +652,7 @@ private:
             dualIsoBlackDelta = 0;
             presentationContext = ReadyFrame::PresentationContext();
             stageTimingTelemetry = QJsonObject();
+            traceStamps = playback_present_trace::StageStamps();
             queuedRequest = RenderRequest();
         }
     };

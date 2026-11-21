@@ -442,7 +442,7 @@ param(
     [ValidateRange(-1, 10000)][double]$CudaLaunchTimingMinMs = -1,
 
     # PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: the app's opt-in per-present playback trace (MLVAPP_PLAYBACK_PRESENT_TRACE=1; its rows
-    # land in the run log after the Play stops). Absent: nothing is set and the emitted job is the text it was before this parameter.
+    # land in the run log after the Play stops). Absent (r10): the emitted job names MLVAPP_PLAYBACK_PRESENT_TRACE=0 explicitly in its one bracketed PRESENT-TRACE-OFF-ARM-1 region, so an inherited =1 cannot reach the app; present, it names =1 and no =0.
     [switch]$PresentTrace,
 
     # PLAYBACK-STARTUP-WAIT-PREWARM-1: the app's opt-in first-present identity capture (MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE=1: the paused start
@@ -6335,6 +6335,19 @@ if ($PresentTrace) {
     $text = $traceAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
         param($m)
         $m.Value + $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_PRESENT_TRACE=1'," + $m.Groups['nl'].Value
+    })
+}
+else {
+    # PLAYBACK-TRACE-LOWOVERHEAD-1 r10 (sol r9 A2): a job without -PresentTrace names the flag at its OFF value. The runner builds the app's environment from its own
+    # process environment plus this list, so an inherited MLVAPP_PLAYBACK_PRESENT_TRACE=1 (a shell, a Scheduled Task env block) would leave the OFF arm of the overhead
+    # pair tracing: both arms would carry the stage hooks and the pair would read as no overhead. Same pattern as HEAVY-FRAME-LOG-1; the ON arm above keeps '=1' alone.
+    $traceOffAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($traceOffAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_PRESENT_TRACE_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_PLAYBACK_PRESENT_TRACE=0 to' }
+    $text = $traceOffAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $ind = $m.Groups['ind'].Value; $nl = $m.Groups['nl'].Value
+        # BEFORE the anchor line, never after it: every other switch's line sits immediately after the anchor (the jobs' pinned shape), so none of them moves
+        $ind + '# PRESENT-TRACE-OFF-ARM-1 >>>' + $nl + $ind + "'MLVAPP_PLAYBACK_PRESENT_TRACE=0'," + $nl + $ind + '# PRESENT-TRACE-OFF-ARM-1 <<<' + $nl + $m.Value
     })
 }
 

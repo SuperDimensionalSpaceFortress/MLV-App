@@ -2503,6 +2503,7 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     m_timerId = startTimer( 40, Qt::PreciseTimer ); //25fps initially only, is set after import
     m_timerCacheId = startTimer( 1000 ); //1fps
     m_playbackPresentTrace.setEnabled( mlvappPlaybackPresentTraceRequested() );
+    playback_present_trace::setStampsEnabled( m_playbackPresentTrace.enabled() );
 
     //Connect Export Handler
     connect( this, SIGNAL(exportReady()), this, SLOT(exportHandler()) );
@@ -27976,7 +27977,9 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeStartAudioSyncApplied = m_playbackAudioSyncAppliedCount;
     m_playbackSmokeStartAudioSyncSkipped = m_playbackAudioSyncSkippedCount;
     m_playbackSmokeStartTime = mlv_stage_timing_now();
-    m_playbackPresentTrace.begin( m_playbackSmokeStartTime * 1000.0, 4096 );   // r7 present trace (no-op when off)
+    // r7 present trace (no-op when off): a fixed ring of the NEWEST 4096 presents; a longer Play overwrites the oldest and the
+    // dump's header names how many (dropped=)
+    m_playbackPresentTrace.begin( m_playbackSmokeStartTime * 1000.0, 4096 );
     m_playbackSlipHistogram.reset( m_playbackSmokeStartPosition, getPlaybackFramerate() );
     m_playbackTextureSplit.reset();   // K1 (texture-present split)
     // PLAYBACK-STARTUP-CATCHUP-BURST-1: the timeline owes the wall time since Play only when the legacy startup banks
@@ -28900,6 +28903,8 @@ void MainWindow::notePlaybackSmokePresentedFrame(
             traceRow.renderMs = renderWorkMs;
             traceRow.queueMs = queueWaitMs;
             traceRow.creditFrames = m_playbackPaceGuard.creditFrames();
+            // PLAYBACK-TRACE-LOWOVERHEAD-1: the workers' stage stamps only (r3: no configure/H2D span in the LIGHT trace)
+            traceRow.setStages( readyFrame.traceStamps );
             m_playbackPresentTrace.notePresent( traceRow );
         }
         // PLAYBACK-GL-PRESENT-SETUP-STALL-1: the texture-present setup split, only for a present a presenter ran.
@@ -32186,16 +32191,17 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
     if( m_playbackPresentTrace.enabled() )
     {
         const qulonglong traceSession = static_cast<qulonglong>( m_playbackSmokeSessionId );
-        qInfo().noquote() << QStringLiteral( "playback_smoke.present_trace_header session=%1 rows=%2 cols=%3" )
+        // dropped = presents the fixed ring overwrote (the oldest); i below is the present's own number in the Play
+        qInfo().noquote() << QStringLiteral( "playback_smoke.present_trace_header session=%1 rows=%2 dropped=%3 cols=%4" )
                                  .arg( traceSession )
-                                 .arg( static_cast<qulonglong>( m_playbackPresentTrace.rows().size() ) )
+                                 .arg( static_cast<qulonglong>( m_playbackPresentTrace.size() ) )
+                                 .arg( static_cast<qulonglong>( m_playbackPresentTrace.dropped() ) )
                                  .arg( QLatin1String( playback_present_trace::Recorder::header() ) );
-        const std::vector<playback_present_trace::Row> &traceRows = m_playbackPresentTrace.rows();
-        for( size_t i = 0; i < traceRows.size(); ++i )
+        for( size_t i = 0; i < m_playbackPresentTrace.size(); ++i )
             qInfo().noquote() << QStringLiteral( "playback_smoke.present_trace session=%1 row=%2" )
                                      .arg( traceSession )
-                                     .arg( QString::fromStdString(
-                                         playback_present_trace::Recorder::formatRow( i, traceRows[i] ) ) );
+                                     .arg( QString::fromStdString( playback_present_trace::Recorder::formatRow(
+                                         m_playbackPresentTrace.firstIndex() + i, m_playbackPresentTrace.row( i ) ) ) );
     }
 
     if( perfFieldLogEnabled() )
@@ -36412,6 +36418,7 @@ void MainWindow::drawFrameReady()
     }
 
     const double display_start = mlv_stage_timing_now();
+    playback_present_trace::stamp( readyFrame.traceStamps.drawBeginS, display_start );
     if( m_playbackSmokeTimelineTelemetry )
     {
         readyFrame.stageTimingTelemetry.insert(
