@@ -639,14 +639,25 @@ function Test-ProcessIdentityMatch {
 
 function Get-DescendantProcessIdentities {
     # AGENT-JOB-MONITOR-CIM-WALK-1 r1: ONE Win32_Process snapshot per walk. The walk used to issue two CIM queries per descendant (the
-    # children of each node, then each child's own identity: 2N+1 for N descendants), every monitor slice; on Bachelor that kept the WmiPrvSE
-    # host at 0.673 cores on average and 2-3.65 cores inside job windows (hub ruling 2026-11-20T21:56:16Z). Now the process table is read
+    # children of each node, then each child's own identity: 2N+1 for N descendants), every monitor slice. Bachelor's WmiPrvSE host averaged
+    # 0.673 cores over 9.3 days and 2-3.65 cores inside job windows (hub ruling 2026-11-20T21:56:16Z); that ruling attributes about 0.5 core of the
+    # average to a client outside MLV jobs, and calls the in-job link correlated by timing, cost per query not yet measured. What is measured
+    # here is the walk itself (hub host, synthetic 19-descendant tree, median of 20): 3130 ms before, 93 ms after, 39 queries before, 1 after.
+    # Now the process table is read
     # once, with only the five properties an identity needs, and the parent -> children map and every identity are built from that one
     # snapshot: same objects, same field names and formats as Get-ProcessIdentity, same depth-first order (a node's descendants, then the node).
     # Identity checks are unchanged: each identity carries startUtc/startEpochMs/imagePath, and every consumer still re-checks them
     # (Test-ProcessIdentityMatch) before it stops a pid, so a pid reused after the snapshot is refused exactly as before. A pid seen twice in
     # one walk (a parent cycle formed by pid reuse inside the snapshot) is visited once, and the root is never its own descendant.
-    # An unreadable process table gives an empty walk, as the per-node queries (-ErrorAction SilentlyContinue) did.
+    # r2 (sol 1, fable H1): a row is a descendant only if it was created at or after the parent row it names. A row created BEFORE its listed
+    # parent is a stale edge (the old parent died and its pid went to a younger process), an unrelated process, so it is never emitted and
+    # its own subtree is not walked. A parent that is not in the snapshot (an exited root whose children live on) or a row without a readable
+    # CreationDate cannot be compared and is kept. Every consumer calls this walk (both stop helpers, the monitor's retained identities, the lease
+    # child check), so this is the one place the rule lives.
+    # r2 (sol 2, fable H2): the snapshot is read as a stream, so rows already returned before a (non-terminating or terminating) CIM error are
+    # KEPT; the query has -OperationTimeoutSec; a failed or partial snapshot is recorded in $script:LastDescendantWalk (ok, partial, rows, why)
+    # and written as ONE agent.log line (at most one per 60 s per agent, a monitor slice runs every few seconds), and an unreadable process
+    # table still gives an empty walk and never a throw. Stop-ProcessTree reads that record, so a kill path names an incomplete walk.
     # BACHELOR-LEASE-RENEW-MARGIN-1 r1: -OnEach runs before the snapshot and once after it. The job monitor passes its quiet-lease
     # renew tick, so a renew due while the walk starts is started before the snapshot read, and one that fell due during it is started
     # (and one that exited is collected) before the walk returns. It must never wait for a renew to finish (its only waits are
@@ -655,10 +666,30 @@ function Get-DescendantProcessIdentities {
     param([Parameter(Mandatory = $true)][int]$ParentProcessId, [scriptblock]$OnEach = $null)
 
     if ($null -ne $OnEach) { $null = & $OnEach }
-    $all = @()
-    try { $all = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, CreationDate, ExecutablePath, CommandLine -ErrorAction Stop) }
-    catch { $all = @() }
+    $all = New-Object 'System.Collections.Generic.List[object]'
+    $snapshotError = $null
+    $script:LastDescendantWalk = [pscustomobject]@{ ok = $true; partial = $false; rows = 0; why = $null; rootPid = $ParentProcessId }
+    # -ErrorAction Stop turns a non-terminating provider error into a terminating one AT the point it is raised, and the pipeline has already
+    # handed every earlier row to the collector, so those rows survive the catch. The bound is 30 s: far above the measured ~0.1 s, and no longer
+    # than the 30 s the lease snapshot probes are given.
+    try { Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, CreationDate, ExecutablePath, CommandLine -OperationTimeoutSec 30 -ErrorAction Stop | ForEach-Object { [void]$all.Add($_) } }
+    catch { $snapshotError = [string]$_.Exception.Message }
+    if ($null -ne $snapshotError) {
+        $script:LastDescendantWalk = [pscustomobject]@{ ok = $false; partial = ($all.Count -gt 0); rows = $all.Count; why = $snapshotError; rootPid = $ParentProcessId }
+        $nowTs = [System.Diagnostics.Stopwatch]::GetTimestamp()
+        if ($null -eq $script:DescendantWalkFailLogTs -or (($nowTs - [int64]$script:DescendantWalkFailLogTs) / [double][System.Diagnostics.Stopwatch]::Frequency) -ge 60) {
+            $script:DescendantWalkFailLogTs = $nowTs
+            Add-AgentLogLine "descendant-walk: snapshot $(if ($all.Count -gt 0) { 'partial' } else { 'failed' }) pid=$ParentProcessId rows=$($all.Count) why=[$snapshotError]; $(if ($all.Count -gt 0) { 'the rows it returned are walked' } else { 'the walk is empty' })"
+        }
+    }
     if ($null -ne $OnEach) { $null = & $OnEach }
+
+    # pid -> creation time (UTC) for every row that has a readable one (the PID-reuse check below).
+    $createdAt = New-Object 'System.Collections.Generic.Dictionary[int,object]'
+    foreach ($row in $all) {
+        try { if ($null -ne $row -and $null -ne $row.ProcessId -and $row.CreationDate) { $createdAt[[int]$row.ProcessId] = ([DateTime]$row.CreationDate).ToUniversalTime() } }
+        catch { continue }
+    }
 
     # parent pid -> its rows, in the snapshot's order (the order the per-parent query returned them in).
     $byParent = New-Object 'System.Collections.Generic.Dictionary[int,System.Collections.Generic.List[object]]'
@@ -715,6 +746,9 @@ function Get-DescendantProcessIdentities {
             $child = $frame.kids[$frame.next]
             $frame.next = $frame.next + 1
             $childProcessId = [int]$child.ProcessId
+            # r2 (sol 1, fable H1): created BEFORE the parent row it names = a stale edge (the parent's pid was reused), not a descendant.
+            $parentCreated = $null; $childCreated = $null
+            if ($createdAt.TryGetValue([int]$child.ParentProcessId, [ref]$parentCreated) -and $createdAt.TryGetValue($childProcessId, [ref]$childCreated) -and $null -ne $parentCreated -and $null -ne $childCreated -and $childCreated -lt $parentCreated) { continue }
             if (-not $visited.Add($childProcessId)) { continue }
             $grandKids = $null
             if ($byParent.TryGetValue($childProcessId, [ref]$grandKids)) { $stack.Push(@{ kids = $grandKids; next = 0; self = $child }) }
@@ -736,6 +770,9 @@ function Stop-ProcessTree {
     )
 
     $killed = [System.Collections.Generic.List[int]]::new()
+    # AGENT-JOB-MONITOR-CIM-WALK-1 r2 (sol 2, fable H2): the callers append this note to their own message; it is empty unless the walk below
+    # was incomplete, so a failed or partial snapshot is never reported as "the whole tree was stopped".
+    $script:ProcessTreeWalkNote = ""
     $rootMatch = Test-ProcessIdentityMatch -ProcessId $RootProcessId -ExpectedStartUtc $RootStartUtc -ExpectedStartEpochMs $RootStartEpochMs -ExpectedImagePath $RootImagePath
     if (-not $rootMatch.matches) {
         Add-AgentLogLine "refused process-tree stop pid=$RootProcessId reason=$($rootMatch.reason)"
@@ -745,6 +782,13 @@ function Stop-ProcessTree {
         @(Get-DescendantProcessIdentities -ParentProcessId $RootProcessId)
         $rootMatch.identity
     )
+    $walkState = $script:LastDescendantWalk
+    if ($null -ne $walkState -and $walkState.rootPid -eq $RootProcessId -and -not $walkState.ok) {
+        $walkKind = if ($walkState.partial) { "PARTIAL" } else { "FAILED" }
+        $walkScope = if ($walkState.partial) { "only the $($walkState.rows) process rows it returned were searched for descendants" } else { "only the root is stopped" }
+        $script:ProcessTreeWalkNote = "; DESCENDANT WALK $walkKind ($($walkState.why)): $walkScope, descendants it did not list may still be running"
+        Add-AgentLogLine "process-tree stop pid=${RootProcessId}: descendant walk $walkKind why=[$($walkState.why)] rows=$($walkState.rows); $walkScope, descendants it did not list may still be running"
+    }
     foreach ($expected in $identities) {
         if (-not $expected.exists) { continue }
         try {
@@ -4889,8 +4933,9 @@ function Invoke-QueuedJob {
                 $launchedPersisted = Write-StartedMarkerVerified -Path $markerPath -Marker $marker
                 if ($launchedPersisted) { Add-AgentLogLine "launched marker job=$jobId pid=$($jobProcess.Id) verified on retry" }
             }
-            # BACHELOR-LEASE-RENEW-MARGIN-1 r1: the renew tick also runs inside this walk (before each CIM query), the slow step of
-            # a slice under a heavy leg, so a renew due mid-walk is started (and one that exited is collected) there, not a slice later.
+            # BACHELOR-LEASE-RENEW-MARGIN-1 r1: the renew tick also runs inside this walk (before the one snapshot query and once after it),
+            # the slow step of a slice under a heavy leg, so a renew due as the walk starts is started (and one that exited is collected)
+            # there, not a slice later.
             foreach ($descendant in @(Get-DescendantProcessIdentities -ParentProcessId $jobProcess.Id -OnEach { Invoke-QuietLeaseRenewTick })) {
                 if ($descendant.exists) {
                     $trackedDescendants["$($descendant.processId):$($descendant.startEpochMs)"] = $descendant
@@ -4926,7 +4971,7 @@ function Invoke-QueuedJob {
         if ($cancelled) {
             $exit = 130
             $killedProcessIds = @(Stop-ProcessTree -RootProcessId $jobProcess.Id -RootStartUtc $marker.childStartUtc -RootStartEpochMs $marker.childStartEpochMs -RootImagePath $marker.childImagePath)
-            "cancelled by mailbox request; killed process tree pids=$($killedProcessIds -join ',')" |
+            "cancelled by mailbox request; killed process tree pids=$($killedProcessIds -join ',')$($script:ProcessTreeWalkNote)" |
                 Add-Content -Encoding ASCII $errFile
         }
         elseif ($null -ne $leaseStop) {
@@ -4934,9 +4979,9 @@ function Invoke-QueuedJob {
             $killedProcessIds = @(Stop-ProcessTree -RootProcessId $jobProcess.Id -RootStartUtc $marker.childStartUtc -RootStartEpochMs $marker.childStartEpochMs -RootImagePath $marker.childImagePath)
             $script:Admission | Add-Member -NotePropertyName slotContinuity -NotePropertyValue "lost" -Force
             $script:Admission | Add-Member -NotePropertyName leaseStop -NotePropertyValue ([pscustomobject]@{ reason = $leaseStop.reason; why = $leaseStop.why; stoppedUtc = (Get-Date).ToUniversalTime().ToString("o"); guardSec = $script:LeaseBatchJobGuardSec }) -Force
-            "stopped at its batch lease's bound ($($leaseStop.reason): $($leaseStop.why)); killed process tree pids=$($killedProcessIds -join ',')" |
+            "stopped at its batch lease's bound ($($leaseStop.reason): $($leaseStop.why)); killed process tree pids=$($killedProcessIds -join ',')$($script:ProcessTreeWalkNote)" |
                 Add-Content -Encoding ASCII $errFile
-            Add-AgentLogLine "quiet-lease: batch-job-stopped job=$jobId reason=$($leaseStop.reason) why=[$($leaseStop.why)] killed=$($killedProcessIds -join ',')"
+            Add-AgentLogLine "quiet-lease: batch-job-stopped job=$jobId reason=$($leaseStop.reason) why=[$($leaseStop.why)] killed=$($killedProcessIds -join ',')$($script:ProcessTreeWalkNote)"
         }
         elseif ($jobProcess.HasExited) {
             $exit = $jobProcess.ExitCode
@@ -4951,7 +4996,7 @@ function Invoke-QueuedJob {
             $timedOut = $true
             $exit = 124
             $killedProcessIds = @(Stop-ProcessTree -RootProcessId $jobProcess.Id -RootStartUtc $marker.childStartUtc -RootStartEpochMs $marker.childStartEpochMs -RootImagePath $marker.childImagePath)
-            "timed out after ${effectiveTimeoutSec}s; killed process tree pids=$($killedProcessIds -join ',')" |
+            "timed out after ${effectiveTimeoutSec}s; killed process tree pids=$($killedProcessIds -join ',')$($script:ProcessTreeWalkNote)" |
                 Add-Content -Encoding ASCII $errFile
             if ($null -ne $script:Admission.stageCeiling -and $script:Admission.stageCeiling.clamped) {
                 "STAGE_EXEMPT_CEILING_EXCEEDED: staging step ran past its ${effectiveTimeoutSec}s exempt ceiling (asked for $($script:Admission.stageCeiling.requestedSec)s); a lease-exempt job may not heat the host for longer" |
