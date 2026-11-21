@@ -6,6 +6,8 @@
 #include <QString>
 #include <QStringList>
 
+#include <functional>
+
 enum class BatchRenderedVideoCodec : int
 {
     Unspecified = 0,
@@ -381,6 +383,10 @@ struct BatchRenderedVideoFfmpegBinaryPlan
     bool pathSearchOwned = false;
     bool pathSearchAttempted = false;
     bool foundOnPath = false;
+    /* Default request only: the application directory is searched before PATH. A hit there
+     * sets source "app-dir" and foundInAppDir, and leaves foundOnPath false. */
+    bool appDirSearchAttempted = false;
+    bool foundInAppDir = false;
     bool commandExecutableReady = true;
 };
 
@@ -393,8 +399,17 @@ struct BatchRenderedVideoMediaProbeBinaryPlan
     bool pathSearchOwned = false;
     bool pathSearchAttempted = false;
     bool foundOnPath = false;
+    bool appDirSearchAttempted = false;
+    bool foundInAppDir = false;
     bool commandExecutableReady = true;
 };
+
+/* Resolves an executable name. An EMPTY searchDirs list means "search PATH"; otherwise only
+ * the given directories are searched (QStandardPaths::findExecutable semantics). Returns an
+ * empty string when nothing is found. Injected so the lookup order is testable without the
+ * real PATH or the real application directory. */
+using BatchRenderedVideoExecutableResolver =
+    std::function<QString(const QString & name, const QStringList & searchDirs)>;
 
 struct BatchRenderedVideoMediaProbeCommandPlan
 {
@@ -1521,6 +1536,16 @@ batchRenderedVideoFfmpegBinaryPlanFromResolvedPath(
     const QString & resolvedExecutable)
 ;
 
+/* Pure lookup. Only the DEFAULT request (empty or the bare name "ffmpeg") searches
+ * applicationDirectory first and falls back to PATH; any other request is resolved on PATH
+ * alone, exactly as ...FromResolvedPath(request, resolver(request, {})) always did. */
+BatchRenderedVideoFfmpegBinaryPlan
+batchRenderedVideoFfmpegBinaryPlanFromLookup(
+    const QString & requestedExecutable,
+    const QString & applicationDirectory,
+    const BatchRenderedVideoExecutableResolver & resolver)
+;
+
 BatchRenderedVideoFfmpegBinaryPlan
 batchRenderedVideoFfmpegBinaryPlanFromCurrentEnvironment(
     const QString & requestedExecutable = QStringLiteral("ffmpeg"))
@@ -1535,6 +1560,14 @@ BatchRenderedVideoMediaProbeBinaryPlan
 batchRenderedVideoMediaProbeBinaryPlanFromResolvedPath(
     const QString & requestedExecutable,
     const QString & resolvedExecutable)
+;
+
+/* Same rule as ...FfmpegBinaryPlanFromLookup, for the default bare name "ffprobe". */
+BatchRenderedVideoMediaProbeBinaryPlan
+batchRenderedVideoMediaProbeBinaryPlanFromLookup(
+    const QString & requestedExecutable,
+    const QString & applicationDirectory,
+    const BatchRenderedVideoExecutableResolver & resolver)
 ;
 
 BatchRenderedVideoMediaProbeBinaryPlan

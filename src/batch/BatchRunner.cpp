@@ -297,14 +297,15 @@ MediaProbeFacts mediaProbeFactsFromFfmpegDump(const QByteArray &dump)
     return facts;
 }
 
-/* Optional enrichment only. Looks on PATH first, then beside the resolved ffmpeg (the two
- * ship together in every standard distribution). Empty string means "not available", and
- * the caller degrades its REPORT, never its verdict. */
+/* Optional enrichment only. Uses the plan's hit (application directory, then PATH), then
+ * looks beside the resolved ffmpeg (the two ship together in every standard distribution).
+ * Empty string means "not available", and the caller degrades its REPORT, never its verdict. */
 QString resolveOptionalMediaProbe(
     const BatchRenderedVideoMediaProbeBinaryPlan &probePlan,
     const BatchRenderedVideoFfmpegBinaryPlan &ffmpegPlan)
 {
-    if( probePlan.foundOnPath && !probePlan.resolvedExecutable.isEmpty() )
+    if( ( probePlan.foundInAppDir || probePlan.foundOnPath )
+     && !probePlan.resolvedExecutable.isEmpty() )
         return probePlan.resolvedExecutable;
 
     const QString siblingDir = QFileInfo( ffmpegPlan.resolvedExecutable ).absolutePath();
@@ -1039,11 +1040,15 @@ int BatchRunner::run(const QString &inputPath, const QString &outputPath)
          * surface as a failed spawn (exit 4, "export failure"). It is a usage error:
          * report it as one, name what was searched, and exit 2 before touching the clip. */
         if( !ffmpegBinaryPlan.foundOnPath
+         && !ffmpegBinaryPlan.foundInAppDir
          && !QFileInfo::exists( ffmpegBinaryPlan.resolvedExecutable ) )
         {
-            BatchLogger::err(QStringLiteral("[BATCH] ERROR: rendered-video export cannot find ffmpeg. requested=%1 resolved=%2 searched=PATH. Pass --rendered-ffmpeg <path-to-ffmpeg> or put ffmpeg on PATH.\n")
+            BatchLogger::err(QStringLiteral("[BATCH] ERROR: rendered-video export cannot find ffmpeg. requested=%1 resolved=%2 searched=%3. Pass --rendered-ffmpeg <path-to-ffmpeg> or put ffmpeg on PATH.\n")
                 .arg(ffmpegBinaryPlan.requestedExecutable)
-                .arg(ffmpegBinaryPlan.resolvedExecutable));
+                .arg(ffmpegBinaryPlan.resolvedExecutable)
+                .arg(ffmpegBinaryPlan.appDirSearchAttempted
+                    ? QStringLiteral("app-dir,PATH")
+                    : QStringLiteral("PATH")));
             return 2;
         }
 

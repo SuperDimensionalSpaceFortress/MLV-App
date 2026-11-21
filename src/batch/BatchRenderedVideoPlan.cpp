@@ -1,5 +1,6 @@
 #include "BatchRenderedVideoPlan.h"
 
+#include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
 #include <QLocale>
@@ -3636,16 +3637,120 @@ QString batchRenderedVideoCommandExecutableForDisplay(
     return executable;
 }
 
+namespace
+{
+
+/* BATCH-FFMPEG-DEFAULT-APPDIR-LOOKUP-1. The packaged ffmpeg.exe/ffprobe.exe sit beside
+ * MLVApp.exe, and QStandardPaths::findExecutable(name) searches PATH only. So a DEFAULT
+ * request (no --rendered-ffmpeg) looks in the application directory first and falls back to
+ * PATH; an explicit request keeps the PATH-only lookup byte for byte. */
+template <typename Plan, typename FromResolvedPath>
+Plan batchRenderedVideoBinaryPlanFromLookup(
+    const QString & requestedExecutable,
+    const QString & defaultName,
+    const QString & applicationDirectory,
+    const BatchRenderedVideoExecutableResolver & resolver,
+    FromResolvedPath fromResolvedPath)
+{
+    const QString trimmed = requestedExecutable.trimmed();
+    const QString requested = trimmed.isEmpty() ? defaultName : trimmed;
+    const auto resolve = [&resolver](const QString & name, const QStringList & dirs)
+    {
+        return resolver ? resolver(name, dirs) : QString();
+    };
+
+    const QString appDir = applicationDirectory.trimmed();
+    if( requested != defaultName || appDir.isEmpty() )
+        return fromResolvedPath(requested, resolve(requested, QStringList()));
+
+    const QString cleanAppDir = QDir::cleanPath(appDir);
+    const QString appDirHit =
+        resolve(requested, QStringList{ cleanAppDir }).trimmed();
+    if( !appDirHit.isEmpty() )
+    {
+        Plan plan = fromResolvedPath(requested, appDirHit);
+        plan.source = QStringLiteral("app-dir");
+        plan.pathSearchAttempted = false;
+        plan.foundOnPath = false;
+        plan.appDirSearchAttempted = true;
+        plan.foundInAppDir = true;
+        return plan;
+    }
+
+    Plan plan = fromResolvedPath(requested, resolve(requested, QStringList()));
+    plan.appDirSearchAttempted = true;
+    if( !plan.foundOnPath )
+    {
+        plan.reason =
+            QStringLiteral("%1 executable not found in the application directory (%2) or on PATH")
+                .arg(defaultName, cleanAppDir);
+    }
+    return plan;
+}
+
+BatchRenderedVideoExecutableResolver batchRenderedVideoSystemExecutableResolver()
+{
+    return [](const QString & name, const QStringList & searchDirs)
+    {
+        return QStandardPaths::findExecutable(name, searchDirs);
+    };
+}
+
+/* Read here, in the *FromCurrentEnvironment wrappers only. No instance (a console test)
+ * means no application directory: the lookup is then PATH-only, as before. */
+QString batchRenderedVideoCurrentApplicationDirectory()
+{
+    return QCoreApplication::instance()
+        ? QCoreApplication::applicationDirPath()
+        : QString();
+}
+
+} /* anonymous namespace */
+
+BatchRenderedVideoMediaProbeBinaryPlan
+batchRenderedVideoMediaProbeBinaryPlanFromLookup(
+    const QString & requestedExecutable,
+    const QString & applicationDirectory,
+    const BatchRenderedVideoExecutableResolver & resolver)
+{
+    return batchRenderedVideoBinaryPlanFromLookup<BatchRenderedVideoMediaProbeBinaryPlan>(
+        requestedExecutable,
+        QStringLiteral("ffprobe"),
+        applicationDirectory,
+        resolver,
+        [](const QString & requested, const QString & resolved)
+        {
+            return batchRenderedVideoMediaProbeBinaryPlanFromResolvedPath(
+                requested, resolved);
+        });
+}
+
+BatchRenderedVideoFfmpegBinaryPlan
+batchRenderedVideoFfmpegBinaryPlanFromLookup(
+    const QString & requestedExecutable,
+    const QString & applicationDirectory,
+    const BatchRenderedVideoExecutableResolver & resolver)
+{
+    return batchRenderedVideoBinaryPlanFromLookup<BatchRenderedVideoFfmpegBinaryPlan>(
+        requestedExecutable,
+        QStringLiteral("ffmpeg"),
+        applicationDirectory,
+        resolver,
+        [](const QString & requested, const QString & resolved)
+        {
+            return batchRenderedVideoFfmpegBinaryPlanFromResolvedPath(
+                requested, resolved);
+        });
+}
+
 BatchRenderedVideoMediaProbeBinaryPlan
 batchRenderedVideoMediaProbeBinaryPlanFromCurrentEnvironment(
     const QString & requestedExecutable)
 {
-    const QString requested = requestedExecutable.trimmed().isEmpty()
-        ? QStringLiteral("ffprobe")
-        : requestedExecutable.trimmed();
-    return batchRenderedVideoMediaProbeBinaryPlanFromResolvedPath(
-        requested,
-        QStandardPaths::findExecutable(requested));
+    return batchRenderedVideoMediaProbeBinaryPlanFromLookup(
+        requestedExecutable,
+        batchRenderedVideoCurrentApplicationDirectory(),
+        batchRenderedVideoSystemExecutableResolver());
 }
 
 BatchRenderedVideoMediaProbeBinaryPlan
@@ -3701,12 +3806,10 @@ BatchRenderedVideoFfmpegBinaryPlan
 batchRenderedVideoFfmpegBinaryPlanFromCurrentEnvironment(
     const QString & requestedExecutable)
 {
-    const QString requested = requestedExecutable.trimmed().isEmpty()
-        ? QStringLiteral("ffmpeg")
-        : requestedExecutable.trimmed();
-    return batchRenderedVideoFfmpegBinaryPlanFromResolvedPath(
-        requested,
-        QStandardPaths::findExecutable(requested));
+    return batchRenderedVideoFfmpegBinaryPlanFromLookup(
+        requestedExecutable,
+        batchRenderedVideoCurrentApplicationDirectory(),
+        batchRenderedVideoSystemExecutableResolver());
 }
 
 BatchRenderedVideoFfmpegBinaryPlan
