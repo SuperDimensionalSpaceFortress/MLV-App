@@ -333,7 +333,8 @@ function Get-SmokeSummaryTelemetryArm {
     # BENCH-LIGHT-ARM-GAIN-GATES-1: the telemetry arm a smoke leg ran, from the launch block its own result recorded (result.launch: environment AND the argument
     # list, which can carry --stage-log). A result with no recorded launch block, environment or arguments (older binary, missing file) is UNKNOWN, never LIGHT.
     param([object]$Json)
-    Get-FpsArmFromLaunch (Get-NestedValue $Json "launch")
+    # Get-FaProp keeps a one-element "launch" array whole (Get-NestedValue's output would unroll it into the object inside and classify it LIGHT; adversary r5 A6)
+    Get-FpsArmFromLaunch (Get-FaProp $Json "launch")
 }
 
 function Get-PlaybackAbFpsVerdict {
@@ -376,7 +377,8 @@ function Protect-PlaybackCompareFps {
     if ($null -eq $Compare -or $null -eq $Verdict -or $Verdict.allowed) {
         return $Compare
     }
-    foreach ($name in @("presentedFps", "timelineFps", "guiStatusFps", "visibleGuiFps")) {
+    # r5 (adversary A9): avgPresentIntervalMs is the mean gap between two presents, the presented fps in another unit, so its cross-leg delta is withheld with the fps ones
+    foreach ($name in @("presentedFps", "timelineFps", "guiStatusFps", "visibleGuiFps", "avgPresentIntervalMs")) {
         $metric = $Compare.PSObject.Properties[$name]
         if ($null -ne $metric -and $null -ne $metric.Value) {
             $metric.Value.delta = $null
@@ -1742,6 +1744,7 @@ if ($RequireCandidateGlParity) {
 }
 if ($RequireCandidateImprovesPresentedFps) {
     $candidateForSpeed = if ($SeparateCandidateSpeedRun) { $candidateSpeedSummary } else { $candidateSummary }
+    $comparedPairVerdict = if ($SeparateCandidateSpeedRun) { $fpsVerdict.candidateSpeed } else { $fpsVerdict.candidate }
     # round 4 (sol major): this requirement used to compare presentedFps unconditionally, even
     # when Get-HostLoadProofFailures (above) had already flagged one of these exact legs as
     # host-load provisional -- the overall proof still failed either way, but this check ALSO
@@ -1754,10 +1757,12 @@ if ($RequireCandidateImprovesPresentedFps) {
             "baseline=$($baselineSummary.hostLoadProvisional) candidate=$($candidateForSpeed.hostLoadProvisional)"
         )
     }
-    elseif (-not $fpsVerdict.allowed) {
+    elseif (-not $comparedPairVerdict.allowed) {
         # BENCH-LIGHT-ARM-GAIN-GATES-1: an fps verdict from a HEAVY / UNKNOWN leg is refused, never computed: the per-frame logger is in the number.
+        # r5 (adversary A5): the verdict of the pair this requirement compares (baseline vs the separate speed run when there is one), not the aggregate: a HEAVY parity candidate must not
+        # refuse a valid speed-pair improvement check, and the parity pair's own refusal is reported by its compare.
         $proofFailures += (
-            "candidate-presented-fps-improvement-not-evaluated $($fpsVerdict.reason) $($fpsVerdict.detail)"
+            "candidate-presented-fps-improvement-not-evaluated $($comparedPairVerdict.reason) $($comparedPairVerdict.detail)"
         )
     }
     else {

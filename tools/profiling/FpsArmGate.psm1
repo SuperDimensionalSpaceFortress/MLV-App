@@ -53,7 +53,7 @@ $script:FpsArmKnownBenignEnv = [System.Collections.Generic.HashSet[string]]::new
 # excludes every control here. Per control:
 #   id        a short name for the reason text
 #   specKey   the leg spec's generatorArgs key that turns it on ('' = no spec key: an env-only diagnostic)
-#   specKind  'bool' (on unless exactly $false / null: the forwarder's [bool] cast reads the string 'false' as $true) or 'threshold' (a number; on for any value but a negative one,
+#   specKind  'bool' (on unless exactly $false / null: the forwarder's [bool] cast reads the string 'false' as $true) or 'threshold' (a number; on for any value but one in [-1, 0) (r5: the binder's floor is -1, so a number below it is a leg that cannot run, never a quiet one),
 #             because the job's `-ge 0` is what starts the per-launch logger, so 0 is ON). Anything else present is read toward ON.
 #   envVar    the environment variable the job / app reads ('' = none: the control is a helper process the environment cannot show)
 #   kind      how the CONSUMER reads the variable, read from its source: 'flag' = on unless exactly "0" (StageTiming.h:74, MainWindow.cpp:185-186; "" reads toward on, as for every flag),
@@ -96,6 +96,21 @@ $script:FpsObserverEnvNames = [System.Collections.Generic.HashSet[string]]::new(
 
 function Get-FpsObserverControls { $script:FpsObserverControls }
 
+function Test-FaTextEq {
+    # Ordinal equality of two strings. PowerShell's -ceq / -cne / -cin compare with the INVARIANT CULTURE, which ignores zero-width and soft-hyphen characters: 'LIGHT' + U+00AD -ceq 'LIGHT' and
+    # ('0' + U+00AD) -cne '0' is $false, so a recorded value carrying one passed as the word or the zero the native reader compares byte for byte (adversary r5 A1, introduced). Every comparison of
+    # RECORDED text goes through here.
+    param([AllowNull()]$A, [AllowNull()]$B)
+    ($A -is [string]) -and ($B -is [string]) -and [string]::Equals($A, $B, [System.StringComparison]::Ordinal)
+}
+
+function Test-FaTextIn {
+    param([AllowNull()]$A, [string[]]$Set)
+    if ($A -isnot [string]) { return $false }
+    foreach ($s in $Set) { if ([string]::Equals($A, $s, [System.StringComparison]::Ordinal)) { return $true } }
+    $false
+}
+
 function Test-FaHasProp {
     # Is the key PRESENT (a null value counts as present)? The venue leg forwards a key by `.PSObject.Properties['key']`, i.e. by presence, so absent and null are different inputs.
     param([AllowNull()]$Object, [Parameter(Mandatory)][string]$Name)
@@ -110,7 +125,9 @@ function Test-FpsSpecObserverOn {
     # present value other than exactly $false or null is on.
     param([Parameter(Mandatory)]$Control, [bool]$Present, [AllowNull()]$Value)
     if (-not $Present) { return $false }
-    if ($Control.specKind -ceq 'threshold') { return -not (($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) -and $Value -lt 0) }
+    # luna/adversary r5 A11: the generator binder is [ValidateRange(-1, 10000)] (playback-attr-3-cuda-job.ps1:442), so a number below -1 is a leg that cannot run: it is read as ON (UNKNOWN), never as a quiet LIGHT.
+    # Off is a number in [-1, 0) (the default -1, or a fraction the job's `-ge 0` still reads as off).
+    if ($Control.specKind -ceq 'threshold') { return -not (($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) -and $Value -lt 0 -and $Value -ge -1) }
     if ($null -eq $Value) { return $false }
     -not ($Value -is [bool] -and -not $Value)
 }
@@ -136,6 +153,8 @@ function Read-FpsRecordedObserverControls {
     param([AllowNull()]$Container)
     $none = [pscustomobject]@{ present = $false; entries = 0; problem = $null }
     if ($null -eq $Container -or $Container -is [string] -or $Container -is [System.ValueType]) { return $none }
+    # adversary r5 A14: a HOLDER (a record's generatorArgs) that is an array is a record this reader cannot read at all; an outer all-off list must not corroborate it
+    if ($Container -is [System.Array]) { return [pscustomobject]@{ present = $true; entries = 0; problem = [pscustomobject]@{ kind = 'unreadable'; text = 'the record holder is an array, not an object' } } }
     if (-not (Test-FaHasProp $Container 'observerControls')) { return $none }
     $controls = Get-FaProp $Container 'observerControls'
     $fail = { param($kind, $text, $n) [pscustomobject]@{ present = $true; entries = $n; problem = [pscustomobject]@{ kind = $kind; text = $text } } }
@@ -205,7 +224,18 @@ function Get-FpsArmFromLegRecord {
         $oc = Read-FpsRecordedObserverControls $holder
         if ($null -ne $oc.problem) { return New-FpsArm 'UNKNOWN' 'record' "telemetryArm=LIGHT but the record's observerControls fail closed ($($oc.problem.kind): $($oc.problem.text))" }
     }
-    if ($field -isnot [string]) { return $field }
+    if ($field -isnot [string]) {
+        # adversary r5 A2: an arm OBJECT is the arm a smoke summary derived from its launch environment (source 'environment'). A LIGHT object whose leg also records its `launch` must agree with
+        # that launch (a contradicting one is not LIGHT), and one that does not name the environment as its source is a label, which needs a recorded observer list like the bare word.
+        $launch = Get-FaProp $Leg 'launch'
+        if ($null -ne $launch) {
+            $derived = Get-FpsArmFromLaunch $launch
+            if ($derived.arm -cne 'LIGHT') { return New-FpsArm 'UNKNOWN' 'record' "telemetryArm=LIGHT but the leg's recorded launch reads $($derived.arm) ($($derived.reason))" }
+        } elseif (-not (Test-FaTextEq (Get-FaProp $field 'source') 'environment') -and -not (Test-FpsRecordHasObserverEvidence $Leg)) {
+            return New-FpsArm 'UNKNOWN' 'record' 'telemetryArm=LIGHT but the arm object does not name the launch environment as its source and the record records no observer controls'
+        }
+        return $field
+    }
     # a bare arm WORD with no recorded observer controls is not proof (the same rule as a recorded result, Get-FpsArmFromJobResult): the arm object a smoke summary records is judged from its launch
     # environment, the word is not
     if (-not (Test-FpsRecordHasObserverEvidence $Leg)) { return New-FpsArm 'UNKNOWN' 'record' 'telemetryArm=LIGHT but the record records no observer controls (the arm word alone is not proof)' }
@@ -237,7 +267,7 @@ function ConvertTo-FpsArmName {
     if ($null -eq $Value) { return 'UNKNOWN' }
     $v = $Value
     if ($Value -isnot [string]) { $inner = Get-FaProp $Value 'arm'; if ($null -ne $inner) { $v = $inner } }
-    if ($v -is [string] -and $v -cin @('LIGHT', 'HEAVY')) { return [string]$v }
+    if (Test-FaTextIn $v @('LIGHT', 'HEAVY')) { return [string]$v }
     'UNKNOWN'
 }
 
@@ -250,17 +280,17 @@ function Get-FpsArmFromLegSpec {
     param([AllowNull()]$Spec)
     if ($null -eq $Spec -or $Spec -is [string] -or $Spec -is [System.ValueType]) { return New-FpsArm 'UNKNOWN' 'spec' 'no-spec' }
     $legType = Get-FaProp $Spec 'legType'
-    if ($legType -is [string] -and $legType -ceq 'export') { return New-FpsArm 'UNKNOWN' 'spec' 'not-a-playback-leg' }
+    if (Test-FaTextEq $legType 'export') { return New-FpsArm 'UNKNOWN' 'spec' 'not-a-playback-leg' }
     $ga = Get-FaProp $Spec 'generatorArgs'
     $arm = Get-FaProp $ga 'telemetryArm'
     if ($null -eq $arm) { return New-FpsArm 'UNKNOWN' 'spec' 'telemetryArm-absent (the generator default is HEAVY)' }
-    if ($arm -is [string] -and $arm -ceq 'LIGHT') {
+    if (Test-FaTextEq $arm 'LIGHT') {
         # the arm word says LIGHT, but a spec that also switches on an observer control the job forwards (a per-launch logger, a sampler) is not proof of it (adversary pass 3 A2)
         $observer = Get-FpsSpecObserverOn $ga
         if ($null -ne $observer) { return New-FpsArm 'UNKNOWN' 'spec' "generatorArgs.telemetryArm=LIGHT but generatorArgs.$($observer.specKey) enables an observer ($($observer.id)) inside the timed window" }
         return New-FpsArm 'LIGHT' 'spec' 'generatorArgs.telemetryArm=LIGHT'
     }
-    if ($arm -is [string] -and $arm -ceq 'HEAVY') { return New-FpsArm 'HEAVY' 'spec' 'generatorArgs.telemetryArm=HEAVY' }
+    if (Test-FaTextEq $arm 'HEAVY') { return New-FpsArm 'HEAVY' 'spec' 'generatorArgs.telemetryArm=HEAVY' }
     New-FpsArm 'UNKNOWN' 'spec' 'telemetryArm-invalid (not LIGHT or HEAVY)'
 }
 
@@ -275,7 +305,7 @@ function Get-FpsArmFromJobResult {
     if ($null -eq $Result -or $Result -is [string] -or $Result -is [System.ValueType]) { return New-FpsArm 'UNKNOWN' 'result' 'no-result' }
     $arm = Get-FaProp $Result 'telemetryArm'
     if ($null -eq $arm) { return New-FpsArm 'UNKNOWN' 'result' 'result-carries-no-telemetryArm' }
-    if ($arm -is [string] -and $arm -ceq 'LIGHT') {
+    if (Test-FaTextEq $arm 'LIGHT') {
         # a result that records an enabled observer control (the same keys as a spec: at its top level, under its generatorArgs, or under an `observerControls` object) is not LIGHT
         # either (adversary pass 3 A2)
         $containers = @($Result, (Get-FaProp $Result 'generatorArgs'), (Get-FaProp $Result 'observerControls'))
@@ -295,7 +325,7 @@ function Get-FpsArmFromJobResult {
         if (-not $recorded -and -not $ObserversFromSpec) { return New-FpsArm 'UNKNOWN' 'result' 'telemetryArm=LIGHT but the result records no observer controls (provenance carries the arm word only); judge it with its leg spec' }
         return New-FpsArm 'LIGHT' 'result' 'telemetryArm=LIGHT'
     }
-    if ($arm -is [string] -and $arm -ceq 'HEAVY') { return New-FpsArm 'HEAVY' 'result' 'telemetryArm=HEAVY' }
+    if (Test-FaTextEq $arm 'HEAVY') { return New-FpsArm 'HEAVY' 'result' 'telemetryArm=HEAVY' }
     New-FpsArm 'UNKNOWN' 'result' 'telemetryArm-invalid (not LIGHT or HEAVY)'
 }
 
@@ -324,7 +354,7 @@ function Test-FpsEnvFlagOn {
     # other set value is read toward HEAVY (adversary A1: TELEMETRY=false and STAGE_TIMING=false are on in the native readers).
     param([AllowNull()]$Value)
     if ($null -eq $Value) { return $false }
-    ([string]$Value) -cne '0'
+    -not (Test-FaTextEq ([string]$Value) '0')
 }
 
 function Test-FpsEnvVarOn {
@@ -338,7 +368,7 @@ function Test-FpsEnvVarOn {
         $text = [string]$Value
         if ([string]::IsNullOrEmpty($text)) { return $false }
         if ($text -notmatch '^[\x00-\x7F]*$') { return $true }
-        return ($text.Trim(" `t`n`r`v`f").ToLowerInvariant() -cin @('1', 'true', 'yes', 'on'))
+        return (Test-FaTextIn ($text.Trim(" `t`n`r`v`f").ToLowerInvariant()) @('1', 'true', 'yes', 'on'))
     }
     Test-FpsEnvFlagOn $Value
 }
@@ -369,7 +399,7 @@ function ConvertTo-FpsEnvMap {
         $v = $pair[1]
         if ($null -ne $v -and $v -isnot [string] -and $v -isnot [System.ValueType]) { return (& $result 'malformed' $null "environment value of $($pair[0]) is not a scalar") }
         $text = if ($null -eq $v) { '' } else { [string]$v }
-        if ($map.ContainsKey($pair[0]) -and $map[$pair[0]] -cne $text) { return (& $result 'malformed' $null "$($pair[0]) is repeated with different values") }
+        if ($map.ContainsKey($pair[0]) -and -not (Test-FaTextEq $map[$pair[0]] $text)) { return (& $result 'malformed' $null "$($pair[0]) is repeated with different values") }
         $map[$pair[0]] = $text
     }
     & $result 'ok' $map ''
@@ -509,10 +539,10 @@ function Get-FpsLegPlanRefusal {
     # is BAD_PURPOSE (adversary A3); only a plan with no purpose key is undeclared.
     param([AllowNull()]$Purpose, [AllowNull()][object[]]$Items, [switch]$Declared)
     if ($null -eq $Purpose -and -not $Declared) { return @('', 0, '') }
-    if ($Purpose -isnot [string] -or $Purpose -cnotin @('fps-ab', 'stage-attribution')) {
+    if (-not (Test-FaTextIn $Purpose @('fps-ab', 'stage-attribution'))) {
         return @('BAD_PURPOSE', 0, "purpose must be 'fps-ab' or 'stage-attribution'")
     }
-    if ($Purpose -cne 'fps-ab') { return @('', 0, '') }
+    if (-not (Test-FaTextEq $Purpose 'fps-ab')) { return @('', 0, '') }
     # A $null item is an item whose arm nobody supplied: UNKNOWN at its position, never dropped (adversary A7).
     $arms = @()
     if ($null -ne $Items) {

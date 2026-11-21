@@ -707,6 +707,10 @@ else {
         detail = [string]$playbackAbFpsArmVerdict.detail
     }
     if ($playbackAbFpsArmRefusal.refused) {
+        # r5 (adversary A8): a packet written before this gate carries the wrapper's own "candidate-presented-fps-not-improved ..." failure, computed from an fps pair this gate now refuses. The proof-failure
+        # loop above copied it into the blockers and a diagnostic before the arm was judged; it is not a finding about a refused pair, so it is taken back out here (every other failure stays).
+        [void]$playbackAbBlockers.RemoveAll([Predicate[string]]{ param($b) $b.StartsWith('candidate-presented-fps-not-improved', [StringComparison]::Ordinal) })
+        [void]$diagnostics.RemoveAll([Predicate[object]]{ param($d) ($d.code -ceq 'PLAYBACK_AB_PROOF_FAILURE') -and ([string]$d.message).StartsWith('candidate-presented-fps-not-improved', [StringComparison]::Ordinal) })
         Add-Diagnostic `
             -Diagnostics $diagnostics `
             -Area "playback-speed" `
@@ -749,7 +753,8 @@ if ($playbackAb -and $playbackAbSpeedCompare) {
     $playbackSpeedEvidence = @(
         "comparison_basis=$playbackAbComparisonBasis"
     ) + $playbackSpeedFpsLines + @(
-        (Format-MetricDeltaLine -Label "avg present interval" -Metric $playbackAbSpeedCompare.avgPresentIntervalMs -Unit " ms" -LowerIsBetter),
+        # r5 (adversary A9): the mean gap between two presents IS the presented fps in another unit (50 ms vs 40 ms = 20 vs 25 fps; no stage is timed by it), so a refused pair prints no delta for it
+        $(if ($playbackAbFpsArmRefusal.refused) { "avg present interval: withheld ($($playbackAbFpsArmRefusal.reason)); the gap between presents is the fps in another unit" } else { (Format-MetricDeltaLine -Label "avg present interval" -Metric $playbackAbSpeedCompare.avgPresentIntervalMs -Unit " ms" -LowerIsBetter) }),
         (Format-MetricDeltaLine -Label "render total" -Metric $playbackAbSpeedCompare.avgRenderTotalMs -Unit " ms" -LowerIsBetter)
     )
     # BENCH-LIGHT-ARM-GAIN-GATES-1 (adversary A9): the packet's cached suggestion is fps-delta-derived, so it is not repeated for a pair the arm gate refused.

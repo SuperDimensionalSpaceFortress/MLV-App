@@ -3076,6 +3076,16 @@ $envs = @(
 # updateTextureIfNeeded), so a LIGHT leg (a presented-fps measurement) must not carry it. Only a LIGHT leg drops it; every other arm keeps the line above exactly as before. (The cpu leg's
 # template edit below removes the same line from its own list; this filter finds nothing there.)
 if ($TelemetryArm -eq 'LIGHT') { $envs = @($envs | Where-Object { $_ -ne 'MLVAPP_VIEWPORT_PRESENT_DIAG=1' }) }
+# r5 (adversary A3): the filter above drops only what this job EMITS. The smoke child also inherits this process's environment, so a worker that carries one of the observer variables would still run its
+# logger inside a LIGHT leg while the receipt (which serializes the override list) says nothing. A LIGHT leg removes each of them from its own process environment first (the same technique as the cpu leg's
+# GL-viewport clear; removed, not set to 0, because some readers test only that the variable is set). The list is the observer list of tools/profiling/FpsArmGate.psm1 (a test compares the two).
+if ($TelemetryArm -eq 'LIGHT') {
+    foreach ($inheritedObserverVariable in @('MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY', 'MLVAPP_PLAYBACK_DETAILED_TIMELINE_TELEMETRY', 'MLVAPP_STAGE_TIMING', 'MLVAPP_PERF_FIELD_LOG', 'MLVAPP_PLAYBACK_RBF_DETAIL_TIMING',
+            'MLVAPP_INTERACTIVE_TRACE', 'MLVAPP_GPU_TEX_NR_OVERLAP_TRACE', 'MLVAPP_VIEWPORT_PRESENT_DIAG', 'MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT', 'MLVAPP_PHASE3_TEL_PATH', 'MLVAPP_STAGE_TIMING_FILE',
+            'MLVAPP_PERF_FIELD_LOG_PATH', 'MLVAPP_PERF_FIELD_LOG_DIR', 'MLVAPP_CUDA_LAUNCH_TIMING', 'MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS', 'MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE', 'MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR')) {
+        [Environment]::SetEnvironmentVariable($inheritedObserverVariable, $null, 'Process')
+    }
+}
 # LIGHT-ARM-PRESENT-DIAG-1 <<<
 $envList = "'" + ($envs -join "','") + "'"
 function ConvertTo-PsSingleQuoted([string]$Value) { "'" + $Value.Replace("'", "''") + "'" }

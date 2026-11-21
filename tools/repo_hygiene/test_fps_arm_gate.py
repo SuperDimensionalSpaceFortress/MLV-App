@@ -474,7 +474,7 @@ class CudaPlaybackAbFpsGateTests(_Probe):
     @staticmethod
     def leg(arm: str | None, fps: float, queue_ms: float) -> str:
         arm_part = _light_word(arm)
-        return f"[pscustomobject]@{{ {arm_part}presentedFps = {fps}; avgQueueWaitMs = {queue_ms}; avgDrawTotalMs = 12.0 }}"
+        return f"[pscustomobject]@{{ {arm_part}presentedFps = {fps}; avgPresentIntervalMs = {round(1000.0 / fps, 3)}; avgQueueWaitMs = {queue_ms}; avgDrawTotalMs = 12.0 }}"
 
     def run_ab(self, baseline: str, candidate: str) -> dict:
         out = self.ok(f"$b = {baseline}\n$c = {candidate}\n"
@@ -490,6 +490,7 @@ class CudaPlaybackAbFpsGateTests(_Probe):
         r = self.run_ab(self.leg("LIGHT", 50.0, 5.0), self.leg("LIGHT", 55.0, 5.0))
         self.assertTrue(r["verdict"]["allowed"])
         self.assertEqual(r["compare"]["presentedFps"]["deltaPercent"], 10.0)
+        self.assertIsNotNone(r["compare"]["avgPresentIntervalMs"]["deltaPercent"], "an allowed pair keeps the interval delta")
         self.assertNotEqual(r["analysis"]["dominantBottleneck"], "fps-arm-refused")
 
     def test_a_heavy_pair_refuses_the_fps_delta_and_keeps_stage_deltas(self) -> None:
@@ -501,6 +502,12 @@ class CudaPlaybackAbFpsGateTests(_Probe):
         self.assertIsNone(fps["deltaPercent"])
         self.assertEqual(fps["refused"], HEAVY_REASON)
         self.assertEqual(r["compare"]["avgQueueWaitMs"]["deltaPercent"], -50.0, "stage metrics stay")
+        # r5 (adversary A9): the gap between presents is the fps in another unit, so its cross-leg delta is withheld with the fps ones (and the analysis does not carry it)
+        interval = r["compare"]["avgPresentIntervalMs"]
+        self.assertIsNone(interval["delta"])
+        self.assertIsNone(interval["deltaPercent"])
+        self.assertEqual(interval["refused"], HEAVY_REASON)
+        self.assertIsNone(r["analysis"]["evidence"]["presentIntervalDeltaPercent"])
         self.assertEqual(r["analysis"]["dominantBottleneck"], "fps-arm-refused")
         self.assertEqual(r["analysis"]["evidence"]["queueWaitDeltaPercent"], -50.0)
 
@@ -580,6 +587,28 @@ class CudaPlaybackAbRequireImprovementBlockTests(_Probe):
             "$fpsVerdict = Get-PlaybackAbFpsVerdict -BaselineSummary $baselineSummary -CandidateSummary $candidateSummary -CandidateSpeedSummary $candidateSpeedSummary\n"
             + block + "\nforeach ($f in $proofFailures) { Write-Host ('FAIL=' + $f) }\nWrite-Host ('COUNT=' + @($proofFailures).Count)\n")
         return out.splitlines()
+
+    def run_separate(self, parity: str, speed: str, fps_speed: float) -> str:
+        source = CUDA_AB_SCRIPT.read_text(encoding="utf-8")
+        block = _extract_block(source, "if ($RequireCandidateImprovesPresentedFps) {", "candidate-presented-fps-not-improved baseline=$baselineFps candidate=$candidateFps", trailing_lines=3)
+        return self.ok(
+            f"$baselineSummary = [pscustomobject]@{{ telemetryArm = 'LIGHT'; {OBSERVERS_RECORDED_OFF}presentedFps = 10.0; hostLoadProvisional = $false }}\n"
+            f"$candidateSummary = [pscustomobject]@{{ telemetryArm = '{parity}'; {OBSERVERS_RECORDED_OFF}presentedFps = 7.0; hostLoadProvisional = $false }}\n"
+            f"$candidateSpeedSummary = [pscustomobject]@{{ telemetryArm = '{speed}'; {OBSERVERS_RECORDED_OFF}presentedFps = {fps_speed}; hostLoadProvisional = $false }}\n"
+            "$SeparateCandidateSpeedRun = $true\n$RequireCandidateImprovesPresentedFps = $true\n$proofFailures = @()\n"
+            "$fpsVerdict = Get-PlaybackAbFpsVerdict -BaselineSummary $baselineSummary -CandidateSummary $candidateSummary -CandidateSpeedSummary $candidateSpeedSummary -SeparateCandidateSpeedRun\n"
+            + block + "\nforeach ($f in $proofFailures) { Write-Host ('FAIL=' + $f) }\nWrite-Host ('COUNT=' + @($proofFailures).Count)\n")
+
+    def test_a_separate_speed_run_is_judged_on_the_speed_pair_not_the_aggregate(self) -> None:
+        # r5 (adversary A5): the parity candidate is HEAVY (the validation observer), the speed run is LIGHT; the requirement compares baseline with the speed run, so the parity pair's refusal
+        # (reported by its own compare) must not refuse it
+        ok = self.run_separate("HEAVY", "LIGHT", 20.0)
+        self.assertNotIn("not-evaluated", ok)
+        self.assertIn("COUNT=0", ok)
+        regress = self.run_separate("HEAVY", "LIGHT", 9.0)
+        self.assertIn("candidate-presented-fps-not-improved baseline=10 candidate=9", regress)
+        # and a HEAVY speed run is still refused, typed
+        self.assertIn(HEAVY_REASON, self.run_separate("LIGHT", "HEAVY", 20.0))
 
     def test_heavy_legs_get_the_typed_refusal_not_a_regression_line(self) -> None:
         lines = self.run_block("'HEAVY'", "'HEAVY'", 40.0, 30.0)
@@ -793,7 +822,12 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
         # the improvement diagnostic is behind the arm refusal
         self.assertRegex(source, r"-not \$playbackAbHostLoadProvisional -and\s+-not \$playbackAbFpsArmRefusal\.refused -and")
 
-    def run_summarizer_block(self, baseline_arm: str, candidate_arm: str, analysis: str = "$null", candidate_extra: str = "", bare_candidate: bool = False) -> list[str]:
+    def run_summarizer_block(self, baseline_arm: str, candidate_arm: str, analysis: str = "$null", candidate_extra: str = "", bare_candidate: bool = False, stale_failures: bool = False) -> list[str]:
+        # stale_failures: what the proof-failure loop (before this block) copied from a packet written before the gate: the wrapper's own fps-regression string, and one unrelated failure
+        stale_injection = ""
+        if stale_failures:
+            stale_injection = ("foreach ($f in @('candidate-presented-fps-not-improved baseline=50 candidate=40', 'candidate-no-readback-frames=0')) { [void]$playbackAbBlockers.Add($f); "
+                               "Add-Diagnostic -Diagnostics $diagnostics -Area 'playback-speed' -Code 'PLAYBACK_AB_PROOF_FAILURE' -Message $f -NextAction 'x' }\n")
         candidate_word = "telemetryArm = '" + candidate_arm + "'; " if bare_candidate else _light_word(candidate_arm)
         tmp = Path(tempfile.mkdtemp(prefix="fps-arm-summ-"))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
@@ -816,6 +850,7 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
             "avgRenderTotalMs = [pscustomobject]@{ baseline = 10; candidate = 11; delta = 1; deltaPercent = 10 } }\n"
             "$playbackAbCandidateLeg = $playbackAb.candidate\n$playbackAbHostLoadProvisional = $false\n"
             "$playbackAbBlockers = [System.Collections.Generic.List[string]]::new()\n$diagnostics = [System.Collections.Generic.List[object]]::new()\n"
+            + stale_injection
             + "if ($true) {\n" + block + "\n" + evidence +
             "\nforeach ($d in $diagnostics) { Write-Host ('DIAG=' + $d.code) }\nforeach ($e in $playbackSpeedEvidence) { Write-Host ('EV=' + $e) }\n"
             "Write-Host ('BLOCKERS=' + ($playbackAbBlockers -join ' / '))\n", encoding="utf-8")
@@ -829,7 +864,10 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
         self.assertNotIn("PLAYBACK_PRESENTED_FPS_NOT_IMPROVED", text)
         self.assertIn(HEAVY_REASON, text)
         self.assertNotIn("presented FPS: CPU", text)
-        self.assertIn("avg present interval", text, "stage lines stay")
+        self.assertIn("render total", text, "stage lines stay")
+        # r5 (adversary A9): the gap between presents is the fps in another unit, so no delta line is printed for it on a refused pair
+        self.assertIn("avg present interval: withheld", text)
+        self.assertNotIn("avg present interval: CPU", text)
 
     def test_a_refused_pair_repeats_no_cached_fps_derived_suggestion(self) -> None:
         # adversary A9 (pre-existing append, same class): the packet's analysis.suggestedOptimization is derived from the fps delta
@@ -860,6 +898,17 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
         self.assertNotIn("presented FPS: CPU", text)
         off = "\n".join(self.run_summarizer_block("LIGHT", "LIGHT", candidate_extra="utilSample = $false; "))
         self.assertNotIn("PLAYBACK_AB_FPS_ARM_REFUSED", off)
+
+    def test_a_stale_fps_regression_failure_is_not_republished_for_a_refused_pair(self) -> None:
+        # r5 (adversary A8): a packet written before this gate carried "candidate-presented-fps-not-improved baseline=50 candidate=40" (an fps pair the gate refuses now); the loop above the arm
+        # judgement copied it into the blockers and a diagnostic. It is taken out for a refused pair; the unrelated failure stays, and an allowed (LIGHT) pair keeps both.
+        refused = self.run_summarizer_block("HEAVY", "HEAVY", stale_failures=True)
+        blockers = next(line for line in refused if line.startswith("BLOCKERS="))
+        self.assertNotIn("candidate-presented-fps-not-improved", blockers)
+        self.assertIn("candidate-no-readback-frames=0", blockers)
+        self.assertEqual([line for line in refused if line == "DIAG=PLAYBACK_AB_PROOF_FAILURE"], ["DIAG=PLAYBACK_AB_PROOF_FAILURE"])
+        allowed = next(line for line in self.run_summarizer_block("LIGHT", "LIGHT", stale_failures=True) if line.startswith("BLOCKERS="))
+        self.assertIn("candidate-presented-fps-not-improved", allowed)
 
     def test_a_candidate_that_carries_only_the_light_word_is_refused_here_too(self) -> None:
         # r5 (Dot on f51e0821): the third verdict reader (summarize-local-cuda-proof.ps1:700-701) reads the same rule
@@ -1248,6 +1297,77 @@ class ObserverControlTests(_Probe):
         self.assertEqual(sorted(set(rows["HEAVY|$false"]) - set(rows["LIGHT|$false"]) - {diag}),
                          sorted(["MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=0", "MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY=1", "MLVAPP_PLAYBACK_DETAILED_TIMELINE_TELEMETRY=1",
                                 "MLVAPP_STAGE_TIMING=1", "MLVAPP_PERF_FIELD_LOG=1"]))
+
+    def test_a_light_venue_leg_clears_every_inherited_observer_variable_and_other_arms_keep_them(self) -> None:
+        # r5 (adversary A3): the filter above drops only the override the job emits; the smoke child inherits the job's process environment, so a worker carrying MLVAPP_VIEWPORT_PRESENT_DIAG=on
+        # (or MLVAPP_STAGE_TIMING=1 ...) ran its logger inside an admitted LIGHT leg. The region clears each observer variable of the module's list for a LIGHT leg only.
+        job = (PROFILING / "bachelor" / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8")
+        region = job.split("# LIGHT-ARM-PRESENT-DIAG-1 >>>", 1)[1].split("# LIGHT-ARM-PRESENT-DIAG-1 <<<", 1)[0]
+        listed = set(self.ok("(Get-FpsObserverControls | Where-Object { $_.envVar } | ForEach-Object { $_.envVar }) -join ','").strip().split(","))
+        self.assertGreater(len(listed), 15)
+        self.assertEqual(sorted(n for n in listed if f"'{n}'" not in region), [], "every observer variable of the module's list is cleared by the LIGHT leg's region")
+        body = "".join(
+            f"$TelemetryArm = '{arm}'; $envs = @('A=1','MLVAPP_VIEWPORT_PRESENT_DIAG=1'); $env:MLVAPP_STAGE_TIMING = '1'; $env:MLVAPP_VIEWPORT_PRESENT_DIAG = 'on'; $env:MLVAPP_PERF_FIELD_LOG_DIR = 'x'\n{region}\n"
+            f"Write-Host ('R={arm}|' + [bool]$env:MLVAPP_STAGE_TIMING + '|' + [bool]$env:MLVAPP_VIEWPORT_PRESENT_DIAG + '|' + [bool]$env:MLVAPP_PERF_FIELD_LOG_DIR + '|' + ($envs -join ','))\n"
+            for arm in ("LIGHT", "HEAVY", ""))
+        rows = [line for line in self.ok(body).splitlines() if line.startswith("R=")]
+        self.assertEqual(rows, ["R=LIGHT|False|False|False|A=1", "R=HEAVY|True|True|True|A=1,MLVAPP_VIEWPORT_PRESENT_DIAG=1", "R=|True|True|True|A=1,MLVAPP_VIEWPORT_PRESENT_DIAG=1"])
+
+    def test_a_flag_or_arm_word_carrying_a_zero_width_character_is_not_the_plain_one(self) -> None:
+        # r5 (adversary A1): PowerShell's -ceq / -cne / -cin ignore U+00AD and the zero-width characters, so 'LIGHT'+U+00AD read as LIGHT and ('0'+U+00AD) as the zero the native reader
+        # compares byte for byte. Recorded text is compared ordinally.
+        shy = "[char]173"
+        cases = {
+            f"Get-FpsArmFromEnvironment @({LIGHT_ENV},('MLVAPP_STAGE_TIMING=0' + {shy}))": "HEAVY",
+            f"Get-FpsArmFromEnvironment @({LIGHT_ENV},'MLVAPP_STAGE_TIMING=0')": "LIGHT",
+            f"Get-FpsArmFromEnvironment @({LIGHT_ENV},('MLVAPP_STAGE_TIMING=0' + [char]8203))": "HEAVY",
+            f"Get-FpsArmFromEnvironment @({LIGHT_ENV},('MLVAPP_STAGE_TIMING=0' + [char]65279))": "HEAVY",
+            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = ('LIGHT' + {shy}); {OBSERVERS_RECORDED_OFF}}})": "UNKNOWN",
+            f"Get-FpsArmFromJobResult ([pscustomobject]@{{ telemetryArm = ('LIGHT' + {shy}); {OBSERVERS_RECORDED_OFF}}})": "UNKNOWN",
+            f"Get-FpsArmFromLegSpec ([pscustomobject]@{{ legType = 'speed'; generatorArgs = [pscustomobject]@{{ telemetryArm = ('LIGHT' + {shy}) }} }})": "UNKNOWN",
+        }
+        self.check(cases)
+        # a key repeated with a value that differs only by such a character is a malformed environment, not one value
+        out = self.ok(f"$e = ConvertTo-FpsEnvMap @('MLVAPP_STAGE_TIMING=0', ('mlvapp_stage_timing=0' + {shy}))\nWrite-Host ('STATE=' + $e.state)")
+        self.assertEqual(out.strip(), "STATE=malformed")
+
+    def test_a_record_whose_generator_args_is_an_array_fails_closed_in_both_readers(self) -> None:
+        # r5 (adversary A14): the array holder's properties were invisible to the helpers, and the outer all-off list corroborated the record
+        doc = self._json('{"telemetryArm":"LIGHT","observerControls":{"utilSample":false},"generatorArgs":[{"utilSample":true}]}')
+        self.check({f"Get-FpsArmFromLegRecord {doc}": "UNKNOWN", f"Get-FpsArmFromJobResult {doc}": "UNKNOWN"})
+
+    def test_a_threshold_below_the_binders_floor_is_not_quiet(self) -> None:
+        # r5 (adversary A11): the generator binder is [ValidateRange(-1, 10000)] (playback-attr-3-cuda-job.ps1:442): -1 is the default (off) and a number in [-1, 0) is still off to the job's -ge 0;
+        # a number below -1 is a leg that cannot run, so it is never an admitted LIGHT leg
+        self.check({
+            f"Get-FpsArmFromLegSpec ({_spec(cudaLaunchTimingMinMs='-2')})": "UNKNOWN",
+            f"Get-FpsArmFromLegSpec ({_spec(cudaLaunchTimingMinMs='-1.5')})": "UNKNOWN",
+            f"Get-FpsArmFromLegSpec ({_spec(cudaLaunchTimingMinMs='-1')})": "LIGHT",
+            f"Get-FpsArmFromLegSpec ({_spec(cudaLaunchTimingMinMs='-0.5')})": "LIGHT",
+            f"Get-FpsArmFromLegSpec ({_spec(cudaLaunchTimingMinMs='0')})": "UNKNOWN",
+        })
+
+    def test_a_malformed_launch_block_cannot_read_light_through_the_comparators(self) -> None:
+        # r5 (adversary A6): Get-NestedValue unrolled a one-element "launch" array into the object inside, so the comparators classified a malformed record LIGHT. They read the block with Get-FaProp now.
+        for script in (COMPARE_SMOKE_AB_SCRIPT, CUDA_AB_SCRIPT):
+            source = script.read_text(encoding="utf-8")
+            self.assertNotIn('Get-FpsArmFromLaunch (Get-NestedValue', source, script.name)
+            self.assertIn('Get-FpsArmFromLaunch (Get-FaProp', source, script.name)
+        out = self.ok("$j = ConvertFrom-Json '{\"launch\":[{\"environment\":{\"MLVAPP_PLAYBACK_SMOKE_TELEMETRY\":\"1\",\"MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG\":\"1\"},\"arguments\":[]}]}'\n"
+                      "Write-Host ('ARM=' + (Get-FpsArmFromLaunch (Get-FaProp $j 'launch')).arm)")
+        self.assertEqual(out.strip(), "ARM=UNKNOWN")
+
+    def test_a_light_arm_object_that_contradicts_its_recorded_launch_is_not_light(self) -> None:
+        # r5 (adversary A2): an arm object returned as it was; a leg that also records its launch must agree with it, and an object that does not name the launch environment as its source is a label
+        launch_heavy = "launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1'; MLVAPP_VIEWPORT_PRESENT_DIAG = 'yes' }; arguments = @() }"
+        launch_light = "launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' }; arguments = @() }"
+        self.check({
+            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = (New-FpsArm 'LIGHT' 'environment' 'x'); {launch_heavy} }})": "UNKNOWN",
+            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = (New-FpsArm 'LIGHT' 'environment' 'x'); {launch_light} }})": "LIGHT",
+            "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = [pscustomobject]@{ arm = 'LIGHT' } })": "UNKNOWN",
+            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = [pscustomobject]@{{ arm = 'LIGHT' }}; {OBSERVERS_RECORDED_OFF}}})": "LIGHT",
+            "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = (New-FpsArm 'LIGHT' 'environment' 'x') })": "LIGHT",
+        })
 
     def test_every_generator_arg_the_venue_leg_forwards_is_classified(self) -> None:
         # The class guard: a NEW generatorArgs key must be named observer (module list) or not-an-observer (below), so none reaches the job unclassified.

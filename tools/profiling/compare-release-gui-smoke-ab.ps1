@@ -466,8 +466,10 @@ function Get-FpsArmComparisonEvidence {
         [object]$AfterSmoke
     )
 
-    $beforeArm = Get-FpsArmFromLaunch (Get-NestedValue $BeforeSmoke "launch")
-    $afterArm = Get-FpsArmFromLaunch (Get-NestedValue $AfterSmoke "launch")
+    # Get-FaProp, not Get-NestedValue: Get-NestedValue's pipeline output unrolls a one-element array into its element, so "launch": [ { ... } ] read as the object inside and classified LIGHT
+    # (adversary r5 A6); Get-FaProp keeps the array whole and Get-FpsArmFromLaunch refuses it.
+    $beforeArm = Get-FpsArmFromLaunch (Get-FaProp $BeforeSmoke "launch")
+    $afterArm = Get-FpsArmFromLaunch (Get-FaProp $AfterSmoke "launch")
     $verdict = Get-FpsPairVerdict -Baseline $beforeArm -Candidate $afterArm -BaselineName "before" -CandidateName "after"
     [pscustomobject]@{
         refused = (-not $verdict.allowed)
