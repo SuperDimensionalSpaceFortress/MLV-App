@@ -50,21 +50,22 @@ bool GraphicsZoomView::isZoomEnabled()
 }
 
 //LOOK-FULLSCREEN-PARITY-1: set the corner look label ("" hides it); repaints once
+//LOOK-LABEL-PLAYBACK-INFO-1: only the union of the old and new label rects, never the whole viewport -- unless a handed-over
+//frame is still waiting for its paint: paintEvent credits that frame as on screen (r28-r30), so that paint must draw all of it.
 void GraphicsZoomView::setLookLabel(const QString &text)
 {
     if( m_lookLabelText == text ) return;
+    const QRect before = refreshLookLabelPixmap();
     m_lookLabelText = text;
-    viewport()->update();
+    const QRect after = refreshLookLabelPixmap();
+    const QRect dirty = before.united( after );
+    if( m_pixmapPendingSerial != m_pixmapPaintedSerial || dirty.isEmpty() ) viewport()->update();
+    else viewport()->update( dirty );
 }
 
-//Blit the cached look label in the viewport's bottom-right corner. The frame's own repaints
-//touch only the picture, so the label is redrawn when its region is exposed, not per frame.
-void GraphicsZoomView::drawForeground(QPainter *painter, const QRectF &rect)
+QRect GraphicsZoomView::refreshLookLabelPixmap()
 {
-    QGraphicsView::drawForeground( painter, rect );
-    m_lookLabelDrawnText.clear();
-    if( m_lookLabelText.isEmpty() ) return;
-
+    if( m_lookLabelText.isEmpty() ) return QRect();
     const qreal dpr = viewport()->devicePixelRatioF();
     const QSize deviceSize( qRound( viewport()->width() * dpr ), qRound( viewport()->height() * dpr ) );
     const int fontPx = look_label::fontPixels( deviceSize.height() );
@@ -76,7 +77,34 @@ void GraphicsZoomView::drawForeground(QPainter *painter, const QRectF &rect)
         m_lookLabelPixmapFontPx = fontPx;
         m_lookLabelPixmapDpr = dpr;
     }
-    if( m_lookLabelPixmap.isNull() ) return;
+    if( m_lookLabelPixmap.isNull() ) return QRect();
+    const QRect deviceRect = look_label::overlayRect( deviceSize, m_lookLabelPixmap.size(),
+                                                      look_label::marginPixels( fontPx ) );
+    if( deviceRect.isEmpty() ) return QRect();
+    // Logical pixels, widened by one so a fractional dpr never leaves an undrawn edge.
+    return QRectF( deviceRect.x() / dpr, deviceRect.y() / dpr, deviceRect.width() / dpr, deviceRect.height() / dpr )
+        .toAlignedRect().adjusted( -1, -1, 1, 1 );
+}
+
+//Blit the cached look label in the viewport's bottom-right corner. The frame's own repaints
+//touch only the picture, so the label is redrawn when its region is exposed, not per frame.
+void GraphicsZoomView::drawForeground(QPainter *painter, const QRectF &rect)
+{
+    QGraphicsView::drawForeground( painter, rect );
+    paintLookLabel( painter );
+}
+
+//LOOK-LABEL-PLAYBACK-INFO-1 r21 (adversary pass 20 A1): the one label drawing routine. drawForeground (the CPU viewport's paint)
+//and GpuDisplayViewport::paintGL (the GPU widget viewport consumes the Paint event, so drawForeground never runs there) both call it.
+void GraphicsZoomView::paintLookLabel(QPainter *painter)
+{
+    m_lookLabelDrawnText.clear();
+    if( m_lookLabelText.isEmpty() ) return;
+
+    const qreal dpr = viewport()->devicePixelRatioF();
+    const QSize deviceSize( qRound( viewport()->width() * dpr ), qRound( viewport()->height() * dpr ) );
+    const int fontPx = look_label::fontPixels( deviceSize.height() );
+    if( refreshLookLabelPixmap().isEmpty() ) return;
     const QRect deviceRect = look_label::overlayRect( deviceSize, m_lookLabelPixmap.size(),
                                                       look_label::marginPixels( fontPx ) );
     if( deviceRect.isEmpty() ) return;

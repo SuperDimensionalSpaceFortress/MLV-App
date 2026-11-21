@@ -1804,10 +1804,12 @@ TEST(LookLabelWiring, EveryLabelDerivationGoesThroughTheOnePendingAwareHelper)
                     .contains(QStringLiteral("outcome.shown()")));
 }
 
-// The documented gap (PR #459 Known gap): MLVAPP_EXPERIMENTAL_GL_VIEWPORT installs GpuDisplayViewport, which owns the
+// The formerly documented gap (PR #459 Known gap): MLVAPP_EXPERIMENTAL_GL_VIEWPORT installs GpuDisplayViewport, which owns the
 // viewport's Paint while a GPU frame is pending, so GraphicsZoomView::drawForeground (the CPU corner label) is never
-// reached and nothing else draws the label there. Pinned so a change to that route fails here, not silently on screen.
-TEST(LookLabelWiring, GlViewportRouteIsExcludedFromTheCornerLabel)
+// reached. Pinned so a change to that route fails here, not silently on screen. LOOK-LABEL-PLAYBACK-INFO-1 r21 (adversary pass 20
+// A1) closed the gap: the viewport's paintGL hands the label to GraphicsZoomView::paintLookLabel (by name, so gui_tests, which
+// does not link GraphicsZoomView, still builds); the pin now holds that hand-off and that the viewport still draws no label itself.
+TEST(LookLabelWiring, GlViewportRouteHandsTheCornerLabelToTheView)
 {
     const QString vp = readRepoFile(QStringLiteral("platform/qt/GpuDisplayViewport.cpp"));
     // The route: only the environment variable installs it, and only when the GL window is not the preview.
@@ -1821,8 +1823,12 @@ TEST(LookLabelWiring, GlViewportRouteIsExcludedFromTheCornerLabel)
     const QString filter = functionBody(vp, QStringLiteral("bool GpuDisplayViewport::eventFilter(QObject *watched, QEvent *event)"));
     ASSERT_TRUE(filter.contains(QStringLiteral("event->type() == QEvent::Paint && hasPendingFrame()")));
     ASSERT_TRUE(filter.contains(QStringLiteral("QOpenGLWidget::event(event);\n        return true;")));
-    // And it draws no label of its own; the corner label lives only in GraphicsZoomView and GpuDisplayWindow.
-    ASSERT_FALSE(vp.contains(QStringLiteral("looklabel"), Qt::CaseInsensitive));
+    // r21 (pass 20 A1): the paint it owns now draws the label, through the view's own routine (no label state or raster of its own);
+    // the corner label's rasterising still lives only in GraphicsZoomView and GpuDisplayWindow.
+    const QString paintGl = functionBody(vp, QStringLiteral("void GpuDisplayViewport::paintGL()"));
+    ASSERT_TRUE(paintGl.contains(QStringLiteral("QMetaObject::invokeMethod(m_view, \"paintLookLabel\", Qt::DirectConnection")));
+    ASSERT_FALSE(vp.contains(QStringLiteral("renderLookLabelOverlayImage")));
+    ASSERT_FALSE(vp.contains(QStringLiteral("m_lookLabel")));
     ASSERT_FALSE(readRepoFile(QStringLiteral("platform/qt/GpuDisplayViewport.h"))
                      .contains(QStringLiteral("looklabel"), Qt::CaseInsensitive));
     // updateLookLabel has no GL-viewport branch: the viewport gets the text and the status bar still shows it.
@@ -1900,8 +1906,12 @@ TEST(LookLabelWiring, LabelReadsTheGradesStateAndUpdatesOnEveryChange)
     // Once per change: nothing is pushed when neither the text nor the fullscreen state changed.
     ASSERT_TRUE(update.contains(QStringLiteral(
         "if( text == m_lookLabelText && fullscreenShown == m_lookLabelFullscreenShown ) return;")));
-    ASSERT_TRUE(update.contains(QStringLiteral("GpuDisplayWindow::setLookLabelIfActive( overlayText )")));
-    ASSERT_TRUE(update.contains(QStringLiteral("ui->graphicsView->setLookLabel(")));
+    // LOOK-LABEL-PLAYBACK-INFO-1: the corner push is factored into pushLookLabelOverlay (look line + info lines), which the
+    // change path calls once.
+    ASSERT_TRUE(update.contains(QStringLiteral("pushLookLabelOverlay();")));
+    const QString push = functionBody(mw, QStringLiteral("void MainWindow::pushLookLabelOverlay( void )"));
+    ASSERT_TRUE(push.contains(QStringLiteral("GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, repaintNow )")));
+    ASSERT_TRUE(push.contains(QStringLiteral("ui->graphicsView->setLookLabel(")));
     ASSERT_TRUE(update.contains(QStringLiteral("m_pLookLabelStatus->setText( text )")));
 
     // Every change path re-derives it: flavor, the switch (click and programmatic), fullscreen, the setting,

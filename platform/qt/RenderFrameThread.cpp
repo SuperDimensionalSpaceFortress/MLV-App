@@ -5124,6 +5124,17 @@ void RenderFrameThread::drawFrame( int slotIndex,
         renderedImageHeight = cpuRenderedImageHeight;
         slot.renderedImageWidth = renderedImageWidth;
         slot.renderedImageHeight = renderedImageHeight;
+        /* LOOK-LABEL-PLAYBACK-INFO-1 r18 (keys B2 on 00c600a9): the rendered-size
+         * keys were written above with the reduced recon size; rewrite them with
+         * the size this frame is made at, as the consumed-reduced-recon branch
+         * does, so every reader (the playback label's shown and debayer scale,
+         * the toolbar indicator, the render manifest) reads a full-size frame. */
+        slot.stageTimingTelemetry.insert(
+            QStringLiteral("render_thread_rendered_width"),
+            renderedImageWidth );
+        slot.stageTimingTelemetry.insert(
+            QStringLiteral("render_thread_rendered_height"),
+            renderedImageHeight );
     }
     slot.stageTimingTelemetry.insert(
         QStringLiteral("gpu_playback_recon_amaze_texture_present_skip_gate_output_mode"),

@@ -45,8 +45,10 @@ TEST(PlaybackFpsMeterWiring, FpsMeterMeasuresDrawToDrawAndIdleTicksDoNotRestartI
     const QString body = timerFrameEventBody();
     ASSERT_FALSE(body.isEmpty());
     ASSERT_TRUE(body.contains(QStringLiteral("static QTime lastDrawTime;")));
+    // LOOK-LABEL-PLAYBACK-INFO-1 r12 (adversary pass 13 A2): the draw-to-draw interval, none for a new Play's first draw
     ASSERT_TRUE(body.contains(QStringLiteral(
-        "const int measuredFrameMs = lastDrawTime.isValid() ? lastDrawTime.msecsTo( nowTime ) : 0;")));
+        "const int measuredFrameMs = playback_fps_meter::meterIntervalMs(\n"
+        "            firstDrawOfPlay, lastDrawTime.isValid(), lastDrawTime.isValid() ? lastDrawTime.msecsTo( nowTime ) : 0 );")));
     ASSERT_TRUE(body.contains(QStringLiteral("playback_fps_meter::smoothedFrameMs(")));
     // the old measurement off the idle-re-armed lastTime is gone
     ASSERT_FALSE(body.contains(QStringLiteral("const int measuredFrameMs = lastTime.msecsTo( nowTime );")));
@@ -65,6 +67,11 @@ TEST(PlaybackFpsMeterWiring, FpsMeterMeasuresDrawToDrawAndIdleTicksDoNotRestartI
     const int lambdaEnd = lambda.indexOf(QStringLiteral("if( m_frameStillDrawing )"));
     ASSERT_TRUE(lambdaEnd > zeroAt);
     ASSERT_FALSE(lambda.left(lambdaEnd).contains(QStringLiteral("lastTime =")));
+    // LOOK-LABEL-PLAYBACK-INFO-1 r7 (adversary pass 9 A1): the 250 ms fps-text gate goes through the policy, which
+    // treats a wall-clock wrap as due; the raw `>= 250` held the status fps and the corner rate across midnight.
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "|| playback_fps_meter::fpsTextUpdateDue( m_lastPlaybackFpsStatusUpdateTime.msecsTo( nowTime ) );")));
+    ASSERT_FALSE(body.contains(QStringLiteral("m_lastPlaybackFpsStatusUpdateTime.msecsTo( nowTime ) >=")));
 }
 
 // sol r1 BLOCKER: each 8 ms tick used to return through the m_frameStillDrawing branch before the

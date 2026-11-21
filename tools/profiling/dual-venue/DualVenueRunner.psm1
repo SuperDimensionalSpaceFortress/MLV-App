@@ -1633,26 +1633,58 @@ function Get-DvLookLabelEvidence {
     (windowed); `expectedText` is what the app derived from the look in force; `surface` is fullscreen_gpu_window / fullscreen_cpu_viewport / windowed_status_bar / none.
     `lookLabelShown` is true only when the surface is not none and it shows the expected, non-empty text. Informational: it never blocks a leg (a build without the
     line reports lookLabelShown=false with source 'absent from the run log'). Pure.
+    LOOK-LABEL-PLAYBACK-INFO-1: also the playback-info lines drawn under the look line -- infoShownText / infoExpectedText / infoFields, from the fields the app
+    appends after wait_ms= (null on a build that does not print them) -- and a `playing` block from the LAST gui_smoke.look_label_playing line (what the corner
+    drew while playing; null when absent). Informational only: neither ever blocks a leg nor changes lookLabelShown.
     #>
     param([AllowNull()][AllowEmptyString()][string]$LogText)
     $m = $null
+    $p = $null
     if (-not [string]::IsNullOrEmpty($LogText)) {
         # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r24 (opus key3 r23 class sweep): the record bodies, quote-masked (Get-DvLogRecordBodies), so a
         # label record spelled inside another record's quoted span (`note='gui_smoke.look_label shown="a" ... wait_ms=0'`) has no `shown=` and answers
         # nothing; the app's own label text holds no `=`, so its shown / expected values read as before. Before r24 this reader split the raw text.
         foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
             # r13 (r12 adversary A1 sibling): culture-invariant ($script:DvCi), so a tr-TR upper-case look_label record is read as every other culture reads it
-            $labelMatch = [regex]::Match($line, 'gui_smoke\.look_label shown="(?<shown>[^"]*)" expected="(?<expected>[^"]*)" surface=(?<surface>\S+) show_in_fullscreen=(?<sif>[01]) wait_ms=(?<wait>\d+)', $script:DvCi)
+            # LOOK-LABEL-PLAYBACK-INFO-1: wait_ms= is read as a whole token (toCount reads a non-digit token as null) and the playback-info fields the app appends after it are optional
+            # LOOK-LABEL-PLAYBACK-INFO-1 r21 (adversary pass 20 A5 / A6): the record marker starts on a token boundary (no name character or `.` before it), so
+            # `other.gui_smoke.look_label_playing ...` or `xgui_smoke.look_label ...` is a different record, never the one the app wrote. The app's own marker
+            # follows `event=` or the start of the body.
+            $labelMatch = [regex]::Match($line, '(?<![A-Za-z0-9_.])gui_smoke\.look_label shown="(?<shown>[^"]*)" expected="(?<expected>[^"]*)" surface=(?<surface>\S+) show_in_fullscreen=(?<sif>[01]) wait_ms=(?<wait>\S+)(?: info_shown="(?<infoShown>[^"]*)" info_expected="(?<infoExpected>[^"]*)" info_fields=(?<infoFields>\S+))?', $script:DvCi)
             if ($labelMatch.Success) {
+                # r21 (A7): the quote mask turned an `=` inside a quoted value into U+001A (ConvertTo-DvQuoteMaskedBody); the app never writes U+001A, so the
+                # receipt gets the text back as it was logged. Only the quoted text values: surface / sif / wait / infoFields are unquoted tokens.
                 $m = @{}
-                foreach ($g in 'shown', 'expected', 'surface', 'sif', 'wait') { $m[$g] = $labelMatch.Groups[$g].Value }
+                foreach ($g in 'shown', 'expected') { $m[$g] = $labelMatch.Groups[$g].Value.Replace($script:DvQuotedEqualsMask, [char]'=') }
+                foreach ($g in 'surface', 'sif', 'wait') { $m[$g] = $labelMatch.Groups[$g].Value }
+                # a build that does not print the info fields leaves these groups unmatched, so the keys stay absent and infoPresent reads false
+                foreach ($g in 'infoShown', 'infoExpected') { if ($labelMatch.Groups[$g].Success) { $m[$g] = $labelMatch.Groups[$g].Value.Replace($script:DvQuotedEqualsMask, [char]'=') } }
+                if ($labelMatch.Groups['infoFields'].Success) { $m['infoFields'] = $labelMatch.Groups['infoFields'].Value }
+            }
+            else {
+                # same culture-invariant read for the playing record (LOOK-LABEL-PLAYBACK-INFO-1, sibling of the r13 label read above)
+                $playMatch = [regex]::Match($line, '(?<![A-Za-z0-9_.])gui_smoke\.look_label_playing shown="(?<shown>[^"]*)" info_shown="(?<infoShown>[^"]*)" surface=(?<surface>\S+) samples=(?<samples>\S+)', $script:DvCi)
+                if ($playMatch.Success) {
+                    $p = @{}
+                    foreach ($g in 'shown', 'infoShown') { $p[$g] = $playMatch.Groups[$g].Value.Replace($script:DvQuotedEqualsMask, [char]'=') }
+                    foreach ($g in 'surface', 'samples') { $p[$g] = $playMatch.Groups[$g].Value }
+                }
             }
         }
     }
+    # r1 adversary A4: a counter past Int32 (or Int64) never throws here: it reads as Int64, or null when even that overflows.
+    # r1 adversary A3: the whole token, digits only (1.5, 1junk, -1, +3 read as null, never truncated to a leading number).
+    $toCount = { param([string]$Digits) $n = [long]0; if ($Digits -cmatch '\A[0-9]+\z' -and [long]::TryParse($Digits, [ref]$n)) { $n } else { $null } }
+    $playing = $null
+    if ($null -ne $p) {
+        $playing = [ordered]@{ shownText = [string]$p['shown']; infoShownText = [string]$p['infoShown']; surface = [string]$p['surface']; samples = (& $toCount ([string]$p['samples'])) }
+    }
     if ($null -eq $m) {
         return [ordered]@{ source = 'absent from the run log'; lookLabelShown = $false; shownText = $null; expectedText = $null; surface = $null
-                           showInFullscreen = $null; waitMs = $null; reason = 'the run log has no gui_smoke.look_label line' }
+                           showInFullscreen = $null; waitMs = $null; reason = 'the run log has no gui_smoke.look_label line'
+                           infoShownText = $null; infoExpectedText = $null; infoFields = $null; playing = $playing }
     }
+    $infoPresent = $m.ContainsKey('infoFields') -and $null -ne $m['infoFields']
     $shown = [string]$m['shown']
     $expected = [string]$m['expected']
     $surface = [string]$m['surface']
@@ -1667,8 +1699,12 @@ function Get-DvLookLabelEvidence {
         expectedText = $expected
         surface = $surface
         showInFullscreen = ([int]$m['sif'] -eq 1)
-        waitMs = [int]$m['wait']
+        waitMs = (& $toCount ([string]$m['wait']))
         reason = $reason
+        infoShownText = $(if ($infoPresent) { [string]$m['infoShown'] } else { $null })
+        infoExpectedText = $(if ($infoPresent) { [string]$m['infoExpected'] } else { $null })
+        infoFields = $(if ($infoPresent) { [string]$m['infoFields'] } else { $null })
+        playing = $playing
     }
 }
 

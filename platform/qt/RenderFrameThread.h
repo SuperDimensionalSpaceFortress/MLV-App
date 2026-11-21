@@ -171,6 +171,12 @@ public:
             /* Requested playback scale factor (1, 2, 4, or 8). The renderer may
              * reject incompatible clip dimensions and report the active scale. */
             int playbackScaleFactor = 1;
+            /* LOOK-LABEL-PLAYBACK-INFO-1 r3: the scale the setting or Auto ASKED for (playbackScaleFactorPolicyDecision),
+             * before the GPU texture route's clamp; 0 = unknown. The labels match a presented frame on this one. */
+            int playbackScaleFactorPolicy = 0;
+            /* LOOK-LABEL-PLAYBACK-INFO-1 r21 (adversary pass 20 A2): the debayer menu text in force when this frame was REQUESTED.
+             * The debayer field of the playback info reads the presented frame's own, never the live selection. */
+            QString debayerName;
             MainWindowGpuPreviewPolicyState gpuPreviewPolicy;
             GpuDisplayViewport::PresentationOptions gpuPresentationOptions;
             GpuPreviewProcessingConfig gpuPreviewProcessingConfig;

@@ -13,7 +13,9 @@
 
 /*! \brief White text on a translucent dark rounded backing, premultiplied ARGB32, in device pixels.
  *  The backing keeps it readable on bright frames and the soft edge on dark ones. `fontPx` is the
- *  text height (look_label::fontPixels). A null image for empty text. */
+ *  text height (look_label::fontPixels). A null image for empty text.
+ *  LOOK-LABEL-PLAYBACK-INFO-1: one line per '\n' (the look line, then the playback-info lines), each
+ *  right-aligned; a single line renders exactly as before. */
 QImage renderLookLabelOverlayImage( const QString &text, int fontPx );
 
 #endif // LOOKLABELOVERLAY_H

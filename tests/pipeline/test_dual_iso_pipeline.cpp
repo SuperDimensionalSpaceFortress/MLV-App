@@ -7393,6 +7393,23 @@ TEST(DualIsoPipeline, MixChromaAvx2RenderProofIsFrameScoped)
     ASSERT_EQ(1, publishes);
 }
 
+// LOOK-LABEL-PLAYBACK-INFO-1 r16 (adversary pass 17 A2 on 06faad35): HQ Dual-ISO, AMaZE, CPU 8-bit presentation, GPU recon
+// on, texture presentation off. A GPU-reconstructed Full frame left this thread's "last recon used CUDA" flag at 1, then a
+// Half preview frame ran the CPU x1 proxy recon (applyLLRawProcObject_with_dims) and kept it, so the info label refused the
+// proxy's route tag 7 and read "AMaZE", not "AMaZE->Bilinear (Half proxy)". Every with-dimensions recon is a CPU recon of
+// THIS frame (the recon worker's entry already reset it), so both entries clear it, even one that returns early.
+TEST(DualIsoPipeline, WithDimsCpuReconClearsTheLastGpuReconUsedFlag)
+{
+    llrpSetGpuPlaybackReconLastUsedForTesting(1);
+    ASSERT_EQ(1, llrpGpuPlaybackReconLastUsedForTesting());
+    (void)applyLLRawProcObject_with_dims(nullptr, nullptr, 0, 0, 0);
+    ASSERT_EQ(0, llrpGpuPlaybackReconLastUsedForTesting());
+    llrpSetGpuPlaybackReconLastUsedForTesting(1);
+    (void)applyLLRawProcObjectWorker_with_dims(nullptr, nullptr, 0, 0, 0, nullptr, 0);
+    ASSERT_EQ(0, llrpGpuPlaybackReconLastUsedForTesting());
+    llrpSetGpuPlaybackReconLastUsedForTesting(0);
+}
+
 // DUALISO-FULL20-PUBLISH-FRAME-SCOPED-1 (Dot G1, bus eeb4b6e, cos-feedback/mlv-app/pr-785.md): #785
 // scoped only mix_chroma_avx2_used. drawFrame still read the whole full20 last-run record raw, so a
 // processed8/processed16/debayered cache-hit frame (no llrawproc run, no reset of the record)
@@ -12721,7 +12738,13 @@ TEST(DualIsoPipeline, Phase4B_NonDualIsoScaleEightWorks)
     const std::vector<uint8_t> scaled8 = fixture.renderFrame8Scaled(0, 1, 8);
     ASSERT_EQ(static_cast<std::size_t>(full_w / 8) * (full_h / 8) * 3u, scaled8.size());
     ASSERT_EQ(8, fixture.video()->playback_scale_factor_active);
-    ASSERT_EQ(3, mlv_phase4bv2_last_path_taken());
+    /* The non-HQ x8 route is the full-recon post-downsample fallback
+     * (mlv_render_scaled_rgb16), which never writes the thread-local route
+     * tag: 0 = "v2 entry not invoked / rejected before path selection". This
+     * used to assert 3, which was only the tag the previous test on this
+     * thread (the x4 test) left behind; the scale-1 render above now clears
+     * the tag (LOOK-LABEL-PLAYBACK-INFO-1 r13), so it reads 0 on any order. */
+    ASSERT_EQ(0, mlv_phase4bv2_last_path_taken());
     ASSERT_EQ(std::string("not HQ Dual ISO; full-recon post-downsample fallback"),
               std::string(mlv_phase4bv2_last_fallback_reason()));
 

@@ -389,7 +389,10 @@ Expected behavior on `llvmpipe` or another software renderer:
 
 - The probe reports unavailable.
 - The debayer path falls back to CPU.
-- `gpu_bilinear_debayer_active` stays `false`.
+- `gpu_bilinear_debayer_active` is `false` on a software renderer only because the probe reports unavailable.
+  The flag is not always false: the render-thread GPU bilinear path sets it together with a renderer description
+  (`RenderFrameThread.cpp`, the `gpuBilinearDebayerApplyGpuOffscreen` success branch), and the two Bayer-texture
+  presenter branches in `MainWindow::presentPlaybackPreparedFrame` set it with their handoff mode.
 - `gpu_amaze_debayer_active` stays `false` unless the CUDA AMaZE backend is
   available and the explicit AMaZE GPU selector is active.
 

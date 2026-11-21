@@ -6454,6 +6454,13 @@ int applyLLRawProcObject_with_dims(mlvObject_t * video,
                                    int override_w,
                                    int override_h)
 {
+    /* LOOK-LABEL-PLAYBACK-INFO-1 r16 (adversary pass 17 A2 on 06faad35): every
+     * caller (the x1 half/quarter proxy cores and the scaled pre-recon routes in
+     * video_mlv.c) runs THIS frame's recon on the CPU here, so the thread's "last
+     * recon used CUDA" state describes this recon, as the recon worker's entry
+     * below already does. Without it a Half proxy frame after a GPU-reconstructed
+     * Full frame kept used=1 and the info label refused the proxy's route tag. */
+    llrawproc_gpu_playback_reset_last_run_state();
     return llrawproc_apply_with_dims_internal(video, raw_image_buff, raw_image_size,
                                               override_w, override_h, NULL, 0);
 }

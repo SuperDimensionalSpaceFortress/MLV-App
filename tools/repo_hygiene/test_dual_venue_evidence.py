@@ -6067,6 +6067,92 @@ class LookLabelEvidenceTests(unittest.TestCase):
         app = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8")
         self.assertIn('gui_smoke.look_label shown=\\"%1\\" expected=\\"%2\\" surface=%3 show_in_fullscreen=%4 wait_ms=%5', app)
 
+    # LOOK-LABEL-PLAYBACK-INFO-1: the info lines are appended after wait_ms=, and the playing sample is its own line. Both informational.
+    def test_an_old_line_without_info_fields_still_parses(self) -> None:
+        v = self.evidence(self.line("Look: Cinematic", "Look: Cinematic", "fullscreen_gpu_window") + "\n")
+        self.assertEqual((v["lookLabelShown"], v["shownText"], v["waitMs"]), (True, "Look: Cinematic", 17))
+        self.assertEqual((v["infoShownText"], v["infoExpectedText"], v["infoFields"], v["playing"]), (None, None, None, None))
+
+    def test_a_new_line_parses_every_info_field_and_the_playing_block(self) -> None:
+        # ASCII separators here: the harness passes the log through an environment variable, which does not keep U+00B7 on Windows.
+        info = "GPU display GPU Tex NR - Full - AMaZE (GPU) / 24 fps - DF on - Dual-ISO on - 1920x1080"
+        line = (self.line("Look: Cinematic", "Look: Cinematic", "fullscreen_gpu_window")
+                + f' info_shown="{info}" info_expected="{info}" info_fields=pipeline,scale,debayer,fps,dual_iso,resolution')
+        playing = ('gui_smoke.look_label_playing shown="Look: Cinematic" info_shown="GPU display GPU Tex NR - Full / 23.9/24 fps - DF on"'
+                   ' surface=fullscreen_gpu_window samples=88')
+        v = self.evidence(line + "\n" + playing + "\n")
+        self.assertEqual((v["lookLabelShown"], v["shownText"], v["expectedText"], v["waitMs"]), (True, "Look: Cinematic", "Look: Cinematic", 17))
+        self.assertEqual((v["infoShownText"], v["infoExpectedText"], v["infoFields"]),
+                         (info, info, "pipeline,scale,debayer,fps,dual_iso,resolution"))
+        self.assertEqual(v["playing"], {"shownText": "Look: Cinematic", "infoShownText": "GPU display GPU Tex NR - Full / 23.9/24 fps - DF on",
+                                        "surface": "fullscreen_gpu_window", "samples": 88})
+
+    def test_r1_a4_a_huge_samples_count_never_throws(self) -> None:
+        # r1 adversary A4 (06898800): samples past Int32 must not throw: the block is informational and never blocks a leg.
+        v = self.evidence('gui_smoke.look_label_playing shown="Look: Off" info_shown="" surface=none samples=2147483648\n')
+        self.assertEqual(v["playing"]["samples"], 2147483648)
+        line = self.line("Look: Off", "Look: Off", "windowed_status_bar").replace("wait_ms=17", "wait_ms=2147483648")
+        v = self.evidence(line + "\n")
+        self.assertEqual(v["waitMs"], 2147483648)
+
+    def test_r1_a3_a_counter_with_a_suffix_reads_as_unknown_not_truncated(self) -> None:
+        # r1 adversary A3 (a472a49f): samples=1.5 / samples=1junk used to read as 1 (and wait_ms=12junk as 12). A token that is not all
+        # digits is null; the playing block and the look label are still read (informational, never blocks a leg).
+        for token in ("1.5", "1junk", "-1", "+3"):
+            v = self.evidence(f'gui_smoke.look_label_playing shown="Look: Off" info_shown="" surface=none samples={token}\n')
+            self.assertIsNotNone(v["playing"], token)
+            self.assertIsNone(v["playing"]["samples"], token)
+            self.assertEqual(v["playing"]["shownText"], "Look: Off", token)
+        line = self.line("Look: Cinematic", "Look: Cinematic", "windowed_status_bar").replace("wait_ms=17", "wait_ms=12junk")
+        v = self.evidence(line + "\n")
+        self.assertEqual((v["lookLabelShown"], v["waitMs"]), (True, None))
+        v = self.evidence(line + ' info_shown="a" info_expected="a" info_fields=fps\n')
+        self.assertEqual((v["waitMs"], v["infoShownText"], v["infoFields"]), (None, "a", "fps"))
+
+    def test_info_never_blocks_or_changes_look_label_shown(self) -> None:
+        line = self.line("Look: Off", "Look: Off", "windowed_status_bar") + ' info_shown="" info_expected="" info_fields=none'
+        v = self.evidence(line + "\n")
+        self.assertEqual((v["lookLabelShown"], v["infoShownText"], v["infoFields"]), (True, "", "none"))
+        v = self.evidence('gui_smoke.look_label_playing shown="" info_shown="" surface=none samples=0\n')
+        self.assertEqual((v["lookLabelShown"], v["source"], v["playing"]["samples"]), (False, "absent from the run log", 0))
+        app = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8")
+        self.assertIn('info_shown=\\"%6\\" info_expected=\\"%7\\" info_fields=%8', app)
+        self.assertIn('gui_smoke.look_label_playing shown=\\"%1\\" info_shown=\\"%2\\" surface=%3 samples=%4', app)
+
+    # LOOK-LABEL-PLAYBACK-INFO-1 r21 (adversary pass 20 A5, A6 and A7 on a671ed77): the readers take the LAST actual record, matched on a token boundary.
+    PLAYING = ('gui_smoke.look_label_playing shown="Look: Cinematic" info_shown="GPU display - Full / 23.9/24 fps"'
+               ' surface=fullscreen_gpu_window samples=88')
+
+    def test_r21_a5_a_longer_token_is_not_the_playing_record(self) -> None:
+        for prefix in ("other.", "x", "my_", "a1"):
+            fake = prefix + 'gui_smoke.look_label_playing shown="Look: Fake" info_shown="Wrong" surface=fullscreen_gpu_window samples=5'
+            v = self.evidence(self.PLAYING + "\n" + fake + "\n")
+            self.assertEqual(v["playing"], {"shownText": "Look: Cinematic", "infoShownText": "GPU display - Full / 23.9/24 fps",
+                                            "surface": "fullscreen_gpu_window", "samples": 88}, prefix)
+        # the app's own prefix (an interaction_trace line) is still read
+        v = self.evidence("[INFO] interaction_trace event=" + self.PLAYING + "\n")
+        self.assertEqual(v["playing"]["samples"], 88)
+
+    def test_r21_a6_a_longer_token_is_not_the_look_label_record(self) -> None:
+        for prefix in ("other.", "x", "my_", "a1"):
+            fake = prefix + self.line("Look: Fake", "Look: Fake", "fullscreen_gpu_window")
+            v = self.evidence(self.line("Look: Cinematic", "Look: Cinematic", "fullscreen_gpu_window") + "\n" + fake + "\n")
+            self.assertEqual((v["lookLabelShown"], v["shownText"], v["expectedText"]), (True, "Look: Cinematic", "Look: Cinematic"), prefix)
+        v = self.evidence("[INFO] interaction_trace event=" + self.line("Look: Cinematic", "Look: Cinematic", "windowed_status_bar") + "\n")
+        self.assertEqual((v["lookLabelShown"], v["surface"]), (True, "windowed_status_bar"))
+
+    def test_r21_a7_an_equals_sign_inside_a_quoted_info_value_is_returned_as_it_was_logged(self) -> None:
+        line = (self.line("Look: A=B", "Look: A=B", "fullscreen_gpu_window")
+                + ' info_shown="Scale=Full / fps=24" info_expected="Scale=Full / fps=24" info_fields=scale,fps')
+        playing = ('gui_smoke.look_label_playing shown="Look: A=B" info_shown="Scale=Full / fps=24"'
+                   ' surface=fullscreen_gpu_window samples=3')
+        v = self.evidence(line + "\n" + playing + "\n")
+        self.assertEqual((v["shownText"], v["expectedText"], v["infoShownText"], v["infoExpectedText"]),
+                         ("Look: A=B", "Look: A=B", "Scale=Full / fps=24", "Scale=Full / fps=24"))
+        self.assertEqual((v["playing"]["shownText"], v["playing"]["infoShownText"]), ("Look: A=B", "Scale=Full / fps=24"))
+        self.assertTrue(v["lookLabelShown"])
+        self.assertNotIn("\x1a", json.dumps(v, ensure_ascii=False))
+
 
 @requires_windows_pwsh
 class LookAssistEvidenceTests(unittest.TestCase):

@@ -222,13 +222,18 @@ QSize GpuDisplayWindow::displaySize()
     return win ? win->size() : QSize();
 }
 
-bool GpuDisplayWindow::setLookLabelIfActive(const QString &text)
+bool GpuDisplayWindow::setLookLabelIfActive(const QString &text, bool repaintNow)
 {
     GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
     if ( !win || QThread::currentThread() != win->thread() ) return false;
-    if ( win->m_lookLabelText == text ) return true;
+    if ( win->m_lookLabelText == text )
+    {
+        // LOOK-LABEL-PLAYBACK-INFO-1 r3: a text stored for the next frame's paint that never came (frames stalled) is painted now.
+        if ( repaintNow && win->m_lookLabelDrawnText != text ) win->update();
+        return true;
+    }
     win->m_lookLabelText = text;
-    win->update();
+    if ( repaintNow ) win->update();
     return true;
 }
 
@@ -2387,6 +2392,16 @@ void GpuDisplayWindow::drawLookLabel(int fbw, int fbh)
     if ( m_lookLabelImage.isNull() ) return;
     ensureProgram();
     if ( !m_program ) return;
+    // LOOK-LABEL-PLAYBACK-INFO-1: the info lines change at up to 4 Hz while playing; a same-size image is uploaded into
+    // the existing texture. It is reallocated only on a size change or after a context loss (the texture was deleted).
+    if ( m_lookLabelTextureDirty && m_lookLabelTexture
+         && m_lookLabelTexture->width() == m_lookLabelImage.width()
+         && m_lookLabelTexture->height() == m_lookLabelImage.height() )
+    {
+        m_lookLabelTexture->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt8,
+                                    m_lookLabelImage.constBits());
+        m_lookLabelTextureDirty = false;
+    }
     if ( m_lookLabelTextureDirty || !m_lookLabelTexture )
     {
         delete m_lookLabelTexture;
