@@ -1841,7 +1841,8 @@ class CompareMachinePerfPlaybackAbHostLoadRefusalTests(_ProbeCase):
         resolved_state = state if state is not None else ("exceeded" if provisional else "quiet")
         provisional_literal = "$true" if provisional else "$false"
         return (
-            "[pscustomobject]@{ telemetryArm = 'LIGHT'; observerControls = [pscustomobject]@{ utilSample = $false }; hostLoadProvisional = " + provisional_literal +
+            "[pscustomobject]@{ telemetryArm = 'LIGHT'; launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; "
+            "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' }; arguments = @() }; hostLoadProvisional = " + provisional_literal +
             "; hostLoadState = '" + resolved_state + "' }"
         )
 
@@ -1984,7 +1985,8 @@ class CompareMachinePerfPlaybackAbFpsDeltaRefusalTests(_ProbeCase):
         resolved_state = state if state is not None else ("exceeded" if provisional else "quiet")
         provisional_literal = "$true" if provisional else "$false"
         return (
-            "[pscustomobject]@{ telemetryArm = 'LIGHT'; observerControls = [pscustomobject]@{ utilSample = $false }; hostLoadProvisional = " + provisional_literal +
+            "[pscustomobject]@{ telemetryArm = 'LIGHT'; launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; "
+            "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' }; arguments = @() }; hostLoadProvisional = " + provisional_literal +
             "; hostLoadState = '" + resolved_state + "' }"
         )
 

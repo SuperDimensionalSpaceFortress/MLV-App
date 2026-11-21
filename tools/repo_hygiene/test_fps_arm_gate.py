@@ -93,18 +93,18 @@ class _Probe(unittest.TestCase):
         return proc.stdout
 
 
-# BENCH-LIGHT-ARM-GAIN-GATES-1 r5 (Dot on f51e0821): a saved leg record's LIGHT arm WORD is proof only beside a recorded observer list, the rule a recorded result already had. A LIGHT leg
-# fixture therefore carries the list a real leg records, every observer off (a bare 'LIGHT' record is pinned UNKNOWN in ObserverControlTests).
-OBSERVERS_RECORDED_OFF = "observerControls = [pscustomobject]@{ utilSample = $false; corePartitionTelemetry = $false }; "
-# the launch block a LIGHT smoke records (what the wrapper's leg record now carries beside its arm): telemetry on, the per-frame log opted out, no stage log
+# the launch block a LIGHT smoke records (what the wrapper's leg record carries beside its arm): telemetry on, the per-frame log opted out, no arguments. It matches the producers' exact LIGHT
+# shape (FpsArmGate.psm1 $script:FpsLightArgs / $script:FpsLightEnv), so it is PROOF of LIGHT (BENCH-LIGHT-ARM-GAIN-GATES-1 r8: a bare LIGHT word, or one beside an observerControls list, is not).
 RECORDED_LIGHT_LAUNCH = ("launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' }; arguments = @() }")
+# the evidence fragment a LIGHT leg-record literal carries (r5 carried an observerControls list here; r8 deleted that evidence: the recorded launch is the proof)
+LIGHT_EVIDENCE = RECORDED_LIGHT_LAUNCH + "; "
 
 
 def _light_word(arm: str | None) -> str:
-    """The `telemetryArm` (and recorded observer list for LIGHT) fragment of a pwsh leg-record literal; empty for no arm."""
+    """The `telemetryArm` (and recorded launch for LIGHT) fragment of a pwsh leg-record literal; empty for no arm."""
     if arm is None:
         return ""
-    return f"telemetryArm = '{arm}'; " + (OBSERVERS_RECORDED_OFF if arm == "LIGHT" else "")
+    return f"telemetryArm = '{arm}'; " + (LIGHT_EVIDENCE if arm == "LIGHT" else "")
 
 
 SPEC_LIGHT = "[pscustomobject]@{ legType = 'speed'; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT'; presentTrace = $true } }"
@@ -134,15 +134,16 @@ class ArmClassifierTests(_Probe):
             "    Write-Host ('ARGS=' + $argText + ' ARM=' + (Get-FpsArmFromLaunch $launch).arm)\n"
             "}\n")
         got = dict(line.split(" ARM=") for line in out.strip().splitlines())
+        # r8: a list holding an argument outside the producers' LIGHT shape (a stage log, an unknown flag) is UNKNOWN, not HEAVY and not LIGHT
         self.assertEqual(got, {"ARGS=[]": "LIGHT", 'ARGS="--playback-smoke"': "UNKNOWN", 'ARGS=" "': "UNKNOWN", 'ARGS=""': "UNKNOWN", "ARGS=null": "UNKNOWN", "ARGS=7": "UNKNOWN",
-                               'ARGS=["--stage-log=x.csv"]': "HEAVY", 'ARGS=["--playback-smoke"]': "LIGHT"})
+                               'ARGS=["--stage-log=x.csv"]': "UNKNOWN", 'ARGS=["--playback-smoke"]': "UNKNOWN"})
 
     def test_an_embedded_generator_args_arm_must_be_the_scalar_light(self) -> None:
         # BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary pass 5 A4): generatorArgs.telemetryArm embedded in a record was read through the arm-object-tolerant ConvertTo-FpsArmName, so
         # {"arm":"LIGHT"} there passed both record readers while the spec reader refuses it. The embedded value is a spec word: exactly the string LIGHT, nothing else.
         out = self.ok(
             "foreach ($embedded in @('\"LIGHT\"', '{\"arm\":\"LIGHT\"}', '[\"LIGHT\"]', '\"light\"')) {\n"
-            "    $rec = ('{\"telemetryArm\":\"LIGHT\",\"observerControls\":{\"utilSample\":false},\"generatorArgs\":{\"telemetryArm\":' + $embedded + '}}') | ConvertFrom-Json\n"
+            "    $rec = ('{\"telemetryArm\":\"LIGHT\",\"generatorArgs\":{\"telemetryArm\":' + $embedded + '}}') | ConvertFrom-Json\n"
             "    Write-Host ('E=' + $embedded + ' LEG=' + (Get-FpsArmFromLegRecord $rec).arm + ' RESULT=' + (Get-FpsArmFromJobResult $rec).arm)\n"
             "}\n")
         got = {line.split(" LEG=")[0]: line.split(" LEG=")[1] for line in out.strip().splitlines()}
@@ -205,9 +206,12 @@ class ArmClassifierTests(_Probe):
                     (k in args) and ((isinstance(args[k], (int, float)) and not isinstance(args[k], bool) and args[k] >= 0) if k == "cudaLaunchTimingMinMs"
                                      else (args[k] is not False and args[k] is not None))
                     for k in OBSERVER_SPEC_KEYS)
-                expected[path.name] = "UNKNOWN" if (arm == "LIGHT" and observer_on) else arm
+                # r8 (sibling sweep of r6 A1): a LIGHT word counts only on a 'speed' leg; the 52 committed 'look' legs capture a contact sheet inside the timed Play, so they are UNKNOWN
+                look_light = arm == "LIGHT" and doc.get("legType") != "speed"
+                expected[path.name] = "UNKNOWN" if (arm == "LIGHT" and (observer_on or look_light)) else arm
         self.assertIn("HEAVY", expected.values())
         self.assertIn("LIGHT", expected.values())
+        self.assertGreater(sum(1 for p in specs if json.loads(p.read_text(encoding="utf-8")).get("legType") == "look"), 40, "the corpus holds the look legs this rule narrows")
         probe = ("foreach ($f in Get-ChildItem -LiteralPath '" + str(LEGS_DIR) + "' -Filter *.json | Sort-Object Name) {\n"
                  "  $s = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json\n"
                  "  Write-Host ($f.Name + '=' + (Get-FpsArmFromLegSpec $s).arm)\n}\n")
@@ -218,7 +222,10 @@ class ArmClassifierTests(_Probe):
         self.assertEqual(self.arm("Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'HEAVY' })"), "ARM=HEAVY")
         # r2 pass 5 A2: a result that records no observer controls cannot prove there were none (provenance.json carries telemetryArm only), so alone it is UNKNOWN
         self.assertEqual(self.arm("Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT' })"), "ARM=UNKNOWN")
-        self.assertEqual(self.arm("Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT'; observerControls = [pscustomobject]@{ utilSample = $false } })"), "ARM=LIGHT")
+        # r8: an observerControls list is no evidence at all (it is neither read nor trusted); the proof is a launch matching the producers' LIGHT shape, LIGHT generatorArgs, or a LIGHT spec
+        self.assertEqual(self.arm("Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT'; observerControls = [pscustomobject]@{ utilSample = $false } })"), "ARM=UNKNOWN")
+        self.assertEqual(self.arm(f"Get-FpsArmFromJobResult ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {RECORDED_LIGHT_LAUNCH} }})"), "ARM=LIGHT")
+        self.assertEqual(self.arm("Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT'; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' } })"), "ARM=LIGHT")
         self.assertEqual(self.arm("Get-FpsArmFromJobResult ([pscustomobject]@{ sourceCommit = 'x' })"), "ARM=UNKNOWN")
         self.assertEqual(self.arm("Get-FpsArmFromJobResult $null"), "ARM=UNKNOWN")
 
@@ -227,66 +234,100 @@ class ArmClassifierTests(_Probe):
         self.assertEqual(self.arm(f"Get-FpsArm -Spec ({SPEC_LIGHT}) -Result ([pscustomobject]@{{ telemetryArm = 'HEAVY' }})"), "ARM=UNKNOWN")
         self.assertEqual(self.arm(f"Get-FpsArm -Spec ({SPEC_HEAVY}) -Result ([pscustomobject]@{{ telemetryArm = 'LIGHT' }})"), "ARM=UNKNOWN")
         self.assertEqual(self.arm("Get-FpsArm -Spec $null -Result ([pscustomobject]@{ telemetryArm = 'LIGHT' })"), "ARM=UNKNOWN")
-        self.assertEqual(self.arm("Get-FpsArm -Spec $null -Result ([pscustomobject]@{ telemetryArm = 'LIGHT'; observerControls = [pscustomobject]@{ cudaLaunchTimingMinMs = -1 } })"), "ARM=LIGHT")
+        self.assertEqual(self.arm("Get-FpsArm -Spec $null -Result ([pscustomobject]@{ telemetryArm = 'LIGHT'; observerControls = [pscustomobject]@{ cudaLaunchTimingMinMs = -1 } })"), "ARM=UNKNOWN")
+        self.assertEqual(self.arm(f"Get-FpsArm -Spec $null -Result ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {RECORDED_LIGHT_LAUNCH} }})"), "ARM=LIGHT")
         self.assertEqual(self.arm("Get-FpsArm -Spec $null -Result $null"), "ARM=UNKNOWN")
 
     def test_launch_environment_follows_the_apps_frame_log_rule(self) -> None:
+        # r8 (the narrow promise): the environment is judged against the producers' exact LIGHT shape (a closed MLVAPP_* table with exact values); the app's frame-log rule then decides
+        # LIGHT (telemetry off, or on with the per-frame log opted out) from HEAVY (telemetry on, not opted out). Anything outside the table, whatever its value, is UNKNOWN.
+        both = "'MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1'"
         cases = {
             "$null": "UNKNOWN",
             "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1')": "HEAVY",
-            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1')": "LIGHT",
+            f"@({both})": "LIGHT",
             "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=0')": "HEAVY",
             "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=2')": "UNKNOWN",
-            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_STAGE_TIMING=1')": "HEAVY",
-            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_PERF_FIELD_LOG=1')": "HEAVY",
-            "@('MLVAPP_STAGE_TIMING=0')": "LIGHT",
+            "@()": "LIGHT",                                     # a recorded environment that holds no MLVAPP_* control: frame telemetry is off (the real runner always records its log directory)
+            "[pscustomobject]@{ }": "LIGHT",
+            "@('QT_OPENGL=desktop')": "LIGHT",                  # only the MLVAPP_* namespace is the app's control surface
             "[pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1' }": "HEAVY",
-            "[ordered]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = 'true' }": "LIGHT",
-            # adversary A1: the native readers disagree on every value but "0", so "false" / "off" / "" are read toward HEAVY
-            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=false')": "HEAVY",
-            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_STAGE_TIMING=false')": "HEAVY",
-            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY=false')": "HEAVY",
-            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_PERF_FIELD_LOG=')": "HEAVY",
-            # adversary A2: Windows environment names compare ignoring case
-            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','mlvapp_stage_timing=1')": "HEAVY",
-            "@('mlvapp_playback_smoke_telemetry=1','mlvapp_playback_smoke_telemetry_disable_frame_log=1')": "LIGHT",
-            "@('MLVAPP_STAGE_TIMING=1','mlvapp_stage_timing=0')": "UNKNOWN",
-            "@('MLVAPP_STAGE_TIMING=0','mlvapp_stage_timing=0')": "LIGHT",
-            # adversary pass 2 A1: LIGHT is proven only against a closed list of MLVAPP_* variables; other per-frame diagnostics (named or not) are never LIGHT
-            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_GPU_TEX_NR_OVERLAP_TRACE=1')": "HEAVY",
-            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_INTERACTIVE_TRACE=1')": "HEAVY",
-            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_PHASE3_TEL_PATH=C:\\Temp\\stages.csv')": "HEAVY",
-            # r4 (luna r3 B2, supersedes r2 pass 5 A2): MLVAPP_VIEWPORT_PRESENT_DIAG logs from the per-present paths (GpuDisplayViewport.cpp:1226-1231, :2014-2019), so it is an observer; the venue
-            # job no longer puts it in a LIGHT leg's environment (playback-attr-3-cuda-job.ps1), so a LIGHT launch does not carry it
-            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_VIEWPORT_PRESENT_DIAG=1')": "HEAVY",
-            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_VIEWPORT_PRESENT_DIAG=0')": "LIGHT",
-            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_A_NEW_DIAGNOSTIC_NOBODY_LISTED=1')": "UNKNOWN",
-            # r2 pass 5 A1: "0" is not proof of OFF for a variable nobody listed (the native mode parsers read 0 as a mode), so any presence is UNKNOWN
-            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_A_NEW_DIAGNOSTIC_NOBODY_LISTED=0')": "UNKNOWN",
-            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG=1','MLVAPP_PLAYBACK_QUALITY_MODE=phase3_hq','OTHER_VAR=1')": "LIGHT",
-            "@('MLVAPP_A_NEW_DIAGNOSTIC_NOBODY_LISTED=1')": "UNKNOWN",
-            # adversary pass 2 A2: no Unicode trimming of the opt-out (the native readers trim ASCII only); any whitespace or non-ASCII text is UNKNOWN
-            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1', \"MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=$([char]0xA0)1$([char]0xA0)\")": "UNKNOWN",
+            "[ordered]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' }": "LIGHT",
+            # the opt-out is the exact text 1 (the table's value); every other spelling is outside the shape
+            "[ordered]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = 'true' }": "UNKNOWN",
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=TRUE')": "UNKNOWN",
             "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1 ')": "UNKNOWN",
-            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=TRUE')": "LIGHT",
-            # adversary A1: a value that is not text is malformed, never its coerced text
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1', \"MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=$([char]0xA0)1$([char]0xA0)\")": "UNKNOWN",
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=false')": "UNKNOWN",
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=0')": "UNKNOWN",
+            # Windows environment names compare ignoring case
+            "@('mlvapp_playback_smoke_telemetry=1','mlvapp_playback_smoke_telemetry_disable_frame_log=1')": "LIGHT",
+            # a key NOT in the table is UNKNOWN whatever it is and whatever its value: every observer, probe and trace the old denylist named, and the ones nobody has named
+            f"@({both},'MLVAPP_STAGE_TIMING=1')": "UNKNOWN",
+            f"@({both},'MLVAPP_STAGE_TIMING=0')": "UNKNOWN",
+            f"@({both},'MLVAPP_STAGE_TIMING=false')": "UNKNOWN",
+            f"@({both},'mlvapp_stage_timing=1')": "UNKNOWN",
+            f"@({both},'MLVAPP_PERF_FIELD_LOG=1')": "UNKNOWN",
+            f"@({both},'MLVAPP_PERF_FIELD_LOG=')": "UNKNOWN",
+            f"@({both},'MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY=false')": "UNKNOWN",
+            f"@({both},'MLVAPP_GPU_TEX_NR_OVERLAP_TRACE=1')": "UNKNOWN",
+            f"@({both},'MLVAPP_INTERACTIVE_TRACE=1')": "UNKNOWN",
+            f"@({both},'MLVAPP_PHASE3_TEL_PATH=C:\\Temp\\stages.csv')": "UNKNOWN",
+            f"@({both},'MLVAPP_VIEWPORT_PRESENT_DIAG=1')": "UNKNOWN",
+            f"@({both},'MLVAPP_VIEWPORT_PRESENT_DIAG=0')": "UNKNOWN",
+            f"@({both},'MLVAPP_A_NEW_DIAGNOSTIC_NOBODY_LISTED=1')": "UNKNOWN",
+            f"@({both},'MLVAPP_A_NEW_DIAGNOSTIC_NOBODY_LISTED=0')": "UNKNOWN",
+            "@('MLVAPP_A_NEW_DIAGNOSTIC_NOBODY_LISTED=1')": "UNKNOWN",
+            # a table key with a value the table does not name is UNKNOWN too
+            f"@({both},'MLVAPP_PLAYBACK_QUALITY_MODE=other')": "UNKNOWN",
+            f"@({both},'MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG=0')": "UNKNOWN",
+            f"@({both},'MLVAPP_PLAYBACK_MAX_THREADS=4x')": "UNKNOWN",
+            # the table keys with their exact values, and a non-MLVAPP name, stay LIGHT
+            f"@({both},'MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG=1','MLVAPP_PLAYBACK_QUALITY_MODE=phase3_hq','MLVAPP_PLAYBACK_MAX_THREADS=4','OTHER_VAR=1')": "LIGHT",
+            f"@({both},'MLVAPP_CRASH_FORENSICS_LOG_DIR=C:\\Temp\\forensics')": "LIGHT",
+            # a repeated key is malformed, whatever its values (r8 MOOT A4: the duplicate that a JSON parser collapses is a key the table does not list; a KEY=VALUE list repeats are refused here)
+            f"@({both},'MLVAPP_STAGE_TIMING=1','mlvapp_stage_timing=0')": "UNKNOWN",
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','mlvapp_playback_smoke_telemetry=1')": "UNKNOWN",
+            # a value that is not text is malformed, never its coerced text
             "[pscustomobject]@{ MLVAPP_STAGE_TIMING = @('0') }": "UNKNOWN",
             "[pscustomobject]@{ MLVAPP_STAGE_TIMING = [pscustomobject]@{ a = 1 } }": "UNKNOWN",
             "@(1, 2)": "UNKNOWN",
         }
-        got = self.arms([f"Get-FpsArmFromEnvironment ({expr})" for expr in cases])
+        got = self.arms([f"Get-FpsArmFromEnvironment ({expr}) @()" for expr in cases])
         self.assertEqual(dict(zip(cases, got)), {expr: f"ARM={want}" for expr, want in cases.items()})
 
     def test_the_launch_block_is_judged_on_its_arguments_too(self) -> None:
-        # adversary A3: --stage-log=<file> turns the app's stage logger on whatever the environment says
+        # r8 (the narrow promise; A1 of r6): the recorded arguments must match the producers' exact LIGHT shape (a closed flag table, FpsArmGate.psm1 $script:FpsLightArgs). --stage-log and the
+        # contact-sheet options turn on work inside the timed window; neither is in the table, so a launch that passed one is UNKNOWN, like any flag nobody listed.
         env = "environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' }"
+        producer_args = ("'--gui-smoke-playback', '--input', 'C:\\clips\\a.mlv', '--seconds', '7.5', '--start-frame', '0', '--presented-frames', '120', '--drop-frame-mode', 'persisted', "
+                         "'--settle-ms', '2500', '--settle-cpu-percent', '10', '--settle-cpu-stable-ms', '1000', '--settle-cpu-max-ms', '45000', '--receipt', 'C:\\r\\receipt.json', "
+                         "'--scope', 'none', '--playback-debayer=amaze', '--gpu-amaze-texture-present', '--no-look-assist', '--display-prefer=\\\\.\\DISPLAY1'")
         cases = {
             f"[pscustomobject]@{{ {env}; arguments = @() }}": "LIGHT",
             f"[pscustomobject]@{{ {env}; arguments = @('--input', 'x') }}": "LIGHT",
-            f"[pscustomobject]@{{ {env}; arguments = @('--stage-log=C:\\Temp\\stage.csv') }}": "HEAVY",
-            f"[pscustomobject]@{{ {env}; arguments = @('--stage-log', 'C:\\Temp\\stage.csv') }}": "HEAVY",
-            f"[pscustomobject]@{{ {env}; arguments = @('-STAGE-LOG=x') }}": "HEAVY",
-            f"[pscustomobject]@{{ {env}; arguments = @('/stage-log:x') }}": "HEAVY",
+            f"[pscustomobject]@{{ {env}; arguments = @({producer_args}) }}": "LIGHT",                       # the whole shape the runner emits
+            f"[pscustomobject]@{{ {env}; arguments = @('--stage-log=C:\\Temp\\stage.csv') }}": "UNKNOWN",
+            f"[pscustomobject]@{{ {env}; arguments = @('--stage-log', 'C:\\Temp\\stage.csv') }}": "UNKNOWN",
+            f"[pscustomobject]@{{ {env}; arguments = @('-STAGE-LOG=x') }}": "UNKNOWN",
+            f"[pscustomobject]@{{ {env}; arguments = @('/stage-log:x') }}": "UNKNOWN",
+            # A1 (the adversary's input): contact-sheet capture reads the framebuffer in the timed pass
+            f"[pscustomobject]@{{ {env}; arguments = @('--gui-smoke', '--contact-sheet-dir', 'C:\\Temp\\sheet', '--contact-sheet-frames', '6') }}": "UNKNOWN",
+            f"[pscustomobject]@{{ {env}; arguments = @('--gui-smoke-playback', '--contact-sheet-dir', 'C:\\Temp\\sheet') }}": "UNKNOWN",
+            f"[pscustomobject]@{{ {env}; arguments = @('--gui-smoke-playback', '--contact-sheet-seek-mode') }}": "UNKNOWN",
+            f"[pscustomobject]@{{ {env}; arguments = @('--gui-smoke-playback', '--screenshot-output', 'C:\\Temp\\s.png') }}": "UNKNOWN",
+            f"[pscustomobject]@{{ {env}; arguments = @('--gui-smoke-playback', '--exercise-clip-lifecycle-stress') }}": "UNKNOWN",
+            # a known flag in a shape the table does not name: repeated, valueless, valued when bare, a value that is a flag, an equals form of a next-value flag
+            f"[pscustomobject]@{{ {env}; arguments = @('--gui-smoke-playback', '--gui-smoke-playback') }}": "UNKNOWN",
+            f"[pscustomobject]@{{ {env}; arguments = @('--seconds') }}": "UNKNOWN",
+            f"[pscustomobject]@{{ {env}; arguments = @('--seconds', '--start-frame') }}": "UNKNOWN",
+            f"[pscustomobject]@{{ {env}; arguments = @('--seconds', '7x') }}": "UNKNOWN",
+            f"[pscustomobject]@{{ {env}; arguments = @('--seconds=7') }}": "UNKNOWN",
+            f"[pscustomobject]@{{ {env}; arguments = @('--gui-smoke-playback=1') }}": "UNKNOWN",
+            f"[pscustomobject]@{{ {env}; arguments = @('--playback-debayer=') }}": "UNKNOWN",
+            f"[pscustomobject]@{{ {env}; arguments = @('--scope', 'all') }}": "UNKNOWN",
+            f"[pscustomobject]@{{ {env}; arguments = @('--drop-frame-mode', 'off') }}": "UNKNOWN",
+            f"[pscustomobject]@{{ {env}; arguments = @('--input', \"a$([char]10)b\") }}": "UNKNOWN",
             f"[pscustomobject]@{{ {env}; arguments = @(5) }}": "UNKNOWN",
             f"[pscustomobject]@{{ {env} }}": "UNKNOWN",
             "[pscustomobject]@{ arguments = @() }": "UNKNOWN",
@@ -419,7 +460,7 @@ class GuiSmokeInheritedEnvironmentRecordTests(_Probe):
             "$o = [ordered]@{ MLVAPP_STAGE_TIMING = '0' }\nAdd-InheritedMlvAppEnvironmentRecord -Target $o -Cleared @()\nWrite-Host ('OVERRIDE_KEPT=' + $o['MLVAPP_STAGE_TIMING'])\n")
         lines = dict(line.split("=", 1) for line in out.strip().splitlines())
         self.assertEqual(lines["BEFORE"], "LIGHT")
-        self.assertEqual(lines["AFTER"], "HEAVY")
+        self.assertEqual(lines["AFTER"], "UNKNOWN", "r8: the recorded inherited variables are outside the LIGHT shape (a stage logger, and a stranger nobody listed)")
         self.assertIn("MLVAPP_STAGE_TIMING", lines["RECORDED"])
         self.assertIn("MLVAPP_SOME_STRANGER", lines["RECORDED"])
         self.assertNotIn("MLVAPP_PLAYBACK_QUALITY_MODE", lines["RECORDED"], "a cleared variable never reaches the child")
@@ -667,7 +708,7 @@ class CudaPlaybackAbFpsGateTests(_Probe):
             ("launch = [pscustomobject]@{ arguments = @(); environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; "
              "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' } }"): "LIGHT",
             ("launch = [pscustomobject]@{ arguments = @('--stage-log=C:\\Temp\\s.csv'); environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; "
-             "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' } }"): "HEAVY",
+             "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' } }"): "UNKNOWN",   # r8: outside the producers' LIGHT argument shape
             "launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1' } }": "UNKNOWN",
             "launch = [pscustomobject]@{ }": "UNKNOWN",
             "x = 1": "UNKNOWN",
@@ -689,8 +730,8 @@ class CudaPlaybackAbRequireImprovementBlockTests(_Probe):
         source = CUDA_AB_SCRIPT.read_text(encoding="utf-8")
         block = _extract_block(source, "if ($RequireCandidateImprovesPresentedFps) {", "candidate-presented-fps-not-improved baseline=$baselineFps candidate=$candidateFps", trailing_lines=3)
         out = self.ok(
-            f"$baselineSummary = [pscustomobject]@{{ telemetryArm = {baseline}; {OBSERVERS_RECORDED_OFF}presentedFps = {fps_b}; hostLoadProvisional = $false }}\n"
-            f"$candidateSummary = [pscustomobject]@{{ telemetryArm = {candidate}; {OBSERVERS_RECORDED_OFF}presentedFps = {fps_c}; hostLoadProvisional = $false }}\n"
+            f"$baselineSummary = [pscustomobject]@{{ telemetryArm = {baseline}; {LIGHT_EVIDENCE}presentedFps = {fps_b}; hostLoadProvisional = $false }}\n"
+            f"$candidateSummary = [pscustomobject]@{{ telemetryArm = {candidate}; {LIGHT_EVIDENCE}presentedFps = {fps_c}; hostLoadProvisional = $false }}\n"
             "$candidateSpeedSummary = $null\n$SeparateCandidateSpeedRun = $false\n$RequireCandidateImprovesPresentedFps = $true\n$proofFailures = @()\n"
             "$fpsVerdict = Get-PlaybackAbFpsVerdict -BaselineSummary $baselineSummary -CandidateSummary $candidateSummary -CandidateSpeedSummary $candidateSpeedSummary\n"
             + block + "\nforeach ($f in $proofFailures) { Write-Host ('FAIL=' + $f) }\nWrite-Host ('COUNT=' + @($proofFailures).Count)\n")
@@ -700,9 +741,9 @@ class CudaPlaybackAbRequireImprovementBlockTests(_Probe):
         source = CUDA_AB_SCRIPT.read_text(encoding="utf-8")
         block = _extract_block(source, "if ($RequireCandidateImprovesPresentedFps) {", "candidate-presented-fps-not-improved baseline=$baselineFps candidate=$candidateFps", trailing_lines=3)
         return self.ok(
-            f"$baselineSummary = [pscustomobject]@{{ telemetryArm = 'LIGHT'; {OBSERVERS_RECORDED_OFF}presentedFps = 10.0; hostLoadProvisional = $false }}\n"
-            f"$candidateSummary = [pscustomobject]@{{ telemetryArm = '{parity}'; {OBSERVERS_RECORDED_OFF}presentedFps = 7.0; hostLoadProvisional = $false }}\n"
-            f"$candidateSpeedSummary = [pscustomobject]@{{ telemetryArm = '{speed}'; {OBSERVERS_RECORDED_OFF}presentedFps = {fps_speed}; hostLoadProvisional = $false }}\n"
+            f"$baselineSummary = [pscustomobject]@{{ telemetryArm = 'LIGHT'; {LIGHT_EVIDENCE}presentedFps = 10.0; hostLoadProvisional = $false }}\n"
+            f"$candidateSummary = [pscustomobject]@{{ telemetryArm = '{parity}'; {LIGHT_EVIDENCE}presentedFps = 7.0; hostLoadProvisional = $false }}\n"
+            f"$candidateSpeedSummary = [pscustomobject]@{{ telemetryArm = '{speed}'; {LIGHT_EVIDENCE}presentedFps = {fps_speed}; hostLoadProvisional = $false }}\n"
             "$SeparateCandidateSpeedRun = $true\n$RequireCandidateImprovesPresentedFps = $true\n$proofFailures = @()\n"
             "$fpsVerdict = Get-PlaybackAbFpsVerdict -BaselineSummary $baselineSummary -CandidateSummary $candidateSummary -CandidateSpeedSummary $candidateSpeedSummary -SeparateCandidateSpeedRun\n"
             + block + "\nforeach ($f in $proofFailures) { Write-Host ('FAIL=' + $f) }\nWrite-Host ('COUNT=' + @($proofFailures).Count)\n")
@@ -743,7 +784,9 @@ class CudaPlaybackAbRequireImprovementBlockTests(_Probe):
             "$fpsVerdict = Get-PlaybackAbFpsVerdict -BaselineSummary $baselineSummary -CandidateSummary $candidateSummary -CandidateSpeedSummary $candidateSpeedSummary\n"
             "Write-Host ('ALLOWED=' + $fpsVerdict.allowed + ' REASON=' + $fpsVerdict.reason)\n"
             + block + "\nforeach ($f in $proofFailures) { Write-Host ('FAIL=' + $f) }\nWrite-Host ('COUNT=' + @($proofFailures).Count)\n")
-        self.assertIn("ARM=HEAVY,HEAVY", out, "the wrapper's own legs record the HEAVY launch (this is the open successor BENCH-WRAPPER-LIGHT-ENV-1)")
+        # r8: the baseline leg (telemetry on, no per-frame opt-out) is HEAVY; the speed leg also sets MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT=0, a key outside the LIGHT shape, so it is UNKNOWN
+        # (it was HEAVY by the denylist's frame-log rule). The pair is still refused with the typed HEAVY reason (heavy outranks unknown).
+        self.assertIn("ARM=HEAVY,UNKNOWN", out, "the wrapper's own legs are never LIGHT (this is the open successor BENCH-WRAPPER-LIGHT-ENV-1)")
         self.assertIn(f"ALLOWED=False REASON={HEAVY_REASON}", out)
         self.assertIn("candidate-presented-fps-improvement-not-evaluated", out)
         self.assertNotIn("candidate-presented-fps-not-improved", out, "a HEAVY pair is never reported as a regression either")
@@ -806,7 +849,7 @@ class CompareMachinePerfFpsGateTests(_Probe):
 
     def test_a_record_with_a_speed_compare_is_judged_on_its_speed_leg(self) -> None:
         # adversary A6: the row publishes speedCompare, so the leg judged is candidateSpeed; an absent one is UNKNOWN, never the ordinary candidate
-        leg = f"[pscustomobject]@{{ telemetryArm = 'LIGHT'; {OBSERVERS_RECORDED_OFF}hostLoadProvisional = $false; hostLoadState = 'quiet' }}"
+        leg = f"[pscustomobject]@{{ telemetryArm = 'LIGHT'; {LIGHT_EVIDENCE}hostLoadProvisional = $false; hostLoadState = 'quiet' }}"
         heavy = "[pscustomobject]@{ telemetryArm = 'HEAVY'; hostLoadProvisional = $false; hostLoadState = 'quiet' }"
         fingerprint = "machineFingerprint = [pscustomobject]@{ schema = 'machine-fingerprint.v1'; hostname = 'H'; cpu = 'x'; gpu = 'y'; os = 'z'; build_sha = 'abc1234' }; "
         compare = "[pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 10.0; candidate = 20.0; deltaPercent = 100.0 } }"
@@ -823,7 +866,7 @@ class CompareMachinePerfFpsGateTests(_Probe):
     def test_a_saved_speed_leg_held_in_a_one_element_array_is_unknown_through_the_pair_selection(self) -> None:
         # BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary pass 5 A3): `$candidateLeg = if (...) { $Record.candidateSpeed }` unrolled a one-element array into the leg inside it, so a malformed
         # container the direct reader rejects was judged as that LIGHT leg and the machine row published the speed delta. Both leg choices keep the container whole.
-        light = f"[pscustomobject]@{{ telemetryArm = 'LIGHT'; {OBSERVERS_RECORDED_OFF}hostLoadProvisional = $false; hostLoadState = 'quiet' }}"
+        light = f"[pscustomobject]@{{ telemetryArm = 'LIGHT'; {LIGHT_EVIDENCE}hostLoadProvisional = $false; hostLoadState = 'quiet' }}"
         heavy = "[pscustomobject]@{ telemetryArm = 'HEAVY'; hostLoadProvisional = $false; hostLoadState = 'quiet' }"
         fingerprint = "machineFingerprint = [pscustomobject]@{ schema = 'machine-fingerprint.v1'; hostname = 'H'; cpu = 'x'; gpu = 'y'; os = 'z'; build_sha = 'abc1234' }; "
         compare = "[pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 20.0; candidate = 30.0; delta = 10.0; deltaPercent = 50.0 } }"
@@ -950,14 +993,17 @@ class CompareGuiSmokeAbFpsGateTests(_Probe):
         self.assertIsNone(r["result"]["autoDecision"]["averageFpsEquivalent"]["deltaPercent"])
         self.assertEqual(r["result"]["autoDecision"]["averageMs"]["deltaPercent"], -10.0, "a ms stage figure stays")
 
-    def test_a_stage_log_argument_makes_a_smoke_heavy(self) -> None:
-        # adversary A3, sibling site: the arm gate reads launch.arguments as well as launch.environment
-        staged = ("[pscustomobject]@{ launch = [pscustomobject]@{ arguments = @('--stage-log=C:\\Temp\\s.csv'); "
-                  f"environment = [pscustomobject]@{{ {self.LIGHT_ENV} }} }} }}")
-        out = self.ok(f"$e = Get-FpsArmComparisonEvidence -BeforeSmoke ({self.smoke(self.LIGHT_ENV)}) -AfterSmoke ({staged})\n$e | ConvertTo-Json -Compress")
-        e = json.loads(out.strip().splitlines()[-1])
-        self.assertTrue(e["refused"])
-        self.assertEqual((e["reason"], e["after"]["arm"]), (HEAVY_REASON, "HEAVY"))
+    def test_an_argument_outside_the_light_shape_refuses_the_smoke(self) -> None:
+        # adversary A3, sibling site: the arm gate reads launch.arguments as well as launch.environment. r8: a --stage-log (and the contact-sheet options of r6 A1) is not in the producers'
+        # LIGHT argument table, so the smoke is UNKNOWN (refused with the unknown-arm reason), no longer HEAVY.
+        for argument in ("'--stage-log=C:\\Temp\\s.csv'", "'--contact-sheet-dir', 'C:\\Temp\\sheet', '--contact-sheet-frames', '6'"):
+            with self.subTest(argument=argument):
+                staged = (f"[pscustomobject]@{{ launch = [pscustomobject]@{{ arguments = @({argument}); "
+                          f"environment = [pscustomobject]@{{ {self.LIGHT_ENV} }} }} }}")
+                out = self.ok(f"$e = Get-FpsArmComparisonEvidence -BeforeSmoke ({self.smoke(self.LIGHT_ENV)}) -AfterSmoke ({staged})\n$e | ConvertTo-Json -Compress")
+                e = json.loads(out.strip().splitlines()[-1])
+                self.assertTrue(e["refused"])
+                self.assertEqual((e["reason"], e["after"]["arm"]), (UNKNOWN_REASON, "UNKNOWN"))
 
     def test_a_mixed_pair_and_a_smoke_with_no_recorded_environment_are_refused(self) -> None:
         self.assertEqual(self.run_compare(self.LIGHT_ENV, self.HEAVY_ENV)["evidence"]["reason"], HEAVY_REASON)
@@ -1108,28 +1154,31 @@ class ObserverControlTests(_Probe):
         got = self.arms(list(cases))
         self.assertEqual(dict(zip(cases, got)), {expr: f"ARM={want}" for expr, want in cases.items()})
 
-    # --- A1: env path, the consumer decides what "on" means (each rule read from its source) ---------------------------------------------------------------
-    def test_a_path_valued_variable_is_on_whenever_it_is_non_empty(self) -> None:
-        # RenderFrameThread.cpp:60-62 opens a stage CSV from ANY non-empty MLVAPP_PHASE3_TEL_PATH; StageTiming.h:87-90 opens MLVAPP_STAGE_TIMING_FILE the same way;
-        # CrashForensics.cpp:687 reads MLVAPP_PERF_FIELD_LOG_PATH trimmed-non-empty; GpuDisplayWindow.cpp:146 dumps into a non-empty MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR.
+    # --- the environment table: a closed list with exact values (r8 replaces the per-consumer denylist of r2-r6) ---------------------------------------------
+    def test_a_path_valued_variable_outside_the_table_is_unknown_whatever_its_value(self) -> None:
+        # RenderFrameThread.cpp:60-62 opens a stage CSV from ANY non-empty MLVAPP_PHASE3_TEL_PATH; StageTiming.h:87-90 opens MLVAPP_STAGE_TIMING_FILE the same way; CrashForensics.cpp:687 reads
+        # MLVAPP_PERF_FIELD_LOG_PATH; GpuDisplayWindow.cpp:146 dumps into a non-empty MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR. The table names none of them, so each is UNKNOWN whatever its value
+        # (empty included: an empty value is still a set variable, qEnvironmentVariableIsSet); the table's own path keys (a log directory, a DLL) stay LIGHT.
         def env(*pairs: str) -> str:
-            return "Get-FpsArmFromEnvironment @(" + LIGHT_ENV + "," + ",".join(f"'{p}'" for p in pairs) + ")"
+            return "Get-FpsArmFromEnvironment @(" + LIGHT_ENV + "," + ",".join(f"'{p}'" for p in pairs) + ") @()"
         self.check({
-            env("MLVAPP_PHASE3_TEL_PATH=0"): "HEAVY",                       # the adversary's input
-            env("MLVAPP_PHASE3_TEL_PATH=false"): "HEAVY",
-            env("MLVAPP_PHASE3_TEL_PATH=C:\\Temp\\stages.csv"): "HEAVY",
-            env("MLVAPP_PHASE3_TEL_PATH="): "LIGHT",                        # empty is the one value the consumer reads as off
-            env("mlvapp_phase3_tel_path=0"): "HEAVY",
+            env("MLVAPP_PHASE3_TEL_PATH=0"): "UNKNOWN",
+            env("MLVAPP_PHASE3_TEL_PATH=false"): "UNKNOWN",
+            env("MLVAPP_PHASE3_TEL_PATH=C:\\Temp\\stages.csv"): "UNKNOWN",
+            env("MLVAPP_PHASE3_TEL_PATH="): "UNKNOWN",
+            env("mlvapp_phase3_tel_path=0"): "UNKNOWN",
             env("MLVAPP_STAGE_TIMING_FILE=0"): "UNKNOWN",
             env("MLVAPP_PERF_FIELD_LOG_PATH=0"): "UNKNOWN",
             env("MLVAPP_PERF_FIELD_LOG_DIR=0"): "UNKNOWN",
             env("MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR=0"): "UNKNOWN",
-            env("MLVAPP_A_NEW_DIAGNOSTIC_DUMP_DIR=0"): "UNKNOWN",           # any unlisted *_PATH / *_FILE / *_DIR is a path
+            env("MLVAPP_A_NEW_DIAGNOSTIC_DUMP_DIR=0"): "UNKNOWN",
             env("MLVAPP_A_NEW_DIAGNOSTIC_FILE=0"): "UNKNOWN",
-            env("MLVAPP_A_NEW_DIAGNOSTIC_DUMP_DIR="): "UNKNOWN",             # an empty value is still a set variable (qEnvironmentVariableIsSet); only a LISTED consumer is known to read it as off
-            env("MLVAPP_CRASH_FORENSICS_LOG_DIR=C:\\Temp\\forensics"): "LIGHT",  # configuration, on the closed benign list
-            env("MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS=0"): "UNKNOWN",          # a threshold of zero ms is a value, not an off switch
-            env("MLVAPP_PLAYBACK_PRESENT_TRACE=1"): "LIGHT",                # the in-memory trace is on the benign list, matching the spec classifier (presentTrace)
+            env("MLVAPP_A_NEW_DIAGNOSTIC_DUMP_DIR="): "UNKNOWN",
+            env("MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS=0"): "UNKNOWN",
+            env("MLVAPP_CRASH_FORENSICS_LOG_DIR=C:\\Temp\\forensics"): "LIGHT",
+            env("MLVAPP_GPU_PLAYBACK_RECON_DLL=C:\\pkg\\recon.dll"): "LIGHT",
+            env("MLVAPP_PLAYBACK_PRESENT_TRACE=1"): "LIGHT",                # the in-memory trace is a table row, matching the spec classifier (presentTrace)
+            env("MLVAPP_PLAYBACK_PRESENT_TRACE=0"): "UNKNOWN",              # the table names the value the job emits, 1
         })
 
     def test_the_adversary_input_for_a1_is_not_light_through_the_launch_block(self) -> None:
@@ -1137,7 +1186,7 @@ class ObserverControlTests(_Probe):
                   "MLVAPP_PHASE3_TEL_PATH = '0' }; arguments = @() }")
         out = self.ok(f"$a = Get-FpsArmFromLaunch ({launch})\nWrite-Host ('ARM=' + $a.arm)\n"
                       f"$v = Get-FpsPairVerdict -Baseline $a -Candidate $a\nWrite-Host ('ALLOWED=' + $v.allowed)")
-        self.assertIn("ARM=HEAVY", out)
+        self.assertIn("ARM=UNKNOWN", out)
         self.assertIn("ALLOWED=False", out)
 
     # --- A2: spec / result path, the same list ----------------------------------------------------------------------------------------------------------
@@ -1170,19 +1219,20 @@ class ObserverControlTests(_Probe):
             "Get-FpsArmFromJobResult (ConvertFrom-Json '{\"telemetryArm\":\"LIGHT\",\"cudaLaunchTimingMinMs\":null}')": "UNKNOWN",
         })
 
-    def test_the_recon_output_validation_flag_is_a_per_frame_observer(self) -> None:
-        # r2 pass 4 A2: MainWindow.cpp:404-409 / RenderFrameThread.cpp:696-702 (set and not "0") run a GL readback, SHA256 and a CPU recon replay per presented frame
+    def test_the_recon_output_validation_flag_is_outside_the_light_shape(self) -> None:
+        # r2 pass 4 A2: MainWindow.cpp:404-409 / RenderFrameThread.cpp:696-702 (set and not "0") run a GL readback, SHA256 and a CPU recon replay per presented frame. r8: the table does not name it
+        # (nor its sample-every), so it is UNKNOWN at any value, the wrapper speed leg's explicit "0" included; the routing keys the job sets stay LIGHT.
         def env(*pairs: str) -> str:
-            return "Get-FpsArmFromEnvironment @(" + LIGHT_ENV + "," + ",".join(f"'{p}'" for p in pairs) + ")"
+            return "Get-FpsArmFromEnvironment @(" + LIGHT_ENV + "," + ",".join(f"'{p}'" for p in pairs) + ") @()"
         adversary = ("[pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1'; MLVAPP_GPU_PLAYBACK_RECON = '1'; "
                      "MLVAPP_EXPERIMENTAL_GPU_PLAYBACK_RECON_TEXTURE_PRESENT = '1'; MLVAPP_EXPERIMENTAL_GPU_AMAZE_TEXTURE_PRESENT = '1'; "
                      "MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT = '1'; MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT_SAMPLE_EVERY = '1' }")
         self.check({
-            f"Get-FpsArmFromEnvironment ({adversary})": "HEAVY",
-            env("MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT=1"): "HEAVY",
-            env("MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT=true"): "HEAVY",
-            env("MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT=0"): "LIGHT",                 # the speed leg of run-release-cuda-playback-ab.ps1:1378
-            env("MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT=0", "MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT_SAMPLE_EVERY=4"): "LIGHT",   # inert without the flag
+            f"Get-FpsArmFromEnvironment ({adversary}) @()": "UNKNOWN",
+            env("MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT=1"): "UNKNOWN",
+            env("MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT=true"): "UNKNOWN",
+            env("MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT=0"): "UNKNOWN",                # the speed leg of run-release-cuda-playback-ab.ps1:1378 (a key outside the shape)
+            env("MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT=0", "MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT_SAMPLE_EVERY=4"): "UNKNOWN",
             env("MLVAPP_GPU_PLAYBACK_RECON=1", "MLVAPP_EXPERIMENTAL_GPU_PLAYBACK_RECON_TEXTURE_PRESENT=1", "MLVAPP_EXPERIMENTAL_GPU_AMAZE_TEXTURE_PRESENT=1"): "LIGHT",   # a route, not an observer
             env("MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG=1"): "LIGHT",                # deduped to one line per session (playback-attr-3-cuda-job.ps1:268-277)
         })
@@ -1190,7 +1240,7 @@ class ObserverControlTests(_Probe):
     def test_the_record_helper_judges_the_whole_leg_not_its_arm_word(self) -> None:
         self.check({
             "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = 'LIGHT' })": "UNKNOWN",   # r5: the bare arm word is not proof (the rule a recorded result already had)
-            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {OBSERVERS_RECORDED_OFF}}})": "LIGHT",
+            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {LIGHT_EVIDENCE}}})": "LIGHT",
             "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = 'LIGHT'; utilSample = $true })": "UNKNOWN",
             "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = 'LIGHT'; generatorArgs = [pscustomobject]@{ cudaLaunchTimingMinMs = 0 } })": "UNKNOWN",
             "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = 'HEAVY'; utilSample = $true })": "HEAVY",
@@ -1205,9 +1255,9 @@ class ObserverControlTests(_Probe):
 
     def test_an_unlisted_variable_is_unknown_whatever_its_value(self) -> None:
         # r2 pass 5 A1: MLVAPP_PROCESSING_CORE_COLOR_MAIN_PRELUDE_WB_PROBE=0 is a MODE (raw_processing.c:346 processing_parse_probe_mode: mode 0 enables the probe timing); the dual-iso
-        # probes read their value the same way (dualiso.c:304, :396). "0" is only proof of off for a consumer this module lists.
+        # probes read their value the same way (dualiso.c:304, :396). "0" is no proof of off for a name outside the table (r8: the table is the only thing a LIGHT leg may carry).
         def env(*pairs: str) -> str:
-            return "Get-FpsArmFromEnvironment @(" + LIGHT_ENV + "," + ",".join(f"'{p}'" for p in pairs) + ")"
+            return "Get-FpsArmFromEnvironment @(" + LIGHT_ENV + "," + ",".join(f"'{p}'" for p in pairs) + ") @()"
         self.check({
             env("MLVAPP_PROCESSING_CORE_COLOR_MAIN_PRELUDE_WB_PROBE=0"): "UNKNOWN",   # the adversary's input
             env("MLVAPP_PROCESSING_CORE_COLOR_MAIN_PRELUDE_WB_PROBE=1"): "UNKNOWN",
@@ -1219,30 +1269,39 @@ class ObserverControlTests(_Probe):
             env("NOT_AN_MLVAPP_VARIABLE=0", "QT_OPENGL=desktop"): "LIGHT",             # only the MLVAPP_ namespace is the app's own control surface
         })
 
-    def test_every_variable_the_job_generator_emits_is_classified(self) -> None:
-        # r2 pass 5 A2: the spec classifier said LIGHT for a leg whose job adds MLVAPP_VIEWPORT_PRESENT_DIAG=1, which the env classifier called HEAVY. The class guard: each MLVAPP_* name
-        # the generator itself writes is either on the observer list (not LIGHT when set) or a standing configuration the closed benign list holds (LIGHT), so the classifiers cannot disagree
-        # about the generator's own environment. The two arm switches are the arm itself.
+    # The MLVAPP_* names the job generator writes that the LIGHT table does NOT hold, each for one stated reason. A launch that records one is UNKNOWN: refused, the safe side.
+    #   observers a LIGHT leg must not carry: the HEAVY arm's loggers (playback-attr-3-cuda-job.ps1:3041-3045), the viewport present diag a LIGHT leg drops (:3078), the per-launch CUDA timer
+    #   (spec key cudaLaunchTimingMinMs), the first-present capture and the warm-reuse miss dump (spec keys firstPresentCapture / warmReuseMissDump);
+    #   spec-driven knobs and test hooks (thread partitions, scope cadence, kill switches, fault injection) that a venue leg sets from its spec: the spec reader (c) judges those legs, and a recorded
+    #   launch that carries one is not the producers' standing LIGHT shape, so it over-refuses rather than guess a value domain for each.
+    JOB_NAMES_A_LIGHT_LEG_DOES_NOT_CARRY = {
+        "MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY", "MLVAPP_PLAYBACK_DETAILED_TIMELINE_TELEMETRY", "MLVAPP_STAGE_TIMING", "MLVAPP_PERF_FIELD_LOG", "MLVAPP_VIEWPORT_PRESENT_DIAG",
+        "MLVAPP_CUDA_LAUNCH_TIMING", "MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS", "MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE", "MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR",
+        "MLVAPP_DISABLE_PREP_POINTWISE_FAST", "MLVAPP_DISABLE_RAW_UINT16_PREFETCH", "MLVAPP_RAW_UINT16_PREFETCH_DECODERS", "MLVAPP_GPU_FAULT_INJECT", "MLVAPP_GPU_RECON_RELEASE_DEFERRED",
+        "MLVAPP_GPU_SAFE_START", "MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY", "MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE", "MLVAPP_PLAYBACK_PREP_OMP_THREADS", "MLVAPP_PLAYBACK_RECON_OMP_THREADS",
+        "MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES", "MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK", "MLVAPP_PLAYBACK_SCOPE_INTERVAL_MS",
+    }
+
+    def test_every_variable_the_job_generator_emits_is_in_the_light_table_or_named_as_not_light(self) -> None:
+        # r2 pass 5 A2 (class guard, r8 form): each MLVAPP_* name the generator itself writes is either a row of the LIGHT environment table (the closed list a LIGHT leg may carry, each row citing its
+        # producer) or named in JOB_NAMES_A_LIGHT_LEG_DOES_NOT_CARRY, so a NEW name the generator starts to emit cannot pass the gate unclassified: it fails here until someone decides which it is.
         job = (PROFILING / "bachelor" / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8")
-        names = sorted(set(re.findall(r"MLVAPP_[A-Z0-9_]+(?==)", job)) - {"MLVAPP_PLAYBACK_SMOKE_TELEMETRY", "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG"})
-        self.assertGreater(len(names), 30)
-        body = ("$observerEnv = @(Get-FpsObserverControls | Where-Object { $_.envVar } | ForEach-Object { $_.envVar })\n"
-                f"foreach ($n in @({','.join(repr(n) for n in names)})) {{\n"
-                f"  $arm = (Get-FpsArmFromEnvironment @({LIGHT_ENV}, ($n + '=1'))).arm\n"
-                "  Write-Host ('ROW=' + $n + '|' + $arm + '|' + ($observerEnv -contains $n))\n}\n")
-        wrong = []
-        for line in self.ok(body).splitlines():
-            if line.startswith("ROW="):
-                name, arm, is_observer = line[4:].split("|")
-                if (is_observer == "True") == (arm == "LIGHT"):
-                    wrong.append(f"{name}: arm={arm} observer={is_observer}")
-        self.assertEqual(wrong, [], "classify each name the generator emits: add it to the observer list or to FpsArmKnownBenignEnv")
+        names = sorted(set(re.findall(r"MLVAPP_[A-Z0-9_]+(?==)", job)))
+        self.assertGreater(len(names), 25)
+        table = set(self.ok("(Get-FpsLightShape).environment | ForEach-Object { $_.name }").split())
+        unclassified = [n for n in names if n not in table and n not in self.JOB_NAMES_A_LIGHT_LEG_DOES_NOT_CARRY]
+        self.assertEqual(unclassified, [], "classify each name the generator emits: add a row to $script:FpsLightEnv (a LIGHT leg carries it) or name it in JOB_NAMES_A_LIGHT_LEG_DOES_NOT_CARRY")
+        # the exemption list holds only names the job really writes and the table really excludes (no stale entry hides a decision)
+        self.assertEqual(sorted(n for n in self.JOB_NAMES_A_LIGHT_LEG_DOES_NOT_CARRY if n not in names or n in table), [])
+        # and each one a LIGHT leg must not carry reads UNKNOWN or HEAVY through the gate, never LIGHT
+        body = "".join(f"Write-Host ('ARM=' + (Get-FpsArmFromEnvironment @({LIGHT_ENV}, '{n}=1') @()).arm)\n" for n in sorted(self.JOB_NAMES_A_LIGHT_LEG_DOES_NOT_CARRY))
+        self.assertEqual(set(self.ok(body).split()), {"ARM=UNKNOWN"})
 
     def test_a_result_that_records_observer_controls_is_judged_on_them(self) -> None:
         self.check({
             "Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT'; observerControls = [pscustomobject]@{ utilSample = $true } })": "UNKNOWN",
             "Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT'; observerControls = [pscustomobject]@{ cudaLaunchTimingMinMs = 0 } })": "UNKNOWN",
-            "Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT'; observerControls = [pscustomobject]@{ cudaLaunchTimingMinMs = -1; utilSample = $false } })": "LIGHT",
+            "Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT'; observerControls = [pscustomobject]@{ cudaLaunchTimingMinMs = -1; utilSample = $false } })": "UNKNOWN",   # r8: no evidence
             # the adversary's result-only input: provenance of a valid -TelemetryArm LIGHT -UtilSample job carries the arm word and no observer record
             "Get-FpsArmFromJobResult (ConvertFrom-Json '{\"rangeHeadSha\":\"x\",\"telemetryArm\":\"LIGHT\"}')": "UNKNOWN",
             # a spec supplies the observer record, so a bare LIGHT result under a clean LIGHT spec still agrees
@@ -1276,50 +1335,32 @@ class ObserverControlTests(_Probe):
         self.check({
             "Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT'; cudaLaunchTimingMinMs = 0 })": "UNKNOWN",
             "Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT'; generatorArgs = [pscustomobject]@{ utilSample = $true } })": "UNKNOWN",
-            "Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT'; corePartitionTelemetry = $false })": "LIGHT",
+            "Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT'; corePartitionTelemetry = $false })": "UNKNOWN",   # r8: an off switch is no evidence of LIGHT by itself
+            f"Get-FpsArmFromJobResult ([pscustomobject]@{{ telemetryArm = 'LIGHT'; corePartitionTelemetry = $false; {RECORDED_LIGHT_LAUNCH} }})": "LIGHT",
+            f"Get-FpsArmFromJobResult ([pscustomobject]@{{ telemetryArm = 'LIGHT'; utilSample = $true; {RECORDED_LIGHT_LAUNCH} }})": "UNKNOWN",
             "Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'HEAVY'; utilSample = $true })": "HEAVY",
         })
 
     # --- the shared list --------------------------------------------------------------------------------------------------------------------------------
-    def test_one_list_drives_the_three_classifiers(self) -> None:
-        # Every control the module lists must refuse LIGHT in the classifier of each surface it has (spec key -> spec and result, env name -> env), and its OFF value must not.
+    def test_one_list_drives_the_spec_and_the_result_classifiers(self) -> None:
+        # r8: the list is the generator's five forwarded switches only (the environment is judged against the LIGHT table instead). Every control must refuse LIGHT in the spec and the result
+        # classifier (a result judged beside a LIGHT spec), and its OFF value must not.
         out = self.ok(
             "foreach ($c in Get-FpsObserverControls) {\n"
-            "  $row = @{ id = $c.id; specKey = $c.specKey; envVar = $c.envVar; kind = $c.kind; severity = $c.severity }\n"
-            "  if ($c.specKey) {\n"
-            "    $on = switch ($c.specKind) { 'threshold' { 0 } default { $true } }\n"
-            "    $off = switch ($c.specKind) { 'threshold' { -1 } default { $false } }\n"
-            "    $mk = { param($v) $ga = [pscustomobject]@{ telemetryArm = 'LIGHT' }; $ga | Add-Member -NotePropertyName $c.specKey -NotePropertyValue $v; [pscustomobject]@{ legType = 'speed'; generatorArgs = $ga } }\n"
-            "    $row.specOn = (Get-FpsArmFromLegSpec (& $mk $on)).arm; $row.specOff = (Get-FpsArmFromLegSpec (& $mk $off)).arm\n"
-            "    $rk = { param($v) $r = [pscustomobject]@{ telemetryArm = 'LIGHT' }; $r | Add-Member -NotePropertyName $c.specKey -NotePropertyValue $v; $r }\n"
-            "    $row.resultOn = (Get-FpsArmFromJobResult (& $rk $on)).arm; $row.resultOff = (Get-FpsArmFromJobResult (& $rk $off)).arm\n"
-            "  }\n"
-            "  if ($c.envVar) {\n"
-            "    $env = @('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1', 'MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1', ($c.envVar + '=0'))\n"
-            "    $row.envZero = (Get-FpsArmFromEnvironment $env).arm\n"
-            "    $env2 = @('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1', 'MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1', ($c.envVar + '='))\n"
-            "    $row.envEmpty = (Get-FpsArmFromEnvironment $env2).arm\n"
-            "  }\n"
+            "  $row = @{ id = $c.id; specKey = $c.specKey }\n"
+            "  $on = switch ($c.specKind) { 'threshold' { 0 } default { $true } }\n"
+            "  $off = switch ($c.specKind) { 'threshold' { -1 } default { $false } }\n"
+            "  $mk = { param($v) $ga = [pscustomobject]@{ telemetryArm = 'LIGHT' }; $ga | Add-Member -NotePropertyName $c.specKey -NotePropertyValue $v; [pscustomobject]@{ legType = 'speed'; generatorArgs = $ga } }\n"
+            "  $row.specOn = (Get-FpsArmFromLegSpec (& $mk $on)).arm; $row.specOff = (Get-FpsArmFromLegSpec (& $mk $off)).arm\n"
+            "  $rk = { param($v) $r = [pscustomobject]@{ telemetryArm = 'LIGHT' }; $r | Add-Member -NotePropertyName $c.specKey -NotePropertyValue $v; $r }\n"
+            "  $row.resultOn = (Get-FpsArmFromJobResult (& $rk $on) -ObserversFromSpec (& $mk $off)).arm; $row.resultOff = (Get-FpsArmFromJobResult (& $rk $off) -ObserversFromSpec (& $mk $off)).arm\n"
             "  $row | ConvertTo-Json -Compress\n}\n")
         rows = [json.loads(line) for line in out.splitlines() if line.startswith("{")]
-        self.assertGreaterEqual(len(rows), 12, "the list must hold the nine per-frame diagnostics plus the generator observers")
         spec_keys = {r["specKey"] for r in rows if r.get("specKey")}
         self.assertEqual(spec_keys, set(OBSERVER_SPEC_KEYS))
         for r in rows:
-            if r.get("specKey"):
-                self.assertEqual((r["specOn"], r["resultOn"]), ("UNKNOWN", "UNKNOWN"), r)
-                self.assertEqual((r["specOff"], r["resultOff"]), ("LIGHT", "LIGHT"), r)
-            if r.get("envVar"):
-                # kind 'flag': "0" is off and "" reads toward on; kind 'value': "0" is a value (on) and "" is the only off
-                if r["kind"] == "value":
-                    self.assertNotEqual(r["envZero"], "LIGHT", r)
-                    self.assertEqual(r["envEmpty"], "LIGHT", r)
-                elif r["kind"] == "truthy":
-                    # the app reads only 1 / true / yes / on (trimmed, any case) as on: "0" and "" are off (GpuDisplayViewport.cpp:51-60)
-                    self.assertEqual((r["envZero"], r["envEmpty"]), ("LIGHT", "LIGHT"), r)
-                else:
-                    self.assertEqual(r["envZero"], "LIGHT", r)
-                    self.assertNotEqual(r["envEmpty"], "LIGHT", r)
+            self.assertEqual((r["specOn"], r["resultOn"]), ("UNKNOWN", "UNKNOWN"), r)
+            self.assertEqual((r["specOff"], r["resultOff"]), ("LIGHT", "LIGHT"), r)
 
     # --- r4 (luna r3 blockers B1 = A1, B2 = A2) -------------------------------------------------------------------------------------------------------------
     @staticmethod
@@ -1339,89 +1380,75 @@ class ObserverControlTests(_Probe):
             f"$a = Get-FpsArmFromLegRecord {self._json(doc)}\n$v = Get-FpsPairVerdict -Baseline $a -Candidate $a\nWrite-Host ('PAIR=' + $v.allowed + '|' + $v.reason)\n" for doc in literal))
         self.assertEqual(out.split(), [f"PAIR=False|{UNKNOWN_REASON}"] * len(literal))
 
-    def test_a_leg_record_reads_every_kind_of_enabled_observer_control(self) -> None:
+    def test_an_observer_controls_entry_of_any_kind_is_no_evidence_for_a_leg_record(self) -> None:
+        # r8 MOOT A3 (r6 A3 lived in the observerControls reading, Read-FpsRecordedObserverControls / Test-FpsRecordHasObserverEvidence, both deleted): the adversary's record was two quiet saved legs
+        # with telemetryArm LIGHT, observerControls {"irrelevant":false} and no launch, which the old reader called LIGHT because one unrelated false value made the entry count positive. The
+        # record's `observerControls` is neither read nor trusted now: LIGHT needs a launch matching the producers' shape or LIGHT generatorArgs, so every one of these is UNKNOWN, all-off included.
         def rec(controls: str) -> str:
             return f"Get-FpsArmFromLegRecord {self._json('{' + chr(34) + 'telemetryArm' + chr(34) + ':' + chr(34) + 'LIGHT' + chr(34) + ',' + chr(34) + 'observerControls' + chr(34) + ':' + controls + '}')}"
-        self.check({
-            rec('{"cudaLaunchTimingMinMs":0}'): "UNKNOWN",             # the threshold's own rule: 0 is ON (the job's -ge 0)
-            rec('{"warmReuseMissDump":true}'): "UNKNOWN",
-            rec('{"someObserverNobodyListed":true}'): "UNKNOWN",       # an unlisted entry: true
-            rec('{"someObserverNobodyListed":1}'): "UNKNOWN",          # a non-zero number
-            rec('{"someObserverNobodyListed":2.5}'): "UNKNOWN",
-            rec('{"someObserverNobodyListed":"true"}'): "UNKNOWN",     # a non-empty truthy string
-            rec('{"someObserverNobodyListed":"yes"}'): "UNKNOWN",
-            rec('{"utilSample":false,"corePartitionTelemetry":true}'): "UNKNOWN",   # one enabled entry among disabled ones
-            # fail closed: present but not an object, or an entry that cannot be read as a boolean
-            rec('"utilSample"'): "UNKNOWN",
-            rec('5'): "UNKNOWN",
-            rec('true'): "UNKNOWN",
-            rec('["utilSample"]'): "UNKNOWN",
-            rec('[]'): "UNKNOWN",
-            rec('null'): "UNKNOWN",
-            rec('{"someObserverNobodyListed":null}'): "UNKNOWN",
-            rec('{"someObserverNobodyListed":[true]}'): "UNKNOWN",
-            rec('{"someObserverNobodyListed":{"on":true}}'): "UNKNOWN",
-            rec('{"someObserverNobodyListed":""}'): "UNKNOWN",
-            # admission controls: all-false (and the threshold's -1) stays LIGHT; an EMPTY list records nothing, so it is the bare word again (UNKNOWN, r5)
-            rec('{}'): "UNKNOWN",
-            rec('{"utilSample":false,"corePartitionTelemetry":false,"firstPresentCapture":false,"warmReuseMissDump":false,"cudaLaunchTimingMinMs":-1}'): "LIGHT",
-            rec('{"someObserverNobodyListed":false}'): "LIGHT",
-            rec('{"someObserverNobodyListed":0}'): "LIGHT",
-        })
+        controls = ['{"irrelevant":false}', '{"someObserverNobodyListed":true}', '{"someObserverNobodyListed":0}', '{"someObserverNobodyListed":false}', '{"cudaLaunchTimingMinMs":0}',
+                    '{"utilSample":false,"corePartitionTelemetry":false,"firstPresentCapture":false,"warmReuseMissDump":false,"cudaLaunchTimingMinMs":-1}',
+                    '{"utilSample":false,"corePartitionTelemetry":true}', '{}', '"utilSample"', '5', 'true', '["utilSample"]', '[]', 'null', '{"someObserverNobodyListed":null}']
+        self.check({rec(c): "UNKNOWN" for c in controls})
+        # the same record through the verdict reader every caller uses: the pair is refused as unknown-arm, never allowed
+        irrelevant = self._json('{"telemetryArm":"LIGHT","observerControls":{"irrelevant":false}}')
+        out = self.ok(f"$a = Get-FpsArmFromLegRecord {irrelevant}\n$v = Get-FpsPairVerdict -Baseline $a -Candidate $a\nWrite-Host ('PAIR=' + $v.allowed + '|' + $v.reason)\n")
+        self.assertEqual(out.split(), [f"PAIR=False|{UNKNOWN_REASON}"])
 
     def test_a_bare_light_leg_record_is_unknown_and_the_pair_is_refused(self) -> None:
         # r5 (Dot on f51e0821, bus 4cd3358 cos-feedback/mlv-app/pr-871.md; Grok, PR comment 7039843864): a saved leg whose only evidence is the arm WORD read LIGHT here while a recorded
-        # result with the same word was refused (Get-FpsArmFromJobResult, no observer record). One evidence rule now: the word is proof only beside a recorded observer list.
+        # result with the same word was refused. r8: one evidence rule for both: the word is proof only beside a launch that matches the producers' LIGHT shape, or LIGHT generatorArgs.
         bare = self._json('{"telemetryArm":"LIGHT"}')
         empty = self._json('{"telemetryArm":"LIGHT","observerControls":{}}')
         recorded_off = self._json('{"telemetryArm":"LIGHT","observerControls":{"utilSample":false}}')
+        launch = '{"environment":{"MLVAPP_PLAYBACK_SMOKE_TELEMETRY":"1","MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG":"1"},"arguments":[]}'
+        with_launch = self._json('{"telemetryArm":"LIGHT","launch":' + launch + '}')
+        with_ga = self._json('{"telemetryArm":"LIGHT","generatorArgs":{"telemetryArm":"LIGHT","presentTrace":true}}')
         heavy = self._json('{"telemetryArm":"HEAVY","observerControls":{"utilSample":true}}')
         self.check({
             f"Get-FpsArmFromLegRecord {bare}": "UNKNOWN",
             f"Get-FpsArmFromLegRecord {empty}": "UNKNOWN",
-            f"Get-FpsArmFromLegRecord {recorded_off}": "LIGHT",
+            f"Get-FpsArmFromLegRecord {recorded_off}": "UNKNOWN",
+            f"Get-FpsArmFromLegRecord {with_launch}": "LIGHT",
+            f"Get-FpsArmFromLegRecord {with_ga}": "LIGHT",
             f"Get-FpsArmFromLegRecord {heavy}": "HEAVY",
             # the boundary the reader shares with a recorded result: the same record reads the same arm through both
             f"Get-FpsArmFromJobResult {bare}": "UNKNOWN",
             f"Get-FpsArmFromJobResult {empty}": "UNKNOWN",
-            f"Get-FpsArmFromJobResult {recorded_off}": "LIGHT",
+            f"Get-FpsArmFromJobResult {recorded_off}": "UNKNOWN",
+            f"Get-FpsArmFromJobResult {with_launch}": "LIGHT",
+            f"Get-FpsArmFromJobResult {with_ga}": "LIGHT",
         })
-        # through the verdict reader every caller uses (Get-FpsPairVerdict): an uncorroborated bare LIGHT/LIGHT pair is refused as UNKNOWN, a corroborated pair is allowed
+        # through the verdict reader every caller uses (Get-FpsPairVerdict): an uncorroborated bare LIGHT/LIGHT pair is refused as UNKNOWN, a launch-proven pair is allowed
         out = self.ok(
             f"$b = Get-FpsArmFromLegRecord {bare}\n$v = Get-FpsPairVerdict -Baseline $b -Candidate $b\nWrite-Host ('BARE=' + $v.allowed + '|' + $v.reason)\n"
-            f"$o = Get-FpsArmFromLegRecord {recorded_off}\n$v = Get-FpsPairVerdict -Baseline $o -Candidate $o\nWrite-Host ('OFF=' + $v.allowed + '|' + $v.reason)\n")
-        self.assertEqual(out.split(), [f"BARE=False|{UNKNOWN_REASON}", "OFF=True|"])
+            f"$o = Get-FpsArmFromLegRecord {with_launch}\n$v = Get-FpsPairVerdict -Baseline $o -Candidate $o\nWrite-Host ('LAUNCH=' + $v.allowed + '|' + $v.reason)\n")
+        self.assertEqual(out.split(), [f"BARE=False|{UNKNOWN_REASON}", "LAUNCH=True|"])
 
-    def test_a_job_result_reads_observer_controls_the_same_way(self) -> None:
-        # sibling sweep: Get-FpsArmFromJobResult already read observerControls, but skipped a malformed one; the leg-record and result readers now share one rule
+    def test_a_job_result_ignores_an_observer_controls_entry_too(self) -> None:
+        # r8: the result reader shares the leg reader's evidence rule, so an observerControls entry of any kind (all-off included) leaves a result's LIGHT word unproven
         def res(controls: str) -> str:
             return "Get-FpsArmFromJobResult " + self._json('{"telemetryArm":"LIGHT","observerControls":' + controls + '}')
-        self.check({
-            res('{"someObserverNobodyListed":true}'): "UNKNOWN",
-            res('"utilSample"'): "UNKNOWN",
-            res('["utilSample"]'): "UNKNOWN",
-            res('{"someObserverNobodyListed":null}'): "UNKNOWN",
-            res('{"utilSample":false}'): "LIGHT",
-            res('{"someObserverNobodyListed":0}'): "LIGHT",
-        })
+        self.check({res(c): "UNKNOWN" for c in ('{"someObserverNobodyListed":true}', '"utilSample"', '["utilSample"]', '{"someObserverNobodyListed":null}', '{"utilSample":false}', '{"someObserverNobodyListed":0}')})
 
-    def test_viewport_present_diag_is_an_active_observer_in_every_spelling_the_app_accepts(self) -> None:
+    def test_viewport_present_diag_is_outside_the_light_shape_in_every_spelling(self) -> None:
         # B2: GpuDisplayViewport.cpp:62-71 envFlagEnabled reads the value trimmed and lowercased: 1 / true / yes / on are ON, everything else (0, false, off, no, empty) is OFF; the app logs
-        # from the per-present paths when it is on (:1226-1231 setPresentedImage, :2014-2019 updateTextureIfNeeded). It was on the benign list, so a LIGHT-looking launch passed.
+        # from the per-present paths when it is on (:1226-1231 setPresentedImage, :2014-2019 updateTextureIfNeeded). r8: the LIGHT table does not hold the variable (the job drops it from a LIGHT
+        # leg), so any recorded value of it, an off spelling included, is UNKNOWN; absent is LIGHT.
         def launch(value: str | None) -> str:
             extra = "" if value is None else f"; MLVAPP_VIEWPORT_PRESENT_DIAG = '{value}'"
             return ("Get-FpsArmFromLaunch ([pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; "
                     f"MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1'{extra} }}; arguments = @() }})")
-        cases = {launch(v): "HEAVY" for v in ("1", "true", "on", "yes", "TRUE", "On", "YES", " 1 ", "1\t", "true\r\n")}
-        cases.update({launch(v): "LIGHT" for v in (None, "0", "false", "off", "no", "", "FALSE", "Off")})
+        cases = {launch(v): "UNKNOWN" for v in ("1", "true", "on", "yes", "TRUE", "On", "YES", " 1 ", "1\t", "true\r\n", "0", "false", "off", "no", "", "FALSE", "Off")}
+        cases[launch(None)] = "LIGHT"
         self.check(cases)
         # the key compares ignoring case, and the list form of the launch environment reads the same
         self.check({
-            "Get-FpsArmFromEnvironment @('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','mlvapp_viewport_present_diag=on')": "HEAVY",
-            "Get-FpsArmFromEnvironment @('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_VIEWPORT_PRESENT_DIAG=0')": "LIGHT",
+            "Get-FpsArmFromEnvironment @('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','mlvapp_viewport_present_diag=on') @()": "UNKNOWN",
+            "Get-FpsArmFromEnvironment @('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_VIEWPORT_PRESENT_DIAG=0') @()": "UNKNOWN",
         })
         out = self.ok("$a = " + launch("1") + "\n$v = Get-FpsPairVerdict -Baseline $a -Candidate $a\nWrite-Host ('ALLOWED=' + $v.allowed + '|' + $v.reason)")
-        self.assertIn(f"ALLOWED=False|{HEAVY_REASON}", out)
+        self.assertIn(f"ALLOWED=False|{UNKNOWN_REASON}", out)
 
     def test_the_venue_job_leaves_the_present_diag_out_of_a_light_leg_and_keeps_it_elsewhere(self) -> None:
         # B2, spec-only route: the job puts MLVAPP_VIEWPORT_PRESENT_DIAG=1 in $envs unconditionally (playback-attr-3-cuda-job.ps1 :3061), so a spec that says only telemetryArm LIGHT
@@ -1454,37 +1481,47 @@ class ObserverControlTests(_Probe):
                          sorted(["MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=0", "MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY=1", "MLVAPP_PLAYBACK_DETAILED_TIMELINE_TELEMETRY=1",
                                 "MLVAPP_STAGE_TIMING=1", "MLVAPP_PERF_FIELD_LOG=1"]))
 
-    def test_a_light_venue_leg_clears_every_inherited_observer_variable_and_other_arms_keep_them(self) -> None:
-        # r5 (adversary A3): the filter above drops only the override the job emits; the smoke child inherits the job's process environment, so a worker carrying MLVAPP_VIEWPORT_PRESENT_DIAG=on
-        # (or MLVAPP_STAGE_TIMING=1 ...) ran its logger inside an admitted LIGHT leg. The region clears each observer variable of the module's list for a LIGHT leg only.
+    def test_a_light_venue_leg_clears_every_inherited_mlvapp_variable_the_job_does_not_set(self) -> None:
+        # r5 (adversary A3), r8 (r6 A2, FIXED): the filter above drops only the override the job emits; the smoke child inherits the job's process environment, so a worker carrying an app control
+        # the job does not set ran it inside an admitted LIGHT leg while the plan and sidecars said LIGHT (r6's input: MLVAPP_GPU_TEX_NR_READY_BACKLOG_TELEMETRY=1, a variable no list named). A
+        # hard-coded list cannot be complete, so a LIGHT leg removes EVERY inherited MLVAPP_* variable of its own process that the job does not itself set for the leg (the names in $envs), and
+        # nothing else: another arm keeps them, a name the job sets keeps its inherited value (the explicit override replaces it), the hub fixture flag (read by the runner, not the app) and a
+        # non-MLVAPP name are untouched.
         job = (PROFILING / "bachelor" / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8")
         region = job.split("# LIGHT-ARM-PRESENT-DIAG-1 >>>", 1)[1].split("# LIGHT-ARM-PRESENT-DIAG-1 <<<", 1)[0]
-        listed = set(self.ok("(Get-FpsObserverControls | Where-Object { $_.envVar } | ForEach-Object { $_.envVar }) -join ','").strip().split(","))
-        self.assertGreater(len(listed), 15)
-        self.assertEqual(sorted(n for n in listed if f"'{n}'" not in region), [], "every observer variable of the module's list is cleared by the LIGHT leg's region")
+        for name in ("MLVAPP_STAGE_TIMING", "MLVAPP_PERF_FIELD_LOG_DIR", "MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE", "MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR"):
+            self.assertNotIn(name, region, f"the region keeps no hard-coded observer name list ({name})")
         body = "".join(
-            f"$TelemetryArm = '{arm}'; $envs = @('A=1','MLVAPP_VIEWPORT_PRESENT_DIAG=1'); $env:MLVAPP_STAGE_TIMING = '1'; $env:MLVAPP_VIEWPORT_PRESENT_DIAG = 'on'; $env:MLVAPP_PERF_FIELD_LOG_DIR = 'x'\n{region}\n"
-            f"Write-Host ('R={arm}|' + [bool]$env:MLVAPP_STAGE_TIMING + '|' + [bool]$env:MLVAPP_VIEWPORT_PRESENT_DIAG + '|' + [bool]$env:MLVAPP_PERF_FIELD_LOG_DIR + '|' + ($envs -join ','))\n"
+            f"$TelemetryArm = '{arm}'; $envs = @('MLVAPP_PLAYBACK_QUALITY_MODE=phase3_hq', 'QT_OPENGL=desktop'); $env:MLVAPP_GPU_TEX_NR_READY_BACKLOG_TELEMETRY = '1'; $env:MLVAPP_STAGE_TIMING = '1'; "
+            "$env:mlvapp_viewport_present_diag = 'on'; $env:MLVAPP_PLAYBACK_QUALITY_MODE = 'inherited'; $env:MLVAPP_HUB_PLAYBACK_CI_FIXTURE = 'CI_FIXTURE_ONLY'; $env:NOT_THE_APP = 'x'\n"
+            f"{region}\n"
+            f"Write-Host ('R={arm}|' + [bool]$env:MLVAPP_GPU_TEX_NR_READY_BACKLOG_TELEMETRY + '|' + [bool]$env:MLVAPP_STAGE_TIMING + '|' + [bool]$env:MLVAPP_VIEWPORT_PRESENT_DIAG + '|' + "
+            "[string]$env:MLVAPP_PLAYBACK_QUALITY_MODE + '|' + [bool]$env:MLVAPP_HUB_PLAYBACK_CI_FIXTURE + '|' + [bool]$env:NOT_THE_APP)\n"
             for arm in ("LIGHT", "HEAVY", ""))
         rows = [line for line in self.ok(body).splitlines() if line.startswith("R=")]
-        self.assertEqual(rows, ["R=LIGHT|False|False|False|A=1", "R=HEAVY|True|True|True|A=1,MLVAPP_VIEWPORT_PRESENT_DIAG=1", "R=|True|True|True|A=1,MLVAPP_VIEWPORT_PRESENT_DIAG=1"])
+        self.assertEqual(rows, ["R=LIGHT|False|False|False|inherited|True|True", "R=HEAVY|True|True|True|inherited|True|True", "R=|True|True|True|inherited|True|True"])
 
     def test_a_flag_or_arm_word_carrying_a_zero_width_character_is_not_the_plain_one(self) -> None:
         # r5 (adversary A1): PowerShell's -ceq / -cne / -cin ignore U+00AD and the zero-width characters, so 'LIGHT'+U+00AD read as LIGHT and ('0'+U+00AD) as the zero the native reader
         # compares byte for byte. Recorded text is compared ordinally.
         shy = "[char]173"
+        # r8: the table's exact values are compared ordinally, so a value carrying such a character is not the table's value (it was a HEAVY read of an unlisted "0" before)
         cases = {
-            f"Get-FpsArmFromEnvironment @({LIGHT_ENV},('MLVAPP_STAGE_TIMING=0' + {shy}))": "HEAVY",
-            f"Get-FpsArmFromEnvironment @({LIGHT_ENV},'MLVAPP_STAGE_TIMING=0')": "LIGHT",
-            f"Get-FpsArmFromEnvironment @({LIGHT_ENV},('MLVAPP_STAGE_TIMING=0' + [char]8203))": "HEAVY",
-            f"Get-FpsArmFromEnvironment @({LIGHT_ENV},('MLVAPP_STAGE_TIMING=0' + [char]65279))": "HEAVY",
-            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = ('LIGHT' + {shy}); {OBSERVERS_RECORDED_OFF}}})": "UNKNOWN",
-            f"Get-FpsArmFromJobResult ([pscustomobject]@{{ telemetryArm = ('LIGHT' + {shy}); {OBSERVERS_RECORDED_OFF}}})": "UNKNOWN",
+            f"Get-FpsArmFromEnvironment @({LIGHT_ENV},('MLVAPP_PLAYBACK_QUALITY_MODE=phase3_hq' + {shy})) @()": "UNKNOWN",
+            f"Get-FpsArmFromEnvironment @({LIGHT_ENV},'MLVAPP_PLAYBACK_QUALITY_MODE=phase3_hq') @()": "LIGHT",
+            f"Get-FpsArmFromEnvironment @({LIGHT_ENV},('MLVAPP_PLAYBACK_QUALITY_MODE=phase3_hq' + [char]8203)) @()": "UNKNOWN",
+            f"Get-FpsArmFromEnvironment @({LIGHT_ENV},('MLVAPP_PLAYBACK_QUALITY_MODE=phase3_hq' + [char]65279)) @()": "UNKNOWN",
+            f"Get-FpsArmFromEnvironment @('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1',('MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1' + {shy})) @()": "UNKNOWN",
+            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = ('LIGHT' + {shy}); {LIGHT_EVIDENCE}}})": "UNKNOWN",
+            f"Get-FpsArmFromJobResult ([pscustomobject]@{{ telemetryArm = ('LIGHT' + {shy}); {LIGHT_EVIDENCE}}})": "UNKNOWN",
             f"Get-FpsArmFromLegSpec ([pscustomobject]@{{ legType = 'speed'; generatorArgs = [pscustomobject]@{{ telemetryArm = ('LIGHT' + {shy}) }} }})": "UNKNOWN",
         }
         self.check(cases)
         # a key repeated with a value that differs only by such a character is a malformed environment, not one value
         out = self.ok(f"$e = ConvertTo-FpsEnvMap @('MLVAPP_STAGE_TIMING=0', ('mlvapp_stage_timing=0' + {shy}))\nWrite-Host ('STATE=' + $e.state)")
+        self.assertEqual(out.strip(), "STATE=malformed")
+        # r8: a repeated key is malformed whatever its values (the old rule refused only repeats whose values differed)
+        out = self.ok("$e = ConvertTo-FpsEnvMap @('MLVAPP_STAGE_TIMING=0', 'mlvapp_stage_timing=0')\nWrite-Host ('STATE=' + $e.state)")
         self.assertEqual(out.strip(), "STATE=malformed")
 
     def test_a_record_whose_generator_args_is_an_array_fails_closed_in_both_readers(self) -> None:
@@ -1521,7 +1558,7 @@ class ObserverControlTests(_Probe):
             f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = (New-FpsArm 'LIGHT' 'environment' 'x'); {launch_heavy} }})": "UNKNOWN",
             f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = (New-FpsArm 'LIGHT' 'environment' 'x'); {launch_light} }})": "LIGHT",
             "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = [pscustomobject]@{ arm = 'LIGHT' } })": "UNKNOWN",
-            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = [pscustomobject]@{{ arm = 'LIGHT' }}; {OBSERVERS_RECORDED_OFF}}})": "LIGHT",
+            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = [pscustomobject]@{{ arm = 'LIGHT' }}; {LIGHT_EVIDENCE}}})": "LIGHT",
             "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = (New-FpsArm 'LIGHT' 'environment' 'x') })": "UNKNOWN",
             # r5 pass 2 A3: the `source` label does not exempt an arm object from evidence, and a null launch is no launch
             "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = [pscustomobject]@{ arm = 'LIGHT'; source = 'environment' } })": "UNKNOWN",
@@ -1532,13 +1569,13 @@ class ObserverControlTests(_Probe):
         # r5 pass 2 A2: a STRING arm skipped launch corroboration and an embedded generatorArgs.telemetryArm was never compared
         stage = "launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1'; MLVAPP_STAGE_TIMING = '1' }; arguments = @() }"
         self.check({
-            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {OBSERVERS_RECORDED_OFF}{stage} }})": "UNKNOWN",
-            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {OBSERVERS_RECORDED_OFF}generatorArgs = [pscustomobject]@{{ telemetryArm = 'HEAVY' }} }})": "UNKNOWN",
+            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {stage} }})": "UNKNOWN",
+            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {LIGHT_EVIDENCE}generatorArgs = [pscustomobject]@{{ telemetryArm = 'HEAVY' }} }})": "UNKNOWN",
             f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = (New-FpsArm 'LIGHT' 'environment' 'x'); {RECORDED_LIGHT_LAUNCH}; generatorArgs = [pscustomobject]@{{ telemetryArm = 'HEAVY' }} }})": "UNKNOWN",
-            f"Get-FpsArmFromJobResult ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {OBSERVERS_RECORDED_OFF}generatorArgs = [pscustomobject]@{{ telemetryArm = 'HEAVY' }} }})": "UNKNOWN",
+            f"Get-FpsArmFromJobResult ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {LIGHT_EVIDENCE}generatorArgs = [pscustomobject]@{{ telemetryArm = 'HEAVY' }} }})": "UNKNOWN",
             # the agreeing controls: a recorded LIGHT launch alone is evidence, and an embedded LIGHT is no contradiction
             f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {RECORDED_LIGHT_LAUNCH} }})": "LIGHT",
-            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {OBSERVERS_RECORDED_OFF}generatorArgs = [pscustomobject]@{{ telemetryArm = 'LIGHT' }} }})": "LIGHT",
+            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {LIGHT_EVIDENCE}generatorArgs = [pscustomobject]@{{ telemetryArm = 'LIGHT' }} }})": "LIGHT",
         })
 
     def test_a_scalar_generator_args_fails_closed_in_both_readers(self) -> None:
@@ -1581,6 +1618,93 @@ class ObserverControlTests(_Probe):
         out = self.ok("(Get-FpsObserverControls | Where-Object { $_.specKey } | ForEach-Object { $_.specKey }) -join ','")
         observers = set(out.strip().split(","))
         self.assertEqual(sorted(keys - observers - not_observers), [], "classify each new generatorArgs key: add it to Get-FpsObserverControls or to not_observers here")
+
+
+@requires_pwsh
+class LightShapeAllowlistTests(_Probe):
+    """BENCH-LIGHT-ARM-GAIN-GATES-1 r8, THE NARROW PROMISE: LIGHT only on the producers' exact closed shape (two data tables in FpsArmGate.psm1), UNKNOWN on anything else."""
+
+    def arms(self, exprs: list[str]) -> list[str]:
+        return self.ok("".join(f"Write-Host ('ARM=' + ({e}).arm)\n" for e in exprs)).split()
+
+    def check(self, cases: dict[str, str]) -> None:
+        self.assertEqual(dict(zip(cases, self.arms(list(cases)))), {expr: f"ARM={want}" for expr, want in cases.items()})
+
+    def test_every_row_of_the_light_table_is_emitted_by_a_producer(self) -> None:
+        # the table is derived from the producers, never invented: each argument flag is a literal of the smoke runner, each environment name a literal of the runner, the venue job or the length gate
+        runner = (PROFILING / "run-release-gui-smoke.ps1").read_text(encoding="utf-8")
+        sources = runner + (PROFILING / "bachelor" / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8") + (PROFILING / "gui-smoke-length-gate.ps1").read_text(encoding="utf-8")
+        shape = json.loads(self.ok("Get-FpsLightShape | ConvertTo-Json -Depth 5 -Compress").strip().splitlines()[-1])
+        self.assertGreater(len(shape["arguments"]), 15)
+        self.assertGreater(len(shape["environment"]), 25)
+        missing = [row["name"] for row in shape["arguments"] if f'"{row["name"]}' not in runner]
+        missing += [row["name"] for row in shape["environment"] if row["name"] not in sources]
+        self.assertEqual(missing, [], "a table row no producer emits")
+        for row in shape["arguments"] + shape["environment"]:
+            self.assertRegex(row["rule"], r"^(|int|num|word|text|exact:.+|oneof:.+)$", row)
+
+    def test_the_a1_contact_sheet_input_is_unknown_for_a_saved_record_a_launch_and_the_pair(self) -> None:
+        # A1 (r6, FIXED): the adversary's launch (contact-sheet options, telemetry on with the frame-log opt-out) read LIGHT through the saved-leg reader and the launch reader and the pair was allowed
+        out = self.ok(
+            "$launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' }; "
+            "arguments = @('--gui-smoke', '--contact-sheet-dir', 'C:\\Temp\\sheet', '--contact-sheet-frames', '6') }\n"
+            "$rec = [pscustomobject]@{ telemetryArm = 'LIGHT'; launch = $launch }\n"
+            "$good = [pscustomobject]@{ telemetryArm = 'LIGHT'; launch = [pscustomobject]@{ environment = $launch.environment; arguments = @() } }\n"
+            "$a = Get-FpsArmFromLegRecord $rec; $g = Get-FpsArmFromLegRecord $good\n"
+            "Write-Host ('LEG=' + $a.arm + ' LAUNCH=' + (Get-FpsArmFromLaunch $launch).arm + ' GOOD=' + $g.arm)\n"
+            "$v = Get-FpsPairVerdict -Baseline $g -Candidate $a\nWrite-Host ('PAIR=' + $v.allowed + '|' + $v.reason)\n")
+        self.assertEqual(out.split(), ["LEG=UNKNOWN", "LAUNCH=UNKNOWN", "GOOD=LIGHT", f"PAIR=False|{UNKNOWN_REASON}"])
+
+    def test_moot_a4_a_repeated_environment_key_is_unknown(self) -> None:
+        # r6 A4 lived in the duplicate-value check of the environment reader; the allowlist makes the adversary's input (MLVAPP_STAGE_TIMING twice, "1" then "0") UNKNOWN twice over: the key is
+        # not in the table, and a repeated key is malformed whatever its values. A parser that collapses a duplicate JSON key to its last value still leaves the key outside the table.
+        out = self.ok(
+            "$json = '{\"environment\":{\"MLVAPP_STAGE_TIMING\":\"1\",\"MLVAPP_STAGE_TIMING\":\"0\",\"MLVAPP_PLAYBACK_SMOKE_TELEMETRY\":\"1\",\"MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG\":\"1\"},\"arguments\":[\"--gui-smoke\"]}'\n"
+            "try { $l = $json | ConvertFrom-Json; Write-Host ('JSON=' + (Get-FpsArmFromLaunch $l).arm) } catch { Write-Host 'JSON=PARSE_REFUSED' }\n"
+            "Write-Host ('LIST=' + (Get-FpsArmFromEnvironment @('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1', 'MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1', 'MLVAPP_STAGE_TIMING=1', 'MLVAPP_STAGE_TIMING=0') @()).arm)\n"
+            "Write-Host ('LISTSAME=' + (Get-FpsArmFromEnvironment @('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1', 'MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1') @()).arm)\n")
+        lines = dict(line.split("=", 1) for line in out.split())
+        self.assertIn(lines["JSON"], ("UNKNOWN", "PARSE_REFUSED"))
+        self.assertEqual((lines["LIST"], lines["LISTSAME"]), ("UNKNOWN", "UNKNOWN"))
+
+    def test_the_whole_table_is_light_and_nothing_added_to_it_is(self) -> None:
+        # the full producer shape (every table environment row at the value the producers emit) is LIGHT, and each single outside addition (a name, a value, a flag) turns it UNKNOWN
+        body = ("$shape = Get-FpsLightShape\n$map = [ordered]@{}\n"
+                "foreach ($row in $shape.environment) {\n"
+                "  $v = switch -Regex ($row.rule) { '^exact:(.*)$' { $Matches[1] } '^oneof:([^|]*)' { $Matches[1] } '^int$' { '4' } '^num$' { '7.5' } '^word$' { 'amaze' } default { 'C:\\x\\y' } }\n"
+                "  $map[$row.name] = $v\n}\n"
+                "Write-Host ('FULL=' + (Get-FpsArmFromEnvironment $map @()).arm)\n"
+                "$extra = [ordered]@{}; foreach ($k in $map.Keys) { $extra[$k] = $map[$k] }; $extra['MLVAPP_ANYTHING_ELSE'] = '0'\n"
+                "Write-Host ('EXTRA=' + (Get-FpsArmFromEnvironment $extra @()).arm)\n"
+                "$bad = [ordered]@{}; foreach ($k in $map.Keys) { $bad[$k] = $map[$k] }; $bad['MLVAPP_GPU_PLAYBACK_RECON'] = '2'\n"
+                "Write-Host ('VALUE=' + (Get-FpsArmFromEnvironment $bad @()).arm)\n")
+        lines = dict(line.split("=", 1) for line in self.ok(body).split())
+        self.assertEqual(lines, {"FULL": "LIGHT", "EXTRA": "UNKNOWN", "VALUE": "UNKNOWN"})
+
+    def test_a_look_leg_spec_is_not_a_light_fps_leg_whatever_its_arm_word_says(self) -> None:
+        # the spec-side sibling of A1: a look leg grabs its contact sheet in the timed Play (Invoke-VenueLeg.ps1:586-589), so a LIGHT word on it is not proof; only legType 'speed' is
+        ga = "generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' }"
+        self.check({
+            f"Get-FpsArmFromLegSpec ([pscustomobject]@{{ legType = 'speed'; {ga} }})": "LIGHT",
+            f"Get-FpsArmFromLegSpec ([pscustomobject]@{{ legType = 'look'; {ga}; look = [pscustomobject]@{{ contactSheetFrames = 6 }} }})": "UNKNOWN",
+            f"Get-FpsArmFromLegSpec ([pscustomobject]@{{ {ga} }})": "UNKNOWN",
+            f"Get-FpsArmFromLegSpec ([pscustomobject]@{{ legType = 'Speed'; {ga} }})": "UNKNOWN",
+            f"Get-FpsArm -Spec ([pscustomobject]@{{ legType = 'look'; {ga} }}) -Result ([pscustomobject]@{{ telemetryArm = 'LIGHT' }})": "UNKNOWN",
+        })
+        out = self.ok("$p = Get-FpsLegPlanRefusal -Purpose 'fps-ab' -Items @([pscustomobject]@{ item = 1; arm = (Get-FpsArmFromLegSpec ([pscustomobject]@{ legType = 'look'; "
+                      "generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' } })) })\nWrite-Host ('PLAN=' + ($p -join '|').Substring(0, 21))")
+        self.assertEqual(out.strip(), "PLAN=FPS_AB_UNKNOWN_ARM|1|")
+
+    def test_a_launch_outside_the_shape_is_never_light_through_any_reader(self) -> None:
+        # one record, every reader: a launch with a flag outside the table is UNKNOWN through the launch reader, the saved-leg reader and the result reader alike
+        launch = ("[pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' }; "
+                  "arguments = @('--gui-smoke-playback', '--launch-only') }")
+        self.check({
+            f"Get-FpsArmFromLaunch ({launch})": "UNKNOWN",
+            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; launch = {launch} }})": "UNKNOWN",
+            f"Get-FpsArmFromJobResult ([pscustomobject]@{{ telemetryArm = 'LIGHT'; launch = {launch} }})": "UNKNOWN",
+            f"Get-FpsArmFromJobResult ([pscustomobject]@{{ telemetryArm = 'LIGHT'; launch = {launch} }}) -ObserversFromSpec ({SPEC_LIGHT})": "UNKNOWN",
+        })
 
 
 if __name__ == "__main__":

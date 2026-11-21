@@ -3076,14 +3076,18 @@ $envs = @(
 # updateTextureIfNeeded), so a LIGHT leg (a presented-fps measurement) must not carry it. Only a LIGHT leg drops it; every other arm keeps the line above exactly as before. (The cpu leg's
 # template edit below removes the same line from its own list; this filter finds nothing there.)
 if ($TelemetryArm -eq 'LIGHT') { $envs = @($envs | Where-Object { $_ -ne 'MLVAPP_VIEWPORT_PRESENT_DIAG=1' }) }
-# r5 (adversary A3): the filter above drops only what this job EMITS. The smoke child also inherits this process's environment, so a worker that carries one of the observer variables would still run its
-# logger inside a LIGHT leg while the receipt (which serializes the override list) says nothing. A LIGHT leg removes each of them from its own process environment first (the same technique as the cpu leg's
-# GL-viewport clear; removed, not set to 0, because some readers test only that the variable is set). The list is the observer list of tools/profiling/FpsArmGate.psm1 (a test compares the two).
+# r5 (adversary A3), r8 (adversary r6 A2): the filter above drops only what this job EMITS. The smoke child also inherits this process's environment, so a worker that carries an app control the job
+# does not set would still run it inside a LIGHT leg while the receipt (which serializes the override list) says nothing. A hard-coded list of observer names cannot be complete (r6: an unlisted
+# ready-backlog observer got through), so a LIGHT leg removes EVERY inherited MLVAPP_* variable of its own process environment that the job does not itself set for the leg (an allowlist of what the
+# job sets: the names in $envs), the same technique as the cpu leg's GL-viewport clear; removed, not set to 0, because some readers test only that the variable is set. One name is exempt: the hub-host
+# fixture flag is read by the smoke runner itself (not the app) and decides whether it may run on a hub host at all; it is not a control of the app, and the recorded launch shows it.
 if ($TelemetryArm -eq 'LIGHT') {
-    foreach ($inheritedObserverVariable in @('MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY', 'MLVAPP_PLAYBACK_DETAILED_TIMELINE_TELEMETRY', 'MLVAPP_STAGE_TIMING', 'MLVAPP_PERF_FIELD_LOG', 'MLVAPP_PLAYBACK_RBF_DETAIL_TIMING',
-            'MLVAPP_INTERACTIVE_TRACE', 'MLVAPP_GPU_TEX_NR_OVERLAP_TRACE', 'MLVAPP_VIEWPORT_PRESENT_DIAG', 'MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT', 'MLVAPP_PHASE3_TEL_PATH', 'MLVAPP_STAGE_TIMING_FILE',
-            'MLVAPP_PERF_FIELD_LOG_PATH', 'MLVAPP_PERF_FIELD_LOG_DIR', 'MLVAPP_CUDA_LAUNCH_TIMING', 'MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS', 'MLVAPP_SMOKE_FIRST_PRESENT_CAPTURE', 'MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR')) {
-        [Environment]::SetEnvironmentVariable($inheritedObserverVariable, $null, 'Process')
+    $lightLegJobSets = @($envs | ForEach-Object { ([string]$_).Split('=')[0] })
+    foreach ($inheritedVariable in @([Environment]::GetEnvironmentVariables().Keys | ForEach-Object { [string]$_ })) {
+        if ($inheritedVariable -inotmatch '^MLVAPP_') { continue }
+        if ($inheritedVariable -ieq 'MLVAPP_HUB_PLAYBACK_CI_FIXTURE') { continue }
+        if ($lightLegJobSets -contains $inheritedVariable) { continue }
+        [Environment]::SetEnvironmentVariable($inheritedVariable, $null, 'Process')
     }
 }
 # LIGHT-ARM-PRESENT-DIAG-1 <<<
