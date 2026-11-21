@@ -494,7 +494,7 @@ foreach ($leg in $plan) {
         try {
             # (d) ONE re-probe under the claim: the measurement nearest the leg is the one its line carries
             if ($ticket) { $pf = [string](Update-VenueTicket -Ticket $ticket -Phase 'probing' -StaleAfterSec $ticketProbeStaleSec); if ($pf -cne 'OK') { L "TICKET_PHASE_$pf ticket=$($ticket.name) phase=probing leg=$($leg.name) (the phase and its longer lifetime did not land; the probe goes on)" } }
-            $re =Invoke-QuietProbe $leg.name 'under-claim' 0
+            $re = Invoke-QuietProbe $leg.name 'under-claim' 0
             if ($re.foreignFloor) { $legReFF = $true; $legReFFLine = $re.foreignFloorLine }
             L "QUIET leg=$($leg.name) phase=under-claim exit=$($re.code) verdict=$($re.verdict) mean=$(Format-Mean $re.mean)$(if ($re.reason) { " reason=$($re.reason)" })"
             if ($re.verdict -ceq 'GATE_BUSY') {

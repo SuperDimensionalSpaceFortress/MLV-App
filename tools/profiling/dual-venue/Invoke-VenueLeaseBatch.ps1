@@ -2275,6 +2275,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         # refreshes it to ready on its first request.
         $beatStaleSec = [int][Math]::Max(90, 3 * $TicketBeatSec)
         $waitStartUtc = [DateTime]::UtcNow   # the wait ends waitSec after THIS, not after the ticket work: slow ticket I/O never pushes the claim request past the deadline the wait was checked against
+        $waitClock = [Diagnostics.Stopwatch]::StartNew()   # adversary A7: the wait and its heartbeat cadence are measured on this monotonic clock, never by differencing the wall clock (a runner clock step of +1600 s ended a 1800 s cooldown early, one of -600 s lengthened it)
         $ticketArgs0 = @{ Venue = $Venue; RunDir = $RunDir; Purpose = "$Purpose batch $batchNo"; StaleAfterSec = $beatStaleSec; ClaimDir = $ClaimDir; Phase = 'cooldown' }
         if ($script:TicketOn) {
             try {
@@ -2286,11 +2287,10 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             } catch { $script:batchTicket = $null; LogBest "TICKET_UNAVAILABLE batch=$batchNo $($_.Exception.Message -replace '\s+', ' ') (ticketless for this wait)" }
         }
         if ($script:batchTicket) {
-            $waitEndUtc = $waitStartUtc.AddSeconds([double]$bw.waitSec)
-            while (($leftSec = ($waitEndUtc - [DateTime]::UtcNow).TotalSeconds) -gt 0) {
+            while (($leftSec = ([double]$bw.waitSec - $waitClock.Elapsed.TotalSeconds)) -gt 0) {
                 # r10: a [double] first operand, never the bare variable (an Int32 first operand rounds the double)
                 Start-Sleep -Seconds ([int][Math]::Ceiling([Math]::Min([double]$leftSec, [double]$TicketBeatSec)))
-                if ([DateTime]::UtcNow -ge $waitEndUtc) { break }
+                if ($waitClock.Elapsed.TotalSeconds -ge [double]$bw.waitSec) { break }
                 # the heartbeat's answer is read: LOST (the ticket was reaped, e.g. after a long write lock) is retaken at once so the holder is not out of the line until its wait ends; BUSY or no answer is tried again next slice
                 $hb = Invoke-BatchTicketCall '[string](Update-VenueTicket -Ticket $a.t -Phase cooldown -StaleAfterSec $a.s)' @{ t = $script:batchTicket; s = $beatStaleSec }
                 $hbRes = $(if ($hb.answered) { [string]@($hb.value)[-1] } else { 'NO_ANSWER' })
@@ -2299,7 +2299,19 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     if ($tk.answered -and @($tk.value).Count -gt 0) { $script:batchTicket = @($tk.value)[-1]; LogBest "TICKET_RETAKEN batch=$batchNo ticket=$($script:batchTicket.name) phase=cooldown (the ticket was removed during the wait: back of the line)" }
                 } elseif ($hbRes -cne 'OK') { LogBest "TICKET_HEARTBEAT_MISSED batch=$batchNo result=$hbRes (tried again next slice)" }
             }
-        } else { Start-Sleep -Seconds $bw.waitSec }
+        } else {
+            # adversary A5: only what is LEFT of the wait is slept. Ticket creation that was given up on (5 s) is part of the wait, not added to it: a second full sleep after it pushed the first claim request past the deadline the wait was checked against.
+            $leftNoTicketSec = [double]$bw.waitSec - $waitClock.Elapsed.TotalSeconds
+            if ($leftNoTicketSec -gt 0) { Start-Sleep -Seconds ([int][Math]::Ceiling($leftNoTicketSec)) }
+        }
+        # adversary A5: ticket work (the creation, each heartbeat, a retake) is bounded to 5 s per call but is not inside the wait; when it carried the clock to -DeadlineUtc or past it, no claim request starts.
+        if ([DateTime]::UtcNow -ge $deadline) {
+            $b.endReason = 'DEADLINE'; $b.endDetail = "lease-$($bw.reason.ToLowerInvariant())-wait: the wait and its ticket work ended at or after the deadline, so no claim was asked for"
+            Set-Stop 'DEADLINE' 3
+            LogBest "BATCH_END batch=$batchNo token=$token reason=DEADLINE detail=$($b.endDetail)"
+            $b.logWriteFailures = $script:logWriteFailures; Write-BatchReceipt $b
+            break
+        }
     }
     # (1) the claim, once per batch. A LIVE claim of another chain is waited out; stale claims are broken once each.
     $ticketStaleSec = [int][Math]::Min(86400, [Math]::Max(90, 3 * $ClaimPollSec))   # a ticket not refreshed for 3 polls (or 90 s) is stale: the next waiter reaps it
@@ -2439,8 +2451,10 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     # r5 (dot 242171b3 B1): the claim's expiry is renewed for as long as the batch holds it (the open's wait for the lease, the by-name wait and the legs can all
     # outlast -ClaimTtlSec), so Get-VenueClaimStaleReason never finds a live owner's claim expired. The keeper dies with this process.
     $claimKeeper = Start-VenueClaimKeeper -Venue $Venue -Nonce $claim.nonce -TtlSec $ClaimTtlSec -RenewSec $ClaimRenewSec -ClaimDir $ClaimDir
+    $script:keeperStoppedEarly = $false; $script:keeperStoppedInTime = $null; $script:keeperLive = $true   # r7: Enable-WriteSuppression stops a live keeper (and redirects the close job). Adversary A8: set BEFORE the ticket log below, which can find the alias
+    # adversary A8: a refusal recorded while the keeper was not yet live (the TICKET_TAKEN log above found batch.log aliased to an input) stopped nothing: the keeper started afterwards and rewrote the claim in place. Stopped here, as Enable-WriteSuppression stops a live one.
+    if ($script:RunOutputAliased) { $script:keeperStoppedEarly = $true; $script:keeperStoppedInTime = Stop-VenueKeeper -Keeper $claimKeeper; $script:keeperLive = $false }
     if ($script:batchTicket) { Close-BatchTicket 'claim-granted' }   # VENUE-FIFO-TICKET-BEFORE-PRECLAIM-1: after the keeper started (adversary r3 pass 2 A3), bounded (A1)
-    $script:keeperStoppedEarly = $false; $script:keeperStoppedInTime = $null; $script:keeperLive = $true   # r7: Enable-WriteSuppression stops a live keeper (and redirects the close job)
     # r3 (Dot B1): the finally block's cancel, close and ledger charge follow whether the open was SUBMITTED, never "$op is null": a null $op before the call (a throw while
     # the sidecar was checked) means nothing was sent. r16 (sol r15 B1; hub ruling 08:18:44Z): submitted = um-run.ps1 was called for it ($script:umRunCalled), not merely
     # Submit-AgentJob: a job file that could not be created or written here (JOB_WRITE_FAILED) reached no one.
