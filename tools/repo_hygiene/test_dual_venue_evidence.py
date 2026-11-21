@@ -898,8 +898,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertRegex(GENERATOR.read_text(encoding="utf-8"), r"\[ValidateSet\('', 'on', 'off', IgnoreCase = \$false\)\]\s+\[string\]\$PlaybackConform = ''")
 
     def test_the_present_trace_reaches_the_apps_env_only_when_asked(self) -> None:
-        """PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: -PresentTrace adds MLVAPP_PLAYBACK_PRESENT_TRACE=1 to the app's env list; absent, the job is
-        the text it was. The runner maps a leg's generatorArgs.presentTrace true for any leg."""
+        """PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: -PresentTrace adds MLVAPP_PLAYBACK_PRESENT_TRACE=1 to the app's env list; absent (r10), the job names the OFF value
+        '=0' in its one bracketed PRESENT-TRACE-OFF-ARM-1 region and nothing else differs. The runner maps a leg's generatorArgs.presentTrace true for any leg."""
         plain = self.generate(GENERATOR, "pt-plain.job.ps1", []).read_text(encoding="utf-8").replace("\r\n", "\n")
         # r10 (sol r9 A2), forced companion: the plain job no longer names no flag; it names the OFF value in its one bracketed PRESENT-TRACE-OFF-ARM-1 region
         self.assertNotIn("MLVAPP_PLAYBACK_PRESENT_TRACE=1", plain)
@@ -6066,7 +6066,51 @@ class PresentTraceArmEvidenceTests(unittest.TestCase):
     OFF = {"generatorArgs": {}}
     ON = {"generatorArgs": {"presentTrace": True}}
     HEADER = "playback_smoke.present_trace_header session={s} rows=2 dropped=0 cols=i,frame,pos,t"
-    ROW = "playback_smoke.present_trace session={s} row=0,1,1,10.000,0.000,5.000"
+    # one complete row, the shape PlaybackPresentTrace.h formatRow prints (one number per header column)
+    PAYLOAD = "0,1,1,10.000,0.000,5.000,1.000,2.000,3.000,0.000,0.000,0.0000,-1.000,0,0,0,0.000,0,0.0000,-1.000,0,0,1.000,2.000,2.000,2.000,2.000,2.000,2.000,6.000,1"
+    ROW = "playback_smoke.present_trace session={s} row=" + PAYLOAD
+
+    def test_the_row_shape_is_the_apps_header_shape(self) -> None:
+        """r10 adversary pass A1: the row a leg is judged on is exactly one number per column of the app's own header, so a column appended to the header must be appended
+        here (DvPresentTraceRowFields) too, and the fixture payload above is that shape."""
+        source = (ROOT / "platform" / "qt" / "PlaybackPresentTrace.h").read_text(encoding="utf-8")
+        match = re.search(r"static const char \*header\(\)\s*\{\s*return ((?:\s*\"[^\"]*\")+)\s*;", source)
+        self.assertIsNotNone(match)
+        columns = "".join(re.findall(r'"([^"]*)"', match.group(1))).split(",")
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn(f"$script:DvPresentTraceRowFields = {len(columns)}\n", module.replace("\r\n", "\n"))
+        self.assertEqual(len(self.PAYLOAD.split(",")), len(columns))
+
+    def test_a_malformed_or_truncated_row_never_honours_an_on_arm_and_still_fails_an_off_arm(self) -> None:
+        """r10 adversary pass A1: `row=` with no payload, a payload cut short, trailing text and a Qt location cut are no row. ON: no row, blocks. OFF: the record is still the
+        app saying the trace was on, so it still blocks."""
+        bad = ["playback_smoke.present_trace session=3 row=", self.ROW.format(s=3) + "garbage", self.ROW.format(s=3).rsplit(",", 1)[0],
+               "playback_smoke.present_trace session=3 row=0 (C:/Build !/MainWindow.cpp:"]
+        for line in bad:
+            on = self.verdict(self.ON, self.log(line))
+            self.assertEqual((on["verdict"], on["blocks"], on["measuredRows"]), ("ON_ARM_NOT_TRACED", True, 0), line)
+            off = self.verdict(self.OFF, self.log(line))
+            self.assertEqual((off["verdict"], off["blocks"]), ("OFF_ARM_TRACED", True), line)
+
+    def test_a_row_of_another_play_never_honours_an_on_arm_when_the_measured_marker_is_missing(self) -> None:
+        """r10 adversary pass A2: the measured session is the one the app's measured_session marker names. With no marker the summary reader falls back to the FIRST summary
+        (session 2 here), and that must not let another Play's row honour the arm."""
+        log = "\n".join(["interaction_trace event=automation.pacing_isolated settings_store=run_scoped",
+                         "playback_smoke.summary session=2 reason=play-stop presented_frames=600", self.ROW.format(s=2),
+                         "playback_smoke.summary session=3 reason=play-stop presented_frames=600"]) + "\n"
+        v = self.verdict(self.ON, log)
+        self.assertEqual((v["verdict"], v["blocks"]), ("ON_ARM_NOT_TRACED", True))
+        marked = self.verdict(self.ON, log.replace("interaction_trace", "playback_smoke.measured_session id=2\ninteraction_trace", 1))
+        self.assertEqual((marked["verdict"], marked["blocks"]), ("ON_TRACED", False), "the app's own marker naming session 2 makes session 2 the measured one")
+
+    def test_the_validator_compares_a_stored_trace_block_with_the_one_the_log_derives(self) -> None:
+        """r10 adversary pass A3: a receipt's presentTrace block is re-derived; a contradictory one is INVALID (PRESENT_TRACE_NOT_FROM_EVIDENCE)."""
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("$storedPresentTrace = Get-DvProp $Receipt 'presentTrace'", module)
+        self.assertIn("foreach ($f in @('requested', 'rows', 'measuredRows', 'verdict')) {", module)
+        self.assertIn('$invalid.Add("PRESENT_TRACE_NOT_FROM_EVIDENCE: presentTrace.$f is not what the hashed run log and the committed leg spec derive")', module)
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("rows = $presentTraceVerdict.rows; measuredRows = $presentTraceVerdict.measuredRows; verdict = $presentTraceVerdict.verdict", runner)
 
     def verdict(self, spec: dict, log: str) -> dict:
         proc, out = run_pwsh_json("$s = $env:DVE_SPEC | ConvertFrom-Json\n(Get-DvPresentTraceEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress",

@@ -905,6 +905,25 @@ TEST(PlaybackPresentTraceWiring, EachStampColumnsDocNamesTheSiteThatStampsIt)
     }
     ASSERT_TRUE(header.contains(QStringLiteral("render_thread_start_stage_time")));
     ASSERT_TRUE(header.contains(QStringLiteral("ready - rnd == render")));
+    // r10 adversary pass A4 (same defect class): the four worker columns name their sample points too
+    const QString dsField = lineWith(QStringLiteral("double decodeStartS = 0.0;"));
+    const QString deField = lineWith(QStringLiteral("double decodeEndS = 0.0;"));
+    const QString rsField = lineWith(QStringLiteral("double reconStartS = 0.0;"));
+    const QString reField = lineWith(QStringLiteral("double reconEndS = 0.0;"));
+    const QString dsColumn = lineWith(QStringLiteral("double dsMs = kUnknownMs;"));
+    const QString deColumn = lineWith(QStringLiteral("double deMs = kUnknownMs;"));
+    const QString rsColumn = lineWith(QStringLiteral("double rsMs = kUnknownMs;"));
+    const QString reColumn = lineWith(QStringLiteral("double reMs = kUnknownMs;"));
+    for (const QString &line : { dsField, deField, rsField, reField, dsColumn, deColumn, rsColumn, reColumn })
+        ASSERT_FALSE(line.isEmpty());
+    for (const QString &line : { dsField, dsColumn })
+        ASSERT_TRUE(line.contains(QStringLiteral("decodeFrameForWorker")));
+    for (const QString &line : { deField, deColumn })
+        ASSERT_TRUE(line.contains(QStringLiteral("after the raw decode")) || line.contains(QStringLiteral("right after the raw decode")));
+    for (const QString &line : { rsField, rsColumn })
+        ASSERT_TRUE(line.contains(QStringLiteral("OpenMP team setup")));
+    for (const QString &line : { reField, reColumn })
+        ASSERT_TRUE(line.contains(QStringLiteral("ProcessReady transition")));
 }
 
 TEST(PlaybackPresentTraceWiring, ReadOnceFromTheEnvironmentAndEveryHookIsGuarded)
