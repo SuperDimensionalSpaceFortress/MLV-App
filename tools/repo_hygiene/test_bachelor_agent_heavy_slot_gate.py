@@ -440,7 +440,10 @@ def _pwsh_script_argv(script: str):
 
 
 PWSH_SCRIPT_BASE_SEC = 120  # a bare pwsh start, the compile of the capture type and the script's own end: what a script with NO worker call needs
-_CAPTURE_CALL = re.compile(r"(?i)\b(Read-CapturedResult|Read-CapturedText|Remove-CaptureFiles)\b([^\n]*)")  # PowerShell command names are case-insensitive (sol r4)
+# PowerShell command names are case-insensitive (sol r4). sol r9 B2: a call's arguments end at the NEXT call on the same line (or the line end), so two
+# calls on one line are two call sites, each charged its own ceiling and each read for its own bound.
+_CAPTURE_CALL_NAMES = r"Read-CapturedResult|Read-CapturedText|Remove-CaptureFiles"
+_CAPTURE_CALL = re.compile(r"(?i)\b(" + _CAPTURE_CALL_NAMES + r")\b([^\n]*?)(?=\b(?:" + _CAPTURE_CALL_NAMES + r")\b|\n|\Z)")
 # the bound of an accept call on a call line: the seam variable (a pwsh script) or its value (a generated script, e.g. _plain_task_script)
 _ACCEPT_BOUND_ON_CALL_LINE = re.compile(r"(?i)\$AcceptMs\b|(?<![\w$.])" + str(CAPTURE_ACCEPT_BOUND_MS) + r"(?![\w.])")
 _LOOP_BLOCK_HEAD = re.compile(r"(?i)(?:\b(?:foreach|for|while)\s*\([^{}]*\)|\bdo|ForEach-Object)\s*$")
@@ -457,6 +460,79 @@ def _call_is_inside_a_loop(body: str, position: int) -> bool:
             stack.pop()
     return any(stack)
 MAX_DECLARED_BOUND_MS = 120000  # an integer on a call line above this is a pid or a count, not an operation bound
+
+# sol r9 B1: the source guard that keeps every accept arm off a real helper deadline. It read decimal literals only, so a hex literal (0x1388),
+# a suffixed one (5kb, 10000L) and a call with NO bound at all (the helper then applies its own real 10 s default) all passed it.
+_PS_NUMBER = re.compile(r"(?i)(?<![\w$.])(0x[0-9a-f]+|\d+(?:\.\d+)?(?:e[+-]?\d+)?)(kb|mb|gb|tb|pb)?[ld]?(?![\w.])")
+_PS_SIZE_SUFFIX = {"kb": 1024, "mb": 1024**2, "gb": 1024**3, "tb": 1024**4, "pb": 1024**5}
+
+
+def _ps_number_values(text: str) -> list[float]:
+    """The value of every PowerShell numeric literal in `text`: decimal, fractional, exponent, hex (0x1388), a size suffix (kb..pb), an L / D type suffix."""
+    values: list[float] = []
+    for match in _PS_NUMBER.finditer(text):
+        raw = match.group(1)
+        try:
+            value = float(int(raw, 16)) if raw.lower().startswith("0x") else float(raw)
+        except ValueError:
+            continue
+        values.append(value * _PS_SIZE_SUFFIX.get((match.group(2) or "").lower(), 1))
+    return values
+
+
+def _ps_call_arguments(rest: str) -> list[str]:
+    """The positional arguments of a PowerShell command, read from the text after its name: split on top-level whitespace, quote, paren, brace and
+    bracket aware, ended by a top-level `;`, `|` or an unmatched closing bracket (the end of the statement or of the enclosing expression)."""
+    tokens: list[str] = []
+    current, depth, quote = "", 0, None
+    for char in rest:
+        if quote:
+            current += char
+            if char == quote:
+                quote = None
+            continue
+        if char in "'\"":
+            quote = char
+            current += char
+            continue
+        if char in "({[":
+            depth += 1
+        elif char in ")}]":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and char in ";|":
+            break
+        if depth == 0 and char.isspace():
+            if current:
+                tokens.append(current)
+                current = ""
+            continue
+        current += char
+    if current:
+        tokens.append(current)
+    return tokens
+
+
+def capture_call_bound_offenders(text: str) -> list[str]:
+    """Every Read-Captured* / Remove-CaptureFiles call of `text` (a Python source holding PowerShell strings) that is not an accept arm's `$AcceptMs`
+    shape: a call with fewer than two positional arguments (no bound: the helper's real default deadline applies), or a numeric literal of a second or
+    more up to MAX_DECLARED_BOUND_MS on the call, in any PowerShell spelling. Comment lines and a `function` definition are no calls."""
+    offenders: list[str] = []
+    for line in text.splitlines():
+        if line.lstrip().startswith(("#", "self.assert")):  # prose, and a source pin that only names the helper
+            continue
+        for match in _CAPTURE_CALL.finditer(line):
+            if re.search(r"(?i)\bfunction\s+$", line[:match.start()]):
+                continue
+            label = f"{match.group(1)}{match.group(2)}".strip()[:100]
+            arguments = _ps_call_arguments(match.group(2))
+            # a real call's first argument is a variable, an array, a string, a sub-expression or a block; prose that names the helper ("the
+            # Read-CapturedResult and Remove-CaptureFiles call") has a bare word, an empty tail or a closing bracket there
+            if len(arguments) == 1 and arguments[0][0] in "$@'\"([{":
+                offenders.append(f"{label}: no bound argument (the helper applies its own real default deadline)")
+            offenders.extend(f"{label}: {value:g}" for value in _ps_number_values(match.group(2)) if 1000 <= value <= MAX_DECLARED_BOUND_MS)
+    return offenders
 
 
 def pwsh_script_budget_sec(script: str, repeat: int = 1) -> float:
@@ -887,6 +963,22 @@ def _windows_kill_path() -> "mock._patch":
     return mock.patch.object(sys.modules[__name__], "_IS_POSIX", False)
 
 
+_TASKKILL_MISSING_NOTE = "its process tree kill is NOT confirmed (taskkill failed: FileNotFoundError)"
+
+
+def _hang_verdict_wordings(label: str, host_is_posix: bool) -> tuple[str, ...]:
+    """The kill wordings a genuine-hang verdict may carry on one pass of the hang regression (sol r9 B3: one wording per branch, never the union).
+
+    "host taskkill" runs the host's own kill branch: a POSIX host kills the process GROUP; a Windows host kills the TREE with its own taskkill (the
+    original assertion also allowed the missing-taskkill note there, and nothing else). "taskkill missing" forces the Windows branch with taskkill
+    absent on every host, so it is the missing-taskkill note only."""
+    if label == "taskkill missing":
+        return (_TASKKILL_MISSING_NOTE,)
+    if host_is_posix:
+        return ("its process group was killed",)
+    return ("its process tree was killed", _TASKKILL_MISSING_NOTE)
+
+
 class _WindowsKillPath:
     """Mixin for a fixture class whose every test fakes `taskkill`: the Windows kill branch is forced for each test (adversary r8 A1)."""
 
@@ -1104,7 +1196,6 @@ class BoundedRunTests(unittest.TestCase):
         # adversary r6 A2 (PowerShell half): the suite-named failure reads the captured output through Read-CapturedText, which has its
         # own bound, so a stalled temp store cannot hold the verdict back. The seam hands in a task that never completes.
         fifo = FIFO_TEST.read_text(encoding="ascii")
-        body = _fifo_capture_io_region(fifo)
         self.assertIn("$ReadBoundMs = 10000", fifo)
         suite = fifo[fifo.index("function Invoke-BoundedSuite"):]
         suite = suite[:suite.index("\n}\n")]
@@ -1117,12 +1208,14 @@ class BoundedRunTests(unittest.TestCase):
         os.close(fd)
         try:
             Path(good).write_text("hello", encoding="ascii")
-            script = ("$ReadBoundMs = 10000\n" + body + "\n"
+            # sol r9 B1 (sibling): GOOD is an accept arm, so the accept seam and never the helper's real 10 s default; MISSING names it too
+            script = ("$ReadBoundMs = 10000\n" + _accept_region() + "\n"
+                      "$good = '" + good.replace("'", "''") + "'\n"
                       "$hang = { param($p) [Threading.Tasks.TaskCompletionSource[string]]::new().Task }\n"
                       "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
                       f"Write-Output ('HUNG|' + (Read-CapturedText (Join-Path ([IO.Path]::GetTempPath()) 'stdout.txt') 300 $hang) + '|' + ($sw.ElapsedMilliseconds -lt {capture_call_ceiling_ms(300)}))\n"
-                      "Write-Output ('GOOD|' + (Read-CapturedText '" + good.replace("'", "''") + "'))\n"
-                      "Write-Output ('MISSING|' + (Read-CapturedText (Join-Path (Join-Path ([IO.Path]::GetTempPath()) 'no-such-dir-r6') 'x.txt')))\n")
+                      "Write-Output ('GOOD|' + (Read-CapturedText $good $AcceptMs))\n"
+                      "Write-Output ('MISSING|' + (Read-CapturedText (Join-Path (Join-Path ([IO.Path]::GetTempPath()) 'no-such-dir-r6') 'x.txt') $AcceptMs))\n")
             proc = _run_pwsh_script(script)
         finally:
             os.unlink(good)
@@ -2136,10 +2229,11 @@ class BoundedCaptureIoTests(unittest.TestCase):
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_a_directory_path_handed_to_the_capture_cleanup_is_reported_as_still_present(self) -> None:
         # adversary r8 pass-12 A4: File.Exists(directory) is false, so a path that is a directory (nothing deleted) read as a clean removal.
-        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        # sol r9 B1: an accept arm (a success verdict is asserted), so it runs at the accept seam and names it, never the helper's real 10 s default.
+        script = (_accept_region() + "\n"
                   "$dir = Join-Path ([IO.Path]::GetTempPath()) ('mlv-r8-dir-' + [guid]::NewGuid().ToString('N'))\n"
                   "$null = New-Item -ItemType Directory -Path $dir\n"
-                  "Write-Output ('DIR|' + (Remove-CaptureFiles @($dir)))\n"
+                  "Write-Output ('DIR|' + (Remove-CaptureFiles @($dir) $AcceptMs))\n"
                   "Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -2150,15 +2244,15 @@ class BoundedCaptureIoTests(unittest.TestCase):
         # sol r8 B2 (PowerShell half): File.Delete threw (swallowed) and File.Exists / Directory.Exists return False on ANY error, so the
         # helper reported an empty success note. A NUL in the path makes all three behave that way on every platform, without an ACL change.
         # Only "file not found" / "directory not found" from the probe means gone; any other error leaves the removal unconfirmed.
-        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        script = (_accept_region() + "\n"  # sol r9 B1: accept arms (success rows GONE / NOPARENT), so the accept seam and no real default deadline
                   "$bad = 'C:\\x\\a' + [char]0 + 'b.tmp'\n"
                   "$real = [IO.Path]::GetTempFileName()\n"
-                  "Write-Output ('BAD|' + (Remove-CaptureFiles @($bad)).Replace([string][char]0, '<NUL>'))\n"
-                  "Write-Output ('MIXED|' + (Remove-CaptureFiles @($real, $bad)).Replace([string][char]0, '<NUL>') + '|' + (Test-Path -LiteralPath $real))\n"
+                  "Write-Output ('BAD|' + (Remove-CaptureFiles @($bad) $AcceptMs).Replace([string][char]0, '<NUL>'))\n"
+                  "Write-Output ('MIXED|' + (Remove-CaptureFiles @($real, $bad) $AcceptMs).Replace([string][char]0, '<NUL>') + '|' + (Test-Path -LiteralPath $real))\n"
                   "$gone = Join-Path ([IO.Path]::GetTempPath()) ('mlv-r9-gone-' + [guid]::NewGuid().ToString('N') + '.tmp')\n"
-                  "Write-Output ('GONE|[' + (Remove-CaptureFiles @($gone)) + ']')\n"
+                  "Write-Output ('GONE|[' + (Remove-CaptureFiles @($gone) $AcceptMs) + ']')\n"
                   "$noParent = Join-Path ([IO.Path]::GetTempPath()) ('mlv-r9-noparent-' + [guid]::NewGuid().ToString('N') + '\\a.tmp')\n"
-                  "Write-Output ('NOPARENT|[' + (Remove-CaptureFiles @($noParent)) + ']')\n")
+                  "Write-Output ('NOPARENT|[' + (Remove-CaptureFiles @($noParent) $AcceptMs) + ']')\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertRegex(proc.stdout, r"BAD\|capture cleanup incomplete: removal not confirmed: C:\\x\\a<NUL>b\.tmp \(ArgumentException", proc.stdout)
@@ -2251,12 +2345,14 @@ class BoundedCaptureIoTests(unittest.TestCase):
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_a_stalled_capture_cleanup_is_abandoned_and_named(self) -> None:
         # sol r6 B2 (PowerShell half): a delete that never completes is abandoned after the bound and the note names the files.
-        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        # sol r9 B1: STALLED is the timeout arm (its 300 ms bound is the subject); CLEAN is an accept arm and names the accept seam, because the
+        # helper's real 10 s default would turn a slow delete on a loaded runner into "capture cleanup abandoned after 10 s".
+        script = (_accept_region() + "\n"
                   "$hang = { param($p) [Threading.Tasks.TaskCompletionSource[bool]]::new().Task }\n"
                   "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
                   f"Write-Output ('STALLED|' + (Remove-CaptureFiles @('C:\\x\\a.txt', 'C:\\x\\b.txt') 300 $hang) + '|' + ($sw.ElapsedMilliseconds -lt {capture_call_ceiling_ms(300)}))\n"
                   "$real = [IO.Path]::GetTempFileName()\n"
-                  "Write-Output ('CLEAN|[' + (Remove-CaptureFiles @($real)) + ']|' + (Test-Path -LiteralPath $real))\n")
+                  "Write-Output ('CLEAN|[' + (Remove-CaptureFiles @($real) $AcceptMs) + ']|' + (Test-Path -LiteralPath $real))\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("STALLED|capture cleanup abandoned after 0.3 s: C:\\x\\a.txt, C:\\x\\b.txt|True", proc.stdout)
@@ -2338,6 +2434,20 @@ class BoundedCaptureIoTests(unittest.TestCase):
             self.assertIn(f"{label}|True|ok", proc.stdout, proc.stdout + proc.stderr)
         self.assertGreater(elapsed, base, "the script must outlast the typed base, or this case no longer shows what a fixed cap does")
 
+    def test_r10_the_hang_regression_accepts_one_kill_wording_per_pass_and_branch(self) -> None:
+        # sol r9 B3: the union (tree OR group OR not-confirmed) let the Windows host pass accept a group-only verdict, which the original
+        # assertion rejected. Every cell of (pass, host) names the wordings it accepts; the others are refused.
+        group, tree, missing = "its process group was killed", "its process tree was killed", _TASKKILL_MISSING_NOTE
+        self.assertEqual(_hang_verdict_wordings("host taskkill", host_is_posix=True), (group,))
+        self.assertEqual(_hang_verdict_wordings("host taskkill", host_is_posix=False), (tree, missing))
+        self.assertEqual(_hang_verdict_wordings("taskkill missing", host_is_posix=True), (missing,))
+        self.assertEqual(_hang_verdict_wordings("taskkill missing", host_is_posix=False), (missing,))
+        self.assertNotIn(group, _hang_verdict_wordings("host taskkill", host_is_posix=False), "a Windows host never kills by process group")
+        self.assertNotIn(tree, _hang_verdict_wordings("host taskkill", host_is_posix=True))
+        for posix in (True, False):
+            self.assertNotIn(group, _hang_verdict_wordings("taskkill missing", host_is_posix=posix))
+            self.assertNotIn(tree, _hang_verdict_wordings("taskkill missing", host_is_posix=posix))
+
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_r16_c1_a_genuine_hang_still_fails_by_case_name_at_the_budget(self) -> None:
         # The verdict is case-named either way. The kill note depends on the host: taskkill exists only on Windows, so on Ubuntu the
@@ -2360,8 +2470,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
                         _run_pwsh_script("Start-Sleep -Seconds 600\n")
                 message = str(caught.exception)
                 self.assertIn("test_r16_c1_a_genuine_hang_still_fails_by_case_name_at_the_budget exceeded its 3 s wall-clock bound", message)
-                self.assertTrue("its process tree was killed" in message or "its process group was killed" in message
-                                or "its process tree kill is NOT confirmed (taskkill failed: FileNotFoundError)" in message, message)
+                self.assertTrue(any(wording in message for wording in _hang_verdict_wordings(label, host_is_posix=_IS_POSIX)), message)
                 if label == "taskkill missing":
                     self.assertIn("kill is NOT confirmed (taskkill failed: FileNotFoundError)", message)
 
@@ -2541,6 +2650,22 @@ class BoundedCaptureIoTests(unittest.TestCase):
         two = one + "$r = Read-CapturedResult $p $AcceptMs $f\n"
         self.assertEqual(pwsh_script_budget_sec(two), PWSH_SCRIPT_BASE_SEC + 2 * CAPTURE_ACCEPT_CALL_CEILING_MS / 1000)
 
+    def test_r10_two_capture_calls_on_one_line_are_two_call_sites_each_charged_its_own_ceiling(self) -> None:
+        # sol r9 B2: the call scan took the REST of the line as one call's arguments, so a line that makes two accept calls was charged one ceiling
+        # (245 s instead of 370 s): two calls that each completed within their promised allowance were cut off by the outer run_bounded budget.
+        region = "function Read-CapturedResult { }\n# END bounded capture io\n"
+        accept = CAPTURE_ACCEPT_CALL_CEILING_MS
+        same_line = region + "$r = Read-CapturedResult $p $AcceptMs $f; Remove-CaptureFiles @($p) $AcceptMs $f\n"
+        self.assertEqual(pwsh_script_budget_sec(same_line), PWSH_SCRIPT_BASE_SEC + 2 * accept / 1000)
+        self.assertEqual(PWSH_SCRIPT_BASE_SEC + 2 * accept / 1000, 120 + 2 * 125, "the report's figure: 120 s base + 2 x 125 s")
+        self.assertEqual(pwsh_script_budget_sec(region + "Write-Output ((Read-CapturedResult $p $AcceptMs $f).Ok + (Remove-CaptureFiles @($p) $AcceptMs $f))\n"),
+                         PWSH_SCRIPT_BASE_SEC + 2 * accept / 1000, "a call nested in a statement is a call site as well")
+        mixed = region + "$r = Read-CapturedResult $p 300 $f; $n = Remove-CaptureFiles @($p) $AcceptMs $f\n"
+        self.assertEqual(pwsh_script_budget_sec(mixed), PWSH_SCRIPT_BASE_SEC + (capture_call_ceiling_ms(300) + accept) / 1000,
+                         "each call of the line is read for its OWN bound, not the line's largest")
+        self.assertEqual(pwsh_script_budget_sec(region + "$a = Read-CapturedResult $p 300 $f; $b = Read-CapturedResult $p 300 $f\n"),
+                         PWSH_SCRIPT_BASE_SEC + 2 * capture_call_ceiling_ms(300) / 1000)
+
     def test_the_accept_bound_is_no_deadline_a_runner_delay_can_cross(self) -> None:
         # CI-FLAKE-HEAVY-SLOT-GATE-PLAIN-TASK-CLEANUP-5S-1 r2 (sol r1 blocker): 5 s -> 60 s only moved the real deadline. A success verdict that
         # is measured against ANY real deadline of the helper is still a statement about the runner (a task delayed 61000 ms under a 60000 ms
@@ -2566,17 +2691,23 @@ class BoundedCaptureIoTests(unittest.TestCase):
         start = source.index("class BoundedCaptureIoTests(")
         body = source[start:source.index("\nclass BoundedCleanupTests(")]
         bounds = []
-        for chunk in re.split(r"\n    (?:@[^\n]*\n    )*def ", body):
+        # sol r9 B1 sweep: one case outside the class makes real accept calls too (its other lines are source pins), so it is read as well
+        outside = [chunk for chunk in re.split(r"\n    (?:@[^\n]*\n    )*def ", source)
+                   if chunk.split("(", 1)[0] == "test_the_fifo_suite_reads_its_captured_output_under_a_bound"]
+        self.assertEqual(len(outside), 1, "the guarded case outside the class must exist exactly once")
+        for chunk in re.split(r"\n    (?:@[^\n]*\n    )*def ", body) + outside:
             name = chunk.split("(", 1)[0]
             if name.startswith("test_no_accept_arm_of_the_bounded_capture_io_cases"):
                 continue
-            # PowerShell command names are case-insensitive; a generator call (_plain_task_script) carries its bound as a Python argument.
-            for match in re.finditer(r"(?i)(?:Read-Captured(?:Result|Text)|Remove-CaptureFiles)\b([^\n]*)|_plain_task_script\(([^\n]*)", chunk):
-                for number in re.findall(r"(?<![\w$.])(\d+)(?![\w.])", match.group(1) or match.group(2)):
-                    # sol r2 B1: NO typed number of a second or more is an accept arm's bound, the helper's own maximum included (60000 was
-                    # accepted here and is still a real deadline). An accept arm passes `$AcceptMs` (or CAPTURE_ACCEPT_BOUND_MS from Python).
-                    if 1000 <= int(number) <= MAX_DECLARED_BOUND_MS and name not in self._LONG_BOUND_EXEMPT:
-                        bounds.append(f"{name}: {number}")
+            if name in self._LONG_BOUND_EXEMPT:
+                continue
+            # sol r2 B1: NO typed number of a second or more is an accept arm's bound, the helper's own maximum included (60000 was accepted here
+            # and is still a real deadline). An accept arm passes `$AcceptMs` (or CAPTURE_ACCEPT_BOUND_MS from Python). sol r9 B1: a call with NO
+            # bound and a hex or suffixed literal are the same defect (capture_call_bound_offenders reads every PowerShell spelling).
+            bounds.extend(f"{name}: {offender}" for offender in capture_call_bound_offenders(chunk))
+            # a generator call (_plain_task_script) carries its bound as a Python argument
+            for match in re.finditer(r"_plain_task_script\(([^\n]*)", chunk):
+                bounds.extend(f"{name}: {value:g}" for value in _ps_number_values(match.group(1)) if 1000 <= value <= MAX_DECLARED_BOUND_MS)
         self.assertEqual(bounds, [], "an accept arm passes a typed bound; use $AcceptMs (the seam of _accept_region), which no helper deadline can end")
         waits = []
         for chunk in re.split(r"\n    (?:@[^\n]*\n    )*def ", body):
@@ -2594,6 +2725,25 @@ class BoundedCaptureIoTests(unittest.TestCase):
                     if millis >= 1000 and "$sw.ElapsedMilliseconds -lt" not in line:
                         waits.append(f"{name}: {line.strip()[:90]}")
         self.assertEqual(waits, [], "a BoundedCaptureIoTests case waits a second or more for real; name it in _ALLOWED_LONG_SLEEPS with why it is never waited out")
+
+    def test_no_accept_arm_of_the_bounded_capture_io_cases_guard_flags_bare_hex_and_suffixed_bounds(self) -> None:
+        # sol r9 B1: the guard's own catalogue. A bare call (real 10 s default), a hex literal and a suffixed literal were all passed by the
+        # decimal-only guard; the accept shapes and the sub-second timeout shapes must stay clean.
+        flagged = ("Remove-CaptureFiles @($real)", "Read-CapturedResult $p", "Read-CapturedText 'C:\\x\\a.txt'",
+                   "Remove-CaptureFiles @($real) 0x1388 $f", "Read-CapturedResult $p 0xEA60 $f", "Read-CapturedResult $p 5000 $f",
+                   "Remove-CaptureFiles @($real) 10000L $f", "Read-CapturedResult $p 5kb $f", "Read-CapturedResult $p 5e3 $f",
+                   "Write-Output ('X|' + (Remove-CaptureFiles @($real)) + '|' + (Test-Path -LiteralPath $real))")
+        for text in flagged:
+            with self.subTest(text):
+                self.assertNotEqual(capture_call_bound_offenders(text), [], text)
+        clean = ("Remove-CaptureFiles @($real) $AcceptMs $f", "Read-CapturedResult $p $AcceptMs $f", "Remove-CaptureFiles @('a', 'b') 300 $hang",
+                 "Read-CapturedText 'C:\\x\\a.txt' $b $seam; Write-Output 'x'", "Write-Output ('Y|' + (Remove-CaptureFiles @($real) $AcceptMs $f) + ']')",
+                 "# Remove-CaptureFiles @($real) is only prose", "function Read-CapturedResult([string]$Path) { }",
+                 "the real Read-CapturedResult and Remove-CaptureFiles) under a private TMPDIR", "docstring: Read-CapturedResult / Remove-CaptureFiles")
+        for text in clean:
+            with self.subTest(text):
+                self.assertEqual(capture_call_bound_offenders(text), [], text)
+        self.assertEqual(len(capture_call_bound_offenders("Read-CapturedResult $p; Remove-CaptureFiles @($p)")), 2, "both calls of one line are read")
 
     # Cases that legitimately carry a sleep literal of a second or more, because it is never waited out: the worker is killed at the case's small
     # bound, or the hang is killed at its budget (the reason is the case's own comment). A case NOT listed here may not add one.
@@ -2891,9 +3041,9 @@ class BoundedCaptureIoTests(unittest.TestCase):
         # adversary r7 A3: a delete that fails (a read-only or held file) is reported, not read as a success. Split out of the STALLED/CLEAN test
         # (hosted ubuntu CI, run 41485699571): the ReadOnly attribute does not stop a POSIX unlink, so the case printed `STUCK||False` there
         # and the teardown threw on the already-removed file. The teardown now also tolerates a file that is gone.
-        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        script = (_accept_region() + "\n"  # sol r9 B1: the accept seam, never the helper's real 10 s default
                   "$stuck = [IO.Path]::GetTempFileName(); [IO.File]::SetAttributes($stuck, [IO.FileAttributes]::ReadOnly)\n"
-                  "Write-Output ('STUCK|' + (Remove-CaptureFiles @($stuck)) + '|' + (Test-Path -LiteralPath $stuck))\n"
+                  "Write-Output ('STUCK|' + (Remove-CaptureFiles @($stuck) $AcceptMs) + '|' + (Test-Path -LiteralPath $stuck))\n"
                   "if (Test-Path -LiteralPath $stuck) { [IO.File]::SetAttributes($stuck, [IO.FileAttributes]::Normal); Remove-Item -LiteralPath $stuck -Force }\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -3064,12 +3214,11 @@ class BoundedCaptureIoTests(unittest.TestCase):
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_b1_the_helpers_return_a_failure_note_when_their_own_setup_throws(self) -> None:
         # Dot B1 (b): called directly, with the setup failing, neither helper throws; each reports the failure in its own return value.
-        fifo = FIFO_TEST.read_text(encoding="ascii")
-        script = (_fifo_capture_io_region(fifo) + "\n"
+        script = (_accept_region() + "\n"  # sol r9 B1: no call of the class names no bound
                   "function Initialize-BoundedCaptureIo { throw 'compile denied' }\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
-                  "try { $r = Read-CapturedResult $p; Write-Output ('READ|' + $r.Ok + '|' + $r.Text) } catch { Write-Output ('READ-THREW|' + $_.Exception.Message) }\n"
-                  "try { Write-Output ('DEL|' + (Remove-CaptureFiles @($p))) } catch { Write-Output ('DEL-THREW|' + $_.Exception.Message) }\n")
+                  "try { $r = Read-CapturedResult $p $AcceptMs; Write-Output ('READ|' + $r.Ok + '|' + $r.Text) } catch { Write-Output ('READ-THREW|' + $_.Exception.Message) }\n"
+                  "try { Write-Output ('DEL|' + (Remove-CaptureFiles @($p) $AcceptMs)) } catch { Write-Output ('DEL-THREW|' + $_.Exception.Message) }\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("READ|False|<read failed: compile denied>", proc.stdout, proc.stdout + proc.stderr)
