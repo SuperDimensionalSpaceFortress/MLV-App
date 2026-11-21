@@ -18,6 +18,8 @@ from pathlib import Path
 _SIBLING_IMPORT = re.compile(r"^\s*Import-Module\s+\(Join-Path\s+\$(?:PSScriptRoot|here)\s+'([^']+\.psm1)'\)", re.MULTILINE)
 # a module of a NEIGHBOURING folder, by a relative path that climbs one level: '..\<folder>\<name>.psm1' (imported or read as text)
 _CROSS_TREE_MODULE = re.compile(r"Join-Path\s+\$(?:PSScriptRoot|here)\s+'(\.\.\\[A-Za-z0-9_.-]+\\[A-Za-z0-9_.-]+\.psm1)'")
+# a module of the PARENT folder, imported by `(Join-Path (Split-Path -Parent $here|$PSScriptRoot) 'X.psm1')`: the same place as '..\X.psm1'
+_PARENT_FOLDER_MODULE = re.compile(r"Join-Path\s+\(Split-Path\s+-Parent\s+\$(?:PSScriptRoot|here)\)\s+'([A-Za-z0-9_.-]+\.psm1)'")
 
 
 def sibling_modules(source: Path) -> list[Path]:
@@ -35,10 +37,14 @@ def sibling_modules(source: Path) -> list[Path]:
 
 
 def cross_tree_modules(source: Path) -> list[str]:
-    """The '..\\<folder>\\<name>.psm1' paths `source` and its siblings import or read, relative to `source`'s folder, in first-seen order."""
+    """The '..\\<folder>\\<name>.psm1' and '..\\<name>.psm1' paths `source`, its siblings and the runner scripts of its folder import or read, relative to `source`'s
+    folder, in first-seen order. BENCH-LIGHT-ARM-GAIN-GATES-1 r3 (hosted Tests run 44737591712): the lease-batch runner (a .ps1 in the same folder, not a module `source`
+    imports) imports `(Split-Path -Parent $here) 'FpsArmGate.psm1'`, one folder up; the fixtures run that runner from a scratch copy, so its folder's *.ps1 are scanned too."""
     found: list[str] = []
-    for current in [source, *sibling_modules(source)]:
-        for rel in _CROSS_TREE_MODULE.findall(current.read_text(encoding="utf-8")):
+    for current in [source, *sibling_modules(source), *sorted(source.parent.glob("*.ps1"))]:
+        text = current.read_text(encoding="utf-8")
+        rels = _CROSS_TREE_MODULE.findall(text) + ["..\\" + name for name in _PARENT_FOLDER_MODULE.findall(text)]
+        for rel in rels:
             if rel not in found:
                 found.append(rel)
     return found

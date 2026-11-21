@@ -4,6 +4,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# BENCH-LIGHT-ARM-GAIN-GATES-1: a presented-fps delta, diagnosis or suggestion comes only from a LIGHT / LIGHT playback A/B (hub ruling 2026-11-20T05:25:54Z item 2).
+Import-Module (Join-Path $PSScriptRoot "FpsArmGate.psm1") -Force
 
 $Json = $false
 $OutputJson = ""
@@ -359,6 +361,10 @@ function Get-ProofSummarySuggestion {
     if ((Get-PlaybackAbHostLoadRefusal -Record $playbackAb).provisional) {
         return "rerun_playback_ab_with_quiet_host"
     }
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: neither the embedded analysis nor the fps delta below is trusted from a HEAVY / UNKNOWN pair.
+    if ((Get-PlaybackAbFpsArmRefusal -Record $playbackAb).refused) {
+        return "rerun_playback_ab_with_light_arm"
+    }
     if ($playbackAb.analysis -and $playbackAb.analysis.suggestedOptimization) {
         return [string]$playbackAb.analysis.suggestedOptimization
     }
@@ -467,13 +473,37 @@ function Get-PlaybackAbHostLoadRefusal {
     # how $compare/$playbackComparisonBasis are chosen below).
     param([object]$Record)
 
-    $candidateLeg = if ($Record.speedCompare -and $Record.candidateSpeed) { $Record.candidateSpeed } else { $Record.candidate }
+    # BENCH-LIGHT-ARM-GAIN-GATES-1 (adversary A6, sibling): same leg choice as Get-PlaybackAbFpsArmRefusal below: a record with a speedCompare judges its candidateSpeed leg, and a missing one
+    # reads as provisional (Get-PlaybackAbLegHostLoadProvisional treats a null leg as provisional), never as the ordinary candidate.
+    # r6 (adversary pass 5 A3): the leg is ASSIGNED inside each branch. `$x = if (...) { $Record.candidateSpeed }` unrolls a one-element array into the leg inside it, so a malformed
+    # container the direct readers refuse was judged as that leg; an assignment keeps the container whole.
+    if ($Record.speedCompare) { $candidateLeg = $Record.candidateSpeed } else { $candidateLeg = $Record.candidate }
     $baselineProvisional = Get-PlaybackAbLegHostLoadProvisional -Leg $Record.baseline
     $candidateProvisional = Get-PlaybackAbLegHostLoadProvisional -Leg $candidateLeg
     [pscustomobject]@{
         provisional = ($baselineProvisional -or $candidateProvisional)
         baselineProvisional = $baselineProvisional
         candidateProvisional = $candidateProvisional
+    }
+}
+
+function Get-PlaybackAbFpsArmRefusal {
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: the arm gate for a mlvapp-cuda-playback-ab.v1 record, re-derived from the legs' own recorded telemetryArm (never from the record's cached
+    # fpsVerdict or analysis: an older or edited record could carry an `allowed` it never earned). Same leg choice as Get-PlaybackAbHostLoadRefusal. A leg that records no arm
+    # (a record written before this gate) is UNKNOWN and refused, exactly like HEAVY: an arm nobody can prove LIGHT is not LIGHT.
+    param([object]$Record)
+
+    # The leg judged is the leg the PUBLISHED compare came from: when the record carries a speedCompare the row / analysis / suggestion read it, so its candidateSpeed leg is judged, and an
+    # absent candidateSpeed there is UNKNOWN (a null leg), never a fall-back to the ordinary candidate (adversary A6).
+    # r6 (adversary pass 5 A3): assigned inside each branch so a one-element container is not unrolled into the leg inside it (see Get-PlaybackAbHostLoadRefusal)
+    if ($Record.speedCompare) { $candidateLeg = $Record.candidateSpeed } else { $candidateLeg = $Record.candidate }
+    $verdict = Get-FpsPairVerdict `
+        -Baseline (Get-FpsArmFromLegRecord $Record.baseline) `
+        -Candidate (Get-FpsArmFromLegRecord $candidateLeg)
+    [pscustomobject]@{
+        refused = (-not $verdict.allowed)
+        reason = [string]$verdict.reason
+        detail = [string]$verdict.detail
     }
 }
 
@@ -487,6 +517,14 @@ function Get-PlaybackAbAnalysis {
         return [pscustomobject]@{
             dominantBottleneck = "host-load-provisional"
             suggestedOptimization = "rerun_playback_ab_with_quiet_host"
+        }
+    }
+
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: the diagnosis is driven by the presented-fps delta, so it is withheld for a HEAVY / UNKNOWN pair too.
+    if ((Get-PlaybackAbFpsArmRefusal -Record $Record).refused) {
+        return [pscustomobject]@{
+            dominantBottleneck = "fps-arm-refused"
+            suggestedOptimization = "rerun_playback_ab_with_light_arm"
         }
     }
 
@@ -948,13 +986,21 @@ function New-PlaybackAbSummaryRow {
     # matching gap for the raw delta number itself. Refused to $null, with an explicit reason
     # field (not just an absence a reader could mistake for "not computed yet").
     $hostLoadRefusal = Get-PlaybackAbHostLoadRefusal -Record $Record
-    $fpsDeltaRefused = [bool]$hostLoadRefusal.provisional
-    $fpsDeltaRefusedReason = if ($fpsDeltaRefused) {
-        "host_load_provisional: an fps delta computed against a leg whose host load was " +
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: and the delta is refused the same way when either leg ran the HEAVY telemetry arm (a mixed pair too) or its arm is unrecorded: a HEAVY leg's
+    # presented fps measures the per-frame logger (about 20-27 % on M16-1457 CUDA fullscreen s1), so only a LIGHT / LIGHT pair may publish an fps gain or cost.
+    $fpsArmRefusal = Get-PlaybackAbFpsArmRefusal -Record $Record
+    $fpsDeltaRefused = ([bool]$hostLoadRefusal.provisional -or [bool]$fpsArmRefusal.refused)
+    $fpsDeltaRefusedReasons = @()
+    if ($hostLoadRefusal.provisional) {
+        $fpsDeltaRefusedReasons += (
+            "host_load_provisional: an fps delta computed against a leg whose host load was " +
             "exceeded or could not be measured is never usable as a regression or acceptance signal."
-    } else {
-        $null
+        )
     }
+    if ($fpsArmRefusal.refused) {
+        $fpsDeltaRefusedReasons += "$($fpsArmRefusal.reason): $($fpsArmRefusal.detail); only a LIGHT / LIGHT pair may publish a presented-fps gain or cost (stage metrics stay)."
+    }
+    $fpsDeltaRefusedReason = if ($fpsDeltaRefused) { ($fpsDeltaRefusedReasons -join " ") } else { $null }
     $suggestion = if ([string]::IsNullOrWhiteSpace([string]$analysis.suggestedOptimization)) {
         if ([string]$Record.status -ne "success") {
             "fix_playback_ab_proof_failures"
@@ -974,6 +1020,7 @@ function New-PlaybackAbSummaryRow {
         presented_fps = if ($null -ne $candidatePresented) { [math]::Round($candidatePresented, 3) } else { $null }
         playback_fps_delta_pct = if ($fpsDeltaRefused -or $null -eq $deltaPct) { $null } else { [math]::Round($deltaPct, 3) }
         playback_fps_delta_refused_reason = $fpsDeltaRefusedReason
+        playback_fps_arm_verdict = if ($fpsArmRefusal.refused) { $fpsArmRefusal.reason } else { "allowed" }
         no_readback_pct = $null
         fallback_pct = $null
         fallback_count = $null

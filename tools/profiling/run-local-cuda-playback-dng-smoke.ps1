@@ -681,6 +681,8 @@ function Get-PlaybackAbProofSummary {
         candidateSpeed = $Summary.candidateSpeed
         compare = $Summary.compare
         speedCompare = $Summary.speedCompare
+        # BENCH-LIGHT-ARM-GAIN-GATES-1: the A/B's arm verdict travels with its compare; a HEAVY / UNKNOWN pair's fps deltas are already withheld there.
+        fpsVerdict = $Summary.fpsVerdict
         analysis = $Summary.analysis
         proofFailures = @($Summary.proofFailures | Where-Object { $null -ne $_ })
         proofBoundary = $Summary.proofBoundary

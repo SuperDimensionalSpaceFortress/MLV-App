@@ -93,7 +93,7 @@
 #         venue with exactly that manifest (Get-VenueStagedBuildManifest, the file Invoke-VenueLeg hashes) and its cached exe, dll and package zip present and
 #         hashing to the manifest's digests (-VerifyArtifacts; BUILD_ARTIFACT_MISSING / BUILD_ARTIFACT_MISMATCH). One bad item refuses the whole plan on stderr,
 #         BATCH_USAGE LEG_PLAN_REFUSED reason=<BAD_ITEM_SHAPE | BAD_SOURCE_COMMIT | BAD_MANIFEST_SHA256 | BAD_BACKEND | BAD_ARM | LEG_SPEC_MISSING | BUILD_NOT_STAGED |
-#         BUILD_MANIFEST_MISMATCH | BUILD_ARTIFACT_MISSING | BUILD_ARTIFACT_MISMATCH | SHARE_UNREACHABLE | LEG_SPEC_INVALID> item=<n> (or LEG_PLAN_UNREADABLE | LEG_PLAN_INVALID), exit 2: nothing is submitted, so no lease ever fails
+#         BUILD_MANIFEST_MISMATCH | BUILD_ARTIFACT_MISSING | BUILD_ARTIFACT_MISMATCH | SHARE_UNREACHABLE | LEG_SPEC_INVALID | BAD_PURPOSE | FPS_AB_HEAVY_ARM | FPS_AB_UNKNOWN_ARM> item=<n> (or LEG_PLAN_UNREADABLE | LEG_PLAN_INVALID), exit 2: nothing is submitted, so no lease ever fails
 #         halfway on a build. A spec that is not a mlv-app/dual-venue-leg/v1 spec, does not list the item's backend, or has a field Invoke-VenueLeg casts or validates
 #         (playSeconds, visualCapture and its opt-out reason, scaleFactor, acceptedEffectiveScale) it would throw on, is refused here (LEG_SPEC_INVALID, BAD_BACKEND)
 #         because Invoke-VenueLeg would throw on it only after the lease is open.
@@ -112,6 +112,9 @@
 #         given up on, goes to stderr only: showing batch.log is no input would read the inputs again with no bound. Each read keeps its 30 s, and the claim, gate and open checks refuse on their first as before; only the claim check that follows an unfinished pass is cut to the deadline.
 #         A SHARE_UNREACHABLE from any of these checks says guardReads(sec): what each read took ('+' = still running when given up on; start = the worker's own start, nothing read yet) and
 #         claimWaitBefore=yes|no (waitedSec: first denied poll to the grant, or to now while still denied).
+#         BENCH-LIGHT-ARM-GAIN-GATES-1: the plan object may declare "purpose": "fps-ab" (its legs are compared on presented fps) or "stage-attribution" (stage metrics only). An fps-ab plan is refused
+#         FPS_AB_HEAVY_ARM when any leg's spec runs the HEAVY telemetry arm (generatorArgs.telemetryArm; a HEAVY leg's fps measures the per-frame logger) and FPS_AB_UNKNOWN_ARM when a spec names
+#         no arm; any other purpose is BAD_PURPOSE. leg-plan.json records the purpose and each leg's derived telemetryArm (tools\profiling\FpsArmGate.psm1).
 #      b. The legs run in plan order (-PlanOrder AsGiven), or with the arms INTERLEAVED, A B A B (-PlanOrder Interleave, Get-VenueInterleavedLegPlan), so lease
 #         position and venue heat fall on every arm alike. Per-leg budget, re-check, claim loss and deadline handling are the scalar form's, leg by leg.
 #      c. Each leg process gets its own -SourceCommit / -BuildManifestSha256 / -Backend; each batch leg row and run result carries name, arm, backend, sourceCommit
@@ -254,6 +257,7 @@ $here = $PSScriptRoot
 Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking
 Import-Module (Join-Path $here 'VenueThermalGate.psm1') -Force
 Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force -DisableNameChecking   # LEASE-BATCH-RECEIPT-ROOT-1: Test-DvUnderClaudeState, the leg's own receipt-root rule
+Import-Module (Join-Path (Split-Path -Parent $here) 'FpsArmGate.psm1') -Force   # BENCH-LIGHT-ARM-GAIN-GATES-1: the telemetry-arm classifier and the fps-A/B plan rule
 # r9 (sol r8 B2): every thermal-helper call passes its optional parameters explicitly (the dispatch grace below, the Stopwatch now), so an ambient $PSDefaultParameterValues
 # entry can never widen the one-second dispatch grace (a probe admitted 50 s past the deadline) or freeze the thermal clock
 $ThermalDispatchGraceSec = 1
@@ -1364,6 +1368,26 @@ function Get-LegSpecId([string]$Path) {
     $legId
 }
 
+function Get-LegSpecTelemetryArm([string]$Path) {
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: the telemetry arm (LIGHT / HEAVY / UNKNOWN) a -LegPlan item's spec will run, derived from generatorArgs.telemetryArm by the same bounded read as
+    # Get-LegSpecId. A spec that cannot be read or parsed in the bound is UNKNOWN (refused like HEAVY for an fps A/B), never LIGHT.
+    # Adversary A4: the arm is judged from the SAME bytes the leg will run. The export-budget preflight (Get-ExportBudgetRefusal, which runs just before this call) recorded the sha256 of the
+    # bytes it judged in $script:SpecBudgetSha256, and the leg is bound to them by -ExpectSpecSha256. These bytes must hash to that digest; a spec that changed between the two reads (a
+    # HEAVY file shown LIGHT to this read and put back for the run) is UNKNOWN, never the arm this read happened to see. No recorded digest is UNKNOWN too.
+    $spec = $null
+    try {
+        $r = Read-SpecBytesWithin $Path (Get-SpecReadBoundSec)
+        # r6 (adversary pass 5 A5): a read that got no answer in its bound is a TIMEOUT the caller must see (readTimedOut), not a quiet UNKNOWN the plan goes on from toward a refusal after -DeadlineUtc
+        if ($r.state -ceq 'TIMEOUT') { return [pscustomobject]@{ arm = 'UNKNOWN'; source = 'spec'; reason = 'the spec read for the arm did not answer within the time left before -DeadlineUtc'; readTimedOut = $true } }
+        if ($r.state -ceq 'OK') {
+            $judged = if ($script:SpecBudgetSha256 -is [hashtable] -and $script:SpecBudgetSha256.ContainsKey($Path)) { [string]$script:SpecBudgetSha256[$Path] } else { '' }
+            if ($judged -and ((Get-BytesSha256 ([byte[]]$r.bytes)) -ceq $judged)) { $spec = [Text.Encoding]::UTF8.GetString([byte[]]$r.bytes) | ConvertFrom-Json }
+            else { return (New-FpsArm 'UNKNOWN' 'spec' 'the spec bytes read for the arm are not the bytes the preflight judged and the leg is bound to (changed between reads, or no judged digest)') }
+        }
+    } catch { $spec = $null }
+    Get-FpsArmFromLegSpec $spec
+}
+
 function Get-SpecReadBoundSec {
     # r19 (sol r18 B2 = pass20-A2): the longest a spec read may take now: what is left before -DeadlineUtc less the refusal's reserve, under the preflight child's own cap (120 s). A guard
     # worker (no -DeadlineUtc in its scope) has the cap: the worker is itself given up on at its guard budget, and its callers pass that budget's remainder instead.
@@ -1532,6 +1556,20 @@ function Get-ScalarLegShapeRefusal([string]$Path) {
     $(if ($null -ne $refusal) { [string]$refusal } else { '' })
 }
 
+function Get-SpecPathJudgedConflict([hashtable]$Seen, [string]$Path) {
+    # BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary A7, on 245e26de): the judged digests are kept one per spec PATH ($script:SpecBudgetSha256), so two plan items that share a path
+    # overwrote each other's: item A's arm was read from the bytes it judged, then the file changed, item B judged the new bytes, and A's leg ran (bound to B's digest) on bytes its recorded
+    # arm never described. A path is judged ONCE per run: the first item (or scalar entry) to pass the shape and budget checks records the digest in $Seen, and any later entry whose own
+    # judged digest for the same path differs is the typed refusal below (fail closed; no claim, lease or leg). Returns '' when this path's digest is new or unchanged.
+    $now = [string]$script:SpecBudgetSha256[$Path]
+    if ($Seen.ContainsKey($Path) -and [string]$Seen[$Path] -cne $now) {
+        return "'$Path' cannot be run: two entries of this run name the same leg spec and judged different bytes of it (sha256 $($Seen[$Path]), then $(if ($now) { $now } else { 'none recorded' })); one recorded arm and one leg binding must describe one set of bytes, so no claim or lease is taken"
+    }
+    $Seen[$Path] = $now
+    ''
+}
+$specJudgedOnce = @{}
+
 # The planned legs: name, spec path, backend ('' = whatever the spec lists). Same naming as Invoke-VenueChain.
 $plan = [System.Collections.Generic.List[object]]::new()
 $planRecord = $null
@@ -1576,8 +1614,22 @@ if ($legPlanMode) {
             if ($specRefusal[0]) { Stop-PlanRefused $specRefusal[0] $n $specRefusal[1] }
             $budgetRefusal = Get-ExportBudgetRefusal $path   # r8 (adversary r7 A3): an export window the agent's job cap refuses is refused HERE, before any claim or lease
             if ($budgetRefusal[0]) { Stop-PlanRefused $budgetRefusal[0] $n $budgetRefusal[1] }
-            $items.Add([pscustomobject]@{ item = $n; legId = (Get-LegSpecId $path); spec = $path; backend = $be.ToLowerInvariant(); arm = $arm; sourceCommit = $sc.ToLowerInvariant(); buildManifestSha256 = $ms.ToLowerInvariant() })
+            $judgedConflict = Get-SpecPathJudgedConflict $specJudgedOnce $path   # r6 (adversary A7): one judged digest per spec path
+            if ($judgedConflict) { Stop-PlanRefused 'SPEC_CHANGED_BETWEEN_PLAN_ITEMS' $n $judgedConflict }
+            $armRead = Get-LegSpecTelemetryArm $path
+            if ($armRead.readTimedOut) { Stop-PlanRefused 'SPEC_READ_TIMEOUT' $n "'$path' cannot be run: the leg spec could not be read for its telemetry arm within the time left before -DeadlineUtc; no claim or lease is taken on it" }   # r6 (adversary pass 5 A5)
+            $items.Add([pscustomobject]@{ item = $n; legId = (Get-LegSpecId $path); spec = $path; backend = $be.ToLowerInvariant(); arm = $arm; sourceCommit = $sc.ToLowerInvariant(); buildManifestSha256 = $ms.ToLowerInvariant()
+                    telemetryArm = $armRead.arm })
         }
+        # BENCH-LIGHT-ARM-GAIN-GATES-1 (hub ruling 2026-11-20T05:25:54Z item 2): a plan may declare `purpose`. 'fps-ab' = its legs are compared on presented fps, so every leg must run the LIGHT
+        # telemetry arm (a HEAVY leg's fps measures the per-frame logger; a spec that names no arm is UNKNOWN and refused alike). 'stage-attribution' = stage metrics only: HEAVY allowed. No
+        # purpose: nothing is refused here, and every gain/cost reader still refuses an fps verdict from a HEAVY / UNKNOWN pair. Checked with the items, before any claim, lease or staging read.
+        # The purpose is passed AS PARSED, never coerced to a string: a one-element ["fps-ab"] would otherwise read as 'fps-ab' (adversary A3). A declared purpose that is not the scalar string is BAD_PURPOSE.
+        $planPurpose = $null
+        $planPurposeDeclared = ($doc -is [System.Management.Automation.PSCustomObject]) -and ($null -ne $doc.PSObject.Properties['purpose'])
+        if ($planPurposeDeclared) { $planPurpose = $doc.PSObject.Properties['purpose'].Value }
+        $purposeRefusal = Get-FpsLegPlanRefusal -Purpose $planPurpose -Items @($items | ForEach-Object { [pscustomobject]@{ item = $_.item; arm = $_.telemetryArm } }) -Declared:$planPurposeDeclared
+        if ($purposeRefusal[0]) { Stop-PlanRefused ([string]$purposeRefusal[0]) ([int]$purposeRefusal[1]) ([string]$purposeRefusal[2]) }
         # Each build once (the read Invoke-VenueChain's supplementary leg makes): staged on the venue, and with exactly the manifest the item names.
         $builds = [ordered]@{}
         foreach ($it in $items) {
@@ -1612,10 +1664,10 @@ if ($legPlanMode) {
         }
         foreach ($it in $ordered) {
             $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}-{3}' -f ($plan.Count + 1), $it.legId, $it.backend, $it.arm); spec = $it.spec; backend = $it.backend
-                    arm = $it.arm; sourceCommit = $it.sourceCommit; buildManifestSha256 = $it.buildManifestSha256; planItem = $it.item })
+                    arm = $it.arm; sourceCommit = $it.sourceCommit; buildManifestSha256 = $it.buildManifestSha256; planItem = $it.item; telemetryArm = $it.telemetryArm })
         }
-        $planRecord = [ordered]@{ schema = 'mlv-app/venue-lease-leg-plan-run/v1'; legPlan = $planPath; order = $PlanOrder; arms = @($plan | ForEach-Object { $_.arm } | Select-Object -Unique)
-            legs = @($plan | ForEach-Object { [ordered]@{ name = $_.name; planItem = $_.planItem; arm = $_.arm; backend = $_.backend; sourceCommit = $_.sourceCommit; buildManifestSha256 = $_.buildManifestSha256; spec = $_.spec } })
+        $planRecord = [ordered]@{ schema = 'mlv-app/venue-lease-leg-plan-run/v1'; legPlan = $planPath; order = $PlanOrder; purpose = $planPurpose; arms = @($plan | ForEach-Object { $_.arm } | Select-Object -Unique)
+            legs = @($plan | ForEach-Object { [ordered]@{ name = $_.name; planItem = $_.planItem; arm = $_.arm; telemetryArm = $_.telemetryArm; backend = $_.backend; sourceCommit = $_.sourceCommit; buildManifestSha256 = $_.buildManifestSha256; spec = $_.spec } })
             builds = @($builds.Keys | ForEach-Object { [ordered]@{ sourceCommit = $_; state = $builds[$_].state; sha256 = $builds[$_].sha256; path = $builds[$_].path } }) }
         if ($null -ne $spread) { $planRecord.thermalSpread = $spread }
     } catch {
@@ -1631,6 +1683,8 @@ if ($legPlanMode) {
         if ($shapeRefusal) { Stop-Usage "LEG_SPEC_INVALID '$($e.specPath)' cannot be run: $shapeRefusal" }
         $budgetRefusal = Get-ExportBudgetRefusal ([string]$e.specPath)   # r8 (adversary r7 A3): before the lease, as -LegPlan does
         if ($budgetRefusal[0]) { Stop-Usage "$($budgetRefusal[0]) $($budgetRefusal[1])" }
+        $judgedConflict = Get-SpecPathJudgedConflict $specJudgedOnce ([string]$e.specPath)   # r6 (adversary A7 sibling): one judged digest per spec path
+        if ($judgedConflict) { Stop-Usage "SPEC_CHANGED_BETWEEN_PLAN_ITEMS $judgedConflict" }
         $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend })
     }
 } else {
@@ -1648,6 +1702,8 @@ if ($legPlanMode) {
         if ($shapeRefusal) { Stop-Usage "LEG_SPEC_INVALID '$path' cannot be run: $shapeRefusal" }
         $budgetRefusal = Get-ExportBudgetRefusal $path   # r8 (adversary r7 A3): before any claim or lease, as -LegPlan does
         if ($budgetRefusal[0]) { Stop-Usage "$($budgetRefusal[0]) $($budgetRefusal[1])" }
+        $judgedConflict = Get-SpecPathJudgedConflict $specJudgedOnce $path   # r6 (adversary A7 sibling): one judged digest per spec path
+        if ($judgedConflict) { Stop-Usage "SPEC_CHANGED_BETWEEN_PLAN_ITEMS $judgedConflict" }
         $legId = Get-LegSpecId $path
         for ($r = 1; $r -le $Repeats; $r++) {
             $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f ($plan.Count + 1), $legId, $(if ($Backend) { $Backend } else { 'spec' })); spec = $path; backend = $(if ($Backend) { $Backend } else { '' }) })

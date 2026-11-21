@@ -1124,6 +1124,8 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         tree = self.case / "tree" / "tools" / "profiling"
         shutil.copytree(DV, tree / "dual-venue", ignore=shutil.ignore_patterns("look-receipts", "legs", "legsets"))
         (tree / "bachelor").mkdir()
+        # BENCH-LIGHT-ARM-GAIN-GATES-1 r3: the runner imports ..\FpsArmGate.psm1 and the dual-venue modules read neighbouring-folder modules; a scratch tree carries them all
+        copy_cross_tree_modules(MODULE, tree / "dual-venue")
         agent = AGENT.read_bytes()
         self.assertEqual(agent.count(b"[int]$LeaseBatchIdleSec = 300,"), 1, "the agent's idle bound moved: update this fixture")
         (tree / "bachelor" / AGENT.name).write_bytes(agent.replace(b"[int]$LeaseBatchIdleSec = 300,", b"[int]$LeaseBatchIdleSec = " + idle + b","))
@@ -2056,6 +2058,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         tree = self.case / "tree" / "tools" / "profiling"
         shutil.copytree(DV, tree / "dual-venue", ignore=shutil.ignore_patterns("look-receipts", "legs", "legsets"))
         (tree / "bachelor").mkdir()
+        copy_cross_tree_modules(MODULE, tree / "dual-venue")   # BENCH-LIGHT-ARM-GAIN-GATES-1 r3: ..\FpsArmGate.psm1 (the runner's import) and the neighbouring-folder modules
         agent = AGENT.read_bytes()
         (tree / "bachelor" / AGENT.name).write_bytes(agent.replace(b"[int]$LeaseBatchIdleSec = 300,", b"[int]$LeaseBatchIdleSec,"))
         self.runner = tree / "dual-venue" / RUNNER.name
@@ -3560,6 +3563,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # the validated, ordered plan is kept beside the receipts
         kept = json.loads((self.run_dir / "leg-plan.json").read_text(encoding="utf-8"))
         self.assertEqual([x["arm"] for x in kept["legs"]], ["A", "B", "A", "B"])
+        # BENCH-LIGHT-ARM-GAIN-GATES-1: every leg states its derived telemetry arm (these fixture specs name none: UNKNOWN) and the plan its purpose (undeclared: null)
+        self.assertEqual([x["telemetryArm"] for x in kept["legs"]], ["UNKNOWN"] * 4)
+        self.assertIsNone(kept["purpose"])
         self.assertEqual(sorted((s["sourceCommit"], s["state"]) for s in kept["builds"]), [(a, "STAGED"), (b, "STAGED")])
 
     def test_the_plan_runs_as_given_without_the_interleave_option(self) -> None:
@@ -5921,6 +5927,42 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertTrue(rows, "no leg ran on the unchanged spec. " + out)
                 for row in rows:
                     self.assertEqual(row, f"expect={want} read={want}", out)
+
+    def test_bench_light_arm_a7_two_plan_items_that_share_a_spec_path_never_judge_different_bytes_of_it(self) -> None:
+        # BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary A7 on 245e26de): the judged digest was kept one per spec PATH, so item B's reads of changed bytes overwrote item A's digest and A's
+        # leg ran (bound to B's digest) on bytes its recorded arm never described. The stand-in budget child rewrites the shared spec after item 1's budget read, so item 2 judges other
+        # bytes of the same path. The batch must refuse the whole plan (typed SPEC_CHANGED_BETWEEN_PLAN_ITEMS, item 2) before any claim, lease or leg. Control: an unchanged shared spec is
+        # not refused for this reason.
+        fake = self.case / "fake-export-budget-a7.ps1"
+        fake.write_text("param([switch]$PreflightBudgetOnly, [string]$ClipId, [string]$Format, [int]$MaxFrames, [long]$DescribeTimeBudgetBytes = -1)\n"
+                        "if ($MaxFrames -gt 19000) { throw \"DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED $MaxFrames frames of $ClipId need a job timeout past the agent's cap\" }\n"
+                        "if ($env:FAKE_MUTATE_SPEC) { Copy-Item -LiteralPath $env:FAKE_MUTATE_FROM -Destination $env:FAKE_MUTATE_SPEC -Force }\n"
+                        "[pscustomobject]@{ jobTimeoutSec = 1 }\n", encoding="utf-8")
+        doc = json.loads((DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"))
+        doc["export"]["maxFrames"] = 480
+        judged_text = json.dumps(doc)
+        doc["export"]["maxFrames"] = 600
+        changed = self.case / "export-a7-changed.json"
+        changed.write_text(json.dumps(doc), encoding="utf-8")
+        spec = self.case / "export-a7.json"
+
+        def reset() -> None:
+            for p in (self.events, self.leg_args, self.claim_path):
+                p.unlink(missing_ok=True)
+            shutil.rmtree(self.run_dir, ignore_errors=True)
+            spec.write_text(judged_text, encoding="utf-8")
+        reset()
+        plan = self.write_plan([self.item(spec, "A", self.commit_a), self.item(spec, "B", self.commit_a)])
+        r = self.run_plan(plan, "-ExportBudgetScript", str(fake), FAKE_MUTATE_SPEC=str(spec), FAKE_MUTATE_FROM=str(changed))
+        out = r.stdout[-3000:] + r.stderr[-3000:]
+        self.assertIn('"maxFrames": 600', spec.read_text(encoding="utf-8"), "the stand-in did not change the spec, so the test proves nothing. " + out)
+        self.assertEqual([k for k in self.kinds() if k.startswith("LEG")], [], "a leg ran on a spec its plan item's recorded arm did not describe. " + out)
+        self.assertFalse((self.run_dir / "batches.jsonl").exists(), "a lease was opened on two items that judged different bytes of one spec. " + out)
+        self.assertEqual(r.returncode, 2, out)
+        self.assertIn("LEG_PLAN_REFUSED reason=SPEC_CHANGED_BETWEEN_PLAN_ITEMS item=2 ", r.stderr, out)
+        reset()
+        r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a), self.item(spec, "B", self.commit_a)]), "-ExportBudgetScript", str(fake))
+        self.assertNotIn("SPEC_CHANGED_BETWEEN_PLAN_ITEMS", r.stderr, "control: an unchanged shared spec. " + r.stdout[-3000:] + r.stderr[-3000:])
 
     def test_r19_b1_the_leg_refuses_spec_bytes_that_are_not_the_ones_the_budget_judged(self) -> None:
         # r19 (sol r18 B1, the dispatch site Invoke-VenueLeg.ps1:225): the bytes the LEG reads are the bytes run, so the leg compares them with -ExpectSpecSha256 and throws
