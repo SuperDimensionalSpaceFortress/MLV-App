@@ -4535,8 +4535,8 @@ UNRESOLVED_EXECUTED_SITES = {
          "($script:VenueClaimShapeModulePath, a literal Join-Path under $PSScriptRoot), which the census scans in its own file. Dot-sourcing it only defines that "
          "predicate, which the read then calls on its manifest claims; nothing here launches a process"),
         (". ([scriptblock]::Create((Get-VenueProcessTreeHelperSource)))",
-         "EXPORT-KILL-DESCENDANT-CONFIRM-1 r1 (adversary A4 on 2223cc4d): inside Invoke-VenueBoundedProcess, before its child starts (r7, sol r6d B2: "
-         "it used to run after the child timed out, inside the cleanup allowance). "
+         "EXPORT-KILL-DESCENDANT-CONFIRM-1 r1 (adversary A4 on 2223cc4d): at the module's top level, once when VenueChain.psm1 loads (r7b, adversary A2 "
+         "on 1413e30f and sol r6d B2: it used to run inside Invoke-VenueBoundedProcess, after the child timed out, inside the cleanup allowance). "
          "Get-VenueProcessTreeHelperSource is this module's own function; it returns the verbatim text of two functions, Get-AttrCudaProcessTreeSnapshot "
          "and Wait-AttrCudaProcessTreeGone, extracted by a regex from the tracked tools/profiling/bachelor/AttrCudaArtifacts.psm1 "
          "($script:VenueProcessTreeModulePath, a literal Join-Path under $PSScriptRoot), which the census scans in its own file. Dot-sourcing them only "

@@ -6021,7 +6021,8 @@ function New-DvHealthProbeJobText {
     # by a computed name closure the ATTR-3 spliced-body scan cannot read, and the scan learns a body only from a LITERAL -Name list in a listed splice source. They are listed
     # here, beside the other read-only venue helper, so the scan reads and clears both bodies (read-only process tables, no write). r7 (sol r6d B3): the probe never calls
     # them, so the text is discarded and the probe carries neither (test_r7_b3_the_health_probe_carries_no_process_tree_helper_and_the_scan_still_reads_both).
-    $null = Get-AttrCudaEmbeddedFunctionSource -Name @('Get-AttrCudaProcessTreeSnapshot', 'Wait-AttrCudaProcessTreeGone')
+    # r7b (adversary A4 on 1413e30f): a read that fails here (the module locked between the two extractions) can never cost the probe, which needs neither body.
+    try { $null = Get-AttrCudaEmbeddedFunctionSource -Name @('Get-AttrCudaProcessTreeSnapshot', 'Wait-AttrCudaProcessTreeGone') } catch { }
     $body = @"
 `$ErrorActionPreference = 'Stop'
 `$AgentRoot = '$root'

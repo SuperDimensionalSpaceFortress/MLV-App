@@ -5195,11 +5195,12 @@ function Wait-AttrCudaProcessTreeGone {
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $survivors = @()
     $lastError = 'no-time-to-confirm'
-    while (($WaitMs - $clock.ElapsedMilliseconds) -ge $scanFloorMs) {
+    # r7b (adversary A3 on 1413e30f): the clock is read to the fraction of a millisecond; ElapsedMilliseconds truncates, so 1200.6 ms read as inside a 1200 ms bound.
+    while (($WaitMs - $clock.Elapsed.TotalMilliseconds) -ge $scanFloorMs) {
         try {
             # r5b fix 2 (adversary A2 on e75704ae): the floor is re-checked at the moment the scan's timeout is granted (the 250 ms sleep and the work since the loop
             # test have used budget), so a scan never starts, or is granted its 1 s minimum, with less than $scanFloorMs left.
-            $remainMs = $WaitMs - $clock.ElapsedMilliseconds
+            $remainMs = $WaitMs - $clock.Elapsed.TotalMilliseconds
             if ($remainMs -lt $scanFloorMs) { break }
             $leftSec = [int][Math]::Floor($remainMs / 1000.0)
             $rows = if ($null -ne $Scan) { @(& $Scan) } else { @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec $leftSec -ErrorAction Stop) }
@@ -5280,7 +5281,7 @@ function Wait-AttrCudaProcessTreeGone {
             $noPidUnder = $null
             foreach ($np in $noPidParents) { if ($expanded.Contains($np) -or $adopted.Contains($np)) { $noPidUnder = $np; break } }
             if ($null -ne $noPidUnder) { $lastError = "descendant-unreadable parent=$noPidUnder" }
-            if ($clock.ElapsedMilliseconds -gt $WaitMs) { $lastError = 'scan-ended-past-the-bound'; break }
+            if ($clock.Elapsed.TotalMilliseconds -gt $WaitMs) { $lastError = 'scan-ended-past-the-bound'; break }
             if ($survivors.Count -eq 0 -and $null -eq $noPidUnder) { return [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }
         } catch { $lastError = "scan-failed: $([string]$_.Exception.Message -replace '\s+', ' ')" }
         $sleepMs = [Math]::Min(250, $WaitMs - $clock.ElapsedMilliseconds - $scanFloorMs)

@@ -2509,12 +2509,12 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         wait_src = ARTIFACTS_MODULE.read_text(encoding="utf-8")
         start = wait_src.index("function Wait-AttrCudaProcessTreeGone")
         body = wait_src[start:wait_src.index("function Get-AttrCudaProcessCpuSnapshot")]
-        self.assertIn("$remainMs = $WaitMs - $clock.ElapsedMilliseconds\n", body)
+        self.assertIn("$remainMs = $WaitMs - $clock.Elapsed.TotalMilliseconds\n", body)
         self.assertIn("if ($remainMs -lt $scanFloorMs) { break }", body, "the floor is re-checked where the scan's timeout is granted")
         self.assertNotIn("[Math]::Max(1,", body, "no 1 s minimum is forced on a scan the budget cannot cover")
         venue = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
         line = next(ln for ln in venue.splitlines() if "Get-AttrCudaProcessTreeSnapshot -RootProcessId $p.Id" in ln)
-        self.assertIn("$grantSec = [int][Math]::Floor(($CleanupWaitMs - $cleanup.ElapsedMilliseconds) / 1000.0); if ($grantSec -ge 1)", line)
+        self.assertIn("$grantSec = [int][Math]::Floor(($CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds) / 1000.0); if ($grantSec -ge 1)", line)
         self.assertNotIn("$leftMs", line, "the snapshot timeout is read at the grant, never from a stored value")
 
     def test_r3_a_new_child_on_a_reused_member_pid_is_a_survivor(self) -> None:
@@ -2542,8 +2542,10 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         got = json.loads(run_pwsh(["-Command",
             "$ErrorActionPreference = 'Stop'\n"
             f"$m = Import-Module '{module}' -Force -DisableNameChecking -PassThru\n"
-            f"$global:fakeSrc = @'\n{fake}\n'@\n"
-            "& $m { function script:Get-VenueProcessTreeHelperSource { Start-Sleep -Milliseconds $global:srcDelay; $global:fakeSrc } }\n"
+            # r7b: the helpers are defined when the module loads, so the fakes replace them in the module's own scope; the old source seam is slowed to prove no
+            # call reads it any more
+            "& $m { " + fake.replace("function Get-", "function script:Get-").replace("function Wait-", "function script:Wait-") + " }\n"
+            "& $m { function script:Get-VenueProcessTreeHelperSource { Start-Sleep -Milliseconds $global:srcDelay; throw 'no call reads the source' } }\n"
             "$exe = (Get-Process -Id $PID).Path; $out = [ordered]@{}\n"
             "foreach ($case in @(@('spent', 1600, 1500), @('left', 1200, 5000))) {\n"
             "    $global:snapCalls = 0; $global:snapTimeout = $null; $global:srcDelay = $case[1]\n"
@@ -2618,32 +2620,52 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         fake = ("function Get-AttrCudaProcessTreeSnapshot { param($RootProcessId, $OperationTimeoutSec) $global:snapCalls++; $global:snapTimeout = $OperationTimeoutSec; "
                 "[pscustomobject]@{ ok = $true; rootProcessId = [int64]$RootProcessId; rootCreationTicks = [int64]1; members = @(); error = $null } }\n"
                 "function Wait-AttrCudaProcessTreeGone { param($Snapshot, $WaitMs) [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }")
+        # r7b (adversary A2 on 1413e30f): r7 loaded the source before Process.Start, which delayed a start its caller had timed against an absolute deadline. The
+        # helpers are now defined once when the module loads: the fakes replace them in the module's own scope, and the old source seam is slowed (and throws) to
+        # prove no call reads it. 'quick': a child that exits at once returns in well under the slow read. A3 on 1413e30f: 'late' is a wait that returns its
+        # confirmation past the one cleanup allowance; that is late evidence and confirms nothing.
+        late_wait = "function script:Wait-AttrCudaProcessTreeGone { param($Snapshot, $WaitMs) if ($global:lateWait) { Start-Sleep -Milliseconds ($WaitMs + 400) }; [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }"
         got = json.loads(run_pwsh(["-Command",
             "$ErrorActionPreference = 'Stop'\n"
             f"$m = Import-Module '{module}' -Force -DisableNameChecking -PassThru\n"
-            f"$global:fakeSrc = @'\n{fake}\n'@\n"
-            "& $m { function script:Get-VenueProcessTreeHelperSource { Start-Sleep -Milliseconds $global:srcDelay; if ($global:srcThrow) { throw 'helper file locked' }; $global:fakeSrc } }\n"
-            "$exe = (Get-Process -Id $PID).Path; $out = [ordered]@{}\n"
-            "foreach ($case in @(@('slow', 1600, 1500, $false), @('broken', 0, 1500, $true))) {\n"
-            "    $global:snapCalls = 0; $global:snapTimeout = $null; $global:srcDelay = $case[1]; $global:srcThrow = $case[3]\n"
+            "$loadedAtImport = & $m { $script:VenueProcessTreeHelpersLoaded }\n"
+            "& $m { " + fake.replace("function Get-", "function script:Get-").split("\n")[0] + " }\n"
+            "& $m { " + late_wait + " }\n"
+            "& $m { function script:Get-VenueProcessTreeHelperSource { Start-Sleep -Milliseconds 3000; throw 'no call reads the source' } }\n"
+            "$exe = (Get-Process -Id $PID).Path; $out = [ordered]@{ loadedAtImport = $loadedAtImport }\n"
+            "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
+            "$q = Invoke-VenueBoundedProcess -FilePath $exe -ArgumentList @('-NoProfile', '-Command', 'exit 0') -TimeoutSec 30 -CleanupWaitMs 1500\n"
+            "$out['quick'] = [ordered]@{ timedOut = $q.timedOut; exit = $q.exit; ms = $sw.ElapsedMilliseconds }\n"
+            "foreach ($case in @(@('slow', $true, $false), @('late', $true, $true), @('broken', $false, $false))) {\n"
+            "    $global:snapCalls = 0; $global:snapTimeout = $null; $global:lateWait = $case[2]; $flag = $case[1]\n"
+            "    & $m { param($f) $script:VenueProcessTreeHelpersLoaded = $f } $flag\n"
             "    $sw = [Diagnostics.Stopwatch]::StartNew()\n"
-            "    $r = Invoke-VenueBoundedProcess -FilePath $exe -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 60') -TimeoutSec 2 -CleanupWaitMs $case[2]\n"
+            "    $r = Invoke-VenueBoundedProcess -FilePath $exe -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 60') -TimeoutSec 2 -CleanupWaitMs 1500\n"
             "    $out[$case[0]] = [ordered]@{ timedOut = $r.timedOut; killConfirmed = $r.killConfirmed; snapCalls = $global:snapCalls; snapTimeout = $global:snapTimeout; ms = $sw.ElapsedMilliseconds }\n"
             "}\n"
             "$out | ConvertTo-Json -Compress -Depth 4"], timeout=300).stdout.strip().splitlines()[-1])
+        self.assertTrue(got["loadedAtImport"], f"the real helpers load with the module: {got}")
+        self.assertFalse(got["quick"]["timedOut"], got)
+        self.assertLess(got["quick"]["ms"], 2500, f"no call reads the helper source before its child starts: {got}")
         self.assertTrue(got["slow"]["timedOut"], got)
         self.assertEqual(got["slow"]["snapCalls"], 1, f"a slow helper-source read never spends the cleanup allowance: {got}")
         self.assertEqual(got["slow"]["snapTimeout"], 1, got)
         self.assertTrue(got["slow"]["killConfirmed"], got)
+        self.assertTrue(got["late"]["timedOut"], got)
+        self.assertFalse(got["late"]["killConfirmed"], f"a confirmation returned past the cleanup allowance confirms nothing: {got}")
         self.assertTrue(got["broken"]["timedOut"], got)
         self.assertEqual(got["broken"]["snapCalls"], 0, got)
-        self.assertFalse(got["broken"]["killConfirmed"], f"a helper source that will not load is an unknown tree, an unconfirmed kill: {got}")
+        self.assertFalse(got["broken"]["killConfirmed"], f"a helper source that did not load is an unknown tree, an unconfirmed kill: {got}")
         self.assertLess(got["broken"]["ms"], 2000 + 1500 + 1500, f"the child is still killed inside the bound: {got}")
         text = module.read_text(encoding="utf-8")
         body = text[text.index("function Invoke-VenueBoundedProcess"):text.index("function Get-VenueDriverScriptMissing")]
-        self.assertEqual(body.count("Get-VenueProcessTreeHelperSource"), 1, "the source is read once per call")
-        self.assertLess(body.index("Get-VenueProcessTreeHelperSource"), body.index("$p = [Diagnostics.Process]::Start($psi)"),
-                        "the helper source is loaded before the child starts, never inside the cleanup allowance")
+        self.assertNotIn("Get-VenueProcessTreeHelperSource", body, "no call reads the helper source: not before its child starts, not inside the cleanup allowance")
+        load = text.index("try { . ([scriptblock]::Create((Get-VenueProcessTreeHelperSource))); $script:VenueProcessTreeHelpersLoaded = $true }")
+        self.assertLess(load, text.index("function Invoke-VenueBoundedProcess"), "the helpers are defined once, at the module's top level")
+        self.assertIn("if ($cleanup.Elapsed.TotalMilliseconds -gt $CleanupWaitMs) { $treeGone = $false }", body)
+        dvr = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("try { $null = Get-AttrCudaEmbeddedFunctionSource -Name @('Get-AttrCudaProcessTreeSnapshot', 'Wait-AttrCudaProcessTreeGone') } catch { }", dvr,
+                      "adversary A4 on 1413e30f: the discarded listing read can never cost the health probe")
 
     def test_r7_b3_the_health_probe_carries_no_process_tree_helper_and_the_scan_still_reads_both(self) -> None:
         """r7, sol r6d B3. DualVenueRunner.psm1 lists the two process-tree helpers by a literal -Name so the ATTR-3 spliced-body scan reads and clears them (forced by
