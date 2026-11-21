@@ -865,6 +865,28 @@ TEST(DualIsoGpuConfigureCache, TheSnapshotBuilderAndThePresenterCopyTheLutGenera
     ASSERT_TRUE(has(mainWindow, "destination->lut_generation=source.lutGeneration;"));
 }
 
+// adversary r13 A1: the snapshot cache key must NOT hold the ISO pattern. The snapshot is a memcpy of the source LUT
+// tables, which do not depend on the pattern, and the texture state carries the pattern separately. A pattern in the key
+// gives every pattern its own snapshot, so a pattern-only change hands the backend new table addresses and its LUT key
+// re-uploads the unchanged tables (the very work this card removes), on the Qt texture-present route.
+TEST(DualIsoGpuConfigureCache, ThePatternIsNotPartOfTheSnapshotCacheKeyButStaysOnTheTextureState)
+{
+    const std::string header = squeezedSource("platform/qt/RenderFrameThread.h");
+    ASSERT_TRUE(!header.empty());
+    ASSERT_TRUE(!has(header, "&&isBright==other.isBright"));
+    // exactly one isBright member is left: the texture state's, which the presenter reads
+    size_t members = 0;
+    for (size_t at = header.find("std::array<int,4>isBright{{0,0,0,0}};"); at != std::string::npos;
+         at = header.find("std::array<int,4>isBright{{0,0,0,0}};", at + 1))
+        ++members;
+    ASSERT_EQ(size_t(1), members);
+    const std::string source = squeezedSource("platform/qt/RenderFrameThread.cpp");
+    ASSERT_TRUE(!source.empty());
+    ASSERT_TRUE(!has(source, "key.isBright[i]=source.is_bright[i];"));
+    // the per-frame pattern still reaches the texture state on every call, hit or miss
+    ASSERT_TRUE(has(source, "destination.isBright[i]=source.is_bright[i];"));
+}
+
 // ---- the DLL harness's alternate pattern (sol r6 B1) ------------------------------------------------------------
 // dll_test.cpp feeds igpu_recon_set_iso_pattern an alternate pattern and expects the output to change. For a truth
 // pattern that equals its own half-swap (1,0,1,0 / 0,1,0,1 / 0,0,0,0 / 1,1,1,1) the alternate was the truth itself,

@@ -811,10 +811,7 @@ makeGpuPlaybackReconTextureLutKey( const llrpGpuPlaybackReconState_t &source,
     key.useAliasMap = source.use_alias_map != 0;
     key.useFullres = source.use_fullres != 0;
     key.chromaSmoothMethod = source.chroma_smooth_method;
-    for( size_t i = 0; i < key.isBright.size(); ++i )
-    {
-        key.isBright[i] = source.is_bright[i];
-    }
+    /* adversary r13 A1: the ISO pattern is not part of the key (see LutSnapshotKey). */
     key.applyDither = source.apply_dither != 0;
     key.processingGeneration = processingGeneration;
     /* adversary r7 A1: tables rewritten in place keep their addresses, so the stamp is part of the key. */
