@@ -18,6 +18,7 @@ Windows-only test below runs that script's pure-function cases (-UnitOnly, no he
 
 from __future__ import annotations
 
+import ast
 import base64
 import contextlib
 import gc
@@ -26,6 +27,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -77,6 +79,19 @@ def _fifo_constant_ms(name: str) -> int:
     return int(match.group(1))
 
 
+CAPTURE_IO_MAX_MS = _fifo_constant_ms("CaptureIoMaxMs")  # the largest bound the helpers accept; the bound every ACCEPT arm uses (see CAPTURE_ACCEPT_BOUND_MS)
+# CI-FLAKE-HEAVY-SLOT-GATE-PLAIN-TASK-CLEANUP-5S-1: a case that asserts a SUCCESS (a finished task, a clean cleanup, the text read back) is
+# measured against the helper's bound from the call's clock, and the worker process it hands the factory to must start its answer, write it
+# and END inside that bound. A typed 5 s therefore made the verdict a statement about the runner (hosted `windows unittest heavy 7/14`,
+# run 44725973056: "capture cleanup abandoned after 5 s: C:\x\a.txt" on a loaded runner). r1 moved the bound to the helper's maximum (60 s)
+# and sol r1 (PR #876) showed that only moved the deadline: a task delayed 61000 ms is still abandoned. Every accept arm of
+# BoundedCaptureIoTests therefore runs with the seam of _accept_region(): the bound ($AcceptMs), the helper's own maximum ($CaptureIoMaxMs)
+# and the worker-start wait ($CaptureWorkerStartMs) are all the largest Int32 millisecond count (24.8 days), so none of the HELPER's own
+# deadlines can elapse inside a unit test. The one deadline that remains is the outer one: run_bounded kills the whole pwsh tree when the
+# case's whole-script budget (pwsh_script_budget_sec) runs out, and that budget charges every accept call CAPTURE_ACCEPT_CALL_CEILING_MS (never
+# less than r1's 125 s). A hang is therefore still a named failure of the case, at that budget. The cases that assert a TIMEOUT keep their
+# small typed bounds, because there the bound is the thing under test.
+CAPTURE_ACCEPT_BOUND_MS = 2**31 - 1
 CAPTURE_WORKER_START_MS = _fifo_constant_ms("CaptureWorkerStartMs")  # a worker may take this long to be ready, before the step's clock
 CAPTURE_WORKER_KILL_MS = _fifo_constant_ms("CaptureWorkerKillMs")  # teardown: each of the job, group and tree kills
 CAPTURE_WORKER_REAP_MS = _fifo_constant_ms("CaptureWorkerReapMs")  # teardown: the reap, and the scratch directory removal
@@ -88,6 +103,12 @@ def capture_call_ceiling_ms(bound_ms: int) -> int:
     return CAPTURE_WORKER_START_MS + bound_ms + 3 * CAPTURE_WORKER_KILL_MS + 2 * CAPTURE_WORKER_REAP_MS + CAPTURE_CEILING_SLACK_MS
 
 
+# r3 (Grok G1): what the whole-script budget charges ONE accept call (a bound of CAPTURE_ACCEPT_BOUND_MS / `$AcceptMs`). The helper's own deadline
+# is gone for an accept arm, so the outer run_bounded budget is the only deadline left, and it must not be tighter than the one r1 allowed
+# (capture_call_ceiling_ms of the helper's 60 s maximum = 125 s). r2 charged a variable bound only the worker start bound (95 s per call).
+CAPTURE_ACCEPT_CALL_CEILING_MS = capture_call_ceiling_ms(CAPTURE_IO_MAX_MS)
+
+
 def max_wait_and_kill_sec(timeout: float) -> float:
     """The longest the wait plus the tree-kill cleanup of run_bounded(timeout=...) may take (what a virtual clock counts)."""
     return timeout + CLEANUP_BOUND_SEC
@@ -96,6 +117,32 @@ def max_wait_and_kill_sec(timeout: float) -> float:
 def max_run_bounded_sec(timeout: float) -> float:
     """The longest run_bounded(timeout=...) may take before it must have raised: every allowance the helper makes, added up once."""
     return max_wait_and_kill_sec(timeout) + CAPTURE_CLOSE_BOUND_SEC + MAX_READ_SEC + CAPTURE_CLEANUP_BOUND_SEC
+
+
+# sol r4 B3: a case's own verdict and teardown only happen if the HOSTED JOB is still alive when run_bounded's budget runs out. The hosted ubuntu
+# shard job is cancelled at its cap (tests.yml `timeout-minutes: 30`, read here from the shard runner that enforces the same number), and the
+# shard runner warns at BUDGET_WARN_SHARE of it. Both are READ from tools/repo_hygiene/ci_unittest_shard.py, never typed; the cap is read, not changed.
+# A generated whole-script budget, plus everything run_bounded may still do after it (max_run_bounded_sec), must fit inside that share, or the
+# job ends the case before the case can name itself. _run_pwsh_script refuses a script above HOSTED_CASE_BUDGET_MAX_SEC before it launches anything.
+_SHARD_SOURCE = (ROOT / "tools" / "repo_hygiene" / "ci_unittest_shard.py").read_text(encoding="utf-8")
+_JOB_CAP_MATCH = re.search(r'(?m)^JOB_CAP_MINUTES = \{[^}\n]*"ubuntu": (\d+)', _SHARD_SOURCE)
+_WARN_SHARE_MATCH = re.search(r"(?m)^BUDGET_WARN_SHARE = ([0-9.]+)\s*$", _SHARD_SOURCE)
+if _JOB_CAP_MATCH is None or _WARN_SHARE_MATCH is None:
+    raise AssertionError("ci_unittest_shard.py no longer defines JOB_CAP_MINUTES (with an ubuntu entry) and BUDGET_WARN_SHARE as plain numbers")
+HOSTED_UBUNTU_JOB_CAP_SEC = int(_JOB_CAP_MATCH.group(1)) * 60  # the tightest hosted cap: the windows jobs have 50 min
+SHARD_BUDGET_WARN_SHARE = float(_WARN_SHARE_MATCH.group(1))
+HOSTED_CASE_BUDGET_MAX_SEC = HOSTED_UBUNTU_JOB_CAP_SEC * SHARD_BUDGET_WARN_SHARE - max_run_bounded_sec(0)
+
+
+def _checked_budget_sec(budget: float, case: str) -> float:
+    """`budget` if a hosted job can wait for it; a refusal (nothing launched) when it is above HOSTED_CASE_BUDGET_MAX_SEC.
+
+    sol r4 B3: the static ceiling only. A job-clock clamp (reading how much of the job is already spent) is not part of this card; it is
+    successor work (HEAVY-SLOT-POSIX-TREE-KILL-HELPER-1)."""
+    if budget > HOSTED_CASE_BUDGET_MAX_SEC:
+        raise AssertionError(f"{case}: the derived whole-script budget of {budget:g} s is above {HOSTED_CASE_BUDGET_MAX_SEC:g} s, the most a "
+                             f"hosted job ({HOSTED_UBUNTU_JOB_CAP_SEC} s cap, warned at {SHARD_BUDGET_WARN_SHARE:g} of it) can wait for; no child was started")
+    return budget
 
 
 # sol r14 B1 / adversary r14 A1 / adversary r15 A1, A2 / hub ruling on r15 A1 (the fifth pass on this class): no cleanup-critical path runs
@@ -229,6 +276,13 @@ def _read_captured(path: Path, *, tolerate_oserror: bool) -> str:
     return str(box["text"])
 
 
+# sol r4 B2 (narrowed r7): POSIX has no taskkill, so a timed-out driver was killed alone. run_bounded starts its child in a session of its own on
+# POSIX (start_new_session) and _kill_tree then sends ONE SIGKILL to that group. The full descendant walk (a setsid'ed capture worker is in a group
+# of its own) and a real-process teardown test are NOT part of this card: they are HEAVY-SLOT-POSIX-TREE-KILL-HELPER-1.
+_IS_POSIX = os.name == "posix"
+_SIGKILL = getattr(signal, "SIGKILL", 9)
+
+
 def _kill_taskkill_child(taskkill: subprocess.Popen, problems: list[str]) -> None:
     """A taskkill that did not exit in time is killed and reaped under its own bound; a hung reap is reported, never waited on."""
     try:
@@ -253,21 +307,30 @@ def _kill_tree(proc: subprocess.Popen) -> str:
     next step, not just OSError / SubprocessError; only an interrupt (not an Exception) propagates.
     """
     problems: list[str] = []
-    try:
-        taskkill = subprocess.Popen(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception as exc:
-        problems.append(f"taskkill failed: {_exc_type_name(exc)}")
+    if _IS_POSIX:
+        # sol r4 B2 (narrowed r7): there is no taskkill on POSIX; the driver leads its own session (run_bounded), so its group gets one SIGKILL.
+        try:
+            os.killpg(proc.pid, _SIGKILL)  # type: ignore[attr-defined]
+        except ProcessLookupError:
+            pass  # the group is already gone
+        except Exception as exc:
+            problems.append(f"process group kill failed: {_exc_type_name(exc)}")
     else:
         try:
-            returncode = taskkill.wait(timeout=TASKKILL_BOUND_SEC)
-            if returncode != 0:
-                problems.append(f"taskkill exited {returncode}")
-        except subprocess.TimeoutExpired:
-            problems.append(f"taskkill failed: it did not exit within {TASKKILL_BOUND_SEC} s")
-            _kill_taskkill_child(taskkill, problems)
+            taskkill = subprocess.Popen(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as exc:
             problems.append(f"taskkill failed: {_exc_type_name(exc)}")
+        else:
+            try:
+                returncode = taskkill.wait(timeout=TASKKILL_BOUND_SEC)
+                if returncode != 0:
+                    problems.append(f"taskkill exited {returncode}")
+            except subprocess.TimeoutExpired:
+                problems.append(f"taskkill failed: it did not exit within {TASKKILL_BOUND_SEC} s")
+                _kill_taskkill_child(taskkill, problems)
+            except Exception as exc:
+                problems.append(f"taskkill failed: {_exc_type_name(exc)}")
     try:
         proc.kill()
     except Exception as exc:
@@ -278,11 +341,17 @@ def _kill_tree(proc: subprocess.Popen) -> str:
         problems.append(f"the root process was still running {ROOT_REAP_SEC} s after the kill")
     except Exception as exc:
         problems.append(f"waiting for the root process failed: {_exc_type_name(exc)}")
-    return "its process tree was killed" if not problems else f"its process tree kill is NOT confirmed ({'; '.join(problems)})"
+    # adversary r8 A2: on POSIX only the driver's own group was signalled (a setsid'ed capture worker is in a group of its own), so the verdict
+    # claims the GROUP there and the whole TREE only where taskkill /T walked it.
+    scope = "process group" if _IS_POSIX else "process tree"
+    return f"its {scope} was killed" if not problems else f"its {scope} kill is NOT confirmed ({'; '.join(problems)})"
 
 
-def run_bounded(argv: list[str], timeout: float, case: str) -> tuple[int, str, str]:
+def run_bounded(argv: list[str], timeout: float, case: str, env: dict[str, str] | None = None) -> tuple[int, str, str]:
     """Run argv under a real wall-clock bound and return (returncode, stdout, stderr).
+
+    `env` is the child's environment (None: inherit). On POSIX the child leads a session of its own, so a timeout can end its whole group and
+    (sol r4 B2, narrowed r7: _kill_tree sends one SIGKILL to that group; the descendant walk is HEAVY-SLOT-POSIX-TREE-KILL-HELPER-1).
 
     subprocess.run(timeout=) is NOT a bound on Windows when the child has children: it kills only the root process and
     then waits in communicate() for the pipes to close, and any surviving grandchild (the suites here start pwsh agents,
@@ -313,7 +382,12 @@ def run_bounded(argv: list[str], timeout: float, case: str) -> tuple[int, str, s
             captures.append(out)
             err = open(err_path, "wb")
             captures.append(err)
-            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err)
+            launch: dict[str, object] = {}
+            if _IS_POSIX:
+                launch["start_new_session"] = True
+            if env is not None:
+                launch["env"] = env
+            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err, **launch)  # type: ignore[arg-type]
             try:
                 proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
@@ -366,7 +440,9 @@ def _pwsh_script_argv(script: str):
 
 
 PWSH_SCRIPT_BASE_SEC = 120  # a bare pwsh start, the compile of the capture type and the script's own end: what a script with NO worker call needs
-_CAPTURE_CALL = re.compile(r"\b(Read-CapturedResult|Read-CapturedText|Remove-CaptureFiles)\b([^\n]*)")
+_CAPTURE_CALL = re.compile(r"(?i)\b(Read-CapturedResult|Read-CapturedText|Remove-CaptureFiles)\b([^\n]*)")  # PowerShell command names are case-insensitive (sol r4)
+# the bound of an accept call on a call line: the seam variable (a pwsh script) or its value (a generated script, e.g. _plain_task_script)
+_ACCEPT_BOUND_ON_CALL_LINE = re.compile(r"(?i)\$AcceptMs\b|(?<![\w$.])" + str(CAPTURE_ACCEPT_BOUND_MS) + r"(?![\w.])")
 _LOOP_BLOCK_HEAD = re.compile(r"(?i)(?:\b(?:foreach|for|while)\s*\([^{}]*\)|\bdo|ForEach-Object)\s*$")
 
 
@@ -390,7 +466,7 @@ def pwsh_script_budget_sec(script: str, repeat: int = 1) -> float:
     capture_call_ceiling_ms(its bound) (the worker start bound, the operation, the teardown bounds, slack). A fixed 120 s therefore failed a
     valid script after four permitted slow starts (the transport case makes 18 calls). The budget is the base allowance plus, for every call
     site in the script body (the helpers' own definitions, before the END marker, are not calls), that call's ceiling; a call line whose bound
-    is a variable is charged the worker start bound. A script that wraps calls in a loop must say how often with `repeat`, so a loop can never
+    is `$AcceptMs` (or its value) is charged CAPTURE_ACCEPT_CALL_CEILING_MS (r3 G1), any other variable bound the worker start bound. A script that wraps calls in a loop must say how often with `repeat`, so a loop can never
     hide calls from the derivation. A genuine hang still ends at the budget: run_bounded kills the whole tree and fails by case name.
     """
     marker = "# END bounded capture io"
@@ -402,7 +478,10 @@ def pwsh_script_budget_sec(script: str, repeat: int = 1) -> float:
         if re.search(r"(?i)\bfunction\s+$", body[:match.start()]):
             continue
         bounds = [int(n) for n in re.findall(r"(?<![\w$.])\d+(?![\w.])", match.group(2)) if 0 < int(n) <= MAX_DECLARED_BOUND_MS]
-        ceiling = capture_call_ceiling_ms(max(bounds) if bounds else CAPTURE_WORKER_START_MS)
+        if _ACCEPT_BOUND_ON_CALL_LINE.search(match.group(2)):
+            ceiling = CAPTURE_ACCEPT_CALL_CEILING_MS  # r3 G1: an accept call is charged the named accept ceiling, not the worker start bound
+        else:
+            ceiling = capture_call_ceiling_ms(max(bounds) if bounds else CAPTURE_WORKER_START_MS)
         if _call_is_inside_a_loop(body, match.start()):
             looped_ms += ceiling
         else:
@@ -421,16 +500,65 @@ def _case_name() -> str:
 
 def _run_pwsh_script(script: str, repeat: int = 1) -> subprocess.CompletedProcess:
     """Run `script` in a bare pwsh under its derived budget; a hang kills the tree and fails by case name (run_bounded)."""
-    budget = pwsh_script_budget_sec(script, repeat)
+    # sol r4 B3: the hosted job would be cancelled before a budget it cannot wait for ran out, so a hung capture would end with no case verdict
+    # and no teardown. Nothing is launched above HOSTED_CASE_BUDGET_MAX_SEC (split the case).
+    budget = _checked_budget_sec(pwsh_script_budget_sec(script, repeat), _case_name())
     with _pwsh_script_argv(script) as argv:
         code, out, err = run_bounded(argv, budget, _case_name())
     return subprocess.CompletedProcess(argv, code, out, err)
+
+
+def _live_assert_less_bounds(source: str, names: set[str]) -> dict[str, list[object]]:
+    """{test name: the literal bounds of its `self.assertLess(x, <literal>, ...)` statements} for the named tests, counting only a statement that
+    is DIRECTLY in the test's body (an assertion inside a dead `if False:` branch is no assertion)."""
+    found: dict[str, list[object]] = {}
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.FunctionDef) and node.name in names:
+            found[node.name] = [stmt.value.args[1].value for stmt in node.body  # type: ignore[attr-defined]
+                                if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call) and isinstance(stmt.value.func, ast.Attribute)
+                                and stmt.value.func.attr == "assertLess" and len(stmt.value.args) >= 2 and isinstance(stmt.value.args[1], ast.Constant)]
+    return found
 
 
 def _fifo_capture_io_region(fifo: str) -> str:
     """The fifo script's bounded capture io helpers, between their BEGIN / END markers, ready to dot-source in a bare pwsh."""
     begin = fifo.index("# BEGIN bounded capture io")
     return fifo[begin:fifo.index("# END bounded capture io")]
+
+
+def _run_argv_bounded(argv: list[str], timeout: float, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    """A child that may start capture workers, under run_bounded (sol r4 B2): a timeout fails by case name and ends the whole tree, the worker
+    included. The stdlib's own run-with-timeout kills the root only, and on POSIX there is no taskkill to cover the rest."""
+    case = _case_name()
+    code, out, err = run_bounded(argv, _checked_budget_sec(timeout, case), case, env)
+    return subprocess.CompletedProcess(argv, code, out, err)
+
+
+# adversary r5 pass 3 A5: the budget derivation scans only what follows this marker (the helpers' own definitions, comments and dormant internal calls
+# are not calls the script makes). A generated region carries it, so a region with no call of its own costs the base allowance and nothing more.
+_END_OF_CAPTURE_REGION = "# END bounded capture io\n"
+
+
+def _raw_region_with_maximum(helper_max_ms: int, worker_start_ms: int = CAPTURE_ACCEPT_BOUND_MS) -> str:
+    """The capture region with NO accept seam on the OPERATION, its helper maximum ($CaptureIoMaxMs) patched down to `helper_max_ms`: the scaled
+    stand-in for a seam that only moved the deadline (r1: the bound was the helper's own maximum).
+
+    sol r4 B1: the worker-start wait ($CaptureWorkerStartMs) is extended to `worker_start_ms` (default: the accept bound, as _accept_region does),
+    because it is no part of the subject here: a slow worker start must never fail the case before its operation is exercised. A caller passes a
+    small value only to show that the seam is what keeps a start error out."""
+    return (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n" + _END_OF_CAPTURE_REGION
+            + f"$CaptureIoMaxMs = {helper_max_ms}\n$CaptureWorkerStartMs = {worker_start_ms}\n")
+
+
+def _accept_region(helper_max_ms: int | None = None) -> str:
+    """The capture region plus the accept-arm seam (sol r2 B1): after the region has defined its bounds, `$AcceptMs`, `$CaptureIoMaxMs` and
+    `$CaptureWorkerStartMs` become CAPTURE_ACCEPT_BOUND_MS, so no deadline of the HELPER can end a success asserted by an accept arm (the outer
+    run_bounded whole-script budget remains). `helper_max_ms` first patches the helper maximum down, as _raw_region_with_maximum does, to
+    prove the seam overrides it (r3 G2)."""
+    region = _fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n" + _END_OF_CAPTURE_REGION
+    if helper_max_ms is not None:
+        region += f"$CaptureIoMaxMs = {helper_max_ms}\n"
+    return region + f"$CaptureIoMaxMs = {CAPTURE_ACCEPT_BOUND_MS}; $CaptureWorkerStartMs = {CAPTURE_ACCEPT_BOUND_MS}; $AcceptMs = {CAPTURE_ACCEPT_BOUND_MS}\n"
 
 
 # sol r12 B1: what a forced end of a pwsh process looks like in code. Neither the bounded capture helpers nor the proof of their exit may use it.
@@ -754,6 +882,102 @@ class BachelorAgentHeavySlotGateUnit(unittest.TestCase):
         self.assertLessEqual(unit["heartbeat"]["capped"], 64)
 
 
+def _windows_kill_path() -> "mock._patch":
+    """adversary r8 A1: a fixture that fakes `taskkill` models the Windows kill path, so it forces that branch of _kill_tree on every host."""
+    return mock.patch.object(sys.modules[__name__], "_IS_POSIX", False)
+
+
+class _WindowsKillPath:
+    """Mixin for a fixture class whose every test fakes `taskkill`: the Windows kill branch is forced for each test (adversary r8 A1)."""
+
+    def setUp(self) -> None:
+        super().setUp()  # type: ignore[misc]
+        patcher = _windows_kill_path()
+        patcher.start()
+        self.addCleanup(patcher.stop)  # type: ignore[attr-defined]
+
+
+class PosixGroupKillTests(unittest.TestCase):
+    """sol r4 B2, narrowed r7: on POSIX run_bounded starts its child in a session of its own and a timeout sends ONE SIGKILL to that group.
+
+    MOCKED, on every OS: nothing here starts or signals a real process tree. A test that proves a real session-escaping descendant dies is not part of
+    this card; it belongs to HEAVY-SLOT-POSIX-TREE-KILL-HELPER-1."""
+
+    def _timed_out_run(self, killpg: object) -> tuple[list[dict], object, str]:
+        module = sys.modules[__name__]
+        launched: list[dict] = []
+
+        class FakeRoot:
+            pid = 424242
+            returncode = 1
+            killed = False
+            waits = 0
+
+            def wait(self, timeout: object = None) -> int:
+                FakeRoot.waits += 1
+                if FakeRoot.waits == 1:
+                    raise subprocess.TimeoutExpired("fake", timeout)  # the run bound
+                return 1  # the reap after the kill
+
+            def kill(self) -> None:
+                FakeRoot.killed = True
+
+        def popen(argv: object, *args: object, **kwargs: object) -> object:
+            launched.append(dict(kwargs))
+            return FakeRoot()
+
+        with mock.patch.object(module, "_IS_POSIX", True), mock.patch.object(os, "killpg", killpg, create=True), \
+                mock.patch.object(subprocess, "Popen", side_effect=popen):
+            with self.assertRaises(AssertionError) as caught:
+                run_bounded(["x"], 1, "posix-group-case")
+        return launched, FakeRoot, str(caught.exception)
+
+    def test_r7_b2_a_posix_timeout_starts_the_child_in_its_own_session_and_sigkills_its_group_once(self) -> None:
+        killpg = mock.Mock()
+        launched, root, message = self._timed_out_run(killpg)
+        self.assertEqual(len(launched), 1, "on POSIX no taskkill is started; the only child is the driver")
+        self.assertTrue(launched[0].get("start_new_session"), "the driver must lead its own session so its group is its own")
+        killpg.assert_called_once_with(424242, sys.modules[__name__]._SIGKILL)
+        self.assertTrue(root.killed, "the driver itself is still killed and reaped after the group")
+        self.assertIn("posix-group-case exceeded its 1 s wall-clock bound", message)
+        # adversary r8 A2: only the driver's group was signalled, so the verdict says GROUP, never "tree" (a setsid'ed worker is in a group of its own)
+        self.assertIn("its process group was killed", message)
+        self.assertNotIn("process tree was killed", message)
+
+    def test_r7_b2_a_group_that_is_already_gone_is_no_problem_and_a_failed_kill_is_named_not_confirmed(self) -> None:
+        _, _, gone = self._timed_out_run(mock.Mock(side_effect=ProcessLookupError(3, "no such process")))
+        self.assertIn("its process group was killed", gone)
+        _, _, denied = self._timed_out_run(mock.Mock(side_effect=PermissionError(1, "not permitted")))
+        self.assertIn("process group kill failed: PermissionError", denied)
+        self.assertIn("its process group kill is NOT confirmed", denied)
+        self.assertIn("posix-group-case exceeded its 1 s wall-clock bound", denied)
+
+
+class WindowsPathFixturesOnAPosixHostTests(unittest.TestCase):
+    """adversary r8 A1: the fixtures that fake `taskkill` model the WINDOWS kill path. On a POSIX host (hosted ubuntu) `_kill_tree` took the group-kill
+    branch for them instead: the fake taskkill was never started, the expected "NOT confirmed" verdicts never appeared, and a fixture's fake pid
+    (4242) was signalled as a real process group. Each fixture class forces the Windows branch in its own setUp."""
+
+    NAMES = (
+        "BoundedRunOutputReadFailureTests.test_a_timeout_keeps_its_case_named_verdict_when_taskkill_hangs_or_fails",
+        "BoundedRunInputRangeTests.test_a_wait_that_raises_after_the_launch_still_kills_the_tree_and_names_the_case",
+        "HostileExceptionRenderingTests.test_a_hostile_exception_in_any_cleanup_phase_keeps_the_case_named_verdict_and_the_root_kill_and_reap",
+        "BoundedCaptureIoTests.test_a_finished_cleanup_adds_no_note_to_the_verdict",
+        "BoundedCleanupTests.test_a_slow_but_successful_taskkill_stays_inside_the_regression_ceiling",
+    )
+
+    def test_r8_a1_the_taskkill_fixtures_pass_on_a_posix_host_and_never_signal_a_process_group(self) -> None:
+        module = sys.modules[__name__]
+        killpg = mock.Mock()
+        suite = unittest.defaultTestLoader.loadTestsFromNames(self.NAMES, module)
+        result = unittest.TestResult()
+        with mock.patch.object(module, "_IS_POSIX", True), mock.patch.object(os, "killpg", killpg, create=True):
+            suite.run(result)
+        self.assertEqual(killpg.call_count, 0, f"a taskkill fixture signalled a process group: {killpg.call_args_list}")
+        self.assertEqual([(str(test), trace) for test, trace in result.failures + result.errors], [])
+        self.assertEqual((result.testsRun, len(result.skipped)), (len(self.NAMES), 0))
+
+
 @unittest.skipUnless(os.name == "nt", "the bound is a Windows process-tree kill")
 class BoundedRunTests(unittest.TestCase):
     """run_bounded fails a hung process tree by case name inside its bound (the old subprocess.run(timeout=) did not)."""
@@ -769,6 +993,45 @@ class BoundedRunTests(unittest.TestCase):
         # successful taskkill (27 s, 31 s, up to its 60 s bound) is not a false CI failure.
         self.assertLess(time.monotonic() - started, max_run_bounded_sec(3) + CLEANUP_MARGIN_SEC)
         self.assertIn("stub-hang-case exceeded its 3 s wall-clock bound", str(caught.exception))
+
+    # ---- CI-FLAKE-HEAVY-SLOT-GATE-PLAIN-TASK-CLEANUP-5S-1 r5 (sol r4 B2, B3, B4) ----
+    def test_r5_b3_a_generated_whole_script_budget_that_the_hosted_job_could_not_wait_for_is_refused_before_any_child(self) -> None:
+        # sol r4 B3: the 18-call transport script's budget was 2465 s on a hosted Ubuntu job that is cancelled at 1800 s, so a hung capture
+        # was ended by the job, with no case-level verdict and no teardown. A generated budget must leave the case's own verdict room inside
+        # the job: _run_pwsh_script refuses (before it launches anything) a budget above HOSTED_CASE_BUDGET_MAX_SEC.
+        module = sys.modules[__name__]
+        region = "function Read-CapturedResult { }\n# END bounded capture io\n"
+        looped = (region + "foreach ($t in $texts) {\n  $r = Read-CapturedResult $p $AcceptMs $ok\n  $r = Read-CapturedResult $p $AcceptMs $bad\n"
+                  "  $n = Remove-CaptureFiles @($p) $AcceptMs $ok\n}\n")
+        with mock.patch.object(module, "run_bounded", return_value=(0, "", "")) as bounded:
+            with self.assertRaises(AssertionError) as refused:
+                _run_pwsh_script(looped, repeat=6)  # the old transport shape: 18 accept calls
+            bounded.assert_not_called()
+        self.assertIn("hosted", str(refused.exception))
+        one = region + "$r = Read-CapturedResult $p $AcceptMs $ok\n"
+        with mock.patch.object(module, "run_bounded", return_value=(0, "", "")) as bounded:
+            _run_pwsh_script(one)
+        self.assertEqual(bounded.call_args.args[1], PWSH_SCRIPT_BASE_SEC + CAPTURE_ACCEPT_CALL_CEILING_MS / 1000)
+        # the limit is derived from the workflow's job cap and the shard budget share, never typed
+        self.assertEqual(HOSTED_UBUNTU_JOB_CAP_SEC, 30 * 60)
+        self.assertLessEqual(max_run_bounded_sec(HOSTED_CASE_BUDGET_MAX_SEC), HOSTED_UBUNTU_JOB_CAP_SEC * SHARD_BUDGET_WARN_SHARE)
+        self.assertLess(pwsh_script_budget_sec(looped, repeat=2), HOSTED_CASE_BUDGET_MAX_SEC, "two texts per script would still fit; six did not")
+
+    def test_r5_b3_the_capture_call_scan_is_case_insensitive_like_powershell(self) -> None:
+        # sol r4 hardening: PowerShell command names are case-insensitive, so a lowercase call must be charged like the recognized spelling.
+        region = "function Read-CapturedResult { }\n# END bounded capture io\n"
+        self.assertEqual(pwsh_script_budget_sec(region + "$r = read-capturedresult $p $acceptms $f\n"), PWSH_SCRIPT_BASE_SEC + CAPTURE_ACCEPT_CALL_CEILING_MS / 1000)
+
+    def test_r5_b4_the_three_existing_timing_assertions_keep_their_original_bounds(self) -> None:
+        # sol r4 B4: the three assertions below were widened from 10 s / 30 s / 30 s to 148 s / 205 s / 148 s, which let a 60 s abandonment pass.
+        # They stay at their original bounds (coverage preservation); a larger ceiling belongs in a NEW test with its own reason.
+        expected = {"test_a_stalled_capture_cleanup_after_a_timeout_returns_the_named_verdict_and_names_the_abandoned_step": 10,
+                    "test_a_stalled_capture_cleanup_after_a_clean_run_returns_the_result_and_warns": 30,
+                    "test_a_capture_close_that_stalls_is_abandoned_inside_its_bound_and_named": 30}
+        self.assertEqual(_live_assert_less_bounds(Path(__file__).read_text(encoding="utf-8"), set(expected)), {name: [bound] for name, bound in expected.items()})
+        # adversary r5 A11: a literal in a dead branch is no assertion; only a direct statement of the test body counts
+        weakened = ("class T:\n    def test_a(self):\n        if False:\n            self.assertLess(elapsed, 10)\n        self.assertLess(elapsed, limit)\n")
+        self.assertEqual(_live_assert_less_bounds(weakened, {"test_a"}), {"test_a": []})
 
     @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
     def test_an_out_of_range_suite_bound_is_refused_at_binding_without_launching_a_child(self) -> None:
@@ -874,7 +1137,7 @@ class BoundedRunTests(unittest.TestCase):
         self.assertEqual((rc, out.strip(), err), (3, "out", "err"))
 
 
-class BoundedRunOutputReadFailureTests(unittest.TestCase):
+class BoundedRunOutputReadFailureTests(_WindowsKillPath, unittest.TestCase):
     """sol r2 BLOCKER: a captured-output read error after a timeout must not replace the case-named timeout verdict.
 
     Injected in memory (no real process, no real sharing violation): wait() raises TimeoutExpired, the tree and root cleanup
@@ -1141,7 +1404,7 @@ class BoundedRunOutputReadFailureTests(unittest.TestCase):
             self.assertIsInstance(caught, PermissionError, f"{name}: {caught!r}")
 
 
-class BoundedRunInputRangeTests(unittest.TestCase):
+class BoundedRunInputRangeTests(_WindowsKillPath, unittest.TestCase):
     """sol r5 B1 (INV-9): an accepted timeout must never bypass the cleanup after the child is launched.
 
     The unusable bounds (1e308, inf, nan) made the Windows wait raise OverflowError / ValueError after the launch, past the
@@ -1241,7 +1504,7 @@ def _hostile_exception(kind: str, calls: list[str]) -> BaseException:
 HOSTILE_KINDS = ("repr_throws", "str_throws", "repr_blocks", "str_blocks")
 
 
-class HostileExceptionRenderingTests(unittest.TestCase):
+class HostileExceptionRenderingTests(_WindowsKillPath, unittest.TestCase):
     """sol r14 B1 / adversary r14 A1: no cleanup-critical path of run_bounded renders an arbitrary exception with repr() / str() / !r.
 
     Sol reproduced it with a real subprocess.Popen audit event: an exception with a throwing __repr__ escaped the taskkill launch handler
@@ -1568,7 +1831,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
         caught: BaseException | None = None
         try:
             with warnings.catch_warnings(record=True) as recorded, mock.patch.object(subprocess, "Popen", side_effect=popen), \
-                    mock.patch.object(shutil, "rmtree", stalled_rmtree), \
+                    _windows_kill_path(), mock.patch.object(shutil, "rmtree", stalled_rmtree), \
                     mock.patch.object(sys.modules[__name__], "CAPTURE_CLEANUP_BOUND_SEC", 0.3):
                 warnings.simplefilter("always")
                 try:
@@ -1626,7 +1889,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
             real_start(thread)
 
         popen = BoundedRunOutputReadFailureTests._popen_for(proc, BoundedRunOutputReadFailureTests._FakeTaskkill(0))
-        with mock.patch.object(subprocess, "Popen", side_effect=popen), mock.patch.object(threading.Thread, "start", start):
+        with mock.patch.object(subprocess, "Popen", side_effect=popen), _windows_kill_path(), mock.patch.object(threading.Thread, "start", start):
             try:
                 run_bounded(["child"], 3, "thread-start-case")
             except BaseException as exc:  # noqa: BLE001 - the verdict type is the assertion
@@ -1660,7 +1923,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
         proc = BoundedRunOutputReadFailureTests._TimedOutProc()
         popen = BoundedRunOutputReadFailureTests._popen_for(proc, BoundedRunOutputReadFailureTests._FakeTaskkill(0))
         try:
-            with mock.patch.object(subprocess, "Popen", side_effect=popen), mock.patch.object(shutil, "rmtree", leave_behind):
+            with mock.patch.object(subprocess, "Popen", side_effect=popen), _windows_kill_path(), mock.patch.object(shutil, "rmtree", leave_behind):
                 with self.assertRaises(AssertionError) as caught:
                     run_bounded(["child"], 3, "left-behind-case")
         finally:
@@ -1748,7 +2011,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
             return CaptureFile(real_open(path, mode, *args, **kwargs))
 
         popen = BoundedRunOutputReadFailureTests._popen_for(proc, BoundedRunOutputReadFailureTests._FakeTaskkill(0))
-        patches = [mock.patch.object(subprocess, "Popen", side_effect=popen),
+        patches = [mock.patch.object(subprocess, "Popen", side_effect=popen), _windows_kill_path(),
                    mock.patch.object(sys.modules[__name__], "open", fake_open, create=True)]
         if close_bound is not None:
             patches.append(mock.patch.object(sys.modules[__name__], "CAPTURE_CLOSE_BOUND_SEC", close_bound))
@@ -1918,7 +2181,8 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertIn("close-case exceeded its 3 s wall-clock bound", str(caught))
 
     def test_a_finished_cleanup_adds_no_note_to_the_verdict(self) -> None:
-        caught = BoundedRunOutputReadFailureTests()._run_failing_cleanup(taskkill=0)
+        with _windows_kill_path():  # a bare instance of the fixture class has had no setUp
+            caught = BoundedRunOutputReadFailureTests()._run_failing_cleanup(taskkill=0)
         self.assertNotIn("capture cleanup", str(caught))
 
     @staticmethod
@@ -2055,15 +2319,15 @@ class BoundedCaptureIoTests(unittest.TestCase):
         # Real pwsh, scaled: the typed base is patched down to 4 s (standing in for the old fixed cap), and every worker start is delayed
         # 2 s (a PERMITTED delay: far under CaptureWorkerStartMs). Three calls then run longer than that base, so a fixed cap of that size
         # fails this script; the derived budget adds the three calls' own ceilings and passes it.
-        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        script = (_accept_region() + "\n"
                   "# END bounded capture io\n"
                   "$real = (Get-Command Start-CaptureWorker -CommandType Function).ScriptBlock\n"
                   "function Start-CaptureWorker { Start-Sleep -Milliseconds 2000; & $real }\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
                   "$f = { param($p) [Threading.Tasks.Task]::FromResult('ok') }\n"
-                  "$r = Read-CapturedResult $p 5000 $f; Write-Output ('ONE|' + $r.Ok + '|' + $r.Text)\n"
-                  "$r = Read-CapturedResult $p 5000 $f; Write-Output ('TWO|' + $r.Ok + '|' + $r.Text)\n"
-                  "$r = Read-CapturedResult $p 5000 $f; Write-Output ('THREE|' + $r.Ok + '|' + $r.Text)\n")
+                  "$r = Read-CapturedResult $p $AcceptMs $f; Write-Output ('ONE|' + $r.Ok + '|' + $r.Text)\n"
+                  "$r = Read-CapturedResult $p $AcceptMs $f; Write-Output ('TWO|' + $r.Ok + '|' + $r.Text)\n"
+                  "$r = Read-CapturedResult $p $AcceptMs $f; Write-Output ('THREE|' + $r.Ok + '|' + $r.Text)\n")
         base = 4
         started = time.monotonic()
         with mock.patch(f"{__name__}.PWSH_SCRIPT_BASE_SEC", base):
@@ -2086,15 +2350,17 @@ class BoundedCaptureIoTests(unittest.TestCase):
                 raise FileNotFoundError(2, "taskkill is not installed")
             return real_popen(argv, *args, **kwargs)
 
-        for label, patch in (("host taskkill", mock.patch.object(subprocess, "Popen", real_popen)),
-                             ("taskkill missing", mock.patch.object(subprocess, "Popen", without_taskkill))):
-            with self.subTest(label), patch:
+        # adversary r8 A1/A2: on a POSIX host the first pass takes the group-kill branch (verdict: "process group"); the second pass is the Windows
+        # branch with taskkill missing, so it forces that branch (a POSIX driver would otherwise be killed by group and never ask for taskkill).
+        for label, patch, windows_branch in (("host taskkill", mock.patch.object(subprocess, "Popen", real_popen), contextlib.nullcontext()),
+                                             ("taskkill missing", mock.patch.object(subprocess, "Popen", without_taskkill), _windows_kill_path())):
+            with self.subTest(label), patch, windows_branch:
                 with mock.patch(f"{__name__}.PWSH_SCRIPT_BASE_SEC", 3):
                     with self.assertRaises(AssertionError) as caught:
                         _run_pwsh_script("Start-Sleep -Seconds 600\n")
                 message = str(caught.exception)
                 self.assertIn("test_r16_c1_a_genuine_hang_still_fails_by_case_name_at_the_budget exceeded its 3 s wall-clock bound", message)
-                self.assertTrue("its process tree was killed" in message
+                self.assertTrue("its process tree was killed" in message or "its process group was killed" in message
                                 or "its process tree kill is NOT confirmed (taskkill failed: FileNotFoundError)" in message, message)
                 if label == "taskkill missing":
                     self.assertIn("kill is NOT confirmed (taskkill failed: FileNotFoundError)", message)
@@ -2103,7 +2369,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
     def test_a_factory_that_consumes_the_bound_before_returning_a_completed_task_is_a_timeout_not_a_late_success(self) -> None:
         # sol r9 B1 (catalogue B-01): an expired budget used to become Wait(0), and an already-completed task then returned success even
         # though its factory had spent the whole bound. The deadline is measured from the call's start: elapsed >= bound is a timeout.
-        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        script = (_accept_region() + "\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"   # native path: a drive-letter literal is not split on Linux (r11)
                   "$slowText = { param($p) Start-Sleep -Milliseconds 300; [Threading.Tasks.Task]::FromResult('payload') }\n"
                   "$slowDel = { param($p) Start-Sleep -Milliseconds 300; [Threading.Tasks.Task]::FromResult('') }\n"
@@ -2112,9 +2378,9 @@ class BoundedCaptureIoTests(unittest.TestCase):
                   "$r = Read-CapturedResult $p 50 $slowText\n"
                   "Write-Output ('LATE-READ|' + $r.Ok + '|' + $r.Text)\n"
                   "Write-Output ('LATE-DEL|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 50 $slowDel))\n"
-                  "$r = Read-CapturedResult $p 5000 $fastText\n"
+                  "$r = Read-CapturedResult $p $AcceptMs $fastText\n"
                   "Write-Output ('FAST-READ|' + $r.Ok + '|' + $r.Text)\n"
-                  "Write-Output ('FAST-DEL|[' + (Remove-CaptureFiles @('C:\\x\\a.txt') 5000 $fastDel) + ']')\n")
+                  "Write-Output ('FAST-DEL|[' + (Remove-CaptureFiles @('C:\\x\\a.txt') $AcceptMs $fastDel) + ']')\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("LATE-READ|False|<read timed out: a.txt not readable within 50 ms>", proc.stdout)
@@ -2129,16 +2395,16 @@ class BoundedCaptureIoTests(unittest.TestCase):
         # The slow ToString makes the conversion cost deterministic. The check is the LAST step before a success is returned.
         # r13 (sol r12 B1): the factory and the conversion run in a worker PROCESS, so the slow type is defined inside the factory itself
         # (a PowerShell class: no compile, and a type of the calling process is not visible in the worker).
-        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        script = (_accept_region() + "\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"   # native path (r11): see the leaf-name guard test
                   "$slow = { param($p) class SlowText { [string] ToString() { [Threading.Thread]::Sleep(300); return 'payload' } }; "
                   "[Threading.Tasks.Task]::FromResult([object][SlowText]::new()) }\n"
                   "$r = Read-CapturedResult $p 100 $slow\n"
                   "Write-Output ('SLOW-READ|' + $r.Ok + '|' + $r.Text)\n"
                   "Write-Output ('SLOW-DEL|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 100 $slow))\n"
-                  "$r = Read-CapturedResult $p 5000 $slow\n"
+                  "$r = Read-CapturedResult $p $AcceptMs $slow\n"
                   "Write-Output ('INSIDE-READ|' + $r.Ok + '|' + $r.Text)\n"
-                  "Write-Output ('INSIDE-DEL|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 5000 $slow))\n")
+                  "Write-Output ('INSIDE-DEL|' + (Remove-CaptureFiles @('C:\\x\\a.txt') $AcceptMs $slow))\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("SLOW-READ|False|<read timed out: a.txt not readable within 100 ms>", proc.stdout)
@@ -2156,24 +2422,42 @@ class BoundedCaptureIoTests(unittest.TestCase):
             name = chunk.split("(", 1)[0]
             if name.startswith("test_a_test_that_asserts_a_leaf_name"):
                 continue
-            if "<read timed out: " in chunk and re.search(r"Read-Captured(?:Result|Text) '[A-Za-z]:\\\\", chunk):
+            # adversary r1 A1: _plain_task_script builds the reads whose timeout text the forced-slow case asserts, so it is leaf-asserting too.
+            if ("<read timed out: " in chunk or name == "_plain_task_script") and re.search(r"Read-Captured(?:Result|Text) '[A-Za-z]:\\\\", chunk):
                 offenders.append(name)
         self.assertEqual(offenders, [], "a leaf-asserting test feeds Read-Captured* a drive-letter literal; use a Join-Path temp path")
+
+    @staticmethod
+    def _plain_task_script(bound_ms: int | str, factory_delay_ms: int = 0, region: str | None = None) -> str:
+        """The plain-completed-task arms at `bound_ms` (a number, or the name of a pwsh variable such as `$AcceptMs`). `factory_delay_ms` is the
+        forced-slow seam: every factory spends that long before it hands back its task, the way a loaded runner spends it starting the worker
+        and finishing the call. `region` replaces the default accept region (r3 G2: the raw region with a patched-down maximum)."""
+        slow = f"Start-Sleep -Milliseconds {factory_delay_ms}; " if factory_delay_ms else ""
+        # The reads take a NATIVE path (Join-Path): the reader names the leaf with GetFileName, which is 'a.txt' for 'C:\x\a.txt' on Windows but
+        # the whole literal on Linux (the r11 leaf-name rule), and the forced-slow case asserts that leaf in its timeout text.
+        return ((region if region is not None else _accept_region()) + "\n"
+                "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
+                f"$plain = {{ param($p) {slow}[Threading.Tasks.Task]::CompletedTask }}\n"
+                f"$ran = {{ param($p) {slow}[Threading.Tasks.Task]::Delay(1) }}\n"
+                f"Write-Output ('PLAIN-DEL|[' + (Remove-CaptureFiles @('C:\\x\\a.txt') {bound_ms} $plain) + ']')\n"
+                f"Write-Output ('RUN-DEL|[' + (Remove-CaptureFiles @('C:\\x\\a.txt') {bound_ms} $ran) + ']')\n"
+                f"$r = Read-CapturedResult $p {bound_ms} $plain\n"
+                "Write-Output ('PLAIN-READ|' + $r.Ok + '|[' + $r.Text + ']')\n"
+                f"$r = Read-CapturedResult $p {bound_ms} $ran\n"
+                "Write-Output ('RUN-READ|' + $r.Ok + '|[' + $r.Text + ']')\n")
+
+    def test_r7_g4_the_generated_plain_task_assignment_is_spaced_like_every_other_assignment(self) -> None:
+        # Grok G4: the generator line emitted `$plain ={ ...` (no space after `=`) while every sibling line emits `$name = {`.
+        script = self._plain_task_script(CAPTURE_ACCEPT_BOUND_MS)
+        self.assertIn("$plain = { param($p) [Threading.Tasks.Task]::CompletedTask }\n", script)
+        self.assertNotIn("$plain ={", script)
 
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_an_accepted_plain_completed_task_has_no_result_so_no_false_cleanup_problem_and_no_fabricated_text(self) -> None:
         # sol r9 B2: a plain [Task]::CompletedTask exposes the runtime type System.Threading.Tasks.VoidTaskResult as its Result. A non-generic
         # Task has no result: cleanup reports no problem and the reader returns empty text, never the type name.
-        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
-                  "$plain = { param($p) [Threading.Tasks.Task]::CompletedTask }\n"
-                  "$ran = { param($p) [Threading.Tasks.Task]::Delay(1) }\n"
-                  "Write-Output ('PLAIN-DEL|[' + (Remove-CaptureFiles @('C:\\x\\a.txt') 5000 $plain) + ']')\n"
-                  "Write-Output ('RUN-DEL|[' + (Remove-CaptureFiles @('C:\\x\\a.txt') 5000 $ran) + ']')\n"
-                  "$r = Read-CapturedResult 'C:\\x\\a.txt' 5000 $plain\n"
-                  "Write-Output ('PLAIN-READ|' + $r.Ok + '|[' + $r.Text + ']')\n"
-                  "$r = Read-CapturedResult 'C:\\x\\a.txt' 5000 $ran\n"
-                  "Write-Output ('RUN-READ|' + $r.Ok + '|[' + $r.Text + ']')\n")
-        proc = self._pwsh(script)
+        # CI-FLAKE-HEAVY-SLOT-GATE-PLAIN-TASK-CLEANUP-5S-1: an ACCEPT arm, so it runs at CAPTURE_ACCEPT_BOUND_MS (see its comment).
+        proc = self._pwsh(self._plain_task_script(CAPTURE_ACCEPT_BOUND_MS))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertNotIn("VoidTaskResult", proc.stdout)
         self.assertIn("PLAIN-DEL|[]", proc.stdout)
@@ -2182,25 +2466,175 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertIn("RUN-READ|True|[]", proc.stdout)
 
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_the_plain_task_arms_pass_under_a_forced_slow_seam_only_because_their_bound_cannot_elapse(self) -> None:
+        # CI-FLAKE-HEAVY-SLOT-GATE-PLAIN-TASK-CLEANUP-5S-1 RED/GREEN, without a real wait of a second: every factory is forced to spend 400 ms
+        # (a loaded runner's start/finish latency, scaled down). Under a bound that latency can exceed (300 ms: the old typed 5 s and equally the
+        # r1 bound of 60 s, the helper's own maximum, which a 61 s latency crosses; both scaled to a bound under the seam's 400 ms) the arms are
+        # ABANDONED, so the success the accept test asserts was a statement about the runner; under the accept bound (CAPTURE_ACCEPT_BOUND_MS,
+        # no helper deadline) the same slow seam still yields every clean verdict. sol r2 B1 made the second half true for 61 s, not only 5 s.
+        slow_ms = 400
+        self.assertLess(slow_ms, 1000, "a case in this class never performs a real wait of a second")
+        red = self._pwsh(self._plain_task_script(300, factory_delay_ms=slow_ms))
+        self.assertEqual(red.returncode, 0, red.stdout + red.stderr)
+        self.assertIn("PLAIN-DEL|[capture cleanup abandoned after 0.3 s: C:\\x\\a.txt]", red.stdout, "the slow seam must really be able to trip a small bound")
+        self.assertIn("PLAIN-READ|False|[<read timed out: a.txt not readable within 300 ms>]", red.stdout)
+        green = self._pwsh(self._plain_task_script(CAPTURE_ACCEPT_BOUND_MS, factory_delay_ms=slow_ms))
+        self.assertEqual(green.returncode, 0, green.stdout + green.stderr)
+        for row in ("PLAIN-DEL|[]", "RUN-DEL|[]", "PLAIN-READ|True|[]", "RUN-READ|True|[]"):
+            self.assertIn(row, green.stdout)
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_r3_g2_a_delay_past_the_helper_maximum_abandons_a_raw_read_and_not_an_accept_arm(self) -> None:
+        # r3 (Grok G2), executable and scaled: the helper maximum is patched down to 300 ms, and the factory delay is taken from the bound it
+        # must defeat (maximum + margin), never a fixed constant. In the RAW region (r1's seam: the bound IS the helper maximum) a read that
+        # delayed past it is ABANDONED, which is the sol r1 escape (61000 ms past 60000 ms), without a real wait of a second. The same delay
+        # under _accept_region() (with the same patched maximum, which the seam must override) yields every clean row. A seam that only moved
+        # the deadline (the accept bound = the helper maximum) fails the second half.
+        maximum_ms, margin_ms = 300, 100
+        slow_ms = maximum_ms + margin_ms
+        self.assertLess(slow_ms, 1000, "a case in this class never performs a real wait of a second")
+        raw = self._pwsh(self._plain_task_script("$CaptureIoMaxMs", factory_delay_ms=slow_ms, region=_raw_region_with_maximum(maximum_ms)))
+        self.assertEqual(raw.returncode, 0, raw.stdout + raw.stderr)
+        self.assertIn(f"PLAIN-DEL|[capture cleanup abandoned after {maximum_ms / 1000:g} s: C:\\x\\a.txt]", raw.stdout, "the delay must cross the patched maximum")
+        self.assertIn(f"PLAIN-READ|False|[<read timed out: a.txt not readable within {maximum_ms} ms>]", raw.stdout)
+        accept = self._pwsh(self._plain_task_script("$AcceptMs", factory_delay_ms=slow_ms, region=_accept_region(helper_max_ms=maximum_ms)))
+        self.assertEqual(accept.returncode, 0, accept.stdout + accept.stderr)
+        for row in ("PLAIN-DEL|[]", "RUN-DEL|[]", "PLAIN-READ|True|[]", "RUN-READ|True|[]"):
+            self.assertIn(row, accept.stdout)
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_r5_b1_the_raw_g2_arm_carries_the_same_extended_worker_start_seam_as_every_accept_arm(self) -> None:
+        # sol r4 B1: the G2 control's RAW arm kept the 30 s worker-start wait ($CaptureWorkerStartMs), so a runner that started the worker in 31 s
+        # failed G2 with "the capture worker was not ready within 30000 ms" before the forced-slow operation ran: the runner-speed dependency
+        # G2 exists to remove. The raw arm now extends ONLY the start wait (its helper maximum stays the patched-down one: that is the
+        # subject), exactly as _accept_region does. Source half: the LAST assignment in each region is the accept bound.
+        for label, region in (("raw", _raw_region_with_maximum(300)), ("accept", _accept_region(helper_max_ms=300))):
+            self.assertEqual(re.findall(r"\$CaptureWorkerStartMs = (\d+)", region)[-1], str(CAPTURE_ACCEPT_BOUND_MS), label)
+        # Executed half, DETERMINISTIC (adversary r5 A7: a 1 ms start wait is no control, because Start-CaptureWorker tests the ready FILE before
+        # the clock, so a worker published before the parent is scheduled again skips the deadline): a real pwsh reports the values the helpers
+        # will actually read once the region is dot-sourced, the raw arm's maximum staying the patched-down one and only its start wait moving.
+        probe = "\nWrite-Output ('SEAM|' + $CaptureWorkerStartMs + '|' + $CaptureIoMaxMs)\n"
+        for label, region, expected in (("raw", _raw_region_with_maximum(300), f"SEAM|{CAPTURE_ACCEPT_BOUND_MS}|300"),
+                                        ("raw with a start wait", _raw_region_with_maximum(300, worker_start_ms=1234), "SEAM|1234|300"),
+                                        ("accept", _accept_region(helper_max_ms=300), f"SEAM|{CAPTURE_ACCEPT_BOUND_MS}|{CAPTURE_ACCEPT_BOUND_MS}")):
+            proc = self._pwsh(region + probe)
+            self.assertEqual(proc.returncode, 0, label + proc.stdout + proc.stderr)
+            self.assertIn(expected, proc.stdout, label)
+        # and the worker-start check the seam feeds is the one Start-CaptureWorker enforces (the r15 B3 source pin, repeated where G2 lives)
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        begin = fifo.index("function Start-CaptureWorker")
+        self.assertIn("-ge $CaptureWorkerStartMs", fifo[begin:fifo.index("function Get-CaptureTaskResult", begin)])
+
+    def test_r3_g1_one_accept_call_is_charged_no_less_than_the_r1_ceiling_by_the_whole_script_budget(self) -> None:
+        # r3 (Grok G1): the whole-script budget is the one deadline an accept arm still has (run_bounded kills the tree there). r2 charged a call
+        # whose bound is a variable the worker start bound only (95 s), below r1's 125 s. A script with exactly one `$AcceptMs` call is pinned to
+        # the named accept ceiling, so the charge cannot shrink silently again; so is a generated script that embeds the accept bound's value.
+        self.assertGreaterEqual(CAPTURE_ACCEPT_CALL_CEILING_MS, capture_call_ceiling_ms(CAPTURE_IO_MAX_MS))
+        self.assertGreaterEqual(CAPTURE_ACCEPT_CALL_CEILING_MS, 125_000, "r1's per-call charge for the helper's 60 s maximum")
+        self.assertGreater(CAPTURE_ACCEPT_CALL_CEILING_MS, capture_call_ceiling_ms(CAPTURE_WORKER_START_MS), "r2's per-call charge (95 s), which was too small")
+        region = "function Read-CapturedResult { }\n# END bounded capture io\n"
+        one = region + "$r = Read-CapturedResult $p $AcceptMs $f\n"
+        self.assertEqual(pwsh_script_budget_sec(one), PWSH_SCRIPT_BASE_SEC + CAPTURE_ACCEPT_CALL_CEILING_MS / 1000)
+        self.assertEqual(pwsh_script_budget_sec(region + "$n = Remove-CaptureFiles @($p) $AcceptMs $f\n"), PWSH_SCRIPT_BASE_SEC + CAPTURE_ACCEPT_CALL_CEILING_MS / 1000)
+        generated = region + f"$r = Read-CapturedResult $p {CAPTURE_ACCEPT_BOUND_MS} $f\n"
+        self.assertEqual(pwsh_script_budget_sec(generated), PWSH_SCRIPT_BASE_SEC + CAPTURE_ACCEPT_CALL_CEILING_MS / 1000)
+        two = one + "$r = Read-CapturedResult $p $AcceptMs $f\n"
+        self.assertEqual(pwsh_script_budget_sec(two), PWSH_SCRIPT_BASE_SEC + 2 * CAPTURE_ACCEPT_CALL_CEILING_MS / 1000)
+
+    def test_the_accept_bound_is_no_deadline_a_runner_delay_can_cross(self) -> None:
+        # CI-FLAKE-HEAVY-SLOT-GATE-PLAIN-TASK-CLEANUP-5S-1 r2 (sol r1 blocker): 5 s -> 60 s only moved the real deadline. A success verdict that
+        # is measured against ANY real deadline of the helper is still a statement about the runner (a task delayed 61000 ms under a 60000 ms
+        # bound is abandoned). The accept arms therefore run with the seam of _accept_region: the bound and the worker-start wait are both raised
+        # past anything a case can wait out, so a slow success is never turned red by the helper. The one deadline left is the outer run_bounded
+        # budget (pwsh_script_budget_sec): a hang is still a named failure of the case there.
+        self.assertGreater(CAPTURE_ACCEPT_BOUND_MS, CAPTURE_IO_MAX_MS, "the accept bound is the helper's maximum, which is itself a real deadline")
+        self.assertLessEqual(CAPTURE_ACCEPT_BOUND_MS, 2**31 - 1, "an [int] bound: Task.Wait / WaitForExit take an Int32")
+        seam = _accept_region()
+        self.assertIn(f"$CaptureIoMaxMs = {CAPTURE_ACCEPT_BOUND_MS}", seam)
+        self.assertIn(f"$CaptureWorkerStartMs = {CAPTURE_ACCEPT_BOUND_MS}", seam)
+        self.assertIn(f"$AcceptMs = {CAPTURE_ACCEPT_BOUND_MS}", seam)
+        self.assertGreater(seam.rindex("$CaptureIoMaxMs = "), seam.index("$CaptureIoMaxMs = " + str(CAPTURE_IO_MAX_MS)), "the override must come AFTER the region defines the variable")
+
+    def test_no_accept_arm_of_the_bounded_capture_io_cases_carries_a_wall_clock_dependent_bound(self) -> None:
+        # CI-FLAKE-HEAVY-SLOT-GATE-PLAIN-TASK-CLEANUP-5S-1 guard, source pin (every OS). In this class a bound of a second or more on a
+        # Read-Captured* / Remove-CaptureFiles call is an ACCEPT arm (a success is asserted against it) and must be CAPTURE_ACCEPT_BOUND_MS: a
+        # typed 5 s / 10 s / 20 s lets a loaded runner turn the success into an abandonment. The timeout cases use bounds under a second.
+        # And no case of the class performs a real wait of a second or more: a Start-Sleep / Thread.Sleep / Task.Delay / time.sleep literal of
+        # 1000 ms or more is allowed only where it is never waited out (a factory killed at its small bound, a hang killed at its budget, a
+        # deliberately slow worker start) and is named in _ALLOWED_LONG_SLEEPS with the reason.
+        source = Path(__file__).read_text(encoding="utf-8")
+        start = source.index("class BoundedCaptureIoTests(")
+        body = source[start:source.index("\nclass BoundedCleanupTests(")]
+        bounds = []
+        for chunk in re.split(r"\n    (?:@[^\n]*\n    )*def ", body):
+            name = chunk.split("(", 1)[0]
+            if name.startswith("test_no_accept_arm_of_the_bounded_capture_io_cases"):
+                continue
+            # PowerShell command names are case-insensitive; a generator call (_plain_task_script) carries its bound as a Python argument.
+            for match in re.finditer(r"(?i)(?:Read-Captured(?:Result|Text)|Remove-CaptureFiles)\b([^\n]*)|_plain_task_script\(([^\n]*)", chunk):
+                for number in re.findall(r"(?<![\w$.])(\d+)(?![\w.])", match.group(1) or match.group(2)):
+                    # sol r2 B1: NO typed number of a second or more is an accept arm's bound, the helper's own maximum included (60000 was
+                    # accepted here and is still a real deadline). An accept arm passes `$AcceptMs` (or CAPTURE_ACCEPT_BOUND_MS from Python).
+                    if 1000 <= int(number) <= MAX_DECLARED_BOUND_MS and name not in self._LONG_BOUND_EXEMPT:
+                        bounds.append(f"{name}: {number}")
+        self.assertEqual(bounds, [], "an accept arm passes a typed bound; use $AcceptMs (the seam of _accept_region), which no helper deadline can end")
+        waits = []
+        for chunk in re.split(r"\n    (?:@[^\n]*\n    )*def ", body):
+            name = chunk.split("(", 1)[0]
+            if name.startswith("test_no_accept_arm_of_the_bounded_capture_io_cases") or name in self._ALLOWED_LONG_SLEEPS:
+                continue
+            for line in chunk.splitlines():
+                if line.lstrip().startswith("#"):
+                    continue
+                for match in re.finditer(r"(?i)Start-Sleep\s+-Milliseconds\s+(\d+)|Start-Sleep\s+-Seconds\s+(\d+)|Sleep\s*\(\s*(\d+)\s*\)|Task\]::Delay\s*\(\s*(\d+)\s*\)|time\.sleep\s*\(\s*([\d.]+)\s*\)"
+                                         r"|factory_delay_ms=(\d+)", line):
+                    ms, sec, thread_ms, delay_ms, py_sec, seam_ms = match.groups()
+                    millis = (int(ms) if ms else int(sec) * 1000 if sec else int(thread_ms) if thread_ms else int(delay_ms) if delay_ms
+                              else int(seam_ms) if seam_ms else float(py_sec) * 1000)
+                    if millis >= 1000 and "$sw.ElapsedMilliseconds -lt" not in line:
+                        waits.append(f"{name}: {line.strip()[:90]}")
+        self.assertEqual(waits, [], "a BoundedCaptureIoTests case waits a second or more for real; name it in _ALLOWED_LONG_SLEEPS with why it is never waited out")
+
+    # Cases that legitimately carry a sleep literal of a second or more, because it is never waited out: the worker is killed at the case's small
+    # bound, or the hang is killed at its budget (the reason is the case's own comment). A case NOT listed here may not add one.
+    _ALLOWED_LONG_SLEEPS = frozenset({
+        "test_r16_c1_a_script_whose_permitted_slow_worker_starts_outlast_the_old_fixed_cap_still_passes",  # the scaled slow-start case: its 2 s start delay IS the subject
+        "test_r16_c1_a_genuine_hang_still_fails_by_case_name_at_the_budget",  # a 600 s sleep killed at a 3 s budget
+        "test_a_synchronous_factory_or_result_conversion_that_outlasts_the_bound_returns_the_named_timeout_inside_a_generous_ceiling",  # Sleep(ceiling+slack) killed at a 50 ms bound
+        "test_a_factory_that_never_returns_still_gets_the_named_timeout_and_the_process_still_exits",  # Sleep(Infinite) killed at a 200 ms bound
+        "test_a_result_conversion_that_never_returns_still_gets_the_named_timeout_and_the_process_still_exits",
+        # a 600 s sleeper the factory starts so the teardown has a descendant to reap; the case polls until it is gone and never waits it out
+        "test_a_process_orphaned_by_an_ended_intermediate_still_ends_with_the_worker",
+        "test_a_process_the_factory_started_ends_with_the_worker_even_when_the_worker_ended_first",
+        "_run_worker_driver",
+    })
+    # Cases whose long literal is not an accept arm's bound: the budget arithmetic feeds the text of a call to a PURE function (nothing runs).
+    # (sol r2 B1: the orphan case was exempt for its typed 40 s bound; it is an accept arm like the rest and now passes $AcceptMs.)
+    _LONG_BOUND_EXEMPT = frozenset({
+        "test_r16_c1_the_whole_script_budget_is_derived_from_the_calls_the_script_makes",
+        "test_r3_g1_one_accept_call_is_charged_no_less_than_the_r1_ceiling_by_the_whole_script_budget",  # pins the budget arithmetic; `/ 1000` is ms -> s, not a bound
+    })
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_a_task_that_derives_from_task_of_string_keeps_its_result_in_both_callers(self) -> None:
         # sol r11 B1: Get-CaptureTaskResult asked the RUNTIME type whether it is generic. A class derived from Task<string> is not
         # (IsGenericType is False) yet carries a real result, so the reader returned Ok with empty text and the cleanup reported success
         # over 'still present: a.txt'. The generic base is now found by walking the BaseType chain. The ordinary Task<string> is the control.
         # r13 (sol r12 B1): the derived type is defined inside each factory (the factory runs in a worker process of its own).
         derived_type = "class DerivedTextTask : System.Threading.Tasks.Task[string] { DerivedTextTask([Func[string]]$f) : base($f) {} }; "
-        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        script = (_accept_region() + "\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
                   "$derived = { param($p) " + derived_type + "$t = [DerivedTextTask]::new([Func[string]]{ 'payload' }); $t.RunSynchronously(); $t }\n"
                   "$derivedDel = { param($p) " + derived_type + "$t = [DerivedTextTask]::new([Func[string]]{ 'still present: a.txt' }); $t.RunSynchronously(); $t }\n"
                   "$plain = { param($p) [Threading.Tasks.Task]::FromResult('payload') }\n"
                   "$plainDel = { param($p) [Threading.Tasks.Task]::FromResult('still present: a.txt') }\n"
                   "Write-Output ('DERIVED-TYPE|' + (& $derived $p).GetType().IsGenericType)\n"
-                  "$r = Read-CapturedResult $p 5000 $derived\n"
+                  "$r = Read-CapturedResult $p $AcceptMs $derived\n"
                   "Write-Output ('DERIVED-READ|' + $r.Ok + '|' + $r.Text)\n"
-                  "Write-Output ('DERIVED-DEL|' + (Remove-CaptureFiles @($p) 5000 $derivedDel))\n"
-                  "$r = Read-CapturedResult $p 5000 $plain\n"
+                  "Write-Output ('DERIVED-DEL|' + (Remove-CaptureFiles @($p) $AcceptMs $derivedDel))\n"
+                  "$r = Read-CapturedResult $p $AcceptMs $plain\n"
                   "Write-Output ('PLAIN-READ|' + $r.Ok + '|' + $r.Text)\n"
-                  "Write-Output ('PLAIN-DEL|' + (Remove-CaptureFiles @($p) 5000 $plainDel))\n")
+                  "Write-Output ('PLAIN-DEL|' + (Remove-CaptureFiles @($p) $AcceptMs $plainDel))\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("DERIVED-TYPE|False", proc.stdout, "the repro must really be a non-generic runtime type")
@@ -2297,39 +2731,40 @@ class BoundedCaptureIoTests(unittest.TestCase):
         # adversary r13 A1: the r13 worker's JSON transport turned an ISO date string into a DateTime, so '2026-11-04T12:00:00Z' came back as
         # '11/04/2026 12:00:00' with Ok=True. Each text is rebuilt in the factory from its code units (the factory is self-contained), and
         # must come back code unit for code unit through the reader's text, the reader's failure and the cleanup's note.
-        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
-                  "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
-                  "$texts = @('2026-11-04T12:00:00Z', '{\"a\":1}', ' padded ', 'true', ('nul' + [char]0 + 'x'), ([string][char]0x00e9 + [char]0xD800 + 'z'))\n"
-                  "$i = 0\n"
-                  "foreach ($t in $texts) {\n"
-                  "  $units = ($t.ToCharArray() | ForEach-Object { [int]$_ }) -join ','\n"
-                  "  $make = '[string]::new([char[]]@(' + $units + '))'\n"
-                  "  $ok = [scriptblock]::Create('param($p) [Threading.Tasks.Task]::FromResult(' + $make + ')')\n"
-                  "  $bad = [scriptblock]::Create('param($p) throw ' + $make)\n"
-                  "  $r = Read-CapturedResult $p 10000 $ok\n"
-                  "  Write-Output (\"TEXT|$i|\" + ($r.Ok -and $r.Text -ceq $t))\n"
-                  "  $r = Read-CapturedResult $p 10000 $bad\n"
-                  "  Write-Output (\"ERROR|$i|\" + ((-not $r.Ok) -and $r.Text -ceq \"<read failed: $t>\"))\n"
-                  "  Write-Output (\"NOTE|$i|\" + ((Remove-CaptureFiles @($p) 10000 $ok) -ceq \"capture cleanup incomplete: $t\"))\n"
-                  "  $i++\n"
-                  "}\n")
-        proc = self._pwsh(script, repeat=6)  # the loop runs the six texts: 18 worker calls in all
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        for kind in ("TEXT", "ERROR", "NOTE"):
-            for i in range(6):
-                self.assertIn(f"{kind}|{i}|True", proc.stdout, f"{kind} {i}\n{proc.stdout}{proc.stderr}")
+        # sol r4 B3: one script per text (three worker calls each), not one 18-call loop: that script's derived budget was above what a hosted
+        # ubuntu job can wait for, so a hung capture ended with the job's cancellation and no case verdict. _run_pwsh_script now refuses it.
+        for i in range(6):
+            script = (_accept_region() + "\n"
+                      "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
+                      "$texts = @('2026-11-04T12:00:00Z', '{\"a\":1}', ' padded ', 'true', ('nul' + [char]0 + 'x'), ([string][char]0x00e9 + [char]0xD800 + 'z'))\n"
+                      f"$i = {i}\n"
+                      "$t = $texts[$i]\n"
+                      "$units = ($t.ToCharArray() | ForEach-Object { [int]$_ }) -join ','\n"
+                      "$make = '[string]::new([char[]]@(' + $units + '))'\n"
+                      "$ok = [scriptblock]::Create('param($p) [Threading.Tasks.Task]::FromResult(' + $make + ')')\n"
+                      "$bad = [scriptblock]::Create('param($p) throw ' + $make)\n"
+                      "$r = Read-CapturedResult $p $AcceptMs $ok\n"
+                      "Write-Output (\"TEXT|$i|\" + ($r.Ok -and $r.Text -ceq $t))\n"
+                      "$r = Read-CapturedResult $p $AcceptMs $bad\n"
+                      "Write-Output (\"ERROR|$i|\" + ((-not $r.Ok) -and $r.Text -ceq \"<read failed: $t>\"))\n"
+                      "Write-Output (\"NOTE|$i|\" + ((Remove-CaptureFiles @($p) $AcceptMs $ok) -ceq \"capture cleanup incomplete: $t\"))\n")
+            with self.subTest(text=i):
+                proc = self._pwsh(script)  # three worker calls: a budget far inside the hosted job
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                for kind in ("TEXT", "ERROR", "NOTE"):
+                    self.assertIn(f"{kind}|{i}|True", proc.stdout, f"{kind} {i}\n{proc.stdout}{proc.stderr}")
 
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_the_worker_hands_the_factory_its_argument_in_the_shape_it_was_given(self) -> None:
         # adversary r13 A2: a one-element string[] reached the cleanup factory as a String (so $paths[0] was 'C'), an empty one as $null.
-        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        script = (_accept_region() + "\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
                   "$shape = { param($x) [Threading.Tasks.Task]::FromResult('type=' + $x.GetType().FullName + ' n=' + @($x).Count + ' items=' + ($x -join '|')) }\n"
                   "$none = { param($x) [Threading.Tasks.Task]::FromResult('null=' + ($null -eq $x) + ' type=' + $(if ($null -ne $x) { $x.GetType().FullName })) }\n"
-                  "Write-Output ('ONE|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 5000 $shape))\n"
-                  "Write-Output ('TWO|' + (Remove-CaptureFiles @('C:\\x\\a.txt', 'C:\\x\\b.txt') 5000 $shape))\n"
-                  "Write-Output ('EMPTY|' + (Remove-CaptureFiles @() 5000 $none))\n"
-                  "Write-Output ('SCALAR|' + (Read-CapturedResult $p 5000 $shape).Text)\n")
+                  "Write-Output ('ONE|' + (Remove-CaptureFiles @('C:\\x\\a.txt') $AcceptMs $shape))\n"
+                  "Write-Output ('TWO|' + (Remove-CaptureFiles @('C:\\x\\a.txt', 'C:\\x\\b.txt') $AcceptMs $shape))\n"
+                  "Write-Output ('EMPTY|' + (Remove-CaptureFiles @() $AcceptMs $none))\n"
+                  "Write-Output ('SCALAR|' + (Read-CapturedResult $p $AcceptMs $shape).Text)\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("ONE|capture cleanup incomplete: type=System.String[] n=1 items=C:\\x\\a.txt", proc.stdout)
@@ -2340,10 +2775,10 @@ class BoundedCaptureIoTests(unittest.TestCase):
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_a_null_element_of_the_argument_reaches_the_factory_as_null(self) -> None:
         # adversary r13 pass-2 A1: the wire kept the null ('-'), but the worker's indexed assignment into its string[] turned it into ''.
-        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        script = (_accept_region() + "\n"
                   "$probe = { param($x) [Threading.Tasks.Task]::FromResult('null0=' + ($null -eq $x[0]) + ' empty1=' + ($x[1] -ceq '') + ' n=' + $x.Count) }\n"
                   "$paths = [string[]]::new(2); $paths[1] = ''\n"
-                  "Write-Output ('NULLS|' + (Remove-CaptureFiles $paths 5000 $probe))\n")
+                  "Write-Output ('NULLS|' + (Remove-CaptureFiles $paths $AcceptMs $probe))\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("NULLS|capture cleanup incomplete: null0=True empty1=True n=2", proc.stdout)
@@ -2360,12 +2795,12 @@ class BoundedCaptureIoTests(unittest.TestCase):
                      "-ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 600'); "
                      "[IO.File]::WriteAllText('" + pid_file.replace("'", "''") + "', [string]$c.Id)")
             encoded = base64.b64encode(inner.encode("utf-16-le")).decode("ascii")
-            script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+            script = (_accept_region() + "\n"
                       "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
-                      "$orphaning = { param($p) $m = Start-Process -FilePath (Get-Process -Id $PID).Path -NoNewWindow -PassThru "
+                      "$orphaning ={ param($p) $m = Start-Process -FilePath (Get-Process -Id $PID).Path -NoNewWindow -PassThru "
                       "-ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', '" + encoded + "'); "
                       "$null = $m.WaitForExit(30000); [Threading.Tasks.Task]::FromResult('orphaned') }\n"
-                      "$r = Read-CapturedResult $p 40000 $orphaning\n"
+                      "$r = Read-CapturedResult $p $AcceptMs $orphaning\n"
                       "Write-Output ('ORPHAN-READ|' + $r.Ok + '|' + $r.Text)\n"
                       "$id = [int][IO.File]::ReadAllText('" + pid_file.replace("'", "''") + "'); $sw = [Diagnostics.Stopwatch]::StartNew()\n"
                       "while ($null -ne (Get-Process -Id $id -ErrorAction SilentlyContinue) -and $sw.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 100 }\n"
@@ -2394,13 +2829,13 @@ class BoundedCaptureIoTests(unittest.TestCase):
                         "-ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 600'); "
                         f"[IO.File]::WriteAllText('{quoted}', [string]$c.Id); {tail} }}")
 
-            script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+            script = (_accept_region() + "\n"
                       "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
                       "$throwing = " + spawner(pid_files[0], "throw 'factory exploded'") + "\n"
                       "$finishing = " + spawner(pid_files[1], "[Threading.Tasks.Task]::FromResult('')") + "\n"
-                      "$r = Read-CapturedResult $p 20000 $throwing\n"
+                      "$r = Read-CapturedResult $p $AcceptMs $throwing\n"
                       "Write-Output ('THROW-READ|' + $r.Ok + '|' + $r.Text)\n"
-                      "Write-Output ('FINISH-DEL|[' + (Remove-CaptureFiles @($p) 20000 $finishing) + ']')\n"
+                      "Write-Output ('FINISH-DEL|[' + (Remove-CaptureFiles @($p) $AcceptMs $finishing) + ']')\n"
                       "foreach ($f in @(" + ", ".join("'" + f.replace("'", "''") + "'" for f in pid_files) + ")) {\n"
                       "  $id = [int][IO.File]::ReadAllText($f); $sw = [Diagnostics.Stopwatch]::StartNew()\n"
                       "  while ($null -ne (Get-Process -Id $id -ErrorAction SilentlyContinue) -and $sw.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 100 }\n"
@@ -2427,20 +2862,20 @@ class BoundedCaptureIoTests(unittest.TestCase):
     def test_a_factory_the_worker_cannot_run_is_a_named_failure_not_a_hang_or_a_success(self) -> None:
         # r12/r13: the factory runs in its own worker process, so it must be self-contained. A variable of the calling scope, a missing type and a
         # throw are all named failures (the same <read failed: ...> / cleanup failed note), never a hang or a success.
-        script = ("$callerOnly = 'x'\n" + _fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        script = ("$callerOnly = 'x'\n" + _accept_region() + "\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
                   "$callerClass = { param($p) if ($null -eq $callerOnly) { throw 'the caller scope is not visible in the worker' }; [Threading.Tasks.Task]::FromResult('x') }\n"
                   "$noType = { param($p) [NoSuchTypeAnywhere12]::new(); [Threading.Tasks.Task]::FromResult('x') }\n"
                   "$boom = { param($p) throw 'factory exploded' }\n"
-                  "$r = Read-CapturedResult $p 5000 $callerClass\n"
+                  "$r = Read-CapturedResult $p $AcceptMs $callerClass\n"
                   "Write-Output ('CLASS-READ|' + $r.Ok + '|' + $r.Text)\n"
-                  "Write-Output ('CLASS-DEL|' + (Remove-CaptureFiles @($p) 5000 $callerClass))\n"
-                  "$r = Read-CapturedResult $p 5000 $noType\n"
+                  "Write-Output ('CLASS-DEL|' + (Remove-CaptureFiles @($p) $AcceptMs $callerClass))\n"
+                  "$r = Read-CapturedResult $p $AcceptMs $noType\n"
                   "Write-Output ('NOTYPE-READ|' + $r.Ok + '|' + $r.Text)\n"
-                  "Write-Output ('NOTYPE-DEL|' + (Remove-CaptureFiles @($p) 5000 $noType))\n"
-                  "$r = Read-CapturedResult $p 5000 $boom\n"
+                  "Write-Output ('NOTYPE-DEL|' + (Remove-CaptureFiles @($p) $AcceptMs $noType))\n"
+                  "$r = Read-CapturedResult $p $AcceptMs $boom\n"
                   "Write-Output ('BOOM-READ|' + $r.Ok + '|' + $r.Text)\n"
-                  "Write-Output ('BOOM-DEL|' + (Remove-CaptureFiles @($p) 5000 $boom))\n")
+                  "Write-Output ('BOOM-DEL|' + (Remove-CaptureFiles @($p) $AcceptMs $boom))\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("CLASS-READ|False|<read failed: the caller scope is not visible in the worker>", proc.stdout)
@@ -2715,11 +3150,11 @@ class BoundedCaptureIoTests(unittest.TestCase):
         sleeper = ("{ param($p) $c = Start-Process -FilePath (Get-Process -Id $PID).Path -NoNewWindow -PassThru "
                    "-ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 600'); "
                    "[IO.File]::WriteAllText('" + pid_file.replace("'", "''") + "', [string]$c.Id); [Threading.Tasks.Task]::FromResult('hello from the factory') }")
-        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        script = (_accept_region() + "\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
                   f"$factory = {sleeper}\n"
                   "Write-Output ('EXE|' + (Get-Process -Id $PID).Path)\n"
-                  "$r = Read-CapturedResult $p 60000 $factory\n"
+                  "$r = Read-CapturedResult $p $AcceptMs $factory\n"
                   "Write-Output ('READ|' + $r.Ok + '|' + $r.Text)\n"
                   "$id = [int][IO.File]::ReadAllText('" + pid_file.replace("'", "''") + "'); $sw = [Diagnostics.Stopwatch]::StartNew()\n"
                   "while ($null -ne (Get-Process -Id $id -ErrorAction SilentlyContinue) -and $sw.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 100 }\n"
@@ -2730,7 +3165,9 @@ class BoundedCaptureIoTests(unittest.TestCase):
         script_path = os.path.join(work, "driver.ps1")
         Path(script_path).write_text(script, encoding="utf-8")
         env = dict(os.environ, TMPDIR=tmp)
-        return subprocess.run([pwsh_exe, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", script_path], capture_output=True, text=True, timeout=240, env=env)
+        # adversary r5 A5: the budget is DERIVED from the capture calls the driver makes (here one accept call), as _run_pwsh_script does; the typed
+        # 240 s it replaces was below what one permitted slow worker start (CAPTURE_ACCEPT_CALL_CEILING_MS) plus the script base allows.
+        return _run_argv_bounded([pwsh_exe, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", script_path], pwsh_script_budget_sec(script), env)
 
     def _skip_unless_setsid_branch(self) -> None:
         if os.name != "posix":
@@ -2739,6 +3176,21 @@ class BoundedCaptureIoTests(unittest.TestCase):
             self.skipTest("SKIPPED: no setsid at /usr/bin/setsid or /bin/setsid, so the setsid branch of Start-CaptureWorker is not taken")
         if PWSH is None:
             self.skipTest("SKIPPED: pwsh is not on PATH")
+
+    def test_r5_b2_the_real_worker_drivers_run_under_a_budget_derived_from_their_calls_not_a_typed_240_s(self) -> None:
+        # sol r4 B2 (the callers routed through the bounded runner): both real-driver entry points called the raw runner with a typed 240 s, which a valid schedule (one worker start
+        # of 241 s, the script ending at 244 s) exceeds although the derived budget for one accept call is longer, and which skipped the hosted preflight.
+        module = sys.modules[__name__]
+        with tempfile.TemporaryDirectory(prefix="heavy-slot-gate-r5-a5-") as work, \
+                mock.patch.object(module, "_run_argv_bounded", return_value=subprocess.CompletedProcess([], 0, "", "")) as bounded:
+            self._run_worker_driver("pwsh", work)
+            script = Path(work, "driver.ps1").read_text(encoding="utf-8")
+        self.assertEqual(bounded.call_args.args[1], pwsh_script_budget_sec(script))
+        self.assertGreaterEqual(bounded.call_args.args[1], PWSH_SCRIPT_BASE_SEC + CAPTURE_ACCEPT_CALL_CEILING_MS / 1000)
+        escape = Path(__file__).read_text(encoding="utf-8")
+        escape = escape[escape.index("\n    def _run_session_escape_case") + 1:]
+        escape = escape[:escape.index("\n    def ", 10)] if "\n    def " in escape[10:] else escape
+        self.assertIn("pwsh_script_budget_sec(script)", escape, "the session-escape driver passes a typed budget")
 
     def _assert_worker_driver_ok(self, proc: subprocess.CompletedProcess) -> None:
         out = proc.stdout + proc.stderr
@@ -2761,7 +3213,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
         # setsid could not exec the first, the worker ended before it was ready and the -Start seam failed instead of running its factory.
         # (Get-Process).Path resolves symlinks on Linux, so the spaced pwsh is a hard-linked (or copied) tree of $PSHOME, not a symlink.
         self._skip_unless_setsid_branch()
-        home = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-Command", "[Console]::Out.Write($PSHOME)"], capture_output=True, text=True, timeout=60).stdout.strip()
+        home = _run_argv_bounded([PWSH, "-NoLogo", "-NoProfile", "-Command", "[Console]::Out.Write($PSHOME)"], 60).stdout.strip()
         work = tempfile.mkdtemp(prefix="heavy-slot-gate-b2-spaced-")
         try:
             spaced = os.path.join(work, "Power Shell")
@@ -2770,7 +3222,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
             except (OSError, shutil.Error) as exc:
                 self.skipTest(f"SKIPPED: could not build a pwsh install under a path with a space from {home} ({type(exc).__name__}: {exc})")
             spaced_pwsh = os.path.join(spaced, "pwsh")
-            probe = subprocess.run([spaced_pwsh, "-NoLogo", "-NoProfile", "-Command", "(Get-Process -Id $PID).Path"], capture_output=True, text=True, timeout=120)
+            probe = _run_argv_bounded([spaced_pwsh, "-NoLogo", "-NoProfile", "-Command", "(Get-Process -Id $PID).Path"], 120)
             if probe.returncode != 0 or " " not in probe.stdout.strip():
                 self.skipTest(f"SKIPPED: the copied pwsh does not run, or its real path has no space (exit {probe.returncode}, path {probe.stdout.strip()!r}, {probe.stderr.strip()[:200]!r})")
             proc = self._run_worker_driver(spaced_pwsh, work)
@@ -2897,19 +3349,19 @@ class BoundedCaptureIoTests(unittest.TestCase):
                         "if (-not [IO.File]::Exists('" + quoted_pid_file + "')) { throw 'the session-escaping sleeper never became ready' }; "
                         "[Threading.Tasks.Task]::FromResult('escaped sleeper ready')")
             self.assertNotIn("\n'@", template)
-            script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+            script = (_accept_region() + "\n"
                       "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
                       "$argv = @((ConvertTo-CommandLineArg '/bin/sh'), (ConvertTo-CommandLineArg '" + script_file.replace("'", "''") + "'), "
                       "(ConvertTo-CommandLineArg '" + quoted_pid_file + "'))\n"
                       "$argvLiteral = '(' + (($argv | ForEach-Object { \"'\" + $_.Replace(\"'\", \"''\") + \"'\" }) -join ', ') + ')'\n"
                       "$template = @'\n" + template + "\n'@\n"
                       "$factory = [scriptblock]::Create($template.Replace('@ARGV@', $argvLiteral))\n"
-                      "$r = Read-CapturedResult $p 60000 $factory\n"
+                      "$r = Read-CapturedResult $p $AcceptMs $factory\n"
                       "Write-Output ('READ|' + $r.Ok + '|' + $r.Text)\n")
             script_path = os.path.join(base, "driver.ps1")
             Path(script_path).write_text(script, encoding="utf-8")
-            proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", script_path], capture_output=True, text=True,
-                                  timeout=240, env=dict(os.environ, TMPDIR=tmp))
+            proc = _run_argv_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", script_path], pwsh_script_budget_sec(script),  # derived (adversary r5 A5)
+                                     dict(os.environ, TMPDIR=tmp))
             if os.path.exists(pid_file):
                 escaped_pid = int(Path(pid_file).read_text(encoding="ascii").strip())
             out = proc.stdout + proc.stderr
@@ -2943,7 +3395,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertNotRegex(case, r"-ArgumentList @\('/bin/sh'", "the argv must not be handed to Start-Process unquoted")
 
 
-class BoundedCleanupTests(unittest.TestCase):
+class BoundedCleanupTests(_WindowsKillPath, unittest.TestCase):
     """sol r4b B1 / B2: the cleanup after a timeout is bounded end to end, and the regression's ceiling is derived from that bound.
 
     Everything runs on a virtual clock with in-memory process fakes: a fake wait advances the clock by what it would have waited
