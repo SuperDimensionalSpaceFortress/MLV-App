@@ -1593,8 +1593,11 @@ class CdngTotalContainmentTests(unittest.TestCase):
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         # (a case that throws inside the ForEach-Object yields no row, so every case must have one: a short list is the throw)
         self.assertEqual(len(got), len(fields) + 1, (len(got), proc.stderr[-3000:]))
+        # (under the harness's default preference the failed method call is a non-terminating error and the reason prints "is a , not a JSON number"; under Stop, as the writer runs, it throws)
+        self.assertNotIn("Method invocation failed", proc.stderr + proc.stdout)
         for f, row in zip(fields + ("llrawproc_total_ms",), got):
             with self.subTest(field=f):
+                self.assertFalse(any("is a , not" in p for p in row["problems"]), row)
                 self.assertEqual(row["outcome"], "INVALID", row)
                 self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID: ") and f in p for p in row["problems"]), row)
 
