@@ -273,6 +273,11 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in HFR_NATIVE_S1_LEGS if rel not in
 # EXPORT-VENUE-LEG-1: the four export legs (two clips x CDNG lossless / ProRes); test_dual_venue_export_leg pins their shape.
 EXPORT_VENUE_LEGS = tuple(f"legs/m16-{clip}-export-{fmt}.json" for clip in ("1243", "1456") for fmt in ("cdng-lossless", "prores"))
 SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in EXPORT_VENUE_LEGS if rel not in SHIPPED_LEGS))
+# PLAYBACK-TRACE-LOWOVERHEAD-1 r8: the present-trace ON twins of the overhead gate's two legs (trace OFF vs ON on ONE build), keyed to the OFF leg each
+# twins; legId, card and generatorArgs.presentTrace true are the only differences (the classifier branch for this card pins it).
+PRESENT_TRACE_OVERHEAD_LEGS = {"legs/m16-1457-native-fullscreen-s1-ptrace.json": "legs/m16-1457-native-fullscreen-s1.json",
+                               "legs/m16-1243-pace-cinematic-fullscreen-s1-ptrace.json": "legs/m16-1243-pace-cinematic-fullscreen-s1.json"}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *PRESENT_TRACE_OVERHEAD_LEGS)
 assert len(set(SHIPPED_LEGS)) == len(SHIPPED_LEGS), "a shipped leg is listed twice"
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
@@ -8185,6 +8190,17 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertRegex(spec["legId"], r"^m16-1243-chainattr-(c|p|t12)-fullscreen-s1$", path.name)
             elif spec["card"] == "HFR-NATIVE-60FPS-FULLRES-1":   # the Look Assist ON control of the native s1 pair (its -nola twin is classic)
                 self.assert_hfr_native_s1_flavored_leg(spec, path.name)
+            elif spec["card"] == "PLAYBACK-TRACE-LOWOVERHEAD-1":   # the trace-ON twins of the overhead gate (PRESENT_TRACE_OVERHEAD_LEGS)
+                rel = "legs/" + path.name
+                self.assertIn(rel, PRESENT_TRACE_OVERHEAD_LEGS, path.name)
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"-ptrace$", path.name)
+                # the twin is its OFF leg except legId, card and presentTrace true
+                source = json.loads((DV / PRESENT_TRACE_OVERHEAD_LEGS[rel]).read_text(encoding="utf-8"))
+                self.assertNotIn("presentTrace", source["generatorArgs"], PRESENT_TRACE_OVERHEAD_LEGS[rel])
+                source["legId"], source["card"] = spec["legId"], spec["card"]
+                source["generatorArgs"] = dict(source["generatorArgs"], presentTrace=True)
+                self.assertEqual(spec, source, path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
                 self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}", f"m16-1243-look-scale2-{flavor}-agxoff"), path.name)
                 self.assertEqual(spec["legId"], path.stem, path.name)

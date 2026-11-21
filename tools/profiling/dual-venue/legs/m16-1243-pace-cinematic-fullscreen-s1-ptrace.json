@@ -5,7 +5,7 @@
   "legType": "speed",
   "clipId": "M16-1243",
   "playSeconds": 25,
-  "backends": ["cuda"],
+  "backends": ["cuda", "cpu"],
   "scaleFactor": 1,
   "displayMode": "fullscreen",
   "generatorArgs": { "telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "forceLookAssist": true, "lookFlavor": "cinematic", "presentTrace": true },
@@ -16,12 +16,20 @@
         { "metric": "lookAssistForced", "op": "eq", "value": true },
         { "metric": "gpuFramesTotal", "op": "gt", "value": 0 },
         { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" }
+      ],
+      "cpu": [
+        { "metric": "lookAssistForced", "op": "eq", "value": true },
+        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" }
       ]
     },
     "supplementary": {
       "cuda": [
         { "metric": "lookAssistForced", "op": "eq", "value": true },
         { "metric": "gpuFramesTotal", "op": "gt", "value": 0 },
+        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" }
+      ],
+      "cpu": [
+        { "metric": "lookAssistForced", "op": "eq", "value": true },
         { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" }
       ]
     }
