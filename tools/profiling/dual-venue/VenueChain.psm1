@@ -717,14 +717,14 @@ function Request-VenueClaim {
                     $seen = $null; try { $seen = Get-VenueClaim -Venue $Venue -ClaimDir $ClaimDir } catch { $seen = $null }
                     # r8 rule 7 (adversary r7 pass 3 A11): the queue returned is the census made AFTER the give-back, so the place returned is the caller's in that census (the snapshot's place could be one past it)
                     $myAfter = @($after | Where-Object { $_.name -ceq $t.name })
-                    return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $(if ($seen) { $seen.claim }); path = $r.path; broken = @($r.broken); ticket = $t; queue = $after; position = $(if ($myAfter.Count -gt 0) { [int]$myAfter[0].position } else { $position }); staleTickets = @($removed); note = '' }
+                    return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $(if ($seen) { $seen.claim }); path = $r.path; broken = @($r.broken); ticket = $t; queue = $after; position = $(if ($myAfter.Count -gt 0) { [int]$myAfter[0].position } else { 0 }); staleTickets = @($removed); note = '' }
                 }
                 # TAIL-1 A13 (= #878 sol r10 B1; replaces r7 A3's "kept as a grant"): five BUSY give-backs did not let go, and handing the claim over would hand a caller a claim owed to an OLDER ready ticket. The answer is QUEUED;
                 # the claim that could not be given back is named on the ticket (pendingReleaseNonce), so it is not leaked, and the next poll made with this ticket lets go of it before anything else (the top of this function).
                 $t | Add-Member -NotePropertyName pendingReleaseNonce -NotePropertyValue ([string]$r.claim.nonce) -Force
                 $seenBusy = $null; try { $seenBusy = Get-VenueClaim -Venue $Venue -ClaimDir $ClaimDir } catch { $seenBusy = $null }
                 $myBusy = @($after | Where-Object { $_.name -ceq $t.name })
-                return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $(if ($seenBusy) { $seenBusy.claim }); path = $r.path; broken = @($r.broken); ticket = $t; queue = $after; position = $(if ($myBusy.Count -gt 0) { [int]$myBusy[0].position } else { $position }); staleTickets = @($removed)
+                return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $(if ($seenBusy) { $seenBusy.claim }); path = $r.path; broken = @($r.broken); ticket = $t; queue = $after; position = $(if ($myBusy.Count -gt 0) { [int]$myBusy[0].position } else { 0 }); staleTickets = @($removed)
                     note = "CLAIM_GIVE_BACK_BUSY ticket=$($t.name) (the claim was granted behind an older ready ticket and could not be given back in 5 tries; queued, the next poll lets go of it)" }
             }
         } catch { $null = $_ }
