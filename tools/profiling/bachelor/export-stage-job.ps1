@@ -330,10 +330,16 @@ try {
     # r8 (adversary r7 pass A2): the kill is CONFIRMED or it is typed. A tree kill that threw (access denied: ffmpeg or a child may still hold the output), a fallback root-only
     # kill (the descendants are unknown) or a root still running after 30 s used to be swallowed: the job then read changing output, tried to delete it and published an ordinary
     # EXPORT_TIMEOUT. Now any of them ends EXPORT_KILL_UNCONFIRMED (exit 48, an INVALID export: no measurement and no FAIL claim about the product).
+    # EXPORT-KILL-DESCENDANT-CONFIRM-1 (adversary pass 26 A1 on 559536d7): Kill($true) may return and the root's wait read true while a descendant (ffmpeg) is still alive, so
+    # the root alone confirmed the tree. The descendants are recorded BEFORE the kill (pid + creation time: a reused pid is no survivor) and each must be seen gone within 15 s
+    # after the root's wait. A survivor, or a tree that could not be read, leaves the kill unconfirmed (EXPORT_KILL_UNCONFIRMED, exit 48) and the survivors are traced.
     $killConfirmed = $true
     if ($timedOut) {
+        $exportTree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $app.Id
         try { $app.Kill($true) } catch { $killConfirmed = $false; Write-JobTrace "step export kill tree error=$([string]$_.CategoryInfo.Reason)"; try { $app.Kill() } catch { Write-JobTrace "step export kill root error=$([string]$_.CategoryInfo.Reason)" } }
         if (-not $app.WaitForExit(30000)) { $killConfirmed = $false }
+        $exportTreeGone = Wait-AttrCudaProcessTreeGone -Snapshot $exportTree -WaitMs 15000
+        if (-not $exportTreeGone.confirmed) { $killConfirmed = $false; Write-JobTrace "step export kill descendants unconfirmed reason=$($exportTreeGone.error) survivors=$(@($exportTreeGone.survivors) -join ',')" }
     }
     $exportWatch.Stop()
     $appExitCode = if ($timedOut) { $null } else { $app.ExitCode }

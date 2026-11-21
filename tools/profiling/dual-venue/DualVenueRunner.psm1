@@ -6017,6 +6017,10 @@ function New-DvHealthProbeJobText {
     $root = $AgentRoot.Replace("'", "''")
     Import-Module (Join-Path $PSScriptRoot '..\bachelor\AttrCudaArtifacts.psm1')
     $sessionLockedSource = Get-AttrCudaEmbeddedFunctionSource -Name @('Get-AttrCudaSessionLocked')
+    # EXPORT-KILL-DESCENDANT-CONFIRM-1 r2 (hosted CI, test_a_dynamic_splice_source_embeds_only_bodies_the_scan_already_enumerates): export-stage-job.ps1 embeds these two helpers
+    # by a computed name closure the ATTR-3 spliced-body scan cannot read, and the scan learns a body only from a LITERAL -Name list in a listed splice source. They are listed
+    # here, beside the other read-only venue helper, so the scan reads and clears both bodies (read-only process tables, no write). The probe defines them and never calls them.
+    $processTreeSource = Get-AttrCudaEmbeddedFunctionSource -Name @('Get-AttrCudaProcessTreeSnapshot', 'Wait-AttrCudaProcessTreeGone')
     $body = @"
 `$ErrorActionPreference = 'Stop'
 `$AgentRoot = '$root'
@@ -6047,7 +6051,7 @@ try { Add-Type -AssemblyName System.Windows.Forms; `$probe.displayDevice = [stri
 `$probe.presentmonSha256 = `$(if (Test-Path -LiteralPath `$pm -PathType Leaf) { (Get-FileHash -LiteralPath `$pm -Algorithm SHA256).Hash.ToLowerInvariant() } else { `$null })
 "@
     # The embedded function is concatenated, never interpolated: its own `$` must reach the venue as written.
-    $body + "`r`n" + $sessionLockedSource + "`r`n" + '$probe.sessionLocked = Get-AttrCudaSessionLocked' + "`r`n" +
+    $body + "`r`n" + $sessionLockedSource + "`r`n" + $processTreeSource + "`r`n" + '$probe.sessionLocked = Get-AttrCudaSessionLocked' + "`r`n" +
         'Write-Output (''DVE_PROBE='' + ($probe | ConvertTo-Json -Compress -Depth 4))' + "`r`n"
 }
 

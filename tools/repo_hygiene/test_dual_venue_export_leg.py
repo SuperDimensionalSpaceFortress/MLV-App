@@ -2194,5 +2194,369 @@ class ExportJobGeneratorTests(unittest.TestCase):
             self.assertFalse(out.exists())
 
 
+ARTIFACTS_MODULE = ROOT / "tools" / "profiling" / "bachelor" / "AttrCudaArtifacts.psm1"
+# A root pwsh that starts one child pwsh (its pid goes to the file) and then sleeps: a two-process tree, no app, no clip.
+TREE_ROOT_COMMAND = ("$c = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile','-Command','Start-Sleep 90' -NoNewWindow -PassThru; "
+                     "Set-Content -LiteralPath '{pid_file}' -Value ('' + $c.Id + ' ' + $c.StartTime.ToFileTimeUtc()); Start-Sleep 90")
+
+
+@requires_windows_pwsh
+class ExportKillDescendantConfirmTests(unittest.TestCase):
+    """EXPORT-KILL-DESCENDANT-CONFIRM-1 (adversary pass 26 A1 on 559536d7, split from EXPORT-VENUE-LEG-1 r20). Kill($true) may return, and the root's wait read true,
+    while a descendant (ffmpeg under a ProRes export) is still alive: the .NET contract allows it. The kill was confirmed by the root alone, so the job inspected output
+    a live process held and typed EXPORT_TIMEOUT / 40. The descendants are now recorded before the kill (pid + creation time) and each must be seen gone, or the run is
+    EXPORT_KILL_UNCONFIRMED / 48 and no output is enumerated. The survivor is simulated by turning the tree kill into a root-only kill in a copy of the code (the
+    state the contract permits); no MLVApp, no clip."""
+
+    def export_kill_block(self, survivor: bool) -> dict:
+        """Run the job's own export-wait-through-classification block (sliced from the generator's template) on a real two-process tree that times out."""
+        src = EXPORT_JOB.read_text(encoding="utf-8")
+        start = src.index("    $exportWatch = [Diagnostics.Stopwatch]::StartNew()\n")
+        end_anchor = src.index("    $exitFor = @{", start)
+        end = src.index("\n", end_anchor) + 1
+        block = src[start:end]
+        if survivor:
+            self.assertEqual(block.count("try { $app.Kill($true) }"), 1, "the survivor seam must apply")
+            block = block.replace("try { $app.Kill($true) }", "try { $app.Kill() }")
+        with tempfile.TemporaryDirectory() as d:
+            work = Path(d)
+            out_dir = work / "out"
+            out_dir.mkdir()
+            (out_dir / "clip.mov").write_bytes(b"not a movie")
+            pid_file = work / "child.pid"
+            script = work / "run.ps1"
+            script.write_text(
+                "$ErrorActionPreference = 'Stop'\n"
+                f"Import-Module '{ARTIFACTS_MODULE}' -Force -DisableNameChecking\n"
+                "$traceLines = [System.Collections.Generic.List[string]]::new()\n"
+                "function Write-JobTrace([string]$Message) { $traceLines.Add($Message) }\n"
+                "function Get-AttrCudaFileSha256Blocks { param($Path, $TracePath, $Label) [pscustomobject]@{ sha256 = 'stub' } }\n"
+                f"$Format = 'prores'; $MaxFrames = 24; $ExportTimeoutSec = 6; $outDir = '{out_dir}'\n"
+                f"$batchLog = '{work / 'batch.log'}'; $profilePath = '{work / 'export-profile.json'}'; $stageLog = '{work / 'stage-timing.log'}'; $Trace = '{work / 'trace.txt'}'\n"
+                "$psi = [Diagnostics.ProcessStartInfo]::new((Get-Process -Id $PID).Path)\n"
+                f"foreach ($a in @('-NoProfile', '-Command', @'\n{TREE_ROOT_COMMAND.format(pid_file=pid_file)}\n'@)) {{ $psi.ArgumentList.Add($a) }}\n"
+                "$psi.UseShellExecute = $false; $psi.CreateNoWindow = $true\n"
+                f"$childPid = $null; function Test-FixtureChild($id) {{ if ($null -eq $id) {{ return $false }}; $ft = try {{ [int64]((Get-Content -LiteralPath '{pid_file}' -Raw).Trim() -split ' ')[1] }} catch {{ $null }}; $cp = Get-Process -Id $id -ErrorAction SilentlyContinue; ($null -ne $cp) -and ($null -ne $ft) -and ($cp.StartTime.ToFileTimeUtc() -eq $ft) }}\n"
+                "try {\n" + block +
+                f"    $childPid = try {{ [int]((Get-Content -LiteralPath '{pid_file}' -Raw).Trim() -split ' ')[0] }} catch {{ $null }}\n"
+                "    $childAlive = Test-FixtureChild $childPid\n"
+                "    [ordered]@{ result = $result; exit = $exitFor[$result]; outputs = $outputs.Count; killConfirmed = $killConfirmed; childStarted = ($null -ne $childPid);\n"
+                "                childAlive = $childAlive; trace = @($traceLines) } | ConvertTo-Json -Compress\n"
+                "} finally {\n"
+                f"    if ($null -eq $childPid) {{ $childPid = try {{ [int]((Get-Content -LiteralPath '{pid_file}' -Raw).Trim() -split ' ')[0] }} catch {{ $null }} }}\n"
+                "    if (Test-FixtureChild $childPid) { Stop-Process -Id $childPid -Force -ErrorAction SilentlyContinue }\n"
+                "    if ($null -ne $app -and -not $app.HasExited) { $app.Kill($true) }\n"
+                "}\n", encoding="utf-8")
+            proc = run_pwsh(["-File", str(script)], timeout=300)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            got = json.loads(proc.stdout.strip().splitlines()[-1])
+            self.assertTrue(got["childStarted"], f"the tree had its descendant before the timeout: {got}")
+            return got
+
+    def test_a_descendant_that_outlives_the_root_makes_the_kill_unconfirmed_and_no_output_is_read(self) -> None:
+        got = self.export_kill_block(survivor=True)
+        self.assertTrue(got["childAlive"], f"the seam left a live descendant after the root exited: {got}")
+        self.assertEqual((got["result"], got["exit"]), ("EXPORT_KILL_UNCONFIRMED", 48), got)
+        self.assertFalse(got["killConfirmed"], got)
+        self.assertEqual(got["outputs"], 0, f"no output is enumerated while a descendant may hold it: {got}")
+        self.assertTrue(any("survivors=" in line for line in got["trace"]), f"the survivor pids are traced: {got}")
+
+    def test_control_a_tree_that_is_all_gone_is_an_ordinary_timeout(self) -> None:
+        got = self.export_kill_block(survivor=False)
+        self.assertFalse(got["childAlive"], got)
+        self.assertEqual((got["result"], got["exit"]), ("EXPORT_TIMEOUT", 40), got)
+        self.assertTrue(got["killConfirmed"], got)
+        self.assertEqual(got["outputs"], 1, got)
+
+    def test_the_job_records_the_tree_before_the_kill_and_confirms_it_after_the_root_wait(self) -> None:
+        text = EXPORT_JOB.read_text(encoding="utf-8")
+        snap = text.index("$exportTree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $app.Id")
+        kill = text.index("try { $app.Kill($true) }")
+        root_wait = text.index("if (-not $app.WaitForExit(30000)) { $killConfirmed = $false }")
+        tree_wait = text.index("$exportTreeGone = Wait-AttrCudaProcessTreeGone -Snapshot $exportTree -WaitMs 15000")
+        self.assertLess(snap, kill, "the descendants are recorded while their parents still exist")
+        self.assertLess(root_wait, tree_wait)
+        self.assertLess(tree_wait, text.index("$logText = try {"), "the tree is settled before any output is read")
+        self.assertIn("if (-not $exportTreeGone.confirmed) { $killConfirmed = $false;", text)
+
+    def snapshot_and_wait(self, body: str) -> dict:
+        proc = run_pwsh(["-Command", f"$ErrorActionPreference = 'Stop'; Import-Module '{ARTIFACTS_MODULE}' -Force -DisableNameChecking\n"
+                         "$t = [datetime]::new(2026, 11, 19, 12, 0, 0, [DateTimeKind]::Utc)\n"
+                         "function Row($p, $pp, $c) { [pscustomobject]@{ ProcessId = $p; ParentProcessId = $pp; CreationDate = $c } }\n" + body])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    def test_the_snapshot_walks_the_tree_skips_a_reused_parent_pid_and_fails_closed_on_an_unreadable_tree(self) -> None:
+        got = self.snapshot_and_wait(
+            # r3 fix 2: a real scan always holds pid 4 (System, older than everything); without it 400 would be an orphan created after the root, i.e. a member
+            "$rows = @((Row 4 0 $t.AddDays(-1)), (Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 202 201 $t.AddSeconds(2)), (Row 300 100 $t.AddHours(-3)), (Row 400 4 $t.AddSeconds(3)))\n"
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes $rows\n"
+            "$bad = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($rows + @(Row 203 201 $null))\n"
+            "$gone = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 201 100 $t))\n"
+            "[ordered]@{ ok = $s.ok; members = @($s.members | ForEach-Object { $_.processId }); bad = $bad.ok; badWhy = $bad.error; rootGone = $gone.ok; rootGoneWhy = $gone.error } | ConvertTo-Json -Compress")
+        self.assertTrue(got["ok"], got)
+        # r1 fix iteration (adversary A2 on 2223cc4d): a child that reads three hours older than its parent (a clock stepped back) is still a member; creation times
+        # never order the walk, so a process on a reused pid is adopted too, which can only leave the kill unconfirmed. A stranger (parent 4) is not.
+        self.assertEqual(sorted(got["members"]), [201, 202, 300], "the walk follows ParentProcessId alone")
+        self.assertFalse(got["bad"], got)
+        self.assertIn("descendant-unreadable", got["badWhy"])
+        self.assertFalse(got["rootGone"], got)
+        self.assertIn("root-not-in-scan", got["rootGoneWhy"])
+
+    def test_the_wait_names_a_survivor_ignores_a_reused_pid_and_fails_closed_on_a_failed_scan(self) -> None:
+        got = self.snapshot_and_wait(
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)), (Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 400 4 $t), (Row 600 999 $t.AddHours(-1)))\n"
+            "$alive = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @((Row 201 100 $t.AddSeconds(1))) }\n"
+            # r3 (A1 on 4d69f211): a real scan always holds pid 4 (System, older than everything); without it the reused 201 would have no provable parent
+            "$reused = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @((Row 4 0 $t.AddDays(-1)), (Row 201 4 $t.AddMinutes(5))) }\n"
+            "$unread = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @((Row 201 4 $null)) }\n"
+            "$failed = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { throw 'wmi down' }\n"
+            "$unknown = Wait-AttrCudaProcessTreeGone -Snapshot ([pscustomobject]@{ ok = $false; members = @(); error = 'scan-failed: x' }) -WaitMs 1200\n"
+            "$none = Wait-AttrCudaProcessTreeGone -Snapshot $null -WaitMs 1200\n"
+            "[ordered]@{ alive = $alive.confirmed; survivors = @($alive.survivors); reused = $reused.confirmed; unread = $unread.confirmed; failed = $failed.confirmed;\n"
+            "            failedWhy = $failed.error; unknown = $unknown.confirmed; none = $none.confirmed } | ConvertTo-Json -Compress")
+        self.assertFalse(got["alive"], got)
+        self.assertEqual(got["survivors"], [201], got)
+        self.assertTrue(got["reused"], "the same pid with another creation time is a reused number, not a survivor")
+        self.assertFalse(got["unread"], "a member pid whose creation time cannot be read is not known gone")
+        self.assertFalse(got["failed"], got)
+        self.assertIn("scan-failed", got["failedWhy"])
+        self.assertFalse(got["unknown"], got)
+        self.assertFalse(got["none"], got)
+
+    def test_r1_fix_the_wait_rewalks_late_descendants_keeps_its_bound_and_takes_only_a_boolean_ok(self) -> None:
+        """r1 fix iteration on 2223cc4d. A1: member 201 starts 202 after the snapshot and exits before the kill; 202 (parent 201) is a survivor. A3: -WaitMs 0 is
+        no time to confirm, and an empty scan that ENDS past the bound confirms nothing. A6: ok='false' (a string) is not the boolean $true."""
+        got = self.snapshot_and_wait(
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)), (Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 400 4 $t), (Row 600 999 $t.AddHours(-1)))\n"
+            "$late = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @((Row 202 201 $t.AddSeconds(5)), (Row 203 202 $t.AddSeconds(6)), (Row 400 4 $t)) }\n"
+            "$rootChild = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @((Row 205 100 $t.AddSeconds(7))) }\n"
+            "$zero = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 0 -Scan { @() }\n"
+            "$slow = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { Start-Sleep -Milliseconds 1500; @() }\n"
+            "$str = Wait-AttrCudaProcessTreeGone -Snapshot ([pscustomobject]@{ ok = 'false'; rootProcessId = 100; rootCreationTicks = 1; members = @(); error = 'scan-failed: denied' }) -WaitMs 1200 -Scan { @() }\n"
+            "$empty = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @((Row 400 4 $t)) }\n"
+            "[ordered]@{ late = $late.confirmed; lateSurvivors = @($late.survivors); rootChild = $rootChild.confirmed; zero = $zero.confirmed; slow = $slow.confirmed;\n"
+            "            slowWhy = $slow.error; str = $str.confirmed; empty = $empty.confirmed } | ConvertTo-Json -Compress")
+        self.assertFalse(got["late"], got)
+        self.assertEqual(sorted(got["lateSurvivors"]), [202, 203], got)
+        self.assertFalse(got["rootChild"], "a child the root started after the snapshot is a survivor too")
+        self.assertFalse(got["zero"], got)
+        self.assertFalse(got["slow"], got)
+        self.assertEqual(got["slowWhy"], "scan-ended-past-the-bound", got)
+        self.assertFalse(got["str"], got)
+        self.assertTrue(got["empty"], "a tree with no live member and no live descendant is confirmed gone")
+
+    def test_r1_fix2_a_found_descendant_stays_recorded_and_no_scan_starts_past_the_bound(self) -> None:
+        """r1 fix 2 on 348c4357. A1: the first scan finds 202 (parent 201) and 203 (parent 202); the second shows only 203, whose parent is gone: 203 is still a
+        survivor. A2: with a survivor that never goes, every scan starts while CIM's 1 s floor is still left, and a bound under 1 s runs no scan at all."""
+        got = self.snapshot_and_wait(
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)), (Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 400 4 $t), (Row 600 999 $t.AddHours(-1)))\n"
+            "$n = [ref]0\n"
+            "$kept = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1600 -Scan { $n.Value++; if ($n.Value -eq 1) { @((Row 202 201 $t.AddSeconds(5)), (Row 203 202 $t.AddSeconds(6))) } else { @((Row 203 202 $t.AddSeconds(6))) } }\n"
+            "$sw = [Diagnostics.Stopwatch]::StartNew(); $starts = [System.Collections.Generic.List[double]]::new()\n"
+            "$stuck = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1800 -Scan { $starts.Add($sw.Elapsed.TotalMilliseconds); @((Row 201 100 $t.AddSeconds(1))) }\n"
+            "$total = $sw.Elapsed.TotalMilliseconds\n"
+            "$m = [ref]0\n"
+            "$tight = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 900 -Scan { $m.Value++; @() }\n"
+            "[ordered]@{ kept = $kept.confirmed; keptSurvivors = @($kept.survivors); scans = $n.Value; stuck = $stuck.confirmed; lastStart = ($starts | Measure-Object -Maximum).Maximum;\n"
+            "            total = $total; tight = $tight.confirmed; tightScans = $m.Value; tightWhy = $tight.error } | ConvertTo-Json -Compress")
+        self.assertFalse(got["kept"], got)
+        self.assertEqual(got["keptSurvivors"], [203], got)
+        self.assertGreaterEqual(got["scans"], 2, got)
+        self.assertFalse(got["stuck"], got)
+        self.assertLessEqual(got["lastStart"], 1800 - 1000 + 50, f"no scan starts once less than the 1 s floor is left: {got}")
+        self.assertLess(got["total"], 1800 + 300, got)
+        self.assertFalse(got["tight"], got)
+        self.assertEqual(got["tightScans"], 0, got)
+        self.assertEqual(got["tightWhy"], "no-time-to-confirm", got)
+
+    def test_the_venue_bounded_process_confirms_its_kill_by_the_whole_tree(self) -> None:
+        """Sibling (pass 26 A1 siblings): Invoke-VenueBoundedProcess (VenueChain.psm1) confirmed its kill by the root's HasExited; Invoke-VenueLeaseBatch.ps1 reads that
+        killConfirmed for both export budget preflight children. A descendant that outlives the root now leaves it unconfirmed."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            dv = root / "tools" / "profiling" / "dual-venue"
+            shutil.copytree(DV, dv, ignore=shutil.ignore_patterns("__pycache__", "legs", "legsets", "receipts"))
+            (root / "tools" / "profiling" / "bachelor").mkdir(parents=True)
+            shutil.copyfile(ARTIFACTS_MODULE, root / "tools" / "profiling" / "bachelor" / "AttrCudaArtifacts.psm1")
+            module = dv / "VenueChain.psm1"
+            text = module.read_text(encoding="utf-8")
+            self.assertEqual(text.count("try { $p.Kill($true) }"), 1, "the survivor seam must apply")
+            module.write_text(text.replace("try { $p.Kill($true) }", "try { $p.Kill() }"), encoding="utf-8")
+            pid_file = root / "child.pid"
+            script = root / "run.ps1"
+            script.write_text(
+                "$ErrorActionPreference = 'Stop'\n"
+                f"Import-Module '{module}' -Force -DisableNameChecking\n"
+                f"$childPid = $null; function Test-FixtureChild($id) {{ if ($null -eq $id) {{ return $false }}; $ft = try {{ [int64]((Get-Content -LiteralPath '{pid_file}' -Raw).Trim() -split ' ')[1] }} catch {{ $null }}; $cp = Get-Process -Id $id -ErrorAction SilentlyContinue; ($null -ne $cp) -and ($null -ne $ft) -and ($cp.StartTime.ToFileTimeUtc() -eq $ft) }}\n"
+                "try {\n"
+                f"    $r = Invoke-VenueBoundedProcess -FilePath (Get-Process -Id $PID).Path -ArgumentList @('-NoProfile', '-Command', @'\n{TREE_ROOT_COMMAND.format(pid_file=pid_file)}\n'@) -TimeoutSec 6 -CleanupWaitMs 3000\n"
+                f"    $childPid = try {{ [int]((Get-Content -LiteralPath '{pid_file}' -Raw).Trim() -split ' ')[0] }} catch {{ $null }}\n"
+                "    $childAlive = Test-FixtureChild $childPid\n"
+                "    [ordered]@{ timedOut = $r.timedOut; killConfirmed = $r.killConfirmed; childStarted = ($null -ne $childPid); childAlive = $childAlive } | ConvertTo-Json -Compress\n"
+                "} finally {\n"
+                f"    if ($null -eq $childPid) {{ $childPid = try {{ [int]((Get-Content -LiteralPath '{pid_file}' -Raw).Trim() -split ' ')[0] }} catch {{ $null }} }}\n"
+                "    if (Test-FixtureChild $childPid) { Stop-Process -Id $childPid -Force -ErrorAction SilentlyContinue }\n"
+                "}\n", encoding="utf-8")
+            proc = run_pwsh(["-File", str(script)], timeout=300)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            got = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertTrue(got["childStarted"] and got["childAlive"], f"the seam left a live descendant after the root exited: {got}")
+        self.assertTrue(got["timedOut"], got)
+        self.assertFalse(got["killConfirmed"], f"a live descendant is never a confirmed kill: {got}")
+
+    def test_r3_a_late_grandchild_whose_parents_are_gone_is_a_survivor(self) -> None:
+        """r3, adversary A1 on 4d69f211. After the snapshot, member 201 starts 202, 202 starts 203, then 201 and 202 exit: the scan shows only 203, whose parent is gone.
+        Its ancestry cannot be proved either way, and it was created after the root, so it is a survivor (fail closed). Same for a parent pid that a YOUNGER process
+        now holds (a reused number cannot be 203's parent). Controls: a process whose live parent is older (pid 4, System) and an orphan created before the root are
+        not survivors."""
+        got = self.snapshot_and_wait(
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)), (Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 400 4 $t), (Row 600 999 $t.AddHours(-1)))\n"
+            "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
+            "$orphan = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 203 202 $t.AddSeconds(4)))) }\n"
+            "$young = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 203 202 $t.AddSeconds(4)), (Row 202 4 $t.AddSeconds(9)))) }\n"
+            "$chain = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 202 777 $t.AddSeconds(3)), (Row 203 202 $t.AddSeconds(4)))) }\n"
+            "$unrelated = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 500 4 $t.AddSeconds(4)), (Row 600 999 $t.AddHours(-1)))) }\n"
+            # r3 fix 2 (adversary A1 on 6b788356): after a one-hour clock rollback 203 reads OLDER than the root; it is still no outsider the snapshot saw
+            "$rollback = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 203 202 $t.AddHours(-1).AddSeconds(4)))) }\n"
+            # a pre-snapshot orphan (its parent 202 already gone) created after the root is a member of the snapshot itself
+            "$pre = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 203 202 $t.AddSeconds(4)), (Row 600 999 $t.AddHours(-1))))\n"
+            "$preWait = Wait-AttrCudaProcessTreeGone -Snapshot $pre -WaitMs 1200 -Scan { @($sys + @((Row 203 202 $t.AddSeconds(4)), (Row 600 999 $t.AddHours(-1)))) }\n"
+            # adversary A2 advisory on 6b788356: a snapshot missing its fields under strict mode is an unknown tree, never a throw
+            "Set-StrictMode -Version Latest\n"
+            "$bare = Wait-AttrCudaProcessTreeGone -Snapshot ([pscustomobject]@{}) -WaitMs 1200 -Scan { @() }\n"
+            "$noErr = Wait-AttrCudaProcessTreeGone -Snapshot ([pscustomobject]@{ ok = $false }) -WaitMs 1200 -Scan { @() }\n"
+            "Set-StrictMode -Off\n"
+            "[ordered]@{ orphan = $orphan.confirmed; orphanSurvivors = @($orphan.survivors); young = $young.confirmed; youngSurvivors = @($young.survivors);\n"
+            "            chain = $chain.confirmed; chainSurvivors = @($chain.survivors); unrelated = $unrelated.confirmed;\n"
+            "            rollback = $rollback.confirmed; rollbackSurvivors = @($rollback.survivors); preMembers = @($pre.members | ForEach-Object { $_.processId });\n"
+            "            preOthers = @($pre.others.Keys | Sort-Object); preWait = $preWait.confirmed; bare = $bare.confirmed; noErr = $noErr.confirmed; noErrWhy = $noErr.error } | ConvertTo-Json -Compress")
+        self.assertFalse(got["orphan"], f"a late grandchild with no provable ancestry is never confirmed gone: {got}")
+        self.assertEqual(got["orphanSurvivors"], [203], got)
+        self.assertFalse(got["young"], got)
+        self.assertEqual(got["youngSurvivors"], [203], f"a parent younger than its child is a reused number, not the parent: {got}")
+        self.assertFalse(got["chain"], got)
+        self.assertEqual(sorted(got["chainSurvivors"]), [202, 203], got)
+        self.assertTrue(got["unrelated"], f"a process under a live older outsider, or an outsider the snapshot saw, is not the tree: {got}")
+        self.assertFalse(got["rollback"], f"a clock stepped back never proves a late orphan predates the tree: {got}")
+        self.assertEqual(got["rollbackSurvivors"], [203], got)
+        self.assertEqual(sorted(got["preMembers"]), [201, 203], f"an orphan created after the root is a snapshot member: {got}")
+        self.assertEqual(got["preOthers"], [0, 4, 600], got)
+        self.assertFalse(got["preWait"], got)
+        self.assertFalse(got["bare"], got)
+        self.assertFalse(got["noErr"], got)
+        self.assertIn("tree-unknown", got["noErrWhy"])
+
+    def test_r5b_a_clock_stepped_back_makes_the_tree_unknown_and_the_kill_unconfirmed(self) -> None:
+        """r5b, adversary A1 and A2 on 2420b65f, plus advisory A4. A1: the clock is stepped back an hour after the root (T) and member 201 started, and a pre-snapshot
+        orphan 203 (parent 202 already gone) reads OLDER than the root; the old code classified it as an outsider and confirmed the kill while it lived. A creation time
+        ahead of the clock proves the step, so the snapshot is unknown. A2: the same on the wait side, with a reused parent pid. Controls: a normal clock, and a skew
+        inside the 2 s tolerance (r6: cut from 10 s; a 5 s rollback is now a step), change nothing. A4: a snapshot whose property getter throws is an unknown tree, never a throw."""
+        got = self.snapshot_and_wait(
+            "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
+            "$rows = @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 203 202 $t.AddHours(-1).AddSeconds(4)), (Row 600 4 $t.AddHours(-2))))\n"
+            "$back = $t.AddHours(-1).AddMinutes(10).Ticks\n"
+            "$a1 = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes $rows -NowTicks $back\n"
+            "$a1Control = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes $rows -NowTicks $t.AddMinutes(5).Ticks\n"
+            "$skew = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes $rows -NowTicks $t.AddSeconds(-1).Ticks\n"
+            # r6 (adversary pass 7 A1(b)): a five-second rollback is past the 2 s tolerance, on the snapshot side and on the wait side
+            "$a1b = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes $rows -NowTicks $t.AddSeconds(-5).Ticks\n"
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 600 4 $t.AddHours(-2)))) -NowTicks $t.AddMinutes(5).Ticks\n"
+            "$scan = { @($sys + @((Row 600 4 $t.AddHours(-2)), (Row 202 600 $t.AddMinutes(-1)), (Row 203 202 $t.AddSeconds(4)))) }\n"
+            "$a2 = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan $scan -NowTicks $t.AddMinutes(-1).AddSeconds(30).Ticks\n"
+            "$a2Control = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 201 100 $t.AddSeconds(1)))) } -NowTicks $t.AddMinutes(5).Ticks\n"
+            "$a2b = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 201 100 $t.AddSeconds(1)))) } -NowTicks $t.AddSeconds(-5).Ticks\n"
+            "$a2Skew = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 201 100 $t.AddSeconds(1)))) } -NowTicks $t.AddSeconds(-1).Ticks\n"
+            "$getter = [pscustomobject]@{ rootProcessId = 100; rootCreationTicks = 1; members = @(); error = $null }\n"
+            "Add-Member -InputObject $getter -MemberType ScriptProperty -Name ok -Value { throw 'snapshot getter failed' }\n"
+            "$a4 = Wait-AttrCudaProcessTreeGone -Snapshot $getter -WaitMs 1200 -Scan { @() }\n"
+            "[ordered]@{ a1 = $a1.ok; a1Why = $a1.error; a1Control = $a1Control.ok; skew = $skew.ok; a1b = $a1b.ok; a1bWhy = $a1b.error; a2 = $a2.confirmed; a2Why = $a2.error; a2Control = $a2Control.confirmed;\n"
+            "            a2b = $a2b.confirmed; a2bWhy = $a2b.error; a2Skew = $a2Skew.confirmed; a2SkewWhy = $a2Skew.error;\n"
+            "            a2ControlSurvivors = @($a2Control.survivors); a4 = $a4.confirmed; a4Why = $a4.error } | ConvertTo-Json -Compress")
+        self.assertFalse(got["a1"], f"a creation time ahead of the clock means a stepped-back clock: the tree is unknown: {got}")
+        self.assertIn("clock-stepped-back", got["a1Why"], got)
+        self.assertTrue(got["a1Control"], f"a normal clock changes nothing: {got}")
+        self.assertTrue(got["skew"], f"a skew inside the 2 s tolerance is not a step: {got}")
+        self.assertFalse(got["a1b"], f"r6 A1(b): a five-second rollback is past the 2 s tolerance: the tree is unknown: {got}")
+        self.assertIn("clock-stepped-back", got["a1bWhy"], got)
+        self.assertFalse(got["a2b"], f"r6 A1(b): a five-second rollback on the wait side is never a confirmed kill: {got}")
+        self.assertIn("clock-stepped-back", got["a2bWhy"], got)
+        self.assertNotIn("clock-stepped-back", str(got["a2SkewWhy"]), f"a 2 s skew on the wait side is inside the tolerance: {got}")
+        self.assertFalse(got["a2"], f"a live descendant is never confirmed gone on a stepped-back clock: {got}")
+        self.assertIn("clock-stepped-back", got["a2Why"], got)
+        self.assertFalse(got["a2Control"], f"a normal clock still names the live recorded member 201 as a survivor: {got}")
+        self.assertEqual(got["a2ControlSurvivors"], [201], got)
+        self.assertFalse(got["a4"], got)
+        self.assertIn("tree-unknown", got["a4Why"], got)
+
+    def test_r6_no_scan_is_granted_with_under_its_one_second_floor_left(self) -> None:
+        """r6, adversary pass 7 A2 on e75704ae. The wait granted `Max(1, floor(left/1000))` s from a budget read earlier, so a scan could start with 950 ms left and end past
+        the bound; Invoke-VenueBoundedProcess did the same from a stored leftMs. Behavior: a -WaitMs under 1 s starts no scan; 1200 ms starts one. Source: the grant re-reads
+        the clock where the timeout is computed, breaks under the floor, and no 1 s minimum is forced on either site."""
+        got = self.snapshot_and_wait(
+            "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1))))\n"
+            "$global:scans = 0\n"
+            "$under = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 950 -Scan { $global:scans++; @($sys) }\n"
+            "$underScans = $global:scans; $global:scans = 0\n"
+            "$fits = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { $global:scans++; @($sys) }\n"
+            "[ordered]@{ under = $under.confirmed; underWhy = $under.error; underScans = $underScans; fits = $fits.confirmed; fitsScans = $global:scans } | ConvertTo-Json -Compress")
+        self.assertFalse(got["under"], f"a bound under the 1 s floor is no time to confirm: {got}")
+        self.assertEqual(got["underScans"], 0, f"no scan starts with under 1 s left: {got}")
+        self.assertEqual(got["underWhy"], "no-time-to-confirm", got)
+        self.assertTrue(got["fits"], got)
+        self.assertEqual(got["fitsScans"], 1, got)
+        wait_src = ARTIFACTS_MODULE.read_text(encoding="utf-8")
+        start = wait_src.index("function Wait-AttrCudaProcessTreeGone")
+        body = wait_src[start:wait_src.index("function Get-AttrCudaProcessCpuSnapshot")]
+        self.assertIn("$remainMs = $WaitMs - $clock.ElapsedMilliseconds\n", body)
+        self.assertIn("if ($remainMs -lt $scanFloorMs) { break }", body, "the floor is re-checked where the scan's timeout is granted")
+        self.assertNotIn("[Math]::Max(1,", body, "no 1 s minimum is forced on a scan the budget cannot cover")
+        venue = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
+        line = next(ln for ln in venue.splitlines() if "Get-AttrCudaProcessTreeSnapshot -RootProcessId $p.Id" in ln)
+        self.assertIn("$grantSec = [int][Math]::Floor(($CleanupWaitMs - $cleanup.ElapsedMilliseconds) / 1000.0); if ($grantSec -ge 1)", line)
+        self.assertNotIn("$leftMs", line, "the snapshot timeout is read at the grant, never from a stored value")
+
+    def test_r3_a_new_child_on_a_reused_member_pid_is_a_survivor(self) -> None:
+        """r3, adversary A2 on 4d69f211. Old member 201 exits; the root starts a NEW child that reuses pid 201 (another creation time). It is not the recorded identity,
+        but its parent is the root, so the walk adopts it: identity is (pid, creation time), and a recorded pid number never hides a new process."""
+        got = self.snapshot_and_wait(
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)), (Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 400 4 $t), (Row 600 999 $t.AddHours(-1)))\n"
+            "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
+            "$reuse = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 201 100 $t.AddSeconds(5)))) }\n"
+            "$grand = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 201 100 $t.AddSeconds(5)), (Row 300 201 $t.AddSeconds(6)))) }\n"
+            "[ordered]@{ reuse = $reuse.confirmed; reuseSurvivors = @($reuse.survivors); grand = $grand.confirmed; grandSurvivors = @($grand.survivors) } | ConvertTo-Json -Compress")
+        self.assertFalse(got["reuse"], f"a new child of the root on a reused member pid is a survivor: {got}")
+        self.assertEqual(got["reuseSurvivors"], [201], got)
+        self.assertFalse(got["grand"], got)
+        self.assertEqual(sorted(got["grandSurvivors"]), [201, 300], got)
+
+    def test_r3_the_bounded_process_starts_no_tree_scan_once_its_cleanup_budget_is_spent(self) -> None:
+        """r3, adversary A3 on 4d69f211. Invoke-VenueBoundedProcess checked the ORIGINAL -CleanupWaitMs once, then gave the snapshot scan floor(CleanupWaitMs/1000) s
+        after the helper source loaded. Here the source takes 1600 ms to load under a 1500 ms budget: no scan may start, and the kill is unconfirmed. With 5000 ms
+        and a 1200 ms load, the scan gets at most the remaining whole seconds (3), never the original 5."""
+        module = DV / "VenueChain.psm1"
+        fake = ("function Get-AttrCudaProcessTreeSnapshot { param($RootProcessId, $OperationTimeoutSec) $global:snapCalls++; $global:snapTimeout = $OperationTimeoutSec; "
+                "[pscustomobject]@{ ok = $true; rootProcessId = [int64]$RootProcessId; rootCreationTicks = [int64]1; members = @(); error = $null } }\n"
+                "function Wait-AttrCudaProcessTreeGone { param($Snapshot, $WaitMs) [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }")
+        got = json.loads(run_pwsh(["-Command",
+            "$ErrorActionPreference = 'Stop'\n"
+            f"$m = Import-Module '{module}' -Force -DisableNameChecking -PassThru\n"
+            f"$global:fakeSrc = @'\n{fake}\n'@\n"
+            "& $m { function script:Get-VenueProcessTreeHelperSource { Start-Sleep -Milliseconds $global:srcDelay; $global:fakeSrc } }\n"
+            "$exe = (Get-Process -Id $PID).Path; $out = [ordered]@{}\n"
+            "foreach ($case in @(@('spent', 1600, 1500), @('left', 1200, 5000))) {\n"
+            "    $global:snapCalls = 0; $global:snapTimeout = $null; $global:srcDelay = $case[1]\n"
+            "    $r = Invoke-VenueBoundedProcess -FilePath $exe -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 60') -TimeoutSec 1 -CleanupWaitMs $case[2]\n"
+            "    $out[$case[0]] = [ordered]@{ timedOut = $r.timedOut; killConfirmed = $r.killConfirmed; snapCalls = $global:snapCalls; snapTimeout = $global:snapTimeout }\n"
+            "}\n"
+            "$out | ConvertTo-Json -Compress -Depth 4"], timeout=300).stdout.strip().splitlines()[-1])
+        self.assertTrue(got["spent"]["timedOut"], got)
+        self.assertEqual(got["spent"]["snapCalls"], 0, f"no tree scan starts after the cleanup budget is spent: {got}")
+        self.assertFalse(got["spent"]["killConfirmed"], f"a tree never scanned is an unconfirmed kill: {got}")
+        self.assertEqual(got["left"]["snapCalls"], 1, got)
+        self.assertLessEqual(got["left"]["snapTimeout"], 3, f"the scan gets only the whole seconds that remain: {got}")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5048,6 +5048,238 @@ function Get-AttrCudaQuiescenceSample {
     }
 }
 
+function Get-AttrCudaProcessTreeSnapshot {
+    <#
+    .SYNOPSIS
+    EXPORT-KILL-DESCENDANT-CONFIRM-1: the descendants of a LIVE root, each {processId, creationTicks}, recorded BEFORE a tree kill (afterwards their parents are
+    gone and the tree cannot be walked), so Wait-AttrCudaProcessTreeGone can confirm every one of them gone. Kill($true) returning and the root's wait reading
+    true do not prove that: a descendant (ffmpeg under the export) can still run.
+    .DESCRIPTION
+    ONE Win32_Process scan (bounded by -OperationTimeoutSec), walked in memory from the root by ParentProcessId alone. Creation times are NOT used to order a child
+    after its parent (r1 fix iteration, adversary A2 on 2223cc4d): they are clock values, and a clock stepped back makes a real child read older than its parent. A
+    process that merely inherited a member's pid number is then adopted too; that can only make the kill UNCONFIRMED, never confirmed. Returns
+    [pscustomobject]@{ ok; rootProcessId; rootCreationTicks; members; error }. ok is $false -- the tree is NOT known and no caller may confirm it dead -- when the
+    scan throws, the root is not in it, or a row whose parent is a member has no readable pid or creation time. Never throws.
+    -Processes is the test seam: the rows of the scan (ProcessId, ParentProcessId, CreationDate).
+    #>
+    param([Parameter(Mandatory = $true)][int]$RootProcessId, [object[]]$Processes, [ValidateRange(1, 120)][int]$OperationTimeoutSec = 20, [int64]$NowTicks)
+    $unknown = { param([string]$Why) [pscustomobject]@{ ok = $false; rootProcessId = [int64]$RootProcessId; rootCreationTicks = $null; members = @(); error = $Why } }
+    try {
+        $rows = if ($PSBoundParameters.ContainsKey('Processes')) { @($Processes) } else { @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec $OperationTimeoutSec -ErrorAction Stop) }
+        # r5b fix (adversary A1 on 2420b65f; r6 tolerance 10 s -> 2 s): a creation time AHEAD of the clock (beyond 2 s of skew) proves the clock was stepped back after that process started, so the
+        # creation-time ordering the orphan classification below relies on is untrustworthy: the tree is unknown (fail closed), never classified by a rolled-back clock.
+        # -NowTicks is the test seam; the check is inline because VenueChain and DualVenueRunner embed this function alone, by name.
+        $nowTicks = $(if ($PSBoundParameters.ContainsKey('NowTicks')) { [int64]$NowTicks } else { [DateTime]::UtcNow.Ticks })
+        foreach ($row in $rows) {
+            if ($null -ne $row -and $null -ne $row.CreationDate -and ([datetime]$row.CreationDate).ToUniversalTime().Ticks -gt ($nowTicks + 20000000L)) { return (& $unknown "clock-stepped-back pid=$($row.ProcessId)") }
+        }
+        $byParent = @{}
+        $rootTicks = $null
+        foreach ($row in $rows) {
+            if ($null -eq $row) { continue }
+            if ($null -ne $row.ProcessId -and [int64]$row.ProcessId -eq [int64]$RootProcessId) {
+                if ($null -eq $row.CreationDate) { return (& $unknown 'root-creation-unreadable') }
+                $rootTicks = ([datetime]$row.CreationDate).ToUniversalTime().Ticks
+            }
+            if ($null -eq $row.ParentProcessId) { continue }
+            $parentKey = [int64]$row.ParentProcessId
+            if (-not $byParent.ContainsKey($parentKey)) { $byParent[$parentKey] = [System.Collections.Generic.List[object]]::new() }
+            $byParent[$parentKey].Add($row)
+        }
+        if ($null -eq $rootTicks) { return (& $unknown "root-not-in-scan pid=$RootProcessId") }
+        $members = [System.Collections.Generic.List[object]]::new()
+        $seen = [System.Collections.Generic.HashSet[int64]]::new()
+        [void]$seen.Add([int64]$RootProcessId)
+        $queue = [System.Collections.Generic.Queue[object]]::new()
+        $queue.Enqueue([pscustomobject]@{ processId = [int64]$RootProcessId; creationTicks = $rootTicks })
+        while ($queue.Count -gt 0) {
+            $parent = $queue.Dequeue()
+            if (-not $byParent.ContainsKey($parent.processId)) { continue }
+            foreach ($child in $byParent[$parent.processId]) {
+                if ($null -eq $child.ProcessId -or $null -eq $child.CreationDate) { return (& $unknown "descendant-unreadable parent=$($parent.processId)") }
+                $childPid = [int64]$child.ProcessId
+                $childTicks = ([datetime]$child.CreationDate).ToUniversalTime().Ticks
+                if ($seen.Contains($childPid)) { continue }
+                [void]$seen.Add($childPid)
+                $member = [pscustomobject]@{ processId = $childPid; creationTicks = $childTicks }
+                $members.Add($member)
+                $queue.Enqueue($member)
+            }
+        }
+        # r3 fix 2 (adversary A1 on 4d69f211 and on 6b788356): a row the walk did not reach climbs ParentProcessId while the parent is in this scan and no younger than
+        # the child. A climb that stops at a process created AFTER the root (its parent gone, younger or unreadable) cannot be proved outside the tree: its rows are
+        # members. Every other row is recorded in .others by identity (pid -> creation ticks): the processes known to exist outside the tree BEFORE the kill. The wait
+        # then needs no clock to judge a later orphan: one that is not a known outsider is unproven, whatever its creation time reads.
+        $memberIds = @{}
+        $memberIds[[int64]$RootProcessId] = $rootTicks
+        foreach ($m in $members) { $memberIds[$m.processId] = $m.creationTicks }
+        $rowTicks = @{}
+        $rowParent = @{}
+        foreach ($row in $rows) {
+            if ($null -eq $row -or $null -eq $row.ProcessId) { continue }
+            $rp = [int64]$row.ProcessId
+            $rowTicks[$rp] = $(if ($null -eq $row.CreationDate) { $null } else { ([datetime]$row.CreationDate).ToUniversalTime().Ticks })
+            $rowParent[$rp] = $(if ($null -eq $row.ParentProcessId) { $null } else { [int64]$row.ParentProcessId })
+        }
+        $late = @{}
+        foreach ($start in @($rowTicks.Keys)) {
+            if ($memberIds.ContainsKey([int64]$start) -or $late.ContainsKey([int64]$start)) { continue }
+            $climb = [System.Collections.Generic.List[int64]]::new()
+            $cur = [int64]$start
+            $verdict = $false
+            while ($true) {
+                if ($late.ContainsKey($cur)) { $verdict = $late[$cur]; break }
+                if ($memberIds.ContainsKey($cur)) { $verdict = $true; break }
+                $climb.Add($cur)
+                $curTicks = $rowTicks[$cur]
+                $up = $rowParent[$cur]
+                if ($null -ne $up -and $null -ne $curTicks -and $up -ne $cur -and -not $climb.Contains($up) -and $rowTicks.ContainsKey($up) -and $null -ne $rowTicks[$up] -and [int64]$rowTicks[$up] -le [int64]$curTicks) { $cur = $up; continue }
+                $verdict = ($null -ne $curTicks) -and ([int64]$curTicks -gt [int64]$rootTicks)
+                break
+            }
+            foreach ($q in $climb) { $late[$q] = $verdict }
+        }
+        $others = @{}
+        foreach ($q in @($late.Keys)) {
+            if ($late[$q]) { $members.Add([pscustomobject]@{ processId = [int64]$q; creationTicks = $rowTicks[$q] }) } else { $others[[int64]$q] = $rowTicks[$q] }
+        }
+        [pscustomobject]@{ ok = $true; rootProcessId = [int64]$RootProcessId; rootCreationTicks = $rootTicks; members = @($members); others = $others; error = $null }
+    } catch { & $unknown "scan-failed: $([string]$_.Exception.Message -replace '\s+', ' ')" }
+}
+
+function Wait-AttrCudaProcessTreeGone {
+    <#
+    .SYNOPSIS
+    EXPORT-KILL-DESCENDANT-CONFIRM-1: confirm that every member of a Get-AttrCudaProcessTreeSnapshot is gone, one Win32_Process scan every 250 ms for at most -WaitMs.
+    .DESCRIPTION
+    A SURVIVOR, in one scan, is (a) a recorded member (or the root) whose pid shows with its recorded creation time, or with no readable creation time (a reuse
+    cannot be told apart then), or (b) r1 fix iteration (adversary A1 on 2223cc4d): any live process whose ParentProcessId chain reaches the root or a recorded
+    member, so a child started after the snapshot by a member that then exited is still found, or (c) r3 (adversary A1 on 4d69f211): any live process whose
+    ancestry cannot be proved -- climbing ParentProcessId while the parent is in the scan and no younger than the child, the climb stops at a process (its parent gone,
+    younger, or unreadable) that is not an outsider the snapshot recorded in .others by pid and creation time (r3 fix 2: no clock comparison, so a clock stepped back
+    proves nothing) -- so a grandchild whose parents both exited is never confirmed gone. The same
+    pid with ANOTHER creation time is a reused number, not a survivor by (a); it is still adopted by (b) or (c) on its own row (r3, adversary A2 on 4d69f211: identity
+    is pid and creation time, a recorded number never hides a new process), which can only leave the kill unconfirmed. A survivor (b) or (c) finds stays recorded for
+    every later scan. Budget (adversary A3 on 2223cc4d, A2 on 348c4357): a scan starts only while CIM's 1 s floor is left, under a timeout no longer than what is left; a scan
+    that ENDS past -WaitMs confirms nothing, and a -WaitMs under 1 s is no time to confirm. Returns
+    [pscustomobject]@{ confirmed; survivors; error }: confirmed is $true only when the snapshot's ok is the boolean $true and a scan that ended inside -WaitMs showed
+    no survivor. Anything else is $false (fail closed). Never throws. -Scan is the test seam: a scriptblock returning the rows of one scan.
+    #>
+    param([Parameter(Mandatory = $true)][AllowNull()]$Snapshot, [ValidateRange(0, 600000)][int]$WaitMs = 15000, [scriptblock]$Scan, [int64]$NowTicks)
+    # r3 fix 2 (adversary A2 advisory on 6b788356): every snapshot field is read through PSObject.Properties, so a snapshot missing one (under strict mode) is an
+    # unknown tree, never a throw. r5b fix (adversary A4 on 2420b65f): a property getter that throws is read inside the same guard.
+    $snapProps = $null
+    try {
+        if ($null -ne $Snapshot) { $snapProps = $Snapshot.PSObject.Properties }
+        $snapOk = ($null -ne $snapProps) -and ($null -ne $snapProps['ok']) -and ($snapProps['ok'].Value -is [bool]) -and [bool]$snapProps['ok'].Value
+        if (-not $snapOk -or $null -eq $snapProps['rootProcessId'] -or $null -eq $snapProps['rootProcessId'].Value -or $null -eq $snapProps['rootCreationTicks'] -or $null -eq $snapProps['rootCreationTicks'].Value) {
+            $why = $(if ($null -eq $Snapshot) { 'no snapshot' } elseif ($null -ne $snapProps -and $null -ne $snapProps['error']) { [string]$snapProps['error'].Value } else { 'snapshot fields missing' })
+            return [pscustomobject]@{ confirmed = $false; survivors = @(); error = "tree-unknown: $why" }
+        }
+    } catch { return [pscustomobject]@{ confirmed = $false; survivors = @(); error = "tree-unknown: unreadable snapshot" } }
+    # r1 fix 2 (adversary A3 advisory on 348c4357): a snapshot whose identities do not convert is an unknown tree, never a throw.
+    $recorded = @{}
+    $known = @{}
+    try {
+        $recorded[[int64]$Snapshot.rootProcessId] = [int64]$Snapshot.rootCreationTicks
+        foreach ($m in @($(if ($null -ne $snapProps['members']) { $snapProps['members'].Value } else { @() }))) { $recorded[[int64]$m.processId] = $(if ($null -eq $m.creationTicks) { $null } else { [int64]$m.creationTicks }) }
+        # r3 fix 2 (adversary A1 on 6b788356): the outsiders the snapshot saw (pid -> creation ticks). A snapshot without them knows no outsider: every orphan is unproven.
+        $othersRaw = $(if ($null -ne $snapProps['others']) { $snapProps['others'].Value } else { $null })
+        if ($othersRaw -is [hashtable]) { foreach ($k in @($othersRaw.Keys)) { $known[[int64]$k] = $(if ($null -eq $othersRaw[$k]) { $null } else { [int64]$othersRaw[$k] }) } }
+    } catch { return [pscustomobject]@{ confirmed = $false; survivors = @(); error = "tree-unknown: unreadable snapshot identity" } }
+    # r1 fix 2 (adversary A2 on 348c4357): a scan is STARTED only while at least $scanFloorMs (CIM's own 1 s OperationTimeoutSec floor) is left, under a timeout no
+    # longer than what is left, and no sleep runs into that floor; so no scan is granted past the bound. A bound under 1 s is no time to confirm.
+    $scanFloorMs = 1000
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $survivors = @()
+    $lastError = 'no-time-to-confirm'
+    while (($WaitMs - $clock.ElapsedMilliseconds) -ge $scanFloorMs) {
+        try {
+            # r5b fix 2 (adversary A2 on e75704ae): the floor is re-checked at the moment the scan's timeout is granted (the 250 ms sleep and the work since the loop
+            # test have used budget), so a scan never starts, or is granted its 1 s minimum, with less than $scanFloorMs left.
+            $remainMs = $WaitMs - $clock.ElapsedMilliseconds
+            if ($remainMs -lt $scanFloorMs) { break }
+            $leftSec = [int][Math]::Floor($remainMs / 1000.0)
+            $rows = if ($null -ne $Scan) { @(& $Scan) } else { @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec $leftSec -ErrorAction Stop) }
+            # r5b fix (adversary A2 on 2420b65f; r6 tolerance 10 s -> 2 s): a creation time AHEAD of the clock (beyond 2 s of skew) proves the clock was stepped back after that process started; the
+            # creation-time ordering of the climb below is then untrustworthy, so the kill is UNCONFIRMED (fail closed), whatever the other rows show.
+            $nowTicks = $(if ($PSBoundParameters.ContainsKey('NowTicks')) { [int64]$NowTicks } else { [DateTime]::UtcNow.Ticks })
+            foreach ($futureRow in $rows) {
+                if ($null -ne $futureRow -and $null -ne $futureRow.CreationDate -and ([datetime]$futureRow.CreationDate).ToUniversalTime().Ticks -gt ($nowTicks + 20000000L)) {
+                    return [pscustomobject]@{ confirmed = $false; survivors = @($survivors); error = "clock-stepped-back pid=$($futureRow.ProcessId)" }
+                }
+            }
+            $byParent = @{}
+            $rowTicks = @{}
+            $rowParent = @{}
+            $found = [System.Collections.Generic.List[int64]]::new()
+            foreach ($row in $rows) {
+                if ($null -eq $row -or $null -eq $row.ProcessId) { continue }
+                $rowPid = [int64]$row.ProcessId
+                $ticks = $(if ($null -eq $row.CreationDate) { $null } else { ([datetime]$row.CreationDate).ToUniversalTime().Ticks })
+                $rowTicks[$rowPid] = $ticks
+                $rowParent[$rowPid] = $(if ($null -eq $row.ParentProcessId) { $null } else { [int64]$row.ParentProcessId })
+                # a recorded identity with no known creation time ($null: found by the walk with none readable) matches its pid whatever the creation time
+                if ($recorded.ContainsKey($rowPid) -and ($null -eq $ticks -or $null -eq $recorded[$rowPid] -or [int64]$ticks -eq [int64]$recorded[$rowPid])) { $found.Add($rowPid) }
+                if ($null -ne $row.ParentProcessId) {
+                    $parentKey = [int64]$row.ParentProcessId
+                    if (-not $byParent.ContainsKey($parentKey)) { $byParent[$parentKey] = [System.Collections.Generic.List[int64]]::new() }
+                    $byParent[$parentKey].Add($rowPid)
+                }
+            }
+            # r3 (adversary A2 on 4d69f211): identity is (pid, creation time). The walk is seeded by the recorded pid NUMBERS ($expanded: whose children were read), but a
+            # live row is adopted by its own entry in $adopted, never pre-seeded, so a NEW process on a reused member number whose parent is a member is a survivor.
+            $expanded = [System.Collections.Generic.HashSet[int64]]::new()
+            $adopted = [System.Collections.Generic.HashSet[int64]]::new()
+            $queue = [System.Collections.Generic.Queue[int64]]::new()
+            foreach ($k in @($recorded.Keys)) { [void]$expanded.Add([int64]$k); $queue.Enqueue([int64]$k) }
+            $discovered = [System.Collections.Generic.List[int64]]::new()
+            while ($queue.Count -gt 0) {
+                $parentPid = $queue.Dequeue()
+                if (-not $byParent.ContainsKey($parentPid)) { continue }
+                foreach ($childPid in $byParent[$parentPid]) {
+                    if ($adopted.Add($childPid)) { $found.Add($childPid); $discovered.Add($childPid) }
+                    if ($expanded.Add($childPid)) { $queue.Enqueue($childPid) }
+                }
+            }
+            # r3 (adversary A1 on 4d69f211): a live row the walk did not reach can still descend from the tree when its chain is broken (202 started 203, then 201 and 202
+            # exited). Climb ParentProcessId while the parent is in this scan and no younger than the child (a younger holder of the number is a reuse, not the parent).
+            # Where the climb stops, the top's parent is gone or unprovable; unless that top is an outsider the snapshot saw (same pid AND creation time, both
+            # readable), ancestry is unproven and every row on the climb is a survivor (fail closed), recorded from then on. r3 fix 2 (adversary A1 on 6b788356): no
+            # wall-clock comparison decides this, so a clock stepped back cannot make a late orphan read as older than the tree.
+            $unproven = @{}
+            foreach ($start in @($rowTicks.Keys)) {
+                if ($adopted.Contains([int64]$start) -or $unproven.ContainsKey([int64]$start)) { continue }
+                $climb = [System.Collections.Generic.List[int64]]::new()
+                $cur = [int64]$start
+                $verdict = $false
+                while ($true) {
+                    if ($unproven.ContainsKey($cur)) { $verdict = $unproven[$cur]; break }
+                    if ($adopted.Contains($cur)) { $verdict = $true; break }
+                    $climb.Add($cur)
+                    $curTicks = $rowTicks[$cur]
+                    $up = $rowParent[$cur]
+                    if ($null -ne $up -and $null -ne $curTicks -and $up -ne $cur -and -not $climb.Contains($up) -and $rowTicks.ContainsKey($up) -and $null -ne $rowTicks[$up] -and [int64]$rowTicks[$up] -le [int64]$curTicks) { $cur = $up; continue }
+                    $verdict = -not (($null -ne $curTicks) -and $known.ContainsKey($cur) -and ($null -ne $known[$cur]) -and ([int64]$known[$cur] -eq [int64]$curTicks))
+                    break
+                }
+                foreach ($q in $climb) { $unproven[$q] = $verdict }
+            }
+            foreach ($q in @($unproven.Keys)) { if ($unproven[$q] -and $adopted.Add([int64]$q)) { $found.Add([int64]$q); $discovered.Add([int64]$q) } }
+            # r1 fix 2 (adversary A1 on 348c4357): a descendant the walk found is recorded from then on, so a later scan still sees it after its parent exits.
+            foreach ($d in $discovered) { $recorded[$d] = $rowTicks[$d] }
+            $survivors = @($found | Sort-Object -Unique)
+            $lastError = 'survivors'
+            if ($clock.ElapsedMilliseconds -gt $WaitMs) { $lastError = 'scan-ended-past-the-bound'; break }
+            if ($survivors.Count -eq 0) { return [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }
+        } catch { $lastError = "scan-failed: $([string]$_.Exception.Message -replace '\s+', ' ')" }
+        $sleepMs = [Math]::Min(250, $WaitMs - $clock.ElapsedMilliseconds - $scanFloorMs)
+        if ($sleepMs -lt 0) { break }
+        if ($sleepMs -gt 0) { Start-Sleep -Milliseconds ([int]$sleepMs) }
+    }
+    [pscustomobject]@{ confirmed = $false; survivors = @($survivors); error = $lastError }
+}
+
 function Get-AttrCudaProcessCpuSnapshot {
     <#
     .SYNOPSIS
@@ -8323,6 +8555,8 @@ Export-ModuleMember -Function `
     Stop-AttrCudaDisplayWakeKeepAlive, `
     Get-AttrCudaQuiescenceSample, `
     Get-AttrCudaProcessCpuSnapshot, `
+    Get-AttrCudaProcessTreeSnapshot, `
+    Wait-AttrCudaProcessTreeGone, `
     Get-AttrCudaTopCpuProcesses, `
     Get-AttrCudaWindowsDisplayInventory, `
     Get-AttrCudaMeasurementVenue, `
