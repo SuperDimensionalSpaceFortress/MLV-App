@@ -6046,10 +6046,11 @@ $displayAsleepOverride = [ordered]@{'
 }
 if ($TelemetryArm -eq 'LIGHT') {
     # BENCH-LIGHT-ARM-GAIN-GATES-1 r8 (adversary r6 A2): the smoke child inherits this job's process environment, so a worker that carries an app control the job does not set (r6's input:
-    # MLVAPP_GPU_TEX_NR_READY_BACKLOG_TELEMETRY=1, a variable no list named) would run it inside an admitted LIGHT leg while the plan and sidecars say LIGHT. A hard-coded list of observer names
+    # the NR-ready backlog telemetry variable, set to 1, a variable no list named) would run it inside an admitted LIGHT leg while the plan and sidecars say LIGHT. A hard-coded list of observer names
     # cannot be complete, so a LIGHT job removes EVERY inherited MLVAPP_* variable of its own process that it does not itself set for the leg (an allowlist of what the job sets: the names
-    # in $envs), the same technique as the cpu leg's GL-viewport clear; removed, not set to 0, because some readers test only that the variable is set. One name is exempt: the hub-host fixture
-    # flag is read by the smoke runner itself (not the app) and decides whether it may run on a hub host at all; the recorded launch shows it. The text goes inside the existing
+    # in $envs), the same technique as the cpu leg's GL-viewport clear; removed, not set to 0, because some readers test only that the variable is set. One name is kept: the hub-host fixture
+    # flag is read by the smoke runner itself (not the app) and decides whether it may run on a hub host at all, so it stays for the smoke runner and the recorded launch shows it. Because no
+    # row of the LIGHT environment table names that flag, a fixture launch reads UNKNOWN for the arm: fixture legs are refused for fps on purpose. The text goes inside the existing
     # LIGHT-ARM-PRESENT-DIAG-1 region (so the region count and the byte identity of every other job stay as pinned), and only into a LIGHT job (the publish-write scan reads the default text).
     $template = Edit-DualVenueTemplate $template @'
 # LIGHT-ARM-PRESENT-DIAG-1 <<<

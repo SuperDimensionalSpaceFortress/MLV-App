@@ -154,7 +154,7 @@ class ArmClassifierTests(_Probe):
         # {"arm":"LIGHT"} there passed both record readers while the spec reader refuses it. The embedded value is a spec word: exactly the string LIGHT, nothing else.
         out = self.ok(
             "foreach ($embedded in @('\"LIGHT\"', '{\"arm\":\"LIGHT\"}', '[\"LIGHT\"]', '\"light\"')) {\n"
-            "    $rec = ('{\"telemetryArm\":\"LIGHT\",\"generatorArgs\":{\"telemetryArm\":' + $embedded + '}}') | ConvertFrom-Json\n"
+            "    $rec = ('{\"telemetryArm\":\"LIGHT\",\"legType\":\"speed\",\"generatorArgs\":{\"telemetryArm\":' + $embedded + '}}') | ConvertFrom-Json\n"
             "    Write-Host ('E=' + $embedded + ' LEG=' + (Get-FpsArmFromLegRecord $rec).arm + ' RESULT=' + (Get-FpsArmFromJobResult $rec).arm)\n"
             "}\n")
         got = {line.split(" LEG=")[0]: line.split(" LEG=")[1] for line in out.strip().splitlines()}
@@ -236,7 +236,9 @@ class ArmClassifierTests(_Probe):
         # r8: an observerControls list is no evidence at all (it is neither read nor trusted); the proof is a launch matching the producers' LIGHT shape, LIGHT generatorArgs, or a LIGHT spec
         self.assertEqual(self.arm("Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT'; observerControls = [pscustomobject]@{ utilSample = $false } })"), "ARM=UNKNOWN")
         self.assertEqual(self.arm(f"Get-FpsArmFromJobResult ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {RECORDED_LIGHT_LAUNCH} }})"), "ARM=LIGHT")
-        self.assertEqual(self.arm("Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT'; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' } })"), "ARM=LIGHT")
+        # r10 G10: LIGHT generatorArgs alone prove LIGHT only on a speed leg (re-baselined: the same record without a legType is UNKNOWN)
+        self.assertEqual(self.arm("Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT'; legType = 'speed'; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' } })"), "ARM=LIGHT")
+        self.assertEqual(self.arm("Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT'; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' } })"), "ARM=UNKNOWN")
         self.assertEqual(self.arm("Get-FpsArmFromJobResult ([pscustomobject]@{ sourceCommit = 'x' })"), "ARM=UNKNOWN")
         self.assertEqual(self.arm("Get-FpsArmFromJobResult $null"), "ARM=UNKNOWN")
 
@@ -1151,6 +1153,15 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
 OBSERVER_SPEC_KEYS = ("cudaLaunchTimingMinMs", "corePartitionTelemetry", "utilSample", "firstPresentCapture", "warmReuseMissDump")
 LIGHT_ENV = "'MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1'"
 
+# r10 G11: the raw environment reader judges an environment list without the launch members every producer records; only the module itself and this test file may name it
+ENVIRONMENT_READER = "Get-FpsArmFromEnvironment"
+ENVIRONMENT_READER_ALLOWED_PATHS = frozenset({"tools/profiling/FpsArmGate.psm1", "tools/repo_hygiene/test_fps_arm_gate.py"})
+
+
+def _callers_of_the_environment_reader(files: list[tuple[str, str]]) -> list[str]:
+    """The repo-relative paths, among the (path, text) pairs given, that name the raw environment reader and are not the module or this test."""
+    return sorted(path for path, text in files if ENVIRONMENT_READER in text and path.replace("\\", "/") not in ENVIRONMENT_READER_ALLOWED_PATHS)
+
 
 def _spec(**generator_args: str) -> str:
     """A pwsh expression for a LIGHT speed-leg spec whose generatorArgs also carry the given raw pwsh values."""
@@ -1314,6 +1325,45 @@ class ObserverControlTests(_Probe):
         body = "".join(f"Write-Host ('ARM=' + (Get-FpsArmFromEnvironment @({LIGHT_ENV}, '{n}=1') @()).arm)\n" for n in sorted(self.JOB_NAMES_A_LIGHT_LEG_DOES_NOT_CARRY))
         self.assertEqual(set(self.ok(body).split()), {"ARM=UNKNOWN"})
 
+    def test_g12_a_fixture_launch_reads_unknown_and_the_job_comment_names_no_variable_assignment(self) -> None:
+        # r10 G12 (Grok ask 7060550362): the LIGHT-job comment said the hub-host fixture flag is exempt and implied such a leg is still an admitted LIGHT leg. The code keeps the flag for the smoke
+        # runner, no row of the LIGHT environment table names it, so a fixture launch reads UNKNOWN: fixture legs are refused for fps on purpose. This UNKNOWN pin passes on 5aa4a230 too (it pins existing behaviour).
+        out = self.ok(f"Write-Host ('PLAIN=' + (Get-FpsArmFromEnvironment @({LIGHT_ENV}) @()).arm)\n"
+                      f"Write-Host ('FIXTURE=' + (Get-FpsArmFromEnvironment @({LIGHT_ENV}, 'MLVAPP_HUB_PLAYBACK_CI_FIXTURE=1') @()).arm)\n")
+        self.assertEqual(out.split(), ["PLAIN=LIGHT", "FIXTURE=UNKNOWN"])
+        job_lines = (PROFILING / "bachelor" / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8").splitlines()
+        start = next(i for i, line in enumerate(job_lines) if "BENCH-LIGHT-ARM-GAIN-GATES-1 r8 (adversary r6 A2)" in line)
+        end = start
+        while job_lines[end].lstrip().startswith("#"):
+            end += 1
+        block = " ".join(line.lstrip(" #") for line in job_lines[start:end])
+        self.assertGreater(end - start, 4, "the comment block under test was not found")
+        self.assertNotRegex(block, r"MLVAPP_[A-Z0-9_]+=", "a comment token the generator scan would read as an emitted variable")
+        self.assertIn("fixture legs are refused for fps on purpose", block)
+        self.assertNotIn("is exempt", block)
+
+    # --- r10 G11: nobody outside the module may call the raw environment reader --------------------------------------------------------------------------
+    def test_g11_the_guard_reports_a_caller_outside_the_module_in_a_synthetic_tree(self) -> None:
+        # RED proof of the guard: a reader script that calls the function is reported; the module and this test file are not; a file that only lacks the name is not.
+        reported = _callers_of_the_environment_reader([
+            ("tools/profiling/some-reader.ps1", "$arm = Get-FpsArmFromEnvironment $env @()"),
+            ("tools/profiling/FpsArmGate.psm1", "function Get-FpsArmFromEnvironment { }"),
+            ("tools/repo_hygiene/test_fps_arm_gate.py", "Get-FpsArmFromEnvironment"),
+            ("tools/profiling/other.ps1", "Get-FpsArmFromLaunch $launch"),
+        ])
+        self.assertEqual(reported, ["tools/profiling/some-reader.ps1"])
+
+    @unittest.skipIf(shutil.which("git") is None, "git is not on PATH")
+    def test_g11_no_tracked_file_outside_the_module_calls_the_raw_environment_reader(self) -> None:
+        # The raw environment reader judges an environment list WITHOUT the launch members every producer records, so a caller that holds a recorded launch must go through
+        # Get-FpsArmFromLaunch. It stays exported for the test probes; this scan keeps any other file from calling it. Tracked files only (git grep), no filesystem walk.
+        proc = subprocess.run(["git", "grep", "-l", "-F", "Get-FpsArmFromEnvironment"], cwd=ROOT, capture_output=True, text=True, creationflags=_NO_WINDOW)
+        self.assertIn(proc.returncode, (0, 1), proc.stderr)
+        paths = [p for p in proc.stdout.splitlines() if p.strip()]
+        self.assertIn("tools/profiling/FpsArmGate.psm1", paths, "the scan found nothing it should always find")
+        pairs = [(p, (ROOT / p).read_text(encoding="utf-8", errors="replace")) for p in paths]
+        self.assertEqual(_callers_of_the_environment_reader(pairs), [], "call Get-FpsArmFromLaunch (the launch block) instead of Get-FpsArmFromEnvironment")
+
     def test_a_result_that_records_observer_controls_is_judged_on_them(self) -> None:
         self.check({
             "Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT'; observerControls = [pscustomobject]@{ utilSample = $true } })": "UNKNOWN",
@@ -1420,21 +1470,25 @@ class ObserverControlTests(_Probe):
         recorded_off = self._json('{"telemetryArm":"LIGHT","observerControls":{"utilSample":false}}')
         launch = '{"environment":' + LIGHT_ENV_JSON + ',"arguments":' + PRODUCER_ARGS_JSON + '}'
         with_launch = self._json('{"telemetryArm":"LIGHT","launch":' + launch + '}')
+        # r10 (G10): generatorArgs proves LIGHT only on a speed leg, so a record with no legType reads UNKNOWN (re-baselined from LIGHT) and the legType 'speed' variant stays LIGHT
         with_ga = self._json('{"telemetryArm":"LIGHT","generatorArgs":{"telemetryArm":"LIGHT","presentTrace":true}}')
+        with_ga_speed = self._json('{"telemetryArm":"LIGHT","legType":"speed","generatorArgs":{"telemetryArm":"LIGHT","presentTrace":true}}')
         heavy = self._json('{"telemetryArm":"HEAVY","observerControls":{"utilSample":true}}')
         self.check({
             f"Get-FpsArmFromLegRecord {bare}": "UNKNOWN",
             f"Get-FpsArmFromLegRecord {empty}": "UNKNOWN",
             f"Get-FpsArmFromLegRecord {recorded_off}": "UNKNOWN",
             f"Get-FpsArmFromLegRecord {with_launch}": "LIGHT",
-            f"Get-FpsArmFromLegRecord {with_ga}": "LIGHT",
+            f"Get-FpsArmFromLegRecord {with_ga}": "UNKNOWN",
+            f"Get-FpsArmFromLegRecord {with_ga_speed}": "LIGHT",
             f"Get-FpsArmFromLegRecord {heavy}": "HEAVY",
             # the boundary the reader shares with a recorded result: the same record reads the same arm through both
             f"Get-FpsArmFromJobResult {bare}": "UNKNOWN",
             f"Get-FpsArmFromJobResult {empty}": "UNKNOWN",
             f"Get-FpsArmFromJobResult {recorded_off}": "UNKNOWN",
             f"Get-FpsArmFromJobResult {with_launch}": "LIGHT",
-            f"Get-FpsArmFromJobResult {with_ga}": "LIGHT",
+            f"Get-FpsArmFromJobResult {with_ga}": "UNKNOWN",
+            f"Get-FpsArmFromJobResult {with_ga_speed}": "LIGHT",
         })
         # through the verdict reader every caller uses (Get-FpsPairVerdict): an uncorroborated bare LIGHT/LIGHT pair is refused as UNKNOWN, a launch-proven pair is allowed
         out = self.ok(
@@ -1740,8 +1794,46 @@ class LightShapeAllowlistTests(_Probe):
                 cases[f"{reader} ([pscustomobject]@{{ telemetryArm = 'LIGHT'; generatorArgs = [pscustomobject]@{{ telemetryArm = 'LIGHT' }}; observerControls = {controls} }})"] = "UNKNOWN"
                 cases[f"{reader} ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {RECORDED_LIGHT_LAUNCH}; observerControls = {controls} }})"] = "UNKNOWN"
             cases[f"{reader} ([pscustomobject]@{{ telemetryArm = 'LIGHT'; generatorArgs = [pscustomobject]@{{ telemetryArm = 'LIGHT'; observerControls = [pscustomobject]@{{ utilSample = $true }} }} }})"] = "UNKNOWN"
-            cases[f"{reader} ([pscustomobject]@{{ telemetryArm = 'LIGHT'; generatorArgs = [pscustomobject]@{{ telemetryArm = 'LIGHT' }} }})"] = "LIGHT"
+            # r10 (G10): LIGHT generatorArgs prove LIGHT only on a speed leg; with no legType the record is UNKNOWN (re-baselined from LIGHT), and the legType 'speed' variant stays LIGHT
+            cases[f"{reader} ([pscustomobject]@{{ telemetryArm = 'LIGHT'; generatorArgs = [pscustomobject]@{{ telemetryArm = 'LIGHT' }} }})"] = "UNKNOWN"
+            cases[f"{reader} ([pscustomobject]@{{ telemetryArm = 'LIGHT'; legType = 'speed'; generatorArgs = [pscustomobject]@{{ telemetryArm = 'LIGHT' }} }})"] = "LIGHT"
         self.check(cases)
+
+    def test_g10_a_record_with_no_speed_legtype_and_light_generator_args_is_unknown_through_the_pair_verdict(self) -> None:
+        # r10 G10 (Grok ask 7060550362): the record path refused only a PRESENT non-speed legType and the generatorArgs path never looked at legType, while the spec reader needs exactly
+        # 'speed'. A record with telemetryArm LIGHT, LIGHT generatorArgs and NO legType read LIGHT and the pair was allowed. RED on 5aa4a230: allowed = True for the legType-absent pair.
+        ga = "generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' }"
+        out = self.ok(
+            "".join(
+                f"$a = {reader} ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {extra}{ga} }})\n"
+                f"$v = Get-FpsPairVerdict -Baseline $a -Candidate $a\nWrite-Host ('{label}=' + $v.allowed + '|' + $v.reason)\n"
+                for reader in ("Get-FpsArmFromLegRecord", "Get-FpsArmFromJobResult")
+                for label, extra in ((f"{reader}-ABSENT", ""), (f"{reader}-SPEED", "legType = 'speed'; "))))
+        self.assertEqual(out.split(), [
+            f"Get-FpsArmFromLegRecord-ABSENT=False|{UNKNOWN_REASON}", "Get-FpsArmFromLegRecord-SPEED=True|",
+            f"Get-FpsArmFromJobResult-ABSENT=False|{UNKNOWN_REASON}", "Get-FpsArmFromJobResult-SPEED=True|"])
+
+    def test_g10_one_speed_leg_predicate_gives_a_record_and_a_spec_the_same_answer_for_every_legtype(self) -> None:
+        # r10 G10 parity: one table of legType values fed to a record and to a spec that are otherwise LIGHT; each row reads LIGHT on both or on neither (one private predicate, Test-FpsSpeedLeg)
+        zws = "[string]::new(@([char]0x200B))"
+        rows = {
+            "absent": None, "null": "$null", "empty": "''", "speed": "'speed'", "SPEED": "'SPEED'", "space-speed": "' speed'", "speed-zwsp": f"('speed' + {zws})",
+            "look": "'look'", "export": "'export'", "int7": "7",
+        }
+        ga = "generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' }"
+        body = ""
+        for name, value in rows.items():
+            lt = "" if value is None else f"legType = {value}; "
+            body += (f"Write-Host ('{name}|' + (Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {lt}{ga} }})).arm"
+                     f" + '|' + (Get-FpsArmFromLegSpec ([pscustomobject]@{{ {lt}{ga} }})).arm)\n")
+        got = {}
+        for line in self.ok(body).split():
+            name, record, spec = line.split("|")
+            got[name] = (record, spec)
+        self.assertEqual(set(got), set(rows))
+        for name, (record, spec) in got.items():
+            self.assertEqual(record == "LIGHT", spec == "LIGHT", f"{name}: record={record} spec={spec}")
+        self.assertEqual({n for n, (r, s) in got.items() if r == "LIGHT"}, {"speed"})
 
     def test_a8_an_empty_or_partial_recorded_launch_is_not_light_through_every_reader(self) -> None:
         # r8 adversary A8: {"arguments":[],"environment":{}} matched both tables vacuously and read LIGHT through the launch reader and the saved-leg reader. LIGHT needs the members every producer

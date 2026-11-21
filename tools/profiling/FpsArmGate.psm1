@@ -162,6 +162,13 @@ function Get-FpsSpecObserverOn {
     $null
 }
 
+function Test-FpsSpeedLeg {
+    # r10 (G10): THE one rule for "this leg measures presented fps": the container carries a legType and it is exactly the text 'speed' (ordinal; absent, null, 'Speed', ' speed', a number and every other
+    # value are not). The record check and the spec reader both call this, so a record and a spec that are otherwise LIGHT cannot disagree about it. Private (not exported).
+    param([AllowNull()]$Container)
+    (Test-FaHasProp $Container 'legType') -and (Test-FaTextEq (Get-FaProp $Container 'legType') 'speed')
+}
+
 function Get-FpsSpecHolderProblem {
     # A record's embedded `generatorArgs` read as a venue spec (c): an object whose telemetryArm is exactly the text LIGHT and whose forwarded switches are all off. Returns the problem text, else $null.
     param([AllowNull()]$Holder)
@@ -182,9 +189,12 @@ function Get-FpsRecordLightProblem {
     # r6 reader that tried to read it is deleted, r8 adversary A4), a `look` block and any legType but 'speed' (a look leg captures its contact sheet inside the timed Play, r8 adversary A3).
     if (Test-FaHasProp $Record 'observerControls') { return 'it carries an observerControls entry, which no producer records (outside the LIGHT shape)' }
     if (Test-FaHasProp $Record 'look') { return 'it carries a look block (a look leg captures its contact sheet inside the timed Play)' }
-    if ((Test-FaHasProp $Record 'legType') -and -not (Test-FaTextEq (Get-FaProp $Record 'legType') 'speed')) { return "its legType is not 'speed'" }
+    if ((Test-FaHasProp $Record 'legType') -and -not (Test-FpsSpeedLeg $Record)) { return "its legType is not 'speed'" }
     $hasLaunch = Test-FaHasProp $Record 'launch'
     $hasGa = Test-FaHasProp $Record 'generatorArgs'
+    # r10 (G10): generatorArgs are a venue SPEC's fields, and a spec proves LIGHT only on a speed leg (Get-FpsArmFromLegSpec), so a record that leans on them ALONE carries the same legType. A record
+    # proven by its recorded launch (the local smoke producers write no legType) is judged on the launch, and its generatorArgs only have to agree (checked below).
+    if ($hasGa -and -not $hasLaunch -and -not (Test-FpsSpeedLeg $Record)) { return "its generatorArgs prove LIGHT only on a speed leg and it records no legType 'speed'" }
     if ($hasLaunch) {
         $derived = Get-FpsArmFromLaunch (Get-FaProp $Record 'launch')
         if (-not (Test-FaTextEq $derived.arm 'LIGHT')) { return "its recorded launch reads $($derived.arm) ($($derived.reason))" }
@@ -264,7 +274,7 @@ function Get-FpsArmFromLegSpec {
     if (Test-FaTextEq $arm 'LIGHT') {
         # r8 (sibling sweep of r6 A1, the spec side): a LIGHT word is proof only on a leg that measures presented fps, the exact legType 'speed'. A 'look' leg grabs its contact sheet from the
         # framebuffer inside the timed Play (Invoke-VenueLeg.ps1:586-589, playback-attr-3-cuda-job.ps1:3125), so it is not a presented-fps measurement whatever its arm word says (52 committed specs).
-        if (-not (Test-FaTextEq $legType 'speed')) { return New-FpsArm 'UNKNOWN' 'spec' 'generatorArgs.telemetryArm=LIGHT but the leg is not a speed leg (a look leg captures its contact sheet inside the timed Play)' }
+        if (-not (Test-FpsSpeedLeg $Spec)) { return New-FpsArm 'UNKNOWN' 'spec' 'generatorArgs.telemetryArm=LIGHT but the leg is not a speed leg (a look leg captures its contact sheet inside the timed Play)' }
         # the arm word says LIGHT, but a spec that also switches on a forwarded observer (a per-launch logger, a sampler) is not proof of it (adversary pass 3 A2)
         $observer = Get-FpsSpecObserverOn $ga
         if ($null -ne $observer) { return New-FpsArm 'UNKNOWN' 'spec' "generatorArgs.telemetryArm=LIGHT but generatorArgs.$($observer.specKey) enables an observer ($($observer.id)) inside the timed window" }
