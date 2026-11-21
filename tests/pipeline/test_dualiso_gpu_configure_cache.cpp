@@ -887,6 +887,82 @@ TEST(DualIsoGpuConfigureCache, ThePatternIsNotPartOfTheSnapshotCacheKeyButStaysO
     ASSERT_TRUE(has(source, "destination.isBright[i]=source.is_bright[i];"));
 }
 
+// ---- the count on a configure event belongs to its own call (adversary r13 A1, second pass) -------------------------
+// The event logger runs after the backend mutex is released. A count read there is the global cumulative value at THAT
+// moment, so a frame that configures in the gap between another frame's unlock and its log line makes the first frame
+// report the second one's ordinal and the sequence loses a number. The ordinal is taken under the lock, at the call.
+// The after-unlock hook runs a second frame's configure inside that gap, on the same thread (the mutex is free there).
+extern "C" void llrpSetGpuReconAfterUnlockHookForTesting(void (*hook)(void));
+
+namespace
+{
+
+std::vector<std::string> g_eventLines;
+bool g_gapFrameRan = false;
+
+void captureEventLine(const char * line)
+{
+    g_eventLines.push_back(std::string(line));
+}
+
+void runTheSecondFrameInTheGap()
+{
+    llrpSetGpuReconAfterUnlockHookForTesting(nullptr);
+    llrpGpuPlaybackReconState_t second = configureState(12); // pattern 1100 again: its own set_iso_pattern
+    g_gapFrameRan = runState(second) != 0;
+}
+
+// the count= of the set_iso_pattern line a given frame logged, or -1
+long long patternCountLoggedBy(unsigned long long frame)
+{
+    for (size_t i = 0; i < g_eventLines.size(); ++i)
+    {
+        unsigned long long f = 0;
+        double wall = 0.0;
+        double dur = 0.0;
+        int w = 0;
+        int h = 0;
+        int rc = 0;
+        long long count = -1;
+        if (std::sscanf(g_eventLines[i].c_str(),
+                        "gpu_recon_event kind=set_iso_pattern frame=%llu wall_ms=%lf dur_ms=%lf width=%d height=%d "
+                        "rc=%d count=%lld",
+                        &f, &wall, &dur, &w, &h, &rc, &count) == 7
+            && f == frame)
+            return count;
+    }
+    return -1;
+}
+
+} // namespace
+
+TEST(DualIsoGpuConfigureCache, ASetIsoPatternEventCarriesTheOrdinalOfItsOwnCallNotTheCountAtLogTime)
+{
+    FakeBackendScope scope;
+    ASSERT_EQ(1, llrpSetFakeGpuBackendIsoPatternSymbolForTesting(1));
+    int ok = 0;
+    (void)configureWorkOf(configureState(10), &ok); // 1100: the first configure
+    ASSERT_EQ(1, ok);
+    const long long before = (long long)llrpGpuPlaybackReconSetIsoPatternCount();
+
+    g_eventLines.clear();
+    g_gapFrameRan = false;
+    llrpSetGpuReconEventLogger(&captureEventLine);
+    llrpGpuPlaybackReconState_t first = configureState(11);
+    first.is_bright[0] = 1; first.is_bright[1] = 0; first.is_bright[2] = 0; first.is_bright[3] = 1; // 1001
+    llrpSetGpuReconAfterUnlockHookForTesting(&runTheSecondFrameInTheGap);
+    const int firstOk = runState(first);
+    llrpSetGpuReconAfterUnlockHookForTesting(nullptr);
+    llrpSetGpuReconEventLogger(nullptr);
+
+    ASSERT_EQ(1, firstOk);
+    ASSERT_TRUE(g_gapFrameRan);
+    ASSERT_EQ(before + 2, (long long)llrpGpuPlaybackReconSetIsoPatternCount());
+    // frame 11 made the first call, frame 12 the second: each line names its own ordinal
+    ASSERT_EQ(before + 1, patternCountLoggedBy(11));
+    ASSERT_EQ(before + 2, patternCountLoggedBy(12));
+}
+
 // ---- the DLL harness's alternate pattern (sol r6 B1) ------------------------------------------------------------
 // dll_test.cpp feeds igpu_recon_set_iso_pattern an alternate pattern and expects the output to change. For a truth
 // pattern that equals its own half-swap (1,0,1,0 / 0,1,0,1 / 0,0,0,0 / 1,1,1,1) the alternate was the truth itself,

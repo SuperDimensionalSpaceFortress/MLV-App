@@ -2854,6 +2854,11 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     int set_luts_called = 0;
     /* DUALISO-CONFIGURE-CACHE-1: the pattern-only configure. */
     int set_pattern_called = 0;
+    /* adversary r13 A1: each configure event reports the ordinal of ITS call, taken under the lock where the call is
+     * made. The logger runs after the unlock, where the global counters already hold a later frame's value. */
+    long long set_clip_count = 0;
+    long long set_luts_count = 0;
+    long long set_pattern_count = 0;
     int set_pattern_rc = 0;
     double set_pattern_start_s = 0.0;
     double set_pattern_ms = 0.0;
@@ -3016,7 +3021,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         set_pattern_rc = g->set_iso_pattern(g->backend, clip.is_bright);
         set_pattern_ms = (mlv_stage_timing_now() - set_pattern_start_s) * 1000.0;
         set_pattern_called = 1;
-        InterlockedIncrement64(&g_llrawproc_gpu_set_iso_pattern_count);
+        set_pattern_count = (long long)InterlockedIncrement64(&g_llrawproc_gpu_set_iso_pattern_count);
         if(set_pattern_rc == 0)
         {
             memcpy(g->configured_clip.is_bright, clip.is_bright, sizeof(clip.is_bright));
@@ -3048,7 +3053,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         g_llrawproc_gpu_last_set_clip_ms = set_clip_ms;
         set_clip_rc = rc;
         set_clip_called = 1;
-        InterlockedIncrement64(&g_llrawproc_gpu_set_clip_count);
+        set_clip_count = (long long)InterlockedIncrement64(&g_llrawproc_gpu_set_clip_count);
         if(set_clip_event)
             llrawproc_gpu_stage_telemetry_capture(g, set_clip_event,
                                                   "recon:set_clip",
@@ -3080,7 +3085,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         g_llrawproc_gpu_last_set_luts_ms = set_luts_ms;
         set_luts_rc = rc;
         set_luts_called = 1;
-        InterlockedIncrement64(&g_llrawproc_gpu_set_luts_count);
+        set_luts_count = (long long)InterlockedIncrement64(&g_llrawproc_gpu_set_luts_count);
         if(set_luts_event)
             llrawproc_gpu_stage_telemetry_capture(g, set_luts_event,
                                                   "recon:set_luts",
@@ -3373,7 +3378,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
                      "width=%d height=%d rc=%d count=%lld pattern=%d%d%d%d",
                      (unsigned long long)frame_id, set_pattern_start_s * 1000.0, set_pattern_ms,
                      clip.width, clip.height, set_pattern_rc,
-                     (long long)g_llrawproc_gpu_set_iso_pattern_count,
+                     set_pattern_count,
                      clip.is_bright[0], clip.is_bright[1], clip.is_bright[2], clip.is_bright[3]);
             g_llrawproc_gpu_recon_event_logger(line);
         }
@@ -3384,7 +3389,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
                      "width=%d height=%d rc=%d count=%lld changed=%s black=%d white=%d",
                      (unsigned long long)frame_id, set_clip_start_s * 1000.0, set_clip_ms,
                      clip.width, clip.height, set_clip_rc,
-                     (long long)g_llrawproc_gpu_set_clip_count, set_clip_changed,
+                     set_clip_count, set_clip_changed,
                      clip.black_level, clip.white_level);
             g_llrawproc_gpu_recon_event_logger(line);
         }
@@ -3395,7 +3400,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
                      "width=%d height=%d rc=%d count=%lld",
                      (unsigned long long)frame_id, set_luts_start_s * 1000.0, set_luts_ms,
                      clip.width, clip.height, set_luts_rc,
-                     (long long)g_llrawproc_gpu_set_luts_count);
+                     set_luts_count);
             g_llrawproc_gpu_recon_event_logger(line);
         }
     }
