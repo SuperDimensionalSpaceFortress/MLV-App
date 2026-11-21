@@ -2205,11 +2205,11 @@ foreach ($D in @(0, 500, 680, 750)) {
 
     def test_tail1_a1_a_release_call_that_never_returns_cannot_hold_the_batch_past_its_bound(self) -> None:
         # pass 11 A1 / G15 / A1b: one bounded worker/timeout seam covers the in-flight call AND the final probe. The seam makes EVERY Release-VenueClaim call sleep 25 s: the batch must still end DEADLINE
-        # inside the bound: the 0.2 s the seam holds the grant, the 0.75 s reserve, one call (<= 0.8 s), the probe (<= 0.5 s) and 3 s for process start-up of the worker and exit = 5.25 s past -DeadlineUtc.
+        # inside the bound: the 0.2 s the seam holds the grant, the 0.75 s reserve, one call (cap 1.5 s), the probe (cap 1.0 s) and 2.5 s for the workers' start-up and the exit = 6.0 s past -DeadlineUtc.
         # The unbounded inline call held the batch 25 s (and the probe another 25 s).
         r = self.late_grant_scenario(hold=False, stall_sec=25)
         past = (r["endUtc"] - r["deadline"]).total_seconds()
-        self.assertLess(past, 5.25, f"the batch ended {past:.1f} s past -DeadlineUtc with a release call that never returns (bound 5.25 s): {r['releaseCalls']}\n{r['log']}")
+        self.assertLess(past, 6.0, f"the batch ended {past:.1f} s past -DeadlineUtc with a release call that never returns (bound 6.0 s): {r['releaseCalls']}\n{r['log']}")
         self.assertTrue(any("CLAIM_LATE_GRANT_NOT_RELEASED" in l for l in r["log"].splitlines()), f"a release that never answered must be logged as not released:\n{r['log']}")
         self.assertEqual(r["exit"], 3, f"the batch must still end DEADLINE (exit 3):\n{r['log']}\n{r['out']}")
 

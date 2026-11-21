@@ -815,10 +815,21 @@ function Invoke-VenueLateRelease {
     VENUE-FIFO-ADVERSARY-TAIL-1: the release of a claim granted at or after -DeadlineUtc, as ONE seam (the retry loop, and the one final single-open probe at the end of the reserve), so a sweep can drive it
     with an injected clock. -Call is { param([int]$MaxAttempts, [double]$TimeoutSec) } and answers RELEASED | ABSENT | NOT_OURS | BUSY | NO_ANSWER | ERROR; -Clock answers the seconds since the retry began;
     -Sleep takes milliseconds. Returns @{ answer; tries; probed; endSec }.
+    TAIL-1 (pass 11 A1, Grok G15/A1b): every call, the in-flight one and the final probe, is handed a time limit (-TimeoutSec) and the default -Call runs it on a bounded worker (Invoke-VenueBoundedRead:
+    abandoned and counted when it does not answer, so Complete-VenueProcess exits at once). A full call may run to what is left of -BoundSec plus -CallCapSec (the worker's start-up and one healthy call);
+    the probe to -ProbeCapSec. A call that never returns therefore ends this function by BoundSec + CallCapSec + ProbeCapSec at the latest.
     #>
-    param([Parameter(Mandatory)][string]$Venue, [Parameter(Mandatory)][string]$Nonce, [string]$ClaimDir = '', [double]$BoundSec = 0.75, [scriptblock]$Call = $null, [scriptblock]$Clock = $null, [scriptblock]$Sleep = $null)
+    param([Parameter(Mandatory)][string]$Venue, [Parameter(Mandatory)][string]$Nonce, [string]$ClaimDir = '', [double]$BoundSec = 0.75, [double]$CallCapSec = 1.5, [double]$ProbeCapSec = 1.0,
+        [scriptblock]$Call = $null, [scriptblock]$Clock = $null, [scriptblock]$Sleep = $null)
     $released = @('RELEASED', 'ABSENT', 'NOT_OURS')
-    if ($null -eq $Call) { $Call = { param([int]$MaxAttempts, [double]$TimeoutSec) Release-VenueClaim -Venue $Venue -Nonce $Nonce -ClaimDir $ClaimDir -MaxAttempts $MaxAttempts }.GetNewClosure() }
+    if ($null -eq $Call) {
+        $modulePath = $MyInvocation.MyCommand.Module.Path
+        $Call = {
+            param([int]$MaxAttempts, [double]$TimeoutSec)
+            $w = Invoke-VenueBoundedRead -TimeoutSec ([Math]::Max(1.0, $TimeoutSec)) -Argument @{ m = $modulePath; v = $Venue; n = $Nonce; d = $ClaimDir; k = $MaxAttempts } -ScriptText 'param($a) $ErrorActionPreference = ''Stop''; Import-Module $a.m -Force -DisableNameChecking; Release-VenueClaim -Venue $a.v -Nonce $a.n -ClaimDir $a.d -MaxAttempts $a.k'
+            if ($w.answered -and @($w.value).Count -gt 0) { [string]@($w.value)[-1] } else { 'NO_ANSWER' }
+        }   # no GetNewClosure: a closure is cut off from this module's private Invoke-VenueBoundedRead; the block runs inside this function, so $modulePath, $Venue, $Nonce and $ClaimDir are visible
+    }
     if ($null -eq $Clock) { $sw = [Diagnostics.Stopwatch]::StartNew(); $Clock = { $sw.Elapsed.TotalSeconds }.GetNewClosure() }
     if ($null -eq $Sleep) { $Sleep = { param([int]$Ms) Start-Sleep -Milliseconds $Ms } }
     $answer = ''; $tries = 0; $probed = $false
@@ -826,7 +837,7 @@ function Invoke-VenueLateRelease {
         # r10 (adversary A1): the clock is asked again after the sleep: one clamped to the end of the reserve (or woken late) must not start a try, which would run a whole release call past it
         if ($try -gt 1 -and (& $Clock) -ge $BoundSec) { break }
         $tries++
-        try { $answer = [string](& $Call 5 0.0) } catch { $answer = 'ERROR' }
+        try { $answer = [string](& $Call 5 ([Math]::Max(0.0, $BoundSec - (& $Clock)) + $CallCapSec)) } catch { $answer = 'ERROR' }
         if ($answer -cin $released) { break }
         $left = $BoundSec - (& $Clock)
         if ($try -ge 5 -or $left -le 0) { break }
@@ -834,7 +845,7 @@ function Invoke-VenueLateRelease {
     }
     if ($answer -cnotin $released) {
         $probed = $true
-        try { $answer = [string](& $Call 1 0.0) } catch { $answer = 'ERROR' }
+        try { $answer = [string](& $Call 1 $ProbeCapSec) } catch { $answer = 'ERROR' }
     }
     [pscustomobject]@{ answer = $answer; tries = $tries; probed = $probed; endSec = (& $Clock) }
 }
