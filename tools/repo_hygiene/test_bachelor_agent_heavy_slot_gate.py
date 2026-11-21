@@ -470,6 +470,7 @@ PWSH_SCRIPT_BASE_SEC = 120  # a bare pwsh start, the compile of the capture type
 _CAPTURE_CALL_PARAMETERS = {"read-capturedresult": ("Path", "BoundMs", "Start"), "read-capturedtext": ("Path", "BoundMs", "Start"),
                             "remove-capturefiles": ("Paths", "BoundMs", "Start")}
 _CAPTURE_NAME = re.compile(r"(?i)(?<![\w$.:\-])(" + "|".join(re.escape(name) for name in _CAPTURE_CALL_PARAMETERS) + r")(?![\w\-])")
+_QUOTED_INVOCATION = re.compile(r"(?i)(?<![\w$])[&.]\s*(['\"])(" + "|".join(re.escape(name) for name in _CAPTURE_CALL_PARAMETERS) + r")\1")
 _LOOP_BLOCK_HEAD = re.compile(r"(?i)(?:\b(?:foreach|for|while)\s*\([^{}]*\)|\bdo|ForEach-Object)\s*$")
 _OUTSIDE, _QUOTED, _COMMENT = 0, 1, 2
 
@@ -478,37 +479,60 @@ def _ps_mask(text: str) -> tuple[str, list[int]]:
     """`text` with the body of every quoted string and every comment replaced by spaces (newlines kept), and a parallel list marking each character
     _OUTSIDE, _QUOTED (a string body) or _COMMENT. A doubled quote inside a string and a backtick escape inside a double-quoted one stay in the string."""
     masked, kinds = list(text), [_OUTSIDE] * len(text)
-    index, quote = 0, ""
-    while index < len(text):
-        char = text[index]
-        if quote:
-            if char == "`" and quote == '"' and index + 1 < len(text):
-                for k in (index, index + 1):
-                    kinds[k] = _QUOTED
-                    masked[k] = " " if text[k] not in "\r\n" else text[k]
+    size = len(text)
+
+    def blank(k: int, kind: int) -> None:
+        kinds[k] = kind
+        if text[k] not in "\r\n":
+            masked[k] = " "
+
+    # pass-7b A1: a double-quoted string can hold `$( ... )`, which is CODE (an executable call inside it is a call), so the scan keeps a stack:
+    # a quote character for a string body, an int (the open paren depth) for a subexpression. A block comment `<# ... #>` is a comment too.
+    stack: list = []
+    index = 0
+    while index < size:
+        char, top = text[index], (stack[-1] if stack else None)
+        if top in ("'", '"'):
+            if top == '"' and char == "`" and index + 1 < size:
+                blank(index, _QUOTED)
+                blank(index + 1, _QUOTED)
                 index += 2
-                continue
-            if char == quote:
-                if index + 1 < len(text) and text[index + 1] == quote:
-                    for k in (index, index + 1):
-                        kinds[k], masked[k] = _QUOTED, " "
-                    index += 2
-                    continue
-                quote = ""
+            elif top == '"' and char == "$" and index + 1 < size and text[index + 1] == "(":
+                stack.append(1)  # the subexpression is code: its characters stay _OUTSIDE
+                index += 2
+            elif char == top and index + 1 < size and text[index + 1] == top:
+                blank(index, _QUOTED)
+                blank(index + 1, _QUOTED)
+                index += 2
+            elif char == top:
+                stack.pop()
                 index += 1
-                continue
-            kinds[index] = _QUOTED
-            if char not in "\r\n":
-                masked[index] = " "
-            index += 1
+            else:
+                blank(index, _QUOTED)
+                index += 1
             continue
         if char in "'\"":
-            quote = char
+            stack.append(char)
+        elif text.startswith("<#", index):
+            end = text.find("#>", index + 2)
+            end = size if end < 0 else end + 2
+            for k in range(index, end):
+                blank(k, _COMMENT)
+            index = end
+            continue
         elif char == "#" and (index == 0 or text[index - 1] in " \t\r\n;({|"):
-            while index < len(text) and text[index] not in "\r\n":
-                kinds[index], masked[index] = _COMMENT, " "
+            while index < size and text[index] not in "\r\n":
+                blank(index, _COMMENT)
                 index += 1
             continue
+        elif isinstance(top, int):
+            if char == "(":
+                stack[-1] = top + 1
+            elif char == ")":
+                if top == 1:
+                    stack.pop()
+                else:
+                    stack[-1] = top - 1
         index += 1
     return "".join(masked), kinds
 
@@ -521,6 +545,9 @@ def _ps_command_arguments(text: str, masked: str, kinds: list[int], start: int) 
     while index < len(text):
         char, kind = text[index], kinds[index]
         if kind == _COMMENT:
+            if current and depth == 0:  # a comment is whitespace between two arguments (`$p <# note #> 60000`)
+                tokens.append(current)
+                current = ""
             index += 1
             continue
         if kind == _OUTSIDE:
@@ -608,7 +635,11 @@ def ps_capture_calls(text: str) -> list[_CaptureCall]:
         if re.search(r"(?i)\bfunction\s+$", masked[:match.start()]):
             continue
         calls.append(_CaptureCall(match.group(1), match.start(), _ps_command_arguments(text, masked, kinds, match.end())))
-    return calls
+    # pass-7b A1: a quoted command name is still a call when it is invoked: `& 'Read-CapturedResult' $p $AcceptMs $f` (the quoted body is masked above)
+    for match in _QUOTED_INVOCATION.finditer(text):
+        if kinds[match.start()] == _OUTSIDE:
+            calls.append(_CaptureCall(match.group(2), match.start(), _ps_command_arguments(text, masked, kinds, match.end())))
+    return sorted(calls, key=lambda call: call.position)
 
 
 def _call_is_inside_a_loop(body: str, position: int) -> bool:
@@ -625,18 +656,67 @@ def _call_is_inside_a_loop(body: str, position: int) -> bool:
     return any(stack)
 
 
+_PS_PLAIN_VARIABLE = re.compile(r"\$(?:\w+:)?\w+")
+_PS_TYPE_CAST = re.compile(r"(?i)\[\s*(?:u?int(?:16|32|64)?|u?long|double|single|float|decimal)\s*\]")
+_PS_LITERAL_IN_EXPRESSION = re.compile(r"(?i)(?<![\w$.])(?:0x[0-9a-f]+|0b[01]+|\d+(?:\.\d+)?(?:e[+-]?\d+)?)(?:kb|mb|gb|tb|pb)?[ld]?(?![\w.])")
+
+
+def _ps_bound_value(token: str) -> float | None:
+    """The numeric value of a bound token: a literal (_ps_number_value), or an arithmetic expression over literals, numeric casts and quoted numbers
+    (`([int]'60000')`, `(60 * 999)`), evaluated with a closed set of operators. None when it is anything else (a variable, a call, an unknown form)."""
+    value = _ps_number_value(token)
+    if value is not None:
+        return value
+    text = _PS_TYPE_CAST.sub("", token)
+    text = re.sub(r"(['\"])\s*([+-]?[\w.]+)\s*\1", r"\2", text)  # a quoted number is converted by the binder
+    text = _PS_LITERAL_IN_EXPRESSION.sub(lambda m: repr(_ps_number_value(m.group(0))), text)
+    try:
+        tree = ast.parse(text.strip(), mode="eval")
+    except SyntaxError:
+        return None
+
+    def evaluate(node: ast.AST) -> float:
+        if isinstance(node, ast.Expression):
+            return evaluate(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+            return float(node.value)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            return -evaluate(node.operand) if isinstance(node.op, ast.USub) else evaluate(node.operand)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod)):
+            left, right = evaluate(node.left), evaluate(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if not right:
+                raise ValueError("division by zero")
+            return left / right if isinstance(node.op, ast.Div) else left % right
+        raise ValueError("not a closed numeric expression")
+
+    try:
+        result = evaluate(tree)
+    except (ValueError, OverflowError, ZeroDivisionError):
+        return None
+    return result
+
+
 def _bound_ceiling_ms(bound: str | None) -> int:
     """What the whole-script budget charges one call with this bound token: the accept ceiling for `$AcceptMs` or its value, the call ceiling of a
-    numeric bound, the worker start bound for a variable or an absent one (the helper's own default is far under it)."""
+    numeric bound or a numeric expression, the worker start bound for a plain variable or an absent one (the helper's own default is far under it),
+    and the helper's own maximum for any other expression (pass-7b A2: the worst a validated bound can be)."""
     if bound is None:
         return capture_call_ceiling_ms(CAPTURE_WORKER_START_MS)
     if re.fullmatch(r"(?i)\$AcceptMs", bound.strip()):
         return CAPTURE_ACCEPT_CALL_CEILING_MS
-    value = _ps_number_value(bound)
+    value = _ps_bound_value(bound)
     if value is not None and round(value) == CAPTURE_ACCEPT_BOUND_MS:
         return CAPTURE_ACCEPT_CALL_CEILING_MS  # r3 G1: an accept call is charged the named accept ceiling, not the worker start bound
     if value is not None and round(value) > 0:
         return capture_call_ceiling_ms(round(value))
+    if value is None and not _PS_PLAIN_VARIABLE.fullmatch(bound.strip()):
+        return CAPTURE_ACCEPT_CALL_CEILING_MS  # an expression this scan cannot evaluate: charged the helper's maximum
     return capture_call_ceiling_ms(CAPTURE_WORKER_START_MS)
 
 
@@ -653,25 +733,46 @@ def capture_call_bound_offenders(text: str) -> list[str]:
         if call.bound is None:
             offenders.append(f"{label}: no bound argument (the helper applies its own real default deadline)")
             continue
-        value = _ps_number_value(call.bound)
+        value = _ps_bound_value(call.bound)
         if value is not None:
             if round(value) >= 1000:
                 offenders.append(f"{label}: {value:g}")
-        elif call.bound.lstrip().startswith(("(", "[", "{", "$(")):  # an expression: any literal of a second or more in it is a typed bound
-            masked = _ps_mask(call.bound)[0]
-            offenders.extend(f"{label}: {number:g}" for number in (_ps_number_value(t) for t in re.findall(r"[\w.]+", masked))
-                             if number is not None and round(number) >= 1000)
+        elif not _PS_PLAIN_VARIABLE.fullmatch(call.bound.strip()):
+            # pass-7b A2: an expression the scan cannot evaluate could be any typed bound (`([int]$x)`, a call): an accept arm names `$AcceptMs`
+            offenders.append(f"{label}: the bound is an expression the guard cannot evaluate; name $AcceptMs")
     return offenders
 
 
 def python_ps_fragments(function: ast.FunctionDef) -> list[str]:
     """The PowerShell text a test function builds: every string literal of its body, an f-string with each `{...}` replaced by a variable-like
     placeholder. A docstring is prose, and a string that is a direct argument of a `self.assert*` call is a source pin or a message, neither of which
-    runs; both are left out. (Python keeps adjacent literals in one string; a call split across a `+` is written on one line by the cases.)"""
+    runs; both are left out. Python keeps adjacent literals in one string, and a `+` chain of strings is joined into one text (each non-literal operand
+    a variable-like placeholder)."""
     fragments: list[str] = []
 
+    def stringy(node: ast.AST) -> bool:
+        return (isinstance(node, ast.JoinedStr) or (isinstance(node, ast.Constant) and isinstance(node.value, str))
+                or (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add) and (stringy(node.left) or stringy(node.right))))
+
+    def operands(node: ast.AST) -> list[ast.AST]:
+        return operands(node.left) + operands(node.right) if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add) and stringy(node) else [node]
+
     def visit(node: ast.AST) -> None:
-        if isinstance(node, ast.JoinedStr):
+        if isinstance(node, ast.BinOp) and stringy(node):
+            # pass-7b A3: a script built with `+` is ONE text (a quote opened in one literal closes in the next), each non-literal operand a variable-like
+            # placeholder; reading the literals one by one made a closing quote look like an opening one and hid the call that followed it
+            parts = operands(node)
+            fragments.append("".join(part.value if isinstance(part, ast.Constant) else
+                                     "".join(p.value if isinstance(p, ast.Constant) else "$PYTHON_EXPR" for p in part.values) if isinstance(part, ast.JoinedStr)
+                                     else "$PYTHON_EXPR" for part in parts))
+            for part in parts:
+                if not isinstance(part, (ast.Constant, ast.JoinedStr)):
+                    visit(part)
+                elif isinstance(part, ast.JoinedStr):
+                    for p in part.values:
+                        if isinstance(p, ast.FormattedValue):
+                            visit(p.value)
+        elif isinstance(node, ast.JoinedStr):
             fragments.append("".join(part.value if isinstance(part, ast.Constant) else "$PYTHON_EXPR" for part in node.values))
             for part in node.values:
                 if isinstance(part, ast.FormattedValue):
@@ -2861,6 +2962,16 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertEqual(pwsh_script_budget_sec(region + "$r = Read-CapturedResult -Path $p -BoundMs $AcceptMs -Start $f\n"), one_call)
         self.assertEqual(pwsh_script_budget_sec(region + "$r = Read-CapturedResult $p -B 300\n"), PWSH_SCRIPT_BASE_SEC + capture_call_ceiling_ms(300) / 1000)
         self.assertEqual(pwsh_script_budget_sec(region + f"$r = Read-CapturedResult $p {CAPTURE_ACCEPT_BOUND_MS} $f\n"), one_call, "the accept value is the accept bound")
+        # pass-7b A1: code inside a double-quoted string is a call; a quoted invocation is a call; a block comment between arguments is whitespace
+        self.assertEqual(pwsh_script_budget_sec(region + 'Write-Output "R|$(Read-CapturedResult $p 60000 $f)"\n'), one_call, "an interpolated call is charged")
+        self.assertEqual(pwsh_script_budget_sec(region + "& 'Read-CapturedResult' $p $AcceptMs $f\n"), one_call, "a quoted invocation is charged")
+        self.assertEqual(pwsh_script_budget_sec(region + "$r = Read-CapturedResult $p <# note #> 60000 $f\n"), one_call, "the comment is no argument")
+        # pass-7b A2: a numeric bound written as an expression is charged for its value; an expression the scan cannot evaluate, the helper's maximum
+        self.assertEqual(pwsh_script_budget_sec(region + "$r = Read-CapturedResult $p ([int]'60000') $f\n"), one_call)
+        self.assertEqual(pwsh_script_budget_sec(region + "$r = Read-CapturedResult $p (60 * 999) $f\n"), PWSH_SCRIPT_BASE_SEC + capture_call_ceiling_ms(59940) / 1000)
+        self.assertEqual(pwsh_script_budget_sec(region + "$r = Read-CapturedResult $p ([int]$x) $f\n"), one_call, "an unknown expression is charged the maximum")
+        self.assertEqual(pwsh_script_budget_sec(region + "$r = Read-CapturedResult $p $b $f\n"), PWSH_SCRIPT_BASE_SEC + capture_call_ceiling_ms(CAPTURE_WORKER_START_MS) / 1000,
+                         "a plain variable is still the worker start bound")
         # pass-7 A4: a comment between a loop head and its brace hides nothing, and a brace in a string closes no block
         commented = region + "foreach ($i in 1..9) # read\n{ $r = Read-CapturedResult $p $AcceptMs $f }\n"
         with self.assertRaises(AssertionError, msg="a call in a commented loop head still needs its repeat"):
@@ -2951,7 +3062,11 @@ class BoundedCaptureIoTests(unittest.TestCase):
                    "Read-CapturedText -Path $good", "Remove-CaptureFiles -Paths @($real)", "Read-CapturedResult a.txt", "Read-CapturedResult -Path:a.txt",
                    "Read-CapturedResult $p 0b1001110001000 $f", "Read-CapturedResult $p 999.6 $f", "Read-CapturedResult $p 200000 $f",
                    "Read-CapturedResult $p '5000' $f", "Read-CapturedResult $p (5 * 1000) $f", "Read-CapturedResult -Path $p -BoundMs 5000",
-                   "Remove-CaptureFiles @($real) -B 12000", "Read-CapturedResult $p `\n  5000 $f")
+                   "Remove-CaptureFiles @($real) -B 12000", "Read-CapturedResult $p `\n  5000 $f",
+                   # pass-7b A1 / A2: executable code inside a string, a quoted invocation, a block comment between arguments, and bound expressions
+                   'Write-Output "R|$(Read-CapturedResult $p 60000 $f)"', "& 'Read-CapturedResult' $p 5000 $f", "Read-CapturedResult $p <# note #> 60000 $f",
+                   "Read-CapturedResult $p ([int]'60000') $f", "Read-CapturedResult $p (60 * 999) $f", "Read-CapturedResult $p ([int]$x) $f",
+                   "Read-CapturedResult $p ($x + 1) $f", "Write-Output \"a $(Remove-CaptureFiles @($real))\"")
         for text in flagged:
             with self.subTest(text):
                 self.assertNotEqual(capture_call_bound_offenders(text), [], text)
@@ -2961,7 +3076,10 @@ class BoundedCaptureIoTests(unittest.TestCase):
                  "Read-CapturedResult -Path $p -BoundMs $AcceptMs", "Remove-CaptureFiles -Paths @($real) -BoundMs $AcceptMs",
                  "Read-CapturedResult $p $AcceptMs $f; $later = 60000", "Read-CapturedResult $p 999.4 $f",
                  "Read-CapturedResult '" + "-".join(["Read-CapturedText"] * 3) + "' $AcceptMs $f", "Read-CapturedText $good `\n  $AcceptMs",
-                 "Write-Output 'Read-CapturedResult a.txt' # Remove-CaptureFiles @($x)")
+                 "Write-Output 'Read-CapturedResult a.txt' # Remove-CaptureFiles @($x)",
+                 'Write-Output "R|$(Read-CapturedResult $p $AcceptMs $f)"', "& 'Read-CapturedResult' $p $AcceptMs $f",
+                 "Read-CapturedResult $p <# 5000 #> $AcceptMs $f", "Read-CapturedResult $p (30 * 10) $f", "Read-CapturedResult $p ([int]'300') $f",
+                 'Write-Output "Read-CapturedResult a.txt $x"', "<# Read-CapturedResult a.txt #> Write-Output 1")
         for text in clean:
             with self.subTest(text):
                 self.assertEqual(capture_call_bound_offenders(text), [], text)
@@ -2974,6 +3092,11 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertEqual(len(fragments), 1, fragments)
         self.assertEqual([call.name for call in ps_capture_calls(fragments[0])], ["Remove-CaptureFiles", "Read-CapturedText"])
         self.assertEqual(len(capture_call_bound_offenders(fragments[0])), 1, "the f-string call has a path placeholder and no bound")
+        # pass-7b A3: a script built with `+` is one text, so a quote opened in one literal and closed in the next hides nothing
+        concatenated = ("class C:\n    def case(self):\n        s = '$good = \\'' + good + '\\'\\nRead-CapturedText $good 5000\\n'\n")
+        fragments = python_ps_fragments(ast.parse(concatenated).body[0].body[0])  # type: ignore[attr-defined]
+        self.assertEqual(fragments, ["$good = '$PYTHON_EXPR'\nRead-CapturedText $good 5000\n"])
+        self.assertEqual(len(capture_call_bound_offenders(fragments[0])), 1, "the restored 5 s bound after a concatenated path is seen")
 
     # Cases that legitimately carry a sleep literal of a second or more, because it is never waited out: the worker is killed at the case's small
     # bound, or the hang is killed at its budget (the reason is the case's own comment). A case NOT listed here may not add one.
