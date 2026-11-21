@@ -1262,6 +1262,32 @@ inline PlayStopState evaluatePlayStop( int64_t consumed, int64_t required, bool 
     return PlayStopState::Continue;
 }
 
+// REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1: does the gui-smoke measured-play loop END on this observation? Pure.
+// A timeline Reached (the source frames were consumed) is seen BEFORE the frames still in flight have presented, so a
+// frame-pinned capture (targetPresentedFrames > 0) that broke on it stopped 2 to 3 frames short and failed the strict
+// presented == target check (exit 11, 0 frames written). While target > 0 and presented < target a Reached therefore does
+// NOT end the loop: the presented-count stop (the present path stops Play at exactly N) ends it. Every other state still
+// ends it at once -- SafetyTimeout above all, so the wall-clock net still bounds the loop (Reached past the deadline is
+// already SafetyTimeout in evaluatePlayStop). target == 0 (an unpinned play) is exactly the previous decision.
+// stressPending: the clip-lifecycle stress has not run yet, so a Reached must wait for it (its own, older reason).
+inline bool measuredPlayLoopShouldStop( PlayStopState state, bool stressPending,
+                                        int64_t targetPresentedFrames, int64_t presentedFrames )
+{
+    switch( state )
+    {
+    case PlayStopState::SafetyTimeout:
+    case PlayStopState::EndedEarly:
+    case PlayStopState::PaceTooSlow:
+        return true;
+    case PlayStopState::Reached:
+        if( stressPending ) return false;
+        return !( targetPresentedFrames > 0 && presentedFrames < targetPresentedFrames );
+    case PlayStopState::Continue:
+        break;
+    }
+    return false;
+}
+
 inline const char *playStopFailureReason( PlayStopState state )
 {
     switch( state )
