@@ -96,6 +96,8 @@ class _Probe(unittest.TestCase):
 # BENCH-LIGHT-ARM-GAIN-GATES-1 r5 (Dot on f51e0821): a saved leg record's LIGHT arm WORD is proof only beside a recorded observer list, the rule a recorded result already had. A LIGHT leg
 # fixture therefore carries the list a real leg records, every observer off (a bare 'LIGHT' record is pinned UNKNOWN in ObserverControlTests).
 OBSERVERS_RECORDED_OFF = "observerControls = [pscustomobject]@{ utilSample = $false; corePartitionTelemetry = $false }; "
+# the launch block a LIGHT smoke records (what the wrapper's leg record now carries beside its arm): telemetry on, the per-frame log opted out, no stage log
+RECORDED_LIGHT_LAUNCH = ("launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' }; arguments = @() }")
 
 
 def _light_word(arm: str | None) -> str:
@@ -1039,7 +1041,8 @@ class ObserverControlTests(_Probe):
             "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = 'LIGHT'; utilSample = $true })": "UNKNOWN",
             "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = 'LIGHT'; generatorArgs = [pscustomobject]@{ cudaLaunchTimingMinMs = 0 } })": "UNKNOWN",
             "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = 'HEAVY'; utilSample = $true })": "HEAVY",
-            "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = (New-FpsArm 'LIGHT' 'environment' 'x') })": "LIGHT",
+            "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = (New-FpsArm 'LIGHT' 'environment' 'x') })": "UNKNOWN",   # r5 pass 2 A3: an arm label, whatever its source, is not proof
+            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = (New-FpsArm 'LIGHT' 'environment' 'x'); {RECORDED_LIGHT_LAUNCH} }})": "LIGHT",
             "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = (New-FpsArm 'LIGHT' 'environment' 'x'); firstPresentCapture = $true })": "UNKNOWN",
             "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = (New-FpsArm 'HEAVY' 'environment' 'x') })": "HEAVY",
             "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = @('LIGHT') })": "UNKNOWN",
@@ -1366,8 +1369,50 @@ class ObserverControlTests(_Probe):
             f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = (New-FpsArm 'LIGHT' 'environment' 'x'); {launch_light} }})": "LIGHT",
             "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = [pscustomobject]@{ arm = 'LIGHT' } })": "UNKNOWN",
             f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = [pscustomobject]@{{ arm = 'LIGHT' }}; {OBSERVERS_RECORDED_OFF}}})": "LIGHT",
-            "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = (New-FpsArm 'LIGHT' 'environment' 'x') })": "LIGHT",
+            "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = (New-FpsArm 'LIGHT' 'environment' 'x') })": "UNKNOWN",
+            # r5 pass 2 A3: the `source` label does not exempt an arm object from evidence, and a null launch is no launch
+            "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = [pscustomobject]@{ arm = 'LIGHT'; source = 'environment' } })": "UNKNOWN",
+            "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = [pscustomobject]@{ arm = 'LIGHT'; source = 'environment' }; launch = $null })": "UNKNOWN",
         })
+
+    def test_a_light_label_that_contradicts_the_rest_of_its_record_is_not_light(self) -> None:
+        # r5 pass 2 A2: a STRING arm skipped launch corroboration and an embedded generatorArgs.telemetryArm was never compared
+        stage = "launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1'; MLVAPP_STAGE_TIMING = '1' }; arguments = @() }"
+        self.check({
+            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {OBSERVERS_RECORDED_OFF}{stage} }})": "UNKNOWN",
+            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {OBSERVERS_RECORDED_OFF}generatorArgs = [pscustomobject]@{{ telemetryArm = 'HEAVY' }} }})": "UNKNOWN",
+            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = (New-FpsArm 'LIGHT' 'environment' 'x'); {RECORDED_LIGHT_LAUNCH}; generatorArgs = [pscustomobject]@{{ telemetryArm = 'HEAVY' }} }})": "UNKNOWN",
+            f"Get-FpsArmFromJobResult ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {OBSERVERS_RECORDED_OFF}generatorArgs = [pscustomobject]@{{ telemetryArm = 'HEAVY' }} }})": "UNKNOWN",
+            # the agreeing controls: a recorded LIGHT launch alone is evidence, and an embedded LIGHT is no contradiction
+            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {RECORDED_LIGHT_LAUNCH} }})": "LIGHT",
+            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {OBSERVERS_RECORDED_OFF}generatorArgs = [pscustomobject]@{{ telemetryArm = 'LIGHT' }} }})": "LIGHT",
+        })
+
+    def test_a_scalar_generator_args_fails_closed_in_both_readers(self) -> None:
+        # r5 pass 2 A4: an array was refused but a scalar generatorArgs was read as absent, and the outer all-off list corroborated the record
+        cases = {}
+        for literal in ('"broken"', '""', '" "', "0", "1", "true", "false", "null"):
+            doc = self._json('{"telemetryArm":"LIGHT","observerControls":{"utilSample":false},"generatorArgs":' + literal + '}')
+            cases[f"Get-FpsArmFromLegRecord {doc}"] = "UNKNOWN"
+            cases[f"Get-FpsArmFromJobResult {doc}"] = "UNKNOWN"
+        self.check(cases)
+
+    def test_a_control_character_in_a_recorded_value_or_key_is_not_the_plain_one(self) -> None:
+        # r5 pass 2 A1: `-in` and `-ieq` are culture compares too: "1" + U+0001 read as the frame-log opt-out "1", and an observerControls key with U+00AD matched the listed threshold's name
+        # and so skipped the nonzero-unlisted-entry refusal
+        def launch(value: str, suffix: str) -> str:
+            return ("Get-FpsArmFromLaunch ([pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; "
+                    "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = ('" + value + "' + " + suffix + ") }; arguments = @() })")
+        self.check({
+            launch("1", "[char]1"): "UNKNOWN",
+            launch("on", "[char]173"): "UNKNOWN",
+            launch("0", "[char]173"): "UNKNOWN",
+            launch("1", "''"): "LIGHT",
+            self._shy_key_record(): "UNKNOWN",
+        })
+
+    def _shy_key_record(self) -> str:
+        return ("Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = 'LIGHT'; observerControls = [pscustomobject]@{ ('cudaLaunchTimingMinMs' + [char]173) = -1 } })")
 
     def test_every_generator_arg_the_venue_leg_forwards_is_classified(self) -> None:
         # The class guard: a NEW generatorArgs key must be named observer (module list) or not-an-observer (below), so none reaches the job unclassified.

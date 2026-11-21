@@ -171,7 +171,8 @@ function Read-FpsRecordedObserverControls {
     }
     foreach ($pair in $pairs) {
         $name = [string]$pair[0]; $v = $pair[1]
-        $listed = @($script:FpsObserverControls | Where-Object { $_.specKey -and ($_.specKey -ieq $name) } | Select-Object -First 1)
+        # ordinal, ignoring case only (-ieq is a culture compare: "cudaLaunchTimingMinMs" + U+00AD matched the listed key; adversary r5 pass 2 A1)
+        $listed = @($script:FpsObserverControls | Where-Object { $_.specKey -and [string]::Equals([string]$_.specKey, $name, [System.StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1)
         if ($listed.Count -gt 0) {
             if (Test-FpsSpecObserverOn $listed[0] $true $v) { return (& $fail 'enabled' "observerControls.$name is enabled ($($listed[0].id))" $pairs.Count) }
             continue
@@ -182,6 +183,33 @@ function Read-FpsRecordedObserverControls {
         return (& $fail 'unreadable' "observerControls.$name cannot be read as a boolean" $pairs.Count)
     }
     [pscustomobject]@{ present = $true; entries = $pairs.Count; problem = $null }
+}
+
+function Get-FpsRecordShapeProblem {
+    # A record whose `generatorArgs` is PRESENT but is not an object (a scalar, null, an array) cannot be read for observers at all; an outer all-off list must not corroborate it (adversary r5 A14, pass 2 A4).
+    param([AllowNull()]$Record)
+    if ($null -eq $Record -or $Record -is [string] -or $Record -is [System.ValueType]) { return $null }
+    if (Test-FaHasProp $Record 'generatorArgs') {
+        $ga = Get-FaProp $Record 'generatorArgs'
+        if ($null -eq $ga -or $ga -is [string] -or $ga -is [System.ValueType] -or $ga -is [System.Array]) { return 'generatorArgs is present but is not an object' }
+    }
+    $null
+}
+
+function Get-FpsRecordContradiction {
+    # Does a LIGHT record's other evidence say something else? Its recorded `launch` (when it has one) must read LIGHT, and a `generatorArgs.telemetryArm` it embeds must be exactly LIGHT (adversary r5 pass 2 A2).
+    param([AllowNull()]$Record)
+    $launch = Get-FaProp $Record 'launch'
+    if ($null -ne $launch) {
+        $derived = Get-FpsArmFromLaunch $launch
+        if (-not (Test-FaTextEq $derived.arm 'LIGHT')) { return "the record's own launch reads $($derived.arm) ($($derived.reason))" }
+    }
+    $ga = Get-FaProp $Record 'generatorArgs'
+    if ($null -ne $ga -and $ga -isnot [string] -and $ga -isnot [System.ValueType] -and (Test-FaHasProp $ga 'telemetryArm')) {
+        $embedded = ConvertTo-FpsArmName (Get-FaProp $ga 'telemetryArm')
+        if (-not (Test-FaTextEq $embedded 'LIGHT')) { return "the record's generatorArgs.telemetryArm reads $embedded" }
+    }
+    $null
 }
 
 function Test-FpsRecordHasObserverEvidence {
@@ -224,21 +252,19 @@ function Get-FpsArmFromLegRecord {
         $oc = Read-FpsRecordedObserverControls $holder
         if ($null -ne $oc.problem) { return New-FpsArm 'UNKNOWN' 'record' "telemetryArm=LIGHT but the record's observerControls fail closed ($($oc.problem.kind): $($oc.problem.text))" }
     }
-    if ($field -isnot [string]) {
-        # adversary r5 A2: an arm OBJECT is the arm a smoke summary derived from its launch environment (source 'environment'). A LIGHT object whose leg also records its `launch` must agree with
-        # that launch (a contradicting one is not LIGHT), and one that does not name the environment as its source is a label, which needs a recorded observer list like the bare word.
-        $launch = Get-FaProp $Leg 'launch'
-        if ($null -ne $launch) {
-            $derived = Get-FpsArmFromLaunch $launch
-            if ($derived.arm -cne 'LIGHT') { return New-FpsArm 'UNKNOWN' 'record' "telemetryArm=LIGHT but the leg's recorded launch reads $($derived.arm) ($($derived.reason))" }
-        } elseif (-not (Test-FaTextEq (Get-FaProp $field 'source') 'environment') -and -not (Test-FpsRecordHasObserverEvidence $Leg)) {
-            return New-FpsArm 'UNKNOWN' 'record' 'telemetryArm=LIGHT but the arm object does not name the launch environment as its source and the record records no observer controls'
-        }
-        return $field
+    # adversary r5 pass 2 A4: a generatorArgs that is present but not an object (a scalar, null, an array) is unreadable, so no outer list may corroborate the record
+    $shape = Get-FpsRecordShapeProblem $Leg
+    if ($null -ne $shape) { return New-FpsArm 'UNKNOWN' 'record' "telemetryArm=LIGHT but the record fails closed ($shape)" }
+    # adversary r5 pass 2 A2: the other evidence the record carries must agree with the LIGHT label, for the arm word and the arm object alike: its recorded `launch` must read LIGHT and a
+    # generatorArgs.telemetryArm it embeds must be exactly LIGHT
+    $contradiction = Get-FpsRecordContradiction $Leg
+    if ($null -ne $contradiction) { return New-FpsArm 'UNKNOWN' 'record' "telemetryArm=LIGHT but $contradiction" }
+    # The label (a bare word, or an arm object whatever its `source` says: adversary r5 pass 2 A3) is not proof by itself. Evidence is a recorded launch (just judged LIGHT above) or a recorded
+    # observer list, the same rule as a recorded result (Get-FpsArmFromJobResult).
+    if ($null -eq (Get-FaProp $Leg 'launch') -and -not (Test-FpsRecordHasObserverEvidence $Leg)) {
+        return New-FpsArm 'UNKNOWN' 'record' 'telemetryArm=LIGHT but the record records neither its launch nor its observer controls (the arm label alone is not proof)'
     }
-    # a bare arm WORD with no recorded observer controls is not proof (the same rule as a recorded result, Get-FpsArmFromJobResult): the arm object a smoke summary records is judged from its launch
-    # environment, the word is not
-    if (-not (Test-FpsRecordHasObserverEvidence $Leg)) { return New-FpsArm 'UNKNOWN' 'record' 'telemetryArm=LIGHT but the record records no observer controls (the arm word alone is not proof)' }
+    if ($field -isnot [string]) { return $field }
     New-FpsArm 'LIGHT' 'record' 'telemetryArm=LIGHT'
 }
 
@@ -309,6 +335,10 @@ function Get-FpsArmFromJobResult {
         # a result that records an enabled observer control (the same keys as a spec: at its top level, under its generatorArgs, or under an `observerControls` object) is not LIGHT
         # either (adversary pass 3 A2)
         $containers = @($Result, (Get-FaProp $Result 'generatorArgs'), (Get-FaProp $Result 'observerControls'))
+        $shape = Get-FpsRecordShapeProblem $Result
+        if ($null -ne $shape) { return New-FpsArm 'UNKNOWN' 'result' "telemetryArm=LIGHT but the result fails closed ($shape)" }
+        $contradiction = Get-FpsRecordContradiction $Result
+        if ($null -ne $contradiction) { return New-FpsArm 'UNKNOWN' 'result' "telemetryArm=LIGHT but $contradiction" }
         # the same rule as a leg record's (Read-FpsRecordedObserverControls): an `observerControls` that is not an object, an enabled entry of any name, or an entry that cannot be read fails closed
         foreach ($holder in @($Result, (Get-FaProp $Result 'generatorArgs'))) {
             $oc = Read-FpsRecordedObserverControls $holder
@@ -453,8 +483,9 @@ function Get-FpsArmFromEnvironment {
     $raw = $map['MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG']
     if ($raw -notmatch '^[\x00-\x7F]*$' -or $raw -match '\s') { return New-FpsArm 'UNKNOWN' 'environment' 'the per-frame log opt-out holds whitespace or non-ASCII text, which the native readers handle differently' }
     $d = $raw.ToLowerInvariant()
-    if ($d -in @('1', 'true', 'yes', 'on')) { return New-FpsArm 'LIGHT' 'environment' 'frame telemetry on, per-frame log opted out' }
-    if ($d -in @('', '0', 'false', 'off', 'no')) { return New-FpsArm 'HEAVY' 'environment' 'frame telemetry on, per-frame log opt-out is explicitly off' }
+    # ordinal, not -in (culture compare): "1" + U+0001 is not the "1" the native reader sees (adversary r5 pass 2 A1)
+    if (Test-FaTextIn $d @('1', 'true', 'yes', 'on')) { return New-FpsArm 'LIGHT' 'environment' 'frame telemetry on, per-frame log opted out' }
+    if (Test-FaTextIn $d @('', '0', 'false', 'off', 'no')) { return New-FpsArm 'HEAVY' 'environment' 'frame telemetry on, per-frame log opt-out is explicitly off' }
     New-FpsArm 'UNKNOWN' 'environment' "per-frame log opt-out value '$d' is read differently by the app's two readers"
 }
 

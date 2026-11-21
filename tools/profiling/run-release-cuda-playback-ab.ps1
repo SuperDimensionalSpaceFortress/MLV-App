@@ -966,6 +966,8 @@ function Read-SmokeSummary {
         exitCode = $ExitCode
         validationOk = $validationOk
         telemetryArm = (Get-SmokeSummaryTelemetryArm -Json $json)
+        # the launch block the arm was derived from, recorded beside it so a saved leg is judged against its own launch (adversary r5 pass 2 A3: an arm label alone is not proof)
+        launch = (Get-FaProp $json 'launch')
         hostLoadProvisional = $hostLoadProvisional
         hostLoadState = $hostLoadState
         hostLoadReason = $hostLoadReason
