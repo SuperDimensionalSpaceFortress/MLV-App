@@ -344,7 +344,7 @@ function Update-VenueTicket {
     Heartbeat: rewrite the ticket's heartbeat (and, when given, its phase and staleAfterSec) as a whole new file moved over the old one (Write-VenueTicketAtomic).
     Returns OK | LOST (the ticket is gone or is not ours) | BUSY (a reader or the rename was refused five times; try again).
     #>
-    param([Parameter(Mandatory)]$Ticket, [ValidateSet('', 'waiting', 'cooldown', 'probing', 'supplementary')][string]$Phase = '', [int]$StaleAfterSec = 0, $NowUtc = $null)   # every phase a caller passes (Invoke-VenueChain.ps1 sets probing and supplementary; the lease batch cooldown; a request waiting). ValidateSet is case-insensitive: stored lower-case below, as New-VenueTicket does
+    param([Parameter(Mandatory)]$Ticket, [ValidateSet('', 'waiting', 'cooldown', 'probing', 'supplementary')][string]$Phase = '', [int]$StaleAfterSec = 0, $NowUtc = $null)   # every phase a caller passes (the chain runner sets probing and supplementary; the lease batch cooldown; a request waiting). ValidateSet is case-insensitive: stored lower-case below, as New-VenueTicket does
     $now = Resolve-VenueNow $NowUtc
     for ($attempt = 1; $attempt -le 5; $attempt++) {
         if (-not (Test-Path -LiteralPath $Ticket.path -PathType Leaf)) { return 'LOST' }
