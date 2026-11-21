@@ -465,49 +465,54 @@ function Invoke-PinnedPayloadInstall {
 
     # Adversary 500e2892-A1: the listing taken before the child exists is what places a process outside its tree on a timeout.
     $baseline = Get-PinnedPayloadBaseline
-    # Adversary a7bf472f-A7: the output folder's identity before the child starts, so a timeout recovery restores into THAT folder only.
-    $outputIdentity = Get-PinnedDirectoryIdentity -LiteralPath $OutputDir
+    # Adversary a7bf472f-A7 / bf1ac39c-A1: the output folder is HELD from before the child starts until any recovery is done, so a timeout
+    # recovery restores into THAT folder only (disposed in the finally below).
+    $outputPin = Open-PinnedDirectoryPin -LiteralPath $OutputDir
     try {
-        $process = [System.Diagnostics.Process]::Start($psi)
-    } catch {
-        $result.reason = "the extractor did not start: $($_.Exception.Message)"
-        return [pscustomobject]$result
-    }
-    try {
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit($TimeoutSec * 1000)) {
-            $result.timedOut = $true
-            $stop = Stop-PinnedPayloadChild -Process $process -Baseline $baseline
-            $result.killConfirmed = [bool]$stop.confirmed
-            $childPid = $process.Id
-            $killError = [string]$stop.killError
-        } else {
-            $process.WaitForExit()
-            $result.exitCode = $process.ExitCode
+        try {
+            $process = [System.Diagnostics.Process]::Start($psi)
+        } catch {
+            $result.reason = "the extractor did not start: $($_.Exception.Message)"
+            return [pscustomobject]$result
         }
-        if ($stdoutTask.Wait(10000)) { $result.stdout = [string]$stdoutTask.Result }
-        if ($stderrTask.Wait(10000)) { $result.stderr = [string]$stderrTask.Result }
+        try {
+            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+            $stderrTask = $process.StandardError.ReadToEndAsync()
+            if (-not $process.WaitForExit($TimeoutSec * 1000)) {
+                $result.timedOut = $true
+                $stop = Stop-PinnedPayloadChild -Process $process -Baseline $baseline
+                $result.killConfirmed = [bool]$stop.confirmed
+                $childPid = $process.Id
+                $killError = [string]$stop.killError
+            } else {
+                $process.WaitForExit()
+                $result.exitCode = $process.ExitCode
+            }
+            if ($stdoutTask.Wait(10000)) { $result.stdout = [string]$stdoutTask.Result }
+            if ($stderrTask.Wait(10000)) { $result.stderr = [string]$stderrTask.Result }
+        } finally {
+            $process.Dispose()
+        }
+        if ($result.timedOut) {
+            $result.reason = if ($result.killConfirmed) {
+                "the extractor was still running after $TimeoutSec s; its root was killed (root-only kill) and its process tree was seen gone"
+            } else {
+                "the extractor was still running after $TimeoutSec s and the kill was NOT confirmed (pid $childPid or a descendant may still be running$(if ($killError) { "; kill error: $killError" }))"
+            }
+            # Adversary f92303b7-A1: a kill between the extractor's move of an original into its transaction backup and the install of
+            # the replacement bypasses the Python rollback and leaves the destination missing. Once the kill is CONFIRMED (no child can
+            # still move files) the originals are put back; with an unconfirmed kill nothing is touched, since the child may still run.
+            if ($result.killConfirmed) {
+                $recovery = Complete-PinnedPayloadTimeoutRecovery -OutputDir $OutputDir -TransactionId $transactionId -Pin $outputPin
+                $result.transactionRestored = @($recovery.restored)
+                $result.reason += "; $($recovery.text)"
+            } else {
+                $result.reason += '; its transaction was NOT reconciled (the extractor may still be running)'
+            }
+            return [pscustomobject]$result
+        }
     } finally {
-        $process.Dispose()
-    }
-    if ($result.timedOut) {
-        $result.reason = if ($result.killConfirmed) {
-            "the extractor was still running after $TimeoutSec s; its root was killed (root-only kill) and its process tree was seen gone"
-        } else {
-            "the extractor was still running after $TimeoutSec s and the kill was NOT confirmed (pid $childPid or a descendant may still be running$(if ($killError) { "; kill error: $killError" }))"
-        }
-        # Adversary f92303b7-A1: a kill between the extractor's move of an original into its transaction backup and the install of
-        # the replacement bypasses the Python rollback and leaves the destination missing. Once the kill is CONFIRMED (no child can
-        # still move files) the originals are put back; with an unconfirmed kill nothing is touched, since the child may still run.
-        if ($result.killConfirmed) {
-            $recovery = Complete-PinnedPayloadTimeoutRecovery -OutputDir $OutputDir -TransactionId $transactionId -StartIdentity $outputIdentity
-            $result.transactionRestored = @($recovery.restored)
-            $result.reason += "; $($recovery.text)"
-        } else {
-            $result.reason += '; its transaction was NOT reconciled (the extractor may still be running)'
-        }
-        return [pscustomobject]$result
+        if ($outputPin) { $outputPin.handle.Dispose() }
     }
     if ($result.exitCode -ne 0) {
         $result.reason = "the extractor exited $($result.exitCode): $($result.stderr.Trim())"
@@ -711,11 +716,16 @@ namespace MlvReleaseAdmission {
             return string.Equals(held.Substring(heldRoot.TrimEnd('\\').Length), requested.Substring(requestedRoot.TrimEnd('\\').Length), StringComparison.Ordinal);
         }
 
-        // Adversary a7bf472f-A7: the identity (volume serial and file index) of the directory a pathname resolves to NOW, every reparse
-        // point followed; null with detail when it cannot be opened or is not a directory. Opened for attributes only, sharing all.
-        public static string DirectoryIdentity(string path, out string detail) {
+        // Adversary a7bf472f-A7 / bf1ac39c-A1: HOLDS the directory a pathname resolves to now (every reparse point followed) and returns
+        // that directory's own resolved path. Share mode read and write only (no FILE_SHARE_DELETE), so while the handle is open the
+        // directory cannot be renamed or deleted, and neither can a plain ancestor of it; its resolved path holds no reparse point. So a
+        // restore through that path reaches the held directory however the caller's spelling is retargeted. Null with detail on failure.
+        public static SafeFileHandle OpenDirectoryPin(string path, out string finalPath, out string detail) {
+            finalPath = null;
             detail = "";
-            SafeFileHandle handle = CreateFileW(path, 0x80 /* FILE_READ_ATTRIBUTES */, 0x7 /* read, write, delete */, IntPtr.Zero, OPEN_EXISTING,
+            // FILE_LIST_DIRECTORY is requested with the attributes: an attribute-only open is exempt from share checks, so it would not
+            // stop a rename.
+            SafeFileHandle handle = CreateFileW(path, 0x81 /* FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES */, 0x3 /* read, write */, IntPtr.Zero, OPEN_EXISTING,
                 0x02000000 /* FILE_FLAG_BACKUP_SEMANTICS */, IntPtr.Zero);
             if (handle == null || handle.IsInvalid) {
                 int error = Marshal.GetLastWin32Error();
@@ -723,13 +733,18 @@ namespace MlvReleaseAdmission {
                 detail = Win32Text(error);
                 return null;
             }
+            bool keep = false;
             try {
                 ByHandleFileInformation info;
                 if (!GetFileInformationByHandle(handle, out info)) { detail = Win32Text(Marshal.GetLastWin32Error()); return null; }
                 if ((info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) { detail = "not a directory"; return null; }
-                return info.VolumeSerialNumber.ToString("x8") + ":" + info.FileIndexHigh.ToString("x8") + info.FileIndexLow.ToString("x8");
+                int pathError;
+                finalPath = HandlePath(handle, out pathError);
+                if (finalPath == null) { detail = "the held folder's path could not be read: " + Win32Text(pathError); return null; }
+                keep = true;
+                return handle;
             } finally {
-                handle.Dispose();
+                if (!keep) { handle.Dispose(); }
             }
         }
 
@@ -825,37 +840,35 @@ function Open-PinnedNoFollowStream {
     return [pscustomobject]@{ stream = $opened.Stream; code = ''; detail = '' }
 }
 
-# Adversary a7bf472f-A7: the identity ('<volume>:<file index>') of the folder LiteralPath resolves to now, or $null when it is absent or
-# cannot be read. Never throws.
-function Get-PinnedDirectoryIdentity {
+# Adversary a7bf472f-A7 / bf1ac39c-A1: holds the folder LiteralPath resolves to now; returns { handle; path } (path = the held folder's
+# own resolved path), or $null when it is absent or cannot be held. The caller disposes .handle. Never throws.
+function Open-PinnedDirectoryPin {
     param([Parameter(Mandatory)][string]$LiteralPath)
     try {
         if (-not ($script:PinnedNoFollowTypeName -as [type])) {
             Add-Type -TypeDefinition $script:PinnedNoFollowSource -Language CSharp -ErrorAction Stop
         }
+        $finalPath = $null
         $detail = ''
-        return [MlvReleaseAdmission.PinnedNoFollowOpen]::DirectoryIdentity($LiteralPath, [ref]$detail)
+        $handle = [MlvReleaseAdmission.PinnedNoFollowOpen]::OpenDirectoryPin($LiteralPath, [ref]$finalPath, [ref]$detail)
+        if (-not $handle) { return $null }
+        return [pscustomobject]@{ handle = $handle; path = [string]$finalPath }
     } catch {
         return $null
     }
 }
 
-# Adversary a7bf472f-A7: the recovery after a CONFIRMED stop, bound to the output folder the install started with. StartIdentity is
-# Get-PinnedDirectoryIdentity of OutputDir taken before the child started ($null: the folder did not exist then). When the folder
-# OutputDir names now is another one (a junction on the way was retargeted), nothing is restored and the text says so; a transaction
-# folder that is not found is said to be not found, never "reconciled". Never throws; returns { restored; text }.
+# Adversary a7bf472f-A7 / bf1ac39c-A1: the recovery after a CONFIRMED stop, bound to the output folder the install HELD from before the
+# child started (Pin, from Open-PinnedDirectoryPin; $null when OutputDir did not exist then, and OutputDir's spelling is used). The
+# restore goes through the held folder's own resolved path, so a junction retargeted on the caller's spelling cannot redirect it; a
+# transaction folder that is not found is said to be not found, never "reconciled". Never throws; returns { restored; text }.
 function Complete-PinnedPayloadTimeoutRecovery {
     param(
         [Parameter(Mandatory)][string]$OutputDir,
         [Parameter(Mandatory)][string]$TransactionId,
-        [AllowNull()][AllowEmptyString()][string]$StartIdentity
+        [AllowNull()]$Pin
     )
-    if ($StartIdentity) {
-        $now = Get-PinnedDirectoryIdentity -LiteralPath $OutputDir
-        if ($now -cne $StartIdentity) {
-            return [pscustomobject]@{ restored = @(); text = "its transaction was NOT reconciled: $OutputDir is no longer the folder the install started with (identity $StartIdentity, now $(if ($now) { $now } else { 'unreadable' })), so nothing was restored" }
-        }
-    }
+    if ($Pin) { $OutputDir = [string]$Pin.path }
     $restore = Restore-PinnedPayloadTransaction -OutputDir $OutputDir -TransactionId $TransactionId
     $errors = if (@($restore.errors).Count) { ", errors [$(@($restore.errors) -join '; ')]" } else { '' }
     if (-not $restore.found) {
@@ -971,7 +984,8 @@ function Test-PinnedZipMember {
             $name = $raw.Replace('\', '/')
             $isDirectory = $name.EndsWith('/')
             $path = if ($isDirectory) { $name.Substring(0, $name.Length - 1) } else { $name }
-            $badSegments = @($path.Split('/') | Where-Object { $_ -eq '' -or $_ -eq '.' -or $_ -eq '..' -or $_ -match '[. ]\z' -or $_ -match '~[0-9]' -or $_ -match '[:*?"<>|\x00-\x1f]' })
+            # Adversary bf1ac39c-A7: a reserved device name (CON, PRN, AUX, NUL, COM0-9, LPT0-9; with any extension) cannot be extracted.
+            $badSegments = @($path.Split('/') | Where-Object { $_ -eq '' -or $_ -eq '.' -or $_ -eq '..' -or $_ -match '[. ]\z' -or $_ -match '~[0-9]' -or $_ -match '[:*?"<>|\x00-\x1f]' -or $_ -match '^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(\.[^.]*)*\z' })
             if ($path.Length -eq 0 -or $badSegments.Count -gt 0) {
                 $check.reason = "$ZipPath entry '$raw' is not a canonical entry name (it could extract over another entry)"
                 return [pscustomobject]$check

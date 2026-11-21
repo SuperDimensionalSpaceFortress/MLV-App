@@ -317,6 +317,15 @@ class ScriptsInstallUnconditionallyTests(unittest.TestCase):
         statements = [m.start() for m in re.finditer(r"(?m)^\s*exit 10\s*$", release)]
         self.assertEqual(len(statements), 1, "exactly one exit 10 statement")
         self.assertLess(statements[0], release.index("$ffmpegHold = Open-PinnedFileHold"))
+        # adversary bf1ac39c-A8 (sibling of a7bf472f-A2, class: a terminal exit deferred past a later failure): exit 8 is IMMEDIATE in
+        # the DLL-load FAIL branch too, ahead of the ffmpeg hold (exit 9).
+        dll = re.search(r"if \(\$probeDllFailure\) \{\n(.*?)\n\} elseif", release, re.S)
+        self.assertIsNotNone(dll, "the DLL-load branch is gone")
+        self.assertRegex(dll.group(1), r"\n\s*exit 8$")
+        eights = [m.start() for m in re.finditer(r"(?m)^\s*exit 8\s*$", release)]
+        self.assertEqual(len(eights), 1, "exactly one exit 8 statement")
+        self.assertLess(eights[0], release.index("$ffmpegHold = Open-PinnedFileHold"))
+        self.assertNotIn("if ($probeDllFailure) { exit 8 }", release)
         # adversary a7bf472f-A5 (advisory, in scope): [uint32] of a negative NTSTATUS threw before exit 8; the status is formatted as an int.
         self.assertNotIn("[uint32]$probeExit", release)
         self.assertIn("-f ([int]$probeExit)", release)
@@ -1008,8 +1017,10 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         # literal name was counted; Expand-Archive -Force then wrote the alias over the pinned file. Every entry name must be
         # canonical (no ., .., empty, trailing-dot/space, 8.3 or stream segment), and no two entries may name one path.
         payload = b"MZ pinned ffmpeg bytes" * 100
+        # adversary bf1ac39c-A7: a reserved device name (NUL, CON, COM1, LPT1, AUX, PRN; with or without an extension) cannot be
+        # extracted on Windows, so the package would pass and then fail to expand.
         for alias in ("./ffmpeg.exe", ".\\ffmpeg.exe", "/ffmpeg.exe", "sub/../ffmpeg.exe", "ffmpeg.exe.", "ffmpeg.exe ",
-                      "FFMPEG~1.EXE", "ffmpeg.exe::$DATA", "sub//x.dll"):
+                      "FFMPEG~1.EXE", "ffmpeg.exe::$DATA", "sub//x.dll", "NUL", "nul.txt", "sub/Com1", "LPT9.dll", "aux", "PRN.x", "con"):
             with self.subTest(alias=alias):
                 bad = self._zip(f"alias-{abs(hash(alias))}.zip", {"MLVApp.exe": b"exe", "ffmpeg.exe": payload, alias: b"MZwrong"})
                 result = self._check_zip(bad, payload)
@@ -1099,11 +1110,13 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         self._assert_backup_reported(result, mine / "ffmpeg.exe")
         self.assertEqual((other / "ffmpeg.exe").read_bytes(), b"Q-OLD")
 
-    def test_recovery_refuses_an_output_folder_retargeted_after_the_start(self) -> None:
+    def test_recovery_restores_only_into_the_output_folder_held_since_the_start(self) -> None:
         # adversary a7bf472f-A7: OutputDir current was a junction to A, the extractor moved OLD into A's transaction, the stop confirmed,
-        # and current was retargeted to B before recovery. Recovery re-resolved the spelling, found nothing in B and still said
-        # "transaction reconciled". The folder's identity is bound before the child starts; recovery refuses a different folder, and a
-        # transaction that is not found is said to be not found.
+        # and current was retargeted to B before recovery; recovery re-resolved the spelling, found nothing in B and still said
+        # "transaction reconciled". adversary bf1ac39c-A1: an identity check followed by a restore BY NAME left a retarget window between
+        # them. The output folder is now HELD from before the child starts (no FILE_SHARE_DELETE: it and its plain ancestors cannot be
+        # renamed) and recovery restores into the held folder's own resolved path, never through the spelling again. A transaction that
+        # is not found is said to be not found.
         a = self.tmp / "A"
         b = self.tmp / "B"
         backup = a / f".vendored-payload-transaction-{self.MINE}"
@@ -1111,30 +1124,27 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         (backup / "ffmpeg.exe").write_bytes(b"OLD")
         b.mkdir()
         current = self.tmp / "current"
-        call = "& $m { param($o, $t, $s) Complete-PinnedPayloadTimeoutRecovery -OutputDir $o -TransactionId $t -StartIdentity $s }"
+        call = "& $m { param($o, $t, $p) Complete-PinnedPayloadTimeoutRecovery -OutputDir $o -TransactionId $t -Pin $p }"
         result = self._ps(
             "$null = New-Item -ItemType Junction -Path $env:FFX_CUR -Target $env:FFX_A\n"
-            "$start = & $m { param($o) Get-PinnedDirectoryIdentity -LiteralPath $o } $env:FFX_CUR\n"
+            "$pin = & $m { param($o) Open-PinnedDirectoryPin -LiteralPath $o } $env:FFX_CUR\n"
             "[System.IO.Directory]::Delete($env:FFX_CUR)\n"
             "$null = New-Item -ItemType Junction -Path $env:FFX_CUR -Target $env:FFX_B\n"
-            f"$moved = {call} $env:FFX_CUR $env:FFX_TX $start\n"
-            "$backupKept = Test-Path -LiteralPath (Join-Path $env:FFX_A \".vendored-payload-transaction-$($env:FFX_TX)\\ffmpeg.exe\")\n"
-            "[System.IO.Directory]::Delete($env:FFX_CUR)\n"
-            "$null = New-Item -ItemType Junction -Path $env:FFX_CUR -Target $env:FFX_A\n"
-            f"$same = {call} $env:FFX_CUR $env:FFX_TX $start\n"
+            "$renameRefused = $false\n"
+            "try { [System.IO.Directory]::Move($env:FFX_A, $env:FFX_A + '-moved') } catch { $renameRefused = $true }\n"
+            f"$moved = {call} $env:FFX_CUR $env:FFX_TX $pin\n"
+            "if ($pin) { $pin.handle.Dispose() }\n"
             "[System.IO.Directory]::Delete($env:FFX_CUR)\n"
             f"$none = {call} $env:FFX_B $env:FFX_TX $null\n"
-            "[ordered]@{ start = [string]$start; moved = $moved.text; movedRestored = @($moved.restored).Count; backupKept = $backupKept;"
-            " same = $same.text; sameRestored = @($same.restored); none = $none.text } | ConvertTo-Json -Compress\n",
+            "[ordered]@{ pinned = [bool]$pin; renameRefused = $renameRefused; moved = $moved.text; movedRestored = @($moved.restored);"
+            " none = $none.text } | ConvertTo-Json -Compress\n",
             FFX_CUR=str(current), FFX_A=str(a), FFX_B=str(b), FFX_TX=self.MINE)
-        self.assertTrue(result["start"], result)
-        self.assertIn("is no longer the folder the install started with", result["moved"])
-        self.assertNotIn("reconciled: restored", result["moved"])
-        self.assertEqual(result["movedRestored"], 0, result)
-        self.assertTrue(result["backupKept"], result)
-        self.assertIn("transaction reconciled: restored [ffmpeg.exe]", result["same"])
-        self.assertEqual(result["sameRestored"], ["ffmpeg.exe"], result)
+        self.assertTrue(result["pinned"], result)
+        self.assertTrue(result["renameRefused"], "the held output folder must not be renamable")
+        self.assertIn("transaction reconciled: restored [ffmpeg.exe]", result["moved"])
+        self.assertEqual(result["movedRestored"], ["ffmpeg.exe"], result)
         self.assertEqual((a / "ffmpeg.exe").read_bytes(), b"OLD")
+        self.assertFalse((b / "ffmpeg.exe").exists(), "nothing may be restored into the retargeted folder")
         self.assertIn("no transaction folder", result["none"])
         self.assertNotIn("reconciled", result["none"])
 
@@ -1187,9 +1197,11 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         branch = body[body.index("if ($result.timedOut) {"): body.index("if ($result.exitCode -ne 0) {")]
         # adversary a7bf472f-A7: the recovery is bound to the output folder's identity taken before the child started.
         self.assertRegex(branch, r"if \(\$result\.killConfirmed\) \{\n\s*\$recovery = Complete-PinnedPayloadTimeoutRecovery -OutputDir \$OutputDir "
-                                 r"-TransactionId \$transactionId -StartIdentity \$outputIdentity\n")
-        self.assertLess(body.index("$outputIdentity = Get-PinnedDirectoryIdentity -LiteralPath $OutputDir"),
+                                 r"-TransactionId \$transactionId -Pin \$outputPin\n")
+        # adversary bf1ac39c-A1: the output folder is HELD from before the child starts until the recovery is done.
+        self.assertLess(body.index("$outputPin = Open-PinnedDirectoryPin -LiteralPath $OutputDir"),
                         body.index("[System.Diagnostics.Process]::Start($psi)"))
+        self.assertIn("if ($outputPin) { $outputPin.handle.Dispose() }", body)
         recovery = re.search(r"function Complete-PinnedPayloadTimeoutRecovery \{.*?\n\}", text, re.S).group(0)
         self.assertEqual(recovery.count("Restore-PinnedPayloadTransaction -OutputDir $OutputDir -TransactionId $TransactionId"), 1)
         self.assertIn("was NOT reconciled", branch)

@@ -271,6 +271,8 @@ if ($probeDllFailure) {
     # Adversary a7bf472f-A5: an NTSTATUS such as 0xC0000135 is a NEGATIVE Int32, which [uint32] refuses (it threw before exit 8); the
     # X8 format of the Int32 itself prints its two's-complement hex.
     Write-Host ("FAIL: artifact is NOT self-contained -- launch probe exited 0x{0:X8} (DLL load failure)" -f ([int]$probeExit)) -ForegroundColor Red
+    # Adversary bf1ac39c-A8 (sibling of a7bf472f-A2): exit 8 is IMMEDIATE, ahead of the ffmpeg hold below (exit 9).
+    exit 8
 } elseif ($probeStopUnconfirmed) {
     # Adversary a7bf472f-A2: exit 10 is IMMEDIATE, so neither the ffmpeg hold below (exit 9) nor a manifest write that throws can end
     # the script first with another code.
@@ -312,4 +314,3 @@ try {
 Write-Host "OK -> $destExe" -ForegroundColor Green
 Write-Host "    embedded-SHA==HEAD: $shaOk ; self-contained: $($deploy.selfContained) ; manifest written"
 if (-not $shaOk) { exit 6 }
-if ($probeDllFailure) { exit 8 }
