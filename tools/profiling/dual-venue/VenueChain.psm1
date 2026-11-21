@@ -211,6 +211,49 @@ $script:TicketNameRx = [regex]'^([0-9]{19})-p([0-9]+)-([0-9]+)\.ticket\.json$'  
 
 function Resolve-VenueNow($Value) { if ($null -eq $Value) { [DateTime]::UtcNow } else { ConvertTo-VenueUtc $Value } }
 
+# r8 rule 2 (adversary r7 pass 3 A1): the last phase this PROCESS read from each ticket (by path, with the nonce it was read under), so a ticket whose file is busy for longer than a settle window keeps
+# the phase it was last seen with, and a ticket this process never read stays "phase unknown, not ready". Bounded: cleared past 512 entries; pruned to the files present at every census.
+$script:TicketPhaseSeen = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
+
+function Get-VenueTicketNameKey {
+    # r8 rule 1: the owner pid and start ticks a ticket's file NAME carries (<ticks>-p<pid>-<start>.ticket.json), as text; $null for a name that is no ticket's. The name is readable when the file is not.
+    param([string]$Name)
+    $m = $script:TicketNameRx.Match([string]$Name)
+    if (-not $m.Success) { return $null }
+    [pscustomobject]@{ pidText = $m.Groups[2].Value; startText = $m.Groups[3].Value }
+}
+
+function Test-VenueOwnTicketRow {
+    # r8 rule 1 (adversary r7 pass 3 A2, A7; the r6 A9 class "a batch queued behind itself"): a row that is ANOTHER ticket of the caller's own process (the pid and start ticks in the names match) and run directory
+    # (compared when the ticket is readable; a busy file has only its name to go by) is the caller's own, and never blocks it: a stranded or half-made ticket of this very owner must not queue its next place behind it.
+    param($Row, [string]$MyName, [string]$MyRunDir = '')
+    if ($Row.name -ceq $MyName) { return $false }
+    $mine = Get-VenueTicketNameKey $MyName
+    $theirs = Get-VenueTicketNameKey $Row.name
+    if ($null -eq $mine -or $null -eq $theirs -or $mine.pidText -cne $theirs.pidText -or $mine.startText -cne $theirs.startText) { return $false }
+    if ($null -ne $Row.ticket) { return ([string]$Row.ticket.runDir -ceq $MyRunDir) }
+    $true
+}
+
+function Get-VenueRowPhase {
+    # r8 rule 2: a row's phase: the parsed ticket's, or (a BUSY file) the last one this process read, or $null (unknown).
+    # A scalar string or $null, never the raw value: a one-element array would be unrolled by the pipeline into its element, and read as that string (the r7 A10 array case).
+    param($Row)
+    if ($null -ne $Row.ticket) { $own = $Row.ticket.phase; if ($own -is [string]) { return [string]$own } else { return $null } }
+    $p = $Row.PSObject.Properties['lastPhase']
+    if ($Row.state -ceq 'BUSY' -and $null -ne $p) { return $p.Value }
+    $null
+}
+
+function Get-VenueClaimAgeSec {
+    # r8 rule 4 (adversary r7 pass 3 A5): the age of a claim by its OWN claimedUtc, the clock the claim's expiry runs on (not the moment a caller's request happened to return). $null when it cannot be read.
+    param($Claim, $NowUtc = $null)
+    if ($null -eq $Claim) { return $null }
+    $claimed = ConvertTo-VenueUtc $Claim.claimedUtc
+    if ($null -eq $claimed) { return $null }
+    [Math]::Max(0.0, ((Resolve-VenueNow $NowUtc) - $claimed).TotalSeconds)
+}
+
 function Get-VenueTicketDir {
     param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '')
     Join-Path (Split-Path -Parent (Get-VenueClaimPath -Venue $Venue -ClaimDir $ClaimDir)) "$Venue.tickets"
@@ -306,16 +349,22 @@ function Get-VenueTickets {
     $now = Resolve-VenueNow $NowUtc
     $dir = Get-VenueTicketDir -Venue $Venue -ClaimDir $ClaimDir
     $rows = [System.Collections.Generic.List[object]]::new()
+    $present = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     if (Test-Path -LiteralPath $dir -PathType Container) {
         foreach ($file in @(Get-ChildItem -LiteralPath $dir -Filter '*.ticket.json' -File -ErrorAction SilentlyContinue)) {
             $m = $script:TicketNameRx.Match($file.Name)
             if (-not $m.Success) { continue }
+            [void]$present.Add($file.FullName)
             $keys = $null
             try { $keys = @([decimal]$m.Groups[1].Value, [decimal]$m.Groups[2].Value, [decimal]$m.Groups[3].Value) } catch { continue }   # a name whose number is past any decimal is no ticket of ours (pass 2 A7): skipped, never a throw out of the census
             $f = Read-VenueClaimFile $file.FullName -ShareDelete
             if (-not $f.exists) { continue }
-            $row = [ordered]@{ name = $file.Name; path = $file.FullName; key = $keys[0]; pidKey = $keys[1]; startKey = $keys[2]; state = 'LIVE'; reason = $null; text = $f.text; ticket = $null; position = 0; ageSec = $null; heartbeatAgeSec = $null }
-            if ($f.busy) { $row.state = 'BUSY' }
+            $row = [ordered]@{ name = $file.Name; path = $file.FullName; key = $keys[0]; pidKey = $keys[1]; startKey = $keys[2]; state = 'LIVE'; reason = $null; text = $f.text; ticket = $null; position = 0; ageSec = $null; heartbeatAgeSec = $null; lastPhase = $null }
+            if ($f.busy) {
+                $row.state = 'BUSY'
+                $seen = $null
+                if ($script:TicketPhaseSeen.TryGetValue($file.FullName, [ref]$seen)) { $row.lastPhase = $seen.phase }   # r8 rule 2: a busy file keeps the phase this process last read from it
+            }
             else {
                 $t = $null
                 try { $t = $f.text | ConvertFrom-Json -ErrorAction Stop -NoEnumerate } catch { $t = $null }
@@ -325,6 +374,8 @@ function Get-VenueTickets {
                     else { $row.state = 'STALE'; $row.reason = 'unreadable' }
                 } else {
                     $row.ticket = $t
+                    if ($script:TicketPhaseSeen.Count -ge 512) { $script:TicketPhaseSeen.Clear() }
+                    $script:TicketPhaseSeen[$file.FullName] = [pscustomobject]@{ nonce = [string]$t.nonce; phase = $(if ($t.phase -is [string]) { [string]$t.phase } else { $null }) }
                     $why = Get-VenueTicketStaleReason -Ticket $t -NowUtc $now
                     if ($why) { $row.state = 'STALE'; $row.reason = $why }
                     $c = ConvertTo-VenueUtc $t.createdUtc; $b = ConvertTo-VenueUtc $t.heartbeatUtc
@@ -336,6 +387,9 @@ function Get-VenueTickets {
             $rows.Add([pscustomobject]$row)
         }
     }
+    $prefix = $null
+    try { $prefix = [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($dir)).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar } catch { $prefix = $null }
+    if ($null -ne $prefix) { foreach ($k in @($script:TicketPhaseSeen.Keys)) { if ($k.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -and -not $present.Contains($k)) { [void]$script:TicketPhaseSeen.Remove($k) } } }   # r8 rule 2: a ticket no longer in its folder is forgotten
     $sorted = @($rows | Sort-Object -Property key, pidKey, startKey, name)   # arrival tick, then owner pid, then owner start ticks: equal ticks never fall back to enumeration order
     $pos = 0
     foreach ($r in $sorted) { if ($r.state -cne 'STALE') { $pos++; $r.position = $pos } }
@@ -348,9 +402,11 @@ function Write-VenueTicketAtomic {
     # The temp name does not end in .ticket.json, so Get-VenueTickets never lists it. Throws when the rename is refused (a handle without FileShare.Delete): Update-VenueTicket retries it
     # (five attempts, then returns BUSY), and Request-VenueClaim retries a BUSY for up to 2 s, then returns QUEUED with a TICKET_PHASE_BUSY note. A process that dies between the CreateNew and the
     # rename leaves its temp behind: Remove-VenueOrphanTicketTemps reaps those older than 5 minutes in Request-VenueClaim's stale sweep.
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][byte[]]$Bytes, [Diagnostics.Stopwatch]$Clock = $null, [double]$BudgetSec = 0)
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][byte[]]$Bytes, [Diagnostics.Stopwatch]$Clock = $null, [ValidateRange(0, 3600)][double]$BudgetSec = 0)
     $tmp = $Path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
     try {
+        # r8 rule 6: the budget is asked before the temp is written too, not only before the rename (a rename already running cannot be cut short: that half is the platform's)
+        if ($BudgetSec -gt 0 -and $null -ne $Clock -and $Clock.Elapsed.TotalSeconds -ge $BudgetSec) { throw 'TICKET_BUDGET the budget ended before the temp write: nothing was written' }
         $fs = [IO.File]::Open($tmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
         try { $fs.Write($Bytes, 0, $Bytes.Length); $fs.Flush($true) } finally { $fs.Dispose() }
         if ($BudgetSec -gt 0 -and $null -ne $Clock -and $Clock.Elapsed.TotalSeconds -ge $BudgetSec) { throw 'TICKET_BUDGET the budget ended before the rename: nothing was published' }
@@ -387,6 +443,15 @@ function Remove-VenueOrphanTicketTemps {
     } finally { Exit-VenueTicketLock $lock }
 }
 
+function Test-VenueAdoptedByName {
+    # r8 rule 1: a ticket object Find-VenueOwnTicket made for a BUSY file carries adopted='by-name' and no nonce; the file it names is this owner's only when its pid is the one in the name and its run directory is the caller's.
+    param($Ticket, $Parsed)
+    $flag = $Ticket.PSObject.Properties['adopted']
+    if ($null -eq $flag -or [string]$flag.Value -cne 'by-name' -or $null -eq $Parsed) { return $false }
+    $k = Get-VenueTicketNameKey ([string]$Ticket.name)
+    ($null -ne $k) -and ([string]$Parsed.ownerPid -ceq $k.pidText) -and ([string]$Parsed.runDir -ceq [string]$Ticket.runDir) -and -not [string]::IsNullOrEmpty([string]$Parsed.nonce)
+}
+
 function Update-VenueTicket {
     <#
     .SYNOPSIS
@@ -395,7 +460,7 @@ function Update-VenueTicket {
     Request-VenueClaim retries BUSY for up to 2 s and then answers QUEUED (note TICKET_PHASE_BUSY); the lease batch's cooldown heartbeat retakes on LOST and logs TICKET_HEARTBEAT_MISSED on BUSY;
     the chain's probing/supplementary phase sets log TICKET_PHASE_<result> on LOST or BUSY.
     #>
-    param([Parameter(Mandatory)]$Ticket, [ValidateSet('', 'waiting', 'cooldown', 'probing', 'supplementary')][string]$Phase = '', [int]$StaleAfterSec = 0, $NowUtc = $null, [double]$BudgetSec = 0)   # every phase a caller passes (the chain runner sets probing and supplementary; the lease batch cooldown; a request waiting). ValidateSet is case-insensitive: stored lower-case below, as New-VenueTicket does. -BudgetSec (adversary A6, 0 = none): no attempt starts, and no back-off sleeps, past this many seconds (a monotonic clock), so a caller's bound is a bound
+    param([Parameter(Mandatory)]$Ticket, [ValidateSet('', 'waiting', 'cooldown', 'probing', 'supplementary')][string]$Phase = '', [int]$StaleAfterSec = 0, $NowUtc = $null, [ValidateRange(0, 3600)][double]$BudgetSec = 0)   # r8 rule 6: 0 (none) through 3600 s; NaN, a negative and Infinity are refused at binding. Every phase a caller passes (the chain runner sets probing and supplementary; the lease batch cooldown; a request waiting). ValidateSet is case-insensitive: stored lower-case below, as New-VenueTicket does. -BudgetSec (adversary A6, 0 = none): no attempt starts, and no back-off sleeps, past this many seconds (a monotonic clock), so a caller's bound is a bound
     $now = Resolve-VenueNow $NowUtc
     $clock = [Diagnostics.Stopwatch]::StartNew()
     for ($attempt = 1; $attempt -le 5; $attempt++) {
@@ -407,6 +472,7 @@ function Update-VenueTicket {
         $lock = Enter-VenueTicketLock -TicketPath $Ticket.path -TimeoutMs $(if ($BudgetSec -gt 0) { [int][Math]::Max(1.0, [Math]::Min(1000.0, ($BudgetSec - $clock.Elapsed.TotalSeconds) * 1000.0)) } else { 1000 })
         if ($null -eq $lock) { continue }
         try {
+            if ($BudgetSec -gt 0 -and $clock.Elapsed.TotalSeconds -ge $BudgetSec) { continue }   # r8 rule 6: asked again with the lock taken, before the read (the lock can be won late)
             if (-not (Test-Path -LiteralPath $Ticket.path -PathType Leaf)) { return 'LOST' }
             $text = $null
             $fs = $null
@@ -415,7 +481,9 @@ function Update-VenueTicket {
                 try { $sr = [IO.StreamReader]::new($fs, [Text.UTF8Encoding]::new($false), $false, 4096, $true); $text = $sr.ReadToEnd(); $sr.Dispose() } finally { $fs.Dispose() }
             } catch { continue }
             $j = $null; try { $j = $text | ConvertFrom-Json -ErrorAction Stop } catch { $j = $null }
-            if ($null -eq $j -or [string]$j.nonce -cne [string]$Ticket.nonce) { return 'LOST' }
+            $want = [string]$Ticket.nonce
+            if ($null -ne $j -and $want -ceq '' -and (Test-VenueAdoptedByName $Ticket $j)) { $want = [string]$j.nonce; try { $Ticket.nonce = $want } catch { $null = $_ } }   # r8 rule 1: a ticket adopted by NAME (its file was busy) takes its nonce from the file, once the file proves to be this owner's
+            if ($null -eq $j -or $want -ceq '' -or [string]$j.nonce -cne $want) { return 'LOST' }
             $fields = [ordered]@{
                 schema = [string]$j.schema; venue = [string]$j.venue; ownerPid = [int]$j.ownerPid; ownerCreatedUtc = (ConvertTo-VenueUtc $j.ownerCreatedUtc).ToString('o'); host = [string]$j.host
                 runDir = [string]$j.runDir; purpose = [string]$j.purpose; createdUtc = (ConvertTo-VenueUtc $j.createdUtc).ToString('o'); heartbeatUtc = $now.ToString('o')
@@ -445,6 +513,7 @@ function Enter-VenueTicketLock {
         try { return [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
         catch { if ($clock.Elapsed.TotalMilliseconds -ge $TimeoutMs) { return $null } }
         Start-Sleep -Milliseconds 15
+        if ($clock.Elapsed.TotalMilliseconds -ge $TimeoutMs) { return $null }   # r8 rule 6: no attempt starts after the timeout (the budget of an update): the lock may have been released during the sleep
     }
 }
 
@@ -477,14 +546,35 @@ function Remove-VenueTicket {
     End the caller's place in the line (only when the file still carries the ticket's nonce). Returns REMOVED | CHANGED | ABSENT | BUSY.
     #>
     param([Parameter(Mandatory)]$Ticket)
-    Remove-VenueTicketFile -Path $Ticket.path -ExpectedNonce ([string]$Ticket.nonce)
+    $nonce = [string]$Ticket.nonce
+    if ($nonce -ceq '' -and $null -ne $Ticket.PSObject.Properties['adopted']) {
+        # r8 rule 1: a ticket adopted by NAME (its file was busy when Find-VenueOwnTicket found it): the nonce is read now. A file still busy cannot be ended yet (BUSY, kept and tried again); one that is not this owner's is CHANGED.
+        $f = Read-VenueClaimFile $Ticket.path -ShareDelete
+        if (-not $f.exists) { return 'ABSENT' }
+        if ($f.busy) { return 'BUSY' }
+        $j = $null; try { $j = $f.text | ConvertFrom-Json -ErrorAction Stop } catch { $j = $null }
+        if (-not (Test-VenueAdoptedByName $Ticket $j)) { return 'CHANGED' }
+        $nonce = [string]$j.nonce
+    }
+    Remove-VenueTicketFile -Path $Ticket.path -ExpectedNonce $nonce
 }
 
 function Find-VenueOwnTicket {
     # r7 adversary A7: this owner's oldest live ticket for the same run directory and purpose, as the ticket object New-VenueTicket returns, or $null. Used to take over a ticket whose creating call the caller gave up on.
     param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '', [string]$RunDir = '', [string]$Purpose = '', [int]$OwnerPid = $PID, $NowUtc = $null)
+    $ownStart = Get-VenueProcessStartUtc $OwnerPid
     foreach ($row in @(Get-VenueTickets -Venue $Venue -ClaimDir $ClaimDir -NowUtc $NowUtc)) {   # oldest first
-        if ($row.state -ceq 'STALE' -or $null -eq $row.ticket) { continue }
+        if ($row.state -ceq 'STALE') { continue }
+        if ($null -eq $row.ticket) {
+            # r8 rule 1 (adversary r7 pass 3 A7): a ticket whose file is BUSY (its creating call was given up on while the write still held it) is this owner's when the pid and start ticks in its NAME are this owner's.
+            # It is adopted by name (no nonce yet: Update-VenueTicket and Remove-VenueTicket read it from the file once it opens), never replaced by a second, later ticket.
+            if ($row.state -ceq 'BUSY' -and $null -ne $ownStart -and $ownStart -ne [DateTime]::MinValue -and $row.pidKey -eq [decimal]$OwnerPid -and $row.startKey -eq [decimal]$ownStart.Ticks) {
+                $seen = $null; $nonce = ''
+                if ($script:TicketPhaseSeen.TryGetValue($row.path, [ref]$seen)) { $nonce = [string]$seen.nonce }
+                return [pscustomobject]@{ name = $row.name; path = $row.path; nonce = $nonce; venue = $Venue; runDir = $RunDir; ownerPid = $OwnerPid; createdUtc = ''; adopted = 'by-name' }
+            }
+            continue
+        }
         $tk = $row.ticket
         if ([string]$tk.runDir -cne $RunDir -or [string]$tk.purpose -cne $Purpose -or [string]$tk.ownerPid -cne [string]$OwnerPid -or [string]::IsNullOrEmpty([string]$tk.nonce)) { continue }
         return [pscustomobject]@{ name = $row.name; path = $row.path; nonce = [string]$tk.nonce; venue = $Venue; runDir = $RunDir; ownerPid = $OwnerPid; createdUtc = [string]$tk.createdUtc }
@@ -495,13 +585,14 @@ function Find-VenueOwnTicket {
 function Get-VenueSettledLive {
     # r7 adversary A3 / A2: the live line (tickets that are not STALE) with every OLDER ticket whose file was busy for a moment (no parsed ticket, so no known phase) read again, for up to 1 s, before a head is chosen
     # from it (a ticket being created or renamed over is busy for milliseconds). One still unreadable after that stays "phase unknown, not ready", so a ticket held for good never blocks the line.
-    param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '', $NowUtc = $null, [Parameter(Mandatory)][string]$MyName, $Live = $null)
+    param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '', $NowUtc = $null, [Parameter(Mandatory)][string]$MyName, $Live = $null, [string]$MyRunDir = '')
     $now = Resolve-VenueNow $NowUtc
     if ($null -eq $Live) { $Live = @(Get-VenueTickets -Venue $Venue -ClaimDir $ClaimDir -NowUtc $now | Where-Object { $_.state -cne 'STALE' }) }
     $clock = [Diagnostics.Stopwatch]::StartNew()
     while ($clock.Elapsed.TotalSeconds -lt 1.0) {
         $mine = @($Live | Where-Object { $_.name -ceq $MyName })
-        if ($mine.Count -eq 0 -or @($Live | Where-Object { $null -eq $_.ticket -and $_.name -cne $MyName -and $_.position -lt $mine[0].position }).Count -eq 0) { break }
+        # r8 rules 1 and 2: an older busy file is waited for only when it is neither the caller's own (never blocks it) nor last seen ready (its phase is known: a head)
+        if ($mine.Count -eq 0 -or @($Live | Where-Object { $null -eq $_.ticket -and $_.name -cne $MyName -and $_.position -lt $mine[0].position -and -not (Test-VenueTicketPhaseReady (Get-VenueRowPhase $_)) -and -not (Test-VenueOwnTicketRow $_ $MyName $MyRunDir) }).Count -eq 0) { break }
         Start-Sleep -Milliseconds 100
         $Live = @(Get-VenueTickets -Venue $Venue -ClaimDir $ClaimDir -NowUtc $now | Where-Object { $_.state -cne 'STALE' })
     }
@@ -510,8 +601,9 @@ function Get-VenueSettledLive {
 
 function Select-VenueHead {
     # The head of a live line: the caller's own ticket, or the oldest ticket that is READY (a known ready phase). Returns zero or one row.
-    param($Live, [Parameter(Mandatory)][string]$MyName)
-    @($Live | Where-Object { $_.name -ceq $MyName -or ($null -ne $_.ticket -and (Test-VenueTicketPhaseReady $_.ticket.phase)) } | Select-Object -First 1)
+    # r8 rules 1 and 2: a ticket of the caller's own process and run never blocks it, and a busy file counts with the phase this process last read from it (a ticket never read stays "phase unknown, not ready").
+    param($Live, [Parameter(Mandatory)][string]$MyName, [string]$MyRunDir = '')
+    @($Live | Where-Object { $_.name -ceq $MyName -or ((Test-VenueTicketPhaseReady (Get-VenueRowPhase $_)) -and -not (Test-VenueOwnTicketRow $_ $MyName $MyRunDir)) } | Select-Object -First 1)
 }
 
 function Request-VenueClaim {
@@ -572,13 +664,13 @@ function Request-VenueClaim {
     }
     if ($stale.Count -gt 0) { $line = Get-VenueTickets -Venue $Venue -ClaimDir $ClaimDir -NowUtc $now }
     # adversary A3 / r7 A2: an OLDER ticket whose file is busy for a moment is read again (Get-VenueSettledLive) before the head is chosen, here and again after a grant
-    $live = @(Get-VenueSettledLive -Venue $Venue -ClaimDir $ClaimDir -NowUtc $now -MyName $t.name -Live @($line | Where-Object { $_.state -cne 'STALE' }))
+    $live = @(Get-VenueSettledLive -Venue $Venue -ClaimDir $ClaimDir -NowUtc $now -MyName $t.name -MyRunDir $RunDir -Live @($line | Where-Object { $_.state -cne 'STALE' }))
     $mine = @($live | Where-Object { $_.name -ceq $t.name })
     $position = $(if ($mine.Count -gt 0) { [int]$mine[0].position } else { 0 })
     # VENUE-FIFO-TICKET-BEFORE-PRECLAIM-1: the head is the oldest live ticket that is READY. A ticket in phase 'cooldown' (its holder is waiting out Bachelor's lease cooldown or budget and
     # cannot take the claim yet) keeps its place but never blocks a ready waiter behind it; the caller's own ticket was just refreshed to 'waiting', so it is always ready.
     # A ticket whose phase cannot be read (no parsed ticket), or is not a KNOWN ready phase (adversary A13), is not known to be ready, so it cannot block either: it keeps its place and is judged at the next request.
-    $head = @(Select-VenueHead -Live $live -MyName $t.name)
+    $head = @(Select-VenueHead -Live $live -MyName $t.name -MyRunDir $RunDir)
     if ($head.Count -eq 0 -or $head[0].name -cne $t.name) {
         $seen = Get-VenueClaim -Venue $Venue -ClaimDir $ClaimDir
         return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $seen.claim; path = $seen.path; broken = @(); ticket = $t; queue = $live; position = $position; staleTickets = @($removed); note = '' }
@@ -591,8 +683,8 @@ function Request-VenueClaim {
         # r7 A12: a census that cannot be made (any throw) never costs a granted claim: the base returned the grant without one.
         $grantClock = [Diagnostics.Stopwatch]::StartNew()
         try {
-            $after = @(Get-VenueSettledLive -Venue $Venue -ClaimDir $ClaimDir -NowUtc $now -MyName $t.name)
-            $headAfter = @(Select-VenueHead -Live $after -MyName $t.name)
+            $after = @(Get-VenueSettledLive -Venue $Venue -ClaimDir $ClaimDir -NowUtc $now -MyName $t.name -MyRunDir $RunDir)
+            $headAfter = @(Select-VenueHead -Live $after -MyName $t.name -MyRunDir $RunDir)
             if ($headAfter.Count -gt 0 -and $headAfter[0].name -cne $t.name) {
                 $back = ''
                 for ($giveBack = 1; $giveBack -le 5; $giveBack++) {
@@ -602,7 +694,9 @@ function Request-VenueClaim {
                 }
                 if ($back -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) {
                     $seen = $null; try { $seen = Get-VenueClaim -Venue $Venue -ClaimDir $ClaimDir } catch { $seen = $null }
-                    return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $(if ($seen) { $seen.claim }); path = $r.path; broken = @($r.broken); ticket = $t; queue = $after; position = $position; staleTickets = @($removed); note = '' }
+                    # r8 rule 7 (adversary r7 pass 3 A11): the queue returned is the census made AFTER the give-back, so the place returned is the caller's in that census (the snapshot's place could be one past it)
+                    $myAfter = @($after | Where-Object { $_.name -ceq $t.name })
+                    return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $(if ($seen) { $seen.claim }); path = $r.path; broken = @($r.broken); ticket = $t; queue = $after; position = $(if ($myAfter.Count -gt 0) { [int]$myAfter[0].position } else { $position }); staleTickets = @($removed); note = '' }
                 }
             }
         } catch { $null = $_ }
@@ -610,7 +704,9 @@ function Request-VenueClaim {
         # is handed over; one that does not is answered QUEUED with the holder's claim, never as a grant with an obsolete nonce.
         if ($grantClock.Elapsed.TotalSeconds -gt 2.0) {
             $own = $null; try { $own = Get-VenueClaim -Venue $Venue -ClaimDir $ClaimDir } catch { $own = $null }
-            if ($null -ne $own -and ($own.state -cne 'LIVE' -or [string]$own.claim.nonce -cne [string]$r.claim.nonce)) {
+            # r8 rule 3 (adversary r7 pass 3 A4): lost only on a POSITIVE answer: no claim (FREE), a stale one, or a live one that names ANOTHER nonce. A BUSY read (the file is held, and still names this owner) is not a loss.
+            $lost = $null -ne $own -and ($own.state -cin @('FREE', 'STALE') -or ($own.state -ceq 'LIVE' -and $null -ne $own.claim -and -not [string]::IsNullOrEmpty([string]$own.claim.nonce) -and [string]$own.claim.nonce -cne [string]$r.claim.nonce))
+            if ($lost) {
                 return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $own.claim; path = $r.path; broken = @($r.broken); ticket = $t; queue = $live; position = $position; staleTickets = @($removed); note = '' }
             }
         }
@@ -1946,4 +2042,4 @@ Export-ModuleMember -Function New-VenueCapsProbeId, Get-VenueDriverScriptMissing
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
     Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueStagedArtifactNames, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
     Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueInterleavedLegPlan, Get-VenueLegPreLoadMean, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait, Get-VenueRunStartCap, Get-VenueLegPlaySeconds, Get-VenuePlanPlaySeconds, ConvertTo-VenueStartCapTime,Get-VenueLeaseCaps, Resolve-VenueLeaseCaps,
-    Update-VenueClaim, Start-VenueKeeper, Stop-VenueKeeper, Start-VenueClaimKeeper, Get-VenueClaimKeeperLoss, New-VenueJobLivenessWrite, Write-VenueJobLiveness, Test-VenueJobLivenessReadback, Start-VenueJobLiveness, Stop-VenueJobLiveness
+    Get-VenueClaimAgeSec, Update-VenueClaim, Start-VenueKeeper, Stop-VenueKeeper, Start-VenueClaimKeeper, Get-VenueClaimKeeperLoss, New-VenueJobLivenessWrite, Write-VenueJobLiveness, Test-VenueJobLivenessReadback, Start-VenueJobLiveness, Stop-VenueJobLiveness

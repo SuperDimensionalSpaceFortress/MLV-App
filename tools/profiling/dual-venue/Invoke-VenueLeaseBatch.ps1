@@ -872,6 +872,9 @@ function Invoke-BatchTicketCall([string]$Body, [hashtable]$Argument, [double]$Se
     # adversary r3 pass 2 (A1, A4): every ticket call outside Request-VenueClaim (create, heartbeat, remove) runs on ONE bounded worker (VenueChain's Invoke-VenueBoundedRead, 5 s, abandoned and
     # counted like every other claim-folder read), so a stalled claim folder cannot hold the batch or its deadline. $Body is the worker's script text; it sees VenueChain imported and
     # its argument as $a (this hashtable plus .m, the module path). Returns { answered; value; error }.
+    # r8 rule 5 (adversary r7 pass 3 A3): the ONE deadline gate, immediately before EACH ticket call (every create, heartbeat, end, stranded retry and retake starts here): a call is started only with more than 6 s left
+    # before -DeadlineUtc (it is bounded to 5 s), so a sequence of calls in one loop turn can never carry the batch past the deadline the turn was checked against. Not started: not answered, nothing was sent.
+    if (($deadline - [DateTime]::UtcNow).TotalSeconds -le 6.0) { return [pscustomobject]@{ answered = $false; value = $null; error = 'NO_ROOM less than 6 s were left before -DeadlineUtc, so the ticket call was not started' } }
     & (Get-Module VenueChain) { param($b, $a, $s) Invoke-VenueBoundedRead -ScriptText ('param($a) Import-Module $a.m -Force -DisableNameChecking; ' + $b) -Argument $a -TimeoutSec $s } $Body ($Argument + @{ m = (Join-Path $here 'VenueChain.psm1') }) $Sec
 }
 
@@ -2377,6 +2380,14 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         # pass that did not finish, still unvouched, is the refusal below
         $requestUnanswered = $(if ([string]$req.state -cin @('REQUEST_NO_ROOM', 'REQUEST_NO_ANSWER', 'REQUEST_LATE_GRANT')) { [string]$req.why } else { '' })
         $retryRoomGone = $requestThrew -or $requestUnanswered -or ((-not $req.granted) -and $unfinished -gt 0 -and -not (Test-ClaimWaitRetryRoom ([DateTime]::UtcNow) 0 $deadline))
+        # r8 rule 5 (adversary r7 pass 3 A3): a claim granted at or after -DeadlineUtc is never used, whichever request took it (a retry's has this gate in Invoke-ClaimRetryRequest, the first inline one had none): it is let go
+        # before the guard, and the batch ends DEADLINE (no claim held) like every other deadline stop.
+        $lateGrant = $req.granted -and [DateTime]::UtcNow -ge $deadline
+        if ($lateGrant) {
+            try { [void]$(if ($grantedOnRetry) { Invoke-ClaimRetryRelease $deadline $req.claim.nonce } else { Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir }) } catch { }
+            LogBest "CLAIM_LATE_GRANT batch=$batchNo (the claim was granted at or after the deadline: let go, not used)"
+            break
+        }
         # r11 (sol r10 blocker 3): the preflight guard ran before this wait, which can be long, and an alias to an output can appear in it. The same guard runs again after every attempt,
         # before the first write (the CLAIM_* log lines, leg-plan.json): a hit releases a claim just taken, opens no lease and ends in the typed refusal (exit 2).
         # r5 (key3 r4 B1, Dot 6457724432): an attempt NOT granted (a foreign chain holds the venue, and may be measuring) runs the guard bounded too, 30 s as the gate guard, and
@@ -2450,6 +2461,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         # r13 pass 2 (adversary A2): the keeper starts only after that guard, whose reads can take a while; a claim granted longer ago than its TTL less one renew interval may lapse
         # (and be taken by another claimant) before the keeper's first renewal, so it is let go and asked for again, never carried into an open.
         $guardSec = ([DateTime]::UtcNow - $grantReadUtc).TotalSeconds
+        # r8 rule 4 (adversary r7 pass 3 A5): the margin is the claim's age by its OWN claimedUtc when that is the longer (a long census inside the request is spent from the same expiry); an unreadable stamp keeps the measure above
+        if ($req.granted) { $claimAgeSec = Get-VenueClaimAgeSec -Claim $req.claim; if ($null -ne $claimAgeSec -and $claimAgeSec -gt $guardSec) { $guardSec = $claimAgeSec } }
         if ($req.granted -and $guardSec -ge ($ClaimTtlSec - $ClaimRenewSec)) {
             try { [void]$(if ($grantedOnRetry) { Invoke-ClaimRetryRelease $deadline $req.claim.nonce } else { Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir }) } catch { }
             LogBest "CLAIM_LAPSED_IN_GUARD batch=$batchNo guardSec=$([int]$guardSec) ttlSec=$ClaimTtlSec renewSec=$ClaimRenewSec (the claim was let go before the keeper started; asked for again)"

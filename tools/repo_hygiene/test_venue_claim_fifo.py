@@ -1773,7 +1773,7 @@ $r = Receive-Job $job -Wait -AutoRemoveJob
     def test_a_grant_older_than_two_seconds_is_checked_to_still_name_this_owner_before_it_is_handed_over(self) -> None:
         # r7 pass 2 A2: the post-grant census can take long on a slow claim folder, a short claim can expire and be replaced meanwhile, and the first request still returned granted=true with its obsolete nonce.
         # The census is slowed by a seam (2.5 s inside the post-grant block) while the claim is replaced by another owner's.
-        mod = self.seam_module("            $after = @(Get-VenueSettledLive -Venue $Venue -ClaimDir $ClaimDir -NowUtc $now -MyName $t.name)", "            Start-Sleep -Milliseconds 2500\n            $after = @(Get-VenueSettledLive -Venue $Venue -ClaimDir $ClaimDir -NowUtc $now -MyName $t.name)")
+        mod = self.seam_module("            $after = @(Get-VenueSettledLive -Venue $Venue -ClaimDir $ClaimDir -NowUtc $now -MyName $t.name -MyRunDir $RunDir)", "            Start-Sleep -Milliseconds 2500\n            $after = @(Get-VenueSettledLive -Venue $Venue -ClaimDir $ClaimDir -NowUtc $now -MyName $t.name -MyRunDir $RunDir)")
         r = self.ps(self.SEAM_A2C.replace("@@SEAMMOD@@", str(mod)))
         self.assertTrue(r["otherGranted"], "the scenario did not replace the claim")
         self.assertEqual((r["state"], r["granted"]), ("QUEUED", False), f"a grant whose claim another owner replaced meanwhile was handed over: {r}")
