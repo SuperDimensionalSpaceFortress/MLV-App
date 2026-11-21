@@ -1160,7 +1160,8 @@ ENVIRONMENT_READER_ALLOWED_PATHS = frozenset({"tools/profiling/FpsArmGate.psm1",
 
 def _callers_of_the_environment_reader(files: list[tuple[str, str]]) -> list[str]:
     """The repo-relative paths, among the (path, text) pairs given, that name the raw environment reader and are not the module or this test."""
-    return sorted(path for path, text in files if ENVIRONMENT_READER in text and path.replace("\\", "/") not in ENVIRONMENT_READER_ALLOWED_PATHS)
+    # case-insensitive: PowerShell resolves a command name without regard to case (adversary r10 pass A6)
+    return sorted(path for path, text in files if ENVIRONMENT_READER.lower() in text.lower() and path.replace("\\", "/") not in ENVIRONMENT_READER_ALLOWED_PATHS)
 
 
 def _spec(**generator_args: str) -> str:
@@ -1350,14 +1351,16 @@ class ObserverControlTests(_Probe):
             ("tools/profiling/FpsArmGate.psm1", "function Get-FpsArmFromEnvironment { }"),
             ("tools/repo_hygiene/test_fps_arm_gate.py", "Get-FpsArmFromEnvironment"),
             ("tools/profiling/other.ps1", "Get-FpsArmFromLaunch $launch"),
+            # PowerShell resolves command names without regard to case, so a lower-case call is a call (adversary r10 pass A6)
+            ("tools/profiling/lower-case-reader.ps1", "& 'get-fpsarmfromenvironment' @{} @()"),
         ])
-        self.assertEqual(reported, ["tools/profiling/some-reader.ps1"])
+        self.assertEqual(reported, ["tools/profiling/lower-case-reader.ps1", "tools/profiling/some-reader.ps1"])
 
     @unittest.skipIf(shutil.which("git") is None, "git is not on PATH")
     def test_g11_no_tracked_file_outside_the_module_calls_the_raw_environment_reader(self) -> None:
         # The raw environment reader judges an environment list WITHOUT the launch members every producer records, so a caller that holds a recorded launch must go through
         # Get-FpsArmFromLaunch. It stays exported for the test probes; this scan keeps any other file from calling it. Tracked files only (git grep), no filesystem walk.
-        proc = subprocess.run(["git", "grep", "-l", "-F", "Get-FpsArmFromEnvironment"], cwd=ROOT, capture_output=True, text=True, creationflags=_NO_WINDOW)
+        proc = subprocess.run(["git", "grep", "-l", "-i", "-F", "Get-FpsArmFromEnvironment"], cwd=ROOT, capture_output=True, text=True, creationflags=_NO_WINDOW)
         self.assertIn(proc.returncode, (0, 1), proc.stderr)
         paths = [p for p in proc.stdout.splitlines() if p.strip()]
         self.assertIn("tools/profiling/FpsArmGate.psm1", paths, "the scan found nothing it should always find")
