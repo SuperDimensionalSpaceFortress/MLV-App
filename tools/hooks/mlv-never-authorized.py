@@ -1240,24 +1240,57 @@ def read_json(path):
 
 # ------------------------------------------------------------------------ verbs
 
-_DELETE_RX = re.compile(
-    r"(?:^|[\s;&|`(])(?:rm|del|rd|rmdir)\b"
+# HOOK-NA-READONLY-COMMAND-FALSE-POSITIVES-1 (payload 6): a short verb is a COMMAND WORD only
+# when it is not glued to `=`, a path separator, `.`, `:` or `-`.  `RD="<run dir>"` is a
+# shell ASSIGNMENT of a variable named RD, and the old `\b` alone read it as `rd` (rmdir)
+# with the run dir as its operand -- measured 2026-11-14 on a Bash call that only RAN a
+# Python file ("deleting ...\r13 run dir denied on the carve-out paths").  `rm -rf x`,
+# `rd /s /q x` and `del x` keep matching: each is followed by whitespace.
+#
+# r2 (adversary A1, 2026-11-15): ONLY `=` is a non-command tail, and only OUTSIDE a cmd.exe
+# context.  cmd parses `del/q x`, `rd/s x`, `move/y a b` -- and `del=x`, since `=` is one of
+# its argument delimiters -- as the verb plus its switch, so r1's wider tail `[=/\\.:\-]`
+# let `cmd /c del/q <kill-switch marker>` through both the delete scan and the marker guard.
+# When the text names cmd in ANY spelling (``cmd``, ``cmd.exe``, ``c^md``, ``c`md``,
+# ``%COMSPEC%``, ``$env:ComSpec``, ``forfiles``, a ``.bat``/``.cmd`` file) the strict base
+# reading -- a bare ``\b`` after the verb -- is used, exactly as before this card.
+_SHORT_VERB_TAIL = r"(?!=)"
+_DELETE_VERB_HEAD = r"(?:^|[\s;&|`(])(?:rm|del|rd|rmdir)\b"
+_DELETE_VERB_REST = (
     r"|\bremove-item\b"
     r"|\bgit\s+rm\b"
     r"|\bos\.(?:remove|unlink)\s*\("
     r"|\bshutil\.rmtree\s*\("
-    r"|\.unlink\s*\(",
-    re.I,
+    r"|\.unlink\s*\("
 )
-_MOVE_RX = re.compile(
-    r"(?:^|[\s;&|`(])(?:mv|move)\b"
+_DELETE_RX = re.compile(_DELETE_VERB_HEAD + _SHORT_VERB_TAIL + _DELETE_VERB_REST, re.I)
+_DELETE_RX_STRICT = re.compile(_DELETE_VERB_HEAD + _DELETE_VERB_REST, re.I)
+_MOVE_VERB_HEAD = r"(?:^|[\s;&|`(])(?:mv|move)\b"
+_MOVE_VERB_REST = (
     r"|\bmove-item\b"
     r"|\brename-item\b"
     r"|\bgit\s+mv\b"
     r"|\bos\.rename\s*\("
-    r"|\bshutil\.move\s*\(",
-    re.I,
+    r"|\bshutil\.move\s*\("
 )
+_MOVE_RX = re.compile(_MOVE_VERB_HEAD + _SHORT_VERB_TAIL + _MOVE_VERB_REST, re.I)
+_MOVE_RX_STRICT = re.compile(_MOVE_VERB_HEAD + _MOVE_VERB_REST, re.I)
+_CMD_CONTEXT_RX = re.compile(
+    r"(?:^|[^\w-])(?:cmd|comspec|forfiles)(?:\.exe)?(?![\w-])|\.(?:bat|cmd)(?![\w-])", re.I
+)
+
+
+def _deescaped(command):
+    """The text with every shell escape and quote character removed (``pws`h`` -> ``pwsh``,
+    ``bas\\h`` -> ``bash``, ``ba''sh`` -> ``bash``, ``c^md`` -> ``cmd``).  Only ever SEARCHED,
+    to widen a refusal -- never used to narrow one."""
+    return re.sub(r"[`\\'\"^]", "", command or "")
+
+
+def _cmd_context(command):
+    """Does the text reach cmd.exe in any spelling?  Then the strict verb reading applies."""
+    text = command or ""
+    return bool(_CMD_CONTEXT_RX.search(text) or _CMD_CONTEXT_RX.search(_deescaped(text)))
 # A single '>' that is followed by something path-like.  '>>' (append), '2>&1', '->',
 # '>=' and '<>' are all excluded, so an append never reads as a truncation.
 _TRUNC_REDIRECT_RX = re.compile(r"(?<![>\-=!<])>(?!>)\s*['\"]?[\w.$~/\\{]")
@@ -1295,7 +1328,7 @@ _TRUNC_CMDLET_SEGMENT_RX = re.compile(
 )
 
 
-def truncating_destinations(command):
+def truncating_destinations(command, tool=None):
     """The tokens a truncating redirect or cmdlet actually WRITES TO.
 
     Interpreter method names (``write_bytes(``, ``write_text(``, ``open(..., 'w')``) are
@@ -1303,20 +1336,442 @@ def truncating_destinations(command):
     interpreter one-liner's effect is invisible to a text matcher BY DESIGN (see the limit
     recorded under the pre-flight artifact act), and inventing a verb for it denies the
     common read-then-write-elsewhere shape while still proving nothing about the target.
+
+    HOOK-NA-READONLY-COMMAND-FALSE-POSITIVES-1: with a ``tool`` the OPERATORS are found in
+    ``code_view`` (a ``>`` inside a quoted DATA string -- a regex's ``(?<name>``, ruling
+    text's ``<owner account> /pass`` -- is not a redirect) and each DESTINATION is still read
+    from the ORIGINAL text at the same offset, so a quoted destination keeps its spelling.
+    Without a ``tool`` (or when the text cannot be lexed) this is the old quote-blind scan.
     """
+    command = command or ""
+    view = code_view(command, tool) if tool else None
+    if view is None:
+        view = command
     dests = []
-    for match in _TRUNC_DEST_RX.finditer(command or ""):
-        dests.append(match.group(1))
-    for match in _TRUNC_CMDLET_SEGMENT_RX.finditer(command or ""):
-        segment = match.group(0)
-        if _APPEND_FLAG_RX.search(segment):
+    for match in _TRUNC_DEST_RX.finditer(view):
+        real = _TRUNC_DEST_RX.match(command, match.start())
+        dests.append(real.group(1) if real else match.group(1))
+    for match in _TRUNC_CMDLET_SEGMENT_RX.finditer(view):
+        segment = command[match.start() : match.end()]
+        if _APPEND_FLAG_RX.search(view[match.start() : match.end()]):
             continue
-        dests.extend(
-            token
-            for token in tokens(segment)[1:]
-            if not token.startswith("-") and ("/" in token or "\\" in token)
-        )
+        dests.extend(_cmdlet_path_tokens(segment, view is not command))
     return dests
+
+
+# -------------------------------------------- HOOK-NA-READONLY-COMMAND-FALSE-POSITIVES-1
+#
+# MEASURED, NOT ARGUED.  On 2026-11-14 this hook stopped at least six fix rounds on commands
+# that wrote or deleted NOTHING on a protected path, and every lane obeyed the never-reshape
+# rule and ended PARTIAL.  Three root causes, one of them shared by five of the seven deny
+# payloads (tools/repo_hygiene/test_mlv_never_authorized.py, group ``hooknaro``):
+#
+#   (a) QUOTE-BLIND OPERATOR SCANS.  A ``>`` or a delete cmdlet's NAME inside a quoted DATA
+#       string -- a Select-String regex ``(?<s>\S*)``, ruling text quoting a ``cmdkey ...
+#       <owner account> /pass`` switch, ledger prose naming ``Remove-Item`` -- was read as a
+#       redirect or a delete.  ``code_view`` masks the interior of every quoted string that
+#       is DATA, so the operator scans see only code; operands are still read from the
+#       ORIGINAL text.
+#   (b) WHOLE-COMMAND DELETE ATTRIBUTION.  A delete verb was bound to EVERY protected token
+#       in the command, so ``Remove-Item <own scratch>; ...; pwsh -File <fleet-runs script>``
+#       was "deleting" the script.  ``positional_bindings`` binds each delete/move verb to
+#       the tokens of ITS OWN STATEMENT, and falls back to the old whole-command binding
+#       whenever the statement's real target is not visible in it (a variable, a splat, a
+#       pipeline with no operand, a relative operand after a directory change, an
+#       interpreter verb).
+#   (c) ``RD=`` READ AS ``rd`` -- see ``_SHORT_VERB_TAIL``.
+#
+# FAIL CLOSED, NEVER OPEN.  Every place this delta cannot be sure, it returns the OLD answer:
+# ``code_view`` returns None (and every caller uses the raw text) for unbalanced quotes,
+# here-strings, heredocs, ANSI-C ``$'...'`` strings and typographic quotes; a quoted string is
+# CODE, not data, when any string-evaluating launcher appears in the command (``pwsh``,
+# ``cmd``, ``bash -c``, ``iex``, ``Start-Process``, ``[scriptblock]::Create`` ...), when it
+# sits at a command position (after ``&``, ``.``, ``;``, ``|``, ``(``, ``{``, a newline or at
+# the start), or when it is a double-quoted string carrying a ``$(`` subexpression (or, in
+# Bash, a backtick).  The kill-switch marker guard (S99/O118), NA-7's ``.factory`` token scan,
+# NA-10 and NA-11 keep the quote-blind ``shell_acts`` unchanged.
+
+_TYPOGRAPHIC_QUOTES = u"\u2018\u2019\u201a\u201b\u201c\u201d\u201e\u201f"
+_LAUNCHER_RX = re.compile(
+    r"(?:^|[\s;&|`(\"'/\\{])"
+    r"(?:pwsh|powershell|powershell_ise|cmd|bash|sh|zsh|dash|ksh|fish|wsl|ssh"
+    r"|python\d*(?:\.\d+)?|py|pythonw|node|perl|ruby|php|osascript)(?:\.exe)?(?=$|[\s\"';|&)])"
+    r"|\b(?:invoke-expression|iex|invoke-command|icm|start-process|saps|start-job|sajb"
+    r"|start-threadjob|invoke-item|ii|eval|scriptblock|invokescript|newscriptblock"
+    r"|addscript|encodedcommand)\b",
+    re.I,
+)
+_LAUNCHER_NAME_RX = re.compile(
+    r"(?:pwsh|powershell|powershell_ise|cmd|bash|sh|zsh|dash|ksh|fish|wsl|ssh"
+    r"|python\d*(?:\.\d+)?|py|pythonw|node|perl|ruby|php|osascript)(?:\.exe)?",
+    re.I,
+)
+_COMMAND_POSITION_CHARS = frozenset("&.;|({\n")
+# r2 (adversary A3, 2026-11-15): a launcher the list above cannot SEE by name.  r1 matched
+# launcher names on the skeleton only, so ``pws`h -Command '...'`` (PowerShell resolves it to
+# pwsh.exe), ``bas\h -c '...'``, ``ba''sh``, ``& $env:ComSpec /c "..."``, ``& ('p'+'wsh')`` and
+# ``forfiles /c "cmd /c del ..."`` masked the very string that is executed.  ``code_view``
+# now masks NOTHING (the old quote-blind reading) when any of these holds:
+#   * a launcher name appears in the RAW text, or in the text with every escape and quote
+#     character removed (``_deescaped``) -- inside a quoted string too;
+#   * an executor that runs another program's argument string appears outside quotes
+#     (``_INDIRECT_LAUNCHER_RX``: forfiles, schtasks, xargs, env, sudo, ``git -c``/``config``/
+#     ``--exec``/``rebase``/``bisect``/``submodule foreach`` ...);
+#   * the program name itself is computed: PowerShell ``&``/``.`` followed by ``$``, ``(``,
+#     ``[`` or a quoted string holding ``$`` (``_DYNAMIC_CALL_RX``); in Bash, any ``$`` or
+#     backtick outside quotes (an expansion can BE the command word).
+_INDIRECT_LAUNCHER_RX = re.compile(
+    r"(?:^|[\s;&|`(\"'/\\{])"
+    r"(?:forfiles|schtasks|at|runas|psexec\d*|paexec|conhost|wt|wscript|cscript|mshta|rundll32"
+    r"|regsvr32|wmic|xargs|exec|env|sudo|doas|nohup|watch|parallel|busybox|su|script|timeout"
+    r"|nice|ionice|setsid|stdbuf|flock|chroot|unbuffer|time|command|builtin|trap|source)"
+    r"(?:\.exe)?(?=$|[\s\"';|&)])"
+    r"|\b(?:comspec|executioncontext|processstartinfo|win32_process|invoke-cimmethod"
+    r"|invoke-wmimethod|wmiclass|add-type|register-scheduledtask|new-scheduledtaskaction"
+    r"|register-objectevent|register-engineevent|register-wmievent|new-pssession"
+    r"|enter-pssession)\b"
+    r"|\[(?:system\.)?(?:diagnostics\.)?process\]|\[powershell\]|\.invoke\w*\s*\("
+    r"|\bgit\b[^\n;|&]*\s(?:-c|config|--exec|-x|--exec-path|--upload-pack|--receive-pack"
+    r"|rebase|bisect|submodule|filter-branch|filter-repo|difftool|mergetool)(?=$|[\s=])",
+    re.I,
+)
+_DYNAMIC_CALL_RX = re.compile(r"(?:^|[\s;|(\n{])[&.]\s*[$(\[]", re.I)
+# Read on the RAW text: the skeleton masks the `$` of `& "$p" -c '...'`.
+_DYNAMIC_QUOTED_CALL_RX = re.compile(r"(?:^|[\s;|(\n{])[&.]\s*\"[^\"]*\$", re.I)
+
+
+def _launcher_hidden(command, skeleton, tool):
+    """r2 (A3): may a quoted string here be executed by a launcher the skeleton scan misses?"""
+    if _LAUNCHER_RX.search(command) or _LAUNCHER_RX.search(_deescaped(command)):
+        return True
+    if _INDIRECT_LAUNCHER_RX.search(skeleton) or _DYNAMIC_CALL_RX.search(skeleton):
+        return True
+    if _DYNAMIC_QUOTED_CALL_RX.search(command):
+        return True
+    # Bash: ANY expansion may be the command word (`"$p" -c '...'`, `$(printf bash) -c`),
+    # and the skeleton masks the ones inside double quotes -- so read the raw text.
+    if tool == "Bash" and ("$" in command or "`" in command):
+        return True
+    return False
+
+
+def quoted_spans(command, tool):
+    """-> ``[(start, end)]`` of every quoted string (quotes included), or None if unlexable.
+
+    Bash: ``\\`` escapes outside quotes and inside double quotes; single quotes are literal.
+    PowerShell: the backtick escapes outside quotes and inside double quotes; ``''`` and
+    ``""`` are the doubled-quote escapes.  None means "do not trust a reading of this text":
+    unbalanced quotes, a PowerShell here-string (``@"``/``@'``), a heredoc (``<<``), an ANSI-C
+    string (``$'``), or any typographic quote (PowerShell treats them as delimiters too).
+    """
+    if not command:
+        return []
+    if "@\"" in command or "@'" in command or "<<" in command or "$'" in command:
+        return None
+    if any(char in command for char in _TYPOGRAPHIC_QUOTES):
+        return None
+    bash = tool == "Bash"
+    escape = "\\" if bash else "`"
+    spans = []
+    index = 0
+    length = len(command)
+    while index < length:
+        char = command[index]
+        if char == escape:
+            index += 2
+            continue
+        if char == "'":
+            probe = index + 1
+            while True:
+                close = command.find("'", probe)
+                if close == -1:
+                    return None
+                if not bash and close + 1 < length and command[close + 1] == "'":
+                    probe = close + 2
+                    continue
+                break
+            spans.append((index, close + 1))
+            index = close + 1
+            continue
+        if char == '"':
+            probe = index + 1
+            close = -1
+            while probe < length:
+                inner = command[probe]
+                if inner == escape:
+                    probe += 2
+                    continue
+                if inner == '"':
+                    if not bash and probe + 1 < length and command[probe + 1] == '"':
+                        probe += 2
+                        continue
+                    close = probe
+                    break
+                probe += 1
+            if close == -1:
+                return None
+            spans.append((index, close + 1))
+            index = close + 1
+            continue
+        index += 1
+    return spans
+
+
+def _mask(command, spans):
+    """``command`` with the INTERIOR of each span replaced by ``_`` -- same length, quotes kept."""
+    chars = list(command)
+    for start, end in spans:
+        for position in range(start + 1, end - 1):
+            if chars[position] != "\n":
+                chars[position] = "_"
+    return "".join(chars)
+
+
+def _span_is_code(command, start, end, tool):
+    """Is this quoted string CODE (a command name, or text a shell will evaluate)?"""
+    body = command[start + 1 : end - 1]
+    if command[start] == '"' and ("$(" in body or (tool == "Bash" and "`" in body)):
+        return True
+    probe = start - 1
+    while probe >= 0 and command[probe] in " \t":
+        probe -= 1
+    if probe < 0 or command[probe] in _COMMAND_POSITION_CHARS:
+        return True
+    return False
+
+
+def code_view(command, tool):
+    """The command with every quoted DATA string's interior masked, or None (fail closed).
+
+    Same length as ``command``, so an offset found in the view indexes the original.  When a
+    string-evaluating launcher appears anywhere -- outside quotes, or as the whole of a
+    quoted executable path such as ``"C:\\...\\pwsh.exe"`` -- NOTHING is masked: every quoted
+    string may be code, which is the old quote-blind reading exactly.
+    """
+    command = command or ""
+    spans = quoted_spans(command, tool)
+    if spans is None:
+        return None
+    skeleton = _mask(command, spans)
+    if _LAUNCHER_RX.search(skeleton):
+        return command
+    if _launcher_hidden(command, skeleton, tool):
+        return command
+    for start, end in spans:
+        # A quoted string whose LAST path segment is a launcher executable is a launcher:
+        # `& "C:\Program Files\PowerShell\7\pwsh.exe" -c "..."`, `Start-Process "cmd"`.
+        body = command[start + 1 : end - 1].strip()
+        leaf = re.split(r"[\\/]", body)[-1] if body else ""
+        if leaf and _LAUNCHER_NAME_RX.fullmatch(leaf):
+            return command
+    data = [(s, e) for (s, e) in spans if not _span_is_code(command, s, e, tool)]
+    return _mask(command, data)
+
+
+def _statement_bounds(command, tool, position):
+    """-> ``(start, end)`` of the statement holding ``position``, or None (fail closed).
+
+    Boundaries are ``;``, ``&&``, ``||``, a lone ``&`` and a newline, OUTSIDE every quoted
+    string and at parenthesis depth 0.  A newline is NOT a boundary when the line ends with
+    ``|``, ``&``, ``,``, ``(``, ``{``, the escape character, or the next line begins with
+    ``|`` (a continued pipeline).  A pipe is never a boundary: ``gci <path> | Remove-Item``
+    keeps the producer's operand in the delete's statement.
+    """
+    spans = quoted_spans(command, tool)
+    if spans is None:
+        return None
+    skeleton = _mask(command, spans)
+    escape = "\\" if tool == "Bash" else "`"
+    cuts = []
+    depth = 0
+    index = 0
+    length = len(skeleton)
+    in_span = [False] * length
+    for start, end in spans:
+        for p in range(start, end):
+            in_span[p] = True
+    while index < length:
+        char = skeleton[index]
+        if in_span[index]:
+            index += 1
+            continue
+        if char == escape:
+            index += 2
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif depth == 0:
+            if char == ";":
+                cuts.append((index, index + 1))
+            elif char in "&|" and skeleton[index : index + 2] in ("&&", "||"):
+                cuts.append((index, index + 2))
+                index += 2
+                continue
+            elif char == "&":
+                before = skeleton[index - 1] if index > 0 else ""
+                after = skeleton[index + 1] if index + 1 < length else ""
+                if before not in "><" and after != ">":
+                    cuts.append((index, index + 1))
+            elif char == "\n":
+                tail = skeleton[:index].rstrip(" \t\r")
+                head = skeleton[index + 1 :].lstrip(" \t\r")
+                continued = (tail[-1:] in ("|", "&", ",", "(", "{", escape)) or head[:1] == "|"
+                if not continued:
+                    cuts.append((index, index + 1))
+        index += 1
+    if depth != 0:
+        return None
+    start = 0
+    for cut_start, cut_end in cuts:
+        if cut_end <= position:
+            start = cut_end
+        elif cut_start > position:
+            return start, cut_start
+    return start, length
+
+
+_SHELL_DELETE_RX = re.compile(
+    _DELETE_VERB_HEAD + _SHORT_VERB_TAIL + r"|\bremove-item\b|\bgit\s+rm\b", re.I
+)
+_SHELL_DELETE_RX_STRICT = re.compile(_DELETE_VERB_HEAD + r"|\bremove-item\b|\bgit\s+rm\b", re.I)
+_INTERP_DELETE_RX = re.compile(
+    r"\bos\.(?:remove|unlink)\s*\(|\bshutil\.rmtree\s*\(|\.unlink\s*\(", re.I
+)
+_SHELL_MOVE_RX = re.compile(
+    _MOVE_VERB_HEAD + _SHORT_VERB_TAIL + r"|\bmove-item\b|\brename-item\b|\bgit\s+mv\b", re.I
+)
+_SHELL_MOVE_RX_STRICT = re.compile(
+    _MOVE_VERB_HEAD + r"|\bmove-item\b|\brename-item\b|\bgit\s+mv\b", re.I
+)
+_INTERP_MOVE_RX = re.compile(r"\bos\.rename\s*\(|\bshutil\.move\s*\(", re.I)
+_DIR_CHANGE_RX = re.compile(
+    r"(?:^|[\s;&|`(])(?:cd|chdir|pushd|popd|sl|set-location|push-location|pop-location)\b",
+    re.I,
+)
+_HARMLESS_DOLLAR_RX = re.compile(r"(?:-[\w-]+:)?\$(?:true|false|null)", re.I)
+
+
+def _statement_hides_its_target(statement_tokens):
+    """True when a statement's real target may not be a literal token IN it."""
+    for token in statement_tokens:
+        if "$" in token and not _HARMLESS_DOLLAR_RX.fullmatch(token):
+            return True
+        if re.search(r"%[A-Za-z_]\w*%", token):
+            return True
+        if token.startswith("@") or token in ("{}", "{}+"):
+            return True
+    return False
+
+
+def positional_bindings(command, tool):
+    """-> ``{act: [raw tokens bound to it]}`` for the delete and move acts.
+
+    Each shell delete/move verb found in ``code_view`` binds the tokens of ITS OWN statement.
+    It binds EVERY token of the command instead -- the pre-delta reading -- when the view or
+    the statement cannot be read, when the statement's target may be held in a variable,
+    splat or ``%NAME%`` reference, when the verb has no literal operand after it (its target
+    arrives through the pipeline or a continuation), when an operand is relative and the
+    command changes directory, or when the verb is an interpreter call (``os.remove(`` and
+    the like are matched on the raw text, inside quotes too, exactly as before).
+    """
+    command = command or ""
+    whole = tokens(command)
+    bound = {}
+    scan = _GIT_RM_CACHED_RX.sub(lambda m: "_" * len(m.group(0)), command)
+    view = code_view(scan, tool)
+    strict = _cmd_context(scan)  # r2 (A1): the same strict reading as ``shell_acts``
+    for act, shell_rx, interp_rx in (
+        ("delete", _SHELL_DELETE_RX_STRICT if strict else _SHELL_DELETE_RX, _INTERP_DELETE_RX),
+        ("move", _SHELL_MOVE_RX_STRICT if strict else _SHELL_MOVE_RX, _INTERP_MOVE_RX),
+    ):
+        if interp_rx.search(scan):
+            bound[act] = list(whole)
+            continue
+        if view is None:
+            if shell_rx.search(scan):
+                bound[act] = list(whole)
+            continue
+        spans = quoted_spans(command, tool) or []
+        for match in shell_rx.finditer(view):
+            inside = any(start < match.end() - 1 < end for start, end in spans)
+            bounds = _statement_bounds(command, tool, match.end() - 1)
+            if bounds is None or inside:
+                # A verb inside a quoted string the view kept as CODE (a nested
+                # `pwsh -Command "..."`, a string at a command position) is read the old
+                # way: its statement is the outer one, so bind the whole command.
+                bound[act] = list(whole)
+                break
+            statement = command[bounds[0] : bounds[1]]
+            statement_tokens = tokens(statement)
+            operands = [
+                token
+                for token in tokens(command[match.end() : bounds[1]])
+                if not token.startswith("-")
+            ]
+            relative = any(not is_absolute(norm(token)) for token in operands)
+            if (
+                not operands
+                or _statement_hides_its_target(statement_tokens)
+                or (relative and _DIR_CHANGE_RX.search(code_view(command, tool) or command))
+            ):
+                bound[act] = list(whole)
+                break
+            bound.setdefault(act, []).extend(statement_tokens)
+    return bound
+
+
+_VALUE_PARAMETER_NAMES = ("value", "inputobject")
+
+
+def _is_value_parameter(token):
+    """``-Value``/``-InputObject`` (any unambiguous prefix, optional trailing ``:``)."""
+    if not token.startswith("-") or len(token) < 3:
+        return False
+    name = token[1:].rstrip(":").lower()
+    if len(name) < 2:
+        return False
+    return any(full.startswith(name) for full in _VALUE_PARAMETER_NAMES)
+
+
+def _cmdlet_path_tokens(segment, skip_values):
+    """Path-like tokens of a write cmdlet's segment, after its verb.
+
+    With ``skip_values`` (the segment was found in a ``code_view``), the argument of
+    ``-Value``/``-InputObject`` is DATA, not a destination: ``Add-Content <ledger> -Value
+    "<text quoting C:\\somewhere>"`` writes the ledger only.  Every other path-like token is
+    kept, positional ones included -- the old reading, fail closed.
+    """
+    found = []
+    matches = list(_TOKEN_RX.finditer(segment))[1:]
+    skipping = False
+    previous_end = None
+    for match in matches:
+        token = next(group for group in match.groups() if group is not None)
+        if skipping and previous_end is not None:
+            # The value is ONE argument: the token right after the parameter, plus any
+            # further tokens joined to it by a comma (`-Value $a,$b`).  A token after
+            # whitespace alone is the NEXT argument -- a positional Path -- and is kept.
+            if segment[previous_end : match.start()].strip() != ",":
+                skipping = False
+        if token.startswith("-"):
+            skipping = skip_values and _is_value_parameter(token)
+            previous_end = None
+            continue
+        if skipping:
+            # r2 (adversary A2): an EMPTY value (`-Value ""`, `-InputObject ''`) is still the
+            # one argument.  r1 skipped it before this line without recording where it
+            # ended, so the positional destination after it was consumed as the value.
+            previous_end = match.end()
+            continue
+        if not token:
+            continue
+        if "/" in token or "\\" in token:
+            found.append(token)
+    return found
 
 
 _GIT_RM_CACHED_RX = re.compile(r"\bgit\s+rm\b(?=[^\n;|&]*--cached\b)", re.I)
@@ -1331,9 +1786,10 @@ def shell_acts(command):
     """
     scan = _GIT_RM_CACHED_RX.sub(" gitrmcached ", command or "")
     acts = set()
-    if _DELETE_RX.search(scan):
+    strict = _cmd_context(scan)  # r2 (A1): cmd reads `del/q` and `del=x` as del
+    if (_DELETE_RX_STRICT if strict else _DELETE_RX).search(scan):
         acts.add("delete")
-    if _MOVE_RX.search(scan):
+    if (_MOVE_RX_STRICT if strict else _MOVE_RX).search(scan):
         acts.add("move")
     if _TRUNC_REDIRECT_RX.search(scan):
         acts.add("truncate")
@@ -2773,7 +3229,134 @@ def _create_is_admissible(ctx, path_norm):
     return True
 
 
-def _na2_decide(ctx, path_norm, acts, source):
+_LANE_DRAFT_NAME_RX = re.compile(
+    r"(?:pr-body[^/]*\.md|commit-msg[^/]*\.txt|comment[^/]*\.md|ack[^/]*\.md)"
+)
+_RUN_DIR_PREFIX = "lane-"
+
+
+def _own_lane_run_dir(ctx):
+    """The CALLING lane's run dir (normalised), or None.
+
+    Derived from ``MLV_LANE_PROMPT`` -- the dispatcher sets it to the absolute path of the
+    lane's prompt file, which lives in the lane's run dir (Invoke-Lane.ps1,
+    LANE-PROMPT-ENV-DIRECT-DISPATCH-1) -- and accepted only when that directory is a DIRECT
+    child of ``<board root>/.claude-state/fleet-runs`` whose name starts ``lane-``.  A tool
+    call cannot set the hook's environment, and NA-3 refuses a persistent write of the name.
+    Unset, unresolvable, or anywhere else: None, and nothing below is loosened.
+    """
+    if not ctx.lane_prompt:
+        return None
+    prompt_norm = norm(ctx.lane_prompt)
+    if _unresolved_env_ref(prompt_norm) or "/" not in prompt_norm:
+        return None
+    run_dir = prompt_norm.rsplit("/", 1)[0]
+    if "/" not in run_dir:
+        return None
+    parent, leaf = run_dir.rsplit("/", 1)
+    fleet_root = norm(os.path.join(ctx.board_root_raw, ".claude-state", "fleet-runs"))
+    if parent != fleet_root or not leaf.startswith(_RUN_DIR_PREFIX):
+        return None
+    return run_dir
+
+
+def _is_own_lane_draft(ctx, path_norm):
+    """HOOK-NA2-SHRINKING-EDIT-LANE-DRAFT-1: a draft file DIRECTLY in the calling lane's run dir.
+
+    Draft names only: ``pr-body*.md``, ``commit-msg*.txt``, ``comment*.md``, ``ack*.md``.
+    ``summary.md``, ``dispatch-proof.txt``, receipts, prompts and every other file in the run
+    dir, every file in any OTHER run dir, and everything under ``hub-tools`` stay guarded.
+    """
+    if ctx.tool not in ("Edit", "Write"):
+        return False
+    run_dir = _own_lane_run_dir(ctx)
+    if run_dir is None or "/" not in path_norm:
+        return False
+    parent, base = path_norm.rsplit("/", 1)
+    if parent != run_dir:
+        return False
+    return bool(_LANE_DRAFT_NAME_RX.fullmatch(base))
+
+
+def _shell_target_absent(ctx, path_norm, raw_spellings):
+    """HOOK-NA-READONLY-COMMAND-FALSE-POSITIVES-1: does a shell truncation provably CREATE?
+
+    True only when EVERY spelling of the destination resolves -- this hook's own variables
+    expanded, nothing else standing -- to an ABSOLUTE path that does not exist on disk (links
+    included: ``lexists``).  A relative spelling (the shell's cwd is not this process's), a
+    variable, a glob, ``~``, or on Windows a single-slash POSIX spelling (Git Bash reads
+    ``/c/x`` as ``C:\\x`` while this process would read ``\\c\\x``) is not provable, and the
+    old refusal stands.  The fixed receipt names and anything under ``receipts/`` are held
+    back exactly as ``_create_is_admissible`` holds them back.
+    """
+    if not raw_spellings:
+        return False
+    if has_seg(path_norm, RECEIPTS_DIR_SEG):
+        return False
+    base = path_norm.rsplit("/", 1)[-1]
+    if base.startswith(EXECUTION_CONTROL_PREFIX) or base in FIXED_RECEIPT_BASENAMES:
+        return False
+    for raw in raw_spellings:
+        text = expand_hook_env(str(raw).strip().strip('"').strip("'"))
+        if not text or re.search(r"[$%*?\[\]~`]", text):
+            return False
+        spelled = text.replace("\\", "/")
+        if not is_absolute(spelled.lower()):
+            return False
+        if os.name == "nt" and spelled.startswith("/") and not spelled.startswith("//"):
+            return False
+        try:
+            # BOTH spellings: on Windows they are one file; on POSIX a backslash is a
+            # literal name character, so a file at the slash spelling must also count as
+            # present -- either one existing means "may shrink", which is the refusal.
+            if os.path.lexists(text) or os.path.lexists(spelled):
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _sole_first_statement_write(command, tool, path_norm, raw_spellings):
+    """r2 (adversary A4): is this truncation the command's FIRST and ONLY touch of the path?
+
+    ``_shell_target_absent`` proves the file is absent when the hook runs, not when the
+    redirect opens it.  r1 accepted ``Set-Content <new> -Value "evidence"; Set-Content <new>
+    -Value ""`` -- both checks saw the file absent, the first statement created it and the
+    second shrank it -- and the same holds when an EARLIER statement (an adversary pass, a
+    script, a relative-path or variable write) creates the file the truncation then empties.
+    So the exemption needs ALL of: one truncating spelling of the path; the path mentioned by
+    exactly one token of the whole command; that spelling inside the FIRST statement; and a
+    first statement with no pipeline, no subexpression and exactly one write destination,
+    so nothing in it can run before the redirect opens the file.  Anything else: the old
+    refusal.
+    """
+    command = command or ""
+    if not raw_spellings or len(raw_spellings) != 1:
+        return False
+    if sum(1 for token in tokens(command) if norm(token) == path_norm) != 1:
+        return False
+    raw = str(raw_spellings[0])
+    index = command.find(raw)
+    if index < 0:
+        index = command.find(raw.strip().strip('"').strip("'"))
+    if index < 0:
+        return False
+    bounds = _statement_bounds(command, tool, index)
+    if bounds is None or command[: bounds[0]].strip():
+        return False
+    statement = command[bounds[0] : bounds[1]]
+    spans = quoted_spans(statement, tool)
+    if spans is None:
+        return False
+    skeleton = _mask(statement, spans)
+    if "|" in skeleton or "(" in skeleton or "$" in skeleton or "`" in skeleton:
+        return False
+    if len(_write_destinations(statement, tool)) != 1:
+        return False
+    return True
+
+
+def _na2_decide(ctx, path_norm, acts, source, raw_spellings=None):
     """One protected path, one act set.  Raises Deny, or returns for ALLOW."""
     tag = _carve_tag(ctx, path_norm)
 
@@ -2806,6 +3389,12 @@ def _na2_decide(ctx, path_norm, acts, source):
             # paths admit, and only because the dedicated act is evaluated BEFORE this rule
             # -- its `Set-Content` half is denied here too, not merely its `Remove-Item`.
             if "truncate" in acts:
+                # HOOK-NA-READONLY-COMMAND-FALSE-POSITIVES-1: a truncation that provably
+                # CREATES a file under fleet-runs shrinks nothing -- the shell twin of the
+                # create-or-extend the file tools already get here.  Fleet-runs only: the
+                # receipts carve-out keeps O125's "shell create of receipts/x.json is DENY".
+                if tag == "fleet" and _shell_target_absent(ctx, path_norm, raw_spellings):
+                    return
                 raise Deny(
                     "NA-2",
                     "a truncating write to %s cannot be proven non-shrinking" % path_norm,
@@ -2814,6 +3403,8 @@ def _na2_decide(ctx, path_norm, acts, source):
         if _file_shrinks(ctx):
             if tag in ("resume", "seat") and _archive_release_ok(ctx, path_norm, ctx.new_text):
                 return
+            if tag == "fleet" and _is_own_lane_draft(ctx, path_norm):
+                return  # HOOK-NA2-SHRINKING-EDIT-LANE-DRAFT-1: the lane's own draft
             raise Deny(
                 "NA-2",
                 "shrinking overwrite of %s (archive with a stub instead)" % path_norm,
@@ -3110,22 +3701,34 @@ def rule_na2(ctx):
         # `rm -rf A B` really does name both, and a delete verb's operands are the tokens.
         # A truncation, by contrast, has exactly one destination per redirect, and reading
         # a protected file BESIDE one is the commonest read-only act on this board.
-        positional = acts - {"truncate"}
-        targets = (
-            frozenset(norm(dest) for dest in truncating_destinations(ctx.command))
-            if "truncate" in acts
-            else frozenset()
-        )
+        #
+        # HOOK-NA-READONLY-COMMAND-FALSE-POSITIVES-1: delete and move no longer keep the
+        # whole-command attribution.  `positional_bindings` binds each verb to the tokens of
+        # ITS OWN statement (and falls back to every token whenever the statement's target
+        # is not visible in it), and the truncation targets come from the quote-aware scan,
+        # so a `>` or a cmdlet name inside a quoted DATA string names no target at all.
+        bindings = positional_bindings(ctx.command, ctx.tool)
+        bound = {}
+        for act, bound_tokens in bindings.items():
+            for token in bound_tokens:
+                bound.setdefault(norm(token), set()).add(act)
+        raw_targets = {}
+        if "truncate" in acts:
+            for dest in truncating_destinations(ctx.command, ctx.tool):
+                raw_targets.setdefault(norm(dest), []).append(dest)
         for token in tokens(ctx.command):
             path_norm = norm(token)
             if not _is_na2_protected(path_norm):
                 continue
-            token_acts = set(positional)
-            if path_norm in targets:
+            token_acts = set(bound.get(path_norm, ()))
+            if path_norm in raw_targets:
                 token_acts.add("truncate")
             if not token_acts:
                 continue
-            _na2_decide(ctx, path_norm, token_acts, "shell")
+            spellings = raw_targets.get(path_norm)
+            if spellings and not _sole_first_statement_write(ctx.command, ctx.tool, path_norm, spellings):
+                spellings = None  # r2 (A4): the create cannot be proven to be the FIRST touch
+            _na2_decide(ctx, path_norm, token_acts, "shell", spellings)
         return
     # S125: the SECOND dedicated act is decided BEFORE generic content attribution, and
     # content attribution BEFORE the path guard and its carve-outs -- a carve-out is a
@@ -3966,19 +4569,36 @@ _REDIRECT_DEST_RX = re.compile(r"(?<![\-=!<])>>?\s*(['\"][^'\"]+['\"]|[^\s;|&()<
 _TEE_RX = re.compile(r"(?:^|[\s;&|`(])tee\b[^\n;|&]*", re.I)
 
 
-def _write_destinations(command):
-    """Every path this command text could WRITE to."""
+def _write_destinations(command, tool=None):
+    """Every path this command text could WRITE to.
+
+    HOOK-NA-READONLY-COMMAND-FALSE-POSITIVES-1: with a ``tool``, every OPERATOR (``>``,
+    ``>>``) and every writer VERB is found in ``code_view``, so a ``>`` inside a quoted DATA
+    string -- a Select-String regex ``(?<s>\\S*)`` (read as the UNC path ``//s/*``), ruling
+    text ``<owner account> /pass`` (read as ``/pass``) -- writes nothing; destinations are
+    read from the ORIGINAL text at the same offset, and a content cmdlet's ``-Value`` /
+    ``-InputObject`` argument is data.  Without a ``tool``, or when ``code_view`` cannot read
+    the text, this is the old quote-blind scan exactly (NA-10 and NA-11 still call it so).
+    """
+    view = code_view(command, tool) if tool else None
+    masked = view is not None and view is not command
+    if view is None:
+        view = command
     dests = []
-    for match in _REDIRECT_DEST_RX.finditer(command):
-        dests.append(match.group(1))
+    for match in _REDIRECT_DEST_RX.finditer(view):
+        real = _REDIRECT_DEST_RX.match(command, match.start())
+        dests.append(real.group(1) if real else match.group(1))
     for pattern in (_SED_I_RX, _COPY_RX, _SET_CONTENT_RX, _TEE_RX):
-        for match in pattern.finditer(command):
-            segment = match.group(0)
-            candidates = [
-                token
-                for token in tokens(segment)[1:]
-                if not token.startswith("-") and ("/" in token or "\\" in token)
-            ]
+        for match in pattern.finditer(view):
+            segment = command[match.start() : match.end()]
+            if pattern is _SET_CONTENT_RX:
+                candidates = _cmdlet_path_tokens(segment, masked)
+            else:
+                candidates = [
+                    token
+                    for token in tokens(segment)[1:]
+                    if not token.startswith("-") and ("/" in token or "\\" in token)
+                ]
             if pattern is _COPY_RX and len(candidates) > 1:
                 candidates = candidates[1:]  # cp SRC DST -- only DST is written
             dests.extend(candidates)
@@ -4034,7 +4654,7 @@ def _na7_check_path(ctx, path_norm, how):
 
 def rule_na7(ctx):
     if ctx.tool in SHELL_TOOLS:
-        dests = _write_destinations(ctx.command)
+        dests = _write_destinations(ctx.command, ctx.tool)
         acts = shell_acts(ctx.command)
         if dests or acts:
             for token in tokens(ctx.command):

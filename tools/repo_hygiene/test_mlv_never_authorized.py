@@ -201,7 +201,41 @@ import unittest
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-HOOK = os.path.join(REPO_ROOT, "tools", "hooks", "mlv-never-authorized.py")
+TRACKED_HOOK = os.path.join(REPO_ROOT, "tools", "hooks", "mlv-never-authorized.py")
+# HOOK-NA-READONLY-COMMAND-FALSE-POSITIVES-1: WHICH HOOK THE TABLE JUDGES IS A PARAMETER.
+# Hook evolution is hub-authored (NA-10 refuses a lane writing the tracked hook), so a lane
+# stages a proposed copy OUTSIDE the tree and must be able to prove it RED/GREEN against this
+# exact table.  `NA_HOOK_UNDER_TEST=<path>` points the suite at that copy; unset (the default,
+# and what CI runs) it is the tracked hook, byte for byte as before.
+#
+# THE COPY IS STAGED, NOT RUN IN PLACE, because the hook derives its OWN worktree root (NA-7's
+# first root and the `{REPO}` placeholder) from `__file__`: three `dirname`s up.  A copy run
+# from a run dir would put that root somewhere else and every `{REPO}` row would measure a
+# different tree.  So the copy is placed at `<stage>/tools/hooks/mlv-never-authorized.py` and
+# `HOOK_ROOT` -- the root the hook under test will derive -- is `<stage>`.  The name is not
+# `MLV_`-prefixed on purpose: `_invoke` strips every `MLV_` name from the hook's environment,
+# and this one is read by the suite, never by the hook.
+HOOK_UNDER_TEST_ENV = "NA_HOOK_UNDER_TEST"
+
+
+def _stage_hook_under_test():
+    override = os.environ.get(HOOK_UNDER_TEST_ENV)
+    if not override:
+        return TRACKED_HOOK, REPO_ROOT
+    source = os.path.abspath(override)
+    if not os.path.isfile(source):
+        raise RuntimeError("%s=%s is not a file" % (HOOK_UNDER_TEST_ENV, override))
+    import atexit
+
+    stage = tempfile.mkdtemp(prefix="na-hook-under-test-")
+    atexit.register(shutil.rmtree, stage, True)
+    os.makedirs(os.path.join(stage, "tools", "hooks"))
+    staged = os.path.join(stage, "tools", "hooks", "mlv-never-authorized.py")
+    shutil.copyfile(source, staged)
+    return staged, stage
+
+
+HOOK, HOOK_ROOT = _stage_hook_under_test()
 # ROUND 3 (S134): this suite's own text, so a gate that depends on a HARNESS line can assert
 # that line instead of remembering it.  Read once, at import, from `__file__` itself.
 with open(os.path.abspath(__file__), "r", encoding="utf-8") as _handle:
@@ -877,6 +911,290 @@ NA11_BRIDGE_FILE = "{REPO}/tools/agent-bridge/bridge_core.py"
 NA11_BRIDGE_NESTED = "{REPO}/tools/agent-bridge/pkg/session.py"
 NA11_OUTSIDE_AGENTS = "{REPO}/agents/agent-bridge-source-of-truth.md"
 NA11_NEW_TEXT = "# suspended in-tree agent-bridge churn\n"
+
+
+# ------------------------------- HOOK-NA-READONLY-COMMAND-FALSE-POSITIVES-1 (group `hooknaro`)
+#
+# MEASURED 2026-11-14/15: the hook stopped at least six fix rounds on commands that wrote or
+# deleted NOTHING protected, and every lane obeyed the never-reshape rule and ended PARTIAL.
+# Each payload below is the DENIED tool input COPIED FROM THE TRANSCRIPT, with exactly one
+# substitution -- the board root `C:\!Layi Wkspc\MLV-App` became `{BOARD}` -- because every
+# row here runs against a tmp board.  Each ALLOW subject sits beside TRUE refusals of the same
+# shape, so a hook that simply stopped enforcing goes RED on them rather than looking fixed:
+# a real delete of a fleet-runs file, a real write to //server/share, a real shrink of a
+# summary.md.  Where a payload lives in the hook-deny file of its run is named per row.
+# Folds HOOK-NA2-SHRINKING-EDIT-LANE-DRAFT-1 (payload 5).
+HOOKNARO_R6 = "lane-LEASE-BATCH-IDLE-END-UNSEEN-1-r6-20261114T2230Z"
+HOOKNARO_R9 = "lane-HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1-r9-20261114T1845Z"
+HOOKNARO_R10 = "lane-HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1-r10-20261114T2200Z"
+HOOKNARO_R3 = "lane-LEASE-BATCH-IDLE-END-UNSEEN-1-r3-20261114T1720Z"
+HOOKNARO_R1B = "lane-LANE-PREPUSH-PYTEST-LEG-GIT-ENV-1-r1b-20261114T2315Z"
+HOOKNARO_R13 = "lane-DOCTRINE-OUTBOX-WMI-CHILD-ERRORMODE-1-r13-20261114T2200Z"
+HOOKNARO_TICK = "lane-HUB-TICK-20261114T2301Z"
+
+# Payload 1 -- 811 r10, lane-HFR-...-r10-20261114T2200Z\hook-deny.txt, 22:56:47Z.
+# NA-7 "write outside both the worktree and the board root (//s/*)": the `>` of the regex
+# named group `(?<s>` inside a quoted -Pattern was read as a redirect onto `\\S\*\`.
+HOOKNARO_P1 = 'git diff e9a55f21..HEAD --stat -- src platform tools/gpu; "---"; Select-String -Path tools/profiling/dual-venue/DualVenueRunner.psm1 -Pattern "measured_session id=\\(\\?<s>\\\\S\\*\\)|summary session=\\(\\?<s>\\\\S\\*\\)|sessionUnreadable = \\(|if \\(\\`$sessionUnreadable\\)|DUE_WAKE_SESSION_UNREADABLE: the first|function Test-DvReceiptValid|Get-DvDueWakeDeliveryEvidence -Spec \\`$spec -LogText \\`$ev" | % { "D:{0}: {1}" -f $_.LineNumber, $_.Line.Trim().Substring(0,[Math]::Min(100,$_.Line.Trim().Length)) }; Select-String -Path tools/profiling/venue-b/playback-attr-3-cuda-job.ps1 -Pattern "id=\\(\\?<session>\\\\S\\*\\)|session=\\(\\?<session>\\\\S\\*\\)|measured_session id=\\(\\\\S\\*\\)|summary session=\\(\\\\S\\*\\)|session id is unreadable" | % { "J:{0}: {1}" -f $_.LineNumber, $_.Line.Trim().Substring(0,[Math]::Min(90,$_.Line.Trim().Length)) }; Select-String -Path tools/profiling/venue-b/AttrCudaArtifacts.psm1 -Pattern "measured_session id=\\(\\\\S\\*\\)" | % { "A:{0}" -f $_.LineNumber }; Select-String -Path tools/profiling/dual-venue/Invoke-VenueLeg.ps1 -Pattern "Get-DvDueWakeDeliveryEvidence" | % { "I:{0}" -f $_.LineNumber }; Select-String -Path tools/repo_hygiene/test_dual_venue_evidence.py,tools/repo_hygiene/test_playback_attr_3_cuda_contact_sheet.py,tools/repo_hygiene/test_core_partition_leg.py,tools/repo_hygiene/test_util_sample_leg.py -Pattern "def test_r10_|r10Malformed|malformedMeasuredIdIsNoSession = " | % { "{0}:{1}: {2}" -f (Split-Path $_.Path -Leaf), $_.LineNumber, $_.Line.Trim().Substring(0,[Math]::Min(80,$_.Line.Trim().Length)) }'
+# Payload 2 -- 817 r6, lane-LEASE-...-r6-20261114T2230Z\hook-deny.md, 22:54:28Z.
+# NA-2 "deleting ...\hub-tools\start-adversarypass.ps1": the Remove-Item of the lane's own
+# worktree scratch was bound to a script path in a LATER statement.
+HOOKNARO_P2 = 'Remove-Item -Recurse -Force "C:\\mlvtmp\\lane-LEASE-BATCH-IDLE-END-UNSEEN-1-20261114\\.r6-scratch" -Confirm:$false; git status --porcelain; pwsh -NoProfile -File "{BOARD}\\.claude-state\\fleet-runs\\hub-tools\\Start-AdversaryPass.ps1" -WorkDir "C:\\mlvtmp\\lane-LEASE-BATCH-IDLE-END-UNSEEN-1-20261114" -Card LEASE-BATCH-IDLE-END-UNSEEN-1 -Round r6 -RunDir "{BOARD}\\.claude-state\\fleet-runs\\lane-LEASE-BATCH-IDLE-END-UNSEEN-1-r6-20261114T2230Z" -Wait -TimeoutSec 2700; "exit=$LASTEXITCODE"'
+# Payload 3 -- hub chat a3a530fb, hub-autopilot\hub-chat-deny-20261114T2315Z.md, 23:14:41Z.
+# NA-2 "deleting ...\orchestrator-resume-current.md": the WORD for the delete cmdlet inside
+# the double-quoted ruling text was read as a delete of a checkpoint named elsewhere.
+HOOKNARO_P3 = '$now=[DateTime]::UtcNow.ToString(\'yyyy-MM-ddTHH:mm:ssZ\'); $l=\'{BOARD}\\.claude-state\\kernel\\subject-ledger.md\'\n$line="[tool stamp $now] HUB RULING (HUB-TICK 20261114T2312Z, PC-MINI3, hub chat a3a530fb; A0 + A0b + C; veto open): (1) CoS: only the 7 standing false positives. (2) Since 2251Z: 817 r6 PARTIAL HOOK_DENY NA-2 (Remove-Item of its own scratch combined with a fleet-runs script path in one command; cc90eef2 local, unpushed). hookgitenv r1 PARTIAL NA-7 (a read-only recon redirected to /tmp), no edit. 811 r10 PARTIAL NA-7 (205a5b6c local, adversary A1/A2 open). The headless HUB-TICK 2301Z then dispatched 814 r12 (PROVEN pid 34372, the hub chat\'s prompt: my owed item is done) and armed, WhenSlotFree in order, hookgitenv-r1b (fired 23:11Z), pr817-r7, pr811-r11, and queued HOOK-NA-READONLY-COMMAND-FALSE-POSITIVES-1 P2. The hub chat accepts all of it (veto open). (3) 815 r14 written (run dir lane-DOCTRINE-OUTBOX-WMI-CHILD-ERRORMODE-1-r14-20261114T2315Z, sonnet: G16 a/b plus r13\'s 8 over-refusals as one class; its prompt STOPs if r13 is still live; never run the outbox tests with git variables pointing at the board) and armed pr815-r14-G16-overrefusal-mini3-20261114T2315Z WhenSlotFree after 817 r7 and 811 r11 (FIX_ROUND_HOLD_ADMIT). Promise 22:55Z Sun. (4) Pattern: 3 of 4 lanes this hour stopped on hook denies of benign commands (NA-2 delete+path in one command, NA-7 /tmp read redirect). The 815 r14 prompt names both shapes; the card HOOK-NA-READONLY-COMMAND-FALSE-POSITIVES-1 owns the hook side. QL: Dot silent 54.5 h, advisory."\nAdd-Content -LiteralPath $l -Value $line -Encoding utf8\n$blk = "## $now hub chat a3a530fb tick 2312Z (PC-MINI3)`n- 814 r12 LIVE (pid 34372, dispatched by the headless HUB-TICK 2301Z): owed item done.`n- Slot FIFO (WhenSlotFree): hookgitenv r1b (fired 23:11Z), then pr817-r7 (cc90eef2 unpushed; G10/G11 due 22:15Z Sun), then pr811-r11 (A1/A2 on 205a5b6c), then pr815-r14 (G16 + over-refusals; due 22:55Z Sun; run dir lane-DOCTRINE-OUTBOX-WMI-CHILD-ERRORMODE-1-r14-20261114T2315Z).`n- 815 r13 still live (CI wait, rider-exempt).`n- Hook-deny pattern: NA-2 (a delete plus a fleet-runs path in one command) and NA-7 (a /tmp redirect); card HOOK-NA-READONLY-COMMAND-FALSE-POSITIVES-1 P2.`n`n"\nforeach ($f in \'{BOARD}\\.claude-state\\SESSION-HANDOFF.md\',\'{BOARD}\\.claude-state\\coordination\\dual-lane\\orchestrator-resume-CURRENT.md\') { $old=[IO.File]::ReadAllText($f); [IO.File]::WriteAllText($f, $blk + $old, [Text.UTF8Encoding]::new($false)) }; "ok"\n[TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTime]::UtcNow,\'Central Standard Time\').ToString(\'MMMM d, yyyy \\a\\t h:mm:ss tt\')'
+# Payload 4 -- headless HUB-TICK 2301Z (transcript b2cbdf97), 23:02:28Z.  NA-2 "a truncating
+# write ... cannot be proven non-shrinking" on a `*>` redirect CREATING a file in the tick's
+# own run dir: nothing existed at the target, so nothing could shrink.
+HOOKNARO_P4 = 'pwsh -NoProfile -File "{BOARD}\\.claude-state\\fleet-runs\\hub-tools\\cos-open-ask-scan.ps1" *> "{BOARD}\\.claude-state\\fleet-runs\\lane-HUB-TICK-20261114T2301Z\\cos-scan.out.txt"; "rc=$LASTEXITCODE"'
+# Payload 5 -- HOOK-NA2-SHRINKING-EDIT-LANE-DRAFT-1.  811 r9 (19:21:27Z, r9 hook-deny.txt) and
+# 817 r3 (19:25:18Z): a SHRINKING Edit of the lane's OWN pr-body draft in its OWN run dir.
+HOOKNARO_P5A_PATH = "{BOARD}\\.claude-state\\fleet-runs\\" + HOOKNARO_R9 + "\\pr-body-r9.md"
+HOOKNARO_P5A_OLD = "(`DualVenueRunner.psm1` ~:4317)"
+HOOKNARO_P5A_NEW = "(`DualVenueRunner.psm1:4325`)"
+HOOKNARO_P5B_PATH = "{BOARD}\\.claude-state\\fleet-runs\\" + HOOKNARO_R3 + "\\pr-body-r3.md"
+HOOKNARO_P5B_OLD = "| `test_venue_thermal_gate.py` (the heat-history tests) | 114 passed | see the r3 comment for the final-head rerun |"
+HOOKNARO_P5B_NEW = "| `test_venue_thermal_gate.py` (the heat-history tests) | 114 passed | 253ac155 (final head) and 55df4367 |"
+# The tidy-up Edit of lane-LANE-PREPUSH-PYTEST-LEG-GIT-ENV-1-r1b\hook-deny-01.md (23:14:33Z).
+# It is NOT a draft in the lane's run dir: it shrinks SHARED hub tooling under
+# fleet-runs\hub-tools, which the card keeps guarded, so it is pinned as a TRUE refusal.
+HOOKNARO_P5C_PATH = "{BOARD}\\.claude-state\\fleet-runs\\hub-tools\\Test-LaneCommitMsgGuard.ps1"
+HOOKNARO_P5C_OLD = "    $sel = GitC $wt2 @('--version'); $selOut = "
+HOOKNARO_P5C_NEW = "    $selOut ="
+# Payload 6 -- 815 r13, lane-DOCTRINE-...-r13-20261114T2200Z\summary.md "Hook interactions",
+# 22:48:27Z.  NA-2 "deleting c:/!layi wkspc/mlv-app/.claude-state/fleet-runs/
+# lane-doctrine-outbox-wmi-child-errormode-1-r13-20261114t2200z is denied on the carve-out
+# paths" on a Bash call that only RAN a Python file: `RD="<run dir>"` was read as `rd`.
+HOOKNARO_P6 = 'cd "C:/mlvtmp/lane-DOCTRINE-OUTBOX-WMI-CHILD-ERRORMODE-1-20261114" && RD="{BOARD}/.claude-state/fleet-runs/lane-DOCTRINE-OUTBOX-WMI-CHILD-ERRORMODE-1-r13-20261114T2200Z" && py -3 -I "$RD/repro_open.py" "$PWD" "$RD" 2>&1 | tail -15'
+# Payload 7 -- hub chat a3a530fb, hub-autopilot\hub-chat-deny-20261115T0025Z.md, 00:23:29Z.
+# NA-7 "write outside both the worktree and the board root (/pass)": the `>` of
+# `<owner account> /pass` inside a double-quoted string VALUE was read as a redirect.
+# ONE MORE SUBSTITUTION, and only here: the lowercase venue host name became `venue-b`,
+# because `test_no_case_references_a_real_board_path` (O81/O97) refuses that host's name in
+# any row.  It sits inside the quoted value and is inert data either way.
+HOOKNARO_P7 = '$L="{BOARD}\\.claude-state\\kernel\\subject-ledger.md"; $ts=(Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ");\n$r1="- **[tool stamp $ts] HUB RULING (hub chat a3a530fb, owner ask \'durable fix + faster if migrating the runner does it; swarm, adjudicate, execute\'): RUNNER MIGRATION NO_GO.** 3-agent swarm synthesis: (1) the DLL pair\'s build ends in dll_test.exe, which needs an NVIDIA GPU, and PC-MINI3 has only an AMD iGPU, no nvcc, no Visual Studio and no admin; (2) every venue job reaches Bachelor through \\\\venue-b\\mlv-agent anyway, so a local build would not remove the credential need; (3) moving the build means toolchain drift (MSVC 14.37 + CUDA 12.6.3 pinned on Ultra-Magnus) plus an elevation the hub does not have. MINI3-CUDA-DLLPAIR-LOCAL-BUILD-1 stays parked NO_GO. DURABLE FIX = owner SMB credentials for BOTH venues (cmdkey /add:Ultra-Magnus and /add:venue-b with MicrosoftAccount\\<owner account> /pass), plus the cut-over checklist step (tools\\workstation\\README.md 6b, written) and a fail-closed share preflight (MINI3-CUTOVER-STATE-GAPS-1, widened below). FASTER, done now: producer cap 2->4 (hub-autopilot\\producer-cap.json, backup kept; measured Load 9%, run queue 0, 77.5/93.7 GB free); HOOK-NA-READONLY-COMMAND-FALSE-POSITIVES-1 raised to P1 and armed (hooknaro-r1-mini3-20261115T0030Z), since hook over-refusal cost at least 6 fix rounds today. Veto stays open to the owner.";\n$r2="- **[tool stamp $ts] CORRECTION (hub chat a3a530fb): MINI3-CUTOVER-STATE-GAPS-1 widened.** Add: (a) Setup-MlvWorkstation -Phase Verify fails closed unless Test-Path is True for both \\\\Ultra-Magnus\\g\\Temp\\mlv-gpu-profile\\agent\\heartbeat.txt and \\\\venue-b\\mlv-agent\\heartbeat.txt; (b) the venue stage chain reports a typed SHARE_ACCESS_DENIED (System error 5) instead of the misleading \'No agent heartbeat\'; (c) the README step 6b (SMB credentials for both venues, written untracked in tools\\workstation) lands with the tools\\workstation tree.";\nAdd-Content -LiteralPath $L -Value $r1,$r2 -Encoding utf8; "ok $ts"; Get-ChildItem "{BOARD}\\.claude-state" -Recurse -Filter "Update-CardQueue*.ps1" -ErrorAction SilentlyContinue | Select-Object -First 3 FullName'.replace("bachelor", "venue-b")
+
+# Payload 8 -- HOOK-NA-READONLY-COMMAND-FALSE-POSITIVES-1 r1 itself, lane-...-r1-20261115T0030Z\
+# hook-deny.md, ~00:52Z.  NA-2 "deleting <the r1 run dir>": the only delete was
+# `Remove-Item Env:NA_HOOK_UNDER_TEST` (the Env: drive), bound to the `$rd=` run-dir
+# assignment of an EARLIER statement.  Reduced to its shape as r1's hub-apply.md section 5 gives it.
+HOOKNARO_P8 = '$rd="{FLEET}\\lane-X"; py -3 -c "print(1)"; Remove-Item Env:NA_HOOK_UNDER_TEST; Get-ChildItem -LiteralPath $rd'
+# r2 adversary A4: a fleet-runs file that does not exist (its run dir does not either).
+HOOKNARO_A4_NEW = "{FLEET}\\lane-ADVERSARY-NONEXISTENT\\summary.md"
+
+_HNR_SUMMARY_R6 = "{FLEET}\\" + HOOKNARO_R6 + "\\summary.md"
+
+
+def _hnr(name, tool, tool_input, expect, na=None, reason=None, fixture=None):
+    row = {"name": "hooknaro " + name, "group": "hooknaro", "tool": tool,
+           "input": tool_input, "expect": expect}
+    if na:
+        row["na"] = na
+    if reason:
+        row["reason_contains"] = reason
+    if fixture:
+        row["fixture"] = fixture
+    return row
+
+
+_NA7_OUT = "outside both the worktree and the board root"
+_NA2_CARVE = "denied on the carve-out paths"
+_NA2_TRUNC = "cannot be proven non-shrinking"
+_NA2_SHRINK = "shrinking overwrite"
+
+HOOKNARO_ROWS = [
+    # ---- payload 1: a regex in a quoted -Pattern is not a redirect
+    _hnr("p1 read-only git diff plus Select-String regex holding (?<s>\\S*)", "PowerShell",
+         {"command": HOOKNARO_P1}, "ALLOW"),
+    _hnr("p1 CTL a real redirect of Select-String output to //server/share", "PowerShell",
+         {"command": 'Select-String -Path tools/x.psm1 -Pattern "id=\\(\\?<s>\\\\S\\*\\)" > //server/share/anchors.txt'},
+         "DENY", "NA-7", (_NA7_OUT, "//server/share/anchors.txt")),
+    _hnr("p1 CTL a real Set-Content to //server/share", "PowerShell",
+         {"command": 'Set-Content -LiteralPath "//server/share/x.txt" -Value 1'},
+         "DENY", "NA-7", (_NA7_OUT, "//server/share/x.txt")),
+    _hnr("p1 CTL a redirect inside a pwsh -Command string is still read", "PowerShell",
+         {"command": 'pwsh -Command "Select-String -Path x -Pattern \'(?<s>a)\' > //server/share/x.txt"'},
+         "DENY", "NA-7", _NA7_OUT),
+    # ---- payload 2: a delete binds only its own statement
+    _hnr("p2 Remove-Item of own worktree scratch then Start-AdversaryPass", "PowerShell",
+         {"command": HOOKNARO_P2}, "ALLOW"),
+    _hnr("p2 CTL the same command deleting a fleet-runs summary.md", "PowerShell",
+         {"command": HOOKNARO_P2.replace(
+             "C:\\mlvtmp\\lane-LEASE-BATCH-IDLE-END-UNSEEN-1-20261114\\.r6-scratch",
+             _HNR_SUMMARY_R6)},
+         "DENY", "NA-2", (HOOKNARO_R6.lower() + "/summary.md", _NA2_CARVE)),
+    _hnr("p2 CTL a delete through a variable binds the whole command", "PowerShell",
+         {"command": '$p = "' + _HNR_SUMMARY_R6 + '"; Remove-Item -LiteralPath $p'},
+         "DENY", "NA-2", _NA2_CARVE),
+    _hnr("p2 CTL a pipeline feeding Remove-Item from a fleet-runs listing", "PowerShell",
+         {"command": 'Get-ChildItem -LiteralPath "{FLEET}\\' + HOOKNARO_R6 + '" | Remove-Item -Recurse -Force'},
+         "DENY", "NA-2", _NA2_CARVE),
+    _hnr("p2 CTL a relative delete after Set-Location into a run dir", "PowerShell",
+         {"command": 'Set-Location "{FLEET}\\' + HOOKNARO_R6 + '"; Remove-Item -Recurse -Force *'},
+         "DENY", "NA-2", _NA2_CARVE),
+    _hnr("p2 CTL a backtick line continuation keeps the operand in the statement", "PowerShell",
+         {"command": 'Remove-Item -Recurse -Force `\n  "' + _HNR_SUMMARY_R6 + '"'},
+         "DENY", "NA-2", (HOOKNARO_R6.lower() + "/summary.md", _NA2_CARVE)),
+    # ---- payload 3: a cmdlet NAME inside quoted ruling text is not a delete
+    _hnr("p3 ledger append quoting a delete cmdlet beside checkpoint paths", "PowerShell",
+         {"command": HOOKNARO_P3}, "ALLOW"),
+    _hnr("p3 CTL the same command plus a real delete of the checkpoint", "PowerShell",
+         {"command": HOOKNARO_P3 + "\nRemove-Item -LiteralPath '{DUAL}\\orchestrator-resume-CURRENT.md'"},
+         "DENY", "NA-2", ("orchestrator-resume-current.md", _NA2_CARVE)),
+    _hnr("p3 CTL a delete inside a pwsh -Command string is still a delete", "PowerShell",
+         {"command": 'pwsh -Command "Remove-Item -LiteralPath \'{DUAL}/orchestrator-resume-CURRENT.md\'"'},
+         "DENY", "NA-2", _NA2_CARVE),
+    _hnr("p3 CTL a quoted cmdlet name at the call operator is code", "PowerShell",
+         {"command": '& "Remove-Item" -LiteralPath \'{DUAL}/orchestrator-resume-CURRENT.md\''},
+         "DENY", "NA-2", _NA2_CARVE),
+    # ---- payload 4: a redirect that creates a NEW fleet-runs file shrinks nothing
+    _hnr("p4 *> redirect creating a new file in the tick's own run dir", "PowerShell",
+         {"command": HOOKNARO_P4}, "ALLOW"),
+    _hnr("p4 CTL the same redirect onto a file that already exists", "PowerShell",
+         {"command": HOOKNARO_P4}, "DENY", "NA-2", ("cos-scan.out.txt", _NA2_TRUNC),
+         fixture="hooknaro_existing_scan_out"),
+    _hnr("p4 CTL the same redirect creating a file under a receipts directory", "PowerShell",
+         {"command": HOOKNARO_P4.replace("\\cos-scan.out.txt", "\\receipts\\cos-scan.out.txt")},
+         "DENY", "NA-2", _NA2_TRUNC),
+    # ---- payload 5: a shrinking Edit of the lane's OWN draft in its OWN run dir
+    _hnr("p5 811 r9 shrinking Edit of its own pr-body draft", "Edit",
+         {"file_path": HOOKNARO_P5A_PATH, "old_string": HOOKNARO_P5A_OLD,
+          "new_string": HOOKNARO_P5A_NEW}, "ALLOW", fixture="hooknaro_lane_r9"),
+    _hnr("p5 817 r3 shrinking Edit of its own pr-body draft", "Edit",
+         {"file_path": HOOKNARO_P5B_PATH, "old_string": HOOKNARO_P5B_OLD,
+          "new_string": HOOKNARO_P5B_NEW}, "ALLOW", fixture="hooknaro_lane_r3"),
+    _hnr("p5 CTL the same shrink of the run dir's summary.md", "Edit",
+         {"file_path": HOOKNARO_P5A_PATH.replace("pr-body-r9.md", "summary.md"),
+          "old_string": HOOKNARO_P5A_OLD, "new_string": HOOKNARO_P5A_NEW},
+         "DENY", "NA-2", ("/summary.md", _NA2_SHRINK), fixture="hooknaro_lane_r9"),
+    _hnr("p5 CTL the same shrink of dispatch-proof.txt", "Edit",
+         {"file_path": HOOKNARO_P5A_PATH.replace("pr-body-r9.md", "dispatch-proof.txt"),
+          "old_string": HOOKNARO_P5A_OLD, "new_string": HOOKNARO_P5A_NEW},
+         "DENY", "NA-2", _NA2_SHRINK, fixture="hooknaro_lane_r9"),
+    _hnr("p5 CTL the same draft shrink from ANOTHER lane's run dir", "Edit",
+         {"file_path": HOOKNARO_P5A_PATH, "old_string": HOOKNARO_P5A_OLD,
+          "new_string": HOOKNARO_P5A_NEW}, "DENY", "NA-2", _NA2_SHRINK,
+         fixture="hooknaro_lane_r10"),
+    _hnr("p5 CTL the same draft shrink with no lane prompt", "Edit",
+         {"file_path": HOOKNARO_P5A_PATH, "old_string": HOOKNARO_P5A_OLD,
+          "new_string": HOOKNARO_P5A_NEW}, "DENY", "NA-2", _NA2_SHRINK),
+    _hnr("p5 CTL a draft name in a subdirectory of the own run dir", "Edit",
+         {"file_path": HOOKNARO_P5A_PATH.replace("\\pr-body-r9.md", "\\sub\\pr-body-r9.md"),
+          "old_string": HOOKNARO_P5A_OLD, "new_string": HOOKNARO_P5A_NEW},
+         "DENY", "NA-2", _NA2_SHRINK, fixture="hooknaro_lane_r9"),
+    _hnr("p5 CTL the r1b tidy-up shrink of shared hub-tools", "Edit",
+         {"file_path": HOOKNARO_P5C_PATH, "old_string": HOOKNARO_P5C_OLD,
+          "new_string": HOOKNARO_P5C_NEW}, "DENY", "NA-2",
+         ("hub-tools/test-lanecommitmsgguard.ps1", _NA2_SHRINK), fixture="hooknaro_lane_r1b"),
+    # ---- payload 6: `RD=` is an assignment, not rd
+    _hnr("p6 Bash run of a Python file with RD= naming the run dir", "Bash",
+         {"command": HOOKNARO_P6}, "ALLOW"),
+    _hnr("p6 CTL a real rm -rf of that run dir through RD", "Bash",
+         {"command": 'RD="{BOARD}/.claude-state/fleet-runs/' + HOOKNARO_R13 + '" && rm -rf "$RD"'},
+         "DENY", "NA-2", (HOOKNARO_R13.lower(), _NA2_CARVE)),
+    _hnr("p6 CTL a real rd of a run dir", "PowerShell",
+         {"command": 'rd -Recurse "{FLEET}\\' + HOOKNARO_R13 + '"'},
+         "DENY", "NA-2", (HOOKNARO_R13.lower(), _NA2_CARVE)),
+    # ---- payload 7: a `>` inside a quoted string VALUE is not a redirect
+    _hnr("p7 ledger Add-Content whose value quotes <owner account> /pass", "PowerShell",
+         {"command": HOOKNARO_P7}, "ALLOW"),
+    _hnr("p7 CTL Add-Content to a //server/share ledger", "PowerShell",
+         {"command": 'Add-Content -LiteralPath "//server/share/ledger.md" -Value $r1'},
+         "DENY", "NA-7", (_NA7_OUT, "//server/share/ledger.md")),
+    _hnr("p7 CTL a real redirect onto /pass outside the quotes", "PowerShell",
+         {"command": '$r1 = "<owner account>"; "ruling" > /pass'},
+         "DENY", "NA-7", (_NA7_OUT, "(/pass)")),
+    _hnr("p7 CTL a positional path after -Value is still the destination", "PowerShell",
+         {"command": 'Add-Content -Value "ruling" "//server/share/ledger.md"'},
+         "DENY", "NA-7", (_NA7_OUT, "//server/share/ledger.md")),
+    # ---- payload 8: r1's own stop -- a `Remove-Item Env:` beside a run-dir variable
+    _hnr("p8 Remove-Item of the Env: drive beside a $rd run-dir assignment", "PowerShell",
+         {"command": HOOKNARO_P8}, "ALLOW"),
+    _hnr("p8 CTL the same shape with a real Remove-Item of a fleet-runs file", "PowerShell",
+         {"command": HOOKNARO_P8.replace(
+             "Remove-Item Env:NA_HOOK_UNDER_TEST",
+             "Remove-Item -LiteralPath \"{FLEET}\\lane-X\\summary.md\"")},
+         "DENY", "NA-2", ("lane-x/summary.md", _NA2_CARVE)),
+] + [
+    # ---- r2: the adversary pass on 695abdc0 (adversary-695abdc0.json), each finding's
+    # `input` verbatim but for the board root, plus its siblings.  Every row is a TRUE
+    # refusal that the base hook (52f4654e) refuses and the r1 hook (695abdc0) ALLOWED.
+    # A1: cmd reads `del/q`, `rd/s`, `move/y` and `rd=` as the verb plus a switch.
+    _hnr("a1 CTL cmd /c del/q of the kill-switch marker", "PowerShell",
+         {"command": 'cmd /c del/q "{DUAL}\\WORKSTREAM-LOOP-DISABLED"'},
+         "DENY", "NA-2", "WORKSTREAM-LOOP-DISABLED"),
+    _hnr("a1 CTL cmd /c rd/s/q of a run dir", "PowerShell",
+         {"command": 'cmd /c rd/s/q "{FLEET}\\' + HOOKNARO_R6 + '"'},
+         "DENY", "NA-2", (HOOKNARO_R6.lower(), _NA2_CARVE)),
+    _hnr("a1 CTL cmd /c move/y of a run-dir summary.md", "PowerShell",
+         {"command": 'cmd /c move/y "' + _HNR_SUMMARY_R6 + '" "C:\\mlvtmp\\x.md"'},
+         "DENY", "NA-2", "moving"),
+    _hnr("a1 CTL caret-escaped c^md del/q of a run-dir summary.md", "PowerShell",
+         {"command": 'c^md /c del/q "' + _HNR_SUMMARY_R6 + '"'},
+         "DENY", "NA-2", (HOOKNARO_R6.lower() + "/summary.md", _NA2_CARVE)),
+    _hnr("a1 CTL Git Bash cmd //c rd= of a run dir", "Bash",
+         {"command": 'cmd //c rd="{BOARD}/.claude-state/fleet-runs/' + HOOKNARO_R13 + '"'},
+         "DENY", "NA-2", (HOOKNARO_R13.lower(), _NA2_CARVE)),
+    # A2: an EMPTY -Value/-InputObject is still the one value argument.
+    _hnr("a2 CTL Set-Content -Value empty then a positional checkpoint", "PowerShell",
+         {"command": 'Set-Content -Value "" "{BOARD}/.claude-state/coordination/dual-lane/orchestrator-resume-CURRENT.md"'},
+         "DENY", "NA-2", ("orchestrator-resume-current.md", _NA2_TRUNC)),
+    _hnr("a2 CTL Out-File -InputObject empty then a positional checkpoint", "PowerShell",
+         {"command": "Out-File -InputObject '' '{DUAL}/orchestrator-resume-CURRENT.md'"},
+         "DENY", "NA-2", ("orchestrator-resume-current.md", _NA2_TRUNC)),
+    _hnr("a2 CTL Add-Content -Value empty then a positional //server/share", "PowerShell",
+         {"command": 'Add-Content -Value "" "//server/share/ledger.md"'},
+         "DENY", "NA-7", (_NA7_OUT, "//server/share/ledger.md")),
+    # A3: a launcher the name list cannot see is still a launcher.
+    _hnr("a3 CTL backtick-escaped pws`h -Command redirect to //server/share", "PowerShell",
+         {"command": "pws`h -Command '\"x\" > //server/share/x.txt'"},
+         "DENY", "NA-7", _NA7_OUT),
+    _hnr("a3 CTL backslash-escaped bas\\h -c redirect to //server/share", "Bash",
+         {"command": "bas\\h -c 'echo x > //server/share/x.txt'"},
+         "DENY", "NA-7", _NA7_OUT),
+    _hnr("a3 CTL escaped launcher running Remove-Item of a checkpoint", "PowerShell",
+         {"command": "pws`h -Command 'Remove-Item -LiteralPath \"{DUAL}/orchestrator-resume-CURRENT.md\"'"},
+         "DENY", "NA-2", ("orchestrator-resume-current.md", _NA2_CARVE)),
+    _hnr("a3 CTL quote-split ba''sh -c redirect to //server/share", "Bash",
+         {"command": "ba''sh -c 'echo x > //server/share/x.txt'"},
+         "DENY", "NA-7", _NA7_OUT),
+    _hnr("a3 CTL computed program name & ('p'+'wsh') redirect", "PowerShell",
+         {"command": "& ('p'+'wsh') -c '\"x\" > //server/share/x.txt'"},
+         "DENY", "NA-7", _NA7_OUT),
+    _hnr("a3 CTL & $env:ComSpec /c string deleting a run-dir summary.md", "PowerShell",
+         {"command": '& $env:ComSpec /c "type nul & del ' + _HNR_SUMMARY_R6 + '"'},
+         "DENY", "NA-2", (HOOKNARO_R6.lower() + "/summary.md", _NA2_CARVE)),
+    _hnr("a3 CTL forfiles /c string running cmd del of a run-dir summary.md", "PowerShell",
+         {"command": 'forfiles /p C:\\mlvtmp /c "cmd /c del ' + _HNR_SUMMARY_R6 + '"'},
+         "DENY", "NA-2", (HOOKNARO_R6.lower() + "/summary.md", _NA2_CARVE)),
+    _hnr("a3 CTL a quoted variable as the Bash command word", "Bash",
+         {"command": "\"$SHELL\" -c 'echo x > //server/share/x.txt'"},
+         "DENY", "NA-7", _NA7_OUT),
+    _hnr("a3 CTL & on a quoted variable as the PowerShell program", "PowerShell",
+         {"command": "$p='p'+'wsh'; & \"$p\" -c '\"x\" > //server/share/x.txt'"},
+         "DENY", "NA-7", _NA7_OUT),
+    _hnr("a3 CTL git -c alias string running rm -rf of a run dir", "Bash",
+         {"command": 'git -c alias.x="!f() { rm -rf {BOARD}/.claude-state/fleet-runs/' + HOOKNARO_R13 + '; }; f" x'},
+         "DENY", "NA-2", (HOOKNARO_R13.lower(), _NA2_CARVE)),
+    # A4: a create is exempt only as the command's FIRST and ONLY touch of the path.
+    _hnr("a4 CTL Set-Content creating then emptying one new fleet-runs file", "PowerShell",
+         {"command": 'Set-Content -LiteralPath "' + HOOKNARO_A4_NEW + '" -Value "earlier evidence"; '
+                     'Set-Content -LiteralPath "' + HOOKNARO_A4_NEW + '" -Value ""'},
+         "DENY", "NA-2", ("lane-adversary-nonexistent/summary.md", _NA2_TRUNC)),
+    _hnr("a4 CTL Add-Content creating then an empty redirect onto it", "PowerShell",
+         {"command": 'Add-Content -LiteralPath "' + HOOKNARO_A4_NEW + '" -Value "earlier evidence"; '
+                     '"" > "' + HOOKNARO_A4_NEW + '"'},
+         "DENY", "NA-2", ("lane-adversary-nonexistent/summary.md", _NA2_TRUNC)),
+    _hnr("a4 CTL an earlier statement may create the file a later redirect empties", "PowerShell",
+         {"command": 'pwsh -NoProfile -File "{FLEET}\\hub-tools\\Start-AdversaryPass.ps1"; "" > "'
+                     + HOOKNARO_A4_NEW + '"'},
+         "DENY", "NA-2", ("lane-adversary-nonexistent/summary.md", _NA2_TRUNC)),
+    _hnr("a4 CTL a pipeline producer may create the file Set-Content empties", "PowerShell",
+         {"command": 'pwsh -NoProfile -File "{FLEET}\\hub-tools\\maker.ps1" | Set-Content -LiteralPath "'
+                     + HOOKNARO_A4_NEW + '"'},
+         "DENY", "NA-2", ("lane-adversary-nonexistent/summary.md", _NA2_TRUNC)),
+]
 
 
 # --------------------------------------------------------------------------- table
@@ -4696,6 +5014,7 @@ CASES = [
         "na": "NA-7",
         "reason_contains": "outside both the worktree and the board root",
     },
+] + HOOKNARO_ROWS + [
     # ------------------------------------------------------- the 6 benign ALLOW controls
     {
         "name": "benign git push fork product branch",
@@ -6216,6 +6535,31 @@ def fixture_checkpoint_archived(paths):
     return {}
 
 
+def _hooknaro_lane_prompt(run_dir_name):
+    """HOOK-NA2-SHRINKING-EDIT-LANE-DRAFT-1: the CALLING lane, as the dispatcher names it.
+
+    `Invoke-Lane.ps1` sets the child's `MLV_LANE_PROMPT` to the absolute path of the prompt
+    file it read, which lives in the lane's run dir; the hook derives "this lane's own run
+    dir" from it and from nothing a tool call can set.
+    """
+
+    def fixture(paths):
+        prompt = os.path.join(paths["FLEET"], run_dir_name, "prompt.md")
+        _write(prompt, "# card\n\n- CLIP_OR_NONE: none\n")
+        return {"MLV_LANE_PROMPT": prompt}
+
+    return fixture
+
+
+def fixture_hooknaro_existing_scan_out(paths):
+    """Payload 4's control: the `*>` target already EXISTS, so the truncation may shrink it."""
+    _write(
+        os.path.join(paths["FLEET"], HOOKNARO_TICK, "cos-scan.out.txt"),
+        "an earlier scan's output that a truncation would destroy\n",
+    )
+    return {}
+
+
 def fixture_checkpoint_unarchived(paths):
     _write(os.path.join(paths["DUAL"], "orchestrator-resume-CURRENT.md"), CHECKPOINT_LONG)
     return {}
@@ -6332,6 +6676,12 @@ FIXTURES = {
     "manifest_venue_env_only": fixture_manifest_venue_env_only,
     "venue_at_board": fixture_venue_at_board,
     "venue_at_worktree": fixture_venue_at_worktree,
+    # HOOK-NA-READONLY-COMMAND-FALSE-POSITIVES-1
+    "hooknaro_lane_r9": _hooknaro_lane_prompt(HOOKNARO_R9),
+    "hooknaro_lane_r3": _hooknaro_lane_prompt(HOOKNARO_R3),
+    "hooknaro_lane_r10": _hooknaro_lane_prompt(HOOKNARO_R10),
+    "hooknaro_lane_r1b": _hooknaro_lane_prompt(HOOKNARO_R1B),
+    "hooknaro_existing_scan_out": fixture_hooknaro_existing_scan_out,
 }
 
 
@@ -6361,7 +6711,10 @@ class MlvNeverAuthorizedHookTests(unittest.TestCase):
             # a lane editing its own gate actually looks like -- and because NA-7 allows
             # that tree by construction, so an NA-10 DENY there is attributable to NA-10.
             # It is derived, never a literal, so it is the checkout on either matrix leg.
-            "REPO": REPO_ROOT,
+            # NA_HOOK_UNDER_TEST: the root the hook UNDER TEST derives -- the checkout by
+            # default, the staging tree when a proposed copy is judged.
+            "REPO": HOOK_ROOT,
+            "FLEET": os.path.join(board, ".claude-state", "fleet-runs"),
             "CLIP_AUTH": os.path.join(board, "clips", "authorized", "take01.mlv"),
         }
         for key in ("BOARD", "DUAL", "RECEIPTS", "OUTSIDE", "CACHE", "WORKTREE"):
@@ -9156,6 +9509,84 @@ for _case in CASES:
     setattr(MlvNeverAuthorizedHookTests, _name, _make_test(_case))
     if _case.get("group") == "na6":
         setattr(Na6DifferentialTests, _name, _make_differential(_case))
+
+
+class HookNaReadonlyFalsePositiveTableTests(unittest.TestCase):
+    """HOOK-NA-READONLY-COMMAND-FALSE-POSITIVES-1: the payload table cannot shrink silently.
+
+    Nine ALLOW subjects (the eight deny payloads; payload 5 has two runs) and forty-seven
+    TRUE refusals beside them -- twenty-five from r1 and the payload-8 control, twenty-two
+    from the r2 adversary pass (a1..a4, with siblings).  Pinned by count AND by the rule each refusal asserts,
+    so a subject cannot be kept while the refusal next to it is quietly dropped or
+    retargeted; and each subject is pinned to ITS OWN payload input and fixture (r2
+    advisory A5: a count-and-name check alone let one subject's input be swapped for
+    another's).
+    """
+
+    def test_the_hooknaro_group_keeps_every_subject_and_every_refusal(self):
+        rows = [case for case in CASES if case["group"] == "hooknaro"]
+        allow = [case for case in rows if case["expect"] == "ALLOW"]
+        deny = [case for case in rows if case["expect"] == "DENY"]
+        self.assertEqual(len(allow), 9, [case["name"] for case in allow])
+        self.assertEqual(len(deny), 47, [case["name"] for case in deny])
+        by_rule = {}
+        for case in deny:
+            by_rule[case["na"]] = by_rule.get(case["na"], 0) + 1
+        self.assertEqual(by_rule, {"NA-2": 34, "NA-7": 13}, by_rule)
+        for payload in ("p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8"):
+            names = [case["name"] for case in rows if case["name"].startswith("hooknaro " + payload + " ")]
+            self.assertTrue(any(" CTL " in name for name in names), payload)
+            self.assertTrue(any(" CTL " not in name for name in names), payload)
+        for finding in ("a1", "a2", "a3", "a4"):
+            names = [case["name"] for case in rows if case["name"].startswith("hooknaro " + finding + " ")]
+            self.assertTrue(names, finding)
+            self.assertTrue(all(" CTL " in name for name in names), finding)
+
+    def test_each_hooknaro_subject_carries_its_own_payload(self):
+        # r2 advisory A5: name -> (tool, input, fixture), so swapping one subject's input or
+        # fixture for another's goes RED even though the counts and names still match.
+        wanted = {
+            "hooknaro p1 read-only git diff plus Select-String regex holding (?<s>\\S*)":
+                ("PowerShell", {"command": HOOKNARO_P1}, None),
+            "hooknaro p2 Remove-Item of own worktree scratch then Start-AdversaryPass":
+                ("PowerShell", {"command": HOOKNARO_P2}, None),
+            "hooknaro p3 ledger append quoting a delete cmdlet beside checkpoint paths":
+                ("PowerShell", {"command": HOOKNARO_P3}, None),
+            "hooknaro p4 *> redirect creating a new file in the tick's own run dir":
+                ("PowerShell", {"command": HOOKNARO_P4}, None),
+            "hooknaro p5 811 r9 shrinking Edit of its own pr-body draft":
+                ("Edit", {"file_path": HOOKNARO_P5A_PATH, "old_string": HOOKNARO_P5A_OLD,
+                          "new_string": HOOKNARO_P5A_NEW}, "hooknaro_lane_r9"),
+            "hooknaro p5 817 r3 shrinking Edit of its own pr-body draft":
+                ("Edit", {"file_path": HOOKNARO_P5B_PATH, "old_string": HOOKNARO_P5B_OLD,
+                          "new_string": HOOKNARO_P5B_NEW}, "hooknaro_lane_r3"),
+            "hooknaro p6 Bash run of a Python file with RD= naming the run dir":
+                ("Bash", {"command": HOOKNARO_P6}, None),
+            "hooknaro p7 ledger Add-Content whose value quotes <owner account> /pass":
+                ("PowerShell", {"command": HOOKNARO_P7}, None),
+            "hooknaro p8 Remove-Item of the Env: drive beside a $rd run-dir assignment":
+                ("PowerShell", {"command": HOOKNARO_P8}, None),
+        }
+        got = {
+            case["name"]: (case["tool"], case["input"], case.get("fixture"))
+            for case in CASES
+            if case["group"] == "hooknaro" and case["expect"] == "ALLOW"
+        }
+        self.assertEqual(got, wanted)
+
+    def test_the_hook_under_test_is_named_by_the_environment_or_is_the_tracked_hook(self):
+        override = os.environ.get(HOOK_UNDER_TEST_ENV)
+        if not override:
+            self.assertEqual(HOOK, TRACKED_HOOK)
+            self.assertEqual(HOOK_ROOT, REPO_ROOT)
+            return
+        with open(os.path.abspath(override), "rb") as handle:
+            wanted = hashlib.sha256(handle.read()).hexdigest()
+        with open(HOOK, "rb") as handle:
+            self.assertEqual(hashlib.sha256(handle.read()).hexdigest(), wanted)
+        self.assertEqual(
+            os.path.dirname(os.path.dirname(os.path.dirname(HOOK))), HOOK_ROOT
+        )
 
 
 if __name__ == "__main__":
