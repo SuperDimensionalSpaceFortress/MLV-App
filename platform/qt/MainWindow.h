@@ -874,6 +874,9 @@ private:
     quint64 m_playbackPresentedFrameCount = 0;           // r21 (adversary pass 20 A3): frames recordPresentedFrame has recorded
     quint64 m_playbackFpsMeterSeenPresentedCount = 0;    // r21: the count the fps meter last stepped on; a draw feeds it only when this moved
     QTime m_lastPlaybackFpsStatusUpdateTime;
+    QTime m_playbackFpsMeterPresentedStamp;       // INFO-2 r2 (pass 1 A2): wall time recordPresentedFrame ran for the latest presented frame (the handoff)
+    QElapsedTimer m_playbackPresentedClock;       // INFO-2 r2 (pass 1 A7): restarted by every presented frame (monotonic); invalid before the first
+    QTime m_playbackFpsMeterPrevPresentedStamp;   // INFO-2 r2: the presentation stamp the meter last stepped on (the interval's start)
     QLabel *m_pFrameNumber;
     QLabel *m_pChosenDebayer;
     QLabel *m_pLookLabelStatus = nullptr;   // LOOK-FULLSCREEN-PARITY-1: the current look, windowed
@@ -907,6 +910,8 @@ private:
         int presentedRoute = 0;   // r12 adversary A1: the presented frame's CPU render-path code (a proxy route relabels)
         int debayerScale = 0;     // r13 adversary pass 15 A1: a prep frame's debayer scale (presentedPlaybackDebayerScale)
         QString debayer;          // INFO-2 r1 (pass 21 A1): the debayer name the label shows (playbackInfoDebayerName)
+        bool dualIsoOn = false;   // INFO-2 r2 (pass 1 A5): the displayed image's Dual-ISO state (playbackInfoDualIsoOn)
+        double playbackRate = 0.0;   // INFO-2 r2 (pass 1 A8): the effective conform rate (getPlaybackFramerate) the fps field shows
         bool operator==( const PlaybackInfoInputs &o ) const
         {
             return pipelineStatus == o.pipelineStatus && scopeCaveat == o.scopeCaveat && requestedScale == o.requestedScale
@@ -914,7 +919,9 @@ private:
                 && requestContextScale == o.requestContextScale && gpuAmaze == o.gpuAmaze && gpuBilinear == o.gpuBilinear
                 && presentedRoute == o.presentedRoute
                 && debayerScale == o.debayerScale
-                && debayer == o.debayer;   // presentedFrameScaleOf is a function of presentedScale + requestContextValid, both keyed
+                && debayer == o.debayer
+                && dualIsoOn == o.dualIsoOn
+                && playbackRate == o.playbackRate;   // presentedFrameScaleOf is a function of presentedScale + requestContextValid, both keyed
         }
     };
     PlaybackInfoInputs m_playbackInfoInputs;
@@ -2413,6 +2420,8 @@ private:
     // The one push of the look label (plus the info lines in fullscreen) to the status bar and the corner surfaces.
     void pushLookLabelOverlay( void );
     playback_info_label::Facts playbackInfoFacts( void );
+    bool playbackInfoLiveDualIsoOn( void ) const;    // INFO-2 r2 (pass 1 A5): Dual-ISO applied by the live settings (the next frame's request)
+    bool playbackInfoDualIsoOn( void ) const;        // INFO-2 r2 (pass 1 A5): the displayed image's own (the presented frame's context)
     QString playbackInfoDebayerName( void ) const;   // INFO-2 r1 (pass 21 A1): the shown debayer name, also the relabel key's
     // r12 adversary A1: the presented frame's CPU render-path code, read from its own telemetry (0 = full recon or unknown).
     int presentedPlaybackRouteCode( void ) const;

@@ -2964,10 +2964,13 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     //Zero the fps meter when paused, before the first draw, or stalled. Runs on EVERY tick, including
     //the still-drawing early returns below: a busy render must not leave the previous fps on screen.
     //Touches only the meter state, never lastTime, so drop-frame pacing is unchanged.
-    const auto resetFpsMeterIfIdle = [this]( const QTime & now )
+    const auto resetFpsMeterIfIdle = [this]( const QTime & now, bool presentationAgeWrapped = false )
     {
         const bool hasDraw = lastDrawTime.isValid();
-        if( playback_fps_meter::fpsMeterShouldReset( ui->actionPlay->isChecked(), hasDraw,
+        // INFO-2 r2 (pass 1 A2): the interval now reads presentation stamps, so a wrap between two of them is stalled even when
+        // the tick clock's own age is positive (presentationAgeWrapped).
+        if( presentationAgeWrapped
+         || playback_fps_meter::fpsMeterShouldReset( ui->actionPlay->isChecked(), hasDraw,
                                                      hasDraw ? lastDrawTime.msecsTo( now ) : 0 ) )
         {
             const QString playbackFpsText = playback_conform::playbackFpsStatusText(
@@ -2988,6 +2991,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
             m_playbackInfoFpsShown = 0.0;
             m_lastPlaybackFpsStatusUpdateTime = QTime();
             lastDrawTime = QTime();
+            m_playbackFpsMeterPrevPresentedStamp = QTime();   // INFO-2 r2 (pass 1 A2): a restart has no previous presentation
             // LOOK-LABEL-PLAYBACK-INFO-1: once per reset of a measured rate (this branch runs every idle tick).
             if( fpsWasMeasured && m_lookLabelFullscreenShown && m_playbackInfoToggles.fps )
             {
@@ -3134,16 +3138,28 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
         const bool presentedSinceMeterStep = m_playbackPresentedFrameCount != m_playbackFpsMeterSeenPresentedCount;
         if( playback_fps_meter::drawFeedsMeter( presentedSinceMeterStep ) )
         {
+        // INFO-2 r2 (adversary pass 1 A2): the interval is between successful PRESENTATIONS, measured on the stamps
+        // recordPresentedFrame took at each handoff (the QTime clock type is unchanged: PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1
+        // owns that change), never on the tick that happens to observe them. Frames presented since the last step share the span.
+        const int presentedFramesSinceStep = static_cast<int>(
+            qMin<quint64>( m_playbackPresentedFrameCount - m_playbackFpsMeterSeenPresentedCount, 1000000 ) );
+        const QTime presentedStamp = m_playbackFpsMeterPresentedStamp;
+        const bool hasPreviousPresentation = m_playbackFpsMeterPrevPresentedStamp.isValid() && presentedStamp.isValid();
         m_playbackFpsMeterSeenPresentedCount = m_playbackPresentedFrameCount;
         const bool firstDrawOfPlay = m_playbackFpsMeterNewPlay;
         m_playbackFpsMeterNewPlay = false;
         if( firstDrawOfPlay ) m_playbackFpsEmaFrameMs = 0.0;
         const int measuredFrameMs = playback_fps_meter::meterIntervalMs(
-            firstDrawOfPlay, lastDrawTime.isValid(), lastDrawTime.isValid() ? lastDrawTime.msecsTo( nowTime ) : 0 );
+            firstDrawOfPlay, hasPreviousPresentation,
+            hasPreviousPresentation
+                ? playback_fps_meter::presentedIntervalMs( m_playbackFpsMeterPrevPresentedStamp.msecsTo( presentedStamp ),
+                                                           presentedFramesSinceStep )
+                : 0 );
         // r21 (adversary pass 20 A4): a negative age (the wall clock wrapped or stepped back) is stalled: the smoothing clears the
         // average, and the rate the corner still shows is withdrawn with it, never republished from the timeline before the wrap.
-        if( measuredFrameMs < 0 ) resetFpsMeterIfIdle( nowTime );   // fpsMeterShouldReset reads the same negative age as stalled: the one reset
-        lastDrawTime = nowTime;
+        if( measuredFrameMs < 0 ) resetFpsMeterIfIdle( nowTime, true );   // the one reset (a wrapped presentation age is stalled, as fpsMeterStalled reads it)
+        lastDrawTime = nowTime;   // the stall clock (a draw happened); the interval above reads the presentation stamps
+        m_playbackFpsMeterPrevPresentedStamp = presentedStamp;
         m_playbackFramesStalled = false;   // LOOK-LABEL-PLAYBACK-INFO-1 r3: a frame was drawn, so the next one carries the label
         if( timeDiff != 0 )
         {
@@ -7727,6 +7743,7 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
         m_playbackPresentationGeneration.load( std::memory_order_acquire );
     requestContext.zoomFitEnabled = zoomFitEnabled;
     requestContext.debayerName = m_pChosenDebayer ? m_pChosenDebayer->text() : QString();   // r21 (pass 20 A2): what produces this frame
+    requestContext.dualIsoOn = playbackInfoLiveDualIsoOn();   // INFO-2 r2 (pass 1 A5): whether Dual-ISO is applied to this frame
     requestContext.renderThreadUsing16BitPreview = m_renderThreadUsing16BitPreview;
     requestContext.renderThreadUsingGpuPreviewProcessing = m_renderThreadUsingGpuPreviewProcessing;
     requestContext.renderThreadUsingGpuBilinearDebayer = m_renderThreadUsingGpuBilinearDebayer;
@@ -8725,6 +8742,10 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
                      it != stageTimingTelemetry.constEnd();
                      ++it )
                 {
+                    // INFO-2 r2 (adversary pass 1 A3): the presenter's own GPU debayer flags (inserted above from the recorded
+                    // presented frame, which the label reads) are not overwritten by the worker's telemetry of the same name.
+                    if( it.key() == QStringLiteral("gpu_bilinear_debayer_active")
+                     || it.key() == QStringLiteral("gpu_amaze_debayer_active") ) continue;
                     sample.insert( it.key(), it.value() );
                 }
             }
@@ -21163,6 +21184,15 @@ void MainWindow::applyPlaybackConformSettings( bool persist )
         resetPlaybackQualityAutoRunState();
     }
     refreshPlaybackFpsStatus();
+    // INFO-2 r2 (adversary pass 1 A8): the corner label shows the effective conform rate "(60->24)" and relabels when it changes,
+    // independently of any fps measurement (a stalled meter leaves the label clean otherwise): the rate is in the relabel key.
+    if( m_fileLoaded && m_pMlvObject )
+    {
+        GpuPlaybackPipelineStatus infoStatus = GpuPlaybackPipelineStatus::Cpu;
+        bool infoScopeCaveat = false;
+        presentedGpuPlaybackPipelineStatus( infoStatus, infoScopeCaveat );
+        refreshPlaybackInfoOnInputChange( infoStatus, m_playbackInfoInputs.scopeCaveat );
+    }
     if( playbackConformActive() && ui->actionAudioOutput->isChecked()
      && m_pMlvObject && doesMlvHaveAudio( m_pMlvObject ) )
     {
@@ -25034,6 +25064,8 @@ void MainWindow::refreshPlaybackInfoOnInputChange( GpuPlaybackPipelineStatus sta
     inputs.presentedRoute = presentedPlaybackRouteCode();   // r12 adversary A1: a proxy route change relabels
     inputs.debayerScale = presentedPlaybackDebayerScale();   // r13 adversary pass 15 A1: so does the prep frame's debayer scale
     inputs.debayer = playbackInfoDebayerName();   // INFO-2 r1 (pass 21 A1): the shown name, so a debayer change relabels
+    inputs.dualIsoOn = playbackInfoDualIsoOn();   // INFO-2 r2 (pass 1 A5): the displayed image's Dual-ISO state, so the replacement frame relabels
+    inputs.playbackRate = m_pMlvObject ? getPlaybackFramerate() : 0.0;   // INFO-2 r2 (pass 1 A8): the conform rate the fps field shows
     if( inputs == m_playbackInfoInputs ) return;
     m_playbackInfoInputs = inputs;
     // r1 pass-3 A2: while playing, flushPlaybackInfoIfDue's 250 ms gate relabels, so a per-frame flip stays at most 4 Hz.
@@ -34310,7 +34342,13 @@ void MainWindow::pushLookLabelOverlay( void )
     // Cleared by updatePlaybackInfoLabel after the push that carries the withdrawn text (a look-line push meanwhile repaints too),
     // or by the fps gate's next measured rate (r3: the rate is back, so there is nothing left to withdraw).
     // r3 pass-2 A1: and while frames are stalled (the meter's reset after a draw, until the next draw), since no frame will come.
-    const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn || m_playbackFramesStalled;
+    // INFO-2 r2 (pass 1 A7): and when no frame has been presented for a whole relabel gate (the first frame of a Play, or a stall
+    // with no earlier draw to arm the meter's stall), so the deferred text is visible within the gate plus one tick regardless.
+    const bool presentedClockValid = m_playbackPresentedClock.isValid();
+    const bool paintOverdue = playback_info_label::nextPaintOverdue( presentedClockValid,
+                                                                     presentedClockValid ? m_playbackPresentedClock.elapsed() : 0 );
+    const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn || m_playbackFramesStalled
+        || paintOverdue;
     GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, repaintNow );
     ui->graphicsView->setLookLabel( gpuWindow ? QString() : m_lookLabelOverlayText );
 }
@@ -34323,6 +34361,21 @@ QString MainWindow::playbackInfoDebayerName( void ) const
     return ( m_lastPresentedRequestContextValid && !m_lastPresentedRequestContext.debayerName.isEmpty() )
         ? m_lastPresentedRequestContext.debayerName
         : ( m_pChosenDebayer ? m_pChosenDebayer->text() : QString() );
+}
+
+// INFO-2 r2 (adversary pass 1 A5): r1 adversary A2's rule (with RAW corrections off llrawproc never runs, so the selected mode is
+// not applied), read from the live settings: what the NEXT frame will be requested with.
+bool MainWindow::playbackInfoLiveDualIsoOn( void ) const
+{
+    return m_pMlvObject && llrpGetFixRawMode( m_pMlvObject ) != 0 && llrpGetDualIsoMode( m_pMlvObject ) != 0;
+}
+
+// INFO-2 r2 (adversary pass 1 A5): the Dual-ISO state of the DISPLAYED image: the presented frame's own, recorded when it was
+// requested. Unchecking Raw Corrections over a paused, already reconstructed frame leaves the label at "on" until the
+// replacement frame is presented. No presented frame yet: the live settings, which are then what will produce it.
+bool MainWindow::playbackInfoDualIsoOn( void ) const
+{
+    return m_lastPresentedRequestContextValid ? m_lastPresentedRequestContext.dualIsoOn : playbackInfoLiveDualIsoOn();
 }
 
 playback_info_label::Facts MainWindow::playbackInfoFacts( void )
@@ -34375,7 +34428,8 @@ playback_info_label::Facts MainWindow::playbackInfoFacts( void )
     facts.dropFrame = ui->actionDropFrameMode->isChecked();
     facts.dualIsoClip = llrpGetDualIsoValidity( m_pMlvObject ) != DISO_INVALID;
     // r1 adversary A2: with RAW corrections off llrawproc never runs, so the selected mode is not applied.
-    facts.dualIsoOn = llrpGetFixRawMode( m_pMlvObject ) != 0 && llrpGetDualIsoMode( m_pMlvObject ) != 0;
+    // INFO-2 r2 (pass 1 A5): of the DISPLAYED image (the presented frame's own), never the live settings.
+    facts.dualIsoOn = playbackInfoDualIsoOn();
     facts.width = static_cast<int>( getMlvWidth( m_pMlvObject ) );
     facts.height = static_cast<int>( getMlvHeight( m_pMlvObject ) );
     return facts;
@@ -34513,7 +34567,7 @@ void MainWindow::setPlaybackInfoToggle( bool playback_info_label::Toggles::*fiel
 {
     if( m_playbackInfoToggles.*field == on ) return;
     m_playbackInfoToggles.*field = on;
-    playback_info_label::togglesWriteToSettings( m_playbackInfoToggles );
+    playback_info_label::toggleWriteToSettings( field, on );   // INFO-2 r2 (pass 1 A6): only this toggle's own choice
     updatePlaybackInfoLabel();
 }
 
@@ -35192,6 +35246,8 @@ void MainWindow::recordPresentedFrame( const RenderFrameThread::ReadyFrame &read
                                        const PresentationRequestContext &requestContext )
 {
     ++m_playbackPresentedFrameCount;   // r21 (adversary pass 20 A3): the fps meter advances only when this moved
+    m_playbackFpsMeterPresentedStamp = QTime::currentTime();   // INFO-2 r2 (pass 1 A2): the presentation time, taken at the handoff
+    m_playbackPresentedClock.start();                          // INFO-2 r2 (pass 1 A7): the monotonic twin, for "is the next paint overdue"
     m_lastPresentedRequestSerial = readyFrame.requestSerial;
     m_lastPresentedRequestContext = requestContext;
     m_lastPresentedRequestContextValid = true;

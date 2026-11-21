@@ -363,7 +363,7 @@ TEST(PlaybackInfoLabel, R1P3A1WithdrawalRepaintsAtOnce)
     // (R3P2A1StalledFramesPaintTheStoredLabel).
     ASSERT_TRUE(push.contains(QStringLiteral(
         "const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn"
-        " || m_playbackFramesStalled;")));
+        " || m_playbackFramesStalled\n        || paintOverdue;")));   // INFO-2 r2 (pass 1 A7): or no frame was presented for a whole relabel gate
     ASSERT_TRUE(push.contains(QStringLiteral("GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, repaintNow )")));
 }
 
@@ -467,7 +467,7 @@ TEST(PlaybackInfoLabel, R2P2A2OnlyAWithdrawalRepaintsWhilePlaying)
     // r3 pass-2 A1: a stall (no draw for > 500 ms after one) is no Play-from-paused start: the flag needs a draw first.
     ASSERT_TRUE(push.contains(QStringLiteral(
         "const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn"
-        " || m_playbackFramesStalled;")));
+        " || m_playbackFramesStalled\n        || paintOverdue;")));   // INFO-2 r2 (pass 1 A7): or no frame was presented for a whole relabel gate
     // The push never clears it (a look-line push while the info relabel waits must not eat the withdrawal); the info relabel
     // clears it after its own push, or on each early return past the gate (nothing to withdraw).
     ASSERT_FALSE(push.contains(QStringLiteral("m_playbackInfoRateWithdrawn = false;")));
@@ -603,7 +603,7 @@ TEST(PlaybackInfoLabel, R3P2A1StalledFramesPaintTheStoredLabel)
     const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay("));
     ASSERT_TRUE(push.contains(QStringLiteral(
         "const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn"
-        " || m_playbackFramesStalled;")));
+        " || m_playbackFramesStalled\n        || paintOverdue;")));   // INFO-2 r2 (pass 1 A7): or no frame was presented for a whole relabel gate
     const QString tick = functionBody(source, QStringLiteral("void MainWindow::timerFrameEvent("));
     const int enteredAt = tick.indexOf(QStringLiteral("const bool stallEntered = ui->actionPlay->isChecked() && hasDraw;"));
     const int setAt = tick.indexOf(QStringLiteral("if( stallEntered ) m_playbackFramesStalled = true;"));
@@ -672,8 +672,10 @@ TEST(PlaybackInfoLabel, R1A2DualIsoOnNeedsRawCorrections)
 {
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString facts = functionBody(source, QStringLiteral("playback_info_label::Facts MainWindow::playbackInfoFacts("));
-    ASSERT_TRUE(facts.contains(QStringLiteral(
-        "facts.dualIsoOn = llrpGetFixRawMode( m_pMlvObject ) != 0 && llrpGetDualIsoMode( m_pMlvObject ) != 0;")));
+    // INFO-2 r2 (pass 1 A5): the field reads the displayed image's own state (playbackInfoDualIsoOn); the r1 A2 rule moved to the live reader
+    ASSERT_TRUE(facts.contains(QStringLiteral("facts.dualIsoOn = playbackInfoDualIsoOn();")));
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "return m_pMlvObject && llrpGetFixRawMode( m_pMlvObject ) != 0 && llrpGetDualIsoMode( m_pMlvObject ) != 0;")));
     const QString rawFix = functionBody(source, QStringLiteral("void MainWindow::on_checkBoxRawFixEnable_clicked("));
     ASSERT_TRUE(rawFix.contains(QStringLiteral("updatePlaybackInfoLabel();")));
 }
@@ -1164,7 +1166,7 @@ TEST(PlaybackInfoLabel, R13P15A2APlayToggleClearsThePreviousPlaysStall)
     ASSERT_TRUE(relabelAt > clearAt);
     // the push reads the flag for its repaint decision, and only an in-Play stall after a draw sets it again
     const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay( void )"));
-    ASSERT_TRUE(push.contains(QStringLiteral("m_playbackFramesStalled;")));
+    ASSERT_TRUE(push.contains(QStringLiteral("m_playbackFramesStalled\n        || paintOverdue;")));   // INFO-2 r2 (pass 1 A7) added the overdue-paint term
     ASSERT_TRUE(source.contains(QStringLiteral("const bool stallEntered = ui->actionPlay->isChecked() && hasDraw;")));
     ASSERT_TRUE(source.contains(QStringLiteral("if( stallEntered ) m_playbackFramesStalled = true;")));
 }
@@ -1555,9 +1557,19 @@ TEST(PlaybackInfoLabel, R21G2TogglesFromSettingsReadsTheSixKeysWithDefaultTrueAn
         const bool fields[6] = { t.pipeline, t.scale, t.debayer, t.fps, t.dualIso, t.resolution };
         for ( int f = 0; f < 6; ++f ) ASSERT_EQ(f != k, fields[f]);
     }
-    // the write helper round-trips through the same keys
+    // the write helper round-trips through the same keys (INFO-2 r2 A6: one toggle at a time, each its own key)
     playback_info_label::Toggles written = togglesFromMask(0x2A);   // scale, fps, resolution on
-    playback_info_label::togglesWriteToSettings(written);
+    {
+        auto store = automation_settings::openAppSettings();
+        store->clear();
+        store->sync();
+    }
+    playback_info_label::toggleWriteToSettings(&playback_info_label::Toggles::pipeline, written.pipeline);
+    playback_info_label::toggleWriteToSettings(&playback_info_label::Toggles::scale, written.scale);
+    playback_info_label::toggleWriteToSettings(&playback_info_label::Toggles::debayer, written.debayer);
+    playback_info_label::toggleWriteToSettings(&playback_info_label::Toggles::fps, written.fps);
+    playback_info_label::toggleWriteToSettings(&playback_info_label::Toggles::dualIso, written.dualIso);
+    playback_info_label::toggleWriteToSettings(&playback_info_label::Toggles::resolution, written.resolution);
     const playback_info_label::Toggles read = playback_info_label::togglesFromSettings();
     ASSERT_TRUE(!read.pipeline && read.scale && !read.debayer && read.fps && !read.dualIso && read.resolution);
     automation_settings::releaseForTest();
@@ -1665,7 +1677,9 @@ TEST(PlaybackInfoLabel, R21A4ANegativeDrawAgeClearsThePreviousMeasuredRate)
     ASSERT_TRUE(clearAt >= 0);
     // the one reset (it zeroes the status text, the average and the shown rate, and withdraws the corner's rate), reached because
     // fpsMeterShouldReset reads a negative age as stalled (R7A1ANegativeOrWrappedDrawAgeCountsAsStalled)
-    ASSERT_TRUE(tick.mid(clearAt, 300).contains(QStringLiteral("resetFpsMeterIfIdle( nowTime );")));
+    // INFO-2 r2 (pass 1 A2): the interval reads presentation stamps, so a wrapped stamp age forces the reset itself (the tick clock's own age
+    // can be positive while two stamps straddle the wrap)
+    ASSERT_TRUE(tick.mid(clearAt, 300).contains(QStringLiteral("resetFpsMeterIfIdle( nowTime, true );")));
     ASSERT_TRUE(playback_fps_meter::fpsMeterShouldReset(true, true, midnightWrapMs));
 }
 
@@ -1741,4 +1755,205 @@ TEST(PlaybackInfoLabel, InfoTwoR1A5TheDebayerAttributionReadsThePresentedFramesS
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString facts = functionBody(source, QStringLiteral("playback_info_label::Facts MainWindow::playbackInfoFacts( void )"));
     ASSERT_TRUE(facts.contains(QStringLiteral("facts.presentedFrameScale = playback_info_label::presentedFrameScaleOf( m_lastPresentedRequestContextValid, activeScale );")));
+}
+
+// INFO-2 r2 (adversary pass 1 A2 on b056b902, introduced, major): a 24 fps clip, successful handoffs at 8 and 117 ms, observing
+// request ticks at 42 and 126 ms. The meter stamped the TICKS, so it read 126 - 42 = 84 ms = 11.9/24 instead of the 109 ms between
+// the two presentations = 9.2/24. The interval is measured on the stamps recordPresentedFrame takes at the handoff (QTime stays: the
+// clock type belongs to PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1). Frames presented between two steps share the span.
+TEST(PlaybackInfoLabel, InfoTwoR2A2TheMeterIntervalIsBetweenPresentationsNotBetweenTheObservingTicks)
+{
+    const int handoffA = 8, handoffB = 117, tickA = 42, tickB = 126;
+    const int between = playback_fps_meter::presentedIntervalMs(handoffB - handoffA, 1);
+    ASSERT_EQ(109, between);
+    ASSERT_QSTR_EQ(QStringLiteral("9.2"), QString::number(1000.0 / playback_fps_meter::smoothedFrameMs(0.0, between), 'f', 1));
+    ASSERT_QSTR_EQ(QStringLiteral("11.9"), QString::number(1000.0 / (tickB - tickA), 'f', 1));   // what the tick stamps said
+    // two handoffs inside one observed span are two frames of it, never one long frame; a non-positive span passes through
+    ASSERT_EQ(42, playback_fps_meter::presentedIntervalMs(84, 2));
+    ASSERT_EQ(33, playback_fps_meter::presentedIntervalMs(100, 3));
+    ASSERT_EQ(109, playback_fps_meter::presentedIntervalMs(109, 0));
+    ASSERT_EQ(0, playback_fps_meter::presentedIntervalMs(0, 4));
+    ASSERT_EQ(-86399958, playback_fps_meter::presentedIntervalMs(-86399958, 2));   // a wrap stays negative: stalled
+    // the wiring: the handoff takes the stamp, the meter step reads stamps, and the tick clock (QTime) is not swapped for another type
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString record = functionBody(source, QStringLiteral("void MainWindow::recordPresentedFrame("));
+    ASSERT_TRUE(record.contains(QStringLiteral("m_playbackFpsMeterPresentedStamp = QTime::currentTime();")));
+    const QString tick = functionBody(source, QStringLiteral("void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )"));
+    ASSERT_TRUE(tick.contains(QStringLiteral("const QTime presentedStamp = m_playbackFpsMeterPresentedStamp;")));
+    ASSERT_TRUE(tick.contains(QStringLiteral("m_playbackFpsMeterPrevPresentedStamp = presentedStamp;")));
+    ASSERT_TRUE(tick.contains(QStringLiteral("m_playbackFpsMeterPrevPresentedStamp = QTime();")));   // a restart forgets it
+    ASSERT_FALSE(tick.contains(QStringLiteral("QElapsedTimer")));
+    ASSERT_TRUE(tick.contains(QStringLiteral("static QTime lastDrawTime;")));
+    const QString header = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
+    ASSERT_TRUE(header.contains(QStringLiteral("QTime m_playbackFpsMeterPresentedStamp;")));
+    ASSERT_TRUE(header.contains(QStringLiteral("QTime m_playbackFpsMeterPrevPresentedStamp;")));
+    // the frames since the last step divide the span (the count the r21 gate already keeps)
+    ASSERT_TRUE(tick.contains(QStringLiteral(
+        "qMin<quint64>( m_playbackPresentedFrameCount - m_playbackFpsMeterSeenPresentedCount, 1000000 ) );")));
+}
+
+// INFO-2 r2 (adversary pass 1 A2, POLICY_MUTANT_SURVIVED on b056b902 platform/qt/MainWindow.cpp:3135): the whole presented-since-step
+// statement and its gate, so `!presentedSinceMeterStep` (a meter that steps only on a request that presented NOTHING) fails here.
+TEST(PlaybackInfoLabel, InfoTwoR2PolicyCallSitePinTheMeterGateKeepsItsFullArgument)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "const bool presentedSinceMeterStep = m_playbackPresentedFrameCount != m_playbackFpsMeterSeenPresentedCount;\n"
+        "        if( playback_fps_meter::drawFeedsMeter( presentedSinceMeterStep ) )")));
+}
+
+// INFO-2 r2 (POLICY_MUTANT_SURVIVED on b056b902 platform/qt/MainWindow.cpp:34428 and :34429): the two telemetry flags of
+// presentedPlaybackUnreducedCpuDebayerScale, pinned with the whole argument list. An inverted flag reads a frame the CPU debayered at
+// scale 1 as a GPU-recon frame (and the other way round), so the label names the wrong scale.
+TEST(PlaybackInfoLabel, InfoTwoR2PolicyCallSitePinUnreducedCpuDebayerScaleKeepsItsFullArgumentList)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "return playback_info_label::unreducedCpuDebayerScale(\n"
+        "        telemetryBoolValue( telemetry, \"processed16_stage_measured\" ),\n"
+        "        telemetryBoolValue( telemetry, \"gpu_playback_recon_texture_present_active\" ),")));
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "        telemetryIntValue( telemetry, \"render_thread_source_width\" ),\n"
+        "        telemetryIntValue( telemetry, \"render_thread_rendered_width\" ) );")));
+}
+
+// INFO-2 r2 (adversary pass 1 A3 on b056b902, introduced, major): HQ Dual-ISO, GPU recon and texture present enabled, AMaZE selected,
+// the AMaZE DLL missing, a successful R16 bilinear present. r20 made the presenter record gpu_bilinear_debayer_active = true (and the
+// AMaZE sibling), and the headless sample's worker-telemetry loop then overwrote the key with the worker's own false next to the
+// shader description. The loop skips both keys.
+TEST(PlaybackInfoLabel, InfoTwoR2A3TheHeadlessSampleKeepsThePresentersGpuDebayerFlags)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int recordedAt = source.indexOf(QStringLiteral("sample.insert( QStringLiteral(\"gpu_bilinear_debayer_active\"),\n"
+                                                         "                           m_lastPresentedFrameUsedGpuBilinearDebayer );"));
+    ASSERT_TRUE(recordedAt >= 0);
+    const int amazeAt = source.indexOf(QStringLiteral("sample.insert( QStringLiteral(\"gpu_amaze_debayer_active\"),\n"
+                                                      "                           m_lastPresentedFrameUsedGpuAmazeDebayer );"), recordedAt);
+    ASSERT_TRUE(amazeAt > recordedAt);
+    const int loopAt = source.indexOf(QStringLiteral("for( auto it = stageTimingTelemetry.constBegin();"), amazeAt);
+    ASSERT_TRUE(loopAt > amazeAt);
+    const int loopEnd = source.indexOf(QStringLiteral("const QJsonObject frameColorTelemetry"), loopAt);
+    ASSERT_TRUE(loopEnd > loopAt);
+    const QString loop = source.mid(loopAt, loopEnd - loopAt);
+    ASSERT_TRUE(loop.contains(QStringLiteral(
+        "if( it.key() == QStringLiteral(\"gpu_bilinear_debayer_active\")\n"
+        "                     || it.key() == QStringLiteral(\"gpu_amaze_debayer_active\") ) continue;")));
+    ASSERT_TRUE(loop.indexOf(QStringLiteral("continue;")) < loop.indexOf(QStringLiteral("sample.insert( it.key(), it.value() );")));
+}
+
+// INFO-2 r2 (adversary pass 1 A5 on b056b902, introduced, major): pause on a valid HQ Dual-ISO frame with Raw Corrections on, then
+// uncheck Raw Corrections before its replacement frame lands. The field read the live settings, so the label said "Dual-ISO off" over
+// the already reconstructed frame. The field reads the presented frame's own state, recorded when it was requested, and the relabel
+// key carries it so the replacement frame relabels.
+TEST(PlaybackInfoLabel, InfoTwoR2A5TheDualIsoFieldDescribesTheDisplayedImageNotTheLiveSettings)
+{
+    // the label: the field is exactly the facts' state
+    playback_info_label::Facts shown = ownerFacts();
+    shown.dualIsoClip = true;
+    shown.dualIsoOn = true;
+    ASSERT_QSTR_EQ(QStringLiteral("Dual-ISO on"), playback_info_label::dualIsoField(shown));
+    const QString header = readRepoFile(QStringLiteral("platform/qt/RenderFrameThread.h"));
+    ASSERT_TRUE(header.contains(QStringLiteral("bool dualIsoOn = false;")));
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString draw = functionBody(source, QStringLiteral("void MainWindow::drawFrame( bool updateTimecodeLabel )"));
+    ASSERT_TRUE(draw.contains(QStringLiteral("requestContext.dualIsoOn = playbackInfoLiveDualIsoOn();")));
+    const QString facts = functionBody(source, QStringLiteral("playback_info_label::Facts MainWindow::playbackInfoFacts( void )"));
+    ASSERT_TRUE(facts.contains(QStringLiteral("facts.dualIsoOn = playbackInfoDualIsoOn();")));
+    ASSERT_FALSE(facts.contains(QStringLiteral("llrpGetFixRawMode")));   // no live read in the facts
+    const QString reader = functionBody(source, QStringLiteral("bool MainWindow::playbackInfoDualIsoOn( void ) const"));
+    ASSERT_TRUE(reader.contains(QStringLiteral(
+        "return m_lastPresentedRequestContextValid ? m_lastPresentedRequestContext.dualIsoOn : playbackInfoLiveDualIsoOn();")));
+    const QString key = functionBody(source, QStringLiteral("void MainWindow::refreshPlaybackInfoOnInputChange("));
+    ASSERT_TRUE(key.contains(QStringLiteral("inputs.dualIsoOn = playbackInfoDualIsoOn();")));
+    const QString mainHeader = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
+    ASSERT_TRUE(mainHeader.contains(QStringLiteral("&& dualIsoOn == o.dualIsoOn")));
+    // the class: no other label reader takes the Dual-ISO state from the live settings
+    const QString info = functionBody(source, QStringLiteral("void MainWindow::updatePlaybackInfoLabel("));
+    ASSERT_FALSE(info.contains(QStringLiteral("playbackInfoLiveDualIsoOn")));
+}
+
+// INFO-2 r2 (adversary pass 1 A6 on b056b902, introduced, major): two interactive instances load all toggles enabled; A saves FPS off,
+// then B saves Dual-ISO off from its existing view. B wrote its whole stale struct, FPS=true included, so the next launch lost A's
+// choice. Each toggle persists only its own key.
+TEST(PlaybackInfoLabel, InfoTwoR2A6EachToggleWritesOnlyItsOwnSettingsKey)
+{
+    const QString dir = QDir::tempPath() + QStringLiteral("/mlvapp-info2r2a6-") + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    ASSERT_FALSE(automation_settings::isolate(dir).isEmpty());
+    // instance B loaded all six on (its in-memory copy), then A saved FPS off, then B saves Dual-ISO off
+    const playback_info_label::Toggles instanceB = togglesFromMask(0x3F);
+    ASSERT_TRUE(instanceB.fps);
+    playback_info_label::toggleWriteToSettings(&playback_info_label::Toggles::fps, false);           // instance A
+    playback_info_label::toggleWriteToSettings(&playback_info_label::Toggles::dualIso, false);       // instance B
+    const playback_info_label::Toggles next = playback_info_label::togglesFromSettings();
+    ASSERT_FALSE(next.fps);        // A's choice survives B's save
+    ASSERT_FALSE(next.dualIso);
+    ASSERT_TRUE(next.pipeline && next.scale && next.debayer && next.resolution);
+    // each member maps to its own key, and a non-toggle member to none
+    ASSERT_QSTR_EQ(QString::fromLatin1(playback_info_label::Settings::kKeyShowResolution()),
+                   QString::fromLatin1(playback_info_label::toggleSettingsKey(&playback_info_label::Toggles::resolution)));
+    ASSERT_QSTR_EQ(QString::fromLatin1(playback_info_label::Settings::kKeyShowPipeline()),
+                   QString::fromLatin1(playback_info_label::toggleSettingsKey(&playback_info_label::Toggles::pipeline)));
+    automation_settings::releaseForTest();
+    QDir(dir).removeRecursively();
+    // the wiring: the toggle handler writes its own choice, never the whole struct
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString handler = functionBody(source, QStringLiteral("void MainWindow::setPlaybackInfoToggle("));
+    ASSERT_TRUE(handler.contains(QStringLiteral("playback_info_label::toggleWriteToSettings( field, on );")));
+    ASSERT_FALSE(handler.contains(QStringLiteral("togglesWriteToSettings")));
+    const QString policy = readRepoFile(QStringLiteral("platform/qt/PlaybackInfoLabelPolicy.h"));
+    ASSERT_FALSE(policy.contains(QStringLiteral("inline void togglesWriteToSettings(")));
+}
+
+// INFO-2 r2 (adversary pass 1 A7 on b056b902, introduced, major): fullscreen GPU window, a paused idle tick, the first Play frame
+// takes 900 ms, Resolution is disabled at 100 ms. The 250 ms relabel only stored the text for the next paint; the stall rule needs an
+// earlier draw, so the old text stayed on screen until the first new paint. When no frame has been presented for a whole relabel gate
+// the relabel repaints at once.
+TEST(PlaybackInfoLabel, InfoTwoR2A7ADeferredPlayingRelabelIsVisibleWithinTheGatePlusATickWhenNoFrameArrives)
+{
+    ASSERT_TRUE(playback_info_label::nextPaintOverdue(false, 0));       // no presented frame yet (the first Play frame is pending)
+    ASSERT_TRUE(playback_info_label::nextPaintOverdue(true, 250));      // a whole gate without a presentation
+    ASSERT_TRUE(playback_info_label::nextPaintOverdue(true, 900));
+    ASSERT_FALSE(playback_info_label::nextPaintOverdue(true, 249));     // frames arriving: their paint carries the text, no extra paint
+    ASSERT_FALSE(playback_info_label::nextPaintOverdue(true, 42));
+    // the scenario's relabel: due at the first tick at or after 250 ms from the last one, with the frame still 900 ms away
+    ASSERT_TRUE(playback_info_label::deferredRelabelDue(true, true, 250));
+    ASSERT_TRUE(playback_info_label::nextPaintOverdue(true, 250 + 8));
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay("));
+    ASSERT_TRUE(push.contains(QStringLiteral(
+        "const bool paintOverdue = playback_info_label::nextPaintOverdue( presentedClockValid,\n"
+        "                                                                     presentedClockValid ? m_playbackPresentedClock.elapsed() : 0 );")));
+    ASSERT_TRUE(push.contains(QStringLiteral("const bool presentedClockValid = m_playbackPresentedClock.isValid();")));
+    const QString record = functionBody(source, QStringLiteral("void MainWindow::recordPresentedFrame("));
+    ASSERT_TRUE(record.contains(QStringLiteral("m_playbackPresentedClock.start();")));
+    const QString header = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
+    ASSERT_TRUE(header.contains(QStringLiteral("QElapsedTimer m_playbackPresentedClock;")));
+}
+
+// INFO-2 r2 (adversary pass 1 A8 on b056b902, introduced, major): a 60 fps clip conformed to 24, stalled at "--/60 fps (60->24)";
+// 30 is selected with no conform override and no further presentation. The status meter refreshed but the corner stayed at 60->24
+// because the relabel key never saw the conform rate. The rate is in the key and the conform funnel asks for the relabel, whatever
+// the measured fps does.
+TEST(PlaybackInfoLabel, InfoTwoR2A8TheCornerRelabelsOnAConformRateChangeIndependentlyOfMeasuredFps)
+{
+    playback_info_label::Facts f = ownerFacts();
+    f.clipFps = 60.0;
+    f.playing = true;
+    f.achievedFps = 0.0;   // stalled: "--"
+    f.playbackRate = 24.0;
+    ASSERT_QSTR_EQ(QStringLiteral("--/60 fps (60->24)"), playback_info_label::fpsField(f));
+    f.playbackRate = 30.0;
+    ASSERT_QSTR_EQ(QStringLiteral("--/60 fps (60->30)"), playback_info_label::fpsField(f));
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString key = functionBody(source, QStringLiteral("void MainWindow::refreshPlaybackInfoOnInputChange("));
+    ASSERT_TRUE(key.contains(QStringLiteral("inputs.playbackRate = m_pMlvObject ? getPlaybackFramerate() : 0.0;")));
+    const QString header = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
+    ASSERT_TRUE(header.contains(QStringLiteral("&& playbackRate == o.playbackRate")));
+    const QString apply = functionBody(source, QStringLiteral("void MainWindow::applyPlaybackConformSettings( bool persist )"));
+    const int statusAt = apply.indexOf(QStringLiteral("refreshPlaybackFpsStatus();"));
+    ASSERT_TRUE(statusAt >= 0);
+    const int relabelAt = apply.indexOf(QStringLiteral("refreshPlaybackInfoOnInputChange( infoStatus, m_playbackInfoInputs.scopeCaveat );"), statusAt);
+    ASSERT_TRUE(relabelAt > statusAt);
+    // nothing in the relabel reads a measured rate (the key is the conform rate, not the achieved fps)
+    ASSERT_FALSE(key.contains(QStringLiteral("m_playbackInfoFpsShown")));
 }

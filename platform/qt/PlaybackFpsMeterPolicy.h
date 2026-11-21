@@ -79,6 +79,17 @@ inline bool drawFeedsMeter( bool presentedSinceLastMeterStep )
     return presentedSinceLastMeterStep;
 }
 
+/*! INFO-2 r2 (adversary pass 1 A2): the per-frame interval between two PRESENTATIONS. msBetweenStamps is the time between the
+ *  presentation stamp the meter last stepped on and the latest one (both taken when recordPresentedFrame ran, never at the
+ *  observing tick); framesPresented is how many frames were presented between them, so two handoffs inside one tick are two
+ *  frames of one span, never one long frame. A non-positive span (same millisecond, or a wrapped wall clock the caller reads as
+ *  stalled) passes through unchanged. Example: handoffs at 8 and 117 ms, one frame -> 109 ms (9.2 fps at 24). */
+inline int presentedIntervalMs( int msBetweenStamps, int framesPresented )
+{
+    if( msBetweenStamps <= 0 || framesPresented <= 1 ) return msBetweenStamps;
+    return ( msBetweenStamps + framesPresented / 2 ) / framesPresented;
+}
+
 } // namespace playback_fps_meter
 
 #endif // PLAYBACKFPSMETERPOLICY_H

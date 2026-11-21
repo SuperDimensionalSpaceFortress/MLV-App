@@ -46,19 +46,25 @@ TEST(PlaybackFpsMeterWiring, FpsMeterMeasuresDrawToDrawAndIdleTicksDoNotRestartI
     ASSERT_FALSE(body.isEmpty());
     ASSERT_TRUE(body.contains(QStringLiteral("static QTime lastDrawTime;")));
     // LOOK-LABEL-PLAYBACK-INFO-1 r12 (adversary pass 13 A2): the draw-to-draw interval, none for a new Play's first draw
+    // INFO-2 r2 (adversary pass 1 A2): between successful PRESENTATIONS (the stamps recordPresentedFrame took at each handoff),
+    // never between the ticks that observe them; lastDrawTime stays the stall clock
     ASSERT_TRUE(body.contains(QStringLiteral(
         "const int measuredFrameMs = playback_fps_meter::meterIntervalMs(\n"
-        "            firstDrawOfPlay, lastDrawTime.isValid(), lastDrawTime.isValid() ? lastDrawTime.msecsTo( nowTime ) : 0 );")));
+        "            firstDrawOfPlay, hasPreviousPresentation,\n"
+        "            hasPreviousPresentation\n"
+        "                ? playback_fps_meter::presentedIntervalMs( m_playbackFpsMeterPrevPresentedStamp.msecsTo( presentedStamp ),\n"
+        "                                                           presentedFramesSinceStep )\n"
+        "                : 0 );")));
     ASSERT_TRUE(body.contains(QStringLiteral("playback_fps_meter::smoothedFrameMs(")));
     // the old measurement off the idle-re-armed lastTime is gone
     ASSERT_FALSE(body.contains(QStringLiteral("const int measuredFrameMs = lastTime.msecsTo( nowTime );")));
     // the reset policy lives in one pure function, called with the real play state and draw age
     // (exact text: a `true ||` or dropped operand cannot slip through)
-    const int lambdaAt = body.indexOf(QStringLiteral("const auto resetFpsMeterIfIdle = [this]( const QTime & now )"));
+    const int lambdaAt = body.indexOf(QStringLiteral("const auto resetFpsMeterIfIdle = [this]( const QTime & now, bool presentationAgeWrapped = false )"));
     ASSERT_TRUE(lambdaAt >= 0);
     const QString lambda = body.mid(lambdaAt);
     const int policyAt = lambda.indexOf(QStringLiteral(
-        "playback_fps_meter::fpsMeterShouldReset( ui->actionPlay->isChecked(), hasDraw,\n"
+        "|| playback_fps_meter::fpsMeterShouldReset( ui->actionPlay->isChecked(), hasDraw,\n"
         "                                                     hasDraw ? lastDrawTime.msecsTo( now ) : 0 )"));
     const int zeroAt = lambda.indexOf(QStringLiteral("m_playbackFpsEmaFrameMs = 0.0;"));
     ASSERT_TRUE(policyAt >= 0);

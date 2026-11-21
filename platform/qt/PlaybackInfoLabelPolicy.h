@@ -234,6 +234,16 @@ inline bool playingRelabelDeferred( bool playing, bool clockValid, qint64 elapse
     return playing && clockValid && elapsedMs < kDeferredRelabelMs;
 }
 
+/*! \brief INFO-2 r2 (adversary pass 1 A7): while playing, a relabel normally only STORES its text for the next frame's paint (the
+ *  label adds no paint of its own to playback). When no frame has been presented for a whole relabel gate (the first frame of a
+ *  Play that takes 900 ms, or any stall, with or without an earlier draw), no paint is coming: the relabel repaints at once, so a
+ *  deferred change is visible within the gate plus one tick whether or not frames arrive. `clockValid` / `msSincePresented` = a
+ *  monotonic clock (QElapsedTimer) restarted by every presented frame; no presented frame yet is overdue. */
+inline bool nextPaintOverdue( bool clockValid, qint64 msSincePresented )
+{
+    return !clockValid || msSincePresented >= kDeferredRelabelMs;
+}
+
 /*! \brief r3 adversary A1 (9c9941cd): does the presented frame's active scale belong to the requested scale? It compares the
  *  presented request's POLICY scale (what the setting or Auto asked for), never its effective scale: the GPU texture route clamps
  *  an x8 request to 1, and comparing that 1 with the asked 8 hid "Eighth->Full". `activeScale` must be 1, 2, 4 or 8. */
@@ -354,15 +364,27 @@ inline Toggles togglesFromSettings()
     return toggles;
 }
 
-inline void togglesWriteToSettings( const Toggles &toggles )
+/*! \brief INFO-2 r2 (adversary pass 1 A6): the settings key of one toggle (nullptr for a member that is not a toggle). */
+inline const char *toggleSettingsKey( bool Toggles::*field )
 {
+    if( field == &Toggles::pipeline ) return Settings::kKeyShowPipeline();
+    if( field == &Toggles::scale ) return Settings::kKeyShowScale();
+    if( field == &Toggles::debayer ) return Settings::kKeyShowDebayer();
+    if( field == &Toggles::fps ) return Settings::kKeyShowFps();
+    if( field == &Toggles::dualIso ) return Settings::kKeyShowDualIso();
+    if( field == &Toggles::resolution ) return Settings::kKeyShowResolution();
+    return nullptr;
+}
+
+/*! \brief INFO-2 r2 (adversary pass 1 A6): persists ONLY the one toggle's own choice. The whole-struct write this replaces stored
+ *  every other field from the writer's in-memory copy, so a second instance that loaded before the first one saved wrote the
+ *  first's field back at its stale value and the next launch lost the choice. */
+inline void toggleWriteToSettings( bool Toggles::*field, bool on )
+{
+    const char *key = toggleSettingsKey( field );
+    if( !key ) return;
     auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
-    set.setValue( Settings::kKeyShowPipeline(), toggles.pipeline );
-    set.setValue( Settings::kKeyShowScale(), toggles.scale );
-    set.setValue( Settings::kKeyShowDebayer(), toggles.debayer );
-    set.setValue( Settings::kKeyShowFps(), toggles.fps );
-    set.setValue( Settings::kKeyShowDualIso(), toggles.dualIso );
-    set.setValue( Settings::kKeyShowResolution(), toggles.resolution );
+    set.setValue( key, on );
 }
 
 } // namespace playback_info_label

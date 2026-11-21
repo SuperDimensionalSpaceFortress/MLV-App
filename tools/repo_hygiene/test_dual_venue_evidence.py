@@ -6153,6 +6153,46 @@ class LookLabelEvidenceTests(unittest.TestCase):
         self.assertTrue(v["lookLabelShown"])
         self.assertNotIn("\x1a", json.dumps(v, ensure_ascii=False))
 
+    # INFO-2 r2 (adversary pass 1 A4 and A10 on b056b902): the look-label readers take only a record that STARTS as one, and a quoted value
+    # comes back exactly as logged.
+    def test_info2_r2_a4_a_label_marker_inside_another_record_is_not_a_label_record(self) -> None:
+        # the pass-1 A4 input: a real playing record (samples=88), then an interaction capture whose payload spells the marker
+        fake = ('interaction_trace event=capture capture=gui_smoke.look_label_playing shown="Look: Fake" info_shown="Wrong"'
+                ' surface=fullscreen_gpu_window samples=4')
+        v = self.evidence(self.PLAYING + "\n" + fake + "\n")
+        self.assertEqual(v["playing"], {"shownText": "Look: Cinematic", "infoShownText": "GPU display - Full / 23.9/24 fps",
+                                        "surface": "fullscreen_gpu_window", "samples": 88})
+        # the same, unquoted and on the same line as another record's own fields, for BOTH recognizers (the stopped one shares the defect)
+        for fake_line in ('note=x capture=' + self.PLAYING.replace("Cinematic", "Fake").replace("samples=88", "samples=4"),
+                          'capture=' + self.line("Look: Fake", "Look: Fake", "fullscreen_gpu_window"),
+                          'playback_smoke.summary session=3 ' + self.line("Look: Fake", "Look: Fake", "windowed_status_bar")):
+            v = self.evidence(self.PLAYING + "\n" + self.line("Look: Cinematic", "Look: Cinematic", "fullscreen_gpu_window") + "\n" + fake_line + "\n")
+            self.assertEqual(v["playing"]["samples"], 88, fake_line)
+            self.assertEqual((v["lookLabelShown"], v["shownText"], v["surface"]), (True, "Look: Cinematic", "fullscreen_gpu_window"), fake_line)
+        # a log whose ONLY label text sits inside another record has no label record at all
+        v = self.evidence(fake + "\n")
+        self.assertEqual((v["lookLabelShown"], v["source"], v["playing"]), (False, "absent from the run log", None))
+
+    def test_info2_r2_a4_the_apps_own_prefixes_still_start_a_record(self) -> None:
+        for prefix in ("", "[INFO] ", "[2026-11-21 10:00:00] [INFO] ", "[INFO] interaction_trace event=", "interaction_trace event="):
+            v = self.evidence(prefix + self.PLAYING + "\n")
+            self.assertEqual(v["playing"]["samples"], 88, prefix)
+            v = self.evidence(prefix + self.line("Look: Cinematic", "Look: Cinematic", "fullscreen_gpu_window") + "\n")
+            self.assertTrue(v["lookLabelShown"], prefix)
+
+    def test_info2_r2_a10_a_literal_u001a_in_a_quoted_value_is_returned_as_logged(self) -> None:
+        # the pass-1 A10 input: a valid playing record with a literal U+001A between A and B in info_shown (the reader returned A=B)
+        playing = ('gui_smoke.look_label_playing shown="Look: A\x1aB" info_shown="A\x1aB" surface=fullscreen_gpu_window samples=7')
+        v = self.evidence(playing + "\n")
+        self.assertEqual((v["playing"]["shownText"], v["playing"]["infoShownText"]), ("Look: A\x1aB", "A\x1aB"))
+        # next to a real `=` (which the mask does hide): the `=` comes back, the U+001A stays itself
+        line = (self.line("Look: A\x1aB=C", "Look: A\x1aB=C", "fullscreen_gpu_window")
+                + ' info_shown="x\x1ay=z" info_expected="x\x1ay=z" info_fields=scale')
+        v = self.evidence(line + "\n")
+        self.assertEqual((v["shownText"], v["expectedText"], v["infoShownText"], v["infoExpectedText"]),
+                         ("Look: A\x1aB=C", "Look: A\x1aB=C", "x\x1ay=z", "x\x1ay=z"))
+        self.assertTrue(v["lookLabelShown"])
+
 
 @requires_windows_pwsh
 class LookAssistEvidenceTests(unittest.TestCase):

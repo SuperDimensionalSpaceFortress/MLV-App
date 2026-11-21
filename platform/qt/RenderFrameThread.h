@@ -177,6 +177,10 @@ public:
             /* LOOK-LABEL-PLAYBACK-INFO-1 r21 (adversary pass 20 A2): the debayer menu text in force when this frame was REQUESTED.
              * The debayer field of the playback info reads the presented frame's own, never the live selection. */
             QString debayerName;
+            /* INFO-2 r2 (adversary pass 1 A5): whether Dual-ISO reconstruction was applied (Raw Corrections on and a Dual-ISO mode
+             * selected) when this frame was REQUESTED. The Dual-ISO field of the playback info describes the displayed image, so
+             * it reads the presented frame's own, never the live settings. */
+            bool dualIsoOn = false;
             MainWindowGpuPreviewPolicyState gpuPreviewPolicy;
             GpuDisplayViewport::PresentationOptions gpuPresentationOptions;
             GpuPreviewProcessingConfig gpuPreviewProcessingConfig;
