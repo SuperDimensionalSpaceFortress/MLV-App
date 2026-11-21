@@ -1984,6 +1984,59 @@ Wait-Job $job | Out-Null; Remove-Job $job -Force
         self.assertFalse(r["read"], f"a lock attempt started after the budget ended and went on to read the ticket: {r}")
         self.assertEqual(r["result"], "BUSY", r)
 
+    # ---- r9: the adversary pass on de591425 (the fix iteration: A4, A5) ----
+
+    def test_r9_a4_a_phase_with_a_character_the_culture_compare_ignores_is_refused_not_stored(self) -> None:
+        # r9 A4: [ValidateSet('waiting', 'cooldown')] compares with the current culture and ignores U+00AD / U+200D, so 'wait<U+00AD>ing' bound and was stored with the extra character: a ticket no ordinal reader
+        # knows as ready, so a younger waiter overtook it. Both writers (New-VenueTicket, Update-VenueTicket) refuse it; the canonical spelling and a different case still store the canonical lower-case word.
+        r = self.ps("""
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d -Phase cooldown -StaleAfterSec 600
+$cases = [ordered]@{ softhyphen = ('wait' + [char]0x00AD + 'ing'); zwj = ('wait' + [char]0x200D + 'ing'); upper = 'WAITING'; mixed = 'Cooldown' }
+$out = [ordered]@{}
+foreach ($k in $cases.Keys) {
+  $made = $null; $refused = $false
+  try { $made = New-VenueTicket -Venue bachelor -RunDir ('run-' + $k) -ClaimDir $d -Phase $cases[$k] } catch { $refused = $true }
+  $stored = $null; if ($made) { $stored = [string](Get-Content -LiteralPath $made.path -Raw | ConvertFrom-Json).phase }
+  $out["new_$k"] = [pscustomobject]@{ refused = $refused; stored = $stored }
+}
+$upd = $false; try { $null = Update-VenueTicket -Ticket $A -Phase ('cool' + [char]0x00AD + 'down') } catch { $upd = $true }
+$out['update_refused'] = $upd
+$out['update_phase_after'] = [string](Get-Content -LiteralPath $A.path -Raw | ConvertFrom-Json).phase
+$out['update_upper'] = [string](Update-VenueTicket -Ticket $A -Phase 'WAITING')
+$out['update_upper_phase'] = [string](Get-Content -LiteralPath $A.path -Raw | ConvertFrom-Json).phase
+$out | ConvertTo-Json -Compress -Depth 4
+""")
+        for k in ("softhyphen", "zwj"):
+            self.assertEqual(r[f"new_{k}"], {"refused": True, "stored": None}, f"a phase with an ignored character was accepted by New-VenueTicket: {r}")
+        self.assertEqual(r["new_upper"], {"refused": False, "stored": "waiting"}, r)
+        self.assertEqual(r["new_mixed"], {"refused": False, "stored": "cooldown"}, r)
+        self.assertTrue(r["update_refused"], f"Update-VenueTicket accepted a phase with an ignored character: {r}")
+        self.assertEqual(r["update_phase_after"], "cooldown", r)
+        self.assertEqual((r["update_upper"], r["update_upper_phase"]), ("OK", "waiting"), r)
+
+    BUDGET_PATH_SEAM = """
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d -Phase cooldown -StaleAfterSec 600
+$env:SEAM_LOCK = '@@LOCK@@'; $env:SEAM_READ = '@@READ@@'
+$r = Update-VenueTicket -Ticket $A -Phase 'waiting' -BudgetSec 0.2
+$phase = (Get-Content -LiteralPath $A.path -Raw | ConvertFrom-Json).phase
+[pscustomobject]@{ result = [string]$r; phase = $phase; lock = (Test-Path -LiteralPath '@@LOCK@@'); read = (Test-Path -LiteralPath '@@READ@@') } | ConvertTo-Json -Compress
+"""
+
+    def test_r9_a5_no_lock_attempt_starts_after_a_slow_path_check_spent_the_budget(self) -> None:
+        # r9 A5: the budget was asked at the top of an attempt, but the path check right before the lock can itself be slow on a share; the lock attempt then started past the budget.
+        mod = self.seam_text(("if (-not (Test-Path -LiteralPath $Ticket.path -PathType Leaf)) { return 'LOST' }   # no lock for a ticket that is not there", "if (-not (Test-Path -LiteralPath $Ticket.path -PathType Leaf)) { return 'LOST' }; Start-Sleep -Milliseconds 400   # no lock for a ticket that is not there"),
+                             ("        $lock = Enter-VenueTicketLock -TicketPath $Ticket.path", "        [IO.File]::WriteAllText($env:SEAM_LOCK, '1'); $lock = Enter-VenueTicketLock -TicketPath $Ticket.path"))
+        r = self.ps(self.BUDGET_PATH_SEAM.replace("@@LOCK@@", str(self.case / "seam-a5-lock.txt")).replace("@@READ@@", str(self.case / "seam-a5-read.txt")), module=mod)
+        self.assertFalse(r["lock"], f"a lock attempt started after the budget ended in the path check: {r}")
+        self.assertEqual((r["result"], r["phase"]), ("BUSY", "cooldown"), r)
+
+    def test_r9_a5_no_ticket_read_starts_after_a_slow_path_check_under_the_lock_spent_the_budget(self) -> None:
+        mod = self.seam_text(("            if (-not (Test-Path -LiteralPath $Ticket.path -PathType Leaf)) { return 'LOST' }\n", "            if (-not (Test-Path -LiteralPath $Ticket.path -PathType Leaf)) { return 'LOST' }; Start-Sleep -Milliseconds 400\n"),
+                             ("$fs = [IO.File]::Open($Ticket.path, [IO.FileMode]::Open, [IO.FileAccess]::Read,", "[IO.File]::WriteAllText($env:SEAM_READ, '1'); $fs = [IO.File]::Open($Ticket.path, [IO.FileMode]::Open, [IO.FileAccess]::Read,"))
+        r = self.ps(self.BUDGET_PATH_SEAM.replace("@@LOCK@@", str(self.case / "seam-a5b-lock.txt")).replace("@@READ@@", str(self.case / "seam-a5b-read.txt")), module=mod)
+        self.assertFalse(r["read"], f"the ticket was read after the budget ended in the path check under the lock: {r}")
+        self.assertEqual((r["result"], r["phase"]), ("BUSY", "cooldown"), r)
+
     SEAM_A7 = """
 $X = New-VenueTicket -Venue bachelor -RunDir 'run-X' -ClaimDir $d -Phase cooldown -StaleAfterSec 600 -OwnerPid @@S@@
 Start-Sleep -Milliseconds 30
