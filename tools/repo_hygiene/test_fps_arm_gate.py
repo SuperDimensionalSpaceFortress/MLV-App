@@ -93,6 +93,18 @@ class _Probe(unittest.TestCase):
         return proc.stdout
 
 
+# BENCH-LIGHT-ARM-GAIN-GATES-1 r5 (Dot on f51e0821): a saved leg record's LIGHT arm WORD is proof only beside a recorded observer list, the rule a recorded result already had. A LIGHT leg
+# fixture therefore carries the list a real leg records, every observer off (a bare 'LIGHT' record is pinned UNKNOWN in ObserverControlTests).
+OBSERVERS_RECORDED_OFF = "observerControls = [pscustomobject]@{ utilSample = $false; corePartitionTelemetry = $false }; "
+
+
+def _light_word(arm: str | None) -> str:
+    """The `telemetryArm` (and recorded observer list for LIGHT) fragment of a pwsh leg-record literal; empty for no arm."""
+    if arm is None:
+        return ""
+    return f"telemetryArm = '{arm}'; " + (OBSERVERS_RECORDED_OFF if arm == "LIGHT" else "")
+
+
 SPEC_LIGHT = "[pscustomobject]@{ legType = 'speed'; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT'; presentTrace = $true } }"
 SPEC_HEAVY = "[pscustomobject]@{ legType = 'speed'; generatorArgs = [pscustomobject]@{ telemetryArm = 'HEAVY' } }"
 SPEC_NO_ARM = "[pscustomobject]@{ legType = 'speed'; generatorArgs = [pscustomobject]@{ unpaced = $true } }"
@@ -461,7 +473,7 @@ class CudaPlaybackAbFpsGateTests(_Probe):
 
     @staticmethod
     def leg(arm: str | None, fps: float, queue_ms: float) -> str:
-        arm_part = "" if arm is None else f"telemetryArm = '{arm}'; "
+        arm_part = _light_word(arm)
         return f"[pscustomobject]@{{ {arm_part}presentedFps = {fps}; avgQueueWaitMs = {queue_ms}; avgDrawTotalMs = 12.0 }}"
 
     def run_ab(self, baseline: str, candidate: str) -> dict:
@@ -496,6 +508,16 @@ class CudaPlaybackAbFpsGateTests(_Probe):
         r = self.run_ab(self.leg("LIGHT", 54.0, 5.0), self.leg("HEAVY", 41.0, 5.0))
         self.assertEqual(r["verdict"]["reason"], HEAVY_REASON)
         self.assertIsNone(r["compare"]["presentedFps"]["deltaPercent"])
+
+    def test_a_leg_that_carries_only_the_light_word_is_unknown_and_refused(self) -> None:
+        # r5 (Dot on f51e0821): the arm word alone is not proof (the rule a recorded result already had); a leg that also records its observer list is
+        bare = "[pscustomobject]@{ telemetryArm = 'LIGHT'; presentedFps = 55.0; avgQueueWaitMs = 5.0; avgDrawTotalMs = 12.0 }"
+        r = self.run_ab(self.leg("LIGHT", 50.0, 5.0), bare)
+        self.assertFalse(r["verdict"]["allowed"])
+        self.assertEqual(r["verdict"]["reason"], UNKNOWN_REASON)
+        self.assertIsNone(r["compare"]["presentedFps"]["deltaPercent"])
+        r = self.run_ab(bare, self.leg("LIGHT", 55.0, 5.0))
+        self.assertEqual(r["verdict"]["reason"], UNKNOWN_REASON)
 
     def test_a_leg_with_no_recorded_arm_is_unknown_and_refused(self) -> None:
         r = self.run_ab(self.leg(None, 54.0, 5.0), self.leg("LIGHT", 55.0, 5.0))
@@ -552,8 +574,8 @@ class CudaPlaybackAbRequireImprovementBlockTests(_Probe):
         source = CUDA_AB_SCRIPT.read_text(encoding="utf-8")
         block = _extract_block(source, "if ($RequireCandidateImprovesPresentedFps) {", "candidate-presented-fps-not-improved baseline=$baselineFps candidate=$candidateFps", trailing_lines=3)
         out = self.ok(
-            f"$baselineSummary = [pscustomobject]@{{ telemetryArm = {baseline}; presentedFps = {fps_b}; hostLoadProvisional = $false }}\n"
-            f"$candidateSummary = [pscustomobject]@{{ telemetryArm = {candidate}; presentedFps = {fps_c}; hostLoadProvisional = $false }}\n"
+            f"$baselineSummary = [pscustomobject]@{{ telemetryArm = {baseline}; {OBSERVERS_RECORDED_OFF}presentedFps = {fps_b}; hostLoadProvisional = $false }}\n"
+            f"$candidateSummary = [pscustomobject]@{{ telemetryArm = {candidate}; {OBSERVERS_RECORDED_OFF}presentedFps = {fps_c}; hostLoadProvisional = $false }}\n"
             "$candidateSpeedSummary = $null\n$SeparateCandidateSpeedRun = $false\n$RequireCandidateImprovesPresentedFps = $true\n$proofFailures = @()\n"
             "$fpsVerdict = Get-PlaybackAbFpsVerdict -BaselineSummary $baselineSummary -CandidateSummary $candidateSummary -CandidateSpeedSummary $candidateSpeedSummary\n"
             + block + "\nforeach ($f in $proofFailures) { Write-Host ('FAIL=' + $f) }\nWrite-Host ('COUNT=' + @($proofFailures).Count)\n")
@@ -583,7 +605,7 @@ class CompareMachinePerfFpsGateTests(_Probe):
     @staticmethod
     def record(baseline_arm: str | None, candidate_arm: str | None, with_verdict: bool = False) -> str:
         def leg(arm: str | None) -> str:
-            arm_part = "" if arm is None else f"telemetryArm = '{arm}'; "
+            arm_part = _light_word(arm)
             return f"[pscustomobject]@{{ {arm_part}hostLoadProvisional = $false; hostLoadState = 'quiet' }}"
         verdict = "fpsVerdict = [pscustomobject]@{ allowed = $true; reason = '' }; " if with_verdict else ""
         return ("[pscustomobject]@{ schema = 'mlvapp-cuda-playback-ab.v1'; status = 'success'; " + verdict +
@@ -616,7 +638,7 @@ class CompareMachinePerfFpsGateTests(_Probe):
 
     def test_a_record_with_a_speed_compare_is_judged_on_its_speed_leg(self) -> None:
         # adversary A6: the row publishes speedCompare, so the leg judged is candidateSpeed; an absent one is UNKNOWN, never the ordinary candidate
-        leg = "[pscustomobject]@{ telemetryArm = 'LIGHT'; hostLoadProvisional = $false; hostLoadState = 'quiet' }"
+        leg = f"[pscustomobject]@{{ telemetryArm = 'LIGHT'; {OBSERVERS_RECORDED_OFF}hostLoadProvisional = $false; hostLoadState = 'quiet' }}"
         heavy = "[pscustomobject]@{ telemetryArm = 'HEAVY'; hostLoadProvisional = $false; hostLoadState = 'quiet' }"
         fingerprint = "machineFingerprint = [pscustomobject]@{ schema = 'machine-fingerprint.v1'; hostname = 'H'; cpu = 'x'; gpu = 'y'; os = 'z'; build_sha = 'abc1234' }; "
         compare = "[pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 10.0; candidate = 20.0; deltaPercent = 100.0 } }"
@@ -653,6 +675,23 @@ class CompareMachinePerfFpsGateTests(_Probe):
         ok = self.row(with_extra("utilSample = $false; "))
         self.assertEqual(ok["playback_fps_delta_pct"], 100.0)
 
+    def test_a_record_whose_legs_carry_only_the_light_word_is_unknown_and_refused(self) -> None:
+        # r5 (Dot on f51e0821): the saved A/B record's legs name LIGHT and record no observer controls, so the delta and the cached optimization are withheld through THIS verdict reader too
+        def bare(extra: str = "") -> str:
+            return f"[pscustomobject]@{{ telemetryArm = 'LIGHT'; {extra}hostLoadProvisional = $false; hostLoadState = 'quiet' }}"
+        record = self.record("LIGHT", "LIGHT").replace(f"baseline = {self.record_leg('LIGHT')}; candidate = {self.record_leg('LIGHT')};", f"baseline = {bare()}; candidate = {bare()};")
+        self.assertIn(f"baseline = {bare()}", record, "the fixture replacement must land")
+        r = self.row(record)
+        self.assertIsNone(r["playback_fps_delta_pct"])
+        self.assertEqual(r["playback_fps_arm_verdict"], UNKNOWN_REASON)
+        self.assertEqual(r["dominant_bottleneck"], "fps-arm-refused")
+        corroborated = self.row(self.record("LIGHT", "LIGHT"))
+        self.assertEqual(corroborated["playback_fps_arm_verdict"], "allowed")
+
+    @staticmethod
+    def record_leg(arm: str | None) -> str:
+        return f"[pscustomobject]@{{ {_light_word(arm)}hostLoadProvisional = $false; hostLoadState = 'quiet' }}"
+
     def test_a_record_that_names_no_arm_is_unknown_and_refused_even_if_it_carries_a_cached_allowed_verdict(self) -> None:
         for with_verdict in (False, True):
             with self.subTest(cached_verdict=with_verdict):
@@ -668,7 +707,7 @@ class CompareMachinePerfSuggestionFpsGateTests(_Probe):
                  "Get-ProofSummarySuggestion"]
 
     def suggestion(self, arm: str | None) -> str:
-        arm_part = "" if arm is None else f"telemetryArm = '{arm}'; "
+        arm_part = _light_word(arm)
         leg = f"[pscustomobject]@{{ {arm_part}hostLoadProvisional = $false; hostLoadState = 'quiet' }}"
         return self.ok(
             "$rec = [pscustomobject]@{ proof = [pscustomobject]@{ playback = [pscustomobject]@{ totalFallbackFrames = 0; totalGpuTextureNoReadbackFrames = 5 }; "
@@ -754,7 +793,8 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
         # the improvement diagnostic is behind the arm refusal
         self.assertRegex(source, r"-not \$playbackAbHostLoadProvisional -and\s+-not \$playbackAbFpsArmRefusal\.refused -and")
 
-    def run_summarizer_block(self, baseline_arm: str, candidate_arm: str, analysis: str = "$null", candidate_extra: str = "") -> list[str]:
+    def run_summarizer_block(self, baseline_arm: str, candidate_arm: str, analysis: str = "$null", candidate_extra: str = "", bare_candidate: bool = False) -> list[str]:
+        candidate_word = "telemetryArm = '" + candidate_arm + "'; " if bare_candidate else _light_word(candidate_arm)
         tmp = Path(tempfile.mkdtemp(prefix="fps-arm-summ-"))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         source = SUMMARIZER_SCRIPT.read_text(encoding="utf-8")
@@ -768,8 +808,8 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
         probe.write_text(
             "$ErrorActionPreference = 'Stop'\n" f"Import-Module '{MODULE}' -Force\n" + funcs +
             "\n$playbackAbComparisonBasis = 'candidate'\n"
-            f"$playbackAb = [pscustomobject]@{{ analysis = {analysis}; baseline = [pscustomobject]@{{ telemetryArm = '{baseline_arm}'; hostLoadProvisional = $false; hostLoadState = 'quiet' }}; "
-            f"candidate = [pscustomobject]@{{ telemetryArm = '{candidate_arm}'; {candidate_extra}hostLoadProvisional = $false; hostLoadState = 'quiet' }} }}\n"
+            f"$playbackAb = [pscustomobject]@{{ analysis = {analysis}; baseline = [pscustomobject]@{{ {_light_word(baseline_arm)}hostLoadProvisional = $false; hostLoadState = 'quiet' }}; "
+            f"candidate = [pscustomobject]@{{ {candidate_word}{candidate_extra}hostLoadProvisional = $false; hostLoadState = 'quiet' }} }}\n"
             "$playbackAbSpeedCompare = [pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 50; candidate = 49; delta = -1; deltaPercent = -2 }; "
             "guiStatusFps = [pscustomobject]@{ baseline = 50; candidate = 49; delta = -1; deltaPercent = -2 }; "
             "avgPresentIntervalMs = [pscustomobject]@{ baseline = 20; candidate = 21; delta = 1; deltaPercent = 5 }; "
@@ -820,6 +860,14 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
         self.assertNotIn("presented FPS: CPU", text)
         off = "\n".join(self.run_summarizer_block("LIGHT", "LIGHT", candidate_extra="utilSample = $false; "))
         self.assertNotIn("PLAYBACK_AB_FPS_ARM_REFUSED", off)
+
+    def test_a_candidate_that_carries_only_the_light_word_is_refused_here_too(self) -> None:
+        # r5 (Dot on f51e0821): the third verdict reader (summarize-local-cuda-proof.ps1:700-701) reads the same rule
+        text = "\n".join(self.run_summarizer_block("LIGHT", "LIGHT", bare_candidate=True))
+        self.assertIn("DIAG=PLAYBACK_AB_FPS_ARM_REFUSED", text)
+        self.assertIn(UNKNOWN_REASON, text)
+        self.assertNotIn("PLAYBACK_PRESENTED_FPS_NOT_IMPROVED", text)
+        self.assertNotIn("presented FPS: CPU", text)
 
     def test_a_refused_pair_labels_the_section_refused_not_pass(self) -> None:
         # r2 advisory A4 (summarize-local-cuda-proof.ps1:761): the section verdict read PASS although its fps comparison was refused
@@ -937,7 +985,8 @@ class ObserverControlTests(_Probe):
 
     def test_the_record_helper_judges_the_whole_leg_not_its_arm_word(self) -> None:
         self.check({
-            "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = 'LIGHT' })": "LIGHT",
+            "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = 'LIGHT' })": "UNKNOWN",   # r5: the bare arm word is not proof (the rule a recorded result already had)
+            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {OBSERVERS_RECORDED_OFF}}})": "LIGHT",
             "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = 'LIGHT'; utilSample = $true })": "UNKNOWN",
             "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = 'LIGHT'; generatorArgs = [pscustomobject]@{ cudaLaunchTimingMinMs = 0 } })": "UNKNOWN",
             "Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = 'HEAVY'; utilSample = $true })": "HEAVY",
@@ -1108,18 +1157,35 @@ class ObserverControlTests(_Probe):
             rec('{"someObserverNobodyListed":[true]}'): "UNKNOWN",
             rec('{"someObserverNobodyListed":{"on":true}}'): "UNKNOWN",
             rec('{"someObserverNobodyListed":""}'): "UNKNOWN",
-            # admission controls: all-false (and the threshold's -1) stays LIGHT
-            rec('{}'): "LIGHT",
+            # admission controls: all-false (and the threshold's -1) stays LIGHT; an EMPTY list records nothing, so it is the bare word again (UNKNOWN, r5)
+            rec('{}'): "UNKNOWN",
             rec('{"utilSample":false,"corePartitionTelemetry":false,"firstPresentCapture":false,"warmReuseMissDump":false,"cudaLaunchTimingMinMs":-1}'): "LIGHT",
             rec('{"someObserverNobodyListed":false}'): "LIGHT",
             rec('{"someObserverNobodyListed":0}'): "LIGHT",
         })
 
-    def test_a_leg_record_without_observer_controls_stays_light(self) -> None:
+    def test_a_bare_light_leg_record_is_unknown_and_the_pair_is_refused(self) -> None:
+        # r5 (Dot on f51e0821, bus 4cd3358 cos-feedback/mlv-app/pr-871.md; Grok, PR comment 7039843864): a saved leg whose only evidence is the arm WORD read LIGHT here while a recorded
+        # result with the same word was refused (Get-FpsArmFromJobResult, no observer record). One evidence rule now: the word is proof only beside a recorded observer list.
+        bare = self._json('{"telemetryArm":"LIGHT"}')
+        empty = self._json('{"telemetryArm":"LIGHT","observerControls":{}}')
+        recorded_off = self._json('{"telemetryArm":"LIGHT","observerControls":{"utilSample":false}}')
+        heavy = self._json('{"telemetryArm":"HEAVY","observerControls":{"utilSample":true}}')
         self.check({
-            f"Get-FpsArmFromLegRecord {self._json('{' + chr(34) + 'telemetryArm' + chr(34) + ':' + chr(34) + 'LIGHT' + chr(34) + '}')}": "LIGHT",
-            f"Get-FpsArmFromLegRecord {self._json('{' + chr(34) + 'telemetryArm' + chr(34) + ':' + chr(34) + 'HEAVY' + chr(34) + ',' + chr(34) + 'observerControls' + chr(34) + ':{' + chr(34) + 'utilSample' + chr(34) + ':true}}')}": "HEAVY",
+            f"Get-FpsArmFromLegRecord {bare}": "UNKNOWN",
+            f"Get-FpsArmFromLegRecord {empty}": "UNKNOWN",
+            f"Get-FpsArmFromLegRecord {recorded_off}": "LIGHT",
+            f"Get-FpsArmFromLegRecord {heavy}": "HEAVY",
+            # the boundary the reader shares with a recorded result: the same record reads the same arm through both
+            f"Get-FpsArmFromJobResult {bare}": "UNKNOWN",
+            f"Get-FpsArmFromJobResult {empty}": "UNKNOWN",
+            f"Get-FpsArmFromJobResult {recorded_off}": "LIGHT",
         })
+        # through the verdict reader every caller uses (Get-FpsPairVerdict): an uncorroborated bare LIGHT/LIGHT pair is refused as UNKNOWN, a corroborated pair is allowed
+        out = self.ok(
+            f"$b = Get-FpsArmFromLegRecord {bare}\n$v = Get-FpsPairVerdict -Baseline $b -Candidate $b\nWrite-Host ('BARE=' + $v.allowed + '|' + $v.reason)\n"
+            f"$o = Get-FpsArmFromLegRecord {recorded_off}\n$v = Get-FpsPairVerdict -Baseline $o -Candidate $o\nWrite-Host ('OFF=' + $v.allowed + '|' + $v.reason)\n")
+        self.assertEqual(out.split(), [f"BARE=False|{UNKNOWN_REASON}", "OFF=True|"])
 
     def test_a_job_result_reads_observer_controls_the_same_way(self) -> None:
         # sibling sweep: Get-FpsArmFromJobResult already read observerControls, but skipped a malformed one; the leg-record and result readers now share one rule
@@ -1158,7 +1224,7 @@ class ObserverControlTests(_Probe):
         job = (PROFILING / "bachelor" / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8")
         block = _extract_block(job, "$telemetryArmEnvs = if ($TelemetryArm -eq 'LIGHT') {", "$envList = ", trailing_lines=-1)
         body = "".join(
-            f"$TelemetryArm = '{arm}'; $reconDll = 'x'; $pkgDir = 'C:\\pkg'; $DisablePaintPerSubmit = {flag}\n{block}\nWrite-Host ('ENVS={arm}|{flag}|' + ($envs -join ','))\n"
+            f"$TelemetryArm = '{arm}'; $reconDll = 'x'; $pkgDir = 'pkg'; $DisablePaintPerSubmit = {flag}\n{block}\nWrite-Host ('ENVS={arm}|{flag}|' + ($envs -join ','))\n"
             for arm, flag in (("LIGHT", "$false"), ("LIGHT", "$true"), ("HEAVY", "$false"), ("HEAVY", "$true"), ("", "$false")))
         rows = {}
         for line in self.ok(body).splitlines():

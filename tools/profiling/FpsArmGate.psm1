@@ -165,6 +165,23 @@ function Read-FpsRecordedObserverControls {
     [pscustomobject]@{ present = $true; entries = $pairs.Count; problem = $null }
 }
 
+function Test-FpsRecordHasObserverEvidence {
+    # Does a RECORD (a leg record or a job result) say anything about its observer controls? True when its `observerControls` (directly or under its generatorArgs) has an entry, or it names
+    # a listed control's key (at its top level, under its generatorArgs, or inside `observerControls`), on OR off. An arm WORD alone is not evidence that no sampler or per-launch logger ran
+    # (adversary pass 5 A2 for a result; BENCH-LIGHT-ARM-GAIN-GATES-1 r5, Dot on f51e0821, the same rule for a saved leg record): one rule for both readers.
+    param([AllowNull()]$Record)
+    if ($null -eq $Record -or $Record -is [string] -or $Record -is [System.ValueType]) { return $false }
+    $generatorArgs = Get-FaProp $Record 'generatorArgs'
+    foreach ($holder in @($Record, $generatorArgs)) {
+        if ((Read-FpsRecordedObserverControls $holder).entries -gt 0) { return $true }
+    }
+    foreach ($container in @($Record, $generatorArgs, (Get-FaProp $Record 'observerControls'))) {
+        if ($null -eq $container -or $container -is [string] -or $container -is [System.ValueType]) { continue }
+        foreach ($c in $script:FpsObserverControls) { if ($c.specKey -and (Test-FaHasProp $container $c.specKey)) { return $true } }
+    }
+    $false
+}
+
 function Get-FpsArmFromLegRecord {
     <#
     .SYNOPSIS
@@ -189,6 +206,9 @@ function Get-FpsArmFromLegRecord {
         if ($null -ne $oc.problem) { return New-FpsArm 'UNKNOWN' 'record' "telemetryArm=LIGHT but the record's observerControls fail closed ($($oc.problem.kind): $($oc.problem.text))" }
     }
     if ($field -isnot [string]) { return $field }
+    # a bare arm WORD with no recorded observer controls is not proof (the same rule as a recorded result, Get-FpsArmFromJobResult): the arm object a smoke summary records is judged from its launch
+    # environment, the word is not
+    if (-not (Test-FpsRecordHasObserverEvidence $Leg)) { return New-FpsArm 'UNKNOWN' 'record' 'telemetryArm=LIGHT but the record records no observer controls (the arm word alone is not proof)' }
     New-FpsArm 'LIGHT' 'record' 'telemetryArm=LIGHT'
 }
 
@@ -259,21 +279,19 @@ function Get-FpsArmFromJobResult {
         # a result that records an enabled observer control (the same keys as a spec: at its top level, under its generatorArgs, or under an `observerControls` object) is not LIGHT
         # either (adversary pass 3 A2)
         $containers = @($Result, (Get-FaProp $Result 'generatorArgs'), (Get-FaProp $Result 'observerControls'))
-        $recorded = $false
         # the same rule as a leg record's (Read-FpsRecordedObserverControls): an `observerControls` that is not an object, an enabled entry of any name, or an entry that cannot be read fails closed
         foreach ($holder in @($Result, (Get-FaProp $Result 'generatorArgs'))) {
             $oc = Read-FpsRecordedObserverControls $holder
             if ($null -ne $oc.problem) { return New-FpsArm 'UNKNOWN' 'result' "telemetryArm=LIGHT but the result's observerControls fail closed ($($oc.problem.kind): $($oc.problem.text))" }
-            if ($oc.entries -gt 0) { $recorded = $true }
         }
         foreach ($container in $containers) {
             if ($null -eq $container -or $container -is [string] -or $container -is [System.ValueType]) { continue }
-            foreach ($c in $script:FpsObserverControls) { if ($c.specKey -and (Test-FaHasProp $container $c.specKey)) { $recorded = $true } }
             $observer = Get-FpsSpecObserverOn $container
             if ($null -ne $observer) { return New-FpsArm 'UNKNOWN' 'result' "telemetryArm=LIGHT but the result records $($observer.specKey) enabled ($($observer.id))" }
         }
         # the job's provenance.json / evidence-manifest.json carry the arm WORD and no observer record, so a result alone cannot prove that no sampler or per-launch logger ran (adversary pass 5
         # A2): without a recorded observer list (or a spec to judge them from) a LIGHT word is UNKNOWN
+        $recorded = Test-FpsRecordHasObserverEvidence $Result
         if (-not $recorded -and -not $ObserversFromSpec) { return New-FpsArm 'UNKNOWN' 'result' 'telemetryArm=LIGHT but the result records no observer controls (provenance carries the arm word only); judge it with its leg spec' }
         return New-FpsArm 'LIGHT' 'result' 'telemetryArm=LIGHT'
     }

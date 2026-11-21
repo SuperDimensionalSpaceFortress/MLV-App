@@ -3071,10 +3071,12 @@ $envs = @(
 # MLVAPP_PLAYBACK_SCALE_FACTOR override is emitted; -ScaleFactor 4 is explicit
 # below for self-documentation even though it is run-release-gui-smoke.ps1's own
 # default.
+# LIGHT-ARM-PRESENT-DIAG-1 >>>
 # BENCH-LIGHT-ARM-GAIN-GATES-1 r4 (luna r3 B2): MLVAPP_VIEWPORT_PRESENT_DIAG=1 makes the app log from its per-present paths (platform/qt/GpuDisplayViewport.cpp setPresentedImage /
 # updateTextureIfNeeded), so a LIGHT leg (a presented-fps measurement) must not carry it. Only a LIGHT leg drops it; every other arm keeps the line above exactly as before. (The cpu leg's
 # template edit below removes the same line from its own list; this filter finds nothing there.)
 if ($TelemetryArm -eq 'LIGHT') { $envs = @($envs | Where-Object { $_ -ne 'MLVAPP_VIEWPORT_PRESENT_DIAG=1' }) }
+# LIGHT-ARM-PRESENT-DIAG-1 <<<
 $envList = "'" + ($envs -join "','") + "'"
 function ConvertTo-PsSingleQuoted([string]$Value) { "'" + $Value.Replace("'", "''") + "'" }
 $cmd = "& $(ConvertTo-PsSingleQuoted $smoke) -ExePath $(ConvertTo-PsSingleQuoted $exePath) -Input $(ConvertTo-PsSingleQuoted $clipPath) -Output $(ConvertTo-PsSingleQuoted $resultPath) -Seconds $PlaySeconds -StartFrame 0 -SettleMs 2500 -ProcessTimeoutMs $SmokeProcessTimeoutMs__LEG_HARD_LIMIT_ARGS__ -ScaleFactor __SCALE_FACTOR__ __EXPECTED_SCALE_ARGS__-UsePersistedPlaybackSettings -RequireLookAssist:`$false -Scope none -FrameTelemetry -PreserveExperimentalEnvironment -ExtraEnvironment @($envList)"

@@ -538,6 +538,12 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     SESSION_ANCHOR_OPEN = "SESSION-ANCHOR-1 >>>"
     SESSION_ANCHOR_CLOSE = "SESSION-ANCHOR-1 <<<"
     SESSION_ANCHOR_REGIONS = 2
+    # BENCH-LIGHT-ARM-GAIN-GATES-1 r5 (hosted CI 44840627698 / 44840627726: r4's comment and filter sat outside every region): a LIGHT leg's environment drops the
+    # app's per-present logger MLVAPP_VIEWPORT_PRESENT_DIAG=1, which the base list carries for every arm (the base $envs lines stay verbatim; only the filter is added).
+    # One region in every job (the filter is a no-op outside a LIGHT leg); absent from the baseline.
+    LIGHT_ARM_PRESENT_DIAG_OPEN = "LIGHT-ARM-PRESENT-DIAG-1 >>>"
+    LIGHT_ARM_PRESENT_DIAG_CLOSE = "LIGHT-ARM-PRESENT-DIAG-1 <<<"
+    LIGHT_ARM_PRESENT_DIAG_REGIONS = 1
     # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r5 (CI run 43580040634): the ONE claim-shape predicate (Get-AttrCudaBuildManifestClaimSha256). Two regions in every job: its
     # splice, and $manifestChecks reading each digest through it. The second REPLACES the baseline's member-access block (test_playback_attr_3_cuda_behaviour
     # test_every_claim_reader_calls_the_one_predicate forbids keeping it), so that exact baseline block is pinned below and taken out of the baseline, once, before the
@@ -590,7 +596,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                     "cpu-gl-env-clear": (cls.CPU_GL_ENV_CLEAR_OPEN, cls.CPU_GL_ENV_CLEAR_CLOSE),
                     "pm-internal-gap": (cls.PM_INTERNAL_GAP_OPEN, cls.PM_INTERNAL_GAP_CLOSE),
                     "session-anchor": (cls.SESSION_ANCHOR_OPEN, cls.SESSION_ANCHOR_CLOSE),
-                    "claim-shape": (cls.CLAIM_SHAPE_OPEN, cls.CLAIM_SHAPE_CLOSE)}
+                    "claim-shape": (cls.CLAIM_SHAPE_OPEN, cls.CLAIM_SHAPE_CLOSE),
+                    "light-arm-present-diag": (cls.LIGHT_ARM_PRESENT_DIAG_OPEN, cls.LIGHT_ARM_PRESENT_DIAG_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -647,6 +654,7 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual((new_counts["cpu-gl-env-clear"], old_counts["cpu-gl-env-clear"]), (0, 0), "a cuda job carries no cpu GL-viewport env-clear region, and neither does the baseline")
         self.assertEqual((new_counts["pm-internal-gap"], old_counts["pm-internal-gap"]), (self.PM_INTERNAL_GAP_REGIONS, 0), "the default job carries exactly the pinned number of bracketed PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 regions; the baseline predates them")
         self.assertEqual((new_counts["session-anchor"], old_counts["session-anchor"]), (self.SESSION_ANCHOR_REGIONS, 0), "the default job carries exactly the pinned number of bracketed SESSION-ANCHOR-1 regions; the baseline predates them")
+        self.assertEqual((new_counts["light-arm-present-diag"], old_counts["light-arm-present-diag"]), (self.LIGHT_ARM_PRESENT_DIAG_REGIONS, 0), "the default job carries exactly the pinned number of bracketed LIGHT-ARM-PRESENT-DIAG-1 regions; the baseline predates them")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
@@ -9147,6 +9155,9 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r5: the claim-shape predicate's regions, in every new job (cuda and cpu); the base predates them.
                 self.assertEqual((new_counts.pop("claim-shape"), old_counts.pop("claim-shape")),
                                  (GeneratorByteIdentityAndVariantTests.CLAIM_SHAPE_REGIONS, 0), name)
+                # BENCH-LIGHT-ARM-GAIN-GATES-1 r5: the LIGHT-leg present-diag filter's region, in every new job (cuda and cpu); the base predates it.
+                self.assertEqual((new_counts.pop("light-arm-present-diag"), old_counts.pop("light-arm-present-diag")),
+                                 (GeneratorByteIdentityAndVariantTests.LIGHT_ARM_PRESENT_DIAG_REGIONS, 0), name)
                 self.assertEqual(new_counts, old_counts, f"{name}: the job without -LookReceiptPath carries the base generator's bracketed regions")
                 self.assertEqual(kept, old_kept, f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
                 self.assertNotIn(b"LookReceipt", new)
