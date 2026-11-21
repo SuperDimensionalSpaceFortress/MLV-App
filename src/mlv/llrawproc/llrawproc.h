@@ -125,6 +125,11 @@ typedef struct
      * bridged the two and left async H2D permanently disarmed. See
      * .claude-state/project-memory/async-h2d-frameid-crosses-a-subsystem-boundary-20260905.md. */
     uint64_t frame_id;
+    /* DUALISO-CONFIGURE-CACHE-1 (sol r6 B3): a stamp that changes whenever the CONTENTS behind raw2ev, ev2raw,
+     * mix_curve or fullres_curve are rewritten. The backend skips a LUT upload only when pointers, levels and this
+     * stamp all match; a writer that rewrites a table in place MUST give the state a new stamp. 0 = the builder
+     * keeps no stamp (its tables are immutable while referenced), so only the pointers distinguish them. */
+    uint64_t lut_generation;
 } llrpGpuPlaybackReconState_t;
 
 typedef struct
@@ -358,6 +363,10 @@ int llrpGpuPlaybackReconReducedIsoNotchAvailable(void);
 /* Cumulative igpu_recon_set_clip / set_luts calls made by the C seam. */
 uint64_t llrpGpuPlaybackReconSetClipCount(void);
 uint64_t llrpGpuPlaybackReconSetLutsCount(void);
+/* DUALISO-CONFIGURE-CACHE-1: cumulative igpu_recon_set_iso_pattern calls (the pattern-only configure that
+ * replaces a set_clip + set_luts when only the ISO pattern moved). Additive; the two counts above keep
+ * their meaning. */
+uint64_t llrpGpuPlaybackReconSetIsoPatternCount(void);
 /* One line per set_clip / set_luts event (frame, wall ms, dims), emitted after
  * the backend mutex is released. NULL uninstalls. */
 typedef void (*llrpGpuReconEventLogger_t)(const char * line);

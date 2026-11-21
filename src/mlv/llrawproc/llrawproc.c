@@ -664,6 +664,7 @@ static void llrawproc_gpu_playback_public_state_from_dualiso(
     out->fullres_curve = state->fullres_curve;
     out->randn05 = state->randn05;
     out->apply_dither = state->apply_dither;
+    out->lut_generation = state->lut_generation;
 }
 
 static int llrawproc_gpu_playback_dualiso_state_from_public(
@@ -698,6 +699,7 @@ static int llrawproc_gpu_playback_dualiso_state_from_public(
     out->fullres_curve = state->fullres_curve;
     out->randn05 = state->randn05;
     out->apply_dither = state->apply_dither;
+    out->lut_generation = state->lut_generation;
     return 1;
 }
 
@@ -838,6 +840,8 @@ typedef int (*llrawproc_gpu_copy_last_device_output_to_gl_texture_fn)(
 typedef int (*llrawproc_gpu_allocated_bytes_fn)(igpu_recon_backend*, uint64_t*);
 typedef int (*llrawproc_gpu_reset_gl_texture_resources_fn)(igpu_recon_backend*);
 typedef int (*llrawproc_gpu_set_reduced_iso_notch_fn)(igpu_recon_backend*, int);
+/* DUALISO-CONFIGURE-CACHE-1: optional igpu_recon_set_iso_pattern (store-only pattern update). */
+typedef int (*llrawproc_gpu_set_iso_pattern_fn)(igpu_recon_backend*, const int*);
 typedef int (*llrawproc_gpu_take_cuda_error_fn)(int, igpu_cuda_error_t*);
 typedef int (*llrawproc_gpu_drain_cuda_errors_fn)(int, igpu_cuda_error_t*, int, unsigned long long*);
 typedef const volatile long * (*llrawproc_gpu_cuda_error_pending_word_fn)(int);
@@ -854,6 +858,7 @@ typedef struct
     int apply_dither;
     double ev_correction;
     double dark_noise;
+    uint64_t lut_generation;   /* sol r6 B3: the contents behind the pointers above (llrpGpuPlaybackReconState_t) */
 } llrawprocGpuReconLutsKey_t;
 
 typedef struct
@@ -883,6 +888,7 @@ typedef struct
     llrawproc_gpu_allocated_bytes_fn allocated_bytes;
     llrawproc_gpu_reset_gl_texture_resources_fn reset_gl_texture_resources;
     llrawproc_gpu_set_reduced_iso_notch_fn set_reduced_iso_notch;
+    llrawproc_gpu_set_iso_pattern_fn set_iso_pattern;
     /* GPU-FIELD-TELEMETRY-1: optional; called only on a failed stage call.
      * r4: the DLL hands each noted code out once, per channel, under its own
      * mutex, so a bypass preupload and a render never share a cursor. */
@@ -896,6 +902,10 @@ typedef struct
     igpu_recon_clip_t configured_clip;
     int luts_configured;
     llrawprocGpuReconLutsKey_t configured_luts_key;
+    /* DUALISO-CONFIGURE-CACHE-1: the sticky notch flag the backend holds. Cleared (with the rest of
+     * this struct) by every release, so a recreated backend is told its notch again. */
+    int notch_configured;
+    int configured_notch;
     /* PLAYBACK-CUDA-HONOUR-SCALE-1: retained device outputs handed out and not
      * yet released. igpu_recon_set_clip frees EVERY retained output, in use or
      * not, so a clip whose dimensions differ is refused while any is
@@ -911,6 +921,8 @@ static pthread_mutex_t g_llrawproc_gpu_recon_backend_mutex = PTHREAD_MUTEX_INITI
  * backend struct so a backend release does not reset them. */
 static volatile LONG64 g_llrawproc_gpu_set_clip_count = 0;
 static volatile LONG64 g_llrawproc_gpu_set_luts_count = 0;
+/* DUALISO-CONFIGURE-CACHE-1: additive; igpu_recon_set_clip / set_luts keep their meaning. */
+static volatile LONG64 g_llrawproc_gpu_set_iso_pattern_count = 0;
 static llrpGpuReconEventLogger_t g_llrawproc_gpu_recon_event_logger = NULL;
 static llrpGpuStageTelemetrySink_t g_llrawproc_gpu_stage_telemetry_sink = NULL;
 static volatile LONG g_llrawproc_gpu_recon_run_active = 0;
@@ -1248,6 +1260,13 @@ static int g_llrawproc_fake_gpu_backend_last_run_reduced_iso_notch = -1;
 static uint64_t g_llrawproc_fake_gpu_backend_runs_with_notch = 0;
 static uint64_t g_llrawproc_fake_gpu_backend_runs_without_notch = 0;
 static uint64_t g_llrawproc_fake_gpu_backend_notch_set_calls = 0;
+/* DUALISO-CONFIGURE-CACHE-1: set_iso_pattern calls, and the pattern the latest run saw. */
+static uint64_t g_llrawproc_fake_gpu_backend_pattern_set_calls = 0;
+static int g_llrawproc_fake_gpu_backend_last_run_is_bright[4] = {-1, -1, -1, -1};
+/* The whole configured state (clip, LUT pointers, notch) the latest run executed under. */
+static igpu_recon_clip_t g_llrawproc_fake_gpu_backend_last_run_clip = {0};
+static igpu_recon_luts_t g_llrawproc_fake_gpu_backend_last_run_luts = {0};
+static int g_llrawproc_fake_gpu_backend_last_run_state_valid = 0;
 /* GPU-FIELD-TELEMETRY-1: the fake's igpu_recon_take_cuda_error queues (one per
  * channel, each code handed out once, as igpu_cuda_error_slot.h does), and a
  * one-shot run failure a test injects (rc 0 = none armed). */
@@ -1368,6 +1387,22 @@ static int llrawproc_fake_gpu_backend_set_reduced_iso_notch(igpu_recon_backend *
     return 0;
 }
 
+/* DUALISO-CONFIGURE-CACHE-1: the fake's igpu_recon_set_iso_pattern. It stores the pattern only, as the
+ * CUDA backend does; the pattern a run sees is whatever the clip or this call last stored. */
+static int llrawproc_fake_gpu_backend_set_iso_pattern(igpu_recon_backend * b, const int * is_bright)
+{
+    int i;
+    (void)b;
+    if(!is_bright) return -1;
+    for(i = 0; i < 4; ++i)
+    {
+        if(is_bright[i] != 0 && is_bright[i] != 1) return -1;
+    }
+    memcpy(g_llrawproc_fake_gpu_backend_clip.is_bright, is_bright, sizeof(g_llrawproc_fake_gpu_backend_clip.is_bright));
+    ++g_llrawproc_fake_gpu_backend_pattern_set_calls;
+    return 0;
+}
+
 static int llrawproc_fake_gpu_backend_abi_version(igpu_recon_backend * b)
 {
     (void)b;
@@ -1419,6 +1454,11 @@ uint64_t llrpFakeGpuBackendReleaseCallsForTesting(void)
 }
 
 static igpu_recon_luts_t g_llrawproc_fake_gpu_backend_luts = {0};
+/* DUALISO-CONFIGURE-CACHE-1 test-only: what the fake "device" holds, as entry 0 of each table at its latest
+ * set_luts (0 raw2ev, 1 ev2raw, 2 mix_curve, 3 fullres_curve, 4 randn05). Entry 0 only: some fixtures pass
+ * one-element tables. A pointer compare cannot tell an in-place content change from none. */
+static int g_llrawproc_fake_gpu_backend_lut_shadow_valid[5];
+static double g_llrawproc_fake_gpu_backend_lut_shadow[5];
 
 static int llrawproc_fake_gpu_backend_set_luts(igpu_recon_backend * b,
                                                const igpu_recon_luts_t * luts)
@@ -1430,7 +1470,22 @@ static int llrawproc_fake_gpu_backend_set_luts(igpu_recon_backend * b,
     if(luts->mix_curve) g_llrawproc_fake_gpu_backend_luts.mix_curve = luts->mix_curve;
     if(luts->fullres_curve) g_llrawproc_fake_gpu_backend_luts.fullres_curve = luts->fullres_curve;
     if(luts->randn05) g_llrawproc_fake_gpu_backend_luts.randn05 = luts->randn05;
+    if(luts->raw2ev) { g_llrawproc_fake_gpu_backend_lut_shadow_valid[0] = 1; g_llrawproc_fake_gpu_backend_lut_shadow[0] = luts->raw2ev[0]; }
+    if(luts->ev2raw) { g_llrawproc_fake_gpu_backend_lut_shadow_valid[1] = 1; g_llrawproc_fake_gpu_backend_lut_shadow[1] = luts->ev2raw[0]; }
+    if(luts->mix_curve) { g_llrawproc_fake_gpu_backend_lut_shadow_valid[2] = 1; g_llrawproc_fake_gpu_backend_lut_shadow[2] = luts->mix_curve[0]; }
+    if(luts->fullres_curve) { g_llrawproc_fake_gpu_backend_lut_shadow_valid[3] = 1; g_llrawproc_fake_gpu_backend_lut_shadow[3] = luts->fullres_curve[0]; }
+    if(luts->randn05) { g_llrawproc_fake_gpu_backend_lut_shadow_valid[4] = 1; g_llrawproc_fake_gpu_backend_lut_shadow[4] = luts->randn05[0]; }
     return 0;
+}
+
+/* DUALISO-CONFIGURE-CACHE-1 test-only: entry 0 of table `which` (see above) as the fake's latest set_luts took it.
+ * Returns 0 when that table was never uploaded since the fake was installed. */
+int llrpFakeGpuBackendDeviceLutEntryForTesting(int which, double * value);
+int llrpFakeGpuBackendDeviceLutEntryForTesting(int which, double * value)
+{
+    if(which < 0 || which > 4 || !g_llrawproc_fake_gpu_backend_lut_shadow_valid[which]) return 0;
+    if(value) *value = g_llrawproc_fake_gpu_backend_lut_shadow[which];
+    return 1;
 }
 
 static void llrawproc_fake_gpu_backend_dump_blob(const char * dir, const char * name,
@@ -1519,6 +1574,12 @@ static int llrawproc_fake_gpu_backend_run(igpu_recon_backend * b,
     llrawproc_fake_gpu_backend_dump_vectors(frame, in_bayer14, pixel_count);
     g_llrawproc_fake_gpu_backend_last_run_reduced_iso_notch =
         g_llrawproc_fake_gpu_backend_reduced_iso_notch;
+    memcpy(g_llrawproc_fake_gpu_backend_last_run_is_bright,
+           g_llrawproc_fake_gpu_backend_clip.is_bright,
+           sizeof(g_llrawproc_fake_gpu_backend_last_run_is_bright));
+    g_llrawproc_fake_gpu_backend_last_run_clip = g_llrawproc_fake_gpu_backend_clip;
+    g_llrawproc_fake_gpu_backend_last_run_luts = g_llrawproc_fake_gpu_backend_luts;
+    g_llrawproc_fake_gpu_backend_last_run_state_valid = 1;
     if(g_llrawproc_fake_gpu_backend_reduced_iso_notch == 1)
         ++g_llrawproc_fake_gpu_backend_runs_with_notch;
     else
@@ -1847,6 +1908,8 @@ int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install)
     g_llrawproc_fake_gpu_backend_last_device_height = 0;
     memset(&g_llrawproc_fake_gpu_backend_clip, 0, sizeof(g_llrawproc_fake_gpu_backend_clip));
     memset(&g_llrawproc_fake_gpu_backend_luts, 0, sizeof(g_llrawproc_fake_gpu_backend_luts));
+    memset(g_llrawproc_fake_gpu_backend_lut_shadow_valid, 0, sizeof(g_llrawproc_fake_gpu_backend_lut_shadow_valid));
+    memset(g_llrawproc_fake_gpu_backend_lut_shadow, 0, sizeof(g_llrawproc_fake_gpu_backend_lut_shadow));
     memset(&g_llrawproc_fake_gpu_backend_last_status, 0, sizeof(g_llrawproc_fake_gpu_backend_last_status));
     g_llrawproc_fake_gpu_backend_next_token = 1;
     g_llrawproc_fake_gpu_backend_in_use_count = 0;
@@ -1856,6 +1919,13 @@ int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install)
     g_llrawproc_fake_gpu_backend_runs_with_notch = 0;
     g_llrawproc_fake_gpu_backend_runs_without_notch = 0;
     g_llrawproc_fake_gpu_backend_notch_set_calls = 0;
+    g_llrawproc_fake_gpu_backend_pattern_set_calls = 0;
+    memset(g_llrawproc_fake_gpu_backend_last_run_is_bright, 0xff, sizeof(g_llrawproc_fake_gpu_backend_last_run_is_bright));
+    memset(&g_llrawproc_fake_gpu_backend_last_run_clip, 0, sizeof(g_llrawproc_fake_gpu_backend_last_run_clip));
+    memset(&g_llrawproc_fake_gpu_backend_last_run_luts, 0, sizeof(g_llrawproc_fake_gpu_backend_last_run_luts));
+    g_llrawproc_fake_gpu_backend_last_run_state_valid = 0;
+    memset(&g_llrawproc_fake_gpu_backend_luts, 0, sizeof(g_llrawproc_fake_gpu_backend_luts));
+    memset(&g_llrawproc_fake_gpu_backend_clip, 0, sizeof(g_llrawproc_fake_gpu_backend_clip));
     memset(g_llrawproc_fake_gpu_backend_cuda_errors, 0, sizeof(g_llrawproc_fake_gpu_backend_cuda_errors));
     g_llrawproc_fake_gpu_backend_cuda_error_pending[0] = 0;
     g_llrawproc_fake_gpu_backend_cuda_error_pending[1] = 0;
@@ -1889,6 +1959,7 @@ int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install)
         g->retain_last_device_output = llrawproc_fake_gpu_backend_retain_last_device_output;
         g->release_retained_device_output = llrawproc_fake_gpu_backend_release_retained_device_output;
         g->set_reduced_iso_notch = llrawproc_fake_gpu_backend_set_reduced_iso_notch;
+        g->set_iso_pattern = llrawproc_fake_gpu_backend_set_iso_pattern;
         g->reset_gl_texture_resources = llrawproc_fake_gpu_backend_reset_gl_texture_resources;
         g->destroy = llrawproc_fake_gpu_backend_destroy;
         g->take_cuda_error = llrawproc_fake_gpu_backend_take_cuda_error;
@@ -1981,7 +2052,60 @@ int llrpSetFakeGpuBackendReducedIsoNotchSymbolForTesting(int present)
     g->set_reduced_iso_notch =
         present ? llrawproc_fake_gpu_backend_set_reduced_iso_notch : NULL;
     if(!present) g_llrawproc_fake_gpu_backend_reduced_iso_notch = 0;
+    /* DUALISO-CONFIGURE-CACHE-1: the symbol came or went, so what was last told to it is unknown. */
+    g->notch_configured = 0;
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+    return 1;
+}
+
+/* DUALISO-CONFIGURE-CACHE-1 test-only: model an older DLL (present=0) that lacks
+ * igpu_recon_set_iso_pattern, or restore the symbol (present=1). */
+int llrpSetFakeGpuBackendIsoPatternSymbolForTesting(int present);
+int llrpSetFakeGpuBackendIsoPatternSymbolForTesting(int present)
+{
+    llrawprocGpuExportBackend_t * g = &g_llrawproc_gpu_export_backend;
+    if(!g_llrawproc_fake_gpu_backend_installed) return 0;
+    pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    llrawproc_gpu_recon_drain_deferred_releases_locked();
+    g->set_iso_pattern = present ? llrawproc_fake_gpu_backend_set_iso_pattern : NULL;
+    pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+    return 1;
+}
+
+/* DUALISO-CONFIGURE-CACHE-1 test-only: how many set_iso_pattern calls the fake took, and the ISO pattern
+ * its most recent run saw ({-1,-1,-1,-1} before any run). */
+void llrpFakeGpuBackendIsoPatternStateForTesting(uint64_t * set_calls, int * last_run_is_bright4);
+void llrpFakeGpuBackendIsoPatternStateForTesting(uint64_t * set_calls, int * last_run_is_bright4)
+{
+    if(set_calls) *set_calls = g_llrawproc_fake_gpu_backend_pattern_set_calls;
+    if(last_run_is_bright4)
+        memcpy(last_run_is_bright4, g_llrawproc_fake_gpu_backend_last_run_is_bright,
+               sizeof(g_llrawproc_fake_gpu_backend_last_run_is_bright));
+}
+
+/* DUALISO-CONFIGURE-CACHE-1 test-only: the whole backend state the fake's latest run executed under: the clip it
+ * held (dims, levels, ISO pattern), the LUT pointers it held and its notch flag. Returns 0 before any run. */
+int llrpFakeGpuBackendLastRunStateForTesting(int * width, int * height, int * black, int * white,
+                                             int * is_bright4, const void ** raw2ev, const void ** ev2raw,
+                                             const void ** mix, const void ** fullres, const void ** randn,
+                                             int * notch);
+int llrpFakeGpuBackendLastRunStateForTesting(int * width, int * height, int * black, int * white,
+                                             int * is_bright4, const void ** raw2ev, const void ** ev2raw,
+                                             const void ** mix, const void ** fullres, const void ** randn,
+                                             int * notch)
+{
+    if(!g_llrawproc_fake_gpu_backend_last_run_state_valid) return 0;
+    if(width) *width = g_llrawproc_fake_gpu_backend_last_run_clip.width;
+    if(height) *height = g_llrawproc_fake_gpu_backend_last_run_clip.height;
+    if(black) *black = g_llrawproc_fake_gpu_backend_last_run_clip.black_level;
+    if(white) *white = g_llrawproc_fake_gpu_backend_last_run_clip.white_level;
+    if(is_bright4) memcpy(is_bright4, g_llrawproc_fake_gpu_backend_last_run_clip.is_bright, 4 * sizeof(int));
+    if(raw2ev) *raw2ev = g_llrawproc_fake_gpu_backend_last_run_luts.raw2ev;
+    if(ev2raw) *ev2raw = g_llrawproc_fake_gpu_backend_last_run_luts.ev2raw;
+    if(mix) *mix = g_llrawproc_fake_gpu_backend_last_run_luts.mix_curve;
+    if(fullres) *fullres = g_llrawproc_fake_gpu_backend_last_run_luts.fullres_curve;
+    if(randn) *randn = g_llrawproc_fake_gpu_backend_last_run_luts.randn05;
+    if(notch) *notch = g_llrawproc_fake_gpu_backend_reduced_iso_notch;
     return 1;
 }
 
@@ -2153,6 +2277,11 @@ static int llrawproc_gpu_export_backend_available(int prefer_playback_dll)
         g->set_reduced_iso_notch = resolved.typed;
     }
     {
+        union { FARPROC raw; llrawproc_gpu_set_iso_pattern_fn typed; } resolved;
+        resolved.raw = GetProcAddress(g->dll, "igpu_recon_set_iso_pattern");
+        g->set_iso_pattern = resolved.typed;
+    }
+    {
         union { FARPROC raw; llrawproc_gpu_take_cuda_error_fn typed; } resolved;
         resolved.raw = GetProcAddress(g->dll, "igpu_recon_take_cuda_error");
         g->take_cuda_error = resolved.typed;
@@ -2189,6 +2318,10 @@ static int llrawproc_gpu_export_backend_available(int prefer_playback_dll)
         llrawproc_gpu_export_backend_create_failed(g, dll_path, backend_name);
         return 0;
     }
+    /* DUALISO-CONFIGURE-CACHE-1: a new backend holds no clip, LUTs or notch flag. */
+    g->clip_configured = 0;
+    g->luts_configured = 0;
+    g->notch_configured = 0;
 
     return 1;
 }
@@ -2669,6 +2802,7 @@ static void llrawproc_gpu_recon_luts_key_from_state(
     key->apply_dither = state->apply_dither;
     key->ev_correction = state->ev_correction;
     key->dark_noise = state->dark_noise;
+    key->lut_generation = state->lut_generation;
 }
 
 /* CUDA-RECON-DUALISO-TIMER-SPLIT-1 (adversary r1 A1): a run_backend call refused
@@ -2718,6 +2852,11 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     int set_clip_called = 0;
     const char * set_clip_changed = "none";
     int set_luts_called = 0;
+    /* DUALISO-CONFIGURE-CACHE-1: the pattern-only configure. */
+    int set_pattern_called = 0;
+    int set_pattern_rc = 0;
+    double set_pattern_start_s = 0.0;
+    double set_pattern_ms = 0.0;
     double set_clip_start_s = 0.0;
     double set_clip_ms = 0.0;
     double set_luts_start_s = 0.0;
@@ -2825,14 +2964,31 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         if(rc_out) *rc_out = -3;
         return 0;
     }
+    /* DUALISO-CONFIGURE-CACHE-1. What the backend holds, per input it reads:
+     *   clip geometry (width, height, black, white)  -> igpu_recon_set_clip (buffers, constants)
+     *   ISO pattern is_bright[4]                      -> igpu_recon_set_iso_pattern, else set_clip
+     *   LUT key (pointers, levels, dither, ev, noise) -> igpu_recon_set_luts
+     *   notch flag                                    -> igpu_recon_set_reduced_iso_notch
+     * The dual-ISO prepare re-derives the pattern per frame (M16-1457: 1438 of 1439 frames differ
+     * from the previous one at constant dims and levels); the backend's run re-pushes the pattern
+     * constants itself and set_clip never touches the LUT buffers, so a pattern-only change must
+     * neither re-upload the LUTs nor pay a set_clip. Geometry changes keep the full set_clip plus
+     * set_luts of before. */
     const int clip_matches =
         g->clip_configured
         && memcmp(&g->configured_clip, &clip, sizeof(clip)) == 0;
+    const int geometry_matches =
+        g->clip_configured
+        && g->configured_clip.width == clip.width
+        && g->configured_clip.height == clip.height
+        && g->configured_clip.black_level == clip.black_level
+        && g->configured_clip.white_level == clip.white_level;
     const int luts_match =
         g->luts_configured
         && memcmp(&g->configured_luts_key, &luts_key, sizeof(luts_key)) == 0;
-    const int need_set_clip = !clip_matches;
-    const int need_set_luts = need_set_clip || !luts_match;
+    int need_set_pattern = !clip_matches && geometry_matches && g->set_iso_pattern != NULL;
+    int need_set_clip = !clip_matches && !need_set_pattern;
+    const int need_set_luts = (need_set_clip && !geometry_matches) || !luts_match;
 
     if(need_set_clip
      && g->clip_configured
@@ -2853,6 +3009,24 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
         if(rc_out) *rc_out = LLRP_GPU_PLAYBACK_RECON_RC_NO_REDUCED_ISO_NOTCH;
         return 0;
+    }
+    if(need_set_pattern)
+    {
+        set_pattern_start_s = mlv_stage_timing_now();
+        set_pattern_rc = g->set_iso_pattern(g->backend, clip.is_bright);
+        set_pattern_ms = (mlv_stage_timing_now() - set_pattern_start_s) * 1000.0;
+        set_pattern_called = 1;
+        InterlockedIncrement64(&g_llrawproc_gpu_set_iso_pattern_count);
+        if(set_pattern_rc == 0)
+        {
+            memcpy(g->configured_clip.is_bright, clip.is_bright, sizeof(clip.is_bright));
+        }
+        else
+        {
+            /* The backend refused the pattern: configure in full, as an older DLL would. */
+            need_set_pattern = 0;
+            need_set_clip = 1;
+        }
     }
     if(need_set_clip)
     {
@@ -2883,7 +3057,8 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         {
             g->configured_clip = clip;
             g->clip_configured = 1;
-            g->luts_configured = 0;
+            /* set_clip leaves the LUT buffers alone; a geometry change keeps the re-upload of before. */
+            if(!geometry_matches) g->luts_configured = 0;
         }
         else
         {
@@ -2922,8 +3097,21 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     }
     if(rc == 0 && g->set_reduced_iso_notch)
     {
-        /* Sticky in the backend: set it for every run, 1 only for reduced dims. */
-        rc = g->set_reduced_iso_notch(g->backend, reduced_iso_notch ? 1 : 0);
+        /* Sticky in the backend, 1 only for reduced dims: told once per change, not once per run. */
+        const int want_notch = reduced_iso_notch ? 1 : 0;
+        if(!g->notch_configured || g->configured_notch != want_notch)
+        {
+            rc = g->set_reduced_iso_notch(g->backend, want_notch);
+            if(rc == 0)
+            {
+                g->notch_configured = 1;
+                g->configured_notch = want_notch;
+            }
+            else
+            {
+                g->notch_configured = 0;
+            }
+        }
     }
     if(rc == 0)
     {
@@ -3175,9 +3363,20 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         }
     }
 
-    if(g_llrawproc_gpu_recon_event_logger && (set_clip_called || set_luts_called))
+    if(g_llrawproc_gpu_recon_event_logger && (set_clip_called || set_luts_called || set_pattern_called))
     {
         char line[256];
+        if(set_pattern_called)
+        {
+            snprintf(line, sizeof(line),
+                     "gpu_recon_event kind=set_iso_pattern frame=%llu wall_ms=%.3f dur_ms=%.3f "
+                     "width=%d height=%d rc=%d count=%lld pattern=%d%d%d%d",
+                     (unsigned long long)frame_id, set_pattern_start_s * 1000.0, set_pattern_ms,
+                     clip.width, clip.height, set_pattern_rc,
+                     (long long)g_llrawproc_gpu_set_iso_pattern_count,
+                     clip.is_bright[0], clip.is_bright[1], clip.is_bright[2], clip.is_bright[3]);
+            g_llrawproc_gpu_recon_event_logger(line);
+        }
         if(set_clip_called)
         {
             snprintf(line, sizeof(line),
@@ -3606,6 +3805,35 @@ int llrpGpuPlaybackReconRunRetainedDeviceBayer16(
                                                retained_out, rc_out, timing_out, 0);
 }
 
+/* DUALISO-CONFIGURE-CACHE-1 r3 test-only: one run exactly as the reduced route makes it (reduced_iso_notch=1,
+ * through llrawproc_gpu_playback_run_retained), with the retained output released at once so a later run may
+ * change dims. Only the reduced route passes the notch flag, and it needs a whole MLV frame to get there. */
+int llrpGpuPlaybackReconRunReducedNotchProbeForTesting(const llrpGpuPlaybackReconState_t * state,
+                                                       const uint16_t * raw_input_bayer14,
+                                                       size_t raw_image_size,
+                                                       int * rc_out);
+static int llrawproc_gpu_playback_run_retained(
+    const llrpGpuPlaybackReconState_t * state,
+    const uint16_t * raw_input_bayer14,
+    size_t raw_image_size,
+    llrpGpuPlaybackRetainedDeviceBayer16_t * retained_out,
+    int * rc_out,
+    llrpGpuPlaybackReconTiming_t * timing_out,
+    int reduced_iso_notch);
+int llrpGpuPlaybackReconRunReducedNotchProbeForTesting(const llrpGpuPlaybackReconState_t * state,
+                                                       const uint16_t * raw_input_bayer14,
+                                                       size_t raw_image_size,
+                                                       int * rc_out)
+{
+    llrpGpuPlaybackRetainedDeviceBayer16_t retained;
+    llrpGpuPlaybackReconTiming_t timing;
+    memset(&retained, 0, sizeof(retained));
+    const int used = llrawproc_gpu_playback_run_retained(state, raw_input_bayer14, raw_image_size,
+                                                         &retained, rc_out, &timing, 1);
+    if(used && retained.token) llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(retained.token);
+    return used;
+}
+
 /* PLAYBACK-CUDA-HONOUR-SCALE-1 r2: reduced_iso_notch=1 only for the reduced
  * route (llrawproc_with_dims_gpu_playback_texture). */
 static int llrawproc_gpu_playback_run_retained(
@@ -3768,6 +3996,11 @@ uint64_t llrpGpuPlaybackReconSetClipCount(void)
 uint64_t llrpGpuPlaybackReconSetLutsCount(void)
 {
     return (uint64_t)InterlockedCompareExchange64(&g_llrawproc_gpu_set_luts_count, 0, 0);
+}
+
+uint64_t llrpGpuPlaybackReconSetIsoPatternCount(void)
+{
+    return (uint64_t)InterlockedCompareExchange64(&g_llrawproc_gpu_set_iso_pattern_count, 0, 0);
 }
 
 void llrpSetGpuReconEventLogger(llrpGpuReconEventLogger_t logger)

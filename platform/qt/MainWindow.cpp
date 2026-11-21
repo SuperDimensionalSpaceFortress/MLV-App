@@ -349,6 +349,9 @@ static bool buildGpuPlaybackReconStateForTexturePresent(
         source.applyDither ? source.luts->randn05.data() : nullptr;
     destination->apply_dither = source.applyDither ? 1 : 0;
     destination->frame_id = source.frameId;
+    /* adversary r7 A1: the stamp of the source tables travels with the snapshot, so a fresh snapshot that lands at a
+     * freed one's address (or a rewrite of the source tables) is not mistaken for no change by the backend's LUT key. */
+    destination->lut_generation = source.lutGeneration;
     return true;
 }
 
