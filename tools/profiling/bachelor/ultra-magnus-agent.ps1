@@ -783,10 +783,23 @@ function Get-DescendantProcessIdentities {
             }
         }
     }
+    # r5 (adversary pass 6 A1, the null-start variant): a root row whose CreationDate cannot be read (whatever read it came from) cannot be compared with the
+    # recorded start, and the recorded start would then stand in for it, so a replacement root's child would pass both checks. Fail closed: unverifiable.
+    if ($null -eq $rootUnverifiable -and $null -ne $RootStartEpochMs) {
+        foreach ($rootStartRow in $all) {
+            try {
+                if ($null -eq $rootStartRow -or $null -eq $rootStartRow.ProcessId -or [int]$rootStartRow.ProcessId -ne $ParentProcessId) { continue }
+                $rootRowStart = $null
+                if ($rootStartRow.CreationDate) { $rootRowStart = ([DateTime]$rootStartRow.CreationDate).ToUniversalTime() }
+                if ($null -eq $rootRowStart) { $rootUnverifiable = 'the root row has no readable start'; break }
+            }
+            catch { $rootUnverifiable = 'the root row has no readable start'; break }
+        }
+    }
     $recPartial = if ($null -ne $rootUnverifiable) { $false } elseif ($fbAttempted) { $fellBack } else { $all.Count -gt 0 }
-    if ($null -eq $snapshotError -and -not $skipSnapshot) { $walkRecord.rows = $all.Count }   # r4 (pass 5 A11): a complete read reports the rows it saw
-    if ($null -ne $snapshotError) {
-        $walkWhy = if ($null -ne $rootUnverifiable) { "$snapshotError; root row unreadable; children not walked ($rootUnverifiable)" } else { $snapshotError }
+    if ($null -eq $snapshotError -and -not $skipSnapshot -and $null -eq $rootUnverifiable) { $walkRecord.rows = $all.Count }   # r4 (pass 5 A11): a complete read reports the rows it saw
+    if ($null -ne $snapshotError -or $null -ne $rootUnverifiable) {
+        $walkWhy = if ($null -eq $rootUnverifiable) { $snapshotError } elseif ($null -ne $snapshotError) { "$snapshotError; root row unreadable; children not walked ($rootUnverifiable)" } else { "root row unreadable; children not walked ($rootUnverifiable)" }
         $walkRecord = [pscustomobject]@{ ok = $false; partial = $recPartial; rows = $all.Count; why = $walkWhy; rootPid = $ParentProcessId }
         $nowTs = [System.Diagnostics.Stopwatch]::GetTimestamp()
         $ageSec = { param($ts) ($nowTs - [int64]$ts) / [double][System.Diagnostics.Stopwatch]::Frequency }
@@ -1108,6 +1121,23 @@ function Complete-WindowlessRedirectedProcess {
         }
     }
     if ($null -ne $disposeError) { throw $disposeError }
+}
+
+function Get-LostJobDiagnostics {
+    # r5 (adversary pass 6 A2): the job monitor writes its diagnostics (a failed output capture, an incomplete post-exit census) into the job's err file, and
+    # the receipt reads that file back. An append the file refuses (read-only, locked) is non-terminating, so the line would vanish and the receipt would
+    # publish a clean exit. Given what the receipt read back, this returns the diagnostics that are missing from it; the caller adds them to the receipt's
+    # stderr and the agent log, so a capture failure or an incomplete census is never silent.
+    param([string]$Stderr, $CaptureDrainFailure, $PostExitWalk)
+    $lost = [System.Collections.Generic.List[string]]::new()
+    $text = if ($null -eq $Stderr) { '' } else { $Stderr }
+    if ($null -ne $CaptureDrainFailure -and -not $text.Contains('output capture failed:')) {
+        $lost.Add("output capture failed: $CaptureDrainFailure (the job's stdout/stderr may be incomplete; this line could not be written to the job's err file)")
+    }
+    if ($null -ne $PostExitWalk -and -not $PostExitWalk.ok -and -not $text.Contains('post-exit descendant census')) {
+        $lost.Add("post-exit descendant census $(if ($PostExitWalk.partial) { 'PARTIAL' } else { 'FAILED' }) ($($PostExitWalk.why)): descendants it did not list may still be running (this line could not be written to the job's err file)")
+    }
+    return @($lost)
 }
 
 function Get-JobMetadata {
@@ -5032,6 +5062,7 @@ function Invoke-QueuedJob {
     $errFile = Join-Path $logs "$jobId.err.txt"
     $monitorFailureNote = $null   # r4 (pass 4 A5): set by the catch below, appended after the output capture is drained
     $captureDrainFailure = $null  # r4 (pass 5 A6): set when draining the output capture failed; written into the job's stderr
+    $postExitWalk = $null         # r5 (pass 6 A2): the post-exit census record of THIS job, read back at the receipt (set in the normal-exit branch)
     $started = (Get-Date).ToUniversalTime().ToString("o")
     $exit = $null
     $timedOut = $false
@@ -5260,6 +5291,12 @@ function Invoke-QueuedJob {
     # r4 (pass 5 A8): -LiteralPath: a job id with [ ] in it names its own file, never a wildcard match of another job's log.
     $stdout = if (Test-Path -LiteralPath $outFile) { Get-Content -LiteralPath $outFile -Raw } else { "" }
     $stderr = if (Test-Path -LiteralPath $errFile) { Get-Content -LiteralPath $errFile -Raw } else { "" }
+    # r5 (pass 6 A2): a diagnostic the err file refused is not lost: it is added to the receipt's stderr (in memory) and named in agent.log.
+    $lostDiagnostics = @(Get-LostJobDiagnostics -Stderr $stderr -CaptureDrainFailure $captureDrainFailure -PostExitWalk $(if ($null -ne $postExitWalk -and $null -ne $marker -and $postExitWalk.rootPid -eq $marker.childPid) { $postExitWalk } else { $null }))
+    if ($lostDiagnostics.Count -gt 0) {
+        $stderr = "$stderr$(if ($stderr -and -not $stderr.EndsWith("`n")) { "`r`n" })$($lostDiagnostics -join "`r`n")`r`n"
+        Add-AgentLogLine "job diagnostics not persisted to the err file job=${jobId}: $($lostDiagnostics -join ' | ')"
+    }
     # r2b: the child fields come from this agent's own in-memory marker, which holds them whether or not the
     # launched write ever verified (a launch that threw leaves childPid null, as before).
     # quiet-lease r1: the lease's renew record joins the admission (the result's shape is unchanged).

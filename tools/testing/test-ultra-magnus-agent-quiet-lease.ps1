@@ -6369,6 +6369,16 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $o['g6Exited'] = & $g6Run @((New-RtProc 4631 4630 5)) @((New-RtProc 4631 4630 5)) $true 4630
             # (e) control: the root-row read returns the SAME start (the same process): the children are walked.
             $o['g6SameStart'] = & $g6Run @((New-RtProc 4640 1 0), (New-RtProc 4641 4640 3)) @((New-RtProc 4641 4640 3)) $true 4640
+            # r5 (adversary pass 6 A1, the null-start variant): the root-row read returns the root with NO readable CreationDate: it cannot be compared with the
+            # recorded start (which would stand in for it), so the root is unverifiable and nothing is emitted under it. (f) after a partial read; (g) a COMPLETE read.
+            $g6NullRoot = { param([int]$Id) $nr = New-RtProc $Id 1 0; $nr.CreationDate = $null; $nr }
+            $o['g6NullStartPartial'] = & $g6Run @((& $g6NullRoot 4670), (New-RtProc 4671 4670 41)) @((New-RtProc 4671 4670 41)) $true 4670
+            $script:RtTable = @((& $g6NullRoot 4680), (New-RtProc 4681 4680 41))
+            $script:RtFailEmpty = $false; $script:RtFilterRows = $false; $script:RtFail = $null; $script:RtFullRows = $null
+            $script:RtTimeouts.Clear(); $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null
+            $g6cw = @(Get-DescendantProcessIdentities -ParentProcessId 4680 -RootStartEpochMs $rootMs)
+            $g6cr = $script:LastDescendantWalk
+            $o['g6NullStartComplete'] = [pscustomobject]@{ ids = (& $ids $g6cw); ok = $g6cr.ok; partial = $g6cr.partial; why = [string]$g6cr.why; queries = $script:RtTimeouts.Count }
             # r5 (variant coverage, pass 5 A4's second shape: "at 3886 the same empty result wrongly classifies a live lease child as foreign"): the lease owner
             # check reads the same walk. (i) the full read fails with no rows and the per-parent reads answer: the wrapper's live child is still its child.
             # (ii) the G6 shape: a failed read that returned the replacement wrapper's child but not the wrapper's row: that child is NOT the wrapper's child.
@@ -6466,7 +6476,11 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True ($g6d.ids -eq '4631' -and $g6d.reuseLines -eq 0 -and $g6d.ok -eq $false -and $g6d.partial -eq $true -and $g6d.queries -eq 2) "cim-walk-root-start: (G6 d) control: the root-row read returns no row (the root exited, the pid is free): the recorded start is authoritative and the real child is walked: $rtTxt"
         $g6e = $rtOut['g6SameStart']
         Assert-True ($g6e.ids -eq '4641' -and $g6e.reuseLines -eq 0 -and $g6e.queries -eq 2) "cim-walk-root-start: (G6 e) control: the root-row read returns the SAME start (the same process): the child is walked: $rtTxt"
-        Assert-True ($rtOut['ownerFallback'].ok -eq $true) "cim-walk-root-start: (variant, pass 5 A4 second shape) the lease owner check, with the full read failed and the per-parent reads answering, still accepts the wrapper's live child: $rtTxt"
+        $g6f = $rtOut['g6NullStartPartial']
+        Assert-True ($g6f.ids -eq '' -and $g6f.ok -eq $false -and $g6f.partial -eq $false -and $g6f.why.Contains('the root row has no readable start') -and $g6f.why.Contains('children not walked') -and $g6f.queries -eq 2) "cim-walk-root-start: (pass 6 A1 variant f) the root-row read returns the root with no readable start: the replacement root's child is NOT emitted and the walk record says the root is unverifiable: $rtTxt"
+        $g6g = $rtOut['g6NullStartComplete']
+        Assert-True ($g6g.ids -eq '' -and $g6g.ok -eq $false -and $g6g.why.Contains('the root row has no readable start') -and $g6g.queries -eq 1) "cim-walk-root-start: (pass 6 A1 variant g) a COMPLETE read whose root row has no readable start is unverifiable too (the recorded start must not stand in for it): $rtTxt"
+        Assert-True ($rtOut['ownerFallback'].ok -eq $true)"cim-walk-root-start: (variant, pass 5 A4 second shape) the lease owner check, with the full read failed and the per-parent reads answering, still accepts the wrapper's live child: $rtTxt"
         Assert-True ($rtOut['ownerG6'].ok -eq $false) "cim-walk-root-start: (variant, G6) the lease owner check refuses a child of a REUSED wrapper pid when the failed read lacked the wrapper's row: $rtTxt"
         $frt = $rtOut['fallbackRowsThenThrow']
         Assert-True ($frt.ids -eq '7101' -and $frt.rows -eq 2 -and $frt.partial -eq $true -and $frt.ok -eq $false) "cim-walk-root-start: (variant, pass 5 A5 second shape) a per-parent read that returns the child and then THROWS keeps the child and records PARTIAL: $rtTxt"
@@ -6556,6 +6570,26 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             [pscustomobject]@{ first = $s1; second = $s2; errClosed = (-not $sdErr.CanWrite) }
         }
         Assert-True ($sdOut.first -match 'stdout dispose broke' -and $null -eq $sdOut.second -and $sdOut.errClosed) "cim-walk-root-start: (variant, pass 5 A6 second shape) a stdout Dispose that throws does not skip the stderr Dispose; the failure propagates once and a second drain is a no-op: $($sdOut | ConvertTo-Json -Compress)"
+        # r5 (adversary pass 6 A2): a diagnostic the job's err file refused (read-only, locked) is re-added to the receipt's stderr and named in agent.log, so a
+        # failed output capture or an incomplete post-exit census never publishes as a clean exit.
+        $ldOut = & {
+            . ([scriptblock]::Create((Get-FunctionBody 'Get-LostJobDiagnostics')))
+            $ldOk = [pscustomobject]@{ ok = $true; partial = $false; why = $null }
+            $ldBad = [pscustomobject]@{ ok = $false; partial = $true; why = 'RPC error' }
+            [pscustomobject]@{
+                none = @(Get-LostJobDiagnostics -Stderr '' -CaptureDrainFailure $null -PostExitWalk $ldOk).Count
+                capLost = @(Get-LostJobDiagnostics -Stderr '' -CaptureDrainFailure 'capture failed' -PostExitWalk $null)
+                capKept = @(Get-LostJobDiagnostics -Stderr "x`noutput capture failed: capture failed (the job's stdout/stderr may be incomplete)`n" -CaptureDrainFailure 'capture failed' -PostExitWalk $null).Count
+                censusLost = @(Get-LostJobDiagnostics -Stderr 'job output' -CaptureDrainFailure $null -PostExitWalk $ldBad)
+                censusKept = @(Get-LostJobDiagnostics -Stderr 'post-exit descendant census PARTIAL (RPC error): ...' -CaptureDrainFailure $null -PostExitWalk $ldBad).Count
+                nullStderr = @(Get-LostJobDiagnostics -Stderr $null -CaptureDrainFailure 'c' -PostExitWalk $null).Count
+            }
+        }
+        Assert-True ($ldOut.none -eq 0 -and $ldOut.capLost.Count -eq 1 -and $ldOut.capLost[0].Contains('output capture failed: capture failed') -and $ldOut.capLost[0].Contains('could not be written') -and $ldOut.capKept -eq 0 -and $ldOut.censusLost.Count -eq 1 -and $ldOut.censusLost[0].Contains('PARTIAL (RPC error)') -and $ldOut.censusKept -eq 0 -and $ldOut.nullStderr -eq 1) "cim-walk-root-start: (pass 6 A2) Get-LostJobDiagnostics returns exactly the diagnostics missing from the stderr the receipt read back (a refused capture-failure or census line), and nothing for ones that are there: $($ldOut | ConvertTo-Json -Compress -Depth 4)"
+        $ldCalls = @($rtQj.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-LostJobDiagnostics' }, $true))
+        $ldReadBack = @($rtQj.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-Content' -and $n.Extent.Text.Contains('$errFile') }, $true))
+        $ldResult = @($rtQj.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -ceq '$result' }, $true))
+        Assert-True ($ldCalls.Count -eq 1 -and (& $rtHasParam $ldCalls[0] 'CaptureDrainFailure') -and (& $rtHasParam $ldCalls[0] 'PostExitWalk') -and $ldReadBack.Count -ge 1 -and $ldResult.Count -ge 1 -and $ldCalls[0].Extent.StartOffset -gt $ldReadBack[$ldReadBack.Count - 1].Extent.StartOffset -and $ldCalls[0].Extent.EndOffset -lt $ldResult[0].Extent.StartOffset) "cim-walk-root-start: (pass 6 A2) Invoke-QueuedJob checks the diagnostics after it reads the err file back and before it builds the receipt (calls=$($ldCalls.Count))"
         $rtDrains = @($rtQj.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Complete-WindowlessRedirectedProcess' }, $true))
         $rtUncaught = @($rtDrains | Where-Object {
             $dn = $_; $caught = $false; $cur = $dn.Parent
