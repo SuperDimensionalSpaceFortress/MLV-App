@@ -467,7 +467,7 @@ function Get-VenueBackoffMs {
     # The back-off before the next attempt: 40 ms x attempt, cut to what is left of a budget (adversary A6) so a sleep never runs past it.
     param([int]$Attempt, [Diagnostics.Stopwatch]$Clock, [double]$BudgetSec = 0)
     $ms = 40.0 * $Attempt
-    if ($BudgetSec -gt 0) { $ms = [Math]::Min($ms, ($BudgetSec - $Clock.Elapsed.TotalSeconds) * 1000.0) }
+    if ($BudgetSec -gt 0) { $ms = [Math]::Min([double]$ms, ($BudgetSec - $Clock.Elapsed.TotalSeconds) * 1000.0) }   # a [double] first operand (the Int32 overload rounds)
     [int][Math]::Floor([Math]::Max(0.0, $ms))   # Floor, never a cast ([int]0.6 is 1): a back-off never outlasts what is left
 }
 
