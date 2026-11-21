@@ -1536,9 +1536,21 @@ batchRenderedVideoFfmpegBinaryPlanFromResolvedPath(
     const QString & resolvedExecutable)
 ;
 
-/* Pure lookup. Only the DEFAULT request (empty or the bare name "ffmpeg") searches
- * applicationDirectory first and falls back to PATH; any other request is resolved on PATH
- * alone, exactly as ...FromResolvedPath(request, resolver(request, {})) always did. */
+/* "ffmpeg" -> "ffmpeg.exe" on Windows, unchanged elsewhere: the exact packaged file name the
+ * application-directory lookup asks for. */
+QString batchRenderedVideoAppDirExecutableName(
+    const QString & bareName)
+;
+
+/* QStandardPaths::findExecutable; for an app-dir search (non-empty searchDirs) a hit must
+ * also be a non-empty regular file. */
+BatchRenderedVideoExecutableResolver batchRenderedVideoSystemExecutableResolver()
+;
+
+/* Pure lookup. Only the DEFAULT request (no request at all: empty or blank) searches
+ * applicationDirectory first and falls back to PATH; any other request -- including the bare
+ * name "ffmpeg" passed explicitly -- is resolved on PATH alone, exactly as
+ * ...FromResolvedPath(request, resolver(request, {})) always did. */
 BatchRenderedVideoFfmpegBinaryPlan
 batchRenderedVideoFfmpegBinaryPlanFromLookup(
     const QString & requestedExecutable,
@@ -1546,9 +1558,15 @@ batchRenderedVideoFfmpegBinaryPlanFromLookup(
     const BatchRenderedVideoExecutableResolver & resolver)
 ;
 
+/* No argument = the default request (app directory, then PATH). */
 BatchRenderedVideoFfmpegBinaryPlan
 batchRenderedVideoFfmpegBinaryPlanFromCurrentEnvironment(
-    const QString & requestedExecutable = QStringLiteral("ffmpeg"))
+    const QString & requestedExecutable = QString())
+;
+
+/* Preflight: a PATH hit, or a resolvedExecutable that still exists. */
+bool batchRenderedVideoFfmpegBinaryPlanUsableAtPreflight(
+    const BatchRenderedVideoFfmpegBinaryPlan & plan)
 ;
 
 BatchRenderedVideoMediaProbeBinaryPlan
@@ -1572,7 +1590,7 @@ batchRenderedVideoMediaProbeBinaryPlanFromLookup(
 
 BatchRenderedVideoMediaProbeBinaryPlan
 batchRenderedVideoMediaProbeBinaryPlanFromCurrentEnvironment(
-    const QString & requestedExecutable = QStringLiteral("ffprobe"))
+    const QString & requestedExecutable = QString())
 ;
 
 QString batchRenderedVideoCommandExecutableForDisplay(

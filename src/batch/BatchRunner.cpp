@@ -1039,9 +1039,7 @@ int BatchRunner::run(const QString &inputPath, const QString &outputPath)
          * found, so an --rendered-ffmpeg typo would otherwise survive preflight and only
          * surface as a failed spawn (exit 4, "export failure"). It is a usage error:
          * report it as one, name what was searched, and exit 2 before touching the clip. */
-        if( !ffmpegBinaryPlan.foundOnPath
-         && !ffmpegBinaryPlan.foundInAppDir
-         && !QFileInfo::exists( ffmpegBinaryPlan.resolvedExecutable ) )
+        if( !batchRenderedVideoFfmpegBinaryPlanUsableAtPreflight( ffmpegBinaryPlan ) )
         {
             BatchLogger::err(QStringLiteral("[BATCH] ERROR: rendered-video export cannot find ffmpeg. requested=%1 resolved=%2 searched=%3. Pass --rendered-ffmpeg <path-to-ffmpeg> or put ffmpeg on PATH.\n")
                 .arg(ffmpegBinaryPlan.requestedExecutable)

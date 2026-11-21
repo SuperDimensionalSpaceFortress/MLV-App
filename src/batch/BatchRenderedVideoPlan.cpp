@@ -3653,22 +3653,29 @@ Plan batchRenderedVideoBinaryPlanFromLookup(
     FromResolvedPath fromResolvedPath)
 {
     const QString trimmed = requestedExecutable.trimmed();
-    const QString requested = trimmed.isEmpty() ? defaultName : trimmed;
     const auto resolve = [&resolver](const QString & name, const QStringList & dirs)
     {
         return resolver ? resolver(name, dirs) : QString();
     };
 
-    const QString appDir = applicationDirectory.trimmed();
-    if( requested != defaultName || appDir.isEmpty() )
-        return fromResolvedPath(requested, resolve(requested, QStringList()));
-
-    const QString cleanAppDir = QDir::cleanPath(appDir);
-    const QString appDirHit =
-        resolve(requested, QStringList{ cleanAppDir }).trimmed();
-    if( !appDirHit.isEmpty() )
+    /* Only NO request is the default. An explicit request -- even the bare default name,
+     * e.g. --rendered-ffmpeg ffmpeg -- keeps the PATH-only lookup (adversary A1). */
+    if( !trimmed.isEmpty() || applicationDirectory.isEmpty() )
     {
-        Plan plan = fromResolvedPath(requested, appDirHit);
+        const QString requested = trimmed.isEmpty() ? defaultName : trimmed;
+        return fromResolvedPath(requested, resolve(requested, QStringList()));
+    }
+
+    /* The application directory is an OS path: never trimmed (adversary A2). The packaged
+     * binary is asked for by its exact file name, so a stray ffmpeg.com / .bat / .cmd beside
+     * it can never shadow it (adversary A3). */
+    const QString cleanAppDir = QDir::cleanPath(applicationDirectory);
+    const QString appDirHit = resolve(
+        batchRenderedVideoAppDirExecutableName(defaultName),
+        QStringList{ cleanAppDir });
+    if( !appDirHit.trimmed().isEmpty() )
+    {
+        Plan plan = fromResolvedPath(defaultName, appDirHit);
         plan.source = QStringLiteral("app-dir");
         plan.pathSearchAttempted = false;
         plan.foundOnPath = false;
@@ -3677,7 +3684,7 @@ Plan batchRenderedVideoBinaryPlanFromLookup(
         return plan;
     }
 
-    Plan plan = fromResolvedPath(requested, resolve(requested, QStringList()));
+    Plan plan = fromResolvedPath(defaultName, resolve(defaultName, QStringList()));
     plan.appDirSearchAttempted = true;
     if( !plan.foundOnPath )
     {
@@ -3686,14 +3693,6 @@ Plan batchRenderedVideoBinaryPlanFromLookup(
                 .arg(defaultName, cleanAppDir);
     }
     return plan;
-}
-
-BatchRenderedVideoExecutableResolver batchRenderedVideoSystemExecutableResolver()
-{
-    return [](const QString & name, const QStringList & searchDirs)
-    {
-        return QStandardPaths::findExecutable(name, searchDirs);
-    };
 }
 
 /* Read here, in the *FromCurrentEnvironment wrappers only. No instance (a console test)
@@ -3706,6 +3705,42 @@ QString batchRenderedVideoCurrentApplicationDirectory()
 }
 
 } /* anonymous namespace */
+
+QString batchRenderedVideoAppDirExecutableName(
+    const QString & bareName)
+{
+#ifdef Q_OS_WIN
+    return bareName + QStringLiteral(".exe");
+#else
+    return bareName;
+#endif
+}
+
+BatchRenderedVideoExecutableResolver batchRenderedVideoSystemExecutableResolver()
+{
+    return [](const QString & name, const QStringList & searchDirs) -> QString
+    {
+        const QString hit = QStandardPaths::findExecutable(name, searchDirs);
+        /* App-dir search only (PATH keeps today's rule): a candidate must be a non-empty
+         * regular file, so an empty placeholder never wins over a working PATH copy (A3). */
+        if( !searchDirs.isEmpty() && !hit.isEmpty() )
+        {
+            const QFileInfo info(hit);
+            if( !info.isFile() || info.size() <= 0 )
+                return QString();
+        }
+        return hit;
+    };
+}
+
+bool batchRenderedVideoFfmpegBinaryPlanUsableAtPreflight(
+    const BatchRenderedVideoFfmpegBinaryPlan & plan)
+{
+    /* A PATH hit is trusted as before. Anything else -- an app-dir hit, an explicit path, a
+     * name nothing resolved -- must still exist when preflight runs, so a selection that
+     * vanished after the lookup is a usage error (exit 2), never a failed spawn (A4). */
+    return plan.foundOnPath || QFileInfo::exists(plan.resolvedExecutable);
+}
 
 BatchRenderedVideoMediaProbeBinaryPlan
 batchRenderedVideoMediaProbeBinaryPlanFromLookup(
@@ -3765,10 +3800,11 @@ batchRenderedVideoMediaProbeBinaryPlanFromResolvedPath(
     plan.pathSearchOwned = true;
     plan.pathSearchAttempted = true;
 
-    const QString resolved = resolvedExecutable.trimmed();
-    if( !resolved.isEmpty() )
+    /* A resolved path is an OS path: a blank one means "not found", but a real one is never
+     * trimmed (a trailing U+3000 is a legal file-name character; adversary A2). */
+    if( !resolvedExecutable.trimmed().isEmpty() )
     {
-        plan.resolvedExecutable = QDir::cleanPath(resolved);
+        plan.resolvedExecutable = QDir::cleanPath(resolvedExecutable);
         plan.foundOnPath = true;
         plan.commandExecutableReady = true;
         plan.reason.clear();
@@ -3824,10 +3860,11 @@ batchRenderedVideoFfmpegBinaryPlanFromResolvedPath(
     plan.pathSearchOwned = true;
     plan.pathSearchAttempted = true;
 
-    const QString resolved = resolvedExecutable.trimmed();
-    if( !resolved.isEmpty() )
+    /* A resolved path is an OS path: a blank one means "not found", but a real one is never
+     * trimmed (a trailing U+3000 is a legal file-name character; adversary A2). */
+    if( !resolvedExecutable.trimmed().isEmpty() )
     {
-        plan.resolvedExecutable = QDir::cleanPath(resolved);
+        plan.resolvedExecutable = QDir::cleanPath(resolvedExecutable);
         plan.foundOnPath = true;
         plan.commandExecutableReady = true;
         plan.reason.clear();
