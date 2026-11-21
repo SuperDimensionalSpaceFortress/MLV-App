@@ -1795,6 +1795,214 @@ $r = Receive-Job $job -Wait -AutoRemoveJob
             self.assertIn(needle, run)
         self.assertTrue(all(b < 128 for b in LEASE_RUNNER.read_bytes()), f"{LEASE_RUNNER.name} is not ASCII")
 
+    # ---- r8: the seven module rules that settle r7's open majors (A1-A7 of the pass on bba152c0) as ONE policy ----
+    # rule 1 own tickets never block their owner (A2, A7)   rule 2 last-known phase (A1)   rule 3 BUSY is not loss (A4)   rule 4 renewal margin from the claim's claimedUtc (A5)
+    # rule 5 one deadline gate before EACH ticket call (A3)   rule 6 -BudgetSec bound and asked before each lock attempt, read and temp write (A6)   rule 7 the give-back's position from the post-give-back census
+
+    OWN_STRANDED = """
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -Purpose 'P batch 1' -ClaimDir $d
+Start-Sleep -Milliseconds 30
+$B = New-VenueTicket -Venue bachelor -RunDir 'run-A' -Purpose 'P batch 2' -ClaimDir $d
+$r = Request-VenueClaim -Venue bachelor -RunDir 'run-A' -Purpose 'P batch 2' -ClaimDir $d -Ticket $B
+[pscustomobject]@{ state = [string]$r.state; granted = [bool]$r.granted } | ConvertTo-Json -Compress
+"""
+
+    def test_r8_rule1_an_earlier_ready_ticket_of_the_same_process_and_run_never_blocks_its_owner(self) -> None:
+        # r8 rule 1 (r7 pass 3 A2, and the r6 A9 class "a batch queued behind itself"): a stranded ticket (its removal was BUSY) of this very process and run directory stays ready in the line; the
+        # next batch's ticket queued behind it. The owner's pid and start ticks are in the file NAME, so a ticket of the caller's own process and run is never the head that blocks the caller.
+        r = self.ps(self.OWN_STRANDED)
+        self.assertEqual((r["state"], r["granted"]), ("TAKEN", True), f"a batch queued behind its own earlier ticket: {r}")
+
+    def test_r8_rule1_a_ticket_of_the_same_process_for_another_run_still_keeps_its_place(self) -> None:
+        # the FIFO contract is untouched: only the caller's own RUN is skipped, so two runs of one process (this test, the older chain tests) still queue in arrival order.
+        r = self.ps(self.OWN_STRANDED.replace("-RunDir 'run-A' -Purpose 'P batch 2' -ClaimDir $d\n$r", "-RunDir 'run-B' -Purpose 'P batch 2' -ClaimDir $d\n$r").replace("-RunDir 'run-A' -Purpose 'P batch 2' -ClaimDir $d -Ticket", "-RunDir 'run-B' -Purpose 'P batch 2' -ClaimDir $d -Ticket"))
+        self.assertEqual((r["state"], r["granted"]), ("QUEUED", False), f"a younger run of the same process passed an older ready ticket: {r}")
+
+    ADOPT_BUSY = """
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -Purpose 'P batch 1' -ClaimDir $d -Phase cooldown -StaleAfterSec 600
+Start-Sleep -Milliseconds 30
+$C = New-VenueTicket -Venue bachelor -RunDir 'run-C' -ClaimDir $d -OwnerPid @@S@@
+$hold = [IO.File]::Open($A.path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+$r1 = Request-VenueClaim -Venue bachelor -RunDir 'run-A' -Purpose 'P batch 1' -ClaimDir $d -UseTicket
+$files = @(Get-ChildItem -LiteralPath (Split-Path -Parent $A.path) -Filter '*.ticket.json' -File).Count
+$hold.Dispose()
+$r2 = Request-VenueClaim -Venue bachelor -RunDir 'run-A' -Purpose 'P batch 1' -ClaimDir $d -UseTicket -Ticket $r1.ticket
+$end = [string](Remove-VenueTicket -Ticket $r2.ticket)
+$left = @(Get-ChildItem -LiteralPath (Split-Path -Parent $A.path) -Filter '*.ticket.json' -File).Count
+[pscustomobject]@{ adopted = ($r1.ticket.name -ceq $A.name); s1 = [string]$r1.state; note = [string]$r1.note; files = $files; s2 = [string]$r2.state; g2 = [bool]$r2.granted; end = $end; left = $left } | ConvertTo-Json -Compress
+"""
+
+    def test_r8_rule1_an_own_ticket_whose_file_is_busy_is_adopted_by_its_name_never_replaced_by_a_second_one(self) -> None:
+        # r8 rule 1 (r7 pass 3 A7): the original creation call is given up on, its file is busy (held exclusively), and the first claim request found no readable own ticket and made a SECOND, later one.
+        # The busy file's name carries this process's pid and start ticks: it is adopted by name, kept in the line (QUEUED, the flip not landed), and once readable it is flipped and ended with its own nonce.
+        s = self.sleeper()
+        r = self.ps(self.ADOPT_BUSY.replace("@@S@@", str(s.pid)))
+        self.assertTrue(r["adopted"], f"a second ticket was made beside the owner's own busy one: {r}")
+        self.assertEqual((r["s1"], r["files"]), ("QUEUED", 2), r)
+        self.assertIn("TICKET_PHASE_BUSY", r["note"], r)
+        self.assertEqual((r["s2"], r["g2"], r["end"], r["left"]), ("TAKEN", True, "REMOVED", 1), f"the adopted ticket could not be flipped and ended once its file was readable: {r}")
+
+    LAST_PHASE = """
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d -OwnerPid @@S@@
+Start-Sleep -Milliseconds 30
+$B = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$seen = @(Get-VenueTickets -Venue bachelor -ClaimDir $d)
+$hold = [IO.File]::Open($A.path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+$r = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $B
+$hold.Dispose()
+[pscustomobject]@{ state = [string]$r.state; granted = [bool]$r.granted; claimExists = (Test-Path -LiteralPath (Join-Path $d 'bachelor.claim.json')) } | ConvertTo-Json -Compress
+"""
+
+    def test_r8_rule2_an_older_ticket_last_seen_ready_keeps_that_phase_while_its_file_is_held(self) -> None:
+        # r8 rule 2 (r7 pass 3 A1): an older READY ticket whose file is held open for longer than the settle window was skipped as "phase unknown" and a younger waiter took the claim. A ticket
+        # this process has read keeps its last-known phase while busy. (One never read stays "phase unknown, not ready": test_a_ticket_being_rewritten_whose_phase_cannot_be_read pins that.)
+        s = self.sleeper()
+        r = self.ps(self.LAST_PHASE.replace("@@S@@", str(s.pid)))
+        self.assertEqual((r["state"], r["granted"], r["claimExists"]), ("QUEUED", False, False), f"a younger waiter passed an older ticket last seen ready: {r}")
+
+    def test_r8_rule2_a_cooldown_ticket_last_seen_not_ready_never_blocks_while_busy(self) -> None:
+        s = self.sleeper()
+        r = self.ps(self.LAST_PHASE.replace("@@S@@", str(s.pid)).replace("-ClaimDir $d -OwnerPid", "-ClaimDir $d -Phase cooldown -StaleAfterSec 600 -OwnerPid"))
+        self.assertEqual((r["state"], r["granted"]), ("TAKEN", True), f"a ticket last seen in cooldown blocked a ready waiter: {r}")
+
+    def test_r8_rule3_a_busy_ownership_read_after_a_failed_give_back_is_not_a_loss(self) -> None:
+        # r8 rule 3 (r7 pass 3 A4): five give-backs answered BUSY (a reader holding the claim file with no share at all) and the ownership read that follows was BUSY too: B was told QUEUED while the file
+        # still named B. Only a positive different nonce, or FREE / STALE, is a loss.
+        mark = self.case / "seam-a4-mark.txt"
+        mod = self.seam_module("    $r = Invoke-VenueClaimAttempt @attemptArgs\n", "    [IO.File]::WriteAllText($env:SEAM_MARK, '1'); Start-Sleep -Milliseconds 2500\n    $r = Invoke-VenueClaimAttempt @attemptArgs\n    if ($r.granted) { Start-Sleep -Milliseconds 1500 }\n")
+        script = self.SEAM_A3B.replace("@@SEAMMOD@@", str(mod)).replace("@@MARK@@", str(mark)).replace("[IO.FileAccess]::Read, [IO.FileShare]::Read", "[IO.FileAccess]::Read, [IO.FileShare]::None")
+        self.assertIn("[IO.FileShare]::None", script.split("$cp = ")[1], "the scenario's observer must hold the claim file with no share")
+        r = self.ps(script)
+        self.assertEqual((r["state"], r["granted"], r["ours"]), ("TAKEN", True, True), f"a BUSY ownership read was counted as the claim's loss: {r}")
+
+    def test_r8_rule4_the_claim_age_is_read_from_the_claims_own_claimedutc(self) -> None:
+        # r8 rule 4 (r7 pass 3 A5): the lease batch measured the renewal margin from AFTER Request-VenueClaim returned, so a long census inside the request ate the margin unseen.
+        r = self.ps("""
+$now = [DateTime]::UtcNow
+$old = [pscustomobject]@{ claimedUtc = $now.AddSeconds(-63).ToString('o') }
+$none = [pscustomobject]@{ claimedUtc = 'not a date' }
+[pscustomobject]@{ age = [double](Get-VenueClaimAgeSec -Claim $old -NowUtc $now); bad = ($null -eq (Get-VenueClaimAgeSec -Claim $none -NowUtc $now)); nul = ($null -eq (Get-VenueClaimAgeSec -Claim $null -NowUtc $now)) } | ConvertTo-Json -Compress
+""")
+        self.assertAlmostEqual(r["age"], 63.0, delta=0.01)
+        self.assertTrue(r["bad"] and r["nul"], "an unreadable claimedUtc must answer $null (the caller then keeps its own measure)")
+        run = LEASE_RUNNER.read_text(encoding="utf-8")
+        at = run.index("$guardSec = ([DateTime]::UtcNow - $grantReadUtc).TotalSeconds")
+        self.assertIn("Get-VenueClaimAgeSec", run[at:at + 700], "the renewal margin is not measured from the claim's own claimedUtc")
+
+    def test_r8_rule5_a_ticket_call_is_gated_on_the_deadline_immediately_before_it_starts(self) -> None:
+        # r8 rule 5 (r7 pass 3 A3): the room before -DeadlineUtc was asked once per loop turn, so a stranded retry then the heartbeat both started inside one turn. The gate sits in Invoke-BatchTicketCall,
+        # the one place every worker-run ticket call (create, heartbeat, end, stranded retry, retake) starts from.
+        import re
+        run = LEASE_RUNNER.read_text(encoding="utf-8")
+        helper = re.search(r"function Invoke-BatchTicketCall.*?\n}\n", run, re.S)
+        self.assertIsNotNone(helper)
+        script = ("$ErrorActionPreference = 'Stop'\n" f"Import-Module '{MODULE}' -Force -DisableNameChecking\n$here = '{DV}'\n" + helper.group(0) + "\n"
+                  "$out = [ordered]@{}\n"
+                  "$deadline = [DateTime]::UtcNow.AddSeconds(3)\n$sw = [Diagnostics.Stopwatch]::StartNew()\n$near = Invoke-BatchTicketCall '1' @{}\n$out.nearMs = $sw.Elapsed.TotalMilliseconds; $out.nearAnswered = [bool]$near.answered; $out.nearError = [string]$near.error\n"
+                  "$deadline = [DateTime]::UtcNow.AddSeconds(60)\n$far = Invoke-BatchTicketCall '1' @{}\n$out.farAnswered = [bool]$far.answered\n[pscustomobject]$out | ConvertTo-Json -Compress\n")
+        f = self.case / "gate.ps1"
+        f.write_text(script, encoding="utf-8")
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(f)], capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        r = json.loads([l for l in p.stdout.splitlines() if l.strip()][-1])
+        self.assertFalse(r["nearAnswered"], f"a ticket call started with 3 s left before the deadline: {r}")
+        self.assertLess(r["nearMs"], 1500, r)
+        self.assertIn("NO_ROOM", r["nearError"], r)
+        self.assertTrue(r["farAnswered"], f"the gate refused a call with 60 s left: {r}")
+
+    def test_r8_rule5_a_claim_granted_by_the_first_inline_request_at_or_after_the_deadline_is_released_not_used(self) -> None:
+        run = LEASE_RUNNER.read_text(encoding="utf-8")
+        self.assertEqual(run.count("$lateGrant = "), 1, "the late-grant gate before the guard is missing or doubled")
+        at = run.index("$lateGrant = ")
+        self.assertLess(at, run.index("$claimGuardSec = [double]($ClaimTtlSec"), "the late-grant gate must sit before the claim guard")
+        self.assertIn("[DateTime]::UtcNow -ge $deadline", run[at:at + 200])
+
+    def test_r8_rule6_the_ticket_update_budget_is_bounded_to_zero_through_3600_seconds(self) -> None:
+        # r8 rule 6 (r7 pass 3 A8): -BudgetSec accepted NaN, -1 and Infinity, which supplied no finite cutoff (and NaN / -1 bypassed the positive-budget checks).
+        r = self.ps("""
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d
+$out = [ordered]@{}
+foreach ($v in @('NaN', '-1', 'Infinity', '3601', '0', '2.5', '3600')) {
+  $bad = $false
+  try { $null = Update-VenueTicket -Ticket $A -Phase 'waiting' -BudgetSec ([double]::Parse($v, [Globalization.CultureInfo]::InvariantCulture)) } catch { $bad = ($_.Exception.Message -match 'BudgetSec|range|Range|validat') }
+  $out["v$v"] = $bad
+}
+[pscustomobject]$out | ConvertTo-Json -Compress
+""")
+        for refused in ("vNaN", "v-1", "vInfinity", "v3601"):
+            self.assertTrue(r[refused], f"-BudgetSec {refused[1:]} was accepted: {r}")
+        for accepted in ("v0", "v2.5", "v3600"):
+            self.assertFalse(r[accepted], f"-BudgetSec {accepted[1:]} was refused: {r}")
+
+    BUDGET_SEAM = """
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d -Phase cooldown -StaleAfterSec 600
+$env:SEAM_READ = '@@READ@@'; $env:SEAM_TMP = '@@TMP@@'
+$r = Update-VenueTicket -Ticket $A -Phase 'waiting' -BudgetSec 0.2
+$phase = (Get-Content -LiteralPath $A.path -Raw | ConvertFrom-Json).phase
+[pscustomobject]@{ result = [string]$r; phase = $phase; read = (Test-Path -LiteralPath '@@READ@@'); tmp = (Test-Path -LiteralPath '@@TMP@@') } | ConvertTo-Json -Compress
+"""
+
+    def test_r8_rule6_no_ticket_read_starts_after_the_budget_ended_while_the_lock_was_taken(self) -> None:
+        # r8 rule 6 (r7 pass 3 A6): the budget was asked at the top of an attempt and before the publish, not before the read that follows a lock taken late.
+        mod = self.seam_text(("if ($null -eq $lock) { continue }", "if ($null -eq $lock) { continue }; Start-Sleep -Milliseconds 500"),
+                             ("$fs = [IO.File]::Open($Ticket.path, [IO.FileMode]::Open, [IO.FileAccess]::Read,", "[IO.File]::WriteAllText($env:SEAM_READ, '1'); $fs = [IO.File]::Open($Ticket.path, [IO.FileMode]::Open, [IO.FileAccess]::Read,"))
+        r = self.ps(self.BUDGET_SEAM.replace("@@READ@@", str(self.case / "seam-read.txt")).replace("@@TMP@@", str(self.case / "seam-tmp.txt")), module=mod)
+        self.assertFalse(r["read"], f"the ticket was read after the budget ended: {r}")
+        self.assertEqual((r["result"], r["phase"]), ("BUSY", "cooldown"), r)
+
+    def test_r8_rule6_no_temp_write_starts_after_the_budget_ended(self) -> None:
+        mod = self.seam_text(("$tmp = $Path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'", "$tmp = $Path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'; Start-Sleep -Milliseconds 500"),
+                             ("$fs = [IO.File]::Open($tmp, [IO.FileMode]::CreateNew,", "[IO.File]::WriteAllText($env:SEAM_TMP, '1'); $fs = [IO.File]::Open($tmp, [IO.FileMode]::CreateNew,"))
+        r = self.ps(self.BUDGET_SEAM.replace("@@READ@@", str(self.case / "seam-read.txt")).replace("@@TMP@@", str(self.case / "seam-tmp.txt")), module=mod)
+        self.assertFalse(r["tmp"], f"a temp file was written after the budget ended: {r}")
+        self.assertEqual((r["result"], r["phase"]), ("BUSY", "cooldown"), r)
+
+    LOCK_AFTER_BUDGET = """
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d -Phase cooldown -StaleAfterSec 600
+$env:SEAM_READ = '@@READ@@'
+$job = Start-Job -ArgumentList '@@MOD@@', $A.path, '@@MARK@@' -ScriptBlock { param($m, $p, $mark) Import-Module $m -Force -DisableNameChecking; $l = & (Get-Module VenueChain) { param($p) Enter-VenueTicketLock -TicketPath $p -TimeoutMs 1000 } $p; [IO.File]::WriteAllText($mark, '1'); Start-Sleep -Milliseconds 800; & (Get-Module VenueChain) { param($l) Exit-VenueTicketLock $l } $l }
+$t0 = [DateTime]::UtcNow
+while (-not (Test-Path -LiteralPath '@@MARK@@') -and ([DateTime]::UtcNow - $t0).TotalSeconds -lt 60) { Start-Sleep -Milliseconds 20 }
+$r = Update-VenueTicket -Ticket $A -Phase 'waiting' -BudgetSec 0.1
+Wait-Job $job | Out-Null; Remove-Job $job -Force
+[pscustomobject]@{ result = [string]$r; read = (Test-Path -LiteralPath '@@READ@@') } | ConvertTo-Json -Compress
+"""
+
+    def test_r8_rule6_no_lock_attempt_starts_after_the_budget_ended_during_the_retry_sleep(self) -> None:
+        # r8 rule 6 (r7 pass 3 A6, the lock half): the lock was released after the budget expired, during the 15 ms retry sleep, and one more attempt then took it and went on to read and write.
+        mod = self.seam_text(("Start-Sleep -Milliseconds 15\n", "Start-Sleep -Milliseconds 1200\n"),
+                             ("$fs = [IO.File]::Open($Ticket.path, [IO.FileMode]::Open, [IO.FileAccess]::Read,", "[IO.File]::WriteAllText($env:SEAM_READ, '1'); $fs = [IO.File]::Open($Ticket.path, [IO.FileMode]::Open, [IO.FileAccess]::Read,"))
+        script = self.LOCK_AFTER_BUDGET.replace("@@MOD@@", str(mod)).replace("@@READ@@", str(self.case / "seam-read2.txt")).replace("@@MARK@@", str(self.case / "seam-lock-mark.txt"))
+        r = self.ps(script, module=mod)
+        self.assertFalse(r["read"], f"a lock attempt started after the budget ended and went on to read the ticket: {r}")
+        self.assertEqual(r["result"], "BUSY", r)
+
+    SEAM_A7 = """
+$X = New-VenueTicket -Venue bachelor -RunDir 'run-X' -ClaimDir $d -Phase cooldown -StaleAfterSec 600 -OwnerPid @@S@@
+Start-Sleep -Milliseconds 30
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d -Phase cooldown -StaleAfterSec 600
+Start-Sleep -Milliseconds 30
+$B = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$job = Start-Job -ArgumentList $B, $d, '@@SEAMMOD@@', '@@MARK@@' -ScriptBlock { param($B, $d, $m, $mark) $env:SEAM_MARK = $mark; Import-Module $m -Force -DisableNameChecking; Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $B }
+$t0 = [DateTime]::UtcNow
+while (-not (Test-Path -LiteralPath '@@MARK@@') -and ([DateTime]::UtcNow - $t0).TotalSeconds -lt 60) { Start-Sleep -Milliseconds 50 }
+$gone = [string](Remove-VenueTicket -Ticket $X)
+$flip = Update-VenueTicket -Ticket $A -Phase 'waiting'
+$r = Receive-Job $job -Wait -AutoRemoveJob
+$mine = @($r.queue | Where-Object { $_.name -ceq $B.name })
+[pscustomobject]@{ gone = $gone; flip = [string]$flip; state = [string]$r.state; position = [int]$r.position; queueLen = @($r.queue).Count; truePosition = $(if ($mine.Count) { [int]$mine[0].position } else { 0 }) } | ConvertTo-Json -Compress
+"""
+
+    def test_r8_rule7_the_position_of_a_given_back_claim_is_the_one_in_the_returned_queue(self) -> None:
+        # r8 rule 7 (r7 pass 3 A11): the give-back returned the census made after it as the queue but the position of the snapshot before it (a runner could log 3/2).
+        s = self.sleeper()
+        mark = self.case / "seam-a7-mark.txt"
+        mod = self.seam_module("    $r = Invoke-VenueClaimAttempt @attemptArgs\n", "    [IO.File]::WriteAllText($env:SEAM_MARK, '1'); Start-Sleep -Milliseconds 2500\n    $r = Invoke-VenueClaimAttempt @attemptArgs\n")
+        r = self.ps(self.SEAM_A7.replace("@@S@@", str(s.pid)).replace("@@SEAMMOD@@", str(mod)).replace("@@MARK@@", str(mark)))
+        self.assertEqual((r["gone"], r["flip"], r["state"]), ("REMOVED", "OK", "QUEUED"), r)
+        self.assertEqual(r["position"], r["truePosition"], f"the position is not the caller's place in the queue it returned: {r}")
+        self.assertLessEqual(r["position"], r["queueLen"], r)
+
 
 if __name__ == "__main__":
     unittest.main()
