@@ -4519,7 +4519,7 @@ $script:ExportEvidenceFiles = @('summary.json', 'batch.log', 'export-profile.jso
 $script:ExportStageContainTolerance = 1.05
 $script:ExportStageContainSlackMs = 1.0
 # (EXPORT-CDNG-TOTAL-CONTAINMENT-1, adversary A2: a figure AT the limit is inside it; the binary product 40.00046 * 1.05 + 1 is 43.000482999999996, a hair under the decimal 43.000483, so a comparison
-# adds this far-below-the-precision-of-a-timing epsilon, and no real overrun, which is at least a microsecond in these figures, is hidden by it)
+# adds this far-below-the-precision-of-a-timing epsilon, and no real overrun, which is at least a microsecond in these figures (the writers emit six decimals), is hidden by it)
 $script:ExportStageContainEpsilonMs = 1e-9
 # (adversary r11 A1: raw_uint16 is a stage the app may not publish, which skipped both of its child pairs; the transitive pairs hold disk_read and decompress inside debayered_frame whether or not
 # raw_uint16 is present, as the stage tree above nests them)
@@ -4722,7 +4722,7 @@ function Get-DvExportContainmentProblem {
         if ($present.Count -lt 2 -or $null -eq $parent) { continue }
         $sum = 0.0; foreach ($n in $present) { $sum += [double]$Means[$n] }
         if ($sum -gt [double]$parent * $script:ExportStageContainTolerance + $script:ExportStageContainSlackMs + $script:ExportStageContainEpsilonMs) {
-            return "EXPORT_STAGE_CONTAINMENT_MISMATCH: the disjoint stages $($present -join ' + ') total $([math]::Round($sum, 6)) ms (mean) inside $($group[1]) mean $parent ms, so their shares are of work this run's frames do not hold"
+            return "EXPORT_STAGE_CONTAINMENT_MISMATCH: the disjoint stages $($present -join ' + ') total $([math]::Round($sum, 6)) ms (mean) inside $($group[1]) mean $(Get-DvExportRound $parent) ms, so their shares are of work this run's frames do not hold"
         }
     }
     $bad = [System.Collections.Generic.List[string[]]]::new()   # (a list of pairs: a pipeline would unroll a one-pair result into its two names)
@@ -4731,7 +4731,7 @@ function Get-DvExportContainmentProblem {
         if ($null -ne $c -and $null -ne $p -and [double]$c -gt [double]$p * $script:ExportStageContainTolerance + $script:ExportStageContainSlackMs + $script:ExportStageContainEpsilonMs) { $bad.Add([string[]]@($pair[0], $pair[1])) }
     }
     if ($bad.Count -eq 0) { return $null }
-    "EXPORT_STAGE_CONTAINMENT_MISMATCH: $($bad.Count) stage(s) are timed longer than the stage that contains them (first: $($bad[0][0]) mean $($Means[$bad[0][0]]) ms inside $($bad[0][1]) mean $($Means[$bad[0][1]]) ms), so their shares are of work this run's frames do not hold"
+    "EXPORT_STAGE_CONTAINMENT_MISMATCH: $($bad.Count) stage(s) are timed longer than the stage that contains them (first: $($bad[0][0]) mean $(Get-DvExportRound $Means[$bad[0][0]]) ms inside $($bad[0][1]) mean $(Get-DvExportRound $Means[$bad[0][1]]) ms), so their shares are of work this run's frames do not hold"
 }
 
 # r11 (sol r9 B2 (a), fable r9 B2; EXPORT-VENUE-LEG-1): the OUTERMOST containment: the measured per-frame work is inside the batch's own DONE elapsed. A DONE elapsed shorter than the
@@ -4741,7 +4741,7 @@ function Get-DvExportContainmentProblem {
 function Get-DvExportWallContainmentProblem {
     param($WallSeconds, $Frames, [string]$StageName, $StageMeanMs)
     if ($null -eq $WallSeconds -or $null -eq $Frames -or [int64]$Frames -le 0 -or $null -eq $StageMeanMs) { return $null }
-    $wallPerFrame = Get-DvExportRound ([double]$WallSeconds * 1000.0 / [double]$Frames)
+    $wallPerFrame = [double]$WallSeconds * 1000.0 / [double]$Frames   # (unrounded, as are the means: sol r1 B3)
     Get-DvExportContainmentProblem -Means @{ batch_wall_per_frame = $wallPerFrame; $StageName = $StageMeanMs } -Pairs @(, @($StageName, 'batch_wall_per_frame'))
 }
 
@@ -4754,7 +4754,9 @@ function Get-DvExportWallContainmentProblem {
 # bracket entry/exit time the worker's own clock does not see, so it is judged as a SYSTEMATIC gap: more than a tenth of the frames (adversary A1: a mean let ONE 2000 ms scheduler pause in the
 # bracket and the producer void a 480-frame run whose children were exact; a pause is a few frames, a forged or mis-wired total is most of them). Same tolerance as every pair (5 % + 1 ms).
 # The worker's own total (llrawproc_total_ms, dng.c:588, adversary A4) is the exact identity, on the worker's one clock, so when a frame carries it, it agrees with the children either way, per frame.
-# A frame that does not carry the total (or, for the sum, every one of the eight figures) is not judged: llrawproc_ms is an optional total and a stage the app did not run is permitted absent.
+# A frame that does not carry the total is not judged against it: llrawproc_ms is an optional total and a stage the app did not run is permitted absent. A frame that lacks some of the eight children is still
+# held to what it DOES carry (r2, sol r1 B2): the present children are a lower bound on the sum, so they must still fit inside llrawproc_ms and inside the worker's llrawproc_total_ms; only the
+# "total longer than its children" direction needs all eight.
 $script:ExportCdngLlrawprocTimedChildren = @('llrawproc_dark_frame', 'llrawproc_vertical_stripes', 'llrawproc_focus_pixels', 'llrawproc_bad_pixels', 'llrawproc_pattern_noise', 'llrawproc_dual_iso', 'llrawproc_chroma_smooth')
 
 function Get-DvExportCdngTotalFrameProblems {
@@ -4774,19 +4776,21 @@ function Get-DvExportCdngTotalFrameProblems {
         if ($null -ne $total -and $null -ne $producer -and $total -gt $producer * $tol + $limitSlack) {
             $past.Add("frame_index $at llrawproc_ms $(Get-DvExportRound $total) ms inside producer_frame_ms $(Get-DvExportRound $producer) ms")
         }
+        # (r2, sol r1 B2 / INV-2: $sum is the sum of the children this frame PRESENTS, so it is a LOWER BOUND on the full sum when one is absent: a child omitted from the frame is work of 0 or more ms,
+        # never less. Only the over-the-container directions are judged on a lower bound; "the bracket is longer than its children" needs the whole sum, so it still waits for $whole.)
         $sum = 0.0; $whole = $true   # (a figure that is absent or not a conforming timing leaves the sum underivable on this frame; the record schema types that elsewhere)
         foreach ($n in @($script:ExportCdngLlrawprocTimedChildren) + 'llrawproc_other') { $part = & $timing $frame "${n}_ms"; if ($null -eq $part) { $whole = $false } else { $sum += $part } }
-        if (-not $whole) { continue }
+        $what = $(if ($whole) { 'the seven timed children and llrawproc_other_ms' } else { 'the present llrawproc children (a lower bound: not every one is published on this frame)' })
         $workerTotal = & $timing $frame 'llrawproc_total_ms'
-        if ($null -ne $workerTotal -and ($workerTotal -gt $sum * $tol + $limitSlack -or $sum -gt $workerTotal * $tol + $limitSlack)) {
-            $worker.Add("frame_index $at llrawproc_total_ms $(Get-DvExportRound $workerTotal) ms beside the seven timed children and llrawproc_other_ms totalling $(Get-DvExportRound $sum) ms")
+        if ($null -ne $workerTotal -and (($whole -and $workerTotal -gt $sum * $tol + $limitSlack) -or $sum -gt $workerTotal * $tol + $limitSlack)) {
+            $worker.Add("frame_index $at llrawproc_total_ms $(Get-DvExportRound $workerTotal) ms beside $what totalling $(Get-DvExportRound $sum) ms")
         }
         if ($null -eq $total) { continue }
-        $judged++
+        if ($whole) { $judged++ }
         if ($sum -gt $total * $tol + $limitSlack) {
-            $beyond.Add("frame_index $at the seven timed children and llrawproc_other_ms total $(Get-DvExportRound $sum) ms inside llrawproc_ms $(Get-DvExportRound $total) ms")
+            $beyond.Add("frame_index $at $what total $(Get-DvExportRound $sum) ms inside llrawproc_ms $(Get-DvExportRound $total) ms")
         }
-        if ($total -gt $sum * $tol + $limitSlack) {
+        if ($whole -and $total -gt $sum * $tol + $limitSlack) {
             $longer.Add("frame_index $at llrawproc_ms $(Get-DvExportRound $total) ms beside the seven timed children and llrawproc_other_ms totalling $(Get-DvExportRound $sum) ms")
         }
     }
@@ -4855,6 +4859,9 @@ $script:ExportTimingMaxMs = 86400000.0
 # present on any successful frame is present on all of them (its share is of the denominator's window). These two are required on every successful frame.
 $script:ExportCdngTimingFields = @(@($script:ExportCdngProducerStages) + @($script:ExportCdngWriterStages) + @('llrawproc', 'producer_frame') | ForEach-Object { "${_}_ms" })
 $script:ExportCdngRequiredTimingFields = @('producer_frame_ms', 'llrawproc_dual_iso_ms')
+# (EXPORT-CDNG-TOTAL-CONTAINMENT-1 r2, sol r1 B1 / INV-4: the worker's own total is read by Get-DvExportCdngTotalFrameProblems, so a PRESENT one is schema-checked like every timing above: a string, null,
+# array or over-ceiling value is EXPORT_RECORD_INVALID, never treated as absent. It is not a published stage row, so it joins no window rule: only the value domain is checked, on every frame that carries it.)
+$script:ExportCdngSchemaOnlyTimingFields = @('llrawproc_total_ms')
 # Stage-log record: one line, exactly this shape. Every line that carries the tag must match it (the digits are bounded so no value can overflow a cast).
 $script:ExportStageLogTag = '[mlv-stage-timing]'
 $script:ExportStageLogRecord = '^\[mlv-stage-timing\] frame=(?<f>[0-9]{1,12}) stage=(?<s>[a-z0-9_]{1,64}) ms=(?<ms>[0-9]{1,12}(?:\.[0-9]{1,9})?)$'
@@ -4869,6 +4876,15 @@ function Get-DvExportTimingProblem {
     if ($d -lt 0) { return 'is negative' }
     if ($d -gt $script:ExportTimingMaxMs) { return "is past the $($script:ExportTimingMaxMs) ms ceiling" }
     $null
+}
+
+function Get-DvExportExactMean {
+    # EXPORT-CDNG-TOTAL-CONTAINMENT-1 r2 (sol r1 B3 / INV-5): the UNROUNDED mean of the conforming timings ($null when there is none). The published stage rows round their means to 6 places
+    # (Get-DvExportStageRow); a containment gate reads this instead, so 29 frames at the documented 5 % + 1 ms tolerance and one a hair inside it are not turned INVALID by a mean rounded before it is compared.
+    param($Values)
+    $v = @($Values | Where-Object { $null -eq (Get-DvExportTimingProblem $_) } | ForEach-Object { [double]$_ })
+    if ($v.Count -eq 0) { return $null }
+    ($v | Measure-Object -Sum).Sum / $v.Count
 }
 
 function Get-DvExportStageRow {
@@ -4905,7 +4921,7 @@ function Test-DvExportCdngProfileRecords {
         if ((Get-DvProp $r 'success') -isnot [bool]) { & $note 'success' 'is not a JSON boolean' $i }
         $fi = Get-DvProp $r 'frame_index'
         if (-not (($fi -is [int] -or $fi -is [long]) -and [int64]$fi -ge 0)) { & $note 'frame_index' 'is not a non-negative integer' $i }
-        foreach ($field in $script:ExportCdngTimingFields) {
+        foreach ($field in @($script:ExportCdngTimingFields) + @($script:ExportCdngSchemaOnlyTimingFields)) {
             if ($null -eq $r.PSObject.Properties[$field]) { continue }
             $why = Get-DvExportTimingProblem (Get-DvProp $r $field)
             if ($null -ne $why) { & $note $field $why $i }
@@ -5086,8 +5102,10 @@ function Get-DvExportEvidence {
                                   largestStage = $(if ($largest.Count) { [string]$largest[0] } else { $null }) }
             if ($largest.Count) { $m.largestStage = [string]$largest[0]; $m.largestStageShare = $rowsOut[[string]$largest[0]].share }
             # r8 fix 2 (adversary r8 A1): every producer stage is inside producer_frame_ms and every llrawproc_* child is inside llrawproc_ms
-            $means = @{ producer_frame = $denRow.meanMs; llrawproc = $stages.llrawprocTotal.meanMs }
-            foreach ($name in $script:ExportCdngProducerStages) { $means[$name] = $rowsOut[$name].meanMs }
+            # (r2, sol r1 B3: the gates read the UNROUNDED means, so a profile at the documented tolerance on every frame is not turned INVALID by a mean rounded before it is compared; the published rows keep their rounded means)
+            $exactDen = Get-DvExportExactMean $producer
+            $means = @{ producer_frame = $exactDen; llrawproc = (Get-DvExportExactMean @($ok | ForEach-Object { Get-DvProp $_ 'llrawproc_ms' })) }
+            foreach ($name in $script:ExportCdngProducerStages) { $means[$name] = Get-DvExportExactMean @($ok | ForEach-Object { Get-DvProp $_ "${name}_ms" }) }
             # (r8 fix 3, adversary pass 10 A1: the llrawproc TOTAL is published as a row too, so it is held inside producer_frame_ms like every producer stage)
             $pairs = @(foreach ($name in $script:ExportCdngProducerStages) { , @($name, 'producer_frame') }) + @(foreach ($name in $script:ExportCdngLlrawprocChildren) { , @($name, 'llrawproc') }) + @(, @('llrawproc', 'producer_frame'))
             # r11 (fable r9 B2): the producer stages are the DISJOINT partition of producer_frame (the llrawproc TOTAL is not in that list, so it is not counted twice), so they are held TOGETHER
@@ -5109,10 +5127,10 @@ function Get-DvExportEvidence {
             if ($null -ne $containment) { $problems.Add($containment) }
             $disjoint = Get-DvExportContainmentProblem -Means $means -Pairs $script:ExportCdngContainedPairs -SumGroups $script:ExportCdngSumGroups
             if ($null -ne $disjoint) { $problems.Add($disjoint) }
-            # EXPORT-CDNG-TOTAL-CONTAINMENT-1 (Dot I5): the llrawproc TOTAL inside producer_frame_ms and equal to its children, on every successful frame (the mean pair above cannot see one frame)
+            # EXPORT-CDNG-TOTAL-CONTAINMENT-1 (Dot I5): the llrawproc TOTAL inside producer_frame_ms, the children inside it and (when published) the worker total equal to them, per frame (the mean pair above cannot see one frame; the longer-than-its-children direction is a more-than-a-tenth-of-the-frames rule)
             foreach ($totalProblem in @(Get-DvExportCdngTotalFrameProblems -Frames $ok)) { $problems.Add($totalProblem) }
             # r11 (sol r9 B2 (a)): and the producer's per-frame work is inside the batch's own elapsed
-            $wallContainment = Get-DvExportWallContainmentProblem -WallSeconds $m.wallSeconds -Frames $m.framesExported -StageName 'producer_frame' -StageMeanMs $denRow.meanMs
+            $wallContainment = Get-DvExportWallContainmentProblem -WallSeconds $m.wallSeconds -Frames $m.framesExported -StageName 'producer_frame' -StageMeanMs $exactDen
             if ($null -ne $wallContainment) { $problems.Add($wallContainment) }
             # adversary r2 A2: a capture is a stage-share measurement; successful rows with no producer_frame_ms (or no producer stage figure at all) measured none
             if ($ok.Count -gt 0 -and ($denRow.samples -ne $ok.Count -or $null -eq $denRow.meanMs -or [double]$denRow.meanMs -le 0 -or $largest.Count -eq 0)) {
@@ -5147,7 +5165,7 @@ function Get-DvExportEvidence {
             foreach ($name in $script:ExportRenderedStages) { $rowsOut[$name] = Get-DvExportStageRow -Values @($perStage[$name].Values) -Denominator $p16.meanMs }
             $untimed = $(if ($null -ne $batchWall -and $null -ne $p16.meanMs) { Get-DvExportRound ($batchWall - $p16.meanMs) } else { $null })
             # r11 (sol r9 B2 (a)): the measured per-frame work is inside the batch's elapsed (typed INVALID otherwise); a residual the logging precision made slightly negative is 0, never a negative stage
-            $wallContainment = Get-DvExportWallContainmentProblem -WallSeconds $m.wallSeconds -Frames $m.framesExported -StageName 'processed16_total' -StageMeanMs $p16.meanMs
+            $wallContainment = Get-DvExportWallContainmentProblem -WallSeconds $m.wallSeconds -Frames $m.framesExported -StageName 'processed16_total' -StageMeanMs (Get-DvExportExactMean @($perStage['processed16_total'].Values))
             if ($null -ne $wallContainment) { $problems.Add($wallContainment) }
             elseif ($null -ne $untimed -and $untimed -lt 0) { $untimed = 0.0 }
             $disjoint = $(if ($null -ne $rowsOut['debayered_frame'].meanMs -and $null -ne $rowsOut['processing'].meanMs) { Get-DvExportRound ($rowsOut['debayered_frame'].meanMs + $rowsOut['processing'].meanMs) } else { $null })
@@ -5166,7 +5184,7 @@ function Get-DvExportEvidence {
             # decompress, llrawproc) is timed on exactly processed16_total's frames or on none at all (a stage the app did not run is absent, never partial)
             # r8 fix 2 (adversary r8 A1): and each stage's mean is inside the stage that contains it (the rendered stage tree in $script:ExportRenderedContainment)
             $means = @{}
-            foreach ($name in $script:ExportRenderedStages) { $means[$name] = $rowsOut[$name].meanMs }
+            foreach ($name in $script:ExportRenderedStages) { $means[$name] = Get-DvExportExactMean @($perStage[$name].Values) }   # (unrounded: sol r1 B3)
             $containment = Get-DvExportContainmentProblem -Means $means -Pairs $script:ExportRenderedContainment -SumGroups $script:ExportRenderedSumGroups
             if ($null -ne $containment) { $problems.Add($containment) }
             $p16Frames = $perStage['processed16_total']
