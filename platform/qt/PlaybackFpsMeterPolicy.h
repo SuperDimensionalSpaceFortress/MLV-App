@@ -46,12 +46,16 @@ inline bool fpsMeterShouldReset( bool playChecked, bool hasDraw, int msSinceLast
 }
 
 /*! One meter step: fold the interval since the previous draw into the running
- *  frame-time average. A non-positive interval (same millisecond, clock wrap)
- *  leaves the average alone; an interval past the stall limit is a restart
- *  (the average is reseeded from it rather than smoothed into stale data). */
+ *  frame-time average. A zero interval (same millisecond) leaves the average
+ *  alone; an interval past the stall limit is a restart (the average is reseeded
+ *  from it rather than smoothed into stale data). r21 (adversary pass 20 A4): a
+ *  NEGATIVE interval (wall-clock wrap or step back) is stalled like fpsMeterStalled
+ *  says, so it clears the average (0 = unmeasured) instead of preserving the rate
+ *  of the timeline before the wrap; the next positive interval reseeds it. */
 inline double smoothedFrameMs( double emaFrameMs, int msSinceLastDraw )
 {
-    if( msSinceLastDraw <= 0 ) return emaFrameMs;
+    if( msSinceLastDraw < 0 ) return 0.0;
+    if( msSinceLastDraw == 0 ) return emaFrameMs;
     if( emaFrameMs <= 0.0 || fpsMeterStalled( msSinceLastDraw ) )
     {
         return static_cast<double>( msSinceLastDraw );
@@ -65,6 +69,14 @@ inline double smoothedFrameMs( double emaFrameMs, int msSinceLastDraw )
 inline int meterIntervalMs( bool firstDrawOfPlay, bool hasPreviousDraw, int msSincePreviousDraw )
 {
     return ( firstDrawOfPlay || !hasPreviousDraw ) ? 0 : msSincePreviousDraw;
+}
+
+/*! LOOK-LABEL-PLAYBACK-INFO-1 r21 (adversary pass 20 A3): a draw REQUEST feeds the meter only when a frame was presented since the
+ *  meter's last step. A request that reached present_nothing (no presenter took it, no prepared image) shows nothing, so its tick
+ *  would timestamp an interval between requests, never between presented frames (3.3/24 fps after a 300 ms gap). */
+inline bool drawFeedsMeter( bool presentedSinceLastMeterStep )
+{
+    return presentedSinceLastMeterStep;
 }
 
 } // namespace playback_fps_meter

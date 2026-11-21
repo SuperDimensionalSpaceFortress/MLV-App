@@ -871,6 +871,8 @@ private:
     QString m_lastPlaybackFpsStatusText;
     double m_playbackFpsEmaFrameMs = 0.0;
     bool m_playbackFpsMeterNewPlay = false;   // r12 (adversary pass 13 A2): the next draw is a new Play's first (feeds no interval)
+    quint64 m_playbackPresentedFrameCount = 0;           // r21 (adversary pass 20 A3): frames recordPresentedFrame has recorded
+    quint64 m_playbackFpsMeterSeenPresentedCount = 0;    // r21: the count the fps meter last stepped on; a draw feeds it only when this moved
     QTime m_lastPlaybackFpsStatusUpdateTime;
     QLabel *m_pFrameNumber;
     QLabel *m_pChosenDebayer;

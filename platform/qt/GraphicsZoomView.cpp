@@ -91,6 +91,13 @@ QRect GraphicsZoomView::refreshLookLabelPixmap()
 void GraphicsZoomView::drawForeground(QPainter *painter, const QRectF &rect)
 {
     QGraphicsView::drawForeground( painter, rect );
+    paintLookLabel( painter );
+}
+
+//LOOK-LABEL-PLAYBACK-INFO-1 r21 (adversary pass 20 A1): the one label drawing routine. drawForeground (the CPU viewport's paint)
+//and GpuDisplayViewport::paintGL (the GPU widget viewport consumes the Paint event, so drawForeground never runs there) both call it.
+void GraphicsZoomView::paintLookLabel(QPainter *painter)
+{
     m_lookLabelDrawnText.clear();
     if( m_lookLabelText.isEmpty() ) return;
 

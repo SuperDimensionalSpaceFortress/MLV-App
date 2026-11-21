@@ -3128,11 +3128,21 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
         //feeds the drop-frame elapsed time), so it cannot serve here -- see playback_fps_meter::smoothedFrameMs.
         // LOOK-LABEL-PLAYBACK-INFO-1 r12 (adversary pass 13 A2): the first draw of a Play drops the previous Play's average and
         // feeds no interval, so the rate stays unmeasured ("--") until an interval inside this Play exists.
+        // LOOK-LABEL-PLAYBACK-INFO-1 r21 (adversary pass 20 A3): only a PRESENTED frame advances the meter. A request that reached
+        // present_nothing shows nothing, so stamping it would make the next request's interval an interval between requests
+        // (3.3/24 fps after a 300 ms gap), not between presented frames. recordPresentedFrame counts every presented frame.
+        const bool presentedSinceMeterStep = m_playbackPresentedFrameCount != m_playbackFpsMeterSeenPresentedCount;
+        if( playback_fps_meter::drawFeedsMeter( presentedSinceMeterStep ) )
+        {
+        m_playbackFpsMeterSeenPresentedCount = m_playbackPresentedFrameCount;
         const bool firstDrawOfPlay = m_playbackFpsMeterNewPlay;
         m_playbackFpsMeterNewPlay = false;
         if( firstDrawOfPlay ) m_playbackFpsEmaFrameMs = 0.0;
         const int measuredFrameMs = playback_fps_meter::meterIntervalMs(
             firstDrawOfPlay, lastDrawTime.isValid(), lastDrawTime.isValid() ? lastDrawTime.msecsTo( nowTime ) : 0 );
+        // r21 (adversary pass 20 A4): a negative age (the wall clock wrapped or stepped back) is stalled: the smoothing clears the
+        // average, and the rate the corner still shows is withdrawn with it, never republished from the timeline before the wrap.
+        if( measuredFrameMs < 0 ) resetFpsMeterIfIdle( nowTime );   // fpsMeterShouldReset reads the same negative age as stalled: the one reset
         lastDrawTime = nowTime;
         m_playbackFramesStalled = false;   // LOOK-LABEL-PLAYBACK-INFO-1 r3: a frame was drawn, so the next one carries the label
         if( timeDiff != 0 )
@@ -3169,6 +3179,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
                 }
             }
         }
+        }   // drawFeedsMeter (r21 pass 20 A3)
         lastTime = nowTime;
 
         //When playback is off, the timeDiff is set to 0 for DropFrameMode
@@ -5844,6 +5855,7 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
         if( framePresentedByViewport )
         {
             readyFrame.usedGpuAmazeDebayer = true;
+            readyFrame.usedGpuBilinearDebayer = false;   // LOOK-LABEL-PLAYBACK-INFO-1 r21 (Grok G1): the slot may carry the render thread's bilinear flag
             readyFrame.gpuAmazeFallbackReason.clear();
             readyFrame.gpuAmazeRendererDescription = textureRenderer;
             readyFrame.stageTimingTelemetry.insert(
@@ -5900,6 +5912,7 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                                                       sourceHeight,
                                                       task.gpuPresentationOptions );
                 readyFrame.usedGpuAmazeDebayer = framePresentedByViewport;
+                if( framePresentedByViewport ) readyFrame.usedGpuBilinearDebayer = false;   // r21 (Grok G1)
                 readyFrame.gpuAmazeFallbackReason =
                     textureReason.isEmpty()
                         ? QStringLiteral("GPU AMaZE texture-present failed; used CPU-readback fallback")
@@ -6183,6 +6196,7 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                 gpuPlaybackReconNoReadbackPresented = true;
                 texturePresentHandoffMode =
                     QStringLiteral("gl_r16_bilinear_shader");
+                readyFrame.gpuBilinearRendererDescription = texturePresentHandoffMode;   // r21 (Grok G4): the one reader is recordPresentedFrame
                 texturePresentSource =
                     QStringLiteral("cuda_gl_r16_texture");
             }
@@ -6273,6 +6287,7 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                     texturePresentSource =
                         QStringLiteral("cuda_amaze_readback_rgb16_fallback");
                     readyFrame.usedGpuAmazeDebayer = true;
+                    readyFrame.usedGpuBilinearDebayer = false;   // r21 (Grok G1)
                     readyFrame.gpuAmazeFallbackReason =
                         texturePresentReason.isEmpty()
                             ? QStringLiteral("GPU playback recon AMaZE texture-present failed; used readback RGB16 fallback")
@@ -6965,6 +6980,7 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
             /* LOOK-LABEL-PLAYBACK-INFO-1 r20 A1: the display shader debayers the Bayer texture on the GPU (bilinear). */
             readyFrame.usedGpuBilinearDebayer = true;
             readyFrame.usedGpuAmazeDebayer = false;
+            readyFrame.gpuBilinearRendererDescription = QStringLiteral("gl_bayer16_bilinear_shader");   // r21 (Grok G4): this branch's handoff mode
         }
         readyFrame.stageTimingTelemetry.insert(
             QStringLiteral("gpu_playback_recon_texture_present_active"),
@@ -7710,6 +7726,7 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
     requestContext.presentationGeneration =
         m_playbackPresentationGeneration.load( std::memory_order_acquire );
     requestContext.zoomFitEnabled = zoomFitEnabled;
+    requestContext.debayerName = m_pChosenDebayer ? m_pChosenDebayer->text() : QString();   // r21 (pass 20 A2): what produces this frame
     requestContext.renderThreadUsing16BitPreview = m_renderThreadUsing16BitPreview;
     requestContext.renderThreadUsingGpuPreviewProcessing = m_renderThreadUsingGpuPreviewProcessing;
     requestContext.renderThreadUsingGpuBilinearDebayer = m_renderThreadUsingGpuBilinearDebayer;
@@ -33407,6 +33424,7 @@ void MainWindow::on_actionPlay_toggled(bool checked)
     // r12 (adversary pass 13 A2 on c58f5bd8): and the average with it: the next draw starts this Play's meter afresh.
     m_playbackFpsEmaFrameMs = 0.0;
     m_playbackFpsMeterNewPlay = true;
+    m_playbackFpsMeterSeenPresentedCount = m_playbackPresentedFrameCount;   // r21 (pass 20 A3): a frame presented before this Play is not its first
     // r13 (adversary pass 15 A2 on 189dd4f9): a stall belongs to the Play it happened in. Kept across Stop -> Play, it made the
     // new Play's "--" relabel repaint the retained paused frame at once; a stall of this Play is set again after its own draw.
     m_playbackFramesStalled = false;
@@ -34323,7 +34341,12 @@ playback_info_label::Facts MainWindow::playbackInfoFacts( void )
         m_lastPresentedRequestContextValid, m_lastPresentedRequestContext.playbackScaleFactorPolicy,
         facts.requestedScale, activeScale );
     // The chosen debayer's menu text, never the playback debayer label helper (it returns "receipt").
-    facts.debayer = m_pChosenDebayer ? m_pChosenDebayer->text() : QString();
+    // r21 (adversary pass 20 A2): the debayer that produced the PRESENTED frame (recorded when it was requested), never the live
+    // selection: after an AMaZE selection the label must keep reading the old name until the replacement frame is presented.
+    // No presented frame yet (or none recorded): the selection, which is then what will produce it.
+    facts.debayer = ( m_lastPresentedRequestContextValid && !m_lastPresentedRequestContext.debayerName.isEmpty() )
+        ? m_lastPresentedRequestContext.debayerName
+        : ( m_pChosenDebayer ? m_pChosenDebayer->text() : QString() );
     facts.debayerOnGpu = m_lastPresentedFrameUsedGpuAmazeDebayer || m_lastPresentedFrameUsedGpuBilinearDebayer;
     // r3 (adversary a271daee A2): what the GPU ran (LMMSE selected may render with GPU AMaZE).
     facts.gpuDebayer = m_lastPresentedFrameUsedGpuAmazeDebayer ? QStringLiteral( "AMaZE" )
@@ -35156,6 +35179,7 @@ void MainWindow::exportAbort( void )
 void MainWindow::recordPresentedFrame( const RenderFrameThread::ReadyFrame &readyFrame,
                                        const PresentationRequestContext &requestContext )
 {
+    ++m_playbackPresentedFrameCount;   // r21 (adversary pass 20 A3): the fps meter advances only when this moved
     m_lastPresentedRequestSerial = readyFrame.requestSerial;
     m_lastPresentedRequestContext = requestContext;
     m_lastPresentedRequestContextValid = true;

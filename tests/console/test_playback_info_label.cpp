@@ -10,9 +10,12 @@
 #include "../../platform/qt/PlaybackScaleLabel.h"
 
 #include <QChar>
+#include <QDir>
 #include <QFile>
+#include <QList>
 #include <QString>
 #include <QTextStream>
+#include <QUuid>
 
 #include <string>
 
@@ -1413,5 +1416,248 @@ TEST(PlaybackInfoLabel, R20A1BayerTexturePresenterBranchesRecordTheGpuBilinearDe
     // the class sweep: the Bayer-texture presenters are exactly these two calls, and each records the flag
     ASSERT_EQ(1, body.count(QStringLiteral("GpuDisplayViewport::presentGpuPlaybackReconTexture(")));
     ASSERT_EQ(1, body.count(QStringLiteral("GpuDisplayViewport::presentBayer16(")));
+    // r21 (Grok G1 residual): the global count of the flag writes is replaced by the per-branch flag-pair assertion below
+    // (R21G1EveryPresenterBranchCarriesExactlyOneOfTheTwoGpuDebayerFlags): readyFrame can arrive carrying the render thread's
+    // bilinear flag, so every AMaZE write clears it as every bilinear write clears the AMaZE flag.
     ASSERT_EQ(2, body.count(setBilinear));
+}
+
+namespace
+{
+
+// r21: the innermost brace block that holds `pos` (the presenter branch a flag write belongs to), braces counted in source order.
+QString enclosingBlock(const QString &text, int pos)
+{
+    int depth = 0;
+    int start = 0;
+    for ( int i = pos - 1; i >= 0; --i )
+    {
+        if ( text.at(i) == QLatin1Char('}') ) ++depth;
+        else if ( text.at(i) == QLatin1Char('{') )
+        {
+            if ( depth == 0 ) { start = i; break; }
+            --depth;
+        }
+    }
+    depth = 0;
+    int end = text.size();
+    for ( int i = pos; i < text.size(); ++i )
+    {
+        if ( text.at(i) == QLatin1Char('{') ) ++depth;
+        else if ( text.at(i) == QLatin1Char('}') )
+        {
+            if ( depth == 0 ) { end = i; break; }
+            --depth;
+        }
+    }
+    return text.mid(start, end - start);
+}
+
+QList<int> allIndexesOf(const QString &text, const QString &needle)
+{
+    QList<int> at;
+    for ( int i = text.indexOf(needle); i >= 0; i = text.indexOf(needle, i + 1) ) at.append(i);
+    return at;
+}
+
+} // namespace
+
+// r21 (Grok G1 residual on #834, comment 7061902251): readyFrame is acquired from the render thread (acquireLatestReadyFrame copies
+// the slot's flags, RenderFrameThread.cpp:1896-1899) and the slot can carry usedGpuBilinearDebayer=true (RenderFrameThread.cpp:5423).
+// An AMaZE presenter that sets usedGpuAmazeDebayer without clearing the bilinear flag presents a frame that carries both, and the
+// label's gpuDebayer reads AMaZE first but debayerOnGpu/route read either. The sweep is per branch: the branch that sets one flag true
+// sets the other false, and no presented branch carries both true.
+TEST(PlaybackInfoLabel, R21G1EveryPresenterBranchCarriesExactlyOneOfTheTwoGpuDebayerFlags)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString body = functionBody(source, QStringLiteral("void MainWindow::presentPlaybackPreparedFrame("));
+    ASSERT_FALSE(body.isEmpty());
+    const QString amazeTrue = QStringLiteral("readyFrame.usedGpuAmazeDebayer = true;");
+    const QString amazePresented = QStringLiteral("readyFrame.usedGpuAmazeDebayer = framePresentedByViewport;");
+    const QString bilinearTrue = QStringLiteral("readyFrame.usedGpuBilinearDebayer = true;");
+    const QString amazeFalse = QStringLiteral("readyFrame.usedGpuAmazeDebayer = false;");
+    const QString bilinearFalse = QStringLiteral("readyFrame.usedGpuBilinearDebayer = false;");
+    // the writers: three AMaZE presenters (post-WB texture, RGB16 offscreen fallback, CUDA AMaZE readback fallback), two bilinear
+    const QList<int> amazeSites = allIndexesOf(body, amazeTrue) + allIndexesOf(body, amazePresented);
+    const QList<int> bilinearSites = allIndexesOf(body, bilinearTrue);
+    ASSERT_EQ(3, amazeSites.size());
+    ASSERT_EQ(2, bilinearSites.size());
+    for ( int at : amazeSites )
+    {
+        const QString branch = enclosingBlock(body, at);
+        ASSERT_TRUE(branch.contains(bilinearFalse));   // the AMaZE branch clears the bilinear flag
+        ASSERT_FALSE(branch.contains(bilinearTrue));   // and no presented branch carries both
+    }
+    for ( int at : bilinearSites )
+    {
+        const QString branch = enclosingBlock(body, at);
+        ASSERT_TRUE(branch.contains(amazeFalse));      // the bilinear branch clears the AMaZE flag
+        ASSERT_FALSE(branch.contains(amazeTrue));
+        ASSERT_FALSE(branch.contains(amazePresented));
+    }
+}
+
+// r21 (Grok G4): the GPU bilinear renderer description is read at recordPresentedFrame (m_lastPresentedGpuBilinearRendererDescription).
+// The two presenter branches that set usedGpuBilinearDebayer never set it, so it read empty for a frame the label calls GPU Bilinear.
+TEST(PlaybackInfoLabel, R21G4TheBayerPresenterBranchesSetTheGpuBilinearRendererDescription)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString body = functionBody(source, QStringLiteral("void MainWindow::presentPlaybackPreparedFrame("));
+    ASSERT_FALSE(body.isEmpty());
+    const QString bilinearTrue = QStringLiteral("readyFrame.usedGpuBilinearDebayer = true;");
+    const QString description = QStringLiteral("readyFrame.gpuBilinearRendererDescription =");
+    const QList<int> sites = allIndexesOf(body, bilinearTrue);
+    ASSERT_EQ(2, sites.size());
+    for ( int at : sites ) ASSERT_TRUE(enclosingBlock(body, at).contains(description));
+    // branch 1 names the handoff mode it just set (gl_r16_bilinear_shader)
+    const int shaderAt = body.indexOf(QStringLiteral("QStringLiteral(\"gl_r16_bilinear_shader\");"));
+    ASSERT_TRUE(shaderAt >= 0);
+    const int descriptionAt = body.indexOf(QStringLiteral("readyFrame.gpuBilinearRendererDescription = texturePresentHandoffMode;"), shaderAt);
+    ASSERT_TRUE(descriptionAt > shaderAt);
+    // the one reader
+    const QString recorded = functionBody(source, QStringLiteral("void MainWindow::recordPresentedFrame("));
+    ASSERT_TRUE(recorded.contains(QStringLiteral("m_lastPresentedGpuBilinearRendererDescription = readyFrame.gpuBilinearRendererDescription;")));
+    // the docs line: the flag is not always false; the render-thread GPU bilinear path sets it with a renderer
+    const QString docs = readRepoFile(QStringLiteral("docs/13-testing-infrastructure.md"));
+    ASSERT_FALSE(docs.contains(QStringLiteral("- `gpu_bilinear_debayer_active` stays `false`.")));
+    ASSERT_TRUE(docs.contains(QStringLiteral("`gpu_bilinear_debayer_active` is `false` on a software renderer only because the probe reports unavailable")));
+}
+
+// r21 (Grok G2): togglesFromSettings reads the six Show* keys, each default true, from the app's settings store; MainWindow's
+// settings load and the Edit-settings reload both call it. An isolated INI store (automation_settings) keeps the test off the registry.
+TEST(PlaybackInfoLabel, R21G2TogglesFromSettingsReadsTheSixKeysWithDefaultTrueAndTheLoadPathCallsIt)
+{
+    const QString dir = QDir::tempPath() + QStringLiteral("/mlvapp-r21g2-") + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    ASSERT_FALSE(automation_settings::isolate(dir).isEmpty());
+    // an empty store: every field defaults on
+    playback_info_label::Toggles defaults = playback_info_label::togglesFromSettings();
+    ASSERT_TRUE(defaults.pipeline && defaults.scale && defaults.debayer && defaults.fps && defaults.dualIso && defaults.resolution);
+    ASSERT_TRUE(playback_info_label::Settings::kDefaultShow());
+    ASSERT_QSTR_EQ(QStringLiteral("Playback/LookLabelInfo/ShowPipeline"), QString::fromLatin1(playback_info_label::Settings::kKeyShowPipeline()));
+    ASSERT_QSTR_EQ(QStringLiteral("Playback/LookLabelInfo/ShowResolution"), QString::fromLatin1(playback_info_label::Settings::kKeyShowResolution()));
+    // each key switches only its own field off
+    const char *keys[6] = { playback_info_label::Settings::kKeyShowPipeline(), playback_info_label::Settings::kKeyShowScale(),
+                            playback_info_label::Settings::kKeyShowDebayer(), playback_info_label::Settings::kKeyShowFps(),
+                            playback_info_label::Settings::kKeyShowDualIso(), playback_info_label::Settings::kKeyShowResolution() };
+    for ( int k = 0; k < 6; ++k )
+    {
+        {
+            auto store = automation_settings::openAppSettings();
+            store->clear();
+            store->setValue(QString::fromLatin1(keys[k]), false);
+            store->sync();
+        }
+        const playback_info_label::Toggles t = playback_info_label::togglesFromSettings();
+        const bool fields[6] = { t.pipeline, t.scale, t.debayer, t.fps, t.dualIso, t.resolution };
+        for ( int f = 0; f < 6; ++f ) ASSERT_EQ(f != k, fields[f]);
+    }
+    // the write helper round-trips through the same keys
+    playback_info_label::Toggles written = togglesFromMask(0x2A);   // scale, fps, resolution on
+    playback_info_label::togglesWriteToSettings(written);
+    const playback_info_label::Toggles read = playback_info_label::togglesFromSettings();
+    ASSERT_TRUE(!read.pipeline && read.scale && !read.debayer && read.fps && !read.dualIso && read.resolution);
+    automation_settings::releaseForTest();
+    QDir(dir).removeRecursively();
+    // the load path: the two MainWindow settings reads call it
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_EQ(2, source.count(QStringLiteral("m_playbackInfoToggles = playback_info_label::togglesFromSettings();")));
+}
+
+// r21 (adversary pass 20 A1, introduced, major): MLVAPP_EXPERIMENTAL_GL_VIEWPORT=1, a clip presented by the GPU widget viewport,
+// fullscreen look label and Scale enabled. GpuDisplayViewport::eventFilter consumes the Paint event while a frame is pending, so
+// QGraphicsView::paintEvent never runs and GraphicsZoomView::drawForeground (the only caller of the label blit) never draws the
+// look label or the playback-info lines. The viewport's own paintGL now hands the label to the view's one drawing routine.
+TEST(PlaybackInfoLabel, R21A1TheGpuWidgetViewportPaintDrawsTheLookLabelAndThePlaybackInfo)
+{
+    const QString viewport = readRepoFile(QStringLiteral("platform/qt/GpuDisplayViewport.cpp"));
+    const QString paintGl = functionBody(viewport, QStringLiteral("void GpuDisplayViewport::paintGL()"));
+    ASSERT_FALSE(paintGl.isEmpty());
+    // the consumed Paint event runs paintGL (QOpenGLWidget::event), which draws the frame and then the label over it
+    // (called by name: GpuDisplayViewport.cpp is also built into gui_tests, which does not link GraphicsZoomView)
+    ASSERT_TRUE(paintGl.contains(QStringLiteral("QMetaObject::invokeMethod(m_view, \"paintLookLabel\", Qt::DirectConnection")));
+    const int frameDrawAt = paintGl.indexOf(QStringLiteral("glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);"));
+    ASSERT_TRUE(frameDrawAt >= 0);
+    ASSERT_TRUE(paintGl.indexOf(QStringLiteral("\"paintLookLabel\"")) > frameDrawAt);   // over the frame, never under it
+    const QString zoomHeader = readRepoFile(QStringLiteral("platform/qt/GraphicsZoomView.h"));
+    ASSERT_TRUE(zoomHeader.contains(QStringLiteral("Q_INVOKABLE void paintLookLabel(QPainter *painter);")));
+    const QString gui = readRepoFile(QStringLiteral("tests/gui/gui_tests.pro"));
+    ASSERT_FALSE(gui.contains(QStringLiteral("GraphicsZoomView.cpp")));   // so a direct call from the viewport would not link there
+    // the view's CPU paint (drawForeground) and the GPU viewport's paint draw through the same routine, so the receipt's drawn
+    // text (lookLabelDrawnText) is whatever either surface last drew
+    const QString zoom = readRepoFile(QStringLiteral("platform/qt/GraphicsZoomView.cpp"));
+    const QString foreground = functionBody(zoom, QStringLiteral("void GraphicsZoomView::drawForeground("));
+    ASSERT_TRUE(foreground.contains(QStringLiteral("paintLookLabel( painter );")));
+    const QString label = functionBody(zoom, QStringLiteral("void GraphicsZoomView::paintLookLabel("));
+    ASSERT_TRUE(label.contains(QStringLiteral("m_lookLabelDrawnText = m_lookLabelText;")));
+    ASSERT_TRUE(label.contains(QStringLiteral("painter->drawPixmap(")));
+}
+
+// r21 (adversary pass 20 A2, introduced, major): a paused full-size CPU frame made with LMMSE, the debayer field on; AMaZE is selected
+// (m_pChosenDebayer text changes at once) and the label paints while the asynchronous replacement is pending: it read "AMaZE" over
+// the LMMSE frame. The debayer name is recorded on the request context when the frame is requested, and the field reads the
+// PRESENTED frame's context.
+TEST(PlaybackInfoLabel, R21A2TheDebayerFieldReadsTheDebayerThatProducedThePresentedFrame)
+{
+    // the label: the field is exactly the facts' name (nothing else substitutes the current selection)
+    playback_info_label::Facts presented = cpuFullScaleFacts(QStringLiteral("LMMSE"));
+    ASSERT_QSTR_EQ(QStringLiteral("LMMSE"), playback_info_label::debayerField(presented));
+    const QString header = readRepoFile(QStringLiteral("platform/qt/RenderFrameThread.h"));
+    ASSERT_TRUE(header.contains(QStringLiteral("QString debayerName;")));
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    // written when the frame is requested (drawFrame), read from the presented frame's context (playbackInfoFacts)
+    const QString draw = functionBody(source, QStringLiteral("void MainWindow::drawFrame( bool updateTimecodeLabel )"));
+    ASSERT_TRUE(draw.contains(QStringLiteral("requestContext.debayerName = m_pChosenDebayer ? m_pChosenDebayer->text() : QString();")));
+    const QString facts = functionBody(source, QStringLiteral("playback_info_label::Facts MainWindow::playbackInfoFacts( void )"));
+    ASSERT_FALSE(facts.contains(QStringLiteral("facts.debayer = m_pChosenDebayer ? m_pChosenDebayer->text() : QString();")));
+    ASSERT_TRUE(facts.contains(QStringLiteral("m_lastPresentedRequestContext.debayerName")));
+    // the class: no label reader takes the debayer text from the live selection
+    const QString info = functionBody(source, QStringLiteral("void MainWindow::updatePlaybackInfoLabel("));
+    ASSERT_FALSE(info.contains(QStringLiteral("m_pChosenDebayer")));
+}
+
+// r21 (adversary pass 20 A3, introduced, major): 24 fps Play; the first request at t=0 reaches present_nothing (no successful
+// presenter, no prepared image); the second at t=300 ms has a nonzero tick interval and supplies the first paint after the relabel
+// gate opens. The meter timestamped both requests and published 3.3/24 fps with no interval between presented frames. Only a
+// presented frame advances the meter's timestamp (recordPresentedFrame counts them).
+TEST(PlaybackInfoLabel, R21A3OnlyAPresentedFrameAdvancesTheFpsMeter)
+{
+    // the pure step: a request that presented nothing feeds no interval and does not re-arm the draw timestamp
+    ASSERT_TRUE(playback_fps_meter::drawFeedsMeter(true));
+    ASSERT_FALSE(playback_fps_meter::drawFeedsMeter(false));
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString record = functionBody(source, QStringLiteral("void MainWindow::recordPresentedFrame("));
+    ASSERT_TRUE(record.contains(QStringLiteral("++m_playbackPresentedFrameCount;")));
+    const QString tick = functionBody(source, QStringLiteral("void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )"));
+    const int gateAt = tick.indexOf(QStringLiteral("playback_fps_meter::drawFeedsMeter("));
+    ASSERT_TRUE(gateAt >= 0);
+    // the Play's first-draw flag, the timestamp, the interval and the smoothing all sit behind the presented-frame check
+    ASSERT_TRUE(tick.indexOf(QStringLiteral("const bool firstDrawOfPlay = m_playbackFpsMeterNewPlay;")) > gateAt);
+    ASSERT_TRUE(tick.indexOf(QStringLiteral("lastDrawTime = nowTime;")) > gateAt);
+    ASSERT_TRUE(tick.indexOf(QStringLiteral("playback_fps_meter::meterIntervalMs(")) > gateAt);
+    ASSERT_TRUE(tick.indexOf(QStringLiteral("playback_fps_meter::smoothedFrameMs(")) > gateAt);
+    ASSERT_TRUE(tick.contains(QStringLiteral("m_playbackFpsMeterSeenPresentedCount = m_playbackPresentedFrameCount;")));
+}
+
+// r21 (adversary pass 20 A4, introduced, major): 24 fps normal Play, EMA 40 ms, last draw and update 23:59:59.980; the first
+// post-midnight tick at 00:00:00.022 has whole-frame credit and draws. The draw branch handed -86399958 to the smoothing, which
+// PRESERVED 40 ms (a negative age is stalled everywhere else), replaced the timestamp and republished 25.0/24 fps. A negative age
+// clears the previous measured rate and the corner reads "--" until an interval inside the new timeline exists.
+TEST(PlaybackInfoLabel, R21A4ANegativeDrawAgeClearsThePreviousMeasuredRate)
+{
+    const int midnightWrapMs = -86399958;   // QTime(23,59,59,980).msecsTo(QTime(0,0,0,22))
+    ASSERT_TRUE(playback_fps_meter::fpsMeterStalled(midnightWrapMs));
+    ASSERT_TRUE(playback_fps_meter::smoothedFrameMs(40.0, midnightWrapMs) <= 0.0);   // cleared, never the preserved 40 ms
+    ASSERT_TRUE(playback_fps_meter::smoothedFrameMs(40.0, -1) <= 0.0);
+    // zero (same millisecond) still leaves the average alone, and the next positive interval reseeds from itself
+    ASSERT_EQ(40.0, playback_fps_meter::smoothedFrameMs(40.0, 0));
+    ASSERT_EQ(41.0, playback_fps_meter::smoothedFrameMs(playback_fps_meter::smoothedFrameMs(40.0, midnightWrapMs), 41));
+    // the wiring: a cleared average withdraws the shown rate (the rate is not republished from the preserved average)
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString tick = functionBody(source, QStringLiteral("void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )"));
+    const int clearAt = tick.indexOf(QStringLiteral("if( measuredFrameMs < 0 )"));
+    ASSERT_TRUE(clearAt >= 0);
+    // the one reset (it zeroes the status text, the average and the shown rate, and withdraws the corner's rate), reached because
+    // fpsMeterShouldReset reads a negative age as stalled (R7A1ANegativeOrWrappedDrawAgeCountsAsStalled)
+    ASSERT_TRUE(tick.mid(clearAt, 300).contains(QStringLiteral("resetFpsMeterIfIdle( nowTime );")));
+    ASSERT_TRUE(playback_fps_meter::fpsMeterShouldReset(true, true, midnightWrapMs));
 }

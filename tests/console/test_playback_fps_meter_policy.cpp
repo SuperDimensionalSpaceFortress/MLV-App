@@ -38,7 +38,8 @@ TEST(PlaybackFpsMeterPolicy, SeedsFromTheFirstSampleAndSmoothsAfter)
 TEST(PlaybackFpsMeterPolicy, IgnoresANonPositiveIntervalAndRestartsAfterAStall)
 {
     ASSERT_EQ(42.0, smoothedFrameMs(42.0, 0));
-    ASSERT_EQ(42.0, smoothedFrameMs(42.0, -3)); // clock wrap across midnight
+    // clock wrap across midnight: stalled, so the average is cleared (r21 pass 20 A4), never preserved
+    ASSERT_EQ(0.0, smoothedFrameMs(42.0, -3));
     // A long gap is a restart, not a sample to smooth into the old average.
     ASSERT_EQ(900.0, smoothedFrameMs(42.0, 900));
     ASSERT_FALSE(fpsMeterStalled(kFpsMeterStallMs));
@@ -75,8 +76,8 @@ TEST(PlaybackFpsMeterPolicy, R7A1ANegativeOrWrappedDrawAgeCountsAsStalled)
     // zero (same millisecond) and a normal frame period are not stalls
     ASSERT_FALSE(fpsMeterStalled(0));
     ASSERT_FALSE(fpsMeterShouldReset(true, true, 0));
-    // the smoothing step still ignores a negative sample (its <= 0 guard runs first)
-    ASSERT_EQ(42.0, smoothedFrameMs(42.0, midnightWrapMs));
+    // r21 (pass 20 A4): the smoothing step clears the average on a negative sample, as the stall check above says
+    ASSERT_EQ(0.0, smoothedFrameMs(42.0, midnightWrapMs));
 }
 
 // r7 A1 sibling (MainWindow.cpp fps-text gate): the same wall-clock wrap on the 250 ms text gate held the

@@ -1962,12 +1962,62 @@
     },
     {
       "path": "platform/qt/PlaybackFpsMeterPolicy.h",
-      "anchor": "if ( msSinceLastDraw <= 0 ) return emaFrameMs ;",
+      "anchor": "if ( msSinceLastDraw == 0 ) return emaFrameMs ;",
       "class": "value_fallback_select",
       "clock": "other",
-      "justification": "STATUS-FPS-METER-1: smoothedFrameMs() input-validity guard. msSinceLastDraw is a Qt QTime::msecsTo() draw-to-draw wall-clock delta; a non-positive value (first draw with no prior timestamp, or a clock step) leaves the FPS EMA unchanged instead of blending a bogus sample. A display smoothing guard for the status-bar FPS meter, not proof that any stage ran or a frame rendered.",
+      "justification": "STATUS-FPS-METER-1 (LOOK-LABEL-PLAYBACK-INFO-1 r21 narrowed it from '<= 0'): smoothedFrameMs() input-validity guard. msSinceLastDraw is a Qt QTime::msecsTo() draw-to-draw wall-clock delta; a zero value (first draw with no prior timestamp, or the same millisecond) leaves the FPS EMA unchanged instead of blending a bogus sample. A display smoothing guard for the status-bar FPS meter, not proof that any stage ran or a frame rendered.",
       "lines": [
-        34
+        58
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackFpsMeterPolicy.h",
+      "anchor": "if ( msSinceLastDraw < 0 ) return 0.0 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-1 r21 (adversary pass 20 A4): smoothedFrameMs() clears the average (0.0 = unmeasured) for a negative wall-clock draw age (midnight wrap, clock step back), which fpsMeterStalled() already counts as stalled, instead of preserving the rate of the timeline before the wrap. A display reset of the status-bar fps text and the corner rate; the value feeds only those, never whether a stage ran or a frame rendered.",
+      "lines": [
+        57
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "if ( measuredFrameMs < 0 ) resetFpsMeterIfIdle ( nowTime ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-1 r21 (adversary pass 20 A4): the draw branch of timerFrameEvent routes a negative draw-to-draw QTime::msecsTo() age (wall-clock wrap) through the one fps-meter stall reset, which zeroes the status text, the average and the corner's shown rate. A display reset for the fps text, never proof that a stage ran or a frame rendered.",
+      "lines": [
+        3145
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_fps_meter_policy.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , smoothedFrameMs ( 42.0 , - 3 ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-1 r21 (adversary pass 20 A4): pins that a negative (clock-wrapped) draw age clears the fps average. A pure arithmetic assertion on a policy function over literals; no stage or clock runs.",
+      "lines": [
+        42
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_fps_meter_policy.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , smoothedFrameMs ( 42.0 , midnightWrapMs ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-1 r21 (adversary pass 20 A4): pins that the midnight-wrap draw age (-86399400 ms literal) clears the fps average. A pure arithmetic assertion on a policy function over literals; no stage or clock runs.",
+      "lines": [
+        80
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_info_label.cpp",
+      "anchor": "const int clearAt = tick . indexOf ( QStringLiteral ( \"if( measuredFrameMs < 0 )\" ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-1 r21 (adversary pass 20 A4): a source-text search for the wiring line in MainWindow.cpp (the string literal is the searched text). It reads source text, never a duration, clock or a run of any stage.",
+      "lines": [
+        1657
       ]
     },
     {

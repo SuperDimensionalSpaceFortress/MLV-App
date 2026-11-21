@@ -1647,19 +1647,27 @@ function Get-DvLookLabelEvidence {
         foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
             # r13 (r12 adversary A1 sibling): culture-invariant ($script:DvCi), so a tr-TR upper-case look_label record is read as every other culture reads it
             # LOOK-LABEL-PLAYBACK-INFO-1: wait_ms= is read as a whole token (toCount reads a non-digit token as null) and the playback-info fields the app appends after it are optional
-            $labelMatch = [regex]::Match($line, 'gui_smoke\.look_label shown="(?<shown>[^"]*)" expected="(?<expected>[^"]*)" surface=(?<surface>\S+) show_in_fullscreen=(?<sif>[01]) wait_ms=(?<wait>\S+)(?: info_shown="(?<infoShown>[^"]*)" info_expected="(?<infoExpected>[^"]*)" info_fields=(?<infoFields>\S+))?', $script:DvCi)
+            # LOOK-LABEL-PLAYBACK-INFO-1 r21 (adversary pass 20 A5 / A6): the record marker starts on a token boundary (no name character or `.` before it), so
+            # `other.gui_smoke.look_label_playing ...` or `xgui_smoke.look_label ...` is a different record, never the one the app wrote. The app's own marker
+            # follows `event=` or the start of the body.
+            $labelMatch = [regex]::Match($line, '(?<![A-Za-z0-9_.])gui_smoke\.look_label shown="(?<shown>[^"]*)" expected="(?<expected>[^"]*)" surface=(?<surface>\S+) show_in_fullscreen=(?<sif>[01]) wait_ms=(?<wait>\S+)(?: info_shown="(?<infoShown>[^"]*)" info_expected="(?<infoExpected>[^"]*)" info_fields=(?<infoFields>\S+))?', $script:DvCi)
             if ($labelMatch.Success) {
+                # r21 (A7): the quote mask turned an `=` inside a quoted value into U+001A (ConvertTo-DvQuoteMaskedBody); the app never writes U+001A, so the
+                # receipt gets the text back as it was logged. Only the quoted text values: surface / sif / wait / infoFields are unquoted tokens.
                 $m = @{}
-                foreach ($g in 'shown', 'expected', 'surface', 'sif', 'wait') { $m[$g] = $labelMatch.Groups[$g].Value }
+                foreach ($g in 'shown', 'expected') { $m[$g] = $labelMatch.Groups[$g].Value.Replace($script:DvQuotedEqualsMask, [char]'=') }
+                foreach ($g in 'surface', 'sif', 'wait') { $m[$g] = $labelMatch.Groups[$g].Value }
                 # a build that does not print the info fields leaves these groups unmatched, so the keys stay absent and infoPresent reads false
-                foreach ($g in 'infoShown', 'infoExpected', 'infoFields') { if ($labelMatch.Groups[$g].Success) { $m[$g] = $labelMatch.Groups[$g].Value } }
+                foreach ($g in 'infoShown', 'infoExpected') { if ($labelMatch.Groups[$g].Success) { $m[$g] = $labelMatch.Groups[$g].Value.Replace($script:DvQuotedEqualsMask, [char]'=') } }
+                if ($labelMatch.Groups['infoFields'].Success) { $m['infoFields'] = $labelMatch.Groups['infoFields'].Value }
             }
             else {
                 # same culture-invariant read for the playing record (LOOK-LABEL-PLAYBACK-INFO-1, sibling of the r13 label read above)
-                $playMatch = [regex]::Match($line, 'gui_smoke\.look_label_playing shown="(?<shown>[^"]*)" info_shown="(?<infoShown>[^"]*)" surface=(?<surface>\S+) samples=(?<samples>\S+)', $script:DvCi)
+                $playMatch = [regex]::Match($line, '(?<![A-Za-z0-9_.])gui_smoke\.look_label_playing shown="(?<shown>[^"]*)" info_shown="(?<infoShown>[^"]*)" surface=(?<surface>\S+) samples=(?<samples>\S+)', $script:DvCi)
                 if ($playMatch.Success) {
                     $p = @{}
-                    foreach ($g in 'shown', 'infoShown', 'surface', 'samples') { $p[$g] = $playMatch.Groups[$g].Value }
+                    foreach ($g in 'shown', 'infoShown') { $p[$g] = $playMatch.Groups[$g].Value.Replace($script:DvQuotedEqualsMask, [char]'=') }
+                    foreach ($g in 'surface', 'samples') { $p[$g] = $playMatch.Groups[$g].Value }
                 }
             }
         }

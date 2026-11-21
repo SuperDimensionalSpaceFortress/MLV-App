@@ -36,6 +36,13 @@ public:
     void setLookLabel(const QString &text);
     // The label text the most recent viewport paint drew ("" when it drew none).
     QString lookLabelDrawnText(void) const { return m_lookLabelDrawnText; }
+    // LOOK-LABEL-PLAYBACK-INFO-1 r21 (adversary pass 20 A1): blits the cached label in the viewport's corner with `painter` (viewport
+    // coordinates) and records what it drew. drawForeground() calls it; so does the GPU widget viewport's paintGL, which owns the
+    // Paint event while a frame is pending, so QGraphicsView::paintEvent (and drawForeground) never run on that path.
+    // Q_INVOKABLE: the viewport calls it by name (GpuDisplayViewport.cpp is also built into gui_tests, which does not link this class).
+    Q_INVOKABLE void paintLookLabel(QPainter *painter);
+    // Whether a label is set (the GPU widget viewport opens a QPainter only for one).
+    Q_INVOKABLE bool hasLookLabel(void) const { return !m_lookLabelText.isEmpty(); }
 
     //Wall time of every preview paint (playback_smoke.gui_present_summary)
     using PaintTiming = preview_paint_timing::Totals;
