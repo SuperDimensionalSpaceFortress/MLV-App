@@ -998,6 +998,13 @@ class VenueLeaseBatchFifoTests(unittest.TestCase):
                 p.kill()
             p.wait()
 
+    def sleeper(self) -> subprocess.Popen:
+        # r8: a live process of its own for a ticket owner that is not the scenario's pwsh (the same helper as VenueClaimFifoTests.sleeper)
+        p = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 120"])
+        self._children.append(p)
+        time.sleep(1.0)
+        return p
+
     def ps(self, script: str, module: Path | None = None) -> dict:
         f = self.case / f"scenario-{len(list(self.case.glob('scenario-*.ps1')))}.ps1"
         f.write_text(f"$ErrorActionPreference = 'Stop'\nImport-Module '{module or MODULE}' -Force -DisableNameChecking\n$d = '{self.claims}'\n{script}\n", encoding="utf-8")
