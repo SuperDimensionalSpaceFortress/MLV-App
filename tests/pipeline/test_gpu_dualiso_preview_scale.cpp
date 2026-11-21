@@ -2126,7 +2126,7 @@ TEST(GpuDualIsoPreviewScale, C1ReceiptConfigReconParity)
                     }
                     ASSERT_TRUE(readU16(dir + "/in.u16", gpuIn, n));
                     ASSERT_TRUE(writeU16(dir + "/cpu_in.u16", cpuIn));
-                    // Both routes then share the with-dims prefix (llrawproc.c:5282-5442, incl.
+                    // Both routes then share the with-dims prefix (llrawproc.c:5292-5452, incl.
                     // the restricted-range rescale) before the recon, so in.u16 is that prefix
                     // applied to this shrink; recorded, not asserted byte-equal.
                     size_t inMismatches = 0;
