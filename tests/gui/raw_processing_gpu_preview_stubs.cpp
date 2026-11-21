@@ -164,6 +164,12 @@ extern "C" uint64_t llrpGpuPlaybackReconSetLutsCount(void)
     return 0;
 }
 
+/* DUALISO-CONFIGURE-CACHE-1 r17 (adversary A1): the same gate also reads the pattern-only configure counter. */
+extern "C" uint64_t llrpGpuPlaybackReconSetIsoPatternCount(void)
+{
+    return 0;
+}
+
 /* PLAYBACK-CUDA-HONOUR-SCALE-1 r4: GpuDisplayWindow.cpp's play-stop summary reads the phase-tent
  * shrink counters (video_mlv.c); the GUI harness links no engine, so no shrink ever ran. */
 extern "C" uint64_t mlvDualIsoPhaseTentShrinkFrames(void)

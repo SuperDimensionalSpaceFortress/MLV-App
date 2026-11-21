@@ -850,16 +850,20 @@ TEST(PlaybackWarmOutputReuseWiring, TheWarmKeysTheSlotOnlyAfterItsAmazeSucceeded
                               "key.blackLevel = blackLevel;", "key.wb[0] = wbMultipliers[0];", "key.wb[1] = wbMultipliers[1];",
                               "key.wb[2] = wbMultipliers[2];", "key.reducedHnyquist = reducedHnyquist;",
                               "key.setClipCountAfterWarm = setClipCountAfter;", "key.setLutsCountAfterWarm = setLutsCountAfter;",
+                              "key.setPatternCountAfterWarm = setPatternCountAfter;",
                               "key.captureId = captureId;"})
         ASSERT_TRUE(warm.contains(QString::fromLatin1(field)));
     // MainWindow hands the warm its frame and the counts read on the worker right after the run
     const QString source = sourceFile("platform/qt/MainWindow.cpp");
     ASSERT_TRUE(source.contains(QStringLiteral(
         "static_cast<uint64_t>( done.frameNumber ), outcome.setClipCountAfter, outcome.setLutsCountAfter,")));
+    ASSERT_TRUE(source.contains(QStringLiteral("outcome.setPatternCountAfter,")));   // adversary r17 A1
     const QString core = sourceFile("platform/qt/PlaybackReconWarmRun.h");
     const int after = core.indexOf(QStringLiteral("out.setClipCountAfter = llrpGpuPlaybackReconSetClipCount();"));
     ASSERT_TRUE(after > core.indexOf(QStringLiteral("applyLLRawProcObjectWorker( video, raw.data()")));
     ASSERT_TRUE(core.contains(QStringLiteral("out.setLutsCountAfter = llrpGpuPlaybackReconSetLutsCount();")));
+    // adversary r17 A1: the pattern-only configure counts too, read on the same worker right after the same run
+    ASSERT_TRUE(core.contains(QStringLiteral("out.setPatternCountAfter = llrpGpuPlaybackReconSetIsoPatternCount();")));
 }
 
 TEST(PlaybackWarmOutputReuseWiring, TheKeyIsClearedWithTheSlotAndByAReRunPrewarm)
@@ -931,7 +935,8 @@ TEST(PlaybackWarmOutputReuseWiring, TheGateAndTheCompareComeBeforeTheDeviceAmaze
     const QString gateCall = present.mid(gate, onNone - gate);
     for (const char *input : {"playbackWarmOutputReuseEnabled(),", "stagedAdopted,", "warmKey,", "presentKey,",
                               "llrpGpuCudaSuppressed() != 0,", "validationProbeTexture,",
-                              "llrpGpuPlaybackReconSetClipCount(),", "llrpGpuPlaybackReconSetLutsCount());"})
+                              "llrpGpuPlaybackReconSetClipCount(),", "llrpGpuPlaybackReconSetLutsCount(),",
+                              "llrpGpuPlaybackReconSetIsoPatternCount());"})
         ASSERT_TRUE(gateCall.contains(QString::fromLatin1(input)));
     for (const char *field : {"presentKey.frame = state->frame_id;", "presentKey.width = texWidth;", "presentKey.height = texHeight;",
                               "presentKey.blackLevel = blackLevel;", "presentKey.wb[2] = wbMultipliers[2];",

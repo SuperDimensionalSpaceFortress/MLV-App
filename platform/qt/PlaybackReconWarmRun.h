@@ -50,6 +50,7 @@ struct Outcome
     // after this run (the warm key: a later configuration call means the warm's output may be stale)
     uint64_t setClipCountAfter = 0;
     uint64_t setLutsCountAfter = 0;
+    uint64_t setPatternCountAfter = 0;   // adversary r17 A1: set_iso_pattern (the pattern-only configure) moves neither count above
     int backendRc = 0;
     llrpGpuPlaybackRetainedDeviceBayer16_t retained;   // valid when ran; the caller releases retained.token
     // PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1: the llrawproc runs this warm made (F-a: 2 when the first one
@@ -180,6 +181,7 @@ inline Outcome run( mlvObject_t *video,
         ++out.warmRuns;
         out.setClipCountAfter = llrpGpuPlaybackReconSetClipCount();
         out.setLutsCountAfter = llrpGpuPlaybackReconSetLutsCount();
+        out.setPatternCountAfter = llrpGpuPlaybackReconSetIsoPatternCount();
         out.setClipCalls = out.setClipCountAfter - setClipBefore;
         out.setLutsCalls = out.setLutsCountAfter - setLutsBefore;
         // this thread's run_backend just measured them (0 when the run needed neither)

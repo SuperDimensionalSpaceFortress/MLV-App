@@ -160,6 +160,7 @@ struct Key
     bool reducedHnyquist = false;
     uint64_t setClipCountAfterWarm = 0;
     uint64_t setLutsCountAfterWarm = 0;
+    uint64_t setPatternCountAfterWarm = 0;   // adversary r17 A1: set_iso_pattern is a configure that moves neither count above
     uint64_t captureId = 0;
     PreparedState state;   // F-key: the recon's per-run constants this AMaZE input was made with
 };
@@ -173,7 +174,8 @@ inline Reason preGate( bool enabled,
                        bool cudaSuppressed,
                        bool validationProbe,
                        uint64_t setClipNow,
-                       uint64_t setLutsNow )
+                       uint64_t setLutsNow,
+                       uint64_t setPatternNow )
 {
     if( !enabled ) return Reason::Disabled;
     if( !adopted ) return Reason::NotAdopted;
@@ -188,7 +190,8 @@ inline Reason preGate( bool enabled,
         if( !( warmKey.wb[i] == presentKey.wb[i] ) ) return Reason::WbMismatch;
     }
     if( warmKey.reducedHnyquist != presentKey.reducedHnyquist ) return Reason::HnyquistMismatch;
-    if( setClipNow != warmKey.setClipCountAfterWarm || setLutsNow != warmKey.setLutsCountAfterWarm )
+    if( setClipNow != warmKey.setClipCountAfterWarm || setLutsNow != warmKey.setLutsCountAfterWarm
+     || setPatternNow != warmKey.setPatternCountAfterWarm )
         return Reason::ReconConfiguredSinceWarm;
     // F-key: decided here, before any compare; an unknown state on either side is never proven equal
     if( !warmKey.state.valid || !presentKey.state.valid || !preparedStateDiff( warmKey.state, presentKey.state ).isEmpty() )

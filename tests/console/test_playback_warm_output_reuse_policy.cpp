@@ -57,6 +57,7 @@ Key warmKey()
     k.reducedHnyquist = false;
     k.setClipCountAfterWarm = 3;
     k.setLutsCountAfterWarm = 5;
+    k.setPatternCountAfterWarm = 11;
     k.captureId = 7;
     k.state = preparedState();
     return k;
@@ -69,14 +70,16 @@ Key presentKey()
     k.valid = false;
     k.setClipCountAfterWarm = 0;
     k.setLutsCountAfterWarm = 0;
+    k.setPatternCountAfterWarm = 0;
     k.captureId = 0;
     return k;
 }
 
-// enabled, adopted, not suppressed, not a validation probe, no set_clip / set_luts since the warm
+// enabled, adopted, not suppressed, not a validation probe, no set_clip / set_luts / set_iso_pattern since the warm
 Reason gate(const Key &warm, const Key &present)
 {
-    return preGate(true, true, warm, present, false, false, warm.setClipCountAfterWarm, warm.setLutsCountAfterWarm);
+    return preGate(true, true, warm, present, false, false, warm.setClipCountAfterWarm, warm.setLutsCountAfterWarm,
+                   warm.setPatternCountAfterWarm);
 }
 
 std::string name(Reason reason) { return std::string(reasonName(reason)); }
@@ -162,20 +165,23 @@ TEST(PlaybackWarmOutputReusePolicy, EachSkipReasonRefusesBeforeAnyCompare)
     const Key p = presentKey();
     const uint64_t c = w.setClipCountAfterWarm;
     const uint64_t l = w.setLutsCountAfterWarm;
-    ASSERT_EQ(std::string("disabled"), name(preGate(false, true, w, p, false, false, c, l)));
-    ASSERT_EQ(std::string("not_adopted"), name(preGate(true, false, w, p, false, false, c, l)));
+    const uint64_t t = w.setPatternCountAfterWarm;
+    ASSERT_EQ(std::string("disabled"), name(preGate(false, true, w, p, false, false, c, l, t)));
+    ASSERT_EQ(std::string("not_adopted"), name(preGate(true, false, w, p, false, false, c, l, t)));
     Key invalid = w;
     invalid.valid = false;
-    ASSERT_EQ(std::string("no_warm_key"), name(preGate(true, true, invalid, p, false, false, c, l)));
+    ASSERT_EQ(std::string("no_warm_key"), name(preGate(true, true, invalid, p, false, false, c, l, t)));
     Key noCapture = w;
     noCapture.captureId = 0;
-    ASSERT_EQ(std::string("no_warm_key"), name(preGate(true, true, noCapture, p, false, false, c, l)));
-    ASSERT_EQ(std::string("validation_probe"), name(preGate(true, true, w, p, false, true, c, l)));
-    ASSERT_EQ(std::string("cuda_suppressed"), name(preGate(true, true, w, p, true, false, c, l)));
-    ASSERT_EQ(std::string("recon_configured_since_warm"), name(preGate(true, true, w, p, false, false, c + 1, l)));
-    ASSERT_EQ(std::string("recon_configured_since_warm"), name(preGate(true, true, w, p, false, false, c, l + 1)));
+    ASSERT_EQ(std::string("no_warm_key"), name(preGate(true, true, noCapture, p, false, false, c, l, t)));
+    ASSERT_EQ(std::string("validation_probe"), name(preGate(true, true, w, p, false, true, c, l, t)));
+    ASSERT_EQ(std::string("cuda_suppressed"), name(preGate(true, true, w, p, true, false, c, l, t)));
+    ASSERT_EQ(std::string("recon_configured_since_warm"), name(preGate(true, true, w, p, false, false, c + 1, l, t)));
+    ASSERT_EQ(std::string("recon_configured_since_warm"), name(preGate(true, true, w, p, false, false, c, l + 1, t)));
+    // adversary r17 A1: a pattern-only configure (set_iso_pattern) advances neither of the two counts above
+    ASSERT_EQ(std::string("recon_configured_since_warm"), name(preGate(true, true, w, p, false, false, c, l, t + 1)));
     // a default (never set) key, as the window holds before any warm
-    ASSERT_EQ(std::string("no_warm_key"), name(preGate(true, true, Key(), p, false, false, 0, 0)));
+    ASSERT_EQ(std::string("no_warm_key"), name(preGate(true, true, Key(), p, false, false, 0, 0, 0)));
     for (const Reason r : {Reason::Disabled, Reason::NotAdopted, Reason::NoWarmKey, Reason::ValidationProbe,
                            Reason::CudaSuppressed, Reason::FrameMismatch, Reason::SizeMismatch, Reason::BlackMismatch,
                            Reason::WbMismatch, Reason::HnyquistMismatch, Reason::ReconConfiguredSinceWarm})
@@ -188,8 +194,28 @@ TEST(PlaybackWarmOutputReusePolicy, TheKillSwitchAndAdoptionOutrankEveryOtherFie
     p.frame += 1;
     p.wb[0] += 1.0;
     // disabled first, then not adopted, whatever else differs
-    ASSERT_EQ(std::string("disabled"), name(preGate(false, false, Key(), p, true, true, 9, 9)));
-    ASSERT_EQ(std::string("not_adopted"), name(preGate(true, false, warmKey(), p, true, true, 9, 9)));
+    ASSERT_EQ(std::string("disabled"), name(preGate(false, false, Key(), p, true, true, 9, 9, 9)));
+    ASSERT_EQ(std::string("not_adopted"), name(preGate(true, false, warmKey(), p, true, true, 9, 9, 9)));
+}
+
+// adversary r17 A1: the pattern-only configure (llrpGpuPlaybackReconSetIsoPatternCount) is a recon configure like the clip
+// and LUT ones. Warm frame 0 with pattern 1100, finish frame 1 with 0011 and identical geometry, levels and LUTs: only the
+// pattern count moved, and the warm output must not be compared (let alone reused) as if nothing had changed.
+TEST(PlaybackWarmOutputReusePolicy, APatternOnlyConfigureSinceTheWarmRefusesTheCompare)
+{
+    const Key w = warmKey();
+    const Key p = presentKey();
+    ASSERT_EQ(std::string("none"), name(gate(w, p)));
+    ASSERT_EQ(std::string("recon_configured_since_warm"),
+              name(preGate(true, true, w, p, false, false, w.setClipCountAfterWarm, w.setLutsCountAfterWarm,
+                           w.setPatternCountAfterWarm + 1)));
+    // each of the three counts alone refuses; none of them moving does not
+    ASSERT_EQ(std::string("recon_configured_since_warm"),
+              name(preGate(true, true, w, p, false, false, w.setClipCountAfterWarm + 1, w.setLutsCountAfterWarm,
+                           w.setPatternCountAfterWarm)));
+    ASSERT_EQ(std::string("recon_configured_since_warm"),
+              name(preGate(true, true, w, p, false, false, w.setClipCountAfterWarm, w.setLutsCountAfterWarm + 1,
+                           w.setPatternCountAfterWarm)));
 }
 
 // ---- after the compare ----
@@ -343,7 +369,7 @@ TEST(PlaybackWarmOutputReusePolicy, AMissingPreparedStateOnEitherSideIsAStateMis
     ASSERT_EQ(std::string("frame_mismatch"), name(gate(warmKey(), frame)));
     ASSERT_EQ(std::string("recon_configured_since_warm"),
               name(preGate(true, true, warmKey(), present, false, false, warmKey().setClipCountAfterWarm + 1,
-                           warmKey().setLutsCountAfterWarm)));
+                           warmKey().setLutsCountAfterWarm, warmKey().setPatternCountAfterWarm)));
 }
 
 TEST(PlaybackWarmOutputReusePolicy, ThePreparedStateIsReadFromTheReconStateByName)

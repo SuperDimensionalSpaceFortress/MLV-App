@@ -31185,7 +31185,7 @@ void MainWindow::onPlaybackReconWarmDone( const RenderFrameThread::PlaybackRecon
             outcome.retained.device_bayer16, outcome.width, outcome.height, done.blackLevel, wb,
             playbackReducedHnyquistWanted( outcome.scale > 1 ), &line.amazeKernelMs, &amazeReason, &amazeTiming,
             static_cast<uint64_t>( done.frameNumber ), outcome.setClipCountAfter, outcome.setLutsCountAfter,
-            &reuseCapture, &warmState );
+            outcome.setPatternCountAfter, &reuseCapture, &warmState );
     }
     else if( hasOutput )
     {

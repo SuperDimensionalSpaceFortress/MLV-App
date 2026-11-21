@@ -131,6 +131,7 @@ public:
                                                              uint64_t frame = 0,
                                                              uint64_t setClipCountAfter = 0,
                                                              uint64_t setLutsCountAfter = 0,
+                                                             uint64_t setPatternCountAfter = 0,
                                                              QString *reuseCapture = nullptr,
                                                              const playback_warm_output_reuse::PreparedState *warmState = nullptr);
     /* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R2 (PlaybackWarmOutputReusePolicy.h): after the warm's
@@ -358,6 +359,7 @@ private:
                                               uint64_t frame,
                                               uint64_t setClipCountAfter,
                                               uint64_t setLutsCountAfter,
+                                              uint64_t setPatternCountAfter,
                                               QString *reuseCapture,
                                               const playback_warm_output_reuse::PreparedState *warmState);
     /* R2: clears the warm key and the backend's input capture (no CUDA call). */
