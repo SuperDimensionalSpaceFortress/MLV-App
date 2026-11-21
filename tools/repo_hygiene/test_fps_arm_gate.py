@@ -93,9 +93,18 @@ class _Probe(unittest.TestCase):
         return proc.stdout
 
 
-# the launch block a LIGHT smoke records (what the wrapper's leg record carries beside its arm): telemetry on, the per-frame log opted out, no arguments. It matches the producers' exact LIGHT
-# shape (FpsArmGate.psm1 $script:FpsLightArgs / $script:FpsLightEnv), so it is PROOF of LIGHT (BENCH-LIGHT-ARM-GAIN-GATES-1 r8: a bare LIGHT word, or one beside an observerControls list, is not).
-RECORDED_LIGHT_LAUNCH = ("launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' }; arguments = @() }")
+# the launch block a LIGHT smoke records (what the wrapper's leg record carries beside its arm): the members EVERY producer launch records (run-release-gui-smoke.ps1:1481-1503 arguments and the
+# crash-log directory, the table rows marked required), frame telemetry on, the per-frame log opted out. It matches the producers' exact LIGHT shape (FpsArmGate.psm1 $script:FpsLightArgs /
+# $script:FpsLightEnv), so it is PROOF of LIGHT (BENCH-LIGHT-ARM-GAIN-GATES-1 r8: a bare LIGHT word, an observerControls list, or an empty launch is not).
+PRODUCER_ARGS_PS = ("'--gui-smoke-playback', '--input', 'C:\\clip.mlv', '--seconds', '7', '--start-frame', '0', '--settle-ms', '2500', '--settle-cpu-percent', '10', "
+                    "'--settle-cpu-stable-ms', '1000', '--settle-cpu-max-ms', '45000'")
+PRODUCER_LOGDIR_PS = "MLVAPP_CRASH_FORENSICS_LOG_DIR = 'C:\\logs'"
+LIGHT_LAUNCH_ENV_PS = f"MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1'; {PRODUCER_LOGDIR_PS}"
+RECORDED_LIGHT_LAUNCH = f"launch = [pscustomobject]@{{ environment = [pscustomobject]@{{ {LIGHT_LAUNCH_ENV_PS} }}; arguments = @({PRODUCER_ARGS_PS}) }}"
+# the same launch as JSON text (a parsed saved record): used where a test feeds ConvertFrom-Json
+PRODUCER_ARGS_JSON = ('["--gui-smoke-playback","--input","C:\\\\clip.mlv","--seconds","7","--start-frame","0","--settle-ms","2500","--settle-cpu-percent","10",'
+                      '"--settle-cpu-stable-ms","1000","--settle-cpu-max-ms","45000"]')
+LIGHT_ENV_JSON = '{"MLVAPP_PLAYBACK_SMOKE_TELEMETRY":"1","MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG":"1","MLVAPP_CRASH_FORENSICS_LOG_DIR":"C:\\\\logs"}'
 # the evidence fragment a LIGHT leg-record literal carries (r5 carried an observerControls list here; r8 deleted that evidence: the recorded launch is the proof)
 LIGHT_EVIDENCE = RECORDED_LIGHT_LAUNCH + "; "
 
@@ -128,15 +137,17 @@ class ArmClassifierTests(_Probe):
         # BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary pass 5 A2): `@($launchArgs)` turned the JSON string "--playback-smoke" (or " ") into a one-element list, so a launch with a scalar argument
         # value was LIGHT. The recorded argument list must BE a list (an empty one is a launch that passed nothing); anything else is UNKNOWN, and a list holding --stage-log is still HEAVY.
         out = self.ok(
-            "$envJson = '\"environment\":{\"MLVAPP_PLAYBACK_SMOKE_TELEMETRY\":\"1\",\"MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG\":\"1\"}'\n"
-            "foreach ($argText in @('[]', '\"--playback-smoke\"', '\" \"', '\"\"', 'null', '7', '[\"--stage-log=x.csv\"]', '[\"--playback-smoke\"]')) {\n"
+            "$envJson = '\"environment\":" + LIGHT_ENV_JSON + "'\n"
+            "foreach ($argText in @('[]', '\"--playback-smoke\"', '\" \"', '\"\"', 'null', '7', '[\"--stage-log=x.csv\"]', '[\"--playback-smoke\"]', '" + PRODUCER_ARGS_JSON + "')) {\n"
             "    $launch = ('{' + $envJson + ',\"arguments\":' + $argText + '}') | ConvertFrom-Json\n"
-            "    Write-Host ('ARGS=' + $argText + ' ARM=' + (Get-FpsArmFromLaunch $launch).arm)\n"
+            "    $label = if ($argText.Length -gt 30) { $argText.Substring(0, 17) } else { $argText }\n"
+            "    Write-Host ('ARGS=' + $label + ' ARM=' + (Get-FpsArmFromLaunch $launch).arm)\n"
             "}\n")
         got = dict(line.split(" ARM=") for line in out.strip().splitlines())
-        # r8: a list holding an argument outside the producers' LIGHT shape (a stage log, an unknown flag) is UNKNOWN, not HEAVY and not LIGHT
-        self.assertEqual(got, {"ARGS=[]": "LIGHT", 'ARGS="--playback-smoke"': "UNKNOWN", 'ARGS=" "': "UNKNOWN", 'ARGS=""': "UNKNOWN", "ARGS=null": "UNKNOWN", "ARGS=7": "UNKNOWN",
-                               'ARGS=["--stage-log=x.csv"]': "UNKNOWN", 'ARGS=["--playback-smoke"]': "UNKNOWN"})
+        # r8: a list holding an argument outside the producers' LIGHT shape (a stage log, an unknown flag) is UNKNOWN, not HEAVY and not LIGHT; an EMPTY list is not the producers' shape either
+        # (A8: every producer launch records --gui-smoke-playback and the rest of the runner's unconditional arguments); the full producer list is LIGHT
+        self.assertEqual(got, {"ARGS=[]": "UNKNOWN", 'ARGS="--playback-smoke"': "UNKNOWN", 'ARGS=" "': "UNKNOWN", 'ARGS=""': "UNKNOWN", "ARGS=null": "UNKNOWN", "ARGS=7": "UNKNOWN",
+                               'ARGS=["--stage-log=x.csv"]': "UNKNOWN", 'ARGS=["--playback-smoke"]': "UNKNOWN", 'ARGS=["--gui-smoke-pla': "LIGHT"})
 
     def test_an_embedded_generator_args_arm_must_be_the_scalar_light(self) -> None:
         # BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary pass 5 A4): generatorArgs.telemetryArm embedded in a record was read through the arm-object-tolerant ConvertTo-FpsArmName, so
@@ -299,13 +310,18 @@ class ArmClassifierTests(_Probe):
     def test_the_launch_block_is_judged_on_its_arguments_too(self) -> None:
         # r8 (the narrow promise; A1 of r6): the recorded arguments must match the producers' exact LIGHT shape (a closed flag table, FpsArmGate.psm1 $script:FpsLightArgs). --stage-log and the
         # contact-sheet options turn on work inside the timed window; neither is in the table, so a launch that passed one is UNKNOWN, like any flag nobody listed.
-        env = "environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' }"
+        env = f"environment = [pscustomobject]@{{ {LIGHT_LAUNCH_ENV_PS} }}"
         producer_args = ("'--gui-smoke-playback', '--input', 'C:\\clips\\a.mlv', '--seconds', '7.5', '--start-frame', '0', '--presented-frames', '120', '--drop-frame-mode', 'persisted', "
                          "'--settle-ms', '2500', '--settle-cpu-percent', '10', '--settle-cpu-stable-ms', '1000', '--settle-cpu-max-ms', '45000', '--receipt', 'C:\\r\\receipt.json', "
                          "'--scope', 'none', '--playback-debayer=amaze', '--gpu-amaze-texture-present', '--no-look-assist', '--display-prefer=\\\\.\\DISPLAY1'")
         cases = {
-            f"[pscustomobject]@{{ {env}; arguments = @() }}": "LIGHT",
-            f"[pscustomobject]@{{ {env}; arguments = @('--input', 'x') }}": "LIGHT",
+            f"[pscustomobject]@{{ {env}; arguments = @({PRODUCER_ARGS_PS}) }}": "LIGHT",
+            # A8: an empty or partial list matches the tables vacuously but is not the shape every producer launch records (--gui-smoke-playback, --input, --seconds, --start-frame, the settle options)
+            f"[pscustomobject]@{{ {env}; arguments = @() }}": "UNKNOWN",
+            f"[pscustomobject]@{{ {env}; arguments = @('--input', 'x') }}": "UNKNOWN",
+            f"[pscustomobject]@{{ {env}; arguments = @({PRODUCER_ARGS_PS.replace(chr(39) + '--start-frame' + chr(39) + ', ' + chr(39) + '0' + chr(39) + ', ', '')}) }}": "UNKNOWN",
+            f"[pscustomobject]@{{ environment = [pscustomobject]@{{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' }}; arguments = @({PRODUCER_ARGS_PS}) }}": "UNKNOWN",   # no crash-log directory
+            "[pscustomobject]@{ environment = [pscustomobject]@{ }; arguments = @() }": "UNKNOWN",                                                                                                    # the adversary's empty launch
             f"[pscustomobject]@{{ {env}; arguments = @({producer_args}) }}": "LIGHT",                       # the whole shape the runner emits
             f"[pscustomobject]@{{ {env}; arguments = @('--stage-log=C:\\Temp\\stage.csv') }}": "UNKNOWN",
             f"[pscustomobject]@{{ {env}; arguments = @('--stage-log', 'C:\\Temp\\stage.csv') }}": "UNKNOWN",
@@ -705,8 +721,9 @@ class CudaPlaybackAbFpsGateTests(_Probe):
     def test_the_smoke_summary_arm_is_read_from_the_recorded_launch_environment(self) -> None:
         cases = {
             "launch = [pscustomobject]@{ arguments = @(); environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1' } }": "HEAVY",
+            f"launch = [pscustomobject]@{{ arguments = @({PRODUCER_ARGS_PS}); environment = [pscustomobject]@{{ {LIGHT_LAUNCH_ENV_PS} }} }}": "LIGHT",
             ("launch = [pscustomobject]@{ arguments = @(); environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; "
-             "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' } }"): "LIGHT",
+             "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' } }"): "UNKNOWN",   # A8: the empty argument list and the missing crash-log directory are not the producers' shape
             ("launch = [pscustomobject]@{ arguments = @('--stage-log=C:\\Temp\\s.csv'); environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; "
              "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' } }"): "UNKNOWN",   # r8: outside the producers' LIGHT argument shape
             "launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1' } }": "UNKNOWN",
@@ -961,10 +978,10 @@ class CompareGuiSmokeAbFpsGateTests(_Probe):
     def smoke(env: str | None) -> str:
         if env is None:
             return "[pscustomobject]@{ launch = [pscustomobject]@{ } }"
-        return f"[pscustomobject]@{{ launch = [pscustomobject]@{{ arguments = @(); environment = [pscustomobject]@{{ {env} }} }} }}"
+        return f"[pscustomobject]@{{ launch = [pscustomobject]@{{ arguments = @({PRODUCER_ARGS_PS}); environment = [pscustomobject]@{{ {env} }} }} }}"
 
     HEAVY_ENV = "MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'"
-    LIGHT_ENV = "MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1'"
+    LIGHT_ENV = LIGHT_LAUNCH_ENV_PS
 
     def run_compare(self, before: str | None, after: str | None) -> dict:
         out = self.ok(
@@ -1401,7 +1418,7 @@ class ObserverControlTests(_Probe):
         bare = self._json('{"telemetryArm":"LIGHT"}')
         empty = self._json('{"telemetryArm":"LIGHT","observerControls":{}}')
         recorded_off = self._json('{"telemetryArm":"LIGHT","observerControls":{"utilSample":false}}')
-        launch = '{"environment":{"MLVAPP_PLAYBACK_SMOKE_TELEMETRY":"1","MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG":"1"},"arguments":[]}'
+        launch = '{"environment":' + LIGHT_ENV_JSON + ',"arguments":' + PRODUCER_ARGS_JSON + '}'
         with_launch = self._json('{"telemetryArm":"LIGHT","launch":' + launch + '}')
         with_ga = self._json('{"telemetryArm":"LIGHT","generatorArgs":{"telemetryArm":"LIGHT","presentTrace":true}}')
         heavy = self._json('{"telemetryArm":"HEAVY","observerControls":{"utilSample":true}}')
@@ -1438,7 +1455,7 @@ class ObserverControlTests(_Probe):
         def launch(value: str | None) -> str:
             extra = "" if value is None else f"; MLVAPP_VIEWPORT_PRESENT_DIAG = '{value}'"
             return ("Get-FpsArmFromLaunch ([pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; "
-                    f"MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1'{extra} }}; arguments = @() }})")
+                    f"MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1'; {PRODUCER_LOGDIR_PS}{extra} }}; arguments = @({PRODUCER_ARGS_PS}) }})")
         cases = {launch(v): "UNKNOWN" for v in ("1", "true", "on", "yes", "TRUE", "On", "YES", " 1 ", "1\t", "true\r\n", "0", "false", "off", "no", "", "FALSE", "Off")}
         cases[launch(None)] = "LIGHT"
         self.check(cases)
@@ -1553,7 +1570,7 @@ class ObserverControlTests(_Probe):
     def test_a_light_arm_object_that_contradicts_its_recorded_launch_is_not_light(self) -> None:
         # r5 (adversary A2): an arm object returned as it was; a leg that also records its launch must agree with it, and an object that does not name the launch environment as its source is a label
         launch_heavy = "launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1'; MLVAPP_VIEWPORT_PRESENT_DIAG = 'yes' }; arguments = @() }"
-        launch_light = "launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' }; arguments = @() }"
+        launch_light = RECORDED_LIGHT_LAUNCH
         self.check({
             f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = (New-FpsArm 'LIGHT' 'environment' 'x'); {launch_heavy} }})": "UNKNOWN",
             f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = (New-FpsArm 'LIGHT' 'environment' 'x'); {launch_light} }})": "LIGHT",
@@ -1591,8 +1608,8 @@ class ObserverControlTests(_Probe):
         # r5 pass 2 A1: `-in` and `-ieq` are culture compares too: "1" + U+0001 read as the frame-log opt-out "1", and an observerControls key with U+00AD matched the listed threshold's name
         # and so skipped the nonzero-unlisted-entry refusal
         def launch(value: str, suffix: str) -> str:
-            return ("Get-FpsArmFromLaunch ([pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; "
-                    "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = ('" + value + "' + " + suffix + ") }; arguments = @() })")
+            return ("Get-FpsArmFromLaunch ([pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; " + PRODUCER_LOGDIR_PS + "; "
+                    "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = ('" + value + "' + " + suffix + ") }; arguments = @(" + PRODUCER_ARGS_PS + ") })")
         self.check({
             launch("1", "[char]1"): "UNKNOWN",
             launch("on", "[char]173"): "UNKNOWN",
@@ -1646,10 +1663,10 @@ class LightShapeAllowlistTests(_Probe):
     def test_the_a1_contact_sheet_input_is_unknown_for_a_saved_record_a_launch_and_the_pair(self) -> None:
         # A1 (r6, FIXED): the adversary's launch (contact-sheet options, telemetry on with the frame-log opt-out) read LIGHT through the saved-leg reader and the launch reader and the pair was allowed
         out = self.ok(
-            "$launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' }; "
-            "arguments = @('--gui-smoke', '--contact-sheet-dir', 'C:\\Temp\\sheet', '--contact-sheet-frames', '6') }\n"
+            f"$launch = [pscustomobject]@{{ environment = [pscustomobject]@{{ {LIGHT_LAUNCH_ENV_PS} }}; "
+            f"arguments = @({PRODUCER_ARGS_PS}, '--contact-sheet-dir', 'C:\\Temp\\sheet', '--contact-sheet-frames', '6') }}\n"
             "$rec = [pscustomobject]@{ telemetryArm = 'LIGHT'; launch = $launch }\n"
-            "$good = [pscustomobject]@{ telemetryArm = 'LIGHT'; launch = [pscustomobject]@{ environment = $launch.environment; arguments = @() } }\n"
+            f"$good = [pscustomobject]@{{ telemetryArm = 'LIGHT'; launch = [pscustomobject]@{{ environment = $launch.environment; arguments = @({PRODUCER_ARGS_PS}) }} }}\n"
             "$a = Get-FpsArmFromLegRecord $rec; $g = Get-FpsArmFromLegRecord $good\n"
             "Write-Host ('LEG=' + $a.arm + ' LAUNCH=' + (Get-FpsArmFromLaunch $launch).arm + ' GOOD=' + $g.arm)\n"
             "$v = Get-FpsPairVerdict -Baseline $g -Candidate $a\nWrite-Host ('PAIR=' + $v.allowed + '|' + $v.reason)\n")
@@ -1695,10 +1712,62 @@ class LightShapeAllowlistTests(_Probe):
                       "generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' } })) })\nWrite-Host ('PLAN=' + ($p -join '|').Substring(0, 21))")
         self.assertEqual(out.strip(), "PLAN=FPS_AB_UNKNOWN_ARM|1|")
 
+    def test_a3_a_look_leg_carried_by_a_saved_record_or_result_is_not_light(self) -> None:
+        # r8 adversary A3: the spec reader refused a look spec, but a saved record or a result that embeds the same fields (record-level legType 'look', a `look` block, generatorArgs LIGHT)
+        # read LIGHT through the record readers, and the pair was allowed. A record that carries a look block or any legType but 'speed' is outside the LIGHT shape.
+        ga = "generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' }"
+        cases = {}
+        for reader in ("Get-FpsArmFromLegRecord", "Get-FpsArmFromJobResult"):
+            cases[f"{reader} ([pscustomobject]@{{ telemetryArm = 'LIGHT'; legType = 'look'; {ga}; look = [pscustomobject]@{{ contactSheetFrames = 6 }} }})"] = "UNKNOWN"
+            cases[f"{reader} ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {ga}; look = [pscustomobject]@{{ contactSheetFrames = 6 }} }})"] = "UNKNOWN"
+            cases[f"{reader} ([pscustomobject]@{{ telemetryArm = 'LIGHT'; legType = 'look'; {ga} }})"] = "UNKNOWN"
+            cases[f"{reader} ([pscustomobject]@{{ telemetryArm = 'LIGHT'; legType = 'speed'; {ga} }})"] = "LIGHT"
+            cases[f"{reader} ([pscustomobject]@{{ telemetryArm = 'LIGHT'; legType = 'look'; {RECORDED_LIGHT_LAUNCH} }})"] = "UNKNOWN"
+        self.check(cases)
+        out = self.ok(f"$a = Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; legType = 'look'; {ga}; look = [pscustomobject]@{{ contactSheetFrames = 6 }} }})\n"
+                      f"$b = Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {RECORDED_LIGHT_LAUNCH} }})\n"
+                      "$v = Get-FpsPairVerdict -Baseline $b -Candidate $a\nWrite-Host ('PAIR=' + $v.allowed + '|' + $v.reason)")
+        self.assertEqual(out.strip(), f"PAIR=False|{UNKNOWN_REASON}")
+
+    def test_a4_an_observer_controls_entry_beside_corroborating_evidence_is_not_light(self) -> None:
+        # r8 adversary A4: a record with LIGHT generatorArgs (or a launch) AND an observerControls entry that says an observer is enabled read LIGHT, because the entry is no longer read and the
+        # other field corroborated. No producer records an observerControls entry at all, so its mere presence is outside the LIGHT shape (a presence test, not a reading: the entry's value is never
+        # interpreted, so none of the deleted denylist logic returns). The reverse stays: a record with no such key and a proof is LIGHT.
+        cases = {}
+        for reader in ("Get-FpsArmFromLegRecord", "Get-FpsArmFromJobResult"):
+            for controls in ("[pscustomobject]@{ utilSample = $true }", "[pscustomobject]@{ corePartitionTelemetry = $true }", "[pscustomobject]@{ firstPresentCapture = $true }",
+                             "[pscustomobject]@{ utilSample = $false }", "[pscustomobject]@{ }", "$null"):
+                cases[f"{reader} ([pscustomobject]@{{ telemetryArm = 'LIGHT'; generatorArgs = [pscustomobject]@{{ telemetryArm = 'LIGHT' }}; observerControls = {controls} }})"] = "UNKNOWN"
+                cases[f"{reader} ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {RECORDED_LIGHT_LAUNCH}; observerControls = {controls} }})"] = "UNKNOWN"
+            cases[f"{reader} ([pscustomobject]@{{ telemetryArm = 'LIGHT'; generatorArgs = [pscustomobject]@{{ telemetryArm = 'LIGHT'; observerControls = [pscustomobject]@{{ utilSample = $true }} }} }})"] = "UNKNOWN"
+            cases[f"{reader} ([pscustomobject]@{{ telemetryArm = 'LIGHT'; generatorArgs = [pscustomobject]@{{ telemetryArm = 'LIGHT' }} }})"] = "LIGHT"
+        self.check(cases)
+
+    def test_a8_an_empty_or_partial_recorded_launch_is_not_light_through_every_reader(self) -> None:
+        # r8 adversary A8: {"arguments":[],"environment":{}} matched both tables vacuously and read LIGHT through the launch reader and the saved-leg reader. LIGHT needs the members every producer
+        # launch records (the rows marked required: --gui-smoke-playback, --input, --seconds, --start-frame, the settle options, the crash-log directory).
+        empty = "[pscustomobject]@{ arguments = @(); environment = [pscustomobject]@{ } }"
+        no_dir = f"[pscustomobject]@{{ arguments = @({PRODUCER_ARGS_PS}); environment = [pscustomobject]@{{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' }} }}"
+        full = f"[pscustomobject]@{{ arguments = @({PRODUCER_ARGS_PS}); environment = [pscustomobject]@{{ {LIGHT_LAUNCH_ENV_PS} }} }}"
+        self.check({
+            f"Get-FpsArmFromLaunch ({empty})": "UNKNOWN",
+            f"Get-FpsArmFromLaunch ({no_dir})": "UNKNOWN",
+            f"Get-FpsArmFromLaunch ({full})": "LIGHT",
+            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; launch = {empty} }})": "UNKNOWN",
+            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; launch = {full} }})": "LIGHT",
+            f"Get-FpsArmFromJobResult ([pscustomobject]@{{ telemetryArm = 'LIGHT'; launch = {empty} }})": "UNKNOWN",
+            # the HEAVY reading is a positive fact about a table-clean launch and does not need the mandatory members
+            "Get-FpsArmFromLaunch ([pscustomobject]@{ arguments = @(); environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1' } })": "HEAVY",
+        })
+        shape = json.loads(self.ok("Get-FpsLightShape | ConvertTo-Json -Depth 5 -Compress").strip().splitlines()[-1])
+        required = sorted(r["name"] for r in shape["arguments"] + shape["environment"] if r["required"])
+        self.assertEqual(required, sorted(["--gui-smoke-playback", "--input", "--seconds", "--start-frame", "--settle-ms", "--settle-cpu-percent", "--settle-cpu-stable-ms", "--settle-cpu-max-ms",
+                                           "MLVAPP_CRASH_FORENSICS_LOG_DIR"]))
+
     def test_a_launch_outside_the_shape_is_never_light_through_any_reader(self) -> None:
         # one record, every reader: a launch with a flag outside the table is UNKNOWN through the launch reader, the saved-leg reader and the result reader alike
-        launch = ("[pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' }; "
-                  "arguments = @('--gui-smoke-playback', '--launch-only') }")
+        launch = (f"[pscustomobject]@{{ environment = [pscustomobject]@{{ {LIGHT_LAUNCH_ENV_PS} }}; "
+                  f"arguments = @({PRODUCER_ARGS_PS}, '--launch-only') }}")
         self.check({
             f"Get-FpsArmFromLaunch ({launch})": "UNKNOWN",
             f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; launch = {launch} }})": "UNKNOWN",

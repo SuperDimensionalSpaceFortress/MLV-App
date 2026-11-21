@@ -28,22 +28,23 @@ Set-StrictMode -Version Latest
 # THE LIGHT LAUNCH SHAPE (d). One row per allowed thing; each row cites the producer that emits it. Rules: 'int' / 'num' / 'word' are closed character
 # classes, 'text' is non-empty without control characters (a path or a display name), 'exact:<v>' and 'oneof:<a>|<b>' are exact ordinal values.
 # Forms (arguments): 'bare' = the flag alone, 'next' = the flag then its value as the next list element, 'eq' = one element flag=value.
+# -Required marks a member EVERY producer launch records (an empty launch is not the producers' shape): Get-FpsArmFromLaunch refuses a LIGHT reading that lacks one (r8 adversary A8).
 function New-FpsAllow {
-    param([string]$Name, [string]$Form, [string]$Rule)
-    [pscustomobject]@{ name = $Name; form = $Form; rule = $Rule }
+    param([string]$Name, [string]$Form, [string]$Rule, [switch]$Required)
+    [pscustomobject]@{ name = $Name; form = $Form; rule = $Rule; required = [bool]$Required }
 }
 # ARGUMENTS: tools/profiling/run-release-gui-smoke.ps1 builds the list (line numbers are in that file); the job's own command line is playback-attr-3-cuda-job.ps1:3092.
 $script:FpsLightArgs = @(
-    New-FpsAllow '--gui-smoke-playback' 'bare' ''                       # run-release-gui-smoke.ps1:1481
-    New-FpsAllow '--input' 'next' 'text'                                # :1482
-    New-FpsAllow '--seconds' 'next' 'num'                               # :1483
-    New-FpsAllow '--start-frame' 'next' 'int'                           # :1487
+    New-FpsAllow '--gui-smoke-playback' 'bare' '' -Required            # run-release-gui-smoke.ps1:1481 (required: the runner always emits :1481-1503 below)
+    New-FpsAllow '--input' 'next' 'text' -Required                      # :1482
+    New-FpsAllow '--seconds' 'next' 'num' -Required                     # :1483
+    New-FpsAllow '--start-frame' 'next' 'int' -Required                 # :1487
     New-FpsAllow '--presented-frames' 'next' 'int'                      # :1490
     New-FpsAllow '--drop-frame-mode' 'next' 'exact:persisted'           # :1493 (default :27)
-    New-FpsAllow '--settle-ms' 'next' 'int'                             # :1496
-    New-FpsAllow '--settle-cpu-percent' 'next' 'num'                    # :1497
-    New-FpsAllow '--settle-cpu-stable-ms' 'next' 'int'                  # :1501
-    New-FpsAllow '--settle-cpu-max-ms' 'next' 'int'                     # :1502
+    New-FpsAllow '--settle-ms' 'next' 'int' -Required                   # :1496
+    New-FpsAllow '--settle-cpu-percent' 'next' 'num' -Required          # :1497
+    New-FpsAllow '--settle-cpu-stable-ms' 'next' 'int' -Required        # :1501
+    New-FpsAllow '--settle-cpu-max-ms' 'next' 'int' -Required           # :1502
     New-FpsAllow '--receipt' 'next' 'text'                              # :1510
     New-FpsAllow '--scope' 'next' 'exact:none'                          # :1513, the job passes -Scope none (playback-attr-3-cuda-job.ps1:3092)
     New-FpsAllow '--playback-debayer' 'eq' 'word'                       # :1516
@@ -60,7 +61,7 @@ $script:FpsLightEnv = @(
     New-FpsAllow 'MLVAPP_PLAYBACK_SMOKE_TELEMETRY' 'env' 'exact:1'                     # run-release-gui-smoke.ps1:1693, playback-attr-3-cuda-job.ps1:3027
     New-FpsAllow 'MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG' 'env' 'oneof:1|0' # playback-attr-3-cuda-job.ps1:3028 (1 = LIGHT); 0 is the HEAVY arm's value (:3039)
     New-FpsAllow 'MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG' 'env' 'exact:1'          # playback-attr-3-cuda-job.ps1:3029
-    New-FpsAllow 'MLVAPP_CRASH_FORENSICS_LOG_DIR' 'env' 'text'                         # run-release-gui-smoke.ps1:1695
+    New-FpsAllow 'MLVAPP_CRASH_FORENSICS_LOG_DIR' 'env' 'text' -Required               # run-release-gui-smoke.ps1:1695 and :1717 (every launch sets it)
     New-FpsAllow 'MLVAPP_PLAYBACK_MAX_THREADS' 'env' 'int'                             # run-release-gui-smoke.ps1:1690
     New-FpsAllow 'MLVAPP_PLAYBACK_QUALITY_MODE' 'env' 'exact:phase3_hq'                # playback-attr-3-cuda-job.ps1:3049
     New-FpsAllow 'MLVAPP_PLAYBACK_PHASE3_UNATTENDED' 'env' 'exact:1'                   # run-release-gui-smoke.ps1:1700, playback-attr-3-cuda-job.ps1:3053
@@ -166,6 +167,7 @@ function Get-FpsSpecHolderProblem {
     if ($null -eq $Holder -or $Holder -is [string] -or $Holder -is [System.ValueType] -or $Holder -is [System.Array]) { return 'generatorArgs is present but is not an object' }
     if (-not (Test-FaHasProp $Holder 'telemetryArm')) { return 'its generatorArgs names no telemetryArm' }
     if (-not (Test-FaTextEq (Get-FaProp $Holder 'telemetryArm') 'LIGHT')) { return 'its generatorArgs.telemetryArm is not exactly LIGHT' }
+    if (Test-FaHasProp $Holder 'observerControls') { return 'its generatorArgs carries an observerControls entry, which no producer records (outside the LIGHT shape)' }
     $observer = Get-FpsSpecObserverOn $Holder
     if ($null -ne $observer) { return "its generatorArgs.$($observer.specKey) enables an observer ($($observer.id))" }
     $null
@@ -175,6 +177,11 @@ function Get-FpsRecordLightProblem {
     # Why a record (a saved leg or a venue result) whose arm word reads LIGHT is nevertheless not proven LIGHT, else $null. Every piece of evidence it carries must hold, and it must carry at least
     # one that PROVES: a recorded launch that matches the producers' LIGHT shape (d), or generatorArgs that read as a LIGHT spec (c), or (for a result) a LIGHT spec the caller judged it with.
     param([AllowNull()]$Record, [bool]$SpecGiven = $false)
+    # Keys no LIGHT producer record carries, so a record that has one is outside the shape (a presence test, not a reading of the entries): an `observerControls` entry (no producer emits one; the
+    # r6 reader that tried to read it is deleted, r8 adversary A4), a `look` block and any legType but 'speed' (a look leg captures its contact sheet inside the timed Play, r8 adversary A3).
+    if (Test-FaHasProp $Record 'observerControls') { return 'it carries an observerControls entry, which no producer records (outside the LIGHT shape)' }
+    if (Test-FaHasProp $Record 'look') { return 'it carries a look block (a look leg captures its contact sheet inside the timed Play)' }
+    if ((Test-FaHasProp $Record 'legType') -and -not (Test-FaTextEq (Get-FaProp $Record 'legType') 'speed')) { return "its legType is not 'speed'" }
     $hasLaunch = Test-FaHasProp $Record 'launch'
     $hasGa = Test-FaHasProp $Record 'generatorArgs'
     if ($hasLaunch) {
@@ -429,7 +436,17 @@ function Get-FpsArmFromLaunch {
     $launchArgs = Get-FaProp $Launch 'arguments'
     # r6 (adversary pass 5 A2): the recorded argument list must BE a list (`@($x)` made the JSON string "--playback-smoke" a one-element list and a null a list holding one null).
     if ($launchArgs -isnot [System.Collections.IList]) { return New-FpsArm 'UNKNOWN' 'environment' 'malformed-arguments (the recorded arguments are not a list)' }
-    Get-FpsArmFromEnvironment -Environment (Get-FaProp $Launch 'environment') -Arguments $launchArgs
+    $recordedEnvironment = Get-FaProp $Launch 'environment'
+    $arm = Get-FpsArmFromEnvironment -Environment $recordedEnvironment -Arguments $launchArgs
+    # r8 (adversary A8): LIGHT also needs the members every producer launch records (the rows marked -Required); an empty launch ({"arguments":[],"environment":{}}) matches the tables vacuously
+    if ($arm.arm -ceq 'LIGHT') {
+        $have = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($a in @($launchArgs)) { $cut = $a.IndexOf('='); [void]$have.Add($(if ($a.StartsWith('--', [System.StringComparison]::Ordinal) -and $cut -gt 2) { $a.Substring(0, $cut) } else { $a })) }
+        $map = (ConvertTo-FpsEnvMap $recordedEnvironment).map
+        foreach ($row in $script:FpsLightArgs) { if ($row.required -and -not $have.Contains($row.name)) { return New-FpsArm 'UNKNOWN' 'environment' "the launch lacks $($row.name), which every producer launch records" } }
+        foreach ($row in $script:FpsLightEnv) { if ($row.required -and -not $map.ContainsKey($row.name)) { return New-FpsArm 'UNKNOWN' 'environment' "the launch lacks $($row.name), which every producer launch records" } }
+    }
+    $arm
 }
 
 function Get-FpsPairVerdict {

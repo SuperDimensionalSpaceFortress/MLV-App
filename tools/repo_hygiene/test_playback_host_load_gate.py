@@ -1842,7 +1842,9 @@ class CompareMachinePerfPlaybackAbHostLoadRefusalTests(_ProbeCase):
         provisional_literal = "$true" if provisional else "$false"
         return (
             "[pscustomobject]@{ telemetryArm = 'LIGHT'; launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; "
-            "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' }; arguments = @() }; hostLoadProvisional = " + provisional_literal +
+            "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1'; MLVAPP_CRASH_FORENSICS_LOG_DIR = 'C:/logs' }; "
+            "arguments = @('--gui-smoke-playback', '--input', 'C:/clip.mlv', '--seconds', '7', '--start-frame', '0', '--settle-ms', '2500', '--settle-cpu-percent', '10', "
+            "'--settle-cpu-stable-ms', '1000', '--settle-cpu-max-ms', '45000') }; hostLoadProvisional = " + provisional_literal +
             "; hostLoadState = '" + resolved_state + "' }"
         )
 
@@ -1986,7 +1988,9 @@ class CompareMachinePerfPlaybackAbFpsDeltaRefusalTests(_ProbeCase):
         provisional_literal = "$true" if provisional else "$false"
         return (
             "[pscustomobject]@{ telemetryArm = 'LIGHT'; launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; "
-            "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' }; arguments = @() }; hostLoadProvisional = " + provisional_literal +
+            "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1'; MLVAPP_CRASH_FORENSICS_LOG_DIR = 'C:/logs' }; "
+            "arguments = @('--gui-smoke-playback', '--input', 'C:/clip.mlv', '--seconds', '7', '--start-frame', '0', '--settle-ms', '2500', '--settle-cpu-percent', '10', "
+            "'--settle-cpu-stable-ms', '1000', '--settle-cpu-max-ms', '45000') }; hostLoadProvisional = " + provisional_literal +
             "; hostLoadState = '" + resolved_state + "' }"
         )
 
