@@ -1369,3 +1369,49 @@ TEST(PlaybackInfoLabel, R16P17A2ProxyAfterAGpuReconFrameNamesTheProxy)
     ASSERT_TRUE(resetAt >= 0);
     ASSERT_TRUE(entry.indexOf(QStringLiteral("return llrawproc_apply_with_dims_internal(")) > resetAt);
 }
+
+// r20 (adversary pass 19 A1 on c6787183, introduced, major): 1920x1088 supported HQ Dual-ISO, AMaZE selected, Don't Switch Debayer,
+// CUDA recon + GL, texture present on, MLVAPP_GPU_AMAZE_DEBAYER_DLL pointing at a missing file. The AMaZE R16 texture backend is
+// unavailable, so the CPU AMaZE debayer is not skipped and the viewport presents the recon through the R16 bilinear shader
+// (gl_r16_bilinear_shader). That branch, and the readback Bayer branch, never recorded the GPU bilinear debayer flag the label
+// reads, so both surfaces said "AMaZE" over a frame the GPU debayered bilinear. Class: every presenter branch that hands the viewport
+// a Bayer texture (the display shader debayers it) records usedGpuBilinearDebayer and clears the AMaZE flag.
+TEST(PlaybackInfoLabel, R20A1BayerTexturePresenterBranchesRecordTheGpuBilinearDebayerTheLabelReads)
+{
+    // the label: the flags the frame carries decide the text
+    playback_info_label::Facts stale = cpuFullScaleFacts(QStringLiteral("AMaZE"));
+    stale.gpuDisplay = true;
+    stale.debayerOnGpu = false;
+    stale.gpuDebayer = QString();
+    ASSERT_QSTR_EQ(QStringLiteral("AMaZE"), playback_info_label::debayerField(stale));
+    playback_info_label::Facts fixed = stale;
+    fixed.debayerOnGpu = true;
+    fixed.gpuDebayer = QStringLiteral("Bilinear");
+    ASSERT_QSTR_EQ(QStringLiteral("AMaZE->Bilinear (GPU)"), playback_info_label::debayerField(fixed));
+    // the producer: the presenter branches in MainWindow::presentPlaybackPreparedFrame
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString body = functionBody(source, QStringLiteral("void MainWindow::presentPlaybackPreparedFrame("));
+    ASSERT_FALSE(body.isEmpty());
+    const QString setBilinear = QStringLiteral("readyFrame.usedGpuBilinearDebayer = true;");
+    const QString clearAmaze = QStringLiteral("readyFrame.usedGpuAmazeDebayer = false;");
+    // branch 1: the no-readback R16 bilinear shader presenter
+    const int shaderAt = body.indexOf(QStringLiteral("QStringLiteral(\"gl_r16_bilinear_shader\");"));
+    ASSERT_TRUE(shaderAt >= 0);
+    const int shaderBranchAt = body.lastIndexOf(QStringLiteral("if( framePresentedByViewport )"), shaderAt);
+    ASSERT_TRUE(shaderBranchAt >= 0);
+    const QString shaderBranch = body.mid(shaderBranchAt, shaderAt - shaderBranchAt);
+    ASSERT_TRUE(shaderBranch.contains(setBilinear));
+    ASSERT_TRUE(shaderBranch.contains(clearAmaze));
+    // branch 2: the readback Bayer presenter
+    const int bayerAt = body.indexOf(QStringLiteral("GpuDisplayViewport::presentBayer16("));
+    ASSERT_TRUE(bayerAt >= 0);
+    const int bayerEnd = body.indexOf(QStringLiteral("if( !gpuPlaybackReconTextureNoReadbackCandidate"), bayerAt);
+    ASSERT_TRUE(bayerEnd > bayerAt);
+    const QString bayerBranch = body.mid(bayerAt, bayerEnd - bayerAt);
+    ASSERT_TRUE(bayerBranch.contains(setBilinear));
+    ASSERT_TRUE(bayerBranch.contains(clearAmaze));
+    // the class sweep: the Bayer-texture presenters are exactly these two calls, and each records the flag
+    ASSERT_EQ(1, body.count(QStringLiteral("GpuDisplayViewport::presentGpuPlaybackReconTexture(")));
+    ASSERT_EQ(1, body.count(QStringLiteral("GpuDisplayViewport::presentBayer16(")));
+    ASSERT_EQ(2, body.count(setBilinear));
+}

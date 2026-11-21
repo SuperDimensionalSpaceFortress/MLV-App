@@ -6177,6 +6177,9 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
             texturePresentSetupTimingKnown = true;
             if( framePresentedByViewport )
             {
+                /* LOOK-LABEL-PLAYBACK-INFO-1 r20 A1: the R16 bilinear shader debayered this frame on the GPU; the label reads these flags. */
+                readyFrame.usedGpuBilinearDebayer = true;
+                readyFrame.usedGpuAmazeDebayer = false;
                 gpuPlaybackReconNoReadbackPresented = true;
                 texturePresentHandoffMode =
                     QStringLiteral("gl_r16_bilinear_shader");
@@ -6957,6 +6960,12 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                                                 task.gpuPresentationOptions );
         const double texturePresentMs =
             (mlv_stage_timing_now() - texturePresentStart) * 1000.0;
+        if( framePresentedByViewport )
+        {
+            /* LOOK-LABEL-PLAYBACK-INFO-1 r20 A1: the display shader debayers the Bayer texture on the GPU (bilinear). */
+            readyFrame.usedGpuBilinearDebayer = true;
+            readyFrame.usedGpuAmazeDebayer = false;
+        }
         readyFrame.stageTimingTelemetry.insert(
             QStringLiteral("gpu_playback_recon_texture_present_active"),
             framePresentedByViewport );
