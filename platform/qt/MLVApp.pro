@@ -323,7 +323,8 @@ SOURCES += \
     ../../src/batch/BatchLogger.cpp \
     ../../src/batch/ReceiptLoader.cpp \
     ../../src/batch/ReceiptApplier.cpp \
-    ../../src/batch/LookAssistAnalysis.cpp
+    ../../src/batch/LookAssistAnalysis.cpp \
+    FullscreenControlBar.cpp
 
 jpeg2k_enabled {
     OPENJPH = ../../src/mlv/OpenJPH
@@ -411,6 +412,9 @@ HEADERS += MainWindow.h \
            PlaybackSlotRelease.h \
            PlaybackSwapInterval.h \
            LookLabelPolicy.h \
+           ViewerIdlePolicy.h \
+           ViewerCursorSurfaces.h \
+           ViewerMouseRetrievalHook.h \
            LookLabelOverlay.h \
            PlaybackScopesDuringPlayback.h \
            PlayerShortcutBinding.h \
@@ -584,7 +588,9 @@ HEADERS += MainWindow.h \
     ../../src/batch/BatchLogger.h \
     ../../src/batch/ReceiptLoader.h \
     ../../src/batch/ReceiptApplier.h \
-    ../../src/batch/LookAssistAnalysis.h
+    ../../src/batch/LookAssistAnalysis.h \
+    FullscreenControlBarPolicy.h \
+    FullscreenControlBar.h
 
 jpeg2k_enabled {
     HEADERS += \

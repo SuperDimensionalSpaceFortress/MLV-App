@@ -2594,6 +2594,13 @@ if ($cfg.engine -eq 'claude') {
             )
         }
     }
+    # LANE-AUTO-MEMORY-OFF-1: headless lanes should not use Claude Code auto memory (the NA-7 machine-memory deny class).
+    # The generated settings turn auto memory off (settings key only, hub decision 2026-11-20T10:50Z; honored through
+    # --settings, measured 2026-11-20T13:03Z) UNLESS the launching environment already carries the inherited
+    # auto-memory override variable with a value that forces memory on. This launcher does not clear, pin or detect
+    # that variable (owner boundary NA-3 forbids touching that variable family) and no current launcher sets it.
+    # A higher-precedence administrator-managed policy settings file that turns memory on would also win over this key.
+    $settingsObj.autoMemoryEnabled = $false
     if (-not $AllowBulkReads) {
         $denyRules = @(
             'Read(**/gpu-lane-impl-review-sync.md)',
