@@ -363,7 +363,7 @@ TEST(PlaybackInfoLabel, R1P3A1WithdrawalRepaintsAtOnce)
     // (R3P2A1StalledFramesPaintTheStoredLabel).
     ASSERT_TRUE(push.contains(QStringLiteral(
         "const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn"
-        " || m_playbackFramesStalled\n        || paintOverdue;")));   // INFO-2 r2 (pass 1 A7): or no frame was presented for a whole relabel gate
+        " || m_playbackFramesStalled;")));
     ASSERT_TRUE(push.contains(QStringLiteral("GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, repaintNow )")));
 }
 
@@ -467,7 +467,7 @@ TEST(PlaybackInfoLabel, R2P2A2OnlyAWithdrawalRepaintsWhilePlaying)
     // r3 pass-2 A1: a stall (no draw for > 500 ms after one) is no Play-from-paused start: the flag needs a draw first.
     ASSERT_TRUE(push.contains(QStringLiteral(
         "const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn"
-        " || m_playbackFramesStalled\n        || paintOverdue;")));   // INFO-2 r2 (pass 1 A7): or no frame was presented for a whole relabel gate
+        " || m_playbackFramesStalled;")));
     // The push never clears it (a look-line push while the info relabel waits must not eat the withdrawal); the info relabel
     // clears it after its own push, or on each early return past the gate (nothing to withdraw).
     ASSERT_FALSE(push.contains(QStringLiteral("m_playbackInfoRateWithdrawn = false;")));
@@ -603,7 +603,7 @@ TEST(PlaybackInfoLabel, R3P2A1StalledFramesPaintTheStoredLabel)
     const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay("));
     ASSERT_TRUE(push.contains(QStringLiteral(
         "const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn"
-        " || m_playbackFramesStalled\n        || paintOverdue;")));   // INFO-2 r2 (pass 1 A7): or no frame was presented for a whole relabel gate
+        " || m_playbackFramesStalled;")));
     const QString tick = functionBody(source, QStringLiteral("void MainWindow::timerFrameEvent("));
     const int enteredAt = tick.indexOf(QStringLiteral("const bool stallEntered = ui->actionPlay->isChecked() && hasDraw;"));
     const int setAt = tick.indexOf(QStringLiteral("if( stallEntered ) m_playbackFramesStalled = true;"));
@@ -1166,7 +1166,7 @@ TEST(PlaybackInfoLabel, R13P15A2APlayToggleClearsThePreviousPlaysStall)
     ASSERT_TRUE(relabelAt > clearAt);
     // the push reads the flag for its repaint decision, and only an in-Play stall after a draw sets it again
     const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay( void )"));
-    ASSERT_TRUE(push.contains(QStringLiteral("m_playbackFramesStalled\n        || paintOverdue;")));   // INFO-2 r2 (pass 1 A7) added the overdue-paint term
+    ASSERT_TRUE(push.contains(QStringLiteral("m_playbackFramesStalled;")));
     ASSERT_TRUE(source.contains(QStringLiteral("const bool stallEntered = ui->actionPlay->isChecked() && hasDraw;")));
     ASSERT_TRUE(source.contains(QStringLiteral("if( stallEntered ) m_playbackFramesStalled = true;")));
 }
@@ -1906,28 +1906,64 @@ TEST(PlaybackInfoLabel, InfoTwoR2A6EachToggleWritesOnlyItsOwnSettingsKey)
 
 // INFO-2 r2 (adversary pass 1 A7 on b056b902, introduced, major): fullscreen GPU window, a paused idle tick, the first Play frame
 // takes 900 ms, Resolution is disabled at 100 ms. The 250 ms relabel only stored the text for the next paint; the stall rule needs an
-// earlier draw, so the old text stayed on screen until the first new paint. When no frame has been presented for a whole relabel gate
-// the relabel repaints at once.
+// earlier draw, so the old text stayed on screen until the first new paint. The stored text is owed a paint: INFO-2 pass 2 A1 (on
+// 9496cb72) showed the first answer (a presentation-age rule) failed when a paused scrub had just presented a frame (30 ms old at
+// the flush), so the debt is armed by the store itself and a frame presented SINCE the store is what clears it.
 TEST(PlaybackInfoLabel, InfoTwoR2A7ADeferredPlayingRelabelIsVisibleWithinTheGatePlusATickWhenNoFrameArrives)
 {
-    ASSERT_TRUE(playback_info_label::nextPaintOverdue(false, 0));       // no presented frame yet (the first Play frame is pending)
-    ASSERT_TRUE(playback_info_label::nextPaintOverdue(true, 250));      // a whole gate without a presentation
-    ASSERT_TRUE(playback_info_label::nextPaintOverdue(true, 900));
-    ASSERT_FALSE(playback_info_label::nextPaintOverdue(true, 249));     // frames arriving: their paint carries the text, no extra paint
-    ASSERT_FALSE(playback_info_label::nextPaintOverdue(true, 42));
-    // the scenario's relabel: due at the first tick at or after 250 ms from the last one, with the frame still 900 ms away
+    // the policy: owed, no frame since the store, and the debt old enough
+    ASSERT_TRUE(playback_info_label::labelPaintOwedDue(true, false, playback_info_label::kLabelPaintOwedMs));
+    ASSERT_TRUE(playback_info_label::labelPaintOwedDue(true, false, 900));
+    ASSERT_FALSE(playback_info_label::labelPaintOwedDue(true, false, playback_info_label::kLabelPaintOwedMs - 1));   // a steady Play's frame comes sooner
+    ASSERT_FALSE(playback_info_label::labelPaintOwedDue(true, true, 900));    // a frame presented since the store carried the text
+    ASSERT_FALSE(playback_info_label::labelPaintOwedDue(false, false, 900));  // nothing stored
+    ASSERT_TRUE(playback_info_label::kLabelPaintOwedMs > 42);                 // one frame period at 24 fps never pays it
+    // pass 2 A1's input: relabel paused at 0, a paused scrub presents at 220 (its age is 30 ms at the flush), Play at 230, flush at
+    // 250 stores the text, the first Play frame is due at 1130. The debt is armed at 250 by the store, whatever the last
+    // presentation's age was, so it is due by 250 + kLabelPaintOwedMs (a tick later), 800 ms before the frame.
     ASSERT_TRUE(playback_info_label::deferredRelabelDue(true, true, 250));
-    ASSERT_TRUE(playback_info_label::nextPaintOverdue(true, 250 + 8));
+    const int storeAtMs = 250;
+    ASSERT_TRUE(playback_info_label::labelPaintOwedDue(true, false, (storeAtMs + playback_info_label::kLabelPaintOwedMs + 8) - storeAtMs));
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay("));
     ASSERT_TRUE(push.contains(QStringLiteral(
-        "const bool paintOverdue = playback_info_label::nextPaintOverdue( presentedClockValid,\n"
-        "                                                                     presentedClockValid ? m_playbackPresentedClock.elapsed() : 0 );")));
-    ASSERT_TRUE(push.contains(QStringLiteral("const bool presentedClockValid = m_playbackPresentedClock.isValid();")));
-    const QString record = functionBody(source, QStringLiteral("void MainWindow::recordPresentedFrame("));
-    ASSERT_TRUE(record.contains(QStringLiteral("m_playbackPresentedClock.start();")));
+        "    if( repaintNow || !gpuWindow ) m_lookLabelPaintOwedClock.invalidate();\n"
+        "    else\n"
+        "    {\n"
+        "        m_lookLabelPaintOwedClock.start();\n"
+        "        m_lookLabelPaintOwedPresentedCount = m_playbackPresentedFrameCount;\n"
+        "    }")));
+    const QString settle = functionBody(source, QStringLiteral("void MainWindow::settleLookLabelPaintIfOwed( void )"));
+    ASSERT_TRUE(settle.contains(QStringLiteral(
+        "const bool framePresentedSinceStore = m_playbackPresentedFrameCount != m_lookLabelPaintOwedPresentedCount;")));
+    ASSERT_TRUE(settle.contains(QStringLiteral("if( !ui->actionPlay->isChecked() || framePresentedSinceStore )")));
+    ASSERT_TRUE(settle.contains(QStringLiteral(
+        "if( playback_info_label::labelPaintOwedDue( owed, framePresentedSinceStore, m_lookLabelPaintOwedClock.elapsed() ) )")));
+    ASSERT_TRUE(settle.contains(QStringLiteral("GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, true );")));
+    // every tick, right after the gated flush
+    const QString tick = functionBody(source, QStringLiteral("void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )"));
+    const int flushAt = tick.indexOf(QStringLiteral("flushPlaybackInfoIfDue();"));
+    ASSERT_TRUE(flushAt >= 0);
+    ASSERT_TRUE(tick.indexOf(QStringLiteral("settleLookLabelPaintIfOwed();"), flushAt) > flushAt);
     const QString header = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
-    ASSERT_TRUE(header.contains(QStringLiteral("QElapsedTimer m_playbackPresentedClock;")));
+    ASSERT_TRUE(header.contains(QStringLiteral("QElapsedTimer m_lookLabelPaintOwedClock;")));
+    ASSERT_FALSE(source.contains(QStringLiteral("m_playbackPresentedClock")));   // the first answer's presentation-age clock is gone
+}
+
+// INFO-2 r2 (adversary pass 2 A2 on 9496cb72, introduced, major): 24 fps, start on paused frame 0, Cut Out 3, Loop off. Frames 1 and
+// 2 hand off at 8 and 117 ms; the frame-2 request consumes the first stamp, then the next advance stops Play. The Play toggle set the
+// meter's seen count to the presentation count at the STOP as well as at the start, dropping the final 109 ms interval. It does so
+// at the start only.
+TEST(PlaybackInfoLabel, InfoTwoR2A2TheStopOfAPlayKeepsThePresentationsTheMeterHasNotSteppedOn)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString toggled = functionBody(source, QStringLiteral("void MainWindow::on_actionPlay_toggled(bool checked)"));
+    ASSERT_FALSE(toggled.isEmpty());
+    ASSERT_TRUE(toggled.contains(QStringLiteral(
+        "if( checked ) m_playbackFpsMeterSeenPresentedCount = m_playbackPresentedFrameCount;")));
+    ASSERT_FALSE(toggled.contains(QStringLiteral("\n    m_playbackFpsMeterSeenPresentedCount = m_playbackPresentedFrameCount;")));
+    // the advisory: the span helper's rounding addition does not overflow int
+    ASSERT_EQ(1073741824, playback_fps_meter::presentedIntervalMs(2147483647, 2));
 }
 
 // INFO-2 r2 (adversary pass 1 A8 on b056b902, introduced, major): a 60 fps clip conformed to 24, stalled at "--/60 fps (60->24)";

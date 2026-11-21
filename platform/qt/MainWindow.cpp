@@ -2956,8 +2956,9 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     // LOOK-LABEL-PLAYBACK-INFO-1 r2 (adversary A1): a deferred info change relabels on its own monotonic 250 ms gate, every tick,
     // never behind the fps meter's wall-clock gate or a measured rate.
     flushPlaybackInfoIfDue();
+    settleLookLabelPaintIfOwed();   // INFO-2 r2 (pass 1 A7, pass 2 A1): every tick, so a late first frame or a stall never holds the new text back
 
-    static QTime lastTime;              //Last Time a picture was rendered
+    static QTime lastTime;             //Last Time a picture was rendered
     static QTime lastDrawTime;          //Last Time a frame was DRAWN (fps meter only; lastTime is re-armed on idle ticks)
     static int timeDiff = 0;           //TimeDiff between 2 rendered frames in Playback
 
@@ -33457,7 +33458,10 @@ void MainWindow::on_actionPlay_toggled(bool checked)
     // r12 (adversary pass 13 A2 on c58f5bd8): and the average with it: the next draw starts this Play's meter afresh.
     m_playbackFpsEmaFrameMs = 0.0;
     m_playbackFpsMeterNewPlay = true;
-    m_playbackFpsMeterSeenPresentedCount = m_playbackPresentedFrameCount;   // r21 (pass 20 A3): a frame presented before this Play is not its first
+    // r21 (pass 20 A3): a frame presented before this Play is not its first. INFO-2 r2 (pass 2 A2): only at Play START: at a Stop (a
+    // Cut Out or a user stop) the presentations the meter has not stepped on yet still carry the Play's last valid interval, and the
+    // step that follows consumes it (the next Play start drops whatever a Stop left).
+    if( checked ) m_playbackFpsMeterSeenPresentedCount = m_playbackPresentedFrameCount;
     // r13 (adversary pass 15 A2 on 189dd4f9): a stall belongs to the Play it happened in. Kept across Stop -> Play, it made the
     // new Play's "--" relabel repaint the retained paused frame at once; a stall of this Play is set again after its own draw.
     m_playbackFramesStalled = false;
@@ -34342,14 +34346,17 @@ void MainWindow::pushLookLabelOverlay( void )
     // Cleared by updatePlaybackInfoLabel after the push that carries the withdrawn text (a look-line push meanwhile repaints too),
     // or by the fps gate's next measured rate (r3: the rate is back, so there is nothing left to withdraw).
     // r3 pass-2 A1: and while frames are stalled (the meter's reset after a draw, until the next draw), since no frame will come.
-    // INFO-2 r2 (pass 1 A7): and when no frame has been presented for a whole relabel gate (the first frame of a Play, or a stall
-    // with no earlier draw to arm the meter's stall), so the deferred text is visible within the gate plus one tick regardless.
-    const bool presentedClockValid = m_playbackPresentedClock.isValid();
-    const bool paintOverdue = playback_info_label::nextPaintOverdue( presentedClockValid,
-                                                                     presentedClockValid ? m_playbackPresentedClock.elapsed() : 0 );
-    const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn || m_playbackFramesStalled
-        || paintOverdue;
+    const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn || m_playbackFramesStalled;
     GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, repaintNow );
+    // INFO-2 r2 (pass 1 A7, pass 2 A1): a text stored for the next frame's paint is owed that paint. settleLookLabelPaintIfOwed (every
+    // tick) makes it when no frame was presented within kLabelPaintOwedMs of this store, whatever the stall history: the deferred
+    // change is visible within the gate plus a few ticks even when the first frame of a Play is late. A repaint now settles the debt.
+    if( repaintNow || !gpuWindow ) m_lookLabelPaintOwedClock.invalidate();
+    else
+    {
+        m_lookLabelPaintOwedClock.start();
+        m_lookLabelPaintOwedPresentedCount = m_playbackPresentedFrameCount;
+    }
     ui->graphicsView->setLookLabel( gpuWindow ? QString() : m_lookLabelOverlayText );
 }
 
@@ -34561,6 +34568,26 @@ void MainWindow::flushPlaybackInfoIfDue( void )
     if( playback_info_label::deferredRelabelDue( m_playbackInfoInputsDirty, clockValid,
                                                  clockValid ? m_playbackInfoRelabelClock.elapsed() : 0 ) )
         updatePlaybackInfoLabel();
+}
+
+// INFO-2 r2 (adversary pass 1 A7, pass 2 A1): the paint a stored playing label is owed. pushLookLabelOverlay arms the debt when it
+// stores the text for the next frame's paint; a frame presented since carries the text (debt cleared), a Stop clears it, and when no
+// frame came within kLabelPaintOwedMs the label is painted now (setLookLabelIfActive paints only when the drawn text differs).
+void MainWindow::settleLookLabelPaintIfOwed( void )
+{
+    const bool owed = m_lookLabelPaintOwedClock.isValid();
+    if( !owed ) return;
+    const bool framePresentedSinceStore = m_playbackPresentedFrameCount != m_lookLabelPaintOwedPresentedCount;
+    if( !ui->actionPlay->isChecked() || framePresentedSinceStore )
+    {
+        m_lookLabelPaintOwedClock.invalidate();
+        return;
+    }
+    if( playback_info_label::labelPaintOwedDue( owed, framePresentedSinceStore, m_lookLabelPaintOwedClock.elapsed() ) )
+    {
+        m_lookLabelPaintOwedClock.invalidate();
+        GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, true );
+    }
 }
 
 void MainWindow::setPlaybackInfoToggle( bool playback_info_label::Toggles::*field, bool on )
@@ -35247,7 +35274,6 @@ void MainWindow::recordPresentedFrame( const RenderFrameThread::ReadyFrame &read
 {
     ++m_playbackPresentedFrameCount;   // r21 (adversary pass 20 A3): the fps meter advances only when this moved
     m_playbackFpsMeterPresentedStamp = QTime::currentTime();   // INFO-2 r2 (pass 1 A2): the presentation time, taken at the handoff
-    m_playbackPresentedClock.start();                          // INFO-2 r2 (pass 1 A7): the monotonic twin, for "is the next paint overdue"
     m_lastPresentedRequestSerial = readyFrame.requestSerial;
     m_lastPresentedRequestContext = requestContext;
     m_lastPresentedRequestContextValid = true;

@@ -234,14 +234,17 @@ inline bool playingRelabelDeferred( bool playing, bool clockValid, qint64 elapse
     return playing && clockValid && elapsedMs < kDeferredRelabelMs;
 }
 
-/*! \brief INFO-2 r2 (adversary pass 1 A7): while playing, a relabel normally only STORES its text for the next frame's paint (the
- *  label adds no paint of its own to playback). When no frame has been presented for a whole relabel gate (the first frame of a
- *  Play that takes 900 ms, or any stall, with or without an earlier draw), no paint is coming: the relabel repaints at once, so a
- *  deferred change is visible within the gate plus one tick whether or not frames arrive. `clockValid` / `msSincePresented` = a
- *  monotonic clock (QElapsedTimer) restarted by every presented frame; no presented frame yet is overdue. */
-inline bool nextPaintOverdue( bool clockValid, qint64 msSincePresented )
+/*! \brief INFO-2 r2 (adversary pass 1 A7, pass 2 A1): while playing, a relabel normally only STORES its text for the next frame's
+ *  paint (the label adds no paint of its own to playback). The stored text is OWED a paint: when no frame has been presented
+ *  within kLabelPaintOwedMs of the store (the first frame of a Play that takes 900 ms, or any stall, whatever came before: a paused
+ *  scrub, an earlier draw or none), no frame's paint is coming, so the owed paint is made. A frame presented since the store
+ *  carries the text with its own paint and clears the debt. `owed` = a store is waiting (monotonic QElapsedTimer armed),
+ *  `framePresentedSinceStore` = the presented-frame count moved since it was armed, `msSinceStore` = that timer's age. One frame
+ *  period at 24 fps is 42 ms, so a steady Play never pays it. */
+constexpr qint64 kLabelPaintOwedMs = 50;
+inline bool labelPaintOwedDue( bool owed, bool framePresentedSinceStore, qint64 msSinceStore )
 {
-    return !clockValid || msSincePresented >= kDeferredRelabelMs;
+    return owed && !framePresentedSinceStore && msSinceStore >= kLabelPaintOwedMs;
 }
 
 /*! \brief r3 adversary A1 (9c9941cd): does the presented frame's active scale belong to the requested scale? It compares the

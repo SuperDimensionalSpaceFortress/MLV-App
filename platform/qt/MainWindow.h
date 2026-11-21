@@ -875,7 +875,8 @@ private:
     quint64 m_playbackFpsMeterSeenPresentedCount = 0;    // r21: the count the fps meter last stepped on; a draw feeds it only when this moved
     QTime m_lastPlaybackFpsStatusUpdateTime;
     QTime m_playbackFpsMeterPresentedStamp;       // INFO-2 r2 (pass 1 A2): wall time recordPresentedFrame ran for the latest presented frame (the handoff)
-    QElapsedTimer m_playbackPresentedClock;       // INFO-2 r2 (pass 1 A7): restarted by every presented frame (monotonic); invalid before the first
+    QElapsedTimer m_lookLabelPaintOwedClock;      // INFO-2 r2 (pass 1 A7): armed when a playing relabel stored its text for the next paint (monotonic); invalid = no debt
+    quint64 m_lookLabelPaintOwedPresentedCount = 0;   // INFO-2 r2: the presented-frame count when it was armed; a frame since carries the text
     QTime m_playbackFpsMeterPrevPresentedStamp;   // INFO-2 r2: the presentation stamp the meter last stepped on (the interval's start)
     QLabel *m_pFrameNumber;
     QLabel *m_pChosenDebayer;
@@ -2417,6 +2418,7 @@ private:
     // r3: forceWithdrawal (only the fps meter's reset of a measured rate) skips the playing gate.
     void updatePlaybackInfoLabel( bool forceWithdrawal = false );
     void flushPlaybackInfoIfDue( void );
+    void settleLookLabelPaintIfOwed( void );   // INFO-2 r2 (pass 1 A7, pass 2 A1): the paint a stored playing label is owed when no frame comes
     // The one push of the look label (plus the info lines in fullscreen) to the status bar and the corner surfaces.
     void pushLookLabelOverlay( void );
     playback_info_label::Facts playbackInfoFacts( void );

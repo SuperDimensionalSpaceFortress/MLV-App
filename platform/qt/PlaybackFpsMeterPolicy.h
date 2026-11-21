@@ -87,7 +87,7 @@ inline bool drawFeedsMeter( bool presentedSinceLastMeterStep )
 inline int presentedIntervalMs( int msBetweenStamps, int framesPresented )
 {
     if( msBetweenStamps <= 0 || framesPresented <= 1 ) return msBetweenStamps;
-    return ( msBetweenStamps + framesPresented / 2 ) / framesPresented;
+    return static_cast<int>( ( static_cast<long long>( msBetweenStamps ) + framesPresented / 2 ) / framesPresented );   // wide: no int overflow
 }
 
 } // namespace playback_fps_meter
