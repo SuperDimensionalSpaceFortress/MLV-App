@@ -2393,11 +2393,13 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             $lateClock = [Diagnostics.Stopwatch]::StartNew()
             $lateBoundSec = [double]($script:ClaimRetryRequestReserveSec - $script:ClaimRetryRefusalTailSec)
             for ($lateTry = 1; $lateTry -le 5; $lateTry++) {
+                # r10 (adversary A1): the clock is asked again after the sleep: one clamped to the end of the reserve (or woken late) must not start a try, which would run a whole release call past it
+                if ($lateTry -gt 1 -and $lateClock.Elapsed.TotalSeconds -ge $lateBoundSec) { break }
                 try { $lateAnswer = [string]$(if ($grantedOnRetry) { Invoke-ClaimRetryRelease $deadline $req.claim.nonce } else { Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir }) } catch { $lateAnswer = 'ERROR' }
                 if ($grantedOnRetry -or $lateAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { break }
                 $lateLeftSec = $lateBoundSec - $lateClock.Elapsed.TotalSeconds
                 if ($lateTry -ge 5 -or $lateLeftSec -le 0) { break }
-                Start-Sleep -Milliseconds ([int][Math]::Min([double](100 * $lateTry), [double]($lateLeftSec * 1000)))
+                Start-Sleep -Milliseconds ([int][Math]::Ceiling([Math]::Min([double](100 * $lateTry), [double]($lateLeftSec * 1000))))   # rounded UP: a sleep cut short by the cast would wake just before the bound and start a try inside it
             }
             if ($lateAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { LogBest "CLAIM_LATE_GRANT batch=$batchNo (the claim was granted at or after the deadline: let go, not used)" }
             else { LogBest "CLAIM_LATE_GRANT_NOT_RELEASED batch=$batchNo answer=$lateAnswer (the claim was granted at or after the deadline and is NOT known to be let go: it still names this batch until its expiry or its owner's exit)" }

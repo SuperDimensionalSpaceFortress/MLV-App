@@ -2009,7 +2009,7 @@ $logLines = @(Get-Content -LiteralPath $log | Where-Object { $_ -match 'CLAIM_LA
 [pscustomobject]@{ held = $true; heldUtc = $heldUtc.ToString('o'); seenUtc = $(if ($seenUtc) { $seenUtc.ToString('o') } else { '' }); nonce = $nonce; stillNamed = $stillNamed; release = $rel; lines = $logLines } | ConvertTo-Json -Compress
 """
 
-    def late_grant_scenario(self, hold: bool, deadline_sec: float = 20.0) -> dict:
+    def late_grant_scenario(self, hold: bool, deadline_sec: float = 20.0, release_seam: bool = False) -> dict:
         # A real lease batch whose claim is GRANTED AFTER -DeadlineUtc: a copy of VenueChain.psm1 keeps the granted claim standing until 0.2 s past the deadline (the seam, nothing else changed), so the
         # batch takes the late-grant branch. With hold=True a reader (FileShare.Read, no Delete) holds the claim file from the grant until the batch has logged what it did, so every release is refused (BUSY).
         import shutil
@@ -2019,11 +2019,19 @@ $logLines = @(Get-Content -LiteralPath $log | Where-Object { $_ -match 'CLAIM_LA
         anchor = "    $r = Invoke-VenueClaimAttempt @attemptArgs\n"
         self.assertEqual(text.count(anchor), 1, "late-grant seam anchor moved")
         seam = anchor + "    if ($r.granted -and $env:SEAM_UNTIL_UTC) { $u = [DateTime]::Parse($env:SEAM_UNTIL_UTC, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind); while ([DateTime]::UtcNow -lt $u) { Start-Sleep -Milliseconds 20 } }\n"
+        text = text.replace(anchor, seam)
+        env: dict[str, str] = {}
+        if release_seam:
+            # r10 adversary A1: every Release-VenueClaim call is logged with its start time, takes 650 ms and answers BUSY (a release that takes most of the 750 ms reserve, deterministically)
+            rel_anchor = "    switch (Remove-VenueClaimIfUnchanged -Path $path -ExpectedNonce $Nonce) {\n"
+            self.assertEqual(text.count(rel_anchor), 1, "release seam anchor moved")
+            text = text.replace(rel_anchor, "    if ($env:SEAM_RELEASE_LOG) { [IO.File]::AppendAllText($env:SEAM_RELEASE_LOG, [DateTime]::UtcNow.ToString('o') + [Environment]::NewLine); Start-Sleep -Milliseconds 650; return 'BUSY' }\n" + rel_anchor)
+            env["SEAM_RELEASE_LOG"] = str(self.case / "release-calls.log")
         runner = copy_with_siblings(LEASE_RUNNER, Path(tempfile.mkdtemp(prefix="late-", dir=self.case)))
-        (runner.parent / MODULE.name).write_text(text.replace(anchor, seam), encoding="utf-8")
+        (runner.parent / MODULE.name).write_text(text, encoding="utf-8")
         (runner.parent.parent / "bachelor").mkdir(exist_ok=True)   # the runner reads the agent's own script at ..\\bachelor\\ultra-magnus-agent.ps1 for the liveness read-back
         shutil.copy2(DV.parent / "bachelor" / "ultra-magnus-agent.ps1", runner.parent.parent / "bachelor" / "ultra-magnus-agent.ps1")
-        p = self.start_batch("L", claim_poll=1, runner=runner, deadline_utc=deadline, SEAM_UNTIL_UTC=until.strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
+        p = self.start_batch("L", claim_poll=1, runner=runner, deadline_utc=deadline, SEAM_UNTIL_UTC=until.strftime("%Y-%m-%dT%H:%M:%S.%fZ"), **env)
         holder = None
         if hold:
             script = (self.LATE_GRANT_HOLDER.replace("@@CP@@", str(self.claim_path)).replace("@@LOG@@", str(Path(p.run_dir) / "batch.log"))   # type: ignore[attr-defined]
@@ -2034,7 +2042,8 @@ $logLines = @(Get-Content -LiteralPath $log | Where-Object { $_ -match 'CLAIM_LA
             self.assertEqual(holder.returncode, 0, f"the claim-file holder failed:\n{holder.stdout}\n{holder.stderr}")
         p.wait(timeout=150)
         out = Path(p.out_path).read_text(encoding="utf-8", errors="replace")   # type: ignore[attr-defined]
-        r = {"log": self.batch_log(p), "out": out, "deadline": deadline, "claimLeft": self.claim_path.exists()}
+        r = {"log": self.batch_log(p), "out": out, "deadline": deadline, "claimLeft": self.claim_path.exists(),
+             "releaseCalls": [l for l in Path(env["SEAM_RELEASE_LOG"]).read_text(encoding="utf-8").splitlines() if l.strip()] if release_seam and Path(env["SEAM_RELEASE_LOG"]).exists() else []}
         if holder is not None:
             r["holder"] = json.loads([l for l in holder.stdout.splitlines() if l.strip()][-1])
             self.assertTrue(r["holder"]["held"], f"the claim file was never granted (no late grant to test):\n{r['log']}\n{out}")
@@ -2064,6 +2073,14 @@ $logLines = @(Get-Content -LiteralPath $log | Where-Object { $_ -match 'CLAIM_LA
         spent = (datetime.fromisoformat(h["seenUtc"].replace("Z", "+00:00")) - r["deadline"]).total_seconds()
         self.assertLess(spent, 3.0, f"the late grant's release retry ran {spent:.2f} s past -DeadlineUtc (bound: the 0.75 s reserve, one call in flight and tolerance = 3.0 s): {h['lines']}")
         self.assertTrue(any("CLAIM_LATE_GRANT_NOT_RELEASED" in l for l in h["lines"]), f"the reader held the file, so the release must be logged as not released: {h['lines']}")
+
+    def test_r10_a1_no_release_try_starts_once_the_sleep_before_it_ran_to_the_end_of_the_reserve(self) -> None:
+        # r10 adversary A1 (blocker, introduced by G13's loop): the sleep is clamped to what is left of the 0.75 s reserve, and the next try then started without asking the clock again, so a try began at the
+        # reserve's end and ran a whole further release call past it. Here every release call takes 650 ms and answers BUSY (the seam): try 1 ends at about 0.65 s, the sleep is clamped to the
+        # 0.1 s that is left, and the reserve is spent when it ends. Exactly ONE release call may have been made; the unfixed loop made a second.
+        r = self.late_grant_scenario(hold=False, release_seam=True)
+        self.assertTrue(any("CLAIM_LATE_GRANT_NOT_RELEASED" in l for l in r["log"].splitlines()), f"the always-BUSY release must be logged as not released:\n{r['log']}")
+        self.assertEqual(len(r["releaseCalls"]), 1, f"a release try started after the reserve was spent: calls at {r['releaseCalls']}")
 
     def test_r10_g14_an_unheld_late_grant_is_let_go_and_logged_so(self) -> None:
         # the other half of the behaviour: nobody holds the claim file, the release answers at once, the claim is gone and the line says "let go"
