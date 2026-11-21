@@ -10,6 +10,8 @@ The start line also logs MLVAPP_RAW_UINT16_PREFETCH_DECODERS, the lever's K knob
 existing MLVAPP_DISABLE_RAW_UINT16_PREFETCH.
 """
 from pathlib import Path
+import shutil
+import subprocess
 import unittest
 
 
@@ -88,6 +90,30 @@ class RawUint16PerFrameKeysTests(unittest.TestCase):
         statement = _statement_containing(self.source, '"playback_smoke.start ', "qInfo()")
         self.assertIn("env_raw_uint16_prefetch_decoders=%", statement)
         self.assertIn('envValueForLog( "MLVAPP_RAW_UINT16_PREFETCH_DECODERS" )', statement)
+
+
+class Lj92SlowHuffConfigurationTests(unittest.TestCase):
+    """LJ92-PRED1-FAST-PATH-1 r11 (adversary A1, introduced major): the u64 predictor-1 reader read self->hufflut and
+    self->huffbits unconditionally, but a -DSLOW_HUFF build compiles the ljp struct without those two members, so
+    lj92.c stopped compiling in that (legacy, commented-out in the source, never defined by a project) configuration,
+    which master still compiled. The legacy configuration stays a compilable one."""
+
+    def _syntax_check(self, *defines: str) -> "subprocess.CompletedProcess[str]":
+        compiler = shutil.which("gcc") or shutil.which("cc")
+        if compiler is None:
+            self.skipTest("no C compiler on PATH")
+        return subprocess.run(
+            [compiler, "-std=c99", "-fopenmp", "-fsyntax-only", *defines, "-I", str(ROOT / "src"),
+             str(ROOT / "src/mlv/liblj92/lj92.c")],
+            capture_output=True, text=True, timeout=120, check=False)
+
+    def test_lj92_compiles_in_the_default_configuration(self) -> None:
+        result = self._syntax_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_lj92_compiles_with_slow_huff_defined(self) -> None:
+        result = self._syntax_check("-DSLOW_HUFF")
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

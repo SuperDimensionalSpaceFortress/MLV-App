@@ -57,6 +57,7 @@ static MLV_STAGE_THREAD_LOCAL int g_lj92_last_skip_length = 0;
 static MLV_STAGE_THREAD_LOCAL int g_lj92_last_linearize_active = 0;
 static MLV_STAGE_THREAD_LOCAL int g_lj92_last_component_count = 0;
 static MLV_STAGE_THREAD_LOCAL int g_lj92_last_predictor = -1;
+static MLV_STAGE_THREAD_LOCAL int g_lj92_last_huff_max_ssss = -1;
 static MLV_STAGE_THREAD_LOCAL double g_lj92_last_pred6_total_ms = 0.0;
 static MLV_STAGE_THREAD_LOCAL double g_lj92_last_pred6_bitstream_ms = 0.0;
 static MLV_STAGE_THREAD_LOCAL double g_lj92_last_pred6_predictor_ms = 0.0;
@@ -97,6 +98,7 @@ typedef struct _ljp {
 #else
     u32* hufflut;
     int huffbits;
+    int huffmaxssss; // Largest SSSS (symbol value) in the table; gates the u64 pred-1 reader
 #endif
     // Parse state
     int cnt;
@@ -339,6 +341,15 @@ static int parseHuff(ljp* self) {
      * from uninitialised memory; it can decode nothing, so it is refused. */
     if (maxbits == 0) return LJ92_ERROR_CORRUPT;
     self->huffbits = maxbits;
+    /* LJ92-PRED1-FAST-PATH-1 r3: the u64 pred-1 reader refills once per sample to >= 32 bits, which covers a
+     * symbol only while code length (<= 16) + extra bits (SSSS <= 15; 16 carries none) fits. A table naming any
+     * larger SSSS stays on the legacy reader, whose behaviour there is undefined. The symbols are inside the
+     * payload (checked above). */
+    int maxssss = 0;
+    for (int sym = 0; sym < symbols; sym++) {
+        if (huffvals[sym] > maxssss) maxssss = huffvals[sym];
+    }
+    self->huffmaxssss = maxssss;
     /* Now fill the lut */
     u32* hufflut = malloc((1<<maxbits) * sizeof(u32));
     if (hufflut == NULL) return LJ92_ERROR_NO_MEMORY;
@@ -562,6 +573,121 @@ static LJ92_ALWAYS_INLINE int nextdiff_fast(ljp* self, u32* b_io, int* cnt_io, i
     return diff;
 }
 
+typedef uint64_t u64;
+
+/* LJ92-PRED1-FAST-PATH-1 r3: u64-accumulator bit reader for the predictor-1 fast path.
+ *
+ * The entropy data is a byte stream in which every 0xFF byte is emitted and the byte after it is dropped (whatever its
+ * value), and every byte at or past datalen reads as zero. nextdiff_fast() consumes it in 16-bit pairs and finds the
+ * Huffman index with a variable shift (acc >> (cnt - huffbits)); this reader keeps the bits LEFT-ALIGNED in a 64-bit
+ * accumulator, so the index is a constant shift (acc >> (64 - huffbits)) and consuming n bits is one left shift: the
+ * per-sample dependency chain (index -> table load -> shift) is shorter. It refills when fewer than 32 bits remain
+ * (one refill serves a whole symbol: <= 16 code bits + <= 15 extra bits) and loads 8 bytes at once when none of them
+ * is 0xFF. The bits it hands out are the same bits in the same order, so every difference, and so every decoded
+ * sample, is identical to nextdiff_fast()'s. nextdiff_fast() itself is untouched: pred-6 and the generic scan share it.
+ *
+ * Invariant: the top cnt bits of acc are the next unread stream bits; the bits below them are either zero or, after a bulk
+ * load, the bits of the bytes that follow in the stream (the bulk load ORs in a whole 8-byte word but only credits whole
+ * bytes it needs, so the surplus equals what the next refill would add: OR-ing it again changes nothing). The byte-wise
+ * path clears them first. */
+static MLV_STAGE_THREAD_LOCAL int g_lj92_force_legacy_pred1_reader = 0;
+static MLV_STAGE_THREAD_LOCAL int g_lj92_last_pred1_u64_reader_active = 0;
+
+#ifndef SLOW_HUFF
+static LJ92_ALWAYS_INLINE void lj92_pred1_refill(const u8* data, int datalen, u64* acc_io, int* cnt_io, int* ix_io)
+{
+    u64 acc = *acc_io;
+    int cnt = *cnt_io;
+    int ix = *ix_io;
+    if (datalen - ix >= 8) {
+        const u8* p = &data[ix];
+        const u64 w = ((u64)p[0] << 56) | ((u64)p[1] << 48) | ((u64)p[2] << 40) | ((u64)p[3] << 32)
+                    | ((u64)p[4] << 24) | ((u64)p[5] << 16) | ((u64)p[6] << 8) | (u64)p[7];
+        /* nonzero iff some byte of w is 0xFF (has-zero-byte test on ~w; exact, no false positives) */
+        if (((~w - 0x0101010101010101ull) & w & 0x8080808080808080ull) == 0) {
+            acc |= w >> cnt;                /* cnt < 32 here */
+            const int n = (63 - cnt) >> 3;  /* 4..7 whole bytes credited; cnt + 8n <= 63 */
+            cnt += 8 * n;
+            ix += n;
+            *acc_io = acc;
+            *cnt_io = cnt;
+            *ix_io = ix;
+            return;
+        }
+    }
+    /* Byte-wise: the exact FF-skip and zero-past-end rules (see lj92_load_entropy_pair / lj92_advance_entropy_ix). */
+    acc = cnt > 0 ? (acc >> (64 - cnt)) << (64 - cnt) : 0u; /* drop the surplus a bulk load left below the credited bits */
+    while (cnt <= 56) {
+        const u64 byte = ix < datalen ? (u64)data[ix] : 0u;
+        ix = lj92_advance_entropy_ix(ix, byte == 0xFF ? 2 : 1, datalen);
+        acc |= byte << (56 - cnt);
+        cnt += 8;
+    }
+    *acc_io = acc;
+    *cnt_io = cnt;
+    *ix_io = ix;
+}
+
+/* Valid only when huffmaxssss <= 16 (see lj92_pred1_u64_reader_eligible): a fallback entry then has 1 <= t <= 15. */
+static LJ92_ALWAYS_INLINE int lj92_pred1_nextdiff(const u8* data, int datalen, const u32* hufflut, int huffbits,
+                                                  u64* acc_io, int* cnt_io, int* ix_io)
+{
+    u64 acc = *acc_io;
+    int cnt = *cnt_io;
+    int ix = *ix_io;
+    if (cnt < 32) lj92_pred1_refill(data, datalen, &acc, &cnt, &ix);
+    const u32 huffentry = hufflut[(u32)(acc >> (64 - huffbits))];
+    int diff;
+    if (huffentry & LJ92_HUFF_DIRECT_FLAG) {
+        const int used = (int)(huffentry & LJ92_HUFF_DIRECT_BITS_MASK);
+        acc <<= used;
+        cnt -= used;
+        diff = lj92_unpack_huff_direct_diff(huffentry);
+    } else {
+        const int t = (int)(huffentry >> 8);
+        const int used = (int)(huffentry & 0xFF);
+        acc <<= used;
+        const u32 v = (u32)(acc >> (64 - t));
+        acc <<= t;
+        cnt -= used + t;
+        diff = (int)v;
+        if (diff < (1 << (t - 1))) diff += 1 - (1 << t);
+    }
+    *acc_io = acc;
+    *cnt_io = cnt;
+    *ix_io = ix;
+    return diff;
+}
+#else
+static LJ92_ALWAYS_INLINE int lj92_pred1_nextdiff(const u8* data, int datalen, const u32* hufflut, int huffbits,
+                                                  u64* acc_io, int* cnt_io, int* ix_io)
+{
+    (void)data; (void)datalen; (void)hufflut; (void)huffbits; (void)acc_io; (void)cnt_io; (void)ix_io;
+    return 0; /* SLOW_HUFF builds never take the u64 reader */
+}
+#endif
+
+/* r11 (adversary A1): the SLOW_HUFF ljp struct has no hufflut / huffbits members, and lj92_pred1_u64_reader_eligible
+ * returns 0 there, so the two parseScanPred1Fast*Impl bodies only ever pass placeholders to the stub above. */
+#ifdef SLOW_HUFF
+#define LJ92_PRED1_HUFFLUT(self) ((const u32*)NULL)
+#define LJ92_PRED1_HUFFBITS(self) 0
+#else
+#define LJ92_PRED1_HUFFLUT(self) ((self)->hufflut)
+#define LJ92_PRED1_HUFFBITS(self) ((self)->huffbits)
+#endif
+
+static int lj92_pred1_u64_reader_eligible(const ljp* self)
+{
+#ifdef SLOW_HUFF
+    (void)self;
+    return 0;
+#else
+    return !g_lj92_force_legacy_pred1_reader && self->hufflut != NULL && self->huffbits >= 1 && self->huffbits <= 16
+        && self->huffmaxssss <= 16;
+#endif
+}
+
 static int lj92_pred6_split_enabled(void)
 {
     static int initialized = 0;
@@ -614,6 +740,7 @@ static void lj92_reset_last_pred6_timing(void)
     g_lj92_last_pred1_fast_path_measurement_requested = 0;
     g_lj92_last_pred1_fast_path_measurement_active = 0;
     g_lj92_last_pred1_fast_path_eligible = 0;
+    g_lj92_last_pred1_u64_reader_active = 0;
     g_lj92_last_scan_component_count = 0;
     g_lj92_last_write_length = 0;
     g_lj92_last_expected_write_length = 0;
@@ -621,6 +748,7 @@ static void lj92_reset_last_pred6_timing(void)
     g_lj92_last_linearize_active = 0;
     g_lj92_last_component_count = 0;
     g_lj92_last_predictor = -1;
+    g_lj92_last_huff_max_ssss = -1;
     g_lj92_last_pred6_total_ms = 0.0;
     g_lj92_last_pred6_bitstream_ms = 0.0;
     g_lj92_last_pred6_predictor_ms = 0.0;
@@ -683,13 +811,19 @@ static int lj92_can_use_pred1_fast_path(const ljp* self,
 
 static int parseScanPred1Fast(ljp* self);
 
-static int parseScanPred1FastMeasured(ljp* self)
+/* use_u64 is a compile-time constant at both call sites, so each wrapper below holds one reader. */
+static LJ92_ALWAYS_INLINE int parseScanPred1FastMeasuredImpl(ljp* self, const int use_u64)
 {
     int ix = lj92_scan_entropy_start(self); /* r6 A2: bounded, was ix += BEH(data[scanstart]) */
     if (ix < 0) return LJ92_ERROR_CORRUPT;
 
     int cnt = 0;
     u32 b = 0;
+    u64 acc = 0;
+    const u8* const data = self->data;
+    const int datalen = self->datalen;
+    const u32* const hufflut = LJ92_PRED1_HUFFLUT(self);
+    const int huffbits = LJ92_PRED1_HUFFBITS(self);
 
     const int width = self->x;
     const int height = self->y;
@@ -704,6 +838,7 @@ static int parseScanPred1FastMeasured(ljp* self)
     if (diff_buffer == NULL) {
         return parseScanPred1Fast(self);
     }
+    g_lj92_last_pred1_u64_reader_active = use_u64;
 
     const double total_start = mlv_stage_timing_now();
     double bitstream_ms = 0.0;
@@ -713,7 +848,9 @@ static int parseScanPred1FastMeasured(ljp* self)
     for (int row = 0; row < height; row++) {
         stage_start = mlv_stage_timing_now();
         for (int index = 0; index < row_stride; index++) {
-            diff_buffer[index] = nextdiff_fast(self, &b, &cnt, &ix);
+            diff_buffer[index] = use_u64
+                ? lj92_pred1_nextdiff(data, datalen, hufflut, huffbits, &acc, &cnt, &ix)
+                : nextdiff_fast(self, &b, &cnt, &ix);
         }
         bitstream_ms += (mlv_stage_timing_now() - stage_start) * 1000.0;
 
@@ -754,18 +891,30 @@ static int parseScanPred1FastMeasured(ljp* self)
 
     self->ix = ix;
     self->cnt = cnt;
-    self->b = b;
+    self->b = use_u64 ? (u32)acc : b; /* write-only after the scan */
     lj92_commit_last_generic_timing(0, 0.0, 0.0, 0.0);
     return LJ92_ERROR_NONE;
 }
 
-static int parseScanPred1Fast(ljp* self)
+static int parseScanPred1FastMeasured(ljp* self)
+{
+    return lj92_pred1_u64_reader_eligible(self) ? parseScanPred1FastMeasuredImpl(self, 1)
+                                                : parseScanPred1FastMeasuredImpl(self, 0);
+}
+
+static LJ92_ALWAYS_INLINE int parseScanPred1FastImpl(ljp* self, const int use_u64)
 {
     int ix = lj92_scan_entropy_start(self); /* r6 A2: bounded, was ix += BEH(data[scanstart]) */
     if (ix < 0) return LJ92_ERROR_CORRUPT;
 
     int cnt = 0;
     u32 b = 0;
+    u64 acc = 0;
+    const u8* const data = self->data;
+    const int datalen = self->datalen;
+    const u32* const hufflut = LJ92_PRED1_HUFFLUT(self);
+    const int huffbits = LJ92_PRED1_HUFFBITS(self);
+    g_lj92_last_pred1_u64_reader_active = use_u64;
 
     const int width = self->x;
     const int height = self->y;
@@ -792,7 +941,10 @@ static int parseScanPred1Fast(ljp* self)
                 else
                     Px = thisrow[prev_colx + component];
 
-                const int value = (u16)(Px + nextdiff_fast(self, &b, &cnt, &ix));
+                const int diff = use_u64
+                    ? lj92_pred1_nextdiff(data, datalen, hufflut, huffbits, &acc, &cnt, &ix)
+                    : nextdiff_fast(self, &b, &cnt, &ix);
+                const int value = (u16)(Px + diff);
                 thisrow[colx + component] = (u16)value;
                 out[colx + component] = (u16)value;
             }
@@ -807,9 +959,15 @@ static int parseScanPred1Fast(ljp* self)
     lj92_commit_last_pred1_fast_path_timing(1, 0, 0.0, 0.0, 0.0);
     self->ix = ix;
     self->cnt = cnt;
-    self->b = b;
+    self->b = use_u64 ? (u32)acc : b; /* write-only after the scan */
     lj92_commit_last_generic_timing(0, 0.0, 0.0, 0.0);
     return LJ92_ERROR_NONE;
+}
+
+static int parseScanPred1Fast(ljp* self)
+{
+    return lj92_pred1_u64_reader_eligible(self) ? parseScanPred1FastImpl(self, 1)
+                                                : parseScanPred1FastImpl(self, 0);
 }
 
 static int parsePred6(ljp* self) {
@@ -1011,6 +1169,9 @@ static int parseScan(ljp* self) {
     g_lj92_last_linearize_active = self->linearize != NULL;
     g_lj92_last_component_count = self->components;
     g_lj92_last_predictor = pred;
+#ifndef SLOW_HUFF
+    g_lj92_last_huff_max_ssss = self->huffmaxssss;
+#endif
     if (pred<0 || pred>7) return ret;
     g_lj92_last_pred1_fast_path_eligible =
         lj92_can_use_pred1_fast_path(self,
@@ -1310,6 +1471,18 @@ int lj92_get_last_pred1_fast_path_measurement_requested(void) {
 
 int lj92_get_last_pred1_fast_path_measurement_active(void) {
     return g_lj92_last_pred1_fast_path_measurement_active;
+}
+
+int lj92_get_last_huff_max_ssss(void) {
+    return g_lj92_last_huff_max_ssss;
+}
+
+void lj92_set_pred1_legacy_reader(int force_legacy) {
+    g_lj92_force_legacy_pred1_reader = force_legacy != 0;
+}
+
+int lj92_get_last_pred1_u64_reader_active(void) {
+    return g_lj92_last_pred1_u64_reader_active;
 }
 
 int lj92_get_last_pred1_fast_path_eligible(void) {
