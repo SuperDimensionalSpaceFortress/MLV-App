@@ -170,7 +170,8 @@ SOURCES += \
     $$REPO_ROOT/tests/pipeline/test_gpu_playback_recon_preload.cpp \
     $$REPO_ROOT/tests/pipeline/test_gpu_device_loss_selfheal.cpp \
     $$REPO_ROOT/tests/pipeline/test_visual_capture_source_hash.cpp \
-    $$REPO_ROOT/tests/pipeline/test_dualiso_gpu_split_timing.cpp
+    $$REPO_ROOT/tests/pipeline/test_dualiso_gpu_split_timing.cpp \
+    $$REPO_ROOT/tests/pipeline/test_lj92_pred1_reader.cpp
 
 HEADERS += \
     $$REPO_ROOT/src/processing/ThreadExitCache.h \

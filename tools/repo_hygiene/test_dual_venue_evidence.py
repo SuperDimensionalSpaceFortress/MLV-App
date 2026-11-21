@@ -273,6 +273,9 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in HFR_NATIVE_S1_LEGS if rel not in
 # EXPORT-VENUE-LEG-1: the four export legs (two clips x CDNG lossless / ProRes); test_dual_venue_export_leg pins their shape.
 EXPORT_VENUE_LEGS = tuple(f"legs/m16-{clip}-export-{fmt}.json" for clip in ("1243", "1456") for fmt in ("cdng-lossless", "prores"))
 SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in EXPORT_VENUE_LEGS if rel not in SHIPPED_LEGS))
+# LJ92-PRED1-FAST-PATH-1 r3: the per-frame lj92 layout probe, one cpu s1 Look Assist leg per clip (LegSpecSchemaTests pins the shape and the applied-flavor gate).
+LJ92_LAYOUT_LEGS = tuple(f"legs/m16-{clip}-lj92-layout-cpu-s1.json" for clip in ("1243", "1457"))
+SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in LJ92_LAYOUT_LEGS if rel not in SHIPPED_LEGS))
 assert len(set(SHIPPED_LEGS)) == len(SHIPPED_LEGS), "a shipped leg is listed twice"
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
@@ -4084,6 +4087,18 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         receipt = self.receipt_for(repo, self.evidence("m6"))
         receipt["playback"]["sourceAdvanced"] = 5000
         self.assertEqual(self.status(receipt, repo, module=mutated)[:2], ("ADVISORY", False))
+
+    def test_a_stored_lj92_layout_row_count_the_log_does_not_re_derive_is_not_valid(self) -> None:
+        """LJ92-PRED1-FAST-PATH-1 r12 (adversary pass 1 A5): the verifier compared every other playback fact but not lj92LayoutRows, so a receipt whose block says
+        2 over a hashed log that re-derives 0 stayed verified. A block that predates the field (names none) stays verified."""
+        repo = self.prod_repo()
+        receipt = self.receipt_for(repo, self.evidence("a5"))
+        self.assertNotIn("lj92LayoutRows", receipt["playback"], "the premise: this factory's block predates the field and stays verified")
+        self.assertAdvisory(receipt, repo)
+        receipt["playback"]["lj92LayoutRows"] = 2   # the factory's log holds no layout row
+        self.assertNotValid(receipt, repo, "PLAYBACK_NOT_FROM_EVIDENCE", "INVALID")
+        receipt["playback"]["lj92LayoutRows"] = None   # r12 (adversary pass 2 A2): present as a JSON null is a stored claim too, never "absent"
+        self.assertNotValid(receipt, repo, "PLAYBACK_NOT_FROM_EVIDENCE", "INVALID")
 
     def test_mutation_without_the_outcome_derivation_a_pass_over_failing_criteria_validates(self) -> None:
         mutated = self.mutated_module([("if ($expected -cne $outcome) {", "if ($false) {")])
@@ -8183,6 +8198,15 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "CPU-S1-RECON-CHAIN-ATTRIBUTION-1":   # the Look Assist on arms of the chain attribution (the classic arm l never reaches this chain)
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-chainattr-(c|p|t12)-fullscreen-s1$", path.name)
+            elif spec["card"] == "LJ92-PRED1-FAST-PATH-1":   # the lj92 layout probe legs: cpu s1 Look Assist, one per clip, gated on the applied flavor like every flavored leg
+                self.assertIn("legs/" + path.name, LJ92_LAYOUT_LEGS, path.name)
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertEqual((spec["legType"], spec["backends"], spec["scaleFactor"], spec["displayMode"]), ("speed", ["cpu"], 1, "fullscreen"), path.name)
+                self.assertIs(spec["generatorArgs"].get("forceLookAssist"), True, path.name)
+                # r11 (adversary A1): the per-frame lj92 layout rows ARE the product of these legs; a LIGHT arm sets
+                # MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1, which skips both per-frame emitters, so a LIGHT layout leg
+                # can pass its other gates with zero layout rows. Only HEAVY keeps them.
+                self.assertEqual(spec["generatorArgs"].get("telemetryArm"), "HEAVY", path.name)
             elif spec["card"] == "HFR-NATIVE-60FPS-FULLRES-1":   # the Look Assist ON control of the native s1 pair (its -nola twin is classic)
                 self.assert_hfr_native_s1_flavored_leg(spec, path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
@@ -18455,6 +18479,98 @@ class TeamPartitionEvidenceTests(unittest.TestCase):
             with self.subTest(spec=spec, case="unreadable"):
                 v = self.verdict(spec, self.log(self.OFF_RECORD() + " extra=1"))
                 self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+
+
+# LJ92-PRED1-FAST-PATH-1 r12 (adversary r11 A3, introduced major): the per-frame lj92 layout rows are the product of the two layout legs, but both legs
+# gated only on the look values, so a HEAVY leg that recorded no `raw_uint16_lj92_*` row at all still passed. Both roles of both specs now need at least
+# one measured-session row that reports a layout (a non-negative predictor), re-derived from the run log by Get-DvPlaybackEvidence -> Get-DvCriteriaMetrics,
+# the one chain Invoke-VenueLeg and the receipt verifier share.
+LJ92_LAYOUT_ROWS_CRITERION = {"metric": "lj92LayoutRows", "op": "ge", "value": 1}
+
+
+@requires_windows_pwsh
+class Lj92LayoutLegsRequireLayoutRowsTests(unittest.TestCase):
+    CLIP = "M16-1243"
+
+    @staticmethod
+    def log(frame_rows: list[str]) -> str:
+        return "\n".join([
+            "playback_smoke.measured_session id=3",
+            *[f"playback_smoke.frame session=3 index={i} prep_region_total_ms=1 prep_region_unattributed_ms=0" for i in range(1, 11)],
+            *frame_rows,
+            conformed_summary_line()]) + "\n"
+
+    @staticmethod
+    def layout_row(index: int, session: str = "3", predictor: str = "1", emitter: str = "cpu_frame") -> str:
+        return (f"playback_smoke.{emitter} session={session} index={index} raw_uint16_ms=9.000 raw_uint16_source=0 raw_uint16_frame_lj92_ms=8.000"
+                f" raw_uint16_inflight_wait_ms=0.000 raw_uint16_lj92_predictor={predictor} raw_uint16_lj92_precision=14 raw_uint16_lj92_max_ssss=12"
+                " raw_uint16_lj92_component_count=2 raw_uint16_lj92_scan_component_count=2 raw_uint16_lj92_pred1_fast_path_eligible=1"
+                " raw_uint16_lj92_pred1_fast_path_active=1")
+
+    def judge(self, log: str) -> list[dict]:
+        sha = hashlib.sha256(log.encode("utf-8")).hexdigest()
+        script = (
+            "$summary = [pscustomobject]@{ sourceFrames = [pscustomobject]@{ sourceAdvanced = 1499; requiredSourceFrames = 1499; failures = @() }; fixtureRehearsal = $false;"
+            " clipId = $env:DVE_CLIP; lookAssistForced = $true; gpuFramesTotal = 0; lookFlavorReported = 'cinematic' }\n"
+            "$manifest = [pscustomobject]@{ smokeRunLog = [pscustomobject]@{ runNonce = $env:DVE_NONCE; sha256 = $env:DVE_SHA } }\n"
+            "$result = [pscustomobject]@{ evidence = [pscustomobject]@{ runNonce = $env:DVE_NONCE; runLogSnapshot = [pscustomobject]@{ sha256 = $env:DVE_SHA } } }\n"
+            "$out = foreach ($rel in ($env:DVE_SPECS -split ';')) {\n"
+            "  $spec = Get-Content -Raw -LiteralPath (Join-Path $env:DVE_DV $rel) | ConvertFrom-Json\n"
+            "  $pb = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ResultJson $result -LogText $env:DVE_LOG -LogSha256 $env:DVE_SHA"
+            " -ExpectedClipId $env:DVE_CLIP\n"
+            "  $m = Get-DvCriteriaMetrics -Metrics (Get-DvVerbatimMetrics -Summary $summary -EvidenceManifest $manifest) -Playback $pb\n"
+            "  foreach ($role in 'acceptance', 'supplementary') {\n"
+            "    $v = Test-DvCriteria -Criteria $spec.criteria.$role.cpu -Metrics $m\n"
+            "    [ordered]@{ spec = $rel; role = $role; pass = $v.pass; failures = @($v.failures); rows = $m.lj92LayoutRows }\n"
+            "  }\n"
+            "}\n"
+            "ConvertTo-Json -InputObject @($out) -Compress -Depth 5")
+        proc, out = run_pwsh_json(script, DVE_LOG=log, DVE_SHA=sha, DVE_NONCE=NONCE, DVE_CLIP=self.CLIP, DVE_DV=str(DV), DVE_SPECS=";".join(LJ92_LAYOUT_LEGS))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), 2 * len(LJ92_LAYOUT_LEGS), out)
+        return out
+
+    def test_both_roles_of_both_layout_specs_name_the_layout_row_criterion(self) -> None:
+        for rel in LJ92_LAYOUT_LEGS:
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            for role in ("acceptance", "supplementary"):
+                with self.subTest(spec=rel, role=role):
+                    self.assertIn(LJ92_LAYOUT_ROWS_CRITERION, spec["criteria"][role]["cpu"])
+
+    def test_a_heavy_leg_with_ten_generic_rows_and_no_layout_row_fails(self) -> None:
+        """The finding's input: scale, look and ten measured-session generic frame rows held, zero cpu_frame / gpu_frame rows with lj92 fields."""
+        for row in self.judge(self.log([])):
+            with self.subTest(spec=row["spec"], role=row["role"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual([f.split(" ")[0] for f in row["failures"]], ["lj92LayoutRows"], row)
+                self.assertEqual(row["rows"], 0, row)
+
+    def test_a_row_of_another_session_or_one_without_a_layout_does_not_count(self) -> None:
+        cases = {
+            "another session's row": [self.layout_row(1, session="4")],
+            "a sentinel predictor (the decode failed)": [self.layout_row(1, predictor="-1")],
+            "a frame row of the wrong kind": [self.layout_row(1, emitter="frame")],
+            # r12 (adversary pass 1 A1): one complete layout, not one key
+            "a row that names only a predictor": ["playback_smoke.cpu_frame session=3 index=1 raw_uint16_lj92_predictor=1"],
+            "an unsupported predictor": [self.layout_row(1, predictor="8")],
+            "a predictor named twice": [self.layout_row(1) + " raw_uint16_lj92_predictor=-1"],
+            "a signed predictor": [self.layout_row(1, predictor="+1")],
+            # r12 (adversary pass 2 A1, A3): all seven emitted fields, and a record body that kept its whole text
+            "a row without its fast-path fields": [self.layout_row(1).replace(" raw_uint16_lj92_pred1_fast_path_eligible=1 raw_uint16_lj92_pred1_fast_path_active=1", "")],
+            "a row whose tail was cut at a location suffix": [self.layout_row(1) + " (raw_uint16_lj92_predictor=7)"],
+        }
+        for name, rows in cases.items():
+            for row in self.judge(self.log(rows)):
+                with self.subTest(case=name, spec=row["spec"], role=row["role"]):
+                    self.assertFalse(row["pass"], row)
+                    self.assertEqual(row["rows"], 0, row)
+
+    def test_a_measured_session_layout_row_from_either_emitter_passes(self) -> None:
+        for emitter in ("cpu_frame", "gpu_frame"):
+            for row in self.judge(self.log([self.layout_row(1, emitter=emitter)])):
+                with self.subTest(emitter=emitter, spec=row["spec"], role=row["role"]):
+                    self.assertTrue(row["pass"], row)
+                    self.assertEqual(row["rows"], 1, row)
 
 
 if __name__ == "__main__":

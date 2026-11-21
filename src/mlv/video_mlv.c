@@ -72,6 +72,8 @@ static MLV_STAGE_THREAD_LOCAL int g_mlv_last_raw_uint16_lj92_skip_length = 0;
 static MLV_STAGE_THREAD_LOCAL int g_mlv_last_raw_uint16_lj92_linearize_active = 0;
 static MLV_STAGE_THREAD_LOCAL int g_mlv_last_raw_uint16_lj92_component_count = 0;
 static MLV_STAGE_THREAD_LOCAL int g_mlv_last_raw_uint16_lj92_predictor = -1;
+static MLV_STAGE_THREAD_LOCAL int g_mlv_last_raw_uint16_lj92_precision = 0;
+static MLV_STAGE_THREAD_LOCAL int g_mlv_last_raw_uint16_lj92_max_ssss = -1;
 static MLV_STAGE_THREAD_LOCAL double g_mlv_last_raw_uint16_lj92_pred6_total_ms = 0.0;
 static MLV_STAGE_THREAD_LOCAL double g_mlv_last_raw_uint16_lj92_pred6_bitstream_ms = 0.0;
 static MLV_STAGE_THREAD_LOCAL double g_mlv_last_raw_uint16_lj92_pred6_predictor_ms = 0.0;
@@ -177,6 +179,8 @@ static uint64_t file_get_pos(FILE *stream)
     X(int, g_mlv_last_raw_uint16_lj92_linearize_active, 0) \
     X(int, g_mlv_last_raw_uint16_lj92_component_count, 0) \
     X(int, g_mlv_last_raw_uint16_lj92_predictor, -1) \
+    X(int, g_mlv_last_raw_uint16_lj92_precision, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_max_ssss, -1) \
     X(double, g_mlv_last_raw_uint16_lj92_pred6_total_ms, 0.0) \
     X(double, g_mlv_last_raw_uint16_lj92_pred6_bitstream_ms, 0.0) \
     X(double, g_mlv_last_raw_uint16_lj92_pred6_predictor_ms, 0.0) \
@@ -3710,6 +3714,24 @@ int mlvDngBaselineExposureToBias(const int32_t baseline[2],
     return 1;
 }
 
+/* LJ92-PRED1-FAST-PATH-1 r12 (adversary pass 1 A2): a decode that failed describes no layout. The lj92 getters are
+ * copied before the status check (the timings of a failed decode are still wanted), so a failure puts every layout
+ * getter back to its reset sentinel: a layout is valid only for a decode that produced a frame. */
+static void mlv_reset_last_raw_uint16_lj92_layout(void)
+{
+    g_mlv_last_raw_uint16_lj92_pred1_fast_path_active = 0;
+    g_mlv_last_raw_uint16_lj92_pred1_fast_path_eligible = 0;
+    g_mlv_last_raw_uint16_lj92_scan_component_count = 0;
+    g_mlv_last_raw_uint16_lj92_write_length = 0;
+    g_mlv_last_raw_uint16_lj92_expected_write_length = 0;
+    g_mlv_last_raw_uint16_lj92_skip_length = 0;
+    g_mlv_last_raw_uint16_lj92_linearize_active = 0;
+    g_mlv_last_raw_uint16_lj92_component_count = 0;
+    g_mlv_last_raw_uint16_lj92_predictor = -1;
+    g_mlv_last_raw_uint16_lj92_precision = 0;
+    g_mlv_last_raw_uint16_lj92_max_ssss = -1;
+}
+
 /* Unpack or decompress original raw data */
 static int getMlvRawFrameUint16Direct(mlvObject_t * video, uint64_t frameIndex, uint16_t * unpackedFrame)
 {
@@ -3720,6 +3742,43 @@ static int getMlvRawFrameUint16Direct(mlvObject_t * video, uint64_t frameIndex, 
     size_t raw_frame_capacity = 0;
 
     mlv_raw_uint16_count_decode_for_testing(frameIndex);
+
+    /* LJ92-PRED1-FAST-PATH-1 r12 (adversary r11 A1): the per-decode telemetry, the lj92 layout included, is reset
+     * FIRST, ahead of the DNG return, the input-capacity refusals and the raw-frame malloc return, so a decode that
+     * fails early reports the reset sentinels and never the previous frame's layout (a layout is valid only for the
+     * decode that produced it). */
+    g_mlv_last_raw_uint16_disk_read_ms = 0.0;
+    g_mlv_last_raw_uint16_decompress_ms = 0.0;
+    g_mlv_last_raw_uint16_decompress_prepare_ms = 0.0;
+    g_mlv_last_raw_uint16_decompress_execute_ms = 0.0;
+    g_mlv_last_raw_uint16_lj92_pred6_split_active = 0;
+    g_mlv_last_raw_uint16_lj92_pred6_split_requested = 0;
+    g_mlv_last_raw_uint16_lj92_generic_split_active = 0;
+    g_mlv_last_raw_uint16_lj92_generic_split_requested = 0;
+    g_mlv_last_raw_uint16_lj92_pred1_fast_path_active = 0;
+    g_mlv_last_raw_uint16_lj92_pred1_fast_path_measurement_requested = 0;
+    g_mlv_last_raw_uint16_lj92_pred1_fast_path_measurement_active = 0;
+    g_mlv_last_raw_uint16_lj92_pred1_fast_path_eligible = 0;
+    g_mlv_last_raw_uint16_lj92_scan_component_count = 0;
+    g_mlv_last_raw_uint16_lj92_write_length = 0;
+    g_mlv_last_raw_uint16_lj92_expected_write_length = 0;
+    g_mlv_last_raw_uint16_lj92_skip_length = 0;
+    g_mlv_last_raw_uint16_lj92_linearize_active = 0;
+    g_mlv_last_raw_uint16_lj92_component_count = 0;
+    g_mlv_last_raw_uint16_lj92_predictor = -1;
+    g_mlv_last_raw_uint16_lj92_precision = 0;
+    g_mlv_last_raw_uint16_lj92_max_ssss = -1;
+    g_mlv_last_raw_uint16_lj92_pred6_total_ms = 0.0;
+    g_mlv_last_raw_uint16_lj92_pred6_bitstream_ms = 0.0;
+    g_mlv_last_raw_uint16_lj92_pred6_predictor_ms = 0.0;
+    g_mlv_last_raw_uint16_lj92_generic_total_ms = 0.0;
+    g_mlv_last_raw_uint16_lj92_generic_bitstream_ms = 0.0;
+    g_mlv_last_raw_uint16_lj92_generic_predictor_ms = 0.0;
+    g_mlv_last_raw_uint16_lj92_pred1_fast_path_total_ms = 0.0;
+    g_mlv_last_raw_uint16_lj92_pred1_fast_path_bitstream_ms = 0.0;
+    g_mlv_last_raw_uint16_lj92_pred1_fast_path_predictor_ms = 0.0;
+    g_mlv_last_raw_uint16_unpack_ms = 0.0;
+    g_mlv_last_raw_uint16_copy_ms = 0.0;
 
     /* CinemaDNG folder source: there is no MLV/mcraw file[chunk] container.
      * Each frame is its own .dng file. Decode the requested frame's bayer
@@ -3791,37 +3850,6 @@ static int getMlvRawFrameUint16Direct(mlvObject_t * video, uint64_t frameIndex, 
      * every read is bounded by the retained allocation capacity. */
     uint8_t * raw_frame = (uint8_t *)malloc(raw_frame_capacity);
     if(!raw_frame) return 1;
-
-    g_mlv_last_raw_uint16_disk_read_ms = 0.0;
-    g_mlv_last_raw_uint16_decompress_ms = 0.0;
-    g_mlv_last_raw_uint16_decompress_prepare_ms = 0.0;
-    g_mlv_last_raw_uint16_decompress_execute_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred6_split_active = 0;
-    g_mlv_last_raw_uint16_lj92_pred6_split_requested = 0;
-    g_mlv_last_raw_uint16_lj92_generic_split_active = 0;
-    g_mlv_last_raw_uint16_lj92_generic_split_requested = 0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_active = 0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_measurement_requested = 0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_measurement_active = 0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_eligible = 0;
-    g_mlv_last_raw_uint16_lj92_scan_component_count = 0;
-    g_mlv_last_raw_uint16_lj92_write_length = 0;
-    g_mlv_last_raw_uint16_lj92_expected_write_length = 0;
-    g_mlv_last_raw_uint16_lj92_skip_length = 0;
-    g_mlv_last_raw_uint16_lj92_linearize_active = 0;
-    g_mlv_last_raw_uint16_lj92_component_count = 0;
-    g_mlv_last_raw_uint16_lj92_predictor = -1;
-    g_mlv_last_raw_uint16_lj92_pred6_total_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred6_bitstream_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred6_predictor_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_generic_total_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_generic_bitstream_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_generic_predictor_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_total_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_bitstream_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_predictor_ms = 0.0;
-    g_mlv_last_raw_uint16_unpack_ms = 0.0;
-    g_mlv_last_raw_uint16_copy_ms = 0.0;
 
     FILE * file = video->file[chunk];
 
@@ -4047,6 +4075,9 @@ static int getMlvRawFrameUint16Direct(mlvObject_t * video, uint64_t frameIndex, 
                     lj92_get_last_component_count();
                 g_mlv_last_raw_uint16_lj92_predictor =
                     lj92_get_last_predictor();
+                g_mlv_last_raw_uint16_lj92_precision = bitdepth; /* SOF3 precision, checked equal to the RAWI depth above */
+                g_mlv_last_raw_uint16_lj92_max_ssss =
+                    lj92_get_last_huff_max_ssss();
                 g_mlv_last_raw_uint16_lj92_pred6_total_ms =
                     lj92_get_last_pred6_total_ms();
                 g_mlv_last_raw_uint16_lj92_pred6_bitstream_ms =
@@ -4068,6 +4099,7 @@ static int getMlvRawFrameUint16Direct(mlvObject_t * video, uint64_t frameIndex, 
                 if(ret != LJ92_ERROR_NONE)
                 {
                     DEBUG( printf("LJ92 decoder: Failed with error code (%d)\n", ret); )
+                    mlv_reset_last_raw_uint16_lj92_layout();
                     free(raw_frame);
                     return 1;
                 }
@@ -4581,6 +4613,8 @@ int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * un
         g_mlv_last_raw_uint16_lj92_linearize_active = 0;
         g_mlv_last_raw_uint16_lj92_component_count = 0;
         g_mlv_last_raw_uint16_lj92_predictor = -1;
+        g_mlv_last_raw_uint16_lj92_precision = 0;
+        g_mlv_last_raw_uint16_lj92_max_ssss = -1;
         g_mlv_last_raw_uint16_lj92_pred6_total_ms = 0.0;
         g_mlv_last_raw_uint16_lj92_pred6_bitstream_ms = 0.0;
         g_mlv_last_raw_uint16_lj92_pred6_predictor_ms = 0.0;
@@ -9565,6 +9599,16 @@ int getMlvLastRawUint16Lj92ComponentCount(void)
 int getMlvLastRawUint16Lj92Predictor(void)
 {
     return g_mlv_last_raw_uint16_lj92_predictor;
+}
+
+int getMlvLastRawUint16Lj92Precision(void)
+{
+    return g_mlv_last_raw_uint16_lj92_precision;
+}
+
+int getMlvLastRawUint16Lj92MaxSsss(void)
+{
+    return g_mlv_last_raw_uint16_lj92_max_ssss;
 }
 
 double getMlvLastRawUint16Lj92Pred6TotalMilliseconds(void)

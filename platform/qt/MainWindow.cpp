@@ -30539,10 +30539,23 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         // whichever thread decoded it (a hit's raw_decompress_ms is 0). Appended to gpu_frame and cpu_frame alike, not
         // positional, so the CUDA texture route carries the per-frame series on its own record.
         const QString rawUint16FrameKeys =
-            QStringLiteral( " raw_uint16_source=%1 raw_uint16_frame_lj92_ms=%2 raw_uint16_inflight_wait_ms=%3" )
+            QStringLiteral( " raw_uint16_source=%1 raw_uint16_frame_lj92_ms=%2 raw_uint16_inflight_wait_ms=%3"
+                            // LJ92-PRED1-FAST-PATH-1 r3: the layout of the frame this thread decoded (-1 / 0 on a
+                            // prefetch hit, which decoded nothing here): predictor, SOF3 precision, largest Huffman SSSS,
+                            // components, scan components, and whether the pred-1 fast path was eligible / taken.
+                            " raw_uint16_lj92_predictor=%4 raw_uint16_lj92_precision=%5 raw_uint16_lj92_max_ssss=%6"
+                            " raw_uint16_lj92_component_count=%7 raw_uint16_lj92_scan_component_count=%8"
+                            " raw_uint16_lj92_pred1_fast_path_eligible=%9 raw_uint16_lj92_pred1_fast_path_active=%10" )
                 .arg( timing.value( QStringLiteral("raw_uint16_source") ).toString( QStringLiteral("none") ) )
                 .arg( telemetryDoubleValue( timing, "raw_uint16_frame_lj92_ms" ), 0, 'f', 3 )
-                .arg( telemetryDoubleValue( timing, "raw_uint16_inflight_wait_ms" ), 0, 'f', 3 );
+                .arg( telemetryDoubleValue( timing, "raw_uint16_inflight_wait_ms" ), 0, 'f', 3 )
+                .arg( timing.value( QStringLiteral("raw_uint16_lj92_predictor") ).toInt( -1 ) )
+                .arg( telemetryIntValue( timing, "raw_uint16_lj92_precision" ) )
+                .arg( timing.value( QStringLiteral("raw_uint16_lj92_max_ssss") ).toInt( -1 ) )
+                .arg( telemetryIntValue( timing, "raw_uint16_lj92_component_count" ) )
+                .arg( telemetryIntValue( timing, "raw_uint16_lj92_scan_component_count" ) )
+                .arg( telemetryBoolValue( timing, "raw_uint16_lj92_pred1_fast_path_eligible" ) ? 1 : 0 )
+                .arg( telemetryBoolValue( timing, "raw_uint16_lj92_pred1_fast_path_active" ) ? 1 : 0 );
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.gpu_frame session=%1 index=%2 status=%3 "
