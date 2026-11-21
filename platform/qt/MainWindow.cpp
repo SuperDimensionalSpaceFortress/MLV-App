@@ -11226,10 +11226,11 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         measuredState = programmaticPlayState( playbackClock.elapsed(), measuredSafetyMs );
         // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1: a frame-pinned capture waits for its presented count (the present path
         // stops Play at exactly N); the timeout, early-end and pace stops are unchanged, and so is an unpinned play.
+        // r3: the wait ends once the timeline is more than kMeasuredPlayMaxFramesInFlight past the admitted window.
         if( playback_frame_range::measuredPlayLoopShouldStop(
                 measuredState, options.exerciseClipLifecycleStress && !stressAttempted,
                 m_playbackSmokeTargetPresentedFrames, m_playbackSmokePresentedFrames,
-                m_playRequiredSourceFrames, ui->actionPlay->isChecked() ) )
+                m_playRequiredSourceFrames, ui->actionPlay->isChecked(), m_sourceAdvance.consumed() ) )
         {
             break;
         }

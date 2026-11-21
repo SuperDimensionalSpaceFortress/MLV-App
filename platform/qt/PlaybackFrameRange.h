@@ -1278,9 +1278,19 @@ inline PlayStopState evaluatePlayStop( int64_t consumed, int64_t required, bool 
 //  - playStillRunning (Play is still checked): presents can still arrive only while Play runs. A Play that already ended
 //    (the cut-out stop, the engine's own end) with the count short is the terminal exit-11 mismatch, not a 55 s wait for a
 //    count that is frozen and then a PLAY_SAFETY_TIMEOUT.
+// r3 (Grok G1(b) on ee8f00bc): a third limit. consumedSourceFrames (m_sourceAdvance.consumed()) is how far the timeline has
+// run. The wait is for the frames that were already IN FLIGHT at the Reached, and the render pipeline cannot hold more than
+// kMeasuredPlayMaxFramesInFlight of them, so the loop waits only while the timeline is fewer than that many source frames
+// past the admitted window (it stops at the observation that sees it that far past). Presents that stall or skip (drops) while Play still runs on a paced timeline end the wait there: the
+// exit-11 mismatch, as before this card, and never a Play that runs on past the window to the safety timeout, or that
+// makes up dropped presents with source frames from outside the pinned window. A timeline that holds at the window (the
+// unpaced isolated hold in playbackHandling) never trips it; that wait is bounded by the SafetyTimeout above.
+// RenderFrameThread::kMaxFrameSlotCount (12) + RenderFrameThread::kRenderRequestQueueDepth (4); both are private there.
+constexpr int64_t kMeasuredPlayMaxFramesInFlight = 16;
 inline bool measuredPlayLoopShouldStop( PlayStopState state, bool stressPending,
                                         int64_t targetPresentedFrames, int64_t presentedFrames,
-                                        int64_t requiredSourceFrames, bool playStillRunning )
+                                        int64_t requiredSourceFrames, bool playStillRunning,
+                                        int64_t consumedSourceFrames )
 {
     switch( state )
     {
@@ -1291,7 +1301,8 @@ inline bool measuredPlayLoopShouldStop( PlayStopState state, bool stressPending,
     case PlayStopState::Reached:
         if( stressPending ) return false;
         return !( targetPresentedFrames > 0 && presentedFrames < targetPresentedFrames
-                  && targetPresentedFrames <= requiredSourceFrames && playStillRunning );
+                  && targetPresentedFrames <= requiredSourceFrames && playStillRunning
+                  && consumedSourceFrames - requiredSourceFrames < kMeasuredPlayMaxFramesInFlight );
     case PlayStopState::Continue:
         break;
     }

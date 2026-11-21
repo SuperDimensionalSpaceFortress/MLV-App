@@ -149,7 +149,8 @@ PINNED_STOP_STATEMENTS = {
         "if( playback_frame_range::measuredPlayLoopShouldStop( measuredState, "
         "options.exerciseClipLifecycleStress && !stressAttempted, "
         "m_playbackSmokeTargetPresentedFrames, m_playbackSmokePresentedFrames, "
-        "m_playRequiredSourceFrames, ui->actionPlay->isChecked() ) ) { break; }",
+        # r3 (Grok G1(b)): and how far the timeline has run, so the wait never runs on past the admitted window.
+        "m_playRequiredSourceFrames, ui->actionPlay->isChecked(), m_sourceAdvance.consumed() ) ) { break; }",
         "if( measuredState != playback_frame_range::PlayStopState::Reached ) { "
         "m_playbackSmokeFullscreenLossLatchArmed = false; programmaticStop( \"gui-smoke-measured-early-end\" );",
         "&& programmaticPlayConsumed() && ( playbackClock.elapsed() >= qMax( 0, options.stressSwitchAtMs ) "
