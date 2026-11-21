@@ -567,6 +567,12 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['prepOmpThreads']) { $gen['PrepOmpThreads'] = [int]$spec.generatorArgs.prepOmpThreads }
         # CUDA-HEADROOM-UTIL-SAMPLER-1: the opt-in GPU/CPU utilisation sampler around the measured launch, for any leg (fail open: it never changes the verdict). Only a JSON true arms it.
         if ($spec.generatorArgs.PSObject.Properties['utilSample'] -and $spec.generatorArgs.utilSample -is [bool] -and $spec.generatorArgs.utilSample) { $gen['UtilSample'] = $true }
+        # BENCH-CLOCKS-POWER-LOG-1: the opt-in per-leg clocks / power / limit-flag sampler around the measured launch (fail open: it never changes the verdict). Only a JSON true arms it; its interval and warm-up mark are read only with it.
+        if ($spec.generatorArgs.PSObject.Properties['clocksPower'] -and $spec.generatorArgs.clocksPower -is [bool] -and $spec.generatorArgs.clocksPower) {
+            $gen['ClocksPower'] = $true
+            if ($spec.generatorArgs.PSObject.Properties['clocksPowerIntervalMs']) { $gen['ClocksPowerIntervalMs'] = [int]$spec.generatorArgs.clocksPowerIntervalMs }
+            if ($spec.generatorArgs.PSObject.Properties['clocksPowerWarmup'] -and $spec.generatorArgs.clocksPowerWarmup -is [bool] -and $spec.generatorArgs.clocksPowerWarmup) { $gen['ClocksPowerWarmup'] = $true }
+        }
         # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on, and the app's playback scope throttle interval, for any leg.
         if ($spec.generatorArgs.PSObject.Properties['scope']) { $gen['Scope'] = [string]$spec.generatorArgs.scope }
         if ($spec.generatorArgs.PSObject.Properties['scopeIntervalMs']) { $gen['ScopeIntervalMs'] = [int]$spec.generatorArgs.scopeIntervalMs }

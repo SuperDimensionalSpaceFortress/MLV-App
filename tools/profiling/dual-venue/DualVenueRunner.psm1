@@ -3216,7 +3216,7 @@ $script:ExportFields = @('format', 'maxFrames', 'receipt', 'receiptSha256', 'dua
 $script:ExportExcludedKeys = @('look', 'displayMode', 'visualCapture', 'visualCaptureOptOutReason', 'acceptedEffectiveScale', 'presentTearingExpectedReason')
 $script:ExportGeneratorArgs = @('cpuQuiescenceThresholdPercent')
 # the generatorArgs members leg-spec.schema.json types boolean (prepConflatedMove: const true); a test pins this list to the schema
-$script:GeneratorArgsBooleanSwitches = @('forceLookAssist', 'corePartitionTelemetry', 'disableLookAssist', 'presentTrace', 'firstPresentCapture', 'warmReuseMissDump', 'unpaced', 'disablePrepPointwiseFast', 'prepConflatedMove', 'utilSample', 'disableReconReleaseDeferred', 'dueWakeDeliveryPost')
+$script:GeneratorArgsBooleanSwitches = @('forceLookAssist', 'corePartitionTelemetry', 'disableLookAssist', 'presentTrace', 'firstPresentCapture', 'warmReuseMissDump', 'unpaced', 'disablePrepPointwiseFast', 'prepConflatedMove', 'utilSample', 'disableReconReleaseDeferred', 'dueWakeDeliveryPost', 'clocksPower', 'clocksPowerWarmup')
 # EXPORT-VENUE-LEG-1: an export leg's typed shape (the schema's export block and its allOf exclusions), and `export` refused on any other leg. Called by
 # Get-DvLegSpecShapeRefusal, so the leg and the lease batch's preflight refuse the same specs before a lease opens. Returns the refusal text, or $null.
 function Get-DvExportShapeRefusal {
@@ -3298,6 +3298,11 @@ function Get-DvLegSpecShapeRefusal {
             if ($null -ne $teamProp -and -not (($teamProp.Value -is [int] -or $teamProp.Value -is [long]) -and $teamProp.Value -ge 1 -and $teamProp.Value -le 16)) {
                 return "generatorArgs.$($teamProp.Name) must be a whole number from 1 to 16 (it is $(ConvertTo-Json -InputObject $teamProp.Value -Compress -Depth 3))"
             }
+        }
+        # BENCH-CLOCKS-POWER-LOG-1: a PRESENT clocksPowerIntervalMs is a whole number from 250 to 5000 (a JSON int, never null or a double), refused before a lease opens
+        $cpIntervalProp = $genArgsProp.Value.PSObject.Properties['clocksPowerIntervalMs']
+        if ($null -ne $cpIntervalProp -and -not (($cpIntervalProp.Value -is [int] -or $cpIntervalProp.Value -is [long]) -and $cpIntervalProp.Value -ge 250 -and $cpIntervalProp.Value -le 5000)) {
+            return "generatorArgs.clocksPowerIntervalMs must be a whole number from 250 to 5000 (it is $(ConvertTo-Json -InputObject $cpIntervalProp.Value -Compress -Depth 3))"
         }
         if (($null -eq $teamProps[0]) -ne ($null -eq $teamProps[1])) {
             return 'generatorArgs.reconOmpThreads and generatorArgs.prepOmpThreads are both set or neither (the team partition names both teams)'

@@ -398,7 +398,8 @@ class ControlContainerShapeTests(RunnerHarness, unittest.TestCase):
 
 
 BOOL_SWITCHES = ("forceLookAssist", "corePartitionTelemetry", "disableLookAssist", "presentTrace", "firstPresentCapture", "warmReuseMissDump", "unpaced",
-                 "disablePrepPointwiseFast", "prepConflatedMove", "utilSample", "disableReconReleaseDeferred", "dueWakeDeliveryPost")   # every generatorArgs member leg-spec.schema.json types as a boolean (prepConflatedMove: const true)
+                 "disablePrepPointwiseFast", "prepConflatedMove", "utilSample", "disableReconReleaseDeferred", "dueWakeDeliveryPost",
+                 "clocksPower", "clocksPowerWarmup")   # every generatorArgs member leg-spec.schema.json types as a boolean (prepConflatedMove: const true)
 
 
 @requires_windows_pwsh
