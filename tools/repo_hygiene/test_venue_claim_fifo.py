@@ -1616,6 +1616,29 @@ $after = $null; if (Test-Path -LiteralPath $cp) { $after = (Get-Content -Literal
         self.assertEqual((r["state"], r["granted"], r["claimExists"], r["ours"], r["pending"]), ("QUEUED", False, True, True, True), f"a claim that could not be given back must be QUEUED with its nonce kept on the ticket: {r}")
         self.assertEqual((r["state2"], r["granted2"], r["claimAfterPoll"], r["pendingAfterPoll"]), ("QUEUED", False, False, ""), f"the next poll did not release the stranded claim: {r}")
 
+    SEAM_T1A7 = """
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d -Phase cooldown -StaleAfterSec 600
+Start-Sleep -Milliseconds 30
+$B = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$job = Start-Job -ArgumentList $B, $d, '@@SEAMMOD@@', '@@MARK@@' -ScriptBlock { param($B, $d, $m, $mark) $env:SEAM_MARK = $mark; Import-Module $m -Force -DisableNameChecking; Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $B }
+$t0 = [DateTime]::UtcNow
+while (-not (Test-Path -LiteralPath '@@MARK@@') -and ([DateTime]::UtcNow - $t0).TotalSeconds -lt 60) { Start-Sleep -Milliseconds 50 }
+$flip = Update-VenueTicket -Ticket $A -Phase 'waiting'
+$r = Receive-Job $job -Wait -AutoRemoveJob
+[pscustomobject]@{ flip = $flip; state = [string]$r.state; granted = [bool]$r.granted; position = [int]$r.position; queueCount = @($r.queue).Count; queueNames = @($r.queue | ForEach-Object { $_.name }) } | ConvertTo-Json -Compress
+"""
+
+    def test_tail1_a7_a_give_back_after_the_callers_own_ticket_was_reaped_answers_position_zero_with_the_census_it_made(self) -> None:
+        # pass 11 A7 (introduced by r8 rule 7): B takes the claim as the head (A is still in cooldown), A flips to waiting while B holds it, and B's own ticket is reaped (the seam removes the file right after the grant,
+        # as A's stale sweep would for a heartbeat B did not make in time). The second census is [A]; B gives the claim back. The queue returned is that census, so B's place in it is 0 (not in it), never the 2 B held in the
+        # first census: the batch and the chain print the place as "<position>/<queue length>", and 2/1 is a place past the end of its own line.
+        mark = self.case / "seam-a7-mark.txt"
+        mod = self.seam_module("    $r = Invoke-VenueClaimAttempt @attemptArgs\n", "    [IO.File]::WriteAllText($env:SEAM_MARK, '1'); Start-Sleep -Milliseconds 2500\n    $r = Invoke-VenueClaimAttempt @attemptArgs\n    if ($r.granted) { Remove-Item -LiteralPath $t.path -Force }\n")
+        r = self.ps(self.SEAM_T1A7.replace("@@SEAMMOD@@", str(mod)).replace("@@MARK@@", str(mark)))
+        self.assertEqual((r["state"], r["granted"], r["queueCount"]), ("QUEUED", False, 1), f"B must give the claim back and be queued behind A (a census of one row): {r}")
+        self.assertEqual(r["position"], 0, f"the place returned is not in the census returned (a place past the end of the line): {r}")
+        self.assertFalse(self.claim_path.exists(), "the claim B gave back is still standing")
+
     LOCK_JOB = """
 Set-Location -LiteralPath '@@CASE@@'
 $job = Start-Job -ArgumentList '@@MOD@@', '@@ABS@@', '@@MARK@@' -ScriptBlock { param($m, $abs, $mark) Import-Module $m -Force -DisableNameChecking; $got = & (Get-Module VenueChain) { param($p) $l = Enter-VenueTicketLock -TicketPath $p -TimeoutMs 400; $ok = ($null -ne $l); Exit-VenueTicketLock $l; $ok } $abs; [IO.File]::WriteAllText($mark, [string]$got) }
