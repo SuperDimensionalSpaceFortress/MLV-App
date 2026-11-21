@@ -3192,7 +3192,9 @@ class LocalCudaProofSummarizerGuardExecutesTests(_ProbeCase):
     script = CUDA_PROOF_SUMMARIZER_SCRIPT
     functions = ["Get-Field", "New-Diagnostic", "Add-Diagnostic"]
 
-    START_MARKER = "$playbackAbCandidateLeg = if ($playbackAbComparisonBasis -eq \"candidateSpeed\")"
+    # BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary pass 5 A3 sibling): the summarizer now assigns the candidate leg inside each branch of the if (a one-element container is not unrolled into the
+    # leg inside it), so the block starts at that comment; the guard that follows is unchanged.
+    START_MARKER = "# r6 (adversary pass 5 A3 sibling): assigned inside each branch"
     END_MARKER = (
         "an fps number measured under provisional or unrecorded host load is not a property "
         "of the build."

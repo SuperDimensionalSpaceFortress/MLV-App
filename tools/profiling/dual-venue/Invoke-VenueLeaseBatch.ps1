@@ -1377,6 +1377,8 @@ function Get-LegSpecTelemetryArm([string]$Path) {
     $spec = $null
     try {
         $r = Read-SpecBytesWithin $Path (Get-SpecReadBoundSec)
+        # r6 (adversary pass 5 A5): a read that got no answer in its bound is a TIMEOUT the caller must see (readTimedOut), not a quiet UNKNOWN the plan goes on from toward a refusal after -DeadlineUtc
+        if ($r.state -ceq 'TIMEOUT') { return [pscustomobject]@{ arm = 'UNKNOWN'; source = 'spec'; reason = 'the spec read for the arm did not answer within the time left before -DeadlineUtc'; readTimedOut = $true } }
         if ($r.state -ceq 'OK') {
             $judged = if ($script:SpecBudgetSha256 -is [hashtable] -and $script:SpecBudgetSha256.ContainsKey($Path)) { [string]$script:SpecBudgetSha256[$Path] } else { '' }
             if ($judged -and ((Get-BytesSha256 ([byte[]]$r.bytes)) -ceq $judged)) { $spec = [Text.Encoding]::UTF8.GetString([byte[]]$r.bytes) | ConvertFrom-Json }
@@ -1614,8 +1616,10 @@ if ($legPlanMode) {
             if ($budgetRefusal[0]) { Stop-PlanRefused $budgetRefusal[0] $n $budgetRefusal[1] }
             $judgedConflict = Get-SpecPathJudgedConflict $specJudgedOnce $path   # r6 (adversary A7): one judged digest per spec path
             if ($judgedConflict) { Stop-PlanRefused 'SPEC_CHANGED_BETWEEN_PLAN_ITEMS' $n $judgedConflict }
+            $armRead = Get-LegSpecTelemetryArm $path
+            if ($armRead.readTimedOut) { Stop-PlanRefused 'SPEC_READ_TIMEOUT' $n "'$path' cannot be run: the leg spec could not be read for its telemetry arm within the time left before -DeadlineUtc; no claim or lease is taken on it" }   # r6 (adversary pass 5 A5)
             $items.Add([pscustomobject]@{ item = $n; legId = (Get-LegSpecId $path); spec = $path; backend = $be.ToLowerInvariant(); arm = $arm; sourceCommit = $sc.ToLowerInvariant(); buildManifestSha256 = $ms.ToLowerInvariant()
-                    telemetryArm = (Get-LegSpecTelemetryArm $path).arm })
+                    telemetryArm = $armRead.arm })
         }
         # BENCH-LIGHT-ARM-GAIN-GATES-1 (hub ruling 2026-11-20T05:25:54Z item 2): a plan may declare `purpose`. 'fps-ab' = its legs are compared on presented fps, so every leg must run the LIGHT
         # telemetry arm (a HEAVY leg's fps measures the per-frame logger; a spec that names no arm is UNKNOWN and refused alike). 'stage-attribution' = stage metrics only: HEAVY allowed. No

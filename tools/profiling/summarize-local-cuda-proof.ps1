@@ -650,10 +650,11 @@ else {
     # host load at all. Check the relevant legs' hostLoadProvisional independently, defaulting a
     # missing/absent property to provisional (fail toward provisional, same stance as every other
     # reader in this card).
-    $playbackAbCandidateLeg = if ($playbackAbComparisonBasis -eq "candidateSpeed") {
-        $playbackAb.candidateSpeed
+    # r6 (adversary pass 5 A3 sibling): assigned inside each branch, so a one-element container is not unrolled into the leg inside it
+    if ($playbackAbComparisonBasis -eq "candidateSpeed") {
+        $playbackAbCandidateLeg = $playbackAb.candidateSpeed
     } else {
-        $playbackAb.candidate
+        $playbackAbCandidateLeg = $playbackAb.candidate
     }
     $playbackAbHostLoadLegs = @(
         [pscustomobject]@{ Name = "baseline"; Leg = $playbackAb.baseline },

@@ -206,7 +206,10 @@ function Get-FpsRecordContradiction {
     }
     $ga = Get-FaProp $Record 'generatorArgs'
     if ($null -ne $ga -and $ga -isnot [string] -and $ga -isnot [System.ValueType] -and (Test-FaHasProp $ga 'telemetryArm')) {
-        $embedded = ConvertTo-FpsArmName (Get-FaProp $ga 'telemetryArm')
+        # r6 (adversary pass 5 A4): the embedded value is a SPEC word (the spec reader accepts only the text LIGHT / HEAVY): an arm object ({"arm":"LIGHT"}) or a list is not it, whatever
+        # ConvertTo-FpsArmName would read out of it
+        $embeddedRaw = Get-FaProp $ga 'telemetryArm'
+        $embedded = $(if ($embeddedRaw -is [string]) { ConvertTo-FpsArmName $embeddedRaw } else { 'UNKNOWN' })
         if (-not (Test-FaTextEq $embedded 'LIGHT')) { return "the record's generatorArgs.telemetryArm reads $embedded" }
     }
     $null
@@ -330,7 +333,8 @@ function Get-FpsArmFromJobResult {
     # r6 (adversary A13): it carries the spec itself, not a bare switch, so the override cannot be claimed with no spec behind it: a bare switch is a binding error, and a null, a scalar or a
     # boolean is no spec (the result's LIGHT word is then UNKNOWN as without the override).
     param([AllowNull()]$Result, [AllowNull()]$ObserversFromSpec)
-    $specGiven = ($null -ne $ObserversFromSpec -and $ObserversFromSpec -isnot [string] -and $ObserversFromSpec -isnot [System.ValueType])
+    # r6 (adversary pass 5 A6): and the spec must itself read LIGHT (an empty list, an empty object or a HEAVY spec corroborates nothing)
+    $specGiven = ($null -ne $ObserversFromSpec -and $ObserversFromSpec -isnot [string] -and $ObserversFromSpec -isnot [System.ValueType] -and (Get-FpsArmFromLegSpec $ObserversFromSpec).arm -ceq 'LIGHT')
     if ($null -eq $Result -or $Result -is [string] -or $Result -is [System.ValueType]) { return New-FpsArm 'UNKNOWN' 'result' 'no-result' }
     $arm = Get-FaProp $Result 'telemetryArm'
     if ($null -eq $arm) { return New-FpsArm 'UNKNOWN' 'result' 'result-carries-no-telemetryArm' }
@@ -454,6 +458,8 @@ function Get-FpsArmFromEnvironment {
     # The app turns the stage logger on from its own command line too (--stage-log=<file>, main.cpp): a launch that passed it ran per-frame stage timing whatever its environment says
     # (adversary A3). Arguments given must all be text; any form of the option (--stage-log, -stage-log, /stage-log, with = or : or a following value) is HEAVY.
     if ($null -ne $Arguments) {
+        # r6 (adversary pass 5 A2 sibling): given arguments must be a list; a scalar is not "no stage-log argument"
+        if ($Arguments -isnot [System.Collections.IList]) { return New-FpsArm 'UNKNOWN' 'environment' 'malformed-arguments (the arguments are not a list)' }
         foreach ($a in @($Arguments)) {
             if ($a -isnot [string]) { return New-FpsArm 'UNKNOWN' 'environment' 'malformed-arguments (an argument is not text)' }
             if ($a -imatch '^(--?|/)stage-log([=:]|$)') { return New-FpsArm 'HEAVY' 'environment' "the launch passed $($a.Split('=')[0]) (the stage logger)" }
@@ -505,7 +511,10 @@ function Get-FpsArmFromLaunch {
     if (-not $hasEnv) { return New-FpsArm 'UNKNOWN' 'environment' 'no-environment-recorded' }
     if (-not $hasArgs) { return New-FpsArm 'UNKNOWN' 'environment' 'no-arguments-recorded (the argument list can carry --stage-log)' }
     $launchArgs = Get-FaProp $Launch 'arguments'
-    Get-FpsArmFromEnvironment -Environment (Get-FaProp $Launch 'environment') -Arguments @($launchArgs)
+    # r6 (adversary pass 5 A2): the recorded argument list must BE a list. `@($launchArgs)` made the JSON string "--playback-smoke" (or " ") a one-element list and a null a list holding one
+    # null, so a scalar was read as an argument list that passed nothing; a scalar, null or any non-list value is not an argument list, so the launch is UNKNOWN.
+    if ($launchArgs -isnot [System.Collections.IList]) { return New-FpsArm 'UNKNOWN' 'environment' 'malformed-arguments (the recorded arguments are not a list)' }
+    Get-FpsArmFromEnvironment -Environment (Get-FaProp $Launch 'environment') -Arguments $launchArgs
 }
 
 function Get-FpsPairVerdict {

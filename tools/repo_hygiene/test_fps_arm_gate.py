@@ -124,6 +124,30 @@ class ArmClassifierTests(_Probe):
         body = "".join(f"Write-Host ('ARM=' + ({e}).arm)\n" for e in exprs)
         return self.ok(body).split()
 
+    def test_a_launch_whose_arguments_are_not_a_list_is_unknown(self) -> None:
+        # BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary pass 5 A2): `@($launchArgs)` turned the JSON string "--playback-smoke" (or " ") into a one-element list, so a launch with a scalar argument
+        # value was LIGHT. The recorded argument list must BE a list (an empty one is a launch that passed nothing); anything else is UNKNOWN, and a list holding --stage-log is still HEAVY.
+        out = self.ok(
+            "$envJson = '\"environment\":{\"MLVAPP_PLAYBACK_SMOKE_TELEMETRY\":\"1\",\"MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG\":\"1\"}'\n"
+            "foreach ($argText in @('[]', '\"--playback-smoke\"', '\" \"', '\"\"', 'null', '7', '[\"--stage-log=x.csv\"]', '[\"--playback-smoke\"]')) {\n"
+            "    $launch = ('{' + $envJson + ',\"arguments\":' + $argText + '}') | ConvertFrom-Json\n"
+            "    Write-Host ('ARGS=' + $argText + ' ARM=' + (Get-FpsArmFromLaunch $launch).arm)\n"
+            "}\n")
+        got = dict(line.split(" ARM=") for line in out.strip().splitlines())
+        self.assertEqual(got, {"ARGS=[]": "LIGHT", 'ARGS="--playback-smoke"': "UNKNOWN", 'ARGS=" "': "UNKNOWN", 'ARGS=""': "UNKNOWN", "ARGS=null": "UNKNOWN", "ARGS=7": "UNKNOWN",
+                               'ARGS=["--stage-log=x.csv"]': "HEAVY", 'ARGS=["--playback-smoke"]': "LIGHT"})
+
+    def test_an_embedded_generator_args_arm_must_be_the_scalar_light(self) -> None:
+        # BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary pass 5 A4): generatorArgs.telemetryArm embedded in a record was read through the arm-object-tolerant ConvertTo-FpsArmName, so
+        # {"arm":"LIGHT"} there passed both record readers while the spec reader refuses it. The embedded value is a spec word: exactly the string LIGHT, nothing else.
+        out = self.ok(
+            "foreach ($embedded in @('\"LIGHT\"', '{\"arm\":\"LIGHT\"}', '[\"LIGHT\"]', '\"light\"')) {\n"
+            "    $rec = ('{\"telemetryArm\":\"LIGHT\",\"observerControls\":{\"utilSample\":false},\"generatorArgs\":{\"telemetryArm\":' + $embedded + '}}') | ConvertFrom-Json\n"
+            "    Write-Host ('E=' + $embedded + ' LEG=' + (Get-FpsArmFromLegRecord $rec).arm + ' RESULT=' + (Get-FpsArmFromJobResult $rec).arm)\n"
+            "}\n")
+        got = {line.split(" LEG=")[0]: line.split(" LEG=")[1] for line in out.strip().splitlines()}
+        self.assertEqual(got, {'E="LIGHT"': "LIGHT RESULT=LIGHT", 'E={"arm":"LIGHT"}': "UNKNOWN RESULT=UNKNOWN", 'E=["LIGHT"]': "UNKNOWN RESULT=UNKNOWN", 'E="light"': "UNKNOWN RESULT=UNKNOWN"})
+
     def test_a_result_only_light_word_is_never_light_through_the_observers_from_spec_override(self) -> None:
         # BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary A13): -ObserversFromSpec was a bare caller-supplied switch, so a result that records no observer list was admitted as LIGHT with no spec at all.
         # The override now carries the spec the caller judged the observers from: a bare switch, a null, a scalar or a boolean (no spec) is refused (a binding error or UNKNOWN), never LIGHT;
@@ -131,9 +155,12 @@ class ArmClassifierTests(_Probe):
         out = self.ok(
             "$r = [pscustomobject]@{ telemetryArm = 'LIGHT' }\n"
             "$spec = [pscustomobject]@{ legType = 'speed'; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' } }\n"
-            "foreach ($case in @('BARE', 'NULL', 'TRUE', 'TEXT', 'SPEC')) {\n"
+            "foreach ($case in @('BARE', 'NULL', 'TRUE', 'TEXT', 'EMPTYLIST', 'EMPTYOBJ', 'HEAVYSPEC', 'SPEC')) {\n"
             "    try {\n"
             "        $a = switch ($case) {\n"
+            "            'EMPTYLIST' { Get-FpsArmFromJobResult $r -ObserversFromSpec @() }\n"
+            "            'EMPTYOBJ' { Get-FpsArmFromJobResult $r -ObserversFromSpec @{} }\n"
+            "            'HEAVYSPEC' { Get-FpsArmFromJobResult $r -ObserversFromSpec ([pscustomobject]@{ legType = 'speed'; generatorArgs = [pscustomobject]@{ telemetryArm = 'HEAVY' } }) }\n"
             "            'BARE' { Get-FpsArmFromJobResult $r -ObserversFromSpec }\n"
             "            'NULL' { Get-FpsArmFromJobResult $r -ObserversFromSpec $null }\n"
             "            'TRUE' { Get-FpsArmFromJobResult $r -ObserversFromSpec $true }\n"
@@ -144,7 +171,7 @@ class ArmClassifierTests(_Probe):
             "    } catch { Write-Host ($case + '=REFUSED') }\n"
             "}\n"
             "Write-Host ('BOTH=' + (Get-FpsArm $spec $r).arm)\n")
-        self.assertEqual(out.split(), ["BARE=REFUSED", "NULL=UNKNOWN", "TRUE=UNKNOWN", "TEXT=UNKNOWN", "SPEC=LIGHT", "BOTH=LIGHT"])
+        self.assertEqual(out.split(), ["BARE=REFUSED", "NULL=UNKNOWN", "TRUE=UNKNOWN", "TEXT=UNKNOWN", "EMPTYLIST=UNKNOWN", "EMPTYOBJ=UNKNOWN", "HEAVYSPEC=UNKNOWN", "SPEC=LIGHT", "BOTH=LIGHT"])
 
     def test_heavy_switch_spec_is_heavy(self) -> None:
         self.assertEqual(self.arm(f"Get-FpsArmFromLegSpec ({SPEC_HEAVY})"), "ARM=HEAVY")
@@ -372,6 +399,41 @@ class LegPlanRuleTests(_Probe):
         self.assertEqual(self.refusal("'fps'", ["LIGHT"])[0], "BAD_PURPOSE")
 
 
+@requires_pwsh
+class GuiSmokeInheritedEnvironmentRecordTests(_Probe):
+    """BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary pass 5 A1): the smoke runner's recorded launch environment must show every MLVAPP_* variable the child inherits."""
+
+    script = PROFILING / "run-release-gui-smoke.ps1"
+    functions = ["Add-InheritedMlvAppEnvironmentRecord"]
+
+    def test_an_inherited_stage_logger_is_recorded_so_a_light_override_does_not_hide_it(self) -> None:
+        # the runner records only the overrides it set; a parent MLVAPP_STAGE_TIMING=1 reached the child unrecorded and the classifier allowed the pair. The inherited value is now recorded
+        # (same value, so what runs is unchanged), the classifier reads it, and a variable the launch clears is not recorded.
+        out = self.ok(
+            "$env:MLVAPP_STAGE_TIMING = '1'\n$env:MLVAPP_SOME_STRANGER = 'x'\n$env:MLVAPP_PLAYBACK_QUALITY_MODE = 'q'\n$env:NOT_MLVAPP_THING = 'y'\n"
+            "$launchEnv = [ordered]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' }\n"
+            "Write-Host ('BEFORE=' + (Get-FpsArmFromEnvironment $launchEnv @()).arm)\n"
+            "Add-InheritedMlvAppEnvironmentRecord -Target $launchEnv -Cleared @('MLVAPP_PLAYBACK_QUALITY_MODE')\n"
+            "Write-Host ('AFTER=' + (Get-FpsArmFromEnvironment $launchEnv @()).arm)\n"
+            "Write-Host ('RECORDED=' + (($launchEnv.Keys | Sort-Object) -join ','))\n"
+            "$o = [ordered]@{ MLVAPP_STAGE_TIMING = '0' }\nAdd-InheritedMlvAppEnvironmentRecord -Target $o -Cleared @()\nWrite-Host ('OVERRIDE_KEPT=' + $o['MLVAPP_STAGE_TIMING'])\n")
+        lines = dict(line.split("=", 1) for line in out.strip().splitlines())
+        self.assertEqual(lines["BEFORE"], "LIGHT")
+        self.assertEqual(lines["AFTER"], "HEAVY")
+        self.assertIn("MLVAPP_STAGE_TIMING", lines["RECORDED"])
+        self.assertIn("MLVAPP_SOME_STRANGER", lines["RECORDED"])
+        self.assertNotIn("MLVAPP_PLAYBACK_QUALITY_MODE", lines["RECORDED"], "a cleared variable never reaches the child")
+        self.assertNotIn("NOT_MLVAPP_THING", lines["RECORDED"])
+        self.assertEqual(lines["OVERRIDE_KEPT"], "0", "an explicit override is never replaced by the inherited value")
+
+    def test_the_runner_records_the_inherited_variables_before_it_reports_or_dry_runs_its_launch(self) -> None:
+        source = (PROFILING / "run-release-gui-smoke.ps1").read_text(encoding="utf-8")
+        call = source.index("Add-InheritedMlvAppEnvironmentRecord -Target $launchEnv -Cleared $clearedEnvironment")
+        self.assertLess(source.index("$clearedEnvironment = @($clearedEnvironment | Select-Object -Unique)"), call)
+        self.assertLess(call, source.index("if ($DryRun) {"))
+        self.assertLess(call, source.index("environment = $launchEnv\n        validationPolicy"))
+
+
 class LeaseBatchPlanCheckerTests(unittest.TestCase):
     """(d), end to end: the real Invoke-VenueLeaseBatch.ps1 -LegPlan refuses a plan that labels HEAVY legs as an fps A/B, before any claim or lease."""
 
@@ -422,6 +484,28 @@ class LeaseBatchPlanCheckerTests(unittest.TestCase):
         r = self.run_plan([self.spec("fx-a", {"telemetryArm": "LIGHT"}), self.spec("fx-b", {"unpaced": True})], "fps-ab")
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("LEG_PLAN_REFUSED reason=FPS_AB_UNKNOWN_ARM item=2 ", r.stderr)
+
+    def test_an_arm_read_that_gets_no_answer_in_its_bound_is_a_typed_timeout_not_a_quiet_unknown(self) -> None:
+        # BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary pass 5 A5): Get-LegSpecTelemetryArm dropped the bounded read's TIMEOUT state, so an arm read that used up the room before -DeadlineUtc was just an
+        # UNKNOWN arm and the plan went on (more reads, staging) toward a refusal after the deadline. The arm now says it timed out, and the plan loop stops at once with the same typed
+        # SPEC_READ_TIMEOUT its sibling reads use.
+        source = LEASE_BATCH_SCRIPT.read_text(encoding="utf-8")
+        m = re.search(r"function Get-LegSpecTelemetryArm\(.*?\n\}\r?\n", source, re.DOTALL)
+        self.assertIsNotNone(m)
+        script = self.tmp / "armtimeout.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n" f"Import-Module '{MODULE}' -Force\n" + m.group(0) +
+            "function Get-SpecReadBoundSec { 5.0 }\n"
+            "function Read-SpecBytesWithin($Path, $Bound) { [pscustomobject]@{ state = $script:State; bytes = $null; error = '' } }\n"
+            "$script:SpecBudgetSha256 = @{}\n"
+            "foreach ($s in @('TIMEOUT', 'FAILED')) { $script:State = $s; $a = Get-LegSpecTelemetryArm 's.json'; Write-Host ($s + '=' + $a.arm + ',timedOut=' + [bool]$a.readTimedOut) }\n",
+            encoding="utf-8")
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, creationflags=_NO_WINDOW)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.split(), ["TIMEOUT=UNKNOWN,timedOut=True", "FAILED=UNKNOWN,timedOut=False"])
+        call = source.index("$armRead = Get-LegSpecTelemetryArm $path")
+        stop = source.index("Stop-PlanRefused 'SPEC_READ_TIMEOUT' $n", call)
+        self.assertLess(stop, source.index("$items.Add(", call), "the typed timeout stops the plan before the item is kept")
 
     def test_the_arm_is_judged_from_the_bytes_the_leg_is_bound_to(self) -> None:
         # adversary A4: Get-LegSpecTelemetryArm must hash its read against the digest the preflight judged (the one -ExpectSpecSha256 binds the leg to). A spec shown as LIGHT to this
@@ -735,6 +819,22 @@ class CompareMachinePerfFpsGateTests(_Probe):
         self.assertEqual(heavy_speed["playback_fps_arm_verdict"], HEAVY_REASON)
         light_speed = self.row(f"[pscustomobject]@{{ {base}candidateSpeed = {leg} }}")
         self.assertEqual(light_speed["playback_fps_delta_pct"], 100.0)
+
+    def test_a_saved_speed_leg_held_in_a_one_element_array_is_unknown_through_the_pair_selection(self) -> None:
+        # BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary pass 5 A3): `$candidateLeg = if (...) { $Record.candidateSpeed }` unrolled a one-element array into the leg inside it, so a malformed
+        # container the direct reader rejects was judged as that LIGHT leg and the machine row published the speed delta. Both leg choices keep the container whole.
+        light = f"[pscustomobject]@{{ telemetryArm = 'LIGHT'; {OBSERVERS_RECORDED_OFF}hostLoadProvisional = $false; hostLoadState = 'quiet' }}"
+        heavy = "[pscustomobject]@{ telemetryArm = 'HEAVY'; hostLoadProvisional = $false; hostLoadState = 'quiet' }"
+        fingerprint = "machineFingerprint = [pscustomobject]@{ schema = 'machine-fingerprint.v1'; hostname = 'H'; cpu = 'x'; gpu = 'y'; os = 'z'; build_sha = 'abc1234' }; "
+        compare = "[pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 20.0; candidate = 30.0; delta = 10.0; deltaPercent = 50.0 } }"
+        base = f"schema = 'mlvapp-cuda-playback-ab.v1'; status = 'success'; {fingerprint}baseline = {light}; candidate = {heavy}; compare = {compare}; speedCompare = {compare}; "
+        wrapped = self.row(f"[pscustomobject]@{{ {base}candidateSpeed = @({light}) }}")
+        self.assertIsNone(wrapped["playback_fps_delta_pct"])
+        self.assertEqual(wrapped["playback_fps_arm_verdict"], UNKNOWN_REASON)
+        plain = self.row(f"[pscustomobject]@{{ {base}candidateSpeed = {light} }}")
+        self.assertEqual(plain["playback_fps_delta_pct"], 50.0, "control: the same leg, not wrapped")
+        out = self.ok(f"$r = [pscustomobject]@{{ {base}candidateSpeed = @({light}) }}\nWrite-Host ('PROV=' + (Get-PlaybackAbHostLoadRefusal -Record $r).candidateProvisional)\n")
+        self.assertIn("PROV=True", out, "the host-load reader judges the same leg: a wrapped container is provisional, never the leg inside it")
 
     def test_a_json_record_whose_arm_is_a_one_element_array_is_refused(self) -> None:
         # adversary A5: parsed JSON, the way compare-machine-perf reads a record

@@ -475,7 +475,9 @@ function Get-PlaybackAbHostLoadRefusal {
 
     # BENCH-LIGHT-ARM-GAIN-GATES-1 (adversary A6, sibling): same leg choice as Get-PlaybackAbFpsArmRefusal below: a record with a speedCompare judges its candidateSpeed leg, and a missing one
     # reads as provisional (Get-PlaybackAbLegHostLoadProvisional treats a null leg as provisional), never as the ordinary candidate.
-    $candidateLeg = if ($Record.speedCompare) { $Record.candidateSpeed } else { $Record.candidate }
+    # r6 (adversary pass 5 A3): the leg is ASSIGNED inside each branch. `$x = if (...) { $Record.candidateSpeed }` unrolls a one-element array into the leg inside it, so a malformed
+    # container the direct readers refuse was judged as that leg; an assignment keeps the container whole.
+    if ($Record.speedCompare) { $candidateLeg = $Record.candidateSpeed } else { $candidateLeg = $Record.candidate }
     $baselineProvisional = Get-PlaybackAbLegHostLoadProvisional -Leg $Record.baseline
     $candidateProvisional = Get-PlaybackAbLegHostLoadProvisional -Leg $candidateLeg
     [pscustomobject]@{
@@ -493,7 +495,8 @@ function Get-PlaybackAbFpsArmRefusal {
 
     # The leg judged is the leg the PUBLISHED compare came from: when the record carries a speedCompare the row / analysis / suggestion read it, so its candidateSpeed leg is judged, and an
     # absent candidateSpeed there is UNKNOWN (a null leg), never a fall-back to the ordinary candidate (adversary A6).
-    $candidateLeg = if ($Record.speedCompare) { $Record.candidateSpeed } else { $Record.candidate }
+    # r6 (adversary pass 5 A3): assigned inside each branch so a one-element container is not unrolled into the leg inside it (see Get-PlaybackAbHostLoadRefusal)
+    if ($Record.speedCompare) { $candidateLeg = $Record.candidateSpeed } else { $candidateLeg = $Record.candidate }
     $verdict = Get-FpsPairVerdict `
         -Baseline (Get-FpsArmFromLegRecord $Record.baseline) `
         -Candidate (Get-FpsArmFromLegRecord $candidateLeg)
