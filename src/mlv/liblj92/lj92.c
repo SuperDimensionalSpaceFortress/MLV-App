@@ -667,6 +667,16 @@ static LJ92_ALWAYS_INLINE int lj92_pred1_nextdiff(const u8* data, int datalen, c
 }
 #endif
 
+/* r11 (adversary A1): the SLOW_HUFF ljp struct has no hufflut / huffbits members, and lj92_pred1_u64_reader_eligible
+ * returns 0 there, so the two parseScanPred1Fast*Impl bodies only ever pass placeholders to the stub above. */
+#ifdef SLOW_HUFF
+#define LJ92_PRED1_HUFFLUT(self) ((const u32*)NULL)
+#define LJ92_PRED1_HUFFBITS(self) 0
+#else
+#define LJ92_PRED1_HUFFLUT(self) ((self)->hufflut)
+#define LJ92_PRED1_HUFFBITS(self) ((self)->huffbits)
+#endif
+
 static int lj92_pred1_u64_reader_eligible(const ljp* self)
 {
 #ifdef SLOW_HUFF
@@ -812,8 +822,8 @@ static LJ92_ALWAYS_INLINE int parseScanPred1FastMeasuredImpl(ljp* self, const in
     u64 acc = 0;
     const u8* const data = self->data;
     const int datalen = self->datalen;
-    const u32* const hufflut = self->hufflut;
-    const int huffbits = self->huffbits;
+    const u32* const hufflut = LJ92_PRED1_HUFFLUT(self);
+    const int huffbits = LJ92_PRED1_HUFFBITS(self);
 
     const int width = self->x;
     const int height = self->y;
@@ -902,8 +912,8 @@ static LJ92_ALWAYS_INLINE int parseScanPred1FastImpl(ljp* self, const int use_u6
     u64 acc = 0;
     const u8* const data = self->data;
     const int datalen = self->datalen;
-    const u32* const hufflut = self->hufflut;
-    const int huffbits = self->huffbits;
+    const u32* const hufflut = LJ92_PRED1_HUFFLUT(self);
+    const int huffbits = LJ92_PRED1_HUFFBITS(self);
     g_lj92_last_pred1_u64_reader_active = use_u64;
 
     const int width = self->x;
