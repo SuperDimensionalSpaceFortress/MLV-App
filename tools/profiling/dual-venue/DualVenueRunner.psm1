@@ -4518,6 +4518,9 @@ $script:ExportEvidenceFiles = @('summary.json', 'batch.log', 'export-profile.jso
 # slack two clocks and rounding can honestly show (5 % + 1 ms); a pair whose parent or child is wholly absent is skipped (a stage the app did not run is permitted).
 $script:ExportStageContainTolerance = 1.05
 $script:ExportStageContainSlackMs = 1.0
+# (EXPORT-CDNG-TOTAL-CONTAINMENT-1, adversary A2: a figure AT the limit is inside it; the binary product 40.00046 * 1.05 + 1 is 43.000482999999996, a hair under the decimal 43.000483, so a comparison
+# adds this far-below-the-precision-of-a-timing epsilon, and no real overrun, which is at least a microsecond in these figures, is hidden by it)
+$script:ExportStageContainEpsilonMs = 1e-9
 # (adversary r11 A1: raw_uint16 is a stage the app may not publish, which skipped both of its child pairs; the transitive pairs hold disk_read and decompress inside debayered_frame whether or not
 # raw_uint16 is present, as the stage tree above nests them)
 $script:ExportRenderedContainment = @(@('raw_uint16', 'debayered_frame'), @('raw_uint16_disk_read', 'raw_uint16'), @('raw_uint16_decompress', 'raw_uint16'), @('llrawproc', 'debayered_frame'),
@@ -4718,14 +4721,14 @@ function Get-DvExportContainmentProblem {
         $parent = $Means[[string]$group[1]]
         if ($present.Count -lt 2 -or $null -eq $parent) { continue }
         $sum = 0.0; foreach ($n in $present) { $sum += [double]$Means[$n] }
-        if ($sum -gt [double]$parent * $script:ExportStageContainTolerance + $script:ExportStageContainSlackMs) {
+        if ($sum -gt [double]$parent * $script:ExportStageContainTolerance + $script:ExportStageContainSlackMs + $script:ExportStageContainEpsilonMs) {
             return "EXPORT_STAGE_CONTAINMENT_MISMATCH: the disjoint stages $($present -join ' + ') total $([math]::Round($sum, 6)) ms (mean) inside $($group[1]) mean $parent ms, so their shares are of work this run's frames do not hold"
         }
     }
     $bad = [System.Collections.Generic.List[string[]]]::new()   # (a list of pairs: a pipeline would unroll a one-pair result into its two names)
     foreach ($pair in $Pairs) {
         $c = $Means[$pair[0]]; $p = $Means[$pair[1]]
-        if ($null -ne $c -and $null -ne $p -and [double]$c -gt [double]$p * $script:ExportStageContainTolerance + $script:ExportStageContainSlackMs) { $bad.Add([string[]]@($pair[0], $pair[1])) }
+        if ($null -ne $c -and $null -ne $p -and [double]$c -gt [double]$p * $script:ExportStageContainTolerance + $script:ExportStageContainSlackMs + $script:ExportStageContainEpsilonMs) { $bad.Add([string[]]@($pair[0], $pair[1])) }
     }
     if ($bad.Count -eq 0) { return $null }
     "EXPORT_STAGE_CONTAINMENT_MISMATCH: $($bad.Count) stage(s) are timed longer than the stage that contains them (first: $($bad[0][0]) mean $($Means[$bad[0][0]]) ms inside $($bad[0][1]) mean $($Means[$bad[0][1]]) ms), so their shares are of work this run's frames do not hold"
@@ -4748,42 +4751,51 @@ function Get-DvExportWallContainmentProblem {
 # worker is the call the bracket wraps (applyLLRawProcObject -> applyLLRawProcObjectWorker, llrawproc.c:5008, :6329); the lock times are not in the sum (llrawproc_other retains them).
 # Per frame, only what holds by NESTING is judged, so one scheduler hiccup cannot void a leg: the bracket is inside producer_frame_ms (the pair the mean check had, now on every frame: a total of
 # 130 ms beside 63 ms of producer work is a mean of 43 ms inside a mean 63 ms and was never seen), and the children are inside the bracket. The inverse (a bracket much longer than its children) is
-# bracket entry/exit time the worker's own clock does not see, so it is judged on the MEANS, where one preempted frame averages out. Same tolerance as every pair (5 % + 1 ms).
+# bracket entry/exit time the worker's own clock does not see, so it is judged as a SYSTEMATIC gap: more than a tenth of the frames (adversary A1: a mean let ONE 2000 ms scheduler pause in the
+# bracket and the producer void a 480-frame run whose children were exact; a pause is a few frames, a forged or mis-wired total is most of them). Same tolerance as every pair (5 % + 1 ms).
+# The worker's own total (llrawproc_total_ms, dng.c:588, adversary A4) is the exact identity, on the worker's one clock, so when a frame carries it, it agrees with the children either way, per frame.
 # A frame that does not carry the total (or, for the sum, every one of the eight figures) is not judged: llrawproc_ms is an optional total and a stage the app did not run is permitted absent.
 $script:ExportCdngLlrawprocTimedChildren = @('llrawproc_dark_frame', 'llrawproc_vertical_stripes', 'llrawproc_focus_pixels', 'llrawproc_bad_pixels', 'llrawproc_pattern_noise', 'llrawproc_dual_iso', 'llrawproc_chroma_smooth')
 
 function Get-DvExportCdngTotalFrameProblems {
     # $Frames: the successful profile frame records. Returns the typed problems (zero to three): EXPORT_STAGE_CONTAINMENT_MISMATCH (the total past producer_frame_ms on some frame) and
-    # EXPORT_STAGE_SUM_MISMATCH (the seven timed children plus llrawproc_other_ms past the total on some frame, or the mean total past the mean of that sum).
+    # EXPORT_STAGE_SUM_MISMATCH (the seven timed children plus llrawproc_other_ms past llrawproc_ms on some frame, llrawproc_ms past that sum on more than a tenth of the frames, or the worker's
+    # llrawproc_total_ms apart from that sum on some frame).
     param($Frames)
-    $past = [System.Collections.Generic.List[string]]::new(); $beyond = [System.Collections.Generic.List[string]]::new()
-    $tol = $script:ExportStageContainTolerance; $slack = $script:ExportStageContainSlackMs
+    $past = [System.Collections.Generic.List[string]]::new(); $beyond = [System.Collections.Generic.List[string]]::new(); $longer = [System.Collections.Generic.List[string]]::new()
+    $worker = [System.Collections.Generic.List[string]]::new()
+    $judged = 0
+    $tol = $script:ExportStageContainTolerance; $limitSlack = $script:ExportStageContainSlackMs + $script:ExportStageContainEpsilonMs
     $timing = { param($frame, $field) $v = Get-DvProp $frame $field; if ($null -ne $frame.PSObject.Properties[$field] -and $null -eq (Get-DvExportTimingProblem $v)) { [double]$v } else { $null } }
-    $totals = [System.Collections.Generic.List[double]]::new(); $sums = [System.Collections.Generic.List[double]]::new()
     foreach ($frame in @($Frames)) {
-        $total = & $timing $frame 'llrawproc_ms'
-        if ($null -eq $total) { continue }
         $at = Get-DvProp $frame 'frame_index'
+        $total = & $timing $frame 'llrawproc_ms'
         $producer = & $timing $frame 'producer_frame_ms'
-        if ($null -ne $producer -and $total -gt $producer * $tol + $slack) {
+        if ($null -ne $total -and $null -ne $producer -and $total -gt $producer * $tol + $limitSlack) {
             $past.Add("frame_index $at llrawproc_ms $(Get-DvExportRound $total) ms inside producer_frame_ms $(Get-DvExportRound $producer) ms")
         }
         $sum = 0.0; $whole = $true   # (a figure that is absent or not a conforming timing leaves the sum underivable on this frame; the record schema types that elsewhere)
         foreach ($n in @($script:ExportCdngLlrawprocTimedChildren) + 'llrawproc_other') { $part = & $timing $frame "${n}_ms"; if ($null -eq $part) { $whole = $false } else { $sum += $part } }
         if (-not $whole) { continue }
-        $totals.Add($total); $sums.Add($sum)
-        if ($sum -gt $total * $tol + $slack) {
+        $workerTotal = & $timing $frame 'llrawproc_total_ms'
+        if ($null -ne $workerTotal -and ($workerTotal -gt $sum * $tol + $limitSlack -or $sum -gt $workerTotal * $tol + $limitSlack)) {
+            $worker.Add("frame_index $at llrawproc_total_ms $(Get-DvExportRound $workerTotal) ms beside the seven timed children and llrawproc_other_ms totalling $(Get-DvExportRound $sum) ms")
+        }
+        if ($null -eq $total) { continue }
+        $judged++
+        if ($sum -gt $total * $tol + $limitSlack) {
             $beyond.Add("frame_index $at the seven timed children and llrawproc_other_ms total $(Get-DvExportRound $sum) ms inside llrawproc_ms $(Get-DvExportRound $total) ms")
+        }
+        if ($total -gt $sum * $tol + $limitSlack) {
+            $longer.Add("frame_index $at llrawproc_ms $(Get-DvExportRound $total) ms beside the seven timed children and llrawproc_other_ms totalling $(Get-DvExportRound $sum) ms")
         }
     }
     if ($past.Count -gt 0) { "EXPORT_STAGE_CONTAINMENT_MISMATCH: $($past.Count) frame(s) time llrawproc_ms longer than the producer_frame_ms that contains it (first: $($past[0])), so the published llrawproc total is of work this run's frames do not hold" }
     if ($beyond.Count -gt 0) { "EXPORT_STAGE_SUM_MISMATCH: $($beyond.Count) frame(s) time the llrawproc children longer than the llrawproc_ms that contains them (first: $($beyond[0])), so the published llrawproc total is not the work its children measured" }
-    elseif ($totals.Count -gt 0) {
-        $meanTotal = ($totals | Measure-Object -Average).Average; $meanSum = ($sums | Measure-Object -Average).Average
-        if ($meanTotal -gt $meanSum * $tol + $slack) {
-            "EXPORT_STAGE_SUM_MISMATCH: the mean llrawproc_ms $(Get-DvExportRound $meanTotal) ms is longer than the mean $(Get-DvExportRound $meanSum) ms of the seven timed children plus llrawproc_other_ms it totals over $($totals.Count) frame(s), so the published llrawproc total is not the work its children measured"
-        }
+    elseif ($longer.Count * 10 -gt $judged) {
+        "EXPORT_STAGE_SUM_MISMATCH: $($longer.Count) of $judged frame(s) publish an llrawproc_ms longer than the seven timed children plus llrawproc_other_ms it totals (first: $($longer[0])), so the published llrawproc total is not the work its children measured"
     }
+    if ($worker.Count -gt 0) { "EXPORT_STAGE_SUM_MISMATCH: $($worker.Count) frame(s) publish a worker llrawproc_total_ms that is not the sum of the llrawproc children it totals (first: $($worker[0])), so the published llrawproc timings are not one measurement" }
 }
 
 function Get-DvExportInt64($Value) {
