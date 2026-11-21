@@ -1379,10 +1379,21 @@ function Get-DvLj92LayoutRowCount {
     param([AllowNull()][AllowEmptyString()][string]$LogText, [AllowNull()][AllowEmptyString()][string]$Session)
     if ([string]::IsNullOrEmpty($LogText) -or [string]::IsNullOrEmpty($Session)) { return $null }
     $rs = $script:DvRecordStart
+    # r12 (adversary pass 1 A1): a COMPLETE layout, not one key. Each layout key appears exactly once, in a lossless-JPEG range (predictor 1-7, precision 2-16,
+    # largest SSSS 0-16, one to four components and scan components); a row with only a predictor, an unsupported predictor or a repeated key does not count.
+    $layoutKeys = [ordered]@{ raw_uint16_lj92_predictor = @(1, 7); raw_uint16_lj92_precision = @(2, 16); raw_uint16_lj92_max_ssss = @(0, 16)
+                              raw_uint16_lj92_component_count = @(1, 4); raw_uint16_lj92_scan_component_count = @(1, 4) }
     $count = 0
     foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
         if ($line -cmatch ($rs + 'playback_smoke\.(?:cpu|gpu)_frame session=(?<s>[0-9]+) ') -and $Matches['s'] -ceq $Session) {
-            if ($line -cmatch ' raw_uint16_lj92_predictor=[0-9]+(?: |$)') { $count++ }
+            $complete = $true
+            foreach ($key in $layoutKeys.Keys) {
+                $found = [regex]::Matches($line, ' ' + $key + '=(?<v>[^ ]*)(?= |$)')
+                $value = 0
+                if ($found.Count -ne 1 -or -not [int]::TryParse($found[0].Groups['v'].Value, [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$value) `
+                    -or $value -lt $layoutKeys[$key][0] -or $value -gt $layoutKeys[$key][1]) { $complete = $false; break }
+            }
+            if ($complete) { $count++ }
         }
     }
     return $count
@@ -3009,6 +3020,8 @@ $script:UmRunSchema = 'mlv-app/dual-venue-um-run/v1'
 # The receipt's playback block fields that must equal what is re-derived from the files (a stored valid / invalidReasons is not one).
 $script:PlaybackComparedFields = @('sourceAdvanced', 'requiredSourceFrames', 'nativeFps', 'paceFps', 'fpsOverride', 'wrapped', 'wrapCount',
     'expectedRunNonce', 'observedRunNonce', 'manifestRunNonce', 'logSha256', 'logShaBound', 'settingsIsolated', 'fixtureRehearsal', 'clipId')
+# LJ92-PRED1-FAST-PATH-1 r12 (adversary pass 1 A5): compared too, but only when the stored block carries it (a receipt written before the field existed names none).
+$script:PlaybackComparedWhenPresentFields = @('lj92LayoutRows')
 
 function Test-DvNumber($Value) {
     ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal] -or $Value -is [single] -or $Value -is [int16] -or $Value -is [byte] -or $Value -is [uint32] -or $Value -is [uint64])
@@ -5520,6 +5533,9 @@ function Test-DvReceiptValid {
         else {
             foreach ($f in $script:PlaybackComparedFields) {
                 if (-not (Test-DvJsonEquivalent (Get-DvProp $stored $f) (Get-DvProp $derived $f))) { $invalid.Add("PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive") }
+            }
+            foreach ($f in $script:PlaybackComparedWhenPresentFields) {
+                if ($null -ne (Get-DvProp $stored $f) -and -not (Test-DvJsonEquivalent (Get-DvProp $stored $f) (Get-DvProp $derived $f))) { $invalid.Add("PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive") }
             }
         }
         foreach ($p in @($derived.invalidReasons)) { if ($null -ne $p -and [string]$p -ne '') { $invalid.Add([string]$p) } }

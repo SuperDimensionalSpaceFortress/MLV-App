@@ -4088,6 +4088,16 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         receipt["playback"]["sourceAdvanced"] = 5000
         self.assertEqual(self.status(receipt, repo, module=mutated)[:2], ("ADVISORY", False))
 
+    def test_a_stored_lj92_layout_row_count_the_log_does_not_re_derive_is_not_valid(self) -> None:
+        """LJ92-PRED1-FAST-PATH-1 r12 (adversary pass 1 A5): the verifier compared every other playback fact but not lj92LayoutRows, so a receipt whose block says
+        2 over a hashed log that re-derives 0 stayed verified. A block that predates the field (names none) stays verified."""
+        repo = self.prod_repo()
+        receipt = self.receipt_for(repo, self.evidence("a5"))
+        self.assertNotIn("lj92LayoutRows", receipt["playback"], "the premise: this factory's block predates the field and stays verified")
+        self.assertAdvisory(receipt, repo)
+        receipt["playback"]["lj92LayoutRows"] = 2   # the factory's log holds no layout row
+        self.assertNotValid(receipt, repo, "PLAYBACK_NOT_FROM_EVIDENCE", "INVALID")
+
     def test_mutation_without_the_outcome_derivation_a_pass_over_failing_criteria_validates(self) -> None:
         mutated = self.mutated_module([("if ($expected -cne $outcome) {", "if ($false) {")])
         repo = self.prod_repo()
@@ -18538,6 +18548,11 @@ class Lj92LayoutLegsRequireLayoutRowsTests(unittest.TestCase):
             "another session's row": [self.layout_row(1, session="4")],
             "a sentinel predictor (the decode failed)": [self.layout_row(1, predictor="-1")],
             "a frame row of the wrong kind": [self.layout_row(1, emitter="frame")],
+            # r12 (adversary pass 1 A1): one complete layout, not one key
+            "a row that names only a predictor": ["playback_smoke.cpu_frame session=3 index=1 raw_uint16_lj92_predictor=1"],
+            "an unsupported predictor": [self.layout_row(1, predictor="8")],
+            "a predictor named twice": [self.layout_row(1) + " raw_uint16_lj92_predictor=-1"],
+            "a signed predictor": [self.layout_row(1, predictor="+1")],
         }
         for name, rows in cases.items():
             for row in self.judge(self.log(rows)):
