@@ -673,7 +673,7 @@ function Get-DescendantProcessIdentities {
     # handed every earlier row to the collector, so those rows survive the catch. The bound is 30 s: far above the measured ~0.1 s, and no longer
     # than the 30 s the lease snapshot probes are given.
     try { Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, CreationDate, ExecutablePath, CommandLine -OperationTimeoutSec 30 -ErrorAction Stop | ForEach-Object { [void]$all.Add($_) } }
-    catch { $snapshotError = [string]$_.Exception.Message }
+    catch { $snapshotError = ([string]$_.Exception.Message) -replace '\s*[\r\n]+\s*', ' ' }   # one physical log line (adversary A10)
     if ($null -ne $snapshotError) {
         $script:LastDescendantWalk = [pscustomobject]@{ ok = $false; partial = ($all.Count -gt 0); rows = $all.Count; why = $snapshotError; rootPid = $ParentProcessId }
         $nowTs = [System.Diagnostics.Stopwatch]::GetTimestamp()
@@ -689,6 +689,15 @@ function Get-DescendantProcessIdentities {
     foreach ($row in $all) {
         try { if ($null -ne $row -and $null -ne $row.ProcessId -and $row.CreationDate) { $createdAt[[int]$row.ProcessId] = ([DateTime]$row.CreationDate).ToUniversalTime() } }
         catch { continue }
+    }
+    # r2 (adversary A3): a snapshot that failed AFTER returning rows but BEFORE the root's own row has no creation time to compare the root's
+    # children with, and a stale edge would pass. The root's start is then read once from its identity; if that cannot be read either, the
+    # root's children cannot be checked for pid reuse and are not walked (the walk is already recorded as partial).
+    $rootUnverified = $false
+    if ($null -ne $snapshotError -and $all.Count -gt 0 -and -not $createdAt.ContainsKey($ParentProcessId)) {
+        $rootIdentity = Get-ProcessIdentity -ProcessId $ParentProcessId
+        if ($rootIdentity.exists -and $rootIdentity.startUtc) { $createdAt[$ParentProcessId] = [DateTimeOffset]::Parse([string]$rootIdentity.startUtc).UtcDateTime }
+        elseif (-not $rootIdentity.exists) { $rootUnverified = $true }   # (a live root with no readable start cannot be compared and is kept, as in a complete snapshot)
     }
 
     # parent pid -> its rows, in the snapshot's order (the order the per-parent query returned them in).
@@ -739,7 +748,7 @@ function Get-DescendantProcessIdentities {
     [void]$visited.Add($ParentProcessId)
     $stack = New-Object 'System.Collections.Generic.Stack[object]'
     $rootKids = $null
-    if ($byParent.TryGetValue($ParentProcessId, [ref]$rootKids)) { $stack.Push(@{ kids = $rootKids; next = 0; self = $null }) }
+    if (-not $rootUnverified -and $byParent.TryGetValue($ParentProcessId, [ref]$rootKids)) { $stack.Push(@{ kids = $rootKids; next = 0; self = $null }) }
     while ($stack.Count -gt 0) {
         $frame = $stack.Peek()
         if ($frame.next -lt $frame.kids.Count) {
@@ -748,7 +757,15 @@ function Get-DescendantProcessIdentities {
             $childProcessId = [int]$child.ProcessId
             # r2 (sol 1, fable H1): created BEFORE the parent row it names = a stale edge (the parent's pid was reused), not a descendant.
             $parentCreated = $null; $childCreated = $null
-            if ($createdAt.TryGetValue([int]$child.ParentProcessId, [ref]$parentCreated) -and $createdAt.TryGetValue($childProcessId, [ref]$childCreated) -and $null -ne $parentCreated -and $null -ne $childCreated -and $childCreated -lt $parentCreated) { continue }
+            if ($createdAt.TryGetValue([int]$child.ParentProcessId, [ref]$parentCreated) -and $createdAt.TryGetValue($childProcessId, [ref]$childCreated) -and $null -ne $parentCreated -and $null -ne $childCreated -and $childCreated -lt $parentCreated) {
+                # Named once per pid (at most 256 pids per agent run): a stale edge persists for as long as the stale process lives. The known limit
+                # (adversary A1): a backward wall-clock step between the parent's and a real child's creation reads the same way, and is skipped too.
+                if ($null -eq $script:DescendantWalkStaleLogged) { $script:DescendantWalkStaleLogged = New-Object 'System.Collections.Generic.HashSet[int]' }
+                if ($script:DescendantWalkStaleLogged.Count -lt 256 -and $script:DescendantWalkStaleLogged.Add($childProcessId)) {
+                    Add-AgentLogLine "descendant-walk: skipped pid=$childProcessId (created $($childCreated.ToString('o')), before its listed parent pid=$($child.ParentProcessId) created $($parentCreated.ToString('o')): a reused parent pid, or a backward clock step)"
+                }
+                continue
+            }
             if (-not $visited.Add($childProcessId)) { continue }
             $grandKids = $null
             if ($byParent.TryGetValue($childProcessId, [ref]$grandKids)) { $stack.Push(@{ kids = $grandKids; next = 0; self = $child }) }
@@ -785,9 +802,10 @@ function Stop-ProcessTree {
     $walkState = $script:LastDescendantWalk
     if ($null -ne $walkState -and $walkState.rootPid -eq $RootProcessId -and -not $walkState.ok) {
         $walkKind = if ($walkState.partial) { "PARTIAL" } else { "FAILED" }
-        $walkScope = if ($walkState.partial) { "only the $($walkState.rows) process rows it returned were searched for descendants" } else { "only the root is stopped" }
-        $script:ProcessTreeWalkNote = "; DESCENDANT WALK $walkKind ($($walkState.why)): $walkScope, descendants it did not list may still be running"
-        Add-AgentLogLine "process-tree stop pid=${RootProcessId}: descendant walk $walkKind why=[$($walkState.why)] rows=$($walkState.rows); $walkScope, descendants it did not list may still be running"
+        # What was TARGETED, never what died: a stop that is then refused (access denied) still reads honestly, and killed= says what ended.
+        $walkScope = if ($walkState.partial) { "only descendants found in the $($walkState.rows) process rows it returned were targeted" } else { "it listed no descendants, so only the root was targeted" }
+        $script:ProcessTreeWalkNote = "; DESCENDANT WALK $walkKind ($($walkState.why)): $walkScope; descendants it did not list may still be running"
+        Add-AgentLogLine "process-tree stop pid=${RootProcessId}: descendant walk $walkKind why=[$($walkState.why)] rows=$($walkState.rows); $walkScope; descendants it did not list may still be running"
     }
     foreach ($expected in $identities) {
         if (-not $expected.exists) { continue }
@@ -1738,7 +1756,7 @@ function Invoke-AdoptStartedJob {
         if ($finalMatch.matches) {
             $timedOut = $true
             $killedProcessIds = @(Stop-ProcessTree -RootProcessId ([int]$Marker.childPid) -RootStartUtc ([string]$Marker.childStartUtc) -RootStartEpochMs $Marker.childStartEpochMs -RootImagePath $Marker.childImagePath)
-            "adopted child timed out after ${adoptedTimeoutSec}s; killed process tree pids=$($killedProcessIds -join ',')" |
+            "adopted child timed out after ${adoptedTimeoutSec}s; killed process tree pids=$($killedProcessIds -join ',')$($script:ProcessTreeWalkNote)" |
                 Add-Content -Encoding ASCII $Marker.errFile
             # STAGE-JOB-LEASE-EXEMPT-HARDENING-1 r2: an adopted stage child killed at a bound that was the exempt ceiling's (the marker's timeoutSec when
             # it was clamped, or the r3 clamp above) is typed as the live path types it. A non-stage or unclamped marker gets no reason.
@@ -3218,8 +3236,10 @@ function Stop-HeavySlotHolder {
     $exited = $p.HasExited
     if (-not $exited -and $acquired) { $exited = $p.WaitForExit(15000) }
     $killed = @()
+    $stopNote = ""   # AGENT-JOB-MONITOR-CIM-WALK-1 r2 (adversary A5): the incomplete-walk note of this call's stop, if any
     if (-not $exited) {
         $killed = @(Stop-ProcessTree -RootProcessId $Holder.pid -RootStartUtc $Holder.identity.startUtc -RootStartEpochMs $Holder.identity.startEpochMs -RootImagePath $Holder.identity.imagePath)
+        $stopNote = [string]$script:ProcessTreeWalkNote
         $exited = $p.WaitForExit(5000)
     }
     $rc = if ($exited) { $p.ExitCode } else { "still-running" }
@@ -3227,7 +3247,7 @@ function Stop-HeavySlotHolder {
     try { $Holder.launch.OutStream.Dispose(); $Holder.launch.ErrStream.Dispose() } catch { }
     $p.Dispose()
     Remove-Item -LiteralPath $Holder.acquiredFile, $Holder.releaseFile, $Holder.recordFile -Force -ErrorAction SilentlyContinue
-    Add-AgentLogLine "heavy-slot-gate: holder ended job=$($Holder.jobId) pid=$($Holder.pid) acquired=$acquired rc=$rc killed=$($killed -join ',') why=[$Why]"
+    Add-AgentLogLine "heavy-slot-gate: holder ended job=$($Holder.jobId) pid=$($Holder.pid) acquired=$acquired rc=$rc killed=$($killed -join ',')$stopNote why=[$Why]"
 }
 
 function Stop-StaleHeavySlotHolders {
@@ -3238,7 +3258,7 @@ function Stop-StaleHeavySlotHolders {
         $r = Read-JsonFile -Path $f.FullName
         if ($null -ne $r -and $r.pid -and $null -ne $r.startEpochMs -and (Get-ProcessIdentity -ProcessId ([int]$r.pid)).exists) {
             $killed = @(Stop-ProcessTree -RootProcessId ([int]$r.pid) -RootStartEpochMs $r.startEpochMs)
-            Add-AgentLogLine "heavy-slot-gate: stale holder id=$($r.id) pid=$($r.pid) from agent pid=$($r.agentPid) stopped=$($killed -join ',')"
+            Add-AgentLogLine "heavy-slot-gate: stale holder id=$($r.id) pid=$($r.pid) from agent pid=$($r.agentPid) stopped=$($killed -join ',')$($script:ProcessTreeWalkNote)"
         }
         Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
     }
@@ -3771,8 +3791,15 @@ function Test-QuietLeaseOwnerPid {
     # interpreter as a child, and heavy-slot.py prints its own os.getpid()). Returns @{ ok; why }.
     param([Parameter(Mandatory = $true)]$Lease, [Parameter(Mandatory = $true)][int]$OwnerPid)
     if ($OwnerPid -eq $Lease.pid) { return [pscustomobject]@{ ok = $true; why = "wrapper pid" } }
-    $kids = @(Get-DescendantProcessIdentities -ParentProcessId $Lease.pid | Where-Object { $_.exists } | ForEach-Object { [int]$_.processId })
-    if ($kids -contains $OwnerPid) { return [pscustomobject]@{ ok = $true; why = "child of wrapper pid $($Lease.pid)" } }
+    $kids = @(Get-DescendantProcessIdentities -ParentProcessId $Lease.pid | Where-Object { $_.exists -and [int]$_.processId -eq $OwnerPid })
+    if ($kids.Count -gt 0) {
+        # AGENT-JOB-MONITOR-CIM-WALK-1 r2 (adversary A2): the walk's identity is a row of one snapshot, which an owner that exited while the snapshot
+        # was read still appears in. This answer is cached by the caller, so the owner itself is read once more (one filtered query, on this
+        # rare path only) before it is called a live child, as the per-child identity reads of the old walk did.
+        $ownerNow = Test-ProcessIdentityMatch -ProcessId $OwnerPid -ExpectedStartUtc $kids[0].startUtc -ExpectedStartEpochMs $kids[0].startEpochMs -ExpectedImagePath $kids[0].imagePath
+        if ($ownerNow.matches) { return [pscustomobject]@{ ok = $true; why = "child of wrapper pid $($Lease.pid)" } }
+        return [pscustomobject]@{ ok = $false; why = "lease active line names pid $OwnerPid, a child of the request wrapper (pid $($Lease.pid)) in the process snapshot that is no longer the same running process ($($ownerNow.reason))" }
+    }
     return [pscustomobject]@{ ok = $false; why = "lease active line names pid $OwnerPid, which is neither the request wrapper (pid $($Lease.pid)) nor its child" }
 }
 
@@ -4117,6 +4144,7 @@ function Stop-QuietLease {
     $p = $Lease.proc
     $releaseRc = "not-needed"
     $killed = @()
+    $stopNote = ""   # AGENT-JOB-MONITOR-CIM-WALK-1 r2 (adversary A5): the incomplete-walk note of this call's stop, if any
     if (-not $p.HasExited) {
         $c = Start-HeavySlotCli -Arguments @("lease", "release", "--label", $Lease.label)
         $r = Complete-HeavySlotCli -Call $c -TimeoutSec 30 -HeartbeatActivity "lease-release job=$($Lease.jobId)"
@@ -4124,6 +4152,7 @@ function Stop-QuietLease {
         $exited = $p.WaitForExit(5000)
         if (-not $exited) {
             $killed = @(Stop-ProcessTree -RootProcessId $Lease.pid -RootStartUtc $Lease.identity.startUtc -RootStartEpochMs $Lease.identity.startEpochMs -RootImagePath $Lease.identity.imagePath)
+            $stopNote = [string]$script:ProcessTreeWalkNote
             $exited = $p.WaitForExit(5000)
         }
     }
@@ -4137,7 +4166,7 @@ function Stop-QuietLease {
     catch { }
     try { $p.Dispose() } catch { }
     Remove-Item -LiteralPath $Lease.recordFile -Force -ErrorAction SilentlyContinue
-    Add-AgentLogLine "quiet-lease: ended job=$($Lease.jobId) pid=$($Lease.pid) active=$($null -ne $Lease.active) rc=$rc releaseRc=$releaseRc killed=$($killed -join ',') renews=$($Lease.renewsOk)/$($Lease.renewStarts) renewFailures=$($Lease.renewFailures) renewSlow=$($Lease.renewSlow) renewMaxGapSec=$($Lease.renewMaxGapSec) why=[$Why]"
+    Add-AgentLogLine "quiet-lease: ended job=$($Lease.jobId) pid=$($Lease.pid) active=$($null -ne $Lease.active) rc=$rc releaseRc=$releaseRc killed=$($killed -join ',')$stopNote renews=$($Lease.renewsOk)/$($Lease.renewStarts) renewFailures=$($Lease.renewFailures) renewSlow=$($Lease.renewSlow) renewMaxGapSec=$($Lease.renewMaxGapSec) why=[$Why]"
     return [pscustomobject]@{ releaseRc = $releaseRc; rc = $rc; killed = @($killed) }
 }
 
@@ -4153,7 +4182,7 @@ function Stop-StaleQuietLeases {
                 $c = Start-HeavySlotCli -Arguments @("lease", "release", "--label", [string]$r.label)
                 $rel = Complete-HeavySlotCli -Call $c -TimeoutSec 30 -HeartbeatActivity "stale-lease-release"
                 $killed = @(Stop-ProcessTree -RootProcessId ([int]$r.pid) -RootStartEpochMs $r.startEpochMs)
-                Add-AgentLogLine "quiet-lease: stale lease id=$($r.id) pid=$($r.pid) from agent pid=$($r.agentPid) releaseRc=$($rel.rc) stopped=$($killed -join ',')"
+                Add-AgentLogLine "quiet-lease: stale lease id=$($r.id) pid=$($r.pid) from agent pid=$($r.agentPid) releaseRc=$($rel.rc) stopped=$($killed -join ',')$($script:ProcessTreeWalkNote)"
             }
         }
         Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
