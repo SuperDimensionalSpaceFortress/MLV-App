@@ -1309,6 +1309,29 @@ inline bool measuredPlayLoopShouldStop( PlayStopState state, bool stressPending,
     return false;
 }
 
+// r3 fix 2 (adversary A1 on 38c05d4b): counts cannot tell a frame still in flight from one the engine DROPPED (drop-frame mode
+// stepping 99 -> 101 counts 100 as consumed but never presents it). With one drop inside the window the count is one short at
+// the Reached, the wait above lets the timeline run on, and the first source frame PAST the window completes the count: the
+// present-path stop then fires (presented >= target, consumed) and the strict check would pass a capture holding a frame from
+// outside the pinned window. So the pinned count is met only when the frame that completed it is a WINDOW frame.
+// admittedWindowLastFrame: the last source frame of the admitted window, on the counter's own frame scale (the slider's, the
+// same scale as the present path's displayFrame). Once consumed() >= required it is where the required-th distinct frame was
+// reached (highWater less the frames consumed since); before that it is where the window would end. Unarmed: no window known
+// (the maximum, so only the count decides, as before this card).
+inline int64_t admittedWindowLastFrame( const SourceFrameAdvanceCounter &advance, int64_t requiredSourceFrames )
+{
+    if( !advance.armed ) return std::numeric_limits<int64_t>::max();
+    return advance.highWater - ( advance.consumed() - requiredSourceFrames );
+}
+// The frame that completed a pinned count (the last one presented) lies inside the admitted window. target <= 0 (an unpinned
+// play) has no pinned count, so it is always true; a pinned run that presented nothing has no completing frame to judge (the
+// count check, which runs first, already fails it).
+inline bool pinnedCountCompletedInsideWindow( int64_t targetPresentedFrames, int64_t lastPresentedFrame, int64_t windowLastFrame )
+{
+    if( targetPresentedFrames <= 0 || lastPresentedFrame < 0 ) return true;
+    return lastPresentedFrame <= windowLastFrame;
+}
+
 inline const char *playStopFailureReason( PlayStopState state )
 {
     switch( state )
