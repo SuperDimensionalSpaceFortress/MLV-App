@@ -1075,6 +1075,18 @@ class VenueLeaseBatchFifoTests(unittest.TestCase):
         self.assertEqual(list(self.ticket_dir.glob("*.ticket.json")) if self.ticket_dir.exists() else [], [], "a ticket was left behind")
         self.assertIn("TICKET_TAKEN", self.batch_log(pa))
 
+    def test_tail1_a6_an_explicit_no_ticket_batch_leaves_no_ticket_whatever_the_callers_ambient_defaults_are(self) -> None:
+        # pass 11 A6: -NoTicket omitted -UseTicket from Request-VenueClaim instead of binding it to false, so a caller that sets $PSDefaultParameterValues['Request-VenueClaim:UseTicket'] = $true (a profile, a wrapper)
+        # gave the opt-out batch a ticket that nothing closed (TicketOn is false, so the ordinary close skips it). The wrapper sets that default and runs the real batch with -NoTicket against a free claim.
+        wrapper = self.case / "wrap-ambient-default.ps1"
+        wrapper.write_text("$PSDefaultParameterValues['Request-VenueClaim:UseTicket'] = $true\n& '" + str(LEASE_RUNNER) + "' @args\nexit $LASTEXITCODE\n", encoding="utf-8")
+        p = self.start_batch("N", claim_poll=1, runner=wrapper, extra=("-NoTicket",))
+        p.wait(timeout=180)
+        out = Path(p.out_path).read_text(encoding="utf-8", errors="replace")   # type: ignore[attr-defined]
+        self.assertEqual(p.returncode, 0, out)
+        self.assertEqual(list(self.ticket_dir.glob("*.ticket.json")) if self.ticket_dir.exists() else [], [], f"an opt-out batch left a ticket behind:\n{self.batch_log(p)}")
+        self.assertNotIn("TICKET_TAKEN", self.batch_log(p), "an opt-out batch took a ticket")
+
     READY_FIRST = """
 $A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d -Phase cooldown -StaleAfterSec 600
 Start-Sleep -Milliseconds 30
