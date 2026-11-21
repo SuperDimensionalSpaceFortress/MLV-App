@@ -1597,16 +1597,24 @@ Start-Sleep -Milliseconds 9000
 $hold.Dispose()
 $r = Receive-Job $job -Wait -AutoRemoveJob
 $claim = $null; if (Test-Path -LiteralPath $cp) { $claim = (Get-Content -LiteralPath $cp -Raw | ConvertFrom-Json).nonce }
-[pscustomobject]@{ flip = $flip; state = [string]$r.state; granted = [bool]$r.granted; claimExists = [bool]$claim; ours = ($claim -and $r.claim -and $claim -ceq $r.claim.nonce) } | ConvertTo-Json -Compress
+$pending = [string]$r.ticket.pendingReleaseNonce
+# A13: the next poll (made with the ticket the first answer returned) lets go of the stranded claim before anything else
+$r2 = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $r.ticket
+$after = $null; if (Test-Path -LiteralPath $cp) { $after = (Get-Content -LiteralPath $cp -Raw | ConvertFrom-Json).nonce }
+[pscustomobject]@{ flip = $flip; state = [string]$r.state; granted = [bool]$r.granted; claimExists = [bool]$claim; ours = [bool]($claim -and $pending -and $claim -ceq $pending); pending = [bool]$pending
+  state2 = [string]$r2.state; granted2 = [bool]$r2.granted; claimAfterPoll = [bool]$after; pendingAfterPoll = [string]$r2.ticket.pendingReleaseNonce } | ConvertTo-Json -Compress
 """
 
-    def test_a_grant_that_cannot_be_given_back_is_kept_not_leaked_as_a_queued_answer(self) -> None:
+    def test_a_grant_that_cannot_be_given_back_is_queued_with_its_nonce_on_the_ticket_and_the_next_poll_releases_it(self) -> None:
         # r7 pass 1 A3 (blocker): the give-back's answer was discarded, so a reader of the claim file that refused the release left the claim naming B while B was told QUEUED (and nobody owned its nonce).
         mark = self.case / "seam-a3b-mark.txt"
         # the seam keeps the claim standing for 1.5 s after its creation (so the observer reliably opens it) and the observer holds it for 9 s, longer than every give-back attempt together
         mod = self.seam_module("    $r = Invoke-VenueClaimAttempt @attemptArgs\n", "    [IO.File]::WriteAllText($env:SEAM_MARK, '1'); Start-Sleep -Milliseconds 2500\n    $r = Invoke-VenueClaimAttempt @attemptArgs\n    if ($r.granted) { Start-Sleep -Milliseconds 1500 }\n")
         r = self.ps(self.SEAM_A3B.replace("@@SEAMMOD@@", str(mod)).replace("@@MARK@@", str(mark)))
-        self.assertEqual((r["state"], r["granted"], r["ours"]), ("TAKEN", True, True), f"a claim that could not be given back was not handed over (a QUEUED answer while the claim still names this owner leaks it): {r}")
+        # TAIL-1 A13 (= #878 sol r10 B1), replaces r7 pass 1 A3's contract (TAKEN after five BUSY give-backs): the caller is not handed a claim it was owed to an older ticket. The answer is QUEUED, the claim that could
+        # not be given back is still standing and named by the ticket (pendingReleaseNonce, so it is not leaked), and the NEXT poll lets go of it before anything else.
+        self.assertEqual((r["state"], r["granted"], r["claimExists"], r["ours"], r["pending"]), ("QUEUED", False, True, True, True), f"a claim that could not be given back must be QUEUED with its nonce kept on the ticket: {r}")
+        self.assertEqual((r["state2"], r["granted2"], r["claimAfterPoll"], r["pendingAfterPoll"]), ("QUEUED", False, False, ""), f"the next poll did not release the stranded claim: {r}")
 
     LOCK_JOB = """
 Set-Location -LiteralPath '@@CASE@@'
@@ -1880,7 +1888,9 @@ $hold.Dispose()
         script = self.SEAM_A3B.replace("@@SEAMMOD@@", str(mod)).replace("@@MARK@@", str(mark)).replace("[IO.FileAccess]::Read, [IO.FileShare]::Read", "[IO.FileAccess]::Read, [IO.FileShare]::None")
         self.assertIn("[IO.FileShare]::None", script.split("$cp = ")[1], "the scenario's observer must hold the claim file with no share")
         r = self.ps(script)
-        self.assertEqual((r["state"], r["granted"], r["ours"]), ("TAKEN", True, True), f"a BUSY ownership read was counted as the claim's loss: {r}")
+        # TAIL-1 A13: the same five BUSY give-backs now end QUEUED too (see the test above); what r8 rule 3 pins stays: a BUSY ownership read is not the claim's LOSS, so the nonce is still kept on the ticket and the next poll releases it
+        self.assertEqual((r["state"], r["granted"], r["ours"], r["pending"]), ("QUEUED", False, True, True), f"a BUSY ownership read was counted as the claim's loss (the nonce was not kept on the ticket): {r}")
+        self.assertEqual((r["granted2"], r["claimAfterPoll"]), (False, False), f"the next poll did not release the stranded claim: {r}")
 
     def test_r8_rule4_the_claim_age_is_read_from_the_claims_own_claimedutc(self) -> None:
         # r8 rule 4 (r7 pass 3 A5): the lease batch measured the renewal margin from AFTER Request-VenueClaim returned, so a long census inside the request ate the margin unseen.
