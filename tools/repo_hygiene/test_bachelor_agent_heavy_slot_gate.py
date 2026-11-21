@@ -341,7 +341,10 @@ def _kill_tree(proc: subprocess.Popen) -> str:
         problems.append(f"the root process was still running {ROOT_REAP_SEC} s after the kill")
     except Exception as exc:
         problems.append(f"waiting for the root process failed: {_exc_type_name(exc)}")
-    return "its process tree was killed" if not problems else f"its process tree kill is NOT confirmed ({'; '.join(problems)})"
+    # adversary r8 A2: on POSIX only the driver's own group was signalled (a setsid'ed capture worker is in a group of its own), so the verdict
+    # claims the GROUP there and the whole TREE only where taskkill /T walked it.
+    scope = "process group" if _IS_POSIX else "process tree"
+    return f"its {scope} was killed" if not problems else f"its {scope} kill is NOT confirmed ({'; '.join(problems)})"
 
 
 def run_bounded(argv: list[str], timeout: float, case: str, env: dict[str, str] | None = None) -> tuple[int, str, str]:
@@ -879,6 +882,21 @@ class BachelorAgentHeavySlotGateUnit(unittest.TestCase):
         self.assertLessEqual(unit["heartbeat"]["capped"], 64)
 
 
+def _windows_kill_path() -> "mock._patch":
+    """adversary r8 A1: a fixture that fakes `taskkill` models the Windows kill path, so it forces that branch of _kill_tree on every host."""
+    return mock.patch.object(sys.modules[__name__], "_IS_POSIX", False)
+
+
+class _WindowsKillPath:
+    """Mixin for a fixture class whose every test fakes `taskkill`: the Windows kill branch is forced for each test (adversary r8 A1)."""
+
+    def setUp(self) -> None:
+        super().setUp()  # type: ignore[misc]
+        patcher = _windows_kill_path()
+        patcher.start()
+        self.addCleanup(patcher.stop)  # type: ignore[attr-defined]
+
+
 class PosixGroupKillTests(unittest.TestCase):
     """sol r4 B2, narrowed r7: on POSIX run_bounded starts its child in a session of its own and a timeout sends ONE SIGKILL to that group.
 
@@ -922,15 +940,42 @@ class PosixGroupKillTests(unittest.TestCase):
         killpg.assert_called_once_with(424242, sys.modules[__name__]._SIGKILL)
         self.assertTrue(root.killed, "the driver itself is still killed and reaped after the group")
         self.assertIn("posix-group-case exceeded its 1 s wall-clock bound", message)
-        self.assertIn("its process tree was killed", message)
+        # adversary r8 A2: only the driver's group was signalled, so the verdict says GROUP, never "tree" (a setsid'ed worker is in a group of its own)
+        self.assertIn("its process group was killed", message)
+        self.assertNotIn("process tree was killed", message)
 
     def test_r7_b2_a_group_that_is_already_gone_is_no_problem_and_a_failed_kill_is_named_not_confirmed(self) -> None:
         _, _, gone = self._timed_out_run(mock.Mock(side_effect=ProcessLookupError(3, "no such process")))
-        self.assertIn("its process tree was killed", gone)
+        self.assertIn("its process group was killed", gone)
         _, _, denied = self._timed_out_run(mock.Mock(side_effect=PermissionError(1, "not permitted")))
         self.assertIn("process group kill failed: PermissionError", denied)
-        self.assertIn("NOT confirmed", denied)
+        self.assertIn("its process group kill is NOT confirmed", denied)
         self.assertIn("posix-group-case exceeded its 1 s wall-clock bound", denied)
+
+
+class WindowsPathFixturesOnAPosixHostTests(unittest.TestCase):
+    """adversary r8 A1: the fixtures that fake `taskkill` model the WINDOWS kill path. On a POSIX host (hosted ubuntu) `_kill_tree` took the group-kill
+    branch for them instead: the fake taskkill was never started, the expected "NOT confirmed" verdicts never appeared, and a fixture's fake pid
+    (4242) was signalled as a real process group. Each fixture class forces the Windows branch in its own setUp."""
+
+    NAMES = (
+        "BoundedRunOutputReadFailureTests.test_a_timeout_keeps_its_case_named_verdict_when_taskkill_hangs_or_fails",
+        "BoundedRunInputRangeTests.test_a_wait_that_raises_after_the_launch_still_kills_the_tree_and_names_the_case",
+        "HostileExceptionRenderingTests.test_a_hostile_exception_in_any_cleanup_phase_keeps_the_case_named_verdict_and_the_root_kill_and_reap",
+        "BoundedCaptureIoTests.test_a_finished_cleanup_adds_no_note_to_the_verdict",
+        "BoundedCleanupTests.test_a_slow_but_successful_taskkill_stays_inside_the_regression_ceiling",
+    )
+
+    def test_r8_a1_the_taskkill_fixtures_pass_on_a_posix_host_and_never_signal_a_process_group(self) -> None:
+        module = sys.modules[__name__]
+        killpg = mock.Mock()
+        suite = unittest.defaultTestLoader.loadTestsFromNames(self.NAMES, module)
+        result = unittest.TestResult()
+        with mock.patch.object(module, "_IS_POSIX", True), mock.patch.object(os, "killpg", killpg, create=True):
+            suite.run(result)
+        self.assertEqual(killpg.call_count, 0, f"a taskkill fixture signalled a process group: {killpg.call_args_list}")
+        self.assertEqual([(str(test), trace) for test, trace in result.failures + result.errors], [])
+        self.assertEqual((result.testsRun, len(result.skipped)), (len(self.NAMES), 0))
 
 
 @unittest.skipUnless(os.name == "nt", "the bound is a Windows process-tree kill")
@@ -1092,7 +1137,7 @@ class BoundedRunTests(unittest.TestCase):
         self.assertEqual((rc, out.strip(), err), (3, "out", "err"))
 
 
-class BoundedRunOutputReadFailureTests(unittest.TestCase):
+class BoundedRunOutputReadFailureTests(_WindowsKillPath, unittest.TestCase):
     """sol r2 BLOCKER: a captured-output read error after a timeout must not replace the case-named timeout verdict.
 
     Injected in memory (no real process, no real sharing violation): wait() raises TimeoutExpired, the tree and root cleanup
@@ -1359,7 +1404,7 @@ class BoundedRunOutputReadFailureTests(unittest.TestCase):
             self.assertIsInstance(caught, PermissionError, f"{name}: {caught!r}")
 
 
-class BoundedRunInputRangeTests(unittest.TestCase):
+class BoundedRunInputRangeTests(_WindowsKillPath, unittest.TestCase):
     """sol r5 B1 (INV-9): an accepted timeout must never bypass the cleanup after the child is launched.
 
     The unusable bounds (1e308, inf, nan) made the Windows wait raise OverflowError / ValueError after the launch, past the
@@ -1459,7 +1504,7 @@ def _hostile_exception(kind: str, calls: list[str]) -> BaseException:
 HOSTILE_KINDS = ("repr_throws", "str_throws", "repr_blocks", "str_blocks")
 
 
-class HostileExceptionRenderingTests(unittest.TestCase):
+class HostileExceptionRenderingTests(_WindowsKillPath, unittest.TestCase):
     """sol r14 B1 / adversary r14 A1: no cleanup-critical path of run_bounded renders an arbitrary exception with repr() / str() / !r.
 
     Sol reproduced it with a real subprocess.Popen audit event: an exception with a throwing __repr__ escaped the taskkill launch handler
@@ -1786,7 +1831,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
         caught: BaseException | None = None
         try:
             with warnings.catch_warnings(record=True) as recorded, mock.patch.object(subprocess, "Popen", side_effect=popen), \
-                    mock.patch.object(shutil, "rmtree", stalled_rmtree), \
+                    _windows_kill_path(), mock.patch.object(shutil, "rmtree", stalled_rmtree), \
                     mock.patch.object(sys.modules[__name__], "CAPTURE_CLEANUP_BOUND_SEC", 0.3):
                 warnings.simplefilter("always")
                 try:
@@ -1844,7 +1889,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
             real_start(thread)
 
         popen = BoundedRunOutputReadFailureTests._popen_for(proc, BoundedRunOutputReadFailureTests._FakeTaskkill(0))
-        with mock.patch.object(subprocess, "Popen", side_effect=popen), mock.patch.object(threading.Thread, "start", start):
+        with mock.patch.object(subprocess, "Popen", side_effect=popen), _windows_kill_path(), mock.patch.object(threading.Thread, "start", start):
             try:
                 run_bounded(["child"], 3, "thread-start-case")
             except BaseException as exc:  # noqa: BLE001 - the verdict type is the assertion
@@ -1878,7 +1923,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
         proc = BoundedRunOutputReadFailureTests._TimedOutProc()
         popen = BoundedRunOutputReadFailureTests._popen_for(proc, BoundedRunOutputReadFailureTests._FakeTaskkill(0))
         try:
-            with mock.patch.object(subprocess, "Popen", side_effect=popen), mock.patch.object(shutil, "rmtree", leave_behind):
+            with mock.patch.object(subprocess, "Popen", side_effect=popen), _windows_kill_path(), mock.patch.object(shutil, "rmtree", leave_behind):
                 with self.assertRaises(AssertionError) as caught:
                     run_bounded(["child"], 3, "left-behind-case")
         finally:
@@ -1966,7 +2011,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
             return CaptureFile(real_open(path, mode, *args, **kwargs))
 
         popen = BoundedRunOutputReadFailureTests._popen_for(proc, BoundedRunOutputReadFailureTests._FakeTaskkill(0))
-        patches = [mock.patch.object(subprocess, "Popen", side_effect=popen),
+        patches = [mock.patch.object(subprocess, "Popen", side_effect=popen), _windows_kill_path(),
                    mock.patch.object(sys.modules[__name__], "open", fake_open, create=True)]
         if close_bound is not None:
             patches.append(mock.patch.object(sys.modules[__name__], "CAPTURE_CLOSE_BOUND_SEC", close_bound))
@@ -2136,7 +2181,8 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertIn("close-case exceeded its 3 s wall-clock bound", str(caught))
 
     def test_a_finished_cleanup_adds_no_note_to_the_verdict(self) -> None:
-        caught = BoundedRunOutputReadFailureTests()._run_failing_cleanup(taskkill=0)
+        with _windows_kill_path():  # a bare instance of the fixture class has had no setUp
+            caught = BoundedRunOutputReadFailureTests()._run_failing_cleanup(taskkill=0)
         self.assertNotIn("capture cleanup", str(caught))
 
     @staticmethod
@@ -2304,15 +2350,17 @@ class BoundedCaptureIoTests(unittest.TestCase):
                 raise FileNotFoundError(2, "taskkill is not installed")
             return real_popen(argv, *args, **kwargs)
 
-        for label, patch in (("host taskkill", mock.patch.object(subprocess, "Popen", real_popen)),
-                             ("taskkill missing", mock.patch.object(subprocess, "Popen", without_taskkill))):
-            with self.subTest(label), patch:
+        # adversary r8 A1/A2: on a POSIX host the first pass takes the group-kill branch (verdict: "process group"); the second pass is the Windows
+        # branch with taskkill missing, so it forces that branch (a POSIX driver would otherwise be killed by group and never ask for taskkill).
+        for label, patch, windows_branch in (("host taskkill", mock.patch.object(subprocess, "Popen", real_popen), contextlib.nullcontext()),
+                                             ("taskkill missing", mock.patch.object(subprocess, "Popen", without_taskkill), _windows_kill_path())):
+            with self.subTest(label), patch, windows_branch:
                 with mock.patch(f"{__name__}.PWSH_SCRIPT_BASE_SEC", 3):
                     with self.assertRaises(AssertionError) as caught:
                         _run_pwsh_script("Start-Sleep -Seconds 600\n")
                 message = str(caught.exception)
                 self.assertIn("test_r16_c1_a_genuine_hang_still_fails_by_case_name_at_the_budget exceeded its 3 s wall-clock bound", message)
-                self.assertTrue("its process tree was killed" in message
+                self.assertTrue("its process tree was killed" in message or "its process group was killed" in message
                                 or "its process tree kill is NOT confirmed (taskkill failed: FileNotFoundError)" in message, message)
                 if label == "taskkill missing":
                     self.assertIn("kill is NOT confirmed (taskkill failed: FileNotFoundError)", message)
@@ -3347,7 +3395,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertNotRegex(case, r"-ArgumentList @\('/bin/sh'", "the argv must not be handed to Start-Process unquoted")
 
 
-class BoundedCleanupTests(unittest.TestCase):
+class BoundedCleanupTests(_WindowsKillPath, unittest.TestCase):
     """sol r4b B1 / B2: the cleanup after a timeout is bounded end to end, and the regression's ceiling is derived from that bound.
 
     Everything runs on a virtual clock with in-memory process fakes: a fake wait advances the clock by what it would have waited
