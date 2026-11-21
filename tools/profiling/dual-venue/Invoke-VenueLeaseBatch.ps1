@@ -841,12 +841,15 @@ function Close-BatchTicket([string]$Why) {
     # ticket to be reaped as dead-pid, so no unbounded claim-folder I/O sits ahead of their bounded release and typed refusal.
     $t = $script:batchTicket
     if ($null -eq $t) { return }
-    $script:batchTicket = $null
     $res = try {
         $r = Invoke-BatchTicketCall '[string](Remove-VenueTicket $a.t)' @{ t = $t }
         if ($r.answered) { [string]@($r.value)[-1] } else { "NO_ANSWER ($($r.error))" }
     } catch { "ERROR $($_.Exception.Message -replace '\s+', ' ')" }
-    LogBest "TICKET_ENDED batch=$batchNo why=$Why result=$res"
+    # r7 A8: the reference is dropped only once the ticket is known gone (REMOVED, ABSENT) or no longer ours (CHANGED). BUSY (a reader held the file), no answer or an error keep it, so the end is tried again
+    # at the next batch's start (the top of the batch loop) and a ready ticket is not left standing in the line after the claim is released.
+    $kept = $res -cnotin @('REMOVED', 'ABSENT', 'CHANGED')
+    if (-not $kept) { $script:batchTicket = $null }
+    LogBest "TICKET_ENDED batch=$batchNo why=$Why result=$res$(if ($kept) { ' (kept: the end is tried again at the next batch)' })"
 }
 
 function Invoke-BatchTicketCall([string]$Body, [hashtable]$Argument, [double]$Sec = 5) {
@@ -2253,6 +2256,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     }
     foreach ($ck in $capsReceipt.Keys) { $b[$ck] = $capsReceipt[$ck] }
     $openLeaseUnnamed = $false   # r5 (adversary r4 pass 3 A1): this batch's open carried a leaseBatch that is not one object (the finally charges it open-lease-unnamed)
+    if ($script:batchTicket) { Close-BatchTicket 'leftover' }   # r7 A8: an earlier batch's ticket whose end was BUSY or unanswered is ended again before this batch takes its own place
     $script:batchTicket = $null
     $script:TicketOn = -not $NoTicket   # one script-scope switch for every ticket step; the claim loop is also lifted out and run on its own by test_venue_lease_batch.py, where it is unset (ticketless, as before)
     # (0) CAPS b and c: wait out the cooldown after the last lease and the 3 h budget BEFORE the claim, so the venue is never held through either.
@@ -2277,7 +2281,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         $waitStartUtc = [DateTime]::UtcNow   # the wait ends waitSec after THIS, not after the ticket work: slow ticket I/O never pushes the claim request past the deadline the wait was checked against
         $waitClock = [Diagnostics.Stopwatch]::StartNew()   # adversary A7: the wait and its heartbeat cadence are measured on this monotonic clock, never by differencing the wall clock (a runner clock step of +1600 s ended a 1800 s cooldown early, one of -600 s lengthened it)
         $ticketArgs0 = @{ Venue = $Venue; RunDir = $RunDir; Purpose = "$Purpose batch $batchNo"; StaleAfterSec = $beatStaleSec; ClaimDir = $ClaimDir; Phase = 'cooldown' }
-        if ($script:TicketOn) {
+        # r7 A5: a ticket call is a bounded worker (5 s) that can answer late; it is started only with more than 6 s left before -DeadlineUtc, so ticket work can never carry the batch past the deadline the wait
+        # was checked against. With less room the wait is ticketless (the first claim request takes the place; a ticket made meanwhile is taken over there).
+        if ($script:TicketOn -and ($deadline - [DateTime]::UtcNow).TotalSeconds -gt 6.0) {
             try {
                 $tk = Invoke-BatchTicketCall '$k = $a.k; New-VenueTicket @k' @{ k = $ticketArgs0 }
                 if ($tk.answered -and @($tk.value).Count -gt 0) {
@@ -2291,10 +2297,11 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # r10: a [double] first operand, never the bare variable (an Int32 first operand rounds the double)
                 Start-Sleep -Seconds ([int][Math]::Ceiling([Math]::Min([double]$leftSec, [double]$TicketBeatSec)))
                 if ($waitClock.Elapsed.TotalSeconds -ge [double]$bw.waitSec) { break }
+                if (($deadline - [DateTime]::UtcNow).TotalSeconds -le 6.0) { continue }   # r7 A5: no ticket call that could outlast the deadline (the wait goes on; the claim request refreshes the ticket)
                 # the heartbeat's answer is read: LOST (the ticket was reaped, e.g. after a long write lock) is retaken at once so the holder is not out of the line until its wait ends; BUSY or no answer is tried again next slice
                 $hb = Invoke-BatchTicketCall '[string](Update-VenueTicket -Ticket $a.t -Phase cooldown -StaleAfterSec $a.s)' @{ t = $script:batchTicket; s = $beatStaleSec }
                 $hbRes = $(if ($hb.answered) { [string]@($hb.value)[-1] } else { 'NO_ANSWER' })
-                if ($hbRes -ceq 'LOST') {
+                if ($hbRes -ceq 'LOST' -and ($deadline - [DateTime]::UtcNow).TotalSeconds -gt 6.0) {
                     $tk = Invoke-BatchTicketCall '$k = $a.k; New-VenueTicket @k' @{ k = $ticketArgs0 }
                     if ($tk.answered -and @($tk.value).Count -gt 0) { $script:batchTicket = @($tk.value)[-1]; LogBest "TICKET_RETAKEN batch=$batchNo ticket=$($script:batchTicket.name) phase=cooldown (the ticket was removed during the wait: back of the line)" }
                 } elseif ($hbRes -cne 'OK') { LogBest "TICKET_HEARTBEAT_MISSED batch=$batchNo result=$hbRes (tried again next slice)" }
@@ -2450,10 +2457,14 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     $b.claimNonce = $claim.nonce
     # r5 (dot 242171b3 B1): the claim's expiry is renewed for as long as the batch holds it (the open's wait for the lease, the by-name wait and the legs can all
     # outlast -ClaimTtlSec), so Get-VenueClaimStaleReason never finds a live owner's claim expired. The keeper dies with this process.
-    $claimKeeper = Start-VenueClaimKeeper -Venue $Venue -Nonce $claim.nonce -TtlSec $ClaimTtlSec -RenewSec $ClaimRenewSec -ClaimDir $ClaimDir
-    $script:keeperStoppedEarly = $false; $script:keeperStoppedInTime = $null; $script:keeperLive = $true   # r7: Enable-WriteSuppression stops a live keeper (and redirects the close job). Adversary A8: set BEFORE the ticket log below, which can find the alias
-    # adversary A8: a refusal recorded while the keeper was not yet live (the TICKET_TAKEN log above found batch.log aliased to an input) stopped nothing: the keeper started afterwards and rewrote the claim in place. Stopped here, as Enable-WriteSuppression stops a live one.
-    if ($script:RunOutputAliased) { $script:keeperStoppedEarly = $true; $script:keeperStoppedInTime = Stop-VenueKeeper -Keeper $claimKeeper; $script:keeperLive = $false }
+    # adversary A8 / r7 A11: a refusal recorded BEFORE this point (the TICKET_TAKEN log above found batch.log aliased to an input) leaves the claim file alone: no keeper is started at all (a started one could renew once
+    # before any check). A keeper that is started has keeperLive set before the ticket log below, which can find the alias: Enable-WriteSuppression then stops it (and redirects the close job).
+    if ($script:RunOutputAliased) {
+        $claimKeeper = $null; $script:keeperStoppedEarly = $true; $script:keeperStoppedInTime = $true; $script:keeperLive = $false
+    } else {
+        $claimKeeper = Start-VenueClaimKeeper -Venue $Venue -Nonce $claim.nonce -TtlSec $ClaimTtlSec -RenewSec $ClaimRenewSec -ClaimDir $ClaimDir
+        $script:keeperStoppedEarly = $false; $script:keeperStoppedInTime = $null; $script:keeperLive = $true   # r7: Enable-WriteSuppression stops a live keeper (and redirects the close job)
+    }
     if ($script:batchTicket) { Close-BatchTicket 'claim-granted' }   # VENUE-FIFO-TICKET-BEFORE-PRECLAIM-1: after the keeper started (adversary r3 pass 2 A3), bounded (A1)
     # r3 (Dot B1): the finally block's cancel, close and ledger charge follow whether the open was SUBMITTED, never "$op is null": a null $op before the call (a throw while
     # the sidecar was checked) means nothing was sent. r16 (sol r15 B1; hub ruling 08:18:44Z): submitted = um-run.ps1 was called for it ($script:umRunCalled), not merely

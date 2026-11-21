@@ -358,7 +358,7 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
         # sees the other. A ticket that queued since the idle check above is served first: yield (the finally releases the claim) and do nothing (Dot 180e287f).
         $own = Get-VenueSupplementaryIdle -Venue $suppVenue -ClaimDir $ClaimDir -OwnNonce $req.claim.nonce
         if (-not $own.idle) { Write-SuppSkip $Leg $Trigger 'YIELDED_TO_TICKET' "liveTickets=$($own.liveTickets) claimState=$($own.claimState) (queued after the idle check)" $false; return }
-        if ($script:ticket) { $pf = [string](Update-VenueTicket -Ticket $script:ticket -Phase 'supplementary' -StaleAfterSec ($suppProbeStaleSec + $SupplementaryMaxSec)); if ($pf -cne 'OK') { L "TICKET_PHASE_$pf ticket=$($script:ticket.name) phase=supplementary (the phase and its longer lifetime did not land; the probe goes on)" } }
+        if ($script:ticket) { $pf = [string](Update-VenueTicket -Ticket $script:ticket -Phase 'supplementary' -StaleAfterSec ($suppProbeStaleSec + $SupplementaryMaxSec)); if ($pf -cne 'OK') { try { L "TICKET_PHASE_$pf ticket=$($script:ticket.name) phase=supplementary (the phase and its longer lifetime did not land; the probe goes on)" } catch { $null = $_ } } }   # r7 A15: a log line that cannot be written never stops the probe
         $sq = Invoke-QuietProbe $Leg.name "um-suppl-$Trigger" 0 $suppVenue $suppProbeAdmissionSec
         L "SUPPLEMENTARY_PROBE leg=$($Leg.name) venue=$suppVenue exit=$($sq.code) verdict=$($sq.verdict) mean=$(Format-Mean $sq.mean)$(if ($sq.reason) { " reason=$($sq.reason)" })"
         if ($sq.verdict -cnotin @('QUIET', 'COOLDOWN_UNMET')) { Write-SuppSkip $Leg $Trigger 'UM_NOT_QUIET' "verdict=$($sq.verdict) mean=$(Format-Mean $sq.mean)$(if ($sq.reason) { " reason=$($sq.reason)" })" $false; return }
@@ -448,7 +448,7 @@ foreach ($leg in $plan) {
             }
         }
         # (b) the quiet wait, WITHOUT the claim
-        if ($ticket) { $pf = [string](Update-VenueTicket -Ticket $ticket -Phase 'probing' -StaleAfterSec $ticketProbeStaleSec); if ($pf -cne 'OK') { L "TICKET_PHASE_$pf ticket=$($ticket.name) phase=probing leg=$($leg.name) (the phase and its longer lifetime did not land; the probe goes on)" } }   # a ticket kept across a GATE_BUSY: held for this ONE probe
+        if ($ticket) { $pf = [string](Update-VenueTicket -Ticket $ticket -Phase 'probing' -StaleAfterSec $ticketProbeStaleSec); if ($pf -cne 'OK') { try { L "TICKET_PHASE_$pf ticket=$($ticket.name) phase=probing leg=$($leg.name) (the phase and its longer lifetime did not land; the probe goes on)" } catch { $null = $_ } } }   # r7 A15: a log line that cannot be written never stops the probe   # a ticket kept across a GATE_BUSY: held for this ONE probe
         $pre = Invoke-QuietProbe $leg.name 'pre-claim' $QuietMaxWaitSec
         if ($pre.foreignFloor) { $legPreFF = $true; $legPreFFLine = $pre.foreignFloorLine }
         L "QUIET leg=$($leg.name) phase=pre-claim exit=$($pre.code) verdict=$($pre.verdict) mean=$(Format-Mean $pre.mean) waitedSec=$($pre.waitedSec)$(if ($pre.reason) { " reason=$($pre.reason)" }) (no claim held)"
@@ -476,7 +476,7 @@ foreach ($leg in $plan) {
             $req = Request-VenueClaim @rq
             if ($req.ticket -and ($null -eq $ticket -or $req.ticket.name -cne $ticket.name)) { L "TICKET_TAKEN leg=$($leg.name) ticket=$($req.ticket.name) runDir=$RunDir pid=$PID$(if ($ticket) { ' (the earlier ticket was lost: back of the line)' })" }
             if ($req.ticket) { if ($null -eq $ticket -or $req.ticket.name -cne $ticket.name) { $ticketKeeps = 0 }; $ticket = $req.ticket }   # a new place in the line starts a new keep count
-            if ($req.note) { L "$($req.note) leg=$($leg.name)" }   # Grok CoS G7: the flip to waiting stayed BUSY, the request came back QUEUED (tried again at the next poll)
+            if ($req.note) { try { L "$($req.note) leg=$($leg.name)" } catch { $null = $_ } }   # r7 A15: best effort. Grok CoS G7: the flip to waiting stayed BUSY, the request came back QUEUED (tried again at the next poll)
             foreach ($st in $req.staleTickets) { L "TICKET_STALE_REMOVED venue=$Venue reason=$($st.reason) ownerPid=$($st.ticket.ownerPid) runDir=$($st.ticket.runDir) ticket=$($st.name)" }
             foreach ($b in $req.broken) { L "CLAIM_STALE_BROKEN venue=$Venue reason=$($b.reason) ownerPid=$($b.claim.ownerPid) ownerCreatedUtc=$($b.claim.ownerCreatedUtc) runDir=$($b.claim.runDir) expiresUtc=$($b.claim.expiresUtc)" }
             if ($req.granted) { $claim = $req.claim; break }
@@ -493,7 +493,7 @@ foreach ($leg in $plan) {
         $released = $false
         try {
             # (d) ONE re-probe under the claim: the measurement nearest the leg is the one its line carries
-            if ($ticket) { $pf = [string](Update-VenueTicket -Ticket $ticket -Phase 'probing' -StaleAfterSec $ticketProbeStaleSec); if ($pf -cne 'OK') { L "TICKET_PHASE_$pf ticket=$($ticket.name) phase=probing leg=$($leg.name) (the phase and its longer lifetime did not land; the probe goes on)" } }
+            if ($ticket) { $pf = [string](Update-VenueTicket -Ticket $ticket -Phase 'probing' -StaleAfterSec $ticketProbeStaleSec); if ($pf -cne 'OK') { try { L "TICKET_PHASE_$pf ticket=$($ticket.name) phase=probing leg=$($leg.name) (the phase and its longer lifetime did not land; the probe goes on)" } catch { $null = $_ } } }   # r7 A15: a log line that cannot be written never stops the probe
             $re = Invoke-QuietProbe $leg.name 'under-claim' 0
             if ($re.foreignFloor) { $legReFF = $true; $legReFFLine = $re.foreignFloorLine }
             L "QUIET leg=$($leg.name) phase=under-claim exit=$($re.code) verdict=$($re.verdict) mean=$(Format-Mean $re.mean)$(if ($re.reason) { " reason=$($re.reason)" })"

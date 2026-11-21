@@ -225,9 +225,9 @@ ROUTE_DELETE_ALLOWED = {
         "process dies between the temp's CreateNew and the rename. $f comes only from a non-recursive listing of the venue's own ticket folder (<ClaimDir>\\<venue>.tickets, "
         "never a venue share) filtered by the full name pattern ^<19 digits>-p<pid>-<start ticks>.ticket.json.<32 hex>.tmp$ and by an age of more than 5 minutes; a file "
         "in use or already gone is skipped. A footage name cannot match that pattern, and the folder holds no footage.",
-    ("VenueChain.psm1", "if ($made) { try { [IO.File]::Delete($path) } catch { $null = $_ } }"):
+    ("VenueChain.psm1", "try { [IO.File]::Delete($path); $gone = $true } catch { Start-Sleep -Milliseconds 100 }"):
         "VENUE-FIFO-TICKET-BEFORE-PRECLAIM-1 r7 (adversary A9, New-VenueTicket): takes back the ONE ticket file this call itself created a moment earlier with FileMode.CreateNew "
-        "(the `$made` flag is set only after that open succeeded) when writing or flushing its body then failed, so a half-made ticket of the same owner never stays in the line. $path is "
+        "(the `$made` flag is set only after that open succeeded; retried for up to 1 s while a reader holds it) when writing or flushing its body then failed, so a half-made ticket of the same owner never stays in the line. $path is "
         "<ClaimDir>\\<venue>.tickets\\<19 digits>-p<pid>-<start ticks>.ticket.json, built in the same loop iteration from the claim folder and the owner's pid and start ticks (the board's "
         "claim folder, never a venue share); fixed-name leaf, no wildcard, no -Recurse, never a name this call did not create.",
 }
