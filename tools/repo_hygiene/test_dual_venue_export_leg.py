@@ -2552,10 +2552,115 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
             "}\n"
             "$out | ConvertTo-Json -Compress -Depth 4"], timeout=300).stdout.strip().splitlines()[-1])
         self.assertTrue(got["spent"]["timedOut"], got)
-        self.assertEqual(got["spent"]["snapCalls"], 0, f"no tree scan starts after the cleanup budget is spent: {got}")
-        self.assertFalse(got["spent"]["killConfirmed"], f"a tree never scanned is an unconfirmed kill: {got}")
+        # r7 (sol r6d B2): the source now loads BEFORE the child starts, outside the cleanup window, so a 1600 ms load no longer spends the 1500 ms allowance: the
+        # scan starts with its whole second and the (fake) wait confirms. A load that DID run inside the window is still held to the floor by the grant below.
+        self.assertEqual(got["spent"]["snapCalls"], 1, f"a slow source load before the child starts costs the cleanup allowance nothing: {got}")
+        self.assertTrue(got["spent"]["killConfirmed"], got)
         self.assertEqual(got["left"]["snapCalls"], 1, got)
-        self.assertLessEqual(got["left"]["snapTimeout"], 3, f"the scan gets only the whole seconds that remain: {got}")
+        self.assertLessEqual(got["left"]["snapTimeout"], 5, f"the scan gets only the whole seconds that remain: {got}")
+
+    def test_r7_b1_an_orphan_at_the_roots_exact_creation_time_is_never_a_proven_outsider(self) -> None:
+        """r7, sol r6d B1. Root 100 and a live orphan 203 (parent 202 gone) share one CreationDate. The snapshot used `-gt` against the root's time, so 203 was recorded
+        as an outsider and the wait, seeing it unchanged, confirmed the kill (EXPORT_TIMEOUT / 40 while it lived). An EQUAL time proves nothing: only a strictly older
+        time does. Sibling (same class, the ancestry climb): a parent no younger than the child was followed, so an orphan created after the root whose dead parent's pid
+        a process of the SAME creation time reused climbed into the outsiders through it. A real parent is strictly older, so an equal one is a reuse and the climb stops.
+        Controls: an orphan strictly older than the root is still an outsider, and the wait still confirms the kill with it alive."""
+        got = self.snapshot_and_wait(
+            "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
+            "$eq = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 203 202 $t)))\n"
+            "$eqWait = Wait-AttrCudaProcessTreeGone -Snapshot $eq -WaitMs 1200 -Scan { @($sys + @((Row 203 202 $t))) }\n"
+            "$reuse = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($sys + @((Row 100 4 $t), (Row 203 202 $t.AddSeconds(5)), (Row 202 4 $t.AddSeconds(5))))\n"
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1))))\n"
+            "$reuseWait = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 203 202 $t.AddSeconds(5)), (Row 202 4 $t.AddSeconds(5)))) }\n"
+            "$old = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 203 202 $t.AddTicks(-10))))\n"
+            "$oldWait = Wait-AttrCudaProcessTreeGone -Snapshot $old -WaitMs 1200 -Scan { @($sys + @((Row 203 202 $t.AddTicks(-10)))) }\n"
+            "[ordered]@{ eqMembers = @($eq.members | ForEach-Object { $_.processId }); eqOthers = @($eq.others.Keys | Sort-Object); eqWait = $eqWait.confirmed;\n"
+            "            eqSurvivors = @($eqWait.survivors); reuseMembers = @($reuse.members | ForEach-Object { $_.processId }); reuseWait = $reuseWait.confirmed;\n"
+            "            reuseSurvivors = @($reuseWait.survivors); oldMembers = @($old.members | ForEach-Object { $_.processId }); oldOthers = @($old.others.Keys | Sort-Object);\n"
+            "            oldWait = $oldWait.confirmed } | ConvertTo-Json -Compress")
+        self.assertEqual(sorted(got["eqMembers"]), [201, 203], f"an orphan at the root's exact creation time is a member (fail closed): {got}")
+        self.assertNotIn(203, got["eqOthers"], got)
+        self.assertFalse(got["eqWait"], f"a live equal-time orphan is never a confirmed kill: {got}")
+        self.assertEqual(got["eqSurvivors"], [203], got)
+        self.assertIn(203, got["reuseMembers"], f"an equal-time parent is a reused number, never a proof of ancestry: {got}")
+        self.assertFalse(got["reuseWait"], f"a late orphan never climbs to an outsider through an equal-time parent: {got}")
+        self.assertEqual(got["reuseSurvivors"], [203], got)
+        self.assertEqual(got["oldMembers"], [201], f"control: an orphan strictly older than the root is no member: {got}")
+        self.assertEqual(got["oldOthers"], [0, 4, 203], got)
+        self.assertTrue(got["oldWait"], f"control: a known older outsider alive in the wait is not a survivor: {got}")
+
+    def test_r7_a_wait_row_with_no_pid_under_the_tree_is_never_a_confirmed_kill(self) -> None:
+        """r7 fold-in (sol r6d hardening; fable EKDC-WAIT-NULL-PID-ROW-FAIL-CLOSED-1). The snapshot fails closed on a row with no readable pid under a member
+        (descendant-unreadable); the wait dropped the same row and confirmed. It now fails closed the same way, under a recorded member, the root, or a process the
+        wait found in the tree. Control: a no-pid row under an unrelated parent is ignored, as in the snapshot."""
+        got = self.snapshot_and_wait(
+            "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 400 4 $t.AddSeconds(-5))))\n"
+            "$member = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row $null 201 $t.AddSeconds(5)))) }\n"
+            "$root = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row $null 100 $t.AddSeconds(5)))) }\n"
+            "$late = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 202 201 $t.AddSeconds(4)), (Row $null 202 $t.AddSeconds(5)))) }\n"
+            "$other = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 400 4 $t.AddSeconds(-5)), (Row $null 400 $t.AddSeconds(5)))) }\n"
+            "[ordered]@{ member = $member.confirmed; memberWhy = $member.error; root = $root.confirmed; late = $late.confirmed; lateWhy = $late.error;\n"
+            "            other = $other.confirmed; otherWhy = $other.error } | ConvertTo-Json -Compress")
+        self.assertFalse(got["member"], f"a no-pid row under a recorded member is an unreadable descendant: {got}")
+        self.assertIn("descendant-unreadable", str(got["memberWhy"]), got)
+        self.assertFalse(got["root"], got)
+        self.assertFalse(got["late"], got)
+        self.assertIn("descendant-unreadable", str(got["lateWhy"]), got)
+        self.assertTrue(got["other"], f"control: a no-pid row under an unrelated outsider is not the tree: {got}")
+
+    def test_r7_b2_the_helper_source_loads_before_the_child_starts_so_the_kill_never_waits_on_it(self) -> None:
+        """r7, sol r6d B2. Invoke-VenueBoundedProcess read and compiled the helper source AFTER its child timed out, inside the -CleanupWaitMs allowance and before
+        the kill: a 1600 ms read under a 1500 ms allowance spent it all, so no scan ran and the kill came after the allowance. The source is now loaded before the
+        child starts. Behavior: a 1600 ms load under 1500 ms still gets its snapshot scan and the kill. A load that throws leaves the tree unknown (unconfirmed)
+        and the child is still killed inside the bound. Source: the load precedes Process.Start, and nothing reads the source after the timeout."""
+        module = DV / "VenueChain.psm1"
+        fake = ("function Get-AttrCudaProcessTreeSnapshot { param($RootProcessId, $OperationTimeoutSec) $global:snapCalls++; $global:snapTimeout = $OperationTimeoutSec; "
+                "[pscustomobject]@{ ok = $true; rootProcessId = [int64]$RootProcessId; rootCreationTicks = [int64]1; members = @(); error = $null } }\n"
+                "function Wait-AttrCudaProcessTreeGone { param($Snapshot, $WaitMs) [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }")
+        got = json.loads(run_pwsh(["-Command",
+            "$ErrorActionPreference = 'Stop'\n"
+            f"$m = Import-Module '{module}' -Force -DisableNameChecking -PassThru\n"
+            f"$global:fakeSrc = @'\n{fake}\n'@\n"
+            "& $m { function script:Get-VenueProcessTreeHelperSource { Start-Sleep -Milliseconds $global:srcDelay; if ($global:srcThrow) { throw 'helper file locked' }; $global:fakeSrc } }\n"
+            "$exe = (Get-Process -Id $PID).Path; $out = [ordered]@{}\n"
+            "foreach ($case in @(@('slow', 1600, 1500, $false), @('broken', 0, 1500, $true))) {\n"
+            "    $global:snapCalls = 0; $global:snapTimeout = $null; $global:srcDelay = $case[1]; $global:srcThrow = $case[3]\n"
+            "    $sw = [Diagnostics.Stopwatch]::StartNew()\n"
+            "    $r = Invoke-VenueBoundedProcess -FilePath $exe -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 60') -TimeoutSec 2 -CleanupWaitMs $case[2]\n"
+            "    $out[$case[0]] = [ordered]@{ timedOut = $r.timedOut; killConfirmed = $r.killConfirmed; snapCalls = $global:snapCalls; snapTimeout = $global:snapTimeout; ms = $sw.ElapsedMilliseconds }\n"
+            "}\n"
+            "$out | ConvertTo-Json -Compress -Depth 4"], timeout=300).stdout.strip().splitlines()[-1])
+        self.assertTrue(got["slow"]["timedOut"], got)
+        self.assertEqual(got["slow"]["snapCalls"], 1, f"a slow helper-source read never spends the cleanup allowance: {got}")
+        self.assertEqual(got["slow"]["snapTimeout"], 1, got)
+        self.assertTrue(got["slow"]["killConfirmed"], got)
+        self.assertTrue(got["broken"]["timedOut"], got)
+        self.assertEqual(got["broken"]["snapCalls"], 0, got)
+        self.assertFalse(got["broken"]["killConfirmed"], f"a helper source that will not load is an unknown tree, an unconfirmed kill: {got}")
+        self.assertLess(got["broken"]["ms"], 2000 + 1500 + 1500, f"the child is still killed inside the bound: {got}")
+        text = module.read_text(encoding="utf-8")
+        body = text[text.index("function Invoke-VenueBoundedProcess"):text.index("function Get-VenueDriverScriptMissing")]
+        self.assertEqual(body.count("Get-VenueProcessTreeHelperSource"), 1, "the source is read once per call")
+        self.assertLess(body.index("Get-VenueProcessTreeHelperSource"), body.index("$p = [Diagnostics.Process]::Start($psi)"),
+                        "the helper source is loaded before the child starts, never inside the cleanup allowance")
+
+    def test_r7_b3_the_health_probe_carries_no_process_tree_helper_and_the_scan_still_reads_both(self) -> None:
+        """r7, sol r6d B3. DualVenueRunner.psm1 lists the two process-tree helpers by a literal -Name so the ATTR-3 spliced-body scan reads and clears them (forced by
+        test_attr3_spliced_body_scan.py test_a_dynamic_splice_source_embeds_only_bodies_the_scan_already_enumerates). That listing needs no splice: the health probe
+        defined both and called neither. The probe now carries only Get-AttrCudaSessionLocked, and the literal listing stays."""
+        got = json.loads(run_pwsh(["-Command",
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force -DisableNameChecking\n"
+            "$p = New-DvHealthProbeJobText -AgentRoot 'C:\\mlvtmp\\mlv-agent'\n"
+            "[ordered]@{ snap = $p.Contains('function Get-AttrCudaProcessTreeSnapshot'); wait = $p.Contains('function Wait-AttrCudaProcessTreeGone');\n"
+            "            locked = $p.Contains('function Get-AttrCudaSessionLocked') } | ConvertTo-Json -Compress"], timeout=300).stdout.strip().splitlines()[-1])
+        self.assertFalse(got["snap"], f"the probe never calls the snapshot helper, so it does not carry it: {got}")
+        self.assertFalse(got["wait"], got)
+        self.assertTrue(got["locked"], got)
+        text = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("Get-AttrCudaEmbeddedFunctionSource -Name @('Get-AttrCudaProcessTreeSnapshot', 'Wait-AttrCudaProcessTreeGone')", text,
+                      "the literal listing the ATTR-3 scan reads stays")
 
 
 if __name__ == "__main__":

@@ -1678,8 +1678,8 @@ function Resolve-VenueLeaseCaps {
 $script:VenueProcessTreeModulePath = Join-Path $PSScriptRoot '..\bachelor\AttrCudaArtifacts.psm1'
 function Get-VenueProcessTreeHelperSource {
     # EXPORT-KILL-DESCENDANT-CONFIRM-1: the verbatim text of Get-AttrCudaProcessTreeSnapshot and Wait-AttrCudaProcessTreeGone, extracted from AttrCudaArtifacts.psm1 by the same
-    # column-0 contract as Get-VenueClaimShapeSource (read as text, never imported: this module imports nothing from the bachelor tree). It is read only when a bounded child
-    # has timed out; a file that will not read or a missing function throws, and the caller then counts the tree as unknown (an unconfirmed kill).
+    # column-0 contract as Get-VenueClaimShapeSource (read as text, never imported: this module imports nothing from the bachelor tree). It is read before a bounded child
+    # starts (r7, sol r6d B2); a file that will not read or a missing function throws, and the caller then counts the tree as unknown (an unconfirmed kill on timeout).
     param([string]$Path = $script:VenueProcessTreeModulePath)
     $src = [IO.File]::ReadAllText($Path)
     @(foreach ($name in 'Get-AttrCudaProcessTreeSnapshot', 'Wait-AttrCudaProcessTreeGone') {
@@ -1701,6 +1701,10 @@ function Invoke-VenueBoundedProcess {
           [ValidateRange(100, 60000)][int]$CleanupWaitMs = 15000)
     # r11 (adversary r11 A5, A6): after the bound, the kill wait and both stream waits share ONE budget ($CleanupWaitMs: they used to add up to 3 x 15 s past a caller's deadline), and a tree kill
     # that threw is never "confirmed" because the root happened to exit: killConfirmed needs no kill error AND the root gone.
+    # r7 (sol r6d B2): the process-tree helpers are read and defined HERE, before the child starts and outside the -CleanupWaitMs allowance, so a slow read never delays
+    # the kill or spends the allowance (it ran after the timeout and before the kill). A source that will not load leaves the tree unknown: an unconfirmed kill on timeout.
+    $treeHelpers = $false
+    try { . ([scriptblock]::Create((Get-VenueProcessTreeHelperSource))); $treeHelpers = $true } catch { $treeHelpers = $false }
     $psi = [Diagnostics.ProcessStartInfo]::new($FilePath)
     foreach ($a in $ArgumentList) { [void]$psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
@@ -1717,9 +1721,9 @@ function Invoke-VenueBoundedProcess {
         # (r1 fix iteration, adversary A3 on 2223cc4d: a snapshot that ends past the budget is no snapshot, and the tree wait gets only what is left; each CIM scan has a 1 s floor)
         $tree = $null
         # (r1 fix 2, adversary A2 on 348c4357: the snapshot scan starts only when CIM's 1 s floor fits the budget; under 1 s the tree is unknown, an unconfirmed kill)
-        # (r3, adversary A3 on 4d69f211: the budget is re-read from the one $cleanup stopwatch AFTER the helper source loads, and the scan gets only the whole seconds
-        # still left; when less than the 1 s floor is left no scan starts and the tree is unknown)
-        if ($CleanupWaitMs -ge 1000) { try { . ([scriptblock]::Create((Get-VenueProcessTreeHelperSource))); $grantSec = [int][Math]::Floor(($CleanupWaitMs - $cleanup.ElapsedMilliseconds) / 1000.0); if ($grantSec -ge 1) { $tree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $p.Id -OperationTimeoutSec $grantSec } } catch { $tree = $null } }
+        # (r3, adversary A3 on 4d69f211: the budget is re-read from the one $cleanup stopwatch, and the scan gets only the whole seconds still left; when less than the
+        # 1 s floor is left no scan starts and the tree is unknown. r7: the helper source was loaded before the child started, above)
+        if ($treeHelpers -and $CleanupWaitMs -ge 1000) { try { $grantSec = [int][Math]::Floor(($CleanupWaitMs - $cleanup.ElapsedMilliseconds) / 1000.0); if ($grantSec -ge 1) { $tree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $p.Id -OperationTimeoutSec $grantSec } } catch { $tree = $null } }
         # (r6, adversary pass 7 A2 sibling: the whole seconds left are read at the moment the scan's timeout is granted, not from a value taken earlier, and under the 1 s floor no scan starts)
         if ($cleanup.ElapsedMilliseconds -ge $CleanupWaitMs) { $tree = $null }
         try { $p.Kill($true) } catch { $killErrored = $true }; [void]$p.WaitForExit([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds))

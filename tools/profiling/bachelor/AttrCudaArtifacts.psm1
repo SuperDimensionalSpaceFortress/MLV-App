@@ -5110,6 +5110,8 @@ function Get-AttrCudaProcessTreeSnapshot {
         # the child. A climb that stops at a process created AFTER the root (its parent gone, younger or unreadable) cannot be proved outside the tree: its rows are
         # members. Every other row is recorded in .others by identity (pid -> creation ticks): the processes known to exist outside the tree BEFORE the kill. The wait
         # then needs no clock to judge a later orphan: one that is not a known outsider is unproven, whatever its creation time reads.
+        # r7 (sol r6d B1): an EQUAL creation time proves nothing. A climb top at the root's own time is a member (only a strictly older top is outside the tree), and the
+        # climb follows only a STRICTLY older parent: a real parent is created before its child, so a holder of the parent's number with the same time is a reuse.
         $memberIds = @{}
         $memberIds[[int64]$RootProcessId] = $rootTicks
         foreach ($m in $members) { $memberIds[$m.processId] = $m.creationTicks }
@@ -5133,8 +5135,8 @@ function Get-AttrCudaProcessTreeSnapshot {
                 $climb.Add($cur)
                 $curTicks = $rowTicks[$cur]
                 $up = $rowParent[$cur]
-                if ($null -ne $up -and $null -ne $curTicks -and $up -ne $cur -and -not $climb.Contains($up) -and $rowTicks.ContainsKey($up) -and $null -ne $rowTicks[$up] -and [int64]$rowTicks[$up] -le [int64]$curTicks) { $cur = $up; continue }
-                $verdict = ($null -ne $curTicks) -and ([int64]$curTicks -gt [int64]$rootTicks)
+                if ($null -ne $up -and $null -ne $curTicks -and $up -ne $cur -and -not $climb.Contains($up) -and $rowTicks.ContainsKey($up) -and $null -ne $rowTicks[$up] -and [int64]$rowTicks[$up] -lt [int64]$curTicks) { $cur = $up; continue }
+                $verdict = ($null -ne $curTicks) -and ([int64]$curTicks -ge [int64]$rootTicks)
                 break
             }
             foreach ($q in $climb) { $late[$q] = $verdict }
@@ -5213,7 +5215,11 @@ function Wait-AttrCudaProcessTreeGone {
             $rowTicks = @{}
             $rowParent = @{}
             $found = [System.Collections.Generic.List[int64]]::new()
+            # r7 (sol r6d hardening, fable EKDC-WAIT-NULL-PID-ROW-FAIL-CLOSED-1): a row with no readable pid is kept by its parent, and one under the tree (checked once the
+            # walk below has found the tree) makes this scan unable to confirm, as the snapshot's descendant-unreadable does; it was dropped and the kill confirmed.
+            $noPidParents = [System.Collections.Generic.List[int64]]::new()
             foreach ($row in $rows) {
+                if ($null -ne $row -and $null -eq $row.ProcessId -and $null -ne $row.ParentProcessId) { $noPidParents.Add([int64]$row.ParentProcessId) }
                 if ($null -eq $row -or $null -eq $row.ProcessId) { continue }
                 $rowPid = [int64]$row.ProcessId
                 $ticks = $(if ($null -eq $row.CreationDate) { $null } else { ([datetime]$row.CreationDate).ToUniversalTime().Ticks })
@@ -5246,7 +5252,8 @@ function Wait-AttrCudaProcessTreeGone {
             # exited). Climb ParentProcessId while the parent is in this scan and no younger than the child (a younger holder of the number is a reuse, not the parent).
             # Where the climb stops, the top's parent is gone or unprovable; unless that top is an outsider the snapshot saw (same pid AND creation time, both
             # readable), ancestry is unproven and every row on the climb is a survivor (fail closed), recorded from then on. r3 fix 2 (adversary A1 on 6b788356): no
-            # wall-clock comparison decides this, so a clock stepped back cannot make a late orphan read as older than the tree.
+            # wall-clock comparison decides this, so a clock stepped back cannot make a late orphan read as older than the tree. r7 (sol r6d B1 sibling): the climb follows
+            # only a STRICTLY older parent; one with the child's own creation time is a reused number, so a late orphan never climbs to a known outsider through it.
             $unproven = @{}
             foreach ($start in @($rowTicks.Keys)) {
                 if ($adopted.Contains([int64]$start) -or $unproven.ContainsKey([int64]$start)) { continue }
@@ -5259,7 +5266,7 @@ function Wait-AttrCudaProcessTreeGone {
                     $climb.Add($cur)
                     $curTicks = $rowTicks[$cur]
                     $up = $rowParent[$cur]
-                    if ($null -ne $up -and $null -ne $curTicks -and $up -ne $cur -and -not $climb.Contains($up) -and $rowTicks.ContainsKey($up) -and $null -ne $rowTicks[$up] -and [int64]$rowTicks[$up] -le [int64]$curTicks) { $cur = $up; continue }
+                    if ($null -ne $up -and $null -ne $curTicks -and $up -ne $cur -and -not $climb.Contains($up) -and $rowTicks.ContainsKey($up) -and $null -ne $rowTicks[$up] -and [int64]$rowTicks[$up] -lt [int64]$curTicks) { $cur = $up; continue }
                     $verdict = -not (($null -ne $curTicks) -and $known.ContainsKey($cur) -and ($null -ne $known[$cur]) -and ([int64]$known[$cur] -eq [int64]$curTicks))
                     break
                 }
@@ -5270,8 +5277,11 @@ function Wait-AttrCudaProcessTreeGone {
             foreach ($d in $discovered) { $recorded[$d] = $rowTicks[$d] }
             $survivors = @($found | Sort-Object -Unique)
             $lastError = 'survivors'
+            $noPidUnder = $null
+            foreach ($np in $noPidParents) { if ($expanded.Contains($np) -or $adopted.Contains($np)) { $noPidUnder = $np; break } }
+            if ($null -ne $noPidUnder) { $lastError = "descendant-unreadable parent=$noPidUnder" }
             if ($clock.ElapsedMilliseconds -gt $WaitMs) { $lastError = 'scan-ended-past-the-bound'; break }
-            if ($survivors.Count -eq 0) { return [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }
+            if ($survivors.Count -eq 0 -and $null -eq $noPidUnder) { return [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }
         } catch { $lastError = "scan-failed: $([string]$_.Exception.Message -replace '\s+', ' ')" }
         $sleepMs = [Math]::Min(250, $WaitMs - $clock.ElapsedMilliseconds - $scanFloorMs)
         if ($sleepMs -lt 0) { break }
