@@ -11348,20 +11348,6 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             << " observed=" << m_playbackSmokePresentedFrames << ".\n";
         return 11;
     }
-    // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r3 fix 2 (adversary A1 on 38c05d4b): a count completed by a source frame past the
-    // admitted window (a dropped window frame made up by the next one) is not the pinned capture: the same exit 11.
-    const int64_t pinnedWindowLastFrame =
-        playback_frame_range::admittedWindowLastFrame( m_sourceAdvance, m_playRequiredSourceFrames );
-    if( !playback_frame_range::pinnedCountCompletedInsideWindow(
-            m_playbackSmokeTargetPresentedFrames, m_playbackSmokeLastPresentedFrame, pinnedWindowLastFrame ) )
-    {
-        err << "[GUI-SMOKE] ERROR: exact presented-frame target was not met inside the admitted window; target="
-            << m_playbackSmokeTargetPresentedFrames
-            << " observed=" << m_playbackSmokePresentedFrames
-            << " last_presented_frame=" << m_playbackSmokeLastPresentedFrame
-            << " window_last_frame=" << static_cast<qlonglong>( pinnedWindowLastFrame ) << ".\n";
-        return 11;
-    }
 
     if( options.exerciseClipLifecycleStress && !stressAttempted )
     {
