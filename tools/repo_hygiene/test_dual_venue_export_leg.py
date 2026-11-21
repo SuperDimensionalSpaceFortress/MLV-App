@@ -1591,6 +1591,8 @@ class CdngTotalContainmentTests(unittest.TestCase):
         proc, got = evidence_cases([cdng_case(profile=cdng_total_profile(per_frame={7: {f: hostile}}), criteria=[]) for f in fields]
                                    + [cdng_case(profile=cdng_total_profile(per_frame={7: {"llrawproc_total_ms": {"GetType": "x"}}}), criteria=[])])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        # (a case that throws inside the ForEach-Object yields no row, so every case must have one: a short list is the throw)
+        self.assertEqual(len(got), len(fields) + 1, (len(got), proc.stderr[-3000:]))
         for f, row in zip(fields + ("llrawproc_total_ms",), got):
             with self.subTest(field=f):
                 self.assertEqual(row["outcome"], "INVALID", row)
