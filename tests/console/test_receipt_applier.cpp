@@ -2317,6 +2317,85 @@ TEST(BatchExportFormat, FfmpegAppDirSelectionMustStillExistAtPreflight)
             QStringLiteral("ffmpeg"), QString())) );
 }
 
+/* Adversary A2 (195f6c11): an app-dir selection replaced by a DIRECTORY after the lookup is
+ * refused at preflight too. */
+TEST(BatchExportFormat, FfmpegSelectionReplacedByDirectoryIsRefusedAtPreflight)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE( dir.isValid() );
+    const QString appDir = QDir::cleanPath(dir.path());
+    const QString packaged = appDir + QStringLiteral("/ffmpeg.exe");
+    ASSERT_TRUE( QDir(appDir).mkdir(QStringLiteral("ffmpeg.exe")) );
+    const BatchRenderedVideoFfmpegBinaryPlan plan =
+        batchRenderedVideoFfmpegBinaryPlanFromLookup(
+            QString(), appDir,
+            appDirLookupFakeResolver(packaged, QString(), nullptr));
+    ASSERT_TRUE( plan.foundInAppDir );
+    ASSERT_FALSE( batchRenderedVideoFfmpegBinaryPlanUsableAtPreflight(plan) );
+}
+
+/* Adversary A5 (195f6c11): the preflight message names only the places actually searched. */
+TEST(BatchExportFormat, FfmpegSearchedLocationsNameOnlyWhatWasSearched)
+{
+    const QString appDir = QStringLiteral("C:/apps/MLVApp");
+    ASSERT_EQ( std::string("app-dir"), appDirLookupText(
+        batchRenderedVideoFfmpegBinaryPlanSearchedLocations(
+            batchRenderedVideoFfmpegBinaryPlanFromLookup(
+                QString(), appDir,
+                appDirLookupFakeResolver(QStringLiteral("C:/apps/MLVApp/ffmpeg.exe"), QString(), nullptr)))) );
+    ASSERT_EQ( std::string("app-dir,PATH"), appDirLookupText(
+        batchRenderedVideoFfmpegBinaryPlanSearchedLocations(
+            batchRenderedVideoFfmpegBinaryPlanFromLookup(
+                QString(), appDir, appDirLookupFakeResolver(QString(), QString(), nullptr)))) );
+    ASSERT_EQ( std::string("PATH"), appDirLookupText(
+        batchRenderedVideoFfmpegBinaryPlanSearchedLocations(
+            batchRenderedVideoFfmpegBinaryPlanFromLookup(
+                QStringLiteral("ffmpeg"), appDir,
+                appDirLookupFakeResolver(QString(), QString(), nullptr)))) );
+}
+
+/* Adversary A3 (195f6c11): the optional ffprobe selection re-checks a stale app-dir hit and
+ * then tries PATH, and never accepts an empty placeholder beside ffmpeg. */
+TEST(BatchExportFormat, OptionalMediaProbeSelectionSkipsStaleAndEmptyCandidates)
+{
+    QTemporaryDir appTemp;
+    QTemporaryDir pathTemp;
+    ASSERT_TRUE( appTemp.isValid() );
+    ASSERT_TRUE( pathTemp.isValid() );
+    const QString appDir = QDir::cleanPath(appTemp.path());
+    const QString appProbe = appDir + QStringLiteral("/ffprobe.exe");
+    const QString appFfmpeg = appDir + QStringLiteral("/ffmpeg.exe");
+    const QString pathProbe = QDir::cleanPath(pathTemp.path()) + QStringLiteral("/ffprobe.exe");
+    ASSERT_TRUE( appDirLookupWriteFile(appProbe, QByteArray("MZ")) );
+    ASSERT_TRUE( appDirLookupWriteFile(appFfmpeg, QByteArray("MZ")) );
+    ASSERT_TRUE( appDirLookupWriteFile(pathProbe, QByteArray("MZ")) );
+
+    const BatchRenderedVideoMediaProbeBinaryPlan probePlan =
+        batchRenderedVideoMediaProbeBinaryPlanFromLookup(
+            QString(), appDir, appDirLookupFakeResolver(appProbe, pathProbe, nullptr));
+    const BatchRenderedVideoFfmpegBinaryPlan ffmpegPlan =
+        batchRenderedVideoFfmpegBinaryPlanFromLookup(
+            QString(), appDir, appDirLookupFakeResolver(appFfmpeg, QString(), nullptr));
+    ASSERT_TRUE( probePlan.foundInAppDir );
+
+    /* Fresh app-dir hit: used. */
+    ASSERT_EQ( appDirLookupText(appProbe), appDirLookupText(
+        batchRenderedVideoOptionalMediaProbeExecutable(
+            probePlan, ffmpegPlan, appDirLookupFakeResolver(QString(), pathProbe, nullptr))) );
+
+    /* Stale app-dir hit: PATH is searched now, and its probe is used. */
+    ASSERT_TRUE( QFile::rename(appProbe, appDir + QStringLiteral("/ffprobe.old")) );
+    ASSERT_EQ( appDirLookupText(pathProbe), appDirLookupText(
+        batchRenderedVideoOptionalMediaProbeExecutable(
+            probePlan, ffmpegPlan, appDirLookupFakeResolver(QString(), pathProbe, nullptr))) );
+
+    /* Stale app-dir hit, nothing on PATH, an EMPTY ffprobe beside ffmpeg: not available. */
+    ASSERT_TRUE( appDirLookupWriteFile(appProbe, QByteArray()) );
+    ASSERT_EQ( std::string(), appDirLookupText(
+        batchRenderedVideoOptionalMediaProbeExecutable(
+            probePlan, ffmpegPlan, appDirLookupFakeResolver(QString(), QString(), nullptr))) );
+}
+
 TEST(BatchExportFormat, MediaProbeDefaultLookupMirrorsFfmpeg)
 {
     const QString appDir = QStringLiteral("C:/apps/MLVApp");
