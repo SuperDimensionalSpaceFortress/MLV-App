@@ -303,8 +303,12 @@ TEST(PlaybackInfoLabel, MainWindowWiring)
     ASSERT_TRUE(source.contains(QStringLiteral("gui_smoke.look_label_playing shown=")));
     // Never playbackDebayerLabel() (it returns "receipt"): the chosen debayer's menu text.
     const QString facts = functionBody(source, QStringLiteral("playback_info_label::Facts MainWindow::playbackInfoFacts("));
-    ASSERT_TRUE(facts.contains(QStringLiteral("m_pChosenDebayer->text()")));
+    // INFO-2 r1 (pass 21 A1): the facts read it through playbackInfoDebayerName (the relabel key's reader), which falls back to it
+    const QString reader = functionBody(source, QStringLiteral("QString MainWindow::playbackInfoDebayerName( void ) const"));
+    ASSERT_TRUE(facts.contains(QStringLiteral("playbackInfoDebayerName()")));
+    ASSERT_TRUE(reader.contains(QStringLiteral("m_pChosenDebayer->text()")));
     ASSERT_FALSE(facts.contains(QStringLiteral("playbackDebayerLabel(")));
+    ASSERT_FALSE(reader.contains(QStringLiteral("playbackDebayerLabel(")));
 }
 
 // r1 adversary A1 (06898800): the toolbar indicator runs per frame in Auto mode (its cache holds the per-frame decision stats),
@@ -1609,7 +1613,10 @@ TEST(PlaybackInfoLabel, R21A2TheDebayerFieldReadsTheDebayerThatProducedThePresen
     ASSERT_TRUE(draw.contains(QStringLiteral("requestContext.debayerName = m_pChosenDebayer ? m_pChosenDebayer->text() : QString();")));
     const QString facts = functionBody(source, QStringLiteral("playback_info_label::Facts MainWindow::playbackInfoFacts( void )"));
     ASSERT_FALSE(facts.contains(QStringLiteral("facts.debayer = m_pChosenDebayer ? m_pChosenDebayer->text() : QString();")));
-    ASSERT_TRUE(facts.contains(QStringLiteral("m_lastPresentedRequestContext.debayerName")));
+    // INFO-2 r1 (pass 21 A1): the facts read it through playbackInfoDebayerName, which reads the presented frame's context
+    ASSERT_TRUE(facts.contains(QStringLiteral("facts.debayer = playbackInfoDebayerName();")));
+    const QString reader = functionBody(source, QStringLiteral("QString MainWindow::playbackInfoDebayerName( void ) const"));
+    ASSERT_TRUE(reader.contains(QStringLiteral("m_lastPresentedRequestContext.debayerName")));
     // the class: no label reader takes the debayer text from the live selection
     const QString info = functionBody(source, QStringLiteral("void MainWindow::updatePlaybackInfoLabel("));
     ASSERT_FALSE(info.contains(QStringLiteral("m_pChosenDebayer")));
@@ -1660,4 +1667,78 @@ TEST(PlaybackInfoLabel, R21A4ANegativeDrawAgeClearsThePreviousMeasuredRate)
     // fpsMeterShouldReset reads a negative age as stalled (R7A1ANegativeOrWrappedDrawAgeCountsAsStalled)
     ASSERT_TRUE(tick.mid(clearAt, 300).contains(QStringLiteral("resetFpsMeterIfIdle( nowTime );")));
     ASSERT_TRUE(playback_fps_meter::fpsMeterShouldReset(true, true, midnightWrapMs));
+}
+
+// INFO-2 r1 (adversary pass 21 A1 on deebf5bb, introduced, major): pause on a full-size CPU LMMSE frame, select AMaZE, and the
+// replacement frame arrives on the same pipeline, scale, route and GPU flags. The relabel key (PlaybackInfoInputs) lacked the debayer
+// name, so refreshPlaybackInfoOnInputChange compared equal and the label kept "LMMSE". The key carries the shown name, read by the
+// one reader the label's facts use.
+TEST(PlaybackInfoLabel, InfoTwoR1A1TheRelabelKeyCarriesTheDebayerNameTheLabelShows)
+{
+    const QString header = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
+    const int structAt = header.indexOf(QStringLiteral("struct PlaybackInfoInputs"));
+    ASSERT_TRUE(structAt >= 0);
+    const int structEnd = header.indexOf(QStringLiteral("PlaybackInfoInputs m_playbackInfoInputs;"), structAt);
+    ASSERT_TRUE(structEnd > structAt);
+    const QString key = header.mid(structAt, structEnd - structAt);
+    ASSERT_TRUE(key.contains(QStringLiteral("QString debayer;")));
+    ASSERT_TRUE(key.contains(QStringLiteral("debayer == o.debayer")));
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString refresh = functionBody(source, QStringLiteral("void MainWindow::refreshPlaybackInfoOnInputChange("));
+    ASSERT_FALSE(refresh.isEmpty());
+    ASSERT_TRUE(refresh.contains(QStringLiteral("inputs.debayer = playbackInfoDebayerName();")));
+    ASSERT_TRUE(refresh.indexOf(QStringLiteral("inputs.debayer = playbackInfoDebayerName();")) < refresh.indexOf(QStringLiteral("if( inputs == m_playbackInfoInputs ) return;")));
+    // the class: the label's facts and the key read the name through the same reader (no second copy of the rule)
+    const QString facts = functionBody(source, QStringLiteral("playback_info_label::Facts MainWindow::playbackInfoFacts( void )"));
+    ASSERT_TRUE(facts.contains(QStringLiteral("facts.debayer = playbackInfoDebayerName();")));
+    const QString reader = functionBody(source, QStringLiteral("QString MainWindow::playbackInfoDebayerName( void ) const"));
+    ASSERT_TRUE(reader.contains(QStringLiteral("m_lastPresentedRequestContext.debayerName")));
+    ASSERT_FALSE(facts.contains(QStringLiteral("m_lastPresentedRequestContext.debayerName")));   // R21A2's pin moved into the reader
+    // the effect on the text: the two names the key now tells apart compose to different labels
+    playback_info_label::Facts before = cpuFullScaleFacts(QStringLiteral("LMMSE"));
+    playback_info_label::Facts after = cpuFullScaleFacts(QStringLiteral("AMaZE"));
+    ASSERT_TRUE(playback_info_label::compose(before, playback_info_label::Toggles(), true)
+                != playback_info_label::compose(after, playback_info_label::Toggles(), true));
+}
+
+// INFO-2 r1 (adversary pass 21 A5 on deebf5bb, introduced, major): paused 1920x1080 CPU processed-8 frame, LMMSE, scale 1. Select
+// scale 4 and read the label before the replacement frame is presented: the live request (4) no longer matches the frame's request
+// context, presentedValid went false, and the debayer field took the LIVE scale ("LMMSE->Scaled") over a frame debayered full size.
+// The field reads the presented frame's own scale (presentedFrameScale).
+TEST(PlaybackInfoLabel, InfoTwoR1A5TheDebayerAttributionReadsThePresentedFramesScaleNotTheLiveRequest)
+{
+    ASSERT_EQ(1, playback_info_label::presentedFrameScaleOf(true, 1));
+    ASSERT_EQ(8, playback_info_label::presentedFrameScaleOf(true, 8));
+    ASSERT_EQ(0, playback_info_label::presentedFrameScaleOf(false, 1));   // no presented request context
+    ASSERT_EQ(0, playback_info_label::presentedFrameScaleOf(true, 3));
+    ASSERT_EQ(0, playback_info_label::presentedFrameScaleOf(true, 0));
+    ASSERT_EQ(0, playback_info_label::presentedFrameScaleOf(true, -1));
+    // the paused scale change: the frame on screen is Full, the live request is Quarter
+    playback_info_label::Facts f = cpuFullScaleFacts(QStringLiteral("LMMSE"));
+    f.requestedScale = 4;
+    f.presentedScale = 1;
+    f.presentedValid = playback_info_label::presentedScaleBelongsToRequest(true, 1, f.requestedScale, f.presentedScale);
+    ASSERT_FALSE(f.presentedValid);   // the scale field keeps the toolbar's rule (the asked scale until the frame follows)
+    f.presentedFrameScale = playback_info_label::presentedFrameScaleOf(true, f.presentedScale);
+    ASSERT_QSTR_EQ(QStringLiteral("LMMSE"), playback_info_label::debayerField(f));   // the retained frame was debayered full size
+    // the other direction: the retained frame is Quarter while the live request went back to Full
+    playback_info_label::Facts g = cpuFullScaleFacts(QStringLiteral("LMMSE"));
+    g.requestedScale = 1;
+    g.presentedScale = 4;
+    g.presentedValid = false;
+    g.presentedFrameScale = playback_info_label::presentedFrameScaleOf(true, 4);
+    ASSERT_QSTR_EQ(QStringLiteral("LMMSE->Scaled"), playback_info_label::debayerField(g));
+    // a frame that says its own debayer scale (a playback-prep frame) still decides first
+    g.debayerScale = 1;
+    ASSERT_QSTR_EQ(QStringLiteral("LMMSE"), playback_info_label::debayerField(g));
+    // no presented frame: the legacy fallback (the requested scale) is unchanged
+    playback_info_label::Facts none = cpuFullScaleFacts(QStringLiteral("LMMSE"));
+    none.requestedScale = 4;
+    none.presentedValid = false;
+    none.presentedScale = 0;
+    ASSERT_QSTR_EQ(QStringLiteral("LMMSE->Scaled"), playback_info_label::debayerField(none));
+    // the wiring: playbackInfoFacts hands the presented frame's scale to the label
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString facts = functionBody(source, QStringLiteral("playback_info_label::Facts MainWindow::playbackInfoFacts( void )"));
+    ASSERT_TRUE(facts.contains(QStringLiteral("facts.presentedFrameScale = playback_info_label::presentedFrameScaleOf( m_lastPresentedRequestContextValid, activeScale );")));
 }

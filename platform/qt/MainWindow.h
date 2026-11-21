@@ -906,13 +906,15 @@ private:
         bool gpuBilinear = false;
         int presentedRoute = 0;   // r12 adversary A1: the presented frame's CPU render-path code (a proxy route relabels)
         int debayerScale = 0;     // r13 adversary pass 15 A1: a prep frame's debayer scale (presentedPlaybackDebayerScale)
+        QString debayer;          // INFO-2 r1 (pass 21 A1): the debayer name the label shows (playbackInfoDebayerName)
         bool operator==( const PlaybackInfoInputs &o ) const
         {
             return pipelineStatus == o.pipelineStatus && scopeCaveat == o.scopeCaveat && requestedScale == o.requestedScale
                 && presentedScale == o.presentedScale && requestContextValid == o.requestContextValid
                 && requestContextScale == o.requestContextScale && gpuAmaze == o.gpuAmaze && gpuBilinear == o.gpuBilinear
                 && presentedRoute == o.presentedRoute
-                && debayerScale == o.debayerScale;
+                && debayerScale == o.debayerScale
+                && debayer == o.debayer;   // presentedFrameScaleOf is a function of presentedScale + requestContextValid, both keyed
         }
     };
     PlaybackInfoInputs m_playbackInfoInputs;
@@ -2411,6 +2413,7 @@ private:
     // The one push of the look label (plus the info lines in fullscreen) to the status bar and the corner surfaces.
     void pushLookLabelOverlay( void );
     playback_info_label::Facts playbackInfoFacts( void );
+    QString playbackInfoDebayerName( void ) const;   // INFO-2 r1 (pass 21 A1): the shown debayer name, also the relabel key's
     // r12 adversary A1: the presented frame's CPU render-path code, read from its own telemetry (0 = full recon or unknown).
     int presentedPlaybackRouteCode( void ) const;
     // r12 pass-13 A1: the presented frame's shown scale (a CPU prep frame: the render's achieved size times the prep's factor).

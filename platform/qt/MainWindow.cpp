@@ -25033,6 +25033,7 @@ void MainWindow::refreshPlaybackInfoOnInputChange( GpuPlaybackPipelineStatus sta
     inputs.gpuBilinear = m_lastPresentedFrameUsedGpuBilinearDebayer;
     inputs.presentedRoute = presentedPlaybackRouteCode();   // r12 adversary A1: a proxy route change relabels
     inputs.debayerScale = presentedPlaybackDebayerScale();   // r13 adversary pass 15 A1: so does the prep frame's debayer scale
+    inputs.debayer = playbackInfoDebayerName();   // INFO-2 r1 (pass 21 A1): the shown name, so a debayer change relabels
     if( inputs == m_playbackInfoInputs ) return;
     m_playbackInfoInputs = inputs;
     // r1 pass-3 A2: while playing, flushPlaybackInfoIfDue's 250 ms gate relabels, so a per-frame flip stays at most 4 Hz.
@@ -34314,6 +34315,16 @@ void MainWindow::pushLookLabelOverlay( void )
     ui->graphicsView->setLookLabel( gpuWindow ? QString() : m_lookLabelOverlayText );
 }
 
+// INFO-2 r1 (adversary pass 21 A1 on deebf5bb): the debayer name the label shows, the one reader for the label's facts and for
+// its relabel key. The key lacked it, so after an AMaZE selection while paused the replacement frame arrived with the same
+// pipeline, scale, route and GPU flags, the key compared equal, and the label kept the old name.
+QString MainWindow::playbackInfoDebayerName( void ) const
+{
+    return ( m_lastPresentedRequestContextValid && !m_lastPresentedRequestContext.debayerName.isEmpty() )
+        ? m_lastPresentedRequestContext.debayerName
+        : ( m_pChosenDebayer ? m_pChosenDebayer->text() : QString() );
+}
+
 playback_info_label::Facts MainWindow::playbackInfoFacts( void )
 {
     playback_info_label::Facts facts;
@@ -34340,13 +34351,14 @@ playback_info_label::Facts MainWindow::playbackInfoFacts( void )
     facts.presentedValid = playback_info_label::presentedScaleBelongsToRequest(
         m_lastPresentedRequestContextValid, m_lastPresentedRequestContext.playbackScaleFactorPolicy,
         facts.requestedScale, activeScale );
+    // INFO-2 r1 (adversary pass 21 A5): the debayer attribution reads the retained frame's own scale, never the live request.
+    facts.presentedFrameScale = playback_info_label::presentedFrameScaleOf( m_lastPresentedRequestContextValid, activeScale );
     // The chosen debayer's menu text, never the playback debayer label helper (it returns "receipt").
     // r21 (adversary pass 20 A2): the debayer that produced the PRESENTED frame (recorded when it was requested), never the live
     // selection: after an AMaZE selection the label must keep reading the old name until the replacement frame is presented.
     // No presented frame yet (or none recorded): the selection, which is then what will produce it.
-    facts.debayer = ( m_lastPresentedRequestContextValid && !m_lastPresentedRequestContext.debayerName.isEmpty() )
-        ? m_lastPresentedRequestContext.debayerName
-        : ( m_pChosenDebayer ? m_pChosenDebayer->text() : QString() );
+    // INFO-2 r1 (adversary pass 21 A1): one reader, shared with the relabel key (refreshPlaybackInfoOnInputChange).
+    facts.debayer = playbackInfoDebayerName();
     facts.debayerOnGpu = m_lastPresentedFrameUsedGpuAmazeDebayer || m_lastPresentedFrameUsedGpuBilinearDebayer;
     // r3 (adversary a271daee A2): what the GPU ran (LMMSE selected may render with GPU AMaZE).
     facts.gpuDebayer = m_lastPresentedFrameUsedGpuAmazeDebayer ? QStringLiteral( "AMaZE" )

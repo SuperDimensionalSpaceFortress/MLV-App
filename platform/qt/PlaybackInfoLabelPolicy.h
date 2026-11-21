@@ -33,7 +33,10 @@ struct Facts
     int requestedScale = 0;           // 1, 2, 4, 8 (0 = unknown, the scale field is omitted)
     int presentedScale = 0;
     bool presentedValid = false;      // presentedScale belongs to the requested scale's frames
-    QString debayer;                  // the chosen debayer's menu text ("" = omitted)
+    int presentedFrameScale = 0;      // INFO-2 r1 (pass 21 A5): the scale the PRESENTED frame was rendered at, independent of the live
+                                      // request (presentedValid compares against it); 0 = no valid presented frame, debayerField then
+                                      // falls back to presentedScale / requestedScale.
+    QString debayer;                 // the chosen debayer's menu text ("" = omitted)
     bool debayerOnGpu = false;
     QString gpuDebayer;               // r3: the algorithm the GPU ran for the presented frame ("AMaZE", "Bilinear"; "" = none)
     int presentedRoute = 0;           // r12 (adversary A1): the presented frame's CPU render-path code (render_thread_phase4b_path,
@@ -135,7 +138,11 @@ inline QString debayerField( const Facts &facts )
     // r7 (adversary pass 10 A1 on 235e3275): a CPU frame below full scale never runs the selected debayer. Every scaled CPU
     // route bins the Bayer to RGB (pl_downsample_bayer_to_rgb_2x/4x/8x) or runs bilinear on a reduced Bayer (video_mlv.c),
     // so it reads "<selected>->Scaled" (selected -> ran), never "AMaZE". The scale is the one the scale field names as shown.
-    const int shownScale = ( facts.presentedValid && facts.presentedScale > 0 ) ? facts.presentedScale : facts.requestedScale;
+    // INFO-2 r1 (adversary pass 21 A5 on deebf5bb): the retained frame's OWN scale decides, never the live request: a paused
+    // scale change makes presentedValid false (the live request no longer matches the frame's), and the label then read the new
+    // request ("LMMSE->Scaled") over a frame that was debayered full size. The legacy shown scale is the fallback only.
+    const int shownScale = facts.presentedFrameScale > 0 ? facts.presentedFrameScale
+        : ( ( facts.presentedValid && facts.presentedScale > 0 ) ? facts.presentedScale : facts.requestedScale );
     // r13 (adversary pass 15 A1 on 189dd4f9): a playback-prep frame may debayer full size with the selected algorithm and be
     // box-reduced afterwards (the recon-reuse refusal), so the frame's own debayer scale decides, not the scale it is shown at.
     const int debayerRanScale = facts.debayerScale > 0 ? facts.debayerScale : shownScale;
@@ -234,6 +241,15 @@ inline bool presentedScaleBelongsToRequest( bool contextValid, int contextPolicy
 {
     const bool activeValid = activeScale == 1 || activeScale == 2 || activeScale == 4 || activeScale == 8;
     return activeValid && contextValid && requestedScale > 0 && contextPolicyScale == requestedScale;
+}
+
+/*! \brief INFO-2 r1 (adversary pass 21 A5 on deebf5bb): the scale the presented frame itself was rendered at, whatever scale is
+ *  requested now. `activeScale` (the presented frame's shown scale) must be 1, 2, 4 or 8 and the presented request context known;
+ *  0 otherwise (debayerField then keeps the legacy fallback). */
+inline int presentedFrameScaleOf( bool contextValid, int activeScale )
+{
+    const bool activeValid = activeScale == 1 || activeScale == 2 || activeScale == 4 || activeScale == 8;
+    return ( contextValid && activeValid ) ? activeScale : 0;
 }
 
 /*! \brief r12 pass-2 A1 (c58f5bd8): the scale a CPU playback-prep frame is presented at. OutputDebayered16 renders at the size the
