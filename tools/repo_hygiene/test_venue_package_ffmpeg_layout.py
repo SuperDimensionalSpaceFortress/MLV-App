@@ -304,8 +304,18 @@ class ScriptsInstallUnconditionallyTests(unittest.TestCase):
         # PR 862 r10 (the split, sol r9 B1 caller build-release.ps1:247): the kill is root-only, so the success text says the ROOT was
         # killed and the tree was SEEN gone; and a probe stop that is NOT confirmed is a typed FAIL with its own non-zero exit, never a
         # WARN (a confirmed-killed timeout keeps its WARN).
-        self.assertIn("its root was killed (root-only kill) and its process tree was seen gone", body)
+        # PR 862 r11 re-baseline (Grok G8): a confirmed stop says only that no tree member was still LISTED; it does not prove that no
+        # descendant is alive (adversary bf1ac39c-A4/A5, fa89f1b3-A6, card PINNED-PAYLOAD-KILL-TREE-DST-1), so no text may claim that.
+        self.assertIn("its root was killed (root-only kill) and no tree member was still listed (not proof that no descendant runs: "
+                      "PINNED-PAYLOAD-KILL-TREE-DST-1)", body)
         self.assertNotIn("its process tree was killed", body)
+        for path in (HELPER_MODULE, BUILD_RELEASE, ASSEMBLER):
+            source = _normalised(path)
+            for claim in ("root killed, tree seen gone", "process tree was seen gone", "a live descendant leaves it false",
+                          "a live one leaves the stop unconfirmed", "so a live one leaves"):
+                self.assertNotIn(claim, source, f"{path.name} still claims the closed invariant: {claim!r}")
+        self.assertIn("KNOWN HOLE", text)
+        self.assertIn("a confirmed-timeout recovery\n# can run while an orphan is live", text)
         self.assertIn("$probeStopUnconfirmed = ($probeTimedOut -and -not $probeKillConfirmed)", release)
         self.assertRegex(release, r"\} elseif \(\$probeStopUnconfirmed\) \{\n(?:\s*#[^\n]*\n)*\s*Write-Host \"FAIL: launch probe timed out")
         self.assertIn("10=the launch probe timed out and its stop was NOT confirmed", release)
@@ -340,7 +350,8 @@ class ScriptsInstallUnconditionallyTests(unittest.TestCase):
         flat = [a or b for a, b in items]
         self.assertEqual(flat[:3], ["-3", "-m", "tools.repo_hygiene.extract_vendored_native_payload"])
         self.assertNotIn("-I", flat, "-I drops the working directory from sys.path and with it the tools package")
-        for flag, value in (("--repo-root", "$RepoRoot"), ("--payload-id", "$PayloadId"), ("--archive-reference", "$ArchiveReference"), ("--output-dir", "$OutputDir")):
+        # PR 862 r11 re-baseline (adversary fa89f1b3-A1): the extractor is given the HELD output folder's own resolved path.
+        for flag, value in (("--repo-root", "$RepoRoot"), ("--payload-id", "$PayloadId"), ("--archive-reference", "$ArchiveReference"), ("--output-dir", "$pinnedOutputDir")):
             self.assertEqual(flat[flat.index(flag) + 1], value)
         self.assertEqual(flat[-1], "--verify-installed")
         # adversary ae560106-A2: the local install validates the named record alone, never the tracked-file census.
@@ -517,6 +528,97 @@ class HelperBehaviourTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         for name, path in traces.items():
             self.assertFalse(path.exists(), f"{name} reached a git child: {path} was written")
+
+    def _install_full(self, output_dir: str, prelude: str = "", epilogue: str = "", extra_env: dict | None = None) -> dict:
+        module = str(HELPER_MODULE).replace("'", "''")
+        script = (
+            prelude
+            + f"Import-Module '{module}' -Force\n"
+            f"$r = {HELPER} -RepoRoot $env:FFX_REPO -PayloadId '{PAYLOAD_ID}' -ArchiveReference 'ffmpegWin64.zip' -OutputDir $env:FFX_OUT -TimeoutSec 600\n"
+            + epilogue
+            + "[ordered]@{ ok = $r.ok; reason = $r.reason; exitCode = $r.exitCode;"
+            " outputPinned = $(if ($r.PSObject.Properties['outputPinned']) { $r.outputPinned } else { $null });"
+            " outputDir = $(if ($r.PSObject.Properties['outputDir']) { $r.outputDir } else { $null }); installed = @($r.installed) }"
+            " | ConvertTo-Json -Depth 4 -Compress\n"
+        )
+        env = dict(os.environ, FFX_REPO=str(ROOT), FFX_OUT=output_dir, **(extra_env or {}))
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                              capture_output=True, text=True, timeout=900, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_an_output_folder_that_cannot_be_pinned_refuses_the_install_before_any_child(self) -> None:
+        # PR 862 r11 (Grok G6(c), adversary fa89f1b3-A1 related case): another handle holds OutputDir with DELETE access and share-read
+        # only (no share-write, no share-delete), so the install's pin fails with a sharing violation. Open-PinnedDirectoryPin returned
+        # $null, the install started the child anyway and a timeout recovery would have used the caller's spelling. Now the install
+        # refuses before any child, with the typed code and the pin's own detail, and says the folder was not pinned.
+        out = self.tmp / "held-elsewhere"
+        out.mkdir()
+        holder = (
+            "Add-Type -TypeDefinition @\"\n"
+            "using System; using System.Runtime.InteropServices; using Microsoft.Win32.SafeHandles;\n"
+            "public static class FfxForeignHolder {\n"
+            "  [DllImport(\"kernel32.dll\", CharSet = CharSet.Unicode, SetLastError = true)]\n"
+            "  public static extern SafeFileHandle CreateFileW(string n, uint a, uint s, IntPtr sa, uint d, uint f, IntPtr t);\n"
+            "}\n"
+            "\"@\n"
+            # DELETE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ only, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS (a directory handle)
+            "$holder = [FfxForeignHolder]::CreateFileW($env:FFX_OUT, 0x10080, 0x1, [IntPtr]::Zero, 3, 0x02000000, [IntPtr]::Zero)\n"
+            "if ($holder.IsInvalid) { throw ('the foreign holder could not open the folder: win32 ' + [Runtime.InteropServices.Marshal]::GetLastWin32Error()) }\n"
+        )
+        result = self._install_full(str(out), prelude=holder, epilogue="$holder.Dispose()\n")
+        self.assertFalse(result["ok"], result)
+        self.assertTrue(result["reason"].startswith("output-pin-failed: "), result)
+        self.assertIn("could not be pinned", result["reason"])
+        self.assertIn("(win32 32)", result["reason"], "the pin's own failure detail (a sharing violation) is carried")
+        self.assertIn("no extractor was started", result["reason"])
+        self.assertIsNone(result["exitCode"], "no child ran")
+        self.assertIs(result["outputPinned"], False, result)
+        self.assertEqual(list(out.iterdir()), [], "nothing was installed or staged")
+
+    def test_the_extractor_installs_into_the_held_folders_resolved_path(self) -> None:
+        # PR 862 r11 (adversary fa89f1b3-A1): OutputDir current is a junction to A when the install pins A. The extractor was still given
+        # the junction spelling, so a retarget to B after the pin made it back up B's file while the recovery looked in A. The extractor
+        # (and the report check, and any recovery) now get the HELD folder's own resolved path: the install lands in A, is reported under
+        # A's path (never the junction spelling), and the result says the folder was pinned and which one.
+        a = self.tmp / "A"
+        a.mkdir()
+        current = self.tmp / "current"
+        made = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+                               "$null = New-Item -ItemType Junction -Path $env:FFX_CUR -Target $env:FFX_A"],
+                              capture_output=True, text=True, timeout=60, env=dict(os.environ, FFX_CUR=str(current), FFX_A=str(a)))
+        self.assertEqual(made.returncode, 0, made.stderr)
+        self.addCleanup(lambda: os.path.lexists(current) and os.rmdir(current))
+        result = self._install_full(str(current))
+        self.assertTrue(result["ok"], result)
+        self.assertIs(result["outputPinned"], True, result)
+        self.assertTrue(os.path.samefile(result["outputDir"], a), result)
+        self.assertNotIn("current", result["outputDir"], "the held folder's resolved path, not the junction spelling")
+        rows = result["installed"]
+        self.assertEqual(len(rows), 1, result)
+        self.assertTrue(os.path.samefile(os.path.dirname(rows[0]["path"]), a), result)
+        self.assertNotIn("current", rows[0]["path"], "reported under the held folder's path, not the junction spelling")
+        self.assertTrue((a / "ffmpeg.exe").is_file())
+        # an absent output folder is created, THEN pinned, before the child starts
+        absent = self.tmp / "absent" / "deeper"
+        result = self._install_full(str(absent))
+        self.assertTrue(result["ok"], result)
+        self.assertIs(result["outputPinned"], True, result)
+        self.assertTrue((absent / "ffmpeg.exe").is_file())
+
+    def test_an_inherited_utf16_python_io_encoding_still_gives_a_readable_report(self) -> None:
+        # PR 862 r11 (adversary bf1ac39c-A6, Grok G7(a)): PYTHONIOENCODING=utf-16-le was inherited by the child, which verified and
+        # published the pinned file and then printed a NUL-interleaved report the wrapper refused. The child's report is UTF-8 now.
+        out = self.tmp / "out"
+        out.mkdir()
+        result = self._run(str(out), extra_env={"PYTHONIOENCODING": "utf-16-le"})
+        self.assertTrue(result["ok"], result)
+        self.assertTrue((out / "ffmpeg.exe").is_file())
+        text = _normalised(HELPER_MODULE)
+        for line in ("$psi.Environment['PYTHONIOENCODING'] = 'utf-8'", "$psi.Environment['PYTHONUTF8'] = '1'",
+                     "$psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)",
+                     "$psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)"):
+            self.assertIn(line, text)
 
     def test_a_hash_that_throws_returns_a_typed_failure_instead_of_throwing(self) -> None:
         # adversary 32bf39a9-A2: a FileShare.None handle on the installed ffmpeg.exe makes the helper's own hash throw. Get-FileHash is
@@ -1019,8 +1121,16 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         payload = b"MZ pinned ffmpeg bytes" * 100
         # adversary bf1ac39c-A7: a reserved device name (NUL, CON, COM1, LPT1, AUX, PRN; with or without an extension) cannot be
         # extracted on Windows, so the package would pass and then fail to expand.
+        # PR 862 r11 (adversary fa89f1b3-A3, Grok G10): EVERY entry of the one reserved-name list, bare, lower case, with an extension
+        # and below a folder: CON, PRN, AUX, NUL, COM0-9, LPT0-9, COM and LPT with the superscript digits 1-3, CONIN$ and CONOUT$.
+        reserved = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+        for stem in ("COM", "LPT"):
+            reserved += [f"{stem}{digit}" for digit in "0123456789"] + [f"{stem}{digit}" for digit in ("\u00b9", "\u00b2", "\u00b3")]
+        # each name once (one pwsh per case), rotating through the bare, lower-case-with-extension and below-a-folder forms
+        reserved_forms = [(name, name.lower() + ".txt", "sub/" + name + ".dll")[index % 3] for index, name in enumerate(reserved)]
         for alias in ("./ffmpeg.exe", ".\\ffmpeg.exe", "/ffmpeg.exe", "sub/../ffmpeg.exe", "ffmpeg.exe.", "ffmpeg.exe ",
-                      "FFMPEG~1.EXE", "ffmpeg.exe::$DATA", "sub//x.dll", "NUL", "nul.txt", "sub/Com1", "LPT9.dll", "aux", "PRN.x", "con"):
+                      "FFMPEG~1.EXE", "ffmpeg.exe::$DATA", "sub//x.dll", "NUL", "nul.txt", "sub/Com1", "LPT9.dll", "aux", "PRN.x", "con",
+                      *reserved_forms):
             with self.subTest(alias=alias):
                 bad = self._zip(f"alias-{abs(hash(alias))}.zip", {"MLVApp.exe": b"exe", "ffmpeg.exe": payload, alias: b"MZwrong"})
                 result = self._check_zip(bad, payload)
@@ -1032,6 +1142,16 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         self.assertIn("name one extracted path", result["reason"])
         good = self._zip("good-tree.zip", {"MLVApp.exe": b"exe", "ffmpeg.exe": payload, "pixel_maps/": b"", "pixel_maps/a.fpm": b"a"})
         self.assertTrue(self._check_zip(good, payload)["ok"], "a canonical tree with a directory entry passes")
+        # Names that only START like a device name are ordinary files and pass (the list is not a prefix match).
+        near = self._zip("near-names.zip", {"ffmpeg.exe": payload, "CONSOLE.txt": b"a", "COM10.dll": b"b", "LPTX": b"c",
+                                            "NULL.dat": b"d", "AUXILIARY": b"e", "CONIN.txt": b"f"})
+        self.assertTrue(self._check_zip(near, payload)["ok"], "a name that merely starts like a device name is not refused")
+        # ONE constant list, ASCII source: the superscript digits are regex escapes.
+        text = _normalised(HELPER_MODULE)
+        self.assertEqual(text.count("$script:PinnedReservedDeviceNames = @("), 1)
+        self.assertIn(r"'COM[0-9\u00B9\u00B2\u00B3]', 'LPT[0-9\u00B9\u00B2\u00B3]', 'CONIN\$', 'CONOUT\$'", text)
+        self.assertNotIn("COM[0-9]|LPT[0-9]", text, "no second, shorter reserved-name list")
+        self.assertTrue(HELPER_MODULE.read_bytes().isascii(), "the module must stay ASCII-only")
         # adversary a7bf472f-A4: ffmpeg.exe/child.txt makes ffmpeg.exe an (implicit) directory on extraction, so the root ffmpeg.exe entry
         # cannot be written there. A file entry and any entry below it name one path as both a file and a directory: refused in either
         # order, in any case, member or not.
@@ -1110,6 +1230,38 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         self._assert_backup_reported(result, mine / "ffmpeg.exe")
         self.assertEqual((other / "ffmpeg.exe").read_bytes(), b"Q-OLD")
 
+    def test_recovery_moves_only_its_own_transactions_backups(self) -> None:
+        # PR 862 r11 (adversary fa89f1b3-A2): OutputDir has no ffmpeg.exe; transaction MINE holds OLD, a second plain transaction OTHER
+        # holds OTHER. Right after the recovery lists MINE, a concurrent rename moves MINE aside and puts OTHER's folder under MINE's
+        # name. The recovery used the listed pathnames, so it moved OTHER out and said ffmpeg.exe was restored. The transaction folder is
+        # now HELD from before its listing until the last move (it cannot be renamed), and the backups move from the held folder.
+        out = self.tmp / "out"
+        mine = out / f".vendored-payload-transaction-{self.MINE}"
+        other = out / f".vendored-payload-transaction-{self.OTHER}"
+        aside = out / "moved-aside"
+        mine.mkdir(parents=True)
+        other.mkdir()
+        (mine / "ffmpeg.exe").write_bytes(b"OLD")
+        (other / "ffmpeg.exe").write_bytes(b"OTHER")
+        result = self._ps(
+            "function global:Get-ChildItem { [CmdletBinding()] param([string]$LiteralPath, [switch]$Force)\n"
+            "  $rows = @(Microsoft.PowerShell.Management\\Get-ChildItem -LiteralPath $LiteralPath -Force -ErrorAction Stop)\n"
+            "  if (-not $global:FfxSwapTried) {\n"
+            "    $global:FfxSwapTried = $true\n"
+            "    try { [System.IO.Directory]::Move($env:FFX_MINE, $env:FFX_ASIDE); [System.IO.Directory]::Move($env:FFX_OTHER, $env:FFX_MINE);"
+            " $global:FfxSwap = 'swapped' } catch { $global:FfxSwap = 'refused: ' + $_.Exception.Message }\n"
+            "  }\n"
+            "  return $rows\n"
+            "}\n"
+            "$r = & $m { param($o, $t) Restore-PinnedPayloadTransaction -OutputDir $o -TransactionId $t } $env:FFX_OUT $env:FFX_TX\n"
+            "[ordered]@{ restored = @($r.restored); errors = @($r.errors); found = $r.found; swap = [string]$global:FfxSwap } | ConvertTo-Json -Compress\n",
+            FFX_OUT=str(out), FFX_TX=self.MINE, FFX_MINE=str(mine), FFX_OTHER=str(other), FFX_ASIDE=str(aside))
+        self.assertTrue(result["swap"].startswith("refused"), f"the held transaction folder must not be renamable: {result}")
+        self.assertEqual(result["restored"], ["ffmpeg.exe"], result)
+        self.assertEqual((out / "ffmpeg.exe").read_bytes(), b"OLD", "only this transaction's own backup may be restored")
+        self.assertEqual((other / "ffmpeg.exe").read_bytes(), b"OTHER", "another transaction's backup is never moved")
+        self.assertFalse(aside.exists())
+
     def test_recovery_restores_only_into_the_output_folder_held_since_the_start(self) -> None:
         # adversary a7bf472f-A7: OutputDir current was a junction to A, the extractor moved OLD into A's transaction, the stop confirmed,
         # and current was retargeted to B before recovery; recovery re-resolved the spelling, found nothing in B and still said
@@ -1124,7 +1276,9 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         (backup / "ffmpeg.exe").write_bytes(b"OLD")
         b.mkdir()
         current = self.tmp / "current"
-        call = "& $m { param($o, $t, $p) Complete-PinnedPayloadTimeoutRecovery -OutputDir $o -TransactionId $t -Pin $p }"
+        # PR 862 r11 re-baseline (Grok G6): the recovery takes the pin only (no -OutputDir spelling), a pin is always an object whose
+        # .handle says whether it holds, and a recovery without a held folder refuses and says so instead of using any spelling.
+        call = "& $m { param($t, $p) Complete-PinnedPayloadTimeoutRecovery -TransactionId $t -Pin $p }"
         result = self._ps(
             "$null = New-Item -ItemType Junction -Path $env:FFX_CUR -Target $env:FFX_A\n"
             "$pin = & $m { param($o) Open-PinnedDirectoryPin -LiteralPath $o } $env:FFX_CUR\n"
@@ -1132,12 +1286,18 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
             "$null = New-Item -ItemType Junction -Path $env:FFX_CUR -Target $env:FFX_B\n"
             "$renameRefused = $false\n"
             "try { [System.IO.Directory]::Move($env:FFX_A, $env:FFX_A + '-moved') } catch { $renameRefused = $true }\n"
-            f"$moved = {call} $env:FFX_CUR $env:FFX_TX $pin\n"
-            "if ($pin) { $pin.handle.Dispose() }\n"
+            f"$moved = {call} $env:FFX_TX $pin\n"
+            "if ($pin.handle) { $pin.handle.Dispose() }\n"
             "[System.IO.Directory]::Delete($env:FFX_CUR)\n"
-            f"$none = {call} $env:FFX_B $env:FFX_TX $null\n"
-            "[ordered]@{ pinned = [bool]$pin; renameRefused = $renameRefused; moved = $moved.text; movedRestored = @($moved.restored);"
-            " none = $none.text } | ConvertTo-Json -Compress\n",
+            "$pinB = & $m { param($o) Open-PinnedDirectoryPin -LiteralPath $o } $env:FFX_B\n"
+            f"$none = {call} $env:FFX_TX $pinB\n"
+            "$pinB.handle.Dispose()\n"
+            f"$unpinned = {call} $env:FFX_TX $null\n"
+            "$absentPin = & $m { param($o) Open-PinnedDirectoryPin -LiteralPath $o } ($env:FFX_B + '-absent')\n"
+            f"$absent = {call} $env:FFX_TX $absentPin\n"
+            "[ordered]@{ pinned = [bool]$pin.handle; renameRefused = $renameRefused; moved = $moved.text; movedRestored = @($moved.restored);"
+            " none = $none.text; unpinned = $unpinned.text; absent = $absent.text; absentHeld = [bool]$absentPin.handle;"
+            " absentDetail = [string]$absentPin.detail } | ConvertTo-Json -Compress\n",
             FFX_CUR=str(current), FFX_A=str(a), FFX_B=str(b), FFX_TX=self.MINE)
         self.assertTrue(result["pinned"], result)
         self.assertTrue(result["renameRefused"], "the held output folder must not be renamable")
@@ -1147,6 +1307,10 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         self.assertFalse((b / "ffmpeg.exe").exists(), "nothing may be restored into the retargeted folder")
         self.assertIn("no transaction folder", result["none"])
         self.assertNotIn("reconciled", result["none"])
+        for key in ("unpinned", "absent"):
+            self.assertIn("the output folder was not pinned, so the recovery refused to run", result[key], result)
+        self.assertFalse(result["absentHeld"], result)
+        self.assertIn("could not be pinned", result["absentDetail"], result)
 
     def test_a_transaction_that_cannot_be_listed_is_an_error_never_silence(self) -> None:
         # adversary 78d626ed-A3: a backup listing that failed (ListDirectory denied) was dropped by SilentlyContinue and recovery
@@ -1196,18 +1360,23 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         self.assertNotIn("preexistingTransactions", body, "recovery is by exact id, never by which folders look new")
         branch = body[body.index("if ($result.timedOut) {"): body.index("if ($result.exitCode -ne 0) {")]
         # adversary a7bf472f-A7: the recovery is bound to the output folder's identity taken before the child started.
-        self.assertRegex(branch, r"if \(\$result\.killConfirmed\) \{\n\s*\$recovery = Complete-PinnedPayloadTimeoutRecovery -OutputDir \$OutputDir "
+        # PR 862 r11 re-baseline (Grok G6): the recovery takes the held pin only; there is no spelling to fall back to.
+        self.assertRegex(branch, r"if \(\$result\.killConfirmed\) \{\n\s*\$recovery = Complete-PinnedPayloadTimeoutRecovery "
                                  r"-TransactionId \$transactionId -Pin \$outputPin\n")
         # adversary bf1ac39c-A1: the output folder is HELD from before the child starts until the recovery is done.
         self.assertLess(body.index("$outputPin = Open-PinnedDirectoryPin -LiteralPath $OutputDir"),
                         body.index("[System.Diagnostics.Process]::Start($psi)"))
-        self.assertIn("if ($outputPin) { $outputPin.handle.Dispose() }", body)
+        # Grok G6: a pin that failed refuses the install, typed, before the child is even described.
+        self.assertLess(body.index("output-pin-failed: the output folder $OutputDir could not be held"),
+                        body.index("$psi = [System.Diagnostics.ProcessStartInfo]::new("))
+        self.assertIn("$outputPin.handle.Dispose()", body)
+        self.assertNotIn("if ($Pin) { $OutputDir = [string]$Pin.path }", text, "no recovery falls back to the caller's spelling")
         recovery = re.search(r"function Complete-PinnedPayloadTimeoutRecovery \{.*?\n\}", text, re.S).group(0)
         self.assertEqual(recovery.count("Restore-PinnedPayloadTransaction -OutputDir $OutputDir -TransactionId $TransactionId"), 1)
         self.assertIn("was NOT reconciled", branch)
-        # PR 862 r10 re-baseline: killConfirmed is the ROOT-ONLY stop's confirmation (the root killed, the tree seen gone); there is no
-        # recovery after an unconfirmed stop: no second kill, no retry, no restore.
-        self.assertIn("its root was killed (root-only kill) and its process tree was seen gone", branch)
+        # PR 862 r10 re-baseline: killConfirmed is the ROOT-ONLY stop's confirmation; there is no recovery after an unconfirmed stop: no
+        # second kill, no retry, no restore. PR 862 r11 (Grok G8): its text claims only that no tree member was still listed.
+        self.assertIn("its root was killed (root-only kill) and no tree member was still listed", branch)
         self.assertEqual(branch.count("Stop-PinnedPayloadChild"), 0, "no second stop or kill in the timeout branch")
         self.assertEqual(branch.count("Restore-PinnedPayloadTransaction"), 0, "the branch restores only through the identity-bound recovery")
         restore =text[text.index("function Restore-PinnedPayloadTransaction {"): text.index(f"function {HELPER} {{")]
@@ -1574,6 +1743,73 @@ class RecordOnlyInstallTests(unittest.TestCase):
             code = extractor.main(self._argv("--record-only", "--manifest", str(tampered)))
         self.assertEqual(code, 1, err.getvalue())
         self.assertIn("sha256 mismatch", err.getvalue())
+        self.assertEqual(list(self.out.iterdir()), [])
+
+    def _tampered_manifest(self, **changes: object) -> Path:
+        manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+        record = next(r for r in manifest["payloads"] if r.get("id") == PAYLOAD_ID)
+        record.update(changes)
+        tampered = Path(self._tmp.name) / "tampered-manifest.json"
+        tampered.write_text(json.dumps(manifest), encoding="utf-8")
+        return tampered
+
+    def test_record_only_refuses_an_archive_path_that_is_tracked_only_as_a_glob(self) -> None:
+        # PR 862 r11 (adversary fa89f1b3-A4, bf1ac39c-A3): the record's path platform/qt/[F]Fmpeg/ffmpegWin64.zip names an UNTRACKED copy
+        # of the pinned archive at the literal bracket folder. `git ls-files -- <path>` read it as a glob and returned the tracked
+        # platform/qt/FFmpeg row, so the untracked file was admitted. The tracked check is a :(literal) pathspec whose row must name the
+        # exact path. The copy is a hard link (no 40 MB copy) and is removed afterwards; nothing tracked is touched.
+        import io
+        from unittest import mock
+        from tools.repo_hygiene import extract_vendored_native_payload as extractor
+
+        real = PurePosixPath(_ffmpeg_record()["path"])
+        bracket = PurePosixPath(*real.parts[:-2], "[" + real.parts[-2][0] + "]" + real.parts[-2][1:], real.name)
+        folder = ROOT / Path(*bracket.parts[:-1])
+        self.assertFalse(folder.exists(), f"{folder} must not exist before the test")
+        folder.mkdir()
+        self.addCleanup(folder.rmdir)
+        copy = folder / bracket.name
+        try:
+            os.link(ROOT / Path(*real.parts), copy)
+        except OSError:
+            shutil.copyfile(ROOT / Path(*real.parts), copy)
+        self.addCleanup(copy.unlink)
+        tampered = self._tampered_manifest(path=str(bracket))
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err, mock.patch("sys.stdout", new_callable=io.StringIO):
+            code = extractor.main(self._argv("--record-only", "--manifest", str(tampered)))
+        self.assertEqual(code, 1, err.getvalue())
+        self.assertIn("must be Git-tracked at exactly this path", err.getvalue())
+        self.assertEqual(list(self.out.iterdir()), [])
+
+    def test_a_mismatched_archive_reference_is_refused_before_any_record_file_is_read(self) -> None:
+        # PR 862 r11 (adversary fa89f1b3-A5): the selected record's path named another TRACKED file (here a script; the finding used a
+        # clip fixture) with bytes 1. The record-only validation opened and read it before the archive-reference check refused. The
+        # caller's reference is now checked first, so that file is never opened.
+        import io
+        from unittest import mock
+        from tools.repo_hygiene import extract_vendored_native_payload as extractor
+
+        other = "tools/build-release.ps1"
+        tampered = self._tampered_manifest(path=other, bytes=1)
+        opened: list[Path] = []
+        real_path_open = Path.open
+        real_os_open = os.open
+
+        def path_open(self, *args, **kwargs):
+            opened.append(Path(self))
+            return real_path_open(self, *args, **kwargs)
+
+        def os_open(path, *args, **kwargs):
+            opened.append(Path(os.fsdecode(path)))
+            return real_os_open(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", path_open), mock.patch.object(os, "open", os_open), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            code = extractor.main(self._argv("--record-only", "--manifest", str(tampered)))
+        self.assertEqual(code, 1, err.getvalue())
+        self.assertIn("archive reference mismatch", err.getvalue())
+        target = (ROOT / other).resolve()
+        self.assertEqual([str(p) for p in opened if p.resolve() == target], [], "the unrelated tracked file was opened")
         self.assertEqual(list(self.out.iterdir()), [])
 
 

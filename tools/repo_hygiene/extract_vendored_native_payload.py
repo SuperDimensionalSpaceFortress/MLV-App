@@ -13,11 +13,13 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .hidden_spawn import no_window_flags
 from .vendored_native_payloads import (
     DEFAULT_MANIFEST,
     ArchiveView,
@@ -38,10 +40,38 @@ from .vendored_native_payloads import (
 )
 
 
+def _require_literally_tracked(repo_root: Path, relative: str, label: str) -> None:
+    """The EXACT path ``relative`` is one stage-0 regular file in the Git index (PR 862 r11, adversary fa89f1b3-A4, bf1ac39c-A3).
+
+    ``git ls-files -- <path>`` treats the path as a glob, so ``platform/qt/[F]Fmpeg/ffmpegWin64.zip`` matched the tracked
+    ``platform/qt/FFmpeg/ffmpegWin64.zip`` while an untracked copy at the literal bracket path was the file opened. The pathspec here
+    is ``:(literal)`` and the one returned row must name exactly ``relative``.
+    """
+    try:
+        tracked = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-files", "-z", "--error-unmatch", "--stage", "--", f":(literal){relative}"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=no_window_flags(),
+        )
+    except OSError as exc:
+        raise PayloadIntegrityError(f"{label} cannot verify Git tracking: {exc}") from exc
+    _require(tracked.returncode == 0, f"{label} must be Git-tracked at exactly this path: {relative}")
+    rows = [row for row in tracked.stdout.split(b"\0") if row]
+    _require(len(rows) == 1 and b"\t" in rows[0], f"{label} Git index entry is ambiguous: {relative}")
+    head, name = rows[0].split(b"\t", 1)
+    fields = head.split()
+    _require(name == relative.encode("utf-8"), f"{label} Git index entry names {name!r}, not exactly {relative!r}")
+    _require(len(fields) == 3 and fields[0] in {b"100644", b"100755"} and fields[2] == b"0",
+             f"{label} must be a stage-0 regular file in the Git index: {relative}")
+
+
 def load_record_only_snapshot(
     repo_root: Path,
     manifest_path: Path,
     payload_id: str,
+    archive_reference: str,
 ) -> tuple[dict[str, Any], dict[str, Any], str]:
     """Validate ONLY the named active record, never the repository-wide tracked-file census.
 
@@ -62,6 +92,14 @@ def load_record_only_snapshot(
     _require(manifest.get("schema_version") == 1, "payload manifest schema_version must be 1")
     policy = _validate_policy(manifest.get("integrity_policy"))
     record = _record_for_id(manifest, payload_id)
+    # PR 862 r11 (adversary fa89f1b3-A5): the caller's archive reference is checked BEFORE any file named by the record is read, so a
+    # record whose path names another tracked file (a clip fixture, a script) is refused without opening it. Then the exact path must
+    # be tracked (literal pathspec, fa89f1b3-A4), and only then is the archive read and validated.
+    label = str(record.get("id") or "payload")
+    relative = _manifest_path(record.get("path"), label)
+    _require(PurePosixPath(relative).name == archive_reference,
+             f"{label} archive reference mismatch: expected {PurePosixPath(relative).name!r}, got {archive_reference!r}")
+    _require_literally_tracked(repo_root, relative, f"{label} archive")
     _validate_archive(repo_root, record, policy, selected=True, require_tracked=True)
     _validate_provenance(record)
     return manifest, record, manifest_sha256
@@ -345,7 +383,7 @@ def extract_payload(
     _require(transaction_id is None or re.fullmatch(r"[0-9a-f]{32}", transaction_id) is not None,
              f"transaction id must be 32 lowercase hex characters: {transaction_id!r}")
     if record_only:
-        _, record, manifest_sha256 = load_record_only_snapshot(repo_root, manifest_path, payload_id)
+        _, record, manifest_sha256 = load_record_only_snapshot(repo_root, manifest_path, payload_id, archive_reference)
     else:
         manifest, manifest_sha256 = load_validated_manifest_snapshot(repo_root, manifest_path)
         record = _record_for_id(manifest, payload_id)

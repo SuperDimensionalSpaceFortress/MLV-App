@@ -29,7 +29,10 @@ function Test-ReviewedReleaseRuntimeExtraName {
 # install, so the bytes cannot depend on which revision RepoRoot has checked out. RepoRoot must be a git
 # checkout (the archive's Git tracking is checked with git ls-files on that one path). The child is synchronous and bounded: past
 # TimeoutSec its ROOT alone is killed (PR 862 r10, the split) and the result says timedOut (and killConfirmed, whether the root's
-# exit was seen and its whole tree was seen gone; a live descendant leaves it false and nothing is recovered). Nothing here throws on a failed install, including a locked installed file (adversary 32bf39a9-A2);
+# exit was seen and no tree member or possible orphan was still LISTED; a descendant SEEN live leaves it false and nothing is recovered,
+# but a descendant the listings cannot place can be missed, so a confirmed stop does not prove that none is alive: known hole, card
+# PINNED-PAYLOAD-KILL-TREE-DST-1, adversary bf1ac39c-A4/A5 and fa89f1b3-A6). The output folder is created when absent and HELD (pinned)
+# before the child starts; a folder that cannot be pinned refuses the install before any child (PR 862 r11, Grok G6). Nothing here throws on a failed install, including a locked installed file (adversary 32bf39a9-A2);
 # the caller reads .ok and stops with its own typed failure.
 
 # Adversary b5fce5a9-A1: .NET's recursive kill finds descendants by comparing LOCAL start times, so a child started just after a
@@ -185,8 +188,11 @@ function Get-PinnedPayloadBaseline {
 
 # Kills a timed-out child's ROOT only (PR 862 r10, the split) and reports whether the root's exit AND its whole process tree's
 # absence were SEEN; a Kill that throws (access denied), a wait that times out, or any tree member still listed is never reported
-# as confirmed (adversary 32bf39a9-A3). Descendants are never killed here: a live one leaves the stop unconfirmed, which every caller
-# treats as a hard failure with no recovery. Killing the tree is card PINNED-PAYLOAD-KILL-TREE-DST-1.
+# as confirmed (adversary 32bf39a9-A3). Descendants are never killed here: a descendant SEEN still listed leaves the stop unconfirmed,
+# which every caller treats as a hard failure with no recovery. KNOWN HOLE (PR 862 r11, Grok G8): this does NOT prove that no
+# descendant is alive. An orphan whose identity aliases a baseline row after a clock step or pid reuse (adversary bf1ac39c-A4,
+# fa89f1b3-A6), or a late observation at the budget edge (bf1ac39c-A5), can still give confirmed=true, so a confirmed-timeout recovery
+# can run while an orphan is live. Killing and proving the tree is card PINNED-PAYLOAD-KILL-TREE-DST-1.
 function Stop-PinnedPayloadChild {
     [CmdletBinding()]
     param(
@@ -241,7 +247,8 @@ function Stop-PinnedPayloadChild {
     # descendants by .NET's parent predicate over LOCAL start times, so across a DST fall-back fold a probe reusing a dead parent's pid
     # could select an unrelated baseline survivor and terminate it. Nothing is ever killed by a pid read from a listing either (adversary
     # 0f5308ad-A1/A2: a listing can join one process's parent id to another's identity, and an open by pid can reach a replacement).
-    # Every descendant is left running and is counted below, so a live one leaves the stop unconfirmed and no recovery runs.
+    # Every descendant is left running and is counted below: one the listings place in the tree (or cannot place outside it) leaves the
+    # stop unconfirmed and no recovery runs; one they misplace is the known hole named above (PINNED-PAYLOAD-KILL-TREE-DST-1).
     $killError = ''
     try { $null = $Process.Kill($false) } catch { $killError = $_.Exception.Message }
     $exited = $false
@@ -320,13 +327,30 @@ function Restore-PinnedPayloadTransaction {
     if (-not $item.PSIsContainer -or $item.LinkType) {
         return [pscustomobject][ordered]@{ restored = @(); errors = @("$folder is not a plain folder; nothing restored"); found = $true }
     }
-    try {
-        $backups = @(Get-ChildItem -LiteralPath $folder -Force -ErrorAction Stop)
-    } catch {
-        return [pscustomobject][ordered]@{ restored = @(); errors = @("$folder could not be listed: $($_.Exception.Message)"); found = $true }
+    # PR 862 r11 (adversary fa89f1b3-A2): the transaction folder itself is HELD (no FILE_SHARE_DELETE) from before it is listed until the
+    # last move, and the held folder must BE the entry .vendored-payload-transaction-<id> under OutputDir (its own resolved path compared
+    # with the requested pathname spelled from its directory entries), so a concurrent rename cannot swap another transaction's folder
+    # in under this name between the listing and the moves. Every backup is moved from the HELD folder's resolved path.
+    $txPin = Open-PinnedDirectoryPin -LiteralPath $folder
+    if (-not $txPin.handle) {
+        return [pscustomobject][ordered]@{ restored = @(); errors = @("$folder could not be held: $($txPin.detail); nothing restored"); found = $true }
     }
+    try {
+        $requestedRoot = $null
+        $pathError = 0
+        $requested = [MlvReleaseAdmission.PinnedNoFollowOpen]::OnDiskPath([System.IO.Path]::GetFullPath($folder), [ref]$requestedRoot, [ref]$pathError)
+        if (-not $requested -or -not [MlvReleaseAdmission.PinnedNoFollowOpen]::SamePathname([string]$txPin.path, [string]$requested, [string]$requestedRoot)) {
+            return [pscustomobject][ordered]@{ restored = @(); errors = @("$folder is held as $($txPin.path), not as its own entry $requested; nothing restored"); found = $true }
+        }
+        $heldFolder = [string]$txPin.path
+        try {
+            $backups = @(Get-ChildItem -LiteralPath $folder -Force -ErrorAction Stop)
+        } catch {
+            return [pscustomobject][ordered]@{ restored = @(); errors = @("$folder could not be listed: $($_.Exception.Message)"); found = $true }
+        }
     foreach ($backup in $backups) {
         if ($backup.PSIsContainer -or $backup.LinkType) { $errors += "$($backup.FullName) is not a plain file; not restored"; continue }
+        $source = Join-Path $heldFolder $backup.Name
         $destination = Join-Path $OutputDir $backup.Name
         # Adversary 32501f50-A1: a backup goes back ONLY onto an absent destination. A file there now is this install's own
         # replacement or a concurrent install's verified file; either way it is left alone and the original stays in the backup.
@@ -336,7 +360,7 @@ function Restore-PinnedPayloadTransaction {
             continue
         }
         try {
-            [System.IO.File]::Move($backup.FullName, $destination, $false)
+            [System.IO.File]::Move($source, $destination, $false)
             $restored += $backup.Name
         } catch {
             if ([System.IO.File]::Exists($destination) -or [System.IO.Directory]::Exists($destination)) {
@@ -345,6 +369,9 @@ function Restore-PinnedPayloadTransaction {
                 $errors += "$($backup.Name): $($_.Exception.Message); backup kept at $($backup.FullName)"
             }
         }
+    }
+    } finally {
+        $txPin.handle.Dispose()
     }
     return [pscustomobject][ordered]@{ restored = $restored; errors = $errors; found = $true }
 }
@@ -382,6 +409,10 @@ function Install-PinnedVendoredPayload {
         stderr        = ''
         installed     = @()
         transactionRestored = @()
+        # PR 862 r11 (Grok G6): whether the output folder was HELD before the child started, and that held folder's own resolved path
+        # (the path the extractor, the report check and any recovery used). An install whose folder was not pinned never starts a child.
+        outputPinned  = $false
+        outputDir     = ''
     }
     # Every step fills $result; anything that throws (a locked installed file, an unreadable report) is a
     # typed ok=false here, never an exception past the caller's own failure branch.
@@ -436,6 +467,28 @@ function Invoke-PinnedPayloadInstall {
         return [pscustomobject]$result
     }
 
+    # PR 862 r11 (Grok G6, adversary fa89f1b3-A1): the output folder is created when absent and then HELD (pinned) BEFORE the child
+    # starts. A folder that cannot be created or pinned, for ANY reason (a sharing violation, an ACL denial, a path that cannot be
+    # read back), refuses the install here with the typed code output-pin-failed and the pin's own detail; no child is started. The
+    # extractor's --output-dir, the report check below and any timeout recovery all use the HELD folder's own resolved path, never the
+    # caller's spelling again, so a junction retargeted after the pin cannot split the install from its recovery.
+    if (-not [System.IO.Directory]::Exists($OutputDir)) {
+        try {
+            $null = [System.IO.Directory]::CreateDirectory($OutputDir)
+        } catch {
+            $result.reason = "output-pin-failed: the output folder $OutputDir could not be created: $($_.Exception.Message); no extractor was started"
+            return [pscustomobject]$result
+        }
+    }
+    $outputPin = Open-PinnedDirectoryPin -LiteralPath $OutputDir
+    if (-not $outputPin.handle) {
+        $result.reason = "output-pin-failed: the output folder $OutputDir could not be held: $($outputPin.detail); no extractor was started"
+        return [pscustomobject]$result
+    }
+    $pinnedOutputDir = [string]$outputPin.path
+    $result.outputPinned = $true
+    $result.outputDir = $pinnedOutputDir
+    try {
     $psi = [System.Diagnostics.ProcessStartInfo]::new($launcher.Source)
     # ArgumentList quotes each element itself, so a path with spaces stays one argument. No -I: it would
     # drop the working directory from sys.path and with it the tools package.
@@ -444,7 +497,7 @@ function Invoke-PinnedPayloadInstall {
     # --transaction-id (adversary 78d626ed-A1): this child's publication transaction folder is named by this call, so a timeout
     # recovery below restores exactly this child's originals and never another install's sharing the folder.
     $transactionId = [guid]::NewGuid().ToString('N')
-    foreach ($argument in @('-3', '-m', 'tools.repo_hygiene.extract_vendored_native_payload', '--repo-root', $RepoRoot, '--payload-id', $PayloadId, '--archive-reference', $ArchiveReference, '--output-dir', $OutputDir, '--transaction-id', $transactionId, '--record-only', '--verify-installed')) {
+    foreach ($argument in @('-3', '-m', 'tools.repo_hygiene.extract_vendored_native_payload', '--repo-root', $RepoRoot, '--payload-id', $PayloadId, '--archive-reference', $ArchiveReference, '--output-dir', $pinnedOutputDir, '--transaction-id', $transactionId, '--record-only', '--verify-installed')) {
         [void]$psi.ArgumentList.Add([string]$argument)
     }
     $psi.WorkingDirectory = $RepoRoot
@@ -456,6 +509,12 @@ function Invoke-PinnedPayloadInstall {
     # path; and the checkout is not written to (no __pycache__).
     foreach ($name in @('PYTHONPATH', 'PYTHONHOME', 'PYTHONSAFEPATH', 'PYTHONSTARTUP')) { [void]$psi.Environment.Remove($name) }
     $psi.Environment['PYTHONDONTWRITEBYTECODE'] = '1'
+    # PR 862 r11 (adversary bf1ac39c-A6, Grok G7(a)): the child's report is UTF-8 on both sides. An inherited PYTHONIOENCODING (say
+    # utf-16-le) or a legacy console code page made a valid install print a report this wrapper could not parse.
+    $psi.Environment['PYTHONIOENCODING'] = 'utf-8'
+    $psi.Environment['PYTHONUTF8'] = '1'
+    $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    $psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
     # No inherited GIT_* variable reaches the manifest validator's git children (adversary 32bf39a9-A1): GIT_TRACE2_EVENT
     # naming a tracked file appends to it, and GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE would aim git ls-files at another
     # repository. git then reads only RepoRoot, the working directory.
@@ -465,10 +524,8 @@ function Invoke-PinnedPayloadInstall {
 
     # Adversary 500e2892-A1: the listing taken before the child exists is what places a process outside its tree on a timeout.
     $baseline = Get-PinnedPayloadBaseline
-    # Adversary a7bf472f-A7 / bf1ac39c-A1: the output folder is HELD from before the child starts until any recovery is done, so a timeout
-    # recovery restores into THAT folder only (disposed in the finally below).
-    $outputPin = Open-PinnedDirectoryPin -LiteralPath $OutputDir
-    try {
+    # Adversary a7bf472f-A7 / bf1ac39c-A1: the output folder is HELD (above) from before the child starts until any recovery is done, so a
+    # timeout recovery restores into THAT folder only (disposed in the finally below).
         try {
             $process = [System.Diagnostics.Process]::Start($psi)
         } catch {
@@ -495,7 +552,7 @@ function Invoke-PinnedPayloadInstall {
         }
         if ($result.timedOut) {
             $result.reason = if ($result.killConfirmed) {
-                "the extractor was still running after $TimeoutSec s; its root was killed (root-only kill) and its process tree was seen gone"
+                "the extractor was still running after $TimeoutSec s; its root was killed (root-only kill) and no tree member was still listed (not proof that no descendant runs: PINNED-PAYLOAD-KILL-TREE-DST-1)"
             } else {
                 "the extractor was still running after $TimeoutSec s and the kill was NOT confirmed (pid $childPid or a descendant may still be running$(if ($killError) { "; kill error: $killError" }))"
             }
@@ -503,7 +560,7 @@ function Invoke-PinnedPayloadInstall {
             # the replacement bypasses the Python rollback and leaves the destination missing. Once the kill is CONFIRMED (no child can
             # still move files) the originals are put back; with an unconfirmed kill nothing is touched, since the child may still run.
             if ($result.killConfirmed) {
-                $recovery = Complete-PinnedPayloadTimeoutRecovery -OutputDir $OutputDir -TransactionId $transactionId -Pin $outputPin
+                $recovery = Complete-PinnedPayloadTimeoutRecovery -TransactionId $transactionId -Pin $outputPin
                 $result.transactionRestored = @($recovery.restored)
                 $result.reason += "; $($recovery.text)"
             } else {
@@ -512,7 +569,7 @@ function Invoke-PinnedPayloadInstall {
             return [pscustomobject]$result
         }
     } finally {
-        if ($outputPin) { $outputPin.handle.Dispose() }
+        $outputPin.handle.Dispose()
     }
     if ($result.exitCode -ne 0) {
         $result.reason = "the extractor exited $($result.exitCode): $($result.stderr.Trim())"
@@ -537,7 +594,7 @@ function Invoke-PinnedPayloadInstall {
     }
     # Re-read every installed file here: the record is what is on disk now, not what the child said.
     $installed = @()
-    $outputDirKey = [System.IO.Path]::TrimEndingDirectorySeparator($OutputDir)
+    $outputDirKey = [System.IO.Path]::TrimEndingDirectorySeparator($pinnedOutputDir)
     foreach ($row in $rows) {
         foreach ($field in @('path', 'bytes', 'sha256')) {
             if (-not ($row -and $row.PSObject.Properties[$field])) {
@@ -840,8 +897,10 @@ function Open-PinnedNoFollowStream {
     return [pscustomobject]@{ stream = $opened.Stream; code = ''; detail = '' }
 }
 
-# Adversary a7bf472f-A7 / bf1ac39c-A1: holds the folder LiteralPath resolves to now; returns { handle; path } (path = the held folder's
-# own resolved path), or $null when it is absent or cannot be held. The caller disposes .handle. Never throws.
+# Adversary a7bf472f-A7 / bf1ac39c-A1: holds the folder LiteralPath resolves to now. ALWAYS returns { handle; path; detail }: handle and
+# path (the held folder's own resolved path) on success; handle $null and detail = why (absent, sharing violation, access denied, a path
+# that cannot be read back, add-type failure) otherwise, so a caller can refuse with the reason (PR 862 r11, Grok G6). The caller
+# disposes .handle. Never throws.
 function Open-PinnedDirectoryPin {
     param([Parameter(Mandatory)][string]$LiteralPath)
     try {
@@ -851,24 +910,27 @@ function Open-PinnedDirectoryPin {
         $finalPath = $null
         $detail = ''
         $handle = [MlvReleaseAdmission.PinnedNoFollowOpen]::OpenDirectoryPin($LiteralPath, [ref]$finalPath, [ref]$detail)
-        if (-not $handle) { return $null }
-        return [pscustomobject]@{ handle = $handle; path = [string]$finalPath }
+        if (-not $handle) { return [pscustomobject]@{ handle = $null; path = ''; detail = "$LiteralPath could not be pinned: $detail" } }
+        return [pscustomobject]@{ handle = $handle; path = [string]$finalPath; detail = '' }
     } catch {
-        return $null
+        return [pscustomobject]@{ handle = $null; path = ''; detail = "$LiteralPath could not be pinned: $($_.Exception.Message)" }
     }
 }
 
 # Adversary a7bf472f-A7 / bf1ac39c-A1: the recovery after a CONFIRMED stop, bound to the output folder the install HELD from before the
-# child started (Pin, from Open-PinnedDirectoryPin; $null when OutputDir did not exist then, and OutputDir's spelling is used). The
-# restore goes through the held folder's own resolved path, so a junction retargeted on the caller's spelling cannot redirect it; a
-# transaction folder that is not found is said to be not found, never "reconciled". Never throws; returns { restored; text }.
+# child started (Pin, from Open-PinnedDirectoryPin). The restore goes through the held folder's own resolved path, so a junction
+# retargeted on the caller's spelling cannot redirect it. PR 862 r11 (Grok G6): there is no unpinned fallback any more; without a held
+# folder the recovery refuses and says so. A transaction folder that is not found is said to be not found, never "reconciled". Never
+# throws; returns { restored; text }.
 function Complete-PinnedPayloadTimeoutRecovery {
     param(
-        [Parameter(Mandatory)][string]$OutputDir,
         [Parameter(Mandatory)][string]$TransactionId,
         [AllowNull()]$Pin
     )
-    if ($Pin) { $OutputDir = [string]$Pin.path }
+    if (-not ($Pin -and $Pin.handle -and -not $Pin.handle.IsClosed -and $Pin.path)) {
+        return [pscustomobject]@{ restored = @(); text = 'the output folder was not pinned, so the recovery refused to run; nothing restored (unbound recovery)' }
+    }
+    $OutputDir = [string]$Pin.path
     $restore = Restore-PinnedPayloadTransaction -OutputDir $OutputDir -TransactionId $TransactionId
     $errors = if (@($restore.errors).Count) { ", errors [$(@($restore.errors) -join '; ')]" } else { '' }
     if (-not $restore.found) {
@@ -925,6 +987,18 @@ function Open-PinnedFileHold {
     $hold.stream = $stream
     $hold.ok = $true
     return [pscustomobject]$hold
+}
+
+# PR 862 r11 (adversary bf1ac39c-A7, fa89f1b3-A3, Grok G10): the ONE list of Windows reserved device names (Microsoft, "Naming Files,
+# Paths, and Namespaces"): CON, PRN, AUX, NUL, COM0-9 and LPT0-9 including the superscript digits 1, 2 and 3 (U+00B9, U+00B2, U+00B3,
+# written as regex escapes so this file stays ASCII), CONIN$ and CONOUT$. A segment is reserved when its part before the first dot,
+# trailing spaces dropped, is one of them (case-insensitive), so NUL, nul.txt and COM1 .x are all refused.
+$script:PinnedReservedDeviceNames = @('CON', 'PRN', 'AUX', 'NUL', 'COM[0-9\u00B9\u00B2\u00B3]', 'LPT[0-9\u00B9\u00B2\u00B3]', 'CONIN\$', 'CONOUT\$')
+$script:PinnedReservedDeviceNamePattern = '^(?i:' + ($script:PinnedReservedDeviceNames -join '|') + ')\z'
+
+function Test-PinnedReservedDeviceName {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Segment)
+    return ((($Segment -split '\.', 2)[0]).TrimEnd(' ') -match $script:PinnedReservedDeviceNamePattern)
 }
 
 # Proves a published zip carries exactly one root entry MemberName whose bytes are the recorded ones. The zip is opened once
@@ -984,8 +1058,8 @@ function Test-PinnedZipMember {
             $name = $raw.Replace('\', '/')
             $isDirectory = $name.EndsWith('/')
             $path = if ($isDirectory) { $name.Substring(0, $name.Length - 1) } else { $name }
-            # Adversary bf1ac39c-A7: a reserved device name (CON, PRN, AUX, NUL, COM0-9, LPT0-9; with any extension) cannot be extracted.
-            $badSegments = @($path.Split('/') | Where-Object { $_ -eq '' -or $_ -eq '.' -or $_ -eq '..' -or $_ -match '[. ]\z' -or $_ -match '~[0-9]' -or $_ -match '[:*?"<>|\x00-\x1f]' -or $_ -match '^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(\.[^.]*)*\z' })
+            # Adversary bf1ac39c-A7 / fa89f1b3-A3: a reserved device name ($script:PinnedReservedDeviceNames; with any extension) cannot be extracted.
+            $badSegments = @($path.Split('/') | Where-Object { $_ -eq '' -or $_ -eq '.' -or $_ -eq '..' -or $_ -match '[. ]\z' -or $_ -match '~[0-9]' -or $_ -match '[:*?"<>|\x00-\x1f]' -or (Test-PinnedReservedDeviceName -Segment $_) })
             if ($path.Length -eq 0 -or $badSegments.Count -gt 0) {
                 $check.reason = "$ZipPath entry '$raw' is not a canonical entry name (it could extract over another entry)"
                 return [pscustomobject]$check

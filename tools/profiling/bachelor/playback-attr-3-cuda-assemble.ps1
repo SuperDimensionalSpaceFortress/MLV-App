@@ -345,7 +345,9 @@ try {
 }
 if (-not $ffmpegInstall.ok) { Complete-Failed 28 'ffmpegExeInstall' "ffmpeg.exe was not installed from the pinned payload $ffmpegPayloadId : $($ffmpegInstall.reason) (see logs\ffmpeg-exe-install.log)" }
 $ffmpegExePath = Join-Path $releaseDir 'ffmpeg.exe'
-$ffmpegRows = @($ffmpegInstall.installed | Where-Object { [string]::Equals([string]$_.path, $ffmpegExePath, [StringComparison]::OrdinalIgnoreCase) })
+# PR 862 r11 (adversary fa89f1b3-A1 sibling :337): the helper installs into the output folder it HELD, and reports each file under
+# that folder's own resolved path (.outputDir), which need not be this spelling (8.3, junction); the row is matched by its name.
+$ffmpegRows = @($ffmpegInstall.installed | Where-Object { [string]::Equals([string]$_.name, 'ffmpeg.exe', [StringComparison]::OrdinalIgnoreCase) })
 if ($ffmpegRows.Count -ne 1 -or -not (Test-Path -LiteralPath $ffmpegExePath -PathType Leaf)) {
     Complete-Failed 28 'ffmpegExeInstall' "the pinned payload $ffmpegPayloadId did not install $ffmpegExePath (installed: $(@($ffmpegInstall.installed | ForEach-Object { $_.path }) -join ', '))"
 }
@@ -386,7 +388,8 @@ if (-not $SkipLaunchProbe) {
             # The kill is confirmed or the failure says it is not (adversary 32bf39a9-A3, sibling of the ffmpeg install's). PR 862 r10 (sol r9
             # B1 caller :387, the split): the stop kills the probe's ROOT only; any probe timeout, confirmed or not, ends in Complete-Failed 23.
             $probeStop = Stop-PinnedPayloadChild -Process $probe -Baseline $probeBaseline
-            $probeKillNote = if ($probeStop.confirmed) { 'root killed, tree seen gone' } else { "kill NOT confirmed, pid $($probe.Id) may still run$(if ($probeStop.killError) { ": $($probeStop.killError)" })" }
+            # PR 862 r11 (Grok G8): confirmed means no tree member was still LISTED, not that no descendant runs (PINNED-PAYLOAD-KILL-TREE-DST-1).
+            $probeKillNote = if ($probeStop.confirmed) { 'root killed, no tree member still listed (not proof that no descendant runs)' } else { "kill NOT confirmed, pid $($probe.Id) may still run$(if ($probeStop.killError) { ": $($probeStop.killError)" })" }
             $launchProbe.timedOut = $true
         } else {
             $launchProbe.exitCode = $probe.ExitCode

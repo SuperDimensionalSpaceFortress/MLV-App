@@ -279,7 +279,9 @@ if ($probeDllFailure) {
     Write-Host "FAIL: launch probe timed out after 30s and its stop was NOT confirmed (root-only kill; pid $($p.Id) or a descendant may still run$(if ($probeKillError) { ": $probeKillError" })); exit 10, nothing recovered" -ForegroundColor Red
     exit 10
 } elseif ($probeTimedOut) {
-    Write-Host "WARN: launch probe timed out after 30s (root killed, tree seen gone); could not confirm self-contained launch" -ForegroundColor Yellow
+    # PR 862 r11 (Grok G8): a confirmed stop means the root was killed and no tree member was still LISTED; it does not prove that no
+    # descendant is alive (adversary bf1ac39c-A4/A5, fa89f1b3-A6; card PINNED-PAYLOAD-KILL-TREE-DST-1), so the text claims no more.
+    Write-Host "WARN: launch probe timed out after 30s (root killed, no tree member still listed; not proof that no descendant runs, see PINNED-PAYLOAD-KILL-TREE-DST-1); could not confirm self-contained launch" -ForegroundColor Yellow
 } elseif ($probeExit -ne 0) {
     Write-Host "NOTE: launch probe resolved all DLLs (no 0xC0000135) but --batch --help returned $probeExit (likely environment, e.g. no interactive desktop)" -ForegroundColor Yellow
 } else {
