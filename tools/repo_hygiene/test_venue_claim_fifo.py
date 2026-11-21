@@ -1254,6 +1254,83 @@ while (-not (Test-Path -LiteralPath '{done}') -and [DateTime]::UtcNow -lt $stop)
         self.assertGreater(r["requests"], 10, "the younger waiter hardly asked: the race was not exercised")
         self.assertEqual(r["wins"], 0, f"the younger waiter took the claim {r['wins']} times in {r['requests']} requests while the older READY ticket was being rewritten")
 
+    FLIP_BUSY = """
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d -Phase cooldown -StaleAfterSec 600
+Start-Sleep -Milliseconds 30
+$B = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+[IO.File]::WriteAllText('@@READY@@', $A.path)
+$t0 = [DateTime]::UtcNow
+while (-not (Test-Path -LiteralPath '@@HELD@@') -and ([DateTime]::UtcNow - $t0).TotalSeconds -lt 30) { Start-Sleep -Milliseconds 50 }
+$r = Request-VenueClaim -Venue bachelor -RunDir 'run-A' -ClaimDir $d -Ticket $A
+$phase = (Get-Content -LiteralPath $A.path -Raw | ConvertFrom-Json).phase
+[pscustomobject]@{ state = $r.state; granted = [bool]$r.granted; phase = $phase; note = [string]$r.note; ticket = $A.name } | ConvertTo-Json -Compress
+"""
+
+    def run_flip_with_a_foreign_handle(self, release_after_sec: float | None) -> dict:
+        # a handle opened WITHOUT FileShare.Delete (CPython's open() on Windows shares read and write, not delete) on the older waiter's ticket makes the heartbeat's rename-over fail
+        import threading
+        ready, held = self.case / "flip-ready.txt", self.case / "flip-held.txt"
+        stop = threading.Event()
+        def holder() -> None:
+            t0 = time.time()
+            while not ready.exists() and time.time() - t0 < 60:
+                time.sleep(0.02)
+            path = ready.read_text(encoding="utf-8").strip()
+            fh = open(path, "rb")
+            try:
+                held.write_text("1", encoding="utf-8")
+                if release_after_sec is None:
+                    stop.wait(60)
+                else:
+                    time.sleep(release_after_sec)
+            finally:
+                fh.close()
+        th = threading.Thread(target=holder, daemon=True)
+        th.start()
+        try:
+            return self.ps(self.FLIP_BUSY.replace("@@READY@@", str(ready)).replace("@@HELD@@", str(held)))
+        finally:
+            stop.set()
+            th.join(timeout=70)
+
+    def test_a_waiter_whose_phase_flip_stays_busy_is_queued_and_never_goes_on_as_if_it_landed(self) -> None:
+        # Grok CoS G7 (#878, 75d63036): Request-VenueClaim acted only on LOST from the cooldown -> waiting flip. On BUSY it went on to the head check while its ticket still read cooldown, so
+        # every other waiter's ready check skipped it, and it took the claim on a ticket the line saw as not ready. On a flip that stays BUSY it must return QUEUED (not granted), with a typed note.
+        r = self.run_flip_with_a_foreign_handle(None)
+        self.assertEqual((r["state"], r["granted"]), ("QUEUED", False), f"the flip did not land but the request went on: {r}")
+        self.assertEqual(r["phase"], "cooldown", "the ticket was never rewritten while the foreign handle held it")
+        self.assertIn("TICKET_PHASE_BUSY", r["note"], "the typed line is missing")
+        self.assertIn(r["ticket"], r["note"], "the typed line does not name the ticket")
+        self.assertIn("waiting", r["note"], "the typed line does not name the phase")
+
+    def test_a_phase_flip_that_is_busy_for_a_moment_is_retried_and_lands(self) -> None:
+        # G7: a BUSY that clears within the short bound (about 2 s) is retried, not given up on: the flip lands and the request goes on as a ready waiter.
+        r = self.run_flip_with_a_foreign_handle(0.9)
+        self.assertEqual(r["phase"], "waiting", f"a transient BUSY was not retried until the flip landed: {r}")
+        self.assertEqual((r["state"], r["granted"]), ("TAKEN", True), r)
+        self.assertEqual(r["note"], "")
+
+    ORPHAN_TMP = """
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d
+$dir = Split-Path -Parent $A.path
+$old = Join-Path $dir ($A.name + '.' + ('a' * 32) + '.tmp')
+$new = Join-Path $dir ($A.name + '.' + ('b' * 32) + '.tmp')
+$odd = Join-Path $dir 'notes.tmp'
+foreach ($p in @($old, $new, $odd)) { [IO.File]::WriteAllText($p, 'x') }
+(Get-Item -LiteralPath $old).LastWriteTimeUtc = [DateTime]::UtcNow.AddMinutes(-10)
+(Get-Item -LiteralPath $odd).LastWriteTimeUtc = [DateTime]::UtcNow.AddMinutes(-10)
+$r = Request-VenueClaim -Venue bachelor -RunDir 'run-A' -ClaimDir $d -Ticket $A
+[pscustomobject]@{ oldGone = -not (Test-Path -LiteralPath $old); newKept = (Test-Path -LiteralPath $new); oddKept = (Test-Path -LiteralPath $odd); ticketKept = (Test-Path -LiteralPath $A.path); state = $r.state } | ConvertTo-Json -Compress
+"""
+
+    def test_an_orphaned_ticket_temp_file_older_than_five_minutes_is_reaped_and_a_fresh_one_is_kept(self) -> None:
+        # Grok CoS G8 (#878): Write-VenueTicketAtomic leaves <ticket>.<guid>.tmp behind when the process dies between CreateNew and the rename. The stale sweep reaps those older than 5 minutes.
+        r = self.ps(self.ORPHAN_TMP)
+        self.assertTrue(r["oldGone"], "an orphaned ticket temp file older than 5 minutes was not reaped")
+        self.assertTrue(r["newKept"], "a fresh temp file (a heartbeat in flight) was removed")
+        self.assertTrue(r["oddKept"], "a file that is not a ticket temp name was removed")
+        self.assertTrue(r["ticketKept"])
+
     def test_the_cooldown_wait_is_anchored_before_the_ticket_work_and_every_ticket_call_is_bounded(self) -> None:
         # adversary pass 2 A1 + A4: the wait end was measured after the ticket was created (so slow ticket I/O pushed the claim request past -DeadlineUtc), and creation and the heartbeat
         # ran inline (a stalled claim folder held the batch; a heartbeat that failed was discarded, so a lost ticket was never retaken).

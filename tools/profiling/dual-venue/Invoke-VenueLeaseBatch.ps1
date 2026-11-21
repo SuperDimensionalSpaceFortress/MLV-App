@@ -2322,6 +2322,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 if ($null -eq $script:batchTicket) { $ticketNote = "TICKET_TAKEN batch=$batchNo ticket=$($req.ticket.name) phase=waiting position=$($req.position)/$(@($req.queue).Count)" }
                 elseif ($script:batchTicket.name -cne $req.ticket.name) { $ticketNote = "TICKET_RETAKEN batch=$batchNo ticket=$($req.ticket.name) (the earlier one was removed from under this batch: back of the line) position=$($req.position)/$(@($req.queue).Count)" }
                 $script:batchTicket = $req.ticket
+                # Grok CoS G7: a flip to waiting that stayed BUSY comes back QUEUED with a typed note; it is logged with the line above (one place, once the guard has vouched for batch.log)
+                if ($null -ne $req.PSObject.Properties['note'] -and [string]$req.note) { $ticketNote = $(if ($ticketNote) { "$ticketNote | " } else { '' }) + "batch=$batchNo $([string]$req.note)" }
             }
         }
         catch {

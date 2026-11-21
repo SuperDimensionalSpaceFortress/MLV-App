@@ -211,6 +211,20 @@ ROUTE_DELETE_ALLOWED = {
         "run kept for its own lease open (jobId = lease-batch-open-<stamp>-lb<token>, minted by Invoke-VenueLeaseBatch), after the open's result is in hand or its "
         "lease receipt was found. The path is the Start-VenueJobLiveness share plus the fixed folder and the .json suffix, only when it is a leaf, no wildcard, no "
         "-Recurse; the sidecar is the runner's own liveness note, never a clip.",
+    ("VenueChain.psm1", "[IO.File]::Move($tmp, $Path, $true)"):
+        "VENUE-FIFO-TICKET-BEFORE-PRECLAIM-1 r5 (Write-VenueTicketAtomic): the heartbeat of a line ticket publishes the temp file it wrote one line earlier "
+        "($Path + '.' + <guid> + '.tmp', a CreateNew leaf beside the ticket) over the ticket itself in one replacing rename. $Path is the `.ticket.json` object that "
+        "New-VenueTicket returned (<ClaimDir>\\<venue>.tickets\\<19 digits>-p<pid>-<start ticks>.ticket.json, the board's claim folder, never a venue share) and "
+        "Update-VenueTicket has just re-read it and matched its nonce; the source and the destination are both ticket-queue files, never a clip.",
+    ("VenueChain.psm1", "} finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } }"):
+        "VENUE-FIFO-TICKET-BEFORE-PRECLAIM-1 r5 (Write-VenueTicketAtomic): the finally clause removes only $tmp, the `<ticket>.<guid>.tmp` this call made beside the ticket, "
+        "and only while it is still there (a successful move has consumed it). Fixed-name leaf in the claim queue folder, no wildcard, no -Recurse; the guid suffix "
+        "means a footage name cannot equal it.",
+    ("VenueChain.psm1", "try { [IO.File]::Delete($f.FullName) } catch { $null = $_ }"):
+        "VENUE-FIFO-TICKET-BEFORE-PRECLAIM-1 r6 (Grok CoS G8, Remove-VenueOrphanTicketTemps): reaps one orphaned `<ticket>.<guid>.tmp`, what Write-VenueTicketAtomic leaves when its "
+        "process dies between the temp's CreateNew and the rename. $f comes only from a non-recursive listing of the venue's own ticket folder (<ClaimDir>\\<venue>.tickets, "
+        "never a venue share) filtered by the full name pattern ^<19 digits>-p<pid>-<start ticks>.ticket.json.<32 hex>.tmp$ and by an age of more than 5 minutes; a file "
+        "in use or already gone is skipped. A footage name cannot match that pattern, and the folder holds no footage.",
 }
 
 TRAILING_COMMENT = re.compile(r"\s+#\s.*$")
