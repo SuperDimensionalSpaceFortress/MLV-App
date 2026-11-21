@@ -18,10 +18,23 @@ win32 {
     QMAKE_CFLAGS_RELEASE += -O3
 }
 
+# lj92.c reaches omp_get_wtime through StageTiming.h's fallbacks on every platform (r1 adversary A1), so the Linux and
+# macOS scopes link OpenMP the way tests/pipeline/pipeline_tests.pro does.
 linux-g++* {
-    QMAKE_CFLAGS += -std=c99
+    QMAKE_CFLAGS += -std=c99 -fopenmp
+    LIBS += -lgomp
 }
 
 macx {
     QMAKE_CFLAGS += -std=c99
+    equals(QT_ARCH, x86_64) {
+        QMAKE_CFLAGS += -fopenmp
+        INCLUDEPATH += /usr/local/opt/llvm/include
+        LIBS += -L/usr/local/opt/llvm/lib -lomp
+    }
+    equals(QT_ARCH, arm64) {
+        QMAKE_CFLAGS += -fopenmp
+        INCLUDEPATH += /opt/homebrew/opt/llvm/include
+        LIBS += -L/opt/homebrew/opt/llvm/lib -lomp
+    }
 }

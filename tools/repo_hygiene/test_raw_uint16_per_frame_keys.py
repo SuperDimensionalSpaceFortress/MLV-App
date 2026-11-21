@@ -115,6 +115,44 @@ class Lj92SlowHuffConfigurationTests(unittest.TestCase):
         result = self._syntax_check("-DSLOW_HUFF")
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    @staticmethod
+    def _platform_scopes(pro_text: str) -> "dict[str, str]":
+        """Top-level `name { ... }` qmake scopes of a .pro file, name -> body (nested scopes stay in the body)."""
+        scopes: "dict[str, str]" = {}
+        depth = 0
+        name = ""
+        body_start = 0
+        header_start = 0
+        for index, char in enumerate(pro_text):
+            if char == "{":
+                if depth == 0:
+                    name = pro_text[header_start:index].strip()
+                    body_start = index + 1
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    scopes[name] = pro_text[body_start:index]
+                    header_start = index + 1
+            elif char == "\n" and depth == 0:
+                header_start = index + 1
+        return scopes
+
+    def test_standalone_lj92_targets_link_openmp_on_every_declared_platform(self) -> None:
+        """LJ92-PRED1-DECODER-ONLY-1 r1 (adversary A1, introduced major): lj92.c reaches omp_get_wtime through
+        mlv_stage_timing_now's fallbacks (src/debug/StageTiming.h), so a standalone target that compiles it needs OpenMP
+        on its compile AND link line in every platform scope it declares, as pipeline_tests.pro does. The reader tool's
+        win32 scope had it; its linux-g++* and macx scopes, and every scope of the fuzz target, did not."""
+        for relative in ("tests/console/lj92_pred1_reader_tool.pro", "tests/fuzz/fuzz_lj92.pro"):
+            scopes = self._platform_scopes((ROOT / relative).read_text(encoding="utf-8"))
+            for platform in ("win32", "linux-g++*", "macx"):
+                self.assertIn(platform, scopes, relative + " lost its " + platform + " scope")
+                body = scopes[platform]
+                self.assertRegex(body, r"QMAKE_CFLAGS\s*\+=[^\n]*-fopenmp", relative + " " + platform + ": C compile lacks -fopenmp")
+                self.assertRegex(
+                    body, r"(QMAKE_LFLAGS\s*\+=[^\n]*-fopenmp|LIBS\s*\+=[^\n]*-l(libgomp-1|gomp|omp)\b)",
+                    relative + " " + platform + ": link line lacks OpenMP")
+
 
 if __name__ == "__main__":
     unittest.main()
