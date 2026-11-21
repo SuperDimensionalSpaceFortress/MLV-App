@@ -3274,7 +3274,7 @@ function Get-DvLegSpecShapeRefusal {
     foreach ($container in 'look', 'generatorArgs', 'acceptedEffectiveScale', 'timeouts', 'criteria', 'export') {
         $present = $Spec.PSObject.Properties[$container]
         if ($null -ne $present -and $present.Value -isnot [System.Management.Automation.PSCustomObject]) {
-            $shape = $(if ($null -eq $present.Value) { 'null' } elseif ($present.Value -is [array]) { 'an array' } else { "a $($present.Value.GetType().Name)" })
+            $shape = $(if ($null -eq $present.Value) { 'null' } elseif ($present.Value -is [array]) { 'an array' } else { "a $(Get-DvTypeName $present.Value)" })
             return "$container must be a single JSON object (it is $shape)"
         }
     }
@@ -4521,6 +4521,28 @@ $script:ExportStageContainSlackMs = 1.0
 # (EXPORT-CDNG-TOTAL-CONTAINMENT-1, adversary A2: a figure AT the limit is inside it; the binary product 40.00046 * 1.05 + 1 is 43.000482999999996, a hair under the decimal 43.000483, so a comparison
 # adds this far-below-the-precision-of-a-timing epsilon, and no real overrun, which is at least a microsecond in these figures (the writers emit six decimals), is hidden by it)
 $script:ExportStageContainEpsilonMs = 1e-9
+# (EXPORT-CDNG-TOTAL-CONTAINMENT-1 r2 fix 1, adversary pass A2 + A3 on 62dff0fa: every containment comparison is made in [decimal], on figures QUANTIZED to the 6 decimals the writers emit (%.6f), so
+# (A2) a figure exactly at the decimal limit is inside it at ANY magnitude (a binary double product is several ulps past the decimal at 2e7 ms, and a double mean of repeated decimals is a hair off),
+# and (A3) a mean a sub-precision hair past the limit is accepted, as the means rounded to that precision were before this card; rounding is monotone, so a value at or inside the limit is never
+# refused by it, and an overrun of a full microsecond still is.)
+$script:ExportStageContainToleranceD = [decimal]1.05
+$script:ExportStageContainSlackD = [decimal]1.0
+$script:ExportStageContainEpsilonD = [decimal]0.000000001
+
+function Test-DvExportBeyondTolerance {
+    # $true when $Child is past $Parent * 5 % + 1 ms (+ a nanosecond), both compared at 6 decimals in decimal arithmetic.
+    param($Child, $Parent)
+    $limit = [decimal]$Parent * $script:ExportStageContainToleranceD + $script:ExportStageContainSlackD + $script:ExportStageContainEpsilonD
+    [math]::Round([decimal]$Child, 6) -gt [math]::Round($limit, 6)
+}
+
+function Get-DvTypeName {
+    # The .NET type name of a value read from JSON, for a reason that names it. A JSON object whose key is `GetType` (PSCustomObject property) makes `$Value.GetType()` throw "does not contain a method",
+    # so the call is guarded: whatever the value, naming its type never throws.
+    param($Value)
+    if ($null -eq $Value) { return 'null' }
+    try { $Value.GetType().Name } catch { 'JSON object' }
+}
 # (adversary r11 A1: raw_uint16 is a stage the app may not publish, which skipped both of its child pairs; the transitive pairs hold disk_read and decompress inside debayered_frame whether or not
 # raw_uint16 is present, as the stage tree above nests them)
 $script:ExportRenderedContainment = @(@('raw_uint16', 'debayered_frame'), @('raw_uint16_disk_read', 'raw_uint16'), @('raw_uint16_decompress', 'raw_uint16'), @('llrawproc', 'debayered_frame'),
@@ -4720,15 +4742,15 @@ function Get-DvExportContainmentProblem {
         $present = @($group[0] | Where-Object { $null -ne $Means[$_] })
         $parent = $Means[[string]$group[1]]
         if ($present.Count -lt 2 -or $null -eq $parent) { continue }
-        $sum = 0.0; foreach ($n in $present) { $sum += [double]$Means[$n] }
-        if ($sum -gt [double]$parent * $script:ExportStageContainTolerance + $script:ExportStageContainSlackMs + $script:ExportStageContainEpsilonMs) {
+        $sum = [decimal]0; foreach ($n in $present) { $sum += [decimal]$Means[$n] }
+        if (Test-DvExportBeyondTolerance $sum $parent) {
             return "EXPORT_STAGE_CONTAINMENT_MISMATCH: the disjoint stages $($present -join ' + ') total $([math]::Round($sum, 6)) ms (mean) inside $($group[1]) mean $(Get-DvExportRound $parent) ms, so their shares are of work this run's frames do not hold"
         }
     }
     $bad = [System.Collections.Generic.List[string[]]]::new()   # (a list of pairs: a pipeline would unroll a one-pair result into its two names)
     foreach ($pair in $Pairs) {
         $c = $Means[$pair[0]]; $p = $Means[$pair[1]]
-        if ($null -ne $c -and $null -ne $p -and [double]$c -gt [double]$p * $script:ExportStageContainTolerance + $script:ExportStageContainSlackMs + $script:ExportStageContainEpsilonMs) { $bad.Add([string[]]@($pair[0], $pair[1])) }
+        if ($null -ne $c -and $null -ne $p -and (Test-DvExportBeyondTolerance $c $p)) { $bad.Add([string[]]@($pair[0], $pair[1])) }
     }
     if ($bad.Count -eq 0) { return $null }
     "EXPORT_STAGE_CONTAINMENT_MISMATCH: $($bad.Count) stage(s) are timed longer than the stage that contains them (first: $($bad[0][0]) mean $(Get-DvExportRound $Means[$bad[0][0]]) ms inside $($bad[0][1]) mean $(Get-DvExportRound $Means[$bad[0][1]]) ms), so their shares are of work this run's frames do not hold"
@@ -4741,7 +4763,7 @@ function Get-DvExportContainmentProblem {
 function Get-DvExportWallContainmentProblem {
     param($WallSeconds, $Frames, [string]$StageName, $StageMeanMs)
     if ($null -eq $WallSeconds -or $null -eq $Frames -or [int64]$Frames -le 0 -or $null -eq $StageMeanMs) { return $null }
-    $wallPerFrame = [double]$WallSeconds * 1000.0 / [double]$Frames   # (unrounded, as are the means: sol r1 B3)
+    $wallPerFrame = [decimal]$WallSeconds * [decimal]1000 / [decimal]$Frames   # (unrounded and in decimal, as are the means: sol r1 B3; the comparison quantizes: Test-DvExportBeyondTolerance)
     Get-DvExportContainmentProblem -Means @{ batch_wall_per_frame = $wallPerFrame; $StageName = $StageMeanMs } -Pairs @(, @($StageName, 'batch_wall_per_frame'))
 }
 
@@ -4760,41 +4782,48 @@ function Get-DvExportWallContainmentProblem {
 $script:ExportCdngLlrawprocTimedChildren = @('llrawproc_dark_frame', 'llrawproc_vertical_stripes', 'llrawproc_focus_pixels', 'llrawproc_bad_pixels', 'llrawproc_pattern_noise', 'llrawproc_dual_iso', 'llrawproc_chroma_smooth')
 
 function Get-DvExportCdngTotalFrameProblems {
-    # $Frames: the successful profile frame records. Returns the typed problems (zero to three): EXPORT_STAGE_CONTAINMENT_MISMATCH (the total past producer_frame_ms on some frame) and
+    # $Frames: the successful profile frame records. Returns the typed problems (zero to four): EXPORT_STAGE_CONTAINMENT_MISMATCH (the total past producer_frame_ms on some frame, or the worker's llrawproc_total_ms past the bracket that wraps it) and
     # EXPORT_STAGE_SUM_MISMATCH (the seven timed children plus llrawproc_other_ms past llrawproc_ms on some frame, llrawproc_ms past that sum on more than a tenth of the frames, or the worker's
     # llrawproc_total_ms apart from that sum on some frame).
     param($Frames)
     $past = [System.Collections.Generic.List[string]]::new(); $beyond = [System.Collections.Generic.List[string]]::new(); $longer = [System.Collections.Generic.List[string]]::new()
-    $worker = [System.Collections.Generic.List[string]]::new()
+    $worker = [System.Collections.Generic.List[string]]::new(); $workerOut = [System.Collections.Generic.List[string]]::new()
     $judged = 0
-    $tol = $script:ExportStageContainTolerance; $limitSlack = $script:ExportStageContainSlackMs + $script:ExportStageContainEpsilonMs
-    $timing = { param($frame, $field) $v = Get-DvProp $frame $field; if ($null -ne $frame.PSObject.Properties[$field] -and $null -eq (Get-DvExportTimingProblem $v)) { [double]$v } else { $null } }
+    # (every comparison is Test-DvExportBeyondTolerance: decimal arithmetic on figures quantized to the writers' 6 decimals; the figures are [decimal] throughout. Adversary pass A2 on 62dff0fa.)
+    $timing = { param($frame, $field) $v = Get-DvProp $frame $field; if ($null -ne $frame.PSObject.Properties[$field] -and $null -eq (Get-DvExportTimingProblem $v)) { [decimal][double]$v } else { $null } }
     foreach ($frame in @($Frames)) {
         $at = Get-DvProp $frame 'frame_index'
         $total = & $timing $frame 'llrawproc_ms'
         $producer = & $timing $frame 'producer_frame_ms'
-        if ($null -ne $total -and $null -ne $producer -and $total -gt $producer * $tol + $limitSlack) {
+        if ($null -ne $total -and $null -ne $producer -and (Test-DvExportBeyondTolerance $total $producer)) {
             $past.Add("frame_index $at llrawproc_ms $(Get-DvExportRound $total) ms inside producer_frame_ms $(Get-DvExportRound $producer) ms")
         }
         # (r2, sol r1 B2 / INV-2: $sum is the sum of the children this frame PRESENTS, so it is a LOWER BOUND on the full sum when one is absent: a child omitted from the frame is work of 0 or more ms,
         # never less. Only the over-the-container directions are judged on a lower bound; "the bracket is longer than its children" needs the whole sum, so it still waits for $whole.)
-        $sum = 0.0; $whole = $true   # (a figure that is absent or not a conforming timing leaves the sum underivable on this frame; the record schema types that elsewhere)
+        $sum = [decimal]0; $whole = $true   # (a figure that is absent or not a conforming timing leaves the sum underivable on this frame; the record schema types that elsewhere)
         foreach ($n in @($script:ExportCdngLlrawprocTimedChildren) + 'llrawproc_other') { $part = & $timing $frame "${n}_ms"; if ($null -eq $part) { $whole = $false } else { $sum += $part } }
         $what = $(if ($whole) { 'the seven timed children and llrawproc_other_ms' } else { 'the present llrawproc children (a lower bound: not every one is published on this frame)' })
         $workerTotal = & $timing $frame 'llrawproc_total_ms'
-        if ($null -ne $workerTotal -and (($whole -and $workerTotal -gt $sum * $tol + $limitSlack) -or $sum -gt $workerTotal * $tol + $limitSlack)) {
-            $worker.Add("frame_index $at llrawproc_total_ms $(Get-DvExportRound $workerTotal) ms beside $what totalling $(Get-DvExportRound $sum) ms")
+        if ($null -ne $workerTotal) {
+            # (adversary pass A4 on 62dff0fa: the worker is the call the llrawproc_ms bracket wraps (dng.c:2619-2622), so its total is inside the bracket, and inside producer_frame_ms when there is no
+            # bracket; with the remainder omitted the present children cannot refute it, and with all eight present they agree with it, so only this containment can see a worker total past what wraps it)
+            if ($null -ne $total -and (Test-DvExportBeyondTolerance $workerTotal $total)) { $workerOut.Add("frame_index $at llrawproc_total_ms $(Get-DvExportRound $workerTotal) ms inside the llrawproc_ms bracket $(Get-DvExportRound $total) ms") }
+            elseif ($null -ne $producer -and (Test-DvExportBeyondTolerance $workerTotal $producer)) { $workerOut.Add("frame_index $at llrawproc_total_ms $(Get-DvExportRound $workerTotal) ms inside producer_frame_ms $(Get-DvExportRound $producer) ms") }
+            if (($whole -and (Test-DvExportBeyondTolerance $workerTotal $sum)) -or (Test-DvExportBeyondTolerance $sum $workerTotal)) {
+                $worker.Add("frame_index $at llrawproc_total_ms $(Get-DvExportRound $workerTotal) ms beside $what totalling $(Get-DvExportRound $sum) ms")
+            }
         }
         if ($null -eq $total) { continue }
         if ($whole) { $judged++ }
-        if ($sum -gt $total * $tol + $limitSlack) {
+        if (Test-DvExportBeyondTolerance $sum $total) {
             $beyond.Add("frame_index $at $what total $(Get-DvExportRound $sum) ms inside llrawproc_ms $(Get-DvExportRound $total) ms")
         }
-        if ($whole -and $total -gt $sum * $tol + $limitSlack) {
+        if ($whole -and (Test-DvExportBeyondTolerance $total $sum)) {
             $longer.Add("frame_index $at llrawproc_ms $(Get-DvExportRound $total) ms beside the seven timed children and llrawproc_other_ms totalling $(Get-DvExportRound $sum) ms")
         }
     }
     if ($past.Count -gt 0) { "EXPORT_STAGE_CONTAINMENT_MISMATCH: $($past.Count) frame(s) time llrawproc_ms longer than the producer_frame_ms that contains it (first: $($past[0])), so the published llrawproc total is of work this run's frames do not hold" }
+    if ($workerOut.Count -gt 0) { "EXPORT_STAGE_CONTAINMENT_MISMATCH: $($workerOut.Count) frame(s) publish a worker llrawproc_total_ms longer than the llrawproc_ms bracket (or producer_frame_ms) that wraps the worker call (first: $($workerOut[0])), so the published worker total is of work this run's frames do not hold" }
     if ($beyond.Count -gt 0) { "EXPORT_STAGE_SUM_MISMATCH: $($beyond.Count) frame(s) time the llrawproc children longer than the llrawproc_ms that contains them (first: $($beyond[0])), so the published llrawproc total is not the work its children measured" }
     elseif ($longer.Count * 10 -gt $judged) {
         "EXPORT_STAGE_SUM_MISMATCH: $($longer.Count) of $judged frame(s) publish an llrawproc_ms longer than the seven timed children plus llrawproc_other_ms it totals (first: $($longer[0])), so the published llrawproc total is not the work its children measured"
@@ -4870,7 +4899,7 @@ function Get-DvExportTimingProblem {
     # $null when $Value is a conforming timing, else the reason it is not. Never throws, whatever the value is.
     param($Value)
     if ($null -eq $Value) { return 'is JSON null' }
-    if (-not ($Value -is [double] -or $Value -is [int] -or $Value -is [long] -or $Value -is [decimal])) { return "is a $($Value.GetType().Name), not a JSON number" }
+    if (-not ($Value -is [double] -or $Value -is [int] -or $Value -is [long] -or $Value -is [decimal])) { return "is a $(Get-DvTypeName $Value), not a JSON number" }
     $d = [double]$Value
     if (-not [double]::IsFinite($d)) { return 'is not finite' }
     if ($d -lt 0) { return 'is negative' }
@@ -4882,9 +4911,11 @@ function Get-DvExportExactMean {
     # EXPORT-CDNG-TOTAL-CONTAINMENT-1 r2 (sol r1 B3 / INV-5): the UNROUNDED mean of the conforming timings ($null when there is none). The published stage rows round their means to 6 places
     # (Get-DvExportStageRow); a containment gate reads this instead, so 29 frames at the documented 5 % + 1 ms tolerance and one a hair inside it are not turned INVALID by a mean rounded before it is compared.
     param($Values)
-    $v = @($Values | Where-Object { $null -eq (Get-DvExportTimingProblem $_) } | ForEach-Object { [double]$_ })
+    # (a [decimal], summed exactly: a double mean of repeated decimals is a hair off the decimal it equals; adversary pass A2 on 62dff0fa)
+    $v = @($Values | Where-Object { $null -eq (Get-DvExportTimingProblem $_) } | ForEach-Object { [decimal][double]$_ })
     if ($v.Count -eq 0) { return $null }
-    ($v | Measure-Object -Sum).Sum / $v.Count
+    $sum = [decimal]0; foreach ($x in $v) { $sum += $x }
+    $sum / [decimal]$v.Count
 }
 
 function Get-DvExportStageRow {
@@ -6294,9 +6325,9 @@ function Get-DvPresentMonGapVerdict {
     # right operand to its own type, so a JSON true in source or kind read as 'app_swap_window' / 'internal'. Every string field this verdict reads
     # must be a [string] (or absent), and the placement field a [bool] (or absent); anything else is a blocking typed refusal, never compared.
     $untyped = @(foreach ($field in @(@('presentMonStatus', $rawStatus), @('presentMonTemporalGapKind', $kind), @('presentMonTemporalWindowSource', $source))) {
-        if ($null -ne $field[1] -and -not ($field[1] -is [string])) { "$($field[0]) is a $($field[1].GetType().Name) ('$($field[1])'), not a string" }
+        if ($null -ne $field[1] -and -not ($field[1] -is [string])) { "$($field[0]) is a $(Get-DvTypeName $field[1]) ('$($field[1])'), not a string" }
     })
-    if ($null -ne $atAppStall -and -not ($atAppStall -is [bool])) { $untyped += "presentMonTemporalOverBoundGapAtAppStall is a $($atAppStall.GetType().Name) ('$atAppStall'), not a Boolean" }
+    if ($null -ne $atAppStall -and -not ($atAppStall -is [bool])) { $untyped += "presentMonTemporalOverBoundGapAtAppStall is a $(Get-DvTypeName $atAppStall) ('$atAppStall'), not a Boolean" }
     $gap = $null
     if ($rawGap -is [double] -or $rawGap -is [int] -or $rawGap -is [long] -or $rawGap -is [decimal]) {
         $d = [double]$rawGap

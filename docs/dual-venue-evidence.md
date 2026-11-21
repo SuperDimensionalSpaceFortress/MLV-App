@@ -461,8 +461,10 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
     tolerance as every pair (5 % + 1 ms, with a 1e-9 ms epsilon so a decimal figure exactly at the limit is inside it). A frame with no `llrawproc_ms` is not judged against it (a stage the
     app did not run is permitted absent). A frame without all eight figures is still held to the ones it carries: they are a **lower bound** on the sum, so they must fit inside
     `llrawproc_ms` and inside the worker total (`EXPORT_STAGE_SUM_MISMATCH`); only "the total is longer than its children" needs all eight. A **present** `llrawproc_total_ms` is
-    schema-checked like every timing (a string, null, array, boolean, negative or over-the-24 h-ceiling value is `EXPORT_RECORD_INVALID`, never read as absent). The containment gates compare
-    the **unrounded** means (the published rows keep their 6-place means), so a run at the documented tolerance on every frame is not rejected by a mean rounded before the gate. Writer, receipt re-derivation and the reader share `Get-DvExportEvidence`, so all three apply it under empty and shipped criteria.
+    schema-checked like every timing (a string, null, array, boolean, negative or over-the-24 h-ceiling value is `EXPORT_RECORD_INVALID`, never read as absent). A published worker total is also **inside the `llrawproc_ms` bracket that wraps the
+    worker call** (inside `producer_frame_ms` when there is no bracket): `EXPORT_STAGE_CONTAINMENT_MISMATCH`. Every containment comparison (means, disjoint groups, pairs, the wall, each frame) is made in
+    decimal arithmetic on exact decimal means, quantized to the 6 decimals the writers emit (the published rows keep their 6-place means), so a figure exactly at the documented tolerance is accepted
+    at any magnitude and a mean a sub-precision hair past it is not refused, while an overrun of a full microsecond is. Writer, receipt re-derivation and the reader share `Get-DvExportEvidence`, so all three apply it under empty and shipped criteria.
   * ProRes: the denominator is the mean `processed16_total`, the timed per-frame work. The top-level stages are `debayered_frame` and `processing`.
     `raw_uint16` and `llrawproc` nest inside `debayered_frame`. The batch's `DONE elapsed` starts before the clip opens and also times finish, verify and
     probe, so it is never a denominator. `batchWallPerFrameMs` and `untimedPerFrameMs` (wall per frame minus `processed16_total`: open, pipe write,
