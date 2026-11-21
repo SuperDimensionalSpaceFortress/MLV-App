@@ -4278,7 +4278,9 @@ TEST( PlaybackMeasuredLoopExit, TheLagParameterizedLoopEndsAtExactlyTheTargetWhe
             ASSERT_TRUE( fresh.consumed - c.target < playback_frame_range::kMeasuredPlayMaxFramesInFlight );
             const LoopEnd old = run( Rule::Old, timeline, c.target, c.target, lag, 0, everyDueFramePresents );
             ASSERT_TRUE( old.presented < c.target );                          // the exit-11 shape
-            ASSERT_EQ( std::max<int64_t>( 0, c.target - lag ), old.presented );
+            // by value: ASSERT_EQ binds `const auto &`, and std::max returns a reference to its (temporary) argument
+            const int64_t oldPresentedAtTheReached = std::max<int64_t>( 0, c.target - lag );
+            ASSERT_EQ( oldPresentedAtTheReached, old.presented );
             ASSERT_EQ( c.target, old.consumed );                              // it broke at the first Reached
             ++checked;
         }
