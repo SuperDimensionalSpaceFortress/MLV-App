@@ -538,7 +538,8 @@ class HelperBehaviourTests(unittest.TestCase):
             + epilogue
             + "[ordered]@{ ok = $r.ok; reason = $r.reason; exitCode = $r.exitCode;"
             " outputPinned = $(if ($r.PSObject.Properties['outputPinned']) { $r.outputPinned } else { $null });"
-            " outputDir = $(if ($r.PSObject.Properties['outputDir']) { $r.outputDir } else { $null }); installed = @($r.installed) }"
+            " outputDir = $(if ($r.PSObject.Properties['outputDir']) { $r.outputDir } else { $null }); installed = @($r.installed);"
+            " probe = [string]$global:FfxProbe }"
             " | ConvertTo-Json -Depth 4 -Compress\n"
         )
         env = dict(os.environ, FFX_REPO=str(ROOT), FFX_OUT=output_dir, **(extra_env or {}))
@@ -619,6 +620,51 @@ class HelperBehaviourTests(unittest.TestCase):
                      "$psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)",
                      "$psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)"):
             self.assertIn(line, text)
+
+    def test_an_inherited_python_user_site_that_prints_never_corrupts_the_report(self) -> None:
+        # PR 862 r11 (adversary e9d903be-A5, the class of bf1ac39c-A6): an inherited PYTHONUSERBASE aimed at a user site whose
+        # usercustomize.py prints one line. The line preceded the extractor's JSON on stdout after the install had committed, and the
+        # wrapper refused a completed install. No inherited PYTHON* variable reaches the child now, and the user site is off.
+        userbase = self.tmp / "userbase"
+        env = dict(os.environ, PYTHONUSERBASE=str(userbase))
+        env.pop("PYTHONNOUSERSITE", None)
+        site = subprocess.run(["py", "-3", "-c", "import site; print(site.getusersitepackages())"], capture_output=True, text=True,
+                              timeout=60, env=env)
+        self.assertEqual(site.returncode, 0, site.stderr)
+        site_dir = Path(site.stdout.strip())
+        site_dir.mkdir(parents=True)
+        (site_dir / "usercustomize.py").write_text("print('Python startup complete')\n", encoding="ascii")
+        probe = subprocess.run(["py", "-3", "-c", "pass"], capture_output=True, text=True, timeout=60, env=env)
+        self.assertIn("Python startup complete", probe.stdout, "precondition: this interpreter runs the inherited user site")
+        out = self.tmp / "out"
+        out.mkdir()
+        result = self._run(str(out), extra_env={"PYTHONUSERBASE": str(userbase)})
+        self.assertTrue(result["ok"], result)
+        text = _normalised(HELPER_MODULE)
+        self.assertIn("if ([string]$name -like 'PYTHON*') { [void]$psi.Environment.Remove([string]$name) }", text)
+        self.assertIn("$psi.Environment['PYTHONNOUSERSITE'] = '1'", text)
+
+    def test_the_output_folder_stays_held_while_the_installed_files_are_re_read(self) -> None:
+        # PR 862 r11 (adversary e9d903be-A2): the output pin was released before the wrapper parsed the report and re-read the installed
+        # files by pathname, so the folder could be renamed and replaced in between (an empty one refused a completed install; one with
+        # a byte-identical copy passed under another directory identity). The pin is now held until the function returns: a rename of
+        # the output folder attempted while the installed file is re-hashed is refused and the install's own folder is the one read.
+        out = self.tmp / "out"
+        out.mkdir()
+        prelude = (
+            "function global:Get-FileHash { [CmdletBinding()] param([string]$LiteralPath, [string]$Algorithm)\n"
+            "  if (-not $global:FfxProbe) {\n"
+            "    try { [System.IO.Directory]::Move($env:FFX_OUT, $env:FFX_OUT + '-parked'); $global:FfxProbe = 'renamed' }"
+            " catch { $global:FfxProbe = 'refused: ' + $_.Exception.Message }\n"
+            "  }\n"
+            "  Microsoft.PowerShell.Utility\\Get-FileHash -LiteralPath $LiteralPath -Algorithm $Algorithm\n"
+            "}\n"
+        )
+        result = self._install_full(str(out), prelude=prelude)
+        self.assertTrue(result["probe"].startswith("refused"), result)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue((out / "ffmpeg.exe").is_file())
+        self.assertFalse(Path(str(out) + "-parked").exists())
 
     def test_a_hash_that_throws_returns_a_typed_failure_instead_of_throwing(self) -> None:
         # adversary 32bf39a9-A2: a FileShare.None handle on the installed ffmpeg.exe makes the helper's own hash throw. Get-FileHash is

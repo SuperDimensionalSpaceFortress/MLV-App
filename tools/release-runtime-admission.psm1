@@ -210,7 +210,9 @@ function Stop-PinnedPayloadChild {
     )
     # One monotonic clock bounds every wait of this stop (r6 property 2); no wall-clock reading decides anything here. A listing starts
     # only while at least one whole second (the CIM bound's granularity) is left, and is bounded to the whole seconds left, rounded DOWN
-    # (adversary df7e3c66-A2); a tree seen gone only after the budget is spent is not confirmed (adversary d7942d7f-A2).
+    # (adversary df7e3c66-A2); a tree seen gone only after the budget is spent, by whole milliseconds, is not confirmed (adversary
+    # d7942d7f-A2). KNOWN HOLE (adversary bf1ac39c-A5, e9d903be-A6): ElapsedMilliseconds truncates, so a result that lands less than one
+    # millisecond past the budget still confirms; card PINNED-PAYLOAD-KILL-TREE-DST-1.
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
     $listingSec = { [int][math]::Min(30, [math]::Floor(($ConfirmMs - $clock.ElapsedMilliseconds) / 1000.0)) }
     # The root's identity is read through the handle this caller holds, never from a listing (key3 r5 B1, psm1:108 sibling).
@@ -508,6 +510,13 @@ function Invoke-PinnedPayloadInstall {
     # The tools package must come from RepoRoot (the working directory), never from an inherited search
     # path; and the checkout is not written to (no __pycache__).
     foreach ($name in @('PYTHONPATH', 'PYTHONHOME', 'PYTHONSAFEPATH', 'PYTHONSTARTUP')) { [void]$psi.Environment.Remove($name) }
+    # PR 862 r11 (adversary e9d903be-A5, same class as bf1ac39c-A6: inherited Python startup state corrupting the child's report): NO
+    # inherited PYTHON* variable reaches the child (PYTHONUSERBASE aiming at a usercustomize that prints, PYTHONINSPECT, PYTHONVERBOSE,
+    # ...), and the user site is off, so the child's stdout carries the extractor's report alone. Only the values set below remain.
+    foreach ($name in @($psi.Environment.Keys)) {
+        if ([string]$name -like 'PYTHON*') { [void]$psi.Environment.Remove([string]$name) }
+    }
+    $psi.Environment['PYTHONNOUSERSITE'] = '1'
     $psi.Environment['PYTHONDONTWRITEBYTECODE'] = '1'
     # PR 862 r11 (adversary bf1ac39c-A6, Grok G7(a)): the child's report is UTF-8 on both sides. An inherited PYTHONIOENCODING (say
     # utf-16-le) or a legacy console code page made a valid install print a report this wrapper could not parse.
@@ -568,9 +577,9 @@ function Invoke-PinnedPayloadInstall {
             }
             return [pscustomobject]$result
         }
-    } finally {
-        $outputPin.handle.Dispose()
-    }
+    # PR 862 r11 (adversary e9d903be-A2): the output folder stays HELD through the report check below too, so the installed files are
+    # re-read in the very folder the child installed into (it cannot be renamed and replaced in between); released in the finally at
+    # the end of this function.
     if ($result.exitCode -ne 0) {
         $result.reason = "the extractor exited $($result.exitCode): $($result.stderr.Trim())"
         return [pscustomobject]$result
@@ -622,6 +631,9 @@ function Invoke-PinnedPayloadInstall {
     $result.installed = $installed
     $result.ok = $true
     return [pscustomobject]$result
+    } finally {
+        $outputPin.handle.Dispose()
+    }
 }
 
 # Adversary ae560106-A1: a delete or a rewrite of the installed ffmpeg.exe after its readback reached the zip or the manifest
