@@ -196,10 +196,14 @@ TEST(PlaybackPresentTraceStages, AFrameStoresItsStageStampsOrderedAndRebasedToTh
     ASSERT_NEAR(22.0, a.readyMs, 1e-9);
     ASSERT_NEAR(35.0, a.presentMs, 1e-9);
     ASSERT_TRUE(a.stagesOrdered());
-    // out of order is reported, not hidden
-    Row bad = a;
-    bad.reMs = 4.0;
-    ASSERT_FALSE(bad.stagesOrdered());
+    // out of order is reported, not hidden: the verdict is judged in notePresent on the absolute inputs and stored in the row
+    Row bad;
+    bad.setStages(stagesFrom(1.001));
+    bad.reMs = 1004.0;                     // recon ended (absolute) before the decode ended at 1007
+    bad.readyMs = 1022.0;
+    bad.presentMs = 1035.0;
+    trace.notePresent(bad);
+    ASSERT_FALSE(trace.row(1).stagesOrdered());
 }
 
 TEST(PlaybackPresentTraceStages, AStageThatWasNeverStampedStaysUnknownAndAStageBeforeThePlayStaysNegative)
@@ -427,8 +431,9 @@ double *chainField(Row &r, int index)
 
 // r5 (sol r4 B1, HUB RULING 2026-11-20T18:55Z): presence is explicit, never a magnitude test. A KNOWN stamp that rebases to
 // -5e8 ms or lower (a Play origin far past the stage clock's zero) is a stamp like any other. Sol's literal input, then
-// every one of the nine adjacent edges of the chain.
-TEST(PlaybackPresentTraceStages, AKnownStampFarBeforeThePlayOriginStillTakesPartInTheOrderCheck)
+// every one of the nine adjacent edges of the chain. r6 (fable key3 r5 B1): the order is judged on the ABSOLUTE inputs in
+// notePresent and the verdict is stored, so the test is named for that and not for the rebase.
+TEST(PlaybackPresentTraceStages, AKnownStampIsOrderedOnItsAbsoluteValueNoMatterWhatTheRebaseDoesToIt)
 {
     {
         Recorder trace;
@@ -497,6 +502,143 @@ TEST(PlaybackPresentTraceStages, ANonFiniteStageInAnAcceptedRowIsUnknownAndNever
             ASSERT_FALSE(trace.row(0).stagesOrdered());
         }
     }
+}
+
+// r6 (fable key3 r5 B1, HUB RULING 2026-11-20T22:58Z): begin()'s origin is an accepted input too. A non-finite origin is
+// REFUSED (the Play records nothing), and a huge finite one cannot hide a reversal, because the order is judged on the
+// absolute inputs and not on values that were rebased (and rounded) against that origin.
+TEST(PlaybackPresentTraceStages, ANonFiniteOriginIsRefusedAndAHugeOneCannotHideAReversedChain)
+{
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    for (const double origin : { nan, inf, -inf })
+    {
+        Recorder trace;
+        trace.setEnabled(true);
+        trace.begin(origin, 4);
+        ASSERT_FALSE(trace.active());              // refused: the Play is not recorded
+        Row r;
+        r.reqMs = 20.0;
+        r.dqMs = 10.0;                             // reversed
+        r.presentMs = 30.0;
+        trace.notePresent(r);
+        ASSERT_TRUE(trace.empty());                // so no row can say stage_ok=1 for it
+        ASSERT_EQ(static_cast<size_t>(0), trace.total());
+        trace.begin(1000.0, 4);                    // a later, valid Play records again
+        ASSERT_TRUE(trace.active());
+        trace.notePresent(r);
+        ASSERT_EQ(static_cast<size_t>(1), trace.size());
+        ASSERT_FALSE(trace.row(0).stagesOrdered());
+    }
+}
+
+TEST(PlaybackPresentTraceStages, AHugeFiniteOriginCannotRoundTwoReversedStampsIntoAnOrderedChain)
+{
+    {
+        // fable's literal: both stamps round to exactly -1e20 once rebased against 1e20
+        Recorder trace;
+        trace.setEnabled(true);
+        trace.begin(1.0e20, 2);
+        playback_present_trace::StageStamps s;
+        s.requestS = 2.0;
+        s.decodeQueueS = 1.0;                      // before the request
+        Row r;
+        r.setStages(s);
+        r.presentMs = 1.0e20;
+        trace.notePresent(r);
+        ASSERT_FALSE(trace.row(0).stagesOrdered());
+        playback_present_trace::StageStamps good;
+        good.requestS = 1.0;
+        good.decodeQueueS = 2.0;                   // in order, and still ordered
+        Row g;
+        g.setStages(good);
+        g.presentMs = 1.0e20;
+        trace.notePresent(g);
+        ASSERT_TRUE(trace.row(1).stagesOrdered());
+    }
+}
+
+TEST(PlaybackPresentTraceStages, ARebaseThatOverflowsIsUnknownAndNeverAnInfiniteStoredValue)
+{
+    {
+        // 1e308 - (-1e308) overflows to +inf
+        Recorder trace;
+        trace.setEnabled(true);
+        trace.begin(-1.0e308, 1);
+        Row r;
+        r.reqMs = 1.0e308;
+        r.dqMs = 1.0e308;
+        r.presentMs = 1.0e308;
+        trace.notePresent(r);
+        ASSERT_TRUE(std::isfinite(trace.row(0).reqMs));
+        ASSERT_TRUE(std::isfinite(trace.row(0).dqMs));
+        ASSERT_TRUE(std::isfinite(trace.row(0).presentMs));
+    }
+}
+
+// r6 (fable key3 r5 B2): formatRow must never cut a row. Two 1e308 stamps print 313 characters each; the row still has one
+// field per header column and still ends with stage_ok.
+TEST(PlaybackPresentTraceStages, ARowWithHugeFiniteStampsIsNeverCutShort)
+{
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(0.0, 1);
+    Row r;
+    r.reqMs = 1.0e308;
+    r.dqMs = 1.0e308;
+    r.dsMs = 1.0e308;
+    r.deMs = 1.0e308;
+    r.rsMs = 1.0e308;
+    r.reMs = 1.0e308;
+    r.rndMs = 1.0e308;
+    r.drawBeginMs = 1.0e308;
+    r.presentMs = 30.0;                            // before the stamps: stage_ok=0
+    trace.notePresent(r);
+    const std::string header = Recorder::header();
+    const std::string row = Recorder::formatRow(0, trace.row(0));
+    const auto commas = [](const std::string &s) { size_t n = 0; for (char c : s) n += c == ',' ? 1 : 0; return n; };
+    ASSERT_EQ(commas(header), commas(row));
+    ASSERT_TRUE(row.size() > 2 && row.compare(row.size() - 2, 2, ",0") == 0);   // stage_ok is present and 0
+}
+
+// r6 (fable key3 r5 H1): a non-finite presentMs is unknown at the entry. It is stored as the marker, never as NaN, and the
+// next row keeps its interval and its present-to-first-tick gap, measured from the last KNOWN present.
+TEST(PlaybackPresentTraceStages, ANonFinitePresentIsUnknownAndTheNextRowKeepsItsIntervalAndTickGap)
+{
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    for (const double bad : { nan, inf, -inf })
+    {
+        Recorder trace;
+        trace.setEnabled(true);
+        trace.begin(0.0, 8);
+        Row first;
+        first.presentMs = 10.0;
+        trace.notePresent(first);
+        Row unknown;
+        unknown.presentMs = bad;
+        trace.notePresent(unknown);
+        trace.noteTick(30.0, false, false);        // 20 ms after the last known present
+        Row next;
+        next.presentMs = 50.0;
+        trace.notePresent(next);
+        ASSERT_NEAR(playback_present_trace::kUnknownMs, trace.row(1).presentMs, 0.0);
+        ASSERT_TRUE(trace.row(1).stagesOrdered());
+        ASSERT_TRUE(std::isfinite(trace.row(2).intervalMs));
+        ASSERT_NEAR(40.0, trace.row(2).intervalMs, 1e-9);
+        ASSERT_NEAR(20.0, trace.row(2).maxTickGapMs, 1e-9);
+    }
+    // fable's literal: nothing known before the NaN present
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(0.0, 4);
+    Row unknown;
+    unknown.presentMs = nan;
+    trace.notePresent(unknown);
+    Row next;
+    next.presentMs = 50.0;
+    trace.notePresent(next);
+    ASSERT_TRUE(std::isfinite(trace.row(1).intervalMs));
 }
 
 // r3 (adversary 81c5805c A1/A2, HUB RULING 2026-11-20T11:30Z): the LIGHT trace has no configure or H2D column, and no code

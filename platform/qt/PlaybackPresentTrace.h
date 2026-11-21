@@ -70,7 +70,7 @@ struct Row
 {
     int frame = 0;                // displayFrame
     int position = 0;             // timeline (slider) position at the present
-    double presentMs = 0.0;       // the present was recorded (notePlaybackSmokePresentedFrame)
+    double presentMs = 0.0;       // the present was recorded (notePlaybackSmokePresentedFrame); kUnknownMs when the input was not finite
     double intervalMs = 0.0;      // since the previous present (0 for the first)
     double readyMs = -1.0;        // the render thread emitted this frame ready (input: absolute ms, -1 = not known)
     double uiLatencyMs = 0.0;     // ready emit -> drawFrameReady picked it up (GUI thread)
@@ -102,10 +102,13 @@ struct Row
     double drawBeginMs = kUnknownMs;  // GUI draw began
 
     /*! Which of the ten chain stamps (request .. present, bit i = chain position i) this row KNOWS. Set in ONE place,
-     *  notePresent, from the INPUT: an absolute stage-clock time that is finite and not negative is known. The rebased value
-     *  may then be any number at all (-1.0 or -5e8 included), so no value can say "unknown" and none is tested for it. A
-     *  row that never passed notePresent knows nothing. */
+     *  notePresent, from the INPUT: an absolute stage-clock time that is finite and not negative is known (the present: any
+     *  finite value). The rebased value may then be any finite number (-1.0 or -5e8 included), so no value can say
+     *  "unknown" and none is tested for it. A row that never passed notePresent knows nothing. */
     unsigned knownMask = 0;
+    /*! notePresent's verdict on the order of the KNOWN stamps, judged on the ABSOLUTE inputs before they were rebased (rebasing
+     *  against a large origin rounds two different stamps onto one value). A row that never passed notePresent is "ordered". */
+    bool ordered = true;
     static constexpr int kChainLength = 10;
     static constexpr int kReadyIndex = 7;
     static constexpr int kPresentIndex = 9;
@@ -133,17 +136,21 @@ struct Row
 
     /*! True when the KNOWN stamps never run backwards along request .. present (1 = ordered). It orders what was stamped;
      *  it does not say every stage was instrumented. Presence is knownMask, never a value (adversary a7085920 A2, sol r3 B1,
-     *  sol r4 B1/B2); notePresent guarantees every known stamp is finite, so the comparison below cannot meet a NaN. */
-    bool stagesOrdered() const
+     *  sol r4 B1/B2). The verdict is the one notePresent stored (\a ordered), judged on the absolute inputs: the stored,
+     *  rebased columns are for the log and are not what the order is read from (fable key3 r5 B1). */
+    bool stagesOrdered() const { return ordered; }
+
+    /*! The order check itself, over the ten ABSOLUTE chain values (request .. present) and the mask of the known ones. Every
+     *  known value is finite (notePresent's entry rule), so the comparison cannot meet a NaN. */
+    static bool chainOrdered( const double ( &absolute )[kChainLength], unsigned mask )
     {
-        const double chain[kChainLength] = { reqMs, dqMs, dsMs, deMs, rsMs, reMs, rndMs, readyMs, drawBeginMs, presentMs };
         bool haveLast = false;
         double last = 0.0;
         for( int i = 0; i < kChainLength; ++i )
         {
-            if( !( ( knownMask >> i ) & 1u ) ) continue;
-            if( haveLast && chain[i] < last ) return false;
-            last = chain[i];
+            if( !( ( mask >> i ) & 1u ) ) continue;
+            if( haveLast && absolute[i] < last ) return false;
+            last = absolute[i];
             haveLast = true;
         }
         return true;
@@ -163,6 +170,16 @@ public:
     void begin( double originMs, size_t expectedRows )
     {
         if( !m_enabled ) return;
+        if( !std::isfinite( originMs ) )
+        {
+            // REFUSED (fable key3 r5 B1): a NaN or infinite origin has no meaning, and every rebased stamp would inherit it. The
+            // Play is simply not recorded: rows of the previous Play are dropped and active() stays false.
+            m_active = false;
+            m_total = 0;
+            m_pending = Row();
+            m_ring.clear();
+            return;
+        }
         m_active = true;
         m_originMs = originMs;
         m_ring.assign( expectedRows > 0 ? expectedRows : 1, Row() );
@@ -220,30 +237,36 @@ public:
     void notePresent( Row row )
     {
         if( !active() ) return;
-        // The ONE place a Row's stamps are judged, on the INPUT (absolute stage-clock ms): finite and not negative = known.
-        // A NaN or infinite input, and the unknown markers (kUnknownMs, ready's -1), are unknown and are stored as that
-        // marker, so no later code can meet a non-finite value. Only then is a known stamp rebased, and it may land on any
-        // value (a stage may precede the Play's start); its presence is the mask bit, never its value.
+        // The ONE place a Row's chain stamps are judged, on the INPUT (absolute stage-clock ms). A stage stamp is known when it
+        // is finite and not negative; the present is known when it is finite. A known stamp whose rebase (input - origin)
+        // would overflow is unknown too. An unknown one (NaN or infinite, kUnknownMs, ready's -1) is stored as its column's
+        // documented marker, so every stored value is finite and no later code can meet a NaN. The ORDER is judged here, on
+        // the absolute inputs and before any rebase (which can round two stamps onto one value), and the verdict is stored;
+        // a known stamp's presence is the mask bit, never its value.
         double *chain[Row::kChainLength];
         row.chainFields( chain );
+        double absolute[Row::kChainLength];
+        double rebased[Row::kChainLength];
         row.knownMask = 0;
         for( int i = 0; i < Row::kChainLength; ++i )
         {
             const double input = *chain[i];
-            if( i == Row::kPresentIndex )
-            {
-                if( std::isfinite( input ) ) row.knownMask |= 1u << i;
-                *chain[i] = input - m_originMs;   // the present is always recorded; only its ORDERING presence is the mask
-            }
-            else if( std::isfinite( input ) && input >= 0.0 )
-            {
-                row.knownMask |= 1u << i;
-                *chain[i] = input - m_originMs;
-            }
+            absolute[i] = input;
+            rebased[i] = input - m_originMs;
+            const bool inputKnown = i == Row::kPresentIndex ? std::isfinite( input ) : ( std::isfinite( input ) && input >= 0.0 );
+            if( inputKnown && std::isfinite( rebased[i] ) ) row.knownMask |= 1u << i;
+        }
+        row.ordered = Row::chainOrdered( absolute, row.knownMask );
+        for( int i = 0; i < Row::kChainLength; ++i )
+        {
+            if( ( row.knownMask >> i ) & 1u )
+                *chain[i] = rebased[i];
             else
                 *chain[i] = i == Row::kReadyIndex ? -1.0 : kUnknownMs;   // each column's documented "unknown"
         }
-        row.intervalMs = m_havePresent ? row.presentMs - m_lastPresentMs : 0.0;
+        const bool presentKnown = ( row.knownMask >> Row::kPresentIndex ) & 1u;
+        // An unknown present (NaN, infinite) leaves the interval and tick-gap history on the last KNOWN present.
+        row.intervalMs = ( presentKnown && m_havePresent ) ? row.presentMs - m_lastPresentMs : 0.0;
         row.prevEndMs = m_havePresentEnd ? m_lastPresentEndMs : -1.0;   // the column's documented "none yet"
         row.ticks = m_pending.ticks;
         row.busyTicks = m_pending.busyTicks;
@@ -258,8 +281,11 @@ public:
         m_ring[m_total % m_ring.size()] = row;   // a fixed slot: no allocation
         ++m_total;
         m_pending = Row();
-        m_lastPresentMs = row.presentMs;
-        m_havePresent = true;
+        if( presentKnown )
+        {
+            m_lastPresentMs = row.presentMs;
+            m_havePresent = true;
+        }
         m_haveTick = false;
     }
 
@@ -292,17 +318,25 @@ public:
 
     static std::string formatRow( size_t index, const Row &r )
     {
-        char buf[640];
-        std::snprintf( buf, sizeof( buf ),
-                       "%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.3f,%d,%d,%d,%.3f,%d,%.4f,%.3f,%.0f,%d,"
-                       "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d",
-                       static_cast<int>( index ), r.frame, r.position, r.presentMs, r.intervalMs, r.readyMs, r.uiLatencyMs, r.drawMs,
-                       r.renderMs, r.queueMs, r.grabMs, r.creditFrames, r.prevEndMs, r.ticks, r.busyTicks,
-                       r.predictiveTicks, r.maxTickGapMs, r.advances, r.advancedFrames, r.lastAdvanceMs,
-                       r.lastTickDiffMs, r.audioSyncs,
-                       r.reqMs, r.dqMs, r.dsMs, r.deMs, r.rsMs, r.reMs, r.rndMs, r.drawBeginMs,
-                       r.stagesOrdered() ? 1 : 0 );
-        return std::string( buf );
+        // Sized from the row itself (fable key3 r5 B2): a finite double can print 300+ characters with %.3f, so no fixed buffer
+        // is safe. This runs after the Play has stopped, so the second snprintf is off the timed path.
+        static const char *const kFormat =
+            "%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.3f,%d,%d,%d,%.3f,%d,%.4f,%.3f,%.0f,%d,"
+            "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d";
+        const auto print = [&]( char *destination, size_t capacity )
+        {
+            return std::snprintf( destination, capacity, kFormat,
+                                  static_cast<int>( index ), r.frame, r.position, r.presentMs, r.intervalMs, r.readyMs,
+                                  r.uiLatencyMs, r.drawMs, r.renderMs, r.queueMs, r.grabMs, r.creditFrames, r.prevEndMs,
+                                  r.ticks, r.busyTicks, r.predictiveTicks, r.maxTickGapMs, r.advances, r.advancedFrames,
+                                  r.lastAdvanceMs, r.lastTickDiffMs, r.audioSyncs, r.reqMs, r.dqMs, r.dsMs, r.deMs, r.rsMs,
+                                  r.reMs, r.rndMs, r.drawBeginMs, r.stagesOrdered() ? 1 : 0 );
+        };
+        const int needed = print( nullptr, 0 );
+        if( needed <= 0 ) return std::string();
+        std::string line( static_cast<size_t>( needed ), '\0' );
+        print( &line[0], line.size() + 1 );
+        return line;
     }
 
 private:
