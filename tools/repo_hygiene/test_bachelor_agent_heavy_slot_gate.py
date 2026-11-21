@@ -144,6 +144,14 @@ HOSTED_JOB_START_ENV = _JOB_START_ENV_MATCH.group(1)
 MIN_CLAMPED_BUDGET_SEC = 30  # a case with less than this left inside its job is refused rather than started
 
 
+@contextlib.contextmanager
+def _without_job_clock():
+    """No job start in the environment, so a test of the STATIC ceiling or of a generated budget never depends on how far into a hosted job it runs."""
+    with mock.patch.dict(os.environ):
+        os.environ.pop(HOSTED_JOB_START_ENV, None)
+        yield
+
+
 def _checked_budget_sec(budget: float, case: str, environ: dict[str, str] | None = None, wall_clock: object = time.time) -> float:
     """`budget` if a hosted job can wait for it, the part of it the job has left when it cannot, and a refusal (nothing launched) when that is too little.
 
@@ -321,11 +329,11 @@ def _signal_process(pid: int, sig: int) -> None:
 
 
 _SIGSTOP = getattr(signal, "SIGSTOP", 19)
-# adversary r5 A3: reading the process table is itself bounded, and the whole POSIX kill fits the allowance that taskkill leaves VACANT on POSIX
-# (taskkill cannot exist there, so TASKKILL_BOUND_SEC + TASKKILL_REAP_SEC of CLEANUP_BOUND_SEC are never spent): rounds x census bound.
-POSIX_CENSUS_BOUND_SEC = 10
-POSIX_KILL_ROUNDS = 5
-POSIX_TREE_KILL_BOUND_SEC = POSIX_KILL_ROUNDS * POSIX_CENSUS_BOUND_SEC
+# adversary r5 A3 (pass 3 A3): the whole freeze-and-kill, every read of the process table included, is bounded by POSIX_TREE_KILL_BOUND_SEC, which fits
+# the allowance that taskkill leaves VACANT on POSIX (taskkill cannot exist there, so TASKKILL_BOUND_SEC + TASKKILL_REAP_SEC of CLEANUP_BOUND_SEC
+# are never spent). POSIX_KILL_ROUNDS caps the freeze rounds (10 ms apart) inside it.
+POSIX_TREE_KILL_BOUND_SEC = 50
+POSIX_KILL_ROUNDS = 200
 
 
 def _parse_proc_stat(text: str) -> tuple[str, int, int, str]:
@@ -397,11 +405,16 @@ def _call_within(bound_sec: float, call: object) -> object:
 def _kill_posix_tree(proc: object) -> str:
     """POSIX only, for a REAL Popen that run_bounded started in its own session: the whole tree is killed. '' when it does not apply.
 
-    adversary r5 A1: the driver's group is FROZEN (SIGSTOP) first, so it can start nothing new while the tree is read, and the table is read
-    again each round until a round finds nothing new (a descendant that starts its own children is caught on the next round).
-    adversary r5 A2: a descendant is signalled only while its start time still matches the census (a reused pid is skipped), and it is
-    STOPPED before it is killed: a stopped process cannot exit, so neither its pid nor the group it leads can be reused before the kill.
-    The window between the start-time check and the stop remains, as the fifo script states for its own group kill (nothing here closes it).
+    FREEZE FIRST, THEN KILL (adversary r5 pass 3 A1, A2). Nothing is killed until the whole tree is stopped: the driver's group is stopped, then
+    every descendant the process table shows (setsid'ed ones included, found by parent links) is stopped after its start time is checked against
+    the census, and the table is read again until a round finds no new descendant AND every one reads as stopped (state T), which is when no
+    fork can still be in flight. While they are stopped none can exit, so no parent link breaks (a child forked just before its parent
+    observed the stop is still found, under the stopped parent) and no pid or group can be reused. Only then is each stopped descendant killed
+    BY PID (never by a group signal: a group kill ends a stopped leader, whose pid the kernel may recycle before an individual signal), and
+    finally the driver's group, which the driver's own unreaped pid keeps safe. The window between the start-time check and the stop remains,
+    as the fifo script states for its own group kill; nothing here closes it. The whole freeze-and-kill runs on a daemon thread under
+    POSIX_TREE_KILL_BOUND_SEC (adversary r5 pass 3 A3: EVERY read of the process table is inside it, the per-process identity reads included);
+    when it overruns, the driver's group is still killed and the verdict says the tree kill is not confirmed.
     A step that fails is reported, never allowed to replace the timeout verdict, and the remaining steps still run; only a SUCCESSFUL kill counts."""
     if not _IS_POSIX or not isinstance(proc, _REAL_POPEN):
         return ""
@@ -430,32 +443,36 @@ def _kill_posix_tree(proc: object) -> str:
         problems.append(f"reading the driver's group failed: {_exc_type_name(exc)}")
     if leads:
         send(_signal_group, pid, _SIGSTOP, "group")
-    done: set[int] = set()
-    unreadable = 0
-    exhausted = True
-    for _ in range(POSIX_KILL_ROUNDS):
-        try:
-            table, unreadable_now = _call_within(POSIX_CENSUS_BOUND_SEC, lambda: _read_process_table(_PROC_ROOT))  # type: ignore[misc]
-        except Exception as exc:  # noqa: BLE001
-            problems.append(f"the process table could not be read: {_exc_type_name(exc)}")
-            exhausted = False
-            break
-        unreadable = max(unreadable, unreadable_now)
-        members = [(child, table[child]) for child in _live_descendants(table, pid) if child not in done]
-        if not members:
-            exhausted = False
-            break
-        stopped = [(child, entry) for child, entry in members if _same_process(_PROC_ROOT, child, entry[3]) and send(_signal_process, child, _SIGSTOP, "process")]
-        for child, entry in stopped:
-            if entry[2] == child and send(_signal_group, child, _SIGKILL, "group"):  # a descendant that leads a group of its own: the whole group
-                killed["groups"] += 1
+
+    def freeze_then_kill() -> None:
+        frozen: dict[int, str] = {}  # descendant -> the start time it was stopped under
+        seen: set[int] = set()  # every descendant a census has shown (one whose start time no longer matches is never stopped, so never retried)
+        unreadable = 0
+        settled = False
+        for _ in range(POSIX_KILL_ROUNDS):
+            table, unreadable_now = _read_process_table(_PROC_ROOT)
+            unreadable = max(unreadable, unreadable_now)
+            new = [child for child in _live_descendants(table, pid) if child not in seen]
+            for child in new:
+                seen.add(child)
+                if _same_process(_PROC_ROOT, child, table[child][3]) and send(_signal_process, child, _SIGSTOP, "process"):
+                    frozen[child] = table[child][3]
+            if not new and all(table[child][0] in ("T", "t") for child in frozen if child in table):
+                settled = True  # a census with nothing new in which every descendant reads as stopped: no fork can still be in flight
+                break
+            time.sleep(0.01)  # a stop is delivered asynchronously
+        if not settled:
+            problems.append(f"descendants were still starting or not yet stopped after {POSIX_KILL_ROUNDS} rounds")
+        if unreadable:
+            problems.append(f"{unreadable} process table entr(ies) could not be read, so a descendant behind one is unconfirmed")
+        for child in frozen:
             if send(_signal_process, child, _SIGKILL, "process"):
                 killed["processes"] += 1
-            done.add(child)
-    if exhausted:
-        problems.append(f"descendants were still appearing after {POSIX_KILL_ROUNDS} rounds")
-    if unreadable:
-        problems.append(f"{unreadable} process table entr(ies) could not be read, so a descendant behind one is unconfirmed")
+
+    try:
+        _call_within(POSIX_TREE_KILL_BOUND_SEC, freeze_then_kill)
+    except Exception as exc:  # noqa: BLE001
+        problems.append(f"the tree kill did not finish: {_exc_type_name(exc)}")
     if leads and send(_signal_group, pid, _SIGKILL, "group"):
         killed["groups"] += 1
     note = f"POSIX tree kill: {killed['groups']} group(s) and {killed['processes']} descendant(s) killed"
@@ -612,9 +629,11 @@ def _pwsh_script_argv(script: str):
 
 
 PWSH_SCRIPT_BASE_SEC = 120  # a bare pwsh start, the compile of the capture type and the script's own end: what a script with NO worker call needs
-_CAPTURE_CALL = re.compile(r"(?i)\b(Read-CapturedResult|Read-CapturedText|Remove-CaptureFiles)\b")  # PowerShell command names are case-insensitive
-# the bound of an accept call on a call line: the seam variable (a pwsh script) or its value (a generated script, e.g. _plain_task_script)
-_ACCEPT_BOUND_ON_CALL_LINE = re.compile(r"(?i)\$AcceptMs\b|(?<![\w$.])" + str(CAPTURE_ACCEPT_BOUND_MS) + r"(?![\w.])")
+# PowerShell command names are case-insensitive. A call is the NAME in command position: not inside a quoted string or a file name ('Remove-CaptureFiles.txt'
+# is a path, adversary r5 pass 3 A6), so it may not follow a quote, `$`, `.`, `-` or a word character, nor continue into `.`, `-` or a word character.
+_CAPTURE_CALL = re.compile(r"(?i)(?<![\w.'\"$-])(Read-CapturedResult|Read-CapturedText|Remove-CaptureFiles)(?![\w.'\"-])")
+# the bound of an accept call on a call line: the seam variable (a pwsh script; `${AcceptMs}` is the same variable) or its value (a generated script)
+_ACCEPT_BOUND_ON_CALL_LINE = re.compile(r"(?i)\$\{?AcceptMs\b\}?|(?<![\w$.])" + str(CAPTURE_ACCEPT_BOUND_MS) + r"(?![\w.])")
 _LOOP_BLOCK_HEAD = re.compile(r"(?i)(?:\b(?:foreach|for|while)\s*\([^{}]*\)|\bdo|ForEach-Object)\s*$")
 
 
@@ -682,8 +701,11 @@ def _run_pwsh_script(script: str, repeat: int = 1) -> subprocess.CompletedProces
     """Run `script` in a bare pwsh under its derived budget; a hang kills the tree and fails by case name (run_bounded)."""
     # sol r4 B3 / adversary r5 A4: the hosted job would be cancelled before a budget it cannot wait for ran out, so a hung capture would end with
     # no case verdict and no teardown. Nothing is launched above the ceiling (split the case); a budget is clamped to what the job has left.
-    budget = _checked_budget_sec(pwsh_script_budget_sec(script, repeat), _case_name())
+    derived = pwsh_script_budget_sec(script, repeat)
     with _pwsh_script_argv(script) as argv:
+        # adversary r5 pass 3 A4: the job's clock is read AFTER the script file is written, as late as possible before the child starts, so the
+        # setup time is not handed to the child as budget it no longer has.
+        budget = _checked_budget_sec(derived, _case_name())
         code, out, err = run_bounded(argv, budget, _case_name())
     return subprocess.CompletedProcess(argv, code, out, err)
 
@@ -737,6 +759,11 @@ def _run_argv_bounded(argv: list[str], timeout: float, env: dict[str, str] | Non
     return subprocess.CompletedProcess(argv, code, out, err)
 
 
+# adversary r5 pass 3 A5: the budget derivation scans only what follows this marker (the helpers' own definitions, comments and dormant internal calls
+# are not calls the script makes). A generated region carries it, so a region with no call of its own costs the base allowance and nothing more.
+_END_OF_CAPTURE_REGION = "# END bounded capture io\n"
+
+
 def _raw_region_with_maximum(helper_max_ms: int, worker_start_ms: int = CAPTURE_ACCEPT_BOUND_MS) -> str:
     """The capture region with NO accept seam on the OPERATION, its helper maximum ($CaptureIoMaxMs) patched down to `helper_max_ms`: the scaled
     stand-in for a seam that only moved the deadline (r1: the bound was the helper's own maximum).
@@ -744,7 +771,7 @@ def _raw_region_with_maximum(helper_max_ms: int, worker_start_ms: int = CAPTURE_
     sol r4 B1: the worker-start wait ($CaptureWorkerStartMs) is extended to `worker_start_ms` (default: the accept bound, as _accept_region does),
     because it is no part of the subject here: a slow worker start must never fail the case before its operation is exercised. A caller passes a
     small value only to show that the seam is what keeps a start error out."""
-    return (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+    return (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n" + _END_OF_CAPTURE_REGION
             + f"$CaptureIoMaxMs = {helper_max_ms}\n$CaptureWorkerStartMs = {worker_start_ms}\n")
 
 
@@ -753,7 +780,7 @@ def _accept_region(helper_max_ms: int | None = None) -> str:
     `$CaptureWorkerStartMs` become CAPTURE_ACCEPT_BOUND_MS, so no deadline of the HELPER can end a success asserted by an accept arm (the outer
     run_bounded whole-script budget remains). `helper_max_ms` first patches the helper maximum down, as _raw_region_with_maximum does, to
     prove the seam overrides it (r3 G2)."""
-    region = _fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+    region = _fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n" + _END_OF_CAPTURE_REGION
     if helper_max_ms is not None:
         region += f"$CaptureIoMaxMs = {helper_max_ms}\n"
     return region + f"$CaptureIoMaxMs = {CAPTURE_ACCEPT_BOUND_MS}; $CaptureWorkerStartMs = {CAPTURE_ACCEPT_BOUND_MS}; $AcceptMs = {CAPTURE_ACCEPT_BOUND_MS}\n"
@@ -1132,13 +1159,17 @@ class BoundedRunTests(unittest.TestCase):
         kill, stop = module._SIGKILL, module._SIGSTOP
         self.assertTrue(kwargs.get("start_new_session"), "the driver must lead its own session so its group is its own")
         self.assertEqual(signalled[0], ("group", proc.pid, stop), "the driver's group is frozen before the process table is read (adversary r5 A1)")
-        self.assertIn(("group", proc.pid, kill), signalled, "the driver's process group was not killed")
-        self.assertIn(("group", worker, kill), signalled, "the group of a descendant that leads its own session was not killed")
-        self.assertIn(("process", worker, kill), signalled)
+        self.assertEqual(signalled[-1], ("group", proc.pid, kill), "the driver's process group is killed LAST, after every descendant")
+        self.assertIn(("process", worker, kill), signalled, "a descendant that leads its own session (setsid) was not killed")
         self.assertIn(("process", grandchild, kill), signalled)
+        self.assertEqual([entry for entry in signalled if entry[0] == "group" and entry[2] == kill], [("group", proc.pid, kill)],
+                         "no descendant's group is killed: a group kill would end a stopped leader whose pid could be reused (adversary r5 pass 3 A2)")
+        last_stop = max(index for index, entry in enumerate(signalled) if entry[2] == stop)
+        first_kill = min(index for index, entry in enumerate(signalled) if entry[2] == kill)
+        self.assertLess(last_stop, first_kill, "everything is stopped before anything is killed")
         self.assertTrue(all(entry[1] != unrelated for entry in signalled), "a process that is not below the driver must never be signalled")
         self.assertIn("taskkill failed: FileNotFoundError", str(caught.exception))
-        self.assertIn("POSIX tree kill: 2 group(s) and 2 descendant(s) killed", str(caught.exception))
+        self.assertIn("POSIX tree kill: 1 group(s) and 2 descendant(s) killed", str(caught.exception))
         self.assertIsNotNone(proc.poll(), "the driver itself must be ended and reaped")
 
     @contextlib.contextmanager
@@ -1147,9 +1178,25 @@ class BoundedRunTests(unittest.TestCase):
         `on_signal(kind, id, sig)` may change that table the way a live system changes it between two steps."""
         module = sys.modules[__name__]
 
+        def settle(kind: str, target: int, sig: int) -> None:
+            """What a live kernel does to the fake table: a stopped process reads as state T; a killed one is gone."""
+            for name in os.listdir(proc_root):
+                stat_path = Path(proc_root, name, "stat")
+                try:
+                    _, _, pgrp, _ = _parse_proc_stat(stat_path.read_text(encoding="ascii"))
+                except (OSError, ValueError, IndexError):
+                    continue
+                if (int(name) if kind == "process" else pgrp) != target:
+                    continue
+                if sig == module._SIGKILL:
+                    shutil.rmtree(Path(proc_root, name), ignore_errors=True)
+                elif sig == module._SIGSTOP:
+                    stat_path.write_text(stat_path.read_text(encoding="ascii").replace(") S ", ") T ", 1), encoding="ascii")
+
         def record(kind: str):
             def send(target: int, sig: int) -> None:
                 signalled.append((kind, target, sig))
+                settle(kind, target, sig)
                 if on_signal is not None:
                     on_signal(kind, target, sig)
             return send
@@ -1204,6 +1251,11 @@ class BoundedRunTests(unittest.TestCase):
         self.assertEqual(signalled[0][2], sys.modules[__name__]._SIGSTOP, signalled)
         self.assertIn(("process", worker, kill), signalled, note)
         self.assertIn(("process", grandchild, kill), signalled, "a descendant found only on a later round must be killed too\n" + note)
+        # adversary r5 pass 3 A1: nothing is killed before the whole tree is stopped, so a parent can never die (and orphan the child it forked
+        # a moment before it observed its stop) between two census rounds
+        stops = [index for index, entry in enumerate(signalled) if entry[0] == "process" and entry[2] == sys.modules[__name__]._SIGSTOP]
+        kills = [index for index, entry in enumerate(signalled) if entry[0] == "process" and entry[2] == kill]
+        self.assertLess(max(stops), min(kills), signalled)
 
     def test_r5_a2_a_pid_reused_by_an_unrelated_process_after_the_census_is_never_signalled(self) -> None:
         # adversary r5 A2: the worker exited and an UNRELATED session leader took its pid between the census and the signal. The recorded start
@@ -1237,31 +1289,35 @@ class BoundedRunTests(unittest.TestCase):
             self._write_fake_proc(proc_root, {child.pid: (1, child.pid), worker: (child.pid, worker)})
 
             def gone(kind: str, target: int, sig: int) -> None:
-                if target == worker:
+                if target == worker and sig == sys.modules[__name__]._SIGKILL:
                     raise ProcessLookupError(3, "no such process")
 
             note = self._kill_note(proc_root, [], gone, child=child)
             self.assertIn("0 descendant(s) killed", note)
 
-    def test_r5_a3_a_stalled_process_table_read_is_abandoned_inside_its_bound_and_named(self) -> None:
+    def test_r5_a3_a_stalled_read_of_the_process_table_or_of_one_process_is_abandoned_inside_the_bound_and_named(self) -> None:
+        # adversary r5 pass 3 A3: the bound covers EVERY read of the process table: the census and the per-process identity read before a stop.
         module = sys.modules[__name__]
         release = threading.Event()
-        with tempfile.TemporaryDirectory(prefix="heavy-slot-gate-a3c-proc-") as proc_root:
-            child = self._sleeping_child()
-            self._write_fake_proc(proc_root, {child.pid: (1, child.pid)})
-            started = time.monotonic()
-            try:
-                with mock.patch.object(module, "POSIX_CENSUS_BOUND_SEC", 0.2):
-                    note = self._kill_note(proc_root, [], table=lambda *args: release.wait(60), child=child)
-            finally:
-                release.set()
-        self.assertLess(time.monotonic() - started, 20, "a stalled table read held the verdict back")
-        self.assertIn("could not be read: TimeoutError", note)
+        worker = 900041
+        for label, patched in (("census", "_read_process_table"), ("identity", "_same_process")):
+            with self.subTest(label), tempfile.TemporaryDirectory(prefix="heavy-slot-gate-a3c-proc-") as proc_root:
+                child = self._sleeping_child()
+                self._write_fake_proc(proc_root, {child.pid: (1, child.pid), worker: (child.pid, worker)})
+                started = time.monotonic()
+                try:
+                    with mock.patch.object(module, "POSIX_TREE_KILL_BOUND_SEC", 0.3), \
+                            mock.patch.object(module, patched, side_effect=lambda *args: release.wait(60)):
+                        note = self._kill_note(proc_root, [], child=child)
+                finally:
+                    release.set()
+                self.assertLess(time.monotonic() - started, 20, "a stalled read held the verdict back")
+                self.assertIn("the tree kill did not finish: TimeoutError", note)
+            release.clear()
 
     def test_r5_a3_the_whole_posix_kill_fits_inside_the_allowance_taskkill_leaves_vacant_on_posix(self) -> None:
         # taskkill cannot exist on POSIX, so its allowance inside CLEANUP_BOUND_SEC is never spent there: the POSIX kill is bounded by it.
         self.assertLessEqual(POSIX_TREE_KILL_BOUND_SEC, TASKKILL_BOUND_SEC + TASKKILL_REAP_SEC)
-        self.assertEqual(POSIX_TREE_KILL_BOUND_SEC, POSIX_KILL_ROUNDS * POSIX_CENSUS_BOUND_SEC)
 
     def test_r5_a4_a_budget_is_clamped_to_what_the_hosted_job_has_left(self) -> None:
         # adversary r5 A4: a four-call case (620 s) that starts at second 1240 of an 1800 s job has 560 s left, not the static 1215 s.
@@ -1287,10 +1343,47 @@ class BoundedRunTests(unittest.TestCase):
         self.assertEqual(pwsh_script_budget_sec(ten), PWSH_SCRIPT_BASE_SEC + 10 * CAPTURE_ACCEPT_CALL_CEILING_MS / 1000)
         continued = region + "$r = Read-CapturedResult $p `\n    $AcceptMs $f\n"
         self.assertEqual(pwsh_script_budget_sec(continued), PWSH_SCRIPT_BASE_SEC + CAPTURE_ACCEPT_CALL_CEILING_MS / 1000)
-        with mock.patch.object(sys.modules[__name__], "run_bounded", return_value=(0, "", "")) as bounded:
+        with _without_job_clock(), mock.patch.object(sys.modules[__name__], "run_bounded", return_value=(0, "", "")) as bounded:
             with self.assertRaises(AssertionError):
                 _run_pwsh_script(ten)  # 1370 s: more than a hosted job can wait for, and now it is counted
             bounded.assert_not_called()
+        # adversary r5 pass 3 A6: a file NAME that holds a helper's name is no call, and `${AcceptMs}` is the same variable as `$AcceptMs`
+        named = region + "$f = { param($p) }\n" + "Read-CapturedResult 'Remove-CaptureFiles.txt' 50 $f\n" * 8
+        self.assertEqual(pwsh_script_budget_sec(named), PWSH_SCRIPT_BASE_SEC + 8 * capture_call_ceiling_ms(50) / 1000)
+        self.assertEqual(pwsh_script_budget_sec(region + "$r = Read-CapturedResult $p ${AcceptMs} $f\n"), PWSH_SCRIPT_BASE_SEC + CAPTURE_ACCEPT_CALL_CEILING_MS / 1000)
+
+    def test_r5_a5_a_generated_region_is_charged_only_for_the_calls_the_script_makes(self) -> None:
+        # adversary r5 pass 3 A5: a generated region had no END marker, so the budget scan read the helpers' own text: a dormant internal wrapper call
+        # and a comment cost 190 s, and eight real accept calls (1120 s) were charged 1310 s and refused by the hosted ceiling.
+        module = sys.modules[__name__]
+        self.assertEqual(pwsh_script_budget_sec(_accept_region()), PWSH_SCRIPT_BASE_SEC)
+        self.assertEqual(pwsh_script_budget_sec(_raw_region_with_maximum(300)), PWSH_SCRIPT_BASE_SEC)
+        eight = _accept_region() + "$p = 'x'\n$f = { param($p) [Threading.Tasks.Task]::CompletedTask }\n" + "Read-CapturedResult $p $AcceptMs $f\n" * 8
+        self.assertEqual(pwsh_script_budget_sec(eight), PWSH_SCRIPT_BASE_SEC + 8 * CAPTURE_ACCEPT_CALL_CEILING_MS / 1000)
+        with _without_job_clock(), mock.patch.object(module, "run_bounded", return_value=(0, "", "")) as bounded:
+            _run_pwsh_script(eight)  # 1120 s: inside the hosted ceiling, so it launches
+        bounded.assert_called_once()
+
+    def test_r5_a4_the_job_clock_is_read_after_the_script_file_is_written(self) -> None:
+        # adversary r5 pass 3 A4: a clamp computed before the script was written handed the child setup time it no longer had.
+        module = sys.modules[__name__]
+        events: list[str] = []
+        real_argv = module._pwsh_script_argv
+
+        @contextlib.contextmanager
+        def tracking(script: str):
+            with real_argv(script) as argv:
+                events.append("script written")
+                yield argv
+
+        def clock(budget: float, case: str, *args: object) -> float:
+            events.append("clock read")
+            return budget
+
+        with mock.patch.object(module, "_pwsh_script_argv", tracking), mock.patch.object(module, "_checked_budget_sec", side_effect=clock), \
+                mock.patch.object(module, "run_bounded", return_value=(0, "", "")):
+            _run_pwsh_script("Write-Output 'no worker call'")
+        self.assertEqual(events, ["script written", "clock read"])
 
     @unittest.skipUnless(os.name == "posix", "a session of its own and killpg exist only on POSIX; hosted Ubuntu runs this")
     def test_r5_b2_a_real_session_escaping_child_of_a_timed_out_driver_does_not_survive_on_posix(self) -> None:
