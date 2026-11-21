@@ -1156,7 +1156,7 @@ $r3 = Update-VenueTicket -Ticket $A
 $p3 = (Get-Content -LiteralPath $A.path -Raw | ConvertFrom-Json).phase
 $bad = 'none'; try { [void](Update-VenueTicket -Ticket $A -Phase 'bogus') } catch { $bad = 'refused' }
 $p4 = (Get-Content -LiteralPath $A.path -Raw | ConvertFrom-Json).phase
-$left = @(Get-ChildItem -LiteralPath (Split-Path -Parent $A.path) | Where-Object { $_.Name -notlike '*.ticket.json' }).Count
+$left = @(Get-ChildItem -LiteralPath (Split-Path -Parent $A.path) -Force | Where-Object { $_.Name -notlike '*.ticket.json' -and $_.Name -ne '.ticket.lock' }).Count   # .ticket.lock is the ticket folder's lock file, left in place by design (never listed)
 [pscustomobject]@{ r1 = $r1; p1 = $p1; r2 = $r2; p2 = $p2; r3 = $r3; p3 = $p3; bad = $bad; p4 = $p4; left = $left } | ConvertTo-Json -Compress
 """
 
@@ -1378,7 +1378,7 @@ $beat = Receive-Job $job -Wait -AutoRemoveJob
         # r7 adversary A2: the heartbeat read the nonce and closed its handle; its rename-over then RE-CREATED a ticket a reaper or its owner had removed in between (File.Move with overwrite
         # publishes to an absent name), so a reaped or ended ticket came back. The heartbeat now holds its read handle (share Read + Delete) across the check and the rename: a remove cannot open the file.
         mark = self.case / "seam-a2-mark.txt"
-        anchor = "try { Write-VenueTicketAtomic -Path $Ticket.path -Bytes (ConvertTo-VenueTicketBytes $fields) }"
+        anchor = "try { Write-VenueTicketAtomic -Path $Ticket.path "   # a prefix: the call's later arguments (the budget) may change
         mod = self.seam_module(anchor, "[IO.File]::WriteAllText($env:SEAM_MARK, '1'); Start-Sleep -Milliseconds 2500; " + anchor)
         r = self.ps(self.SEAM_A2.replace("@@SEAMMOD@@", str(mod)).replace("@@MARK@@", str(mark)))
         self.assertNotEqual(r["removed"], "REMOVED", f"the ticket was removed while its heartbeat sat between the nonce check and the rename, and the heartbeat then brought it back: {r}")
@@ -1614,7 +1614,7 @@ Wait-Job $job | Out-Null; Receive-Job $job | Out-Null; Remove-Job $job
         # r7 pass 1 A4 (blocker): the mutex was keyed on the spelling of the directory, so a heartbeat given a relative ClaimDir and a reaper that spells it absolutely (FileInfo.FullName) did not exclude each other.
         mark = self.case / "lock-mark.txt"
         absolute = self.claims / "bachelor.tickets" / "x.ticket.json"
-        (self.case / "claims").mkdir(exist_ok=True)
+        (self.claims / "bachelor.tickets").mkdir(parents=True, exist_ok=True)   # the lock file lives in the ticket folder, which exists once a ticket does
         script = self.LOCK_JOB.replace("@@CASE@@", str(self.case)).replace("@@MOD@@", str(MODULE)).replace("@@ABS@@", str(absolute)).replace("@@MARK@@", str(mark))
         r = self.ps(script)
         self.assertTrue(r["held"], "the first spelling did not get the lock")
@@ -1639,7 +1639,7 @@ $A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -Purpose 'P batch 1' -Claim
 Start-Sleep -Milliseconds 30
 $B = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
 $r = Request-VenueClaim -Venue bachelor -RunDir 'run-A' -Purpose 'P batch 1' -ClaimDir $d -UseTicket
-$files = @(Get-ChildItem -LiteralPath (Split-Path -Parent $A.path) -File | ForEach-Object { $_.Name }).Count
+$files = @(Get-ChildItem -LiteralPath (Split-Path -Parent $A.path) -Filter '*.ticket.json' -File | ForEach-Object { $_.Name }).Count
 $phase = (Get-Content -LiteralPath $A.path -Raw | ConvertFrom-Json).phase
 [pscustomobject]@{ adopted = ($r.ticket.name -ceq $A.name); state = [string]$r.state; files = $files; phase = $phase } | ConvertTo-Json -Compress
 """
@@ -1660,7 +1660,7 @@ $hold = [IO.File]::Open($ticketFile, [IO.FileMode]::Open, [IO.FileAccess]::Read,
 Start-Sleep -Milliseconds 700
 $hold.Dispose()
 $name = Receive-Job $job -Wait -AutoRemoveJob
-$files = @(Get-ChildItem -LiteralPath (Join-Path $d 'bachelor.tickets') -File | ForEach-Object { $_.Name })
+$files = @(Get-ChildItem -LiteralPath (Join-Path $d 'bachelor.tickets') -Filter '*.ticket.json' -File | ForEach-Object { $_.Name })
 [pscustomobject]@{ files = $files.Count; returned = [string]$name; returnedExists = ($files -contains [string]$name) } | ConvertTo-Json -Compress
 """
 
@@ -1678,6 +1678,7 @@ $files = @(Get-ChildItem -LiteralPath (Join-Path $d 'bachelor.tickets') -File | 
 $A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d -NowUtc '1900-01-01T00:00:00Z'
 $dir = Split-Path -Parent $A.path
 [IO.File]::WriteAllText((Join-Path $dir '9999999999999999999-p1-1.ticket.json'), '')
+[IO.File]::WriteAllText((Join-Path $dir '0000000000000000001-p79228162514264337593543950336-1.ticket.json'), '')
 $threw = ''; $rows = 0
 try { $rows = @(Get-VenueTickets -Venue bachelor -ClaimDir $d).Count } catch { $threw = $_.Exception.Message -replace '\\s+', ' ' }
 $B = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
@@ -1716,7 +1717,8 @@ Wait-Job $job | Out-Null; Remove-Job $job -Force
         self.assertEqual(wait.count("($deadline - [DateTime]::UtcNow).TotalSeconds -gt 6.0") + wait.count("($deadline - [DateTime]::UtcNow).TotalSeconds -le 6.0"), 3, "a ticket call in the wait is not guarded by the room before the deadline")
         close = run[run.index("function Close-BatchTicket"):run.index("function Invoke-BatchTicketCall")]
         self.assertIn("-cnotin @('REMOVED', 'ABSENT', 'CHANGED')", close, "the reference is dropped whatever the end's answer was")
-        self.assertIn("Close-BatchTicket 'leftover'", run, "a ticket that could not be ended is never tried again")
+        self.assertIn("$script:strandedTickets.Add($t)", close, "a ticket whose end was not confirmed is dropped with the batch's reference")
+        self.assertEqual(run.count("Invoke-StrandedTicketRetry '"), 3, "a stranded ticket is not tried again at the top of the batch loop, in the cooldown wait and in the claim poll")
 
     def test_a_ticket_phase_log_line_that_cannot_be_written_never_stops_the_chain(self) -> None:
         # r7 pass 1 A15: the new TICKET_PHASE_* and note log lines went through L, which throws when the chain log cannot be appended to (the pre-claim probe then never ran).
@@ -1724,6 +1726,50 @@ Wait-Job $job | Out-Null; Remove-Job $job -Force
         for line in chain.splitlines():
             if 'L "TICKET_PHASE_$pf' in line or 'L "$($req.note)' in line:
                 self.assertIn("try { L ", line, f"an unguarded log line: {line.strip()[:120]}")
+
+    # ---- r7, second fix iteration: the adversary pass on 04d1455e (A1 A2 A3 A5 A7; A4 is DISTINGUISHED in the PR body) ----
+
+    JUNCTION_LOCK = """
+$real = Join-Path $d 'bachelor.tickets'
+New-Item -ItemType Junction -Path '@@ALIAS@@' -Target $real | Out-Null
+$job = Start-Job -ArgumentList '@@MOD@@', '@@VIAALIAS@@', '@@MARK@@' -ScriptBlock { param($m, $p, $mark) Import-Module $m -Force -DisableNameChecking; $got = & (Get-Module VenueChain) { param($p) $l = Enter-VenueTicketLock -TicketPath $p -TimeoutMs 400; $ok = ($null -ne $l); Exit-VenueTicketLock $l; $ok } $p; [IO.File]::WriteAllText($mark, [string]$got) }
+$held = & (Get-Module VenueChain) { param($p) Enter-VenueTicketLock -TicketPath $p -TimeoutMs 500 } (Join-Path $real 'x.ticket.json')
+Wait-Job $job | Out-Null; Receive-Job $job | Out-Null; Remove-Job $job
+& (Get-Module VenueChain) { param($l) Exit-VenueTicketLock $l } $held
+[pscustomobject]@{ held = ($null -ne $held); otherGotIt = ([IO.File]::ReadAllText('@@MARK@@') -eq 'True') } | ConvertTo-Json -Compress
+"""
+
+    def test_the_ticket_lock_is_the_same_through_a_junction_to_the_ticket_folder(self) -> None:
+        # r7 pass 2 A3: the lock was keyed on the directory's spelling, so a ClaimDir that reaches the same folder through a junction did not exclude a heartbeat that used the real path. The lock is now a file
+        # opened exclusively in the folder itself: the file system decides what is the same folder.
+        (self.claims / "bachelor.tickets").mkdir(parents=True, exist_ok=True)
+        alias = self.case / "alias"
+        mark = self.case / "junction-mark.txt"
+        script = self.JUNCTION_LOCK.replace("@@ALIAS@@", str(alias)).replace("@@VIAALIAS@@", str(alias / "x.ticket.json")).replace("@@MOD@@", str(MODULE)).replace("@@MARK@@", str(mark))
+        r = self.ps(script)
+        self.assertTrue(r["held"], "the real path did not get the lock")
+        self.assertFalse(r["otherGotIt"], "the junction spelling of the same folder got the lock too")
+
+    SEAM_A2C = """
+$B = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$job = Start-Job -ArgumentList $B, $d, '@@SEAMMOD@@' -ScriptBlock { param($B, $d, $m) Import-Module $m -Force -DisableNameChecking; Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $B }
+$cp = Join-Path $d 'bachelor.claim.json'
+$t0 = [DateTime]::UtcNow
+while (-not (Test-Path -LiteralPath $cp) -and ([DateTime]::UtcNow - $t0).TotalSeconds -lt 60) { Start-Sleep -Milliseconds 5 }
+$first = (Get-Content -LiteralPath $cp -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue).nonce
+Remove-Item -LiteralPath $cp -Force
+$other = Request-VenueClaim -Venue bachelor -RunDir 'run-X' -Purpose replacement -ClaimDir $d
+$r = Receive-Job $job -Wait -AutoRemoveJob
+[pscustomobject]@{ state = [string]$r.state; granted = [bool]$r.granted; otherGranted = [bool]$other.granted; holder = [string]$r.claim.runDir } | ConvertTo-Json -Compress
+"""
+
+    def test_a_grant_older_than_two_seconds_is_checked_to_still_name_this_owner_before_it_is_handed_over(self) -> None:
+        # r7 pass 2 A2: the post-grant census can take long on a slow claim folder, a short claim can expire and be replaced meanwhile, and the first request still returned granted=true with its obsolete nonce.
+        # The census is slowed by a seam (2.5 s inside the post-grant block) while the claim is replaced by another owner's.
+        mod = self.seam_module("            $after = @(Get-VenueSettledLive -Venue $Venue -ClaimDir $ClaimDir -NowUtc $now -MyName $t.name)", "            Start-Sleep -Milliseconds 2500\n            $after = @(Get-VenueSettledLive -Venue $Venue -ClaimDir $ClaimDir -NowUtc $now -MyName $t.name)")
+        r = self.ps(self.SEAM_A2C.replace("@@SEAMMOD@@", str(mod)))
+        self.assertTrue(r["otherGranted"], "the scenario did not replace the claim")
+        self.assertEqual((r["state"], r["granted"]), ("QUEUED", False), f"a grant whose claim another owner replaced meanwhile was handed over: {r}")
 
     def test_the_cooldown_wait_is_anchored_before_the_ticket_work_and_every_ticket_call_is_bounded(self) -> None:
         # adversary pass 2 A1 + A4: the wait end was measured after the ticket was created (so slow ticket I/O pushed the claim request past -DeadlineUtc), and creation and the heartbeat
