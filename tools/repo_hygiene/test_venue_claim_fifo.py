@@ -1013,7 +1013,7 @@ class VenueLeaseBatchFifoTests(unittest.TestCase):
             raise AssertionError(f"scenario failed ({r.returncode}):\n{r.stdout}\n{r.stderr}")
         return json.loads([l for l in r.stdout.splitlines() if l.strip()][-1])
 
-    def start_batch(self, name: str, claim_poll: int, specs: str = "", extra: tuple = (), cooldown: str = "0", runner: Path | None = None, **env: str) -> subprocess.Popen:
+    def start_batch(self, name: str, claim_poll: int, specs: str = "", extra: tuple = (), cooldown: str = "0", runner: Path | None = None, deadline_sec: float = 200.0, deadline_utc: datetime | None = None, **env: str) -> subprocess.Popen:
         run_dir, share = self.case / f"run-{name}", self.case / f"share-{name}"
         share.mkdir()
         (share / "cancel").mkdir()
@@ -1025,7 +1025,7 @@ class VenueLeaseBatchFifoTests(unittest.TestCase):
         args = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(runner or LEASE_RUNNER), "-LegSpec", specs or str(self.spec), "-RunDir", str(run_dir), "-SourceCommit", "a" * 40,
                 "-BuildManifestSha256", "b" * 64, "-ClaimDir", str(self.claims), "-QuietScript", str(self.tmp / "fake-quiet.ps1"), "-LegScript", str(self.tmp / "fake-leg.ps1"),
                 "-UmRunScript", str(self.tmp / "fake-umrun.ps1"), "-AgentShare", str(share), "-LegBudgetSec", "60", "-LeaseMarginSec", "0", "-ClaimPollSec", str(claim_poll),
-                "-RecheckSec", "1", "-LeaseCooldownSec", cooldown, "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=200)), *extra]
+                "-RecheckSec", "1", "-LeaseCooldownSec", cooldown, "-DeadlineUtc", utc_iso(deadline_utc or datetime.now(timezone.utc) + timedelta(seconds=deadline_sec)), *extra]
         out_path = self.case / f"stdout-{name}.txt"
         with open(out_path, "w", encoding="utf-8") as out_file:
             p = subprocess.Popen(args, stdout=out_file, stderr=subprocess.STDOUT, text=True, env=e)
@@ -1986,17 +1986,92 @@ Wait-Job $job | Out-Null; Remove-Job $job -Force
 
     # ---- r9: the adversary pass on de591425 (the fix iteration: A4, A5, A7) ----
 
-    def test_r9_a7_a_late_grant_whose_release_was_refused_is_not_logged_as_let_go(self) -> None:
-        # r9 A7: the late-grant branch discarded the release's answer and always logged "let go": a reader of the claim file refuses the release (BUSY) and the claim still named the batch. A source-level test
-        # (the branch needs a grant after -DeadlineUtc plus a reader holding the claim file; the answer's handling is what changed): the answer is kept, retried inline, and "let go" is logged only for a release.
-        run = LEASE_RUNNER.read_text(encoding="utf-8")
-        at = run.index("$lateGrant = ")
-        block = run[at:at + 2600]
-        self.assertIn("$lateAnswer = [string]$(", block, "the late grant's release answer is discarded")
-        self.assertIn("-le 5; $lateTry++", block, "the inline release of a late grant is not retried")
-        self.assertIn("if ($lateAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { LogBest \"CLAIM_LATE_GRANT batch=$batchNo", block, "'let go' must be conditional on a release answer")
-        self.assertIn("CLAIM_LATE_GRANT_NOT_RELEASED", block, "a refused release must be logged as not released")
-        self.assertNotIn("[void]$(if ($grantedOnRetry)", block, "the release answer is still thrown away with [void]")
+    # ---- r10 (Grok CoS G13, G14 on 2d3fda1d): the late grant, run for real ----
+
+    LATE_GRANT_HOLDER = """
+$ErrorActionPreference = 'Stop'
+$cp = '@@CP@@'; $log = '@@LOG@@'
+$t0 = [DateTime]::UtcNow; $hold = $null
+while ($null -eq $hold -and ([DateTime]::UtcNow - $t0).TotalSeconds -lt 120) { try { $hold = [IO.File]::Open($cp, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read) } catch { Start-Sleep -Milliseconds 2 } }
+if ($null -eq $hold) { [pscustomobject]@{ held = $false } | ConvertTo-Json -Compress; exit 0 }
+$heldUtc = [DateTime]::UtcNow
+$nonce = ''; try { $nonce = [string](Get-Content -LiteralPath $cp -Raw | ConvertFrom-Json).nonce } catch { }
+$seenUtc = $null
+while ($null -eq $seenUtc -and ([DateTime]::UtcNow - $t0).TotalSeconds -lt 120) {
+  $txt = ''; try { $fs = [IO.File]::Open($log, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite); $sr = [IO.StreamReader]::new($fs); $txt = $sr.ReadToEnd(); $sr.Dispose() } catch { }
+  if ($txt -match 'CLAIM_LATE_GRANT') { $seenUtc = [DateTime]::UtcNow } else { Start-Sleep -Milliseconds 20 }
+}
+$stillNamed = $false; try { $stillNamed = ([string](Get-Content -LiteralPath $cp -Raw | ConvertFrom-Json).nonce -ceq $nonce) } catch { }
+$hold.Dispose()
+Import-Module '@@MOD@@' -Force -DisableNameChecking
+$rel = [string](Release-VenueClaim -Venue bachelor -Nonce $nonce -ClaimDir '@@D@@')
+$logLines = @(Get-Content -LiteralPath $log | Where-Object { $_ -match 'CLAIM_LATE_GRANT' })
+[pscustomobject]@{ held = $true; heldUtc = $heldUtc.ToString('o'); seenUtc = $(if ($seenUtc) { $seenUtc.ToString('o') } else { '' }); nonce = $nonce; stillNamed = $stillNamed; release = $rel; lines = $logLines } | ConvertTo-Json -Compress
+"""
+
+    def late_grant_scenario(self, hold: bool, deadline_sec: float = 20.0) -> dict:
+        # A real lease batch whose claim is GRANTED AFTER -DeadlineUtc: a copy of VenueChain.psm1 keeps the granted claim standing until 0.2 s past the deadline (the seam, nothing else changed), so the
+        # batch takes the late-grant branch. With hold=True a reader (FileShare.Read, no Delete) holds the claim file from the grant until the batch has logged what it did, so every release is refused (BUSY).
+        import shutil
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=deadline_sec)).replace(microsecond=0)
+        until = deadline + timedelta(milliseconds=200)
+        text = MODULE.read_text(encoding="utf-8")
+        anchor = "    $r = Invoke-VenueClaimAttempt @attemptArgs\n"
+        self.assertEqual(text.count(anchor), 1, "late-grant seam anchor moved")
+        seam = anchor + "    if ($r.granted -and $env:SEAM_UNTIL_UTC) { $u = [DateTime]::Parse($env:SEAM_UNTIL_UTC, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind); while ([DateTime]::UtcNow -lt $u) { Start-Sleep -Milliseconds 20 } }\n"
+        runner = copy_with_siblings(LEASE_RUNNER, Path(tempfile.mkdtemp(prefix="late-", dir=self.case)))
+        (runner.parent / MODULE.name).write_text(text.replace(anchor, seam), encoding="utf-8")
+        (runner.parent.parent / "bachelor").mkdir(exist_ok=True)   # the runner reads the agent's own script at ..\\bachelor\\ultra-magnus-agent.ps1 for the liveness read-back
+        shutil.copy2(DV.parent / "bachelor" / "ultra-magnus-agent.ps1", runner.parent.parent / "bachelor" / "ultra-magnus-agent.ps1")
+        p = self.start_batch("L", claim_poll=1, runner=runner, deadline_utc=deadline, SEAM_UNTIL_UTC=until.strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
+        holder = None
+        if hold:
+            script = (self.LATE_GRANT_HOLDER.replace("@@CP@@", str(self.claim_path)).replace("@@LOG@@", str(Path(p.run_dir) / "batch.log"))   # type: ignore[attr-defined]
+                      .replace("@@MOD@@", str(MODULE)).replace("@@D@@", str(self.claims)))
+            f = self.case / "late-grant-holder.ps1"
+            f.write_text(script, encoding="utf-8")
+            holder = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(f)], capture_output=True, text=True, timeout=150)
+            self.assertEqual(holder.returncode, 0, f"the claim-file holder failed:\n{holder.stdout}\n{holder.stderr}")
+        p.wait(timeout=150)
+        out = Path(p.out_path).read_text(encoding="utf-8", errors="replace")   # type: ignore[attr-defined]
+        r = {"log": self.batch_log(p), "out": out, "deadline": deadline, "claimLeft": self.claim_path.exists()}
+        if holder is not None:
+            r["holder"] = json.loads([l for l in holder.stdout.splitlines() if l.strip()][-1])
+            self.assertTrue(r["holder"]["held"], f"the claim file was never granted (no late grant to test):\n{r['log']}\n{out}")
+        self.assertIn("CLAIM_LATE_GRANT", r["log"], f"the batch never reached its late-grant branch (the seam or the deadline is wrong):\n{r['log']}\n{out}")
+        return r
+
+    def test_r10_g14_a_late_grant_whose_release_is_refused_is_logged_not_released_and_the_claim_stays_until_it_is_freed(self) -> None:
+        # r9 A7 / Grok CoS G14 (replaces r9's source-text test, which would pass with wrong logic and fail on a reformat): a REAL batch is granted the claim after -DeadlineUtc while a reader holds the
+        # claim file for the whole window. Behaviour asserted: the batch logs CLAIM_LATE_GRANT_NOT_RELEASED (never "let go"), the claim still names the batch while the file is held, and the
+        # release succeeds once it is freed (so the claim was never lost track of: its nonce was the grant's).
+        r = self.late_grant_scenario(hold=True)
+        h = r["holder"]
+        self.assertTrue(any("CLAIM_LATE_GRANT_NOT_RELEASED" in l for l in h["lines"]), f"a release the reader refused was not logged as not released: {h['lines']}\n{r['log']}")
+        self.assertFalse(any("CLAIM_LATE_GRANT batch=" in l for l in h["lines"]), f"a claim that was NOT let go was logged as let go (the 'CLAIM_LATE_GRANT batch=' line): {h['lines']}")
+        self.assertTrue(h["stillNamed"], f"the claim did not still name the batch while the file was held: {h}")
+        self.assertEqual(h["release"], "RELEASED", f"the claim could not be released once the file was freed: {h}")
+        self.assertFalse(self.claim_path.exists(), "a claim was left behind after the release")
+
+    def test_r10_g13_the_inline_release_retry_of_a_late_grant_stops_within_the_reserve(self) -> None:
+        # Grok CoS G13 (r9 A7's retry): five outer tries of Release-VenueClaim (each 5 opens, 50-250 ms apart, about 0.75 s when BUSY) with a 100-500 ms sleep after each, the fifth too, ran up to about
+        # 5.25 s past -DeadlineUtc. The bound is the reserve Invoke-ClaimRetryRelease uses ($script:ClaimRetryRequestReserveSec 1 s less $script:ClaimRetryRefusalTailSec 0.25 s = 0.75 s), measured from the
+        # retry's start. A reader holds the claim file for the whole window; the seam makes the retry start 0.2 s past the deadline. Allowed: that 0.2 s, the 0.75 s reserve, one release call already in
+        # flight when the reserve ends (about 0.75 s), and 1.3 s of tolerance for the log line and this poll = 3.0 s. The unbounded retry took 5.5 s or more.
+        r = self.late_grant_scenario(hold=True)
+        h = r["holder"]
+        self.assertTrue(h["seenUtc"], f"no CLAIM_LATE_GRANT line was logged: {r['log']}")
+        spent = (datetime.fromisoformat(h["seenUtc"].replace("Z", "+00:00")) - r["deadline"]).total_seconds()
+        self.assertLess(spent, 3.0, f"the late grant's release retry ran {spent:.2f} s past -DeadlineUtc (bound: the 0.75 s reserve, one call in flight and tolerance = 3.0 s): {h['lines']}")
+        self.assertTrue(any("CLAIM_LATE_GRANT_NOT_RELEASED" in l for l in h["lines"]), f"the reader held the file, so the release must be logged as not released: {h['lines']}")
+
+    def test_r10_g14_an_unheld_late_grant_is_let_go_and_logged_so(self) -> None:
+        # the other half of the behaviour: nobody holds the claim file, the release answers at once, the claim is gone and the line says "let go"
+        r = self.late_grant_scenario(hold=False)
+        lines = [l for l in r["log"].splitlines() if "CLAIM_LATE_GRANT" in l]
+        self.assertTrue(any("CLAIM_LATE_GRANT batch=" in l and "let go" in l for l in lines), f"a released late grant was not logged as let go: {lines}")
+        self.assertFalse(any("NOT_RELEASED" in l for l in lines), f"a released late grant was logged as not released: {lines}")
+        self.assertFalse(r["claimLeft"], "the late grant's claim was left behind")
 
     def test_r9_a4_a_phase_with_a_character_the_culture_compare_ignores_is_refused_not_stored(self) -> None:
         # r9 A4: [ValidateSet('waiting', 'cooldown')] compares with the current culture and ignores U+00AD / U+200D, so 'wait<U+00AD>ing' bound and was stored with the extra character: a ticket no ordinal reader

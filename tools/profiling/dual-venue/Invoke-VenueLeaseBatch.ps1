@@ -2386,11 +2386,18 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         if ($lateGrant) {
             # r9 (adversary r9 A7): the release's answer was discarded and "let go" logged whatever it was: a reader holding the claim file refuses a release (BUSY), so the claim still named this batch. The inline release is
             # retried (a few short tries, as the ticket give-back is) and the line says what happened; a retry-granted claim keeps its single bounded release (Invoke-ClaimRetryRelease).
+            # r10 (Grok CoS G13): this retry runs past -DeadlineUtc by definition, so it is bounded as Invoke-ClaimRetryRelease is: the reserve less the refusal's own print ($script:ClaimRetryRequestReserveSec less
+            # $script:ClaimRetryRefusalTailSec), measured on a monotonic clock from the retry's start. A try is never started once it has run out, no sleep follows the last try, and a sleep never runs past it. A release
+            # call already in flight is not interrupted (Release-VenueClaim's own 5 opens, 0.75 s when BUSY), so the most past the bound is that one call.
             $lateAnswer = ''
+            $lateClock = [Diagnostics.Stopwatch]::StartNew()
+            $lateBoundSec = [double]($script:ClaimRetryRequestReserveSec - $script:ClaimRetryRefusalTailSec)
             for ($lateTry = 1; $lateTry -le 5; $lateTry++) {
                 try { $lateAnswer = [string]$(if ($grantedOnRetry) { Invoke-ClaimRetryRelease $deadline $req.claim.nonce } else { Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir }) } catch { $lateAnswer = 'ERROR' }
                 if ($grantedOnRetry -or $lateAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { break }
-                Start-Sleep -Milliseconds (100 * $lateTry)
+                $lateLeftSec = $lateBoundSec - $lateClock.Elapsed.TotalSeconds
+                if ($lateTry -ge 5 -or $lateLeftSec -le 0) { break }
+                Start-Sleep -Milliseconds ([int][Math]::Min([double](100 * $lateTry), [double]($lateLeftSec * 1000)))
             }
             if ($lateAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { LogBest "CLAIM_LATE_GRANT batch=$batchNo (the claim was granted at or after the deadline: let go, not used)" }
             else { LogBest "CLAIM_LATE_GRANT_NOT_RELEASED batch=$batchNo answer=$lateAnswer (the claim was granted at or after the deadline and is NOT known to be let go: it still names this batch until its expiry or its owner's exit)" }
