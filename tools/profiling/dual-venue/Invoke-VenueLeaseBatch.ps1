@@ -2353,7 +2353,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         $grantedOnRetry = $unfinished -gt 0
         try {
             # VENUE-FIFO-TICKET-BEFORE-PRECLAIM-1: every request carries the batch's ticket (taken here on the first one when the batch had no wait before it), so the claim goes to the oldest ready ticket
-            $ticketArgs = $(if ($script:TicketOn) { @{ UseTicket = $true; Ticket = $script:batchTicket; TicketStaleAfterSec = $ticketStaleSec } } else { @{} })
+            $ticketArgs = $(if ($script:TicketOn) { @{ UseTicket = $true; Ticket = $script:batchTicket; TicketStaleAfterSec = $ticketStaleSec } } else { @{ UseTicket = $false } })   # TAIL-1 pass 11 A6: -NoTicket BINDS the switch to false, so a caller's $PSDefaultParameterValues cannot turn it on
             $req = $(if ($unfinished -gt 0) { Invoke-ClaimRetryRequest -DeadlineUtc $deadline -RequestArgs (@{ Venue = $Venue; RunDir = $RunDir; Purpose = "$Purpose batch $batchNo"; TtlSec = $ClaimTtlSec; ClaimDir = $ClaimDir } + $ticketArgs) }
                 else { Request-VenueClaim -Venue $Venue -RunDir $RunDir -Purpose "$Purpose batch $batchNo" -TtlSec $ClaimTtlSec -ClaimDir $ClaimDir @ticketArgs })
             # the line for it is written only once the guard below has vouched for where batch.log is (no write before a read vouched for the input's location), never here

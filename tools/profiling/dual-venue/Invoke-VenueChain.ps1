@@ -348,7 +348,7 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
     if ($built.state -ceq 'NOT_STAGED') { Write-SuppSkip $Leg $Trigger 'BUILD_NOT_STAGED' "no staged build manifest for $($SourceCommit.Substring(0, 12)) at $($built.path); the chain stages and builds nothing" $true; return }
     # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1: a staged manifest whose cached exe/dll/zip is absent or differs from its digest would fail in the leg job after the claim and the probe
     if ($built.artifactProblem) { $ap = $built.artifactProblem -split ' ', 2; Write-SuppSkip $Leg $Trigger $ap[0] "$($ap[1])" $true; return }
-    $req = Request-VenueClaim -Venue $suppVenue -RunDir $RunDir -Purpose "$Purpose supplementary leg $($Leg.name)" -TtlSec ([Math]::Max(60, [Math]::Min($SupplementaryMaxSec, $remainSec) + $suppProbeStaleSec)) -ClaimDir $ClaimDir
+    $req = Request-VenueClaim -Venue $suppVenue -RunDir $RunDir -Purpose "$Purpose supplementary leg $($Leg.name)" -TtlSec ([Math]::Max(60, [Math]::Min($SupplementaryMaxSec, $remainSec) + $suppProbeStaleSec)) -ClaimDir $ClaimDir -UseTicket:$false   # TAIL-1 pass 11 A6: the supplementary request never takes a ticket, whatever the caller's ambient defaults are
     foreach ($b in $req.broken) { L "CLAIM_STALE_BROKEN venue=$suppVenue reason=$($b.reason) ownerPid=$($b.claim.ownerPid) runDir=$($b.claim.runDir) expiresUtc=$($b.claim.expiresUtc)" }
     if (-not $req.granted) { Write-SuppSkip $Leg $Trigger 'UM_BUSY' "claim state=$($req.state)" $false; return }
     $t0s = [DateTime]::UtcNow
@@ -473,6 +473,7 @@ foreach ($leg in $plan) {
         while ($true) {
             $rq = @{ Venue = $Venue; RunDir = $RunDir; Purpose = "$Purpose leg $($leg.name)"; TtlSec = $ClaimTtlSec; ClaimDir = $ClaimDir }
             if (-not $NoTicket) { $rq['UseTicket'] = $true; $rq['TicketStaleAfterSec'] = $ticketPollStaleSec; if ($ticket) { $rq['Ticket'] = $ticket } }
+            else { $rq['UseTicket'] = $false }   # TAIL-1 pass 11 A6: an explicit opt-out is BOUND to false, never left to a caller's $PSDefaultParameterValues
             $req = Request-VenueClaim @rq
             if ($req.ticket -and ($null -eq $ticket -or $req.ticket.name -cne $ticket.name)) { L "TICKET_TAKEN leg=$($leg.name) ticket=$($req.ticket.name) runDir=$RunDir pid=$PID$(if ($ticket) { ' (the earlier ticket was lost: back of the line)' })" }
             if ($req.ticket) { if ($null -eq $ticket -or $req.ticket.name -cne $ticket.name) { $ticketKeeps = 0 }; $ticket = $req.ticket }   # a new place in the line starts a new keep count
