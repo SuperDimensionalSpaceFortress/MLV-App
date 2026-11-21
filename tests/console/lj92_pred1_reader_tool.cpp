@@ -416,10 +416,131 @@ void run_synthetic(Counters & c, std::mt19937 & rng)
     }
 }
 
+// ---------------------------------------------------------------------------------------------------- r2 regressions
+// LJ92-PRED1-DECODER-ONLY-1 r2 (sol r1 provisional verdict on 3ae57852, blockers S1, S2, S4). Each check below was run
+// against 3ae57852 before its fix and failed there.
+
+// S1: the caller may point lj92_decode's target INSIDE the compressed stream (the output overwrites bytes the decoder
+// has not read yet). Master's lazy 16-bit-pair reader sees its own earlier output there; the u64 reader's 8-byte bulk
+// load had already taken the original bytes, so the pixels differed. The default decode must match the legacy one.
+struct AliasResult
+{
+    int open_ret = -1, ret = -1, u64_active = -1, measurement_active = -1;
+    std::vector<uint16_t> samples;
+};
+
+AliasResult decode_aliased(const Bytes & stream, size_t target_byte, int count, bool legacy)
+{
+    AliasResult r;
+    Bytes copy(stream.size() + 2);
+    // the u16 target must be 2-aligned: slide the copy by one byte when needed
+    uint8_t * base = copy.data() + ((((uintptr_t)copy.data() + target_byte) & 1u) ? 1 : 0);
+    std::memcpy(base, stream.data(), stream.size());
+    lj92 h = nullptr;
+    int w = 0, hh = 0, bits = 0, comps = 0;
+    r.open_ret = lj92_open(&h, base, (int)stream.size(), &w, &hh, &bits, &comps);
+    if (r.open_ret != LJ92_ERROR_NONE) return r;
+    uint16_t * target = reinterpret_cast<uint16_t *>(base + target_byte);
+    lj92_set_pred1_legacy_reader(legacy ? 1 : 0);
+    r.ret = lj92_decode(h, target, count, 0, nullptr, 0);
+    lj92_set_pred1_legacy_reader(0);
+    r.u64_active = lj92_get_last_pred1_u64_reader_active();
+    r.measurement_active = lj92_get_last_pred1_fast_path_measurement_active();
+    r.samples.resize((size_t)count);
+    std::memcpy(r.samples.data(), target, (size_t)count * sizeof(uint16_t));
+    lj92_close(h);
+    return r;
+}
+
+void check_aliased_output(Counters & c, int width, int height)
+{
+    Table t;                                   // two codes of length 16: 0000 -> SSSS 0, 0001 -> SSSS 16
+    t.symbols = { 0, 16 }; t.lengths = { 16, 16 }; t.codes = { 0u, 1u }; t.counts[16] = 2; t.max_len = 16;
+    Bytes s = make_header(t, width, height, 16, 1);
+    const size_t entropy = entropy_start(t, 1);
+    const uint8_t body[] = { 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xD9 };
+    s.insert(s.end(), body, body + sizeof(body));
+    const std::string shape = std::to_string(width) + "x" + std::to_string(height);
+    for (size_t offset : { (size_t)0, (size_t)2, (size_t)4 })
+    {
+        const std::string label = "aliased-output " + shape + " target=entropy+" + std::to_string(offset);
+        const AliasResult legacy = decode_aliased(s, entropy + offset, 2, true);
+        const AliasResult fresh = decode_aliased(s, entropy + offset, 2, false);
+        c.checks++;
+        if (legacy.open_ret != LJ92_ERROR_NONE || fresh.open_ret != LJ92_ERROR_NONE) { c.fail(label + ": open refused"); continue; }
+        if (legacy.ret != fresh.ret) c.fail(label + ": decode return differs");
+        if (legacy.samples != fresh.samples)
+            c.fail(label + ": pixels differ from the legacy reader: legacy=[" + std::to_string(legacy.samples[0]) + "," + std::to_string(legacy.samples[1])
+                   + "] default=[" + std::to_string(fresh.samples[0]) + "," + std::to_string(fresh.samples[1]) + "]");
+        if (offset == 2 && legacy.samples != std::vector<uint16_t>({ 32768, 32768 }))
+            c.fail(label + ": legacy (master) pixels are no longer [32768,32768]");
+        if (fresh.u64_active != 0) c.fail(label + ": the u64 reader ran on an output that overlaps the compressed input");
+    }
+    // the same stream with the output elsewhere must still take the u64 reader: the overlap test is not a blanket fallback
+    Bytes separate(s);
+    lj92 h = nullptr;
+    int w = 0, hh = 0, bits = 0, comps = 0;
+    c.checks++;
+    if (lj92_open(&h, separate.data(), (int)separate.size(), &w, &hh, &bits, &comps) != LJ92_ERROR_NONE) { c.fail("aliased-output " + shape + ": control open refused"); return; }
+    uint16_t out[2] = { 0, 0 };
+    const int ret = lj92_decode(h, out, 2, 0, nullptr, 0);
+    if (ret != LJ92_ERROR_NONE || lj92_get_last_pred1_u64_reader_active() != 1)
+        c.fail("aliased-output " + shape + ": a non-overlapping output no longer takes the u64 reader");
+    lj92_close(h);
+}
+
+// S2: the oracle must not count a required-route case as checked when both readers refuse to open it.
+void check_oracle_flags_unchecked_refusal(Counters & c)
+{
+    std::mt19937 rng(1);
+    const Table lone = make_table({ 0 }, 1, rng);
+    Counters probe;
+    compare_readers(probe, "oracle-probe", make_header(lone, 1, 1, 8, 1), 1);   // header only: both readers refuse to open
+    c.checks++;
+    if (probe.failures == 0) c.fail("oracle: a required-route case whose two readers both refuse to open was accepted as checked");
+}
+
+// S4: the u64-reader getter reports a decode that produced at least one sample, and a failed call resets it.
+void check_getters(Counters & c)
+{
+    std::mt19937 rng(7);
+    const Table lone = make_table({ 0 }, 1, rng);
+    uint16_t buf[4] = { 0, 0, 0, 0 };
+    int w = 0, hh = 0, bits = 0, comps = 0;
+
+    Bytes frame = make_header(lone, 1, 1, 8, 1);
+    frame.push_back(0x00); frame.push_back(0xFF); frame.push_back(0xD9);
+    lj92 h = nullptr;
+    c.checks++;
+    if (lj92_open(&h, frame.data(), (int)frame.size(), &w, &hh, &bits, &comps) != LJ92_ERROR_NONE) { c.fail("getters: 1x1 control open refused"); return; }
+    if (lj92_decode(h, buf, 1, 0, nullptr, 0) != LJ92_ERROR_NONE || lj92_get_last_pred1_u64_reader_active() != 1)
+        c.fail("getters: a 1x1 pred-1 decode no longer reports the u64 reader (control)");
+    // a refused call must not leave the previous decode's report behind
+    c.checks++;
+    if (lj92_decode(nullptr, buf, 1, 0, nullptr, 0) != LJ92_ERROR_BAD_HANDLE) c.fail("getters: lj92_decode(NULL) did not return BAD_HANDLE");
+    if (lj92_get_last_pred1_u64_reader_active() != 0) c.fail("getters: lj92_decode(NULL) left the previous decode's u64-reader report standing");
+    lj92_close(h);
+
+    // 1x0: a pred-1 scan with no sample to decode never touches the reader
+    Bytes empty = make_header(lone, 1, 0, 8, 1);
+    empty.push_back(0x00); empty.push_back(0xFF); empty.push_back(0xD9);
+    h = nullptr;
+    c.checks++;
+    if (lj92_open(&h, empty.data(), (int)empty.size(), &w, &hh, &bits, &comps) != LJ92_ERROR_NONE) { c.fail("getters: 1x0 open refused"); return; }
+    const int ret = lj92_decode(h, buf, 0, 0, nullptr, 0);
+    if (ret != LJ92_ERROR_NONE) c.fail("getters: 1x0 decode did not succeed");
+    if (lj92_get_last_pred1_u64_reader_active() != 0) c.fail("getters: a 1x0 decode (no sample) reports the u64 reader active");
+    lj92_close(h);
+}
+
 int run_selftest(const std::string & root, unsigned seed)
 {
     Counters c;
     std::mt19937 rng(seed);
+    check_aliased_output(c, 2, 1);
+    check_aliased_output(c, 1, 2);
+    check_oracle_flags_unchecked_refusal(c);
+    check_getters(c);
     int fixture_frames = 0;
     for (const char * fixture : kFixtures)
     {
