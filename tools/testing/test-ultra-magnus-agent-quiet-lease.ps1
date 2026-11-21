@@ -1199,7 +1199,7 @@ try {
         'lapse-end-timing-pure', 'lease-seam-pid-cleanup', 'lease-start-post-start-failure', 'lease-start-post-start-cleanup-throws', 'fake-flag-unreadable',
         'lease-seam-command-mode', 'lease-seam-wrapper-host', 'fixture-census-probe-error', 'fake-release-readable-deadline', 'fake-release-unreadable-then-readable-deadline',
         'fake-release-unreadable-deadline', 'lease-seam-unowned-never-killed', 'fake-release-absent-after-deadline', 'fake-release-absent-before-deadline',
-        'lease-seam-census-self-pid', 'renew-slow-monitor-slice', 'renew-gap-clock-step', 'renew-gap-round-up',
+        'lease-seam-census-self-pid', 'renew-slow-monitor-slice', 'cim-walk-snapshot', 'cim-walk-cycle', 'cim-walk-pid-reuse', 'cim-walk-partial-snapshot', 'cim-walk-root-start', 'cim-walk-live-parity', 'renew-gap-clock-step', 'renew-gap-round-up',
         'renew-collect-after-slow-slice', 'renew-stale-still-demotes', 'renew-gap-dst-fallback', 'renew-exit-stamp-transient-step', 'renew-exit-stamp-dst',
         'renew-exit-stamp-late-known-limit', 'renew-gap-reverted-step-known-limit', 'renew-gap-reverted-step-base-neighbour',
         'renew-call-start-before-process-start', 'renew-gap-prestart-stall-no-false-stop', 'renew-gap-reverted-step-record-wall-demotes',
@@ -5780,10 +5780,15 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
     # it does not under-read the gap between the fake heavy-slot.py's renew records, and the monitor loop passes the tick into its walk.
     # (r4: the reverted wall step that CAN make it under-read is the pinned known limit renew-gap-reverted-step-known-limit.)
     # RED on fork/master a7278cbd: cadence 60 s, one tick per slice, gap measured to the collection -> about two slices (150+ s).
+    # AGENT-JOB-MONITOR-CIM-WALK-1 r1: the 70-90 s slices above were nine CIM steps of a per-node walk; the walk is now one snapshot query, so the
+    # model is a slow single query (35-65 s slices); see the comment at the slice loop.
     if (Test-Case 'renew-slow-monitor-slice') {
         $rsSaved = @{ q = $script:QuietLease; w = $script:QuietLeaseWaiting; b = $script:LeaseBatch }
-        try {
-            $rsOut = & {
+        # r2 (sol 4, fable H4): the slice model runs TWICE, with the same agent code: the r1 matrix (35-65 s slices) and the original repeated 70-90 s
+        # slices (a single snapshot query of 65-85 s; the base's nine steps of 9 s each made the same 70-90 s).
+        $rsRun = {
+            param($Targets)
+            & {
                 $LeaseRenewSec = [int]$paramDefaults['LeaseRenewSec']
                 $LeaseRenewTimeoutSec = [int]$paramDefaults['LeaseRenewTimeoutSec']
                 $script:RsNow = [datetime]::new(2026, 11, 18, 2, 0, 0, [DateTimeKind]::Local)
@@ -5792,10 +5797,11 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 function Get-Date { return $script:RsNow }
                 function Step-RsClock([double]$Sec) { $script:RsNow = $script:RsNow.AddSeconds($Sec) }
                 function Get-CimInstance {
-                    [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter)
+                    # AGENT-JOB-MONITOR-CIM-WALK-1 r1: the walk reads ONE snapshot of the process table (-Property, no -Filter), so the slice's whole
+                    # modelled cost is this one query: the worst case, a single query that alone takes the slice's whole walk time (r2: 30-85 s).
+                    [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter, [string[]]$Property, [uint32]$OperationTimeoutSec)
                     Step-RsClock $script:RsOpCost
-                    if ($Filter -ceq 'ParentProcessId=4000') { return @(4001, 4002, 4003, 4004 | ForEach-Object { [pscustomobject]@{ ProcessId = $_ } }) }
-                    return @()
+                    return @(4001, 4002, 4003, 4004 | ForEach-Object { [pscustomobject]@{ ProcessId = [uint32]$_; ParentProcessId = [uint32]4000; CreationDate = $null; ExecutablePath = 'C:\x.exe'; CommandLine = 'x' } })
                 }
                 function Get-ProcessIdentity { param([int]$ProcessId) Step-RsClock $script:RsOpCost; return [pscustomobject]@{ exists = $true; processId = $ProcessId; startEpochMs = 1 } }
                 function Start-HeavySlotCli {
@@ -5817,10 +5823,13 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 $script:QuietLease = $lease; $script:QuietLeaseWaiting = $null; $script:LeaseBatch = $null
                 $hasOnEach = (Get-Command Get-DescendantProcessIdentities).Parameters.ContainsKey('OnEach')
                 $slices = [System.Collections.Generic.List[object]]::new()
-                # Slice lengths (walk + 5 s wait): 70-90 s, the 90 s ones twice; 9 clock steps per walk (5 CIM queries, 4 identities).
-                foreach ($target in @(70, 90, 80, 75, 90, 85, 72, 88)) {
+                # Slice lengths (walk + 5 s wait): 35-65 s. AGENT-JOB-MONITOR-CIM-WALK-1 r1: the base walk spent 70-90 s per slice in 9 CIM steps under a heavy
+                # leg, ticking between each. The walk is now ONE snapshot query: here a query of 30-60 s (3-7x one old step; the measured one is ~0.1 s), and a
+                # renew can start only at the walk's two ticks and the slice's own tick, so one query that alone outlasts the cadence (a 90 s slice: gap 95 s)
+                # is the pinned limit named in Get-DescendantProcessIdentities, not something this case can hold under 90 s.
+                foreach ($target in @($Targets)) {
                     $sliceStart = Get-Date
-                    $script:RsOpCost = ($target - 5) / 9.0
+                    $script:RsOpCost = ($target - 5) / 1.0
                     $walk = if ($hasOnEach) { @(Get-DescendantProcessIdentities -ParentProcessId 4000 -OnEach { Invoke-QuietLeaseRenewTick }) } else { @(Get-DescendantProcessIdentities -ParentProcessId 4000) }
                     Invoke-QuietLeaseRenewTick
                     $gap = Get-QuietLeaseRenewOkGapSec -Lease $lease
@@ -5835,12 +5844,26 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                     recordMaxGapSec = [double](@(@($recGaps) + @($firstRec)) | Measure-Object -Maximum).Maximum; records = $script:RsRecords.Count }
             }
         }
+        try {
+            $rsOut = & $rsRun -Targets @(35, 65, 50, 40, 65, 55, 38, 60)
+            $rsLong = & $rsRun -Targets @(70, 90, 80, 75, 90, 85, 72, 88)
+        }
         finally { $script:QuietLease = $rsSaved.q; $script:QuietLeaseWaiting = $rsSaved.w; $script:LeaseBatch = $rsSaved.b }
         $rsTxt = $rsOut | ConvertTo-Json -Depth 5 -Compress
-        Assert-True (@($rsOut.slices | Where-Object { $_.sliceSec -lt 70 -or $_.sliceSec -gt 90 }).Count -eq 0) "renew-slow-monitor-slice: every modelled monitor slice takes 70-90 s: $rsTxt"
+        $rsLongTxt = $rsLong | ConvertTo-Json -Depth 5 -Compress
+        Assert-True (@($rsOut.slices | Where-Object { $_.sliceSec -lt 35 -or $_.sliceSec -gt 65 }).Count -eq 0) "renew-slow-monitor-slice: every modelled monitor slice takes 35-65 s: $rsTxt"
         Assert-True ($rsOut.failures -eq 0 -and $rsOut.slow -eq 0 -and $rsOut.ok -ge 1) "renew-slow-monitor-slice: the renews succeed (late is the only fault modelled): $rsTxt"
-        Assert-True ($rsOut.okMaxGapSec -lt 90 -and $rsOut.checkMaxGapSec -lt 90) "renew-slow-monitor-slice: with 70-90 s monitor slices the gap between SUCCESSFUL renews stays < 90 s (stale limit $($script:LeaseRenewStaleSec) s); measured okMaxGapSec=$($rsOut.okMaxGapSec) checkMaxGapSec=$($rsOut.checkMaxGapSec): $rsTxt"
+        Assert-True ($rsOut.okMaxGapSec -lt 90 -and $rsOut.checkMaxGapSec -lt 90) "renew-slow-monitor-slice: with 35-65 s monitor slices (one snapshot query of 30-60 s) the gap between SUCCESSFUL renews stays < 90 s (stale limit $($script:LeaseRenewStaleSec) s); measured okMaxGapSec=$($rsOut.okMaxGapSec) checkMaxGapSec=$($rsOut.checkMaxGapSec): $rsTxt"
         Assert-True ($rsOut.okMaxGapSec + 0.05 -ge $rsOut.recordMaxGapSec) "renew-slow-monitor-slice: with no clock step, the agent's measured gap does not under-read heavy-slot.py's gap between renew records (okMaxGapSec=$($rsOut.okMaxGapSec) recordMaxGapSec=$($rsOut.recordMaxGapSec))"
+        # r2 (sol 4): the ORIGINAL repeated 70-90 s slices, through the same agent code (one snapshot query of 65-85 s per slice, the worst case a
+        # single query can be). The gap between successful renews is not held under 90 s here (a query that alone outlasts the cadence can start a
+        # renew only at its two ticks: a 90 s slice reads ~90 s), so the bound is the real one: it stays under the stale limit (LeaseRenewStaleSec,
+        # 120 s, what demotes a batch lease) with at least the 5 s monitor wait and the renew's own 3 s as margin, the renews all succeed and the
+        # agent's measured gap never under-reads heavy-slot.py's gap between renew records.
+        Assert-True (@($rsLong.slices | Where-Object { $_.sliceSec -lt 70 -or $_.sliceSec -gt 90 }).Count -eq 0 -and @($rsLong.slices).Count -eq 8) "renew-slow-monitor-slice: every repeated modelled monitor slice of the long matrix takes 70-90 s (8 slices): $rsLongTxt"
+        Assert-True ($rsLong.failures -eq 0 -and $rsLong.slow -eq 0 -and $rsLong.ok -ge 4) "renew-slow-monitor-slice: with repeated 70-90 s slices the renews succeed, repeatedly (late is the only fault modelled): $rsLongTxt"
+        Assert-True ($rsLong.okMaxGapSec -le ($script:LeaseRenewStaleSec - 8) -and $rsLong.checkMaxGapSec -le ($script:LeaseRenewStaleSec - 8)) "renew-slow-monitor-slice: with repeated 70-90 s monitor slices the gap between SUCCESSFUL renews stays at least 8 s under the stale limit ($($script:LeaseRenewStaleSec) s); measured okMaxGapSec=$($rsLong.okMaxGapSec) checkMaxGapSec=$($rsLong.checkMaxGapSec): $rsLongTxt"
+        Assert-True ($rsLong.okMaxGapSec + 0.05 -ge $rsLong.recordMaxGapSec) "renew-slow-monitor-slice: with repeated 70-90 s slices the agent's measured gap does not under-read heavy-slot.py's gap between renew records (okMaxGapSec=$($rsLong.okMaxGapSec) recordMaxGapSec=$($rsLong.recordMaxGapSec))"
         # Pass 2 A3: matched against the REAL monitor loop (the while loop over $jobProcess in Invoke-QueuedJob's AST, comments excluded), so a
         # comment carrying the call, or the call anywhere else, does not satisfy it.
         # r2 (pass 3 A3): command names are matched case-INsensitively (-eq), as PowerShell resolves them, so a lowercase walk is counted too;
@@ -5892,6 +5915,644 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True ($rsArgCalls.Count -eq 7 -and @($rsArgCalls[0..5] | Where-Object { & $rsIsWired $_ }).Count -eq 0 -and (& $rsIsWired $rsArgCalls[6])) "renew-slow-monitor-slice: the wiring guard refuses a tick given an argument (`$(throw 'skip'), a splat, a switch, a value) or a redirection, and a backgrounded walk (pass 12 A2), and accepts the bare shipped form: calls=$($rsArgCalls.Count) wired=$(@($rsArgCalls | ForEach-Object { [bool](& $rsIsWired $_) }) -join ',')"
         Assert-True ([int]$paramDefaults['LeaseRenewSec'] -le 30) "renew-slow-monitor-slice: the agent's default LeaseRenewSec is at most a quarter of the 120 s stale limit (got $($paramDefaults['LeaseRenewSec']))"
         $results.renewSlowMonitorSlice = $rsOut
+        $results.renewSlowMonitorSliceLong = $rsLong
+    }
+    # ------------------------------------------------------------ AGENT-JOB-MONITOR-CIM-WALK-1 r1: one process snapshot per descendant walk
+    # Bachelor's WmiPrvSE host averaged 0.673 cores over 9.3 days and peaked at 2-3.65 cores inside job windows (hub ruling 2026-11-20T21:56:16Z),
+    # timed with the job monitor's descendant walk: two Win32_Process CIM queries per descendant (one for the children, one for each child's
+    # identity), every monitor slice. Here the REAL Get-DescendantProcessIdentities runs against a fake process table behind a counting
+    # Get-CimInstance stand-in. Asserted: (1) EXACTLY ONE CIM query per walk (r2), none of them a per-pid -Filter query, and it is bounded by -OperationTimeoutSec; (2) the walk's output is
+    # identical, field for field and in depth-first order, to the legacy per-node walk (reproduced here) over the same table; (3) -OnEach fires
+    # before the snapshot and once after it; (4) an unreadable process table yields an empty walk, never a throw, as the legacy walk did.
+    # RED on fork/master ce80f515: 2N+1 queries (19 for the 9-descendant tree below).
+    if (Test-Case 'cim-walk-snapshot') {
+        $cwOut = & {
+            $script:CwLog = [System.Collections.Generic.List[string]]::new()
+            $script:CwTimeouts = [System.Collections.Generic.List[int]]::new()
+            $script:CwTable = @()
+            $script:CwFail = $false
+            $cwBase = [datetime]::new(2026, 11, 20, 12, 0, 0, [DateTimeKind]::Local)
+            function New-CwProc([int]$Id, [int]$Parent, [int]$Sec, [string]$Image, [string]$Cmd) {
+                [pscustomobject]@{ ProcessId = [uint32]$Id; ParentProcessId = [uint32]$Parent; CreationDate = $cwBase.AddSeconds($Sec).AddMilliseconds(123); ExecutablePath = $Image; CommandLine = $Cmd }
+            }
+            function Get-CimInstance {
+                [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter, [string[]]$Property, [uint32]$OperationTimeoutSec)
+                $script:CwLog.Add("cim|$ClassName|$Filter")
+                if ($PSBoundParameters.ContainsKey('OperationTimeoutSec')) { $script:CwTimeouts.Add([int]$OperationTimeoutSec) } else { $script:CwTimeouts.Add(-1) }
+                if ($script:CwFail) { Write-Error 'simulated CIM failure'; return }
+                $rows = @($script:CwTable)
+                if ($Filter -match '^ParentProcessId=(\d+)$') { $n = [int]$Matches[1]; return @($rows | Where-Object { [int]$_.ParentProcessId -eq $n }) }
+                if ($Filter -match '^ProcessId=(\d+)$') { $n = [int]$Matches[1]; return @($rows | Where-Object { [int]$_.ProcessId -eq $n }) }
+                return $rows
+            }
+            function Get-LegacyDescendants {
+                param([int]$ParentProcessId)
+                $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$ParentProcessId" -ErrorAction SilentlyContinue)
+                foreach ($child in $children) {
+                    $childProcessId = [int]$child.ProcessId
+                    Get-LegacyDescendants -ParentProcessId $childProcessId
+                    Get-ProcessIdentity -ProcessId $childProcessId
+                }
+            }
+            # root 7000 -> 7001..7003 -> two grandchildren each; table order interleaves the levels and unrelated processes.
+            $script:CwTable = @(
+                (New-CwProc 4 0 0 $null $null), (New-CwProc 8000 1 1 'C:\other\a.exe' 'a.exe'), (New-CwProc 7000 1 2 'C:\Program Files\PowerShell\7\pwsh.exe' 'pwsh.exe -File job.ps1'),
+                (New-CwProc 7021 7002 9 'C:\tools\ffmpeg.exe' 'ffmpeg.exe -i "a b.mov" out.mp4'), (New-CwProc 7001 7000 3 'C:\Windows\System32\cmd.exe' 'cmd.exe /c x'),
+                (New-CwProc 7011 7001 4 'C:\tools\mlvapp.exe' 'mlvapp.exe --batch'), (New-CwProc 8001 8000 5 'C:\other\b.exe' $null), (New-CwProc 7002 7000 6 'C:\Windows\System32\cmd.exe' 'cmd.exe /c y'),
+                (New-CwProc 7012 7001 7 $null $null), (New-CwProc 7003 7000 8 'C:\Windows\System32\cmd.exe' 'cmd.exe /c z'), (New-CwProc 7022 7002 10 'C:\tools\ffmpeg.exe' 'ffmpeg.exe -i q'),
+                (New-CwProc 7031 7003 11 'C:\tools\mlvapp.exe' 'mlvapp.exe'), (New-CwProc 7032 7003 12 'C:\tools\mlvapp.exe' 'mlvapp.exe 2')
+            )
+            $script:CwLog.Clear()
+            $legacy = @(Get-LegacyDescendants -ParentProcessId 7000)
+            $legacyQueries = @($script:CwLog | Where-Object { $_ -like 'cim|*' }).Count
+            $script:CwLog.Clear()
+            $script:CwTimeouts.Clear()
+            $walk = @(Get-DescendantProcessIdentities -ParentProcessId 7000 -OnEach { $script:CwLog.Add('onEach') })
+            $walkLog = @($script:CwLog)
+            $walkTimeouts = @($script:CwTimeouts)
+            $script:CwLog.Clear()
+            $noOnEach = @(Get-DescendantProcessIdentities -ParentProcessId 7000)
+            $noOnEachQueries = @($script:CwLog | Where-Object { $_ -like 'cim|*' }).Count
+            $script:CwLog.Clear()
+            $script:CwFail = $true
+            $failErr = $null
+            $failWalk = @()
+            try { $failWalk = @(Get-DescendantProcessIdentities -ParentProcessId 7000 -ErrorAction SilentlyContinue) } catch { $failErr = $_.Exception.Message }
+            $script:CwFail = $false
+            $script:CwLog.Clear()
+            $leaf = @(Get-DescendantProcessIdentities -ParentProcessId 7011)
+            [pscustomobject]@{
+                legacyCount = $legacy.Count; legacyQueries = $legacyQueries
+                walkCount = $walk.Count; walkLog = $walkLog; walkTimeouts = $walkTimeouts; walkJson = ($walk | ConvertTo-Json -Depth 4 -Compress); legacyJson = ($legacy | ConvertTo-Json -Depth 4 -Compress)
+                walkIds = (@($walk | ForEach-Object { [int]$_.processId }) -join ','); legacyIds = (@($legacy | ForEach-Object { [int]$_.processId }) -join ',')
+                noOnEachCount = $noOnEach.Count; noOnEachQueries = $noOnEachQueries; failCount = $failWalk.Count; failErr = $failErr; leafCount = $leaf.Count
+            }
+        }
+        $cwQueries = @($cwOut.walkLog | Where-Object { $_ -like 'cim|*' })
+        $cwTxt = $cwOut | ConvertTo-Json -Depth 4 -Compress
+        Assert-True ($cwOut.legacyCount -eq 9 -and $cwOut.legacyIds -eq '7011,7012,7001,7021,7022,7002,7031,7032,7003') "cim-walk-snapshot: the reference (legacy) walk over the 9-descendant fixture reads depth-first, children after their descendants: $cwTxt"
+        Assert-True ($cwOut.legacyQueries -eq 19) "cim-walk-snapshot: the legacy reference issues 2N+1 = 19 queries for N=9 (the fixture models what the base agent does): $cwTxt"
+        # r2 (fable H4): EXACTLY one query per walk, so a duplicated snapshot (two unfiltered queries) goes red; it was "-le 2".
+        Assert-True ($cwQueries.Count -eq 1) "cim-walk-snapshot: a descendant walk over a 9-descendant tree issues exactly 1 CIM query (got $($cwQueries.Count): $($cwQueries -join ' ; '))"
+        Assert-True (@($cwQueries | Where-Object { $_ -match '\|(Parent)?ProcessId=' }).Count -eq 0) "cim-walk-snapshot: no per-pid -Filter query is issued by the walk: $($cwQueries -join ' ; ')"
+        Assert-True ($cwOut.noOnEachQueries -eq 1) "cim-walk-snapshot: the walk without -OnEach also issues exactly 1 query (got $($cwOut.noOnEachQueries))"
+        # r2 (sol 2, fable H2): the snapshot query is bounded (-OperationTimeoutSec, a positive number of seconds that cannot outlast a monitor slice by much).
+        # r3 (adversary pass 3 A8): EXACTLY the declared 30 s default (a range accepted 60 s), and (A2) the clamp's ends are in the cim-walk-timeout case.
+        Assert-True (@($cwOut.walkTimeouts).Count -eq 1 -and [int]@($cwOut.walkTimeouts)[0] -eq 30) "cim-walk-snapshot: the one snapshot query passes -OperationTimeoutSec of exactly 30 s by default (got [$(@($cwOut.walkTimeouts) -join ',')]; -1 = not passed)"
+        Assert-True ($cwOut.walkCount -eq 9 -and $cwOut.walkIds -eq $cwOut.legacyIds) "cim-walk-snapshot: the walk returns the same descendants in the same depth-first order as the legacy walk: walk=[$($cwOut.walkIds)] legacy=[$($cwOut.legacyIds)]"
+        Assert-True ($cwOut.walkJson -ceq $cwOut.legacyJson) "cim-walk-snapshot: every identity field (exists, processId, startUtc, startEpochMs, imagePath, commandLine) equals the legacy walk's: walk=$($cwOut.walkJson) legacy=$($cwOut.legacyJson)"
+        $cwFirstCim = [Array]::IndexOf(@($cwOut.walkLog), @($cwQueries)[0])
+        $cwLastCim = [Array]::LastIndexOf(@($cwOut.walkLog), @($cwQueries)[-1])
+        $cwOnEachBefore = @(@($cwOut.walkLog)[0..([Math]::Max(0, $cwFirstCim))] | Where-Object { $_ -eq 'onEach' }).Count
+        $cwOnEachAfter = @(@($cwOut.walkLog)[$cwLastCim..(@($cwOut.walkLog).Count - 1)] | Where-Object { $_ -eq 'onEach' }).Count
+        Assert-True ($cwOnEachBefore -ge 1 -and $cwOnEachAfter -ge 1) "cim-walk-snapshot: -OnEach fires before the snapshot and at least once after it (before=$cwOnEachBefore after=$cwOnEachAfter): $($cwOut.walkLog -join ' ; ')"
+        Assert-True ($cwOut.failCount -eq 0 -and $null -eq $cwOut.failErr) "cim-walk-snapshot: an unreadable process table gives an empty walk and no throw (count=$($cwOut.failCount) err=$($cwOut.failErr))"
+        Assert-True ($cwOut.leafCount -eq 0) "cim-walk-snapshot: a pid with no children walks to nothing (got $($cwOut.leafCount))"
+        $results.cimWalkSnapshot = $cwOut
+    }
+    # A parent cycle in ONE snapshot (a pid reused between a child's creation and the table read can point a parent's ParentProcessId back at its
+    # own descendant) must end the walk, and the root is never reported as its own descendant. The legacy walk had no such guard; it is NOT run
+    # against the base agent (its unbounded recursion would end this process), so there is no RED for this case: it guards the new code only.
+    if (Test-Case 'cim-walk-cycle') {
+        $cyOut = & {
+            $cwBase = [datetime]::new(2026, 11, 20, 12, 0, 0, [DateTimeKind]::Local)
+            function New-CwProc([int]$Id, [int]$Parent, [int]$Sec) { [pscustomobject]@{ ProcessId = [uint32]$Id; ParentProcessId = [uint32]$Parent; CreationDate = $cwBase.AddSeconds($Sec); ExecutablePath = 'C:\x.exe'; CommandLine = 'x' } }
+            $script:CyTable = @((New-CwProc 9000 9002 1), (New-CwProc 9001 9000 2), (New-CwProc 9002 9001 3), (New-CwProc 0 0 0))
+            function Get-CimInstance { [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter, [string[]]$Property, [uint32]$OperationTimeoutSec) return @($script:CyTable) }
+            $cyWalk = @(Get-DescendantProcessIdentities -ParentProcessId 9000)
+            $idle = @(Get-DescendantProcessIdentities -ParentProcessId 0)
+            [pscustomobject]@{ ids = (@($cyWalk | ForEach-Object { [int]$_.processId }) -join ','); idleIds = (@($idle | ForEach-Object { [int]$_.processId }) -join ',') }
+        }
+        Assert-True ($cyOut.ids -eq '9002,9001') "cim-walk-cycle: a 9000 -> 9001 -> 9002 -> 9000 parent cycle ends, lists each other process once and never the root: ids=[$($cyOut.ids)]"
+        Assert-True ($cyOut.idleIds -eq '') "cim-walk-cycle: pid 0 (its own parent in the table) is not reported as a descendant of itself: ids=[$($cyOut.idleIds)]"
+        $results.cimWalkCycle = $cyOut
+    }
+    # AGENT-JOB-MONITOR-CIM-WALK-1 r2 (sol 1, fable H1): PID reuse. A row whose ParentProcessId names a pid that NOW belongs to a younger process
+    # (the row was created BEFORE its listed parent) is a stale edge: the old parent died, its pid was reused, and the row is an unrelated process.
+    # It is not a descendant, so no stop helper, retained identity or lease child report may hold it. The literal input: root 4000 created
+    # 12:00:10, row 4001 (ParentProcessId 4000) created 12:00:00 must NOT be emitted. A child created at the same instant, one with no
+    # CreationDate, and the orphans of a root that is no longer in the table (the job exited, its children live on) are still descendants.
+    # DEFECT_CLASS: contract gap (the walk trusted ParentProcessId alone). Every consumer calls this walk, so one filter covers them all.
+    if (Test-Case 'cim-walk-pid-reuse') {
+        $prOut = & {
+            $script:PrStopped = [System.Collections.Generic.List[int]]::new()
+            $prBase = [datetime]::new(2026, 11, 20, 12, 0, 0, [DateTimeKind]::Local)
+            function New-PrProc([int]$Id, [int]$Parent, $Sec) { [pscustomobject]@{ ProcessId = [uint32]$Id; ParentProcessId = [uint32]$Parent; CreationDate = $(if ($null -eq $Sec) { $null } else { $prBase.AddSeconds([double]$Sec) }); ExecutablePath = 'C:\x\p.exe'; CommandLine = "p $Id" } }
+            $script:PrTable = @((New-PrProc 4000 1 10), (New-PrProc 4001 4000 0), (New-PrProc 4004 4001 -60), (New-PrProc 4002 4000 20), (New-PrProc 4003 4002 30), (New-PrProc 4005 4000 10), (New-PrProc 4006 4000 $null),
+                (New-PrProc 4101 4100 5), (New-PrProc 4102 4101 6))
+            function Get-CimInstance {
+                [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter, [string[]]$Property, [uint32]$OperationTimeoutSec)
+                $rows = @($script:PrTable)
+                if ($Filter -match '^ProcessId=(\d+)$') { $n = [int]$Matches[1]; return @($rows | Where-Object { [int]$_.ProcessId -eq $n }) }
+                return $rows
+            }
+            function Stop-Process { [CmdletBinding()] param([int]$Id, [switch]$Force) $script:PrStopped.Add($Id) }
+            $script:Log.Clear(); $script:DescendantWalkStaleLogged = $null
+            $walk = @(Get-DescendantProcessIdentities -ParentProcessId 4000)
+            $orphans = @(Get-DescendantProcessIdentities -ParentProcessId 4100)
+            $rootMs = [DateTimeOffset]::new($prBase.AddSeconds(10)).ToUnixTimeMilliseconds()
+            $killed = @(Stop-ProcessTree -RootProcessId 4000 -RootStartEpochMs $rootMs)
+            # adversary A1 (known limit): a skipped row is NAMED in agent.log, once per pid however many walks see it (the walk above and Stop-ProcessTree's both do).
+            $skipLines = @($script:Log | Where-Object { $_ -match '^descendant-walk: skipped pid=' })
+            [pscustomobject]@{ ids = (@($walk | ForEach-Object { [int]$_.processId }) -join ','); orphanIds = (@($orphans | ForEach-Object { [int]$_.processId }) -join ','); killed = ($killed -join ','); stopped = (@($script:PrStopped) -join ',')
+                skipped = (@($skipLines | ForEach-Object { if ($_ -match 'skipped pid=(\d+)') { $Matches[1] } }) -join ',')
+                note = [string]$script:ProcessTreeWalkNote; stopSkipLines = @($script:Log | Where-Object { $_ -match '^process-tree stop pid=4000: SKIPPED' }) }
+        }
+        $prTxt = $prOut | ConvertTo-Json -Compress
+        Assert-True ($prOut.ids -notmatch '4001' -and $prOut.ids -notmatch '4004') "cim-walk-pid-reuse: row 4001 (created 12:00:00, ParentProcessId 4000 whose pid now belongs to a process created 12:00:10) and its child 4004 are NOT descendants: $prTxt"
+        Assert-True ($prOut.ids -eq '4003,4002,4005,4006') "cim-walk-pid-reuse: the real descendants stay (a child created the same instant as its parent, one with no CreationDate) in depth-first order: $prTxt"
+        Assert-True ($prOut.orphanIds -eq '4102,4101') "cim-walk-pid-reuse: the orphans of a root that is no longer in the table are still descendants: $prTxt"
+        Assert-True ($prOut.killed -eq '4003,4002,4005,4006,4000' -and $prOut.stopped -eq $prOut.killed) "cim-walk-pid-reuse: Stop-ProcessTree (the cancel, lease-stop and timeout kill) stops the real descendants and the root, never the stale-edge process 4001 or its child 4004: $prTxt"
+        Assert-True ($prOut.skipped -eq '4001') "cim-walk-pid-reuse: the skipped stale-edge row 4001 (its subtree, 4004, is never reached) is named once in agent.log however many walks see it: skipped=[$($prOut.skipped)] $prTxt"
+        # adversary pass 2 A1 (known limit): a skipped row is never silent on a kill path. Whether it is a reused parent pid or a real child after a backward
+        # clock step (the walk cannot tell them apart), Stop-ProcessTree says it did not target it: a log line and the caller note.
+        Assert-True (@($prOut.stopSkipLines).Count -eq 1 -and $prOut.note -match 'SKIPPED pids=4001' -and $prOut.note -match 'backward clock step' -and $prOut.note -match 'still running') "cim-walk-pid-reuse: a kill path names the rows it skipped as created before their listed parent (here 4001), so a real child after a backward clock step is reported as not stopped, never as a clean tree: $prTxt"
+        $results.cimWalkPidReuse = $prOut
+    }
+    # r2 (sol 2, fable H2): a snapshot that returns rows and THEN fails (a non-terminating provider error, or a throw) keeps the rows it returned; a
+    # failed or partial snapshot writes ONE agent.log line naming it (kind, pid, rows, why); the query carries -OperationTimeoutSec; and on a kill
+    # path (Stop-ProcessTree: cancel, lease stop, timeout) a failed or partial walk is NAMED in a log line and in the note the callers append to
+    # their message, so the root is never reported as the whole tree. DEFECT_CLASS: incomplete fix (error handling that discarded evidence).
+    if (Test-Case 'cim-walk-partial-snapshot') {
+        $psOut = & {
+            $script:PsMode = 'ok'
+            $script:PsGone = @()
+            $script:PsEvents = [System.Collections.Generic.List[string]]::new()
+            $script:PsFilterTimeouts = [System.Collections.Generic.List[int]]::new()
+            $script:PsStopped = [System.Collections.Generic.List[int]]::new()
+            $psBase = [datetime]::new(2026, 11, 20, 12, 0, 0, [DateTimeKind]::Local)
+            function New-PsProc([int]$Id, [int]$Parent, [double]$Sec) { [pscustomobject]@{ ProcessId = [uint32]$Id; ParentProcessId = [uint32]$Parent; CreationDate = $psBase.AddSeconds($Sec); ExecutablePath = 'C:\x\p.exe'; CommandLine = "p $Id" } }
+            $script:PsTable = @((New-PsProc 7000 1 0), (New-PsProc 7001 7000 1), (New-PsProc 7002 7000 2), (New-PsProc 7011 7001 3), (New-PsProc 8000 1 4))
+            $script:PsReplaceSec = $null   # r3 (adversary pass 3 A3): when set, a filtered read of pid 7011 returns a REPLACEMENT created this many seconds after the epoch
+            function Get-CimInstance {
+                [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter, [string[]]$Property, [uint32]$OperationTimeoutSec)
+                $rows = @($script:PsTable)
+                if ($Filter -match '^ProcessId=(\d+)$') {
+                    $n = [int]$Matches[1]
+                    $script:PsEvents.Add("filter:$Filter"); $script:PsFilterTimeouts.Add($(if ($PSBoundParameters.ContainsKey('OperationTimeoutSec')) { [int]$OperationTimeoutSec } else { -1 }))
+                    if (@($script:PsGone) -contains $n) { return @() }
+                    if ($null -ne $script:PsReplaceSec -and $n -eq 7011) { return @(New-PsProc 7011 9999 $script:PsReplaceSec) }
+                    return @($rows | Where-Object { [int]$_.ProcessId -eq $n })
+                }
+                $script:PsEvents.Add('snapshot')
+                switch ($script:PsMode) {
+                    'ok' { return $rows }
+                    'partial-nonterminating' { $rows | ForEach-Object { $_ }; Write-Error 'simulated provider error after rows'; return }
+                    'partial-throw' { $rows | ForEach-Object { $_ }; throw 'simulated provider throw after rows' }
+                    # adversary A3: the snapshot returns a stale-edge row (7004, created BEFORE the live root 7000) and a real one (7005), then fails BEFORE the root's own row.
+                    'before-root' { (New-PsProc 7004 7000 -30); (New-PsProc 7005 7000 5); Write-Error 'simulated provider error before the root row'; return }
+                    # adversary A10: a provider message with an embedded CRLF.
+                    'fail-multiline' { Write-Error "RPC unavailable`r`nprovider retry exhausted"; return }
+                    default { Write-Error 'simulated CIM failure'; return }
+                }
+            }
+            function Stop-Process { [CmdletBinding()] param([int]$Id, [switch]$Force) $script:PsStopped.Add($Id) }
+            $rootMs = [DateTimeOffset]::new($psBase).ToUnixTimeMilliseconds()
+            $rowsOut = [ordered]@{}
+            foreach ($mode in @('ok', 'partial-nonterminating', 'partial-throw', 'fail')) {
+                $script:PsMode = $mode
+                $script:Log.Clear(); $script:PsStopped.Clear(); $script:DescendantWalkFailLogTs = $null; $script:LastDescendantWalk = $null; $script:ProcessTreeWalkNote = $null
+                $walk = @(Get-DescendantProcessIdentities -ParentProcessId 7000)
+                $walkLines = @($script:Log | Where-Object { $_ -match '^descendant-walk: snapshot' })
+                $walkState = $script:LastDescendantWalk
+                $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null
+                $killed = @(Stop-ProcessTree -RootProcessId 7000 -RootStartEpochMs $rootMs)
+                $stopLines = @($script:Log | Where-Object { $_ -match '^process-tree stop pid=7000: descendant walk' })
+                $rowsOut[$mode] = [pscustomobject]@{ ids = (@($walk | ForEach-Object { [int]$_.processId }) -join ','); walkLines = $walkLines; ok = $(if ($null -ne $walkState) { [bool]$walkState.ok } else { $null })
+                    killed = ($killed -join ','); stopLines = $stopLines; note = [string]$script:ProcessTreeWalkNote }
+            }
+            # adversary A3: the snapshot fails after a stale-edge row and BEFORE the root's own row. The root's start is read once from its identity,
+            # so the stale row (created before it) is still refused; with the root unreadable too, none of its children are walked.
+            $script:PsMode = 'before-root'
+            foreach ($gone in @(@(), @(7000))) {
+                $script:PsGone = $gone
+                $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null; $script:DescendantWalkStaleLogged = $null
+                $script:PsEvents.Clear(); $script:PsFilterTimeouts.Clear()
+                # r3 (adversary pass 3 A1): the walk takes the root's RECORDED start (as every caller has it), so it reads no root row at all.
+                $walk = @(Get-DescendantProcessIdentities -ParentProcessId 7000 -RootStartEpochMs $rootMs -OnEach { $script:PsEvents.Add('tick') })
+                $rowsOut["before-root-gone$(@($gone).Count)"] = [pscustomobject]@{ ids = (@($walk | ForEach-Object { [int]$_.processId }) -join ','); events = (@($script:PsEvents) -join ' > '); filterTimeouts = (@($script:PsFilterTimeouts) -join ',')
+                    why = [string]$script:LastDescendantWalk.why }
+            }
+            $script:PsGone = @()
+            # adversary A10: one snapshot failure is one physical agent.log line, whatever the provider's message holds.
+            $script:PsMode = 'fail-multiline'
+            $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null
+            $null = @(Get-DescendantProcessIdentities -ParentProcessId 7000)
+            $mlLines = @($script:Log | Where-Object { $_ -match 'descendant-walk: snapshot failed' })
+            $rowsOut['multiline'] = [pscustomobject]@{ count = $mlLines.Count; hasNewline = [bool]($mlLines.Count -gt 0 -and $mlLines[0] -match '[\r\n]'); line = $(if ($mlLines.Count -gt 0) { $mlLines[0] } else { $null }) }
+            # adversary A2: the lease owner check re-reads the owner (the walk's identity is one snapshot row; an owner that exited while it was read is not a live child).
+            $script:PsMode = 'ok'
+            $lease = [pscustomobject]@{ pid = 7000 }
+            $own = [ordered]@{}
+            $own['wrapper'] = (Test-QuietLeaseOwnerPid -Lease $lease -OwnerPid 7000).ok
+            $own['child'] = (Test-QuietLeaseOwnerPid -Lease $lease -OwnerPid 7011).ok
+            $own['stranger'] = (Test-QuietLeaseOwnerPid -Lease $lease -OwnerPid 8000).ok
+            $script:PsGone = @(7011)
+            $ownGone = Test-QuietLeaseOwnerPid -Lease $lease -OwnerPid 7011
+            $own['childExitedDuringSnapshot'] = $ownGone.ok
+            $own['childExitedWhy'] = $ownGone.why
+            $script:PsGone = @()
+            # r3 (adversary pass 3 A3): a replacement process that took pid 7011 1.5 s after the snapshot row's process, with the same image, is within the
+            # identity matcher's 2 s epoch tolerance; the exact start string of the snapshot row must also match, so it is refused.
+            $script:PsReplaceSec = 4.5   # the snapshot row for 7011 is created at +3 s
+            $ownReplaced = Test-QuietLeaseOwnerPid -Lease $lease -OwnerPid 7011
+            $own['replacedAt1500ms'] = $ownReplaced.ok
+            $own['replacedWhy'] = $ownReplaced.why
+            $script:PsReplaceSec = 3   # the same process (same start): still accepted
+            $own['sameStart'] = (Test-QuietLeaseOwnerPid -Lease $lease -OwnerPid 7011).ok
+            $script:PsReplaceSec = $null
+            $rowsOut['owner'] = [pscustomobject]$own
+            $rowsOut
+        }
+        $psTxt = $psOut | ConvertTo-Json -Depth 5 -Compress
+        Assert-True ($psOut['ok'].ids -eq '7011,7001,7002' -and @($psOut['ok'].walkLines).Count -eq 0 -and $psOut['ok'].ok -eq $true -and @($psOut['ok'].stopLines).Count -eq 0 -and $psOut['ok'].note -eq '' -and $psOut['ok'].killed -eq '7011,7001,7002,7000') "cim-walk-partial-snapshot: a good snapshot walks, logs nothing and leaves an empty kill note: $psTxt"
+        foreach ($m in @(@{ mode = 'partial-nonterminating'; why = 'simulated provider error after rows' }, @{ mode = 'partial-throw'; why = 'simulated provider throw after rows' })) {
+            $r = $psOut[$m.mode]
+            Assert-True ($r.ids -eq '7011,7001,7002') "cim-walk-partial-snapshot: rows returned before a $($m.mode) CIM error are KEPT, not discarded: $psTxt"
+            Assert-True (@($r.walkLines).Count -eq 1 -and $r.walkLines[0] -match 'snapshot partial' -and $r.walkLines[0] -match 'pid=7000' -and $r.walkLines[0] -match 'rows=5' -and $r.walkLines[0].Contains($m.why)) "cim-walk-partial-snapshot: a $($m.mode) snapshot writes exactly one agent.log line naming it (partial, pid, rows=5, why): $psTxt"
+            Assert-True ($r.ok -eq $false) "cim-walk-partial-snapshot: the walk records that the snapshot was not complete ($($m.mode)): $psTxt"
+            Assert-True ($r.killed -eq '7011,7001,7002,7000' -and @($r.stopLines).Count -eq 1 -and $r.stopLines[0] -match 'PARTIAL' -and $r.note -match 'PARTIAL' -and $r.note.Contains($m.why)) "cim-walk-partial-snapshot: a kill path over a $($m.mode) walk stops what it found and says the walk was PARTIAL and why (log line and caller note): $psTxt"
+        }
+        $f = $psOut['fail']
+        Assert-True ($f.ids -eq '' -and @($f.walkLines).Count -eq 1 -and $f.walkLines[0] -match 'snapshot failed' -and $f.walkLines[0] -match 'pid=7000' -and $f.walkLines[0].Contains('simulated CIM failure') -and $f.ok -eq $false) "cim-walk-partial-snapshot: a failed snapshot gives an empty walk, no throw, and one agent.log line naming it: $psTxt"
+        Assert-True ($f.killed -eq '7000' -and @($f.stopLines).Count -eq 1 -and $f.stopLines[0] -match 'FAILED' -and $f.note -match 'FAILED' -and $f.note.Contains('simulated CIM failure') -and $f.note -match 'only the root was targeted' -and $f.note -notmatch 'is stopped') "cim-walk-partial-snapshot: a kill path whose snapshot FAILED does not report the root as the whole tree: it says the walk FAILED, why, and that descendants may still run (log line and caller note): $psTxt"
+        $b0 = $psOut['before-root-gone0']; $b1 = $psOut['before-root-gone1']
+        # r3 (adversary pass 3 A1, hub tests (a)): the walk takes the root's RECORDED start, so a snapshot that fails after a stale-edge row and BEFORE the
+        # root's own row still refuses the stale row and keeps the real child, whether or not the root still exists (b1: the root has EXITED, so a
+        # filtered read of its row would be empty) - the child is still found. No second query is made (the r2 filtered root read is gone).
+        Assert-True ($b0.ids -eq '7005') "cim-walk-partial-snapshot: a snapshot that fails after a stale-edge row and BEFORE the root's own row still refuses the stale row (the root's start is the recorded one) and keeps the real child: ids=[$($b0.ids)] $psTxt"
+        Assert-True ($b1.ids -eq '7005') "cim-walk-partial-snapshot: the root has EXITED (its row is in no read): the partial snapshot's child row is still found: ids=[$($b1.ids)] $psTxt"
+        foreach ($bx in @($b0, $b1)) {
+            Assert-True ($bx.events -ceq 'tick > snapshot > tick' -and $bx.filterTimeouts -ceq '') "cim-walk-partial-snapshot: the walk issues the one snapshot and no filtered root read, between its two ticks (events=[$($bx.events)] filter timeouts=[$($bx.filterTimeouts)])"
+        }
+        Assert-True ($b1.why.Contains('simulated provider error before the root row')) "cim-walk-partial-snapshot: the walk record names the snapshot failure: [$($b1.why)]"
+        $ml = $psOut['multiline']
+        Assert-True ($ml.count -eq 1 -and -not $ml.hasNewline -and ([string]$ml.line).Contains('RPC unavailable') -and ([string]$ml.line).Contains('provider retry exhausted')) "cim-walk-partial-snapshot: a provider message with an embedded CRLF is ONE physical agent.log line: $psTxt"
+        $ow = $psOut['owner']
+        Assert-True ($ow.wrapper -eq $true -and $ow.child -eq $true -and $ow.stranger -eq $false) "cim-walk-partial-snapshot: the lease owner check accepts the wrapper and a live child of it and refuses a stranger: $psTxt"
+        Assert-True ($ow.childExitedDuringSnapshot -eq $false -and ([string]$ow.childExitedWhy) -match 'no longer the same running process') "cim-walk-partial-snapshot: a child that appears in the snapshot but is gone when the owner is re-read is NOT a live owner (the owner's answer is cached): $psTxt"
+        Assert-True ($ow.replacedAt1500ms -eq $false -and ([string]$ow.replacedWhy) -match 'no longer the same running process') "cim-walk-partial-snapshot: a replacement process at pid 7011, created 1.5 s later with the same image, is refused (the re-read also needs the snapshot row's exact start string, not only the 2 s epoch tolerance): $psTxt"
+        Assert-True ($ow.sameStart -eq $true) "cim-walk-partial-snapshot: the same process (identical start string) is still accepted as the live child: $psTxt"
+        # Every kill path says an incomplete walk. The three of Invoke-QueuedJob (cancel, lease stop, timeout) carry the note on the line that names the killed pids
+        # (a second interpolation on another line cannot satisfy this: adversary A8), and each of the other Stop-ProcessTree sites carries it (or the $stopNote
+        # it captured right after the call) in the message that reports the stop.
+        # Read from the agent's AST (adversary pass 2 A3): a comment carrying the text satisfies nothing; only an interpolation inside an actual string does.
+        $qjFn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-QueuedJob' }, $true)
+        $isNoteString = { param($n) $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -and @($n.NestedExpressions | Where-Object { $_.Extent.Text -ceq '$($script:ProcessTreeWalkNote)' -or $_.Extent.Text -ceq '$stopNote' }).Count -gt 0 }
+        $qjSites = @($qjFn.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Stop-ProcessTree' }, $true))
+        # r4 (adversary pass 3 A7): a counted message string must be EXECUTED and WRITTEN: the first element of a two-element pipeline whose second
+        # element is Add-Content to $errFile. A string parked in `if ($false) { $null = "..." }` (or any assignment/discard) is not counted.
+        $isWrittenToErrFile = {
+            param($n)
+            $ce = $n.Parent
+            if ($ce -isnot [System.Management.Automation.Language.CommandExpressionAst] -or -not [object]::ReferenceEquals($ce.Expression, $n)) { return $false }
+            $pl = $ce.Parent
+            if ($pl -isnot [System.Management.Automation.Language.PipelineAst] -or $pl.PipelineElements.Count -ne 2 -or -not [object]::ReferenceEquals($pl.PipelineElements[0], $ce)) { return $false }
+            $sink = $pl.PipelineElements[1]
+            if ($sink -isnot [System.Management.Automation.Language.CommandAst] -or $sink.GetCommandName() -ne 'Add-Content') { return $false }
+            return (@($sink.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.VariableExpressionAst] -and $_.VariablePath.UserPath -ceq 'errFile' }).Count -eq 1)
+        }
+        $qjMsgs = @($qjFn.FindAll({ param($n) (& $isNoteString $n) -and $n.Value.Contains('killed process tree pids=') -and (& $isWrittenToErrFile $n) }, $true))
+        Assert-True ($qjSites.Count -eq 3 -and $qjMsgs.Count -eq 3) "cim-walk-partial-snapshot: all three job kill paths (cancel, lease stop, timeout) append the walk note to the message string that names the killed pids (sites=$($qjSites.Count) messages=$($qjMsgs.Count))"
+        $allCalls = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Stop-ProcessTree' }, $true))
+        $noteStrings = @($ast.FindAll({ param($n) & $isNoteString $n }, $true))
+        Assert-True ($allCalls.Count -eq 8 -and $noteStrings.Count -eq 10) "cim-walk-partial-snapshot: the agent's 8 Stop-ProcessTree call sites (adopted child, holder end, stale holder, lease end, stale lease, and the three job kill paths) report the walk note in 9 message strings (the lease stop also in its agent.log line), plus the one Stop-ProcessTree builds from it: sites=$($allCalls.Count) noteStrings=$($noteStrings.Count)"
+        $results.cimWalkPartialSnapshot = $psOut
+    }
+    # AGENT-JOB-MONITOR-CIM-WALK-1 r3 (adversary pass 3 A1 blocker, A2, A4; Grok G1, G3). DEFECT_CLASS: contract gap (the walk took the root's creation
+    # time from the root's SNAPSHOT ROW, not from the recorded identity every caller holds). Asserted on the REAL walk behind a fake process table:
+    #   (a) the root exited and the snapshot returns a child row and then errors: the child is still found;
+    #   (b) a child older than the recorded root start is still refused (and named in the walk record);
+    #   (c) G1: a root row whose start differs from the recorded one is another process (the pid was reused): ignored in favour of the recorded start,
+    #       the real orphan (created after the recorded start, before the reuser) is emitted, the reuser's own child is not;
+    #   (d) A2: -TimeoutSec is clamped to 1..30 and is the -OperationTimeoutSec of the one snapshot query; the monitor loop passes the time left;
+    #   (e) G3/A4: a walk nested in -OnEach leaves the outer walk's record intact, and the snapshot-failure log limiter is per root pid;
+    #   (f) every caller of the walk passes the recorded start (AST), and the normal-exit census writes an incomplete result into the err file.
+    if (Test-Case 'cim-walk-root-start') {
+        $rtOut = & {
+            $script:RtTimeouts = [System.Collections.Generic.List[int]]::new()
+            $script:RtFail = $null
+            $script:RtFailEmpty = $false; $script:RtFilterRows = $false; $script:RtFilterThenFail = $false; $script:RtFullRows = $null; $script:RtFilterDelayMs = 0; $script:RtFullDelayMs = 0
+            $script:RtTable = @()
+            $rtBase =[datetime]::new(2026, 11, 20, 12, 0, 0, [DateTimeKind]::Local)
+            function New-RtProc([int]$Id, [int]$Parent, [double]$Sec, [long]$Ticks = 0) { [pscustomobject]@{ ProcessId = [uint32]$Id; ParentProcessId = [uint32]$Parent; CreationDate = $rtBase.AddSeconds($Sec).AddTicks($Ticks); ExecutablePath = 'C:\x\p.exe'; CommandLine = "p $Id" } }
+            function Get-CimInstance {
+                [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter, [string[]]$Property, [uint32]$OperationTimeoutSec)
+                $script:RtTimeouts.Add($(if ($PSBoundParameters.ContainsKey('OperationTimeoutSec')) { [int]$OperationTimeoutSec } else { -1 }))
+                $rows = @($script:RtTable)
+                # r4 (pass 4 A3): a per-parent filtered read (the walk's fallback) answers from the table only when RtFilterRows is set; the full-table read
+                # fails at once, with no rows, when RtFailEmpty is set.
+                if ($PSBoundParameters.ContainsKey('Filter')) {
+                    if ($script:RtFilterDelayMs -gt 0) { Start-Sleep -Milliseconds $script:RtFilterDelayMs }
+                    if ($script:RtFilterRows) {
+                        $mine = if ($Filter -match '^ParentProcessId=(\d+)$') { $fp = [int]$Matches[1]; @($rows | Where-Object { [int]$_.ParentProcessId -eq $fp }) } elseif ($Filter -match '^ProcessId=(\d+)$') { $fp = [int]$Matches[1]; @($rows | Where-Object { [int]$_.ProcessId -eq $fp }) } else { @() }
+                        $mine | ForEach-Object { $_ }
+                        if ($script:RtFilterThenFail -and $mine.Count -gt 0 -and $Filter -like 'ParentProcessId=*') { Write-Error 'filtered read failed after rows'; return }   # r4 (pass 5 A5): rows first, then the error
+                        return
+                    }
+                    Write-Error 'filtered read unavailable'; return
+                }
+                if ($script:RtFullDelayMs -gt 0) { Start-Sleep -Milliseconds $script:RtFullDelayMs }
+                if ($script:RtFailEmpty) { Write-Error 'full-table read failed'; return }
+                if ($null -ne $script:RtFail) { $emit = if ($null -ne $script:RtFullRows) { @($script:RtFullRows) } else { $rows }; $emit | ForEach-Object { $_ }; Write-Error ([string]$script:RtFail); return }
+                return $rows
+            }
+            $rootMs = [DateTimeOffset]::new($rtBase).ToUnixTimeMilliseconds()
+            $ids = { param($w) (@($w | ForEach-Object { [int]$_.processId }) -join ',') }
+            $o = [ordered]@{}
+            # (a) + (b): the root 4200 (recorded start 12:00:00) has exited, so its row is in no read. 4201 (created 30 s BEFORE it) is a stale edge, 4202 a real child.
+            $script:RtTable = @((New-RtProc 4201 4200 -30), (New-RtProc 4202 4200 5), (New-RtProc 4203 4201 -20))
+            $script:Log.Clear(); $script:DescendantWalkStaleLogged = $null; $script:DescendantWalkFailLogTs = $null
+            $w = @(Get-DescendantProcessIdentities -ParentProcessId 4200 -RootStartEpochMs $rootMs)
+            $o['exitedComplete'] = [pscustomobject]@{ ids = (& $ids $w); skipped = (@($script:LastDescendantWalk.skipped) -join ','); ok = $script:LastDescendantWalk.ok }
+            $script:RtFail = 'simulated provider error after rows'
+            $w = @(Get-DescendantProcessIdentities -ParentProcessId 4200 -RootStartEpochMs $rootMs)
+            $o['exitedPartial'] = [pscustomobject]@{ ids = (& $ids $w); skipped = (@($script:LastDescendantWalk.skipped) -join ','); ok = $script:LastDescendantWalk.ok; partial = $script:LastDescendantWalk.partial; rows = $script:LastDescendantWalk.rows }
+            $script:RtFail = $null
+            # (c) G1: pid 4300 now belongs to a process created 12:00:10 (it has its own child 4301, created 12:00:12). The REAL orphan 4302 was created 12:00:05
+            # (after the recorded root start 12:00:00, before the reuser); 4303 was created 12:00:-05 (a stale edge).
+            $script:RtTable = @((New-RtProc 4300 1 10), (New-RtProc 4301 4300 12), (New-RtProc 4302 4300 5), (New-RtProc 4303 4300 -5), (New-RtProc 4304 4302 6))
+            $script:Log.Clear(); $script:DescendantWalkStaleLogged = $null
+            $w = @(Get-DescendantProcessIdentities -ParentProcessId 4300 -RootStartEpochMs $rootMs)
+            $o['reused'] = [pscustomobject]@{ ids = (& $ids $w); skipped = (@($script:LastDescendantWalk.skipped) -join ','); reuseLines = @($script:Log | Where-Object { $_ -match 'root pid=4300 was reused' }) }
+            # the same table WITHOUT a recorded start keeps r2's behaviour: the root's snapshot row is the only parent time there is
+            $w = @(Get-DescendantProcessIdentities -ParentProcessId 4300)
+            $o['reusedNoStart'] = [pscustomobject]@{ ids = (& $ids $w) }
+            # the root's row IS the recorded process (its start differs from the recorded ms only below the millisecond): nothing is reused or dropped.
+            $script:RtTable = @((New-RtProc 4400 1 0 1234567), (New-RtProc 4401 4400 1), (New-RtProc 4402 4400 3))
+            $ms = [DateTimeOffset]::new($rtBase.AddTicks(1234567)).ToUnixTimeMilliseconds()
+            $script:Log.Clear()
+            $w = @(Get-DescendantProcessIdentities -ParentProcessId 4400 -RootStartEpochMs $ms)
+            $o['sameRow'] = [pscustomobject]@{ ids = (& $ids $w); reuseLines = @($script:Log | Where-Object { $_ -match 'was reused' }).Count }
+            # (d) A2: -TimeoutSec is clamped to 1..30 and is the one query's -OperationTimeoutSec.
+            $script:RtTable = @()
+            $clamp = [ordered]@{}
+            foreach ($t in @(0, -5, 1, 7, 30, 100)) { $script:RtTimeouts.Clear(); $null = @(Get-DescendantProcessIdentities -ParentProcessId 1 -TimeoutSec $t); $clamp["$t"] = (@($script:RtTimeouts) -join ',') }
+            $script:RtTimeouts.Clear(); $null = @(Get-DescendantProcessIdentities -ParentProcessId 1); $clamp['default'] = (@($script:RtTimeouts) -join ',')
+            $o['clamp'] = [pscustomobject]$clamp
+            # (e) G3/A4: the outer walk of root 7000 fails after returning rows (a stale edge among them); its CLOSING -OnEach tick runs a complete nested walk of 8000.
+            $script:RtTable = @((New-RtProc 7000 1 0), (New-RtProc 7004 7000 -30), (New-RtProc 7005 7000 5))
+            $script:RtFail = 'simulated outer failure'
+            $script:RtTick = 0
+            $script:Log.Clear(); $script:DescendantWalkStaleLogged = $null; $script:DescendantWalkFailLogTs = $null
+            $w = @(Get-DescendantProcessIdentities -ParentProcessId 7000 -RootStartEpochMs $rootMs -OnEach { $script:RtTick++; if ($script:RtTick -eq 2) { $keep = $script:RtFail; $script:RtFail = $null; $null = @(Get-DescendantProcessIdentities -ParentProcessId 8000); $script:RtFail = $keep } })
+            $rec = $script:LastDescendantWalk
+            $o['nested'] = [pscustomobject]@{ ids = (& $ids $w); ticks = $script:RtTick; rootPid = $rec.rootPid; ok = $rec.ok; partial = $rec.partial; rows = $rec.rows; why = [string]$rec.why; skipped = (@($rec.skipped) -join ',') }
+            # the snapshot-failure log limiter is per root pid: a second root's failure inside 60 s is still logged, a repeat of the first is not.
+            $script:RtTable = @(); $script:RtFail = 'boom'
+            $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null
+            foreach ($p in @(7000, 8000, 7000)) { $null = @(Get-DescendantProcessIdentities -ParentProcessId $p) }
+            $o['limiter'] = @($script:Log | Where-Object { $_ -match '^descendant-walk: snapshot' } | ForEach-Object { if ($_ -match 'pid=(\d+)') { $Matches[1] } }) -join ','
+            $script:RtFail = $null
+            # r4 (adversary pass 4). A2: the root's pid now belongs to a process created 1.5 s AFTER the recorded start (inside the identity checks' 2 s
+            # tolerance); its child 4501 (1.6 s) is ITS child, not the exited root's.
+            $script:RtTable = @((New-RtProc 4500 1 1.5), (New-RtProc 4501 4500 1.6))
+            $script:Log.Clear()
+            $w = @(Get-DescendantProcessIdentities -ParentProcessId 4500 -RootStartEpochMs $rootMs)
+            $o['reusedNear'] = [pscustomobject]@{ ids = (& $ids $w); reuseLines = @($script:Log | Where-Object { $_ -match 'root pid=4500 was reused' }).Count }
+            # A3: the full-table read FAILS with no rows, the per-parent filtered reads answer: the children (7101, and 7102 below it) are still found, as PARTIAL.
+            $script:RtTable = @((New-RtProc 7100 1 0), (New-RtProc 7101 7100 3), (New-RtProc 7102 7101 4), (New-RtProc 7103 1 2))
+            $script:RtFailEmpty = $true; $script:RtFilterRows = $true; $script:RtTimeouts.Clear(); $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null
+            $w = @(Get-DescendantProcessIdentities -ParentProcessId 7100 -RootStartEpochMs $rootMs)
+            $rec = $script:LastDescendantWalk
+            $o['fallback'] = [pscustomobject]@{ ids = (& $ids $w); ok = $rec.ok; partial = $rec.partial; rows = $rec.rows; queries = $script:RtTimeouts.Count; logs = @($script:Log | Where-Object { $_ -match '^descendant-walk: snapshot' }) }
+            $script:RtFilterRows = $false; $script:RtTimeouts.Clear()
+            $w = @(Get-DescendantProcessIdentities -ParentProcessId 7100 -RootStartEpochMs $rootMs)
+            $rec = $script:LastDescendantWalk
+            $o['fallbackDead'] = [pscustomobject]@{ ids = (& $ids $w); ok = $rec.ok; partial = $rec.partial; rows = $rec.rows; queries = $script:RtTimeouts.Count }
+            # A9: 257 distinct roots fail inside one minute, then the FIRST root fails again: still suppressed (the table never forgets a recent entry).
+            $script:RtTable = @(); $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null
+            foreach ($p in 7000..7256) { $null = @(Get-DescendantProcessIdentities -ParentProcessId $p) }
+            $limFirst = @($script:Log | Where-Object { $_ -match '^descendant-walk: snapshot' }).Count
+            $null = @(Get-DescendantProcessIdentities -ParentProcessId 7000)
+            $null = @(Get-DescendantProcessIdentities -ParentProcessId 7256)   # r4 (pass 5 A7): the 257th root, the one a capped table would not remember
+            $o['limiterFull'] = [pscustomobject]@{ first = $limFirst; afterRepeat = @($script:Log | Where-Object { $_ -match '^descendant-walk: snapshot' }).Count }
+            # r4 (pass 5 A2): the full-table read fails with no rows; the replacement root 4500 (created 40 s after the recorded start) is read by the
+            # fallback, so its child 4501 is recognised as ITS child and is not walked.
+            $script:RtTable = @((New-RtProc 4500 1 40), (New-RtProc 4501 4500 41))
+            $script:RtFailEmpty = $true; $script:RtFilterRows = $true; $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null
+            $w = @(Get-DescendantProcessIdentities -ParentProcessId 4500 -RootStartEpochMs $rootMs)
+            $o['fallbackReused'] = [pscustomobject]@{ ids = (& $ids $w); reuseLines = @($script:Log | Where-Object { $_ -match 'root pid=4500 was reused' }).Count }
+            # r4 (pass 5 A4): the full read emits ONE UNRELATED row and then fails; the fallback still runs and finds the child.
+            $script:RtTable = @((New-RtProc 7100 1 0), (New-RtProc 7101 7100 3), (New-RtProc 7102 7101 4))
+            $script:RtFailEmpty = $false; $script:RtFail = 'RPC error'; $script:RtFullRows = @((New-RtProc 4 0 -100)); $script:RtTimeouts.Clear(); $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null
+            $w = @(Get-DescendantProcessIdentities -ParentProcessId 7100 -RootStartEpochMs $rootMs)
+            $o['unrelatedPartial'] = [pscustomobject]@{ ids = (& $ids $w); partial = $script:LastDescendantWalk.partial; queries = $script:RtTimeouts.Count }
+            # r4 (pass 5 A5): a per-parent read returns the child and THEN errors: the child is kept (streamed read), the error ends the fallback.
+            $script:RtFullRows = $null; $script:RtFail = $null; $script:RtFailEmpty = $true; $script:RtFilterThenFail = $true; $script:RtTable = @((New-RtProc 7100 1 0), (New-RtProc 7101 7100 3))
+            $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null
+            $w = @(Get-DescendantProcessIdentities -ParentProcessId 7100 -RootStartEpochMs $rootMs)
+            $o['fallbackRowsThenError'] = [pscustomobject]@{ ids = (& $ids $w); rows = $script:LastDescendantWalk.rows; partial = $script:LastDescendantWalk.partial; ok = $script:LastDescendantWalk.ok }
+            $script:RtFilterThenFail = $false
+            # r4 (pass 5 A1): ONE budget. 2 s left; the full read takes 1.9 s and fails; each per-parent read takes 1.9 s. The root-row read starts (0.1 s left);
+            # nothing starts after it.
+            $script:RtTable = @((New-RtProc 7100 1 0), (New-RtProc 7101 7100 3))
+            $script:RtFilterRows = $true; $script:RtFullDelayMs = 1900; $script:RtFilterDelayMs = 1900; $script:RtTimeouts.Clear()
+            $bwatch = [System.Diagnostics.Stopwatch]::StartNew()
+            $null = @(Get-DescendantProcessIdentities -ParentProcessId 7100 -RootStartEpochMs $rootMs -Deadline ((Get-Date).AddSeconds(2)))
+            $o['fallbackBudget'] = [pscustomobject]@{ queries = $script:RtTimeouts.Count; timeouts = (@($script:RtTimeouts) -join ','); elapsedSec = [Math]::Round($bwatch.Elapsed.TotalSeconds, 1) }
+            $script:RtFullDelayMs = 0; $script:RtFilterDelayMs = 0
+            # r4 (pass 5 A11, A13): a complete read reports its row count; a deadline of DateTime.MaxValue gives the 30 s ceiling, not an overflow.
+            $script:RtFailEmpty = $false; $script:RtFilterRows = $false; $script:RtTimeouts.Clear()
+            $script:RtTable = @((New-RtProc 7100 1 0), (New-RtProc 7101 7100 3))
+            $maxThrew = $null
+            try { $null = @(Get-DescendantProcessIdentities -ParentProcessId 7100 -RootStartEpochMs $rootMs -Deadline ([DateTime]::MaxValue)) } catch { $maxThrew = $_.Exception.Message }
+            $o['completeRead'] = [pscustomobject]@{ rows = $script:LastDescendantWalk.rows; ok = $script:LastDescendantWalk.ok; maxDeadlineTimeouts = (@($script:RtTimeouts) -join ','); threw = $maxThrew }
+            $script:RtFailEmpty = $false
+            # A1: the snapshot's bound is worked out from the DEADLINE when the snapshot starts, after the opening tick (which here takes 2.2 s of a 3 s budget).
+            $script:RtTable = @()
+            $dl = [ordered]@{}
+            $script:RtTickA = $false; $script:RtTimeouts.Clear()
+            $null = @(Get-DescendantProcessIdentities -ParentProcessId 1 -Deadline ((Get-Date).AddSeconds(3)) -OnEach { if (-not $script:RtTickA) { $script:RtTickA = $true; Start-Sleep -Milliseconds 2200 } })
+            $dl['slowTick'] = (@($script:RtTimeouts) -join ',')
+            $script:RtTickA = $false; $script:RtTimeouts.Clear()
+            $null = @(Get-DescendantProcessIdentities -ParentProcessId 1 -Deadline ((Get-Date).AddSeconds(1)) -OnEach { if (-not $script:RtTickA) { $script:RtTickA = $true; Start-Sleep -Milliseconds 1300 } })
+            $dl['pastDeadlineQueries'] = $script:RtTimeouts.Count
+            $dl['pastDeadlineWhy'] = [string]$script:LastDescendantWalk.why
+            $script:RtTimeouts.Clear(); $null = @(Get-DescendantProcessIdentities -ParentProcessId 1 -Deadline ((Get-Date).AddSeconds(100)))
+            $dl['far'] = (@($script:RtTimeouts) -join ',')
+            $script:RtTimeouts.Clear(); $null = @(Get-DescendantProcessIdentities -ParentProcessId 1 -Deadline ((Get-Date).AddSeconds(6.5)))
+            $dl['near'] = (@($script:RtTimeouts) -join ',')
+            $o['deadline'] = [pscustomobject]$dl
+            $script:RtFail = $null
+            $o
+        }
+        $rtTxt = $rtOut | ConvertTo-Json -Depth 5 -Compress
+        Assert-True ($rtOut['exitedComplete'].ids -eq '4202' -and $rtOut['exitedComplete'].skipped -eq '4201' -and $rtOut['exitedComplete'].ok -eq $true) "cim-walk-root-start: (b) a child created before the RECORDED start of an exited root is refused (and named in the walk record); the real child is walked: $rtTxt"
+        Assert-True ($rtOut['exitedPartial'].ids -eq '4202' -and $rtOut['exitedPartial'].skipped -eq '4201' -and $rtOut['exitedPartial'].ok -eq $false -and $rtOut['exitedPartial'].partial -eq $true -and $rtOut['exitedPartial'].rows -eq 3) "cim-walk-root-start: (a) the root exited, the snapshot returned its child rows and then errored: the real child is still found, the stale one is still refused, and the record says PARTIAL: $rtTxt"
+        Assert-True ($rtOut['reused'].ids -eq '4304,4302' -and $rtOut['reused'].skipped -eq '4303') "cim-walk-root-start: (c) G1, a root row whose start (12:00:10) differs from the recorded one (12:00:00) is ignored in favour of the recorded start: the orphan 4302 (12:00:05) and its child 4304 are emitted, the stale 4303 is skipped, the reuser's child 4301 (12:00:12) is not: $rtTxt"
+        Assert-True (@($rtOut['reused'].reuseLines).Count -eq 1 -and $rtOut['reused'].reuseLines[0] -match 'pids=4301') "cim-walk-root-start: (c) the rows left out as the reuser's children are named in one agent.log line: $rtTxt"
+        Assert-True ($rtOut['reusedNoStart'].ids -eq '4301') "cim-walk-root-start: without a recorded start the walk keeps r2's rule (the root's snapshot row is its only creation time: the stale 4303 and the older 4302 are skipped, the younger 4301 is kept; this is the behaviour -RootStartEpochMs replaces): $rtTxt"
+        Assert-True ($rtOut['sameRow'].ids -eq '4401,4402' -and $rtOut['sameRow'].reuseLines -eq 0) "cim-walk-root-start: a root row whose start equals the recorded one to the millisecond is the same process: nothing is dropped as a reuser's child: $rtTxt"
+        $cl = $rtOut['clamp']
+        Assert-True ($cl.'0' -ceq '1' -and $cl.'-5' -ceq '1' -and $cl.'1' -ceq '1' -and $cl.'7' -ceq '7' -and $cl.'30' -ceq '30' -and $cl.'100' -ceq '30' -and $cl.default -ceq '30') "cim-walk-root-start: (A2) -TimeoutSec is the snapshot's -OperationTimeoutSec, clamped to 1..30 (0->1, -5->1, 1->1, 7->7, 30->30, 100->30, default 30): $rtTxt"
+        $ns = $rtOut['nested']
+        Assert-True ($ns.ticks -eq 2 -and $ns.rootPid -eq 7000 -and $ns.ok -eq $false -and $ns.partial -eq $true -and $ns.rows -eq 3 -and $ns.skipped -eq '7004' -and $ns.why -match 'simulated outer failure' -and $ns.ids -eq '7005') "cim-walk-root-start: (G3, A4) a walk nested in the closing -OnEach tick leaves the OUTER walk's record intact (root 7000, failed after 3 rows, skipped 7004): $rtTxt"
+        Assert-True ($rtOut['limiter'] -ceq '7000,8000') "cim-walk-root-start: (G3) the snapshot-failure log limiter is per root pid (7000, then 8000, then a repeat of 7000 inside 60 s is not logged again): got [$($rtOut['limiter'])]"
+        # r4 (adversary pass 4): A2, A3, A9, A1 on the real walk.
+        Assert-True ($rtOut['reusedNear'].ids -eq '' -and $rtOut['reusedNear'].reuseLines -eq 1) "cim-walk-root-start: (A2) a process that took the root's pid 1.5 s after the recorded start (inside the identity checks' 2 s tolerance) is a reuser: its child 4501 is NOT walked and the reuse is named once: $rtTxt"
+        $fb = $rtOut['fallback']
+        Assert-True ($fb.ids -eq '7102,7101' -and $fb.ok -eq $false -and $fb.partial -eq $true -and $fb.rows -eq 3 -and $fb.queries -eq 5 -and @($fb.logs).Count -eq 1 -and @($fb.logs)[0] -match 'fell back' -and @($fb.logs)[0] -match 'pid=7100') "cim-walk-root-start: (A3) the full-table read failed with no rows but the per-parent reads answer: the children 7101 and 7102 are found (1 full + the root's row + 3 per-parent queries... = 5), recorded PARTIAL with the 3 rows read, one log line says it fell back: $rtTxt"
+        Assert-True ($rtOut['fallbackReused'].ids -eq '' -and $rtOut['fallbackReused'].reuseLines -eq 1) "cim-walk-root-start: (A2, pass 5) the fallback reads the root's own row: a replacement root (created 40 s after the recorded start) is a reuser and its child 4501 is not walked: $rtTxt"
+        Assert-True ($rtOut['unrelatedPartial'].ids -eq '7102,7101' -and $rtOut['unrelatedPartial'].partial -eq $true) "cim-walk-root-start: (A4, pass 5) a read that returned only an UNRELATED row before it failed still falls back, and finds the children: $rtTxt"
+        $fre = $rtOut['fallbackRowsThenError']
+        Assert-True ($fre.ids -eq '7101' -and $fre.rows -eq 2 -and $fre.partial -eq $true -and $fre.ok -eq $false) "cim-walk-root-start: (A5, pass 5) a per-parent read that returns the child and then errors keeps the child (streamed read) and records PARTIAL: $rtTxt"
+        $fbb = $rtOut['fallbackBudget']
+        Assert-True ($fbb.queries -eq 2 -and $fbb.timeouts -ceq '2,1' -and $fbb.elapsedSec -lt 4.6) "cim-walk-root-start: (A1, pass 5) the full read and the fallback share ONE budget: 2 s left, a 1.9 s full read leaves 0.1 s, so only the root-row read starts (timeouts 2 then 1) and nothing after it (queries=$($fbb.queries) timeouts=[$($fbb.timeouts)] elapsed=$($fbb.elapsedSec) s)"
+        Assert-True ($rtOut['completeRead'].rows -eq 2 -and $rtOut['completeRead'].ok -eq $true -and $rtOut['completeRead'].maxDeadlineTimeouts -ceq '30') "cim-walk-root-start: (A11, A13 pass 5) a complete read reports rows=2 and a DateTime.MaxValue deadline gives the 30 s ceiling instead of an integer overflow: $rtTxt"
+        $fd = $rtOut['fallbackDead']
+        Assert-True ($fd.ids -eq '' -and $fd.ok -eq $false -and $fd.partial -eq $false -and $fd.rows -eq 0 -and $fd.queries -eq 2) "cim-walk-root-start: (A3) when the per-parent reads fail too the walk is FAILED and empty, after one fallback read: $rtTxt"
+        Assert-True ($rtOut['limiterFull'].first -eq 257 -and $rtOut['limiterFull'].afterRepeat -eq 257) "cim-walk-root-start: (A9) after 257 distinct failing roots inside a minute the FIRST root's repeat is still suppressed (logged $($rtOut['limiterFull'].first) then $($rtOut['limiterFull'].afterRepeat) after repeats of the first and of the 257th root): the limiter remembers every root for its whole minute (pass 5 A7: no cap)"
+        $dlo = $rtOut['deadline']
+        Assert-True ($dlo.slowTick -ceq '1') "cim-walk-root-start: (A1) the opening tick took 2.2 s of a 3 s deadline: the snapshot is bounded by what is left THEN (1 s), not by the 3 s worked out before the tick: got [$($dlo.slowTick)]"
+        Assert-True ($dlo.pastDeadlineQueries -eq 0 -and $dlo.pastDeadlineWhy -match 'deadline') "cim-walk-root-start: (A1) a deadline that passed during the opening tick means no snapshot is read (queries=$($dlo.pastDeadlineQueries) why=[$($dlo.pastDeadlineWhy)])"
+        Assert-True ($dlo.far -ceq '30' -and $dlo.near -ceq '7') "cim-walk-root-start: (A1) a deadline 100 s away gives the 30 s ceiling, one 6.5 s away gives 7 (far=[$($dlo.far)] near=[$($dlo.near)])"
+        # (f) the AST: every call of the walk passes the root's recorded start; the monitor loop's call passes the time left to its deadline; the
+        # normal-exit branch's incomplete census goes to the job's err file.
+        $rtCalls = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-DescendantProcessIdentities' }, $true))
+        $rtHasParam = { param($Cmd, [string]$Name) @($Cmd.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq $Name }).Count -eq 1 }
+        Assert-True ($rtCalls.Count -eq 4 -and @($rtCalls | Where-Object { & $rtHasParam $_ 'RootStartEpochMs' }).Count -eq 4) "cim-walk-root-start: all 4 callers of the walk (Stop-ProcessTree, the lease owner check, the monitor loop, the normal-exit census) pass -RootStartEpochMs (calls=$($rtCalls.Count))"
+        $rtQj = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-QueuedJob' }, $true)
+        $rtLoop = $rtQj.Find({ param($n) $n -is [System.Management.Automation.Language.WhileStatementAst] -and $n.Condition.Extent.Text -match '\$jobProcess\.HasExited' }, $true)
+        $rtLoopCalls = @($rtLoop.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-DescendantProcessIdentities' }, $true))
+        # r4 (pass 4 A1): the loop hands the walk its DEADLINE (the walk works the time left out when its snapshot starts); a figure computed in the loop
+        # before the opening tick (the r3 $walkLeftSec) goes stale during that tick, so none may remain.
+        $rtDeadlineArg = $null
+        if ($rtLoopCalls.Count -eq 1) { $els = @($rtLoopCalls[0].CommandElements); for ($i = 0; $i -lt $els.Count; $i++) { if ($els[$i] -is [System.Management.Automation.Language.CommandParameterAst] -and $els[$i].ParameterName -eq 'Deadline' -and $i + 1 -lt $els.Count) { $rtDeadlineArg = $els[$i + 1] } } }
+        $rtStale = @($rtLoop.Body.FindAll({ param($n) ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -ceq '$walkLeftSec') -or ($n -is [System.Management.Automation.Language.CommandParameterAst] -and $n.ParameterName -eq 'TimeoutSec') }, $true))
+        Assert-True ($rtLoopCalls.Count -eq 1 -and $rtDeadlineArg -is [System.Management.Automation.Language.VariableExpressionAst] -and $rtDeadlineArg.VariablePath.UserPath -ceq 'deadline' -and $rtStale.Count -eq 0) "cim-walk-root-start: (A1) the monitor loop passes the job's `$deadline as the walk's -Deadline and no pre-computed -TimeoutSec/`$walkLeftSec remains (loop calls=$($rtLoopCalls.Count) stale=$($rtStale.Count))"
+        $rtErrPipes = @($rtQj.FindAll({ param($n) $n -is [System.Management.Automation.Language.PipelineAst] -and @($n.PipelineElements).Count -eq 2 -and $n.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst] -and $n.PipelineElements[0].Expression -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -and $n.PipelineElements[0].Expression.Value.Contains('post-exit descendant census') -and $n.PipelineElements[1] -is [System.Management.Automation.Language.CommandAst] -and $n.PipelineElements[1].GetCommandName() -eq 'Add-Content' -and $n.PipelineElements[1].Extent.Text.Contains('$errFile') }, $true))
+        Assert-True ($rtErrPipes.Count -eq 2) "cim-walk-root-start: (A1) the normal-exit census writes an incomplete result and the skipped rows into the job's err file (pipes=$($rtErrPipes.Count))"
+        # r4 (pass 4 A4): the census line says what was TARGETED; "stopped" would be a claim the stop may not have earned (access denied).
+        Assert-True (@($rtErrPipes | Where-Object { $_.PipelineElements[0].Expression.Value -match 'were stopped' }).Count -eq 0 -and @($rtErrPipes | Where-Object { $_.PipelineElements[0].Expression.Value -match 'were targeted for stop' }).Count -ge 1) "cim-walk-root-start: (A4) the post-exit census line says the descendants were TARGETED for stop and never claims they were stopped"
+        # r4 (pass 4 A5): every line the job monitor appends to the err file comes AFTER the output capture is drained (the async copies write the same
+        # file from offset 0 and overwrite an earlier append): some statement before it, in it or an enclosing block, calls Complete-WindowlessRedirectedProcess.
+        $rtAllErrPipes = @($rtQj.FindAll({ param($n) $n -is [System.Management.Automation.Language.PipelineAst] -and @($n.PipelineElements).Count -eq 2 -and $n.PipelineElements[1] -is [System.Management.Automation.Language.CommandAst] -and $n.PipelineElements[1].GetCommandName() -eq 'Add-Content' -and $n.PipelineElements[1].Extent.Text.Contains('$errFile') }, $true))
+        $rtUndrained = @($rtAllErrPipes | Where-Object {
+            $pipe = $_; $ok = $false; $cur = $pipe.Parent
+            while ($null -ne $cur -and -not $ok) {
+                if ($cur -is [System.Management.Automation.Language.StatementBlockAst] -or $cur -is [System.Management.Automation.Language.NamedBlockAst]) {
+                    # a real command in the AST (a comment naming the function does not count)
+                    foreach ($st in @($cur.Statements)) { if ($st.Extent.EndOffset -le $pipe.Extent.StartOffset -and @($st.FindAll({ param($c) $c -is [System.Management.Automation.Language.CommandAst] -and $c.GetCommandName() -eq 'Complete-WindowlessRedirectedProcess' }, $true)).Count -gt 0) { $ok = $true } }
+                }
+                $cur = $cur.Parent
+            }
+            -not $ok
+        })
+        Assert-True ($rtAllErrPipes.Count -ge 7 -and $rtUndrained.Count -eq 0) "cim-walk-root-start: (A5) all $($rtAllErrPipes.Count) err-file appends of Invoke-QueuedJob (cancel, lease stop, timeout, stage ceiling, the two post-exit census lines, the monitor failure) come after the output capture is drained (undrained=$($rtUndrained.Count))"
+        $drOut = & {
+            . ([scriptblock]::Create((Get-FunctionBody 'Complete-WindowlessRedirectedProcess')))
+            $drPath = Join-Path $fx 'cim-walk-drain.txt'
+            $drErr = [System.IO.File]::Open($drPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+            $drOutS = [System.IO.MemoryStream]::new()
+            $drLaunch = [pscustomobject]@{ OutCopy = [System.Threading.Tasks.Task]::CompletedTask; ErrCopy = [System.Threading.Tasks.Task]::CompletedTask; OutStream = $drOutS; ErrStream = $drErr }
+            $e1 = $null; $e2 = $null
+            try { Complete-WindowlessRedirectedProcess -Launch $drLaunch } catch { $e1 = $_.Exception.Message }
+            try { Complete-WindowlessRedirectedProcess -Launch $drLaunch } catch { $e2 = $_.Exception.Message }
+            'late-diagnostic' | Add-Content -Encoding ASCII $drPath
+            [pscustomobject]@{ first = $e1; second = $e2; drained = $drLaunch.Drained; text = ((Get-Content -LiteralPath $drPath -Raw) -replace '\s+$', '') }
+        }
+        # r4 (pass 5 A6): a copy that FAULTED still propagates (as it did before), both capture streams are disposed, a second call is a no-op, and every
+        # drain call of Invoke-QueuedJob sits inside a try that has a catch, so the failure is written into the job's stderr and never escapes past the receipt.
+        $fdOut = & {
+            . ([scriptblock]::Create((Get-FunctionBody 'Complete-WindowlessRedirectedProcess')))
+            $fdErr = [System.IO.File]::Open((Join-Path $fx 'cim-walk-drain-fault-err.txt'), [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+            $fdOutS = [System.IO.File]::Open((Join-Path $fx 'cim-walk-drain-fault-out.txt'), [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+            $fdLaunch = [pscustomobject]@{ OutCopy = [System.Threading.Tasks.Task]::CompletedTask; ErrCopy = [System.Threading.Tasks.Task]::FromException([System.IO.IOException]::new('stderr copy broke')); OutStream = $fdOutS; ErrStream = $fdErr }
+            $f1 = $null; $f2 = $null
+            try { Complete-WindowlessRedirectedProcess -Launch $fdLaunch } catch { $f1 = $_.Exception.Message }
+            try { Complete-WindowlessRedirectedProcess -Launch $fdLaunch } catch { $f2 = $_.Exception.Message }
+            [pscustomobject]@{ first = $f1; second = $f2; outClosed = (-not $fdOutS.CanWrite); errClosed = (-not $fdErr.CanWrite) }
+        }
+        Assert-True ($fdOut.first -match 'stderr copy broke' -and $null -eq $fdOut.second -and $fdOut.outClosed -and $fdOut.errClosed) "cim-walk-root-start: (A6) a faulted stderr copy propagates once, both capture streams are closed, and the second drain is a no-op: $($fdOut | ConvertTo-Json -Compress)"
+        $rtDrains = @($rtQj.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Complete-WindowlessRedirectedProcess' }, $true))
+        $rtUncaught = @($rtDrains | Where-Object {
+            $dn = $_; $caught = $false; $cur = $dn.Parent
+            while ($null -ne $cur -and -not $caught) {
+                if ($cur -is [System.Management.Automation.Language.TryStatementAst] -and @($cur.CatchClauses).Count -ge 1 -and $dn.Extent.StartOffset -ge $cur.Body.Extent.StartOffset -and $dn.Extent.EndOffset -le $cur.Body.Extent.EndOffset) { $caught = $true }
+                $cur = $cur.Parent
+            }
+            -not $caught
+        })
+        Assert-True ($rtDrains.Count -ge 5 -and $rtUncaught.Count -eq 0) "cim-walk-root-start: (A6) all $($rtDrains.Count) drain calls of Invoke-QueuedJob (cancel, lease stop, normal exit, timeout, the finally) are inside a try with a catch (uncaught=$($rtUncaught.Count)); the failure is written into the job's stderr"
+        # r4 (pass 5 A8): the job's log files are always addressed with -LiteralPath (a job id with [ ] must not wildcard-match another job's log).
+        $rtPathCmds = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and @('Add-Content', 'Get-Content', 'Test-Path') -contains $n.GetCommandName() -and $n.Extent.Text -match '\$(\w+\.)?(err|out)File\b' }, $true))
+        $rtNoLit = @($rtPathCmds | Where-Object { -not (& $rtHasParam $_ 'LiteralPath') })
+        Assert-True ($rtPathCmds.Count -ge 10 -and $rtNoLit.Count -eq 0) "cim-walk-root-start: (A8) every Add-Content / Get-Content / Test-Path of a job's out or err file in the agent uses -LiteralPath (commands=$($rtPathCmds.Count) positional=$($rtNoLit.Count))"
+        # r4 (pass 5 A3): a descendant the walk found is stopped only if its exact start string still matches (the 2 s epoch tolerance is not a same-process test).
+        $exOut = & {
+            . ([scriptblock]::Create((Get-FunctionBody 'Stop-VerifiedProcessIdentities')))
+            $script:ExStopped = [System.Collections.Generic.List[int]]::new()
+            $script:ExNow = $null
+            function Get-ProcessIdentity { param([int]$ProcessId) $script:ExNow }
+            function Stop-Process { [CmdletBinding()] param([int]$Id, [switch]$Force) $script:ExStopped.Add($Id) }
+            $startA = [datetime]::new(2026, 11, 20, 12, 0, 10, [DateTimeKind]::Utc)
+            $mkId = { param($t) [pscustomobject]@{ exists = $true; processId = 4501; startUtc = $t.ToString('o'); startEpochMs = [DateTimeOffset]::new($t).ToUnixTimeMilliseconds(); imagePath = 'C:\Tools\worker.exe' } }
+            $idA = & $mkId $startA
+            $script:ExNow = & $mkId $startA.AddMilliseconds(1500)   # a replacement at the same pid and image, created 1.5 s later
+            $k1 = @(Stop-VerifiedProcessIdentities -Identities @($idA))
+            $script:ExNow = $idA
+            $k2 = @(Stop-VerifiedProcessIdentities -Identities @($idA))
+            [pscustomobject]@{ replacementStopped = ($k1.Count -gt 0); sameStopped = ($k2.Count -eq 1 -and $k2[0] -eq 4501); stopCalls = $script:ExStopped.Count }
+        }
+        Assert-True ($exOut.replacementStopped -eq $false -and $exOut.sameStopped -eq $true -and $exOut.stopCalls -eq 1) "cim-walk-root-start: (A3, pass 5) a replacement process at the same pid and image created 1.5 s after the snapshot row is NOT stopped; the same process is: $($exOut | ConvertTo-Json -Compress)"
+        $rtMatchCalls = @(@('Stop-ProcessTree', 'Stop-VerifiedProcessIdentities') | ForEach-Object { $fnName = $_; $fa = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fnName }, $true); @($fa.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Test-ProcessIdentityMatch' }, $true)) })
+        Assert-True ($rtMatchCalls.Count -eq 3 -and @($rtMatchCalls | Where-Object { & $rtHasParam $_ 'RequireExactStart' }).Count -eq 2) "cim-walk-root-start: (A3, pass 5) the two descendant stop loops (Stop-ProcessTree's per-identity loop and Stop-VerifiedProcessIdentities) pass -RequireExactStart; the root's own check keeps its tolerance (calls=$($rtMatchCalls.Count))"
+        Assert-True ($null -eq $drOut.first -and $null -eq $drOut.second -and $drOut.drained -eq $true -and $drOut.text -ceq 'late-diagnostic') "cim-walk-root-start: (A5) Complete-WindowlessRedirectedProcess can be called twice (the monitor drains early, the finally drains again) without an error, and a line appended after the drain is kept: $($drOut | ConvertTo-Json -Compress)"
+        $results.cimWalkRootStart = $rtOut
+    }
+    # The same comparison on a LIVE tree (real Get-CimInstance, real processes): cmd.exe -> cmd.exe -> ping.exe. The legacy walk is reproduced
+    # here; the agent's walk must return the same set of (processId, startUtc, imagePath). Retried (3 times) against a helper process (conhost.exe)
+    # appearing between the two walks; the tree is stopped afterwards.
+    if (Test-Case 'cim-walk-live-parity') {
+        $lvOut = & {
+            function Get-LegacyDescendants {
+                param([int]$ParentProcessId)
+                $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$ParentProcessId" -ErrorAction SilentlyContinue)
+                foreach ($child in $children) {
+                    $childProcessId = [int]$child.ProcessId
+                    Get-LegacyDescendants -ParentProcessId $childProcessId
+                    Get-ProcessIdentity -ProcessId $childProcessId
+                }
+            }
+            $cmdExe = Join-Path $env:SystemRoot 'System32\cmd.exe'
+            $psiL = [Diagnostics.ProcessStartInfo]::new($cmdExe)
+            # r2 (sol 3): both cmd.exe lines of the tree name a path under the fixture dir (an echo to nul; the inner one is escaped with ^& so the
+            # outer cmd passes it on), the marker the suite's own leak census counts: a tree that outlives the case is a FIXTURE-LEAK, never invisible.
+            $lvMark = Join-Path $fx 'cim-walk-live-parity'
+            # adversary pass 2 A5: the marker goes into the cmd line only when it is a plain drive path (the census reads nothing else as a match anyway);
+            # a temp dir holding & ^ % ( ) or a space would otherwise change what cmd runs.
+            $lvPlain = ($lvMark -cmatch '^[A-Za-z]:(\\[A-Za-z0-9_.\-~]+)+$')
+            $lvCmd = if ($lvPlain) { "echo $lvMark >nul & cmd.exe /c echo $lvMark >nul ^& ping.exe -n 120 127.0.0.1 >nul" } else { 'cmd.exe /c ping.exe -n 120 127.0.0.1 >nul' }
+            foreach ($a in @('/c', $lvCmd)) { [void]$psiL.ArgumentList.Add($a) }
+            $psiL.UseShellExecute = $false; $psiL.CreateNoWindow = $true
+            $root = Register-OwnedChild ([Diagnostics.Process]::Start($psiL))   # owned: the suite's own sweep ends it if this case dies early
+            $attempts = 0; $legacyKeys = @(); $newKeys = @(); $same = $false; $marked = $false
+            try {
+                for ($attempts = 1; $attempts -le 3 -and -not $same; $attempts++) {
+                    $deadline = [DateTime]::UtcNow.AddSeconds(20)
+                    do { $legacy = @(Get-LegacyDescendants -ParentProcessId $root.Id); if (@($legacy | Where-Object { $_.exists -and $_.imagePath -match 'ping\.exe$' }).Count -ge 1) { break }; Start-Sleep -Milliseconds 300 } while ([DateTime]::UtcNow -lt $deadline)
+                    $new = @(Get-DescendantProcessIdentities -ParentProcessId $root.Id)
+                    $legacy = @(Get-LegacyDescendants -ParentProcessId $root.Id)
+                    $legacyKeys = @($legacy | Where-Object { $_.exists } | ForEach-Object { "$($_.processId)|$($_.startUtc)|$($_.imagePath)" } | Sort-Object)
+                    $newKeys = @($new | Where-Object { $_.exists } | ForEach-Object { "$($_.processId)|$($_.startUtc)|$($_.imagePath)" } | Sort-Object)
+                    # r2 (sol hardening): parity counts only when the expected chain is in BOTH sets (an inner cmd.exe and the ping.exe under it), not any equal non-empty pair.
+                    $chain = (@($newKeys | Where-Object { $_ -match 'cmd\.exe$' }).Count -ge 1 -and @($newKeys | Where-Object { $_ -match 'ping\.exe$' }).Count -ge 1)
+                    $same = ($chain -and ($legacyKeys -join "`n") -ceq ($newKeys -join "`n"))
+                    $marked = ($same -and (-not $lvPlain -or @($new | Where-Object { $_.exists -and $_.imagePath -match 'cmd\.exe$' -and ([string]$_.commandLine).Contains($lvMark) }).Count -ge 1))
+                }
+            }
+            finally {
+                # r2 (sol 3, fable H3): stop ONLY the tree this case started, through the Process object it holds (Kill($true) ends the root and the
+                # processes below it); never a bare pid from a fresh walk (a pid reused after the walk would be a stranger).
+                try { $root.Kill($true) } catch { try { $root.Kill() } catch { } }
+                try { [void]$root.WaitForExit(10000) } catch { }
+            }
+            [pscustomobject]@{ same = $same; marked = $marked; attempts = ($attempts - 1); legacyKeys = $legacyKeys; newKeys = $newKeys }
+        }
+        Assert-True ($lvOut.same) "cim-walk-live-parity: the walk returns the same (processId, startUtc, imagePath) set as the legacy per-node walk on a live cmd -> cmd -> ping tree (the chain must contain the inner cmd.exe and ping.exe): $($lvOut | ConvertTo-Json -Depth 4 -Compress)"
+        Assert-True ($lvOut.marked) "cim-walk-live-parity: the fixture's inner cmd.exe carries the fixture-path marker the outer leak census counts: $($lvOut | ConvertTo-Json -Depth 4 -Compress)"
+        $results.cimWalkLiveParity = $lvOut
     }
     # BACHELOR-LEASE-RENEW-MARGIN-1 r1, adversary pass 1 on 41ffc7fa (both introduced, major): the agent's successful-renew gap must not read
     # shorter than heavy-slot.py's on these inputs (r4: a wall step reverted between two agent samples is the one it can miss, the pinned known
@@ -5975,7 +6636,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 function Get-AgentMonotonicSec { return $script:RcMono }
                 function Step-RcClock([double]$Sec) { $script:RcNowUtc = $script:RcNowUtc.AddSeconds($Sec); $script:RcMono += $Sec }
                 function Get-CimInstance {
-                    [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter)
+                    [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter, [string[]]$Property, [uint32]$OperationTimeoutSec)   # AGENT-JOB-MONITOR-CIM-WALK-1: the walk's snapshot passes -Property and (r2) -OperationTimeoutSec
                     Step-RcClock $script:RcQuery
                     $script:RcNowUtc = $script:RcNowUtc.AddSeconds($script:RcWallStep); $script:RcWallStep = 0
                     return @()
