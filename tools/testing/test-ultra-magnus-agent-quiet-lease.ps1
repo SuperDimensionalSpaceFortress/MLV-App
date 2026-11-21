@@ -6235,6 +6235,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         $rtOut = & {
             $script:RtTimeouts = [System.Collections.Generic.List[int]]::new()
             $script:RtFail = $null
+            $script:RtRootSeq = $null; $script:RtRootSeqPid = 0; $script:RtRootCalls = 0   # r5 (pass 7 A2): see the mock's root-row sequence
             $script:RtFilterThenThrow = $false   # r5 (variant coverage, pass 5 A5): the per-parent read THROWS after its rows (the other shape of "throws or raises Write-Error")
             $script:RtFailEmpty = $false; $script:RtFilterRows = $false; $script:RtFilterThenFail = $false; $script:RtFullRows = $null; $script:RtFilterDelayMs = 0; $script:RtFullDelayMs = 0
             $script:RtTable = @()
@@ -6248,6 +6249,15 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 # fails at once, with no rows, when RtFailEmpty is set.
                 if ($PSBoundParameters.ContainsKey('Filter')) {
                     if ($script:RtFilterDelayMs -gt 0) { Start-Sleep -Milliseconds $script:RtFilterDelayMs }
+                    # r5 (pass 7 A2): the root's row can answer differently on each read: $script:RtRootSeq[i] is the answer of the i-th ProcessId=<RtRootSeqPid> read
+                    # (a row, $null for no row, or 'FAIL' for a provider error); the last element repeats.
+                    if ($null -ne $script:RtRootSeq -and $Filter -eq "ProcessId=$($script:RtRootSeqPid)") {
+                        $seqIdx = [Math]::Min($script:RtRootCalls, @($script:RtRootSeq).Count - 1); $script:RtRootCalls++
+                        $seqAns = @($script:RtRootSeq)[$seqIdx]
+                        if ($seqAns -is [string] -and $seqAns -eq 'FAIL') { Write-Error 'root re-read failed'; return }
+                        if ($null -ne $seqAns) { $seqAns }
+                        return
+                    }
                     if ($script:RtFilterRows) {
                         $mine = if ($Filter -match '^ParentProcessId=(\d+)$') { $fp = [int]$Matches[1]; @($rows | Where-Object { [int]$_.ParentProcessId -eq $fp }) } elseif ($Filter -match '^ProcessId=(\d+)$') { $fp = [int]$Matches[1]; @($rows | Where-Object { [int]$_.ProcessId -eq $fp }) } else { @() }
                         $mine | ForEach-Object { $_ }
@@ -6392,6 +6402,48 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $ownB = Test-QuietLeaseOwnerPid -Lease $ownerLeaseB -OwnerPid 7211
             $o['ownerFallback'] = [pscustomobject]@{ ok = $ownA.ok; why = [string]$ownA.why }
             $o['ownerG6'] = [pscustomobject]@{ ok = $ownB.ok; why = [string]$ownB.why }
+            # r5 (adversary pass 7). A4: the deadline is 1.2 s away and the failed full read took 1.5 s (inside the whole-second budget of 2 s): no supplemental read
+            # starts, on the partial route (root row) and on the fallback route.
+            $o['p7DeadlinePartial'] = & $g6Run @((New-RtProc 4700 1 40), (New-RtProc 4701 4700 41)) @((New-RtProc 4701 4700 41)) $true 4700 ((Get-Date).AddSeconds(1.2)) 1500
+            $script:RtTable = @((New-RtProc 4710 1 0), (New-RtProc 4711 4710 3))
+            $script:RtFailEmpty = $true; $script:RtFilterRows = $true; $script:RtFail = $null; $script:RtFullRows = $null; $script:RtFullDelayMs = 1500
+            $script:RtTimeouts.Clear(); $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null
+            $p7w = @(Get-DescendantProcessIdentities -ParentProcessId 4710 -RootStartEpochMs $rootMs -Deadline ((Get-Date).AddSeconds(1.2)))
+            $o['p7DeadlineFallback'] = [pscustomobject]@{ ids = (& $ids $p7w); queries = $script:RtTimeouts.Count }
+            $script:RtFullDelayMs = 0
+            # A2: the fallback reads the root row, then the children, then the root row ONCE MORE: a root that exited and whose pid was reused in between is seen.
+            $p7Run = {
+                param($RootSeq, $ChildRows, [int]$RootPid)
+                $script:RtTable = @($ChildRows); $script:RtFailEmpty = $true; $script:RtFilterRows = $true; $script:RtFail = $null; $script:RtFullRows = $null
+                $script:RtRootSeq = @($RootSeq); $script:RtRootSeqPid = $RootPid; $script:RtRootCalls = 0
+                $script:RtTimeouts.Clear(); $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null; $script:DescendantWalkStaleLogged = $null
+                $p7r = @(Get-DescendantProcessIdentities -ParentProcessId $RootPid -RootStartEpochMs $rootMs)
+                $p7rec = $script:LastDescendantWalk
+                $script:RtRootSeq = $null
+                [pscustomobject]@{ ids = (& $ids $p7r); ok = $p7rec.ok; partial = $p7rec.partial; why = [string]$p7rec.why; rootReads = $script:RtRootCalls
+                    reuseLines = @($script:Log | Where-Object { $_ -match "root pid=$RootPid was reused" }).Count }
+            }
+            $o['p7Reused'] = & $p7Run @((New-RtProc 7300 1 0), (New-RtProc 7300 1 40)) @((New-RtProc 7301 7300 41)) 7300
+            $o['p7SameRoot'] = & $p7Run @((New-RtProc 7310 1 0)) @((New-RtProc 7311 7310 3)) 7310
+            $o['p7RecheckFail'] = & $p7Run @((New-RtProc 7320 1 0), 'FAIL') @((New-RtProc 7321 7320 41)) 7320
+            # A3: a descendant row with no readable creation time proves no start: it reads as not existing; the exact-start check refuses an empty expected start.
+            $p7Kid = New-RtProc 4721 4720 3; $p7Kid.CreationDate = $null
+            $script:RtTable = @((New-RtProc 4720 1 0), $p7Kid)
+            $script:RtFailEmpty = $false; $script:RtFilterRows = $false; $script:RtFail = $null; $script:RtFullRows = $null; $script:DescendantWalkFailLogTs = $null
+            $p7k = @(Get-DescendantProcessIdentities -ParentProcessId 4720 -RootStartEpochMs $rootMs)
+            $o['p7NullStartKid'] = [pscustomobject]@{ total = $p7k.Count; existing = @($p7k | Where-Object { $_.exists }).Count }
+            $script:RtTable = @((New-RtProc 4730 99 15)); $script:RtFilterRows = $true
+            $p7ms = [DateTimeOffset]::new($rtBase.AddSeconds(15)).ToUnixTimeMilliseconds()
+            $p7Tol = Test-ProcessIdentityMatch -ProcessId 4730 -ExpectedStartEpochMs $p7ms
+            $p7Ex = Test-ProcessIdentityMatch -ProcessId 4730 -ExpectedStartEpochMs $p7ms -RequireExactStart
+            $o['p7ExactEmpty'] = [pscustomobject]@{ tolerant = $p7Tol.matches; exactNoStart = $p7Ex.matches }
+            # A8: the full read returned ONE unrelated row and failed; the fallback's own first read failed too: FAILED (not partial), and the reason names that read.
+            $script:RtTable = @(); $script:RtFailEmpty = $false; $script:RtFail = 'full RPC failure'; $script:RtFullRows = @((New-RtProc 7999 1 -100)); $script:RtFilterRows = $false
+            $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null
+            $p7f = @(Get-DescendantProcessIdentities -ParentProcessId 7600 -RootStartEpochMs $rootMs)
+            $p7fr = $script:LastDescendantWalk
+            $o['p7FallbackRootFail'] = [pscustomobject]@{ ids = (& $ids $p7f); ok = $p7fr.ok; partial = $p7fr.partial; why = [string]$p7fr.why; logs = @($script:Log | Where-Object { $_ -match '^descendant-walk: snapshot' }) }
+            $script:RtRootSeq = $null
             # the state the cases below were written against (full read fails empty, filtered reads answer)
             $script:RtFailEmpty = $true; $script:RtFilterRows = $true; $script:RtFail = $null; $script:RtFullRows = $null; $script:RtFilterThenFail = $false; $script:RtFullDelayMs = 0; $script:RtFilterDelayMs = 0
             # r4 (pass 5 A4): the full read emits ONE UNRELATED row and then fails; the fallback still runs and finds the child.
@@ -6459,7 +6511,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         # r4 (adversary pass 4): A2, A3, A9, A1 on the real walk.
         Assert-True ($rtOut['reusedNear'].ids -eq '' -and $rtOut['reusedNear'].reuseLines -eq 1) "cim-walk-root-start: (A2) a process that took the root's pid 1.5 s after the recorded start (inside the identity checks' 2 s tolerance) is a reuser: its child 4501 is NOT walked and the reuse is named once: $rtTxt"
         $fb = $rtOut['fallback']
-        Assert-True ($fb.ids -eq '7102,7101' -and $fb.ok -eq $false -and $fb.partial -eq $true -and $fb.rows -eq 3 -and $fb.queries -eq 5 -and @($fb.logs).Count -eq 1 -and @($fb.logs)[0] -match 'fell back' -and @($fb.logs)[0] -match 'pid=7100') "cim-walk-root-start: (A3) the full-table read failed with no rows but the per-parent reads answer: the children 7101 and 7102 are found (1 full + the root's row + 3 per-parent queries... = 5), recorded PARTIAL with the 3 rows read, one log line says it fell back: $rtTxt"
+        Assert-True ($fb.ids -eq '7102,7101' -and $fb.ok -eq $false -and $fb.partial -eq $true -and $fb.rows -eq 4 -and $fb.queries -eq 6 -and @($fb.logs).Count -eq 1 -and @($fb.logs)[0] -match 'fell back' -and @($fb.logs)[0] -match 'pid=7100') "cim-walk-root-start: (A3) the full-table read failed with no rows but the per-parent reads answer: the children 7101 and 7102 are found (1 full + the root's row + 3 per-parent queries... = 5), recorded PARTIAL with the 3 rows read, one log line says it fell back: $rtTxt"
         Assert-True ($rtOut['fallbackReused'].ids -eq '' -and $rtOut['fallbackReused'].reuseLines -eq 1) "cim-walk-root-start: (A2, pass 5) the fallback reads the root's own row: a replacement root (created 40 s after the recorded start) is a reuser and its child 4501 is not walked: $rtTxt"
         # r5 (Grok G6): a failed read holding the root's CHILDREN but not the root's own row reads that row once (no per-parent fallback), then decides.
         $g6a = $rtOut['g6Reused']
@@ -6480,7 +6532,20 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True ($g6f.ids -eq '' -and $g6f.ok -eq $false -and $g6f.partial -eq $false -and $g6f.why.Contains('the root row has no readable start') -and $g6f.why.Contains('children not walked') -and $g6f.queries -eq 2) "cim-walk-root-start: (pass 6 A1 variant f) the root-row read returns the root with no readable start: the replacement root's child is NOT emitted and the walk record says the root is unverifiable: $rtTxt"
         $g6g = $rtOut['g6NullStartComplete']
         Assert-True ($g6g.ids -eq '' -and $g6g.ok -eq $false -and $g6g.why.Contains('the root row has no readable start') -and $g6g.queries -eq 1) "cim-walk-root-start: (pass 6 A1 variant g) a COMPLETE read whose root row has no readable start is unverifiable too (the recorded start must not stand in for it): $rtTxt"
-        Assert-True ($rtOut['ownerFallback'].ok -eq $true)"cim-walk-root-start: (variant, pass 5 A4 second shape) the lease owner check, with the full read failed and the per-parent reads answering, still accepts the wrapper's live child: $rtTxt"
+        # r5 (adversary pass 7)
+        Assert-True ($rtOut['p7DeadlinePartial'].ids -eq '' -and $rtOut['p7DeadlinePartial'].queries -eq 1 -and $rtOut['p7DeadlinePartial'].why.Contains('no budget left')) "cim-walk-root-start: (pass 7 A4, root-row route) the deadline is 1.2 s away and the failed full read took 1.5 s (inside the whole-second budget): NO root-row read starts after the deadline (queries=$($rtOut['p7DeadlinePartial'].queries)): $rtTxt"
+        Assert-True ($rtOut['p7DeadlineFallback'].ids -eq '' -and $rtOut['p7DeadlineFallback'].queries -eq 1) "cim-walk-root-start: (pass 7 A4, fallback route) the same deadline: NO per-parent fallback read starts after it (queries=$($rtOut['p7DeadlineFallback'].queries)): $rtTxt"
+        $p7a = $rtOut['p7Reused']
+        Assert-True ($p7a.ids -eq '' -and $p7a.reuseLines -eq 1 -and $p7a.rootReads -eq 2) "cim-walk-root-start: (pass 7 A2) the fallback re-reads the root row after the children: the root that exited and whose pid was reused between the reads is a reuser, its child is NOT walked (rootReads=$($p7a.rootReads)): $rtTxt"
+        $p7b = $rtOut['p7SameRoot']
+        Assert-True ($p7b.ids -eq '7311' -and $p7b.reuseLines -eq 0 -and $p7b.rootReads -eq 2) "cim-walk-root-start: (pass 7 A2) control: the root row is the same on both reads: the child is walked: $rtTxt"
+        $p7c = $rtOut['p7RecheckFail']
+        Assert-True ($p7c.ids -eq '' -and $p7c.ok -eq $false -and $p7c.partial -eq $false -and $p7c.why.Contains('the root row re-read failed') -and $p7c.why.Contains('children not walked')) "cim-walk-root-start: (pass 7 A2) the root-row re-read fails: the root is unverifiable and nothing is emitted: $rtTxt"
+        Assert-True ($rtOut['p7NullStartKid'].total -eq 1 -and $rtOut['p7NullStartKid'].existing -eq 0) "cim-walk-root-start: (pass 7 A3) a descendant row with no readable creation time reads as NOT existing (no identity that proves nothing is emitted): $rtTxt"
+        Assert-True ($rtOut['p7ExactEmpty'].tolerant -eq $true -and $rtOut['p7ExactEmpty'].exactNoStart -eq $false) "cim-walk-root-start: (pass 7 A3) -RequireExactStart with no expected start string does not match (two empty starts are not the same process), while the tolerant check still matches: $rtTxt"
+        $p7d = $rtOut['p7FallbackRootFail']
+        Assert-True ($p7d.ids -eq '' -and $p7d.ok -eq $false -and $p7d.partial -eq $false -and $p7d.why.Contains('the filtered read it fell back to failed') -and $p7d.why.Contains('filtered read unavailable') -and @($p7d.logs).Count -eq 1 -and @($p7d.logs)[0] -match 'snapshot failed' -and @($p7d.logs)[0] -notmatch 'fell back to are walked') "cim-walk-root-start: (pass 7 A8) one unrelated row from the failed full read is not fallback output: the walk is FAILED (not partial), the reason names the fallback's own failed read, and the log line does not claim the per-parent reads were walked: $rtTxt"
+        Assert-True ($rtOut['ownerFallback'].ok -eq $true) "cim-walk-root-start: (variant, pass 5 A4 second shape) the lease owner check, with the full read failed and the per-parent reads answering, still accepts the wrapper's live child: $rtTxt"
         Assert-True ($rtOut['ownerG6'].ok -eq $false) "cim-walk-root-start: (variant, G6) the lease owner check refuses a child of a REUSED wrapper pid when the failed read lacked the wrapper's row: $rtTxt"
         $frt = $rtOut['fallbackRowsThenThrow']
         Assert-True ($frt.ids -eq '7101' -and $frt.rows -eq 2 -and $frt.partial -eq $true -and $frt.ok -eq $false) "cim-walk-root-start: (variant, pass 5 A5 second shape) a per-parent read that returns the child and then THROWS keeps the child and records PARTIAL: $rtTxt"
@@ -6583,13 +6648,32 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 censusLost = @(Get-LostJobDiagnostics -Stderr 'job output' -CaptureDrainFailure $null -PostExitWalk $ldBad)
                 censusKept = @(Get-LostJobDiagnostics -Stderr 'post-exit descendant census PARTIAL (RPC error): ...' -CaptureDrainFailure $null -PostExitWalk $ldBad).Count
                 nullStderr = @(Get-LostJobDiagnostics -Stderr $null -CaptureDrainFailure 'c' -PostExitWalk $null).Count
+                # pass 7 A6: a child's own similar text is not the agent's line; a refused SKIPPED line is restored on its own
+                childPhrase = @(Get-LostJobDiagnostics -Stderr "child: post-exit descendant census retry queued`nchild: output capture failed: application cache only`n" -CaptureDrainFailure 'disk I/O fault' -PostExitWalk ([pscustomobject]@{ ok = $false; partial = $true; why = 'RPC unavailable'; skipped = @() }))
+                skippedLost = @(Get-LostJobDiagnostics -Stderr "post-exit descendant census PARTIAL (RPC unavailable): only the descendants found in the 3 process rows it returned`n" -CaptureDrainFailure $null -PostExitWalk ([pscustomobject]@{ ok = $false; partial = $true; why = 'RPC unavailable'; skipped = @(7501) }))
             }
         }
-        Assert-True ($ldOut.none -eq 0 -and $ldOut.capLost.Count -eq 1 -and $ldOut.capLost[0].Contains('output capture failed: capture failed') -and $ldOut.capLost[0].Contains('could not be written') -and $ldOut.capKept -eq 0 -and $ldOut.censusLost.Count -eq 1 -and $ldOut.censusLost[0].Contains('PARTIAL (RPC error)') -and $ldOut.censusKept -eq 0 -and $ldOut.nullStderr -eq 1) "cim-walk-root-start: (pass 6 A2) Get-LostJobDiagnostics returns exactly the diagnostics missing from the stderr the receipt read back (a refused capture-failure or census line), and nothing for ones that are there: $($ldOut | ConvertTo-Json -Compress -Depth 4)"
+        Assert-True ($ldOut.none -eq 0 -and $ldOut.capLost.Count -eq 1 -and $ldOut.capLost[0].Contains('output capture failed: capture failed') -and $ldOut.capLost[0].Contains('could not be written') -and $ldOut.capKept -eq 0 -and $ldOut.censusLost.Count -eq 1 -and $ldOut.censusLost[0].Contains('PARTIAL (RPC error)') -and $ldOut.censusKept -eq 0 -and $ldOut.nullStderr -eq 1 -and $ldOut.childPhrase.Count -eq 2 -and $ldOut.childPhrase[0].Contains('disk I/O fault') -and $ldOut.childPhrase[1].Contains('RPC unavailable') -and $ldOut.skippedLost.Count -eq 1 -and $ldOut.skippedLost[0].Contains('SKIPPED pids=7501')) "cim-walk-root-start: (pass 6 A2, pass 7 A6) Get-LostJobDiagnostics returns exactly the diagnostics missing from the stderr the receipt read back (a refused capture-failure or census line), and nothing for ones that are there: $($ldOut | ConvertTo-Json -Compress -Depth 4)"
         $ldCalls = @($rtQj.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-LostJobDiagnostics' }, $true))
         $ldReadBack = @($rtQj.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-Content' -and $n.Extent.Text.Contains('$errFile') }, $true))
         $ldResult = @($rtQj.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -ceq '$result' }, $true))
         Assert-True ($ldCalls.Count -eq 1 -and (& $rtHasParam $ldCalls[0] 'CaptureDrainFailure') -and (& $rtHasParam $ldCalls[0] 'PostExitWalk') -and $ldReadBack.Count -ge 1 -and $ldResult.Count -ge 1 -and $ldCalls[0].Extent.StartOffset -gt $ldReadBack[$ldReadBack.Count - 1].Extent.StartOffset -and $ldCalls[0].Extent.EndOffset -lt $ldResult[0].Extent.StartOffset) "cim-walk-root-start: (pass 6 A2) Invoke-QueuedJob checks the diagnostics after it reads the err file back and before it builds the receipt (calls=$($ldCalls.Count))"
+        # r5 (adversary pass 7 A7): a capture copy that never completes (a surviving descendant holds the pipe) ends the drain after -CaptureWaitMs with a typed
+        # message, both streams are still disposed, and a second drain is a no-op: nothing sits in front of the diagnostic appends and the receipt forever.
+        $bwOut = & {
+            . ([scriptblock]::Create((Get-FunctionBody 'Complete-WindowlessRedirectedProcess')))
+            $bwErr = [System.IO.File]::Open((Join-Path $fx 'cim-walk-drain-bound-err.txt'), [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+            $bwOutS = [System.IO.MemoryStream]::new()
+            $bwTcs = [System.Threading.Tasks.TaskCompletionSource[object]]::new()
+            $bwLaunch = [pscustomobject]@{ OutCopy = $bwTcs.Task; ErrCopy = [System.Threading.Tasks.Task]::CompletedTask; OutStream = $bwOutS; ErrStream = $bwErr }
+            $bw1 = $null; $bw2 = $null
+            $bwWatch = [System.Diagnostics.Stopwatch]::StartNew()
+            try { Complete-WindowlessRedirectedProcess -Launch $bwLaunch -CaptureWaitMs 300 } catch { $bw1 = $_.Exception.Message }
+            $bwElapsed = $bwWatch.Elapsed.TotalSeconds
+            try { Complete-WindowlessRedirectedProcess -Launch $bwLaunch -CaptureWaitMs 300 } catch { $bw2 = $_.Exception.Message }
+            [pscustomobject]@{ first = $bw1; second = $bw2; elapsedSec = [Math]::Round($bwElapsed, 2); errClosed = (-not $bwErr.CanWrite); outClosed = (-not $bwOutS.CanWrite) }
+        }
+        Assert-True ($bwOut.first -match 'did not finish within 0\.3 s' -and $null -eq $bwOut.second -and $bwOut.elapsedSec -lt 10 -and $bwOut.errClosed -and $bwOut.outClosed) "cim-walk-root-start: (pass 7 A7) a never-ending capture copy ends the drain after the bound with a typed message, both streams are closed, and the second drain is a no-op: $($bwOut | ConvertTo-Json -Compress)"
         $rtDrains = @($rtQj.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Complete-WindowlessRedirectedProcess' }, $true))
         $rtUncaught = @($rtDrains | Where-Object {
             $dn = $_; $caught = $false; $cur = $dn.Parent

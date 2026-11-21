@@ -63,7 +63,9 @@ $lift = @('Resolve-HeavySlotPython', 'Get-ProcessIdentity', 'Test-EpochMillisClo
     # r4 (master merge of AGENT-TIMESTAMP-PARSE-TZ-1): Invoke-AdoptStartedJob now reads the marker's startedUtc through this helper
     'ConvertTo-UtcDateTime',
     # BACHELOR-THERMAL-GATE-AGENT-THRESHOLD-PARITY-1 r2: Invoke-QueuedJob calls it for the heat rule it publishes
-    'Get-AgentHeatRule')
+    'Get-AgentHeatRule',
+    # AGENT-JOB-MONITOR-CIM-WALK-1 r5 (pass 6 A2, pass 7 A1): Invoke-QueuedJob's receipt tail calls it for diagnostics the job's err file refused
+    'Get-LostJobDiagnostics')
 foreach ($name in $lift) { $fn = Find-Function $name; Assert-True ($null -ne $fn) "agent defines $name"; . ([scriptblock]::Create($fn.Extent.Text)) }
 # The function under change: lifted when present, so a base agent runs every behavioural case and fails each on behaviour.
 $classifyFn = Find-Function 'Get-GateExemptClass'

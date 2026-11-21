@@ -621,6 +621,8 @@ function Test-ProcessIdentityMatch {
         $startMatches = ([string]$identity.startUtc -eq [string]$ExpectedStartUtc)
     }
     if ($RequireExactStart -and -not [string]::IsNullOrWhiteSpace($ExpectedStartUtc) -and [string]$identity.startUtc -ne [string]$ExpectedStartUtc) { $startMatches = $false }
+    # r5 (pass 7 A3): the exact check has nothing to compare against when the expected start is empty; two empty strings are not the same process.
+    if ($RequireExactStart -and ([string]::IsNullOrWhiteSpace($ExpectedStartUtc) -or [string]::IsNullOrWhiteSpace([string]$identity.startUtc))) { $startMatches = $false }
     $imageMatches = $true
     if (-not [string]::IsNullOrWhiteSpace($ExpectedImagePath)) {
         $imageMatches = ([string]::Equals($identity.imagePath, $ExpectedImagePath, [StringComparison]::OrdinalIgnoreCase))
@@ -701,6 +703,16 @@ function Get-DescendantProcessIdentities {
         else { $snapshotTimeoutSec = [int][Math]::Min(30.0, [Math]::Max(1.0, [Math]::Ceiling($leftSec))) }   # r4 (pass 5 A13): clamped as a double, so a far deadline cannot overflow the integer
     }
     $walkWatch = [System.Diagnostics.Stopwatch]::StartNew()   # r4 (pass 5 A1): the full read and any fallback reads share ONE budget, $snapshotTimeoutSec
+    # r5 (adversary pass 7 A4): what is left for a SUPPLEMENTAL read is the smaller of the walk's one budget and the time left to the job's deadline, read
+    # now: the budget is a whole-second ceiling of the deadline distance, so a read that overran inside it must not start another past the deadline itself.
+    $readLeftSec = {
+        $leftBudget = $snapshotTimeoutSec - $walkWatch.Elapsed.TotalSeconds
+        if ($null -ne $Deadline) {
+            $leftDeadline = (([DateTime]$Deadline).ToUniversalTime() - (Get-Date).ToUniversalTime()).TotalSeconds
+            if ($leftDeadline -lt $leftBudget) { $leftBudget = $leftDeadline }
+        }
+        $leftBudget
+    }
     # -ErrorAction Stop turns a non-terminating provider error into a terminating one AT the point it is raised, and the pipeline has already
     # handed every earlier row to the collector, so those rows survive the catch. The bound is at most 30 s: far above the measured ~0.1 s, and no
     # longer than the 30 s the lease snapshot probes are given.
@@ -713,6 +725,8 @@ function Get-DescendantProcessIdentities {
     }
     $fellBack = $false
     $fbAttempted = $false
+    $fbError = $null            # r5 (pass 7 A8): why the fallback's own read ended, when it did
+    $fbRecheckError = $null     # r5 (pass 7 A2): the root-row re-read after the fallback found children
     # r4 (pass 5 A4): the fallback runs when the read FAILED and nothing it returned relates to the root (no row for the root's pid, none naming it as
     # parent): zero rows, or only unrelated ones. A partial read that already holds the root's children or the root's own row is walked as it is
     # (the hub's r3 rule: no per-parent fallback on a partial snapshot; r5 G6 adds ONE root-row read when that partial snapshot lacks the root's own row).
@@ -732,8 +746,9 @@ function Get-DescendantProcessIdentities {
         $fbSteps = New-Object 'System.Collections.Generic.Queue[string]'
         $fbSteps.Enqueue("ProcessId=$ParentProcessId"); $fbSteps.Enqueue("ParentProcessId=$ParentProcessId")
         $fbNodes = 0
+        $fbOther = New-Object 'System.Collections.Generic.List[int]'   # r5 (pass 7 A8): rows the FALLBACK itself returned for processes other than the root
         while ($fbSteps.Count -gt 0 -and $fbNodes -lt 33) {
-            $fbLeft = $snapshotTimeoutSec - $walkWatch.Elapsed.TotalSeconds
+            $fbLeft = & $readLeftSec
             if ($fbLeft -le 0) { break }
             $fbFilter = $fbSteps.Dequeue(); $fbNodes++
             $fbTimeout = [int][Math]::Min(30.0, [Math]::Max(1.0, [Math]::Ceiling($fbLeft)))
@@ -743,14 +758,33 @@ function Get-DescendantProcessIdentities {
                     $fbRow = $_
                     if ($null -ne $fbRow -and $null -ne $fbRow.ProcessId) {
                         [void]$all.Add($fbRow)
+                        if ([int]$fbRow.ProcessId -ne $ParentProcessId) { $fbOther.Add([int]$fbRow.ProcessId) }
                         if ($fbIsChildren -and $fbSeen.Add([int]$fbRow.ProcessId)) { $fbSteps.Enqueue("ParentProcessId=$([int]$fbRow.ProcessId)") }
                     }
                 }
             }
-            catch { break }
+            catch { $fbError = ([string]$_.Exception.Message) -replace '\s*[\r\n]+\s*', ' '; break }
         }
-        # PARTIAL only if the fallback found a process OTHER than the root; the root's own row alone proves no listing of its children.
-        $fellBack = (@($all | Where-Object { $null -ne $_ -and $null -ne $_.ProcessId -and [int]$_.ProcessId -ne $ParentProcessId }).Count -gt 0)
+        # r5 (pass 7 A2): the fallback reads the root's row, THEN its children, as separate reads: a root that exited and whose pid was reused between them
+        # would leave the old root row standing. When children were found and no read failed, the root's row is read ONCE MORE (rows are appended, and the
+        # last row for a pid is the one the reuse check sees). A row whose start differs from the first is the reuser; the re-read failing, or no time left
+        # for it, leaves the root unverifiable (below).
+        if ($fbOther.Count -gt 0 -and $null -eq $fbError) {
+            $fbRecheckLeft = & $readLeftSec
+            if ($fbRecheckLeft -le 0) { $fbRecheckError = 'no time left to re-read the root row after the children were read' }
+            else {
+                try {
+                    Get-CimInstance Win32_Process -Filter "ProcessId=$ParentProcessId" -Property ProcessId, ParentProcessId, CreationDate, ExecutablePath, CommandLine -OperationTimeoutSec ([int][Math]::Min(30.0, [Math]::Max(1.0, [Math]::Ceiling($fbRecheckLeft)))) -ErrorAction Stop | ForEach-Object {
+                        $fbRecheckRow = $_
+                        if ($null -ne $fbRecheckRow -and $null -ne $fbRecheckRow.ProcessId -and [int]$fbRecheckRow.ProcessId -eq $ParentProcessId) { [void]$all.Add($fbRecheckRow) }
+                    }
+                }
+                catch { $fbRecheckError = ([string]$_.Exception.Message) -replace '\s*[\r\n]+\s*', ' ' }
+            }
+        }
+        # PARTIAL only if the FALLBACK found a process other than the root (pass 7 A8: not a row the failed full read had returned); the root's own row alone
+        # proves no listing of its children.
+        $fellBack = ($fbOther.Count -gt 0)
         $fbAttempted = $true
     }
     # r5 (Grok G6): a FAILED read that returned related rows (so no per-parent fallback ran) but NOT the root's own row cannot tell a root that is still
@@ -760,13 +794,14 @@ function Get-DescendantProcessIdentities {
     # below sees it. No row comes back: the root has exited and nothing holds its pid, so the recorded start stays authoritative (r3 G1) and the children
     # are walked. The read fails, times out or has no budget left: the root's children are UNVERIFIABLE and NOTHING is emitted under the root.
     $rootUnverifiable = $null
+    if ($null -ne $fbRecheckError) { $rootUnverifiable = "the root row re-read failed: $fbRecheckError" }
     if ($null -ne $snapshotError -and $anyRelated) {
         $hasRootRow = $false
         foreach ($rootScanRow in $all) {
             try { if ($null -ne $rootScanRow -and $null -ne $rootScanRow.ProcessId -and [int]$rootScanRow.ProcessId -eq $ParentProcessId) { $hasRootRow = $true; break } } catch { continue }
         }
         if (-not $hasRootRow) {
-            $rrLeft = $snapshotTimeoutSec - $walkWatch.Elapsed.TotalSeconds
+            $rrLeft = & $readLeftSec
             if ($rrLeft -le 0) { $rootUnverifiable = 'no budget left for the root row read' }
             else {
                 $rrTimeout = [int][Math]::Min(30.0, [Math]::Max(1.0, [Math]::Ceiling($rrLeft)))
@@ -799,7 +834,7 @@ function Get-DescendantProcessIdentities {
     $recPartial = if ($null -ne $rootUnverifiable) { $false } elseif ($fbAttempted) { $fellBack } else { $all.Count -gt 0 }
     if ($null -eq $snapshotError -and -not $skipSnapshot -and $null -eq $rootUnverifiable) { $walkRecord.rows = $all.Count }   # r4 (pass 5 A11): a complete read reports the rows it saw
     if ($null -ne $snapshotError -or $null -ne $rootUnverifiable) {
-        $walkWhy = if ($null -eq $rootUnverifiable) { $snapshotError } elseif ($null -ne $snapshotError) { "$snapshotError; root row unreadable; children not walked ($rootUnverifiable)" } else { "root row unreadable; children not walked ($rootUnverifiable)" }
+        $walkWhy = if ($null -eq $rootUnverifiable) { $(if ($null -ne $fbError) { "$snapshotError; the filtered read it fell back to failed: $fbError" } else { $snapshotError }) } elseif ($null -ne $snapshotError) { "$snapshotError; root row unreadable; children not walked ($rootUnverifiable)" } else { "root row unreadable; children not walked ($rootUnverifiable)" }
         $walkRecord = [pscustomobject]@{ ok = $false; partial = $recPartial; rows = $all.Count; why = $walkWhy; rootPid = $ParentProcessId }
         $nowTs = [System.Diagnostics.Stopwatch]::GetTimestamp()
         $ageSec = { param($ts) ($nowTs - [int64]$ts) / [double][System.Diagnostics.Stopwatch]::Frequency }
@@ -808,7 +843,7 @@ function Get-DescendantProcessIdentities {
         if ($null -eq $lastFailTs -or (& $ageSec $lastFailTs) -ge 60) {
             # r4 (pass 5 A7): no cap. An entry is dropped only once it is 60 s old (when the table passes 64 entries, on each new failure), so every root
             # is remembered for its whole minute and the table is as large as the roots that failed in the last minute, never more.
-            if ($null -eq $lastFailTs -and $script:DescendantWalkFailLogTs.Count -ge 64) {
+            if ($script:DescendantWalkFailLogTs.Count -ge 64) {   # r5 (pass 7 A11): also on a repeat of a known root, so a full table never holds entries 60 s old
                 foreach ($failKey in @($script:DescendantWalkFailLogTs.Keys)) { if ((& $ageSec $script:DescendantWalkFailLogTs[$failKey]) -ge 60) { $script:DescendantWalkFailLogTs.Remove($failKey) } }
             }
             $script:DescendantWalkFailLogTs[$ParentProcessId] = $nowTs
@@ -862,6 +897,9 @@ function Get-DescendantProcessIdentities {
         param($process)
         $identityPid = [int]$process.ProcessId
         try {
+            # r5 (adversary pass 7 A3): a row with no readable creation time proves no start, so the identity it would give proves nothing about WHICH process
+            # holds the pid: it reads as not existing (a kill path and the lease owner check skip it) instead of passing every later start comparison.
+            if (-not $process.CreationDate) { throw 'no creation date' }
             $startUtc = $null
             if ($process.CreationDate) {
                 $startUtc = ([DateTime]$process.CreationDate).ToUniversalTime().ToString("o")
@@ -1099,7 +1137,11 @@ function Start-WindowlessRedirectedProcess {
 }
 
 function Complete-WindowlessRedirectedProcess {
-    param([Parameter(Mandatory = $true)]$Launch)
+    # r5 (adversary pass 7 A7): -CaptureWaitMs bounds the wait for each capture copy. A surviving descendant that holds an inherited stdout/stderr handle
+    # keeps the copy pending for as long as it lives; an unbounded wait here sat in front of every diagnostic append and the receipt. After the bound the
+    # drain fails with a typed message (the callers record it in the job's stderr), the streams are still disposed, and the pending copy is left to end
+    # on its own (its late fault is never observed).
+    param([Parameter(Mandatory = $true)]$Launch, [int]$CaptureWaitMs = 30000)
 
     # r4 (adversary pass 4 A5): idempotent. The capture streams are opened with FileMode.Create and written from offset 0 by the async copies, so
     # a line appended to the err file BEFORE the copies finish is overwritten by them. The job monitor therefore drains here (once the tree is
@@ -1107,6 +1149,10 @@ function Complete-WindowlessRedirectedProcess {
     if ($null -ne $Launch.PSObject.Properties['Drained'] -and $Launch.Drained) { return }
     $Launch | Add-Member -NotePropertyName Drained -NotePropertyValue $true -Force
     try {
+        foreach ($copyTask in @($Launch.OutCopy, $Launch.ErrCopy)) {
+            if (-not $copyTask.IsCompleted) { [void][System.Threading.Tasks.Task]::WaitAny([System.Threading.Tasks.Task[]]@($copyTask), [Math]::Max(1, $CaptureWaitMs)) }
+            if (-not $copyTask.IsCompleted) { throw "output capture did not finish within $([Math]::Round($CaptureWaitMs / 1000.0, 1)) s (a surviving descendant may hold the pipe open)" }
+        }
         [void]$Launch.OutCopy.GetAwaiter().GetResult()
         [void]$Launch.ErrCopy.GetAwaiter().GetResult()
         $Launch.OutStream.Flush()
@@ -1131,11 +1177,23 @@ function Get-LostJobDiagnostics {
     param([string]$Stderr, $CaptureDrainFailure, $PostExitWalk)
     $lost = [System.Collections.Generic.List[string]]::new()
     $text = if ($null -eq $Stderr) { '' } else { $Stderr }
-    if ($null -ne $CaptureDrainFailure -and -not $text.Contains('output capture failed:')) {
+    # r5 (pass 7 A6): the agent's own lines START a line and carry the job's actual diagnostic; a child that merely prints a similar phrase (mid-line, or
+    # with another text) does not stand in for them. Each of the three lines (capture failure, census PARTIAL/FAILED, census SKIPPED) is checked on its own.
+    if ($null -ne $CaptureDrainFailure -and $text -cnotmatch ('(?m)^output capture failed: ' + [regex]::Escape([string]$CaptureDrainFailure) + ' \(')) {
         $lost.Add("output capture failed: $CaptureDrainFailure (the job's stdout/stderr may be incomplete; this line could not be written to the job's err file)")
     }
-    if ($null -ne $PostExitWalk -and -not $PostExitWalk.ok -and -not $text.Contains('post-exit descendant census')) {
-        $lost.Add("post-exit descendant census $(if ($PostExitWalk.partial) { 'PARTIAL' } else { 'FAILED' }) ($($PostExitWalk.why)): descendants it did not list may still be running (this line could not be written to the job's err file)")
+    if ($null -ne $PostExitWalk -and -not $PostExitWalk.ok) {
+        $censusKind = if ($PostExitWalk.partial) { 'PARTIAL' } else { 'FAILED' }
+        if ($text -cnotmatch ('(?m)^post-exit descendant census ' + $censusKind + ' \(' + [regex]::Escape([string]$PostExitWalk.why) + '\): ')) {
+            $lost.Add("post-exit descendant census $censusKind ($($PostExitWalk.why)): descendants it did not list may still be running (this line could not be written to the job's err file)")
+        }
+    }
+    $skippedRows = if ($null -ne $PostExitWalk) { @($PostExitWalk.skipped | Where-Object { $null -ne $_ }) } else { @() }
+    if ($skippedRows.Count -gt 0) {
+        $skippedList = $skippedRows -join ','
+        if ($text -cnotmatch ('(?m)^post-exit descendant census SKIPPED pids=' + [regex]::Escape($skippedList) + ' \(')) {
+            $lost.Add("post-exit descendant census SKIPPED pids=$skippedList (created before their listed parent: a reused parent pid, or a backward clock step, in which case they are still running; this line could not be written to the job's err file)")
+        }
     }
     return @($lost)
 }
