@@ -1382,9 +1382,12 @@ function Get-DvLj92LayoutRowCount {
     # r12 (adversary pass 1 A1): a COMPLETE layout, not one key. Each layout key appears exactly once, in a lossless-JPEG range (predictor 1-7, precision 2-16,
     # largest SSSS 0-16, one to four components and scan components); a row with only a predictor, an unsupported predictor or a repeated key does not count.
     $layoutKeys = [ordered]@{ raw_uint16_lj92_predictor = @(1, 7); raw_uint16_lj92_precision = @(2, 16); raw_uint16_lj92_max_ssss = @(0, 16)
-                              raw_uint16_lj92_component_count = @(1, 4); raw_uint16_lj92_scan_component_count = @(1, 4) }
+                              raw_uint16_lj92_component_count = @(1, 4); raw_uint16_lj92_scan_component_count = @(1, 4)
+                              raw_uint16_lj92_pred1_fast_path_eligible = @(0, 1); raw_uint16_lj92_pred1_fast_path_active = @(0, 1) }
     $count = 0
     foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
+        # r12 (adversary pass 2 A3): a record whose body lost its tail (a ` (` location cut) or holds a masked quote cannot show the layout is complete or free of a repeated key
+        if ($line.EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal) -or $line.IndexOf($script:DvQuotedEqualsMask) -ge 0) { continue }
         if ($line -cmatch ($rs + 'playback_smoke\.(?:cpu|gpu)_frame session=(?<s>[0-9]+) ') -and $Matches['s'] -ceq $Session) {
             $complete = $true
             foreach ($key in $layoutKeys.Keys) {
@@ -5535,7 +5538,8 @@ function Test-DvReceiptValid {
                 if (-not (Test-DvJsonEquivalent (Get-DvProp $stored $f) (Get-DvProp $derived $f))) { $invalid.Add("PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive") }
             }
             foreach ($f in $script:PlaybackComparedWhenPresentFields) {
-                if ($null -ne (Get-DvProp $stored $f) -and -not (Test-DvJsonEquivalent (Get-DvProp $stored $f) (Get-DvProp $derived $f))) { $invalid.Add("PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive") }
+                # r12 (adversary pass 2 A2): PRESENT in the stored block, a JSON null included; only an absent key (a block written before the field) is skipped
+                if ($null -ne $stored -and ((Get-DvKeys $stored) -contains $f) -and -not (Test-DvJsonEquivalent (Get-DvProp $stored $f) (Get-DvProp $derived $f))) { $invalid.Add("PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive") }
             }
         }
         foreach ($p in @($derived.invalidReasons)) { if ($null -ne $p -and [string]$p -ne '') { $invalid.Add([string]$p) } }

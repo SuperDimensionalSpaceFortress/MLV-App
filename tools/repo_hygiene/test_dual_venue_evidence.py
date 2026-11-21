@@ -4097,6 +4097,8 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         self.assertAdvisory(receipt, repo)
         receipt["playback"]["lj92LayoutRows"] = 2   # the factory's log holds no layout row
         self.assertNotValid(receipt, repo, "PLAYBACK_NOT_FROM_EVIDENCE", "INVALID")
+        receipt["playback"]["lj92LayoutRows"] = None   # r12 (adversary pass 2 A2): present as a JSON null is a stored claim too, never "absent"
+        self.assertNotValid(receipt, repo, "PLAYBACK_NOT_FROM_EVIDENCE", "INVALID")
 
     def test_mutation_without_the_outcome_derivation_a_pass_over_failing_criteria_validates(self) -> None:
         mutated = self.mutated_module([("if ($expected -cne $outcome) {", "if ($false) {")])
@@ -18553,6 +18555,9 @@ class Lj92LayoutLegsRequireLayoutRowsTests(unittest.TestCase):
             "an unsupported predictor": [self.layout_row(1, predictor="8")],
             "a predictor named twice": [self.layout_row(1) + " raw_uint16_lj92_predictor=-1"],
             "a signed predictor": [self.layout_row(1, predictor="+1")],
+            # r12 (adversary pass 2 A1, A3): all seven emitted fields, and a record body that kept its whole text
+            "a row without its fast-path fields": [self.layout_row(1).replace(" raw_uint16_lj92_pred1_fast_path_eligible=1 raw_uint16_lj92_pred1_fast_path_active=1", "")],
+            "a row whose tail was cut at a location suffix": [self.layout_row(1) + " (raw_uint16_lj92_predictor=7)"],
         }
         for name, rows in cases.items():
             for row in self.judge(self.log(rows)):
