@@ -37,6 +37,36 @@
       ]
     },
     {
+      "path": "platform/qt/ViewerIdlePolicy.h",
+      "anchor": "if ( tick != Tick :: None && rearmMs && pollMs > 0 && * rearmMs > pollMs ) * rearmMs = pollMs ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "PLAYER-CURSOR-AUTOHIDE-1 r3: viewer_idle::Controller::onTimeout caps the next idle-timer interval at the caller's poll period; a non-positive pollMs means no cap (old callers). A config-value decision about how soon to look at the pointer again, never whether any stage ran.",
+      "lines": [
+        250
+      ]
+    },
+    {
+      "path": "tests/console/test_viewer_idle_policy.cpp",
+      "anchor": "ASSERT_TRUE ( viewer_idle :: kPointerPollMs ( ) > 0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYER-CURSOR-AUTOHIDE-1 r3 P8: pins that the constant poll period is positive (a constexpr config value), so the cap it feeds is real. Structural, cannot distinguish ran from did not run.",
+      "lines": [
+        332
+      ]
+    },
+    {
+      "path": "tests/gui/test_gui_smoke.cpp",
+      "anchor": "int firstLookMs ( ) const { return pollMs > 0 && pollMs < m_idleMs ? pollMs : m_idleMs ; }",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "PLAYER-CURSOR-AUTOHIDE-1 r3: the gui ViewerIdleHarness picks its first idle-timer interval like MainWindow (the poll period when a positive one below the idle interval is set, else the idle interval). A config-value selection, never a run-proof.",
+      "lines": [
+        2379
+      ]
+    },
+    {
       "path": "platform/qt/MainWindow.cpp",
       "anchor": "if ( cpuSecondsDelta < 0.0 || wallMsDelta <= 0 ) return - 1.0 ;",
       "class": "division_guard",
@@ -3285,6 +3315,16 @@
       "justification": "PLAYER-DOUBLECLICK-FULLSCREEN-1: the gui test's deliverViewerMouse helper sets a synthetic mouse-event timestamp only when the caller passed one (0 = leave Qt's default). Fixture plumbing for the double-click gate tests; no clock is read and nothing is proved by it.",
       "lines": [
         4269
+      ]
+    },
+    {
+      "path": "tests/console/test_fullscreen_control_bar_policy.cpp",
+      "anchor": "ASSERT_EQ ( 0 , int ( rig . bar . shownMs ( 100000 ) ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYER-FULLSCREEN-CONTROL-BAR-1: negative check on the pure Presenter with an injected clock (no live clock read): a bar that was never shown has accumulated zero shown time. It proves the bar did NOT show; the positive side (shows/raster/upload counters going to 1 after real activity) is asserted by counters in the same test, never by a duration.",
+      "lines": [
+        143
       ]
     }
   ]

@@ -382,6 +382,186 @@ class GeneratorTests(_GeneratorCase):
         # the one capture invocation runs the script out of the verified bundle, never a copy found on the venue
         self.assertIn("$bundleCapture = Join-Path $BundleDir 'capture-reference-frame.ps1'", job)
 
+    # --- REFERENCE-FRAME-GPU-PLAYBACK-RECON-ARG-1: a capture with GPU playback recon ON, chosen by a generator parameter ---------------------------
+    # The gate profiles live in tools/gates/output-budget.json, whose validator (tools/gates/output_budget.py) accepts exactly the eight profile
+    # keys it knows and requires every (clip, profile) pair, so a profile cannot carry the setting without changing the canonical gate. The
+    # setting is therefore a parameter of this generator, composed with any profile, and (like -Seconds) part of the job's identity.
+    RECON_ENV_NAMES = ("MLVAPP_GPU_PLAYBACK_RECON", "MLVAPP_GPU_PLAYBACK_RECON_BACKEND", "MLVAPP_GPU_PLAYBACK_RECON_DLL")
+
+    @staticmethod
+    def capture_block(job: str) -> str:
+        invocation = next(line.strip() for line in job.splitlines() if line.strip().startswith("$captureCommand =") and "-Exe" in line)
+        return job[job.index(invocation):job.index("$captureOutput =")]
+
+    @staticmethod
+    def identity_sha(job: str) -> str:
+        found = re.findall(r"(?m)^\$JobIdentitySha256 = '([0-9a-f]{64})'$", job)
+        assert len(found) == 1, found
+        return found[0]
+
+    def generate_job(self, name: str, *extra: str) -> str:
+        proc, out = self.generate(name, *extra)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return out.read_text(encoding="utf-8")
+
+    def test_gpu_playback_recon_on_emits_the_recon_env_at_the_capture_call(self) -> None:
+        job = self.generate_job("recon-on", "-GpuPlaybackRecon", "on")
+        self.assertIn("$GpuPlaybackRecon = 'on'", job)
+        block = self.capture_block(job)
+        for name in self.RECON_ENV_NAMES:
+            self.assertIn(name, block, f"{name} does not reach the capture command")
+        self.assertIn("MLVAPP_GPU_PLAYBACK_RECON = '1'", block)
+        self.assertIn("MLVAPP_GPU_PLAYBACK_RECON_BACKEND = 'cuda'", block)
+        # the DLL is the one the job deployed beside the exe, never a path typed by the caller
+        self.assertIn("$reconDll", block)
+        # the profile's own quality mode still rides the same -ExtraEnv (the capture script takes ONE hashtable)
+        self.assertIn("MLVAPP_PLAYBACK_QUALITY_MODE", block)
+        self.assertEqual(block.count("-ExtraEnv"), 1, block)
+
+    def test_the_default_is_off_and_emits_no_recon_text_at_all(self) -> None:
+        default = self.emitted()
+        explicit_off = self.generate_job("recon-off", "-GpuPlaybackRecon", "off")
+        self.assertEqual(default, explicit_off, "an explicit 'off' is not the default job")
+        self.assertNotIn("GpuPlaybackRecon", default)
+        self.assertNotIn("MLVAPP_GPU_PLAYBACK_RECON", default)
+        self.assertIn("MLVAPP_PLAYBACK_QUALITY_MODE = '$QualityMode'", self.capture_block(default))
+
+    def test_the_default_job_keeps_the_exact_text_around_every_recon_seam(self) -> None:
+        # The recon fragments enter the template through tokens that expand to nothing when off. A token that eats or adds one character (a space after
+        # `=`, a line break) changes every default job, so each seam's surrounding text is pinned as the base generator emitted it (measured byte-identical
+        # to the base generator's output when this card was written).
+        default = self.emitted()
+        # (read_text turns the file's CRLF into LF, so the seams are written with LF)
+        for seam in ("$DisableLookAssist = $true\n$Seconds = 30\n",
+                     "$captureCommand += \" -PresentedFrames $PresentedFrames\" }\n        if ($QualityMode -ne '') { $captureCommand += \" -ExtraEnv @{ MLVAPP_PLAYBACK_QUALITY_MODE = '$QualityMode' }\" }\n        # FAIL CLOSED",
+                     "if ($captureRc -ne 0 -and ($captureRc -lt 1 -or $captureRc -gt 199)) { $captureRc = 199 }\n$viewsChanged = ($captureRc -eq 0 -and -not $viewsIntactAfterCapture)\n",
+                     "$candidateInvalidMarker = $null\n$candidateQuarantined = $null\nif ($viewsChanged -and (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {\n",
+                     "captureParameters = [ordered]@{ seconds = $Seconds; presentedFrames = $PresentedFrames }\n",
+                     "footageView = [ordered]@{ mode = $ownerViewMode; intactAfterCapture = $viewsIntactAfterCapture }\n    stagedOnHost = ",
+                     # r5: the 225 path's parse and stamp lines (the object-root guard is an 'on'-only token between them)
+                     "$candidateDoc = [IO.File]::ReadAllText($candidatePath) | ConvertFrom-Json\n        $candidateDoc | Add-Member -NotePropertyName status -NotePropertyValue 'invalid' -Force\n"):
+            with self.subTest(seam=seam[:60]):
+                self.assertIn(seam, default)
+
+    def test_the_job_identity_differs_between_recon_on_and_off(self) -> None:
+        off = self.emitted()
+        on = self.generate_job("recon-on-ident", "-GpuPlaybackRecon", "on")
+        self.assertNotEqual(self.identity_sha(on), self.identity_sha(off))
+        self.assertNotEqual(self.job_id(on), self.job_id(off), "a GPU-recon job shares a work tree and an outbox name with a CPU one")
+
+    def test_a_recon_on_job_records_the_setting_in_result_json(self) -> None:
+        on = self.generate_job("recon-on-result", "-GpuPlaybackRecon", "on")
+        self.assertRegex(on, r"captureParameters = \[ordered\]@\{[^}\r\n]*gpuPlaybackRecon = \$GpuPlaybackRecon")
+
+    def test_the_recon_on_job_gates_the_candidate_on_the_apps_gpu_summary_and_the_header_names_its_step_code(self) -> None:
+        on = self.generate_job("recon-on-evidence", "-GpuPlaybackRecon", "on")
+        self.assertIn(r"playback_smoke\.gpu_summary session=", on)
+        self.assertIn("$StepLog['reconEvidence']", on)
+        self.assertNotIn("gpu_summary", self.emitted(), "the default job reads the gpu summary: its text changed")
+        self.assertNotIn("reconEvidence", self.emitted())
+        header = GENERATOR.read_text(encoding="utf-8").split("[CmdletBinding()]", 1)[0]
+        self.assertRegex(header, r"228 reconEvidence")
+        steps = re.findall(r"(\d{3}) (\w+)", header[header.index("The EMITTED job"):])
+        codes = [code for code, _ in steps]
+        self.assertEqual(len(codes), len(set(codes)), f"two documented steps share a code: {steps}")
+
+    def test_both_record_reads_of_the_recon_gate_start_at_the_record_start_in_the_emitted_job(self) -> None:
+        # adversary A1 on 973b6efa: a record is read only where it STARTS the line, after the app's [utc] [LEVEL] [0x<thread>] prefix. The summary-session read
+        # is anchored too (a forged 'playback_smoke.summary session=9 ' inside another record's text must not move the measured session). That forgery cannot
+        # be run end to end -- the capture's own receipt oracle refuses such a log first (exit 43) -- so the anchor is pinned as text; the gpu_summary forgery
+        # runs end to end in EmittedJobOnAFixtureAgentRootTests.
+        on = self.generate_job("recon-on-anchor", "-GpuPlaybackRecon", "on")
+        self.assertIn(r"$reconRecordStart = '^(?:\[[^\]]*\] ){0,3}'", on)
+        self.assertIn(r"[regex]::Match($reconLine, $reconRecordStart + 'playback_smoke\.summary session=([0-9]+) ')", on)
+        self.assertIn(r"[regex]::Match($reconLine, $reconRecordStart + 'playback_smoke\.gpu_summary session=' + $reconSession + ' (?<rest>.*)$')", on)
+
+    def test_the_object_root_guard_is_emitted_for_both_stamps_of_an_on_job_and_for_neither_of_an_off_job(self) -> None:
+        # adversary A1 on ac80ede1 / A2 on 01ba7f33: the guard is an 'on'-only fragment, so the default job's text is the base's
+        on = self.generate_job("recon-on-objroot", "-GpuPlaybackRecon", "on")
+        self.assertEqual(on.count("MANIFEST_ROOT_NOT_AN_OBJECT"), 2, "the 228 stamp and the 225 stamp each need the guard")
+        self.assertIn("$candidateDoc -isnot [System.Management.Automation.PSCustomObject]", on)
+        self.assertIn("$reconDoc -isnot [System.Management.Automation.PSCustomObject]", on)
+        self.assertNotIn("MANIFEST_ROOT_NOT_AN_OBJECT", self.emitted())
+
+    def test_an_on_job_whose_agent_root_lies_inside_an_outbox_is_refused_and_an_off_job_is_not(self) -> None:
+        # adversary A1 on 01ba7f33: the staging directory is under <AgentRoot>\work, which is only "outside every outbox" if the root is not inside one.
+        # r6: the venue-table equality check refuses these first in production; the outbox string rule is the SECOND NET, reached under -OfflineTestMode
+        # (the one seam that lets an 'on' job name a root the table does not hold).
+        for label, root in (("nested", r"C:\mlvtmp\mlv-agent\outbox\nested-agent"), ("top", r"C:\outbox"), ("cased", r"C:\mlvtmp\mlv-agent\OutBox"), ("last", r"C:\mlvtmp\agent\outbox")):
+            with self.subTest(root=root):
+                proc, out = self.generate(f"recon-outbox-{label}", "-OfflineTestMode", "-GpuPlaybackRecon", "on", "-AgentRoot", root)
+                self.refused(proc, "REFERENCE_FRAME_GPU_RECON_AGENTROOT_IN_OUTBOX")
+                self.assertFalse(out.exists(), "a refused job wrote a file")
+        for label, root in (("off", r"C:\mlvtmp\mlv-agent\outbox\nested-agent"), ("neighbour", r"C:\mlvtmp\outboxes\agent")):
+            with self.subTest(allowed=root):
+                extra = ("-AgentRoot", root) if label == "off" else ("-OfflineTestMode", "-GpuPlaybackRecon", "on", "-AgentRoot", root)
+                proc, _out = self.generate(f"recon-outbox-ok-{label}", *extra)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    # --- r6 (hub ruling, option a): an 'on' job's agent root EQUALS the committed venue table's agentRoot ------------------------------------------
+    # Three adversary passes found three spellings of one class ("the agent root is inside an outbox": array root, outbox\nested, trailing-dot
+    # `outbox.`), because a string rule describes what a path LOOKS like and Windows has more spellings of one directory than any rule lists (trailing
+    # dot or space, 8.3 names, case). An equality check against the committed table names the one root an 'on' job may stage under, so every spelling
+    # of "somewhere else" is the same refusal and none needs its own rule.
+    NOT_VENUE_ROOT = "REFERENCE_FRAME_GPU_RECON_AGENTROOT_NOT_VENUE_ROOT"
+
+    def test_an_on_job_must_name_the_committed_venue_agent_root_whatever_the_spelling_of_the_other_root(self) -> None:
+        for label, root in (
+            ("nested", r"C:\mlvtmp\mlv-agent\outbox\nested-agent"),     # pass 7
+            ("dotcomponent", r"C:\mlvtmp\mlv-agent\outbox.\rf"),        # pass 8 (trailing-dot component)
+            ("dotlast", r"C:\mlvtmp\mlv-agent\outbox."),                # trailing dot, last component
+            ("spacecomponent", r"C:\mlvtmp\mlv-agent\outbox \rf"),      # trailing space
+            ("outboxtop", r"C:\mlvtmp\mlv-agent\outbox"),               # the outbox itself (the array-root pass's directory)
+            ("short83", r"C:\mlvtmp\mlv-agent\OUTBOX~1\rf"),            # an 8.3-shaped name
+            ("shortroot", r"C:\MLVTMP~1\mlv-agent"),                    # an 8.3 spelling of the table's own root
+            ("caseonly", r"C:\mlvtmp\MLV-AGENT"),                       # a case-only difference
+            ("subdir", r"C:\mlvtmp\mlv-agent\sub"),                     # a child of the table root
+            ("parent", "C:\\mlvtmp"),                                   # a parent of the table root
+            ("doubleslash", "C:\\mlvtmp\\\\mlv-agent"),                # a doubled separator inside
+            ("otherven", r"G:\Temp\mlv-gpu-profile\agent"),             # the OTHER venue's root, on a bachelor job
+            ("elsewhere", r"C:\elsewhere"),
+        ):
+            with self.subTest(root=root):
+                proc, out = self.generate(f"recon-notvenue-{label}", "-GpuPlaybackRecon", "on", "-AgentRoot", root)
+                self.refused(proc, self.NOT_VENUE_ROOT)
+                self.assertFalse(out.exists(), "a refused job wrote a file")
+
+    def test_an_on_job_on_the_venue_root_is_accepted_with_or_without_a_trailing_separator_and_an_off_job_names_any_root(self) -> None:
+        for label, root in (("exact", r"C:\mlvtmp\mlv-agent"), ("trailing", "C:\\mlvtmp\\mlv-agent\\"), ("trailing2", "C:\\mlvtmp\\mlv-agent\\\\")):
+            with self.subTest(root=root):
+                proc, _out = self.generate(f"recon-venue-ok-{label}", "-GpuPlaybackRecon", "on", "-AgentRoot", root)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        proc, _out = self.generate("recon-venue-ok-default", "-GpuPlaybackRecon", "on")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        ultra, _out = self.generate("recon-venue-ok-ultra", "-GpuPlaybackRecon", "on", "-Venue", "ultra-magnus", "-AgentRoot", r"G:\Temp\mlv-gpu-profile\agent")
+        self.assertEqual(ultra.returncode, 0, ultra.stdout + ultra.stderr)
+        crossed, _out = self.generate("recon-venue-crossed", "-GpuPlaybackRecon", "on", "-Venue", "ultra-magnus", "-AgentRoot", r"C:\mlvtmp\mlv-agent")
+        self.refused(crossed, self.NOT_VENUE_ROOT)
+        off, _out = self.generate("recon-venue-off", "-AgentRoot", r"C:\elsewhere")
+        self.assertEqual(off.returncode, 0, off.stdout + off.stderr)
+
+    def test_the_offline_test_seam_is_the_only_way_an_on_job_names_a_root_the_table_does_not_hold(self) -> None:
+        proc, out = self.generate("recon-seam", "-OfflineTestMode", "-GpuPlaybackRecon", "on", "-AgentRoot", r"C:\elsewhere")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("ADMISSION=offline-test", proc.stdout)
+        # the seam does not widen the second net: an outbox root is still refused under it
+        bad, _out = self.generate("recon-seam-outbox", "-OfflineTestMode", "-GpuPlaybackRecon", "on", "-AgentRoot", r"C:\elsewhere\outbox\rf")
+        self.refused(bad, "REFERENCE_FRAME_GPU_RECON_AGENTROOT_IN_OUTBOX")
+        # no new switch: the generator's own parameter block holds the one switch it had
+        text = GENERATOR.read_text(encoding="utf-8")
+        params = text[text.index("[CmdletBinding()]"):text.index("$ErrorActionPreference = 'Stop'")]
+        self.assertEqual(re.findall(r"\[switch\]\$(\w+)", params), ["OfflineTestMode"], "the seam must be the existing -OfflineTestMode, not a new switch")
+
+    def test_the_recon_equality_rule_is_documented_in_the_generator_header(self) -> None:
+        header = GENERATOR.read_text(encoding="utf-8").split("[CmdletBinding()]", 1)[0]
+        self.assertIn("REFERENCE_FRAME_GPU_RECON_AGENTROOT_NOT_VENUE_ROOT", header)
+
+    def test_a_recon_value_other_than_off_or_on_is_refused_with_a_typed_code_and_no_job_is_written(self) -> None:
+        for label, value in (("yes", "yes"), ("upper", "ON"), ("one", "1"), ("empty", "")):
+            proc, out = self.generate(f"recon-bad-{label}", "-GpuPlaybackRecon", value)
+            self.refused(proc, "REFERENCE_FRAME_GPU_PLAYBACK_RECON_INVALID")
+            self.assertFalse(out.exists(), f"{value!r}: a refused value left a job behind")
+
     def test_the_job_acts_on_the_capture_exit_code_and_never_calls_the_candidate_reviewed(self) -> None:
         job = self.emitted()
         self.assertRegex(job, r"\$captureRc\s*=\s*\$LASTEXITCODE[\s\S]*?\$captureRc\s+-ne\s+0")
@@ -451,7 +631,7 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         path.write_text(json.dumps(manifest), encoding="utf-8")
         return hashlib.sha256(path.read_bytes()).hexdigest()
 
-    def job_for_this_agent(self, manifest_sha: str, name: str, clip_id: str = CLIP_ID) -> Path:
+    def job_for_this_agent(self, manifest_sha: str, name: str, clip_id: str = CLIP_ID, generator_args: tuple[str, ...] = ()) -> Path:
         """The emitted job for this test's own agent root, written to `<name>.job.ps1`.
 
         The generator is a pure function of (commit, manifest sha, clip) plus the agent root it bakes into ONE line, `$AgentRoot = '...'`. Every
@@ -459,14 +639,17 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         -- with an -AgentRoot of its own, so its substitution and allowlist are exercised for real -- and each test re-points that single line at
         its own root. The swap asserts the anchor is unique, so a generator that moved or doubled the line fails loudly here."""
         cache = type(self)._emission_by_inputs
-        key = (manifest_sha, clip_id)
+        key = (manifest_sha, clip_id, generator_args)
         if key not in cache:
             template_root = self.tmp / f"agent-template-{len(cache)}"
             template_root.mkdir()
             out = self.tmp / f"template-{len(cache)}.job.ps1"
+            # r6: an 'on' job may only be generated for the committed venue table's agent root (and a job generated under -OfflineTestMode refuses to run),
+            # so an 'on' template takes the table's root by default and the swap below re-points the one line, exactly as it does for an 'off' template.
+            root_args = () if ("-GpuPlaybackRecon", "on") == tuple(generator_args[:2]) else ("-AgentRoot", str(template_root))
             gen = _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(GENERATOR),
                         "-SourceCommit", self.head, "-BuildManifestSha256", manifest_sha, "-ClipId", clip_id, "-RepoRoot", str(self.repo),
-                        "-OutFile", str(out), "-AgentRoot", str(template_root)])
+                        "-OutFile", str(out), *root_args, *generator_args])
             self.assertEqual(gen.returncode, 0, gen.stdout + gen.stderr)
             cache[key] = out.read_text(encoding="utf-8")
         job, count = re.subn(r"(?m)^\$AgentRoot = '[^']*'$", lambda _m: f"$AgentRoot = '{self.agent}'", cache[key])
@@ -567,8 +750,11 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assertFalse((self.artifacts() / "capture" / "reference-frame-candidate.json").exists())
 
     # --- F-01 footage-path-disclosure: a SUCCESSFUL capture publishes nothing that names the owner's part path ---------------------------------
+    APP_LOG_PREFIX = "[2026-11-20T00:00:00.000Z] [info] [0x1] "
+
     def run_stand_in_capture(self, name: str, edit: tuple[str, str] | None = None,
-                             more_edits: tuple[tuple[str, str], ...] = ()) -> tuple[subprocess.CompletedProcess, Path, Path, str, Path, str]:
+                             more_edits: tuple[tuple[str, str], ...] = (), generator_args: tuple[str, ...] = (),
+                             env_probe: Path | None = None, app_log_extra: str = "") -> tuple[subprocess.CompletedProcess, Path, Path, str, Path, str]:
         """The emitted job run end to end against a stand-in app; returns (ran, outbox, part, part sha256, the app's argv file, the path marker)."""
         marker = "OWNERREALPATHMARKERq7z3"
         owner_dir = self.tmp / f"{marker}-dir"
@@ -577,11 +763,12 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         part_bytes = part.read_bytes()
         part_sha = hashlib.sha256(part_bytes).hexdigest()
         sha = self.stage_build()
-        gen_out = self.job_for_this_agent(sha, name)
+        gen_out = self.job_for_this_agent(sha, name, generator_args=generator_args)
         app_dir = self.tmp / "stand-in-app"
         app_dir.mkdir(exist_ok=True)
         log_template = app_dir / "app.log.template"
-        log_template.write_text("t0 playback_smoke.start session=1\nt1 " + oracle_tests._good_line() + "\n", encoding="utf-8")
+        # the app's own record prefix ([utc] [LEVEL] [0x<thread>] ), which the recon evidence gate anchors on
+        log_template.write_text(self.APP_LOG_PREFIX + "playback_smoke.start session=1\n" + self.APP_LOG_PREFIX + oracle_tests._good_line() + "\n" + app_log_extra, encoding="utf-8")
         grab = app_dir / "grab.template"
         grab.write_bytes(b"\0" * 65536)
         args_file = app_dir / "app-args.json"
@@ -592,6 +779,11 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         job = gen_out.read_text(encoding="utf-8")
         job, count = re.subn(r"(?m)^\$OwnerPartsJson = '.*'$", lambda _m: f"$OwnerPartsJson = '{parts}'", job)
         self.assertEqual(count, 1)
+        if env_probe is not None:
+            # a wrapper in front of the stand-in that records the MLVAPP_GPU_PLAYBACK_RECON* environment the app would have been launched with
+            probe = app_dir / "env-probe.cmd"
+            probe.write_text(f'@echo off\r\nset MLVAPP_GPU_PLAYBACK_RECON> "{env_probe}"\r\ncall "{fake}" %*\r\nexit /b %errorlevel%\r\n', encoding="ascii")
+            fake = probe
         self.assertEqual(job.count("-Exe '$exePath'"), 1, "the capture's -Exe anchor moved: this fixture is stale")
         job = job.replace("-Exe '$exePath'", f"-Exe '{fake}'")
         for anchor, injected in (() if edit is None else (edit,)) + tuple(more_edits):
@@ -642,6 +834,508 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         # 3. the original is untouched, and the job removed its view entry when it closed the workspace
         self.assertEqual(hashlib.sha256(part.read_bytes()).hexdigest(), part_sha)
         self.assertEqual([p.name for p in (work / "owner-clip").iterdir()], [], "a view entry outlived the job")
+
+    # --- REFERENCE-FRAME-GPU-PLAYBACK-RECON-ARG-1: the recon setting, run end to end against the stand-in app --------------------------------------
+    def probed_env(self, probe: Path) -> dict[str, str]:
+        pairs = (line.split("=", 1) for line in probe.read_text(encoding="utf-8", errors="replace").splitlines() if "=" in line)
+        return {key: value for key, value in pairs}
+
+    @staticmethod
+    def gpu_summary_line(session: object = 0, cpu: object = 0, recon: object = 480, texture_readback: object = 0, texture_no_readback: object = 0,
+                         suffix: str = "") -> str:
+        """The app's playback_smoke.gpu_summary record (MainWindow.cpp prints exactly these fields), after the stand-in's summary line (session=0).
+        suffix is whatever the log's message pattern appends after the six fields (for example a source location)."""
+        return (f"{EmittedJobOnAFixtureAgentRootTests.APP_LOG_PREFIX}playback_smoke.gpu_summary session={session} cpu_frames={cpu} gpu_preview_frames=0 gpu_recon_readback_frames={recon} "
+                f"gpu_texture_readback_frames={texture_readback} gpu_texture_no_readback_frames={texture_no_readback}{suffix}\n")
+
+    def test_a_recon_on_job_launches_the_app_with_the_recon_env_and_records_it_in_result_json(self) -> None:
+        probe = self.tmp / "recon-on-env.txt"
+        ran, pub, _part, _sha, _args, _marker = self.run_stand_in_capture("reconon", generator_args=("-GpuPlaybackRecon", "on"), env_probe=probe,
+                                                                        app_log_extra=self.gpu_summary_line())
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+        env = self.probed_env(probe)
+        self.assertEqual(env.get("MLVAPP_GPU_PLAYBACK_RECON"), "1", env)
+        self.assertEqual(env.get("MLVAPP_GPU_PLAYBACK_RECON_BACKEND"), "cuda", env)
+        work = next((self.agent / "work").glob("reference-frame-*"))
+        dll = env.get("MLVAPP_GPU_PLAYBACK_RECON_DLL", "")
+        self.assertEqual(Path(dll).name, "igpu_recon_cuda.dll", env)
+        self.assertTrue(Path(dll).is_file(), f"the DLL the app is told to load does not exist: {dll}")
+        self.assertIn(str(work), dll, "the DLL is not the one the job deployed under its own work directory")
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual(result["captureParameters"]["gpuPlaybackRecon"], "on")
+        self.assertEqual((result["status"], result["exitCode"]), ("candidate-unreviewed", 0))
+        self.assertIs(result["gpuReconEvidence"]["ok"], True, result["gpuReconEvidence"])
+        self.assertEqual((result["gpuReconEvidence"]["cpuFrames"], result["gpuReconEvidence"]["reconFrames"]), (0, 480))
+        manifest = json.loads((pub / "capture" / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
+        applied = manifest["settings"]["envApplied"]
+        self.assertIn("MLVAPP_GPU_PLAYBACK_RECON", applied)
+        self.assertIn("MLVAPP_PLAYBACK_QUALITY_MODE", applied, "the profile's quality mode was lost when the recon env joined it")
+
+    def held_capture_dir(self) -> Path:
+        """Where an 'on' job holds a capture it did not release: <agent>\\work\\<job>\\capture-staging."""
+        return next((self.agent / "work").glob("reference-frame-*")) / "capture-staging"
+
+    # --- adversary A1 on 4cb84958: 'on' REQUESTS the GPU recon, so the job accepts the capture only when the app's own counters show it ran ----------
+    def assert_recon_not_proven(self, name: str, log_extra: str, reason_token: str) -> None:
+        ran, pub, _part, _sha, _args, _marker = self.run_stand_in_capture(name, generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=log_extra)
+        self.assertEqual(ran.returncode, 228, ran.stdout + ran.stderr)
+        self.assertIn("RESULT=REFERENCE_FRAME_CAPTURE_FAILED EXIT=228 CAPTURE_EXIT=0", ran.stdout)
+        self.assertNotIn("CAPTURE_OK", ran.stdout)
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["status"], result["exitCode"], result["captureExitCode"]), ("capture-failed", 228, 0))
+        self.assertIsNone(result["candidateSha256"], "a capture whose GPU recon was not proven was named a candidate")
+        self.assertEqual(result["steps"]["reconEvidence"], 228)
+        self.assertIs(result["gpuReconEvidence"]["ok"], False)
+        self.assertIn(reason_token, result["gpuReconEvidence"]["reason"])
+        # the manifest the capture wrote still calls itself a candidate, so it is voided: the marker a reader honours, and the stamp in place.
+        # r7: and the capture is HELD in staging, never released into the outbox, whatever landed (the voiding layers are best effort)
+        held = self.held_capture_dir()
+        self.assertFalse((pub / "capture").exists(), "an unproven capture was released into the outbox")
+        self.assertIs(result["captureStaging"]["held"], True)
+        self.assertTrue((held / "reference-frame-candidate.invalid").is_file())
+        manifest = json.loads((held / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((manifest["status"], manifest["invalid"]), ("invalid", True))
+        # adversary pass 4 A1: result.json says what the voiding did, the way the 225 path says it (marker landed, stamp landed, nothing quarantined)
+        self.assertEqual((result["candidateInvalidated"], result["candidateInvalidMarker"], result["candidateQuarantined"]), (True, True, None))
+
+    def test_a_recon_on_capture_that_ran_any_frame_on_the_cpu_is_not_a_candidate(self) -> None:
+        # the adversary's input: MLVAPP_GPU_FAULT_INJECT in the venue's environment suppresses CUDA and the rest of the capture plays on the CPU
+        self.assert_recon_not_proven("recon-cpu-frames", self.gpu_summary_line(cpu=3, recon=477), "CPU_FRAMES_NONZERO")
+
+    def test_a_recon_on_capture_with_no_gpu_summary_is_not_a_candidate(self) -> None:
+        self.assert_recon_not_proven("recon-no-gpu-line", "", "GPU_SUMMARY_ABSENT")
+
+    def test_a_recon_on_capture_whose_gpu_summary_belongs_to_another_session_is_not_a_candidate(self) -> None:
+        self.assert_recon_not_proven("recon-other-session", self.gpu_summary_line(session=7), "GPU_SUMMARY_ABSENT")
+
+    def test_a_recon_on_capture_with_no_gpu_frames_at_all_is_not_a_candidate(self) -> None:
+        self.assert_recon_not_proven("recon-zero-gpu", self.gpu_summary_line(recon=0), "NO_GPU_RECON_FRAMES")
+
+    def test_a_recon_on_capture_whose_counter_is_not_a_decimal_count_is_not_a_candidate(self) -> None:
+        for label, bad in (("hex", "0x0"), ("empty", ""), ("null", "null")):
+            with self.subTest(label):
+                self.assert_recon_not_proven(f"recon-bad-{label}", self.gpu_summary_line(cpu=bad), "COUNTER_NOT_NUMERIC")
+
+    # --- adversary A1 on bdf4b3a5 (pass 2, introduced major): a trailing source-location suffix must never overwrite the app's own counters ----------
+    FAKE_LOCATION_SUFFIX = " (C:/build cpu_frames=0 gpu_recon_readback_frames=480 x/platform/qt/MainWindow.cpp:31715)"
+
+    def test_a_recon_on_capture_whose_log_line_carries_counter_lookalikes_after_the_real_fields_is_not_a_candidate(self) -> None:
+        # the adversary's input: the real counters say 480 CPU frames and no GPU frame; a location suffix then spells 'cpu_frames=0 ... =480'
+        self.assert_recon_not_proven("recon-suffix-overwrite", self.gpu_summary_line(cpu=480, recon=0, suffix=self.FAKE_LOCATION_SUFFIX), "CPU_FRAMES_NONZERO")
+
+    def test_a_recon_on_capture_whose_counter_run_repeats_a_counter_is_not_a_candidate(self) -> None:
+        # the same class without a separating token: a repeated key inside the contiguous key=value run is ambiguous, so it is unproven (never last-wins)
+        self.assert_recon_not_proven("recon-duplicate-counter", self.gpu_summary_line(cpu=480, recon=0, suffix=" cpu_frames=0 gpu_recon_readback_frames=480"),
+                                     "COUNTER_DUPLICATE")
+
+    # --- adversary A1 on 973b6efa (pass 3, introduced major): a record is read only where it STARTS the record body, never as text inside another record ---
+    FORGED_GPU_SUMMARY = ("playback_smoke.gpu_summary session=0 cpu_frames=0 gpu_preview_frames=0 gpu_recon_readback_frames=480 "
+                          "gpu_texture_readback_frames=0 gpu_texture_no_readback_frames=0 x")
+
+    def test_a_recon_on_capture_whose_later_record_carries_a_forged_gpu_summary_in_its_location_is_not_a_candidate(self) -> None:
+        # the adversary's input: the real record says 480 CPU frames; a LATER record (overlap_summary) carries a build path that spells a whole gpu_summary
+        later = f"{self.APP_LOG_PREFIX}playback_smoke.overlap_summary session=0 frames=480 (C:/b {self.FORGED_GPU_SUMMARY}/platform/qt/MainWindow.cpp:1)\n"
+        self.assert_recon_not_proven("recon-forged-later-record", self.gpu_summary_line(cpu=480, recon=0) + later, "CPU_FRAMES_NONZERO")
+
+    # --- adversary A1 on c30fba42 (pass 4, introduced major): the 228 voiding path publishes the same three fields the 225 path does -----------------
+    # The injections below are the 225 tests' (VIEW_CHANGED family), re-anchored on the recon block's own lines.
+    RECON_MANIFEST_ANCHOR = "$reconManifestPath = Join-Path $captureOut 'reference-frame-candidate.json'"
+    RECON_STAMP_PUBLISH_FAILS = ("[void](Publish-AttrCudaText -Path $reconManifestPath -Value ($reconDoc | ConvertTo-Json -Depth 64))",
+                                 "throw 'INJECTED_CANDIDATE_PUBLISH_FAILURE'")
+    RECON_MARKER_PUBLISH_FAILS = ("[void](Publish-AttrCudaText -Path (Join-Path $captureOut 'reference-frame-candidate.invalid') ",
+                                  "throw 'INJECTED_MARKER_PUBLISH_FAILURE'; [void](Publish-AttrCudaText -Path (Join-Path $captureOut 'reference-frame-candidate.invalid') ")
+    RECON_MOVE_FAILS = ("Move-Item -LiteralPath $reconManifestPath -Destination ",
+                        "throw 'INJECTED_QUARANTINE_RENAME_FAILURE'; Move-Item -LiteralPath $reconManifestPath -Destination ")
+    RECON_STAMP_UNPARSEABLE = (RECON_MANIFEST_ANCHOR, RECON_MANIFEST_ANCHOR + "; [IO.File]::WriteAllText($reconManifestPath, '{\"status\": \"candidate-unreviewed\", \"truncated')")
+    RECON_MANIFEST_ABSENT = (RECON_MANIFEST_ANCHOR, RECON_MANIFEST_ANCHOR + "; Remove-Item -LiteralPath $reconManifestPath -Force")
+
+    def run_recon_voided(self, name: str, *edits: tuple[str, str]) -> tuple[subprocess.CompletedProcess, Path]:
+        """An 'on' capture whose app log shows CPU frames (so the job exits 228), with injected failures in the voiding layers."""
+        ran, pub, *_ = self.run_stand_in_capture(name, generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line(cpu=480, recon=0),
+                                                 edit=edits[0] if edits else None, more_edits=tuple(edits[1:]))
+        self.assertEqual(ran.returncode, 228, ran.stdout + ran.stderr)
+        return ran, pub
+
+    def assert_voided_publishes(self, pub: Path, expected: tuple, *, candidate_indexed: bool = False) -> dict:
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["status"], result["exitCode"], result["captureExitCode"]), ("capture-failed", 228, 0))
+        self.assertIsNone(result["candidateSha256"])
+        self.assertEqual((result["candidateInvalidated"], result["candidateInvalidMarker"], result["candidateQuarantined"]), expected)
+        self.assertEqual(self._frame_provenance().index_capture_records(str(pub)), {}, "frame_provenance still indexes the voided capture")
+        # r7: a voided capture is held in staging whatever mix of marker and stamp landed, never released into the outbox
+        self.assertFalse((pub / "capture").exists(), "a voided capture was released into the outbox")
+        self.assertIs(result["captureStaging"]["held"], True)
+        self.assertTrue((self.held_capture_dir() / "reference-frame.png").is_file(), "the held capture is not in staging")
+        return result
+
+    def test_a_voided_recon_capture_whose_marker_and_stamp_both_land_publishes_both_as_true(self) -> None:
+        ran, pub = self.run_recon_voided("recon-void-both")
+        self.assert_voided_publishes(pub, (True, True, None))
+
+    def test_a_voided_recon_capture_whose_stamp_fails_publishes_the_stamp_as_false_and_the_marker_as_true(self) -> None:
+        ran, pub = self.run_recon_voided("recon-void-stampfails", self.RECON_STAMP_PUBLISH_FAILS)
+        self.assertIn("CANDIDATE_NOT_INVALIDATED", ran.stdout)
+        self.assert_voided_publishes(pub, (False, True, None))
+        manifest = json.loads((self.held_capture_dir() / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual(manifest["status"], "candidate-unreviewed", "the marker alone is all the stamp-less manifest carries: the capture is held, so no reader meets it")
+
+    def test_a_voided_recon_capture_whose_manifest_does_not_parse_publishes_the_stamp_as_false(self) -> None:
+        ran, pub = self.run_recon_voided("recon-void-unparseable", self.RECON_STAMP_UNPARSEABLE)
+        self.assertIn("CANDIDATE_NOT_INVALIDATED", ran.stdout)
+        self.assert_voided_publishes(pub, (False, True, None))
+
+    def test_a_voided_recon_capture_whose_marker_fails_publishes_the_marker_as_false_and_the_stamp_as_true(self) -> None:
+        ran, pub = self.run_recon_voided("recon-void-markerfails", self.RECON_MARKER_PUBLISH_FAILS)
+        self.assertIn("CANDIDATE_MARKER_NOT_WRITTEN", ran.stdout)
+        self.assert_voided_publishes(pub, (True, False, None))
+        self.assertFalse((self.held_capture_dir() / "reference-frame-candidate.invalid").exists())
+
+    def test_a_voided_recon_capture_whose_marker_and_stamp_both_fail_is_quarantined_and_publishes_it(self) -> None:
+        ran, pub = self.run_recon_voided("recon-void-quarantine", self.RECON_STAMP_PUBLISH_FAILS, self.RECON_MARKER_PUBLISH_FAILS)
+        self.assert_voided_publishes(pub, (False, False, True))
+        capture = self.held_capture_dir()
+        self.assertFalse((capture / "reference-frame-candidate.json").exists(), "the manifest still carries the candidate name")
+        self.assertIn("candidate-unreviewed", (capture / "reference-frame-candidate.INVALID.json").read_text(encoding="utf-8-sig"))
+
+    def test_a_voided_recon_capture_whose_quarantine_move_throws_publishes_the_quarantine_as_false(self) -> None:
+        ran, pub = self.run_recon_voided("recon-void-movefails", self.RECON_STAMP_PUBLISH_FAILS, self.RECON_MARKER_PUBLISH_FAILS, self.RECON_MOVE_FAILS)
+        self.assertIn("CANDIDATE_NOT_QUARANTINED", ran.stdout)
+        self.assertIn("INJECTED_QUARANTINE_RENAME_FAILURE", ran.stdout)
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["candidateInvalidated"], result["candidateInvalidMarker"], result["candidateQuarantined"]), (False, False, False))
+        # r4 (B1): the failed move leaves the manifest as the capture wrote it, so the capture is HELD in staging, never published as a candidate
+        held = next((self.agent / "work").glob("reference-frame-*")) / "capture-staging"
+        self.assertTrue((held / "reference-frame-candidate.json").is_file(), "the failed move must leave the manifest as the capture wrote it")
+        self.assertEqual(sorted(p.name for p in held.glob("*INVALID*")), [])
+        self.assertFalse((pub / "capture").exists())
+        self.assert_no_candidate_anywhere_in_the_outbox()
+
+    def test_a_voided_recon_capture_numbers_an_occupied_quarantine_target_the_way_the_225_path_does(self) -> None:
+        # the sweep's row 7: the 225 path numbers .INVALID.json, .INVALID.1.json ...; a fixed name makes the move throw and leaves the candidate name in place
+        plant = (self.RECON_MANIFEST_ANCHOR, self.RECON_MANIFEST_ANCHOR + "; [IO.File]::WriteAllText((Join-Path $captureOut 'reference-frame-candidate.INVALID.json'), 'earlier-run')")
+        ran, pub = self.run_recon_voided("recon-void-occupied", plant, self.RECON_STAMP_PUBLISH_FAILS, self.RECON_MARKER_PUBLISH_FAILS)
+        self.assertNotIn("CANDIDATE_NOT_QUARANTINED", ran.stdout, "the quarantine rename threw on an occupied target")
+        self.assert_voided_publishes(pub, (False, False, True))
+        capture = self.held_capture_dir()
+        self.assertEqual((capture / "reference-frame-candidate.INVALID.json").read_text(encoding="utf-8-sig"), "earlier-run", "an earlier quarantine was overwritten")
+        self.assertIn("candidate-unreviewed", (capture / "reference-frame-candidate.INVALID.1.json").read_text(encoding="utf-8-sig"))
+
+    def test_a_voided_recon_capture_with_no_manifest_publishes_only_the_marker(self) -> None:
+        # nothing to stamp or quarantine (null, as in the 225 path), but the marker is still written by this path, so it is reported as landed
+        ran, pub = self.run_recon_voided("recon-void-nomanifest", self.RECON_MANIFEST_ABSENT)
+        self.assert_voided_publishes(pub, (None, True, None))
+
+    def test_a_voided_recon_capture_whose_view_also_changed_records_both_causes(self) -> None:
+        # the sweep's row 1: 228 wins the exit code, but the steps and the invalid reasons keep the view change, as the 225 path would have recorded it
+        ran, pub = self.run_recon_voided("recon-void-viewchanged", self.VIEW_CHANGED)
+        result = self.assert_voided_publishes(pub, (True, True, None))
+        self.assertEqual((result["steps"]["reconEvidence"], result["steps"]["footageViewIntact"]), (228, 225))
+        self.assertIs(result["footageView"]["intactAfterCapture"], False)
+        marker = json.loads((self.held_capture_dir() / "reference-frame-candidate.invalid").read_text(encoding="utf-8-sig"))
+        self.assertIn("OWNER_FOOTAGE_VIEW_CHANGED_DURING_CAPTURE", marker["invalid_reasons"])
+        self.assertTrue(any(reason.startswith("GPU_RECON_NOT_PROVEN") for reason in marker["invalid_reasons"]), marker)
+
+    # --- key blocker B1 on 3a28fbf2 (sol, fable key3): an unproven 'on' capture is never indexable, even when every voiding layer AND the result fail --
+    # The voiding layers (marker, stamp, quarantine) and result.json are all best effort, and frame_provenance reads an absent / torn / status-less
+    # parent result as "not failed", so no sequence of best-effort writes can make 'unproven' hold. The 'on' job therefore captures into a staging
+    # directory under its own work tree, outside every outbox, and releases it into <outbox>\<job>.artifacts\capture only when it may be indexed
+    # (proven and intact) or is voided (a layer landed, or no candidate manifest is left). Anything else stays in staging.
+    RESULT_PUBLISH_FAILS = ("try { [void](Publish-AttrCudaText -Path (Join-Path $Pub 'result.json')",
+                            "try { throw 'INJECTED_RESULT_PUBLISH_FAILURE'; [void](Publish-AttrCudaText -Path (Join-Path $Pub 'result.json')")
+    # Complete-Failed's fallback result.json is skipped too (its guard reads $PubReady): the parent result is then absent
+    FALLBACK_RESULT_NOT_WRITTEN = ("function Complete-Failed([int]$Code, [string]$Step, [string]$Message) {",
+                                   "function Complete-Failed([int]$Code, [string]$Step, [string]$Message) {\r\n    $PubReady = $false")
+    # a torn result.json: the publish wrote half a document and threw
+    RESULT_TORN = ("try { [void](Publish-AttrCudaText -Path (Join-Path $Pub 'result.json')",
+                   "try { [IO.File]::WriteAllText((Join-Path $Pub 'result.json'), '{\"status\": \"capture-fai'); throw 'INJECTED_TORN_RESULT'; [void](Publish-AttrCudaText -Path (Join-Path $Pub 'result.json')")
+
+    def assert_no_candidate_anywhere_in_the_outbox(self) -> None:
+        indexed = self._frame_provenance().index_capture_records(str(self.agent / "outbox"))
+        self.assertEqual(indexed, {}, "frame_provenance indexes a capture whose GPU recon was not proven")
+
+    def run_recon_every_layer_fails(self, name: str, *more: tuple[str, str]) -> tuple[subprocess.CompletedProcess, Path]:
+        """An 'on' capture with CPU frames (unproven) where the marker, the stamp and the quarantine move all fail, plus whatever else `more` breaks."""
+        ran, pub, *_ = self.run_stand_in_capture(name, generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line(cpu=480, recon=0),
+                                                 edit=self.RECON_STAMP_PUBLISH_FAILS, more_edits=(self.RECON_MARKER_PUBLISH_FAILS, self.RECON_MOVE_FAILS) + more)
+        return ran, pub
+
+    def test_an_unproven_recon_capture_is_not_indexable_when_every_voiding_layer_fails_and_the_parent_result_is_absent(self) -> None:
+        ran, pub = self.run_recon_every_layer_fails("recon-b1-absent", self.FALLBACK_RESULT_NOT_WRITTEN, self.RESULT_PUBLISH_FAILS)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        self.assertFalse((pub / "result.json").exists(), "fixture is stale: the parent result was meant to be absent")
+        self.assert_no_candidate_anywhere_in_the_outbox()
+
+    def test_an_unproven_recon_capture_is_not_indexable_when_every_voiding_layer_fails_and_the_parent_result_is_torn(self) -> None:
+        ran, pub = self.run_recon_every_layer_fails("recon-b1-torn", self.FALLBACK_RESULT_NOT_WRITTEN, self.RESULT_TORN)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        with self.assertRaises(ValueError):
+            json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assert_no_candidate_anywhere_in_the_outbox()
+
+    def test_an_unproven_recon_capture_is_not_indexable_when_every_voiding_layer_fails_and_the_parent_result_is_the_status_less_fallback(self) -> None:
+        ran, pub = self.run_recon_every_layer_fails("recon-b1-fallback", self.RESULT_PUBLISH_FAILS)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        fallback = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((fallback["failedStep"], fallback.get("status")), ("publishResult", None), "fixture is stale: expected the status-less fallback")
+        self.assert_no_candidate_anywhere_in_the_outbox()
+
+    def test_a_recon_capture_the_job_dies_on_before_it_can_void_it_is_not_indexable(self) -> None:
+        # fable's second input: the capture script wrote the manifest as a candidate, and the job process is gone before the marker is written
+        die = (self.RECON_MANIFEST_ANCHOR, self.RECON_MANIFEST_ANCHOR + "; exit 91")
+        ran, *_ = self.run_stand_in_capture("recon-b1-killed", generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line(cpu=480, recon=0), edit=die)
+        self.assertEqual(ran.returncode, 91, ran.stdout + ran.stderr)
+        self.assert_no_candidate_anywhere_in_the_outbox()
+
+    def test_a_recon_capture_with_the_footage_view_changed_and_every_voiding_layer_failing_is_not_indexable_even_with_the_result_gone(self) -> None:
+        # the 225 sibling: counters are fine, so the capture is GPU-proven, but a view changed; the same fail-closed placement applies
+        ran, pub, *_ = self.run_stand_in_capture("recon-b1-225", generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line(),
+                                                 edit=self.VIEW_CHANGED,
+                                                 more_edits=(self.STAMP_PUBLISH_FAILS, self.MARKER_PUBLISH_FAILS,
+                                                             ("Move-Item -LiteralPath $candidatePath -Destination ", "throw 'INJECTED_QUARANTINE_RENAME_FAILURE'; Move-Item -LiteralPath $candidatePath -Destination "),
+                                                             self.FALLBACK_RESULT_NOT_WRITTEN, self.RESULT_PUBLISH_FAILS))
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        self.assert_no_candidate_anywhere_in_the_outbox()
+
+    # --- adversary A1 on ac80ede1 (introduced major): the stamp assumes the manifest is a JSON object -------------------------------------------------
+    # A manifest whose root is an ARRAY parses, takes the stamp on every element and serializes back as an array, so the stamp "lands" ($true) but
+    # frame_provenance does not read an array root as stamped, and the voided capture is released and indexed. The stamp therefore requires an object
+    # root; any other root counts as "stamp failed", which sends the job on to the sibling marker and then the quarantine rename.
+    ARRAY_ROOT = "'[{\"status\":\"candidate-unreviewed\"},{\"status\":\"candidate-unreviewed\"}]'"
+    RECON_MANIFEST_ARRAY_ROOT = (RECON_MANIFEST_ANCHOR, RECON_MANIFEST_ANCHOR + "; [IO.File]::WriteAllText($reconManifestPath, " + ARRAY_ROOT + ")")
+    CANDIDATE_MANIFEST_ARRAY_ROOT = ("$candidatePath = Join-Path $captureOut 'reference-frame-candidate.json'",
+                                     "$candidatePath = Join-Path $captureOut 'reference-frame-candidate.json'; [IO.File]::WriteAllText($candidatePath, " + ARRAY_ROOT + ")")
+
+    def test_the_result_gone_and_the_marker_failing_an_unproven_recon_capture_with_an_array_root_manifest_is_not_indexable(self) -> None:
+        ran, pub, *_ = self.run_stand_in_capture("recon-a1-array228", generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line(cpu=480, recon=0),
+                                                 edit=self.RECON_MANIFEST_ARRAY_ROOT,
+                                                 more_edits=(self.RECON_MARKER_PUBLISH_FAILS, self.FALLBACK_RESULT_NOT_WRITTEN, self.RESULT_PUBLISH_FAILS))
+        self.assertIn("CANDIDATE_NOT_INVALIDATED", ran.stdout, "the stamp claimed to land on a manifest whose root is not an object")
+        self.assert_no_candidate_anywhere_in_the_outbox()
+
+    def test_the_225_sibling_a_view_changed_capture_with_an_array_root_manifest_and_no_marker_or_result_is_not_indexable(self) -> None:
+        # the 225 sibling on an 'on' job (the recon is proven, so only the view change voids it). An 'off' job's 225 path is the base's, byte for byte, and is not
+        # changed by this card (test_the_default_job_keeps_the_exact_text_around_every_recon_seam pins its text).
+        ran, *_ = self.run_stand_in_capture("a1-array225", generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line(), edit=self.VIEW_CHANGED,
+                                            more_edits=(self.CANDIDATE_MANIFEST_ARRAY_ROOT, self.MARKER_PUBLISH_FAILS, self.FALLBACK_RESULT_NOT_WRITTEN, self.RESULT_PUBLISH_FAILS))
+        self.assertIn("CANDIDATE_NOT_INVALIDATED", ran.stdout, "the stamp claimed to land on a manifest whose root is not an object")
+        self.assert_no_candidate_anywhere_in_the_outbox()
+
+    def test_a_recon_capture_the_job_could_not_void_stays_in_staging_and_result_json_says_where(self) -> None:
+        ran, pub = self.run_recon_voided("recon-b1-held", self.RECON_STAMP_PUBLISH_FAILS, self.RECON_MARKER_PUBLISH_FAILS, self.RECON_MOVE_FAILS)
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["candidateInvalidated"], result["candidateInvalidMarker"], result["candidateQuarantined"]), (False, False, False))
+        self.assertIs(result["captureStaging"]["published"], False)
+        self.assertIs(result["captureStaging"]["held"], True)
+        work = next((self.agent / "work").glob("reference-frame-*"))
+        self.assertTrue((work / "capture-staging" / "reference-frame-candidate.json").is_file(), "the held capture is not in staging")
+        self.assertFalse((pub / "capture").exists(), "a capture the job could not void was published")
+        self.assert_no_candidate_anywhere_in_the_outbox()
+
+    def test_a_proven_recon_capture_is_published_out_of_staging_and_is_indexable(self) -> None:
+        ran, pub, *_ = self.run_stand_in_capture("recon-b1-released", generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line())
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["captureStaging"]["published"], result["captureStaging"]["held"]), (True, False))
+        self.assertFalse((next((self.agent / "work").glob("reference-frame-*")) / "capture-staging").exists(), "the staging directory outlived its release")
+        self.assertEqual(len(self._frame_provenance().index_capture_records(str(self.agent / "outbox"))), 1)
+
+    def test_a_proven_recon_capture_that_cannot_be_published_out_of_staging_is_a_typed_failure_and_not_indexable(self) -> None:
+        stuck = ("Move-Item -LiteralPath $captureOut -Destination ", "throw 'INJECTED_RELEASE_FAILURE'; Move-Item -LiteralPath $captureOut -Destination ")
+        ran, pub, *_ = self.run_stand_in_capture("recon-b1-release-fails", generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line(), edit=stuck)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        self.assertIn("RESULT=REFERENCE_FRAME_FAILED STEP=publishResult EXIT=223", ran.stdout)
+        self.assertIn("INJECTED_RELEASE_FAILURE", ran.stdout)
+        self.assert_no_candidate_anywhere_in_the_outbox()
+
+    # --- r7 (key blockers B1 and B2 on 66e7595f; sol r6, opus r6) ---------------------------------------------------------------------------------
+    # B1: r4 released a voided capture when ANY voiding layer landed. The stamp alone is not a release ticket: frame_provenance reads a manifest it cannot
+    # open as "not stamped" and an absent / torn / status-less parent result as "not failed", so a first manifest read that fails transiently (a sharing
+    # violation, an SMB hiccup) indexes a capture the job had voided, and build() then counts it as matched. The 'on' job releases into the outbox ONLY a
+    # proven candidate; every other capture is HELD in staging whatever mix of marker, stamp and quarantine landed.
+    def flaky_first_manifest_read(self):
+        """frame_provenance whose first open of a candidate manifest raises PermissionError (the lock clears before the second read)."""
+        fp = self._frame_provenance()
+        real_open = open
+        state = {"failed": False}
+
+        def flaky_open(path, *args, **kwargs):
+            if not state["failed"] and str(path).endswith("reference-frame-candidate.json"):
+                state["failed"] = True
+                raise PermissionError(13, "INJECTED_SHARING_VIOLATION", str(path))
+            return real_open(path, *args, **kwargs)
+
+        fp.open = flaky_open
+        return fp
+
+    def assert_held_and_never_indexed_or_counted(self, name: str, pub: Path) -> None:
+        self.assertFalse((pub / "capture").exists(), "a capture that was not proven was released into the outbox")
+        self.assertTrue((self.held_capture_dir() / "reference-frame.png").is_file(), "the held capture is not in staging")
+        frames = self.tmp / f"frames-{name}"
+        frames.mkdir()
+        (frames / "frame.png").write_bytes(b"\0" * 65536)   # the stand-in app's grab: the exact bytes of the capture's image
+        report = self.flaky_first_manifest_read().build(str(frames), str(self.agent / "outbox"))
+        self.assertEqual((report["recordsIndexed"], report["matched"]), (0, 0), "frame_provenance indexed or counted a capture that was not proven")
+
+    def run_recon_unproven(self, name: str, *edits: tuple[str, str], cpu: int = 480, recon: int = 0) -> tuple[subprocess.CompletedProcess, Path]:
+        ran, pub, *_ = self.run_stand_in_capture(name, generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line(cpu=cpu, recon=recon),
+                                                 edit=edits[0] if edits else None, more_edits=tuple(edits[1:]))
+        return ran, pub
+
+    def test_b1_held_never_indexed_stamp_only_result_absent(self) -> None:
+        ran, pub = self.run_recon_unproven("r7-b1-absent", self.RECON_MARKER_PUBLISH_FAILS, self.FALLBACK_RESULT_NOT_WRITTEN, self.RESULT_PUBLISH_FAILS)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        self.assertFalse((pub / "result.json").exists(), "fixture is stale: the parent result was meant to be absent")
+        self.assert_held_and_never_indexed_or_counted("r7-b1-absent", pub)
+
+    def test_b1_held_never_indexed_stamp_only_result_torn(self) -> None:
+        ran, pub = self.run_recon_unproven("r7-b1-torn", self.RECON_MARKER_PUBLISH_FAILS, self.FALLBACK_RESULT_NOT_WRITTEN, self.RESULT_TORN)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        with self.assertRaises(ValueError):
+            json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assert_held_and_never_indexed_or_counted("r7-b1-torn", pub)
+
+    def test_b1_held_never_indexed_stamp_only_result_status_less(self) -> None:
+        ran, pub = self.run_recon_unproven("r7-b1-fallback", self.RECON_MARKER_PUBLISH_FAILS, self.RESULT_PUBLISH_FAILS)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        fallback = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((fallback["failedStep"], fallback.get("status")), ("publishResult", None), "fixture is stale: expected the status-less fallback")
+        self.assert_held_and_never_indexed_or_counted("r7-b1-fallback", pub)
+
+    def test_b1_held_never_indexed_twin_marker_only(self) -> None:
+        ran, pub = self.run_recon_unproven("r7-b1-twin-marker", self.RECON_STAMP_PUBLISH_FAILS, self.FALLBACK_RESULT_NOT_WRITTEN, self.RESULT_PUBLISH_FAILS)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        self.assertTrue((self.held_capture_dir() / "reference-frame-candidate.invalid").is_file(), "fixture is stale: the marker was meant to land")
+        self.assert_held_and_never_indexed_or_counted("r7-b1-twin-marker", pub)
+
+    def test_b1_held_never_indexed_twin_both_fail_quarantined(self) -> None:
+        ran, pub = self.run_recon_unproven("r7-b1-twin-both-fail", self.RECON_STAMP_PUBLISH_FAILS, self.RECON_MARKER_PUBLISH_FAILS, self.FALLBACK_RESULT_NOT_WRITTEN,
+                                           self.RESULT_PUBLISH_FAILS)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        self.assertTrue((self.held_capture_dir() / "reference-frame-candidate.INVALID.json").is_file(), "fixture is stale: the quarantine was meant to land")
+        self.assert_held_and_never_indexed_or_counted("r7-b1-twin-both-fail", pub)
+
+    def test_b1_held_never_indexed_twin_both_landed(self) -> None:
+        ran, pub = self.run_recon_unproven("r7-b1-twin-both-land", self.FALLBACK_RESULT_NOT_WRITTEN, self.RESULT_PUBLISH_FAILS)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        self.assertTrue((self.held_capture_dir() / "reference-frame-candidate.invalid").is_file(), "fixture is stale: the marker was meant to land")
+        self.assert_held_and_never_indexed_or_counted("r7-b1-twin-both-land", pub)
+
+    def test_b1_held_never_indexed_the_225_door(self) -> None:
+        # opus r6's second door: counters are fine (the recon is proven), a footage view changed, the marker fails, the stamp lands, the result is gone
+        ran, pub = self.run_recon_unproven("r7-b1-225", self.VIEW_CHANGED, self.MARKER_PUBLISH_FAILS, self.FALLBACK_RESULT_NOT_WRITTEN, self.RESULT_PUBLISH_FAILS, cpu=0, recon=480)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        self.assert_held_and_never_indexed_or_counted("r7-b1-225", pub)
+
+    def test_b1_held_capture_says_so_in_result_json(self) -> None:
+        ran, pub = self.run_recon_unproven("r7-b1-held-says", self.RECON_MARKER_PUBLISH_FAILS)
+        self.assertEqual(ran.returncode, 228, ran.stdout + ran.stderr)
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["captureStaging"]["published"], result["captureStaging"]["held"]), (False, True))
+        self.assertEqual((result["candidateInvalidated"], result["candidateInvalidMarker"]), (True, False))
+        self.assertIn("CAPTURE_HELD_IN_STAGING", ran.stdout)
+        self.assert_held_and_never_indexed_or_counted("r7-b1-held-says", pub)
+
+    def test_b1_proven_capture_still_released(self) -> None:
+        ran, pub, *_ = self.run_stand_in_capture("r7-b1-proven", generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line())
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+        self.assertEqual(len(self._frame_provenance().index_capture_records(str(self.agent / "outbox"))), 1)
+
+    # B2: the release moves the image from staging to the outbox, so the manifest the capture wrote (it names the staging image) must be rewritten to name the
+    # published image. The rewrite happens WHILE the capture is still held in staging, and the release is then ONE directory rename that carries the
+    # manifest and the image into the outbox together: a reader of the outbox never meets a manifest that names an image the outbox does not hold.
+    def assert_published_manifest_names_the_published_image(self, name: str, log: str, *, edits: tuple[tuple[str, str], ...] = ()) -> tuple[dict, Path]:
+        ran, pub, *_ = self.run_stand_in_capture(name, generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=log,
+                                                 edit=edits[0] if edits else None, more_edits=tuple(edits[1:]))
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+        published = pub / "capture"
+        manifest_bytes = (published / "reference-frame-candidate.json").read_bytes()
+        manifest = json.loads(manifest_bytes.decode("utf-8-sig"))
+        named = Path(manifest["artifact"]["path"])
+        norm = lambda p: os.path.normcase(os.path.normpath(str(p)))   # noqa: E731
+        self.assertEqual(norm(named), norm(published / "reference-frame.png"), "the published manifest does not name the published image")
+        self.assertTrue(named.is_file(), "the image the published manifest names does not exist")
+        self.assertEqual(manifest["artifact"]["sha256"].lower(), hashlib.sha256(named.read_bytes()).hexdigest())
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual(result["candidateSha256"], hashlib.sha256(manifest_bytes).hexdigest(), "result.json names the manifest as the capture wrote it, not as published")
+        return manifest, published
+
+    def test_b2_published_manifest_recon_readback_counter(self) -> None:
+        self.assert_published_manifest_names_the_published_image("r7-b2-recon", self.gpu_summary_line(recon=480))
+
+    def test_b2_published_manifest_texture_readback_counter(self) -> None:
+        self.assert_published_manifest_names_the_published_image("r7-b2-texture", self.gpu_summary_line(recon=0, texture_readback=480))
+
+    def test_b2_published_manifest_texture_no_readback_counter(self) -> None:
+        self.assert_published_manifest_names_the_published_image("r7-b2-texture-nr", self.gpu_summary_line(recon=0, texture_no_readback=480))
+
+    def test_b2_app_log_named_beside_published_image(self) -> None:
+        manifest, published = self.assert_published_manifest_names_the_published_image("r7-b2-applog-leaf", self.gpu_summary_line())
+        leaf = manifest["settings"]["appLog"]
+        self.assertEqual(os.path.basename(leaf), leaf, "the capture script writes the app log as a leaf name")
+        self.assertTrue((published / leaf).is_file(), "the app log the manifest names is not beside the published image")
+        # the same treatment as artifact.path: a manifest that names the app log by a staging PATH names the published one after the release
+        path_valued = ("$candidatePath = Join-Path $captureOut 'reference-frame-candidate.json'",
+                       "$candidatePath = Join-Path $captureOut 'reference-frame-candidate.json'; $d = [IO.File]::ReadAllText($candidatePath) | ConvertFrom-Json; "
+                       "$d.settings.appLog = (Join-Path $captureOut $d.settings.appLog); [IO.File]::WriteAllText($candidatePath, ($d | ConvertTo-Json -Depth 64))")
+        manifest2, published2 = self.assert_published_manifest_names_the_published_image("r7-b2-applog-path", self.gpu_summary_line(), edits=(path_valued,))
+        norm = lambda p: os.path.normcase(os.path.normpath(str(p)))   # noqa: E731
+        self.assertEqual(norm(manifest2["settings"]["appLog"]), norm(published2 / leaf))
+        self.assertTrue(Path(manifest2["settings"]["appLog"]).is_file())
+
+    def test_b2_manifest_that_cannot_be_rewritten_is_held(self) -> None:
+        ran, pub, *_ = self.run_stand_in_capture("r7-b2-unparseable", generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line(), edit=self.UNPARSEABLE_MANIFEST)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        self.assertIn("CAPTURE_NOT_PUBLISHED", ran.stdout)
+        self.assert_held_and_never_indexed_or_counted("r7-b2-unparseable", pub)
+
+    def test_b2_failed_release_leaves_held_manifest_as_written(self) -> None:
+        stuck = ("Move-Item -LiteralPath $captureOut -Destination ", "throw 'INJECTED_RELEASE_FAILURE'; Move-Item -LiteralPath $captureOut -Destination ")
+        ran, pub, *_ = self.run_stand_in_capture("r7-b2-move-fails", generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line(), edit=stuck)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        held = self.held_capture_dir()
+        manifest = json.loads((held / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
+        norm = lambda p: os.path.normcase(os.path.normpath(str(p)))   # noqa: E731
+        self.assertEqual(norm(manifest["artifact"]["path"]), norm(held / "reference-frame.png"), "the held manifest names an outbox image that was never published")
+        self.assert_held_and_never_indexed_or_counted("r7-b2-move-fails", pub)
+
+    def test_b2_rewrite_precedes_the_one_rename(self) -> None:
+        # the order is the contract: rewrite while held, then a single Move-Item of the whole capture directory (image and manifest together)
+        text = GENERATOR.read_text(encoding="utf-8")
+        release = text[text.index("$captureMayPublish = $candidateOk"):text.index("if ($captureStaging.held) { Say \"CAPTURE_HELD_IN_STAGING")]
+        self.assertLess(release.index("Publish-AttrCudaText -Path $candidatePath"), release.index("Move-Item -LiteralPath $captureOut"))
+        self.assertEqual(release.count("Move-Item"), 1)
+
+    def test_b1_release_rule_is_proven_only(self) -> None:
+        text = GENERATOR.read_text(encoding="utf-8")
+        release = text[text.index("$captureMayPublish = $candidateOk"):text.index("if ($captureStaging.held) { Say \"CAPTURE_HELD_IN_STAGING")]
+        for stale in ("$candidateInvalidated -eq $true", "$candidateInvalidMarker -eq $true", "candidateMarkerPath -PathType Leaf", "-not (Test-Path -LiteralPath $candidatePath"):
+            self.assertNotIn(stale, release, f"the release still lets {stale!r} open the outbox for a capture that is not proven")
+
+    def test_a_recon_on_capture_with_the_real_counters_and_a_trailing_source_location_is_still_a_candidate(self) -> None:
+        # the gate must not turn a harmless suffix into a false refusal: the location here carries no counter-shaped token
+        ran, pub, *_ = self.run_stand_in_capture("recon-suffix-ok", generator_args=("-GpuPlaybackRecon", "on"),
+                                                 app_log_extra=self.gpu_summary_line(suffix=" (C:/build x/platform/qt/MainWindow.cpp:31715)"))
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["status"], result["gpuReconEvidence"]["cpuFrames"], result["gpuReconEvidence"]["reconFrames"]), ("candidate-unreviewed", 0, 480))
+
+    def test_a_default_job_does_not_read_the_gpu_summary_and_still_passes_with_cpu_frames(self) -> None:
+        # off = CPU reconstruction is legitimate: the evidence gate belongs to 'on' only
+        ran, pub, *_ = self.run_stand_in_capture("reconoff-cpu", app_log_extra=self.gpu_summary_line(cpu=480, recon=0))
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertNotIn("gpuReconEvidence", result)
+        self.assertNotIn("reconEvidence", result["steps"])
+
+    def test_a_default_job_launches_the_app_with_no_recon_env_and_result_json_names_no_recon_setting(self) -> None:
+        probe = self.tmp / "recon-off-env.txt"
+        ran, pub, _part, _sha, _args, _marker = self.run_stand_in_capture("reconoff", env_probe=probe)
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+        self.assertEqual(self.probed_env(probe), {}, "a default job passed a recon variable to the app")
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertNotIn("gpuPlaybackRecon", result["captureParameters"])
+        manifest = json.loads((pub / "capture" / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual([name for name in manifest["settings"]["envApplied"] if name.startswith("MLVAPP_GPU_PLAYBACK_RECON")], [])
 
     # --- r4 (CoS 81b6c553 P2): the emitted job itself refuses a receipt profile, before anything is written or launched ---------------------------
     def test_an_emitted_job_carrying_a_receipt_profile_refuses_before_anything_is_written_or_launched(self) -> None:

@@ -33,6 +33,7 @@
 #include "../../src/batch/LookAssistAnalysis.h"   // LookAssistFlavor, and the LookAssistAppliedMarker member below
 #include "LookAssistAnalysisPump.h"
 #include "LookLabelPolicy.h"                        // look_label::LabelGrade member below (r16)
+#include "ViewerCursorSurfaces.h"                   // PLAYER-CURSOR-AUTOHIDE-1 viewer_idle members below
 #include "ViewerDoubleClickPolicy.h"                // viewer_dblclick::Gate member below (PLAYER-DOUBLECLICK-FULLSCREEN-1)
 #include "SessionModel.h"
 #include "PlaybackFrameRange.h"
@@ -75,6 +76,7 @@
 #include "PlaybackConformPolicy.h"
 #include "PlaybackSourceAdvanceTracker.h"
 #include "batch/BatchTypes.h"
+#include "FullscreenControlBarPolicy.h"   // PLAYER-FULLSCREEN-CONTROL-BAR-1 fullscreen_bar members below
 #include <atomic>
 #include <deque>
 #include <functional>
@@ -95,6 +97,7 @@ class QAction;
 class QElapsedTimer;
 class QScreen;
 class QWindow;
+class FullscreenControlBarWidget;
 
 class MainWindow : public QMainWindow
 {
@@ -918,6 +921,39 @@ private:
     bool m_dontDraw;
     bool m_frameStillDrawing;
     bool m_fileLoaded = false;
+    // PLAYER-CURSOR-AUTOHIDE-1: fullscreen cursor auto-hide (one idle clock, shared later by
+    // PLAYER-FULLSCREEN-CONTROL-BAR-1; no second timer).
+    viewer_idle::Surfaces viewerIdleSurfaces( void ) const;
+    viewer_idle::Inputs viewerIdleInputs( void ) const;
+    void viewerIdleRestore( void );
+    void viewerIdleFullscreenChanged( bool on );
+    void viewerIdleWindowStateChanged( void );
+    void viewerIdleTimeout( void );
+    void viewerIdleNoteEvent( QObject *watched, QEvent *event );
+    QTimer *m_viewerIdleTimer = nullptr;
+    QElapsedTimer m_viewerIdleClock;
+    viewer_idle::Controller m_viewerIdle;
+    viewer_idle::CursorHider m_viewerCursorHider;
+    QPointF m_viewerIdleLastGlobal;
+    bool m_viewerIdleHaveLast = false;
+    viewer_idle::PointerWatch m_viewerIdlePointer;
+    // PLAYER-FULLSCREEN-CONTROL-BAR-1: the fullscreen control bar on the idle clock above (no second timer).
+    void viewerIdleApplyShown( bool shown, bool byActivity );
+    bool fullscreenBarShown( void ) const;
+    void fullscreenBarSetShown( bool shown );
+    void fullscreenBarFeed( int frameIndex = -1 );
+    void fullscreenBarSyncPlayState( void );
+    bool fullscreenBarHeld( void ) const;
+    bool fullscreenBarInput( const fullscreen_bar::Layout &layout, QEvent *event, const QPointF &devicePos, bool fromWidget );
+    bool fullscreenBarRouteGpuEvent( QObject *watched, QEvent *event );
+    void fullscreenBarEmitSummary( void );
+    FullscreenControlBarWidget *m_fullscreenBarWidget = nullptr;
+    QMetaObject::Connection m_fullscreenBarSliderFeed;
+    bool m_fullscreenBarFrameFeed = false;   // true only while shown: drawFrameNumberLabel feeds each presented frame
+    fullscreen_bar::InputState m_fullscreenBarInput;
+    QPoint m_fullscreenBarEntryPos;
+    bool m_fullscreenBarSawMove = false;
+    bool m_fullscreenBarSummaryEmitted = false;
     bool m_inOpeningProcess;
     bool m_setSliders;
     int m_timerId;
