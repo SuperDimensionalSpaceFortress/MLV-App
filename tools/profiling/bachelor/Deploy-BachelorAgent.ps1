@@ -16,7 +16,8 @@
 #                 agent sees it on Bachelor, or the share path the board uses. Required. For -RestartMode when-idle it must
 #                 be the agent's own local root: the restart is bound to the agent whose script is <VenueRoot>\ultra-magnus-agent.ps1.
 #   -Source       the agent to deploy. Default: ultra-magnus-agent.ps1 beside this script (the tracked file).
-#   -DryRun       run every check and print what would happen; change nothing (it takes no lock). A refusal is still a refusal.
+#   -DryRun       run every check and print what would happen; change nothing (it takes no lock). A refusal is still a refusal,
+#                 except the restart decision, which a dry run reports (decision= wouldExit=) instead of exiting on it.
 #   -RestartMode  none (default) | when-idle. when-idle restarts the agent after a verified deploy, and only when running\
 #                 and inbox\ still hold no live job and no lease is held at that moment ("live" = the busy predicate below).
 #   -RestartScript, -TaskXmlFile, -TestCorruptAfterWrite  test seams (see below); not for the venue.
@@ -28,6 +29,13 @@
 #      this process even if killed). Two deployers on one root could each judge "no previous copy" and one would delete the
 #      other's verified deploy; the second is refused (DEPLOY_REFUSED_LOCKED). A leftover deploy.lock is never removed by this script.
 #   4. the venue copy already has that sha -> DEPLOY_NOOP, exit 0 (idempotent; nothing is touched, busy or not).
+#      With -RestartMode when-idle a no-op still writes nothing, but the live agent may be running an OLDER script it read before
+#      the file was written (a copy-only deploy, or a crash after the write): the restart binding below must hold, and the agent is
+#      restarted (the step 8 path, on the same idle gate). No file or process time proves which bytes a running agent loaded (a copy
+#      can carry old file times, a clock step reorders any two wall-clock times), so a when-idle no-op never reports "current": it
+#      restarts, and reads no file time at all (Get-NoopRestartDecision). -RestartMode none = no restart.
+#      On the real path a heartbeat whose start cannot be read is a binding refusal (16); with the -RestartScript seam (no binding)
+#      it is `restarted=no reason=unreadable`, exit 12, never a silent success.
 #   5. busy or leased -> typed refusal, nothing changed (table below). Busy is ONE predicate ($script:LiveWorkRules): an
 #      inbox\*.job.ps1, a running\*.started.json or an unresolved marker tmp, each read with the agent's own call; any other
 #      entry is an ignored leftover (DEPLOY_IGNORED_LEFTOVERS, printed after step 2): not busy, and never deleted, moved or
@@ -40,8 +48,17 @@
 #   9. DEPLOY_OK sha=<s> rollback=<path|none> restarted=<yes|no>
 #
 # Typed lines (stdout) and exit codes - the hub parses these
-#   DEPLOY_NOOP sha=<s>                                          0
-#   DEPLOY_DRYRUN action=<deploy|noop> sha=<s> restart=<mode>   0
+#   DEPLOY_NOOP sha=<s>                                          0   (-RestartMode none: this exact line, busy or not)
+#   DEPLOY_NOOP sha=<s> restarted=yes reason=loaded-script-unproven pid=<n> agentStartUtc=<t>
+#                                                                0   (when-idle; the times are information, never the decision)
+#   DEPLOY_NOOP sha=<s> restarted=no reason=<unreadable|no-live-agent|restart-host-refused|busy|lease|restart-failed> ...
+#                                                                12|16|16|10|11|14 (when-idle; after the matching typed line;
+#                                                                unreadable and no-live-agent: the -RestartScript seam only)
+#   DEPLOY_DRYRUN action=<deploy|noop> sha=<s> restart=<mode>   0   (-RestartMode none)
+#   DEPLOY_DRYRUN action=deploy sha=<s> restart=when-idle decision=<restart-if-idle wouldExit=0|refuse wouldExit=16 why=<..>>   0
+#   DEPLOY_DRYRUN action=noop sha=<s> restart=when-idle decision=<restart|no-restart> reason=<as DEPLOY_NOOP> wouldExit=<n> ...  0
+#                 (a dry run REPORTS the restart decision, including a binding that does not hold, instead of exiting 16/12;
+#                 a busy, leased or unreadable venue is still a refusal, judged before any of these lines, NOOP or deploy)
 #   DEPLOY_OK sha=<s> rollback=<path|none> restarted=<yes|no>    0
 #   DEPLOY_WARN_ARRIVED_DURING_RESTART running=<n> inbox=<n> ... 0  (printed before DEPLOY_OK; see "Residual race")
 #   DEPLOY_IGNORED_LEFTOVERS ignored=<n> (<per folder>) ...      -  (informational, after step 2, only when n > 0; no exit of its own)
@@ -171,6 +188,18 @@ foreach ($pathParam in 'Source', 'VenueRoot', 'RestartScript', 'TaskXmlFile', 'T
         exit 12
     }
     Set-Variable -Name $pathParam -Value $pathNormalized
+}
+# -RestartMode is reduced to its ONE canonical spelling here, so every later dispatch reads exactly 'none' or 'when-idle' (adversary pass
+# 3 A1 of e7cfa491). ValidateSet compares culture-aware and ignores characters such as a soft hyphen (U+00AD): it accepted
+# 'when<U+00AD>-idle', which no ordinal dispatch below matched, so that run skipped the binding, the refusals and the restart as if it
+# were 'none'. A mode that is not ordinally (case-insensitively) one of the two is a typed refusal, before anything is read or changed.
+if ([string]::Equals([string]$RestartMode, 'when-idle', [System.StringComparison]::OrdinalIgnoreCase)) { $RestartMode = 'when-idle' }
+elseif ([string]::Equals([string]$RestartMode, 'none', [System.StringComparison]::OrdinalIgnoreCase)) { $RestartMode = 'none' }
+else {
+    $modeWhy = "-RestartMode '$RestartMode' is not none or when-idle (it holds a character the parameter check ignores); retype it"
+    if ($pathDotSourced) { throw $modeWhy }
+    Write-Output "DEPLOY_REFUSED_UNREADABLE $modeWhy"
+    exit 12
 }
 $agentName = 'ultra-magnus-agent.ps1'
 # ONE tolerance for "same process start": the heartbeat's processStartUtc against the live process (alive check) and the old
@@ -1320,6 +1349,66 @@ function Invoke-AgentRestart {
     return @{ why = $null; warn = $warn }
 }
 
+function Get-NoopRefusalReason {
+    # the reason= a NOOP's DEPLOY_NOOP restarted=no line gives for a Get-Refusals code: it names the refusal that was observed
+    # (adversary pass 3 A2 of e7cfa491: an unreadable venue said reason=busy)
+    param([int]$Code)
+    switch ($Code) {
+        10 { return 'busy' }
+        11 { return 'lease' }
+        12 { return 'unreadable' }
+        default { return "refused-$Code" }
+    }
+}
+
+function Get-NoopRestartDecision {
+    # BACHELOR-DEPLOY-NOOP-SKIPS-RESTART-1: the venue copy already has the source sha, so nothing is written; with -RestartMode when-idle
+    # the question is whether the LIVE agent runs that file or an older one it read before the file was written (a copy-only deploy, or a
+    # crash after the write). NOTHING ON THIS SIDE CAN PROVE WHICH BYTES A RUNNING PROCESS LOADED: the agent records no hash of its own
+    # script, and "it started after the file was written" compares two WALL-CLOCK times. A copy can carry its source's write and creation
+    # times (adversary pass 1 A1 of 100e87dc: Copy-Item, robocopy), and a clock stepped back after the agent started makes a copy that
+    # landed LATER read as EARLIER, change time included (pass 2 A1 of a4389eb1: NTP, a manual set, a VM resume). So a when-idle no-op
+    # never attests "current": it restarts the live agent (on the binding and the idle gate, like a deploy), and it reads no file time
+    # at all. The one way to say "do not restart" is -RestartMode none.
+    # Returns @{ restart; reason; detail; code }:
+    #   restart=$true  reason=loaded-script-unproven         the live agent is identified; it is restarted
+    #   restart=$false reason=unreadable      code 12  (the -RestartScript seam only) the heartbeat start cannot be read, so the live
+    #                                                  process cannot be identified; never a silent success
+    #   restart=$false reason=no-live-agent   code 16  (the -RestartScript seam only) the heartbeat pid is not a live process with its start
+    # On the real path the restart binding has already proved the live agent (it refuses with 16 BEFORE this runs, an unreadable
+    # heartbeat start included), so there this always returns restart=$true.
+    # $Beat: the heartbeat the restart binding proved (it carries osStart, the start the OS reported for the pid), or $null when no binding
+    # ran (the -RestartScript seam), in which case the heartbeat is read here and held to the same "live, with its recorded start" test.
+    param([string]$AgentScript, $Beat)
+    $unreadable = { param([string]$Why) return @{ restart = $false; reason = 'unreadable'; detail = $Why; code = 12 } }
+    $startText = $null
+    if ($null -ne $Beat -and -not [string]::IsNullOrWhiteSpace([string]$Beat.osStart)) { $startText = [string]$Beat.osStart }
+    else {
+        $Beat = Read-HeartbeatBounded
+        if ($null -eq $Beat) { return (& $unreadable 'heartbeat.txt is missing, unreadable or did not answer in time, so the agent start is unknown') }
+        if ([string]::IsNullOrWhiteSpace([string]$Beat.start)) { return (& $unreadable "heartbeat pid=$($Beat.pid) records no processStartUtc, so the agent start is unknown") }
+        try { [void](ConvertTo-UtcStart -Text $Beat.start) }
+        catch { return (& $unreadable "heartbeat processStartUtc=$($Beat.start) is not a time") }
+        if (-not (Test-AgentProcessAlive -Beat $Beat -RequireStart)) {
+            return @{ restart = $false; reason = 'no-live-agent'; detail = "heartbeat pid=$($Beat.pid) is not a live agent process with the recorded start time; start the agent task by hand"; code = 16 }
+        }
+        try {
+            $proc = Get-LiveProcess -ProcessId $Beat.pid
+            if ($null -eq $proc) { return @{ restart = $false; reason = 'no-live-agent'; detail = "heartbeat pid=$($Beat.pid) is no longer a running process"; code = 16 } }
+            $startText = $proc.StartTime.ToUniversalTime().ToString('o')
+        }
+        catch { return (& $unreadable "the OS start time of heartbeat pid=$($Beat.pid) could not be read: $($_.Exception.Message)") }
+    }
+    try { $agentStart = ConvertTo-UtcStart -Text $startText }
+    catch { return (& $unreadable "the agent start $startText is not a time") }
+    # No file time is read (sol r2 B1 of bf28f1bd, adversary pass 5 A1 of a7c1fa5a): the times never decided, and each read of them was
+    # a synchronous metadata request to the venue that a stalled share could hold, together with deploy.lock (unbounded), or that kept
+    # the process alive after its deadline (bounded: an abandoned runspace stuck in the call holds pwsh's shutdown). A NOOP makes no
+    # request beyond the hash, the heartbeat, the binding and the idle reads it shares with a deploy.
+    $detail = "pid=$($Beat.pid) agentStartUtc=$($agentStart.ToString('o'))"
+    return @{ restart = $true; reason = 'loaded-script-unproven'; detail = $detail; code = 0 }
+}
+
 # Dot-sourced (`. <script> -VenueRoot <x>`): the functions above only.
 if ([string]::Equals([string]$MyInvocation.InvocationName, '.', [System.StringComparison]::Ordinal)) { return }
 
@@ -1371,18 +1460,70 @@ try {
             exit 12
         }
     }
-    if ($destExists -and $destSha -ceq $srcSha) {
+    $isNoop = $destExists -and $destSha -ceq $srcSha
+    $whenIdle = [string]::Equals([string]$RestartMode, 'when-idle', [System.StringComparison]::OrdinalIgnoreCase)
+    if ($isNoop -and -not $whenIdle) {
         Out-Typed "DEPLOY_NOOP sha=$srcSha"
         exit 0
     }
 
-    # restart binding precheck: nothing may change if the restart could not be done safely afterwards
-    if ([string]::Equals([string]$RestartMode, 'when-idle', [System.StringComparison]::OrdinalIgnoreCase) -and $RestartScript.Length -eq 0) {
+    # restart binding precheck: nothing may change if the restart could not be done safely afterwards. A dry run REPORTS a binding that
+    # does not hold (decision=refuse wouldExit=16) and goes on: run from a machine that is not the agent host (the hub, over the share),
+    # the binding can never hold, and a dry run that stopped at it would prove nothing about the rest of the deploy.
+    $bind = $null
+    if ($whenIdle -and $RestartScript.Length -eq 0) {
         $bind = Get-RestartBindingRefusal -AgentScript $dest
-        if ($null -ne $bind) {
+        if ($null -ne $bind -and -not $DryRun) {
             Out-Typed "DEPLOY_REFUSED_RESTART_HOST $bind"
+            if ($isNoop) { Out-Typed "DEPLOY_NOOP sha=$srcSha restarted=no reason=restart-host-refused" }
             exit 16
         }
+    }
+
+    # 4b. a no-op with -RestartMode when-idle: restart the live agent (Get-NoopRestartDecision: which bytes it loaded cannot be proved),
+    # on the same idle gate and the same restart path as a deploy. Nothing is written either way.
+    if ($isNoop) {
+        # a dry run's refusals stay refusals (adversary A2 of 100e87dc): busy, leased or unreadable is judged BEFORE any dry-run report
+        # below, whatever restart decision would follow, exactly as a dry deploy judges it before its DEPLOY_DRYRUN line
+        if ($DryRun) {
+            $dryRef = Get-Refusals
+            if ($null -ne $dryRef) {
+                foreach ($l in $dryRef.lines) { Out-Typed $l }
+                exit $dryRef.code
+            }
+        }
+        if ($null -ne $bind) {
+            Out-Typed "DEPLOY_DRYRUN action=noop sha=$srcSha restart=$RestartMode decision=no-restart reason=restart-host-refused wouldExit=16 why=$bind"
+            exit 0
+        }
+        $decision = Get-NoopRestartDecision -AgentScript $dest -Beat $(if ($RestartScript.Length -eq 0) { $script:BoundBeat } else { $null })
+        if (-not $decision.restart) {
+            if ($DryRun) {
+                Out-Typed "DEPLOY_DRYRUN action=noop sha=$srcSha restart=$RestartMode decision=no-restart reason=$($decision.reason) wouldExit=$($decision.code) $($decision.detail)"
+                exit 0
+            }
+            Out-Typed "DEPLOY_NOOP sha=$srcSha restarted=no reason=$($decision.reason) $($decision.detail)"
+            exit $decision.code
+        }
+        $noopRef = Get-Refusals
+        if ($null -ne $noopRef) {
+            foreach ($l in $noopRef.lines) { Out-Typed $l }
+            if (-not $DryRun) { Out-Typed "DEPLOY_NOOP sha=$srcSha restarted=no reason=$(Get-NoopRefusalReason -Code $noopRef.code) $($decision.detail)" }
+            exit $noopRef.code
+        }
+        if ($DryRun) {
+            Out-Typed "DEPLOY_DRYRUN action=noop sha=$srcSha restart=$RestartMode decision=restart reason=$($decision.reason) wouldExit=0 $($decision.detail)"
+            exit 0
+        }
+        $noopRes = Invoke-AgentRestart -AgentScript $dest
+        if ($null -ne $noopRes.warn) { Out-Typed $noopRes.warn }
+        if ($null -ne $noopRes.why) {
+            Out-Typed "DEPLOY_RESTART_FAILED $($noopRes.why)"
+            Out-Typed "DEPLOY_NOOP sha=$srcSha restarted=no reason=restart-failed $($decision.detail)"
+            exit 14
+        }
+        Out-Typed "DEPLOY_NOOP sha=$srcSha restarted=yes reason=$($decision.reason) $($decision.detail)"
+        exit 0
     }
 
     # 5. busy / lease / unreadable
@@ -1393,7 +1534,12 @@ try {
     }
 
     if ($DryRun) {
-        Out-Typed "DEPLOY_DRYRUN action=deploy sha=$srcSha restart=$RestartMode"
+        $restartDecision = ''
+        if ($whenIdle) {
+            if ($null -ne $bind) { $restartDecision = " decision=refuse wouldExit=16 why=$bind" }
+            else { $restartDecision = ' decision=restart-if-idle wouldExit=0' }
+        }
+        Out-Typed "DEPLOY_DRYRUN action=deploy sha=$srcSha restart=$RestartMode$restartDecision"
         exit 0
     }
 

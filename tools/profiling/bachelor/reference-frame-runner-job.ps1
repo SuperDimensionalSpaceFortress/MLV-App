@@ -67,6 +67,28 @@
 # layer can be written the manifest is moved out of the candidate name (numbered .INVALID target); that last resort is best effort too: if the move
 # throws (CANDIDATE_NOT_QUARANTINED, result.json candidateQuarantined=false) the manifest keeps the candidate name, and the job still exits 225.
 #
+# GPU PLAYBACK RECON IS A GENERATOR PARAMETER, NOT A PROFILE FIELD (REFERENCE-FRAME-GPU-PLAYBACK-RECON-ARG-1). -GpuPlaybackRecon off|on
+# (default off) makes the capture run with the CUDA playback recon the speed legs use, so a pixel-parity compare of two builds can cover the GPU
+# path. It is a parameter because the profiles in tools/gates/output-budget.json cannot carry it: tools/gates/output_budget.py accepts exactly
+# the eight profile keys it knows (exact_keys) and requires every (clip, profile) pair, so a ninth key or a new profile would change the
+# canonical output-budget gate. 'on' hands the capture, in the ONE -ExtraEnv hashtable beside the profile's quality mode, MLVAPP_GPU_PLAYBACK_RECON=1,
+# MLVAPP_GPU_PLAYBACK_RECON_BACKEND=cuda and MLVAPP_GPU_PLAYBACK_RECON_DLL=<the igpu_recon_cuda.dll the job deployed beside the staged exe>
+# (the names and values playback-attr-3-cuda-job.ps1 gives its speed legs). Any other value is refused (REFERENCE_FRAME_GPU_PLAYBACK_RECON_INVALID), and an
+# 'on' job whose -AgentRoot is not the committed venue table's agentRoot for its -Venue is refused (REFERENCE_FRAME_GPU_RECON_AGENTROOT_NOT_VENUE_ROOT; exact ordinal
+# compare after trimming trailing '\' only; only -OfflineTestMode may name another root), because it stages under <root>\work and a root inside an outbox would be indexed.
+# A root with an 'outbox' path component stays refused as a second net (REFERENCE_FRAME_GPU_RECON_AGENTROOT_IN_OUTBOX; reachable under -OfflineTestMode only).
+# 'on' is part of the job identity (so a GPU-recon job never shares a work tree or an outbox with a CPU one) and result.json records it as
+# captureParameters.gpuPlaybackRecon. 'on' REQUESTS the GPU recon; it does not prove it ran (a venue environment that suppresses CUDA, such as
+# MLVAPP_GPU_FAULT_INJECT, or any fallback leaves the capture on the CPU), so an 'on' job accepts the capture as a candidate only when the app's own
+# playback_smoke.gpu_summary for the SAME session as the final playback_smoke.summary shows cpu_frames == 0 and at least one frame on a recon
+# route (the rule playback-attr-3-cuda-job.ps1 applies to its speed legs). Anything else is step reconEvidence, exit 228: result.json says
+# capture-failed with gpuReconEvidence.reason, and the candidate manifest is voided (marker, then stamp, then move). Those layers are best effort, so
+# an 'on' job does not depend on them (key blocker B1): it captures into $Work\capture-staging, outside every outbox, and releases the capture into
+# <outbox>\<job>.artifacts\capture ONLY when it is a PROVEN candidate (r7: no voiding layer, alone or together, is a release ticket; a stamp-only void was the door).
+# Every other capture is HELD in staging (result.json captureStaging.held), so an unproven capture is never indexable, whatever fails. A proven capture's manifest is
+# rewritten while it is held so that artifact.path names the published image, and the directory is then published by one rename (key blocker B2). 'off' emits NO recon text at all: the job text, the identity digest and result.json are byte-for-byte the
+# ones this generator produced before the parameter existed (the template tokens below expand to nothing), so an absent key means off.
+#
 # NOT COVERED HERE (named, not hidden): no display wake and no PresentMon. If the venue's display is asleep the capture fails
 # visibly (typed, non-zero) rather than producing a frame; the live run is OUTPUT-BUDGET-KNOWN-GOOD-PROPOSAL-2.
 #
@@ -80,7 +102,8 @@
 # The EMITTED job: 0 a candidate; a failed capture exits the capture's own code (all below 100: 43 its receipt check, 70 no exit code;
 # one outside 1-199 is folded to 199); a failed step exits its own 2xx code, which no capture code reaches (204 bundleDecode,
 # 206 artifactNameSafety, 208 buildVerify, 209 deploy, 218 footageVerify, 219 bundleReverify, 220 bundleWrite, 222 admissionMode,
-# 223 publishResult, 224 footageView, 225 footageViewIntact, 226 receiptProfile, 227 captureSetup). The capture's raw code is result.json
+# 223 publishResult, 224 footageView, 225 footageViewIntact, 226 receiptProfile, 227 captureSetup, 228 reconEvidence: -GpuPlaybackRecon on and
+# the app's gpu_summary does not show the recon ran). The capture's raw code is result.json
 # captureExitCode and the RESULT line's CAPTURE_EXIT (REFERENCE-FRAME-JOB-EXIT-CODE-SPACE-1).
 
 [CmdletBinding()]
@@ -103,6 +126,9 @@ param(
     # capture-reference-frame.ps1's own -Seconds (its fail-closed timeout) and -PresentedFrames (-1 = auto: the smallest N that plays the floor).
     [ValidateRange(10, 3600)][int]$Seconds = 30,
     [ValidateRange(-1, 100000)][int]$PresentedFrames = -1,
+    # 'on' runs the capture with the CUDA GPU playback recon enabled (header: GPU PLAYBACK RECON IS A GENERATOR PARAMETER). Checked below, not by
+    # ValidateSet, so a bad value is a typed refusal (exit 21) and not a parameter-binding error.
+    [string]$GpuPlaybackRecon = 'off',
     # Default: the venue table's agentRoot.
     [string]$AgentRoot = '',
     [string]$RepoRoot = '',
@@ -127,6 +153,8 @@ function Stop-Refused([string]$Code) {
     Write-Output "RESULT=REFERENCE_FRAME_JOB_REFUSED CODE=$Code"
     exit 21
 }
+
+if ($GpuPlaybackRecon -cnotin @('off', 'on')) { Stop-Refused 'REFERENCE_FRAME_GPU_PLAYBACK_RECON_INVALID' }
 
 $dvDir = Join-Path $PSScriptRoot '..\dual-venue'
 Import-Module (Join-Path $dvDir 'DualVenueRunner.psm1') -Force
@@ -268,14 +296,26 @@ foreach ($n in @($names.exeName, $names.reconName, $names.packageZipName, $names
 $venueEntry = $table.venues.PSObject.Properties[$Venue].Value
 if ([string]::IsNullOrWhiteSpace($AgentRoot)) { $AgentRoot = [string]$venueEntry.agentRoot }
 if ($AgentRoot -notmatch '^[A-Za-z]:\\[A-Za-z0-9 _.~\\-]+$') { throw 'REFERENCE_FRAME_AGENTROOT_INVALID -AgentRoot contains characters outside the allowlist' }
+# r6 (hub ruling, option a; adversary passes 6-8 each found another spelling of "the agent root is inside an outbox"): an 'on' job's agent root must EQUAL the committed
+# venue table's agentRoot for the venue it is for. The comparison is exact and ordinal ('-cne', so a case-only difference is refused) after trimming only trailing '\' from both
+# sides: no GetFullPath, because normalisation is what makes two spellings of one directory compare equal, and the table is the one root that is KNOWN not to be an outbox.
+# The only way to name another root is -OfflineTestMode (the existing seam; a job generated under it refuses to run on any host, so it is never evidence).
+# An 'off' job is not affected: it keeps the base's behaviour for any allowlisted root.
+if ($GpuPlaybackRecon -ceq 'on' -and -not $OfflineTestMode -and $AgentRoot.TrimEnd('\') -cne ([string]$venueEntry.agentRoot).TrimEnd('\')) { Stop-Refused 'REFERENCE_FRAME_GPU_RECON_AGENTROOT_NOT_VENUE_ROOT' }
+# r5 (adversary A1 on 01ba7f33): an 'on' job stages its capture under <AgentRoot>\work, "outside every outbox" only if the agent root is not itself inside one. A reader
+# that walks an outbox recursively would index a staging directory nested in it before the job has proven the recon, so that root is refused for an 'on' job.
+if ($GpuPlaybackRecon -ceq 'on' -and $AgentRoot -match '(?i)(^|\\)outbox(\\|$)') { Stop-Refused 'REFERENCE_FRAME_GPU_RECON_AGENTROOT_IN_OUTBOX' }
 
 # The job's identity is its effective configuration (header: THE JOB'S IDENTITY IS ITS EFFECTIVE CONFIGURATION).
-$identityText = @(
+$identityLines = @(
     'mlvapp.reference-frame-job-identity.v1', "source=$SourceCommit", "buildManifestSha256=$BuildManifestSha256", "venue=$Venue", "clip=$ClipId",
     "parts=$(@($ownerParts | ForEach-Object { $_.sha256 }) -join ',')", "bundle=$bundleDigest", "gateProfile=$GateProfile", "gateSpecSha256=$specSha256",
     "startFrame=$gateStartFrame", "disableLookAssist=$disableLookAssistLiteral", "playbackProcessing=$gateProcessing", "qualityMode=$gateQualityMode",
     "seconds=$Seconds", "presentedFrames=$PresentedFrames"
-) -join "`n"
+)
+# GPU playback recon joins the identity only when it is on, so every 'off' job keeps the id it always had and an 'on' job can never share a work tree or an outbox with one.
+if ($GpuPlaybackRecon -ceq 'on') { $identityLines += 'gpuPlaybackRecon=on' }
+$identityText = $identityLines -join "`n"
 $jobIdentitySha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($identityText))).ToLowerInvariant()
 $jobId = "reference-frame-$($SourceCommit.Substring(0,12))-$ClipId-$($jobIdentitySha256.Substring(0,12))"
 [void](Assert-AttrCudaSafeArtifactName -Name $jobId)
@@ -324,6 +364,201 @@ $embeddedFunctions = $embeddedFunctions + "`r`n`r`n" + (Get-AttrCudaEmbeddedFunc
     'Close-AttrCudaOwnerFootageWorkspace'
 ))
 
+# --- GPU playback recon fragments (header: GPU PLAYBACK RECON IS A GENERATOR PARAMETER) ---------------------------------------------------
+# Template tokens (GPU_RECON_*, and the ExtraEnv line), each EMPTY (or, for the ExtraEnv line, today's own line) when off, so an 'off' job is byte-identical to what this
+# generator emitted before the parameter existed.
+$reconDeclaration = ''
+$reconResultParameter = ''
+$reconEvidenceCheck = ''
+$reconResultEvidence = ''
+$reconPublish = ''
+$reconStage = ''
+$reconRelease = ''
+$reconObjectRoot = ''
+# today's line, verbatim: the profile's quality mode is the only -ExtraEnv entry
+$captureExtraEnv = @'
+if ($QualityMode -ne '') { $captureCommand += " -ExtraEnv @{ MLVAPP_PLAYBACK_QUALITY_MODE = '$QualityMode' }" }
+'@.TrimEnd()
+if ($GpuPlaybackRecon -ceq 'on') {
+    $reconDeclaration = "`$GpuPlaybackRecon = 'on'`r`n"
+    $reconResultParameter = '; gpuPlaybackRecon = $GpuPlaybackRecon'
+    $reconResultEvidence = "`r`n    gpuReconEvidence = `$reconEvidence`r`n    captureStaging = `$captureStaging"
+    # r4 (key blocker B1): the capture runs in a staging directory under the job's own work tree, never under the outbox, so a capture whose GPU recon was
+    # not proven cannot be indexed by a reader whatever later step fails (the voiding layers and result.json are all best effort).
+    $reconStage = "`r`n        `$captureOut = Join-Path `$Work 'capture-staging'"
+    # r5 (adversary A1 on ac80ede1): the 225 path's stamp needs an object-root manifest too (the recon block's own stamp carries the same guard inline). Only
+    # an 'on' job emits it, so an 'off' job stays byte-identical to the base; the 225 path on an 'off' job is the base's and is not changed by this card.
+    $reconObjectRoot = "`r`n        if (`$candidateDoc -isnot [System.Management.Automation.PSCustomObject]) { throw 'MANIFEST_ROOT_NOT_AN_OBJECT' }"
+    $reconRelease = @'
+# GPU PLAYBACK RECON (r4, key blocker B1; r7, key blockers B1 and B2): the capture ran in $Work\capture-staging, outside every outbox, so it is not indexable by
+# construction. It is released into $Pub\capture ONLY when it is a PROVEN candidate ($candidateOk: the capture exited 0, the recon is proven, the views are
+# intact). Every other capture is HELD in staging, whatever mix of marker, stamp and quarantine landed: those layers are best effort, and frame_provenance
+# reads a manifest it cannot open as "not stamped" and an absent, torn or status-less result.json as "not failed", so no voiding layer is a release ticket
+# (the r4 rule released on any one of them, and a transient first manifest read then indexed a voided capture). result.json says so (captureStaging.held),
+# and the exit code is unchanged.
+# The manifest the capture wrote names the STAGING image (artifact.path). A proven capture's manifest is therefore rewritten to name the image where it will be
+# published, WHILE the capture is still held (no reader can see staging), and the capture directory is then published by ONE rename: the manifest and the image
+# reach the outbox together, so a reader never meets a manifest naming an image the outbox does not hold. Any failure holds the capture and puts the manifest back.
+$captureMayPublish = $candidateOk
+$captureStaging = [ordered]@{ published = $false; held = (-not $captureMayPublish); where = "work\$JobId\capture-staging" }
+if ($captureMayPublish) {
+    $stagedManifestText = $null
+    try {
+        $stagedManifestText = [IO.File]::ReadAllText($candidatePath)
+        $publishedDoc = $stagedManifestText | ConvertFrom-Json
+        if ($publishedDoc -isnot [System.Management.Automation.PSCustomObject]) { throw 'PUBLISHED_MANIFEST_NOT_AN_OBJECT' }
+        $publishedCaptureDir = Join-Path $Pub 'capture'
+        $artifactLeaf = [IO.Path]::GetFileName([string]$publishedDoc.artifact.path)
+        if ([string]::IsNullOrEmpty($artifactLeaf) -or -not (Test-Path -LiteralPath (Join-Path $captureOut $artifactLeaf) -PathType Leaf)) { throw 'MANIFEST_ARTIFACT_NOT_IN_CAPTURE' }
+        $publishedDoc.artifact.path = Join-Path $publishedCaptureDir $artifactLeaf
+        # settings.appLog is the capture script's leaf name (still true beside the published image); a PATH-valued one gets the same treatment as artifact.path
+        if ($publishedDoc.settings.appLog -is [string] -and $publishedDoc.settings.appLog -match '[\\/]') {
+            $publishedDoc.settings.appLog = Join-Path $publishedCaptureDir ([IO.Path]::GetFileName($publishedDoc.settings.appLog))
+        }
+        [void](Publish-AttrCudaText -Path $candidatePath -Value ($publishedDoc | ConvertTo-Json -Depth 64))
+        # result.json names the manifest as it is published
+        $candidateSha256 = Get-ShaLower $candidatePath
+        Move-Item -LiteralPath $captureOut -Destination $publishedCaptureDir -ErrorAction Stop
+        $captureStaging.published = $true
+    } catch {
+        $captureStaging.held = $true
+        Say "CAPTURE_NOT_PUBLISHED $($_.Exception.Message)"
+        # the held manifest must not name an image that was never published: put back the text the capture wrote
+        if ($null -ne $stagedManifestText -and (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
+            try { [IO.File]::WriteAllText($candidatePath, $stagedManifestText) } catch { Say "HELD_MANIFEST_NOT_RESTORED $($_.Exception.Message)" }
+        }
+        # a proven candidate that cannot be released is a typed failure (223), never a published candidate and never a silent success
+        Complete-Failed 223 'publishResult' "GPU_RECON_CAPTURE_NOT_PUBLISHED $($_.Exception.Message)"
+    }
+}
+if ($captureStaging.held) { Say "CAPTURE_HELD_IN_STAGING the capture is not a proven candidate (or could not be released) and stays under work\$JobId\capture-staging" }
+'@ + "`r`n"
+    # appended to the line that initialises the three published invalidation fields to null, so the 228 path's outcomes (not null) reach result.json
+    $reconPublish = "`r`n`$candidateInvalidated = `$reconInvalidated; `$candidateInvalidMarker = `$reconInvalidMarker; `$candidateQuarantined = `$reconQuarantined"
+    # Placed after the capture's exit code is final and before the view check: a capture that exited 0 is a candidate only if the app's counters
+    # show the GPU recon ran. The proof binds the gpu_summary to the SAME session as the last playback_smoke.summary (the one the capture's own receipt
+    # oracle reads) and reads every counter as a plain decimal, so an absent, empty, hex or null counter is unproven, never zero.
+    $reconEvidenceCheck = @'
+$reconEvidence = [ordered]@{ checked = $false; ok = $false; reason = ''; session = $null; cpuFrames = $null; reconFrames = $null }
+if ($captureRc -eq 0) {
+    $reconEvidence.checked = $true
+    try {
+        $reconAppLog = @(Get-ChildItem -LiteralPath $captureOut -Filter 'mlvapp-*.log' -File -ErrorAction Stop | Sort-Object LastWriteTimeUtc -Descending) | Select-Object -First 1
+        if ($null -eq $reconAppLog) { throw 'APP_LOG_ABSENT' }
+        $reconLogLines = @([IO.File]::ReadAllLines($reconAppLog.FullName))
+        $reconSession = $null
+        # A record is read only where it STARTS the line, after the app's own prefix ([utc] [LEVEL] [0x<thread>] ), never as text inside another record
+        # (a build path or a source location in a later record's tail can spell a whole summary line).
+        $reconRecordStart = '^(?:\[[^\]]*\] ){0,3}'
+        foreach ($reconLine in $reconLogLines) {
+            $reconMatch = [regex]::Match($reconLine, $reconRecordStart + 'playback_smoke\.summary session=([0-9]+) ')
+            if ($reconMatch.Success) { $reconSession = $reconMatch.Groups[1].Value }
+        }
+        if ($null -eq $reconSession) { throw 'SUMMARY_LINE_ABSENT' }
+        $reconEvidence.session = $reconSession
+        $reconFields = $null
+        $reconDuplicate = ''
+        foreach ($reconLine in $reconLogLines) {
+            $reconMatch = [regex]::Match($reconLine, $reconRecordStart + 'playback_smoke\.gpu_summary session=' + $reconSession + ' (?<rest>.*)$')
+            if ($reconMatch.Success) {
+                # Only the contiguous run of key=value tokens right after the session is the app's record. Whatever the log's message pattern appends after it
+                # (a source location, which can itself spell counter-shaped text) is never read, and a key repeated inside the run is ambiguous: unproven, never last-wins.
+                $reconFields = @{}
+                $reconDuplicate = ''
+                foreach ($reconToken in ($reconMatch.Groups['rest'].Value -split '\s+')) {
+                    $reconPair = [regex]::Match($reconToken, '^([A-Za-z0-9_]+)=(\S*)$')
+                    if (-not $reconPair.Success) { break }
+                    if ($reconFields.ContainsKey($reconPair.Groups[1].Value)) { $reconDuplicate = $reconPair.Groups[1].Value; break }
+                    $reconFields[$reconPair.Groups[1].Value] = $reconPair.Groups[2].Value
+                }
+            }
+        }
+        if ($null -eq $reconFields) { throw 'GPU_SUMMARY_ABSENT' }
+        if ($reconDuplicate -ne '') { throw "COUNTER_DUPLICATE $reconDuplicate" }
+        $reconCounts = @{}
+        foreach ($reconKey in 'cpu_frames', 'gpu_recon_readback_frames', 'gpu_texture_readback_frames', 'gpu_texture_no_readback_frames') {
+            if (-not $reconFields.ContainsKey($reconKey)) { throw "COUNTER_ABSENT $reconKey" }
+            if ([string]$reconFields[$reconKey] -cnotmatch '^[0-9]{1,9}$') { throw "COUNTER_NOT_NUMERIC $reconKey" }
+            $reconCounts[$reconKey] = [long]$reconFields[$reconKey]
+        }
+        $reconEvidence.cpuFrames = $reconCounts['cpu_frames']
+        $reconEvidence.reconFrames = $reconCounts['gpu_recon_readback_frames'] + $reconCounts['gpu_texture_readback_frames'] + $reconCounts['gpu_texture_no_readback_frames']
+        if ($reconCounts['cpu_frames'] -ne 0) { throw "CPU_FRAMES_NONZERO cpu_frames=$($reconCounts['cpu_frames'])" }
+        if ($reconEvidence.reconFrames -le 0) { throw 'NO_GPU_RECON_FRAMES' }
+        $reconEvidence.ok = $true
+    } catch {
+        $reconThrown = [string]$_.Exception.Message
+        $reconEvidence.reason = $(if ($reconThrown -cmatch '^[A-Z_]+(?: [a-z_]+(?:=[0-9]+)?)?$') { $reconThrown } else { 'APP_LOG_UNREADABLE' })
+    }
+}
+if ($reconEvidence.ok) { $StepLog['reconEvidence'] = 0 }
+# What the voiding did, in the 225 path's own shape (null = there was nothing to do, false = that layer failed, true = it landed). These cannot be the
+# published candidateInvalidated / candidateInvalidMarker / candidateQuarantined themselves: the template initialises those after this block, so the
+# values are carried across and copied in at that initialisation (GPU_RECON_PUBLISH).
+$reconInvalidated = $null
+$reconInvalidMarker = $null
+$reconQuarantined = $null
+if ($reconEvidence.checked -and -not $reconEvidence.ok) {
+    # not proven: step reconEvidence, exit 228. The manifest the capture wrote still calls itself a candidate, so it is voided the way the 225 path voids one:
+    # a sibling marker first (a reader honours it whatever the manifest says), then the stamp in place, and only if neither lands the manifest is moved.
+    $StepLog['reconEvidence'] = 228
+    $reconInvalidReasons = @("GPU_RECON_NOT_PROVEN $($reconEvidence.reason)", 'reference-frame-runner step reconEvidence exit 228')
+    if (-not $viewsIntactAfterCapture) {
+        # the footage view changed during the same capture: 228 keeps the exit code (the first failing step), but the cause is not lost, it is recorded as the 225 path records it
+        $StepLog['footageViewIntact'] = 225
+        $reconInvalidReasons = @('OWNER_FOOTAGE_VIEW_CHANGED_DURING_CAPTURE') + $reconInvalidReasons
+    }
+    $reconManifestPath = Join-Path $captureOut 'reference-frame-candidate.json'
+    $reconInvalidMarker = $false
+    try {
+        [void](Publish-AttrCudaText -Path (Join-Path $captureOut 'reference-frame-candidate.invalid') -Value ([ordered]@{ schema = 'mlvapp.reference-frame-candidate-invalid.v1'; invalid = $true; invalid_reasons = $reconInvalidReasons } | ConvertTo-Json -Depth 4))
+        $reconInvalidMarker = $true
+    } catch {
+        Say "CANDIDATE_MARKER_NOT_WRITTEN $($_.Exception.Message)"
+    }
+    if (Test-Path -LiteralPath $reconManifestPath -PathType Leaf) {
+        $reconInvalidated = $false
+        try {
+            $reconDoc = [IO.File]::ReadAllText($reconManifestPath) | ConvertFrom-Json
+            # the stamp is only a stamp on an object root: an array root takes it on every element and serializes back as an array no reader reads as stamped
+            if ($reconDoc -isnot [System.Management.Automation.PSCustomObject]) { throw 'MANIFEST_ROOT_NOT_AN_OBJECT' }
+            $reconDoc | Add-Member -NotePropertyName status -NotePropertyValue 'invalid' -Force
+            $reconDoc | Add-Member -NotePropertyName invalid -NotePropertyValue $true -Force
+            $reconDoc | Add-Member -NotePropertyName invalid_reasons -NotePropertyValue $reconInvalidReasons -Force
+            [void](Publish-AttrCudaText -Path $reconManifestPath -Value ($reconDoc | ConvertTo-Json -Depth 64))
+            $reconInvalidated = $true
+        } catch {
+            Say "CANDIDATE_NOT_INVALIDATED $($_.Exception.Message)"
+        }
+        if (-not $reconInvalidated -and -not $reconInvalidMarker) {
+            $reconQuarantined = $false
+            try {
+                # numbered the way the 225 path numbers its target (.INVALID.json, then .INVALID.1.json ...): an occupied target is never overwritten and never makes the move throw
+                $reconQuarantineTarget = Join-Path $captureOut 'reference-frame-candidate.INVALID.json'
+                $reconQuarantineCounter = 1
+                while (Test-Path -LiteralPath $reconQuarantineTarget) { $reconQuarantineTarget = Join-Path $captureOut "reference-frame-candidate.INVALID.$reconQuarantineCounter.json"; $reconQuarantineCounter++ }
+                Move-Item -LiteralPath $reconManifestPath -Destination $reconQuarantineTarget -ErrorAction Stop
+                $reconQuarantined = $true
+            } catch {
+                Say "CANDIDATE_NOT_QUARANTINED $($_.Exception.Message)"
+            }
+        }
+    }
+    $captureRc = 228
+    Say "FAIL step=reconEvidence exit=228 GPU_RECON_NOT_PROVEN $($reconEvidence.reason)"
+}
+
+'@
+    # The capture script takes ONE -ExtraEnv hashtable, so the recon variables and the profile's quality mode are built into it together. The names
+    # and values are the speed legs' (playback-attr-3-cuda-job.ps1); the DLL is the one this job deployed beside the staged exe ($reconDll).
+    $captureExtraEnv = @'
+$reconDllLiteral = $reconDll.Replace("'", "''")
+        $extraEnvPairs = @("MLVAPP_GPU_PLAYBACK_RECON = '1'", "MLVAPP_GPU_PLAYBACK_RECON_BACKEND = 'cuda'", "MLVAPP_GPU_PLAYBACK_RECON_DLL = '$reconDllLiteral'")
+        if ($QualityMode -ne '') { $extraEnvPairs = @("MLVAPP_PLAYBACK_QUALITY_MODE = '$QualityMode'") + $extraEnvPairs }
+        $captureCommand += " -ExtraEnv @{ $($extraEnvPairs -join '; ') }"
+'@.TrimEnd()
+}
+
 # --- job body template (placeholders are substituted below, in one pass) -----------------------------------------------------------
 $template = @'
 # -VerifyOnly runs the read-only prefix (name safety, base64 decode, hash for every bundle file) and exits WITHOUT creating
@@ -347,7 +582,7 @@ $StartFrame = __START_FRAME__
 $PlaybackProcessing = '__PLAYBACK_PROCESSING__'
 $QualityMode = '__QUALITY_MODE__'
 $DisableLookAssist = __DISABLE_LOOK_ASSIST__
-$Seconds = __SECONDS__
+__GPU_RECON_DECLARATION__$Seconds = __SECONDS__
 $PresentedFrames = __PRESENTED_FRAMES__
 $ExeName = '__EXE_NAME__'
 $ReconName = '__RECON_NAME__'
@@ -586,13 +821,13 @@ try {
         if ($onDisk -ne $entry.sha256) { Complete-Failed 219 'bundleReverify' "bundle file $($entry.name) changed on disk after it was verified ($onDisk)" }
     }
     try {
-        $captureOut = Join-Path $Pub 'capture'
+        $captureOut = Join-Path $Pub 'capture'__GPU_RECON_STAGE__
         [void](New-AttrCudaDirectory -Path $captureOut)
         $captureCommand = "& '$bundleCapture' -Exe '$exePath' -Clip '$clipPath' -OutDir '$captureOut' -Commit '$SourceCommit' -ProfileId $GateProfileId -Seconds $Seconds -StartFrame $StartFrame"
         if ($DisableLookAssist) { $captureCommand += ' -DisableLookAssist' }
         if ($PlaybackProcessing -ne '') { $captureCommand += " -PlaybackProcessing $PlaybackProcessing" }
         if ($PresentedFrames -ge 0) { $captureCommand += " -PresentedFrames $PresentedFrames" }
-        if ($QualityMode -ne '') { $captureCommand += " -ExtraEnv @{ MLVAPP_PLAYBACK_QUALITY_MODE = '$QualityMode' }" }
+        __CAPTURE_EXTRA_ENV__
         # FAIL CLOSED: a statement-terminating error inside the capture command (a parameter that does not bind, say) leaves $LASTEXITCODE null,
         # and `exit $null` is exit 0 -- a capture that never ran must never read as one that passed. 70 = the capture command produced no exit code.
         $captureCommand += '; if ($null -eq $LASTEXITCODE) { exit 70 }; exit $LASTEXITCODE'
@@ -616,7 +851,7 @@ $StepLog['capture'] = $captureRc
 # cannot land in the step space either; the raw code is result.json captureExitCode and the RESULT line's CAPTURE_EXIT in every case.
 $captureExitCode = $captureRc
 if ($captureRc -ne 0 -and ($captureRc -lt 1 -or $captureRc -gt 199)) { $captureRc = 199 }
-$viewsChanged = ($captureRc -eq 0 -and -not $viewsIntactAfterCapture)
+__GPU_RECON_EVIDENCE_CHECK__$viewsChanged = ($captureRc -eq 0 -and -not $viewsIntactAfterCapture)
 if ($viewsChanged) { $StepLog['footageViewIntact'] = 225 }
 $candidateOk = ($captureRc -eq 0 -and -not $viewsChanged)
 
@@ -632,7 +867,7 @@ $candidateSha256 = if ($candidateOk -and (Test-Path -LiteralPath $candidatePath)
 $candidateMarkerPath = Join-Path $captureOut 'reference-frame-candidate.invalid'
 $candidateInvalidated = $null
 $candidateInvalidMarker = $null
-$candidateQuarantined = $null
+$candidateQuarantined = $null__GPU_RECON_PUBLISH__
 if ($viewsChanged -and (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
     $candidateInvalidated = $false
     $candidateInvalidMarker = $false
@@ -644,7 +879,7 @@ if ($viewsChanged -and (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
         Say "CANDIDATE_MARKER_NOT_WRITTEN $($_.Exception.Message)"
     }
     try {
-        $candidateDoc = [IO.File]::ReadAllText($candidatePath) | ConvertFrom-Json
+        $candidateDoc = [IO.File]::ReadAllText($candidatePath) | ConvertFrom-Json__GPU_RECON_OBJECT_ROOT__
         $candidateDoc | Add-Member -NotePropertyName status -NotePropertyValue 'invalid' -Force
         $candidateDoc | Add-Member -NotePropertyName invalid -NotePropertyValue $true -Force
         $candidateDoc | Add-Member -NotePropertyName invalid_reasons -NotePropertyValue $candidateInvalidReasons -Force
@@ -669,7 +904,7 @@ if ($viewsChanged -and (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
         }
     }
 }
-try { [void](Publish-AttrCudaText -Path (Join-Path $Pub 'result.json') -Value (([ordered]@{
+__GPU_RECON_RELEASE__try { [void](Publish-AttrCudaText -Path (Join-Path $Pub 'result.json') -Value (([ordered]@{
     schema = 'mlvapp.reference-frame-runner.v1'; jobId = $JobId; jobIdentitySha256 = $JobIdentitySha256
     exitCode = $(if ($viewsChanged) { 225 } else { $captureRc }); captureExitCode = $captureExitCode
     status = $(if ($candidateOk) { 'candidate-unreviewed' } else { 'capture-failed' })
@@ -677,11 +912,11 @@ try { [void](Publish-AttrCudaText -Path (Join-Path $Pub 'result.json') -Value ((
     admission = [ordered]@{ mode = $AdmissionMode; consentKind = $ConsentKind }
     gateProfile = [ordered]@{ id = $GateProfileId; specSha256 = $GateSpecSha256; startFrame = $StartFrame; disableLookAssist = $DisableLookAssist; playbackProcessing = $PlaybackProcessing; qualityMode = $QualityMode }
     bundle = @($BundleEntries | ForEach-Object { [ordered]@{ name = $_.name; sha256 = $_.sha256 } })
-    captureParameters = [ordered]@{ seconds = $Seconds; presentedFrames = $PresentedFrames }
+    captureParameters = [ordered]@{ seconds = $Seconds; presentedFrames = $PresentedFrames__GPU_RECON_RESULT_PARAMETER__ }
     exeSha256 = $artifactHashes['exe']; candidateSha256 = $candidateSha256; candidateInvalidated = $candidateInvalidated
     candidateInvalidMarker = $candidateInvalidMarker; candidateQuarantined = $candidateQuarantined
     clipParts = @($verifiedParts | ForEach-Object { [ordered]@{ index = $_.index; length = $_.length; sha256 = $_.sha256 } })
-    footageView = [ordered]@{ mode = $ownerViewMode; intactAfterCapture = $viewsIntactAfterCapture }
+    footageView = [ordered]@{ mode = $ownerViewMode; intactAfterCapture = $viewsIntactAfterCapture }__GPU_RECON_RESULT_EVIDENCE__
     stagedOnHost = $env:COMPUTERNAME; steps = $StepLog
 }) | ConvertTo-Json -Depth 10)) } catch { Complete-Failed 223 'publishResult' $_.Exception.Message }
 if ($viewsChanged) {
@@ -715,6 +950,15 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     PLAYBACK_PROCESSING = $gateProcessing
     QUALITY_MODE = $gateQualityMode
     DISABLE_LOOK_ASSIST = $disableLookAssistLiteral
+    GPU_RECON_DECLARATION = $reconDeclaration
+    CAPTURE_EXTRA_ENV = $captureExtraEnv
+    GPU_RECON_RESULT_PARAMETER = $reconResultParameter
+    GPU_RECON_EVIDENCE_CHECK = $reconEvidenceCheck
+    GPU_RECON_RESULT_EVIDENCE = $reconResultEvidence
+    GPU_RECON_PUBLISH = $reconPublish
+    GPU_RECON_STAGE = $reconStage
+    GPU_RECON_RELEASE = $reconRelease
+    GPU_RECON_OBJECT_ROOT = $reconObjectRoot
     SECONDS = [string]$Seconds
     PRESENTED_FRAMES = [string]$PresentedFrames
     EXE_NAME = $names.exeName
@@ -728,7 +972,8 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
 })
 [IO.File]::WriteAllText($OutFile, $text, [Text.UTF8Encoding]::new($false))
 
-Write-Output "RESULT=REFERENCE_FRAME_JOB_EMITTED SOURCE=$SourceCommit TOOLS=$ToolsCommit CLIP=$ClipId VENUE=$Venue GATE_PROFILE=$GateProfile START_FRAME=$gateStartFrame ADMISSION=$admissionMode BUNDLE_DIGEST=$bundleDigest JOB=$OutFile"
+$reconEmitNote = if ($GpuPlaybackRecon -ceq 'on') { ' GPU_PLAYBACK_RECON=on' } else { '' }
+Write-Output "RESULT=REFERENCE_FRAME_JOB_EMITTED SOURCE=$SourceCommit TOOLS=$ToolsCommit CLIP=$ClipId VENUE=$Venue GATE_PROFILE=$GateProfile START_FRAME=$gateStartFrame ADMISSION=$admissionMode BUNDLE_DIGEST=$bundleDigest$reconEmitNote JOB=$OutFile"
 
 [pscustomobject]@{
     jobFile = $OutFile
@@ -740,6 +985,7 @@ Write-Output "RESULT=REFERENCE_FRAME_JOB_EMITTED SOURCE=$SourceCommit TOOLS=$Too
     venue = $Venue
     gateProfile = $GateProfile
     startFrame = $gateStartFrame
+    gpuPlaybackRecon = $GpuPlaybackRecon
     bundleDigest = $bundleDigest
     files = @($closure | ForEach-Object { [ordered]@{ name = $_.name; sha256 = $_.sha256 } })
     agentRoot = $AgentRoot
