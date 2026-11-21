@@ -682,8 +682,6 @@ function Get-DescendantProcessIdentities {
             Add-AgentLogLine "descendant-walk: snapshot $(if ($all.Count -gt 0) { 'partial' } else { 'failed' }) pid=$ParentProcessId rows=$($all.Count) why=[$snapshotError]; $(if ($all.Count -gt 0) { 'the rows it returned are walked' } else { 'the walk is empty' })"
         }
     }
-    if ($null -ne $OnEach) { $null = & $OnEach }
-
     # pid -> creation time (UTC) for every row that has a readable one (the PID-reuse check below).
     $createdAt = New-Object 'System.Collections.Generic.Dictionary[int,object]'
     foreach ($row in $all) {
@@ -691,14 +689,22 @@ function Get-DescendantProcessIdentities {
         catch { continue }
     }
     # r2 (adversary A3): a snapshot that failed AFTER returning rows but BEFORE the root's own row has no creation time to compare the root's
-    # children with, and a stale edge would pass. The root's start is then read once from its identity; if that cannot be read either, the
-    # root's children cannot be checked for pid reuse and are not walked (the walk is already recorded as partial).
+    # children with, and a stale edge would pass. Only then (a walk that is already recorded as partial, so the one-query rule is the success
+    # path's) the root's own row is read once, filtered, with a 10 s -OperationTimeoutSec (adversary pass 2 A2: never unbounded), BEFORE the
+    # closing -OnEach tick so no read follows the last tick. If that cannot be read either, the root's children cannot be checked for pid reuse
+    # and are not walked (the walk record says so).
     $rootUnverified = $false
     if ($null -ne $snapshotError -and $all.Count -gt 0 -and -not $createdAt.ContainsKey($ParentProcessId)) {
-        $rootIdentity = Get-ProcessIdentity -ProcessId $ParentProcessId
-        if ($rootIdentity.exists -and $rootIdentity.startUtc) { $createdAt[$ParentProcessId] = [DateTimeOffset]::Parse([string]$rootIdentity.startUtc).UtcDateTime }
-        elseif (-not $rootIdentity.exists) { $rootUnverified = $true }   # (a live root with no readable start cannot be compared and is kept, as in a complete snapshot)
+        $rootRow = $null
+        try { $rootRow = Get-CimInstance Win32_Process -Filter "ProcessId=$ParentProcessId" -Property ProcessId, CreationDate -OperationTimeoutSec 10 -ErrorAction Stop | Select-Object -First 1 } catch { $rootRow = $null }
+        if ($null -eq $rootRow) { $rootUnverified = $true }
+        elseif ($rootRow.CreationDate) {
+            # (a live root row with no readable start cannot be compared and is kept, as in a complete snapshot)
+            try { $createdAt[$ParentProcessId] = ([DateTime]$rootRow.CreationDate).ToUniversalTime() } catch { $rootUnverified = $true }
+        }
+        if ($rootUnverified) { $script:LastDescendantWalk.why = "$($script:LastDescendantWalk.why); the root's own row was not in the partial snapshot and could not be read, so its children were not walked" }
     }
+    if ($null -ne $OnEach) { $null = & $OnEach }
 
     # parent pid -> its rows, in the snapshot's order (the order the per-parent query returned them in).
     $byParent = New-Object 'System.Collections.Generic.Dictionary[int,System.Collections.Generic.List[object]]'
@@ -747,6 +753,7 @@ function Get-DescendantProcessIdentities {
     $visited = New-Object 'System.Collections.Generic.HashSet[int]'
     [void]$visited.Add($ParentProcessId)
     $stack = New-Object 'System.Collections.Generic.Stack[object]'
+    $skipped = New-Object 'System.Collections.Generic.List[int]'   # rows skipped as created before their listed parent (recorded for the kill paths)
     $rootKids = $null
     if (-not $rootUnverified -and $byParent.TryGetValue($ParentProcessId, [ref]$rootKids)) { $stack.Push(@{ kids = $rootKids; next = 0; self = $null }) }
     while ($stack.Count -gt 0) {
@@ -760,6 +767,9 @@ function Get-DescendantProcessIdentities {
             if ($createdAt.TryGetValue([int]$child.ParentProcessId, [ref]$parentCreated) -and $createdAt.TryGetValue($childProcessId, [ref]$childCreated) -and $null -ne $parentCreated -and $null -ne $childCreated -and $childCreated -lt $parentCreated) {
                 # Named once per pid (at most 256 pids per agent run): a stale edge persists for as long as the stale process lives. The known limit
                 # (adversary A1): a backward wall-clock step between the parent's and a real child's creation reads the same way, and is skipped too.
+                # Neither is silent on a kill path: the rows are recorded in $script:LastDescendantWalk.skipped and Stop-ProcessTree names them
+                # (log line and caller note), so a real child that was skipped is reported as not stopped, never as a clean tree.
+                [void]$skipped.Add($childProcessId)
                 if ($null -eq $script:DescendantWalkStaleLogged) { $script:DescendantWalkStaleLogged = New-Object 'System.Collections.Generic.HashSet[int]' }
                 if ($script:DescendantWalkStaleLogged.Count -lt 256 -and $script:DescendantWalkStaleLogged.Add($childProcessId)) {
                     Add-AgentLogLine "descendant-walk: skipped pid=$childProcessId (created $($childCreated.ToString('o')), before its listed parent pid=$($child.ParentProcessId) created $($parentCreated.ToString('o')): a reused parent pid, or a backward clock step)"
@@ -776,6 +786,7 @@ function Get-DescendantProcessIdentities {
             if ($null -ne $frame.self) { & $identityOf $frame.self }
         }
     }
+    $script:LastDescendantWalk | Add-Member -NotePropertyName skipped -NotePropertyValue @($skipped) -Force
 }
 
 function Stop-ProcessTree {
@@ -806,6 +817,13 @@ function Stop-ProcessTree {
         $walkScope = if ($walkState.partial) { "only descendants found in the $($walkState.rows) process rows it returned were targeted" } else { "it listed no descendants, so only the root was targeted" }
         $script:ProcessTreeWalkNote = "; DESCENDANT WALK $walkKind ($($walkState.why)): $walkScope; descendants it did not list may still be running"
         Add-AgentLogLine "process-tree stop pid=${RootProcessId}: descendant walk $walkKind why=[$($walkState.why)] rows=$($walkState.rows); $walkScope; descendants it did not list may still be running"
+    }
+    # Rows skipped as created before their listed parent (adversary pass 2 A1): a reused parent pid, or a backward clock step (then they are real
+    # children, and this stop did not target them). Named so a kill never reads as a clean tree.
+    if ($null -ne $walkState -and $walkState.rootPid -eq $RootProcessId -and @($walkState.skipped).Count -gt 0) {
+        $skipText = "SKIPPED pids=$(@($walkState.skipped) -join ',') (created before their listed parent: a reused parent pid, or a backward clock step, in which case they are still running)"
+        $script:ProcessTreeWalkNote = "$($script:ProcessTreeWalkNote); $skipText"
+        Add-AgentLogLine "process-tree stop pid=${RootProcessId}: $skipText"
     }
     foreach ($expected in $identities) {
         if (-not $expected.exists) { continue }

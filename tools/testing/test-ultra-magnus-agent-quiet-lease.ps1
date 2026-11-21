@@ -6054,7 +6054,8 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             # adversary A1 (known limit): a skipped row is NAMED in agent.log, once per pid however many walks see it (the walk above and Stop-ProcessTree's both do).
             $skipLines = @($script:Log | Where-Object { $_ -match '^descendant-walk: skipped pid=' })
             [pscustomobject]@{ ids = (@($walk | ForEach-Object { [int]$_.processId }) -join ','); orphanIds = (@($orphans | ForEach-Object { [int]$_.processId }) -join ','); killed = ($killed -join ','); stopped = (@($script:PrStopped) -join ',')
-                skipped = (@($skipLines | ForEach-Object { if ($_ -match 'skipped pid=(\d+)') { $Matches[1] } }) -join ',') }
+                skipped = (@($skipLines | ForEach-Object { if ($_ -match 'skipped pid=(\d+)') { $Matches[1] } }) -join ',')
+                note = [string]$script:ProcessTreeWalkNote; stopSkipLines = @($script:Log | Where-Object { $_ -match '^process-tree stop pid=4000: SKIPPED' }) }
         }
         $prTxt = $prOut | ConvertTo-Json -Compress
         Assert-True ($prOut.ids -notmatch '4001' -and $prOut.ids -notmatch '4004') "cim-walk-pid-reuse: row 4001 (created 12:00:00, ParentProcessId 4000 whose pid now belongs to a process created 12:00:10) and its child 4004 are NOT descendants: $prTxt"
@@ -6062,6 +6063,9 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True ($prOut.orphanIds -eq '4102,4101') "cim-walk-pid-reuse: the orphans of a root that is no longer in the table are still descendants: $prTxt"
         Assert-True ($prOut.killed -eq '4003,4002,4005,4006,4000' -and $prOut.stopped -eq $prOut.killed) "cim-walk-pid-reuse: Stop-ProcessTree (the cancel, lease-stop and timeout kill) stops the real descendants and the root, never the stale-edge process 4001 or its child 4004: $prTxt"
         Assert-True ($prOut.skipped -eq '4001') "cim-walk-pid-reuse: the skipped stale-edge row 4001 (its subtree, 4004, is never reached) is named once in agent.log however many walks see it: skipped=[$($prOut.skipped)] $prTxt"
+        # adversary pass 2 A1 (known limit): a skipped row is never silent on a kill path. Whether it is a reused parent pid or a real child after a backward
+        # clock step (the walk cannot tell them apart), Stop-ProcessTree says it did not target it: a log line and the caller note.
+        Assert-True (@($prOut.stopSkipLines).Count -eq 1 -and $prOut.note -match 'SKIPPED pids=4001' -and $prOut.note -match 'backward clock step' -and $prOut.note -match 'still running') "cim-walk-pid-reuse: a kill path names the rows it skipped as created before their listed parent (here 4001), so a real child after a backward clock step is reported as not stopped, never as a clean tree: $prTxt"
         $results.cimWalkPidReuse = $prOut
     }
     # r2 (sol 2, fable H2): a snapshot that returns rows and THEN fails (a non-terminating provider error, or a throw) keeps the rows it returned; a
@@ -6072,6 +6076,8 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         $psOut = & {
             $script:PsMode = 'ok'
             $script:PsGone = @()
+            $script:PsEvents = [System.Collections.Generic.List[string]]::new()
+            $script:PsFilterTimeouts = [System.Collections.Generic.List[int]]::new()
             $script:PsStopped = [System.Collections.Generic.List[int]]::new()
             $psBase = [datetime]::new(2026, 11, 20, 12, 0, 0, [DateTimeKind]::Local)
             function New-PsProc([int]$Id, [int]$Parent, [int]$Sec) { [pscustomobject]@{ ProcessId = [uint32]$Id; ParentProcessId = [uint32]$Parent; CreationDate = $psBase.AddSeconds($Sec); ExecutablePath = 'C:\x\p.exe'; CommandLine = "p $Id" } }
@@ -6079,7 +6085,13 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             function Get-CimInstance {
                 [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter, [string[]]$Property, [uint32]$OperationTimeoutSec)
                 $rows = @($script:PsTable)
-                if ($Filter -match '^ProcessId=(\d+)$') { $n = [int]$Matches[1]; if (@($script:PsGone) -contains $n) { return @() }; return @($rows | Where-Object { [int]$_.ProcessId -eq $n }) }
+                if ($Filter -match '^ProcessId=(\d+)$') {
+                    $n = [int]$Matches[1]
+                    $script:PsEvents.Add("filter:$Filter"); $script:PsFilterTimeouts.Add($(if ($PSBoundParameters.ContainsKey('OperationTimeoutSec')) { [int]$OperationTimeoutSec } else { -1 }))
+                    if (@($script:PsGone) -contains $n) { return @() }
+                    return @($rows | Where-Object { [int]$_.ProcessId -eq $n })
+                }
+                $script:PsEvents.Add('snapshot')
                 switch ($script:PsMode) {
                     'ok' { return $rows }
                     'partial-nonterminating' { $rows | ForEach-Object { $_ }; Write-Error 'simulated provider error after rows'; return }
@@ -6112,8 +6124,10 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             foreach ($gone in @(@(), @(7000))) {
                 $script:PsGone = $gone
                 $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null; $script:DescendantWalkStaleLogged = $null
-                $walk = @(Get-DescendantProcessIdentities -ParentProcessId 7000)
-                $rowsOut["before-root-gone$(@($gone).Count)"] = [pscustomobject]@{ ids = (@($walk | ForEach-Object { [int]$_.processId }) -join ',') }
+                $script:PsEvents.Clear(); $script:PsFilterTimeouts.Clear()
+                $walk = @(Get-DescendantProcessIdentities -ParentProcessId 7000 -OnEach { $script:PsEvents.Add('tick') })
+                $rowsOut["before-root-gone$(@($gone).Count)"] = [pscustomobject]@{ ids = (@($walk | ForEach-Object { [int]$_.processId }) -join ','); events = (@($script:PsEvents) -join ' > '); filterTimeouts = (@($script:PsFilterTimeouts) -join ',')
+                    why = [string]$script:LastDescendantWalk.why }
             }
             $script:PsGone = @()
             # adversary A10: one snapshot failure is one physical agent.log line, whatever the provider's message holds.
@@ -6152,6 +6166,11 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         $b0 = $psOut['before-root-gone0']; $b1 = $psOut['before-root-gone1']
         Assert-True ($b0.ids -eq '7005') "cim-walk-partial-snapshot: a snapshot that fails after a stale-edge row and BEFORE the root's own row still refuses the stale row (the root's start is read once from its identity) and keeps the real child: ids=[$($b0.ids)] $psTxt"
         Assert-True ($b1.ids -eq '') "cim-walk-partial-snapshot: with the root's row missing AND its identity unreadable, none of its children is walked (they cannot be checked for pid reuse): ids=[$($b1.ids)] $psTxt"
+        # adversary pass 2 A2: the one extra read of the partial path is bounded (-OperationTimeoutSec) and happens BEFORE the closing -OnEach tick.
+        foreach ($bx in @($b0, $b1)) {
+            Assert-True ($bx.events -ceq 'tick > snapshot > filter:ProcessId=7000 > tick' -and $bx.filterTimeouts -match '^(\d+)$' -and [int]$bx.filterTimeouts -ge 1 -and [int]$bx.filterTimeouts -le 60) "cim-walk-partial-snapshot: the partial path's root read is one filtered query with -OperationTimeoutSec 1-60, between the snapshot and the closing tick (events=[$($bx.events)] timeouts=[$($bx.filterTimeouts)])"
+        }
+        Assert-True ($b1.why.Contains('could not be read')) "cim-walk-partial-snapshot: a root that cannot be verified is recorded in the walk's why: [$($b1.why)]"
         $ml = $psOut['multiline']
         Assert-True ($ml.count -eq 1 -and -not $ml.hasNewline -and ([string]$ml.line).Contains('RPC unavailable') -and ([string]$ml.line).Contains('provider retry exhausted')) "cim-walk-partial-snapshot: a provider message with an embedded CRLF is ONE physical agent.log line: $psTxt"
         $ow = $psOut['owner']
@@ -6160,13 +6179,15 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         # Every kill path says an incomplete walk. The three of Invoke-QueuedJob (cancel, lease stop, timeout) carry the note on the line that names the killed pids
         # (a second interpolation on another line cannot satisfy this: adversary A8), and each of the other Stop-ProcessTree sites carries it (or the $stopNote
         # it captured right after the call) in the message that reports the stop.
-        $qjText = Get-FunctionBody 'Invoke-QueuedJob'
-        $qjMsgs = @([regex]::Matches($qjText, [regex]::Escape('killed process tree pids=$($killedProcessIds -join '','')$($script:ProcessTreeWalkNote)"')))
-        $qjSites = @([regex]::Matches($qjText, [regex]::Escape('Stop-ProcessTree -RootProcessId $jobProcess.Id')))
-        Assert-True ($qjSites.Count -eq 3 -and $qjMsgs.Count -eq 3) "cim-walk-partial-snapshot: all three job kill paths (cancel, lease stop, timeout) append the walk note to the message that names the killed pids (sites=$($qjSites.Count) messages=$($qjMsgs.Count))"
-        $allCalls = @([regex]::Matches($agentText, [regex]::Escape('Stop-ProcessTree -RootProcessId')) | ForEach-Object { $_.Index })
-        $uncovered = @($allCalls | Where-Object { $seg = $agentText.Substring($_, [Math]::Min(2200, $agentText.Length - $_)); -not ($seg.Contains('ProcessTreeWalkNote') -or $seg.Contains('$stopNote')) })
-        Assert-True ($allCalls.Count -eq 8 -and $uncovered.Count -eq 0) "cim-walk-partial-snapshot: every Stop-ProcessTree call site in the agent (8: adopted child, holder end, stale holder, lease end, stale lease, and the three job kill paths) reports the walk note (sites=$($allCalls.Count) uncovered=$($uncovered.Count))"
+        # Read from the agent's AST (adversary pass 2 A3): a comment carrying the text satisfies nothing; only an interpolation inside an actual string does.
+        $qjFn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-QueuedJob' }, $true)
+        $isNoteString = { param($n) $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -and @($n.NestedExpressions | Where-Object { $_.Extent.Text -ceq '$($script:ProcessTreeWalkNote)' -or $_.Extent.Text -ceq '$stopNote' }).Count -gt 0 }
+        $qjSites = @($qjFn.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Stop-ProcessTree' }, $true))
+        $qjMsgs = @($qjFn.FindAll({ param($n) (& $isNoteString $n) -and $n.Value.Contains('killed process tree pids=') }, $true))
+        Assert-True ($qjSites.Count -eq 3 -and $qjMsgs.Count -eq 3) "cim-walk-partial-snapshot: all three job kill paths (cancel, lease stop, timeout) append the walk note to the message string that names the killed pids (sites=$($qjSites.Count) messages=$($qjMsgs.Count))"
+        $allCalls = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Stop-ProcessTree' }, $true))
+        $noteStrings = @($ast.FindAll({ param($n) & $isNoteString $n }, $true))
+        Assert-True ($allCalls.Count -eq 8 -and $noteStrings.Count -eq 10) "cim-walk-partial-snapshot: the agent's 8 Stop-ProcessTree call sites (adopted child, holder end, stale holder, lease end, stale lease, and the three job kill paths) report the walk note in 9 message strings (the lease stop also in its agent.log line), plus the one Stop-ProcessTree builds from it: sites=$($allCalls.Count) noteStrings=$($noteStrings.Count)"
         $results.cimWalkPartialSnapshot = $psOut
     }
     # The same comparison on a LIVE tree (real Get-CimInstance, real processes): cmd.exe -> cmd.exe -> ping.exe. The legacy walk is reproduced
@@ -6188,7 +6209,11 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             # r2 (sol 3): both cmd.exe lines of the tree name a path under the fixture dir (an echo to nul; the inner one is escaped with ^& so the
             # outer cmd passes it on), the marker the suite's own leak census counts: a tree that outlives the case is a FIXTURE-LEAK, never invisible.
             $lvMark = Join-Path $fx 'cim-walk-live-parity'
-            foreach ($a in @('/c', "echo $lvMark >nul & cmd.exe /c echo $lvMark >nul ^& ping.exe -n 120 127.0.0.1 >nul")) { [void]$psiL.ArgumentList.Add($a) }
+            # adversary pass 2 A5: the marker goes into the cmd line only when it is a plain drive path (the census reads nothing else as a match anyway);
+            # a temp dir holding & ^ % ( ) or a space would otherwise change what cmd runs.
+            $lvPlain = ($lvMark -cmatch '^[A-Za-z]:(\\[A-Za-z0-9_.\-~]+)+$')
+            $lvCmd = if ($lvPlain) { "echo $lvMark >nul & cmd.exe /c echo $lvMark >nul ^& ping.exe -n 120 127.0.0.1 >nul" } else { 'cmd.exe /c ping.exe -n 120 127.0.0.1 >nul' }
+            foreach ($a in @('/c', $lvCmd)) { [void]$psiL.ArgumentList.Add($a) }
             $psiL.UseShellExecute = $false; $psiL.CreateNoWindow = $true
             $root = Register-OwnedChild ([Diagnostics.Process]::Start($psiL))   # owned: the suite's own sweep ends it if this case dies early
             $attempts = 0; $legacyKeys = @(); $newKeys = @(); $same = $false; $marked = $false
@@ -6203,7 +6228,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                     # r2 (sol hardening): parity counts only when the expected chain is in BOTH sets (an inner cmd.exe and the ping.exe under it), not any equal non-empty pair.
                     $chain = (@($newKeys | Where-Object { $_ -match 'cmd\.exe$' }).Count -ge 1 -and @($newKeys | Where-Object { $_ -match 'ping\.exe$' }).Count -ge 1)
                     $same = ($chain -and ($legacyKeys -join "`n") -ceq ($newKeys -join "`n"))
-                    $marked = ($same -and @($new | Where-Object { $_.exists -and $_.imagePath -match 'cmd\.exe$' -and ([string]$_.commandLine).Contains($lvMark) }).Count -ge 1)
+                    $marked = ($same -and (-not $lvPlain -or @($new | Where-Object { $_.exists -and $_.imagePath -match 'cmd\.exe$' -and ([string]$_.commandLine).Contains($lvMark) }).Count -ge 1))
                 }
             }
             finally {
