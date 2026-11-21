@@ -2390,9 +2390,11 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             # $script:ClaimRetryRefusalTailSec), measured on a monotonic clock from the retry's start. A try is never started once it has run out, no sleep follows the last try, and a sleep never runs past it. A release
             # call already in flight is not interrupted (Release-VenueClaim's own 5 opens, 0.5 s when BUSY), so the most past the bound is that one call.
             # r11 (sol r10 B2): a call used to answer BUSY 0.25 s AFTER its last open (a sleep with nothing behind it), i.e. at 0.75 s, the whole bound, so the first BUSY ended the retry and a reader that let go at
-            # 0.65 s left the claim behind. The call now answers BUSY at 0.5 s, so the loop goes on until the bound is spent: the loop only stops with the clock at or past the bound, and a call that is then
-            # the last one began before it, so its last open falls at or after the bound (a reader that lets go inside the reserve always meets one more open). Worst case past -DeadlineUtc: a try begins just
-            # before the bound (0.75 s less one tick) and runs its 0.5 s: about 1.25 s, plus the log line. A sleep is never taken after the last try.
+            # 0.65 s left the claim behind. The call now answers BUSY at 0.5 s, so the loop goes on while the bound is not spent.
+            # r11 pass 1 (adversary A1, introduced by that change): the last sleep can still carry the clock past the bound AFTER the last open (a fifth open that failed at 0.68 s, a 0.07 s sleep to the bound,
+            # a reader that lets go at 0.70 s). So when the loop ends without a release, ONE final probe is made at the end of the reserve: Release-VenueClaim -MaxAttempts 1, a single open with no sleep. It is
+            # a probe, not a further retry (the A1 rule of r10 stands: no whole release call starts once the reserve is spent). Worst case past -DeadlineUtc: a try that begins just before the bound
+            # (0.75 s less one tick) and runs its 0.5 s = about 1.25 s, plus the one open of the probe and the log line. A claim granted on a retry has its own single bounded release and no probe.
             $lateAnswer = ''
             $lateClock = [Diagnostics.Stopwatch]::StartNew()
             $lateBoundSec = [double]($script:ClaimRetryRequestReserveSec - $script:ClaimRetryRefusalTailSec)
@@ -2404,6 +2406,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $lateLeftSec = $lateBoundSec - $lateClock.Elapsed.TotalSeconds
                 if ($lateTry -ge 5 -or $lateLeftSec -le 0) { break }
                 Start-Sleep -Milliseconds ([int][Math]::Ceiling([Math]::Min([double](100 * $lateTry), [double]($lateLeftSec * 1000))))   # rounded UP: a sleep cut short by the cast would wake just before the bound and start a try inside it
+            }
+            if (-not $grantedOnRetry -and $lateAnswer -cnotin @('RELEASED', 'ABSENT', 'NOT_OURS')) {
+                try { $lateAnswer = [string](Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir -MaxAttempts 1) } catch { $lateAnswer = 'ERROR' }
             }
             if ($lateAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { LogBest "CLAIM_LATE_GRANT batch=$batchNo (the claim was granted at or after the deadline: let go, not used)" }
             else { LogBest "CLAIM_LATE_GRANT_NOT_RELEASED batch=$batchNo answer=$lateAnswer (the claim was granted at or after the deadline and is NOT known to be let go: it still names this batch until its expiry or its owner's exit)" }

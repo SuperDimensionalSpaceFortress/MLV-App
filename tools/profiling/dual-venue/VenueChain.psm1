@@ -147,13 +147,14 @@ function Get-VenueClaim {
 function Remove-VenueClaimIfUnchanged {
     # Opens the claim exclusively (only FileShare.Delete, so no one can read, write or take it meanwhile), re-reads it and deletes it only when it still
     # holds -ExpectedText (or, with -ExpectedNonce, that nonce). Returns REMOVED | CHANGED | ABSENT | BUSY.
-    param([Parameter(Mandatory)][string]$Path, [string]$ExpectedText = $null, [string]$ExpectedNonce = '')
-    for ($attempt = 1; $attempt -le 5; $attempt++) {
+    # r11 pass 1 (adversary A1): -MaxAttempts (1..5, default 5) is how many opens are tried; the late grant's final probe asks for one.
+    param([Parameter(Mandatory)][string]$Path, [string]$ExpectedText = $null, [string]$ExpectedNonce = '', [ValidateRange(1, 5)][int]$MaxAttempts = 5)
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return 'ABSENT' }
         $fs = $null
         # r11 (sol r10 B2): no sleep after the LAST attempt. It was followed by nothing but the BUSY answer, so a call that found the file held answered at 750 ms (opens at 0, 50, 150, 300, 500) when its last
         # open was at 500 ms: the late grant's release (reserve 0.75 s) took that one answer as the end of the reserve and gave up on a reader that let go at 650 ms. It now answers BUSY right after its last open (500 ms).
-        try { $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Delete) } catch { if ($attempt -lt 5) { Start-Sleep -Milliseconds (50 * $attempt) }; continue }
+        try { $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Delete) } catch { if ($attempt -lt $MaxAttempts) { Start-Sleep -Milliseconds (50 * $attempt) }; continue }
         try {
             $sr = [IO.StreamReader]::new($fs, [Text.UTF8Encoding]::new($false), $false, 4096, $true)
             $text = $sr.ReadToEnd(); $sr.Dispose()
@@ -799,9 +800,9 @@ function Release-VenueClaim {
     .SYNOPSIS
     Release the venue's claim if it is still the one with -Nonce. Returns RELEASED | NOT_OURS | ABSENT | BUSY.
     #>
-    param([Parameter(Mandatory)][string]$Venue, [Parameter(Mandatory)][string]$Nonce, [string]$ClaimDir = '')
+    param([Parameter(Mandatory)][string]$Venue, [Parameter(Mandatory)][string]$Nonce, [string]$ClaimDir = '', [ValidateRange(1, 5)][int]$MaxAttempts = 5)
     $path = Get-VenueClaimPath -Venue $Venue -ClaimDir $ClaimDir
-    switch (Remove-VenueClaimIfUnchanged -Path $path -ExpectedNonce $Nonce) {
+    switch (Remove-VenueClaimIfUnchanged -Path $path -ExpectedNonce $Nonce -MaxAttempts $MaxAttempts) {
         'REMOVED' { 'RELEASED' }
         'CHANGED' { 'NOT_OURS' }
         default { $_ }

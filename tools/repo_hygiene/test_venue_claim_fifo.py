@@ -2025,7 +2025,7 @@ $hold.Dispose()
 [pscustomobject]@{ held = $true; sawRelease = ($null -ne $entry); closedAfterMs = [int]$sw.Elapsed.TotalMilliseconds } | ConvertTo-Json -Compress
 """
 
-    def late_grant_scenario(self, hold: bool, deadline_sec: float = 20.0, release_seam: bool = False, observe_close_ms: int = 0) -> dict:
+    def late_grant_scenario(self, hold: bool, deadline_sec: float = 20.0, release_seam: bool = False, observe_close_ms: int = 0, slow_full_call_ms: int = 0) -> dict:
         # A real lease batch whose claim is GRANTED AFTER -DeadlineUtc: a copy of VenueChain.psm1 keeps the granted claim standing until 0.2 s past the deadline (the seam, nothing else changed), so the
         # batch takes the late-grant branch. With hold=True a reader (FileShare.Read, no Delete) holds the claim file from the grant until the batch has logged what it did, so every release is refused (BUSY).
         import shutil
@@ -2037,17 +2037,20 @@ $hold.Dispose()
         seam = anchor + "    if ($r.granted -and $env:SEAM_UNTIL_UTC) { $u = [DateTime]::Parse($env:SEAM_UNTIL_UTC, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind); while ([DateTime]::UtcNow -lt $u) { Start-Sleep -Milliseconds 20 } }\n"
         text = text.replace(anchor, seam)
         env: dict[str, str] = {}
+        rel_anchor = "    switch (Remove-VenueClaimIfUnchanged -Path $path -ExpectedNonce $Nonce -MaxAttempts $MaxAttempts) {\n"
+        log_call = "[IO.File]::AppendAllText($env:SEAM_RELEASE_LOG, [DateTime]::UtcNow.ToString('o') + ' max=' + $MaxAttempts + [Environment]::NewLine)"
         if release_seam:
-            # r10 adversary A1: every Release-VenueClaim call is logged with its start time, takes 650 ms and answers BUSY (a release that takes most of the 750 ms reserve, deterministically)
-            rel_anchor = "    switch (Remove-VenueClaimIfUnchanged -Path $path -ExpectedNonce $Nonce) {\n"
+            # r10 adversary A1: every Release-VenueClaim call is logged with its start time and its -MaxAttempts; a full call (the default 5) takes 650 ms and answers BUSY (a release that takes most of the 750 ms
+            # reserve, deterministically); r11 pass 1: the final single-open probe (-MaxAttempts 1) answers BUSY at once, so the claim is never released and the NOT_RELEASED line is what is asserted
             self.assertEqual(text.count(rel_anchor), 1, "release seam anchor moved")
-            text = text.replace(rel_anchor, "    if ($env:SEAM_RELEASE_LOG) { [IO.File]::AppendAllText($env:SEAM_RELEASE_LOG, [DateTime]::UtcNow.ToString('o') + [Environment]::NewLine); Start-Sleep -Milliseconds 650; return 'BUSY' }\n" + rel_anchor)
+            text = text.replace(rel_anchor, "    if ($env:SEAM_RELEASE_LOG) { " + log_call + "; if ($MaxAttempts -gt 1) { Start-Sleep -Milliseconds 650 }; return 'BUSY' }\n" + rel_anchor)
             env["SEAM_RELEASE_LOG"] = str(self.case / "release-calls.log")
         elif observe_close_ms:
-            # r11 B2: the same log line at the start of every Release-VenueClaim call, and nothing else changed (the call runs as it ships)
-            rel_anchor = "    switch (Remove-VenueClaimIfUnchanged -Path $path -ExpectedNonce $Nonce) {\n"
+            # r11 B2: the same log line at the start of every Release-VenueClaim call. Nothing else changed (the call runs as it ships), unless slow_full_call_ms is given (r11 pass 1 A1): then a FULL call
+            # sleeps that long and answers BUSY without touching the file, and only the single-open probe runs for real
             self.assertEqual(text.count(rel_anchor), 1, "release seam anchor moved")
-            text = text.replace(rel_anchor, "    if ($env:SEAM_RELEASE_LOG) { [IO.File]::AppendAllText($env:SEAM_RELEASE_LOG, [DateTime]::UtcNow.ToString('o') + [Environment]::NewLine) }\n" + rel_anchor)
+            slow = ("; if ($MaxAttempts -gt 1) { Start-Sleep -Milliseconds %d; return 'BUSY' }" % slow_full_call_ms) if slow_full_call_ms else ""
+            text = text.replace(rel_anchor, "    if ($env:SEAM_RELEASE_LOG) { " + log_call + slow + " }\n" + rel_anchor)
             env["SEAM_RELEASE_LOG"] = str(self.case / "release-calls.log")
         runner = copy_with_siblings(LEASE_RUNNER, Path(tempfile.mkdtemp(prefix="late-", dir=self.case)))
         (runner.parent / MODULE.name).write_text(text, encoding="utf-8")
@@ -2105,7 +2108,27 @@ $hold.Dispose()
         # 0.1 s that is left, and the reserve is spent when it ends. Exactly ONE release call may have been made; the unfixed loop made a second.
         r = self.late_grant_scenario(hold=False, release_seam=True)
         self.assertTrue(any("CLAIM_LATE_GRANT_NOT_RELEASED" in l for l in r["log"].splitlines()), f"the always-BUSY release must be logged as not released:\n{r['log']}")
-        self.assertEqual(len(r["releaseCalls"]), 1, f"a release try started after the reserve was spent: calls at {r['releaseCalls']}")
+        # r11 pass 1: the final single-open probe (-MaxAttempts 1, the seam answers it BUSY at once) is not a release call and is not counted: ONE full call, and at most that one probe after it
+        full = [c for c in r["releaseCalls"] if c.endswith("max=5")]
+        probes = [c for c in r["releaseCalls"] if c.endswith("max=1")]
+        self.assertEqual(len(full), 1, f"a release try started after the reserve was spent: calls at {r['releaseCalls']}")
+        self.assertLessEqual(len(probes), 1, f"more than one final probe: {r['releaseCalls']}")
+        self.assertEqual(len(full) + len(probes), len(r["releaseCalls"]), f"a call with an unexpected -MaxAttempts: {r['releaseCalls']}")
+
+    def test_r11_pass1_a1_a_reader_that_lets_go_between_the_last_open_and_the_end_of_the_reserve_is_met_by_the_final_probe(self) -> None:
+        # r11 adversary pass 1 A1 (blocker, introduced by the B2 change): with the trailing sleep gone a BUSY call answers at 500 ms, but one whose fifth open failed at 680 ms (slow opens) is followed by a 70 ms
+        # sleep that spends the reserve, and no open follows it: a reader that lets go at 700 ms left the claim behind. The seam makes every FULL release call take 680 ms and answer BUSY without touching the
+        # file; the observer lets go 650 ms after the first call starts (about 700 ms by the time it does). Expected: the one final single-open probe at the end of the reserve releases the claim.
+        r = self.late_grant_scenario(hold=False, observe_close_ms=650, slow_full_call_ms=680)
+        h = r["holder"]
+        self.assertTrue(h["sawRelease"], f"the observer never saw a release call: {h}")
+        lines = [l for l in r["log"].splitlines() if "CLAIM_LATE_GRANT" in l]
+        self.assertTrue(any("CLAIM_LATE_GRANT batch=" in l and "let go" in l for l in lines), f"a reader that let go between the last open and the end of the reserve left the claim unreleased: {lines}\ncalls: {r['releaseCalls']}")
+        self.assertFalse(r["claimLeft"], "the late grant's claim file was left behind")
+        full = [c for c in r["releaseCalls"] if c.endswith("max=5")]
+        self.assertEqual(len(full), 1, f"a whole release call started after the reserve was spent: {r['releaseCalls']}")
+        self.assertEqual(r["exit"], 3, f"the batch must still end DEADLINE (exit 3):\n{r['log']}\n{r['out']}")
+        self.assertNotRegex(r["log"], r"LEASE_OPEN|LEASE_CHARGED|LEG_START|LEG_PLAN_WRITTEN", f"a lease was opened or charged after a late grant:\n{r['log']}")
 
     def test_r11_b2_a_reader_that_lets_go_inside_the_reserve_does_not_leave_the_late_grants_claim_behind(self) -> None:
         # r11 sol r10 blocker B2 (introduced by r10's G13 bound): a Release-VenueClaim call's own opens fall at 0, 50, 150, 300 and 500 ms and it answers BUSY at 750 ms (a 250 ms sleep after the last open), which
