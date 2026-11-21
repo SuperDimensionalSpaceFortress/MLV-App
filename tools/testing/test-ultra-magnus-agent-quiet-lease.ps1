@@ -6200,7 +6200,19 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         $qjFn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-QueuedJob' }, $true)
         $isNoteString = { param($n) $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -and @($n.NestedExpressions | Where-Object { $_.Extent.Text -ceq '$($script:ProcessTreeWalkNote)' -or $_.Extent.Text -ceq '$stopNote' }).Count -gt 0 }
         $qjSites = @($qjFn.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Stop-ProcessTree' }, $true))
-        $qjMsgs = @($qjFn.FindAll({ param($n) (& $isNoteString $n) -and $n.Value.Contains('killed process tree pids=') }, $true))
+        # r4 (adversary pass 3 A7): a counted message string must be EXECUTED and WRITTEN: the first element of a two-element pipeline whose second
+        # element is Add-Content to $errFile. A string parked in `if ($false) { $null = "..." }` (or any assignment/discard) is not counted.
+        $isWrittenToErrFile = {
+            param($n)
+            $ce = $n.Parent
+            if ($ce -isnot [System.Management.Automation.Language.CommandExpressionAst] -or -not [object]::ReferenceEquals($ce.Expression, $n)) { return $false }
+            $pl = $ce.Parent
+            if ($pl -isnot [System.Management.Automation.Language.PipelineAst] -or $pl.PipelineElements.Count -ne 2 -or -not [object]::ReferenceEquals($pl.PipelineElements[0], $ce)) { return $false }
+            $sink = $pl.PipelineElements[1]
+            if ($sink -isnot [System.Management.Automation.Language.CommandAst] -or $sink.GetCommandName() -ne 'Add-Content') { return $false }
+            return (@($sink.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.VariableExpressionAst] -and $_.VariablePath.UserPath -ceq 'errFile' }).Count -eq 1)
+        }
+        $qjMsgs = @($qjFn.FindAll({ param($n) (& $isNoteString $n) -and $n.Value.Contains('killed process tree pids=') -and (& $isWrittenToErrFile $n) }, $true))
         Assert-True ($qjSites.Count -eq 3 -and $qjMsgs.Count -eq 3) "cim-walk-partial-snapshot: all three job kill paths (cancel, lease stop, timeout) append the walk note to the message string that names the killed pids (sites=$($qjSites.Count) messages=$($qjMsgs.Count))"
         $allCalls = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Stop-ProcessTree' }, $true))
         $noteStrings = @($ast.FindAll({ param($n) & $isNoteString $n }, $true))
