@@ -23,10 +23,12 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <functional>
 #include <mutex>
@@ -47,6 +49,9 @@ const char * const kFixtures[] = {
     "tests/fixtures/clips/tiny_dual_iso.mlv",
     "tests/fixtures/clips/large_dual_iso.mlv",
 };
+// r2d adversary pass 4 (A3): the lossless frames each checked-in fixture holds. The workload is exactly this many; an empty
+// fixture or a VIDF block the walk skipped is a refusal, not a smaller run.
+const size_t kFixtureFrames[] = { 2, 16 };
 
 // ---------------------------------------------------------------------------------------------------- file helpers
 
@@ -97,7 +102,7 @@ bool collect_lj92_payloads(const Bytes & file, std::vector<Bytes> & frames)
             const uint32_t space = rd32(file, pos + 28);
             const size_t start = pos + 32 + space;
             if (start + 2 < pos + size && file[start] == 0xFF && file[start + 1] == 0xD8)
-                frames.emplace_back(file.begin() + (long)start, file.begin() + (long)(pos + size));
+                frames.emplace_back(file.begin() + (std::ptrdiff_t)start, file.begin() + (std::ptrdiff_t)(pos + size));
         }
         pos += size;
     }
@@ -392,11 +397,11 @@ void run_synthetic(Counters & c, std::mt19937 & rng)
                 if (stream.size() > start + 4)
                 {
                     for (size_t cut = 1; cut <= 40 && cut < stream.size() - start; cut++)
-                        compare_readers(c, label + " cut-" + std::to_string(cut), Bytes(stream.begin(), stream.end() - (long)cut), spec.expect_u64, nullptr, true);
+                        compare_readers(c, label + " cut-" + std::to_string(cut), Bytes(stream.begin(), stream.end() - (std::ptrdiff_t)cut), spec.expect_u64, nullptr, true);
                     for (int k = 1; k < 12; k++)
                     {
                         const size_t keep = start + (stream.size() - start) * (size_t)k / 12u;
-                        compare_readers(c, label + " keep-" + std::to_string(keep), Bytes(stream.begin(), stream.begin() + (long)keep), spec.expect_u64, nullptr, true);
+                        compare_readers(c, label + " keep-" + std::to_string(keep), Bytes(stream.begin(), stream.begin() + (std::ptrdiff_t)keep), spec.expect_u64, nullptr, true);
                     }
                     // the tail of a stream that ends in a stuffed 0xFF, and a stream that ends on a bare 0xFF
                     Bytes ff_end(stream.begin(), stream.end() - 2);
@@ -575,13 +580,15 @@ int run_selftest(const std::string & root, unsigned seed)
     check_bench_options(c);
     check_scale_core(c);
     int fixture_frames = 0;
-    for (const char * fixture : kFixtures)
+    for (size_t fi = 0; fi < sizeof(kFixtures) / sizeof(kFixtures[0]); fi++)
     {
+        const char * const fixture = kFixtures[fi];
         Bytes file;
         if (root.empty() || !read_file(root + "/" + fixture, file)) { std::fprintf(stderr, "NOTE: fixture %s not readable under root '%s'\n", fixture, root.c_str()); c.fail(std::string("fixture unreadable: ") + fixture); continue; }
         std::vector<Bytes> frames;
         if (!collect_lj92_payloads(file, frames)) c.fail(std::string("fixture block walk stopped before the end of the file (damaged or cut): ") + fixture);
         if (frames.empty()) { c.fail(std::string("fixture holds no lossless frame: ") + fixture); continue; }
+        if (frames.size() != kFixtureFrames[fi]) c.fail(std::string("fixture holds ") + std::to_string(frames.size()) + " lossless frame(s), the declared workload is " + std::to_string(kFixtureFrames[fi]) + ": " + fixture);
         for (size_t i = 0; i < frames.size(); i++)
         {
             const DecodeInfo probe = decode_copy(frames[i], false);
@@ -600,9 +607,9 @@ int run_selftest(const std::string & root, unsigned seed)
             if (i % 8 == 0)
             {
                 for (size_t cut = 1; cut <= 40 && cut < f.size(); cut++)
-                    compare_readers(c, std::string(fixture) + " frame " + std::to_string(i) + " cut-" + std::to_string(cut), Bytes(f.begin(), f.end() - (long)cut), -1, nullptr, true);
+                    compare_readers(c, std::string(fixture) + " frame " + std::to_string(i) + " cut-" + std::to_string(cut), Bytes(f.begin(), f.end() - (std::ptrdiff_t)cut), -1, nullptr, true);
                 for (int k = 1; k < 8; k++)
-                    compare_readers(c, std::string(fixture) + " frame " + std::to_string(i) + " keep-" + std::to_string(k), Bytes(f.begin(), f.begin() + (long)(f.size() * (size_t)k / 8u)), -1, nullptr, true);
+                    compare_readers(c, std::string(fixture) + " frame " + std::to_string(i) + " keep-" + std::to_string(k), Bytes(f.begin(), f.begin() + (std::ptrdiff_t)(f.size() * (size_t)k / 8u)), -1, nullptr, true);
             }
         }
     }
@@ -633,12 +640,14 @@ bool load_frames(const std::string & root, std::vector<Bytes> & frames, std::vec
 {
     // r2d adversary pass 3 (A4): the workload is the WHOLE declared fixture set. A fixture that cannot be read, or whose block
     // walk stops before the end of the file, refuses the run instead of shrinking it.
-    for (const char * fixture : kFixtures)
+    for (size_t fi = 0; fi < sizeof(kFixtures) / sizeof(kFixtures[0]); fi++)
     {
+        const char * const fixture = kFixtures[fi];
         Bytes file;
         if (!read_file(root + "/" + fixture, file)) { std::fprintf(stderr, "fixture unreadable: %s/%s\n", root.c_str(), fixture); return false; }
         std::vector<Bytes> got;
         if (!collect_lj92_payloads(file, got)) { std::fprintf(stderr, "fixture block walk stopped before the end of the file (damaged or cut): %s\n", fixture); return false; }
+        if (got.size() != kFixtureFrames[fi]) { std::fprintf(stderr, "fixture holds %zu lossless frame(s), the declared workload is %zu: %s\n", got.size(), kFixtureFrames[fi], fixture); return false; }
         for (auto & g : got) { frames.push_back(std::move(g)); origin.push_back(fixture); }
     }
     return !frames.empty();
@@ -696,11 +705,46 @@ double time_decode(Opened & o, bool legacy, Route & route, double * bitstream_ms
     return ret == LJ92_ERROR_NONE ? t1 - t0 : -1.0;
 }
 
+// Empty when a timed decode is a usable sample of its arm: it succeeded (time_decode's -1 is the failure sentinel) and it ran
+// the route the arm is labelled with. The ONE place that reads the sentinel.
+std::string decode_problem(double ms, const Route & r, bool legacy_arm)
+{
+    std::string why;
+    if (ms < 0) why = "the decode failed";
+    else why = route_problem(r, legacy_arm);
+    return why;
+}
+
+// r2d adversary pass 4 (A1, A2): EVERY frame of the declared workload, whether or not a cap or a timed loop would reach it,
+// is decoded once per arm before anything is timed; the first frame that is not a usable sample of its arm refuses the run.
+// production_loop also refuses the measurement route (its total is not the production loop's). Empty when all frames pass.
+std::string workload_route_problem(const std::vector<Bytes> & frames, bool production_loop)
+{
+    for (size_t i = 0; i < frames.size(); i++)
+    {
+        Opened o;
+        if (!open_frame(o, frames[i])) return "frame " + std::to_string(i) + " did not open";
+        std::string why;
+        for (int arm = 0; arm < 2 && why.empty(); arm++)
+        {
+            Route r;
+            const double ms = time_decode(o, arm == 0, r);
+            why = decode_problem(ms, r, arm == 0);
+            if (why.empty() && production_loop && r.measurement_active) why = "the measurement route is active, so the total is not the production loop's";
+            if (!why.empty()) why = "frame " + std::to_string(i) + ", " + (arm == 0 ? "legacy" : "new") + " arm: " + why;
+        }
+        if (o.handle) lj92_close(o.handle);
+        if (!why.empty()) return why;
+    }
+    return std::string();
+}
+
 int run_bench(const std::string & root, int iters)
 {
     std::vector<Bytes> frames;
     std::vector<std::string> origin;
     if (!load_frames(root, frames, origin)) { std::fprintf(stderr, "no fixture frames\n"); return 2; }
+    { const std::string why = workload_route_problem(frames, false); if (!why.empty()) { std::fprintf(stderr, "bench refused (whole workload, %s)\n", why.c_str()); return 3; } }
     // a bounded, evenly spread sample of the large fixture keeps a run short; the tiny one is taken whole
     std::vector<size_t> pick;
     for (size_t i = 0; i < frames.size(); i++) pick.push_back(i);
@@ -713,13 +757,8 @@ int run_bench(const std::string & root, int iters)
     // from the decoder's own measurement-active report, not from the environment.
     bool split = false;
     auto arm_ok = [&](const char * phase, size_t k, bool legacy_arm, double ms, const Route & r) -> bool {
-        std::string why;
-        if (ms < 0) why = "the decode failed";
-        else
-        {
-            why = route_problem(r, legacy_arm);
-            if (why.empty() && (r.measurement_active != 0) != split) why = "the measurement route is not the same for every decode";
-        }
+        std::string why = decode_problem(ms, r, legacy_arm);
+        if (why.empty() && (r.measurement_active != 0) != split) why = "the measurement route is not the same for every decode";
         if (why.empty()) return true;
         std::fprintf(stderr, "bench refused (%s, frame %zu, %s arm): %s\n", phase, pick[k], legacy_arm ? "legacy" : "new", why.c_str());
         return false;
@@ -796,15 +835,20 @@ int scale_measure(const std::vector<Bytes> & frames, const std::vector<size_t> &
     std::vector<std::vector<double>> lat((size_t)workers);
     std::vector<double> samples_done((size_t)workers, 0.0);
     std::vector<double> end_ms((size_t)workers, 0.0);
+    std::vector<char> signalled((size_t)workers, 0);   // a worker that threw before it reached the barrier still counts as arrived
     std::vector<std::thread> threads;
+    int started = 0;
+    // r2d adversary pass 4 (A4): an allocation failure or a thread that cannot start is a controlled refusal, never a terminate
+    try {
     for (int w = 0; w < workers; w++)
     {
-        threads.emplace_back([&, w]() {
+        threads.emplace_back([&, w]() { try {
             // RAM-resident payload copies and a private decoder and output buffer per worker; no file I/O inside the timed loop
             std::vector<Opened> own(pick.size());
             bool opened_all = true;
             for (size_t k = 0; k < pick.size(); k++) if (!open_frame(own[k], frames[pick[k]])) opened_all = false;
             if (!opened_all) { int none = 0; if (refused.compare_exchange_strong(none, 1)) std::fprintf(stderr, "scale refused (worker %d): a fixture frame did not open\n", w); }
+            signalled[(size_t)w] = 1;
             ready.fetch_add(1);
             while (!go.load()) std::this_thread::yield();
             const double start = start_ms.load();   // ONE start for every worker, so the aggregate interval is the one they all ran in
@@ -818,10 +862,8 @@ int scale_measure(const std::vector<Bytes> & frames, const std::vector<size_t> &
                 Opened & o = own[k % own.size()];
                 Route r;
                 const double ms = time_decode(o, legacy, r);
-                std::string why;
-                if (ms < 0) why = "the decode failed";
-                else if (!(why = route_problem(r, legacy)).empty()) {}
-                else if (r.measurement_active) why = "the measurement route is active, so the total is not the production loop's";
+                std::string why = decode_problem(ms, r, legacy);
+                if (why.empty() && r.measurement_active) why = "the measurement route is active, so the total is not the production loop's";
                 if (!why.empty())
                 {
                     int none = 0;
@@ -835,9 +877,18 @@ int scale_measure(const std::vector<Bytes> & frames, const std::vector<size_t> &
             end_ms[(size_t)w] = now_ms();
             samples_done[(size_t)w] = done;
             for (auto & o : own) if (o.handle) lj92_close(o.handle);
-        });
+        } catch (...) {
+            int none = 0;
+            if (refused.compare_exchange_strong(none, 3)) std::fprintf(stderr, "scale refused (worker %d): setup or decode threw (out of memory?)\n", w);
+            if (!signalled[(size_t)w]) { signalled[(size_t)w] = 1; ready.fetch_add(1); }
+        } });
+        started++;
     }
-    while (ready.load() < workers) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } catch (...) {
+        int none = 0;
+        if (refused.compare_exchange_strong(none, 4)) std::fprintf(stderr, "scale refused: worker %d could not be started\n", started);
+    }
+    while (ready.load() < started) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     start_ms.store(now_ms());
     go.store(true);
     for (auto & t : threads) t.join();
@@ -867,6 +918,7 @@ int run_scale(const std::string & root, double seconds)
     std::vector<Bytes> frames;
     std::vector<std::string> origin;
     if (!load_frames(root, frames, origin)) { std::fprintf(stderr, "no fixture frames\n"); return 2; }
+    { const std::string why = workload_route_problem(frames, true); if (!why.empty()) { std::fprintf(stderr, "scale refused (whole workload, %s)\n", why.c_str()); return 3; } }
     std::vector<size_t> pick;
     const size_t want = std::min<size_t>(frames.size(), 24);
     for (size_t k = 0; k < want; k++) pick.push_back(k * frames.size() / want);
@@ -1051,9 +1103,22 @@ void check_scale_core(Counters & c)
     mixed.push_back(encode_picture(over, 64, 32, 14, 1, rng, 0, picture));
     ScaleRow row;
     c.checks++;
-    if (scale_measure(mixed, { 0, 1, 2 }, 2, false, 0.01, row) != 3) c.fail("scale: a new arm that fell back to the legacy reader was not refused");
+    if (scale_measure(mixed, { 2 }, 1, false, 0.01, row) != 3) c.fail("scale: a new arm that fell back to the legacy reader was not refused");
     c.checks++;
     if (scale_measure(mixed, { 0, 1, 2 }, 2, true, 0.01, row) != 0) c.fail("scale: the legacy arm on the same ring was refused");
+
+    // pass 4 (A1, A2): the whole-workload check reaches a bad frame that no cap and no timed loop would; it names a frame the
+    // u64 reader declines and a frame that is not predictor 1 at all (the generic route)
+    c.checks++;
+    if (!workload_route_problem(frames, false).empty()) c.fail("workload: the route check refused an eligible ring");
+    c.checks++;
+    if (workload_route_problem(mixed, false).empty()) c.fail("workload: a ring holding a frame the u64 reader declines passed the route check");
+    std::vector<Bytes> generic = frames;
+    Bytes pred2 = frames[0];
+    pred2[entropy_start(good, 1) - 3] = 2;                 // the SOS predictor byte: predictor 2 never takes the pred-1 fast path
+    generic.push_back(pred2);
+    c.checks++;
+    if (workload_route_problem(generic, false).empty()) c.fail("workload: a ring holding a predictor-2 (generic-route) frame passed the route check");
 
     // A4: a block walk that stops before the end of the file is reported, not taken as a smaller workload
     auto put32 = [](Bytes & b, uint32_t v) { for (int i = 0; i < 4; i++) b.push_back((uint8_t)(v >> (8 * i))); };
@@ -1094,10 +1159,18 @@ int main(int argc, char ** argv)
         std::fprintf(stderr, "lj92_pred1_reader_tool: %s\n%s", err.c_str(), usage);
         return 2;
     }
-    const std::string root = find_root(args.root);
-    if (args.mode == "--selftest") return run_selftest(root, args.seed);
-    if (args.mode == "--bench") return run_bench(root, args.iters);
-    if (args.mode == "--scale") return run_scale(root, args.seconds);
+    try
+    {
+        const std::string root = find_root(args.root);
+        if (args.mode == "--selftest") return run_selftest(root, args.seed);
+        if (args.mode == "--bench") return run_bench(root, args.iters);
+        if (args.mode == "--scale") return run_scale(root, args.seconds);
+    }
+    catch (const std::exception & e)   // r2d adversary pass 4 (A4): an allocation failure is a refusal (exit 3), not a terminate
+    {
+        std::fprintf(stderr, "lj92_pred1_reader_tool: refused: %s\n", e.what());
+        return 3;
+    }
     std::fprintf(stderr, "%s", usage);
     return 2;
 }
