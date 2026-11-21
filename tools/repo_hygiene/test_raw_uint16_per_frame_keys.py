@@ -146,6 +146,21 @@ class RawUint16PerFrameKeysTests(unittest.TestCase):
         self.assertNotEqual(reset, -1)
         self.assertLess(reset, first_return, "a decode that returns early must not keep the previous layout")
 
+    def test_a_failed_lj92_decode_resets_the_layout_it_copied_before_the_status_check(self) -> None:
+        """LJ92-PRED1-FAST-PATH-1 r12 (adversary pass 1 A2, introduced major): the wrapper copies the decoder's layout
+        getters before it checks the decode status, so a decode that failed after parseScan (a scan predictor the
+        decoder refuses, a corrupt entropy segment) left a predictor, precision and category maximum for a frame that
+        was never produced. The failure branch must put the layout back to its sentinels."""
+        source = (ROOT / "src/mlv/video_mlv.c").read_text(encoding="utf-8")
+        copied = source.index("g_mlv_last_raw_uint16_lj92_predictor =\n                    lj92_get_last_predictor();")
+        status_check = source.index("if(ret != LJ92_ERROR_NONE)", copied)
+        failure_branch = source[status_check:source.index("return 1;", status_check)]
+        self.assertIn("mlv_reset_last_raw_uint16_lj92_layout();", failure_branch)
+        helper_start = source.index("static void mlv_reset_last_raw_uint16_lj92_layout(void)")
+        helper = source[helper_start:source.index("\n}\n", helper_start)]
+        for sentinel in ("lj92_predictor = -1;", "lj92_precision = 0;", "lj92_max_ssss = -1;", "lj92_component_count = 0;"):
+            self.assertIn(sentinel, helper)
+
     def test_gpu_frame_record_appends_the_keys(self) -> None:
         statement = _statement_containing(self.source, '"playback_smoke.gpu_frame ', "qInfo()")
         self.assertIn("+ " + SHARED_KEYS, statement)
