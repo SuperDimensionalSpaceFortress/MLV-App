@@ -925,6 +925,14 @@ static volatile LONG64 g_llrawproc_gpu_set_luts_count = 0;
 static volatile LONG64 g_llrawproc_gpu_set_iso_pattern_count = 0;
 static llrpGpuReconEventLogger_t g_llrawproc_gpu_recon_event_logger = NULL;
 static llrpGpuStageTelemetrySink_t g_llrawproc_gpu_stage_telemetry_sink = NULL;
+/* adversary r14 A1: a logger may uninstall itself (llrpSetGpuReconEventLogger(NULL)) from inside its own call. Each event
+ * therefore reads the global once, into a local, and calls only a non-NULL value; a check of the global followed by a
+ * second read of it would call the NULL the logger had just stored. */
+static void llrawproc_gpu_emit_recon_event(const char * line)
+{
+    const llrpGpuReconEventLogger_t logger = g_llrawproc_gpu_recon_event_logger;
+    if(logger) logger(line);
+}
 static volatile LONG g_llrawproc_gpu_recon_run_active = 0;
 static volatile LONG g_llrawproc_gpu_preupload_bypass_active = 0;
 /* GPU-DEVICE-LOSS-SELF-HEAL-1: see llrpSetGpuCudaSuppressed in llrawproc.h. */
@@ -2513,7 +2521,9 @@ static void llrawproc_gpu_stage_telemetry_take_released(int channel, llrawprocGp
 static void llrawproc_gpu_stage_telemetry_keep_released(llrawprocGpuExportBackend_t * g)
 {
     int channel;
-    if(!g_llrawproc_gpu_stage_telemetry_sink) return;
+    /* adversary r14 A1 sibling sweep: read the global once, into a local, like the other sink sites. */
+    const llrpGpuStageTelemetrySink_t sink = g_llrawproc_gpu_stage_telemetry_sink;
+    if(!sink) return;
     for(channel = 0; channel < 2; ++channel)
     {
         llrawprocGpuCudaNotes_t taken;
@@ -3380,7 +3390,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
                      clip.width, clip.height, set_pattern_rc,
                      set_pattern_count,
                      clip.is_bright[0], clip.is_bright[1], clip.is_bright[2], clip.is_bright[3]);
-            g_llrawproc_gpu_recon_event_logger(line);
+            llrawproc_gpu_emit_recon_event(line);
         }
         if(set_clip_called)
         {
@@ -3391,7 +3401,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
                      clip.width, clip.height, set_clip_rc,
                      set_clip_count, set_clip_changed,
                      clip.black_level, clip.white_level);
-            g_llrawproc_gpu_recon_event_logger(line);
+            llrawproc_gpu_emit_recon_event(line);
         }
         if(set_luts_called)
         {
@@ -3401,7 +3411,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
                      (unsigned long long)frame_id, set_luts_start_s * 1000.0, set_luts_ms,
                      clip.width, clip.height, set_luts_rc,
                      set_luts_count);
-            g_llrawproc_gpu_recon_event_logger(line);
+            llrawproc_gpu_emit_recon_event(line);
         }
     }
 

@@ -963,6 +963,40 @@ TEST(DualIsoGpuConfigureCache, ASetIsoPatternEventCarriesTheOrdinalOfItsOwnCallN
     ASSERT_EQ(before + 2, patternCountLoggedBy(12));
 }
 
+// ---- adversary r14 A1: a logger that uninstalls itself from inside its own call ---------------------------------------
+// One configure can log up to three events (set_iso_pattern, set_clip, set_luts). The code checked the global logger once
+// and then called it for each event; a logger that calls llrpSetGpuReconEventLogger(NULL) in its set_iso_pattern event
+// left the global NULL, and the next event called it. Each event must read the global once and call only a non-NULL value.
+namespace
+{
+
+void captureThenUninstallOnPattern(const char * line)
+{
+    g_eventLines.push_back(std::string(line));
+    if (std::strstr(line, "kind=set_iso_pattern") != nullptr) llrpSetGpuReconEventLogger(nullptr);
+}
+
+} // namespace
+
+TEST(DualIsoGpuConfigureCache, ALoggerThatUninstallsItselfInItsPatternEventIsNotCalledAgainAndNothingCallsNull)
+{
+    FakeBackendScope scope;
+    ASSERT_EQ(1, llrpSetFakeGpuBackendIsoPatternSymbolForTesting(1));
+    int ok = 0;
+    (void)configureWorkOf(configureState(10), &ok); // 1100: the first configure
+    ASSERT_EQ(1, ok);
+    g_eventLines.clear();
+    llrpSetGpuReconEventLogger(&captureThenUninstallOnPattern);
+    llrpGpuPlaybackReconState_t s = configureState(11);
+    s.is_bright[0] = 0; s.is_bright[1] = 0; s.is_bright[2] = 1; s.is_bright[3] = 1; // 0011: a set_iso_pattern
+    s.dark_noise = 9.0;                                                              // and a set_luts
+    const int ran = runState(s); // on the unfixed code this calls the NULL logger after the pattern event
+    llrpSetGpuReconEventLogger(nullptr);
+    ASSERT_EQ(1, ran);
+    ASSERT_EQ(1u, g_eventLines.size()); // only the pattern line; events after the uninstall are not delivered
+    ASSERT_TRUE(g_eventLines[0].find("kind=set_iso_pattern") != std::string::npos);
+}
+
 // ---- the DLL harness's alternate pattern (sol r6 B1) ------------------------------------------------------------
 // dll_test.cpp feeds igpu_recon_set_iso_pattern an alternate pattern and expects the output to change. For a truth
 // pattern that equals its own half-swap (1,0,1,0 / 0,1,0,1 / 0,0,0,0 / 1,1,1,1) the alternate was the truth itself,
