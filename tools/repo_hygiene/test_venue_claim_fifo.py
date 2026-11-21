@@ -1004,7 +1004,7 @@ class VenueLeaseBatchFifoTests(unittest.TestCase):
             raise AssertionError(f"scenario failed ({r.returncode}):\n{r.stdout}\n{r.stderr}")
         return json.loads([l for l in r.stdout.splitlines() if l.strip()][-1])
 
-    def start_batch(self, name: str, claim_poll: int, specs: str = "", extra: tuple = (), cooldown: str = "0", **env: str) -> subprocess.Popen:
+    def start_batch(self, name: str, claim_poll: int, specs: str = "", extra: tuple = (), cooldown: str = "0", runner: Path | None = None, **env: str) -> subprocess.Popen:
         run_dir, share = self.case / f"run-{name}", self.case / f"share-{name}"
         share.mkdir()
         (share / "cancel").mkdir()
@@ -1013,7 +1013,7 @@ class VenueLeaseBatchFifoTests(unittest.TestCase):
         e.update({"FAKE_EVENTS": str(self.case / f"events-{name}.log"), "FAKE_SHARE": str(share), "FAKE_CLAIM_PATH": str(self.claim_path), "FAKE_LEG_ROOT": str(self.case / f"root-{name}"),
                   "FAKE_CAPS_EVENTS": str(self.case / f"caps-{name}.log")})
         e.update(env)
-        args = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(LEASE_RUNNER), "-LegSpec", specs or str(self.spec), "-RunDir", str(run_dir), "-SourceCommit", "a" * 40,
+        args = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(runner or LEASE_RUNNER), "-LegSpec", specs or str(self.spec), "-RunDir", str(run_dir), "-SourceCommit", "a" * 40,
                 "-BuildManifestSha256", "b" * 64, "-ClaimDir", str(self.claims), "-QuietScript", str(self.tmp / "fake-quiet.ps1"), "-LegScript", str(self.tmp / "fake-leg.ps1"),
                 "-UmRunScript", str(self.tmp / "fake-umrun.ps1"), "-AgentShare", str(share), "-LegBudgetSec", "60", "-LeaseMarginSec", "0", "-ClaimPollSec", str(claim_poll),
                 "-RecheckSec", "1", "-LeaseCooldownSec", cooldown, "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=200)), *extra]
@@ -1109,17 +1109,72 @@ $b1 = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $B
         self.assertEqual(r["phaseA"], "cooldown", "the phase is stored in its one spelling")
         self.assertEqual((r["b1"], r["b1Granted"]), ("TAKEN", True), "a cooldown ticket, however spelled, never blocks a ready waiter behind it")
 
+    def wait_for_cooldown_ticket(self, p: subprocess.Popen) -> None:
+        # BATCH_WAIT is logged BEFORE the ticket is taken (the ticket call is a bounded read on its own thread), so wait for the TICKET_TAKEN line: the ticket file exists once it is logged
+        try:
+            self.wait_for(lambda: "TICKET_TAKEN batch=2" in self.batch_log(p), "batch 2's cooldown ticket taken")
+        except AssertionError as exc:
+            self.fail(f"{exc}\n{self.batch_log(p)}")
+
+    def test_a_slow_ticket_worker_leaves_no_ticket_at_batch_wait_and_the_helper_waits_for_ticket_taken(self) -> None:
+        # Grok CoS G2(b) (#878): the r4 race was a heartbeat test that waited for BATCH_WAIT, logged before the cooldown ticket is taken. The ticket worker is made SLOW here (a copy of
+        # the module whose New-VenueTicket sleeps 2.5 s, inside Invoke-BatchTicketCall's 5 s bound): at BATCH_WAIT there is no ticket yet, and wait_for_cooldown_ticket (the wait the heartbeat
+        # test uses) returns only once the ticket file exists. A helper that waited for BATCH_WAIT would find none here.
+        text = MODULE.read_text(encoding="utf-8")
+        anchor = "    New-Item -ItemType Directory -Force -Path $dir | Out-Null\n    $ownerStart = Get-VenueProcessStartUtc $OwnerPid"
+        self.assertEqual(text.count(anchor), 1, "slow-worker anchor moved")
+        runner = copy_with_siblings(LEASE_RUNNER, Path(tempfile.mkdtemp(prefix="slow-", dir=self.case)))
+        (runner.parent / MODULE.name).write_text(text.replace(anchor, "    Start-Sleep -Milliseconds 2500\n" + anchor), encoding="utf-8")
+        import shutil   # the runner reads the agent's own script at ..\bachelor\ultra-magnus-agent.ps1 for the liveness read-back
+        (runner.parent.parent / "bachelor").mkdir(exist_ok=True)
+        shutil.copy2(DV.parent / "bachelor" / "ultra-magnus-agent.ps1", runner.parent.parent / "bachelor" / "ultra-magnus-agent.ps1")
+        spec_b = self.tmp / "fx-b.json"
+        spec_b.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "card": "TEST-CARD", "legId": "fx-b", "backends": ["cpu", "cuda"], "scaleFactor": 1}), encoding="utf-8")
+        p = self.start_batch("S", claim_poll=1, specs=f"{self.spec},{spec_b}", extra=("-TicketBeatSec", "1"), cooldown="14", runner=runner, FAKE_LEASE_REMAIN="70,2700", FAKE_LEG_REMAIN="50,2600")
+        def tickets() -> list:
+            return list(self.ticket_dir.glob("*.ticket.json")) if self.ticket_dir.exists() else []
+        try:
+            self.wait_for(lambda: "BATCH_WAIT batch=2" in self.batch_log(p), "batch 2's BATCH_WAIT line")
+        except AssertionError as exc:
+            self.fail(f"{exc}\n{self.batch_log(p)}")
+        self.assertEqual(tickets(), [], f"a ticket exists at BATCH_WAIT although the worker is slow: the slow-worker seam did not bite\n{self.batch_log(p)}")
+        self.wait_for_cooldown_ticket(p)
+        self.assertEqual(len(tickets()), 1, f"TICKET_TAKEN is logged but the ticket file is not there\n{self.batch_log(p)}")
+        log = self.batch_log(p)
+        self.assertLess(log.index("BATCH_WAIT batch=2"), log.index("TICKET_TAKEN batch=2"))
+        p.wait(timeout=180)
+
+    ATOMIC_PHASE = """
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d
+$r1 = Update-VenueTicket -Ticket $A -Phase 'CoolDown' -StaleAfterSec 600
+$p1 = (Get-Content -LiteralPath $A.path -Raw | ConvertFrom-Json).phase
+$r2 = Update-VenueTicket -Ticket $A -Phase 'PROBING'
+$p2 = (Get-Content -LiteralPath $A.path -Raw | ConvertFrom-Json).phase
+$r3 = Update-VenueTicket -Ticket $A
+$p3 = (Get-Content -LiteralPath $A.path -Raw | ConvertFrom-Json).phase
+$bad = 'none'; try { [void](Update-VenueTicket -Ticket $A -Phase 'bogus') } catch { $bad = 'refused' }
+$p4 = (Get-Content -LiteralPath $A.path -Raw | ConvertFrom-Json).phase
+$left = @(Get-ChildItem -LiteralPath (Split-Path -Parent $A.path) | Where-Object { $_.Name -notlike '*.ticket.json' }).Count
+[pscustomobject]@{ r1 = $r1; p1 = $p1; r2 = $r2; p2 = $p2; r3 = $r3; p3 = $p3; bad = $bad; p4 = $p4; left = $left } | ConvertTo-Json -Compress
+"""
+
+    def test_update_venue_ticket_stores_one_lower_case_spelling_of_a_known_phase_and_refuses_an_unknown_one(self) -> None:
+        # Grok CoS G5 (#878): New-VenueTicket validates and lower-cases the phase; Update-VenueTicket stored any string as given. The set is every phase a caller passes (the chain
+        # sets probing and supplementary, Invoke-VenueChain.ps1; the lease batch cooldown), wider than the CoS's suggested three.
+        r = self.ps(self.ATOMIC_PHASE)
+        self.assertEqual((r["r1"], r["p1"]), ("OK", "cooldown"), "a mixed-case phase is stored lower-case")
+        self.assertEqual((r["r2"], r["p2"]), ("OK", "probing"))
+        self.assertEqual((r["r3"], r["p3"]), ("OK", "probing"), "no -Phase keeps the stored phase")
+        self.assertEqual((r["bad"], r["p4"]), ("refused", "probing"), "an unknown phase is refused and the ticket is unchanged")
+        self.assertEqual(r["left"], 0, "a temp file was left beside the tickets")
+
     def test_a_cooldown_ticket_is_kept_alive_by_a_heartbeat_not_a_lifetime_as_long_as_the_wait(self) -> None:
         # adversary A3 (r3 pass 1): the ticket lived waitSec + 120 s, clamped to 86400 s, so a 172800 s cooldown (2880 min) let a ready waiter reap the live holder's ticket mid-wait
         # and the holder came back behind it. Now the lifetime is short and the wait refreshes the heartbeat (-TicketBeatSec).
         spec_b = self.tmp / "fx-b.json"
         spec_b.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "card": "TEST-CARD", "legId": "fx-b", "backends": ["cpu", "cuda"], "scaleFactor": 1}), encoding="utf-8")
         p = self.start_batch("W", claim_poll=1, specs=f"{self.spec},{spec_b}", extra=("-TicketBeatSec", "1"), cooldown="14", FAKE_LEASE_REMAIN="70,2700", FAKE_LEG_REMAIN="50,2600")
-        # BATCH_WAIT is logged BEFORE the ticket is taken (the ticket call is a bounded read on its own thread), so wait for the TICKET_TAKEN line: the ticket file exists once it is logged
-        try:
-            self.wait_for(lambda: "TICKET_TAKEN batch=2" in self.batch_log(p), "batch 2's cooldown ticket taken")
-        except AssertionError as exc:
-            self.fail(f"{exc}\n{self.batch_log(p)}")
+        self.wait_for_cooldown_ticket(p)
         def ticket() -> dict:
             files = list(self.ticket_dir.glob("*.ticket.json")) if self.ticket_dir.exists() else []
             self.assertEqual(len(files), 1, f"one cooldown ticket expected, found {files}\n{self.batch_log(p)}")
@@ -1162,6 +1217,42 @@ try { $b1 = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Tic
         # adversary pass 2 A2: a cooldown ticket held by a writer reads as BUSY with no parsed ticket; its missing phase passed the readiness filter and QUEUED the ready B on a free claim
         r = self.ps(self.BUSY_HOLDER)
         self.assertEqual((r["b1"], r["b1Granted"]), ("TAKEN", True), "an unreadable ticket's phase is unknown: it is not ready, so it cannot block")
+
+    def test_an_older_ready_ticket_being_heartbeat_rewritten_is_never_overtaken_by_a_younger_waiter(self) -> None:
+        # Grok CoS G4 (#878, 678e5fad): Update-VenueTicket rewrote the ticket IN PLACE (open ReadWrite + FileShare.Read, SetLength(0), Write), so a younger waiter that read the older
+        # READY ticket inside that window got BUSY or a truncated body, took it for not ready, made itself head and took the claim. The REAL writer runs in one process while
+        # a younger waiter requests the claim in another, over and over: the younger one must never be granted while the older ready ticket stands in the line.
+        ready, done = self.case / "updater-ready.txt", self.case / "updater-done.txt"
+        updater = self.case / "updater.ps1"
+        updater.write_text(   # the updater process OWNS the older ticket (a ticket whose owner pid is dead is reaped as stale), so it must stay alive while the race runs
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+            f"$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir '{self.claims}' -StaleAfterSec 600\n"
+            f"[IO.File]::WriteAllText('{ready}', '1')\n"
+            "$end = [DateTime]::UtcNow.AddSeconds(10); $ok = 0; $other = 0\n"
+            "while ([DateTime]::UtcNow -lt $end) { if ((Update-VenueTicket -Ticket $A -Phase 'waiting') -ceq 'OK') { $ok++ } else { $other++ } }\n"
+            f"[IO.File]::WriteAllText('{done}', ('{{0}} {{1}}' -f $ok, $other))\n", encoding="utf-8")
+        p = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(updater)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self._children.append(p)
+        t0 = time.time()
+        while not ready.exists() and time.time() - t0 < 60:
+            time.sleep(0.1)
+        self.assertTrue(ready.exists(), "the updater process never started")
+        r = self.ps(f"""
+$B = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$n = 0; $wins = 0; $stop = [DateTime]::UtcNow.AddSeconds(40)
+while (-not (Test-Path -LiteralPath '{done}') -and [DateTime]::UtcNow -lt $stop) {{
+  $r = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $B
+  if ($r.granted) {{ $wins++; [void](Release-VenueClaim -Venue bachelor -Nonce $r.claim.nonce -ClaimDir $d) }}
+  $n++
+}}
+[pscustomobject]@{{ requests = $n; wins = $wins }} | ConvertTo-Json -Compress
+""")
+        p.wait(timeout=60)
+        ok = int(done.read_text(encoding="utf-8").split()[0])
+        self.assertGreater(ok, 20, "the older ticket was hardly rewritten: the race was not exercised")
+        self.assertGreater(r["requests"], 10, "the younger waiter hardly asked: the race was not exercised")
+        self.assertEqual(r["wins"], 0, f"the younger waiter took the claim {r['wins']} times in {r['requests']} requests while the older READY ticket was being rewritten")
 
     def test_the_cooldown_wait_is_anchored_before_the_ticket_work_and_every_ticket_call_is_bounded(self) -> None:
         # adversary pass 2 A1 + A4: the wait end was measured after the ticket was created (so slow ticket I/O pushed the claim request past -DeadlineUtc), and creation and the heartbeat

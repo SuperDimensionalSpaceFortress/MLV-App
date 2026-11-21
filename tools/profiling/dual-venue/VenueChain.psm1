@@ -22,6 +22,8 @@
 # claim yet (a lease batch waiting out Bachelor's lease cooldown or 3 h budget, Invoke-VenueLeaseBatch.ps1) sets phase 'cooldown' (New-VenueTicket -Phase, Update-VenueTicket -Phase):
 # the claim goes to the oldest live ticket that is not in 'cooldown', so a waiter that is not ready keeps its place but never blocks a ready one, and when it turns ready it is again
 # ahead of every later arrival (2026-11-20: a later batch took the claim 09:25:10Z ahead of one that had waited since 08:17:03Z, because lease batches took no ticket).
+# A heartbeat rewrites the ticket as a WHOLE new file moved over the old one (Update-VenueTicket / Write-VenueTicketAtomic), never in place: an in-place rewrite showed a younger reader a
+# busy or empty file, so an older READY ticket read as not ready and was overtaken (Grok CoS G4 on #878). Ticket readers share Delete so that rename never waits on a read.
 # BACK-COMPAT: the claim file, its name and its CreateNew semantics are unchanged, and Request-VenueClaim called WITHOUT -UseTicket / -Ticket is the old
 # one-shot attempt. Ticketing orders ONLY ticket holders: a legacy (ticketless) chain still takes any free claim (it can win a race against the line), and a
 # ticket holder never waits on a legacy waiter (nothing ticketless is ever in the line), so the two kinds cannot deadlock; they only share the claim.
@@ -97,11 +99,14 @@ function Get-VenueClaimStaleReason {
     $null
 }
 
-function Read-VenueClaimFile([string]$Path) {
+function Read-VenueClaimFile {
     # One read with FileShare.Read: a writer (CreateNew, FileShare.None) or a breaker (FileShare.Delete) holding the file makes it BUSY, never half-read.
+    # -ShareDelete (tickets only): the reader also lets the file be renamed over while it reads, so a heartbeat's replacing rename (Write-VenueTicketAtomic) never waits on a reader.
+    param([string]$Path, [switch]$ShareDelete)
+    $share = $(if ($ShareDelete) { [IO.FileShare]::Read -bor [IO.FileShare]::Delete } else { [IO.FileShare]::Read })
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return [pscustomobject]@{ exists = $false; busy = $false; text = $null; lastWriteUtc = $null } }
     try {
-        $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
         try {
             $sr = [IO.StreamReader]::new($fs, [Text.UTF8Encoding]::new($false), $false, 4096, $true)
             $text = $sr.ReadToEnd(); $sr.Dispose()
@@ -292,7 +297,7 @@ function Get-VenueTickets {
         foreach ($file in @(Get-ChildItem -LiteralPath $dir -Filter '*.ticket.json' -File -ErrorAction SilentlyContinue)) {
             $m = $script:TicketNameRx.Match($file.Name)
             if (-not $m.Success) { continue }
-            $f = Read-VenueClaimFile $file.FullName
+            $f = Read-VenueClaimFile $file.FullName -ShareDelete
             if (-not $f.exists) { continue }
             $row = [ordered]@{ name = $file.Name; path = $file.FullName; key = [int64]$m.Groups[1].Value; pidKey = [decimal]$m.Groups[2].Value; startKey = [decimal]$m.Groups[3].Value; state = 'LIVE'; reason = $null; text = $f.text; ticket = $null; position = 0; ageSec = $null; heartbeatAgeSec = $null }
             if ($f.busy) { $row.state = 'BUSY' }
@@ -320,31 +325,44 @@ function Get-VenueTickets {
     $sorted
 }
 
+function Write-VenueTicketAtomic {
+    # VENUE-FIFO-TICKET-BEFORE-PRECLAIM-1 r5 (Grok CoS G4): the new body goes to a name beside the ticket and is moved over it in one replacing rename, so a reader sees the whole old
+    # ticket or the whole new one, never a zero-length or half-written file (an in-place SetLength(0)+Write made an older READY ticket read as not ready, and a younger waiter overtook it).
+    # The temp name does not end in .ticket.json, so Get-VenueTickets never lists it. Throws when the rename is refused (a handle without FileShare.Delete): the caller retries.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][byte[]]$Bytes)
+    $tmp = $Path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    try {
+        $fs = [IO.File]::Open($tmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $fs.Write($Bytes, 0, $Bytes.Length); $fs.Flush($true) } finally { $fs.Dispose() }
+        [IO.File]::Move($tmp, $Path, $true)   # MoveFileEx replace-existing. NOT [IO.File]::Replace: ReplaceFileW is not atomic for a concurrent open (measured: a reader saw the name ABSENT 1009 and BUSY 1541 times in 6 s of heartbeats, and an absent older ticket is no ticket at all), the rename-over showed 0 in 19058 reads. A ticket reaped between our read and this rename comes back, but only its heartbeating (so live) owner could have written it.
+    } finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } }
+}
+
 function Update-VenueTicket {
     <#
     .SYNOPSIS
-    Heartbeat: rewrite the ticket's heartbeat (and, when given, its phase and staleAfterSec). Returns OK | LOST (the ticket is gone or is not ours) | BUSY (a reader held it; try again).
+    Heartbeat: rewrite the ticket's heartbeat (and, when given, its phase and staleAfterSec) as a whole new file moved over the old one (Write-VenueTicketAtomic).
+    Returns OK | LOST (the ticket is gone or is not ours) | BUSY (a reader or the rename was refused five times; try again).
     #>
-    param([Parameter(Mandatory)]$Ticket, [string]$Phase = '', [int]$StaleAfterSec = 0, $NowUtc = $null)
+    param([Parameter(Mandatory)]$Ticket, [ValidateSet('', 'waiting', 'cooldown', 'probing', 'supplementary')][string]$Phase = '', [int]$StaleAfterSec = 0, $NowUtc = $null)   # every phase a caller passes (Invoke-VenueChain.ps1 sets probing and supplementary; the lease batch cooldown; a request waiting). ValidateSet is case-insensitive: stored lower-case below, as New-VenueTicket does
     $now = Resolve-VenueNow $NowUtc
     for ($attempt = 1; $attempt -le 5; $attempt++) {
         if (-not (Test-Path -LiteralPath $Ticket.path -PathType Leaf)) { return 'LOST' }
-        $fs = $null
-        try { $fs = [IO.File]::Open($Ticket.path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Read) } catch { Start-Sleep -Milliseconds (40 * $attempt); continue }
+        $text = $null
         try {
-            $sr = [IO.StreamReader]::new($fs, [Text.UTF8Encoding]::new($false), $false, 4096, $true)
-            $text = $sr.ReadToEnd(); $sr.Dispose()
-            $j = $null; try { $j = $text | ConvertFrom-Json -ErrorAction Stop } catch { $j = $null }
-            if ($null -eq $j -or [string]$j.nonce -cne [string]$Ticket.nonce) { return 'LOST' }
-            $fields = [ordered]@{
-                schema = [string]$j.schema; venue = [string]$j.venue; ownerPid = [int]$j.ownerPid; ownerCreatedUtc = (ConvertTo-VenueUtc $j.ownerCreatedUtc).ToString('o'); host = [string]$j.host
-                runDir = [string]$j.runDir; purpose = [string]$j.purpose; createdUtc = (ConvertTo-VenueUtc $j.createdUtc).ToString('o'); heartbeatUtc = $now.ToString('o')
-                staleAfterSec = $(if ($StaleAfterSec -gt 0) { $StaleAfterSec } else { [int]$j.staleAfterSec }); phase = $(if ($Phase) { $Phase } else { [string]$j.phase }); nonce = [string]$j.nonce
-            }
-            $bytes = ConvertTo-VenueTicketBytes $fields
-            $fs.SetLength(0); $fs.Position = 0; $fs.Write($bytes, 0, $bytes.Length); $fs.Flush($true)
-            return 'OK'
-        } finally { $fs.Dispose() }
+            $fs = [IO.File]::Open($Ticket.path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::Read -bor [IO.FileShare]::Delete))
+            try { $sr = [IO.StreamReader]::new($fs, [Text.UTF8Encoding]::new($false), $false, 4096, $true); $text = $sr.ReadToEnd(); $sr.Dispose() } finally { $fs.Dispose() }
+        } catch { Start-Sleep -Milliseconds (40 * $attempt); continue }
+        $j = $null; try { $j = $text | ConvertFrom-Json -ErrorAction Stop } catch { $j = $null }
+        if ($null -eq $j -or [string]$j.nonce -cne [string]$Ticket.nonce) { return 'LOST' }
+        $fields = [ordered]@{
+            schema = [string]$j.schema; venue = [string]$j.venue; ownerPid = [int]$j.ownerPid; ownerCreatedUtc = (ConvertTo-VenueUtc $j.ownerCreatedUtc).ToString('o'); host = [string]$j.host
+            runDir = [string]$j.runDir; purpose = [string]$j.purpose; createdUtc = (ConvertTo-VenueUtc $j.createdUtc).ToString('o'); heartbeatUtc = $now.ToString('o')
+            staleAfterSec = $(if ($StaleAfterSec -gt 0) { $StaleAfterSec } else { [int]$j.staleAfterSec }); phase = $(if ($Phase) { $Phase.ToLowerInvariant() } else { [string]$j.phase }); nonce = [string]$j.nonce
+        }
+        try { Write-VenueTicketAtomic -Path $Ticket.path -Bytes (ConvertTo-VenueTicketBytes $fields) }
+        catch { if (-not (Test-Path -LiteralPath $Ticket.path -PathType Leaf)) { return 'LOST' }; Start-Sleep -Milliseconds (40 * $attempt); continue }
+        return 'OK'
     }
     'BUSY'
 }
