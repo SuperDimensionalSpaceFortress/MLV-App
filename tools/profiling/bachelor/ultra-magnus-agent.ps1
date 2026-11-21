@@ -683,6 +683,9 @@ function Get-DescendantProcessIdentities {
     # r4 (pass 4 A3): a snapshot that FAILS with no rows falls back to the per-parent filtered reads (bounded), so a provider that fails the full-table
     # read but answers filtered ones still finds the children; what it finds is recorded as PARTIAL.
     # r4 (pass 4 A9): the failure-log limiter drops only entries older than 60 s when it is full; it never forgets a recent one.
+    # r5 (Grok G6, the partial-read variant of pass 5 A2): a failed read whose rows lack the root's own row gets ONE bounded ProcessId=<root> read in
+    # the same budget, even when it holds rows naming the root as parent. Row back: the exact-millisecond reuse check sees it. No row: the root exited,
+    # the recorded start stays authoritative. Read failed or no budget: the root's children are unverifiable and NOTHING is emitted under the root.
     param([Parameter(Mandatory = $true)][int]$ParentProcessId, [scriptblock]$OnEach = $null, $RootStartEpochMs = $null, [int]$TimeoutSec = 30, $Deadline = $null)
 
     $snapshotTimeoutSec = [Math]::Min(30, [Math]::Max(1, $TimeoutSec))
@@ -712,7 +715,7 @@ function Get-DescendantProcessIdentities {
     $fbAttempted = $false
     # r4 (pass 5 A4): the fallback runs when the read FAILED and nothing it returned relates to the root (no row for the root's pid, none naming it as
     # parent): zero rows, or only unrelated ones. A partial read that already holds the root's children or the root's own row is walked as it is
-    # (the hub's r3 rule: no second query on a partial snapshot).
+    # (the hub's r3 rule: no per-parent fallback on a partial snapshot; r5 G6 adds ONE root-row read when that partial snapshot lacks the root's own row).
     $anyRelated = $false
     if ($null -ne $snapshotError) {
         foreach ($relRow in $all) {
@@ -750,10 +753,41 @@ function Get-DescendantProcessIdentities {
         $fellBack = (@($all | Where-Object { $null -ne $_ -and $null -ne $_.ProcessId -and [int]$_.ProcessId -ne $ParentProcessId }).Count -gt 0)
         $fbAttempted = $true
     }
-    $recPartial = if ($fbAttempted) { $fellBack } else { $all.Count -gt 0 }
+    # r5 (Grok G6): a FAILED read that returned related rows (so no per-parent fallback ran) but NOT the root's own row cannot tell a root that is still
+    # the recorded process from one that exited and whose pid was REUSED: a child of the replacement root (created after the recorded start) would pass
+    # both the reuse check and the stale-edge check and be emitted. So the root's row is read, ONE bounded ProcessId=<root> filtered read inside the same
+    # $walkWatch budget (started only while budget remains, the same clamp as the fallback). A row comes back: the exact-millisecond reuse comparison
+    # below sees it. No row comes back: the root has exited and nothing holds its pid, so the recorded start stays authoritative (r3 G1) and the children
+    # are walked. The read fails, times out or has no budget left: the root's children are UNVERIFIABLE and NOTHING is emitted under the root.
+    $rootUnverifiable = $null
+    if ($null -ne $snapshotError -and $anyRelated) {
+        $hasRootRow = $false
+        foreach ($rootScanRow in $all) {
+            try { if ($null -ne $rootScanRow -and $null -ne $rootScanRow.ProcessId -and [int]$rootScanRow.ProcessId -eq $ParentProcessId) { $hasRootRow = $true; break } } catch { continue }
+        }
+        if (-not $hasRootRow) {
+            $rrLeft = $snapshotTimeoutSec - $walkWatch.Elapsed.TotalSeconds
+            if ($rrLeft -le 0) { $rootUnverifiable = 'no budget left for the root row read' }
+            else {
+                $rrTimeout = [int][Math]::Min(30.0, [Math]::Max(1.0, [Math]::Ceiling($rrLeft)))
+                $rrError = $null
+                try {
+                    Get-CimInstance Win32_Process -Filter "ProcessId=$ParentProcessId" -Property ProcessId, ParentProcessId, CreationDate, ExecutablePath, CommandLine -OperationTimeoutSec $rrTimeout -ErrorAction Stop | ForEach-Object {
+                        $rrRow = $_
+                        if ($null -ne $rrRow -and $null -ne $rrRow.ProcessId -and [int]$rrRow.ProcessId -eq $ParentProcessId) { [void]$all.Add($rrRow); $hasRootRow = $true }
+                    }
+                }
+                catch { $rrError = ([string]$_.Exception.Message) -replace '\s*[\r\n]+\s*', ' ' }
+                # a row streamed before the error is a row read; an error with no row read is an unreadable root
+                if ($null -ne $rrError -and -not $hasRootRow) { $rootUnverifiable = "the root row read failed: $rrError" }
+            }
+        }
+    }
+    $recPartial = if ($null -ne $rootUnverifiable) { $false } elseif ($fbAttempted) { $fellBack } else { $all.Count -gt 0 }
     if ($null -eq $snapshotError -and -not $skipSnapshot) { $walkRecord.rows = $all.Count }   # r4 (pass 5 A11): a complete read reports the rows it saw
     if ($null -ne $snapshotError) {
-        $walkRecord = [pscustomobject]@{ ok = $false; partial = $recPartial; rows = $all.Count; why = $snapshotError; rootPid = $ParentProcessId }
+        $walkWhy = if ($null -ne $rootUnverifiable) { "$snapshotError; root row unreadable; children not walked ($rootUnverifiable)" } else { $snapshotError }
+        $walkRecord = [pscustomobject]@{ ok = $false; partial = $recPartial; rows = $all.Count; why = $walkWhy; rootPid = $ParentProcessId }
         $nowTs = [System.Diagnostics.Stopwatch]::GetTimestamp()
         $ageSec = { param($ts) ($nowTs - [int64]$ts) / [double][System.Diagnostics.Stopwatch]::Frequency }
         if ($null -eq $script:DescendantWalkFailLogTs -or $script:DescendantWalkFailLogTs -isnot [hashtable]) { $script:DescendantWalkFailLogTs = @{} }
@@ -765,9 +799,11 @@ function Get-DescendantProcessIdentities {
                 foreach ($failKey in @($script:DescendantWalkFailLogTs.Keys)) { if ((& $ageSec $script:DescendantWalkFailLogTs[$failKey]) -ge 60) { $script:DescendantWalkFailLogTs.Remove($failKey) } }
             }
             $script:DescendantWalkFailLogTs[$ParentProcessId] = $nowTs
-            Add-AgentLogLine "descendant-walk: snapshot $(if ($recPartial) { 'partial' } else { 'failed' }) pid=$ParentProcessId rows=$($all.Count) why=[$snapshotError]; $(if ($fellBack) { 'the per-parent filtered reads it fell back to are walked' } elseif ($recPartial) { 'the rows it returned are walked' } else { 'the walk is empty' })"
+            Add-AgentLogLine "descendant-walk: snapshot $(if ($recPartial) { 'partial' } else { 'failed' }) pid=$ParentProcessId rows=$($all.Count) why=[$walkWhy]; $(if ($null -ne $rootUnverifiable) { 'root row unreadable; children not walked' } elseif ($fellBack) { 'the per-parent filtered reads it fell back to are walked' } elseif ($recPartial) { 'the rows it returned are walked' } else { 'the walk is empty' })"
         }
     }
+    # r5 (G6): an unverifiable root emits nothing under it (the rows read are counted in the record above, then dropped).
+    if ($null -ne $rootUnverifiable) { $all.Clear() }
     # pid -> creation time (UTC) for every row that has a readable one (the PID-reuse check below).
     $createdAt = New-Object 'System.Collections.Generic.Dictionary[int,object]'
     foreach ($row in $all) {
@@ -775,7 +811,7 @@ function Get-DescendantProcessIdentities {
         catch { continue }
     }
     # The root's creation time is the RECORDED start when one is given (see the header). A snapshot row for the root's pid whose start is not the
-    # recorded one (beyond the 2 s the identity checks tolerate) is a process that took the pid after the root exited.
+    # recorded one to the EXACT MILLISECOND (no 2 s tolerance, unlike the identity checks) is a process that took the pid after the root exited.
     $rootReusedAt = $null
     $recordedRootStart = $null
     if ($null -ne $RootStartEpochMs) {

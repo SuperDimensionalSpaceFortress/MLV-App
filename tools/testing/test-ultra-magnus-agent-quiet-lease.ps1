@@ -6179,11 +6179,14 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         $b0 = $psOut['before-root-gone0']; $b1 = $psOut['before-root-gone1']
         # r3 (adversary pass 3 A1, hub tests (a)): the walk takes the root's RECORDED start, so a snapshot that fails after a stale-edge row and BEFORE the
         # root's own row still refuses the stale row and keeps the real child, whether or not the root still exists (b1: the root has EXITED, so a
-        # filtered read of its row would be empty) - the child is still found. No second query is made (the r2 filtered root read is gone).
+        # filtered read of its row is empty) - the child is still found. (r5 G6: the recorded start no longer replaces the root-row read; the read is
+        # made once, because without the row a REUSED root pid cannot be told from the recorded process. The recorded start stays authoritative.)
         Assert-True ($b0.ids -eq '7005') "cim-walk-partial-snapshot: a snapshot that fails after a stale-edge row and BEFORE the root's own row still refuses the stale row (the root's start is the recorded one) and keeps the real child: ids=[$($b0.ids)] $psTxt"
         Assert-True ($b1.ids -eq '7005') "cim-walk-partial-snapshot: the root has EXITED (its row is in no read): the partial snapshot's child row is still found: ids=[$($b1.ids)] $psTxt"
+        # r5 (Grok G6): the failed snapshot lacks the root's own row, so the walk reads it ONCE (b0: the root is the recorded process, same start; b1: the root
+        # exited, no row), between the same two ticks, inside the one budget; it is never a per-parent fallback.
         foreach ($bx in @($b0, $b1)) {
-            Assert-True ($bx.events -ceq 'tick > snapshot > tick' -and $bx.filterTimeouts -ceq '') "cim-walk-partial-snapshot: the walk issues the one snapshot and no filtered root read, between its two ticks (events=[$($bx.events)] filter timeouts=[$($bx.filterTimeouts)])"
+            Assert-True ($bx.events -ceq 'tick > snapshot > filter:ProcessId=7000 > tick' -and $bx.filterTimeouts -match '^(30|29)$') "cim-walk-partial-snapshot: the walk issues the one snapshot and ONE filtered root-row read (G6), between its two ticks (events=[$($bx.events)] filter timeouts=[$($bx.filterTimeouts)])"
         }
         Assert-True ($b1.why.Contains('simulated provider error before the root row')) "cim-walk-partial-snapshot: the walk record names the snapshot failure: [$($b1.why)]"
         $ml = $psOut['multiline']
@@ -6232,6 +6235,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         $rtOut = & {
             $script:RtTimeouts = [System.Collections.Generic.List[int]]::new()
             $script:RtFail = $null
+            $script:RtFilterThenThrow = $false   # r5 (variant coverage, pass 5 A5): the per-parent read THROWS after its rows (the other shape of "throws or raises Write-Error")
             $script:RtFailEmpty = $false; $script:RtFilterRows = $false; $script:RtFilterThenFail = $false; $script:RtFullRows = $null; $script:RtFilterDelayMs = 0; $script:RtFullDelayMs = 0
             $script:RtTable = @()
             $rtBase =[datetime]::new(2026, 11, 20, 12, 0, 0, [DateTimeKind]::Local)
@@ -6248,6 +6252,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                         $mine = if ($Filter -match '^ParentProcessId=(\d+)$') { $fp = [int]$Matches[1]; @($rows | Where-Object { [int]$_.ParentProcessId -eq $fp }) } elseif ($Filter -match '^ProcessId=(\d+)$') { $fp = [int]$Matches[1]; @($rows | Where-Object { [int]$_.ProcessId -eq $fp }) } else { @() }
                         $mine | ForEach-Object { $_ }
                         if ($script:RtFilterThenFail -and $mine.Count -gt 0 -and $Filter -like 'ParentProcessId=*') { Write-Error 'filtered read failed after rows'; return }   # r4 (pass 5 A5): rows first, then the error
+                        if ($script:RtFilterThenThrow -and $mine.Count -gt 0 -and $Filter -like 'ParentProcessId=*') { throw 'filtered read threw after rows' }   # r5: rows first, then a THROW
                         return
                     }
                     Write-Error 'filtered read unavailable'; return
@@ -6266,8 +6271,10 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $w = @(Get-DescendantProcessIdentities -ParentProcessId 4200 -RootStartEpochMs $rootMs)
             $o['exitedComplete'] = [pscustomobject]@{ ids = (& $ids $w); skipped = (@($script:LastDescendantWalk.skipped) -join ','); ok = $script:LastDescendantWalk.ok }
             $script:RtFail = 'simulated provider error after rows'
+            $script:RtFilterRows = $true   # r5 (G6): the partial read lacks the root's row, so it is read once; the exited root answers with no row
             $w = @(Get-DescendantProcessIdentities -ParentProcessId 4200 -RootStartEpochMs $rootMs)
             $o['exitedPartial'] = [pscustomobject]@{ ids = (& $ids $w); skipped = (@($script:LastDescendantWalk.skipped) -join ','); ok = $script:LastDescendantWalk.ok; partial = $script:LastDescendantWalk.partial; rows = $script:LastDescendantWalk.rows }
+            $script:RtFilterRows = $false
             $script:RtFail = $null
             # (c) G1: pid 4300 now belongs to a process created 12:00:10 (it has its own child 4301, created 12:00:12). The REAL orphan 4302 was created 12:00:05
             # (after the recorded root start 12:00:00, before the reuser); 4303 was created 12:00:-05 (a stale edge).
@@ -6333,6 +6340,50 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $script:RtFailEmpty = $true; $script:RtFilterRows = $true; $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null
             $w = @(Get-DescendantProcessIdentities -ParentProcessId 4500 -RootStartEpochMs $rootMs)
             $o['fallbackReused'] = [pscustomobject]@{ ids = (& $ids $w); reuseLines = @($script:Log | Where-Object { $_ -match 'root pid=4500 was reused' }).Count }
+            # r5 (Grok G6, the partial-read variant of pass 5 A2). DEFECT_CLASS: incomplete fix (r4 fixed only the zero-related-rows case). The full read FAILS after
+            # returning rows that name the root as parent but NOT the root's own row (so no per-parent fallback runs). The root's row is read by ONE bounded
+            # ProcessId=<root> filtered read: g6Reused (a), g6Reused1ms (b), g6Unreadable (c), g6NoBudget / g6Clamp (c2, c3), g6Exited (d), g6SameStart (e).
+            $g6Run = {
+                param($Table, $FullRows, [bool]$FilterOk, [int]$RootPid, $Deadline = $null, [int]$FullDelayMs = 0)
+                $script:RtTable = @($Table); $script:RtFullRows = @($FullRows); $script:RtFail = 'partial read error after rows'
+                $script:RtFailEmpty = $false; $script:RtFilterRows = $FilterOk; $script:RtFilterThenFail = $false; $script:RtFullDelayMs = $FullDelayMs
+                $script:RtTimeouts.Clear(); $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null; $script:DescendantWalkStaleLogged = $null
+                # the outer @() keeps an EMPTY walk an empty array (an if-statement's result would unroll it to $null, which the ids reader counts as pid 0)
+                $g6W = @(if ($null -ne $Deadline) { Get-DescendantProcessIdentities -ParentProcessId $RootPid -RootStartEpochMs $rootMs -Deadline $Deadline } else { Get-DescendantProcessIdentities -ParentProcessId $RootPid -RootStartEpochMs $rootMs })
+                $g6Rec = $script:LastDescendantWalk
+                $script:RtFullDelayMs = 0; $script:RtFail = $null; $script:RtFullRows = $null
+                [pscustomobject]@{ ids = (& $ids $g6W); ok = $g6Rec.ok; partial = $g6Rec.partial; rows = $g6Rec.rows; why = [string]$g6Rec.why; queries = $script:RtTimeouts.Count; timeouts = (@($script:RtTimeouts) -join ',')
+                    reuseLines = @($script:Log | Where-Object { $_ -match "root pid=$RootPid was reused" }).Count; logs = @($script:Log | Where-Object { $_ -match '^descendant-walk: snapshot' }) }
+            }
+            # (a) Grok's literal repro: pid 4600 now belongs to a process created 40 s after the recorded start; its child 4601 (41 s) is the only row the failed read returned.
+            $o['g6Reused'] = & $g6Run @((New-RtProc 4600 1 40), (New-RtProc 4601 4600 41)) @((New-RtProc 4601 4600 41)) $true 4600
+            # (b) the same, with the child created EXACTLY 1 ms after the recorded root start (the reuser took the pid in that same millisecond tick).
+            $o['g6Reused1ms'] = & $g6Run @((New-RtProc 4610 1 0 10000), (New-RtProc 4611 4610 0 10000)) @((New-RtProc 4611 4610 0 10000)) $true 4610
+            # (c) the root-row read itself FAILS: the root's children are unverifiable, nothing is emitted under it, and the record and the log line say so.
+            $o['g6Unreadable'] = & $g6Run @((New-RtProc 4620 1 40), (New-RtProc 4621 4620 41)) @((New-RtProc 4621 4620 41)) $false 4620
+            # (c2) no budget left for the root-row read (1 s left, the failed full read took 1.3 s): no read is started and the root is unverifiable.
+            $o['g6NoBudget'] = & $g6Run @((New-RtProc 4660 1 40), (New-RtProc 4661 4660 41)) @((New-RtProc 4661 4660 41)) $true 4660 ((Get-Date).AddSeconds(1)) 1300
+            # (c3) the root-row read starts while budget remains and takes the same clamp as the fallback (2 s left, the full read took 1.7 s: a 1 s bound).
+            $o['g6Clamp'] = & $g6Run @((New-RtProc 4650 1 40), (New-RtProc 4651 4650 41)) @((New-RtProc 4651 4650 41)) $true 4650 ((Get-Date).AddSeconds(2)) 1700
+            # (d) control: the root-row read returns NO row (the root exited, nothing holds its pid): the recorded start is authoritative and the real child is walked.
+            $o['g6Exited'] = & $g6Run @((New-RtProc 4631 4630 5)) @((New-RtProc 4631 4630 5)) $true 4630
+            # (e) control: the root-row read returns the SAME start (the same process): the children are walked.
+            $o['g6SameStart'] = & $g6Run @((New-RtProc 4640 1 0), (New-RtProc 4641 4640 3)) @((New-RtProc 4641 4640 3)) $true 4640
+            # r5 (variant coverage, pass 5 A4's second shape: "at 3886 the same empty result wrongly classifies a live lease child as foreign"): the lease owner
+            # check reads the same walk. (i) the full read fails with no rows and the per-parent reads answer: the wrapper's live child is still its child.
+            # (ii) the G6 shape: a failed read that returned the replacement wrapper's child but not the wrapper's row: that child is NOT the wrapper's child.
+            $script:RtTable = @((New-RtProc 7200 1 0), (New-RtProc 7201 7200 3))
+            $script:RtFailEmpty = $true; $script:RtFilterRows = $true; $script:RtFail = $null; $script:RtFullRows = $null; $script:DescendantWalkFailLogTs = $null
+            $ownerLeaseA = [pscustomobject]@{ pid = 7200; identity = [pscustomobject]@{ startEpochMs = $rootMs } }
+            $ownA = Test-QuietLeaseOwnerPid -Lease $ownerLeaseA -OwnerPid 7201
+            $script:RtTable = @((New-RtProc 7210 1 40), (New-RtProc 7211 7210 41))
+            $script:RtFailEmpty = $false; $script:RtFail = 'partial read error after rows'; $script:RtFullRows = @((New-RtProc 7211 7210 41)); $script:DescendantWalkFailLogTs = $null
+            $ownerLeaseB = [pscustomobject]@{ pid = 7210; identity = [pscustomobject]@{ startEpochMs = $rootMs } }
+            $ownB = Test-QuietLeaseOwnerPid -Lease $ownerLeaseB -OwnerPid 7211
+            $o['ownerFallback'] = [pscustomobject]@{ ok = $ownA.ok; why = [string]$ownA.why }
+            $o['ownerG6'] = [pscustomobject]@{ ok = $ownB.ok; why = [string]$ownB.why }
+            # the state the cases below were written against (full read fails empty, filtered reads answer)
+            $script:RtFailEmpty = $true; $script:RtFilterRows = $true; $script:RtFail = $null; $script:RtFullRows = $null; $script:RtFilterThenFail = $false; $script:RtFullDelayMs = 0; $script:RtFilterDelayMs = 0
             # r4 (pass 5 A4): the full read emits ONE UNRELATED row and then fails; the fallback still runs and finds the child.
             $script:RtTable = @((New-RtProc 7100 1 0), (New-RtProc 7101 7100 3), (New-RtProc 7102 7101 4))
             $script:RtFailEmpty = $false; $script:RtFail = 'RPC error'; $script:RtFullRows = @((New-RtProc 4 0 -100)); $script:RtTimeouts.Clear(); $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null
@@ -6344,6 +6395,12 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $w = @(Get-DescendantProcessIdentities -ParentProcessId 7100 -RootStartEpochMs $rootMs)
             $o['fallbackRowsThenError'] = [pscustomobject]@{ ids = (& $ids $w); rows = $script:LastDescendantWalk.rows; partial = $script:LastDescendantWalk.partial; ok = $script:LastDescendantWalk.ok }
             $script:RtFilterThenFail = $false
+            # r5 (variant coverage, pass 5 A5): the same, but the per-parent read THROWS after the child instead of raising Write-Error.
+            $script:RtFilterThenThrow = $true; $script:RtFilterThenFail = $false
+            $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null
+            $w = @(Get-DescendantProcessIdentities -ParentProcessId 7100 -RootStartEpochMs $rootMs)
+            $o['fallbackRowsThenThrow'] = [pscustomobject]@{ ids = (& $ids $w); rows = $script:LastDescendantWalk.rows; partial = $script:LastDescendantWalk.partial; ok = $script:LastDescendantWalk.ok }
+            $script:RtFilterThenThrow = $false
             # r4 (pass 5 A1): ONE budget. 2 s left; the full read takes 1.9 s and fails; each per-parent read takes 1.9 s. The root-row read starts (0.1 s left);
             # nothing starts after it.
             $script:RtTable = @((New-RtProc 7100 1 0), (New-RtProc 7101 7100 3))
@@ -6394,6 +6451,25 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         $fb = $rtOut['fallback']
         Assert-True ($fb.ids -eq '7102,7101' -and $fb.ok -eq $false -and $fb.partial -eq $true -and $fb.rows -eq 3 -and $fb.queries -eq 5 -and @($fb.logs).Count -eq 1 -and @($fb.logs)[0] -match 'fell back' -and @($fb.logs)[0] -match 'pid=7100') "cim-walk-root-start: (A3) the full-table read failed with no rows but the per-parent reads answer: the children 7101 and 7102 are found (1 full + the root's row + 3 per-parent queries... = 5), recorded PARTIAL with the 3 rows read, one log line says it fell back: $rtTxt"
         Assert-True ($rtOut['fallbackReused'].ids -eq '' -and $rtOut['fallbackReused'].reuseLines -eq 1) "cim-walk-root-start: (A2, pass 5) the fallback reads the root's own row: a replacement root (created 40 s after the recorded start) is a reuser and its child 4501 is not walked: $rtTxt"
+        # r5 (Grok G6): a failed read holding the root's CHILDREN but not the root's own row reads that row once (no per-parent fallback), then decides.
+        $g6a = $rtOut['g6Reused']
+        Assert-True ($g6a.ids -eq '' -and $g6a.reuseLines -eq 1 -and $g6a.queries -eq 2 -and $g6a.timeouts -match '^30,(30|29)$') "cim-walk-root-start: (G6 a) a failed read returned the replacement root's child (created after the recorded start) but not the root's row: the root row is read once (2 queries, no per-parent fallback), the pid is a reuser, the child 4601 is NOT emitted, the reuse is named once: $rtTxt"
+        $g6b = $rtOut['g6Reused1ms']
+        Assert-True ($g6b.ids -eq '' -and $g6b.reuseLines -eq 1 -and $g6b.queries -eq 2) "cim-walk-root-start: (G6 b) the same with the child created exactly 1 ms after the recorded root start: not emitted: $rtTxt"
+        $g6c = $rtOut['g6Unreadable']
+        Assert-True ($g6c.ids -eq '' -and $g6c.ok -eq $false -and $g6c.partial -eq $false -and $g6c.rows -eq 1 -and $g6c.queries -eq 2 -and $g6c.why.Contains('root row unreadable; children not walked') -and $g6c.why.Contains('the root row read failed') -and @($g6c.logs).Count -eq 1 -and @($g6c.logs)[0].Contains('root row unreadable; children not walked') -and @($g6c.logs)[0] -match 'snapshot failed') "cim-walk-root-start: (G6 c) the root-row read fails: an EMPTY walk, recorded FAILED (not partial) with the unverifiable reason in the walk record and in the one rate-limited log line: $rtTxt"
+        $g6n = $rtOut['g6NoBudget']
+        Assert-True ($g6n.ids -eq '' -and $g6n.ok -eq $false -and $g6n.queries -eq 1 -and $g6n.why.Contains('no budget left for the root row read') -and $g6n.why.Contains('children not walked')) "cim-walk-root-start: (G6 c2) no budget left (1 s deadline, a 1.3 s failed full read): no root-row read is started, the root is unverifiable, the walk is empty (queries=$($g6n.queries)): $rtTxt"
+        $g6k = $rtOut['g6Clamp']
+        Assert-True ($g6k.queries -eq 2 -and $g6k.timeouts -ceq '2,1' -and $g6k.ids -eq '' -and $g6k.reuseLines -eq 1) "cim-walk-root-start: (G6 c3) the root-row read starts while budget remains and is bounded by what is left (2 s, then 1 s): timeouts=[$($g6k.timeouts)]: $rtTxt"
+        $g6d = $rtOut['g6Exited']
+        Assert-True ($g6d.ids -eq '4631' -and $g6d.reuseLines -eq 0 -and $g6d.ok -eq $false -and $g6d.partial -eq $true -and $g6d.queries -eq 2) "cim-walk-root-start: (G6 d) control: the root-row read returns no row (the root exited, the pid is free): the recorded start is authoritative and the real child is walked: $rtTxt"
+        $g6e = $rtOut['g6SameStart']
+        Assert-True ($g6e.ids -eq '4641' -and $g6e.reuseLines -eq 0 -and $g6e.queries -eq 2) "cim-walk-root-start: (G6 e) control: the root-row read returns the SAME start (the same process): the child is walked: $rtTxt"
+        Assert-True ($rtOut['ownerFallback'].ok -eq $true) "cim-walk-root-start: (variant, pass 5 A4 second shape) the lease owner check, with the full read failed and the per-parent reads answering, still accepts the wrapper's live child: $rtTxt"
+        Assert-True ($rtOut['ownerG6'].ok -eq $false) "cim-walk-root-start: (variant, G6) the lease owner check refuses a child of a REUSED wrapper pid when the failed read lacked the wrapper's row: $rtTxt"
+        $frt = $rtOut['fallbackRowsThenThrow']
+        Assert-True ($frt.ids -eq '7101' -and $frt.rows -eq 2 -and $frt.partial -eq $true -and $frt.ok -eq $false) "cim-walk-root-start: (variant, pass 5 A5 second shape) a per-parent read that returns the child and then THROWS keeps the child and records PARTIAL: $rtTxt"
         Assert-True ($rtOut['unrelatedPartial'].ids -eq '7102,7101' -and $rtOut['unrelatedPartial'].partial -eq $true) "cim-walk-root-start: (A4, pass 5) a read that returned only an UNRELATED row before it failed still falls back, and finds the children: $rtTxt"
         $fre = $rtOut['fallbackRowsThenError']
         Assert-True ($fre.ids -eq '7101' -and $fre.rows -eq 2 -and $fre.partial -eq $true -and $fre.ok -eq $false) "cim-walk-root-start: (A5, pass 5) a per-parent read that returns the child and then errors keeps the child (streamed read) and records PARTIAL: $rtTxt"
@@ -6465,6 +6541,21 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             [pscustomobject]@{ first = $f1; second = $f2; outClosed = (-not $fdOutS.CanWrite); errClosed = (-not $fdErr.CanWrite) }
         }
         Assert-True ($fdOut.first -match 'stderr copy broke' -and $null -eq $fdOut.second -and $fdOut.outClosed -and $fdOut.errClosed) "cim-walk-root-start: (A6) a faulted stderr copy propagates once, both capture streams are closed, and the second drain is a no-op: $($fdOut | ConvertTo-Json -Compress)"
+        # r5 (variant coverage, pass 5 A6's second shape: "if stdout Dispose throws, stderr Dispose is skipped"): the stdout capture stream's Dispose THROWS; the
+        # stderr stream is still disposed, the failure propagates once, and a second drain is a no-op.
+        $sdOut = & {
+            . ([scriptblock]::Create((Get-FunctionBody 'Complete-WindowlessRedirectedProcess')))
+            $sdErr = [System.IO.File]::Open((Join-Path $fx 'cim-walk-drain-sd-err.txt'), [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+            $sdOutS = [pscustomobject]@{}
+            $sdOutS | Add-Member -MemberType ScriptMethod -Name Flush -Value { }
+            $sdOutS | Add-Member -MemberType ScriptMethod -Name Dispose -Value { throw 'stdout dispose broke' }
+            $sdLaunch = [pscustomobject]@{ OutCopy = [System.Threading.Tasks.Task]::CompletedTask; ErrCopy = [System.Threading.Tasks.Task]::CompletedTask; OutStream = $sdOutS; ErrStream = $sdErr }
+            $s1 = $null; $s2 = $null
+            try { Complete-WindowlessRedirectedProcess -Launch $sdLaunch } catch { $s1 = $_.Exception.Message }
+            try { Complete-WindowlessRedirectedProcess -Launch $sdLaunch } catch { $s2 = $_.Exception.Message }
+            [pscustomobject]@{ first = $s1; second = $s2; errClosed = (-not $sdErr.CanWrite) }
+        }
+        Assert-True ($sdOut.first -match 'stdout dispose broke' -and $null -eq $sdOut.second -and $sdOut.errClosed) "cim-walk-root-start: (variant, pass 5 A6 second shape) a stdout Dispose that throws does not skip the stderr Dispose; the failure propagates once and a second drain is a no-op: $($sdOut | ConvertTo-Json -Compress)"
         $rtDrains = @($rtQj.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Complete-WindowlessRedirectedProcess' }, $true))
         $rtUncaught = @($rtDrains | Where-Object {
             $dn = $_; $caught = $false; $cur = $dn.Parent
