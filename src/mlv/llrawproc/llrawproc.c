@@ -4358,6 +4358,11 @@ uint64_t llrpGpuPlaybackReconSetLutsCount(void)
     return 0;
 }
 
+uint64_t llrpGpuPlaybackReconSetIsoPatternCount(void)
+{
+    return 0;
+}
+
 void llrpSetGpuReconEventLogger(llrpGpuReconEventLogger_t logger)
 {
     (void)logger;

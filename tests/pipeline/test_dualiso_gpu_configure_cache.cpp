@@ -1047,3 +1047,80 @@ TEST(DualIsoGpuConfigureCache, TheHarnessAlternateDiffersFromTheTruthForEveryBin
     for (int m = 0; m < 16; ++m)
         ASSERT_EQ(1, alternateDiffers(m & 1, (m >> 1) & 1, (m >> 2) & 1, (m >> 3) & 1));
 }
+
+// ---- the DLL harness's buffer allocations (sol r16 #2) --------------------------------------------------------------
+// The checked-in 8192x4320 vector needs three more 70,778,880-byte buffers in the pattern step, and the harness passed
+// each malloc result straight to memset. A failed allocation must be a typed diagnostic and a non-zero exit, never a
+// null dereference. The helper is header-only so an allocator that fails can be injected here; dll_test.cpp is not
+// linked into the test binaries, so its use of the helper is pinned on its text, as the Qt wiring above is.
+#include "../../tools/gpu/backend/dll_test_alloc.h"
+
+namespace
+{
+
+size_t g_allocCalls = 0;
+size_t g_allocBytes = 0;
+
+void * failingAlloc(size_t bytes)
+{
+    ++g_allocCalls;
+    g_allocBytes = bytes;
+    return nullptr;
+}
+
+void * dirtyAlloc(size_t bytes)
+{
+    ++g_allocCalls;
+    g_allocBytes = bytes;
+    void * p = std::malloc(bytes);
+    if (p) std::memset(p, 0xAB, bytes);
+    return p;
+}
+
+} // namespace
+
+TEST(DualIsoGpuConfigureCache, TheHarnessAllocationHelperReturnsNullWhenTheAllocatorFails)
+{
+    g_allocCalls = 0;
+    g_allocBytes = 0;
+    const size_t n = size_t(8192) * 4320; // the res8k vector
+    uint16_t * p = dll_test_alloc_u16_zeroed(n, "alt", failingAlloc);
+    ASSERT_TRUE(p == nullptr);
+    ASSERT_EQ(size_t(1), g_allocCalls);
+    ASSERT_EQ(size_t(70778880), g_allocBytes);
+}
+
+TEST(DualIsoGpuConfigureCache, TheHarnessAllocationHelperZeroFillsWhatTheAllocatorReturns)
+{
+    g_allocCalls = 0;
+    uint16_t * p = dll_test_alloc_u16_zeroed(1024, "back", dirtyAlloc);
+    ASSERT_TRUE(p != nullptr);
+    ASSERT_EQ(size_t(1), g_allocCalls);
+    ASSERT_EQ(size_t(2048), g_allocBytes);
+    size_t nonZero = 0;
+    for (size_t i = 0; i < 1024; ++i) nonZero += p[i] != 0u;
+    std::free(p);
+    ASSERT_EQ(size_t(0), nonZero);
+}
+
+TEST(DualIsoGpuConfigureCache, TheHarnessAllocationHelperRefusesASizeThatOverflowsWithoutCallingTheAllocator)
+{
+    g_allocCalls = 0;
+    ASSERT_TRUE(dll_test_alloc_u16_zeroed((size_t)-1, "alt_ref", failingAlloc) == nullptr);
+    ASSERT_TRUE(dll_test_alloc_u16_zeroed(0, "alt_ref", failingAlloc) == nullptr);
+    ASSERT_EQ(size_t(0), g_allocCalls);
+}
+
+TEST(DualIsoGpuConfigureCache, TheDllHarnessChecksEveryBufferAllocationBeforeUsingIt)
+{
+    const std::string src = squeezedSource("tools/gpu/backend/dll_test.cpp");
+    ASSERT_TRUE(!src.empty());
+    ASSERT_TRUE(has(src, "#include\"dll_test_alloc.h\""));
+    // no raw uint16 plane allocation is left: each goes through the helper and is tested before use
+    ASSERT_TRUE(!has(src, "(uint16_t*)malloc("));
+    // the three pattern-step buffers, tested together before the first memcmp, run or use
+    ASSERT_TRUE(has(src, "uint16_t*alt=dll_test_alloc_u16_zeroed(n,\"alt\",malloc);"));
+    ASSERT_TRUE(has(src, "uint16_t*alt_ref=dll_test_alloc_u16_zeroed(n,\"alt_ref\",malloc);"));
+    ASSERT_TRUE(has(src, "uint16_t*back=dll_test_alloc_u16_zeroed(n,\"back\",malloc);"));
+    ASSERT_TRUE(has(src, "if(!alt||!alt_ref||!back){free(alt);free(alt_ref);free(back);return4;}"));
+}

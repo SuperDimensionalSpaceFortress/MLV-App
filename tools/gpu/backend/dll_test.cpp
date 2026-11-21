@@ -39,6 +39,7 @@
 
 #include "igpu_recon.h"
 #include "iso_pattern_alternate.h"
+#include "dll_test_alloc.h"
 
 extern "C" {
 __declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001;
@@ -91,6 +92,7 @@ static void* load_blob(const std::string& path, size_t expect_bytes)
         exit(3);
     }
     void* p = malloc(sz);
+    if (!p) { fprintf(stderr, "[dll_test] allocation failed: %s (%ld bytes)\n", path.c_str(), sz); exit(3); }
     if (fread(p, 1, sz, f) != (size_t)sz) { fprintf(stderr, "short read %s\n", path.c_str()); exit(3); }
     fclose(f);
     return p;
@@ -461,8 +463,8 @@ int main(int argc, char** argv)
            frame.chroma_smooth_method,
            frame.apply_dither);
 
-    uint16_t* result = (uint16_t*)malloc(n * sizeof(uint16_t));
-    memset(result, 0, n * sizeof(uint16_t));
+    uint16_t* result = dll_test_alloc_u16_zeroed(n, "result", malloc);
+    if (!result) return 4;
 
     int rc = f_run(b, &frame, h_in, IGPU_OUT_CPU16, result, 0);
     if (rc != 0) { fprintf(stderr, "[dll_test] run() returned %d\n", rc); return 4; }
@@ -501,12 +503,11 @@ int main(int argc, char** argv)
             const int alt_is_half_swap = dll_test_alternate_is_half_swap(truth);
             (void)dll_test_pick_alternate_iso_pattern(truth, other);
             const int bad[4]   = { 1, 2, 0, 0 };
-            uint16_t* alt = (uint16_t*)malloc(n * sizeof(uint16_t));
-            uint16_t* alt_ref = (uint16_t*)malloc(n * sizeof(uint16_t));
-            uint16_t* back = (uint16_t*)malloc(n * sizeof(uint16_t));
-            memset(alt, 0, n * sizeof(uint16_t));
-            memset(alt_ref, 0, n * sizeof(uint16_t));
-            memset(back, 0, n * sizeof(uint16_t));
+            /* sol r16 #2: all three planes are checked before any is used (8192x4320 is 70,778,880 bytes each). */
+            uint16_t* alt = dll_test_alloc_u16_zeroed(n, "alt", malloc);
+            uint16_t* alt_ref = dll_test_alloc_u16_zeroed(n, "alt_ref", malloc);
+            uint16_t* back = dll_test_alloc_u16_zeroed(n, "back", malloc);
+            if (!alt || !alt_ref || !back) { free(alt); free(alt_ref); free(back); return 4; }
             if (f_pattern(b, bad) == 0) {
                 fprintf(stderr, "[dll_test] set_iso_pattern accepted a value outside {0,1}\n");
                 return 4;
@@ -561,8 +562,8 @@ int main(int argc, char** argv)
     }
 
     /* ---- 6. async-H2D exact-match use + mismatch fail-closed fallback ---- */
-    uint16_t* preuploaded_result = (uint16_t*)malloc(n * sizeof(uint16_t));
-    memset(preuploaded_result, 0, n * sizeof(uint16_t));
+    uint16_t* preuploaded_result = dll_test_alloc_u16_zeroed(n, "preuploaded_result", malloc);
+    if (!preuploaded_result) return 4;
     if (f_preupload(b, 41, h_in, n * sizeof(uint16_t), 1) != 0) {
         fprintf(stderr, "[dll_test] exact preupload rejected\n");
         return 4;
@@ -607,8 +608,8 @@ int main(int argc, char** argv)
         fprintf(stderr, "[dll_test] cross-frame restage of frame 41 rejected\n");
         return 4;
     }
-    uint16_t* cross_frame_result = (uint16_t*)malloc(n * sizeof(uint16_t));
-    memset(cross_frame_result, 0, n * sizeof(uint16_t));
+    uint16_t* cross_frame_result = dll_test_alloc_u16_zeroed(n, "cross_frame_result", malloc);
+    if (!cross_frame_result) return 4;
     rc = f_run_preuploaded(b, 42, &frame, h_in,
                           IGPU_OUT_CPU16, cross_frame_result, 0);
     if (rc != 0) {
@@ -631,13 +632,15 @@ int main(int argc, char** argv)
     }
     printf("[dll_test] async-H2D cross-frame (41 staged, 42 run) rejected + fell back correctly PASS\n");
 
-    uint16_t* mutated = (uint16_t*)malloc(n * sizeof(uint16_t));
-    uint16_t* sync_mutated = (uint16_t*)malloc(n * sizeof(uint16_t));
-    uint16_t* fallback_mutated = (uint16_t*)malloc(n * sizeof(uint16_t));
+    uint16_t* mutated = dll_test_alloc_u16_zeroed(n, "mutated", malloc);
+    uint16_t* sync_mutated = dll_test_alloc_u16_zeroed(n, "sync_mutated", malloc);
+    uint16_t* fallback_mutated = dll_test_alloc_u16_zeroed(n, "fallback_mutated", malloc);
+    if (!mutated || !sync_mutated || !fallback_mutated) {
+        free(mutated); free(sync_mutated); free(fallback_mutated);
+        return 4;
+    }
     memcpy(mutated, h_in, n * sizeof(uint16_t));
     mutated[n / 2] ^= 1u;
-    memset(sync_mutated, 0, n * sizeof(uint16_t));
-    memset(fallback_mutated, 0, n * sizeof(uint16_t));
     rc = f_run(b, &frame, mutated, IGPU_OUT_CPU16, sync_mutated, 0);
     if (rc != 0) {
         fprintf(stderr, "[dll_test] synchronous mutated oracle returned %d\n", rc);
@@ -716,8 +719,12 @@ int main(int argc, char** argv)
             printf("  total    = %.3f\n", t.total_ms);
         }
 
-        uint16_t* gl_result = (uint16_t*)malloc(n * sizeof(uint16_t));
-        memset(gl_result, 0, n * sizeof(uint16_t));
+        uint16_t* gl_result = dll_test_alloc_u16_zeroed(n, "gl_result", malloc);
+        if (!gl_result) {
+            glDeleteTextures(1, &tex);
+            destroy_hidden_gl_context(&gl);
+            return 5;
+        }
         glBindTexture(GL_TEXTURE_2D, tex);
         glFinish();
         glGetTexImage(GL_TEXTURE_2D, 0, GL_RED, GL_UNSIGNED_SHORT, gl_result);

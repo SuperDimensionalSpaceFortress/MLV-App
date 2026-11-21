@@ -2126,9 +2126,9 @@ TEST(GpuDualIsoPreviewScale, C1ReceiptConfigReconParity)
                     }
                     ASSERT_TRUE(readU16(dir + "/in.u16", gpuIn, n));
                     ASSERT_TRUE(writeU16(dir + "/cpu_in.u16", cpuIn));
-                    // Both routes then share the with-dims prefix (llrawproc.c:5292-5452, incl.
-                    // the restricted-range rescale) before the recon, so in.u16 is that prefix
-                    // applied to this shrink; recorded, not asserted byte-equal.
+                    // Both routes then share the with-dims prefix (llrawproc.c:5297-5457, and the
+                    // restricted-range rescale at llrawproc.c:7121) before the recon, so in.u16 is that
+                    // prefix applied to this shrink; recorded, not asserted byte-equal.
                     size_t inMismatches = 0;
                     for (size_t i = 0; i < n; ++i) inMismatches += gpuIn[i] != cpuIn[i];
                     std::printf("[gpu-dualiso-preview-scale] receipt parity %s in.u16 vs CPU-plan tent shrink (pre-prefix): mismatches %zu / %zu\n",
