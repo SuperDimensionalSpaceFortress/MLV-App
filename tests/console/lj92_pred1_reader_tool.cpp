@@ -14,10 +14,15 @@
 //       RAM-resident payload copies, one decoder and one output buffer per worker, 1/2/4/8 workers: aggregate MP/s and
 //       per-frame decode latency p50/p95 for the legacy and the default reader.
 //
+// Options are strict: --iters 1..100000, --seed 0..4294967295, --seconds 0 < S <= 3600; a bad or missing value or an unknown
+// option exits 2. --bench / --scale exit 3 (no BENCH_RESULT / SCALE_RESULT) when a decode fails, when an arm left the
+// predictor-1 fast path, or when the new arm did not run the u64 reader.
+//
 // Fixtures are named as ONE complete repo-relative string and found by walking up from the working directory (or --root).
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -134,10 +139,11 @@ DecodeInfo decode_copy(const Bytes & stream, bool legacy)
 struct Counters
 {
     int checks = 0, failures = 0, refusals = 0;
+    bool quiet = false;   // a probe counter that is MEANT to fail (the oracle self-check) must not print FAIL lines
     void fail(const std::string & what)
     {
         failures++;
-        if (failures <= 40) std::fprintf(stderr, "FAIL %s\n", what.c_str());
+        if (!quiet && failures <= 40) std::fprintf(stderr, "FAIL %s\n", what.c_str());
     }
 };
 
@@ -163,6 +169,16 @@ void compare_readers(Counters & c, const std::string & label, const Bytes & stre
     if (expect_u64 >= 0 && fresh.u64_active != expect_u64)
         c.fail(label + ": u64 reader taken=" + std::to_string(fresh.u64_active) + " expected=" + std::to_string(expect_u64));
     if (expected != nullptr && fresh.samples != *expected) c.fail(label + ": decode differs from the encoded picture");
+}
+
+// r2d (sol r1 S2): a stream that must be refused is asserted as a refusal, explicitly: both readers must refuse to open it.
+void expect_refusal(Counters & c, const std::string & label, const Bytes & stream)
+{
+    const DecodeInfo legacy = decode_copy(stream, true);
+    const DecodeInfo fresh = decode_copy(stream, false);
+    c.checks++;
+    if (legacy.open_ret == LJ92_ERROR_NONE || fresh.open_ret == LJ92_ERROR_NONE)
+        c.fail(label + ": a stream this case needs refused was opened (legacy open=" + std::to_string(legacy.open_ret) + " default open=" + std::to_string(fresh.open_ret) + ")");
 }
 
 // A canonical Huffman table over a chosen symbol set (SSSS values), code lengths 1..16 with Kraft sum < 1.
@@ -373,18 +389,18 @@ void run_synthetic(Counters & c, std::mt19937 & rng)
                 if (stream.size() > start + 4)
                 {
                     for (size_t cut = 1; cut <= 40 && cut < stream.size() - start; cut++)
-                        compare_readers(c, label + " cut-" + std::to_string(cut), Bytes(stream.begin(), stream.end() - (long)cut), spec.expect_u64);
+                        compare_readers(c, label + " cut-" + std::to_string(cut), Bytes(stream.begin(), stream.end() - (long)cut), spec.expect_u64, nullptr, true);
                     for (int k = 1; k < 12; k++)
                     {
                         const size_t keep = start + (stream.size() - start) * (size_t)k / 12u;
-                        compare_readers(c, label + " keep-" + std::to_string(keep), Bytes(stream.begin(), stream.begin() + (long)keep), spec.expect_u64);
+                        compare_readers(c, label + " keep-" + std::to_string(keep), Bytes(stream.begin(), stream.begin() + (long)keep), spec.expect_u64, nullptr, true);
                     }
                     // the tail of a stream that ends in a stuffed 0xFF, and a stream that ends on a bare 0xFF
                     Bytes ff_end(stream.begin(), stream.end() - 2);
                     ff_end.push_back(0xFF);
-                    compare_readers(c, label + " bare-FF-end", ff_end, spec.expect_u64);
+                    compare_readers(c, label + " bare-FF-end", ff_end, spec.expect_u64, nullptr, true);
                     ff_end.push_back(0x00);
-                    compare_readers(c, label + " FF00-end", ff_end, spec.expect_u64);
+                    compare_readers(c, label + " FF00-end", ff_end, spec.expect_u64, nullptr, true);
                 }
 
                 // corruption: bit flips, planted 0xFF, planted 0xFF 0xD9 / 0xFF 0xD8 markers inside the entropy data
@@ -401,7 +417,7 @@ void run_synthetic(Counters & c, std::mt19937 & rng)
                         else if (kind == 2) { bad[at] = 0xFF; bad[at + 1] = 0xD9; }
                         else { bad[at] = 0xFF; bad[at + 1] = (uint8_t)(rng() & 0xFFu); }
                     }
-                    compare_readers(c, label + " corrupt-" + std::to_string(m), bad, spec.expect_u64);
+                    compare_readers(c, label + " corrupt-" + std::to_string(m), bad, spec.expect_u64, nullptr, true);
                 }
 
                 // pure noise entropy at several 0xFF densities (every bit pattern, including undefined codes), plus a
@@ -413,12 +429,12 @@ void run_synthetic(Counters & c, std::mt19937 & rng)
                     Bytes noise = make_header(table, d[0], d[1], bits, comps);
                     for (size_t i = 0; i < noise_len; i++)
                         noise.push_back((density == 100 || (int)(rng() % 100u) < density) ? 0xFF : (uint8_t)(rng() & 0xFFu));
-                    compare_readers(c, label + " noise-ff" + std::to_string(density), noise, spec.expect_u64);
+                    compare_readers(c, label + " noise-ff" + std::to_string(density), noise, spec.expect_u64, nullptr, true);
                 }
                 Bytes zeros = make_header(table, d[0], d[1], bits, comps);
                 zeros.insert(zeros.end(), noise_len, 0x00);
-                compare_readers(c, label + " zeros", zeros, spec.expect_u64);
-                compare_readers(c, label + " no-entropy", make_header(table, d[0], d[1], bits, comps), spec.expect_u64);
+                compare_readers(c, label + " zeros", zeros, spec.expect_u64, nullptr, true);
+                expect_refusal(c, label + " no-entropy", make_header(table, d[0], d[1], bits, comps));
             }
         }
     }
@@ -503,6 +519,7 @@ void check_oracle_flags_unchecked_refusal(Counters & c)
     std::mt19937 rng(1);
     const Table lone = make_table({ 0 }, 1, rng);
     Counters probe;
+    probe.quiet = true;
     compare_readers(probe, "oracle-probe", make_header(lone, 1, 1, 8, 1), 1);   // header only: both readers refuse to open
     c.checks++;
     if (probe.failures == 0) c.fail("oracle: a required-route case whose two readers both refuse to open was accepted as checked");
@@ -541,6 +558,8 @@ void check_getters(Counters & c)
     lj92_close(h);
 }
 
+void check_bench_options(Counters & c);   // S3 checks, defined with the option parser below
+
 int run_selftest(const std::string & root, unsigned seed)
 {
     Counters c;
@@ -549,6 +568,7 @@ int run_selftest(const std::string & root, unsigned seed)
     check_aliased_output(c, 1, 2);
     check_oracle_flags_unchecked_refusal(c);
     check_getters(c);
+    check_bench_options(c);
     int fixture_frames = 0;
     for (const char * fixture : kFixtures)
     {
@@ -575,14 +595,14 @@ int run_selftest(const std::string & root, unsigned seed)
             if (i % 8 == 0)
             {
                 for (size_t cut = 1; cut <= 40 && cut < f.size(); cut++)
-                    compare_readers(c, std::string(fixture) + " frame " + std::to_string(i) + " cut-" + std::to_string(cut), Bytes(f.begin(), f.end() - (long)cut), -1);
+                    compare_readers(c, std::string(fixture) + " frame " + std::to_string(i) + " cut-" + std::to_string(cut), Bytes(f.begin(), f.end() - (long)cut), -1, nullptr, true);
                 for (int k = 1; k < 8; k++)
-                    compare_readers(c, std::string(fixture) + " frame " + std::to_string(i) + " keep-" + std::to_string(k), Bytes(f.begin(), f.begin() + (long)(f.size() * (size_t)k / 8u)), -1);
+                    compare_readers(c, std::string(fixture) + " frame " + std::to_string(i) + " keep-" + std::to_string(k), Bytes(f.begin(), f.begin() + (long)(f.size() * (size_t)k / 8u)), -1, nullptr, true);
             }
         }
     }
     run_synthetic(c, rng);
-    std::printf("selftest seed=%u fixture_frames=%d checks=%d failures=%d\n", seed, fixture_frames, c.checks, c.failures);
+    std::printf("selftest seed=%u fixture_frames=%d checks=%d refusals=%d failures=%d\n", seed, fixture_frames, c.checks, c.refusals, c.failures);
     std::printf(c.failures == 0 ? "SELFTEST PASS\n" : "SELFTEST FAIL\n");
     return c.failures == 0 ? 0 : 1;
 }
@@ -633,15 +653,37 @@ bool open_frame(Opened & o, const Bytes & payload)
     return true;
 }
 
-// bitstream_ms / predictor_ms: the decoder's own split, filled only when MLVAPP_PRED1_FASTPATH_MEASUREMENT is set in the environment
-// (that route decodes a row of differences, then runs the predictor, so its total is not the production loop's).
-double time_decode(Opened & o, bool legacy, double * bitstream_ms = nullptr, double * predictor_ms = nullptr)
+// r2d (sol r1 S3): the route one decode actually took, read from the decoder's own getters on the calling thread right
+// after the call. A timing is attributed to the arm it is labelled with only when this says so.
+struct Route
+{
+    int fast_active = 0, u64_active = 0, measurement_active = 0;
+};
+
+// Empty when the arm ran the route its label claims; otherwise why it did not. A generic-route decode (for example under
+// MLVAPP_PROFILE_LJ92_GENERIC_SPLIT) is no timing of either reader, and the new arm must have run the u64 reader.
+std::string route_problem(const Route & r, bool legacy_arm)
+{
+    if (!r.fast_active) return "the predictor-1 fast path did not run, so this is not a reader timing (generic route)";
+    if (legacy_arm && r.u64_active) return "the forced-legacy arm ran the u64 reader";
+    if (!legacy_arm && !r.u64_active) return "the new arm did not run the u64 reader";
+    return std::string();
+}
+
+// bitstream_ms / predictor_ms: the decoder's own split, filled only when the measurement route is active
+// (MLVAPP_PRED1_FASTPATH_MEASUREMENT; that route decodes a row of differences, then runs the predictor, so its total is not
+// the production loop's). Returns the elapsed ms, or a negative number when the decode failed: a failed decode is never a
+// sample, the callers refuse the run.
+double time_decode(Opened & o, bool legacy, Route & route, double * bitstream_ms = nullptr, double * predictor_ms = nullptr)
 {
     lj92_set_pred1_legacy_reader(legacy ? 1 : 0);
     const double t0 = now_ms();
     const int ret = lj92_decode(o.handle, o.out.data(), (int)o.out.size(), 0, nullptr, 0);
     const double t1 = now_ms();
     lj92_set_pred1_legacy_reader(0);
+    route.fast_active = lj92_get_last_pred1_fast_path_active();
+    route.u64_active = lj92_get_last_pred1_u64_reader_active();
+    route.measurement_active = lj92_get_last_pred1_fast_path_measurement_active();
     if (bitstream_ms) *bitstream_ms = lj92_get_last_pred1_fast_path_bitstream_ms();
     if (predictor_ms) *predictor_ms = lj92_get_last_pred1_fast_path_predictor_ms();
     return ret == LJ92_ERROR_NONE ? t1 - t0 : -1.0;
@@ -657,11 +699,33 @@ int run_bench(const std::string & root, int iters)
     for (size_t i = 0; i < frames.size(); i++) pick.push_back(i);
     if (pick.size() > 48) { std::vector<size_t> s; for (size_t k = 0; k < 48; k++) s.push_back(pick[k * pick.size() / 48]); pick = s; }
     std::vector<Opened> opened(pick.size());
-    for (size_t k = 0; k < pick.size(); k++) if (!open_frame(opened[k], frames[pick[k]])) { std::fprintf(stderr, "open failed frame %zu\n", pick[k]); return 2; }
+    auto close_all = [&]() { for (auto & o : opened) if (o.handle) { lj92_close(o.handle); o.handle = nullptr; } };
+    for (size_t k = 0; k < pick.size(); k++) if (!open_frame(opened[k], frames[pick[k]])) { std::fprintf(stderr, "open failed frame %zu\n", pick[k]); close_all(); return 2; }
     std::vector<std::vector<double>> legacy_t(pick.size()), fresh_t(pick.size());
-    // warm-up pass (not recorded)
-    for (auto & o : opened) { time_decode(o, true); time_decode(o, false); }
-    const bool split = std::getenv("MLVAPP_PRED1_FASTPATH_MEASUREMENT") != nullptr;
+    // r2d (sol r1 S3): every decode, warm-up included, must have run the route its arm is labelled with; the split columns come
+    // from the decoder's own measurement-active report, not from the environment.
+    bool split = false;
+    auto arm_ok = [&](const char * phase, size_t k, bool legacy_arm, double ms, const Route & r) -> bool {
+        std::string why;
+        if (ms < 0) why = "the decode failed";
+        else
+        {
+            why = route_problem(r, legacy_arm);
+            if (why.empty() && (r.measurement_active != 0) != split) why = "the measurement route is not the same for every decode";
+        }
+        if (why.empty()) return true;
+        std::fprintf(stderr, "bench refused (%s, frame %zu, %s arm): %s\n", phase, pick[k], legacy_arm ? "legacy" : "new", why.c_str());
+        return false;
+    };
+    // warm-up pass (not recorded); it also proves the route before anything is timed
+    for (size_t k = 0; k < opened.size(); k++)
+    {
+        Route rl, rf;
+        const double wl = time_decode(opened[k], true, rl);
+        const double wf = time_decode(opened[k], false, rf);
+        if (k == 0) split = rf.measurement_active != 0;
+        if (!arm_ok("warm-up", k, true, wl, rl) || !arm_ok("warm-up", k, false, wf, rf)) { close_all(); return 3; }
+    }
     std::vector<double> bs_l, pr_l, bs_f, pr_f;
     for (int it = 0; it < iters; it++)
     {
@@ -669,8 +733,10 @@ int run_bench(const std::string & root, int iters)
         {
             const bool legacy_first = ((it + (int)k) & 1) == 0;
             double bs_a = 0, pr_a = 0, bs_b = 0, pr_b = 0;
-            double a = time_decode(opened[k], legacy_first, &bs_a, &pr_a);
-            double b = time_decode(opened[k], !legacy_first, &bs_b, &pr_b);
+            Route ra, rb;
+            double a = time_decode(opened[k], legacy_first, ra, &bs_a, &pr_a);
+            double b = time_decode(opened[k], !legacy_first, rb, &bs_b, &pr_b);
+            if (!arm_ok("timed", k, legacy_first, a, ra) || !arm_ok("timed", k, !legacy_first, b, rb)) { close_all(); return 3; }
             (legacy_first ? legacy_t : fresh_t)[k].push_back(a);
             (legacy_first ? fresh_t : legacy_t)[k].push_back(b);
             if (split)
@@ -698,7 +764,7 @@ int run_bench(const std::string & root, int iters)
     std::printf("new     min=%.4f median=%.4f p95=%.4f ms/frame (median of per-frame medians %.4f)\n", percentile(all_f, 0.0), percentile(all_f, 0.5), percentile(all_f, 0.95), percentile(med_f, 0.5));
     const double ml = percentile(all_l, 0.5), mf = percentile(all_f, 0.5);
     std::printf("BENCH_RESULT median_legacy_ms=%.4f median_new_ms=%.4f change_pct=%.1f\n", ml, mf, ml > 0 ? (mf - ml) / ml * 100.0 : 0.0);
-    for (auto & o : opened) lj92_close(o.handle);
+    close_all();
     return 0;
 }
 
@@ -720,6 +786,7 @@ int run_scale(const std::string & root, double seconds)
         {
             const bool legacy = mode == 0;
             std::atomic<bool> go(false);
+            std::atomic<int> refused(0);   // r2d (sol r1 S3): set by the first worker whose decode failed or ran the wrong route
             std::vector<std::vector<double>> lat((size_t)workers);
             std::vector<double> samples_done((size_t)workers, 0.0);
             std::vector<double> wall((size_t)workers, 0.0);
@@ -729,16 +796,30 @@ int run_scale(const std::string & root, double seconds)
                 threads.emplace_back([&, w]() {
                     // RAM-resident payload copies and a private decoder and output buffer per worker; no file I/O inside the timed loop
                     std::vector<Opened> own(pick.size());
-                    for (size_t k = 0; k < pick.size(); k++) open_frame(own[k], frames[pick[k]]);
+                    bool opened_all = true;
+                    for (size_t k = 0; k < pick.size(); k++) if (!open_frame(own[k], frames[pick[k]])) opened_all = false;
+                    if (!opened_all) { int none = 0; if (refused.compare_exchange_strong(none, 1)) std::fprintf(stderr, "scale refused (worker %d): a fixture frame did not open\n", w); }
                     while (!go.load()) std::this_thread::yield();
                     const double start = now_ms();
                     size_t k = (size_t)w;
                     double done = 0.0;
-                    while (now_ms() - start < seconds * 1000.0)
+                    while (refused.load() == 0 && now_ms() - start < seconds * 1000.0)
                     {
                         Opened & o = own[k % own.size()];
-                        const double ms = time_decode(o, legacy);
-                        if (ms >= 0) { lat[(size_t)w].push_back(ms); done += (double)o.out.size(); }
+                        Route r;
+                        const double ms = time_decode(o, legacy, r);
+                        std::string why;
+                        if (ms < 0) why = "the decode failed";
+                        else if (!(why = route_problem(r, legacy)).empty()) {}
+                        else if (r.measurement_active) why = "the measurement route is active, so the total is not the production loop's";
+                        if (!why.empty())
+                        {
+                            int none = 0;
+                            if (refused.compare_exchange_strong(none, 2))
+                                std::fprintf(stderr, "scale refused (worker %d, %s reader): %s\n", w, legacy ? "legacy" : "new", why.c_str());
+                            break;
+                        }
+                        lat[(size_t)w].push_back(ms); done += (double)o.out.size();
                         k++;
                     }
                     wall[(size_t)w] = now_ms() - start;
@@ -749,6 +830,7 @@ int run_scale(const std::string & root, double seconds)
             std::this_thread::sleep_for(std::chrono::milliseconds(300));
             go.store(true);
             for (auto & t : threads) t.join();
+            if (refused.load() != 0) return 3;   // no SCALE_RESULT line for a run that did not measure its labelled reader
             std::vector<double> all;
             double total = 0.0, longest = 0.0;
             for (int w = 0; w < workers; w++) { all.insert(all.end(), lat[(size_t)w].begin(), lat[(size_t)w].end()); total += samples_done[(size_t)w]; longest = std::max(longest, wall[(size_t)w]); }
@@ -759,6 +841,131 @@ int run_scale(const std::string & root, double seconds)
     return 0;
 }
 
+// ---------------------------------------------------------------------------------------------------- options
+
+struct Args
+{
+    std::string mode, root;
+    unsigned seed = 20261120u;
+    int iters = 15;
+    double seconds = 4.0;
+};
+
+// r2d (sol r1 S3): strict option values. Digits only for the integers (no sign, no space, no suffix), a plain decimal for
+// --seconds; a value outside the bounds, a missing value and an unknown option are all usage errors, never a silent default.
+bool parse_uint_arg(const char * s, unsigned long long lo, unsigned long long hi, unsigned long long & out)
+{
+    if (s == nullptr || *s == 0 || std::strlen(s) > 19) return false;
+    unsigned long long v = 0;
+    for (const char * p = s; *p; p++)
+    {
+        if (*p < '0' || *p > '9') return false;
+        v = v * 10ull + (unsigned long long)(*p - '0');
+    }
+    if (v < lo || v > hi) return false;
+    out = v;
+    return true;
+}
+
+bool parse_seconds_arg(const char * s, double & out)
+{
+    if (s == nullptr || *s == 0) return false;
+    for (const char * p = s; *p; p++) if (!std::strchr("0123456789.eE+-", *p)) return false;
+    char * end = nullptr;
+    const double v = std::strtod(s, &end);
+    if (end == s || *end != 0 || !std::isfinite(v) || v <= 0.0 || v > 3600.0) return false;
+    out = v;
+    return true;
+}
+
+// Returns 0 and fills args, or 2 with the reason in err.
+int parse_args(const std::vector<std::string> & argv, Args & args, std::string & err)
+{
+    for (size_t i = 0; i < argv.size(); i++)
+    {
+        const std::string & a = argv[i];
+        if (a == "--selftest" || a == "--bench" || a == "--scale")
+        {
+            if (!args.mode.empty() && args.mode != a) { err = "two modes given: " + args.mode + " and " + a; return 2; }
+            args.mode = a;
+            continue;
+        }
+        if (a != "--seed" && a != "--root" && a != "--iters" && a != "--seconds") { err = "unknown option: " + a; return 2; }
+        if (i + 1 >= argv.size()) { err = "option " + a + " needs a value"; return 2; }
+        const char * v = argv[++i].c_str();
+        unsigned long long n = 0;
+        if (a == "--root") args.root = v;
+        else if (a == "--seed")
+        {
+            if (!parse_uint_arg(v, 0ull, 0xFFFFFFFFull, n)) { err = "--seed wants an integer 0..4294967295, got '" + std::string(v) + "'"; return 2; }
+            args.seed = (unsigned)n;
+        }
+        else if (a == "--iters")
+        {
+            if (!parse_uint_arg(v, 1ull, 100000ull, n)) { err = "--iters wants an integer 1..100000, got '" + std::string(v) + "'"; return 2; }
+            args.iters = (int)n;
+        }
+        else if (!parse_seconds_arg(v, args.seconds)) { err = "--seconds wants a finite number 0 < S <= 3600, got '" + std::string(v) + "'"; return 2; }
+    }
+    return 0;
+}
+
+void check_bench_options(Counters & c)
+{
+    auto parses = [](std::vector<std::string> v) { Args a; std::string e; return parse_args(v, a, e) == 0; };
+    const struct { const char * label; std::vector<std::string> argv; bool ok; } cases[] = {
+        { "plain bench", { "--bench" }, true },
+        { "iters 1", { "--bench", "--iters", "1" }, true },
+        { "iters 100000", { "--bench", "--iters", "100000" }, true },
+        { "iters 0", { "--bench", "--iters", "0" }, false },
+        { "iters 100001", { "--bench", "--iters", "100001" }, false },
+        { "iters garbage", { "--bench", "--iters", "abc" }, false },
+        { "iters signed", { "--bench", "--iters", "-5" }, false },
+        { "iters suffix", { "--bench", "--iters", "5x" }, false },
+        { "iters empty", { "--bench", "--iters", "" }, false },
+        { "seed garbage", { "--bench", "--seed", "x" }, false },
+        { "seed too big", { "--selftest", "--seed", "4294967296" }, false },
+        { "seconds 1", { "--scale", "--seconds", "1" }, true },
+        { "seconds 0.5", { "--scale", "--seconds", "0.5" }, true },
+        { "seconds 3600", { "--scale", "--seconds", "3600" }, true },
+        { "seconds 1e308", { "--scale", "--seconds", "1e308" }, false },
+        { "seconds 3601", { "--scale", "--seconds", "3601" }, false },
+        { "seconds nan", { "--scale", "--seconds", "nan" }, false },
+        { "seconds inf", { "--scale", "--seconds", "inf" }, false },
+        { "seconds zero", { "--scale", "--seconds", "0" }, false },
+        { "seconds negative", { "--scale", "--seconds", "-3" }, false },
+        { "seconds hex", { "--scale", "--seconds", "0x10" }, false },
+        { "seconds underflow", { "--scale", "--seconds", "1e-400" }, false },
+        { "unknown option", { "--bench", "--bogus" }, false },
+        { "missing value", { "--bench", "--iters" }, false },
+        { "missing root value", { "--bench", "--root" }, false },
+        { "two modes", { "--bench", "--scale" }, false },
+    };
+    for (const auto & t : cases)
+    {
+        c.checks++;
+        if (parses(t.argv) != t.ok) c.fail(std::string("options: '") + t.label + "' was " + (t.ok ? "refused" : "accepted"));
+    }
+    // a timing is attributed to the reader that really ran
+    Route generic, legacy_arm, new_arm, new_on_legacy;
+    legacy_arm.fast_active = 1;
+    new_arm.fast_active = 1; new_arm.u64_active = 1;
+    new_on_legacy.fast_active = 1;
+    const struct { const char * label; Route r; bool legacy; bool ok; } routes[] = {
+        { "generic route, legacy arm", generic, true, false },
+        { "generic route, new arm", generic, false, false },
+        { "legacy arm on the legacy reader", legacy_arm, true, true },
+        { "new arm on the u64 reader", new_arm, false, true },
+        { "new arm that fell back to the legacy reader", new_on_legacy, false, false },
+        { "legacy arm that ran the u64 reader", new_arm, true, false },
+    };
+    for (const auto & t : routes)
+    {
+        c.checks++;
+        if (route_problem(t.r, t.legacy).empty() != t.ok) c.fail(std::string("route: '") + t.label + "' was " + (t.ok ? "refused" : "accepted"));
+    }
+}
+
 } // namespace
 
 // tests/pipeline/test_lj92_pred1_reader.cpp includes this file to run run_selftest() inside pipeline_tests (so CI runs it);
@@ -766,24 +973,19 @@ int run_scale(const std::string & root, double seconds)
 #ifndef LJ92_PRED1_READER_TOOL_NO_MAIN
 int main(int argc, char ** argv)
 {
-    std::string mode, root;
-    unsigned seed = 20261120u;
-    int iters = 15;
-    double seconds = 4.0;
-    for (int i = 1; i < argc; i++)
+    const char * const usage = "usage: lj92_pred1_reader_tool --selftest|--bench|--scale [--seed N] [--iters 1..100000] [--seconds 0<S<=3600] [--root DIR]\n";
+    Args args;
+    std::string err;
+    if (parse_args(std::vector<std::string>(argv + 1, argv + argc), args, err) != 0)
     {
-        const std::string a = argv[i];
-        if (a == "--selftest" || a == "--bench" || a == "--scale") mode = a;
-        else if (a == "--seed" && i + 1 < argc) seed = (unsigned)std::strtoul(argv[++i], nullptr, 10);
-        else if (a == "--root" && i + 1 < argc) root = argv[++i];
-        else if (a == "--iters" && i + 1 < argc) iters = std::atoi(argv[++i]);
-        else if (a == "--seconds" && i + 1 < argc) seconds = std::atof(argv[++i]);
+        std::fprintf(stderr, "lj92_pred1_reader_tool: %s\n%s", err.c_str(), usage);
+        return 2;
     }
-    root = find_root(root);
-    if (mode == "--selftest") return run_selftest(root, seed);
-    if (mode == "--bench") return run_bench(root, iters);
-    if (mode == "--scale") return run_scale(root, seconds);
-    std::fprintf(stderr, "usage: lj92_pred1_reader_tool --selftest|--bench|--scale [--seed N] [--iters N] [--seconds S] [--root DIR]\n");
+    const std::string root = find_root(args.root);
+    if (args.mode == "--selftest") return run_selftest(root, args.seed);
+    if (args.mode == "--bench") return run_bench(root, args.iters);
+    if (args.mode == "--scale") return run_scale(root, args.seconds);
+    std::fprintf(stderr, "%s", usage);
     return 2;
 }
 #endif // LJ92_PRED1_READER_TOOL_NO_MAIN
