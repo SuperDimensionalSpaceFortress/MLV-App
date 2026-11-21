@@ -383,9 +383,10 @@ if (-not $SkipLaunchProbe) {
         $probe = Start-Process -FilePath $releaseExe -ArgumentList '--batch', '--help' `
             -WorkingDirectory $probeDir -PassThru -WindowStyle Hidden
         if (-not $probe.WaitForExit(120000)) {
-            # The kill is confirmed or the failure says it is not (adversary 32bf39a9-A3, sibling of the ffmpeg install's).
+            # The kill is confirmed or the failure says it is not (adversary 32bf39a9-A3, sibling of the ffmpeg install's). PR 862 r10 (sol r9
+            # B1 caller :387, the split): the stop kills the probe's ROOT only; any probe timeout, confirmed or not, ends in Complete-Failed 23.
             $probeStop = Stop-PinnedPayloadChild -Process $probe -Baseline $probeBaseline
-            $probeKillNote = if ($probeStop.confirmed) { 'killed, exit seen' } else { "kill NOT confirmed, pid $($probe.Id) may still run$(if ($probeStop.killError) { ": $($probeStop.killError)" })" }
+            $probeKillNote = if ($probeStop.confirmed) { 'root killed, tree seen gone' } else { "kill NOT confirmed, pid $($probe.Id) may still run$(if ($probeStop.killError) { ": $($probeStop.killError)" })" }
             $launchProbe.timedOut = $true
         } else {
             $launchProbe.exitCode = $probe.ExitCode

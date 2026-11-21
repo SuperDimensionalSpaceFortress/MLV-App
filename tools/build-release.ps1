@@ -20,7 +20,8 @@
 # Exit codes: 5=dirty tree (no -AllowDirty); 6=provenance stamp sha != HEAD; 7=runtime deploy
 #   failed (windeployqt or a required MinGW runtime DLL missing); 8=artifact not self-contained
 #   (launch probe died with a DLL-load NTSTATUS, e.g. 0xC0000135); 9=ffmpeg.exe was not installed and verified from
-#   the pinned payload, or it changed before build-manifest.json was written.
+#   the pinned payload, or it changed before build-manifest.json was written; 10=the launch probe timed out and its stop was NOT confirmed
+#   (PR 862 r10: the kill is root-only, so a probe descendant still running, or any unconfirmed stop, is a hard failure with no recovery).
 param(
     [string]$SourceRoot = (Resolve-Path "$PSScriptRoot\..").Path,
     [string]$QtBin      = "C:\Qt\6.10.2\mingw_64\bin",
@@ -254,6 +255,9 @@ try {
 }
 $probeDllFailure = ($null -ne $probeExit -and $dllLoadFailures -contains $probeExit)
 $deploy.selfContained = (-not $probeDllFailure -and -not $probeTimedOut)
+# PR 862 r10 (sol r9 B1 caller :247, the split): the stop kills the probe's root only; a stop that is not confirmed (a descendant still
+# listed, a kill that threw, an exit not seen) is a typed FAIL with exit 10, never a WARN. A confirmed-killed timeout keeps its WARN.
+$probeStopUnconfirmed = ($probeTimedOut -and -not $probeKillConfirmed)
 $launchProbe = [ordered]@{
     mode             = '--batch --help'
     sanitizedPath    = $true
@@ -265,9 +269,10 @@ $launchProbe = [ordered]@{
 }
 if ($probeDllFailure) {
     Write-Host ("FAIL: artifact is NOT self-contained -- launch probe exited 0x{0:X8} (DLL load failure)" -f ([uint32]$probeExit)) -ForegroundColor Red
+} elseif ($probeStopUnconfirmed) {
+    Write-Host "FAIL: launch probe timed out after 30s and its stop was NOT confirmed (root-only kill; pid $($p.Id) or a descendant may still run$(if ($probeKillError) { ": $probeKillError" })); exit 10, nothing recovered" -ForegroundColor Red
 } elseif ($probeTimedOut) {
-    $killNote = if ($probeKillConfirmed) { 'killed, exit seen' } else { "kill NOT confirmed, pid $($p.Id) may still run$(if ($probeKillError) { ": $probeKillError" })" }
-    Write-Host "WARN: launch probe timed out after 30s ($killNote); could not confirm self-contained launch" -ForegroundColor Yellow
+    Write-Host "WARN: launch probe timed out after 30s (root killed, tree seen gone); could not confirm self-contained launch" -ForegroundColor Yellow
 } elseif ($probeExit -ne 0) {
     Write-Host "NOTE: launch probe resolved all DLLs (no 0xC0000135) but --batch --help returned $probeExit (likely environment, e.g. no interactive desktop)" -ForegroundColor Yellow
 } else {
@@ -303,3 +308,4 @@ Write-Host "OK -> $destExe" -ForegroundColor Green
 Write-Host "    embedded-SHA==HEAD: $shaOk ; self-contained: $($deploy.selfContained) ; manifest written"
 if (-not $shaOk) { exit 6 }
 if ($probeDllFailure) { exit 8 }
+if ($probeStopUnconfirmed) { exit 10 }

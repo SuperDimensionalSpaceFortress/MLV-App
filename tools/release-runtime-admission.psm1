@@ -28,13 +28,13 @@ function Test-ReviewedReleaseRuntimeExtraName {
 # re-hashes the in-repo archive and every selected member against the manifest before and after the atomic
 # install, so the bytes cannot depend on which revision RepoRoot has checked out. RepoRoot must be a git
 # checkout (the archive's Git tracking is checked with git ls-files on that one path). The child is synchronous and bounded: past
-# TimeoutSec its whole tree is killed and the result says timedOut (and killConfirmed, whether the exit was
-# seen). Nothing here throws on a failed install, including a locked installed file (adversary 32bf39a9-A2);
+# TimeoutSec its ROOT alone is killed (PR 862 r10, the split) and the result says timedOut (and killConfirmed, whether the root's
+# exit was seen and its whole tree was seen gone; a live descendant leaves it false and nothing is recovered). Nothing here throws on a failed install, including a locked installed file (adversary 32bf39a9-A2);
 # the caller reads .ok and stops with its own typed failure.
 
-# Adversary b5fce5a9-A1: Kill($true) finds descendants by comparing LOCAL start times, so a child started just after a DST
-# fall-back fold reads as older than its parent and is left running while the root's exit reads as confirmed. The tree is
-# therefore also derived here from parent ids and creation times. Rows: { id; parentId; startUtc } (startUtc $null = unknown).
+# Adversary b5fce5a9-A1: .NET's recursive kill finds descendants by comparing LOCAL start times, so a child started just after a
+# DST fall-back fold reads as older than its parent (and, sol r9 B1, a baseline survivor can read as a child). The stop therefore
+# kills only the root (PR 862 r10) and derives the tree it must SEE gone here, from parent ids and creation times. Rows: { id; parentId; startUtc } (startUtc $null = unknown).
 # Adversary 0f5308ad-A1 (r6): ONE Win32_Process query reads each row's pid, parent id AND creation time from the same snapshot. The
 # earlier join of a parent-id read with a later GetProcesses start-time read, by pid, let a pid reused between the two reads inherit a
 # stale parent. startUtc is the UTC creation time cut to whole microseconds (the CIM datetime's precision), so it compares equal to the
@@ -183,8 +183,10 @@ function Get-PinnedPayloadBaseline {
     try { return , @(Get-PinnedPayloadProcessTable -TimeoutSec $TimeoutSec) } catch { return $null }
 }
 
-# Kills a timed-out child's whole tree and reports whether its exit was SEEN; a Kill that throws (access
-# denied) or a wait that times out is never reported as killed (adversary 32bf39a9-A3).
+# Kills a timed-out child's ROOT only (PR 862 r10, the split) and reports whether the root's exit AND its whole process tree's
+# absence were SEEN; a Kill that throws (access denied), a wait that times out, or any tree member still listed is never reported
+# as confirmed (adversary 32bf39a9-A3). Descendants are never killed here: a live one leaves the stop unconfirmed, which every caller
+# treats as a hard failure with no recovery. Killing the tree is card PINNED-PAYLOAD-KILL-TREE-DST-1.
 function Stop-PinnedPayloadChild {
     [CmdletBinding()]
     param(
@@ -235,11 +237,13 @@ function Stop-PinnedPayloadChild {
             } catch { $treeError = "the process tree could not be listed before the kill: $($_.Exception.Message)" }
         }
     }
-    # The ONLY kill: Kill($true) through the root's own held handle. Nothing is ever killed by a pid read from a listing (adversary
-    # 0f5308ad-A1/A2: a listing can join one process's parent id to another's identity, and an open by pid can reach a replacement); a
-    # descendant Kill($true) misses is counted below and leaves the kill unconfirmed, so no recovery runs while it may live.
+    # The ONLY kill: the ROOT alone, through the root's own held handle (PR 862 r10, sol r9 B1 / 8d24187c-A1). A recursive kill selects
+    # descendants by .NET's parent predicate over LOCAL start times, so across a DST fall-back fold a probe reusing a dead parent's pid
+    # could select an unrelated baseline survivor and terminate it. Nothing is ever killed by a pid read from a listing either (adversary
+    # 0f5308ad-A1/A2: a listing can join one process's parent id to another's identity, and an open by pid can reach a replacement).
+    # Every descendant is left running and is counted below, so a live one leaves the stop unconfirmed and no recovery runs.
     $killError = ''
-    try { $null = $Process.Kill($true) } catch { $killError = $_.Exception.Message }
+    try { $null = $Process.Kill($false) } catch { $killError = $_.Exception.Message }
     $exited = $false
     try { $exited = [bool]$Process.WaitForExit([int][math]::Max(0, $ConfirmMs - $clock.ElapsedMilliseconds)) } catch { if (-not $killError) { $killError = "the exit could not be awaited: $($_.Exception.Message)" } }
     if (-not $treeError) {
@@ -269,14 +273,15 @@ function Stop-PinnedPayloadChild {
                 [System.Threading.Thread]::Sleep([int][math]::Max(0, [math]::Min(100, $ConfirmMs - $clock.ElapsedMilliseconds)))
             }
             if (-not $listed) { $treeError = "no whole second of the $ConfirmMs ms confirmation budget was left to list the tree after the kill" }
-            elseif ($left.Count) { $treeError = "pid(s) $(@($left | ForEach-Object { $_.id }) -join ', ') still running after the tree kill (a member, or a row on a member's parent id that no clock-free fact places outside the tree)" }
+            elseif ($left.Count) { $treeError = "pid(s) $(@($left | ForEach-Object { $_.id }) -join ', ') still running after the root-only kill (a member, or a row on a member's parent id that no clock-free fact places outside the tree)" }
             elseif ($orphans.Count) { $treeError = "orphan-possible: pid(s) $(@($orphans | ForEach-Object { $_.id }) -join ', ') not in the pre-start baseline$(if ($null -eq $Baseline) { ' (none was taken)' }) and with no live parent shown outside the tree that was listed before them, so each may be a descendant whose parent exited; the tree is not confirmed" }
             elseif ($clock.ElapsedMilliseconds -gt $ConfirmMs) { $treeError = "the tree was seen gone only after the $ConfirmMs ms confirmation budget was spent ($($clock.ElapsedMilliseconds) ms)" }
         } catch { $treeError = "the process tree could not be listed after the kill: $($_.Exception.Message)" }
     }
     if ($treeError) { $killError = if ($killError) { "$killError; $treeError" } else { $treeError } }
-    # The ROOT's exit is not the tree's: a Kill(true) that threw (a descendant it could not end) leaves the tree
-    # unconfirmed even when the root exited (adversary 6627beef-A1).
+    # The ROOT's exit is not the tree's: the root-only kill ends the root and leaves every descendant, so the stop is confirmed only
+    # when the root's exit was seen, the kill did not throw, and no tree member (or possible orphan) was still listed (adversary
+    # 6627beef-A1).
     return [pscustomobject][ordered]@{ exited = $exited; killError = $killError; confirmed = ($exited -and -not $killError) }
 }
 
@@ -486,7 +491,7 @@ function Invoke-PinnedPayloadInstall {
     }
     if ($result.timedOut) {
         $result.reason = if ($result.killConfirmed) {
-            "the extractor was still running after $TimeoutSec s; its process tree was killed and its exit seen"
+            "the extractor was still running after $TimeoutSec s; its root was killed (root-only kill) and its process tree was seen gone"
         } else {
             "the extractor was still running after $TimeoutSec s and the kill was NOT confirmed (pid $childPid or a descendant may still be running$(if ($killError) { "; kill error: $killError" }))"
         }

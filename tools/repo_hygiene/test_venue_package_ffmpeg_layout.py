@@ -38,6 +38,29 @@ PAYLOAD_ID = "ffmpeg-windows-x86_64"
 HELPER = "Install-PinnedVendoredPayload"
 PWSH = shutil.which("pwsh")
 
+
+# PR 862 r10 (Grok G4(b)): ONE decision for every capability this file cannot get. Off Windows CI a missing capability skips with
+# its reason; on Windows CI (os.name == "nt" and CI set non-empty) it FAILS, since a skip there would silently hide a behavioural run
+# the hosted Windows shards are expected to make. Read at the moment of the skip, never cached at import.
+CAPABILITY_FAILURE_MARKER = "WINDOWS_CI_CAPABILITY_MISSING"
+
+
+def _capability_missing(reason: str) -> None:
+    if os.name == "nt" and os.environ.get("CI"):
+        raise AssertionError(f"{CAPABILITY_FAILURE_MARKER}: {reason} (a skip on Windows CI would hide this behavioural run)")
+    raise unittest.SkipTest(reason)
+
+
+def _requires(available: bool, reason: str):
+    """Class gate: without the capability the whole class goes through _capability_missing (skip, or a failure on Windows CI)."""
+    def gate(cls):
+        if not available:
+            def setUpClass(klass) -> None:  # noqa: N802 - unittest's hook name
+                _capability_missing(reason)
+            cls.setUpClass = classmethod(setUpClass)
+        return cls
+    return gate
+
 # Lists every CommandAst of one file with its offset, its enclosing AST node types and its named arguments (the static value
 # of a constant string, the variable name of a plain variable, and the source text either way). Test code: it launches nothing.
 AST_SCRIPT = r"""
@@ -170,7 +193,7 @@ class JobAndManifestAgreeTests(unittest.TestCase):
         self.assertRegex(workflow, rf"extract_vendored_native_payload[^\n]*--payload-id {re.escape(PAYLOAD_ID)} --archive-reference {re.escape(archive)}[^\n]*--verify-installed")
 
 
-@unittest.skipUnless(PWSH, "needs pwsh for the PowerShell AST")
+@_requires(bool(PWSH), "needs pwsh for the PowerShell AST")
 class ScriptsInstallUnconditionallyTests(unittest.TestCase):
     # adversary 32bf39a9-A4: the output dir is pinned EXACTLY (a substring match accepted (Join-Path $releaseDir 'other')).
     # adversary 6627beef-A2: (Resolve-Path -LiteralPath $dest).Path threw (dest renamed) before the helper, past exit 9; the provider
@@ -278,6 +301,15 @@ class ScriptsInstallUnconditionallyTests(unittest.TestCase):
         self.assertNotIn("try { $probe.Kill() } catch { }", assembler)
         self.assertIn("if ($probeStop.confirmed) {", assembler)
         self.assertNotIn("$probeStop.exited", release + assembler)
+        # PR 862 r10 (the split, sol r9 B1 caller build-release.ps1:247): the kill is root-only, so the success text says the ROOT was
+        # killed and the tree was SEEN gone; and a probe stop that is NOT confirmed is a typed FAIL with its own non-zero exit, never a
+        # WARN (a confirmed-killed timeout keeps its WARN).
+        self.assertIn("its root was killed (root-only kill) and its process tree was seen gone", body)
+        self.assertNotIn("its process tree was killed", body)
+        self.assertIn("$probeStopUnconfirmed = ($probeTimedOut -and -not $probeKillConfirmed)", release)
+        self.assertRegex(release, r"\} elseif \(\$probeStopUnconfirmed\) \{\n\s*Write-Host \"FAIL: launch probe timed out")
+        self.assertIn("if ($probeStopUnconfirmed) { exit 10 }", release)
+        self.assertIn("10=the launch probe timed out and its stop was NOT confirmed", release)
 
     def test_the_helper_runs_the_extractor_with_verify_installed_bounded(self) -> None:
         text = _normalised(HELPER_MODULE)
@@ -299,7 +331,11 @@ class ScriptsInstallUnconditionallyTests(unittest.TestCase):
         self.assertIn("$psi.WorkingDirectory = $RepoRoot", body)
         self.assertIn("$process.WaitForExit($TimeoutSec * 1000)", body)
         stop = text[text.index("function Stop-PinnedPayloadChild {"): text.index(f"function {HELPER} {{")]
-        self.assertIn("$null = $Process.Kill($true)", stop, "the timeout kill must take the whole tree")
+        # PR 862 r10 (sol r9 B1 / 8d24187c-A1, the split): the timeout kill is ROOT-ONLY, through the held handle. A recursive kill picks
+        # descendants by .NET's parent predicate over LOCAL start times, which a DST fold turns onto an unrelated baseline survivor.
+        self.assertEqual(re.findall(r"\.Kill\(", stop), [".Kill("], "exactly one kill in Stop-PinnedPayloadChild")
+        self.assertIn("$null = $Process.Kill($false)", stop, "the timeout kill must take the root alone")
+        self.assertNotRegex(text, r"(?i)Kill\(\s*\$?true\s*\)", "no recursive kill anywhere in the module")
         self.assertIn(f"Export-ModuleMember -Function Test-ReviewedReleaseRuntimeExtraName, {HELPER}, Stop-PinnedPayloadChild, Open-PinnedFileHold, Test-PinnedZipMember", text)
         # adversary 32bf39a9-A1: every inherited GIT_* variable is dropped from the child's environment.
         self.assertIn("if ([string]$name -like 'GIT_*') { [void]$psi.Environment.Remove([string]$name) }", body)
@@ -403,7 +439,7 @@ class ScriptsInstallUnconditionallyTests(unittest.TestCase):
                         self._assert_one_unconditional_install(mutant, variable)
 
 
-@unittest.skipUnless(os.name == "nt" and PWSH and shutil.which("py"), "needs Windows, pwsh and py.exe")
+@_requires(os.name == "nt" and bool(PWSH) and bool(shutil.which("py")), "needs Windows, pwsh and py.exe")
 class HelperBehaviourTests(unittest.TestCase):
     """The real helper on the real in-repo archive."""
 
@@ -534,7 +570,10 @@ class HelperBehaviourTests(unittest.TestCase):
 
     def test_a_descendant_kill_true_missed_across_the_dst_fold_leaves_the_kill_unconfirmed(self) -> None:
         # adversary b5fce5a9-A1: py.exe started 06:59:59Z and its extractor 07:00:01Z on 2026-11-01 (the Central fall-back fold), so by
-        # LOCAL time the child is older than its parent and Kill($true) leaves it running; the root's exit then read as confirmed.
+        # LOCAL time the child is older than its parent; the root's exit alone then read as confirmed.
+        # PR 862 r10 re-baseline (the split): the kill is root-only, so a descendant is NEVER killed (sol r9 B1: a recursive kill across
+        # the fold can select a baseline survivor); any descendant still listed after the root's exit leaves the stop unconfirmed. The
+        # assertions are unchanged: a listed descendant is unconfirmed, a tree seen gone is confirmed.
         fold = "2026-11-01T06:59:59Z"
         root = self._row(4242, 1, fold)
         child = self._row(5151, 4242, "2026-11-01T07:00:01Z")
@@ -772,36 +811,77 @@ class HelperBehaviourTests(unittest.TestCase):
         self.assertFalse(counted["confirmed"], counted)
         self.assertIn("5151 still running", counted["killError"])
 
-    def test_a_real_tree_is_killed_and_confirmed_through_the_real_listing(self) -> None:
-        # r6: the identity rule must still prove a REAL root (handle creation time == listing creation time) and confirm a real tree
-        # gone, or every real timeout would read unconfirmed and never reconcile.
+    # A real root started from PowerShell with every standard stream redirected; FFX_ARGS holds its arguments, one per line. Every
+    # process here is a system binary that expires by itself (ping -n 12 is about 11 s); nothing is ever stopped by a pid from a listing.
+    _REAL_ROOT = (
+        "$psi = [System.Diagnostics.ProcessStartInfo]::new($env:FFX_EXE)\n"
+        "foreach ($a in ($env:FFX_ARGS -split \"`n\")) { [void]$psi.ArgumentList.Add($a) }\n"
+        "$psi.UseShellExecute = $false; $psi.CreateNoWindow = $true\n"
+        "$psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true\n"
+    )
+
+    def _real_stop(self, exe: str, args: list[str], child_name: str | None) -> dict:
         module = str(HELPER_MODULE).replace("'", "''")
-        spawner = "import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']); time.sleep(120)"
         script = (
             f"$m = Import-Module '{module}' -Force -PassThru\n"
-            "$psi = [System.Diagnostics.ProcessStartInfo]::new($env:FFX_PY)\n"
-            "[void]$psi.ArgumentList.Add('-c'); [void]$psi.ArgumentList.Add($env:FFX_SPAWNER)\n"
-            "$psi.UseShellExecute = $false\n"
-            "$b = Get-PinnedPayloadBaseline\n"
+            + self._REAL_ROOT
+            + "$b = Get-PinnedPayloadBaseline\n"
             "$p = [System.Diagnostics.Process]::Start($psi)\n"
-            "$deadline = [System.Diagnostics.Stopwatch]::StartNew()\n"
-            "do { [System.Threading.Thread]::Sleep(100); $kids = @(Get-CimInstance -ClassName Win32_Process -Filter \"ParentProcessId = $($p.Id)\") } "
-            "while (-not $kids.Count -and $deadline.ElapsedMilliseconds -lt 20000)\n"
-            "$r = & $m { param($q, $s) Stop-PinnedPayloadChild -Process $q -Baseline $s } $p $b\n"
-            "$alive = @($kids | Where-Object { $k = $_; try { $h = [System.Diagnostics.Process]::GetProcessById([int]$k.ProcessId); $h.Dispose(); $true } catch { $false } })\n"
-            "[ordered]@{ kids = $kids.Count; confirmed = $r.confirmed; killError = $r.killError; alive = $alive.Count } | ConvertTo-Json -Compress\n"
+            "$kid = $null\n"
+            "if ($env:FFX_CHILD) {\n"
+            "  $deadline = [System.Diagnostics.Stopwatch]::StartNew()\n"
+            "  do { [System.Threading.Thread]::Sleep(100); $kid = @(Get-CimInstance -ClassName Win32_Process -Filter \"ParentProcessId = $($p.Id) AND Name = '$($env:FFX_CHILD)'\")[0] } "
+            "while (-not $kid -and $deadline.ElapsedMilliseconds -lt 10000)\n"
+            "}\n"
+            # The child's own handle, opened while it is known to be the root's child, proves it alive afterwards by identity (not by pid).
+            "$kidHandle = if ($kid) { [System.Diagnostics.Process]::GetProcessById([int]$kid.ProcessId) } else { $null }\n"
+            "$r = & $m { param($q, $s) Stop-PinnedPayloadChild -Process $q -Baseline $s -ConfirmMs 4000 } $p $b\n"
+            "$kidAlive = if ($kidHandle) { -not $kidHandle.HasExited } else { $null }\n"
+            "[ordered]@{ rootExited = $p.HasExited; kid = $(if ($kid) { [int]$kid.ProcessId } else { $null }); kidAlive = $kidAlive;"
+            " confirmed = $r.confirmed; exited = $r.exited; killError = $r.killError } | ConvertTo-Json -Compress\n"
         )
+        env = dict(os.environ, FFX_EXE=exe, FFX_ARGS="\n".join(args), FFX_CHILD=child_name or "")
         proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True,
-                              timeout=120, env=dict(os.environ, FFX_PY=sys.executable, FFX_SPAWNER=spawner))
+                              timeout=120, env=env)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        result = json.loads(proc.stdout)
-        self.assertEqual(result["kids"], 1, result)
-        self.assertTrue(result["confirmed"], result)
-        self.assertEqual(result["alive"], 0, result)
+        return json.loads(proc.stdout)
+
+    def test_a_real_root_only_kill_leaves_a_live_child_and_the_stop_unconfirmed(self) -> None:
+        # PR 862 r10 (sol r9 B1 / 8d24187c-A1, the split; replaces test_a_real_tree_is_killed_and_confirmed_through_the_real_listing):
+        # a real root (cmd.exe) with one long-lived child (PING.EXE, self-expiring), stopped with a pre-start baseline. The kill is
+        # root-only, so the child is STILL alive after the stop and the stop is unconfirmed, naming the child's pid. On 8d24187c the
+        # recursive kill ended the child and the stop confirmed.
+        system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+        result = self._real_stop(str(system32 / "cmd.exe"), ["/d", "/c", "ping", "-n", "12", "127.0.0.1"], "PING.EXE")
+        self.assertIsNotNone(result["kid"], result)
+        self.assertTrue(result["rootExited"], result)
+        self.assertTrue(result["kidAlive"], f"the root-only kill must never end a descendant: {result}")
+        self.assertFalse(result["confirmed"], result)
+        self.assertIn(f"{result['kid']} still running", result["killError"])
+
+    def test_a_real_root_with_no_descendant_is_killed_and_confirmed_through_the_real_listing(self) -> None:
+        # r6, kept under r10: the identity rule must still prove a REAL root (handle creation time == listing creation time) and confirm
+        # it gone when it has no descendant, or every real timeout would read unconfirmed and never reconcile.
+        # On a busy host (a fleet host running other lanes) unrelated processes started after the baseline whose parent has exited are
+        # read orphan-possible by the r8 fail-closed rule, so the stop can be unconfirmed for them alone. What must hold on any host: the
+        # root is proven (no "not in the listing", no unreadable creation time), nothing of the tree is still running, the only possible
+        # error is orphan-possible, and on a quiet host (hosted CI) the stop confirms.
+        system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+        result = self._real_stop(str(system32 / "PING.EXE"), ["-n", "12", "127.0.0.1"], None)
+        self.assertTrue(result["rootExited"], result)
+        self.assertTrue(result["exited"], result)
+        error = result["killError"]
+        for forbidden in ("not in the listing", "could not be read", "still running", "could not be listed", "budget"):
+            self.assertNotIn(forbidden, error, result)
+        self.assertEqual(result["confirmed"], error == "", result)
+        if error:
+            self.assertTrue(error.startswith("orphan-possible: "), result)
+        if os.environ.get("CI"):
+            self.assertTrue(result["confirmed"], result)
 
     def test_the_stop_kills_only_through_the_roots_handle_and_times_with_one_stopwatch(self) -> None:
         # r6 properties 1 and 2 at the source: the listing is ONE Win32_Process query carrying pid, parent id and creation time (no
-        # GetProcesses join), the only kill is Kill($true) through the held root handle (no per-pid open), and every wait comes from one
+        # GetProcesses join), the only kill is the root-only Kill through the held root handle (no per-pid open), and every wait comes from one
         # monotonic Stopwatch (no wall-clock reading).
         text = HELPER_MODULE.read_text(encoding="utf-8")
         table = re.search(r"function Get-PinnedPayloadProcessTable \{.*?\n\}", text, re.S).group(0)
@@ -810,8 +890,10 @@ class HelperBehaviourTests(unittest.TestCase):
         self.assertNotIn("GetProcesses", table)
         stop = re.search(r"function Stop-PinnedPayloadChild \{.*?\n\}", text, re.S).group(0)
         self.assertNotIn("GetProcessById", stop)
+        # PR 862 r10: the one kill is the ROOT's alone (Kill($false)); no recursive kill exists in the module (8d24187c-A1).
         self.assertEqual(re.findall(r"\.Kill\(", stop), [".Kill("])
-        self.assertIn("$Process.Kill($true)", stop)
+        self.assertIn("$Process.Kill($false)", stop)
+        self.assertNotRegex(text, r"(?i)Kill\(\s*\$?true\s*\)")
         self.assertIn("[System.Diagnostics.Stopwatch]::StartNew()", stop)
         for wall in ("Get-Date", "::Now", "::UtcNow"):
             self.assertNotIn(wall, stop)
@@ -849,7 +931,7 @@ def _short_spelling(path: Path) -> Path:
     return Path(buffer.value) if 0 < length < len(buffer) else path
 
 
-@unittest.skipUnless(os.name == "nt" and PWSH, "needs Windows and pwsh")
+@_requires(os.name == "nt" and bool(PWSH), "needs Windows and pwsh")
 class PublicationCheckBehaviourTests(unittest.TestCase):
     """adversary ae560106-A1: the bytes are re-read at the point of publication (zip entry; held file during the manifest write)."""
 
@@ -949,6 +1031,8 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
     def test_a_killed_install_gets_its_original_back(self) -> None:
         # adversary f92303b7-A1: the extractor moved the original ffmpeg.exe into its transaction backup and was killed (timeout)
         # before the replacement landed; the Python rollback never ran, so ffmpeg.exe was absent and OLD stayed in the backup.
+        # PR 862 r10 re-baseline: unchanged here. The restore runs only after a CONFIRMED stop, which with the root-only kill means a
+        # root with no descendant still listed; a tree with a live descendant is unconfirmed and never reaches this restore.
         out = self.tmp / "out"
         mine = out / f".vendored-payload-transaction-{self.MINE}"
         mine.mkdir(parents=True)
@@ -1044,7 +1128,12 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         branch = body[body.index("if ($result.timedOut) {"): body.index("if ($result.exitCode -ne 0) {")]
         self.assertRegex(branch, r"if \(\$result\.killConfirmed\) \{\n\s*\$restore = Restore-PinnedPayloadTransaction -OutputDir \$OutputDir -TransactionId \$transactionId\n")
         self.assertIn("was NOT reconciled", branch)
-        restore = text[text.index("function Restore-PinnedPayloadTransaction {"): text.index(f"function {HELPER} {{")]
+        # PR 862 r10 re-baseline: killConfirmed is the ROOT-ONLY stop's confirmation (the root killed, the tree seen gone); there is no
+        # recovery after an unconfirmed stop: no second kill, no retry, no restore.
+        self.assertIn("its root was killed (root-only kill) and its process tree was seen gone", branch)
+        self.assertEqual(branch.count("Stop-PinnedPayloadChild"), 0, "no second stop or kill in the timeout branch")
+        self.assertEqual(branch.count("Restore-PinnedPayloadTransaction"), 1)
+        restore =text[text.index("function Restore-PinnedPayloadTransaction {"): text.index(f"function {HELPER} {{")]
         self.assertNotRegex(restore, r"Remove-Item|::Delete\(", "the reconciliation only moves files back, it never deletes")
         self.assertNotRegex(restore, r"::Move\(.*\$true\)", "a backup is never moved over a destination (adversary 32501f50-A1)")
 
@@ -1087,7 +1176,9 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         member = next(m for m in record["selected_members"] if m["output_name"] == "ffmpeg.exe")
         archive = ROOT / Path(record["path"])
         if archive.stat().st_size != record["bytes"]:
-            self.skipTest(f"{archive} is not the pinned archive here (an LFS pointer or a partial checkout)")
+            # PR 862 r10 (Grok G4(b) sibling): the archive is a plain Git blob (no LFS filter) and the Windows shards check out the
+            # whole tree, so on Windows CI a wrong size can only hide a broken checkout: it fails there; elsewhere it skips.
+            _capability_missing(f"{archive} is not the pinned archive here (an LFS pointer or a partial checkout)")
         for label, digest in self._case_variants(member["sha256"]).items():
             with self.subTest(case=label):
                 result = self._ps(
@@ -1123,11 +1214,35 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("could not be opened", result["reason"])
 
+    def test_a_missing_capability_fails_on_windows_ci_and_skips_elsewhere(self) -> None:
+        # PR 862 r10 (Grok G4(b)): a symbolic link that cannot be created (here: its folder does not exist) under CI=true on Windows
+        # must FAIL the test, never skip it; with CI unset it still skips with its reason. On 8d24187c it skipped on CI too.
+        from unittest import mock
+        target = self.tmp / "target.bin"
+        target.write_bytes(b"x")
+        link = self.tmp / "no-such-folder" / "link.bin"
+        with mock.patch.dict(os.environ, {"CI": "true"}):
+            try:
+                self._symlink_or_skip(link, target)
+            except unittest.SkipTest as exc:
+                self.fail(f"a missing capability was skipped on Windows CI: {exc}")
+            except AssertionError as exc:
+                self.assertIn(CAPABILITY_FAILURE_MARKER, str(exc))
+            else:
+                self.fail("a link into a missing folder was created")
+        with mock.patch.dict(os.environ, {"CI": ""}):
+            with self.assertRaises(unittest.SkipTest):
+                self._symlink_or_skip(link, target)
+        # every capability skip in this file goes through the one decision: no direct skipTest/skipUnless/skipIf is left.
+        source = _normalised(Path(__file__))
+        self.assertNotRegex(source, r"self\.skipTest\(|@unittest\.skip(Unless|If)?\(")
+        self.assertEqual(source.count("_capability_missing(f\"per-directory case sensitivity cannot be enabled here"), 1)
+
     def _symlink_or_skip(self, link: Path, target: Path) -> None:
         try:
             os.symlink(target, link)
         except OSError as exc:
-            self.skipTest(f"this account cannot create a file symbolic link ({exc}); the source pin covers the open flags")
+            _capability_missing(f"this account cannot create a file symbolic link ({exc}); the source pin covers the open flags")
 
     def test_a_symbolic_link_to_the_pinned_bytes_is_never_held(self) -> None:
         # sol r8 B1 trace: the verified file is moved to pin\ffmpeg.exe and the output pathname becomes a symbolic link to it. The old
@@ -1233,7 +1348,7 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         flag = subprocess.run(["fsutil.exe", "file", "setCaseSensitiveInfo", str(case), "enable"], capture_output=True, text=True)
         probe = subprocess.run(["fsutil.exe", "file", "queryCaseSensitiveInfo", str(case)], capture_output=True, text=True)
         if flag.returncode != 0 or "is enabled" not in probe.stdout:
-            self.skipTest(f"per-directory case sensitivity cannot be enabled here: {(flag.stdout + flag.stderr).strip()}")
+            _capability_missing(f"per-directory case sensitivity cannot be enabled here: {(flag.stdout + flag.stderr).strip()}")
         (case / "pin" / "d0ae83d69070").mkdir(parents=True)
         (case / "pin" / "d0ae83d69070" / "ffmpeg.exe").write_bytes(payload)
         result = self._ps(
