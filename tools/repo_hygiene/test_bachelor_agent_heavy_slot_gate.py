@@ -132,6 +132,38 @@ if _JOB_CAP_MATCH is None or _WARN_SHARE_MATCH is None:
 HOSTED_UBUNTU_JOB_CAP_SEC = int(_JOB_CAP_MATCH.group(1)) * 60  # the tightest hosted cap: the windows jobs have 50 min
 SHARD_BUDGET_WARN_SHARE = float(_WARN_SHARE_MATCH.group(1))
 HOSTED_CASE_BUDGET_MAX_SEC = HOSTED_UBUNTU_JOB_CAP_SEC * SHARD_BUDGET_WARN_SHARE - max_run_bounded_sec(0)
+# adversary r5 A4: the static ceiling above does not know how much of the job is already spent (a case that starts at second 1240 of 1800 has
+# 560 s left, not 1215). The workflow exports the job start (CI_SHARD_JOB_START_EPOCH, the same variable the shard runner reads), so the budget
+# is also clamped to what the job has LEFT, with the case's own allowances after it; with no believable start nothing is clamped.
+_JOB_CAP_WINDOWS_MATCH = re.search(r'(?m)^JOB_CAP_MINUTES = \{[^}\n]*"windows": (\d+)', _SHARD_SOURCE)
+_JOB_START_ENV_MATCH = re.search(r'(?m)^JOB_START_ENV = "([A-Z_]+)"\s*$', _SHARD_SOURCE)
+if _JOB_CAP_WINDOWS_MATCH is None or _JOB_START_ENV_MATCH is None:
+    raise AssertionError("ci_unittest_shard.py no longer defines a windows JOB_CAP_MINUTES entry and JOB_START_ENV as plain literals")
+HOSTED_WINDOWS_JOB_CAP_SEC = int(_JOB_CAP_WINDOWS_MATCH.group(1)) * 60
+HOSTED_JOB_START_ENV = _JOB_START_ENV_MATCH.group(1)
+MIN_CLAMPED_BUDGET_SEC = 30  # a case with less than this left inside its job is refused rather than started
+
+
+def _checked_budget_sec(budget: float, case: str, environ: dict[str, str] | None = None, wall_clock: object = time.time) -> float:
+    """`budget` if a hosted job can wait for it, the part of it the job has left when it cannot, and a refusal (nothing launched) when that is too little.
+
+    sol r4 B3: a budget above HOSTED_CASE_BUDGET_MAX_SEC is refused outright. adversary r5 A4: when the job's start is known (and believable: not
+    in the future, not older than the cap) the budget plus run_bounded's own allowances plus a margin must fit what is left of THIS job's cap."""
+    if budget > HOSTED_CASE_BUDGET_MAX_SEC:
+        raise AssertionError(f"{case}: the derived whole-script budget of {budget:g} s is above {HOSTED_CASE_BUDGET_MAX_SEC:g} s, the most a "
+                             f"hosted job ({HOSTED_UBUNTU_JOB_CAP_SEC} s cap, warned at {SHARD_BUDGET_WARN_SHARE:g} of it) can wait for; no child was started")
+    try:
+        started = float((os.environ if environ is None else environ)[HOSTED_JOB_START_ENV])
+    except (KeyError, ValueError):
+        return budget
+    cap = HOSTED_WINDOWS_JOB_CAP_SEC if os.name == "nt" else HOSTED_UBUNTU_JOB_CAP_SEC
+    elapsed = wall_clock() - started  # type: ignore[operator]
+    if not math.isfinite(elapsed) or elapsed < 0 or elapsed > cap:
+        return budget
+    room = cap - elapsed - max_run_bounded_sec(0) - CLEANUP_MARGIN_SEC
+    if room < MIN_CLAMPED_BUDGET_SEC:
+        raise AssertionError(f"{case}: the hosted job has {cap - elapsed:.0f} s left, less than this case's own cleanup needs; no child was started")
+    return min(budget, room)
 
 
 # sol r14 B1 / adversary r14 A1 / adversary r15 A1, A2 / hub ruling on r15 A1 (the fifth pass on this class): no cleanup-critical path runs
@@ -288,70 +320,146 @@ def _signal_process(pid: int, sig: int) -> None:
     os.kill(pid, sig)
 
 
-def _posix_descendants(root_pid: int, proc_root: str) -> list[tuple[int, int]]:
-    """(pid, process group) of every process below root_pid by parent links in the process table at proc_root (setsid'ed ones included)."""
-    table: dict[int, tuple[int, int]] = {}
+_SIGSTOP = getattr(signal, "SIGSTOP", 19)
+# adversary r5 A3: reading the process table is itself bounded, and the whole POSIX kill fits the allowance that taskkill leaves VACANT on POSIX
+# (taskkill cannot exist there, so TASKKILL_BOUND_SEC + TASKKILL_REAP_SEC of CLEANUP_BOUND_SEC are never spent): rounds x census bound.
+POSIX_CENSUS_BOUND_SEC = 10
+POSIX_KILL_ROUNDS = 5
+POSIX_TREE_KILL_BOUND_SEC = POSIX_KILL_ROUNDS * POSIX_CENSUS_BOUND_SEC
+
+
+def _parse_proc_stat(text: str) -> tuple[str, int, int, str]:
+    """(state, parent, process group, start time) of one `/proc/<pid>/stat` line; the name may hold spaces and ')', so split after the LAST ')'."""
+    fields = text[text.rindex(")") + 2:].split()
+    return fields[0], int(fields[1]), int(fields[2]), fields[19]  # field 22 (start time) is index 19 here, as the fifo script reads it
+
+
+def _read_process_table(proc_root: str) -> tuple[dict[int, tuple[str, int, int, str]], int]:
+    """({pid: (state, parent, group, start time)}, number of entries that could not be read) for the process table at proc_root.
+
+    A process that ended while the table was read is skipped; an entry that EXISTS but cannot be read or parsed (a permission error) is counted,
+    because a descendant behind it would otherwise be missed in silence (adversary r5 A3)."""
+    table: dict[int, tuple[str, int, int, str]] = {}
+    unreadable = 0
     for name in os.listdir(proc_root):
         if not name.isdigit():
             continue
         try:
-            text = Path(proc_root, name, "stat").read_text(encoding="ascii", errors="replace")
-            fields = text[text.rindex(")") + 2:].split()  # after the last ')': state, ppid, pgrp, ...
-            table[int(name)] = (int(fields[1]), int(fields[2]))
+            table[int(name)] = _parse_proc_stat(Path(proc_root, name, "stat").read_text(encoding="ascii", errors="replace"))
+        except (FileNotFoundError, ProcessLookupError, NotADirectoryError):
+            continue  # ended while the table was read
         except (OSError, ValueError, IndexError):
-            continue  # a process that ended while the table was read
-    found: list[tuple[int, int]] = []
+            unreadable += 1
+    return table, unreadable
+
+
+def _live_descendants(table: dict[int, tuple[str, int, int, str]], root_pid: int) -> list[int]:
+    """Every live (not zombie) process below root_pid by parent links, setsid'ed ones included."""
+    found: list[int] = []
     seen = {root_pid}
     frontier = {root_pid}
     while frontier:
-        children = {pid for pid, (ppid, _) in table.items() if ppid in frontier and pid not in seen}
-        found.extend((pid, table[pid][1]) for pid in sorted(children))
+        children = {pid for pid, (_, ppid, _, _) in table.items() if ppid in frontier and pid not in seen}
+        found.extend(pid for pid in sorted(children) if table[pid][0] != "Z")
         seen |= children
         frontier = children
     return found
 
 
+def _same_process(proc_root: str, pid: int, start: str) -> bool:
+    """True while pid is still the process whose start time was recorded (a pid reused by an unrelated process has another start time)."""
+    try:
+        return _parse_proc_stat(Path(proc_root, str(pid), "stat").read_text(encoding="ascii", errors="replace"))[3] == start
+    except Exception:  # noqa: BLE001 - gone or unreadable: it is not signalled
+        return False
+
+
+def _call_within(bound_sec: float, call: object) -> object:
+    """call() on a daemon thread, abandoned (TimeoutError) after bound_sec: a stalled read can never hold the verdict back."""
+    box: dict[str, object] = {}
+
+    def work() -> None:
+        try:
+            box["value"] = call()  # type: ignore[operator]
+        except BaseException as exc:  # noqa: BLE001 - handed to the caller
+            box["error"] = exc
+
+    thread = threading.Thread(target=work, name="posix-process-table", daemon=True)
+    thread.start()
+    thread.join(bound_sec)
+    if thread.is_alive():
+        raise TimeoutError(f"abandoned after {bound_sec:g} s")
+    if "error" in box:
+        raise box["error"]  # type: ignore[misc]
+    return box["value"]
+
+
 def _kill_posix_tree(proc: object) -> str:
     """POSIX only, for a REAL Popen that run_bounded started in its own session: the whole tree is killed. '' when it does not apply.
 
-    The descendants are read BEFORE the driver is killed (afterwards they are reparented and no longer reachable by parent links). A failing
-    step is reported, never allowed to replace the timeout verdict, and the remaining steps still run."""
+    adversary r5 A1: the driver's group is FROZEN (SIGSTOP) first, so it can start nothing new while the tree is read, and the table is read
+    again each round until a round finds nothing new (a descendant that starts its own children is caught on the next round).
+    adversary r5 A2: a descendant is signalled only while its start time still matches the census (a reused pid is skipped), and it is
+    STOPPED before it is killed: a stopped process cannot exit, so neither its pid nor the group it leads can be reused before the kill.
+    The window between the start-time check and the stop remains, as the fifo script states for its own group kill (nothing here closes it).
+    A step that fails is reported, never allowed to replace the timeout verdict, and the remaining steps still run; only a SUCCESSFUL kill counts."""
     if not _IS_POSIX or not isinstance(proc, _REAL_POPEN):
         return ""
     problems: list[str] = []
+    killed = {"groups": 0, "processes": 0}
     pid = proc.pid
+
+    def send(sender: object, target: int, sig: int, what: str) -> bool:
+        try:
+            sender(target, sig)  # type: ignore[operator]
+            return True
+        except ProcessLookupError:
+            return False  # already gone
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"signalling {what} {target} failed: {_exc_type_name(exc)}")
+            return False
+
+    leads = False
     try:
-        descendants = _posix_descendants(pid, _PROC_ROOT)
-    except Exception as exc:  # noqa: BLE001 - a diagnostic never replaces a verdict
-        descendants = []
-        problems.append(f"the process table could not be read: {_exc_type_name(exc)}")
-    groups: list[int] = []
-    try:
-        if _group_of(pid) == pid:  # the driver leads its own group (start_new_session); never signal a group it merely belongs to
-            groups.append(pid)
-        else:
+        leads = _group_of(pid) == pid  # never signal a group the driver merely belongs to
+        if not leads:
             problems.append("the driver does not lead its own process group")
     except ProcessLookupError:
         pass
     except Exception as exc:  # noqa: BLE001
         problems.append(f"reading the driver's group failed: {_exc_type_name(exc)}")
-    groups.extend(child for child, group in descendants if group == child and child not in groups)  # each descendant that leads a group of its own
-    for group in groups:
+    if leads:
+        send(_signal_group, pid, _SIGSTOP, "group")
+    done: set[int] = set()
+    unreadable = 0
+    exhausted = True
+    for _ in range(POSIX_KILL_ROUNDS):
         try:
-            _signal_group(group, _SIGKILL)
-        except ProcessLookupError:
-            pass
+            table, unreadable_now = _call_within(POSIX_CENSUS_BOUND_SEC, lambda: _read_process_table(_PROC_ROOT))  # type: ignore[misc]
         except Exception as exc:  # noqa: BLE001
-            problems.append(f"killing group {group} failed: {_exc_type_name(exc)}")
-    for child, _ in descendants:
-        try:
-            _signal_process(child, _SIGKILL)
-        except ProcessLookupError:
-            pass
-        except Exception as exc:  # noqa: BLE001
-            problems.append(f"killing process {child} failed: {_exc_type_name(exc)}")
-    done = f"POSIX tree kill: {len(groups)} group(s) and {len(descendants)} descendant(s) signalled"
-    return done if not problems else f"{done}; NOT confirmed ({'; '.join(problems)})"
+            problems.append(f"the process table could not be read: {_exc_type_name(exc)}")
+            exhausted = False
+            break
+        unreadable = max(unreadable, unreadable_now)
+        members = [(child, table[child]) for child in _live_descendants(table, pid) if child not in done]
+        if not members:
+            exhausted = False
+            break
+        stopped = [(child, entry) for child, entry in members if _same_process(_PROC_ROOT, child, entry[3]) and send(_signal_process, child, _SIGSTOP, "process")]
+        for child, entry in stopped:
+            if entry[2] == child and send(_signal_group, child, _SIGKILL, "group"):  # a descendant that leads a group of its own: the whole group
+                killed["groups"] += 1
+            if send(_signal_process, child, _SIGKILL, "process"):
+                killed["processes"] += 1
+            done.add(child)
+    if exhausted:
+        problems.append(f"descendants were still appearing after {POSIX_KILL_ROUNDS} rounds")
+    if unreadable:
+        problems.append(f"{unreadable} process table entr(ies) could not be read, so a descendant behind one is unconfirmed")
+    if leads and send(_signal_group, pid, _SIGKILL, "group"):
+        killed["groups"] += 1
+    note = f"POSIX tree kill: {killed['groups']} group(s) and {killed['processes']} descendant(s) killed"
+    return note if not problems else f"{note}; NOT confirmed ({'; '.join(problems)})"
 
 
 def _kill_taskkill_child(taskkill: subprocess.Popen, problems: list[str]) -> None:
@@ -504,7 +612,7 @@ def _pwsh_script_argv(script: str):
 
 
 PWSH_SCRIPT_BASE_SEC = 120  # a bare pwsh start, the compile of the capture type and the script's own end: what a script with NO worker call needs
-_CAPTURE_CALL = re.compile(r"(?i)\b(Read-CapturedResult|Read-CapturedText|Remove-CaptureFiles)\b([^\n]*)")  # PowerShell command names are case-insensitive
+_CAPTURE_CALL = re.compile(r"(?i)\b(Read-CapturedResult|Read-CapturedText|Remove-CaptureFiles)\b")  # PowerShell command names are case-insensitive
 # the bound of an accept call on a call line: the seam variable (a pwsh script) or its value (a generated script, e.g. _plain_task_script)
 _ACCEPT_BOUND_ON_CALL_LINE = re.compile(r"(?i)\$AcceptMs\b|(?<![\w$.])" + str(CAPTURE_ACCEPT_BOUND_MS) + r"(?![\w.])")
 _LOOP_BLOCK_HEAD = re.compile(r"(?i)(?:\b(?:foreach|for|while)\s*\([^{}]*\)|\bdo|ForEach-Object)\s*$")
@@ -537,12 +645,20 @@ def pwsh_script_budget_sec(script: str, repeat: int = 1) -> float:
     body = script[script.index(marker):] if marker in script else script
     if repeat < 1:
         raise ValueError("repeat must be at least 1")
+    # adversary r5 A6: a backtick continuation joins its next line to the call (its bound may sit there), and every call on a line is its own call:
+    # a call's arguments end at the next capture call on the same line, not at the end of the line, so `a; b; c` charges three calls, not one.
+    body = re.sub(r"`[ \t]*\r?\n[ \t]*", " ", body)
     straight_ms, looped_ms = 0, 0
-    for match in _CAPTURE_CALL.finditer(body):
+    calls = list(_CAPTURE_CALL.finditer(body))
+    for index, match in enumerate(calls):
         if re.search(r"(?i)\bfunction\s+$", body[:match.start()]):
             continue
-        bounds = [int(n) for n in re.findall(r"(?<![\w$.])\d+(?![\w.])", match.group(2)) if 0 < int(n) <= MAX_DECLARED_BOUND_MS]
-        if _ACCEPT_BOUND_ON_CALL_LINE.search(match.group(2)):
+        line_end = body.find("\n", match.end())
+        line_end = len(body) if line_end == -1 else line_end
+        next_start = calls[index + 1].start() if index + 1 < len(calls) and calls[index + 1].start() < line_end else line_end
+        arguments = body[match.end():next_start]
+        bounds = [int(n) for n in re.findall(r"(?<![\w$.])\d+(?![\w.])", arguments) if 0 < int(n) <= MAX_DECLARED_BOUND_MS]
+        if _ACCEPT_BOUND_ON_CALL_LINE.search(arguments):
             ceiling = CAPTURE_ACCEPT_CALL_CEILING_MS  # r3 G1: an accept call is charged the named accept ceiling, not the worker start bound
         else:
             ceiling = capture_call_ceiling_ms(max(bounds) if bounds else CAPTURE_WORKER_START_MS)
@@ -564,15 +680,47 @@ def _case_name() -> str:
 
 def _run_pwsh_script(script: str, repeat: int = 1) -> subprocess.CompletedProcess:
     """Run `script` in a bare pwsh under its derived budget; a hang kills the tree and fails by case name (run_bounded)."""
-    budget = pwsh_script_budget_sec(script, repeat)
-    if budget > HOSTED_CASE_BUDGET_MAX_SEC:
-        # sol r4 B3: the hosted job would be cancelled before this budget ran out, so a hung capture would end with no case verdict and no
-        # teardown. Nothing is launched: split the case into scripts that each fit, or charge only the calls that can really hang.
-        raise AssertionError(f"{_case_name()}: the derived whole-script budget of {budget:g} s is above {HOSTED_CASE_BUDGET_MAX_SEC:g} s, the most a "
-                             f"hosted job ({HOSTED_UBUNTU_JOB_CAP_SEC} s cap, warned at {SHARD_BUDGET_WARN_SHARE:g} of it) can wait for; no child was started")
+    # sol r4 B3 / adversary r5 A4: the hosted job would be cancelled before a budget it cannot wait for ran out, so a hung capture would end with
+    # no case verdict and no teardown. Nothing is launched above the ceiling (split the case); a budget is clamped to what the job has left.
+    budget = _checked_budget_sec(pwsh_script_budget_sec(script, repeat), _case_name())
     with _pwsh_script_argv(script) as argv:
         code, out, err = run_bounded(argv, budget, _case_name())
     return subprocess.CompletedProcess(argv, code, out, err)
+
+
+_UNBOUNDED_SUBPROCESS_CALLS = ("run", "call", "check_call", "check_output")  # the stdlib's wait-with-timeout family: it kills the root only
+
+
+def _direct_subprocess_calls(source: str) -> list[str]:
+    """Every direct call of the stdlib's subprocess run/call/check_* family in `source`, as `line N`: through the module, an aliased module
+    (`import subprocess as sp`) or an aliased function (`from subprocess import run as launch`). Every such call is a finding, whatever its keywords."""
+    tree = ast.parse(source)
+    modules, functions = {"subprocess"}, set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(alias.asname or alias.name for alias in node.names if alias.name == "subprocess")
+        elif isinstance(node, ast.ImportFrom) and node.module == "subprocess":
+            functions.update(alias.asname or alias.name for alias in node.names if alias.name in _UNBOUNDED_SUBPROCESS_CALLS)
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            target = node.func
+            if (isinstance(target, ast.Attribute) and target.attr in _UNBOUNDED_SUBPROCESS_CALLS and isinstance(target.value, ast.Name)
+                    and target.value.id in modules) or (isinstance(target, ast.Name) and target.id in functions):
+                found.append(f"line {node.lineno}")
+    return found
+
+
+def _live_assert_less_bounds(source: str, names: set[str]) -> dict[str, list[object]]:
+    """{test name: the literal bounds of its `self.assertLess(x, <literal>, ...)` statements} for the named tests, counting only a statement that
+    is DIRECTLY in the test's body (an assertion inside a dead `if False:` branch is no assertion)."""
+    found: dict[str, list[object]] = {}
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.FunctionDef) and node.name in names:
+            found[node.name] = [stmt.value.args[1].value for stmt in node.body  # type: ignore[attr-defined]
+                                if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call) and isinstance(stmt.value.func, ast.Attribute)
+                                and stmt.value.func.attr == "assertLess" and len(stmt.value.args) >= 2 and isinstance(stmt.value.args[1], ast.Constant)]
+    return found
 
 
 def _fifo_capture_io_region(fifo: str) -> str:
@@ -584,7 +732,8 @@ def _fifo_capture_io_region(fifo: str) -> str:
 def _run_argv_bounded(argv: list[str], timeout: float, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """A child that may start capture workers, under run_bounded (sol r4 B2): a timeout fails by case name and ends the whole tree, the worker
     included. The stdlib's own run-with-timeout kills the root only, and on POSIX there is no taskkill to cover the rest."""
-    code, out, err = run_bounded(argv, timeout, _case_name(), env)
+    case = _case_name()
+    code, out, err = run_bounded(argv, _checked_budget_sec(timeout, case), case, env)
     return subprocess.CompletedProcess(argv, code, out, err)
 
 
@@ -963,7 +1112,7 @@ class BoundedRunTests(unittest.TestCase):
         module = sys.modules[__name__]
         real_popen = subprocess.Popen
         launched: list[tuple[subprocess.Popen, dict]] = []
-        signalled: list[tuple[str, int]] = []
+        signalled: list[tuple[str, int, int]] = []
         worker, grandchild, unrelated = 900001, 900002, 900003
 
         with tempfile.TemporaryDirectory(prefix="heavy-slot-gate-b2-proc-") as proc_root:
@@ -976,32 +1125,182 @@ class BoundedRunTests(unittest.TestCase):
                 self._write_fake_proc(proc_root, {proc.pid: (1, proc.pid), worker: (proc.pid, worker), grandchild: (worker, worker), unrelated: (1, unrelated)})
                 return proc
 
-            with mock.patch.object(subprocess, "Popen", side_effect=popen), \
-                    mock.patch.object(module, "_IS_POSIX", True, create=True), \
-                    mock.patch.object(module, "_PROC_ROOT", proc_root, create=True), \
-                    mock.patch.object(module, "_group_of", side_effect=lambda pid: pid, create=True), \
-                    mock.patch.object(module, "_signal_group", side_effect=lambda pgid, sig: signalled.append(("group", pgid)), create=True), \
-                    mock.patch.object(module, "_signal_process", side_effect=lambda pid, sig: signalled.append(("process", pid)), create=True):
+            with mock.patch.object(subprocess, "Popen", side_effect=popen), self._posix_signals(proc_root, signalled):
                 with self.assertRaises(AssertionError) as caught:
                     run_bounded([sys.executable, "-c", "import time; time.sleep(60)"], 1, "posix-group-case")
         proc, kwargs = launched[0]
+        kill, stop = module._SIGKILL, module._SIGSTOP
         self.assertTrue(kwargs.get("start_new_session"), "the driver must lead its own session so its group is its own")
-        self.assertIn(("group", proc.pid), signalled, "the driver's process group was not killed")
-        self.assertIn(("group", worker), signalled, "the group of a descendant that leads its own session was not killed")
-        self.assertIn(("process", worker), signalled)
-        self.assertIn(("process", grandchild), signalled)
-        self.assertNotIn(("process", unrelated), signalled, "a process that is not below the driver must never be signalled")
-        self.assertNotIn(("group", unrelated), signalled)
+        self.assertEqual(signalled[0], ("group", proc.pid, stop), "the driver's group is frozen before the process table is read (adversary r5 A1)")
+        self.assertIn(("group", proc.pid, kill), signalled, "the driver's process group was not killed")
+        self.assertIn(("group", worker, kill), signalled, "the group of a descendant that leads its own session was not killed")
+        self.assertIn(("process", worker, kill), signalled)
+        self.assertIn(("process", grandchild, kill), signalled)
+        self.assertTrue(all(entry[1] != unrelated for entry in signalled), "a process that is not below the driver must never be signalled")
         self.assertIn("taskkill failed: FileNotFoundError", str(caught.exception))
-        self.assertIn("POSIX tree kill", str(caught.exception))
+        self.assertIn("POSIX tree kill: 2 group(s) and 2 descendant(s) killed", str(caught.exception))
         self.assertIsNotNone(proc.poll(), "the driver itself must be ended and reaped")
+
+    @contextlib.contextmanager
+    def _posix_signals(self, proc_root: str, signalled: list, on_signal: object = None):
+        """POSIX behaviour on any OS: the signals are RECORDED as (kind, id, signal), never sent; the process table is the fake at proc_root, and
+        `on_signal(kind, id, sig)` may change that table the way a live system changes it between two steps."""
+        module = sys.modules[__name__]
+
+        def record(kind: str):
+            def send(target: int, sig: int) -> None:
+                signalled.append((kind, target, sig))
+                if on_signal is not None:
+                    on_signal(kind, target, sig)
+            return send
+
+        with mock.patch.object(module, "_IS_POSIX", True, create=True), mock.patch.object(module, "_PROC_ROOT", proc_root, create=True), \
+                mock.patch.object(module, "_group_of", side_effect=lambda pid: pid, create=True), \
+                mock.patch.object(module, "_signal_group", side_effect=record("group"), create=True), \
+                mock.patch.object(module, "_signal_process", side_effect=record("process"), create=True):
+            yield
+
+    @staticmethod
+    def _sleeping_child() -> subprocess.Popen:
+        return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _kill_note(self, proc_root: str, signalled: list, on_signal: object = None, table: object = None, child: subprocess.Popen | None = None) -> str:
+        """The note _kill_posix_tree returns for a real child, with the fake table (and optionally a replaced census) in place."""
+        module = sys.modules[__name__]
+        child = child if child is not None else self._sleeping_child()
+        try:
+            patches = [self._posix_signals(proc_root, signalled, on_signal)]
+            if table is not None:
+                patches.append(mock.patch.object(module, "_read_process_table", side_effect=table))
+            with contextlib.ExitStack() as stack:
+                for patch in patches:
+                    stack.enter_context(patch)
+                return module._kill_posix_tree(child)
+        finally:
+            child.kill()
+            child.wait(timeout=30)
+
+    def test_r5_a1_a_descendant_the_driver_starts_after_the_group_is_frozen_or_after_a_round_is_still_killed(self) -> None:
+        # adversary r5 A1: the old kill read the table ONCE and then killed, so a worker the driver launched in between survived (reparented). The
+        # group is frozen first and the table is read again each round: here the worker appears only AFTER the freeze, its own child only on the
+        # second round, and both are killed.
+        worker, grandchild = 900011, 900012
+        signalled: list = []
+        with tempfile.TemporaryDirectory(prefix="heavy-slot-gate-a1-proc-") as proc_root:
+            child = self._sleeping_child()
+            self._write_fake_proc(proc_root, {child.pid: (1, child.pid)})
+            added = {"worker": False, "grandchild": False}
+
+            def on_signal(kind: str, target: int, sig: int) -> None:
+                if not added["worker"]:  # the first signal is the freeze: a launch that raced it lands right after
+                    added["worker"] = True
+                    self._write_fake_proc(proc_root, {worker: (child.pid, worker)})
+                elif kind == "process" and target == worker and sig == sys.modules[__name__]._SIGSTOP and not added["grandchild"]:
+                    added["grandchild"] = True  # the worker started its own child before it was stopped; only the next round sees it
+                    self._write_fake_proc(proc_root, {grandchild: (worker, worker)})
+
+            note = self._kill_note(proc_root, signalled, on_signal, child=child)
+        kill = sys.modules[__name__]._SIGKILL
+        self.assertEqual(signalled[0][2], sys.modules[__name__]._SIGSTOP, signalled)
+        self.assertIn(("process", worker, kill), signalled, note)
+        self.assertIn(("process", grandchild, kill), signalled, "a descendant found only on a later round must be killed too\n" + note)
+
+    def test_r5_a2_a_pid_reused_by_an_unrelated_process_after_the_census_is_never_signalled(self) -> None:
+        # adversary r5 A2: the worker exited and an UNRELATED session leader took its pid between the census and the signal. The recorded start
+        # time no longer matches, so nothing is sent to it (neither the process nor the group it would have led).
+        worker = 900021
+        signalled: list = []
+        with tempfile.TemporaryDirectory(prefix="heavy-slot-gate-a2-proc-") as proc_root:
+            child = self._sleeping_child()
+            self._write_fake_proc(proc_root, {child.pid: (1, child.pid), worker: (1, worker)})  # the pid now belongs to an unrelated leader...
+            Path(proc_root, str(worker), "stat").write_text(f"{worker} (unrelated) S 1 {worker} {worker} 0 -1 4194560 100 0 0 0 0 0 0 0 20 0 1 0 7777 1000000 100\n", encoding="ascii")
+            census = ({child.pid: ("S", 1, child.pid, "5000"), worker: ("S", child.pid, worker, "5000")}, 0)  # ...but the census saw the old worker
+            note = self._kill_note(proc_root, signalled, table=[census, ({child.pid: ("S", 1, child.pid, "5000")}, 0)], child=child)
+        self.assertTrue(all(entry[1] != worker for entry in signalled), f"a reused pid was signalled: {signalled}\n{note}")
+
+    def test_r5_a3_an_unreadable_table_entry_and_a_failed_kill_are_reported_and_a_failed_kill_is_not_counted(self) -> None:
+        worker = 900031
+        with tempfile.TemporaryDirectory(prefix="heavy-slot-gate-a3-proc-") as proc_root:
+            self._write_fake_proc(proc_root, {worker: (1, worker)})
+            os.makedirs(os.path.join(proc_root, "900032", "stat"))  # an entry that exists but cannot be read as a file
+            table, unreadable = _read_process_table(proc_root)
+            self.assertEqual((sorted(table), unreadable), ([worker], 1))
+            # the same unreadable entry makes the kill say its result is unconfirmed
+            child = self._sleeping_child()
+            self._write_fake_proc(proc_root, {child.pid: (1, child.pid), worker: (child.pid, worker)})
+            note = self._kill_note(proc_root, [], child=child)
+            self.assertIn("could not be read", note)
+            self.assertIn("NOT confirmed", note)
+        # a kill that finds the process already gone is not counted as a kill
+        with tempfile.TemporaryDirectory(prefix="heavy-slot-gate-a3b-proc-") as proc_root:
+            child = self._sleeping_child()
+            self._write_fake_proc(proc_root, {child.pid: (1, child.pid), worker: (child.pid, worker)})
+
+            def gone(kind: str, target: int, sig: int) -> None:
+                if target == worker:
+                    raise ProcessLookupError(3, "no such process")
+
+            note = self._kill_note(proc_root, [], gone, child=child)
+            self.assertIn("0 descendant(s) killed", note)
+
+    def test_r5_a3_a_stalled_process_table_read_is_abandoned_inside_its_bound_and_named(self) -> None:
+        module = sys.modules[__name__]
+        release = threading.Event()
+        with tempfile.TemporaryDirectory(prefix="heavy-slot-gate-a3c-proc-") as proc_root:
+            child = self._sleeping_child()
+            self._write_fake_proc(proc_root, {child.pid: (1, child.pid)})
+            started = time.monotonic()
+            try:
+                with mock.patch.object(module, "POSIX_CENSUS_BOUND_SEC", 0.2):
+                    note = self._kill_note(proc_root, [], table=lambda *args: release.wait(60), child=child)
+            finally:
+                release.set()
+        self.assertLess(time.monotonic() - started, 20, "a stalled table read held the verdict back")
+        self.assertIn("could not be read: TimeoutError", note)
+
+    def test_r5_a3_the_whole_posix_kill_fits_inside_the_allowance_taskkill_leaves_vacant_on_posix(self) -> None:
+        # taskkill cannot exist on POSIX, so its allowance inside CLEANUP_BOUND_SEC is never spent there: the POSIX kill is bounded by it.
+        self.assertLessEqual(POSIX_TREE_KILL_BOUND_SEC, TASKKILL_BOUND_SEC + TASKKILL_REAP_SEC)
+        self.assertEqual(POSIX_TREE_KILL_BOUND_SEC, POSIX_KILL_ROUNDS * POSIX_CENSUS_BOUND_SEC)
+
+    def test_r5_a4_a_budget_is_clamped_to_what_the_hosted_job_has_left(self) -> None:
+        # adversary r5 A4: a four-call case (620 s) that starts at second 1240 of an 1800 s job has 560 s left, not the static 1215 s.
+        cap = HOSTED_WINDOWS_JOB_CAP_SEC if os.name == "nt" else HOSTED_UBUNTU_JOB_CAP_SEC
+        now = 1_800_000_000.0
+        env = {HOSTED_JOB_START_ENV: str(now - (cap - 560))}
+        clamped = _checked_budget_sec(620, "clamp-case", env, lambda: now)
+        self.assertLessEqual(clamped + max_run_bounded_sec(0) + CLEANUP_MARGIN_SEC, 560, "the clamped budget plus its allowances must fit the job's remainder")
+        self.assertLess(clamped, 620)
+        self.assertEqual(_checked_budget_sec(100, "roomy-case", env, lambda: now), 100, "a budget that fits is untouched")
+        self.assertEqual(_checked_budget_sec(620, "no-env-case", {}, lambda: now), 620, "no job start: nothing is clamped")
+        for garbage in ("soon", str(now + 500), str(now - cap - 5)):  # not a number, in the future, older than the cap: not believable
+            self.assertEqual(_checked_budget_sec(620, "garbage-case", {HOSTED_JOB_START_ENV: garbage}, lambda: now), 620, garbage)
+        with self.assertRaises(AssertionError) as refused:  # 20 s left: nothing is started
+            _checked_budget_sec(620, "spent-case", {HOSTED_JOB_START_ENV: str(now - (cap - 20))}, lambda: now)
+        self.assertIn("no child was started", str(refused.exception))
+
+    def test_r5_a6_every_capture_call_is_charged_when_several_share_a_line_or_a_continuation_carries_the_bound(self) -> None:
+        # adversary r5 A6: a call's arguments ran to the end of the LINE, so `a; b; c` on one line charged one call, and a backtick continuation
+        # hid the bound on the next line.
+        region = "function Read-CapturedResult { }\n# END bounded capture io\n"
+        ten = region + "; ".join(["$r = Read-CapturedResult $p $AcceptMs $f"] * 10) + "\n"
+        self.assertEqual(pwsh_script_budget_sec(ten), PWSH_SCRIPT_BASE_SEC + 10 * CAPTURE_ACCEPT_CALL_CEILING_MS / 1000)
+        continued = region + "$r = Read-CapturedResult $p `\n    $AcceptMs $f\n"
+        self.assertEqual(pwsh_script_budget_sec(continued), PWSH_SCRIPT_BASE_SEC + CAPTURE_ACCEPT_CALL_CEILING_MS / 1000)
+        with mock.patch.object(sys.modules[__name__], "run_bounded", return_value=(0, "", "")) as bounded:
+            with self.assertRaises(AssertionError):
+                _run_pwsh_script(ten)  # 1370 s: more than a hosted job can wait for, and now it is counted
+            bounded.assert_not_called()
 
     @unittest.skipUnless(os.name == "posix", "a session of its own and killpg exist only on POSIX; hosted Ubuntu runs this")
     def test_r5_b2_a_real_session_escaping_child_of_a_timed_out_driver_does_not_survive_on_posix(self) -> None:
-        # The executed form of sol r4 B2: the driver forks a child that calls setsid (the capture worker's shape), publishes its pid and the
-        # driver then hangs. After the timeout the child must be gone (a zombie awaiting its reaper counts as gone).
+        # The executed form of sol r4 B2: the driver forks a child that calls setsid (the capture worker's shape) and publishes its pid; the
+        # teardown the timeout runs (_kill_tree, on a driver started in its own session as run_bounded starts it) must then end that child too
+        # (a zombie awaiting its reaper counts as gone). The teardown is called as soon as the pid is published, so no fixed wait decides it
+        # (adversary r5 A7); the fixture's own child is killed by pid only when it is the SAME process (start time) and only on a failure.
         work = tempfile.mkdtemp(prefix="heavy-slot-gate-r5-b2-")
-        child_pid: int | None = None
+        child: tuple[int, str] | None = None
+        proc: subprocess.Popen | None = None
         try:
             pid_file = os.path.join(work, "child.pid")
             driver = ("import os, sys, time\n"
@@ -1012,38 +1311,51 @@ class BoundedRunTests(unittest.TestCase):
                       "    time.sleep(600)\n"
                       "else:\n"
                       "    time.sleep(600)\n")
-            with self.assertRaises(AssertionError) as caught:
-                run_bounded([sys.executable, "-c", driver, pid_file], 6, "real-session-escape-case")
-            self.assertIn("real-session-escape-case exceeded its 6 s wall-clock bound", str(caught.exception))
-            self.assertTrue(os.path.exists(pid_file), "the session-escaping child never published its pid inside the bound")
+            proc = subprocess.Popen([sys.executable, "-c", driver, pid_file], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, start_new_session=True)
+            deadline = time.monotonic() + 60
+            while not os.path.exists(pid_file) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(os.path.exists(pid_file), "the session-escaping child never published its pid")
             child_pid = int(Path(pid_file).read_text(encoding="ascii").strip())
+            child = (child_pid, _parse_proc_stat(Path("/proc", str(child_pid), "stat").read_text(encoding="ascii"))[3])
+            note = _kill_tree(proc)
+            self.assertIn("POSIX tree kill", note)
 
             def gone() -> bool:
                 try:
-                    stat = Path("/proc", str(child_pid), "stat").read_text(encoding="ascii")
+                    return _parse_proc_stat(Path("/proc", str(child_pid), "stat").read_text(encoding="ascii"))[0] == "Z"
                 except OSError:
                     return True
-                return stat[stat.rindex(")") + 2:].split()[0] == "Z"
 
             deadline = time.monotonic() + 10
             while not gone() and time.monotonic() < deadline:
                 time.sleep(0.05)
-            self.assertTrue(gone(), "the driver's session-escaping child survived the timeout")
+            self.assertTrue(gone(), "the driver's session-escaping child survived the teardown\n" + note)
         finally:
-            if child_pid is not None:
-                with contextlib.suppress(OSError):
-                    os.kill(child_pid, signal.SIGKILL)  # exact pid, the fixture's own child, only on a failure path
+            if child is not None:
+                try:
+                    state, _, _, start = _parse_proc_stat(Path("/proc", str(child[0]), "stat").read_text(encoding="ascii"))
+                except (OSError, ValueError, IndexError):
+                    state, start = "Z", ""  # gone
+                if state != "Z" and start == child[1]:  # a failure path only: still alive AND still the same process (same start time)
+                    with contextlib.suppress(OSError):
+                        os.kill(child[0], signal.SIGKILL)
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+            if proc is not None:
+                proc.wait(timeout=30)
             shutil.rmtree(work, ignore_errors=True)
 
     def test_r5_b2_no_direct_subprocess_run_with_a_timeout_is_left_in_this_file(self) -> None:
         # sol r4 B2: the two direct POSIX callers (the worker driver and the session-escape case) used subprocess.run(timeout=), which on expiry
         # kills only the root and has no teardown for the worker. Every bounded child here goes through run_bounded.
-        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
-        offenders = [f"line {node.lineno}" for node in ast.walk(tree)
-                     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "run"
-                     and isinstance(node.func.value, ast.Name) and node.func.value.id == "subprocess"
-                     and any(keyword.arg == "timeout" for keyword in node.keywords)]
-        self.assertEqual(offenders, [], "use run_bounded: a timeout there kills the whole tree, the worker included")
+        self.assertEqual(_direct_subprocess_calls(Path(__file__).read_text(encoding="utf-8")), [], "use run_bounded: a timeout there kills the whole tree, the worker included")
+        # adversary r5 A10: the census sees an aliased import, an aliased module and a keyword dictionary too (each flagged here, none before)
+        for mutated in ("from subprocess import run as launch\nlaunch(['x'], timeout=240)\n",
+                        "import subprocess as sp\nsp.check_output(['x'], timeout=240)\n",
+                        "import subprocess\nsubprocess.run(['x'], **{'timeout': 240})\n"):
+            self.assertEqual(len(_direct_subprocess_calls(mutated)), 1, mutated)
 
     def test_r5_b3_a_generated_whole_script_budget_that_the_hosted_job_could_not_wait_for_is_refused_before_any_child(self) -> None:
         # sol r4 B3: the 18-call transport script's budget was 2465 s on a hosted Ubuntu job that is cancelled at 1800 s, so a hung capture
@@ -1078,13 +1390,10 @@ class BoundedRunTests(unittest.TestCase):
         expected = {"test_a_stalled_capture_cleanup_after_a_timeout_returns_the_named_verdict_and_names_the_abandoned_step": 10,
                     "test_a_stalled_capture_cleanup_after_a_clean_run_returns_the_result_and_warns": 30,
                     "test_a_capture_close_that_stalls_is_abandoned_inside_its_bound_and_named": 30}
-        found: dict[str, list[object]] = {}
-        for node in ast.walk(ast.parse(Path(__file__).read_text(encoding="utf-8"))):
-            if isinstance(node, ast.FunctionDef) and node.name in expected:
-                found[node.name] = [call.args[1].value for call in ast.walk(node)  # type: ignore[attr-defined]
-                                    if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr == "assertLess"
-                                    and len(call.args) >= 2 and isinstance(call.args[1], ast.Constant)]
-        self.assertEqual(found, {name: [bound] for name, bound in expected.items()})
+        self.assertEqual(_live_assert_less_bounds(Path(__file__).read_text(encoding="utf-8"), set(expected)), {name: [bound] for name, bound in expected.items()})
+        # adversary r5 A11: a literal in a dead branch is no assertion; only a direct statement of the test body counts
+        weakened = ("class T:\n    def test_a(self):\n        if False:\n            self.assertLess(elapsed, 10)\n        self.assertLess(elapsed, limit)\n")
+        self.assertEqual(_live_assert_less_bounds(weakened, {"test_a"}), {"test_a": []})
 
     @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
     def test_an_out_of_range_suite_bound_is_refused_at_binding_without_launching_a_child(self) -> None:
@@ -2554,14 +2863,20 @@ class BoundedCaptureIoTests(unittest.TestCase):
         # subject), exactly as _accept_region does. Source half: the LAST assignment in each region is the accept bound.
         for label, region in (("raw", _raw_region_with_maximum(300)), ("accept", _accept_region(helper_max_ms=300))):
             self.assertEqual(re.findall(r"\$CaptureWorkerStartMs = (\d+)", region)[-1], str(CAPTURE_ACCEPT_BOUND_MS), label)
-        # Executed half, scaled (no real wait of a second): the same raw region with a start wait of 1 ms (a start the runner could not finish
-        # in time) fails by the named start error, so the seam is what separates the two; with the default seam no start error can occur.
-        starved = self._pwsh(self._plain_task_script("$CaptureIoMaxMs", region=_raw_region_with_maximum(300, worker_start_ms=1)))
-        self.assertEqual(starved.returncode, 0, starved.stdout + starved.stderr)
-        self.assertIn("the capture worker was not ready within 1 ms", starved.stdout)
-        seamed = self._pwsh(self._plain_task_script("$CaptureIoMaxMs", region=_raw_region_with_maximum(300)))
-        self.assertEqual(seamed.returncode, 0, seamed.stdout + seamed.stderr)
-        self.assertNotIn("was not ready within", seamed.stdout + seamed.stderr)
+        # Executed half, DETERMINISTIC (adversary r5 A7: a 1 ms start wait is no control, because Start-CaptureWorker tests the ready FILE before
+        # the clock, so a worker published before the parent is scheduled again skips the deadline): a real pwsh reports the values the helpers
+        # will actually read once the region is dot-sourced, the raw arm's maximum staying the patched-down one and only its start wait moving.
+        probe = "\nWrite-Output ('SEAM|' + $CaptureWorkerStartMs + '|' + $CaptureIoMaxMs)\n"
+        for label, region, expected in (("raw", _raw_region_with_maximum(300), f"SEAM|{CAPTURE_ACCEPT_BOUND_MS}|300"),
+                                        ("raw with a start wait", _raw_region_with_maximum(300, worker_start_ms=1234), "SEAM|1234|300"),
+                                        ("accept", _accept_region(helper_max_ms=300), f"SEAM|{CAPTURE_ACCEPT_BOUND_MS}|{CAPTURE_ACCEPT_BOUND_MS}")):
+            proc = self._pwsh(region + probe)
+            self.assertEqual(proc.returncode, 0, label + proc.stdout + proc.stderr)
+            self.assertIn(expected, proc.stdout, label)
+        # and the worker-start check the seam feeds is the one Start-CaptureWorker enforces (the r15 B3 source pin, repeated where G2 lives)
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        begin = fifo.index("function Start-CaptureWorker")
+        self.assertIn("-ge $CaptureWorkerStartMs", fifo[begin:fifo.index("function Get-CaptureTaskResult", begin)])
 
     def test_r3_g1_one_accept_call_is_charged_no_less_than_the_r1_ceiling_by_the_whole_script_budget(self) -> None:
         # r3 (Grok G1): the whole-script budget is the one deadline an accept arm still has (run_bounded kills the tree there). r2 charged a call
@@ -3203,7 +3518,9 @@ class BoundedCaptureIoTests(unittest.TestCase):
         script_path = os.path.join(work, "driver.ps1")
         Path(script_path).write_text(script, encoding="utf-8")
         env = dict(os.environ, TMPDIR=tmp)
-        return _run_argv_bounded([pwsh_exe, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", script_path], 240, env)
+        # adversary r5 A5: the budget is DERIVED from the capture calls the driver makes (here one accept call), as _run_pwsh_script does; the typed
+        # 240 s it replaces was below what one permitted slow worker start (CAPTURE_ACCEPT_CALL_CEILING_MS) plus the script base allows.
+        return _run_argv_bounded([pwsh_exe, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", script_path], pwsh_script_budget_sec(script), env)
 
     def _skip_unless_setsid_branch(self) -> None:
         if os.name != "posix":
@@ -3212,6 +3529,21 @@ class BoundedCaptureIoTests(unittest.TestCase):
             self.skipTest("SKIPPED: no setsid at /usr/bin/setsid or /bin/setsid, so the setsid branch of Start-CaptureWorker is not taken")
         if PWSH is None:
             self.skipTest("SKIPPED: pwsh is not on PATH")
+
+    def test_r5_a5_the_real_worker_drivers_run_under_a_budget_derived_from_their_calls_not_a_typed_240_s(self) -> None:
+        # adversary r5 A5: both real-driver entry points called the raw runner with a typed 240 s, which a valid schedule (one worker start
+        # of 241 s, the script ending at 244 s) exceeds although the derived budget for one accept call is longer, and which skipped the hosted preflight.
+        module = sys.modules[__name__]
+        with tempfile.TemporaryDirectory(prefix="heavy-slot-gate-r5-a5-") as work, \
+                mock.patch.object(module, "_run_argv_bounded", return_value=subprocess.CompletedProcess([], 0, "", "")) as bounded:
+            self._run_worker_driver("pwsh", work)
+            script = Path(work, "driver.ps1").read_text(encoding="utf-8")
+        self.assertEqual(bounded.call_args.args[1], pwsh_script_budget_sec(script))
+        self.assertGreaterEqual(bounded.call_args.args[1], PWSH_SCRIPT_BASE_SEC + CAPTURE_ACCEPT_CALL_CEILING_MS / 1000)
+        escape = Path(__file__).read_text(encoding="utf-8")
+        escape = escape[escape.index("\n    def _run_session_escape_case") + 1:]
+        escape = escape[:escape.index("\n    def ", 10)] if "\n    def " in escape[10:] else escape
+        self.assertIn("pwsh_script_budget_sec(script)", escape, "the session-escape driver passes a typed budget")
 
     def _assert_worker_driver_ok(self, proc: subprocess.CompletedProcess) -> None:
         out = proc.stdout + proc.stderr
@@ -3381,7 +3713,8 @@ class BoundedCaptureIoTests(unittest.TestCase):
                       "Write-Output ('READ|' + $r.Ok + '|' + $r.Text)\n")
             script_path = os.path.join(base, "driver.ps1")
             Path(script_path).write_text(script, encoding="utf-8")
-            proc = _run_argv_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", script_path], 240, dict(os.environ, TMPDIR=tmp))
+            proc = _run_argv_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", script_path], pwsh_script_budget_sec(script),  # derived (adversary r5 A5)
+                                     dict(os.environ, TMPDIR=tmp))
             if os.path.exists(pid_file):
                 escaped_pid = int(Path(pid_file).read_text(encoding="ascii").strip())
             out = proc.stdout + proc.stderr
