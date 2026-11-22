@@ -875,7 +875,11 @@ function Invoke-BatchTicketCall([string]$Body, [hashtable]$Argument, [double]$Se
     # r8 rule 5 (adversary r7 pass 3 A3): the ONE deadline gate, immediately before EACH ticket call (every create, heartbeat, end, stranded retry and retake starts here): a call is started only with more than 6 s left
     # before -DeadlineUtc (it is bounded to 5 s), so a sequence of calls in one loop turn can never carry the batch past the deadline the turn was checked against. Not started: not answered, nothing was sent.
     if (($deadline - [DateTime]::UtcNow).TotalSeconds -le 6.0) { return [pscustomobject]@{ answered = $false; value = $null; error = 'NO_ROOM less than 6 s were left before -DeadlineUtc, so the ticket call was not started' } }
-    & (Get-Module VenueChain) { param($b, $a, $s) Invoke-VenueBoundedRead -ScriptText ('param($a) Import-Module $a.m -Force -DisableNameChecking; ' + $b) -Argument $a -TimeoutSec $s } $Body ($Argument + @{ m = (Join-Path $here 'VenueChain.psm1') }) $Sec
+    # TAIL-1 r2 (pre-existing: pass 10 A3 / r9 A6): ONE elapsed-time bound per call. A stopwatch starts before the worker does and its end is the call's bound (or the room before -DeadlineUtc when that is less), so the
+    # worker's start-up is inside the bound instead of added before the wait, and an answer seen after the end is never acted on (Invoke-VenueBoundedRead -Clock/-EndSec)
+    $callClock = [Diagnostics.Stopwatch]::StartNew()
+    $callEndSec = [Math]::Min($Sec, ($deadline - [DateTime]::UtcNow).TotalSeconds)
+    & (Get-Module VenueChain) { param($b, $a, $s, $c, $e) Invoke-VenueBoundedRead -ScriptText ('param($a) Import-Module $a.m -Force -DisableNameChecking; ' + $b) -Argument $a -TimeoutSec $s -Clock $c -EndSec $e -EndIsBoundEnd } $Body ($Argument + @{ m = (Join-Path $here 'VenueChain.psm1') }) $Sec $callClock $callEndSec
 }
 
 function Disable-RunDirWrites([string]$Why) {
