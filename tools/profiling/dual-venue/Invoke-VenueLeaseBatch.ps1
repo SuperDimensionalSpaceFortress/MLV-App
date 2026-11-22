@@ -1436,7 +1436,8 @@ function Get-LegSpecTelemetryArm([string]$Path) {
         if ($r.state -ceq 'TIMEOUT') { return [pscustomobject]@{ arm = 'UNKNOWN'; source = 'spec'; reason = 'the spec read for the arm did not answer within the time left before -DeadlineUtc'; readTimedOut = $true } }
         if ($r.state -ceq 'OK') {
             $judged = if ($script:SpecBudgetSha256 -is [hashtable] -and $script:SpecBudgetSha256.ContainsKey($Path)) { [string]$script:SpecBudgetSha256[$Path] } else { '' }
-            if ($judged -and ((Get-BytesSha256 ([byte[]]$r.bytes)) -ceq $judged)) { $spec = [Text.Encoding]::UTF8.GetString([byte[]]$r.bytes) | ConvertFrom-Json }
+            # r14 (sol r13 B4): a spec that repeats a key throws here (caught below: the arm is UNKNOWN), never collapses to the last value
+            if ($judged -and ((Get-BytesSha256 ([byte[]]$r.bytes)) -ceq $judged)) { $specText = [Text.Encoding]::UTF8.GetString([byte[]]$r.bytes); Assert-FpsJsonNoRepeatedKey $specText $Path; $spec = $specText | ConvertFrom-Json }
             else { return (New-FpsArm 'UNKNOWN' 'spec' 'the spec bytes read for the arm are not the bytes the preflight judged and the leg is bound to (changed between reads, or no judged digest)') }
         }
     } catch { $spec = $null }
@@ -1639,7 +1640,8 @@ if ($legPlanMode) {
         # r19 (sol r18 B2 sibling sweep): the plan's read is bounded by the room before -DeadlineUtc too; no answer in it is the typed LEG_PLAN_UNREADABLE, never a read past the deadline
         $planRead = Read-SpecBytesWithin $planPath (Get-SpecReadBoundSec)
         if ($planRead.state -ceq 'TIMEOUT') { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' could not be read within the time left before -DeadlineUtc" }
-        $doc = try { if ($planRead.state -cne 'OK') { throw [string]$planRead.error }; [IO.StreamReader]::new([IO.MemoryStream]::new([byte[]]$planRead.bytes), $true).ReadToEnd() | ConvertFrom-Json -NoEnumerate } catch { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' is not JSON: $($_.Exception.Message)" }
+        # r14 (sol r13 B4): a plan that repeats a key (a `purpose` written twice) is LEG_PLAN_UNREADABLE, never the last value the parser kept
+        $doc = try { if ($planRead.state -cne 'OK') { throw [string]$planRead.error }; $planText = [IO.StreamReader]::new([IO.MemoryStream]::new([byte[]]$planRead.bytes), $true).ReadToEnd(); Assert-FpsJsonNoRepeatedKey $planText $planPath; $planText | ConvertFrom-Json -NoEnumerate } catch { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' is not JSON: $($_.Exception.Message)" }
         # Dot B1: the entries are kept exactly as written, nulls included, so each is shape-checked at its ORIGINAL position below. Nothing here filters, unrolls or wraps them.
         $rawItems = $null
         if ($doc -is [array]) { $rawItems = $doc }

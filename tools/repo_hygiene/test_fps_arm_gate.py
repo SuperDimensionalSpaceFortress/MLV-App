@@ -542,6 +542,21 @@ class LeaseBatchPlanCheckerTests(unittest.TestCase):
                               capture_output=True, text=True, timeout=300, creationflags=_NO_WINDOW)
 
     @requires_windows_pwsh
+    def test_sol_r13_b4_a_plan_that_repeats_its_purpose_is_unreadable_not_the_last_value(self) -> None:
+        # r14 (sol r13 B4): ConvertFrom-Json kept the LAST `purpose` ('stage-attribution'), so an fps-ab plan with a HEAVY item skipped the HEAVY refusal. A plan that repeats a key is refused.
+        spec = self.spec("fx-dup", {"telemetryArm": "HEAVY"})
+        leg = json.dumps({"legSpec": str(spec), "backend": "cpu", "sourceCommit": self.COMMIT, "buildManifestSha256": self.MANIFEST, "arm": "A"})
+        plan_path = self.tmp / "plan.json"
+        plan_path.write_text('{"schema":"mlv-app/venue-lease-leg-plan/v1","purpose":"fps-ab","purpose":"stage-attribution","legs":[' + leg + "]}", encoding="utf-8")
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(LEASE_BATCH_SCRIPT), "-LegPlan", str(plan_path), "-RunDir", str(self.tmp / "run"),
+                            "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.tmp / "share"), "-DeadlineUtc", "2099-01-01T00:00:00Z"],
+                           capture_output=True, text=True, timeout=300, creationflags=_NO_WINDOW)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=LEG_PLAN_UNREADABLE ", r.stderr)
+        self.assertIn("FPS_JSON_REPEATED_KEY", r.stderr)
+        self.assertFalse((self.tmp / "claims").exists() and any((self.tmp / "claims").iterdir()), "no claim was written")
+
+    @requires_windows_pwsh
     def test_fps_ab_with_a_heavy_leg_is_refused_before_any_claim(self) -> None:
         light = self.spec("fx-light", {"telemetryArm": "LIGHT", "presentTrace": True})
         heavy = self.spec("fx-heavy", {"telemetryArm": "HEAVY"})
@@ -787,6 +802,16 @@ class CudaPlaybackAbRequireImprovementBlockTests(_Probe):
             "$SeparateCandidateSpeedRun = $true\n$RequireCandidateImprovesPresentedFps = $true\n$proofFailures = @()\n"
             "$fpsVerdict = Get-PlaybackAbFpsVerdict -BaselineSummary $baselineSummary -CandidateSummary $candidateSummary -CandidateSpeedSummary $candidateSpeedSummary -SeparateCandidateSpeedRun\n"
             + block + "\nforeach ($f in $proofFailures) { Write-Host ('FAIL=' + $f) }\nWrite-Host ('COUNT=' + @($proofFailures).Count)\n")
+
+    def test_adversary_r14_a1_a_smoke_result_with_record_level_observer_evidence_is_not_light(self) -> None:
+        # r14 (adversary r14 A1, the sol r13 B2 class at the CUDA A/B reader): Get-SmokeSummaryTelemetryArm classified the smoke result from its launch block alone, and Read-SmokeSummary then
+        # dropped the record-level observerControls, so the saved pair was allowed. The whole result is judged now; a plain LIGHT result still reads LIGHT.
+        launch = f"launch = [pscustomobject]@{{ environment = [pscustomobject]@{{ {LIGHT_LAUNCH_ENV_PS} }}; arguments = @({PRODUCER_ARGS_PS}) }}"
+        out = self.ok(
+            f"Write-Host ('PLAIN=' + (Get-SmokeSummaryTelemetryArm ([pscustomobject]@{{ {launch} }})).arm)\n"
+            f"Write-Host ('OC=' + (Get-SmokeSummaryTelemetryArm ([pscustomobject]@{{ observerControls = [pscustomobject]@{{ utilSample = $true }}; {launch} }})).arm)\n"
+            f"Write-Host ('SWITCH=' + (Get-SmokeSummaryTelemetryArm ([pscustomobject]@{{ firstPresentCapture = $true; {launch} }})).arm)\n")
+        self.assertEqual(out.split(), ["PLAIN=LIGHT", "OC=UNKNOWN", "SWITCH=UNKNOWN"])
 
     def test_a_separate_speed_run_is_judged_on_the_speed_pair_not_the_aggregate(self) -> None:
         # r5 (adversary A5): the parity candidate is HEAVY (the validation observer), the speed run is LIGHT; the requirement compares baseline with the speed run, so the parity pair's refusal
@@ -1693,10 +1718,10 @@ class ObserverControlTests(_Probe):
         self.assertNotIn('Get-FpsArmFromLaunch (Get-NestedValue', compare_source)
         self.assertIn("$beforeArm = Get-FpsArmFromSmokeRecord $BeforeSmoke", compare_source)
         self.assertIn("$afterArm = Get-FpsArmFromSmokeRecord $AfterSmoke", compare_source)
-        for script in (CUDA_AB_SCRIPT,):
-            source = script.read_text(encoding="utf-8")
-            self.assertNotIn('Get-FpsArmFromLaunch (Get-NestedValue', source, script.name)
-            self.assertIn('Get-FpsArmFromLaunch (Get-FaProp', source, script.name)
+        # r14 (adversary r14 A1): the CUDA A/B smoke reader judges the whole result through the same module reader
+        cuda_source = CUDA_AB_SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn('Get-FpsArmFromLaunch (Get-NestedValue', cuda_source)
+        self.assertIn("Get-FpsArmFromSmokeRecord $Json", cuda_source)
         out = self.ok("$j = ConvertFrom-Json '{\"launch\":[{\"environment\":{\"MLVAPP_PLAYBACK_SMOKE_TELEMETRY\":\"1\",\"MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG\":\"1\"},\"arguments\":[]}]}'\n"
                       "Write-Host ('ARM=' + (Get-FpsArmFromLaunch (Get-FaProp $j 'launch')).arm)")
         self.assertEqual(out.strip(), "ARM=UNKNOWN")
@@ -1817,6 +1842,39 @@ class LightShapeAllowlistTests(_Probe):
         lines = dict(line.split("=", 1) for line in out.split())
         self.assertIn(lines["JSON"], ("UNKNOWN", "PARSE_REFUSED"))
         self.assertEqual((lines["LIST"], lines["LISTSAME"]), ("UNKNOWN", "UNKNOWN"))
+
+    def test_sol_r13_b4_a_repeated_json_key_is_refused_before_the_parser_keeps_one_value(self) -> None:
+        # r14 (sol r13 B4, adversary r14 A2): ConvertFrom-Json keeps the LAST value of a repeated key, so a launch whose opt-out was written "0" then "1" read LIGHT. The raw text is checked first.
+        dup = ('{"launch":{"environment":{"MLVAPP_PLAYBACK_SMOKE_TELEMETRY":"1","MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG":"0",'
+               '"MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG":"1","MLVAPP_CRASH_FORENSICS_LOG_DIR":"C:\\\\logs"},"arguments":' + PRODUCER_ARGS_JSON + '}}')
+        clean = dup.replace('"MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG":"0",', "")
+        case_dup = clean.replace('"MLVAPP_CRASH_FORENSICS_LOG_DIR"', '"mlvapp_playback_smoke_telemetry":"1","MLVAPP_CRASH_FORENSICS_LOG_DIR"')
+        nested = '[{"a":1},{"b":{"c":[{"k":1,"k":2}]}}]'
+        body = ""
+        for name, text in (("DUP", dup), ("CLEAN", clean), ("CASE", case_dup), ("NESTED", nested), ("BAD", "{oops")):
+            body += f"$t = @'\n{text}\n'@\nWrite-Host ('{name}=' + $(if ($null -eq (Get-FpsJsonRepeatedKeyProblem $t)) {{ 'none' }} else {{ 'repeat' }}))\n"
+        body += (f"$t = @'\n{clean}\n'@\nWrite-Host ('CLEANARM=' + (Get-FpsArmFromSmokeRecord ($t | ConvertFrom-Json)).arm)\n"
+                 f"$t = @'\n{dup}\n'@\ntry {{ Assert-FpsJsonNoRepeatedKey $t 'probe'; Write-Host 'ASSERT=passed' }} catch {{ Write-Host ('ASSERT=' + $_.Exception.Message.Split(':')[0]) }}\n")
+        lines = dict(line.split("=", 1) for line in self.ok(body).split())
+        self.assertEqual(lines, {"DUP": "repeat", "CLEAN": "none", "CASE": "repeat", "NESTED": "repeat", "BAD": "repeat", "CLEANARM": "LIGHT", "ASSERT": "FPS_JSON_REPEATED_KEY"})
+
+    def test_every_reader_of_a_judged_record_checks_for_a_repeated_key_before_it_parses(self) -> None:
+        # the class guard for sol r13 B4 / adversary r14 A2: each parse site of a record, smoke result, summary or plan the arm gate judges calls Assert-FpsJsonNoRepeatedKey on the raw text
+        # before ConvertFrom-Json, so a new reader of one of those files that parses directly is a decision someone makes here.
+        sites = {
+            "compare-release-gui-smoke-ab.ps1": ["Assert-FpsJsonNoRepeatedKey $raw $resolved"],
+            "run-release-cuda-playback-ab.ps1": ["Assert-FpsJsonNoRepeatedKey $raw $Path"],
+            "compare-machine-perf.ps1": ["Assert-FpsJsonNoRepeatedKey $raw $resolved", 'Assert-FpsJsonNoRepeatedKey $line "${resolved}:$lineNumber"'],
+            "summarize-local-cuda-proof.ps1": ["Assert-FpsJsonNoRepeatedKey $summaryRaw $summaryFullPath"],
+            "run-local-cuda-playback-dng-smoke.ps1": ["Assert-FpsJsonNoRepeatedKey $playbackAbRaw $playbackAbSummaryPath"],
+            "dual-venue/Invoke-VenueLeaseBatch.ps1": ["Assert-FpsJsonNoRepeatedKey $specText $Path", "Assert-FpsJsonNoRepeatedKey $planText $planPath"],
+        }
+        # (the other ConvertFrom-Json reads in these scripts are not judged by the arm gate: a screenshot manifest, a logged-metadata line, a clip descriptor, the single-leg playback smoke
+        # summary and the CDNG matrix summary)
+        for rel, calls in sites.items():
+            source = (PROFILING / rel).read_text(encoding="utf-8")
+            for call in calls:
+                self.assertIn(call, source, rel)
 
     def test_the_whole_table_is_light_and_nothing_added_to_it_is(self) -> None:
         # the full producer shape (every table environment row at the value the producers emit) is LIGHT, and each single outside addition (a name, a value, a flag) turns it UNKNOWN

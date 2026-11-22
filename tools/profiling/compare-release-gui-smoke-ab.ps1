@@ -28,7 +28,9 @@ function Read-SmokeJson {
     if (-not (Test-Path -LiteralPath $resolved)) {
         throw "Smoke JSON not found: $resolved"
     }
-    Get-Content -LiteralPath $resolved -Raw | ConvertFrom-Json -Depth 100
+    $raw = Get-Content -LiteralPath $resolved -Raw
+    Assert-FpsJsonNoRepeatedKey $raw $resolved   # r14 (sol r13 B4, adversary r14 A2): a repeated key is refused, never collapsed to its last value
+    $raw | ConvertFrom-Json -Depth 100
 }
 
 function Resolve-ExistingFileBinding {

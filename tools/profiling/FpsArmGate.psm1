@@ -492,6 +492,57 @@ function Get-FpsArmFromSmokeRecord {
     $arm
 }
 
+function Get-FpsJsonRepeatedKeyProblem {
+    <#
+    .SYNOPSIS
+    r14 (sol r13 B4, adversary r14 A2): ConvertFrom-Json keeps only the LAST value of a key an object repeats, so a recorded opt-out written "0" then "1" (or a plan purpose written twice) reached
+    the gate as one clean value and ConvertTo-FpsEnvMap's repeat check never saw it. This reads the RAW text with System.Text.Json (whose object enumeration keeps every repeat) and returns
+    "<path> repeats the key '<name>'" for the first object that names a key twice (names compared ignoring case, as the Windows environment and ConvertTo-FpsEnvMap do), else $null. Text
+    the strict reader cannot parse is a problem too (fail closed): it cannot be shown free of repeats.
+    #>
+    param([AllowNull()][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $options = [System.Text.Json.JsonDocumentOptions]::new()
+    $options.AllowTrailingCommas = $true
+    $options.CommentHandling = [System.Text.Json.JsonCommentHandling]::Skip
+    $options.MaxDepth = 256
+    $doc = $null
+    try { $doc = [System.Text.Json.JsonDocument]::Parse($Text, $options) } catch { return "the JSON cannot be read strictly enough to rule out a repeated key ($($_.Exception.Message))" }
+    try {
+        $pending = [System.Collections.Generic.Stack[object]]::new()
+        $pending.Push(@('$', $doc.RootElement))
+        while ($pending.Count -gt 0) {
+            $item = $pending.Pop()
+            $path = [string]$item[0]
+            $element = $item[1]
+            if ($element.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+                $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                foreach ($property in $element.EnumerateObject()) {
+                    if (-not $seen.Add($property.Name)) { return "$path repeats the key '$($property.Name)'" }
+                    $kind = $property.Value.ValueKind
+                    if ($kind -eq [System.Text.Json.JsonValueKind]::Object -or $kind -eq [System.Text.Json.JsonValueKind]::Array) { $pending.Push(@("$path.$($property.Name)", $property.Value)) }
+                }
+            } elseif ($element.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
+                $index = 0
+                foreach ($value in $element.EnumerateArray()) {
+                    $kind = $value.ValueKind
+                    if ($kind -eq [System.Text.Json.JsonValueKind]::Object -or $kind -eq [System.Text.Json.JsonValueKind]::Array) { $pending.Push(@("$path[$index]", $value)) }
+                    $index++
+                }
+            }
+        }
+    } finally { $doc.Dispose() }
+    $null
+}
+
+function Assert-FpsJsonNoRepeatedKey {
+    # Throws "FPS_JSON_REPEATED_KEY: <problem> (<label>)" when Get-FpsJsonRepeatedKeyProblem finds one; every reader that parses a record, a smoke result or a plan the arm gate judges calls this on
+    # the raw text first, so its own error path (a typed refusal, an UNKNOWN arm or a failed read) handles the repeat instead of a parser picking one value.
+    param([AllowNull()][string]$Text, [string]$Label = 'JSON')
+    $problem = Get-FpsJsonRepeatedKeyProblem $Text
+    if ($null -ne $problem) { throw "FPS_JSON_REPEATED_KEY: $problem ($Label)" }
+}
+
 function Get-FpsPairVerdict {
     <#
     .SYNOPSIS
@@ -576,4 +627,4 @@ function Get-FpsLegPlanRefusal {
     @('', 0, '')
 }
 
-Export-ModuleMember -Function Get-FpsObserverControls, Get-FpsLightShape, Get-FpsArmFromLegRecord, Get-FaProp, New-FpsArm, ConvertTo-FpsArmName, Get-FpsArmFromLegSpec, Get-FpsArmFromJobResult, Get-FpsArm, ConvertTo-FpsEnvMap, Get-FpsArmFromEnvironment, Get-FpsArmFromLaunch, Get-FpsArmFromSmokeRecord, Get-FpsPairVerdict, Get-FpsArmsVerdict, Get-FpsLegPlanRefusal
+Export-ModuleMember -Function Get-FpsObserverControls, Get-FpsLightShape, Get-FpsArmFromLegRecord, Get-FaProp, New-FpsArm, ConvertTo-FpsArmName, Get-FpsArmFromLegSpec, Get-FpsArmFromJobResult, Get-FpsArm, ConvertTo-FpsEnvMap, Get-FpsArmFromEnvironment, Get-FpsArmFromLaunch, Get-FpsArmFromSmokeRecord, Get-FpsJsonRepeatedKeyProblem, Assert-FpsJsonNoRepeatedKey, Get-FpsPairVerdict, Get-FpsArmsVerdict, Get-FpsLegPlanRefusal

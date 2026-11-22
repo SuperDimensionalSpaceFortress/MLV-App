@@ -477,7 +477,9 @@ if (!(Test-Path -LiteralPath $SummaryPath -PathType Leaf)) {
 }
 
 $summaryFullPath = (Resolve-Path -LiteralPath $SummaryPath).Path
-$summary = Get-Content -LiteralPath $summaryFullPath -Raw | ConvertFrom-Json -Depth 100
+$summaryRaw = Get-Content -LiteralPath $summaryFullPath -Raw
+Assert-FpsJsonNoRepeatedKey $summaryRaw $summaryFullPath   # r14 (sol r13 B4, adversary r14 A2): a repeated key is refused, never collapsed to its last value
+$summary = $summaryRaw | ConvertFrom-Json -Depth 100
 $failures = @($summary.failures | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
 $warnings = @($summary.warnings | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
 

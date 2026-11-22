@@ -333,8 +333,9 @@ function Get-SmokeSummaryTelemetryArm {
     # BENCH-LIGHT-ARM-GAIN-GATES-1: the telemetry arm a smoke leg ran, from the launch block its own result recorded (result.launch: environment AND the argument
     # list, which can carry --stage-log). A result with no recorded launch block, environment or arguments (older binary, missing file) is UNKNOWN, never LIGHT.
     param([object]$Json)
-    # Get-FaProp keeps a one-element "launch" array whole (Get-NestedValue's output would unroll it into the object inside and classify it LIGHT; adversary r5 A6)
-    Get-FpsArmFromLaunch (Get-FaProp $Json "launch")
+    # Get-FaProp keeps a one-element "launch" array whole (Get-NestedValue's output would unroll it into the object inside and classify it LIGHT; adversary r5 A6): the module reader does that.
+    # r14 (adversary r14 A1, the sol r13 B2 class): the WHOLE smoke record is judged, so a LIGHT launch beside a record-level observerControls entry is not LIGHT (Get-FpsArmFromSmokeRecord).
+    Get-FpsArmFromSmokeRecord $Json
 }
 
 function Get-PlaybackAbFpsVerdict {
@@ -851,7 +852,9 @@ function Read-SmokeSummary {
         }
     }
 
-    $json = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -Depth 100
+    $raw = Get-Content -LiteralPath $Path -Raw
+    Assert-FpsJsonNoRepeatedKey $raw $Path   # r14 (sol r13 B4, adversary r14 A2): a repeated key is refused, never collapsed to its last value
+    $json = $raw | ConvertFrom-Json -Depth 100
     $hostLoad = Get-NestedValue $json "hostLoad"
     $hostLoadFields = Get-SmokeSummaryHostLoadFields -HostLoad $hostLoad
     $hostLoadProvisional = $hostLoadFields.provisional

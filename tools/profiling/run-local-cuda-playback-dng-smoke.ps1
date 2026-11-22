@@ -33,6 +33,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "cuda-backend-architecture.ps1")
+Import-Module (Join-Path $PSScriptRoot "FpsArmGate.psm1") -Force   # r14 (adversary r14 A2): the repeated-key check for the playback A/B summary this wrapper reads
 
 if ($Seconds -lt 1) {
     throw "-Seconds must be >= 1."
@@ -870,7 +871,9 @@ if (-not $SkipPlaybackAb -and $failures.Count -eq 0) {
     $playbackAbChild = Invoke-ChildPowerShell -Arguments $playbackAbArgs
     $playbackAbSummaryPath = Join-Path $playbackAbRoot "summary.json"
     if (Test-Path -LiteralPath $playbackAbSummaryPath) {
-        $playbackAb = Get-Content -LiteralPath $playbackAbSummaryPath -Raw | ConvertFrom-Json -Depth 100
+        $playbackAbRaw = Get-Content -LiteralPath $playbackAbSummaryPath -Raw
+        Assert-FpsJsonNoRepeatedKey $playbackAbRaw $playbackAbSummaryPath   # r14 (sol r13 B4, adversary r14 A2): a repeated key is refused, never collapsed to its last value
+        $playbackAb = $playbackAbRaw | ConvertFrom-Json -Depth 100
     }
     else {
         Add-Failure $failures "Playback A/B did not write $playbackAbSummaryPath."

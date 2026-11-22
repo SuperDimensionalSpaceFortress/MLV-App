@@ -45,10 +45,23 @@ function Read-JsonRecords {
         throw "Input JSON is empty: $resolved"
     }
 
+    # r14 (sol r13 B4, adversary r14 A2): a repeated key is refused, never collapsed to its last value. A text that parses as ONE JSON document is checked whole (and the refusal is thrown
+    # outside the try, so it is not mistaken for a JSONL file); a JSONL text is checked line by line below.
+    $wholeParsed = $false
+    $wholeJson = $null
     try {
+        $wholeJson = ($raw | ConvertFrom-Json -Depth 100)
+        $wholeParsed = $true
+    }
+    catch { }
+    if ($wholeParsed) {
+        Assert-FpsJsonNoRepeatedKey $raw $resolved
+    }
+    try {
+        if (-not $wholeParsed) { throw 'not one JSON document' }
         return @([pscustomobject]@{
             source = $resolved
-            json = ($raw | ConvertFrom-Json -Depth 100)
+            json = $wholeJson
         })
     }
     catch {
@@ -60,6 +73,7 @@ function Read-JsonRecords {
                 continue
             }
             try {
+                Assert-FpsJsonNoRepeatedKey $line "${resolved}:$lineNumber"
                 $records += [pscustomobject]@{
                     source = "${resolved}:$lineNumber"
                     json = ($line | ConvertFrom-Json -Depth 100)
