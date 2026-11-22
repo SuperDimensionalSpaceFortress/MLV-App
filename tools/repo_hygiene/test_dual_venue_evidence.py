@@ -279,7 +279,7 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *FSTOGGLE_LEGS)
 EXPORT_VENUE_LEGS = tuple(f"legs/m16-{clip}-export-{fmt}.json" for clip in ("1243", "1456") for fmt in ("cdng-lossless", "prores"))
 SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in EXPORT_VENUE_LEGS if rel not in SHIPPED_LEGS))
 # M16-1457-VENUE-BASELINE-DRIFT-1 r3: the thread-cap sweep (worker cap 4 / 8 / 12 / 16, each its own spec; the existing no-cap m16-1457-headroom-unpaced-fullscreen-s1 is the
-# 'auto' arm, NOT a 16-worker arm: the app picks 12 on the Bachelor host, adversary A2) and the P-core-only arm
+# 'auto' arm: the app chooses its own worker count (16 on Bachelor's 20 logical CPUs in the 2026-11-22 r3 run logs, but nothing in the spec pins it), so the 16 arm is explicit too) and the P-core-only arm
 # of the Bachelor baseline-drift bench, keyed to the leg each one copies. Unpaced swap-interval-0 legs, so they carry presentTearingExpectedReason like their source.
 # DriftLegSpecTests pins the shape: only legId, card, generatorArgs.playbackMaxThreads (and, for the P-core arm, the affinity keys and two criteria) differ.
 DRIFT_LEGS = {"legs/m16-1457-drift-t4-unpaced-fullscreen-s1.json": "legs/m16-1457-headroom-unpaced-fullscreen-s1.json",
@@ -19590,8 +19590,9 @@ class DriftLegSpecTests(unittest.TestCase):
         self.assertEqual(int(template["generatorArgs"]["benchAffinityMask"], 16) & int(template["generatorArgs"]["corePartitionHelperMask"], 16), 0)
 
     def test_the_sweep_names_every_cap_it_compares_and_never_leans_on_the_no_cap_headroom_leg(self) -> None:
-        """r3 adversary A2: the tracked no-cap headroom leg lets the app pick its own worker count (12 on the Bachelor host), so it is NOT a 16-worker arm.
-        Every cap the sweep compares (4, 8, 12 and 16) is its own spec carrying that cap; the no-cap leg stays the 'auto' arm."""
+        """r3 adversary A2: the tracked no-cap headroom leg lets the app pick its own worker count (which depends on the host's logical CPUs; the r3 run logs
+        show 16 on Bachelor's 20, but the spec does not pin it), so it is not a pinned 16-worker arm. Every cap the sweep compares (4, 8, 12 and 16) is its
+        own spec carrying that cap; the no-cap leg stays the 'auto' arm."""
         caps = {rel: self.load(rel)["generatorArgs"].get("playbackMaxThreads") for rel in DRIFT_LEGS if "-pcore" not in rel}
         self.assertEqual(sorted(caps.values()), [4, 8, 12, 16], caps)
         self.assertNotIn("playbackMaxThreads", self.load("legs/m16-1457-headroom-unpaced-fullscreen-s1.json")["generatorArgs"])
