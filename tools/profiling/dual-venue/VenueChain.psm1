@@ -499,11 +499,16 @@ function Update-VenueTicket {
             $want = [string]$Ticket.nonce
             if ($null -ne $j -and $want -ceq '' -and (Test-VenueAdoptedByName $Ticket $j)) { $want = [string]$j.nonce; try { $Ticket.nonce = $want } catch { $null = $_ } }   # r8 rule 1: a ticket adopted by NAME (its file was busy) takes its nonce from the file, once the file proves to be this owner's
             if ($null -eq $j -or $want -ceq '' -or [string]$j.nonce -cne $want) { return 'LOST' }
-            $fields = [ordered]@{
-                schema = [string]$j.schema; venue = [string]$j.venue; ownerPid = [int]$j.ownerPid; ownerCreatedUtc = (ConvertTo-VenueUtc $j.ownerCreatedUtc).ToString('o'); host = [string]$j.host
-                runDir = [string]$j.runDir; purpose = [string]$j.purpose; createdUtc = (ConvertTo-VenueUtc $j.createdUtc).ToString('o'); heartbeatUtc = $now.ToString('o')
-                staleAfterSec = $(if ($StaleAfterSec -gt 0) { $StaleAfterSec } else { [int]$j.staleAfterSec }); phase = $(if ($storedPhase) { $storedPhase } else { [string]$j.phase }); nonce = [string]$j.nonce
-            }
+            # TAIL-1 r2 (pre-existing: pass 10 A10): a body whose fields cannot be carried over (a createdUtc that is null or not a time) used to throw out of this function, through Request-VenueClaim, instead of ending the ticket's
+            # place: it is answered LOST, so the caller takes a new ticket (the unreadable one is reaped as any ticket nobody refreshes)
+            $fields = $null
+            try {
+                $fields = [ordered]@{
+                    schema = [string]$j.schema; venue = [string]$j.venue; ownerPid = [int]$j.ownerPid; ownerCreatedUtc = (ConvertTo-VenueUtc $j.ownerCreatedUtc).ToString('o'); host = [string]$j.host
+                    runDir = [string]$j.runDir; purpose = [string]$j.purpose; createdUtc = (ConvertTo-VenueUtc $j.createdUtc).ToString('o'); heartbeatUtc = $now.ToString('o')
+                    staleAfterSec = $(if ($StaleAfterSec -gt 0) { $StaleAfterSec } else { [int]$j.staleAfterSec }); phase = $(if ($storedPhase) { $storedPhase } else { [string]$j.phase }); nonce = [string]$j.nonce
+                }
+            } catch { return 'LOST' }
             try { Write-VenueTicketAtomic -Path $Ticket.path -Bytes (ConvertTo-VenueTicketBytes $fields) -Clock $clock -BudgetSec $BudgetSec }   # r7 A6: the budget is asked once more right before the publish
             catch { if (-not (Test-Path -LiteralPath $Ticket.path -PathType Leaf)) { return 'LOST' }; continue }
             return 'OK'
@@ -519,15 +524,19 @@ function Enter-VenueTicketLock {
     # junction spelling of the claim folder all reach the one lock file (a named mutex keyed on the path's spelling did not). A holder that dies releases it with its process; the file is left in place and never listed
     # (it is neither *.ticket.json nor a ticket temp). Works across sessions and over a shared claim folder. The directory must exist (a ticket is in it).
     param([Parameter(Mandatory)][string]$TicketPath, [int]$TimeoutMs = 1000)
+    # TAIL-1 r2 (pre-existing: pass 10 A4, pass 11 A3, r9 A5): the timeout is measured from the CALL, not from after the directory check (which can be slow on a share and used to be free time), and no
+    # attempt starts, and no sleep runs, past it
+    $clock = [Diagnostics.Stopwatch]::StartNew()
     $dir = $null
     try { $dir = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($TicketPath))) } catch { $dir = $null }
     if ([string]::IsNullOrEmpty($dir) -or -not (Test-Path -LiteralPath $dir -PathType Container)) { return $null }
     $lockPath = Join-Path $dir '.ticket.lock'
-    $clock = [Diagnostics.Stopwatch]::StartNew()
     while ($true) {
+        if ($clock.Elapsed.TotalMilliseconds -ge $TimeoutMs) { return $null }   # no attempt starts at or after the timeout, the first one included
         try { return [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
         catch { if ($clock.Elapsed.TotalMilliseconds -ge $TimeoutMs) { return $null } }
-        Start-Sleep -Milliseconds 15
+        $napMs = [int][Math]::Floor([Math]::Min(15.0, [Math]::Max(0.0, $TimeoutMs - $clock.Elapsed.TotalMilliseconds)))   # never past what is left of the timeout
+        if ($napMs -gt 0) { Start-Sleep -Milliseconds $napMs }
         if ($clock.Elapsed.TotalMilliseconds -ge $TimeoutMs) { return $null }   # r8 rule 6: no attempt starts after the timeout (the budget of an update): the lock may have been released during the sleep
     }
 }
