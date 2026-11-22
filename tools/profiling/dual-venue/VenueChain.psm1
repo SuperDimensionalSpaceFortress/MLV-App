@@ -329,6 +329,7 @@ function Get-VenueTicketStaleReason {
     if (-not [int]::TryParse([string]$Ticket.ownerPid, [ref]$pidValue) -or $pidValue -le 0) { return 'unreadable' }
     $created = ConvertTo-VenueUtc $Ticket.ownerCreatedUtc
     $beat = ConvertTo-VenueUtc $Ticket.heartbeatUtc
+    if ($null -eq (ConvertTo-VenueUtc $Ticket.createdUtc)) { return 'unreadable' }   # TAIL-1 r2 pass 2 A1: a refresh cannot carry a ticket whose createdUtc is not a time over (Update-VenueTicket answers LOST), so that ticket must not stay live beside its replacement
     $after = 0.0
     if ($null -eq $created -or $null -eq $beat -or -not [double]::TryParse([string]$Ticket.staleAfterSec, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$after)) { return 'unreadable' }
     if (-not [double]::IsFinite($after) -or $after -le 0) { return 'unreadable' }   # TAIL-1 r2 (pre-existing: pass 10 A11): the JSON string NaN or Infinity parses, and NaN / Infinity made "heartbeat age greater than the window" false for ever: a lifetime that is not a finite positive number is unreadable
@@ -853,9 +854,10 @@ function Invoke-VenueLateRelease {
     abandoned and counted when it does not answer, so Complete-VenueProcess exits at once). A full call may run to what is left of -BoundSec plus -CallCapSec (the worker's start-up and one healthy call);
     the probe to -ProbeCapSec. A call that never returns therefore ends this function by BoundSec + CallCapSec + ProbeCapSec at the latest.
     #>
-    # TAIL-1 r2 A6: a cap that is not a finite number of seconds, or is negative, is REFUSED (a NaN bound used to bind and die in an integer conversion before the probe); a cap under one second is HONOURED (below)
+    # TAIL-1 r2 A6 (+ pass 2 A2): a cap that is not a finite number of seconds, is negative, or is over an hour is REFUSED (a NaN bound used to bind and die in an integer conversion before the probe, and so did one of 3,000,000 s);
+    # a cap under one second is HONOURED (below)
     param([Parameter(Mandatory)][string]$Venue, [Parameter(Mandatory)][string]$Nonce, [string]$ClaimDir = '',
-        [ValidateScript({ [double]::IsFinite($_) -and $_ -ge 0 })][double]$BoundSec = 0.75, [ValidateScript({ [double]::IsFinite($_) -and $_ -ge 0 })][double]$CallCapSec = 1.5, [ValidateScript({ [double]::IsFinite($_) -and $_ -ge 0 })][double]$ProbeCapSec = 1.0,
+        [ValidateScript({ [double]::IsFinite($_) -and $_ -ge 0 -and $_ -le 3600 })][double]$BoundSec = 0.75, [ValidateScript({ [double]::IsFinite($_) -and $_ -ge 0 -and $_ -le 3600 })][double]$CallCapSec = 1.5, [ValidateScript({ [double]::IsFinite($_) -and $_ -ge 0 -and $_ -le 3600 })][double]$ProbeCapSec = 1.0,
         [scriptblock]$Call = $null, [scriptblock]$Clock = $null, [scriptblock]$Sleep = $null)
     $released = @('RELEASED', 'ABSENT', 'NOT_OURS')
     if ($null -eq $Call) {
@@ -888,8 +890,15 @@ function Invoke-VenueLateRelease {
         # the probe is made at the END of the reserve, as the comment above says, never earlier
         $untilBound = $BoundSec - (& $Clock)
         if ($untilBound -gt 0) { & $Sleep ([int][Math]::Ceiling($untilBound * 1000.0)) }
-        $probed = $true
-        try { $answer = [string](& $Call 1 $ProbeCapSec) } catch { $answer = 'ERROR' }
+        # pass 2 A3: the whole function has ONE end (bound + the call's cap + the probe's cap). A worker's start-up can use the time itself (a descheduled thread), so the probe is given only what is left of that end and
+        # is not started at all when none is
+        $hardEnd = $BoundSec + $CallCapSec + $ProbeCapSec
+        $probeSec = [Math]::Min($ProbeCapSec, $hardEnd - (& $Clock))
+        if ($probeSec -le 0) { $answer = 'NO_ANSWER' }
+        else {
+            $probed = $true
+            try { $answer = [string](& $Call 1 $probeSec) } catch { $answer = 'ERROR' }
+        }
     }
     [pscustomobject]@{ answer = $answer; tries = $tries; probed = $probed; endSec = (& $Clock) }
 }
