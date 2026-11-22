@@ -2499,6 +2499,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         if ($holder -cne $lastHolder) { LogBest "CLAIM_HELD batch=$batchNo state=$($req.state) holder $holder -> wait$(if ($script:batchTicket -and $null -ne $req.PSObject.Properties['position']) { " position=$($req.position)/$(@($req.queue).Count)" })"; $lastHolder = $holder }
         if ([DateTime]::UtcNow.AddSeconds($ClaimPollSec) -ge $deadline) { break }
         Invoke-StrandedTicketRetry 'claim-wait'
+        # TAIL-1 r2 (pre-existing: pass 11 A4 / pass 10 A2): the stranded-ticket retry above takes time of its own (a removal worker up to 5 s) AFTER the room check, so the room is asked again: a poll sleep that no longer fits before the deadline is not started
+        if ([DateTime]::UtcNow.AddSeconds($ClaimPollSec) -ge $deadline) { break }
         Start-Sleep -Seconds $ClaimPollSec
         # r3 (sol r2 B-01 class sweep): a wakeup that came late starts no request after the deadline. This poll's pass answered, so DEADLINE's line and receipt may write.
         if ([DateTime]::UtcNow -ge $deadline) { break }
