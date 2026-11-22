@@ -4518,22 +4518,25 @@ $script:ExportEvidenceFiles = @('summary.json', 'batch.log', 'export-profile.jso
 # slack two clocks and rounding can honestly show (5 % + 1 ms); a pair whose parent or child is wholly absent is skipped (a stage the app did not run is permitted).
 $script:ExportStageContainTolerance = 1.05
 $script:ExportStageContainSlackMs = 1.0
-# (EXPORT-CDNG-TOTAL-CONTAINMENT-1, adversary A2: a figure AT the limit is inside it; the binary product 40.00046 * 1.05 + 1 is 43.000482999999996, a hair under the decimal 43.000483, so a comparison
-# adds this far-below-the-precision-of-a-timing epsilon, and no real overrun, which is at least a microsecond in these figures (the writers emit six decimals), is hidden by it)
-$script:ExportStageContainEpsilonMs = 1e-9
-# (EXPORT-CDNG-TOTAL-CONTAINMENT-1 r2 fix 1, adversary pass A2 + A3 on 62dff0fa: every containment comparison is made in [decimal], on figures QUANTIZED to the 6 decimals the writers emit (%.6f), so
-# (A2) a figure exactly at the decimal limit is inside it at ANY magnitude (a binary double product is several ulps past the decimal at 2e7 ms, and a double mean of repeated decimals is a hair off),
-# and (A3) a mean a sub-precision hair past the limit is accepted, as the means rounded to that precision were before this card; rounding is monotone, so a value at or inside the limit is never
-# refused by it, and an overrun of a full microsecond still is.)
+# (EXPORT-CDNG-TOTAL-CONTAINMENT-1, adversary A2: a figure AT the limit is inside it; the binary product 40.00046 * 1.05 + 1 is 43.000482999999996, a hair under the decimal 43.000483, which is why
+# the comparison is in [decimal] below; the one epsilon, $script:ExportStageContainEpsilonD, is documented with it)
+# (EXPORT-CDNG-TOTAL-CONTAINMENT-1 r2 fix 1, adversary pass A2 + A3 on 62dff0fa: every containment comparison is made in [decimal], so (A2) a figure exactly at the decimal limit is inside it at ANY
+# magnitude (a binary double product is several ulps past the decimal at 2e7 ms, and a double mean of repeated decimals is a hair off), and (A3) a mean a sub-precision hair past the limit is
+# accepted. r3 B1: that hair is now ONE documented epsilon on the unrounded comparison (below), not a rounding of both sides, which hid a full emitted increment.)
 $script:ExportStageContainToleranceD = [decimal]1.05
 $script:ExportStageContainSlackD = [decimal]1.0
-$script:ExportStageContainEpsilonD = [decimal]0.000000001
+# (EXPORT-CDNG-TOTAL-CONTAINMENT-1 r3 B1, sol r2 INV-4 on f755f502: rounding BOTH sides to 6 decimals before the compare let a mean over the limit by one FULL emitted increment pass, because
+# the limit and the mean rounded to the same figure (limit 101.8984375, mean 101.8984385, both 101.898438). The comparison is now on the UNROUNDED decimals against the exact limit plus ONE
+# epsilon, 4e-7 ms = four tenths of an emitted increment, the same on every side of every gate: a mean of figures the writers emit at 6 decimals is a hair off the figure it equals, by less
+# than half an increment (5e-7), so an overrun of less than four tenths of an increment is that hair (the r2 controls: 3e-7 over passes) and an overrun of half an increment or more is a
+# real one (5e-7 and 1e-6 over fail). A figure exactly AT the limit is inside it at any magnitude, as decimal arithmetic keeps it exact.)
+$script:ExportStageContainEpsilonD = [decimal]0.0000004
 
 function Test-DvExportBeyondTolerance {
-    # $true when $Child is past $Parent * 5 % + 1 ms (+ a nanosecond), both compared at 6 decimals in decimal arithmetic.
+    # $true when $Child is past $Parent * 5 % + 1 ms + the epsilon above: unrounded, in decimal arithmetic (never both sides rounded to the emitted precision first).
     param($Child, $Parent)
     $limit = [decimal]$Parent * $script:ExportStageContainToleranceD + $script:ExportStageContainSlackD + $script:ExportStageContainEpsilonD
-    [math]::Round([decimal]$Child, 6) -gt [math]::Round($limit, 6)
+    [decimal]$Child -gt $limit
 }
 
 function Get-DvTypeName {
@@ -4763,7 +4766,7 @@ function Get-DvExportContainmentProblem {
 function Get-DvExportWallContainmentProblem {
     param($WallSeconds, $Frames, [string]$StageName, $StageMeanMs)
     if ($null -eq $WallSeconds -or $null -eq $Frames -or [int64]$Frames -le 0 -or $null -eq $StageMeanMs) { return $null }
-    $wallPerFrame = [decimal]$WallSeconds * [decimal]1000 / [decimal]$Frames   # (unrounded and in decimal, as are the means: sol r1 B3; the comparison quantizes: Test-DvExportBeyondTolerance)
+    $wallPerFrame = [decimal]$WallSeconds * [decimal]1000 / [decimal]$Frames   # (unrounded and in decimal, as are the means: sol r1 B3; compared unrounded too: Test-DvExportBeyondTolerance)
     Get-DvExportContainmentProblem -Means @{ batch_wall_per_frame = $wallPerFrame; $StageName = $StageMeanMs } -Pairs @(, @($StageName, 'batch_wall_per_frame'))
 }
 
@@ -4789,7 +4792,7 @@ function Get-DvExportCdngTotalFrameProblems {
     $past = [System.Collections.Generic.List[string]]::new(); $beyond = [System.Collections.Generic.List[string]]::new(); $longer = [System.Collections.Generic.List[string]]::new()
     $worker = [System.Collections.Generic.List[string]]::new(); $workerOut = [System.Collections.Generic.List[string]]::new()
     $judged = 0
-    # (every comparison is Test-DvExportBeyondTolerance: decimal arithmetic on figures quantized to the writers' 6 decimals; the figures are [decimal] throughout. Adversary pass A2 on 62dff0fa.)
+    # (every comparison is Test-DvExportBeyondTolerance: unrounded decimal arithmetic against the exact limit plus one epsilon; the figures are [decimal] throughout. Adversary pass A2 on 62dff0fa; sol r2 B1.)
     $timing = { param($frame, $field) $v = Get-DvProp $frame $field; if ($null -ne $frame.PSObject.Properties[$field] -and $null -eq (Get-DvExportTimingProblem $v)) { [decimal][double]$v } else { $null } }
     foreach ($frame in @($Frames)) {
         $at = Get-DvProp $frame 'frame_index'
