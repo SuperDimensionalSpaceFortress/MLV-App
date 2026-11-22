@@ -50,6 +50,18 @@ QString dueWakeRepoSource( const QString & relative )
     return stream.readAll();
 }
 
+// CI-FLAKE-PLAYBACK-DUE-WAKE-R17A1-TIMING-1 r5 (20x run on a loaded host: the R17A1 sink test read 76.1-79.2 ms for an 80 ms
+// sleep in 9 of 20 runs, and R3A3 read under 140 ms for 150 ms once): the sleep's wait is MsgWaitForMultipleObjectsEx with a
+// whole-ms timeout, whose expiry is tick-granular, and the product does not re-read the clock on a timeout, so a sleep may end
+// up to one timer tick (15.625 ms by default; 16 with margin) before its requested time. The floor a sleep must reach is
+// therefore its request less that tick, never less than 1 ms: it still fails a sleep cut short at a dispatch or ended at ~0 ms,
+// and what pins the sleep not being cut short mid-way is the probe liveness check in the R17A1 fixture, not the wall floor.
+constexpr double kSleepTimerTickSlackMs = 16.0;
+double dueWakeSleepFloorMs( double requestedMs )
+{
+    return std::max( 1.0, requestedMs - kSleepTimerTickSlackMs );
+}
+
 QString functionBody( const QString & source, const QString & signature, const QString & nextSignature )
 {
     const int begin = source.indexOf( signature );
@@ -2312,7 +2324,7 @@ TEST(PlaybackDueWakeSend, OnlyAQueuedSentMessageEndsTheRunnerSleepAndAConsumedPo
     QElapsedTimer t;
     t.start();
     ASSERT_TRUE( wake.sleepForSmokeRunner( 20 ) == PlaybackDueWake::RunnerSleep::Slept );
-    ASSERT_TRUE( t.elapsed() >= 15 );
+    ASSERT_TRUE( static_cast<double>( t.elapsed() ) >= dueWakeSleepFloorMs( 20.0 ) );   // a 20 ms sleep, less one timer tick
     ASSERT_EQ( static_cast<quint64>( 0 ), wake.runnerSleepsWokenBySent() );
 #endif
 }
@@ -2347,7 +2359,7 @@ TEST(PlaybackDueWakeSend, G1_AForeignSentMessageInTheRunnerSleepIsNotAWakeAndThe
     sender.join();
     ASSERT_TRUE( sent.load() );
     ASSERT_TRUE( slept == PlaybackDueWake::RunnerSleep::Slept );      // not WokenBySent
-    ASSERT_TRUE( sleptMs >= 140 );                                     // the full interval, never cut short at ~15 ms
+    ASSERT_TRUE( static_cast<double>( sleptMs ) >= dueWakeSleepFloorMs( 150.0 ) );   // the full interval (less one timer tick), never cut short at ~15 ms
     ASSERT_EQ( static_cast<quint64>( 0 ), wake.runnerSleepsWokenBySent() );
     ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenOther() );
     ASSERT_EQ( 0, fired );
@@ -2445,7 +2457,7 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
     ASSERT_TRUE( sent.load() );
     ASSERT_EQ( 1, foreign.calls );
     ASSERT_TRUE( slept == PlaybackDueWake::RunnerSleep::Slept );
-    ASSERT_TRUE( sleptMs >= 140 );                                     // the cadence is unchanged: the full interval
+    ASSERT_TRUE( static_cast<double>( sleptMs ) >= dueWakeSleepFloorMs( 150.0 ) );   // the cadence is unchanged: the full interval (less one timer tick)
     // the handler ran as GUI work: a wake posted from it is not classed asleep, nor as a runner-sleep post
     ASSERT_TRUE( foreign.at.state == PlaybackGuiSleepTrace::State::Running );
     const PlaybackDueWakePostClass c = playbackDueWakeClassifyPost( foreign.at, foreign.handlerStartMs, foreign.handlerStartMs + 1.0 );
@@ -2604,7 +2616,7 @@ TEST(PlaybackDueWakeSend, R2A1_AStaleSentWakeInTheRunnerSleepIsNotHeldCountedOrA
     QElapsedTimer t;
     t.start();
     ASSERT_TRUE( wake.sleepForSmokeRunner( 60 ) == PlaybackDueWake::RunnerSleep::Slept );
-    ASSERT_TRUE( t.elapsed() >= 50 );                                  // the stale wake did not cut it short
+    ASSERT_TRUE( static_cast<double>( t.elapsed() ) >= dueWakeSleepFloorMs( 60.0 ) );   // the stale wake did not cut it short (60 ms less one timer tick)
     ASSERT_EQ( static_cast<quint64>( 0 ), wake.runnerSleepsWokenBySent() );
     ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenOther() );
     wake.dispatchSentMessages();
@@ -2676,7 +2688,7 @@ TEST(PlaybackDueWakeSend, G3_AFailedRunnerSleepWaitSleepsTheRestOfTheIntervalAnd
     QElapsedTimer t;
     t.start();
     ASSERT_TRUE( wake.sleepForSmokeRunner( 60 ) == PlaybackDueWake::RunnerSleep::Slept );
-    ASSERT_TRUE( t.elapsed() >= 50 );                                  // never ~0 ms
+    ASSERT_TRUE( static_cast<double>( t.elapsed() ) >= dueWakeSleepFloorMs( 60.0 ) );   // never ~0 ms (60 ms less one timer tick)
     ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepWaitFailures() );
     ASSERT_EQ( static_cast<quint64>( 0 ), wake.runnerSleepsWokenBySent() );
     wake.setRunnerSleepWaitFailsForTest( false );
@@ -2994,7 +3006,8 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     ASSERT_TRUE( w.chargedS[1] * 1000.0 <= returnedMs - handlerEndMs + 0.5 );
     ASSERT_TRUE( w.chargedS[0] * 1000.0 >= 10.0 );                     // the sender waits 20 ms after the entry stamp: only later
     // the sleep is never cut short at a dispatch: it runs the requested 80 ms (late only lengthens it)
-    ASSERT_TRUE( ( returnS - entryS ) * 1000.0 >= 79.0 );
+    // (r5: the floor is the request less one timer tick; a 20x run read 76.1-79.2 ms here, so the former 79.0 failed 9 of 20)
+    ASSERT_TRUE( ( returnS - entryS ) * 1000.0 >= dueWakeSleepFloorMs( 80.0 ) );
     // the segments and the dispatches tile the sleep: the dispatch account is exactly what the segments leave out (1e-8: the
     // sum is taken in another order than the reads, which costs a few ulps of a seconds-since-boot value)
     double dispatchSpanS = 0.0;
@@ -3017,7 +3030,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     ASSERT_TRUE( std::fabs( plain.chargedS[0] - ( g_r17A1Stamps[1] - g_r17A1Stamps[0] ) ) < 1e-9 );   // exactly entry to return
     ASSERT_TRUE( std::fabs( plain.firstStartS[0] - g_r17A1Stamps[0] ) < 1e-9 );                        // ...with the clock's own endpoints
     ASSERT_TRUE( std::fabs( plain.lastEndS[0] - g_r17A1Stamps[1] ) < 1e-9 );
-    ASSERT_TRUE( plain.chargedS[0] * 1000.0 >= 12.0 );                 // the requested 15 ms, never cut short (late only lengthens)
+    ASSERT_TRUE( plain.chargedS[0] * 1000.0 >= dueWakeSleepFloorMs( 15.0 ) );   // the requested 15 ms less one timer tick: never ~0 ms
     PlaybackDueWake postWake( nullptr, []() {}, PlaybackDueWakeDeliveryMode::Post );
     R17A1Windows none;
     ASSERT_TRUE( postWake.sleepForSmokeRunner( 1, &r17A1NowS, &r17A1Charge, &none ) == PlaybackDueWake::RunnerSleep::NotHandled );
