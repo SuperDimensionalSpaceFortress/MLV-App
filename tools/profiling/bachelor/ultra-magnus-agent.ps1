@@ -698,7 +698,14 @@ function Get-DescendantProcessIdentities {
     # no row makes that parent's children unverifiable.
     # r8 (sol r7 B3): a root row that is confirmed as the recorded process (same millisecond) keeps its PRECISE CreationDate for the ancestry compare.
     # r8 (sol r7 B4): a supplemental read whose answer arrives after the job's deadline contributes no evidence (checked after the read, not only before).
-    param([Parameter(Mandatory = $true)][int]$ParentProcessId, [scriptblock]$OnEach = $null, $RootStartEpochMs = $null, [int]$TimeoutSec = 30, $Deadline = $null, [switch]$RootExited)
+    # r8b (adversary pass 11 A2): -RootPidPinned is the LIVE form of the -RootExited guarantee: the caller holds the root's own Process handle (the agent
+    # started it), so the pid cannot be reused while the walk runs, whether the root is still alive or exits during it. Such a walk keeps the recorded start
+    # when the root's row is gone, as -RootExited does. A caller that only knows the pid (the lease owner check, an adopted or stale root) stays fail-closed.
+    # r8b (pass 11 A1): rows read for the root's pid at DIFFERENT starts (one read sees one process, a later read another) mean the pid changed hands between
+    # the reads; a child read in between cannot be bound to a generation, so the root is unverifiable (the last row alone set the replacement boundary).
+    # r8b (pass 11 A3): with no job deadline the walk's ONE budget plays the deadline's part: a supplemental read that answers after it is no evidence.
+    # r8b (pass 11 A6): a descendant row with no readable start (a leaf included) is UNVERIFIED: it cannot be checked against its parent or stopped by identity.
+    param([Parameter(Mandatory = $true)][int]$ParentProcessId, [scriptblock]$OnEach = $null, $RootStartEpochMs = $null, [int]$TimeoutSec = 30, $Deadline = $null, [switch]$RootExited, [switch]$RootPidPinned)
 
     $snapshotTimeoutSec = [Math]::Min(30, [Math]::Max(1, $TimeoutSec))
     $script:LastDescendantWalk = $null   # a walk that ends early never leaves an earlier walk's record behind
@@ -725,7 +732,13 @@ function Get-DescendantProcessIdentities {
     }
     # r8 (sol r7 B4): read AFTER a supplemental read returns: an answer that arrived past the job's deadline is no evidence (the read's whole-second bound
     # can overrun the deadline by up to a second).
-    $pastDeadline = { $null -ne $Deadline -and (([DateTime]$Deadline).ToUniversalTime() - (Get-Date).ToUniversalTime()).TotalSeconds -le 0 }
+    # r8b (adversary pass 11 A3): the same for the walk's ONE budget, which bounds the reads of a walk with no deadline (a Stop-ProcessTree census): a read's
+    # whole-second bound can overrun it too. Returns what the answer came after ('the job deadline' or the budget), or $null when it came in time.
+    $lateWhy = {
+        if ($null -ne $Deadline -and (([DateTime]$Deadline).ToUniversalTime() - (Get-Date).ToUniversalTime()).TotalSeconds -le 0) { return 'the job deadline' }
+        if ($walkWatch.Elapsed.TotalSeconds -gt $snapshotTimeoutSec) { return "the walk's $snapshotTimeoutSec s budget" }
+        return $null
+    }
     # r8 (sol r7 B2): a row's OWN creation time (UTC), or $null when it has none or it cannot be read.
     $rowStartOf = { param($r) try { if ($null -ne $r -and $r.CreationDate) { ([DateTime]$r.CreationDate).ToUniversalTime() } else { $null } } catch { $null } }
     # -ErrorAction Stop turns a non-terminating provider error into a terminating one AT the point it is raised, and the pipeline has already
@@ -782,7 +795,8 @@ function Get-DescendantProcessIdentities {
             }
             catch { $fbReadError = ([string]$_.Exception.Message) -replace '\s*[\r\n]+\s*', ' ' }
             # r8 (sol r7 B4): an answer that arrived past the job's deadline is no evidence: its rows are dropped and it ends the fallback like an error.
-            if (& $pastDeadline) { $fbError = "the filtered read $fbFilter answered after the job deadline"; break }
+            $fbLate = & $lateWhy   # r8b (pass 11 A3): or after the walk's budget
+            if ($null -ne $fbLate) { $fbError = "the filtered read $fbFilter answered after $fbLate"; break }
             foreach ($fbRow in $fbRead) {
                 [void]$all.Add($fbRow)
                 if ([int]$fbRow.ProcessId -ne $ParentProcessId) { $fbOther.Add([int]$fbRow.ProcessId) } else { $fbRootRowSeen = $true }
@@ -810,7 +824,8 @@ function Get-DescendantProcessIdentities {
                     }
                 }
                 catch { $fbError = ([string]$_.Exception.Message) -replace '\s*[\r\n]+\s*', ' '; break }
-                if (& $pastDeadline) { $fbError = "the re-read of parent pid=$fbParentPid answered after the job deadline"; break }
+                $fbVerLate = & $lateWhy   # r8b (pass 11 A3)
+                if ($null -ne $fbVerLate) { $fbError = "the re-read of parent pid=$fbParentPid answered after $fbVerLate"; break }
                 $fbSame = ($fbVerRows.Count -gt 0)
                 foreach ($fbVerRow in $fbVerRows) { $fbVerStart = & $rowStartOf $fbVerRow; if ($null -eq $fbVerStart -or $fbVerStart -ne [DateTime]$fbAdmitted) { $fbSame = $false } }
                 $fbGenOk[$fbGenKey] = $fbSame
@@ -840,7 +855,7 @@ function Get-DescendantProcessIdentities {
                     }
                 }
                 catch { $fbRecheckError = ([string]$_.Exception.Message) -replace '\s*[\r\n]+\s*', ' ' }
-                if ($null -eq $fbRecheckError -and (& $pastDeadline)) { $fbRecheckError = 'the root row re-read answered after the job deadline' }   # r8 (sol r7 B4)
+                if ($null -eq $fbRecheckError) { $fbRecheckLate = & $lateWhy; if ($null -ne $fbRecheckLate) { $fbRecheckError = "the root row re-read answered after $fbRecheckLate" } }   # r8 (sol r7 B4), r8b (pass 11 A3)
                 if ($null -eq $fbRecheckError -and -not $fbRecheckGot -and $fbRootRowSeen) { $fbRecheckEmpty = $true }
             }
         }
@@ -881,14 +896,16 @@ function Get-DescendantProcessIdentities {
                 # included (r5 counted that row as "read"): an error is never hidden by a row that came before it, as for the fallback reads above.
                 if ($null -ne $rrError) { $rootUnverifiable = "the root row read failed: $rrError" }
                 # r8 (sol r7 B4): an answer that arrived past the job's deadline (a 0.2 s remainder gets a whole-second bound) is no evidence for the root.
-                elseif (& $pastDeadline) { $rootUnverifiable = 'the root row read answered after the job deadline' }
+                # r8b (pass 11 A3): or after the walk's budget.
+                elseif ($null -ne ($rrLate = & $lateWhy)) { $rootUnverifiable = "the root row read answered after $rrLate" }
             }
         }
     }
     # r8 (sol r7 B1, hub decision): a LIVE caller (no -RootExited) whose reads hold a row naming the root as parent but no row for the root's pid cannot
     # tell the recorded root from a process that took its pid after it exited: unverifiable, the same as the fallback's empty re-read. Only the post-exit
     # census (-RootExited: it holds the exited root's handle, so the pid cannot be reused) keeps the r3 G1 contract (the recorded start stands).
-    if ($null -eq $rootUnverifiable -and -not $RootExited) {
+    # r8b (pass 11 A2): -RootPidPinned (the caller holds the live root's Process handle) gives the same guarantee as -RootExited: the pid cannot be reused.
+    if ($null -eq $rootUnverifiable -and -not ($RootExited -or $RootPidPinned)) {
         $liveRootRow = $false; $liveRootChild = $false
         foreach ($liveRow in $all) {
             try {
@@ -912,6 +929,21 @@ function Get-DescendantProcessIdentities {
             }
             catch { $rootUnverifiable = 'the root row has no readable start'; break }
         }
+    }
+    # r8b (adversary pass 11 A1): the root's pid is ONE process generation across the reads of a walk. Rows for it at different starts (the fallback's first
+    # root read and its re-read, or the root-row read and a snapshot row) mean the pid changed hands between the reads, and a child read in between may be a
+    # child of a generation no read kept (the last row alone set the replacement boundary too late): unverifiable, nothing is emitted under the root.
+    if ($null -eq $rootUnverifiable) {
+        $rootGenTicks = New-Object 'System.Collections.Generic.HashSet[long]'
+        foreach ($rootGenRow in $all) {
+            try {
+                if ($null -eq $rootGenRow -or $null -eq $rootGenRow.ProcessId -or [int]$rootGenRow.ProcessId -ne $ParentProcessId) { continue }
+                $rootGenStart = & $rowStartOf $rootGenRow
+                if ($null -ne $rootGenStart) { [void]$rootGenTicks.Add([long]$rootGenStart.Ticks) }
+            }
+            catch { continue }
+        }
+        if ($rootGenTicks.Count -gt 1) { $rootUnverifiable = "the root pid's rows carry $($rootGenTicks.Count) different starts across the reads (the pid changed hands between them)" }
     }
     $recPartial = if ($null -ne $rootUnverifiable) { $false } elseif ($fbAttempted) { $fellBack } else { $all.Count -gt 0 }
     if ($null -eq $snapshotError -and -not $skipSnapshot -and $null -eq $rootUnverifiable) { $walkRecord.rows = $all.Count }   # r4 (pass 5 A11): a complete read reports the rows it saw
@@ -1072,10 +1104,16 @@ function Get-DescendantProcessIdentities {
                     # r7 (A3): no readable start on this row (r8: or, in the fallback, not the same process when re-read): its children are unverifiable
                     # (see above). The row itself is only listed.
                     foreach ($noStartKid in $grandKids) { try { [void]$unverified.Add([int]$noStartKid.ProcessId) } catch { continue } }
+                    if ($null -eq $childCreated) { [void]$unverified.Add($childProcessId) }   # r8b (pass 11 A6): the start-less row itself too
                     & $identityOf $child
                 }
             }
-            else { & $identityOf $child }
+            else {
+                # r8b (adversary pass 11 A6): a start-less LEAF is unverified as well: it is listed as not existing (no kill path stops it), so it is named in the
+                # record, the agent.log line, Stop-ProcessTree's note and the post-exit census line, never dropped silently.
+                if ($null -eq $childCreated) { [void]$unverified.Add($childProcessId) }
+                & $identityOf $child
+            }
         }
         else {
             [void]$stack.Pop()
@@ -1089,7 +1127,7 @@ function Get-DescendantProcessIdentities {
         if ($null -eq $script:DescendantWalkUnverifiedLogged) { $script:DescendantWalkUnverifiedLogged = New-Object 'System.Collections.Generic.HashSet[int]' }
         $newUnverified = @($unverified | Where-Object { $script:DescendantWalkUnverifiedLogged.Count -lt 256 -and $script:DescendantWalkUnverifiedLogged.Add([int]$_) })
         if ($newUnverified.Count -gt 0) {
-            Add-AgentLogLine "descendant-walk: unverified pids=$($newUnverified -join ',') (their parent row has no readable creation time, or was not the same process when read again, so their ancestry cannot be checked; they were not walked and are still running if they exist)"
+            Add-AgentLogLine "descendant-walk: unverified pids=$($newUnverified -join ',') (their own row or their parent row has no readable creation time, or their parent was not the same process when read again, so their ancestry cannot be checked; they were not walked and are still running if they exist)"
         }
     }
     $walkRecord | Add-Member -NotePropertyName unverified -NotePropertyValue @($unverified) -Force
@@ -1102,10 +1140,16 @@ function Stop-ProcessTree {
         [Parameter(Mandatory = $true)][int]$RootProcessId,
         [string]$RootStartUtc,
         $RootStartEpochMs,
-        [string]$RootImagePath
+        [string]$RootImagePath,
+        # r8b (adversary pass 11 A2): the root's own Process object, when the caller started the root and still holds it (the job child, the holder, the
+        # lease wrapper). An open process handle keeps the pid from being reused, so the walk is -RootPidPinned: a root that exits between this stop's
+        # identity check and the snapshot still has its children walked under the recorded start. Without it (a pid read from disk) the walk fails closed.
+        $RootProcess = $null
     )
 
     $killed = [System.Collections.Generic.List[int]]::new()
+    $rootPinned = $false
+    if ($null -ne $RootProcess) { try { $rootPinned = ([int]$RootProcess.Id -eq $RootProcessId) } catch { $rootPinned = $false } }   # a disposed object has no Id: not pinned
     # AGENT-JOB-MONITOR-CIM-WALK-1 r2 (sol 2, fable H2): the callers append this note to their own message; it is empty unless the walk below
     # was incomplete, so a failed or partial snapshot is never reported as "the whole tree was stopped".
     $script:ProcessTreeWalkNote = ""
@@ -1116,7 +1160,7 @@ function Stop-ProcessTree {
     }
     $identities = @(
         # r3 (adversary pass 3 A1, Grok G1): the walk is anchored to the start of the root this stop just verified, not to whatever row the snapshot holds.
-        @(Get-DescendantProcessIdentities -ParentProcessId $RootProcessId -RootStartEpochMs $rootMatch.identity.startEpochMs)
+        @(Get-DescendantProcessIdentities -ParentProcessId $RootProcessId -RootStartEpochMs $rootMatch.identity.startEpochMs -RootPidPinned:$rootPinned)
         $rootMatch.identity
     )
     $walkState = $script:LastDescendantWalk
@@ -1136,7 +1180,7 @@ function Stop-ProcessTree {
     }
     # r7 (A3): children of a row with no readable creation time were not walked and not targeted; a kill never reads as a clean tree.
     if ($null -ne $walkState -and $walkState.rootPid -eq $RootProcessId -and @($walkState.unverified).Count -gt 0) {
-        $unverifiedText = "UNVERIFIED pids=$(@($walkState.unverified) -join ',') (their parent row has no readable creation time, or was not the same process when read again, so their ancestry cannot be checked: not targeted, and still running if they exist)"
+        $unverifiedText = "UNVERIFIED pids=$(@($walkState.unverified) -join ',') (their own row or their parent row has no readable creation time, or their parent was not the same process when read again, so their ancestry cannot be checked: not targeted, and still running if they exist)"
         $script:ProcessTreeWalkNote += "; $unverifiedText"
         Add-AgentLogLine "process-tree stop pid=${RootProcessId}: $unverifiedText"
     }
@@ -1280,19 +1324,24 @@ function Complete-WindowlessRedirectedProcess {
     if ($null -ne $Launch.PSObject.Properties['Drained'] -and $Launch.Drained) { return }
     $Launch | Add-Member -NotePropertyName Drained -NotePropertyValue $true -Force
     try {
-        # r8 (sol r7 B7): each copy's result is read as soon as it is COMPLETE, in completion order, before any wait on the other: a copy that already
-        # faulted (an IOException) propagates its own failure and is never masked by the bound on a copy still pending (which made the fault unobserved).
-        # The bound is one -CaptureWaitMs for the whole drain.
+        # r8 (sol r7 B7): each copy's result is read in completion order: a copy that faulted (an IOException) propagates its own failure and is never
+        # masked by the bound on a copy still pending (which made the fault unobserved). The bound is one -CaptureWaitMs for the whole drain.
+        # r8b (adversary pass 11 A4): a fault is no longer thrown the moment it is seen. Every copy is first given the rest of the ONE -CaptureWaitMs (a healthy
+        # copy still delivering output drains before the streams are disposed below), noting the order the copies complete in; THEN the first copy that
+        # completed with a fault propagates its own failure (B7: a still-pending copy never masks it), and only with no fault does a pending copy end at the bound.
         $captureWatch = [System.Diagnostics.Stopwatch]::StartNew()
         $copies = [System.Collections.Generic.List[System.Threading.Tasks.Task]]::new()
+        $completedInOrder = [System.Collections.Generic.List[System.Threading.Tasks.Task]]::new()
         foreach ($copyTask in @($Launch.OutCopy, $Launch.ErrCopy)) { $copies.Add($copyTask) }
         while ($true) {
-            foreach ($copyTask in @($copies)) { if ($copyTask.IsCompleted) { [void]$copies.Remove($copyTask); [void]$copyTask.GetAwaiter().GetResult() } }
+            foreach ($copyTask in @($copies)) { if ($copyTask.IsCompleted) { [void]$copies.Remove($copyTask); $completedInOrder.Add($copyTask) } }
             if ($copies.Count -eq 0) { break }
             $captureLeftMs = [int][Math]::Max(0, $CaptureWaitMs - $captureWatch.Elapsed.TotalMilliseconds)
-            if ($captureLeftMs -le 0) { throw "output capture did not finish within $([Math]::Round($CaptureWaitMs / 1000.0, 1)) s (a surviving descendant may hold the pipe open)" }
+            if ($captureLeftMs -le 0) { break }
             [void][System.Threading.Tasks.Task]::WaitAny($copies.ToArray(), [Math]::Max(1, $captureLeftMs))
         }
+        foreach ($copyTask in $completedInOrder) { if ($copyTask.IsFaulted -or $copyTask.IsCanceled) { [void]$copyTask.GetAwaiter().GetResult() } }   # the earliest fault, as itself
+        if ($copies.Count -gt 0) { throw "output capture did not finish within $([Math]::Round($CaptureWaitMs / 1000.0, 1)) s (a surviving descendant may hold the pipe open)" }
         $Launch.OutStream.Flush()
         $Launch.ErrStream.Flush()
     }
@@ -1319,7 +1368,12 @@ function Get-LostJobDiagnostics {
     # r8 (sol r7 B6): -StopNote is the incomplete-stop note a kill path (cancel, lease stop, timeout, adopted timeout) appended to its own line; it is
     # recovered the same way when that append was refused.
     # r8 (class sweep): -MonitorFailureNote (the "agent failed to launch or monitor job" line) is recovered the same way.
-    param([string]$Stderr, $CaptureDrainFailure, $PostExitWalk, [hashtable]$Tags = $null, [string]$StopNote = '', $MonitorFailureNote = $null)
+    # r8b (adversary pass 11 A9): a line counts as written when it starts with the kind's FIXED prefix and ends with the kind's token. The variable text
+    # between them (a capture failure, a census why, a stop note, an exception message) is NOT matched: the err file is written as ASCII, which turns every
+    # non-ASCII character of that text into '?', so a localised message ('accès refusé') never matched its own persisted line and was recovered twice. The
+    # token alone proves the line is the agent's (one per job and kind, never written anywhere else).
+    # r8b (pass 11 A8): -CeilingNote is the STAGE_EXEMPT_CEILING_EXCEEDED line (live or adopted timeout), recovered the same way when its append was refused.
+    param([string]$Stderr, $CaptureDrainFailure, $PostExitWalk, [hashtable]$Tags = $null, [string]$StopNote = '', $MonitorFailureNote = $null, [string]$CeilingNote = '')
     $lost = [System.Collections.Generic.List[string]]::new()
     $text = if ($null -eq $Stderr) { '' } else { $Stderr }
     $written = {
@@ -1328,14 +1382,14 @@ function Get-LostJobDiagnostics {
         if ([string]::IsNullOrEmpty($tag)) { return $false }
         return ($text -cmatch ('(?m)' + $PrefixPattern + '.*' + [regex]::Escape($tag) + '\r?$'))
     }
-    # r5 (pass 7 A6): the agent's own lines START a line and carry the job's actual diagnostic; a child that merely prints a similar phrase (mid-line, or
-    # with another text) does not stand in for them. Each line (capture failure, census PARTIAL/FAILED, UNVERIFIED, SKIPPED, the stop note) is checked on its own.
-    if ($null -ne $CaptureDrainFailure -and -not (& $written 'capture' ('^output capture failed: ' + [regex]::Escape([string]$CaptureDrainFailure) + ' \('))) {
+    # r5 (pass 7 A6): the agent's own lines START a line; a child that merely prints a similar phrase (mid-line) does not stand in for them. Each line
+    # (capture failure, census PARTIAL/FAILED, UNVERIFIED, SKIPPED, the stop note, the monitor failure, the stage ceiling) is checked on its own.
+    if ($null -ne $CaptureDrainFailure -and -not (& $written 'capture' '^output capture failed: ')) {
         $lost.Add("output capture failed: $CaptureDrainFailure (the job's stdout/stderr may be incomplete; this line could not be written to the job's err file)")
     }
     if ($null -ne $PostExitWalk -and -not $PostExitWalk.ok) {
         $censusKind = if ($PostExitWalk.partial) { 'PARTIAL' } else { 'FAILED' }
-        if (-not (& $written 'census' ('^post-exit descendant census ' + $censusKind + ' \(' + [regex]::Escape([string]$PostExitWalk.why) + '\): '))) {
+        if (-not (& $written 'census' ('^post-exit descendant census ' + $censusKind + ' \('))) {   # r8b (A9): the why is not matched (ASCII-written)
             $lost.Add("post-exit descendant census $censusKind ($($PostExitWalk.why)): descendants it did not list may still be running (this line could not be written to the job's err file)")
         }
     }
@@ -1345,7 +1399,7 @@ function Get-LostJobDiagnostics {
     if ($unverifiedRows.Count -gt 0) {
         $unverifiedList = $unverifiedRows -join ','
         if (-not (& $written 'unverified' ('^post-exit descendant census UNVERIFIED pids=' + [regex]::Escape($unverifiedList) + ' \('))) {
-            $lost.Add("post-exit descendant census UNVERIFIED pids=$unverifiedList (their parent row has no readable creation time, or was not the same process when read again, so their ancestry cannot be checked: this census did not target them, and they are still running if they exist; this line could not be written to the job's err file)")
+            $lost.Add("post-exit descendant census UNVERIFIED pids=$unverifiedList (their own row or their parent row has no readable creation time, or their parent was not the same process when read again, so their ancestry cannot be checked: this census did not target them, and they are still running if they exist; this line could not be written to the job's err file)")
         }
     }
     if ($skippedRows.Count -gt 0) {
@@ -1354,11 +1408,14 @@ function Get-LostJobDiagnostics {
             $lost.Add("post-exit descendant census SKIPPED pids=$skippedList (created before their listed parent: a reused parent pid, or a backward clock step, in which case they are still running; this line could not be written to the job's err file)")
         }
     }
-    if (-not [string]::IsNullOrEmpty($StopNote) -and -not (& $written 'stop' ('killed process tree pids=[0-9,]*' + [regex]::Escape($StopNote)))) {
+    if (-not [string]::IsNullOrEmpty($StopNote) -and -not (& $written 'stop' 'killed process tree pids=[0-9,]*')) {   # r8b (A9): the note's why is not matched
         $lost.Add("process tree stop incomplete$StopNote (this line could not be written to the job's err file)")
     }
-    if ($null -ne $MonitorFailureNote -and -not (& $written 'monitor' ('^' + [regex]::Escape([string]$MonitorFailureNote)))) {
+    if ($null -ne $MonitorFailureNote -and -not (& $written 'monitor' '^agent failed to launch or monitor job: ')) {   # r8b (A9): the exception text is not matched
         $lost.Add("$MonitorFailureNote (this line could not be written to the job's err file)")
+    }
+    if (-not [string]::IsNullOrEmpty($CeilingNote) -and -not (& $written 'ceiling' '^STAGE_EXEMPT_CEILING_EXCEEDED: ')) {   # r8b (pass 11 A8)
+        $lost.Add("$CeilingNote (this line could not be written to the job's err file)")
     }
     return @($lost)
 }
@@ -2149,6 +2206,7 @@ function Invoke-AdoptStartedJob {
     $killedProcessIds = @()
     $adoptedTags = New-JobDiagnosticTags   # r8 (sol r7 B5, B6)
     $adoptedStopNote = ''
+    $adoptedCeilingNote = ''   # r8b (adversary pass 11 A8)
     try {
         $startedUtc = ConvertTo-UtcDateTime $Marker.startedUtc
         if ($null -eq $startedUtc) { throw "adopted marker for job $jobId has no readable startedUtc, so no deadline can be computed" }
@@ -2186,7 +2244,8 @@ function Invoke-AdoptStartedJob {
             # STAGE-JOB-LEASE-EXEMPT-HARDENING-1 r2: an adopted stage child killed at a bound that was the exempt ceiling's (the marker's timeoutSec when
             # it was clamped, or the r3 clamp above) is typed as the live path types it. A non-stage or unclamped marker gets no reason.
             if ($adoptedClamped) {
-                "STAGE_EXEMPT_CEILING_EXCEEDED: adopted staging step ran past its ${adoptedTimeoutSec}s exempt ceiling (asked for ${adoptedRequestedSec}s); a lease-exempt job may not heat the host for longer$($adoptedTags['ceiling'])" |
+                $adoptedCeilingNote = "STAGE_EXEMPT_CEILING_EXCEEDED: adopted staging step ran past its ${adoptedTimeoutSec}s exempt ceiling (asked for ${adoptedRequestedSec}s); a lease-exempt job may not heat the host for longer"   # r8b (pass 11 A8)
+                "$adoptedCeilingNote$($adoptedTags['ceiling'])" |
                     Add-Content -Encoding ASCII -LiteralPath $Marker.errFile
                 Add-AgentLogLine "heavy-slot-gate: STAGE_EXEMPT_CEILING_EXCEEDED job=$jobId ceiling=${adoptedTimeoutSec}s adopted killed pids=$($killedProcessIds -join ',')"
             }
@@ -2198,7 +2257,7 @@ function Invoke-AdoptStartedJob {
     }
     $adoptedStderr = if (Test-Path -LiteralPath $Marker.errFile) { Get-Content -LiteralPath $Marker.errFile -Raw } else { "" }
     # r8 (sol r7 B6): an incomplete-stop note the err file refused still reaches the receipt (and agent.log).
-    $adoptedLost = @(Get-LostJobDiagnostics -Stderr $adoptedStderr -CaptureDrainFailure $null -PostExitWalk $null -Tags $adoptedTags -StopNote $adoptedStopNote)
+    $adoptedLost = @(Get-LostJobDiagnostics -Stderr $adoptedStderr -CaptureDrainFailure $null -PostExitWalk $null -Tags $adoptedTags -StopNote $adoptedStopNote -CeilingNote $adoptedCeilingNote)
     if ($adoptedLost.Count -gt 0) {
         $adoptedStderr = "$adoptedStderr$(if ($adoptedStderr -and -not $adoptedStderr.EndsWith("`n")) { "`r`n" })$($adoptedLost -join "`r`n")`r`n"
         Add-AgentLogLine "job diagnostics not persisted to the err file job=${jobId} (adopted): $($adoptedLost -join ' | ')"
@@ -3670,7 +3729,7 @@ function Stop-HeavySlotHolder {
     $killed = @()
     $stopNote = ""   # AGENT-JOB-MONITOR-CIM-WALK-1 r2 (adversary A5): the incomplete-walk note of this call's stop, if any
     if (-not $exited) {
-        $killed = @(Stop-ProcessTree -RootProcessId $Holder.pid -RootStartUtc $Holder.identity.startUtc -RootStartEpochMs $Holder.identity.startEpochMs -RootImagePath $Holder.identity.imagePath)
+        $killed = @(Stop-ProcessTree -RootProcessId $Holder.pid -RootStartUtc $Holder.identity.startUtc -RootStartEpochMs $Holder.identity.startEpochMs -RootImagePath $Holder.identity.imagePath -RootProcess $p)   # r8b (pass 11 A2): the held handle pins the pid
         $stopNote = [string]$script:ProcessTreeWalkNote
         $exited = $p.WaitForExit(5000)
     }
@@ -4587,7 +4646,7 @@ function Stop-QuietLease {
         $releaseRc = if ($r.done) { [string]$r.rc } else { "not-done ($($r.why))" }
         $exited = $p.WaitForExit(5000)
         if (-not $exited) {
-            $killed = @(Stop-ProcessTree -RootProcessId $Lease.pid -RootStartUtc $Lease.identity.startUtc -RootStartEpochMs $Lease.identity.startEpochMs -RootImagePath $Lease.identity.imagePath)
+            $killed = @(Stop-ProcessTree -RootProcessId $Lease.pid -RootStartUtc $Lease.identity.startUtc -RootStartEpochMs $Lease.identity.startEpochMs -RootImagePath $Lease.identity.imagePath -RootProcess $p)   # r8b (pass 11 A2)
             $stopNote = [string]$script:ProcessTreeWalkNote
             $exited = $p.WaitForExit(5000)
         }
@@ -5306,6 +5365,7 @@ function Invoke-QueuedJob {
     $postExitWalk = $null         # r5 (pass 6 A2): the post-exit census record of THIS job, read back at the receipt (set in the normal-exit branch)
     $diagTags = New-JobDiagnosticTags   # r8 (sol r7 B5): the tokens that mark this job's err-file diagnostics as the agent's own
     $jobStopNote = ''             # r8 (sol r7 B6): the incomplete-stop note of this job's kill path (cancel, lease stop, timeout), recovered if its append is refused
+    $jobCeilingNote = ''          # r8b (adversary pass 11 A8): the STAGE_EXEMPT_CEILING_EXCEEDED line, recovered the same way
     $started = (Get-Date).ToUniversalTime().ToString("o")
     $exit = $null
     $timedOut = $false
@@ -5443,7 +5503,8 @@ function Invoke-QueuedJob {
 
         if ($cancelled) {
             $exit = 130
-            $killedProcessIds = @(Stop-ProcessTree -RootProcessId $jobProcess.Id -RootStartUtc $marker.childStartUtc -RootStartEpochMs $marker.childStartEpochMs -RootImagePath $marker.childImagePath)
+            # r8b (adversary pass 11 A2): -RootProcess: this agent holds the job child's handle, so a root that exits before the snapshot still has its children walked.
+            $killedProcessIds = @(Stop-ProcessTree -RootProcessId $jobProcess.Id -RootStartUtc $marker.childStartUtc -RootStartEpochMs $marker.childStartEpochMs -RootImagePath $marker.childImagePath -RootProcess $jobProcess)
             $jobStopNote = [string]$script:ProcessTreeWalkNote   # r8 (sol r7 B6): kept for the receipt, whatever the err file does with the line below
             try { Complete-WindowlessRedirectedProcess -Launch $launch } catch { $captureDrainFailure = $_.Exception.Message; Add-AgentLogLine "job output capture drain failed job=${jobId}: $captureDrainFailure" }   # r4 (A5): drain BEFORE the diagnostic is appended
             "cancelled by mailbox request; killed process tree pids=$($killedProcessIds -join ',')$($script:ProcessTreeWalkNote)$($diagTags['stop'])" |
@@ -5451,7 +5512,7 @@ function Invoke-QueuedJob {
         }
         elseif ($null -ne $leaseStop) {
             $exit = 124
-            $killedProcessIds = @(Stop-ProcessTree -RootProcessId $jobProcess.Id -RootStartUtc $marker.childStartUtc -RootStartEpochMs $marker.childStartEpochMs -RootImagePath $marker.childImagePath)
+            $killedProcessIds = @(Stop-ProcessTree -RootProcessId $jobProcess.Id -RootStartUtc $marker.childStartUtc -RootStartEpochMs $marker.childStartEpochMs -RootImagePath $marker.childImagePath -RootProcess $jobProcess)   # r8b (pass 11 A2)
             $jobStopNote = [string]$script:ProcessTreeWalkNote   # r8 (sol r7 B6)
             $script:Admission | Add-Member -NotePropertyName slotContinuity -NotePropertyValue "lost" -Force
             $script:Admission | Add-Member -NotePropertyName leaseStop -NotePropertyValue ([pscustomobject]@{ reason = $leaseStop.reason; why = $leaseStop.why; stoppedUtc = (Get-Date).ToUniversalTime().ToString("o"); guardSec = $script:LeaseBatchJobGuardSec }) -Force
@@ -5482,7 +5543,7 @@ function Invoke-QueuedJob {
                         Add-Content -Encoding ASCII -LiteralPath $errFile
                 }
                 if (@($postExitWalk.unverified).Count -gt 0) {
-                    "post-exit descendant census UNVERIFIED pids=$(@($postExitWalk.unverified) -join ',') (their parent row has no readable creation time, or was not the same process when read again, so their ancestry cannot be checked: this census did not target them, and they are still running if they exist)$($diagTags['unverified'])" |
+                    "post-exit descendant census UNVERIFIED pids=$(@($postExitWalk.unverified) -join ',') (their own row or their parent row has no readable creation time, or their parent was not the same process when read again, so their ancestry cannot be checked: this census did not target them, and they are still running if they exist)$($diagTags['unverified'])" |
                         Add-Content -Encoding ASCII -LiteralPath $errFile
                 }
                 if (@($postExitWalk.skipped).Count -gt 0) {
@@ -5494,13 +5555,14 @@ function Invoke-QueuedJob {
         else {
             $timedOut = $true
             $exit = 124
-            $killedProcessIds = @(Stop-ProcessTree -RootProcessId $jobProcess.Id -RootStartUtc $marker.childStartUtc -RootStartEpochMs $marker.childStartEpochMs -RootImagePath $marker.childImagePath)
+            $killedProcessIds = @(Stop-ProcessTree -RootProcessId $jobProcess.Id -RootStartUtc $marker.childStartUtc -RootStartEpochMs $marker.childStartEpochMs -RootImagePath $marker.childImagePath -RootProcess $jobProcess)   # r8b (pass 11 A2)
             $jobStopNote = [string]$script:ProcessTreeWalkNote   # r8 (sol r7 B6)
             try { Complete-WindowlessRedirectedProcess -Launch $launch } catch { $captureDrainFailure = $_.Exception.Message; Add-AgentLogLine "job output capture drain failed job=${jobId}: $captureDrainFailure" }   # r4 (A5)
             "timed out after ${effectiveTimeoutSec}s; killed process tree pids=$($killedProcessIds -join ',')$($script:ProcessTreeWalkNote)$($diagTags['stop'])" |
                 Add-Content -Encoding ASCII -LiteralPath $errFile
             if ($null -ne $script:Admission.stageCeiling -and $script:Admission.stageCeiling.clamped) {
-                "STAGE_EXEMPT_CEILING_EXCEEDED: staging step ran past its ${effectiveTimeoutSec}s exempt ceiling (asked for $($script:Admission.stageCeiling.requestedSec)s); a lease-exempt job may not heat the host for longer$($diagTags['ceiling'])" |
+                $jobCeilingNote = "STAGE_EXEMPT_CEILING_EXCEEDED: staging step ran past its ${effectiveTimeoutSec}s exempt ceiling (asked for $($script:Admission.stageCeiling.requestedSec)s); a lease-exempt job may not heat the host for longer"
+                "$jobCeilingNote$($diagTags['ceiling'])" |
                     Add-Content -Encoding ASCII -LiteralPath $errFile
                 Add-AgentLogLine "heavy-slot-gate: STAGE_EXEMPT_CEILING_EXCEEDED job=$jobId ceiling=${effectiveTimeoutSec}s killed pids=$($killedProcessIds -join ',')"
             }
@@ -5545,7 +5607,7 @@ function Invoke-QueuedJob {
     $stderr = if (Test-Path -LiteralPath $errFile) { Get-Content -LiteralPath $errFile -Raw } else { "" }
     # r5 (pass 6 A2): a diagnostic the err file refused is not lost: it is added to the receipt's stderr (in memory) and named in agent.log.
     # r8 (sol r7 B5, B6): only a line carrying this job's token counts as written (-Tags), and the kill path's incomplete-stop note is recovered too (-StopNote).
-    $lostDiagnostics = @(Get-LostJobDiagnostics -Stderr $stderr -CaptureDrainFailure $captureDrainFailure -PostExitWalk $(if ($null -ne $postExitWalk -and $null -ne $marker -and $postExitWalk.rootPid -eq $marker.childPid) { $postExitWalk } else { $null }) -Tags $diagTags -StopNote $jobStopNote -MonitorFailureNote $monitorFailureNote)
+    $lostDiagnostics = @(Get-LostJobDiagnostics -Stderr $stderr -CaptureDrainFailure $captureDrainFailure -PostExitWalk $(if ($null -ne $postExitWalk -and $null -ne $marker -and $postExitWalk.rootPid -eq $marker.childPid) { $postExitWalk } else { $null }) -Tags $diagTags -StopNote $jobStopNote -MonitorFailureNote $monitorFailureNote -CeilingNote $jobCeilingNote)
     if ($lostDiagnostics.Count -gt 0) {
         $stderr = "$stderr$(if ($stderr -and -not $stderr.EndsWith("`n")) { "`r`n" })$($lostDiagnostics -join "`r`n")`r`n"
         Add-AgentLogLine "job diagnostics not persisted to the err file job=${jobId}: $($lostDiagnostics -join ' | ')"
