@@ -716,12 +716,11 @@ function Get-DescendantProcessIdentities {
     $walkRecord = [pscustomobject]@{ ok = $true; partial = $false; rows = 0; why = $null; rootPid = $ParentProcessId }
     if ($null -ne $Deadline) {
         $leftSec = (([DateTime]$Deadline).ToUniversalTime() - (Get-Date).ToUniversalTime()).TotalSeconds
-        # r10 split (sol r9 B4, adversary pass 13 A3): the snapshot's whole-second bound never reaches PAST the deadline. It is the whole seconds left
-        # (floor), and with less than 1 s left (the provider's floor) no snapshot is read: a census that answered after the deadline let a root that
-        # exited in that overrun read as a normal exit, where the merge base's short filtered reads ended in time and the loop took the timeout branch.
-        # The kill path that follows takes its own walk, as for a deadline already passed.
-        if ($leftSec -lt 1) { $skipSnapshot = $true }
-        else { $snapshotTimeoutSec = [int][Math]::Min(30.0, [Math]::Floor($leftSec)) }   # r4 (pass 5 A13): clamped as a double, so a far deadline cannot overflow the integer
+        # r10 split (sol r9 B4, adversary pass 13 A3): the bound is the whole seconds left (floor), so with 1 s or more left it never reaches past the
+        # deadline. With less than 1 s left the census is still read with the provider's 1 s floor (r10 pass A2: skipping it dropped the only census of a
+        # short job, which the merge base's walk took); that last-second overrun is the full-table read's own latency (successor CIM-WALK-SLOW-SNAPSHOT-BUDGET-1).
+        if ($leftSec -le 0) { $skipSnapshot = $true }
+        else { $snapshotTimeoutSec = [int][Math]::Min(30.0, [Math]::Max(1.0, [Math]::Floor($leftSec))) }   # r4 (pass 5 A13): clamped as a double, so a far deadline cannot overflow the integer
     }
     $walkWatch = [System.Diagnostics.Stopwatch]::StartNew()   # r4 (pass 5 A1): the full read and any fallback reads share ONE budget, $snapshotTimeoutSec
     # r5 (adversary pass 7 A4): what is left for a SUPPLEMENTAL read is the smaller of the walk's one budget and the time left to the job's deadline, read
@@ -729,7 +728,10 @@ function Get-DescendantProcessIdentities {
     $readLeftSec = {
         $leftBudget = $snapshotTimeoutSec - $walkWatch.Elapsed.TotalSeconds
         if ($null -ne $Deadline) {
-            $leftDeadline = (([DateTime]$Deadline).ToUniversalTime() - (Get-Date).ToUniversalTime()).TotalSeconds
+            # r10 split (adversary r10 pass A1): whole seconds to the deadline (floor). A supplemental read is bounded by the ceiling of what this returns,
+            # so it never reaches past the deadline; with under 1 s left none starts (the merge base never needed these reads, and one that answered late
+            # let a root that exited in the overrun read as a normal exit).
+            $leftDeadline = [Math]::Floor((([DateTime]$Deadline).ToUniversalTime() - (Get-Date).ToUniversalTime()).TotalSeconds)
             if ($leftDeadline -lt $leftBudget) { $leftBudget = $leftDeadline }
         }
         $leftBudget
@@ -749,7 +751,7 @@ function Get-DescendantProcessIdentities {
     # handed every earlier row to the collector, so those rows survive the catch. The bound is at most 30 s: far above the measured ~0.1 s, and no
     # longer than the 30 s the lease snapshot probes are given.
     if ($skipSnapshot) {
-        $walkRecord = [pscustomobject]@{ ok = $false; partial = $false; rows = 0; why = 'less than 1 s was left to the job deadline when the snapshot was due, so no snapshot was read'; rootPid = $ParentProcessId }
+        $walkRecord = [pscustomobject]@{ ok = $false; partial = $false; rows = 0; why = 'the job deadline was reached before the snapshot was read'; rootPid = $ParentProcessId }
     }
     else {
         try { Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, CreationDate, ExecutablePath, CommandLine -OperationTimeoutSec $snapshotTimeoutSec -ErrorAction Stop | ForEach-Object { [void]$all.Add($_) } }
@@ -762,10 +764,12 @@ function Get-DescendantProcessIdentities {
     # r4 (pass 5 A4): the fallback runs when the read FAILED and nothing it returned relates to the root (no row for the root's pid, none naming it as
     # parent): zero rows, or only unrelated ones. A partial read that already holds the root's children or the root's own row is walked as it is
     # (the hub's r3 rule: no per-parent fallback on a partial snapshot; r5 G6 adds ONE root-row read when that partial snapshot lacks the root's own row).
+    # r10 split (adversary r10 pass A6): only a row naming the root as PARENT counts. A failed read that returned the root's own row and none of its children
+    # lists no children at all, so the per-parent fallback (the merge base's filtered reads) still runs and finds them.
     $anyRelated = $false
     if ($null -ne $snapshotError) {
         foreach ($relRow in $all) {
-            try { if ($null -ne $relRow -and (([int]$relRow.ProcessId -eq $ParentProcessId) -or ($null -ne $relRow.ParentProcessId -and [int]$relRow.ParentProcessId -eq $ParentProcessId))) { $anyRelated = $true; break } } catch { continue }
+            try { if ($null -ne $relRow -and $null -ne $relRow.ParentProcessId -and [int]$relRow.ParentProcessId -eq $ParentProcessId -and [int]$relRow.ProcessId -ne $ParentProcessId) { $anyRelated = $true; break } } catch { continue }
         }
     }
     if ($null -ne $snapshotError -and -not $anyRelated) {
@@ -907,6 +911,14 @@ function Get-DescendantProcessIdentities {
                 elseif ($null -ne ($rrLate = & $lateWhy)) { $rootUnverifiable = "the root row read answered after $rrLate" }
             }
         }
+    }
+    # r10 split (adversary r10 pass A3): every unknown above (a root-row read or re-read that failed, answered late or had no budget, a filtered read that failed
+    # after the root's children were read) is the question "did the pid change hands between the reads?". A caller that holds the root's handle (-RootPidPinned,
+    # -RootExited) already knows the answer is no, so for it none of them makes the root unverifiable: the children already read are walked (PARTIAL, with the
+    # read's error in the record), as the merge base's walk did. A caller that holds no handle stays fail-closed.
+    if (($RootExited -or $RootPidPinned) -and $null -ne $rootUnverifiable) {
+        if ($null -ne $fbChildrenError -and $null -eq $fbError) { $fbError = $fbChildrenError }
+        $rootUnverifiable = $null
     }
     # r8 (sol r7 B1, hub decision): a LIVE caller (no -RootExited) whose reads hold a row naming the root as parent but no row for the root's pid cannot
     # tell the recorded root from a process that took its pid after it exited: unverifiable, the same as the fallback's empty re-read. Only the post-exit
@@ -1389,7 +1401,9 @@ function Get-LostJobDiagnostics {
         if ([string]::IsNullOrEmpty($tag)) { return $false }
         # r10 split (sol r9 B6, adversary pass 13 A6): (?s) lets the variable text span lines, so a multi-line exception message persisted with its token
         # is the agent's line (no duplicate in the receipt, no false "not persisted" in agent.log). The token still has to end a line.
-        return ($text -cmatch ('(?ms)' + $PrefixPattern + '.*' + [regex]::Escape($tag) + '\r?$'))
+        # r10 (adversary r10 pass A4): the prefix is no longer anchored to a line start: a job whose own stderr ends without a newline glues the agent's first
+        # append onto its last line ('tailpost-exit ...'), and that line was then re-reported as lost. The token alone proves the line is the agent's.
+        return ($text -cmatch ('(?ms)' + $PrefixPattern.TrimStart('^') + '.*' + [regex]::Escape($tag) + '\r?$'))
     }
     # r5 (pass 7 A6): the agent's own lines START a line; a child that merely prints a similar phrase (mid-line) does not stand in for them. Each line
     # (capture failure, census PARTIAL/FAILED, UNVERIFIED, SKIPPED, the stop note, the monitor failure, the stage ceiling) is checked on its own.
@@ -5476,7 +5490,7 @@ function Invoke-QueuedJob {
             # the slow step of a slice under a heavy leg, so a renew due as the walk starts is started (and one that exited is collected)
             # there, not a slice later.
             # r3 (adversary pass 3 A1, A2): anchored to the child's recorded start, and the snapshot is bounded by the time left to the deadline
-            # (r10: whole seconds left, floor; under 1 s no snapshot; the walk clamps it to 1..30), so its bound never reaches past the deadline.
+            # (r10: whole seconds left, floor, at least 1 s; the walk clamps it to 1..30), so with 1 s or more left its bound never reaches past the deadline.
             # r4 (pass 4 A1): the walk is handed the DEADLINE and works out the time left itself when its snapshot starts (after the opening tick).
             # r10 split (sol r9 B3, adversary pass 12 A2): -RootPidPinned: this agent holds the job child's handle ($jobProcess), so its pid cannot be
             # reused; a root that exited just before the snapshot still has its children tracked for the post-exit cleanup, as the merge base's walk did.
