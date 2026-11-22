@@ -51,7 +51,7 @@ enum class Reason
     BlackMismatch,
     WbMismatch,                 // any of the three doubles not exactly equal
     HnyquistMismatch,
-    ReconConfiguredSinceWarm,   // a set_clip or set_luts ran after the warm
+    ReconConfiguredSinceWarm,   // a set_clip, set_luts or set_iso_pattern ran after the warm (read before and after the compare)
     StateMismatch,              // WARM-RECON-DETERMINISM-1 F-key: the recon's per-run constants differ (or one is unknown)
     // final outcomes after the compare
     Hit,
@@ -165,6 +165,14 @@ struct Key
     PreparedState state;   // F-key: the recon's per-run constants this AMaZE input was made with
 };
 
+/*! Whether any configure (set_clip, set_luts, set_iso_pattern) ran since the warm: one predicate for the gate and for
+ *  decide()'s recheck after the compare. */
+inline bool configuredSinceWarm( const Key &warmKey, uint64_t setClipNow, uint64_t setLutsNow, uint64_t setPatternNow )
+{
+    return setClipNow != warmKey.setClipCountAfterWarm || setLutsNow != warmKey.setLutsCountAfterWarm
+        || setPatternNow != warmKey.setPatternCountAfterWarm;
+}
+
 /*! Everything but the content: Reason::None means compare the input bytes against warmKey.captureId. Exact double
  *  equality on WB on purpose (a 1-ulp difference is a different AMaZE output). */
 inline Reason preGate( bool enabled,
@@ -190,9 +198,7 @@ inline Reason preGate( bool enabled,
         if( !( warmKey.wb[i] == presentKey.wb[i] ) ) return Reason::WbMismatch;
     }
     if( warmKey.reducedHnyquist != presentKey.reducedHnyquist ) return Reason::HnyquistMismatch;
-    if( setClipNow != warmKey.setClipCountAfterWarm || setLutsNow != warmKey.setLutsCountAfterWarm
-     || setPatternNow != warmKey.setPatternCountAfterWarm )
-        return Reason::ReconConfiguredSinceWarm;
+    if( configuredSinceWarm( warmKey, setClipNow, setLutsNow, setPatternNow ) ) return Reason::ReconConfiguredSinceWarm;
     // F-key: decided here, before any compare; an unknown state on either side is never proven equal
     if( !warmKey.state.valid || !presentKey.state.valid || !preparedStateDiff( warmKey.state, presentKey.state ).isEmpty() )
         return Reason::StateMismatch;
@@ -208,6 +214,53 @@ inline Reason afterCompare( bool compareCompleted, bool equal, const QString &wh
     if( why == QLatin1String( "capture_missing" ) ) return Reason::CaptureMissing;
     if( why == QLatin1String( "cuda_suppressed" ) ) return Reason::CudaSuppressed;
     return Reason::CompareFailed;
+}
+
+/*! The three process-wide configure counts (llrpGpuPlaybackReconSetClipCount / SetLutsCount / SetIsoPatternCount), read
+ *  together. */
+struct LiveCounts
+{
+    uint64_t setClip = 0;
+    uint64_t setLuts = 0;
+    uint64_t setPattern = 0;
+};
+
+/*! The present's whole decision (GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture): preGate() on the live
+ *  counts, then, only when it passed, the exact input compare. readLiveCounts() returns a LiveCounts;
+ *  compareInput( bool *equal, QString *why ) runs the compare and returns whether it completed.
+ *  *compareAttempted says whether compareInput ran.
+ *  sol r17 #2: the counts preGate() read are a sample. The recon worker configures while the GUI thread presents, so a
+ *  lookahead frame's set_iso_pattern (or set_clip / set_luts) can land after that read and before or during the compare.
+ *  A hit is therefore authorized only by the counts read again AFTER the compare: if any moved since the warm, the
+ *  outcome is ReconConfiguredSinceWarm. The first read stays (it skips the compare when a configure is already visible).
+ *  Only a hit is rechecked; every other outcome already runs AMaZE, and a content miss keeps its name (the dump's
+ *  trigger). */
+template <typename ReadLiveCounts, typename CompareInput>
+inline Reason decide( bool enabled,
+                      bool adopted,
+                      const Key &warmKey,
+                      const Key &presentKey,
+                      bool cudaSuppressed,
+                      bool validationProbe,
+                      ReadLiveCounts readLiveCounts,
+                      CompareInput compareInput,
+                      bool *compareAttempted )
+{
+    if( compareAttempted ) *compareAttempted = false;
+    const LiveCounts sampled = readLiveCounts();
+    const Reason gate = preGate( enabled, adopted, warmKey, presentKey, cudaSuppressed, validationProbe, sampled.setClip,
+                                 sampled.setLuts, sampled.setPattern );
+    if( gate != Reason::None ) return gate;
+    if( compareAttempted ) *compareAttempted = true;
+    bool equal = false;
+    QString why;
+    const bool completed = compareInput( &equal, &why );
+    const Reason compared = afterCompare( completed, equal, why );
+    if( compared != Reason::Hit ) return compared;
+    const LiveCounts after = readLiveCounts();
+    if( configuredSinceWarm( warmKey, after.setClip, after.setLuts, after.setPattern ) )
+        return Reason::ReconConfiguredSinceWarm;
+    return Reason::Hit;
 }
 
 /*! Reuse only on a hit: every other reason runs AMaZE unchanged. */

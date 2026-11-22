@@ -1448,28 +1448,34 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
             presentKey.reducedHnyquist = reducedHnyquist;
             // WARM-RECON-DETERMINISM-1 F-key: this present's recon constants (the state its recon ran with)
             presentKey.state = playback_warm_output_reuse::preparedStateFrom( *state );
-            playback_warm_output_reuse::Reason reuseReason = playback_warm_output_reuse::preGate(
+            // sol r17 #2: the recon worker configures (a lookahead frame's set_iso_pattern) while this GUI thread
+            // presents, so decide() reads the live counts for the gate AND again after the compare
+            const auto readLiveConfigureCounts = []()
+            {
+                playback_warm_output_reuse::LiveCounts now;
+                now.setClip = llrpGpuPlaybackReconSetClipCount();
+                now.setLuts = llrpGpuPlaybackReconSetLutsCount();
+                now.setPattern = llrpGpuPlaybackReconSetIsoPatternCount();
+                return now;
+            };
+            bool reuseCompareAttempted = false;
+            playback_warm_output_reuse::Reason reuseReason = playback_warm_output_reuse::decide(
                 playbackWarmOutputReuseEnabled(),
                 stagedAdopted,
                 warmKey,
                 presentKey,
                 llrpGpuCudaSuppressed() != 0,
                 validationProbeTexture,
-                llrpGpuPlaybackReconSetClipCount(),
-                llrpGpuPlaybackReconSetLutsCount(),
-                llrpGpuPlaybackReconSetIsoPatternCount());
-            bool reuseCompareAttempted = false;
-            if ( reuseReason == playback_warm_output_reuse::Reason::None )
-            {
-                reuseCompareAttempted = true;
-                const double compareStartMs = elapsedMs();
-                bool sameInput = false;
-                QString compareWhy;
-                const bool compared = gpuAmazeDebayerInputBayer16MatchesCapture(
-                    deviceBayer16, texWidth, texHeight, warmKey.captureId, &sameInput, &compareWhy);
-                setupTiming.reuse_compare_ms = elapsedMs() - compareStartMs;
-                reuseReason = playback_warm_output_reuse::afterCompare(compared, sameInput, compareWhy);
-            }
+                readLiveConfigureCounts,
+                [&](bool *sameInput, QString *compareWhy)
+                {
+                    const double compareStartMs = elapsedMs();
+                    const bool compared = gpuAmazeDebayerInputBayer16MatchesCapture(
+                        deviceBayer16, texWidth, texHeight, warmKey.captureId, sameInput, compareWhy);
+                    setupTiming.reuse_compare_ms = elapsedMs() - compareStartMs;
+                    return compared;
+                },
+                &reuseCompareAttempted);
             // WARM-RECON-DETERMINISM-1: both states on a state or content miss; the opt-in dump reads the capture, so
             // before its release
             setupTiming.reuse_states = playback_warm_output_reuse::stateFields( reuseReason, warmKey, presentKey );
