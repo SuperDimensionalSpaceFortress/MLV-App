@@ -297,6 +297,29 @@ TEST(ReceiptLoader, AMalformedOptOutNeverSwitchesLookAssistOff)
         "<receipt version=\"4\">\n  <lookAssistEnabled><value/></lookAssistEnabled>\n</receipt>\n"), &nested));
 }
 
+// r4 (r4 adversary A1 on 07462a6a): text around a child element (mixed content) is no scalar either. The scan read
+// 0<value/> as 0 (the child skipped, the text kept): it switched Look Assist off, and a later 1<value/> hid a valid
+// opt-out before it.
+TEST(ReceiptLoader, AMixedContentOptOutIsNoValue)
+{
+    const char *const on[] = {
+        "<receipt version=\"4\"><cutIn>1</cutIn><cutOut>1</cutOut><lookAssistEnabled>0<value/></lookAssistEnabled></receipt>",
+        "<receipt version=\"4\"><cutIn>1</cutIn><cutOut>1</cutOut><lookAssistEnabled><value/>0</lookAssistEnabled></receipt>",
+        "<receipt version=\"4\"><cutIn>1</cutIn><cutOut>1</cutOut><lookAssistEnabled>0<value>1</value></lookAssistEnabled></receipt>",
+    };
+    for (const char *text : on)
+    {
+        ReceiptSettings receipt;
+        ASSERT_TRUE(loadReceiptText(QByteArray(text), &receipt));
+        ASSERT_TRUE(receipt.lookAssistEnabled());
+    }
+    ReceiptSettings off;
+    ASSERT_TRUE(loadReceiptText(QByteArrayLiteral(
+        "<receipt version=\"4\"><cutIn>1</cutIn><cutOut>1</cutOut><lookAssistEnabled>0</lookAssistEnabled>"
+        "<lookAssistEnabled>1<value/></lookAssistEnabled></receipt>"), &off));
+    ASSERT_FALSE(off.lookAssistEnabled());
+}
+
 // r4: a valid scalar keeps its meaning next to a malformed one, in either order and either layout; surrounding
 // whitespace is still a value.
 TEST(ReceiptLoader, AValidOptOutSurvivesAMalformedNeighbour)
@@ -351,7 +374,10 @@ TEST(ReceiptLoader, TheOptOutScanReadsTheWalksOwnBytes)
     ASSERT_EQ(-1, helper.indexOf(QStringLiteral("QFile file")));
     ASSERT_EQ(-1, helper.indexOf(QStringLiteral(".open(")));
     ASSERT_TRUE(helper.indexOf(QStringLiteral("qobject_cast<QBuffer *>( reader->device() )")) >= 0);
-    ASSERT_TRUE(helper.indexOf(QStringLiteral("readElementText( QXmlStreamReader::SkipChildElements )")) >= 0);
+    // r4 (r4 adversary A1): the scan reads the element token by token, so a child inside it is seen (readElementText
+    // with SkipChildElements kept the text around a skipped child); A2's later scalar is still reached (pinned above).
+    ASSERT_EQ(-1, helper.indexOf(QStringLiteral("readElementText(")));
+    ASSERT_TRUE(helper.indexOf(QStringLiteral("!childElement && lookAssistEnabledValue( text, &on )")) >= 0);
     // r4 (sol r3 B1): the scan reads a child's value with the handlers' rule, never a bare toInt() of any text.
     ASSERT_TRUE(helper.indexOf(QStringLiteral("lookAssistEnabledValue( text, &on )")) >= 0);
     ASSERT_EQ(-1, helper.indexOf(QStringLiteral("text.toInt() != 0")));

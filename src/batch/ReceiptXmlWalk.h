@@ -4,7 +4,7 @@
 /* The Look Assist opt-out of the receipt element readers (ReceiptLoader::parseXmlElements and
  * MainWindow::readXmlElementsFromFile).
  *
- * Their token walk is base's, unchanged: every element handler ends with readElementText() then
+ * Their token walk is base's, unchanged: every element handler reads the element's text, then
  * readNext(), so in a compact receipt (no whitespace between elements) it reads the first element,
  * steps past the next one and stops at that one's end element. Reading the rest of a compact receipt
  * changed fields such as cutIn/cutOut with Look Assist off, so the off path was no longer base's
@@ -103,13 +103,34 @@ public:
                 if( depth == 0 && scan.namespaceUri().isEmpty()
                  && scan.name() == QString( "lookAssistEnabled" ) )
                 {
-                    // Child elements are skipped, not an error, so a malformed earlier one cannot hide a
-                    // later scalar opt-out (r2 adversary A2). Its text is read as the handlers read it:
-                    // one with no integer in it is no value and changes nothing (r4, sol r3 B1).
-                    const QString text = scan.readElementText( QXmlStreamReader::SkipChildElements );
+                    // Read token by token to the element's own end. A child element in it (mixed content
+                    // such as 0<value/>, which the handlers' text read refuses) makes it no value; the scan
+                    // goes on, so a malformed earlier one cannot hide a later scalar opt-out (r2 adversary
+                    // A2; r4 adversary A1 on 07462a6a). Its text is read with the handlers' rule: one with
+                    // no integer in it is no value and changes nothing (r4, sol r3 B1).
+                    QString text;
+                    bool childElement = false;
+                    int inner = 0;
+                    while( !scan.atEnd() )
+                    {
+                        scan.readNext();
+                        if( scan.hasError() ) break;
+                        if( scan.isStartElement() )
+                        {
+                            childElement = true;
+                            ++inner;
+                        }
+                        else if( scan.isEndElement() )
+                        {
+                            if( inner == 0 ) break; // the lookAssistEnabled element's own end
+                            --inner;
+                        }
+                        else if( inner == 0 && scan.isCharacters() )
+                            text += scan.text();
+                    }
                     if( scan.hasError() ) break;
                     bool on = true;
-                    if( lookAssistEnabledValue( text, &on ) ) lastValue = on ? 1 : 0;
+                    if( !childElement && lookAssistEnabledValue( text, &on ) ) lastValue = on ? 1 : 0;
                     continue;
                 }
                 ++depth;
