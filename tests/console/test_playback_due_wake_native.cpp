@@ -30,6 +30,7 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -2488,8 +2489,8 @@ TEST(PlaybackDueWakeSend, R2A1_AStaleSentWakeInTheRunnerSleepIsNotHeldCountedOrA
     wake.resetStrandedCounts();
     wake.arm( 0.5 );
     ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
+    t.restart();                                                       // before arm: the replacement's 40 ms are inside what t measures
     wake.arm( 40.0 );
-    t.restart();
     ASSERT_TRUE( wake.sleepForSmokeRunner( 500 ) == PlaybackDueWake::RunnerSleep::WokenBySent );
     ASSERT_TRUE( t.elapsed() >= 30 );                                  // not at the stale wake (~0 ms), at the replacement
     ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenBySent() );
@@ -2631,6 +2632,17 @@ double r17A1NowS()
 {
     return dueWakeQpcNowMs() / 1000.0;
 }
+// CI-FLAKE-PLAYBACK-DUE-WAKE-R17A1-TIMING-1: the caller clock the sleep is handed, recording every read it makes. Whatever the
+// scheduler did, the sleep's segments are differences of these reads, so the test measures the times it then compares against.
+std::vector<double> g_r17A1Stamps;
+std::atomic<bool> g_r17A1Entered { false };
+double r17A1RecordingNowS()
+{
+    const double s = dueWakeQpcNowMs() / 1000.0;
+    g_r17A1Stamps.push_back( s );
+    g_r17A1Entered = true;
+    return s;
+}
 }
 #endif
 
@@ -2647,38 +2659,92 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     RegisterClassW( &wc );
     const HWND window = CreateWindowExW( 0, kClass, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr );
     ASSERT_TRUE( window != nullptr );
-    R17A1Windows w;
-    g_r17A1Windows = &w;
-    std::atomic<bool> sent { false };
-    std::thread sender( [window, &sent]() {
-        Sleep( 20 );
-        sent = SendNotifyMessageW( window, kR17A1ForeignMessage, 0, 0 ) != 0;
-    } );
-    const double enteredMs = dueWakeQpcNowMs();
-    const PlaybackDueWake::RunnerSleep slept = wake.sleepForSmokeRunner( 80, &r17A1NowS, &r17A1Charge, &w );
-    const double returnedMs = dueWakeQpcNowMs();
-    sender.join();
-    g_r17A1Windows = nullptr;
+    // CI-FLAKE-PLAYBACK-DUE-WAKE-R17A1-TIMING-1 (hosted run 44998377370: `w.chargedS[1] * 1000.0 >= 30.0` failed, the sender
+    // thread woke at ~55 ms of the 80). Every bound below follows from a clock read the test or the sleep made, never from the
+    // scheduler running a thread on time. The sender starts its 20 ms only once the sleep has stamped its entry, so a main
+    // thread descheduled before the sleep cannot eat the segment before the send. The send itself must land inside the sleep
+    // for the property to be observable at all; when the sender is so late that it misses the whole 80 ms (no dispatch ran, so
+    // there is nothing to measure), the observation is retried -- a pass can never come from a missed send, since the dispatch
+    // span, both segments and the 4 stamps are all asserted below.
+    constexpr int kAttempts = 5;
+    std::unique_ptr<R17A1Windows> wp;
+    std::vector<std::pair<double, double>> spans;
+    std::vector<double> stamps;
+    double enteredMs = 0.0;
+    double returnedMs = 0.0;
+    PlaybackDueWake::RunnerSleep slept = PlaybackDueWake::RunnerSleep::NotHandled;
+    bool sentOk = false;
+    bool landed = false;
+    for( int attempt = 0; attempt < kAttempts && !landed; ++attempt )
+    {
+        wp.reset( new R17A1Windows );
+        g_r17A1Windows = wp.get();
+        g_r17A1Stamps.clear();
+        g_r17A1Entered = false;
+        g_r17A1HandlerStartMs = 0.0;
+        g_r17A1HandlerEndMs = 0.0;
+        std::atomic<bool> sent { false };
+        std::thread sender( [window, &sent]() {
+            const ULONGLONG giveUp = GetTickCount64() + 5000;
+            while( !g_r17A1Entered.load() && GetTickCount64() < giveUp ) Sleep( 0 );
+            Sleep( 20 );
+            sent = SendNotifyMessageW( window, kR17A1ForeignMessage, 0, 0 ) != 0;
+        } );
+        enteredMs = dueWakeQpcNowMs();
+        slept = wake.sleepForSmokeRunner( 80, &r17A1RecordingNowS, &r17A1Charge, wp.get() );
+        returnedMs = dueWakeQpcNowMs();
+        sender.join();
+        g_r17A1Windows = nullptr;
+        // a send that missed the sleep is still queued: take it now (its handler sees no windows), so it cannot cut the next try
+        MSG drain;
+        PeekMessageW( &drain, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );
+        sentOk = sent.load();
+        spans = wake.lastRunnerSleepDispatchSpansS();
+        stamps = g_r17A1Stamps;
+        landed = spans.size() == 1;
+    }
     DestroyWindow( window );
-    ASSERT_TRUE( sent.load() );
+    ASSERT_TRUE( sentOk );
+    ASSERT_TRUE( landed );                                             // the send fell inside one of the sleeps
     ASSERT_TRUE( slept == PlaybackDueWake::RunnerSleep::Slept );
+    R17A1Windows &w = *wp;
     // one segment per window: the old one was charged before the handler closed it, the new one only after it opened
     ASSERT_EQ( 1, w.segments[0] );
     ASSERT_EQ( 1, w.segments[1] );
+    // the four reads the sleep made on the caller clock: its entry, the dispatch's begin and end, and its return
+    ASSERT_EQ( static_cast<size_t>( 4 ), stamps.size() );
+    const double entryS = stamps[0];
+    const double dispatchStartS = stamps[1];
+    const double dispatchEndS = stamps[2];
+    const double returnS = stamps[3];
+    ASSERT_TRUE( entryS * 1000.0 >= enteredMs - 1e-6 );                // the sleep ran between the test's own two reads (1e-6: the /1000 then *1000 round trip)
+    ASSERT_TRUE( returnS * 1000.0 <= returnedMs + 1e-6 );
+    ASSERT_TRUE( entryS < dispatchStartS && dispatchStartS <= dispatchEndS && dispatchEndS < returnS );
+    // segment 0 is exactly [entry, dispatch begin] and segment 1 exactly [dispatch end, return], on any scheduler: a late
+    // sender moves the dispatch, never the identity
+    ASSERT_TRUE( std::fabs( w.chargedS[0] - ( dispatchStartS - entryS ) ) < 1e-9 );
+    ASSERT_TRUE( std::fabs( w.chargedS[1] - ( returnS - dispatchEndS ) ) < 1e-9 );
     ASSERT_TRUE( w.chargedS[0] * 1000.0 <= g_r17A1HandlerStartMs - enteredMs + 0.5 );
-    ASSERT_TRUE( w.chargedS[0] * 1000.0 >= 10.0 );                     // the ~20 ms before the send
     ASSERT_TRUE( w.chargedS[1] * 1000.0 <= returnedMs - g_r17A1HandlerEndMs + 0.5 );
-    ASSERT_TRUE( w.chargedS[1] * 1000.0 >= 30.0 );                     // the rest of the 80 ms
+    ASSERT_TRUE( w.chargedS[0] * 1000.0 >= 10.0 );                     // the sender waits 20 ms after the entry stamp: only later
+    // the sleep is never cut short at the dispatch: it runs the requested 80 ms (late only lengthens it)
+    ASSERT_TRUE( ( returnS - entryS ) * 1000.0 >= 79.0 );
     // the two segments and the dispatch tile the sleep: the dispatch account is exactly what the segments leave out
-    const std::vector<std::pair<double, double>> spans = wake.lastRunnerSleepDispatchSpansS();
     ASSERT_EQ( static_cast<size_t>( 1 ), spans.size() );
+    ASSERT_TRUE( std::fabs( spans[0].first - dispatchStartS ) < 1e-9 );
+    ASSERT_TRUE( std::fabs( spans[0].second - dispatchEndS ) < 1e-9 );
+    ASSERT_TRUE( std::fabs( w.chargedS[0] + ( spans[0].second - spans[0].first ) + w.chargedS[1] - ( returnS - entryS ) ) < 1e-9 );
+    // the dispatch span sits inside the handler's own reads' bracket: it began before the handler and ended after it
     ASSERT_TRUE( spans[0].first * 1000.0 <= g_r17A1HandlerStartMs + 0.5 );
     ASSERT_TRUE( spans[0].second * 1000.0 >= g_r17A1HandlerEndMs - 0.5 );
     // a sleep no dispatch cuts is one segment, charged to the window open at its end; NotHandled hands out none
     R17A1Windows plain;
-    ASSERT_TRUE( wake.sleepForSmokeRunner( 15, &r17A1NowS, &r17A1Charge, &plain ) == PlaybackDueWake::RunnerSleep::Slept );
+    g_r17A1Stamps.clear();
+    ASSERT_TRUE( wake.sleepForSmokeRunner( 15, &r17A1RecordingNowS, &r17A1Charge, &plain ) == PlaybackDueWake::RunnerSleep::Slept );
     ASSERT_EQ( 1, plain.segments[0] );
-    ASSERT_TRUE( plain.chargedS[0] * 1000.0 >= 12.0 );
+    ASSERT_EQ( static_cast<size_t>( 2 ), g_r17A1Stamps.size() );
+    ASSERT_TRUE( std::fabs( plain.chargedS[0] - ( g_r17A1Stamps[1] - g_r17A1Stamps[0] ) ) < 1e-9 );   // exactly entry to return
+    ASSERT_TRUE( plain.chargedS[0] * 1000.0 >= 12.0 );                 // the requested 15 ms, never cut short (late only lengthens)
     PlaybackDueWake postWake( nullptr, []() {}, PlaybackDueWakeDeliveryMode::Post );
     R17A1Windows none;
     ASSERT_TRUE( postWake.sleepForSmokeRunner( 1, &r17A1NowS, &r17A1Charge, &none ) == PlaybackDueWake::RunnerSleep::NotHandled );
