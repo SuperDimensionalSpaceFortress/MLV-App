@@ -2017,6 +2017,146 @@ function Get-DvDueWakeDelivered {
     'delivered'
 }
 
+function Get-DvWindowToggleRequestEvidence {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1 (adversary A5 on ead7bbdb): a leg that does NOT name generatorArgs.midPlayWindowToggles must have driven no window
+    toggle. The app honours MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES from any process environment, so a variable inherited from the launcher would move the window
+    of an ordinary windowed leg (and its job, plain, publishes no windowToggles* scalar to show it). `blocks` is true when such a leg's run log carries a
+    gui_smoke.window_toggle or gui_smoke.window_toggles record, read from the app's record body only (Get-DvLogRecordBodies cuts the log prefix and the Qt
+    location suffix). A leg that asks is judged by its own windowToggles* criteria, not here. Pure and shared: the runner gates on it and Test-DvReceiptValid
+    re-derives it from the hashed run log.
+    #>
+    param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
+    $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'midPlayWindowToggles'
+    $requested = ($raw -is [bool]) -and $raw
+    $mentions = 0
+    foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
+        # (the body still starts with the optional `[utc] [LEVEL] [0x<thread>] ` prefix; a record counts only where it starts the body after it)
+        # r4 (adversary A2 on 0b915c19): the letter i is the class [Ii], so a host culture that does not fold an upper-case I (tr-TR) still counts GUI_SMOKE.WINDOW_TOGGLE
+        # r7 (r7 adversary A1 on be8fb7b6, its inputs: `gui_smoke.window_toggles<TAB>requested=4 ...` and the bare name): the name ends at ANY non-name character or the
+        # line end, never only at a literal space, so a toggle-named record in any spelling is a mention (fail closed: an ordinary leg blocks)
+        # r8 (keys r7 B1, input: `gui_smoke.window_toggles<U+212A> requested=4 driven=4 reason=ok` on an ordinary leg): the terminator is (?!$script:DvNameChar), ASCII
+        # matched case-sensitively, so a U+212A / U+0130 glued to the name ends it and the record is a mention (under -match a bare [A-Za-z0-9_] folded them in)
+        if ($line -match ('^\s*(?:\[[^\]]*\]\s*)*gu[Ii]_smoke\.w[Ii]ndow_toggles?(?!' + $script:DvNameChar + ')')) { $mentions++ }
+    }
+    $blocks = (-not $requested) -and ($mentions -gt 0)
+    [pscustomobject]@{
+        requested = $requested
+        mentions = $mentions
+        blocks = $blocks
+        reason = $(if ($blocks) { "WINDOW_TOGGLES_INHERITED: the run log carries $mentions gui_smoke.window_toggle record(s) but the leg does not name midPlayWindowToggles (MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES came from the launcher's environment)" } else { $null })
+    }
+}
+
+function Get-DvWindowToggleCriteriaGap {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r11 (r11 adversary A1 on b82002ec, its input: an fstoggle spec with windowToggleEvidenceReason removed from both role
+    criteria arrays, over an honest reason=summary-reason-incomplete): a leg that names generatorArgs.midPlayWindowToggles relies on its CRITERIA to fail an honest
+    non-ok toggle proof (the reconcile gate passes it as "what the log derives"), so criteria.acceptance and criteria.supplementary must both be present, each
+    must hold an array for every backend the spec names, and every array must bind all five: windowTogglesRequested / Driven / KeptPlaying / Advanced eq 4 (the job's schedule) and
+    windowToggleEvidenceReason eq "ok". Returns the gap text, or $null. A leg that does not ask returns $null.
+    #>
+    param([Parameter(Mandatory)]$Spec)
+    $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'midPlayWindowToggles'
+    if (-not (($raw -is [bool]) -and $raw)) { return $null }
+    $required = @(@('windowTogglesRequested', '4'), @('windowTogglesDriven', '4'), @('windowTogglesKeptPlaying', '4'), @('windowTogglesAdvanced', '4'), @('windowToggleEvidenceReason', 'ok'))
+    $criteria = Get-DvProp $Spec 'criteria'
+    # r11b (r11 adversary A1 on 7d6aea0a, inputs: criteria.supplementary = {}, and both sets keyed cpu while backends = ["cuda"]): BOTH sets must be present, and
+    # each must hold a role array for EVERY backend the spec names (the array Test-DvCriteria judges; a missing one passes vacuously), each binding all five
+    # r12 (sol r11 B1 on d3b176e3, input: backends ["cpu","cuda"] with complete cpu and cuda arrays in both sets): Get-DvProp hands the backends array over as ONE
+    # pipeline object, so piping it straight into a [string] cast joined it into 'cpu cuda' and refused a valid spec. The value is held first and @() enumerates its
+    # elements; each is one backend NAME (a JSON string, the schema's enum), and an entry that is not a string is refused by name, never cast
+    # r12 adversary A1 on 3f7bf31b (input: backends [null, "cuda"] with complete cuda arrays): a null or empty entry is REFUSED, never skipped; the leg's default
+    # backend is the FIRST entry (Invoke-VenueLeg.ps1), so a skipped null admitted a spec at preflight that failed late
+    $backendsValue = Get-DvProp $Spec 'backends'
+    if ($null -eq $backendsValue) { return 'the spec names no backend, so no criteria array is judged' }
+    $backends = [System.Collections.Generic.List[string]]::new()
+    foreach ($entry in @($backendsValue)) {
+        if ($entry -isnot [string] -or $entry.Length -eq 0) {
+            return "the spec's backends holds an entry that is not a backend name ($(ConvertTo-Json -InputObject $entry -Compress -Depth 3)), so no criteria array is named by it"
+        }
+        $backends.Add($entry)
+    }
+    if ($backends.Count -lt 1) { return 'the spec names no backend, so no criteria array is judged' }
+    foreach ($setName in 'acceptance', 'supplementary') {
+        $set = Get-DvProp $criteria $setName
+        if ($null -eq $set) { return "criteria.$setName is absent, so nothing fails a non-ok toggle proof" }
+        if ($set -isnot [System.Management.Automation.PSCustomObject]) { return "criteria.$setName is not one JSON object" }
+        foreach ($backend in $backends) {
+            if ($null -eq $set.PSObject.Properties[$backend]) { return "criteria.$setName has no $backend array (a backend the spec names), so nothing fails a non-ok toggle proof" }
+        }
+        # r14 (r14 adversary A1 on 1376a142, input: windowTogglesDriven's value 4 -> [4] in both cuda arrays over a healthy log): a [string] cast read [4] (and ["4"],
+        # ["ok"]) as the bound value, while Test-DvCriteria compares the RAW value (4 -eq @(4) is false), so an unbound spec passed preflight and FAILED a healthy
+        # capture late. A row binds only when its value is the JSON scalar the evaluator matches: a number for the four counts (as the framesExported binding in
+        # Get-DvExportOutcome reads one) and a string for the reason; any other value (array, object, boolean, null, a numeric string) is no binding
+        foreach ($role in $set.PSObject.Properties) {
+            $rows = @($role.Value)
+            foreach ($need in $required) {
+                $bound = @($rows | Where-Object { $null -ne $_ -and [string](Get-DvProp $_ 'metric') -ceq $need[0] -and [string](Get-DvProp $_ 'op') -ceq 'eq' -and $(if ($need[1] -ceq 'ok') { (Get-DvProp $_ 'value') -is [string] } else { (Get-DvProp $_ 'value') -is [int] -or (Get-DvProp $_ 'value') -is [long] -or (Get-DvProp $_ 'value') -is [double] }) -and [string](Get-DvProp $_ 'value') -ceq $need[1] })
+                if ($bound.Count -lt 1) { return "criteria.$setName.$($role.Name) does not bind $($need[0]) eq $($need[1])" }
+            }
+        }
+    }
+    $null
+}
+
+function Get-DvWindowToggleReconcileEvidence {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r3 (sol B4 on 11def8e4): a leg that NAMES generatorArgs.midPlayWindowToggles must have its windowToggles* scalars
+    (windowTogglesRequested / Driven / KeptPlaying / Advanced and windowToggleEvidenceReason) backed by the hashed run log. They are re-derived here from the
+    log with the job's own reader (Get-AttrCudaWindowToggleEvidence, over the measured session Get-DvSmokeSummaryFields names; r11: an UNREADABLE one blocks with
+    WINDOW_TOGGLES_SESSION_UNREADABLE and is never handed to the reader as no id) and
+    compared field for field with the metrics; `blocks` is true when any of the five is absent or differs, so a summary whose toggle records were removed from
+    the log (and the log-hash references refreshed) is INVALID, never a PASS. An honest failure (the scalars are exactly what the log derives, reason not ok)
+    does not block: the criteria FAIL it. A leg that does not ask is not judged here (Get-DvWindowToggleRequestEvidence is its gate). Pure and shared: the
+    runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log.
+    #>
+    param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText, $Metrics)
+    $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'midPlayWindowToggles'
+    $requested = ($raw -is [bool]) -and $raw
+    if (-not $requested) { return [pscustomobject]@{ requested = $false; blocks = $false; reason = $null; derived = $null } }
+    # r11 (r11 adversary A1 on b82002ec): an honest non-ok proof passes this gate and is failed by the criteria, so a requested leg whose criteria do not bind the
+    # five scalars is INVALID here (the leg writer and Test-DvReceiptValid both call this), never a PASS of a non-ok proof
+    $criteriaGap = Get-DvWindowToggleCriteriaGap -Spec $Spec
+    if ($null -ne $criteriaGap) {
+        return [pscustomobject]@{ requested = $true; blocks = $true; reason = "WINDOW_TOGGLES_CRITERIA_UNBOUND: the leg names midPlayWindowToggles but $criteriaGap"; derived = $null }
+    }
+    $sessionRead = Get-DvSmokeSummaryFields -LogText $LogText
+    # r11 (sol r10 A2, opus key3 r10 H1 on 7fc447b9, input: the healthy log with id=3x / session=3x): an UNREADABLE measured session (a malformed first marker, or
+    # with no marker a malformed first summary) names no session, so it REFUSES requested-toggle proof with a typed reason; before r11 it became the empty id and the
+    # reader's automatic selection picked the only marker (3x) and derived ok. The derived evidence is the refusal itself, never a reader result
+    if ($sessionRead.sessionUnreadable -eq $true) {
+        return [pscustomobject]@{
+            requested = $true
+            blocks = $true
+            reason = 'WINDOW_TOGGLES_SESSION_UNREADABLE: the leg names midPlayWindowToggles but the run log''s measured playback_smoke session is unreadable (Get-DvSmokeSummaryFields sessionUnreadable), so no toggle record is the measured Play''s; requested-toggle proof is refused, never derived by automatic session selection'
+            derived = [pscustomobject]@{ requested = 0; driven = 0; keptPlaying = 0; advanced = 0; reason = 'measured-session-unreadable' }
+        }
+    }
+    $session = $(if ($null -ne $sessionRead.session) { [string]$sessionRead.session } else { '' })
+    $module = Import-Module (Join-Path $PSScriptRoot '..\bachelor\AttrCudaArtifacts.psm1') -PassThru -DisableNameChecking
+    $derived = & $module { param([string]$t, [string]$s) Get-AttrCudaWindowToggleEvidence -LogText $t -MeasuredSessionId $s } ([string]$LogText) $session
+    $pairs = @(@('windowTogglesRequested', $derived.requested), @('windowTogglesDriven', $derived.driven), @('windowTogglesKeptPlaying', $derived.keptPlaying),
+        @('windowTogglesAdvanced', $derived.advanced), @('windowToggleEvidenceReason', $derived.reason))
+    $mismatches = [System.Collections.Generic.List[string]]::new()
+    foreach ($pair in $pairs) {
+        $claimed = Get-DvProp $Metrics $pair[0]
+        if ($null -eq $claimed -or -not [string]::Equals([string]$claimed, [string]$pair[1], [StringComparison]::Ordinal)) {
+            $mismatches.Add("$($pair[0])=$(if ($null -eq $claimed) { '<absent>' } else { [string]$claimed }) but the run log derives $([string]$pair[1])")
+        }
+    }
+    $blocks = $mismatches.Count -gt 0
+    [pscustomobject]@{
+        requested = $true
+        blocks = $blocks
+        reason = $(if ($blocks) { "WINDOW_TOGGLES_NOT_FROM_LOG: the leg names midPlayWindowToggles but its windowToggles* scalars are not what the hashed run log derives ($($mismatches -join '; ')); a toggle claim the raw records do not back is no evidence" } else { $null })
+        derived = $derived
+    }
+}
+
 function Get-DvDueWakeDeliveryEvidence {
     <#
     .SYNOPSIS
@@ -2449,7 +2589,7 @@ function Get-DvLookAssistEvidence {
         if (-not [string]::IsNullOrEmpty($LogText)) {
             # r4 (r3 adversary A2 on #726): matched on the record body, so a Qt location path never selects (or answers for) the visual_state line
             # r27: the raw lines, index for index with the bodies (Get-DvLogRecordBodies splits the same way and keeps every line), for the discarded text
-            $rawLines = $LogText -split "`r?`n"
+            $rawLines = $LogText -split $script:DvLogLineBreak
             $bodies = Get-DvLogRecordBodies -LogText $LogText
             for ($li = 0; $li -lt $bodies.Count; $li++) {
                 $line = $bodies[$li]
@@ -2824,6 +2964,10 @@ function Get-DvLogRecordDiscardedText {
 # (log_line_field::fieldValue maps every C0 control to '_'), so a masked `<key>=` is no `<key>=` for any reader, and a value stays one token.
 $script:DvQuotedEqualsMask = [char]0x1A
 $script:DvQuoteChars = [char[]]@([char]'"', [char]"'")
+# VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r7 (r6 adversary A1 on 1ee5e122, its input: `playback_smoke.frame session=3 n=1<CR>gui_smoke.window_toggles ...`): the ONE
+# rule for where a run-log record ends: CRLF, a bare CR or a bare LF (the job's Get-AttrCudaWindowToggleEvidence splits the same way). An LF-only split left a
+# CR-joined record behind the body before it, so no reader saw it. Get-DvLogRecordBodies and every raw-line list kept index for index with it split by this.
+$script:DvLogLineBreak = '\r\n|\r|\n'
 
 function ConvertTo-DvQuoteMaskedBody {
     <#
@@ -2868,7 +3012,8 @@ function Get-DvLogRecordBodies {
     #>
     param([AllowNull()][AllowEmptyString()][string]$LogText)
     if ([string]::IsNullOrEmpty($LogText)) { return , [string[]]@() }
-    $lines = $LogText -split "`r?`n"
+    # r7 (r6 adversary A1): a bare CR ends a record too ($script:DvLogLineBreak)
+    $lines = $LogText -split $script:DvLogLineBreak
     # r5: only a line that holds ` (` can carry a location; the rest are returned as they are without a call
     for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i].IndexOf(' (', [StringComparison]::Ordinal) -ge 0) { $lines[$i] = Get-DvLogRecordBody -Line $lines[$i] } }
     # r24: only a body that holds a quote can hold a quoted span; the rest are returned as they are without a call
@@ -3216,7 +3361,7 @@ $script:ExportFields = @('format', 'maxFrames', 'receipt', 'receiptSha256', 'dua
 $script:ExportExcludedKeys = @('look', 'displayMode', 'visualCapture', 'visualCaptureOptOutReason', 'acceptedEffectiveScale', 'presentTearingExpectedReason')
 $script:ExportGeneratorArgs = @('cpuQuiescenceThresholdPercent')
 # the generatorArgs members leg-spec.schema.json types boolean (prepConflatedMove: const true); a test pins this list to the schema
-$script:GeneratorArgsBooleanSwitches = @('forceLookAssist', 'corePartitionTelemetry', 'disableLookAssist', 'presentTrace', 'firstPresentCapture', 'warmReuseMissDump', 'unpaced', 'disablePrepPointwiseFast', 'prepConflatedMove', 'utilSample', 'disableReconReleaseDeferred', 'dueWakeDeliveryPost')
+$script:GeneratorArgsBooleanSwitches = @('forceLookAssist', 'corePartitionTelemetry', 'disableLookAssist', 'presentTrace', 'firstPresentCapture', 'warmReuseMissDump', 'unpaced', 'disablePrepPointwiseFast', 'prepConflatedMove', 'utilSample', 'disableReconReleaseDeferred', 'dueWakeDeliveryPost', 'midPlayWindowToggles')
 # EXPORT-VENUE-LEG-1: an export leg's typed shape (the schema's export block and its allOf exclusions), and `export` refused on any other leg. Called by
 # Get-DvLegSpecShapeRefusal, so the leg and the lease batch's preflight refuse the same specs before a lease opens. Returns the refusal text, or $null.
 function Get-DvExportShapeRefusal {
@@ -3274,7 +3419,7 @@ function Get-DvLegSpecShapeRefusal {
     foreach ($container in 'look', 'generatorArgs', 'acceptedEffectiveScale', 'timeouts', 'criteria', 'export') {
         $present = $Spec.PSObject.Properties[$container]
         if ($null -ne $present -and $present.Value -isnot [System.Management.Automation.PSCustomObject]) {
-            $shape = $(if ($null -eq $present.Value) { 'null' } elseif ($present.Value -is [array]) { 'an array' } else { "a $($present.Value.GetType().Name)" })
+            $shape = $(if ($null -eq $present.Value) { 'null' } elseif ($present.Value -is [array]) { 'an array' } else { "a $(Get-DvTypeName $present.Value)" })
             return "$container must be a single JSON object (it is $shape)"
         }
     }
@@ -3289,6 +3434,20 @@ function Get-DvLegSpecShapeRefusal {
             if ($null -ne $switchProp -and $switchProp.Value -isnot [bool]) {
                 return "generatorArgs.$switchName must be JSON true or false (it is $(ConvertTo-Json -InputObject $switchProp.Value -Compress -Depth 3))"
             }
+        }
+        # VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1 (adversary A4 on ead7bbdb): the mid-play window toggles are a WINDOWED leg's instrument (the app clears
+        # them on any other leg and drives nothing). The schema's allOf rule says so for a committed spec; this is the live check, for the leg and every batch
+        # preflight, so a spec that names the key on a fullscreen leg (or no display mode at all, the fullscreen default) never reaches a lease.
+        $midPlayToggleProp = $genArgsProp.Value.PSObject.Properties['midPlayWindowToggles']
+        if ($null -ne $midPlayToggleProp -and $midPlayToggleProp.Value -is [bool] -and $midPlayToggleProp.Value) {
+            $displayModeProp = $Spec.PSObject.Properties['displayMode']
+            if ($null -eq $displayModeProp -or $displayModeProp.Value -isnot [string] -or $displayModeProp.Value -cne 'windowed') {
+                return 'generatorArgs.midPlayWindowToggles needs displayMode "windowed" (the app drives the toggles on a windowed leg only)'
+            }
+            # r12 (fable r11 note on d3b176e3, input: criteria.supplementary = {}): the criteria that fail an honest non-ok toggle proof are checked here too, by the
+            # reconciler's own Get-DvWindowToggleCriteriaGap and with its typed reason, so an unbound leg is refused before a lease opens, not only after its run
+            $toggleCriteriaGap = Get-DvWindowToggleCriteriaGap -Spec $Spec
+            if ($null -ne $toggleCriteriaGap) { return "WINDOW_TOGGLES_CRITERIA_UNBOUND: the leg names midPlayWindowToggles but $toggleCriteriaGap" }
         }
         # CPU-S1-FS-SPIKE-TEAM-PARTITION-1 (adversary A3 and A4 on 84d66a4b): a PRESENT team-partition key is a whole number from 1 to 16 -- a JSON int, the
         # convention look.contactSheetFrames uses (a JSON number with a fraction, 12.0 included, parses to a double and is no whole number here), never null --
@@ -4516,8 +4675,35 @@ $script:ExportEvidenceFiles = @('summary.json', 'batch.log', 'export-profile.jso
 # r8 fix 2 (adversary r8 A1): the PARENT/CHILD half of the stage schema. A published share is of work the stage's parent contains: a child whose mean exceeds its parent's is
 # no measurement of this run (raw_uint16 at 900 ms inside a 40 ms debayered_frame read a 16x share and PASSed). Pairs are child -> parent, over the stage rows' means, with the
 # slack two clocks and rounding can honestly show (5 % + 1 ms); a pair whose parent or child is wholly absent is skipped (a stage the app did not run is permitted).
-$script:ExportStageContainTolerance = 1.05
-$script:ExportStageContainSlackMs = 1.0
+# (EXPORT-CDNG-TOTAL-CONTAINMENT-1, adversary A2: a figure AT the limit is inside it; the binary product 40.00046 * 1.05 + 1 is 43.000482999999996, a hair under the decimal 43.000483, which is why
+# the comparison is in [decimal] below; the one epsilon, $script:ExportStageContainEpsilonD, is documented with it)
+# (EXPORT-CDNG-TOTAL-CONTAINMENT-1 r2 fix 1, adversary pass A2 + A3 on 62dff0fa: every containment comparison is made in [decimal], so (A2) a figure exactly at the decimal limit is inside it at ANY
+# magnitude (a binary double product is several ulps past the decimal at 2e7 ms, and a double mean of repeated decimals is a hair off), and (A3) a mean a sub-precision hair past the limit is
+# accepted. r3 B1: that hair is now ONE documented epsilon on the unrounded comparison (below), not a rounding of both sides, which hid a full emitted increment.)
+$script:ExportStageContainToleranceD = [decimal]1.05
+$script:ExportStageContainSlackD = [decimal]1.0
+# (EXPORT-CDNG-TOTAL-CONTAINMENT-1 r3 B1, sol r2 INV-4 on f755f502: rounding BOTH sides to 6 decimals before the compare let a mean over the limit by one FULL emitted increment pass, because
+# the limit and the mean rounded to the same figure (limit 101.8984375, mean 101.8984385, both 101.898438). The comparison is now on the UNROUNDED decimals against the exact limit plus ONE
+# epsilon, 4e-7 ms = four tenths of an emitted increment, the same on every side of every gate. The epsilon is a POLICY choice, not a correction of arithmetic: the means and the limits are exact
+# decimals and are not off at all. It says an overrun of less than four tenths of an emitted increment is within what the 6-decimal figures can show (the r2 controls: 3e-7 over passes), and an
+# overrun of half an increment or more is a real one (5e-7 and 1e-6 over fail). A figure exactly AT the limit is inside it at any magnitude, as decimal arithmetic keeps it exact. The wall
+# gates' limit is built from the DONE elapsed as the log wrote it (r4 B1), not from the 6-decimal published wallSeconds.)
+$script:ExportStageContainEpsilonD = [decimal]0.0000004
+
+function Test-DvExportBeyondTolerance {
+    # $true when $Child is past $Parent * 5 % + 1 ms + the epsilon above: unrounded, in decimal arithmetic (never both sides rounded to the emitted precision first).
+    param($Child, $Parent)
+    $limit = [decimal]$Parent * $script:ExportStageContainToleranceD + $script:ExportStageContainSlackD + $script:ExportStageContainEpsilonD
+    [decimal]$Child -gt $limit
+}
+
+function Get-DvTypeName {
+    # The .NET type name of a value read from JSON, for a reason that names it. A JSON object whose key is `GetType` (PSCustomObject property) makes `$Value.GetType()` throw "does not contain a method",
+    # so the call is guarded: whatever the value, naming its type never throws.
+    param($Value)
+    if ($null -eq $Value) { return 'null' }
+    try { $Value.GetType().Name } catch { 'JSON object' }
+}
 # (adversary r11 A1: raw_uint16 is a stage the app may not publish, which skipped both of its child pairs; the transitive pairs hold disk_read and decompress inside debayered_frame whether or not
 # raw_uint16 is present, as the stage tree above nests them)
 $script:ExportRenderedContainment = @(@('raw_uint16', 'debayered_frame'), @('raw_uint16_disk_read', 'raw_uint16'), @('raw_uint16_decompress', 'raw_uint16'), @('llrawproc', 'debayered_frame'),
@@ -4717,18 +4903,18 @@ function Get-DvExportContainmentProblem {
         $present = @($group[0] | Where-Object { $null -ne $Means[$_] })
         $parent = $Means[[string]$group[1]]
         if ($present.Count -lt 2 -or $null -eq $parent) { continue }
-        $sum = 0.0; foreach ($n in $present) { $sum += [double]$Means[$n] }
-        if ($sum -gt [double]$parent * $script:ExportStageContainTolerance + $script:ExportStageContainSlackMs) {
-            return "EXPORT_STAGE_CONTAINMENT_MISMATCH: the disjoint stages $($present -join ' + ') total $([math]::Round($sum, 6)) ms (mean) inside $($group[1]) mean $parent ms, so their shares are of work this run's frames do not hold"
+        $sum = [decimal]0; foreach ($n in $present) { $sum += [decimal]$Means[$n] }
+        if (Test-DvExportBeyondTolerance $sum $parent) {
+            return "EXPORT_STAGE_CONTAINMENT_MISMATCH: the disjoint stages $($present -join ' + ') total $([math]::Round($sum, 6)) ms (mean) inside $($group[1]) mean $(Get-DvExportRound $parent) ms, so their shares are of work this run's frames do not hold"
         }
     }
     $bad = [System.Collections.Generic.List[string[]]]::new()   # (a list of pairs: a pipeline would unroll a one-pair result into its two names)
     foreach ($pair in $Pairs) {
         $c = $Means[$pair[0]]; $p = $Means[$pair[1]]
-        if ($null -ne $c -and $null -ne $p -and [double]$c -gt [double]$p * $script:ExportStageContainTolerance + $script:ExportStageContainSlackMs) { $bad.Add([string[]]@($pair[0], $pair[1])) }
+        if ($null -ne $c -and $null -ne $p -and (Test-DvExportBeyondTolerance $c $p)) { $bad.Add([string[]]@($pair[0], $pair[1])) }
     }
     if ($bad.Count -eq 0) { return $null }
-    "EXPORT_STAGE_CONTAINMENT_MISMATCH: $($bad.Count) stage(s) are timed longer than the stage that contains them (first: $($bad[0][0]) mean $($Means[$bad[0][0]]) ms inside $($bad[0][1]) mean $($Means[$bad[0][1]]) ms), so their shares are of work this run's frames do not hold"
+    "EXPORT_STAGE_CONTAINMENT_MISMATCH: $($bad.Count) stage(s) are timed longer than the stage that contains them (first: $($bad[0][0]) mean $(Get-DvExportRound $Means[$bad[0][0]]) ms inside $($bad[0][1]) mean $(Get-DvExportRound $Means[$bad[0][1]]) ms), so their shares are of work this run's frames do not hold"
 }
 
 # r11 (sol r9 B2 (a), fable r9 B2; EXPORT-VENUE-LEG-1): the OUTERMOST containment: the measured per-frame work is inside the batch's own DONE elapsed. A DONE elapsed shorter than the
@@ -4738,8 +4924,73 @@ function Get-DvExportContainmentProblem {
 function Get-DvExportWallContainmentProblem {
     param($WallSeconds, $Frames, [string]$StageName, $StageMeanMs)
     if ($null -eq $WallSeconds -or $null -eq $Frames -or [int64]$Frames -le 0 -or $null -eq $StageMeanMs) { return $null }
-    $wallPerFrame = Get-DvExportRound ([double]$WallSeconds * 1000.0 / [double]$Frames)
+    # $WallSeconds is the DONE elapsed exactly as the log wrote it ([decimal], up to 9 decimals), never the 6-decimal published wallSeconds (r4 B1, opus r3): the limit is exact, in decimal like the means (sol r1 B3), compared unrounded (Test-DvExportBeyondTolerance)
+    $wallPerFrame = [decimal]$WallSeconds * [decimal]1000 / [decimal]$Frames
     Get-DvExportContainmentProblem -Means @{ batch_wall_per_frame = $wallPerFrame; $StageName = $StageMeanMs } -Pairs @(, @($StageName, 'batch_wall_per_frame'))
+}
+
+# EXPORT-CDNG-TOTAL-CONTAINMENT-1 (Dot I5-EXPORT-CDNG-TOTAL-CONTAINMENT on #838, ask 6967301971): the llrawproc TOTAL (llrawproc_ms, the producer's bracket around the llrawproc call: dng.c:2619-2622)
+# is published as its own figure (stages.llrawprocTotal and its share), so it is held to the two things it is: inside producer_frame_ms, and the sum of the llrawproc children it brackets.
+# dng.c:571-604 writes llrawproc_other_ms = max(0, llrawproc_total_ms - the seven timed children), so the seven timed children plus llrawproc_other_ms are the worker's own total, and that
+# worker is the call the bracket wraps (applyLLRawProcObject -> applyLLRawProcObjectWorker, llrawproc.c:5008, :6329); the lock times are not in the sum (llrawproc_other retains them).
+# Per frame, only what holds by NESTING is judged, so one scheduler hiccup cannot void a leg: the bracket is inside producer_frame_ms (the pair the mean check had, now on every frame: a total of
+# 130 ms beside 63 ms of producer work is a mean of 43 ms inside a mean 63 ms and was never seen), and the children are inside the bracket. The inverse (a bracket much longer than its children) is
+# bracket entry/exit time the worker's own clock does not see, so it is judged as a SYSTEMATIC gap: more than a tenth of the frames (adversary A1: a mean let ONE 2000 ms scheduler pause in the
+# bracket and the producer void a 480-frame run whose children were exact; a pause is a few frames, a forged or mis-wired total is most of them). Same tolerance as every pair (5 % + 1 ms).
+# The worker's own total (llrawproc_total_ms, dng.c:588, adversary A4) is the exact identity, on the worker's one clock, so when a frame carries it, it agrees with the children either way, per frame.
+# A frame that does not carry the total is not judged against it: llrawproc_ms is an optional total and a stage the app did not run is permitted absent. A frame that lacks some of the eight children is still
+# held to what it DOES carry (r2, sol r1 B2): the present children are a lower bound on the sum, so they must still fit inside llrawproc_ms and inside the worker's llrawproc_total_ms; only the
+# "total longer than its children" direction needs all eight.
+$script:ExportCdngLlrawprocTimedChildren = @('llrawproc_dark_frame', 'llrawproc_vertical_stripes', 'llrawproc_focus_pixels', 'llrawproc_bad_pixels', 'llrawproc_pattern_noise', 'llrawproc_dual_iso', 'llrawproc_chroma_smooth')
+
+function Get-DvExportCdngTotalFrameProblems {
+    # $Frames: the successful profile frame records. Returns the typed problems (zero to four): EXPORT_STAGE_CONTAINMENT_MISMATCH (the total past producer_frame_ms on some frame, or the worker's llrawproc_total_ms past the bracket that wraps it) and
+    # EXPORT_STAGE_SUM_MISMATCH (the seven timed children plus llrawproc_other_ms past llrawproc_ms on some frame, llrawproc_ms past that sum on more than a tenth of the frames, or the worker's
+    # llrawproc_total_ms apart from that sum on some frame).
+    param($Frames)
+    $past = [System.Collections.Generic.List[string]]::new(); $beyond = [System.Collections.Generic.List[string]]::new(); $longer = [System.Collections.Generic.List[string]]::new()
+    $worker = [System.Collections.Generic.List[string]]::new(); $workerOut = [System.Collections.Generic.List[string]]::new()
+    $judged = 0
+    # (every comparison is Test-DvExportBeyondTolerance: unrounded decimal arithmetic against the exact limit plus one epsilon; the figures are [decimal] throughout. Adversary pass A2 on 62dff0fa; sol r2 B1.)
+    $timing = { param($frame, $field) $v = Get-DvProp $frame $field; if ($null -ne $frame.PSObject.Properties[$field] -and $null -eq (Get-DvExportTimingProblem $v)) { [decimal][double]$v } else { $null } }
+    foreach ($frame in @($Frames)) {
+        $at = Get-DvProp $frame 'frame_index'
+        $total = & $timing $frame 'llrawproc_ms'
+        $producer = & $timing $frame 'producer_frame_ms'
+        if ($null -ne $total -and $null -ne $producer -and (Test-DvExportBeyondTolerance $total $producer)) {
+            $past.Add("frame_index $at llrawproc_ms $(Get-DvExportRound $total) ms inside producer_frame_ms $(Get-DvExportRound $producer) ms")
+        }
+        # (r2, sol r1 B2 / INV-2: $sum is the sum of the children this frame PRESENTS, so it is a LOWER BOUND on the full sum when one is absent: a child omitted from the frame is work of 0 or more ms,
+        # never less. Only the over-the-container directions are judged on a lower bound; "the bracket is longer than its children" needs the whole sum, so it still waits for $whole.)
+        $sum = [decimal]0; $whole = $true   # (a figure that is absent or not a conforming timing leaves the sum underivable on this frame; the record schema types that elsewhere)
+        foreach ($n in @($script:ExportCdngLlrawprocTimedChildren) + 'llrawproc_other') { $part = & $timing $frame "${n}_ms"; if ($null -eq $part) { $whole = $false } else { $sum += $part } }
+        $what = $(if ($whole) { 'the seven timed children and llrawproc_other_ms' } else { 'the present llrawproc children (a lower bound: not every one is published on this frame)' })
+        $workerTotal = & $timing $frame 'llrawproc_total_ms'
+        if ($null -ne $workerTotal) {
+            # (adversary pass A4 on 62dff0fa: the worker is the call the llrawproc_ms bracket wraps (dng.c:2619-2622), so its total is inside the bracket, and inside producer_frame_ms when there is no
+            # bracket; with the remainder omitted the present children cannot refute it, and with all eight present they agree with it, so only this containment can see a worker total past what wraps it)
+            if ($null -ne $total -and (Test-DvExportBeyondTolerance $workerTotal $total)) { $workerOut.Add("frame_index $at llrawproc_total_ms $(Get-DvExportRound $workerTotal) ms inside the llrawproc_ms bracket $(Get-DvExportRound $total) ms") }
+            elseif ($null -ne $producer -and (Test-DvExportBeyondTolerance $workerTotal $producer)) { $workerOut.Add("frame_index $at llrawproc_total_ms $(Get-DvExportRound $workerTotal) ms inside producer_frame_ms $(Get-DvExportRound $producer) ms") }
+            if (($whole -and (Test-DvExportBeyondTolerance $workerTotal $sum)) -or (Test-DvExportBeyondTolerance $sum $workerTotal)) {
+                $worker.Add("frame_index $at llrawproc_total_ms $(Get-DvExportRound $workerTotal) ms beside $what totalling $(Get-DvExportRound $sum) ms")
+            }
+        }
+        if ($null -eq $total) { continue }
+        if ($whole) { $judged++ }
+        if (Test-DvExportBeyondTolerance $sum $total) {
+            $beyond.Add("frame_index $at $what total $(Get-DvExportRound $sum) ms inside llrawproc_ms $(Get-DvExportRound $total) ms")
+        }
+        if ($whole -and (Test-DvExportBeyondTolerance $total $sum)) {
+            $longer.Add("frame_index $at llrawproc_ms $(Get-DvExportRound $total) ms beside the seven timed children and llrawproc_other_ms totalling $(Get-DvExportRound $sum) ms")
+        }
+    }
+    if ($past.Count -gt 0) { "EXPORT_STAGE_CONTAINMENT_MISMATCH: $($past.Count) frame(s) time llrawproc_ms longer than the producer_frame_ms that contains it (first: $($past[0])), so the published llrawproc total is of work this run's frames do not hold" }
+    if ($workerOut.Count -gt 0) { "EXPORT_STAGE_CONTAINMENT_MISMATCH: $($workerOut.Count) frame(s) publish a worker llrawproc_total_ms longer than the llrawproc_ms bracket (or producer_frame_ms) that wraps the worker call (first: $($workerOut[0])), so the published worker total is of work this run's frames do not hold" }
+    if ($beyond.Count -gt 0) { "EXPORT_STAGE_SUM_MISMATCH: $($beyond.Count) frame(s) time the llrawproc children longer than the llrawproc_ms that contains them (first: $($beyond[0])), so the published llrawproc total is not the work its children measured" }
+    elseif ($longer.Count * 10 -gt $judged) {
+        "EXPORT_STAGE_SUM_MISMATCH: $($longer.Count) of $judged frame(s) publish an llrawproc_ms longer than the seven timed children plus llrawproc_other_ms it totals (first: $($longer[0])), so the published llrawproc total is not the work its children measured"
+    }
+    if ($worker.Count -gt 0) { "EXPORT_STAGE_SUM_MISMATCH: $($worker.Count) frame(s) publish a worker llrawproc_total_ms that is not the sum of the llrawproc children it totals (first: $($worker[0])), so the published llrawproc timings are not one measurement" }
 }
 
 function Get-DvExportInt64($Value) {
@@ -4799,6 +5050,9 @@ $script:ExportTimingMaxMs = 86400000.0
 # present on any successful frame is present on all of them (its share is of the denominator's window). These two are required on every successful frame.
 $script:ExportCdngTimingFields = @(@($script:ExportCdngProducerStages) + @($script:ExportCdngWriterStages) + @('llrawproc', 'producer_frame') | ForEach-Object { "${_}_ms" })
 $script:ExportCdngRequiredTimingFields = @('producer_frame_ms', 'llrawproc_dual_iso_ms')
+# (EXPORT-CDNG-TOTAL-CONTAINMENT-1 r2, sol r1 B1 / INV-4: the worker's own total is read by Get-DvExportCdngTotalFrameProblems, so a PRESENT one is schema-checked like every timing above: a string, null,
+# array or over-ceiling value is EXPORT_RECORD_INVALID, never treated as absent. It is not a published stage row, so it joins no window rule: only the value domain is checked, on every frame that carries it.)
+$script:ExportCdngSchemaOnlyTimingFields = @('llrawproc_total_ms')
 # Stage-log record: one line, exactly this shape. Every line that carries the tag must match it (the digits are bounded so no value can overflow a cast).
 $script:ExportStageLogTag = '[mlv-stage-timing]'
 $script:ExportStageLogRecord = '^\[mlv-stage-timing\] frame=(?<f>[0-9]{1,12}) stage=(?<s>[a-z0-9_]{1,64}) ms=(?<ms>[0-9]{1,12}(?:\.[0-9]{1,9})?)$'
@@ -4807,12 +5061,23 @@ function Get-DvExportTimingProblem {
     # $null when $Value is a conforming timing, else the reason it is not. Never throws, whatever the value is.
     param($Value)
     if ($null -eq $Value) { return 'is JSON null' }
-    if (-not ($Value -is [double] -or $Value -is [int] -or $Value -is [long] -or $Value -is [decimal])) { return "is a $($Value.GetType().Name), not a JSON number" }
+    if (-not ($Value -is [double] -or $Value -is [int] -or $Value -is [long] -or $Value -is [decimal])) { return "is a $(Get-DvTypeName $Value), not a JSON number" }
     $d = [double]$Value
     if (-not [double]::IsFinite($d)) { return 'is not finite' }
     if ($d -lt 0) { return 'is negative' }
     if ($d -gt $script:ExportTimingMaxMs) { return "is past the $($script:ExportTimingMaxMs) ms ceiling" }
     $null
+}
+
+function Get-DvExportExactMean {
+    # EXPORT-CDNG-TOTAL-CONTAINMENT-1 r2 (sol r1 B3 / INV-5): the UNROUNDED mean of the conforming timings ($null when there is none). The published stage rows round their means to 6 places
+    # (Get-DvExportStageRow); a containment gate reads this instead, so 29 frames at the documented 5 % + 1 ms tolerance and one a hair inside it are not turned INVALID by a mean rounded before it is compared.
+    param($Values)
+    # (a [decimal], summed exactly: a double mean of repeated decimals is a hair off the decimal it equals; adversary pass A2 on 62dff0fa)
+    $v = @($Values | Where-Object { $null -eq (Get-DvExportTimingProblem $_) } | ForEach-Object { [decimal][double]$_ })
+    if ($v.Count -eq 0) { return $null }
+    $sum = [decimal]0; foreach ($x in $v) { $sum += $x }
+    $sum / [decimal]$v.Count
 }
 
 function Get-DvExportStageRow {
@@ -4849,7 +5114,7 @@ function Test-DvExportCdngProfileRecords {
         if ((Get-DvProp $r 'success') -isnot [bool]) { & $note 'success' 'is not a JSON boolean' $i }
         $fi = Get-DvProp $r 'frame_index'
         if (-not (($fi -is [int] -or $fi -is [long]) -and [int64]$fi -ge 0)) { & $note 'frame_index' 'is not a non-negative integer' $i }
-        foreach ($field in $script:ExportCdngTimingFields) {
+        foreach ($field in @($script:ExportCdngTimingFields) + @($script:ExportCdngSchemaOnlyTimingFields)) {
             if ($null -eq $r.PSObject.Properties[$field]) { continue }
             $why = Get-DvExportTimingProblem (Get-DvProp $r $field)
             if ($null -ne $why) { & $note $field $why $i }
@@ -4935,6 +5200,7 @@ function Get-DvExportEvidence {
                      profileFramesFailed = $null; stageFramesSeen = $null; dualIsoActiveFrames = $null; dualIsoClassAgrees = $null; outputFileCount = $null; outputBytes = $null
                      wallSeconds = $null; exportFps = $null; largestStage = $null; largestStageShare = $null }
     $classMismatch = $false; $classDetail = $null
+    $wallExact = $null   # the DONE elapsed exactly as the log wrote it, [decimal]; null when there is no single DONE line (the wall gates then have nothing to compare)
     $containmentAdvisory = @()   # (r18's advisory channel, kept EMPTY for the receipt shape the leg runner writes (receipt.export.containmentAdvisory): EXPORT-CDNG-STAGE-CONTAINMENT-1 r1 made the check gate again)
     # -- the batch log: exactly one DONE line for the one clip
     # (r7 A6: the counts are bounded to 15 digits, so a count that does not fit an int64 is no DONE line, typed below, and never an Int64 cast that throws)
@@ -4945,6 +5211,8 @@ function Get-DvExportEvidence {
         $m.framesExported = [int64]$done[0].Groups['e'].Value
         $m.exportFramesSkipped = [int64]$done[0].Groups['s'].Value
         $m.exportFramesFailed = $m.exportFramesSkipped
+        # (EXPORT-CDNG-TOTAL-CONTAINMENT-1 r4 B1, opus r3: wallSeconds is the PUBLISHED figure, 6 decimals; the wall gates' limit is built from the exact matched elapsed, up to 9 decimals, never from it)
+        $wallExact = [decimal]::Parse($done[0].Groups['t'].Value, [Globalization.NumberStyles]::AllowDecimalPoint, [Globalization.CultureInfo]::InvariantCulture)
         $m.wallSeconds = Get-DvExportRound ([double]::Parse($done[0].Groups['t'].Value, [Globalization.CultureInfo]::InvariantCulture))
         $m.exportFps = $(if ($m.wallSeconds -gt 0) { Get-DvExportRound ($m.framesExported / $m.wallSeconds) } else { $null })
     }
@@ -5030,8 +5298,10 @@ function Get-DvExportEvidence {
                                   largestStage = $(if ($largest.Count) { [string]$largest[0] } else { $null }) }
             if ($largest.Count) { $m.largestStage = [string]$largest[0]; $m.largestStageShare = $rowsOut[[string]$largest[0]].share }
             # r8 fix 2 (adversary r8 A1): every producer stage is inside producer_frame_ms and every llrawproc_* child is inside llrawproc_ms
-            $means = @{ producer_frame = $denRow.meanMs; llrawproc = $stages.llrawprocTotal.meanMs }
-            foreach ($name in $script:ExportCdngProducerStages) { $means[$name] = $rowsOut[$name].meanMs }
+            # (r2, sol r1 B3: the gates read the UNROUNDED means, so a profile at the documented tolerance on every frame is not turned INVALID by a mean rounded before it is compared; the published rows keep their rounded means)
+            $exactDen = Get-DvExportExactMean $producer
+            $means = @{ producer_frame = $exactDen; llrawproc = (Get-DvExportExactMean @($ok | ForEach-Object { Get-DvProp $_ 'llrawproc_ms' })) }
+            foreach ($name in $script:ExportCdngProducerStages) { $means[$name] = Get-DvExportExactMean @($ok | ForEach-Object { Get-DvProp $_ "${name}_ms" }) }
             # (r8 fix 3, adversary pass 10 A1: the llrawproc TOTAL is published as a row too, so it is held inside producer_frame_ms like every producer stage)
             $pairs = @(foreach ($name in $script:ExportCdngProducerStages) { , @($name, 'producer_frame') }) + @(foreach ($name in $script:ExportCdngLlrawprocChildren) { , @($name, 'llrawproc') }) + @(, @('llrawproc', 'producer_frame'))
             # r11 (fable r9 B2): the producer stages are the DISJOINT partition of producer_frame (the llrawproc TOTAL is not in that list, so it is not counted twice), so they are held TOGETHER
@@ -5053,8 +5323,10 @@ function Get-DvExportEvidence {
             if ($null -ne $containment) { $problems.Add($containment) }
             $disjoint = Get-DvExportContainmentProblem -Means $means -Pairs $script:ExportCdngContainedPairs -SumGroups $script:ExportCdngSumGroups
             if ($null -ne $disjoint) { $problems.Add($disjoint) }
+            # EXPORT-CDNG-TOTAL-CONTAINMENT-1 (Dot I5): the llrawproc TOTAL inside producer_frame_ms, the children inside it and (when published) the worker total equal to them, per frame (the mean pair above cannot see one frame; the longer-than-its-children direction is a more-than-a-tenth-of-the-frames rule)
+            foreach ($totalProblem in @(Get-DvExportCdngTotalFrameProblems -Frames $ok)) { $problems.Add($totalProblem) }
             # r11 (sol r9 B2 (a)): and the producer's per-frame work is inside the batch's own elapsed
-            $wallContainment = Get-DvExportWallContainmentProblem -WallSeconds $m.wallSeconds -Frames $m.framesExported -StageName 'producer_frame' -StageMeanMs $denRow.meanMs
+            $wallContainment = Get-DvExportWallContainmentProblem -WallSeconds $wallExact -Frames $m.framesExported -StageName 'producer_frame' -StageMeanMs $exactDen
             if ($null -ne $wallContainment) { $problems.Add($wallContainment) }
             # adversary r2 A2: a capture is a stage-share measurement; successful rows with no producer_frame_ms (or no producer stage figure at all) measured none
             if ($ok.Count -gt 0 -and ($denRow.samples -ne $ok.Count -or $null -eq $denRow.meanMs -or [double]$denRow.meanMs -le 0 -or $largest.Count -eq 0)) {
@@ -5089,7 +5361,7 @@ function Get-DvExportEvidence {
             foreach ($name in $script:ExportRenderedStages) { $rowsOut[$name] = Get-DvExportStageRow -Values @($perStage[$name].Values) -Denominator $p16.meanMs }
             $untimed = $(if ($null -ne $batchWall -and $null -ne $p16.meanMs) { Get-DvExportRound ($batchWall - $p16.meanMs) } else { $null })
             # r11 (sol r9 B2 (a)): the measured per-frame work is inside the batch's elapsed (typed INVALID otherwise); a residual the logging precision made slightly negative is 0, never a negative stage
-            $wallContainment = Get-DvExportWallContainmentProblem -WallSeconds $m.wallSeconds -Frames $m.framesExported -StageName 'processed16_total' -StageMeanMs $p16.meanMs
+            $wallContainment = Get-DvExportWallContainmentProblem -WallSeconds $wallExact -Frames $m.framesExported -StageName 'processed16_total' -StageMeanMs (Get-DvExportExactMean @($perStage['processed16_total'].Values))
             if ($null -ne $wallContainment) { $problems.Add($wallContainment) }
             elseif ($null -ne $untimed -and $untimed -lt 0) { $untimed = 0.0 }
             $disjoint = $(if ($null -ne $rowsOut['debayered_frame'].meanMs -and $null -ne $rowsOut['processing'].meanMs) { Get-DvExportRound ($rowsOut['debayered_frame'].meanMs + $rowsOut['processing'].meanMs) } else { $null })
@@ -5108,7 +5380,7 @@ function Get-DvExportEvidence {
             # decompress, llrawproc) is timed on exactly processed16_total's frames or on none at all (a stage the app did not run is absent, never partial)
             # r8 fix 2 (adversary r8 A1): and each stage's mean is inside the stage that contains it (the rendered stage tree in $script:ExportRenderedContainment)
             $means = @{}
-            foreach ($name in $script:ExportRenderedStages) { $means[$name] = $rowsOut[$name].meanMs }
+            foreach ($name in $script:ExportRenderedStages) { $means[$name] = Get-DvExportExactMean @($perStage[$name].Values) }   # (unrounded: sol r1 B3)
             $containment = Get-DvExportContainmentProblem -Means $means -Pairs $script:ExportRenderedContainment -SumGroups $script:ExportRenderedSumGroups
             if ($null -ne $containment) { $problems.Add($containment) }
             $p16Frames = $perStage['processed16_total']
@@ -5664,6 +5936,12 @@ function Test-DvReceiptValid {
                 }
             }
             elseif ($null -ne $storedDueWakeDelivery) { $invalid.Add('DUE_WAKE_DELIVERY_NOT_FROM_EVIDENCE: the receipt carries a dueWakeDelivery block but its committed leg spec names no dueWakeDeliveryPost') }
+            # VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1 (adversary A5): a leg that names no midPlayWindowToggles but whose run log shows window toggles was moved by an inherited env
+            $windowToggleRequestVerdict = Get-DvWindowToggleRequestEvidence -Spec $spec -LogText $ev.logText
+            if ($windowToggleRequestVerdict.blocks) { $invalid.Add("WINDOW_TOGGLES_INHERITED: $($windowToggleRequestVerdict.reason)") }
+            # r3 (sol B4): a leg that names the toggles has its windowToggles* scalars re-derived from the hashed run log; a claim the raw records do not back is INVALID
+            $windowToggleReconcileVerdict = Get-DvWindowToggleReconcileEvidence -Spec $spec -LogText $ev.logText -Metrics $metrics
+            if ($windowToggleReconcileVerdict.blocks) { $invalid.Add($windowToggleReconcileVerdict.reason) }
             # CPU-S1-FS-SPIKE-TEAM-PARTITION-1: a leg that asks for the team partition the app did not report at exactly r+p (or whose report is unreadable, or
             # absent because the binary emits none), or a control leg whose app reports a partition, is no measurement of its arm; the receipt's own
             # teamPartition block is re-derived like the reconReleaseDeferred block.
@@ -6218,9 +6496,9 @@ function Get-DvPresentMonGapVerdict {
     # right operand to its own type, so a JSON true in source or kind read as 'app_swap_window' / 'internal'. Every string field this verdict reads
     # must be a [string] (or absent), and the placement field a [bool] (or absent); anything else is a blocking typed refusal, never compared.
     $untyped = @(foreach ($field in @(@('presentMonStatus', $rawStatus), @('presentMonTemporalGapKind', $kind), @('presentMonTemporalWindowSource', $source))) {
-        if ($null -ne $field[1] -and -not ($field[1] -is [string])) { "$($field[0]) is a $($field[1].GetType().Name) ('$($field[1])'), not a string" }
+        if ($null -ne $field[1] -and -not ($field[1] -is [string])) { "$($field[0]) is a $(Get-DvTypeName $field[1]) ('$($field[1])'), not a string" }
     })
-    if ($null -ne $atAppStall -and -not ($atAppStall -is [bool])) { $untyped += "presentMonTemporalOverBoundGapAtAppStall is a $($atAppStall.GetType().Name) ('$atAppStall'), not a Boolean" }
+    if ($null -ne $atAppStall -and -not ($atAppStall -is [bool])) { $untyped += "presentMonTemporalOverBoundGapAtAppStall is a $(Get-DvTypeName $atAppStall) ('$atAppStall'), not a Boolean" }
     $gap = $null
     if ($rawGap -is [double] -or $rawGap -is [int] -or $rawGap -is [long] -or $rawGap -is [decimal]) {
         $d = [double]$rawGap
@@ -6510,6 +6788,6 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt
