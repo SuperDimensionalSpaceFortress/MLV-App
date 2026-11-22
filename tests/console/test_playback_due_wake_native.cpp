@@ -2481,11 +2481,13 @@ TEST(PlaybackDueWakeSend, G1_AForeignSentMessageInTheRunnerSleepIsNotAWakeAndThe
         dueWakeRecordedClockReset();
         const PlaybackDueWake::RunnerSleep slept = wake.sleepForSmokeRunner( 150, &dueWakeRecordedNowS );
         sender.join();
-        if( wake.lastRunnerSleepDispatchSpansS().empty() )
+        if( wake.runnerSleepsWokenOther() == 0 )
         {
             // adversary pass 1 A4/A7: a sender that missed the whole sleep (its message queued after the sleep returned) left
             // nothing to judge and a pending sent message behind; take it now (it must not reach the next attempt's sleep) and
-            // observe again -- never fail the counts below on a sample the sleep never dispatched in
+            // observe again -- never fail the counts below on a sample the sleep never dispatched in. Keyed on the product's own
+            // count of the dispatch, not on the span record (pass 2 A3): a product that dropped the span still counted the
+            // dispatch, so it fails the observation below instead of being retried away
             MSG drain;
             PeekMessageW( &drain, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );
             continue;
@@ -2599,11 +2601,12 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
         slept = wake.sleepForSmokeRunner( 150, &dueWakeRecordedNowS );
         sleptMs = t.elapsed();
         sender.join();
-        if( wake.lastRunnerSleepDispatchSpansS().empty() )
+        if( foreign.calls == 0 )
         {
             // adversary pass 1 A4/A7: a sender that missed the whole sleep (its message queued after the sleep returned) left
             // nothing to judge and a pending sent message behind. Take it now, so it cannot reach the next attempt's sleep and
-            // double that attempt's handler calls, and observe again
+            // double that attempt's handler calls, and observe again. Keyed on the handler's own call count, not on the span
+            // record (pass 2 A3): a product that dropped the span still ran the handler, so it fails the observation instead
             wake.setGuiTraceActive( false );
             MSG drain;
             PeekMessageW( &drain, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );
@@ -3081,17 +3084,17 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     // dispatched inside the sleep; a probe queued later proves nothing and is not held against it. An attempt with no such
     // probe is observed again, never passed. Two sends taken in one dispatch (a GUI pause) are no failure: the assertions below
     // follow the dispatches the sleep recorded, however many.
-    constexpr int kAttempts = 5;
+    constexpr int kAttempts = 10;
     // r7 (sol review r6, blocker 1): the sleep's wait may expire one timer tick (16 ms) before its 80 ms, so a probe is only held
     // against the sleep when it was queued with that whole tick still to run (the wall floor less kSleepExitMarginMs of slack)
     const double kProbeLatestMs = dueWakeSleepFloorMs( 80.0 ) - kSleepExitMarginMs;
-    // a healthy sleep whose GUI thread was paused across its expiry check legitimately leaves queued probes behind; that pause
-    // reads as a return far past the requested 80 ms, so such an attempt is observed again rather than judged (the wait's own
-    // timer granularity is inside the allowance)
-    // r7 adversary pass 1 A1: 2 ms (was 15): the sleep's entry-to-return stamps read 76.1-79.2 ms for the 80 ms request in 20 of 20
-    // runs on a loaded host (due-wake-20x.md), so a sample that returns 2 ms or more past the request ran across a GUI pause at its
-    // expiry check, where a healthy wait legitimately leaves probes queued; it is observed again, never judged
-    constexpr double kOverrunMs = 2.0;
+    // r7 adversary pass 1/2 A1: a sleep that REACHED its requested time (entry-to-return stamps of 80 ms or more) may have left the
+    // loop through its expiry check right after a dispatch -- PlaybackDueWake.cpp:873 and :877 break there without a further wait
+    // -- so a probe queued after that dispatch is legitimately left pending (a GUI pause between the dispatch's end stamp and that
+    // check, however long, reads exactly like a sleep cut short at the dispatch and paused before its final read). Such a sample
+    // that left a must-run probe pending is observed again, never judged (kAttempts is 10, not 5, for the samples this retries);
+    // a sample that reached its time with every must-run probe dispatched is judged and passes, and one that returned before its
+    // time is judged in full (the wait's own tick-early timeout is the only healthy way out there, and it dispatches first)
     g_r17A1Stamps.reserve( 256 );                                     // the clock callback must never allocate (a throw there would std::terminate the sender's join)
     std::unique_ptr<R17A1Windows> wp;
     std::vector<std::pair<double, double>> spans;
@@ -3177,13 +3180,16 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
             }
         }
         // judged only when the first handler ran in the sleep, the must-run probes reach kR17A1ProbeCoverMs into the sleep (so a
-        // sleep cut short at the first dispatch has probes left queued to show it), and the sleep did not overrun its 80 ms by
-        // more than the allowance; otherwise the sender's or the GUI thread's timing made this attempt unobservable and it is
+        // sleep cut short at the first dispatch has probes left queued to show it), and the sleep did not reach its 80 ms with a
+        // must-run probe pending (below); otherwise the sender's or the GUI thread's timing made this attempt unobservable and it is
         // retried -- never passed (r7, sol review r6, blocker 1: one timely probe no longer makes a sample judgeable)
         // adversary pass 1 A5: and the sleep dispatched at least TWICE: with every send taken in one batch (a GUI pause before the
         // first dispatch) there is no second dispatch whose charge-before-handler order could be observed, so it is observed again
-        landed = handlerRan && !stamps.empty() && timelyProbes != 0u && coverMs >= kR17A1ProbeCoverMs && spans.size() >= 2
-            && ( stamps.back() - stamps.front() ) * 1000.0 <= 80.0 + kOverrunMs;
+        // pass 2 A3: only a record of exactly ONE dispatch is the batched sample; an EMPTY record with the handler run is a product
+        // that dropped its span, which is judged (and fails at dispatches >= 1 below), never retried away
+        landed = handlerRan && !stamps.empty() && timelyProbes != 0u && coverMs >= kR17A1ProbeCoverMs && spans.size() != 1;
+        // r7 adversary pass 2 A1: ...and a sleep that reached its 80 ms with a must-run probe still pending is ambiguous (see above)
+        if( landed && ( stamps.back() - stamps.front() ) * 1000.0 >= 80.0 && ( timelyProbes & ~ranProbes ) != 0u ) landed = false;
     }
     ASSERT_TRUE( sentOk );
     ASSERT_TRUE( landed );                                             // the send fell inside one of the sleeps, with a probe judged
