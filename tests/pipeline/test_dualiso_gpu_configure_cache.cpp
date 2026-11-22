@@ -10,6 +10,12 @@
 #include "../common/repo_paths.h"
 #include "../../src/mlv/llrawproc/llrawproc.h"
 #include "../../platform/qt/PlaybackWarmOutputReusePolicy.h"
+#include "../../platform/qt/PlaybackReconWarmRun.h"
+
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 #include <QByteArray>
 #include <QFile>
@@ -1260,4 +1266,110 @@ TEST(DualIsoGpuConfigureCache, AReuseDecisionInsideANativeLutStoreIsNeverAHit)
     llrpGpuPlaybackReconState_t changed = configureState(2);
     changed.ev_correction = -2.0;   // a LUT-key-only change: set_luts alone
     expectTheDecisionInsideTheNativeStoreIsAMiss("set_luts", 2, configureState(1), changed);
+}
+
+// The warm's side of the same gate. The warm key's counts are the ones its own run read under the backend mutex
+// (llrpGpuPlaybackReconTakeLastRunConfigureCounts), so a configure another thread has PUBLISHED but not yet STORED
+// when the warm builds its key is still outside the key, and the present misses. Counts read after the run, outside
+// the lock (the r21 key), would take that configure in, and the present would hit once the store lands.
+namespace
+{
+
+struct WarmSideGate
+{
+    std::mutex m;
+    std::condition_variable cv;
+    bool inStore = false;   // the other thread's fake set_iso_pattern has stored and is waiting
+    bool release = false;   // the warm thread is done reading; the store may return
+};
+
+WarmSideGate * g_warmSide = nullptr;
+
+void warmSideHoldInsideTheStore(int kind)
+{
+    if (kind != 0 || !g_warmSide) return;
+    std::unique_lock<std::mutex> lock(g_warmSide->m);
+    g_warmSide->inStore = true;
+    g_warmSide->cv.notify_all();
+    g_warmSide->cv.wait(lock, [] { return g_warmSide->release; });
+}
+
+} // namespace
+
+TEST(DualIsoGpuConfigureCache, TheWarmKeyIsTakenUnderTheBackendLockSoAConfigureInFlightIsNotInIt)
+{
+    FakeBackendScope scope;
+    int ok = 0;
+    llrpGpuPlaybackReconState_t warm = configureState(1);
+    setPattern(warm, 1, 1, 0, 0);
+    (void)llrpGpuPlaybackReconTakeLastRunConfigureCounts(nullptr, nullptr, nullptr);
+    (void)configureWorkOf(warm, &ok);   // the warm's run, on this thread
+    ASSERT_EQ(1, ok);
+
+    WarmSideGate gate;
+    g_warmSide = &gate;
+    llrpSetFakeGpuBackendAfterConfigureStoreHookForTesting(warmSideHoldInsideTheStore);
+    int otherOk = 0;
+    std::thread other([&otherOk]
+    {
+        llrpGpuPlaybackReconState_t changed = configureState(2);
+        setPattern(changed, 0, 0, 1, 1);
+        otherOk = runState(changed);
+    });
+    bool reachedTheStore = false;
+    {
+        std::unique_lock<std::mutex> lock(gate.m);
+        reachedTheStore = gate.cv.wait_for(lock, std::chrono::seconds(30), [&gate] { return gate.inStore; });
+    }
+    // the other thread holds the backend mutex inside its native pattern store; its count is already published
+    uint64_t c = 0, l = 0, p = 0;
+    const int keyed = llrpGpuPlaybackReconTakeLastRunConfigureCounts(&c, &l, &p);
+    const playback_warm_output_reuse::LiveCounts afterRunOutsideTheLock = liveConfigureCountsLikeThePresent();
+    {
+        std::lock_guard<std::mutex> lock(gate.m);
+        gate.release = true;
+    }
+    gate.cv.notify_all();
+    other.join();
+    llrpSetFakeGpuBackendAfterConfigureStoreHookForTesting(nullptr);
+    g_warmSide = nullptr;
+    ASSERT_TRUE(reachedTheStore);
+    ASSERT_EQ(1, otherOk);
+    ASSERT_EQ(1, keyed);
+    // a second take finds nothing: the counts are this run's, once
+    ASSERT_EQ(0, llrpGpuPlaybackReconTakeLastRunConfigureCounts(nullptr, nullptr, nullptr));
+
+    playback_warm_output_reuse::Key underLock = raceWarmKeyFromLiveCounts();
+    underLock.setClipCountAfterWarm = c;
+    underLock.setLutsCountAfterWarm = l;
+    underLock.setPatternCountAfterWarm = p;
+    playback_warm_output_reuse::Key afterRun = underLock;
+    afterRun.setClipCountAfterWarm = afterRunOutsideTheLock.setClip;
+    afterRun.setLutsCountAfterWarm = afterRunOutsideTheLock.setLuts;
+    afterRun.setPatternCountAfterWarm = afterRunOutsideTheLock.setPattern;
+    std::printf("[dualiso-configure-cache] r22 warm side: pattern under_lock=%llu after_run=%llu live_now=%llu\n",
+                (unsigned long long)p, (unsigned long long)afterRunOutsideTheLock.setPattern,
+                (unsigned long long)llrpGpuPlaybackReconSetIsoPatternCount());
+    ASSERT_EQ(p + 1, afterRunOutsideTheLock.setPattern);   // the in-flight configure was published, not yet stored
+    // the backend now holds 0011: the key taken under the lock misses ...
+    ASSERT_EQ(std::string("recon_configured_since_warm"),
+              std::string(playback_warm_output_reuse::reasonName(decideWithAnEqualCompare(underLock))));
+    // ... where the r21 key (read after the run, outside the lock) would have been a hit
+    ASSERT_EQ(std::string("hit"), std::string(playback_warm_output_reuse::reasonName(decideWithAnEqualCompare(afterRun))));
+}
+
+// A run that recorded no counts (it never reached the configure) leaves the take empty, and the warm's key then holds
+// kNoKeyCount, which no live count equals.
+TEST(DualIsoGpuConfigureCache, AWarmWithNoRecordedCountsIsNeverReused)
+{
+    (void)llrpGpuPlaybackReconTakeLastRunConfigureCounts(nullptr, nullptr, nullptr);
+    uint64_t c = 5, l = 5, p = 5;
+    ASSERT_EQ(0, llrpGpuPlaybackReconTakeLastRunConfigureCounts(&c, &l, &p));
+    ASSERT_EQ((uint64_t)5, c);   // outputs untouched when nothing was recorded
+    playback_warm_output_reuse::Key k = raceWarmKeyFromLiveCounts();
+    k.setClipCountAfterWarm = playback_recon_warm_run::kNoKeyCount;
+    k.setLutsCountAfterWarm = playback_recon_warm_run::kNoKeyCount;
+    k.setPatternCountAfterWarm = playback_recon_warm_run::kNoKeyCount;
+    ASSERT_EQ(std::string("recon_configured_since_warm"),
+              std::string(playback_warm_output_reuse::reasonName(decideWithAnEqualCompare(k))));
 }

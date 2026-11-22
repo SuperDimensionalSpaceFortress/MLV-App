@@ -853,16 +853,30 @@ TEST(PlaybackWarmOutputReuseWiring, TheWarmKeysTheSlotOnlyAfterItsAmazeSucceeded
                               "key.setPatternCountAfterWarm = setPatternCountAfter;",
                               "key.captureId = captureId;"})
         ASSERT_TRUE(warm.contains(QString::fromLatin1(field)));
-    // MainWindow hands the warm its frame and the counts read on the worker right after the run
+    // MainWindow hands the warm its frame and the KEY counts: r22 (sol r21 #1), the three counts the warm's own run
+    // read under the backend mutex after its configure, not the telemetry counts read after the run outside the lock
     const QString source = sourceFile("platform/qt/MainWindow.cpp");
     ASSERT_TRUE(source.contains(QStringLiteral(
-        "static_cast<uint64_t>( done.frameNumber ), outcome.setClipCountAfter, outcome.setLutsCountAfter,")));
-    ASSERT_TRUE(source.contains(QStringLiteral("outcome.setPatternCountAfter,")));   // adversary r17 A1
+        "static_cast<uint64_t>( done.frameNumber ), outcome.keySetClipCount, outcome.keySetLutsCount,")));
+    ASSERT_TRUE(source.contains(QStringLiteral("outcome.keySetPatternCount, &reuseCapture, &warmState );")));
+    ASSERT_FALSE(source.contains(QStringLiteral("outcome.setPatternCountAfter, &reuseCapture")));
     const QString core = sourceFile("platform/qt/PlaybackReconWarmRun.h");
+    const int run = core.indexOf(QStringLiteral("applyLLRawProcObjectWorker( video, raw.data()"));
+    // an earlier run's counts are dropped before this run, then this run's are taken after it
+    const int dropped = core.indexOf(QStringLiteral("(void)llrpGpuPlaybackReconTakeLastRunConfigureCounts( nullptr, nullptr, nullptr );"));
+    const int taken = core.indexOf(QStringLiteral(
+        "const bool keyed = llrpGpuPlaybackReconTakeLastRunConfigureCounts( &keyClip, &keyLuts, &keyPattern ) != 0;"));
+    ASSERT_TRUE(dropped >= 0);
+    ASSERT_TRUE(run > dropped);
+    ASSERT_TRUE(taken > run);
+    for (const char *field : {"out.keySetClipCount = keyed ? keyClip : kNoKeyCount;",
+                              "out.keySetLutsCount = keyed ? keyLuts : kNoKeyCount;",
+                              "out.keySetPatternCount = keyed ? keyPattern : kNoKeyCount;"})
+        ASSERT_TRUE(core.contains(QString::fromLatin1(field)));
+    // the telemetry counts stay, read on the same worker right after the same run
     const int after = core.indexOf(QStringLiteral("out.setClipCountAfter = llrpGpuPlaybackReconSetClipCount();"));
-    ASSERT_TRUE(after > core.indexOf(QStringLiteral("applyLLRawProcObjectWorker( video, raw.data()")));
+    ASSERT_TRUE(after > run);
     ASSERT_TRUE(core.contains(QStringLiteral("out.setLutsCountAfter = llrpGpuPlaybackReconSetLutsCount();")));
-    // adversary r17 A1: the pattern-only configure counts too, read on the same worker right after the same run
     ASSERT_TRUE(core.contains(QStringLiteral("out.setPatternCountAfter = llrpGpuPlaybackReconSetIsoPatternCount();")));
 }
 

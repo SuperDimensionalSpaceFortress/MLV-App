@@ -259,7 +259,12 @@ inline Reason decide( bool enabled,
     if( compared != Reason::Hit ) return compared;
     // adversary r18 A1: one read of three counters is not one instant (a set_luts can land between its LUT and pattern
     // reads). The counters only ever increase (llrawproc.c InterlockedIncrement64, never reset; full-barrier reads), so
-    // two whole reads that both equal the warm key prove every counter held the warm value at one instant between them
+    // two whole reads that both equal the warm key prove every counter held the warm value at one instant between them.
+    // r22 (sol r21 #1): that instant says nothing about the backend unless each count is published BEFORE its native
+    // configure (llrawproc.c, the configure block of llrawproc_gpu_recon_run_backend): then a count still at the warm
+    // value means its configure's native call had not started, and the warm key's counts are read under the backend
+    // mutex by the warm's own run (llrpGpuPlaybackReconTakeLastRunConfigureCounts), so nothing it does not count was
+    // stored before its recon ran. Pinned by tests/pipeline/test_dualiso_gpu_configure_cache.cpp (AReuseDecisionInside*)
     for( int pass = 0; pass < 2; ++pass )
     {
         const LiveCounts after = readLiveCounts();

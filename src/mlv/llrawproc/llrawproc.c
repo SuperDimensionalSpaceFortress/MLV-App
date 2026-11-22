@@ -923,6 +923,14 @@ static volatile LONG64 g_llrawproc_gpu_set_clip_count = 0;
 static volatile LONG64 g_llrawproc_gpu_set_luts_count = 0;
 /* DUALISO-CONFIGURE-CACHE-1: additive; igpu_recon_set_clip / set_luts keep their meaning. */
 static volatile LONG64 g_llrawproc_gpu_set_iso_pattern_count = 0;
+/* r22 (sol r21 #1, the warm's side of the same gate): the three counts as THIS thread's last
+ * llrawproc_gpu_recon_run_backend read them, under the backend mutex, after its configure and before its run. The
+ * counts are published before every native configure (see the configure block), so any configure the warm's key
+ * does not count started after this snapshot, i.e. after the backend state the warm's recon ran with; a count read
+ * after the run instead (outside the lock) could take in another thread's configure whose native call had not yet
+ * happened. Taken and cleared by llrpGpuPlaybackReconTakeLastRunConfigureCounts. */
+static MLV_THREAD_LOCAL int g_llrawproc_gpu_last_run_configure_counts_valid = 0;
+static MLV_THREAD_LOCAL uint64_t g_llrawproc_gpu_last_run_configure_counts[3] = { 0, 0, 0 };
 static llrpGpuReconEventLogger_t g_llrawproc_gpu_recon_event_logger = NULL;
 static llrpGpuStageTelemetrySink_t g_llrawproc_gpu_stage_telemetry_sink = NULL;
 /* adversary r14 A1: a logger may uninstall itself (llrpSetGpuReconEventLogger(NULL)) from inside its own call. Each event
@@ -3048,13 +3056,20 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         if(rc_out) *rc_out = LLRP_GPU_PLAYBACK_RECON_RC_NO_REDUCED_ISO_NOTCH;
         return 0;
     }
+    /* r22 (sol r21 #1): each configure count is PUBLISHED BEFORE its native call. The warm-output reuse gate
+     * (PlaybackWarmOutputReusePolicy.h decide()) reads these counts on the GUI thread with no lock; published after
+     * the call, a decision whose reads all land between the native store and the increment saw the warm's counts
+     * and returned a hit although the backend already held the new state. InterlockedIncrement64 is a full barrier,
+     * so the new count is visible before the native call starts, and every read that does not see it was taken
+     * before the backend changed. A refused call stays counted: the count says "a configure was attempted", which
+     * is what the gate needs; the timing and rc fields still describe the call itself. */
     if(need_set_pattern)
     {
+        set_pattern_count = (long long)InterlockedIncrement64(&g_llrawproc_gpu_set_iso_pattern_count);
         set_pattern_start_s = mlv_stage_timing_now();
         set_pattern_rc = g->set_iso_pattern(g->backend, clip.is_bright);
         set_pattern_ms = (mlv_stage_timing_now() - set_pattern_start_s) * 1000.0;
         set_pattern_called = 1;
-        set_pattern_count = (long long)InterlockedIncrement64(&g_llrawproc_gpu_set_iso_pattern_count);
         if(set_pattern_rc == 0)
         {
             memcpy(g->configured_clip.is_bright, clip.is_bright, sizeof(clip.is_bright));
@@ -3080,13 +3095,13 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
             set_clip_event = &telemetry_events[telemetry_event_count++];
             llrawproc_gpu_stage_telemetry_enter(g, set_clip_event, IGPU_CUDA_ERROR_CHANNEL_RENDER);
         }
+        set_clip_count = (long long)InterlockedIncrement64(&g_llrawproc_gpu_set_clip_count);   /* r22: before the call */
         set_clip_start_s = mlv_stage_timing_now();
         rc = g->set_clip(g->backend, &clip);
         set_clip_ms = (mlv_stage_timing_now() - set_clip_start_s) * 1000.0;
         g_llrawproc_gpu_last_set_clip_ms = set_clip_ms;
         set_clip_rc = rc;
         set_clip_called = 1;
-        set_clip_count = (long long)InterlockedIncrement64(&g_llrawproc_gpu_set_clip_count);
         if(set_clip_event)
             llrawproc_gpu_stage_telemetry_capture(g, set_clip_event,
                                                   "recon:set_clip",
@@ -3112,13 +3127,13 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
             set_luts_event = &telemetry_events[telemetry_event_count++];
             llrawproc_gpu_stage_telemetry_enter(g, set_luts_event, IGPU_CUDA_ERROR_CHANNEL_RENDER);
         }
+        set_luts_count = (long long)InterlockedIncrement64(&g_llrawproc_gpu_set_luts_count);   /* r22: before the call */
         set_luts_start_s = mlv_stage_timing_now();
         rc = g->set_luts(g->backend, &luts);
         set_luts_ms = (mlv_stage_timing_now() - set_luts_start_s) * 1000.0;
         g_llrawproc_gpu_last_set_luts_ms = set_luts_ms;
         set_luts_rc = rc;
         set_luts_called = 1;
-        set_luts_count = (long long)InterlockedIncrement64(&g_llrawproc_gpu_set_luts_count);
         if(set_luts_event)
             llrawproc_gpu_stage_telemetry_capture(g, set_luts_event,
                                                   "recon:set_luts",
@@ -3150,6 +3165,17 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
                 g->notch_configured = 0;
             }
         }
+    }
+    if(rc == 0)
+    {
+        /* r22: still under the backend mutex, after this run's configure: what the warm's reuse key counts. */
+        g_llrawproc_gpu_last_run_configure_counts[0] =
+            (uint64_t)InterlockedCompareExchange64(&g_llrawproc_gpu_set_clip_count, 0, 0);
+        g_llrawproc_gpu_last_run_configure_counts[1] =
+            (uint64_t)InterlockedCompareExchange64(&g_llrawproc_gpu_set_luts_count, 0, 0);
+        g_llrawproc_gpu_last_run_configure_counts[2] =
+            (uint64_t)InterlockedCompareExchange64(&g_llrawproc_gpu_set_iso_pattern_count, 0, 0);
+        g_llrawproc_gpu_last_run_configure_counts_valid = 1;
     }
     if(rc == 0)
     {
@@ -4041,6 +4067,19 @@ uint64_t llrpGpuPlaybackReconSetIsoPatternCount(void)
     return (uint64_t)InterlockedCompareExchange64(&g_llrawproc_gpu_set_iso_pattern_count, 0, 0);
 }
 
+int llrpGpuPlaybackReconTakeLastRunConfigureCounts(uint64_t * set_clip, uint64_t * set_luts, uint64_t * set_pattern)
+{
+    const int valid = g_llrawproc_gpu_last_run_configure_counts_valid;
+    if(valid)
+    {
+        if(set_clip) *set_clip = g_llrawproc_gpu_last_run_configure_counts[0];
+        if(set_luts) *set_luts = g_llrawproc_gpu_last_run_configure_counts[1];
+        if(set_pattern) *set_pattern = g_llrawproc_gpu_last_run_configure_counts[2];
+    }
+    g_llrawproc_gpu_last_run_configure_counts_valid = 0;
+    return valid;
+}
+
 void llrpSetGpuReconEventLogger(llrpGpuReconEventLogger_t logger)
 {
     g_llrawproc_gpu_recon_event_logger = logger;
@@ -4383,6 +4422,14 @@ uint64_t llrpGpuPlaybackReconSetLutsCount(void)
 
 uint64_t llrpGpuPlaybackReconSetIsoPatternCount(void)
 {
+    return 0;
+}
+
+int llrpGpuPlaybackReconTakeLastRunConfigureCounts(uint64_t * set_clip, uint64_t * set_luts, uint64_t * set_pattern)
+{
+    (void)set_clip;
+    (void)set_luts;
+    (void)set_pattern;
     return 0;
 }
 
