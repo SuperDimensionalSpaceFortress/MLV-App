@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -2848,8 +2849,12 @@ TEST(BatchExportFormat, R6DefaultLookupAppDirCopyWinsOverPathCopy)
 }
 
 /* No copy beside the executable: the default lookup falls back to the PATH copy (the base's
- * plain findExecutable hit, read the same way), and says it searched both places. */
-TEST(BatchExportFormat, R6DefaultLookupWithoutAppDirCopyFallsBackToPath)
+ * plain findExecutable hit, read the same way), and says it searched both places.
+ * r8 seam (sol r7 B3): the body takes two hooks, run after the first absence check and after
+ * the lookups, so a concurrent run's create-then-remove can be staged deterministically. The
+ * registered test passes no-op hooks. */
+static void appDirLookupPathFallbackCheck(const std::function<void()> & afterPreCheck,
+                                          const std::function<void()> & afterLookup)
 {
     const QString appDir = QCoreApplication::applicationDirPath();
     ASSERT_FALSE( appDir.isEmpty() );
@@ -2859,6 +2864,7 @@ TEST(BatchExportFormat, R6DefaultLookupWithoutAppDirCopyFallsBackToPath)
         + appDirLookupPackagedName(QStringLiteral("ffprobe"));
     if( QFileInfo::exists(appFfmpeg) || QFileInfo::exists(appProbe) )
         SKIP_TEST("an ffmpeg or ffprobe already sits beside the test executable");
+    afterPreCheck();
 
     QTemporaryDir toolsTemp;
     ASSERT_TRUE( toolsTemp.isValid() );
@@ -2874,6 +2880,7 @@ TEST(BatchExportFormat, R6DefaultLookupWithoutAppDirCopyFallsBackToPath)
         batchRenderedVideoFfmpegBinaryPlanFromCurrentEnvironment();
     const BatchRenderedVideoMediaProbeBinaryPlan probePlan =
         batchRenderedVideoMediaProbeBinaryPlanFromCurrentEnvironment();
+    afterLookup();
     /* r7 (sol r6 B2): this test places nothing beside the executable, so it checks the
      * absence it relies on itself, after the lookups too, and skips (never asserts) when a
      * packager or a concurrent run put a file there meanwhile. */
@@ -2891,6 +2898,11 @@ TEST(BatchExportFormat, R6DefaultLookupWithoutAppDirCopyFallsBackToPath)
     ASSERT_TRUE( probePlan.appDirSearchAttempted );
     ASSERT_EQ( std::string("app-dir,PATH"),
                appDirLookupText(batchRenderedVideoFfmpegBinaryPlanSearchedLocations(plan)) );
+}
+
+TEST(BatchExportFormat, R6DefaultLookupWithoutAppDirCopyFallsBackToPath)
+{
+    appDirLookupPathFallbackCheck([] {}, [] {});
 }
 
 /* r7, sol r6 B1, literal input: the app-dir ffmpeg selected by the lookup can no longer be
@@ -3068,6 +3080,118 @@ TEST(BatchExportFormat, R7PrecedenceFixtureNeverOverwritesOrDeletesAFileItDidNot
     ASSERT_TRUE( check.open(QIODevice::ReadOnly) );
     ASSERT_EQ( std::string("packager-copy"), std::string(check.readAll().constData()) );
     ASSERT_FALSE( QFileInfo::exists(mine) );
+}
+
+static bool appDirLookupReplaceClosedFile(const QString & path, const QByteArray & bytes)
+{
+    if( !QFile::remove(path) )
+        return false;
+    QFile packager(path);
+    if( !packager.open(QIODevice::WriteOnly | QIODevice::NewOnly) )
+        return false;
+    const bool ok = packager.write(bytes) == bytes.size();
+    packager.close();
+    return ok;
+}
+
+static std::string appDirLookupReadAll(const QString & path)
+{
+    QFile file(path);
+    if( !file.open(QIODevice::ReadOnly) )
+        return std::string("<cannot open>");
+    return file.readAll().toStdString();
+}
+
+/* r8, sol r7 B2, literal input: the fixture created ffmpeg.exe and ffprobe.exe exclusively and
+ * closed them; a packager then replaced each with its own binary under the same name (the
+ * ffmpeg replacement is even the same size as the fixture's bytes). Cleanup must leave both
+ * replacements intact on both routes: the explicit removeBesideExe() (ffmpeg) and the
+ * destructor (ffprobe). A file the fixture created and nobody touched is still removed. */
+TEST(BatchExportFormat, R8PrecedenceFixtureLeavesAFileReplacedAfterItClosedIt)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE( dir.isValid() );
+    const QString root = QDir::cleanPath(dir.path());
+    ASSERT_TRUE( QDir().mkpath(root + QStringLiteral("/explicit")) );
+    ASSERT_TRUE( QDir().mkpath(root + QStringLiteral("/destructor")) );
+    const QString ffmpeg = root + QStringLiteral("/explicit/")
+        + appDirLookupPackagedName(QStringLiteral("ffmpeg"));
+    const QString untouched = root + QStringLiteral("/explicit/")
+        + appDirLookupPackagedName(QStringLiteral("ffprobe"));
+    const QString probe = root + QStringLiteral("/destructor/")
+        + appDirLookupPackagedName(QStringLiteral("ffprobe"));
+
+    {
+        AppDirLookupEnvironmentFixture fixture;
+        ASSERT_TRUE( fixture.createBesideExe(ffmpeg, QByteArray("MZ-app-dir-copy"))
+                     == AppDirLookupCreate::Created );
+        ASSERT_TRUE( fixture.createBesideExe(untouched, QByteArray("MZ-app-dir-copy"))
+                     == AppDirLookupCreate::Created );
+        ASSERT_TRUE( appDirLookupReplaceClosedFile(ffmpeg, QByteArray("packager-ffmpeg")) );
+        /* Nothing of the fixture's own remains: the replacement is not its file. */
+        ASSERT_TRUE( fixture.removeBesideExe() );
+        ASSERT_TRUE( fixture.besideExe.isEmpty() );
+    }
+    ASSERT_EQ( std::string("packager-ffmpeg"), appDirLookupReadAll(ffmpeg) );
+    ASSERT_FALSE( QFileInfo::exists(untouched) );
+
+    {
+        AppDirLookupEnvironmentFixture fixture;
+        ASSERT_TRUE( fixture.createBesideExe(probe, QByteArray("MZ-app-dir-copy"))
+                     == AppDirLookupCreate::Created );
+        ASSERT_TRUE( appDirLookupReplaceClosedFile(probe, QByteArray("packager-ffprobe-binary")) );
+    }
+    ASSERT_EQ( std::string("packager-ffprobe-binary"), appDirLookupReadAll(probe) );
+}
+
+/* r8, sol r7 B3, literal input: process B (the PATH-fallback check) sees neither file beside
+ * the executable; process A (a concurrent run of the precedence test) creates both; B resolves
+ * them; A removes both before B checks again. B's guard then sees absence on both sides of the
+ * lookup. B must skip with a logged reason, never fail its PATH assertions. Staged through the
+ * appDirLookupPathFallbackCheck hooks. */
+TEST(BatchExportFormat, R8PathFallbackCheckSkipsWhenAConcurrentRunCameAndWentDuringTheLookup)
+{
+    const QString appDir = QCoreApplication::applicationDirPath();
+    ASSERT_FALSE( appDir.isEmpty() );
+    const QString appFfmpeg = QDir::cleanPath(appDir) + QStringLiteral("/")
+        + appDirLookupPackagedName(QStringLiteral("ffmpeg"));
+    const QString appProbe = QDir::cleanPath(appDir) + QStringLiteral("/")
+        + appDirLookupPackagedName(QStringLiteral("ffprobe"));
+    if( QFileInfo::exists(appFfmpeg) || QFileInfo::exists(appProbe) )
+        SKIP_TEST("an ffmpeg or ffprobe already sits beside the test executable; the concurrent run cannot be staged");
+
+    AppDirLookupEnvironmentFixture concurrentRun;
+    bool staged = false;
+    bool removed = false;
+    std::string outcome;
+    try
+    {
+        appDirLookupPathFallbackCheck(
+            [&] {
+                staged = concurrentRun.createBesideExe(appFfmpeg, QByteArray("MZ-app-dir-copy"))
+                             == AppDirLookupCreate::Created
+                      && concurrentRun.createBesideExe(appProbe, QByteArray("MZ-app-dir-copy"))
+                             == AppDirLookupCreate::Created;
+            },
+            [&] { removed = concurrentRun.removeBesideExe(); });
+        outcome = "passed";
+    }
+    catch( const minitest::Skip & skip )
+    {
+        outcome = std::string("skipped: ") + skip.what();
+    }
+    catch( const minitest::Failure & failure )
+    {
+        outcome = std::string("failed: ") + failure.what();
+    }
+    std::printf("[R8-B3] staged=%d removed=%d outcome=%s\n", staged ? 1 : 0, removed ? 1 : 0,
+                outcome.c_str());
+    if( !staged )
+        SKIP_TEST("the concurrent run's files could not be created beside the test executable");
+    ASSERT_TRUE( removed );
+    ASSERT_FALSE( QFileInfo::exists(appFfmpeg) );
+    ASSERT_FALSE( QFileInfo::exists(appProbe) );
+    ASSERT_EQ( std::string("skipped"), outcome.substr(0, outcome.find(':')) );
 }
 
 #ifdef Q_OS_WIN
