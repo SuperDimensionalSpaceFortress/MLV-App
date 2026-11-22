@@ -3473,6 +3473,15 @@ function Get-DvLegSpecShapeRefusal {
     $exportRefusal = Get-DvExportShapeRefusal -Spec $Spec -IsExportLeg ($null -ne $legTypeProp -and $legTypeProp.Value -ceq 'export')
     if ($null -ne $exportRefusal) { return $exportRefusal }
     $isLookLeg = ($null -ne $legTypeProp -and $legTypeProp.Value -ceq 'look')
+    # EVERY-FRAME-VISUAL-LEG-SPEC-1 r1 (adversary pass 2 A1): a SPEED leg that runs unpaced says visualCapture false (leg-spec.schema.json). The unpaced Play holds once its
+    # required source frames are consumed (MainWindow.cpp playbackHandling), so the untimed capture tail would show ONE frame six times and still read verdict OK.
+    # Refused here for the leg and every batch preflight alike (scalar, -LegSet and plan), before a lease opens; Get-DvVisualCaptureRequest keeps the same refusal as its own guard.
+    if (-not $isLookLeg -and ($null -eq $legTypeProp -or $legTypeProp.Value -cne 'export') -and $null -ne $genArgsProp -and (Get-DvProp $genArgsProp.Value 'unpaced') -eq $true) {
+        $captureProp = $Spec.PSObject.Properties['visualCapture']
+        if ($null -eq $captureProp -or $captureProp.Value -isnot [bool] -or $captureProp.Value) {
+            return 'an unpaced speed leg cannot keep the visual capture tail (the unpaced Play holds once its source frames are consumed, so every tail capture is one frame): set visualCapture false with a visualCaptureOptOutReason'
+        }
+    }
     # r7 (adversary r6 A2): a look leg reads look.* before its receipt exists, so a look leg with NO look is refused here too (it threw
     # "Cannot index into a null array" after the batch had opened its lease).
     if ($isLookLeg -and $null -eq $Spec.PSObject.Properties['look']) { return 'a look leg needs look (one JSON object); it is absent' }

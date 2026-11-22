@@ -8164,10 +8164,21 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertIs(spec.get("visualCapture"), False, path.name)
         script = ("Import-Module '%s' -Force; $s = Get-Content -Raw '%s' | ConvertFrom-Json; "
                   "try { $null = Get-DvVisualCaptureRequest -Spec $s; 'NOT_REFUSED' } catch { $_.Exception.Message }")
-        for label, spec in (("absent", kept), ("true", dict(kept, visualCapture=True))):
+        # adversary r1 pass 2 A1 (major, introduced): the refusal must also live in the SHAPE predicate, the one the leg (Invoke-VenueLeg) and every lease-batch /
+        # chain preflight (scalar -LegSpec, -LegSet, plan) call before a lease opens; Get-DvVisualCaptureRequest alone was reached only after the lease.
+        shape_script = ("Import-Module '%s' -Force; $s = Get-Content -Raw '%s' | ConvertFrom-Json -NoEnumerate; "
+                        "$r = Get-DvLegSpecShapeRefusal -Spec $s; if ($null -eq $r) { 'SHAPE_OK' } else { 'SHAPE_REFUSED: ' + $r }")
+        for label, spec in (("absent", kept), ("true", dict(kept, visualCapture=True)), ("compliant headroom spec", headroom)):
             with tempfile.TemporaryDirectory() as tmp:
-                spec_path = Path(tmp) / f"{label}.json"
+                spec_path = Path(tmp) / f"{label.split()[0]}.json"
                 spec_path.write_text(json.dumps(spec), encoding="utf-8")
+                shape = run_pwsh(["-NoProfile", "-Command", shape_script % (DV / "DualVenueRunner.psm1", spec_path)])
+                self.assertEqual(shape.returncode, 0, shape.stderr)
+                if label == "compliant headroom spec":
+                    self.assertIn("SHAPE_OK", shape.stdout, label)
+                    continue
+                self.assertIn("SHAPE_REFUSED", shape.stdout, f"{label}: {shape.stdout}")
+                self.assertIn("unpaced speed leg", shape.stdout, label)
                 out = run_pwsh(["-NoProfile", "-Command", script % (DV / "DualVenueRunner.psm1", spec_path)])
                 self.assertEqual(out.returncode, 0, out.stderr)
                 self.assertIn("DVE_LEG_SPEC_INVALID", out.stdout, f"{label}: {out.stdout}")

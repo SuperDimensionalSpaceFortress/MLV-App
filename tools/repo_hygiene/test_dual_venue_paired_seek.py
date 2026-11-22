@@ -413,7 +413,9 @@ class GeneratorArgsBooleanStrictnessTests(RunnerHarness, unittest.TestCase):
                   "Write-Output ('REFUSAL=' + $r)")
         # displayMode windowed: midPlayWindowToggles true is refused on any other display mode (VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 adversary A4), a refusal this
         # strictness test is not about; no other switch reads displayMode
-        spec = '{"schema":"mlv-app/dual-venue-leg/v1","legType":"speed","displayMode":"windowed","generatorArgs":{"%s":%s}}' % (name, raw_json)
+        # EVERY-FRAME-VISUAL-LEG-SPEC-1 r1 (adversary pass 2 A1): an unpaced speed leg must say visualCapture false (a refusal this strictness test is not about)
+        capture = '"visualCapture":false,' if name == "unpaced" else ""
+        spec = '{"schema":"mlv-app/dual-venue-leg/v1","legType":"speed","displayMode":"windowed",%s"generatorArgs":{"%s":%s}}' % (capture, name, raw_json)
         if name == "midPlayWindowToggles":
             # VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r12 (fable r11 note): a requested leg is refused unless its criteria bind the five toggle scalars for every
             # backend it names (WINDOW_TOGGLES_CRITERIA_UNBOUND), another refusal this strictness test is not about, so the spec carries a complete binding
