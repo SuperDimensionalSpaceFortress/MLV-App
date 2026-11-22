@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <vector>
 
 #ifdef Q_OS_WIN
 #ifndef WIN32_LEAN_AND_MEAN
@@ -2498,6 +2499,44 @@ static bool appDirLookupMakeLink(const QString & link, const QString & target, b
     return QFileInfo(link).isSymLink() && QFileInfo::exists(link);
 }
 
+/* r7 adversary A9: a real Windows image from this host's own Windows directory (not a
+ * hard-coded C:). */
+static QString appDirLookupSystemImage()
+{
+    const QString root = qEnvironmentVariable("SystemRoot", QStringLiteral("C:\\Windows"));
+    return QDir::cleanPath(QDir::fromNativeSeparators(root)) + QStringLiteral("/System32/whoami.exe");
+}
+
+/* r7 (sol r6 B1, Windows twin of Unix 0755 -> 0644, adversary A1): replace the file's DACL so
+ * this account is denied FILE_EXECUTE and allowed everything else (metadata, read, delete), so
+ * the file still looks like a non-empty regular file but can no longer be started. */
+static bool appDirLookupDenyExecute(const QString & path)
+{
+    HANDLE token = nullptr;
+    if( !OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) )
+        return false;
+    DWORD size = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+    std::vector<unsigned char> user(size > 0 ? size : 1);
+    const bool gotUser = size > 0
+        && GetTokenInformation(token, TokenUser, user.data(), size, &size) != 0;
+    CloseHandle(token);
+    if( !gotUser )
+        return false;
+    PSID sid = reinterpret_cast<TOKEN_USER *>(user.data())->User.Sid;
+    const DWORD aclSize = sizeof(ACL) + 2 * (sizeof(ACCESS_ALLOWED_ACE) + GetLengthSid(sid));
+    std::vector<unsigned char> aclBytes(aclSize);
+    PACL acl = reinterpret_cast<PACL>(aclBytes.data());
+    SECURITY_DESCRIPTOR descriptor;
+    const std::wstring nativePath = QDir::toNativeSeparators(path).toStdWString();
+    return InitializeAcl(acl, aclSize, ACL_REVISION) != 0
+        && AddAccessDeniedAce(acl, ACL_REVISION, FILE_EXECUTE, sid) != 0
+        && AddAccessAllowedAce(acl, ACL_REVISION, FILE_ALL_ACCESS, sid) != 0
+        && InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) != 0
+        && SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE) != 0
+        && SetFileSecurityW(nativePath.c_str(), DACL_SECURITY_INFORMATION, &descriptor) != 0;
+}
+
 /* A Windows FILE SYMLINK beside MLVApp (hard link when this host cannot make one; the line
  * printed says which) to a real non-empty exe reports QFileInfo size 0, yet it starts: the
  * app-dir lookup and preflight accept it, and the optional ffprobe beside it is found. */
@@ -2508,7 +2547,7 @@ TEST(BatchExportFormat, FfmpegDefaultLookupAcceptsASymlinkedLaunchableFfmpeg)
     ASSERT_TRUE( appTemp.isValid() && realTemp.isValid() );
     const QString appDir = QDir::cleanPath(appTemp.path());
     const QString real = QDir::cleanPath(realTemp.path()) + QStringLiteral("/ffmpeg-real.exe");
-    ASSERT_TRUE( QFile::copy(QStringLiteral("C:/Windows/System32/whoami.exe"), real) );
+    ASSERT_TRUE( QFile::copy(appDirLookupSystemImage(), real) );
     const QString link = appDir + QStringLiteral("/ffmpeg.exe");
     const QString probeLink = appDir + QStringLiteral("/ffprobe.exe");
     bool hard = false;
@@ -2549,7 +2588,7 @@ TEST(BatchExportFormat, R6AppDirSymlinkWhoseTargetWasEmptiedIsRefusedAtPreflight
     ASSERT_TRUE( appTemp.isValid() && realTemp.isValid() );
     const QString appDir = QDir::cleanPath(appTemp.path());
     const QString real = QDir::cleanPath(realTemp.path()) + QStringLiteral("/ffmpeg-real.exe");
-    ASSERT_TRUE( QFile::copy(QStringLiteral("C:/Windows/System32/whoami.exe"), real) );
+    ASSERT_TRUE( QFile::copy(appDirLookupSystemImage(), real) );
     const QString link = appDir + QStringLiteral("/ffmpeg.exe");
     if( !appDirLookupMakeLink(link, real, false) )
         SKIP_TEST("this host cannot create a file symlink (the input needs a symlink, not a hard link)");
@@ -2855,33 +2894,32 @@ TEST(BatchExportFormat, R6DefaultLookupWithoutAppDirCopyFallsBackToPath)
 }
 
 /* r7, sol r6 B1, literal input: the app-dir ffmpeg selected by the lookup can no longer be
- * started when preflight runs. On Unix its mode changed from 0755 to 0644; on Windows (where
- * CreateProcess starts an image by its .exe name) the app-dir file is not a .exe. Preflight
- * refuses it (exit 2, the class of a missing binary) instead of passing it to a launch that
- * fails (exit 4). */
+ * started when preflight runs. On Unix its mode changed from 0755 to 0644; on Windows (adversary
+ * r7 A1) this account was denied FILE_EXECUTE on it. Preflight refuses it (exit 2, the class of
+ * a missing binary) instead of passing it to a launch that fails (exit 4). */
 TEST(BatchExportFormat, R7AppDirSelectionThatCanNoLongerStartIsRefusedAtPreflight)
 {
     QTemporaryDir dir;
     ASSERT_TRUE( dir.isValid() );
     const QString appDir = QDir::cleanPath(dir.path());
 #ifdef Q_OS_WIN
-    const QString notAnImage = appDir + QStringLiteral("/ffmpeg");
-    ASSERT_TRUE( appDirLookupWriteFile(notAnImage, QByteArray("MZ")) );
+    const QString packaged = appDir + QStringLiteral("/ffmpeg.exe");
+    ASSERT_TRUE( QFile::copy(appDirLookupSystemImage(), packaged) );
     const BatchRenderedVideoFfmpegBinaryPlan plan =
         batchRenderedVideoFfmpegBinaryPlanFromLookup(
-            QString(), appDir,
-            appDirLookupFakeResolver(notAnImage, QStringLiteral("C:/tools/ffmpeg.exe"), nullptr));
+            QString(), appDir, batchRenderedVideoSystemExecutableResolver());
     ASSERT_TRUE( plan.foundInAppDir );
+    ASSERT_TRUE( batchRenderedVideoFfmpegBinaryPlanUsableAtPreflight(plan) );
+
+    /* FILE_EXECUTE denied after the lookup; the file still reads as a non-empty regular file. */
+    ASSERT_TRUE( appDirLookupDenyExecute(packaged) );
+    ASSERT_TRUE( QFileInfo(packaged).isFile() );
+    ASSERT_TRUE( QFileInfo(packaged).size() > 0 );
     ASSERT_FALSE( batchRenderedVideoFfmpegBinaryPlanUsableAtPreflight(plan) );
     ASSERT_EQ( std::string("app-dir"),
                appDirLookupText(batchRenderedVideoFfmpegBinaryPlanSearchedLocations(plan)) );
-    /* The packaged .exe passes, as before. */
-    const QString packaged = appDir + QStringLiteral("/ffmpeg.exe");
-    ASSERT_TRUE( appDirLookupWriteFile(packaged, QByteArray("MZ")) );
-    ASSERT_TRUE( batchRenderedVideoFfmpegBinaryPlanUsableAtPreflight(
-        batchRenderedVideoFfmpegBinaryPlanFromLookup(
-            QString(), appDir,
-            appDirLookupFakeResolver(packaged, QString(), nullptr))) );
+    ASSERT_FALSE( batchRenderedVideoFfmpegBinaryPlanFromLookup(
+        QString(), appDir, batchRenderedVideoSystemExecutableResolver()).foundInAppDir );
 #else
     const QString packaged = appDir + QStringLiteral("/ffmpeg");
     ASSERT_TRUE( appDirLookupWriteFile(packaged, QByteArray("#!/bin/sh\nexit 0\n")) );
@@ -2925,11 +2963,13 @@ TEST(BatchExportFormat, R7OptionalProbeThatCanNoLongerStartIsNotChosen)
     const BatchRenderedVideoFfmpegBinaryPlan ffmpegPlan =
         batchRenderedVideoFfmpegBinaryPlanFromResolvedPath(QStringLiteral("ffmpeg"), encoderFfmpeg);
 #ifdef Q_OS_WIN
-    /* Not a .exe: CreateProcess cannot start it by this name. */
-    const QString appProbe = appDir + QStringLiteral("/ffprobe");
+    /* FILE_EXECUTE denied to this account on both. */
+    const QString appProbe = appDir + QStringLiteral("/ffprobe.exe");
     const QString siblingProbe = encoderDir + QStringLiteral("/ffprobe");
     ASSERT_TRUE( appDirLookupWriteFile(appProbe, QByteArray("MZ")) );
     ASSERT_TRUE( appDirLookupWriteFile(siblingProbe, QByteArray("MZ")) );
+    ASSERT_TRUE( appDirLookupDenyExecute(appProbe) );
+    ASSERT_TRUE( appDirLookupDenyExecute(siblingProbe) );
 #else
     const QString appProbe = appDir + QStringLiteral("/ffprobe");
     const QString siblingProbe = encoderDir + QStringLiteral("/ffprobe");
@@ -2956,6 +2996,47 @@ TEST(BatchExportFormat, R7OptionalProbeThatCanNoLongerStartIsNotChosen)
     ASSERT_EQ( appDirLookupText(launchable), appDirLookupText(
         batchRenderedVideoOptionalMediaProbeExecutable(probePlan, ffmpegPlan)) );
 }
+
+#ifdef Q_OS_WIN
+/* r7 adversary A2, literal input: --rendered-ffmpeg C:/Tools/ffmpeg.exe, a working image saved
+ * as C:/Tools/ffprobe (no extension), no ffprobe.exe there and none in PATH or the app dir. The
+ * base took it, and it starts (QProcess hands CreateProcess the full path, which gets no .exe
+ * appended; measured below with a bounded wait), so it stays the optional ffprobe. */
+TEST(BatchExportFormat, R7ExtensionlessFfprobeBesideFfmpegThatStartsIsStillChosen)
+{
+    QTemporaryDir toolsTemp;
+    ASSERT_TRUE( toolsTemp.isValid() );
+    const QString tools = QDir::cleanPath(toolsTemp.path());
+    const QString ffmpeg = tools + QStringLiteral("/ffmpeg.exe");
+    const QString probe = tools + QStringLiteral("/ffprobe");
+    ASSERT_TRUE( QFile::copy(appDirLookupSystemImage(), ffmpeg) );
+    ASSERT_TRUE( QFile::copy(appDirLookupSystemImage(), probe) );
+
+    QProcess start;
+    start.start(probe, QStringList());
+    const bool started = start.waitForStarted(10000);
+    const bool finished = started && start.waitForFinished(10000);
+    if( start.state() != QProcess::NotRunning )
+    {
+        start.kill();
+        start.waitForFinished(5000);
+    }
+    std::printf("[R7-A2-MEASURE] extensionless image started=%d finished=%d exit=%d\n",
+                started ? 1 : 0, finished ? 1 : 0, finished ? start.exitCode() : -1);
+    std::fflush(stdout);
+    ASSERT_TRUE( started );
+
+    const BatchRenderedVideoFfmpegBinaryPlan ffmpegPlan =
+        batchRenderedVideoFfmpegBinaryPlanFromLookup(
+            ffmpeg, QStringLiteral("C:/apps/MLVApp"), appDirLookupFakeResolver(QString(), ffmpeg, nullptr));
+    const BatchRenderedVideoMediaProbeBinaryPlan noProbe =
+        batchRenderedVideoMediaProbeBinaryPlanFromLookup(
+            QString(), QStringLiteral("C:/apps/MLVApp"),
+            appDirLookupFakeResolver(QString(), QString(), nullptr));
+    ASSERT_EQ( appDirLookupText(probe), appDirLookupText(
+        batchRenderedVideoOptionalMediaProbeExecutable(noProbe, ffmpegPlan)) );
+}
+#endif
 
 /* r7, sol r6 B2, literal input: a packager (or a concurrent run of this test executable) put
  * ffmpeg.exe beside console_tests.exe after the precedence test's absence check and before its
@@ -3000,7 +3081,7 @@ TEST(BatchExportFormat, R7LinkFixtureTakesATempPathWithAnAmpersandLiterally)
     const QString dir = QDir::cleanPath(base.path()) + QStringLiteral("/R&D");
     ASSERT_TRUE( QDir().mkpath(dir) );
     const QString real = dir + QStringLiteral("/ffmpeg-real.exe");
-    ASSERT_TRUE( QFile::copy(QStringLiteral("C:/Windows/System32/whoami.exe"), real) );
+    ASSERT_TRUE( QFile::copy(appDirLookupSystemImage(), real) );
     const QString hardLink = dir + QStringLiteral("/ffmpeg.exe");
     ASSERT_TRUE( appDirLookupMakeLink(hardLink, real, true) );
     ASSERT_FALSE( QFileInfo(hardLink).isSymLink() );
