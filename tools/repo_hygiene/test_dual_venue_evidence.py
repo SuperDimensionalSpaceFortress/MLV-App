@@ -8233,6 +8233,32 @@ class LegSpecSchemaTests(unittest.TestCase):
         for label, spec in good.items():
             self.jsonschema.validate(spec, self.schema)
 
+    def test_a_json_array_capture_opt_out_reason_is_refused_not_flattened_to_a_string(self) -> None:
+        """EVERY-FRAME-VISUAL-LEG-SPEC-1 r3 adversary A7 (major, introduced): Get-DvVisualCaptureOptOutRefusal read the reason through `$(if ... { $reason.Value })`, and a
+        subexpression enumerates a one-element array, so a JSON array reason ["a real looking reason"] became the string inside it and was accepted by the shape predicate and
+        the request, while the schema (type string) rejects it. The reason is now tested as read, with no enumeration: an array (one element or several) is refused by all three."""
+        base = json.loads((DV / "legs/m16-1243-headroom-unpaced-windowed-s1.json").read_text(encoding="utf-8"))
+        real_reason = base["visualCaptureOptOutReason"]
+        bad = {
+            "array-one-element-reason": dict(base, visualCaptureOptOutReason=[real_reason]),
+            "array-two-element-reason": dict(base, visualCaptureOptOutReason=[real_reason, real_reason]),
+        }
+        script = ("Import-Module '%s' -Force; foreach ($f in Get-ChildItem -LiteralPath '%s' -Filter *.json) { "
+                  "$s = Get-Content -Raw -LiteralPath $f.FullName | ConvertFrom-Json -NoEnumerate; $r = Get-DvLegSpecShapeRefusal -Spec $s; "
+                  "$q = try { $null = Get-DvVisualCaptureRequest -Spec $s; 'REQ_OK' } catch { 'REQ_THREW' }; "
+                  "$p = $(if ($null -eq $r) { 'SHAPE_OK' } else { 'SHAPE_REFUSED' }); \"$($f.BaseName)|$p|$q\" }")
+        with tempfile.TemporaryDirectory() as tmp:
+            for label, spec in bad.items():
+                (Path(tmp) / f"{label}.json").write_text(json.dumps(spec), encoding="utf-8")
+            out = run_pwsh(["-NoProfile", "-Command", script % (DV / "DualVenueRunner.psm1", tmp)])
+        self.assertEqual(out.returncode, 0, out.stderr)
+        rows = {line.split("|")[0]: line.split("|")[1:] for line in out.stdout.splitlines() if line.count("|") == 2}
+        self.assertEqual(sorted(rows), sorted(bad), out.stdout)
+        for label in bad:
+            self.assertEqual(rows[label], ["SHAPE_REFUSED", "REQ_THREW"], f"{label}: an array reason must be refused by the shape predicate and the request")
+            with self.assertRaises(self.jsonschema.ValidationError, msg=f"schema: {label}"):
+                self.jsonschema.validate(bad[label], self.schema)
+
     def test_the_hand_listed_shipped_legs_are_exactly_the_legs_directory(self) -> None:
         self.assertEqual(sorted(SHIPPED_LEGS), sorted("legs/" + p.name for p in (DV / "legs").glob("*.json")), "SHIPPED_LEGS drifted from the legs/ directory")
 

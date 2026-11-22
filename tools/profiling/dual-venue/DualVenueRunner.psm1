@@ -3864,7 +3864,9 @@ function Get-DvVisualCaptureOptOutRefusal {
     }
     if ($null -ne $flag -and $flag.Value -isnot [bool]) { return 'visualCapture must be a boolean' }
     if ($null -ne $flag -and -not $flag.Value) {
-        $reasonText = $(if ($null -eq $reason) { $null } else { $reason.Value })
+        # r4 adversary A7: read the property value as it is. A subexpression or an `if` expression would enumerate a one-element array into the string inside it.
+        $reasonText = $null
+        if ($null -ne $reason) { $reasonText = $reason.Value }
         if ($reasonText -isnot [datetime] -and ($reasonText -isnot [string] -or [string]::IsNullOrWhiteSpace($reasonText))) {
             return 'visualCapture false needs a visualCaptureOptOutReason (a non-empty reason with a non-space character)'
         }

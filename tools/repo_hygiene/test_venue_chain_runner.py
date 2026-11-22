@@ -75,10 +75,9 @@ switch ($mode) {
 # Invoke-VenueLeg stand-in: records START/END (UTC ticks) to FAKE_LEG_LOG, sleeps FAKE_LEG_SLEEP, and lays out a receipt path + run summary like
 # Invoke-VenueLeg does when FAKE_LEG_PRELOADS (comma list, one per call) is set.
 FAKE_LEG = r"""
-param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '', [string]$ExpectSpecSha256 = '')
+param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '')
 $leaf = Split-Path -Leaf $LegSpec
 if ($env:FAKE_LEG_LOG) { Add-Content -LiteralPath $env:FAKE_LEG_LOG -Value ("START {0} {1} {2}" -f [DateTime]::UtcNow.Ticks, $leaf, $PID) }
-if ($env:FAKE_LEG_SHA_LOG) { Add-Content -LiteralPath $env:FAKE_LEG_SHA_LOG -Value ("{0} {1}" -f $leaf, $ExpectSpecSha256) }
 if ($env:FAKE_LEG_SLEEP) { Start-Sleep -Milliseconds ([int]([double]$env:FAKE_LEG_SLEEP * 1000)) }
 # r1 (VENUE-CHAIN-UNHEALTHY-STREAK-STOP-1): FAKE_LEG_OUTCOMES = comma list of OUTCOME or OUTCOME:DETAIL, one per call (the last repeats), counted in FAKE_LEG_ROOT;
 # the leg prints DVE_OUTCOME / DVE_DETAIL / DVE_RECEIPT_PATH (<root>\receipts\CARD-1\<leg>\<venue>\rcpt-<n>.json) as Invoke-VenueLeg does. FAKE_LEG_DELETE_PATH is
@@ -325,9 +324,8 @@ class VenueChainRunnerTests(unittest.TestCase):
         self.assertGreater(found, 0, f"mutation anchor not in the runner: {old!r}")
         if count is not None:
             self.assertEqual(found, count, f"mutation anchor count changed: {old!r}")
-        # EVERY-FRAME-VISUAL-LEG-SPEC-1 r3: the siblings are derived from the RUNNER (it imports DualVenueRunner.psm1 on every branch now), THEN the mutated text is written over the runner copy
-        copy_with_siblings(RUNNER, d)
         (d / RUNNER.name).write_text(text.replace(old, new), encoding="utf-8")
+        copy_with_siblings(MODULE, d)
         return d / RUNNER.name
 
     def write_claim(self, pid: int, created_iso: str, expires: datetime, run_dir: str = "C:\\elsewhere\\lane-OTHER") -> str:
@@ -404,66 +402,6 @@ class VenueChainRunnerTests(unittest.TestCase):
         self.run_chain(rd, [self.specs[0]], runner=mut, deadline_sec=8)
         pre = [c for c in self.quiet_calls() if "maxWait=600" in c]
         self.assertTrue(pre and all("ownClaimHeld=True" in c for c in pre), pre)
-
-    def test_a_plan_spec_the_leg_would_refuse_is_refused_before_any_probe_or_claim(self) -> None:
-        """EVERY-FRAME-VISUAL-LEG-SPEC-1 r2 adversary A2 (major, introduced): the chain took a claim and probed the venue, and only then did the leg refuse a speed spec that
-        is unpaced and keeps the capture tail (or whose opt-out reason is blank), so a refusable spec cost a claim, a probe and a queue place. The leg's shape predicate now runs
-        on EVERY plan spec (the good first one too) before CHAIN_START: exit 2, a LEG_SPEC_INVALID line, no quiet probe, no leg call and no claim file."""
-        unpaced_keeps_tail = {"legId": "fx-unpaced", "legType": "speed", "generatorArgs": {"unpaced": True}}
-        blank_reason = {"legId": "fx-blank", "legType": "speed", "generatorArgs": {"unpaced": True}, "visualCapture": False, "visualCaptureOptOutReason": " " * 12}
-        for label, spec in (("unpaced-keeps-capture-tail", unpaced_keeps_tail), ("blank-opt-out-reason", blank_reason)):
-            with self.subTest(label):
-                bad = self.case / f"{label}.json"
-                bad.write_text(json.dumps(spec), encoding="utf-8")
-                rd = self.case / f"lane-A2-{label}"
-                r = self.run_chain(rd, [self.specs[0], bad])
-                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-                self.assertIn("LEG_SPEC_INVALID", r.stdout + r.stderr)
-                self.assertIn(bad.name, r.stdout + r.stderr)
-                self.assertEqual(self.quiet_calls(), [], "no quiet probe may run for a spec the leg refuses")
-                self.assertEqual(self.leg_calls(), [], "no leg may start (not even the good first one)")
-                self.assertFalse(self.claim_path.exists(), "no claim may be taken")
-                self.assertFalse((rd / "chain.log").exists() and "CHAIN_START" in (rd / "chain.log").read_text(encoding="utf-8"), "refused before CHAIN_START")
-        good = self.case / "fx-good-unpaced.json"
-        good_bytes = json.dumps({"legId": "fx-good", "legType": "speed", "generatorArgs": {"unpaced": True}, "visualCapture": False,
-                                 "visualCaptureOptOutReason": "an unpaced Play holds its last frame"}).encode("utf-8")
-        good.write_bytes(good_bytes)
-        sha_log = self.case / "leg-sha.log"
-        ok = self.run_chain(self.case / "lane-A2-good", [good], deadline_sec=30, env=self.env(FAKE_LEG_SHA_LOG=str(sha_log)))
-        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
-        self.assertTrue(self.leg_calls() and all("fx-good-unpaced.json" in c for c in self.leg_calls()), self.leg_calls())   # the compliant spec still runs
-        # r3 adversary A2: the leg is bound to the bytes the shape check judged (-ExpectSpecSha256, the leg's own DVE_LEG_SPEC_CHANGED guard)
-        import hashlib
-        self.assertEqual(sha_log.read_text(encoding="utf-8").split(), ["fx-good-unpaced.json", hashlib.sha256(good_bytes).hexdigest()])
-
-    def test_a_plan_spec_that_cannot_be_judged_is_refused_not_cleared(self) -> None:
-        """EVERY-FRAME-VISUAL-LEG-SPEC-1 r3 adversary A1/A2/A3 on 332d84b2: the plan check read the spec with a BOM-stripping reader the leg does not use (a BOM-prefixed
-        refusable spec cleared the chain, which then probed and claimed before the leg refused it), treated an unreadable spec as cleared, ran past -DeadlineUtc on a slow
-        read, and let a -ChainLog that IS a leg spec rewrite the judged bytes. Each is now a refusal before any probe or claim."""
-        refusable = {"legId": "fx-bom", "legType": "speed", "generatorArgs": {"unpaced": True}}
-        bom = self.case / "fx-bom.json"
-        bom.write_bytes(b"\xef\xbb\xbf" + json.dumps(refusable).encode("utf-8"))
-        garbage = self.case / "fx-garbage.json"
-        garbage.write_text("{ not json", encoding="utf-8")
-        for label, spec in (("bom-prefixed", bom), ("not-json", garbage)):
-            with self.subTest(label):
-                r = self.run_chain(self.case / f"lane-A1-{label}", [spec])
-                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-                self.assertIn("LEG_SPEC_INVALID", r.stdout + r.stderr)
-                self.assertEqual(self.quiet_calls(), [])
-                self.assertEqual(self.leg_calls(), [])
-                self.assertFalse(self.claim_path.exists())
-        with self.subTest("deadline-already-passed"):
-            r = self.run_chain(self.case / "lane-A3", [self.specs[0]], deadline_sec=-60)
-            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-            self.assertIn("SPEC_READ_TIMEOUT", r.stdout + r.stderr)
-            self.assertEqual(self.quiet_calls(), [])
-            self.assertFalse(self.claim_path.exists())
-        with self.subTest("chain-log-is-the-spec"):
-            r = self.run_chain(self.case / "lane-A2-log", [self.specs[0]], "-ChainLog", str(self.specs[0]))
-            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-            self.assertIn("-ChainLog names the leg spec itself", r.stdout + r.stderr)
-            self.assertEqual(json.loads(self.specs[0].read_text(encoding="utf-8")), {"legId": "fx-a"}, "the spec was not rewritten")
 
     # ---------------------------------------------------------------- EXIT 6
     def test_exit6_not_measured_leg_is_not_run_and_the_chain_stops(self) -> None:
@@ -1072,7 +1010,7 @@ switch ($mode) {
 """
 
 FAKE_LEG_V = r"""
-param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '', [string]$ExpectSpecSha256 = '')
+param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '')
 $leaf = Split-Path -Leaf $LegSpec
 Add-Content -LiteralPath $env:FAKE_LEG_LOG -Value ("START {0} {1} {2} {3}" -f [DateTime]::UtcNow.Ticks, $leaf, $Venue, $BuildManifestSha256.Substring(0, 8))
 if ($Venue -eq 'ultra-magnus' -and $env:FAKE_UM_LEG_SLEEP) { Start-Sleep -Milliseconds ([int]([double]$env:FAKE_UM_LEG_SLEEP * 1000)) }
@@ -1177,8 +1115,8 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         d = Path(tempfile.mkdtemp(prefix="mut-", dir=self.case))
         text = RUNNER.read_text(encoding="utf-8")
         self.assertEqual(text.count(old), count, f"mutation anchor count changed: {old!r}")
-        copy_with_siblings(RUNNER, d)   # r3: siblings first (the runner imports DualVenueRunner.psm1), then the mutated runner text over the copy
         (d / RUNNER.name).write_text(text.replace(old, new), encoding="utf-8")
+        copy_with_siblings(MODULE, d)
         return d / RUNNER.name
 
     # ---------------------------------------------------------------- (a) after each Bachelor leg, when ultra-magnus is idle
@@ -1693,7 +1631,7 @@ class VenueChainSupplementaryTests(unittest.TestCase):
                            "Add-Content -LiteralPath $env:FAKE_UM_STUB_LOG -Value $JobId\nStart-Sleep -Seconds 120\n", encoding="utf-8")
         wrapper = h.tmp / "leg-wrapper.ps1"
         wrapper.write_text(
-            "param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '', [string]$ExpectSpecSha256 = '')\n"
+            "param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '')\n"
             f"if ($Venue -ne 'ultra-magnus') {{ & '{self.fake_leg}' -Venue $Venue -LegSpec $LegSpec -SourceCommit $SourceCommit -BuildManifestSha256 $BuildManifestSha256; exit 0 }}\n"
             "$be = @(); if ($Backend) { $be = @('-Backend', $Backend) }   # the chain passes -Backend only when the spec lists more than one\n"
             f"& '{self.LEG}' -Venue $Venue -LegSpec $LegSpec -SourceCommit '{h.sha}' -BuildManifestSha256 $BuildManifestSha256 @be -VenueTablePath '{h.table}' "

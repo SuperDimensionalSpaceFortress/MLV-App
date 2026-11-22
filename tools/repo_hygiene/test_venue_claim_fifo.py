@@ -371,8 +371,8 @@ $plain = Request-VenueClaim -Venue bachelor -RunDir 'run-L2' -ClaimDir $d
         d = Path(tempfile.mkdtemp(prefix="mut-", dir=self.case))
         text = RUNNER.read_text(encoding="utf-8")
         self.assertEqual(text.count(old), 1, f"mutation anchor moved: {old}")
-        copy_with_siblings(RUNNER, d)   # r3: siblings first (the runner imports DualVenueRunner.psm1), then the mutated runner text over the copy
         (d / RUNNER.name).write_text(text.replace(old, new), encoding="utf-8")
+        copy_with_siblings(MODULE, d)
         return d / RUNNER.name
 
     def run_kept_head_scenario(self, runner: Path | None) -> tuple[list[str], list[str], list[str]]:
