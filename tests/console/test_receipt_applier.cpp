@@ -2709,11 +2709,81 @@ TEST(BatchExportFormat, MediaProbeFactsNeedCodecAndNumericDimensions)
         QByteArray(R"({"format":{"format_name":"mov,mp4"},"streams":[{"codec_type":"video"},{"codec_type":"video","codec_name":"h264","width":1920,"height":1080}]})")) );
     ASSERT_TRUE( batchRenderedVideoMediaProbeJsonHasVideoFacts(
         QByteArray(R"({"format":{"format_name":"mov,mp4"},"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height":1080}]})")) );
+    /* Adversary pass 5 (46df025e) A6: whitespace is not a fact. */
+    ASSERT_FALSE( batchRenderedVideoMediaProbeJsonHasVideoFacts(
+        QByteArray(R"({"format":{"format_name":" "},"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height":1080}]})")) );
+    ASSERT_FALSE( batchRenderedVideoMediaProbeJsonHasVideoFacts(
+        QByteArray(R"({"format":{"format_name":"mov,mp4"},"streams":[{"codec_type":"video","codec_name":" ","width":1920,"height":1080}]})")) );
+    /* Adversary pass 5 (46df025e) A5, literal input: a dump that names the codec but has no
+     * geometry still REPORTS the codec, so an hevc-for-h264 substitution is refused (as before
+     * this card). */
     const BatchRenderedVideoFfmpegDumpFacts dump = batchRenderedVideoFfmpegDumpFacts(
-        QStringLiteral("Input #0, mov,mp4, from clip.mp4:\n  Stream #0:0: Video: h264\n"));
-    ASSERT_FALSE( dump.parsed );
-    ASSERT_EQ( 0, dump.width );
+        QStringLiteral("Input #0, mov,mp4, from 'clip.mlvapp-partial.mp4':\n  Stream #0:0: Video: hevc\n"));
+    ASSERT_TRUE( dump.parsed );
+    ASSERT_EQ( std::string("hevc"), appDirLookupText(dump.codecName) );
 }
+
+#ifdef Q_OS_WIN
+/* Adversary pass 5 (46df025e) A1-A3, literal PATHEXT values: the PATH continuation past the
+ * failed app-dir ffmpeg.exe (PATH=<app dir>;<tools>) always considers .exe, never a script
+ * (.vbs) and never a suffix that is a path (\..\helper.exe). It reaches <tools>/ffmpeg.exe. */
+TEST(BatchExportFormat, AppDirSpawnRetryContinuationOnlyConsidersSpawnableImages)
+{
+    QTemporaryDir appTemp;
+    QTemporaryDir toolsTemp;
+    ASSERT_TRUE( appTemp.isValid() );
+    ASSERT_TRUE( toolsTemp.isValid() );
+    const QString appDir = QDir::cleanPath(appTemp.path());
+    const QString tools = QDir::cleanPath(toolsTemp.path());
+    const QString bad = appDir + QStringLiteral("/ffmpeg.exe");
+    const QString good = tools + QStringLiteral("/ffmpeg.exe");
+    ASSERT_TRUE( appDirLookupWriteFile(bad, QByteArray("MZ-not-really-a-program")) );
+    ASSERT_TRUE( appDirLookupWriteFile(appDir + QStringLiteral("/ffmpeg.vbs"), QByteArray("WScript.Quit 0\r\n")) );
+    ASSERT_TRUE( appDirLookupWriteFile(appDir + QStringLiteral("/helper.exe"), QByteArray("MZ-helper")) );
+    ASSERT_TRUE( appDirLookupWriteFile(good, QByteArray("MZ-working")) );
+    const QByteArray savedPath = qgetenv("PATH");
+    const QByteArray savedPathExt = qgetenv("PATHEXT");
+    qputenv("PATH", (QDir::toNativeSeparators(appDir) + QDir::listSeparator()
+                     + QDir::toNativeSeparators(tools)).toLocal8Bit());
+    QStringList retries;
+    for( const QByteArray & pathExt : QList<QByteArray>{
+             QByteArray(".COM"), QByteArray(".EXE;.VBS"), QByteArray(".EXE;\\..\\helper.exe") } )
+    {
+        qputenv("PATHEXT", pathExt);
+        retries << batchRenderedVideoAppDirSpawnRetryExecutable(
+            true, true, bad, QStringLiteral("ffmpeg"), batchRenderedVideoSystemExecutableResolver());
+    }
+    qputenv("PATH", savedPath);
+    qputenv("PATHEXT", savedPathExt);
+    for( const QString & retry : retries )
+        ASSERT_EQ( appDirLookupText(good), appDirLookupText(retry) );
+}
+#else
+/* Adversary pass 5 (46df025e) A4, literal input: a hard-linked alias of the failed file earlier
+ * on PATH is the same file (device + inode) and is never the retry. */
+TEST(BatchExportFormat, AppDirSpawnRetryExcludesAHardLinkedAliasOfTheFailedFile)
+{
+    QTemporaryDir appTemp;
+    QTemporaryDir aliasTemp;
+    QTemporaryDir toolsTemp;
+    ASSERT_TRUE( appTemp.isValid() && aliasTemp.isValid() && toolsTemp.isValid() );
+    const QString bad = QDir::cleanPath(appTemp.path()) + QStringLiteral("/ffmpeg");
+    const QString alias = QDir::cleanPath(aliasTemp.path()) + QStringLiteral("/ffmpeg");
+    const QString good = QDir::cleanPath(toolsTemp.path()) + QStringLiteral("/ffmpeg");
+    ASSERT_TRUE( appDirLookupWriteFile(bad, QByteArray("not-an-executable")) );
+    ASSERT_TRUE( appDirLookupWriteFile(good, QByteArray("#!/bin/sh\nexit 0\n")) );
+    ASSERT_TRUE( QFile::copy(bad, alias + QStringLiteral(".tmp")) ); /* placeholder, replaced below */
+    QFile::remove(alias + QStringLiteral(".tmp"));
+    ASSERT_EQ( 0, QProcess::execute(QStringLiteral("ln"), QStringList{ bad, alias }) );
+    const QByteArray savedPath = qgetenv("PATH");
+    qputenv("PATH", (QDir::cleanPath(aliasTemp.path()) + QDir::listSeparator()
+                     + QDir::cleanPath(toolsTemp.path())).toLocal8Bit());
+    const QString retry = batchRenderedVideoAppDirSpawnRetryExecutable(
+        true, true, bad, QStringLiteral("ffmpeg"), batchRenderedVideoSystemExecutableResolver());
+    qputenv("PATH", savedPath);
+    ASSERT_EQ( appDirLookupText(good), appDirLookupText(retry) );
+}
+#endif
 
 /* Adversary A4 (02742e48), literal input: an app-dir ffprobe that exits 0 and prints exactly {}
  * gives NO facts, so the ffmpeg dump fallback still verifies the file. */
