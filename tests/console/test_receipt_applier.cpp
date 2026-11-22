@@ -2841,12 +2841,15 @@ struct AppDirLookupEnvironmentFixture
      * FILE_SHARE_WRITE or FILE_SHARE_DELETE, so while the comparison runs no other process can
      * write, rename, replace or delete that file; the delete is set on the same handle, so it
      * hits exactly the file whose bytes were compared. A reparse point is opened as itself
-     * (never followed) and is never ours. */
+     * (never followed) and is never ours. r9 (sol r8 B2, adversary 9fe53c7a A5): a directory
+     * put under the name is opened too (FILE_FLAG_BACKUP_SEMANTICS), so it is classified as not
+     * ours by its attributes below instead of failing the open and reading as Failed. */
     Cleanup removeIfStillOurs(const QString & path) const
     {
         const std::wstring native = QDir::toNativeSeparators(path).toStdWString();
         HANDLE handle = CreateFileW(native.c_str(), GENERIC_READ | DELETE, FILE_SHARE_READ, nullptr,
-                                    OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+                                    OPEN_EXISTING,
+                                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
         if( handle == INVALID_HANDLE_VALUE )
         {
             const DWORD error = GetLastError();
@@ -2862,11 +2865,18 @@ struct AppDirLookupEnvironmentFixture
          * NotOurs. */
         bool ours = false;
         Cleanup result = Cleanup::Failed;
-        if( GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &tag, sizeof(tag))
-         && GetFileSizeEx(handle, &size) )
+        if( GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &tag, sizeof(tag)) )
         {
-            if( ( tag.FileAttributes & ( FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY ) )
-             || size.QuadPart != expected.size() )
+            /* The type is judged before the size: a directory handle need not report one. */
+            if( tag.FileAttributes & ( FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY ) )
+            {
+                result = Cleanup::NotOurs;
+            }
+            else if( !GetFileSizeEx(handle, &size) )
+            {
+                result = Cleanup::Failed;
+            }
+            else if( size.QuadPart != expected.size() )
             {
                 result = Cleanup::NotOurs;
             }
@@ -2900,26 +2910,75 @@ struct AppDirLookupEnvironmentFixture
         return result;
     }
 #else
-    /* Unix (console_tests does not run there in CI): compare, then unlink by name. A
-     * replacement landing between the two is not detected; the Windows branch has no window. */
+    /* Unix (console_tests does not run there in CI): compare, then unlink by name.
+     * r9 (sol r8 B2, the part the hub ruled in scope): the name is lstat()ed first, and anything
+     * that is not a regular file (a symlink, a directory, a FIFO, a device) is not ours and is
+     * never opened; a regular file of another size is not ours and is never read. The open is
+     * O_NONBLOCK | O_NOFOLLOW, so a FIFO or a symlink swapped in after the lstat can neither
+     * block cleanup nor redirect it, and fstat() must show the same regular file the lstat saw.
+     * At most the recorded number of bytes is read.
+     * DISTINGUISH (hub ruling r9): the unlink is still by name after the compare, so a
+     * replacement landing between the two is not detected; the files live in this fixture's
+     * own per-run directory, and no compare-then-unlink sequence closes that window on POSIX.
+     * The Windows branch compares and deletes through one handle and has no window. */
     Cleanup removeIfStillOurs(const QString & path) const
     {
-        const QFileInfo info(path);
-        if( !info.exists() && !info.isSymLink() )
-            return Cleanup::Gone;
-        if( info.isSymLink() )
+        const QByteArray native = QFile::encodeName(path);
+        struct stat named;
+        if( ::lstat(native.constData(), &named) != 0 )
+            return ( errno == ENOENT || errno == ENOTDIR ) ? Cleanup::Gone : Cleanup::Failed;
+        const QByteArray expected = written.value(path);
+        if( !S_ISREG(named.st_mode) || named.st_size != static_cast<off_t>(expected.size()) )
             return Cleanup::NotOurs;
-        QFile file(path);
-        if( !file.open(QIODevice::ReadOnly) )
-            return Cleanup::Failed;
-        const QByteArray actual = file.readAll();
-        const bool readFailed = file.error() != QFileDevice::NoError;
-        file.close();
-        if( readFailed )
-            return Cleanup::Failed;     /* adversary 2e73c417 A4: unreadable is not foreign */
-        if( actual != written.value(path) )
-            return Cleanup::NotOurs;
-        return QFile::remove(path) ? Cleanup::Removed : Cleanup::Failed;
+        const int fd = ::open(native.constData(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+        if( fd < 0 )
+        {
+            if( errno == ENOENT )
+                return Cleanup::Gone;
+            return errno == ELOOP ? Cleanup::NotOurs : Cleanup::Failed;
+        }
+        Cleanup result = Cleanup::Failed;
+        struct stat opened;
+        if( ::fstat(fd, &opened) == 0 )
+        {
+            if( !S_ISREG(opened.st_mode) || opened.st_dev != named.st_dev
+             || opened.st_ino != named.st_ino || opened.st_size != named.st_size )
+            {
+                result = Cleanup::NotOurs;
+            }
+            else
+            {
+                QByteArray actual(expected.size(), '\0');
+                qsizetype done = 0;
+                bool shorter = false;
+                bool readFailed = false;
+                while( done < actual.size() )
+                {
+                    const ssize_t got = ::read(fd, actual.data() + done, size_t(actual.size() - done));
+                    if( got < 0 && errno == EINTR )
+                        continue;
+                    if( got < 0 )
+                    {
+                        readFailed = true;      /* adversary 2e73c417 A4: unreadable is not foreign */
+                        break;
+                    }
+                    if( got == 0 )
+                    {
+                        shorter = true;         /* fewer bytes than this fixture wrote */
+                        break;
+                    }
+                    done += got;
+                }
+                if( !readFailed )
+                    result = ( !shorter && actual == expected ) ? Cleanup::Removed : Cleanup::NotOurs;
+            }
+        }
+        ::close(fd);
+        if( result != Cleanup::Removed )
+            return result;
+        if( ::unlink(native.constData()) == 0 )
+            return Cleanup::Removed;
+        return errno == ENOENT ? Cleanup::Gone : Cleanup::Failed;
     }
 #endif
 
@@ -3339,7 +3398,9 @@ static void appDirLookupStagedConcurrentRunCheck()
 
     AppDirLookupEnvironmentFixture concurrentRun;
     bool staged = false;
+    bool lookupRan = false;
     bool removed = false;
+    bool skipped = false;
     std::string outcome;
     try
     {
@@ -3350,21 +3411,33 @@ static void appDirLookupStagedConcurrentRunCheck()
                       && concurrentRun.createBesideExe(appProbe, QByteArray("MZ-app-dir-copy"))
                              == AppDirLookupCreate::Created;
             },
-            [&] { removed = concurrentRun.removeBesideExe(); });
+            [&] {
+                lookupRan = true;
+                removed = concurrentRun.removeBesideExe();
+            });
         outcome = "passed";
     }
     catch( const minitest::Skip & skip )
     {
+        skipped = true;
         outcome = std::string("skipped: ") + skip.what();
     }
     catch( const minitest::Failure & failure )
     {
         outcome = std::string("failed: ") + failure.what();
     }
-    std::printf("[R8-B3] staged=%d removed=%d outcome=%s\n", staged ? 1 : 0, removed ? 1 : 0,
-                outcome.c_str());
+    std::printf("[R8-B3] staged=%d lookup=%d removed=%d outcome=%s\n", staged ? 1 : 0,
+                lookupRan ? 1 : 0, removed ? 1 : 0, outcome.c_str());
+    std::fflush(stdout);
     if( !staged )
         SKIP_TEST("the concurrent run's files could not be created beside the test executable");
+    /* r9 (sol r8 B1): a skip raised before the lookup (the PATH helper refusing a temporary
+     * directory that holds the list separator, or any other setup skip) means the staged
+     * scenario never ran, so there is nothing to judge: it propagates as this test's logged
+     * SKIP, never a FAIL and never a PASS. The staged files are removed by the fixture's
+     * destructor on the way out. Only a skip after the lookup is the one this test judges. */
+    if( skipped && !lookupRan )
+        SKIP_TEST(std::string("setup skipped before the staged lookup ran: ") + outcome);
     /* Adversary 2e73c417 A5: judge only this test's own staged files (removed, none left
      * behind), never the shared names, which another console process may legitimately create
      * after the staged removal. */
