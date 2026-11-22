@@ -1663,7 +1663,7 @@ class RunnerHarness:
 
     def write_spec(self, card: str = "DUAL-VENUE-EVIDENCE-1", clip: str = OWNER_CLIP, leg_type: str = "speed", play_seconds: int | None = 25,
                    flavor: str = "classic", scale: int = 4, accepted: dict | None = None, leg_id: str = "unit-leg", display_mode: str | None = None,
-                   generator_args: dict | None = None) -> Path:
+                   generator_args: dict | None = None, contact_frames: int = 2) -> Path:
         spec = {
             "schema": "mlv-app/dual-venue-leg/v1", "legId": leg_id, "card": card, "legType": leg_type, "clipId": clip,
             "backends": ["cuda", "cpu"], "scaleFactor": scale,
@@ -1674,14 +1674,14 @@ class RunnerHarness:
         if play_seconds is not None:
             spec["playSeconds"] = play_seconds
         if leg_type == "look":
-            spec["look"] = {"contactSheetFrames": 2, "lookFlavor": flavor}
+            spec["look"] = {"contactSheetFrames": contact_frames, "lookFlavor": flavor}
         if accepted is not None:
             spec["acceptedEffectiveScale"] = accepted
         if display_mode is not None:
             spec["displayMode"] = display_mode
         if generator_args is not None:
             spec["generatorArgs"] = generator_args
-        suffix = ("" if display_mode is None else f"-dm{display_mode}") + ("" if generator_args is None else "-ga" + hashlib.sha1(json.dumps(generator_args, sort_keys=True).encode()).hexdigest()[:8]) + (("" if flavor == "classic" else f"-{flavor}") + ("" if scale == 4 else f"-s{scale}") + ("" if leg_id == "unit-leg" else f"-{leg_id}")
+        suffix = ("" if contact_frames == 2 else f"-cf{contact_frames}") + ("" if display_mode is None else f"-dm{display_mode}") +("" if generator_args is None else "-ga" + hashlib.sha1(json.dumps(generator_args, sort_keys=True).encode()).hexdigest()[:8]) + (("" if flavor == "classic" else f"-{flavor}") + ("" if scale == 4 else f"-s{scale}") + ("" if leg_id == "unit-leg" else f"-{leg_id}")
                   + ("" if accepted is None else "-acc" + "".join(f"{k}{v}" for k, v in sorted(accepted.items()))))
         path = self.tmp / f"spec-{card}-{clip}-{leg_type}-{play_seconds}{suffix}.json"
         path.write_text(json.dumps(spec), encoding="utf-8")
@@ -1690,7 +1690,7 @@ class RunnerHarness:
     def write_artifacts(self, summary: dict | None = None, manifest: dict | None = None, source_frames: dict | None | bool = True,
                         nonce: str | None = NONCE, sheet: bool = False, line: dict | None = None, observed_nonce: str | None | bool = True,
                         manifest_nonce: str | None | bool = True, log: bool = True, result: bool = True, isolated: str | None = "run_scoped",
-                        declared_log_sha: str | None = None, compose_marker: str | None = None, raw_frames: bool = False,
+                        declared_log_sha: str | None = None, compose_marker: str | None = None, raw_frames: bool = False, raw_frame_count: int = 2,
                         exact_summary: dict | None = None, extra_log_lines: list[str] | None = None,
                         look_assist_state: str | None = "look_assist_enabled=1") -> None:
         """Write the job's artifacts the way master's generator does, INCLUDING the run's own records the receipt is re-derived
@@ -1755,7 +1755,10 @@ class RunnerHarness:
         if raw_frames:
             raw = self.artifacts / "artifacts" / "contact-sheet" / "raw"
             raw.mkdir(parents=True, exist_ok=True)
-            (raw / "frame-00.png").write_bytes(b"\x89PNG\r\n\x1a\nraw")
+            # EVERY-FRAME-VISUAL-LEG-SPEC-1 r5: one PNG and its sidecar per requested frame (write_spec's look default is 2), the pairs the app publishes
+            for i in range(raw_frame_count):
+                (raw / f"frame-{i:02d}.png").write_bytes(b"\x89PNG\r\n\x1a\nraw")
+                (raw / f"frame-{i:02d}.json").write_text(json.dumps({"index": i, "saved": True, "path": f"frame-{i:02d}.png"}), encoding="utf-8")
 
     def stamp_identity(self, venue: str, build_sha: str) -> None:
         """What the real job writes about WHO the run was for: summary.json's display.venue and the evidence manifest's clipId and
@@ -3319,8 +3322,13 @@ def write_contact_frames_manifest(ev: Path) -> str:
     return sha256_of(ev / "contact-frames.json")
 
 
-def stub_raw_frames() -> dict[str, bytes]:
-    return {"frame-00.png": b"\x89PNG\r\n\x1a\nraw0", "frame-00.json": json.dumps({"index": 0, "saved": True, "path": "frame-00.png"}).encode("utf-8")}
+def stub_raw_frames(count: int = 1) -> dict[str, bytes]:
+    """`count` PNG + sidecar pairs (frame-00 ..). EVERY-FRAME-VISUAL-LEG-SPEC-1 r5: a look receipt is valid only with as many pairs as its spec's look.contactSheetFrames."""
+    out: dict[str, bytes] = {}
+    for i in range(count):
+        out[f"frame-{i:02d}.png"] = b"\x89PNG\r\n\x1a\nraw" + str(i).encode()
+        out[f"frame-{i:02d}.json"] = json.dumps({"index": i, "saved": True, "path": f"frame-{i:02d}.png"}).encode("utf-8")
+    return out
 
 
 ISO_DATETIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$")
@@ -3395,10 +3403,19 @@ class EvidenceFactory(RunnerHarness):
             shutil.copytree(art / "contact-sheet", ev / "contact-sheet")
             if leg_type == "look" and (ev / "contact-sheet" / "sheet.png").exists():
                 (ev / "contact-sheet" / "raw").mkdir(exist_ok=True)
-                for fname, data in (raw_frames if raw_frames is not None else stub_raw_frames()).items():
+                for fname, data in (raw_frames if raw_frames is not None else stub_raw_frames(self.spec_look_frame_count())).items():
                     (ev / "contact-sheet" / "raw" / fname).write_bytes(data)
         (ev / "um-run.json").write_text(json.dumps({"schema": "mlv-app/dual-venue-um-run/v1", "exitCode": exit_code, "resultToken": token}), encoding="utf-8")
         return ev
+
+    def spec_look_frame_count(self) -> int:
+        """The look.contactSheetFrames of the leg spec this fixture's receipts name (write_spec's default is 2): the number of PNG + sidecar pairs a faithful capture
+        publishes. A fixture that built its own spec and names it later is the caller's to size (raw_frames=)."""
+        try:
+            value = json.loads(Path(self.spec_path).read_text(encoding="utf-8"))["look"]["contactSheetFrames"]
+        except (AttributeError, OSError, KeyError, TypeError, ValueError):
+            return 2
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 1 else 2
 
     @staticmethod
     def derive_block(ev: Path) -> dict:
@@ -3541,7 +3558,10 @@ class EvidenceFactory(RunnerHarness):
         }
         if leg_type == "look":
             sheet = ev / "contact-sheet" / "sheet.png"
-            info = {"path": str(sheet), "sha256": sha256_of(sheet), "frames": 2, "backend": backend, "rawFramesDir": str(ev / "contact-sheet" / "raw")} if sheet.exists() else None
+            raw_dir = ev / "contact-sheet" / "raw"
+            # (r5: the writer publishes the count it ENUMERATED, never the one the spec asked for)
+            enumerated = sum(1 for p in raw_dir.iterdir() if p.is_file() and p.name.endswith(".png")) if raw_dir.is_dir() else 0
+            info = {"path": str(sheet), "sha256": sha256_of(sheet), "frames": enumerated, "backend": backend, "rawFramesDir": str(ev / "contact-sheet" / "raw")} if sheet.exists() else None
             receipt["look"] = {"legType": "look", "lookFlavor": "classic", "contactSheet": info}
         return receipt
 
@@ -4877,6 +4897,92 @@ class ContactFramesAreHashListedTests(EvidenceFactory, ModuleMutationMixin, unit
                 self.assertEqual(e["sha256"], sha256_of(raw / e["name"]))
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
         self.assertNotIn(".Substring($rawLocal.Length)", runner, "no file name is derived by cutting a path prefix")
+
+
+@requires_windows_pwsh
+class ContactFramesAreTheRequestedCountTests(EvidenceFactory, ModuleMutationMixin, unittest.TestCase):
+    """EVERY-FRAME-VISUAL-LEG-SPEC-1 r5 (sol r4 B1): a look leg that asks for six frames and publishes fewer must never read as a six-frame PASS. Frames can vanish
+    after the app's own completeness check and before publication enumerates them; the count the receipt publishes is then the count ENUMERATED, and the collector, the
+    receipt validator and the composer each refuse a strip whose enumerated count is not the requested one. sol's table: 0 / 1 / 5 / 6 of 6 frames, only 6 of 6 passes."""
+
+    REQUESTED = 6
+
+    def setUp(self) -> None:
+        self.make_harness()
+        self.spec = self.write_spec(leg_type="look", contact_frames=self.REQUESTED)
+        self.repo = self.prod_repo(leg_type="look", spec=self.spec)
+
+    def receipt_over(self, tag: str, frames: dict[str, bytes]) -> tuple[dict, Path]:
+        ev = self.evidence(tag, sheet=True, backend="cpu", leg_type="look", raw_frames=frames)
+        return self.receipt_for(self.repo, ev, backend="cpu", leg_type="look"), ev
+
+    def test_the_validator_refuses_a_strip_of_zero_one_or_five_of_six_frames_and_accepts_six(self) -> None:
+        cases = [(k, *self.receipt_over(f"vc{k}", stub_raw_frames(k))) for k in (0, 1, 5, 6)]
+        got = self.status_batch(self.repo, [(r, None) for _, r, _ in cases])
+        for (k, _, _), result in zip(cases, got):
+            if k == self.REQUESTED:
+                self.expect(result, "ADVISORY", f"{k} of {self.REQUESTED} frames")
+            else:
+                self.expect(result, "INVALID", f"{k} of {self.REQUESTED} frames", "CONTACT_FRAMES_UNLISTED" if k == 0 else "CONTACT_FRAME_COUNT_NOT_REQUESTED")
+
+    def test_the_validator_refuses_a_receipt_that_claims_the_requested_count_over_fewer_enumerated_frames(self) -> None:
+        # the r4 collector wrote frames = the spec's count whatever it enumerated: one PNG, one sidecar, a receipt that says six
+        receipt, _ = self.receipt_over("claim", stub_raw_frames(1))
+        receipt["look"]["contactSheet"]["frames"] = self.REQUESTED
+        # six frames enumerated but the receipt says five (the claim is the enumerated count, never the other way round)
+        full, _ = self.receipt_over("claim6", stub_raw_frames(6))
+        full["look"]["contactSheet"]["frames"] = 5
+        got = self.status_batch(self.repo, [(receipt, None), (full, None)])
+        self.expect(got[0], "INVALID", "six claimed, one enumerated", "CONTACT_FRAME_COUNT_NOT_REQUESTED")
+        self.expect(got[1], "INVALID", "five claimed, six enumerated", "CONTACT_SHEET_FRAMES_NOT_FROM_EVIDENCE")
+
+    def test_the_validator_counts_png_and_sidecar_separately(self) -> None:
+        sidecar_short = stub_raw_frames(6)
+        del sidecar_short["frame-05.json"]
+        png_short = stub_raw_frames(6)
+        del png_short["frame-05.png"]
+        cases = [self.receipt_over("sc", sidecar_short)[0], self.receipt_over("pn", png_short)[0]]
+        for result in self.status_batch(self.repo, [(c, None) for c in cases]):
+            self.expect(result, "INVALID", "five of one kind", "CONTACT_FRAME_COUNT_NOT_REQUESTED")
+
+    def test_mutation_without_the_count_rule_one_of_six_is_accepted(self) -> None:
+        mutated = self.mutated_module([('if (-not $countVerdict.ok) { $invalid.Add("CONTACT_FRAME_COUNT_NOT_REQUESTED: $($countVerdict.reason)") }', "")])
+        receipt, _ = self.receipt_over("mut", stub_raw_frames(1))
+        self.assertEqual(self.status_batch(self.repo, [(receipt, None)], module=mutated)[0][:2], ("ADVISORY", False))   # (INVALID in the table test above)
+
+    def test_the_runner_publishes_the_enumerated_count_and_refuses_a_partial_strip(self) -> None:
+        results = {}
+        for k in (1, 5, 6):
+            self.write_artifacts(sheet=True, raw_frames=True, raw_frame_count=k)
+            proc, receipt, _ = self.run_leg("ultra-magnus", self.spec, extra=["-Backend", "cpu"])
+            self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+            results[k] = receipt
+        for k in (1, 5):
+            self.assertEqual(results[k]["outcome"], "INVALID", f"{k} of {self.REQUESTED}: {results[k]['outcomeDetail']}")
+            self.assertIn("CONTACT_FRAME_COUNT_NOT_REQUESTED", results[k]["outcomeDetail"])
+            self.assertEqual(results[k]["look"]["contactSheet"]["frames"], k, "the receipt names the count it enumerated, not the one the spec asked for")
+        self.assertEqual(results[6]["outcome"], "PASS", results[6]["outcomeDetail"])
+        self.assertEqual(results[6]["look"]["contactSheet"]["frames"], self.REQUESTED)
+
+    def test_the_composer_refuses_a_strip_that_is_not_the_requested_count(self) -> None:
+        """make-contact-sheet.py (run on the venue by the job): --expected-frames is the requested count. numpy / Pillow are not needed here: the count rule is a
+        self-contained function the test lifts out of the parsed source, as it does for scale_label."""
+        import ast
+        source = (ROOT / "tools" / "profiling" / "make-contact-sheet.py").read_text(encoding="utf-8")
+        funcs = [n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == "check_expected_frame_count"]
+        self.assertEqual(len(funcs), 1, "make-contact-sheet.py defines exactly one top-level check_expected_frame_count")
+        namespace: dict = {}
+        exec(compile(ast.Module(body=funcs, type_ignores=[]), "make-contact-sheet.py:check_expected_frame_count", "exec"), namespace)
+        check = namespace["check_expected_frame_count"]
+        for found in (0, 1, 5, 7):
+            with self.assertRaises(ValueError, msg=f"{found} of {self.REQUESTED}"):
+                check(found, self.REQUESTED, "frames")
+        check(6, 6, "frames")
+        check(0, None, "frames")   # no --expected-frames: the composer is what it always was
+        self.assertIn("check_expected_frame_count(len(frames), expected,", source, "compose_sheet counts the sidecars it was handed")
+        self.assertIn("check_expected_frame_count(len(tiles), expected,", source, "compose_sheet counts the tiles it painted")
+        job = (ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8")
+        self.assertIn("'--expected-frames', [string]$ContactSheetFrameCount", job, "the job hands the composer the requested count")
 
 
 @requires_windows_pwsh

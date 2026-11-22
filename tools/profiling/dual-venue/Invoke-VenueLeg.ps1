@@ -917,6 +917,10 @@ if ($isLook -and $artifactsShare) {
     $rawLocal = $null
     $rawShare = Join-Path $artifactsShare 'artifacts\contact-sheet\raw'
     if (-not (Test-Path -LiteralPath $rawShare -PathType Container)) { $rawShare = Join-Path $artifactsShare 'contact-sheet\raw' }
+    # EVERY-FRAME-VISUAL-LEG-SPEC-1 r5 (sol r4 B1): the count of frames the raw directory ENUMERATED (never the spec's), and the verdict of that count against the
+    # requested one. $null until a raw directory was listed.
+    $frameCountVerdict = $null
+    $enumeratedFrames = 0
     $composeShare = Join-Path $artifactsShare 'contact-sheet\compose-status.txt'
     if ((Test-Path -LiteralPath $sheetShare -PathType Leaf) -or (Test-Path -LiteralPath $composeShare -PathType Leaf)) {
         Invoke-DvCollect 'mkdir' $sheetDir { New-Item -ItemType Directory -Force -Path $sheetDir | Out-Null }
@@ -932,6 +936,8 @@ if ($isLook -and $artifactsShare) {
             # directory is listed as "<name>\" with a zero hash: that is not a plain frame name, so the validator refuses it (nothing nested is ever composed).
             $listing = @(Invoke-DvCollect 'hash' $rawLocal { Get-ChildItem -LiteralPath $rawLocal -Force | Sort-Object Name | ForEach-Object {
                 [ordered]@{ name = $(if ($_.PSIsContainer) { $_.Name + '\' } else { $_.Name }); sha256 = $(if ($_.PSIsContainer) { '0' * 64 } else { (Get-DvSha256OfFile $_.FullName) }) } } })
+            $frameCountVerdict = Get-DvContactFrameCountVerdict -Names @($listing | ForEach-Object { $_.name }) -Requested $spec.look.contactSheetFrames
+            $enumeratedFrames = $frameCountVerdict.pngs
             $framesBytes = [Text.UTF8Encoding]::new($false).GetBytes(([ordered]@{ schema = 'mlv-app/dual-venue-contact-frames/v1'; files = $listing } | ConvertTo-Json -Depth 4) + "`n")
             $framesLocal = Join-Path $evidenceDir 'contact-frames.json'
             Invoke-DvCollect 'write' $framesLocal { [IO.File]::WriteAllBytes($framesLocal, $framesBytes) }
@@ -981,7 +987,7 @@ if ($isLook -and $artifactsShare) {
         Invoke-DvCollect 'copy' $sheetShare { Copy-Item -LiteralPath $sheetShare -Destination $sheetLocal }
         $sheetSha = Invoke-DvCollect 'hash' $sheetLocal { Get-DvSha256OfFile $sheetLocal }
         $sheetBytes = Invoke-DvCollect 'size' $sheetLocal { (Get-Item -LiteralPath $sheetLocal).Length }
-        $sheetInfo = [ordered]@{ path = $sheetLocal; sha256 = $sheetSha; bytes = $sheetBytes; frames = [int]$spec.look.contactSheetFrames; backend = $Backend; rawFramesDir = $rawLocal }
+        $sheetInfo = [ordered]@{ path = $sheetLocal; sha256 = $sheetSha; bytes = $sheetBytes; frames = [int]$enumeratedFrames; backend = $Backend; rawFramesDir = $rawLocal }
         if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir)) {
             $sheetCopy = Join-Path $SheetCopyDir "sheet-$($spec.legId)-$Venue-$Backend-$lookFlavor.png"
             Invoke-DvCollect 'copy' $sheetCopy {
@@ -1077,6 +1083,13 @@ if ($outcome -eq 'CAPTURED') {
 # run log cannot confirm, is not a valid measurement under that mode: a typed INVALID with the reason, never a PASS or FAIL. (A legacy spec that names no mode keeps its old behaviour.)
 if ($outcome -in @('PASS', 'FAIL') -and $display.blocks) {
     $detail = "INVALID: the job result was $outcome ($detail) but DISPLAY_MODE_NOT_HONOURED: $($display.reason). A run that did not use the display mode the leg names is no measurement under it"
+    $outcome = 'INVALID'
+}
+# EVERY-FRAME-VISUAL-LEG-SPEC-1 r5 (sol r4 B1), FAIL CLOSED: a look leg whose raw directory enumerated a different number of frames than look.contactSheetFrames asked for
+# (frames vanished after the app's own completeness check and before publication listed them) is a typed INVALID, never a PASS or FAIL: the receipt names the count it
+# enumerated, and Test-DvReceiptValid refuses the same strip.
+if ($outcome -in @('PASS', 'FAIL') -and $isLook -and $null -ne $frameCountVerdict -and -not $frameCountVerdict.ok) {
+    $detail = "INVALID: the job result was $outcome ($detail) but CONTACT_FRAME_COUNT_NOT_REQUESTED: $($frameCountVerdict.reason)"
     $outcome = 'INVALID'
 }
 # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1, FAIL CLOSED: a leg with a usable PresentMon status whose capture has a gap longer than the bound (5000 ms, the job's own temporal

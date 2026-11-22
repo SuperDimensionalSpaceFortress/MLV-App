@@ -4561,7 +4561,9 @@ if ($ContactSheetEnabled -and $contactSheetDir -and (Test-Path -LiteralPath $con
                 '--gpu', $contactSheetGpuLabel,
                 '--build-sha', $SourceCommit,
                 '--backend', $contactSheetBackendLabel,
-                '--scale', $contactSheetScaleLabel
+                '--scale', $contactSheetScaleLabel,
+                # EVERY-FRAME-VISUAL-LEG-SPEC-1 r5 (sol r4 B1): the composer paints this many frames or none (a partial capture is refused, never a shorter strip)
+                '--expected-frames', [string]$ContactSheetFrameCount
             )
             # BLOCKER fix (r1d): quote every element -- see ConvertTo-AttrCudaQuotedProcessArgument's
             # own header for why an unquoted GPU description would silently split across argv.

@@ -403,9 +403,21 @@ def build_header(width, args, frames):
     return header
 
 
+# check_expected_frame_count must stay self-contained (builtins only): the evidence tests lift this one function out of the parsed source and run it alone, because the
+# hosted runner has no numpy / Pillow. EVERY-FRAME-VISUAL-LEG-SPEC-1 r5 (sol r4 B1): a strip is the leg's requested frame count or it is not composed.
+def check_expected_frame_count(found, expected, what):
+    """Refuse (ValueError) a strip whose `found` count of `what` is not the `expected` one. `expected` None (no --expected-frames) accepts any count, the way the composer
+    always behaved. Frames can vanish after the app's own completeness check and before publication lists them, and a strip of the survivors must never read as the
+    requested count."""
+    if expected is not None and found != expected:
+        raise ValueError(f"expected {expected} {what} (the leg's requested frame count) but found {found}; a strip that is not the requested count is not composed")
+
+
 def compose_sheet(frames, frames_dir, args):
     if not frames:
         raise ValueError("no usable (saved=true) frames found in frames dir")
+    expected = getattr(args, "expected_frames", None)
+    check_expected_frame_count(len(frames), expected, "saved frames")
 
     cols = max(1, args.cols)
     rows = (len(frames) + cols - 1) // cols
@@ -439,6 +451,7 @@ def compose_sheet(frames, frames_dir, args):
 
     if not tiles:
         raise ValueError("every sidecar's image failed to resolve; nothing to compose")
+    check_expected_frame_count(len(tiles), expected, "frame images")
 
     grid_width = cols * (tile_size[0] + TILE_PADDING) + TILE_PADDING
     grid_height = rows * (tile_size[1] + TILE_PADDING) + TILE_PADDING
@@ -625,6 +638,9 @@ def main():
     parser.add_argument("--backend", default="")
     parser.add_argument("--scale", default="")
     parser.add_argument("--max-bytes", type=int, default=4_000_000)
+    parser.add_argument("--expected-frames", type=int, default=None,
+                        help="The frame count the leg requested. The sheet is composed only when exactly that many saved frames and images were enumerated "
+                             "(a partial capture is refused, exit 3); unset keeps the composer's old behaviour. Single-sheet mode only.")
     parser.add_argument("--pair-dir", type=Path, default=None,
                         help="Side-by-side mode: the RIGHT side's capture dir, paired with --frames-dir by frame index.")
     parser.add_argument("--left-listed", type=Path, default=None,
@@ -639,6 +655,8 @@ def main():
     args = parser.parse_args()
     if (args.left_listed is None) != (args.right_listed is None) or (args.left_listed is not None and args.pair_dir is None):
         parser.error("--left-listed and --right-listed go together, and only with --pair-dir")
+    if args.expected_frames is not None and (args.expected_frames < 1 or args.pair_dir is not None):
+        parser.error("--expected-frames is a positive count and belongs to single-sheet mode (no --pair-dir)")
 
     if not args.frames_dir.is_dir():
         print(f"[make-contact-sheet] ERROR: frames dir does not exist: {args.frames_dir}", file=sys.stderr)

@@ -3348,6 +3348,28 @@ function Read-DvContactFrames {
     & $done
 }
 
+function Get-DvContactFrameCountVerdict {
+    <#
+    .SYNOPSIS
+    Pure. EVERY-FRAME-VISUAL-LEG-SPEC-1 r5 (sol r4 B1): the frame count a look leg publishes is the count ENUMERATED, and a strip whose enumerated count is not the
+    requested one (look.contactSheetFrames) is refused, never a PASS. Frames can vanish after the app's own completeness check and before publication enumerates
+    them; the composer then painted the survivors and the receipt still said the requested count. The collector (Invoke-VenueLeg.ps1), the receipt validator
+    (Test-DvReceiptValid) and the composer (make-contact-sheet.py --expected-frames) each apply this rule.
+    -Names: the plain file names of the enumerated top-level raw entries (a directory is listed as '<name>\' and is neither). -Requested: the committed
+    look.contactSheetFrames. A PNG and a sidecar are counted separately (case-sensitive extensions, the names Read-DvContactFrames accepts): a frame is a pair.
+    A requested count that is not a positive whole number cannot be compared (the leg-spec shape refusal owns that), so nothing is refused here.
+    Returns [pscustomobject]@{ ok; pngs; sidecars; requested; reason }.
+    #>
+    param($Names, $Requested)
+    $list = @(@($Names) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+    $pngs = @($list | Where-Object { $_ -clike '*.png' }).Count
+    $sidecars = @($list | Where-Object { $_ -clike '*.json' }).Count
+    $wanted = $(if (($Requested -is [int] -or $Requested -is [long]) -and $Requested -ge 1) { [int]$Requested } else { 0 })
+    $ok = ($wanted -eq 0) -or ($pngs -eq $wanted -and $sidecars -eq $wanted)
+    $reason = $(if ($ok) { $null } else { "the leg asked for $wanted frame(s) but the strip holds $pngs PNG(s) and $sidecars sidecar(s); a strip that is not the requested count is not the leg's acceptance evidence" })
+    [pscustomobject]@{ ok = $ok; pngs = $pngs; sidecars = $sidecars; requested = $(if ($wanted -eq 0) { $null } else { $wanted }); reason = $reason }
+}
+
 # --- CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r6: the leg-spec SHAPE refusals, ONE predicate for the leg and the lease batch's preflight --------------
 # (adversary r5 A1) Invoke-VenueLeg refuses these before its terminal try; the batch preflight (Get-LegSpecRefusal) calls this same function, so a spec the
 # leg would refuse is refused before a lease opens, never after it (LEG_FAILED, no receipt). A control container the runner reads members of must be ONE
@@ -6046,6 +6068,14 @@ function Test-DvReceiptValid {
                         # the raw frames the sheet pair would compose are accepted only as the hashed contact-frames manifest lists them
                         $frames = Read-DvContactFrames -Receipt $Receipt -EvidenceDir $ev.dir
                         foreach ($m in @($frames.reasons)) { $invalid.Add([string]$m) }
+                        # EVERY-FRAME-VISUAL-LEG-SPEC-1 r5 (sol r4 B1): a matching sheet hash over a manifest that lists fewer frames than the leg asked for is not the leg's
+                        # strip, and the count the receipt names is the one enumerated (Get-DvContactFrameCountVerdict), never the requested one
+                        if ($frames.ok) {
+                            $countVerdict = Get-DvContactFrameCountVerdict -Names @($frames.files | ForEach-Object { $_.name }) -Requested (Get-DvProp (Get-DvProp $spec 'look') 'contactSheetFrames')
+                            if (-not $countVerdict.ok) { $invalid.Add("CONTACT_FRAME_COUNT_NOT_REQUESTED: $($countVerdict.reason)") }
+                            $claimedFrames = ConvertTo-DvInt64 (Get-DvProp (Get-DvProp (Get-DvProp $Receipt 'look') 'contactSheet') 'frames')
+                            if ($null -eq $claimedFrames -or $claimedFrames -ne $countVerdict.pngs) { $invalid.Add("CONTACT_SHEET_FRAMES_NOT_FROM_EVIDENCE: look.contactSheet.frames is not the $($countVerdict.pngs) frame(s) the hashed manifest enumerates") }
+                        }
                     }
                 }
                 $expected = $(if (-not $sheetOk) { 'FAIL' } elseif ($verdict.pass) { 'PASS' } else { 'FAIL' })
@@ -6824,7 +6854,7 @@ function Write-DvReceipt {
 }
 
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
-    ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
+    ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvContactFrameCountVerdict, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
