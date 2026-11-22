@@ -258,6 +258,66 @@ TEST(ReceiptLoader, AMalformedEarlierOptOutDoesNotHideALaterOne)
     ASSERT_FALSE(receipt.lookAssistEnabled());
 }
 
+// r4 (sol r3 B1 on 875d5e40): a lookAssistEnabled with no integer in it (a child element, an empty element, garbage
+// text) is no value, never a valid 0: Look Assist keeps its documented default (on). The compact receipt makes the walk
+// stop at </cutOut>, so the recovery scan is what reads the malformed element; the indented receipt is the walk's own
+// handler reading it.
+TEST(ReceiptLoader, AMalformedOptOutNeverSwitchesLookAssistOff)
+{
+    ReceiptSettings defaults;
+    ASSERT_TRUE(defaults.lookAssistEnabled());
+    const char *const compact[] = {
+        "<receipt version=\"4\"><cutIn>1</cutIn><cutOut>1</cutOut><lookAssistEnabled><value/></lookAssistEnabled></receipt>",
+        "<receipt version=\"4\"><cutIn>1</cutIn><cutOut>1</cutOut><lookAssistEnabled></lookAssistEnabled></receipt>",
+        "<receipt version=\"4\"><cutIn>1</cutIn><cutOut>1</cutOut><lookAssistEnabled/></receipt>",
+        "<receipt version=\"4\"><cutIn>1</cutIn><cutOut>1</cutOut><lookAssistEnabled>garbage</lookAssistEnabled></receipt>",
+        "<receipt version=\"4\"><cutIn>1</cutIn><cutOut>1</cutOut><lookAssistEnabled>0x</lookAssistEnabled></receipt>",
+    };
+    for (const char *text : compact)
+    {
+        ReceiptSettings receipt;
+        ASSERT_TRUE(loadReceiptText(QByteArray(text), &receipt));
+        ASSERT_TRUE(receipt.lookAssistEnabled());
+    }
+    const char *const indented[] = {
+        "<receipt version=\"4\">\n  <lookAssistEnabled></lookAssistEnabled>\n  <cutIn>2</cutIn>\n</receipt>\n",
+        "<receipt version=\"4\">\n  <lookAssistEnabled/>\n  <cutIn>2</cutIn>\n</receipt>\n",
+        "<receipt version=\"4\">\n  <lookAssistEnabled>garbage</lookAssistEnabled>\n  <cutIn>2</cutIn>\n</receipt>\n",
+    };
+    for (const char *text : indented)
+    {
+        ReceiptSettings receipt;
+        ASSERT_TRUE(loadReceiptText(QByteArray(text), &receipt));
+        ASSERT_TRUE(receipt.lookAssistEnabled());
+        ASSERT_EQ(2u, receipt.cutIn());
+    }
+    // A child element inside the indented handler's element is the typed XML parse failure, as on base.
+    ReceiptSettings nested;
+    ASSERT_FALSE(loadReceiptText(QByteArrayLiteral(
+        "<receipt version=\"4\">\n  <lookAssistEnabled><value/></lookAssistEnabled>\n</receipt>\n"), &nested));
+}
+
+// r4: a valid scalar keeps its meaning next to a malformed one, in either order and either layout; surrounding
+// whitespace is still a value.
+TEST(ReceiptLoader, AValidOptOutSurvivesAMalformedNeighbour)
+{
+    const char *const off[] = {
+        "<receipt version=\"4\"><cutIn>1</cutIn><cutOut>1</cutOut><lookAssistEnabled>0</lookAssistEnabled>"
+        "<lookAssistEnabled>garbage</lookAssistEnabled></receipt>",
+        "<receipt version=\"4\"><cutIn>1</cutIn><cutOut>1</cutOut><lookAssistEnabled/>"
+        "<lookAssistEnabled>0</lookAssistEnabled></receipt>",
+        "<receipt version=\"4\">\n<lookAssistEnabled>0</lookAssistEnabled>\n<lookAssistEnabled>garbage</lookAssistEnabled>\n"
+        "</receipt>\n",
+        "<receipt version=\"4\"><cutIn>1</cutIn><cutOut>1</cutOut><lookAssistEnabled> 0 </lookAssistEnabled></receipt>",
+    };
+    for (const char *text : off)
+    {
+        ReceiptSettings receipt;
+        ASSERT_TRUE(loadReceiptText(QByteArray(text), &receipt));
+        ASSERT_FALSE(receipt.lookAssistEnabled());
+    }
+}
+
 // The GUI's copy of the reader (MainWindow::readXmlElementsFromFile, not linked here) keeps the base walk and applies
 // the same opt-out scan after it (r2 B1/B2), observing every pass at the loop bottom (r3 A1).
 static const QString kOptOutScanCall = QStringLiteral(
@@ -265,9 +325,13 @@ static const QString kOptOutScanCall = QStringLiteral(
 static const QString kOptOutApply = QStringLiteral(
     "    if( optOutWatch.optOut( Rxml ) )\n"
     "        receipt->setLookAssistEnabled( false );");
+// r4 (sol r3 B1): both handlers read the value through the scan's own rule, so an element with no integer in it keeps
+// the current value in the walk exactly as in the scan.
 static const QString kOptOutHandler = QStringLiteral(
     "            optOutWatch.sawLookAssistEnabled( Rxml );\n"
-    "            receipt->setLookAssistEnabled( (bool)Rxml->readElementText().toInt() );");
+    "            bool lookAssistOn = true;\n"
+    "            if( ReceiptXmlWalk::lookAssistEnabledValue( Rxml->readElementText(), &lookAssistOn ) )\n"
+    "                receipt->setLookAssistEnabled( lookAssistOn );");
 
 // r3 (r2 adversary A3 on 40efaff7): the opt-out scan re-reads the bytes the walk parsed, never the file, so a file
 // saved between two reads cannot mix two versions. Every caller of the two element readers parses a QBuffer filled
@@ -288,6 +352,9 @@ TEST(ReceiptLoader, TheOptOutScanReadsTheWalksOwnBytes)
     ASSERT_EQ(-1, helper.indexOf(QStringLiteral(".open(")));
     ASSERT_TRUE(helper.indexOf(QStringLiteral("qobject_cast<QBuffer *>( reader->device() )")) >= 0);
     ASSERT_TRUE(helper.indexOf(QStringLiteral("readElementText( QXmlStreamReader::SkipChildElements )")) >= 0);
+    // r4 (sol r3 B1): the scan reads a child's value with the handlers' rule, never a bare toInt() of any text.
+    ASSERT_TRUE(helper.indexOf(QStringLiteral("lookAssistEnabledValue( text, &on )")) >= 0);
+    ASSERT_EQ(-1, helper.indexOf(QStringLiteral("text.toInt() != 0")));
 
     QFile loader(repo_file_path(QStringLiteral("src/batch/ReceiptLoader.cpp")));
     ASSERT_TRUE(loader.open(QIODevice::ReadOnly | QIODevice::Text));

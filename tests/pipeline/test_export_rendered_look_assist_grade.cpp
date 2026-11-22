@@ -15,10 +15,13 @@
 #include "mlv_pipeline_fixture.h"
 
 #include "../../platform/qt/ReceiptSettings.h"
+#include "../../src/batch/BatchLogger.h"
 #include "../../src/batch/CdngSequenceExport.h"
 #include "../../src/batch/ReceiptApplier.h"
 
+#include <QFile>
 #include <QString>
+#include <QTemporaryDir>
 
 #include <cmath>
 #include <cstdint>
@@ -348,6 +351,64 @@ TEST(ExportRenderedLookAssistGrade, ARefusedChannelRestoresAllFourTables)
         ASSERT_TRUE( curveTables( processing ) == graded );
         freeProcessingObject( processing );
     }
+}
+
+// r4 (sol r3 B2 on 875d5e40): an identity-shaped curve that is malformed (an x with no y on line four) or holds a
+// non-finite knot is refused: the helper returns false, writes the curve warning, and no table moves, from identity or
+// from a graded state.
+TEST(ExportRenderedLookAssistGrade, AMalformedIdentityShapedCurveIsRefusedWithAWarning)
+{
+    const QString three = QStringLiteral( "1e-5;1e-5;1;1;?1e-5;1e-5;1;1;?1e-5;1e-5;1;1;?" );
+    const QString refused[] = {
+        three + QStringLiteral( "1e-5;1e-5;1;1;0.5;" ),
+        three + QStringLiteral( "nan;1e-5;1;1;" ),
+        three + QStringLiteral( "1e-5;1e-5;1;inf;" ),
+        three + QStringLiteral( "1e-5;1e-5;1;1;?0.5;" ),
+    };
+    for( const QString &curve : refused )
+    {
+        for( int graded = 0; graded < 2; ++graded )
+        {
+            processingObject_t *processing = initProcessingObject();
+            ASSERT_TRUE( processing != nullptr );
+            if( graded ) lookAssistTestApplyGradationCurve( processing, QString::fromLatin1( kUserCurve ) );
+            const CurveTables before = curveTables( processing );
+            ReceiptSettings receipt;
+            receipt.setGradationCurve( curve );
+            QTemporaryDir temporary_dir;
+            ASSERT_TRUE( temporary_dir.isValid() );
+            const QString log_path = temporary_dir.filePath( QStringLiteral( "grade.log" ) );
+            BatchLogger::init( log_path );
+            const bool pushed = ReceiptApplier::applyLookAssistGradeToProcessing( &receipt, processing );
+            BatchLogger::shutdown();
+            QFile log_file( log_path );
+            ASSERT_TRUE( log_file.open( QIODevice::ReadOnly | QIODevice::Text ) );
+            const QString log = QString::fromUtf8( log_file.readAll() );
+            log_file.close();
+            ASSERT_FALSE( pushed );
+            ASSERT_TRUE( log.contains( QLatin1String( "WARNING LOOK_ASSIST curve not applied: malformed gradation curve" ) ) );
+            ASSERT_TRUE( curveTables( processing ) == before );
+            freeProcessingObject( processing );
+        }
+    }
+    // The default curve is still left alone without a warning, and returns true.
+    processingObject_t *processing = initProcessingObject();
+    ASSERT_TRUE( processing != nullptr );
+    const CurveTables before = curveTables( processing );
+    ReceiptSettings receipt;
+    QTemporaryDir temporary_dir;
+    ASSERT_TRUE( temporary_dir.isValid() );
+    const QString log_path = temporary_dir.filePath( QStringLiteral( "default.log" ) );
+    BatchLogger::init( log_path );
+    const bool pushed = ReceiptApplier::applyLookAssistGradeToProcessing( &receipt, processing );
+    BatchLogger::shutdown();
+    QFile log_file( log_path );
+    ASSERT_TRUE( log_file.open( QIODevice::ReadOnly | QIODevice::Text ) );
+    ASSERT_FALSE( QString::fromUtf8( log_file.readAll() ).contains( QLatin1String( "curve not applied" ) ) );
+    log_file.close();
+    ASSERT_TRUE( pushed );
+    ASSERT_TRUE( curveTables( processing ) == before );
+    freeProcessingObject( processing );
 }
 
 // A11: an out-of-range receipt vibrance is the slider's end, never a non-finite factor.
