@@ -392,10 +392,11 @@ int BatchRunner::exportRenderedVideoFile(
     ReceiptApplier::applyToMlv( receipt, mlvObject, processingObject );
 
     /* Look Assist, in the same state and on the same clip-wide anchor frame CDNG analyses
-     * (exportSingleFile), so both routes reach the same verdict. CDNG carries the grade as
-     * DNG metadata; a rendered frame shows only processing-object state, so the grade
-     * Look Assist wrote into the receipt is pushed into the processing object too. Off
-     * (receipt or MLVAPP_NO_LOOK_ASSIST) returns false and nothing more is pushed. */
+     * (exportSingleFile), so both routes reach the same verdict. Look Assist writes its
+     * grade into the receipt and pushes only white balance and raw levels; a rendered
+     * frame shows only processing-object state, so the rest of the grade is pushed into
+     * the processing object too. Off (receipt or MLVAPP_NO_LOOK_ASSIST) or a skipped
+     * analysis returns false and nothing more is pushed. */
     const bool lookAssistApplied = ReceiptApplier::applyHeadlessLookAssist(
         receipt, mlvObject, processingObject,
         CdngSequenceExport::lookAssistAnalysisFrameIndex( cutIn, cutIn ) );

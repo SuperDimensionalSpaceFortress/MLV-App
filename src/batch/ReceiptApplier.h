@@ -45,9 +45,11 @@ public:
     /* Pushes the grade applyHeadlessLookAssist wrote into the receipt (exposure, contrast, pivot, vibrance, shadows,
      * highlights and, when it is not the default, the gradation curve) into the processing object, mapped the way the
      * app's slider handlers map them (MainWindow.cpp on_horizontalSlider*_valueChanged; curve channels Y = 0, R = 1,
-     * G = 2, B = 3, as the Curves widget pushes them). CDNG carries the grade as DNG metadata; a rendered frame shows
-     * only processing-object state, so a rendered export calls this after applyHeadlessLookAssist returned true. White
-     * balance is not touched (applyHeadlessLookAssist already set it). Null-safe. */
+     * G = 2, B = 3, as the Curves widget pushes them; a curve string with fewer than four lines pushes nothing, as the
+     * widget does). A rendered frame shows only processing-object state, so a rendered export calls this after
+     * applyHeadlessLookAssist returned true. (A CDNG export carries only Look Assist's exposure, raw levels and white
+     * balance, as DNG metadata; it has no carrier for these sliders or the curve.) White balance is not touched
+     * (applyHeadlessLookAssist already set it). Null-safe. */
     static void applyLookAssistGradeToProcessing(ReceiptSettings *receipt,
                                                  processingObject_t *processingObject);
 

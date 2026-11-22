@@ -6360,9 +6360,32 @@ void processingSetGCurve(processingObject_t *processing, int num, float *pXin, f
         return;
     }
 
-    //Build output sets
+    //Refuse knots the spline cannot use and leave the curve as it is: a non-finite value, or an x that the "no equal x"
+    //nudge in spline1dccc (x = last + 0.000001, stored as float) cannot move past the previous one, e.g. 32;0;32;1 where
+    //32 + 0.000001 rounds back to 32 (EXPORT-PRORES-LOOK-ASSIST-1, adversary A4 on 76653777). Every curve the widget
+    //draws (x in 0..1) passes unchanged.
+    {
+        if( !isfinite( pXin[0] ) || !isfinite( pYin[0] ) ) return;
+        float last = pXin[0];
+        for( int i = 1; i < num; i++ )
+        {
+            if( !isfinite( pXin[i] ) || !isfinite( pYin[i] ) ) return;
+            float x = pXin[i];
+            if( last >= x ) x = last + 0.000001;
+            if( !( x > last ) ) return;
+            last = x;
+        }
+    }
+
+    //Build output sets (a failed allocation leaves the curve as it is; adversary A10 on 76653777)
     float *pXout = (float*)malloc( sizeof(float) * 65536 );
     float *pYout = (float*)malloc( sizeof(float) * 65536 );
+    if( !pXout || !pYout )
+    {
+        free( pXout );
+        free( pYout );
+        return;
+    }
 
     int numOut = 65536;
 
@@ -6429,6 +6452,12 @@ void processingSetHueVsCurves(processingObject_t *processing, int num, float *pX
     //Build output sets
     float *pXout = (float*)malloc( sizeof(float) * 36000 );
     float *pYout = (float*)malloc( sizeof(float) * 36000 );
+    if( !pXout || !pYout )   //adversary A10 on 76653777: a failed allocation leaves the curve as it is
+    {
+        free( pXout );
+        free( pYout );
+        return;
+    }
 
     int numOut = 36000;
 

@@ -131,6 +131,69 @@ TEST(ReceiptLoader, LoadsLookAssistReceiptState)
     ASSERT_NEAR(0.3333, receipt.lookAssistBaselineStretchY(), 0.0001);
 }
 
+// EXPORT-PRORES-LOOK-ASSIST-1, adversary A1 on 76653777: a compact receipt (no whitespace between elements) loses no
+// element. Before the fix the walk stepped past <lookAssistEnabled> and stopped at its end element.
+static bool loadReceiptText(const QByteArray & text, ReceiptSettings * receipt)
+{
+    QTemporaryDir tempDir;
+    if (!tempDir.isValid()) return false;
+    const QString receiptPath = tempDir.filePath(QStringLiteral("compact.marxml"));
+    QFile file(receiptPath);
+    if (!file.open(QIODevice::WriteOnly)) return false;
+    file.write(text);
+    file.close();
+    QString error_message;
+    return ReceiptLoader::loadFromFile(receiptPath, receipt, &error_message) && error_message.isEmpty();
+}
+
+TEST(ReceiptLoader, ACompactReceiptLosesNoElement)
+{
+    ReceiptSettings receipt;
+    ASSERT_TRUE(receipt.lookAssistEnabled());   // the default the skipped element used to leave
+    ASSERT_TRUE(loadReceiptText(QByteArrayLiteral(
+        "<receipt version=\"4\"><cutIn>1</cutIn><lookAssistEnabled>0</lookAssistEnabled></receipt>"), &receipt));
+    ASSERT_EQ(1u, receipt.cutIn());
+    ASSERT_FALSE(receipt.lookAssistEnabled());
+
+    ReceiptSettings flavored;
+    ASSERT_TRUE(loadReceiptText(QByteArrayLiteral(
+        "<receipt version=\"4\"><lookAssistEnabled>1</lookAssistEnabled><lookAssistFlavor>film</lookAssistFlavor>"
+        "<unknownFutureTag>7</unknownFutureTag><cutIn>3</cutIn><cutOut>9</cutOut></receipt>"), &flavored));
+    ASSERT_TRUE(flavored.lookAssistEnabled());
+    ASSERT_EQ(std::string("film"), flavored.lookAssistFlavor().toStdString());
+    ASSERT_EQ(3u, flavored.cutIn());
+    ASSERT_EQ(9u, flavored.cutOut());
+}
+
+TEST(ReceiptLoader, AnIndentedReceiptReadsAsBefore)
+{
+    ReceiptSettings receipt;
+    ASSERT_TRUE(loadReceiptText(QByteArrayLiteral(
+        "<receipt version=\"4\">\n  <cutIn>2</cutIn>\n  <lookAssistEnabled>0</lookAssistEnabled>\n  <cutOut>5</cutOut>\n</receipt>\n"),
+        &receipt));
+    ASSERT_EQ(2u, receipt.cutIn());
+    ASSERT_FALSE(receipt.lookAssistEnabled());
+    ASSERT_EQ(5u, receipt.cutOut());
+}
+
+// The GUI's copy of the reader (MainWindow::readXmlElementsFromFile, not linked here) walks the same way.
+TEST(ReceiptLoader, TheGuiReaderUsesTheSameWalk)
+{
+    QFile file(repo_file_path(QStringLiteral("platform/qt/MainWindow.cpp")));
+    ASSERT_TRUE(file.open(QIODevice::ReadOnly | QIODevice::Text));
+    const QString source = QString::fromUtf8(file.readAll());
+    const int at = source.indexOf(QStringLiteral("void MainWindow::readXmlElementsFromFile("));
+    ASSERT_TRUE(at >= 0);
+    const int end = source.indexOf(QStringLiteral("\n}"), at);
+    ASSERT_TRUE(end > at);
+    const QString body = source.mid(at, end - at);
+    const int next = body.indexOf(QStringLiteral("walk.next( Rxml );"));
+    const int settle = body.lastIndexOf(QStringLiteral("walk.settle( Rxml );"));
+    ASSERT_TRUE(next >= 0);
+    ASSERT_TRUE(settle > next);
+    ASSERT_EQ(-1, body.indexOf(QStringLiteral("        Rxml->readNext();\n\n        if( Rxml->isStartElement() && Rxml->name() == QString( \"exposure\" ) )")));
+}
+
 TEST(ReceiptLoader, MissingReceiptReturnsUsefulError)
 {
     ReceiptSettings receipt;

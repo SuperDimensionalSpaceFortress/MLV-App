@@ -15,7 +15,8 @@
 inline void lookAssistTestApplyGradationCurve( processingObject_t *processing, const QString &curve )
 {
     std::vector<lookassist::LookAssistGradationPoint> lines[4];
-    lookassist::lookAssistParseGradationCurve( curve, lines );
+    // Curves::setConfiguration pushes no table when the string runs out before its fourth line (adversary A3 on 76653777).
+    if( lookassist::lookAssistParseGradationCurve( curve, lines ) != 4 ) return;
     for( int channel = 0; channel < 4; ++channel )
     {
         // Copies: the spline helper nudges equal x values in place, as it does on the widget's own arrays.

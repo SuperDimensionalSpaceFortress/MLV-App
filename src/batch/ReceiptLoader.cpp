@@ -1,5 +1,6 @@
 #include "ReceiptLoader.h"
 #include "BatchLogger.h"
+#include "ReceiptXmlWalk.h"
 
 #include "../../platform/qt/ReceiptSettings.h"
 
@@ -171,9 +172,10 @@ void ReceiptLoader::parseXmlElements(QXmlStreamReader *Rxml,
     receipt->setDualIsoEvCorrection( 1 );
     receipt->setDualIsoBlackDelta( -1 );
 
+    ReceiptXmlWalk walk;
     while( !Rxml->atEnd() && !Rxml->isEndElement() )
     {
-        Rxml->readNext();
+        walk.next( Rxml );
 
         if( Rxml->isStartElement() && Rxml->name() == QString( "exposure" ) )
         {
@@ -815,5 +817,6 @@ void ReceiptLoader::parseXmlElements(QXmlStreamReader *Rxml,
             Rxml->readElementText();
             Rxml->readNext();
         }
+        walk.settle( Rxml );
     }
 }

@@ -212,6 +212,64 @@ static void applyHeadlessRawLevelsAutoFix( ReceiptSettings *receipt,
     llrpResetDngBWLevels( mlvObject );
 }
 
+/* Everything applyHeadlessRawLevelsAutoFix changes, taken just before it, so a Look Assist pass that skips after it
+ * leaves the levels exactly as the receipt applied them: a skipped pass is no grade, and a rendered export renders
+ * with these levels (EXPORT-PRORES-LOOK-ASSIST-1, adversary A2 on 76653777). */
+struct HeadlessRawLevels
+{
+    int receiptBlack = 0;
+    int receiptWhite = 0;
+    int32_t mlvBlack = 0;
+    int32_t mlvWhite = 0;
+    int dngBlack = 0;
+    int dngWhite = 0;
+    float processingBlack = 0.0f;
+    int processingWhite = 0;
+};
+
+static HeadlessRawLevels captureHeadlessRawLevels( ReceiptSettings *receipt,
+                                                   mlvObject_t *mlvObject,
+                                                   processingObject_t *processingObject )
+{
+    HeadlessRawLevels levels;
+    levels.receiptBlack = receipt->rawBlack();
+    levels.receiptWhite = receipt->rawWhite();
+    levels.mlvBlack = getMlvBlackLevel( mlvObject );
+    levels.mlvWhite = getMlvWhiteLevel( mlvObject );
+    if( mlvObject->llrawproc )
+    {
+        levels.dngBlack = mlvObject->llrawproc->dng_black_level;
+        levels.dngWhite = mlvObject->llrawproc->dng_white_level;
+    }
+    levels.processingBlack = processingObject->black_level;
+    levels.processingWhite = processingObject->white_level;
+    return levels;
+}
+
+static void restoreHeadlessRawLevels( const HeadlessRawLevels &levels,
+                                      ReceiptSettings *receipt,
+                                      mlvObject_t *mlvObject,
+                                      processingObject_t *processingObject )
+{
+    receipt->setRawBlack( levels.receiptBlack );
+    receipt->setRawWhite( levels.receiptWhite );
+    setMlvBlackLevel( mlvObject, levels.mlvBlack );
+    setMlvWhiteLevel( mlvObject, levels.mlvWhite );
+    if( mlvObject->llrawproc )
+    {
+        mlvObject->llrawproc->dng_black_level = levels.dngBlack;
+        mlvObject->llrawproc->dng_white_level = levels.dngWhite;
+    }
+    processingObject->black_level = levels.processingBlack;
+    processingObject->white_level = levels.processingWhite;
+    // -1 / -1: keep both levels as set above and rebuild the levels table from them.
+    processingSetBlackAndWhiteLevel( processingObject, -1, -1, getMlvBitdepth( mlvObject ) );
+    llrpResetFpmStatus( mlvObject );
+    llrpResetBpmStatus( mlvObject );
+    resetMlvCache( mlvObject );
+    resetMlvCachedFrame( mlvObject );
+}
+
 }
 
 /* -----------------------------------------------------------------------
@@ -814,6 +872,7 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     else
         captureHeadlessLookAssistBaseline( receipt, mlvObject );
 
+    const HeadlessRawLevels levelsBeforeAutoFix = captureHeadlessRawLevels( receipt, mlvObject, processingObject );
     applyHeadlessRawLevelsAutoFix( receipt, mlvObject, processingObject );
 
     // The flavor: MLVAPP_LOOK_ASSIST_FLAVOR (runs) over the receipt's lookAssistFlavor element; neither = Classic.
@@ -836,6 +895,7 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             "[BATCH] WARNING LOOK_ASSIST skipped: invalid raw size width=%1 height=%2\n" )
             .arg( raw_w )
             .arg( raw_h ) );
+        restoreHeadlessRawLevels( levelsBeforeAutoFix, receipt, mlvObject, processingObject );
         return false;
     }
 
@@ -855,6 +915,7 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             .arg( downscaleFactor )
             .arg( width )
             .arg( height ) );
+        restoreHeadlessRawLevels( levelsBeforeAutoFix, receipt, mlvObject, processingObject );
         return false;
     }
 
@@ -878,6 +939,7 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             .arg( frameIndex )
             .arg( width )
             .arg( height ) );
+        restoreHeadlessRawLevels( levelsBeforeAutoFix, receipt, mlvObject, processingObject );
         return false;
     }
 
@@ -1086,7 +1148,11 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             .arg( processingGetWhiteBalanceTint( processingObject ), 0, 'f', 9 )
             .arg( cachedFrameBefore )
             .arg( mlvObject->current_cached_frame_active ) );
-        return applyHeadlessLookAssist( receipt, mlvObject, processingObject, analysisFrame, true );
+        const bool masterPassApplied =
+            applyHeadlessLookAssist( receipt, mlvObject, processingObject, analysisFrame, true );
+        if( !masterPassApplied )
+            restoreHeadlessRawLevels( levelsBeforeAutoFix, receipt, mlvObject, processingObject );
+        return masterPassApplied;
     }
     // The window-lit check runs on copies (the GUI does the same; see there): by colour alone it only logs; it APPLIES
     // when the aperture-bounded exposure rules night out and a verified surface backs the balance. Never in master's pass.
@@ -1243,8 +1309,11 @@ void ReceiptApplier::applyLookAssistGradeToProcessing(ReceiptSettings *receipt,
     processingSetExposureStops( processingObject, receipt->exposure() / 100.0 + 1.2 );
     processingSetSimpleContrast( processingObject, receipt->contrast() / 100.0 );
     processingSetPivot( processingObject, receipt->pivot() / 100.0 );
+    // The vibrance slider's own range (-100..100; adversary A11 on 76653777): an out-of-range receipt value can neither
+    // overflow the int sum nor hand pow a negative base.
+    const double vibrance = qBound( -100, receipt->vibrance(), 100 );
     processingSetVibrance( processingObject,
-                           std::pow( ( receipt->vibrance() + 100 ) / 200.0 * 2.0, std::log( 3.6 ) / std::log( 2.0 ) ) );
+                           std::pow( ( vibrance + 100.0 ) / 200.0 * 2.0, std::log( 3.6 ) / std::log( 2.0 ) ) );
     processingSetShadows( processingObject, receipt->shadows() * 1.5 / 100.0 );
     processingSetHighlights( processingObject, receipt->highlights() * 1.5 / 100.0 );
 
@@ -1252,7 +1321,9 @@ void ReceiptApplier::applyLookAssistGradeToProcessing(ReceiptSettings *receipt,
     const QString curve = receipt->gradationCurve();
     if( lookassist::lookAssistIsDefaultGradationCurve( curve ) ) return;
     std::vector<lookassist::LookAssistGradationPoint> lines[4];
-    lookassist::lookAssistParseGradationCurve( curve, lines );
+    // Curves::setConfiguration returns before pushing any table when the string runs out before its fourth line, so a
+    // partial curve pushes nothing here either (adversary A3 on 76653777).
+    if( lookassist::lookAssistParseGradationCurve( curve, lines ) != 4 ) return;
     for( int channel = 0; channel < 4; ++channel )
     {
         // Copies: the spline helper nudges equal x values in place, as it does on the widget's own arrays.

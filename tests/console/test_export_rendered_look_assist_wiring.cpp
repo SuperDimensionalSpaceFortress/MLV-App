@@ -1,11 +1,13 @@
 // EXPORT-PRORES-LOOK-ASSIST-1: wiring test. A rendered (ProRes / ffmpeg) batch export must run headless Look Assist the
 // way the CDNG export does, and must then push the grade Look Assist wrote into the receipt into the processing object:
-// CDNG carries the grade as DNG metadata, but a rendered frame shows only processing-object state. BatchRunner.cpp needs
+// Look Assist itself pushes only white balance and raw levels, and a rendered frame shows only processing-object state
+// (CDNG carries only exposure, levels and white balance, as DNG metadata). BatchRunner.cpp needs
 // the GUI build (not linked into console_tests), so this reads the source as text, with comments stripped, as
 // test_export_receipt_debayer_wiring.cpp does. One TEST per check, so reverting one piece turns exactly that test red:
 //   (1) exportRenderedVideoFile calls ReceiptApplier::applyHeadlessLookAssist( exactly once;
 //   (2) after ReceiptApplier::applyToMlv( and before the debayer switch and getMlvProcessedFrame16(;
-//   (3) with lookAssistAnalysisFrameIndex( in its argument list (the clip-wide anchor CDNG analyses);
+//   (3) with lookAssistAnalysisFrameIndex( cutIn, cutIn ) in its argument list (the clip-wide anchor CDNG analyses; a
+//       constant anchor does not pass, adversary A8 on 76653777);
 //   (4) applyLookAssistGradeToProcessing( follows it, before getMlvProcessedFrame16(;
 //   (5) exportSingleFile (CDNG) is unchanged: one applyHeadlessLookAssist( with
 //       lookAssistAnalysisFrameIndex( cutIn, effectiveCutIn ) and no applyLookAssistGradeToProcessing(.
@@ -150,7 +152,43 @@ TEST(ExportRenderedLookAssistWiring, RenderedLookAssistAnalysesTheClipWideAnchor
     const QString body = renderedBody();
     const int lookAssist = body.indexOf(kLookAssistCall);
     ASSERT_TRUE(lookAssist >= 0);
-    ASSERT_TRUE(callArguments(body, lookAssist).contains(QStringLiteral("lookAssistAnalysisFrameIndex(")));
+    ASSERT_TRUE(collapseSpaces(callArguments(body, lookAssist))
+                    .contains(QStringLiteral("lookAssistAnalysisFrameIndex(cutIn,cutIn)")));
+}
+
+// ---- adversary A10 on 76653777: the curve setters survive a failed allocation ----------------------------------
+
+namespace
+{
+
+QString cFunctionBody(const QString & signature)
+{
+    const QString source = stripComments(readRepoFile(QStringLiteral("src/processing/raw_processing.c")));
+    const int at = source.indexOf(signature);
+    if (at < 0) return QString();
+    const int next = source.indexOf(QStringLiteral("\n}"), at);
+    return next < 0 ? QString() : source.mid(at, next - at);
+}
+
+// The allocations' null check sits before the first write through either buffer.
+bool checksAllocationsBeforeUse(const QString & body)
+{
+    const int alloc = body.indexOf(QStringLiteral("float *pYout = (float*)malloc("));
+    const int check = body.indexOf(QStringLiteral("if( !pXout || !pYout )"));
+    const int firstUse = body.indexOf(QStringLiteral("pXout[i] ="));
+    return alloc >= 0 && check > alloc && firstUse > check;
+}
+
+} // namespace
+
+TEST(ExportRenderedLookAssistWiring, GradationCurveSetterChecksItsAllocations)
+{
+    ASSERT_TRUE(checksAllocationsBeforeUse(cFunctionBody(QStringLiteral("void processingSetGCurve("))));
+}
+
+TEST(ExportRenderedLookAssistWiring, HueVsCurveSetterChecksItsAllocations)
+{
+    ASSERT_TRUE(checksAllocationsBeforeUse(cFunctionBody(QStringLiteral("void processingSetHueVsCurves("))));
 }
 
 // (4)

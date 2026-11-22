@@ -13,6 +13,7 @@
 #include "ExportProcess.h"
 #include "../../src/batch/LookAssistAnalysis.h"
 #include "../../src/batch/ReceiptApplier.h"
+#include "../../src/batch/ReceiptXmlWalk.h"
 #include "DualIsoLevelSyncPolicy.h"
 #include "PlaybackFpsMeterPolicy.h"
 #include "PlaybackScaleLabel.h"
@@ -16389,10 +16390,11 @@ void MainWindow::readXmlElementsFromFile(QXmlStreamReader *Rxml, ReceiptSettings
     receipt->setDualIsoEvCorrection( 1 );
     receipt->setDualIsoBlackDelta( -1 );
 
-    //Read tags
+    //Read tags (ReceiptXmlWalk: a compact receipt's next element is not skipped)
+    ReceiptXmlWalk walk;
     while( !Rxml->atEnd() && !Rxml->isEndElement() )
     {
-        Rxml->readNext();
+        walk.next( Rxml );
 
         if( Rxml->isStartElement() && Rxml->name() == QString( "exposure" ) )
         {
@@ -17041,6 +17043,7 @@ void MainWindow::readXmlElementsFromFile(QXmlStreamReader *Rxml, ReceiptSettings
             Rxml->readElementText();
             Rxml->readNext();
         }
+        walk.settle( Rxml );
     }
 }
 
