@@ -4562,7 +4562,10 @@ static inline void build_alias_map(struct raw_info raw_info,
                 (alias_aux[x+0 + (y-6) * w] + alias_aux[x-6 + (y+0) * w] + alias_aux[x+6 + (y+0) * w] + alias_aux[x+0 + (y+6) * w]) * 139 / 1024 +
                 (alias_aux[x-2 + (y-6) * w] + alias_aux[x+2 + (y-6) * w] + alias_aux[x-6 + (y-2) * w] + alias_aux[x+6 + (y-2) * w] + alias_aux[x-6 + (y+2) * w] + alias_aux[x+6 + (y+2) * w] + alias_aux[x-2 + (y+6) * w] + alias_aux[x+2 + (y+6) * w]) * 111 / 1024 +
                 (alias_aux[x-2 + (y-6) * w] + alias_aux[x+2 + (y-6) * w] + alias_aux[x-6 + (y-2) * w] + alias_aux[x+6 + (y-2) * w] + alias_aux[x-6 + (y+2) * w] + alias_aux[x+6 + (y+2) * w] + alias_aux[x-2 + (y+6) * w] + alias_aux[x+2 + (y+6) * w]) * 57 / 1024;
-                alias_map[x + y * w] = c;
+                /* c can exceed 65535 (the 21 tap weights sum to ~13.6);
+                 * saturate like build_alias_map_gaussian_row_avx2 instead of
+                 * letting the uint16_t store wrap a strong alias to a weak one. */
+                alias_map[x + y * w] = MIN(c, 65535);
             }
         }
     }

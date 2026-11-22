@@ -824,15 +824,10 @@ static void build_alias_map_gaussian_row_avx2(uint16_t * alias_map_row,
         acc = _mm256_add_epi32(acc, _mm256_srai_epi32(_mm256_mullo_epi32(sum_outer_8,        v_w111), 10));
         acc = _mm256_add_epi32(acc, _mm256_srai_epi32(_mm256_mullo_epi32(sum_outer_8,        v_w57),  10));
 
-        /* Clamp to uint16 (scalar simply assigns int → uint16, truncating).
-         * To match scalar semantics exactly: scalar `alias_map[..] = c;` where
-         * `c` is `int` and target is uint16 truncates by storing low 16 bits.
-         * Use packus (clamps to [0, 65535]) — but scalar truncates without
-         * clamp. Values are bounded < 2^16 in practice (alias_aux ≤ 65530,
-         * weighted sum ≤ 65530 * (1+820+657+421+...+57)/1024 ≈ ...).
-         * Actually the sum of weights is 1024 + 1241+1504+139+168 = ?
-         * We mimic scalar truncation: use _mm_packus_epi32 with prior min to
-         * 65535 to be safe. The init-err-diff bound 65530 propagates. */
+        /* Saturate to [0, 65535]. The 21 tap weights sum to ~13.6, so the
+         * sum DOES exceed 65535 on real footage (M16-1457 frame 86 around
+         * (568,307)); the scalar loop and the CUDA k_alias_gauss
+         * saturate the same way (they used to wrap it modulo 2^16). */
         const __m256i v_max16 = _mm256_set1_epi32(0xFFFF);
         acc = _mm256_min_epi32(_mm256_max_epi32(acc, v_zero), v_max16);
 
@@ -862,7 +857,8 @@ static void build_alias_map_gaussian_row_avx2(uint16_t * alias_map_row,
             ((int)alias_aux[x   + (size_t)(y-6) * (size_t)w] + (int)alias_aux[x-6 + (size_t)(y  ) * (size_t)w] + (int)alias_aux[x+6 + (size_t)(y  ) * (size_t)w] + (int)alias_aux[x   + (size_t)(y+6) * (size_t)w]) * 139 / 1024 +
             ((int)alias_aux[x-2 + (size_t)(y-6) * (size_t)w] + (int)alias_aux[x+2 + (size_t)(y-6) * (size_t)w] + (int)alias_aux[x-6 + (size_t)(y-2) * (size_t)w] + (int)alias_aux[x+6 + (size_t)(y-2) * (size_t)w] + (int)alias_aux[x-6 + (size_t)(y+2) * (size_t)w] + (int)alias_aux[x+6 + (size_t)(y+2) * (size_t)w] + (int)alias_aux[x-2 + (size_t)(y+6) * (size_t)w] + (int)alias_aux[x+2 + (size_t)(y+6) * (size_t)w]) * 111 / 1024 +
             ((int)alias_aux[x-2 + (size_t)(y-6) * (size_t)w] + (int)alias_aux[x+2 + (size_t)(y-6) * (size_t)w] + (int)alias_aux[x-6 + (size_t)(y-2) * (size_t)w] + (int)alias_aux[x+6 + (size_t)(y-2) * (size_t)w] + (int)alias_aux[x-6 + (size_t)(y+2) * (size_t)w] + (int)alias_aux[x+6 + (size_t)(y+2) * (size_t)w] + (int)alias_aux[x-2 + (size_t)(y+6) * (size_t)w] + (int)alias_aux[x+2 + (size_t)(y+6) * (size_t)w]) * 57 / 1024;
-        alias_map_row[x] = (uint16_t)c;
+        /* Saturate like the vector body above (never wrap modulo 2^16). */
+        alias_map_row[x] = (uint16_t)(c > 0xFFFF ? 0xFFFF : c);
     }
 }
 
