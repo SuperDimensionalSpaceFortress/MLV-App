@@ -2378,6 +2378,37 @@ $r = Invoke-VenueLateRelease -Venue bachelor -Nonce 'n' -ClaimDir $d -BoundSec 0
         full = [c for c in r["calls"][:-1]]
         self.assertTrue(full and all(c.startswith("5/") and float(c.split("/")[1]) <= 0.75 + 1.5 + 1e-9 for c in full), f"a full call was given more than the bound plus its cap, or is not a full call: {r}")
 
+    LOCK_BUDGET_SCRIPT = """
+# a slow directory check (400 ms, the seam) inside Enter-VenueTicketLock with a 200 ms timeout: the budget is spent before the first open, so no open starts (the seam writes the mark at every open attempt)
+$env:SEAM_LOCKTRY = '@@MARK@@'
+New-Item -ItemType Directory -Force -Path (Join-Path $d 'bachelor.tickets') | Out-Null
+$tp = Join-Path (Join-Path $d 'bachelor.tickets') 'x.ticket.json'
+$l = & (Get-Module VenueChain) { param($p) Enter-VenueTicketLock -TicketPath $p -TimeoutMs 200 } $tp
+$got = ($null -ne $l); if ($l) { $l.Dispose() }
+[pscustomobject]@{ got = $got; tried = (Test-Path -LiteralPath '@@MARK@@') } | ConvertTo-Json -Compress
+"""
+
+    def test_tail1_r2_pass10_a4_no_lock_attempt_starts_after_the_timeout_was_spent_in_the_directory_check(self) -> None:
+        # pass 10 A4 / pass 11 A3 / r9 A5 (pre-existing): the lock helper started its clock AFTER the directory check, so a slow check was free time and the first open started past the caller's budget. The clock starts at the call.
+        mark = self.case / "seam-lockbudget-mark.txt"
+        mod = self.seam_text(("    $lockPath = Join-Path $dir '.ticket.lock'\n", "    $lockPath = Join-Path $dir '.ticket.lock'; Start-Sleep -Milliseconds 400\n"),
+                             ("        try { return [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate,", "        [IO.File]::WriteAllText($env:SEAM_LOCKTRY, '1'); try { return [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate,"))
+        r = self.ps(self.LOCK_BUDGET_SCRIPT.replace("@@MARK@@", str(mark)), module=mod)
+        self.assertFalse(r["tried"], f"a lock attempt started after the timeout was spent in the directory check: {r}")
+        self.assertFalse(r["got"], r)
+
+    def test_tail1_r2_pass10_a10_a_ticket_whose_created_time_is_null_does_not_crash_the_claim_request(self) -> None:
+        # pass 10 A10 (pre-existing): the caller's own valid-looking ticket with createdUtc null: the refresh threw out of Update-VenueTicket (a method call on null) and through Request-VenueClaim. It is answered LOST now.
+        r = self.ps("""
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -Purpose 'P' -ClaimDir $d
+$j = Get-Content -LiteralPath $A.path -Raw | ConvertFrom-Json
+$j.createdUtc = $null
+[IO.File]::WriteAllText($A.path, ($j | ConvertTo-Json -Compress))
+$r = Request-VenueClaim -Venue bachelor -RunDir 'run-A' -Purpose 'P' -UseTicket -ClaimDir $d
+[pscustomobject]@{ state = [string]$r.state; granted = [bool]$r.granted; ticket = [string]$r.ticket.name } | ConvertTo-Json -Compress
+""")
+        self.assertTrue(r["ticket"], r)
+
     def give_back_scenario(self, name: str, release_seam: str, env: dict) -> dict:
         # the A7 line-up (B takes the claim as head while A is in cooldown, A flips to waiting while B holds it, so B must give the claim back), with ONE seam inside the give-back
         from unittest import mock
