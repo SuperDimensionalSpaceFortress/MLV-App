@@ -102,6 +102,15 @@ run for a dry run. The new-machine phases refuse to run on VIRTUAL-TEN unless yo
    rules would keep anyway (it is newer, `/XO`) is not opened and is not a failure. A host file Import
    cannot read for any other reason (access denied, over 25 MiB) still counts as carrying a credential.
 
+   **No backup, no replace (IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1).** Before the copy, Import backs
+   up the host `~/.claude/CLAUDE.md` and `settings.json` under `<StateRoot>\backups\home-claude-<stamp>`. A
+   host file whose backup cannot be made (a write failure, a folder at the backup name, a held or unreadable
+   file, a backups folder that cannot be created) is left byte for byte as it is: the bundle copy is not
+   applied and the run records `IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED <path>` (exit 1); the log line
+   `IMPORT_BACKUP_FAILED <path>` names the cause. Fix what blocks the backup and re-run `-Phase Import`. A bundle
+   zip that `tar` cannot expand completely (a truncated copy) is `IMPORT_BUNDLE_EXPAND_FAILED <path>` (exit 1):
+   nothing is snapshotted or copied from it, so copy the zip again and re-run.
+
    **Remote URLs and git tracing (r17).** Every line the script prints or logs redacts a URL's user part
    up to the last `@` before the host, so an unencoded `@` in a password leaks nothing. It also drops
    everything after a `?` or `#` and prints `?***` (a query-string token, a fragment). Every native git

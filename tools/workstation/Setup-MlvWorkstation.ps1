@@ -3302,6 +3302,14 @@ function Invoke-ImportRobocopy {
             foreach ($x in $xfPaths) { if ($e.FullName -ieq $x) { $skipFile = $true } }
             if ($skipFile) { continue }
             $dest = Join-Path $destDir $e.Name
+            # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1: a host file whose pre-import backup could not be made is not replaced (it is left byte for byte as it is), and the run fails.
+            if ($script:ImportBackupUnavailable.Contains([IO.Path]::GetFullPath($dest))) {
+                $n.skipped++
+                Write-Log "IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED $dest (its backup could not be made, so the host file was left as it is; the bundle copy $($e.FullName) was not applied)" 'ERROR'
+                $script:ImportSkippedDest.Add($dest)
+                $script:Failures.Add("IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED $dest")
+                continue
+            }
             try { $r = Copy-ImportFileLocked -Source $e -Dest $dest -ExcludeNewer $exN -ExcludeOlder $exO -ExcludeChanged $exC }
             catch { $n.failed++; Write-Log "IMPORT_COPY_FAILED $dest :: $($_.Exception.Message)" 'ERROR'; $script:Failures.Add("IMPORT_COPY_FAILED $dest"); continue }
             switch ($r.Result) {
@@ -3326,6 +3334,10 @@ function Invoke-ImportRobocopy {
 }
 
 $script:ImportSkippedDest = [System.Collections.Generic.List[string]]::new()
+# IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1: the full paths (compared case-insensitively) of host files that EXIST but whose pre-import backup could not be made (Copy-CleanBackupFile
+# failed on them, or the backups folder could not be created). Invoke-ImportRobocopy leaves such a file as it is: a replace never goes on after its backup failed. A host file that
+# carries a credential is NOT in this set (it is never replaced anyway, and Get-ImportCredentialSkips reports it). Cleared at the start of the Import backup step.
+$script:ImportBackupUnavailable = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 # r12 pass 9 B3: every destination a copy actually wrote ('created' or 'replaced' by Copy-ImportFileLocked), normalised paths. The settings.json profile rewrite reads this, not a
 # timestamp sampled before the copy: a file the copy KEPT (a newer or an identical host file) is the host's own and is never rewritten.
 $script:ImportAppliedDest = [System.Collections.Generic.List[string]]::new()
@@ -3422,6 +3434,10 @@ function Copy-CleanBackupFile {
                 $script:Failures.Add("IMPORT_BACKUP_NOT_DELETED $dest")
             }
         }
+        # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1: a host file that exists but could not be backed up (write failure, a folder at the backup name, a held or unreadable file,
+        # a decode-limit throw) is remembered: Import must not replace it. (The credential refusal above returns before this catch and is not recorded.)
+        try { if (Test-Path -LiteralPath $Path -PathType Leaf) { [void]$script:ImportBackupUnavailable.Add([IO.Path]::GetFullPath($Path)) } }
+        catch { [void]$script:ImportBackupUnavailable.Add($Path) }
         return $false
     }
 }
@@ -3437,9 +3453,17 @@ function Invoke-PhaseImport {
     $src = $BundlePath
     if ((Get-Item -LiteralPath $BundlePath).PSIsContainer -eq $false) {
         $src = Join-Path $MlvTmp "migrate-in\bundle-$stamp"
+        $expandFailuresBefore = $script:Failures.Count
         Invoke-Step "Expand $BundlePath to $src" {
             [void][IO.Directory]::CreateDirectory($src)
             [void](Invoke-Native -Exe (Join-Path $env:SystemRoot 'System32\tar.exe') -Arguments @('-x', '-f', $BundlePath, '-C', $src))
+        }
+        # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1: tar exits non-zero on a truncated or damaged zip AFTER leaving partly written files in the expanded folder; nothing of such a
+        # bundle is snapshotted or copied (the run fails, exit 1). A -WhatIf preview expands nothing and never records a failure.
+        if (-not $WhatIfPreference -and $script:Failures.Count -gt $expandFailuresBefore) {
+            Write-Log "IMPORT_BUNDLE_EXPAND_FAILED $BundlePath (the bundle could not be expanded completely; nothing was imported)" 'ERROR'
+            $script:Failures.Add("IMPORT_BUNDLE_EXPAND_FAILED $BundlePath")
+            return
         }
     }
     # r15 pass 14 A5: a refused Import is a FAILURE of the run (exit 1), never a quiet return that ends 'done' with exit 0
@@ -3454,13 +3478,28 @@ function Invoke-PhaseImport {
     }
     $h = $env:USERPROFILE
     Invoke-Step 'Back up existing ~/.claude CLAUDE.md and settings.json' {
-        $b = Join-Path $StateRoot "backups\home-claude-$stamp"; [void][IO.Directory]::CreateDirectory($b)
+        # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1: no backup, no replace. A host file whose backup fails is remembered in $script:ImportBackupUnavailable and the copy step leaves it alone.
+        $script:ImportBackupUnavailable.Clear()
+        $b = Join-Path $StateRoot "backups\home-claude-$stamp"
+        try { [void][IO.Directory]::CreateDirectory($b) }
+        catch {
+            # no backup can be made at all: every existing host file of this step is protected, then the failure is recorded (Invoke-Step) as before
+            foreach ($f in 'CLAUDE.md', 'settings.json') {
+                $p = Join-Path "$h\.claude" $f
+                if (Test-Path -LiteralPath $p -PathType Leaf) { [void]$script:ImportBackupUnavailable.Add([IO.Path]::GetFullPath($p)) }
+            }
+            Write-Log "IMPORT_BACKUP_FAILED $b (the backup folder cannot be made; the host files in $h\.claude are not replaced)" 'ERROR'
+            throw
+        }
         foreach ($f in 'CLAUDE.md', 'settings.json') {
             $p = Join-Path "$h\.claude" $f
             if (-not (Test-Path -LiteralPath $p)) { continue }
             # r10 A2: a host file that carries a credential is never copied (the backup would be a second, durable copy of it, and Import
             # never replaces such a file anyway, so there is nothing to roll back). One read: the bytes judged are the bytes written.
-            if (-not (Copy-CleanBackupFile -Path $p -DestinationDir $b)) { Write-Log "IMPORT_BACKUP_SKIPPED_CREDENTIAL_FILE $p (it carries a credential or cannot be read; no copy was made)" 'WARN' }
+            if (-not (Copy-CleanBackupFile -Path $p -DestinationDir $b)) {
+                if ($script:ImportBackupUnavailable.Contains([IO.Path]::GetFullPath($p))) { Write-Log "IMPORT_BACKUP_FAILED $p (the backup copy could not be written; the host file is not replaced)" 'ERROR' }
+                else { Write-Log "IMPORT_BACKUP_SKIPPED_CREDENTIAL_FILE $p (it carries a credential or cannot be read; no copy was made)" 'WARN' }
+            }
         }
     }
     Invoke-Step 'Copy bundle into ~/.claude, ~/bin, ~/.codex, ProgramData\FleetDefender, MLV-App\.claude-state' {
