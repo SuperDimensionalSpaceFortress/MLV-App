@@ -278,6 +278,14 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *FSTOGGLE_LEGS)
 # EXPORT-VENUE-LEG-1: the four export legs (two clips x CDNG lossless / ProRes); test_dual_venue_export_leg pins their shape.
 EXPORT_VENUE_LEGS = tuple(f"legs/m16-{clip}-export-{fmt}.json" for clip in ("1243", "1456") for fmt in ("cdng-lossless", "prores"))
 SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in EXPORT_VENUE_LEGS if rel not in SHIPPED_LEGS))
+# M16-1457-VENUE-BASELINE-DRIFT-1 r3: the thread-cap sweep (worker cap 4 / 8 / 12; 16 is the existing m16-1457-headroom-unpaced-fullscreen-s1) and the P-core-only arm
+# of the Bachelor baseline-drift bench, keyed to the leg each one copies. Unpaced swap-interval-0 legs, so they carry presentTearingExpectedReason like their source.
+# DriftLegSpecTests pins the shape: only legId, card, generatorArgs.playbackMaxThreads (and, for the P-core arm, the affinity keys and two criteria) differ.
+DRIFT_LEGS = {"legs/m16-1457-drift-t4-unpaced-fullscreen-s1.json": "legs/m16-1457-headroom-unpaced-fullscreen-s1.json",
+              "legs/m16-1457-drift-t8-unpaced-fullscreen-s1.json": "legs/m16-1457-headroom-unpaced-fullscreen-s1.json",
+              "legs/m16-1457-drift-t12-unpaced-fullscreen-s1.json": "legs/m16-1457-headroom-unpaced-fullscreen-s1.json",
+              "legs/m16-1457-drift-pcore12-unpaced-fullscreen-s1.json": "legs/m16-1457-headroom-unpaced-fullscreen-s1.json"}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *DRIFT_LEGS)
 assert len(set(SHIPPED_LEGS)) == len(SHIPPED_LEGS), "a shipped leg is listed twice"
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
@@ -8102,12 +8110,12 @@ class LegSpecSchemaTests(unittest.TestCase):
         """CUDA-HEADROOM-1 r2: an unpaced leg at swap interval 0 presents with SyncInterval 0, so PresentMon reports AllowsTearing=1 (the hub's
         TEARING flag). Every headroom leg says so in presentTearingExpectedReason; no other leg carries it, and the schema refuses it on any leg
         that is not unpaced at swap interval 0, so the exemption can never reach a paced or vsync leg."""
-        for rel in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS):
+        for rel in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS, *DRIFT_LEGS):
             spec = json.loads((DV / rel).read_text(encoding="utf-8"))
             self.jsonschema.validate(spec, self.schema)
             self.assertGreaterEqual(len(spec.get("presentTearingExpectedReason", "")), 12, rel)
         for path in sorted((DV / "legs").glob("*.json")):
-            if "legs/" + path.name not in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS):
+            if "legs/" + path.name not in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS, *DRIFT_LEGS):
                 self.assertNotIn("presentTearingExpectedReason", json.loads(path.read_text(encoding="utf-8")), path.name)
         leg = json.loads((DV / HEADROOM_LEGS[0]).read_text(encoding="utf-8"))
         paced = {k: v for k, v in leg["generatorArgs"].items() if k != "unpaced"}
@@ -8208,6 +8216,12 @@ class LegSpecSchemaTests(unittest.TestCase):
                 # (VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 added a12 and b1-12-pcore: A and B1 at a worker-thread cap of 12)
                 self.assertRegex(spec["legId"], r"^m16-1243-partition-(a|b1-pcore|b2-pcore-eload|a12|b1-12-pcore)-unpaced-windowed-s1$", path.name)
                 self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
+            elif spec["card"] == "M16-1457-VENUE-BASELINE-DRIFT-1":   # the thread-cap sweep and the P-core arm of the 1457 baseline-drift bench, named by arm
+                self.assertIn("legs/" + path.name, DRIFT_LEGS, path.name)
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1457-drift-(t(4|8|12)|pcore12)-unpaced-fullscreen-s1$", path.name)
+                self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
+                self.assertEqual(spec["generatorArgs"]["swapInterval"], 0, path.name)
             elif spec["card"] == "CUDA-HEADROOM-UTIL-SAMPLER-1":   # the unpaced Cinematic utilisation-sampler leg (Look Assist forced on, the owner shape), named by cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertEqual(spec["legId"], "m16-1243-utilsample-unpaced-windowed-s1", path.name)
@@ -19524,6 +19538,61 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         calls = re.findall(r"Test-DvCriteria -Criteria \$criteria -Metrics ([^\r\n]+)", leg + "\n" + mod)
         self.assertEqual(calls, ["(Get-DvCriteriaMetrics -Metrics $receipt.metrics -Playback $receipt.playback)",
                                  "(Get-DvCriteriaMetrics -Metrics $metrics -Playback $derived)"], calls)
+
+
+class DriftLegSpecTests(unittest.TestCase):
+    """M16-1457-VENUE-BASELINE-DRIFT-1 r3: each drift leg is the tracked 1457 fullscreen s1 headroom leg with only legId, card and generatorArgs.playbackMaxThreads
+    changed (the P-core arm also carries the 1243 b1-12-pcore arm's affinity keys and its two partition criteria), so a worker-cap sweep on the Bachelor
+    venue differs from the 16-thread baseline leg in the cap alone."""
+
+    def setUp(self) -> None:
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema is required")
+        self.jsonschema = jsonschema
+        self.schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+
+    def load(self, rel: str) -> dict:
+        return json.loads((DV / rel).read_text(encoding="utf-8"))
+
+    def test_each_cap_leg_is_its_source_except_the_leg_id_the_card_and_the_cap(self) -> None:
+        caps = {"legs/m16-1457-drift-t4-unpaced-fullscreen-s1.json": 4, "legs/m16-1457-drift-t8-unpaced-fullscreen-s1.json": 8,
+                "legs/m16-1457-drift-t12-unpaced-fullscreen-s1.json": 12}
+        for rel, cap in caps.items():
+            with self.subTest(leg=rel):
+                spec, source = self.load(rel), self.load(DRIFT_LEGS[rel])
+                self.jsonschema.validate(spec, self.schema)
+                self.assertEqual(spec["legId"], Path(rel).stem)
+                self.assertEqual(spec["card"], "M16-1457-VENUE-BASELINE-DRIFT-1")
+                self.assertEqual(spec["generatorArgs"].pop("playbackMaxThreads"), cap)
+                self.assertEqual(dict(spec, legId=source["legId"], card=source["card"]), source)
+                self.assertEqual(list(self.load(rel)), list(source), "the source's keys in the source's order")
+
+    def test_the_pcore_arm_adds_only_the_affinity_keys_the_cap_and_the_two_partition_criteria(self) -> None:
+        rel = "legs/m16-1457-drift-pcore12-unpaced-fullscreen-s1.json"
+        spec, source = self.load(rel), self.load(DRIFT_LEGS[rel])
+        template = self.load("legs/m16-1243-partition-b1-12-pcore-unpaced-windowed-s1.json")
+        self.jsonschema.validate(spec, self.schema)
+        self.assertEqual(spec["legId"], Path(rel).stem)
+        self.assertEqual(spec["card"], "M16-1457-VENUE-BASELINE-DRIFT-1")
+        for key in ("benchAffinityMask", "corePartitionTelemetry", "corePartitionHelperMask", "playbackMaxThreads"):
+            self.assertEqual(spec["generatorArgs"].pop(key), template["generatorArgs"][key], key)
+        gates = [{"metric": "corePartitionTopologyOk", "op": "eq", "value": True}, {"metric": "benchAffinityApplied", "op": "eq", "value": True}]
+        for role in ("acceptance", "supplementary"):
+            for backend in ("cuda", "cpu"):
+                self.assertEqual(spec["criteria"][role][backend][-2:], gates, f"{role}/{backend}")
+                spec["criteria"][role][backend] = spec["criteria"][role][backend][:-2]
+        self.assertEqual(dict(spec, legId=source["legId"], card=source["card"]), source)
+        # the bench mask and the helper mask share no logical CPU (the helper is never a bench CPU)
+        self.assertEqual(int(template["generatorArgs"]["benchAffinityMask"], 16) & int(template["generatorArgs"]["corePartitionHelperMask"], 16), 0)
+
+    def test_no_other_1457_headroom_leg_sets_a_cap_or_the_affinity_keys(self) -> None:
+        for path in sorted((DV / "legs").glob("m16-1457-headroom-*.json")):
+            with self.subTest(leg=path.name):
+                ga = json.loads(path.read_text(encoding="utf-8")).get("generatorArgs") or {}
+                for key in ("playbackMaxThreads", "benchAffinityMask", "corePartitionTelemetry", "corePartitionHelperMask"):
+                    self.assertNotIn(key, ga)
 
 
 class TeamPartitionLegSpecTests(unittest.TestCase):
