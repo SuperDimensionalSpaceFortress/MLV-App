@@ -2094,17 +2094,24 @@ TEST(PlaybackDueWakeSend, D_AStaleSentWakeThroughTheWindowProcedureIsDroppedByTh
 {
 #ifdef Q_OS_WIN
     int fired = 0;
-    PlaybackDueWake wake( nullptr, [&fired]() { ++fired; }, PlaybackDueWakeDeliveryMode::SendNotify );
+    double firedPostFirstMs = -1.0;                                   // the wait thread's own stamp of the delivery that fired
+    bool firedStamped = false;                                        // ...and whether that delivery carried one
+    PlaybackDueWake *self = nullptr;
+    PlaybackDueWake wake( nullptr, [&]() { ++fired; const double stamp = self->lastDeliveryPostFirstMs(); firedStamped = stamp >= 0.0; firedPostFirstMs = stamp; }, PlaybackDueWakeDeliveryMode::SendNotify );
+    self = &wake;
     // r3 (adversary pass 4 A1 sibling): the replacement's own due time is asserted on every judged attempt (see kReplacementMax*)
     bool judged = false;
     for( int attempt = 0; attempt < kReplacementAttempts && !judged; ++attempt )
     {
         fired = 0;
+        firedPostFirstMs = -1.0;
+        firedStamped = false;
         wake.resetStrandedCounts();
         wake.arm( 0.5 );
         ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
         QElapsedTimer t;
         t.start();
+        const double preArmMs = dueWakeQpcNowMs();
         wake.arm( 40.0 );                                         // re-armed before the GUI thread took the sent wake
         const qint64 armCostNs = t.nsecsElapsed();
         if( armCostNs >= kReplacementMaxArmCostNs )
@@ -2119,10 +2126,13 @@ TEST(PlaybackDueWakeSend, D_AStaleSentWakeThroughTheWindowProcedureIsDroppedByTh
         ASSERT_EQ( 0, fired );                                    // the old generation: dropped
         ASSERT_TRUE( wake.armed() );                              // ...and the replacement is still armed
         ASSERT_TRUE( wake.sleepForSmokeRunner( 1000 ) == PlaybackDueWake::RunnerSleep::WokenBySent );
-        ASSERT_TRUE( t.nsecsElapsed() >= kReplacementMinElapsedNs );   // at the replacement's due time, not at the stale wake's (~0.5 ms)
         wake.dispatchSentMessages();
         ASSERT_EQ( 1, fired );                                    // the replacement fires once, at its own due time
         ASSERT_FALSE( wake.armed() );
+        // the wait thread stamped the replacement's delivery on its own clock, so a pause of THIS thread after the wake cannot
+        // lengthen what is measured: from before the arm to that stamp is >= the 40 ms due (less slack), never the stale wake's ~0.5 ms
+        ASSERT_TRUE( firedStamped );                              // a native delivery carries the stamp (this one fired after its publish)
+        ASSERT_TRUE( ( firedPostFirstMs - preArmMs ) * 1000000.0 >= static_cast<double>( kReplacementMinElapsedNs ) );
         judged = true;
     }
     ASSERT_TRUE( judged );                                        // never passes by skipping the bound
@@ -2508,7 +2518,11 @@ TEST(PlaybackDueWakeSend, R2A1_AStaleSentWakeInTheRunnerSleepIsNotHeldCountedOrA
     // or fire; the replacement (variant) still ends it at its own due time. (The live part runs first, so RED shows the behaviour.)
 #ifdef Q_OS_WIN
     int fired = 0;
-    PlaybackDueWake wake( nullptr, [&fired]() { ++fired; }, PlaybackDueWakeDeliveryMode::SendNotify );
+    double firedPostFirstMs = -1.0;                                   // the wait thread's own stamp of the delivery that fired
+    bool firedStamped = false;                                        // ...and whether that delivery carried one
+    PlaybackDueWake *self = nullptr;
+    PlaybackDueWake wake( nullptr, [&]() { ++fired; const double stamp = self->lastDeliveryPostFirstMs(); firedStamped = stamp >= 0.0; firedPostFirstMs = stamp; }, PlaybackDueWakeDeliveryMode::SendNotify );
+    self = &wake;
     wake.arm( 0.5 );
     ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
     wake.cancel();
@@ -2521,18 +2535,22 @@ TEST(PlaybackDueWakeSend, R2A1_AStaleSentWakeInTheRunnerSleepIsNotHeldCountedOrA
     wake.dispatchSentMessages();
     ASSERT_EQ( 0, fired );
     // variant: replaced by arm(40) -- the old generation's wake goes on to sleep, the replacement ends it and fires once
-    // r3 (adversary pass 4 A1): the replacement's own due time is asserted on EVERY judged attempt, never skipped. t starts BEFORE
-    // arm, so the replacement's 40 ms are inside what t measures whatever the scheduler did after the arm; an attempt whose arm
-    // cost reached kReplacementMaxArmCostNs is not judgeable (a pause before the arm could hide a shortened replacement): it is
-    // drained and observed again, keyed on that flag, and the test fails if no attempt could be judged
+    // r3 (adversary pass 4 A1): the replacement's own due time is asserted on EVERY judged attempt, never skipped. It is measured
+    // from before the arm to the wait thread's OWN stamp of the delivery that fired (not to when this thread looks), so a pause of
+    // this thread after the wake cannot lengthen it; an attempt whose arm cost reached kReplacementMaxArmCostNs is not judgeable
+    // (a pause before the arm could hide a shortened replacement): it is drained and observed again, keyed on that flag, and the
+    // test fails if no attempt could be judged
     bool judged = false;
     for( int attempt = 0; attempt < kReplacementAttempts && !judged; ++attempt )
     {
         fired = 0;
+        firedPostFirstMs = -1.0;
+        firedStamped = false;
         wake.resetStrandedCounts();
         wake.arm( 0.5 );
         ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
         t.restart();
+        const double preArmMs = dueWakeQpcNowMs();
         wake.arm( 40.0 );
         const qint64 armCostNs = t.nsecsElapsed();
         if( armCostNs >= kReplacementMaxArmCostNs )
@@ -2542,13 +2560,15 @@ TEST(PlaybackDueWakeSend, R2A1_AStaleSentWakeInTheRunnerSleepIsNotHeldCountedOrA
             continue;
         }
         ASSERT_TRUE( wake.sleepForSmokeRunner( 500 ) == PlaybackDueWake::RunnerSleep::WokenBySent );
-        ASSERT_TRUE( t.nsecsElapsed() >= kReplacementMinElapsedNs );   // not at the stale wake (~0 ms), at the replacement
         ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenBySent() );
         ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenOther() );
         ASSERT_EQ( 0, fired );
         wake.dispatchSentMessages();
         ASSERT_EQ( 1, fired );
         ASSERT_FALSE( wake.armed() );
+        ASSERT_TRUE( firedStamped );                               // a native delivery carries the stamp (this one fired after its publish)
+        // not at the stale wake (~0.5 ms), at the replacement's due time
+        ASSERT_TRUE( ( firedPostFirstMs - preArmMs ) * 1000000.0 >= static_cast<double>( kReplacementMinElapsedNs ) );
         judged = true;
     }
     ASSERT_TRUE( judged );                                            // never passes by skipping the bound
