@@ -466,6 +466,59 @@ TEST(ExportRenderedLookAssistWiring, PartialRemovedReflectsTheRemoval)
     ASSERT_EQ(0, countOccurrences(collapseSpaces(body), QStringLiteral(".arg(framesToExport).arg(partialPath)")));
 }
 
+namespace
+{
+
+// The number of .arg( calls that directly follow another .arg( call's closing parenthesis (a chain). String and char
+// literals are skipped, so a ')' inside "(no diagnostics)" does not end an argument list.
+int chainedArgCalls(const QString & source)
+{
+    const QString call = QStringLiteral(".arg(");
+    int chained = 0;
+    for (int at = source.indexOf(call); at >= 0; at = source.indexOf(call, at + call.size())) {
+        int depth = 0;
+        int i = at + call.size() - 1;   // the '('
+        for (; i < source.size(); ++i) {
+            const QChar c = source.at(i);
+            if (c == QLatin1Char('"') || c == QLatin1Char('\'')) {
+                for (++i; i < source.size() && source.at(i) != c; ++i)
+                    if (source.at(i) == QLatin1Char('\\')) ++i;
+                continue;
+            }
+            if (c == QLatin1Char('(')) ++depth;
+            else if (c == QLatin1Char(')') && --depth == 0) break;
+        }
+        int next = i + 1;
+        while (next < source.size() && source.at(next).isSpace()) ++next;
+        if (source.mid(next, call.size()) == call) ++chained;
+    }
+    return chained;
+}
+
+} // namespace
+
+// r5 (r4 adversary A2 on 07462a6a): a chain of .arg( calls substitutes again into what an earlier call inserted, so a
+// clip whose base name itself holds a %N placeholder lost its name and its counts in the RENDER_CANCELLED record. Every
+// BatchRunner line fills all of its placeholders in one pass, so a name or path is printed as it is.
+TEST(ExportRenderedLookAssistWiring, NoBatchLineSubstitutesIntoAnEarlierValue)
+{
+    // Why: the chain re-substitutes; one multi-arg call does not.
+    const QString name = QStringLiteral("take%1_b");
+    ASSERT_TRUE(QStringLiteral("%1 frames=0/%2 partial_removed=%3").arg(name).arg(7).arg(QStringLiteral("none"))
+                != QStringLiteral("take%1_b frames=0/7 partial_removed=none"));
+    ASSERT_TRUE(QStringLiteral("%1 frames=0/%2 partial_removed=%3").arg(name, QString::number(7), QStringLiteral("none"))
+                == QStringLiteral("take%1_b frames=0/7 partial_removed=none"));
+    // The predicate sees a chain, across lines and past a ')' inside a string, and nothing else.
+    ASSERT_EQ(1, chainedArgCalls(QStringLiteral("f(QStringLiteral(\"%1 %2\").arg(a)\n    .arg(b));")));
+    ASSERT_EQ(1, chainedArgCalls(QStringLiteral("f(QStringLiteral(\"%1 %2\").arg(x ? QStringLiteral(\"(none)\") : a).arg(b));")));
+    ASSERT_EQ(0, chainedArgCalls(QStringLiteral("f(QStringLiteral(\"%1 %2\").arg(a, QString::number(b)));")));
+    ASSERT_EQ(0, chainedArgCalls(QStringLiteral("f(QStringLiteral(\"%1\").arg(a)); g(QStringLiteral(\"%1\").arg(b));")));
+    // BatchRunner.cpp has none.
+    const QString source = batchRunnerSource();
+    ASSERT_FALSE(source.isEmpty());
+    ASSERT_EQ(0, chainedArgCalls(source));
+}
+
 // ---- ReceiptApplier (linked into console_tests, but its curve and level paths need a clip or a fault) -----------------
 
 namespace
