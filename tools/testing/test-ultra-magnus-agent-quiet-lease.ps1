@@ -5800,7 +5800,8 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                     # AGENT-JOB-MONITOR-CIM-WALK-1 r1: the walk reads ONE snapshot of the process table (-Property, no -Filter), so the slice's whole
                     # modelled cost is this one query: the worst case, a single query that alone takes the slice's whole walk time (r2: 30-85 s).
                     [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter, [string[]]$Property, [uint32]$OperationTimeoutSec)
-                    Step-RsClock $script:RsOpCost
+                    # r9 (CI red on d243ffb0): the real provider cannot answer later than the -OperationTimeoutSec the walk passes (clamped to 30 s), so the modelled query never costs more; the rest of the slice is untimed monitor work (see the foreach below).
+                    Step-RsClock $(if ($OperationTimeoutSec -gt 0) { [Math]::Min($script:RsOpCost, [double]$OperationTimeoutSec) } else { $script:RsOpCost })
                     return @(4001, 4002, 4003, 4004 | ForEach-Object { [pscustomobject]@{ ProcessId = [uint32]$_; ParentProcessId = [uint32]4000; CreationDate = $null; ExecutablePath = 'C:\x.exe'; CommandLine = 'x' } })
                 }
                 function Get-ProcessIdentity { param([int]$ProcessId) Step-RsClock $script:RsOpCost; return [pscustomobject]@{ exists = $true; processId = $ProcessId; startEpochMs = 1 } }
@@ -5830,7 +5831,12 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 foreach ($target in @($Targets)) {
                     $sliceStart = Get-Date
                     $script:RsOpCost = ($target - 5) / 1.0
+                    # r9: a walk is bounded by its one 30 s budget, so a slice longer than 35 s is the query (at most 30 s) plus untimed monitor work (no renew tick
+                    # inside it), here split around the walk: half before it, the rest after it. A renew's gap ends at its collection in this model (the fake renew
+                    # prints no record time, so no exit stamp), hence the split keeps each untimed stretch short of one cadence of ticks.
+                    Step-RsClock ([Math]::Max(0.0, ($target - 5) - [Math]::Min($script:RsOpCost, 30.0)) / 2.0)
                     $walk = if ($hasOnEach) { @(Get-DescendantProcessIdentities -ParentProcessId 4000 -OnEach { Invoke-QuietLeaseRenewTick }) } else { @(Get-DescendantProcessIdentities -ParentProcessId 4000) }
+                    Step-RsClock ([Math]::Max(0.0, ($target - 5) - ((Get-Date) - $sliceStart).TotalSeconds))   # r9: the slice's remaining walk time is untimed monitor work, no renew tick inside it
                     Invoke-QuietLeaseRenewTick
                     $gap = Get-QuietLeaseRenewOkGapSec -Lease $lease
                     Step-RsClock 5

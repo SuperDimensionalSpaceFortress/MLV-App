@@ -1370,7 +1370,7 @@ function Get-LostJobDiagnostics {
     # r8 (class sweep): -MonitorFailureNote (the "agent failed to launch or monitor job" line) is recovered the same way.
     # r8b (adversary pass 11 A9): a line counts as written when it starts with the kind's FIXED prefix and ends with the kind's token. The variable text
     # between them (a capture failure, a census why, a stop note, an exception message) is NOT matched: the err file is written as ASCII, which turns every
-    # non-ASCII character of that text into '?', so a localised message ('accès refusé') never matched its own persisted line and was recovered twice. The
+    # non-ASCII character of that text into '?', so a localised message ('acces refuse' with its accents) never matched its own persisted line and was recovered twice. The
     # token alone proves the line is the agent's (one per job and kind, never written anywhere else).
     # r8b (pass 11 A8): -CeilingNote is the STAGE_EXEMPT_CEILING_EXCEEDED line (live or adopted timeout), recovered the same way when its append was refused.
     param([string]$Stderr, $CaptureDrainFailure, $PostExitWalk, [hashtable]$Tags = $null, [string]$StopNote = '', $MonitorFailureNote = $null, [string]$CeilingNote = '')
