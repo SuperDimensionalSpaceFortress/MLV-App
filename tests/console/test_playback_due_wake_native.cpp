@@ -2618,6 +2618,7 @@ namespace {
 R17A1Windows *g_r17A1Windows = nullptr;
 double g_r17A1HandlerStartMs = 0.0;
 double g_r17A1HandlerEndMs = 0.0;
+bool g_r17A1HandlerRan = false;                                        // set by the handler itself: the observation landed
 constexpr UINT kR17A1ForeignMessage = WM_USER + 0x53;
 LRESULT CALLBACK r17A1ForeignProc( HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam )
 {
@@ -2628,6 +2629,7 @@ LRESULT CALLBACK r17A1ForeignProc( HWND hwnd, UINT message, WPARAM wParam, LPARA
         Sleep( 2 );
         if( g_r17A1Windows ) g_r17A1Windows->open = 1;
         g_r17A1HandlerEndMs = dueWakeQpcNowMs();
+        g_r17A1HandlerRan = true;
         return 0;
     }
     return DefWindowProcW( hwnd, message, wParam, lParam );
@@ -2643,7 +2645,8 @@ std::atomic<bool> g_r17A1Entered { false };
 double r17A1RecordingNowS()
 {
     const double s = dueWakeQpcNowMs() / 1000.0;
-    g_r17A1Stamps.push_back( s );
+    // never grows: capacity is reserved up front, and a read past it is dropped so the stamp-count assertion fails instead
+    if( g_r17A1Stamps.size() < g_r17A1Stamps.capacity() ) g_r17A1Stamps.push_back( s );
     g_r17A1Entered = true;
     return s;
 }
@@ -2672,7 +2675,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     // the sleep's span record: an attempt whose handler ran is judged in full below, so a product that dropped the span (or a
     // stamp, or a segment) fails here instead of being retried away. A pass can never come from a missed send.
     constexpr int kAttempts = 5;
-    g_r17A1Stamps.reserve( 16 );                                       // the clock callback must never allocate (a throw there would std::terminate the sender's join)
+    g_r17A1Stamps.reserve( 256 );                                     // the clock callback must never allocate (a throw there would std::terminate the sender's join)
     std::unique_ptr<R17A1Windows> wp;
     std::vector<std::pair<double, double>> spans;
     std::vector<double> stamps;
@@ -2691,6 +2694,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         g_r17A1Entered = false;
         g_r17A1HandlerStartMs = 0.0;
         g_r17A1HandlerEndMs = 0.0;
+        g_r17A1HandlerRan = false;
         std::atomic<bool> sent { false };
         std::thread sender( [window, &sent]() {
             const ULONGLONG giveUp = GetTickCount64() + 5000;
@@ -2707,7 +2711,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         // the handler's own stamps, taken BEFORE the drain below (which runs the handler too, when the send missed the sleep)
         handlerStartMs = g_r17A1HandlerStartMs;
         handlerEndMs = g_r17A1HandlerEndMs;
-        landed = handlerStartMs != 0.0 && handlerEndMs != 0.0;
+        landed = g_r17A1HandlerRan;
         // a send that missed the sleep is still queued: take it now (its handler sees no windows), so it cannot cut the next try
         MSG drain;
         PeekMessageW( &drain, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );
