@@ -53,6 +53,11 @@ void lj92_close(lj92 lj);
  * Starting at target, write writeLength 16bit values, then skip 16bit skipLength value before writing again
  * If linearize is not NULL, use table at linearize to convert data values from output value to target value
  * Data is only correct if LJ92_ERROR_NONE is returned
+ *
+ * Precondition (no aliasing): the compressed input passed to lj92_open and the target buffer must not share
+ * backing memory, whether through the same mapping or through two distinct mappings of the same pages.
+ * The decoder's address-range overlap check sees only same-mapping overlap (it then keeps the legacy reader); it is
+ * a defence, not part of this contract. Behaviour is undefined when the two alias through distinct mappings.
  */
 int lj92_decode(lj92 lj,
                 uint16_t* target, int writeLength, int skipLength, // The image is written to target as a tile

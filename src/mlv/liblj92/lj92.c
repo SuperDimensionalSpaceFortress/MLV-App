@@ -683,10 +683,13 @@ static LJ92_ALWAYS_INLINE int lj92_pred1_nextdiff(const u8* data, int datalen, c
 
 #ifndef SLOW_HUFF
 /* r2c (sol r1 S1): the legacy reader consumes the compressed input a byte at a time and the output is written behind
- * it, so a caller that decodes into a buffer overlapping the compressed input (lj92_decode documents no such
- * restriction) gets a defined result there. The u64 reader loads up to 8 bytes ahead of the byte it credits, so it reads
- * bytes the output has already overwritten. An output range [image, image + writelen*2) that intersects the input range
- * [data, data + datalen) therefore stays on the legacy reader. One test here covers both wrappers. */
+ * it, so a caller that decodes into a buffer overlapping the compressed input (which breaks the lj92.h precondition)
+ * still gets the legacy result there. The u64 reader loads up to 8 bytes ahead of the byte it credits, so it reads
+ * bytes the output has already overwritten. An output range [image, image + writelen*2) that intersects the input
+ * range [data, data + datalen) therefore stays on the legacy reader. One test here covers both wrappers.
+ * r2e (luna r2d): this check is a defence, not the contract. The contract is the no-aliasing precondition in lj92.h
+ * above lj92_decode. Two distinct virtual mappings of the same pages have disjoint address ranges, and portable C has
+ * no way to ask whether two addresses share physical backing, so that case is not detected here and stays undefined. */
 static int lj92_pred1_output_overlaps_input(const ljp* self)
 {
     if (self->writelen <= 0 || self->datalen <= 0) return 0;
