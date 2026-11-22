@@ -2488,7 +2488,8 @@ TEST(BatchExportFormat, FfmpegAppDirSelectionTruncatedAfterLookupIsRefusedAtPref
     ASSERT_EQ( std::string("app-dir"),
                appDirLookupText(batchRenderedVideoFfmpegBinaryPlanSearchedLocations(plan)) );
 
-    /* Explicit request naming the same (now empty) file: unchanged, isFile is the rule. */
+    /* Explicit request naming the same (now empty) file: the base rule, QFileInfo::exists, byte
+     * for byte (r3 S4: r2 had moved it to isFile, which refused an existing directory). */
     ASSERT_TRUE( batchRenderedVideoFfmpegBinaryPlanUsableAtPreflight(
         batchRenderedVideoFfmpegBinaryPlanFromRequestedName(packaged)) );
 }
@@ -2953,19 +2954,26 @@ TEST(BatchExportFormat, AppDirSpawnRetryExcludesASurvivingHardLinkOfTheDeletedFa
         ASSERT_TRUE( appDirLookupWriteFile(tools + QStringLiteral("/") + bare + QStringLiteral(".exe"),
                                            QByteArray("MZ-working")) );
         ASSERT_TRUE( appDirLookupMakeLink(alias, bad, true) );
-        /* The lookup that selected the app-dir file (it was present then). */
-        const QString selected = bare == QStringLiteral("ffmpeg")
-            ? batchRenderedVideoFfmpegBinaryPlanFromLookup(
-                  QString(), appDir, batchRenderedVideoSystemExecutableResolver()).resolvedExecutable
-            : batchRenderedVideoMediaProbeBinaryPlanFromLookup(
-                  QString(), appDir, batchRenderedVideoSystemExecutableResolver()).resolvedExecutable;
+        /* The lookup that selected the app-dir file (it was present then) took its identity. */
+        const BatchRenderedVideoFfmpegBinaryPlan ffmpegPlan =
+            batchRenderedVideoFfmpegBinaryPlanFromLookup(
+                QString(), appDir, batchRenderedVideoSystemExecutableResolver());
+        const BatchRenderedVideoMediaProbeBinaryPlan probePlan =
+            batchRenderedVideoMediaProbeBinaryPlanFromLookup(
+                QString(), appDir, batchRenderedVideoSystemExecutableResolver());
+        const bool isFfmpeg = bare == QStringLiteral("ffmpeg");
+        const QString selected = isFfmpeg ? ffmpegPlan.resolvedExecutable : probePlan.resolvedExecutable;
+        const QString identity = isFfmpeg ? ffmpegPlan.appDirFileIdentity : probePlan.appDirFileIdentity;
         ASSERT_EQ( appDirLookupText(bad), appDirLookupText(selected) );
+        ASSERT_FALSE( identity.isEmpty() );
+        ASSERT_EQ( appDirLookupText(identity),
+                   appDirLookupText(batchRenderedVideoExecutableFileIdentity(alias)) );
         ASSERT_TRUE( QFile::remove(bad) );
         const QByteArray savedPath = qgetenv("PATH");
         qputenv("PATH", (QDir::toNativeSeparators(aliasDir) + QDir::listSeparator()
                          + QDir::toNativeSeparators(tools)).toLocal8Bit());
         retries << batchRenderedVideoAppDirSpawnRetryExecutable(
-            true, true, bad, bare, batchRenderedVideoSystemExecutableResolver());
+            true, true, bad, bare, batchRenderedVideoSystemExecutableResolver(), identity);
         qputenv("PATH", savedPath);
     }
     ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffmpeg.exe")), appDirLookupText(retries.value(0)) );
@@ -2997,15 +3005,44 @@ TEST(BatchExportFormat, ExplicitFfmpegNamingAnExistingDirectoryKeepsTheBaseLaunc
             batchRenderedVideoSystemExecutableResolver())) );
 }
 
-/* r3 sol S3 (RED form, composition on the existing pieces), literal input: expected h264, ffprobe
- * exits 0 with codec_name=hevc and NO height, and the ffmpeg dump emits no facts. Some stage must
- * bind the known hevc so the mismatch is refused and the good output kept. */
+/* r3 sol S3, literal input: expected h264, ffprobe exits 0 with codec_name=hevc and NO height,
+ * and the ffmpeg dump emits no facts. The known hevc binds (so the runner refuses the mismatch
+ * and keeps the good output). Opus sweep: ffprobe `{}` then an unparseable dump binds too (an
+ * empty codec is a mismatch), never "unchecked". Unchanged: a complete JSON wins, dump facts win
+ * over an incomplete JSON, and nothing binds when no probe spoke or the output is not JSON. */
 TEST(BatchExportFormat, IncompleteProbeJsonKeepsAKnownCodecMismatchBinding)
 {
     const QByteArray json(R"({"format":{"format_name":"mov,mp4"},"streams":[{"codec_type":"video","codec_name":"hevc","width":1920}]})");
-    const BatchRenderedVideoFfmpegDumpFacts dump = batchRenderedVideoFfmpegDumpFacts(QString());
-    ASSERT_FALSE( dump.parsed );
-    ASSERT_TRUE( batchRenderedVideoMediaProbeJsonHasVideoFacts(json) || dump.parsed );
+    const BatchRenderedVideoFfmpegDumpFacts noDump = batchRenderedVideoFfmpegDumpFacts(QString());
+    ASSERT_FALSE( noDump.parsed );
+    ASSERT_FALSE( batchRenderedVideoMediaProbeJsonHasVideoFacts(json) );
+    BatchRenderedVideoFfmpegDumpFacts bound = batchRenderedVideoBindingMediaProbeFacts(true, json, noDump);
+    ASSERT_TRUE( bound.parsed );
+    ASSERT_EQ( std::string("hevc"), appDirLookupText(bound.codecName) );
+    ASSERT_TRUE( bound.codecName != QStringLiteral("h264") );
+    ASSERT_EQ( 1920, bound.width );
+    ASSERT_EQ( 0, bound.height );
+
+    bound = batchRenderedVideoBindingMediaProbeFacts(true, QByteArray("{}"),
+        batchRenderedVideoFfmpegDumpFacts(QStringLiteral("garbage, not a stream dump\n")));
+    ASSERT_TRUE( bound.parsed );
+    ASSERT_TRUE( bound.codecName.isEmpty() );
+
+    const BatchRenderedVideoFfmpegDumpFacts dump = batchRenderedVideoFfmpegDumpFacts(
+        QStringLiteral("Input #0, mov,mp4, from 'clip.mlvapp-partial.mp4':\n  Stream #0:0: Video: h264, yuv420p, 1920x1080\n"));
+    ASSERT_TRUE( dump.parsed );
+    bound = batchRenderedVideoBindingMediaProbeFacts(true, json, dump);
+    ASSERT_EQ( std::string("h264"), appDirLookupText(bound.codecName) );
+    ASSERT_EQ( 1080, bound.height );
+
+    const QByteArray complete(R"({"format":{"format_name":"mov,mp4"},"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height":1080}]})");
+    bound = batchRenderedVideoBindingMediaProbeFacts(true, complete, noDump);
+    ASSERT_TRUE( bound.parsed );
+    ASSERT_EQ( std::string("h264"), appDirLookupText(bound.codecName) );
+    ASSERT_EQ( 1080, bound.height );
+
+    ASSERT_FALSE( batchRenderedVideoBindingMediaProbeFacts(false, QByteArray(), noDump).parsed );
+    ASSERT_FALSE( batchRenderedVideoBindingMediaProbeFacts(true, QByteArray("not json"), noDump).parsed );
 }
 
 /* Adversary A4 (02742e48), literal input: an app-dir ffprobe that exits 0 and prints exactly {}

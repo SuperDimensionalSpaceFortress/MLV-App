@@ -3655,15 +3655,60 @@ QString batchRenderedVideoCommandExecutableForDisplay(
 namespace
 {
 
-/* A file that exists but is not a non-empty regular file (an empty placeholder, a directory)
- * is PROVEN unusable. A path that does not exist is not proven anything here (the caller's
- * preflight decides), so it passes through unchanged. */
+#ifdef Q_OS_WIN
+bool batchRenderedVideoIsReparsePoint(const QString & path)
+{
+    const DWORD attributes = GetFileAttributesW(
+        reinterpret_cast<const wchar_t *>(QDir::toNativeSeparators(path).utf16()));
+    return attributes != INVALID_FILE_ATTRIBUTES
+        && ( attributes & FILE_ATTRIBUTE_REPARSE_POINT ) != 0;
+}
+#endif
+
+/* A candidate binary: a regular file with content. r3 F1 (measured on Qt 6.10.2): a Windows
+ * file symlink (winget's Links\ffmpeg.exe) and an app-execution alias report QFileInfo size 0,
+ * the link's own size, yet both start; so a reparse-point file is never judged unusable by its
+ * size -- isFile() plus the start result (the spawn retry) decide it. */
+bool batchRenderedVideoNonEmptyRegularFile(const QString & path)
+{
+    if( path.isEmpty() )
+        return false;
+    const QFileInfo info(path);
+    if( !info.isFile() )
+        return false;
+    if( info.size() > 0 )
+        return true;
+#ifdef Q_OS_WIN
+    return batchRenderedVideoIsReparsePoint(path);
+#else
+    return false;
+#endif
+}
+
+/* r3 S1: on Windows a DEFAULT-request PATH pick is a directly spawnable image (.exe, .com),
+ * never a script (.bat/.cmd/.vbs) that QStandardPaths returned as the first PATHEXT hit. */
+bool batchRenderedVideoSpawnableImageName(const QString & path)
+{
+#ifdef Q_OS_WIN
+    const QString suffix = QFileInfo(path).suffix().toLower();
+    return suffix == QStringLiteral("exe") || suffix == QStringLiteral("com");
+#else
+    Q_UNUSED(path);
+    return true;
+#endif
+}
+
+/* A file that exists but is not a usable candidate (an empty placeholder, a directory, a
+ * script) is PROVEN unusable. A path that does not exist is not proven anything here (the
+ * caller's preflight decides), so it passes through unchanged. */
 bool batchRenderedVideoProvenUnusableFile(const QString & path)
 {
     if( path.trimmed().isEmpty() )
         return false;
     const QFileInfo info(path);
-    return info.exists() && ( !info.isFile() || info.size() <= 0 );
+    return info.exists()
+        && ( !batchRenderedVideoNonEmptyRegularFile(path)
+          || !batchRenderedVideoSpawnableImageName(path) );
 }
 
 /* Same file? Compared by identity (canonical path: resolves symlinks and junctions) when both
@@ -3724,11 +3769,24 @@ bool batchRenderedVideoSameExecutableFile(const QString & a, const QString & b)
 #endif
 }
 
+/* The failed file, by path AND by the identity taken while it was present (r3 S2: a surviving
+ * hard link of a deleted failed file has no path to compare with, only an identity). */
+bool batchRenderedVideoExcludedCandidate(const QString & candidate,
+                                         const QString & excluded,
+                                         const QString & excludedIdentity)
+{
+    if( batchRenderedVideoSameExecutableFile(candidate, excluded) )
+        return true;
+    return !excludedIdentity.isEmpty()
+        && batchRenderedVideoExecutableFileIdentity(candidate) == excludedIdentity;
+}
+
 /* Every PATH candidate for a bare name, in search order: each PATH directory, and within it
  * each PATHEXT suffix (Windows) -- QStandardPaths returns only the first, so a skipped first
  * candidate would otherwise end the search (r2 pass-4 A1/A3). A candidate must exist NOW as a
  * non-empty regular (on Unix: executable) file and must not be the excluded file. */
-QString batchRenderedVideoScanPathForUsableFile(const QString & name, const QString & excluded)
+QString batchRenderedVideoScanPathForUsableFile(const QString & name, const QString & excluded,
+                                                const QString & excludedIdentity)
 {
     QStringList suffixes{ QString() };
 #ifdef Q_OS_WIN
@@ -3753,14 +3811,13 @@ QString batchRenderedVideoScanPathForUsableFile(const QString & name, const QStr
         {
             const QString candidate = QDir::cleanPath(
                 QDir(QDir::fromNativeSeparators(dir)).absoluteFilePath(name + suffix));
-            const QFileInfo info(candidate);
-            if( !info.isFile() || info.size() <= 0 )
+            if( !batchRenderedVideoNonEmptyRegularFile(candidate) )
                 continue;
 #ifndef Q_OS_WIN
-            if( !info.isExecutable() )
+            if( !QFileInfo(candidate).isExecutable() )
                 continue;
 #endif
-            if( batchRenderedVideoSameExecutableFile(candidate, excluded) )
+            if( batchRenderedVideoExcludedCandidate(candidate, excluded, excludedIdentity) )
                 continue;
             return candidate;
         }
@@ -3775,13 +3832,14 @@ QString batchRenderedVideoScanPathForUsableFile(const QString & name, const QStr
 template <typename Resolve>
 QString batchRenderedVideoDefaultPathHit(const Resolve & resolve,
                                          const QString & name,
-                                         const QString & excluded = QString())
+                                         const QString & excluded = QString(),
+                                         const QString & excludedIdentity = QString())
 {
     const QString hit = resolve(name, QStringList());
     if( !batchRenderedVideoProvenUnusableFile(hit)
-     && !batchRenderedVideoSameExecutableFile(hit, excluded) )
+     && !batchRenderedVideoExcludedCandidate(hit, excluded, excludedIdentity) )
         return hit;
-    return batchRenderedVideoScanPathForUsableFile(name, excluded);
+    return batchRenderedVideoScanPathForUsableFile(name, excluded, excludedIdentity);
 }
 
 /* BATCH-FFMPEG-DEFAULT-APPDIR-LOOKUP-1. The packaged ffmpeg.exe sits beside MLVApp.exe (the
@@ -3826,6 +3884,7 @@ Plan batchRenderedVideoBinaryPlanFromLookup(
         plan.foundOnPath = false;
         plan.appDirSearchAttempted = true;
         plan.foundInAppDir = true;
+        plan.appDirFileIdentity = batchRenderedVideoExecutableFileIdentity(appDirHit);
         return plan;
     }
 
@@ -3868,12 +3927,9 @@ BatchRenderedVideoExecutableResolver batchRenderedVideoSystemExecutableResolver(
         const QString hit = QStandardPaths::findExecutable(name, searchDirs);
         /* App-dir search only (PATH keeps today's rule): a candidate must be a non-empty
          * regular file, so an empty placeholder never wins over a working PATH copy (A3). */
-        if( !searchDirs.isEmpty() && !hit.isEmpty() )
-        {
-            const QFileInfo info(hit);
-            if( !info.isFile() || info.size() <= 0 )
-                return QString();
-        }
+        if( !searchDirs.isEmpty() && !hit.isEmpty()
+         && !batchRenderedVideoNonEmptyRegularFile(hit) )
+            return QString();
         return hit;
     };
 }
@@ -3886,10 +3942,14 @@ bool batchRenderedVideoFfmpegBinaryPlanUsableAtPreflight(
      * vanished after the lookup is a usage error (exit 2), never a failed spawn (A4). */
     if( plan.foundOnPath )
         return true;
-    const QFileInfo info(plan.resolvedExecutable);
-    /* An app-dir hit keeps the lookup's non-empty rule at preflight too: one truncated to zero
-     * bytes after the lookup is refused here, not handed to the spawn (r2, A3). */
-    return info.isFile() && ( !plan.foundInAppDir || info.size() > 0 );
+    /* r3 S4: an explicit request keeps the base rule byte for byte (QFileInfo::exists): an
+     * existing directory or a macOS .app bundle passes, and a bad one fails at launch (exit 4). */
+    if( !plan.foundInAppDir )
+        return QFileInfo::exists(plan.resolvedExecutable);
+    /* An app-dir hit keeps the lookup's rule at preflight too: one truncated to zero bytes or
+     * replaced by a directory after the lookup is refused here, not handed to the spawn (r2,
+     * A3); a reparse-point file is judged by the start, not its size (r3 F1). */
+    return batchRenderedVideoNonEmptyRegularFile(plan.resolvedExecutable);
 }
 
 QString batchRenderedVideoFfmpegBinaryPlanSearchedLocations(
@@ -3906,10 +3966,7 @@ namespace
 {
 bool batchRenderedVideoUsableProbeFile(const QString & path)
 {
-    if( path.isEmpty() )
-        return false;
-    const QFileInfo info(path);
-    return info.isFile() && info.size() > 0;
+    return batchRenderedVideoNonEmptyRegularFile(path);
 }
 } /* anonymous namespace */
 
@@ -3952,20 +4009,43 @@ QString batchRenderedVideoAppDirSpawnRetryExecutable(
     bool failedToStart,
     const QString & failedExecutable,
     const QString & defaultName,
-    const BatchRenderedVideoExecutableResolver & resolver)
+    const BatchRenderedVideoExecutableResolver & resolver,
+    const QString & failedFileIdentity)
 {
     /* Only a typed start failure (QProcess::FailedToStart) of an app-dir selection; a timeout
      * or a binary that started is never retried (r2 pass-4 A6). */
     if( !foundInAppDir || !failedToStart || !resolver )
         return QString();
     /* The app dir may also be on PATH (under any spelling): the failed file is excluded by
-     * identity and the search goes on past it (r2 pass-4 A1/A2). */
-    const QString pathHit =
-        batchRenderedVideoDefaultPathHit(resolver, defaultName, failedExecutable);
-    if( !batchRenderedVideoUsableProbeFile(pathHit)
-     || batchRenderedVideoSameExecutableFile(pathHit, failedExecutable) )
+     * path and by the identity the lookup took (r2 pass-4 A1/A2, r3 S2), and the search goes
+     * on past it; a script hit is never the retry (r3 S1). */
+    const QString pathHit = batchRenderedVideoDefaultPathHit(
+        resolver, defaultName, failedExecutable, failedFileIdentity);
+    if( !batchRenderedVideoNonEmptyRegularFile(pathHit)
+     || !batchRenderedVideoSpawnableImageName(pathHit)
+     || batchRenderedVideoExcludedCandidate(pathHit, failedExecutable, failedFileIdentity) )
         return QString();
     return QDir::cleanPath(QFileInfo(pathHit).absoluteFilePath());
+}
+
+QString batchRenderedVideoExecutableFileIdentity(
+    const QString & path)
+{
+    if( path.trimmed().isEmpty() )
+        return QString();
+#ifdef Q_OS_WIN
+    unsigned long long id[2] = { 0, 0 };
+    if( !batchRenderedVideoWindowsFileId(path, id) )
+        return QString();
+    return QStringLiteral("win:%1:%2").arg(id[0]).arg(id[1]);
+#else
+    struct stat st;
+    if( ::stat(QFile::encodeName(path).constData(), &st) != 0 )
+        return QString();
+    return QStringLiteral("unix:%1:%2")
+        .arg(static_cast<qulonglong>(st.st_dev))
+        .arg(static_cast<qulonglong>(st.st_ino));
+#endif
 }
 
 BatchRenderedVideoFfmpegBinaryPlan batchRenderedVideoFfmpegBinaryPlanAfterSpawnRetry(
@@ -4020,6 +4100,41 @@ bool batchRenderedVideoMediaProbeJsonHasVideoFacts(
             && height.isDouble() && height.toInt() > 0;
     }
     return false;
+}
+
+BatchRenderedVideoFfmpegDumpFacts
+batchRenderedVideoBindingMediaProbeFacts(
+    bool probeExitedZero,
+    const QByteArray & probeJson,
+    const BatchRenderedVideoFfmpegDumpFacts & dumpFacts)
+{
+    const bool complete = batchRenderedVideoMediaProbeJsonHasVideoFacts(probeJson);
+    if( !complete && dumpFacts.parsed )
+        return dumpFacts;
+    BatchRenderedVideoFfmpegDumpFacts facts;
+    if( !complete && !probeExitedZero )
+        return facts;
+    QJsonParseError err{};
+    const QJsonDocument doc = QJsonDocument::fromJson(probeJson, &err);
+    if( err.error != QJsonParseError::NoError || !doc.isObject() )
+        return facts;   /* not JSON at all: nothing to bind (as before this card) */
+    const QJsonObject root = doc.object();
+    facts.formatNames = root.value(QStringLiteral("format")).toObject()
+                            .value(QStringLiteral("format_name")).toString();
+    for( const QJsonValue & value : root.value(QStringLiteral("streams")).toArray() )
+    {
+        const QJsonObject stream = value.toObject();
+        if( stream.value(QStringLiteral("codec_type")).toString() != QStringLiteral("video") )
+            continue;
+        facts.codecName = stream.value(QStringLiteral("codec_name")).toString();
+        facts.width = stream.value(QStringLiteral("width")).toInt();
+        facts.height = stream.value(QStringLiteral("height")).toInt();
+        facts.sampleAspectRatio = stream.value(QStringLiteral("sample_aspect_ratio")).toString();
+        facts.displayAspectRatio = stream.value(QStringLiteral("display_aspect_ratio")).toString();
+        break; /* first video stream is the one the runner wrote */
+    }
+    facts.parsed = true;
+    return facts;
 }
 
 BatchRenderedVideoMediaProbeBinaryPlan

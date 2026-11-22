@@ -508,7 +508,8 @@ int BatchRunner::exportRenderedVideoFile(
             plan.ffmpegBinaryPlan.foundInAppDir,
             pipeline.startError() == QProcess::FailedToStart,
             encoderExecutable,
-            QStringLiteral("ffmpeg"), batchRenderedVideoSystemExecutableResolver() );
+            QStringLiteral("ffmpeg"), batchRenderedVideoSystemExecutableResolver(),
+            plan.ffmpegBinaryPlan.appDirFileIdentity );
         if( !retryExecutable.isEmpty() )
         {
             BatchLogger::err(batchRenderedVideoAppDirSpawnRetryLogLine(
@@ -731,6 +732,8 @@ int BatchRunner::exportRenderedVideoFile(
     const QString probeArguments =
         batchRenderedVideoMediaProbeArgumentsWithPath( plan.mediaProbeCommandPlan,
                                                        partialPath );
+    bool probeExitedZero = false;
+    QByteArray probeJson;
     if( !probeExecutable.isEmpty() && !probeArguments.isEmpty() )
     {
         QProcess probe;
@@ -747,7 +750,8 @@ int BatchRunner::exportRenderedVideoFile(
             const QString retryProbe = batchRenderedVideoAppDirSpawnRetryExecutable(
                 probeFromAppDir, probe.error() == QProcess::FailedToStart,
                 probeExecutable, QStringLiteral("ffprobe"),
-                batchRenderedVideoSystemExecutableResolver() );
+                batchRenderedVideoSystemExecutableResolver(),
+                plan.mediaProbeBinaryPlan.appDirFileIdentity );
             if( !retryProbe.isEmpty() )
             {
                 BatchLogger::err(batchRenderedVideoAppDirSpawnRetryLogLine(
@@ -761,7 +765,9 @@ int BatchRunner::exportRenderedVideoFile(
         if( probeStarted && probe.waitForFinished( 60000 )
          && probe.exitCode() == 0 )
         {
-            facts = mediaProbeFactsFromJson( probe.readAllStandardOutput() );
+            probeExitedZero = true;
+            probeJson = probe.readAllStandardOutput();
+            facts = mediaProbeFactsFromJson( probeJson );
         }
     }
     if( !facts.parsed && !ffmpegExecutable.isEmpty() )
@@ -777,6 +783,25 @@ int BatchRunner::exportRenderedVideoFile(
             facts = mediaProbeFactsFromFfmpegDump( dump.readAllStandardError() );
             if( facts.parsed )
                 probeExecutable = ffmpegExecutable;
+        }
+    }
+    if( !facts.parsed && probeExitedZero )
+    {
+        /* r3 S3: ffprobe spoke (exit 0, a JSON object) but incompletely, and the dump gave
+         * nothing: bind what it said, fail closed -- a known hevc-for-h264 is refused and a
+         * missing field is a mismatch, never a publish marked "unchecked". */
+        const BatchRenderedVideoFfmpegDumpFacts bound = batchRenderedVideoBindingMediaProbeFacts(
+            probeExitedZero, probeJson, BatchRenderedVideoFfmpegDumpFacts() );
+        if( bound.parsed )
+        {
+            facts.parsed = true;
+            facts.codecName = bound.codecName;
+            facts.formatNames = bound.formatNames;
+            facts.width = bound.width;
+            facts.height = bound.height;
+            facts.sampleAspectRatio = bound.sampleAspectRatio;
+            facts.displayAspectRatio = bound.displayAspectRatio;
+            facts.source = QStringLiteral("ffprobe-json-incomplete");
         }
     }
     if( facts.parsed )

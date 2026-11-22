@@ -388,6 +388,9 @@ struct BatchRenderedVideoFfmpegBinaryPlan
      * sets source "app-dir" and foundInAppDir, and leaves foundOnPath false. */
     bool appDirSearchAttempted = false;
     bool foundInAppDir = false;
+    /* r3 S2: the app-dir hit's file identity, taken at lookup while the file is present, so a
+     * spawn retry can skip a surviving hard link of it even after its name is deleted. */
+    QString appDirFileIdentity;
     bool commandExecutableReady = true;
 };
 
@@ -402,6 +405,7 @@ struct BatchRenderedVideoMediaProbeBinaryPlan
     bool foundOnPath = false;
     bool appDirSearchAttempted = false;
     bool foundInAppDir = false;
+    QString appDirFileIdentity;
     bool commandExecutableReady = true;
 };
 
@@ -1597,7 +1601,15 @@ QString batchRenderedVideoAppDirSpawnRetryExecutable(
     bool failedToStart,
     const QString & failedExecutable,
     const QString & defaultName,
-    const BatchRenderedVideoExecutableResolver & resolver)
+    const BatchRenderedVideoExecutableResolver & resolver,
+    const QString & failedFileIdentity = QString())
+;
+
+/* r3 S2: a file's identity (Windows: volume serial + file index; elsewhere: device + inode),
+ * the same for every hard link, symlink or junction spelling of it. Empty when the file cannot
+ * be opened (e.g. already deleted): take it while the file is present. */
+QString batchRenderedVideoExecutableFileIdentity(
+    const QString & path)
 ;
 
 /* The ffmpeg plan after a spawn retry: a PATH plan for retryExecutable (so the optional
@@ -1737,6 +1749,18 @@ struct BatchRenderedVideoFfmpegDumpFacts
 
 BatchRenderedVideoFfmpegDumpFacts
 batchRenderedVideoFfmpegDumpFacts(const QString & dumpText)
+;
+
+/* r3 S3: the facts that bind output verification, in the runner's order: complete ffprobe
+ * JSON facts; else the ffmpeg dump's facts; else, when ffprobe ran, exited 0 and printed a JSON
+ * object, that object read as far as it goes (fail closed, as the dump parser does: a known
+ * codec is kept and a missing field reads empty/0, so it is a mismatch, never "unchecked").
+ * parsed=false only when neither probe gave anything. */
+BatchRenderedVideoFfmpegDumpFacts
+batchRenderedVideoBindingMediaProbeFacts(
+    bool probeExitedZero,
+    const QByteArray & probeJson,
+    const BatchRenderedVideoFfmpegDumpFacts & dumpFacts)
 ;
 
 /* The three spellings that all mean SQUARE PIXELS and must all pass an aspect check:
