@@ -2123,8 +2123,17 @@ TEST(BatchExportFormat, FfmpegDefaultLookupPrefersApplicationDirectory)
     }
 }
 
+static bool appDirLookupWriteFile(const QString & path, const QByteArray & bytes);
+
 TEST(BatchExportFormat, FfmpegDefaultLookupFallsBackToPathOnAppDirMiss)
 {
+    /* r4 rule (a): a PATH hit is taken only on a read made now, so the hit this test feeds is
+     * a real file (it was the never-created C:/tools/ffmpeg.exe, which now reads as vanished). */
+    QTemporaryDir toolsTemp;
+    ASSERT_TRUE( toolsTemp.isValid() );
+    const QString toolsFfmpeg = QDir::cleanPath(toolsTemp.path()) + QStringLiteral("/")
+        + appDirLookupPackagedName(QStringLiteral("ffmpeg"));
+    ASSERT_TRUE( appDirLookupWriteFile(toolsFfmpeg, QByteArray("MZ-working")) );
     QStringList calls;
     const BatchRenderedVideoFfmpegBinaryPlan plan =
         batchRenderedVideoFfmpegBinaryPlanFromLookup(
@@ -2132,7 +2141,7 @@ TEST(BatchExportFormat, FfmpegDefaultLookupFallsBackToPathOnAppDirMiss)
             QStringLiteral("C:/apps/MLVApp"),
             appDirLookupFakeResolver(
                 QString(),
-                QStringLiteral("C:/tools/ffmpeg.exe"),
+                toolsFfmpeg,
                 &calls));
     ASSERT_EQ( appDirLookupText(appDirLookupCall(QStringLiteral("ffmpeg"), QStringLiteral("C:/apps/MLVApp"))
                    + QStringLiteral("|ffmpeg@PATH")),
@@ -2144,7 +2153,7 @@ TEST(BatchExportFormat, FfmpegDefaultLookupFallsBackToPathOnAppDirMiss)
     ASSERT_EQ( appDirLookupText(batchRenderedVideoFfmpegBinaryPlanSummary(
                    batchRenderedVideoFfmpegBinaryPlanFromResolvedPath(
                        QStringLiteral("ffmpeg"),
-                       QStringLiteral("C:/tools/ffmpeg.exe")))),
+                       toolsFfmpeg))),
                appDirLookupText(batchRenderedVideoFfmpegBinaryPlanSummary(plan)) );
 }
 
@@ -3157,17 +3166,35 @@ TEST(BatchExportFormat, R4ContinuationFollowsQtSuffixOrderForASpacedPathExt)
 
 /* r4 B3: the runner's spawn-retry wiring for one failed app-dir start. `afterFailedStart` runs
  * right after the start failed (before any identity is read after it). Returns the retry
- * executable, or empty for no retry. RED FORM: BatchRunner.cpp:507-513 at 870419cb, verbatim (the
- * lookup-time identity plus one read after the failure); console tests do not link BatchRunner. */
+ * executable, or empty for no retry. The RED form (0daa60e5) was BatchRunner.cpp:507-513 of
+ * 870419cb verbatim; both runner launch sites now call batchRenderedVideoStartWithAppDirSpawnRetry,
+ * which this drives with a fake start that fails the app-dir image (FailedToStart) and starts
+ * anything else. */
 static QString r4RunnerSpawnRetry(const BatchRenderedVideoFfmpegBinaryPlan & plan,
                                   const std::function<void()> & afterFailedStart)
 {
-    afterFailedStart();
-    return batchRenderedVideoAppDirSpawnRetryExecutable(
-        plan.foundInAppDir, true, plan.resolvedExecutable, QStringLiteral("ffmpeg"),
+    QStringList starts;
+    const BatchRenderedVideoSpawnOutcome outcome = batchRenderedVideoStartWithAppDirSpawnRetry(
+        plan.foundInAppDir, plan.resolvedExecutable, QStringLiteral("ffmpeg"),
         batchRenderedVideoSystemExecutableResolver(),
-        QStringList{ plan.appDirFileIdentity,
-                     batchRenderedVideoExecutableFileIdentity( plan.resolvedExecutable ) });
+        [&plan, &afterFailedStart, &starts](const QString & executable, bool * failedToStart)
+        {
+            starts << executable;
+            if( QDir::cleanPath(executable) == QDir::cleanPath(plan.resolvedExecutable) )
+            {
+                *failedToStart = true;
+                afterFailedStart();
+                return false;
+            }
+            *failedToStart = false;
+            return true;
+        });
+    /* One start of the app-dir image, then at most one retry, which started. */
+    if( outcome.retryExecutable.isEmpty() )
+        return starts.size() == 1 && !outcome.started ? QString() : QStringLiteral("unexpected-start");
+    if( starts.size() != 2 || !outcome.started || outcome.executable != outcome.retryExecutable )
+        return QStringLiteral("unexpected-start");
+    return outcome.retryExecutable;
 }
 
 /* r4 sol r3 B3 (identity of the launched image), literal inputs. A: the lookup finds healthy A;

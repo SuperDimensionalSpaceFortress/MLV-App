@@ -1605,6 +1605,30 @@ QString batchRenderedVideoAppDirSpawnRetryExecutable(
     const QStringList & failedFileIdentities = QStringList())
 ;
 
+/* r4 B3: one start of a selected binary with the single app-dir spawn retry, shared by the
+ * encoder and the optional ffprobe launch in BatchRunner. `start` launches one executable and
+ * says whether it failed with the typed QProcess::FailedToStart; the identity of the image it
+ * launches is read immediately before that start, and only that identity (plus the failed path)
+ * is excluded from the retry search. `onRetry` (optional) runs once, before the retry starts. */
+struct BatchRenderedVideoSpawnOutcome
+{
+    bool started = false;
+    QString executable;      /* the last executable started (the retry, when there was one) */
+    QString retryExecutable; /* empty = no retry */
+};
+using BatchRenderedVideoStartFunction =
+    std::function<bool(const QString & executable, bool * failedToStart)>;
+using BatchRenderedVideoSpawnRetryNotice =
+    std::function<void(const QString & failedExecutable, const QString & retryExecutable)>;
+BatchRenderedVideoSpawnOutcome batchRenderedVideoStartWithAppDirSpawnRetry(
+    bool foundInAppDir,
+    const QString & executable,
+    const QString & defaultName,
+    const BatchRenderedVideoExecutableResolver & resolver,
+    const BatchRenderedVideoStartFunction & start,
+    const BatchRenderedVideoSpawnRetryNotice & onRetry = BatchRenderedVideoSpawnRetryNotice())
+;
+
 /* r3 S2: a file's identity (Windows: volume serial + file index; elsewhere: device + inode),
  * the same for every hard link, symlink or junction spelling of it. Empty when the file cannot
  * be opened (e.g. already deleted): take it while the file is present. */
