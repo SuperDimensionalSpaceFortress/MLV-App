@@ -284,6 +284,7 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in EXPORT_VENUE_LEGS if rel not in 
 DRIFT_LEGS = {"legs/m16-1457-drift-t4-unpaced-fullscreen-s1.json": "legs/m16-1457-headroom-unpaced-fullscreen-s1.json",
               "legs/m16-1457-drift-t8-unpaced-fullscreen-s1.json": "legs/m16-1457-headroom-unpaced-fullscreen-s1.json",
               "legs/m16-1457-drift-t12-unpaced-fullscreen-s1.json": "legs/m16-1457-headroom-unpaced-fullscreen-s1.json",
+              "legs/m16-1457-drift-t16-unpaced-fullscreen-s1.json": "legs/m16-1457-headroom-unpaced-fullscreen-s1.json",
               "legs/m16-1457-drift-pcore12-unpaced-fullscreen-s1.json": "legs/m16-1457-headroom-unpaced-fullscreen-s1.json"}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *DRIFT_LEGS)
 assert len(set(SHIPPED_LEGS)) == len(SHIPPED_LEGS), "a shipped leg is listed twice"
@@ -8219,7 +8220,7 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "M16-1457-VENUE-BASELINE-DRIFT-1":   # the thread-cap sweep and the P-core arm of the 1457 baseline-drift bench, named by arm
                 self.assertIn("legs/" + path.name, DRIFT_LEGS, path.name)
                 self.assertEqual(spec["legId"], path.stem, path.name)
-                self.assertRegex(spec["legId"], r"^m16-1457-drift-(t(4|8|12)|pcore12)-unpaced-fullscreen-s1$", path.name)
+                self.assertRegex(spec["legId"], r"^m16-1457-drift-(t(4|8|12|16)|pcore12)-unpaced-fullscreen-s1$", path.name)
                 self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
                 self.assertEqual(spec["generatorArgs"]["swapInterval"], 0, path.name)
             elif spec["card"] == "CUDA-HEADROOM-UTIL-SAMPLER-1":   # the unpaced Cinematic utilisation-sampler leg (Look Assist forced on, the owner shape), named by cell
@@ -19558,7 +19559,7 @@ class DriftLegSpecTests(unittest.TestCase):
 
     def test_each_cap_leg_is_its_source_except_the_leg_id_the_card_and_the_cap(self) -> None:
         caps = {"legs/m16-1457-drift-t4-unpaced-fullscreen-s1.json": 4, "legs/m16-1457-drift-t8-unpaced-fullscreen-s1.json": 8,
-                "legs/m16-1457-drift-t12-unpaced-fullscreen-s1.json": 12}
+                "legs/m16-1457-drift-t12-unpaced-fullscreen-s1.json": 12, "legs/m16-1457-drift-t16-unpaced-fullscreen-s1.json": 16}
         for rel, cap in caps.items():
             with self.subTest(leg=rel):
                 spec, source = self.load(rel), self.load(DRIFT_LEGS[rel])
@@ -19586,6 +19587,23 @@ class DriftLegSpecTests(unittest.TestCase):
         self.assertEqual(dict(spec, legId=source["legId"], card=source["card"]), source)
         # the bench mask and the helper mask share no logical CPU (the helper is never a bench CPU)
         self.assertEqual(int(template["generatorArgs"]["benchAffinityMask"], 16) & int(template["generatorArgs"]["corePartitionHelperMask"], 16), 0)
+
+    def test_the_sweep_names_every_cap_it_compares_and_never_leans_on_the_no_cap_headroom_leg(self) -> None:
+        """r3 adversary A2: the tracked no-cap headroom leg lets the app pick its own worker count (12 on the Bachelor host), so it is NOT a 16-worker arm.
+        Every cap the sweep compares (4, 8, 12 and 16) is its own spec carrying that cap; the no-cap leg stays the 'auto' arm."""
+        caps = {rel: self.load(rel)["generatorArgs"].get("playbackMaxThreads") for rel in DRIFT_LEGS if "-pcore" not in rel}
+        self.assertEqual(sorted(caps.values()), [4, 8, 12, 16], caps)
+        self.assertNotIn("playbackMaxThreads", self.load("legs/m16-1457-headroom-unpaced-fullscreen-s1.json")["generatorArgs"])
+
+    def test_every_drift_leg_keeps_its_sources_role_on_each_venue(self) -> None:
+        """r3 adversary A1: a card absent from venues.json roles falls to defaultRole (supplementary), so a drift leg on Bachelor would be recorded
+        supplementary while its source leg (card CUDA-HEADROOM-1) is acceptance. The drift card carries the same roles as its source's card."""
+        table = json.loads((DV / "venues.json").read_text(encoding="utf-8"))
+        for rel, source_rel in DRIFT_LEGS.items():
+            with self.subTest(leg=rel):
+                card, source_card = self.load(rel)["card"], self.load(source_rel)["card"]
+                self.assertIn(card, table["roles"], f"{card} is not in venues.json roles (it would take defaultRole {table['defaultRole']!r})")
+                self.assertEqual(table["roles"][card], table["roles"][source_card])
 
     def test_no_other_1457_headroom_leg_sets_a_cap_or_the_affinity_keys(self) -> None:
         for path in sorted((DV / "legs").glob("m16-1457-headroom-*.json")):
