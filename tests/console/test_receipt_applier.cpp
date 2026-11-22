@@ -2753,8 +2753,16 @@ struct AppDirLookupEnvironmentFixture
             + QByteArray::number(QRandomGenerator::global()->generate64())
             + QByteArrayLiteral("\n");
         written.insert(path, content);
-        const bool ok = file.write(content) == content.size();
+        const bool ok = file.write(content) == content.size() && file.flush();
         file.close();
+        if( !ok )
+        {
+            /* r8 adversary 18ebd473 A2: a short write (a full disk) leaves a partial file that
+             * this fixture created moments ago; record the bytes actually there, so cleanup
+             * still removes it instead of disowning it. */
+            QFile partial(path);
+            written.insert(path, partial.open(QIODevice::ReadOnly) ? partial.readAll() : QByteArray());
+        }
 #ifndef Q_OS_WIN
         file.setPermissions(file.permissions() | QFileDevice::ExeOwner | QFileDevice::ExeUser);
 #endif
