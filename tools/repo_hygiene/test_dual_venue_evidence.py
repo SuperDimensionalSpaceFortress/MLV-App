@@ -1724,7 +1724,7 @@ class RunnerHarness:
     def write_artifacts(self, summary: dict | None = None, manifest: dict | None = None, source_frames: dict | None | bool = True,
                         nonce: str | None = NONCE, sheet: bool = False, line: dict | None = None, observed_nonce: str | None | bool = True,
                         manifest_nonce: str | None | bool = True, log: bool = True, result: bool = True, isolated: str | None = "run_scoped",
-                        declared_log_sha: str | None = None, compose_marker: str | None = None, raw_frames: bool = False, raw_frame_count: int = 2,
+                        declared_log_sha: str | None = None, compose_marker: str | None = None, raw_frames: bool = False, raw_frame_count: int | None = None,
                         exact_summary: dict | None = None, extra_log_lines: list[str] | None = None,
                         look_assist_state: str | None = "look_assist_enabled=1") -> None:
         """Write the job's artifacts the way master's generator does, INCLUDING the run's own records the receipt is re-derived
@@ -1792,8 +1792,10 @@ class RunnerHarness:
             for stale_frame in raw.iterdir():   # (a case that asks for fewer frames must not inherit the previous case's: adversary pass-9 A9)
                 if stale_frame.is_file():
                     stale_frame.unlink()
-            # EVERY-FRAME-VISUAL-LEG-SPEC-1 r5: one PNG and its sidecar per requested frame (write_spec's look default is 2), the pairs the app publishes
-            for i in range(raw_frame_count):
+            # EVERY-FRAME-VISUAL-LEG-SPEC-1 r5: one PNG and its sidecar per requested frame, the pairs the app publishes. An explicit raw_frame_count is the caller's;
+            # with none, two pairs are written (write_spec's look default) and run_leg sizes them to the spec it is handed (sync_default_raw_frames_to_spec).
+            self._raw_frames_default = raw_frame_count is None
+            for i in range(2 if raw_frame_count is None else raw_frame_count):
                 (raw / f"frame-{i:02d}.png").write_bytes(b"\x89PNG\r\n\x1a\nraw")
                 (raw / f"frame-{i:02d}.json").write_text(json.dumps({"index": i, "saved": True, "path": f"frame-{i:02d}.png"}), encoding="utf-8")
 
@@ -1817,10 +1819,35 @@ class RunnerHarness:
             man.setdefault("buildManifest", {"name": "build.json", "sha256": build_sha})
             manifest_path.write_text(json.dumps(man), encoding="utf-8")
 
+    def sync_default_raw_frames_to_spec(self, spec: Path) -> None:
+        """EVERY-FRAME-VISUAL-LEG-SPEC-1 r5: a look leg's strip is its spec's look.contactSheetFrames pairs (frame-00 ..), so the default raw frames write_artifacts(raw_frames=True)
+        leaves are topped up to, or trimmed back to, the spec's count. Only the default pairs are touched: a count a case chose, and any frame a case wrote itself
+        (a partner with its own display_frame), is the case's own."""
+        raw = self.artifacts / "artifacts" / "contact-sheet" / "raw"
+        if not (getattr(self, "_raw_frames_default", False) and raw.is_dir()):
+            return
+        try:
+            want = json.loads(Path(spec).read_text(encoding="utf-8"))["look"]["contactSheetFrames"]
+        except (OSError, KeyError, TypeError, ValueError):
+            return
+        if not (isinstance(want, int) and not isinstance(want, bool) and 1 <= want <= 60):
+            return
+        for i in range(want):
+            if not (raw / f"frame-{i:02d}.png").exists():
+                (raw / f"frame-{i:02d}.png").write_bytes(b"\x89PNG\r\n\x1a\nraw")
+            if not (raw / f"frame-{i:02d}.json").exists():
+                (raw / f"frame-{i:02d}.json").write_text(json.dumps({"index": i, "saved": True, "path": f"frame-{i:02d}.png"}), encoding="utf-8")
+        for i in range(want, 2):
+            png, side = raw / f"frame-{i:02d}.png", raw / f"frame-{i:02d}.json"
+            if png.exists() and png.read_bytes() == b"\x89PNG\r\n\x1a\nraw":
+                png.unlink()
+                side.unlink(missing_ok=True)
+
     def run_leg(self, venue: str, spec: Path, probe: dict | None = None, main_mode: str = "capture", health_mode: str = "ok",
                 extra: list[str] | None = None, gen_refusal: str | None = None, dv: Path = DV, consent: Path | None = None,
                 token: tuple[str, int] | None = None) -> tuple[subprocess.CompletedProcess, dict | None, list[str]]:
         self.stamp_identity(venue, self.build_sha)
+        self.sync_default_raw_frames_to_spec(spec)
         if token is not None:
             main_mode = "token"
         if probe is None:

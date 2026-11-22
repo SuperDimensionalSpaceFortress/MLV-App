@@ -962,7 +962,8 @@ class PairedSeekCommittedStillSetTests(PairedStillsHarness, unittest.TestCase):
     def run_case(self, spec: Path, sidecars: list[bytes], claim: str | None = None, extra_files: dict[str, bytes] | None = None,
                  partners: list[int] | None = None):
         runner ={"dv": self.mutated_runner([("Invoke-VenueLeg.ps1", VERDICT_DONE_ANCHOR, VERDICT_DONE_ANCHOR + claim)])} if claim else {}
-        self.write_artifacts(sheet=True, raw_frames=True)
+        # EVERY-FRAME-VISUAL-LEG-SPEC-1 r5: the in-pass strip is complete (the spec's look.contactSheetFrames pairs); a case here makes only the PAUSED stills partial
+        self.write_artifacts(sheet=True, raw_frames=True, raw_frame_count=json.loads(spec.read_text(encoding="utf-8"))["look"]["contactSheetFrames"])
         self.write_seek_stills(sidecars)
         if partners is not None:
             write_in_pass_partners(self.artifacts, len(partners), frames=partners)
