@@ -2511,7 +2511,68 @@ TEST(BatchExportFormat, FfmpegDefaultLookupAcceptsASymlinkedLaunchableFfmpeg)
     ASSERT_EQ( appDirLookupText(probeLink), appDirLookupText(
         batchRenderedVideoOptionalMediaProbeExecutable(noProbe, plan)) );
 }
+
+/* r6 adversary A1 (a9dd1d9d), literal input: the app-dir ffmpeg.exe is a file SYMLINK to a real
+ * exe; after the lookup, the TARGET is truncated to zero bytes. The link itself always reports
+ * size 0, so the size of the file it resolves to decides: preflight refuses it (exit 2) and a
+ * fresh lookup no longer counts it as an app-dir hit (PATH decides). */
+TEST(BatchExportFormat, R6AppDirSymlinkWhoseTargetWasEmptiedIsRefusedAtPreflight)
+{
+    QTemporaryDir appTemp;
+    QTemporaryDir realTemp;
+    ASSERT_TRUE( appTemp.isValid() && realTemp.isValid() );
+    const QString appDir = QDir::cleanPath(appTemp.path());
+    const QString real = QDir::cleanPath(realTemp.path()) + QStringLiteral("/ffmpeg-real.exe");
+    ASSERT_TRUE( QFile::copy(QStringLiteral("C:/Windows/System32/whoami.exe"), real) );
+    const QString link = appDir + QStringLiteral("/ffmpeg.exe");
+    if( !appDirLookupMakeLink(link, real, false) )
+        SKIP_TEST("this host cannot create a file symlink (the input needs a symlink, not a hard link)");
+    ASSERT_TRUE( QFileInfo(link).isSymLink() );
+
+    const BatchRenderedVideoFfmpegBinaryPlan plan =
+        batchRenderedVideoFfmpegBinaryPlanFromLookup(
+            QString(), appDir, batchRenderedVideoSystemExecutableResolver());
+    ASSERT_TRUE( plan.foundInAppDir );
+    ASSERT_TRUE( batchRenderedVideoFfmpegBinaryPlanUsableAtPreflight(plan) );
+
+    QFile target(real);
+    ASSERT_TRUE( target.open(QIODevice::WriteOnly | QIODevice::Truncate) );
+    target.close();
+    ASSERT_EQ( static_cast<qint64>(0), QFileInfo(real).size() );
+    ASSERT_FALSE( batchRenderedVideoFfmpegBinaryPlanUsableAtPreflight(plan) );
+    ASSERT_FALSE( batchRenderedVideoFfmpegBinaryPlanFromLookup(
+        QString(), appDir, batchRenderedVideoSystemExecutableResolver()).foundInAppDir );
+}
 #endif
+
+/* r6 adversary A2 (a9dd1d9d), literal input: ffmpeg and ffprobe both resolve in the app dir;
+ * ffprobe.exe is truncated to zero bytes before the optional probe is chosen and there is no
+ * other ffprobe. The stale app-dir hit is skipped, and the sibling step (the same directory)
+ * must not take the same empty file back: one rule judges both steps. */
+TEST(BatchExportFormat, R6StaleAppDirProbeIsNotTakenBackAsTheFfmpegSibling)
+{
+    QTemporaryDir appTemp;
+    ASSERT_TRUE( appTemp.isValid() );
+    const QString appDir = QDir::cleanPath(appTemp.path());
+    const QString appFfmpeg = appDir + QStringLiteral("/ffmpeg.exe");
+    const QString appProbe = appDir + QStringLiteral("/ffprobe.exe");
+    ASSERT_TRUE( appDirLookupWriteFile(appFfmpeg, QByteArray("MZ")) );
+    ASSERT_TRUE( appDirLookupWriteFile(appProbe, QByteArray("MZ")) );
+    const BatchRenderedVideoFfmpegBinaryPlan ffmpegPlan =
+        batchRenderedVideoFfmpegBinaryPlanFromLookup(
+            QString(), appDir, appDirLookupFakeResolver(appFfmpeg, QString(), nullptr));
+    const BatchRenderedVideoMediaProbeBinaryPlan probePlan =
+        batchRenderedVideoMediaProbeBinaryPlanFromLookup(
+            QString(), appDir, appDirLookupFakeResolver(appProbe, QString(), nullptr));
+    ASSERT_TRUE( ffmpegPlan.foundInAppDir );
+    ASSERT_TRUE( probePlan.foundInAppDir );
+    ASSERT_EQ( appDirLookupText(appProbe), appDirLookupText(
+        batchRenderedVideoOptionalMediaProbeExecutable(probePlan, ffmpegPlan)) );
+
+    ASSERT_TRUE( appDirLookupWriteFile(appProbe, QByteArray()) );
+    ASSERT_EQ( std::string(), appDirLookupText(
+        batchRenderedVideoOptionalMediaProbeExecutable(probePlan, ffmpegPlan)) );
+}
 
 TEST(BatchExportFormat, MediaProbeDefaultLookupMirrorsFfmpeg)
 {
@@ -2612,8 +2673,26 @@ struct AppDirLookupEnvironmentFixture
             else
                 qunsetenv("PATH");
         }
+        /* Safety net for a failed ASSERT (a destructor must not throw): a file that cannot be
+         * removed is named on stderr, never left silently. */
+        if( !removeBesideExe() )
+        {
+            for( const QString & path : besideExe )
+                std::fprintf(stderr, "[R6-FIXTURE] could not remove %s\n", qPrintable(path));
+        }
+    }
+
+    /* r6 adversary A3: removal is checked. Each R6 test also ASSERTs it on its normal path. */
+    bool removeBesideExe()
+    {
+        QStringList remaining;
         for( const QString & path : besideExe )
-            QFile::remove(path);
+        {
+            if( QFileInfo::exists(path) && !QFile::remove(path) )
+                remaining << path;
+        }
+        besideExe = remaining;
+        return remaining.isEmpty();
     }
 
     void setPath(const QString & dir)
@@ -2668,6 +2747,9 @@ TEST(BatchExportFormat, R6DefaultLookupAppDirCopyWinsOverPathCopy)
                appDirLookupText(appDirLookupCanonical(probePlan.resolvedExecutable)) );
     ASSERT_EQ( std::string("app-dir"), appDirLookupText(plan.source) );
     ASSERT_EQ( std::string("app-dir"), appDirLookupText(probePlan.source) );
+    ASSERT_TRUE( fixture.removeBesideExe() );
+    ASSERT_FALSE( QFileInfo::exists(appFfmpeg) );
+    ASSERT_FALSE( QFileInfo::exists(appProbe) );
 }
 
 /* No copy beside the executable: the default lookup falls back to the PATH copy (the base's
@@ -2708,6 +2790,8 @@ TEST(BatchExportFormat, R6DefaultLookupWithoutAppDirCopyFallsBackToPath)
     ASSERT_TRUE( probePlan.appDirSearchAttempted );
     ASSERT_EQ( std::string("app-dir,PATH"),
                appDirLookupText(batchRenderedVideoFfmpegBinaryPlanSearchedLocations(plan)) );
+    ASSERT_FALSE( QFileInfo::exists(appFfmpeg) );
+    ASSERT_FALSE( QFileInfo::exists(appProbe) );
 }
 
 TEST(BatchExportFormat, PlansRenderedVideoMediaProbeCommandShape)
