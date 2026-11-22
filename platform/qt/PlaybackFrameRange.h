@@ -1314,7 +1314,7 @@ inline bool measuredPlayLoopShouldStop( PlayStopState state, bool stressPending,
 // A count cannot tell a frame still in flight from a DROPPED one, so the Reached wait above may let the timeline run on and a
 // source frame PAST the admitted window complete the count (the present path then stops Play on it). A present from outside the
 // admitted window is not part of the pinned capture, so the present path ALSO counts the presents whose source frame lies inside
-// the window (sourceFrameInsideAdmittedWindow; MainWindow m_playbackSmokeWindowPresentedFrames), and the capture is met only when
+// the window (sourceFrameInsideAdmittedWindow; r8: PinnedWindowPresents below, deduplicated), and the capture is met only when
 // EVERY present was inside the window and there were exactly target of them. Any present from outside the window -- the frame
 // that completed the count, or one in the middle (a seek out and back, adversary pass 6 A2 on bcac2010) -- and any raw count
 // above the target (pass 6 A1) end by the not-met path (exit 11, the unchanged `not met; target=N observed=M`), never a success.
@@ -1338,6 +1338,66 @@ inline int64_t pinnedCaptureObservedFrames( int64_t targetPresentedFrames, int64
 {
     if( windowPresentedFrames == presentedFrames ) return presentedFrames;
     return windowPresentedFrames == targetPresentedFrames ? presentedFrames : windowPresentedFrames;
+}
+
+// REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r8 (the r7 venue run on 970ef3f9: M16-1243 from frame 120, target 480, exit 11 with
+// `observed=470` and 10 presents past the window, last presented frame 609). Two defects, both fixed here:
+//  - The window started at the counter's start frame (120), which Play never presents: it is already on screen when Play starts
+//    and Play's first tick advances off it (the venue log: 120 -> 121, first Play present 121). So a run with no fault at all
+//    topped out at 479 in-window presents, and the present path, stopping on the RAW count, stopped one frame past the window.
+//  - Every-frame Play acquired the NEWEST ready frame first (see playbackAcquiresOldestReadyFirst below).
+// PinnedWindowPresents is the ONE count the present-path stop, the measured-play loop and the exit-11 check all use: the distinct
+// source frames of the pinned window that were shown. The pinned window is the N frames Play presents,
+// [pinnedWindowFirstFrame( start ), start + N] -- so presented frame N is source frame start + N, the identity the capture script
+// documents for drop-frame-off runs. A repeated present of a window frame and a present of a frame outside the window never count.
+// Armed once, before the first present, from the counter's start frame and the admitted requirement, which nothing moves during the
+// Play (a later arm is ignored). Unarmed, nothing is inside (fail closed).
+inline int64_t pinnedWindowFirstFrame( int64_t counterStartFrame ) { return counterStartFrame; }   // RED STUB: 970ef3f9's window
+struct PinnedWindowPresents
+{
+    int64_t windowStart = 0;
+    int64_t windowFrames = 0;           // 0 = not armed
+    std::vector<unsigned char> seen;    // one flag per window source frame
+    int64_t distinct = 0;               // distinct window source frames shown: the pinned count
+    int64_t outside = 0;                // presents of a source frame outside the window (never counted)
+    int64_t repeats = 0;                // presents of a window frame already counted (never counted again)
+    bool armed() const { return windowFrames > 0; }
+    void arm( int64_t firstFrame, int64_t frames )
+    {
+        if( armed() || frames <= 0 ) return;
+        windowStart = firstFrame;
+        windowFrames = frames;
+        seen.assign( static_cast<size_t>( frames ), 0 );
+    }
+    void notePresent( int64_t sourceFrame )
+    {
+        if( !sourceFrameInsideAdmittedWindow( sourceFrame, armed(), windowStart, windowFrames ) ) { ++outside; return; }
+        unsigned char &shown = seen[static_cast<size_t>( sourceFrame - windowStart )];
+        if( shown ) { ++repeats; return; }
+        shown = 1;
+        ++distinct;
+    }
+};
+// What the present-path stop and the measured-play loop count toward the target: the distinct window frames, never raw presents.
+inline int64_t pinnedPresentStopCount( const PinnedWindowPresents &w ) { return w.distinct + w.outside + w.repeats; }   // RED STUB: raw
+// The `observed` of the strict check (exit 11): pinnedCaptureObservedFrames over the counted presents (distinct window frames plus
+// out-of-window presents; repeats are neither): equal to the target only when there were exactly target distinct window frames
+// and no present outside the window.
+inline int64_t pinnedWindowObservedFrames( int64_t targetPresentedFrames, const PinnedWindowPresents &w )
+{
+    return pinnedCaptureObservedFrames( targetPresentedFrames, w.distinct + w.outside, w.distinct );
+}
+// Every-frame Play (drop-frame mode off) shows every source frame, so a ready frame never overtakes an older ready one. The
+// venue log: the frame skipped by drawFrameReady's forward-only guard was already READY when the next one finished
+// (request_state rendering 0, ready slots 1), and the acquire took the newer one first. Drop-frame Play and a paused redraw keep
+// the newest ready frame first (a stale frame there is rightly skipped).
+inline bool playbackAcquiresOldestReadyFirst( bool playing, bool dropFrameMode ) { (void)playing; (void)dropFrameMode; return false; }   // RED STUB
+// RenderFrameThread's ready-slot choice: does the ready slot with candidateSerial replace the one chosen so far (chosenSerial)?
+// Newest first is the previous rule exactly (a later serial, or an equal one, replaces).
+inline bool readySlotPreferred( bool oldestFirst, bool haveChosen, uint64_t candidateSerial, uint64_t chosenSerial )
+{
+    if( !haveChosen ) return true;
+    return oldestFirst ? candidateSerial < chosenSerial : candidateSerial >= chosenSerial;
 }
 
 inline const char *playStopFailureReason( PlayStopState state )

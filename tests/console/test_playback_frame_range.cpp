@@ -4545,3 +4545,190 @@ TEST( PlaybackMeasuredLoopExit, ASeekOutOfTheWindowOrARawCountAboveNIsNeverThePi
             ASSERT_EQ( presented == kTarget && windowPresented == kTarget, met );
         }
 }
+
+// r8 (the r7 venue run on 970ef3f9: Bachelor, clip id M16-1243, startFrame 120, gate wb_locked, target 480, exit 11 with
+// `target=480 observed=470`, `10 of 480 presents ... outside the admitted window starting at frame 120 (last presented frame 609)`).
+// The app log of that job shows every-frame Play (drop_frame=0) presenting 121..609 with 9 frames skipped by drawFrameReady's
+// forward-only guard (`draw_frame_ready.skip_backward`): 325 334 339 347 350 420 428 450 599. For each, request_state of the NEXT
+// frame's request reads render_thread_rendering_at_request=0 and ready_slot_count_at_request=1: the skipped frame was already
+// rendered and READY when the next one finished, and the acquire took the newer one first. Frame 120 was on screen when Play began
+// (paused present), and Play's first tick advances off it, so no Play present ever shows it, while r4's window [120, 599] counted it:
+// a run with no fault at all could reach only 479 in-window presents. The present path stopped Play on the RAW count (480 at frame
+// 609) while the gate judged the in-window count (470).
+// The replay: Play presents from start + 1 (`firstPlayFrame` overrides it); the playhead leads the present by kTimelineLead frames;
+// at each frame in `bothReadyAt` that frame and the next are both ready at one acquire, readySlotPreferred picks one (frames double
+// as request serials: f was requested before f + 1), the other is acquired next, and the forward-only guard skips it when it is
+// older than the frame on screen. The present-path stop is modelled as MainWindow.cpp wires it: the raw count reached the target,
+// the source frames are consumed, AND pinnedPresentStopCount reached the target.
+namespace measured_loop_r8
+{
+using playback_frame_range::PinnedWindowPresents;
+struct Replay { PinnedWindowPresents w; int64_t raw = 0; int64_t last = -1; int64_t skipped = 0; bool stopped = false;
+                int64_t stopFrame = -1; int64_t observed = 0; bool met = false; };
+constexpr int64_t kTimelineLead = 2;
+inline bool contains( const std::vector<int64_t> &v, int64_t x )
+{
+    for( const int64_t y : v ) if( y == x ) return true;
+    return false;
+}
+inline Replay replay( int64_t start, int64_t target, int64_t required, int64_t lastFrame, const std::vector<int64_t> &bothReadyAt,
+                      bool oldestFirst, int64_t firstPlayFrame = -1 )
+{
+    Replay r;
+    auto present = [&]( int64_t frame )
+    {
+        if( r.stopped ) return;
+        if( r.last >= 0 && frame < r.last ) { ++r.skipped; return; }   // drawFrameReady's forward-only guard (skip_backward)
+        r.last = frame;
+        ++r.raw;
+        r.w.arm( playback_frame_range::pinnedWindowFirstFrame( start ), required );
+        r.w.notePresent( frame );
+        const int64_t consumed = frame + kTimelineLead - start + 1;
+        if( target > 0 && r.raw >= target && consumed >= required
+         && playback_frame_range::pinnedPresentStopCount( r.w ) >= target )
+        {
+            r.stopped = true;
+            r.stopFrame = frame;
+        }
+    };
+    for( int64_t f = firstPlayFrame >= 0 ? firstPlayFrame : start + 1; f <= lastFrame && !r.stopped; ++f )
+    {
+        if( contains( bothReadyAt, f ) )
+        {
+            const bool newerFirst = playback_frame_range::readySlotPreferred( oldestFirst, true, static_cast<uint64_t>( f + 1 ),
+                                                                              static_cast<uint64_t>( f ) );
+            present( newerFirst ? f + 1 : f );
+            present( newerFirst ? f : f + 1 );
+            ++f;
+        }
+        else
+            present( f );
+    }
+    r.observed = playback_frame_range::pinnedWindowObservedFrames( target, r.w );
+    r.met = target > 0 && r.observed == target;
+    return r;
+}
+}
+
+TEST( PlaybackMeasuredLoopExit, TheVenueSequenceNeverStopsOnARawCountAndEveryFramePlayPresentsEveryWindowFrame )
+{
+    using namespace measured_loop_r8;
+    static constexpr int64_t kStart = 120, kTarget = 480, kRequired = 480;
+    const std::vector<int64_t> venuePairs = { 325, 334, 339, 347, 350, 420, 428, 450, 599 };
+
+    // 0. On r4's window [120, 599] the venue sequence is the hub's reading: 480 presents, the last at frame 609, 10 window frames
+    //    missing (120 and the nine skipped) and 10 presents past the window.
+    {
+        std::vector<int64_t> presents;
+        for( int64_t f = kStart + 1; f <= 609; ++f )
+            if( !contains( venuePairs, f ) ) presents.push_back( f );
+        int64_t inWindow = 0;
+        for( const int64_t f : presents )
+            if( playback_frame_range::sourceFrameInsideAdmittedWindow( f, true, kStart, kRequired ) ) ++inWindow;
+        ASSERT_EQ( 480, static_cast<int64_t>( presents.size() ) );
+        ASSERT_EQ( 470, inWindow );
+        ASSERT_EQ( 10, kRequired - inWindow );
+    }
+
+    // 1. The venue run as it ran (newest ready frame first). The stop must NOT fire on the raw count: 480 raw presents at frame 609,
+    //    but only 471 distinct pinned-window frames ([121, 600]: 121..600 less the nine skipped), so no present stop through 609 and
+    //    the capture is not met. 970ef3f9 stopped Play on the 480th raw present (frame 609).
+    const Replay venue = replay( kStart, kTarget, kRequired, 609, venuePairs, false );
+    ASSERT_EQ( 480, venue.raw );
+    ASSERT_EQ( 609, venue.last );
+    ASSERT_EQ( 9, venue.skipped );
+    ASSERT_TRUE( !venue.stopped );                                     // RED on 970ef3f9: the raw count stopped Play at 609
+    ASSERT_EQ( 121, venue.w.windowStart );
+    ASSERT_EQ( 471, venue.w.distinct );
+    ASSERT_EQ( 9, venue.w.outside );                                   // 601..609
+    ASSERT_EQ( 471, venue.observed );
+    ASSERT_TRUE( !venue.met );
+
+    // 2. The same ready pairs, acquired the way every-frame Play now acquires (oldest ready first): no frame is skipped, the
+    //    480th distinct pinned-window frame is 600 (= start + N, the frame the capture script names), Play stops on it, nothing
+    //    outside the window was presented, and the capture is met.
+    const bool everyFramePlayOldestFirst = playback_frame_range::playbackAcquiresOldestReadyFirst( true, false );
+    ASSERT_TRUE( everyFramePlayOldestFirst );                          // RED on 970ef3f9: the newest ready frame first
+    const Replay ordered = replay( kStart, kTarget, kRequired, 609, venuePairs, everyFramePlayOldestFirst );
+    ASSERT_EQ( 0, ordered.skipped );
+    ASSERT_TRUE( ordered.stopped );
+    ASSERT_EQ( kStart + kTarget, ordered.stopFrame );
+    ASSERT_EQ( kTarget, ordered.raw );
+    ASSERT_EQ( 0, ordered.w.outside );
+    ASSERT_EQ( 0, ordered.w.repeats );
+    ASSERT_EQ( kTarget, ordered.w.distinct );
+    ASSERT_EQ( kTarget, ordered.observed );
+    ASSERT_TRUE( ordered.met );
+
+    // 3. A perfect every-frame run (nothing ready out of order): Play presents 121..600 and that is met. On 970ef3f9 (window
+    //    [120, 599]) the 480th raw present was 600, outside its window, and only 479 counted: a run with no fault failed exit 11.
+    const Replay perfect = replay( kStart, kTarget, kRequired, 640, {}, true );
+    ASSERT_TRUE( perfect.stopped );
+    ASSERT_EQ( 600, perfect.stopFrame );
+    ASSERT_EQ( 480, perfect.raw );
+    ASSERT_EQ( 0, perfect.w.outside );
+    ASSERT_TRUE( perfect.met );
+    // and on any window start (0, 240) and lead
+    for( const int64_t start : { int64_t( 0 ), int64_t( 240 ) } )
+    {
+        const Replay p = replay( start, kTarget, kRequired, start + 700, {}, true );
+        ASSERT_TRUE( p.met );
+        ASSERT_EQ( start + kTarget, p.stopFrame );
+    }
+
+    // 4. A Play that ALSO presents the start frame (on screen already, so not part of the pinned window): it is outside the window
+    //    and the capture is not met (fail closed: observed above the target), never a success with N + 1 presents.
+    const Replay withStart = replay( kStart, kTarget, kRequired, 640, {}, true, kStart );
+    ASSERT_TRUE( withStart.stopped );
+    ASSERT_EQ( 1, withStart.w.outside );
+    ASSERT_EQ( kTarget, withStart.w.distinct );
+    ASSERT_EQ( kTarget + 1, withStart.observed );
+    ASSERT_TRUE( !withStart.met );
+
+    // 5. A repeated present of a window frame is never counted again, and a present outside the window never counts.
+    PinnedWindowPresents w;
+    w.arm( playback_frame_range::pinnedWindowFirstFrame( kStart ), kRequired );
+    ASSERT_EQ( 121, w.windowStart );
+    ASSERT_EQ( 0, w.distinct );
+    w.notePresent( 300 );
+    w.notePresent( 300 );
+    w.notePresent( 121 );
+    w.notePresent( 121 );
+    ASSERT_EQ( 2, w.distinct );
+    ASSERT_EQ( 2, w.repeats );
+    w.notePresent( 120 );
+    w.notePresent( 601 );
+    w.notePresent( 600 );
+    ASSERT_EQ( 3, w.distinct );
+    ASSERT_EQ( 2, w.outside );
+    ASSERT_EQ( 3, playback_frame_range::pinnedPresentStopCount( w ) );
+    // the arm is once: a later arm never moves the window or resets the count
+    w.arm( 0, 10 );
+    ASSERT_EQ( 121, w.windowStart );
+    ASSERT_EQ( 3, w.distinct );
+    // an unarmed ledger counts nothing inside (fail closed)
+    PinnedWindowPresents unarmed;
+    unarmed.notePresent( 121 );
+    ASSERT_EQ( 0, unarmed.distinct );
+    ASSERT_EQ( 1, unarmed.outside );
+    // N in-window frames plus an out-of-window present is never met (observed above the target, as before this round)
+    PinnedWindowPresents over;
+    over.arm( 1, 3 );
+    over.notePresent( 1 );
+    over.notePresent( 7 );
+    over.notePresent( 2 );
+    over.notePresent( 3 );
+    ASSERT_EQ( 3, over.distinct );
+    ASSERT_EQ( 4, playback_frame_range::pinnedWindowObservedFrames( 3, over ) );
+
+    // 6. The acquire order: oldest first only in every-frame Play; drop-frame Play and a paused redraw keep the newest first.
+    ASSERT_TRUE( !playback_frame_range::playbackAcquiresOldestReadyFirst( true, true ) );
+    ASSERT_TRUE( !playback_frame_range::playbackAcquiresOldestReadyFirst( false, false ) );
+    ASSERT_TRUE( !playback_frame_range::playbackAcquiresOldestReadyFirst( false, true ) );
+    ASSERT_TRUE( playback_frame_range::readySlotPreferred( true, false, 9, 0 ) );     // the first ready slot is always taken
+    ASSERT_TRUE( playback_frame_range::readySlotPreferred( false, false, 9, 0 ) );
+    ASSERT_TRUE( playback_frame_range::readySlotPreferred( true, true, 210, 211 ) );   // oldest first: 325 (serial 210) wins
+    ASSERT_TRUE( !playback_frame_range::readySlotPreferred( true, true, 211, 210 ) );
+    ASSERT_TRUE( playback_frame_range::readySlotPreferred( false, true, 211, 210 ) );  // newest first: unchanged
+    ASSERT_TRUE( !playback_frame_range::readySlotPreferred( false, true, 210, 211 ) );
+}
