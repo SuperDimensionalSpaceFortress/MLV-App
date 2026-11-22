@@ -334,4 +334,16 @@ TEST(ResizePlaybackPolicyWiring, R8EveryFramePlayAcquiresOldestFirstAndThePinned
     ASSERT_TRUE(floorAt > smokeAt);
     ASSERT_TRUE(identityAt > floorAt);
     ASSERT_TRUE(measuredPlayAt > identityAt);
+
+    // r9 (adversary pass 9 A1 on 35a85cdd): the admission's last frame is the cut range the play gate judges and the engine plays
+    // (checkPlayableWindow: spinBoxCutIn, spinBoxCutOut, the clip's frames and the collapsed-range repair unless the environment
+    // disables it), never the raw cut-out; pass 9 A8: the diagnostic identity frame is computed in 64 bits.
+    const int lastFrameAt = mainWindow.indexOf(QStringLiteral(
+        "const int pinLastFrame = playback_frame_range::pinnedAdmissionLastFrame(\n"
+        "            ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(), totalFrames, !f3CutRangeRepairDisabledByEnvironment() );"), smokeAt);
+    ASSERT_TRUE(lastFrameAt > floorAt);
+    ASSERT_TRUE(identityAt > lastFrameAt);
+    ASSERT_FALSE(mainWindow.contains(QStringLiteral("const int pinLastFrame = ( pinCutOut > 0")));
+    ASSERT_TRUE(mainWindow.indexOf(QStringLiteral("static_cast<qlonglong>( pinStartFrame ) + options.targetPresentedFrames"),
+                                   identityAt) > identityAt);
 }

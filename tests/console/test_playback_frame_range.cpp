@@ -4718,13 +4718,13 @@ TEST( PlaybackMeasuredLoopExit, TheVenueSequenceNeverStopsOnARawCountAndEveryFra
     ASSERT_EQ( 2, w.distinct );
     ASSERT_EQ( 2, w.repeats );
     ASSERT_EQ( 2, playback_frame_range::pinnedPresentStopCount( w ) );
-    w.notePresent( 120 );                                              // the start frame: a repeat (A3)
-    ASSERT_EQ( 3, w.repeats );
-    ASSERT_EQ( 0, w.outside );
+    w.notePresent( 120 );                                              // the start frame after a window present: outside (r9 A3)
+    ASSERT_EQ( 2, w.repeats );                                         // RED on eaa5c9e0: 3 (a repeat at any time)
+    ASSERT_EQ( 1, w.outside );
     w.notePresent( 601 );
     w.notePresent( 600 );
     ASSERT_EQ( 3, w.distinct );
-    ASSERT_EQ( 1, w.outside );
+    ASSERT_EQ( 2, w.outside );
     // the arm is once: a later arm never moves the window or resets the count
     w.arm( 0, 10, 10 );
     ASSERT_EQ( 121, w.windowStart );
@@ -4823,4 +4823,71 @@ TEST( PlaybackMeasuredLoopExit, R8Fix1TheCaptureEndsOnItsIdentityFrameAndNeverWa
                                                                    playback_frame_range::pinnedPresentStopCount( seeked ), 480,
                                                                    true, 481 ) );
     ASSERT_EQ( 478, playback_frame_range::pinnedWindowObservedFrames( 480, seeked ) );
+}
+
+// r9 (adversary pass 9 on 35a85cdd, route b of the REFERENCE-FRAME-PIN-BY-SOURCE-INDEX-1 design review). Each block is RED on
+// eaa5c9e0's rules (the RED stub) and green on the fix.
+TEST( PlaybackMeasuredLoopExit, R9TheAdmissionJudgesThePlayedCutRangeAndTheStartFrameIsARepeatOnlyBeforeTheWindow )
+{
+    using playback_frame_range::PinnedWindowPresents;
+    static constexpr int64_t kStart = 120, kTarget = 480, kRequired = 480;
+
+    // A1: the pinned identity admission reads the cut range the engine plays and the play gate judges (engineCutRangeForPlay with
+    //     the collapsed-range repair), never the raw cut-out. A collapsed range (cutIn == cutOut == 121) of a 1000-frame clip plays
+    //     to frame 999 with the repair on, so start 120 + 480 = 600 is admitted (master admits and plays it); with the repair off
+    //     the engine stops at the raw cut-out (last frame 120), so the pin is refused.
+    const int repairedLast = playback_frame_range::pinnedAdmissionLastFrame( 121, 121, 1000, true );
+    ASSERT_EQ( 999, repairedLast );                                    // RED on eaa5c9e0: 120 (the raw cut-out)
+    ASSERT_TRUE( playback_frame_range::pinnedIdentityFrameAdmitted( kStart, kTarget, repairedLast ) );
+    const int rawLast = playback_frame_range::pinnedAdmissionLastFrame( 121, 121, 1000, false );
+    ASSERT_EQ( 120, rawLast );
+    ASSERT_TRUE( !playback_frame_range::pinnedIdentityFrameAdmitted( kStart, kTarget, rawLast ) );
+    // the venue's range (cut-out 937) is the same either way, and admitted
+    ASSERT_EQ( 936, playback_frame_range::pinnedAdmissionLastFrame( 1, 937, 1000, true ) );
+    ASSERT_EQ( 936, playback_frame_range::pinnedAdmissionLastFrame( 1, 937, 1000, false ) );
+    ASSERT_TRUE( playback_frame_range::pinnedIdentityFrameAdmitted( kStart, kTarget, 936 ) );
+    // an inverted range the engine leaves alone (repair off: cut-out 200 before the cut-in 500) ends at the raw cut-out: refused
+    ASSERT_EQ( 199, playback_frame_range::pinnedAdmissionLastFrame( 500, 200, 1000, false ) );
+    ASSERT_TRUE( !playback_frame_range::pinnedIdentityFrameAdmitted( kStart, kTarget,
+                                                                     playback_frame_range::pinnedAdmissionLastFrame( 500, 200, 1000, false ) ) );
+    // with the repair on the gate and the engine play an inverted range to the clip end, so the admission agrees with them
+    ASSERT_EQ( 999, playback_frame_range::pinnedAdmissionLastFrame( 500, 200, 1000, true ) );
+    // no clip (an invalid range): -1, refused (fail closed)
+    ASSERT_EQ( -1, playback_frame_range::pinnedAdmissionLastFrame( 121, 121, 0, true ) );
+    ASSERT_EQ( -1, playback_frame_range::pinnedAdmissionLastFrame( 121, 121, 0, false ) );
+    ASSERT_TRUE( !playback_frame_range::pinnedIdentityFrameAdmitted( kStart, kTarget,
+                                                                     playback_frame_range::pinnedAdmissionLastFrame( 121, 121, 0, true ) ) );
+    ASSERT_TRUE( !playback_frame_range::pinnedIdentityFrameAdmitted( 0, kTarget, -1 ) );
+    // an unpinned run is still never refused
+    ASSERT_TRUE( playback_frame_range::pinnedIdentityFrameAdmitted( kStart, 0, -1 ) );
+
+    // A3: the start frame (windowStart - 1) is exempt as a repeat ONLY before the first counted present: it is the frame on screen
+    //     when Play began. After a window present, a present of it is a seek back out of the window: outside (fail closed).
+    PinnedWindowPresents scrub;
+    scrub.arm( playback_frame_range::pinnedWindowFirstFrame( kStart ), kRequired, kTarget );
+    for( int64_t f = 121; f <= 130; ++f ) scrub.notePresent( f );
+    ASSERT_EQ( 10, scrub.distinct );
+    scrub.notePresent( 120 );
+    ASSERT_EQ( 1, scrub.outside );                                     // RED on eaa5c9e0: 0 (counted as a repeat)
+    ASSERT_EQ( 0, scrub.repeats );
+    ASSERT_EQ( kTarget, playback_frame_range::pinnedPresentStopCount( scrub ) );        // a lost capture ends the wait at once
+    // kept: before any window present the start frame is a repeat, never outside
+    PinnedWindowPresents opening;
+    opening.arm( playback_frame_range::pinnedWindowFirstFrame( kStart ), kRequired, kTarget );
+    opening.notePresent( 120 );
+    ASSERT_EQ( 1, opening.repeats );
+    ASSERT_EQ( 0, opening.outside );
+    opening.notePresent( 120 );
+    ASSERT_EQ( 2, opening.repeats );
+    ASSERT_EQ( 0, opening.outside );
+    opening.notePresent( 121 );
+    ASSERT_EQ( 1, opening.distinct );
+    ASSERT_EQ( 0, opening.outside );
+    // an outside present first also ends the exemption
+    PinnedWindowPresents outsideFirst;
+    outsideFirst.arm( 121, 480, 480 );
+    outsideFirst.notePresent( 900 );
+    outsideFirst.notePresent( 120 );
+    ASSERT_EQ( 2, outsideFirst.outside );                              // RED on eaa5c9e0: 1
+    ASSERT_EQ( 0, outsideFirst.repeats );
 }

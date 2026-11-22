@@ -1505,6 +1505,14 @@ inline CutRange engineCutRangeForPlay( int cutIn, int cutOut, int totalFrames, b
     return raw;
 }
 
+// r9 RED stub: the raw cut-out (eaa5c9e0's rule), replaced by the fix.
+inline int pinnedAdmissionLastFrame( int cutIn, int cutOut, int totalFrames, bool repairEnabled )
+{
+    (void)cutIn;
+    (void)repairEnabled;
+    return ( cutOut > 0 ? std::min( totalFrames, cutOut ) : totalFrames ) - 1;
+}
+
 // evaluatePlayableWindow -- pure. positionFrame is the 0-based slider position; cutIn/cutOut are the raw
 // spinBoxCutIn/spinBoxCutOut values (1-based, Out inclusive: playbackHandling stops at slider >= cutOut-1).
 // The range is the one the engine plays (engineCutRangeForPlay; the collapsed-range repair is on unless
