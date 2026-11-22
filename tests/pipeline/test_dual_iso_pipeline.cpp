@@ -5059,6 +5059,7 @@ extern "C" int dualisoRowscaleReinitDispatchForTesting(void);
 extern "C" int dualisoRowscaleAvx2Active(void);
 extern "C" int dualisoAliasMapReinitDispatchForTesting(void);
 extern "C" int dualisoAliasMapAvx2Active(void);
+extern "C" int dualisoAliasMapRestoreDispatchForTesting(int use_avx2);
 extern "C" int dualisoAmazeReinitDispatchForTesting(void);
 extern "C" int dualisoAmazeAvx2Active(void);
 
@@ -5526,13 +5527,16 @@ TEST(DualIsoPipeline, HQ_AliasMapAvx2ByteIdentity)
 namespace {
 
 // Restores MLVAPP_DISABLE_AVX2_DUALISO_ALIAS_MAP and the alias-map dispatch on
-// every exit.
+// every exit. The dispatch is put back to the value cached at entry, not
+// recomputed from the restored environment: the environment may have changed
+// after that value was cached (r3, sol r2 hardening).
 class ScopedAliasMapDispatchEnv
 {
 public:
     ScopedAliasMapDispatchEnv()
         : had_value_(qEnvironmentVariableIsSet("MLVAPP_DISABLE_AVX2_DUALISO_ALIAS_MAP"))
         , old_value_(qgetenv("MLVAPP_DISABLE_AVX2_DUALISO_ALIAS_MAP"))
+        , old_dispatch_(dualisoAliasMapAvx2Active())
     {
     }
     ~ScopedAliasMapDispatchEnv()
@@ -5545,7 +5549,7 @@ public:
         {
             qunsetenv("MLVAPP_DISABLE_AVX2_DUALISO_ALIAS_MAP");
         }
-        dualisoAliasMapReinitDispatchForTesting();
+        dualisoAliasMapRestoreDispatchForTesting(old_dispatch_);
     }
     int set_scalar(bool scalar)
     {
@@ -5563,6 +5567,7 @@ public:
 private:
     bool had_value_;
     QByteArray old_value_;
+    int old_dispatch_;
 };
 
 struct AliasGaussFixtureRun
@@ -5669,12 +5674,16 @@ TEST(DualIsoPipeline, AliasMapGaussianSaturatesInsteadOfWrapping)
     const bool host_supports_avx2_fma = false;
 #endif
 
-    for (const Window & window : windows)
+    AliasGaussFixtureRun scalar_runs[2];
+    static_assert(sizeof(windows) / sizeof(windows[0]) == 2, "one scalar run per window");
+    for (size_t w = 0; w < 2; ++w)
     {
+        const Window & window = windows[w];
         const size_t probe = static_cast<size_t>(window.probe_y) * fx::kWidth + window.probe_x;
 
         ASSERT_EQ(0, alias_env.set_scalar(true));
-        const AliasGaussFixtureRun scalar_run = run_alias_gauss_saturation_fixture(window.raw14);
+        scalar_runs[w] = run_alias_gauss_saturation_fixture(window.raw14);
+        const AliasGaussFixtureRun & scalar_run = scalar_runs[w];
         ASSERT_EQ(1, scalar_run.rc);
         ASSERT_EQ(static_cast<size_t>(fx::kWidth * fx::kHeight), scalar_run.alias_map.size());
         std::fprintf(stderr,
@@ -5684,11 +5693,25 @@ TEST(DualIsoPipeline, AliasMapGaussianSaturatesInsteadOfWrapping)
                      static_cast<unsigned>(scalar_run.image[probe]));
         ASSERT_EQ(15000, static_cast<int>(scalar_run.alias_map[probe]));
         ASSERT_EQ(8827, static_cast<int>(scalar_run.image[probe]));
+    }
 
-        if (!host_supports_avx2_fma || alias_env.set_scalar(false) == 0)
-        {
-            continue;  // the scalar half above is the whole contract on this host
-        }
+    // The AVX2 half (the only coverage of the AVX2 vector body and of the AVX2
+    // scalar tail) is reported as a skip, never dropped silently, when it cannot
+    // run here (r3, sol r2 / opus key3 H5 hardening).
+    if (!host_supports_avx2_fma)
+    {
+        SKIP_TEST("AVX2 half not run: no GCC x86 AVX2+FMA host (the scalar half above passed)");
+    }
+    if (alias_env.set_scalar(false) == 0)
+    {
+        SKIP_TEST("AVX2 half not run: the alias-map AVX2 dispatch is disabled (MLVAPP_DISABLE_AVX2 is set; the scalar half above passed)");
+    }
+
+    for (size_t w = 0; w < 2; ++w)
+    {
+        const Window & window = windows[w];
+        const size_t probe = static_cast<size_t>(window.probe_y) * fx::kWidth + window.probe_x;
+        const AliasGaussFixtureRun & scalar_run = scalar_runs[w];
         const AliasGaussFixtureRun avx2_run = run_alias_gauss_saturation_fixture(window.raw14);
         ASSERT_EQ(1, avx2_run.rc);
         ASSERT_EQ(static_cast<size_t>(fx::kWidth * fx::kHeight), avx2_run.alias_map.size());
@@ -5702,6 +5725,63 @@ TEST(DualIsoPipeline, AliasMapGaussianSaturatesInsteadOfWrapping)
         ASSERT_TRUE(avx2_run.alias_map == scalar_run.alias_map);
         ASSERT_TRUE(avx2_run.image == scalar_run.image);
     }
+}
+
+// CUDA-SHADOW-M16-1457-FRAME-86-STAGE-DUMP-1 r3 (sol r2 hardening): the guard
+// must hand back the alias-map dispatch it found, not one recomputed from the
+// restored environment. The two can differ: the environment can change after
+// the dispatch was cached. Both orders are checked; each needs a host where
+// the cache can be 1, so a host without AVX2+FMA reports a skip.
+TEST(DualIsoPipeline, AliasMapDispatchGuardRestoresCachedDispatch)
+{
+    const bool had_override = qEnvironmentVariableIsSet("MLVAPP_DISABLE_AVX2_DUALISO_ALIAS_MAP");
+    const QByteArray old_override = qgetenv("MLVAPP_DISABLE_AVX2_DUALISO_ALIAS_MAP");
+
+    // Order 1: cache 1 with the override unset, then set it to "1" without
+    // refreshing the cache.
+    qunsetenv("MLVAPP_DISABLE_AVX2_DUALISO_ALIAS_MAP");
+    const int cached_on = dualisoAliasMapReinitDispatchForTesting();
+    qputenv("MLVAPP_DISABLE_AVX2_DUALISO_ALIAS_MAP", QByteArrayLiteral("1"));
+    {
+        ScopedAliasMapDispatchEnv guard;
+        guard.set_scalar(false);
+    }
+    const int after_on = dualisoAliasMapAvx2Active();
+    const QByteArray env_after_on = qgetenv("MLVAPP_DISABLE_AVX2_DUALISO_ALIAS_MAP");
+
+    // Order 2: cache 0 with the override "1", then unset it without refreshing.
+    const int cached_off = dualisoAliasMapReinitDispatchForTesting();
+    qunsetenv("MLVAPP_DISABLE_AVX2_DUALISO_ALIAS_MAP");
+    {
+        ScopedAliasMapDispatchEnv guard;
+        guard.set_scalar(true);
+    }
+    const int after_off = dualisoAliasMapAvx2Active();
+    const bool env_set_after_off = qEnvironmentVariableIsSet("MLVAPP_DISABLE_AVX2_DUALISO_ALIAS_MAP");
+
+    // This test's own cleanup runs before any assertion can throw.
+    if (had_override)
+    {
+        qputenv("MLVAPP_DISABLE_AVX2_DUALISO_ALIAS_MAP", old_override);
+    }
+    else
+    {
+        qunsetenv("MLVAPP_DISABLE_AVX2_DUALISO_ALIAS_MAP");
+    }
+    dualisoAliasMapReinitDispatchForTesting();
+
+    std::fprintf(stderr,
+                 "AliasMapDispatchGuardRestoresCachedDispatch: cached_on=%d after_on=%d cached_off=%d after_off=%d\n",
+                 cached_on, after_on, cached_off, after_off);
+    ASSERT_TRUE(env_after_on == QByteArrayLiteral("1"));
+    ASSERT_TRUE(!env_set_after_off);
+    ASSERT_EQ(0, cached_off);
+    ASSERT_EQ(cached_off, after_off);
+    if (cached_on == 0)
+    {
+        SKIP_TEST("the alias-map dispatch cannot cache AVX2 here (no AVX2+FMA, clang, or MLVAPP_DISABLE_AVX2 set)");
+    }
+    ASSERT_EQ(cached_on, after_on);
 }
 
 /* Byte-identity parity audit for the Phase 1B preview rowscale AVX2 kernel.

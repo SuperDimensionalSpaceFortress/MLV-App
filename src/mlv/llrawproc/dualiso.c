@@ -928,6 +928,29 @@ int dualisoAliasMapReinitDispatchForTesting(void)
     return g_dualiso_alias_use_avx2;
 }
 
+/* Test-only hook: put back a dispatch value a test saved from
+ * dualisoAliasMapAvx2Active(), without re-reading the environment (which may
+ * have changed since that value was cached). AVX2 is only set where this build
+ * has the kernels and the host supports them. Not in the public header; tests
+ * forward-declare it. */
+int dualisoAliasMapRestoreDispatchForTesting(int use_avx2);
+int dualisoAliasMapRestoreDispatchForTesting(int use_avx2)
+{
+    int restored = 0;
+    pthread_once(&g_dualiso_alias_dispatch_once, dualiso_alias_dispatch_init);
+#ifdef DUALISO_AVX2_AVAILABLE
+    if (use_avx2)
+    {
+        __builtin_cpu_init();
+        restored = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+    }
+#else
+    (void)use_avx2;
+#endif
+    g_dualiso_alias_use_avx2 = restored;
+    return g_dualiso_alias_use_avx2;
+}
+
 /* ====================================================================== *
  * Phase E1 — AMaZE edge-direction estimator AVX2 dispatch.
  *
