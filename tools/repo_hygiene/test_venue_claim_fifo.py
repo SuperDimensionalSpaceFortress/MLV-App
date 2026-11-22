@@ -2336,7 +2336,8 @@ $r = Invoke-VenueLateRelease -Venue bachelor -Nonce 'n' -ClaimDir $d -BoundSec 0
 $el = $sw.Elapsed.TotalSeconds
 $nan = $false; try { $null = Invoke-VenueLateRelease -Venue bachelor -Nonce 'n' -ClaimDir $d -BoundSec ([double]::NaN) -Call { 'BUSY' } } catch { $nan = $true }
 $neg = $false; try { $null = Invoke-VenueLateRelease -Venue bachelor -Nonce 'n' -ClaimDir $d -ProbeCapSec (-1) -Call { 'BUSY' } } catch { $neg = $true }
-$json = [pscustomobject]@{ elapsed = $el; answer = [string]$r.answer; probed = [bool]$r.probed; nanRefused = $nan; negativeRefused = $neg } | ConvertTo-Json -Compress
+$big = $false; try { $null = Invoke-VenueLateRelease -Venue bachelor -Nonce 'n' -ClaimDir $d -BoundSec 3000000 -Call { 'BUSY' } } catch { $big = $true }
+$json = [pscustomobject]@{ elapsed = $el; answer = [string]$r.answer; probed = [bool]$r.probed; nanRefused = $nan; negativeRefused = $neg; hugeRefused = $big } | ConvertTo-Json -Compress
 [Console]::Out.WriteLine($json)
 & (Get-Module VenueChain) { Complete-VenueProcess -ExitCode 0 }   # the abandoned (stalled) workers are live threads the host would wait 25 s for
 """
@@ -2347,7 +2348,11 @@ $json = [pscustomobject]@{ elapsed = $el; answer = [string]$r.answer; probed = [
         mod = self.seam_text(("    switch (Remove-VenueClaimIfUnchanged -Path $path -ExpectedNonce $Nonce -MaxAttempts $MaxAttempts) {\n",
                               "    if ($env:SEAM_STALL) { Start-Sleep -Seconds 25; return 'BUSY' }\n    switch (Remove-VenueClaimIfUnchanged -Path $path -ExpectedNonce $Nonce -MaxAttempts $MaxAttempts) {\n"))
         r = self.ps(self.A3_SCRIPT, module=mod)
-        self.assertLess(r["elapsed"], 5.0, f"the stalled release took {r['elapsed']:.1f} s (one bound per call: the 2 s start-up inside it, 4 s in all; the old code added the start-up before each wait): {r}")
+        # pass 2 A3: ONE end for the whole function (bound + call cap + probe cap = 1.0 s here); the 2 s start-up of the first worker is unavoidable (a synchronous delay in the caller), but the probe is not started at all once that
+        # end has passed, so the total is one start-up (2 s), not two (4 s)
+        self.assertLess(r["elapsed"], 3.3, f"the stalled release took {r['elapsed']:.1f} s (one end for the whole release: one 2 s start-up, the probe not started past it; the old code added the start-up before each wait, 6 s): {r}")
+        self.assertFalse(r["probed"], f"the final probe was started after the whole release's end had passed: {r}")
+        self.assertTrue(r["hugeRefused"], f"a 3,000,000 s bound was accepted (it overflowed the sleep conversion): {r}")
         self.assertTrue(r["nanRefused"], f"a NaN -BoundSec was accepted: {r}")
         self.assertTrue(r["negativeRefused"], f"a negative -ProbeCapSec was accepted: {r}")
 
@@ -2406,9 +2411,13 @@ $j = Get-Content -LiteralPath $A.path -Raw | ConvertFrom-Json
 $j.createdUtc = $null
 [IO.File]::WriteAllText($A.path, ($j | ConvertTo-Json -Compress))
 $r = Request-VenueClaim -Venue bachelor -RunDir 'run-A' -Purpose 'P' -UseTicket -ClaimDir $d
-[pscustomobject]@{ state = [string]$r.state; granted = [bool]$r.granted; ticket = [string]$r.ticket.name } | ConvertTo-Json -Compress
+$old = @(Get-VenueTickets -Venue bachelor -ClaimDir $d | Where-Object { $_.name -ceq $A.name })
+[pscustomobject]@{ state = [string]$r.state; granted = [bool]$r.granted; ticket = [string]$r.ticket.name; replaced = ($r.ticket.name -cne $A.name); oldState = $(if ($old.Count) { [string]$old[0].state } else { 'GONE' }) } | ConvertTo-Json -Compress
 """)
         self.assertTrue(r["ticket"], r)
+        # pass 2 A1: the uncarryable ticket must not stay LIVE beside its replacement (one owner/run, one live place): it is stale (unreadable) or gone
+        self.assertTrue(r["replaced"], r)
+        self.assertIn(r["oldState"], ("STALE", "GONE"), f"the ticket that could not be refreshed stayed live beside its replacement: {r}")
 
     def test_tail1_r2_pass11_a4_a_claim_poll_sleep_that_no_longer_fits_after_the_stranded_ticket_retry_is_not_started(self) -> None:
         # pass 11 A4 / pass 10 A2 (pre-existing in #878's code): the room for the poll sleep was checked BEFORE Invoke-StrandedTicketRetry, which can spend up to 5 s, and the sleep then ran whole. A foreign claim stands; ClaimPollSec is 3;
