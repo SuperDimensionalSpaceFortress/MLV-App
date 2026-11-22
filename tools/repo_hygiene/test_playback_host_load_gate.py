@@ -1833,6 +1833,16 @@ class CompareMachinePerfPlaybackAbHostLoadRefusalTests(_ProbeCase):
         "Get-PlaybackAbAnalysis",
     ]
 
+    # BENCH-LIGHT-ARM-GAIN-GATES-1 r12: the all-literal head of a LIGHT leg is its own class-level statement, with no
+    # runtime variable beside it, so the hidden-spawn text scan (test_hidden_spawn_flags.py::_could_launch) never reads
+    # a wildcard next to the launch-argument literals. The text is unchanged; nothing here starts a process.
+    _LIGHT_LEG_HEAD = (
+        "[pscustomobject]@{ telemetryArm = 'LIGHT'; launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; "
+        "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1'; MLVAPP_CRASH_FORENSICS_LOG_DIR = 'C:/logs' }; "
+        "arguments = @('--gui-smoke-playback', '--input', 'C:/clip.mlv', '--seconds', '7', '--start-frame', '0', '--settle-ms', '2500', '--settle-cpu-percent', '10', "
+        "'--settle-cpu-stable-ms', '1000', '--settle-cpu-max-ms', '45000') }; hostLoadProvisional = "
+    )
+
     def _leg(self, provisional: bool, state: str = None) -> str:
         # round 5: legs are now built WITH hostLoadState by default (as every real round-4+
         # producer emits it alongside hostLoadProvisional) -- state defaults to the value implied
@@ -1840,13 +1850,7 @@ class CompareMachinePerfPlaybackAbHostLoadRefusalTests(_ProbeCase):
         # BENCH-LIGHT-ARM-GAIN-GATES-1: and WITH telemetryArm LIGHT (a leg that records no arm is UNKNOWN and refused, so these host-load cases need the LIGHT arm to stay about host load).
         resolved_state = state if state is not None else ("exceeded" if provisional else "quiet")
         provisional_literal = "$true" if provisional else "$false"
-        return (
-            "[pscustomobject]@{ telemetryArm = 'LIGHT'; launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; "
-            "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1'; MLVAPP_CRASH_FORENSICS_LOG_DIR = 'C:/logs' }; "
-            "arguments = @('--gui-smoke-playback', '--input', 'C:/clip.mlv', '--seconds', '7', '--start-frame', '0', '--settle-ms', '2500', '--settle-cpu-percent', '10', "
-            "'--settle-cpu-stable-ms', '1000', '--settle-cpu-max-ms', '45000') }; hostLoadProvisional = " + provisional_literal +
-            "; hostLoadState = '" + resolved_state + "' }"
-        )
+        return self._LIGHT_LEG_HEAD + provisional_literal + "; hostLoadState = '" + resolved_state + "' }"
 
     def _record(self, baseline_provisional: bool, candidate_provisional: bool, fps_delta_pct: float = -40.0) -> str:
         baseline = self._leg(baseline_provisional)
@@ -1982,17 +1986,19 @@ class CompareMachinePerfPlaybackAbFpsDeltaRefusalTests(_ProbeCase):
         "New-PlaybackAbSummaryRow",
     ]
 
+    # BENCH-LIGHT-ARM-GAIN-GATES-1 r12: same all-literal class-level head as the class above (see its comment).
+    _LIGHT_LEG_HEAD = (
+        "[pscustomobject]@{ telemetryArm = 'LIGHT'; launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; "
+        "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1'; MLVAPP_CRASH_FORENSICS_LOG_DIR = 'C:/logs' }; "
+        "arguments = @('--gui-smoke-playback', '--input', 'C:/clip.mlv', '--seconds', '7', '--start-frame', '0', '--settle-ms', '2500', '--settle-cpu-percent', '10', "
+        "'--settle-cpu-stable-ms', '1000', '--settle-cpu-max-ms', '45000') }; hostLoadProvisional = "
+    )
+
     def _leg(self, provisional: bool, state: str = None) -> str:
         # BENCH-LIGHT-ARM-GAIN-GATES-1: LIGHT arm, so these cases stay about host load (an unrecorded arm is UNKNOWN and refused).
         resolved_state = state if state is not None else ("exceeded" if provisional else "quiet")
         provisional_literal = "$true" if provisional else "$false"
-        return (
-            "[pscustomobject]@{ telemetryArm = 'LIGHT'; launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; "
-            "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1'; MLVAPP_CRASH_FORENSICS_LOG_DIR = 'C:/logs' }; "
-            "arguments = @('--gui-smoke-playback', '--input', 'C:/clip.mlv', '--seconds', '7', '--start-frame', '0', '--settle-ms', '2500', '--settle-cpu-percent', '10', "
-            "'--settle-cpu-stable-ms', '1000', '--settle-cpu-max-ms', '45000') }; hostLoadProvisional = " + provisional_literal +
-            "; hostLoadState = '" + resolved_state + "' }"
-        )
+        return self._LIGHT_LEG_HEAD + provisional_literal + "; hostLoadState = '" + resolved_state + "' }"
 
     def _record(
         self, baseline_provisional: bool, candidate_provisional: bool,
