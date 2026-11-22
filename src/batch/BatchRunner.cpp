@@ -240,10 +240,6 @@ MediaProbeFacts mediaProbeFactsFromJson(const QByteArray &json)
     const QJsonDocument doc = QJsonDocument::fromJson( json, &err );
     if( err.error != QJsonParseError::NoError || !doc.isObject() )
         return facts;
-    /* A4 (r2): `{}` (or any JSON without a format object and a video stream) is not facts;
-     * leave parsed=false so the ffmpeg dump fallback still checks the file. */
-    if( !batchRenderedVideoMediaProbeJsonHasVideoFacts( json ) )
-        return facts;
 
     const QJsonObject root = doc.object();
     facts.formatNames = root.value( QStringLiteral("format") ).toObject()
@@ -301,15 +297,16 @@ MediaProbeFacts mediaProbeFactsFromFfmpegDump(const QByteArray &dump)
     return facts;
 }
 
-/* Optional enrichment only; the selection rule lives in BatchRenderedVideoPlan.cpp
- * (batchRenderedVideoOptionalMediaProbeExecutable) so the console tests pin it. Empty string
- * means "not available", and the caller degrades its REPORT, never its verdict. */
+/* Optional enrichment only. Uses the probe plan's hit (application directory, then PATH), then
+ * looks beside the resolved ffmpeg (the two ship together in every standard distribution); the
+ * rule lives in BatchRenderedVideoPlan.cpp (batchRenderedVideoOptionalMediaProbeExecutable) so
+ * the console tests pin it. Empty string means "not available", and the caller degrades its
+ * REPORT, never its verdict. */
 QString resolveOptionalMediaProbe(
     const BatchRenderedVideoMediaProbeBinaryPlan &probePlan,
     const BatchRenderedVideoFfmpegBinaryPlan &ffmpegPlan)
 {
-    return batchRenderedVideoOptionalMediaProbeExecutable(
-        probePlan, ffmpegPlan, batchRenderedVideoSystemExecutableResolver() );
+    return batchRenderedVideoOptionalMediaProbeExecutable( probePlan, ffmpegPlan );
 }
 
 } /* anonymous namespace */
@@ -492,40 +489,14 @@ int BatchRunner::exportRenderedVideoFile(
     BatchRenderCancelScope cancelScope;
 
     export_process::StreamingPipeline pipeline;
-    /* r2, A1/A3: a DEFAULT request's app-dir ffmpeg that fails to START (a bad image, or
-     * removed after preflight) is retried ONCE with the PATH ffmpeg. A binary that starts
-     * and then fails is a real encode failure and is never retried; nor is a start that
-     * timed out (typed check, A6), nor an explicit request (foundInAppDir is false). The
-     * retry excludes the identity of the image actually launched, read just before the
-     * start (r4 B3, rule (c) in BatchRenderedVideoPlan.cpp). */
-    const BatchRenderedVideoSpawnOutcome encoderSpawn = batchRenderedVideoStartWithAppDirSpawnRetry(
-        plan.ffmpegBinaryPlan.foundInAppDir,
-        plan.ffmpegCommandPlan.executable,
-        QStringLiteral("ffmpeg"), batchRenderedVideoSystemExecutableResolver(),
-        [&pipeline, &arguments]( const QString & executable, bool * failedToStart )
-        {
-            const bool ok = pipeline.start( QVector<export_process::Invocation>{
-                export_process::invocationFromTemplate( executable, arguments ) } );
-            *failedToStart = !ok && pipeline.startError() == QProcess::FailedToStart;
-            return ok;
-        },
-        [&pipeline, &baseName]( const QString & failedExecutable, const QString & retryExecutable )
-        {
-            BatchLogger::err(batchRenderedVideoAppDirSpawnRetryLogLine(
-                baseName, QStringLiteral("ffmpeg"), failedExecutable,
-                pipeline.diagnostics(), retryExecutable ));
-        } );
-    /* The encoder binary actually running; verification below uses the same one. */
-    const QString encoderExecutable = encoderSpawn.executable;
-    /* The ffmpeg plan of the encoder that ran: the optional ffprobe is looked up beside it. */
-    const BatchRenderedVideoFfmpegBinaryPlan encoderBinaryPlan =
-        batchRenderedVideoFfmpegBinaryPlanAfterSpawnRetry(
-            plan.ffmpegBinaryPlan, encoderSpawn.retryExecutable );
-    const bool encoderStarted = encoderSpawn.started;
-    if( !encoderStarted )
+    const export_process::Invocation invocation =
+        export_process::invocationFromTemplate( plan.ffmpegCommandPlan.executable,
+                                                arguments );
+
+    if( !pipeline.start( QVector<export_process::Invocation>{ invocation } ) )
     {
         BatchLogger::err(QStringLiteral("[BATCH] ERROR: BatchRunner could not start ffmpeg. clip=%1 executable=%2. %3\n")
-            .arg(baseName, encoderExecutable,
+            .arg(baseName, plan.ffmpegCommandPlan.executable,
                  pipeline.diagnostics().trimmed()));
         freeMlvObject( mlvObject );
         freeProcessingObject( processingObject );
@@ -658,7 +629,7 @@ int BatchRunner::exportRenderedVideoFile(
      * sits BEFORE the extension (`clip.mlvapp-partial.mp4`), so ffmpeg selects the same
      * demuxer it would for the final name. The publish below is then reached only by an
      * output that has passed every check. */
-    const QString ffmpegExecutable = encoderExecutable;
+    const QString ffmpegExecutable = plan.ffmpegCommandPlan.executable;
     QStringList failures;
 
     const qint64 outputBytes = QFileInfo( partialPath ).size();
@@ -722,7 +693,7 @@ int BatchRunner::exportRenderedVideoFile(
      * than degrade to `unchecked`. Either way the facts are advisory about WHICH probe
      * spoke and binding about what it said. */
     QString probeExecutable =
-        resolveOptionalMediaProbe( plan.mediaProbeBinaryPlan, encoderBinaryPlan );
+        resolveOptionalMediaProbe( plan.mediaProbeBinaryPlan, plan.ffmpegBinaryPlan );
     MediaProbeFacts facts;
     /* [B2]: the plan bakes the FINAL path into mediaProbeCommandPlan.arguments, so running
      * that string verbatim would probe the previous export on any re-run. Re-aim it at the
@@ -732,45 +703,14 @@ int BatchRunner::exportRenderedVideoFile(
     const QString probeArguments =
         batchRenderedVideoMediaProbeArgumentsWithPath( plan.mediaProbeCommandPlan,
                                                        partialPath );
-    bool probeExitedZero = false;
-    QByteArray probeJson;
-    QString jsonProbeExecutable;
-    BatchRenderedVideoFfmpegDumpFacts dumpFacts;
     if( !probeExecutable.isEmpty() && !probeArguments.isEmpty() )
     {
         QProcess probe;
-        /* r2, A1 sibling: same one-shot PATH retry for an app-dir ffprobe that fails to
-         * START; only when the probe in use IS the plan's app-dir selection, and only on a
-         * typed FailedToStart (a Timedout start is still Starting: never re-used, A6). The
-         * retry excludes the identity of the probe image actually launched (r4 B3). */
-        const bool probeFromAppDir = plan.mediaProbeBinaryPlan.foundInAppDir
-            && QDir::cleanPath( probeExecutable )
-                   == QDir::cleanPath( plan.mediaProbeBinaryPlan.resolvedExecutable );
-        const BatchRenderedVideoSpawnOutcome probeSpawn = batchRenderedVideoStartWithAppDirSpawnRetry(
-            probeFromAppDir, probeExecutable, QStringLiteral("ffprobe"),
-            batchRenderedVideoSystemExecutableResolver(),
-            [&probe, &probeArguments]( const QString & executable, bool * failedToStart )
-            {
-                probe.start( executable, QProcess::splitCommand( probeArguments ) );
-                const bool ok = probe.waitForStarted( 10000 );
-                *failedToStart = !ok && probe.error() == QProcess::FailedToStart;
-                return ok;
-            },
-            [&probe, &baseName]( const QString & failedExecutable, const QString & retryExecutable )
-            {
-                BatchLogger::err(batchRenderedVideoAppDirSpawnRetryLogLine(
-                    baseName, QStringLiteral("ffprobe"), failedExecutable,
-                    probe.errorString(), retryExecutable ));
-            } );
-        probeExecutable = probeSpawn.executable;
-        const bool probeStarted = probeSpawn.started;
-        if( probeStarted && probe.waitForFinished( 60000 )
+        probe.start( probeExecutable, QProcess::splitCommand( probeArguments ) );
+        if( probe.waitForStarted( 10000 ) && probe.waitForFinished( 60000 )
          && probe.exitCode() == 0 )
         {
-            probeExitedZero = true;
-            jsonProbeExecutable = probeExecutable;
-            probeJson = probe.readAllStandardOutput();
-            facts = mediaProbeFactsFromJson( probeJson );
+            facts = mediaProbeFactsFromJson( probe.readAllStandardOutput() );
         }
     }
     if( !facts.parsed && !ffmpegExecutable.isEmpty() )
@@ -783,33 +723,9 @@ int BatchRunner::exportRenderedVideoFile(
          * exits non-zero after printing the dump this parses. */
         if( dump.waitForStarted( 10000 ) && dump.waitForFinished( 60000 ) )
         {
-            const QByteArray dumpText = dump.readAllStandardError();
-            dumpFacts = batchRenderedVideoFfmpegDumpFacts( QString::fromUtf8( dumpText ) );
-            facts = mediaProbeFactsFromFfmpegDump( dumpText );
+            facts = mediaProbeFactsFromFfmpegDump( dump.readAllStandardError() );
             if( facts.parsed )
                 probeExecutable = ffmpegExecutable;
-        }
-    }
-    if( probeExitedZero && !batchRenderedVideoMediaProbeJsonHasVideoFacts( probeJson )
-     && QJsonDocument::fromJson( probeJson ).isObject() )
-    {
-        /* r3 S3 / pass-6 A6: ffprobe spoke (exit 0, a JSON object) but incompletely. Every
-         * fact it stated binds, fail closed -- a known hevc-for-h264 or a 16:15 SAR is refused
-         * even when the dump reads clean; the dump only fills the fields ffprobe left out, and a
-         * field neither gave is a mismatch, never a publish marked "unchecked". */
-        const BatchRenderedVideoFfmpegDumpFacts bound = batchRenderedVideoBindingMediaProbeFacts(
-            probeExitedZero, probeJson, dumpFacts );
-        if( bound.parsed )
-        {
-            facts.parsed = true;
-            facts.codecName = bound.codecName;
-            facts.formatNames = bound.formatNames;
-            facts.width = bound.width;
-            facts.height = bound.height;
-            facts.sampleAspectRatio = bound.sampleAspectRatio;
-            facts.displayAspectRatio = bound.displayAspectRatio;
-            facts.source = QStringLiteral("ffprobe-json-incomplete");
-            probeExecutable = jsonProbeExecutable;
         }
     }
     if( facts.parsed )
