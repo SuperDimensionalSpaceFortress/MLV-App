@@ -4015,6 +4015,66 @@ namespace MlvTest {
     Assert-That ($r.Thrown -match 'our value was taken back' -and $r.Thrown -match 'cannot tell an identical value that another run wrote from ours') 'SSH-PUSHURL-1 r4 A1 setup: the take-back message says git config cannot tell an identical value another run wrote from ours' $r.Thrown
 }
 
+# ================================================================ IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 r1: a replace never goes on after its safety net failed
+# Two ways Import replaced a host file although the thing that protects it was missing or damaged: (1) the pre-import backup of ~/.claude CLAUDE.md / settings.json could not be
+# made (a write failure, a held host file, an unwritable backups folder) and the copy went on to replace the same file with no backup; (2) the bundle zip was truncated, tar
+# exited non-zero after leaving a partly written file in the expanded folder, and Import copied that partial tree. Both now refuse with a typed record and a non-zero exit, and
+# the host file stays byte for byte as it was. In-process (the dot-sourced script, scratch HOME / state / workspace), so the backup folder's name (it carries the stamp) is known.
+function Invoke-R1Import([string]$Tag, [string]$Bundle, [scriptblock]$Prepare) {
+    $ws = New-Scratch "$Tag-ws"; $st = New-Scratch "$Tag-state"; $hm = New-Scratch "$Tag-home"; $tmp = New-Scratch "$Tag-mlvtmp"
+    $hostClaude = Join-Path $hm '.claude\CLAUDE.md'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $hostClaude) | Out-Null
+    [IO.File]::WriteAllText($hostClaude, 'HOST-GOOD-CONTENT')
+    (Get-Item -LiteralPath $hostClaude).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-3)
+    $sv = @{ S = $script:StateRoot; B = $script:BundlePath; R = $script:Repo; T = $script:MlvTmp; L = $script:LogFile; E = $env:USERPROFILE; P = $script:stamp; W = $script:Workspace }
+    $script:StateRoot = $st; $StateRoot = $st; $script:BundlePath = $Bundle; $BundlePath = $Bundle; $script:Repo = (Join-Path $ws 'MLV-App'); $Repo = $script:Repo
+    $script:MlvTmp = $tmp; $MlvTmp = $tmp; $script:LogFile = Join-Path $ws 'r1.log'; $script:stamp = "r1$Tag"; $stamp = $script:stamp; $env:USERPROFILE = $hm
+    $script:Failures.Clear()
+    $out = ''
+    try {
+        if ($Prepare) { & $Prepare $st $script:stamp }
+        try { $out = (Invoke-PhaseImport *>&1 | Out-String) } catch { $out += "THROWN: $($_.Exception.Message)" }
+    } finally {
+        $script:StateRoot = $sv.S; $StateRoot = $sv.S; $script:BundlePath = $sv.B; $BundlePath = $sv.B; $script:Repo = $sv.R; $Repo = $sv.R; $script:MlvTmp = $sv.T; $MlvTmp = $sv.T
+        $script:LogFile = $sv.L; $script:stamp = $sv.P; $stamp = $sv.P; $env:USERPROFILE = $sv.E
+    }
+    return @{ Host = [IO.File]::ReadAllText($hostClaude); Failures = @($script:Failures); Out = $out }
+}
+if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r1 import backup')) {
+    Add-Type -AssemblyName System.IO.Compression
+    $r1bundle = New-Scratch 'r1-bundle'
+    [IO.File]::WriteAllText((Join-Path $r1bundle 'MANIFEST.txt'), 'mlv-migrate-bundle v1')
+    New-Item -ItemType Directory -Force -Path (Join-Path $r1bundle 'home-claude') | Out-Null
+    [IO.File]::WriteAllText((Join-Path $r1bundle 'home-claude\CLAUDE.md'), 'FROM-BUNDLE')
+    # (1a) the backup of THIS file cannot be written (a folder stands where the backup file would go): the host file is not replaced
+    $r1a = Invoke-R1Import 'a' $r1bundle { param($st, $sp) [void][IO.Directory]::CreateDirectory((Join-Path $st "backups\home-claude-$sp\CLAUDE.md")) }
+    Assert-That ($r1a.Host -ceq 'HOST-GOOD-CONTENT') 'r1 import: a host CLAUDE.md whose backup could not be written is NOT replaced (byte-identical)' "host=[$($r1a.Host)]`n$($r1a.Out)"
+    Assert-That (@($r1a.Failures | Where-Object { $_ -like 'IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED*CLAUDE.md*' }).Count -eq 1) 'r1 import: the refusal is a typed failure (IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED <path>; the run exits non-zero)' ($r1a.Failures -join ',')
+    # (1b) the backup FOLDER cannot be made at all (a file stands where backups\ should be): nothing is backed up, so no backed-up file is replaced
+    $r1b = Invoke-R1Import 'b' $r1bundle { param($st, $sp) [IO.File]::WriteAllText((Join-Path $st 'backups'), 'not a folder') }
+    Assert-That ($r1b.Host -ceq 'HOST-GOOD-CONTENT') 'r1 import: a host CLAUDE.md is NOT replaced when the backup folder cannot be made (byte-identical)' "host=[$($r1b.Host)]`n$($r1b.Out)"
+    Assert-That (@($r1b.Failures | Where-Object { $_ -like 'IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED*CLAUDE.md*' }).Count -eq 1) 'r1 import: the unmakeable backup folder gives the same typed failure' ($r1b.Failures -join ',')
+    # (1c) control: a backup that works still lets the newer bundle file replace the older host file
+    $r1c = Invoke-R1Import 'c' $r1bundle $null
+    Assert-That ($r1c.Host -ceq 'FROM-BUNDLE' -and $r1c.Failures.Count -eq 0) 'r1 import control: with a working backup the newer bundle CLAUDE.md still replaces the older host file' "host=[$($r1c.Host)] failures=$($r1c.Failures -join ',')`n$($r1c.Out)"
+    # (2) a truncated bundle zip: tar leaves a partly written CLAUDE.md and exits non-zero; nothing is copied from that tree
+    $r1zip = Join-Path (New-Scratch 'r1-zip') 'bundle.zip'
+    $r1rnd = [Text.Encoding]::ASCII.GetBytes(('plain instruction line for the claude home file' + "`n") * 8200)   # about 400 KB of plain text, stored (not compressed), so a cut lands inside it
+    $r1fs = [IO.File]::Create($r1zip)
+    try {
+        $r1za = [IO.Compression.ZipArchive]::new($r1fs, [IO.Compression.ZipArchiveMode]::Create, $true)
+        try {
+            foreach ($r1e in @(@('MANIFEST.txt', [Text.Encoding]::ASCII.GetBytes('mlv-migrate-bundle v1')), @('home-claude/CLAUDE.md', $r1rnd))) {
+                $r1en = $r1za.CreateEntry($r1e[0], [IO.Compression.CompressionLevel]::NoCompression); $r1es = $r1en.Open(); try { $r1es.Write($r1e[1], 0, $r1e[1].Length) } finally { $r1es.Dispose() }
+            }
+        } finally { $r1za.Dispose() }
+    } finally { $r1fs.Dispose() }
+    $r1all = [IO.File]::ReadAllBytes($r1zip); $r1cut = [byte[]]::new([int]($r1all.Length * 0.6)); [Array]::Copy($r1all, $r1cut, $r1cut.Length); [IO.File]::WriteAllBytes($r1zip, $r1cut)
+    $r1d = Invoke-R1Import 'd' $r1zip $null
+    Assert-That ($r1d.Host -ceq 'HOST-GOOD-CONTENT') 'r1 import: a truncated bundle zip replaces nothing (the host CLAUDE.md is byte-identical)' "host length=$($r1d.Host.Length)`n$($r1d.Out)"
+    Assert-That (@($r1d.Failures | Where-Object { $_ -like 'IMPORT_BUNDLE_EXPAND_FAILED*' }).Count -eq 1) 'r1 import: a truncated bundle zip is a typed failure (IMPORT_BUNDLE_EXPAND_FAILED <path>; the run exits non-zero)' ($r1d.Failures -join ',')
+}
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 
