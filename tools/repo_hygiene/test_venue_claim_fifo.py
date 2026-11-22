@@ -2409,6 +2409,30 @@ $r = Request-VenueClaim -Venue bachelor -RunDir 'run-A' -Purpose 'P' -UseTicket 
 """)
         self.assertTrue(r["ticket"], r)
 
+    def test_tail1_r2_pass11_a4_a_claim_poll_sleep_that_no_longer_fits_after_the_stranded_ticket_retry_is_not_started(self) -> None:
+        # pass 11 A4 / pass 10 A2 (pre-existing in #878's code): the room for the poll sleep was checked BEFORE Invoke-StrandedTicketRetry, which can spend up to 5 s, and the sleep then ran whole. A foreign claim stands; ClaimPollSec is 3;
+        # the seam makes the retry take the batch to 1.5 s before -DeadlineUtc, so the 3 s sleep no longer fits: the batch must end DEADLINE at once, not 1.5 s past the deadline.
+        import shutil
+        s = self.sleeper()
+        foreign = self.ps(f"$r = Request-VenueClaim -Venue bachelor -RunDir 'run-foreign' -Purpose foreign -TtlSec 3600 -ClaimDir $d -OwnerPid {s.pid}\n[pscustomobject]@{{ granted = [bool]$r.granted }} | ConvertTo-Json -Compress")
+        self.assertTrue(foreign["granted"])
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=14)).replace(microsecond=0)
+        text = LEASE_RUNNER.read_text(encoding="utf-8")
+        anchor = "        Invoke-StrandedTicketRetry 'claim-wait'\n"
+        self.assertEqual(text.count(anchor), 1, "stranded-retry seam anchor moved")
+        seam = anchor + "        if ($env:SEAM_STRAND_UNTIL_UTC) { $u = [DateTime]::Parse($env:SEAM_STRAND_UNTIL_UTC, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind); while ([DateTime]::UtcNow -lt $u) { Start-Sleep -Milliseconds 20 }; $env:SEAM_STRAND_UNTIL_UTC = '' }\n"
+        runner = copy_with_siblings(LEASE_RUNNER, Path(tempfile.mkdtemp(prefix="strand-", dir=self.case)), text.replace(anchor, seam))
+        (runner.parent.parent / "bachelor").mkdir(exist_ok=True)
+        shutil.copy2(DV.parent / "bachelor" / "ultra-magnus-agent.ps1", runner.parent.parent / "bachelor" / "ultra-magnus-agent.ps1")
+        until = deadline - timedelta(milliseconds=1500)
+        p = self.start_batch("S", claim_poll=3, runner=runner, deadline_utc=deadline, SEAM_STRAND_UNTIL_UTC=until.strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
+        p.wait(timeout=120)
+        ended = datetime.now(timezone.utc)
+        out = Path(p.out_path).read_text(encoding="utf-8", errors="replace")   # type: ignore[attr-defined]
+        self.assertEqual(p.returncode, 3, f"the batch must end DEADLINE (exit 3):\n{self.batch_log(p)}\n{out}")
+        past = (ended - deadline).total_seconds()
+        self.assertLess(past, 1.0, f"the batch ended {past:.2f} s past -DeadlineUtc: a poll sleep that no longer fit was started after the stranded retry:\n{self.batch_log(p)}")
+
     def give_back_scenario(self, name: str, release_seam: str, env: dict) -> dict:
         # the A7 line-up (B takes the claim as head while A is in cooldown, A flips to waiting while B holds it, so B must give the claim back), with ONE seam inside the give-back
         from unittest import mock
