@@ -75,6 +75,8 @@ $script:FpsLightEnv = @(
     New-FpsAllow 'MLVAPP_GPU_PLAYBACK_RECON_BACKEND' 'env' 'exact:cuda'                # job:3055  (producer cite, alias table in header)
     New-FpsAllow 'MLVAPP_GPU_PLAYBACK_RECON_DLL' 'env' 'text'                          # job:3056  (producer cite, alias table in header)
     New-FpsAllow 'MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D' 'env' 'exact:0'                 # job:3057  (producer cite, alias table in header)
+    # r14 (adversary r14 pass 18 A4, DISTINGUISHED): the CUDA A/B wrapper's own speed leg sets the recon output validator to 0, a name this table deliberately does not carry (r8: UNKNOWN at any
+    # value, pinned by test_the_recon_output_validation_flag_is_outside_the_light_shape); making the wrapper's legs LIGHT is the queued successor BENCH-WRAPPER-LIGHT-ENV-1, not a row here.
     New-FpsAllow 'MLVAPP_EXPERIMENTAL_GPU_PROCESSING' 'env' 'exact:1'                  # job:3058  (producer cite, alias table in header)
     New-FpsAllow 'MLVAPP_EXPERIMENTAL_GPU_AMAZE_DEBAYER' 'env' 'exact:1'               # job:3059  (producer cite, alias table in header)
     New-FpsAllow 'MLVAPP_EXPERIMENTAL_GL_WINDOW_VIEWPORT' 'env' 'exact:1'              # job:3060  (producer cite, alias table in header)
@@ -488,6 +490,11 @@ function Get-FpsArmFromSmokeRecord {
     if ($arm.arm -ceq 'LIGHT') {
         $problem = Get-FpsRecordLightProblem $Record
         if ($null -ne $problem) { return New-FpsArm 'UNKNOWN' 'environment' "the recorded launch reads LIGHT but $problem" }
+        # r14 (adversary r14 pass 18 A2): the smoke runner's result carries no arm word, so one that does must agree with its launch; telemetryArm HEAVY (or anything but LIGHT) beside a
+        # LIGHT launch is contradictory evidence, never a LIGHT the derived arm overrides.
+        if ((Test-FaHasProp $Record 'telemetryArm') -and (ConvertTo-FpsArmName (Get-FaProp $Record 'telemetryArm')) -cne 'LIGHT') {
+            return New-FpsArm 'UNKNOWN' 'environment' 'the recorded launch reads LIGHT but the record names a telemetryArm that is not LIGHT'
+        }
     }
     $arm
 }

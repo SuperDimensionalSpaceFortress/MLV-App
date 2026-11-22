@@ -812,6 +812,13 @@ class CudaPlaybackAbRequireImprovementBlockTests(_Probe):
             f"Write-Host ('OC=' + (Get-SmokeSummaryTelemetryArm ([pscustomobject]@{{ observerControls = [pscustomobject]@{{ utilSample = $true }}; {launch} }})).arm)\n"
             f"Write-Host ('SWITCH=' + (Get-SmokeSummaryTelemetryArm ([pscustomobject]@{{ firstPresentCapture = $true; {launch} }})).arm)\n")
         self.assertEqual(out.split(), ["PLAIN=LIGHT", "OC=UNKNOWN", "SWITCH=UNKNOWN"])
+        # adversary r14 pass 18 A2: a smoke result that names a telemetryArm other than LIGHT beside a LIGHT launch is contradictory evidence (the runner's own result names no arm)
+        out = self.ok(
+            f"Write-Host ('HEAVYWORD=' + (Get-SmokeSummaryTelemetryArm ([pscustomobject]@{{ telemetryArm = 'HEAVY'; {launch} }})).arm)\n"
+            f"Write-Host ('ARMOBJ=' + (Get-SmokeSummaryTelemetryArm ([pscustomobject]@{{ telemetryArm = [pscustomobject]@{{ arm = 'HEAVY' }}; {launch} }})).arm)\n"
+            f"Write-Host ('NULLWORD=' + (Get-SmokeSummaryTelemetryArm ([pscustomobject]@{{ telemetryArm = $null; {launch} }})).arm)\n"
+            f"Write-Host ('LIGHTWORD=' + (Get-SmokeSummaryTelemetryArm ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {launch} }})).arm)\n")
+        self.assertEqual(out.split(), ["HEAVYWORD=UNKNOWN", "ARMOBJ=UNKNOWN", "NULLWORD=UNKNOWN", "LIGHTWORD=LIGHT"])
 
     def test_a_separate_speed_run_is_judged_on_the_speed_pair_not_the_aggregate(self) -> None:
         # r5 (adversary A5): the parity candidate is HEAVY (the validation observer), the speed run is LIGHT; the requirement compares baseline with the speed run, so the parity pair's refusal
