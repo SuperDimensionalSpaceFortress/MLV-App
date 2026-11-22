@@ -287,6 +287,13 @@ DRIFT_LEGS = {"legs/m16-1457-drift-t4-unpaced-fullscreen-s1.json": "legs/m16-145
               "legs/m16-1457-drift-t12-unpaced-fullscreen-s1.json": "legs/m16-1457-headroom-unpaced-fullscreen-s1.json",
               "legs/m16-1457-drift-t16-unpaced-fullscreen-s1.json": "legs/m16-1457-headroom-unpaced-fullscreen-s1.json",
               "legs/m16-1457-drift-pcore12-unpaced-fullscreen-s1.json": "legs/m16-1457-headroom-unpaced-fullscreen-s1.json"}
+# r4: the serial-vs-cooling split. A worker cap of 1 (the schema floor) on its own, and the same single worker pinned to ONE physical P-core (its two logical CPUs):
+# the cool one (Core Temp c0 = logical CPUs 0+1, mask 0x00003) and the hot one (Core Temp c2 = logical CPUs 4+5, mask 0x00030). The mapping is Core Temp core k = logical
+# CPUs 2k and 2k+1 (r4 proved it: Core Temp's P12-a per-core load against the helper's per-CPU utilisation, correlation 0.999; the rival orders correlate -0.57 and -0.41).
+DRIFT_T1_LEGS = {"legs/m16-1457-drift-t1-unpaced-fullscreen-s1.json": None,
+                 "legs/m16-1457-drift-t1-cool-unpaced-fullscreen-s1.json": "0x00003",
+                 "legs/m16-1457-drift-t1-hot-unpaced-fullscreen-s1.json": "0x00030"}
+DRIFT_LEGS = {**DRIFT_LEGS, **{rel: "legs/m16-1457-headroom-unpaced-fullscreen-s1.json" for rel in DRIFT_T1_LEGS}}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *DRIFT_LEGS)
 assert len(set(SHIPPED_LEGS)) == len(SHIPPED_LEGS), "a shipped leg is listed twice"
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
@@ -8221,7 +8228,7 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "M16-1457-VENUE-BASELINE-DRIFT-1":   # the thread-cap sweep and the P-core arm of the 1457 baseline-drift bench, named by arm
                 self.assertIn("legs/" + path.name, DRIFT_LEGS, path.name)
                 self.assertEqual(spec["legId"], path.stem, path.name)
-                self.assertRegex(spec["legId"], r"^m16-1457-drift-(t(4|8|12|16)|pcore12)-unpaced-fullscreen-s1$", path.name)
+                self.assertRegex(spec["legId"], r"^m16-1457-drift-(t(1|4|8|12|16)|t1-cool|t1-hot|pcore12)-unpaced-fullscreen-s1$", path.name)
                 self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
                 self.assertEqual(spec["generatorArgs"]["swapInterval"], 0, path.name)
             elif spec["card"] == "CUDA-HEADROOM-UTIL-SAMPLER-1":   # the unpaced Cinematic utilisation-sampler leg (Look Assist forced on, the owner shape), named by cell
@@ -19559,7 +19566,8 @@ class DriftLegSpecTests(unittest.TestCase):
         return json.loads((DV / rel).read_text(encoding="utf-8"))
 
     def test_each_cap_leg_is_its_source_except_the_leg_id_the_card_and_the_cap(self) -> None:
-        caps = {"legs/m16-1457-drift-t4-unpaced-fullscreen-s1.json": 4, "legs/m16-1457-drift-t8-unpaced-fullscreen-s1.json": 8,
+        caps = {"legs/m16-1457-drift-t1-unpaced-fullscreen-s1.json": 1,
+                "legs/m16-1457-drift-t4-unpaced-fullscreen-s1.json": 4, "legs/m16-1457-drift-t8-unpaced-fullscreen-s1.json": 8,
                 "legs/m16-1457-drift-t12-unpaced-fullscreen-s1.json": 12, "legs/m16-1457-drift-t16-unpaced-fullscreen-s1.json": 16}
         for rel, cap in caps.items():
             with self.subTest(leg=rel):
@@ -19589,12 +19597,52 @@ class DriftLegSpecTests(unittest.TestCase):
         # the bench mask and the helper mask share no logical CPU (the helper is never a bench CPU)
         self.assertEqual(int(template["generatorArgs"]["benchAffinityMask"], 16) & int(template["generatorArgs"]["corePartitionHelperMask"], 16), 0)
 
+    def test_the_single_core_legs_pin_one_physical_p_core_at_cap_one_and_differ_from_each_other_in_the_mask_alone(self) -> None:
+        """r4 serial-vs-cooling split: the cool and the hot leg are the cap-1 leg plus the P-core arm's affinity machinery (telemetry, the E-core helper
+        mask, the two partition criteria that fail a leg whose affinity did not apply), with a bench mask of exactly one physical P-core: its two logical
+        CPUs (Core Temp core k = logical CPUs 2k, 2k+1). Same mask size on both, so a speed gap between them is the core, not the mask width."""
+        t1 = self.load("legs/m16-1457-drift-t1-unpaced-fullscreen-s1.json")
+        pcore = self.load("legs/m16-1457-drift-pcore12-unpaced-fullscreen-s1.json")
+        masks = {}
+        for rel, mask in DRIFT_T1_LEGS.items():
+            if mask is None:
+                continue
+            with self.subTest(leg=rel):
+                spec = self.load(rel)
+                self.jsonschema.validate(spec, self.schema)
+                self.assertEqual(spec["legId"], Path(rel).stem)
+                self.assertEqual(spec["card"], "M16-1457-VENUE-BASELINE-DRIFT-1")
+                ga = spec["generatorArgs"]
+                self.assertEqual(ga["playbackMaxThreads"], 1)
+                self.assertEqual(ga["benchAffinityMask"], mask)
+                self.assertIs(ga["corePartitionTelemetry"], True)
+                self.assertEqual(ga["corePartitionHelperMask"], pcore["generatorArgs"]["corePartitionHelperMask"], "the helper stays on the E-cores")
+                self.assertEqual(int(ga["benchAffinityMask"], 16) & int(ga["corePartitionHelperMask"], 16), 0, "the helper is never a bench CPU")
+                bits = int(ga["benchAffinityMask"], 16)
+                self.assertEqual(bin(bits).count("1"), 2, "one physical P-core = its two hyper-thread siblings")
+                self.assertEqual(bits & 0xFFF, bits, "a P-core logical CPU (0-11)")
+                first = (bits & -bits).bit_length() - 1
+                self.assertEqual(first % 2, 0, "the pair starts on an even logical CPU (2k, 2k+1)")
+                masks[rel] = bits
+                # the rest of the spec is the cap-1 leg's: only legId, the affinity keys and the two partition criteria differ
+                body = json.loads(json.dumps(spec))
+                for key in ("benchAffinityMask", "corePartitionTelemetry", "corePartitionHelperMask"):
+                    body["generatorArgs"].pop(key)
+                gates = [{"metric": "corePartitionTopologyOk", "op": "eq", "value": True}, {"metric": "benchAffinityApplied", "op": "eq", "value": True}]
+                for role in ("acceptance", "supplementary"):
+                    for backend in ("cuda", "cpu"):
+                        self.assertEqual(body["criteria"][role][backend][-2:], gates, f"{role}/{backend}: a leg whose affinity did not apply must FAIL")
+                        body["criteria"][role][backend] = body["criteria"][role][backend][:-2]
+                self.assertEqual(dict(body, legId=t1["legId"]), t1)
+        self.assertEqual(sorted(masks.values()), [0x00003, 0x00030], "one cool core (c0) and one hot core (c2), no overlap")
+
     def test_the_sweep_names_every_cap_it_compares_and_never_leans_on_the_no_cap_headroom_leg(self) -> None:
         """r3 adversary A2: the tracked no-cap headroom leg lets the app pick its own worker count (which depends on the host's logical CPUs; the r3 run logs
         show 16 on Bachelor's 20, but the spec does not pin it), so it is not a pinned 16-worker arm. Every cap the sweep compares (4, 8, 12 and 16) is its
         own spec carrying that cap; the no-cap leg stays the 'auto' arm."""
-        caps = {rel: self.load(rel)["generatorArgs"].get("playbackMaxThreads") for rel in DRIFT_LEGS if "-pcore" not in rel}
-        self.assertEqual(sorted(caps.values()), [4, 8, 12, 16], caps)
+        caps = {rel: self.load(rel)["generatorArgs"].get("playbackMaxThreads") for rel in DRIFT_LEGS
+                if re.search(r"-drift-t\d+-unpaced-", rel)}   # the pure cap legs: not the P-core arm and not the t1 affinity legs (those carry a mask too)
+        self.assertEqual(sorted(caps.values()), [1, 4, 8, 12, 16], caps)
         self.assertNotIn("playbackMaxThreads", self.load("legs/m16-1457-headroom-unpaced-fullscreen-s1.json")["generatorArgs"])
 
     def test_every_drift_leg_keeps_its_sources_role_on_each_venue(self) -> None:
