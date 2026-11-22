@@ -2062,6 +2062,146 @@ function Get-DvDueWakeDelivered {
     'delivered'
 }
 
+function Get-DvWindowToggleRequestEvidence {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1 (adversary A5 on ead7bbdb): a leg that does NOT name generatorArgs.midPlayWindowToggles must have driven no window
+    toggle. The app honours MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES from any process environment, so a variable inherited from the launcher would move the window
+    of an ordinary windowed leg (and its job, plain, publishes no windowToggles* scalar to show it). `blocks` is true when such a leg's run log carries a
+    gui_smoke.window_toggle or gui_smoke.window_toggles record, read from the app's record body only (Get-DvLogRecordBodies cuts the log prefix and the Qt
+    location suffix). A leg that asks is judged by its own windowToggles* criteria, not here. Pure and shared: the runner gates on it and Test-DvReceiptValid
+    re-derives it from the hashed run log.
+    #>
+    param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
+    $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'midPlayWindowToggles'
+    $requested = ($raw -is [bool]) -and $raw
+    $mentions = 0
+    foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
+        # (the body still starts with the optional `[utc] [LEVEL] [0x<thread>] ` prefix; a record counts only where it starts the body after it)
+        # r4 (adversary A2 on 0b915c19): the letter i is the class [Ii], so a host culture that does not fold an upper-case I (tr-TR) still counts GUI_SMOKE.WINDOW_TOGGLE
+        # r7 (r7 adversary A1 on be8fb7b6, its inputs: `gui_smoke.window_toggles<TAB>requested=4 ...` and the bare name): the name ends at ANY non-name character or the
+        # line end, never only at a literal space, so a toggle-named record in any spelling is a mention (fail closed: an ordinary leg blocks)
+        # r8 (keys r7 B1, input: `gui_smoke.window_toggles<U+212A> requested=4 driven=4 reason=ok` on an ordinary leg): the terminator is (?!$script:DvNameChar), ASCII
+        # matched case-sensitively, so a U+212A / U+0130 glued to the name ends it and the record is a mention (under -match a bare [A-Za-z0-9_] folded them in)
+        if ($line -match ('^\s*(?:\[[^\]]*\]\s*)*gu[Ii]_smoke\.w[Ii]ndow_toggles?(?!' + $script:DvNameChar + ')')) { $mentions++ }
+    }
+    $blocks = (-not $requested) -and ($mentions -gt 0)
+    [pscustomobject]@{
+        requested = $requested
+        mentions = $mentions
+        blocks = $blocks
+        reason = $(if ($blocks) { "WINDOW_TOGGLES_INHERITED: the run log carries $mentions gui_smoke.window_toggle record(s) but the leg does not name midPlayWindowToggles (MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES came from the launcher's environment)" } else { $null })
+    }
+}
+
+function Get-DvWindowToggleCriteriaGap {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r11 (r11 adversary A1 on b82002ec, its input: an fstoggle spec with windowToggleEvidenceReason removed from both role
+    criteria arrays, over an honest reason=summary-reason-incomplete): a leg that names generatorArgs.midPlayWindowToggles relies on its CRITERIA to fail an honest
+    non-ok toggle proof (the reconcile gate passes it as "what the log derives"), so criteria.acceptance and criteria.supplementary must both be present, each
+    must hold an array for every backend the spec names, and every array must bind all five: windowTogglesRequested / Driven / KeptPlaying / Advanced eq 4 (the job's schedule) and
+    windowToggleEvidenceReason eq "ok". Returns the gap text, or $null. A leg that does not ask returns $null.
+    #>
+    param([Parameter(Mandatory)]$Spec)
+    $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'midPlayWindowToggles'
+    if (-not (($raw -is [bool]) -and $raw)) { return $null }
+    $required = @(@('windowTogglesRequested', '4'), @('windowTogglesDriven', '4'), @('windowTogglesKeptPlaying', '4'), @('windowTogglesAdvanced', '4'), @('windowToggleEvidenceReason', 'ok'))
+    $criteria = Get-DvProp $Spec 'criteria'
+    # r11b (r11 adversary A1 on 7d6aea0a, inputs: criteria.supplementary = {}, and both sets keyed cpu while backends = ["cuda"]): BOTH sets must be present, and
+    # each must hold a role array for EVERY backend the spec names (the array Test-DvCriteria judges; a missing one passes vacuously), each binding all five
+    # r12 (sol r11 B1 on d3b176e3, input: backends ["cpu","cuda"] with complete cpu and cuda arrays in both sets): Get-DvProp hands the backends array over as ONE
+    # pipeline object, so piping it straight into a [string] cast joined it into 'cpu cuda' and refused a valid spec. The value is held first and @() enumerates its
+    # elements; each is one backend NAME (a JSON string, the schema's enum), and an entry that is not a string is refused by name, never cast
+    # r12 adversary A1 on 3f7bf31b (input: backends [null, "cuda"] with complete cuda arrays): a null or empty entry is REFUSED, never skipped; the leg's default
+    # backend is the FIRST entry (Invoke-VenueLeg.ps1), so a skipped null admitted a spec at preflight that failed late
+    $backendsValue = Get-DvProp $Spec 'backends'
+    if ($null -eq $backendsValue) { return 'the spec names no backend, so no criteria array is judged' }
+    $backends = [System.Collections.Generic.List[string]]::new()
+    foreach ($entry in @($backendsValue)) {
+        if ($entry -isnot [string] -or $entry.Length -eq 0) {
+            return "the spec's backends holds an entry that is not a backend name ($(ConvertTo-Json -InputObject $entry -Compress -Depth 3)), so no criteria array is named by it"
+        }
+        $backends.Add($entry)
+    }
+    if ($backends.Count -lt 1) { return 'the spec names no backend, so no criteria array is judged' }
+    foreach ($setName in 'acceptance', 'supplementary') {
+        $set = Get-DvProp $criteria $setName
+        if ($null -eq $set) { return "criteria.$setName is absent, so nothing fails a non-ok toggle proof" }
+        if ($set -isnot [System.Management.Automation.PSCustomObject]) { return "criteria.$setName is not one JSON object" }
+        foreach ($backend in $backends) {
+            if ($null -eq $set.PSObject.Properties[$backend]) { return "criteria.$setName has no $backend array (a backend the spec names), so nothing fails a non-ok toggle proof" }
+        }
+        # r14 (r14 adversary A1 on 1376a142, input: windowTogglesDriven's value 4 -> [4] in both cuda arrays over a healthy log): a [string] cast read [4] (and ["4"],
+        # ["ok"]) as the bound value, while Test-DvCriteria compares the RAW value (4 -eq @(4) is false), so an unbound spec passed preflight and FAILED a healthy
+        # capture late. A row binds only when its value is the JSON scalar the evaluator matches: a number for the four counts (as the framesExported binding in
+        # Get-DvExportOutcome reads one) and a string for the reason; any other value (array, object, boolean, null, a numeric string) is no binding
+        foreach ($role in $set.PSObject.Properties) {
+            $rows = @($role.Value)
+            foreach ($need in $required) {
+                $bound = @($rows | Where-Object { $null -ne $_ -and [string](Get-DvProp $_ 'metric') -ceq $need[0] -and [string](Get-DvProp $_ 'op') -ceq 'eq' -and $(if ($need[1] -ceq 'ok') { (Get-DvProp $_ 'value') -is [string] } else { (Get-DvProp $_ 'value') -is [int] -or (Get-DvProp $_ 'value') -is [long] -or (Get-DvProp $_ 'value') -is [double] }) -and [string](Get-DvProp $_ 'value') -ceq $need[1] })
+                if ($bound.Count -lt 1) { return "criteria.$setName.$($role.Name) does not bind $($need[0]) eq $($need[1])" }
+            }
+        }
+    }
+    $null
+}
+
+function Get-DvWindowToggleReconcileEvidence {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r3 (sol B4 on 11def8e4): a leg that NAMES generatorArgs.midPlayWindowToggles must have its windowToggles* scalars
+    (windowTogglesRequested / Driven / KeptPlaying / Advanced and windowToggleEvidenceReason) backed by the hashed run log. They are re-derived here from the
+    log with the job's own reader (Get-AttrCudaWindowToggleEvidence, over the measured session Get-DvSmokeSummaryFields names; r11: an UNREADABLE one blocks with
+    WINDOW_TOGGLES_SESSION_UNREADABLE and is never handed to the reader as no id) and
+    compared field for field with the metrics; `blocks` is true when any of the five is absent or differs, so a summary whose toggle records were removed from
+    the log (and the log-hash references refreshed) is INVALID, never a PASS. An honest failure (the scalars are exactly what the log derives, reason not ok)
+    does not block: the criteria FAIL it. A leg that does not ask is not judged here (Get-DvWindowToggleRequestEvidence is its gate). Pure and shared: the
+    runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log.
+    #>
+    param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText, $Metrics)
+    $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'midPlayWindowToggles'
+    $requested = ($raw -is [bool]) -and $raw
+    if (-not $requested) { return [pscustomobject]@{ requested = $false; blocks = $false; reason = $null; derived = $null } }
+    # r11 (r11 adversary A1 on b82002ec): an honest non-ok proof passes this gate and is failed by the criteria, so a requested leg whose criteria do not bind the
+    # five scalars is INVALID here (the leg writer and Test-DvReceiptValid both call this), never a PASS of a non-ok proof
+    $criteriaGap = Get-DvWindowToggleCriteriaGap -Spec $Spec
+    if ($null -ne $criteriaGap) {
+        return [pscustomobject]@{ requested = $true; blocks = $true; reason = "WINDOW_TOGGLES_CRITERIA_UNBOUND: the leg names midPlayWindowToggles but $criteriaGap"; derived = $null }
+    }
+    $sessionRead = Get-DvSmokeSummaryFields -LogText $LogText
+    # r11 (sol r10 A2, opus key3 r10 H1 on 7fc447b9, input: the healthy log with id=3x / session=3x): an UNREADABLE measured session (a malformed first marker, or
+    # with no marker a malformed first summary) names no session, so it REFUSES requested-toggle proof with a typed reason; before r11 it became the empty id and the
+    # reader's automatic selection picked the only marker (3x) and derived ok. The derived evidence is the refusal itself, never a reader result
+    if ($sessionRead.sessionUnreadable -eq $true) {
+        return [pscustomobject]@{
+            requested = $true
+            blocks = $true
+            reason = 'WINDOW_TOGGLES_SESSION_UNREADABLE: the leg names midPlayWindowToggles but the run log''s measured playback_smoke session is unreadable (Get-DvSmokeSummaryFields sessionUnreadable), so no toggle record is the measured Play''s; requested-toggle proof is refused, never derived by automatic session selection'
+            derived = [pscustomobject]@{ requested = 0; driven = 0; keptPlaying = 0; advanced = 0; reason = 'measured-session-unreadable' }
+        }
+    }
+    $session = $(if ($null -ne $sessionRead.session) { [string]$sessionRead.session } else { '' })
+    $module = Import-Module (Join-Path $PSScriptRoot '..\bachelor\AttrCudaArtifacts.psm1') -PassThru -DisableNameChecking
+    $derived = & $module { param([string]$t, [string]$s) Get-AttrCudaWindowToggleEvidence -LogText $t -MeasuredSessionId $s } ([string]$LogText) $session
+    $pairs = @(@('windowTogglesRequested', $derived.requested), @('windowTogglesDriven', $derived.driven), @('windowTogglesKeptPlaying', $derived.keptPlaying),
+        @('windowTogglesAdvanced', $derived.advanced), @('windowToggleEvidenceReason', $derived.reason))
+    $mismatches = [System.Collections.Generic.List[string]]::new()
+    foreach ($pair in $pairs) {
+        $claimed = Get-DvProp $Metrics $pair[0]
+        if ($null -eq $claimed -or -not [string]::Equals([string]$claimed, [string]$pair[1], [StringComparison]::Ordinal)) {
+            $mismatches.Add("$($pair[0])=$(if ($null -eq $claimed) { '<absent>' } else { [string]$claimed }) but the run log derives $([string]$pair[1])")
+        }
+    }
+    $blocks = $mismatches.Count -gt 0
+    [pscustomobject]@{
+        requested = $true
+        blocks = $blocks
+        reason = $(if ($blocks) { "WINDOW_TOGGLES_NOT_FROM_LOG: the leg names midPlayWindowToggles but its windowToggles* scalars are not what the hashed run log derives ($($mismatches -join '; ')); a toggle claim the raw records do not back is no evidence" } else { $null })
+        derived = $derived
+    }
+}
+
 function Get-DvDueWakeDeliveryEvidence {
     <#
     .SYNOPSIS
@@ -2494,7 +2634,7 @@ function Get-DvLookAssistEvidence {
         if (-not [string]::IsNullOrEmpty($LogText)) {
             # r4 (r3 adversary A2 on #726): matched on the record body, so a Qt location path never selects (or answers for) the visual_state line
             # r27: the raw lines, index for index with the bodies (Get-DvLogRecordBodies splits the same way and keeps every line), for the discarded text
-            $rawLines = $LogText -split "`r?`n"
+            $rawLines = $LogText -split $script:DvLogLineBreak
             $bodies = Get-DvLogRecordBodies -LogText $LogText
             for ($li = 0; $li -lt $bodies.Count; $li++) {
                 $line = $bodies[$li]
@@ -2869,6 +3009,10 @@ function Get-DvLogRecordDiscardedText {
 # (log_line_field::fieldValue maps every C0 control to '_'), so a masked `<key>=` is no `<key>=` for any reader, and a value stays one token.
 $script:DvQuotedEqualsMask = [char]0x1A
 $script:DvQuoteChars = [char[]]@([char]'"', [char]"'")
+# VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r7 (r6 adversary A1 on 1ee5e122, its input: `playback_smoke.frame session=3 n=1<CR>gui_smoke.window_toggles ...`): the ONE
+# rule for where a run-log record ends: CRLF, a bare CR or a bare LF (the job's Get-AttrCudaWindowToggleEvidence splits the same way). An LF-only split left a
+# CR-joined record behind the body before it, so no reader saw it. Get-DvLogRecordBodies and every raw-line list kept index for index with it split by this.
+$script:DvLogLineBreak = '\r\n|\r|\n'
 
 function ConvertTo-DvQuoteMaskedBody {
     <#
@@ -2913,7 +3057,8 @@ function Get-DvLogRecordBodies {
     #>
     param([AllowNull()][AllowEmptyString()][string]$LogText, [switch]$Unmasked)
     if ([string]::IsNullOrEmpty($LogText)) { return , [string[]]@() }
-    $lines = $LogText -split "`r?`n"
+    # r7 (r6 adversary A1): a bare CR ends a record too ($script:DvLogLineBreak)
+    $lines = $LogText -split $script:DvLogLineBreak
     # r5: only a line that holds ` (` can carry a location; the rest are returned as they are without a call
     for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i].IndexOf(' (', [StringComparison]::Ordinal) -ge 0) { $lines[$i] = Get-DvLogRecordBody -Line $lines[$i] } }
     # INFO-2 r2 (adversary pass 1 A10): -Unmasked returns the same bodies, line for line and character for character, without the quote mask, so a reader that
@@ -3264,7 +3409,7 @@ $script:ExportFields = @('format', 'maxFrames', 'receipt', 'receiptSha256', 'dua
 $script:ExportExcludedKeys = @('look', 'displayMode', 'visualCapture', 'visualCaptureOptOutReason', 'acceptedEffectiveScale', 'presentTearingExpectedReason')
 $script:ExportGeneratorArgs = @('cpuQuiescenceThresholdPercent')
 # the generatorArgs members leg-spec.schema.json types boolean (prepConflatedMove: const true); a test pins this list to the schema
-$script:GeneratorArgsBooleanSwitches = @('forceLookAssist', 'corePartitionTelemetry', 'disableLookAssist', 'presentTrace', 'firstPresentCapture', 'warmReuseMissDump', 'unpaced', 'disablePrepPointwiseFast', 'prepConflatedMove', 'utilSample', 'disableReconReleaseDeferred', 'dueWakeDeliveryPost')
+$script:GeneratorArgsBooleanSwitches = @('forceLookAssist', 'corePartitionTelemetry', 'disableLookAssist', 'presentTrace', 'firstPresentCapture', 'warmReuseMissDump', 'unpaced', 'disablePrepPointwiseFast', 'prepConflatedMove', 'utilSample', 'disableReconReleaseDeferred', 'dueWakeDeliveryPost', 'midPlayWindowToggles')
 # EXPORT-VENUE-LEG-1: an export leg's typed shape (the schema's export block and its allOf exclusions), and `export` refused on any other leg. Called by
 # Get-DvLegSpecShapeRefusal, so the leg and the lease batch's preflight refuse the same specs before a lease opens. Returns the refusal text, or $null.
 function Get-DvExportShapeRefusal {
@@ -3337,6 +3482,20 @@ function Get-DvLegSpecShapeRefusal {
             if ($null -ne $switchProp -and $switchProp.Value -isnot [bool]) {
                 return "generatorArgs.$switchName must be JSON true or false (it is $(ConvertTo-Json -InputObject $switchProp.Value -Compress -Depth 3))"
             }
+        }
+        # VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1 (adversary A4 on ead7bbdb): the mid-play window toggles are a WINDOWED leg's instrument (the app clears
+        # them on any other leg and drives nothing). The schema's allOf rule says so for a committed spec; this is the live check, for the leg and every batch
+        # preflight, so a spec that names the key on a fullscreen leg (or no display mode at all, the fullscreen default) never reaches a lease.
+        $midPlayToggleProp = $genArgsProp.Value.PSObject.Properties['midPlayWindowToggles']
+        if ($null -ne $midPlayToggleProp -and $midPlayToggleProp.Value -is [bool] -and $midPlayToggleProp.Value) {
+            $displayModeProp = $Spec.PSObject.Properties['displayMode']
+            if ($null -eq $displayModeProp -or $displayModeProp.Value -isnot [string] -or $displayModeProp.Value -cne 'windowed') {
+                return 'generatorArgs.midPlayWindowToggles needs displayMode "windowed" (the app drives the toggles on a windowed leg only)'
+            }
+            # r12 (fable r11 note on d3b176e3, input: criteria.supplementary = {}): the criteria that fail an honest non-ok toggle proof are checked here too, by the
+            # reconciler's own Get-DvWindowToggleCriteriaGap and with its typed reason, so an unbound leg is refused before a lease opens, not only after its run
+            $toggleCriteriaGap = Get-DvWindowToggleCriteriaGap -Spec $Spec
+            if ($null -ne $toggleCriteriaGap) { return "WINDOW_TOGGLES_CRITERIA_UNBOUND: the leg names midPlayWindowToggles but $toggleCriteriaGap" }
         }
         # CPU-S1-FS-SPIKE-TEAM-PARTITION-1 (adversary A3 and A4 on 84d66a4b): a PRESENT team-partition key is a whole number from 1 to 16 -- a JSON int, the
         # convention look.contactSheetFrames uses (a JSON number with a fraction, 12.0 included, parses to a double and is no whole number here), never null --
@@ -5712,6 +5871,12 @@ function Test-DvReceiptValid {
                 }
             }
             elseif ($null -ne $storedDueWakeDelivery) { $invalid.Add('DUE_WAKE_DELIVERY_NOT_FROM_EVIDENCE: the receipt carries a dueWakeDelivery block but its committed leg spec names no dueWakeDeliveryPost') }
+            # VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1 (adversary A5): a leg that names no midPlayWindowToggles but whose run log shows window toggles was moved by an inherited env
+            $windowToggleRequestVerdict = Get-DvWindowToggleRequestEvidence -Spec $spec -LogText $ev.logText
+            if ($windowToggleRequestVerdict.blocks) { $invalid.Add("WINDOW_TOGGLES_INHERITED: $($windowToggleRequestVerdict.reason)") }
+            # r3 (sol B4): a leg that names the toggles has its windowToggles* scalars re-derived from the hashed run log; a claim the raw records do not back is INVALID
+            $windowToggleReconcileVerdict = Get-DvWindowToggleReconcileEvidence -Spec $spec -LogText $ev.logText -Metrics $metrics
+            if ($windowToggleReconcileVerdict.blocks) { $invalid.Add($windowToggleReconcileVerdict.reason) }
             # CPU-S1-FS-SPIKE-TEAM-PARTITION-1: a leg that asks for the team partition the app did not report at exactly r+p (or whose report is unreadable, or
             # absent because the binary emits none), or a control leg whose app reports a partition, is no measurement of its arm; the receipt's own
             # teamPartition block is re-derived like the reconReleaseDeferred block.
@@ -6558,6 +6723,6 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt

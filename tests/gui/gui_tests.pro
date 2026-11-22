@@ -26,7 +26,8 @@ SOURCES += \
     $$REPO_ROOT/tests/common/repo_paths.cpp \
     $$REPO_ROOT/tests/gui/raw_processing_gpu_preview_stubs.cpp \
     $$REPO_ROOT/tests/gui/gpu_field_telemetry_stub.cpp \
-    $$REPO_ROOT/tests/gui/test_gui_smoke.cpp
+    $$REPO_ROOT/tests/gui/test_gui_smoke.cpp \
+    $$REPO_ROOT/platform/qt/FullscreenControlBar.cpp
 
 HEADERS += \
     $$REPO_ROOT/src/processing/ThreadExitCache.h \
@@ -58,4 +59,6 @@ HEADERS += \
     $$REPO_ROOT/tests/common/hash_helpers.h \
     $$REPO_ROOT/tests/common/image_regression.h \
     $$REPO_ROOT/tests/common/repo_paths.h \
-    $$REPO_ROOT/tests/common/test_runtime.h
+    $$REPO_ROOT/tests/common/test_runtime.h \
+    $$REPO_ROOT/platform/qt/FullscreenControlBarPolicy.h \
+    $$REPO_ROOT/platform/qt/FullscreenControlBar.h

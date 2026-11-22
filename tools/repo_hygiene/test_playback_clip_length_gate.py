@@ -2373,6 +2373,8 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
             ("platform/qt/MainWindow.cpp", "postEvent"): 1,
             ("platform/qt/FocusPixelMapManager.cpp", "notify"): 3,
             ("platform/qt/SyncDownloadWaiter.h", "notify"): 2,
+            # PLAYER-FULLSCREEN-CONTROL-BAR-1 r3: the CPU bar's wheel re-dispatch to the viewport (a delivered clone).
+            ("platform/qt/FullscreenControlBar.cpp", "sendEvent"): 1,
         })
 
     def test_the_two_pinned_postevent_sites_pass(self) -> None:
@@ -3203,6 +3205,46 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
         problems = scan_app_play_sources(self._mutated(anchor, anchor + "\n        ui->actionPlay->setChecked( false );"))
         self.assertTrue(problems, "the scan did not go red on a resize stop")
         self.assertTrue(any("unreviewed Play stop in MainWindow::resizeEvent" in p for p in problems), problems)
+
+    # PLAYER-FULLSCREEN-CONTROL-BAR-1 r3: the bar's Play button is one reviewed user-input trigger, pinned as the WHOLE
+    # fullscreenBarInput body; the bar reads the play state only through isChecked() (no connect on the action).
+    _BAR_TOGGLE = "case fullscreen_bar::Action::TogglePlay: ui->actionPlay->trigger(); fullscreenBarSyncPlayState(); break;"
+
+    def test_player_fullscreen_control_bar_1_the_bar_input_body_is_pinned(self) -> None:
+        self.assertIn("bool MainWindow::fullscreenBarInput(", PINNED_HELPER_BODIES)
+        self.assertEqual(scan_app_play_sources(self.sources), [])
+
+    def test_player_fullscreen_control_bar_1_a_second_trigger_in_the_bar_input_changes_the_pin(self) -> None:
+        problems = scan_app_play_sources(self._mutated(
+            self._BAR_TOGGLE, self._BAR_TOGGLE.replace("trigger();", "trigger(); ui->actionPlay->trigger();", 1)))
+        self.assertTrue(any("pinned helper body changed" in p and "fullscreenBarInput" in p for p in problems), problems)
+
+    def test_player_fullscreen_control_bar_1_a_trigger_on_another_action_changes_the_pin(self) -> None:
+        problems = scan_app_play_sources(self._mutated(
+            "case fullscreen_bar::Action::PrevFrame: ui->actionPreviousFrame->trigger(); break;",
+            "case fullscreen_bar::Action::PrevFrame: ui->actionPlay->trigger(); break;"))
+        self.assertTrue(any("pinned helper body changed" in p and "fullscreenBarInput" in p for p in problems), problems)
+
+    def test_player_fullscreen_control_bar_1_a_connect_on_the_play_action_is_unreviewed(self) -> None:
+        # The r2 head's feed (hosted CI run 44773031416): a connect on the Play action in the bar's show path.
+        anchor = "m_fullscreenBarFrameFeed = true;"
+        problems = scan_app_play_sources(self._mutated(anchor, "m_fullscreenBarPlayFeed = connect( ui->actionPlay, "
+                                                       "&QAction::toggled, this, [this]( bool ) { fullscreenBarFeed(); } );\n"
+                                                       "        " + anchor))
+        self.assertTrue(any("unreviewed use of the Play action" in p and "&QAction::toggled" in p for p in problems), problems)
+
+    def test_player_fullscreen_control_bar_1_a_second_dispatch_in_the_bar_widget_is_unreviewed(self) -> None:
+        bar = "platform/qt/FullscreenControlBar.cpp"
+        self.assertEqual(PINNED_EVENT_SITES[(bar, "sendEvent")], 1)
+        anchor = "    QCoreApplication::sendEvent( target, &copy );"
+        problems = scan_app_play_sources(self._mutated(anchor, anchor + "\n" + anchor, path=bar))
+        self.assertTrue(any("event dispatch sendEvent in platform/qt/FullscreenControlBar.cpp x2" in p for p in problems),
+                        problems)
+
+    def test_player_fullscreen_control_bar_1_a_trigger_outside_the_pinned_body_is_unreviewed(self) -> None:
+        anchor = "void MainWindow::fullscreenBarSyncPlayState( void )\n{"
+        problems = scan_app_play_sources(self._mutated(anchor, anchor + "\n    ui->actionPlay->trigger();"))
+        self.assertTrue(any("unreviewed use of the Play action" in p for p in problems), problems)
 
     def test_player_toolbar_transport_buttons_1_the_stop_button_is_one_reviewed_user_input_stop(self) -> None:
         # PLAYER-TOOLBAR-TRANSPORT-BUTTONS-1: the Stop button seeks to cut in, then pauses (the closeEvent user-pause form).

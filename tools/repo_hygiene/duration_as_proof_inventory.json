@@ -3386,6 +3386,16 @@
       "lines": [
         4269
       ]
+    },
+    {
+      "path": "tests/console/test_fullscreen_control_bar_policy.cpp",
+      "anchor": "ASSERT_EQ ( 0 , int ( rig . bar . shownMs ( 100000 ) ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYER-FULLSCREEN-CONTROL-BAR-1: negative check on the pure Presenter with an injected clock (no live clock read): a bar that was never shown has accumulated zero shown time. It proves the bar did NOT show; the positive side (shows/raster/upload counters going to 1 after real activity) is asserted by counters in the same test, never by a duration.",
+      "lines": [
+        143
+      ]
     }
   ]
 }
