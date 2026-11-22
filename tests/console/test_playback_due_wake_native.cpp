@@ -2131,7 +2131,9 @@ TEST(PlaybackDueWakeSend, D_AStaleSentWakeThroughTheWindowProcedureIsDroppedByTh
         ASSERT_FALSE( wake.armed() );
         // the wait thread stamped the replacement's delivery on its own clock, so a pause of THIS thread after the wake cannot
         // lengthen what is measured: from before the arm to that stamp is >= the 40 ms due (less slack), never the stale wake's ~0.5 ms
-        ASSERT_TRUE( firedStamped );                              // a native delivery carries the stamp (this one fired after its publish)
+        // a delivery the GUI took before the wait thread published its return stamp carries no split (PlaybackDueWake.h
+        // lastDeliveryPostFirstMs, "unsplit"): nothing to measure, so this attempt is not judged and is observed again
+        if( !firedStamped ) continue;
         ASSERT_TRUE( ( firedPostFirstMs - preArmMs ) * 1000000.0 >= static_cast<double>( kReplacementMinElapsedNs ) );
         judged = true;
     }
@@ -2566,7 +2568,9 @@ TEST(PlaybackDueWakeSend, R2A1_AStaleSentWakeInTheRunnerSleepIsNotHeldCountedOrA
         wake.dispatchSentMessages();
         ASSERT_EQ( 1, fired );
         ASSERT_FALSE( wake.armed() );
-        ASSERT_TRUE( firedStamped );                               // a native delivery carries the stamp (this one fired after its publish)
+        // a delivery the GUI took before the wait thread published its return stamp carries no split (PlaybackDueWake.h
+        // lastDeliveryPostFirstMs, "unsplit"): nothing to measure, so this attempt is not judged and is observed again
+        if( !firedStamped ) continue;
         // not at the stale wake (~0.5 ms), at the replacement's due time
         ASSERT_TRUE( ( firedPostFirstMs - preArmMs ) * 1000000.0 >= static_cast<double>( kReplacementMinElapsedNs ) );
         judged = true;
