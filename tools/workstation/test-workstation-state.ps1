@@ -4202,6 +4202,33 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r4 import backup')) {
         Remove-Item -LiteralPath "$($script:R3HostPath).aside" -Force -ErrorAction SilentlyContinue
     }
     Assert-That ($r4d.Host -ceq 'FROM-BUNDLE' -and $r4d.Failures.Count -eq 0) 'r4 import: a read-denied host CLAUDE.md that vanished before the replace is created from the bundle (the skip for its unreadable content no longer applies)' "host=[$($r4d.Host)] failures=$($r4d.Failures -join ',')`n$($r4d.Out)"
+    # (d2) the same, with the host file moved away BEFORE the gate probes it (right after the inspection)
+    $r4d2 = Invoke-R3Import 'r4d2' -3 0 { param($st, $sp) & icacls.exe $script:R3HostPath /deny '*S-1-1-0:(RD)' 2>&1 | Out-Null } { param($From, $To) if (Test-Path -LiteralPath $script:R3HostPath -PathType Leaf) { Move-Item -LiteralPath $script:R3HostPath -Destination "$($script:R3HostPath).aside" } } {
+        & icacls.exe "$($script:R3HostPath).aside" /remove:d '*S-1-1-0' 2>&1 | Out-Null
+        Remove-Item -LiteralPath "$($script:R3HostPath).aside" -Force -ErrorAction SilentlyContinue
+    }
+    Assert-That ($r4d2.Host -ceq 'FROM-BUNDLE' -and $r4d2.Failures.Count -eq 0) 'r4 import: a read-denied host CLAUDE.md that vanished before the gate looked is created from the bundle too' "host=[$($r4d2.Host)] failures=$($r4d2.Failures -join ',')`n$($r4d2.Out)"
+    # (d3) ~/.claude is renamed away and a junction onto another folder put in its place after the backup step; the file found there was never backed up, so it is not replaced
+    $script:R4Live = $null; $script:R4Swapped = $false
+    $r4d3 = Invoke-R3Import 'r4d3' -3 0 $null {
+        param($From, $To)
+        if ($script:R4Swapped) { return }
+        $script:R4Swapped = $true
+        $cd = Split-Path -Parent $script:R3HostPath
+        $live = New-Scratch 'r4d3-live'; [IO.File]::WriteAllText((Join-Path $live 'CLAUDE.md'), 'HOST-NEW'); (Get-Item -LiteralPath (Join-Path $live 'CLAUDE.md')).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-2)
+        $script:R4Live = Join-Path $live 'CLAUDE.md'
+        Move-Item -LiteralPath $cd -Destination "$cd-old"
+        [void](New-Item -ItemType Junction -Path $cd -Target $live)
+    } {
+        $cd = Split-Path -Parent $script:R3HostPath
+        if ($script:R4Live) { $script:R4LiveAfter = [IO.File]::ReadAllText($script:R4Live) }
+        if (Test-Path -LiteralPath "$cd-old") { try { [IO.Directory]::Delete($cd) } catch { }; Move-Item -LiteralPath "$cd-old" -Destination $cd }
+    }
+    Assert-That ($script:R4LiveAfter -ceq 'HOST-NEW') 'r4 import: a host CLAUDE.md found through a junction put in place after the backup step is NOT replaced (no backup holds its bytes)' "live=[$($script:R4LiveAfter)] failures=$($r4d3.Failures -join ',')`n$($r4d3.Out)"
+    # (d4) a log that cannot be written (a folder where the log file belongs, as a full disk would do) must not turn a failed backup into a throw
+    $r4lf = $script:LogFile; $script:LogFile = (New-Scratch 'r4d4-logdir'); $r4ret = $null; $r4thrown = ''
+    try { $r4ret = Copy-CleanBackupFile -Path (Join-Path (New-Scratch 'r4d4-src') 'missing.md') -DestinationDir (New-Scratch 'r4d4-dest') } catch { $r4thrown = $_.Exception.Message } finally { $script:LogFile = $r4lf }
+    Assert-That ((-not $r4thrown) -and (@($r4ret)[-1] -eq $false)) 'r4 import: a backup that fails while the log cannot be written still returns false (it never throws past its own cleanup)' "thrown=[$r4thrown] ret=[$($r4ret -join ',')]"
     # (e) a bundle CLAUDE.md that grows past the scan limit AFTER the inspection (before the copy) is skipped by the copy; it is not a failed backup
     $r4e = Invoke-R3Import 'r4e' -3 0 { param($st, $sp) [void][IO.Directory]::CreateDirectory((Join-Path $st "backups\home-claude-$sp\CLAUDE.md")) } {
         param($From, $To)

@@ -3324,7 +3324,10 @@ function Invoke-ImportRobocopy {
             # judged BEFORE the credential skips (a host file whose bytes cannot be read is skipped there, silently) and only when the copy rules WOULD replace it (a file /XO keeps, even a held
             # one, is not a failure). Copy-ImportFileLocked makes the same judgement again under its lock, on the bytes it is about to replace.
             # r4: a destination Import deliberately never writes (an excluded bundle file, or a host file it never replaces: $neverSet) has no backup to judge.
-            if (-not $neverSet.ContainsKey($e.FullName.ToLowerInvariant()) -and [IO.File]::Exists($dest)) {
+            $isNever = $neverSet.ContainsKey($e.FullName.ToLowerInvariant())
+            # the inspection skipped this file for what the HOST file held (unreadable; the one skip that is not deliberate), and that host file is gone before the gate even looks: create the bundle copy
+            if ($inSkipSet -and -not $isNever -and -not [IO.File]::Exists($dest)) { $inSkipSet = $false }
+            if (-not $isNever -and [IO.File]::Exists($dest)) {
                 $gap = Get-ImportBackupGap -Dest $dest
                 if ($script:ImportAfterHostProbeHook) { & $script:ImportAfterHostProbeHook $dest }   # test seam (null in a real run): the host file goes away right after the existence probe
                 # r4: ONE FileInfo, Exists read first: a host file that is gone by now is a CREATION (Copy-ImportFileLocked CreateNew), not a replacement; a missing file's timestamp reads
@@ -3430,8 +3433,11 @@ function Get-ImportRealPath {
 function Get-ImportBackupGap {
     param([string]$Dest, [byte[]]$HeldBytes = $null)
     if ($script:ImportBackupProtected.Count -eq 0) { return '' }
-    $full = Get-ImportRealPath $Dest
-    if (-not $script:ImportBackupProtected.Contains($full)) { return '' }
+    # r4 (pass 2 A1): protected by its PHYSICAL path or by the path as it was registered (both are registered): a directory renamed away and a link put in its place after the backup
+    # step does not make the destination an unprotected one, and the backup recorded for the registered file no longer matches the file now found there.
+    $full = $null
+    foreach ($k in @((Get-ImportRealPath $Dest), [IO.Path]::GetFullPath($Dest))) { if ($script:ImportBackupProtected.Contains($k)) { $full = $k; break } }
+    if (-not $full) { return '' }
     $has = $script:ImportBackupHash.ContainsKey($full)
     if ($null -eq $HeldBytes) {
         if ($has -or $script:ImportBackupCredentialSkipped.Contains($full)) { return '' }
@@ -3540,8 +3546,7 @@ function Copy-CleanBackupFile {
         $script:ImportBackupHandle[$realKey] = $keep
         return $true
     } catch {
-        # r4: the cause is named in the log (a read that failed, a folder at the backup name, a sharing violation), not only the generic IMPORT_BACKUP_FAILED line the caller writes
-        Write-Log "  (backup of $Path failed: $($_.Exception.Message))" 'WARN'
+        $backupWhy = $_.Exception.Message
         # r15 (pass 12 A6 sibling): a partly written backup copy is removed and the removal is proven; one that cannot be removed is a typed failure of the run.
         # r16 (adversary pass 15 A4 sibling): removed THROUGH the held handle, never by pathname: a failure before this run opened $dest (an unreadable source) deletes
         # nothing, and a file another process saved at $dest after a release can never be the one deleted.
@@ -3555,6 +3560,9 @@ function Copy-CleanBackupFile {
         }
         # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1: a failed backup records NOTHING here (r3: no probe of the path, which a file coming back or going away could fool). The absence of a
         # recorded backup hash is what keeps Import from replacing the file (Get-ImportBackupGap).
+        # r4: the cause is named in the log (a read that failed, a folder at the backup name, a sharing violation), AFTER the cleanup above and guarded: the log itself can fail (a full disk),
+        # and that must never skip the removal of a half-written backup or turn this typed false into a throw.
+        try { Write-Log "  (backup of $Path failed: $backupWhy)" 'WARN' } catch { }
         return $false
     }
 }
@@ -3600,7 +3608,10 @@ function Invoke-PhaseImport {
     # refuses to replace them instead of finding them unprotected.
     Close-ImportBackupHandles
     $script:ImportBackupProtected.Clear(); $script:ImportBackupHash.Clear(); $script:ImportBackupCredentialSkipped.Clear()
-    foreach ($f in 'CLAUDE.md', 'settings.json') { [void]$script:ImportBackupProtected.Add((Get-ImportRealPath (Join-Path "$h\.claude" $f))) }
+    foreach ($f in 'CLAUDE.md', 'settings.json') {
+        [void]$script:ImportBackupProtected.Add((Get-ImportRealPath (Join-Path "$h\.claude" $f)))
+        [void]$script:ImportBackupProtected.Add([IO.Path]::GetFullPath((Join-Path "$h\.claude" $f)))
+    }
     Invoke-Step 'Back up existing ~/.claude CLAUDE.md and settings.json' {
         $b = Join-Path $StateRoot "backups\home-claude-$stamp"
         try { [void][IO.Directory]::CreateDirectory($b) }
