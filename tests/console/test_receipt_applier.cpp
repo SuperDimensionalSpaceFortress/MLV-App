@@ -3371,12 +3371,19 @@ TEST(BatchExportFormat, MediaProbeDefaultLookupMirrorsFfmpeg)
     ASSERT_TRUE( plan.commandExecutableReady );
     ASSERT_TRUE( plan.reason.isEmpty() );
 
+    /* r4 rule (a): the PATH hit fed here is a real file (it was the never-created
+     * C:/tools/ffprobe.exe, which now reads as vanished). */
+    QTemporaryDir toolsTemp;
+    ASSERT_TRUE( toolsTemp.isValid() );
+    const QString toolsProbe = QDir::cleanPath(toolsTemp.path()) + QStringLiteral("/")
+        + appDirLookupPackagedName(QStringLiteral("ffprobe"));
+    ASSERT_TRUE( appDirLookupWriteFile(toolsProbe, QByteArray("MZ-working")) );
     calls.clear();
     plan = batchRenderedVideoMediaProbeBinaryPlanFromLookup(
         QString(),
         appDir,
         appDirLookupFakeResolver(
-            QString(), QStringLiteral("C:/tools/ffprobe.exe"), &calls));
+            QString(), toolsProbe, &calls));
     ASSERT_EQ( appDirLookupText(appDirCall + QStringLiteral("|ffprobe@PATH")),
                appDirLookupText(calls.join(QLatin1Char('|'))) );
     ASSERT_TRUE( plan.foundOnPath );
@@ -3384,7 +3391,7 @@ TEST(BatchExportFormat, MediaProbeDefaultLookupMirrorsFfmpeg)
     ASSERT_EQ( appDirLookupText(batchRenderedVideoMediaProbeBinaryPlanSummary(
                    batchRenderedVideoMediaProbeBinaryPlanFromResolvedPath(
                        QStringLiteral("ffprobe"),
-                       QStringLiteral("C:/tools/ffprobe.exe")))),
+                       toolsProbe))),
                appDirLookupText(batchRenderedVideoMediaProbeBinaryPlanSummary(plan)) );
 
     for( const QString & request : QStringList{
