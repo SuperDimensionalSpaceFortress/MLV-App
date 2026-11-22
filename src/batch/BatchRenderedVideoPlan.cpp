@@ -9,13 +9,6 @@
 
 #include <cmath>
 
-#ifdef Q_OS_WIN
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
-
 QString batchRenderedVideoJobPlanSummary(
     const BatchRenderedVideoJobPlan & plan)
 {
@@ -3647,34 +3640,12 @@ QString batchRenderedVideoCommandExecutableForDisplay(
 namespace
 {
 
-#ifdef Q_OS_WIN
-/* A raw Win32 call gets the \\?\ form, so a path past MAX_PATH (with LongPathsEnabled=0) still
- * opens, as it does for Qt's own metadata calls. */
-std::wstring batchRenderedVideoWin32Path(const QString & path)
-{
-    QString native = QDir::toNativeSeparators(QDir::cleanPath(QFileInfo(path).absoluteFilePath()));
-    if( !native.startsWith(QStringLiteral("\\\\?\\")) )
-    {
-        if( native.startsWith(QStringLiteral("\\\\")) )
-            native = QStringLiteral("\\\\?\\UNC\\") + native.mid(2);
-        else
-            native = QStringLiteral("\\\\?\\") + native;
-    }
-    return native.toStdWString();
-}
-
-bool batchRenderedVideoIsReparsePoint(const QString & path)
-{
-    const DWORD attributes = GetFileAttributesW(batchRenderedVideoWin32Path(path).c_str());
-    return attributes != INVALID_FILE_ATTRIBUTES
-        && ( attributes & FILE_ATTRIBUTE_REPARSE_POINT ) != 0;
-}
-#endif
-
-/* An app-dir candidate binary: a regular file with content, so an empty placeholder beside
- * MLVApp never wins over a working PATH copy. Measured on Qt 6.10.2: a Windows file symlink
- * and an app-execution alias report QFileInfo size 0 (the link's own size) yet both start, so
- * a reparse-point file is never judged unusable by its size. */
+/* THE app-dir binary rule (one predicate for every step that can take a file from the
+ * application directory: the lookup, preflight, the optional ffprobe and its ffmpeg-sibling
+ * step): a regular file with content, so an empty placeholder beside MLVApp never wins over a
+ * working PATH copy. Measured on Qt 6.10.2: a Windows file symlink reports QFileInfo size 0
+ * (the link's own size), so a link is judged by the file it RESOLVES to (r6 adversary A1: a
+ * link whose target was emptied is refused). */
 bool batchRenderedVideoNonEmptyRegularFile(const QString & path)
 {
     if( path.isEmpty() )
@@ -3684,11 +3655,8 @@ bool batchRenderedVideoNonEmptyRegularFile(const QString & path)
         return false;
     if( info.size() > 0 )
         return true;
-#ifdef Q_OS_WIN
-    return batchRenderedVideoIsReparsePoint(path);
-#else
-    return false;
-#endif
+    const QString target = info.canonicalFilePath();
+    return !target.isEmpty() && QFileInfo(target).size() > 0;
 }
 
 /* BATCH-FFMPEG-DEFAULT-APPDIR-LOOKUP-1. The packaged ffmpeg.exe sits beside MLVApp.exe, and
@@ -3817,17 +3785,19 @@ QString batchRenderedVideoOptionalMediaProbeExecutable(
      && batchRenderedVideoNonEmptyRegularFile(probePlan.resolvedExecutable) )
         return probePlan.resolvedExecutable;
 
-    /* 2. Beside the resolved ffmpeg (the two ship together in every standard distribution),
-     * exactly as before this card. */
+    /* 2. Beside the resolved ffmpeg (the two ship together in every standard distribution).
+     * The sibling directory may BE the application directory, so a candidate passes the same
+     * app-dir rule as step 1 (r6 adversary A2: an app-dir ffprobe step 1 refused as emptied is
+     * never taken back here). The base took any existing regular file; an empty one could not
+     * start, and the ffmpeg-dump verification ran instead, as it does now. */
     const QString siblingDir = QFileInfo(ffmpegPlan.resolvedExecutable).absolutePath();
     if( siblingDir.isEmpty() )
         return QString();
     for( const QString & candidate : QStringList{ siblingDir + QStringLiteral("/ffprobe.exe"),
                                                   siblingDir + QStringLiteral("/ffprobe") } )
     {
-        const QFileInfo info(candidate);
-        if( info.exists() && info.isFile() )
-            return QDir::cleanPath(info.absoluteFilePath());
+        if( batchRenderedVideoNonEmptyRegularFile(candidate) )
+            return QDir::cleanPath(QFileInfo(candidate).absoluteFilePath());
     }
     return QString();
 }

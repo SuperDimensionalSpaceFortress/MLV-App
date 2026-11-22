@@ -1577,8 +1577,9 @@ QString batchRenderedVideoFfmpegBinaryPlanSearchedLocations(
 ;
 
 /* The optional ffprobe used to enrich output verification: the probe plan's PATH hit (as
- * before this card), or its app-dir hit while that is still a non-empty regular file; else an
- * ffprobe beside the resolved ffmpeg (as before this card). Empty = not available. */
+ * before this card), or its app-dir hit while that is still a non-empty regular file; else a
+ * non-empty regular ffprobe beside the resolved ffmpeg (that directory may be the app dir, so
+ * the same rule applies). Empty = not available. */
 QString batchRenderedVideoOptionalMediaProbeExecutable(
     const BatchRenderedVideoMediaProbeBinaryPlan & probePlan,
     const BatchRenderedVideoFfmpegBinaryPlan & ffmpegPlan)

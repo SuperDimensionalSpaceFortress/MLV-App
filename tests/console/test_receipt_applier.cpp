@@ -2412,8 +2412,8 @@ TEST(BatchExportFormat, FfmpegSearchedLocationsNameOnlyWhatWasSearched)
 }
 
 /* r6 (split): the optional ffprobe uses a fresh app-dir hit; a stale one (removed or emptied
- * after the lookup) is skipped and the base rule decides: an ffprobe beside the resolved ffmpeg,
- * else none. No second PATH lookup is made. */
+ * after the lookup) is skipped and the sibling step decides: a non-empty ffprobe beside the
+ * resolved ffmpeg, else none. No second PATH lookup is made. */
 TEST(BatchExportFormat, OptionalMediaProbeSelectionUsesAFreshAppDirHitThenTheFfmpegSibling)
 {
     QTemporaryDir appTemp;
