@@ -1149,8 +1149,9 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
         self.assertIn('"PASS"', verdict)
 
 
-# The five generatorArgs keys of a leg spec that turn an observer on inside the timed window (the independent oracle of the corpus test; the module holds the same list as data).
-OBSERVER_SPEC_KEYS = ("cudaLaunchTimingMinMs", "corePartitionTelemetry", "utilSample", "firstPresentCapture", "warmReuseMissDump")
+# The six generatorArgs keys of a leg spec that turn an observer, or a presentation-moving hook (r13: midPlayWindowToggles, adversary pass 15 A1), on inside the timed window (the independent oracle
+# of the corpus test; the module holds the same list as data).
+OBSERVER_SPEC_KEYS = ("cudaLaunchTimingMinMs", "corePartitionTelemetry", "utilSample", "firstPresentCapture", "warmReuseMissDump", "midPlayWindowToggles")
 LIGHT_ENV = "'MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1'"
 
 # r10 G11: the raw environment reader judges an environment list without the launch members every producer records; only the module itself and this test file may name it
@@ -1435,6 +1436,26 @@ class ObserverControlTests(_Probe):
             self.assertEqual((r["specOn"], r["resultOn"]), ("UNKNOWN", "UNKNOWN"), r)
             self.assertEqual((r["specOff"], r["resultOff"]), ("LIGHT", "LIGHT"), r)
 
+    def test_a_mid_play_window_toggle_spec_is_not_proof_of_light(self) -> None:
+        # r13, adversary pass 15 A1 (introduced): the committed fstoggle legs (master #851) say telemetryArm=LIGHT on a speed leg but drive fs_on / fs_off / restore / maximize inside the measured Play
+        # (playback-attr-3-cuda-job.ps1 under -MidPlayWindowToggles), so their spec read LIGHT while the same setting recorded as a launch environment read UNKNOWN. Every reader must agree: UNKNOWN.
+        legs = PROFILING / "dual-venue" / "legs"
+        specs = sorted(legs.glob("*fstoggle*.json"))
+        self.assertGreaterEqual(len(specs), 2)
+        for spec in specs:
+            doc = json.loads(spec.read_text(encoding="utf-8"))
+            self.assertIs(doc["generatorArgs"].get("midPlayWindowToggles"), True, spec.name)
+            self.assertEqual(doc["generatorArgs"].get("telemetryArm"), "LIGHT", spec.name)
+        path = str(specs[0]).replace("\\", "/")
+        spec_expr = f"(Get-Content -Raw -LiteralPath '{path}' | ConvertFrom-Json)"
+        out = self.ok(
+            f"$s = {spec_expr}\n"
+            "Write-Host ('SPEC=' + (Get-FpsArmFromLegSpec $s).arm)\n"
+            "Write-Host ('RECORD=' + (Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = 'LIGHT'; legType = 'speed'; generatorArgs = $s.generatorArgs })).arm)\n"
+            "Write-Host ('RESULT=' + (Get-FpsArmFromJobResult ([pscustomobject]@{ telemetryArm = 'LIGHT' }) -ObserversFromSpec $s).arm)\n"
+            "Write-Host ('PLAN=' + (Get-FpsLegPlanRefusal 'fps-ab' @([pscustomobject]@{ item = 1; arm = (Get-FpsArmFromLegSpec $s) }) -Declared)[0])\n")
+        self.assertEqual(out.split()[:4], ["SPEC=UNKNOWN", "RECORD=UNKNOWN", "RESULT=UNKNOWN", "PLAN=FPS_AB_UNKNOWN_ARM"])
+
     # --- r4 (luna r3 blockers B1 = A1, B2 = A2) -------------------------------------------------------------------------------------------------------------
     @staticmethod
     def _json(doc: str) -> str:
@@ -1691,8 +1712,6 @@ class ObserverControlTests(_Probe):
             "partitionLoadMask", "partitionLoadThreads", "corePartitionHelperMask", "playbackMaxThreads", "gpuFaultInject", "gpuSafeStart", "automationSettingsDir", "gpuPreLaunches",
             "disableLookAssist", "presentTrace", "unpaced", "disablePrepPointwiseFast", "prepConflatedMove", "disableReconReleaseDeferred", "dueWakeDeliveryPost", "reconOmpThreads",
             "prepOmpThreads", "scope", "scopeIntervalMs", "scopesDuringPlayback", "forceLookAssist", "lookFlavor", "playbackRenderLookaheadFrames", "lookReceipt", "lookReceiptSha256",
-            # r13 (master 1a65d592, #851): a window-state test hook, not a logger or sampler; the env it sets is classified above (JOB_NAMES_A_LIGHT_LEG_DOES_NOT_CARRY).
-            "midPlayWindowToggles",
         }
         out = self.ok("(Get-FpsObserverControls | Where-Object { $_.specKey } | ForEach-Object { $_.specKey }) -join ','")
         observers = set(out.strip().split(","))

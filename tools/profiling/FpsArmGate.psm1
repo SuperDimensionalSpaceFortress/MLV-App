@@ -9,7 +9,7 @@
 # THE NARROW PROMISE (HUB RULING 2026-11-21T06:10Z, r7/r8): a leg is LIGHT only on an exact, CLOSED shape; anything else is UNKNOWN and refused.
 #   (a) its recorded arm word is exactly LIGHT (Test-FaTextEq);
 #   (b) when a spec and a result are both present they agree (Get-FpsArm);
-#   (c) on a venue leg the generator's own forwarded switches (the five generatorArgs keys of $script:FpsObserverControls) are all off;
+#   (c) on a venue leg the generator's own forwarded switches (the six generatorArgs keys of $script:FpsObserverControls) are all off;
 #   (d) on a local launch or a saved record, the recorded launch ARGUMENTS and the recorded MLVAPP_* ENVIRONMENT match the producers' exact LIGHT
 #       shape: the two data tables below ($script:FpsLightArgs, $script:FpsLightEnv). A flag or key not in a table, a value that differs, a
 #       repeated key or flag, a missing record and an unparsable record are UNKNOWN. There is no denylist: a list of what is NOT LIGHT over an
@@ -112,6 +112,9 @@ $script:FpsObserverControls = @(
     New-FpsObserver 'util-sample' 'utilSample' 'bool'
     New-FpsObserver 'first-present-capture' 'firstPresentCapture' 'bool'
     New-FpsObserver 'warm-reuse-miss-dump' 'warmReuseMissDump' 'bool'
+    # r13 (adversary pass 15 A1): not a logger but a hook that moves the presentation surface (fullscreen / windowed / restore / maximize) inside the measured Play (Invoke-VenueLeg.ps1:566 forwards it,
+    # the job emits MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES); a spec that names it must not read LIGHT while the same setting recorded as a launch environment reads UNKNOWN.
+    New-FpsObserver 'mid-play-window-toggles' 'midPlayWindowToggles' 'bool'
 )
 
 function Get-FpsObserverControls { $script:FpsObserverControls }
