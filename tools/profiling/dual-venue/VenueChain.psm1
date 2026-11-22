@@ -332,7 +332,8 @@ function Get-VenueTicketStaleReason {
     if ($null -eq (ConvertTo-VenueUtc $Ticket.createdUtc)) { return 'unreadable' }   # TAIL-1 r2 pass 2 A1: a refresh cannot carry a ticket whose createdUtc is not a time over (Update-VenueTicket answers LOST), so that ticket must not stay live beside its replacement
     $after = 0.0
     if ($null -eq $created -or $null -eq $beat -or -not [double]::TryParse([string]$Ticket.staleAfterSec, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$after)) { return 'unreadable' }
-    if (-not [double]::IsFinite($after) -or $after -le 0) { return 'unreadable' }   # TAIL-1 r2 (pre-existing: pass 10 A11): the JSON string NaN or Infinity parses, and NaN / Infinity made "heartbeat age greater than the window" false for ever: a lifetime that is not a finite positive number is unreadable
+    if (-not [double]::IsFinite($after) -or $after -le 0 -or $after -gt 86400) { return 'unreadable' }   # pass 3 A7: over a day is not a lifetime either (a refresh stores it as an Int32 and 1e20 overflowed to LOST while the census kept the row live); the writers allow 1..86400
+    # TAIL-1 r2 (pre-existing: pass 10 A11): the JSON string NaN or Infinity parses, and NaN / Infinity made "heartbeat age greater than the window" false for ever: a lifetime that is not a finite positive number is unreadable
     $started = Get-VenueProcessStartUtc $pidValue
     if ($null -eq $started) { return 'dead-pid' }
     if ($started -ne [DateTime]::MinValue -and [Math]::Abs(($started - $created).TotalSeconds) -gt $script:PidStartToleranceSec) { return 'pid-reused' }
@@ -736,8 +737,10 @@ function Request-VenueClaim {
                     $seen = $null; try { $seen = Get-VenueClaim -Venue $Venue -ClaimDir $ClaimDir } catch { $seen = $null }
                     # r8 rule 7 (adversary r7 pass 3 A11): the queue returned is the census made AFTER the give-back, so the place returned is the caller's in that census (the snapshot's place could be one past it)
                     # TAIL-1 r2 A8 (pre-existing): the give-back can take most of a second (its retries sleep), and a ticket can be reaped in it, so the census made BEFORE the release is read again AFTER it; one that cannot be made keeps the earlier
+                    # pass 3 A4 + A5: classified at the caller's clock seam (-NowUtc; null = the real time NOW, not the time this request began), and an EMPTY answer is a read that failed (the listing swallows an unreadable folder, and A, the ticket that
+                    # made this give-back necessary, was just seen in it), so it keeps the earlier census
                     $afterRelease = $after
-                    try { $afterRelease = @(Get-VenueTickets -Venue $Venue -ClaimDir $ClaimDir -NowUtc $now | Where-Object { $_.state -cne 'STALE' }) } catch { $afterRelease = $after }
+                    try { $fresh = @(Get-VenueTickets -Venue $Venue -ClaimDir $ClaimDir -NowUtc $NowUtc | Where-Object { $_.state -cne 'STALE' }); if ($fresh.Count -gt 0) { $afterRelease = $fresh } } catch { $afterRelease = $after }
                     $myAfter = @($afterRelease | Where-Object { $_.name -ceq $t.name })
                     return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $(if ($seen) { $seen.claim }); path = $r.path; broken = @($r.broken); ticket = $t; queue = $afterRelease; position = $(if ($myAfter.Count -gt 0) { [int]$myAfter[0].position } else { 0 }); staleTickets = @($removed); note = '' }
                 }
@@ -745,8 +748,11 @@ function Request-VenueClaim {
                 # the claim that could not be given back is named on the ticket (pendingReleaseNonce), so it is not leaked, and the next poll made with this ticket lets go of it before anything else (the top of this function).
                 $t | Add-Member -NotePropertyName pendingReleaseNonce -NotePropertyValue ([string]$r.claim.nonce) -Force
                 $seenBusy = $null; try { $seenBusy = Get-VenueClaim -Venue $Venue -ClaimDir $ClaimDir } catch { $seenBusy = $null }
-                $myBusy = @($after | Where-Object { $_.name -ceq $t.name })
-                return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $(if ($seenBusy) { $seenBusy.claim }); path = $r.path; broken = @($r.broken); ticket = $t; queue = $after; position = $(if ($myBusy.Count -gt 0) { [int]$myBusy[0].position } else { 0 }); staleTickets = @($removed)
+                # pass 3 A4: the same fresh census as the released case (the five tries sleep for 1.5 s, in which a ticket can be reaped), with the same empty-read guard
+                $afterBusy = $after
+                try { $freshBusy = @(Get-VenueTickets -Venue $Venue -ClaimDir $ClaimDir -NowUtc $NowUtc | Where-Object { $_.state -cne 'STALE' }); if ($freshBusy.Count -gt 0) { $afterBusy = $freshBusy } } catch { $afterBusy = $after }
+                $myBusy = @($afterBusy | Where-Object { $_.name -ceq $t.name })
+                return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $(if ($seenBusy) { $seenBusy.claim }); path = $r.path; broken = @($r.broken); ticket = $t; queue = $afterBusy; position = $(if ($myBusy.Count -gt 0) { [int]$myBusy[0].position } else { 0 }); staleTickets = @($removed)
                     note = "CLAIM_GIVE_BACK_BUSY ticket=$($t.name) (the claim was granted behind an older ready ticket and could not be given back in 5 tries; queued, the next poll lets go of it)" }
             }
         } catch { $null = $_ }
@@ -874,12 +880,13 @@ function Invoke-VenueLateRelease {
     }
     if ($null -eq $Clock) { $sw = [Diagnostics.Stopwatch]::StartNew(); $Clock = { $sw.Elapsed.TotalSeconds }.GetNewClosure() }
     if ($null -eq $Sleep) { $Sleep = { param([int]$Ms) Start-Sleep -Milliseconds $Ms } }
-    $answer = ''; $tries = 0; $probed = $false
+    $answer = ''; $tries = 0; $probed = $false; $anyUnanswered = $false   # pass 3 A3: $anyUnanswered = some call did not answer (NO_ANSWER / ERROR), even when the probe after it did (BUSY)
     for ($try = 1; $try -le 5; $try++) {
         # r10 (adversary A1): the clock is asked again after the sleep: one clamped to the end of the reserve (or woken late) must not start a try, which would run a whole release call past it
         if ($try -gt 1 -and (& $Clock) -ge $BoundSec) { break }
         $tries++
         try { $answer = [string](& $Call 5 ([Math]::Max(0.0, $BoundSec - (& $Clock)) + $CallCapSec)) } catch { $answer = 'ERROR' }
+        if ($answer -cin @('NO_ANSWER', 'ERROR')) { $anyUnanswered = $true }
         if ($answer -cin $released) { break }
         $left = $BoundSec - (& $Clock)
         if ($try -ge 5 -or $left -le 0) { break }
@@ -894,13 +901,14 @@ function Invoke-VenueLateRelease {
         # is not started at all when none is
         $hardEnd = $BoundSec + $CallCapSec + $ProbeCapSec
         $probeSec = [Math]::Min($ProbeCapSec, $hardEnd - (& $Clock))
-        if ($probeSec -le 0) { $answer = 'NO_ANSWER' }
+        if ($probeSec -le 0) { $answer = 'NO_ANSWER'; $anyUnanswered = $true }
         else {
             $probed = $true
             try { $answer = [string](& $Call 1 $probeSec) } catch { $answer = 'ERROR' }
+            if ($answer -cin @('NO_ANSWER', 'ERROR')) { $anyUnanswered = $true }
         }
     }
-    [pscustomobject]@{ answer = $answer; tries = $tries; probed = $probed; endSec = (& $Clock) }
+    [pscustomobject]@{ answer = $answer; tries = $tries; probed = $probed; anyUnanswered = $anyUnanswered; endSec = (& $Clock) }
 }
 
 function ConvertFrom-VenueGateLog {
@@ -1351,6 +1359,11 @@ function Invoke-VenueBoundedRead {
     # finite number is REFUSED, typed, before the worker starts. NaN skipped both the clamp (NaN -lt x is false: the full -TimeoutSec wait) and the late-answer rejection
     # (Elapsed - NaN -gt 0 is false), so an answer past the caller's end was acted on.
     if (-not [double]::IsFinite($EndSec)) { throw "VENUE_BUDGET_ENDPOINT_NONFINITE -EndSec is $($EndSec.ToString([Globalization.CultureInfo]::InvariantCulture)); a budget endpoint that is not a finite number is refused, never read as a wait wider than the caller's end" }
+    # TAIL-1 r2 pass 3 A2: a call whose fixed end has ALREADY passed (the caller was descheduled between starting its clock and calling here, or its cap is 0) starts no worker at all: BeginInvoke used to submit the release or the create
+    # before the expired wait was computed, so the worker could change the file while the caller reported NO_ANSWER. Not abandoned, not counted: nothing was sent.
+    if ($null -ne $Clock -and ($EndSec - $Clock.Elapsed.TotalSeconds) -le 0) {
+        return [pscustomobject]@{ answered = $false; value = @(); error = 'the call''s end had passed before its worker was started, so nothing was sent' }
+    }
     $ps = [powershell]::Create()
     $abandoned = $false
     try {

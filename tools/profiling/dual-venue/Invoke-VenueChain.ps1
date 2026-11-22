@@ -285,6 +285,12 @@ $ticketProbeStaleSec = Get-VenueTicketProbeStaleSec -QuietMaxWaitSec $QuietMaxWa
 
 function Close-LegTicket([string]$LegName, [string]$Event, [string]$Why) {
     if ($null -eq $script:ticket) { return }
+    # TAIL-1 r2 pass 3 A6: a claim a give-back could not let go of (A13: its nonce is on the ticket) is let go of BEFORE the ticket is removed and the object dropped, or the name that was kept for it is lost with the ticket
+    # and the claim stands behind a live pid until its expiry
+    if ($null -ne $script:ticket.PSObject.Properties['pendingReleaseNonce'] -and [string]$script:ticket.pendingReleaseNonce) {
+        $pendingRel = ''; try { $pendingRel = [string](Release-VenueClaim -Venue $Venue -Nonce ([string]$script:ticket.pendingReleaseNonce) -ClaimDir $ClaimDir -MaxAttempts 3) } catch { $pendingRel = 'ERROR' }
+        L "CLAIM_PENDING_RELEASE leg=$LegName ticket=$($script:ticket.name) result=$pendingRel (a claim a give-back could not let go of, released as the ticket ends)"
+    }
     $r = Remove-VenueTicket -Ticket $script:ticket
     L "$Event leg=$LegName ticket=$($script:ticket.name) result=$r reason=$Why keeps=$($script:ticketKeeps)/$TicketKeepMax"
     $script:ticket = $null

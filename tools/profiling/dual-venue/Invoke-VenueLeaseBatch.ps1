@@ -2408,10 +2408,13 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             if ($grantedOnRetry) { try { $lateAnswer = [string](Invoke-ClaimRetryRelease $deadline $req.claim.nonce) } catch { $lateAnswer = 'ERROR' } }
             else {
                 # TAIL-1 r2 A5: the caps are passed EXPLICITLY, so a caller's $PSDefaultParameterValues['Invoke-VenueLateRelease:ProbeCapSec' / 'CallCapSec'] cannot widen the bound
-                $lateAnswer = [string](Invoke-VenueLateRelease -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir -BoundSec $lateBoundSec -CallCapSec 1.5 -ProbeCapSec 1.0).answer
-                # TAIL-1 r2 A4: a release that was NOT answered (the claim share stopped answering: both workers timed out) turns the write suppression on, as Invoke-ClaimRetryRelease does, so the log line below
-                # (L / LogBest) cannot probe batch.log on that same failed share unbounded before the deadline result. Said on stderr only from then on. A BUSY answer is an answer: the share is up, the log is written.
-                if ($lateAnswer -cin @('NO_ANSWER', 'ERROR')) { Disable-RunDirWrites "the late release of a claim granted at or after the deadline was not answered ($lateAnswer)" }
+                # pass 3 A1: the injected seams (-Call, -Clock, -Sleep) are bound to $null as well: they are test seams, and a caller's $PSDefaultParameterValues must not replace the release with its own block
+                $late = Invoke-VenueLateRelease -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir -BoundSec $lateBoundSec -CallCapSec 1.5 -ProbeCapSec 1.0 -Call $null -Clock $null -Sleep $null
+                $lateAnswer = [string]$late.answer
+                # TAIL-1 r2 A4 (+ pass 3 A3): a release that was NOT answered (the claim share stopped answering: a worker timed out, in ANY of its calls, even when the probe after it was answered BUSY) turns the write suppression on,
+                # as Invoke-ClaimRetryRelease does, so the log line below (L / LogBest) cannot probe batch.log on that same failed share unbounded before the deadline result. Said on stderr only from then on. A BUSY answer
+                # alone is an answer: the share is up, the log is written.
+                if (($late.anyUnanswered -and $lateAnswer -cnotin @('RELEASED', 'ABSENT', 'NOT_OURS')) -or $lateAnswer -cin @('NO_ANSWER', 'ERROR')) { Disable-RunDirWrites "the late release of a claim granted at or after the deadline was not answered ($lateAnswer)" }
             }
             if ($lateAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { LogBest "CLAIM_LATE_GRANT batch=$batchNo (the claim was granted at or after the deadline: let go, not used)" }
             else { LogBest "CLAIM_LATE_GRANT_NOT_RELEASED batch=$batchNo answer=$lateAnswer (the claim was granted at or after the deadline and is NOT known to be let go: it still names this batch until its expiry or its owner's exit)" }
