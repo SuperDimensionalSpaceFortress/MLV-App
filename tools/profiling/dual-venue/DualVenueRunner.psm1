@@ -3867,7 +3867,8 @@ function Get-DvVisualCaptureOptOutRefusal {
         # r4 adversary A7: read the property value as it is. A subexpression or an `if` expression would enumerate a one-element array into the string inside it.
         $reasonText = $null
         if ($null -ne $reason) { $reasonText = $reason.Value }
-        if ($reasonText -isnot [datetime] -and ($reasonText -isnot [string] -or [string]::IsNullOrWhiteSpace($reasonText))) {
+        # r4 adversary A2: the schema's pattern is checked by Python, whose whitespace class also holds U+001C-U+001F, which .NET IsWhiteSpace does not: refuse those too.
+        if ($reasonText -isnot [datetime] -and ($reasonText -isnot [string] -or $reasonText -notmatch '[^\s\u001c-\u001f]')) {
             return 'visualCapture false needs a visualCaptureOptOutReason (a non-empty reason with a non-space character)'
         }
         return $null
