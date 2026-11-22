@@ -11,6 +11,7 @@ existing MLVAPP_DISABLE_RAW_UINT16_PREFETCH.
 """
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -203,6 +204,38 @@ int main(void)
                 self.assertRegex(
                     body, r"(QMAKE_LFLAGS\s*\+=[^\n]*-fopenmp|LIBS\s*\+=[^\n]*-l(libgomp-1|gomp|omp)\b)",
                     relative + " " + platform + ": link line lacks OpenMP")
+
+    @staticmethod
+    def _macx_arch_branches(macx_body: str) -> "dict[str, str]":
+        """QT_ARCH branches of a macx scope body, arch -> branch body. Reads exactly the lines of the form
+        `equals(QT_ARCH, <arch>) {` ... matching `}` (both .pro files name x86_64 and arm64 this way)."""
+        branches: "dict[str, str]" = {}
+        for opener in re.finditer(r"equals\(\s*QT_ARCH\s*,\s*([A-Za-z0-9_]+)\s*\)\s*\{", macx_body):
+            depth = 1
+            index = opener.end()
+            while depth and index < len(macx_body):
+                depth += {"{": 1, "}": -1}.get(macx_body[index], 0)
+                index += 1
+            branches[opener.group(1)] = macx_body[opener.end():index - 1]
+        return branches
+
+    def test_standalone_lj92_targets_pin_openmp_in_each_macos_arch_branch(self) -> None:
+        """LJ92-PRO-MACOS-ARCH-PIN-1 r1 (Dot advisory 9dab5e8d on #880): the test above reads the WHOLE macx body, so
+        a flag that survives in only one QT_ARCH branch still passes and the other macOS architecture can lose OpenMP
+        while CI stays green. Each architecture the .pro names must carry the compile flag and the link flag itself."""
+        for relative in ("tests/console/lj92_pred1_reader_tool.pro", "tests/fuzz/fuzz_lj92.pro"):
+            scopes = self._platform_scopes((ROOT / relative).read_text(encoding="utf-8"))
+            self.assertIn("macx", scopes, relative + " lost its macx scope")
+            branches = self._macx_arch_branches(scopes["macx"])
+            for arch in ("x86_64", "arm64"):
+                self.assertIn(arch, branches, relative + " macx lost its equals(QT_ARCH, " + arch + ") branch")
+            for arch, body in branches.items():
+                self.assertRegex(
+                    body, r"QMAKE_CFLAGS\s*\+=[^\n]*-fopenmp",
+                    relative + " macx QT_ARCH=" + arch + ": C compile lacks -fopenmp")
+                self.assertRegex(
+                    body, r"(QMAKE_LFLAGS\s*\+=[^\n]*-fopenmp|LIBS\s*\+=[^\n]*-l(libgomp-1|gomp|omp)\b)",
+                    relative + " macx QT_ARCH=" + arch + ": link line lacks OpenMP")
 
 
 if __name__ == "__main__":
