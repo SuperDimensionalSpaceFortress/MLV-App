@@ -241,6 +241,113 @@ TEST(ExportRenderedLookAssistWiring, RenderedGradeIsPushedToProcessingBeforeTheR
     ASSERT_TRUE(grade < render);
 }
 
+// ---- r2 hardening (sol r1 / opus key3 r1 on ed129ee1): a dead branch or a zeroed anchor does not pass -------------
+
+namespace
+{
+
+// Index just past the ')' closing the call at callAt; -1 when unbalanced.
+int callEnd(const QString & body, int callAt)
+{
+    const int open = body.indexOf(QLatin1Char('('), callAt);
+    if (open < 0) return -1;
+    int depth = 0;
+    for (int i = open; i < body.length(); ++i) {
+        if (body.at(i) == QLatin1Char('(')) ++depth;
+        else if (body.at(i) == QLatin1Char(')') && --depth == 0) return i + 1;
+    }
+    return -1;
+}
+
+// The analysis runs unconditionally on exactly the CDNG anchor, and its grade push is guarded by its verdict alone.
+bool analysisIsWiredUnconditionally(const QString & body)
+{
+    const int apply = body.indexOf(QStringLiteral("ReceiptApplier::applyToMlv("));
+    const int lookAssist = body.indexOf(kLookAssistCall);
+    const int grade = body.indexOf(kGradePush);
+    if (apply < 0 || lookAssist <= apply || grade <= lookAssist) return false;
+    const int applyEnd = callEnd(body, apply);
+    const int lookAssistEnd = callEnd(body, lookAssist);
+    if (applyEnd < 0 || lookAssistEnd < 0) return false;
+    return collapseSpaces(body.mid(applyEnd, lookAssist - applyEnd))
+               == QStringLiteral(";BatchRenderCancelScopecancelScope;constboollookAssistApplied=")
+        && collapseSpaces(callArguments(body, lookAssist))
+               == QStringLiteral("receipt,mlvObject,processingObject,CdngSequenceExport::lookAssistAnalysisFrameIndex(cutIn,cutIn)")
+        && collapseSpaces(body.mid(lookAssistEnd, grade - lookAssistEnd))
+               == QStringLiteral(";if(lookAssistApplied){ReceiptApplier::");
+}
+
+const QString kCancelCheck = QStringLiteral("BatchRenderCancelScope::cancelled()");
+
+// r2 B3 (sol r1 on ed129ee1): between the analysis and the frame loop the cancel flag is checked before the plan check
+// and before the encoder spawn, and every return there either is the typed cancellation or sits in a branch that
+// checks the flag first.
+bool preEncodeExitsReportACancel(const QString & body)
+{
+    const int lookAssist = body.indexOf(kLookAssistCall);
+    const int loop = body.indexOf(QStringLiteral("for( uint32_t frameIndex"));
+    if (lookAssist < 0 || loop <= lookAssist) return false;
+    const QString window = body.mid(lookAssist, loop - lookAssist);
+    const int planCheck = window.indexOf(QStringLiteral("if( !plan.runnable )"));
+    const int renderStart = window.indexOf(QStringLiteral("[BATCH] RENDER_START"));
+    const int spawn = window.indexOf(QStringLiteral("pipeline.start("));
+    if (planCheck < 0 || renderStart < 0 || spawn <= renderStart) return false;
+    const int firstCheck = window.indexOf(kCancelCheck);
+    if (firstCheck < 0 || firstCheck > planCheck) return false;
+    if (window.mid(renderStart, spawn - renderStart).indexOf(kCancelCheck) < 0) return false;
+    int returns = 0;
+    for (int at = window.indexOf(QStringLiteral("return ")); at >= 0; at = window.indexOf(QStringLiteral("return "), at + 1)) {
+        ++returns;
+        if (window.mid(at).startsWith(QStringLiteral("return renderedCancelledBeforeEncode("))) continue;
+        const int branch = window.lastIndexOf(QLatin1Char('{'), at);
+        if (branch < 0 || window.mid(branch, at - branch).indexOf(kCancelCheck) < 0) return false;
+    }
+    return returns > 0;
+}
+
+} // namespace
+
+TEST(ExportRenderedLookAssistWiring, RenderedAnalysisIsWiredUnconditionally)
+{
+    const QString body = renderedBody();
+    ASSERT_TRUE(analysisIsWiredUnconditionally(body));
+    // The mutations the r1 reviewers showed passing the older checks now fail.
+    QString deadBranch = body;
+    deadBranch.replace(QStringLiteral("const bool lookAssistApplied ="), QStringLiteral("if (false) {} const bool lookAssistApplied ="));
+    ASSERT_FALSE(analysisIsWiredUnconditionally(deadBranch));
+    QString zeroAnchor = body;
+    zeroAnchor.replace(QStringLiteral("lookAssistAnalysisFrameIndex( cutIn, cutIn )"),
+                       QStringLiteral("lookAssistAnalysisFrameIndex( cutIn, cutIn ) * 0u"));
+    ASSERT_FALSE(analysisIsWiredUnconditionally(zeroAnchor));
+    QString deadPush = body;
+    deadPush.replace(QStringLiteral("if( lookAssistApplied )"), QStringLiteral("if( lookAssistApplied && false )"));
+    ASSERT_FALSE(analysisIsWiredUnconditionally(deadPush));
+}
+
+TEST(ExportRenderedLookAssistWiring, ACancelDuringTheAnalysisIsTheTypedCancellation)
+{
+    ASSERT_TRUE(preEncodeExitsReportACancel(renderedBody()));
+}
+
+TEST(ExportRenderedLookAssistWiring, ACancelCheckMissingFromAPreEncodeExitIsCaught)
+{
+    const QString plain = QStringLiteral(
+        "ReceiptApplier::applyHeadlessLookAssist( r ); if( BatchRenderCancelScope::cancelled() ) { return renderedCancelledBeforeEncode( b ); }"
+        " if( !plan.runnable ) { if( BatchRenderCancelScope::cancelled() ) return renderedCancelledBeforeEncode( b ); return 2; }"
+        " \"[BATCH] RENDER_START\"; if( BatchRenderCancelScope::cancelled() ) { return renderedCancelledBeforeEncode( b ); }"
+        " if( !pipeline.start( i ) ) { if( BatchRenderCancelScope::cancelled() ) return renderedCancelledBeforeEncode( b ); return 4; }"
+        " for( uint32_t frameIndex = 0; ; ) {}");
+    ASSERT_TRUE(preEncodeExitsReportACancel(plain));
+    QString unchecked = plain;
+    unchecked.replace(QStringLiteral("{ if( BatchRenderCancelScope::cancelled() ) return renderedCancelledBeforeEncode( b ); return 4; }"),
+                      QStringLiteral("{ return 4; }"));
+    ASSERT_FALSE(preEncodeExitsReportACancel(unchecked));
+    QString lateCheck = plain;
+    lateCheck.replace(QStringLiteral("ReceiptApplier::applyHeadlessLookAssist( r ); if( BatchRenderCancelScope::cancelled() ) { return renderedCancelledBeforeEncode( b ); }"),
+                      QStringLiteral("ReceiptApplier::applyHeadlessLookAssist( r );"));
+    ASSERT_FALSE(preEncodeExitsReportACancel(lateCheck));
+}
+
 // (5)
 TEST(ExportRenderedLookAssistWiring, CdngExportLookAssistIsUnchanged)
 {

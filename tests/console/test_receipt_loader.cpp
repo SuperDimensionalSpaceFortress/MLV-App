@@ -146,7 +146,7 @@ static bool loadReceiptText(const QByteArray & text, ReceiptSettings * receipt)
     return ReceiptLoader::loadFromFile(receiptPath, receipt, &error_message) && error_message.isEmpty();
 }
 
-TEST(ReceiptLoader, ACompactReceiptLosesNoElement)
+TEST(ReceiptLoader, ACompactReceiptLosesNoOptOut)
 {
     ReceiptSettings receipt;
     ASSERT_TRUE(receipt.lookAssistEnabled());   // the default the skipped element used to leave
@@ -154,15 +154,57 @@ TEST(ReceiptLoader, ACompactReceiptLosesNoElement)
         "<receipt version=\"4\"><cutIn>1</cutIn><lookAssistEnabled>0</lookAssistEnabled></receipt>"), &receipt));
     ASSERT_EQ(1u, receipt.cutIn());
     ASSERT_FALSE(receipt.lookAssistEnabled());
+}
+
+// r2 B1 (sol r1 on ed129ee1): every field other than the Look Assist opt-out is read token for token as on base
+// 1a65d592, whose walk reads a compact receipt's first element and stops at the end of the next one. Reading the rest
+// changed the rendered frame range with Look Assist off (base exports 1..clip end for this receipt, not 2..2).
+TEST(ReceiptLoader, ACompactOffReceiptKeepsTheBaseFrameRange)
+{
+    ReceiptSettings defaults;
+    ReceiptSettings receipt;
+    ASSERT_TRUE(loadReceiptText(QByteArrayLiteral(
+        "<receipt version=\"4\"><lookAssistEnabled>0</lookAssistEnabled><cutIn>2</cutIn><cutOut>2</cutOut></receipt>"),
+        &receipt));
+    ASSERT_FALSE(receipt.lookAssistEnabled());
+    ASSERT_EQ(defaults.cutIn(), receipt.cutIn());
+    ASSERT_EQ(defaults.cutOut(), receipt.cutOut());
 
     ReceiptSettings flavored;
     ASSERT_TRUE(loadReceiptText(QByteArrayLiteral(
         "<receipt version=\"4\"><lookAssistEnabled>1</lookAssistEnabled><lookAssistFlavor>film</lookAssistFlavor>"
         "<unknownFutureTag>7</unknownFutureTag><cutIn>3</cutIn><cutOut>9</cutOut></receipt>"), &flavored));
     ASSERT_TRUE(flavored.lookAssistEnabled());
-    ASSERT_EQ(std::string("film"), flavored.lookAssistFlavor().toStdString());
-    ASSERT_EQ(3u, flavored.cutIn());
-    ASSERT_EQ(9u, flavored.cutOut());
+    ASSERT_EQ(defaults.lookAssistFlavor().toStdString(), flavored.lookAssistFlavor().toStdString());
+    ASSERT_EQ(defaults.cutIn(), flavored.cutIn());
+    ASSERT_EQ(defaults.cutOut(), flavored.cutOut());
+}
+
+// r2 B2a (sol r1 on ed129ee1): a compact namespaced extension between cutIn and the plain opt-out hides nothing.
+TEST(ReceiptLoader, AnExtensionBeforeACompactOptOutDoesNotHideIt)
+{
+    ReceiptSettings receipt;
+    ASSERT_TRUE(loadReceiptText(QByteArrayLiteral(
+        "<receipt version=\"4\" xmlns:x=\"urn:metadata\"><cutIn>1</cutIn><x:lookAssistEnabled>1</x:lookAssistEnabled>"
+        "<lookAssistEnabled>0</lookAssistEnabled></receipt>"), &receipt));
+    ASSERT_FALSE(receipt.lookAssistEnabled());
+}
+
+// r2 B2b (sol r1 on ed129ee1): an indented extension after the plain opt-out does not overwrite it.
+TEST(ReceiptLoader, AnIndentedExtensionAfterTheOptOutDoesNotOverwriteIt)
+{
+    ReceiptSettings receipt;
+    ASSERT_TRUE(loadReceiptText(QByteArrayLiteral(
+        "<receipt version=\"4\" xmlns:x=\"urn:metadata\">\n<lookAssistEnabled>0</lookAssistEnabled>\n"
+        "<x:lookAssistEnabled>1</x:lookAssistEnabled>\n</receipt>\n"), &receipt));
+    ASSERT_FALSE(receipt.lookAssistEnabled());
+
+    // The last plain element still wins when it opts back in, as on base; CRLF reads the same.
+    ReceiptSettings optIn;
+    ASSERT_TRUE(loadReceiptText(QByteArrayLiteral(
+        "<receipt version=\"4\">\r\n<lookAssistEnabled>0</lookAssistEnabled>\r\n<lookAssistEnabled>1</lookAssistEnabled>\r\n"
+        "</receipt>\r\n"), &optIn));
+    ASSERT_TRUE(optIn.lookAssistEnabled());
 }
 
 // Adversary A5 on 16d54744: a compact namespaced extension tag with a known local name does not overwrite the field.
@@ -186,7 +228,8 @@ TEST(ReceiptLoader, AnIndentedReceiptReadsAsBefore)
     ASSERT_EQ(5u, receipt.cutOut());
 }
 
-// The GUI's copy of the reader (MainWindow::readXmlElementsFromFile, not linked here) walks the same way.
+// The GUI's copy of the reader (MainWindow::readXmlElementsFromFile, not linked here) keeps the base walk and applies
+// the same opt-out scan after it (r2 B1/B2).
 TEST(ReceiptLoader, TheGuiReaderUsesTheSameWalk)
 {
     QFile file(repo_file_path(QStringLiteral("platform/qt/MainWindow.cpp")));
@@ -197,11 +240,30 @@ TEST(ReceiptLoader, TheGuiReaderUsesTheSameWalk)
     const int end = source.indexOf(QStringLiteral("\n}"), at);
     ASSERT_TRUE(end > at);
     const QString body = source.mid(at, end - at);
-    const int next = body.indexOf(QStringLiteral("walk.next( Rxml );"));
-    const int settle = body.lastIndexOf(QStringLiteral("walk.settle( Rxml );"));
-    ASSERT_TRUE(next >= 0);
-    ASSERT_TRUE(settle > next);
-    ASSERT_EQ(-1, body.indexOf(QStringLiteral("        Rxml->readNext();\n\n        if( Rxml->isStartElement() && Rxml->name() == QString( \"exposure\" ) )")));
+    const int offset = body.indexOf(QStringLiteral("const qint64 receiptElementOffset = Rxml->characterOffset();"));
+    const int walk = body.indexOf(QStringLiteral(
+        "    while( !Rxml->atEnd() && !Rxml->isEndElement() )\n    {\n        Rxml->readNext();\n\n"
+        "        if( Rxml->isStartElement() && Rxml->name() == QString( \"exposure\" ) )"));
+    const int scan = body.indexOf(QStringLiteral(
+        "if( ReceiptXmlWalk::plainLookAssistOptOut( Rxml, receiptElementOffset ) ) receipt->setLookAssistEnabled( false );"));
+    ASSERT_TRUE(offset >= 0);
+    ASSERT_TRUE(walk > offset);
+    ASSERT_TRUE(scan > walk);
+    ASSERT_TRUE(scan > body.lastIndexOf(QStringLiteral("Rxml->readElementText();")));
+    ASSERT_EQ(-1, body.indexOf(QStringLiteral("walk.next(")));
+    ASSERT_EQ(-1, body.indexOf(QStringLiteral("walk.settle(")));
+}
+
+// The batch reader carries the same two pieces (its behaviour is pinned by the tests above).
+TEST(ReceiptLoader, TheBatchReaderKeepsTheBaseWalk)
+{
+    QFile file(repo_file_path(QStringLiteral("src/batch/ReceiptLoader.cpp")));
+    ASSERT_TRUE(file.open(QIODevice::ReadOnly | QIODevice::Text));
+    const QString source = QString::fromUtf8(file.readAll());
+    ASSERT_EQ(-1, source.indexOf(QStringLiteral("walk.next(")));
+    ASSERT_EQ(-1, source.indexOf(QStringLiteral("walk.settle(")));
+    ASSERT_TRUE(source.indexOf(QStringLiteral(
+        "if( ReceiptXmlWalk::plainLookAssistOptOut( Rxml, receiptElementOffset ) ) receipt->setLookAssistEnabled( false );")) >= 0);
 }
 
 TEST(ReceiptLoader, MissingReceiptReturnsUsefulError)
