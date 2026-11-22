@@ -601,6 +601,9 @@ class LeaseBatchPlanCheckerTests(unittest.TestCase):
         self.assertIsNotNone(skip, "the no-probe list guards the batch.log probe")
         self.assertIn("'SPEC_READ_TIMEOUT'", skip.group(1))
         self.assertIn("'EXPORT_BUDGET_PREFLIGHT_TIMEOUT'", skip.group(1))
+        # the sibling (adversary r14 pass 17 A4 / pass 18 A5): the plan file's own read timeout keeps its LEG_PLAN_UNREADABLE code but skips the probe the same way a location the guard gave up on does
+        self.assertIn("if ($planRead.state -ceq 'TIMEOUT') { $script:RunOutputAliased = $true; Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 ", source)
+        self.assertIn("if (-not $script:RunOutputAliased -and $Reason -cnotin", refused.group(0))
 
     def test_the_arm_is_judged_from_the_bytes_the_leg_is_bound_to(self) -> None:
         # adversary A4: Get-LegSpecTelemetryArm must hash its read against the digest the preflight judged (the one -ExpectSpecSha256 binds the leg to). A spec shown as LIGHT to this

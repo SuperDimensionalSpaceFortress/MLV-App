@@ -1639,7 +1639,9 @@ if ($legPlanMode) {
         if ($outputRefusal) { Stop-PlanRefused (Get-OutputRefusalCode 'LEG_PLAN_IS_RUN_OUTPUT') 0 "the plan file $outputRefusal" }
         # r19 (sol r18 B2 sibling sweep): the plan's read is bounded by the room before -DeadlineUtc too; no answer in it is the typed LEG_PLAN_UNREADABLE, never a read past the deadline
         $planRead = Read-SpecBytesWithin $planPath (Get-SpecReadBoundSec)
-        if ($planRead.state -ceq 'TIMEOUT') { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' could not be read within the time left before -DeadlineUtc" }
+        # r14 (adversary r14 pass 17 A4 / pass 18 A5, the sol r13 B5 class): a plan read that got no answer refuses without probing batch.log first (the stalled share may hold -RunDir too),
+        # the same rule as a location the guard gave up on (RunOutputAliased); stderr carries the typed line. The code stays LEG_PLAN_UNREADABLE.
+        if ($planRead.state -ceq 'TIMEOUT') { $script:RunOutputAliased = $true; Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' could not be read within the time left before -DeadlineUtc" }
         # r14 (sol r13 B4): a plan that repeats a key (a `purpose` written twice) is LEG_PLAN_UNREADABLE, never the last value the parser kept
         $doc = try { if ($planRead.state -cne 'OK') { throw [string]$planRead.error }; $planText = [IO.StreamReader]::new([IO.MemoryStream]::new([byte[]]$planRead.bytes), $true).ReadToEnd(); Assert-FpsJsonNoRepeatedKey $planText $planPath; $planText | ConvertFrom-Json -NoEnumerate } catch { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' is not JSON: $($_.Exception.Message)" }
         # Dot B1: the entries are kept exactly as written, nulls included, so each is shape-checked at its ORIGINAL position below. Nothing here filters, unrolls or wraps them.
