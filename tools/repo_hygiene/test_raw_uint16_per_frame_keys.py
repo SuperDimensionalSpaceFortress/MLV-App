@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -75,6 +76,10 @@ _QMAKE_CONFIG_ATOM = r"CONFIG\(\s*(?:debug|release)\s*(?:,\s*debug\s*\|\s*releas
 _QMAKE_ASSIGNMENT = re.compile(
     r"^(?P<cond>(?:[^=]*?:)?)\s*(?P<var>[A-Za-z_][A-Za-z0-9_.]*)\s*(?P<op>\+=|-=|\*=|~=|=)\s*(?P<value>.*)$")
 _QMAKE_INCLUDE = re.compile(r"include\(\s*([^()$\"',\s]+)\s*\)")
+# take_first(VAR) / take_last(VAR) return a value AND remove it from VAR, so an expansion of either is an edit of VAR wherever it
+# appears, whatever variable it is assigned to (sol r3 B1). A function name assembled from another expansion could spell either, so
+# it is refused too.
+_QMAKE_MUTATING_EXPANSION = re.compile(r"take_(?:first|last)|\$\$\{?[A-Za-z0-9_.]*\$\$")
 _QMAKE_MAX_INCLUDE_NESTING = 8
 # CONFIG tokens a `+=` may add: none of them is a selector the model reads (macx, a platform name, debug/release).
 _QMAKE_BENIGN_CONFIG_TOKENS = frozenset(("c++11", "c++14", "c++17", "c++20", "console", "warn_on", "warn_off"))
@@ -96,6 +101,13 @@ _QMAKE_UNREADABLE_CHARACTER = re.compile(r"[^\x20-\x7e\t]")
 def _read_qmake_file(path: Path) -> str:
     """A .pro/.pri file as qmake sees its bytes: no universal-newline translation (a lone CR must stay a CR)."""
     return path.read_bytes().decode("utf-8")
+
+
+def _qmake_include_is_local(relative: str) -> bool:
+    """Whether include(relative) is a path relative to the including file's directory: no leading `/` (a root path
+    or a `//host/share` UNC path), no backslash (a Windows root or UNC path), no `:` (a drive, or the `//?/UNC/...` forms) and no
+    `~`. Anything else could send the synchronous read to a network share, so it is refused before any file I/O."""
+    return not (relative.startswith(("/", "~")) or "\\" in relative or ":" in relative)
 
 
 def _qmake_include_target(directory: Path, relative: str) -> Path:
@@ -290,6 +302,9 @@ def _qmake_simulate(
             raise AssertionError("unsupported qmake construct: " + repr(statement))
         variable, operator, value = match.group("var"), match.group("op"), match.group("value")
         _qmake_refuse_malformed_value(statement, value)
+        if _QMAKE_MUTATING_EXPANSION.search(value):
+            raise AssertionError("unsupported qmake construct (an expansion that removes a value from the variable it reads): "
+                                 + repr(statement))
         tokens = re.split(r"[ \t]+", value.strip(" \t"))
         tokens = [token for token in tokens if token]
         if variable == "QT_ARCH" or (variable == "CONFIG" and (
@@ -344,6 +359,9 @@ def _qmake_simulate(
         if nesting >= _QMAKE_MAX_INCLUDE_NESTING:
             raise AssertionError("unsupported qmake construct: include() nested more than "
                                  + str(_QMAKE_MAX_INCLUDE_NESTING) + " deep (a loop?)")
+        if not _qmake_include_is_local(relative):
+            raise AssertionError("unsupported qmake construct: include(" + relative + ") is not a path relative to the including "
+                                 "file (a UNC share, drive or root path would read outside this checkout)")
         target = _qmake_include_target(directory, relative)
         try:
             text = _read_qmake_file(target)
@@ -555,6 +573,10 @@ _MACX_PIN_CASES = (
      "macx:equals(QT_ARCH, arm64):CONFIG(release, debug|release):LIBS += -fno-openmp", []),
     ("C-sibling -fno-openmp inside the compiler command", _ARM64_LIVE,
      "macx:equals(QT_ARCH, arm64):QMAKE_CC = clang -fno-openmp", [_COMPILE_GAP]),
+    # sol r3 blocker 1 controls: a replacement function that only READS a tracked variable changes nothing, so it stays readable.
+    ("D-B1 control: last() only reads QMAKE_CFLAGS", _ARM64_LIVE, "macx:equals(QT_ARCH, arm64):SAVED = $$last(QMAKE_CFLAGS)", []),
+    ("D-B1 control: first() only reads LIBS", _ARM64_LIVE, "SAVED = $$first(LIBS)", []),
+    ("D-B1 control: clean_path() on an untracked value", _ARM64_LIVE, "SAVED = $$clean_path($$PWD/..)", []),
     ("C-sibling -fno-openmp inside the linker command", _arm64_section(
         "QMAKE_CFLAGS += -fopenmp", "QMAKE_LFLAGS += -fopenmp"),
      "macx:equals(QT_ARCH, arm64):QMAKE_LINK = clang++ -fno-openmp", [_LINK_GAP]),
@@ -635,6 +657,27 @@ _MACX_PIN_REFUSED = (
     ("C-A12 an unterminated quote in an untracked assignment", _ARM64_LIVE, 'PIN_NOTE = "unterminated\n'),
     ("C-A12 an unterminated function call in an untracked assignment", _ARM64_LIVE, "PIN_NOTE = $$clean_path(foo\n"),
     ("C-A12 a stray closing parenthesis in an untracked assignment", _ARM64_LIVE, "PIN_NOTE = foo)\n"),
+    # sol r3 blocker 1: take_first()/take_last() REMOVE a value from the variable they read, so an assignment to an unwatched
+    # variable that expands one can still strip -fopenmp or -lomp. Every operator, every tracked variable, every spelling.
+    ("D-B1 take_last(QMAKE_CFLAGS) saved into an untracked variable", _ARM64_LIVE,
+     "macx:equals(QT_ARCH, arm64):SAVED = $$take_last(QMAKE_CFLAGS)"),
+    ("D-B1 take_last(LIBS) saved into an untracked variable", _ARM64_LIVE,
+     "macx:equals(QT_ARCH, arm64):SAVED = $$take_last(LIBS)"),
+    ("D-B1 take_first(QMAKE_LFLAGS) saved into an untracked variable", _ARM64_LIVE,
+     "macx:equals(QT_ARCH, arm64):SAVED = $$take_first(QMAKE_LFLAGS)"),
+    ("D-B1 take_last() with +=", _ARM64_LIVE, "macx:equals(QT_ARCH, arm64):SAVED += $$take_last(LIBS)"),
+    ("D-B1 take_last() with *=", _ARM64_LIVE, "macx:equals(QT_ARCH, arm64):SAVED *= $$take_last(LIBS)"),
+    ("D-B1 take_last() with -=", _ARM64_LIVE, "macx:equals(QT_ARCH, arm64):SAVED -= $$take_last(LIBS)"),
+    ("D-B1 take_last() with no condition", _ARM64_LIVE, "SAVED = $$take_last(QMAKE_CFLAGS)"),
+    ("D-B1 take_last() inside the branch", _ARM64_LIVE, _ARM64_BLOCK % "    SAVED = $$take_last(QMAKE_CFLAGS)"),
+    ("D-B1 take_last() under a condition that is false for arm64", _ARM64_LIVE,
+     "win32:SAVED = $$take_last(QMAKE_CFLAGS)"),
+    ("D-B1 braced $${take_last(...)} expansion", _ARM64_LIVE, "macx:equals(QT_ARCH, arm64):SAVED = $${take_last(LIBS)}"),
+    ("D-B1 take_last() as a later argument of another expansion", _ARM64_LIVE,
+     "SAVED = $$join(KEEP, $$take_last(LIBS))"),
+    ("D-B1 a function name assembled from another expansion", _ARM64_LIVE, "SAVED = $$take_$$WHICH(LIBS)"),
+    ("D-B1 take_last() in a tracked variable's own value", _ARM64_LIVE,
+     "macx:equals(QT_ARCH, arm64):QMAKE_CFLAGS_RELEASE = $$take_last(QMAKE_CFLAGS)"),
 )
 
 
@@ -761,7 +804,8 @@ int main(void)
             elif char == "}":
                 depth -= 1
                 if depth == 0:
-                    scopes[name] = pro_text[body_start:index]
+                    # a second scope of the same name is additive in qmake, so its body joins the first one's
+                    scopes[name] = scopes.get(name, "") + "\n" + pro_text[body_start:index]
                     header_start = index + 1
             elif char == "\n" and depth == 0:
                 header_start = index + 1
@@ -887,6 +931,86 @@ int main(void)
                 project = self._project_with_include(scratch, include_line, files)
                 with self.assertRaisesRegex(AssertionError, "unsupported qmake construct"):
                     _project_openmp_gaps(project, "arm64")
+
+    # sol r3 blocker 2: an include path that is not relative to the including file (a UNC share, a drive, a root path) would
+    # send the synchronous read off this machine's checkout, onto a network share with no deadline.
+    _NON_LOCAL_INCLUDES = (
+        "//build-share/qt/openmp.pri",
+        "\\\\build-share\\qt\\openmp.pri",
+        "//?/UNC/build-share/qt/openmp.pri",
+        "C:/qt/openmp.pri",
+        "C:openmp.pri",
+        "c:\\qt\\openmp.pri",
+        "/opt/qt/openmp.pri",
+        "\\qt\\openmp.pri",
+        "..\\common\\openmp.pri",
+    )
+
+    def _reads_made_by(self, project_text: str, directory: Path) -> "list[Path]":
+        """Judge project_text with every file read intercepted; returns the paths the model tried to open."""
+        reads: "list[Path]" = []
+
+        def spy(path: Path) -> str:
+            reads.append(path)
+            raise FileNotFoundError(str(path))
+
+        with mock.patch.dict(globals(), {"_read_qmake_file": spy}):
+            with self.assertRaisesRegex(AssertionError, "unsupported qmake construct"):
+                _macos_openmp_gaps(project_text, "arm64", directory)
+        return reads
+
+    def test_macos_arch_pin_refuses_include_paths_that_leave_the_checkout_before_any_read(self) -> None:
+        directory = Path("proj") / "sub"
+        for relative in self._NON_LOCAL_INCLUDES:
+            with self.subTest("root project " + relative):
+                text = _MACX_PIN_TEMPLATE % {"arm64": _ARM64_LIVE, "tail": "include(" + relative + ")"}
+                self.assertEqual(self._reads_made_by(text, directory), [], "a non-local include must be refused unread")
+            with self.subTest("nested include " + relative):
+                with tempfile.TemporaryDirectory() as scratch:
+                    root = Path(scratch)
+                    (root / "outer.pri").write_text("include(" + relative + ")\n", encoding="utf-8")
+                    reads: "list[Path]" = []
+                    real_read = _read_qmake_file
+
+                    def spy(path: Path) -> str:
+                        reads.append(path)
+                        if path.name == "outer.pri":
+                            return real_read(path)
+                        raise FileNotFoundError(str(path))
+
+                    text = _MACX_PIN_TEMPLATE % {"arm64": _ARM64_LIVE, "tail": "include(outer.pri)"}
+                    with mock.patch.dict(globals(), {"_read_qmake_file": spy}):
+                        with self.assertRaisesRegex(AssertionError, "unsupported qmake construct"):
+                            _macos_openmp_gaps(text, "arm64", root)
+                    self.assertEqual([path.name for path in reads], ["outer.pri"], "only the local include may be read")
+
+    def test_macos_arch_pin_still_follows_parent_and_nested_relative_includes(self) -> None:
+        """The refusal above must not turn away the includes the real projects use (`../common/x.pri`, `sub/x.pri`)."""
+        directory = Path("proj") / "sub"
+        for relative in ("../common/test_defaults.pri", "fuzz_target_defaults.pri", "inner/./x.pri", "a..b/x.pri"):
+            with self.subTest(relative):
+                text = _MACX_PIN_TEMPLATE % {"arm64": _ARM64_LIVE, "tail": "include(" + relative + ")"}
+                reads: "list[Path]" = []
+
+                def spy(path: Path) -> str:
+                    reads.append(path)
+                    return ""
+
+                with mock.patch.dict(globals(), {"_read_qmake_file": spy}):
+                    self.assertEqual(_macos_openmp_gaps(text, "arm64", directory), [])
+                self.assertEqual(len(reads), 1)
+
+    def test_legacy_platform_scope_reader_merges_additive_scopes_of_the_same_name(self) -> None:
+        """sol r3 hardening LJ92-OPENMP-SCOPE-TEST-COMMENT-BLIND-1: a second `macx { ... }` scope is additive in qmake, but
+        the scope reader overwrote the first one, so the legacy whole-scope test went red on a project that still carries the
+        flags."""
+        project = ("macx {\n    QMAKE_CFLAGS += -fopenmp\n    LIBS += -lomp\n}\nmacx {\n    DEFINES += DIAGNOSTICS\n}\n"
+                   "win32 {\n    QMAKE_CFLAGS += -fopenmp\n}\n")
+        scopes = self._platform_scopes(project)
+        self.assertIn("-fopenmp", scopes["macx"])
+        self.assertIn("-lomp", scopes["macx"])
+        self.assertIn("DIAGNOSTICS", scopes["macx"])
+        self.assertNotIn("DIAGNOSTICS", scopes["win32"])
 
     def test_macos_arch_pin_resolves_include_paths_the_way_qmake_cleans_them(self) -> None:
         """sol r2 A13: qmake cleans an include path lexically (`link/../x.pri` is `x.pri`), whatever `link` points at; the
