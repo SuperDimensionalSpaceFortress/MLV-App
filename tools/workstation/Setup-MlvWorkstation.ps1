@@ -307,9 +307,13 @@ function Write-Log {
         $color = @{ INFO = 'Gray'; WARN = 'Yellow'; ERROR = 'Red'; MANUAL = 'Cyan'; OK = 'Green' }[$Level]
         Write-Host $line -ForegroundColor $color
     }
-    # AppendAllText bypasses -WhatIf on purpose: a dry run still leaves its log.
-    [IO.File]::AppendAllText($script:LogFile, $line + [Environment]::NewLine)
+    # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 r6: a MANUAL follow-up is remembered BEFORE the append, so a log that cannot be written does not lose it
     if ($Level -eq 'MANUAL') { $script:Manual.Add($Message) }
+    # AppendAllText bypasses -WhatIf on purpose: a dry run still leaves its log.
+    # r6 (sol r5, hardening): an ERROR line is the line of a failure the caller registers right after it (Write-Log ... 'ERROR'; $script:Failures.Add(...), at every phase). A log that cannot be written
+    # (a full disk, a locked file, a folder at the log's name) must not throw there and skip that registration, so the append of an ERROR line never throws; every other level still does.
+    try { [IO.File]::AppendAllText($script:LogFile, $line + [Environment]::NewLine) }
+    catch { if ($Level -ne 'ERROR') { throw } }
 }
 
 # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 r5: a failure is REGISTERED first and its line logged after, and a log that cannot be written (a full disk, a locked file) never undoes the
@@ -317,18 +321,25 @@ function Write-Log {
 function Add-TypedFailure {
     param([string]$Failure, [string]$Line, [string]$Level = 'ERROR')
     $script:Failures.Add($Failure)
-    try { Write-Log $Line $Level } catch { }
+    Write-LogSafe $Line $Level
+}
+
+# r6 (sol r5): a log line whose failure to write must never interrupt the run. Every progress or notice line of the Import phase goes through it, so a log that turns unwritable mid-run (a full disk, a
+# folder at its name) cannot throw before a failure is registered, or out of a step that has not yet released its backup handles.
+function Write-LogSafe {
+    param([string]$Message, [string]$Level = 'INFO')
+    try { Write-Log $Message $Level } catch { }
 }
 
 function Invoke-Step {
     param([string]$Description, [scriptblock]$Action)
     if ($script:Cmdlet.ShouldProcess($env:COMPUTERNAME, $Description)) {
-        Write-Log "DO   $Description"
+        Write-LogSafe "DO   $Description"   # r6: an opening line that cannot be logged does not stop the step
         try { & $Action } catch {
             Add-TypedFailure -Failure $Description -Line "FAIL $Description :: $($_.Exception.Message)"
         }
     } else {
-        Write-Log "SKIP (WhatIf) $Description"
+        Write-LogSafe "SKIP (WhatIf) $Description"
     }
 }
 
@@ -353,7 +364,9 @@ function Invoke-GitTraceScrubbed {
 
 function Invoke-Native {
     # Runs a native command, logs its output, throws on a non-zero exit unless -AllowFail.
-    param([string]$Exe, [string[]]$Arguments, [switch]$AllowFail, [int[]]$OkCodes = @(0))
+    # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 r6 (sol r5, hardening): -TimeoutSec (> 0) bounds the wait. A child that has not exited by then is killed (it is this function's own child, never
+    # another process) and the call throws '<exe> did not finish within N s', so a read that stalls inside the child can no longer hold the run for ever; 0 (the default) keeps the unbounded call.
+    param([string]$Exe, [string[]]$Arguments, [switch]$AllowFail, [int[]]$OkCodes = @(0), [int]$TimeoutSec = 0)
     # r10 pass 7 A5: a caller (or profile) with $PSNativeCommandUseErrorActionPreference = $true would make a non-zero exit throw before -AllowFail and
     # -OkCodes are consulted (robocopy's normal exit 1 included). This function owns exit-code handling, so it turns that off for its own scope.
     $PSNativeCommandUseErrorActionPreference = $false
@@ -361,8 +374,25 @@ function Invoke-Native {
     Write-Log ("  > {0} {1}" -f $Exe, ($Arguments -join ' '))
     # r4 (sol r3 A2): an argument whose url secret holds a byte git may print in an unknown form: the child's output is withheld whole (fail closed)
     $withhold = @(@($Arguments) | Where-Object { Test-UrlSecretUnprintable $_ }).Count -gt 0
-    $out = Invoke-GitTraceScrubbed { & $Exe @Arguments 2>&1 }   # r17 F3: no inherited GIT_TRACE* destination
-    $code = $LASTEXITCODE
+    if ($TimeoutSec -gt 0) {
+        $psi = [System.Diagnostics.ProcessStartInfo]::new($Exe)
+        foreach ($a in @($Arguments)) { $psi.ArgumentList.Add($a) }
+        $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        $child = [System.Diagnostics.Process]::Start($psi)
+        try {
+            $outTask = $child.StandardOutput.ReadToEndAsync(); $errTask = $child.StandardError.ReadToEndAsync()
+            if (-not $child.WaitForExit($TimeoutSec * 1000)) {
+                try { $child.Kill($true) } catch { }
+                throw "$Exe did not finish within $TimeoutSec s (it was stopped)"
+            }
+            $child.WaitForExit()
+            $out = @(($outTask.Result + $errTask.Result) -split "\r?\n")
+            $code = $child.ExitCode
+        } finally { $child.Dispose() }
+    } else {
+        $out = Invoke-GitTraceScrubbed { & $Exe @Arguments 2>&1 }   # r17 F3: no inherited GIT_TRACE* destination
+        $code = $LASTEXITCODE
+    }
     if ($withhold) {
         $nOut = @(@($out) | Where-Object { "$_".Trim() }).Count
         if ($nOut -gt 0) { Write-Log ("    ({0} line(s) of output withheld: an argument carries a url secret with a byte outside printable ASCII, which the child may print in a form this log cannot redact)" -f $nOut) }
@@ -3001,14 +3031,26 @@ function Get-ImportCredentialSkips {
 # Why a bundle file's bytes are not copied ('' = they are): over the scan limit, or carrying a credential. ONE judgement for Copy-ImportFileLocked and for the backup gate, so the gate
 # never refuses a file the copy would skip anyway (r4: the two used to be judged at different moments).
 function Get-ImportSourceBytesRefusal {
-    param([byte[]]$Bytes, [long]$MaxScanBytes = 26214400, [string]$Name = '')
+    param([byte[]]$Bytes, [long]$MaxScanBytes = 26214400, [string]$Name = '', [long]$HostLength = -1)
     if ($Bytes.Length -gt $MaxScanBytes) { return 'bundle file larger than the scan limit' }
     $sr = [IO.StreamReader]::new([IO.MemoryStream]::new($Bytes), [Text.Encoding]::UTF8, $true)
     try { $srcText = $sr.ReadToEnd() } finally { $sr.Dispose() }
     if (Test-CredentialText $srcText) { return 'bundle file carries a credential' }
     # r5 (sol r4 B3): the credential screen accepts any credential-free bytes, so a damaged settings.json (empty, a stray byte, a cut-off '{') would replace a valid live one and leave the
     # profile with settings it cannot load. A bundle settings.json that is not a JSON object is a damaged source: refused (typed IMPORT_SOURCE_DAMAGED_NOT_REPLACED), the host file untouched.
-    if ($Name -ieq 'settings.json' -and -not (Test-ImportJsonObject $srcText)) { return 'bundle file is damaged: settings.json is not a valid JSON object' }
+    # r6 (sol r5 B1, B2): the same judgement for the other copied files. (a) The two Claude settings files (settings.json and settings.local.json, which a tool must load as one JSON object) are judged
+    # on their STRICT UTF-8 text: the lossy decode above turns a stray 0xFF into U+FFFD and the text then parses, so the raw malformed bytes used to go live. Other .json files are not judged here:
+    # their content is whatever the tool that owns them writes. (b) A zero-byte file is a damaged source against a host file that holds bytes (-HostLength, known where the host file is); against an
+    # absent host file it is just an empty file and is created.
+    if ($Name -ieq 'settings.json' -or $Name -ieq 'settings.local.json') {
+        $strictText = $null
+        try {
+            $sr2 = [IO.StreamReader]::new([IO.MemoryStream]::new($Bytes), [Text.UTF8Encoding]::new($false, $true), $true)
+            try { $strictText = $sr2.ReadToEnd() } finally { $sr2.Dispose() }
+        } catch { return "bundle file is damaged: $Name is not valid UTF-8 text" }
+        if (-not (Test-ImportJsonObject $strictText)) { return "bundle file is damaged: $Name is not a valid JSON object" }
+    }
+    if ($Bytes.Length -eq 0 -and $HostLength -gt 0) { return "bundle file is damaged: $Name is empty and the host file it would replace is not" }
     return ''
 }
 
@@ -3021,6 +3063,7 @@ function Test-ImportJsonObject {
         $opt = [System.Text.Json.JsonDocumentOptions]::new()
         $opt.CommentHandling = [System.Text.Json.JsonCommentHandling]::Skip
         $opt.AllowTrailingCommas = $true
+        $opt.MaxDepth = 512
         $doc = [System.Text.Json.JsonDocument]::Parse($Text, $opt)
         return ($doc.RootElement.ValueKind -eq [System.Text.Json.JsonValueKind]::Object)
     } catch { return $false } finally { if ($doc) { $doc.Dispose() } }
@@ -3092,6 +3135,10 @@ function Copy-ImportFileLocked {
         $dstText = ConvertFrom-ImportBytes $orig
         if (Test-CredentialText $dstText) { return @{ Result = 'changed'; Why = 'host file carries a credential' } }
         if (($CredentialRoleFiles -contains $Source.Name.ToLowerInvariant()) -and (([regex]::new('(?i)(' + $CredentialNameWords + ')')).IsMatch($dstText) -or (Test-CredentialNamePresent $dstText))) { return @{ Result = 'changed'; Why = 'host credential-role file names a credential key' } }
+        # r6 (sol r5 B2): a zero-byte bundle file (an interrupted transfer) never replaces a host file that holds bytes; judged HERE, on the host bytes held under the lock (the source judgement at the top
+        # of this function does not know the host file), before the backup question so the typed record is the source failure
+        $emptyWhy = Get-ImportSourceBytesRefusal -Bytes $bytes -MaxScanBytes $MaxScanBytes -Name $Source.Name -HostLength $orig.Length
+        if ($emptyWhy) { return @{ Result = 'source-damaged'; Why = $emptyWhy } }
         # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 (r3): a backed-up host file is replaced only when the bytes held here are the bytes that were backed up (a file saved since the backup
         # would otherwise be replaced with only the older bytes in the backup), and one that has no backup at all (not made, or the file only came back after the backup step looked) is not.
         $gap = Get-ImportBackupGap -Dest $Dest -HeldBytes $orig
@@ -3301,10 +3348,10 @@ function Invoke-ImportRobocopy {
     $From = [IO.Path]::GetFullPath($From); $To = [IO.Path]::GetFullPath($To)
     $skips = @(Get-ImportCredentialSkips -SourceDir $From -DestDir $To)
     foreach ($s in $skips) {
-        Write-Log "IMPORT_SKIPPED_CREDENTIAL_FILE $($s.Dest) ($($s.Reason); the bundle copy $($s.Source) was not applied)" 'WARN'
-        $script:ImportSkippedDest.Add($s.Dest)
+        $script:ImportSkippedDest.Add($s.Dest)   # r6: registered before its line is logged (Write-LogSafe: a log that cannot be written never interrupts the copy)
+        Write-LogSafe "IMPORT_SKIPPED_CREDENTIAL_FILE $($s.Dest) ($($s.Reason); the bundle copy $($s.Source) was not applied)" 'WARN'
     }
-    if (-not (Test-Path -LiteralPath $From)) { Write-Log "  (absent, skipped) $From" 'WARN'; return }
+    if (-not (Test-Path -LiteralPath $From)) { Write-LogSafe "  (absent, skipped) $From" 'WARN'; return }
     $xfNames = [System.Collections.Generic.List[string]]::new(); $xfPaths = [System.Collections.Generic.List[string]]::new(); $xdPaths = [System.Collections.Generic.List[string]]::new()
     $recurse = $false; $exN = $false; $exO = $false; $exC = $false; $mode = ''
     foreach ($tok in $Extra) {
@@ -3349,6 +3396,7 @@ function Invoke-ImportRobocopy {
             # one, is not a failure). Copy-ImportFileLocked makes the same judgement again under its lock, on the bytes it is about to replace.
             # r4: a destination Import deliberately never writes (an excluded bundle file, or a host file it never replaces: $neverSet) has no backup to judge.
             $isNever = $neverSet.ContainsKey($e.FullName.ToLowerInvariant())
+            $srcVerdict = $null; $hostLen = -1   # r6: the early source judgement (Get-ImportEarlySourceVerdict), made at most once per file, and the host file's length where it is known
             # the inspection skipped this file for what the HOST file held (unreadable; the one skip that is not deliberate), and that host file is gone before the gate even looks: create the bundle copy
             # r5 (sol r4 B1): ONE existence probe feeds both decisions. Two probes let a host file that was there for the first and gone for the second keep its stale "unreadable" skip while the
             # gate below was never entered, so the bundle copy was dropped with no record at all. A host file that is gone is re-probed once more right before the skip is honoured (below).
@@ -3363,16 +3411,17 @@ function Invoke-ImportRobocopy {
                 try {
                     $di = [IO.FileInfo]::new($dest)
                     if (-not $di.Exists) { $hostGone = $true; $wouldReplace = $false }
-                    elseif ($gap) { $wouldReplace = Test-ImportReplaces -Source $e -Dest $di -ExcludeNewer $exN -ExcludeOlder $exO -ExcludeChanged $exC }
+                    elseif ($gap) { $hostLen = $di.Length; $wouldReplace = Test-ImportReplaces -Source $e -Dest $di -ExcludeNewer $exN -ExcludeOlder $exO -ExcludeChanged $exC }
                 } catch { $hostGone = -not [IO.File]::Exists($dest); $wouldReplace = -not $hostGone }
                 # the inspection skipped this file for what the HOST file held (unreadable); that file is gone, so there is nothing left to skip for and the bundle copy is created
                 if ($hostGone) { $inSkipSet = $false }
                 if ($gap -and $wouldReplace) {
                     # a bundle file the copy itself will skip (it grew past the limit, or gained a credential, after the inspection) replaces nothing either: judged on the bytes as they are now
-                    $srcWhy = ''; $srcReadFailed = $false
                     # r5 (sol r4 B2): a bundle file that cannot be READ here is not a backup problem: the copy below reads it again and names the cause (IMPORT_COPY_FAILED), so it is left to the copy
-                    try { $srcWhy = $(if ($e.Length -gt 26214400) { 'bundle file larger than the scan limit' } else { Get-ImportSourceBytesRefusal -Bytes ([IO.File]::ReadAllBytes($e.FullName)) -Name $e.Name }) } catch { $srcReadFailed = $true }
-                    if (-not $srcWhy -and -not $srcReadFailed) {
+                    $srcVerdict = Get-ImportEarlySourceVerdict -Source $e -HostLength $hostLen
+                    # r6 (sol r5 B4): the host file is looked at AGAIN after the (slow) source read: one that went away during it is a creation (Copy-ImportFileLocked CreateNew), not a refusal.
+                    # A direct existence call, not Test-ImportHostFileExists: the r5 probe count (one probe feeds both decisions) is unchanged.
+                    if (-not $srcVerdict.Why -and -not $srcVerdict.ReadFailed -and [IO.File]::Exists($dest)) {
                         $n.skipped++
                         $script:ImportSkippedDest.Add($dest)
                         Add-TypedFailure -Failure "IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED $dest" -Line "IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED $dest ($gap, so the host file was left as it is; the bundle copy $($e.FullName) was not applied)"
@@ -3382,6 +3431,12 @@ function Invoke-ImportRobocopy {
             }
             # r5: the skip for an UNREADABLE host file is honoured only while that host file is still there at this last look: one that went away at any point since the inspection is a creation
             if ($inSkipSet -and -not $isNever -and -not (Test-ImportHostFileExists $dest)) { $inSkipSet = $false }
+            # r6 (sol r5 B3): the skip for an unreadable HOST file says nothing about the BUNDLE file. A bundle file that is damaged or cannot be read is still a failure of its own (the copy below
+            # judges it first and names it: IMPORT_SOURCE_DAMAGED_NOT_REPLACED or IMPORT_COPY_FAILED, the host file untouched), so the stale host skip is not allowed to hide it.
+            if ($inSkipSet -and -not $isNever) {
+                if ($null -eq $srcVerdict) { $srcVerdict = Get-ImportEarlySourceVerdict -Source $e }
+                if ($srcVerdict.ReadFailed -or ($srcVerdict.Why -and $srcVerdict.Why.StartsWith('bundle file is damaged'))) { $inSkipSet = $false }
+            }
             if ($inSkipSet) { continue }
             try { $r = Copy-ImportFileLocked -Source $e -Dest $dest -ExcludeNewer $exN -ExcludeOlder $exO -ExcludeChanged $exC }
             catch { $n.failed++; Add-TypedFailure -Failure "IMPORT_COPY_FAILED $dest" -Line "IMPORT_COPY_FAILED $dest :: $($_.Exception.Message)"; continue }
@@ -3391,8 +3446,8 @@ function Invoke-ImportRobocopy {
                 'kept' { $n.kept++ }
                 'source-credential' {
                     $n.skipped++
-                    Write-Log "IMPORT_SKIPPED_CREDENTIAL_FILE $dest ($($r.Why); the bundle copy $($e.FullName) was not applied)" 'WARN'
                     $script:ImportSkippedDest.Add($dest)
+                    Write-LogSafe "IMPORT_SKIPPED_CREDENTIAL_FILE $dest ($($r.Why); the bundle copy $($e.FullName) was not applied)" 'WARN'
                 }
                 'source-damaged' {
                     # r5 (sol r4 B3): a bundle settings.json that is not a JSON object: a typed failure (exit 1), the host file untouched
@@ -3413,7 +3468,7 @@ function Invoke-ImportRobocopy {
             }
         }
     }
-    Write-Log "  import copy $From -> $To : created $($n.created), replaced $($n.replaced), kept $($n.kept) (older or the same), skipped $($n.skipped), failed $($n.failed)"
+    Write-LogSafe "  import copy $From -> $To : created $($n.created), replaced $($n.replaced), kept $($n.kept) (older or the same), skipped $($n.skipped), failed $($n.failed)"
 }
 
 $script:ImportSkippedDest = [System.Collections.Generic.List[string]]::new()
@@ -3438,6 +3493,18 @@ function Test-ImportHostFileExists {
     $r = [IO.File]::Exists($Path)
     if ($script:ImportExistsProbeHook) { & $script:ImportExistsProbeHook $Path $r }
     return $r
+}
+
+# r6 test seam: called with the bundle file's path right after the backup gate's (early) read of that file (always $null in a real run): the host file goes away while the gate reads a bundle file
+$script:ImportAfterEarlySourceReadHook = $null
+# r6: the ONE early judgement of a bundle file (the gate and the stale host skip both use it): @{ Why; ReadFailed }. Why = the reason the copy will not apply it ('' = it will), as
+# Get-ImportSourceBytesRefusal judges it; ReadFailed = the file could not be read at all (the copy reads it again and names the cause, IMPORT_COPY_FAILED).
+function Get-ImportEarlySourceVerdict {
+    param([IO.FileInfo]$Source, [long]$HostLength = -1)
+    $why = ''; $readFailed = $false
+    try { $why = $(if ($Source.Length -gt 26214400) { 'bundle file larger than the scan limit' } else { Get-ImportSourceBytesRefusal -Bytes ([IO.File]::ReadAllBytes($Source.FullName)) -Name $Source.Name -HostLength $HostLength }) } catch { $readFailed = $true }
+    if ($script:ImportAfterEarlySourceReadHook) { & $script:ImportAfterEarlySourceReadHook $Source.FullName }
+    return @{ Why = $why; ReadFailed = $readFailed }
 }
 
 function Close-ImportBackupHandles {
@@ -3572,7 +3639,17 @@ function Copy-CleanBackupFile {
         if (Test-CredentialText $text) { [void]$script:ImportBackupCredentialSkipped.Add((Get-ImportRealPath $Path)); return $false }
         [void][IO.Directory]::CreateDirectory($DestinationDir)
         # r16 (adversary pass 15 A4 sibling): written through a handle that can also delete it (New-OwnedFileStream), so a failed write takes back exactly this file
-        $ws = New-OwnedFileStream -Path $dest -Mode ([IO.FileMode]::Create)
+        # r6 (sol r5 B7): a backup is NEVER overwritten (CreateNew). The phases of one run share the stamp, so a second Import phase finds the first phase's backup of the same file at this name (the only
+        # copy of the original host bytes, as the file it backs up now holds the first phase's bytes); it is written beside it as <name>.2, .3, ... A directory (or anything else that is not a file) at the name
+        # is not a collision: CreateNew throws and the backup fails, as before.
+        $backupName = $dest; $ws = $null
+        for ($k = 1; $k -le 99 -and -not $ws; $k++) {
+            $cand = $(if ($k -eq 1) { $backupName } else { "$backupName.$k" })
+            if ([IO.File]::Exists($cand)) { continue }
+            try { $ws = New-OwnedFileStream -Path $cand -Mode ([IO.FileMode]::CreateNew); $dest = $cand }
+            catch [System.IO.IOException] { if (-not [IO.File]::Exists($cand)) { throw } }   # a file that appeared since the look is a collision: the next name
+        }
+        if (-not $ws) { throw "no unused backup file name beside $backupName (an earlier backup of it was kept, never overwritten)" }
         $ws.Write($bytes, 0, $bytes.Length); $ws.Flush()
         $ws.Dispose(); $ws = $null
         # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 (r3): what was backed up is recorded by its bytes; Import replaces this host file only while it still holds exactly these bytes.
@@ -3608,7 +3685,7 @@ function Copy-CleanBackupFile {
 
 function Invoke-PhaseImport {
     if (-not (Test-Path -LiteralPath $BundlePath)) {
-        Write-Log "no bundle at ${BundlePath}: run -Phase Export on VIRTUAL-TEN and copy the zip here (README step 4), then re-run -Phase Import" 'MANUAL'
+        Write-LogSafe "no bundle at ${BundlePath}: run -Phase Export on VIRTUAL-TEN and copy the zip here (README step 4), then re-run -Phase Import" 'MANUAL'   # r6: a log that cannot be written never hides the registered failure below
         # r16 (adversary pass 15 A3): nothing was imported, so the run FAILS (exit 1, typed IMPORT_BUNDLE_MISSING), like the r15 IMPORT_BUNDLE_INVALID refusal below; it
         # used to return quietly and end 'done' with exit 0. A -WhatIf preview imports nothing in any case and stays a plain notice.
         if (-not $WhatIfPreference) { Add-TypedFailure -Failure "IMPORT_BUNDLE_MISSING $BundlePath" -Line "IMPORT_BUNDLE_MISSING $BundlePath" }
@@ -3620,7 +3697,8 @@ function Invoke-PhaseImport {
         $expandFailuresBefore = $script:Failures.Count
         Invoke-Step "Expand $BundlePath to $src" {
             [void][IO.Directory]::CreateDirectory($src)
-            [void](Invoke-Native -Exe (Join-Path $env:SystemRoot 'System32\tar.exe') -Arguments @('-x', '-f', $BundlePath, '-C', $src))
+            # r6 (sol r5, hardening): bounded (15 min): a read that stalls inside tar fails the step, and the typed IMPORT_BUNDLE_EXPAND_FAILED below follows, instead of waiting for ever
+            [void](Invoke-Native -Exe (Join-Path $env:SystemRoot 'System32\tar.exe') -Arguments @('-x', '-f', $BundlePath, '-C', $src) -TimeoutSec 900)
         }
         # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1: tar exits non-zero on a truncated or damaged zip AFTER leaving partly written files in the expanded folder; nothing of such a
         # bundle is snapshotted or copied (the run fails, exit 1). A -WhatIf preview expands nothing and never records a failure.
@@ -3636,8 +3714,16 @@ function Invoke-PhaseImport {
     $importSnapshot = $null
     if (-not $WhatIfPreference) {
         $importSnapshot = Join-Path $StateRoot "import-snapshot-$stamp"
+        # r6 (sol r5 B5): a snapshot is COMPLETE only when its step ended without a failure. Robocopy exits 8 after leaving part of the tree in the folder, and the folder's presence used to be the
+        # whole test, so a partial snapshot fed every copy below. A failed step is the typed IMPORT_SNAPSHOT_FAILED, the partial folder is removed, and nothing is imported.
+        $snapshotFailuresBefore = $script:Failures.Count
         Invoke-Step "Snapshot the bundle to $importSnapshot (the scan and the copy read the same bytes)" { [void](New-ImportSnapshot -From $src -To $importSnapshot) }
-        if (Test-Path -LiteralPath $importSnapshot -PathType Container) { $src = $importSnapshot } else { Add-TypedFailure -Failure 'IMPORT_SNAPSHOT_FAILED' -Line 'IMPORT_SNAPSHOT_FAILED the bundle snapshot could not be made; nothing was imported'; return }
+        if ($script:Failures.Count -gt $snapshotFailuresBefore -or -not (Test-Path -LiteralPath $importSnapshot -PathType Container)) {
+            Add-TypedFailure -Failure 'IMPORT_SNAPSHOT_FAILED' -Line 'IMPORT_SNAPSHOT_FAILED the bundle snapshot could not be made completely; nothing was imported'
+            if (Test-Path -LiteralPath $importSnapshot) { try { Remove-Item -LiteralPath $importSnapshot -Recurse -Force -ErrorAction Stop } catch { Write-LogSafe "could not remove the partial import snapshot $importSnapshot : $($_.Exception.Message)" 'WARN' } }
+            return
+        }
+        $src = $importSnapshot
     }
     $h = $env:USERPROFILE
     # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1: no backup, no replace. Both host files are PROTECTED from here (whether or not they exist at this instant); one is replaced only when a
@@ -3655,7 +3741,7 @@ function Invoke-PhaseImport {
         try { [void][IO.Directory]::CreateDirectory($b) }
         catch {
             # no backup can be made at all: nothing is recorded, so every host file of this step stays protected; the failure is recorded (Invoke-Step) as before
-            Write-Log "IMPORT_BACKUP_FAILED $b (the backup folder cannot be made; the host files in $h\.claude are not replaced)" 'ERROR'
+            Write-LogSafe "IMPORT_BACKUP_FAILED $b (the backup folder cannot be made; the host files in $h\.claude are not replaced)" 'ERROR'
             throw
         }
         foreach ($f in 'CLAUDE.md', 'settings.json') {
@@ -3664,8 +3750,8 @@ function Invoke-PhaseImport {
             # r10 A2: a host file that carries a credential is never copied (the backup would be a second, durable copy of it, and Import
             # never replaces such a file anyway, so there is nothing to roll back). One read: the bytes judged are the bytes written.
             if (-not (Copy-CleanBackupFile -Path $p -DestinationDir $b)) {
-                if ($script:ImportBackupCredentialSkipped.Contains((Get-ImportRealPath $p))) { Write-Log "IMPORT_BACKUP_SKIPPED_CREDENTIAL_FILE $p (it carries a credential; no copy was made)" 'WARN' }
-                else { Write-Log "IMPORT_BACKUP_FAILED $p (the backup copy could not be written; the host file is not replaced)" 'ERROR' }
+                if ($script:ImportBackupCredentialSkipped.Contains((Get-ImportRealPath $p))) { Write-LogSafe "IMPORT_BACKUP_SKIPPED_CREDENTIAL_FILE $p (it carries a credential; no copy was made)" 'WARN' }
+                else { Write-LogSafe "IMPORT_BACKUP_FAILED $p (the backup copy could not be written; the host file is not replaced)" 'ERROR' }
             }
         }
     }
@@ -3701,7 +3787,7 @@ function Invoke-PhaseImport {
     }
     } finally { Close-ImportBackupHandles }
     if ($importSnapshot -and (Test-Path -LiteralPath $importSnapshot)) {
-        try { Remove-Item -LiteralPath $importSnapshot -Recurse -Force -ErrorAction Stop } catch { Write-Log "could not remove the import snapshot $importSnapshot : $($_.Exception.Message)" 'WARN' }
+        try { Remove-Item -LiteralPath $importSnapshot -Recurse -Force -ErrorAction Stop } catch { Write-LogSafe "could not remove the import snapshot $importSnapshot : $($_.Exception.Message)" 'WARN' }
     }
     # MINI3-CUTOVER-STATE-GAPS-1 (a): claims came across without their fleet-runs run dirs. A claim younger than 6 h with no run dir
     # reads 'receipt state none' and blocks its card, so those claims are quarantined, not carried.
@@ -3712,16 +3798,16 @@ function Invoke-PhaseImport {
         # r3 A5: when the bundle's settings.json was NOT applied (the host's own credential-bearing one stayed), there is nothing of the bundle to
         # rewrite, and rewriting the host's file would touch a credential-bearing file the Import just refused to replace.
         if (-not $script:ImportSettingsApplied) {
-            Write-Log "skipped the settings.json profile rewrite: the bundle's settings.json was not applied (absent from the bundle, older than the host's, or IMPORT_SKIPPED_CREDENTIAL_FILE), the host's file stays as it is"
+            Write-LogSafe "skipped the settings.json profile rewrite: the bundle's settings.json was not applied (absent from the bundle, older than the host's, or IMPORT_SKIPPED_CREDENTIAL_FILE), the host's file stays as it is"
         } else {
         Invoke-Step "Rewrite $SourceUserProfile -> $h in ~/.claude/settings.json" {
             # r12 A3: one locked read-judge-write (Update-ImportedSettingsLocked); a file it cannot lock, or that gained a credential, stays as it is with a typed failure.
             [void](Update-ImportedSettingsLocked -Path "$h\.claude\settings.json" -FromProfile $SourceUserProfile -ToProfile $h)
         }
         }
-        Write-Log "profile differs from VIRTUAL-TEN ($SourceUserProfile). The TRACKED $Repo\.claude\settings.json hard-codes C:/Users/obabalola/AppData/Local/Python/bin/python.exe, so project hooks will fail here. Prefer an OS user named obabalola; else fix the project file in a PR." 'MANUAL'
+        Write-LogSafe "profile differs from VIRTUAL-TEN ($SourceUserProfile). The TRACKED $Repo\.claude\settings.json hard-codes C:/Users/obabalola/AppData/Local/Python/bin/python.exe, so project hooks will fail here. Prefer an OS user named obabalola; else fix the project file in a PR." 'MANUAL'
     }
-    Write-Log 'imported hub state is a SNAPSHOT: re-export and re-import at cut-over (README phase C) before this host takes the lease' 'WARN'
+    Write-LogSafe 'imported hub state is a SNAPSHOT: re-export and re-import at cut-over (README phase C) before this host takes the lease' 'WARN'
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -4168,8 +4254,8 @@ foreach ($p in $run) {
 
 if (-not $isGate) {
     if ($script:Failures.Count) {
-        Write-Log "$($script:Failures.Count) step(s) failed; fix and re-run (idempotent): $($script:Failures -join ' | ')" 'ERROR'
+        Write-LogSafe "$($script:Failures.Count) step(s) failed; fix and re-run (idempotent): $($script:Failures -join ' | ')" 'ERROR'   # r6: the exit code of a failed run never depends on its log being writable
         exit 1
     }
-    Write-Log "done. log: $script:LogFile" 'OK'
+    Write-LogSafe "done. log: $script:LogFile" 'OK'
 }
