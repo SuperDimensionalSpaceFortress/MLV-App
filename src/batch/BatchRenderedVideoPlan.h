@@ -1602,7 +1602,7 @@ QString batchRenderedVideoAppDirSpawnRetryExecutable(
     const QString & failedExecutable,
     const QString & defaultName,
     const BatchRenderedVideoExecutableResolver & resolver,
-    const QString & failedFileIdentity = QString())
+    const QStringList & failedFileIdentities = QStringList())
 ;
 
 /* r3 S2: a file's identity (Windows: volume serial + file index; elsewhere: device + inode),
@@ -1751,11 +1751,12 @@ BatchRenderedVideoFfmpegDumpFacts
 batchRenderedVideoFfmpegDumpFacts(const QString & dumpText)
 ;
 
-/* r3 S3: the facts that bind output verification, in the runner's order: complete ffprobe
- * JSON facts; else the ffmpeg dump's facts; else, when ffprobe ran, exited 0 and printed a JSON
- * object, that object read as far as it goes (fail closed, as the dump parser does: a known
- * codec is kept and a missing field reads empty/0, so it is a mismatch, never "unchecked").
- * parsed=false only when neither probe gave anything. */
+/* r3 S3 / pass-6 A6: the facts that bind output verification: complete ffprobe JSON facts;
+ * else, when ffprobe ran, exited 0 and printed a JSON object, every fact that object states
+ * (fail closed: a known codec or SAR binds even when the dump reads clean), with only the
+ * fields it left out filled from the dump, and a field neither gave reads empty/0, so it is a
+ * mismatch, never "unchecked"; else the ffmpeg dump's facts. parsed=false only when neither
+ * probe gave anything. */
 BatchRenderedVideoFfmpegDumpFacts
 batchRenderedVideoBindingMediaProbeFacts(
     bool probeExitedZero,

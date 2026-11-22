@@ -2973,11 +2973,62 @@ TEST(BatchExportFormat, AppDirSpawnRetryExcludesASurvivingHardLinkOfTheDeletedFa
         qputenv("PATH", (QDir::toNativeSeparators(aliasDir) + QDir::listSeparator()
                          + QDir::toNativeSeparators(tools)).toLocal8Bit());
         retries << batchRenderedVideoAppDirSpawnRetryExecutable(
-            true, true, bad, bare, batchRenderedVideoSystemExecutableResolver(), identity);
+            true, true, bad, bare, batchRenderedVideoSystemExecutableResolver(), QStringList{ identity });
         qputenv("PATH", savedPath);
     }
     ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffmpeg.exe")), appDirLookupText(retries.value(0)) );
     ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffprobe.exe")), appDirLookupText(retries.value(1)) );
+}
+
+/* r3 adversary pass 6 (f9d88d74) A1, literal input: PATHEXT=.ALT.EXE;.EXE, PATH=<Wrappers>;<Tools>,
+ * Wrappers\ffmpeg.alt.exe exists: the pick must be exactly ffmpeg.exe/.com, so Tools wins. A2:
+ * PATHEXT unset, PATH=<App>, the failed App\ffmpeg.exe is excluded and the working App\ffmpeg.com
+ * in the same directory is the retry (Qt's default list holds .com). A3: the identity taken at
+ * failure time (a replaced file) is excluded as well as the lookup-time one. */
+TEST(BatchExportFormat, DefaultPathPickIsExactlyTheToolImageAndUnsetPathExtReachesCom)
+{
+    QTemporaryDir appTemp;
+    QTemporaryDir wrapTemp;
+    QTemporaryDir toolsTemp;
+    QTemporaryDir aliasTemp;
+    ASSERT_TRUE( appTemp.isValid() && wrapTemp.isValid() && toolsTemp.isValid() && aliasTemp.isValid() );
+    const QString appDir = QDir::cleanPath(appTemp.path());
+    const QString wrappers = QDir::cleanPath(wrapTemp.path());
+    const QString tools = QDir::cleanPath(toolsTemp.path());
+    const QString aliasDir = QDir::cleanPath(aliasTemp.path());
+    const QString bad = appDir + QStringLiteral("/ffmpeg.exe");
+    ASSERT_TRUE( appDirLookupWriteFile(bad, QByteArray("MZ-not-really-a-program")) );
+    ASSERT_TRUE( appDirLookupWriteFile(appDir + QStringLiteral("/ffmpeg.com"), QByteArray("MZ-working-com")) );
+    ASSERT_TRUE( appDirLookupWriteFile(wrappers + QStringLiteral("/ffmpeg.alt.exe"), QByteArray("MZ-exits-7")) );
+    ASSERT_TRUE( appDirLookupWriteFile(tools + QStringLiteral("/ffmpeg.exe"), QByteArray("MZ-working")) );
+    const QString replaced = aliasDir + QStringLiteral("/ffmpeg.exe");
+    ASSERT_TRUE( appDirLookupWriteFile(replaced, QByteArray("MZ-replacement-bad")) );
+    const QString replacedIdentity = batchRenderedVideoExecutableFileIdentity(replaced);
+    ASSERT_FALSE( replacedIdentity.isEmpty() );
+
+    const QByteArray savedPath = qgetenv("PATH");
+    const QByteArray savedPathExt = qgetenv("PATHEXT");
+    qputenv("PATH", (QDir::toNativeSeparators(wrappers) + QDir::listSeparator()
+                     + QDir::toNativeSeparators(tools)).toLocal8Bit());
+    qputenv("PATHEXT", QByteArray(".ALT.EXE;.EXE"));
+    const QString altRetry = batchRenderedVideoAppDirSpawnRetryExecutable(
+        true, true, bad, QStringLiteral("ffmpeg"), batchRenderedVideoSystemExecutableResolver());
+    qputenv("PATH", QDir::toNativeSeparators(appDir).toLocal8Bit());
+    qunsetenv("PATHEXT");
+    const QString comRetry = batchRenderedVideoAppDirSpawnRetryExecutable(
+        true, true, bad, QStringLiteral("ffmpeg"), batchRenderedVideoSystemExecutableResolver());
+    qputenv("PATH", (QDir::toNativeSeparators(aliasDir) + QDir::listSeparator()
+                     + QDir::toNativeSeparators(tools)).toLocal8Bit());
+    qputenv("PATHEXT", QByteArray(".EXE"));
+    const QString replacedRetry = batchRenderedVideoAppDirSpawnRetryExecutable(
+        true, true, bad, QStringLiteral("ffmpeg"), batchRenderedVideoSystemExecutableResolver(),
+        QStringList{ QString(), replacedIdentity });
+    qputenv("PATH", savedPath);
+    qputenv("PATHEXT", savedPathExt);
+
+    ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffmpeg.exe")), appDirLookupText(altRetry) );
+    ASSERT_EQ( appDirLookupText(appDir + QStringLiteral("/ffmpeg.com")), appDirLookupText(comRetry) );
+    ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffmpeg.exe")), appDirLookupText(replacedRetry) );
 }
 #endif
 
@@ -3031,9 +3082,21 @@ TEST(BatchExportFormat, IncompleteProbeJsonKeepsAKnownCodecMismatchBinding)
     const BatchRenderedVideoFfmpegDumpFacts dump = batchRenderedVideoFfmpegDumpFacts(
         QStringLiteral("Input #0, mov,mp4, from 'clip.mlvapp-partial.mp4':\n  Stream #0:0: Video: h264, yuv420p, 1920x1080\n"));
     ASSERT_TRUE( dump.parsed );
-    bound = batchRenderedVideoBindingMediaProbeFacts(true, json, dump);
+    /* Pass-6 A6, literal input: the stated hevc and 16:15 SAR bind even though the dump reads a
+     * clean h264 1920x1080; the dump fills only the missing height. */
+    const QByteArray json6(R"({"format":{"format_name":"mov,mp4"},"streams":[{"codec_type":"video","codec_name":"hevc","width":1920,"sample_aspect_ratio":"16:15"}]})");
+    bound = batchRenderedVideoBindingMediaProbeFacts(true, json6, dump);
+    ASSERT_TRUE( bound.parsed );
+    ASSERT_EQ( std::string("hevc"), appDirLookupText(bound.codecName) );
+    ASSERT_EQ( std::string("16:15"), appDirLookupText(bound.sampleAspectRatio) );
+    ASSERT_EQ( 1080, bound.height );
+    /* `{}` plus a clean dump: the dump's facts (nothing stated, nothing to keep). */
+    bound = batchRenderedVideoBindingMediaProbeFacts(true, QByteArray("{}"), dump);
     ASSERT_EQ( std::string("h264"), appDirLookupText(bound.codecName) );
     ASSERT_EQ( 1080, bound.height );
+    /* No probe ran: the dump decides. */
+    ASSERT_EQ( std::string("h264"), appDirLookupText(
+        batchRenderedVideoBindingMediaProbeFacts(false, QByteArray(), dump).codecName) );
 
     const QByteArray complete(R"({"format":{"format_name":"mov,mp4"},"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height":1080}]})");
     bound = batchRenderedVideoBindingMediaProbeFacts(true, complete, noDump);
