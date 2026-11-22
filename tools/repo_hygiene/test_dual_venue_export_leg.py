@@ -1620,6 +1620,56 @@ class CdngTotalContainmentTests(unittest.TestCase):
         self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p for p in got[1]["problems"]), got[1])
 
 
+    def test_a_mean_a_full_emitted_increment_over_the_exact_limit_is_refused_and_one_at_the_limit_is_not(self) -> None:
+        """r3 B1 (sol r2 INV-4, literal inputs): the comparator rounded BOTH sides to the writers' 6 decimals before comparing, so a mean over the limit by one full emitted increment
+        (1e-6 ms; 128 frames of elapsed=12.3 -> limit 101.8984375, producer timings split 101.898438 / 101.898439 -> mean 101.8984385, both round to 101.898438) read PASS at every gate that uses
+        it. The same literal input at each: the CDNG and ProRes wall gates, the CDNG mean-pair gate, the disjoint-mean gate and the per-frame sum. Each has a control exactly AT its limit."""
+        def wall(lo: float, hi: float) -> dict:
+            doc = json.loads(cdng_profile(128))
+            for i, r in enumerate(doc["frames"]):
+                r["producer_frame_ms"] = lo if i < 64 else hi
+            return cdng_case(maxFrames=128, profile=json.dumps(doc), batch=batch_log(128, elapsed=12.3), manifest=output_manifest(128), criteria=[])
+
+        def prores_wall(lo: float, hi: float) -> dict:
+            out = []
+            for i in range(128):
+                p16 = lo if i < 64 else hi
+                for name, ms in (("raw_uint16_disk_read", 0.0), ("raw_uint16_decompress", 0.0), ("raw_uint16", 0.0), ("llrawproc", 0.0), ("debayered_frame", p16), ("processing", 0.0), ("processed16_total", p16)):
+                    out.append(f"[mlv-stage-timing] frame={i} stage={name} ms={ms:.6f}")
+            return prores_case(maxFrames=128, stage="\n".join(out) + "\n", batch=batch_log(128, verified=128, elapsed=12.3), criteria=[])
+
+        def pair(lo: float, hi: float) -> dict:   # producer 40.000030, raw_read split lo / hi (limit 43.0000315)
+            return cdng_case(dualIsoExpected=False, criteria=[], profile=cdng_total_profile(zero=True, set_rows={"producer_frame_ms": 40.00003}, per_frame={i: {"raw_read_ms": lo if i % 2 == 0 else hi} for i in range(30)}))
+
+        def disjoint(lo: float, hi: float) -> dict:   # producer 40.000030, raw_read 20, compress split lo / hi (sum limit 43.0000315)
+            return cdng_case(dualIsoExpected=False, criteria=[], profile=cdng_total_profile(zero=True, set_rows={"producer_frame_ms": 40.00003, "raw_read_ms": 20.0},
+                                                                                           per_frame={i: {"dng_compress_encode_ms": lo if i % 2 == 0 else hi} for i in range(30)}))
+
+        def frame_sum(bracket: float, children: float) -> dict:   # bracket 60.00001 beside children 64.000011: over the exact limit 64.0000105 by 5e-7
+            return cdng_case(criteria=[], profile=cdng_total_profile(zero=True, set_rows={"producer_frame_ms": 100.0, "llrawproc_ms": bracket, "llrawproc_dual_iso_ms": children}))
+
+        bad = (("cdng_wall_gate", wall(101.898438, 101.898439), CONTAINMENT, "producer_frame"),
+               ("prores_wall_gate", prores_wall(101.898438, 101.898439), CONTAINMENT, "processed16_total"),
+               ("cdng_mean_pair_gate", pair(43.000032, 43.000033), CONTAINMENT, "raw_read"),
+               ("cdng_disjoint_mean_gate", disjoint(23.000032, 23.000033), CONTAINMENT, "disjoint stages"),
+               ("per_frame_sum_over_by_half_an_increment", frame_sum(60.00001, 64.000011), SUM_MISMATCH, "llrawproc_ms"))
+        controls = (("cdng_wall_gate_at_the_limit", wall(101.898437, 101.898438)),
+                    ("prores_wall_gate_at_the_limit", prores_wall(101.898437, 101.898438)),
+                    ("cdng_mean_pair_gate_at_the_limit", pair(43.000031, 43.000032)),
+                    ("cdng_disjoint_mean_gate_at_the_limit", disjoint(23.000031, 23.000032)),
+                    ("per_frame_sum_at_the_limit", frame_sum(60.00002, 64.000021)))
+        proc, got = evidence_cases([c for _n, c, _code, _needle in bad] + [c for _n, c in controls])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(len(got), len(bad) + len(controls), (len(got), proc.stderr[-3000:]))
+        for (name, _c, code, needle), row in zip(bad, got):
+            with self.subTest(case=name):
+                self.assertEqual(row["outcome"], "INVALID", row)
+                self.assertTrue(any(p.startswith(code + ": ") and needle in p for p in row["problems"]), row)
+        for (name, _c), row in zip(controls, got[len(bad):]):
+            with self.subTest(control=name):
+                self.assertEqual((row["problems"], row["outcome"]), ([], "PASS"), row)
+
+
 @requires_windows_pwsh
 class CdngStageContainmentGateTests(unittest.TestCase):
     """EXPORT-CDNG-STAGE-CONTAINMENT-1 (split from EXPORT-VENUE-LEG-1 / #838 by the hub STOP RULE of 2026-11-18T17:26:25Z): the six members #838 found one round at a time, each
