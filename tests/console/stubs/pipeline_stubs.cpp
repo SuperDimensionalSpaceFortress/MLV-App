@@ -201,7 +201,9 @@ void processingSetHighlights(processingObject_t * processing, double value)
     }
 }
 
-void processingSetGCurve(processingObject_t *, int, float *, float *, uint8_t) {}
+/* The real setter's status (raw_processing.h): 0 = table written. Console tests never render; the all-or-nothing curve
+ * push is pinned against the real setter in pipeline_tests (ExportRenderedLookAssistGrade). */
+int processingSetGCurve(processingObject_t *, int, float *, float *, uint8_t) { return 0; }
 
 int processingWhiteBalanceControlsForAsShotNeutral(const double[3], int *, int *)
 {

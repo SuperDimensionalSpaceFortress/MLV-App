@@ -49,8 +49,10 @@ public:
      * widget does). A rendered frame shows only processing-object state, so a rendered export calls this after
      * applyHeadlessLookAssist returned true. (A CDNG export carries only Look Assist's exposure, raw levels and white
      * balance, as DNG metadata; it has no carrier for these sliders or the curve.) White balance is not touched
-     * (applyHeadlessLookAssist already set it). Null-safe. */
-    static void applyLookAssistGradeToProcessing(ReceiptSettings *receipt,
+     * (applyHeadlessLookAssist already set it). Null-safe. The curve is all four channels or none: false (with a
+     * WARNING line) when a non-default curve was not pushed, because it is malformed, a channel's setter refused it (all
+     * four tables are then restored) or memory ran out; the sliders are pushed either way. Never throws. */
+    static bool applyLookAssistGradeToProcessing(ReceiptSettings *receipt,
                                                  processingObject_t *processingObject);
 
     /* The clip's recorded (as-shot) white balance as the app's temperature / tint controls

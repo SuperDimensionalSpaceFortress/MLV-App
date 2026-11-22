@@ -12,85 +12,106 @@
  * to this card is an opt-out: <cutIn>1</cutIn><lookAssistEnabled>0</lookAssistEnabled> left Look Assist
  * on (adversary A1 on 76653777).
  *
- * plainLookAssistOptOut() therefore reads the receipt element again with a second reader on its own
- * handle of the same file, which leaves the main reader's position and error state exactly as base
- * leaves them. It looks only at the element's direct children in no namespace named lookAssistEnabled,
- * so an extension such as <x:lookAssistEnabled> neither hides a later plain opt-out nor overwrites an
- * earlier one (r2 B2). It answers true when the last such child says 0. The caller only ever turns
+ * OptOutWatch only observes the walk (it never moves the reader). When the walk may have missed or
+ * mis-read an opt-out, optOut() reads the element again with a second reader over the SAME bytes the
+ * walk parsed (the walk's device is a QBuffer the caller filled with one read of the file; a file
+ * is never opened twice, so a file saved between the two reads cannot mix two versions: r2 adversary
+ * A3). It looks only at the element's direct children in no namespace named lookAssistEnabled, so an
+ * extension such as <x:lookAssistEnabled> neither hides a later plain opt-out nor overwrites an
+ * earlier one (r2 B2), and answers true when the last such child says 0. The caller only ever turns
  * Look Assist OFF on that answer, so every receipt base read as off stays off, and nothing else the
  * walk read is touched. */
 
-#include <QFile>
-#include <QFileDevice>
+#include <QBuffer>
+#include <QByteArray>
+#include <QString>
 #include <QXmlStreamReader>
 
 namespace ReceiptXmlWalk
 {
 
-/* elementOffset / elementName: reader->characterOffset() and reader->qualifiedName() taken while the
- * main reader stands on the receipt (or session clip) start element whose children are read.
- * extensionSeen: the walk's lookAssistEnabled handler met one in a namespace.
- *
- * Called after the walk. When the walk stopped on the element's own end element it handled every
- * direct child (a skipped compact element always stops it on that child's end instead), so it read
- * every plain lookAssistEnabled, last one winning, exactly as the scan would; unless an extension
- * was among them there is nothing to correct and the file is not read again. Every receipt and
- * session MLV App writes is indented, so a session of many clips is still read once, as on base.
- *
- * False when the reader's device is not a named file, the file cannot be reopened, or the element
- * is not found. A parse error ends the scan with what it read before the error. */
-inline bool plainLookAssistOptOut( QXmlStreamReader *reader, qint64 elementOffset,
-                                   const QString &elementName, bool extensionSeen )
+class OptOutWatch
 {
-    if( !extensionSeen && reader->isEndElement() && reader->qualifiedName() == elementName )
-        return false;
+public:
+    // Constructed while the reader stands on the receipt (or session clip) start element.
+    explicit OptOutWatch( QXmlStreamReader *reader )
+        : m_elementOffset( reader->characterOffset() )
+    {}
 
-    QFileDevice *device = qobject_cast<QFileDevice *>( reader->device() );
-    if( !device || device->fileName().isEmpty() ) return false;
-
-    QFile file( device->fileName() );
-    // The same Text flag as the main reader's handle, so both readers count the same characters.
-    if( !file.open( QIODevice::ReadOnly | ( device->openMode() & QIODevice::Text ) ) ) return false;
-
-    QXmlStreamReader scan( &file );
-    bool found = false;
-    while( !scan.atEnd() && !scan.hasError() )
+    // In the lookAssistEnabled handler, before it reads the text: base's handler matches local names.
+    void sawLookAssistEnabled( QXmlStreamReader *reader )
     {
-        scan.readNext();
-        if( scan.isStartElement() && scan.characterOffset() == elementOffset )
-        {
-            found = true;
-            break;
-        }
+        if( !reader->namespaceUri().isEmpty() ) m_extensionSeen = true;
     }
-    if( !found ) return false;
 
-    int depth = 0;      // 0: a direct child of the element
-    int lastValue = -1; // -1: no plain lookAssistEnabled child read
-    while( !scan.atEnd() && !scan.hasError() )
+    // At the bottom of every pass of the walk. Only a handler's trailing readNext() can leave the reader
+    // on a start element there (the catch-all handler reads every start element the loop lands on), and
+    // the loop's next readNext() then steps past that element: the walk stops early (r2 adversary A1,
+    // which a name comparison missed for a nested <receipt/>).
+    void endOfPass( QXmlStreamReader *reader )
     {
-        scan.readNext();
-        if( scan.hasError() ) break;
-        if( scan.isStartElement() )
+        if( reader->isStartElement() ) m_steppedPast = true;
+    }
+
+    /* After the walk. With no element stepped past, no extension met and the walk on an end element,
+     * the walk handled every direct child, so it read every plain lookAssistEnabled, last one winning,
+     * exactly as the scan would: nothing to correct, nothing read again. Every receipt and session MLV
+     * App writes is indented, so a session of many clips is read once, as on base. */
+    bool optOut( QXmlStreamReader *reader ) const
+    {
+        if( !m_steppedPast && !m_extensionSeen && reader->isEndElement() && !reader->hasError() )
+            return false;
+
+        QBuffer *buffer = qobject_cast<QBuffer *>( reader->device() );
+        if( !buffer ) return false;
+
+        QXmlStreamReader scan( buffer->data() );
+        bool found = false;
+        while( !scan.atEnd() && !scan.hasError() )
         {
-            if( depth == 0 && scan.namespaceUri().isEmpty()
-             && scan.name() == QLatin1String( "lookAssistEnabled" ) )
+            scan.readNext();
+            if( scan.isStartElement() && scan.characterOffset() == m_elementOffset )
             {
-                const QString text = scan.readElementText();
-                if( scan.hasError() ) break;
-                lastValue = ( text.toInt() != 0 ) ? 1 : 0; // the handlers' (bool)toInt()
-                continue;
+                found = true;
+                break;
             }
-            ++depth;
         }
-        else if( scan.isEndElement() )
+        if( !found ) return false;
+
+        int depth = 0;      // 0: a direct child of the element
+        int lastValue = -1; // -1: no plain lookAssistEnabled child read
+        while( !scan.atEnd() && !scan.hasError() )
         {
-            if( depth == 0 ) break; // the element's own end
-            --depth;
+            scan.readNext();
+            if( scan.hasError() ) break;
+            if( scan.isStartElement() )
+            {
+                if( depth == 0 && scan.namespaceUri().isEmpty()
+                 && scan.name() == QString( "lookAssistEnabled" ) )
+                {
+                    // Child elements are skipped, not an error, so a malformed earlier one cannot hide a
+                    // later scalar opt-out (r2 adversary A2). Its text is read as the handlers read it.
+                    const QString text = scan.readElementText( QXmlStreamReader::SkipChildElements );
+                    if( scan.hasError() ) break;
+                    lastValue = ( text.toInt() != 0 ) ? 1 : 0; // the handlers' (bool)toInt()
+                    continue;
+                }
+                ++depth;
+            }
+            else if( scan.isEndElement() )
+            {
+                if( depth == 0 ) break; // the element's own end
+                --depth;
+            }
         }
+        return lastValue == 0;
     }
-    return lastValue == 0;
-}
+
+private:
+    qint64 m_elementOffset = -1;
+    bool m_steppedPast = false;
+    bool m_extensionSeen = false;
+};
 
 } // namespace ReceiptXmlWalk
 

@@ -16036,8 +16036,12 @@ void MainWindow::openSession(QString fileNameSession)
     //Clear the last session
     deleteSession();
 
-    //Parse
-    Rxml.setDevice(&file);
+    //Parse one read of the file: the Look Assist opt-out scan re-reads these bytes, never the file
+    //(ReceiptXmlWalk.h; EXPORT-PRORES-LOOK-ASSIST-1 r2 adversary A3)
+    QByteArray sessionBytes = file.readAll();
+    QBuffer sessionBuffer( &sessionBytes );
+    sessionBuffer.open( QIODevice::ReadOnly );
+    Rxml.setDevice(&sessionBuffer);
     while( !Rxml.atEnd() )
     {
         Rxml.readNext();
@@ -16252,8 +16256,11 @@ void MainWindow::resetReceiptWithDefault( ReceiptSettings *receipt )
     //Version of settings (values may be interpreted differently)
     int versionReceipt = 0;
 
-    //Parse
-    Rxml.setDevice(&file);
+    //Parse one read of the file (the opt-out scan re-reads these bytes, ReceiptXmlWalk.h)
+    QByteArray receiptBytes = file.readAll();
+    QBuffer receiptBuffer( &receiptBytes );
+    receiptBuffer.open( QIODevice::ReadOnly );
+    Rxml.setDevice(&receiptBuffer);
     while( !Rxml.atEnd() )
     {
         Rxml.readNext();
@@ -16306,8 +16313,11 @@ void MainWindow::on_actionImportReceipt_triggered()
     //Version of settings (values may be interpreted differently)
     int versionReceipt = 0;
 
-    //Parse
-    Rxml.setDevice(&file);
+    //Parse one read of the file (the opt-out scan re-reads these bytes, ReceiptXmlWalk.h)
+    QByteArray receiptBytes = file.readAll();
+    QBuffer receiptBuffer( &receiptBytes );
+    receiptBuffer.open( QIODevice::ReadOnly );
+    Rxml.setDevice(&receiptBuffer);
     while( !Rxml.atEnd() )
     {
         Rxml.readNext();
@@ -16390,10 +16400,8 @@ void MainWindow::readXmlElementsFromFile(QXmlStreamReader *Rxml, ReceiptSettings
     receipt->setDualIsoEvCorrection( 1 );
     receipt->setDualIsoBlackDelta( -1 );
 
-    //Read tags (the walk is base's; the element is kept for the opt-out scan below, ReceiptXmlWalk.h)
-    const qint64 receiptElementOffset = Rxml->characterOffset();
-    const QString receiptElementName = Rxml->qualifiedName().toString();
-    bool lookAssistExtensionSeen = false;
+    //Read tags (the walk is base's; optOutWatch only observes it, ReceiptXmlWalk.h)
+    ReceiptXmlWalk::OptOutWatch optOutWatch( Rxml );
     while( !Rxml->atEnd() && !Rxml->isEndElement() )
     {
         Rxml->readNext();
@@ -16817,7 +16825,7 @@ void MainWindow::readXmlElementsFromFile(QXmlStreamReader *Rxml, ReceiptSettings
         }
         else if( Rxml->isStartElement() && Rxml->name() == QString( "lookAssistEnabled" ) )
         {
-            if( !Rxml->namespaceUri().isEmpty() ) lookAssistExtensionSeen = true;
+            optOutWatch.sawLookAssistEnabled( Rxml );
             receipt->setLookAssistEnabled( (bool)Rxml->readElementText().toInt() );
             Rxml->readNext();
         }
@@ -17046,11 +17054,12 @@ void MainWindow::readXmlElementsFromFile(QXmlStreamReader *Rxml, ReceiptSettings
             Rxml->readElementText();
             Rxml->readNext();
         }
+        optOutWatch.endOfPass( Rxml );
     }
 
     //A plain opt-out the walk stepped past, or one a namespaced extension overwrote, still turns Look Assist off;
-    //it never turns it on (EXPORT-PRORES-LOOK-ASSIST-1 r2 B1/B2)
-    if( ReceiptXmlWalk::plainLookAssistOptOut( Rxml, receiptElementOffset, receiptElementName, lookAssistExtensionSeen ) )
+    //it never turns it on (EXPORT-PRORES-LOOK-ASSIST-1 r2 B1/B2, r3 A1-A3)
+    if( optOutWatch.optOut( Rxml ) )
         receipt->setLookAssistEnabled( false );
 }
 

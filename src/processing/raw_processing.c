@@ -6342,7 +6342,7 @@ void processingSetLutStrength(processingObject_t *processing, uint8_t strength)
 }
 
 //Set the gradation curve
-void processingSetGCurve(processingObject_t *processing, int num, float *pXin, float *pYin, uint8_t channel)
+int processingSetGCurve(processingObject_t *processing, int num, float *pXin, float *pYin, uint8_t channel)
 {
     uint16_t *curve;
     if( channel == 1 ) curve = processing->gcurve_r;
@@ -6357,7 +6357,7 @@ void processingSetGCurve(processingObject_t *processing, int num, float *pXin, f
         {
             curve[i] = i;
         }
-        return;
+        return 0;
     }
 
     //Refuse knots the spline cannot use and leave the curve as it is: a non-finite value, or an x that the "no equal x"
@@ -6365,14 +6365,14 @@ void processingSetGCurve(processingObject_t *processing, int num, float *pXin, f
     //32 + 0.000001 rounds back to 32 (EXPORT-PRORES-LOOK-ASSIST-1, adversary A4 on 76653777). Every curve the widget
     //draws (x in 0..1) passes unchanged.
     {
-        if( !isfinite( pXin[0] ) || !isfinite( pYin[0] ) ) return;
+        if( !isfinite( pXin[0] ) || !isfinite( pYin[0] ) ) return 1;
         float last = pXin[0];
         for( int i = 1; i < num; i++ )
         {
-            if( !isfinite( pXin[i] ) || !isfinite( pYin[i] ) ) return;
+            if( !isfinite( pXin[i] ) || !isfinite( pYin[i] ) ) return 1;
             float x = pXin[i];
             if( last >= x ) x = last + 0.000001;
-            if( !( x > last ) ) return;
+            if( !( x > last ) ) return 1;
             last = x;
         }
     }
@@ -6384,7 +6384,7 @@ void processingSetGCurve(processingObject_t *processing, int num, float *pXin, f
     {
         free( pXout );
         free( pYout );
-        return;
+        return 1;
     }
 
     int numOut = 65536;
@@ -6411,6 +6411,7 @@ void processingSetGCurve(processingObject_t *processing, int num, float *pXin, f
 
     free( pXout );
     free( pYout );
+    return ret == 0 ? 0 : 1;
 }
 
 //Set the hue vs curves

@@ -13,7 +13,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <new>
 #include <vector>
 
 namespace
@@ -1155,6 +1157,10 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             .arg( processingGetWhiteBalanceTint( processingObject ), 0, 'f', 9 )
             .arg( cachedFrameBefore )
             .arg( mlvObject->current_cached_frame_active ) );
+        // Master's pass starts from the raw levels this pass found on entry, not from this pass's auto-fix, so a skip in
+        // it gives back the levels the receipt applied (r3, r2 adversary A6 on 40efaff7). Its own auto-fix reads only the
+        // clip's original levels and the baseline it restores, so a pass that does not skip ends on the same levels.
+        restoreHeadlessRawLevels( levelsBeforeAutoFix, receipt, mlvObject, processingObject );
         return applyHeadlessLookAssist( receipt, mlvObject, processingObject, analysisFrame, true );
     }
     // The window-lit check runs on copies (the GUI does the same; see there): by colour alone it only logs; it APPLIES
@@ -1304,10 +1310,24 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     return true;
 }
 
-void ReceiptApplier::applyLookAssistGradeToProcessing(ReceiptSettings *receipt,
+/* The one warning applyLookAssistGradeToProcessing writes when the curve is not pushed. It cannot throw: an allocation
+ * failure while writing it loses the line, never the job (r3, r2 adversary A7 on 40efaff7). */
+static void logLookAssistCurveNotApplied( const char *reason ) noexcept
+{
+    try
+    {
+        BatchLogger::err( QStringLiteral( "[BATCH] WARNING LOOK_ASSIST curve not applied: %1\n" )
+            .arg( QLatin1String( reason ) ) );
+    }
+    catch( ... )
+    {
+    }
+}
+
+bool ReceiptApplier::applyLookAssistGradeToProcessing(ReceiptSettings *receipt,
                                                       processingObject_t *processingObject)
 {
-    if( !receipt || !processingObject ) return;
+    if( !receipt || !processingObject ) return false;
 
     processingSetExposureStops( processingObject, receipt->exposure() / 100.0 + 1.2 );
     processingSetSimpleContrast( processingObject, receipt->contrast() / 100.0 );
@@ -1320,30 +1340,78 @@ void ReceiptApplier::applyLookAssistGradeToProcessing(ReceiptSettings *receipt,
     processingSetShadows( processingObject, receipt->shadows() * 1.5 / 100.0 );
     processingSetHighlights( processingObject, receipt->highlights() * 1.5 / 100.0 );
 
-    // A default curve is left alone, so a grade without one renders exactly as before.
-    const QString curve = receipt->gradationCurve();
-    if( lookassist::lookAssistIsDefaultGradationCurve( curve ) ) return;
-    std::vector<lookassist::LookAssistGradationPoint> lines[4];
-    // Curves::setConfiguration returns before pushing any table when the string runs out before its fourth line, so a
-    // partial curve pushes nothing here either (adversary A3 on 76653777).
-    if( lookassist::lookAssistParseGradationCurve( curve, lines ) != 4 ) return;
-    // Every line the widget draws has its two end points at least; a line with fewer (e.g. a trailing "?0.5;" whose y is
-    // missing) is not a curve, so nothing is pushed rather than a mix of graded and reset channels (adversary A2 on
-    // 16d54744).
-    for( const std::vector<lookassist::LookAssistGradationPoint> &line : lines )
-        if( line.size() < 2 ) return;
+    // The curve is all four channels or none: every C++ allocation (the string, the parse, the knot arrays) happens inside
+    // one try before any table moves, so a std::bad_alloc leaves the tables as they were and never escapes the rendered
+    // job's own error paths (r3, r2 adversary A7 on 40efaff7). The snapshot below is a malloc, checked.
+    std::vector<float> xs[4], ys[4];
+    try
+    {
+        // A default curve is left alone, so a grade without one renders exactly as before.
+        const QString curve = receipt->gradationCurve();
+        if( lookassist::lookAssistIsDefaultGradationCurve( curve ) ) return true;
+        std::vector<lookassist::LookAssistGradationPoint> lines[4];
+        bool wellFormed = false;
+        // Curves::setConfiguration returns before pushing any table when the string runs out before its fourth line, so a
+        // partial curve pushes nothing here either (adversary A3 on 76653777); nor does a line with an x and no y or a
+        // token that is no number (r2 adversary A4 on 40efaff7).
+        if( lookassist::lookAssistParseGradationCurve( curve, lines, &wellFormed ) != 4 || !wellFormed )
+        {
+            logLookAssistCurveNotApplied( "malformed gradation curve" );
+            return false;
+        }
+        // Every line the widget draws has its two end points at least; a line with fewer is not a curve, so nothing is
+        // pushed rather than a mix of graded and reset channels (adversary A2 on 16d54744).
+        for( const std::vector<lookassist::LookAssistGradationPoint> &line : lines )
+            if( line.size() < 2 )
+            {
+                logLookAssistCurveNotApplied( "a line has fewer than two points" );
+                return false;
+            }
+        // Copies: the spline helper nudges equal x values in place, as it does on the widget's own arrays.
+        for( int channel = 0; channel < 4; ++channel )
+        {
+            xs[channel].reserve( lines[channel].size() );
+            ys[channel].reserve( lines[channel].size() );
+            for( const lookassist::LookAssistGradationPoint &point : lines[channel] )
+            {
+                xs[channel].push_back( point.x );
+                ys[channel].push_back( point.y );
+            }
+        }
+    }
+    catch( const std::bad_alloc & )
+    {
+        logLookAssistCurveNotApplied( "out of memory" );
+        return false;
+    }
+
+    // The four tables as they are, so a channel the setter refuses (a knot the spline cannot use) or cannot build (an
+    // allocation) puts all four back: never Y, R and G graded over the old B (r3, r2 adversary A5 on 40efaff7).
+    const size_t tableBytes = sizeof( processingObject->gcurve_y );
+    uint16_t *snapshot = static_cast<uint16_t *>( malloc( tableBytes * 4 ) );
+    if( !snapshot )
+    {
+        logLookAssistCurveNotApplied( "out of memory" );
+        return false;
+    }
+    uint16_t *tables[4] = { processingObject->gcurve_y, processingObject->gcurve_r,
+                            processingObject->gcurve_g, processingObject->gcurve_b };
+    for( int channel = 0; channel < 4; ++channel )
+        memcpy( snapshot + channel * ( tableBytes / sizeof( uint16_t ) ), tables[channel], tableBytes );
     for( int channel = 0; channel < 4; ++channel )
     {
-        // Copies: the spline helper nudges equal x values in place, as it does on the widget's own arrays.
-        std::vector<float> xs, ys;
-        for( const lookassist::LookAssistGradationPoint &point : lines[channel] )
+        if( processingSetGCurve( processingObject, static_cast<int>( xs[channel].size() ), xs[channel].data(),
+                                 ys[channel].data(), static_cast<uint8_t>( channel ) ) != 0 )
         {
-            xs.push_back( point.x );
-            ys.push_back( point.y );
+            for( int restore = 0; restore < 4; ++restore )
+                memcpy( tables[restore], snapshot + restore * ( tableBytes / sizeof( uint16_t ) ), tableBytes );
+            free( snapshot );
+            logLookAssistCurveNotApplied( "a channel's curve was refused; all four tables restored" );
+            return false;
         }
-        processingSetGCurve( processingObject, static_cast<int>( xs.size() ), xs.data(), ys.data(),
-                             static_cast<uint8_t>( channel ) );
     }
+    free( snapshot );
+    return true;
 }
 
 

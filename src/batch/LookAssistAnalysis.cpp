@@ -1881,11 +1881,13 @@ QString lookAssistFilmGradationCurveV1( LookAssistScene scene )
          + identity + QStringLiteral("?") + filmCurveLine( knotX, blueY, 5 );
 }
 
-int lookAssistParseGradationCurve( const QString &curve, std::vector<LookAssistGradationPoint> lines[4] )
+int lookAssistParseGradationCurve( const QString &curve, std::vector<LookAssistGradationPoint> lines[4],
+                                   bool *wellFormed )
 {
     // The same walk as Curves::setConfiguration: a line ends at '?', a value at ';', numbers by toFloat.
     QString config = curve;
     int read = 0;
+    bool formed = true;
     for( int i = 0; i < 4; ++i )
     {
         lines[i].clear();
@@ -1893,19 +1895,29 @@ int lookAssistParseGradationCurve( const QString &curve, std::vector<LookAssistG
         while( config.size() > 0 && !config.startsWith( QLatin1Char('?') ) )
         {
             const int xEnd = config.indexOf( QLatin1Char(';') );
-            if( xEnd < 0 ) { config.clear(); break; }   // malformed tail: the widget would spin on it
+            if( xEnd < 0 ) { config.clear(); formed = false; break; }   // malformed tail: the widget would spin on it
             LookAssistGradationPoint point;
-            point.x = config.left( xEnd ).toFloat();
+            bool xNumber = false;
+            point.x = config.left( xEnd ).toFloat( &xNumber );
             config.remove( 0, xEnd + 1 );
+            // An x with no y before the line ends ('?') or the string does: an odd count of tokens (r2 adversary A4).
+            const int lineEnd = config.indexOf( QLatin1Char('?') );
             const int yEnd = config.indexOf( QLatin1Char(';') );
-            if( yEnd < 0 ) { config.clear(); break; }
-            point.y = config.left( yEnd ).toFloat();
+            if( yEnd < 0 || ( lineEnd >= 0 && lineEnd < yEnd ) )
+            {
+                formed = false;
+                if( yEnd < 0 ) { config.clear(); break; }
+            }
+            bool yNumber = false;
+            point.y = config.left( yEnd ).toFloat( &yNumber );
             config.remove( 0, yEnd + 1 );
+            if( !xNumber || !yNumber ) formed = false;
             lines[i].push_back( point );
         }
         config.remove( 0, 1 );   // the '?'
         ++read;
     }
+    if( wellFormed ) *wellFormed = formed;
     return read;
 }
 

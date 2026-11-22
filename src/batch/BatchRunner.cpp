@@ -123,6 +123,35 @@ int renderedCancelledBeforeEncode(const QString &baseName, uint32_t framesToExpo
     return 4;
 }
 
+/* Every failure exit between the analysis and the frame loop (r3, r2 adversary A8 on 40efaff7). The flag is sampled
+ * before the failure line and again after it, so a cancel recorded before the line or while it is written (a blocked
+ * stderr) is the typed cancellation, exit 4, not the failure. The one window left is between the second sample and the
+ * return: no I/O and no wait, a few instructions after the job had already failed and stopped; a signal landing there
+ * is reported as the failure it raced (DISTINGUISH in the PR). The caller has already freed what it holds. */
+int renderedPreEncodeExit(int failureCode, const QString &failureLine, const QString &baseName,
+                          uint32_t framesToExport, const QString &partialRemoved)
+{
+    if( BatchRenderCancelScope::cancelled() )
+        return renderedCancelledBeforeEncode( baseName, framesToExport, partialRemoved );
+    BatchLogger::err( failureLine );
+    if( BatchRenderCancelScope::cancelled() )
+        return renderedCancelledBeforeEncode( baseName, framesToExport, partialRemoved );
+    return failureCode;
+}
+
+/* Removes the partial output and answers the path when it is gone, an empty string when it was not removed, so a
+ * RENDER_CANCELLED receipt never names a file it left behind (r3, r2 adversary A9 on 40efaff7). A partial that is
+ * still there (held open elsewhere) is named in a WARNING line instead. */
+QString removeRenderedPartial(const QString &partialPath)
+{
+    if( partialPath.isEmpty() ) return QString();
+    if( QFile::remove( partialPath ) ) return partialPath;
+    if( QFileInfo::exists( partialPath ) )
+        BatchLogger::err(QStringLiteral("[BATCH] WARNING RENDER_PARTIAL_KEPT path=%1 (could not be removed)\n")
+            .arg(partialPath));
+    return QString();
+}
+
 /* -------- Output verification --------------------------------------------
  *
  * Verification runs on the ffmpeg binary the export ALREADY REQUIRES, not on ffprobe.
@@ -484,12 +513,11 @@ int BatchRunner::exportRenderedVideoFile(
     {
         freeMlvObject( mlvObject );
         freeProcessingObject( processingObject );
-        if( BatchRenderCancelScope::cancelled() )
-            return renderedCancelledBeforeEncode( baseName, framesToExport, QString() );
-        BatchLogger::err(QStringLiteral("[BATCH] ERROR: BatchRunner rendered-video job is not runnable. clip=%1 %2.\n")
-            .arg(baseName)
-            .arg(batchRenderedVideoJobPlanSummary(plan)));
-        return 2;
+        return renderedPreEncodeExit( 2,
+            QStringLiteral("[BATCH] ERROR: BatchRunner rendered-video job is not runnable. clip=%1 %2.\n")
+                .arg(baseName)
+                .arg(batchRenderedVideoJobPlanSummary(plan)),
+            baseName, framesToExport, QString() );
     }
 
     if( !plan.runnerPrerequisites.limitation.isEmpty()
@@ -510,11 +538,10 @@ int BatchRunner::exportRenderedVideoFile(
     {
         freeMlvObject( mlvObject );
         freeProcessingObject( processingObject );
-        if( BatchRenderCancelScope::cancelled() )
-            return renderedCancelledBeforeEncode( baseName, framesToExport, QString() );
-        BatchLogger::err(QStringLiteral("[BATCH] ERROR: BatchRunner could not build the rendered-video ffmpeg invocation. clip=%1 output=%2.\n")
-            .arg(baseName, finalPath));
-        return 2;
+        return renderedPreEncodeExit( 2,
+            QStringLiteral("[BATCH] ERROR: BatchRunner could not build the rendered-video ffmpeg invocation. clip=%1 output=%2.\n")
+                .arg(baseName, finalPath),
+            baseName, framesToExport, QString() );
     }
 
     QDir().mkpath( QFileInfo( finalPath ).absolutePath() );
@@ -561,12 +588,11 @@ int BatchRunner::exportRenderedVideoFile(
     {
         freeMlvObject( mlvObject );
         freeProcessingObject( processingObject );
-        if( BatchRenderCancelScope::cancelled() )
-            return renderedCancelledBeforeEncode( baseName, framesToExport, QString() );
-        BatchLogger::err(QStringLiteral("[BATCH] ERROR: BatchRunner could not start ffmpeg. clip=%1 executable=%2. %3\n")
-            .arg(baseName, plan.ffmpegCommandPlan.executable,
-                 pipeline.diagnostics().trimmed()));
-        return 4;
+        return renderedPreEncodeExit( 4,
+            QStringLiteral("[BATCH] ERROR: BatchRunner could not start ffmpeg. clip=%1 executable=%2. %3\n")
+                .arg(baseName, plan.ffmpegCommandPlan.executable,
+                     pipeline.diagnostics().trimmed()),
+            baseName, framesToExport, QString() );
     }
 
     const size_t sourcePixels = static_cast<size_t>(srcWidth)
@@ -585,14 +611,13 @@ int BatchRunner::exportRenderedVideoFile(
         pipeline.cancel();
         free( frameBuffer );
         free( scaledBuffer );
-        QFile::remove( partialPath );
+        const QString partialRemoved = removeRenderedPartial( partialPath );
         freeMlvObject( mlvObject );
         freeProcessingObject( processingObject );
-        if( BatchRenderCancelScope::cancelled() )
-            return renderedCancelledBeforeEncode( baseName, framesToExport, partialPath );
-        BatchLogger::err(QStringLiteral("[BATCH] ERROR: BatchRunner could not allocate rendered-video frame buffers. clip=%1 source=%2x%3 output=%4x%5.\n")
-            .arg(baseName).arg(srcWidth).arg(srcHeight).arg(outWidth).arg(outHeight));
-        return 4;
+        return renderedPreEncodeExit( 4,
+            QStringLiteral("[BATCH] ERROR: BatchRunner could not allocate rendered-video frame buffers. clip=%1 source=%2x%3 output=%4x%5.\n")
+                .arg(baseName).arg(srcWidth).arg(srcHeight).arg(outWidth).arg(outHeight),
+            baseName, framesToExport, partialRemoved );
     }
 
     const int workerThreads = mlvappEffectiveWorkerThreadCount();
@@ -660,9 +685,10 @@ int BatchRunner::exportRenderedVideoFile(
 
     if( cancelled )
     {
-        QFile::remove( partialPath );
+        const QString partialRemoved = removeRenderedPartial( partialPath );
         BatchLogger::err(QStringLiteral("[BATCH] RENDER_CANCELLED %1 frames=%2/%3 partial_removed=%4\n")
-            .arg(baseName).arg(framesWritten).arg(framesToExport).arg(partialPath));
+            .arg(baseName).arg(framesWritten).arg(framesToExport)
+            .arg(partialRemoved.isEmpty() ? QStringLiteral("none") : partialRemoved));
         return 4;
     }
 
