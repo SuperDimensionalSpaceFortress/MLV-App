@@ -14,6 +14,7 @@
 #include <QDir>
 #include <QFile>
 #include <QProcess>
+#include <QStandardPaths>
 #include <QTemporaryDir>
 
 #include <cmath>
@@ -3029,6 +3030,197 @@ TEST(BatchExportFormat, DefaultPathPickIsExactlyTheToolImageAndUnsetPathExtReach
     ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffmpeg.exe")), appDirLookupText(altRetry) );
     ASSERT_EQ( appDirLookupText(appDir + QStringLiteral("/ffmpeg.com")), appDirLookupText(comRetry) );
     ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffmpeg.exe")), appDirLookupText(replacedRetry) );
+}
+
+/* r4: the system resolver plus the injected step between resolve and the usability read: a hit
+ * under vanishDir is removed right after the resolver returned it (sol r3 B1's seam, no timing). */
+static BatchRenderedVideoExecutableResolver r4VanishingResolver(const QString & vanishDir)
+{
+    return [vanishDir](const QString & name, const QStringList & searchDirs) -> QString
+    {
+        const QString hit = batchRenderedVideoSystemExecutableResolver()(name, searchDirs);
+        if( searchDirs.isEmpty() && !hit.isEmpty()
+         && QDir::cleanPath(QFileInfo(hit).absolutePath()).compare(vanishDir, Qt::CaseInsensitive) == 0 )
+            QFile::remove(hit);
+        return hit;
+    };
+}
+
+/* r4 sol r3 B1 (resolve-then-read race), literal input: PATH=<Early>;<Tools>; the resolver returns
+ * Early\ffmpeg.exe and it is removed before the usability read; Tools\ffmpeg.exe is valid. The
+ * vanished hit is skipped and the search continues to Tools: for the default ffmpeg and ffprobe
+ * lookups (never "found" on Early), the spawn retry (never empty), and the stale app-dir ffprobe
+ * PATH search. */
+TEST(BatchExportFormat, R4VanishedFirstPathHitContinuesToTheNextPathEntry)
+{
+    QTemporaryDir appTemp;
+    QTemporaryDir emptyAppTemp;
+    QTemporaryDir earlyTemp;
+    QTemporaryDir toolsTemp;
+    ASSERT_TRUE( appTemp.isValid() && emptyAppTemp.isValid() && earlyTemp.isValid() && toolsTemp.isValid() );
+    const QString appDir = QDir::cleanPath(appTemp.path());
+    const QString emptyAppDir = QDir::cleanPath(emptyAppTemp.path());
+    const QString early = QDir::cleanPath(earlyTemp.path());
+    const QString tools = QDir::cleanPath(toolsTemp.path());
+    for( const QString & bare : QStringList{ QStringLiteral("ffmpeg"), QStringLiteral("ffprobe") } )
+    {
+        ASSERT_TRUE( appDirLookupWriteFile(appDir + QStringLiteral("/") + bare + QStringLiteral(".exe"),
+                                           QByteArray("MZ-not-really-a-program")) );
+        ASSERT_TRUE( appDirLookupWriteFile(tools + QStringLiteral("/") + bare + QStringLiteral(".exe"),
+                                           QByteArray("MZ-working")) );
+    }
+    const auto plantEarly = [&early]()
+    {
+        return appDirLookupWriteFile(early + QStringLiteral("/ffmpeg.exe"), QByteArray("MZ-early"))
+            && appDirLookupWriteFile(early + QStringLiteral("/ffprobe.exe"), QByteArray("MZ-early"));
+    };
+    const QByteArray savedPath = qgetenv("PATH");
+    qputenv("PATH", (QDir::toNativeSeparators(early) + QDir::listSeparator()
+                     + QDir::toNativeSeparators(tools)).toLocal8Bit());
+    const bool planted1 = plantEarly();
+    const BatchRenderedVideoFfmpegBinaryPlan ffmpegPlan =
+        batchRenderedVideoFfmpegBinaryPlanFromLookup(QString(), emptyAppDir, r4VanishingResolver(early));
+    const bool planted2 = plantEarly();
+    const BatchRenderedVideoMediaProbeBinaryPlan probePlan =
+        batchRenderedVideoMediaProbeBinaryPlanFromLookup(QString(), emptyAppDir, r4VanishingResolver(early));
+    const bool planted3 = plantEarly();
+    const QString retry = batchRenderedVideoAppDirSpawnRetryExecutable(
+        true, true, appDir + QStringLiteral("/ffmpeg.exe"), QStringLiteral("ffmpeg"), r4VanishingResolver(early));
+    const bool planted4 = plantEarly();
+    const BatchRenderedVideoMediaProbeBinaryPlan staleProbePlan =
+        batchRenderedVideoMediaProbeBinaryPlanFromLookup(
+            QString(), appDir,
+            appDirLookupFakeResolver(appDir + QStringLiteral("/ffprobe-gone.exe"), QString(), nullptr));
+    const BatchRenderedVideoFfmpegBinaryPlan otherFfmpeg =
+        batchRenderedVideoFfmpegBinaryPlanFromResolvedPath(
+            QStringLiteral("ffmpeg"), tools + QStringLiteral("/encoder/ffmpeg.exe"));
+    const QString optionalProbe = batchRenderedVideoOptionalMediaProbeExecutable(
+        staleProbePlan, otherFfmpeg, r4VanishingResolver(early));
+    qputenv("PATH", savedPath);
+
+    ASSERT_TRUE( planted1 && planted2 && planted3 && planted4 );
+    ASSERT_TRUE( ffmpegPlan.foundOnPath );
+    ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffmpeg.exe")), appDirLookupText(ffmpegPlan.resolvedExecutable) );
+    ASSERT_TRUE( probePlan.foundOnPath );
+    ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffprobe.exe")), appDirLookupText(probePlan.resolvedExecutable) );
+    ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffmpeg.exe")), appDirLookupText(retry) );
+    ASSERT_TRUE( staleProbePlan.foundInAppDir );
+    ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffprobe.exe")), appDirLookupText(optionalProbe) );
+}
+
+/* r4 sol r3 B2 (search-order divergence), literal input: PATHEXT=".COM; .EXE" (a space before
+ * .EXE), PATH=<App>;<Tools>, the failed App\ffmpeg.exe excluded, Tools holds a working ffmpeg.exe
+ * and a malformed (non-empty) ffmpeg.com. Qt 6.10.2 does not trim PATHEXT tokens: " .exe" is not
+ * ".exe", so Qt uses its default list, .exe first, and the continuation reaches the working
+ * image. Same for ffprobe. Conformance guard first, under the process's own PATHEXT: in a
+ * directory holding both images the continuation picks what QStandardPaths::findExecutable picks. */
+TEST(BatchExportFormat, R4ContinuationFollowsQtSuffixOrderForASpacedPathExt)
+{
+    QTemporaryDir appTemp;
+    QTemporaryDir toolsTemp;
+    ASSERT_TRUE( appTemp.isValid() && toolsTemp.isValid() );
+    const QString appDir = QDir::cleanPath(appTemp.path());
+    const QString tools = QDir::cleanPath(toolsTemp.path());
+    for( const QString & bare : QStringList{ QStringLiteral("ffmpeg"), QStringLiteral("ffprobe") } )
+    {
+        ASSERT_TRUE( appDirLookupWriteFile(appDir + QStringLiteral("/") + bare + QStringLiteral(".exe"),
+                                           QByteArray("MZ-not-really-a-program")) );
+        ASSERT_TRUE( appDirLookupWriteFile(tools + QStringLiteral("/") + bare + QStringLiteral(".exe"),
+                                           QByteArray("MZ-working")) );
+        ASSERT_TRUE( appDirLookupWriteFile(tools + QStringLiteral("/") + bare + QStringLiteral(".com"),
+                                           QByteArray("malformed-com")) );
+    }
+    const QByteArray savedPath = qgetenv("PATH");
+    const QByteArray savedPathExt = qgetenv("PATHEXT");
+    qputenv("PATH", (QDir::toNativeSeparators(appDir) + QDir::listSeparator()
+                     + QDir::toNativeSeparators(tools)).toLocal8Bit());
+    const QString qtPick = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"), QStringList{ tools });
+    const QString conformRetry = batchRenderedVideoAppDirSpawnRetryExecutable(
+        true, true, appDir + QStringLiteral("/ffmpeg.exe"), QStringLiteral("ffmpeg"),
+        batchRenderedVideoSystemExecutableResolver());
+    qputenv("PATHEXT", QByteArray(".COM; .EXE"));
+    QStringList retries;
+    for( const QString & bare : QStringList{ QStringLiteral("ffmpeg"), QStringLiteral("ffprobe") } )
+    {
+        retries << batchRenderedVideoAppDirSpawnRetryExecutable(
+            true, true, appDir + QStringLiteral("/") + bare + QStringLiteral(".exe"), bare,
+            batchRenderedVideoSystemExecutableResolver());
+    }
+    qputenv("PATH", savedPath);
+    qputenv("PATHEXT", savedPathExt);
+
+    ASSERT_FALSE( qtPick.isEmpty() );
+    ASSERT_EQ( appDirLookupText(qtPick), appDirLookupText(conformRetry) );
+    ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffmpeg.exe")), appDirLookupText(retries.value(0)) );
+    ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffprobe.exe")), appDirLookupText(retries.value(1)) );
+}
+
+/* r4 B3: the runner's spawn-retry wiring for one failed app-dir start. `afterFailedStart` runs
+ * right after the start failed (before any identity is read after it). Returns the retry
+ * executable, or empty for no retry. RED FORM: BatchRunner.cpp:507-513 at 870419cb, verbatim (the
+ * lookup-time identity plus one read after the failure); console tests do not link BatchRunner. */
+static QString r4RunnerSpawnRetry(const BatchRenderedVideoFfmpegBinaryPlan & plan,
+                                  const std::function<void()> & afterFailedStart)
+{
+    afterFailedStart();
+    return batchRenderedVideoAppDirSpawnRetryExecutable(
+        plan.foundInAppDir, true, plan.resolvedExecutable, QStringLiteral("ffmpeg"),
+        batchRenderedVideoSystemExecutableResolver(),
+        QStringList{ plan.appDirFileIdentity,
+                     batchRenderedVideoExecutableFileIdentity( plan.resolvedExecutable ) });
+}
+
+/* r4 sol r3 B3 (identity of the launched image), literal inputs. A: the lookup finds healthy A;
+ * the app path is replaced by malformed B before the launch; PATH holds only a healthy hard link
+ * to A. Expected: exclude B, retry A's link. B (sibling): lookup A, replaced by malformed B; B's
+ * app name is removed after the failure and before an identity is read; PATH holds B's hard link
+ * ahead of a good C. Expected: skip B's link, reach C. */
+TEST(BatchExportFormat, R4SpawnRetryExcludesExactlyTheLaunchedImage)
+{
+    QTemporaryDir appATemp;
+    QTemporaryDir linkATemp;
+    QTemporaryDir appBTemp;
+    QTemporaryDir linkBTemp;
+    QTemporaryDir toolsCTemp;
+    ASSERT_TRUE( appATemp.isValid() && linkATemp.isValid() && appBTemp.isValid()
+                 && linkBTemp.isValid() && toolsCTemp.isValid() );
+    const QString appA = QDir::cleanPath(appATemp.path());
+    const QString linkA = QDir::cleanPath(linkATemp.path());
+    const QString appB = QDir::cleanPath(appBTemp.path());
+    const QString linkB = QDir::cleanPath(linkBTemp.path());
+    const QString toolsC = QDir::cleanPath(toolsCTemp.path());
+
+    /* Input A. */
+    const QString appAExe = appA + QStringLiteral("/ffmpeg.exe");
+    ASSERT_TRUE( appDirLookupWriteFile(appAExe, QByteArray("MZ-healthy-A")) );
+    const BatchRenderedVideoFfmpegBinaryPlan planA =
+        batchRenderedVideoFfmpegBinaryPlanFromLookup(QString(), appA, batchRenderedVideoSystemExecutableResolver());
+    ASSERT_TRUE( planA.foundInAppDir );
+    ASSERT_TRUE( appDirLookupMakeLink(linkA + QStringLiteral("/ffmpeg.exe"), appAExe, true) );
+    ASSERT_TRUE( QFile::remove(appAExe) );
+    ASSERT_TRUE( appDirLookupWriteFile(appAExe, QByteArray("MZ-malformed-B")) );
+    const QByteArray savedPath = qgetenv("PATH");
+    qputenv("PATH", QDir::toNativeSeparators(linkA).toLocal8Bit());
+    const QString retryA = r4RunnerSpawnRetry(planA, []() {});
+
+    /* Input B. */
+    const QString appBExe = appB + QStringLiteral("/ffmpeg.exe");
+    ASSERT_TRUE( appDirLookupWriteFile(appBExe, QByteArray("MZ-healthy-A2")) );
+    const BatchRenderedVideoFfmpegBinaryPlan planB =
+        batchRenderedVideoFfmpegBinaryPlanFromLookup(QString(), appB, batchRenderedVideoSystemExecutableResolver());
+    ASSERT_TRUE( planB.foundInAppDir );
+    ASSERT_TRUE( QFile::remove(appBExe) );
+    ASSERT_TRUE( appDirLookupWriteFile(appBExe, QByteArray("MZ-malformed-B2")) );
+    ASSERT_TRUE( appDirLookupMakeLink(linkB + QStringLiteral("/ffmpeg.exe"), appBExe, true) );
+    ASSERT_TRUE( appDirLookupWriteFile(toolsC + QStringLiteral("/ffmpeg.exe"), QByteArray("MZ-working-C")) );
+    qputenv("PATH", (QDir::toNativeSeparators(linkB) + QDir::listSeparator()
+                     + QDir::toNativeSeparators(toolsC)).toLocal8Bit());
+    const QString retryB = r4RunnerSpawnRetry(planB, [&appBExe]() { QFile::remove(appBExe); });
+    qputenv("PATH", savedPath);
+
+    ASSERT_EQ( appDirLookupText(linkA + QStringLiteral("/ffmpeg.exe")), appDirLookupText(retryA) );
+    ASSERT_FALSE( QFileInfo::exists(appBExe) );
+    ASSERT_EQ( appDirLookupText(toolsC + QStringLiteral("/ffmpeg.exe")), appDirLookupText(retryB) );
 }
 #endif
 
