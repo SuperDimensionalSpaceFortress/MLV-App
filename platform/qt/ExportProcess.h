@@ -147,6 +147,7 @@ public:
         if( invocations.isEmpty() ) return false;
         m_processes.clear();
         m_diagnosticTail.clear();
+        m_startError = QProcess::UnknownError;
         for( int i = 0; i < invocations.size(); ++i )
         {
             auto process = std::make_unique<QProcess>();
@@ -163,6 +164,8 @@ public:
                                    QIODevice::ReadWrite );
             if( !m_processes[i]->waitForStarted( timeoutMs ) )
             {
+                /* Typed: FailedToStart (missing / bad image) vs Timedout etc. */
+                m_startError = m_processes[i]->error();
                 captureDiagnostics();
                 cancel();
                 return false;
@@ -231,6 +234,9 @@ public:
 
     QString diagnostics() const { return QString::fromUtf8( m_diagnosticTail ); }
 
+    /* Why the last start() returned false (UnknownError when it did not fail). */
+    QProcess::ProcessError startError() const { return m_startError; }
+
 private:
     void captureDiagnostics()
     {
@@ -246,6 +252,7 @@ private:
 
     std::vector<std::unique_ptr<QProcess>> m_processes;
     QByteArray m_diagnosticTail;
+    QProcess::ProcessError m_startError = QProcess::UnknownError;
 };
 
 } // namespace export_process

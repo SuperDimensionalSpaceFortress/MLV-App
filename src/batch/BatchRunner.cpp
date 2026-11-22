@@ -494,16 +494,20 @@ int BatchRunner::exportRenderedVideoFile(
     export_process::StreamingPipeline pipeline;
     /* The encoder binary actually running; verification below uses the same one. */
     QString encoderExecutable = plan.ffmpegCommandPlan.executable;
+    /* The ffmpeg plan of the encoder that ran: the optional ffprobe is looked up beside it. */
+    BatchRenderedVideoFfmpegBinaryPlan encoderBinaryPlan = plan.ffmpegBinaryPlan;
     bool encoderStarted = pipeline.start( QVector<export_process::Invocation>{
         export_process::invocationFromTemplate( encoderExecutable, arguments ) } );
     if( !encoderStarted )
     {
         /* r2, A1/A3: a DEFAULT request's app-dir ffmpeg that fails to START (a bad image, or
          * removed after preflight) is retried ONCE with the PATH ffmpeg. A binary that starts
-         * and then fails is a real encode failure and is never retried; nor is an explicit
-         * request (foundInAppDir is false for it). */
+         * and then fails is a real encode failure and is never retried; nor is a start that
+         * timed out (typed check, A6), nor an explicit request (foundInAppDir is false). */
         const QString retryExecutable = batchRenderedVideoAppDirSpawnRetryExecutable(
-            plan.ffmpegBinaryPlan.foundInAppDir, encoderExecutable,
+            plan.ffmpegBinaryPlan.foundInAppDir,
+            pipeline.startError() == QProcess::FailedToStart,
+            encoderExecutable,
             QStringLiteral("ffmpeg"), batchRenderedVideoSystemExecutableResolver() );
         if( !retryExecutable.isEmpty() )
         {
@@ -511,6 +515,8 @@ int BatchRunner::exportRenderedVideoFile(
                 baseName, QStringLiteral("ffmpeg"), encoderExecutable,
                 pipeline.diagnostics(), retryExecutable ));
             encoderExecutable = retryExecutable;
+            encoderBinaryPlan = batchRenderedVideoFfmpegBinaryPlanAfterSpawnRetry(
+                plan.ffmpegBinaryPlan, retryExecutable );
             encoderStarted = pipeline.start( QVector<export_process::Invocation>{
                 export_process::invocationFromTemplate( encoderExecutable, arguments ) } );
         }
@@ -715,7 +721,7 @@ int BatchRunner::exportRenderedVideoFile(
      * than degrade to `unchecked`. Either way the facts are advisory about WHICH probe
      * spoke and binding about what it said. */
     QString probeExecutable =
-        resolveOptionalMediaProbe( plan.mediaProbeBinaryPlan, plan.ffmpegBinaryPlan );
+        resolveOptionalMediaProbe( plan.mediaProbeBinaryPlan, encoderBinaryPlan );
     MediaProbeFacts facts;
     /* [B2]: the plan bakes the FINAL path into mediaProbeCommandPlan.arguments, so running
      * that string verbatim would probe the previous export on any re-run. Re-aim it at the
@@ -733,12 +739,14 @@ int BatchRunner::exportRenderedVideoFile(
         if( !probeStarted )
         {
             /* r2, A1 sibling: same one-shot PATH retry for an app-dir ffprobe that fails to
-             * START; only when the probe in use IS the plan's app-dir selection. */
+             * START; only when the probe in use IS the plan's app-dir selection, and only on a
+             * typed FailedToStart (a Timedout start is still Starting: never re-used, A6). */
             const bool probeFromAppDir = plan.mediaProbeBinaryPlan.foundInAppDir
                 && QDir::cleanPath( probeExecutable )
                        == QDir::cleanPath( plan.mediaProbeBinaryPlan.resolvedExecutable );
             const QString retryProbe = batchRenderedVideoAppDirSpawnRetryExecutable(
-                probeFromAppDir, probeExecutable, QStringLiteral("ffprobe"),
+                probeFromAppDir, probe.error() == QProcess::FailedToStart,
+                probeExecutable, QStringLiteral("ffprobe"),
                 batchRenderedVideoSystemExecutableResolver() );
             if( !retryProbe.isEmpty() )
             {

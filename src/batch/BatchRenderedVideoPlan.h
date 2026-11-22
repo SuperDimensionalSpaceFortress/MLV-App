@@ -1594,9 +1594,17 @@ QString batchRenderedVideoOptionalMediaProbeExecutable(
  * come from the app dir -- an explicit request or a PATH hit is never retried. */
 QString batchRenderedVideoAppDirSpawnRetryExecutable(
     bool foundInAppDir,
+    bool failedToStart,
     const QString & failedExecutable,
     const QString & defaultName,
     const BatchRenderedVideoExecutableResolver & resolver)
+;
+
+/* The ffmpeg plan after a spawn retry: a PATH plan for retryExecutable (so the optional
+ * ffprobe beside the encoder that actually ran is found, r2 pass-4 A5); unchanged when empty. */
+BatchRenderedVideoFfmpegBinaryPlan batchRenderedVideoFfmpegBinaryPlanAfterSpawnRetry(
+    const BatchRenderedVideoFfmpegBinaryPlan & plan,
+    const QString & retryExecutable)
 ;
 
 /* The batch-log line naming both attempts of a spawn retry. */
