@@ -3855,6 +3855,11 @@ function Get-DvVisualCaptureRequest {
         return [pscustomobject]@{ applies = $applies; requested = $false; optOutReason = [string]$reason.Value }
     }
     if ($null -ne $reason) { throw 'DVE_LEG_SPEC_INVALID visualCaptureOptOutReason is only for visualCapture false' }
+    # EVERY-FRAME-VISUAL-LEG-SPEC-1 r1 (adversary A1): an unpaced Play holds once its required source frames are consumed (MainWindow.cpp playbackHandling), so the
+    # untimed capture tail would show ONE frame six times and still read verdict OK. An unpaced speed leg opts out; an every-frame strip is an unpaced look leg's in-pass contact sheet.
+    if ($applies -and ((Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'unpaced') -eq $true)) {
+        throw 'DVE_LEG_SPEC_INVALID an unpaced speed leg cannot keep the visual capture tail (the unpaced Play holds once its source frames are consumed, so every tail capture is one frame): set visualCapture false with a visualCaptureOptOutReason'
+    }
     [pscustomobject]@{ applies = $applies; requested = $applies; optOutReason = $null }
 }
 

@@ -8121,29 +8121,57 @@ class LegSpecSchemaTests(unittest.TestCase):
             with self.assertRaises(self.jsonschema.ValidationError, msg=name):
                 self.jsonschema.validate(bad, self.schema)
 
-    def test_the_everyframe_visual_leg_is_unpaced_and_keeps_its_play_strip(self) -> None:
+    def test_the_everyframe_visual_leg_is_an_unpaced_look_leg_with_an_in_pass_strip(self) -> None:
         """EVERY-FRAME-VISUAL-LEG-SPEC-1: the one committed leg that plays every frame (generatorArgs.unpaced true: the only drop-frame-off key, which sends
-        -DropFrameMode off and fails closed unless the run log shows pace_unpaced active=1 drop_frame=0) AND keeps the post-measurement window captures
-        (visualCapture absent = on, no opt-out reason). The capture tail cannot reach the loop check: the app closes the measured session
-        (finishPlaybackSmokeTelemetry) before the tail, so playback_smoke.summary's presented_frames is final, and PresentMon's window ends at tail_begin_utc.
-        Every other unpaced M16-1243 speed leg opts out; this one must not, and it stays at the clip's own 20 s floor (the runner refuses less)."""
+        -DropFrameMode off and fails closed unless the run log shows pace_unpaced active=1 drop_frame=0) AND carries a strip of frames the app grabbed WHILE
+        it played. It is a LOOK leg: the contact sheet's in-pass grabs (MainWindow.cpp noteContactSheetPresentedFrame) target consumed source frames when
+        unpaced (contactSheetInPassTargetDue). The post-measurement window capture a speed leg keeps is NOT usable here: r1 ran it on Bachelor and all six
+        play captures showed the one source frame 479 (distinctContentHashes 1), because an unpaced Play holds once the required source frames are consumed
+        (MainWindow.cpp playbackHandling: 'programmaticPlayConsumed() ) return'). It stays at the clip's own 20 s floor (the runner refuses less)."""
         for rel in EVERYFRAME_VISUAL_LEGS:
             spec = json.loads((DV / rel).read_text(encoding="utf-8"))
             self.jsonschema.validate(spec, self.schema)
             self.assertEqual(spec["legId"], Path(rel).stem)
-            self.assertEqual(spec["legType"], "speed")
+            self.assertEqual(spec["legType"], "look")
             self.assertEqual(spec["clipId"], "M16-1243")
             self.assertEqual(sorted(spec["backends"]), ["cpu", "cuda"])
             self.assertIs(spec["generatorArgs"]["unpaced"], True, "drop-frame off: the only key that sends -DropFrameMode off")
             self.assertEqual(spec["generatorArgs"]["swapInterval"], 0)
-            self.assertNotIn("visualCapture", spec, "absent means the play strip is ON")
-            self.assertNotIn("visualCaptureOptOutReason", spec)
+            self.assertGreaterEqual(spec["look"]["contactSheetFrames"], 6, "a strip, not one still")
+            self.assertNotIn("pairedSeek", spec["look"], "the strip is the in-pass play frames, not paused seek stills")
+            self.assertNotIn("visualCapture", spec, "a look leg never runs the post-measurement capture")
             self.assertGreaterEqual(spec["playSeconds"], 20, "M16-1243 is 23.976 fps: its play floor is 20 s")
             self.assertGreaterEqual(len(spec["presentTearingExpectedReason"]), 12)
-            for bad_name, bad in (("opt-out without reason", dict(spec, visualCapture=False)),
-                                  ("reason without opt-out", dict(spec, visualCaptureOptOutReason="x" * 20))):
-                with self.assertRaises(self.jsonschema.ValidationError, msg=bad_name):
-                    self.jsonschema.validate(bad, self.schema)
+
+    def test_an_unpaced_speed_leg_cannot_keep_the_post_measurement_capture_tail(self) -> None:
+        """EVERY-FRAME-VISUAL-LEG-SPEC-1 r1 adversary A1 (blocker): an unpaced Play holds once the required source frames are consumed (MainWindow.cpp
+        playbackHandling), so the untimed capture tail of a speed leg shows ONE frame six times and the receipt still says verdict OK (sourceDifference
+        unknown). The schema, the runner and every committed spec refuse the combination: a speed leg with generatorArgs.unpaced true says visualCapture false."""
+        headroom = json.loads((DV / HEADROOM_LEGS[0]).read_text(encoding="utf-8"))
+        self.jsonschema.validate(headroom, self.schema)
+        self.assertIs(headroom["visualCapture"], False)
+        kept = {k: v for k, v in headroom.items() if k not in ("visualCapture", "visualCaptureOptOutReason")}
+        with self.assertRaises(self.jsonschema.ValidationError, msg="unpaced speed leg, capture absent (= on)"):
+            self.jsonschema.validate(kept, self.schema)
+        with self.assertRaises(self.jsonschema.ValidationError, msg="unpaced speed leg, capture true"):
+            self.jsonschema.validate(dict(kept, visualCapture=True), self.schema)
+        paced = dict(kept, generatorArgs={k: v for k, v in kept["generatorArgs"].items() if k not in ("unpaced", "swapInterval")})
+        paced.pop("presentTearingExpectedReason")
+        self.jsonschema.validate(paced, self.schema)   # a paced speed leg keeps the tail as before
+        for path in sorted((DV / "legs").glob("*.json")):
+            spec = json.loads(path.read_text(encoding="utf-8"))
+            if spec["legType"] == "speed" and (spec.get("generatorArgs") or {}).get("unpaced") is True:
+                self.assertIs(spec.get("visualCapture"), False, path.name)
+        script = ("Import-Module '%s' -Force; $s = Get-Content -Raw '%s' | ConvertFrom-Json; "
+                  "try { $null = Get-DvVisualCaptureRequest -Spec $s; 'NOT_REFUSED' } catch { $_.Exception.Message }")
+        for label, spec in (("absent", kept), ("true", dict(kept, visualCapture=True))):
+            with tempfile.TemporaryDirectory() as tmp:
+                spec_path = Path(tmp) / f"{label}.json"
+                spec_path.write_text(json.dumps(spec), encoding="utf-8")
+                out = run_pwsh(["-NoProfile", "-Command", script % (DV / "DualVenueRunner.psm1", spec_path)])
+                self.assertEqual(out.returncode, 0, out.stderr)
+                self.assertIn("DVE_LEG_SPEC_INVALID", out.stdout, f"{label}: {out.stdout}")
+                self.assertNotIn("NOT_REFUSED", out.stdout, label)
 
     def test_the_hand_listed_shipped_legs_are_exactly_the_legs_directory(self) -> None:
         self.assertEqual(sorted(SHIPPED_LEGS), sorted("legs/" + p.name for p in (DV / "legs").glob("*.json")), "SHIPPED_LEGS drifted from the legs/ directory")
@@ -8281,6 +8309,9 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "CPU-S1-RECON-CHAIN-ATTRIBUTION-1":   # the Look Assist on arms of the chain attribution (the classic arm l never reaches this chain)
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-chainattr-(c|p|t12)-fullscreen-s1$", path.name)
+            elif spec["card"] == "EVERY-FRAME-VISUAL-LEG-SPEC-1":   # the every-frame (unpaced) windowed s1 look leg: its in-pass contact sheet is the strip
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertIn("legs/" + path.name, EVERYFRAME_VISUAL_LEGS, path.name)
             elif spec["card"] == "HFR-NATIVE-60FPS-FULLRES-1":   # the Look Assist ON control of the native s1 pair (its -nola twin is classic)
                 self.assert_hfr_native_s1_flavored_leg(spec, path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
