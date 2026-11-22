@@ -384,7 +384,7 @@ try {
         $m = $script:IdentitySeq[0]; $script:IdentitySeq.RemoveAt(0)
         return [pscustomobject]@{ matches = $m; identity = $null; reason = 'stub' }
     }
-    function Stop-ProcessTree { param([int]$RootProcessId, [string]$RootStartUtc, $RootStartEpochMs, [string]$RootImagePath, $RootProcess) $script:Calls.Add('kill'); return @($RootProcessId) }   # AGENT-JOB-MONITOR-CIM-WALK-1 r8b: the agent's -RootProcess
+    function Stop-ProcessTree { param([int]$RootProcessId, [string]$RootStartUtc, $RootStartEpochMs, [string]$RootImagePath) $script:Calls.Add('kill'); return @($RootProcessId) }
     function Get-RecoveredAdmission { param($Admission) return $null }
     function Publish-JobResult { param([string]$JobId, $Result) $script:Published = $Result; return (Join-Path $fx "$JobId.result.json") }
     function Move-JobArtifacts { param($JobId, $JobPath, $DestinationDirectory) }
