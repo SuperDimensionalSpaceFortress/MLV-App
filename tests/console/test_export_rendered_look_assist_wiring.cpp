@@ -183,7 +183,7 @@ bool checksAllocationsBeforeUse(const QString & body)
 
 TEST(ExportRenderedLookAssistWiring, GradationCurveSetterChecksItsAllocations)
 {
-    ASSERT_TRUE(checksAllocationsBeforeUse(cFunctionBody(QStringLiteral("void processingSetGCurve("))));
+    ASSERT_TRUE(checksAllocationsBeforeUse(cFunctionBody(QStringLiteral("int processingSetGCurve("))));
 }
 
 // Adversary A9 on 16d54744: the cancel scope is installed before the analysis, once.
@@ -259,6 +259,24 @@ int callEnd(const QString & body, int callAt)
     return -1;
 }
 
+// r3 (r2 advisory A11 on 40efaff7): the statement at `pos` runs whenever the function body runs: it sits at the body's
+// own brace depth, and the previous non-space character ends a statement or a block (';', '{', '}'), so neither an
+// enclosing block nor an un-braced if (...) / else prefix guards it. The body starts at its first '{'.
+bool atTopLevelStatement(const QString & body, int pos)
+{
+    const int open = body.indexOf(QLatin1Char('{'));
+    if (open < 0 || pos <= open) return false;
+    int depth = 0;
+    for (int i = open; i < pos; ++i) {
+        if (body.at(i) == QLatin1Char('{')) ++depth;
+        else if (body.at(i) == QLatin1Char('}')) --depth;
+    }
+    if (depth != 1) return false;
+    int i = pos - 1;
+    while (i >= 0 && body.at(i).isSpace()) --i;
+    return i >= 0 && (body.at(i) == QLatin1Char(';') || body.at(i) == QLatin1Char('{') || body.at(i) == QLatin1Char('}'));
+}
+
 // The analysis runs unconditionally on exactly the CDNG anchor, and its grade push is guarded by its verdict alone.
 bool analysisIsWiredUnconditionally(const QString & body)
 {
@@ -266,6 +284,7 @@ bool analysisIsWiredUnconditionally(const QString & body)
     const int lookAssist = body.indexOf(kLookAssistCall);
     const int grade = body.indexOf(kGradePush);
     if (apply < 0 || lookAssist <= apply || grade <= lookAssist) return false;
+    if (!atTopLevelStatement(body, apply)) return false;
     const int applyEnd = callEnd(body, apply);
     const int lookAssistEnd = callEnd(body, lookAssist);
     if (applyEnd < 0 || lookAssistEnd < 0) return false;
@@ -279,9 +298,18 @@ bool analysisIsWiredUnconditionally(const QString & body)
 
 const QString kCancelCheck = QStringLiteral("BatchRenderCancelScope::cancelled()");
 
+// The `if` that tests the cancel flag at `checkAt` (the flag call inside its condition) runs unconditionally.
+bool cancelGuardRunsAlways(const QString & body, int checkAt)
+{
+    const int ifAt = body.lastIndexOf(QStringLiteral("if"), checkAt);
+    return ifAt >= 0 && collapseSpaces(body.mid(ifAt, checkAt - ifAt)) == QStringLiteral("if(")
+        && atTopLevelStatement(body, ifAt);
+}
+
 // r2 B3 (sol r1 on ed129ee1): between the analysis and the frame loop the cancel flag is checked before the plan check
-// and before the encoder spawn, and every return there either is the typed cancellation or sits in a branch that
-// checks the flag first.
+// and before the encoder spawn, and every return there is the typed cancellation behind such a check or a failure exit
+// through renderedPreEncodeExit (r3, r2 adversary A8: it samples the flag on both sides of the failure line). Both
+// guards run unconditionally (r3, r2 advisory A11).
 bool preEncodeExitsReportACancel(const QString & body)
 {
     const int lookAssist = body.indexOf(kLookAssistCall);
@@ -294,15 +322,51 @@ bool preEncodeExitsReportACancel(const QString & body)
     if (planCheck < 0 || renderStart < 0 || spawn <= renderStart) return false;
     const int firstCheck = window.indexOf(kCancelCheck);
     if (firstCheck < 0 || firstCheck > planCheck) return false;
-    if (window.mid(renderStart, spawn - renderStart).indexOf(kCancelCheck) < 0) return false;
+    if (!cancelGuardRunsAlways(body, lookAssist + firstCheck)) return false;
+    const int spawnCheck = window.indexOf(kCancelCheck, renderStart);
+    if (spawnCheck < 0 || spawnCheck > spawn) return false;
+    if (!cancelGuardRunsAlways(body, lookAssist + spawnCheck)) return false;
     int returns = 0;
     for (int at = window.indexOf(QStringLiteral("return ")); at >= 0; at = window.indexOf(QStringLiteral("return "), at + 1)) {
         ++returns;
-        if (window.mid(at).startsWith(QStringLiteral("return renderedCancelledBeforeEncode("))) continue;
+        if (window.mid(at).startsWith(QStringLiteral("return renderedPreEncodeExit("))) continue;
+        if (!window.mid(at).startsWith(QStringLiteral("return renderedCancelledBeforeEncode("))) return false;
+        // The typed cancellation is the body of an if on the flag: directly, or in the block that if opens.
+        const QString ifFlag = QStringLiteral("if(BatchRenderCancelScope::cancelled())");
+        const int statement = qMax(window.lastIndexOf(QLatin1Char(';'), at), window.lastIndexOf(QLatin1Char('}'), at));
+        if (collapseSpaces(window.mid(statement + 1, at - statement - 1)) == ifFlag) continue;
         const int branch = window.lastIndexOf(QLatin1Char('{'), at);
-        if (branch < 0 || window.mid(branch, at - branch).indexOf(kCancelCheck) < 0) return false;
+        if (branch < 0 || window.mid(branch, at - branch).contains(QLatin1Char('}'))) return false;
+        const int beforeBranch = qMax(window.lastIndexOf(QLatin1Char(';'), branch), window.lastIndexOf(QLatin1Char('}'), branch));
+        if (collapseSpaces(window.mid(beforeBranch + 1, branch - beforeBranch - 1)) != ifFlag) return false;
     }
     return returns > 0;
+}
+
+// The body of a free function in BatchRunner.cpp, from its signature to the closing brace at column 0.
+QString batchRunnerFunction(const QString & signature)
+{
+    const QString source = batchRunnerSource();
+    const int at = source.indexOf(signature);
+    if (at < 0) return QString();
+    const int end = source.indexOf(QStringLiteral("\n}"), at);
+    return end < 0 ? QString() : source.mid(at, end - at + 2);
+}
+
+// r3 (r2 adversary A8 on 40efaff7): the failure exit samples the flag before its line and again after it, and only then
+// returns the failure code; both samples run unconditionally.
+bool preEncodeExitSamplesAroundTheLine(const QString & helper)
+{
+    const int first = helper.indexOf(kCancelCheck);
+    const int line = helper.indexOf(QStringLiteral("BatchLogger::err( failureLine );"));
+    const int second = helper.indexOf(kCancelCheck, line);
+    const int failure = helper.indexOf(QStringLiteral("return failureCode;"));
+    return first >= 0 && line > first && second > line && failure > second
+        && cancelGuardRunsAlways(helper, first) && cancelGuardRunsAlways(helper, second)
+        && atTopLevelStatement(helper, line) && atTopLevelStatement(helper, failure)
+        && helper.indexOf(QStringLiteral("return renderedCancelledBeforeEncode("), first) < line
+        && helper.indexOf(QStringLiteral("return renderedCancelledBeforeEncode("), second) < failure
+        && helper.indexOf(QStringLiteral("return renderedCancelledBeforeEncode("), second) > second;
 }
 
 } // namespace
@@ -322,6 +386,14 @@ TEST(ExportRenderedLookAssistWiring, RenderedAnalysisIsWiredUnconditionally)
     QString deadPush = body;
     deadPush.replace(QStringLiteral("if( lookAssistApplied )"), QStringLiteral("if( lookAssistApplied && false )"));
     ASSERT_FALSE(analysisIsWiredUnconditionally(deadPush));
+    // r3 (r2 advisory A11 on 40efaff7): applyToMlv, the analysis and the grade enclosed together, braced or not.
+    QString deadAll = body;
+    deadAll.replace(QStringLiteral("ReceiptApplier::applyToMlv("), QStringLiteral("if (false) { ReceiptApplier::applyToMlv("));
+    deadAll.replace(QStringLiteral("switch( receipt->debayer() )"), QStringLiteral("} switch( receipt->debayer() )"));
+    ASSERT_FALSE(analysisIsWiredUnconditionally(deadAll));
+    QString deadPrefix = body;
+    deadPrefix.replace(QStringLiteral("ReceiptApplier::applyToMlv("), QStringLiteral("if (false) ReceiptApplier::applyToMlv("));
+    ASSERT_FALSE(analysisIsWiredUnconditionally(deadPrefix));
 }
 
 TEST(ExportRenderedLookAssistWiring, ACancelDuringTheAnalysisIsTheTypedCancellation)
@@ -332,20 +404,116 @@ TEST(ExportRenderedLookAssistWiring, ACancelDuringTheAnalysisIsTheTypedCancellat
 TEST(ExportRenderedLookAssistWiring, ACancelCheckMissingFromAPreEncodeExitIsCaught)
 {
     const QString plain = QStringLiteral(
-        "ReceiptApplier::applyHeadlessLookAssist( r ); if( BatchRenderCancelScope::cancelled() ) { return renderedCancelledBeforeEncode( b ); }"
-        " if( !plan.runnable ) { if( BatchRenderCancelScope::cancelled() ) return renderedCancelledBeforeEncode( b ); return 2; }"
+        "int f() { ReceiptApplier::applyHeadlessLookAssist( r ); if( BatchRenderCancelScope::cancelled() ) { return renderedCancelledBeforeEncode( b ); }"
+        " if( !plan.runnable ) { return renderedPreEncodeExit( 2, l, b ); }"
         " \"[BATCH] RENDER_START\"; if( BatchRenderCancelScope::cancelled() ) { return renderedCancelledBeforeEncode( b ); }"
-        " if( !pipeline.start( i ) ) { if( BatchRenderCancelScope::cancelled() ) return renderedCancelledBeforeEncode( b ); return 4; }"
-        " for( uint32_t frameIndex = 0; ; ) {}");
+        " if( !pipeline.start( i ) ) { return renderedPreEncodeExit( 4, l, b ); }"
+        " for( uint32_t frameIndex = 0; ; ) {} }");
     ASSERT_TRUE(preEncodeExitsReportACancel(plain));
     QString unchecked = plain;
-    unchecked.replace(QStringLiteral("{ if( BatchRenderCancelScope::cancelled() ) return renderedCancelledBeforeEncode( b ); return 4; }"),
-                      QStringLiteral("{ return 4; }"));
+    unchecked.replace(QStringLiteral("{ return renderedPreEncodeExit( 4, l, b ); }"), QStringLiteral("{ return 4; }"));
     ASSERT_FALSE(preEncodeExitsReportACancel(unchecked));
     QString lateCheck = plain;
     lateCheck.replace(QStringLiteral("ReceiptApplier::applyHeadlessLookAssist( r ); if( BatchRenderCancelScope::cancelled() ) { return renderedCancelledBeforeEncode( b ); }"),
                       QStringLiteral("ReceiptApplier::applyHeadlessLookAssist( r );"));
     ASSERT_FALSE(preEncodeExitsReportACancel(lateCheck));
+    // r3 (r2 advisory A11): a guard that never runs does not pass, braced or not.
+    QString deadGuard = plain;
+    deadGuard.replace(QStringLiteral("( r ); if( BatchRenderCancelScope::cancelled() )"),
+                      QStringLiteral("( r ); if (false) if( BatchRenderCancelScope::cancelled() )"));
+    ASSERT_FALSE(preEncodeExitsReportACancel(deadGuard));
+    QString deadSpawnGuard = plain;
+    deadSpawnGuard.replace(QStringLiteral("\"[BATCH] RENDER_START\"; if( BatchRenderCancelScope::cancelled() ) { return renderedCancelledBeforeEncode( b ); }"),
+                           QStringLiteral("\"[BATCH] RENDER_START\"; if (false) { if( BatchRenderCancelScope::cancelled() ) { return renderedCancelledBeforeEncode( b ); } }"));
+    ASSERT_FALSE(preEncodeExitsReportACancel(deadSpawnGuard));
+}
+
+// r3 (r2 adversary A8 on 40efaff7): a cancel recorded while the failure line is written is still the typed cancellation.
+TEST(ExportRenderedLookAssistWiring, APreEncodeFailureSamplesTheFlagAfterItsLine)
+{
+    const QString helper = batchRunnerFunction(QStringLiteral("int renderedPreEncodeExit("));
+    ASSERT_FALSE(helper.isEmpty());
+    ASSERT_TRUE(preEncodeExitSamplesAroundTheLine(helper));
+    // Every failure exit between the analysis and the frame loop goes through it (four: plan, invocation, spawn, buffers).
+    ASSERT_EQ(4, countOccurrences(renderedBody(), QStringLiteral("return renderedPreEncodeExit(")));
+    // The predicate catches the r2 shape (one sample, before the line) and a dead second sample.
+    QString oneSample = helper;
+    oneSample.replace(QStringLiteral("BatchLogger::err( failureLine );"), QStringLiteral("BatchLogger::err( failureLine ); return failureCode;"));
+    const int tail = oneSample.indexOf(QStringLiteral("return failureCode;")) + QStringLiteral("return failureCode;").size();
+    oneSample = oneSample.left(tail) + QStringLiteral("\n}");
+    ASSERT_FALSE(preEncodeExitSamplesAroundTheLine(oneSample));
+    QString deadSecond = helper;
+    const int line = deadSecond.indexOf(QStringLiteral("BatchLogger::err( failureLine );"));
+    const int secondIf = deadSecond.indexOf(QStringLiteral("if("), line);
+    ASSERT_TRUE(secondIf > line);
+    deadSecond.insert(secondIf, QStringLiteral("if (false) "));
+    ASSERT_FALSE(preEncodeExitSamplesAroundTheLine(deadSecond));
+}
+
+// r3 (r2 adversary A9 on 40efaff7): a RENDER_CANCELLED receipt names the partial as removed only when QFile::remove
+// removed it.
+TEST(ExportRenderedLookAssistWiring, PartialRemovedReflectsTheRemoval)
+{
+    const QString helper = batchRunnerFunction(QStringLiteral("QString removeRenderedPartial("));
+    ASSERT_FALSE(helper.isEmpty());
+    ASSERT_TRUE(helper.contains(QStringLiteral("if( QFile::remove( partialPath ) ) return partialPath;")));
+    ASSERT_EQ(1, countOccurrences(helper, QStringLiteral("return partialPath;")));
+    const QString body = renderedBody();
+    // Both cancelled exits that removed a partial (frame buffers before the loop, the loop's own cancel) name only what
+    // the removal answered.
+    ASSERT_EQ(2, countOccurrences(body, QStringLiteral("const QString partialRemoved = removeRenderedPartial( partialPath );")));
+    ASSERT_EQ(0, countOccurrences(body, QStringLiteral("renderedCancelledBeforeEncode( baseName, framesToExport, partialPath )")));
+    ASSERT_EQ(0, countOccurrences(collapseSpaces(body), QStringLiteral(".arg(framesToExport).arg(partialPath)")));
+}
+
+// ---- ReceiptApplier (linked into console_tests, but its curve and level paths need a clip or a fault) -----------------
+
+namespace
+{
+
+QString receiptApplierSource()
+{
+    return stripComments(readRepoFile(QStringLiteral("src/batch/ReceiptApplier.cpp")));
+}
+
+} // namespace
+
+// r3 (r2 adversary A6 on 40efaff7): master's pass starts from the levels this pass found on entry, so a skip in it gives
+// those back; the re-run stays a tail call (test_look_assist_scene.cpp pins it).
+TEST(ExportRenderedLookAssistWiring, MastersPassStartsFromTheEntryLevels)
+{
+    const QString source = receiptApplierSource();
+    const QString tail = QStringLiteral("return applyHeadlessLookAssist( receipt, mlvObject, processingObject, analysisFrame, true );");
+    ASSERT_EQ(1, countOccurrences(source, tail));
+    const int tailAt = source.indexOf(tail);
+    const int state = source.lastIndexOf(QStringLiteral("daylight_fallback_state"), tailAt);
+    ASSERT_TRUE(state > 0);
+    const int stateEnd = source.indexOf(QLatin1Char(';'), state);
+    ASSERT_TRUE(collapseSpaces(source.mid(stateEnd + 1, tailAt - stateEnd - 1))
+                == QStringLiteral("restoreHeadlessRawLevels(levelsBeforeAutoFix,receipt,mlvObject,processingObject);"));
+}
+
+// r3 (r2 adversary A7 on 40efaff7): every C++ allocation of the curve push happens inside one try, closed by a
+// std::bad_alloc catch, before the first table moves.
+TEST(ExportRenderedLookAssistWiring, TheCurvePushAllocatesBeforeAnyTableMoves)
+{
+    const QString source = receiptApplierSource();
+    const int fn = source.indexOf(QStringLiteral("bool ReceiptApplier::applyLookAssistGradeToProcessing("));
+    ASSERT_TRUE(fn >= 0);
+    const int end = source.indexOf(QStringLiteral("\n}"), fn);
+    const QString body = source.mid(fn, end - fn);
+    const int tryAt = body.indexOf(QStringLiteral("try"));
+    const int curve = body.indexOf(QStringLiteral("receipt->gradationCurve()"));
+    const int parse = body.indexOf(QStringLiteral("lookAssistParseGradationCurve("));
+    const int lastPush = body.lastIndexOf(QStringLiteral("push_back("));
+    const int catchAt = body.indexOf(QStringLiteral("catch( const std::bad_alloc & )"));
+    const int firstSet = body.indexOf(QStringLiteral("processingSetGCurve("));
+    ASSERT_TRUE(tryAt >= 0 && curve > tryAt && parse > curve && lastPush > parse && catchAt > lastPush);
+    ASSERT_TRUE(firstSet > catchAt);
+    ASSERT_TRUE(atTopLevelStatement(body, tryAt));
+    // The setter's status restores all four tables (A5; the pipeline test pins the behaviour).
+    ASSERT_TRUE(body.indexOf(QStringLiteral("!= 0"), firstSet) > firstSet);
+    ASSERT_EQ(-1, body.indexOf(QStringLiteral("BatchLogger::")));   // the warning goes through the noexcept helper
 }
 
 // (5)

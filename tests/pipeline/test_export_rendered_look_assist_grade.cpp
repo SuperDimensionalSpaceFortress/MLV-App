@@ -295,6 +295,61 @@ TEST(ExportRenderedLookAssistGrade, UnusableCurveKnotsLeaveTheTablesAlone)
     freeProcessingObject( processing );
 }
 
+// r3 (r2 adversary A4 on 40efaff7): a line whose ';' tokens are an odd count (an x with no y) is an incomplete curve; no
+// channel changes, not even the well-formed Y line before it. The reference widget push refuses it too.
+TEST(ExportRenderedLookAssistGrade, AnOddTokenCountChangesNoChannel)
+{
+    const char *const malformed[] = {
+        "0;0;1;0;?0;0;1;1;?0;0;1;1;?0;0;1;1;0.5;",           // the adversary's input: B ends on an x
+        "0;0;1;0;?0;0;1;1;0.5;?0;0;1;1;?0;0;1;1;",           // R ends on an x before the '?'
+        "0;0;1;0;?0;0;1;1;?0;0;x;1;?0;0;1;1;",               // a token that is no number
+    };
+    for( const char *curve : malformed )
+    {
+        ReceiptSettings receipt;
+        receipt.setGradationCurve( QString::fromLatin1( curve ) );
+        processingObject_t *processing = initProcessingObject();
+        ASSERT_TRUE( processing != nullptr );
+        const CurveTables before = curveTables( processing );
+        ReceiptApplier::applyLookAssistGradeToProcessing( &receipt, processing );
+        ASSERT_TRUE( curveTables( processing ) == before );
+        lookAssistTestApplyGradationCurve( processing, QString::fromLatin1( curve ) );
+        ASSERT_TRUE( curveTables( processing ) == before );
+        freeProcessingObject( processing );
+    }
+}
+
+// r3 (r2 adversary A5 on 40efaff7): when the setter refuses a later channel (B's 32;0;32;1, a knot the spline cannot
+// use), Y, R and G already pushed are put back: the render never mixes newly graded and prior channels.
+TEST(ExportRenderedLookAssistGrade, ARefusedChannelRestoresAllFourTables)
+{
+    const QString refusedB = QStringLiteral( "0;0;1;0;?0;0;1;1;?0;0;1;1;?32;0;32;1;" );
+    {
+        ReceiptSettings receipt;
+        receipt.setGradationCurve( refusedB );
+        processingObject_t *processing = initProcessingObject();
+        ASSERT_TRUE( processing != nullptr );
+        const CurveTables identity = curveTables( processing );
+        ReceiptApplier::applyLookAssistGradeToProcessing( &receipt, processing );
+        ASSERT_TRUE( curveTables( processing ) == identity );
+        freeProcessingObject( processing );
+    }
+    {
+        // From a graded state too: the prior user curve stays whole.
+        processingObject_t *processing = initProcessingObject();
+        ASSERT_TRUE( processing != nullptr );
+        lookAssistTestApplyGradationCurve( processing, QString::fromLatin1( kUserCurve ) );
+        const CurveTables graded = curveTables( processing );
+        ReceiptSettings receipt;
+        receipt.setGradationCurve( refusedB );
+        ReceiptApplier::applyLookAssistGradeToProcessing( &receipt, processing );
+        ASSERT_TRUE( curveTables( processing ) == graded );
+        lookAssistTestApplyGradationCurve( processing, refusedB );
+        ASSERT_TRUE( curveTables( processing ) == graded );
+        freeProcessingObject( processing );
+    }
+}
+
 // A11: an out-of-range receipt vibrance is the slider's end, never a non-finite factor.
 TEST(ExportRenderedLookAssistGrade, VibranceIsBoundedToTheSliderRange)
 {
