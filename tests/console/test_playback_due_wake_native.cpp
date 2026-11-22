@@ -1364,6 +1364,13 @@ struct HelperWindowGuard
     HWND window;
     ~HelperWindowGuard() { if( window ) DestroyWindow( window ); }
 };
+// r4 (adversary pass 2 A3, and pass 1 A8): a sender thread is joined on every exit. An ASSERT that returns, or a throw, between
+// its creation and its join would otherwise destroy a joinable std::thread (std::terminate) before the window guard above runs
+struct ThreadJoinGuard
+{
+    std::thread &thread;
+    ~ThreadJoinGuard() { if( thread.joinable() ) thread.join(); }
+};
 }
 #endif
 
@@ -2332,6 +2339,7 @@ TEST(PlaybackDueWakeSend, G1_AForeignSentMessageInTheRunnerSleepIsNotAWakeAndThe
         Sleep( 15 );
         sent = SendNotifyMessageW( window, WM_USER + 0x51, 0, 0 ) != 0;
     } );
+    const ThreadJoinGuard senderGuard { sender };
     QElapsedTimer t;
     t.start();
     const PlaybackDueWake::RunnerSleep slept = wake.sleepForSmokeRunner( 150 );
@@ -2424,6 +2432,7 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
         Sleep( 5 );
         sent = SendNotifyMessageW( window, kR3A3ForeignMessage, 0, 0 ) != 0;
     } );
+    const ThreadJoinGuard senderGuard { sender };
     QElapsedTimer t;
     t.start();
     const PlaybackDueWake::RunnerSleep slept = wake.sleepForSmokeRunner( 150 );
@@ -2484,6 +2493,7 @@ TEST(PlaybackDueWakeSend, R15A1_ADescheduleBeforeTheSleepStartsNeverShiftsTheDis
         Sleep( 50 );
         sent = SendNotifyMessageW( window, kR3A3ForeignMessage, 0, 0 ) != 0;
     } );
+    const ThreadJoinGuard senderGuard { sender };
     // r15: the caller hands the sleep its own clock (seconds); the spans come back on it, with no origin of the caller's
     const PlaybackDueWake::RunnerSleep slept = wake.sleepForSmokeRunner( 150, []() { return dueWakeQpcNowMs() / 1000.0; } );
     sender.join();
@@ -2558,6 +2568,7 @@ TEST(PlaybackDueWakeSend, R15A3_TheDurationAccountIsTheDispatchSpansLength)
         Sleep( 10 );
         sent = SendNotifyMessageW( window, kR15A3ForeignMessage, 0, 0 ) != 0;
     } );
+    const ThreadJoinGuard senderGuard { sender };
     const PlaybackDueWake::RunnerSleep slept = wake.sleepForSmokeRunner( 120, &r15A3CallerNowS );
     sender.join();
     ASSERT_TRUE( sent.load() );
@@ -2774,6 +2785,8 @@ constexpr UINT kR17A1ForeignMessage = WM_USER + 0x53;
 // the sleep having run on. The handler records which probe (its wParam) ran, nothing else.
 constexpr UINT kR17A1ProbeMessage = WM_USER + 0x54;
 constexpr int kR17A1MaxProbes = 8;
+// when the sender queues each probe, from its own entry read; the last two leave under 6 ms of the 80 ms unproven by a probe
+constexpr double kR17A1ProbeOffsetsMs[] = { 30.0, 40.0, 50.0, 60.0, 70.0, 74.0 };
 unsigned g_r17A1ProbeRanMask = 0;
 // what the sender did, on its own clock: read by the test only after the sender is joined
 struct R17A1Probes
@@ -2781,13 +2794,6 @@ struct R17A1Probes
     double beforeMs[kR17A1MaxProbes] = {};
     double afterMs[kR17A1MaxProbes] = {};                              // taken after the send returned: the probe is queued by then
     int sent = 0;
-};
-// r4 (adversary pass 1 A8): joins the sender on every exit, so an exception thrown inside the sleep (an allocation in the product's
-// span record, say) unwinds through a joined thread instead of std::terminate, and the helper window guard below it still runs
-struct R17A1JoinOnExit
-{
-    std::thread &thread;
-    ~R17A1JoinOnExit() { if( thread.joinable() ) thread.join(); }
 };
 LRESULT CALLBACK r17A1ForeignProc( HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam )
 {
@@ -2849,8 +2855,9 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     // ran, so there is nothing to measure), the observation is retried. The retry keys on the HANDLER's own stamps, never on
     // the sleep's span record: an attempt whose handler ran is judged in full below, so a product that dropped the span (or a
     // stamp, or a segment) fails here instead of being retried away. A pass can never come from a missed send.
-    // r4 (sol review r3, blocker 2; adversary pass 1 A1/A4): after the first send the sender puts out a liveness probe about
-    // every 10 ms, each stamped on ITS clock once the send returned (queued by then). The caller clock cannot tell a sleep that
+    // r4 (sol review r3, blocker 2; adversary pass 1 A1/A4, pass 2 A1/A2): after the first send the sender puts out liveness
+    // probes at fixed offsets (kR17A1ProbeOffsetsMs: every 10 ms, the last at 74 ms), each stamped on ITS clock once the send
+    // returned (queued by then). The caller clock cannot tell a sleep that
     // ran its 80 ms from one that returned after a dispatch and was then paused before its final read (both read ~80 ms); a
     // message queued while the sleep should still be waiting can: the sleep dispatches it, or it was cut short. A probe that was
     // queued by kProbeLatestMs after the sleep's entry stamp (a full sleep still to run, 10 ms to spare) MUST have been
@@ -2858,8 +2865,11 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     // probe is observed again, never passed. Two sends taken in one dispatch (a GUI pause) are no failure: the assertions below
     // follow the dispatches the sleep recorded, however many.
     constexpr int kAttempts = 5;
-    constexpr double kProbeLatestMs = 70.0;
-    constexpr double kProbeWindowMs = 70.0;                           // the sender stops probing this long after it saw the entry
+    constexpr double kProbeLatestMs = 76.0;
+    // a healthy sleep whose GUI thread was paused across its expiry check legitimately leaves queued probes behind; that pause
+    // reads as a return far past the requested 80 ms, so such an attempt is observed again rather than judged (the wait's own
+    // timer granularity is inside the allowance)
+    constexpr double kOverrunMs = 15.0;
     g_r17A1Stamps.reserve( 256 );                                     // the clock callback must never allocate (a throw there would std::terminate the sender's join)
     std::unique_ptr<R17A1Windows> wp;
     std::vector<std::pair<double, double>> spans;
@@ -2897,12 +2907,14 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
             // true after it (read false at 4,999 ms, true at 5,005 ms) is not admitted either
             if( !entered || GetTickCount64() >= giveUp ) return;       // the sleep never started: no send, so the attempt reads as missed
             const double seenMs = dueWakeQpcNowMs();
-            Sleep( 20 );
+            // each send at an offset from the sender's own entry read, waited out on its clock (not a Sleep, whose granularity
+            // could leave no probe near the end of the sleep)
+            const auto waitUntil = []( double targetMs ) { while( dueWakeQpcNowMs() < targetMs ) Sleep( 0 ); };
+            waitUntil( seenMs + 20.0 );
             sent = SendNotifyMessageW( window, kR17A1ForeignMessage, 0, 0 ) != 0;
-            while( probes.sent < kR17A1MaxProbes )
+            for( const double offsetMs : kR17A1ProbeOffsetsMs )
             {
-                Sleep( 10 );
-                if( dueWakeQpcNowMs() > seenMs + kProbeWindowMs ) break;
+                waitUntil( seenMs + offsetMs );
                 const int i = probes.sent;
                 probes.beforeMs[i] = dueWakeQpcNowMs();
                 SendNotifyMessageW( window, kR17A1ProbeMessage, static_cast<WPARAM>( i ), 0 );
@@ -2910,7 +2922,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
                 probes.sent = i + 1;
             }
         } );
-        const R17A1JoinOnExit senderGuard { sender };
+        const ThreadJoinGuard senderGuard { sender };               // pass 1 A8: an exception inside the sleep unwinds through a joined thread
         enteredMs = dueWakeQpcNowMs();
         slept = wake.sleepForSmokeRunner( 80, &r17A1RecordingNowS, &r17A1Charge, wp.get() );
         returnedMs = dueWakeQpcNowMs();
@@ -2930,9 +2942,11 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         timelyProbes = 0;
         for( int i = 0; i < probes.sent && !stamps.empty(); ++i )
             if( probes.afterMs[i] <= stamps[0] * 1000.0 + kProbeLatestMs ) timelyProbes |= 1u << static_cast<unsigned>( i );
-        // judged only when the first handler ran in the sleep and at least one probe was queued with a full sleep still to run;
-        // otherwise the sender's timing made this attempt unobservable and it is retried
-        landed = handlerRan && !stamps.empty() && timelyProbes != 0u;
+        // judged only when the first handler ran in the sleep, at least one probe was queued with a full sleep still to run, and
+        // the sleep did not overrun its 80 ms by more than the allowance; otherwise the sender's or the GUI thread's timing made
+        // this attempt unobservable and it is retried
+        landed = handlerRan && !stamps.empty() && timelyProbes != 0u
+            && ( stamps.back() - stamps.front() ) * 1000.0 <= 80.0 + kOverrunMs;
     }
     ASSERT_TRUE( sentOk );
     ASSERT_TRUE( landed );                                             // the send fell inside one of the sleeps, with a probe judged
