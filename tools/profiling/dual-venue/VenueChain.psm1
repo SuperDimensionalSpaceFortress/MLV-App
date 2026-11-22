@@ -715,15 +715,20 @@ function Request-VenueClaim {
             if ($headAfter.Count -gt 0 -and $headAfter[0].name -cne $t.name) {
                 $back = ''
                 for ($giveBack = 1; $giveBack -le 5; $giveBack++) {
-                    $back = [string](Release-VenueClaim -Venue $Venue -Nonce $r.claim.nonce -ClaimDir $ClaimDir)
+                    # TAIL-1 r2 A10 (pre-existing): a release that THROWS (the delete is refused: no DELETE right, a policy) is a release that did not let go, i.e. BUSY like any other: it used to leave the loop through the catch
+                    # below and fall through to the grant being handed to a caller that is not the head
+                    try { $back = [string](Release-VenueClaim -Venue $Venue -Nonce $r.claim.nonce -ClaimDir $ClaimDir) } catch { $back = 'BUSY' }
                     if ($back -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { break }
                     Start-Sleep -Milliseconds (100 * $giveBack)
                 }
                 if ($back -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) {
                     $seen = $null; try { $seen = Get-VenueClaim -Venue $Venue -ClaimDir $ClaimDir } catch { $seen = $null }
                     # r8 rule 7 (adversary r7 pass 3 A11): the queue returned is the census made AFTER the give-back, so the place returned is the caller's in that census (the snapshot's place could be one past it)
-                    $myAfter = @($after | Where-Object { $_.name -ceq $t.name })
-                    return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $(if ($seen) { $seen.claim }); path = $r.path; broken = @($r.broken); ticket = $t; queue = $after; position = $(if ($myAfter.Count -gt 0) { [int]$myAfter[0].position } else { 0 }); staleTickets = @($removed); note = '' }
+                    # TAIL-1 r2 A8 (pre-existing): the give-back can take most of a second (its retries sleep), and a ticket can be reaped in it, so the census made BEFORE the release is read again AFTER it; one that cannot be made keeps the earlier
+                    $afterRelease = $after
+                    try { $afterRelease = @(Get-VenueTickets -Venue $Venue -ClaimDir $ClaimDir -NowUtc $now | Where-Object { $_.state -cne 'STALE' }) } catch { $afterRelease = $after }
+                    $myAfter = @($afterRelease | Where-Object { $_.name -ceq $t.name })
+                    return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $(if ($seen) { $seen.claim }); path = $r.path; broken = @($r.broken); ticket = $t; queue = $afterRelease; position = $(if ($myAfter.Count -gt 0) { [int]$myAfter[0].position } else { 0 }); staleTickets = @($removed); note = '' }
                 }
                 # TAIL-1 A13 (= #878 sol r10 B1; replaces r7 A3's "kept as a grant"): five BUSY give-backs did not let go, and handing the claim over would hand a caller a claim owed to an OLDER ready ticket. The answer is QUEUED;
                 # the claim that could not be given back is named on the ticket (pendingReleaseNonce), so it is not leaked, and the next poll made with this ticket lets go of it before anything else (the top of this function).
