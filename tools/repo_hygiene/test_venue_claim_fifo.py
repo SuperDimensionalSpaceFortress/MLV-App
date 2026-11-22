@@ -2070,7 +2070,7 @@ $hold.Dispose()
 [pscustomobject]@{ held = $true; sawRelease = ($null -ne $entry); closedAfterMs = [int]$sw.Elapsed.TotalMilliseconds } | ConvertTo-Json -Compress
 """
 
-    def late_grant_scenario(self, hold: bool, deadline_sec: float = 20.0, release_seam: bool = False, observe_close_ms: int = 0, slow_full_call_ms: int = 0, stall_sec: int = 0) -> dict:
+    def late_grant_scenario(self, hold: bool, deadline_sec: float = 20.0, release_seam: bool = False, observe_close_ms: int = 0, slow_full_call_ms: int = 0, stall_sec: int = 0, ambient_defaults: str = "") -> dict:
         # A real lease batch whose claim is GRANTED AFTER -DeadlineUtc: a copy of VenueChain.psm1 keeps the granted claim standing until 0.2 s past the deadline (the seam, nothing else changed), so the
         # batch takes the late-grant branch. With hold=True a reader (FileShare.Read, no Delete) holds the claim file from the grant until the batch has logged what it did, so every release is refused (BUSY).
         import shutil
@@ -2106,6 +2106,11 @@ $hold.Dispose()
         (runner.parent / MODULE.name).write_text(text, encoding="utf-8")
         (runner.parent.parent / "bachelor").mkdir(exist_ok=True)   # the runner reads the agent's own script at ..\\bachelor\\ultra-magnus-agent.ps1 for the liveness read-back
         shutil.copy2(DV.parent / "bachelor" / "ultra-magnus-agent.ps1", runner.parent.parent / "bachelor" / "ultra-magnus-agent.ps1")
+        if ambient_defaults:
+            # TAIL-1 r2 A5: the real (seamed) runner is run through a wrapper that sets the caller's ambient $PSDefaultParameterValues first
+            wrapper = self.case / "wrap-late-ambient.ps1"
+            wrapper.write_text(ambient_defaults + "\n& '" + str(runner) + "' @args\nexit $LASTEXITCODE\n", encoding="utf-8")
+            runner = wrapper
         p = self.start_batch("L", claim_poll=1, runner=runner, deadline_utc=deadline, SEAM_UNTIL_UTC=until.strftime("%Y-%m-%dT%H:%M:%S.%fZ"), **env)
         holder = None
         if hold or observe_close_ms:
@@ -2255,8 +2260,122 @@ foreach ($D in @(0, 500, 680, 750)) {
         r = self.late_grant_scenario(hold=False, stall_sec=25)
         past = (r["endUtc"] - r["deadline"]).total_seconds()
         self.assertLess(past, 6.0, f"the batch ended {past:.1f} s past -DeadlineUtc with a release call that never returns (bound 6.0 s): {r['releaseCalls']}\n{r['log']}")
-        self.assertTrue(any("CLAIM_LATE_GRANT_NOT_RELEASED" in l for l in r["log"].splitlines()), f"a release that never answered must be logged as not released:\n{r['log']}")
+        # TAIL-1 r2 A4: the release was NOT answered, so the line goes to stderr (batch.log is on the share that stopped answering and is not probed); it is in the batch's output, not in batch.log
+        self.assertTrue(any("CLAIM_LATE_GRANT_NOT_RELEASED" in l for l in (r["log"] + "\n" + r["out"]).splitlines()), f"a release that never answered must be logged as not released:\n{r['log']}\n{r['out']}")
         self.assertEqual(r["exit"], 3, f"the batch must still end DEADLINE (exit 3):\n{r['log']}\n{r['out']}")
+        # A9 (pass r1 A9): the stall run exercises BOTH the full release call and the final probe: both were started (the seam logs each call's -MaxAttempts at its start)
+        self.assertTrue(any(c.endswith("max=5") for c in r["releaseCalls"]), f"no full release call was made: {r['releaseCalls']}")
+        self.assertTrue(any(c.endswith("max=1") for c in r["releaseCalls"]), f"the final probe was never started after the full call did not answer: {r['releaseCalls']}")
+
+    def test_tail1_r2_a4_a_late_release_that_was_not_answered_never_probes_batch_log_on_the_failed_share(self) -> None:
+        # r1 adversary A4 (blocker, introduced by the bounded worker): both release workers timed out, and the line that follows (CLAIM_LATE_GRANT_NOT_RELEASED, written through L, whose write guard probes batch.log in
+        # -RunDir, which may be on the same share) ran unbounded before the DEADLINE result. Invoke-ClaimRetryRelease turns the write suppression on for exactly this; the inline late release did not. With every
+        # release call stalled the line must go to stderr (the batch's output) and batch.log must NOT carry it.
+        r = self.late_grant_scenario(hold=False, stall_sec=25)
+        self.assertNotIn("CLAIM_LATE_GRANT_NOT_RELEASED", r["log"], f"batch.log was written after a release nobody answered (the write suppression was not turned on):\n{r['log']}")
+        self.assertIn("CLAIM_LATE_GRANT_NOT_RELEASED", r["out"], f"the line did not reach stderr/stdout:\n{r['out']}")
+
+    def test_tail1_r2_a5_the_late_release_caps_cannot_be_widened_by_a_callers_ambient_defaults(self) -> None:
+        # r1 adversary A5: Invoke-VenueLateRelease's -CallCapSec / -ProbeCapSec were left to the parameter defaults, so $PSDefaultParameterValues['Invoke-VenueLateRelease:ProbeCapSec'] = 30 gave the probe 30 s.
+        # The batch passes both explicitly now: with every release call stalled it still ends inside the same 6.0 s past -DeadlineUtc.
+        amb = "$PSDefaultParameterValues['Invoke-VenueLateRelease:ProbeCapSec'] = 30.0\n$PSDefaultParameterValues['Invoke-VenueLateRelease:CallCapSec'] = 30.0"
+        r = self.late_grant_scenario(hold=False, stall_sec=25, ambient_defaults=amb)
+        past = (r["endUtc"] - r["deadline"]).total_seconds()
+        self.assertLess(past, 6.0, f"the batch ended {past:.1f} s past -DeadlineUtc under ambient cap defaults (bound 6.0 s): {r['releaseCalls']}\n{r['log']}")
+
+    SEAM_R2A2 = """
+# a claim the give-back could not let go of is named on B's ticket (pendingReleaseNonce); a reader holds it, B's ticket file is gone (reaped), and the next poll answers BUSY for the release and LOST for the flip
+$g = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$B = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$B | Add-Member -NotePropertyName pendingReleaseNonce -NotePropertyValue ([string]$g.claim.nonce) -Force
+Remove-Item -LiteralPath $B.path -Force
+$cp = Join-Path $d 'bachelor.claim.json'
+$hold = [IO.File]::Open($cp, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+try { $r = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $B } finally { $hold.Dispose() }
+$p = $r.ticket.PSObject.Properties['pendingReleaseNonce']
+$r2 = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $r.ticket
+$after = $null; if (Test-Path -LiteralPath $cp) { $after = (Get-Content -LiteralPath $cp -Raw | ConvertFrom-Json).nonce }
+[pscustomobject]@{ nonce = [string]$g.claim.nonce; newTicket = ($r.ticket.name -cne $B.name); pending = $(if ($p) { [string]$p.Value } else { '' }); claimAfterNextPoll = [bool]$after; ours = [bool]($after -and $after -ceq [string]$g.claim.nonce) } | ConvertTo-Json -Compress
+"""
+
+    def test_tail1_r2_a2_a_pending_release_nonce_is_kept_across_a_ticket_that_is_re_taken(self) -> None:
+        # r1 adversary A2 (blocker, introduced by A13): the poll's release was BUSY (a reader holds the claim) and the flip then answered LOST (the ticket was reaped), so the new ticket replaced the old one WITHOUT its
+        # pendingReleaseNonce: the third poll skipped recovery and the claim stood behind QUEUED answers. The replacement ticket carries the name, and the poll after the reader lets go releases the claim.
+        r = self.ps(self.SEAM_R2A2)
+        self.assertTrue(r["newTicket"], f"the reaped ticket was not replaced: {r}")
+        self.assertEqual(r["pending"], r["nonce"], f"the replacement ticket lost the pending release nonce: {r}")
+        self.assertFalse(r["claimAfterNextPoll"], f"the claim was not let go of by the poll after the reader let go: {r}")
+
+    def test_tail1_r2_a1_an_explicit_no_ticket_batch_is_not_defeated_by_a_defaulted_ticket(self) -> None:
+        # r1 adversary A1 (same class as pass 11 A6): a caller's $PSDefaultParameterValues['Request-VenueClaim:Ticket'] skipped the ticketless gate of an otherwise valid -NoTicket batch, which then judged the stale
+        # ticket LOST and took a new one nothing closed. -Ticket is bound to $null as -UseTicket is.
+        wrapper = self.case / "wrap-ambient-ticket.ps1"
+        wrapper.write_text("$PSDefaultParameterValues['Request-VenueClaim:Ticket'] = @{ path = '" + str(self.ticket_dir / "stale.ticket.json") + "'; nonce = 'stale'; name = 'stale.ticket.json' }\n& '" + str(LEASE_RUNNER) + "' @args\nexit $LASTEXITCODE\n", encoding="utf-8")
+        p = self.start_batch("N", claim_poll=1, runner=wrapper, extra=("-NoTicket",))
+        p.wait(timeout=180)
+        out = Path(p.out_path).read_text(encoding="utf-8", errors="replace")   # type: ignore[attr-defined]
+        self.assertEqual(p.returncode, 0, out)
+        self.assertEqual(list(self.ticket_dir.glob("*.ticket.json")) if self.ticket_dir.exists() else [], [], f"an opt-out batch left a ticket behind:\n{self.batch_log(p)}")
+        self.assertNotRegex(self.batch_log(p), r"TICKET_(TAKEN|RETAKEN)", "an opt-out batch took or re-took a ticket")
+
+    def test_tail1_r2_a1_the_chain_runner_binds_the_ticket_to_null_wherever_it_opts_out(self) -> None:
+        # r1 adversary A1 siblings (Invoke-VenueChain.ps1:351, :476): both opt-out requests bind -Ticket to $null next to -UseTicket:$false
+        text = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("-UseTicket:$false -Ticket $null", text, "the supplementary request does not bind -Ticket to $null")
+        self.assertIn("$rq['UseTicket'] = $false; $rq['Ticket'] = $null", text, "the -NoTicket request does not bind -Ticket to $null")
+
+    A3_SCRIPT = """
+# a release call that never returns (the seam stalls Release-VenueClaim) behind a worker whose start-up takes 2 s (the test delay), with the caps under one second: BoundSec 0.75, CallCapSec 0, ProbeCapSec 0.25.
+# ONE elapsed-time bound per call: the start-up is inside it (never added before each relative wait) and a cap under one second is honoured, never raised to the worker's 1 s floor.
+& (Get-Module VenueChain) { $script:VenueTestPreWaitDelayMs = 2000 }
+$env:SEAM_STALL = '1'
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$r = Invoke-VenueLateRelease -Venue bachelor -Nonce 'n' -ClaimDir $d -BoundSec 0.75 -CallCapSec 0 -ProbeCapSec 0.25
+$el = $sw.Elapsed.TotalSeconds
+$nan = $false; try { $null = Invoke-VenueLateRelease -Venue bachelor -Nonce 'n' -ClaimDir $d -BoundSec ([double]::NaN) -Call { 'BUSY' } } catch { $nan = $true }
+$neg = $false; try { $null = Invoke-VenueLateRelease -Venue bachelor -Nonce 'n' -ClaimDir $d -ProbeCapSec (-1) -Call { 'BUSY' } } catch { $neg = $true }
+$json = [pscustomobject]@{ elapsed = $el; answer = [string]$r.answer; probed = [bool]$r.probed; nanRefused = $nan; negativeRefused = $neg } | ConvertTo-Json -Compress
+[Console]::Out.WriteLine($json)
+& (Get-Module VenueChain) { Complete-VenueProcess -ExitCode 0 }   # the abandoned (stalled) workers are live threads the host would wait 25 s for
+"""
+
+    def test_tail1_r2_a3_a6_the_worker_start_up_is_inside_one_bound_and_sub_second_caps_are_honoured_or_refused(self) -> None:
+        # r1 adversary A3 + A6: the start-up delay was added before each relative wait (about 2 s + 1 s per call here, 6 s in all) and each cap under 1 s was raised to 1 s; a NaN bound bound and died in an integer
+        # conversion. Fixed: one end per call on a stopwatch started before the worker (2 s + 2 s = 4 s here), and a non-finite or negative cap is refused.
+        mod = self.seam_text(("    switch (Remove-VenueClaimIfUnchanged -Path $path -ExpectedNonce $Nonce -MaxAttempts $MaxAttempts) {\n",
+                              "    if ($env:SEAM_STALL) { Start-Sleep -Seconds 25; return 'BUSY' }\n    switch (Remove-VenueClaimIfUnchanged -Path $path -ExpectedNonce $Nonce -MaxAttempts $MaxAttempts) {\n"))
+        r = self.ps(self.A3_SCRIPT, module=mod)
+        self.assertLess(r["elapsed"], 5.0, f"the stalled release took {r['elapsed']:.1f} s (one bound per call: the 2 s start-up inside it, 4 s in all; the old code added the start-up before each wait): {r}")
+        self.assertTrue(r["nanRefused"], f"a NaN -BoundSec was accepted: {r}")
+        self.assertTrue(r["negativeRefused"], f"a negative -ProbeCapSec was accepted: {r}")
+
+    A7_SCRIPT = """
+# adversary A7: every call is instant (BUSY until 1.2 s on the injected clock); the five tries end at 1.0 s of a 2 s bound, and the final probe belongs at the END of the reserve, where a reader that let go at 1.2 s is met
+$global:vt = 0.0; $global:probeAt = -1.0
+$call = { param([int]$MaxAttempts, [double]$TimeoutSec); if ($MaxAttempts -le 1) { $global:probeAt = $global:vt }; if ($global:vt -ge 1.2) { return 'RELEASED' }; return 'BUSY' }
+$r = Invoke-VenueLateRelease -Venue bachelor -Nonce 'n' -ClaimDir $d -BoundSec 2 -Call $call -Clock { $global:vt } -Sleep { param([int]$Ms) $global:vt += $Ms / 1000.0 }
+[pscustomobject]@{ answer = [string]$r.answer; tries = $r.tries; probed = [bool]$r.probed; probeAt = $global:probeAt } | ConvertTo-Json -Compress
+"""
+
+    def test_tail1_r2_a7_the_final_probe_is_made_at_the_end_of_the_reserve_not_after_the_fifth_instant_try(self) -> None:
+        r = self.ps(self.A7_SCRIPT)
+        self.assertEqual(r["answer"], "RELEASED", f"a reader that let go at 1.2 s of a 2 s reserve was missed by the final probe: {r}")
+        self.assertGreaterEqual(r["probeAt"], 2.0, f"the final probe was made before the end of the reserve: {r}")
+
+    A9_SCRIPT = """
+# A9: when every full call is NO_ANSWER the final probe is still made, as ONE single-open call limited to the probe cap (-MaxAttempts 1, -TimeoutSec = -ProbeCapSec), and no full call is given more than the bound plus its cap
+$global:log = [System.Collections.Generic.List[string]]::new(); $global:vt = 0.0
+$call = { param([int]$MaxAttempts, [double]$TimeoutSec); $global:log.Add("$MaxAttempts/$([Math]::Round($TimeoutSec, 3))"); $global:vt += 0.2; return 'NO_ANSWER' }
+$r = Invoke-VenueLateRelease -Venue bachelor -Nonce 'n' -ClaimDir $d -BoundSec 0.75 -CallCapSec 1.5 -ProbeCapSec 1.0 -Call $call -Clock { $global:vt } -Sleep { param([int]$Ms) $global:vt += $Ms / 1000.0 }
+[pscustomobject]@{ answer = [string]$r.answer; probed = [bool]$r.probed; calls = @($global:log) } | ConvertTo-Json -Compress
+"""
+
+    def test_tail1_r2_a9_a_full_call_that_does_not_answer_is_followed_by_one_probe_limited_to_the_probe_cap(self) -> None:
+        r = self.ps(self.A9_SCRIPT)
+        self.assertTrue(r["probed"], r)
+        self.assertEqual(r["calls"][-1], "1/1", f"the last call is not the single-open probe at the probe cap: {r}")
+        full = [c for c in r["calls"][:-1]]
+        self.assertTrue(full and all(c.startswith("5/") and float(c.split("/")[1]) <= 0.75 + 1.5 + 1e-9 for c in full), f"a full call was given more than the bound plus its cap, or is not a full call: {r}")
 
     def test_r9_a4_a_phase_with_a_character_the_culture_compare_ignores_is_refused_not_stored(self) -> None:
         # r9 A4: [ValidateSet('waiting', 'cooldown')] compares with the current culture and ignores U+00AD / U+200D, so 'wait<U+00AD>ing' bound and was stored with the extra character: a ticket no ordinal reader
