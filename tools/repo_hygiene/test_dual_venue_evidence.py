@@ -8574,6 +8574,7 @@ NO_PACE_TWIN_BY_DESIGN = {
     **{f"m16-1243-look-scale2-{flavor}-agxoff": "carries a look receipt (agx-off.marxml) that a speed leg cannot carry, so no speed leg can be the same condition"
        for flavor in ("cinematic", "film", "vision50d")},
     "m16-1243-look-scale2-cinematic-agxoff-unpaced": "an unpaced headroom leg carrying a look receipt; its capture-free twin is m16-1243-pace-cinematic-agxoff-unpaced (an unpaced pace leg carrying the receipt in generatorArgs), which this paced-only rule does not see",
+    "m16-1243-everyframe-visual-windowed-s1": "an unpaced every-frame strip leg (EVERY-FRAME-VISUAL-LEG-SPEC-1): its contact sheet grabs run inside the Play, so it measures no rate; the capture-free unpaced twin is m16-1243-headroom-unpaced-windowed-s1, which this paced-only rule does not see",
     "m16-1243-look-scale2-cinematic-agxoff-unpaced-nofast": "the unpaced AgX-off leg with the #680 fast path killed; its capture-free twin is m16-1243-pace-cinematic-agxoff-unpaced-nofast, which this paced-only rule does not see",
     # HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r5 (CI-1, Dot 6541731407): the four #420 conform cells. Their pace claim is the conform pace proof
     # (Get-DvConformPaceProof: the playback_smoke.conform line's conform_active and configured playback_fps against the pace guard's pace_fps), which is
