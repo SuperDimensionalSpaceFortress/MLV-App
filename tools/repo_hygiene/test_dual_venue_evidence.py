@@ -278,7 +278,8 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *FSTOGGLE_LEGS)
 # EXPORT-VENUE-LEG-1: the four export legs (two clips x CDNG lossless / ProRes); test_dual_venue_export_leg pins their shape.
 EXPORT_VENUE_LEGS = tuple(f"legs/m16-{clip}-export-{fmt}.json" for clip in ("1243", "1456") for fmt in ("cdng-lossless", "prores"))
 SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in EXPORT_VENUE_LEGS if rel not in SHIPPED_LEGS))
-# M16-1457-VENUE-BASELINE-DRIFT-1 r3: the thread-cap sweep (worker cap 4 / 8 / 12; 16 is the existing m16-1457-headroom-unpaced-fullscreen-s1) and the P-core-only arm
+# M16-1457-VENUE-BASELINE-DRIFT-1 r3: the thread-cap sweep (worker cap 4 / 8 / 12 / 16, each its own spec; the existing no-cap m16-1457-headroom-unpaced-fullscreen-s1 is the
+# 'auto' arm, NOT a 16-worker arm: the app picks 12 on the Bachelor host, adversary A2) and the P-core-only arm
 # of the Bachelor baseline-drift bench, keyed to the leg each one copies. Unpaced swap-interval-0 legs, so they carry presentTearingExpectedReason like their source.
 # DriftLegSpecTests pins the shape: only legId, card, generatorArgs.playbackMaxThreads (and, for the P-core arm, the affinity keys and two criteria) differ.
 DRIFT_LEGS = {"legs/m16-1457-drift-t4-unpaced-fullscreen-s1.json": "legs/m16-1457-headroom-unpaced-fullscreen-s1.json",
