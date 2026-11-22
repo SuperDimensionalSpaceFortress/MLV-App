@@ -747,6 +747,7 @@ function Get-DescendantProcessIdentities {
         $fbSteps.Enqueue("ProcessId=$ParentProcessId"); $fbSteps.Enqueue("ParentProcessId=$ParentProcessId")
         $fbNodes = 0
         $fbOther = New-Object 'System.Collections.Generic.List[int]'   # r5 (pass 7 A8): rows the FALLBACK itself returned for processes other than the root
+        $fbRootRowSeen = $false     # r7 (sol r6 A2): the fallback's own first read returned a row for the root's pid
         while ($fbSteps.Count -gt 0 -and $fbNodes -lt 33) {
             $fbLeft = & $readLeftSec
             if ($fbLeft -le 0) { break }
@@ -758,7 +759,7 @@ function Get-DescendantProcessIdentities {
                     $fbRow = $_
                     if ($null -ne $fbRow -and $null -ne $fbRow.ProcessId) {
                         [void]$all.Add($fbRow)
-                        if ([int]$fbRow.ProcessId -ne $ParentProcessId) { $fbOther.Add([int]$fbRow.ProcessId) }
+                        if ([int]$fbRow.ProcessId -ne $ParentProcessId) { $fbOther.Add([int]$fbRow.ProcessId) } else { $fbRootRowSeen = $true }
                         if ($fbIsChildren -and $fbSeen.Add([int]$fbRow.ProcessId)) { $fbSteps.Enqueue("ParentProcessId=$([int]$fbRow.ProcessId)") }
                     }
                 }
@@ -769,17 +770,27 @@ function Get-DescendantProcessIdentities {
         # would leave the old root row standing. When children were found and no read failed, the root's row is read ONCE MORE (rows are appended, and the
         # last row for a pid is the one the reuse check sees). A row whose start differs from the first is the reuser; the re-read failing, or no time left
         # for it, leaves the root unverifiable (below).
+        # r7 (opus r6 A1/DC-08b, sol r6 A1): a per-parent read that ERRORS (a throw, or a Write-Error) after the root's children were read is the same
+        # unknown as running out of budget at that point: the root may have exited and its pid been reused between the reads, and the re-read that would
+        # have shown it is never made. So it is NOT skipped silently: the root is unverifiable, like the budget case below, and nothing under it is emitted.
+        # r7 (sol r6 A2): a re-read that returns NO row, when the first read returned one, is the same unknown (the root went away between the reads),
+        # never "keep the first row".
+        $fbChildrenError = $null
+        $fbRecheckEmpty = $false
+        if ($fbOther.Count -gt 0 -and $null -ne $fbError) { $fbChildrenError = $fbError }
         if ($fbOther.Count -gt 0 -and $null -eq $fbError) {
             $fbRecheckLeft = & $readLeftSec
             if ($fbRecheckLeft -le 0) { $fbRecheckError = 'no time left to re-read the root row after the children were read' }
             else {
+                $fbRecheckGot = $false
                 try {
                     Get-CimInstance Win32_Process -Filter "ProcessId=$ParentProcessId" -Property ProcessId, ParentProcessId, CreationDate, ExecutablePath, CommandLine -OperationTimeoutSec ([int][Math]::Min(30.0, [Math]::Max(1.0, [Math]::Ceiling($fbRecheckLeft)))) -ErrorAction Stop | ForEach-Object {
                         $fbRecheckRow = $_
-                        if ($null -ne $fbRecheckRow -and $null -ne $fbRecheckRow.ProcessId -and [int]$fbRecheckRow.ProcessId -eq $ParentProcessId) { [void]$all.Add($fbRecheckRow) }
+                        if ($null -ne $fbRecheckRow -and $null -ne $fbRecheckRow.ProcessId -and [int]$fbRecheckRow.ProcessId -eq $ParentProcessId) { [void]$all.Add($fbRecheckRow); $fbRecheckGot = $true }
                     }
                 }
                 catch { $fbRecheckError = ([string]$_.Exception.Message) -replace '\s*[\r\n]+\s*', ' ' }
+                if ($null -eq $fbRecheckError -and -not $fbRecheckGot -and $fbRootRowSeen) { $fbRecheckEmpty = $true }
             }
         }
         # PARTIAL only if the FALLBACK found a process other than the root (pass 7 A8: not a row the failed full read had returned); the root's own row alone
@@ -795,6 +806,8 @@ function Get-DescendantProcessIdentities {
     # are walked. The read fails, times out or has no budget left: the root's children are UNVERIFIABLE and NOTHING is emitted under the root.
     $rootUnverifiable = $null
     if ($null -ne $fbRecheckError) { $rootUnverifiable = "the root row re-read failed: $fbRecheckError" }
+    elseif ($null -ne $fbChildrenError) { $rootUnverifiable = "a filtered read failed after the root's children were read: $fbChildrenError" }   # r7 (opus r6 A1, sol r6 A1)
+    elseif ($fbRecheckEmpty) { $rootUnverifiable = 'the root row re-read returned no row after the first read returned one (the root may have exited and its pid been reused between the reads)' }   # r7 (sol r6 A2)
     if ($null -ne $snapshotError -and $anyRelated) {
         $hasRootRow = $false
         foreach ($rootScanRow in $all) {
@@ -928,8 +941,23 @@ function Get-DescendantProcessIdentities {
     $stack = New-Object 'System.Collections.Generic.Stack[object]'
     $skipped = New-Object 'System.Collections.Generic.List[int]'   # rows skipped as created before their listed parent (recorded for the kill paths)
     $foreign = New-Object 'System.Collections.Generic.List[int]'   # rows created at or after a process that reused the exited root's pid: that process's children
+    # r7 (sol r6 A3, opus r6 A3): a row with NO readable CreationDate is never a parent edge. The stale-edge rule below compares a child with the creation
+    # time of the parent row it names; with no start on that row the comparison cannot run, so every child of it would pass as a descendant, though its
+    # parent pid may belong to a younger process than the one the child was created under. Such a row is still LISTED (it reads as not existing: no
+    # kill path stops it) but its children are UNVERIFIABLE: not emitted, named in the record ($walkRecord.unverified), one agent.log line per pid,
+    # and the kill paths say so (Stop-ProcessTree's note, the post-exit census line). Log and skip, never silent.
+    $unverified = New-Object 'System.Collections.Generic.List[int]'
     $rootKids = $null
-    if ($byParent.TryGetValue($ParentProcessId, [ref]$rootKids)) { $stack.Push(@{ kids = $rootKids; next = 0; self = $null }) }
+    if ($byParent.TryGetValue($ParentProcessId, [ref]$rootKids)) {
+        $rootRowNoStart = $false   # the root's own row is in the snapshot with no start, and no recorded start stands in for it
+        if (-not $createdAt.ContainsKey($ParentProcessId)) {
+            foreach ($rootNoStartRow in $all) {
+                try { if ($null -ne $rootNoStartRow -and $null -ne $rootNoStartRow.ProcessId -and [int]$rootNoStartRow.ProcessId -eq $ParentProcessId) { $rootRowNoStart = $true; break } } catch { continue }
+            }
+        }
+        if ($rootRowNoStart) { foreach ($noStartKid in $rootKids) { try { [void]$unverified.Add([int]$noStartKid.ProcessId) } catch { continue } } }
+        else { $stack.Push(@{ kids = $rootKids; next = 0; self = $null }) }
+    }
     while ($stack.Count -gt 0) {
         $frame = $stack.Peek()
         if ($frame.next -lt $frame.kids.Count) {
@@ -957,7 +985,14 @@ function Get-DescendantProcessIdentities {
             }
             if (-not $visited.Add($childProcessId)) { continue }
             $grandKids = $null
-            if ($byParent.TryGetValue($childProcessId, [ref]$grandKids)) { $stack.Push(@{ kids = $grandKids; next = 0; self = $child }) }
+            if ($byParent.TryGetValue($childProcessId, [ref]$grandKids)) {
+                if ($createdAt.ContainsKey($childProcessId)) { $stack.Push(@{ kids = $grandKids; next = 0; self = $child }) }
+                else {
+                    # r7 (A3): no readable start on this row: its children are unverifiable (see above). The row itself is only listed.
+                    foreach ($noStartKid in $grandKids) { try { [void]$unverified.Add([int]$noStartKid.ProcessId) } catch { continue } }
+                    & $identityOf $child
+                }
+            }
             else { & $identityOf $child }
         }
         else {
@@ -968,6 +1003,14 @@ function Get-DescendantProcessIdentities {
     if ($foreign.Count -gt 0) {
         Add-AgentLogLine "descendant-walk: root pid=$ParentProcessId was reused by a process created $($rootReusedAt.ToString('o')) (recorded start $($recordedRootStart.ToString('o'))); rows created after it are its own children and were not walked: pids=$(@($foreign) -join ',')"
     }
+    if ($unverified.Count -gt 0) {
+        if ($null -eq $script:DescendantWalkUnverifiedLogged) { $script:DescendantWalkUnverifiedLogged = New-Object 'System.Collections.Generic.HashSet[int]' }
+        $newUnverified = @($unverified | Where-Object { $script:DescendantWalkUnverifiedLogged.Count -lt 256 -and $script:DescendantWalkUnverifiedLogged.Add([int]$_) })
+        if ($newUnverified.Count -gt 0) {
+            Add-AgentLogLine "descendant-walk: unverified pids=$($newUnverified -join ',') (their parent row has no readable creation time, so their ancestry cannot be checked; they were not walked and are still running if they exist)"
+        }
+    }
+    $walkRecord | Add-Member -NotePropertyName unverified -NotePropertyValue @($unverified) -Force
     $walkRecord | Add-Member -NotePropertyName skipped -NotePropertyValue @($skipped) -Force
     $script:LastDescendantWalk = $walkRecord   # published once, here (r3 Grok G3)
 }
@@ -1008,6 +1051,12 @@ function Stop-ProcessTree {
         $skipText = "SKIPPED pids=$(@($walkState.skipped) -join ',') (created before their listed parent: a reused parent pid, or a backward clock step, in which case they are still running)"
         $script:ProcessTreeWalkNote = "$($script:ProcessTreeWalkNote); $skipText"
         Add-AgentLogLine "process-tree stop pid=${RootProcessId}: $skipText"
+    }
+    # r7 (A3): children of a row with no readable creation time were not walked and not targeted; a kill never reads as a clean tree.
+    if ($null -ne $walkState -and $walkState.rootPid -eq $RootProcessId -and @($walkState.unverified).Count -gt 0) {
+        $unverifiedText = "UNVERIFIED pids=$(@($walkState.unverified) -join ',') (their parent row has no readable creation time, so their ancestry cannot be checked: not targeted, and still running if they exist)"
+        $script:ProcessTreeWalkNote += "; $unverifiedText"
+        Add-AgentLogLine "process-tree stop pid=${RootProcessId}: $unverifiedText"
     }
     foreach ($expected in $identities) {
         if (-not $expected.exists) { continue }
@@ -5290,6 +5339,10 @@ function Invoke-QueuedJob {
             if ($null -ne $postExitWalk -and $postExitWalk.rootPid -eq $jobProcess.Id) {
                 if (-not $postExitWalk.ok) {
                     "post-exit descendant census $(if ($postExitWalk.partial) { 'PARTIAL' } else { 'FAILED' }) ($($postExitWalk.why)): only the descendants found in the $($postExitWalk.rows) process rows it returned (and those tracked during the run) were targeted for stop (killedProcessIds says which ended); descendants it did not list may still be running" |
+                        Add-Content -Encoding ASCII -LiteralPath $errFile
+                }
+                if (@($postExitWalk.unverified).Count -gt 0) {
+                    "post-exit descendant census UNVERIFIED pids=$(@($postExitWalk.unverified) -join ',') (their parent row has no readable creation time, so their ancestry cannot be checked: not targeted for stop, and still running if they exist)" |
                         Add-Content -Encoding ASCII -LiteralPath $errFile
                 }
                 if (@($postExitWalk.skipped).Count -gt 0) {

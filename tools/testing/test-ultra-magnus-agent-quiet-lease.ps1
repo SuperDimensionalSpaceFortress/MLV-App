@@ -1199,7 +1199,7 @@ try {
         'lapse-end-timing-pure', 'lease-seam-pid-cleanup', 'lease-start-post-start-failure', 'lease-start-post-start-cleanup-throws', 'fake-flag-unreadable',
         'lease-seam-command-mode', 'lease-seam-wrapper-host', 'fixture-census-probe-error', 'fake-release-readable-deadline', 'fake-release-unreadable-then-readable-deadline',
         'fake-release-unreadable-deadline', 'lease-seam-unowned-never-killed', 'fake-release-absent-after-deadline', 'fake-release-absent-before-deadline',
-        'lease-seam-census-self-pid', 'renew-slow-monitor-slice', 'cim-walk-snapshot', 'cim-walk-cycle', 'cim-walk-pid-reuse', 'cim-walk-partial-snapshot', 'cim-walk-root-start', 'cim-walk-live-parity', 'renew-gap-clock-step', 'renew-gap-round-up',
+        'lease-seam-census-self-pid', 'renew-slow-monitor-slice', 'cim-walk-snapshot', 'cim-walk-cycle', 'cim-walk-pid-reuse', 'cim-walk-partial-snapshot', 'cim-walk-root-start', 'cim-walk-fail-closed', 'cim-walk-live-parity', 'renew-gap-clock-step', 'renew-gap-round-up',
         'renew-collect-after-slow-slice', 'renew-stale-still-demotes', 'renew-gap-dst-fallback', 'renew-exit-stamp-transient-step', 'renew-exit-stamp-dst',
         'renew-exit-stamp-late-known-limit', 'renew-gap-reverted-step-known-limit', 'renew-gap-reverted-step-base-neighbour',
         'renew-call-start-before-process-start', 'renew-gap-prestart-stall-no-false-stop', 'renew-gap-reverted-step-record-wall-demotes',
@@ -6549,10 +6549,12 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True ($rtOut['ownerFallback'].ok -eq $true) "cim-walk-root-start: (variant, pass 5 A4 second shape) the lease owner check, with the full read failed and the per-parent reads answering, still accepts the wrapper's live child: $rtTxt"
         Assert-True ($rtOut['ownerG6'].ok -eq $false) "cim-walk-root-start: (variant, G6) the lease owner check refuses a child of a REUSED wrapper pid when the failed read lacked the wrapper's row: $rtTxt"
         $frt = $rtOut['fallbackRowsThenThrow']
-        Assert-True ($frt.ids -eq '7101' -and $frt.rows -eq 2 -and $frt.partial -eq $true -and $frt.ok -eq $false) "cim-walk-root-start: (variant, pass 5 A5 second shape) a per-parent read that returns the child and then THROWS keeps the child and records PARTIAL: $rtTxt"
+        # r7 (opus r6 A1, sol r6 A1) SUPERSEDES the r4/r5 expectation here ("keeps the child and records PARTIAL"): a per-parent read that errors AFTER the root's
+        # children were read leaves a possibly reused root unchecked, so the root is unverifiable and the child is NOT emitted (cim-walk-fail-closed has the literal repros).
+        Assert-True ($frt.ids -eq '' -and $frt.rows -eq 2 -and $frt.partial -eq $false -and $frt.ok -eq $false) "cim-walk-root-start: (variant, pass 5 A5 second shape, r7 A1) a per-parent read that returns the child and then THROWS makes the root unverifiable: the child is NOT emitted, recorded FAILED with the 2 rows read: $rtTxt"
         Assert-True ($rtOut['unrelatedPartial'].ids -eq '7102,7101' -and $rtOut['unrelatedPartial'].partial -eq $true) "cim-walk-root-start: (A4, pass 5) a read that returned only an UNRELATED row before it failed still falls back, and finds the children: $rtTxt"
         $fre = $rtOut['fallbackRowsThenError']
-        Assert-True ($fre.ids -eq '7101' -and $fre.rows -eq 2 -and $fre.partial -eq $true -and $fre.ok -eq $false) "cim-walk-root-start: (A5, pass 5) a per-parent read that returns the child and then errors keeps the child (streamed read) and records PARTIAL: $rtTxt"
+        Assert-True ($fre.ids -eq '' -and $fre.rows -eq 2 -and $fre.partial -eq $false -and $fre.ok -eq $false) "cim-walk-root-start: (A5, pass 5, r7 A1) a per-parent read that returns the child and then errors (streamed read) makes the root unverifiable (r7 supersedes the r4 keep-the-child rule): the child is NOT emitted, recorded FAILED with the 2 rows read: $rtTxt"
         $fbb = $rtOut['fallbackBudget']
         Assert-True ($fbb.queries -eq 2 -and $fbb.timeouts -ceq '2,1' -and $fbb.elapsedSec -lt 4.6) "cim-walk-root-start: (A1, pass 5) the full read and the fallback share ONE budget: 2 s left, a 1.9 s full read leaves 0.1 s, so only the root-row read starts (timeouts 2 then 1) and nothing after it (queries=$($fbb.queries) timeouts=[$($fbb.timeouts)] elapsed=$($fbb.elapsedSec) s)"
         Assert-True ($rtOut['completeRead'].rows -eq 2 -and $rtOut['completeRead'].ok -eq $true -and $rtOut['completeRead'].maxDeadlineTimeouts -ceq '30') "cim-walk-root-start: (A11, A13 pass 5) a complete read reports rows=2 and a DateTime.MaxValue deadline gives the 30 s ceiling instead of an integer overflow: $rtTxt"
@@ -6578,7 +6580,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         $rtStale = @($rtLoop.Body.FindAll({ param($n) ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -ceq '$walkLeftSec') -or ($n -is [System.Management.Automation.Language.CommandParameterAst] -and $n.ParameterName -eq 'TimeoutSec') }, $true))
         Assert-True ($rtLoopCalls.Count -eq 1 -and $rtDeadlineArg -is [System.Management.Automation.Language.VariableExpressionAst] -and $rtDeadlineArg.VariablePath.UserPath -ceq 'deadline' -and $rtStale.Count -eq 0) "cim-walk-root-start: (A1) the monitor loop passes the job's `$deadline as the walk's -Deadline and no pre-computed -TimeoutSec/`$walkLeftSec remains (loop calls=$($rtLoopCalls.Count) stale=$($rtStale.Count))"
         $rtErrPipes = @($rtQj.FindAll({ param($n) $n -is [System.Management.Automation.Language.PipelineAst] -and @($n.PipelineElements).Count -eq 2 -and $n.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst] -and $n.PipelineElements[0].Expression -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -and $n.PipelineElements[0].Expression.Value.Contains('post-exit descendant census') -and $n.PipelineElements[1] -is [System.Management.Automation.Language.CommandAst] -and $n.PipelineElements[1].GetCommandName() -eq 'Add-Content' -and $n.PipelineElements[1].Extent.Text.Contains('$errFile') }, $true))
-        Assert-True ($rtErrPipes.Count -eq 2) "cim-walk-root-start: (A1) the normal-exit census writes an incomplete result and the skipped rows into the job's err file (pipes=$($rtErrPipes.Count))"
+        Assert-True ($rtErrPipes.Count -eq 3) "cim-walk-root-start: (A1) the normal-exit census writes an incomplete result, the unverified rows (r7 A3) and the skipped rows into the job's err file (pipes=$($rtErrPipes.Count))"
         # r4 (pass 4 A4): the census line says what was TARGETED; "stopped" would be a claim the stop may not have earned (access denied).
         Assert-True (@($rtErrPipes | Where-Object { $_.PipelineElements[0].Expression.Value -match 'were stopped' }).Count -eq 0 -and @($rtErrPipes | Where-Object { $_.PipelineElements[0].Expression.Value -match 'were targeted for stop' }).Count -ge 1) "cim-walk-root-start: (A4) the post-exit census line says the descendants were TARGETED for stop and never claims they were stopped"
         # r4 (pass 4 A5): every line the job monitor appends to the err file comes AFTER the output capture is drained (the async copies write the same
@@ -6710,6 +6712,105 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True ($rtMatchCalls.Count -eq 3 -and @($rtMatchCalls | Where-Object { & $rtHasParam $_ 'RequireExactStart' }).Count -eq 2) "cim-walk-root-start: (A3, pass 5) the two descendant stop loops (Stop-ProcessTree's per-identity loop and Stop-VerifiedProcessIdentities) pass -RequireExactStart; the root's own check keeps its tolerance (calls=$($rtMatchCalls.Count))"
         Assert-True ($null -eq $drOut.first -and $null -eq $drOut.second -and $drOut.drained -eq $true -and $drOut.text -ceq 'late-diagnostic') "cim-walk-root-start: (A5) Complete-WindowlessRedirectedProcess can be called twice (the monitor drains early, the finally drains again) without an error, and a line appended after the drain is kept: $($drOut | ConvertTo-Json -Compress)"
         $results.cimWalkRootStart = $rtOut
+    }
+    # AGENT-JOB-MONITOR-CIM-WALK-1 r7 (opus r6 A1/DC-08b, sol r6 A1-A3; HUB RULING 20261122T0928Z: one narrow fail-closed round). DEFECT_CLASS: incomplete fix
+    # (r5 made an exhausted budget, a failed root-row read and a null root start fail closed, but three sibling reads/rows still failed OPEN).
+    # The literal repros, on the REAL walk behind a fake process table whose reads are scripted per filter:
+    #   A1 (sol 7300/7301; opus DC-08b 7310/7311/7312): a fallback per-parent read that throws or writes an error AFTER the root's children were read makes the
+    #       root UNVERIFIABLE, exactly like running out of budget at that point: no child is emitted, no kill path can stop it;
+    #   A2 (sol 7330/7331): the root's row read by the fallback, the children read, then the root's row re-read returns NO row: the first row can no longer
+    #       be trusted (the root may have exited and its pid been reused in between), so the root is unverifiable;
+    #   A3 (sol 7400/7401/7402): a row with no CreationDate is never used as a parent edge: its children are unverifiable (not emitted, named in the record).
+    # Unverifiable keeps what r5 did for an unverifiable root: the walk is recorded FAILED (ok=false), ONE log line says why, nothing under the root is emitted,
+    # and a kill path names the walk as FAILED (only the verified root is targeted). It never means "stop nothing silently".
+    if (Test-Case 'cim-walk-fail-closed') {
+        $fcOut = & {
+            $fcBase = [datetime]::new(2026, 11, 20, 12, 0, 0, [DateTimeKind]::Local)
+            function New-FcProc([int]$Id, [int]$Parent, $Sec) { [pscustomobject]@{ ProcessId = [uint32]$Id; ParentProcessId = [uint32]$Parent; CreationDate = $(if ($null -eq $Sec) { $null } else { $fcBase.AddSeconds([double]$Sec) }); ExecutablePath = 'C:\x\p.exe'; CommandLine = "p $Id" } }
+            # $script:FcFull: the answer of the full-table read ($null = it fails at once with no rows, so the walk falls back to per-parent reads).
+            # $script:FcAns: filter -> array of answers, one per call of that filter (the last repeats). An answer is @{ rows = @(..); err = $null|'write'|'throw' };
+            # rows are returned first, then the error is raised (the streamed-read shape the walk keeps rows from).
+            $script:FcFull = $null; $script:FcAns = @{}; $script:FcCalls = @{}; $script:FcStopped = [System.Collections.Generic.List[int]]::new()
+            function Get-CimInstance {
+                [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter, [string[]]$Property, [uint32]$OperationTimeoutSec)
+                $ans = $null
+                if ($PSBoundParameters.ContainsKey('Filter')) {
+                    $list = $script:FcAns[$Filter]
+                    if ($null -eq $list) { return }   # an unscripted filter answers with no row
+                    $n = [int]$script:FcCalls[$Filter]; $script:FcCalls[$Filter] = $n + 1
+                    $ans = @($list)[[Math]::Min($n, @($list).Count - 1)]
+                }
+                else {
+                    if ($null -eq $script:FcFull) { Write-Error 'full-table read failed'; return }
+                    $ans = $script:FcFull
+                }
+                foreach ($r in @($ans.rows)) { $r }
+                if ($ans.err -eq 'write') { Write-Error 'scripted provider error'; return }
+                if ($ans.err -eq 'throw') { throw 'scripted provider throw' }
+            }
+            function Stop-Process { [CmdletBinding()] param([int]$Id, [switch]$Force) $script:FcStopped.Add($Id) }
+            $rootMs = [DateTimeOffset]::new($fcBase).ToUnixTimeMilliseconds()
+            $ids = { param($w) (@($w | ForEach-Object { [int]$_.processId }) -join ',') }
+            $run = {
+                param([int]$RootPid, $Full, [hashtable]$Ans, [bool]$Stop = $false, $StopAns = $null)
+                $script:FcFull = $Full; $script:FcAns = $Ans; $script:FcCalls = @{}; $script:FcStopped.Clear()
+                $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null; $script:DescendantWalkStaleLogged = $null; $script:DescendantWalkUnverifiedLogged = $null; $script:LastDescendantWalk = $null; $script:ProcessTreeWalkNote = ''
+                $w = @(Get-DescendantProcessIdentities -ParentProcessId $RootPid -RootStartEpochMs $rootMs)
+                $rec = $script:LastDescendantWalk
+                $r = [ordered]@{ ids = (& $ids $w); existing = (& $ids @($w | Where-Object { $_.exists })); ok = $rec.ok; partial = $rec.partial; why = [string]$rec.why; unverified = (@($rec.unverified) -join ',')
+                    logs = @($script:Log | Where-Object { $_ -match '^descendant-walk:' }); reads = (@($script:FcCalls.Keys | Sort-Object | ForEach-Object { "$_ x$($script:FcCalls[$_])" }) -join ' ') }
+                if ($Stop) {
+                    # Stop-ProcessTree's own identity check of the root is the FIRST read of ProcessId=<root>: a scripted sequence is given one answer more for it.
+                    if ($null -ne $StopAns) { $script:FcAns = $StopAns }
+                    $script:FcCalls = @{}; $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null
+                    $k = @(Stop-ProcessTree -RootProcessId $RootPid -RootStartEpochMs $rootMs)
+                    $r.killed = ($k -join ','); $r.stopped = (@($script:FcStopped) -join ','); $r.note = [string]$script:ProcessTreeWalkNote
+                }
+                [pscustomobject]$r
+            }
+            $o = [ordered]@{}
+            # A1 (sol): root 7300 is the recorded process (12:00:00). The fallback reads its row, then the children of 7300: the replacement's child 7301 (12:00:41)
+            # streams, then the read raises an error (Write-Error) or throws.
+            foreach ($kind in @('write', 'throw')) {
+                $o["a1Sol-$kind"] = & $run 7300 $null @{ 'ProcessId=7300' = @(@{ rows = @(New-FcProc 7300 1 0) }); 'ParentProcessId=7300' = @(@{ rows = @(New-FcProc 7301 7300 41); err = $kind }); 'ProcessId=7301' = @(@{ rows = @(New-FcProc 7301 7300 41) }) } $true
+            }
+            # A1 (opus DC-08b): the read of ProcessId=7310 returns the old root row, ParentProcessId=7310 returns C=7311 (created after the recorded start, by the
+            # process that took the pid), and the per-parent read of C=7311 THROWS (a WMI timeout) with no rows.
+            $o['a1Opus'] = & $run 7310 $null @{ 'ProcessId=7310' = @(@{ rows = @(New-FcProc 7310 1 0) }); 'ParentProcessId=7310' = @(@{ rows = @(New-FcProc 7311 7310 41) }); 'ParentProcessId=7311' = @(@{ rows = @(); err = 'throw' }); 'ProcessId=7311' = @(@{ rows = @(New-FcProc 7311 7310 41) }) } $true
+            # control: the same reads all succeed (the child's own children read returns none): the child is walked and stopped.
+            $o['a1Control'] = & $run 7320 $null @{ 'ProcessId=7320' = @(@{ rows = @(New-FcProc 7320 1 0) }); 'ParentProcessId=7320' = @(@{ rows = @(New-FcProc 7321 7320 3) }); 'ProcessId=7321' = @(@{ rows = @(New-FcProc 7321 7320 3) }) } $true
+            # A2 (sol): the root's first row is the recorded one; the children read returns 7331 (12:00:41); the root's re-read returns NO row.
+            $o['a2Sol'] = & $run 7330 $null @{ 'ProcessId=7330' = @(@{ rows = @(New-FcProc 7330 1 0) }, @{ rows = @() }); 'ParentProcessId=7330' = @(@{ rows = @(New-FcProc 7331 7330 41) }); 'ProcessId=7331' = @(@{ rows = @(New-FcProc 7331 7330 41) }) } $true @{ 'ProcessId=7330' = @(@{ rows = @(New-FcProc 7330 1 0) }, @{ rows = @(New-FcProc 7330 1 0) }, @{ rows = @() }, @{ rows = @(New-FcProc 7330 1 0) }); 'ParentProcessId=7330' = @(@{ rows = @(New-FcProc 7331 7330 41) }); 'ProcessId=7331' = @(@{ rows = @(New-FcProc 7331 7330 41) }) }
+            # A3 (sol): root 7400 (12:00:00) -> 7401 (NO CreationDate) -> 7402 (12:00:01), a COMPLETE full-table read. 7402 names 7401 as parent and 7401 proves no start.
+            $o['a3Sol'] = & $run 7400 @{ rows = @((New-FcProc 7400 1 0), (New-FcProc 7401 7400 $null), (New-FcProc 7402 7401 1)) } @{ 'ProcessId=7400' = @(@{ rows = @(New-FcProc 7400 1 0) }); 'ProcessId=7402' = @(@{ rows = @(New-FcProc 7402 7401 1) }) } $true
+            # control: the same tree with a readable start on 7401: the grandchild is walked.
+            $o['a3Control'] = & $run 7410 @{ rows = @((New-FcProc 7410 1 0), (New-FcProc 7411 7410 1), (New-FcProc 7412 7411 2)) } @{} $false
+            # the null-start row with NO children is only listed (it reads as not existing), nothing is unverifiable.
+            $o['a3Leaf'] = & $run 7420 @{ rows = @((New-FcProc 7420 1 0), (New-FcProc 7421 7420 $null)) } @{} $false
+            $o
+        }
+        $fcTxt = $fcOut | ConvertTo-Json -Depth 6 -Compress
+        foreach ($kind in @('write', 'throw')) {
+            $a1 = $fcOut["a1Sol-$kind"]
+            Assert-True ($a1.ids -eq '' -and $a1.ok -eq $false -and $a1.partial -eq $false -and $a1.why.Contains('children not walked') -and $a1.why.Contains('filtered read failed after the root''s children were read') -and $a1.why.Contains('scripted provider')) "cim-walk-fail-closed: (A1, sol r6, $kind) a fallback per-parent read that streams the replacement root's child 7301 and THEN errors makes the root unverifiable: nothing is emitted and the record says why: $fcTxt"
+            Assert-True ($a1.killed -eq '7300' -and $a1.stopped -eq '7300' -and $a1.note -match 'DESCENDANT WALK FAILED' -and $a1.note -match 'only the root was targeted') "cim-walk-fail-closed: (A1, sol r6, $kind) Stop-ProcessTree stops only the verified root (never 7301) and its note names the walk as FAILED: $fcTxt"
+            Assert-True (@($a1.logs).Count -eq 1 -and $a1.logs[0] -match 'snapshot failed' -and $a1.logs[0].Contains('children not walked')) "cim-walk-fail-closed: (A1, sol r6, $kind) the unverifiable root is named in ONE agent.log line: $fcTxt"
+        }
+        $a1o = $fcOut['a1Opus']
+        Assert-True ($a1o.ids -eq '' -and $a1o.ok -eq $false -and $a1o.why.Contains('children not walked') -and $a1o.killed -eq '7310' -and $a1o.stopped -eq '7310') "cim-walk-fail-closed: (A1, opus r6 DC-08b) the root's row, then its children (7311), then a THROWN read of 7311's children: the root is unverifiable, 7311 is never emitted or stopped: $fcTxt"
+        $a1c = $fcOut['a1Control']
+        Assert-True ($a1c.ids -eq '7321' -and $a1c.ok -eq $false -and $a1c.partial -eq $true -and $a1c.killed -eq '7321,7320') "cim-walk-fail-closed: (A1 control) the same reads without an error: the child 7321 is walked (PARTIAL: the full read failed) and stopped: $fcTxt"
+        $a2 = $fcOut['a2Sol']
+        Assert-True ($a2.ids -eq '' -and $a2.ok -eq $false -and $a2.partial -eq $false -and $a2.why.Contains('children not walked') -and $a2.why.Contains('re-read returned no row') -and $a2.killed -eq '7330') "cim-walk-fail-closed: (A2, sol r6) the root row re-read after the children returns NO row after the first read returned one: the first row is not kept, the root is unverifiable, 7331 is never emitted or stopped: $fcTxt"
+        $a3 = $fcOut['a3Sol']
+        Assert-True ($a3.existing -eq '' -and $a3.ids -eq '7401' -and $a3.unverified -eq '7402' -and $a3.ok -eq $true) "cim-walk-fail-closed: (A3, sol r6) a row with no CreationDate is never a parent edge: 7401 is listed only as not existing, its child 7402 is NOT emitted and is named in the record as unverified: $fcTxt"
+        Assert-True (@($a3.logs | Where-Object { $_ -match 'unverified pids=7402' }).Count -eq 1) "cim-walk-fail-closed: (A3, sol r6) the unverifiable child is named in ONE agent.log line (log and skip, never silent): $fcTxt"
+        Assert-True ($a3.killed -eq '7400' -and $a3.stopped -eq '7400' -and $a3.note -match 'UNVERIFIED pids=7402') "cim-walk-fail-closed: (A3, sol r6) Stop-ProcessTree stops only the verified root (never the unverifiable 7402) and its note names 7402 as UNVERIFIED, so the kill never reads as a clean tree: $fcTxt"
+        $a3c = $fcOut['a3Control']
+        Assert-True ($a3c.ids -eq '7412,7411' -and $a3c.unverified -eq '') "cim-walk-fail-closed: (A3 control) a parent row WITH a readable start passes its children: $fcTxt"
+        $a3l = $fcOut['a3Leaf']
+        Assert-True ($a3l.ids -eq '7421' -and $a3l.existing -eq '' -and $a3l.unverified -eq '') "cim-walk-fail-closed: (A3 control) a null-start row with no children is only listed as not existing; nothing is unverifiable: $fcTxt"
+        $results.cimWalkFailClosed = $fcOut
     }
     # The same comparison on a LIVE tree (real Get-CimInstance, real processes): cmd.exe -> cmd.exe -> ping.exe. The legacy walk is reproduced
     # here; the agent's walk must return the same set of (processId, startUtc, imagePath). Retried (3 times) against a helper process (conhost.exe)
