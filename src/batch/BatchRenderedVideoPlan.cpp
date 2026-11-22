@@ -7,6 +7,16 @@
 #include <QRegularExpression>
 #include <QStandardPaths>
 
+#ifdef Q_OS_WIN
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include <cmath>
 
 QString batchRenderedVideoJobPlanSummary(
@@ -3647,9 +3657,12 @@ namespace
  * reports QFileInfo size 0 (the link's own size), so a link is judged by the file it RESOLVES
  * to (r6 adversary A1: a link whose target was emptied is refused). Can still start (r7, sol r6
  * B1: a file that lost its execute permission after the lookup is a usage error at preflight,
- * exit 2, not a failed launch, exit 4): on Windows the file is a .exe by its own name, the name
- * CreateProcess starts; elsewhere this user may execute it (QFileInfo reads the permissions of
- * the file a link resolves to). */
+ * exit 2, not a failed launch, exit 4): on Windows this account can open it for execute (the
+ * access CreateProcess needs; a link is opened through to the file it resolves to; the name's
+ * extension is not judged, since CreateProcess starts a full path as given, r7 adversary A2);
+ * elsewhere this user may execute it (QFileInfo reads the permissions of the file a link
+ * resolves to). Whether the bytes are a valid image is decided by the OS at launch, as for every
+ * other selection. */
 bool batchRenderedVideoLaunchableAppDirFile(const QString & path)
 {
     if( path.isEmpty() )
@@ -3658,8 +3671,14 @@ bool batchRenderedVideoLaunchableAppDirFile(const QString & path)
     if( !info.isFile() )
         return false;
 #ifdef Q_OS_WIN
-    if( !info.fileName().endsWith(QStringLiteral(".exe"), Qt::CaseInsensitive) )
+    const QString nativePath = QDir::toNativeSeparators(info.absoluteFilePath());
+    const HANDLE handle = CreateFileW(reinterpret_cast<const wchar_t *>(nativePath.utf16()),
+                                      FILE_EXECUTE,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                      nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if( handle == INVALID_HANDLE_VALUE )
         return false;
+    CloseHandle(handle);
 #else
     if( !info.isExecutable() )
         return false;

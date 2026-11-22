@@ -1566,8 +1566,8 @@ batchRenderedVideoFfmpegBinaryPlanFromCurrentEnvironment(
 ;
 
 /* Preflight: a PATH hit is trusted; an explicit selection must exist (QFileInfo::exists, as
- * before this card); an app-dir hit must still be a non-empty regular file that can start (a
- * .exe on Windows, executable by this user elsewhere). */
+ * before this card); an app-dir hit must still be a non-empty regular file that can start (this
+ * account can open it for execute on Windows, may execute it elsewhere). */
 bool batchRenderedVideoFfmpegBinaryPlanUsableAtPreflight(
     const BatchRenderedVideoFfmpegBinaryPlan & plan)
 ;
