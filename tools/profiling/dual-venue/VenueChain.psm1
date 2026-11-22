@@ -331,6 +331,7 @@ function Get-VenueTicketStaleReason {
     $beat = ConvertTo-VenueUtc $Ticket.heartbeatUtc
     $after = 0.0
     if ($null -eq $created -or $null -eq $beat -or -not [double]::TryParse([string]$Ticket.staleAfterSec, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$after)) { return 'unreadable' }
+    if (-not [double]::IsFinite($after) -or $after -le 0) { return 'unreadable' }   # TAIL-1 r2 (pre-existing: pass 10 A11): the JSON string NaN or Infinity parses, and NaN / Infinity made "heartbeat age greater than the window" false for ever: a lifetime that is not a finite positive number is unreadable
     $started = Get-VenueProcessStartUtc $pidValue
     if ($null -eq $started) { return 'dead-pid' }
     if ($started -ne [DateTime]::MinValue -and [Math]::Abs(($started - $created).TotalSeconds) -gt $script:PidStartToleranceSec) { return 'pid-reused' }
