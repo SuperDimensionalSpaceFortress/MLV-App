@@ -2657,8 +2657,19 @@ TEST(BatchExportFormat, MediaProbeDefaultLookupMirrorsFfmpeg)
  * real QStandardPaths resolver, the real QCoreApplication::applicationDirPath() of this test
  * executable, and a PATH this test sets). The files written beside the test executable and the
  * PATH value are restored on every exit path (a failed ASSERT throws). */
+enum class AppDirLookupCreate { Created, AlreadyPresent, Failed };
+
 struct AppDirLookupEnvironmentFixture
 {
+    /* r7 RED (sol r6 B2): this is the r6 fixture's write, unchanged (record the name, then a
+     * truncating WriteOnly open), under the name the r7 tests call. */
+    AppDirLookupCreate createBesideExe(const QString & path, const QByteArray & bytes)
+    {
+        besideExe << path;
+        return appDirLookupWriteFile(path, bytes) ? AppDirLookupCreate::Created
+                                                  : AppDirLookupCreate::Failed;
+    }
+
     QStringList besideExe;
     QByteArray savedPath;
     bool pathWasSet = false;
@@ -2793,6 +2804,167 @@ TEST(BatchExportFormat, R6DefaultLookupWithoutAppDirCopyFallsBackToPath)
     ASSERT_FALSE( QFileInfo::exists(appFfmpeg) );
     ASSERT_FALSE( QFileInfo::exists(appProbe) );
 }
+
+/* r7, sol r6 B1, literal input: the app-dir ffmpeg selected by the lookup can no longer be
+ * started when preflight runs. On Unix its mode changed from 0755 to 0644; on Windows (where
+ * CreateProcess starts an image by its .exe name) the app-dir file is not a .exe. Preflight
+ * refuses it (exit 2, the class of a missing binary) instead of passing it to a launch that
+ * fails (exit 4). */
+TEST(BatchExportFormat, R7AppDirSelectionThatCanNoLongerStartIsRefusedAtPreflight)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE( dir.isValid() );
+    const QString appDir = QDir::cleanPath(dir.path());
+#ifdef Q_OS_WIN
+    const QString notAnImage = appDir + QStringLiteral("/ffmpeg");
+    ASSERT_TRUE( appDirLookupWriteFile(notAnImage, QByteArray("MZ")) );
+    const BatchRenderedVideoFfmpegBinaryPlan plan =
+        batchRenderedVideoFfmpegBinaryPlanFromLookup(
+            QString(), appDir,
+            appDirLookupFakeResolver(notAnImage, QStringLiteral("C:/tools/ffmpeg.exe"), nullptr));
+    ASSERT_TRUE( plan.foundInAppDir );
+    ASSERT_FALSE( batchRenderedVideoFfmpegBinaryPlanUsableAtPreflight(plan) );
+    ASSERT_EQ( std::string("app-dir"),
+               appDirLookupText(batchRenderedVideoFfmpegBinaryPlanSearchedLocations(plan)) );
+    /* The packaged .exe passes, as before. */
+    const QString packaged = appDir + QStringLiteral("/ffmpeg.exe");
+    ASSERT_TRUE( appDirLookupWriteFile(packaged, QByteArray("MZ")) );
+    ASSERT_TRUE( batchRenderedVideoFfmpegBinaryPlanUsableAtPreflight(
+        batchRenderedVideoFfmpegBinaryPlanFromLookup(
+            QString(), appDir,
+            appDirLookupFakeResolver(packaged, QString(), nullptr))) );
+#else
+    const QString packaged = appDir + QStringLiteral("/ffmpeg");
+    ASSERT_TRUE( appDirLookupWriteFile(packaged, QByteArray("#!/bin/sh\nexit 0\n")) );
+    ASSERT_TRUE( QFile::setPermissions(packaged,
+        QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner
+        | QFileDevice::ReadUser | QFileDevice::WriteUser | QFileDevice::ExeUser
+        | QFileDevice::ReadGroup | QFileDevice::ExeGroup
+        | QFileDevice::ReadOther | QFileDevice::ExeOther) );
+    const BatchRenderedVideoFfmpegBinaryPlan plan =
+        batchRenderedVideoFfmpegBinaryPlanFromLookup(
+            QString(), appDir, batchRenderedVideoSystemExecutableResolver());
+    ASSERT_TRUE( plan.foundInAppDir );
+    ASSERT_TRUE( batchRenderedVideoFfmpegBinaryPlanUsableAtPreflight(plan) );
+
+    /* 0755 -> 0644 after the lookup. */
+    ASSERT_TRUE( QFile::setPermissions(packaged,
+        QFileDevice::ReadOwner | QFileDevice::WriteOwner
+        | QFileDevice::ReadUser | QFileDevice::WriteUser
+        | QFileDevice::ReadGroup | QFileDevice::ReadOther) );
+    ASSERT_FALSE( batchRenderedVideoFfmpegBinaryPlanUsableAtPreflight(plan) );
+    ASSERT_EQ( std::string("app-dir"),
+               appDirLookupText(batchRenderedVideoFfmpegBinaryPlanSearchedLocations(plan)) );
+    ASSERT_FALSE( batchRenderedVideoFfmpegBinaryPlanFromLookup(
+        QString(), appDir, batchRenderedVideoSystemExecutableResolver()).foundInAppDir );
+#endif
+}
+
+/* r7, sol r6 B1 sibling sites: the optional ffprobe (the app-dir hit, step 1, and the ffprobe
+ * beside the resolved ffmpeg, step 2) is judged by the same rule, so a file that cannot start
+ * is never chosen and the ffmpeg-dump verification runs instead. */
+TEST(BatchExportFormat, R7OptionalProbeThatCanNoLongerStartIsNotChosen)
+{
+    QTemporaryDir appTemp;
+    QTemporaryDir encoderTemp;
+    ASSERT_TRUE( appTemp.isValid() && encoderTemp.isValid() );
+    const QString appDir = QDir::cleanPath(appTemp.path());
+    const QString encoderDir = QDir::cleanPath(encoderTemp.path());
+    const QString encoderFfmpeg = encoderDir + QStringLiteral("/")
+        + appDirLookupPackagedName(QStringLiteral("ffmpeg"));
+    ASSERT_TRUE( appDirLookupWriteFile(encoderFfmpeg, QByteArray("MZ")) );
+    const BatchRenderedVideoFfmpegBinaryPlan ffmpegPlan =
+        batchRenderedVideoFfmpegBinaryPlanFromResolvedPath(QStringLiteral("ffmpeg"), encoderFfmpeg);
+#ifdef Q_OS_WIN
+    /* Not a .exe: CreateProcess cannot start it by this name. */
+    const QString appProbe = appDir + QStringLiteral("/ffprobe");
+    const QString siblingProbe = encoderDir + QStringLiteral("/ffprobe");
+    ASSERT_TRUE( appDirLookupWriteFile(appProbe, QByteArray("MZ")) );
+    ASSERT_TRUE( appDirLookupWriteFile(siblingProbe, QByteArray("MZ")) );
+#else
+    const QString appProbe = appDir + QStringLiteral("/ffprobe");
+    const QString siblingProbe = encoderDir + QStringLiteral("/ffprobe");
+    ASSERT_TRUE( appDirLookupWriteFile(appProbe, QByteArray("#!/bin/sh\nexit 0\n")) );
+    ASSERT_TRUE( appDirLookupWriteFile(siblingProbe, QByteArray("#!/bin/sh\nexit 0\n")) );
+    const QFileDevice::Permissions noExecute =
+        QFileDevice::ReadOwner | QFileDevice::WriteOwner
+        | QFileDevice::ReadUser | QFileDevice::WriteUser
+        | QFileDevice::ReadGroup | QFileDevice::ReadOther;
+    ASSERT_TRUE( QFile::setPermissions(appProbe, noExecute) );
+    ASSERT_TRUE( QFile::setPermissions(siblingProbe, noExecute) );
+#endif
+    const BatchRenderedVideoMediaProbeBinaryPlan probePlan =
+        batchRenderedVideoMediaProbeBinaryPlanFromLookup(
+            QString(), appDir, appDirLookupFakeResolver(appProbe, QString(), nullptr));
+    ASSERT_TRUE( probePlan.foundInAppDir );
+    ASSERT_EQ( std::string(), appDirLookupText(
+        batchRenderedVideoOptionalMediaProbeExecutable(probePlan, ffmpegPlan)) );
+
+    /* A sibling that can start is still found. */
+    const QString launchable = encoderDir + QStringLiteral("/")
+        + appDirLookupPackagedName(QStringLiteral("ffprobe"));
+    ASSERT_TRUE( appDirLookupWriteFile(launchable, QByteArray("MZ")) );
+    ASSERT_EQ( appDirLookupText(launchable), appDirLookupText(
+        batchRenderedVideoOptionalMediaProbeExecutable(probePlan, ffmpegPlan)) );
+}
+
+/* r7, sol r6 B2, literal input: a packager (or a concurrent run of this test executable) put
+ * ffmpeg.exe beside console_tests.exe after the precedence test's absence check and before its
+ * write. The fixture must create its files exclusively: it never truncates a file it did not
+ * create, reports the name as already present (the test skips), and never removes it. */
+TEST(BatchExportFormat, R7PrecedenceFixtureNeverOverwritesOrDeletesAFileItDidNotCreate)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE( dir.isValid() );
+    const QString foreign = QDir::cleanPath(dir.path()) + QStringLiteral("/")
+        + appDirLookupPackagedName(QStringLiteral("ffmpeg"));
+    {
+        QFile packager(foreign);
+        ASSERT_TRUE( packager.open(QIODevice::WriteOnly) );
+        ASSERT_TRUE( packager.write(QByteArray("packager-copy")) == 13 );
+        packager.close();
+    }
+    const QString mine = QDir::cleanPath(dir.path()) + QStringLiteral("/")
+        + appDirLookupPackagedName(QStringLiteral("ffprobe"));
+    {
+        AppDirLookupEnvironmentFixture fixture;
+        ASSERT_TRUE( fixture.createBesideExe(foreign, QByteArray("MZ-app-dir-copy"))
+                     == AppDirLookupCreate::AlreadyPresent );
+        ASSERT_TRUE( fixture.createBesideExe(mine, QByteArray("MZ-app-dir-copy"))
+                     == AppDirLookupCreate::Created );
+        ASSERT_TRUE( fixture.removeBesideExe() );
+    }
+    QFile check(foreign);
+    ASSERT_TRUE( check.open(QIODevice::ReadOnly) );
+    ASSERT_EQ( std::string("packager-copy"), std::string(check.readAll().constData()) );
+    ASSERT_FALSE( QFileInfo::exists(mine) );
+}
+
+#ifdef Q_OS_WIN
+/* r7, sol r6 B3, literal input: a temporary directory whose path holds a cmd metacharacter
+ * (TEMP=C:\R&D\tmp). The link fixture takes the path literally: the hard link (needs no
+ * privilege) is made, and a file symlink is made or refused by this host, never misparsed. */
+TEST(BatchExportFormat, R7LinkFixtureTakesATempPathWithAnAmpersandLiterally)
+{
+    QTemporaryDir base;
+    ASSERT_TRUE( base.isValid() );
+    const QString dir = QDir::cleanPath(base.path()) + QStringLiteral("/R&D");
+    ASSERT_TRUE( QDir().mkpath(dir) );
+    const QString real = dir + QStringLiteral("/ffmpeg-real.exe");
+    ASSERT_TRUE( QFile::copy(QStringLiteral("C:/Windows/System32/whoami.exe"), real) );
+    const QString hardLink = dir + QStringLiteral("/ffmpeg.exe");
+    ASSERT_TRUE( appDirLookupMakeLink(hardLink, real, true) );
+    ASSERT_FALSE( QFileInfo(hardLink).isSymLink() );
+    ASSERT_EQ( QFileInfo(real).size(), QFileInfo(hardLink).size() );
+    const QString symLink = dir + QStringLiteral("/ffprobe.exe");
+    if( appDirLookupMakeLink(symLink, real, false) )
+        ASSERT_TRUE( QFileInfo(symLink).isSymLink() );
+    else
+        ASSERT_FALSE( QFileInfo(symLink).exists() || QFileInfo(symLink).isSymLink() );
+    /* A link into a directory that does not exist fails, and returns. */
+    ASSERT_FALSE( appDirLookupMakeLink(dir + QStringLiteral("/missing/ffmpeg.exe"), real, true) );
+}
+#endif
 
 TEST(BatchExportFormat, PlansRenderedVideoMediaProbeCommandShape)
 {
