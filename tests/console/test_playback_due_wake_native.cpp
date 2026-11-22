@@ -2489,10 +2489,14 @@ TEST(PlaybackDueWakeSend, R2A1_AStaleSentWakeInTheRunnerSleepIsNotHeldCountedOrA
     wake.resetStrandedCounts();
     wake.arm( 0.5 );
     ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
-    t.restart();                                                       // before arm: the replacement's 40 ms are inside what t measures
+    // t starts BEFORE arm, so the replacement's 40 ms are inside what t measures whatever the scheduler did after the arm; the
+    // arm's own cost is bracketed, and the wall bound is asserted only on a sample whose arm returned promptly (a pause before
+    // the arm would let a shortened arm still read >= 30: such a sample is not evidence, so it asserts nothing, never passes it)
+    t.restart();
     wake.arm( 40.0 );
+    const qint64 armCostNs = t.nsecsElapsed();
     ASSERT_TRUE( wake.sleepForSmokeRunner( 500 ) == PlaybackDueWake::RunnerSleep::WokenBySent );
-    ASSERT_TRUE( t.elapsed() >= 30 );                                  // not at the stale wake (~0 ms), at the replacement
+    if( armCostNs < 5000000 ) ASSERT_TRUE( t.elapsed() >= 30 );       // not at the stale wake (~0 ms), at the replacement
     ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenBySent() );
     ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenOther() );
     ASSERT_EQ( 0, fired );
@@ -2663,13 +2667,17 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     // thread woke at ~55 ms of the 80). Every bound below follows from a clock read the test or the sleep made, never from the
     // scheduler running a thread on time. The sender starts its 20 ms only once the sleep has stamped its entry, so a main
     // thread descheduled before the sleep cannot eat the segment before the send. The send itself must land inside the sleep
-    // for the property to be observable at all; when the sender is so late that it misses the whole 80 ms (no dispatch ran, so
-    // there is nothing to measure), the observation is retried -- a pass can never come from a missed send, since the dispatch
-    // span, both segments and the 4 stamps are all asserted below.
+    // for the property to be observable at all; when the sender is so late that it misses the whole 80 ms (the handler never
+    // ran, so there is nothing to measure), the observation is retried. The retry keys on the HANDLER's own stamps, never on
+    // the sleep's span record: an attempt whose handler ran is judged in full below, so a product that dropped the span (or a
+    // stamp, or a segment) fails here instead of being retried away. A pass can never come from a missed send.
     constexpr int kAttempts = 5;
+    g_r17A1Stamps.reserve( 16 );                                       // the clock callback must never allocate (a throw there would std::terminate the sender's join)
     std::unique_ptr<R17A1Windows> wp;
     std::vector<std::pair<double, double>> spans;
     std::vector<double> stamps;
+    double handlerStartMs = 0.0;
+    double handlerEndMs = 0.0;
     double enteredMs = 0.0;
     double returnedMs = 0.0;
     PlaybackDueWake::RunnerSleep slept = PlaybackDueWake::RunnerSleep::NotHandled;
@@ -2687,6 +2695,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         std::thread sender( [window, &sent]() {
             const ULONGLONG giveUp = GetTickCount64() + 5000;
             while( !g_r17A1Entered.load() && GetTickCount64() < giveUp ) Sleep( 0 );
+            if( !g_r17A1Entered.load() ) return;                       // the sleep never started: no send, so the attempt reads as missed
             Sleep( 20 );
             sent = SendNotifyMessageW( window, kR17A1ForeignMessage, 0, 0 ) != 0;
         } );
@@ -2695,13 +2704,16 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         returnedMs = dueWakeQpcNowMs();
         sender.join();
         g_r17A1Windows = nullptr;
+        // the handler's own stamps, taken BEFORE the drain below (which runs the handler too, when the send missed the sleep)
+        handlerStartMs = g_r17A1HandlerStartMs;
+        handlerEndMs = g_r17A1HandlerEndMs;
+        landed = handlerStartMs != 0.0 && handlerEndMs != 0.0;
         // a send that missed the sleep is still queued: take it now (its handler sees no windows), so it cannot cut the next try
         MSG drain;
         PeekMessageW( &drain, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );
         sentOk = sent.load();
         spans = wake.lastRunnerSleepDispatchSpansS();
         stamps = g_r17A1Stamps;
-        landed = spans.size() == 1;
     }
     DestroyWindow( window );
     ASSERT_TRUE( sentOk );
@@ -2724,8 +2736,8 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     // sender moves the dispatch, never the identity
     ASSERT_TRUE( std::fabs( w.chargedS[0] - ( dispatchStartS - entryS ) ) < 1e-9 );
     ASSERT_TRUE( std::fabs( w.chargedS[1] - ( returnS - dispatchEndS ) ) < 1e-9 );
-    ASSERT_TRUE( w.chargedS[0] * 1000.0 <= g_r17A1HandlerStartMs - enteredMs + 0.5 );
-    ASSERT_TRUE( w.chargedS[1] * 1000.0 <= returnedMs - g_r17A1HandlerEndMs + 0.5 );
+    ASSERT_TRUE( w.chargedS[0] * 1000.0 <= handlerStartMs - enteredMs + 0.5 );
+    ASSERT_TRUE( w.chargedS[1] * 1000.0 <= returnedMs - handlerEndMs + 0.5 );
     ASSERT_TRUE( w.chargedS[0] * 1000.0 >= 10.0 );                     // the sender waits 20 ms after the entry stamp: only later
     // the sleep is never cut short at the dispatch: it runs the requested 80 ms (late only lengthens it)
     ASSERT_TRUE( ( returnS - entryS ) * 1000.0 >= 79.0 );
@@ -2735,8 +2747,8 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     ASSERT_TRUE( std::fabs( spans[0].second - dispatchEndS ) < 1e-9 );
     ASSERT_TRUE( std::fabs( w.chargedS[0] + ( spans[0].second - spans[0].first ) + w.chargedS[1] - ( returnS - entryS ) ) < 1e-9 );
     // the dispatch span sits inside the handler's own reads' bracket: it began before the handler and ended after it
-    ASSERT_TRUE( spans[0].first * 1000.0 <= g_r17A1HandlerStartMs + 0.5 );
-    ASSERT_TRUE( spans[0].second * 1000.0 >= g_r17A1HandlerEndMs - 0.5 );
+    ASSERT_TRUE( spans[0].first * 1000.0 <= handlerStartMs + 0.5 );
+    ASSERT_TRUE( spans[0].second * 1000.0 >= handlerEndMs - 0.5 );
     // a sleep no dispatch cuts is one segment, charged to the window open at its end; NotHandled hands out none
     R17A1Windows plain;
     g_r17A1Stamps.clear();
