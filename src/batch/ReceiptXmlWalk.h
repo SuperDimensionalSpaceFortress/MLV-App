@@ -27,12 +27,24 @@
 namespace ReceiptXmlWalk
 {
 
-/* elementOffset: reader->characterOffset() taken while the main reader stands on the receipt
- * (or session clip) start element whose children are read. False when the reader's device is not
- * a named file, the file cannot be reopened, or the element is not found. A parse error ends the
- * scan with what it read before the error. */
-inline bool plainLookAssistOptOut( QXmlStreamReader *reader, qint64 elementOffset )
+/* elementOffset / elementName: reader->characterOffset() and reader->qualifiedName() taken while the
+ * main reader stands on the receipt (or session clip) start element whose children are read.
+ * extensionSeen: the walk's lookAssistEnabled handler met one in a namespace.
+ *
+ * Called after the walk. When the walk stopped on the element's own end element it handled every
+ * direct child (a skipped compact element always stops it on that child's end instead), so it read
+ * every plain lookAssistEnabled, last one winning, exactly as the scan would; unless an extension
+ * was among them there is nothing to correct and the file is not read again. Every receipt and
+ * session MLV App writes is indented, so a session of many clips is still read once, as on base.
+ *
+ * False when the reader's device is not a named file, the file cannot be reopened, or the element
+ * is not found. A parse error ends the scan with what it read before the error. */
+inline bool plainLookAssistOptOut( QXmlStreamReader *reader, qint64 elementOffset,
+                                   const QString &elementName, bool extensionSeen )
 {
+    if( !extensionSeen && reader->isEndElement() && reader->qualifiedName() == elementName )
+        return false;
+
     QFileDevice *device = qobject_cast<QFileDevice *>( reader->device() );
     if( !device || device->fileName().isEmpty() ) return false;
 

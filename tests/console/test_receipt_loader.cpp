@@ -205,6 +205,14 @@ TEST(ReceiptLoader, AnIndentedExtensionAfterTheOptOutDoesNotOverwriteIt)
         "<receipt version=\"4\">\r\n<lookAssistEnabled>0</lookAssistEnabled>\r\n<lookAssistEnabled>1</lookAssistEnabled>\r\n"
         "</receipt>\r\n"), &optIn));
     ASSERT_TRUE(optIn.lookAssistEnabled());
+
+    // The scan only ever lowers the flag: an extension opt-out base honoured stays honoured.
+    ReceiptSettings extensionOff;
+    ASSERT_TRUE(loadReceiptText(QByteArrayLiteral(
+        "<receipt version=\"4\" xmlns:x=\"urn:metadata\">\n<x:lookAssistEnabled>0</x:lookAssistEnabled>\n<cutIn>4</cutIn>\n"
+        "</receipt>\n"), &extensionOff));
+    ASSERT_FALSE(extensionOff.lookAssistEnabled());
+    ASSERT_EQ(4u, extensionOff.cutIn());
 }
 
 // Adversary A5 on 16d54744: a compact namespaced extension tag with a known local name does not overwrite the field.
@@ -230,6 +238,10 @@ TEST(ReceiptLoader, AnIndentedReceiptReadsAsBefore)
 
 // The GUI's copy of the reader (MainWindow::readXmlElementsFromFile, not linked here) keeps the base walk and applies
 // the same opt-out scan after it (r2 B1/B2).
+static const QString kOptOutScanCall = QStringLiteral(
+    "if( ReceiptXmlWalk::plainLookAssistOptOut( Rxml, receiptElementOffset, receiptElementName, lookAssistExtensionSeen ) )\n"
+    "        receipt->setLookAssistEnabled( false );");
+
 TEST(ReceiptLoader, TheGuiReaderUsesTheSameWalk)
 {
     QFile file(repo_file_path(QStringLiteral("platform/qt/MainWindow.cpp")));
@@ -244,8 +256,10 @@ TEST(ReceiptLoader, TheGuiReaderUsesTheSameWalk)
     const int walk = body.indexOf(QStringLiteral(
         "    while( !Rxml->atEnd() && !Rxml->isEndElement() )\n    {\n        Rxml->readNext();\n\n"
         "        if( Rxml->isStartElement() && Rxml->name() == QString( \"exposure\" ) )"));
-    const int scan = body.indexOf(QStringLiteral(
-        "if( ReceiptXmlWalk::plainLookAssistOptOut( Rxml, receiptElementOffset ) ) receipt->setLookAssistEnabled( false );"));
+    const int scan = body.indexOf(kOptOutScanCall);
+    ASSERT_TRUE(body.indexOf(QStringLiteral(
+        "            if( !Rxml->namespaceUri().isEmpty() ) lookAssistExtensionSeen = true;\n"
+        "            receipt->setLookAssistEnabled( (bool)Rxml->readElementText().toInt() );")) >= 0);
     ASSERT_TRUE(offset >= 0);
     ASSERT_TRUE(walk > offset);
     ASSERT_TRUE(scan > walk);
@@ -262,8 +276,10 @@ TEST(ReceiptLoader, TheBatchReaderKeepsTheBaseWalk)
     const QString source = QString::fromUtf8(file.readAll());
     ASSERT_EQ(-1, source.indexOf(QStringLiteral("walk.next(")));
     ASSERT_EQ(-1, source.indexOf(QStringLiteral("walk.settle(")));
+    ASSERT_TRUE(source.indexOf(kOptOutScanCall) >= 0);
     ASSERT_TRUE(source.indexOf(QStringLiteral(
-        "if( ReceiptXmlWalk::plainLookAssistOptOut( Rxml, receiptElementOffset ) ) receipt->setLookAssistEnabled( false );")) >= 0);
+        "            if( !Rxml->namespaceUri().isEmpty() ) lookAssistExtensionSeen = true;\n"
+        "            receipt->setLookAssistEnabled( (bool)Rxml->readElementText().toInt() );")) >= 0);
 }
 
 TEST(ReceiptLoader, MissingReceiptReturnsUsefulError)
