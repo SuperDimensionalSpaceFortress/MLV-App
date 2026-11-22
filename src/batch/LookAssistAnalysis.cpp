@@ -1881,6 +1881,14 @@ QString lookAssistFilmGradationCurveV1( LookAssistScene scene )
          + identity + QStringLiteral("?") + filmCurveLine( knotX, blueY, 5 );
 }
 
+// A token toFloat reads as a number (the value the parse stores is the same toFloat's).
+static bool gradationTokenIsNumber( const QString &token )
+{
+    bool number = false;
+    token.toFloat( &number );
+    return number;
+}
+
 int lookAssistParseGradationCurve( const QString &curve, std::vector<LookAssistGradationPoint> lines[4],
                                    bool *wellFormed )
 {
@@ -1897,8 +1905,8 @@ int lookAssistParseGradationCurve( const QString &curve, std::vector<LookAssistG
             const int xEnd = config.indexOf( QLatin1Char(';') );
             if( xEnd < 0 ) { config.clear(); formed = false; break; }   // malformed tail: the widget would spin on it
             LookAssistGradationPoint point;
-            bool xNumber = false;
-            point.x = config.left( xEnd ).toFloat( &xNumber );
+            const QString xText = config.left( xEnd );
+            point.x = xText.toFloat();
             config.remove( 0, xEnd + 1 );
             // An x with no y before the line ends ('?') or the string does: an odd count of tokens (r2 adversary A4).
             const int lineEnd = config.indexOf( QLatin1Char('?') );
@@ -1908,10 +1916,10 @@ int lookAssistParseGradationCurve( const QString &curve, std::vector<LookAssistG
                 formed = false;
                 if( yEnd < 0 ) { config.clear(); break; }
             }
-            bool yNumber = false;
-            point.y = config.left( yEnd ).toFloat( &yNumber );
+            const QString yText = config.left( yEnd );
+            point.y = yText.toFloat();
             config.remove( 0, yEnd + 1 );
-            if( !xNumber || !yNumber ) formed = false;
+            if( !gradationTokenIsNumber( xText ) || !gradationTokenIsNumber( yText ) ) formed = false;
             lines[i].push_back( point );
         }
         config.remove( 0, 1 );   // the '?'
