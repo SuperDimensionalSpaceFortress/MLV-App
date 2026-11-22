@@ -561,6 +561,9 @@ try {
         # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1: the due wake's isolation arm (posted, as before r1), for any leg; judged below by the app's
         # own playback_due_wake delivery_kind readback. Only a JSON true arms it.
         if ($spec.generatorArgs.PSObject.Properties['dueWakeDeliveryPost'] -and $spec.generatorArgs.dueWakeDeliveryPost -is [bool] -and $spec.generatorArgs.dueWakeDeliveryPost) { $gen['DueWakeDeliveryPost'] = $true }
+        # VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1: the four mid-play window toggles of a windowed leg (the schema refuses it on a fullscreen leg); judged below
+        # by the job's own windowToggles* summary scalars. Only a JSON true arms it.
+        if ($spec.generatorArgs.PSObject.Properties['midPlayWindowToggles'] -and $spec.generatorArgs.midPlayWindowToggles -is [bool] -and $spec.generatorArgs.midPlayWindowToggles) { $gen['MidPlayWindowToggles'] = $true }
         # CPU-S1-FS-SPIKE-TEAM-PARTITION-1: the asymmetric OpenMP team partition (both or neither; the generator refuses one alone), for any leg; judged below by
         # the app's own playback_smoke.omp_teams readback.
         if ($spec.generatorArgs.PSObject.Properties['reconOmpThreads']) { $gen['ReconOmpThreads'] = [int]$spec.generatorArgs.reconOmpThreads }
@@ -1143,6 +1146,19 @@ $dueWakeDeliveryVerdict = Get-DvDueWakeDeliveryEvidence -Spec $spec -LogText $ru
 if ($dueWakeDeliveryVerdict.requested) { $receipt['dueWakeDelivery'] = [ordered]@{ requested = $true; observed = $dueWakeDeliveryVerdict.observed; verdict = $dueWakeDeliveryVerdict.verdict } }
 if ($outcome -in @('PASS', 'FAIL') -and $dueWakeDeliveryVerdict.blocks) {
     $detail = "INVALID: the job result was $outcome ($detail) but DUE_WAKE_DELIVERY_NOT_HONOURED: $($dueWakeDeliveryVerdict.reason). A run whose due-wake delivery is not the one its leg names (post when it asks, otherwise send) is no measurement of that arm"
+    $outcome = 'INVALID'
+}
+# VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1, FAIL CLOSED (adversary A5): a leg that names no midPlayWindowToggles whose run log shows window toggles was moved
+# by MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES inherited from the launcher's environment: no measurement of its declared shape.
+$windowToggleRequestVerdict = Get-DvWindowToggleRequestEvidence -Spec $spec -LogText $runLogText
+if ($outcome -in @('PASS', 'FAIL') -and $windowToggleRequestVerdict.blocks) {
+    $detail = "INVALID: the job result was $outcome ($detail) but WINDOW_TOGGLES_INHERITED: $($windowToggleRequestVerdict.reason)"
+    $outcome = 'INVALID'
+}
+# r3 (sol B4), FAIL CLOSED: a leg that names midPlayWindowToggles counts only when its windowToggles* scalars are what the run log itself derives (the receipt validator re-derives the same).
+$windowToggleReconcileVerdict = Get-DvWindowToggleReconcileEvidence -Spec $spec -LogText $runLogText -Metrics $receipt.metrics
+if ($outcome -in @('PASS', 'FAIL') -and $windowToggleReconcileVerdict.blocks) {
+    $detail = "INVALID: the job result was $outcome ($detail) but $($windowToggleReconcileVerdict.reason)"
     $outcome = 'INVALID'
 }
 # CPU-S1-FS-SPIKE-TEAM-PARTITION-1, FAIL CLOSED: a leg that asks for the OpenMP team partition counts only when the measured session's own
