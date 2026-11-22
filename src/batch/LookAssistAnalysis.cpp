@@ -9,6 +9,7 @@
 
 #include <QtGlobal>
 #include <algorithm>
+#include <cmath>
 #include <math.h>
 
 namespace lookassist
@@ -1881,12 +1882,13 @@ QString lookAssistFilmGradationCurveV1( LookAssistScene scene )
          + identity + QStringLiteral("?") + filmCurveLine( knotX, blueY, 5 );
 }
 
-// A token toFloat reads as a number (the value the parse stores is the same toFloat's).
+// A token toFloat reads as a finite number (the value the parse stores is the same toFloat's). nan and inf are no knot:
+// every tolerance comparison with nan is false, so a nan knot passed as identity (r4, sol r3 B2 on 875d5e40).
 static bool gradationTokenIsNumber( const QString &token )
 {
     bool number = false;
-    token.toFloat( &number );
-    return number;
+    const float value = token.toFloat( &number );
+    return number && std::isfinite( value );
 }
 
 int lookAssistParseGradationCurve( const QString &curve, std::vector<LookAssistGradationPoint> lines[4],
@@ -1925,20 +1927,31 @@ int lookAssistParseGradationCurve( const QString &curve, std::vector<LookAssistG
         config.remove( 0, 1 );   // the '?'
         ++read;
     }
+    // Text after the fourth line is no part of any curve the widget writes (r4, sol r3 B2): not well formed.
+    if( read == 4 && !config.isEmpty() ) formed = false;
     if( wellFormed ) *wellFormed = formed;
     return read;
+}
+
+// Within 1e-6, as parsed; false for a nan on either side (written so, not as a '>' refusal that nan slips past).
+static bool gradationValueNear( float value, double expected )
+{
+    return fabs( value - expected ) <= 1e-6;
 }
 
 bool lookAssistIsDefaultGradationCurve( const QString &curve )
 {
     if( curve.trimmed().isEmpty() ) return true;
     std::vector<LookAssistGradationPoint> lines[4];
-    if( lookAssistParseGradationCurve( curve, lines ) != 4 ) return false;
+    bool wellFormed = false;
+    // A malformed or non-finite curve is never the default, so no grade is laid over it and the push refuses it with
+    // its warning (r4, sol r3 B2 on 875d5e40).
+    if( lookAssistParseGradationCurve( curve, lines, &wellFormed ) != 4 || !wellFormed ) return false;
     for( const std::vector<LookAssistGradationPoint> &line : lines )
     {
         if( line.size() != 2 ) return false;
-        if( fabs( line[0].x - 1e-5 ) > 1e-6 || fabs( line[0].y - 1e-5 ) > 1e-6 ) return false;
-        if( fabs( line[1].x - 1.0 ) > 1e-6 || fabs( line[1].y - 1.0 ) > 1e-6 ) return false;
+        if( !gradationValueNear( line[0].x, 1e-5 ) || !gradationValueNear( line[0].y, 1e-5 ) ) return false;
+        if( !gradationValueNear( line[1].x, 1.0 ) || !gradationValueNear( line[1].y, 1.0 ) ) return false;
     }
     return true;
 }
@@ -1952,7 +1965,9 @@ QString lookAssistFilmGradeDecision( LookAssistFlavor flavor, const QString &cur
 bool lookAssistFilmOwnsGradationCurve( const QString &curve )
 {
     std::vector<LookAssistGradationPoint> current[4];
-    if( lookAssistParseGradationCurve( curve, current ) != 4 ) return false;
+    bool wellFormed = false;
+    // A malformed curve is the user's, never a grade's: its restore keeps it (r4, sol r3 B2 sibling).
+    if( lookAssistParseGradationCurve( curve, current, &wellFormed ) != 4 || !wellFormed ) return false;
     // Every curve a Film grade ever laid: v3's and the legacy v2's (#328) and v1's (#319), for every scene.
     for( int version = 1; version <= 3; ++version )
         for( int s = 0; s < kFilmGradeScenes; ++s )
@@ -2039,7 +2054,9 @@ bool sameGradationCurve( const std::vector<LookAssistGradationPoint> a[4], const
 bool lookAssistVision50dOwnsGradationCurve( const QString &curve )
 {
     std::vector<LookAssistGradationPoint> current[4];
-    if( lookAssistParseGradationCurve( curve, current ) != 4 ) return false;
+    bool wellFormed = false;
+    // As Film's: a malformed curve is never the grade's (r4, sol r3 B2 sibling).
+    if( lookAssistParseGradationCurve( curve, current, &wellFormed ) != 4 || !wellFormed ) return false;
     for( int s = 0; s < kVision50dGradeScenes; ++s )
     {
         std::vector<LookAssistGradationPoint> laid[4];

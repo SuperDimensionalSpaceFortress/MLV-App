@@ -744,15 +744,17 @@ struct LookAssistGradationPoint
     float x = 0.0f;
     float y = 0.0f;
 };
-/* wellFormed (optional): false when any of the lines read holds a token that is not a number or an odd count of
- * tokens (an x with no y, which the parse drops and the widget spins on); a caller that pushes the curve refuses it
- * then (EXPORT-PRORES-LOOK-ASSIST-1 r3, r2 adversary A4). The lines and the return value are the same either way. */
+/* wellFormed (optional): false when any of the lines read holds a token that is not a finite number or an odd count of
+ * tokens (an x with no y, which the parse drops and the widget spins on), or text follows the fourth line; a caller
+ * that pushes the curve refuses it then (EXPORT-PRORES-LOOK-ASSIST-1 r3, r2 adversary A4; r4, sol r3 B2). The lines
+ * and the return value are the same either way. */
 int lookAssistParseGradationCurve( const QString &curve, std::vector<LookAssistGradationPoint> lines[4],
                                    bool *wellFormed = nullptr );
 
 /* True for the default curve (ReceiptSettings' default, or the widget's rewrite of it): four lines, each exactly the
- * two identity points (1e-5,1e-5) (1,1) within 1e-6. An empty string counts as default. The Film grade is laid only
- * over a default curve; a user's curve is never overwritten. */
+ * two identity points (1e-5,1e-5) (1,1) within 1e-6. An empty string counts as default; a curve the parse finds not
+ * well formed (a non-finite knot included) never does (r4, sol r3 B2), nor is it a grade's own curve. The Film grade is
+ * laid only over a default curve; a user's curve is never overwritten. */
 bool lookAssistIsDefaultGradationCurve( const QString &curve );
 
 /* The Film grade decision for one apply, as reported in grade=...: "film-v3" (the curve is laid), "skipped_user_curve"

@@ -18,7 +18,8 @@
  * is never opened twice, so a file saved between the two reads cannot mix two versions: r2 adversary
  * A3). It looks only at the element's direct children in no namespace named lookAssistEnabled, so an
  * extension such as <x:lookAssistEnabled> neither hides a later plain opt-out nor overwrites an
- * earlier one (r2 B2), and answers true when the last such child says 0. The caller only ever turns
+ * earlier one (r2 B2), and answers true when the last such child holding an integer says 0 (a child with
+ * no integer in it is skipped, lookAssistEnabledValue: r4, sol r3 B1). The caller only ever turns
  * Look Assist OFF on that answer, so every receipt base read as off stays off, and nothing else the
  * walk read is touched. */
 
@@ -29,6 +30,19 @@
 
 namespace ReceiptXmlWalk
 {
+
+/* The value of a lookAssistEnabled element, for the walk's handlers and the scan alike: true, with base's (bool)toInt()
+ * in *on, when the text (surrounding whitespace aside) is an integer. An empty element, a child element or garbage text
+ * is no value: the caller keeps what it had (the documented default is on), so a malformed field never reads as a
+ * valid 0 and never switches Look Assist off (EXPORT-PRORES-LOOK-ASSIST-1 r4, sol r3 B1 on 875d5e40). */
+inline bool lookAssistEnabledValue( const QString &text, bool *on )
+{
+    bool ok = false;
+    const int value = text.trimmed().toInt( &ok );
+    if( !ok ) return false;
+    *on = ( value != 0 );
+    return true;
+}
 
 class OptOutWatch
 {
@@ -90,10 +104,12 @@ public:
                  && scan.name() == QString( "lookAssistEnabled" ) )
                 {
                     // Child elements are skipped, not an error, so a malformed earlier one cannot hide a
-                    // later scalar opt-out (r2 adversary A2). Its text is read as the handlers read it.
+                    // later scalar opt-out (r2 adversary A2). Its text is read as the handlers read it:
+                    // one with no integer in it is no value and changes nothing (r4, sol r3 B1).
                     const QString text = scan.readElementText( QXmlStreamReader::SkipChildElements );
                     if( scan.hasError() ) break;
-                    lastValue = ( text.toInt() != 0 ) ? 1 : 0; // the handlers' (bool)toInt()
+                    bool on = true;
+                    if( lookAssistEnabledValue( text, &on ) ) lastValue = on ? 1 : 0;
                     continue;
                 }
                 ++depth;

@@ -16826,7 +16826,9 @@ void MainWindow::readXmlElementsFromFile(QXmlStreamReader *Rxml, ReceiptSettings
         else if( Rxml->isStartElement() && Rxml->name() == QString( "lookAssistEnabled" ) )
         {
             optOutWatch.sawLookAssistEnabled( Rxml );
-            receipt->setLookAssistEnabled( (bool)Rxml->readElementText().toInt() );
+            bool lookAssistOn = true;
+            if( ReceiptXmlWalk::lookAssistEnabledValue( Rxml->readElementText(), &lookAssistOn ) )
+                receipt->setLookAssistEnabled( lookAssistOn );
             Rxml->readNext();
         }
         else if( Rxml->isStartElement() && Rxml->name() == QString( "lookAssistFlavor" ) )
