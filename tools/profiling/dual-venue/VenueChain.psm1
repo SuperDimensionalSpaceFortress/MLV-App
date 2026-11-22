@@ -647,6 +647,9 @@ function Request-VenueClaim {
         $pendingAnswer = ''; try { $pendingAnswer = [string](Release-VenueClaim -Venue $Venue -Nonce ([string]$t.pendingReleaseNonce) -ClaimDir $ClaimDir -MaxAttempts 3) } catch { $pendingAnswer = 'ERROR' }
         if ($pendingAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { $t.pendingReleaseNonce = '' }
     }
+    # TAIL-1 r2 A2: the name that is still standing is carried across a ticket that is re-taken below (the flip answering LOST replaces $t by a new ticket, which would drop it: BUSY then LOST left the claim with no name)
+    $carryPending = ''
+    if ($null -ne $t -and $null -ne $t.PSObject.Properties['pendingReleaseNonce']) { $carryPending = [string]$t.pendingReleaseNonce }
     # r7 adversary A7: one place in the line per owner. A ticket this owner already made for this same run and purpose, whose creating call was given up on by the caller after the file was written (so the
     # caller holds no reference to it), is taken over here instead of being queued behind by a second, later ticket of the same owner. It then goes through the same flip to waiting as any ticket.
     if ($null -eq $t) { $t = Find-VenueOwnTicket -Venue $Venue -ClaimDir $ClaimDir -RunDir $RunDir -Purpose $Purpose -OwnerPid $OwnerPid -NowUtc $now }
@@ -675,7 +678,10 @@ function Request-VenueClaim {
             }
         }
     }
-    if ($null -eq $t) { $t = New-VenueTicket -Venue $Venue -RunDir $RunDir -Purpose $Purpose -StaleAfterSec $TicketStaleAfterSec -ClaimDir $ClaimDir -OwnerPid $OwnerPid -NowUtc $now }
+    if ($null -eq $t) {
+        $t = New-VenueTicket -Venue $Venue -RunDir $RunDir -Purpose $Purpose -StaleAfterSec $TicketStaleAfterSec -ClaimDir $ClaimDir -OwnerPid $OwnerPid -NowUtc $now
+        if ($carryPending) { $t | Add-Member -NotePropertyName pendingReleaseNonce -NotePropertyValue $carryPending -Force }   # TAIL-1 r2 A2: the replacement ticket names the claim that is still to be let go of
+    }
     $removed = [System.Collections.Generic.List[object]]::new()
     Remove-VenueOrphanTicketTemps -Venue $Venue -ClaimDir $ClaimDir   # G8: best-effort reap of temps an earlier writer died on
     $line = Get-VenueTickets -Venue $Venue -ClaimDir $ClaimDir -NowUtc $now
@@ -832,14 +838,20 @@ function Invoke-VenueLateRelease {
     abandoned and counted when it does not answer, so Complete-VenueProcess exits at once). A full call may run to what is left of -BoundSec plus -CallCapSec (the worker's start-up and one healthy call);
     the probe to -ProbeCapSec. A call that never returns therefore ends this function by BoundSec + CallCapSec + ProbeCapSec at the latest.
     #>
-    param([Parameter(Mandatory)][string]$Venue, [Parameter(Mandatory)][string]$Nonce, [string]$ClaimDir = '', [double]$BoundSec = 0.75, [double]$CallCapSec = 1.5, [double]$ProbeCapSec = 1.0,
+    # TAIL-1 r2 A6: a cap that is not a finite number of seconds, or is negative, is REFUSED (a NaN bound used to bind and die in an integer conversion before the probe); a cap under one second is HONOURED (below)
+    param([Parameter(Mandatory)][string]$Venue, [Parameter(Mandatory)][string]$Nonce, [string]$ClaimDir = '',
+        [ValidateScript({ [double]::IsFinite($_) -and $_ -ge 0 })][double]$BoundSec = 0.75, [ValidateScript({ [double]::IsFinite($_) -and $_ -ge 0 })][double]$CallCapSec = 1.5, [ValidateScript({ [double]::IsFinite($_) -and $_ -ge 0 })][double]$ProbeCapSec = 1.0,
         [scriptblock]$Call = $null, [scriptblock]$Clock = $null, [scriptblock]$Sleep = $null)
     $released = @('RELEASED', 'ABSENT', 'NOT_OURS')
     if ($null -eq $Call) {
         $modulePath = $MyInvocation.MyCommand.Module.Path
         $Call = {
             param([int]$MaxAttempts, [double]$TimeoutSec)
-            $w = Invoke-VenueBoundedRead -TimeoutSec ([Math]::Max(1.0, $TimeoutSec)) -Argument @{ m = $modulePath; v = $Venue; n = $Nonce; d = $ClaimDir; k = $MaxAttempts } -ScriptText 'param($a) $ErrorActionPreference = ''Stop''; Import-Module $a.m -Force -DisableNameChecking; Release-VenueClaim -Venue $a.v -Nonce $a.n -ClaimDir $a.d -MaxAttempts $a.k'
+            # TAIL-1 r2 A3 + A6: ONE elapsed-time bound per call. A stopwatch starts BEFORE the worker does and its end is this call's -TimeoutSec on it (-Clock/-EndSec of Invoke-VenueBoundedRead), so the worker's
+            # start-up is inside the bound, not added before each relative wait, a cap under one second is honoured (the wait is cut to it; -TimeoutSec itself only has to satisfy the worker's 1 s floor), and an
+            # answer seen after the end is never acted on.
+            $callClock = [Diagnostics.Stopwatch]::StartNew()
+            $w = Invoke-VenueBoundedRead -TimeoutSec ([Math]::Min(600.0, [Math]::Max(1.0, $TimeoutSec))) -Clock $callClock -EndSec $TimeoutSec -EndIsBoundEnd -Argument @{ m = $modulePath; v = $Venue; n = $Nonce; d = $ClaimDir; k = $MaxAttempts } -ScriptText 'param($a) $ErrorActionPreference = ''Stop''; Import-Module $a.m -Force -DisableNameChecking; Release-VenueClaim -Venue $a.v -Nonce $a.n -ClaimDir $a.d -MaxAttempts $a.k'
             if ($w.answered -and @($w.value).Count -gt 0) { [string]@($w.value)[-1] } else { 'NO_ANSWER' }
         }   # no GetNewClosure: a closure is cut off from this module's private Invoke-VenueBoundedRead; the block runs inside this function, so $modulePath, $Venue, $Nonce and $ClaimDir are visible
     }
@@ -857,6 +869,10 @@ function Invoke-VenueLateRelease {
         & $Sleep ([int][Math]::Ceiling([Math]::Min([double](100 * $try), [double]($left * 1000))))   # rounded UP: a sleep cut short by the cast would wake just before the bound and start a try inside it
     }
     if ($answer -cnotin $released) {
+        # TAIL-1 r2 A7: the fifth try can end well before the bound when the calls are instant (tries at 0, 0.1, 0.3, 0.6, 1.0 s on a 2 s bound), and the probe then ran at 1.0 s, so a reader that lets go at 1.2 s was missed:
+        # the probe is made at the END of the reserve, as the comment above says, never earlier
+        $untilBound = $BoundSec - (& $Clock)
+        if ($untilBound -gt 0) { & $Sleep ([int][Math]::Ceiling($untilBound * 1000.0)) }
         $probed = $true
         try { $answer = [string](& $Call 1 $ProbeCapSec) } catch { $answer = 'ERROR' }
     }

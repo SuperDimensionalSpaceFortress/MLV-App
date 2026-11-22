@@ -2131,7 +2131,7 @@ $hold.Dispose()
         if holder is not None:
             r["holder"] = json.loads([l for l in holder.stdout.splitlines() if l.strip()][-1])
             self.assertTrue(r["holder"]["held"], f"the claim file was never granted (no late grant to test):\n{r['log']}\n{out}")
-        self.assertIn("CLAIM_LATE_GRANT", r["log"], f"the batch never reached its late-grant branch (the seam or the deadline is wrong):\n{r['log']}\n{out}")
+        self.assertIn("CLAIM_LATE_GRANT", r["log"] + "\n" + out, f"the batch never reached its late-grant branch (the seam or the deadline is wrong):\n{r['log']}\n{out}")
         return r
 
     def test_r10_g14_a_late_grant_whose_release_is_refused_is_logged_not_released_and_the_claim_stays_until_it_is_freed(self) -> None:
@@ -2292,10 +2292,10 @@ Remove-Item -LiteralPath $B.path -Force
 $cp = Join-Path $d 'bachelor.claim.json'
 $hold = [IO.File]::Open($cp, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
 try { $r = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $B } finally { $hold.Dispose() }
-$p = $r.ticket.PSObject.Properties['pendingReleaseNonce']
+$pendingBefore = [string]$r.ticket.pendingReleaseNonce   # read now: the next poll clears it once it lets go
 $r2 = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $r.ticket
 $after = $null; if (Test-Path -LiteralPath $cp) { $after = (Get-Content -LiteralPath $cp -Raw | ConvertFrom-Json).nonce }
-[pscustomobject]@{ nonce = [string]$g.claim.nonce; newTicket = ($r.ticket.name -cne $B.name); pending = $(if ($p) { [string]$p.Value } else { '' }); claimAfterNextPoll = [bool]$after; ours = [bool]($after -and $after -ceq [string]$g.claim.nonce) } | ConvertTo-Json -Compress
+[pscustomobject]@{ nonce = [string]$g.claim.nonce; newTicket = ($r.ticket.name -cne $B.name); pending = $pendingBefore; claimAfterNextPoll = [bool]$after; ours = [bool]($after -and $after -ceq [string]$g.claim.nonce) } | ConvertTo-Json -Compress
 """
 
     def test_tail1_r2_a2_a_pending_release_nonce_is_kept_across_a_ticket_that_is_re_taken(self) -> None:
@@ -2304,7 +2304,8 @@ $after = $null; if (Test-Path -LiteralPath $cp) { $after = (Get-Content -Literal
         r = self.ps(self.SEAM_R2A2)
         self.assertTrue(r["newTicket"], f"the reaped ticket was not replaced: {r}")
         self.assertEqual(r["pending"], r["nonce"], f"the replacement ticket lost the pending release nonce: {r}")
-        self.assertFalse(r["claimAfterNextPoll"], f"the claim was not let go of by the poll after the reader let go: {r}")
+        # the same poll may then take a FRESH claim as the head (a different nonce); what must be gone is the stranded one
+        self.assertFalse(r["ours"], f"the stranded claim was not let go of by the poll after the reader let go: {r}")
 
     def test_tail1_r2_a1_an_explicit_no_ticket_batch_is_not_defeated_by_a_defaulted_ticket(self) -> None:
         # r1 adversary A1 (same class as pass 11 A6): a caller's $PSDefaultParameterValues['Request-VenueClaim:Ticket'] skipped the ticketless gate of an otherwise valid -NoTicket batch, which then judged the stale

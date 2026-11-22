@@ -878,6 +878,16 @@ function Invoke-BatchTicketCall([string]$Body, [hashtable]$Argument, [double]$Se
     & (Get-Module VenueChain) { param($b, $a, $s) Invoke-VenueBoundedRead -ScriptText ('param($a) Import-Module $a.m -Force -DisableNameChecking; ' + $b) -Argument $a -TimeoutSec $s } $Body ($Argument + @{ m = (Join-Path $here 'VenueChain.psm1') }) $Sec
 }
 
+function Disable-RunDirWrites([string]$Why) {
+    # the write suppression (r7 pass 2 A1, shared by Invoke-ClaimRetryRelease and, TAIL-1 r2 A4, the inline late release): nothing more is written into -RunDir (it may be on a share that stopped answering), the
+    # line goes to stderr. Idempotent: the first reason is the one kept.
+    if (-not $script:RunOutputAliased) {
+        $script:RunOutputAliased = $true; $script:batchLog = $null
+        if (-not $script:suppressionHit) { $script:suppressionHit = [pscustomobject]@{ kind = 'content'; item = 0; code = 'SHARE_UNREACHABLE'; locationUnknown = $true; noAnswer = $false
+            why = "$Why, so nothing more is written into -RunDir (it may be on that share)" } }
+    }
+}
+
 function Invoke-ClaimRetryRelease([DateTime]$DeadlineUtc, [string]$Nonce) {
     # r6 pass 3 (adversary r6 pass 2 A1): a claim granted on a RETRY is let go (its guard refused, threw, or outlasted the claim) through VenueChain's own Invoke-VenueBoundedRead,
     # so a claim share that stops answering cannot hold the refusal that follows past the deadline. The bound is the room left less the reserve, at least 1 s (a healthy release
@@ -891,14 +901,7 @@ function Invoke-ClaimRetryRelease([DateTime]$DeadlineUtc, [string]$Nonce) {
     # r8 (sol r7 blocker): a release that THREW (the claim share's read or delete raising through EndInvoke, or the worker not created) returned NO_ANSWER with it still off. Now every
     # exit turns it on in ONE place, the outer finally, unless the worker's answer was read back and is a release ($answered): no room, no answer in the wait, a throw, an answer
     # that released nothing (BUSY), and any exit added later.
-    $suppress = {
-        param([string]$Why)
-        if (-not $script:RunOutputAliased) {
-            $script:RunOutputAliased = $true; $script:batchLog = $null
-            if (-not $script:suppressionHit) { $script:suppressionHit = [pscustomobject]@{ kind = 'content'; item = 0; code = 'SHARE_UNREACHABLE'; locationUnknown = $true; noAnswer = $false
-                why = "the release of a claim granted on a retry $Why, so nothing more is written into -RunDir (it may be on that share)" } }
-        }
-    }
+    $suppress = { param([string]$Why) Disable-RunDirWrites "the release of a claim granted on a retry $Why" }
     $answered = $false; $why = 'ended before it answered'
     try {
         $sec = [Math]::Min([double](($DeadlineUtc - [DateTime]::UtcNow).TotalSeconds - $script:ClaimRetryRefusalTailSec), [double]$script:ClaimRetryRequestReserveSec)
@@ -2353,7 +2356,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         $grantedOnRetry = $unfinished -gt 0
         try {
             # VENUE-FIFO-TICKET-BEFORE-PRECLAIM-1: every request carries the batch's ticket (taken here on the first one when the batch had no wait before it), so the claim goes to the oldest ready ticket
-            $ticketArgs = $(if ($script:TicketOn) { @{ UseTicket = $true; Ticket = $script:batchTicket; TicketStaleAfterSec = $ticketStaleSec } } else { @{ UseTicket = $false } })   # TAIL-1 pass 11 A6: -NoTicket BINDS the switch to false, so a caller's $PSDefaultParameterValues cannot turn it on
+            $ticketArgs = $(if ($script:TicketOn) { @{ UseTicket = $true; Ticket = $script:batchTicket; TicketStaleAfterSec = $ticketStaleSec } } else { @{ UseTicket = $false; Ticket = $null } })   # TAIL-1 pass 11 A6: -NoTicket BINDS the switch to false, so a caller's $PSDefaultParameterValues cannot turn it on; r2 A1: and -Ticket to $null, so a defaulted one cannot defeat the opt-out either
             $req = $(if ($unfinished -gt 0) { Invoke-ClaimRetryRequest -DeadlineUtc $deadline -RequestArgs (@{ Venue = $Venue; RunDir = $RunDir; Purpose = "$Purpose batch $batchNo"; TtlSec = $ClaimTtlSec; ClaimDir = $ClaimDir } + $ticketArgs) }
                 else { Request-VenueClaim -Venue $Venue -RunDir $RunDir -Purpose "$Purpose batch $batchNo" -TtlSec $ClaimTtlSec -ClaimDir $ClaimDir @ticketArgs })
             # the line for it is written only once the guard below has vouched for where batch.log is (no write before a read vouched for the input's location), never here
@@ -2399,7 +2402,13 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             $lateAnswer = ''
             $lateBoundSec = [double]($script:ClaimRetryRequestReserveSec - $script:ClaimRetryRefusalTailSec)
             if ($grantedOnRetry) { try { $lateAnswer = [string](Invoke-ClaimRetryRelease $deadline $req.claim.nonce) } catch { $lateAnswer = 'ERROR' } }
-            else { $lateAnswer = [string](Invoke-VenueLateRelease -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir -BoundSec $lateBoundSec).answer }
+            else {
+                # TAIL-1 r2 A5: the caps are passed EXPLICITLY, so a caller's $PSDefaultParameterValues['Invoke-VenueLateRelease:ProbeCapSec' / 'CallCapSec'] cannot widen the bound
+                $lateAnswer = [string](Invoke-VenueLateRelease -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir -BoundSec $lateBoundSec -CallCapSec 1.5 -ProbeCapSec 1.0).answer
+                # TAIL-1 r2 A4: a release that was NOT answered (the claim share stopped answering: both workers timed out) turns the write suppression on, as Invoke-ClaimRetryRelease does, so the log line below
+                # (L / LogBest) cannot probe batch.log on that same failed share unbounded before the deadline result. Said on stderr only from then on. A BUSY answer is an answer: the share is up, the log is written.
+                if ($lateAnswer -cin @('NO_ANSWER', 'ERROR')) { Disable-RunDirWrites "the late release of a claim granted at or after the deadline was not answered ($lateAnswer)" }
+            }
             if ($lateAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { LogBest "CLAIM_LATE_GRANT batch=$batchNo (the claim was granted at or after the deadline: let go, not used)" }
             else { LogBest "CLAIM_LATE_GRANT_NOT_RELEASED batch=$batchNo answer=$lateAnswer (the claim was granted at or after the deadline and is NOT known to be let go: it still names this batch until its expiry or its owner's exit)" }
             break
