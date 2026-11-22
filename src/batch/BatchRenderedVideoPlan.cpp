@@ -3662,7 +3662,8 @@ namespace
  * extension is not judged, since CreateProcess starts a full path as given, r7 adversary A2);
  * elsewhere this user may execute it (QFileInfo reads the permissions of the file a link
  * resolves to). Whether the bytes are a valid image is decided by the OS at launch, as for every
- * other selection. */
+ * other selection. On Windows the size is read from that same execute handle (r7 adversary
+ * c56d0ff4 A2: a size read before the open could describe a file truncated in between). */
 bool batchRenderedVideoLaunchableAppDirFile(const QString & path)
 {
     if( path.isEmpty() )
@@ -3673,20 +3674,23 @@ bool batchRenderedVideoLaunchableAppDirFile(const QString & path)
 #ifdef Q_OS_WIN
     const QString nativePath = QDir::toNativeSeparators(info.absoluteFilePath());
     const HANDLE handle = CreateFileW(reinterpret_cast<const wchar_t *>(nativePath.utf16()),
-                                      FILE_EXECUTE,
+                                      FILE_EXECUTE | FILE_READ_ATTRIBUTES,
                                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                       nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if( handle == INVALID_HANDLE_VALUE )
         return false;
+    LARGE_INTEGER openedSize;
+    const bool hasContent = GetFileSizeEx(handle, &openedSize) != 0 && openedSize.QuadPart > 0;
     CloseHandle(handle);
+    return hasContent;
 #else
     if( !info.isExecutable() )
         return false;
-#endif
     if( info.size() > 0 )
         return true;
     const QString target = info.canonicalFilePath();
     return !target.isEmpty() && QFileInfo(target).size() > 0;
+#endif
 }
 
 /* BATCH-FFMPEG-DEFAULT-APPDIR-LOOKUP-1. The packaged ffmpeg.exe sits beside MLVApp.exe, and
