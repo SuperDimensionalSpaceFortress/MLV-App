@@ -3652,8 +3652,10 @@ namespace
 
 /* THE app-dir binary rule (one predicate for every step that can take a file from the
  * application directory: the lookup, preflight, the optional ffprobe and its ffmpeg-sibling
- * step): a regular file with content that can still be started, so an empty placeholder beside
- * MLVApp never wins over a working PATH copy. Measured on Qt 6.10.2: a Windows file symlink
+ * step): a regular file with content that can still be started, so the app-dir step never
+ * takes an empty placeholder beside MLVApp. (When the app dir is itself on PATH ahead of a
+ * working copy, the plain PATH fallback can still return that placeholder, as on master; that
+ * continuation belongs to BATCH-FFMPEG-PATH-CONTINUATION-2.) Measured on Qt 6.10.2: a Windows file symlink
  * reports QFileInfo size 0 (the link's own size), so a link is judged by the file it RESOLVES
  * to (r6 adversary A1: a link whose target was emptied is refused). Can still start (r7, sol r6
  * B1: a file that lost its execute permission after the lookup is a usage error at preflight,

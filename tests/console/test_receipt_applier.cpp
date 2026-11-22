@@ -14,7 +14,9 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
+#include <QHash>
 #include <QProcess>
+#include <QRandomGenerator>
 #include <QTemporaryDir>
 
 #include <cmath>
@@ -2741,7 +2743,17 @@ struct AppDirLookupEnvironmentFixture
                                                          : AppDirLookupCreate::Failed;
         }
         besideExe << path;
-        const bool ok = file.write(bytes) == bytes.size();
+        /* r8 (sol r7 B2): the bytes end with a token unique to this fixture and this file, and
+         * are recorded, so cleanup can tell the file it created from one put under the same
+         * name after it was closed. */
+        const QByteArray content = bytes
+            + QByteArrayLiteral("\n#appdir-lookup-fixture pid=")
+            + QByteArray::number(QCoreApplication::applicationPid())
+            + QByteArrayLiteral(" token=")
+            + QByteArray::number(QRandomGenerator::global()->generate64())
+            + QByteArrayLiteral("\n");
+        written.insert(path, content);
+        const bool ok = file.write(content) == content.size();
         file.close();
 #ifndef Q_OS_WIN
         file.setPermissions(file.permissions() | QFileDevice::ExeOwner | QFileDevice::ExeUser);
@@ -2750,6 +2762,10 @@ struct AppDirLookupEnvironmentFixture
     }
 
     QStringList besideExe;
+    /* r8: the exact bytes written to each created file, and the created names cleanup left
+     * because the file there no longer held them (logged on stderr). */
+    QHash<QString, QByteArray> written;
+    QStringList leftForeign;
     QByteArray savedPath;
     bool pathWasSet = false;
     bool pathChanged = false;
@@ -2773,18 +2789,106 @@ struct AppDirLookupEnvironmentFixture
     }
 
     /* r6 adversary A3: removal is checked. Each R6 test also ASSERTs it on its normal path.
-     * r7: it removes only the files createBesideExe created. */
+     * r7: it removes only the files createBesideExe created.
+     * r8 (sol r7 B2): and only while the file under that name still holds the exact bytes this
+     * fixture wrote. A file replaced after the fixture closed it (a packager's binary, even one
+     * of the same size) is left in place and named on stderr. Returns true when nothing this
+     * fixture created remains. */
+    enum class Cleanup { Removed, Gone, NotOurs, Failed };
+
     bool removeBesideExe()
     {
         QStringList remaining;
         for( const QString & path : besideExe )
         {
-            if( QFileInfo::exists(path) && !QFile::remove(path) )
+            switch( removeIfStillOurs(path) )
+            {
+            case Cleanup::Removed:
+            case Cleanup::Gone:
+                break;
+            case Cleanup::NotOurs:
+                leftForeign << path;
+                std::fprintf(stderr, "[R8-FIXTURE] left %s: it no longer holds the bytes this fixture wrote (replaced after the fixture closed it)\n",
+                             qPrintable(path));
+                break;
+            case Cleanup::Failed:
                 remaining << path;
+                break;
+            }
         }
         besideExe = remaining;
         return remaining.isEmpty();
     }
+
+#ifdef Q_OS_WIN
+    /* Windows: ONE handle reads the bytes and deletes the file. It is opened without
+     * FILE_SHARE_WRITE or FILE_SHARE_DELETE, so while the comparison runs no other process can
+     * write, rename, replace or delete that file; the delete is set on the same handle, so it
+     * hits exactly the file whose bytes were compared. A reparse point is opened as itself
+     * (never followed) and is never ours. */
+    Cleanup removeIfStillOurs(const QString & path) const
+    {
+        const std::wstring native = QDir::toNativeSeparators(path).toStdWString();
+        HANDLE handle = CreateFileW(native.c_str(), GENERIC_READ | DELETE, FILE_SHARE_READ, nullptr,
+                                    OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if( handle == INVALID_HANDLE_VALUE )
+        {
+            const DWORD error = GetLastError();
+            return ( error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND )
+                ? Cleanup::Gone : Cleanup::Failed;
+        }
+        const QByteArray expected = written.value(path);
+        FILE_ATTRIBUTE_TAG_INFO tag{};
+        LARGE_INTEGER size{};
+        bool ours = GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &tag, sizeof(tag))
+                 && !( tag.FileAttributes & ( FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY ) )
+                 && GetFileSizeEx(handle, &size)
+                 && size.QuadPart == expected.size();
+        if( ours )
+        {
+            QByteArray actual(expected.size(), '\0');
+            DWORD read = 0;
+            ours = ReadFile(handle, actual.data(), DWORD(actual.size()), &read, nullptr)
+                && read == DWORD(actual.size())
+                && actual == expected;
+        }
+        Cleanup result = Cleanup::NotOurs;
+        if( ours )
+        {
+            /* POSIX semantics (the name goes at once even if a scanner holds the file open),
+             * with the classic disposition as the fallback on hosts without it. */
+            struct { DWORD Flags; } dispositionEx{ 0x1u /* DELETE */ | 0x2u /* POSIX_SEMANTICS */ };
+            FILE_DISPOSITION_INFO disposition{};
+            disposition.DeleteFile = TRUE;
+            const bool deleted =
+                SetFileInformationByHandle(handle, static_cast<FILE_INFO_BY_HANDLE_CLASS>(21) /* FileDispositionInfoEx */,
+                                           &dispositionEx, sizeof(dispositionEx))
+             || SetFileInformationByHandle(handle, FileDispositionInfo, &disposition, sizeof(disposition));
+            result = deleted ? Cleanup::Removed : Cleanup::Failed;
+        }
+        CloseHandle(handle);
+        return result;
+    }
+#else
+    /* Unix (console_tests does not run there in CI): compare, then unlink by name. A
+     * replacement landing between the two is not detected; the Windows branch has no window. */
+    Cleanup removeIfStillOurs(const QString & path) const
+    {
+        const QFileInfo info(path);
+        if( !info.exists() && !info.isSymLink() )
+            return Cleanup::Gone;
+        if( info.isSymLink() )
+            return Cleanup::NotOurs;
+        QFile file(path);
+        if( !file.open(QIODevice::ReadOnly) )
+            return Cleanup::Failed;
+        const bool ours = file.readAll() == written.value(path);
+        file.close();
+        if( !ours )
+            return Cleanup::NotOurs;
+        return QFile::remove(path) ? Cleanup::Removed : Cleanup::Failed;
+    }
+#endif
 
     void setPath(const QString & dir)
     {
@@ -2799,6 +2903,18 @@ static QString appDirLookupCanonical(const QString & path)
 {
     const QString canonical = QFileInfo(path).canonicalFilePath();
     return canonical.isEmpty() ? QDir::cleanPath(path) : canonical;
+}
+
+/* r8: the same path whether or not the file still exists (Windows names are case-blind). */
+static bool appDirLookupSamePath(const QString & a, const QString & b)
+{
+#ifdef Q_OS_WIN
+    const Qt::CaseSensitivity cs = Qt::CaseInsensitive;
+#else
+    const Qt::CaseSensitivity cs = Qt::CaseSensitive;
+#endif
+    return QDir::cleanPath(QDir::fromNativeSeparators(a))
+               .compare(QDir::cleanPath(QDir::fromNativeSeparators(b)), cs) == 0;
 }
 
 /* RED on fork/master: the base resolves the default ffmpeg/ffprobe on PATH only, so the PATH
@@ -2887,6 +3003,19 @@ static void appDirLookupPathFallbackCheck(const std::function<void()> & afterPre
     if( QFileInfo::exists(appFfmpeg) || QFileInfo::exists(appProbe)
      || QFileInfo(appFfmpeg).isSymLink() || QFileInfo(appProbe).isSymLink() )
         SKIP_TEST("an ffmpeg or ffprobe appeared beside the test executable during the lookup (a packaged copy or a concurrent run); the PATH fallback cannot be judged");
+    /* r8 (sol r7 B3): the two absence checks can both pass while a concurrent run created the
+     * files after the first and removed them before the second. The lookup result is the
+     * witness of that window: an app-dir hit at exactly the path the checks looked at means a
+     * file sat there during the lookup, which this test did not put there. Skip with that
+     * reason, never a false FAIL. An app-dir hit at any OTHER path is still a failure. */
+    const bool ffmpegTookAppDir = plan.foundInAppDir || plan.source == QStringLiteral("app-dir");
+    const bool probeTookAppDir = probePlan.foundInAppDir || probePlan.source == QStringLiteral("app-dir");
+    if( ffmpegTookAppDir || probeTookAppDir )
+    {
+        ASSERT_TRUE( !ffmpegTookAppDir || appDirLookupSamePath(plan.resolvedExecutable, appFfmpeg) );
+        ASSERT_TRUE( !probeTookAppDir || appDirLookupSamePath(probePlan.resolvedExecutable, appProbe) );
+        SKIP_TEST("the lookup took an ffmpeg or ffprobe beside the test executable that was absent before and after it (a concurrent run created and removed it in between); the PATH fallback cannot be judged");
+    }
     ASSERT_TRUE( plan.foundOnPath );
     ASSERT_TRUE( probePlan.foundOnPath );
     ASSERT_EQ( appDirLookupText(appDirLookupCanonical(pathFfmpeg)),
