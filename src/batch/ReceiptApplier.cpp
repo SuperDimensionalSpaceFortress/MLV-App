@@ -1148,11 +1148,7 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             .arg( processingGetWhiteBalanceTint( processingObject ), 0, 'f', 9 )
             .arg( cachedFrameBefore )
             .arg( mlvObject->current_cached_frame_active ) );
-        const bool masterPassApplied =
-            applyHeadlessLookAssist( receipt, mlvObject, processingObject, analysisFrame, true );
-        if( !masterPassApplied )
-            restoreHeadlessRawLevels( levelsBeforeAutoFix, receipt, mlvObject, processingObject );
-        return masterPassApplied;
+        return applyHeadlessLookAssist( receipt, mlvObject, processingObject, analysisFrame, true );
     }
     // The window-lit check runs on copies (the GUI does the same; see there): by colour alone it only logs; it APPLIES
     // when the aperture-bounded exposure rules night out and a verified surface backs the balance. Never in master's pass.
