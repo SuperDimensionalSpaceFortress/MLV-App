@@ -35,6 +35,11 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 static QString repo_receipt_path_for_apply(const QString & name)
@@ -3284,18 +3289,26 @@ TEST(BatchExportFormat, R8PrecedenceFixtureLeavesAFileReplacedAfterItClosedIt)
     const QString probe = root + QStringLiteral("/destructor/")
         + appDirLookupPackagedName(QStringLiteral("ffprobe"));
 
+    QByteArray sameSizeReplacement;
     {
         AppDirLookupEnvironmentFixture fixture;
         ASSERT_TRUE( fixture.createBesideExe(ffmpeg, QByteArray("MZ-app-dir-copy"))
                      == AppDirLookupCreate::Created );
         ASSERT_TRUE( fixture.createBesideExe(untouched, QByteArray("MZ-app-dir-copy"))
                      == AppDirLookupCreate::Created );
-        ASSERT_TRUE( appDirLookupReplaceClosedFile(ffmpeg, QByteArray("packager-ffmpeg")) );
+        /* r9, sol r8 H1: the fixture appends a pid and token, so the replacement is padded to
+         * exactly the length the fixture wrote; the size check passes and only the byte
+         * comparison can tell the two apart. */
+        const QByteArray ours = fixture.written.value(ffmpeg);
+        sameSizeReplacement = QByteArray("packager-ffmpeg").leftJustified(ours.size(), '#', true);
+        ASSERT_TRUE( sameSizeReplacement.size() == ours.size() );
+        ASSERT_TRUE( sameSizeReplacement != ours );
+        ASSERT_TRUE( appDirLookupReplaceClosedFile(ffmpeg, sameSizeReplacement) );
         /* Nothing of the fixture's own remains: the replacement is not its file. */
         ASSERT_TRUE( fixture.removeBesideExe() );
         ASSERT_TRUE( fixture.besideExe.isEmpty() );
     }
-    ASSERT_EQ( std::string("packager-ffmpeg"), appDirLookupReadAll(ffmpeg) );
+    ASSERT_EQ( sameSizeReplacement.toStdString(), appDirLookupReadAll(ffmpeg) );
     ASSERT_FALSE( QFileInfo::exists(untouched) );
 
     {
@@ -3311,8 +3324,9 @@ TEST(BatchExportFormat, R8PrecedenceFixtureLeavesAFileReplacedAfterItClosedIt)
  * the executable; process A (a concurrent run of the precedence test) creates both; B resolves
  * them; A removes both before B checks again. B's guard then sees absence on both sides of the
  * lookup. B must skip with a logged reason, never fail its PATH assertions. Staged through the
- * appDirLookupPathFallbackCheck hooks. */
-TEST(BatchExportFormat, R8PathFallbackCheckSkipsWhenAConcurrentRunCameAndWentDuringTheLookup)
+ * appDirLookupPathFallbackCheck hooks.
+ * r9: the body is a function so the R9 test can run it under a TEMP that makes setup skip. */
+static void appDirLookupStagedConcurrentRunCheck()
 {
     const QString appDir = QCoreApplication::applicationDirPath();
     ASSERT_FALSE( appDir.isEmpty() );
@@ -3358,6 +3372,122 @@ TEST(BatchExportFormat, R8PathFallbackCheckSkipsWhenAConcurrentRunCameAndWentDur
     ASSERT_TRUE( concurrentRun.besideExe.isEmpty() );
     ASSERT_TRUE( concurrentRun.leftForeign.isEmpty() );
     ASSERT_EQ( std::string("skipped"), outcome.substr(0, outcome.find(':')) );
+}
+
+TEST(BatchExportFormat, R8PathFallbackCheckSkipsWhenAConcurrentRunCameAndWentDuringTheLookup)
+{
+    appDirLookupStagedConcurrentRunCheck();
+}
+
+/* r9: points the temporary directory (TMP and TEMP on Windows, which reads TMP first; TMPDIR
+ * elsewhere) at one directory for its lifetime and restores each variable on every exit path. */
+struct AppDirLookupTempEnvironment
+{
+    explicit AppDirLookupTempEnvironment(const QString & dir)
+    {
+#ifdef Q_OS_WIN
+        const char * const names[] = { "TMP", "TEMP" };
+#else
+        const char * const names[] = { "TMPDIR" };
+#endif
+        for( const char * name : names )
+        {
+            saved.push_back({ name, qEnvironmentVariableIsSet(name), qgetenv(name) });
+            qputenv(name, QDir::toNativeSeparators(dir).toLocal8Bit());
+        }
+    }
+    ~AppDirLookupTempEnvironment()
+    {
+        for( const Saved & entry : saved )
+        {
+            if( entry.wasSet )
+                qputenv(entry.name, entry.value);
+            else
+                qunsetenv(entry.name);
+        }
+    }
+    struct Saved { const char * name; bool wasSet; QByteArray value; };
+    std::vector<Saved> saved;
+};
+
+/* r9, sol r8 B1, literal input: TEMP=C:\Temp;Cache (a temporary directory whose path holds the
+ * PATH list separator), a writable test directory, both app-dir names absent. The staged B3
+ * check stages both files beside the executable, then the PATH helper skips (its tools
+ * directory cannot be one PATH entry) BEFORE the lookup, so the staged removal never ran. That
+ * setup skip must come out as a logged SKIP: never a FAIL, never a PASS. */
+TEST(BatchExportFormat, R9StagedConcurrentRunCheckPropagatesASetupSkip)
+{
+    QTemporaryDir base;
+    ASSERT_TRUE( base.isValid() );
+    const QString separatorTemp = QDir::cleanPath(base.path()) + QStringLiteral("/Temp")
+        + QDir::listSeparator() + QStringLiteral("Cache");
+    ASSERT_TRUE( QDir().mkpath(separatorTemp) );
+    std::string outcome;
+    {
+        AppDirLookupTempEnvironment temp(separatorTemp);
+        ASSERT_TRUE( QDir::tempPath().contains(QDir::listSeparator()) );
+        try
+        {
+            appDirLookupStagedConcurrentRunCheck();
+            outcome = "passed";
+        }
+        catch( const minitest::Skip & skip )
+        {
+            outcome = std::string("skipped: ") + skip.what();
+        }
+        catch( const minitest::Failure & failure )
+        {
+            outcome = std::string("failed: ") + failure.what();
+        }
+    }
+    std::printf("[R9-B1] temp=%s outcome=%s\n", qPrintable(separatorTemp), outcome.c_str());
+    std::fflush(stdout);
+    ASSERT_EQ( std::string("skipped"), outcome.substr(0, outcome.find(':')) );
+}
+
+/* r9, sol r8 B2 (the part the hub ruled in scope) and adversary 9fe53c7a A5, literal input: the
+ * fixture created ffmpeg(.exe) and closed it, and a directory was then put under that name (both
+ * platforms); on Unix, ffprobe was also replaced by a FIFO with no writer. Cleanup must leave
+ * each one in place as not ours, name it, and RETURN: never report it as a file it failed to
+ * remove, and never block opening the FIFO. */
+TEST(BatchExportFormat, R9PrecedenceFixtureLeavesAReplacementThatIsNotARegularFile)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE( dir.isValid() );
+    const QString root = QDir::cleanPath(dir.path());
+    const QString ffmpeg = root + QStringLiteral("/")
+        + appDirLookupPackagedName(QStringLiteral("ffmpeg"));
+    {
+        AppDirLookupEnvironmentFixture fixture;
+        ASSERT_TRUE( fixture.createBesideExe(ffmpeg, QByteArray("MZ-app-dir-copy"))
+                     == AppDirLookupCreate::Created );
+        ASSERT_TRUE( QFile::remove(ffmpeg) );
+        ASSERT_TRUE( QDir().mkdir(ffmpeg) );
+        const bool cleaned = fixture.removeBesideExe();
+        std::printf("[R9-B2] directory replacement cleaned=%d left=%d pending=%d\n",
+                    cleaned ? 1 : 0, int(fixture.leftForeign.size()), int(fixture.besideExe.size()));
+        std::fflush(stdout);
+        ASSERT_TRUE( cleaned );
+        ASSERT_TRUE( fixture.besideExe.isEmpty() );
+        ASSERT_TRUE( fixture.leftForeign == QStringList{ ffmpeg } );
+    }
+    ASSERT_TRUE( QFileInfo(ffmpeg).isDir() );
+#ifndef Q_OS_WIN
+    const QString probe = root + QStringLiteral("/ffprobe");
+    {
+        AppDirLookupEnvironmentFixture fixture;
+        ASSERT_TRUE( fixture.createBesideExe(probe, QByteArray("MZ-app-dir-copy"))
+                     == AppDirLookupCreate::Created );
+        ASSERT_TRUE( QFile::remove(probe) );
+        ASSERT_TRUE( ::mkfifo(QFile::encodeName(probe).constData(), 0600) == 0 );
+        ASSERT_TRUE( fixture.removeBesideExe() );
+        ASSERT_TRUE( fixture.besideExe.isEmpty() );
+        ASSERT_TRUE( fixture.leftForeign == QStringList{ probe } );
+    }
+    struct stat fifoState;
+    ASSERT_TRUE( ::lstat(QFile::encodeName(probe).constData(), &fifoState) == 0 );
+    ASSERT_TRUE( S_ISFIFO(fifoState.st_mode) );
+#endif
 }
 
 #ifdef Q_OS_WIN
