@@ -231,8 +231,8 @@ struct LiveCounts
  *  *compareAttempted says whether compareInput ran.
  *  sol r17 #2: the counts preGate() read are a sample. The recon worker configures while the GUI thread presents, so a
  *  lookahead frame's set_iso_pattern (or set_clip / set_luts) can land after that read and before or during the compare.
- *  A hit is therefore authorized only by the counts read again AFTER the compare: if any moved since the warm, the
- *  outcome is ReconConfiguredSinceWarm. The first read stays (it skips the compare when a configure is already visible).
+ *  A hit is therefore authorized only by the counts read again AFTER the compare, twice (adversary r18 A1: a torn
+ *  single read): if any moved since the warm, the outcome is ReconConfiguredSinceWarm. The first read stays (it skips the compare when a configure is already visible).
  *  Only a hit is rechecked; every other outcome already runs AMaZE, and a content miss keeps its name (the dump's
  *  trigger). */
 template <typename ReadLiveCounts, typename CompareInput>
@@ -257,9 +257,15 @@ inline Reason decide( bool enabled,
     const bool completed = compareInput( &equal, &why );
     const Reason compared = afterCompare( completed, equal, why );
     if( compared != Reason::Hit ) return compared;
-    const LiveCounts after = readLiveCounts();
-    if( configuredSinceWarm( warmKey, after.setClip, after.setLuts, after.setPattern ) )
-        return Reason::ReconConfiguredSinceWarm;
+    // adversary r18 A1: one read of three counters is not one instant (a set_luts can land between its LUT and pattern
+    // reads). The counters only ever increase (llrawproc.c InterlockedIncrement64, never reset; full-barrier reads), so
+    // two whole reads that both equal the warm key prove every counter held the warm value at one instant between them
+    for( int pass = 0; pass < 2; ++pass )
+    {
+        const LiveCounts after = readLiveCounts();
+        if( configuredSinceWarm( warmKey, after.setClip, after.setLuts, after.setPattern ) )
+            return Reason::ReconConfiguredSinceWarm;
+    }
     return Reason::Hit;
 }
 

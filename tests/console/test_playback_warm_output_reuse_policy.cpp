@@ -232,12 +232,28 @@ struct InjectedPresent
     int compares = 0;
     bool equal = true;                                   // what the exact compare reports
     std::function<void()> duringCompare;                 // a configure landing after the gate's read
+    // adversary r18 A1: the three counters are read one after another (GpuDisplayWindow's readLiveConfigureCounts);
+    // midRead(read, field) runs after field 0 (clip), 1 (luts) or 2 (pattern) of read number `read` was copied
+    std::function<void(int, int)> midRead;
+
+    playback_warm_output_reuse::LiveCounts readSequentially()
+    {
+        ++reads;
+        playback_warm_output_reuse::LiveCounts now;
+        now.setClip = live.setClip;
+        if (midRead) midRead(reads, 0);
+        now.setLuts = live.setLuts;
+        if (midRead) midRead(reads, 1);
+        now.setPattern = live.setPattern;
+        if (midRead) midRead(reads, 2);
+        return now;
+    }
 
     Reason run(const Key &warm, const Key &present, bool *compareAttempted)
     {
         return playback_warm_output_reuse::decide(
             true, true, warm, present, false, false,
-            [this]() { ++reads; return live; },
+            [this]() { return readSequentially(); },
             [this](bool *sameInput, QString *why) {
                 ++compares;
                 if (duringCompare) duringCompare();
@@ -297,7 +313,7 @@ TEST(PlaybackWarmOutputReusePolicy, AClipOrLutsConfigureAfterTheGateReadIsNeverA
     }
 }
 
-// nothing configures: still a hit, and the counts were read before and after the compare
+// nothing configures: still a hit, and the counts were read once before the compare and twice after it
 TEST(PlaybackWarmOutputReusePolicy, WithNoConfigureTheDecisionIsAHitAndReadsTheCountsAfterTheCompare)
 {
     const Key w = warmKey();
@@ -307,8 +323,49 @@ TEST(PlaybackWarmOutputReusePolicy, WithNoConfigureTheDecisionIsAHitAndReadsTheC
     ASSERT_EQ(std::string("hit"), name(r));
     ASSERT_TRUE(reuse(r));
     ASSERT_TRUE(attempted);
-    ASSERT_EQ(2, present.reads);
+    ASSERT_EQ(3, present.reads);
     ASSERT_EQ(1, present.compares);
+}
+
+// adversary r18 A1, the row as written: warm (3,5,11), equal compare; during the first read after the compare, after
+// its LUT read of 5 and before its pattern read, lookahead frame 1244 runs set_luts (5 -> 6). That read is the torn
+// tuple (3,5,11). Expected recon_configured_since_warm, never a hit.
+TEST(PlaybackWarmOutputReusePolicy, AConfigureBetweenTwoCounterReadsAfterTheCompareIsNeverAHit)
+{
+    const Key w = warmKey();
+    InjectedPresent present = atWarmCounts(w);
+    present.midRead = [&present](int read, int field) {
+        if (read == 2 && field == 1) present.live.setLuts = 6;
+    };
+    bool attempted = false;
+    const Reason r = present.run(w, presentKey(), &attempted);
+    ASSERT_EQ(std::string("recon_configured_since_warm"), name(r));
+    ASSERT_FALSE(reuse(r));
+    ASSERT_TRUE(attempted);
+}
+
+// the class: every tear position after the compare (a counter advanced after this read copied it), for each counter
+// already copied in that read
+TEST(PlaybackWarmOutputReusePolicy, EveryTornReadAfterTheCompareIsRefused)
+{
+    const Key w = warmKey();
+    for (int field = 0; field < 3; ++field)
+    {
+        for (int counter = 0; counter <= field; ++counter)
+        {
+            InjectedPresent present = atWarmCounts(w);
+            present.midRead = [&present, field, counter](int read, int at) {
+                if (read != 2 || at != field) return;
+                if (counter == 0) ++present.live.setClip;
+                else if (counter == 1) ++present.live.setLuts;
+                else ++present.live.setPattern;
+            };
+            bool attempted = false;
+            const Reason r = present.run(w, presentKey(), &attempted);
+            ASSERT_EQ(std::string("recon_configured_since_warm"), name(r));
+            ASSERT_FALSE(reuse(r));
+        }
+    }
 }
 
 // a refusal before the compare does not compare and reads once; a content mismatch stays content_mismatch (the dump's

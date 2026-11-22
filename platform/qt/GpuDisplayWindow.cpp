@@ -1449,7 +1449,7 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
             // WARM-RECON-DETERMINISM-1 F-key: this present's recon constants (the state its recon ran with)
             presentKey.state = playback_warm_output_reuse::preparedStateFrom( *state );
             // sol r17 #2: the recon worker configures (a lookahead frame's set_iso_pattern) while this GUI thread
-            // presents, so decide() reads the live counts for the gate AND again after the compare
+            // presents, so decide() reads the live counts for the gate AND twice after the compare (adversary r18 A1)
             const auto readLiveConfigureCounts = []()
             {
                 playback_warm_output_reuse::LiveCounts now;
