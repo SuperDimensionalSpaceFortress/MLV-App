@@ -324,8 +324,9 @@ class VenueChainRunnerTests(unittest.TestCase):
         self.assertGreater(found, 0, f"mutation anchor not in the runner: {old!r}")
         if count is not None:
             self.assertEqual(found, count, f"mutation anchor count changed: {old!r}")
+        # EVERY-FRAME-VISUAL-LEG-SPEC-1 r3: the siblings are derived from the RUNNER (it imports DualVenueRunner.psm1 on every branch now), THEN the mutated text is written over the runner copy
+        copy_with_siblings(RUNNER, d)
         (d / RUNNER.name).write_text(text.replace(old, new), encoding="utf-8")
-        copy_with_siblings(MODULE, d)
         return d / RUNNER.name
 
     def write_claim(self, pid: int, created_iso: str, expires: datetime, run_dir: str = "C:\\elsewhere\\lane-OTHER") -> str:
@@ -402,6 +403,32 @@ class VenueChainRunnerTests(unittest.TestCase):
         self.run_chain(rd, [self.specs[0]], runner=mut, deadline_sec=8)
         pre = [c for c in self.quiet_calls() if "maxWait=600" in c]
         self.assertTrue(pre and all("ownClaimHeld=True" in c for c in pre), pre)
+
+    def test_a_plan_spec_the_leg_would_refuse_is_refused_before_any_probe_or_claim(self) -> None:
+        """EVERY-FRAME-VISUAL-LEG-SPEC-1 r2 adversary A2 (major, introduced): the chain took a claim and probed the venue, and only then did the leg refuse a speed spec that
+        is unpaced and keeps the capture tail (or whose opt-out reason is blank), so a refusable spec cost a claim, a probe and a queue place. The leg's shape predicate now runs
+        on EVERY plan spec (the good first one too) before CHAIN_START: exit 2, a LEG_SPEC_INVALID line, no quiet probe, no leg call and no claim file."""
+        unpaced_keeps_tail = {"legId": "fx-unpaced", "legType": "speed", "generatorArgs": {"unpaced": True}}
+        blank_reason = {"legId": "fx-blank", "legType": "speed", "generatorArgs": {"unpaced": True}, "visualCapture": False, "visualCaptureOptOutReason": " " * 12}
+        for label, spec in (("unpaced-keeps-capture-tail", unpaced_keeps_tail), ("blank-opt-out-reason", blank_reason)):
+            with self.subTest(label):
+                bad = self.case / f"{label}.json"
+                bad.write_text(json.dumps(spec), encoding="utf-8")
+                rd = self.case / f"lane-A2-{label}"
+                r = self.run_chain(rd, [self.specs[0], bad])
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("LEG_SPEC_INVALID", r.stdout + r.stderr)
+                self.assertIn(bad.name, r.stdout + r.stderr)
+                self.assertEqual(self.quiet_calls(), [], "no quiet probe may run for a spec the leg refuses")
+                self.assertEqual(self.leg_calls(), [], "no leg may start (not even the good first one)")
+                self.assertFalse(self.claim_path.exists(), "no claim may be taken")
+                self.assertFalse((rd / "chain.log").exists() and "CHAIN_START" in (rd / "chain.log").read_text(encoding="utf-8"), "refused before CHAIN_START")
+        good = self.case / "fx-good-unpaced.json"
+        good.write_text(json.dumps({"legId": "fx-good", "legType": "speed", "generatorArgs": {"unpaced": True}, "visualCapture": False,
+                                    "visualCaptureOptOutReason": "an unpaced Play holds its last frame"}), encoding="utf-8")
+        ok = self.run_chain(self.case / "lane-A2-good", [good], deadline_sec=30)
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+        self.assertTrue(self.leg_calls() and all("fx-good-unpaced.json" in c for c in self.leg_calls()), self.leg_calls())   # the compliant spec still runs
 
     # ---------------------------------------------------------------- EXIT 6
     def test_exit6_not_measured_leg_is_not_run_and_the_chain_stops(self) -> None:
@@ -1115,8 +1142,8 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         d = Path(tempfile.mkdtemp(prefix="mut-", dir=self.case))
         text = RUNNER.read_text(encoding="utf-8")
         self.assertEqual(text.count(old), count, f"mutation anchor count changed: {old!r}")
+        copy_with_siblings(RUNNER, d)   # r3: siblings first (the runner imports DualVenueRunner.psm1), then the mutated runner text over the copy
         (d / RUNNER.name).write_text(text.replace(old, new), encoding="utf-8")
-        copy_with_siblings(MODULE, d)
         return d / RUNNER.name
 
     # ---------------------------------------------------------------- (a) after each Bachelor leg, when ultra-magnus is idle

@@ -8134,6 +8134,8 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertEqual(spec["legId"], Path(rel).stem)
             self.assertEqual(spec["legType"], "look")
             self.assertEqual(spec["clipId"], "M16-1243")
+            self.assertEqual(spec["displayMode"], "windowed", "r3 adversary A5: the leg's name says windowed")
+            self.assertEqual(spec["scaleFactor"], 1, "r3 adversary A5: the leg's name says s1")
             self.assertEqual(sorted(spec["backends"]), ["cpu", "cuda"])
             self.assertIs(spec["generatorArgs"]["unpaced"], True, "drop-frame off: the only key that sends -DropFrameMode off")
             self.assertEqual(spec["generatorArgs"]["swapInterval"], 0)
@@ -8183,6 +8185,48 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertEqual(out.returncode, 0, out.stderr)
                 self.assertIn("DVE_LEG_SPEC_INVALID", out.stdout, f"{label}: {out.stdout}")
                 self.assertNotIn("NOT_REFUSED", out.stdout, label)
+
+    def test_a_speed_leg_capture_opt_out_needs_one_shared_non_blank_reason_before_a_lease_opens(self) -> None:
+        """EVERY-FRAME-VISUAL-LEG-SPEC-1 r2 adversary A1 (major, introduced): m16-1243-headroom-unpaced-windowed-s1.json with visualCapture false and a
+        visualCaptureOptOutReason of twelve ASCII spaces passed the schema (minLength 12) and Get-DvLegSpecShapeRefusal, so a lease batch / chain opened its lease and
+        Get-DvVisualCaptureRequest then threw (LEG_FAILED exit 7, lease charged). ONE predicate (Get-DvVisualCaptureOptOutRefusal) now decides whether a capture opt-out
+        is valid; the shape predicate and Get-DvVisualCaptureRequest both call it, and the schema's `pattern` requires a non-space character. Every case below must be
+        refused by the schema, by the shape predicate AND by the request, and the compliant spec by none of them."""
+        base = json.loads((DV / "legs/m16-1243-headroom-unpaced-windowed-s1.json").read_text(encoding="utf-8"))
+        self.jsonschema.validate(base, self.schema)
+        paced_gen = {k: v for k, v in base["generatorArgs"].items() if k not in ("unpaced", "swapInterval")}
+        paced = {k: v for k, v in base.items() if k not in ("presentTearingExpectedReason", "visualCapture", "visualCaptureOptOutReason")}
+        paced["generatorArgs"] = paced_gen
+        self.jsonschema.validate(paced, self.schema)
+        real_reason = base["visualCaptureOptOutReason"]
+        bad = {
+            "ws-ascii-unpaced": dict(base, visualCaptureOptOutReason=" " * 12),
+            "ws-tab-nbsp-unpaced": dict(base, visualCaptureOptOutReason="\t " * 6),
+            "ws-ascii-paced": dict(paced, visualCapture=False, visualCaptureOptOutReason=" " * 12),
+            "reason-without-opt-out-paced": dict(paced, visualCaptureOptOutReason=real_reason),
+            "string-flag-paced": dict(paced, visualCapture="false", visualCaptureOptOutReason=real_reason),
+        }
+        good = {"compliant-unpaced": base, "compliant-paced-opt-out": dict(paced, visualCapture=False, visualCaptureOptOutReason=real_reason), "paced-default": paced}
+        script = ("Import-Module '%s' -Force; foreach ($f in Get-ChildItem -LiteralPath '%s' -Filter *.json) { "
+                  "$s = Get-Content -Raw -LiteralPath $f.FullName | ConvertFrom-Json -NoEnumerate; $r = Get-DvLegSpecShapeRefusal -Spec $s; "
+                  "$q = try { $null = Get-DvVisualCaptureRequest -Spec $s; 'REQ_OK' } catch { 'REQ_THREW' }; "
+                  "$p = $(if ($null -eq $r) { 'SHAPE_OK' } else { 'SHAPE_REFUSED' }); \"$($f.BaseName)|$p|$q\" }")
+        with tempfile.TemporaryDirectory() as tmp:
+            for label, spec in {**bad, **good}.items():
+                (Path(tmp) / f"{label}.json").write_text(json.dumps(spec), encoding="utf-8")
+            out = run_pwsh(["-NoProfile", "-Command", script % (DV / "DualVenueRunner.psm1", tmp)])
+        self.assertEqual(out.returncode, 0, out.stderr)
+        rows = {line.split("|")[0]: line.split("|")[1:] for line in out.stdout.splitlines() if line.count("|") == 2}
+        self.assertEqual(sorted(rows), sorted({**bad, **good}), out.stdout)
+        for label in bad:
+            self.assertEqual(rows[label], ["SHAPE_REFUSED", "REQ_THREW"], f"{label}: the shape predicate and the request must agree before a lease opens")
+        for label in good:
+            self.assertEqual(rows[label], ["SHAPE_OK", "REQ_OK"], label)
+        for label, spec in bad.items():
+            with self.assertRaises(self.jsonschema.ValidationError, msg=f"schema: {label}"):
+                self.jsonschema.validate(spec, self.schema)
+        for label, spec in good.items():
+            self.jsonschema.validate(spec, self.schema)
 
     def test_the_hand_listed_shipped_legs_are_exactly_the_legs_directory(self) -> None:
         self.assertEqual(sorted(SHIPPED_LEGS), sorted("legs/" + p.name for p in (DV / "legs").glob("*.json")), "SHIPPED_LEGS drifted from the legs/ directory")
@@ -8323,6 +8367,8 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "EVERY-FRAME-VISUAL-LEG-SPEC-1":   # the every-frame (unpaced) windowed s1 look leg: its in-pass contact sheet is the strip
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertIn("legs/" + path.name, EVERYFRAME_VISUAL_LEGS, path.name)
+                self.assertEqual(spec["displayMode"], "windowed", path.name)   # r3 adversary A5: the windowed-s1 name is a claim the inventory pins
+                self.assertEqual(spec["scaleFactor"], 1, path.name)
             elif spec["card"] == "HFR-NATIVE-60FPS-FULLRES-1":   # the Look Assist ON control of the native s1 pair (its -nola twin is classic)
                 self.assert_hfr_native_s1_flavored_leg(spec, path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)

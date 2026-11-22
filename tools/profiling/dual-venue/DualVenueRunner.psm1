@@ -3475,13 +3475,10 @@ function Get-DvLegSpecShapeRefusal {
     $isLookLeg = ($null -ne $legTypeProp -and $legTypeProp.Value -ceq 'look')
     # EVERY-FRAME-VISUAL-LEG-SPEC-1 r1 (adversary pass 2 A1): a SPEED leg that runs unpaced says visualCapture false (leg-spec.schema.json). The unpaced Play holds once its
     # required source frames are consumed (MainWindow.cpp playbackHandling), so the untimed capture tail would show ONE frame six times and still read verdict OK.
-    # Refused here for the leg and every batch preflight alike (scalar, -LegSet and plan), before a lease opens; Get-DvVisualCaptureRequest keeps the same refusal as its own guard.
-    if (-not $isLookLeg -and ($null -eq $legTypeProp -or $legTypeProp.Value -cne 'export') -and $null -ne $genArgsProp -and (Get-DvProp $genArgsProp.Value 'unpaced') -eq $true) {
-        $captureProp = $Spec.PSObject.Properties['visualCapture']
-        if ($null -eq $captureProp -or $captureProp.Value -isnot [bool] -or $captureProp.Value) {
-            return 'an unpaced speed leg cannot keep the visual capture tail (the unpaced Play holds once its source frames are consumed, so every tail capture is one frame): set visualCapture false with a visualCaptureOptOutReason'
-        }
-    }
+    # Refused here for the leg and every batch preflight alike (scalar, -LegSet and plan), before a lease opens. r2 (adversary A1): the WHOLE capture opt-out rule (a blank reason, a
+    # non-boolean flag, a reason without the opt-out too) is ONE function, Get-DvVisualCaptureOptOutRefusal, which Get-DvVisualCaptureRequest calls as well, so the two cannot disagree.
+    $optOutRefusal = Get-DvVisualCaptureOptOutRefusal -Spec $Spec
+    if ($null -ne $optOutRefusal) { return $optOutRefusal }
     # r7 (adversary r6 A2): a look leg reads look.* before its receipt exists, so a look leg with NO look is refused here too (it threw
     # "Cannot index into a null array" after the batch had opened its lease).
     if ($isLookLeg -and $null -eq $Spec.PSObject.Properties['look']) { return 'a look leg needs look (one JSON object); it is absent' }
@@ -3846,28 +3843,52 @@ $script:VisualFlatViewportStd = 1.0
 $script:VisualHashSize = @(64, 36)
 $script:VisualDiffSize = @(160, 90)
 
+function Get-DvVisualCaptureOptOutRefusal {
+    <#
+    .SYNOPSIS
+    The ONE decision on whether a spec's visual-capture opt-out is valid; $null when it is, else the refusal text. Get-DvLegSpecShapeRefusal (before any lease, claim or
+    probe) and Get-DvVisualCaptureRequest (after the lease, which throws DVE_LEG_SPEC_INVALID with this text) both call it, so the two can never disagree
+    (EVERY-FRAME-VISUAL-LEG-SPEC-1 r2 adversary A1: a reason of twelve spaces passed the pre-lease predicate and the request then threw after the lease was charged).
+    Rule order: an export leg captures nothing (null); an unpaced SPEED leg whose visualCapture is not exactly false cannot keep the capture tail (an unpaced Play holds once
+    its source frames are consumed, so every tail capture is one frame); a visualCapture that is no boolean; visualCapture false needs a string reason with a non-space
+    character; a reason without visualCapture false.
+    #>
+    param($Spec)
+    $legType = [string](Get-DvProp $Spec 'legType')
+    if ($legType -ceq 'export') { return $null }
+    $flag = $Spec.PSObject.Properties['visualCapture']
+    $reason = $Spec.PSObject.Properties['visualCaptureOptOutReason']
+    $keepsTail = ($null -eq $flag -or $flag.Value -isnot [bool] -or $flag.Value)
+    if ($legType -cne 'look' -and $keepsTail -and ((Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'unpaced') -eq $true)) {
+        return 'an unpaced speed leg cannot keep the visual capture tail (the unpaced Play holds once its source frames are consumed, so every tail capture is one frame): set visualCapture false with a visualCaptureOptOutReason'
+    }
+    if ($null -ne $flag -and $flag.Value -isnot [bool]) { return 'visualCapture must be a boolean' }
+    if ($null -ne $flag -and -not $flag.Value) {
+        if ($null -eq $reason -or $reason.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($reason.Value)) {
+            return 'visualCapture false needs a visualCaptureOptOutReason (a non-empty reason with a non-space character)'
+        }
+        return $null
+    }
+    if ($null -ne $reason) { return 'visualCaptureOptOutReason is only for visualCapture false' }
+    $null
+}
+
 function Get-DvVisualCaptureRequest {
     <#
     .SYNOPSIS
     Does this leg keep window captures? Every SPEED leg does (an absent visualCapture means on) unless its spec says visualCapture false
     WITH a visualCaptureOptOutReason; a look leg never runs this capture (applies = false: its contact sheet is the look). An opt-out
-    without a reason, or a reason without the opt-out, is a malformed spec: DVE_LEG_SPEC_INVALID.
+    without a reason, or a reason without the opt-out, is a malformed spec: DVE_LEG_SPEC_INVALID (the text is Get-DvVisualCaptureOptOutRefusal's).
     #>
     param([Parameter(Mandatory)]$Spec)
+    # EVERY-FRAME-VISUAL-LEG-SPEC-1 r2 (adversary A1): one shared predicate, the same one Get-DvLegSpecShapeRefusal runs before a lease opens.
+    $refusal = Get-DvVisualCaptureOptOutRefusal -Spec $Spec
+    if ($null -ne $refusal) { throw "DVE_LEG_SPEC_INVALID $refusal" }
     # EXPORT-VENUE-LEG-1: an export leg plays nothing, so it never captures (and the shape refusal refuses visualCapture on it)
     $applies = ([string](Get-DvProp $Spec 'legType') -cnotin @('look', 'export'))
     $flag = $Spec.PSObject.Properties['visualCapture']
-    $reason = $Spec.PSObject.Properties['visualCaptureOptOutReason']
-    if ($null -ne $flag -and $flag.Value -isnot [bool]) { throw 'DVE_LEG_SPEC_INVALID visualCapture must be a boolean' }
     if ($null -ne $flag -and -not $flag.Value) {
-        if ($null -eq $reason -or [string]::IsNullOrWhiteSpace([string]$reason.Value)) { throw 'DVE_LEG_SPEC_INVALID visualCapture false needs a visualCaptureOptOutReason' }
-        return [pscustomobject]@{ applies = $applies; requested = $false; optOutReason = [string]$reason.Value }
-    }
-    if ($null -ne $reason) { throw 'DVE_LEG_SPEC_INVALID visualCaptureOptOutReason is only for visualCapture false' }
-    # EVERY-FRAME-VISUAL-LEG-SPEC-1 r1 (adversary A1): an unpaced Play holds once its required source frames are consumed (MainWindow.cpp playbackHandling), so the
-    # untimed capture tail would show ONE frame six times and still read verdict OK. An unpaced speed leg opts out; an every-frame strip is an unpaced look leg's in-pass contact sheet.
-    if ($applies -and ((Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'unpaced') -eq $true)) {
-        throw 'DVE_LEG_SPEC_INVALID an unpaced speed leg cannot keep the visual capture tail (the unpaced Play holds once its source frames are consumed, so every tail capture is one frame): set visualCapture false with a visualCaptureOptOutReason'
+        return [pscustomobject]@{ applies = $applies; requested = $false; optOutReason = [string](Get-DvProp $Spec 'visualCaptureOptOutReason') }
     }
     [pscustomobject]@{ applies = $applies; requested = $applies; optOutReason = $null }
 }

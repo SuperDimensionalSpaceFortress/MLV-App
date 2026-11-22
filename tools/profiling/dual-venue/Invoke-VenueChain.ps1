@@ -175,8 +175,17 @@ function L([string]$Message) {
 
 # The planned legs: name, spec path, backend ('' = whatever the spec lists, as Invoke-VenueLeg does with no -Backend).
 $plan = [System.Collections.Generic.List[object]]::new()
+# EVERY-FRAME-VISUAL-LEG-SPEC-1 r3 (adversary A2): the leg's shape predicate runs on EVERY plan spec before CHAIN_START, a probe or a claim -- the -LegSpec branch imports the
+# runner module too (only -LegSet did), so a spec the leg would refuse after the claim (an unpaced speed leg that keeps the capture tail, a blank opt-out reason, ...)
+# is refused here with no claim and no probe, as Invoke-VenueLeaseBatch refuses it before its lease.
+Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force
+function Get-ChainSpecShapeRefusal([string]$Path) {
+    # '' when the spec is runnable, or one that does not parse (left to the leg, as before); else the shape predicate's text
+    try { $spec = [IO.File]::ReadAllText($Path) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop } catch { return '' }
+    try { $refusal = Get-DvLegSpecShapeRefusal -Spec $spec } catch { return "the leg spec cannot be shape-checked ($($_.Exception.Message -replace '\s+', ' '))" }
+    $(if ($null -ne $refusal) { [string]$refusal } else { '' })
+}
 if ($LegSet) {
-    Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force
     $setPath = Join-Path $here "legsets\$LegSet.json"
     $sp = try { Get-DvLegSetPlan -LegSetPath $setPath -Repeats $Repeats -Backend $(if ($Backend) { $Backend } else { '' }) } catch { Stop-Usage $_.Exception.Message }
     foreach ($e in $sp.plan) { $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend }) }
@@ -192,6 +201,11 @@ if ($LegSet) {
             $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f ($plan.Count + 1), $legId, $(if ($Backend) { $Backend } else { 'spec' })); spec = $path; backend = $(if ($Backend) { $Backend } else { '' }) })
         }
     }
+}
+
+foreach ($planSpec in @($plan | ForEach-Object { $_.spec } | Select-Object -Unique)) {
+    $planShapeRefusal = Get-ChainSpecShapeRefusal ([string]$planSpec)
+    if ($planShapeRefusal) { Stop-Usage "LEG_SPEC_INVALID '$planSpec' cannot be run: $planShapeRefusal" }
 }
 
 $results = [System.Collections.Generic.List[object]]::new()
@@ -327,6 +341,9 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
     if ($Trigger -ceq 'held' -and [DateTime]::UtcNow -lt $st.nextUtc) { return }
     $why = Get-VenueSupplementarySpecSkip -SpecPath $Leg.spec -Backend $Leg.backend
     if ($why) { Write-SuppSkip $Leg $Trigger $why '' $true; return }
+    # EVERY-FRAME-VISUAL-LEG-SPEC-1 r3 (adversary A2): the same shape check as the plan's, before the supplementary claim at the Request-VenueClaim below
+    $suppShape = Get-ChainSpecShapeRefusal ([string]$Leg.spec)
+    if ($suppShape) { Write-SuppSkip $Leg $Trigger 'LEG_SPEC_INVALID' $suppShape $true; return }
     if ($null -ne $stopReason) { Write-SuppSkip $Leg $Trigger 'CHAIN_STOPPED' "stopReason=$stopReason" $true; return }
     $remainSec = [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalSeconds)
     if ($remainSec -lt 60) { Write-SuppSkip $Leg $Trigger 'DEADLINE_NEAR' "remainingSec=$remainSec" $false; return }
