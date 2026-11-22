@@ -1378,8 +1378,10 @@ struct PinnedWindowPresents
     {
         lastFrame = sourceFrame;
         // r8 fix 1 (adversary A3): the start frame is the frame already on screen when Play began; a present of it (drop-frame
-        // Play's first tick can grant under one frame, and the start refresh submits it) is a repeat, never an outside present
-        if( armed() && sourceFrame == windowStart - 1 ) { ++repeats; return; }
+        // Play's first tick can grant under one frame, and the start refresh submits it) is a repeat, never an outside present.
+        // r9 (adversary pass 9 A3): only before the first counted present; after it, a present of the start frame is a seek back
+        // out of the window: outside (fail closed).
+        if( armed() && sourceFrame == windowStart - 1 && distinct == 0 && outside == 0 ) { ++repeats; return; }
         if( !sourceFrameInsideAdmittedWindow( sourceFrame, armed(), windowStart, windowFrames ) ) { ++outside; return; }
         unsigned char &shown = seen[static_cast<size_t>( sourceFrame - windowStart )];
         if( shown ) { ++repeats; return; }
@@ -1432,8 +1434,10 @@ inline bool pinnedIdentityFrameAdmitted( int64_t startFrame, int64_t targetPrese
 // venue log: the frame skipped by drawFrameReady's forward-only guard was already READY when the next one finished
 // (request_state rendering 0, ready slots 1), and the acquire took the newer one first. A paused redraw and unpinned drop-frame
 // Play keep the newest ready frame first (a stale frame there is rightly skipped).
-// r8 fix 1: a pinned capture's Play too, whatever the drop-frame mode: the automation forces drop-frame mode on
-// (isolateAutomationPacing; the r7 venue log reads drop_frame=1), so 77fa2218's every-frame-only rule never engaged there.
+// r8 fix 1: a pinned capture's Play too, whatever the drop-frame mode. The measured venue Play ran with drop-frame mode off
+// (playback_smoke.start drop_frame=0; the `automation.pacing_isolated ... drop_frame=1` line is logged at gui-smoke-entry, before
+// the capture's drop-frame-off setting applies), so the every-frame rule above is what engaged there. Oldest-first for a pinned
+// capture in drop-frame mode is a harmless extension for that input (adversary pass 8 A3), not the venue's cause.
 inline bool playbackAcquiresOldestReadyFirst( bool playing, bool dropFrameMode, bool pinnedCapture )
 {
     return playing && ( !dropFrameMode || pinnedCapture );
@@ -1505,12 +1509,14 @@ inline CutRange engineCutRangeForPlay( int cutIn, int cutOut, int totalFrames, b
     return raw;
 }
 
-// r9 RED stub: the raw cut-out (eaa5c9e0's rule), replaced by the fix.
+// REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r9 (adversary pass 9 A1): the last frame (0-based) a pinned capture's identity
+// admission (pinnedIdentityFrameAdmitted) judges against -- the last frame of the range the engine plays and the play gate
+// (checkPlayableWindow) judges, never the raw cut-out: with the collapsed-range repair on, a collapsed or inverted range plays to the
+// clip end. -1 when there is no valid range (no clip): every pinned capture is then refused (fail closed).
 inline int pinnedAdmissionLastFrame( int cutIn, int cutOut, int totalFrames, bool repairEnabled )
 {
-    (void)cutIn;
-    (void)repairEnabled;
-    return ( cutOut > 0 ? std::min( totalFrames, cutOut ) : totalFrames ) - 1;
+    const CutRange range = engineCutRangeForPlay( cutIn, cutOut, totalFrames, repairEnabled );
+    return range.valid ? range.cutOut - 1 : -1;
 }
 
 // evaluatePlayableWindow -- pure. positionFrame is the 0-based slider position; cutIn/cutOut are the raw

@@ -271,7 +271,7 @@ TEST(ResizePlaybackPolicyWiring, R8EveryFramePlayAcquiresOldestFirstAndThePinned
     const QString ready = mainWindowFunction(QStringLiteral("void MainWindow::drawFrameReady("));
     ASSERT_FALSE(ready.isEmpty());
     ASSERT_TRUE(ready.contains(QStringLiteral("playback_frame_range::playbackAcquiresOldestReadyFirst(")));
-    // r8 fix 1: a pinned capture's Play too (the automation forces drop-frame mode on: the r7 venue log's drop_frame=1)
+    // r8 fix 1: a pinned capture's Play too, in drop-frame mode as well (a harmless extension; the venue's measured Play ran drop_frame=0)
     ASSERT_TRUE(ready.contains(QStringLiteral(
         "ui->actionPlay->isChecked(), ui->actionDropFrameMode->isChecked(), m_playbackSmokeTargetPresentedFrames > 0 );")));
     ASSERT_TRUE(ready.contains(QStringLiteral("acquireLatestReadyFrame( &readyFrame, oldestReadyFirst )")));

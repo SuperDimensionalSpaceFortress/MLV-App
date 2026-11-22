@@ -4560,8 +4560,9 @@ TEST( PlaybackMeasuredLoopExit, ASeekOutOfTheWindowOrARawCountAboveNIsNeverThePi
 // as request serials: f was requested before f + 1), the other is acquired next, and the forward-only guard skips it when it is
 // older than the frame on screen. The present-path stop is modelled as MainWindow.cpp wires it: the raw count reached the target,
 // the source frames are consumed, AND pinnedPresentStopCount reached the target.
-// r8 fix 1 (adversary pass 8 on 77fa2218, and the same job's `automation.pacing_isolated ... drop_frame=1`: the automation forces
-// drop-frame mode on, so the venue's Play was drop-frame Play, where 77fa2218's oldest-first acquire never engaged). The replay also
+// r8 fix 1 (adversary pass 8 on 77fa2218; the measured venue Play ran drop_frame=0 -- `playback_smoke.start drop_frame=0` -- and the
+// `automation.pacing_isolated ... drop_frame=1` line is logged at gui-smoke-entry, before the capture's drop-frame-off setting
+// applies, so oldest-first for a pinned capture in drop-frame mode is a harmless extension, not the venue's cause). The replay also
 // models the measured-play loop's poll after each present (measuredPlayLoopShouldStop on the Reached state once the counter has
 // consumed the required frames, fed pinnedPresentStopCount as runGuiPlaybackSmoke feeds it), and `holdFrame` the unpaced
 // isolated hold (the playhead never passes it).
@@ -4661,8 +4662,8 @@ TEST( PlaybackMeasuredLoopExit, TheVenueSequenceNeverStopsOnARawCountAndEveryFra
     ASSERT_EQ( 471, venue.observed );
     ASSERT_TRUE( !venue.met );
 
-    // 2. The same ready pairs, acquired the way a pinned capture now acquires (oldest ready first, also in the drop-frame mode the
-    //    automation forces): no frame is skipped, the 480th distinct pinned-window frame is 600 (= start + N, the frame the capture
+    // 2. The same ready pairs, acquired the way a pinned capture now acquires (oldest ready first; in drop-frame mode too, a harmless
+    //    extension: the venue's measured Play ran drop_frame=0): no frame is skipped, the 480th distinct pinned-window frame is 600 (= start + N, the frame the capture
     //    script names), Play stops on it, nothing outside the window was presented, and the capture is met.
     const bool pinnedDropFramePlayOldestFirst = playback_frame_range::playbackAcquiresOldestReadyFirst( true, true, true );
     ASSERT_TRUE( pinnedDropFramePlayOldestFirst );                     // RED on 77fa2218: drop-frame Play took the newest first

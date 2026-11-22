@@ -10852,9 +10852,11 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r8 fix 1 (adversary A2): the pinned capture ends on source frame start + N, so that
     // frame must exist and lie before the last frame of the cut range (the end-of-clip stop can end Play before the last frame's
     // present is credited). Refused here, before the measured Play (exit 14), never played to a short count.
+    // r9 (adversary pass 9 A1): the cut range is the one the play gate judges and the engine plays (checkPlayableWindow's
+    // arguments: the collapsed-range repair unless the environment disables it), never the raw cut-out.
     {
-        const int pinCutOut = ui->spinBoxCutOut->value();
-        const int pinLastFrame = ( pinCutOut > 0 ? qMin( totalFrames, pinCutOut ) : totalFrames ) - 1;
+        const int pinLastFrame = playback_frame_range::pinnedAdmissionLastFrame(
+            ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(), totalFrames, !f3CutRangeRepairDisabledByEnvironment() );
         const int pinStartFrame = startFrame;
         if( !playback_frame_range::pinnedIdentityFrameAdmitted( pinStartFrame, options.targetPresentedFrames, pinLastFrame ) )
         {
@@ -10865,7 +10867,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 QStringLiteral("play_gate.refused"),
                 QStringLiteral("site=gui-smoke-measured reason=PINNED_FRAME_PAST_CLIP_END presented_frames=%1 start_frame=%2 last_frame=%3")
                     .arg( options.targetPresentedFrames ).arg( pinStartFrame ).arg( pinLastFrame ) );
-            err << "[GUI-SMOKE] ERROR: CLIP_TOO_SHORT (pinned frame " << pinStartFrame + options.targetPresentedFrames
+            err << "[GUI-SMOKE] ERROR: CLIP_TOO_SHORT (pinned frame " << static_cast<qlonglong>( pinStartFrame ) + options.targetPresentedFrames
                 << " is not before the last frame " << pinLastFrame << ")\n";
             return 14;
         }
@@ -11363,7 +11365,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     }
 
     // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r4 (Grok G4; adversary pass 6 A1/A2): the pinned capture is met only when every
-    // present was inside the admitted window [counter start, start + required - 1] and there were exactly N of them
+    // present was inside the admitted window (r8: [start + 1, start + N]) and there were exactly N of them
     // (pinnedCaptureObservedFrames). A dropped window frame made up by a frame past the window, a seek out of the window and back,
     // or a raw count above N ends here, on the unchanged not-met message, never a success. An all-inside run is judged as before.
     // r8: judged on the window ledger the stop also counts (pinnedWindowObservedFrames): the DISTINCT pinned-window frames shown
@@ -36095,7 +36097,8 @@ void MainWindow::drawFrameReady()
         {
             // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r8: every-frame Play takes the oldest ready frame, so a ready frame never
             // overtakes an older ready one that the forward-only guard below would then skip (r7 venue: 9 window frames lost).
-            // r8 fix 1: so does a pinned capture's Play, in the drop-frame mode the automation forces (that venue log: drop_frame=1)
+            // r8 fix 1: so does a pinned capture's Play in drop-frame mode, a harmless extension (adversary pass 8 A3), not the venue's
+            // cause: the measured venue Play ran drop_frame=0 (playback_smoke.start); the drop_frame=1 line is logged at gui-smoke-entry
             const bool oldestReadyFirst = playback_frame_range::playbackAcquiresOldestReadyFirst(
                 ui->actionPlay->isChecked(), ui->actionDropFrameMode->isChecked(), m_playbackSmokeTargetPresentedFrames > 0 );
             haveReadyFrame = targetAwareLookaheadAcquire
