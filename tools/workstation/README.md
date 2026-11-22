@@ -117,7 +117,11 @@ run for a dry run. The new-machine phases refuse to run on VIRTUAL-TEN unless yo
    kept with no failure, held or not; so is a bundle file the copy skips for its size or content, and a
    host file that is gone by the time it is judged is simply created. Fix what blocks the backup and re-run `-Phase Import`. A bundle
    zip that `tar` cannot expand completely (a truncated copy) is `IMPORT_BUNDLE_EXPAND_FAILED <path>` (exit 1):
-   nothing is snapshotted or copied from it, so copy the zip again and re-run.
+   nothing is snapshotted or copied from it, so copy the zip again and re-run. A bundle `settings.json` that
+   is not a JSON object (empty, a stray byte, cut off) is `IMPORT_SOURCE_DAMAGED_NOT_REPLACED <path>` (exit 1):
+   the host `settings.json` stays as it is, so copy the bundle again. A bundle file that cannot be read is
+   `IMPORT_COPY_FAILED <path>`. Every typed failure is registered before its line is logged, so a log that
+   cannot be written never hides the cause.
 
    **Remote URLs and git tracing (r17).** Every line the script prints or logs redacts a URL's user part
    up to the last `@` before the host, so an unencoded `@` in a password leaks nothing. It also drops

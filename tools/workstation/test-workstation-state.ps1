@@ -4249,6 +4249,58 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r4 import backup')) {
     Assert-That ($script:R4Settings -ceq '{"api.key":""}' -and @($r4f.Failures | Where-Object { $_ -like 'IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED*settings.json*' }).Count -eq 0) 'r4 import: a role-file skip of the host settings.json is kept (host untouched) and is not turned into a failed backup' "settings=[$($script:R4Settings)] failures=$($r4f.Failures -join ',')`n$($r4f.Out)"
 }
 
+# ================================================================ IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 r5: one probe, the failure named by its cause, a damaged settings.json refused, a record that survives its log
+# Sol r4 (head 9a303654): (1) a read-denied host file that vanished BETWEEN the gate's two existence probes kept its stale "unreadable" skip and was skipped with no record at all; (2) a bundle
+# file that could not be READ at the early gate was reported as an unavailable backup (the copy would have said IMPORT_COPY_FAILED); (3) a bundle settings.json that is empty or not JSON
+# replaced a valid host settings.json (the credential screen accepts any credential-free bytes); (4) a log append that threw while a refusal was being recorded skipped the typed failure.
+if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r5 import backup')) {
+    $r5Typed = { param($r, $name, $leaf) @($r.Failures | Where-Object { $_ -like "$name*$leaf*" }).Count }
+    $r5Unlock = { & icacls.exe $script:R3HostPath /remove:d '*S-1-1-0' 2>&1 | Out-Null; & icacls.exe "$($script:R3HostPath).aside" /remove:d '*S-1-1-0' 2>&1 | Out-Null; Remove-Item -LiteralPath "$($script:R3HostPath).aside" -Force -ErrorAction SilentlyContinue; $script:ImportExistsProbeHook = $null }
+    # (a) a read-denied host CLAUDE.md that goes away AFTER the first existence probe answered true and before the next: the bundle copy is created, not silently skipped
+    $script:R5Moved = $false
+    $r5a = Invoke-R3Import 'r5a' -3 0 {
+        param($st, $sp)
+        & icacls.exe $script:R3HostPath /deny '*S-1-1-0:(RD)' 2>&1 | Out-Null
+        $script:ImportExistsProbeHook = { param($p, $r) if ($r -and -not $script:R5Moved -and $p -like '*\.claude\CLAUDE.md') { $script:R5Moved = $true; Move-Item -LiteralPath $p -Destination "$p.aside" } }
+    } $null $r5Unlock
+    Assert-That ($script:R5Moved -and $r5a.Host -ceq 'FROM-BUNDLE' -and $r5a.Failures.Count -eq 0) 'r5 import: a read-denied host CLAUDE.md that vanished between the gate''s two existence probes is created from the bundle (never skipped with no record)' "moved=$($script:R5Moved) host=[$($r5a.Host)] failures=$($r5a.Failures -join ',')`n$($r5a.Out)"
+    # (b) the bundle file cannot be READ when the gate looks (read denied on the snapshot after the inspection) and the backup is unavailable: IMPORT_COPY_FAILED, not a backup refusal
+    $script:R5Src = $null
+    $r5b = Invoke-R3Import 'r5b' -3 0 { param($st, $sp) [void][IO.Directory]::CreateDirectory((Join-Path $st "backups\home-claude-$sp\CLAUDE.md")) } {
+        param($From, $To)
+        $script:R5Src = Join-Path $From 'CLAUDE.md'
+        & icacls.exe $script:R5Src /deny '*S-1-1-0:(RD)' 2>&1 | Out-Null
+    } { if ($script:R5Src) { & icacls.exe $script:R5Src /remove:d '*S-1-1-0' 2>&1 | Out-Null } }
+    Assert-That ($r5b.Host -ceq 'HOST-GOOD-CONTENT' -and (& $r5Typed $r5b 'IMPORT_COPY_FAILED' 'CLAUDE.md') -eq 1 -and (& $r5Typed $r5b 'IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED' 'CLAUDE.md') -eq 0) 'r5 import: a bundle file that cannot be read is IMPORT_COPY_FAILED (the host file kept), not an unavailable backup' "host=[$($r5b.Host)] failures=$($r5b.Failures -join ',')`n$($r5b.Out)"
+    # (c) a bundle settings.json that is empty, one 0xFF byte, or '{' only must not replace a valid host settings.json; valid JSON still does
+    $r5Settings = { param($Tag, [byte[]]$Bytes)
+        $script:R5SettingsBytes = $Bytes; $script:R5SettingsAfter = $null
+        $r = Invoke-R3Import $Tag -3 0 {
+            param($st, $sp)
+            $hs = Join-Path (Split-Path -Parent $script:R3HostPath) 'settings.json'
+            [IO.File]::WriteAllText($hs, '{"theme":"dark"}'); (Get-Item -LiteralPath $hs).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-3)
+            [IO.File]::WriteAllBytes((Join-Path $script:BundlePath 'home-claude\settings.json'), $script:R5SettingsBytes)
+        } $null { $script:R5SettingsAfter = [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $script:R3HostPath) 'settings.json')) }
+        return $r
+    }
+    foreach ($r5c in @(@('r5c0', 'zero bytes', [byte[]]@()), @('r5c1', 'a single 0xFF byte', [byte[]]@(255)), @('r5c2', 'only an opening brace', [byte[]]@(123)))) {
+        $r5r = & $r5Settings $r5c[0] $r5c[2]
+        Assert-That ($script:R5SettingsAfter -ceq '{"theme":"dark"}' -and (& $r5Typed $r5r 'IMPORT_SOURCE_DAMAGED_NOT_REPLACED' 'settings.json') -eq 1) "r5 import: a bundle settings.json of $($r5c[1]) leaves the valid host settings.json as it is (typed failure IMPORT_SOURCE_DAMAGED_NOT_REPLACED)" "settings=[$($script:R5SettingsAfter)] failures=$($r5r.Failures -join ',')`n$($r5r.Out)"
+    }
+    $r5v = & $r5Settings 'r5c3' ([Text.Encoding]::UTF8.GetBytes('{"theme":"light"}'))
+    Assert-That ($script:R5SettingsAfter -ceq '{"theme":"light"}' -and $r5v.Failures.Count -eq 0) 'r5 import control: a valid bundle settings.json still replaces an older host settings.json' "settings=[$($script:R5SettingsAfter)] failures=$($r5v.Failures -join ',')"
+    # (d) the log cannot be written exactly when the refusal is emitted: the typed failure is still registered (it is registered BEFORE its line is logged)
+    $r5d = Invoke-R3Import 'r5d' -3 0 { param($st, $sp) [void][IO.Directory]::CreateDirectory((Join-Path $st "backups\home-claude-$sp\CLAUDE.md")) } { param($From, $To) $script:LogFile = (New-Scratch 'r5d-logdir') }
+    Assert-That ($r5d.Host -ceq 'HOST-GOOD-CONTENT' -and (& $r5Typed $r5d 'IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED' 'CLAUDE.md') -eq 1) 'r5 import: a log that cannot be written as a backup refusal is emitted still leaves the typed failure registered (the run fails with its precise cause)' "host=[$($r5d.Host)] failures=$($r5d.Failures -join ',')`n$($r5d.Out)"
+    # (e) the same for the generic step failure: Invoke-Step registers the failure before it tries to log it
+    $r5sv = $script:Cmdlet; $r5lf = $script:LogFile; $r5stub = [pscustomobject]@{}
+    Add-Member -InputObject $r5stub -MemberType ScriptMethod -Name ShouldProcess -Value { param($target, $action) $true }
+    $script:Cmdlet = $r5stub; $script:LogFile = Join-Path (New-Scratch 'r5e-log') 'r5e.log'; $script:R5LogDir = New-Scratch 'r5e-logdir'; $script:Failures.Clear(); $r5eThrown = ''
+    try { Invoke-Step 'r5 failing step' { $script:LogFile = $script:R5LogDir; throw 'boom' } } catch { $r5eThrown = $_.Exception.Message } finally { $script:Cmdlet = $r5sv; $script:LogFile = $r5lf }
+    Assert-That ((-not $r5eThrown) -and @($script:Failures | Where-Object { $_ -eq 'r5 failing step' }).Count -eq 1) 'r5 import: a failing step whose failure line cannot be logged is still registered as a failure and does not throw past Invoke-Step' "thrown=[$r5eThrown] failures=$($script:Failures -join ',')"
+    $script:Failures.Clear()
+}
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 
