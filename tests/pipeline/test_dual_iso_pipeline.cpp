@@ -5736,6 +5736,7 @@ TEST(DualIsoPipeline, AliasMapDispatchGuardRestoresCachedDispatch)
 {
     const bool had_override = qEnvironmentVariableIsSet("MLVAPP_DISABLE_AVX2_DUALISO_ALIAS_MAP");
     const QByteArray old_override = qgetenv("MLVAPP_DISABLE_AVX2_DUALISO_ALIAS_MAP");
+    const int entry_dispatch = dualisoAliasMapAvx2Active();
 
     // Order 1: cache 1 with the override unset, then set it to "1" without
     // refreshing the cache.
@@ -5759,7 +5760,9 @@ TEST(DualIsoPipeline, AliasMapDispatchGuardRestoresCachedDispatch)
     const int after_off = dualisoAliasMapAvx2Active();
     const bool env_set_after_off = qEnvironmentVariableIsSet("MLVAPP_DISABLE_AVX2_DUALISO_ALIAS_MAP");
 
-    // This test's own cleanup runs before any assertion can throw.
+    // This test's own cleanup runs before any assertion can throw. Like the
+    // guard, it puts back the dispatch it found, not one re-derived from the
+    // restored environment (r3 adversary pass A1).
     if (had_override)
     {
         qputenv("MLVAPP_DISABLE_AVX2_DUALISO_ALIAS_MAP", old_override);
@@ -5768,11 +5771,12 @@ TEST(DualIsoPipeline, AliasMapDispatchGuardRestoresCachedDispatch)
     {
         qunsetenv("MLVAPP_DISABLE_AVX2_DUALISO_ALIAS_MAP");
     }
-    dualisoAliasMapReinitDispatchForTesting();
+    const int restored_dispatch = dualisoAliasMapRestoreDispatchForTesting(entry_dispatch);
 
     std::fprintf(stderr,
                  "AliasMapDispatchGuardRestoresCachedDispatch: cached_on=%d after_on=%d cached_off=%d after_off=%d\n",
                  cached_on, after_on, cached_off, after_off);
+    ASSERT_EQ(entry_dispatch, restored_dispatch);
     ASSERT_TRUE(env_after_on == QByteArrayLiteral("1"));
     ASSERT_TRUE(!env_set_after_off);
     ASSERT_EQ(0, cached_off);
