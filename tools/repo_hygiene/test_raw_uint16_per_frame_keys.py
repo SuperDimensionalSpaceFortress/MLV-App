@@ -80,6 +80,23 @@ _QMAKE_INCLUDE = re.compile(r"include\(\s*([^()$\"',\s]+)\s*\)")
 # appears, whatever variable it is assigned to (sol r3 B1). A function name assembled from another expansion could spell either, so
 # it is refused too.
 _QMAKE_MUTATING_EXPANSION = re.compile(r"take_(?:first|last)|\$\$\{?[A-Za-z0-9_.]*\$\$")
+# A denylist of writers is never complete: $$system(cmd, mode, stsvar) also writes into a variable it names (Qt's own
+# toolchain.prf does exactly that), so a value-side replace function is accepted only when it is known to read and nothing else
+# (opus r4). Every other name, including system and any function a feature file defines, is refused wherever it appears.
+_QMAKE_VALUE_FUNCTION_CALL = re.compile(r"\$\$\{?\s*([A-Za-z0-9_.]+)\s*\(")
+_QMAKE_READONLY_VALUE_FUNCTIONS = frozenset((
+    "absolute_path", "basename", "cat", "clean_path", "dirname", "escape_expand", "files", "find", "first", "format_number",
+    "join", "last", "lower", "member", "native_path", "num_add", "quote", "re_escape", "relative_path", "replace", "reverse",
+    "section", "shadowed", "shell_path", "shell_quote", "size", "sorted", "split", "sprintf", "str_member", "system_path",
+    "system_quote", "unique", "upper", "val_escape"))
+
+
+def _qmake_value_expansion_is_unsafe(value: str) -> bool:
+    """Whether a right-hand side expands anything other than a variable, an environment variable, a qmake property or a
+    value function on the read-only list above."""
+    if _QMAKE_MUTATING_EXPANSION.search(value):
+        return True
+    return any(name not in _QMAKE_READONLY_VALUE_FUNCTIONS for name in _QMAKE_VALUE_FUNCTION_CALL.findall(value))
 _QMAKE_MAX_INCLUDE_NESTING = 8
 # CONFIG tokens a `+=` may add: none of them is a selector the model reads (macx, a platform name, debug/release).
 _QMAKE_BENIGN_CONFIG_TOKENS = frozenset(("c++11", "c++14", "c++17", "c++20", "console", "warn_on", "warn_off"))
@@ -302,8 +319,8 @@ def _qmake_simulate(
             raise AssertionError("unsupported qmake construct: " + repr(statement))
         variable, operator, value = match.group("var"), match.group("op"), match.group("value")
         _qmake_refuse_malformed_value(statement, value)
-        if _QMAKE_MUTATING_EXPANSION.search(value):
-            raise AssertionError("unsupported qmake construct (an expansion that removes a value from the variable it reads): "
+        if _qmake_value_expansion_is_unsafe(value):
+            raise AssertionError("unsupported qmake construct (an expansion that may write to a variable it names): "
                                  + repr(statement))
         tokens = re.split(r"[ \t]+", value.strip(" \t"))
         tokens = [token for token in tokens if token]
@@ -678,6 +695,38 @@ _MACX_PIN_REFUSED = (
     ("D-B1 a function name assembled from another expansion", _ARM64_LIVE, "SAVED = $$take_$$WHICH(LIBS)"),
     ("D-B1 take_last() in a tracked variable's own value", _ARM64_LIVE,
      "macx:equals(QT_ARCH, arm64):QMAKE_CFLAGS_RELEASE = $$take_last(QMAKE_CFLAGS)"),
+    # opus r4 blocker (DC-01 class): $$system(cmd, mode, stsvar) writes the exit status into stsvar, so an assignment to an
+    # untracked variable can overwrite LIBS / QMAKE_CFLAGS / QMAKE_LFLAGS with "0". The class is "a value-side replace
+    # function that is not known to only read", so the model allowlists readers instead of denylisting writers.
+    ("E-B1 $$system() status variable is LIBS, conditional", _ARM64_LIVE,
+     "macx:equals(QT_ARCH, arm64):SAVED = $$system(true, lines, LIBS)"),
+    ("E-B1 $$system() status variable is QMAKE_CFLAGS, unconditional", _ARM64_LIVE,
+     "SAVED = $$system(true, lines, QMAKE_CFLAGS)"),
+    ("E-B1 braced $${system(...)} with QMAKE_LFLAGS", _ARM64_LIVE,
+     'SAVED = $${system("true", blob, QMAKE_LFLAGS)}'),
+    ("E-B1 $$system() with += and a status variable", _ARM64_LIVE, "SAVED += $$system(true, lines, LIBS)"),
+    ("E-B1 $$system() inside the branch", _ARM64_LIVE, _ARM64_BLOCK % "    SAVED = $$system(true, lines, LIBS)"),
+    ("E-B1 $$system() as a later argument of another expansion", _ARM64_LIVE,
+     "SAVED = $$join(KEEP, $$system(true, lines, LIBS))"),
+    ("E-B1 $$system() under a condition that is false for arm64", _ARM64_LIVE,
+     "win32:SAVED = $$system(true, lines, LIBS)"),
+    ("E-B1 $$system() with no status variable is still not a known reader", _ARM64_LIVE, "SAVED = $$system(true)"),
+    ("E-B1 a replace function the model does not know", _ARM64_LIVE, "SAVED = $$somethingElse(LIBS)"),
+    ("E-B1 a Qt-defined replace function the model does not know", _ARM64_LIVE, "SAVED = $$qtLibraryTarget(mlv)"),
+    ("E-B1 a braced unknown replace function", _ARM64_LIVE, "SAVED = $${somethingElse(LIBS)}"),
+    ("E-B1 $$system() in a tracked variable's own value", _ARM64_LIVE,
+     "macx:equals(QT_ARCH, arm64):QMAKE_CFLAGS_RELEASE = $$system(true, lines, LIBS)"),
+)
+
+# Value-side replace functions the model accepts: every one only reads its arguments (the project files the pin reads use
+# clean_path, relative_path, files, lower, quote and escape_expand).
+_READONLY_VALUE_FUNCTION_LINES = (
+    "SAVED = $$clean_path($$PWD/..)",
+    "SAVED = $$relative_path($$PWD/x, $$OUT_PWD)",
+    "SAVED = $$files($$PWD/x/*.cpp)",
+    "SAVED = $$lower($$(MLVAPP_ENABLE_AVX))",
+    "SAVED = $$quote($$PWD/x.zip) $$escape_expand(\\n\\t)",
+    "SAVED = $${join(LIST, -)}",
 )
 
 
@@ -867,6 +916,14 @@ int main(void)
                 with self.assertRaisesRegex(AssertionError, "unsupported qmake construct|unterminated"):
                     _macos_openmp_gaps(text, "arm64")
 
+    def test_macos_arch_pin_model_still_reads_value_functions_that_only_read(self) -> None:
+        """The allowlist is not a blanket refusal: a project using the read-only replace functions still gets judged."""
+        for line in _READONLY_VALUE_FUNCTION_LINES:
+            for arch in ("arm64", "x86_64"):
+                with self.subTest(line + " " + arch):
+                    text = _MACX_PIN_TEMPLATE % {"arm64": _ARM64_LIVE, "tail": line}
+                    self.assertEqual(_macos_openmp_gaps(text, arch), [])
+
     def test_macos_arch_pin_model_keeps_disablers_and_inherited_flags_per_architecture(self) -> None:
         """A disabler aimed at one architecture is that architecture's gap only; a flag one architecture inherits from the
         parent scope does not hide that the other architecture's branch carries its own."""
@@ -925,6 +982,10 @@ int main(void)
             ("an include that adds a platform name to CONFIG", "include(../c.pri)", {"c.pri": "CONFIG += linux\n"}),
             ("an include loop", "include(../loop.pri)", {"loop.pri": "include(loop.pri)\n"}),
             ("an include named through a variable", "include($$PWD/../v.pri)", {"v.pri": "DEFINES += X\n"}),
+            ("an include whose $$system() status variable is LIBS", "include(../s.pri)",
+             {"s.pri": "macx:equals(QT_ARCH, arm64):SAVED = $$system(true, lines, LIBS)\n"}),
+            ("an include whose $$system() status variable is QMAKE_CFLAGS", "include(../s.pri)",
+             {"s.pri": "SAVED = $$system(true, lines, QMAKE_CFLAGS)\n"}),
         )
         for name, include_line, files in unreadable:
             with self.subTest(name), tempfile.TemporaryDirectory() as scratch:
