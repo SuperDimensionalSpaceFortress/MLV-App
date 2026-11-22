@@ -4075,6 +4075,70 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r1 import backup')) {
     Assert-That (@($r1d.Failures | Where-Object { $_ -like 'IMPORT_BUNDLE_EXPAND_FAILED*' }).Count -eq 1) 'r1 import: a truncated bundle zip is a typed failure (IMPORT_BUNDLE_EXPAND_FAILED <path>; the run exits non-zero)' ($r1d.Failures -join ',')
 }
 
+# ================================================================ IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 r3: the replace is tied to the backup that was made, not to a path probe
+# Sol r2 (head a78e1737): the r2 guard remembered "this path could not be backed up" from a probe made at one instant. Three ways it still let a host file be replaced without a backup,
+# or failed the run for a file Import keeps: (1) a host file whose bytes cannot be read (access denied) was credential-skipped first, so the refusal was never recorded (exit 0);
+# (2) a host file renamed away while the backup ran and put back before the copy was not remembered, so it was replaced with no backup; (3) a host file saved between the backup and
+# the copy (older than the bundle copy) was replaced and the backup held the OLD bytes; (4) a host file another process HOLDS, with a bundle copy OLDER than it, was reported as a
+# failed backup although /XO keeps it. The replace now needs the bytes of the file it replaces (read under the lock) to equal the bytes that were backed up.
+function Invoke-R3Import([string]$Tag, [int]$HostAgeDays, [int]$BundleAgeDays, [scriptblock]$Prepare, [scriptblock]$Hook, [scriptblock]$Cleanup) {
+    $ws = New-Scratch "$Tag-ws"; $st = New-Scratch "$Tag-state"; $hm = New-Scratch "$Tag-home"; $tmp = New-Scratch "$Tag-mlvtmp"; $bd = New-Scratch "$Tag-bundle"
+    [IO.File]::WriteAllText((Join-Path $bd 'MANIFEST.txt'), 'mlv-migrate-bundle v1')
+    New-Item -ItemType Directory -Force -Path (Join-Path $bd 'home-claude') | Out-Null
+    $bf = Join-Path $bd 'home-claude\CLAUDE.md'
+    [IO.File]::WriteAllText($bf, 'FROM-BUNDLE'); (Get-Item -LiteralPath $bf).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays($BundleAgeDays)
+    $hostClaude = Join-Path $hm '.claude\CLAUDE.md'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $hostClaude) | Out-Null
+    [IO.File]::WriteAllText($hostClaude, 'HOST-GOOD-CONTENT'); (Get-Item -LiteralPath $hostClaude).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays($HostAgeDays)
+    $script:R3HostPath = $hostClaude
+    $sv = @{ S = $script:StateRoot; B = $script:BundlePath; R = $script:Repo; T = $script:MlvTmp; L = $script:LogFile; E = $env:USERPROFILE; P = $script:stamp }
+    $script:StateRoot = $st; $StateRoot = $st; $script:BundlePath = $bd; $BundlePath = $bd; $script:Repo = (Join-Path $ws 'MLV-App'); $Repo = $script:Repo
+    $script:MlvTmp = $tmp; $MlvTmp = $tmp; $script:LogFile = Join-Path $ws 'r3.log'; $script:stamp = "r3$Tag"; $stamp = $script:stamp; $env:USERPROFILE = $hm
+    $script:Failures.Clear()
+    $out = ''
+    try {
+        if ($Prepare) { & $Prepare $st $script:stamp }
+        if ($Hook) { $script:ImportBeforeReplaceHook = $Hook }
+        try { $out = (Invoke-PhaseImport *>&1 | Out-String) } catch { $out += "THROWN: $($_.Exception.Message)" }
+    } finally {
+        $script:ImportBeforeReplaceHook = $null
+        if ($Cleanup) { & $Cleanup }
+        $script:StateRoot = $sv.S; $StateRoot = $sv.S; $script:BundlePath = $sv.B; $BundlePath = $sv.B; $script:Repo = $sv.R; $Repo = $sv.R; $script:MlvTmp = $sv.T; $MlvTmp = $sv.T
+        $script:LogFile = $sv.L; $script:stamp = $sv.P; $stamp = $sv.P; $env:USERPROFILE = $sv.E
+    }
+    return @{ Host = [IO.File]::ReadAllText($hostClaude); Failures = @($script:Failures); Out = $out }
+}
+if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r3 import backup')) {
+    $r3Typed = { param($r) @($r.Failures | Where-Object { $_ -like 'IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED*CLAUDE.md*' }).Count }
+    # (a) the host file's bytes cannot be read (access denied; its attributes can): refused with the typed record, not credential-skipped into a silent exit 0
+    $r3a = Invoke-R3Import 'a' -3 0 { param($st, $sp) & icacls.exe $script:R3HostPath /deny '*S-1-1-0:(RD)' 2>&1 | Out-Null } $null { & icacls.exe $script:R3HostPath /remove:d '*S-1-1-0' 2>&1 | Out-Null }
+    Assert-That ($r3a.Host -ceq 'HOST-GOOD-CONTENT') 'r3 import: a read-denied host CLAUDE.md is left byte-identical' "host=[$($r3a.Host)]`n$($r3a.Out)"
+    Assert-That ((& $r3Typed $r3a) -eq 1) 'r3 import: a read-denied host CLAUDE.md that the bundle would replace is the typed failure IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED (exit 1), not a silent credential skip' ($r3a.Failures -join ',')
+    # (b) the host file is absent while the backup step looks, and is put back (same bytes, same time) before the copy: it is not replaced without a backup
+    $r3b = Invoke-R3Import 'b' -3 0 { param($st, $sp) Move-Item -LiteralPath $script:R3HostPath -Destination "$script:R3HostPath.aside" } { param($From, $To) Move-Item -LiteralPath "$script:R3HostPath.aside" -Destination $script:R3HostPath }
+    Assert-That ($r3b.Host -ceq 'HOST-GOOD-CONTENT') 'r3 import: a host CLAUDE.md that came back after the backup step looked is NOT replaced (no backup of it exists)' "host=[$($r3b.Host)]`n$($r3b.Out)"
+    Assert-That ((& $r3Typed $r3b) -eq 1) 'r3 import: that refusal is the typed failure IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED' ($r3b.Failures -join ',')
+    # (b2) the same when the backups folder cannot be made (the other handler): the file is absent at that moment and back before the copy
+    $r3b2 = Invoke-R3Import 'b2' -3 0 { param($st, $sp) [IO.File]::WriteAllText((Join-Path $st 'backups'), 'not a folder'); Move-Item -LiteralPath $script:R3HostPath -Destination "$script:R3HostPath.aside" } { param($From, $To) Move-Item -LiteralPath "$script:R3HostPath.aside" -Destination $script:R3HostPath }
+    Assert-That ($r3b2.Host -ceq 'HOST-GOOD-CONTENT' -and (& $r3Typed $r3b2) -eq 1) 'r3 import: an unmakeable backups folder plus a host file that comes back is not replaced either (typed failure)' "host=[$($r3b2.Host)] failures=$($r3b2.Failures -join ',')"
+    # (c) an editor saves the host file after the backup was made (its time stays older than the bundle copy): the replace would lose that save, so it is refused
+    $r3c = Invoke-R3Import 'c' -3 0 $null { param($From, $To) [IO.File]::WriteAllText($script:R3HostPath, 'HOST-NEW'); (Get-Item -LiteralPath $script:R3HostPath).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-2) }
+    Assert-That ($r3c.Host -ceq 'HOST-NEW') 'r3 import: a host CLAUDE.md saved after its backup was made is NOT replaced (the backup holds the older bytes)' "host=[$($r3c.Host)]`n$($r3c.Out)"
+    Assert-That ((& $r3Typed $r3c) -eq 1) 'r3 import: that refusal is the typed failure IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED' ($r3c.Failures -join ',')
+    # (d) a host file another process HOLDS (FileShare.None) with an OLDER bundle copy: /XO keeps it, so there is no failure; (e) the same hold with a NEWER bundle copy is refused
+    $r3hold = { param($st, $sp) $script:R3Held = [IO.File]::Open($script:R3HostPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+    $r3rel = { if ($script:R3Held) { $script:R3Held.Dispose(); $script:R3Held = $null } }
+    $r3d = Invoke-R3Import 'd' -3 -5 $r3hold $null $r3rel
+    Assert-That ($r3d.Host -ceq 'HOST-GOOD-CONTENT' -and $r3d.Failures.Count -eq 0) 'r3 import: a HELD host CLAUDE.md that is newer than the bundle copy is kept with no failure (the /XO keep is not turned into a failed Import)' "host=[$($r3d.Host)] failures=$($r3d.Failures -join ',')`n$($r3d.Out)"
+    $r3e = Invoke-R3Import 'e' -3 0 $r3hold $null $r3rel
+    Assert-That ($r3e.Host -ceq 'HOST-GOOD-CONTENT' -and (& $r3Typed $r3e) -eq 1) 'r3 import: a HELD host CLAUDE.md that the bundle copy would replace is refused with the typed failure' "host=[$($r3e.Host)] failures=$($r3e.Failures -join ',')"
+    # (f) controls: a host file that is absent all the way through is created; a host file backed up and unchanged is still replaced
+    $r3f = Invoke-R3Import 'f' -3 0 { param($st, $sp) Remove-Item -LiteralPath $script:R3HostPath -Force }
+    Assert-That ($r3f.Host -ceq 'FROM-BUNDLE' -and $r3f.Failures.Count -eq 0) 'r3 import control: a host CLAUDE.md that is absent throughout is created from the bundle' "host=[$($r3f.Host)] failures=$($r3f.Failures -join ',')"
+    $r3g = Invoke-R3Import 'g' -3 0
+    Assert-That ($r3g.Host -ceq 'FROM-BUNDLE' -and $r3g.Failures.Count -eq 0) 'r3 import control: a host CLAUDE.md that was backed up and not touched since is still replaced by the newer bundle copy' "host=[$($r3g.Host)] failures=$($r3g.Failures -join ',')"
+}
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 

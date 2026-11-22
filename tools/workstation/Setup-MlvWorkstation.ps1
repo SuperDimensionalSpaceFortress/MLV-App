@@ -3056,6 +3056,10 @@ function Copy-ImportFileLocked {
         $dstText = ConvertFrom-ImportBytes $orig
         if (Test-CredentialText $dstText) { return @{ Result = 'changed'; Why = 'host file carries a credential' } }
         if (($CredentialRoleFiles -contains $Source.Name.ToLowerInvariant()) -and (([regex]::new('(?i)(' + $CredentialNameWords + ')')).IsMatch($dstText) -or (Test-CredentialNamePresent $dstText))) { return @{ Result = 'changed'; Why = 'host credential-role file names a credential key' } }
+        # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 (r3): a backed-up host file is replaced only when the bytes held here are the bytes that were backed up (a file saved since the backup
+        # would otherwise be replaced with only the older bytes in the backup), and one that has no backup at all (not made, or the file only came back after the backup step looked) is not.
+        $gap = Get-ImportBackupGap -Dest $Dest -HeldBytes $orig
+        if ($gap) { return @{ Result = 'backup-unavailable'; Why = $gap } }
         # r14 A5: never truncate first. The bundle bytes go to a sibling temp file carrying the bundle timestamp (r12 A5: the timestamp is set before the file takes the host
         # name, so no editor save can be backdated), and File.Replace swaps it in; a write that fails leaves the host file's bytes and timestamp as they were.
         $swap = Set-ImportFileContentAtomic -Dest $Dest -Bytes $bytes -WriteTimeUtc $Source.LastWriteTimeUtc -Held $fs -JudgedBytes $orig
@@ -3297,19 +3301,28 @@ function Invoke-ImportRobocopy {
                 if ($recurse -and -not $skipDir) { $stack.Push($e.FullName) }
                 continue
             }
-            $skipFile = $skipSet.ContainsKey($e.FullName.ToLowerInvariant())
+            $skipFile = $false   # excluded by /XF; the inspection's credential skips are $inSkipSet (the backup judgement below runs for those too)
             foreach ($x in $xfNames) { if ($e.Name -like $x) { $skipFile = $true } }
             foreach ($x in $xfPaths) { if ($e.FullName -ieq $x) { $skipFile = $true } }
             if ($skipFile) { continue }
+            $inSkipSet = $skipSet.ContainsKey($e.FullName.ToLowerInvariant())
             $dest = Join-Path $destDir $e.Name
-            # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1: a host file whose pre-import backup could not be made is not replaced (it is left byte for byte as it is), and the run fails.
-            if ($script:ImportBackupUnavailable.Contains([IO.Path]::GetFullPath($dest))) {
-                $n.skipped++
-                Write-Log "IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED $dest (its backup could not be made, so the host file was left as it is; the bundle copy $($e.FullName) was not applied)" 'ERROR'
-                $script:ImportSkippedDest.Add($dest)
-                $script:Failures.Add("IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED $dest")
-                continue
+            # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1: an existing host file that has no pre-import backup is not replaced (it is left byte for byte as it is) and the run fails. It is
+            # judged BEFORE the credential skips (a host file whose bytes cannot be read is skipped there, silently) and only when the copy rules WOULD replace it (a file /XO keeps, even a held
+            # one, is not a failure). Copy-ImportFileLocked makes the same judgement again under its lock, on the bytes it is about to replace.
+            if ([IO.File]::Exists($dest)) {
+                $gap = Get-ImportBackupGap -Dest $dest
+                $wouldReplace = $true
+                if ($gap) { try { $wouldReplace = Test-ImportReplaces -Source $e -Dest ([IO.FileInfo]::new($dest)) -ExcludeNewer $exN -ExcludeOlder $exO -ExcludeChanged $exC } catch { $wouldReplace = $true } }
+                if ($gap -and $wouldReplace) {
+                    $n.skipped++
+                    Write-Log "IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED $dest ($gap, so the host file was left as it is; the bundle copy $($e.FullName) was not applied)" 'ERROR'
+                    $script:ImportSkippedDest.Add($dest)
+                    $script:Failures.Add("IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED $dest")
+                    continue
+                }
             }
+            if ($inSkipSet) { continue }
             try { $r = Copy-ImportFileLocked -Source $e -Dest $dest -ExcludeNewer $exN -ExcludeOlder $exO -ExcludeChanged $exC }
             catch { $n.failed++; Write-Log "IMPORT_COPY_FAILED $dest :: $($_.Exception.Message)" 'ERROR'; $script:Failures.Add("IMPORT_COPY_FAILED $dest"); continue }
             switch ($r.Result) {
@@ -3320,6 +3333,12 @@ function Invoke-ImportRobocopy {
                     $n.skipped++
                     Write-Log "IMPORT_SKIPPED_CREDENTIAL_FILE $dest ($($r.Why); the bundle copy $($e.FullName) was not applied)" 'WARN'
                     $script:ImportSkippedDest.Add($dest)
+                }
+                'backup-unavailable' {
+                    $n.skipped++
+                    Write-Log "IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED $dest ($($r.Why), so the host file was left as it is; the bundle copy $($e.FullName) was not applied)" 'ERROR'
+                    $script:ImportSkippedDest.Add($dest)
+                    $script:Failures.Add("IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED $dest")
                 }
                 'changed' {
                     $n.skipped++
@@ -3334,10 +3353,31 @@ function Invoke-ImportRobocopy {
 }
 
 $script:ImportSkippedDest = [System.Collections.Generic.List[string]]::new()
-# IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1: the full paths (compared case-insensitively) of host files that EXIST but whose pre-import backup could not be made (Copy-CleanBackupFile
-# failed on them, or the backups folder could not be created). Invoke-ImportRobocopy leaves such a file as it is: a replace never goes on after its backup failed. A host file that
-# carries a credential is NOT in this set (it is never replaced anyway, and Get-ImportCredentialSkips reports it). Cleared at the start of the Import backup step.
-$script:ImportBackupUnavailable = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+# IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 (r3): the replace of a backed-up host file is tied to the backup that WAS made, not to a probe of whether one failed. All three are
+# keyed by the full path (case-insensitive) and cleared at the start of the Import backup step:
+#   ImportBackupProtected          the host files that step is about to back up (CLAUDE.md and settings.json under ~/.claude), whether or not they exist at that moment;
+#   ImportBackupHash               protected path -> SHA-256 of the bytes Copy-CleanBackupFile wrote to the backup (only a backup that was written is recorded);
+#   ImportBackupCredentialSkipped  protected paths deliberately not backed up because they carry a credential (Import never replaces those; they stay a WARN skip).
+# A protected host file is replaced only while it is locked and its bytes still equal the backed-up bytes (Get-ImportBackupGap); with no backup, or a changed file, it is left as it is.
+$script:ImportBackupProtected = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$script:ImportBackupHash = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$script:ImportBackupCredentialSkipped = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+# Why a protected host file may not be replaced, or '' when nothing stands in the way (an unprotected path is always ''). Without -HeldBytes (the early check, no lock yet): a protected
+# file with neither a recorded backup nor a credential skip has no backup. With -HeldBytes (the bytes read under the replace's lock): the recorded backup must be of exactly those bytes.
+function Get-ImportBackupGap {
+    param([string]$Dest, [byte[]]$HeldBytes = $null)
+    $full = [IO.Path]::GetFullPath($Dest)
+    if (-not $script:ImportBackupProtected.Contains($full)) { return '' }
+    $has = $script:ImportBackupHash.ContainsKey($full)
+    if ($null -eq $HeldBytes) {
+        if ($has -or $script:ImportBackupCredentialSkipped.Contains($full)) { return '' }
+        return 'no pre-import backup of this host file was made'
+    }
+    if (-not $has) { return 'no pre-import backup of this host file was made' }
+    if ($script:ImportBackupHash[$full] -cne (Get-ImportBytesHash $HeldBytes)) { return 'the host file changed after its pre-import backup was made (the backup holds older bytes)' }
+    return ''
+}
 # r12 pass 9 B3: every destination a copy actually wrote ('created' or 'replaced' by Copy-ImportFileLocked), normalised paths. The settings.json profile rewrite reads this, not a
 # timestamp sampled before the copy: a file the copy KEPT (a newer or an identical host file) is the host's own and is never rewritten.
 $script:ImportAppliedDest = [System.Collections.Generic.List[string]]::new()
@@ -3415,12 +3455,14 @@ function Copy-CleanBackupFile {
         $bytes = [IO.File]::ReadAllBytes($Path)
         $sr = [IO.StreamReader]::new([IO.MemoryStream]::new($bytes), [Text.Encoding]::UTF8, $true)
         try { $text = $sr.ReadToEnd() } finally { $sr.Dispose() }
-        if (Test-CredentialText $text) { return $false }
+        if (Test-CredentialText $text) { [void]$script:ImportBackupCredentialSkipped.Add([IO.Path]::GetFullPath($Path)); return $false }
         [void][IO.Directory]::CreateDirectory($DestinationDir)
         # r16 (adversary pass 15 A4 sibling): written through a handle that can also delete it (New-OwnedFileStream), so a failed write takes back exactly this file
         $ws = New-OwnedFileStream -Path $dest -Mode ([IO.FileMode]::Create)
         $ws.Write($bytes, 0, $bytes.Length); $ws.Flush()
         $ws.Dispose(); $ws = $null
+        # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 (r3): what was backed up is recorded by its bytes; Import replaces this host file only while it still holds exactly these bytes.
+        $script:ImportBackupHash[[IO.Path]::GetFullPath($Path)] = (Get-ImportBytesHash $bytes)
         return $true
     } catch {
         # r15 (pass 12 A6 sibling): a partly written backup copy is removed and the removal is proven; one that cannot be removed is a typed failure of the run.
@@ -3434,10 +3476,8 @@ function Copy-CleanBackupFile {
                 $script:Failures.Add("IMPORT_BACKUP_NOT_DELETED $dest")
             }
         }
-        # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1: a host file that exists but could not be backed up (write failure, a folder at the backup name, a held or unreadable file,
-        # a decode-limit throw) is remembered: Import must not replace it. (The credential refusal above returns before this catch and is not recorded.)
-        try { if (Test-Path -LiteralPath $Path -PathType Leaf) { [void]$script:ImportBackupUnavailable.Add([IO.Path]::GetFullPath($Path)) } }
-        catch { [void]$script:ImportBackupUnavailable.Add($Path) }
+        # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1: a failed backup records NOTHING here (r3: no probe of the path, which a file coming back or going away could fool). The absence of a
+        # recorded backup hash is what keeps Import from replacing the file (Get-ImportBackupGap).
         return $false
     }
 }
@@ -3478,16 +3518,14 @@ function Invoke-PhaseImport {
     }
     $h = $env:USERPROFILE
     Invoke-Step 'Back up existing ~/.claude CLAUDE.md and settings.json' {
-        # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1: no backup, no replace. A host file whose backup fails is remembered in $script:ImportBackupUnavailable and the copy step leaves it alone.
-        $script:ImportBackupUnavailable.Clear()
+        # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1: no backup, no replace. Both host files are PROTECTED from here (whether or not they exist at this instant); one is replaced only when a
+        # backup of exactly its bytes was written (Copy-CleanBackupFile records it), so a failed backup, a file that comes back later or a save after the backup all leave it alone.
+        $script:ImportBackupProtected.Clear(); $script:ImportBackupHash.Clear(); $script:ImportBackupCredentialSkipped.Clear()
+        foreach ($f in 'CLAUDE.md', 'settings.json') { [void]$script:ImportBackupProtected.Add([IO.Path]::GetFullPath((Join-Path "$h\.claude" $f))) }
         $b = Join-Path $StateRoot "backups\home-claude-$stamp"
         try { [void][IO.Directory]::CreateDirectory($b) }
         catch {
-            # no backup can be made at all: every existing host file of this step is protected, then the failure is recorded (Invoke-Step) as before
-            foreach ($f in 'CLAUDE.md', 'settings.json') {
-                $p = Join-Path "$h\.claude" $f
-                if (Test-Path -LiteralPath $p -PathType Leaf) { [void]$script:ImportBackupUnavailable.Add([IO.Path]::GetFullPath($p)) }
-            }
+            # no backup can be made at all: nothing is recorded, so every host file of this step stays protected; the failure is recorded (Invoke-Step) as before
             Write-Log "IMPORT_BACKUP_FAILED $b (the backup folder cannot be made; the host files in $h\.claude are not replaced)" 'ERROR'
             throw
         }
@@ -3497,8 +3535,8 @@ function Invoke-PhaseImport {
             # r10 A2: a host file that carries a credential is never copied (the backup would be a second, durable copy of it, and Import
             # never replaces such a file anyway, so there is nothing to roll back). One read: the bytes judged are the bytes written.
             if (-not (Copy-CleanBackupFile -Path $p -DestinationDir $b)) {
-                if ($script:ImportBackupUnavailable.Contains([IO.Path]::GetFullPath($p))) { Write-Log "IMPORT_BACKUP_FAILED $p (the backup copy could not be written; the host file is not replaced)" 'ERROR' }
-                else { Write-Log "IMPORT_BACKUP_SKIPPED_CREDENTIAL_FILE $p (it carries a credential or cannot be read; no copy was made)" 'WARN' }
+                if ($script:ImportBackupCredentialSkipped.Contains([IO.Path]::GetFullPath($p))) { Write-Log "IMPORT_BACKUP_SKIPPED_CREDENTIAL_FILE $p (it carries a credential; no copy was made)" 'WARN' }
+                else { Write-Log "IMPORT_BACKUP_FAILED $p (the backup copy could not be written; the host file is not replaced)" 'ERROR' }
             }
         }
     }
