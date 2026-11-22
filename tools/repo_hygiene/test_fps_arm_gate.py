@@ -1309,6 +1309,9 @@ class ObserverControlTests(_Probe):
         "MLVAPP_DISABLE_PREP_POINTWISE_FAST", "MLVAPP_DISABLE_RAW_UINT16_PREFETCH", "MLVAPP_RAW_UINT16_PREFETCH_DECODERS", "MLVAPP_GPU_FAULT_INJECT", "MLVAPP_GPU_RECON_RELEASE_DEFERRED",
         "MLVAPP_GPU_SAFE_START", "MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY", "MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE", "MLVAPP_PLAYBACK_PREP_OMP_THREADS", "MLVAPP_PLAYBACK_RECON_OMP_THREADS",
         "MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES", "MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK", "MLVAPP_PLAYBACK_SCOPE_INTERVAL_MS",
+        # r13 (master 1a65d592, #851): the mid-play window-toggle hook (fullscreen / windowed / restore / maximize while the measured Play runs, playback-attr-3-cuda-job.ps1 under -MidPlayWindowToggles)
+        # moves the presentation surface, so a launch that records it is not the standing LIGHT shape and reads UNKNOWN (a spec-driven test hook, like the fault injection above).
+        "MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES",
     }
 
     def test_every_variable_the_job_generator_emits_is_in_the_light_table_or_named_as_not_light(self) -> None:
@@ -1688,6 +1691,8 @@ class ObserverControlTests(_Probe):
             "partitionLoadMask", "partitionLoadThreads", "corePartitionHelperMask", "playbackMaxThreads", "gpuFaultInject", "gpuSafeStart", "automationSettingsDir", "gpuPreLaunches",
             "disableLookAssist", "presentTrace", "unpaced", "disablePrepPointwiseFast", "prepConflatedMove", "disableReconReleaseDeferred", "dueWakeDeliveryPost", "reconOmpThreads",
             "prepOmpThreads", "scope", "scopeIntervalMs", "scopesDuringPlayback", "forceLookAssist", "lookFlavor", "playbackRenderLookaheadFrames", "lookReceipt", "lookReceiptSha256",
+            # r13 (master 1a65d592, #851): a window-state test hook, not a logger or sampler; the env it sets is classified above (JOB_NAMES_A_LIGHT_LEG_DOES_NOT_CARRY).
+            "midPlayWindowToggles",
         }
         out = self.ok("(Get-FpsObserverControls | Where-Object { $_.specKey } | ForEach-Object { $_.specKey }) -join ','")
         observers = set(out.strip().split(","))
