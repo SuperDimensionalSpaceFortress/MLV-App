@@ -73,12 +73,15 @@ _QMAKE_ASSIGNMENT = re.compile(
 
 
 def _qmake_logical_text(pro_text: str) -> str:
-    """The .pro text qmake actually reads: comments dropped (a `#` runs to the end of its line), then each
-    backslash-newline continuation joined into one logical line."""
+    """The .pro text qmake actually reads: comments dropped (a `#` runs to the end of its LF-terminated line, so only
+    LF splits lines), then each backslash-newline continuation joined into one logical line. A continuation followed by
+    a blank or comment-only line is refused: that is a shape this model does not try to interpret (fail closed)."""
     logical = []
     carry = ""
-    for physical in pro_text.splitlines():
+    for physical in pro_text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         line = physical.split("#", 1)[0].rstrip()
+        if carry and not line.strip():
+            raise AssertionError("unsupported qmake construct: continuation followed by a blank or comment-only line")
         if line.endswith("\\"):
             carry += line[:-1] + " "
             continue
@@ -107,9 +110,13 @@ def _qmake_split_top(text: str, separators: str) -> "list[str]":
 
 
 def _qmake_atom_state(atom: str, arch: str) -> str:
+    if atom.startswith("!!"):
+        raise AssertionError("unsupported qmake construct: repeated '!' in selector " + repr(atom))
     negated = atom.startswith("!")
     atom = atom.lstrip("!").strip()
     arch_match = re.fullmatch(_QT_ARCH_ATOM, atom)
+    if "QT_ARCH" in atom and not arch_match:
+        raise AssertionError("unsupported qmake construct: unreadable QT_ARCH selector " + repr(atom))
     if arch_match:
         state = _TRUE if arch_match.group(1) == arch else _FALSE
     elif atom == "macx":
@@ -152,26 +159,36 @@ def _qmake_effective_flags(pro_text: str, arch: str) -> "dict[str, list[str]]":
     wherever its condition is true OR unknown, so the answer can only err toward reporting a lost flag."""
     values: "dict[str, list[str]]" = {name: [] for name in _QMAKE_TRACKED_VARS}
 
-    def apply(statement: str, scope_state: str) -> None:
+    def apply(statement: str, scope_state: str, depth: int) -> None:
+        # Fail closed: a statement this model cannot read as `[conditions:]VARIABLE op value` is refused, never skipped.
+        # The one exception is the top-level `include(<shared .pri>)` the two .pro files start with; the .pri files
+        # assign none of the tracked variables and are not followed here.
         match = _QMAKE_ASSIGNMENT.match(statement)
         if not match:
-            return
+            if depth == 0 and re.fullmatch(r"include\([^()$]*\)", statement):
+                return
+            raise AssertionError("unsupported qmake construct: " + repr(statement))
+        variable, operator, value = match.group("var"), match.group("op"), match.group("value")
+        if variable == "QT_ARCH" or (variable == "CONFIG" and (operator != "-=" or "macx" in value.split())):
+            raise AssertionError("unsupported qmake construct (it changes what a selector means): " + repr(statement))
         state = _qmake_and([scope_state, _qmake_condition_state(match.group("cond").rstrip(":").strip(), arch)])
-        variable = match.group("var")
-        if variable not in values or state == _FALSE:
+        if variable not in values:
             return
-        tokens = []
-        for token in match.group("value").split():
-            reference = re.fullmatch(r"\$\$\{?([A-Za-z0-9_]+)\}?", token)
-            tokens.extend(values[reference.group(1)] if reference and reference.group(1) in values else [token])
-        operator = match.group("op")
-        if operator in ("+=", "*="):
+        if operator == "~=" or re.search(r"[$\"']", value):
+            raise AssertionError("unsupported qmake construct (substitution, expansion or quoting): " + repr(statement))
+        if state == _FALSE:
+            return
+        tokens = value.split()
+        if operator == "+=":
             if state == _TRUE:
                 values[variable].extend(tokens)
+        elif operator == "*=":
+            if state == _TRUE:
+                values[variable].extend(token for token in dict.fromkeys(tokens) if token not in values[variable])
         elif operator == "-=":
             values[variable] = [token for token in values[variable] if token not in tokens]
         else:
-            values[variable] = tokens if operator == "=" and state == _TRUE else []
+            values[variable] = tokens if state == _TRUE else []
 
     scopes: "list[str]" = []
     buffer = ""
@@ -182,7 +199,7 @@ def _qmake_effective_flags(pro_text: str, arch: str) -> "dict[str, list[str]]":
         statement = buffer.strip()
         buffer = ""
         if statement:
-            apply(statement, scopes[-1] if scopes else _TRUE)
+            apply(statement, scopes[-1] if scopes else _TRUE, len(scopes))
 
     for char in _qmake_logical_text(pro_text):
         if in_reference:
@@ -205,8 +222,8 @@ def _qmake_effective_flags(pro_text: str, arch: str) -> "dict[str, list[str]]":
         else:
             buffer += char
     flush()
-    if scopes:
-        raise AssertionError("unterminated qmake scope")
+    if scopes or in_reference:
+        raise AssertionError("unterminated qmake scope or $${...} reference")
     return values
 
 
@@ -214,7 +231,7 @@ def _macos_openmp_gaps(pro_text: str, arch: str) -> "list[str]":
     """The OpenMP flags a macOS QT_ARCH=arch build of this .pro would NOT get: the C compile flag and the link flag."""
     values = _qmake_effective_flags(pro_text, arch)
     gaps = []
-    if "-fopenmp" not in values["QMAKE_CFLAGS"]:
+    if "-fopenmp" not in values["QMAKE_CFLAGS"] or "-fno-openmp" in values["QMAKE_CFLAGS"]:
         gaps.append("C compile lacks -fopenmp")
     if "-fopenmp" not in values["QMAKE_LFLAGS"] and not any(token in values["LIBS"] for token in _OPENMP_LINK_TOKENS):
         gaps.append("link line lacks OpenMP (-fopenmp in QMAKE_LFLAGS or -lomp/-lgomp in LIBS)")
@@ -245,6 +262,9 @@ def _arm64_section(*lines: str, opener: str = "equals(QT_ARCH, arm64)") -> str:
 # showed the raw-text guard accepted although qmake would not give macOS arm64 the flag (LJ92-PRO-MACOS-ARCH-PIN-1 r1).
 _MACX_PIN_CASES = (
     ("live", _ARM64_LIVE, "", []),
+    ("a U+2028 inside a comment is not a line break to qmake", _ARM64_LIVE, "# note macx:QMAKE_CFLAGS -= -fopenmp", []),
+    ("*= adds a value only once", _arm64_section("QMAKE_CFLAGS *= -fopenmp", "QMAKE_CFLAGS *= -fopenmp", "LIBS += -lomp"), "", []),
+    ("A11 -fno-openmp later on the compile line", _ARM64_LIVE, "macx:equals(QT_ARCH, arm64):QMAKE_CFLAGS += -fno-openmp", [_COMPILE_GAP]),
     ("continuation lines keep the flag", _arm64_section(
         "QMAKE_CFLAGS += \\", "    -fopenmp", "LIBS += -L/opt/homebrew/opt/llvm/lib \\", "    -lomp"), "", []),
     ("second macx scope is additive", _ARM64_LIVE, "macx {\n    DEFINES += EXTRA_DIAGNOSTICS\n}", []),
@@ -271,6 +291,39 @@ _MACX_PIN_CASES = (
     ("A5 reassignment after the macx scope", _ARM64_LIVE, "macx:equals(QT_ARCH, arm64):QMAKE_CFLAGS = -std=c99", [_COMPILE_GAP]),
     ("a brace in a comment does not end the branch", _arm64_section(
         "# } never closes the scope", "QMAKE_CFLAGS += -fopenmp", "LIBS += -lomp"), "", []),
+)
+
+
+_ARM64_BLOCK = "macx:equals(QT_ARCH, arm64) {\n%s\n}"
+# (case name, arm64 section, text after the macx scope). The model reads a deliberately narrow qmake grammar and refuses
+# everything else with an "unsupported qmake construct" error, so a shape it cannot interpret fails the test loudly
+# instead of passing quietly (adversary pass 2 on 1163490a: quoting, aliases, unset/include, selector rewrites, ...).
+_MACX_PIN_REFUSED = (
+    ("A1 comment-only line inside a removal continuation", _ARM64_LIVE,
+     _ARM64_BLOCK % "    QMAKE_CFLAGS -= \\\n        # compiler override\n        -fopenmp"),
+    ("A2 quoted removal operand", _ARM64_LIVE, _ARM64_BLOCK % '    QMAKE_CFLAGS -= "-fopenmp"\n    LIBS -= "-lomp"'),
+    ("A2 quoted addition", _arm64_section('QMAKE_CFLAGS += "-fopenmp"', 'LIBS += "-lomp"'), ""),
+    ("A3 removal through a $$ alias", _ARM64_LIVE,
+     _ARM64_BLOCK % "    OMP_C = -fopenmp\n    QMAKE_CFLAGS -= $$OMP_C\n    LIBS -= $${OMP_C}"),
+    ("A4 flag value copied from another variable", _ARM64_LIVE,
+     _ARM64_BLOCK % "    CONFIG(release, debug|release):QMAKE_LFLAGS += -fopenmp\n    QMAKE_CFLAGS -= $$QMAKE_LFLAGS"),
+    ("A4 CONFIG gains a token", _ARM64_LIVE, "CONFIG += release"),
+    ("A5 unset()", _ARM64_LIVE, "macx:equals(QT_ARCH, arm64):unset(QMAKE_CFLAGS)"),
+    ("A5 conditional include()", _ARM64_LIVE, "macx:equals(QT_ARCH, arm64):include(omp-override.pri)"),
+    ("A6 QT_ARCH reassigned", _ARM64_LIVE, "equals(QT_ARCH, arm64):QT_ARCH ="),
+    ("A6 CONFIG gains the linux scope name", _ARM64_LIVE,
+     _ARM64_BLOCK % "    CONFIG += linux\n    linux:QMAKE_CFLAGS -= -fopenmp"),
+    ("A7 doubled negation", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp", "LIBS += -lomp", opener="!!equals(QT_ARCH, x86_64)"), ""),
+    ("A8 quoted architecture operand", _ARM64_LIVE, 'macx:equals(QT_ARCH, "arm64e"):DEFINES += ARM64E_BUILD'),
+    ("A8 quoted operand on the live opener", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp", "LIBS += -lomp", opener='equals(QT_ARCH, "arm64")'), ""),
+    ("A8 selector text inside a message()", _ARM64_LIVE, 'message("For example, equals(QT_ARCH, example_arch)")'),
+    ("A9 '=' inside a condition", _ARM64_LIVE,
+     _ARM64_BLOCK % '    OMP_MODE = openmp=off\n    equals(OMP_MODE, "openmp=off"):QMAKE_CFLAGS -= -fopenmp'),
+    ("A10 quoted brace", _ARM64_LIVE, 'message("A left brace is {")'),
+    ("A10 unterminated $${ reference", _ARM64_LIVE, "DEFINES += $${BROKEN\n"),
+    ("A12 ~= substitution", _ARM64_LIVE, _ARM64_BLOCK % "    QMAKE_CFLAGS ~= s/^-std=c99$/-std=gnu99/"),
 )
 
 
@@ -446,6 +499,22 @@ int main(void)
             with self.subTest(text):
                 with self.assertRaises(AssertionError):
                     _qmake_effective_flags(text, "arm64")
+
+    def test_macos_arch_pin_model_refuses_constructs_it_cannot_interpret(self) -> None:
+        """Fail closed: a shape outside the narrow grammar raises 'unsupported qmake construct' (or an unterminated
+        scope), for either architecture, so nothing it cannot read can leave the pin passing."""
+        for name, arm64_section, tail in _MACX_PIN_REFUSED:
+            with self.subTest(name):
+                text = _MACX_PIN_TEMPLATE % {"arm64": arm64_section, "tail": tail}
+                with self.assertRaisesRegex(AssertionError, "unsupported qmake construct|unterminated"):
+                    _macos_openmp_gaps(text, "arm64")
+
+    def test_macos_arch_pin_model_returns_effective_tokens(self) -> None:
+        text = _MACX_PIN_TEMPLATE % {
+            "arm64": _arm64_section("QMAKE_CFLAGS *= -fopenmp", "QMAKE_CFLAGS *= -fopenmp", "LIBS += -lomp"), "tail": ""}
+        values = _qmake_effective_flags(text, "arm64")
+        self.assertEqual(values["QMAKE_CFLAGS"], ["-std=c99", "-fopenmp"])
+        self.assertEqual(values["LIBS"], ["-lomp"])
 
 
 if __name__ == "__main__":
