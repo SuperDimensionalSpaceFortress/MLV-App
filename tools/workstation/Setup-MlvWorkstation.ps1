@@ -371,7 +371,7 @@ function Invoke-Native {
     # -OkCodes are consulted (robocopy's normal exit 1 included). This function owns exit-code handling, so it turns that off for its own scope.
     $PSNativeCommandUseErrorActionPreference = $false
     foreach ($a in @($Arguments)) { Register-UrlSecretParts $a }   # DENY-BY-DEFAULT-1 S3: before the command line and before anything the child echoes back
-    Write-Log ("  > {0} {1}" -f $Exe, ($Arguments -join ' '))
+    Write-LogSafe ("  > {0} {1}" -f $Exe, ($Arguments -join ' '))   # r6 (adversary pass 1 A3): a log that cannot be written never stops the child (nor, below, hides its exit code)
     # r4 (sol r3 A2): an argument whose url secret holds a byte git may print in an unknown form: the child's output is withheld whole (fail closed)
     $withhold = @(@($Arguments) | Where-Object { Test-UrlSecretUnprintable $_ }).Count -gt 0
     if ($TimeoutSec -gt 0) {
@@ -395,9 +395,9 @@ function Invoke-Native {
     }
     if ($withhold) {
         $nOut = @(@($out) | Where-Object { "$_".Trim() }).Count
-        if ($nOut -gt 0) { Write-Log ("    ({0} line(s) of output withheld: an argument carries a url secret with a byte outside printable ASCII, which the child may print in a form this log cannot redact)" -f $nOut) }
+        if ($nOut -gt 0) { Write-LogSafe ("    ({0} line(s) of output withheld: an argument carries a url secret with a byte outside printable ASCII, which the child may print in a form this log cannot redact)" -f $nOut) }
     } else {
-        foreach ($o in @($out)) { if ("$o".Trim()) { Write-Log ("    {0}" -f "$o".TrimEnd()) } }
+        foreach ($o in @($out)) { if ("$o".Trim()) { Write-LogSafe ("    {0}" -f "$o".TrimEnd()) } }
     }
     if ($OkCodes -notcontains $code -and -not $AllowFail) { throw "$Exe exited $code" }
     return $code
@@ -425,7 +425,7 @@ function Get-PwshPath {
 function Invoke-Robocopy {
     # Robocopy exit codes 0-7 are success. Never /MIR or /PURGE: a re-run must not delete anything.
     param([string]$From, [string]$To, [string[]]$Files = @(), [string[]]$Extra = @())
-    if (-not (Test-Path -LiteralPath $From)) { Write-Log "  (absent, skipped) $From" 'WARN'; return }
+    if (-not (Test-Path -LiteralPath $From)) { Write-LogSafe "  (absent, skipped) $From" 'WARN'; return }
     $robo = Join-Path $env:SystemRoot 'System32\robocopy.exe'
     $robocopyArgs = @($From, $To) + $Files + @('/R:1', '/W:1', '/NP', '/NFL', '/NDL', '/NJH', '/NJS', '/XJ') + $Extra
     [void](Invoke-Native -Exe $robo -Arguments $robocopyArgs -OkCodes @(0, 1, 2, 3, 4, 5, 6, 7))
@@ -2897,7 +2897,7 @@ function Invoke-PhaseExport {
 function Move-ForeignClaims {
     param([string]$ClaimsDir, [string]$Stamp, [int]$MaxAgeHours = 24)
     $moved = [System.Collections.Generic.List[string]]::new()
-    if (-not (Test-Path -LiteralPath $ClaimsDir -PathType Container)) { Write-Log "no claims folder at $ClaimsDir (nothing to quarantine)"; return }
+    if (-not (Test-Path -LiteralPath $ClaimsDir -PathType Container)) { Write-LogSafe "no claims folder at $ClaimsDir (nothing to quarantine)"; return }
     $dest = Join-Path $ClaimsDir "migrated-foreign-$Stamp"
     $keptMalformed = 0
     foreach ($f in @(Get-ChildItem -LiteralPath $ClaimsDir -Filter '*.claim' -File -Force)) {
@@ -2925,7 +2925,7 @@ function Move-ForeignClaims {
         Move-Item -LiteralPath $f.FullName -Destination (Join-Path $dest $f.Name)
         $moved.Add($f.Name)
     }
-    Write-Log "foreign claims quarantined: $($moved.Count) -> $dest ; malformed claims left in place: $keptMalformed" $(if ($moved.Count) { 'WARN' } else { 'OK' })
+    Write-LogSafe "foreign claims quarantined: $($moved.Count) -> $dest ; malformed claims left in place: $keptMalformed" $(if ($moved.Count) { 'WARN' } else { 'OK' })
     return $moved.ToArray()
 }
 
@@ -3045,8 +3045,10 @@ function Get-ImportSourceBytesRefusal {
     if ($Name -ieq 'settings.json' -or $Name -ieq 'settings.local.json') {
         $strictText = $null
         try {
-            $sr2 = [IO.StreamReader]::new([IO.MemoryStream]::new($Bytes), [Text.UTF8Encoding]::new($false, $true), $true)
+            # no byte order mark detection (adversary pass 1 A1): FF FE would switch the reader to UTF-16 and read UTF-16 bytes as valid text; a UTF-8 BOM (EF BB BF) is the one mark accepted, stripped here
+            $sr2 = [IO.StreamReader]::new([IO.MemoryStream]::new($Bytes), [Text.UTF8Encoding]::new($false, $true), $false)
             try { $strictText = $sr2.ReadToEnd() } finally { $sr2.Dispose() }
+            $strictText = $strictText.TrimStart([char]0xFEFF)
         } catch { return "bundle file is damaged: $Name is not valid UTF-8 text" }
         if (-not (Test-ImportJsonObject $strictText)) { return "bundle file is damaged: $Name is not a valid JSON object" }
     }
@@ -3091,7 +3093,13 @@ function Copy-ImportFileLocked {
     $bytes = [IO.File]::ReadAllBytes($Source.FullName)
     # r17 pass 19 A5: the size limit is judged on the bytes actually read (a bundle file that grew past it after the inspection is skipped, as the inspection would have)
     $srcWhy = Get-ImportSourceBytesRefusal -Bytes $bytes -MaxScanBytes $MaxScanBytes -Name $Source.Name
-    if ($srcWhy) { return @{ Result = $(if ($srcWhy.StartsWith('bundle file is damaged')) { 'source-damaged' } else { 'source-credential' }); Why = $srcWhy } }
+    # r6 (adversary pass 1 A4): a size or credential refusal is final (nothing of the file is ever applied), but a DAMAGED source is judged only where the copy would WRITE: a host file the copy rules
+    # keep anyway (/XO, the host copy is newer) is a failure-free keep, as it was before the damage judgement existed. $damaged is acted on below, once the rules say the file is created or replaced.
+    $damaged = ''
+    if ($srcWhy) {
+        if (-not $srcWhy.StartsWith('bundle file is damaged')) { return @{ Result = 'source-credential'; Why = $srcWhy } }
+        $damaged = $srcWhy
+    }
     [void][IO.Directory]::CreateDirectory((Split-Path -Parent $Dest))
     $fs = $null
     try {
@@ -3099,6 +3107,13 @@ function Copy-ImportFileLocked {
         # r16 A4: created through a handle that can also delete it (New-OwnedFileStream), so a failed write takes back exactly this file
         try { $fs = New-OwnedFileStream -Path $Dest -Mode ([IO.FileMode]::CreateNew); $created = $true }
         catch [System.IO.IOException] { if (-not [IO.File]::Exists($Dest)) { throw } }
+        if ($created -and $damaged) {
+            # a damaged source is not created either: the empty file just made (it did not exist a moment ago) is taken back through its own handle
+            $held = $fs; $fs = $null
+            $rmWhy = Remove-OwnedFileByHandle $held
+            if ($rmWhy) { throw "IMPORT_PARTIAL_NOT_DELETED $Dest ($rmWhy) after: $damaged" }
+            return @{ Result = 'source-damaged'; Why = $damaged }
+        }
         if ($created) {
             # r12 A5: the timestamps are set THROUGH the handle that is still held (nothing can save into the file between the write and its timestamp, and a later
             # import's /XO rule reads the file's real time). The old order released the lock first and set the time by path, which backdated an editor's save.
@@ -3126,6 +3141,11 @@ function Copy-ImportFileLocked {
         }
         # Cheap pre-check without a lock: a destination the rules would not replace is never opened (a running hook may hold it).
         if (-not (Test-ImportReplaces -Source $Source -Dest ([IO.FileInfo]::new($Dest)) -ExcludeNewer $ExcludeNewer -ExcludeOlder $ExcludeOlder -ExcludeChanged $ExcludeChanged)) { return @{ Result = 'kept' } }
+        # r6 (adversary pass 1 A2, A4): the rules say this file WOULD be replaced, so a damaged source, or a zero-byte one over a host file that holds bytes (its LENGTH is metadata: known even when the host
+        # file's data cannot be read), is the typed source failure here, before the lock is tried (a host file that cannot be locked or read must not hide it)
+        if ($damaged) { return @{ Result = 'source-damaged'; Why = $damaged } }
+        $emptyEarly = Get-ImportSourceBytesRefusal -Bytes $bytes -MaxScanBytes $MaxScanBytes -Name $Source.Name -HostLength ([IO.FileInfo]::new($Dest)).Length
+        if ($emptyEarly) { return @{ Result = 'source-damaged'; Why = $emptyEarly } }
         try { $fs = [IO.File]::Open($Dest, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
         catch { return @{ Result = 'changed'; Why = "host file cannot be locked for the replace ($($_.Exception.Message))" } }
         # From here the host file is ours alone: the timestamps, the content and the write below are one atomic view of it.
@@ -3434,7 +3454,11 @@ function Invoke-ImportRobocopy {
             # r6 (sol r5 B3): the skip for an unreadable HOST file says nothing about the BUNDLE file. A bundle file that is damaged or cannot be read is still a failure of its own (the copy below
             # judges it first and names it: IMPORT_SOURCE_DAMAGED_NOT_REPLACED or IMPORT_COPY_FAILED, the host file untouched), so the stale host skip is not allowed to hide it.
             if ($inSkipSet -and -not $isNever) {
-                if ($null -eq $srcVerdict) { $srcVerdict = Get-ImportEarlySourceVerdict -Source $e }
+                if ($null -eq $srcVerdict) {
+                    # the host file's length is metadata (known although its data cannot be read): a zero-byte bundle file over it is a damaged source (adversary pass 1 A2)
+                    try { $hostLen = ([IO.FileInfo]::new($dest)).Length } catch { $hostLen = -1 }
+                    $srcVerdict = Get-ImportEarlySourceVerdict -Source $e -HostLength $hostLen
+                }
                 if ($srcVerdict.ReadFailed -or ($srcVerdict.Why -and $srcVerdict.Why.StartsWith('bundle file is damaged'))) { $inSkipSet = $false }
             }
             if ($inSkipSet) { continue }

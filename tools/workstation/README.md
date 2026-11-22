@@ -121,8 +121,9 @@ run for a dry run. The new-machine phases refuse to run on VIRTUAL-TEN unless yo
    bounded to 15 minutes: a stalled read fails the step instead of waiting for ever). A snapshot that fails
    part way (robocopy exit 8) is `IMPORT_SNAPSHOT_FAILED` (exit 1): the partial snapshot is removed and
    nothing is copied. A bundle `settings.json` or `settings.local.json`
-   that is not valid UTF-8 holding one JSON object, and a zero-byte bundle file whose host counterpart holds
-   bytes, are `IMPORT_SOURCE_DAMAGED_NOT_REPLACED <path>` (exit 1):
+   that is not valid UTF-8 (a UTF-16 file is refused) holding one JSON object, and a zero-byte bundle file
+   whose host counterpart holds bytes, are `IMPORT_SOURCE_DAMAGED_NOT_REPLACED <path>` (exit 1) wherever the
+   copy rules would write the file (a host file that is newer is kept with no failure, as before):
    the host file stays as it is (also when the host file itself cannot be read), so copy the bundle again.
    A bundle file that cannot be read is `IMPORT_COPY_FAILED <path>`. Every typed failure is registered before
    its line is logged, and every log line of the Import phase is written through a guard, so a log that

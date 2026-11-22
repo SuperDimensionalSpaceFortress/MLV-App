@@ -4311,14 +4311,15 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r6 import backup')) {
     $r6Dir = { Split-Path -Parent $script:R3HostPath }
     $script:R6After = $null
     # a bundle file of the given bytes (newer than the host file) against a host file holding $HostText (3 days older); $script:R6After is the host file once the import has ended
-    $r6Run = { param($Tag, $Leaf, [byte[]]$Bytes, [string]$HostText, [scriptblock]$Extra, [scriptblock]$ExtraCleanup)
+    $r6Run = { param($Tag, $Leaf, [byte[]]$Bytes, [string]$HostText, [scriptblock]$Extra, [scriptblock]$ExtraCleanup, [int]$HostAge = -3, [int]$BundleAge = 0)
         $script:R6Leaf = $Leaf; $script:R6Bytes = $Bytes; $script:R6HostText = $HostText; $script:R6Extra = $Extra; $script:R6ExtraCleanup = $ExtraCleanup; $script:R6After = $null
+        $script:R6HostAge = $HostAge; $script:R6BundleAge = $BundleAge
         return (Invoke-R3Import $Tag -3 0 {
             param($st, $sp)
             $hf = Join-Path (& $r6Dir) $script:R6Leaf
-            if ($null -ne $script:R6HostText) { [IO.File]::WriteAllText($hf, $script:R6HostText); (Get-Item -LiteralPath $hf).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-3) }
+            if ($null -ne $script:R6HostText) { [IO.File]::WriteAllText($hf, $script:R6HostText); (Get-Item -LiteralPath $hf).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays($script:R6HostAge) }
             $bf = Join-Path $script:BundlePath "home-claude\$($script:R6Leaf)"
-            [IO.File]::WriteAllBytes($bf, $script:R6Bytes); (Get-Item -LiteralPath $bf).LastWriteTimeUtc = [DateTime]::UtcNow
+            [IO.File]::WriteAllBytes($bf, $script:R6Bytes); (Get-Item -LiteralPath $bf).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays($script:R6BundleAge)
             if ($script:R6Extra) { & $script:R6Extra $st $sp }
         } $null {
             if ($script:R6ExtraCleanup) { & $script:R6ExtraCleanup }
@@ -4339,6 +4340,19 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r6 import backup')) {
     Assert-That ($script:R6After -ceq '{"theme":"light"}' -and $r6b3.Failures.Count -eq 0) 'r6 import control: a valid newer bundle settings.local.json still replaces the older host copy' "settings.local=[$($script:R6After)] failures=$($r6b3.Failures -join ',')"
     $r6b4 = & $r6Run 'r6b4' 'empty-note.txt' ([byte[]]@()) $null
     Assert-That ($script:R6After -ceq '' -and $r6b4.Failures.Count -eq 0) 'r6 import control: a zero-byte bundle file whose host counterpart is absent is still created (an empty file is damaged only against a non-empty host file)' "after=[$($script:R6After)] failures=$($r6b4.Failures -join ',')"
+    # (2b) adversary pass 1 A1: UTF-16 bytes with a byte order mark read as valid text through a BOM-detecting reader: both settings files must be UTF-8
+    $r6b5 = & $r6Run 'r6b5' 'settings.local.json' ([byte[]]@(0xFF, 0xFE, 0x7B, 0x00, 0x7D, 0x00)) '{"theme":"dark"}'
+    Assert-That ($script:R6After -ceq '{"theme":"dark"}' -and (& $r6Typed $r6b5 'IMPORT_SOURCE_DAMAGED_NOT_REPLACED' 'settings.local.json') -eq 1) 'r6 import (adversary A1): a bundle settings.local.json that is UTF-16 (byte order mark FF FE) is not valid UTF-8 and never replaces the host copy' "settings.local=[$($script:R6After)] failures=$($r6b5.Failures -join ',')`n$($r6b5.Out)"
+    $r6b6 = & $r6Run 'r6b6' 'settings.local.json' ([byte[]]@(0xEF, 0xBB, 0xBF) + $r6Utf8.GetBytes('{"theme":"light"}')) '{"theme":"dark"}'
+    Assert-That ($script:R6After.TrimStart([char]0xFEFF) -ceq '{"theme":"light"}' -and $r6b6.Failures.Count -eq 0) 'r6 import control (adversary A1): a UTF-8 settings.local.json with a byte order mark still replaces the older host copy' "settings.local=[$($script:R6After)] failures=$($r6b6.Failures -join ',')"
+    # (2c) adversary pass 1 A4: a damaged bundle file that the copy rules KEEP anyway (/XO: the host copy is newer) is a failure-free keep, as before
+    $r6b7 = & $r6Run 'r6b7' 'settings.local.json' ([byte[]]@(0x7B)) '{"theme":"dark"}' $null $null 0 -1
+    Assert-That ($script:R6After -ceq '{"theme":"dark"}' -and $r6b7.Failures.Count -eq 0) 'r6 import (adversary A4): a damaged bundle settings.local.json that is OLDER than the host copy is kept with no failure (the /XO keep is judged first)' "settings.local=[$($script:R6After)] failures=$($r6b7.Failures -join ',')"
+    # (3c) adversary pass 1 A2: a zero-byte bundle file over a read-denied, non-empty host file that no backup protects (not CLAUDE.md or settings.json): the typed source failure
+    $r6Deny0 = { & icacls.exe (Join-Path (& $r6Dir) $script:R6Leaf) /deny '*S-1-1-0:(RD)' 2>&1 | Out-Null }
+    $r6Undeny0 = { & icacls.exe (Join-Path (& $r6Dir) $script:R6Leaf) /remove:d '*S-1-1-0' 2>&1 | Out-Null }
+    $r6b8 = & $r6Run 'r6b8' 'ROTATION.md' ([byte[]]@()) 'HOST-GOOD-CONTENT' $r6Deny0 $r6Undeny0
+    Assert-That ($script:R6After -ceq 'HOST-GOOD-CONTENT' -and (& $r6Typed $r6b8 'IMPORT_SOURCE_DAMAGED_NOT_REPLACED' 'ROTATION.md') -eq 1) 'r6 import (adversary A2): a zero-byte bundle file over a read-denied non-empty host file is the typed source failure (not a silent skip)' "rotation=[$($script:R6After)] failures=$($r6b8.Failures -join ',')`n$($r6b8.Out)"
     # (3a) the host settings.json denies reads (its backup cannot be made, the inspection skips it) and the bundle settings.json is cut off: the typed source failure, not a silent skip
     $r6Deny = { & icacls.exe (Join-Path (& $r6Dir) $script:R6Leaf) /deny '*S-1-1-0:(RD)' 2>&1 | Out-Null }
     $r6Undeny = { & icacls.exe (Join-Path (& $r6Dir) $script:R6Leaf) /remove:d '*S-1-1-0' 2>&1 | Out-Null }
@@ -4401,6 +4415,10 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r6 import backup')) {
     $r6nThrown = ''; $r6nSw = [Diagnostics.Stopwatch]::StartNew()
     try { [void](Invoke-Native -Exe $r6pw -Arguments @('-NoProfile', '-Command', 'Start-Sleep -Seconds 60') -TimeoutSec 3) } catch { $r6nThrown = $_.Exception.Message }
     Assert-That ($r6nThrown -match 'did not finish within 3' -and $r6nSw.Elapsed.TotalSeconds -lt 30) 'r6 hardening: a native child that outlives its time bound is killed and reported (Invoke-Native -TimeoutSec)' "thrown=[$r6nThrown] seconds=$([int]$r6nSw.Elapsed.TotalSeconds)"
+    # adversary pass 1 A3 (pre-existing): a native call whose command line cannot be logged still runs (the expansion's logging used to throw before tar started)
+    $r6jlf = $script:LogFile; $script:LogFile = (New-Scratch 'r6j-logdir'); $r6jThrown = ''; $r6jCode = $null
+    try { $r6jCode = Invoke-Native -Exe $r6pw -Arguments @('-NoProfile', '-Command', 'exit 0') } catch { $r6jThrown = $_.Exception.Message } finally { $script:LogFile = $r6jlf }
+    Assert-That ((-not $r6jThrown) -and @($r6jCode)[-1] -eq 0) 'r6 hardening (adversary A3): a native call whose log lines cannot be written still runs and returns its exit code' "thrown=[$r6jThrown] code=[$($r6jCode -join ',')]"
     Assert-That ([IO.File]::ReadAllText($setup) -match 'tar\.exe''\) -Arguments @\(''-x'', ''-f'', \$BundlePath, ''-C'', \$src\) -TimeoutSec') 'r6 hardening: the bundle expansion runs tar.exe with a time bound' ''
     $script:Failures.Clear()
 }
