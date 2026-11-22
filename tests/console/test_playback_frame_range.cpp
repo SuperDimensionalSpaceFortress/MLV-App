@@ -4548,7 +4548,7 @@ TEST( PlaybackMeasuredLoopExit, ASeekOutOfTheWindowOrARawCountAboveNIsNeverThePi
 
 // r8 (the r7 venue run on 970ef3f9: Bachelor, clip id M16-1243, startFrame 120, gate wb_locked, target 480, exit 11 with
 // `target=480 observed=470`, `10 of 480 presents ... outside the admitted window starting at frame 120 (last presented frame 609)`).
-// The app log of that job shows every-frame Play (drop_frame=0) presenting 121..609 with 9 frames skipped by drawFrameReady's
+// The app log of that job shows Play presenting 121..609 with 9 frames skipped by drawFrameReady's
 // forward-only guard (`draw_frame_ready.skip_backward`): 325 334 339 347 350 420 428 450 599. For each, request_state of the NEXT
 // frame's request reads render_thread_rendering_at_request=0 and ready_slot_count_at_request=1: the skipped frame was already
 // rendered and READY when the next one finished, and the acquire took the newer one first. Frame 120 was on screen when Play began
@@ -4560,11 +4560,16 @@ TEST( PlaybackMeasuredLoopExit, ASeekOutOfTheWindowOrARawCountAboveNIsNeverThePi
 // as request serials: f was requested before f + 1), the other is acquired next, and the forward-only guard skips it when it is
 // older than the frame on screen. The present-path stop is modelled as MainWindow.cpp wires it: the raw count reached the target,
 // the source frames are consumed, AND pinnedPresentStopCount reached the target.
+// r8 fix 1 (adversary pass 8 on 77fa2218, and the same job's `automation.pacing_isolated ... drop_frame=1`: the automation forces
+// drop-frame mode on, so the venue's Play was drop-frame Play, where 77fa2218's oldest-first acquire never engaged). The replay also
+// models the measured-play loop's poll after each present (measuredPlayLoopShouldStop on the Reached state once the counter has
+// consumed the required frames, fed pinnedPresentStopCount as runGuiPlaybackSmoke feeds it), and `holdFrame` the unpaced
+// isolated hold (the playhead never passes it).
 namespace measured_loop_r8
 {
 using playback_frame_range::PinnedWindowPresents;
 struct Replay { PinnedWindowPresents w; int64_t raw = 0; int64_t last = -1; int64_t skipped = 0; bool stopped = false;
-                int64_t stopFrame = -1; int64_t observed = 0; bool met = false; };
+                bool loopStopped = false; int64_t stopFrame = -1; int64_t observed = 0; bool met = false; };
 constexpr int64_t kTimelineLead = 2;
 inline bool contains( const std::vector<int64_t> &v, int64_t x )
 {
@@ -4572,7 +4577,7 @@ inline bool contains( const std::vector<int64_t> &v, int64_t x )
     return false;
 }
 inline Replay replay( int64_t start, int64_t target, int64_t required, int64_t lastFrame, const std::vector<int64_t> &bothReadyAt,
-                      bool oldestFirst, int64_t firstPlayFrame = -1 )
+                      bool oldestFirst, int64_t firstPlayFrame = -1, int64_t holdFrame = -1 )
 {
     Replay r;
     auto present = [&]( int64_t frame )
@@ -4581,13 +4586,23 @@ inline Replay replay( int64_t start, int64_t target, int64_t required, int64_t l
         if( r.last >= 0 && frame < r.last ) { ++r.skipped; return; }   // drawFrameReady's forward-only guard (skip_backward)
         r.last = frame;
         ++r.raw;
-        r.w.arm( playback_frame_range::pinnedWindowFirstFrame( start ), required );
+        r.w.arm( playback_frame_range::pinnedWindowFirstFrame( start ), required, target );
         r.w.notePresent( frame );
-        const int64_t consumed = frame + kTimelineLead - start + 1;
+        const int64_t playhead = holdFrame >= 0 && frame + kTimelineLead > holdFrame ? holdFrame : frame + kTimelineLead;
+        const int64_t consumed = playhead - start + 1;
         if( target > 0 && r.raw >= target && consumed >= required
          && playback_frame_range::pinnedPresentStopCount( r.w ) >= target )
         {
             r.stopped = true;
+            r.stopFrame = frame;
+            return;
+        }
+        if( consumed >= required
+         && playback_frame_range::measuredPlayLoopShouldStop( playback_frame_range::PlayStopState::Reached, false, target,
+                                                              playback_frame_range::pinnedPresentStopCount( r.w ), required, true,
+                                                              consumed ) )
+        {
+            r.stopped = r.loopStopped = true;
             r.stopFrame = frame;
         }
     };
@@ -4630,26 +4645,28 @@ TEST( PlaybackMeasuredLoopExit, TheVenueSequenceNeverStopsOnARawCountAndEveryFra
         ASSERT_EQ( 10, kRequired - inWindow );
     }
 
-    // 1. The venue run as it ran (newest ready frame first). The stop must NOT fire on the raw count: 480 raw presents at frame 609,
-    //    but only 471 distinct pinned-window frames ([121, 600]: 121..600 less the nine skipped), so no present stop through 609 and
-    //    the capture is not met. 970ef3f9 stopped Play on the 480th raw present (frame 609).
+    // 1. The venue run as it ran (newest ready frame first). The stop must NOT fire on the raw count (970ef3f9 stopped Play on the
+    //    480th raw present, frame 609): at 600 only 471 distinct pinned-window frames ([121, 600]: 121..600 less the nine skipped)
+    //    were shown. r8 fix 1 (adversary A7): the first present outside the window (601) loses the capture for good, so the
+    //    measured-play loop ends the wait there -- on the not-met path -- instead of letting Play run on toward 16 frames past it.
     const Replay venue = replay( kStart, kTarget, kRequired, 609, venuePairs, false );
-    ASSERT_EQ( 480, venue.raw );
-    ASSERT_EQ( 609, venue.last );
     ASSERT_EQ( 9, venue.skipped );
-    ASSERT_TRUE( !venue.stopped );                                     // RED on 970ef3f9: the raw count stopped Play at 609
+    ASSERT_TRUE( venue.stopped );                                      // RED on 77fa2218: no stop through 609
+    ASSERT_TRUE( venue.loopStopped );                                  // the loop's stop, never the present path's count
+    ASSERT_EQ( 601, venue.stopFrame );
+    ASSERT_EQ( 472, venue.raw );
     ASSERT_EQ( 121, venue.w.windowStart );
     ASSERT_EQ( 471, venue.w.distinct );
-    ASSERT_EQ( 9, venue.w.outside );                                   // 601..609
+    ASSERT_EQ( 1, venue.w.outside );
     ASSERT_EQ( 471, venue.observed );
     ASSERT_TRUE( !venue.met );
 
-    // 2. The same ready pairs, acquired the way every-frame Play now acquires (oldest ready first): no frame is skipped, the
-    //    480th distinct pinned-window frame is 600 (= start + N, the frame the capture script names), Play stops on it, nothing
-    //    outside the window was presented, and the capture is met.
-    const bool everyFramePlayOldestFirst = playback_frame_range::playbackAcquiresOldestReadyFirst( true, false );
-    ASSERT_TRUE( everyFramePlayOldestFirst );                          // RED on 970ef3f9: the newest ready frame first
-    const Replay ordered = replay( kStart, kTarget, kRequired, 609, venuePairs, everyFramePlayOldestFirst );
+    // 2. The same ready pairs, acquired the way a pinned capture now acquires (oldest ready first, also in the drop-frame mode the
+    //    automation forces): no frame is skipped, the 480th distinct pinned-window frame is 600 (= start + N, the frame the capture
+    //    script names), Play stops on it, nothing outside the window was presented, and the capture is met.
+    const bool pinnedDropFramePlayOldestFirst = playback_frame_range::playbackAcquiresOldestReadyFirst( true, true, true );
+    ASSERT_TRUE( pinnedDropFramePlayOldestFirst );                     // RED on 77fa2218: drop-frame Play took the newest first
+    const Replay ordered = replay( kStart, kTarget, kRequired, 609, venuePairs, pinnedDropFramePlayOldestFirst );
     ASSERT_EQ( 0, ordered.skipped );
     ASSERT_TRUE( ordered.stopped );
     ASSERT_EQ( kStart + kTarget, ordered.stopFrame );
@@ -4676,19 +4693,23 @@ TEST( PlaybackMeasuredLoopExit, TheVenueSequenceNeverStopsOnARawCountAndEveryFra
         ASSERT_EQ( start + kTarget, p.stopFrame );
     }
 
-    // 4. A Play that ALSO presents the start frame (on screen already, so not part of the pinned window): it is outside the window
-    //    and the capture is not met (fail closed: observed above the target), never a success with N + 1 presents.
+    // 4. A Play that ALSO presents the start frame (adversary A3: drop-frame Play's first tick can grant less than a frame, and the
+    //    start refresh submits it). It is the frame already on screen when Play began: a REPEAT, never a pinned-window frame and
+    //    never an out-of-window present, so the run is judged on 121..600 like any other and is met; it is never counted.
     const Replay withStart = replay( kStart, kTarget, kRequired, 640, {}, true, kStart );
     ASSERT_TRUE( withStart.stopped );
-    ASSERT_EQ( 1, withStart.w.outside );
+    ASSERT_EQ( 600, withStart.stopFrame );
+    ASSERT_EQ( 0, withStart.w.outside );                               // RED on 77fa2218: outside 1, observed 481
+    ASSERT_EQ( 1, withStart.w.repeats );
     ASSERT_EQ( kTarget, withStart.w.distinct );
-    ASSERT_EQ( kTarget + 1, withStart.observed );
-    ASSERT_TRUE( !withStart.met );
+    ASSERT_EQ( kTarget, withStart.observed );
+    ASSERT_TRUE( withStart.met );
 
     // 5. A repeated present of a window frame is never counted again, and a present outside the window never counts.
     PinnedWindowPresents w;
-    w.arm( playback_frame_range::pinnedWindowFirstFrame( kStart ), kRequired );
+    w.arm( playback_frame_range::pinnedWindowFirstFrame( kStart ), kRequired, kTarget );
     ASSERT_EQ( 121, w.windowStart );
+    ASSERT_EQ( 600, w.identityFrame );
     ASSERT_EQ( 0, w.distinct );
     w.notePresent( 300 );
     w.notePresent( 300 );
@@ -4696,14 +4717,16 @@ TEST( PlaybackMeasuredLoopExit, TheVenueSequenceNeverStopsOnARawCountAndEveryFra
     w.notePresent( 121 );
     ASSERT_EQ( 2, w.distinct );
     ASSERT_EQ( 2, w.repeats );
-    w.notePresent( 120 );
+    ASSERT_EQ( 2, playback_frame_range::pinnedPresentStopCount( w ) );
+    w.notePresent( 120 );                                              // the start frame: a repeat (A3)
+    ASSERT_EQ( 3, w.repeats );
+    ASSERT_EQ( 0, w.outside );
     w.notePresent( 601 );
     w.notePresent( 600 );
     ASSERT_EQ( 3, w.distinct );
-    ASSERT_EQ( 2, w.outside );
-    ASSERT_EQ( 3, playback_frame_range::pinnedPresentStopCount( w ) );
+    ASSERT_EQ( 1, w.outside );
     // the arm is once: a later arm never moves the window or resets the count
-    w.arm( 0, 10 );
+    w.arm( 0, 10, 10 );
     ASSERT_EQ( 121, w.windowStart );
     ASSERT_EQ( 3, w.distinct );
     // an unarmed ledger counts nothing inside (fail closed)
@@ -4713,7 +4736,7 @@ TEST( PlaybackMeasuredLoopExit, TheVenueSequenceNeverStopsOnARawCountAndEveryFra
     ASSERT_EQ( 1, unarmed.outside );
     // N in-window frames plus an out-of-window present is never met (observed above the target, as before this round)
     PinnedWindowPresents over;
-    over.arm( 1, 3 );
+    over.arm( 1, 3, 3 );
     over.notePresent( 1 );
     over.notePresent( 7 );
     over.notePresent( 2 );
@@ -4721,14 +4744,83 @@ TEST( PlaybackMeasuredLoopExit, TheVenueSequenceNeverStopsOnARawCountAndEveryFra
     ASSERT_EQ( 3, over.distinct );
     ASSERT_EQ( 4, playback_frame_range::pinnedWindowObservedFrames( 3, over ) );
 
-    // 6. The acquire order: oldest first only in every-frame Play; drop-frame Play and a paused redraw keep the newest first.
-    ASSERT_TRUE( !playback_frame_range::playbackAcquiresOldestReadyFirst( true, true ) );
-    ASSERT_TRUE( !playback_frame_range::playbackAcquiresOldestReadyFirst( false, false ) );
-    ASSERT_TRUE( !playback_frame_range::playbackAcquiresOldestReadyFirst( false, true ) );
+    // 6. The acquire order: oldest first in every-frame Play and in a pinned capture's Play (drop-frame or not); unpinned drop-frame
+    //    Play and a paused redraw keep the newest first.
+    ASSERT_TRUE( playback_frame_range::playbackAcquiresOldestReadyFirst( true, false, false ) );
+    ASSERT_TRUE( playback_frame_range::playbackAcquiresOldestReadyFirst( true, false, true ) );
+    ASSERT_TRUE( !playback_frame_range::playbackAcquiresOldestReadyFirst( true, true, false ) );
+    ASSERT_TRUE( !playback_frame_range::playbackAcquiresOldestReadyFirst( false, false, true ) );
+    ASSERT_TRUE( !playback_frame_range::playbackAcquiresOldestReadyFirst( false, true, true ) );
     ASSERT_TRUE( playback_frame_range::readySlotPreferred( true, false, 9, 0 ) );     // the first ready slot is always taken
     ASSERT_TRUE( playback_frame_range::readySlotPreferred( false, false, 9, 0 ) );
     ASSERT_TRUE( playback_frame_range::readySlotPreferred( true, true, 210, 211 ) );   // oldest first: 325 (serial 210) wins
     ASSERT_TRUE( !playback_frame_range::readySlotPreferred( true, true, 211, 210 ) );
     ASSERT_TRUE( playback_frame_range::readySlotPreferred( false, true, 211, 210 ) );  // newest first: unchanged
     ASSERT_TRUE( !playback_frame_range::readySlotPreferred( false, true, 210, 211 ) );
+}
+
+// r8 fix 1 (adversary pass 8 on 77fa2218): the pinned window [start + 1, start + N] and everything that bounds the Play agree on
+// it. Each block is RED on 77fa2218's rules (the RED stubs) and green on the fix.
+TEST( PlaybackMeasuredLoopExit, R8Fix1TheCaptureEndsOnItsIdentityFrameAndNeverWaitsOnALostCapture )
+{
+    using namespace measured_loop_r8;
+    using playback_frame_range::PinnedWindowPresents;
+    static constexpr int64_t kStart = 120, kTarget = 480, kRequired = 480;
+
+    // A1: the unpaced isolated hold. The counter counts the start frame, so it has consumed the required 480 frames at 599; a
+    //     pinned capture holds only once the playhead is on the identity frame 600 (consumed 481), so 600 is presented and met.
+    //     77fa2218 held at 599: 600 was never presented, 479 distinct, no stop until the safety timeout.
+    int64_t holdFrame = -1;
+    for( int64_t p = kStart; p < kStart + 2 * kRequired && holdFrame < 0; ++p )
+    {
+        const int64_t consumed = p - kStart + 1;
+        if( consumed >= kRequired && playback_frame_range::pinnedUnpacedHoldReached( kTarget, consumed, kRequired ) )
+            holdFrame = p;
+    }
+    ASSERT_EQ( kStart + kTarget, holdFrame );                          // RED on 77fa2218: 599
+    const Replay unpaced = replay( kStart, kTarget, kRequired, holdFrame, {}, true, -1, holdFrame );
+    ASSERT_TRUE( unpaced.stopped );
+    ASSERT_EQ( kStart + kTarget, unpaced.stopFrame );
+    ASSERT_TRUE( unpaced.met );
+    // an unpinned run holds exactly as before, at the required source frames
+    ASSERT_TRUE( playback_frame_range::pinnedUnpacedHoldReached( 0, kRequired, kRequired ) );
+    ASSERT_TRUE( !playback_frame_range::pinnedUnpacedHoldReached( kTarget, kRequired, kRequired ) );
+    ASSERT_TRUE( playback_frame_range::pinnedUnpacedHoldReached( kTarget, kRequired + 1, kRequired ) );
+
+    // A2: the identity frame start + N must exist and lie before the clip's last frame (the engine's end-of-clip stop can end Play
+    //     before the last frame's present is credited). A 480-frame clip (last index 479) or a 481-frame one from frame 0 is
+    //     refused up front; the venue (from 120, cut-out 937) is admitted; an unpinned run is never refused here.
+    ASSERT_TRUE( !playback_frame_range::pinnedIdentityFrameAdmitted( 0, 480, 479 ) );   // RED on 77fa2218: admitted
+    ASSERT_TRUE( !playback_frame_range::pinnedIdentityFrameAdmitted( 0, 480, 480 ) );
+    ASSERT_TRUE( playback_frame_range::pinnedIdentityFrameAdmitted( 0, 480, 481 ) );
+    ASSERT_TRUE( playback_frame_range::pinnedIdentityFrameAdmitted( kStart, kTarget, 936 ) );
+    ASSERT_TRUE( !playback_frame_range::pinnedIdentityFrameAdmitted( 500, 480, 936 ) );
+    ASSERT_TRUE( playback_frame_range::pinnedIdentityFrameAdmitted( 0, 0, 10 ) );
+    ASSERT_TRUE( !playback_frame_range::pinnedIdentityFrameAdmitted( 900, 480, 10 ) );  // start past the last frame
+
+    // A4: N distinct window frames whose LAST present is not the identity frame (a backfill of 4 after 5) never stops Play and is
+    //     never met: the capture would save frame 4, not start + N. A later present of the identity frame credits it.
+    PinnedWindowPresents backfill;
+    backfill.arm( 1, 5, 5 );
+    for( const int64_t f : { int64_t( 1 ), int64_t( 2 ), int64_t( 3 ), int64_t( 5 ), int64_t( 4 ) } ) backfill.notePresent( f );
+    ASSERT_EQ( 5, backfill.distinct );
+    ASSERT_EQ( 4, playback_frame_range::pinnedPresentStopCount( backfill ) );          // RED on 77fa2218: 5, Play stopped on 4
+    ASSERT_EQ( 4, playback_frame_range::pinnedWindowObservedFrames( 5, backfill ) );   // RED on 77fa2218: 5, met
+    backfill.notePresent( 5 );                                                         // a repeat of the identity frame
+    ASSERT_EQ( 5, playback_frame_range::pinnedPresentStopCount( backfill ) );
+    ASSERT_EQ( 5, playback_frame_range::pinnedWindowObservedFrames( 5, backfill ) );
+
+    // A7: once a present fell outside the window the capture can never be met, so the stop count reaches the target and the
+    //     measured-play loop ends at its next Reached poll (consumed only 1 past the window: the timeline was seeked to 900) on the
+    //     not-met path, instead of waiting while consumed() -- which never counts a seek -- stays under 16 past the window.
+    PinnedWindowPresents seeked;
+    seeked.arm( 121, 480, 480 );
+    for( int64_t f = 121; f <= 598; ++f ) seeked.notePresent( f );
+    seeked.notePresent( 900 );
+    seeked.notePresent( 901 );
+    ASSERT_EQ( 480, playback_frame_range::pinnedPresentStopCount( seeked ) );          // RED on 77fa2218: 478
+    ASSERT_TRUE( playback_frame_range::measuredPlayLoopShouldStop( playback_frame_range::PlayStopState::Reached, false, 480,
+                                                                   playback_frame_range::pinnedPresentStopCount( seeked ), 480,
+                                                                   true, 481 ) );
+    ASSERT_EQ( 478, playback_frame_range::pinnedWindowObservedFrames( 480, seeked ) );
 }

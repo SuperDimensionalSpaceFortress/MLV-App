@@ -271,7 +271,9 @@ TEST(ResizePlaybackPolicyWiring, R8EveryFramePlayAcquiresOldestFirstAndThePinned
     const QString ready = mainWindowFunction(QStringLiteral("void MainWindow::drawFrameReady("));
     ASSERT_FALSE(ready.isEmpty());
     ASSERT_TRUE(ready.contains(QStringLiteral("playback_frame_range::playbackAcquiresOldestReadyFirst(")));
-    ASSERT_TRUE(ready.contains(QStringLiteral("ui->actionPlay->isChecked(), ui->actionDropFrameMode->isChecked() );")));
+    // r8 fix 1: a pinned capture's Play too (the automation forces drop-frame mode on: the r7 venue log's drop_frame=1)
+    ASSERT_TRUE(ready.contains(QStringLiteral(
+        "ui->actionPlay->isChecked(), ui->actionDropFrameMode->isChecked(), m_playbackSmokeTargetPresentedFrames > 0 );")));
     ASSERT_TRUE(ready.contains(QStringLiteral("acquireLatestReadyFrame( &readyFrame, oldestReadyFirst )")));
     ASSERT_TRUE(ready.contains(QRegularExpression(QStringLiteral(
         "acquireLatestReadyFrameForPlaybackTarget\\(\\s*&readyFrame,\\s*activePlaybackTarget,\\s*activeGeneration,\\s*oldestReadyFirst\\s*\\)"))));
@@ -316,4 +318,20 @@ TEST(ResizePlaybackPolicyWiring, R8EveryFramePlayAcquiresOldestFirstAndThePinned
     ASSERT_TRUE(observedAt > smokeAt);
     ASSERT_TRUE(judgedAt > observedAt);
     ASSERT_FALSE(mainWindow.contains(QStringLiteral("m_playbackSmokeWindowPresentedFrames")));
+
+    // r8 fix 1 (adversary pass 8 on 77fa2218): the ledger is armed with the target (its identity frame start + N); the unpaced
+    // isolated hold waits for the identity frame (A1); a pin whose identity frame is not before the clip's last frame is refused
+    // before the measured Play (A2).
+    ASSERT_TRUE(note.contains(QStringLiteral("m_playRequiredSourceFrames, m_playbackSmokeTargetPresentedFrames );")));
+    const QString handling = mainWindowFunction(QStringLiteral("void MainWindow::playbackHandling("));
+    ASSERT_TRUE(handling.contains(QStringLiteral(
+        "if( m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() && programmaticPlayConsumed()\n"
+        "         && playback_frame_range::pinnedUnpacedHoldReached( m_playbackSmokeTargetPresentedFrames, m_sourceAdvance.consumed(),\n"
+        "                                                            m_playRequiredSourceFrames ) ) return;")));
+    const int floorAt = mainWindow.indexOf(QStringLiteral("presentedFramesTargetReachesFloor( options.targetPresentedFrames"), smokeAt);
+    const int identityAt = mainWindow.indexOf(QStringLiteral("playback_frame_range::pinnedIdentityFrameAdmitted("), smokeAt);
+    const int measuredPlayAt = mainWindow.indexOf(QStringLiteral("site=gui-smoke-measured reason=PINNED_FRAME_PAST_CLIP_END"), smokeAt);
+    ASSERT_TRUE(floorAt > smokeAt);
+    ASSERT_TRUE(identityAt > floorAt);
+    ASSERT_TRUE(measuredPlayAt > identityAt);
 }

@@ -28495,7 +28495,7 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     // pinned capture (consumed() > 0 is the counter's armed state). Repeats and presents outside the window never count.
     if( m_playbackSmokeTargetPresentedFrames > 0 && m_sourceAdvance.consumed() > 0 )
         m_playbackSmokePinnedWindow.arm( playback_frame_range::pinnedWindowFirstFrame( m_sourceAdvance.startFrame ),
-                                         m_playRequiredSourceFrames );
+                                         m_playRequiredSourceFrames, m_playbackSmokeTargetPresentedFrames );
     m_playbackSmokePinnedWindow.notePresent( static_cast<int64_t>( displayFrame ) );
     const auto avgSmokeMs = [this]( double sum ) -> double
     {
@@ -36069,9 +36069,10 @@ void MainWindow::drawFrameReady()
         if( !haveReadyFrame )
         {
             // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r8: every-frame Play takes the oldest ready frame, so a ready frame never
-            // overtakes an older ready one that the forward-only guard below would then skip (r7 venue: 9 window frames lost)
+            // overtakes an older ready one that the forward-only guard below would then skip (r7 venue: 9 window frames lost).
+            // r8 fix 1: so does a pinned capture's Play, in the drop-frame mode the automation forces (that venue log: drop_frame=1)
             const bool oldestReadyFirst = playback_frame_range::playbackAcquiresOldestReadyFirst(
-                ui->actionPlay->isChecked(), ui->actionDropFrameMode->isChecked() );
+                ui->actionPlay->isChecked(), ui->actionDropFrameMode->isChecked(), m_playbackSmokeTargetPresentedFrames > 0 );
             haveReadyFrame = targetAwareLookaheadAcquire
                 ? m_pRenderThread->acquireLatestReadyFrameForPlaybackTarget(
                     &readyFrame,

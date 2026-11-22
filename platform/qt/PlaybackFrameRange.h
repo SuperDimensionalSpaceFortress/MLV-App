@@ -1357,20 +1357,26 @@ struct PinnedWindowPresents
 {
     int64_t windowStart = 0;
     int64_t windowFrames = 0;           // 0 = not armed
+    int64_t target = 0;                 // the pinned count N
+    int64_t identityFrame = -1;         // start + N: the frame a met capture ends on (the capture script's identity)
     std::vector<unsigned char> seen;    // one flag per window source frame
     int64_t distinct = 0;               // distinct window source frames shown: the pinned count
     int64_t outside = 0;                // presents of a source frame outside the window (never counted)
     int64_t repeats = 0;                // presents of a window frame already counted (never counted again)
+    int64_t lastFrame = -1;             // the source frame of the latest present, whatever it was
     bool armed() const { return windowFrames > 0; }
-    void arm( int64_t firstFrame, int64_t frames )
+    void arm( int64_t firstFrame, int64_t frames, int64_t targetFrames )
     {
-        if( armed() || frames <= 0 ) return;
+        if( armed() || frames <= 0 || targetFrames <= 0 ) return;
         windowStart = firstFrame;
         windowFrames = frames;
+        target = targetFrames;
+        identityFrame = firstFrame + ( targetFrames < frames ? targetFrames : frames ) - 1;
         seen.assign( static_cast<size_t>( frames ), 0 );
     }
     void notePresent( int64_t sourceFrame )
     {
+        lastFrame = sourceFrame;
         if( !sourceFrameInsideAdmittedWindow( sourceFrame, armed(), windowStart, windowFrames ) ) { ++outside; return; }
         unsigned char &shown = seen[static_cast<size_t>( sourceFrame - windowStart )];
         if( shown ) { ++repeats; return; }
@@ -1378,6 +1384,8 @@ struct PinnedWindowPresents
         ++distinct;
     }
 };
+// RED STUB (r8 fix 1): 77fa2218's rule, the distinct count whatever frame is on screen.
+inline int64_t pinnedWindowShownCount( const PinnedWindowPresents &w ) { return w.distinct; }
 // What the present-path stop and the measured-play loop count toward the target: the distinct window frames, never raw presents.
 inline int64_t pinnedPresentStopCount( const PinnedWindowPresents &w ) { return w.distinct; }
 // The `observed` of the strict check (exit 11): pinnedCaptureObservedFrames over the counted presents (distinct window frames plus
@@ -1387,11 +1395,28 @@ inline int64_t pinnedWindowObservedFrames( int64_t targetPresentedFrames, const 
 {
     return pinnedCaptureObservedFrames( targetPresentedFrames, w.distinct + w.outside, w.distinct );
 }
+// RED STUB (r8 fix 1): 77fa2218's unpaced hold, at the counter's required source frames whatever the pin.
+inline bool pinnedUnpacedHoldReached( int64_t targetPresentedFrames, int64_t consumedSourceFrames, int64_t requiredSourceFrames )
+{
+    (void)targetPresentedFrames; (void)consumedSourceFrames; (void)requiredSourceFrames;
+    return true;
+}
+// RED STUB (r8 fix 1): 77fa2218 admitted any pin the play gate admitted.
+inline bool pinnedIdentityFrameAdmitted( int64_t startFrame, int64_t targetPresentedFrames, int64_t lastFrameIndex )
+{
+    (void)startFrame; (void)targetPresentedFrames; (void)lastFrameIndex;
+    return true;
+}
 // Every-frame Play (drop-frame mode off) shows every source frame, so a ready frame never overtakes an older ready one. The
 // venue log: the frame skipped by drawFrameReady's forward-only guard was already READY when the next one finished
 // (request_state rendering 0, ready slots 1), and the acquire took the newer one first. Drop-frame Play and a paused redraw keep
 // the newest ready frame first (a stale frame there is rightly skipped).
-inline bool playbackAcquiresOldestReadyFirst( bool playing, bool dropFrameMode ) { return playing && !dropFrameMode; }
+// RED STUB (r8 fix 1): 77fa2218's rule, which a pinned capture under the automation's forced drop-frame mode never engages.
+inline bool playbackAcquiresOldestReadyFirst( bool playing, bool dropFrameMode, bool pinnedCapture )
+{
+    (void)pinnedCapture;
+    return playing && !dropFrameMode;
+}
 // RenderFrameThread's ready-slot choice: does the ready slot with candidateSerial replace the one chosen so far (chosenSerial)?
 // Newest first is the previous rule exactly (a later serial, or an equal one, replaces).
 inline bool readySlotPreferred( bool oldestFirst, bool haveChosen, uint64_t candidateSerial, uint64_t chosenSerial )
