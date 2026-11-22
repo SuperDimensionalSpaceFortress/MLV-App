@@ -371,9 +371,14 @@ uint64_t llrpGpuPlaybackReconSetIsoPatternCount(void);
  * call (a reader that does not see the new count read before the backend changed). This returns 1 and the three
  * counts as the calling thread's last recon run read them under the backend mutex, after its configure and before
  * its run, or 0 when no run on this thread recorded them since the last call; either way it clears them. NULL
- * outputs are allowed (a call with three NULLs only clears). The warm-output reuse key (PlaybackReconWarmRun.h)
+ * outputs are allowed (a call with all NULLs only clears). The warm-output reuse key (PlaybackReconWarmRun.h)
  * uses it so that its counts describe the backend state its own recon ran with. */
-int llrpGpuPlaybackReconTakeLastRunConfigureCounts(uint64_t * set_clip, uint64_t * set_luts, uint64_t * set_pattern);
+int llrpGpuPlaybackReconTakeLastRunConfigureCounts(uint64_t * set_clip, uint64_t * set_luts, uint64_t * set_pattern,
+                                                   uint64_t * configure_generation);
+/* r22 adversary A1: one count that every native configure (set_iso_pattern, set_clip, set_luts) increments before
+ * its call. A reader that loads it LAST, and still sees the value it expects, read before any configure stored
+ * anything after that value; three per-kind loads alone cannot give that (a configure can land between them). */
+uint64_t llrpGpuPlaybackReconConfigureGeneration(void);
 /* One line per set_clip / set_luts event (frame, wall ms, dims), emitted after
  * the backend mutex is released. NULL uninstalls. */
 typedef void (*llrpGpuReconEventLogger_t)(const char * line);

@@ -930,7 +930,12 @@ static volatile LONG64 g_llrawproc_gpu_set_iso_pattern_count = 0;
  * after the run instead (outside the lock) could take in another thread's configure whose native call had not yet
  * happened. Taken and cleared by llrpGpuPlaybackReconTakeLastRunConfigureCounts. */
 static MLV_THREAD_LOCAL int g_llrawproc_gpu_last_run_configure_counts_valid = 0;
-static MLV_THREAD_LOCAL uint64_t g_llrawproc_gpu_last_run_configure_counts[3] = { 0, 0, 0 };
+static MLV_THREAD_LOCAL uint64_t g_llrawproc_gpu_last_run_configure_counts[4] = { 0, 0, 0, 0 };
+/* r22 adversary A1: ONE count every native configure (set_iso_pattern, set_clip, set_luts) publishes to before its
+ * call, after its own per-kind count. The present reads it LAST: three per-kind loads cannot share one instant, so a
+ * configure published and stored between the present's luts load and its pattern load was invisible to all three; a
+ * store before the generation load is always preceded by a generation increment that load sees. */
+static volatile LONG64 g_llrawproc_gpu_configure_generation = 0;
 static llrpGpuReconEventLogger_t g_llrawproc_gpu_recon_event_logger = NULL;
 static llrpGpuStageTelemetrySink_t g_llrawproc_gpu_stage_telemetry_sink = NULL;
 /* adversary r14 A1: a logger may uninstall itself (llrpSetGpuReconEventLogger(NULL)) from inside its own call. Each event
@@ -3066,6 +3071,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     if(need_set_pattern)
     {
         set_pattern_count = (long long)InterlockedIncrement64(&g_llrawproc_gpu_set_iso_pattern_count);
+        InterlockedIncrement64(&g_llrawproc_gpu_configure_generation);
         set_pattern_start_s = mlv_stage_timing_now();
         set_pattern_rc = g->set_iso_pattern(g->backend, clip.is_bright);
         set_pattern_ms = (mlv_stage_timing_now() - set_pattern_start_s) * 1000.0;
@@ -3096,6 +3102,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
             llrawproc_gpu_stage_telemetry_enter(g, set_clip_event, IGPU_CUDA_ERROR_CHANNEL_RENDER);
         }
         set_clip_count = (long long)InterlockedIncrement64(&g_llrawproc_gpu_set_clip_count);   /* r22: before the call */
+        InterlockedIncrement64(&g_llrawproc_gpu_configure_generation);
         set_clip_start_s = mlv_stage_timing_now();
         rc = g->set_clip(g->backend, &clip);
         set_clip_ms = (mlv_stage_timing_now() - set_clip_start_s) * 1000.0;
@@ -3128,6 +3135,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
             llrawproc_gpu_stage_telemetry_enter(g, set_luts_event, IGPU_CUDA_ERROR_CHANNEL_RENDER);
         }
         set_luts_count = (long long)InterlockedIncrement64(&g_llrawproc_gpu_set_luts_count);   /* r22: before the call */
+        InterlockedIncrement64(&g_llrawproc_gpu_configure_generation);
         set_luts_start_s = mlv_stage_timing_now();
         rc = g->set_luts(g->backend, &luts);
         set_luts_ms = (mlv_stage_timing_now() - set_luts_start_s) * 1000.0;
@@ -3175,6 +3183,8 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
             (uint64_t)InterlockedCompareExchange64(&g_llrawproc_gpu_set_luts_count, 0, 0);
         g_llrawproc_gpu_last_run_configure_counts[2] =
             (uint64_t)InterlockedCompareExchange64(&g_llrawproc_gpu_set_iso_pattern_count, 0, 0);
+        g_llrawproc_gpu_last_run_configure_counts[3] =
+            (uint64_t)InterlockedCompareExchange64(&g_llrawproc_gpu_configure_generation, 0, 0);
         g_llrawproc_gpu_last_run_configure_counts_valid = 1;
     }
     if(rc == 0)
@@ -4067,7 +4077,13 @@ uint64_t llrpGpuPlaybackReconSetIsoPatternCount(void)
     return (uint64_t)InterlockedCompareExchange64(&g_llrawproc_gpu_set_iso_pattern_count, 0, 0);
 }
 
-int llrpGpuPlaybackReconTakeLastRunConfigureCounts(uint64_t * set_clip, uint64_t * set_luts, uint64_t * set_pattern)
+uint64_t llrpGpuPlaybackReconConfigureGeneration(void)
+{
+    return (uint64_t)InterlockedCompareExchange64(&g_llrawproc_gpu_configure_generation, 0, 0);
+}
+
+int llrpGpuPlaybackReconTakeLastRunConfigureCounts(uint64_t * set_clip, uint64_t * set_luts, uint64_t * set_pattern,
+                                                   uint64_t * configure_generation)
 {
     const int valid = g_llrawproc_gpu_last_run_configure_counts_valid;
     if(valid)
@@ -4075,6 +4091,7 @@ int llrpGpuPlaybackReconTakeLastRunConfigureCounts(uint64_t * set_clip, uint64_t
         if(set_clip) *set_clip = g_llrawproc_gpu_last_run_configure_counts[0];
         if(set_luts) *set_luts = g_llrawproc_gpu_last_run_configure_counts[1];
         if(set_pattern) *set_pattern = g_llrawproc_gpu_last_run_configure_counts[2];
+        if(configure_generation) *configure_generation = g_llrawproc_gpu_last_run_configure_counts[3];
     }
     g_llrawproc_gpu_last_run_configure_counts_valid = 0;
     return valid;
@@ -4425,11 +4442,18 @@ uint64_t llrpGpuPlaybackReconSetIsoPatternCount(void)
     return 0;
 }
 
-int llrpGpuPlaybackReconTakeLastRunConfigureCounts(uint64_t * set_clip, uint64_t * set_luts, uint64_t * set_pattern)
+uint64_t llrpGpuPlaybackReconConfigureGeneration(void)
+{
+    return 0;
+}
+
+int llrpGpuPlaybackReconTakeLastRunConfigureCounts(uint64_t * set_clip, uint64_t * set_luts, uint64_t * set_pattern,
+                                                   uint64_t * configure_generation)
 {
     (void)set_clip;
     (void)set_luts;
     (void)set_pattern;
+    (void)configure_generation;
     return 0;
 }
 

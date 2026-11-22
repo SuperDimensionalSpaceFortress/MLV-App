@@ -246,6 +246,7 @@ struct InjectedPresent
         if (midRead) midRead(reads, 1);
         now.setPattern = live.setPattern;
         if (midRead) midRead(reads, 2);
+        now.generation = live.generation;   // r22 adversary A1: loaded last, as GpuDisplayWindow does
         return now;
     }
 
@@ -271,10 +272,40 @@ InjectedPresent atWarmCounts(const Key &w)
     p.live.setClip = w.setClipCountAfterWarm;
     p.live.setLuts = w.setLutsCountAfterWarm;
     p.live.setPattern = w.setPatternCountAfterWarm;
+    p.live.generation = w.configureGenerationAfterWarm;
     return p;
 }
 
 } // namespace
+
+// r22 adversary A1, the row as written: warm and gate counts (3,5,11), adopted valid keys, an equal completed compare;
+// the worker publishes and stores set_luts 5 -> 6 after the luts load of read 3 (the second post-compare read) and
+// before its pattern load. Every native configure also publishes the generation before its call (llrawproc.c) and the
+// present loads the generation last, so the hit is refused.
+TEST(PlaybackWarmOutputReusePolicy, ALutsConfigureInsideTheFinalReadIsNeverAHitBecauseTheGenerationIsReadLast)
+{
+    Key w = warmKey();
+    w.configureGenerationAfterWarm = 19;
+    InjectedPresent present = atWarmCounts(w);
+    present.midRead = [&present](int read, int field)
+    {
+        if (read != 3 || field != 1) return;
+        ++present.live.setLuts;      // published before the native call ...
+        ++present.live.generation;   // ... with the generation
+    };
+    bool attempted = false;
+    const Reason r = present.run(w, presentKey(), &attempted);
+    ASSERT_EQ(3, present.reads);
+    ASSERT_EQ(std::string("recon_configured_since_warm"), name(r));
+    ASSERT_FALSE(reuse(r));
+    // and a generation that moved before the gate skips the compare, like any per-kind count
+    InjectedPresent early = atWarmCounts(w);
+    early.live.generation = 20;
+    bool earlyAttempted = true;
+    ASSERT_EQ(std::string("recon_configured_since_warm"), name(early.run(w, presentKey(), &earlyAttempted)));
+    ASSERT_FALSE(earlyAttempted);
+    ASSERT_EQ(0, early.compares);
+}
 
 // sol r17 #2, the row as written: reuse on, the present samples pattern count 11, then lookahead configures 1100 -> 0011
 // (live count 12) before the present's compare; equal prepared state, equal Bayer16 input. Expected

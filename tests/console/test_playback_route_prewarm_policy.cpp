@@ -851,6 +851,7 @@ TEST(PlaybackWarmOutputReuseWiring, TheWarmKeysTheSlotOnlyAfterItsAmazeSucceeded
                               "key.wb[2] = wbMultipliers[2];", "key.reducedHnyquist = reducedHnyquist;",
                               "key.setClipCountAfterWarm = setClipCountAfter;", "key.setLutsCountAfterWarm = setLutsCountAfter;",
                               "key.setPatternCountAfterWarm = setPatternCountAfter;",
+                              "key.configureGenerationAfterWarm = configureGenerationAfter;",   // r22 adversary A1
                               "key.captureId = captureId;"})
         ASSERT_TRUE(warm.contains(QString::fromLatin1(field)));
     // MainWindow hands the warm its frame and the KEY counts: r22 (sol r21 #1), the three counts the warm's own run
@@ -858,20 +859,23 @@ TEST(PlaybackWarmOutputReuseWiring, TheWarmKeysTheSlotOnlyAfterItsAmazeSucceeded
     const QString source = sourceFile("platform/qt/MainWindow.cpp");
     ASSERT_TRUE(source.contains(QStringLiteral(
         "static_cast<uint64_t>( done.frameNumber ), outcome.keySetClipCount, outcome.keySetLutsCount,")));
-    ASSERT_TRUE(source.contains(QStringLiteral("outcome.keySetPatternCount, &reuseCapture, &warmState );")));
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "outcome.keySetPatternCount, outcome.keyConfigureGeneration, &reuseCapture, &warmState );")));
     ASSERT_FALSE(source.contains(QStringLiteral("outcome.setPatternCountAfter, &reuseCapture")));
     const QString core = sourceFile("platform/qt/PlaybackReconWarmRun.h");
     const int run = core.indexOf(QStringLiteral("applyLLRawProcObjectWorker( video, raw.data()"));
     // an earlier run's counts are dropped before this run, then this run's are taken after it
-    const int dropped = core.indexOf(QStringLiteral("(void)llrpGpuPlaybackReconTakeLastRunConfigureCounts( nullptr, nullptr, nullptr );"));
+    const int dropped = core.indexOf(QStringLiteral(
+        "(void)llrpGpuPlaybackReconTakeLastRunConfigureCounts( nullptr, nullptr, nullptr, nullptr );"));
     const int taken = core.indexOf(QStringLiteral(
-        "const bool keyed = llrpGpuPlaybackReconTakeLastRunConfigureCounts( &keyClip, &keyLuts, &keyPattern ) != 0;"));
+        "llrpGpuPlaybackReconTakeLastRunConfigureCounts( &keyClip, &keyLuts, &keyPattern, &keyGeneration ) != 0;"));
     ASSERT_TRUE(dropped >= 0);
     ASSERT_TRUE(run > dropped);
     ASSERT_TRUE(taken > run);
     for (const char *field : {"out.keySetClipCount = keyed ? keyClip : kNoKeyCount;",
                               "out.keySetLutsCount = keyed ? keyLuts : kNoKeyCount;",
-                              "out.keySetPatternCount = keyed ? keyPattern : kNoKeyCount;"})
+                              "out.keySetPatternCount = keyed ? keyPattern : kNoKeyCount;",
+                              "out.keyConfigureGeneration = keyed ? keyGeneration : kNoKeyCount;"})
         ASSERT_TRUE(core.contains(QString::fromLatin1(field)));
     // the telemetry counts stay, read on the same worker right after the same run
     const int after = core.indexOf(QStringLiteral("out.setClipCountAfter = llrpGpuPlaybackReconSetClipCount();"));
@@ -959,8 +963,17 @@ TEST(PlaybackWarmOutputReuseWiring, TheGateAndTheCompareComeBeforeTheDeviceAmaze
     const QString countRead = present.mid(counts, gate - counts);
     for (const char *read : {"now.setClip = llrpGpuPlaybackReconSetClipCount();",
                              "now.setLuts = llrpGpuPlaybackReconSetLutsCount();",
-                             "now.setPattern = llrpGpuPlaybackReconSetIsoPatternCount();"})
+                             "now.setPattern = llrpGpuPlaybackReconSetIsoPatternCount();",
+                             "now.generation = llrpGpuPlaybackReconConfigureGeneration();"})
         ASSERT_TRUE(countRead.contains(QString::fromLatin1(read)));
+    // r22 adversary A1: the generation is the LAST load of the read (a configure stored before it is always seen)
+    ASSERT_TRUE(countRead.indexOf(QStringLiteral("now.generation = llrpGpuPlaybackReconConfigureGeneration();"))
+                > countRead.indexOf(QStringLiteral("now.setPattern = llrpGpuPlaybackReconSetIsoPatternCount();")));
+    ASSERT_TRUE(countRead.indexOf(QStringLiteral("now.generation = llrpGpuPlaybackReconConfigureGeneration();"))
+                > countRead.indexOf(QStringLiteral("now.setClip = llrpGpuPlaybackReconSetClipCount();")));
+    ASSERT_TRUE(countRead.indexOf(QStringLiteral("now.generation = llrpGpuPlaybackReconConfigureGeneration();"))
+                > countRead.indexOf(QStringLiteral("now.setLuts = llrpGpuPlaybackReconSetLutsCount();")));
+    ASSERT_EQ(1, (int)present.count(QStringLiteral("llrpGpuPlaybackReconConfigureGeneration()")));
     // no count is sampled anywhere else in the present (one stale read is what sol r17 #2 found)
     ASSERT_EQ(1, (int)present.count(QStringLiteral("llrpGpuPlaybackReconSetIsoPatternCount()")));
     ASSERT_EQ(1, (int)present.count(QStringLiteral("llrpGpuPlaybackReconSetClipCount()")));

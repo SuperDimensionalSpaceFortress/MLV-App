@@ -4548,22 +4548,22 @@ $script:ExportCdngStageWindowTable = @(
     # applyLLRawProcObjectWorker(..., NULL, 0) (:6664-6667; body :5261-6588, every timer reset at :5280-5292). The scaled path llrawproc_apply_with_dims_internal (:6851-7337) is
     # playback-only, so none of its lines is a window here; and the literal 0 is stop_before_dual_iso, so the block at :5714-5725 never runs on export. The test Guard
     # (CdngStageContainmentGateTests) re-derives every window below from the C sources by call-site reachability from dng.c's call. The seven timed children (dng.c:571-577):
-    [ordered]@{ name = 'llrawproc_dark_frame'; parent = 'llrawproc'; windows = @('llrawproc.c:5491-5511', 'llrawproc.c:5708-5715') }
-    [ordered]@{ name = 'llrawproc_vertical_stripes'; parent = 'llrawproc'; windows = @('llrawproc.c:5613-5623', 'llrawproc.c:5720-5727') }
-    [ordered]@{ name = 'llrawproc_focus_pixels'; parent = 'llrawproc'; windows = @('llrawproc.c:5644-5664', 'llrawproc.c:5732-5743', 'llrawproc.c:6463-6474') }
-    # (bad_pixels calls llrawproc_reset_force_bad_pixel_search, :5011-5019, only from inside its windows, :5761 and :6497)
-    [ordered]@{ name = 'llrawproc_bad_pixels'; parent = 'llrawproc'; windows = @('llrawproc.c:5669-5695', 'llrawproc.c:5748-5763', 'llrawproc.c:6484-6499', 'llrawproc.c:5011-5019') }
-    [ordered]@{ name = 'llrawproc_pattern_noise'; parent = 'llrawproc'; windows = @('llrawproc.c:5768-5781') }
-    # (dual_iso: :5883-5909, :5914-6342, :6533-6542)
-    [ordered]@{ name = 'llrawproc_dual_iso'; parent = 'llrawproc'; windows = @('llrawproc.c:5883-5909', 'llrawproc.c:5914-6342', 'llrawproc.c:6533-6542') }
-    [ordered]@{ name = 'llrawproc_chroma_smooth'; parent = 'llrawproc'; windows = @('llrawproc.c:6581-6594') }
+    [ordered]@{ name = 'llrawproc_dark_frame'; parent = 'llrawproc'; windows = @('llrawproc.c:5515-5535', 'llrawproc.c:5732-5739') }
+    [ordered]@{ name = 'llrawproc_vertical_stripes'; parent = 'llrawproc'; windows = @('llrawproc.c:5637-5647', 'llrawproc.c:5744-5751') }
+    [ordered]@{ name = 'llrawproc_focus_pixels'; parent = 'llrawproc'; windows = @('llrawproc.c:5668-5688', 'llrawproc.c:5756-5767', 'llrawproc.c:6487-6498') }
+    # (bad_pixels calls llrawproc_reset_force_bad_pixel_search, :5035-5043, only from inside its windows, :5785 and :6521)
+    [ordered]@{ name = 'llrawproc_bad_pixels'; parent = 'llrawproc'; windows = @('llrawproc.c:5693-5719', 'llrawproc.c:5772-5787', 'llrawproc.c:6508-6523', 'llrawproc.c:5035-5043') }
+    [ordered]@{ name = 'llrawproc_pattern_noise'; parent = 'llrawproc'; windows = @('llrawproc.c:5792-5805') }
+    # (dual_iso: :5907-5933, :5938-6366, :6557-6566)
+    [ordered]@{ name = 'llrawproc_dual_iso'; parent = 'llrawproc'; windows = @('llrawproc.c:5907-5933', 'llrawproc.c:5938-6366', 'llrawproc.c:6557-6566') }
+    [ordered]@{ name = 'llrawproc_chroma_smooth'; parent = 'llrawproc'; windows = @('llrawproc.c:6605-6618') }
     # The lock times. shared_lock: the first lock :5369-5515 (or :5369-5603 when the stripes block :5512-5544 does not run; both lie inside the two windows listed), the stripes publish lock
     # :5529-5539 and the relock :5541-5603, the reset lock :4941-4949 (:4949), AND the refine and publish lock times added to it (:6358, :6520).
     # (adversary pass17 A1: because shared_lock ACCUMULATES the refine and publish lock times, it CONTAINS them: each, and their disjoint sum, is inside shared_lock; contains = those rows)
-    [ordered]@{ name = 'llrawproc_shared_lock'; parent = 'llrawproc'; windows = @('llrawproc.c:5465-5611', 'llrawproc.c:5625-5699', 'llrawproc.c:5011-5019',
-        'llrawproc.c:6386-6453', 'llrawproc.c:6611-6615'); contains = @('llrawproc_dualiso_refine_lock', 'llrawproc_publish_lock') }
-    [ordered]@{ name = 'llrawproc_dualiso_refine_lock'; parent = 'llrawproc'; windows = @('llrawproc.c:6386-6453') }
-    [ordered]@{ name = 'llrawproc_publish_lock'; parent = 'llrawproc'; windows = @('llrawproc.c:6611-6615') }
+    [ordered]@{ name = 'llrawproc_shared_lock'; parent = 'llrawproc'; windows = @('llrawproc.c:5489-5635', 'llrawproc.c:5649-5723', 'llrawproc.c:5035-5043',
+        'llrawproc.c:6410-6477', 'llrawproc.c:6635-6639'); contains = @('llrawproc_dualiso_refine_lock', 'llrawproc_publish_lock') }
+    [ordered]@{ name = 'llrawproc_dualiso_refine_lock'; parent = 'llrawproc'; windows = @('llrawproc.c:6410-6477') }
+    [ordered]@{ name = 'llrawproc_publish_lock'; parent = 'llrawproc'; windows = @('llrawproc.c:6635-6639') }
     # pre_dualiso_fix: the worker resets it (:5289) and writes it only inside `if (stop_before_dual_iso)` (:5714-5716), which export's literal 0 never enters, so on export it accrues
     # NOWHERE and has no window (r17 key3 B1: the row carried the scaled call :6626-7096, which met dual_iso's scaled windows and kept it out of every group). A row with no window meets
     # no other row, so it joins every disjoint group: any value export publishes for it is work outside every timed window of llrawproc, and is held inside llrawproc with the rest.

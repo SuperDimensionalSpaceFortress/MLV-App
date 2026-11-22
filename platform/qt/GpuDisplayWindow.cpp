@@ -647,6 +647,7 @@ bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16IfActive(const uint16
                                                                     uint64_t setClipCountAfter,
                                                                     uint64_t setLutsCountAfter,
                                                                     uint64_t setPatternCountAfter,
+                                                                    uint64_t configureGenerationAfter,
                                                                     QString *reuseCapture,
                                                                     const playback_warm_output_reuse::PreparedState *warmState)
 {
@@ -672,7 +673,7 @@ bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16IfActive(const uint16
     return win->warmStagedReconSlotFromDeviceBayer16(deviceBayer16, width, height, blackLevel, wbMultipliers,
                                                      reducedHnyquist, kernelMs, reason, amazeTiming,
                                                      frame, setClipCountAfter, setLutsCountAfter, setPatternCountAfter,
-                                                     reuseCapture, warmState);
+                                                     configureGenerationAfter, reuseCapture, warmState);
 }
 
 /* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W: the first recon present's AMaZE call (device Bayer16 -> RGBA16, the
@@ -692,6 +693,7 @@ bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16(const uint16_t *devi
                                                             uint64_t setClipCountAfter,
                                                             uint64_t setLutsCountAfter,
                                                             uint64_t setPatternCountAfter,
+                                                            uint64_t configureGenerationAfter,
                                                             QString *reuseCapture,
                                                             const playback_warm_output_reuse::PreparedState *warmState)
 {
@@ -768,6 +770,7 @@ bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16(const uint16_t *devi
             key.setClipCountAfterWarm = setClipCountAfter;
             key.setLutsCountAfterWarm = setLutsCountAfter;
             key.setPatternCountAfterWarm = setPatternCountAfter;
+            key.configureGenerationAfterWarm = configureGenerationAfter;
             key.captureId = captureId;
             // WARM-RECON-DETERMINISM-1 F-key: the recon constants of this input (unknown without them: never reused)
             if ( warmState ) key.state = *warmState;
@@ -1456,6 +1459,8 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
                 now.setClip = llrpGpuPlaybackReconSetClipCount();
                 now.setLuts = llrpGpuPlaybackReconSetLutsCount();
                 now.setPattern = llrpGpuPlaybackReconSetIsoPatternCount();
+                // r22 adversary A1: LAST, so that no configure can store between the final load and the decision
+                now.generation = llrpGpuPlaybackReconConfigureGeneration();
                 return now;
             };
             bool reuseCompareAttempted = false;

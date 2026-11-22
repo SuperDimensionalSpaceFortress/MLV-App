@@ -14,6 +14,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <thread>
 
@@ -1145,13 +1146,22 @@ TEST(DualIsoGpuConfigureCache, TheDllHarnessChecksEveryBufferAllocationBeforeUsi
 namespace
 {
 
-playback_warm_output_reuse::LiveCounts liveConfigureCountsLikeThePresent()
+// The loads of GpuDisplayWindow's readLiveConfigureCounts, in its order; afterLutsLoad (tests only) runs between the
+// luts load and the next one.
+playback_warm_output_reuse::LiveCounts liveConfigureCountsLikeThePresent(const std::function<void()> & afterLutsLoad)
 {
     playback_warm_output_reuse::LiveCounts now;
     now.setClip = llrpGpuPlaybackReconSetClipCount();
     now.setLuts = llrpGpuPlaybackReconSetLutsCount();
+    if (afterLutsLoad) afterLutsLoad();
     now.setPattern = llrpGpuPlaybackReconSetIsoPatternCount();
+    now.generation = llrpGpuPlaybackReconConfigureGeneration();   // r22 adversary A1: last
     return now;
+}
+
+playback_warm_output_reuse::LiveCounts liveConfigureCountsLikeThePresent()
+{
+    return liveConfigureCountsLikeThePresent(std::function<void()>());
 }
 
 struct RaceProbe
@@ -1181,6 +1191,7 @@ playback_warm_output_reuse::Key raceWarmKeyFromLiveCounts()
     k.setClipCountAfterWarm = c.setClip;
     k.setLutsCountAfterWarm = c.setLuts;
     k.setPatternCountAfterWarm = c.setPattern;
+    k.configureGenerationAfterWarm = c.generation;
     return k;
 }
 
@@ -1188,7 +1199,7 @@ playback_warm_output_reuse::Reason decideWithAnEqualCompare(const playback_warm_
 {
     bool attempted = false;
     return playback_warm_output_reuse::decide(
-        true, true, warmKey, warmKey, false, false, liveConfigureCountsLikeThePresent,
+        true, true, warmKey, warmKey, false, false, [] { return liveConfigureCountsLikeThePresent(); },
         [](bool * equal, QString * why)
         {
             *equal = true;
@@ -1302,7 +1313,7 @@ TEST(DualIsoGpuConfigureCache, TheWarmKeyIsTakenUnderTheBackendLockSoAConfigureI
     int ok = 0;
     llrpGpuPlaybackReconState_t warm = configureState(1);
     setPattern(warm, 1, 1, 0, 0);
-    (void)llrpGpuPlaybackReconTakeLastRunConfigureCounts(nullptr, nullptr, nullptr);
+    (void)llrpGpuPlaybackReconTakeLastRunConfigureCounts(nullptr, nullptr, nullptr, nullptr);
     (void)configureWorkOf(warm, &ok);   // the warm's run, on this thread
     ASSERT_EQ(1, ok);
 
@@ -1322,8 +1333,8 @@ TEST(DualIsoGpuConfigureCache, TheWarmKeyIsTakenUnderTheBackendLockSoAConfigureI
         reachedTheStore = gate.cv.wait_for(lock, std::chrono::seconds(30), [&gate] { return gate.inStore; });
     }
     // the other thread holds the backend mutex inside its native pattern store; its count is already published
-    uint64_t c = 0, l = 0, p = 0;
-    const int keyed = llrpGpuPlaybackReconTakeLastRunConfigureCounts(&c, &l, &p);
+    uint64_t c = 0, l = 0, p = 0, g = 0;
+    const int keyed = llrpGpuPlaybackReconTakeLastRunConfigureCounts(&c, &l, &p, &g);
     const playback_warm_output_reuse::LiveCounts afterRunOutsideTheLock = liveConfigureCountsLikeThePresent();
     {
         std::lock_guard<std::mutex> lock(gate.m);
@@ -1337,16 +1348,19 @@ TEST(DualIsoGpuConfigureCache, TheWarmKeyIsTakenUnderTheBackendLockSoAConfigureI
     ASSERT_EQ(1, otherOk);
     ASSERT_EQ(1, keyed);
     // a second take finds nothing: the counts are this run's, once
-    ASSERT_EQ(0, llrpGpuPlaybackReconTakeLastRunConfigureCounts(nullptr, nullptr, nullptr));
+    ASSERT_EQ(0, llrpGpuPlaybackReconTakeLastRunConfigureCounts(nullptr, nullptr, nullptr, nullptr));
 
     playback_warm_output_reuse::Key underLock = raceWarmKeyFromLiveCounts();
     underLock.setClipCountAfterWarm = c;
     underLock.setLutsCountAfterWarm = l;
     underLock.setPatternCountAfterWarm = p;
+    underLock.configureGenerationAfterWarm = g;
     playback_warm_output_reuse::Key afterRun = underLock;
     afterRun.setClipCountAfterWarm = afterRunOutsideTheLock.setClip;
     afterRun.setLutsCountAfterWarm = afterRunOutsideTheLock.setLuts;
     afterRun.setPatternCountAfterWarm = afterRunOutsideTheLock.setPattern;
+    afterRun.configureGenerationAfterWarm = afterRunOutsideTheLock.generation;
+    ASSERT_EQ(g + 1, afterRunOutsideTheLock.generation);
     std::printf("[dualiso-configure-cache] r22 warm side: pattern under_lock=%llu after_run=%llu live_now=%llu\n",
                 (unsigned long long)p, (unsigned long long)afterRunOutsideTheLock.setPattern,
                 (unsigned long long)llrpGpuPlaybackReconSetIsoPatternCount());
@@ -1358,18 +1372,63 @@ TEST(DualIsoGpuConfigureCache, TheWarmKeyIsTakenUnderTheBackendLockSoAConfigureI
     ASSERT_EQ(std::string("hit"), std::string(playback_warm_output_reuse::reasonName(decideWithAnEqualCompare(afterRun))));
 }
 
+// adversary r22 A1: a torn final read. The present reads clip, then luts, then pattern; a worker that publishes AND
+// stores a set_luts after the final read's luts load and before its pattern load leaves every per-kind count the
+// present loads at its warm value, although the backend changed before decide()'s last load. The present's read set
+// must end with one load that every configure publishes to before its native call (the configure generation), so
+// that no store can precede the final authorizing load unseen.
+TEST(DualIsoGpuConfigureCache, AReuseDecisionWhoseFinalReadIsTornByAConfigureIsNeverAHit)
+{
+    FakeBackendScope scope;
+    int ok = 0;
+    (void)configureWorkOf(configureState(1), &ok);
+    ASSERT_EQ(1, ok);
+    const playback_warm_output_reuse::Key warmKey = raceWarmKeyFromLiveCounts();
+    int reads = 0;
+    int tornConfigureOk = 0;
+    bool attempted = false;
+    const playback_warm_output_reuse::Reason reason = playback_warm_output_reuse::decide(
+        true, true, warmKey, warmKey, false, false,
+        [&]()
+        {
+            ++reads;
+            // read 1 is the gate's, 2 and 3 the post-compare pair: tear read 3 after its luts load
+            return liveConfigureCountsLikeThePresent([&]()
+            {
+                if (reads != 3) return;
+                llrpGpuPlaybackReconState_t changed = configureState(2);
+                changed.ev_correction = -2.0;   // a LUT-key-only change: set_luts publishes and stores
+                tornConfigureOk = runState(changed);
+            });
+        },
+        [](bool * equal, QString * why)
+        {
+            *equal = true;
+            why->clear();
+            return true;
+        },
+        &attempted);
+    std::printf("[dualiso-configure-cache] r22 A1 torn final read: reads=%d configure_ok=%d reason=%s\n", reads,
+                tornConfigureOk, playback_warm_output_reuse::reasonName(reason));
+    ASSERT_EQ(3, reads);
+    ASSERT_EQ(1, tornConfigureOk);
+    ASSERT_EQ(std::string("recon_configured_since_warm"), std::string(playback_warm_output_reuse::reasonName(reason)));
+}
+
 // A run that recorded no counts (it never reached the configure) leaves the take empty, and the warm's key then holds
 // kNoKeyCount, which no live count equals.
 TEST(DualIsoGpuConfigureCache, AWarmWithNoRecordedCountsIsNeverReused)
 {
-    (void)llrpGpuPlaybackReconTakeLastRunConfigureCounts(nullptr, nullptr, nullptr);
-    uint64_t c = 5, l = 5, p = 5;
-    ASSERT_EQ(0, llrpGpuPlaybackReconTakeLastRunConfigureCounts(&c, &l, &p));
+    (void)llrpGpuPlaybackReconTakeLastRunConfigureCounts(nullptr, nullptr, nullptr, nullptr);
+    uint64_t c = 5, l = 5, p = 5, g = 5;
+    ASSERT_EQ(0, llrpGpuPlaybackReconTakeLastRunConfigureCounts(&c, &l, &p, &g));
     ASSERT_EQ((uint64_t)5, c);   // outputs untouched when nothing was recorded
+    ASSERT_EQ((uint64_t)5, g);
     playback_warm_output_reuse::Key k = raceWarmKeyFromLiveCounts();
     k.setClipCountAfterWarm = playback_recon_warm_run::kNoKeyCount;
     k.setLutsCountAfterWarm = playback_recon_warm_run::kNoKeyCount;
     k.setPatternCountAfterWarm = playback_recon_warm_run::kNoKeyCount;
+    k.configureGenerationAfterWarm = playback_recon_warm_run::kNoKeyCount;
     ASSERT_EQ(std::string("recon_configured_since_warm"),
               std::string(playback_warm_output_reuse::reasonName(decideWithAnEqualCompare(k))));
 }

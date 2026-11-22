@@ -161,6 +161,7 @@ struct Key
     uint64_t setClipCountAfterWarm = 0;
     uint64_t setLutsCountAfterWarm = 0;
     uint64_t setPatternCountAfterWarm = 0;   // adversary r17 A1: set_iso_pattern is a configure that moves neither count above
+    uint64_t configureGenerationAfterWarm = 0;   // r22 adversary A1: llrpGpuPlaybackReconConfigureGeneration, all three kinds
     uint64_t captureId = 0;
     PreparedState state;   // F-key: the recon's per-run constants this AMaZE input was made with
 };
@@ -217,13 +218,23 @@ inline Reason afterCompare( bool compareCompleted, bool equal, const QString &wh
 }
 
 /*! The three process-wide configure counts (llrpGpuPlaybackReconSetClipCount / SetLutsCount / SetIsoPatternCount), read
- *  together. */
+ *  together, and r22 (adversary A1) the configure generation, read LAST (llrpGpuPlaybackReconConfigureGeneration:
+ *  every native configure increments it before its call, so a read whose final load still sees the warm's generation
+ *  was taken before any configure stored anything since the warm). */
 struct LiveCounts
 {
     uint64_t setClip = 0;
     uint64_t setLuts = 0;
     uint64_t setPattern = 0;
+    uint64_t generation = 0;
 };
+
+/*! The per-kind counts and the generation against the warm key: whether any configure ran since the warm. */
+inline bool configuredSinceWarm( const Key &warmKey, const LiveCounts &now )
+{
+    return configuredSinceWarm( warmKey, now.setClip, now.setLuts, now.setPattern )
+        || now.generation != warmKey.configureGenerationAfterWarm;
+}
 
 /*! The present's whole decision (GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture): preGate() on the live
  *  counts, then, only when it passed, the exact input compare. readLiveCounts() returns a LiveCounts;
@@ -251,6 +262,8 @@ inline Reason decide( bool enabled,
     const Reason gate = preGate( enabled, adopted, warmKey, presentKey, cudaSuppressed, validationProbe, sampled.setClip,
                                  sampled.setLuts, sampled.setPattern );
     if( gate != Reason::None ) return gate;
+    // r22 adversary A1: the generation too (preGate keeps its per-kind signature)
+    if( configuredSinceWarm( warmKey, sampled ) ) return Reason::ReconConfiguredSinceWarm;
     if( compareAttempted ) *compareAttempted = true;
     bool equal = false;
     QString why;
@@ -265,11 +278,14 @@ inline Reason decide( bool enabled,
     // value means its configure's native call had not started, and the warm key's counts are read under the backend
     // mutex by the warm's own run (llrpGpuPlaybackReconTakeLastRunConfigureCounts), so nothing it does not count was
     // stored before its recon ran. Pinned by tests/pipeline/test_dualiso_gpu_configure_cache.cpp (AReuseDecisionInside*)
+    // r22 adversary A1: the per-kind instant is at the END of the first whole read, and a configure can still be
+    // published and stored before the second read's last per-kind load. The generation, loaded last in every read and
+    // incremented before every native configure, closes that: a hit means no configure stored anything before
+    // decide()'s final load (AReuseDecisionWhoseFinalReadIsTornByAConfigureIsNeverAHit).
     for( int pass = 0; pass < 2; ++pass )
     {
         const LiveCounts after = readLiveCounts();
-        if( configuredSinceWarm( warmKey, after.setClip, after.setLuts, after.setPattern ) )
-            return Reason::ReconConfiguredSinceWarm;
+        if( configuredSinceWarm( warmKey, after ) ) return Reason::ReconConfiguredSinceWarm;
     }
     return Reason::Hit;
 }

@@ -63,6 +63,7 @@ struct Outcome
     uint64_t keySetClipCount = kNoKeyCount;
     uint64_t keySetLutsCount = kNoKeyCount;
     uint64_t keySetPatternCount = kNoKeyCount;
+    uint64_t keyConfigureGeneration = kNoKeyCount;   // r22 adversary A1: the one count all three kinds publish to
     int backendRc = 0;
     llrpGpuPlaybackRetainedDeviceBayer16_t retained;   // valid when ran; the caller releases retained.token
     // PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1: the llrawproc runs this warm made (F-a: 2 when the first one
@@ -176,7 +177,7 @@ inline Outcome run( mlvObject_t *video,
         const uint64_t setClipRunStart = llrpGpuPlaybackReconSetClipCount();
         const uint64_t setLutsRunStart = llrpGpuPlaybackReconSetLutsCount();
         // r22: drop any counts an earlier run on this thread left, so the ones taken below are this run's
-        (void)llrpGpuPlaybackReconTakeLastRunConfigureCounts( nullptr, nullptr, nullptr );
+        (void)llrpGpuPlaybackReconTakeLastRunConfigureCounts( nullptr, nullptr, nullptr, nullptr );
         const double runStart = mlv_stage_timing_now();
         {
             const ThreadOptIn optIn;
@@ -197,11 +198,13 @@ inline Outcome run( mlvObject_t *video,
         out.setLutsCountAfter = llrpGpuPlaybackReconSetLutsCount();
         out.setPatternCountAfter = llrpGpuPlaybackReconSetIsoPatternCount();
         {
-            uint64_t keyClip = 0, keyLuts = 0, keyPattern = 0;
-            const bool keyed = llrpGpuPlaybackReconTakeLastRunConfigureCounts( &keyClip, &keyLuts, &keyPattern ) != 0;
+            uint64_t keyClip = 0, keyLuts = 0, keyPattern = 0, keyGeneration = 0;
+            const bool keyed =
+                llrpGpuPlaybackReconTakeLastRunConfigureCounts( &keyClip, &keyLuts, &keyPattern, &keyGeneration ) != 0;
             out.keySetClipCount = keyed ? keyClip : kNoKeyCount;
             out.keySetLutsCount = keyed ? keyLuts : kNoKeyCount;
             out.keySetPatternCount = keyed ? keyPattern : kNoKeyCount;
+            out.keyConfigureGeneration = keyed ? keyGeneration : kNoKeyCount;
         }
         out.setClipCalls = out.setClipCountAfter - setClipBefore;
         out.setLutsCalls = out.setLutsCountAfter - setLutsBefore;

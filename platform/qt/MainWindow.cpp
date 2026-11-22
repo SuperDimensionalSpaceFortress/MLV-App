@@ -31185,7 +31185,7 @@ void MainWindow::onPlaybackReconWarmDone( const RenderFrameThread::PlaybackRecon
             outcome.retained.device_bayer16, outcome.width, outcome.height, done.blackLevel, wb,
             playbackReducedHnyquistWanted( outcome.scale > 1 ), &line.amazeKernelMs, &amazeReason, &amazeTiming,
             static_cast<uint64_t>( done.frameNumber ), outcome.keySetClipCount, outcome.keySetLutsCount,
-            outcome.keySetPatternCount, &reuseCapture, &warmState );   // r22: the counts taken under the backend lock
+            outcome.keySetPatternCount, outcome.keyConfigureGeneration, &reuseCapture, &warmState );   // r22: taken under the backend lock
     }
     else if( hasOutput )
     {
