@@ -1566,7 +1566,8 @@ batchRenderedVideoFfmpegBinaryPlanFromCurrentEnvironment(
 ;
 
 /* Preflight: a PATH hit is trusted; an explicit selection must exist (QFileInfo::exists, as
- * before this card); an app-dir hit must still be a non-empty regular file. */
+ * before this card); an app-dir hit must still be a non-empty regular file that can start (a
+ * .exe on Windows, executable by this user elsewhere). */
 bool batchRenderedVideoFfmpegBinaryPlanUsableAtPreflight(
     const BatchRenderedVideoFfmpegBinaryPlan & plan)
 ;
@@ -1577,8 +1578,8 @@ QString batchRenderedVideoFfmpegBinaryPlanSearchedLocations(
 ;
 
 /* The optional ffprobe used to enrich output verification: the probe plan's PATH hit (as
- * before this card), or its app-dir hit while that is still a non-empty regular file; else a
- * non-empty regular ffprobe beside the resolved ffmpeg (that directory may be the app dir, so
+ * before this card), or its app-dir hit while that is still a non-empty regular file that can
+ * start; else such an ffprobe beside the resolved ffmpeg (that directory may be the app dir, so
  * the same rule applies). Empty = not available. */
 QString batchRenderedVideoOptionalMediaProbeExecutable(
     const BatchRenderedVideoMediaProbeBinaryPlan & probePlan,

@@ -23,6 +23,16 @@
 #include <memory>
 #include <string>
 
+#ifdef Q_OS_WIN
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 static QString repo_receipt_path_for_apply(const QString & name)
 {
     return repo_file_path(QStringLiteral("receipts/%1").arg(name));
@@ -2463,13 +2473,29 @@ TEST(BatchExportFormat, OptionalMediaProbeSelectionUsesAFreshAppDirHitThenTheFfm
 }
 
 #ifdef Q_OS_WIN
+/* r7 (sol r6 B3): direct Win32 calls on the literal paths. No cmd.exe (no shell parsing of '&'
+ * or '%' in a temp path, no AutoRun) and no child process to wait on. Every link the R6/R7
+ * tests make goes through this one helper. */
 static bool appDirLookupMakeLink(const QString & link, const QString & target, bool hard)
 {
-    QStringList args{ QStringLiteral("/c"), QStringLiteral("mklink") };
+    const std::wstring linkPath = QDir::toNativeSeparators(link).toStdWString();
+    const std::wstring targetPath = QDir::toNativeSeparators(target).toStdWString();
     if( hard )
-        args << QStringLiteral("/H");
-    args << QDir::toNativeSeparators(link) << QDir::toNativeSeparators(target);
-    return QProcess::execute(QStringLiteral("cmd.exe"), args) == 0 && QFileInfo::exists(link);
+        return CreateHardLinkW(linkPath.c_str(), targetPath.c_str(), nullptr) != 0
+            && QFileInfo::exists(link);
+#ifndef SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
+#define SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE 0x2
+#endif
+    /* A file symlink (flag 0). Developer Mode allows it unprivileged with the flag; a Windows
+     * build that predates the flag rejects it as an invalid parameter, so ask once without. */
+    if( CreateSymbolicLinkW(linkPath.c_str(), targetPath.c_str(),
+                            SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) == 0 )
+    {
+        if( GetLastError() != ERROR_INVALID_PARAMETER
+         || CreateSymbolicLinkW(linkPath.c_str(), targetPath.c_str(), 0) == 0 )
+            return false;
+    }
+    return QFileInfo(link).isSymLink() && QFileInfo::exists(link);
 }
 
 /* A Windows FILE SYMLINK beside MLVApp (hard link when this host cannot make one; the line
@@ -2661,13 +2687,26 @@ enum class AppDirLookupCreate { Created, AlreadyPresent, Failed };
 
 struct AppDirLookupEnvironmentFixture
 {
-    /* r7 RED (sol r6 B2): this is the r6 fixture's write, unchanged (record the name, then a
-     * truncating WriteOnly open), under the name the r7 tests call. */
+    /* r7 (sol r6 B2): besideExe holds ONLY the files this fixture created. The create is
+     * exclusive (QIODevice::NewOnly: the OS fails it when the name exists), so a file a packager
+     * or a concurrent run of this executable placed is never truncated, and since only created
+     * names are recorded, never removed either: the caller skips with a reason instead. */
     AppDirLookupCreate createBesideExe(const QString & path, const QByteArray & bytes)
     {
+        QFile file(path);
+        if( !file.open(QIODevice::WriteOnly | QIODevice::NewOnly) )
+        {
+            const QFileInfo info(path);
+            return ( info.exists() || info.isSymLink() ) ? AppDirLookupCreate::AlreadyPresent
+                                                         : AppDirLookupCreate::Failed;
+        }
         besideExe << path;
-        return appDirLookupWriteFile(path, bytes) ? AppDirLookupCreate::Created
-                                                  : AppDirLookupCreate::Failed;
+        const bool ok = file.write(bytes) == bytes.size();
+        file.close();
+#ifndef Q_OS_WIN
+        file.setPermissions(file.permissions() | QFileDevice::ExeOwner | QFileDevice::ExeUser);
+#endif
+        return ok ? AppDirLookupCreate::Created : AppDirLookupCreate::Failed;
     }
 
     QStringList besideExe;
@@ -2693,7 +2732,8 @@ struct AppDirLookupEnvironmentFixture
         }
     }
 
-    /* r6 adversary A3: removal is checked. Each R6 test also ASSERTs it on its normal path. */
+    /* r6 adversary A3: removal is checked. Each R6 test also ASSERTs it on its normal path.
+     * r7: it removes only the files createBesideExe created. */
     bool removeBesideExe()
     {
         QStringList remaining;
@@ -2731,8 +2771,6 @@ TEST(BatchExportFormat, R6DefaultLookupAppDirCopyWinsOverPathCopy)
         + appDirLookupPackagedName(QStringLiteral("ffmpeg"));
     const QString appProbe = QDir::cleanPath(appDir) + QStringLiteral("/")
         + appDirLookupPackagedName(QStringLiteral("ffprobe"));
-    if( QFileInfo::exists(appFfmpeg) || QFileInfo::exists(appProbe) )
-        SKIP_TEST("an ffmpeg or ffprobe already sits beside the test executable; it is not this test's to replace");
 
     QTemporaryDir toolsTemp;
     ASSERT_TRUE( toolsTemp.isValid() );
@@ -2742,10 +2780,17 @@ TEST(BatchExportFormat, R6DefaultLookupAppDirCopyWinsOverPathCopy)
     ASSERT_TRUE( appDirLookupWriteFile(pathFfmpeg, QByteArray("MZ-path-copy")) );
     ASSERT_TRUE( appDirLookupWriteFile(pathProbe, QByteArray("MZ-path-copy")) );
 
+    /* r7 (sol r6 B2): exclusive create; a name already present (a packaged copy, or a
+     * concurrent run of this executable) is never replaced or removed: the test skips. */
     AppDirLookupEnvironmentFixture fixture;
-    fixture.besideExe << appFfmpeg << appProbe;
-    ASSERT_TRUE( appDirLookupWriteFile(appFfmpeg, QByteArray("MZ-app-dir-copy")) );
-    ASSERT_TRUE( appDirLookupWriteFile(appProbe, QByteArray("MZ-app-dir-copy")) );
+    for( const QString & besideExe : QStringList{ appFfmpeg, appProbe } )
+    {
+        const AppDirLookupCreate made =
+            fixture.createBesideExe(besideExe, QByteArray("MZ-app-dir-copy"));
+        if( made == AppDirLookupCreate::AlreadyPresent )
+            SKIP_TEST("an ffmpeg or ffprobe already sits beside the test executable (a packaged copy or a concurrent run); this test never replaces or removes a file it did not create");
+        ASSERT_TRUE( made == AppDirLookupCreate::Created );
+    }
     fixture.setPath(tools);
 
     const BatchRenderedVideoFfmpegBinaryPlan plan =
@@ -2758,9 +2803,9 @@ TEST(BatchExportFormat, R6DefaultLookupAppDirCopyWinsOverPathCopy)
                appDirLookupText(appDirLookupCanonical(probePlan.resolvedExecutable)) );
     ASSERT_EQ( std::string("app-dir"), appDirLookupText(plan.source) );
     ASSERT_EQ( std::string("app-dir"), appDirLookupText(probePlan.source) );
+    /* Both created files were removed (a name another run creates afterwards is not ours). */
     ASSERT_TRUE( fixture.removeBesideExe() );
-    ASSERT_FALSE( QFileInfo::exists(appFfmpeg) );
-    ASSERT_FALSE( QFileInfo::exists(appProbe) );
+    ASSERT_TRUE( fixture.besideExe.isEmpty() );
 }
 
 /* No copy beside the executable: the default lookup falls back to the PATH copy (the base's
@@ -2790,6 +2835,12 @@ TEST(BatchExportFormat, R6DefaultLookupWithoutAppDirCopyFallsBackToPath)
         batchRenderedVideoFfmpegBinaryPlanFromCurrentEnvironment();
     const BatchRenderedVideoMediaProbeBinaryPlan probePlan =
         batchRenderedVideoMediaProbeBinaryPlanFromCurrentEnvironment();
+    /* r7 (sol r6 B2): this test places nothing beside the executable, so it checks the
+     * absence it relies on itself, after the lookups too, and skips (never asserts) when a
+     * packager or a concurrent run put a file there meanwhile. */
+    if( QFileInfo::exists(appFfmpeg) || QFileInfo::exists(appProbe)
+     || QFileInfo(appFfmpeg).isSymLink() || QFileInfo(appProbe).isSymLink() )
+        SKIP_TEST("an ffmpeg or ffprobe appeared beside the test executable during the lookup (a packaged copy or a concurrent run); the PATH fallback cannot be judged");
     ASSERT_TRUE( plan.foundOnPath );
     ASSERT_TRUE( probePlan.foundOnPath );
     ASSERT_EQ( appDirLookupText(appDirLookupCanonical(pathFfmpeg)),
@@ -2801,8 +2852,6 @@ TEST(BatchExportFormat, R6DefaultLookupWithoutAppDirCopyFallsBackToPath)
     ASSERT_TRUE( probePlan.appDirSearchAttempted );
     ASSERT_EQ( std::string("app-dir,PATH"),
                appDirLookupText(batchRenderedVideoFfmpegBinaryPlanSearchedLocations(plan)) );
-    ASSERT_FALSE( QFileInfo::exists(appFfmpeg) );
-    ASSERT_FALSE( QFileInfo::exists(appProbe) );
 }
 
 /* r7, sol r6 B1, literal input: the app-dir ffmpeg selected by the lookup can no longer be

@@ -3642,17 +3642,28 @@ namespace
 
 /* THE app-dir binary rule (one predicate for every step that can take a file from the
  * application directory: the lookup, preflight, the optional ffprobe and its ffmpeg-sibling
- * step): a regular file with content, so an empty placeholder beside MLVApp never wins over a
- * working PATH copy. Measured on Qt 6.10.2: a Windows file symlink reports QFileInfo size 0
- * (the link's own size), so a link is judged by the file it RESOLVES to (r6 adversary A1: a
- * link whose target was emptied is refused). */
-bool batchRenderedVideoNonEmptyRegularFile(const QString & path)
+ * step): a regular file with content that can still be started, so an empty placeholder beside
+ * MLVApp never wins over a working PATH copy. Measured on Qt 6.10.2: a Windows file symlink
+ * reports QFileInfo size 0 (the link's own size), so a link is judged by the file it RESOLVES
+ * to (r6 adversary A1: a link whose target was emptied is refused). Can still start (r7, sol r6
+ * B1: a file that lost its execute permission after the lookup is a usage error at preflight,
+ * exit 2, not a failed launch, exit 4): on Windows the file is a .exe by its own name, the name
+ * CreateProcess starts; elsewhere this user may execute it (QFileInfo reads the permissions of
+ * the file a link resolves to). */
+bool batchRenderedVideoLaunchableAppDirFile(const QString & path)
 {
     if( path.isEmpty() )
         return false;
     const QFileInfo info(path);
     if( !info.isFile() )
         return false;
+#ifdef Q_OS_WIN
+    if( !info.fileName().endsWith(QStringLiteral(".exe"), Qt::CaseInsensitive) )
+        return false;
+#else
+    if( !info.isExecutable() )
+        return false;
+#endif
     if( info.size() > 0 )
         return true;
     const QString target = info.canonicalFilePath();
@@ -3742,9 +3753,9 @@ BatchRenderedVideoExecutableResolver batchRenderedVideoSystemExecutableResolver(
     {
         const QString hit = QStandardPaths::findExecutable(name, searchDirs);
         /* App-dir search only (PATH keeps the base rule): a candidate must be a non-empty
-         * regular file. */
+         * regular file that can start. */
         if( !searchDirs.isEmpty() && !hit.isEmpty()
-         && !batchRenderedVideoNonEmptyRegularFile(hit) )
+         && !batchRenderedVideoLaunchableAppDirFile(hit) )
             return QString();
         return hit;
     };
@@ -3759,9 +3770,10 @@ bool batchRenderedVideoFfmpegBinaryPlanUsableAtPreflight(
     /* An explicit request keeps the base rule byte for byte (QFileInfo::exists). */
     if( !plan.foundInAppDir )
         return QFileInfo::exists(plan.resolvedExecutable);
-    /* An app-dir hit keeps the lookup's rule at preflight: one removed, truncated to zero bytes
-     * or replaced by a directory after the lookup is a usage error (exit 2), not a failed spawn. */
-    return batchRenderedVideoNonEmptyRegularFile(plan.resolvedExecutable);
+    /* An app-dir hit keeps the lookup's rule at preflight: one removed, truncated to zero bytes,
+     * replaced by a directory or no longer executable after the lookup is a usage error (exit 2),
+     * not a failed spawn. A plain re-check: no identity hold, no retry. */
+    return batchRenderedVideoLaunchableAppDirFile(plan.resolvedExecutable);
 }
 
 QString batchRenderedVideoFfmpegBinaryPlanSearchedLocations(
@@ -3782,7 +3794,7 @@ QString batchRenderedVideoOptionalMediaProbeExecutable(
     if( probePlan.foundOnPath && !probePlan.resolvedExecutable.isEmpty() )
         return probePlan.resolvedExecutable;
     if( probePlan.foundInAppDir
-     && batchRenderedVideoNonEmptyRegularFile(probePlan.resolvedExecutable) )
+     && batchRenderedVideoLaunchableAppDirFile(probePlan.resolvedExecutable) )
         return probePlan.resolvedExecutable;
 
     /* 2. Beside the resolved ffmpeg (the two ship together in every standard distribution).
@@ -3796,7 +3808,7 @@ QString batchRenderedVideoOptionalMediaProbeExecutable(
     for( const QString & candidate : QStringList{ siblingDir + QStringLiteral("/ffprobe.exe"),
                                                   siblingDir + QStringLiteral("/ffprobe") } )
     {
-        if( batchRenderedVideoNonEmptyRegularFile(candidate) )
+        if( batchRenderedVideoLaunchableAppDirFile(candidate) )
             return QDir::cleanPath(QFileInfo(candidate).absoluteFilePath());
     }
     return QString();
