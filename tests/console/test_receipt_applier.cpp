@@ -2615,6 +2615,42 @@ TEST(BatchExportFormat, AppDirSpawnRetrySearchesPathPastTheFailedFile)
 }
 
 #ifdef Q_OS_WIN
+/* r5 A8: what QStandardPaths::findExecutable(name) returns in a FRESH process started with the
+ * CURRENT PATHEXT and PATH -- Qt 6.10.2 qstandardpaths.cpp, token for token: executableExtensions()
+ * (lowercased, split on ';', no trim, Qt's default list when ".exe" is not a token), then for each
+ * PATH directory (cleaned, trailing '/' dropped, made absolute) and each token, the first
+ * candidate that QFileInfo calls an executable file. The real resolver caches PATHEXT once per
+ * process, so a fixture that changes PATHEXT feeds this one instead. App-dir lookups (search
+ * directories given) use the real resolver. */
+static BatchRenderedVideoExecutableResolver r5FreshProcessQtResolver()
+{
+    return [](const QString & name, const QStringList & searchDirs) -> QString
+    {
+        if( !searchDirs.isEmpty() )
+            return batchRenderedVideoSystemExecutableResolver()(name, searchDirs);
+        QStringList tokens = QString::fromLocal8Bit(qgetenv("PATHEXT")).toLower().split(QLatin1Char(';'));
+        if( !tokens.contains(QStringLiteral(".exe"), Qt::CaseInsensitive) )
+            tokens = QStringList{ QStringLiteral(".exe"), QStringLiteral(".com"),
+                                  QStringLiteral(".bat"), QStringLiteral(".cmd") };
+        const QDir currentDir = QDir::current();
+        for( const QString & rawDir : QString::fromLocal8Bit(qgetenv("PATH")).split(
+                 QDir::listSeparator(), Qt::SkipEmptyParts) )
+        {
+            QString dir = QDir::cleanPath(rawDir);
+            if( dir.size() > 1 && dir.endsWith(QLatin1Char('/')) )
+                dir.truncate(dir.size() - 1);
+            const QString root = currentDir.absoluteFilePath(dir + QLatin1Char('/') + name);
+            for( const QString & token : tokens )
+            {
+                const QFileInfo info(root + token);
+                if( info.isFile() && info.isExecutable() )
+                    return QDir::cleanPath(root + token);
+            }
+        }
+        return QString();
+    };
+}
+
 /* Adversary pass 4 (b2530de5) A2, literal input: PATH=<junction to the app dir>;<tools>. The
  * failed image under its junction spelling is the SAME file and is never the retry. */
 TEST(BatchExportFormat, AppDirSpawnRetryExcludesTheFailedFileByIdentity)
@@ -2665,7 +2701,7 @@ TEST(BatchExportFormat, FfmpegDefaultPathSearchReachesALaterSuffixInTheSameDirec
     qputenv("PATHEXT", QByteArray(".EXE;.COM"));
     const BatchRenderedVideoFfmpegBinaryPlan plan =
         batchRenderedVideoFfmpegBinaryPlanFromLookup(
-            QString(), appDir, batchRenderedVideoSystemExecutableResolver());
+            QString(), appDir, r5FreshProcessQtResolver());
     qputenv("PATH", savedPath);
     qputenv("PATHEXT", savedPathExt);
     ASSERT_TRUE( plan.foundOnPath );
@@ -2763,7 +2799,7 @@ TEST(BatchExportFormat, AppDirSpawnRetryContinuationOnlyConsidersSpawnableImages
     {
         qputenv("PATHEXT", pathExt);
         retries << batchRenderedVideoAppDirSpawnRetryExecutable(
-            true, true, bad, QStringLiteral("ffmpeg"), batchRenderedVideoSystemExecutableResolver());
+            true, true, bad, QStringLiteral("ffmpeg"), r5FreshProcessQtResolver());
     }
     qputenv("PATH", savedPath);
     qputenv("PATHEXT", savedPathExt);
@@ -2858,10 +2894,10 @@ TEST(BatchExportFormat, FfmpegDefaultLookupAcceptsASymlinkedLaunchableFfmpeg)
     qputenv("PATHEXT", QByteArray(".COM;.EXE"));
     const BatchRenderedVideoFfmpegBinaryPlan plan =
         batchRenderedVideoFfmpegBinaryPlanFromLookup(
-            QString(), appDir, batchRenderedVideoSystemExecutableResolver());
+            QString(), appDir, r5FreshProcessQtResolver());
     const BatchRenderedVideoFfmpegBinaryPlan app2Plan =
         batchRenderedVideoFfmpegBinaryPlanFromLookup(
-            QString(), app2Dir, batchRenderedVideoSystemExecutableResolver());
+            QString(), app2Dir, r5FreshProcessQtResolver());
     const BatchRenderedVideoMediaProbeBinaryPlan noProbe =
         batchRenderedVideoMediaProbeBinaryPlanFromLookup(
             QString(), appDir, appDirLookupFakeResolver(QString(), QString(), nullptr));
@@ -2870,7 +2906,7 @@ TEST(BatchExportFormat, FfmpegDefaultLookupAcceptsASymlinkedLaunchableFfmpeg)
     const QString bad = appDir + QStringLiteral("/ffmpeg.exe");
     const bool badWritten = appDirLookupWriteFile(bad, QByteArray("MZ-not-really-a-program"));
     const QString retry = batchRenderedVideoAppDirSpawnRetryExecutable(
-        true, true, bad, QStringLiteral("ffmpeg"), batchRenderedVideoSystemExecutableResolver());
+        true, true, bad, QStringLiteral("ffmpeg"), r5FreshProcessQtResolver());
     qputenv("PATH", savedPath);
     qputenv("PATHEXT", savedPathExt);
 
@@ -2916,11 +2952,11 @@ TEST(BatchExportFormat, DefaultPathSearchAndRetrySkipAScriptFirstHit)
     {
         retries << batchRenderedVideoAppDirSpawnRetryExecutable(
             true, true, appDir + QStringLiteral("/") + bare + QStringLiteral(".exe"), bare,
-            batchRenderedVideoSystemExecutableResolver());
+            r5FreshProcessQtResolver());
     }
     const BatchRenderedVideoFfmpegBinaryPlan defaultPlan =
         batchRenderedVideoFfmpegBinaryPlanFromLookup(
-            QString(), QDir::cleanPath(emptyAppTemp.path()), batchRenderedVideoSystemExecutableResolver());
+            QString(), QDir::cleanPath(emptyAppTemp.path()), r5FreshProcessQtResolver());
     const BatchRenderedVideoMediaProbeBinaryPlan staleProbePlan =
         batchRenderedVideoMediaProbeBinaryPlanFromLookup(
             QString(), appDir,
@@ -2929,7 +2965,7 @@ TEST(BatchExportFormat, DefaultPathSearchAndRetrySkipAScriptFirstHit)
         batchRenderedVideoFfmpegBinaryPlanFromResolvedPath(
             QStringLiteral("ffmpeg"), tools + QStringLiteral("/encoder/ffmpeg.exe"));
     const QString optionalProbe = batchRenderedVideoOptionalMediaProbeExecutable(
-        staleProbePlan, otherFfmpeg, batchRenderedVideoSystemExecutableResolver());
+        staleProbePlan, otherFfmpeg, r5FreshProcessQtResolver());
     qputenv("PATH", savedPath);
     qputenv("PATHEXT", savedPathExt);
 
@@ -3021,21 +3057,24 @@ TEST(BatchExportFormat, DefaultPathPickIsExactlyTheToolImageAndUnsetPathExtReach
     qputenv("PATH", (QDir::toNativeSeparators(wrappers) + QDir::listSeparator()
                      + QDir::toNativeSeparators(tools)).toLocal8Bit());
     qputenv("PATHEXT", QByteArray(".ALT.EXE;.EXE"));
+    /* r5 A8: the fresh-process resolver really returns Wrappers\ffmpeg.alt.exe first here. */
+    const QString altHit = r5FreshProcessQtResolver()(QStringLiteral("ffmpeg"), QStringList());
     const QString altRetry = batchRenderedVideoAppDirSpawnRetryExecutable(
-        true, true, bad, QStringLiteral("ffmpeg"), batchRenderedVideoSystemExecutableResolver());
+        true, true, bad, QStringLiteral("ffmpeg"), r5FreshProcessQtResolver());
     qputenv("PATH", QDir::toNativeSeparators(appDir).toLocal8Bit());
     qunsetenv("PATHEXT");
     const QString comRetry = batchRenderedVideoAppDirSpawnRetryExecutable(
-        true, true, bad, QStringLiteral("ffmpeg"), batchRenderedVideoSystemExecutableResolver());
+        true, true, bad, QStringLiteral("ffmpeg"), r5FreshProcessQtResolver());
     qputenv("PATH", (QDir::toNativeSeparators(aliasDir) + QDir::listSeparator()
                      + QDir::toNativeSeparators(tools)).toLocal8Bit());
     qputenv("PATHEXT", QByteArray(".EXE"));
     const QString replacedRetry = batchRenderedVideoAppDirSpawnRetryExecutable(
-        true, true, bad, QStringLiteral("ffmpeg"), batchRenderedVideoSystemExecutableResolver(),
+        true, true, bad, QStringLiteral("ffmpeg"), r5FreshProcessQtResolver(),
         QStringList{ QString(), replacedIdentity });
     qputenv("PATH", savedPath);
     qputenv("PATHEXT", savedPathExt);
 
+    ASSERT_EQ( appDirLookupText(wrappers + QStringLiteral("/ffmpeg.alt.exe")), appDirLookupText(altHit) );
     ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffmpeg.exe")), appDirLookupText(altRetry) );
     ASSERT_EQ( appDirLookupText(appDir + QStringLiteral("/ffmpeg.com")), appDirLookupText(comRetry) );
     ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffmpeg.exe")), appDirLookupText(replacedRetry) );
@@ -3153,7 +3192,7 @@ TEST(BatchExportFormat, R4ContinuationFollowsQtSuffixOrderForASpacedPathExt)
     {
         retries << batchRenderedVideoAppDirSpawnRetryExecutable(
             true, true, appDir + QStringLiteral("/") + bare + QStringLiteral(".exe"), bare,
-            batchRenderedVideoSystemExecutableResolver());
+            r5FreshProcessQtResolver());
     }
     qputenv("PATH", savedPath);
     qputenv("PATHEXT", savedPathExt);
@@ -3174,16 +3213,29 @@ static QString r4RunnerSpawnRetry(const BatchRenderedVideoFfmpegBinaryPlan & pla
                                   const std::function<void()> & afterFailedStart)
 {
     QStringList starts;
+    /* r5 (forced by the A3 pin): the image is held until the start RETURNS, so a name change
+     * made inside the start is refused; `afterFailedStart` runs at the first step after it, the
+     * retry's PATH lookup, still before anything is read after the failure. */
+    bool afterRan = false;
+    const BatchRenderedVideoExecutableResolver resolver =
+        [&afterFailedStart, &afterRan](const QString & name, const QStringList & searchDirs)
+        {
+            if( searchDirs.isEmpty() && !afterRan )
+            {
+                afterRan = true;
+                afterFailedStart();
+            }
+            return batchRenderedVideoSystemExecutableResolver()(name, searchDirs);
+        };
     const BatchRenderedVideoSpawnOutcome outcome = batchRenderedVideoStartWithAppDirSpawnRetry(
         plan.foundInAppDir, plan.resolvedExecutable, QStringLiteral("ffmpeg"),
-        batchRenderedVideoSystemExecutableResolver(),
-        [&plan, &afterFailedStart, &starts](const QString & executable, bool * failedToStart)
+        resolver,
+        [&plan, &starts](const QString & executable, bool * failedToStart)
         {
             starts << executable;
             if( QDir::cleanPath(executable) == QDir::cleanPath(plan.resolvedExecutable) )
             {
                 *failedToStart = true;
-                afterFailedStart();
                 return false;
             }
             *failedToStart = false;
@@ -3249,7 +3301,262 @@ TEST(BatchExportFormat, R4SpawnRetryExcludesExactlyTheLaunchedImage)
     ASSERT_FALSE( QFileInfo::exists(appBExe) );
     ASSERT_EQ( appDirLookupText(toolsC + QStringLiteral("/ffmpeg.exe")), appDirLookupText(retryB) );
 }
+
+/* r5 adversary A1 (2954edb0), literal input: a fresh process with PATHEXT=/ffmpeg.exe;/ffprobe.exe;.EXE
+ * and PATH=<Early>;<Tools>; Early has no top-level tool image but holds Early\ffmpeg\ffmpeg.exe and
+ * Early\ffprobe\ffprobe.exe, Tools holds working images. Qt's first hit is the NESTED image; the
+ * pick must be a literal <PATH dir>\<name>.exe: Tools, for the default ffmpeg and ffprobe lookups,
+ * the spawn retry and the stale app-dir ffprobe PATH search. */
+TEST(BatchExportFormat, R5PathValuedPathExtTokenNeverPicksANestedImage)
+{
+    QTemporaryDir appTemp;
+    QTemporaryDir emptyAppTemp;
+    QTemporaryDir earlyTemp;
+    QTemporaryDir toolsTemp;
+    ASSERT_TRUE( appTemp.isValid() && emptyAppTemp.isValid() && earlyTemp.isValid() && toolsTemp.isValid() );
+    const QString appDir = QDir::cleanPath(appTemp.path());
+    const QString early = QDir::cleanPath(earlyTemp.path());
+    const QString tools = QDir::cleanPath(toolsTemp.path());
+    for( const QString & bare : QStringList{ QStringLiteral("ffmpeg"), QStringLiteral("ffprobe") } )
+    {
+        ASSERT_TRUE( QDir().mkpath(early + QStringLiteral("/") + bare) );
+        ASSERT_TRUE( appDirLookupWriteFile(early + QStringLiteral("/") + bare + QStringLiteral("/") + bare
+                                           + QStringLiteral(".exe"), QByteArray("MZ-nested")) );
+        ASSERT_TRUE( appDirLookupWriteFile(tools + QStringLiteral("/") + bare + QStringLiteral(".exe"),
+                                           QByteArray("MZ-working")) );
+        ASSERT_TRUE( appDirLookupWriteFile(appDir + QStringLiteral("/") + bare + QStringLiteral(".exe"),
+                                           QByteArray("MZ-not-really-a-program")) );
+    }
+    const QByteArray savedPath = qgetenv("PATH");
+    const QByteArray savedPathExt = qgetenv("PATHEXT");
+    qputenv("PATH", (QDir::toNativeSeparators(early) + QDir::listSeparator()
+                     + QDir::toNativeSeparators(tools)).toLocal8Bit());
+    qputenv("PATHEXT", QByteArray("/ffmpeg.exe;/ffprobe.exe;.EXE"));
+    const QString nestedHit = r5FreshProcessQtResolver()(QStringLiteral("ffmpeg"), QStringList());
+    const BatchRenderedVideoFfmpegBinaryPlan ffmpegPlan = batchRenderedVideoFfmpegBinaryPlanFromLookup(
+        QString(), QDir::cleanPath(emptyAppTemp.path()), r5FreshProcessQtResolver());
+    const BatchRenderedVideoMediaProbeBinaryPlan probePlan = batchRenderedVideoMediaProbeBinaryPlanFromLookup(
+        QString(), QDir::cleanPath(emptyAppTemp.path()), r5FreshProcessQtResolver());
+    QStringList retries;
+    for( const QString & bare : QStringList{ QStringLiteral("ffmpeg"), QStringLiteral("ffprobe") } )
+    {
+        retries << batchRenderedVideoAppDirSpawnRetryExecutable(
+            true, true, appDir + QStringLiteral("/") + bare + QStringLiteral(".exe"), bare,
+            r5FreshProcessQtResolver());
+    }
+    const BatchRenderedVideoMediaProbeBinaryPlan staleProbePlan =
+        batchRenderedVideoMediaProbeBinaryPlanFromLookup(
+            QString(), appDir,
+            appDirLookupFakeResolver(appDir + QStringLiteral("/ffprobe-gone.exe"), QString(), nullptr));
+    const QString optionalProbe = batchRenderedVideoOptionalMediaProbeExecutable(
+        staleProbePlan,
+        batchRenderedVideoFfmpegBinaryPlanFromResolvedPath(
+            QStringLiteral("ffmpeg"), tools + QStringLiteral("/encoder/ffmpeg.exe")),
+        r5FreshProcessQtResolver());
+    qputenv("PATH", savedPath);
+    qputenv("PATHEXT", savedPathExt);
+
+    ASSERT_EQ( appDirLookupText(early + QStringLiteral("/ffmpeg/ffmpeg.exe")), appDirLookupText(nestedHit) );
+    ASSERT_TRUE( ffmpegPlan.foundOnPath );
+    ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffmpeg.exe")), appDirLookupText(ffmpegPlan.resolvedExecutable) );
+    ASSERT_TRUE( probePlan.foundOnPath );
+    ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffprobe.exe")), appDirLookupText(probePlan.resolvedExecutable) );
+    ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffmpeg.exe")), appDirLookupText(retries.value(0)) );
+    ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffprobe.exe")), appDirLookupText(retries.value(1)) );
+    ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffprobe.exe")), appDirLookupText(optionalProbe) );
+}
+
+/* r5 adversary A2 (2954edb0), literal input: App\ffmpeg.exe holds exactly `MZ-bad` and failed to
+ * start; PATH=<Tools>, PATHEXT=.EXE, Tools\ffmpeg.exe is a working image B on the same volume; after
+ * the failure App\ffmpeg.exe is replaced by a hard link to B. Only the failed path and the
+ * launched image may be excluded: the retry is Tools\ffmpeg.exe. Same for ffprobe. */
+TEST(BatchExportFormat, R5FailedPathRepointedToTheWorkingImageDoesNotExcludeIt)
+{
+    QTemporaryDir appTemp;
+    QTemporaryDir toolsTemp;
+    ASSERT_TRUE( appTemp.isValid() && toolsTemp.isValid() );
+    const QString appDir = QDir::cleanPath(appTemp.path());
+    const QString tools = QDir::cleanPath(toolsTemp.path());
+    QStringList retries;
+    const QByteArray savedPath = qgetenv("PATH");
+    const QByteArray savedPathExt = qgetenv("PATHEXT");
+    for( const QString & bare : QStringList{ QStringLiteral("ffmpeg"), QStringLiteral("ffprobe") } )
+    {
+        const QString bad = appDir + QStringLiteral("/") + bare + QStringLiteral(".exe");
+        const QString good = tools + QStringLiteral("/") + bare + QStringLiteral(".exe");
+        ASSERT_TRUE( appDirLookupWriteFile(bad, QByteArray("MZ-bad")) );
+        ASSERT_TRUE( appDirLookupWriteFile(good, QByteArray("MZ-working")) );
+        const QString launchedIdentity = batchRenderedVideoExecutableFileIdentity(bad);
+        ASSERT_FALSE( launchedIdentity.isEmpty() );
+        ASSERT_TRUE( QFile::remove(bad) );
+        ASSERT_TRUE( appDirLookupMakeLink(bad, good, true) );
+        qputenv("PATH", QDir::toNativeSeparators(tools).toLocal8Bit());
+        qputenv("PATHEXT", QByteArray(".EXE"));
+        retries << batchRenderedVideoAppDirSpawnRetryExecutable(
+            true, true, bad, bare, r5FreshProcessQtResolver(), QStringList{ launchedIdentity });
+        qputenv("PATH", savedPath);
+        qputenv("PATHEXT", savedPathExt);
+    }
+    ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffmpeg.exe")), appDirLookupText(retries.value(0)) );
+    ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffprobe.exe")), appDirLookupText(retries.value(1)) );
+}
+
+/* r5 adversary A3 (2954edb0), literal input: PATH=<Alias>;<Tools>, App\ffmpeg.exe is healthy image A,
+ * Alias\ffmpeg.exe is a hard link to a separate malformed B (`MZ-bad`), Tools\ffmpeg.exe is healthy.
+ * DURING the start (after the identity read, before the OS opens the path) App\ffmpeg.exe is
+ * replaced by a hard link to B, and the app name is removed once B "failed". The image excluded
+ * by the retry must be the one the start launched: never retry the launched image again. A real
+ * start of a real image under the same wiring still starts (the hold does not block the loader). */
+TEST(BatchExportFormat, R5SpawnRetryExcludesTheImageTheStartReallyLaunched)
+{
+    QTemporaryDir appTemp;
+    QTemporaryDir aliasTemp;
+    QTemporaryDir toolsTemp;
+    QTemporaryDir bTemp;
+    QTemporaryDir realTemp;
+    ASSERT_TRUE( appTemp.isValid() && aliasTemp.isValid() && toolsTemp.isValid() && bTemp.isValid()
+                 && realTemp.isValid() );
+    const QString appDir = QDir::cleanPath(appTemp.path());
+    const QString aliasDir = QDir::cleanPath(aliasTemp.path());
+    const QString tools = QDir::cleanPath(toolsTemp.path());
+    const QString app = appDir + QStringLiteral("/ffmpeg.exe");
+    const QString imageB = QDir::cleanPath(bTemp.path()) + QStringLiteral("/b.exe");
+    ASSERT_TRUE( appDirLookupWriteFile(app, QByteArray("MZ-healthy-A")) );
+    ASSERT_TRUE( appDirLookupWriteFile(imageB, QByteArray("MZ-bad")) );
+    ASSERT_TRUE( appDirLookupMakeLink(aliasDir + QStringLiteral("/ffmpeg.exe"), imageB, true) );
+    ASSERT_TRUE( appDirLookupWriteFile(tools + QStringLiteral("/ffmpeg.exe"), QByteArray("MZ-working")) );
+    const BatchRenderedVideoFfmpegBinaryPlan plan =
+        batchRenderedVideoFfmpegBinaryPlanFromLookup(QString(), appDir, batchRenderedVideoSystemExecutableResolver());
+    ASSERT_TRUE( plan.foundInAppDir );
+
+    const QByteArray savedPath = qgetenv("PATH");
+    const QByteArray savedPathExt = qgetenv("PATHEXT");
+    qputenv("PATH", (QDir::toNativeSeparators(aliasDir) + QDir::listSeparator()
+                     + QDir::toNativeSeparators(tools)).toLocal8Bit());
+    qputenv("PATHEXT", QByteArray(".EXE"));
+    QString launchedAtStart;
+    const BatchRenderedVideoSpawnOutcome outcome = batchRenderedVideoStartWithAppDirSpawnRetry(
+        true, app, QStringLiteral("ffmpeg"), r5FreshProcessQtResolver(),
+        [&app, &imageB, &launchedAtStart](const QString & executable, bool * failedToStart)
+        {
+            if( QDir::cleanPath(executable) != QDir::cleanPath(app) )
+            {
+                *failedToStart = false;
+                return true;
+            }
+            /* The swap, then what the OS would open at this instant, then the name removal. */
+            if( QFile::remove(app) )
+                appDirLookupMakeLink(app, imageB, true);
+            launchedAtStart = batchRenderedVideoExecutableFileIdentity(app);
+            QFile::remove(app);
+            *failedToStart = true;
+            return false;
+        });
+    qputenv("PATH", savedPath);
+    qputenv("PATHEXT", savedPathExt);
+
+    ASSERT_FALSE( launchedAtStart.isEmpty() );
+    ASSERT_FALSE( outcome.retryExecutable.isEmpty() );
+    ASSERT_TRUE( outcome.started );
+    ASSERT_TRUE( batchRenderedVideoExecutableFileIdentity(outcome.retryExecutable) != launchedAtStart );
+
+    /* The hold never blocks a real start of a real image. */
+    const QString realApp = QDir::cleanPath(realTemp.path()) + QStringLiteral("/ffmpeg.exe");
+    ASSERT_TRUE( QFile::copy(QStringLiteral("C:/Windows/System32/whoami.exe"), realApp) );
+    const BatchRenderedVideoSpawnOutcome real = batchRenderedVideoStartWithAppDirSpawnRetry(
+        true, realApp, QStringLiteral("ffmpeg"), batchRenderedVideoSystemExecutableResolver(),
+        [](const QString & executable, bool * failedToStart)
+        {
+            QProcess process;
+            process.start(executable, QStringList());
+            const bool ok = process.waitForStarted(10000);
+            *failedToStart = !ok && process.error() == QProcess::FailedToStart;
+            process.waitForFinished(10000);
+            return ok;
+        });
+    ASSERT_TRUE( real.started );
+    ASSERT_TRUE( real.retryExecutable.isEmpty() );
+}
+
+/* r5 adversary A5 (2954edb0), literal input: PATHEXT=.EXE, PATH=<Early>;<Tools>, both hold a
+ * non-empty ffmpeg.exe / ffprobe.exe; Early's images allow attribute reads but deny FILE_READ_DATA
+ * and FILE_EXECUTE (icacls deny RD,X for Everyone). The unreadable images are skipped: Tools, for
+ * the default lookups and the spawn retry. */
+TEST(BatchExportFormat, R5PathImageThatCannotBeOpenedForExecuteIsSkipped)
+{
+    QTemporaryDir appTemp;
+    QTemporaryDir emptyAppTemp;
+    QTemporaryDir earlyTemp;
+    QTemporaryDir toolsTemp;
+    ASSERT_TRUE( appTemp.isValid() && emptyAppTemp.isValid() && earlyTemp.isValid() && toolsTemp.isValid() );
+    const QString appDir = QDir::cleanPath(appTemp.path());
+    const QString early = QDir::cleanPath(earlyTemp.path());
+    const QString tools = QDir::cleanPath(toolsTemp.path());
+    for( const QString & bare : QStringList{ QStringLiteral("ffmpeg"), QStringLiteral("ffprobe") } )
+    {
+        const QString denied = early + QStringLiteral("/") + bare + QStringLiteral(".exe");
+        ASSERT_TRUE( appDirLookupWriteFile(denied, QByteArray("MZ-early")) );
+        ASSERT_EQ( 0, QProcess::execute(QStringLiteral("icacls"), QStringList{
+            QDir::toNativeSeparators(denied), QStringLiteral("/deny"), QStringLiteral("*S-1-1-0:(RD,X)") }) );
+        ASSERT_TRUE( QFileInfo(denied).isFile() );
+        ASSERT_FALSE( QFile(denied).open(QIODevice::ReadOnly) );
+        ASSERT_TRUE( appDirLookupWriteFile(tools + QStringLiteral("/") + bare + QStringLiteral(".exe"),
+                                           QByteArray("MZ-working")) );
+        ASSERT_TRUE( appDirLookupWriteFile(appDir + QStringLiteral("/") + bare + QStringLiteral(".exe"),
+                                           QByteArray("MZ-not-really-a-program")) );
+    }
+    const QByteArray savedPath = qgetenv("PATH");
+    const QByteArray savedPathExt = qgetenv("PATHEXT");
+    qputenv("PATH", (QDir::toNativeSeparators(early) + QDir::listSeparator()
+                     + QDir::toNativeSeparators(tools)).toLocal8Bit());
+    qputenv("PATHEXT", QByteArray(".EXE"));
+    const BatchRenderedVideoFfmpegBinaryPlan ffmpegPlan = batchRenderedVideoFfmpegBinaryPlanFromLookup(
+        QString(), QDir::cleanPath(emptyAppTemp.path()), r5FreshProcessQtResolver());
+    const BatchRenderedVideoMediaProbeBinaryPlan probePlan = batchRenderedVideoMediaProbeBinaryPlanFromLookup(
+        QString(), QDir::cleanPath(emptyAppTemp.path()), r5FreshProcessQtResolver());
+    const QString retry = batchRenderedVideoAppDirSpawnRetryExecutable(
+        true, true, appDir + QStringLiteral("/ffmpeg.exe"), QStringLiteral("ffmpeg"), r5FreshProcessQtResolver());
+    qputenv("PATH", savedPath);
+    qputenv("PATHEXT", savedPathExt);
+
+    ASSERT_TRUE( ffmpegPlan.foundOnPath );
+    ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffmpeg.exe")), appDirLookupText(ffmpegPlan.resolvedExecutable) );
+    ASSERT_TRUE( probePlan.foundOnPath );
+    ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffprobe.exe")), appDirLookupText(probePlan.resolvedExecutable) );
+    ASSERT_EQ( appDirLookupText(tools + QStringLiteral("/ffmpeg.exe")), appDirLookupText(retry) );
+}
 #endif
+
+/* r5 adversary A7 (2954edb0), literal input: expected h264 1920x1080; ffprobe exits 0 with an
+ * incomplete JSON that STATES width -1 (no codec-complete facts), the ffmpeg dump reads a clean
+ * h264 1920x1080. The stated width binds (the verifier then refuses it, as the base did); so do
+ * a stated 0, 2147483648, 1920.5 and "1920", and a stated blank codec_name or format_name. Only a
+ * field ffprobe left out is filled from the dump. */
+TEST(BatchExportFormat, R5IncompleteProbeJsonStatedContradictionStaysBinding)
+{
+    const BatchRenderedVideoFfmpegDumpFacts dump = batchRenderedVideoFfmpegDumpFacts(
+        QStringLiteral("Input #0, mov,mp4, from 'clip.mlvapp-partial.mp4':\n  Stream #0:0: Video: h264, yuv420p, 1920x1080\n"));
+    ASSERT_TRUE( dump.parsed );
+    ASSERT_EQ( 1920, dump.width );
+    const QByteArray literal(R"({"format":{"format_name":"mov,mp4"},"streams":[{"codec_type":"video","codec_name":"h264","width":-1,"height":1080}]})");
+    BatchRenderedVideoFfmpegDumpFacts bound = batchRenderedVideoBindingMediaProbeFacts(true, literal, dump);
+    ASSERT_TRUE( bound.parsed );
+    ASSERT_EQ( -1, bound.width );
+    ASSERT_EQ( 1080, bound.height );
+    for( const QByteArray & stated : QList<QByteArray>{
+             QByteArray("0"), QByteArray("2147483648"), QByteArray("1920.5"), QByteArray("\"1920\"") } )
+    {
+        const QByteArray json = QByteArray(R"({"format":{"format_name":"mov,mp4"},"streams":[{"codec_type":"video","codec_name":"h264","width":)")
+            + stated + QByteArray(R"(,"height":1080}]})");
+        bound = batchRenderedVideoBindingMediaProbeFacts(true, json, dump);
+        ASSERT_TRUE( bound.width != 1920 );
+    }
+    bound = batchRenderedVideoBindingMediaProbeFacts(true,
+        QByteArray(R"({"format":{"format_name":""},"streams":[{"codec_type":"video","codec_name":"","width":1920}]})"), dump);
+    ASSERT_TRUE( bound.codecName.isEmpty() );
+    ASSERT_TRUE( bound.formatNames.isEmpty() );
+    ASSERT_EQ( 1080, bound.height );
+}
 
 /* r3 sol S4 (and fable N1), literal input: --rendered-ffmpeg C:/Tools where C:/Tools is an
  * existing DIRECTORY and C:/Tools.exe does not exist. The card's compatibility rule keeps the
