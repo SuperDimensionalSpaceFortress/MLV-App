@@ -381,7 +381,7 @@ function Invoke-Native {
         $child = [System.Diagnostics.Process]::Start($psi)
         try {
             $outTask = $child.StandardOutput.ReadToEndAsync(); $errTask = $child.StandardError.ReadToEndAsync()
-            if (-not $child.WaitForExit($TimeoutSec * 1000)) {
+            if (-not $child.WaitForExit([int][Math]::Min([long]$TimeoutSec * 1000, [long][int]::MaxValue))) {   # clamped: the wait takes an Int32 of milliseconds (adversary pass 2 A11)
                 try { $child.Kill($true) } catch { }
                 throw "$Exe did not finish within $TimeoutSec s (it was stopped)"
             }
@@ -3023,7 +3023,7 @@ function Get-ImportCredentialSkips {
         # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 (r4): NeverReplaced = Import deliberately never writes this destination, whatever its backup holds: the BUNDLE file is excluded (too large,
         # unreadable, carries a credential) or the host file is one it never replaces (it carries a credential, or it is a credential-role file naming a credential key). The one skip that is
         # NOT deliberate is a host file whose bytes could not be read: it is a file the copy WOULD have replaced, so the backup gate still judges it.
-        if ($reason) { $skips.Add([pscustomobject]@{ Source = $f.FullName; Dest = $dest; Reason = $reason; NeverReplaced = (-not $reason.StartsWith('host file unreadable')) }) }
+        if ($reason) { $skips.Add([pscustomobject]@{ Source = $f.FullName; Dest = $dest; Reason = $reason; NeverReplaced = (-not ($reason.StartsWith('host file unreadable') -or $reason -ceq 'bundle file unreadable')) }) }   # r6 (adversary pass 2 A5): a BUNDLE file that could not be read is not a deliberate skip either: the copy reads it again and reports IMPORT_COPY_FAILED
     }
     return $skips.ToArray()
 }
@@ -3048,7 +3048,7 @@ function Get-ImportSourceBytesRefusal {
             # no byte order mark detection (adversary pass 1 A1): FF FE would switch the reader to UTF-16 and read UTF-16 bytes as valid text; a UTF-8 BOM (EF BB BF) is the one mark accepted, stripped here
             $sr2 = [IO.StreamReader]::new([IO.MemoryStream]::new($Bytes), [Text.UTF8Encoding]::new($false, $true), $false)
             try { $strictText = $sr2.ReadToEnd() } finally { $sr2.Dispose() }
-            $strictText = $strictText.TrimStart([char]0xFEFF)
+            if ($strictText.Length -gt 0 -and $strictText[0] -eq [char]0xFEFF) { $strictText = $strictText.Substring(1) }   # ONE mark at most (adversary pass 2 A3): a second one is a character before the JSON
         } catch { return "bundle file is damaged: $Name is not valid UTF-8 text" }
         if (-not (Test-ImportJsonObject $strictText)) { return "bundle file is damaged: $Name is not a valid JSON object" }
     }
@@ -3441,7 +3441,10 @@ function Invoke-ImportRobocopy {
                     $srcVerdict = Get-ImportEarlySourceVerdict -Source $e -HostLength $hostLen
                     # r6 (sol r5 B4): the host file is looked at AGAIN after the (slow) source read: one that went away during it is a creation (Copy-ImportFileLocked CreateNew), not a refusal.
                     # A direct existence call, not Test-ImportHostFileExists: the r5 probe count (one probe feeds both decisions) is unchanged.
-                    if (-not $srcVerdict.Why -and -not $srcVerdict.ReadFailed -and [IO.File]::Exists($dest)) {
+                    # r6 (adversary pass 2 A4): and the copy rules are judged AGAIN on that fresh look: a host file saved newer during the read is a keep (the copy compares it afresh), not a refusal
+                    $stillReplaces = $false
+                    try { $di2 = [IO.FileInfo]::new($dest); $stillReplaces = ($di2.Exists -and (Test-ImportReplaces -Source $e -Dest $di2 -ExcludeNewer $exN -ExcludeOlder $exO -ExcludeChanged $exC)) } catch { $stillReplaces = [IO.File]::Exists($dest) }
+                    if (-not $srcVerdict.Why -and -not $srcVerdict.ReadFailed -and $stillReplaces) {
                         $n.skipped++
                         $script:ImportSkippedDest.Add($dest)
                         Add-TypedFailure -Failure "IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED $dest" -Line "IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED $dest ($gap, so the host file was left as it is; the bundle copy $($e.FullName) was not applied)"
@@ -3496,6 +3499,9 @@ function Invoke-ImportRobocopy {
 }
 
 $script:ImportSkippedDest = [System.Collections.Generic.List[string]]::new()
+$script:ImportExpandDone = $false     # r6: set by the 'Expand' step itself, once tar ended without a failure (Invoke-PhaseImport)
+$script:ImportSnapshotDone = $false   # r6: set by the 'Snapshot' step itself, once the snapshot was made completely
+$script:ImportBackupLastWhy = ''      # r6: the cause Copy-CleanBackupFile recorded for its last failure (named in IMPORT_BACKUP_FAILED)
 # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 (r3): the replace of a backed-up host file is tied to the backup that WAS made, not to a probe of whether one failed. All three are
 # keyed by the full path (case-insensitive) and cleared at the start of the Import backup step:
 #   ImportBackupProtected          the host files that step is about to back up (CLAUDE.md and settings.json under ~/.claude), whether or not they exist at that moment;
@@ -3536,6 +3542,35 @@ function Close-ImportBackupHandles {
     $script:ImportBackupHandle.Clear()
 }
 
+# r6: the folder a drive letter was SUBSTituted for ('X:\' -> 'C:\Fixture'), or $null (an ordinary drive, a network drive, anything that cannot be asked). QueryDosDevice answers '\??\C:\Fixture'.
+function Get-ImportSubstTarget {
+    param([string]$Root)
+    try {
+        if ($Root -notmatch '^[A-Za-z]:\\$') { return $null }
+        if (-not ('MlvDosDevice' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class MlvDosDevice {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint QueryDosDevice(string lpDeviceName, StringBuilder lpTargetPath, uint ucchMax);
+    public static string Query(string drive) {
+        StringBuilder sb = new StringBuilder(1024);
+        if (QueryDosDevice(drive, sb, (uint)sb.Capacity) == 0) { return null; }
+        string s = sb.ToString();
+        int i = s.IndexOf('\0');
+        return i >= 0 ? s.Substring(0, i) : s;
+    }
+}
+'@
+        }
+        $t = [MlvDosDevice]::Query($Root.Substring(0, 2))
+        if ($t -and $t.StartsWith('\??\') -and $t.Length -gt 7 -and $t.Substring(4) -match '^[A-Za-z]:\\') { return $t.Substring(4) }
+    } catch { }
+    return $null
+}
+
 # r4: the path a file REALLY is: every part that is a junction or symbolic link is resolved (GetFullPath only tidies the text), so the backup registries are keyed by the physical host file
 # and a destination reached through a link (a junction under the state root onto ~/.claude) is still the protected file. A part that cannot be resolved stays as written.
 function Get-ImportRealPath {
@@ -3544,6 +3579,10 @@ function Get-ImportRealPath {
     if ($Depth -gt 8) { return $full }
     try {
         $root = [IO.Path]::GetPathRoot($full)
+        # r6 (adversary pass 2 A2): a SUBST drive is an alias of a folder, and nothing below the drive root shows it (no reparse point): the drive's target is substituted for the root, so a protected file
+        # reached through the alias drive is keyed by its physical path, as one reached through a junction is.
+        $sub = Get-ImportSubstTarget $root
+        if ($sub) { return (Get-ImportRealPath (Join-Path $sub $full.Substring($root.Length)) ($Depth + 1)) }
         $cur = $root
         foreach ($part in @($full.Substring($root.Length).Split([char[]]@('\', '/'), [StringSplitOptions]::RemoveEmptyEntries))) {
             $next = Join-Path $cur $part
@@ -3677,7 +3716,9 @@ function Copy-CleanBackupFile {
         $ws.Write($bytes, 0, $bytes.Length); $ws.Flush()
         $ws.Dispose(); $ws = $null
         # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 (r3): what was backed up is recorded by its bytes; Import replaces this host file only while it still holds exactly these bytes.
-        # r4: the backup file is held open (FileShare.Read: no delete, rename or write by anyone else) from here until the copy step ends, and what it holds is proven to be the bytes just written
+        # r4: the backup file is held open (FileShare.Read: no delete, rename or write by anyone else) from here until the copy step ends, and what it holds is proven to be the bytes just written.
+        # (A reader-compatible hold needs a second handle opened after the writer closes: a writer handle with write or delete access forces every other opener to share write or delete. When another
+        # process takes the file in that instant the open below fails and the backup is NOT registered: the host file is kept and the typed backup failure stands; adversary pass 2 A7, DISTINGUISHed.)
         $keep = [IO.File]::Open($dest, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
         try {
             if ((Get-ImportBytesHash (Read-ImportHeldBytes $keep)) -cne (Get-ImportBytesHash $bytes)) { throw 'the backup file changed as it was written' }
@@ -3688,6 +3729,7 @@ function Copy-CleanBackupFile {
         return $true
     } catch {
         $backupWhy = $_.Exception.Message
+        $script:ImportBackupLastWhy = $backupWhy   # r6 (adversary pass 2 A14): named in the IMPORT_BACKUP_FAILED line the caller logs
         # r15 (pass 12 A6 sibling): a partly written backup copy is removed and the removal is proven; one that cannot be removed is a typed failure of the run.
         # r16 (adversary pass 15 A4 sibling): removed THROUGH the held handle, never by pathname: a failure before this run opened $dest (an unreadable source) deletes
         # nothing, and a file another process saved at $dest after a release can never be the one deleted.
@@ -3718,15 +3760,18 @@ function Invoke-PhaseImport {
     $src = $BundlePath
     if ((Get-Item -LiteralPath $BundlePath).PSIsContainer -eq $false) {
         $src = Join-Path $MlvTmp "migrate-in\bundle-$stamp"
-        $expandFailuresBefore = $script:Failures.Count
+        # r6 (adversary pass 2 A1): the expansion counts as done only when THIS step ran it to its end (a flag the step itself sets). A failure count (a step that failed) and a folder that exists
+        # (left by an earlier, failed phase of the same run, which shares the stamp) are not proof: a declined step adds no failure and leaves that folder to be read as this run's expansion.
+        $script:ImportExpandDone = $false
         Invoke-Step "Expand $BundlePath to $src" {
             [void][IO.Directory]::CreateDirectory($src)
             # r6 (sol r5, hardening): bounded (15 min): a read that stalls inside tar fails the step, and the typed IMPORT_BUNDLE_EXPAND_FAILED below follows, instead of waiting for ever
             [void](Invoke-Native -Exe (Join-Path $env:SystemRoot 'System32\tar.exe') -Arguments @('-x', '-f', $BundlePath, '-C', $src) -TimeoutSec 900)
+            $script:ImportExpandDone = $true
         }
         # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1: tar exits non-zero on a truncated or damaged zip AFTER leaving partly written files in the expanded folder; nothing of such a
         # bundle is snapshotted or copied (the run fails, exit 1). A -WhatIf preview expands nothing and never records a failure.
-        if (-not $WhatIfPreference -and $script:Failures.Count -gt $expandFailuresBefore) {
+        if (-not $WhatIfPreference -and -not $script:ImportExpandDone) {
             Add-TypedFailure -Failure "IMPORT_BUNDLE_EXPAND_FAILED $BundlePath" -Line "IMPORT_BUNDLE_EXPAND_FAILED $BundlePath (the bundle could not be expanded completely; nothing was imported)"
             return
         }
@@ -3740,9 +3785,11 @@ function Invoke-PhaseImport {
         $importSnapshot = Join-Path $StateRoot "import-snapshot-$stamp"
         # r6 (sol r5 B5): a snapshot is COMPLETE only when its step ended without a failure. Robocopy exits 8 after leaving part of the tree in the folder, and the folder's presence used to be the
         # whole test, so a partial snapshot fed every copy below. A failed step is the typed IMPORT_SNAPSHOT_FAILED, the partial folder is removed, and nothing is imported.
-        $snapshotFailuresBefore = $script:Failures.Count
-        Invoke-Step "Snapshot the bundle to $importSnapshot (the scan and the copy read the same bytes)" { [void](New-ImportSnapshot -From $src -To $importSnapshot) }
-        if ($script:Failures.Count -gt $snapshotFailuresBefore -or -not (Test-Path -LiteralPath $importSnapshot -PathType Container)) {
+        # r6 (adversary pass 2 A1): complete means THIS step ran New-ImportSnapshot to its end (a flag the step sets): a declined step adds no failure, and a folder of the snapshot's name left by an
+        # earlier phase of the same run (the stamp is shared) is not this run's snapshot.
+        $script:ImportSnapshotDone = $false
+        Invoke-Step "Snapshot the bundle to $importSnapshot (the scan and the copy read the same bytes)" { [void](New-ImportSnapshot -From $src -To $importSnapshot); $script:ImportSnapshotDone = $true }
+        if (-not $script:ImportSnapshotDone -or -not (Test-Path -LiteralPath $importSnapshot -PathType Container)) {
             Add-TypedFailure -Failure 'IMPORT_SNAPSHOT_FAILED' -Line 'IMPORT_SNAPSHOT_FAILED the bundle snapshot could not be made completely; nothing was imported'
             if (Test-Path -LiteralPath $importSnapshot) { try { Remove-Item -LiteralPath $importSnapshot -Recurse -Force -ErrorAction Stop } catch { Write-LogSafe "could not remove the partial import snapshot $importSnapshot : $($_.Exception.Message)" 'WARN' } }
             return
@@ -3775,7 +3822,7 @@ function Invoke-PhaseImport {
             # never replaces such a file anyway, so there is nothing to roll back). One read: the bytes judged are the bytes written.
             if (-not (Copy-CleanBackupFile -Path $p -DestinationDir $b)) {
                 if ($script:ImportBackupCredentialSkipped.Contains((Get-ImportRealPath $p))) { Write-LogSafe "IMPORT_BACKUP_SKIPPED_CREDENTIAL_FILE $p (it carries a credential; no copy was made)" 'WARN' }
-                else { Write-LogSafe "IMPORT_BACKUP_FAILED $p (the backup copy could not be written; the host file is not replaced)" 'ERROR' }
+                else { Write-LogSafe "IMPORT_BACKUP_FAILED $p (the backup copy could not be written: $($script:ImportBackupLastWhy); the host file is not replaced)" 'ERROR' }
             }
         }
     }

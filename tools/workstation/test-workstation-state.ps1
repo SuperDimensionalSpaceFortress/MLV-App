@@ -4353,6 +4353,55 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r6 import backup')) {
     $r6Undeny0 = { & icacls.exe (Join-Path (& $r6Dir) $script:R6Leaf) /remove:d '*S-1-1-0' 2>&1 | Out-Null }
     $r6b8 = & $r6Run 'r6b8' 'ROTATION.md' ([byte[]]@()) 'HOST-GOOD-CONTENT' $r6Deny0 $r6Undeny0
     Assert-That ($script:R6After -ceq 'HOST-GOOD-CONTENT' -and (& $r6Typed $r6b8 'IMPORT_SOURCE_DAMAGED_NOT_REPLACED' 'ROTATION.md') -eq 1) 'r6 import (adversary A2): a zero-byte bundle file over a read-denied non-empty host file is the typed source failure (not a silent skip)' "rotation=[$($script:R6After)] failures=$($r6b8.Failures -join ',')`n$($r6b8.Out)"
+    # (2d) adversary pass 2 A3: TWO leading byte order marks are one too many (a reader consumes one; the other is a character before the JSON)
+    $r6b9 = & $r6Run 'r6b9' 'settings.local.json' ([byte[]]@(0xEF, 0xBB, 0xBF, 0xEF, 0xBB, 0xBF, 0x7B, 0x7D)) '{"theme":"dark"}'
+    Assert-That ($script:R6After -ceq '{"theme":"dark"}' -and (& $r6Typed $r6b9 'IMPORT_SOURCE_DAMAGED_NOT_REPLACED' 'settings.local.json') -eq 1) 'r6 import (adversary pass 2 A3): a bundle settings.local.json with TWO UTF-8 byte order marks is a damaged source (at most one is accepted)' "settings.local=[$($script:R6After)] failures=$($r6b9.Failures -join ',')`n$($r6b9.Out)"
+    # (2e) adversary pass 2 A4: the host file is SAVED (newer than the bundle copy) while the gate reads the bundle file and its backup is unavailable: the copy keeps it, so the run has no failure
+    $r6k = Invoke-R3Import 'r6k' -3 0 {
+        param($st, $sp)
+        [void][IO.Directory]::CreateDirectory((Join-Path $st "backups\home-claude-$sp\CLAUDE.md"))
+        $script:ImportAfterEarlySourceReadHook = { param($p) [IO.File]::WriteAllText($script:R3HostPath, 'HOST-NEW'); (Get-Item -LiteralPath $script:R3HostPath).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(1) }
+    } $null { $script:ImportAfterEarlySourceReadHook = $null }
+    Assert-That ($r6k.Host -ceq 'HOST-NEW' -and $r6k.Failures.Count -eq 0) 'r6 import (adversary pass 2 A4): a host file saved newer than the bundle copy while the gate read it is a failure-free keep (the rules are judged again after the read)' "host=[$($r6k.Host)] failures=$($r6k.Failures -join ',')`n$($r6k.Out)"
+    # (2f) adversary pass 2 A5: a bundle file the inspection could not read (here held with no sharing) is not a silent skip: the copy names it (IMPORT_COPY_FAILED)
+    $r6lSrc = New-Scratch 'r6l-src'; $r6lDst = New-Scratch 'r6l-dst'; [IO.File]::WriteAllText((Join-Path $r6lSrc 'CLAUDE.md'), 'FROM-BUNDLE')
+    $r6lHold = [IO.File]::Open((Join-Path $r6lSrc 'CLAUDE.md'), [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try { $r6lSkips = @(Get-ImportCredentialSkips -SourceDir $r6lSrc -DestDir $r6lDst) } finally { $r6lHold.Dispose() }
+    Assert-That ($r6lSkips.Count -eq 1 -and $r6lSkips[0].Reason -ceq 'bundle file unreadable' -and $r6lSkips[0].NeverReplaced -eq $false) 'r6 import (adversary pass 2 A5): a bundle file the inspection could not read is not a deliberate never-replace skip (the copy reads it again and reports IMPORT_COPY_FAILED)' "skips=$($r6lSkips.Count) neverReplaced=$(if ($r6lSkips.Count) { $r6lSkips[0].NeverReplaced })"
+    # (2g) adversary pass 2 A1: a snapshot step that is DECLINED (-Confirm answered No) leaves no snapshot of this run; a leftover folder of that name (an earlier phase of the run) is not one
+    $script:R6Stale = $null
+    $r6m = Invoke-R3Import 'r6m' -3 0 {
+        param($st, $sp)
+        $script:R6SaveCmdlet = $script:Cmdlet
+        $stub = [pscustomobject]@{}
+        Add-Member -InputObject $stub -MemberType ScriptMethod -Name ShouldProcess -Value { param($target, $action) -not ($action -like 'Snapshot the bundle*') }
+        $script:Cmdlet = $stub
+        $stale = Join-Path $st "import-snapshot-$sp\home-claude"; [void][IO.Directory]::CreateDirectory($stale)
+        [IO.File]::WriteAllText((Join-Path $stale 'CLAUDE.md'), 'STALE-SNAPSHOT'); [IO.File]::WriteAllText((Join-Path (Split-Path -Parent $stale) 'MANIFEST.txt'), 'mlv-migrate-bundle v1')
+    } $null { $script:Cmdlet = $script:R6SaveCmdlet }
+    Assert-That ($r6m.Host -ceq 'HOST-GOOD-CONTENT' -and (& $r6Typed $r6m 'IMPORT_SNAPSHOT_FAILED' '') -eq 1) 'r6 import (adversary pass 2 A1): a declined snapshot step never lets a leftover snapshot folder supply host replacements (typed IMPORT_SNAPSHOT_FAILED)' "host=[$($r6m.Host)] failures=$($r6m.Failures -join ',')`n$($r6m.Out)"
+    # (2h) adversary pass 2 A7 (DISTINGUISHed: the close-and-reopen is the r4 design and fails closed; a writer handle would block every reader): a held backup stays READABLE by others and cannot be deleted
+    $r6nSrc = Join-Path (New-Scratch 'r6n-src') 'CLAUDE.md'; [IO.File]::WriteAllText($r6nSrc, 'HOST-GOOD-CONTENT')
+    Close-ImportBackupHandles; $script:ImportBackupHash.Clear(); $script:ImportBackupProtected.Clear()
+    $r6nDest = New-Scratch 'r6n-dest'; $r6nOk = Copy-CleanBackupFile -Path $r6nSrc -DestinationDir $r6nDest
+    $r6nRead = ''; $r6nDelThrown = ''
+    try { $r6nRead = [IO.File]::ReadAllText((Join-Path $r6nDest 'CLAUDE.md')) } catch { $r6nRead = "THROWN: $($_.Exception.Message)" }
+    try { [IO.File]::Delete((Join-Path $r6nDest 'CLAUDE.md')) } catch { $r6nDelThrown = $_.Exception.Message }
+    Assert-That (@($r6nOk)[-1] -eq $true -and $r6nRead -ceq 'HOST-GOOD-CONTENT' -and $r6nDelThrown -and (Test-Path -LiteralPath (Join-Path $r6nDest 'CLAUDE.md'))) 'r6 import (adversary pass 2 A7, distinguished): a held backup is readable by other processes and cannot be deleted while the copy step runs' "ok=[$($r6nOk -join ',')] read=[$r6nRead] delete=[$r6nDelThrown]"
+    Close-ImportBackupHandles; $script:ImportBackupHash.Clear()
+    # (2i) adversary pass 2 A14: the IMPORT_BACKUP_FAILED line names the cause (a denied read of the host file), not only 'could not be written'
+    $r6o = Invoke-R3Import 'r6o' -3 0 { param($st, $sp) & icacls.exe $script:R3HostPath /deny '*S-1-1-0:(RD)' 2>&1 | Out-Null } $null { & icacls.exe $script:R3HostPath /remove:d '*S-1-1-0' 2>&1 | Out-Null }
+    Assert-That ($r6o.Out -match 'IMPORT_BACKUP_FAILED[^\r\n]*denied') 'r6 import (adversary pass 2 A14): the IMPORT_BACKUP_FAILED record names the cause of the failure' "out=$($r6o.Out)"
+    # (2j) adversary pass 2 A2: a path reached through a SUBST drive is the physical file (the protected set is keyed by the physical path)
+    $r6sLetter = $null; foreach ($r6c in 'Y', 'X', 'W', 'V', 'U') { if (-not (Test-Path -LiteralPath "${r6c}:\")) { $r6sLetter = $r6c; break } }
+    if ($r6sLetter) {
+        $r6sDir = New-Scratch 'r6s-physical'; [void][IO.Directory]::CreateDirectory((Join-Path $r6sDir 'a'))
+        & subst.exe "${r6sLetter}:" $r6sDir 2>&1 | Out-Null
+        try {
+            $r6sGot = Get-ImportRealPath "${r6sLetter}:\a\CLAUDE.md"; $r6sWant = Get-ImportRealPath (Join-Path $r6sDir 'a\CLAUDE.md')
+        } finally { & subst.exe "${r6sLetter}:" /d 2>&1 | Out-Null }
+        Assert-That ($r6sGot -ieq $r6sWant) 'r6 import (adversary pass 2 A2): a path through a SUBST drive resolves to the physical file it names (a protected file is not reachable through an alias drive)' "got=[$r6sGot] want=[$r6sWant]"
+    } else { Write-Host 'SKIP r6 import (adversary pass 2 A2): no free drive letter for a SUBST drive' }
     # (3a) the host settings.json denies reads (its backup cannot be made, the inspection skips it) and the bundle settings.json is cut off: the typed source failure, not a silent skip
     $r6Deny = { & icacls.exe (Join-Path (& $r6Dir) $script:R6Leaf) /deny '*S-1-1-0:(RD)' 2>&1 | Out-Null }
     $r6Undeny = { & icacls.exe (Join-Path (& $r6Dir) $script:R6Leaf) /remove:d '*S-1-1-0' 2>&1 | Out-Null }
@@ -4415,6 +4464,10 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r6 import backup')) {
     $r6nThrown = ''; $r6nSw = [Diagnostics.Stopwatch]::StartNew()
     try { [void](Invoke-Native -Exe $r6pw -Arguments @('-NoProfile', '-Command', 'Start-Sleep -Seconds 60') -TimeoutSec 3) } catch { $r6nThrown = $_.Exception.Message }
     Assert-That ($r6nThrown -match 'did not finish within 3' -and $r6nSw.Elapsed.TotalSeconds -lt 30) 'r6 hardening: a native child that outlives its time bound is killed and reported (Invoke-Native -TimeoutSec)' "thrown=[$r6nThrown] seconds=$([int]$r6nSw.Elapsed.TotalSeconds)"
+    # adversary pass 2 A11: a time bound too large for the wait's millisecond argument is clamped, not a conversion error after the child started
+    $r6qCode = $null; $r6qThrown = ''
+    try { $r6qCode = Invoke-Native -Exe $r6pw -Arguments @('-NoProfile', '-Command', 'exit 0') -TimeoutSec 2147484 } catch { $r6qThrown = $_.Exception.Message }
+    Assert-That ((-not $r6qThrown) -and @($r6qCode)[-1] -eq 0) 'r6 hardening (adversary pass 2 A11): an enormous -TimeoutSec is clamped and the call still returns the exit code' "thrown=[$r6qThrown] code=[$($r6qCode -join ',')]"
     # adversary pass 1 A3 (pre-existing): a native call whose command line cannot be logged still runs (the expansion's logging used to throw before tar started)
     $r6jlf = $script:LogFile; $script:LogFile = (New-Scratch 'r6j-logdir'); $r6jThrown = ''; $r6jCode = $null
     try { $r6jCode = Invoke-Native -Exe $r6pw -Arguments @('-NoProfile', '-Command', 'exit 0') } catch { $r6jThrown = $_.Exception.Message } finally { $script:LogFile = $r6jlf }
