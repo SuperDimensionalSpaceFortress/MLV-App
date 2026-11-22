@@ -1669,6 +1669,49 @@ class CdngTotalContainmentTests(unittest.TestCase):
             with self.subTest(control=name):
                 self.assertEqual((row["problems"], row["outcome"]), ([], "PASS"), row)
 
+    def test_the_wall_gate_limit_is_built_from_the_exact_done_elapsed_never_the_rounded_published_figure(self) -> None:
+        """r4 B1 (opus r3, DEFECT_CLASS rounded-gate-input, literal inputs): the DONE regex accepts up to 9 decimals of elapsed, but the wall limit was built from wallSeconds, which is
+        rounded to 6 decimals for publication. elapsed=12.2999996 rounds to 12.3, so the limit moved from the exact 101.89843421875 (+ the 4e-7 epsilon) to 101.8984375 and a mean of 101.8984375
+        read PASS at both wall gates (CDNG producer_frame, ProRes processed16_total). The same input at each, a one-frame run (elapsed=0.0999996, mean 105.9999), and controls at the exact limit."""
+        def exact(text: str) -> str:
+            return batch_log(128, elapsed=12.3).replace("elapsed=12.3", f"elapsed={text}")
+
+        def cdng_wall(lo: float, hi: float, elapsed: str = "12.2999996") -> dict:
+            doc = json.loads(cdng_profile(128))
+            for i, r in enumerate(doc["frames"]):
+                r["producer_frame_ms"] = lo if i < 64 else hi
+            return cdng_case(maxFrames=128, profile=json.dumps(doc), batch=exact(elapsed), manifest=output_manifest(128), criteria=[])
+
+        def prores_wall(lo: float, hi: float, elapsed: str = "12.2999996") -> dict:
+            out = []
+            for i in range(128):
+                p16 = lo if i < 64 else hi
+                for name, ms in (("raw_uint16_disk_read", 0.0), ("raw_uint16_decompress", 0.0), ("raw_uint16", 0.0), ("llrawproc", 0.0), ("debayered_frame", p16), ("processing", 0.0), ("processed16_total", p16)):
+                    out.append(f"[mlv-stage-timing] frame={i} stage={name} ms={ms:.6f}")
+            return prores_case(maxFrames=128, stage="\n".join(out) + "\n", batch=batch_log(128, verified=128, elapsed=12.3).replace("elapsed=12.3", f"elapsed={elapsed}"), criteria=[])
+
+        def one_frame() -> dict:   # exact limit 99.9996 * 1.05 + 1 = 105.99958 (+ 4e-7); the rounded elapsed 0.1 gives 106.0
+            doc = json.loads(cdng_profile(1))
+            doc["frames"][0]["producer_frame_ms"] = 105.9999
+            return cdng_case(maxFrames=1, profile=json.dumps(doc), batch=batch_log(1, elapsed=0.1).replace("elapsed=0.1", "elapsed=0.0999996"), manifest=output_manifest(1), criteria=[])
+
+        bad = (("cdng_wall_gate_3_increments_over", cdng_wall(101.898437, 101.898438), "producer_frame"),
+               ("prores_wall_gate_3_increments_over", prores_wall(101.898437, 101.898438), "processed16_total"),
+               ("cdng_one_frame_elapsed_0_0999996", one_frame(), "producer_frame"))
+        controls = (("cdng_wall_gate_at_the_exact_limit", cdng_wall(101.898434, 101.898435)),
+                    ("prores_wall_gate_at_the_exact_limit", prores_wall(101.898434, 101.898435)),
+                    ("cdng_wall_gate_nine_decimals_that_round_to_itself", cdng_wall(101.898437, 101.898438, elapsed="12.300000000")))
+        proc, got = evidence_cases([c for _n, c, _needle in bad] + [c for _n, c in controls])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(len(got), len(bad) + len(controls), (len(got), proc.stderr[-3000:]))
+        for (name, _c, needle), row in zip(bad, got):
+            with self.subTest(case=name):
+                self.assertEqual(row["outcome"], "INVALID", row)
+                self.assertTrue(any(p.startswith(CONTAINMENT + ": ") and needle in p for p in row["problems"]), row)
+        for (name, _c), row in zip(controls, got[len(bad):]):
+            with self.subTest(control=name):
+                self.assertEqual((row["problems"], row["outcome"]), ([], "PASS"), row)
+
 
 @requires_windows_pwsh
 class CdngStageContainmentGateTests(unittest.TestCase):
