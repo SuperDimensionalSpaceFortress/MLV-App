@@ -4516,8 +4516,6 @@ $script:ExportEvidenceFiles = @('summary.json', 'batch.log', 'export-profile.jso
 # r8 fix 2 (adversary r8 A1): the PARENT/CHILD half of the stage schema. A published share is of work the stage's parent contains: a child whose mean exceeds its parent's is
 # no measurement of this run (raw_uint16 at 900 ms inside a 40 ms debayered_frame read a 16x share and PASSed). Pairs are child -> parent, over the stage rows' means, with the
 # slack two clocks and rounding can honestly show (5 % + 1 ms); a pair whose parent or child is wholly absent is skipped (a stage the app did not run is permitted).
-$script:ExportStageContainTolerance = 1.05
-$script:ExportStageContainSlackMs = 1.0
 # (EXPORT-CDNG-TOTAL-CONTAINMENT-1, adversary A2: a figure AT the limit is inside it; the binary product 40.00046 * 1.05 + 1 is 43.000482999999996, a hair under the decimal 43.000483, which is why
 # the comparison is in [decimal] below; the one epsilon, $script:ExportStageContainEpsilonD, is documented with it)
 # (EXPORT-CDNG-TOTAL-CONTAINMENT-1 r2 fix 1, adversary pass A2 + A3 on 62dff0fa: every containment comparison is made in [decimal], so (A2) a figure exactly at the decimal limit is inside it at ANY
@@ -4527,9 +4525,10 @@ $script:ExportStageContainToleranceD = [decimal]1.05
 $script:ExportStageContainSlackD = [decimal]1.0
 # (EXPORT-CDNG-TOTAL-CONTAINMENT-1 r3 B1, sol r2 INV-4 on f755f502: rounding BOTH sides to 6 decimals before the compare let a mean over the limit by one FULL emitted increment pass, because
 # the limit and the mean rounded to the same figure (limit 101.8984375, mean 101.8984385, both 101.898438). The comparison is now on the UNROUNDED decimals against the exact limit plus ONE
-# epsilon, 4e-7 ms = four tenths of an emitted increment, the same on every side of every gate: a mean of figures the writers emit at 6 decimals is a hair off the figure it equals, by less
-# than half an increment (5e-7), so an overrun of less than four tenths of an increment is that hair (the r2 controls: 3e-7 over passes) and an overrun of half an increment or more is a
-# real one (5e-7 and 1e-6 over fail). A figure exactly AT the limit is inside it at any magnitude, as decimal arithmetic keeps it exact.)
+# epsilon, 4e-7 ms = four tenths of an emitted increment, the same on every side of every gate. The epsilon is a POLICY choice, not a correction of arithmetic: the means and the limits are exact
+# decimals and are not off at all. It says an overrun of less than four tenths of an emitted increment is within what the 6-decimal figures can show (the r2 controls: 3e-7 over passes), and an
+# overrun of half an increment or more is a real one (5e-7 and 1e-6 over fail). A figure exactly AT the limit is inside it at any magnitude, as decimal arithmetic keeps it exact. The wall
+# gates' limit is built from the DONE elapsed as the log wrote it (r4 B1), not from the 6-decimal published wallSeconds.)
 $script:ExportStageContainEpsilonD = [decimal]0.0000004
 
 function Test-DvExportBeyondTolerance {
@@ -4766,7 +4765,8 @@ function Get-DvExportContainmentProblem {
 function Get-DvExportWallContainmentProblem {
     param($WallSeconds, $Frames, [string]$StageName, $StageMeanMs)
     if ($null -eq $WallSeconds -or $null -eq $Frames -or [int64]$Frames -le 0 -or $null -eq $StageMeanMs) { return $null }
-    $wallPerFrame = [decimal]$WallSeconds * [decimal]1000 / [decimal]$Frames   # (unrounded and in decimal, as are the means: sol r1 B3; compared unrounded too: Test-DvExportBeyondTolerance)
+    # $WallSeconds is the DONE elapsed exactly as the log wrote it ([decimal], up to 9 decimals), never the 6-decimal published wallSeconds (r4 B1, opus r3): the limit is exact, in decimal like the means (sol r1 B3), compared unrounded (Test-DvExportBeyondTolerance)
+    $wallPerFrame = [decimal]$WallSeconds * [decimal]1000 / [decimal]$Frames
     Get-DvExportContainmentProblem -Means @{ batch_wall_per_frame = $wallPerFrame; $StageName = $StageMeanMs } -Pairs @(, @($StageName, 'batch_wall_per_frame'))
 }
 
@@ -5041,6 +5041,7 @@ function Get-DvExportEvidence {
                      profileFramesFailed = $null; stageFramesSeen = $null; dualIsoActiveFrames = $null; dualIsoClassAgrees = $null; outputFileCount = $null; outputBytes = $null
                      wallSeconds = $null; exportFps = $null; largestStage = $null; largestStageShare = $null }
     $classMismatch = $false; $classDetail = $null
+    $wallExact = $null   # the DONE elapsed exactly as the log wrote it, [decimal]; null when there is no single DONE line (the wall gates then have nothing to compare)
     $containmentAdvisory = @()   # (r18's advisory channel, kept EMPTY for the receipt shape the leg runner writes (receipt.export.containmentAdvisory): EXPORT-CDNG-STAGE-CONTAINMENT-1 r1 made the check gate again)
     # -- the batch log: exactly one DONE line for the one clip
     # (r7 A6: the counts are bounded to 15 digits, so a count that does not fit an int64 is no DONE line, typed below, and never an Int64 cast that throws)
@@ -5051,6 +5052,8 @@ function Get-DvExportEvidence {
         $m.framesExported = [int64]$done[0].Groups['e'].Value
         $m.exportFramesSkipped = [int64]$done[0].Groups['s'].Value
         $m.exportFramesFailed = $m.exportFramesSkipped
+        # (EXPORT-CDNG-TOTAL-CONTAINMENT-1 r4 B1, opus r3: wallSeconds is the PUBLISHED figure, 6 decimals; the wall gates' limit is built from the exact matched elapsed, up to 9 decimals, never from it)
+        $wallExact = [decimal]::Parse($done[0].Groups['t'].Value, [Globalization.NumberStyles]::AllowDecimalPoint, [Globalization.CultureInfo]::InvariantCulture)
         $m.wallSeconds = Get-DvExportRound ([double]::Parse($done[0].Groups['t'].Value, [Globalization.CultureInfo]::InvariantCulture))
         $m.exportFps = $(if ($m.wallSeconds -gt 0) { Get-DvExportRound ($m.framesExported / $m.wallSeconds) } else { $null })
     }
@@ -5164,7 +5167,7 @@ function Get-DvExportEvidence {
             # EXPORT-CDNG-TOTAL-CONTAINMENT-1 (Dot I5): the llrawproc TOTAL inside producer_frame_ms, the children inside it and (when published) the worker total equal to them, per frame (the mean pair above cannot see one frame; the longer-than-its-children direction is a more-than-a-tenth-of-the-frames rule)
             foreach ($totalProblem in @(Get-DvExportCdngTotalFrameProblems -Frames $ok)) { $problems.Add($totalProblem) }
             # r11 (sol r9 B2 (a)): and the producer's per-frame work is inside the batch's own elapsed
-            $wallContainment = Get-DvExportWallContainmentProblem -WallSeconds $m.wallSeconds -Frames $m.framesExported -StageName 'producer_frame' -StageMeanMs $exactDen
+            $wallContainment = Get-DvExportWallContainmentProblem -WallSeconds $wallExact -Frames $m.framesExported -StageName 'producer_frame' -StageMeanMs $exactDen
             if ($null -ne $wallContainment) { $problems.Add($wallContainment) }
             # adversary r2 A2: a capture is a stage-share measurement; successful rows with no producer_frame_ms (or no producer stage figure at all) measured none
             if ($ok.Count -gt 0 -and ($denRow.samples -ne $ok.Count -or $null -eq $denRow.meanMs -or [double]$denRow.meanMs -le 0 -or $largest.Count -eq 0)) {
@@ -5199,7 +5202,7 @@ function Get-DvExportEvidence {
             foreach ($name in $script:ExportRenderedStages) { $rowsOut[$name] = Get-DvExportStageRow -Values @($perStage[$name].Values) -Denominator $p16.meanMs }
             $untimed = $(if ($null -ne $batchWall -and $null -ne $p16.meanMs) { Get-DvExportRound ($batchWall - $p16.meanMs) } else { $null })
             # r11 (sol r9 B2 (a)): the measured per-frame work is inside the batch's elapsed (typed INVALID otherwise); a residual the logging precision made slightly negative is 0, never a negative stage
-            $wallContainment = Get-DvExportWallContainmentProblem -WallSeconds $m.wallSeconds -Frames $m.framesExported -StageName 'processed16_total' -StageMeanMs (Get-DvExportExactMean @($perStage['processed16_total'].Values))
+            $wallContainment = Get-DvExportWallContainmentProblem -WallSeconds $wallExact -Frames $m.framesExported -StageName 'processed16_total' -StageMeanMs (Get-DvExportExactMean @($perStage['processed16_total'].Values))
             if ($null -ne $wallContainment) { $problems.Add($wallContainment) }
             elseif ($null -ne $untimed -and $untimed -lt 0) { $untimed = 0.0 }
             $disjoint = $(if ($null -ne $rowsOut['debayered_frame'].meanMs -and $null -ne $rowsOut['processing'].meanMs) { Get-DvExportRound ($rowsOut['debayered_frame'].meanMs + $rowsOut['processing'].meanMs) } else { $null })
