@@ -2022,7 +2022,8 @@ Wait-Job $job | Out-Null; Remove-Job $job -Force
 
     def test_r8_rule6_no_lock_attempt_starts_after_the_budget_ended_during_the_retry_sleep(self) -> None:
         # r8 rule 6 (r7 pass 3 A6, the lock half): the lock was released after the budget expired, during the 15 ms retry sleep, and one more attempt then took it and went on to read and write.
-        mod = self.seam_text(("Start-Sleep -Milliseconds 15\n", "Start-Sleep -Milliseconds 1200\n"),
+        # (TAIL-1 r2: the nap is cut to what is left of the timeout, so the seam makes THAT sleep overshoot the budget by 1.2 s, as a descheduled thread does)
+        mod = self.seam_text(("if ($napMs -gt 0) { Start-Sleep -Milliseconds $napMs }\n", "if ($napMs -gt 0) { Start-Sleep -Milliseconds 1200 }\n"),
                              ("$fs = [IO.File]::Open($Ticket.path, [IO.FileMode]::Open, [IO.FileAccess]::Read,", "[IO.File]::WriteAllText($env:SEAM_READ, '1'); $fs = [IO.File]::Open($Ticket.path, [IO.FileMode]::Open, [IO.FileAccess]::Read,"))
         script = self.LOCK_AFTER_BUDGET.replace("@@MOD@@", str(mod)).replace("@@READ@@", str(self.case / "seam-read2.txt")).replace("@@MARK@@", str(self.case / "seam-lock-mark.txt"))
         r = self.ps(script, module=mod)
