@@ -293,7 +293,15 @@ DRIFT_LEGS = {"legs/m16-1457-drift-t4-unpaced-fullscreen-s1.json": "legs/m16-145
 DRIFT_T1_LEGS = {"legs/m16-1457-drift-t1-unpaced-fullscreen-s1.json": None,
                  "legs/m16-1457-drift-t1-cool-unpaced-fullscreen-s1.json": "0x00003",
                  "legs/m16-1457-drift-t1-hot-unpaced-fullscreen-s1.json": "0x00030"}
-DRIFT_LEGS = {**DRIFT_LEGS, **{rel: "legs/m16-1457-headroom-unpaced-fullscreen-s1.json" for rel in DRIFT_T1_LEGS}}
+# r4, first sitting: those three legs and a 20 s window cannot be counted. The app's pace gate (PlaybackFrameRange.h playSafetyMs / playPaceProjectsPastBudget) gives a Play of W
+# seconds of a 59.94 fps clip a budget of W/0.5 + 15 s for 59.94 x W source frames, so W = 20 needs about 21.8 fps; the cap-1 legs ran 19.9 (plain) and 17.9 (cool core) fps and ended early,
+# PaceTooSlow -> INVALID_SOURCE_FRAMES, exit 14, uncounted (the 22 fps baseline itself sits 0.3 fps above that floor). HFR-10S-1 lets a clip of 50 fps or more play a 10 s window (the
+# schema floor), which needs about 17.1 fps. The w10 family below is the same four legs at playSeconds 10, plus the cap-16 comparison arm at the same window.
+DRIFT_W10_LEGS = {"legs/m16-1457-drift-t1-w10-unpaced-fullscreen-s1.json": None,
+                  "legs/m16-1457-drift-t1-cool-w10-unpaced-fullscreen-s1.json": "0x00003",
+                  "legs/m16-1457-drift-t1-hot-w10-unpaced-fullscreen-s1.json": "0x00030",
+                  "legs/m16-1457-drift-t16-w10-unpaced-fullscreen-s1.json": None}
+DRIFT_LEGS = {**DRIFT_LEGS, **{rel: "legs/m16-1457-headroom-unpaced-fullscreen-s1.json" for rel in (*DRIFT_T1_LEGS, *DRIFT_W10_LEGS)}}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *DRIFT_LEGS)
 assert len(set(SHIPPED_LEGS)) == len(SHIPPED_LEGS), "a shipped leg is listed twice"
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
@@ -8228,7 +8236,7 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "M16-1457-VENUE-BASELINE-DRIFT-1":   # the thread-cap sweep and the P-core arm of the 1457 baseline-drift bench, named by arm
                 self.assertIn("legs/" + path.name, DRIFT_LEGS, path.name)
                 self.assertEqual(spec["legId"], path.stem, path.name)
-                self.assertRegex(spec["legId"], r"^m16-1457-drift-(t(1|4|8|12|16)|t1-cool|t1-hot|pcore12)-unpaced-fullscreen-s1$", path.name)
+                self.assertRegex(spec["legId"], r"^m16-1457-drift-(t(1|4|8|12|16)|t1-cool|t1-hot|pcore12|(t1|t1-cool|t1-hot|t16)-w10)-unpaced-fullscreen-s1$", path.name)
                 self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
                 self.assertEqual(spec["generatorArgs"]["swapInterval"], 0, path.name)
             elif spec["card"] == "CUDA-HEADROOM-UTIL-SAMPLER-1":   # the unpaced Cinematic utilisation-sampler leg (Look Assist forced on, the owner shape), named by cell
@@ -19579,6 +19587,47 @@ class DriftLegSpecTests(unittest.TestCase):
                 self.assertEqual(dict(spec, legId=source["legId"], card=source["card"]), source)
                 self.assertEqual(list(self.load(rel)), list(source), "the source's keys in the source's order")
 
+    # The slowest single-worker pace r4 measured with the 20 s window on Bachelor (OLD 4e306d0d, CUDA, 1457 fullscreen s1, cap 1 on one P-core's two logical CPUs): 17.923 fps
+    # (the cap-1 leg with no mask ran 19.856). Both ended early, PaceTooSlow -> exit 14, because a 20 s window needs about 21.8 fps.
+    SLOWEST_MEASURED_CAP1_FPS = 17.923
+
+    def pace_floor_fps(self, play_seconds: int, clip_fps: float = 59.94) -> float:
+        """The pace the app's gate demands of a Play of `play_seconds` of a `clip_fps` clip, read from the constants in PlaybackFrameRange.h (playSafetyMs and
+        required_source_frames = seconds x native fps): frames / (seconds / kMinSustainedPaceFraction + kPlaySafetyMarginMs / 1000)."""
+        text = (Path(__file__).resolve().parents[2] / "platform" / "qt" / "PlaybackFrameRange.h").read_text(encoding="utf-8")
+        fraction = float(re.search(r"constexpr double kMinSustainedPaceFraction = ([0-9.]+);", text).group(1))
+        margin_ms = int(re.search(r"constexpr int kPlaySafetyMarginMs = (\d+);", text).group(1))
+        return play_seconds * clip_fps / (play_seconds / fraction + margin_ms / 1000.0)
+
+    def test_the_20_second_window_cannot_host_a_cap_one_leg_and_the_w10_family_can(self) -> None:
+        """r4: the three cap-1 20 s legs ended PaceTooSlow (INVALID, uncounted). The floor a window sets is a function of the app's gate constants, so this
+        test computes it from the header: the 20 s window's floor is above every cap-1 pace measured, the 10 s window's floor is below all of them."""
+        self.assertGreater(self.pace_floor_fps(20), 21.0)
+        self.assertGreater(self.pace_floor_fps(20), self.SLOWEST_MEASURED_CAP1_FPS + 3.0)
+        self.assertLess(self.pace_floor_fps(10), self.SLOWEST_MEASURED_CAP1_FPS)
+        for rel in DRIFT_W10_LEGS:
+            with self.subTest(leg=rel):
+                spec = self.load(rel)
+                self.assertEqual(spec["playSeconds"], 10, "the schema floor, allowed for a 50 fps or faster clip (HFR-10S-1); 1457 is 59.94 fps")
+                self.assertLess(self.pace_floor_fps(spec["playSeconds"]), self.SLOWEST_MEASURED_CAP1_FPS)
+        for rel in DRIFT_T1_LEGS:
+            with self.subTest(leg=rel):
+                self.assertEqual(self.load(rel)["playSeconds"], 20, "the first-sitting legs keep the window they ran with (their INVALID receipts name it)")
+
+    def test_each_w10_leg_is_its_20_second_counterpart_with_only_the_window_changed(self) -> None:
+        pairs = {"legs/m16-1457-drift-t1-w10-unpaced-fullscreen-s1.json": "legs/m16-1457-drift-t1-unpaced-fullscreen-s1.json",
+                 "legs/m16-1457-drift-t1-cool-w10-unpaced-fullscreen-s1.json": "legs/m16-1457-drift-t1-cool-unpaced-fullscreen-s1.json",
+                 "legs/m16-1457-drift-t1-hot-w10-unpaced-fullscreen-s1.json": "legs/m16-1457-drift-t1-hot-unpaced-fullscreen-s1.json",
+                 "legs/m16-1457-drift-t16-w10-unpaced-fullscreen-s1.json": "legs/m16-1457-drift-t16-unpaced-fullscreen-s1.json"}
+        self.assertEqual(set(pairs), set(DRIFT_W10_LEGS))
+        for rel, twin_rel in pairs.items():
+            with self.subTest(leg=rel):
+                spec, twin = self.load(rel), self.load(twin_rel)
+                self.jsonschema.validate(spec, self.schema)
+                self.assertEqual(spec["legId"], Path(rel).stem)
+                self.assertEqual(spec["card"], "M16-1457-VENUE-BASELINE-DRIFT-1")
+                self.assertEqual(dict(spec, legId=twin["legId"], playSeconds=twin["playSeconds"]), twin)
+
     def test_the_pcore_arm_adds_only_the_affinity_keys_the_cap_and_the_two_partition_criteria(self) -> None:
         rel = "legs/m16-1457-drift-pcore12-unpaced-fullscreen-s1.json"
         spec, source = self.load(rel), self.load(DRIFT_LEGS[rel])
@@ -19601,10 +19650,14 @@ class DriftLegSpecTests(unittest.TestCase):
         """r4 serial-vs-cooling split: the cool and the hot leg are the cap-1 leg plus the P-core arm's affinity machinery (telemetry, the E-core helper
         mask, the two partition criteria that fail a leg whose affinity did not apply), with a bench mask of exactly one physical P-core: its two logical
         CPUs (Core Temp core k = logical CPUs 2k, 2k+1). Same mask size on both, so a speed gap between them is the core, not the mask width."""
-        t1 = self.load("legs/m16-1457-drift-t1-unpaced-fullscreen-s1.json")
         pcore = self.load("legs/m16-1457-drift-pcore12-unpaced-fullscreen-s1.json")
+        for family, base_rel in ((DRIFT_T1_LEGS, "legs/m16-1457-drift-t1-unpaced-fullscreen-s1.json"),
+                                 (DRIFT_W10_LEGS, "legs/m16-1457-drift-t1-w10-unpaced-fullscreen-s1.json")):
+            self.assert_single_core_family(family, self.load(base_rel), pcore)
+
+    def assert_single_core_family(self, family: dict, t1: dict, pcore: dict) -> None:
         masks = {}
-        for rel, mask in DRIFT_T1_LEGS.items():
+        for rel, mask in family.items():
             if mask is None:
                 continue
             with self.subTest(leg=rel):
