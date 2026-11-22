@@ -905,7 +905,15 @@ function Invoke-ClaimRetryRelease([DateTime]$DeadlineUtc, [string]$Nonce) {
     # r8 (sol r7 blocker): a release that THREW (the claim share's read or delete raising through EndInvoke, or the worker not created) returned NO_ANSWER with it still off. Now every
     # exit turns it on in ONE place, the outer finally, unless the worker's answer was read back and is a release ($answered): no room, no answer in the wait, a throw, an answer
     # that released nothing (BUSY), and any exit added later.
-    $suppress = { param([string]$Why) Disable-RunDirWrites "the release of a claim granted on a retry $Why" }
+    # (kept inline, not through Disable-RunDirWrites: the tests of this function lift it from the script by name, alone)
+    $suppress = {
+        param([string]$Why)
+        if (-not $script:RunOutputAliased) {
+            $script:RunOutputAliased = $true; $script:batchLog = $null
+            if (-not $script:suppressionHit) { $script:suppressionHit = [pscustomobject]@{ kind = 'content'; item = 0; code = 'SHARE_UNREACHABLE'; locationUnknown = $true; noAnswer = $false
+                why = "the release of a claim granted on a retry $Why, so nothing more is written into -RunDir (it may be on that share)" } }
+        }
+    }
     $answered = $false; $why = 'ended before it answered'
     try {
         $sec = [Math]::Min([double](($DeadlineUtc - [DateTime]::UtcNow).TotalSeconds - $script:ClaimRetryRefusalTailSec), [double]$script:ClaimRetryRequestReserveSec)
