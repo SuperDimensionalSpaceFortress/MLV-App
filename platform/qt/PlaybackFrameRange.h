@@ -1377,6 +1377,9 @@ struct PinnedWindowPresents
     void notePresent( int64_t sourceFrame )
     {
         lastFrame = sourceFrame;
+        // r8 fix 1 (adversary A3): the start frame is the frame already on screen when Play began; a present of it (drop-frame
+        // Play's first tick can grant under one frame, and the start refresh submits it) is a repeat, never an outside present
+        if( armed() && sourceFrame == windowStart - 1 ) { ++repeats; return; }
         if( !sourceFrameInsideAdmittedWindow( sourceFrame, armed(), windowStart, windowFrames ) ) { ++outside; return; }
         unsigned char &shown = seen[static_cast<size_t>( sourceFrame - windowStart )];
         if( shown ) { ++repeats; return; }
@@ -1384,38 +1387,56 @@ struct PinnedWindowPresents
         ++distinct;
     }
 };
-// RED STUB (r8 fix 1): 77fa2218's rule, the distinct count whatever frame is on screen.
-inline int64_t pinnedWindowShownCount( const PinnedWindowPresents &w ) { return w.distinct; }
-// What the present-path stop and the measured-play loop count toward the target: the distinct window frames, never raw presents.
-inline int64_t pinnedPresentStopCount( const PinnedWindowPresents &w ) { return w.distinct; }
+// r8 fix 1 (adversary A4): the distinct window frames shown, credited in full only while the latest present is the identity frame
+// (start + N). N distinct frames whose latest present is another one (a backfill after the identity frame) count one short, so the
+// capture never stops on, or saves, a frame that is not start + N.
+inline int64_t pinnedWindowShownCount( const PinnedWindowPresents &w )
+{
+    if( !w.armed() || w.distinct < w.target || w.lastFrame == w.identityFrame ) return w.distinct;
+    return w.target - 1;
+}
+// What the present-path stop and the measured-play loop count toward the target: the shown count above, never raw presents.
+// r8 fix 1 (adversary A7): once any present fell outside the window the capture can never be met (the exit-11 check fails it
+// whatever comes next), so the count is the target: the wait ends at once, on the not-met path, instead of running on while
+// consumed() (which never counts a seek) stays under kMeasuredPlayMaxFramesInFlight past the window.
+inline int64_t pinnedPresentStopCount( const PinnedWindowPresents &w )
+{
+    if( w.armed() && w.outside > 0 ) return w.target;
+    return pinnedWindowShownCount( w );
+}
 // The `observed` of the strict check (exit 11): pinnedCaptureObservedFrames over the counted presents (distinct window frames plus
-// out-of-window presents; repeats are neither): equal to the target only when there were exactly target distinct window frames
-// and no present outside the window.
+// out-of-window presents; repeats are neither) and the shown count: equal to the target only when there were exactly target
+// distinct window frames, the latest present was the identity frame, and no present fell outside the window.
 inline int64_t pinnedWindowObservedFrames( int64_t targetPresentedFrames, const PinnedWindowPresents &w )
 {
-    return pinnedCaptureObservedFrames( targetPresentedFrames, w.distinct + w.outside, w.distinct );
+    return pinnedCaptureObservedFrames( targetPresentedFrames, w.distinct + w.outside, pinnedWindowShownCount( w ) );
 }
-// RED STUB (r8 fix 1): 77fa2218's unpaced hold, at the counter's required source frames whatever the pin.
+// r8 fix 1 (adversary A1): the unpaced isolated hold (playbackHandling) holds once the counter consumed the required source
+// frames. The counter counts the start frame, so that is the playhead on start + required - 1: one short of the pinned window's
+// identity frame. A pinned capture holds one frame later (consumed > required), so the identity frame is requested and presented;
+// an unpinned run holds exactly as before.
 inline bool pinnedUnpacedHoldReached( int64_t targetPresentedFrames, int64_t consumedSourceFrames, int64_t requiredSourceFrames )
 {
-    (void)targetPresentedFrames; (void)consumedSourceFrames; (void)requiredSourceFrames;
-    return true;
+    return targetPresentedFrames <= 0 || consumedSourceFrames > requiredSourceFrames;
 }
-// RED STUB (r8 fix 1): 77fa2218 admitted any pin the play gate admitted.
+// r8 fix 1 (adversary A2): a pinned capture is admitted only when its identity frame start + N exists and lies BEFORE the last frame
+// (lastFrameIndex, 0-based) -- the engine's end-of-clip stop can end Play before the last frame's present is credited. Refused
+// up front (exit 14) rather than played to a short count. An unpinned run (N <= 0) is never refused here.
 inline bool pinnedIdentityFrameAdmitted( int64_t startFrame, int64_t targetPresentedFrames, int64_t lastFrameIndex )
 {
-    (void)startFrame; (void)targetPresentedFrames; (void)lastFrameIndex;
-    return true;
+    if( targetPresentedFrames <= 0 ) return true;
+    if( startFrame < 0 || startFrame > lastFrameIndex ) return false;
+    return lastFrameIndex - startFrame > targetPresentedFrames;
 }
 // Every-frame Play (drop-frame mode off) shows every source frame, so a ready frame never overtakes an older ready one. The
 // venue log: the frame skipped by drawFrameReady's forward-only guard was already READY when the next one finished
-// (request_state rendering 0, ready slots 1), and the acquire took the newer one first. Drop-frame Play and a paused redraw keep
-// the newest ready frame first (a stale frame there is rightly skipped).
-// RED STUB (r8 fix 1): 77fa2218's rule, which a pinned capture under the automation's forced drop-frame mode never engages.
+// (request_state rendering 0, ready slots 1), and the acquire took the newer one first. A paused redraw and unpinned drop-frame
+// Play keep the newest ready frame first (a stale frame there is rightly skipped).
+// r8 fix 1: a pinned capture's Play too, whatever the drop-frame mode: the automation forces drop-frame mode on
+// (isolateAutomationPacing; the r7 venue log reads drop_frame=1), so 77fa2218's every-frame-only rule never engaged there.
 inline bool playbackAcquiresOldestReadyFirst( bool playing, bool dropFrameMode, bool pinnedCapture )
 {
-    (void)pinnedCapture;
-    return playing && !dropFrameMode;
+    return playing && ( !dropFrameMode || pinnedCapture );
 }
 // RenderFrameThread's ready-slot choice: does the ready slot with candidateSerial replace the one chosen so far (chosenSerial)?
 // Newest first is the previous rule exactly (a later serial, or an equal one, replaces).

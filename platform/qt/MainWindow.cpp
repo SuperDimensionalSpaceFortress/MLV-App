@@ -10849,6 +10849,27 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                    ? options.targetPresentedFrames / presentedTargetFps : 0.0, 'f', 3 ) << ")\n";
         return 14;
     }
+    // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r8 fix 1 (adversary A2): the pinned capture ends on source frame start + N, so that
+    // frame must exist and lie before the last frame of the cut range (the end-of-clip stop can end Play before the last frame's
+    // present is credited). Refused here, before the measured Play (exit 14), never played to a short count.
+    {
+        const int pinCutOut = ui->spinBoxCutOut->value();
+        const int pinLastFrame = ( pinCutOut > 0 ? qMin( totalFrames, pinCutOut ) : totalFrames ) - 1;
+        const int pinStartFrame = startFrame;
+        if( !playback_frame_range::pinnedIdentityFrameAdmitted( pinStartFrame, options.targetPresentedFrames, pinLastFrame ) )
+        {
+            m_playbackSmokeFullscreenLossLatchArmed = false;
+            ++m_programmaticPlayLedger.refused;
+            m_programmaticPlayLedger.lastRefusalReason = "CLIP_TOO_SHORT";
+            logInteractionEvent(
+                QStringLiteral("play_gate.refused"),
+                QStringLiteral("site=gui-smoke-measured reason=PINNED_FRAME_PAST_CLIP_END presented_frames=%1 start_frame=%2 last_frame=%3")
+                    .arg( options.targetPresentedFrames ).arg( pinStartFrame ).arg( pinLastFrame ) );
+            err << "[GUI-SMOKE] ERROR: CLIP_TOO_SHORT (pinned frame " << pinStartFrame + options.targetPresentedFrames
+                << " is not before the last frame " << pinLastFrame << ")\n";
+            return 14;
+        }
+    }
     // CONTACT-SHEET-SEEK-FRAME-LIST-APP-1: a --contact-sheet-seek-frames frame the clip cannot show would be
     // clamped by the seek and reported as honoured, so it is refused here, before the measured Play (exit 14).
     if( !options.contactSheetSeekFrames.isEmpty() )
@@ -13050,7 +13071,11 @@ void MainWindow::playbackHandling(int timeDiff)
 
         // CUDA-HEADROOM-1: unpaced, present -> early advance -> render -> present never yields to the smoke's stop check
         // (r1 venue: Reached at 480 frames, seen at 615). Once the required source frames are consumed, hold.
-        if( m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() && programmaticPlayConsumed() ) return;
+        // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r8 fix 1 (adversary A1): a pinned capture holds one frame later, on its
+        // identity frame start + N (the counter counts the start frame, so consumed == required is the playhead on start + N - 1).
+        if( m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() && programmaticPlayConsumed()
+         && playback_frame_range::pinnedUnpacedHoldReached( m_playbackSmokeTargetPresentedFrames, m_sourceAdvance.consumed(),
+                                                            m_playRequiredSourceFrames ) ) return;
 
         //when on last frame (r32 fix iteration 2, adversary A1 + A2 on 03850f7b: under conform with Drop Frame and Loop the
         //drop-frame engine owns the wrap from the last frame -- see playback_frame_range::outerLastFrameBranchHandlesTick)
