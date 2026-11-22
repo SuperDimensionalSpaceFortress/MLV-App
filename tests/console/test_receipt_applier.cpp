@@ -2109,7 +2109,8 @@ static bool appDirLookupWriteFile(const QString & path, const QByteArray & bytes
     QFile file(path);
     if( !file.open(QIODevice::WriteOnly) )
         return false;
-    const bool ok = file.write(bytes) == bytes.size();
+    /* r8 adversary 2e73c417 A7: a buffered write can "succeed" and fail at the flush. */
+    const bool ok = file.write(bytes) == bytes.size() && file.flush();
     file.close();
 #ifndef Q_OS_WIN
     file.setPermissions(file.permissions() | QFileDevice::ExeOwner | QFileDevice::ExeUser);
@@ -2736,7 +2737,7 @@ struct AppDirLookupEnvironmentFixture
     AppDirLookupCreate createBesideExe(const QString & path, const QByteArray & bytes)
     {
         QFile file(path);
-        if( !file.open(QIODevice::WriteOnly | QIODevice::NewOnly) )
+        if( !file.open(QIODevice::ReadWrite | QIODevice::NewOnly) )
         {
             const QFileInfo info(path);
             return ( info.exists() || info.isSymLink() ) ? AppDirLookupCreate::AlreadyPresent
@@ -2754,15 +2755,17 @@ struct AppDirLookupEnvironmentFixture
             + QByteArrayLiteral("\n");
         written.insert(path, content);
         const bool ok = file.write(content) == content.size() && file.flush();
-        file.close();
         if( !ok )
         {
             /* r8 adversary 18ebd473 A2: a short write (a full disk) leaves a partial file that
-             * this fixture created moments ago; record the bytes actually there, so cleanup
-             * still removes it instead of disowning it. */
-            QFile partial(path);
-            written.insert(path, partial.open(QIODevice::ReadOnly) ? partial.readAll() : QByteArray());
+             * this fixture created; record the bytes actually there, so cleanup still removes it
+             * instead of disowning it. Adversary 2e73c417 A3: they are read back through the
+             * SAME handle that created the file, before it is closed, so a file put under that
+             * name afterwards is never recorded as ours. */
+            file.seek(0);
+            written.insert(path, file.readAll());
         }
+        file.close();
 #ifndef Q_OS_WIN
         file.setPermissions(file.permissions() | QFileDevice::ExeOwner | QFileDevice::ExeUser);
 #endif
@@ -2848,19 +2851,33 @@ struct AppDirLookupEnvironmentFixture
         const QByteArray expected = written.value(path);
         FILE_ATTRIBUTE_TAG_INFO tag{};
         LARGE_INTEGER size{};
-        bool ours = GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &tag, sizeof(tag))
-                 && !( tag.FileAttributes & ( FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY ) )
-                 && GetFileSizeEx(handle, &size)
-                 && size.QuadPart == expected.size();
-        if( ours )
+        /* Adversary 2e73c417 A4: a file that cannot be READ (an API error, a byte-range lock)
+         * is not proven foreign: it stays pending (Failed, cleanup reports false). Only a
+         * successful read that differs, a different size or a reparse point/directory is
+         * NotOurs. */
+        bool ours = false;
+        Cleanup result = Cleanup::Failed;
+        if( GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &tag, sizeof(tag))
+         && GetFileSizeEx(handle, &size) )
         {
-            QByteArray actual(expected.size(), '\0');
-            DWORD read = 0;
-            ours = ReadFile(handle, actual.data(), DWORD(actual.size()), &read, nullptr)
-                && read == DWORD(actual.size())
-                && actual == expected;
+            if( ( tag.FileAttributes & ( FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY ) )
+             || size.QuadPart != expected.size() )
+            {
+                result = Cleanup::NotOurs;
+            }
+            else
+            {
+                QByteArray actual(expected.size(), '\0');
+                DWORD read = 0;
+                if( ReadFile(handle, actual.data(), DWORD(actual.size()), &read, nullptr)
+                 && read == DWORD(actual.size()) )
+                {
+                    ours = actual == expected;
+                    if( !ours )
+                        result = Cleanup::NotOurs;
+                }
+            }
         }
-        Cleanup result = Cleanup::NotOurs;
         if( ours )
         {
             /* POSIX semantics (the name goes at once even if a scanner holds the file open),
@@ -2890,9 +2907,12 @@ struct AppDirLookupEnvironmentFixture
         QFile file(path);
         if( !file.open(QIODevice::ReadOnly) )
             return Cleanup::Failed;
-        const bool ours = file.readAll() == written.value(path);
+        const QByteArray actual = file.readAll();
+        const bool readFailed = file.error() != QFileDevice::NoError;
         file.close();
-        if( !ours )
+        if( readFailed )
+            return Cleanup::Failed;     /* adversary 2e73c417 A4: unreadable is not foreign */
+        if( actual != written.value(path) )
             return Cleanup::NotOurs;
         return QFile::remove(path) ? Cleanup::Removed : Cleanup::Failed;
     }
@@ -2900,6 +2920,11 @@ struct AppDirLookupEnvironmentFixture
 
     void setPath(const QString & dir)
     {
+        /* r8 adversary 2e73c417 A8: a temporary directory whose path holds the PATH list
+         * separator (TEMP=C:\Temp;Cache) cannot be one PATH entry; the test cannot set up its
+         * control candidate, so it skips instead of judging the product on a split PATH. */
+        if( dir.contains(QDir::listSeparator()) )
+            SKIP_TEST("the temporary tools directory holds the PATH list separator, so it cannot be one PATH entry");
         pathWasSet = qEnvironmentVariableIsSet("PATH");
         savedPath = qgetenv("PATH");
         pathChanged = true;
@@ -3201,6 +3226,7 @@ TEST(BatchExportFormat, R7PrecedenceFixtureNeverOverwritesOrDeletesAFileItDidNot
         QFile packager(foreign);
         ASSERT_TRUE( packager.open(QIODevice::WriteOnly) );
         ASSERT_TRUE( packager.write(QByteArray("packager-copy")) == 13 );
+        ASSERT_TRUE( packager.flush() );
         packager.close();
     }
     const QString mine = QDir::cleanPath(dir.path()) + QStringLiteral("/")
@@ -3226,7 +3252,7 @@ static bool appDirLookupReplaceClosedFile(const QString & path, const QByteArray
     QFile packager(path);
     if( !packager.open(QIODevice::WriteOnly | QIODevice::NewOnly) )
         return false;
-    const bool ok = packager.write(bytes) == bytes.size();
+    const bool ok = packager.write(bytes) == bytes.size() && packager.flush();
     packager.close();
     return ok;
 }
@@ -3325,9 +3351,12 @@ TEST(BatchExportFormat, R8PathFallbackCheckSkipsWhenAConcurrentRunCameAndWentDur
                 outcome.c_str());
     if( !staged )
         SKIP_TEST("the concurrent run's files could not be created beside the test executable");
+    /* Adversary 2e73c417 A5: judge only this test's own staged files (removed, none left
+     * behind), never the shared names, which another console process may legitimately create
+     * after the staged removal. */
     ASSERT_TRUE( removed );
-    ASSERT_FALSE( QFileInfo::exists(appFfmpeg) );
-    ASSERT_FALSE( QFileInfo::exists(appProbe) );
+    ASSERT_TRUE( concurrentRun.besideExe.isEmpty() );
+    ASSERT_TRUE( concurrentRun.leftForeign.isEmpty() );
     ASSERT_EQ( std::string("skipped"), outcome.substr(0, outcome.find(':')) );
 }
 
