@@ -603,7 +603,9 @@ void ReceiptLoader::parseXmlElements(QXmlStreamReader *Rxml,
         {
             optOutWatch.sawLookAssistEnabled( Rxml );
             bool lookAssistOn = true;
-            if( ReceiptXmlWalk::lookAssistEnabledValue( Rxml->readElementText(), &lookAssistOn ) )
+            const QString lookAssistText = Rxml->readElementText();
+            if( optOutWatch.atDirectChild()
+             && ReceiptXmlWalk::lookAssistEnabledValue( lookAssistText, &lookAssistOn ) )
                 receipt->setLookAssistEnabled( lookAssistOn );
             Rxml->readNext();
         }

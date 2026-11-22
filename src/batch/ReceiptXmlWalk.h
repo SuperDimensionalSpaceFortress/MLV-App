@@ -67,6 +67,14 @@ public:
         if( reader->isStartElement() ) m_steppedPast = true;
     }
 
+    /* In the lookAssistEnabled handler: true while the walk is on the element's direct children. Once a pass ends on a
+     * start element (endOfPass), the loop's next readNext() enters that element, and the walk stops at the first end
+     * element it meets, so every element it reads from then on is nested inside a direct child. A lookAssistEnabled read
+     * there is no value: the handler keeps what it had, as the scan does (it reads direct children only), so a nested
+     * <lookAssistEnabled><lookAssistEnabled>0</lookAssistEnabled></lookAssistEnabled> never switches Look Assist off
+     * and a later direct element still counts (EXPORT-PRORES-LOOK-ASSIST-1 r6, sol r5 B1 on feabee0a). */
+    bool atDirectChild() const { return !m_steppedPast; }
+
     /* After the walk. With no element stepped past, no extension met and the walk on an end element,
      * the walk handled every direct child, so it read every plain lookAssistEnabled, last one winning,
      * exactly as the scan would: nothing to correct, nothing read again. Every receipt and session MLV

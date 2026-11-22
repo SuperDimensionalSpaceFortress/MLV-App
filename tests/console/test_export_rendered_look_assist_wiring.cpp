@@ -277,6 +277,21 @@ bool atTopLevelStatement(const QString & body, int pos)
     return i >= 0 && (body.at(i) == QLatin1Char(';') || body.at(i) == QLatin1Char('{') || body.at(i) == QLatin1Char('}'));
 }
 
+// r6 (EXPORT-RENDERED-LOOK-ASSIST-WIRING-GUARD-EARLY-RETURN-1): no statement ahead of `pos` leaves the body on every
+// path. A top-level return / throw / goto (or a call that never returns) before it makes it dead code, though it still
+// sits at the body's top level; a guarded exit (inside a block, or after an if (...) / else) is not one.
+bool noUnconditionalExitBefore(const QString & body, int pos)
+{
+    static const QRegularExpression exitWord(
+        QStringLiteral("\\b(return|throw|goto|exit|_exit|_Exit|quick_exit|abort|std::exit|std::abort|std::terminate)\\b"));
+    QRegularExpressionMatchIterator it = exitWord.globalMatch(body.left(pos));
+    while (it.hasNext()) {
+        const int at = it.next().capturedStart();
+        if (atTopLevelStatement(body, at)) return false;
+    }
+    return true;
+}
+
 // The analysis runs unconditionally on exactly the CDNG anchor, and its grade push is guarded by its verdict alone.
 bool analysisIsWiredUnconditionally(const QString & body)
 {
@@ -284,7 +299,7 @@ bool analysisIsWiredUnconditionally(const QString & body)
     const int lookAssist = body.indexOf(kLookAssistCall);
     const int grade = body.indexOf(kGradePush);
     if (apply < 0 || lookAssist <= apply || grade <= lookAssist) return false;
-    if (!atTopLevelStatement(body, apply)) return false;
+    if (!atTopLevelStatement(body, apply) || !noUnconditionalExitBefore(body, apply)) return false;
     const int applyEnd = callEnd(body, apply);
     const int lookAssistEnd = callEnd(body, lookAssist);
     if (applyEnd < 0 || lookAssistEnd < 0) return false;
@@ -303,7 +318,7 @@ bool cancelGuardRunsAlways(const QString & body, int checkAt)
 {
     const int ifAt = body.lastIndexOf(QStringLiteral("if"), checkAt);
     return ifAt >= 0 && collapseSpaces(body.mid(ifAt, checkAt - ifAt)) == QStringLiteral("if(")
-        && atTopLevelStatement(body, ifAt);
+        && atTopLevelStatement(body, ifAt) && noUnconditionalExitBefore(body, ifAt);
 }
 
 // r2 B3 (sol r1 on ed129ee1): between the analysis and the frame loop the cancel flag is checked before the plan check
@@ -364,6 +379,7 @@ bool preEncodeExitSamplesAroundTheLine(const QString & helper)
     return first >= 0 && line > first && second > line && failure > second
         && cancelGuardRunsAlways(helper, first) && cancelGuardRunsAlways(helper, second)
         && atTopLevelStatement(helper, line) && atTopLevelStatement(helper, failure)
+        && noUnconditionalExitBefore(helper, failure)
         && helper.indexOf(QStringLiteral("return renderedCancelledBeforeEncode("), first) < line
         && helper.indexOf(QStringLiteral("return renderedCancelledBeforeEncode("), second) < failure
         && helper.indexOf(QStringLiteral("return renderedCancelledBeforeEncode("), second) > second;
@@ -434,6 +450,11 @@ TEST(ExportRenderedLookAssistWiring, ACancelCheckMissingFromAPreEncodeExitIsCaug
     deadSpawnGuard.replace(QStringLiteral("\"[BATCH] RENDER_START\"; if( BatchRenderCancelScope::cancelled() ) { return renderedCancelledBeforeEncode( b ); }"),
                            QStringLiteral("\"[BATCH] RENDER_START\"; if (false) { if( BatchRenderCancelScope::cancelled() ) { return renderedCancelledBeforeEncode( b ); } }"));
     ASSERT_FALSE(preEncodeExitsReportACancel(deadSpawnGuard));
+    // r6 (sibling of EXPORT-RENDERED-LOOK-ASSIST-WIRING-GUARD-EARLY-RETURN-1): an unconditional throw ahead of a guard
+    // leaves it dead (the return count above sees only returns).
+    QString thrownPast = plain;
+    thrownPast.replace(QStringLiteral("\"[BATCH] RENDER_START\";"), QStringLiteral("\"[BATCH] RENDER_START\"; throw 0;"));
+    ASSERT_FALSE(preEncodeExitsReportACancel(thrownPast));
 }
 
 // r3 (r2 adversary A8 on 40efaff7): a cancel recorded while the failure line is written is still the typed cancellation.
