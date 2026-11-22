@@ -23,9 +23,12 @@ public:
         m_tokenAt = reader->characterOffset();
     }
 
+    // Only an element in no namespace is handed on: the handlers compare local names, so a compact
+    // <x:lookAssistEnabled> extension tag is stepped over exactly as before (adversary A5 on 16d54744).
     void settle( QXmlStreamReader *reader )
     {
-        m_reuse = reader->isStartElement() && reader->characterOffset() != m_tokenAt;
+        m_reuse = reader->isStartElement() && reader->characterOffset() != m_tokenAt
+               && reader->namespaceUri().isEmpty();
     }
 
 private:

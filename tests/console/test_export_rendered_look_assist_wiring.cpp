@@ -186,6 +186,42 @@ TEST(ExportRenderedLookAssistWiring, GradationCurveSetterChecksItsAllocations)
     ASSERT_TRUE(checksAllocationsBeforeUse(cFunctionBody(QStringLiteral("void processingSetGCurve("))));
 }
 
+// Adversary A9 on 16d54744: the cancel scope is installed before the analysis, once.
+TEST(ExportRenderedLookAssistWiring, CancelScopeCoversTheAnalysis)
+{
+    const QString body = renderedBody();
+    const int scope = body.indexOf(QStringLiteral("BatchRenderCancelScope cancelScope;"));
+    ASSERT_EQ(1, countOccurrences(body, QStringLiteral("BatchRenderCancelScope cancelScope;")));
+    ASSERT_TRUE(scope >= 0);
+    ASSERT_TRUE(scope < body.indexOf(kLookAssistCall));
+}
+
+// Adversary A6 on 16d54744: the spline helper turns an exception into an error return.
+TEST(ExportRenderedLookAssistWiring, SplineHelperCatchesExceptions)
+{
+    const QString helper = stripComments(readRepoFile(QStringLiteral("src/processing/interpolation/spline_helper.cpp")));
+    const int body = helper.indexOf(QStringLiteral("int spline1dccc("));
+    const int tryAt = helper.indexOf(QStringLiteral("try"), body);
+    const int setPoints = helper.indexOf(QStringLiteral("s.set_points("), body);
+    const int catchAt = helper.indexOf(QStringLiteral("catch( ... )"), body);
+    ASSERT_TRUE(body >= 0 && tryAt > body && setPoints > tryAt && catchAt > setPoints);
+}
+
+// Adversary A1 / A3 on 16d54744: the raw analysis thumbnail is zeroed before any allocation can fail, and the debayer
+// buffer starts zeroed.
+TEST(ExportRenderedLookAssistWiring, RawAnalysisThumbnailStartsBlack)
+{
+    const QString source = stripComments(readRepoFile(QStringLiteral("src/mlv/video_mlv_misc.c")));
+    const int fn = source.indexOf(QStringLiteral("void get_area_average_downscale_raw_thumnail("));
+    ASSERT_TRUE(fn >= 0);
+    const int end = source.indexOf(QStringLiteral("\n}"), fn);
+    const QString body = source.mid(fn, end - fn);
+    const int zero = body.indexOf(QStringLiteral("memset(out_buffer, 0,"));
+    const int firstAlloc = body.indexOf(QStringLiteral("malloc("));
+    ASSERT_TRUE(zero >= 0 && firstAlloc > zero);
+    ASSERT_TRUE(body.contains(QStringLiteral("uint16_t *debayered_raw_frame = (uint16_t *) calloc(")));
+}
+
 TEST(ExportRenderedLookAssistWiring, HueVsCurveSetterChecksItsAllocations)
 {
     ASSERT_TRUE(checksAllocationsBeforeUse(cFunctionBody(QStringLiteral("void processingSetHueVsCurves("))));

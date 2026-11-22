@@ -229,6 +229,42 @@ TEST(ExportRenderedLookAssistGrade, APartialCurvePushesNothing)
     freeProcessingObject( processing );
 }
 
+// A2 on 16d54744: four groups, but the last has an x and no y: nothing is pushed, not a graded Y and a reset B.
+TEST(ExportRenderedLookAssistGrade, ACurveWithAnIncompleteLinePushesNothing)
+{
+    ReceiptSettings receipt;
+    receipt.setGradationCurve( QStringLiteral( "1e-5;1e-5;0.5;0.62;1;1;?1e-5;1e-5;1;1;?1e-5;1e-5;1;1;?0.5;" ) );
+    processingObject_t *processing = initProcessingObject();
+    ASSERT_TRUE( processing != nullptr );
+    const CurveTables identity = curveTables( processing );
+    ReceiptApplier::applyLookAssistGradeToProcessing( &receipt, processing );
+    ASSERT_TRUE( curveTables( processing ) == identity );
+    freeProcessingObject( processing );
+}
+
+// A4 on 16d54744: after a skip the receipt holds the raw levels it had on entry, even when a valid Look Assist baseline
+// was restored into it first.
+TEST(ExportRenderedLookAssistGrade, ASkipGivesTheReceiptItsEntryRawLevels)
+{
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE( openTiny( fixture ) );
+    ReceiptSettings &receipt = fixture.receipt();
+    receipt.setLookAssistEnabled( true );
+    receipt.setRawBlack( 20000 );
+    receipt.setRawWhite( 4500 );
+    receipt.setLookAssistBaselineValid( true );
+    receipt.setLookAssistBaselineRawBlack( 18000 );
+    receipt.setLookAssistBaselineRawWhite( 6000 );
+    mlvObject_t *video = fixture.video();
+    const int rawWidth = video->RAWI.xRes;
+    video->RAWI.xRes = 0;
+    const bool applied = ReceiptApplier::applyHeadlessLookAssist( &receipt, video, fixture.processing(), anchorFrame() );
+    video->RAWI.xRes = rawWidth;
+    ASSERT_FALSE( applied );
+    ASSERT_EQ( 20000, receipt.rawBlack() );
+    ASSERT_EQ( 4500, receipt.rawWhite() );
+}
+
 // A4: knots the spline cannot use (an x the equal-x nudge cannot move past the previous one, a non-finite value) leave
 // the curve tables as they were, and nothing aborts.
 TEST(ExportRenderedLookAssistGrade, UnusableCurveKnotsLeaveTheTablesAlone)

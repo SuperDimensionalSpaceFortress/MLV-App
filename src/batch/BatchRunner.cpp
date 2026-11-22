@@ -396,7 +396,10 @@ int BatchRunner::exportRenderedVideoFile(
      * grade into the receipt and pushes only white balance and raw levels; a rendered
      * frame shows only processing-object state, so the rest of the grade is pushed into
      * the processing object too. Off (receipt or MLVAPP_NO_LOOK_ASSIST) or a skipped
-     * analysis returns false and nothing more is pushed. */
+     * analysis returns false and nothing more is pushed. The cancel scope is installed
+     * first, so Ctrl+C during the analysis is the typed cancellation below, not a kill
+     * (adversary A9 on 16d54744). */
+    BatchRenderCancelScope cancelScope;
     const bool lookAssistApplied = ReceiptApplier::applyHeadlessLookAssist(
         receipt, mlvObject, processingObject,
         CdngSequenceExport::lookAssistAnalysisFrameIndex( cutIn, cutIn ) );
@@ -516,8 +519,6 @@ int BatchRunner::exportRenderedVideoFile(
     }
 
     /* ---- Encode ---------------------------------------------------------- */
-    BatchRenderCancelScope cancelScope;
-
     export_process::StreamingPipeline pipeline;
     const export_process::Invocation invocation =
         export_process::invocationFromTemplate( plan.ffmpegCommandPlan.executable,

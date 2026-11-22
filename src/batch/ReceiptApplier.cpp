@@ -867,12 +867,19 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
                                    static_cast<int>( analysisFrame ),
                                    totalFrames - 1 );
 
+    // The receipt's raw levels as they were on entry, before the baseline restore below rewrites them: a skip gives these
+    // back, so the receipt agrees with the live levels it restores (adversary A4 on 16d54744).
+    const int entryReceiptRawBlack = receipt->rawBlack();
+    const int entryReceiptRawWhite = receipt->rawWhite();
+
     if( receipt->lookAssistBaselineValid() )
         restoreHeadlessLookAssistBaseline( receipt );
     else
         captureHeadlessLookAssistBaseline( receipt, mlvObject );
 
-    const HeadlessRawLevels levelsBeforeAutoFix = captureHeadlessRawLevels( receipt, mlvObject, processingObject );
+    HeadlessRawLevels levelsBeforeAutoFix = captureHeadlessRawLevels( receipt, mlvObject, processingObject );
+    levelsBeforeAutoFix.receiptBlack = entryReceiptRawBlack;
+    levelsBeforeAutoFix.receiptWhite = entryReceiptRawWhite;
     applyHeadlessRawLevelsAutoFix( receipt, mlvObject, processingObject );
 
     // The flavor: MLVAPP_LOOK_ASSIST_FLAVOR (runs) over the receipt's lookAssistFlavor element; neither = Classic.
@@ -1320,6 +1327,11 @@ void ReceiptApplier::applyLookAssistGradeToProcessing(ReceiptSettings *receipt,
     // Curves::setConfiguration returns before pushing any table when the string runs out before its fourth line, so a
     // partial curve pushes nothing here either (adversary A3 on 76653777).
     if( lookassist::lookAssistParseGradationCurve( curve, lines ) != 4 ) return;
+    // Every line the widget draws has its two end points at least; a line with fewer (e.g. a trailing "?0.5;" whose y is
+    // missing) is not a curve, so nothing is pushed rather than a mix of graded and reset channels (adversary A2 on
+    // 16d54744).
+    for( const std::vector<lookassist::LookAssistGradationPoint> &line : lines )
+        if( line.size() < 2 ) return;
     for( int channel = 0; channel < 4; ++channel )
     {
         // Copies: the spline helper nudges equal x values in place, as it does on the widget's own arrays.

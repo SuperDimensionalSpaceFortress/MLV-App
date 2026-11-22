@@ -165,6 +165,16 @@ TEST(ReceiptLoader, ACompactReceiptLosesNoElement)
     ASSERT_EQ(9u, flavored.cutOut());
 }
 
+// Adversary A5 on 16d54744: a compact namespaced extension tag with a known local name does not overwrite the field.
+TEST(ReceiptLoader, ACompactNamespacedTagDoesNotOverwriteAField)
+{
+    ReceiptSettings receipt;
+    ASSERT_TRUE(loadReceiptText(QByteArrayLiteral(
+        "<receipt version=\"4\" xmlns:x=\"urn:metadata\"><lookAssistEnabled>0</lookAssistEnabled>"
+        "<x:lookAssistEnabled>1</x:lookAssistEnabled></receipt>"), &receipt));
+    ASSERT_FALSE(receipt.lookAssistEnabled());
+}
+
 TEST(ReceiptLoader, AnIndentedReceiptReadsAsBefore)
 {
     ReceiptSettings receipt;
