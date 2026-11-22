@@ -6056,13 +6056,15 @@ if ($TelemetryArm -eq 'LIGHT') {
     # flag is read by the smoke runner itself (not the app) and decides whether it may run on a hub host at all, so it stays for the smoke runner and the recorded launch shows it. Because no
     # row of the LIGHT environment table names that flag, a fixture launch reads UNKNOWN for the arm: fixture legs are refused for fps on purpose. The text goes inside the existing
     # LIGHT-ARM-PRESENT-DIAG-1 region (so the region count and the byte identity of every other job stay as pinned), and only into a LIGHT job (the publish-write scan reads the default text).
+    # r14: DUALISO_* names are app controls too (sol r13 B6, dualiso.c reads DUALISO_DEBUG_SOURCE_SMOOTH_DIR), and the names are enumerated, never read through `.Keys`, which a variable named
+    # Keys shadows (key3 r13 B1, dictionary-member-shadow).
     $template = Edit-DualVenueTemplate $template @'
 # LIGHT-ARM-PRESENT-DIAG-1 <<<
 '@ @'
 # LIGHT-LEG-INHERITED-MLVAPP-CLEAR-1 >>>
 $lightLegJobSets = @($envs | ForEach-Object { ([string]$_).Split('=')[0] })
-foreach ($inheritedVariable in @([Environment]::GetEnvironmentVariables().Keys | ForEach-Object { [string]$_ })) {
-    if ($inheritedVariable -inotmatch '^MLVAPP_') { continue }
+foreach ($inheritedVariable in @([Environment]::GetEnvironmentVariables().GetEnumerator() | ForEach-Object { [string]$_.Key })) {
+    if ($inheritedVariable -inotmatch '^(MLVAPP_|DUALISO_)') { continue }
     if ($inheritedVariable -ieq 'MLVAPP_HUB_PLAYBACK_CI_FIXTURE') { continue }
     if ($lightLegJobSets -contains $inheritedVariable) { continue }
     [Environment]::SetEnvironmentVariable($inheritedVariable, [NullString]::Value)

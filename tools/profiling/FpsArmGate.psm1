@@ -9,8 +9,8 @@
 # THE NARROW PROMISE (HUB RULING 2026-11-21T06:10Z, r7/r8): a leg is LIGHT only on an exact, CLOSED shape; anything else is UNKNOWN and refused.
 #   (a) its recorded arm word is exactly LIGHT (Test-FaTextEq);
 #   (b) when a spec and a result are both present they agree (Get-FpsArm);
-#   (c) on a venue leg the generator's own forwarded switches (the six generatorArgs keys of $script:FpsObserverControls) are all off;
-#   (d) on a local launch or a saved record, the recorded launch ARGUMENTS and the recorded MLVAPP_* ENVIRONMENT match the producers' exact LIGHT
+#   (c) on a venue leg the generator's own forwarded switches (the seven generatorArgs keys of $script:FpsObserverControls) are all off, and they carry no observerControls entry;
+#   (d) on a local launch or a saved record, the recorded launch ARGUMENTS and the recorded MLVAPP_* / DUALISO_* ENVIRONMENT match the producers' exact LIGHT
 #       shape: the two data tables below ($script:FpsLightArgs, $script:FpsLightEnv). A flag or key not in a table, a value that differs, a
 #       repeated key or flag, a missing record and an unparsable record are UNKNOWN. There is no denylist: a list of what is NOT LIGHT over an
 #       open set never converged (ten adversary passes, 44 majors), so the gate names only what a LIGHT leg IS.
@@ -115,6 +115,9 @@ $script:FpsObserverControls = @(
     # r13 (adversary pass 15 A1): not a logger but a hook that moves the presentation surface (fullscreen / windowed / restore / maximize) inside the measured Play (Invoke-VenueLeg.ps1:566 forwards it,
     # the job emits MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES); a spec that names it must not read LIGHT while the same setting recorded as a launch environment reads UNKNOWN.
     New-FpsObserver 'mid-play-window-toggles' 'midPlayWindowToggles' 'bool'
+    # r14 (sol r13 B1): a timed GPU device-loss injection inside the measured Play (Invoke-VenueLeg.ps1:540 forwards it by presence, the job emits MLVAPP_GPU_FAULT_INJECT, which the launch reader
+    # already refuses); a spec that names it must not read LIGHT either.
+    New-FpsObserver 'gpu-fault-inject' 'gpuFaultInject' 'bool'
 )
 
 function Get-FpsObserverControls { $script:FpsObserverControls }
@@ -281,6 +284,9 @@ function Get-FpsArmFromLegSpec {
         # the arm word says LIGHT, but a spec that also switches on a forwarded observer (a per-launch logger, a sampler) is not proof of it (adversary pass 3 A2)
         $observer = Get-FpsSpecObserverOn $ga
         if ($null -ne $observer) { return New-FpsArm 'UNKNOWN' 'spec' "generatorArgs.telemetryArm=LIGHT but generatorArgs.$($observer.specKey) enables an observer ($($observer.id)) inside the timed window" }
+        # r14 (sol r13 B2): the record reader's rule for the same generatorArgs (Get-FpsSpecHolderProblem): an observerControls entry is outside the LIGHT shape, so a spec and a record that
+        # embeds the same generatorArgs cannot disagree about it.
+        if (Test-FaHasProp $ga 'observerControls') { return New-FpsArm 'UNKNOWN' 'spec' 'generatorArgs.telemetryArm=LIGHT but generatorArgs carries an observerControls entry, which no producer records (outside the LIGHT shape)' }
         return New-FpsArm 'LIGHT' 'spec' 'generatorArgs.telemetryArm=LIGHT'
     }
     if (Test-FaTextEq $arm 'HEAVY') { return New-FpsArm 'HEAVY' 'spec' 'generatorArgs.telemetryArm=HEAVY' }
@@ -339,7 +345,9 @@ function ConvertTo-FpsEnvMap {
     $map = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
     $pairs = [System.Collections.Generic.List[object]]::new()
     if ($Environment -is [System.Collections.IDictionary]) {
-        foreach ($k in $Environment.Keys) { $pairs.Add(@([string]$k, $Environment[$k])) }
+        # r14 (key3 r13 B1, dictionary-member-shadow): never `$Environment.Keys`: on an IDictionary PowerShell resolves `.Keys` to an ENTRY named Keys (any case) before the property, so a
+        # recorded variable named Keys would hide every other name. The enumerator is a method call, which no entry name can shadow.
+        foreach ($entry in $Environment.GetEnumerator()) { $pairs.Add(@([string]$entry.Key, $entry.Value)) }
     } elseif ($Environment -is [System.Management.Automation.PSCustomObject]) {
         foreach ($p in $Environment.PSObject.Properties) { $pairs.Add(@([string]$p.Name, $p.Value)) }
     } else {
@@ -403,13 +411,17 @@ function Get-FpsLaunchArgumentsProblem {
 }
 
 function Get-FpsLaunchEnvironmentProblem {
-    # Do the recorded MLVAPP_* variables match the LIGHT shape table exactly (names ignoring case, values ordinal)? Returns the first problem, else $null. Other names are not judged.
+    # Do the recorded app-control variables match the LIGHT shape table exactly (names ignoring case, values ordinal)? Returns the first problem, else $null. The app's control names are
+    # MLVAPP_* and DUALISO_* (r14, sol r13 B6: src/mlv/llrawproc/dualiso.c reads DUALISO_DEBUG_SOURCE_SMOOTH_DIR and dumps image planes inside the measured Play); no table row is DUALISO_*, so
+    # any such name is outside the shape. Other names are not judged.
     param($Map)
-    foreach ($name in $Map.Keys) {
-        if (-not $name.StartsWith('MLVAPP_', [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+    # r14 (key3 r13 B1, dictionary-member-shadow): the entries are enumerated, never read through `$Map.Keys`, which an entry named Keys (any case) shadows on an IDictionary.
+    foreach ($entry in $Map.GetEnumerator()) {
+        $name = [string]$entry.Key
+        if (-not ($name.StartsWith('MLVAPP_', [System.StringComparison]::OrdinalIgnoreCase) -or $name.StartsWith('DUALISO_', [System.StringComparison]::OrdinalIgnoreCase))) { continue }
         $row = $null
         if (-not $script:FpsLightEnvIndex.TryGetValue($name, [ref]$row)) { return "$name is not in the LIGHT launch shape" }
-        if (-not (Test-FpsAllowedValue $row.rule $Map[$name])) { return "$name has a value the LIGHT launch shape does not allow" }
+        if (-not (Test-FpsAllowedValue $row.rule $entry.Value)) { return "$name has a value the LIGHT launch shape does not allow" }
     }
     $null
 }

@@ -1251,7 +1251,7 @@ function Add-InheritedMlvAppEnvironmentRecord {
 
     foreach ($entry in [System.Environment]::GetEnvironmentVariables().GetEnumerator()) {
         $name = [string]$entry.Key
-        if ($name -notmatch '^MLVAPP_') { continue }
+        if ($name -notmatch '^(MLVAPP_|DUALISO_)') { continue }   # r14 (sol r13 B6): DUALISO_DEBUG_SOURCE_SMOOTH_DIR is an app control too (dualiso.c)
         if ($Target.Contains($name)) { continue }
         if (@($Cleared | Where-Object { [string]::Equals([string]$_, $name, [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0) { continue }
         $Target[$name] = [string]$entry.Value

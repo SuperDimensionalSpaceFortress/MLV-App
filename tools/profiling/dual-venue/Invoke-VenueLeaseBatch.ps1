@@ -392,7 +392,9 @@ function Stop-PlanRefused([string]$Reason, [int]$Item, [string]$Detail) {
     $logPlain = $false
     # r7: nor for an input that no longer resolves (it is exactly when a write is unsafe), and only through the write guard (Test-RunDirWrite)
     # r7 pass 3 (adversary r7 pass 2 A4): nor for OUTPUT_ZONE_UNRESOLVED: the guard could not tell whether the refused input is batch.log (before any input is accepted nothing is compared)
-    if (-not $script:RunOutputAliased -and $Reason -cnotin @('LEG_SPEC_IS_RUN_OUTPUT', 'LEG_PLAN_IS_RUN_OUTPUT', 'BUILD_MANIFEST_IS_RUN_OUTPUT', 'INPUT_VANISHED', 'INPUT_UNREADABLE', 'OUTPUT_ZONE_UNRESOLVED')) {
+    # r14 (sol r13 B5): nor for a bounded read that got no answer (SPEC_READ_TIMEOUT, EXPORT_BUDGET_PREFLIGHT_TIMEOUT): the share that stalled may hold -RunDir too, and the synchronous batch.log
+    # probe below would hold the typed refusal past the deadline the bound was there to keep; stderr carries the line.
+    if (-not $script:RunOutputAliased -and $Reason -cnotin @('LEG_SPEC_IS_RUN_OUTPUT', 'LEG_PLAN_IS_RUN_OUTPUT', 'BUILD_MANIFEST_IS_RUN_OUTPUT', 'INPUT_VANISHED', 'INPUT_UNREADABLE', 'OUTPUT_ZONE_UNRESOLVED', 'SPEC_READ_TIMEOUT', 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT')) {
         try {
             Wait-RunDirReadSeam
             if (-not (Test-Path -LiteralPath $batchLog)) { $logPlain = $true }

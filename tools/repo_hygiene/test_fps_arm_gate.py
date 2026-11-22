@@ -212,7 +212,7 @@ class ArmClassifierTests(_Probe):
             else:
                 args = doc.get("generatorArgs", {})
                 arm = args.get("telemetryArm", "UNKNOWN")
-                # r2 (adversary A2): a spec that also enables an observer control is not proof of LIGHT (the independent oracle: the five keys named in OBSERVER_SPEC_KEYS)
+                # r2 (adversary A2): a spec that also enables an observer control is not proof of LIGHT (the independent oracle: the keys named in OBSERVER_SPEC_KEYS)
                 observer_on = any(
                     (k in args) and ((isinstance(args[k], (int, float)) and not isinstance(args[k], bool) and args[k] >= 0) if k == "cudaLaunchTimingMinMs"
                                      else (args[k] is not False and args[k] is not None))
@@ -485,6 +485,19 @@ class GuiSmokeInheritedEnvironmentRecordTests(_Probe):
         self.assertNotIn("NOT_MLVAPP_THING", lines["RECORDED"])
         self.assertEqual(lines["OVERRIDE_KEPT"], "0", "an explicit override is never replaced by the inherited value")
 
+    def test_an_inherited_dualiso_debug_dump_is_recorded_and_refuses_light(self) -> None:
+        # r14 (sol r13 B6): DUALISO_DEBUG_SOURCE_SMOOTH_DIR is an app control (src/mlv/llrawproc/dualiso.c dumps two image planes inside the measured Play); the runner recorded only MLVAPP_*
+        # names and the classifier judged only MLVAPP_* names, so an inherited dump read LIGHT. It is now recorded and outside the LIGHT shape.
+        out = self.ok(
+            "$env:DUALISO_DEBUG_SOURCE_SMOOTH_DIR = 'C:\\dump'\n"
+            f"$launchEnv = [ordered]@{{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1'; {PRODUCER_LOGDIR_PS} }}\n"
+            f"Write-Host ('BEFORE=' + (Get-FpsArmFromLaunch ([pscustomobject]@{{ environment = $launchEnv; arguments = @({PRODUCER_ARGS_PS}) }})).arm)\n"
+            "Add-InheritedMlvAppEnvironmentRecord -Target $launchEnv -Cleared @()\n"
+            f"Write-Host ('AFTER=' + (Get-FpsArmFromLaunch ([pscustomobject]@{{ environment = $launchEnv; arguments = @({PRODUCER_ARGS_PS}) }})).arm)\n"
+            "Write-Host ('RECORDED=' + [bool]$launchEnv.Contains('DUALISO_DEBUG_SOURCE_SMOOTH_DIR'))\n")
+        lines = dict(line.split("=", 1) for line in out.strip().splitlines())
+        self.assertEqual((lines["BEFORE"], lines["AFTER"], lines["RECORDED"]), ("LIGHT", "UNKNOWN", "True"))
+
     def test_the_runner_records_the_inherited_variables_before_it_reports_or_dry_runs_its_launch(self) -> None:
         source = (PROFILING / "run-release-gui-smoke.ps1").read_text(encoding="utf-8")
         call = source.index("Add-InheritedMlvAppEnvironmentRecord -Target $launchEnv -Cleared $clearedEnvironment")
@@ -565,6 +578,14 @@ class LeaseBatchPlanCheckerTests(unittest.TestCase):
         call = source.index("$armRead = Get-LegSpecTelemetryArm $path")
         stop = source.index("Stop-PlanRefused 'SPEC_READ_TIMEOUT' $n", call)
         self.assertLess(stop, source.index("$items.Add(", call), "the typed timeout stops the plan before the item is kept")
+        # r14 (sol r13 B5): the refusal of a read that timed out must not probe batch.log first (the stalled share may hold -RunDir too, and the synchronous probe would hold the typed
+        # refusal): the timeout codes are in Stop-PlanRefused's no-probe list, beside the codes that already skip it.
+        refused = re.search(r"function Stop-PlanRefused\(.*?\n\}\r?\n", source, re.DOTALL)
+        self.assertIsNotNone(refused)
+        skip = re.search(r"\$Reason -cnotin @\(([^)]*)\)\) \{\s*\n\s*try \{\s*\n\s*Wait-RunDirReadSeam", refused.group(0))
+        self.assertIsNotNone(skip, "the no-probe list guards the batch.log probe")
+        self.assertIn("'SPEC_READ_TIMEOUT'", skip.group(1))
+        self.assertIn("'EXPORT_BUDGET_PREFLIGHT_TIMEOUT'", skip.group(1))
 
     def test_the_arm_is_judged_from_the_bytes_the_leg_is_bound_to(self) -> None:
         # adversary A4: Get-LegSpecTelemetryArm must hash its read against the digest the preflight judged (the one -ExpectSpecSha256 binds the leg to). A spec shown as LIGHT to this
@@ -1151,7 +1172,7 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
 
 # The six generatorArgs keys of a leg spec that turn an observer, or a presentation-moving hook (r13: midPlayWindowToggles, adversary pass 15 A1), on inside the timed window (the independent oracle
 # of the corpus test; the module holds the same list as data).
-OBSERVER_SPEC_KEYS = ("cudaLaunchTimingMinMs", "corePartitionTelemetry", "utilSample", "firstPresentCapture", "warmReuseMissDump", "midPlayWindowToggles")
+OBSERVER_SPEC_KEYS = ("cudaLaunchTimingMinMs", "corePartitionTelemetry", "utilSample", "firstPresentCapture", "warmReuseMissDump", "midPlayWindowToggles", "gpuFaultInject")
 LIGHT_ENV = "'MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1'"
 
 # r10 G11: the raw environment reader judges an environment list without the launch members every producer records; only the module itself and this test file may name it
@@ -1417,7 +1438,7 @@ class ObserverControlTests(_Probe):
 
     # --- the shared list --------------------------------------------------------------------------------------------------------------------------------
     def test_one_list_drives_the_spec_and_the_result_classifiers(self) -> None:
-        # r8: the list is the generator's five forwarded switches only (the environment is judged against the LIGHT table instead). Every control must refuse LIGHT in the spec and the result
+        # r8: the list is the generator's forwarded switches only (OBSERVER_SPEC_KEYS) (the environment is judged against the LIGHT table instead). Every control must refuse LIGHT in the spec and the result
         # classifier (a result judged beside a LIGHT spec), and its OFF value must not.
         out = self.ok(
             "foreach ($c in Get-FpsObserverControls) {\n"
@@ -1598,6 +1619,16 @@ class ObserverControlTests(_Probe):
                 "[string]$env:MLVAPP_PLAYBACK_QUALITY_MODE + '|' + [bool]$env:MLVAPP_HUB_PLAYBACK_CI_FIXTURE + '|' + [bool]$env:NOT_THE_APP)\n")
         rows = [line for line in self.ok(body).splitlines() if line.startswith("R=")]
         self.assertEqual(rows, ["R=False|False|False|inherited|True|True"])
+        # r14 (key3 r13 B1 sibling, dictionary-member-shadow; sol r13 B6): a worker variable named Keys (any case) made `.Keys` return its value, so the clear saw one name and cleared nothing;
+        # and the app reads DUALISO_DEBUG_SOURCE_SMOOTH_DIR (dualiso.c), a control the MLVAPP_ prefix missed.
+        for shadow in ("Keys", "keys", "Values"):
+            with self.subTest(shadow=shadow):
+                body = (f"$envs = @('MLVAPP_PLAYBACK_QUALITY_MODE=phase3_hq'); [Environment]::SetEnvironmentVariable('{shadow}', 'x'); $env:MLVAPP_STAGE_TIMING = '1'; "
+                        "$env:DUALISO_DEBUG_SOURCE_SMOOTH_DIR = 'C:\\dump'; $env:NOT_THE_APP = 'x'\n"
+                        f"{region}\n"
+                        "Write-Host ('R=' + [bool]$env:MLVAPP_STAGE_TIMING + '|' + [bool]$env:DUALISO_DEBUG_SOURCE_SMOOTH_DIR + '|' + [bool]$env:NOT_THE_APP)\n")
+                rows = [line for line in self.ok(body).splitlines() if line.startswith("R=")]
+                self.assertEqual(rows, ["R=False|False|True"])
 
     def test_a_flag_or_arm_word_carrying_a_zero_width_character_is_not_the_plain_one(self) -> None:
         # r5 (adversary A1): PowerShell's -ceq / -cne / -cin ignore U+00AD and the zero-width characters, so 'LIGHT'+U+00AD read as LIGHT and ('0'+U+00AD) as the zero the native reader
@@ -1709,7 +1740,7 @@ class ObserverControlTests(_Probe):
         self.assertGreater(len(keys), 30)
         not_observers = {
             "telemetryArm", "cpuQuiescenceThresholdPercent", "playbackProcessing", "qualityMode", "swapInterval", "playbackConform", "rawPrefetchDecoders", "benchAffinityMask",
-            "partitionLoadMask", "partitionLoadThreads", "corePartitionHelperMask", "playbackMaxThreads", "gpuFaultInject", "gpuSafeStart", "automationSettingsDir", "gpuPreLaunches",
+            "partitionLoadMask", "partitionLoadThreads", "corePartitionHelperMask", "playbackMaxThreads", "gpuSafeStart", "automationSettingsDir", "gpuPreLaunches",
             "disableLookAssist", "presentTrace", "unpaced", "disablePrepPointwiseFast", "prepConflatedMove", "disableReconReleaseDeferred", "dueWakeDeliveryPost", "reconOmpThreads",
             "prepOmpThreads", "scope", "scopeIntervalMs", "scopesDuringPlayback", "forceLookAssist", "lookFlavor", "playbackRenderLookaheadFrames", "lookReceipt", "lookReceiptSha256",
         }
@@ -1778,6 +1809,49 @@ class LightShapeAllowlistTests(_Probe):
                 "Write-Host ('VALUE=' + (Get-FpsArmFromEnvironment $bad @()).arm)\n")
         lines = dict(line.split("=", 1) for line in self.ok(body).split())
         self.assertEqual(lines, {"FULL": "LIGHT", "EXTRA": "UNKNOWN", "VALUE": "UNKNOWN"})
+
+    def test_dictionary_member_shadow_a_recorded_key_named_keys_hides_nothing(self) -> None:
+        # r14 (key3 r13 B1, catalogue row dictionary-member-shadow): the environment reader enumerated `$Map.Keys`, and on an IDictionary PowerShell resolves `.Keys` to an ENTRY named Keys (any
+        # case) before the property, so the allowlist loop saw one non-MLVAPP name and judged nothing: the key3 repro (a LIGHT launch plus MLVAPP_STAGE_TIMING=1 and Keys='x') read LIGHT. The
+        # dictionary-shaped environment (ConvertTo-FpsEnvMap) had the same defect one step earlier: a Keys entry naming one variable hid a fully HEAVY environment.
+        def launch(extra: str, env_kind: str = "[pscustomobject]") -> str:
+            return (f"Get-FpsArmFromLaunch ([pscustomobject]@{{ environment = {env_kind}@{{ {LIGHT_LAUNCH_ENV_PS}; {extra} }}; arguments = @({PRODUCER_ARGS_PS}) }})")
+        cases = {}
+        for shadow in ("Keys", "keys", "KEYS", "Values", "Count", "GetEnumerator"):
+            cases[launch(f"MLVAPP_STAGE_TIMING = '1'; {shadow} = 'x'")] = "UNKNOWN"
+            cases[launch(f"MLVAPP_STAGE_TIMING = '1'; {shadow} = 'x'", "[ordered]")] = "UNKNOWN"
+            cases[launch(f"{shadow} = 'x'")] = "LIGHT"   # the extra non-app name itself changes nothing
+        cases[launch("MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D = '1'; Keys = 'x'")] = "UNKNOWN"   # the value check is not skipped either
+        heavy = ("Get-FpsArmFromLaunch ([pscustomobject]@{ environment = [ordered]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; " + PRODUCER_LOGDIR_PS +
+                 "; Keys = 'MLVAPP_CRASH_FORENSICS_LOG_DIR' }; arguments = @(" + PRODUCER_ARGS_PS + ") })")
+        cases[heavy] = "HEAVY"
+        cases[launch("DUALISO_DEBUG_SOURCE_SMOOTH_DIR = 'C:\\dump'")] = "UNKNOWN"   # sol r13 B6: a DUALISO_ app control is outside the shape too
+        self.check(cases)
+        # the verdict's exact repro, through the saved-leg reader and the pair verdict
+        out = self.ok(
+            "$l = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY='1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG='1'; "
+            "MLVAPP_CRASH_FORENSICS_LOG_DIR='C:\\logs'; MLVAPP_STAGE_TIMING='1'; Keys='x' }; arguments=@(" + PRODUCER_ARGS_PS + ") }\n"
+            "$a = Get-FpsArmFromLegRecord ([pscustomobject]@{ telemetryArm = 'LIGHT'; launch = $l })\n"
+            f"$b = Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; {RECORDED_LIGHT_LAUNCH} }})\n"
+            "$v = Get-FpsPairVerdict -Baseline $b -Candidate $a\nWrite-Host ('REPRO=' + (Get-FpsArmFromLaunch $l).arm + '|' + $a.arm + '|' + $v.allowed)\n")
+        self.assertEqual(out.strip(), "REPRO=UNKNOWN|UNKNOWN|False")
+
+    def test_sol_r13_a_spec_with_a_fault_injection_or_an_embedded_observer_controls_entry_is_not_light(self) -> None:
+        # r14 (sol r13 B1, B2): the spec reader admitted LIGHT for generatorArgs carrying gpuFaultInject (a timed device loss inside the measured Play; the launch reader already refuses
+        # MLVAPP_GPU_FAULT_INJECT) or an observerControls entry (the record reader already refuses it). Spec, result-with-spec and the plan rule now agree on UNKNOWN.
+        fault = "[pscustomobject]@{ legType = 'speed'; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT'; gpuFaultInject = '702@120' } }"
+        oc = "[pscustomobject]@{ legType = 'speed'; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT'; observerControls = [pscustomobject]@{ utilSample = $true } } }"
+        self.check({
+            f"Get-FpsArmFromLegSpec {fault}": "UNKNOWN",
+            f"Get-FpsArmFromLegSpec {oc}": "UNKNOWN",
+            f"Get-FpsArm -Spec {fault} -Result ([pscustomobject]@{{ telemetryArm = 'LIGHT' }})": "UNKNOWN",
+            f"Get-FpsArm -Spec {oc} -Result ([pscustomobject]@{{ telemetryArm = 'LIGHT' }})": "UNKNOWN",
+            f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; legType = 'speed'; generatorArgs = ({fault}).generatorArgs }})": "UNKNOWN",
+            f"Get-FpsArmFromLegSpec ([pscustomobject]@{{ legType = 'speed'; generatorArgs = [pscustomobject]@{{ telemetryArm = 'LIGHT'; gpuFaultInject = $null }} }})": "LIGHT",
+        })
+        out = self.ok(f"$p = Get-FpsLegPlanRefusal -Purpose 'fps-ab' -Items @([pscustomobject]@{{ item = 1; arm = (Get-FpsArmFromLegSpec {fault}) }}, "
+                      f"[pscustomobject]@{{ item = 2; arm = (Get-FpsArmFromLegSpec {oc}) }})\nWrite-Host ('PLAN=' + ($p -join '|').Substring(0, 21))")
+        self.assertEqual(out.strip(), "PLAN=FPS_AB_UNKNOWN_ARM|1|")
 
     def test_a_look_leg_spec_is_not_a_light_fps_leg_whatever_its_arm_word_says(self) -> None:
         # the spec-side sibling of A1: a look leg grabs its contact sheet in the timed Play (Invoke-VenueLeg.ps1:586-589), so a LIGHT word on it is not proof; only legType 'speed' is
