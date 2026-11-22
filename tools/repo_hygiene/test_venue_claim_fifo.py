@@ -2452,6 +2452,25 @@ $json = [pscustomobject]@{{ elapsed = $sw.Elapsed.TotalSeconds; answered = [bool
         self.assertFalse(r["answered"], r)
         self.assertLess(r["elapsed"], 6.5, f"the ticket call took {r['elapsed']:.1f} s: the worker's 3 s start-up was added to its 5 s bound (8 s): {r}")
 
+    def test_tail1_r2_pass10_a11_a_ticket_whose_lifetime_is_not_a_finite_number_is_stale_not_live_for_ever(self) -> None:
+        # pass 10 A11 (pre-existing): staleAfterSec as the JSON string NaN / Infinity parsed, and "heartbeat age > NaN" is false, so a ticket whose heartbeat stopped 10 minutes ago stayed live and blocked the line for ever.
+        r = self.ps("""
+$old = [DateTime]::UtcNow.AddSeconds(-600)
+$out = [ordered]@{}
+foreach ($bad in @('NaN', 'Infinity', '-Infinity', '0')) {
+  $t = New-VenueTicket -Venue bachelor -RunDir ('run-' + $bad) -ClaimDir $d -NowUtc $old -StaleAfterSec 90
+  $j = Get-Content -LiteralPath $t.path -Raw | ConvertFrom-Json
+  $j.staleAfterSec = $bad
+  [IO.File]::WriteAllText($t.path, ($j | ConvertTo-Json -Compress))
+  $row = @(Get-VenueTickets -Venue bachelor -ClaimDir $d | Where-Object { $_.name -ceq $t.name })[0]
+  $out[$bad] = [string]$row.state
+  Remove-Item -LiteralPath $t.path -Force
+}
+$out | ConvertTo-Json -Compress
+""")
+        for bad, state in r.items():
+            self.assertEqual(state, "STALE", f"a ticket whose staleAfterSec is {bad!r} and whose heartbeat is 10 minutes old stayed live: {r}")
+
     def give_back_scenario(self, name: str, release_seam: str, env: dict) -> dict:
         # the A7 line-up (B takes the claim as head while A is in cooldown, A flips to waiting while B holds it, so B must give the claim back), with ONE seam inside the give-back
         from unittest import mock
