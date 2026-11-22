@@ -108,7 +108,12 @@ TEST(ViewerIdleWiring, FullscreenSlotUntouchedAndLeavingRestoresWithoutOverrideC
     ASSERT_FALSE(changed.isEmpty());
     ASSERT_TRUE(changed.contains(QStringLiteral("m_viewerIdleTimer->stop();")));
     ASSERT_TRUE(changed.contains(QStringLiteral("m_viewerIdle.forceShown()")));
-    ASSERT_TRUE(changed.contains(QStringLiteral("m_viewerCursorHider.restore( viewerIdleSurfaces() );")));
+    // PLAYER-FULLSCREEN-CONTROL-BAR-1: the restore goes through viewerIdleApplyShown, which restores the cursor and
+    // moves the control bar with it (test_fullscreen_control_bar_wiring.cpp C3 pins its body).
+    ASSERT_TRUE(changed.contains(QStringLiteral("if( m_viewerIdle.forceShown() ) viewerIdleApplyShown( true, false );")));
+    const QString apply = functionBodyToBrace(source,
+        QStringLiteral("void MainWindow::viewerIdleApplyShown( bool shown, bool byActivity )"));
+    ASSERT_TRUE(apply.contains(QStringLiteral("m_viewerCursorHider.restore( viewerIdleSurfaces() );")));
 }
 
 // W4: the hide gate reads real window state and all three tools; the surfaces are read fresh,

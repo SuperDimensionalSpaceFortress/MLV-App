@@ -66,14 +66,17 @@ struct Inputs
     bool popupOrModalOpen = false;  // a popup (menu) or a modal dialog is open
     bool pointerMoved = false;      // the OS pointer moved since the last look (PointerWatch); not a hide gate
     bool witnessMissing = false;    // Windows: the thread mouse hook is not installed (r6 pass 9 A1)
+    bool overlayHeld = false;       // PLAYER-FULLSCREEN-CONTROL-BAR-1: pointer over the shown bar, or a seek drag
 };
 
 /*! \brief The cursor may hide only in real fullscreen, while active, with no tool and no popup/modal, and (on
  *         Windows) only while the thread mouse hook is installed: without it input that an excluded wait defers
- *         has no witness, so a hidden cursor could stay blank for the whole wait (r6 pass 9 A1, fail-safe). */
+ *         has no witness, so a hidden cursor could stay blank for the whole wait (r6 pass 9 A1, fail-safe). The
+ *         fullscreen control bar holds it shown (and the cursor with it) while the pointer is over the bar or a
+ *         seek drag is in progress (PLAYER-FULLSCREEN-CONTROL-BAR-1). */
 inline bool mayHide( const Inputs &i )
 {
-    return i.fullscreen && i.windowActive && !i.toolArmed && !i.popupOrModalOpen && !i.witnessMissing;
+    return i.fullscreen && i.windowActive && !i.toolArmed && !i.popupOrModalOpen && !i.overlayHeld && !i.witnessMissing;
 }
 
 /*! \brief Whether an event of this type is real mouse activity. A move to the same global position

@@ -109,6 +109,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_recon_warm_run_policy.cpp \
     $$REPO_ROOT/tests/console/test_resize_still_drawing_wait.cpp \
     $$REPO_ROOT/tests/console/test_resize_playback_policy.cpp \
+    $$REPO_ROOT/tests/console/test_smoke_window_toggle_schedule.cpp \
     $$REPO_ROOT/tests/console/test_playback_gpu_clock_kick_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_warm_output_reuse_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_decode_render_overlap.cpp \
@@ -123,7 +124,9 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_scale_label.cpp \
     $$REPO_ROOT/tests/console/test_visual_capture_source_difference.cpp \
     $$REPO_ROOT/tests/console/test_viewer_idle_wiring.cpp \
-    $$REPO_ROOT/tests/console/test_viewer_idle_policy.cpp
+    $$REPO_ROOT/tests/console/test_viewer_idle_policy.cpp \
+    $$REPO_ROOT/tests/console/test_fullscreen_control_bar_policy.cpp \
+    $$REPO_ROOT/tests/console/test_fullscreen_control_bar_wiring.cpp
 
 HEADERS += \
     $$REPO_ROOT/platform/qt/FpmNameValidator.h \
@@ -195,6 +198,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackReconWarmRunPolicy.h \
     $$REPO_ROOT/platform/qt/ResizeStillDrawingWait.h \
     $$REPO_ROOT/platform/qt/ResizePlaybackPolicy.h \
+    $$REPO_ROOT/platform/qt/SmokeWindowToggleSchedule.h \
     $$REPO_ROOT/platform/qt/PlaybackGpuClockKickPolicy.h \
     $$REPO_ROOT/platform/qt/GpuTexturePresentAvailabilityPolicy.h \
     $$REPO_ROOT/platform/qt/DisplayDeviceMapping.h \
@@ -203,7 +207,8 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/GpuFieldTelemetryCore.h \
     $$REPO_ROOT/platform/qt/GpuDeviceLossBreakerCore.h \
     $$REPO_ROOT/platform/qt/VisualCaptureSourceDifference.h \
-    $$REPO_ROOT/platform/qt/VisualCaptureSourceGuard.h
+    $$REPO_ROOT/platform/qt/VisualCaptureSourceGuard.h \
+    $$REPO_ROOT/platform/qt/FullscreenControlBarPolicy.h
 
 win32{
     WINDOWS_TEST_RUNTIME_DEPLOY = $$relative_path($$REPO_ROOT/tools/testing/deploy-windows-test-runtime.ps1, $$OUT_PWD)
