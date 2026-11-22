@@ -1,0 +1,47 @@
+{
+  "schema": "mlv-app/dual-venue-leg/v1",
+  "legId": "m16-1243-everyframe-visual-windowed-s1",
+  "card": "EVERY-FRAME-VISUAL-LEG-SPEC-1",
+  "legType": "speed",
+  "clipId": "M16-1243",
+  "playSeconds": 20,
+  "backends": [
+    "cuda",
+    "cpu"
+  ],
+  "scaleFactor": 1,
+  "displayMode": "windowed",
+  "generatorArgs": {
+    "telemetryArm": "LIGHT",
+    "cpuQuiescenceThresholdPercent": 95,
+    "swapInterval": 0,
+    "unpaced": true
+  },
+  "presentTearingExpectedReason": "every-frame (drop-frame off) leg at swap interval 0: every present goes out with SyncInterval 0, so PresentMon reports AllowsTearing=1 on its Independent Flip presents by design; a measurement-only mode (MLVAPP_PLAYBACK_UNPACED is honoured only in an automation run) that no user playback path reaches",
+  "timeouts": {
+    "queueWaitSec": 900,
+    "extraClaimedWaitSec": 600
+  },
+  "criteria": {
+    "acceptance": {
+      "cuda": [
+        {
+          "metric": "gpuFramesTotal",
+          "op": "gt",
+          "value": 0
+        }
+      ],
+      "cpu": []
+    },
+    "supplementary": {
+      "cuda": [
+        {
+          "metric": "gpuFramesTotal",
+          "op": "gt",
+          "value": 0
+        }
+      ],
+      "cpu": []
+    }
+  }
+}

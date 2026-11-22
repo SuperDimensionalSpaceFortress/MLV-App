@@ -278,6 +278,9 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *FSTOGGLE_LEGS)
 # EXPORT-VENUE-LEG-1: the four export legs (two clips x CDNG lossless / ProRes); test_dual_venue_export_leg pins their shape.
 EXPORT_VENUE_LEGS = tuple(f"legs/m16-{clip}-export-{fmt}.json" for clip in ("1243", "1456") for fmt in ("cdng-lossless", "prores"))
 SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in EXPORT_VENUE_LEGS if rel not in SHIPPED_LEGS))
+# EVERY-FRAME-VISUAL-LEG-SPEC-1: the one every-frame (drop-frame off) leg that keeps a play strip; test_the_everyframe_visual_leg_is_unpaced_and_keeps_its_play_strip pins its keys.
+EVERYFRAME_VISUAL_LEGS = ("legs/m16-1243-everyframe-visual-windowed-s1.json",)
+SHIPPED_LEGS = (*SHIPPED_LEGS, *EVERYFRAME_VISUAL_LEGS)
 assert len(set(SHIPPED_LEGS)) == len(SHIPPED_LEGS), "a shipped leg is listed twice"
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
@@ -8102,12 +8105,12 @@ class LegSpecSchemaTests(unittest.TestCase):
         """CUDA-HEADROOM-1 r2: an unpaced leg at swap interval 0 presents with SyncInterval 0, so PresentMon reports AllowsTearing=1 (the hub's
         TEARING flag). Every headroom leg says so in presentTearingExpectedReason; no other leg carries it, and the schema refuses it on any leg
         that is not unpaced at swap interval 0, so the exemption can never reach a paced or vsync leg."""
-        for rel in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS):
+        for rel in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS, *EVERYFRAME_VISUAL_LEGS):
             spec = json.loads((DV / rel).read_text(encoding="utf-8"))
             self.jsonschema.validate(spec, self.schema)
             self.assertGreaterEqual(len(spec.get("presentTearingExpectedReason", "")), 12, rel)
         for path in sorted((DV / "legs").glob("*.json")):
-            if "legs/" + path.name not in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS):
+            if "legs/" + path.name not in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS, *EVERYFRAME_VISUAL_LEGS):
                 self.assertNotIn("presentTearingExpectedReason", json.loads(path.read_text(encoding="utf-8")), path.name)
         leg = json.loads((DV / HEADROOM_LEGS[0]).read_text(encoding="utf-8"))
         paced = {k: v for k, v in leg["generatorArgs"].items() if k != "unpaced"}
@@ -8117,6 +8120,30 @@ class LegSpecSchemaTests(unittest.TestCase):
                           ("short reason", dict(leg, presentTearingExpectedReason="tearing"))):
             with self.assertRaises(self.jsonschema.ValidationError, msg=name):
                 self.jsonschema.validate(bad, self.schema)
+
+    def test_the_everyframe_visual_leg_is_unpaced_and_keeps_its_play_strip(self) -> None:
+        """EVERY-FRAME-VISUAL-LEG-SPEC-1: the one committed leg that plays every frame (generatorArgs.unpaced true: the only drop-frame-off key, which sends
+        -DropFrameMode off and fails closed unless the run log shows pace_unpaced active=1 drop_frame=0) AND keeps the post-measurement window captures
+        (visualCapture absent = on, no opt-out reason). The capture tail cannot reach the loop check: the app closes the measured session
+        (finishPlaybackSmokeTelemetry) before the tail, so playback_smoke.summary's presented_frames is final, and PresentMon's window ends at tail_begin_utc.
+        Every other unpaced M16-1243 speed leg opts out; this one must not, and it stays at the clip's own 20 s floor (the runner refuses less)."""
+        for rel in EVERYFRAME_VISUAL_LEGS:
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(spec, self.schema)
+            self.assertEqual(spec["legId"], Path(rel).stem)
+            self.assertEqual(spec["legType"], "speed")
+            self.assertEqual(spec["clipId"], "M16-1243")
+            self.assertEqual(sorted(spec["backends"]), ["cpu", "cuda"])
+            self.assertIs(spec["generatorArgs"]["unpaced"], True, "drop-frame off: the only key that sends -DropFrameMode off")
+            self.assertEqual(spec["generatorArgs"]["swapInterval"], 0)
+            self.assertNotIn("visualCapture", spec, "absent means the play strip is ON")
+            self.assertNotIn("visualCaptureOptOutReason", spec)
+            self.assertGreaterEqual(spec["playSeconds"], 20, "M16-1243 is 23.976 fps: its play floor is 20 s")
+            self.assertGreaterEqual(len(spec["presentTearingExpectedReason"]), 12)
+            for bad_name, bad in (("opt-out without reason", dict(spec, visualCapture=False)),
+                                  ("reason without opt-out", dict(spec, visualCaptureOptOutReason="x" * 20))):
+                with self.assertRaises(self.jsonschema.ValidationError, msg=bad_name):
+                    self.jsonschema.validate(bad, self.schema)
 
     def test_the_hand_listed_shipped_legs_are_exactly_the_legs_directory(self) -> None:
         self.assertEqual(sorted(SHIPPED_LEGS), sorted("legs/" + p.name for p in (DV / "legs").glob("*.json")), "SHIPPED_LEGS drifted from the legs/ directory")
