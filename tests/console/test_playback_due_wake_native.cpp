@@ -1328,6 +1328,21 @@ bool waitWithoutPumping( const std::function<bool()> & done, DWORD waitMs )
     while( !done() && GetTickCount64() < deadline ) Sleep( 2 );
     return done();
 }
+// CI-FLAKE-PLAYBACK-DUE-WAKE-R17A1-TIMING-1 r3 (adversary pass 4 A1): a replacement arm's own due time is asserted on EVERY attempt
+// that is judged, never skipped. The timer starts BEFORE arm(), so the replacement's due time is inside what it measures whatever
+// the scheduler did after the arm (late only lengthens it); the arm's own cost is bracketed. A pause before the arm would let a
+// shortened replacement still read long, so an attempt whose arm cost reached kReplacementMaxArmCostNs is not judged (it is
+// drained and the observation retried, keyed on that flag); every judged attempt runs the full bound, and no attempt passes by
+// skipping it. A judged attempt tolerates a pause of < 20 ms before the arm, which an 8 ms shortened wake (8 + 19 < 35) cannot hide behind.
+constexpr int kReplacementAttempts = 5;
+constexpr qint64 kReplacementMaxArmCostNs = 20000000;
+constexpr qint64 kReplacementMinElapsedNs = 35000000;                 // the 40 ms replacement due, less 5 ms of timer slack
+// r3 (adversary pass 4 A5): a helper window is destroyed on every exit, an ASSERT or a throw included (same thread that created it)
+struct HelperWindowGuard
+{
+    HWND window;
+    ~HelperWindowGuard() { if( window ) DestroyWindow( window ); }
+};
 }
 #endif
 
@@ -2080,17 +2095,37 @@ TEST(PlaybackDueWakeSend, D_AStaleSentWakeThroughTheWindowProcedureIsDroppedByTh
 #ifdef Q_OS_WIN
     int fired = 0;
     PlaybackDueWake wake( nullptr, [&fired]() { ++fired; }, PlaybackDueWakeDeliveryMode::SendNotify );
-    wake.arm( 0.5 );
-    ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
-    wake.arm( 40.0 );                                             // re-armed before the GUI thread took the sent wake
-    ASSERT_EQ( 1u, wake.strandedCounts().total );
-    wake.dispatchSentMessages();                                  // dueWakeWindowProc -> handleNativeMessage -> the gate
-    ASSERT_EQ( 0, fired );                                        // the old generation: dropped
-    ASSERT_TRUE( wake.armed() );                                  // ...and the replacement is still armed
-    ASSERT_TRUE( wake.sleepForSmokeRunner( 1000 ) == PlaybackDueWake::RunnerSleep::WokenBySent );
-    wake.dispatchSentMessages();
-    ASSERT_EQ( 1, fired );                                        // the replacement fires once, at its own due time
-    ASSERT_FALSE( wake.armed() );
+    // r3 (adversary pass 4 A1 sibling): the replacement's own due time is asserted on every judged attempt (see kReplacementMax*)
+    bool judged = false;
+    for( int attempt = 0; attempt < kReplacementAttempts && !judged; ++attempt )
+    {
+        fired = 0;
+        wake.resetStrandedCounts();
+        wake.arm( 0.5 );
+        ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
+        QElapsedTimer t;
+        t.start();
+        wake.arm( 40.0 );                                         // re-armed before the GUI thread took the sent wake
+        const qint64 armCostNs = t.nsecsElapsed();
+        if( armCostNs >= kReplacementMaxArmCostNs )
+        {
+            // not judgeable (a pause before the arm could hide a shortened replacement): drain it, observe again
+            wake.sleepForSmokeRunner( 1000 );
+            wake.dispatchSentMessages();
+            continue;
+        }
+        ASSERT_EQ( 1u, wake.strandedCounts().total );
+        wake.dispatchSentMessages();                              // dueWakeWindowProc -> handleNativeMessage -> the gate
+        ASSERT_EQ( 0, fired );                                    // the old generation: dropped
+        ASSERT_TRUE( wake.armed() );                              // ...and the replacement is still armed
+        ASSERT_TRUE( wake.sleepForSmokeRunner( 1000 ) == PlaybackDueWake::RunnerSleep::WokenBySent );
+        ASSERT_TRUE( t.nsecsElapsed() >= kReplacementMinElapsedNs );   // at the replacement's due time, not at the stale wake's (~0.5 ms)
+        wake.dispatchSentMessages();
+        ASSERT_EQ( 1, fired );                                    // the replacement fires once, at its own due time
+        ASSERT_FALSE( wake.armed() );
+        judged = true;
+    }
+    ASSERT_TRUE( judged );                                        // never passes by skipping the bound
     // cancelled after the send: dropped too
     wake.arm( 0.5 );
     ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
@@ -2309,6 +2344,7 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
     RegisterClassW( &wc );
     const HWND window = CreateWindowExW( 0, kClass, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr );
     ASSERT_TRUE( window != nullptr );
+    const HelperWindowGuard windowGuard { window };
     wake.setGuiTraceActive( true );
     std::atomic<bool> sent { false };
     std::thread sender( [window, &sent]() {
@@ -2324,7 +2360,6 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
     const PlaybackGuiSleepTrace::At afterHandler = wake.guiStateAt( foreign.handlerStartMs + 60.0 );
     wake.setGuiTraceActive( false );
     g_r3a3Foreign = nullptr;
-    DestroyWindow( window );
     ASSERT_TRUE( sent.load() );
     ASSERT_EQ( 1, foreign.calls );
     ASSERT_TRUE( slept == PlaybackDueWake::RunnerSleep::Slept );
@@ -2368,6 +2403,7 @@ TEST(PlaybackDueWakeSend, R15A1_ADescheduleBeforeTheSleepStartsNeverShiftsTheDis
     RegisterClassW( &wc );
     const HWND window = CreateWindowExW( 0, kClass, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr );
     ASSERT_TRUE( window != nullptr );
+    const HelperWindowGuard windowGuard { window };
     wake.setGuiTraceActive( true );
     wake.setRunnerSleepStartDelayMsForTest( 20 );
     std::atomic<bool> sent { false };
@@ -2381,7 +2417,6 @@ TEST(PlaybackDueWakeSend, R15A1_ADescheduleBeforeTheSleepStartsNeverShiftsTheDis
     wake.setRunnerSleepStartDelayMsForTest( 0 );
     wake.setGuiTraceActive( false );
     g_r3a3Foreign = nullptr;
-    DestroyWindow( window );
     ASSERT_TRUE( sent.load() );
     ASSERT_EQ( 1, foreign.calls );
     ASSERT_TRUE( slept == PlaybackDueWake::RunnerSleep::Slept );
@@ -2442,6 +2477,7 @@ TEST(PlaybackDueWakeSend, R15A3_TheDurationAccountIsTheDispatchSpansLength)
     RegisterClassW( &wc );
     const HWND window = CreateWindowExW( 0, kClass, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr );
     ASSERT_TRUE( window != nullptr );
+    const HelperWindowGuard windowGuard { window };
     g_r15A3SkewMs = 0;
     g_r15A3Calls = 0;
     std::atomic<bool> sent { false };
@@ -2451,7 +2487,6 @@ TEST(PlaybackDueWakeSend, R15A3_TheDurationAccountIsTheDispatchSpansLength)
     } );
     const PlaybackDueWake::RunnerSleep slept = wake.sleepForSmokeRunner( 120, &r15A3CallerNowS );
     sender.join();
-    DestroyWindow( window );
     ASSERT_TRUE( sent.load() );
     ASSERT_EQ( 1, g_r15A3Calls );
     ASSERT_TRUE( slept == PlaybackDueWake::RunnerSleep::Slept );
@@ -2486,23 +2521,37 @@ TEST(PlaybackDueWakeSend, R2A1_AStaleSentWakeInTheRunnerSleepIsNotHeldCountedOrA
     wake.dispatchSentMessages();
     ASSERT_EQ( 0, fired );
     // variant: replaced by arm(40) -- the old generation's wake goes on to sleep, the replacement ends it and fires once
-    wake.resetStrandedCounts();
-    wake.arm( 0.5 );
-    ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
-    // t starts BEFORE arm, so the replacement's 40 ms are inside what t measures whatever the scheduler did after the arm; the
-    // arm's own cost is bracketed, and the wall bound is asserted only on a sample whose arm returned promptly (a pause before
-    // the arm would let a shortened arm still read >= 30: such a sample is not evidence, so it asserts nothing, never passes it)
-    t.restart();
-    wake.arm( 40.0 );
-    const qint64 armCostNs = t.nsecsElapsed();
-    ASSERT_TRUE( wake.sleepForSmokeRunner( 500 ) == PlaybackDueWake::RunnerSleep::WokenBySent );
-    if( armCostNs < 5000000 ) ASSERT_TRUE( t.elapsed() >= 30 );       // not at the stale wake (~0 ms), at the replacement
-    ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenBySent() );
-    ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenOther() );
-    ASSERT_EQ( 0, fired );
-    wake.dispatchSentMessages();
-    ASSERT_EQ( 1, fired );
-    ASSERT_FALSE( wake.armed() );
+    // r3 (adversary pass 4 A1): the replacement's own due time is asserted on EVERY judged attempt, never skipped. t starts BEFORE
+    // arm, so the replacement's 40 ms are inside what t measures whatever the scheduler did after the arm; an attempt whose arm
+    // cost reached kReplacementMaxArmCostNs is not judgeable (a pause before the arm could hide a shortened replacement): it is
+    // drained and observed again, keyed on that flag, and the test fails if no attempt could be judged
+    bool judged = false;
+    for( int attempt = 0; attempt < kReplacementAttempts && !judged; ++attempt )
+    {
+        fired = 0;
+        wake.resetStrandedCounts();
+        wake.arm( 0.5 );
+        ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
+        t.restart();
+        wake.arm( 40.0 );
+        const qint64 armCostNs = t.nsecsElapsed();
+        if( armCostNs >= kReplacementMaxArmCostNs )
+        {
+            wake.sleepForSmokeRunner( 500 );
+            wake.dispatchSentMessages();
+            continue;
+        }
+        ASSERT_TRUE( wake.sleepForSmokeRunner( 500 ) == PlaybackDueWake::RunnerSleep::WokenBySent );
+        ASSERT_TRUE( t.nsecsElapsed() >= kReplacementMinElapsedNs );   // not at the stale wake (~0 ms), at the replacement
+        ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenBySent() );
+        ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenOther() );
+        ASSERT_EQ( 0, fired );
+        wake.dispatchSentMessages();
+        ASSERT_EQ( 1, fired );
+        ASSERT_FALSE( wake.armed() );
+        judged = true;
+    }
+    ASSERT_TRUE( judged );                                            // never passes by skipping the bound
 #endif
     const QString wakeSource = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
     const QString hold = functionBody( wakeSource, QStringLiteral( "bool PlaybackDueWake::holdWindowProcWake( const void *message )" ),
@@ -2557,12 +2606,16 @@ struct R17A1Windows
     int open = 0;
     double chargedS[2] = { 0.0, 0.0 };
     int segments[2] = { 0, 0 };
+    double firstStartS[2] = { 0.0, 0.0 };                              // the endpoints the sink was handed, not only their difference
+    double lastEndS[2] = { 0.0, 0.0 };
     gui_hop_wait::Recorder hop;
 };
 void r17A1Charge( void *context, double startS, double endS )
 {
     R17A1Windows *w = static_cast<R17A1Windows *>( context );
     w->chargedS[w->open] += endS - startS;
+    if( w->segments[w->open] == 0 ) w->firstStartS[w->open] = startS;
+    w->lastEndS[w->open] = endS;
     ++w->segments[w->open];
     w->hop.push( gui_hop_wait::Kind::RunnerSleep, startS, endS );
 }
@@ -2666,6 +2719,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     RegisterClassW( &wc );
     const HWND window = CreateWindowExW( 0, kClass, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr );
     ASSERT_TRUE( window != nullptr );
+    const HelperWindowGuard windowGuard { window };
     // CI-FLAKE-PLAYBACK-DUE-WAKE-R17A1-TIMING-1 (hosted run 44998377370: `w.chargedS[1] * 1000.0 >= 30.0` failed, the sender
     // thread woke at ~55 ms of the 80). Every bound below follows from a clock read the test or the sleep made, never from the
     // scheduler running a thread on time. The sender starts its 20 ms only once the sleep has stamped its entry, so a main
@@ -2698,8 +2752,10 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         std::atomic<bool> sent { false };
         std::thread sender( [window, &sent]() {
             const ULONGLONG giveUp = GetTickCount64() + 5000;
-            while( !g_r17A1Entered.load() && GetTickCount64() < giveUp ) Sleep( 0 );
-            if( !g_r17A1Entered.load() ) return;                       // the sleep never started: no send, so the attempt reads as missed
+            bool entered = false;
+            // ONE read decides: a read after the deadline cannot admit an entry the loop already gave up on
+            while( !( entered = g_r17A1Entered.load() ) && GetTickCount64() < giveUp ) Sleep( 0 );
+            if( !entered ) return;                                     // the sleep never started: no send, so the attempt reads as missed
             Sleep( 20 );
             sent = SendNotifyMessageW( window, kR17A1ForeignMessage, 0, 0 ) != 0;
         } );
@@ -2719,7 +2775,6 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         spans = wake.lastRunnerSleepDispatchSpansS();
         stamps = g_r17A1Stamps;
     }
-    DestroyWindow( window );
     ASSERT_TRUE( sentOk );
     ASSERT_TRUE( landed );                                             // the send fell inside one of the sleeps
     ASSERT_TRUE( slept == PlaybackDueWake::RunnerSleep::Slept );
@@ -2740,6 +2795,11 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     // sender moves the dispatch, never the identity
     ASSERT_TRUE( std::fabs( w.chargedS[0] - ( dispatchStartS - entryS ) ) < 1e-9 );
     ASSERT_TRUE( std::fabs( w.chargedS[1] - ( returnS - dispatchEndS ) ) < 1e-9 );
+    // r3 (adversary pass 4 A2): and the sink was handed those very endpoints, so a sink call shifted in time is caught too
+    ASSERT_TRUE( std::fabs( w.firstStartS[0] - entryS ) < 1e-9 );
+    ASSERT_TRUE( std::fabs( w.lastEndS[0] - dispatchStartS ) < 1e-9 );
+    ASSERT_TRUE( std::fabs( w.firstStartS[1] - dispatchEndS ) < 1e-9 );
+    ASSERT_TRUE( std::fabs( w.lastEndS[1] - returnS ) < 1e-9 );
     ASSERT_TRUE( w.chargedS[0] * 1000.0 <= handlerStartMs - enteredMs + 0.5 );
     ASSERT_TRUE( w.chargedS[1] * 1000.0 <= returnedMs - handlerEndMs + 0.5 );
     ASSERT_TRUE( w.chargedS[0] * 1000.0 >= 10.0 );                     // the sender waits 20 ms after the entry stamp: only later
@@ -2760,6 +2820,8 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     ASSERT_EQ( 1, plain.segments[0] );
     ASSERT_EQ( static_cast<size_t>( 2 ), g_r17A1Stamps.size() );
     ASSERT_TRUE( std::fabs( plain.chargedS[0] - ( g_r17A1Stamps[1] - g_r17A1Stamps[0] ) ) < 1e-9 );   // exactly entry to return
+    ASSERT_TRUE( std::fabs( plain.firstStartS[0] - g_r17A1Stamps[0] ) < 1e-9 );                        // ...with the clock's own endpoints
+    ASSERT_TRUE( std::fabs( plain.lastEndS[0] - g_r17A1Stamps[1] ) < 1e-9 );
     ASSERT_TRUE( plain.chargedS[0] * 1000.0 >= 12.0 );                 // the requested 15 ms, never cut short (late only lengthens)
     PlaybackDueWake postWake( nullptr, []() {}, PlaybackDueWakeDeliveryMode::Post );
     R17A1Windows none;
