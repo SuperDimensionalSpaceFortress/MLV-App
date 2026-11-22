@@ -2378,6 +2378,38 @@ $r = Invoke-VenueLateRelease -Venue bachelor -Nonce 'n' -ClaimDir $d -BoundSec 0
         full = [c for c in r["calls"][:-1]]
         self.assertTrue(full and all(c.startswith("5/") and float(c.split("/")[1]) <= 0.75 + 1.5 + 1e-9 for c in full), f"a full call was given more than the bound plus its cap, or is not a full call: {r}")
 
+    def give_back_scenario(self, name: str, release_seam: str, env: dict) -> dict:
+        # the A7 line-up (B takes the claim as head while A is in cooldown, A flips to waiting while B holds it, so B must give the claim back), with ONE seam inside the give-back
+        from unittest import mock
+        mark = self.case / f"seam-{name}-mark.txt"
+        mod = self.seam_text(("    $r = Invoke-VenueClaimAttempt @attemptArgs\n", "    [IO.File]::WriteAllText($env:SEAM_MARK, '1'); Start-Sleep -Milliseconds 2500\n    $r = Invoke-VenueClaimAttempt @attemptArgs\n"), *self.give_back_pairs(release_seam))
+        script = self.SEAM_T1A7.replace("@@SEAMMOD@@", str(mod)).replace("@@MARK@@", str(mark)).replace("queueCount = @($r.queue).Count;", "queueCount = @($r.queue).Count; pending = [string]$r.ticket.pendingReleaseNonce; claimExists = (Test-Path -LiteralPath (Join-Path $d 'bachelor.claim.json'));")
+        with mock.patch.dict(os.environ, env):
+            return self.ps(script)
+
+    @staticmethod
+    def give_back_pairs(release_seam: str) -> tuple:
+        if release_seam == "reap":
+            return (("                    if ($back -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { break }\n",
+                     "                    if ($env:SEAM_REAP_AFTER_RELEASE -and $back -ceq 'RELEASED') { Remove-Item -LiteralPath $t.path -Force }\n                    if ($back -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { break }\n"),)
+        return (("            [IO.File]::Delete($Path)   # allowed while our handle is open because it shares Delete; the name is gone once the handle closes\n",
+                 "            if ($env:SEAM_DENY_DELETE) { throw 'Access to the path is denied (seam)' }\n            [IO.File]::Delete($Path)   # allowed while our handle is open because it shares Delete; the name is gone once the handle closes\n"),)
+
+    def test_tail1_r2_a8_the_queue_and_place_a_released_give_back_returns_are_read_after_the_release(self) -> None:
+        # r1 adversary A8 (pre-existing since r8 rule 7): the give-back returned the census made BEFORE its release; a ticket reaped during the retries (here B's own, right after the release) stayed in it and B kept a place at 2
+        # of 2. The census is read again after the release: B is not in it (place 0), and the line is A alone.
+        r = self.give_back_scenario("a8", "reap", {"SEAM_REAP_AFTER_RELEASE": "1"})
+        self.assertEqual((r["state"], r["granted"]), ("QUEUED", False), r)
+        self.assertEqual((r["queueCount"], r["position"]), (1, 0), f"the give-back returned the census made before the release: {r}")
+        self.assertFalse(r["claimExists"], f"the claim B gave back is still standing: {r}")
+
+    def test_tail1_r2_a10_a_give_back_whose_delete_is_refused_does_not_hand_the_claim_to_a_caller_that_is_not_the_head(self) -> None:
+        # r1 adversary A10 (pre-existing): a Release-VenueClaim that THROWS (File.Delete refused) left the give-back through the outer catch and the grant was returned as TAKEN to B although the older A is ready. It counts
+        # as a release that did not let go: five tries, then QUEUED with the claim's nonce on B's ticket (the next poll tries again).
+        r = self.give_back_scenario("a10", "deny", {"SEAM_DENY_DELETE": "1"})
+        self.assertEqual((r["state"], r["granted"]), ("QUEUED", False), f"a younger claimant was handed a claim owed to an older ready ticket: {r}")
+        self.assertTrue(r["pending"], f"the claim that could not be given back is not named on the ticket: {r}")
+
     def test_r9_a4_a_phase_with_a_character_the_culture_compare_ignores_is_refused_not_stored(self) -> None:
         # r9 A4: [ValidateSet('waiting', 'cooldown')] compares with the current culture and ignores U+00AD / U+200D, so 'wait<U+00AD>ing' bound and was stored with the extra character: a ticket no ordinal reader
         # knows as ready, so a younger waiter overtook it. Both writers (New-VenueTicket, Update-VenueTicket) refuse it; the canonical spelling and a different case still store the canonical lower-case word.
