@@ -1395,6 +1395,26 @@ static int llrawproc_fake_gpu_backend_set_reduced_iso_notch(igpu_recon_backend *
     return 0;
 }
 
+/* DUALISO-CONFIGURE-CACHE-1 r22 (sol r21 #1) test-only: called by the fake's set_iso_pattern (kind 0), set_clip (1)
+ * and set_luts (2) right AFTER the fake stored the new configure state and BEFORE the call returns to
+ * llrawproc_gpu_recon_run_backend: the window in which the native state has changed and the caller has not yet run
+ * its next statement. A test reads the process-wide configure counts from inside it. NULL (the default, and always
+ * in the app) calls nothing. Stored and read like the after-unlock hook (InterlockedExchangePointer). */
+static PVOID volatile g_llrawproc_fake_gpu_backend_after_store_hook = NULL;
+
+void llrpSetFakeGpuBackendAfterConfigureStoreHookForTesting(void (*hook)(int kind));
+void llrpSetFakeGpuBackendAfterConfigureStoreHookForTesting(void (*hook)(int kind))
+{
+    InterlockedExchangePointer(&g_llrawproc_fake_gpu_backend_after_store_hook, (PVOID)hook);
+}
+
+static void llrawproc_fake_gpu_backend_after_store(int kind)
+{
+    void (*hook)(int) = (void (*)(int))InterlockedCompareExchangePointer(
+        &g_llrawproc_fake_gpu_backend_after_store_hook, NULL, NULL);
+    if(hook) hook(kind);
+}
+
 /* DUALISO-CONFIGURE-CACHE-1: the fake's igpu_recon_set_iso_pattern. It stores the pattern only, as the
  * CUDA backend does; the pattern a run sees is whatever the clip or this call last stored. */
 static int llrawproc_fake_gpu_backend_set_iso_pattern(igpu_recon_backend * b, const int * is_bright)
@@ -1408,6 +1428,7 @@ static int llrawproc_fake_gpu_backend_set_iso_pattern(igpu_recon_backend * b, co
     }
     memcpy(g_llrawproc_fake_gpu_backend_clip.is_bright, is_bright, sizeof(g_llrawproc_fake_gpu_backend_clip.is_bright));
     ++g_llrawproc_fake_gpu_backend_pattern_set_calls;
+    llrawproc_fake_gpu_backend_after_store(0);
     return 0;
 }
 
@@ -1442,6 +1463,7 @@ static int llrawproc_fake_gpu_backend_set_clip(igpu_recon_backend * b,
         g_llrawproc_fake_gpu_backend_in_use_count = 0;
     }
     g_llrawproc_fake_gpu_backend_clip = *clip;
+    llrawproc_fake_gpu_backend_after_store(1);
     return 0;
 }
 
@@ -1483,6 +1505,7 @@ static int llrawproc_fake_gpu_backend_set_luts(igpu_recon_backend * b,
     if(luts->mix_curve) { g_llrawproc_fake_gpu_backend_lut_shadow_valid[2] = 1; g_llrawproc_fake_gpu_backend_lut_shadow[2] = luts->mix_curve[0]; }
     if(luts->fullres_curve) { g_llrawproc_fake_gpu_backend_lut_shadow_valid[3] = 1; g_llrawproc_fake_gpu_backend_lut_shadow[3] = luts->fullres_curve[0]; }
     if(luts->randn05) { g_llrawproc_fake_gpu_backend_lut_shadow_valid[4] = 1; g_llrawproc_fake_gpu_backend_lut_shadow[4] = luts->randn05[0]; }
+    llrawproc_fake_gpu_backend_after_store(2);
     return 0;
 }
 

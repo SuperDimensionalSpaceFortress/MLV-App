@@ -9,6 +9,7 @@
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
 #include "../../src/mlv/llrawproc/llrawproc.h"
+#include "../../platform/qt/PlaybackWarmOutputReusePolicy.h"
 
 #include <QByteArray>
 #include <QFile>
@@ -38,6 +39,7 @@ extern "C" int llrpGpuPlaybackReconRunReducedNotchProbeForTesting(const llrpGpuP
                                                                    const uint16_t * raw_input_bayer14,
                                                                    size_t raw_image_size, int * rc_out);
 extern "C" void llrpFakeGpuBackendInjectRunFailureForTesting(int rc, int cuda_code, const char * name);
+extern "C" void llrpSetFakeGpuBackendAfterConfigureStoreHookForTesting(void (*hook)(int kind));
 
 namespace
 {
@@ -1123,4 +1125,139 @@ TEST(DualIsoGpuConfigureCache, TheDllHarnessChecksEveryBufferAllocationBeforeUsi
     ASSERT_TRUE(has(src, "uint16_t*alt_ref=dll_test_alloc_u16_zeroed(n,\"alt_ref\",malloc);"));
     ASSERT_TRUE(has(src, "uint16_t*back=dll_test_alloc_u16_zeroed(n,\"back\",malloc);"));
     ASSERT_TRUE(has(src, "if(!alt||!alt_ref||!back){free(alt);free(alt_ref);free(back);return4;}"));
+}
+
+// ---- r22 (sol r21 #1): the warm-output reuse gate after a native configure whose count is not yet published -------
+//
+// Sol's schedule: with reuse on, the recon worker's set_iso_pattern stores 0011 in the backend while the pattern count
+// still reads 11; if both of the present's post-compare reads land in that interval, decide() returns Hit and AMaZE is
+// skipped although the backend state already changed. The fake's after-store hook runs exactly there: the native state
+// has changed and llrawproc_gpu_recon_run_backend has not yet run its next statement. decide() is run from inside it,
+// reading the three process-wide counts the way GpuDisplayWindow's readLiveConfigureCounts does, with a compare that
+// says "equal". Any outcome but recon_configured_since_warm is the race. Clip (set_clip) and LUT (set_luts) alike.
+
+namespace
+{
+
+playback_warm_output_reuse::LiveCounts liveConfigureCountsLikeThePresent()
+{
+    playback_warm_output_reuse::LiveCounts now;
+    now.setClip = llrpGpuPlaybackReconSetClipCount();
+    now.setLuts = llrpGpuPlaybackReconSetLutsCount();
+    now.setPattern = llrpGpuPlaybackReconSetIsoPatternCount();
+    return now;
+}
+
+struct RaceProbe
+{
+    int kind = -1;                      // which fake store runs the decision (0 pattern, 1 clip, 2 luts)
+    int probes = 0;
+    playback_warm_output_reuse::Key warmKey;
+    playback_warm_output_reuse::Reason reason = playback_warm_output_reuse::Reason::None;
+};
+
+RaceProbe g_race;
+
+playback_warm_output_reuse::Key raceWarmKeyFromLiveCounts()
+{
+    playback_warm_output_reuse::Key k;
+    k.valid = true;
+    k.frame = 1;
+    k.width = 4;
+    k.height = 4;
+    k.blackLevel = 100;
+    k.wb[0] = 2.0;
+    k.wb[1] = 1.0;
+    k.wb[2] = 1.5;
+    k.captureId = 7;
+    k.state.valid = true;
+    const playback_warm_output_reuse::LiveCounts c = liveConfigureCountsLikeThePresent();
+    k.setClipCountAfterWarm = c.setClip;
+    k.setLutsCountAfterWarm = c.setLuts;
+    k.setPatternCountAfterWarm = c.setPattern;
+    return k;
+}
+
+playback_warm_output_reuse::Reason decideWithAnEqualCompare(const playback_warm_output_reuse::Key & warmKey)
+{
+    bool attempted = false;
+    return playback_warm_output_reuse::decide(
+        true, true, warmKey, warmKey, false, false, liveConfigureCountsLikeThePresent,
+        [](bool * equal, QString * why)
+        {
+            *equal = true;
+            why->clear();
+            return true;
+        },
+        &attempted);
+}
+
+void raceProbeAfterNativeStore(int kind)
+{
+    if (kind != g_race.kind) return;
+    ++g_race.probes;
+    g_race.reason = decideWithAnEqualCompare(g_race.warmKey);
+}
+
+struct AfterStoreHookScope
+{
+    AfterStoreHookScope() { llrpSetFakeGpuBackendAfterConfigureStoreHookForTesting(raceProbeAfterNativeStore); }
+    ~AfterStoreHookScope()
+    {
+        llrpSetFakeGpuBackendAfterConfigureStoreHookForTesting(nullptr);
+        g_race = RaceProbe();
+    }
+};
+
+// One configure kind: warm on `warmState`, then run `changed` with the decision taken inside the fake's store of `kind`.
+void expectTheDecisionInsideTheNativeStoreIsAMiss(const char * label, int kind, const llrpGpuPlaybackReconState_t & warmState,
+                                                  const llrpGpuPlaybackReconState_t & changed)
+{
+    int ok = 0;
+    (void)configureWorkOf(warmState, &ok);
+    ASSERT_EQ(1, ok);
+    g_race = RaceProbe();
+    g_race.warmKey = raceWarmKeyFromLiveCounts();
+    // not vacuous: with no configure since the warm the same decision is a hit
+    ASSERT_EQ(std::string("hit"), std::string(playback_warm_output_reuse::reasonName(decideWithAnEqualCompare(g_race.warmKey))));
+    g_race.kind = kind;
+    (void)configureWorkOf(changed, &ok);
+    ASSERT_EQ(1, ok);
+    std::printf("[dualiso-configure-cache] r22 race %s: probes=%d reason_inside_native_store=%s\n", label, g_race.probes,
+                playback_warm_output_reuse::reasonName(g_race.reason));
+    ASSERT_EQ(1, g_race.probes);
+    ASSERT_EQ(std::string("recon_configured_since_warm"),
+              std::string(playback_warm_output_reuse::reasonName(g_race.reason)));
+    g_race.kind = -1;
+}
+
+} // namespace
+
+TEST(DualIsoGpuConfigureCache, AReuseDecisionInsideANativePatternStoreIsNeverAHit)
+{
+    FakeBackendScope scope;
+    AfterStoreHookScope hook;
+    llrpGpuPlaybackReconState_t warm = configureState(1);
+    setPattern(warm, 1, 1, 0, 0);
+    llrpGpuPlaybackReconState_t changed = configureState(2);
+    setPattern(changed, 0, 0, 1, 1);   // sol's 1100 -> 0011: a pattern-only configure (set_iso_pattern)
+    expectTheDecisionInsideTheNativeStoreIsAMiss("set_iso_pattern", 0, warm, changed);
+}
+
+TEST(DualIsoGpuConfigureCache, AReuseDecisionInsideANativeClipStoreIsNeverAHit)
+{
+    FakeBackendScope scope;
+    AfterStoreHookScope hook;
+    llrpGpuPlaybackReconState_t changed = configureState(2);
+    changed.black_level = 64;   // a level change: set_clip (then set_luts)
+    expectTheDecisionInsideTheNativeStoreIsAMiss("set_clip", 1, configureState(1), changed);
+}
+
+TEST(DualIsoGpuConfigureCache, AReuseDecisionInsideANativeLutStoreIsNeverAHit)
+{
+    FakeBackendScope scope;
+    AfterStoreHookScope hook;
+    llrpGpuPlaybackReconState_t changed = configureState(2);
+    changed.ev_correction = -2.0;   // a LUT-key-only change: set_luts alone
+    expectTheDecisionInsideTheNativeStoreIsAMiss("set_luts", 2, configureState(1), changed);
 }
