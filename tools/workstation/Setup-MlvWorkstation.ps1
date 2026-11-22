@@ -2983,11 +2983,23 @@ function Get-ImportCredentialSkips {
             elseif (Test-CredentialText $dstText) { $reason = 'host file carries a credential' }
             elseif (($CredentialRoleFiles -contains $f.Name.ToLowerInvariant()) -and ($roleRx.IsMatch($dstText) -or (Test-CredentialNamePresent $dstText))) { $reason = 'host credential-role file names a credential key' }
         }
-        # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 (r4): SourceSide = the reason lies in the BUNDLE file (too large, unreadable, carries a credential), so the copy never writes this
-        # destination whatever the host holds; a host-side reason (the host file is unreadable, carries a credential) is a file the copy WOULD have replaced.
-        if ($reason) { $skips.Add([pscustomobject]@{ Source = $f.FullName; Dest = $dest; Reason = $reason; SourceSide = $reason.StartsWith('bundle file') }) }
+        # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 (r4): NeverReplaced = Import deliberately never writes this destination, whatever its backup holds: the BUNDLE file is excluded (too large,
+        # unreadable, carries a credential) or the host file is one it never replaces (it carries a credential, or it is a credential-role file naming a credential key). The one skip that is
+        # NOT deliberate is a host file whose bytes could not be read: it is a file the copy WOULD have replaced, so the backup gate still judges it.
+        if ($reason) { $skips.Add([pscustomobject]@{ Source = $f.FullName; Dest = $dest; Reason = $reason; NeverReplaced = (-not $reason.StartsWith('host file unreadable')) }) }
     }
     return $skips.ToArray()
+}
+
+# Why a bundle file's bytes are not copied ('' = they are): over the scan limit, or carrying a credential. ONE judgement for Copy-ImportFileLocked and for the backup gate, so the gate
+# never refuses a file the copy would skip anyway (r4: the two used to be judged at different moments).
+function Get-ImportSourceBytesRefusal {
+    param([byte[]]$Bytes, [long]$MaxScanBytes = 26214400)
+    if ($Bytes.Length -gt $MaxScanBytes) { return 'bundle file larger than the scan limit' }
+    $sr = [IO.StreamReader]::new([IO.MemoryStream]::new($Bytes), [Text.Encoding]::UTF8, $true)
+    try { $srcText = $sr.ReadToEnd() } finally { $sr.Dispose() }
+    if (Test-CredentialText $srcText) { return 'bundle file carries a credential' }
+    return ''
 }
 
 # r11 S-B2: would robocopy's rules (the /XO /XN /XC switches the caller passed) replace Dest with Source? newer = Source is newer than Dest (/XN excludes it),
@@ -3011,10 +3023,8 @@ function Copy-ImportFileLocked {
     param([System.IO.FileInfo]$Source, [string]$Dest, [bool]$ExcludeNewer, [bool]$ExcludeOlder, [bool]$ExcludeChanged, [long]$MaxScanBytes = 26214400)
     $bytes = [IO.File]::ReadAllBytes($Source.FullName)
     # r17 pass 19 A5: the size limit is judged on the bytes actually read (a bundle file that grew past it after the inspection is skipped, as the inspection would have)
-    if ($bytes.Length -gt $MaxScanBytes) { return @{ Result = 'source-credential'; Why = 'bundle file larger than the scan limit' } }
-    $sr = [IO.StreamReader]::new([IO.MemoryStream]::new($bytes), [Text.Encoding]::UTF8, $true)
-    try { $srcText = $sr.ReadToEnd() } finally { $sr.Dispose() }
-    if (Test-CredentialText $srcText) { return @{ Result = 'source-credential'; Why = 'bundle file carries a credential' } }
+    $srcWhy = Get-ImportSourceBytesRefusal -Bytes $bytes -MaxScanBytes $MaxScanBytes
+    if ($srcWhy) { return @{ Result = 'source-credential'; Why = $srcWhy } }
     [void][IO.Directory]::CreateDirectory((Split-Path -Parent $Dest))
     $fs = $null
     try {
@@ -3284,8 +3294,8 @@ function Invoke-ImportRobocopy {
     # Test seam: runs between the inspection above and the replace below (the window an editor can save a credential into). Null in every real run.
     if ($script:ImportBeforeReplaceHook) { & $script:ImportBeforeReplaceHook $From $To }
     $skipSet = @{}
-    $srcSkipSet = @{}   # r4: the bundle files Import will not copy at all (the backup gate below has nothing to judge for them)
-    foreach ($s in $skips) { $skipSet[$s.Source.ToLowerInvariant()] = $true; if ($s.SourceSide) { $srcSkipSet[$s.Source.ToLowerInvariant()] = $true } }
+    $neverSet = @{}   # r4: the destinations Import deliberately never writes (Get-ImportCredentialSkips NeverReplaced): the backup gate below has nothing to judge for them
+    foreach ($s in $skips) { $skipSet[$s.Source.ToLowerInvariant()] = $true; if ($s.NeverReplaced) { $neverSet[$s.Source.ToLowerInvariant()] = $true } }
     $n = @{ created = 0; replaced = 0; kept = 0; skipped = 0; failed = 0 }
     $root = $From.TrimEnd('\')
     $stack = [System.Collections.Generic.Stack[string]]::new()
@@ -3313,26 +3323,31 @@ function Invoke-ImportRobocopy {
             # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1: an existing host file that has no pre-import backup is not replaced (it is left byte for byte as it is) and the run fails. It is
             # judged BEFORE the credential skips (a host file whose bytes cannot be read is skipped there, silently) and only when the copy rules WOULD replace it (a file /XO keeps, even a held
             # one, is not a failure). Copy-ImportFileLocked makes the same judgement again under its lock, on the bytes it is about to replace.
-            # r4: a bundle file that is itself excluded from the copy (over the scan limit, unreadable, carrying a credential) replaces nothing, so it has no backup to judge ($srcSkipSet).
-            if (-not $srcSkipSet.ContainsKey($e.FullName.ToLowerInvariant()) -and [IO.File]::Exists($dest)) {
+            # r4: a destination Import deliberately never writes (an excluded bundle file, or a host file it never replaces: $neverSet) has no backup to judge.
+            if (-not $neverSet.ContainsKey($e.FullName.ToLowerInvariant()) -and [IO.File]::Exists($dest)) {
                 $gap = Get-ImportBackupGap -Dest $dest
-                $wouldReplace = $true
-                if ($gap) {
-                    if ($script:ImportAfterHostProbeHook) { & $script:ImportAfterHostProbeHook $dest }   # test seam (null in a real run): the host file goes away right after the existence probe
-                    # r4: ONE FileInfo, Exists read first: a host file that is gone by now is a CREATION (Copy-ImportFileLocked CreateNew), not a replacement; a missing file's timestamp reads
-                    # 1601-01-01 (older than any bundle file) and would otherwise be refused as an unavailable backup. A metadata read that throws is a replacement only while the file is still there.
-                    try {
-                        $di = [IO.FileInfo]::new($dest)
-                        if (-not $di.Exists) { $wouldReplace = $false }
-                        else { $wouldReplace = Test-ImportReplaces -Source $e -Dest $di -ExcludeNewer $exN -ExcludeOlder $exO -ExcludeChanged $exC }
-                    } catch { $wouldReplace = [IO.File]::Exists($dest) }
-                }
+                if ($script:ImportAfterHostProbeHook) { & $script:ImportAfterHostProbeHook $dest }   # test seam (null in a real run): the host file goes away right after the existence probe
+                # r4: ONE FileInfo, Exists read first: a host file that is gone by now is a CREATION (Copy-ImportFileLocked CreateNew), not a replacement; a missing file's timestamp reads
+                # 1601-01-01 (older than any bundle file) and would otherwise be refused as an unavailable backup. A metadata read that throws is a replacement only while the file is still there.
+                $hostGone = $false; $wouldReplace = $true
+                try {
+                    $di = [IO.FileInfo]::new($dest)
+                    if (-not $di.Exists) { $hostGone = $true; $wouldReplace = $false }
+                    elseif ($gap) { $wouldReplace = Test-ImportReplaces -Source $e -Dest $di -ExcludeNewer $exN -ExcludeOlder $exO -ExcludeChanged $exC }
+                } catch { $hostGone = -not [IO.File]::Exists($dest); $wouldReplace = -not $hostGone }
+                # the inspection skipped this file for what the HOST file held (unreadable); that file is gone, so there is nothing left to skip for and the bundle copy is created
+                if ($hostGone) { $inSkipSet = $false }
                 if ($gap -and $wouldReplace) {
-                    $n.skipped++
-                    Write-Log "IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED $dest ($gap, so the host file was left as it is; the bundle copy $($e.FullName) was not applied)" 'ERROR'
-                    $script:ImportSkippedDest.Add($dest)
-                    $script:Failures.Add("IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED $dest")
-                    continue
+                    # a bundle file the copy itself will skip (it grew past the limit, or gained a credential, after the inspection) replaces nothing either: judged on the bytes as they are now
+                    $srcWhy = ''
+                    try { $srcWhy = $(if ($e.Length -gt 26214400) { 'bundle file larger than the scan limit' } else { Get-ImportSourceBytesRefusal -Bytes ([IO.File]::ReadAllBytes($e.FullName)) }) } catch { $srcWhy = '' }
+                    if (-not $srcWhy) {
+                        $n.skipped++
+                        Write-Log "IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED $dest ($gap, so the host file was left as it is; the bundle copy $($e.FullName) was not applied)" 'ERROR'
+                        $script:ImportSkippedDest.Add($dest)
+                        $script:Failures.Add("IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED $dest")
+                        continue
+                    }
                 }
             }
             if ($inSkipSet) { continue }
@@ -3375,16 +3390,47 @@ $script:ImportSkippedDest = [System.Collections.Generic.List[string]]::new()
 $script:ImportBackupProtected = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 $script:ImportBackupHash = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 $script:ImportBackupCredentialSkipped = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-# r4: protected path -> the backup FILE that was written for it. The replace reads that file again under the lock (a stored hash alone does not prove the copy still exists: a backup
-# removed or overwritten after it was made would leave the swap, and the cleanup of its own rollback copy, with no copy of the old bytes anywhere).
-$script:ImportBackupFile = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+# r4: protected path -> a read handle on the backup FILE that was written for it, opened FileShare.Read (nothing else can delete, rename or write it) and held from the moment the backup
+# was written until the copy step ends (Close-ImportBackupHandles). A stored hash alone does not prove the copy still exists: a backup removed after it was made would leave the swap, and
+# the cleanup of its own rollback copy, with no copy of the old bytes anywhere. The replace reads the bytes back through this handle under the host lock.
+$script:ImportBackupHandle = [System.Collections.Generic.Dictionary[string, IO.FileStream]]::new([System.StringComparer]::OrdinalIgnoreCase)
 $script:ImportAfterHostProbeHook = $null   # r4 test seam, called with the host path right after the backup gate's existence probe (always $null in a real run)
+
+function Close-ImportBackupHandles {
+    foreach ($k in @($script:ImportBackupHandle.Keys)) { try { $script:ImportBackupHandle[$k].Dispose() } catch { } }
+    $script:ImportBackupHandle.Clear()
+}
+
+# r4: the path a file REALLY is: every part that is a junction or symbolic link is resolved (GetFullPath only tidies the text), so the backup registries are keyed by the physical host file
+# and a destination reached through a link (a junction under the state root onto ~/.claude) is still the protected file. A part that cannot be resolved stays as written.
+function Get-ImportRealPath {
+    param([string]$Path, [int]$Depth = 0)
+    $full = [IO.Path]::GetFullPath($Path)
+    if ($Depth -gt 8) { return $full }
+    try {
+        $root = [IO.Path]::GetPathRoot($full)
+        $cur = $root
+        foreach ($part in @($full.Substring($root.Length).Split([char[]]@('\', '/'), [StringSplitOptions]::RemoveEmptyEntries))) {
+            $next = Join-Path $cur $part
+            $attr = $null
+            try { $attr = [IO.File]::GetAttributes($next) } catch { $attr = $null }
+            if ($null -ne $attr -and ($attr -band [IO.FileAttributes]::ReparsePoint)) {
+                $t = $null
+                try { $t = $(if ($attr -band [IO.FileAttributes]::Directory) { [IO.DirectoryInfo]::new($next).ResolveLinkTarget($true) } else { [IO.FileInfo]::new($next).ResolveLinkTarget($true) }) } catch { $t = $null }
+                if ($t) { $next = Get-ImportRealPath $t.FullName ($Depth + 1) }
+            }
+            $cur = $next
+        }
+        return $cur
+    } catch { return $full }
+}
 
 # Why a protected host file may not be replaced, or '' when nothing stands in the way (an unprotected path is always ''). Without -HeldBytes (the early check, no lock yet): a protected
 # file with neither a recorded backup nor a credential skip has no backup. With -HeldBytes (the bytes read under the replace's lock): the recorded backup must be of exactly those bytes.
 function Get-ImportBackupGap {
     param([string]$Dest, [byte[]]$HeldBytes = $null)
-    $full = [IO.Path]::GetFullPath($Dest)
+    if ($script:ImportBackupProtected.Count -eq 0) { return '' }
+    $full = Get-ImportRealPath $Dest
     if (-not $script:ImportBackupProtected.Contains($full)) { return '' }
     $has = $script:ImportBackupHash.ContainsKey($full)
     if ($null -eq $HeldBytes) {
@@ -3393,10 +3439,10 @@ function Get-ImportBackupGap {
     }
     if (-not $has) { return 'no pre-import backup of this host file was made' }
     if ($script:ImportBackupHash[$full] -cne (Get-ImportBytesHash $HeldBytes)) { return 'the host file changed after its pre-import backup was made (the backup holds older bytes)' }
-    # r4: the backup file itself must still be there and still hold those bytes (it is read now, under the lock; any read failure fails closed)
-    $bk = $(if ($script:ImportBackupFile.ContainsKey($full)) { $script:ImportBackupFile[$full] } else { '' })
-    if (-not $bk) { return 'the pre-import backup file of this host file is not recorded' }
-    try { $bb = [IO.File]::ReadAllBytes($bk) } catch { return "the pre-import backup file of this host file can no longer be read ($($_.Exception.Message))" }
+    # r4: the backup file itself must still be there and still hold those bytes: it is read now, under the lock, through the handle that has kept it from being deleted since it was written
+    # (any read failure fails closed)
+    if (-not $script:ImportBackupHandle.ContainsKey($full)) { return 'the pre-import backup file of this host file is not held' }
+    try { $bb = Read-ImportHeldBytes $script:ImportBackupHandle[$full] } catch { return "the pre-import backup file of this host file can no longer be read ($($_.Exception.Message))" }
     if ($script:ImportBackupHash[$full] -cne (Get-ImportBytesHash $bb)) { return 'the pre-import backup file of this host file no longer holds the bytes that were backed up' }
     return ''
 }
@@ -3477,17 +3523,25 @@ function Copy-CleanBackupFile {
         $bytes = [IO.File]::ReadAllBytes($Path)
         $sr = [IO.StreamReader]::new([IO.MemoryStream]::new($bytes), [Text.Encoding]::UTF8, $true)
         try { $text = $sr.ReadToEnd() } finally { $sr.Dispose() }
-        if (Test-CredentialText $text) { [void]$script:ImportBackupCredentialSkipped.Add([IO.Path]::GetFullPath($Path)); return $false }
+        if (Test-CredentialText $text) { [void]$script:ImportBackupCredentialSkipped.Add((Get-ImportRealPath $Path)); return $false }
         [void][IO.Directory]::CreateDirectory($DestinationDir)
         # r16 (adversary pass 15 A4 sibling): written through a handle that can also delete it (New-OwnedFileStream), so a failed write takes back exactly this file
         $ws = New-OwnedFileStream -Path $dest -Mode ([IO.FileMode]::Create)
         $ws.Write($bytes, 0, $bytes.Length); $ws.Flush()
         $ws.Dispose(); $ws = $null
         # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 (r3): what was backed up is recorded by its bytes; Import replaces this host file only while it still holds exactly these bytes.
-        $script:ImportBackupHash[[IO.Path]::GetFullPath($Path)] = (Get-ImportBytesHash $bytes)
-        $script:ImportBackupFile[[IO.Path]::GetFullPath($Path)] = [IO.Path]::GetFullPath($dest)
+        # r4: the backup file is held open (FileShare.Read: no delete, rename or write by anyone else) from here until the copy step ends, and what it holds is proven to be the bytes just written
+        $keep = [IO.File]::Open($dest, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        try {
+            if ((Get-ImportBytesHash (Read-ImportHeldBytes $keep)) -cne (Get-ImportBytesHash $bytes)) { throw 'the backup file changed as it was written' }
+        } catch { $keep.Dispose(); throw }
+        $realKey = Get-ImportRealPath $Path
+        $script:ImportBackupHash[$realKey] = (Get-ImportBytesHash $bytes)
+        $script:ImportBackupHandle[$realKey] = $keep
         return $true
     } catch {
+        # r4: the cause is named in the log (a read that failed, a folder at the backup name, a sharing violation), not only the generic IMPORT_BACKUP_FAILED line the caller writes
+        Write-Log "  (backup of $Path failed: $($_.Exception.Message))" 'WARN'
         # r15 (pass 12 A6 sibling): a partly written backup copy is removed and the removal is proven; one that cannot be removed is a typed failure of the run.
         # r16 (adversary pass 15 A4 sibling): removed THROUGH the held handle, never by pathname: a failure before this run opened $dest (an unreadable source) deletes
         # nothing, and a file another process saved at $dest after a release can never be the one deleted.
@@ -3540,11 +3594,14 @@ function Invoke-PhaseImport {
         if (Test-Path -LiteralPath $importSnapshot -PathType Container) { $src = $importSnapshot } else { Write-Log 'IMPORT_SNAPSHOT_FAILED the bundle snapshot could not be made; nothing was imported' 'ERROR'; $script:Failures.Add('IMPORT_SNAPSHOT_FAILED'); return }
     }
     $h = $env:USERPROFILE
+    # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1: no backup, no replace. Both host files are PROTECTED from here (whether or not they exist at this instant); one is replaced only when a
+    # backup of exactly its bytes was written (Copy-CleanBackupFile records it), so a failed backup, a file that comes back later or a save after the backup all leave it alone.
+    # r4: registered BEFORE the backup step, not inside it: a step the owner declines (-Confirm answered No) must leave the files protected, with no backup recorded, so the copy that follows
+    # refuses to replace them instead of finding them unprotected.
+    Close-ImportBackupHandles
+    $script:ImportBackupProtected.Clear(); $script:ImportBackupHash.Clear(); $script:ImportBackupCredentialSkipped.Clear()
+    foreach ($f in 'CLAUDE.md', 'settings.json') { [void]$script:ImportBackupProtected.Add((Get-ImportRealPath (Join-Path "$h\.claude" $f))) }
     Invoke-Step 'Back up existing ~/.claude CLAUDE.md and settings.json' {
-        # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1: no backup, no replace. Both host files are PROTECTED from here (whether or not they exist at this instant); one is replaced only when a
-        # backup of exactly its bytes was written (Copy-CleanBackupFile records it), so a failed backup, a file that comes back later or a save after the backup all leave it alone.
-        $script:ImportBackupProtected.Clear(); $script:ImportBackupHash.Clear(); $script:ImportBackupFile.Clear(); $script:ImportBackupCredentialSkipped.Clear()
-        foreach ($f in 'CLAUDE.md', 'settings.json') { [void]$script:ImportBackupProtected.Add([IO.Path]::GetFullPath((Join-Path "$h\.claude" $f))) }
         $b = Join-Path $StateRoot "backups\home-claude-$stamp"
         try { [void][IO.Directory]::CreateDirectory($b) }
         catch {
@@ -3558,11 +3615,12 @@ function Invoke-PhaseImport {
             # r10 A2: a host file that carries a credential is never copied (the backup would be a second, durable copy of it, and Import
             # never replaces such a file anyway, so there is nothing to roll back). One read: the bytes judged are the bytes written.
             if (-not (Copy-CleanBackupFile -Path $p -DestinationDir $b)) {
-                if ($script:ImportBackupCredentialSkipped.Contains([IO.Path]::GetFullPath($p))) { Write-Log "IMPORT_BACKUP_SKIPPED_CREDENTIAL_FILE $p (it carries a credential; no copy was made)" 'WARN' }
+                if ($script:ImportBackupCredentialSkipped.Contains((Get-ImportRealPath $p))) { Write-Log "IMPORT_BACKUP_SKIPPED_CREDENTIAL_FILE $p (it carries a credential; no copy was made)" 'WARN' }
                 else { Write-Log "IMPORT_BACKUP_FAILED $p (the backup copy could not be written; the host file is not replaced)" 'ERROR' }
             }
         }
     }
+    try {   # r4: the backup handles (Copy-CleanBackupFile) stay open exactly as long as the copy can replace a protected file
     Invoke-Step 'Copy bundle into ~/.claude, ~/bin, ~/.codex, ProgramData\FleetDefender, MLV-App\.claude-state' {
         # Import never touches credentials (adversary A4): the export never stages the credential-shaped names, but a bundle is only a folder, so
         # the same exclusion list is applied on the way IN. A hand-made or tampered bundle cannot overwrite this host's auth.json or
@@ -3592,6 +3650,7 @@ function Invoke-PhaseImport {
         Invoke-ImportRobocopy "$src\project-codex-state\doctrine" "$Repo\.codex-state\doctrine" (@('/E', '/XO') + $inX)
         Invoke-ImportRobocopy "$src\reference" "$StateRoot\reference" (@('/E', '/XO') + $inX)
     }
+    } finally { Close-ImportBackupHandles }
     if ($importSnapshot -and (Test-Path -LiteralPath $importSnapshot)) {
         try { Remove-Item -LiteralPath $importSnapshot -Recurse -Force -ErrorAction Stop } catch { Write-Log "could not remove the import snapshot $importSnapshot : $($_.Exception.Message)" 'WARN' }
     }

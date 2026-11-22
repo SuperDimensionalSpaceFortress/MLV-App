@@ -4106,7 +4106,7 @@ function Invoke-R3Import([string]$Tag, [int]$HostAgeDays, [int]$BundleAgeDays, [
         $script:StateRoot = $sv.S; $StateRoot = $sv.S; $script:BundlePath = $sv.B; $BundlePath = $sv.B; $script:Repo = $sv.R; $Repo = $sv.R; $script:MlvTmp = $sv.T; $MlvTmp = $sv.T
         $script:LogFile = $sv.L; $script:stamp = $sv.P; $stamp = $sv.P; $env:USERPROFILE = $sv.E
     }
-    return @{ Host = [IO.File]::ReadAllText($hostClaude); Failures = @($script:Failures); Out = $out }
+    return @{ Host = $(if (Test-Path -LiteralPath $hostClaude) { [IO.File]::ReadAllText($hostClaude) } else { '<absent>' }); Failures = @($script:Failures); Out = $out }
 }
 if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r3 import backup')) {
     $r3Typed = { param($r) @($r.Failures | Where-Object { $_ -like 'IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED*CLAUDE.md*' }).Count }
@@ -4146,13 +4146,35 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r3 import backup')) {
 # path was refused. The replace now re-reads the backup file under the lock, the gate ignores a source Import will not copy, and a vanished host file is a creation, not a replacement.
 if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r4 import backup')) {
     $r4Typed = { param($r) @($r.Failures | Where-Object { $_ -like 'IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED*CLAUDE.md*' }).Count }
-    # (a) the completed backup is removed after it was made and before the host is locked: the host file is not replaced (no copy of its bytes would survive the swap)
-    $r4a = Invoke-R3Import 'r4a' -3 0 $null { param($From, $To) Remove-Item -LiteralPath (Join-Path $script:StateRoot "backups\home-claude-$($script:stamp)\CLAUDE.md") -Force -ErrorAction SilentlyContinue }
-    Assert-That ($r4a.Host -ceq 'HOST-GOOD-CONTENT') 'r4 import: a host CLAUDE.md whose completed backup disappeared before the replace is NOT replaced (byte-identical)' "host=[$($r4a.Host)]`n$($r4a.Out)"
-    Assert-That ((& $r4Typed $r4a) -eq 1) 'r4 import: that refusal is the typed failure IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED' ($r4a.Failures -join ',')
-    # (a2) the backup file is replaced by other bytes: it no longer holds what was backed up, so the host file is not replaced either
-    $r4a2 = Invoke-R3Import 'r4a2' -3 0 $null { param($From, $To) [IO.File]::WriteAllText((Join-Path $script:StateRoot "backups\home-claude-$($script:stamp)\CLAUDE.md"), 'SOMETHING-ELSE') }
-    Assert-That ($r4a2.Host -ceq 'HOST-GOOD-CONTENT' -and (& $r4Typed $r4a2) -eq 1) 'r4 import: a backup file that no longer holds the backed-up bytes does not license the replace (typed failure, host untouched)' "host=[$($r4a2.Host)] failures=$($r4a2.Failures -join ',')"
+    # (a) a second process tries to delete the completed backup after it was made and before the host is locked. Whatever it manages, a copy of the old host bytes must survive the import: the
+    # host file kept as it was, or the backup still on disk holding them (the backup is held open without delete sharing, so the delete is refused).
+    $r4Survives = { param($r) (($r.Host -ceq 'HOST-GOOD-CONTENT') -or ($script:R4Backup -and (Test-Path -LiteralPath $script:R4Backup) -and ([IO.File]::ReadAllText($script:R4Backup) -ceq 'HOST-GOOD-CONTENT'))) }
+    $script:R4Backup = $null
+    $r4a = Invoke-R3Import 'r4a' -3 0 $null { param($From, $To) $script:R4Backup = Join-Path $script:StateRoot "backups\home-claude-$($script:stamp)\CLAUDE.md"; Remove-Item -LiteralPath $script:R4Backup -Force -ErrorAction SilentlyContinue }
+    Assert-That (& $r4Survives $r4a) 'r4 import: after the backup is deleted behind the import, a copy of the old host CLAUDE.md bytes still exists (the host kept, or the backup that could not be deleted)' "host=[$($r4a.Host)] failures=$($r4a.Failures -join ',')`n$($r4a.Out)"
+    # (a2) the same when the backup file is overwritten with other bytes
+    $script:R4Backup = $null
+    $r4a2 = Invoke-R3Import 'r4a2' -3 0 $null { param($From, $To) $script:R4Backup = Join-Path $script:StateRoot "backups\home-claude-$($script:stamp)\CLAUDE.md"; try { [IO.File]::WriteAllText($script:R4Backup, 'SOMETHING-ELSE') } catch { } }
+    Assert-That (& $r4Survives $r4a2) 'r4 import: after the backup is overwritten behind the import, a copy of the old host CLAUDE.md bytes still exists' "host=[$($r4a2.Host)] failures=$($r4a2.Failures -join ',')"
+    # (a3) the backup step is DECLINED (-Confirm answered No) and the copy step is accepted: the protected host file has no backup, so it is not replaced
+    $r4a3 = Invoke-R3Import 'r4a3' -3 0 {
+        param($st, $sp)
+        $script:R4SaveCmdlet = $script:Cmdlet
+        $stub = [pscustomobject]@{}
+        Add-Member -InputObject $stub -MemberType ScriptMethod -Name ShouldProcess -Value { param($target, $action) -not ($action -like 'Back up existing*') }
+        $script:Cmdlet = $stub
+    } $null { $script:Cmdlet = $script:R4SaveCmdlet }
+    Assert-That ($r4a3.Host -ceq 'HOST-GOOD-CONTENT' -and (& $r4Typed $r4a3) -eq 1) 'r4 import: with the backup step declined, a host CLAUDE.md the bundle would replace is left as it is (typed failure IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED)' "host=[$($r4a3.Host)] failures=$($r4a3.Failures -join ',')"
+    # (a4) the bundle file reaches the host file through a junction (state\reference -> ~/.claude) and the backup could not be made: the physical host file is protected all the same
+    $r4a4 = Invoke-R3Import 'r4a4' -3 0 {
+        param($st, $sp)
+        Remove-Item -LiteralPath (Join-Path $script:BundlePath 'home-claude') -Recurse -Force
+        $rd = Join-Path $script:BundlePath 'reference'; [void][IO.Directory]::CreateDirectory($rd)
+        [IO.File]::WriteAllText((Join-Path $rd 'CLAUDE.md'), 'FROM-BUNDLE')
+        [IO.File]::WriteAllText((Join-Path $st 'backups'), 'not a folder')
+        [void](New-Item -ItemType Junction -Path (Join-Path $st 'reference') -Target (Split-Path -Parent $script:R3HostPath))
+    } $null { try { [IO.Directory]::Delete((Join-Path $script:StateRoot 'reference')) } catch { } }
+    Assert-That ($r4a4.Host -ceq 'HOST-GOOD-CONTENT' -and (& $r4Typed $r4a4) -eq 1) 'r4 import: a host CLAUDE.md reached through a junction is protected like the path itself (not replaced without a backup; typed failure)' "host=[$($r4a4.Host)] failures=$($r4a4.Failures -join ',')`n$($r4a4.Out)"
     # (b) a bundle CLAUDE.md over the scan limit is not copied at all; a directory at the backup name must not turn that skip into a failed backup
     $r4b = Invoke-R3Import 'r4b' -3 0 {
         param($st, $sp)
@@ -4169,6 +4191,35 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r4 import backup')) {
         $script:ImportAfterHostProbeHook = { param($d) if (Test-Path -LiteralPath $d -PathType Leaf) { Move-Item -LiteralPath $d -Destination "$d.aside" } }
     } $null { $script:ImportAfterHostProbeHook = $null; Remove-Item -LiteralPath "$($script:R3HostPath).aside" -Force -ErrorAction SilentlyContinue }
     Assert-That ($r4c.Host -ceq 'FROM-BUNDLE' -and $r4c.Failures.Count -eq 0) 'r4 import: a host CLAUDE.md that vanished between the existence probe and the timestamp read is created from the bundle, not refused as an unavailable backup' "host=[$($r4c.Host)] failures=$($r4c.Failures -join ',')`n$($r4c.Out)"
+    # (d) the same disappearance for a host file the inspection skipped as unreadable (read denied): that skip was for the host file's content, which is gone, so the bundle copy is created
+    $r4d = Invoke-R3Import 'r4d' -3 0 {
+        param($st, $sp)
+        & icacls.exe $script:R3HostPath /deny '*S-1-1-0:(RD)' 2>&1 | Out-Null
+        $script:ImportAfterHostProbeHook = { param($d) if (Test-Path -LiteralPath $d -PathType Leaf) { Move-Item -LiteralPath $d -Destination "$d.aside" } }
+    } $null {
+        $script:ImportAfterHostProbeHook = $null
+        & icacls.exe "$($script:R3HostPath).aside" /remove:d '*S-1-1-0' 2>&1 | Out-Null
+        Remove-Item -LiteralPath "$($script:R3HostPath).aside" -Force -ErrorAction SilentlyContinue
+    }
+    Assert-That ($r4d.Host -ceq 'FROM-BUNDLE' -and $r4d.Failures.Count -eq 0) 'r4 import: a read-denied host CLAUDE.md that vanished before the replace is created from the bundle (the skip for its unreadable content no longer applies)' "host=[$($r4d.Host)] failures=$($r4d.Failures -join ',')`n$($r4d.Out)"
+    # (e) a bundle CLAUDE.md that grows past the scan limit AFTER the inspection (before the copy) is skipped by the copy; it is not a failed backup
+    $r4e = Invoke-R3Import 'r4e' -3 0 { param($st, $sp) [void][IO.Directory]::CreateDirectory((Join-Path $st "backups\home-claude-$sp\CLAUDE.md")) } {
+        param($From, $To)
+        $f = Join-Path $From 'CLAUDE.md'
+        if (Test-Path -LiteralPath $f -PathType Leaf) { $big = [byte[]]::new(26214401); [Array]::Fill($big, [byte]97); [IO.File]::WriteAllBytes($f, $big); (Get-Item -LiteralPath $f).LastWriteTimeUtc = [DateTime]::UtcNow }
+    }
+    Assert-That ($r4e.Host -ceq 'HOST-GOOD-CONTENT' -and (& $r4Typed $r4e) -eq 0) 'r4 import: a bundle file that grew past the scan limit after the inspection is skipped by the copy, not refused as a failed backup' "host length=$($r4e.Host.Length) failures=$($r4e.Failures -join ',')"
+    # (f) a host settings.json that the role rule keeps unconditionally (it names a credential key) is not a failed backup when its backup could not be written: it was never going to be replaced
+    $script:R4Settings = $null
+    $r4f = Invoke-R3Import 'r4f' -3 0 {
+        param($st, $sp)
+        $hs = Join-Path (Split-Path -Parent $script:R3HostPath) 'settings.json'
+        [IO.File]::WriteAllText($hs, '{"api.key":""}'); (Get-Item -LiteralPath $hs).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-3)
+        $bs = Join-Path $script:BundlePath 'home-claude\settings.json'
+        [IO.File]::WriteAllText($bs, '{"theme":"light"}')
+        [void][IO.Directory]::CreateDirectory((Join-Path $st "backups\home-claude-$sp\settings.json"))
+    } $null { $script:R4Settings = [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $script:R3HostPath) 'settings.json')) }
+    Assert-That ($script:R4Settings -ceq '{"api.key":""}' -and @($r4f.Failures | Where-Object { $_ -like 'IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED*settings.json*' }).Count -eq 0) 'r4 import: a role-file skip of the host settings.json is kept (host untouched) and is not turned into a failed backup' "settings=[$($script:R4Settings)] failures=$($r4f.Failures -join ',')`n$($r4f.Out)"
 }
 
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
