@@ -2433,6 +2433,25 @@ $r = Request-VenueClaim -Venue bachelor -RunDir 'run-A' -Purpose 'P' -UseTicket 
         past = (ended - deadline).total_seconds()
         self.assertLess(past, 1.0, f"the batch ended {past:.2f} s past -DeadlineUtc: a poll sleep that no longer fit was started after the stranded retry:\n{self.batch_log(p)}")
 
+    def test_tail1_r2_pass10_a3_a_batch_ticket_calls_worker_start_up_is_inside_its_five_second_bound(self) -> None:
+        # pass 10 A3 / r9 A6 (pre-existing): Invoke-BatchTicketCall gave the worker 5 s from AFTER its start-up, so a 3 s start-up (the module's test delay) made 8 s. One stopwatch started before the worker now ends the call at 5 s.
+        # The function is lifted from the real script by its AST (the script cannot be dot-sourced).
+        script = f"""
+$ast = [Management.Automation.Language.Parser]::ParseFile('{LEASE_RUNNER}', [ref]$null, [ref]$null)
+$fn = $ast.Find({{ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Invoke-BatchTicketCall' }}, $true)
+Invoke-Expression $fn.Extent.Text
+$deadline = [DateTime]::UtcNow.AddSeconds(120); $here = '{DV}'
+& (Get-Module VenueChain) {{ $script:VenueTestPreWaitDelayMs = 3000 }}
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$r = Invoke-BatchTicketCall 'Start-Sleep -Seconds 20; ''x''' @{{ }}
+$json = [pscustomobject]@{{ elapsed = $sw.Elapsed.TotalSeconds; answered = [bool]$r.answered }} | ConvertTo-Json -Compress
+[Console]::Out.WriteLine($json)
+& (Get-Module VenueChain) {{ Complete-VenueProcess -ExitCode 0 }}
+"""
+        r = self.ps(script)
+        self.assertFalse(r["answered"], r)
+        self.assertLess(r["elapsed"], 6.5, f"the ticket call took {r['elapsed']:.1f} s: the worker's 3 s start-up was added to its 5 s bound (8 s): {r}")
+
     def give_back_scenario(self, name: str, release_seam: str, env: dict) -> dict:
         # the A7 line-up (B takes the claim as head while A is in cooldown, A flips to waiting while B holds it, so B must give the claim back), with ONE seam inside the give-back
         from unittest import mock
