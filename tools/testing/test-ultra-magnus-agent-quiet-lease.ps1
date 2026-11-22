@@ -6787,6 +6787,16 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $o['a3Control'] = & $run 7410 @{ rows = @((New-FcProc 7410 1 0), (New-FcProc 7411 7410 1), (New-FcProc 7412 7411 2)) } @{} $false
             # the null-start row with NO children is only listed (it reads as not existing), nothing is unverifiable.
             $o['a3Leaf'] = & $run 7420 @{ rows = @((New-FcProc 7420 1 0), (New-FcProc 7421 7420 $null)) } @{} $false
+            # adversary pass 9 A3 (the same class as A1: every supplementary read that errors fails closed): the full read streams the child 4601 (parent 4600) and
+            # errors; the one root-row read streams the recorded root row and THEN errors. The error is not hidden by the row that came before it.
+            $o['g6RowThenError'] = & $run 4600 @{ rows = @((New-FcProc 4601 4600 41)); err = 'write' } @{ 'ProcessId=4600' = @(@{ rows = @(New-FcProc 4600 1 0); err = 'write' }) } $false
+            # adversary pass 9 A4: the post-exit UNVERIFIED line is recovered into the receipt when the err-file append is refused (the helper reads .unverified).
+            . ([scriptblock]::Create((Get-FunctionBody 'Get-LostJobDiagnostics')))
+            $ldWalk = [pscustomobject]@{ ok = $true; partial = $false; rows = 3; why = $null; rootPid = 7400; skipped = @(); unverified = @(7402) }
+            $o['lostUnverified'] = [pscustomobject]@{
+                lost = @(Get-LostJobDiagnostics -Stderr 'worker finished' -CaptureDrainFailure $null -PostExitWalk $ldWalk)
+                kept = @(Get-LostJobDiagnostics -Stderr "worker finished`npost-exit descendant census UNVERIFIED pids=7402 (their parent row has no readable creation time)`n" -CaptureDrainFailure $null -PostExitWalk $ldWalk).Count
+            }
             $o
         }
         $fcTxt = $fcOut | ConvertTo-Json -Depth 6 -Compress
@@ -6810,6 +6820,12 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True ($a3c.ids -eq '7412,7411' -and $a3c.unverified -eq '') "cim-walk-fail-closed: (A3 control) a parent row WITH a readable start passes its children: $fcTxt"
         $a3l = $fcOut['a3Leaf']
         Assert-True ($a3l.ids -eq '7421' -and $a3l.existing -eq '' -and $a3l.unverified -eq '') "cim-walk-fail-closed: (A3 control) a null-start row with no children is only listed as not existing; nothing is unverifiable: $fcTxt"
+        $g6x = $fcOut['g6RowThenError']
+        Assert-True ($g6x.ids -eq '' -and $g6x.ok -eq $false -and $g6x.why.Contains('the root row read failed') -and $g6x.why.Contains('children not walked')) "cim-walk-fail-closed: (pass 9 A3) the root-row read streams the recorded root row and THEN errors: the root is unverifiable and the child 4601 is NOT emitted (an error is never hidden by a row that came before it): $fcTxt"
+        $lu = $fcOut['lostUnverified']
+        Assert-True (@($lu.lost).Count -eq 1 -and $lu.lost[0] -match 'UNVERIFIED pids=7402' -and $lu.lost[0].Contains('could not be written') -and $lu.kept -eq 0) "cim-walk-fail-closed: (pass 9 A4) an UNVERIFIED census line the err file refused is recovered into the receipt (and not repeated when it was written): $fcTxt"
+        # pass 9 A6: the census line must not claim a descendant was "not targeted" when one already tracked during the run is still stopped.
+        Assert-True ($code -notmatch 'census UNVERIFIED pids=[^"]*not targeted for stop') "cim-walk-fail-closed: (pass 9 A6) the post-exit UNVERIFIED line does not say the rows were 'not targeted for stop' (a descendant tracked in an earlier slice is still stopped)"
         $results.cimWalkFailClosed = $fcOut
     }
     # The same comparison on a LIVE tree (real Get-CimInstance, real processes): cmd.exe -> cmd.exe -> ping.exe. The legacy walk is reproduced

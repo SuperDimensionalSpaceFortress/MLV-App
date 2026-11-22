@@ -826,8 +826,9 @@ function Get-DescendantProcessIdentities {
                     }
                 }
                 catch { $rrError = ([string]$_.Exception.Message) -replace '\s*[\r\n]+\s*', ' ' }
-                # a row streamed before the error is a row read; an error with no row read is an unreadable root
-                if ($null -ne $rrError -and -not $hasRootRow) { $rootUnverifiable = "the root row read failed: $rrError" }
+                # r7 (adversary pass 9 A3, the class of opus r6 A1): ANY error of this read leaves the root unverifiable, a row streamed before the error
+                # included (r5 counted that row as "read"): an error is never hidden by a row that came before it, as for the fallback reads above.
+                if ($null -ne $rrError) { $rootUnverifiable = "the root row read failed: $rrError" }
             }
         }
     }
@@ -1238,6 +1239,14 @@ function Get-LostJobDiagnostics {
         }
     }
     $skippedRows = if ($null -ne $PostExitWalk) { @($PostExitWalk.skipped | Where-Object { $null -ne $_ }) } else { @() }
+    # r7 (adversary pass 9 A4): the UNVERIFIED line (children of a row with no readable creation time) is recovered like the other two.
+    $unverifiedRows = if ($null -ne $PostExitWalk) { @($PostExitWalk.unverified | Where-Object { $null -ne $_ }) } else { @() }
+    if ($unverifiedRows.Count -gt 0) {
+        $unverifiedList = $unverifiedRows -join ','
+        if ($text -cnotmatch ('(?m)^post-exit descendant census UNVERIFIED pids=' + [regex]::Escape($unverifiedList) + ' \(')) {
+            $lost.Add("post-exit descendant census UNVERIFIED pids=$unverifiedList (their parent row has no readable creation time, so their ancestry cannot be checked: this census did not target them, and they are still running if they exist; this line could not be written to the job's err file)")
+        }
+    }
     if ($skippedRows.Count -gt 0) {
         $skippedList = $skippedRows -join ','
         if ($text -cnotmatch ('(?m)^post-exit descendant census SKIPPED pids=' + [regex]::Escape($skippedList) + ' \(')) {
@@ -5342,7 +5351,7 @@ function Invoke-QueuedJob {
                         Add-Content -Encoding ASCII -LiteralPath $errFile
                 }
                 if (@($postExitWalk.unverified).Count -gt 0) {
-                    "post-exit descendant census UNVERIFIED pids=$(@($postExitWalk.unverified) -join ',') (their parent row has no readable creation time, so their ancestry cannot be checked: not targeted for stop, and still running if they exist)" |
+                    "post-exit descendant census UNVERIFIED pids=$(@($postExitWalk.unverified) -join ',') (their parent row has no readable creation time, so their ancestry cannot be checked: this census did not target them, and they are still running if they exist)" |
                         Add-Content -Encoding ASCII -LiteralPath $errFile
                 }
                 if (@($postExitWalk.skipped).Count -gt 0) {
