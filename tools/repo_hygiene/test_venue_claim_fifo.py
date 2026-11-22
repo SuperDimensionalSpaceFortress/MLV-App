@@ -2071,7 +2071,7 @@ $hold.Dispose()
 [pscustomobject]@{ held = $true; sawRelease = ($null -ne $entry); closedAfterMs = [int]$sw.Elapsed.TotalMilliseconds } | ConvertTo-Json -Compress
 """
 
-    def late_grant_scenario(self, hold: bool, deadline_sec: float = 20.0, release_seam: bool = False, observe_close_ms: int = 0, slow_full_call_ms: int = 0, stall_sec: int = 0, ambient_defaults: str = "") -> dict:
+    def late_grant_scenario(self, hold: bool, deadline_sec: float = 20.0, release_seam: bool = False, observe_close_ms: int = 0, slow_full_call_ms: int = 0, stall_sec: int = 0, ambient_defaults: str = "", stall_full_only: bool = False) -> dict:
         # A real lease batch whose claim is GRANTED AFTER -DeadlineUtc: a copy of VenueChain.psm1 keeps the granted claim standing until 0.2 s past the deadline (the seam, nothing else changed), so the
         # batch takes the late-grant branch. With hold=True a reader (FileShare.Read, no Delete) holds the claim file from the grant until the batch has logged what it did, so every release is refused (BUSY).
         import shutil
@@ -2094,7 +2094,8 @@ $hold.Dispose()
         elif stall_sec:
             # VENUE-FIFO-ADVERSARY-TAIL-1 (pass 11 A1, Grok G15/A1b): EVERY Release-VenueClaim call (the full ones and the final probe) never returns inside the test's window: it sleeps stall_sec and answers BUSY.
             self.assertEqual(text.count(rel_anchor), 1, "release seam anchor moved")
-            text = text.replace(rel_anchor, "    if ($env:SEAM_RELEASE_LOG) { " + log_call + "; Start-Sleep -Seconds %d; return 'BUSY' }\n" % stall_sec + rel_anchor)
+            stall_guard = "if ($MaxAttempts -gt 1) { Start-Sleep -Seconds %d }" % stall_sec if stall_full_only else "Start-Sleep -Seconds %d" % stall_sec   # pass 3 A3: only the FULL calls stall; the single-open probe answers BUSY at once
+            text = text.replace(rel_anchor, "    if ($env:SEAM_RELEASE_LOG) { " + log_call + "; " + stall_guard + "; return 'BUSY' }\n" + rel_anchor)
             env["SEAM_RELEASE_LOG"] = str(self.case / "release-calls.log")
         elif observe_close_ms:
             # r11 B2: the same log line at the start of every Release-VenueClaim call. Nothing else changed (the call runs as it ships), unless slow_full_call_ms is given (r11 pass 1 A1): then a FULL call
@@ -2384,6 +2385,57 @@ $r = Invoke-VenueLateRelease -Venue bachelor -Nonce 'n' -ClaimDir $d -BoundSec 0
         full = [c for c in r["calls"][:-1]]
         self.assertTrue(full and all(c.startswith("5/") and float(c.split("/")[1]) <= 0.75 + 1.5 + 1e-9 for c in full), f"a full call was given more than the bound plus its cap, or is not a full call: {r}")
 
+    def test_tail1_r2_pass3_a1_the_late_release_seams_cannot_be_replaced_by_a_callers_ambient_defaults(self) -> None:
+        # pass 3 A1: the test seams of Invoke-VenueLateRelease (-Call, -Clock, -Sleep) were left to $PSDefaultParameterValues, so a default -Call { 'RELEASED' } reported a claim let go that was never opened. They are bound to $null.
+        # Every release call stalls (the seam); the ambient default claims RELEASED: the batch must still say the claim was NOT released.
+        amb = "$PSDefaultParameterValues['Invoke-VenueLateRelease:Call'] = { param([int]$MaxAttempts, [double]$TimeoutSec) 'RELEASED' }"
+        r = self.late_grant_scenario(hold=False, stall_sec=25, ambient_defaults=amb)
+        text = r["log"] + "\n" + r["out"]
+        self.assertIn("CLAIM_LATE_GRANT_NOT_RELEASED", text, f"an ambient default -Call replaced the release and the batch said the claim was let go:\n{text}")
+
+    def test_tail1_r2_pass3_a3_a_late_release_where_the_full_call_did_not_answer_never_writes_batch_log_even_when_the_probe_did(self) -> None:
+        # pass 3 A3: the probe's BUSY overwrote the full call's NO_ANSWER, so the suppression stayed off and batch.log (on the share that stopped answering) was probed. Only the FULL calls stall; the probe answers BUSY at once.
+        r = self.late_grant_scenario(hold=False, stall_sec=25, stall_full_only=True)
+        self.assertNotIn("CLAIM_LATE_GRANT_NOT_RELEASED", r["log"], f"batch.log was written after a release whose full call never answered:\n{r['log']}")
+        self.assertIn("CLAIM_LATE_GRANT_NOT_RELEASED", r["out"], f"the line did not reach stderr/stdout:\n{r['out']}")
+
+    def test_tail1_r2_pass3_a2_a_bounded_read_whose_end_has_passed_starts_no_worker(self) -> None:
+        # pass 3 A2: BeginInvoke submitted the worker before the expired wait was computed, so a call with its end already past (a cap of 0, a descheduled caller) still ran the release or the create. Nothing is sent now.
+        mark = self.case / "bounded-read-mark.txt"
+        r = self.ps(f"""
+& (Get-Module VenueChain) {{ $script:VenueTestPreWaitDelayMs = 500 }}   # the worker the old code submitted had half a second to run before it was abandoned
+$clock = [Diagnostics.Stopwatch]::StartNew(); Start-Sleep -Milliseconds 300
+$w = & (Get-Module VenueChain) {{ param($c) Invoke-VenueBoundedRead -ScriptText 'param($a) [IO.File]::WriteAllText($a, ''ran'')' -Argument '{mark}' -TimeoutSec 5 -Clock $c -EndSec 0.1 }} $clock
+Start-Sleep -Milliseconds 800
+[pscustomobject]@{{ answered = [bool]$w.answered; ran = (Test-Path -LiteralPath '{mark}') }} | ConvertTo-Json -Compress
+""")
+        self.assertEqual((r["answered"], r["ran"]), (False, False), f"a worker was started for a call whose end had passed: {r}")
+
+    def test_tail1_r2_pass3_a3_the_late_release_result_says_when_any_call_did_not_answer(self) -> None:
+        r = self.ps("""
+$call = { param([int]$MaxAttempts, [double]$TimeoutSec); if ($MaxAttempts -gt 1) { return 'NO_ANSWER' }; return 'BUSY' }
+$r = Invoke-VenueLateRelease -Venue bachelor -Nonce 'n' -ClaimDir $d -BoundSec 0.1 -Call $call
+[pscustomobject]@{ answer = [string]$r.answer; any = [bool]$r.anyUnanswered } | ConvertTo-Json -Compress
+""")
+        self.assertEqual((r["answer"], r["any"]), ("BUSY", True), r)
+
+    def test_tail1_r2_pass3_a6_the_chain_lets_go_of_a_pending_claim_before_it_drops_the_ticket(self) -> None:
+        # pass 3 A6: Close-LegTicket removed the ticket and cleared the object, so the nonce kept on it for a claim a give-back could not let go of was lost, and the claim stood behind a live pid. Lifted from the real script by its AST.
+        r = self.ps(f"""
+$ast = [Management.Automation.Language.Parser]::ParseFile('{RUNNER}', [ref]$null, [ref]$null)
+$fn = $ast.Find({{ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Close-LegTicket' }}, $true)
+Invoke-Expression $fn.Extent.Text
+function L([string]$m) {{ }}
+$Venue = 'bachelor'; $ClaimDir = $d; $TicketKeepMax = 2
+$g = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$script:ticket = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$script:ticket | Add-Member -NotePropertyName pendingReleaseNonce -NotePropertyValue ([string]$g.claim.nonce) -Force
+$script:ticketKeeps = 0
+Close-LegTicket 'leg-1' 'TICKET_ENDED' 'test'
+[pscustomobject]@{{ claimLeft = (Test-Path -LiteralPath (Join-Path $d 'bachelor.claim.json')); ticketCleared = ($null -eq $script:ticket) }} | ConvertTo-Json -Compress
+""")
+        self.assertEqual((r["claimLeft"], r["ticketCleared"]), (False, True), f"the pending claim was left standing when the chain dropped its ticket: {r}")
+
     LOCK_BUDGET_SCRIPT = """
 # a slow directory check (400 ms, the seam) inside Enter-VenueTicketLock with a 200 ms timeout: the budget is spent before the first open, so no open starts (the seam writes the mark at every open attempt)
 $env:SEAM_LOCKTRY = '@@MARK@@'
@@ -2467,7 +2519,7 @@ $json = [pscustomobject]@{{ elapsed = $sw.Elapsed.TotalSeconds; answered = [bool
         r = self.ps("""
 $old = [DateTime]::UtcNow.AddSeconds(-600)
 $out = [ordered]@{}
-foreach ($bad in @('NaN', 'Infinity', '-Infinity', '0')) {
+foreach ($bad in @('NaN', 'Infinity', '-Infinity', '0', '1e20', '2147483648', '86401')) {   # pass 3 A7: a lifetime over a day (the writers allow 1..86400) overflows the refresh's Int32 conversion
   $t = New-VenueTicket -Venue bachelor -RunDir ('run-' + $bad) -ClaimDir $d -NowUtc $old -StaleAfterSec 90
   $j = Get-Content -LiteralPath $t.path -Raw | ConvertFrom-Json
   $j.staleAfterSec = $bad
@@ -2492,6 +2544,15 @@ $out | ConvertTo-Json -Compress
 
     @staticmethod
     def give_back_pairs(release_seam: str) -> tuple:
+        brk = "                    if ($back -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { break }\n"
+        deny = ("            [IO.File]::Delete($Path)   # allowed while our handle is open because it shares Delete; the name is gone once the handle closes\n",
+                "            if ($env:SEAM_DENY_DELETE) { throw 'Access to the path is denied (seam)' }\n            [IO.File]::Delete($Path)   # allowed while our handle is open because it shares Delete; the name is gone once the handle closes\n")
+        if release_seam == "reapall":
+            # pass 3 A5: every ticket file is gone after the release, as an unreadable folder looks to the listing (it swallows the error and answers no rows)
+            return ((brk, "                    if ($env:SEAM_REAP_ALL -and $back -ceq 'RELEASED') { Get-ChildItem -LiteralPath (Split-Path -Parent $t.path) -Filter '*.ticket.json' | Remove-Item -Force }\n" + brk),)
+        if release_seam == "denyreap":
+            # pass 3 A4: the five give-backs all fail (the delete is refused) and B's own ticket is reaped inside them
+            return (deny, (brk, "                    if ($env:SEAM_REAP_IN_LOOP) { Remove-Item -LiteralPath $t.path -Force -ErrorAction SilentlyContinue }\n" + brk))
         if release_seam == "reap":
             return (("                    if ($back -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { break }\n",
                      "                    if ($env:SEAM_REAP_AFTER_RELEASE -and $back -ceq 'RELEASED') { Remove-Item -LiteralPath $t.path -Force }\n                    if ($back -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { break }\n"),)
@@ -2505,6 +2566,18 @@ $out | ConvertTo-Json -Compress
         self.assertEqual((r["state"], r["granted"]), ("QUEUED", False), r)
         self.assertEqual((r["queueCount"], r["position"]), (1, 0), f"the give-back returned the census made before the release: {r}")
         self.assertFalse(r["claimExists"], f"the claim B gave back is still standing: {r}")
+
+    def test_tail1_r2_pass3_a4_a_give_back_that_could_not_let_go_returns_the_census_read_after_its_tries(self) -> None:
+        # pass 3 A4: the released case read the census again, the five-BUSY case still returned the one made before the tries (1.5 s of sleeps, in which B's own ticket was reaped)
+        r = self.give_back_scenario("p3a4", "denyreap", {"SEAM_DENY_DELETE": "1", "SEAM_REAP_IN_LOOP": "1"})
+        self.assertEqual((r["state"], r["granted"]), ("QUEUED", False), r)
+        self.assertEqual((r["queueCount"], r["position"]), (1, 0), f"the five-BUSY give-back returned the census made before its tries: {r}")
+
+    def test_tail1_r2_pass3_a5_an_empty_census_after_the_release_is_a_failed_read_and_keeps_the_earlier_one(self) -> None:
+        # pass 3 A5: the listing swallows an unreadable folder and answers no rows; A was just seen in the line, so "no rows" is not the truth, and it must not become an empty queue with position 0
+        r = self.give_back_scenario("p3a5", "reapall", {"SEAM_REAP_ALL": "1"})
+        self.assertEqual((r["state"], r["granted"]), ("QUEUED", False), r)
+        self.assertGreaterEqual(r["queueCount"], 1, f"an empty read replaced the census: {r}")
 
     def test_tail1_r2_a10_a_give_back_whose_delete_is_refused_does_not_hand_the_claim_to_a_caller_that_is_not_the_head(self) -> None:
         # r1 adversary A10 (pre-existing): a Release-VenueClaim that THROWS (File.Delete refused) left the give-back through the outer catch and the grant was returned as TAKEN to B although the older A is ready. It counts
