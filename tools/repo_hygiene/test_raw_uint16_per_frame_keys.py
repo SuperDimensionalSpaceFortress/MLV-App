@@ -61,6 +61,219 @@ def _statement_containing(text: str, marker: str, opener: str) -> str:
     return text[start:_statement_end(text, start) + 1]
 
 
+_TRUE, _FALSE, _UNKNOWN = "true", "false", "unknown"
+# Bare qmake scope names that are never active on macOS. Any other name besides macx stays UNKNOWN (never counts as live).
+_QMAKE_NON_MACOS_SCOPES = frozenset((
+    "win32", "win32-g++", "win32-msvc*", "linux", "linux-g++", "linux-g++*", "linux-g++-64", "android", "ios"))
+_QMAKE_TRACKED_VARS = ("QMAKE_CFLAGS", "QMAKE_LFLAGS", "LIBS")
+_OPENMP_LINK_TOKENS = ("-lomp", "-lgomp", "-llibgomp-1")
+_QT_ARCH_ATOM = r"(?:equals|contains)\(\s*QT_ARCH\s*,\s*([A-Za-z0-9_]+)\s*\)"
+_QMAKE_ASSIGNMENT = re.compile(
+    r"^(?P<cond>(?:[^=]*?:)?)\s*(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*(?P<op>\+=|-=|\*=|~=|=)\s*(?P<value>.*)$")
+
+
+def _qmake_logical_text(pro_text: str) -> str:
+    """The .pro text qmake actually reads: comments dropped (a `#` runs to the end of its line), then each
+    backslash-newline continuation joined into one logical line."""
+    logical = []
+    carry = ""
+    for physical in pro_text.splitlines():
+        line = physical.split("#", 1)[0].rstrip()
+        if line.endswith("\\"):
+            carry += line[:-1] + " "
+            continue
+        logical.append(carry + line)
+        carry = ""
+    if carry:
+        logical.append(carry)
+    return "\n".join(logical)
+
+
+def _qmake_split_top(text: str, separators: str) -> "list[str]":
+    """Split at the given characters, but only outside parentheses (CONFIG(debug, debug|release) stays whole)."""
+    parts = []
+    depth = 0
+    start = 0
+    for index, char in enumerate(text):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char in separators and depth == 0:
+            parts.append(text[start:index])
+            start = index + 1
+    parts.append(text[start:])
+    return [part.strip() for part in parts]
+
+
+def _qmake_atom_state(atom: str, arch: str) -> str:
+    negated = atom.startswith("!")
+    atom = atom.lstrip("!").strip()
+    arch_match = re.fullmatch(_QT_ARCH_ATOM, atom)
+    if arch_match:
+        state = _TRUE if arch_match.group(1) == arch else _FALSE
+    elif atom == "macx":
+        state = _TRUE
+    elif atom in _QMAKE_NON_MACOS_SCOPES:
+        state = _FALSE
+    else:
+        state = _UNKNOWN
+    if negated and state != _UNKNOWN:
+        state = _FALSE if state == _TRUE else _TRUE
+    return state
+
+
+def _qmake_and(states: "list[str]") -> str:
+    if _FALSE in states:
+        return _FALSE
+    return _UNKNOWN if _UNKNOWN in states else _TRUE
+
+
+def _qmake_condition_state(condition: str, arch: str) -> str:
+    """Whether a scope header or single-line prefix is active on macOS with QT_ARCH=arch. `:` is AND, `|` is OR; a
+    header mixing both, `else`, CONFIG(...) and any scope name not listed above stay UNKNOWN."""
+    if not condition:
+        return _TRUE
+    alternatives = _qmake_split_top(condition, "|")
+    conjuncts = _qmake_split_top(condition, ":")
+    if len(alternatives) > 1 and len(conjuncts) > 1:
+        return _UNKNOWN
+    if len(alternatives) > 1:
+        states = [_qmake_atom_state(alternative, arch) for alternative in alternatives]
+        if _TRUE in states:
+            return _TRUE
+        return _UNKNOWN if _UNKNOWN in states else _FALSE
+    return _qmake_and([_qmake_atom_state(conjunct, arch) for conjunct in conjuncts])
+
+
+def _qmake_effective_flags(pro_text: str, arch: str) -> "dict[str, list[str]]":
+    """Effective tokens of QMAKE_CFLAGS, QMAKE_LFLAGS and LIBS for a macOS build with QT_ARCH=arch, simulated in file
+    order. An addition counts only where every enclosing condition is certainly true; a removal or reassignment applies
+    wherever its condition is true OR unknown, so the answer can only err toward reporting a lost flag."""
+    values: "dict[str, list[str]]" = {name: [] for name in _QMAKE_TRACKED_VARS}
+
+    def apply(statement: str, scope_state: str) -> None:
+        match = _QMAKE_ASSIGNMENT.match(statement)
+        if not match:
+            return
+        state = _qmake_and([scope_state, _qmake_condition_state(match.group("cond").rstrip(":").strip(), arch)])
+        variable = match.group("var")
+        if variable not in values or state == _FALSE:
+            return
+        tokens = []
+        for token in match.group("value").split():
+            reference = re.fullmatch(r"\$\$\{?([A-Za-z0-9_]+)\}?", token)
+            tokens.extend(values[reference.group(1)] if reference and reference.group(1) in values else [token])
+        operator = match.group("op")
+        if operator in ("+=", "*="):
+            if state == _TRUE:
+                values[variable].extend(tokens)
+        elif operator == "-=":
+            values[variable] = [token for token in values[variable] if token not in tokens]
+        else:
+            values[variable] = tokens if operator == "=" and state == _TRUE else []
+
+    scopes: "list[str]" = []
+    buffer = ""
+    in_reference = False
+
+    def flush() -> None:
+        nonlocal buffer
+        statement = buffer.strip()
+        buffer = ""
+        if statement:
+            apply(statement, scopes[-1] if scopes else _TRUE)
+
+    for char in _qmake_logical_text(pro_text):
+        if in_reference:
+            buffer += char
+            in_reference = char != "}"
+        elif char == "{" and buffer.endswith("$$"):
+            buffer += char
+            in_reference = True
+        elif char == "{":
+            own = _qmake_condition_state(buffer.strip(), arch)
+            buffer = ""
+            scopes.append(_qmake_and([scopes[-1] if scopes else _TRUE, own]))
+        elif char == "}":
+            flush()
+            if not scopes:
+                raise AssertionError("unbalanced '}' in qmake text")
+            scopes.pop()
+        elif char == "\n":
+            flush()
+        else:
+            buffer += char
+    flush()
+    if scopes:
+        raise AssertionError("unterminated qmake scope")
+    return values
+
+
+def _macos_openmp_gaps(pro_text: str, arch: str) -> "list[str]":
+    """The OpenMP flags a macOS QT_ARCH=arch build of this .pro would NOT get: the C compile flag and the link flag."""
+    values = _qmake_effective_flags(pro_text, arch)
+    gaps = []
+    if "-fopenmp" not in values["QMAKE_CFLAGS"]:
+        gaps.append("C compile lacks -fopenmp")
+    if "-fopenmp" not in values["QMAKE_LFLAGS"] and not any(token in values["LIBS"] for token in _OPENMP_LINK_TOKENS):
+        gaps.append("link line lacks OpenMP (-fopenmp in QMAKE_LFLAGS or -lomp/-lgomp in LIBS)")
+    return gaps
+
+
+_MACX_PIN_TEMPLATE = """\
+macx {
+    QMAKE_CFLAGS += -std=c99
+    equals(QT_ARCH, x86_64) {
+        QMAKE_CFLAGS += -fopenmp
+        LIBS += -L/usr/local/opt/llvm/lib -lomp
+    }
+%(arm64)s
+}
+%(tail)s
+"""
+_ARM64_LIVE = "    equals(QT_ARCH, arm64) {\n        QMAKE_CFLAGS += -fopenmp\n        LIBS += -L/opt/homebrew/opt/llvm/lib -lomp\n    }"
+_BOTH_GAPS = ["C compile lacks -fopenmp", "link line lacks OpenMP (-fopenmp in QMAKE_LFLAGS or -lomp/-lgomp in LIBS)"]
+_COMPILE_GAP, _LINK_GAP = _BOTH_GAPS
+
+
+def _arm64_section(*lines: str, opener: str = "equals(QT_ARCH, arm64)") -> str:
+    return "    " + opener + " {\n" + "".join("        " + line + "\n" for line in lines) + "    }"
+
+
+# (case name, arm64 section, text after the macx scope, expected arm64 gaps). Each shape is one the adversary pass
+# showed the raw-text guard accepted although qmake would not give macOS arm64 the flag (LJ92-PRO-MACOS-ARCH-PIN-1 r1).
+_MACX_PIN_CASES = (
+    ("live", _ARM64_LIVE, "", []),
+    ("continuation lines keep the flag", _arm64_section(
+        "QMAKE_CFLAGS += \\", "    -fopenmp", "LIBS += -L/opt/homebrew/opt/llvm/lib \\", "    -lomp"), "", []),
+    ("second macx scope is additive", _ARM64_LIVE, "macx {\n    DEFINES += EXTRA_DIAGNOSTICS\n}", []),
+    ("A1 assignments commented out", _arm64_section(
+        "# QMAKE_CFLAGS += -fopenmp", "# LIBS += -L/opt/homebrew/opt/llvm/lib -lomp"), "", _BOTH_GAPS),
+    ("A1 whole branch commented out", "\n".join("    # " + line.strip() for line in _ARM64_LIVE.splitlines()), "", _BOTH_GAPS),
+    ("A2 negated architecture", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp", "LIBS += -lomp", opener="!equals(QT_ARCH, arm64)"), "", _BOTH_GAPS),
+    ("A2 flags only under CONFIG(debug)", "    equals(QT_ARCH, arm64) {\n        CONFIG(debug, debug|release) {\n"
+     "            QMAKE_CFLAGS += -fopenmp\n            LIBS += -lomp\n        }\n    }", "", _BOTH_GAPS),
+    ("A3 release branch empty, debug branch carries the flags",
+     _arm64_section(opener="CONFIG(release, debug|release):equals(QT_ARCH, arm64)") + "\n" + _arm64_section(
+         "QMAKE_CFLAGS += -fopenmp", "LIBS += -lomp", opener="CONFIG(debug, debug|release):equals(QT_ARCH, arm64)"),
+     "", _BOTH_GAPS),
+    ("A4 variable name is only a suffix", _arm64_section(
+        "SAVED_QMAKE_CFLAGS += -fopenmp", "SAVED_LIBS += -lomp"), "", _BOTH_GAPS),
+    ("A4 flag only inside another argument", _arm64_section(
+        "QMAKE_CFLAGS += -DSAVED_TEXT=-fopenmp", "SAVED_QMAKE_LFLAGS += -DSAVED_TEXT=-fopenmp"), "", _BOTH_GAPS),
+    ("A4 look-alike link library", _arm64_section("QMAKE_CFLAGS += -fopenmp", "LIBS += -lomp-west"), "", [_LINK_GAP]),
+    ("A5 removal inside the branch", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp", "LIBS += -lomp", "QMAKE_CFLAGS -= -fopenmp", "LIBS -= -lomp"), "", _BOTH_GAPS),
+    ("A5 single-line removal after the macx scope", _ARM64_LIVE,
+     "macx:equals(QT_ARCH, arm64):QMAKE_CFLAGS -= -fopenmp\nmacx:equals(QT_ARCH, arm64):LIBS -= -lomp", _BOTH_GAPS),
+    ("A5 reassignment after the macx scope", _ARM64_LIVE, "macx:equals(QT_ARCH, arm64):QMAKE_CFLAGS = -std=c99", [_COMPILE_GAP]),
+    ("a brace in a comment does not end the branch", _arm64_section(
+        "# } never closes the scope", "QMAKE_CFLAGS += -fopenmp", "LIBS += -lomp"), "", []),
+)
+
+
 class RawUint16PerFrameKeysTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -205,37 +418,34 @@ int main(void)
                     body, r"(QMAKE_LFLAGS\s*\+=[^\n]*-fopenmp|LIBS\s*\+=[^\n]*-l(libgomp-1|gomp|omp)\b)",
                     relative + " " + platform + ": link line lacks OpenMP")
 
-    @staticmethod
-    def _macx_arch_branches(macx_body: str) -> "dict[str, str]":
-        """QT_ARCH branches of a macx scope body, arch -> branch body. Reads exactly the lines of the form
-        `equals(QT_ARCH, <arch>) {` ... matching `}` (both .pro files name x86_64 and arm64 this way)."""
-        branches: "dict[str, str]" = {}
-        for opener in re.finditer(r"equals\(\s*QT_ARCH\s*,\s*([A-Za-z0-9_]+)\s*\)\s*\{", macx_body):
-            depth = 1
-            index = opener.end()
-            while depth and index < len(macx_body):
-                depth += {"{": 1, "}": -1}.get(macx_body[index], 0)
-                index += 1
-            branches[opener.group(1)] = macx_body[opener.end():index - 1]
-        return branches
-
-    def test_standalone_lj92_targets_pin_openmp_in_each_macos_arch_branch(self) -> None:
+    def test_standalone_lj92_targets_pin_openmp_for_each_macos_architecture(self) -> None:
         """LJ92-PRO-MACOS-ARCH-PIN-1 r1 (Dot advisory 9dab5e8d on #880): the test above reads the WHOLE macx body, so
         a flag that survives in only one QT_ARCH branch still passes and the other macOS architecture can lose OpenMP
-        while CI stays green. Each architecture the .pro names must carry the compile flag and the link flag itself."""
+        while CI stays green. For every architecture the .pro names (x86_64 and arm64 always), the flags qmake would
+        really apply on macOS (live lines, not comments; exact tokens; removals honoured) must include the C compile
+        flag and an OpenMP link flag. Quoted lines read, in both files: `equals(QT_ARCH, x86_64) {` and
+        `equals(QT_ARCH, arm64) {`, each holding `QMAKE_CFLAGS += -fopenmp` and `LIBS += -L<llvm>/lib -lomp`."""
         for relative in ("tests/console/lj92_pred1_reader_tool.pro", "tests/fuzz/fuzz_lj92.pro"):
-            scopes = self._platform_scopes((ROOT / relative).read_text(encoding="utf-8"))
-            self.assertIn("macx", scopes, relative + " lost its macx scope")
-            branches = self._macx_arch_branches(scopes["macx"])
-            for arch in ("x86_64", "arm64"):
-                self.assertIn(arch, branches, relative + " macx lost its equals(QT_ARCH, " + arch + ") branch")
-            for arch, body in branches.items():
-                self.assertRegex(
-                    body, r"QMAKE_CFLAGS\s*\+=[^\n]*-fopenmp",
-                    relative + " macx QT_ARCH=" + arch + ": C compile lacks -fopenmp")
-                self.assertRegex(
-                    body, r"(QMAKE_LFLAGS\s*\+=[^\n]*-fopenmp|LIBS\s*\+=[^\n]*-l(libgomp-1|gomp|omp)\b)",
-                    relative + " macx QT_ARCH=" + arch + ": link line lacks OpenMP")
+            pro_text = (ROOT / relative).read_text(encoding="utf-8")
+            named = {"x86_64", "arm64"} | set(re.findall(_QT_ARCH_ATOM, _qmake_logical_text(pro_text)))
+            for arch in sorted(named):
+                for gap in _macos_openmp_gaps(pro_text, arch):
+                    self.fail(relative + " macx QT_ARCH=" + arch + ": " + gap)
+
+    def test_macos_arch_pin_model_rejects_every_shape_qmake_would_not_honour(self) -> None:
+        """The same check, fed the shapes the adversary pass showed a raw-text match accepts. Every case is judged for
+        macOS arm64 (x86_64 stays live in the template) and must report exactly the listed gaps."""
+        for name, arm64_section, tail, expected in _MACX_PIN_CASES:
+            with self.subTest(name):
+                text = _MACX_PIN_TEMPLATE % {"arm64": arm64_section, "tail": tail}
+                self.assertEqual(_macos_openmp_gaps(text, "arm64"), expected)
+                self.assertEqual(_macos_openmp_gaps(text, "x86_64"), [], "x86_64 must stay live in every case")
+
+    def test_macos_arch_pin_model_refuses_unbalanced_scopes(self) -> None:
+        for text in ("macx {\n    QMAKE_CFLAGS += -fopenmp\n", "macx {\n}\n}\n"):
+            with self.subTest(text):
+                with self.assertRaises(AssertionError):
+                    _qmake_effective_flags(text, "arm64")
 
 
 if __name__ == "__main__":
