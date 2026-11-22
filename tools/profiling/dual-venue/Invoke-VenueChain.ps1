@@ -179,9 +179,42 @@ $plan = [System.Collections.Generic.List[object]]::new()
 # runner module too (only -LegSet did), so a spec the leg would refuse after the claim (an unpaced speed leg that keeps the capture tail, a blank opt-out reason, ...)
 # is refused here with no claim and no probe, as Invoke-VenueLeaseBatch refuses it before its lease.
 Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force
+$script:ChainJudgedSha = @{}   # spec path -> the raw sha256 of the bytes its shape check judged; the leg is launched with -ExpectSpecSha256 of it (r3 adversary A2)
+function Read-ChainSpecBytesWithin([string]$Path, [double]$BoundSec) {
+    # r3 (adversary A3): the spec's bytes are read on a pool thread and given up on after $BoundSec, so a share that stopped answering cannot hold the chain past
+    # -DeadlineUtc. state OK (bytes), FAILED (error) or TIMEOUT (no answer in the bound, or no bound left). The same shape as Invoke-VenueLeaseBatch's Read-SpecBytesWithin.
+    if (-not ('VenueChainBoundedRead' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+public static class VenueChainBoundedRead {
+    public static int ReadWithin(string path, int timeoutMs, out byte[] bytes, out string error) {
+        bytes = null; error = null;
+        if (timeoutMs <= 0) { return 2; }
+        System.Threading.Tasks.Task<byte[]> t = System.Threading.Tasks.Task.Run(() => System.IO.File.ReadAllBytes(path));
+        try { if (!t.Wait(timeoutMs)) { return 2; } } catch (AggregateException e) { error = e.InnerException != null ? e.InnerException.Message : e.Message; return 1; }
+        bytes = t.Result;
+        return 0;
+    }
+}
+'@
+    }
+    $b = $null; $e = $null
+    $full = try { [IO.Path]::GetFullPath($Path) } catch { return [pscustomobject]@{ state = 'FAILED'; bytes = $null; error = ($_.Exception.Message -replace '\s+', ' ') } }
+    $ms = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min(3600.0, $BoundSec)) * 1000.0)
+    $rc = [VenueChainBoundedRead]::ReadWithin($full, $ms, [ref]$b, [ref]$e)
+    [pscustomobject]@{ state = @('OK', 'FAILED', 'TIMEOUT')[$rc]; bytes = $b; error = $e }
+}
 function Get-ChainSpecShapeRefusal([string]$Path) {
-    # '' when the spec is runnable, or one that does not parse (left to the leg, as before); else the shape predicate's text
-    try { $spec = [IO.File]::ReadAllText($Path) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop } catch { return '' }
+    # '' when the spec is runnable; else the refusal text. r3 (adversary A1, A2, A3): the spec is read bounded by what is left before the deadline and the bytes are parsed exactly as
+    # Invoke-VenueLeg parses them (UTF8.GetString, so a BOM the leg cannot parse is refused here too); a spec that cannot be read or parsed is a REFUSAL, never a clearance (the leg would
+    # refuse it only after the claim); the raw sha256 of the judged bytes is kept for the leg's -ExpectSpecSha256. A read past the deadline is the typed SPEC_READ_TIMEOUT.
+    $room = ($deadline - [DateTime]::UtcNow).TotalSeconds - 2.0
+    $read = Read-ChainSpecBytesWithin $Path ([Math]::Min(120.0, $room))
+    if ($read.state -ceq 'TIMEOUT') { return "SPEC_READ_TIMEOUT the leg spec could not be read within the time left before -DeadlineUtc; no claim or probe is taken on it" }
+    if ($read.state -cne 'OK') { return "the leg spec could not be read ($($read.error -replace '\s+', ' '))" }
+    $script:ChainJudgedSha[$Path] = ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData([byte[]]$read.bytes)) -replace '-', '').ToLowerInvariant()
+    try { $spec = [Text.Encoding]::UTF8.GetString([byte[]]$read.bytes) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop }
+    catch { return "the leg spec is not valid JSON ($($_.Exception.Message -replace '\s+', ' '))" }
     try { $refusal = Get-DvLegSpecShapeRefusal -Spec $spec } catch { return "the leg spec cannot be shape-checked ($($_.Exception.Message -replace '\s+', ' '))" }
     $(if ($null -ne $refusal) { [string]$refusal } else { '' })
 }
@@ -205,7 +238,12 @@ if ($LegSet) {
 
 foreach ($planSpec in @($plan | ForEach-Object { $_.spec } | Select-Object -Unique)) {
     $planShapeRefusal = Get-ChainSpecShapeRefusal ([string]$planSpec)
+    if ($planShapeRefusal -clike 'SPEC_READ_TIMEOUT *') { Stop-Usage "$planShapeRefusal ('$planSpec')" }
     if ($planShapeRefusal) { Stop-Usage "LEG_SPEC_INVALID '$planSpec' cannot be run: $planShapeRefusal" }
+    # r3 (adversary A2): the chain log is appended to throughout the run; one that IS a leg spec would rewrite the bytes the leg is bound to
+    if ($ChainLog -and [string]::Equals([IO.Path]::GetFullPath($ChainLog), [IO.Path]::GetFullPath([string]$planSpec), [StringComparison]::OrdinalIgnoreCase)) {
+        Stop-Usage "LEG_SPEC_INVALID '$planSpec' cannot be run: -ChainLog names the leg spec itself"
+    }
 }
 
 $results = [System.Collections.Generic.List[object]]::new()
@@ -343,6 +381,7 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
     if ($why) { Write-SuppSkip $Leg $Trigger $why '' $true; return }
     # EVERY-FRAME-VISUAL-LEG-SPEC-1 r3 (adversary A2): the same shape check as the plan's, before the supplementary claim at the Request-VenueClaim below
     $suppShape = Get-ChainSpecShapeRefusal ([string]$Leg.spec)
+    if ($suppShape -clike 'SPEC_READ_TIMEOUT *') { Write-SuppSkip $Leg $Trigger 'SPEC_READ_TIMEOUT' $suppShape $false; return }
     if ($suppShape) { Write-SuppSkip $Leg $Trigger 'LEG_SPEC_INVALID' $suppShape $true; return }
     if ($null -ne $stopReason) { Write-SuppSkip $Leg $Trigger 'CHAIN_STOPPED' "stopReason=$stopReason" $true; return }
     $remainSec = [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalSeconds)
@@ -384,6 +423,7 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
         if ($capSec -lt 60 -and $TestSupplementaryCapSec -eq 0) { Write-SuppSkip $Leg $Trigger 'DEADLINE_NEAR' "remainingSec=$capSec after the probe" $false; return }
         $sOut = Join-Path $RunDir "leg-$($Leg.name)-ultra-magnus-supplementary.out.txt"
         $sArgs = @('-NoProfile', '-NonInteractive', '-File', $LegScript, '-Venue', $suppVenue, '-LegSpec', $Leg.spec, '-SourceCommit', $SourceCommit, '-BuildManifestSha256', $built.sha256)
+        if ($script:ChainJudgedSha.ContainsKey([string]$Leg.spec)) { $sArgs += @('-ExpectSpecSha256', $script:ChainJudgedSha[[string]$Leg.spec]) }   # r3 (adversary A2): the leg runs the bytes the shape check judged
         if ($Leg.backend) { $sArgs += @('-Backend', $Leg.backend) }
         if ($SheetCopyDir) { $sArgs += @('-SheetCopyDir', $SheetCopyDir) }
         L "LEG $($Leg.name) SUPPLEMENTARY_RUN venue=$suppVenue role=supplementary trigger=$Trigger quietVerdict=$($sq.verdict) quietMean=$(Format-Mean $sq.mean) capSec=$capSec umManifestSha256=$($built.sha256) spec=$($Leg.spec) backend=$(if ($Leg.backend) { $Leg.backend } else { 'spec' })"
@@ -544,6 +584,7 @@ foreach ($leg in $plan) {
             # (e) the leg
             $out = Join-Path $RunDir "leg-$($leg.name).out.txt"
             $lArgs = @('-NoProfile', '-NonInteractive', '-File', $LegScript, '-Venue', $Venue, '-LegSpec', $leg.spec, '-SourceCommit', $SourceCommit, '-BuildManifestSha256', $BuildManifestSha256)
+            if ($script:ChainJudgedSha.ContainsKey([string]$leg.spec)) { $lArgs += @('-ExpectSpecSha256', $script:ChainJudgedSha[[string]$leg.spec]) }   # r3 (adversary A2): the leg runs the bytes the shape check judged
             if ($leg.backend) { $lArgs += @('-Backend', $leg.backend) }
             if ($SheetCopyDir) { $lArgs += @('-SheetCopyDir', $SheetCopyDir) }
             L "LEG $($leg.name) RUN verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) spec=$($leg.spec) backend=$(if ($leg.backend) { $leg.backend } else { 'spec' })"

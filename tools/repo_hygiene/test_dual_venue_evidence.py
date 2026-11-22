@@ -8206,7 +8206,12 @@ class LegSpecSchemaTests(unittest.TestCase):
             "reason-without-opt-out-paced": dict(paced, visualCaptureOptOutReason=real_reason),
             "string-flag-paced": dict(paced, visualCapture="false", visualCaptureOptOutReason=real_reason),
         }
-        good = {"compliant-unpaced": base, "compliant-paced-opt-out": dict(paced, visualCapture=False, visualCaptureOptOutReason=real_reason), "paced-default": paced}
+        # r3 adversary A5: an export leg's request must refuse a malformed visualCapture just as the shape predicate does (the base request threw; the first r2 rewrite returned)
+        export = json.loads((DV / "legs/m16-1243-export-prores.json").read_text(encoding="utf-8"))
+        bad["export-null-flag"] = dict(export, visualCapture=None)
+        # r3 adversary A4: ConvertFrom-Json turns an ISO-date-looking JSON string into a [datetime]; it is still the JSON string the schema accepts, so it is a valid reason
+        good = {"compliant-unpaced": base, "compliant-paced-opt-out": dict(paced, visualCapture=False, visualCaptureOptOutReason=real_reason), "paced-default": paced,
+                "iso-date-looking-reason": dict(base, visualCaptureOptOutReason="2026-11-22T00:00:00Z")}
         script = ("Import-Module '%s' -Force; foreach ($f in Get-ChildItem -LiteralPath '%s' -Filter *.json) { "
                   "$s = Get-Content -Raw -LiteralPath $f.FullName | ConvertFrom-Json -NoEnumerate; $r = Get-DvLegSpecShapeRefusal -Spec $s; "
                   "$q = try { $null = Get-DvVisualCaptureRequest -Spec $s; 'REQ_OK' } catch { 'REQ_THREW' }; "

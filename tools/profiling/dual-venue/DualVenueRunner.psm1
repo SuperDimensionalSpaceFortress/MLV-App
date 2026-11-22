@@ -3849,22 +3849,23 @@ function Get-DvVisualCaptureOptOutRefusal {
     The ONE decision on whether a spec's visual-capture opt-out is valid; $null when it is, else the refusal text. Get-DvLegSpecShapeRefusal (before any lease, claim or
     probe) and Get-DvVisualCaptureRequest (after the lease, which throws DVE_LEG_SPEC_INVALID with this text) both call it, so the two can never disagree
     (EVERY-FRAME-VISUAL-LEG-SPEC-1 r2 adversary A1: a reason of twelve spaces passed the pre-lease predicate and the request then threw after the lease was charged).
-    Rule order: an export leg captures nothing (null); an unpaced SPEED leg whose visualCapture is not exactly false cannot keep the capture tail (an unpaced Play holds once
-    its source frames are consumed, so every tail capture is one frame); a visualCapture that is no boolean; visualCapture false needs a string reason with a non-space
-    character; a reason without visualCapture false.
+    Rule order: an unpaced SPEED leg (not look, not export) whose visualCapture is not exactly false cannot keep the capture tail (an unpaced Play holds once
+    its source frames are consumed, so every tail capture is one frame); a visualCapture that is no boolean (an export leg too: the shape predicate and the request must
+    agree on it, r3 adversary A5); visualCapture false needs a reason that is a JSON string with a non-space character (ConvertFrom-Json turns an ISO-date-looking
+    string into a [datetime], which is a string in the JSON and is accepted, r3 adversary A4); a reason without visualCapture false.
     #>
     param($Spec)
     $legType = [string](Get-DvProp $Spec 'legType')
-    if ($legType -ceq 'export') { return $null }
     $flag = $Spec.PSObject.Properties['visualCapture']
     $reason = $Spec.PSObject.Properties['visualCaptureOptOutReason']
     $keepsTail = ($null -eq $flag -or $flag.Value -isnot [bool] -or $flag.Value)
-    if ($legType -cne 'look' -and $keepsTail -and ((Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'unpaced') -eq $true)) {
+    if ($legType -cnotin @('look', 'export') -and $keepsTail -and ((Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'unpaced') -eq $true)) {
         return 'an unpaced speed leg cannot keep the visual capture tail (the unpaced Play holds once its source frames are consumed, so every tail capture is one frame): set visualCapture false with a visualCaptureOptOutReason'
     }
     if ($null -ne $flag -and $flag.Value -isnot [bool]) { return 'visualCapture must be a boolean' }
     if ($null -ne $flag -and -not $flag.Value) {
-        if ($null -eq $reason -or $reason.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($reason.Value)) {
+        $reasonText = $(if ($null -eq $reason) { $null } else { $reason.Value })
+        if ($reasonText -isnot [datetime] -and ($reasonText -isnot [string] -or [string]::IsNullOrWhiteSpace($reasonText))) {
             return 'visualCapture false needs a visualCaptureOptOutReason (a non-empty reason with a non-space character)'
         }
         return $null
