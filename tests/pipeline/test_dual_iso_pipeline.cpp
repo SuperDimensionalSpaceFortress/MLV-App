@@ -5576,7 +5576,7 @@ struct AliasGaussFixtureRun
 // mean23, alias map on, fullres on, chroma smoothing off, scale 0, ISO 100/1600,
 // the ISO-ratio match (ev 1 / black_delta -1 sentinels) and the forced pattern
 // 3 = is_bright {0,0,1,1}.
-AliasGaussFixtureRun run_alias_gauss_saturation_fixture()
+AliasGaussFixtureRun run_alias_gauss_saturation_fixture(const uint16_t * window_raw14)
 {
     namespace fx = dualiso_alias_gauss_saturation_fixture;
     struct raw_info raw = {};
@@ -5593,7 +5593,10 @@ AliasGaussFixtureRun run_alias_gauss_saturation_fixture()
     raw.active_area.y2 = fx::kHeight;
 
     AliasGaussFixtureRun run;
-    run.image.assign(fx::kRaw14, fx::kRaw14 + fx::kWidth * fx::kHeight);
+    run.image.assign(window_raw14, window_raw14 + fx::kWidth * fx::kHeight);
+    // Sized before the recon allocates its native scratch, so nothing below can
+    // throw while that scratch is live (it has no destructor).
+    run.alias_map.assign(static_cast<size_t>(fx::kWidth) * fx::kHeight, 0);
     dualiso_full20bit_scratch_t scratch = {};
     int iso_pattern = 3;
     int auto_correction = -1;
@@ -5617,8 +5620,13 @@ AliasGaussFixtureRun run_alias_gauss_saturation_fixture()
                                 &scratch);
     if (run.rc == 1 && scratch.alias_map)
     {
-        run.alias_map.assign(scratch.alias_map,
-                             scratch.alias_map + fx::kWidth * fx::kHeight);
+        std::copy(scratch.alias_map,
+                  scratch.alias_map + run.alias_map.size(),
+                  run.alias_map.begin());
+    }
+    else
+    {
+        run.alias_map.clear();
     }
     free_dualiso_full20bit_scratch(&scratch);
     return run;
@@ -5627,27 +5635,31 @@ AliasGaussFixtureRun run_alias_gauss_saturation_fixture()
 } // namespace
 
 // CUDA-SHADOW-M16-1457-FRAME-86-STAGE-DUMP-1 r2: build_alias_map's 21-tap
-// Gaussian can exceed 65535 (here at frame-86 pixel (568,307)). The AVX2 kernel
-// saturates it to 65535 and the grayscale step caps that at ALIAS_MAP_MAX, while
-// the scalar loop stored it into the uint16_t map and wrapped it to a SMALL
-// value, so the scalar CPU (and the CUDA port of it) gave 8826 where the
-// production AVX2 CPU gave 8827. Both CPU dispatches must saturate.
+// Gaussian can exceed 65535 (in the 2x2 alias block that frame-86 pixel
+// (568,307) takes its alias value from). The AVX2 vector body saturated it to
+// 65535 and the grayscale step caps that at ALIAS_MAP_MAX, while the scalar loop
+// and the AVX2 scalar tail stored it into the uint16_t map and wrapped it to a
+// SMALL value, so the scalar CPU (and the CUDA port of it) gave 8826 where the
+// production AVX2 CPU gave 8827. Every CPU path must saturate:
+//   - window kRaw14 puts the block in the scalar loop and the AVX2 vector body;
+//   - window kTailRaw14 puts it in the AVX2 scalar tail (x 22..25 of w=32).
+// The CUDA k_alias_gauss store is covered by the venue shadow re-run (the CUDA
+// backend does not build on this host).
 TEST(DualIsoPipeline, AliasMapGaussianSaturatesInsteadOfWrapping)
 {
     namespace fx = dualiso_alias_gauss_saturation_fixture;
-    const size_t probe = static_cast<size_t>(fx::kProbeY) * fx::kWidth + fx::kProbeX;
+    struct Window
+    {
+        const char * name;
+        const uint16_t * raw14;
+        int probe_x;
+        int probe_y;
+    };
+    const Window windows[] = {
+        { "body", fx::kRaw14, fx::kProbeX, fx::kProbeY },
+        { "tail", fx::kTailRaw14, fx::kTailProbeX, fx::kTailProbeY },
+    };
     ScopedAliasMapDispatchEnv alias_env;
-
-    ASSERT_EQ(0, alias_env.set_scalar(true));
-    const AliasGaussFixtureRun scalar_run = run_alias_gauss_saturation_fixture();
-    ASSERT_EQ(1, scalar_run.rc);
-    ASSERT_EQ(static_cast<size_t>(fx::kWidth * fx::kHeight), scalar_run.alias_map.size());
-    std::fprintf(stderr,
-                 "AliasMapGaussianSaturatesInsteadOfWrapping: scalar alias=%u out=%u\n",
-                 static_cast<unsigned>(scalar_run.alias_map[probe]),
-                 static_cast<unsigned>(scalar_run.image[probe]));
-    ASSERT_EQ(15000, static_cast<int>(scalar_run.alias_map[probe]));
-    ASSERT_EQ(8827, static_cast<int>(scalar_run.image[probe]));
 
 #if defined(__GNUC__) && !defined(__clang__) && (defined(__x86_64__) || defined(__i386__))
     __builtin_cpu_init();
@@ -5656,16 +5668,40 @@ TEST(DualIsoPipeline, AliasMapGaussianSaturatesInsteadOfWrapping)
 #else
     const bool host_supports_avx2_fma = false;
 #endif
-    if (!host_supports_avx2_fma || alias_env.set_scalar(false) == 0)
+
+    for (const Window & window : windows)
     {
-        return;  // the scalar half above is the whole contract on this host
+        const size_t probe = static_cast<size_t>(window.probe_y) * fx::kWidth + window.probe_x;
+
+        ASSERT_EQ(0, alias_env.set_scalar(true));
+        const AliasGaussFixtureRun scalar_run = run_alias_gauss_saturation_fixture(window.raw14);
+        ASSERT_EQ(1, scalar_run.rc);
+        ASSERT_EQ(static_cast<size_t>(fx::kWidth * fx::kHeight), scalar_run.alias_map.size());
+        std::fprintf(stderr,
+                     "AliasMapGaussianSaturatesInsteadOfWrapping[%s]: scalar alias=%u out=%u\n",
+                     window.name,
+                     static_cast<unsigned>(scalar_run.alias_map[probe]),
+                     static_cast<unsigned>(scalar_run.image[probe]));
+        ASSERT_EQ(15000, static_cast<int>(scalar_run.alias_map[probe]));
+        ASSERT_EQ(8827, static_cast<int>(scalar_run.image[probe]));
+
+        if (!host_supports_avx2_fma || alias_env.set_scalar(false) == 0)
+        {
+            continue;  // the scalar half above is the whole contract on this host
+        }
+        const AliasGaussFixtureRun avx2_run = run_alias_gauss_saturation_fixture(window.raw14);
+        ASSERT_EQ(1, avx2_run.rc);
+        ASSERT_EQ(static_cast<size_t>(fx::kWidth * fx::kHeight), avx2_run.alias_map.size());
+        std::fprintf(stderr,
+                     "AliasMapGaussianSaturatesInsteadOfWrapping[%s]: avx2 alias=%u out=%u\n",
+                     window.name,
+                     static_cast<unsigned>(avx2_run.alias_map[probe]),
+                     static_cast<unsigned>(avx2_run.image[probe]));
+        ASSERT_EQ(15000, static_cast<int>(avx2_run.alias_map[probe]));
+        ASSERT_EQ(8827, static_cast<int>(avx2_run.image[probe]));
+        ASSERT_TRUE(avx2_run.alias_map == scalar_run.alias_map);
+        ASSERT_TRUE(avx2_run.image == scalar_run.image);
     }
-    const AliasGaussFixtureRun avx2_run = run_alias_gauss_saturation_fixture();
-    ASSERT_EQ(1, avx2_run.rc);
-    ASSERT_EQ(15000, static_cast<int>(avx2_run.alias_map[probe]));
-    ASSERT_EQ(8827, static_cast<int>(avx2_run.image[probe]));
-    ASSERT_TRUE(avx2_run.alias_map == scalar_run.alias_map);
-    ASSERT_TRUE(avx2_run.image == scalar_run.image);
 }
 
 /* Byte-identity parity audit for the Phase 1B preview rowscale AVX2 kernel.

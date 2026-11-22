@@ -701,7 +701,7 @@ static void build_alias_map_init_diff_row_avx2(uint16_t * alias_map,
  *      (sum_cross_6)              * 139 / 1024 +
  *      (sum_outer_eight_a)        * 111 / 1024 +
  *      (sum_outer_eight_a)        *  57 / 1024;
- *     alias_map[x + y*w] = c;
+ *     alias_map[x + y*w] = MIN(c, 65535);   // saturate, never wrap (c can exceed 65535)
  *
  * Each `sum * weight / 1024` term truncates per-term (integer division),
  * so we must NOT collapse equal taps across terms. We compute every term
