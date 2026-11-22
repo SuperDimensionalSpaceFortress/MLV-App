@@ -1982,12 +1982,32 @@
     },
     {
       "path": "platform/qt/MainWindow.cpp",
-      "anchor": "if ( measuredFrameMs < 0 ) resetFpsMeterIfIdle ( nowTime ) ;",
+      "anchor": "if ( measuredFrameMs < 0 ) resetFpsMeterIfIdle ( nowTime , true ) ;",
       "class": "value_fallback_select",
       "clock": "other",
-      "justification": "LOOK-LABEL-PLAYBACK-INFO-1 r21 (adversary pass 20 A4): the draw branch of timerFrameEvent routes a negative draw-to-draw QTime::msecsTo() age (wall-clock wrap) through the one fps-meter stall reset, which zeroes the status text, the average and the corner's shown rate. A display reset for the fps text, never proof that a stage ran or a frame rendered.",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-1 r21 (adversary pass 20 A4), re-anchored by LOOK-LABEL-PLAYBACK-INFO-2 r3 (adversary pass 3 A1: INFO-2 r2 added the second argument): the draw branch of timerFrameEvent routes a negative presentation-to-presentation QTime::msecsTo() age (wall-clock wrap) through the one fps-meter stall reset, which zeroes the status text, the average and the corner's shown rate. A display reset for the fps text, never proof that a stage ran or a frame rendered.",
       "lines": [
-        3145
+        3170
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackFpsMeterPolicy.h",
+      "anchor": "if ( msBetweenStamps <= 0 || framesPresented <= 1 ) return msBetweenStamps ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-2 r2 (adversary pass 1 A2), pinned by r3 (adversary pass 3 A1): presentedIntervalMs() passes a non-positive span between two presentation stamps (same millisecond, or a wrapped wall clock the caller reads as stalled) and a single-frame span through unchanged, and only otherwise divides the span by the frames presented in it. Arithmetic for the status-bar fps text and the corner rate; the value never proves that a stage ran or a frame rendered.",
+      "lines": [
+        89
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_info_label.cpp",
+      "anchor": "ASSERT_EQ ( 0 , playback_fps_meter :: presentedIntervalMs ( 0 , 4 ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-2 r2 (adversary pass 1 A2), pinned by r3 (adversary pass 3 A1): pins that a zero span between presentation stamps passes through presentedIntervalMs unchanged. A pure arithmetic assertion on a policy function over literals; no stage or clock runs.",
+      "lines": [
+        1775
       ]
     },
     {
