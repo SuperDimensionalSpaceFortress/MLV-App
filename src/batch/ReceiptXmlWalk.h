@@ -13,15 +13,17 @@
  * on (adversary A1 on 76653777).
  *
  * OptOutWatch only observes the walk (it never moves the reader). When the walk may have missed or
- * mis-read an opt-out, optOut() reads the element again with a second reader over the SAME bytes the
+ * mis-read the flag, lastDirectValue() reads the element again with a second reader over the SAME bytes the
  * walk parsed (the walk's device is a QBuffer the caller filled with one read of the file; a file
  * is never opened twice, so a file saved between the two reads cannot mix two versions: r2 adversary
  * A3). It looks only at the element's direct children in no namespace named lookAssistEnabled, so an
  * extension such as <x:lookAssistEnabled> neither hides a later plain opt-out nor overwrites an
- * earlier one (r2 B2), and answers true when the last such child holding an integer says 0 (a child with
- * no integer in it is skipped, lookAssistEnabledValue: r4, sol r3 B1). The caller only ever turns
- * Look Assist OFF on that answer, so every receipt base read as off stays off, and nothing else the
- * walk read is touched. */
+ * earlier one (r2 B2), and answers the value of the last such child holding an integer (a child with
+ * no integer in it is skipped, lookAssistEnabledValue: r4, sol r3 B1). The caller sets Look Assist to
+ * that answer, on or off: the last plain direct element wins in every layout, as it does when the walk
+ * reads an indented receipt (r6 adversary A1 on 624f97d7: a direct 0, a nested 1 the walk stopped in,
+ * then a direct 1, stayed off). With no such element the walk's value stands (an extension-only
+ * opt-out base honoured stays honoured), and nothing else the walk read is touched. */
 
 #include <QBuffer>
 #include <QByteArray>
@@ -78,8 +80,9 @@ public:
     /* After the walk. With no element stepped past, no extension met and the walk on an end element,
      * the walk handled every direct child, so it read every plain lookAssistEnabled, last one winning,
      * exactly as the scan would: nothing to correct, nothing read again. Every receipt and session MLV
-     * App writes is indented, so a session of many clips is read once, as on base. */
-    bool optOut( QXmlStreamReader *reader ) const
+     * App writes is indented, so a session of many clips is read once, as on base. Otherwise true, with the
+     * last plain direct element's value in *value, when there is one. */
+    bool lastDirectValue( QXmlStreamReader *reader, bool *value ) const
     {
         if( !m_steppedPast && !m_extensionSeen && reader->isEndElement() && !reader->hasError() )
             return false;
@@ -149,7 +152,9 @@ public:
                 --depth;
             }
         }
-        return lastValue == 0;
+        if( lastValue < 0 ) return false;
+        *value = ( lastValue == 1 );
+        return true;
     }
 
 private:

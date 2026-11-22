@@ -443,9 +443,23 @@ int BatchRunner::exportRenderedVideoFile(
      * first, so Ctrl+C during the analysis is the typed cancellation below, not a kill
      * (adversary A9 on 16d54744). */
     BatchRenderCancelScope cancelScope;
-    const bool lookAssistApplied = ReceiptApplier::applyHeadlessLookAssist(
-        receipt, mlvObject, processingObject,
-        CdngSequenceExport::lookAssistAnalysisFrameIndex( cutIn, cutIn ) );
+    bool lookAssistApplied = false;
+    try
+    {
+        lookAssistApplied = ReceiptApplier::applyHeadlessLookAssist(
+            receipt, mlvObject, processingObject,
+            CdngSequenceExport::lookAssistAnalysisFrameIndex( cutIn, cutIn ) );
+    }
+    catch( ... )
+    {
+        /* An exception out of the analysis (std::bad_alloc in a curve decision) is a failure exit of this job, with
+         * its cleanup, never an exception out of the runner (r6 adversary A3 on 624f97d7). */
+        freeMlvObject( mlvObject );
+        freeProcessingObject( processingObject );
+        return renderedPreEncodeExit( 4,
+            QStringLiteral("[BATCH] ERROR: Look Assist analysis failed (out of memory or internal error). clip=%1\n").arg(baseName),
+            baseName, framesToExport, QString() );
+    }
     if( lookAssistApplied )
     {
         ReceiptApplier::applyLookAssistGradeToProcessing( receipt, processingObject );
@@ -542,8 +556,16 @@ int BatchRunner::exportRenderedVideoFile(
             baseName, framesToExport, QString() );
     }
 
+    /* A cancel already seen removes nothing; a stale partial this run does remove is named if a cancel then lands before
+     * the spawn (r6 adversary A2 on 624f97d7: the removal ran after a cancel and the receipt said partial_removed=none). */
+    if( BatchRenderCancelScope::cancelled() )
+    {
+        freeMlvObject( mlvObject );
+        freeProcessingObject( processingObject );
+        return renderedCancelledBeforeEncode( baseName, framesToExport, QString() );
+    }
     QDir().mkpath( QFileInfo( finalPath ).absolutePath() );
-    QFile::remove( partialPath ); /* a previous cancelled run may have left one */
+    const bool stalePartialRemoved = QFile::remove( partialPath ); /* a previous cancelled run may have left one */
 
     const int srcWidth  = static_cast<int>(getMlvWidth( mlvObject ));
     const int srcHeight = static_cast<int>(getMlvHeight( mlvObject ));
@@ -574,7 +596,9 @@ int BatchRunner::exportRenderedVideoFile(
     {
         freeMlvObject( mlvObject );
         freeProcessingObject( processingObject );
-        return renderedCancelledBeforeEncode( baseName, framesToExport, QString() );
+        // The stale partial this run removed, else one still there (removed now, or named in a kept-file warning).
+        const QString stalePartial = stalePartialRemoved ? partialPath : removeRenderedPartial( partialPath );
+        return renderedCancelledBeforeEncode( baseName, framesToExport, stalePartial );
     }
 
     export_process::StreamingPipeline pipeline;

@@ -17061,10 +17061,11 @@ void MainWindow::readXmlElementsFromFile(QXmlStreamReader *Rxml, ReceiptSettings
         optOutWatch.endOfPass( Rxml );
     }
 
-    //A plain opt-out the walk stepped past, or one a namespaced extension overwrote, still turns Look Assist off;
-    //it never turns it on (EXPORT-PRORES-LOOK-ASSIST-1 r2 B1/B2, r3 A1-A3)
-    if( optOutWatch.optOut( Rxml ) )
-        receipt->setLookAssistEnabled( false );
+    //The last plain direct lookAssistEnabled holding an integer wins, on or off, when the walk stepped past it or a
+    //namespaced extension overwrote it (EXPORT-PRORES-LOOK-ASSIST-1 r2 B1/B2, r3 A1-A3, r6 A1)
+    bool lookAssistDirect = true;
+    if( optOutWatch.lastDirectValue( Rxml, &lookAssistDirect ) )
+        receipt->setLookAssistEnabled( lookAssistDirect );
 }
 
 //Write all receipt elements to xml
