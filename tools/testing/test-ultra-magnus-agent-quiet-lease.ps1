@@ -7169,6 +7169,29 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $script:SpReads.Clear(); $script:LastDescendantWalk = $null; $script:DescendantWalkFailLogTs = $null
             $a6w = @(Get-DescendantProcessIdentities -ParentProcessId 4000 -RootStartEpochMs $rootMs)
             $o['r10A6'] = [pscustomobject]@{ ids = (& $spIds $a6w); partial = $script:LastDescendantWalk.partial; reads = ($script:SpReads -join ' ') }
+            # r10 adversary pass 2 A2: a PINNED walk whose full read emits the root row and throws, and whose ProcessId=4000 read throws, while ParentProcessId=4000
+            # returns 4001: the merge base's walk reads the children first and finds 4001; the pinned fallback starts with the children read.
+            function Get-CimInstance {
+                [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter, [string[]]$Property, [uint32]$OperationTimeoutSec)
+                if ($PSBoundParameters.ContainsKey('Filter')) { $script:SpReads.Add($Filter); if ($Filter -eq 'ProcessId=4000') { throw 'root lookup unavailable' }; if ($Filter -eq 'ProcessId=4001') { New-SpProc 4001 4000 1 }; if ($Filter -eq 'ParentProcessId=4000') { New-SpProc 4001 4000 1 }; return }
+                $script:SpReads.Add('FULL'); New-SpProc 4000 1 0; throw 'partial census'
+            }
+            $script:SpReads.Clear(); $script:LastDescendantWalk = $null; $script:DescendantWalkFailLogTs = $null
+            $p2a2w = @(Get-DescendantProcessIdentities -ParentProcessId 4000 -RootStartEpochMs $rootMs -RootPidPinned -Deadline ((Get-Date).AddSeconds(600)))
+            $o['r10p2A2'] = [pscustomobject]@{ ids = (& $spIds $p2a2w); partial = $script:LastDescendantWalk.partial; reads = ($script:SpReads -join ' ') }
+            # r10 adversary pass 2 A1: a walk nested in another walk's -OnEach (the lease owner check) runs in the outer walk's dynamic scope. The outer walk's
+            # fallback left $fbChildrenError and $fbRecheckEmpty set; the nested walk gets a COMPLETE, healthy census (8000 -> 8001) and must walk 8001.
+            $script:SpWorld = @((New-SpProc 8000 1 0), (New-SpProc 8001 8000 1)); $script:SpFull = 'world'; $script:SpSeq = @{}; $script:SpFullDelayMs = 0
+            function Get-CimInstance {
+                [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter, [string[]]$Property, [uint32]$OperationTimeoutSec)
+                if ($PSBoundParameters.ContainsKey('Filter')) { return }
+                foreach ($r in $script:SpWorld) { $r }
+            }
+            $p2a1w = & {
+                $fbChildrenError = 'outer child census failed'; $fbRecheckEmpty = $true; $fbRecheckError = $null
+                @(Get-DescendantProcessIdentities -ParentProcessId 8000 -RootStartEpochMs $rootMs)
+            }
+            $o['r10p2A1'] = [pscustomobject]@{ ids = (& $spIds $p2a1w); ok = $script:LastDescendantWalk.ok; why = [string]$script:LastDescendantWalk.why }
             # S6 (sol r9 B6, adversary pass 13 A6): a capture failure and a monitor failure whose messages span two lines ('first' LF 'second'), both written
             # WITH their tokens. The merge base never claimed a lost line; nothing is recovered. Control: the same diagnostics refused by the err file: both recovered.
             $spTags = @{ capture = ' [agent-diag c0ffee00000000a1]'; census = ' [agent-diag c0ffee00000000a2]'; unverified = ' [agent-diag c0ffee00000000a3]'; skipped = ' [agent-diag c0ffee00000000a4]'; stop = ' [agent-diag c0ffee00000000a5]'; monitor = ' [agent-diag c0ffee00000000a6]'; ceiling = ' [agent-diag c0ffee00000000a7]' }
@@ -7195,6 +7218,8 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True ($spOut['r10A3-exited'].ids -eq '4001' -and $spOut['r10A3-pinned'].ids -eq '4001' -and $spOut['r10A3-exited'].partial -eq $true) "cim-walk-split-r10: (r10 pass A3) the post-exit census and a pinned walk keep the surviving child 4001 when the root-row read throws (the held handle rules out pid reuse; the merge base walks 4001): $spTxt"
         Assert-True ($spOut['r10A3-unpinned'].ids -eq '' -and $spOut['r10A3-unpinned'].why -match 'root row read failed') "cim-walk-split-r10: (control, pass 9 A3) a caller with no handle stays fail-closed when the root-row read throws: $spTxt"
         Assert-True ($spOut['r10A6'].ids -eq '4001' -and $spOut['r10A6'].reads -match 'ParentProcessId=4000') "cim-walk-split-r10: (r10 pass A6) a failed full read that returned only the root's own row falls back to the per-parent reads and finds 4001 (the merge base's filtered read does): $spTxt"
+        Assert-True ($spOut['r10p2A2'].ids -eq '4001' -and $spOut['r10p2A2'].reads -match 'ParentProcessId=4000') "cim-walk-split-r10: (r10 pass 2 A2) a pinned fallback reads the root's children even when the root-row read throws, and finds 4001 (the merge base does): $spTxt"
+        Assert-True ($spOut['r10p2A1'].ids -eq '8001' -and $spOut['r10p2A1'].ok -eq $true) "cim-walk-split-r10: (r10 pass 2 A1) a walk nested in an outer walk's scope (outer fallback error and empty re-read set) walks its own healthy census: 8001 is emitted and the record is ok: $spTxt"
         Assert-True ($spOut['s6'].written -eq 0 -and $spOut['s6'].refused -eq 2 -and $spOut['s6'].childOnly -eq 1 -and $spOut['s6'].glued -eq 0) "cim-walk-split-r10: (sol r9 B6, pass 13 A6, r10 pass A4) two-line diagnostics and a census line glued onto an unterminated job tail, written with their tokens, are the agent's lines (nothing recovered); refused ones are both recovered; a child's untagged copy stands in for nothing: $spTxt"
         $results.cimWalkSplitR10 = $spOut
     }

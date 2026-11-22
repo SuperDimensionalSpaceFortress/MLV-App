@@ -761,6 +761,10 @@ function Get-DescendantProcessIdentities {
     $fbAttempted = $false
     $fbError = $null            # r5 (pass 7 A8): why the fallback's own read ended, when it did
     $fbRecheckError = $null     # r5 (pass 7 A2): the root-row re-read after the fallback found children
+    # r10 (adversary r10 pass 2 A1): set here, not only inside the fallback below. PowerShell scope is dynamic, so a walk nested in -OnEach (the lease owner
+    # check) that runs no fallback would otherwise read the OUTER walk's values and fail closed on the outer walk's error.
+    $fbChildrenError = $null
+    $fbRecheckEmpty = $false
     # r4 (pass 5 A4): the fallback runs when the read FAILED and nothing it returned relates to the root (no row for the root's pid, none naming it as
     # parent): zero rows, or only unrelated ones. A partial read that already holds the root's children or the root's own row is walked as it is
     # (the hub's r3 rule: no per-parent fallback on a partial snapshot; r5 G6 adds ONE root-row read when that partial snapshot lacks the root's own row).
@@ -780,7 +784,10 @@ function Get-DescendantProcessIdentities {
         $fbSeen = New-Object 'System.Collections.Generic.HashSet[int]'
         [void]$fbSeen.Add($ParentProcessId)
         $fbSteps = New-Object 'System.Collections.Generic.Queue[string]'
-        $fbSteps.Enqueue("ProcessId=$ParentProcessId"); $fbSteps.Enqueue("ParentProcessId=$ParentProcessId")
+        # r10 (adversary r10 pass 2 A2): a caller that holds the root's handle (-RootPidPinned, -RootExited) needs no root row to rule out pid reuse, so its
+        # fallback starts with the children read, as the merge base's walk did: a failing root-row read can no longer end the fallback before the children are read.
+        if (-not ($RootExited -or $RootPidPinned)) { $fbSteps.Enqueue("ProcessId=$ParentProcessId") }
+        $fbSteps.Enqueue("ParentProcessId=$ParentProcessId")
         $fbNodes = 0
         $fbOther = New-Object 'System.Collections.Generic.List[int]'   # r5 (pass 7 A8): rows the FALLBACK itself returned for processes other than the root
         $fbRootRowSeen = $false     # r7 (sol r6 A2): the fallback's own first read returned a row for the root's pid
