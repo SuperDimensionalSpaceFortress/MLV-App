@@ -144,10 +144,10 @@ class StreamingPipeline
 public:
     bool start( const QVector<Invocation> &invocations, int timeoutMs = 10000 )
     {
+        m_startError = QProcess::UnknownError;
         if( invocations.isEmpty() ) return false;
         m_processes.clear();
         m_diagnosticTail.clear();
-        m_startError = QProcess::UnknownError;
         for( int i = 0; i < invocations.size(); ++i )
         {
             auto process = std::make_unique<QProcess>();

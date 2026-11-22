@@ -17,6 +17,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <QFile>
+#include <sys/stat.h>
 #endif
 
 QString batchRenderedVideoJobPlanSummary(
@@ -3257,11 +3260,8 @@ batchRenderedVideoFfmpegDumpFacts(const QString & dumpText)
         }
     }
 
-    /* No usable geometry on the video line is no facts (r2 pass-4 A4 sibling): report nothing
-     * rather than zero dimensions that would fail a valid export. */
-    if( facts.width <= 0 || facts.height <= 0 )
-        return BatchRenderedVideoFfmpegDumpFacts();
-
+    /* Kept as before this card: a dump with a codec but no geometry still reports the codec, so
+     * a codec mismatch is refused (r2 pass-5 A5 showed that dropping it hid a mismatch). */
     facts.parsed = true;
     return facts;
 }
@@ -3700,6 +3700,13 @@ bool batchRenderedVideoSameExecutableFile(const QString & a, const QString & b)
     unsigned long long idB[2] = { 0, 0 };
     if( batchRenderedVideoWindowsFileId(a, idA) && batchRenderedVideoWindowsFileId(b, idB) )
         return idA[0] == idB[0] && idA[1] == idB[1];
+#else
+    /* Device + inode: sees hard links as well as symlinks (r2 pass-5 A4). */
+    struct stat sa;
+    struct stat sb;
+    if( ::stat(QFile::encodeName(a).constData(), &sa) == 0
+     && ::stat(QFile::encodeName(b).constData(), &sb) == 0 )
+        return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
 #endif
     const QFileInfo ia(a);
     const QFileInfo ib(b);
@@ -3725,10 +3732,18 @@ QString batchRenderedVideoScanPathForUsableFile(const QString & name, const QStr
 {
     QStringList suffixes{ QString() };
 #ifdef Q_OS_WIN
-    suffixes = qEnvironmentVariable("PATHEXT", QStringLiteral(".COM;.EXE;.BAT;.CMD"))
-                   .split(QLatin1Char(';'), Qt::SkipEmptyParts);
-    for( QString & suffix : suffixes )
-        suffix = suffix.trimmed().toLower();
+    /* Only directly spawnable images (.exe, .com), in PATHEXT order, and .exe always: never a
+     * script (.vbs/.bat), never a suffix that is a path (r2 pass-5 A1-A3). */
+    suffixes.clear();
+    for( const QString & raw : qEnvironmentVariable("PATHEXT").split(QLatin1Char(';'), Qt::SkipEmptyParts) )
+    {
+        const QString suffix = raw.trimmed().toLower();
+        if( ( suffix == QStringLiteral(".exe") || suffix == QStringLiteral(".com") )
+         && !suffixes.contains(suffix) )
+            suffixes.append(suffix);
+    }
+    if( !suffixes.contains(QStringLiteral(".exe")) )
+        suffixes.append(QStringLiteral(".exe"));
 #endif
     const QStringList pathDirs = qEnvironmentVariable("PATH").split(
         QDir::listSeparator(), Qt::SkipEmptyParts);
@@ -3988,7 +4003,7 @@ bool batchRenderedVideoMediaProbeJsonHasVideoFacts(
     const QJsonObject root = doc.object();
     const QJsonValue format = root.value(QStringLiteral("format"));
     if( !format.isObject()
-     || format.toObject().value(QStringLiteral("format_name")).toString().isEmpty() )
+     || format.toObject().value(QStringLiteral("format_name")).toString().trimmed().isEmpty() )
         return false;
     /* The FIRST video stream is the one the verifier reads: it must carry usable facts
      * (codec name, numeric positive width and height), else the dump fallback runs
@@ -4000,7 +4015,7 @@ bool batchRenderedVideoMediaProbeJsonHasVideoFacts(
             continue;
         const QJsonValue width = stream.value(QStringLiteral("width"));
         const QJsonValue height = stream.value(QStringLiteral("height"));
-        return !stream.value(QStringLiteral("codec_name")).toString().isEmpty()
+        return !stream.value(QStringLiteral("codec_name")).toString().trimmed().isEmpty()
             && width.isDouble() && width.toInt() > 0
             && height.isDouble() && height.toInt() > 0;
     }
