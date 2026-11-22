@@ -3359,12 +3359,15 @@ function Get-DvContactFrameCountVerdict {
     look.contactSheetFrames. The strip is frame-00 .. frame-<Requested-1>, each as a PNG AND its sidecar (the app's own numbering, the one Get-DvPairedSeekVerdict reads):
     the set of frame PNG stems and the set of frame sidecar stems must each BE that set. A frame with only one half, an extra frame, or a frame of another number is a
     mismatch (adversary r5 A4); files that are not frame-NN pairs (the identity legs' identity-pre-play.png, identity-first-present.png, identity.json) are not frames
-    and are not counted (adversary r5 A3). A requested count that is not a whole number from 1 to 999 cannot be compared (the leg-spec shape refusal owns that), so
-    nothing is refused here (and nothing is looped over: adversary r5 A8).
+    and are not counted (adversary r5 A3), but they are the ONLY other files a strip may hold (adversary pass-9 A1: a `frame-extra.png` + `frame-extra.json` pair is read
+    by the composer's `frame-*.json` glob and painted in place of a real frame, so any other plain file is a mismatch). A requested count that is not a whole number
+    from 1 to 999 cannot be compared (the leg-spec shape refusal owns that), so nothing is refused here (and nothing is looped over: adversary r5 A8).
     Returns [pscustomobject]@{ ok; pngs; sidecars; requested; reason }.
     #>
     param($Names, $Requested)
-    $list = @(@($Names) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+    $ancillary = @('identity-pre-play.png', 'identity-first-present.png', 'identity.json')   # (what the app's writeFirstPresentIdentity publishes beside the frames)
+    $list = @(@($Names) | Where-Object { $null -ne $_ -and -not ([string]$_).EndsWith('\') } | ForEach-Object { [string]$_ })   # (a directory is refused by Read-DvContactFrames)
+    $unexpected = @($list | Where-Object { $_ -cnotmatch '^frame-[0-9]{2,}\.(png|json)$' -and $_ -cnotin $ancillary })
     $pngStems = @($list | Where-Object { $_ -cmatch '^frame-[0-9]{2,}\.png$' } | ForEach-Object { $_.Substring(0, $_.Length - '.png'.Length) })
     $sidecarStems = @($list | Where-Object { $_ -cmatch '^frame-[0-9]{2,}\.json$' } | ForEach-Object { $_.Substring(0, $_.Length - '.json'.Length) })
     $wanted = $(if (($Requested -is [int] -or $Requested -is [long]) -and $Requested -ge 1 -and $Requested -le 999) { [int]$Requested } else { 0 })
@@ -3373,9 +3376,9 @@ function Get-DvContactFrameCountVerdict {
         $expected = [System.Collections.Generic.HashSet[string]]::new([string[]]@(for ($i = 0; $i -lt $wanted; $i++) { 'frame-{0:D2}' -f $i }), [StringComparer]::Ordinal)
         $havePng = [System.Collections.Generic.HashSet[string]]::new([string[]]$pngStems, [StringComparer]::Ordinal)
         $haveSidecar = [System.Collections.Generic.HashSet[string]]::new([string[]]$sidecarStems, [StringComparer]::Ordinal)
-        $ok = $havePng.SetEquals($expected) -and $haveSidecar.SetEquals($expected) -and $pngStems.Count -eq $wanted -and $sidecarStems.Count -eq $wanted
+        $ok = $havePng.SetEquals($expected) -and $haveSidecar.SetEquals($expected) -and $pngStems.Count -eq $wanted -and $sidecarStems.Count -eq $wanted -and $unexpected.Count -eq 0
     }
-    $reason = $(if ($ok) { $null } else { "the leg asked for frame-00 .. frame-$('{0:D2}' -f ($wanted - 1)) ($wanted frame(s), each a PNG and its sidecar) but the strip holds $($pngStems.Count) frame PNG(s) and $($sidecarStems.Count) frame sidecar(s) that are not exactly those; a strip that is not the requested frames is not the leg's acceptance evidence" })
+    $reason = $(if ($ok) { $null } else { "the leg asked for frame-00 .. frame-$('{0:D2}' -f ($wanted - 1)) ($wanted frame(s), each a PNG and its sidecar) but the strip holds $($pngStems.Count) frame PNG(s) and $($sidecarStems.Count) frame sidecar(s) that are not exactly those$(if ($unexpected.Count -gt 0) { " (and $($unexpected.Count) file(s) that are not frames: $(($unexpected | Select-Object -First 3) -join ', '))" }); a strip that is not the requested frames is not the leg's acceptance evidence" })
     [pscustomobject]@{ ok = $ok; pngs = $pngStems.Count; sidecars = $sidecarStems.Count; requested = $(if ($wanted -eq 0) { $null } else { $wanted }); reason = $reason }
 }
 

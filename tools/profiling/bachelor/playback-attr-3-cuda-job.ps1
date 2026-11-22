@@ -4567,7 +4567,8 @@ if ($ContactSheetEnabled -and $contactSheetDir -and (Test-Path -LiteralPath $con
             # The composer paints the requested frame count or none (a partial capture is refused, never a shorter strip). Only a composer that declares the option is handed it:
             # the composer is read from the committed SourceCommit, and an older build's parser would exit 2 on an unknown flag, turning a complete strip into a tooling failure.
             # (the receipt writer and validator still refuse a strip of the wrong count whichever composer ran)
-            if (($ContactSheetFrameCount -is [int]) -and $ContactSheetFrameCount -ge 1 -and [Text.Encoding]::UTF8.GetString($contactSheetComposerPayload.bytes).Contains('--expected-frames')) {
+            # ("declares" = an argparse declaration line, never the flag's name in a comment or a string: adversary pass-9 A3)
+            if (($ContactSheetFrameCount -is [int]) -and $ContactSheetFrameCount -ge 1 -and [regex]::IsMatch([Text.Encoding]::UTF8.GetString($contactSheetComposerPayload.bytes), '(?m)^\s*parser\.add_argument\(\s*[\x22\x27]--expected-frames[\x22\x27]')) {
                 $composeArgs += @('--expected-frames', [string]$ContactSheetFrameCount)
             }
             # EVERY-FRAME-VISUAL-LEG-SPEC-1 <<<

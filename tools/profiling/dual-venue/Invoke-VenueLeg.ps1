@@ -922,7 +922,8 @@ if ($isLook -and $artifactsShare) {
     $frameCountVerdict = $null
     $enumeratedFrames = 0
     $composeShare = Join-Path $artifactsShare 'contact-sheet\compose-status.txt'
-    if ((Test-Path -LiteralPath $sheetShare -PathType Leaf) -or (Test-Path -LiteralPath $composeShare -PathType Leaf)) {
+    # (adversary pass-9 A2: the raw directory is enumerated whenever it exists, sheet and compose marker or neither, so a partial strip is counted on every path)
+    if ((Test-Path -LiteralPath $sheetShare -PathType Leaf) -or (Test-Path -LiteralPath $composeShare -PathType Leaf) -or (Test-Path -LiteralPath $rawShare -PathType Container)) {
         Invoke-DvCollect 'mkdir' $sheetDir { New-Item -ItemType Directory -Force -Path $sheetDir | Out-Null }
         foreach ($n in 'stats.json', 'compose-status.txt') {
             $s = Join-Path $artifactsShare "contact-sheet\$n"
@@ -998,6 +999,9 @@ if ($isLook -and $artifactsShare) {
     } elseif (Test-Path -LiteralPath $composeShare -PathType Leaf) {
         $marker = ((Invoke-DvCollect 'read' $composeShare { [IO.File]::ReadAllText($composeShare) }) -split "`r?`n")[0]
         if ($marker -match '^CONTACT_SHEET_COMPOSE_UNAVAILABLE') { $composeUnavailable = $marker }
+        # (adversary pass-9 A2: a venue that could not compose AND published no raw frames kept nothing for composition elsewhere: zero frames enumerated is the
+        # typed count refusal, not a tooling condition that claims its frames were retained)
+        if ($null -ne $composeUnavailable -and $null -eq $frameCountVerdict) { $frameCountVerdict = Get-DvContactFrameCountVerdict -Names @() -Requested $spec.look.contactSheetFrames }
     }
     # The flavor the APP says it applied (the job copies gui_smoke.visual_state look_assist_flavor into its summary): honoured only
     # when it equals the flavor this leg asked for. No summary at all = the job never ran = 'unknown'.
@@ -1091,7 +1095,8 @@ if ($outcome -in @('PASS', 'FAIL') -and $display.blocks) {
 # (adversary r5 A5: a composer that REFUSED the partial strip surfaces as the generic compose-unavailable marker, which is VENUE_TOOLING above; the count the raw
 # directory enumerated is known, so that outcome ends as the typed count refusal too, never as a tooling problem)
 if (($outcome -in @('PASS', 'FAIL') -or ($outcome -ceq 'VENUE_TOOLING' -and $null -ne $composeUnavailable)) -and $isLook -and $null -ne $frameCountVerdict -and -not $frameCountVerdict.ok) {
-    $detail = "INVALID: the job result was $outcome ($detail) but CONTACT_FRAME_COUNT_NOT_REQUESTED: $($frameCountVerdict.reason)"
+    $detail = $(if ($outcome -ceq 'VENUE_TOOLING') { "INVALID: CAPTURED but CONTACT_FRAME_COUNT_NOT_REQUESTED: $($frameCountVerdict.reason). The venue's compose step said: $composeUnavailable" }
+                else { "INVALID: the job result was $outcome ($detail) but CONTACT_FRAME_COUNT_NOT_REQUESTED: $($frameCountVerdict.reason)" })
     $outcome = 'INVALID'
 }
 # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1, FAIL CLOSED: a leg with a usable PresentMon status whose capture has a gap longer than the bound (5000 ms, the job's own temporal

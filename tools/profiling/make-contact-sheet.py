@@ -413,11 +413,23 @@ def check_expected_frame_count(found, expected, what):
         raise ValueError(f"expected {expected} {what} (the leg's requested frame count) but found {found}; a strip that is not the requested count is not composed")
 
 
+def check_expected_frame_stems(stems, expected):
+    """Refuse (ValueError) a strip whose saved sidecars are not exactly frame-00 .. frame-<expected-1> (builtins only, like check_expected_frame_count). load_frames reads every
+    `frame-*.json`, so a stray `frame-extra.json` (with its image) would otherwise be painted in place of a real frame whose own sidecar says saved=false. `expected` None
+    accepts any stems, the way the composer always behaved."""
+    if expected is None:
+        return
+    want = ["frame-%02d" % i for i in range(expected)]
+    if sorted(stems) != want:
+        raise ValueError(f"expected the saved frames {want[0]} .. {want[-1]} (the leg's requested frames) but found {sorted(stems)}; a strip that is not exactly the requested frames is not composed")
+
+
 def compose_sheet(frames, frames_dir, args):
     if not frames:
         raise ValueError("no usable (saved=true) frames found in frames dir")
     expected = getattr(args, "expected_frames", None)
     check_expected_frame_count(len(frames), expected, "saved frames")
+    check_expected_frame_stems([f.get("_stem", "") for f in frames], expected)
 
     cols = max(1, args.cols)
     rows = (len(frames) + cols - 1) // cols

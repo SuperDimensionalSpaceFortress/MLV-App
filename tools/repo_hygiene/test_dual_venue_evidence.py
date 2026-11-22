@@ -691,6 +691,9 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(args_for(base, "$ContactSheetFrameCount = 6"), "composer.py|--scale|1|--expected-frames|6")
         self.assertEqual(args_for(b"parser.add_argument('--scale')\n", "$ContactSheetFrameCount = 6"), "composer.py|--scale|1", "an older composer that does not declare the option")
         self.assertEqual(args_for(base, "$ContactSheetFrameCount = $null"), "composer.py|--scale|1", "no count (the compose snippet a unit test runs alone)")
+        # adversary pass-9 A3: the flag's NAME in a comment or a string is not a declaration
+        for decoy in (b"# reserved: --expected-frames\nparser.add_argument('--scale')\n", b"x = '--expected-frames'\n", b"    # parser.add_argument('--expected-frames')\n"):
+            self.assertEqual(args_for(decoy, "$ContactSheetFrameCount = 6"), "composer.py|--scale|1", decoy.decode("ascii"))
 
     def test_the_other_existing_switches_are_still_byte_identical(self) -> None:
         self.assertByteIdenticalToBaseline("switches", ["-ContactSheet", "-ContactSheetFrames", "4", "-TelemetryArm", "LIGHT", "-DisablePaintPerSubmit"])
@@ -1786,6 +1789,9 @@ class RunnerHarness:
         if raw_frames:
             raw = self.artifacts / "artifacts" / "contact-sheet" / "raw"
             raw.mkdir(parents=True, exist_ok=True)
+            for stale_frame in raw.iterdir():   # (a case that asks for fewer frames must not inherit the previous case's: adversary pass-9 A9)
+                if stale_frame.is_file():
+                    stale_frame.unlink()
             # EVERY-FRAME-VISUAL-LEG-SPEC-1 r5: one PNG and its sidecar per requested frame (write_spec's look default is 2), the pairs the app publishes
             for i in range(raw_frame_count):
                 (raw / f"frame-{i:02d}.png").write_bytes(b"\x89PNG\r\n\x1a\nraw")
@@ -5024,6 +5030,52 @@ class ContactFramesAreTheRequestedCountTests(EvidenceFactory, ModuleMutationMixi
         self.assertEqual(runs[5]["outcome"], "INVALID", runs[5]["outcomeDetail"])
         self.assertIn("CONTACT_FRAME_COUNT_NOT_REQUESTED", runs[5]["outcomeDetail"])
         self.assertEqual(runs[6]["outcome"], "VENUE_TOOLING", "a complete strip over a venue that cannot compose is still a tooling condition: " + runs[6]["outcomeDetail"])
+
+    def test_a_stray_frame_pair_is_not_a_sixth_frame_the_strip_holds_only_the_requested_frames_and_the_known_diagnostics(self) -> None:
+        """adversary pass-9 A1: frame-05 saved=false plus a frame-extra pair (index 5): the composer's frame-*.json glob paints the extra in its place and both lengths read
+        six. The manifest rule refuses any plain file that is neither a requested frame nor one of the app's three identity diagnostics; the composer refuses any saved
+        sidecar set that is not exactly frame-00 .. frame-05."""
+        stray = stub_raw_frames(5)
+        stray["frame-05.png"] = b"\x89PNG\r\n\x1a\nunsaved"
+        stray["frame-05.json"] = json.dumps({"index": 5, "saved": False, "path": "frame-05.png"}).encode("utf-8")
+        stray["frame-extra.png"] = b"\x89PNG\r\n\x1a\nextra"
+        stray["frame-extra.json"] = json.dumps({"index": 5, "saved": True, "path": "frame-extra.png"}).encode("utf-8")
+        plus_note = {**stub_raw_frames(6), "notes.json": b"{}"}
+        for tag, frames in (("stray", stray), ("note", plus_note)):
+            receipt, _ = self.receipt_over(tag, frames)
+            receipt["look"]["contactSheet"]["frames"] = 6
+            self.expect(self.status_batch(self.repo, [(receipt, None)])[0], "INVALID", tag, "CONTACT_FRAME_COUNT_NOT_REQUESTED")
+        import ast
+        source = (ROOT / "tools" / "profiling" / "make-contact-sheet.py").read_text(encoding="utf-8")
+        funcs = [n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == "check_expected_frame_stems"]
+        self.assertEqual(len(funcs), 1)
+        namespace: dict = {}
+        exec(compile(ast.Module(body=funcs, type_ignores=[]), "make-contact-sheet.py:check_expected_frame_stems", "exec"), namespace)
+        check = namespace["check_expected_frame_stems"]
+        canonical = [f"frame-{i:02d}" for i in range(6)]
+        check(canonical, 6)
+        check(list(reversed(canonical)), 6)
+        check(["anything"], None)
+        for stems in (canonical[:5] + ["frame-extra"], canonical + ["frame-extra"], canonical[:4] + canonical[5:] + ["frame-06"], canonical[1:] + ["frame-06"]):
+            with self.assertRaises(ValueError, msg=str(stems)):
+                check(stems, 6)
+        self.assertIn("check_expected_frame_stems([f.get(\"_stem\", \"\") for f in frames], expected)", source, "compose_sheet checks the stems of the sidecars it was handed")
+
+    def test_a_partial_strip_is_counted_on_every_publication_path(self) -> None:
+        """adversary pass-9 A2: five pairs and no sheet.png and no compose marker, and a compose marker with no raw frames at all."""
+        self.write_artifacts(sheet=False, raw_frames=True, raw_frame_count=5)
+        proc, no_sheet = self.run_leg("ultra-magnus", self.spec, extra=["-Backend", "cpu"])[:2]
+        self.assertIsNotNone(no_sheet, proc.stdout + proc.stderr)
+        self.assertEqual(no_sheet["outcome"], "INVALID", no_sheet["outcomeDetail"])
+        self.assertIn("CONTACT_FRAME_COUNT_NOT_REQUESTED", no_sheet["outcomeDetail"])
+
+    def test_a_venue_that_could_not_compose_and_published_no_frames_is_not_a_tooling_problem_that_kept_them(self) -> None:
+        self.write_artifacts(sheet=False, compose_marker="CONTACT_SHEET_COMPOSE_UNAVAILABLE no Python 3 interpreter with Pillow+numpy was found on this venue")
+        proc, bare = self.run_leg("ultra-magnus", self.spec, extra=["-Backend", "cpu"])[:2]
+        self.assertIsNotNone(bare, proc.stdout + proc.stderr)
+        self.assertEqual(bare["outcome"], "INVALID", bare["outcomeDetail"])
+        self.assertIn("CONTACT_FRAME_COUNT_NOT_REQUESTED", bare["outcomeDetail"])
+        self.assertNotIn("kept locally", bare["outcomeDetail"])
 
     def test_the_count_rule_returns_a_verdict_for_any_requested_number(self) -> None:
         """adversary r5 A8: a positive Int64 above Int32 once threw at the cast; a count above the 999 the rest of the module bounds is simply not compared (the shape refusal owns it)."""
