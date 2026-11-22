@@ -148,7 +148,8 @@ PINNED_STOP_STATEMENTS = {
         # Reached waits for its presented count; the timeout, early-end and pace stops, and an unpinned play, are unchanged).
         "if( playback_frame_range::measuredPlayLoopShouldStop( measuredState, "
         "options.exerciseClipLifecycleStress && !stressAttempted, "
-        "m_playbackSmokeTargetPresentedFrames, m_playbackSmokePresentedFrames, "
+        # r8: the count is the distinct admitted-window frames shown, the one the present path and the exit-11 check use.
+        "m_playbackSmokeTargetPresentedFrames, playback_frame_range::pinnedPresentStopCount( m_playbackSmokePinnedWindow ), "
         # r3 (Grok G1(b)): and how far the timeline has run, so the wait never runs on past the admitted window.
         "m_playRequiredSourceFrames, ui->actionPlay->isChecked(), m_sourceAdvance.consumed() ) ) { break; }",
         "if( measuredState != playback_frame_range::PlayStopState::Reached ) { "

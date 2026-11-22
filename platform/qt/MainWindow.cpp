@@ -11227,9 +11227,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1: a frame-pinned capture waits for its presented count (the present path
         // stops Play at exactly N); the timeout, early-end and pace stops are unchanged, and so is an unpinned play.
         // r3: the wait ends once the timeline is more than kMeasuredPlayMaxFramesInFlight past the admitted window.
+        // r8: the count is the distinct window frames shown (pinnedPresentStopCount), the one the present path and the gate use.
         if( playback_frame_range::measuredPlayLoopShouldStop(
                 measuredState, options.exerciseClipLifecycleStress && !stressAttempted,
-                m_playbackSmokeTargetPresentedFrames, m_playbackSmokePresentedFrames,
+                m_playbackSmokeTargetPresentedFrames, playback_frame_range::pinnedPresentStopCount( m_playbackSmokePinnedWindow ),
                 m_playRequiredSourceFrames, ui->actionPlay->isChecked(), m_sourceAdvance.consumed() ) )
         {
             break;
@@ -11344,19 +11345,27 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     // present was inside the admitted window [counter start, start + required - 1] and there were exactly N of them
     // (pinnedCaptureObservedFrames). A dropped window frame made up by a frame past the window, a seek out of the window and back,
     // or a raw count above N ends here, on the unchanged not-met message, never a success. An all-inside run is judged as before.
-    const int64_t pinnedObservedFrames = playback_frame_range::pinnedCaptureObservedFrames(
-        m_playbackSmokeTargetPresentedFrames, m_playbackSmokePresentedFrames, m_playbackSmokeWindowPresentedFrames );
+    // r8: judged on the window ledger the stop also counts (pinnedWindowObservedFrames): the DISTINCT pinned-window frames shown
+    // ([start + 1, start + required]: the frames Play presents); a repeat never counts, and any present outside the window fails it.
+    const playback_frame_range::PinnedWindowPresents &pinnedWindow = m_playbackSmokePinnedWindow;
+    const int64_t pinnedObservedFrames = playback_frame_range::pinnedWindowObservedFrames(
+        m_playbackSmokeTargetPresentedFrames, pinnedWindow );
     if( m_playbackSmokeTargetPresentedFrames > 0
      && pinnedObservedFrames != m_playbackSmokeTargetPresentedFrames )
     {
         err << "[GUI-SMOKE] ERROR: exact presented-frame target was not met; target="
             << m_playbackSmokeTargetPresentedFrames
             << " observed=" << static_cast<qlonglong>( pinnedObservedFrames ) << ".\n";
-        if( m_playbackSmokeWindowPresentedFrames != m_playbackSmokePresentedFrames )
-            err << "[GUI-SMOKE] " << ( m_playbackSmokePresentedFrames - m_playbackSmokeWindowPresentedFrames ) << " of "
+        if( pinnedWindow.outside > 0 )
+            err << "[GUI-SMOKE] " << static_cast<qlonglong>( pinnedWindow.outside ) << " of "
                 << m_playbackSmokePresentedFrames << " presents showed a source frame outside the admitted window starting at frame "
-                << static_cast<qlonglong>( m_sourceAdvance.startFrame ) << " (last presented frame "
+                << static_cast<qlonglong>( pinnedWindow.windowStart ) << " (last presented frame "
                 << m_playbackSmokeLastPresentedFrame << "); they do not count.\n";
+        err << "[GUI-SMOKE] pinned window frames shown " << static_cast<qlonglong>( pinnedWindow.distinct ) << " of "
+            << static_cast<qlonglong>( pinnedWindow.windowFrames ) << " (window starts at frame "
+            << static_cast<qlonglong>( pinnedWindow.windowStart ) << ", after the start frame "
+            << static_cast<qlonglong>( m_sourceAdvance.startFrame ) << "; repeated presents not counted: "
+            << static_cast<qlonglong>( pinnedWindow.repeats ) << ").\n";
         return 11;
     }
 
@@ -27956,7 +27965,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeStartQualityMode = m_playbackQualityMode;
     m_playbackSmokeStartWorkerThreads = mlvappEffectivePlaybackWorkerThreadCount();
     m_playbackSmokePresentedFrames = 0;
-    m_playbackSmokeWindowPresentedFrames = 0;
+    m_playbackSmokePinnedWindow = playback_frame_range::PinnedWindowPresents();   // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r8
     m_playbackSmokeParityMatchCount = 0;
     m_playbackSmokeFirstPresentedFrame = -1;
     m_playbackSmokeLastPresentedFrame = -1;
@@ -28480,11 +28489,14 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     m_playbackSmokeLastPresentedTime = now;
     m_playbackSmokeLastPresentedFrame = static_cast<int>( displayFrame );
     ++m_playbackSmokePresentedFrames;
-    // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r4: the presents inside the admitted window, which the pinned capture is judged on
-    // (runGuiPlaybackSmoke's exit-11 check). consumed() > 0 is the counter's armed state (consumed() is 0 only while unarmed).
-    const bool presentInsideAdmittedWindow = playback_frame_range::sourceFrameInsideAdmittedWindow(
-        static_cast<int64_t>( displayFrame ), m_sourceAdvance.consumed() > 0, m_sourceAdvance.startFrame, m_playRequiredSourceFrames );
-    if( presentInsideAdmittedWindow ) ++m_playbackSmokeWindowPresentedFrames;
+    // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r8: the distinct source frames of the pinned window shown, which the pinned
+    // capture's stop and its exit-11 check both count. The pinned window is the frames Play presents, from the frame after the
+    // counter's start frame (on screen when Play starts; Play's first tick advances off it). Armed once, at the first present of a
+    // pinned capture (consumed() > 0 is the counter's armed state). Repeats and presents outside the window never count.
+    if( m_playbackSmokeTargetPresentedFrames > 0 && m_sourceAdvance.consumed() > 0 )
+        m_playbackSmokePinnedWindow.arm( playback_frame_range::pinnedWindowFirstFrame( m_sourceAdvance.startFrame ),
+                                         m_playRequiredSourceFrames );
+    m_playbackSmokePinnedWindow.notePresent( static_cast<int64_t>( displayFrame ) );
     const auto avgSmokeMs = [this]( double sum ) -> double
     {
         return m_playbackSmokePresentedFrames > 0
@@ -31036,6 +31048,13 @@ void MainWindow::notePlaybackSmokePresentedFrame(
      && programmaticPlayConsumed()   // ENFORCE-3: N presented frames are not N source frames (repaints, drops)
      && ui->actionPlay->isChecked() )
     {
+        // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r8: the stop counts what the gate judges, the distinct pinned-window frames
+        // shown (pinnedPresentStopCount), never raw presents alone (r7 venue: the 480th raw present was frame 609, 10 past the
+        // window, with 10 window frames never shown). Every counted window frame is a present, so the raw count above is only a
+        // necessary condition; short of the window count Play runs on, and the measured-play loop ends a count that cannot
+        // complete (kMeasuredPlayMaxFramesInFlight past the window) on the exit-11 mismatch.
+        if( playback_frame_range::pinnedPresentStopCount( m_playbackSmokePinnedWindow ) < m_playbackSmokeTargetPresentedFrames )
+            return;
         // Accumulate the target frame before stopping. setChecked(false)
         // synchronously finalizes smoke telemetry, so stopping earlier would
         // count frame N while reporting only N-1 timing samples. Playback may
@@ -36049,12 +36068,17 @@ void MainWindow::drawFrameReady()
         }
         if( !haveReadyFrame )
         {
+            // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r8: every-frame Play takes the oldest ready frame, so a ready frame never
+            // overtakes an older ready one that the forward-only guard below would then skip (r7 venue: 9 window frames lost)
+            const bool oldestReadyFirst = playback_frame_range::playbackAcquiresOldestReadyFirst(
+                ui->actionPlay->isChecked(), ui->actionDropFrameMode->isChecked() );
             haveReadyFrame = targetAwareLookaheadAcquire
                 ? m_pRenderThread->acquireLatestReadyFrameForPlaybackTarget(
                     &readyFrame,
                     activePlaybackTarget,
-                    activeGeneration )
-                : m_pRenderThread->acquireLatestReadyFrame( &readyFrame );
+                    activeGeneration,
+                    oldestReadyFirst )
+                : m_pRenderThread->acquireLatestReadyFrame( &readyFrame, oldestReadyFirst );
         }
         if( haveReadyFrame )
         {

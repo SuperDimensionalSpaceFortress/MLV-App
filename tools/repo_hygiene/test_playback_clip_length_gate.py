@@ -3147,14 +3147,19 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
                                  "measuredPlayLoopShouldStop( measuredState == playback_frame_range::PlayStopState::EndedEarly "
                                  "? playback_frame_range::PlayStopState::Continue : measuredState,"),
             "the measured loop stops on a timeline Reached before the pinned presented count": self._mutated_re(
-                r"m_playbackSmokeTargetPresentedFrames,\s*m_playbackSmokePresentedFrames,\s*m_playRequiredSourceFrames,\s*ui->actionPlay->isChecked\(\),\s*m_sourceAdvance\.consumed\(\)\s*\)\s*\)\s*\{\s*break;",
+                r"m_playbackSmokeTargetPresentedFrames,\s*playback_frame_range::pinnedPresentStopCount\(\s*m_playbackSmokePinnedWindow\s*\),\s*m_playRequiredSourceFrames,\s*ui->actionPlay->isChecked\(\),\s*m_sourceAdvance\.consumed\(\)\s*\)\s*\)\s*\{\s*break;",
                 "0, 0, 0, false, 0 ) ) { break;"),
+            # r8 (the r7 venue run, observed=470 of 480): the loop counts the distinct window frames shown, never raw presents
+            "the measured loop counts raw presents again": self._mutated_re(
+                r"playback_frame_range::pinnedPresentStopCount\(\s*m_playbackSmokePinnedWindow\s*\),\s*m_playRequiredSourceFrames,",
+                "m_playbackSmokePresentedFrames, m_playRequiredSourceFrames,"),
             # adversary A2/A3 on 7f0f6d58: the loop is told the admitted window and whether Play still runs
             "the measured loop is no longer told the admitted window": self._mutated_re(
-                r"m_playbackSmokePresentedFrames,\s*m_playRequiredSourceFrames,", "m_playbackSmokePresentedFrames, INT64_MAX,"),
+                r"pinnedPresentStopCount\(\s*m_playbackSmokePinnedWindow\s*\),\s*m_playRequiredSourceFrames,",
+                "pinnedPresentStopCount( m_playbackSmokePinnedWindow ), INT64_MAX,"),
             "the measured loop is no longer told whether Play still runs": self._mutated_re(
-                r"m_playbackSmokePresentedFrames,\s*m_playRequiredSourceFrames,\s*ui->actionPlay->isChecked\(\),",
-                "m_playbackSmokePresentedFrames, m_playRequiredSourceFrames, true,"),
+                r"pinnedPresentStopCount\(\s*m_playbackSmokePinnedWindow\s*\),\s*m_playRequiredSourceFrames,\s*ui->actionPlay->isChecked\(\),",
+                "pinnedPresentStopCount( m_playbackSmokePinnedWindow ), m_playRequiredSourceFrames, true,"),
             # r3 (Grok G1(b) on ee8f00bc): the loop is told how far the timeline has run, or a stalled present plays on past the window
             "the measured loop is no longer told how far the timeline has run": self._mutated_re(
                 r"ui->actionPlay->isChecked\(\),\s*m_sourceAdvance\.consumed\(\)\s*\)\s*\)\s*\{\s*break;",

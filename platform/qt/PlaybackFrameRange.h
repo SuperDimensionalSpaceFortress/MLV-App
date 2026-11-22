@@ -1352,7 +1352,7 @@ inline int64_t pinnedCaptureObservedFrames( int64_t targetPresentedFrames, int64
 // documents for drop-frame-off runs. A repeated present of a window frame and a present of a frame outside the window never count.
 // Armed once, before the first present, from the counter's start frame and the admitted requirement, which nothing moves during the
 // Play (a later arm is ignored). Unarmed, nothing is inside (fail closed).
-inline int64_t pinnedWindowFirstFrame( int64_t counterStartFrame ) { return counterStartFrame; }   // RED STUB: 970ef3f9's window
+inline int64_t pinnedWindowFirstFrame( int64_t counterStartFrame ) { return counterStartFrame + 1; }
 struct PinnedWindowPresents
 {
     int64_t windowStart = 0;
@@ -1379,7 +1379,7 @@ struct PinnedWindowPresents
     }
 };
 // What the present-path stop and the measured-play loop count toward the target: the distinct window frames, never raw presents.
-inline int64_t pinnedPresentStopCount( const PinnedWindowPresents &w ) { return w.distinct + w.outside + w.repeats; }   // RED STUB: raw
+inline int64_t pinnedPresentStopCount( const PinnedWindowPresents &w ) { return w.distinct; }
 // The `observed` of the strict check (exit 11): pinnedCaptureObservedFrames over the counted presents (distinct window frames plus
 // out-of-window presents; repeats are neither): equal to the target only when there were exactly target distinct window frames
 // and no present outside the window.
@@ -1391,7 +1391,7 @@ inline int64_t pinnedWindowObservedFrames( int64_t targetPresentedFrames, const 
 // venue log: the frame skipped by drawFrameReady's forward-only guard was already READY when the next one finished
 // (request_state rendering 0, ready slots 1), and the acquire took the newer one first. Drop-frame Play and a paused redraw keep
 // the newest ready frame first (a stale frame there is rightly skipped).
-inline bool playbackAcquiresOldestReadyFirst( bool playing, bool dropFrameMode ) { (void)playing; (void)dropFrameMode; return false; }   // RED STUB
+inline bool playbackAcquiresOldestReadyFirst( bool playing, bool dropFrameMode ) { return playing && !dropFrameMode; }
 // RenderFrameThread's ready-slot choice: does the ready slot with candidateSerial replace the one chosen so far (chosenSerial)?
 // Newest first is the previous rule exactly (a later serial, or an equal one, replaces).
 inline bool readySlotPreferred( bool oldestFirst, bool haveChosen, uint64_t candidateSerial, uint64_t chosenSerial )
