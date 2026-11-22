@@ -468,8 +468,9 @@ function Get-FpsArmComparisonEvidence {
 
     # Get-FaProp, not Get-NestedValue: Get-NestedValue's pipeline output unrolls a one-element array into its element, so "launch": [ { ... } ] read as the object inside and classified LIGHT
     # (adversary r5 A6); Get-FaProp keeps the array whole and Get-FpsArmFromLaunch refuses it.
-    $beforeArm = Get-FpsArmFromLaunch (Get-FaProp $BeforeSmoke "launch")
-    $afterArm = Get-FpsArmFromLaunch (Get-FaProp $AfterSmoke "launch")
+    # r14 (sol r13 B2): the whole smoke record is judged (Get-FpsArmFromSmokeRecord): a LIGHT launch beside a record-level observerControls entry is not proof of LIGHT.
+    $beforeArm = Get-FpsArmFromSmokeRecord $BeforeSmoke
+    $afterArm = Get-FpsArmFromSmokeRecord $AfterSmoke
     $verdict = Get-FpsPairVerdict -Baseline $beforeArm -Candidate $afterArm -BaselineName "before" -CandidateName "after"
     [pscustomobject]@{
         refused = (-not $verdict.allowed)

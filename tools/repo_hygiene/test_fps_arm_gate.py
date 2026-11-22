@@ -1049,6 +1049,20 @@ class CompareGuiSmokeAbFpsGateTests(_Probe):
         self.assertEqual(self.run_compare(self.LIGHT_ENV, self.HEAVY_ENV)["evidence"]["reason"], HEAVY_REASON)
         self.assertEqual(self.run_compare(self.LIGHT_ENV, None)["evidence"]["reason"], UNKNOWN_REASON)
 
+    def test_sol_r13_b2_a_light_launch_beside_record_level_observer_evidence_is_refused(self) -> None:
+        # r14 (sol r13 B2, launch-projection half): the comparator read only the launch block, so a valid LIGHT launch beside a record-level observerControls entry (which the saved-leg reader
+        # refuses) read LIGHT and the pair kept its fps deltas. The whole smoke record is judged now; a plain LIGHT smoke still reads LIGHT.
+        light = self.smoke(self.LIGHT_ENV)
+        extras = ("observerControls = [pscustomobject]@{ utilSample = $true }", "utilSample = $true", "look = [pscustomobject]@{ contactSheetFrames = 6 }", "legType = 'look'")
+        for extra in extras:
+            with self.subTest(extra=extra):
+                staged = (f"[pscustomobject]@{{ {extra}; launch = [pscustomobject]@{{ arguments = @({PRODUCER_ARGS_PS}); "
+                          f"environment = [pscustomobject]@{{ {self.LIGHT_ENV} }} }} }}")
+                out = self.ok(f"$e = Get-FpsArmComparisonEvidence -BeforeSmoke ({light}) -AfterSmoke ({staged})\n$e | ConvertTo-Json -Compress")
+                e = json.loads(out.strip().splitlines()[-1])
+                self.assertTrue(e["refused"])
+                self.assertEqual((e["reason"], e["before"]["arm"], e["after"]["arm"]), (UNKNOWN_REASON, "LIGHT", "UNKNOWN"))
+
 
 @requires_pwsh
 class LocalProofSummarizerFpsGateTests(unittest.TestCase):
@@ -1671,7 +1685,15 @@ class ObserverControlTests(_Probe):
 
     def test_a_malformed_launch_block_cannot_read_light_through_the_comparators(self) -> None:
         # r5 (adversary A6): Get-NestedValue unrolled a one-element "launch" array into the object inside, so the comparators classified a malformed record LIGHT. They read the block with Get-FaProp now.
-        for script in (COMPARE_SMOKE_AB_SCRIPT, CUDA_AB_SCRIPT):
+        # r14 (sol r13 B2): the GUI comparator reads the whole smoke record through the module's Get-FpsArmFromSmokeRecord, which reads the launch block with Get-FaProp itself
+        module = MODULE.read_text(encoding="utf-8")
+        smoke_reader = module[module.index("function Get-FpsArmFromSmokeRecord"):module.index("function Get-FpsPairVerdict")]
+        self.assertIn("Get-FpsArmFromLaunch (Get-FaProp $Record 'launch')", smoke_reader)
+        compare_source = COMPARE_SMOKE_AB_SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn('Get-FpsArmFromLaunch (Get-NestedValue', compare_source)
+        self.assertIn("$beforeArm = Get-FpsArmFromSmokeRecord $BeforeSmoke", compare_source)
+        self.assertIn("$afterArm = Get-FpsArmFromSmokeRecord $AfterSmoke", compare_source)
+        for script in (CUDA_AB_SCRIPT,):
             source = script.read_text(encoding="utf-8")
             self.assertNotIn('Get-FpsArmFromLaunch (Get-NestedValue', source, script.name)
             self.assertIn('Get-FpsArmFromLaunch (Get-FaProp', source, script.name)

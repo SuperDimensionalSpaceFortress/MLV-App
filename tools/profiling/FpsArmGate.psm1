@@ -475,6 +475,23 @@ function Get-FpsArmFromLaunch {
     $arm
 }
 
+function Get-FpsArmFromSmokeRecord {
+    <#
+    .SYNOPSIS
+    The arm of a local GUI smoke from its WHOLE result record: its recorded `launch` block (Get-FpsArmFromLaunch), and when that reads LIGHT, the record rule over everything else it carries
+    (Get-FpsRecordLightProblem: an observerControls entry, a look block, a legType but 'speed', an enabled forwarded switch). r14 (sol r13 B2): reading the launch alone discarded record-level
+    evidence the saved-leg reader refuses. The smoke runner's own result carries none of those keys, so a producer record is judged on its launch as before.
+    #>
+    param([AllowNull()]$Record)
+    # Get-FaProp keeps a one-element array whole (adversary r5 A6), so "launch": [ { ... } ] is refused by Get-FpsArmFromLaunch.
+    $arm = Get-FpsArmFromLaunch (Get-FaProp $Record 'launch')
+    if ($arm.arm -ceq 'LIGHT') {
+        $problem = Get-FpsRecordLightProblem $Record
+        if ($null -ne $problem) { return New-FpsArm 'UNKNOWN' 'environment' "the recorded launch reads LIGHT but $problem" }
+    }
+    $arm
+}
+
 function Get-FpsPairVerdict {
     <#
     .SYNOPSIS
@@ -559,4 +576,4 @@ function Get-FpsLegPlanRefusal {
     @('', 0, '')
 }
 
-Export-ModuleMember -Function Get-FpsObserverControls, Get-FpsLightShape, Get-FpsArmFromLegRecord, Get-FaProp, New-FpsArm, ConvertTo-FpsArmName, Get-FpsArmFromLegSpec, Get-FpsArmFromJobResult, Get-FpsArm, ConvertTo-FpsEnvMap, Get-FpsArmFromEnvironment, Get-FpsArmFromLaunch, Get-FpsPairVerdict, Get-FpsArmsVerdict, Get-FpsLegPlanRefusal
+Export-ModuleMember -Function Get-FpsObserverControls, Get-FpsLightShape, Get-FpsArmFromLegRecord, Get-FaProp, New-FpsArm, ConvertTo-FpsArmName, Get-FpsArmFromLegSpec, Get-FpsArmFromJobResult, Get-FpsArm, ConvertTo-FpsEnvMap, Get-FpsArmFromEnvironment, Get-FpsArmFromLaunch, Get-FpsArmFromSmokeRecord, Get-FpsPairVerdict, Get-FpsArmsVerdict, Get-FpsLegPlanRefusal
