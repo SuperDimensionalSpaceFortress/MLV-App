@@ -15,6 +15,10 @@
 //return 0 - no error
 int spline1dccc( float *xi, float *yi, int *nin, float *xo, float *yo, int *nout )
 {
+    //An allocation failure in the vectors or the solver is an error return, never an exception through the C caller
+    //(EXPORT-PRORES-LOOK-ASSIST-1, adversary A6 on 16d54744): processingSetGCurve then leaves the curve as it is.
+    try
+    {
     //no equal x values at points
     float last = xi[0];
     for( int i = 1; i < *nin; i++ )
@@ -39,6 +43,11 @@ int spline1dccc( float *xi, float *yi, int *nin, float *xo, float *yo, int *nout
         yo[i] = s( xo[i] );
     }
     return 0;
+    }
+    catch( ... )
+    {
+        return 1;
+    }
 }
 
 #ifdef __cplusplus

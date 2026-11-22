@@ -110,6 +110,48 @@ private:
     void (*m_previousTerm)(int) = SIG_ERR;
 };
 
+/* A cancel seen before the first frame is written (during the Look Assist analysis, or any time up to the
+ * frame loop) is the same typed cancellation the frame loop reports, never the failure of a later step
+ * such as a plan that is not runnable or an encoder that does not start (EXPORT-PRORES-LOOK-ASSIST-1 r2
+ * B3, sol r1 on ed129ee1). The caller has already freed what it holds. */
+int renderedCancelledBeforeEncode(const QString &baseName, uint32_t framesToExport,
+                                  const QString &partialRemoved)
+{
+    BatchLogger::err(QStringLiteral("[BATCH] RENDER_CANCELLED %1 frames=0/%2 partial_removed=%3\n")
+        .arg(baseName, QString::number(framesToExport),
+             partialRemoved.isEmpty() ? QStringLiteral("none") : partialRemoved));
+    return 4;
+}
+
+/* Every failure exit between the analysis and the frame loop (r3, r2 adversary A8 on 40efaff7). The flag is sampled
+ * before the failure line and again after it, so a cancel recorded before the line or while it is written (a blocked
+ * stderr) is the typed cancellation, exit 4, not the failure. The one window left is between the second sample and the
+ * return: no I/O and no wait, a few instructions after the job had already failed and stopped; a signal landing there
+ * is reported as the failure it raced (DISTINGUISH in the PR). The caller has already freed what it holds. */
+int renderedPreEncodeExit(int failureCode, const QString &failureLine, const QString &baseName,
+                          uint32_t framesToExport, const QString &partialRemoved)
+{
+    if( BatchRenderCancelScope::cancelled() )
+        return renderedCancelledBeforeEncode( baseName, framesToExport, partialRemoved );
+    BatchLogger::err( failureLine );
+    if( BatchRenderCancelScope::cancelled() )
+        return renderedCancelledBeforeEncode( baseName, framesToExport, partialRemoved );
+    return failureCode;
+}
+
+/* Removes the partial output and answers the path when it is gone, an empty string when it was not removed, so a
+ * RENDER_CANCELLED receipt never names a file it left behind (r3, r2 adversary A9 on 40efaff7). A partial that is
+ * still there (held open elsewhere) is named in a WARNING line instead. */
+QString removeRenderedPartial(const QString &partialPath)
+{
+    if( partialPath.isEmpty() ) return QString();
+    if( QFile::remove( partialPath ) ) return partialPath;
+    if( QFileInfo::exists( partialPath ) )
+        BatchLogger::err(QStringLiteral("[BATCH] WARNING RENDER_PARTIAL_KEPT path=%1 (could not be removed)\n")
+            .arg(partialPath));
+    return QString();
+}
+
 /* -------- Output verification --------------------------------------------
  *
  * Verification runs on the ffmpeg binary the export ALREADY REQUIRES, not on ffprobe.
@@ -361,7 +403,7 @@ int BatchRunner::exportRenderedVideoFile(
 
     const uint32_t totalFrames = getMlvFrames( mlvObject );
     BatchLogger::out(QStringLiteral("[BATCH] FILE %1 frames=%2\n")
-        .arg( baseName ).arg( totalFrames ));
+        .arg( baseName, QString::number( totalFrames ) ));
 
     /* ---- Frame range, identical rules to the CDNG runner ---------------- */
     uint32_t cutIn  = receipt->cutIn();
@@ -372,7 +414,7 @@ int BatchRunner::exportRenderedVideoFile(
     if( cutIn > totalFrames || cutIn > cutOut )
     {
         BatchLogger::err(QStringLiteral("[BATCH] ERROR: Receipt cut-in %1 is past clip end (frames=%2, cut-out=%3)\n")
-            .arg( cutIn ).arg( totalFrames ).arg( cutOut ));
+            .arg( QString::number( cutIn ), QString::number( totalFrames ), QString::number( cutOut ) ));
         freeMlvObject( mlvObject );
         freeProcessingObject( processingObject );
         return 4;
@@ -384,12 +426,57 @@ int BatchRunner::exportRenderedVideoFile(
     if( cutOut != unclampedCutOut )
     {
         BatchLogger::out(QStringLiteral("[BATCH] MAX_FRAMES %1 max=%2 cutIn=%3 cutOut=%4 originalCutOut=%5\n")
-            .arg( baseName ).arg( BatchContext::maxFrames() )
-            .arg( cutIn ).arg( cutOut ).arg( unclampedCutOut ));
+            .arg( baseName, QString::number( BatchContext::maxFrames() ),
+                  QString::number( cutIn ), QString::number( cutOut ), QString::number( unclampedCutOut ) ));
     }
+    const uint32_t framesToExport = cutOut - cutIn + 1;
 
     /* ---- Receipt -> pipeline, the same call the CDNG runner makes ------- */
     ReceiptApplier::applyToMlv( receipt, mlvObject, processingObject );
+
+    /* Look Assist, in the same state and on the same clip-wide anchor frame CDNG analyses
+     * (exportSingleFile), so both routes reach the same verdict. Look Assist writes its
+     * grade into the receipt and pushes only white balance and raw levels; a rendered
+     * frame shows only processing-object state, so the rest of the grade is pushed into
+     * the processing object too. Off (receipt or MLVAPP_NO_LOOK_ASSIST) or a skipped
+     * analysis returns false and nothing more is pushed. The cancel scope is installed
+     * first, so Ctrl+C during the analysis is the typed cancellation below, not a kill
+     * (adversary A9 on 16d54744). */
+    BatchRenderCancelScope cancelScope;
+    bool lookAssistApplied = false;
+    try
+    {
+        lookAssistApplied = ReceiptApplier::applyHeadlessLookAssist(
+            receipt, mlvObject, processingObject,
+            CdngSequenceExport::lookAssistAnalysisFrameIndex( cutIn, cutIn ) );
+    }
+    catch( ... )
+    {
+        /* An exception out of the analysis (std::bad_alloc in a curve decision) is a failure exit of this job, with
+         * its cleanup, never an exception out of the runner (r6 adversary A3 on 624f97d7). */
+        freeMlvObject( mlvObject );
+        freeProcessingObject( processingObject );
+        return renderedPreEncodeExit( 4,
+            QStringLiteral("[BATCH] ERROR: Look Assist analysis failed (out of memory or internal error). clip=%1\n").arg(baseName),
+            baseName, framesToExport, QString() );
+    }
+    if( lookAssistApplied )
+    {
+        ReceiptApplier::applyLookAssistGradeToProcessing( receipt, processingObject );
+        resetMlvCache( mlvObject );
+        resetMlvCachedFrame( mlvObject );
+        BatchLogger::out(QStringLiteral("[BATCH] RENDER_LOOK applied=true exposure=%1 contrast=%2\n")
+            .arg( QString::number( receipt->exposure() ), QString::number( receipt->contrast() ) ));
+    }
+
+    /* A Ctrl+C during the analysis is the typed cancellation before the plan is checked or the
+     * encoder spawned; every exit from here to the frame loop checks the flag first (r2 B3). */
+    if( BatchRenderCancelScope::cancelled() )
+    {
+        freeMlvObject( mlvObject );
+        freeProcessingObject( processingObject );
+        return renderedCancelledBeforeEncode( baseName, framesToExport, QString() );
+    }
 
     /* Debayer. ReceiptApplier does not set it because CDNG writes Bayer data and never
      * debayers; a rendered export does, so this mirrors the receipt-driven branch of
@@ -438,20 +525,19 @@ int BatchRunner::exportRenderedVideoFile(
 
     if( !plan.runnable )
     {
-        BatchLogger::err(QStringLiteral("[BATCH] ERROR: BatchRunner rendered-video job is not runnable. clip=%1 %2.\n")
-            .arg(baseName)
-            .arg(batchRenderedVideoJobPlanSummary(plan)));
         freeMlvObject( mlvObject );
         freeProcessingObject( processingObject );
-        return 2;
+        return renderedPreEncodeExit( 2,
+            QStringLiteral("[BATCH] ERROR: BatchRunner rendered-video job is not runnable. clip=%1 %2.\n")
+                .arg(baseName, batchRenderedVideoJobPlanSummary(plan)),
+            baseName, framesToExport, QString() );
     }
 
     if( !plan.runnerPrerequisites.limitation.isEmpty()
      && sourceAudioPlan.sourceAudioPresent )
     {
         BatchLogger::out(QStringLiteral("[BATCH] RENDER_AUDIO_DROPPED %1 reason=%2\n")
-            .arg(baseName)
-            .arg(plan.runnerPrerequisites.limitation));
+            .arg(baseName, plan.runnerPrerequisites.limitation));
     }
 
     /* ---- Atomic write target -------------------------------------------- */
@@ -462,17 +548,25 @@ int BatchRunner::exportRenderedVideoFile(
                                                          partialPath );
     if( partialPath.isEmpty() || arguments.isEmpty() )
     {
-        BatchLogger::err(QStringLiteral("[BATCH] ERROR: BatchRunner could not build the rendered-video ffmpeg invocation. clip=%1 output=%2.\n")
-            .arg(baseName, finalPath));
         freeMlvObject( mlvObject );
         freeProcessingObject( processingObject );
-        return 2;
+        return renderedPreEncodeExit( 2,
+            QStringLiteral("[BATCH] ERROR: BatchRunner could not build the rendered-video ffmpeg invocation. clip=%1 output=%2.\n")
+                .arg(baseName, finalPath),
+            baseName, framesToExport, QString() );
     }
 
+    /* A cancel already seen removes nothing; a stale partial this run does remove is named if a cancel then lands before
+     * the spawn (r6 adversary A2 on 624f97d7: the removal ran after a cancel and the receipt said partial_removed=none). */
+    if( BatchRenderCancelScope::cancelled() )
+    {
+        freeMlvObject( mlvObject );
+        freeProcessingObject( processingObject );
+        return renderedCancelledBeforeEncode( baseName, framesToExport, QString() );
+    }
     QDir().mkpath( QFileInfo( finalPath ).absolutePath() );
-    QFile::remove( partialPath ); /* a previous cancelled run may have left one */
+    const bool stalePartialRemoved = QFile::remove( partialPath ); /* a previous cancelled run may have left one */
 
-    const uint32_t framesToExport = cutOut - cutIn + 1;
     const int srcWidth  = static_cast<int>(getMlvWidth( mlvObject ));
     const int srcHeight = static_cast<int>(getMlvHeight( mlvObject ));
     const int outWidth  = plan.ffmpegFramePlan.outputWidth;
@@ -480,25 +574,32 @@ int BatchRunner::exportRenderedVideoFile(
     const bool scaled   = plan.ffmpegFramePlan.scaled;
 
     BatchLogger::out(QStringLiteral("[BATCH] RENDER_START %1 codec=%2 container=%3 source=%4x%5 output=%6x%7 scaled=%8 fps=%9 frames=%10 cutIn=%11 cutOut=%12 out=%13\n")
-        .arg(baseName)
-        .arg(plan.outputVerificationPlan.expectedCodec)
-        .arg(plan.outputVerificationPlan.expectedContainer)
-        .arg(srcWidth).arg(srcHeight)
-        .arg(outWidth).arg(outHeight)
-        .arg(scaled ? QStringLiteral("true") : QStringLiteral("false"))
-        .arg(plan.ffmpegFramePlan.frameRateArgument)
-        .arg(framesToExport).arg(cutIn).arg(cutOut)
-        .arg(finalPath));
+        .arg(baseName,
+             plan.outputVerificationPlan.expectedCodec,
+             plan.outputVerificationPlan.expectedContainer,
+             QString::number(srcWidth), QString::number(srcHeight),
+             QString::number(outWidth), QString::number(outHeight),
+             scaled ? QStringLiteral("true") : QStringLiteral("false"),
+             plan.ffmpegFramePlan.frameRateArgument,
+             QString::number(framesToExport), QString::number(cutIn), QString::number(cutOut),
+             finalPath));
     if( BatchContext::isVerbose() )
     {
         BatchLogger::out(QStringLiteral("[BATCH] RENDER_COMMAND %1 %2\n")
             .arg(batchRenderedVideoCommandExecutableForDisplay(
-                     plan.ffmpegCommandPlan.executable))
-            .arg(arguments));
+                     plan.ffmpegCommandPlan.executable),
+                 arguments));
     }
 
     /* ---- Encode ---------------------------------------------------------- */
-    BatchRenderCancelScope cancelScope;
+    if( BatchRenderCancelScope::cancelled() )
+    {
+        freeMlvObject( mlvObject );
+        freeProcessingObject( processingObject );
+        // The stale partial this run removed, else one still there (removed now, or named in a kept-file warning).
+        const QString stalePartial = stalePartialRemoved ? partialPath : removeRenderedPartial( partialPath );
+        return renderedCancelledBeforeEncode( baseName, framesToExport, stalePartial );
+    }
 
     export_process::StreamingPipeline pipeline;
     const export_process::Invocation invocation =
@@ -507,12 +608,13 @@ int BatchRunner::exportRenderedVideoFile(
 
     if( !pipeline.start( QVector<export_process::Invocation>{ invocation } ) )
     {
-        BatchLogger::err(QStringLiteral("[BATCH] ERROR: BatchRunner could not start ffmpeg. clip=%1 executable=%2. %3\n")
-            .arg(baseName, plan.ffmpegCommandPlan.executable,
-                 pipeline.diagnostics().trimmed()));
         freeMlvObject( mlvObject );
         freeProcessingObject( processingObject );
-        return 4;
+        return renderedPreEncodeExit( 4,
+            QStringLiteral("[BATCH] ERROR: BatchRunner could not start ffmpeg. clip=%1 executable=%2. %3\n")
+                .arg(baseName, plan.ffmpegCommandPlan.executable,
+                     pipeline.diagnostics().trimmed()),
+            baseName, framesToExport, QString() );
     }
 
     const size_t sourcePixels = static_cast<size_t>(srcWidth)
@@ -528,15 +630,17 @@ int BatchRunner::exportRenderedVideoFile(
 
     if( frameBuffer == nullptr || ( scaled && scaledBuffer == nullptr ) )
     {
-        BatchLogger::err(QStringLiteral("[BATCH] ERROR: BatchRunner could not allocate rendered-video frame buffers. clip=%1 source=%2x%3 output=%4x%5.\n")
-            .arg(baseName).arg(srcWidth).arg(srcHeight).arg(outWidth).arg(outHeight));
         pipeline.cancel();
         free( frameBuffer );
         free( scaledBuffer );
-        QFile::remove( partialPath );
+        const QString partialRemoved = removeRenderedPartial( partialPath );
         freeMlvObject( mlvObject );
         freeProcessingObject( processingObject );
-        return 4;
+        return renderedPreEncodeExit( 4,
+            QStringLiteral("[BATCH] ERROR: BatchRunner could not allocate rendered-video frame buffers. clip=%1 source=%2x%3 output=%4x%5.\n")
+                .arg(baseName, QString::number(srcWidth), QString::number(srcHeight),
+                     QString::number(outWidth), QString::number(outHeight)),
+            baseName, framesToExport, partialRemoved );
     }
 
     const int workerThreads = mlvappEffectiveWorkerThreadCount();
@@ -583,8 +687,8 @@ int BatchRunner::exportRenderedVideoFile(
          || ( framesWritten % 25 ) == 0 )
         {
             BatchLogger::out(QStringLiteral("[BATCH] RENDER_PROGRESS %1 frames=%2/%3 elapsed=%4\n")
-                .arg(baseName).arg(framesWritten).arg(framesToExport)
-                .arg(clipTimer.elapsed() / 1000.0, 0, 'f', 1));
+                .arg(baseName, QString::number(framesWritten), QString::number(framesToExport),
+                     QString::number(clipTimer.elapsed() / 1000.0, 'f', 1)));
         }
     }
 
@@ -604,9 +708,10 @@ int BatchRunner::exportRenderedVideoFile(
 
     if( cancelled )
     {
-        QFile::remove( partialPath );
+        const QString partialRemoved = removeRenderedPartial( partialPath );
         BatchLogger::err(QStringLiteral("[BATCH] RENDER_CANCELLED %1 frames=%2/%3 partial_removed=%4\n")
-            .arg(baseName).arg(framesWritten).arg(framesToExport).arg(partialPath));
+            .arg(baseName, QString::number(framesWritten), QString::number(framesToExport),
+                 partialRemoved.isEmpty() ? QStringLiteral("none") : partialRemoved));
         return 4;
     }
 
@@ -614,9 +719,9 @@ int BatchRunner::exportRenderedVideoFile(
     {
         QFile::remove( partialPath );
         BatchLogger::err(QStringLiteral("[BATCH] ERROR: BatchRunner rendered-video encode failed. clip=%1 frames=%2/%3 write_failed=%4 ffmpeg=%5\n")
-            .arg(baseName).arg(framesWritten).arg(framesToExport)
-            .arg(writeFailed ? QStringLiteral("true") : QStringLiteral("false"))
-            .arg(diagnostics.isEmpty() ? QStringLiteral("(no diagnostics)") : diagnostics));
+            .arg(baseName, QString::number(framesWritten), QString::number(framesToExport),
+                 writeFailed ? QStringLiteral("true") : QStringLiteral("false"),
+                 diagnostics.isEmpty() ? QStringLiteral("(no diagnostics)") : diagnostics));
         return 4;
     }
 
@@ -624,7 +729,7 @@ int BatchRunner::exportRenderedVideoFile(
     {
         QFile::remove( partialPath );
         BatchLogger::err(QStringLiteral("[BATCH] ERROR: BatchRunner rendered-video wrote %1 of %2 frames. clip=%3\n")
-            .arg(framesWritten).arg(framesToExport).arg(baseName));
+            .arg(QString::number(framesWritten), QString::number(framesToExport), baseName));
         return 4;
     }
 
@@ -665,7 +770,7 @@ int BatchRunner::exportRenderedVideoFile(
         if( decoded.frameCount != static_cast<int>(framesToExport) )
         {
             failures << QStringLiteral("frame-count expected=%1 decoded=%2")
-                .arg(framesToExport).arg(decoded.frameCount);
+                .arg(QString::number(framesToExport), QString::number(decoded.frameCount));
         }
 
         const double expectedDuration =
@@ -681,9 +786,9 @@ int BatchRunner::exportRenderedVideoFile(
          && qAbs( decoded.durationSeconds - expectedDuration ) > durationTolerance )
         {
             failures << QStringLiteral("duration expected=%1s decoded=%2s tolerance=%3s")
-                .arg(expectedDuration, 0, 'f', 3)
-                .arg(decoded.durationSeconds, 0, 'f', 3)
-                .arg(durationTolerance, 0, 'f', 3);
+                .arg(QString::number(expectedDuration, 'f', 3),
+                     QString::number(decoded.durationSeconds, 'f', 3),
+                     QString::number(durationTolerance, 'f', 3));
         }
     }
 
@@ -695,8 +800,8 @@ int BatchRunner::exportRenderedVideoFile(
                                       outWidth, outHeight, &decodedFrameBytes ) )
     {
         failures << QStringLiteral("decoded-frame-bytes expected=%1 (%2x%3 rgb24) actual=%4")
-            .arg(static_cast<qint64>(outWidth) * outHeight * 3)
-            .arg(outWidth).arg(outHeight).arg(decodedFrameBytes);
+            .arg(QString::number(static_cast<qint64>(outWidth) * outHeight * 3),
+                 QString::number(outWidth), QString::number(outHeight), QString::number(decodedFrameBytes));
     }
 
     /* (c) Codec / container / aspect. ffprobe is preferred when it is resolvable because
@@ -756,7 +861,8 @@ int BatchRunner::exportRenderedVideoFile(
         if( facts.width != outWidth || facts.height != outHeight )
         {
             failures << QStringLiteral("coded-dimensions expected=%1x%2 actual=%3x%4")
-                .arg(outWidth).arg(outHeight).arg(facts.width).arg(facts.height);
+                .arg(QString::number(outWidth), QString::number(outHeight),
+                     QString::number(facts.width), QString::number(facts.height));
         }
         /* A non-1:1 SAR would silently re-stretch the image on playback, undoing the
          * receipt's stretch. This is exactly the aspect defect the check exists for.
@@ -792,26 +898,26 @@ int BatchRunner::exportRenderedVideoFile(
     }
 
     BatchLogger::out(QStringLiteral("[BATCH] RENDER_VERIFIED %1 decoded_frames=%2 decoded_duration=%3 decoded_frame_bytes=%4 dimensions=%5x%6 bytes=%7 container_probe=%8 probe_source=%13 codec=%9 container=%10 sar=%11 dar=%12\n")
-        .arg(baseName)
-        .arg(decoded.frameCount)
-        .arg(decoded.durationSeconds, 0, 'f', 3)
-        .arg(decodedFrameBytes)
-        .arg(outWidth).arg(outHeight)
-        .arg(outputBytes)
-        .arg(facts.parsed ? probeExecutable : QStringLiteral("unavailable"))
-        .arg(facts.parsed ? facts.codecName : QStringLiteral("unchecked"))
-        .arg(facts.parsed ? facts.formatNames : QStringLiteral("unchecked"))
-        .arg(facts.parsed
+        .arg(baseName,
+             QString::number(decoded.frameCount),
+             QString::number(decoded.durationSeconds, 'f', 3),
+             QString::number(decodedFrameBytes),
+             QString::number(outWidth), QString::number(outHeight),
+             QString::number(outputBytes),
+             facts.parsed ? probeExecutable : QStringLiteral("unavailable"),
+             facts.parsed ? facts.codecName : QStringLiteral("unchecked"),
+             facts.parsed ? facts.formatNames : QStringLiteral("unchecked"),
+             facts.parsed
                 ? ( facts.sampleAspectRatio.isEmpty() ? QStringLiteral("unset") : facts.sampleAspectRatio )
-                : QStringLiteral("unchecked"))
-        .arg(facts.parsed
+                : QStringLiteral("unchecked"),
+             facts.parsed
                 ? ( facts.displayAspectRatio.isEmpty() ? QStringLiteral("unset") : facts.displayAspectRatio )
-                : QStringLiteral("unchecked"))
-        .arg(facts.parsed ? facts.source : QStringLiteral("none")));
+                : QStringLiteral("unchecked"),
+             facts.parsed ? facts.source : QStringLiteral("none")));
 
     BatchLogger::out(QStringLiteral("[BATCH] DONE %1 exported=%2 skipped=0 elapsed=%3\n")
-        .arg(baseName).arg(framesWritten)
-        .arg(clipTimer.elapsed() / 1000.0, 0, 'f', 1));
+        .arg(baseName, QString::number(framesWritten),
+             QString::number(clipTimer.elapsed() / 1000.0, 'f', 1)));
 
     return 0;
 }
@@ -851,32 +957,32 @@ int BatchRunner::run(const QString &inputPath, const QString &outputPath)
         if( !renderedPlan.requestValid )
         {
             BatchLogger::err(QStringLiteral("[BATCH] ERROR: BatchRunner invalid rendered-video request. %1. %2.\n")
-                .arg(batchExportFormatRequestSummary(renderedPlan.request))
-                .arg(batchRenderedVideoRequestShapeError(renderedPlan.request)));
+                .arg(batchExportFormatRequestSummary(renderedPlan.request),
+                     batchRenderedVideoRequestShapeError(renderedPlan.request)));
             return 2;
         }
         if( !renderedPlan.targetReady )
         {
             BatchLogger::err(QStringLiteral("[BATCH] ERROR: BatchRunner rendered-video target is incomplete. %1. %2. Choose a rendered codec or container before runner work.\n")
-                .arg(batchExportFormatRequestSummary(renderedPlan.request))
-                .arg(batchRenderedVideoTargetSummary(renderedPlan.target)));
+                .arg(batchExportFormatRequestSummary(renderedPlan.request),
+                     batchRenderedVideoTargetSummary(renderedPlan.target)));
             return 2;
         }
         if( !renderedPlan.encoderReady )
         {
             BatchLogger::err(QStringLiteral("[BATCH] ERROR: BatchRunner rendered-video encoder preset is unavailable. %1. %2. %3.\n")
-                .arg(batchExportFormatRequestSummary(renderedPlan.request))
-                .arg(batchRenderedVideoTargetSummary(renderedPlan.target))
-                .arg(batchRenderedVideoEncoderPresetSummary(renderedPlan.encoderPreset)));
+                .arg(batchExportFormatRequestSummary(renderedPlan.request),
+                     batchRenderedVideoTargetSummary(renderedPlan.target),
+                     batchRenderedVideoEncoderPresetSummary(renderedPlan.encoderPreset)));
             return 2;
         }
         if( !renderedPlan.outputReady )
         {
             BatchLogger::err(QStringLiteral("[BATCH] ERROR: BatchRunner rendered-video output path is invalid. %1. %2. %3. Choose an output directory or an explicit rendered file path ending in %4.\n")
-                .arg(batchExportFormatRequestSummary(renderedPlan.request))
-                .arg(batchRenderedVideoTargetSummary(renderedPlan.target))
-                .arg(batchRenderedVideoOutputPlanSummary(renderedPlan.outputPlan))
-                .arg(renderedPlan.target.extension));
+                .arg(batchExportFormatRequestSummary(renderedPlan.request),
+                     batchRenderedVideoTargetSummary(renderedPlan.target),
+                     batchRenderedVideoOutputPlanSummary(renderedPlan.outputPlan),
+                     renderedPlan.target.extension));
             return 2;
         }
     }
@@ -1028,9 +1134,8 @@ int BatchRunner::run(const QString &inputPath, const QString &outputPath)
         if( !basePlan.preflightReady )
         {
             BatchLogger::err(QStringLiteral("[BATCH] ERROR: BatchRunner rendered-video input/output preflight failed. clip=%1 planned-clips=%2 %3.\n")
-                .arg(baseName)
-                .arg(mlvFiles.size())
-                .arg(batchRenderedVideoJobPlanSummary(basePlan)));
+                .arg(baseName, QString::number(mlvFiles.size()),
+                     batchRenderedVideoJobPlanSummary(basePlan)));
             return 2;
         }
 
@@ -1042,8 +1147,7 @@ int BatchRunner::run(const QString &inputPath, const QString &outputPath)
          && !QFileInfo::exists( ffmpegBinaryPlan.resolvedExecutable ) )
         {
             BatchLogger::err(QStringLiteral("[BATCH] ERROR: rendered-video export cannot find ffmpeg. requested=%1 resolved=%2 searched=PATH. Pass --rendered-ffmpeg <path-to-ffmpeg> or put ffmpeg on PATH.\n")
-                .arg(ffmpegBinaryPlan.requestedExecutable)
-                .arg(ffmpegBinaryPlan.resolvedExecutable));
+                .arg(ffmpegBinaryPlan.requestedExecutable, ffmpegBinaryPlan.resolvedExecutable));
             return 2;
         }
 
@@ -1053,26 +1157,26 @@ int BatchRunner::run(const QString &inputPath, const QString &outputPath)
         if( mlvFiles.size() != 1 )
         {
             BatchLogger::err(QStringLiteral("[BATCH] ERROR: BatchRunner rendered-video export takes exactly one clip. found=%1 input=%2. Point --input at a single .mlv file.\n")
-                .arg(mlvFiles.size()).arg(inputPath));
+                .arg(QString::number(mlvFiles.size()), inputPath));
             return 2;
         }
 
         BatchLogger::out(QStringLiteral("[BATCH] START input=%1 output=%2 export-format=%3 rendered-codec=%4 rendered-container=%5 ffmpeg=%6\n")
-                   .arg( inputPath )
-                   .arg( basePlan.outputPlan.outputPath )
-                   .arg( batchExportFormatName( exportRequest.format ) )
-                   .arg( batchRenderedVideoCodecName( exportRequest.renderedCodec ) )
-                   .arg( batchRenderedVideoContainerName( exportRequest.renderedContainer ) )
-                   .arg( ffmpegBinaryPlan.resolvedExecutable ));
+                   .arg( inputPath,
+                         basePlan.outputPlan.outputPath,
+                         batchExportFormatName( exportRequest.format ),
+                         batchRenderedVideoCodecName( exportRequest.renderedCodec ),
+                         batchRenderedVideoContainerName( exportRequest.renderedContainer ),
+                         ffmpegBinaryPlan.resolvedExecutable ));
 
         const int renderedExit = BatchRunner::exportRenderedVideoFile(
             mlvPath, &receipt, basePlan, renderSettings );
 
         const double totalElapsedRendered = totalTimer.elapsed() / 1000.0;
         BatchLogger::out(QStringLiteral("[BATCH] COMPLETE files=1 succeeded=%1 failed=%2 total_elapsed=%3\n")
-                   .arg( renderedExit == 0 ? 1 : 0 )
-                   .arg( renderedExit == 0 ? 0 : 1 )
-                   .arg( totalElapsedRendered, 0, 'f', 1 ));
+                   .arg( QString::number( renderedExit == 0 ? 1 : 0 ),
+                         QString::number( renderedExit == 0 ? 0 : 1 ),
+                         QString::number( totalElapsedRendered, 'f', 1 ) ));
         return renderedExit;
     }
 
@@ -1091,18 +1195,18 @@ int BatchRunner::run(const QString &inputPath, const QString &outputPath)
     const int cdngCodecOffset =
         normalizedBatchCdngCodecOffset( BatchContext::cdngCodecOffset() );
     BatchLogger::out(QStringLiteral("[BATCH] START input=%1 output=%2 skip-errors=%3 resume=%4 max-frames=%5 cdng-codec=%6 export-format=%7 rendered-codec=%8 rendered-container=%9\n")
-               .arg( inputPath )
-               .arg( outputPath )
-               .arg( BatchContext::skipErrors() ? QStringLiteral("true")
-                                                 : QStringLiteral("false") )
-               .arg( BatchContext::resumeEnabled() ? QStringLiteral("true")
-                                                    : QStringLiteral("false") )
-               .arg( maxFrames > 0 ? QString::number( maxFrames )
-                                    : QStringLiteral("all") )
-               .arg( batchCdngCodecName( cdngCodecOffset ) )
-               .arg( batchExportFormatName( exportRequest.format ) )
-               .arg( batchRenderedVideoCodecName( exportRequest.renderedCodec ) )
-               .arg( batchRenderedVideoContainerName( exportRequest.renderedContainer ) ));
+               .arg( inputPath,
+                     outputPath,
+                     BatchContext::skipErrors() ? QStringLiteral("true")
+                                                : QStringLiteral("false"),
+                     BatchContext::resumeEnabled() ? QStringLiteral("true")
+                                                   : QStringLiteral("false"),
+                     maxFrames > 0 ? QString::number( maxFrames )
+                                   : QStringLiteral("all"),
+                     batchCdngCodecName( cdngCodecOffset ),
+                     batchExportFormatName( exportRequest.format ),
+                     batchRenderedVideoCodecName( exportRequest.renderedCodec ),
+                     batchRenderedVideoContainerName( exportRequest.renderedContainer ) ));
 
     int succeeded = 0;
     int failed = 0;
@@ -1119,28 +1223,29 @@ int BatchRunner::run(const QString &inputPath, const QString &outputPath)
         if( res.success )
         {
             BatchLogger::out(QStringLiteral("[BATCH] DONE %1 exported=%2 skipped=%3 elapsed=%4\n")
-                       .arg( baseName )
-                       .arg( res.framesExported )
-                       .arg( res.framesSkipped )
-                       .arg( res.elapsedSeconds, 0, 'f', 1 ));
+                       .arg( baseName,
+                             QString::number( res.framesExported ),
+                             QString::number( res.framesSkipped ),
+                             QString::number( res.elapsedSeconds, 'f', 1 ) ));
             succeeded++;
         }
         else
         {
             BatchLogger::out(QStringLiteral("[BATCH] FAIL %1 error=%2 exported=%3 skipped=%4 elapsed=%5\n")
                        .arg( baseName,
-                              res.errorMessage )
-                       .arg( res.framesExported )
-                       .arg( res.framesSkipped )
-                       .arg( res.elapsedSeconds, 0, 'f', 1 ));
+                              res.errorMessage,
+                              QString::number( res.framesExported ),
+                              QString::number( res.framesSkipped ),
+                              QString::number( res.elapsedSeconds, 'f', 1 ) ));
             failed++;
 
             /* Without --skip-errors, abort the entire batch on first failure */
             if( !BatchContext::skipErrors() )
             {
                 BatchLogger::out(QStringLiteral("[BATCH] COMPLETE files=%1 succeeded=%2 failed=%3 total_elapsed=%4\n")
-                           .arg( mlvFiles.size() ).arg( succeeded ).arg( failed )
-                           .arg( totalTimer.elapsed() / 1000.0, 0, 'f', 1 ));
+                           .arg( QString::number( mlvFiles.size() ), QString::number( succeeded ),
+                                 QString::number( failed ),
+                                 QString::number( totalTimer.elapsed() / 1000.0, 'f', 1 ) ));
                 return 4;
             }
         }
@@ -1148,8 +1253,8 @@ int BatchRunner::run(const QString &inputPath, const QString &outputPath)
 
     double totalElapsed = totalTimer.elapsed() / 1000.0;
     BatchLogger::out(QStringLiteral("[BATCH] COMPLETE files=%1 succeeded=%2 failed=%3 total_elapsed=%4\n")
-               .arg( mlvFiles.size() ).arg( succeeded ).arg( failed )
-               .arg( totalElapsed, 0, 'f', 1 ));
+               .arg( QString::number( mlvFiles.size() ), QString::number( succeeded ),
+                     QString::number( failed ), QString::number( totalElapsed, 'f', 1 ) ));
 
     if( failed > 0 ) return 1;
     return 0;
@@ -1189,7 +1294,7 @@ ProcessResult BatchRunner::exportSingleFile(const QString &mlvPath,
     setMlvCpuCores( mlvObject, mlvappEffectiveWorkerThreadCount() );
 
     uint32_t totalFrames = getMlvFrames( mlvObject );
-    BatchLogger::out(QStringLiteral("[BATCH] FILE %1 frames=%2\n").arg( baseName ).arg( totalFrames ));
+    BatchLogger::out(QStringLiteral("[BATCH] FILE %1 frames=%2\n").arg( baseName, QString::number( totalFrames ) ));
 
     /* ---- Derive export parameters from receipt ----
      * cutIn/cutOut: use receipt values if set, else export all frames.
@@ -1208,7 +1313,7 @@ ProcessResult BatchRunner::exportSingleFile(const QString &mlvPath,
     {
         result.success = false;
         result.errorMessage = QStringLiteral("Receipt cut-in %1 is past clip end (frames=%2, cut-out=%3)")
-                    .arg( cutIn ).arg( totalFrames ).arg( cutOut );
+                    .arg( QString::number( cutIn ), QString::number( totalFrames ), QString::number( cutOut ) );
         freeMlvObject( mlvObject );
         freeProcessingObject( processingObject );
         return result;
@@ -1220,11 +1325,11 @@ ProcessResult BatchRunner::exportSingleFile(const QString &mlvPath,
     if( cutOut != unclampedCutOut )
     {
         BatchLogger::out(QStringLiteral("[BATCH] MAX_FRAMES %1 max=%2 cutIn=%3 cutOut=%4 originalCutOut=%5\n")
-                   .arg( baseName )
-                   .arg( BatchContext::maxFrames() )
-                   .arg( cutIn )
-                   .arg( cutOut )
-                   .arg( unclampedCutOut ));
+                   .arg( baseName,
+                         QString::number( BatchContext::maxFrames() ),
+                         QString::number( cutIn ),
+                         QString::number( cutOut ),
+                         QString::number( unclampedCutOut ) ));
     }
 
     uint32_t effectiveCutIn = cutIn;  /* may be adjusted by resume */
@@ -1305,7 +1410,8 @@ ProcessResult BatchRunner::exportSingleFile(const QString &mlvPath,
                         {
                             /* Already complete — do NOT delete files, just log and skip */
                             BatchLogger::out(QStringLiteral("[BATCH] RESUME %1 already_complete existing=%2 highestSuffix=%3\n")
-                                       .arg( baseName ).arg( validCount ).arg( highestSuffix ));
+                                       .arg( baseName, QString::number( validCount ),
+                                             QString::number( highestSuffix ) ));
                             result.success = true;
                             result.framesExported = 0;
                             result.framesSkipped = cutOut - cutIn + 1;
@@ -1320,14 +1426,15 @@ ProcessResult BatchRunner::exportSingleFile(const QString &mlvPath,
                         {
                             effectiveCutIn = newCutIn;
                             BatchLogger::out(QStringLiteral("[BATCH] RESUME %1 advancing cutIn=%2 (was %3) existing=%4 highestSuffix=%5\n")
-                                       .arg( baseName ).arg( effectiveCutIn ).arg( cutIn )
-                                       .arg( validCount ).arg( highestSuffix ));
+                                       .arg( baseName, QString::number( effectiveCutIn ),
+                                             QString::number( cutIn ), QString::number( validCount ),
+                                             QString::number( highestSuffix ) ));
                         }
                         else
                         {
                             BatchLogger::out(QStringLiteral("[BATCH] RESUME %1 no_advance highestSuffix=%2 maps_to_frame=%3 below_cutIn=%4\n")
-                                       .arg( baseName ).arg( highestSuffix )
-                                       .arg( resumeFrameIndex ).arg( cutIn ));
+                                       .arg( baseName, QString::number( highestSuffix ),
+                                             QString::number( resumeFrameIndex ), QString::number( cutIn ) ));
                         }
                     }
                     else
@@ -1335,7 +1442,7 @@ ProcessResult BatchRunner::exportSingleFile(const QString &mlvPath,
                         /* Suffix not found in video_index — files may be from a different clip.
                          * Play it safe: export from original cutIn (overwrite). */
                         BatchLogger::out(QStringLiteral("[BATCH] RESUME %1 suffix_not_found highestSuffix=%2 exporting_from=%3\n")
-                                   .arg( baseName ).arg( highestSuffix ).arg( cutIn ));
+                                   .arg( baseName, QString::number( highestSuffix ), QString::number( cutIn ) ));
                     }
                 }
             }

@@ -839,6 +839,49 @@ TEST(LookAssistFlavors, TheFilmGradeIsLaidOnlyOverADefaultCurve)
     ASSERT_TRUE( lookAssistFilmGradeDecision( LookAssistFlavor::Classic, user ) == QLatin1String( "none" ) );
 }
 
+// r4 (sol r3 B2 on 875d5e40): a curve that is identity-shaped but malformed (an odd tail, a token that is no number,
+// content after the fourth line) or holds a non-finite knot is not the default curve, so neither Film nor Vision50d
+// may lay its grade over it, and no grade claims to own it (its restore never replaces it either).
+TEST(LookAssistFlavors, AMalformedOrNonFiniteCurveIsNeverTheDefault)
+{
+    const QString id = QStringLiteral("1e-5;1e-5;1;1;");
+    const QString three = id + QStringLiteral("?") + id + QStringLiteral("?") + id + QStringLiteral("?");
+    const QString notDefault[] = {
+        three + QStringLiteral("1e-5;1e-5;1;1;0.5;"),     // sol's input: an x with no y on line four
+        three + QStringLiteral("nan;1e-5;1;1;"),          // sol's input: a nan knot
+        three + QStringLiteral("1e-5;1e-5;1;inf;"),
+        three + QStringLiteral("1e-5;1e-5;-inf;1;"),
+        three + QStringLiteral("1e-5;1e-5;1;1x;"),
+        id + QStringLiteral("0.5;?") + id + QStringLiteral("?") + id + QStringLiteral("?") + id,
+        three + id + QStringLiteral("?0.5;"),             // content after the fourth line
+    };
+    for( const QString &curve : notDefault )
+    {
+        ASSERT_FALSE( lookAssistIsDefaultGradationCurve( curve ) );
+        ASSERT_TRUE( lookAssistGradeDecision( LookAssistFlavor::Film, curve ) == QLatin1String( "skipped_user_curve" ) );
+        ASSERT_TRUE( lookAssistGradeDecision( LookAssistFlavor::Vision50d, curve ) == QLatin1String( "skipped_user_curve" ) );
+        std::vector<LookAssistGradationPoint> lines[4];
+        bool wellFormed = true;
+        lookAssistParseGradationCurve( curve, lines, &wellFormed );
+        ASSERT_FALSE( wellFormed );
+    }
+    // A grade's own curve with a malformed tail is the user's, not the grade's: the restore keeps it.
+    const QString base = ReceiptSettings().gradationCurve();
+    for( const QString &laid : { lookAssistFilmGradationCurve( LookAssistScene::Shade ),
+                                 lookAssistVision50dGradationCurve( LookAssistScene::Shade ) } )
+    {
+        ASSERT_TRUE( lookAssistGradeOwnsGradationCurve( laid ) );
+        const QString tail = laid + QStringLiteral("0.5;");
+        ASSERT_FALSE( lookAssistGradeOwnsGradationCurve( tail ) );
+        ASSERT_TRUE( lookAssistGradationCurveAfterFilmRestore( tail, base ) == tail );
+    }
+    // The well-formed defaults still are: the receipt default, the widget's rewrite, an empty string, a trailing '?'.
+    ASSERT_TRUE( lookAssistIsDefaultGradationCurve( base ) );
+    ASSERT_TRUE( lookAssistIsDefaultGradationCurve( widgetConfiguration( base ) ) );
+    ASSERT_TRUE( lookAssistIsDefaultGradationCurve( QString() ) );
+    ASSERT_TRUE( lookAssistIsDefaultGradationCurve( base + QStringLiteral("?") ) );
+}
+
 TEST(LookAssistFlavors, LookAssistOffLeavesAFilmSettingUntouchedAndPutsALaidCurveBack)
 {
     FlavorEnvGuard guard;

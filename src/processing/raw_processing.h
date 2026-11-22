@@ -521,8 +521,9 @@ void processingSetVibrance(processingObject_t * processing, double vibranceFacto
 /* Set transformation */
 void processingSetTransformation(processingObject_t * processing, int transformation);
 
-/* Set gradation curve */
-void processingSetGCurve(processingObject_t * processing, int num, float * pXin, float * pYin, uint8_t channel);
+/* Set gradation curve. Returns 0 when the table was written (num < 2 writes the identity), nonzero when it was left as
+ * it is: a knot the spline cannot use, a failed allocation or a spline error (EXPORT-PRORES-LOOK-ASSIST-1 r3). */
+int processingSetGCurve(processingObject_t * processing, int num, float * pXin, float * pYin, uint8_t channel);
 
 /* Set Hue vs. Luma curve */
 void processingSetHueVsCurves(processingObject_t * processing, int num, float * pXin, float * pYin, uint8_t channel);

@@ -13,6 +13,7 @@
 #include "ExportProcess.h"
 #include "../../src/batch/LookAssistAnalysis.h"
 #include "../../src/batch/ReceiptApplier.h"
+#include "../../src/batch/ReceiptXmlWalk.h"
 #include "DualIsoLevelSyncPolicy.h"
 #include "PlaybackFpsMeterPolicy.h"
 #include "PlaybackScaleLabel.h"
@@ -16084,8 +16085,12 @@ void MainWindow::openSession(QString fileNameSession)
     //Clear the last session
     deleteSession();
 
-    //Parse
-    Rxml.setDevice(&file);
+    //Parse one read of the file: the Look Assist opt-out scan re-reads these bytes, never the file
+    //(ReceiptXmlWalk.h; EXPORT-PRORES-LOOK-ASSIST-1 r2 adversary A3)
+    QByteArray sessionBytes = file.readAll();
+    QBuffer sessionBuffer( &sessionBytes );
+    sessionBuffer.open( QIODevice::ReadOnly );
+    Rxml.setDevice(&sessionBuffer);
     while( !Rxml.atEnd() )
     {
         Rxml.readNext();
@@ -16300,8 +16305,11 @@ void MainWindow::resetReceiptWithDefault( ReceiptSettings *receipt )
     //Version of settings (values may be interpreted differently)
     int versionReceipt = 0;
 
-    //Parse
-    Rxml.setDevice(&file);
+    //Parse one read of the file (the opt-out scan re-reads these bytes, ReceiptXmlWalk.h)
+    QByteArray receiptBytes = file.readAll();
+    QBuffer receiptBuffer( &receiptBytes );
+    receiptBuffer.open( QIODevice::ReadOnly );
+    Rxml.setDevice(&receiptBuffer);
     while( !Rxml.atEnd() )
     {
         Rxml.readNext();
@@ -16354,8 +16362,11 @@ void MainWindow::on_actionImportReceipt_triggered()
     //Version of settings (values may be interpreted differently)
     int versionReceipt = 0;
 
-    //Parse
-    Rxml.setDevice(&file);
+    //Parse one read of the file (the opt-out scan re-reads these bytes, ReceiptXmlWalk.h)
+    QByteArray receiptBytes = file.readAll();
+    QBuffer receiptBuffer( &receiptBytes );
+    receiptBuffer.open( QIODevice::ReadOnly );
+    Rxml.setDevice(&receiptBuffer);
     while( !Rxml.atEnd() )
     {
         Rxml.readNext();
@@ -16438,7 +16449,8 @@ void MainWindow::readXmlElementsFromFile(QXmlStreamReader *Rxml, ReceiptSettings
     receipt->setDualIsoEvCorrection( 1 );
     receipt->setDualIsoBlackDelta( -1 );
 
-    //Read tags
+    //Read tags (the walk is base's; optOutWatch only observes it, ReceiptXmlWalk.h)
+    ReceiptXmlWalk::OptOutWatch optOutWatch( Rxml );
     while( !Rxml->atEnd() && !Rxml->isEndElement() )
     {
         Rxml->readNext();
@@ -16862,7 +16874,12 @@ void MainWindow::readXmlElementsFromFile(QXmlStreamReader *Rxml, ReceiptSettings
         }
         else if( Rxml->isStartElement() && Rxml->name() == QString( "lookAssistEnabled" ) )
         {
-            receipt->setLookAssistEnabled( (bool)Rxml->readElementText().toInt() );
+            optOutWatch.sawLookAssistEnabled( Rxml );
+            bool lookAssistOn = true;
+            const QString lookAssistText = Rxml->readElementText();
+            if( optOutWatch.atDirectChild()
+             && ReceiptXmlWalk::lookAssistEnabledValue( lookAssistText, &lookAssistOn ) )
+                receipt->setLookAssistEnabled( lookAssistOn );
             Rxml->readNext();
         }
         else if( Rxml->isStartElement() && Rxml->name() == QString( "lookAssistFlavor" ) )
@@ -17090,7 +17107,14 @@ void MainWindow::readXmlElementsFromFile(QXmlStreamReader *Rxml, ReceiptSettings
             Rxml->readElementText();
             Rxml->readNext();
         }
+        optOutWatch.endOfPass( Rxml );
     }
+
+    //The last plain direct lookAssistEnabled holding an integer wins, on or off, when the walk stepped past it or a
+    //namespaced extension overwrote it (EXPORT-PRORES-LOOK-ASSIST-1 r2 B1/B2, r3 A1-A3, r6 A1)
+    bool lookAssistDirect = true;
+    if( optOutWatch.lastDirectValue( Rxml, &lookAssistDirect ) )
+        receipt->setLookAssistEnabled( lookAssistDirect );
 }
 
 //Write all receipt elements to xml

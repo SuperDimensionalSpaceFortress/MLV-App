@@ -85,6 +85,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_conform_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_conform_wiring.cpp \
     $$REPO_ROOT/tests/console/test_export_receipt_debayer_wiring.cpp \
+    $$REPO_ROOT/tests/console/test_export_rendered_look_assist_wiring.cpp \
     $$REPO_ROOT/tests/console/test_bayer_border_bounds.cpp \
     $$REPO_ROOT/src/librtprocess/src/demosaic/border.cc \
     $$REPO_ROOT/tests/console/test_playback_conform_env_override.cpp \
@@ -129,6 +130,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_fullscreen_control_bar_wiring.cpp
 
 HEADERS += \
+    $$REPO_ROOT/src/batch/ReceiptXmlWalk.h \
     $$REPO_ROOT/platform/qt/FpmNameValidator.h \
     $$REPO_ROOT/platform/qt/AtomicFileReplace.h \
     $$REPO_ROOT/platform/qt/SyncDownloadWaiter.h \

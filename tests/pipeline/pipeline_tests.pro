@@ -155,6 +155,7 @@ SOURCES += \
     $$REPO_ROOT/tests/pipeline/test_repo_root_pin.cpp \
     $$REPO_ROOT/tests/pipeline/test_look_assist_fixture_neutral_probe.cpp \
     $$REPO_ROOT/tests/pipeline/test_look_assist_flavors.cpp \
+    $$REPO_ROOT/tests/pipeline/test_export_rendered_look_assist_grade.cpp \
     $$REPO_ROOT/tests/pipeline/test_sh_frame_state_proxy.cpp \
     $$REPO_ROOT/tests/pipeline/test_look_assist_analysis_render_race.cpp \
     $$REPO_ROOT/tests/pipeline/test_look_assist_analysis_thread_identity.cpp \
@@ -174,6 +175,7 @@ SOURCES += \
     $$REPO_ROOT/tests/pipeline/test_lj92_pred1_reader.cpp
 
 HEADERS += \
+    $$REPO_ROOT/src/batch/ReceiptXmlWalk.h \
     $$REPO_ROOT/src/processing/ThreadExitCache.h \
     $$REPO_ROOT/platform/qt/Debayered16ReconReusePolicy.h \
     $$REPO_ROOT/tests/common/minitest.h \

@@ -164,6 +164,47 @@ void processingSetExposureStops(processingObject_t * processing, double exposure
     }
 }
 
+/* EXPORT-PRORES-LOOK-ASSIST-1: ReceiptApplier::applyLookAssistGradeToProcessing pushes the rest of the grade; console
+ * tests never render, so these only record the value. */
+void processingSetSimpleContrast(processingObject_t * processing, double value)
+{
+    if (processing) {
+        processing->contrast = value * 0.65;
+    }
+}
+
+void processingSetPivot(processingObject_t * processing, double value)
+{
+    if (processing) {
+        processing->pivot = value;
+    }
+}
+
+void processingSetVibrance(processingObject_t * processing, double vibranceFactor)
+{
+    if (processing) {
+        processing->vibrance = vibranceFactor;
+    }
+}
+
+void processingSetShadows(processingObject_t * processing, double value)
+{
+    if (processing) {
+        processing->shadows_highlights.shadows = value;
+    }
+}
+
+void processingSetHighlights(processingObject_t * processing, double value)
+{
+    if (processing) {
+        processing->shadows_highlights.highlights = value;
+    }
+}
+
+/* The real setter's status (raw_processing.h): 0 = table written. Console tests never render; the all-or-nothing curve
+ * push is pinned against the real setter in pipeline_tests (ExportRenderedLookAssistGrade). */
+int processingSetGCurve(processingObject_t *, int, float *, float *, uint8_t) { return 0; }
+
 int processingWhiteBalanceControlsForAsShotNeutral(const double[3], int *, int *)
 {
     return 0; /* console tests never open a clip; only WB_CUSTOM DNG sequences reach the fit (pipeline test covers it) */

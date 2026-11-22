@@ -13,7 +13,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <new>
+#include <vector>
 
 namespace
 {
@@ -209,6 +212,64 @@ static void applyHeadlessRawLevelsAutoFix( ReceiptSettings *receipt,
     llrpResetFpmStatus( mlvObject );
     llrpResetBpmStatus( mlvObject );
     llrpResetDngBWLevels( mlvObject );
+}
+
+/* Everything applyHeadlessRawLevelsAutoFix changes, taken just before it, so a Look Assist pass that skips after it
+ * leaves the levels exactly as the receipt applied them: a skipped pass is no grade, and a rendered export renders
+ * with these levels (EXPORT-PRORES-LOOK-ASSIST-1, adversary A2 on 76653777). */
+struct HeadlessRawLevels
+{
+    int receiptBlack = 0;
+    int receiptWhite = 0;
+    int32_t mlvBlack = 0;
+    int32_t mlvWhite = 0;
+    int dngBlack = 0;
+    int dngWhite = 0;
+    float processingBlack = 0.0f;
+    int processingWhite = 0;
+};
+
+static HeadlessRawLevels captureHeadlessRawLevels( ReceiptSettings *receipt,
+                                                   mlvObject_t *mlvObject,
+                                                   processingObject_t *processingObject )
+{
+    HeadlessRawLevels levels;
+    levels.receiptBlack = receipt->rawBlack();
+    levels.receiptWhite = receipt->rawWhite();
+    levels.mlvBlack = getMlvBlackLevel( mlvObject );
+    levels.mlvWhite = getMlvWhiteLevel( mlvObject );
+    if( mlvObject->llrawproc )
+    {
+        levels.dngBlack = mlvObject->llrawproc->dng_black_level;
+        levels.dngWhite = mlvObject->llrawproc->dng_white_level;
+    }
+    levels.processingBlack = processingObject->black_level;
+    levels.processingWhite = processingObject->white_level;
+    return levels;
+}
+
+static void restoreHeadlessRawLevels( const HeadlessRawLevels &levels,
+                                      ReceiptSettings *receipt,
+                                      mlvObject_t *mlvObject,
+                                      processingObject_t *processingObject )
+{
+    receipt->setRawBlack( levels.receiptBlack );
+    receipt->setRawWhite( levels.receiptWhite );
+    setMlvBlackLevel( mlvObject, levels.mlvBlack );
+    setMlvWhiteLevel( mlvObject, levels.mlvWhite );
+    if( mlvObject->llrawproc )
+    {
+        mlvObject->llrawproc->dng_black_level = levels.dngBlack;
+        mlvObject->llrawproc->dng_white_level = levels.dngWhite;
+    }
+    processingObject->black_level = levels.processingBlack;
+    processingObject->white_level = levels.processingWhite;
+    // -1 / -1: keep both levels as set above and rebuild the levels table from them.
+    processingSetBlackAndWhiteLevel( processingObject, -1, -1, getMlvBitdepth( mlvObject ) );
+    llrpResetFpmStatus( mlvObject );
+    llrpResetBpmStatus( mlvObject );
+    resetMlvCache( mlvObject );
+    resetMlvCachedFrame( mlvObject );
 }
 
 }
@@ -808,11 +869,19 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
                                    static_cast<int>( analysisFrame ),
                                    totalFrames - 1 );
 
+    // The receipt's raw levels as they were on entry, before the baseline restore below rewrites them: a skip gives these
+    // back, so the receipt agrees with the live levels it restores (adversary A4 on 16d54744).
+    const int entryReceiptRawBlack = receipt->rawBlack();
+    const int entryReceiptRawWhite = receipt->rawWhite();
+
     if( receipt->lookAssistBaselineValid() )
         restoreHeadlessLookAssistBaseline( receipt );
     else
         captureHeadlessLookAssistBaseline( receipt, mlvObject );
 
+    HeadlessRawLevels levelsBeforeAutoFix = captureHeadlessRawLevels( receipt, mlvObject, processingObject );
+    levelsBeforeAutoFix.receiptBlack = entryReceiptRawBlack;
+    levelsBeforeAutoFix.receiptWhite = entryReceiptRawWhite;
     applyHeadlessRawLevelsAutoFix( receipt, mlvObject, processingObject );
 
     // The flavor: MLVAPP_LOOK_ASSIST_FLAVOR (runs) over the receipt's lookAssistFlavor element; neither = Classic.
@@ -835,6 +904,7 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             "[BATCH] WARNING LOOK_ASSIST skipped: invalid raw size width=%1 height=%2\n" )
             .arg( raw_w )
             .arg( raw_h ) );
+        restoreHeadlessRawLevels( levelsBeforeAutoFix, receipt, mlvObject, processingObject );
         return false;
     }
 
@@ -854,6 +924,7 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             .arg( downscaleFactor )
             .arg( width )
             .arg( height ) );
+        restoreHeadlessRawLevels( levelsBeforeAutoFix, receipt, mlvObject, processingObject );
         return false;
     }
 
@@ -877,6 +948,7 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             .arg( frameIndex )
             .arg( width )
             .arg( height ) );
+        restoreHeadlessRawLevels( levelsBeforeAutoFix, receipt, mlvObject, processingObject );
         return false;
     }
 
@@ -1085,6 +1157,10 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             .arg( processingGetWhiteBalanceTint( processingObject ), 0, 'f', 9 )
             .arg( cachedFrameBefore )
             .arg( mlvObject->current_cached_frame_active ) );
+        // Master's pass starts from the raw levels this pass found on entry, not from this pass's auto-fix, so a skip in
+        // it gives back the levels the receipt applied (r3, r2 adversary A6 on 40efaff7). Its own auto-fix reads only the
+        // clip's original levels and the baseline it restores, so a pass that does not skip ends on the same levels.
+        restoreHeadlessRawLevels( levelsBeforeAutoFix, receipt, mlvObject, processingObject );
         return applyHeadlessLookAssist( receipt, mlvObject, processingObject, analysisFrame, true );
     }
     // The window-lit check runs on copies (the GUI does the same; see there): by colour alone it only logs; it APPLIES
@@ -1231,6 +1307,110 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
         .arg( lookAssistDecisionLogFields( stats, decisionTrace ) )
         .arg( lookAssistFlavorName( flavor ) ) );
 
+    return true;
+}
+
+/* The one warning applyLookAssistGradeToProcessing writes when the curve is not pushed. It cannot throw: an allocation
+ * failure while writing it loses the line, never the job (r3, r2 adversary A7 on 40efaff7). */
+static void logLookAssistCurveNotApplied( const char *reason ) noexcept
+{
+    try
+    {
+        BatchLogger::err( QStringLiteral( "[BATCH] WARNING LOOK_ASSIST curve not applied: %1\n" )
+            .arg( QLatin1String( reason ) ) );
+    }
+    catch( ... )
+    {
+    }
+}
+
+bool ReceiptApplier::applyLookAssistGradeToProcessing(ReceiptSettings *receipt,
+                                                      processingObject_t *processingObject)
+{
+    if( !receipt || !processingObject ) return false;
+
+    processingSetExposureStops( processingObject, receipt->exposure() / 100.0 + 1.2 );
+    processingSetSimpleContrast( processingObject, receipt->contrast() / 100.0 );
+    processingSetPivot( processingObject, receipt->pivot() / 100.0 );
+    // The vibrance slider's own range (-100..100; adversary A11 on 76653777): an out-of-range receipt value can neither
+    // overflow the int sum nor hand pow a negative base.
+    const double vibrance = qBound( -100, receipt->vibrance(), 100 );
+    processingSetVibrance( processingObject,
+                           std::pow( ( vibrance + 100.0 ) / 200.0 * 2.0, std::log( 3.6 ) / std::log( 2.0 ) ) );
+    processingSetShadows( processingObject, receipt->shadows() * 1.5 / 100.0 );
+    processingSetHighlights( processingObject, receipt->highlights() * 1.5 / 100.0 );
+
+    // The curve is all four channels or none: every C++ allocation (the string, the parse, the knot arrays) happens inside
+    // one try before any table moves, so a std::bad_alloc leaves the tables as they were and never escapes the rendered
+    // job's own error paths (r3, r2 adversary A7 on 40efaff7). The snapshot below is a malloc, checked.
+    std::vector<float> xs[4], ys[4];
+    try
+    {
+        // A default curve is left alone, so a grade without one renders exactly as before.
+        const QString curve = receipt->gradationCurve();
+        if( lookassist::lookAssistIsDefaultGradationCurve( curve ) ) return true;
+        std::vector<lookassist::LookAssistGradationPoint> lines[4];
+        bool wellFormed = false;
+        // Curves::setConfiguration returns before pushing any table when the string runs out before its fourth line, so a
+        // partial curve pushes nothing here either (adversary A3 on 76653777); nor does a line with an x and no y or a
+        // token that is no number (r2 adversary A4 on 40efaff7).
+        if( lookassist::lookAssistParseGradationCurve( curve, lines, &wellFormed ) != 4 || !wellFormed )
+        {
+            logLookAssistCurveNotApplied( "malformed gradation curve" );
+            return false;
+        }
+        // Every line the widget draws has its two end points at least; a line with fewer is not a curve, so nothing is
+        // pushed rather than a mix of graded and reset channels (adversary A2 on 16d54744).
+        for( const std::vector<lookassist::LookAssistGradationPoint> &line : lines )
+            if( line.size() < 2 )
+            {
+                logLookAssistCurveNotApplied( "a line has fewer than two points" );
+                return false;
+            }
+        // Copies: the spline helper nudges equal x values in place, as it does on the widget's own arrays.
+        for( int channel = 0; channel < 4; ++channel )
+        {
+            xs[channel].reserve( lines[channel].size() );
+            ys[channel].reserve( lines[channel].size() );
+            for( const lookassist::LookAssistGradationPoint &point : lines[channel] )
+            {
+                xs[channel].push_back( point.x );
+                ys[channel].push_back( point.y );
+            }
+        }
+    }
+    catch( const std::bad_alloc & )
+    {
+        logLookAssistCurveNotApplied( "out of memory" );
+        return false;
+    }
+
+    // The four tables as they are, so a channel the setter refuses (a knot the spline cannot use) or cannot build (an
+    // allocation) puts all four back: never Y, R and G graded over the old B (r3, r2 adversary A5 on 40efaff7).
+    const size_t tableBytes = sizeof( processingObject->gcurve_y );
+    uint16_t *snapshot = static_cast<uint16_t *>( malloc( tableBytes * 4 ) );
+    if( !snapshot )
+    {
+        logLookAssistCurveNotApplied( "out of memory" );
+        return false;
+    }
+    uint16_t *tables[4] = { processingObject->gcurve_y, processingObject->gcurve_r,
+                            processingObject->gcurve_g, processingObject->gcurve_b };
+    for( int channel = 0; channel < 4; ++channel )
+        memcpy( snapshot + channel * ( tableBytes / sizeof( uint16_t ) ), tables[channel], tableBytes );
+    for( int channel = 0; channel < 4; ++channel )
+    {
+        if( processingSetGCurve( processingObject, static_cast<int>( xs[channel].size() ), xs[channel].data(),
+                                 ys[channel].data(), static_cast<uint8_t>( channel ) ) != 0 )
+        {
+            for( int restore = 0; restore < 4; ++restore )
+                memcpy( tables[restore], snapshot + restore * ( tableBytes / sizeof( uint16_t ) ), tableBytes );
+            free( snapshot );
+            logLookAssistCurveNotApplied( "a channel's curve was refused; all four tables restored" );
+            return false;
+        }
+    }
+    free( snapshot );
     return true;
 }
 

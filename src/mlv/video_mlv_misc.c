@@ -571,6 +571,11 @@ void get_area_average_downscale_raw_thumnail(mlvObject_t *video, int frame_index
         return;
     }
 
+    /* EXPORT-PRORES-LOOK-ASSIST-1 (adversary A1 / A3 on 16d54744): a failed allocation below leaves a black thumbnail
+     * (Look Assist then skips on empty statistics) instead of the caller's uninitialised bytes, and rows debayerBasic
+     * does not write on a degenerate geometry read as zero instead of stale memory. */
+    memset(out_buffer, 0, (size_t)thumbW * (size_t)thumbH * 3u);
+
     float *raw_frame = (float *) malloc((size_t)raw_w * (size_t)raw_h * sizeof(float));
     if (!raw_frame) {
         return;
@@ -578,8 +583,8 @@ void get_area_average_downscale_raw_thumnail(mlvObject_t *video, int frame_index
 
     getMlvRawFrameFloat(video, frame_index, raw_frame);
 
-    uint16_t *debayered_raw_frame = (uint16_t *) malloc(
-        (size_t)raw_w * (size_t)raw_h * 3u * sizeof(uint16_t));
+    uint16_t *debayered_raw_frame = (uint16_t *) calloc(
+        (size_t)raw_w * (size_t)raw_h * 3u, sizeof(uint16_t));
     if (!debayered_raw_frame) {
         free(raw_frame);
         return;
