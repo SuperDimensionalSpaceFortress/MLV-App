@@ -922,8 +922,9 @@ if ($isLook -and $artifactsShare) {
     $frameCountVerdict = $null
     $enumeratedFrames = 0
     $composeShare = Join-Path $artifactsShare 'contact-sheet\compose-status.txt'
-    # (adversary pass-9 A2: the raw directory is enumerated whenever it exists, sheet and compose marker or neither, so a partial strip is counted on every path)
-    if ((Test-Path -LiteralPath $sheetShare -PathType Leaf) -or (Test-Path -LiteralPath $composeShare -PathType Leaf) -or (Test-Path -LiteralPath $rawShare -PathType Container)) {
+    # (adversary pass-9 A2: for a CAPTURED job the raw directory is enumerated whenever it exists, sheet and compose marker or neither, so a partial strip is counted on
+    # every path. A failure terminal's frames stay uncollected without a sheet or marker, as before: a product failure keeps no strip.)
+    if ((Test-Path -LiteralPath $sheetShare -PathType Leaf) -or (Test-Path -LiteralPath $composeShare -PathType Leaf) -or ($resolved.outcome -ceq 'CAPTURED' -and (Test-Path -LiteralPath $rawShare -PathType Container))) {
         Invoke-DvCollect 'mkdir' $sheetDir { New-Item -ItemType Directory -Force -Path $sheetDir | Out-Null }
         foreach ($n in 'stats.json', 'compose-status.txt') {
             $s = Join-Path $artifactsShare "contact-sheet\$n"
@@ -1094,7 +1095,7 @@ if ($outcome -in @('PASS', 'FAIL') -and $display.blocks) {
 # enumerated, and Test-DvReceiptValid refuses the same strip.
 # (adversary r5 A5: a composer that REFUSED the partial strip surfaces as the generic compose-unavailable marker, which is VENUE_TOOLING above; the count the raw
 # directory enumerated is known, so that outcome ends as the typed count refusal too, never as a tooling problem)
-if (($outcome -in @('PASS', 'FAIL') -or ($outcome -ceq 'VENUE_TOOLING' -and $null -ne $composeUnavailable)) -and $isLook -and $null -ne $frameCountVerdict -and -not $frameCountVerdict.ok) {
+if (($outcome -in @('PASS', 'FAIL') -or ($outcome -ceq 'VENUE_TOOLING' -and $null -ne $composeUnavailable)) -and $resolved.outcome -ceq 'CAPTURED' -and $isLook -and $null -ne $frameCountVerdict -and -not $frameCountVerdict.ok) {
     $detail = $(if ($outcome -ceq 'VENUE_TOOLING') { "INVALID: CAPTURED but CONTACT_FRAME_COUNT_NOT_REQUESTED: $($frameCountVerdict.reason). The venue's compose step said: $composeUnavailable" }
                 else { "INVALID: the job result was $outcome ($detail) but CONTACT_FRAME_COUNT_NOT_REQUESTED: $($frameCountVerdict.reason)" })
     $outcome = 'INVALID'
