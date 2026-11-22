@@ -80,18 +80,66 @@ _QMAKE_MAX_INCLUDE_NESTING = 8
 _QMAKE_BENIGN_CONFIG_TOKENS = frozenset(("c++11", "c++14", "c++17", "c++20", "console", "warn_on", "warn_off"))
 # Flag variables whose content can switch OpenMP off for the C compile (QMAKE_CFLAGS and its per-configuration forms) or
 # for the link (QMAKE_LFLAGS and its forms). Their appends are watched for -fno-openmp even where the condition is unknown.
-_QMAKE_COMPILE_FLAG_VARIABLE = re.compile(r"QMAKE_CFLAGS(?:_[A-Z0-9_]+)?")
-_QMAKE_LINK_FLAG_VARIABLE = re.compile(r"QMAKE_LFLAGS(?:_[A-Z0-9_]+)?")
+_QMAKE_COMPILE_FLAG_VARIABLE = re.compile(r"QMAKE_CFLAGS(?:_[A-Z0-9_]+)?|QMAKE_CC")
+# The link line is QMAKE_LFLAGS* plus the library lists Qt emits after them (LIBS, LIBS_PRIVATE, QMAKE_LIBS*): a driver option
+# in any of them reaches the link command (sol r2 A6).
+_QMAKE_LINK_FLAG_VARIABLE = re.compile(
+    r"QMAKE_LFLAGS(?:_[A-Z0-9_]+)?|LIBS|LIBS_PRIVATE|QMAKE_LIBS(?:_[A-Z0-9_]+)?|QMAKE_LINK(?:_[A-Z0-9_]+)?")
+# Driver options that stop the compiler driver from adding the OpenMP runtime by itself (only the -fopenmp-in-QMAKE_LFLAGS
+# credit relies on that auto-link; an explicit -lomp does not).
+_QMAKE_LINK_OPENMP_DISABLERS = ("-fno-openmp", "-nodefaultlibs", "-nostdlib")
+# Characters qmake gives a meaning to are ASCII; everything else (a non-breaking space, a form feed, a lone CR, a NUL) is
+# part of an argument to qmake but a separator to str.split(), so a line carrying one is refused (sol r2 A3, A4).
+_QMAKE_UNREADABLE_CHARACTER = re.compile(r"[^\x20-\x7e\t]")
+
+
+def _read_qmake_file(path: Path) -> str:
+    """A .pro/.pri file as qmake sees its bytes: no universal-newline translation (a lone CR must stay a CR)."""
+    return path.read_bytes().decode("utf-8")
+
+
+def _qmake_include_target(directory: Path, relative: str) -> Path:
+    """The file include(relative) opens: qmake cleans the path lexically (`link/../x.pri` is `x.pri`), it does not resolve
+    symlinks first, so neither does the model."""
+    return Path(os.path.normpath(str(directory / relative)))
+
+
+def _qmake_refuse_malformed_value(statement: str, value: str) -> None:
+    """A right-hand side with an unterminated quote or an unbalanced parenthesis makes qmake mark the project invalid."""
+    depth = 0
+    quote = ""
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if quote:
+            if char == "\\":
+                index += 1
+            elif char == quote:
+                quote = ""
+        elif char in "\"'":
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                break
+        index += 1
+    if quote or depth != 0:
+        raise AssertionError("unsupported qmake construct (unterminated quote or unbalanced parenthesis): " + repr(statement))
 
 
 def _qmake_logical_text(pro_text: str) -> str:
     """The .pro text qmake actually reads: comments dropped (a `#` runs to the end of its LF-terminated line, so only
-    LF splits lines), then each backslash-newline continuation joined into one logical line. A continuation followed by
-    a blank or comment-only line is refused: that is a shape this model does not try to interpret (fail closed)."""
+    LF splits lines; a CR before the LF is part of a CRLF ending), then each backslash-newline continuation joined into
+    one logical line. A continuation followed by a blank or comment-only line, and any character outside printable ASCII
+    and tab in a live line, are refused: shapes this model does not try to interpret (fail closed)."""
     logical = []
     carry = ""
-    for physical in pro_text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-        line = physical.split("#", 1)[0].rstrip()
+    for physical in pro_text.replace("\r\n", "\n").split("\n"):
+        line = physical.split("#", 1)[0].rstrip(" \t")
+        if _QMAKE_UNREADABLE_CHARACTER.search(line):
+            raise AssertionError("unsupported qmake construct: a character qmake does not treat as space or text in " + repr(line))
         if carry and not line.strip():
             raise AssertionError("unsupported qmake construct: continuation followed by a blank or comment-only line")
         if line.endswith("\\"):
@@ -121,7 +169,9 @@ def _qmake_split_top(text: str, separators: str) -> "list[str]":
     return [part.strip() for part in parts]
 
 
-def _qmake_atom_state(atom: str, arch: str) -> str:
+def _qmake_atom_state(atom: str, arch: str, seen: "set[str] | None" = None) -> str:
+    """`seen`, when given, collects every architecture a QT_ARCH test of the project names (see
+    _qmake_named_architectures)."""
     if atom.startswith("!!"):
         raise AssertionError("unsupported qmake construct: repeated '!' in selector " + repr(atom))
     negated = atom.startswith("!")
@@ -130,9 +180,13 @@ def _qmake_atom_state(atom: str, arch: str) -> str:
     if "QT_ARCH" in atom and not arch_match:
         raise AssertionError("unsupported qmake construct: unreadable QT_ARCH selector " + repr(atom))
     if arch_match:
+        if seen is not None:
+            seen.add(arch_match.group(1))
         state = _TRUE if arch_match.group(1) == arch else _FALSE
-    elif atom == "macx":
+    elif atom == "macx" or atom == "true":
         state = _TRUE
+    elif atom == "false":
+        state = _FALSE
     elif atom in _QMAKE_NON_MACOS_SCOPES:
         state = _FALSE
     elif "(" in atom and not re.fullmatch(_QMAKE_CONFIG_ATOM, atom):
@@ -150,11 +204,14 @@ def _qmake_and(states: "list[str]") -> str:
     return _UNKNOWN if _UNKNOWN in states else _TRUE
 
 
-def _qmake_condition_state(condition: str, arch: str) -> str:
+def _qmake_condition_state(condition: str, arch: str, seen: "set[str] | None" = None) -> str:
     """Whether a scope header or single-line prefix is active on macOS with QT_ARCH=arch. `:` is AND, `|` is OR; a
-    header mixing both, `else`, CONFIG(...) and any scope name not listed above stay UNKNOWN."""
+    header mixing both, `else`, CONFIG(...) and any scope name not listed above stay UNKNOWN. Every atom is read first,
+    so a function call anywhere in a mixed header is refused rather than hidden behind the UNKNOWN (sol r2 A1)."""
     if not condition:
         return _TRUE
+    for atom in _qmake_split_top(condition, "|:"):
+        _qmake_atom_state(atom, arch, seen)
     alternatives = _qmake_split_top(condition, "|")
     conjuncts = _qmake_split_top(condition, ":")
     if len(alternatives) > 1 and len(conjuncts) > 1:
@@ -180,10 +237,16 @@ def _qmake_atom_is_arch_local(atom: str, arch: str) -> bool:
     return bool(match) and match.group(1) == arch
 
 
+def _qmake_atom_is_arch_test(atom: str) -> bool:
+    """Whether an atom is a plain (not negated) QT_ARCH test, whichever architecture it names."""
+    return bool(re.fullmatch(_QT_ARCH_ATOM, atom.strip()))
+
+
 def _qmake_condition_is_arch_local(condition: str, arch: str) -> bool:
     """Whether a scope header or single-line prefix is itself a QT_ARCH=arch branch: an AND needs one such conjunct, an OR
-    needs every alternative to be one (so `equals(QT_ARCH, x86_64)|equals(QT_ARCH, arm64)` counts, `macx|equals(...)` does
-    not), and a header mixing the two is never one."""
+    needs every alternative to be a QT_ARCH test and one of them to name this architecture (so
+    `equals(QT_ARCH, x86_64)|equals(QT_ARCH, arm64)` counts, `macx|equals(...)` does not), and a header mixing the two is
+    never one."""
     if not condition:
         return False
     alternatives = _qmake_split_top(condition, "|")
@@ -191,12 +254,13 @@ def _qmake_condition_is_arch_local(condition: str, arch: str) -> bool:
     if len(alternatives) > 1 and len(conjuncts) > 1:
         return False
     if len(alternatives) > 1:
-        return all(_qmake_atom_is_arch_local(alternative, arch) for alternative in alternatives)
+        return (all(_qmake_atom_is_arch_test(alternative) for alternative in alternatives)
+                and any(_qmake_atom_is_arch_local(alternative, arch) for alternative in alternatives))
     return any(_qmake_atom_is_arch_local(conjunct, arch) for conjunct in conjuncts)
 
 
 def _qmake_simulate(
-        pro_text: str, arch: str, source_dir: "Path | None" = None
+        pro_text: str, arch: str, source_dir: "Path | None" = None, seen: "set[str] | None" = None
 ) -> "tuple[dict[str, list[str]], dict[str, set[str]], dict[str, set[str]]]":
     """Simulate a macOS build with QT_ARCH=arch in file order, following include() files where qmake evaluates them.
     Returns (values, branch_local, possible):
@@ -225,18 +289,22 @@ def _qmake_simulate(
                 return
             raise AssertionError("unsupported qmake construct: " + repr(statement))
         variable, operator, value = match.group("var"), match.group("op"), match.group("value")
-        tokens = value.split()
+        _qmake_refuse_malformed_value(statement, value)
+        tokens = re.split(r"[ \t]+", value.strip(" \t"))
+        tokens = [token for token in tokens if token]
         if variable == "QT_ARCH" or (variable == "CONFIG" and (
                 operator in ("=", "~=")
+                or re.search(r"[$\"'`]", value)
                 or (operator == "-=" and "macx" in tokens)
                 or (operator in ("+=", "*=") and not set(tokens) <= _QMAKE_BENIGN_CONFIG_TOKENS))):
             raise AssertionError("unsupported qmake construct (it changes what a selector means): " + repr(statement))
         condition = match.group("cond").rstrip(":").strip()
-        state = _qmake_and([scope[0], _qmake_condition_state(condition, arch)])
+        state = _qmake_and([scope[0], _qmake_condition_state(condition, arch, seen)])
         if not watched(variable):
             return
-        if operator == "~=" or re.search(r"[$\"']", value):
-            raise AssertionError("unsupported qmake construct (substitution, expansion or quoting): " + repr(statement))
+        if operator == "~=" or re.search(r"[$\"']|(?:^|\s)@", value):
+            raise AssertionError("unsupported qmake construct (substitution, expansion, quoting or response file): "
+                                 + repr(statement))
         if state == _FALSE:
             return
         certain = state == _TRUE
@@ -276,9 +344,9 @@ def _qmake_simulate(
         if nesting >= _QMAKE_MAX_INCLUDE_NESTING:
             raise AssertionError("unsupported qmake construct: include() nested more than "
                                  + str(_QMAKE_MAX_INCLUDE_NESTING) + " deep (a loop?)")
-        target = directory / relative
+        target = _qmake_include_target(directory, relative)
         try:
-            text = target.read_text(encoding="utf-8")
+            text = _read_qmake_file(target)
         except (OSError, UnicodeError) as error:
             raise AssertionError("unsupported qmake construct: include(" + relative + ") is unreadable: " + str(error))
         evaluate(text, target.parent, nesting + 1)
@@ -304,7 +372,7 @@ def _qmake_simulate(
                 in_reference = True
             elif char == "{":
                 header = buffer.strip()
-                own = _qmake_condition_state(header, arch)
+                own = _qmake_condition_state(header, arch, seen)
                 buffer = ""
                 parent_state, parent_local = scopes[-1] if scopes else (_TRUE, False)
                 scopes.append((_qmake_and([parent_state, own]),
@@ -339,7 +407,8 @@ def _macos_openmp_gaps(pro_text: str, arch: str, source_dir: "Path | None" = Non
     compile_variables = [name for name in possible if _QMAKE_COMPILE_FLAG_VARIABLE.fullmatch(name)]
     link_variables = [name for name in possible if _QMAKE_LINK_FLAG_VARIABLE.fullmatch(name)]
     compile_disabled = any("-fno-openmp" in possible[name] for name in compile_variables)
-    link_flag_disabled = any("-fno-openmp" in possible[name] for name in link_variables)
+    link_flag_disabled = any(
+        disabler in possible[name] for name in link_variables for disabler in _QMAKE_LINK_OPENMP_DISABLERS)
     gaps = []
     if "-fopenmp" not in values["QMAKE_CFLAGS"] or compile_disabled:
         gaps.append(_COMPILE_GAP)
@@ -356,9 +425,18 @@ def _macos_openmp_gaps(pro_text: str, arch: str, source_dir: "Path | None" = Non
     return gaps
 
 
-def _project_openmp_gaps(project: Path, arch: str) -> "list[str]":
-    """_macos_openmp_gaps for a .pro file on disk."""
-    return _macos_openmp_gaps(project.read_text(encoding="utf-8"), arch, project.parent)
+def _qmake_named_architectures(pro_text: str, source_dir: "Path | None" = None) -> "set[str]":
+    """Every architecture a QT_ARCH test of the project, or of an include() it follows, names: the ones qmake evaluates as
+    conditions, not the ones a comment or a quoted string happens to mention."""
+    seen: "set[str]" = set()
+    _qmake_simulate(pro_text, "x86_64", source_dir, seen)
+    return seen
+
+
+def _project_openmp_gaps(project: Path, arch: str, pro_text: "str | None" = None) -> "list[str]":
+    """_macos_openmp_gaps for a .pro file on disk (pro_text is the already-read root text, so one snapshot of the root is
+    both inventoried and judged)."""
+    return _macos_openmp_gaps(_read_qmake_file(project) if pro_text is None else pro_text, arch, project.parent)
 
 
 _MACX_PIN_TEMPLATE = """\
@@ -453,6 +531,46 @@ _MACX_PIN_CASES = (
     ("B2 a certain removal does cancel the -fno-openmp again", _ARM64_LIVE,
      "macx:equals(QT_ARCH, arm64):CONFIG(release, debug|release):QMAKE_CFLAGS += -fno-openmp\n"
      "macx:equals(QT_ARCH, arm64):QMAKE_CFLAGS -= -fno-openmp", []),
+    # sol r2 (adversary pass 3 on ef997fb3): flags that reach the link line another way, literal booleans, OR-ed architectures
+    # and a CR that is not a line break to qmake.
+    ("C-A3 a bare CR does not end a comment, so it swallows the whole branch",
+     "    # placeholder\r    equals(QT_ARCH, arm64) {\r        QMAKE_CFLAGS += -fopenmp\r        LIBS += -lomp\r    }", "",
+     _BOTH_GAPS),
+    ("C-A6 -fno-openmp appended to LIBS voids the -fopenmp link credit", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp", "QMAKE_LFLAGS += -fopenmp"),
+     "macx:equals(QT_ARCH, arm64):CONFIG(release, debug|release):LIBS += -fno-openmp", [_LINK_GAP]),
+    ("C-A6 -fno-openmp appended to LIBS_PRIVATE voids the -fopenmp link credit", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp", "QMAKE_LFLAGS += -fopenmp"),
+     "macx:equals(QT_ARCH, arm64):CONFIG(release, debug|release):LIBS_PRIVATE += -fno-openmp", [_LINK_GAP]),
+    ("C-A6 -fno-openmp appended to QMAKE_LIBS voids the -fopenmp link credit", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp", "QMAKE_LFLAGS += -fopenmp"),
+     "macx:equals(QT_ARCH, arm64):CONFIG(release, debug|release):QMAKE_LIBS += -fno-openmp", [_LINK_GAP]),
+    ("C-A6 -fno-openmp appended to QMAKE_LIBS_PRIVATE voids the -fopenmp link credit", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp", "QMAKE_LFLAGS += -fopenmp"),
+     "macx:equals(QT_ARCH, arm64):CONFIG(release, debug|release):QMAKE_LIBS_PRIVATE += -fno-openmp", [_LINK_GAP]),
+    ("C-A6 -nodefaultlibs voids the -fopenmp link credit", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp", "QMAKE_LFLAGS += -fopenmp"),
+     "macx:equals(QT_ARCH, arm64):QMAKE_LFLAGS += -nodefaultlibs", [_LINK_GAP]),
+    ("C-A6 an explicit -lomp is not voided by -fno-openmp in LIBS", _ARM64_LIVE,
+     "macx:equals(QT_ARCH, arm64):CONFIG(release, debug|release):LIBS += -fno-openmp", []),
+    ("C-sibling -fno-openmp inside the compiler command", _ARM64_LIVE,
+     "macx:equals(QT_ARCH, arm64):QMAKE_CC = clang -fno-openmp", [_COMPILE_GAP]),
+    ("C-sibling -fno-openmp inside the linker command", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp", "QMAKE_LFLAGS += -fopenmp"),
+     "macx:equals(QT_ARCH, arm64):QMAKE_LINK = clang++ -fno-openmp", [_LINK_GAP]),
+    ("C-A8 a literal true: prefix still opens the branch", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp", "LIBS += -lomp", opener="true:equals(QT_ARCH, arm64)"), "", []),
+    ("C-A8 a literal false: prefix makes a -fno-openmp append unreachable", _ARM64_LIVE,
+     "false:macx:equals(QT_ARCH, arm64):QMAKE_CFLAGS += -fno-openmp", []),
+    ("C-A8 a literal false: prefix makes a removal unreachable", _ARM64_LIVE,
+     "false:macx:equals(QT_ARCH, arm64):QMAKE_CFLAGS -= -fopenmp", []),
+    ("C-A8 a negated literal false: prefix is true", _ARM64_LIVE,
+     "!false:macx:equals(QT_ARCH, arm64):QMAKE_CFLAGS -= -fopenmp", [_COMPILE_GAP]),
+    ("C-A9 an OR of architecture tests is an architecture branch", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp", "LIBS += -lomp", opener="equals(QT_ARCH, arm64)|equals(QT_ARCH, x86_64)"), "", []),
+    ("C-A9 an OR with a platform scope is not an architecture branch", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp", "LIBS += -lomp", opener="macx|equals(QT_ARCH, arm64)"), "",
+     [_LOCAL_COMPILE_GAP, _LOCAL_LINK_GAP]),
 )
 
 
@@ -496,6 +614,27 @@ _MACX_PIN_REFUSED = (
     ("B3 contains() of another variable", _ARM64_LIVE, "contains(OMP_MODE, off):DEFINES += DIAGNOSTICS"),
     ("B3 include() with no directory to resolve it in", _ARM64_LIVE, "include(openmp-override.pri)"),
     ("B3 include() inside a scope", _ARM64_LIVE, _ARM64_BLOCK % "    include(openmp-override.pri)"),
+    # sol r2 (adversary pass 3 on ef997fb3).
+    ("C-A1 unset() hidden behind a mixed | and : header", _ARM64_LIVE,
+     "macx:equals(QT_ARCH, arm64):unset(QMAKE_CFLAGS)|win32 {\n    DEFINES += CHECK\n}"),
+    ("C-A1 unset() hidden behind a mixed | and : inline prefix", _ARM64_LIVE,
+     "macx:equals(QT_ARCH, arm64):unset(LIBS)|win32:DEFINES += CHECK"),
+    ("C-A2 CONFIG loses a selector through a $$ alias", _ARM64_LIVE, "PLATFORM_ALIAS = macx\nCONFIG -= $$PLATFORM_ALIAS"),
+    ("C-A2 CONFIG loses a quoted selector", _ARM64_LIVE, 'CONFIG -= "macx"'),
+    ("C-A2 CONFIG gains a quoted token", _ARM64_LIVE, "CONFIG += '$$X'"),
+    ("C-A4 a non-breaking space is not a qmake separator", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp  -O2", "LIBS += -lomp"), ""),
+    ("C-A4 a form feed is not a qmake separator", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp\x0c -O2", "LIBS += -lomp"), ""),
+    ("C-A3 a bare CR inside a live line", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp\r        LIBS += -lomp"), ""),
+    ("C-A7 a response file hides a -fno-openmp from the compile line", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp @omp.rsp", "LIBS += -lomp"), ""),
+    ("C-A7 a response file hides a -fno-openmp from the link line", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp", "QMAKE_LFLAGS += -fopenmp @omp.rsp"), ""),
+    ("C-A12 an unterminated quote in an untracked assignment", _ARM64_LIVE, 'PIN_NOTE = "unterminated\n'),
+    ("C-A12 an unterminated function call in an untracked assignment", _ARM64_LIVE, "PIN_NOTE = $$clean_path(foo\n"),
+    ("C-A12 a stray closing parenthesis in an untracked assignment", _ARM64_LIVE, "PIN_NOTE = foo)\n"),
 )
 
 
@@ -654,10 +793,10 @@ int main(void)
         `equals(QT_ARCH, arm64) {`, each holding `QMAKE_CFLAGS += -fopenmp` and `LIBS += -L<llvm>/lib -lomp`. A construct
         outside the model's grammar (a condition that calls a function, an include it cannot read) fails the test."""
         for relative in ("tests/console/lj92_pred1_reader_tool.pro", "tests/fuzz/fuzz_lj92.pro"):
-            pro_text = (ROOT / relative).read_text(encoding="utf-8")
-            named = {"x86_64", "arm64"} | set(re.findall(_QT_ARCH_ATOM, _qmake_logical_text(pro_text)))
+            pro_text = _read_qmake_file(ROOT / relative)
+            named = {"x86_64", "arm64"} | _qmake_named_architectures(pro_text, (ROOT / relative).parent)
             for arch in sorted(named):
-                for gap in _project_openmp_gaps(ROOT / relative, arch):
+                for gap in _project_openmp_gaps(ROOT / relative, arch, pro_text):
                     self.fail(relative + " macx QT_ARCH=" + arch + ": " + gap)
 
     def test_macos_arch_pin_model_rejects_every_shape_qmake_would_not_honour(self) -> None:
@@ -748,6 +887,51 @@ int main(void)
                 project = self._project_with_include(scratch, include_line, files)
                 with self.assertRaisesRegex(AssertionError, "unsupported qmake construct"):
                     _project_openmp_gaps(project, "arm64")
+
+    def test_macos_arch_pin_resolves_include_paths_the_way_qmake_cleans_them(self) -> None:
+        """sol r2 A13: qmake cleans an include path lexically (`link/../x.pri` is `x.pri`), whatever `link` points at; the
+        guard must open the same file, not the one the operating system finds by following a symlink."""
+        directory = Path("proj") / "sub"
+        self.assertEqual(_qmake_include_target(directory, "link/../override.pri"), Path(os.path.normpath("proj/sub/override.pri")))
+        self.assertEqual(_qmake_include_target(directory, "../x/./y.pri"), Path(os.path.normpath("proj/x/y.pri")))
+        removal = "macx:equals(QT_ARCH, arm64):QMAKE_CFLAGS -= -fopenmp\nmacx:equals(QT_ARCH, arm64):LIBS -= -lomp\n"
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            (root / "alt" / "deep").mkdir(parents=True)
+            (root / "alt" / "override.pri").write_text("", encoding="utf-8")
+            (root / "override.pri").write_text(removal, encoding="utf-8")
+            try:
+                os.symlink(root / "alt" / "deep", root / "link", target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("this host cannot create a directory symlink")
+            project = root / "target.pro"
+            project.write_text(
+                _MACX_PIN_TEMPLATE % {"arm64": _ARM64_LIVE, "tail": "include(link/../override.pri)"}, encoding="utf-8")
+            self.assertEqual(_project_openmp_gaps(project, "arm64"), _BOTH_GAPS)
+
+    def test_macos_arch_pin_discovers_architectures_the_project_really_tests(self) -> None:
+        """sol r2 A5/A10: the architectures to judge are the ones a condition of the project or of a followed include tests,
+        not the ones a quoted description happens to mention, and they come from the same text the flags are judged on."""
+        with tempfile.TemporaryDirectory() as scratch:
+            project = self._project_with_include(
+                scratch, "include(../extra.pri)", {"extra.pri": "macx:equals(QT_ARCH, arm64e):DEFINES += ARM64E\n"})
+            named = _qmake_named_architectures(project.read_text(encoding="utf-8"), project.parent)
+            self.assertEqual(named, {"x86_64", "arm64", "arm64e"})
+        described = _MACX_PIN_TEMPLATE % {"arm64": _ARM64_LIVE, "tail": 'DESCRIPTION = "equals(QT_ARCH, arm64e)"'}
+        self.assertEqual(_qmake_named_architectures(described, None), {"x86_64", "arm64"})
+        commented = _MACX_PIN_TEMPLATE % {"arm64": _ARM64_LIVE, "tail": "# macx:equals(QT_ARCH, arm64e):DEFINES += ARM64E"}
+        self.assertEqual(_qmake_named_architectures(commented, None), {"x86_64", "arm64"})
+
+    def test_macos_arch_pin_reads_project_bytes_without_universal_newlines(self) -> None:
+        """sol r2 A3: a lone CR is not a line break to qmake, so reading a project with universal newlines would turn a
+        comment that qmake swallows whole into live lines; CRLF files still read as ordinary lines."""
+        cr_branch = "    # placeholder\r    equals(QT_ARCH, arm64) {\r        QMAKE_CFLAGS += -fopenmp\r        LIBS += -lomp\r    }"
+        with tempfile.TemporaryDirectory() as scratch:
+            project = Path(scratch) / "cr.pro"
+            project.write_bytes((_MACX_PIN_TEMPLATE % {"arm64": cr_branch, "tail": ""}).encode("utf-8"))
+            self.assertEqual(_project_openmp_gaps(project, "arm64"), _BOTH_GAPS)
+            project.write_bytes((_MACX_PIN_TEMPLATE % {"arm64": _ARM64_LIVE, "tail": ""}).replace("\n", "\r\n").encode("utf-8"))
+            self.assertEqual(_project_openmp_gaps(project, "arm64"), [])
 
     def test_macos_arch_pin_model_returns_effective_tokens(self) -> None:
         text = _MACX_PIN_TEMPLATE % {
