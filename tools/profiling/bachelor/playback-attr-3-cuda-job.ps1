@@ -4561,10 +4561,16 @@ if ($ContactSheetEnabled -and $contactSheetDir -and (Test-Path -LiteralPath $con
                 '--gpu', $contactSheetGpuLabel,
                 '--build-sha', $SourceCommit,
                 '--backend', $contactSheetBackendLabel,
-                '--scale', $contactSheetScaleLabel,
-                # EVERY-FRAME-VISUAL-LEG-SPEC-1 r5 (sol r4 B1): the composer paints this many frames or none (a partial capture is refused, never a shorter strip)
-                '--expected-frames', [string]$ContactSheetFrameCount
+                '--scale', $contactSheetScaleLabel
             )
+            # EVERY-FRAME-VISUAL-LEG-SPEC-1 >>> (r5, sol r4 B1: the only text this card adds to the default job; test_dual_venue_evidence strips this region to prove the rest is byte-identical to the pinned baseline)
+            # The composer paints the requested frame count or none (a partial capture is refused, never a shorter strip). Only a composer that declares the option is handed it:
+            # the composer is read from the committed SourceCommit, and an older build's parser would exit 2 on an unknown flag, turning a complete strip into a tooling failure.
+            # (the receipt writer and validator still refuse a strip of the wrong count whichever composer ran)
+            if (($ContactSheetFrameCount -is [int]) -and $ContactSheetFrameCount -ge 1 -and [Text.Encoding]::UTF8.GetString($contactSheetComposerPayload.bytes).Contains('--expected-frames')) {
+                $composeArgs += @('--expected-frames', [string]$ContactSheetFrameCount)
+            }
+            # EVERY-FRAME-VISUAL-LEG-SPEC-1 <<<
             # BLOCKER fix (r1d): quote every element -- see ConvertTo-AttrCudaQuotedProcessArgument's
             # own header for why an unquoted GPU description would silently split across argv.
             $composeArgs = @($composeArgs | ForEach-Object { ConvertTo-AttrCudaQuotedProcessArgument -Value $_ })

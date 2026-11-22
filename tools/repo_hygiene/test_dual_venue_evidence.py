@@ -561,7 +561,12 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     # r27 (adversary pass-30 A1 on 7879786f): a sixth region, after the $manifestChecks hash loop, re-authenticates the build manifest LAST (pass-29 A1); it is a pure
     # addition, so no baseline block is taken out for it.
     CLAIM_SHAPE_REGIONS = 6
-    CLAIM_SHAPE_REPLACED_BASELINE = (("$manifestChecks = @(\n"
+    # EVERY-FRAME-VISUAL-LEG-SPEC-1 r5 (adversary r5 A1 on b6fbbe34): the composer's `--expected-frames` argument. One region in every job (the compose step is part of the
+    # template whether or not -ContactSheet is on), a pure addition after the unchanged $composeArgs statement; absent from the baseline.
+    EVERY_FRAME_COUNT_OPEN = "EVERY-FRAME-VISUAL-LEG-SPEC-1 >>>"
+    EVERY_FRAME_COUNT_CLOSE = "EVERY-FRAME-VISUAL-LEG-SPEC-1 <<<"
+    EVERY_FRAME_COUNT_REGIONS = 1
+    CLAIM_SHAPE_REPLACED_BASELINE =(("$manifestChecks = @(\n"
                                       "    @{ label = 'packageZip'; path = (Join-Path $Cache $BasePackageZip); expectedSha = $buildManifest.packageZip.sha256 },\n"
                                       "    @{ label = 'exe'; path = (Join-Path $Cache $ExeName); expectedSha = $buildManifest.exe.sha256 },\n"
                                       "    @{ label = 'dll'; path = (Join-Path $Cache $ReconName); expectedSha = $buildManifest.dll.sha256 }\n"
@@ -598,7 +603,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                     "cpu-gl-env-clear": (cls.CPU_GL_ENV_CLEAR_OPEN, cls.CPU_GL_ENV_CLEAR_CLOSE),
                     "pm-internal-gap": (cls.PM_INTERNAL_GAP_OPEN, cls.PM_INTERNAL_GAP_CLOSE),
                     "session-anchor": (cls.SESSION_ANCHOR_OPEN, cls.SESSION_ANCHOR_CLOSE),
-                    "claim-shape": (cls.CLAIM_SHAPE_OPEN, cls.CLAIM_SHAPE_CLOSE)}
+                    "claim-shape": (cls.CLAIM_SHAPE_OPEN, cls.CLAIM_SHAPE_CLOSE),
+                    "every-frame-count": (cls.EVERY_FRAME_COUNT_OPEN, cls.EVERY_FRAME_COUNT_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -632,6 +638,7 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         stripped, new_counts = self.strip_regions(new.read_text(encoding="utf-8"))
         old_stripped, old_counts = self.strip_regions(self.without_claim_shape_replaced_baseline(old.read_text(encoding="utf-8")))
         self.assertEqual((new_counts["claim-shape"], old_counts["claim-shape"]), (self.CLAIM_SHAPE_REGIONS, 0), "the default job carries exactly the pinned number of bracketed VENUE-STAGE-CLAIM-SHAPE-1 regions; the baseline predates them")
+        self.assertEqual((new_counts["every-frame-count"], old_counts["every-frame-count"]), (self.EVERY_FRAME_COUNT_REGIONS, 0), "the default job carries exactly the pinned number of bracketed EVERY-FRAME-VISUAL-LEG-SPEC-1 regions; the baseline predates them")
         self.assertEqual(new_counts["leg-terminals"], 4, "the default job carries exactly the four bracketed DVE-LEG-TERMINALS-1 regions (the wait-failure block and its two summary fields, the smoke-failure block and its one summary field)")
         self.assertEqual(old_counts["leg-terminals"], 4, "the baseline carries the same four")
         self.assertEqual(new_counts["presentmon-evidence"], self.PRESENTMON_EVIDENCE_REGIONS, "the default job carries exactly the pinned number of bracketed DVE-PRESENTMON-EVIDENCE-1 regions")
@@ -660,6 +667,30 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
 
     def test_default_arguments_emit_a_byte_identical_job(self) -> None:
         self.assertByteIdenticalToBaseline("default", [])
+
+    def test_the_composer_is_handed_the_expected_count_only_when_it_declares_the_option(self) -> None:
+        """EVERY-FRAME-VISUAL-LEG-SPEC-1 r5 (adversary r5 A2 / A7): the composer is read from the committed SourceCommit. An older build's parser exits 2 on an unknown
+        `--expected-frames`, which turned a complete strip into VENUE_TOOLING. The job's EVERY-FRAME-VISUAL-LEG-SPEC-1 region runs here with stand-in variables: a composer
+        that declares the option is handed the requested count, one that does not (or a snippet with no count) is handed nothing."""
+        import base64
+        text = lf(self.generate(GENERATOR, "expected-frames.job.ps1", ["-ContactSheet", "-ContactSheetFrames", "6"]).read_text(encoding="utf-8"))
+        region = text.split(self.EVERY_FRAME_COUNT_OPEN, 1)[1].split(self.EVERY_FRAME_COUNT_CLOSE, 1)[0].split("\n", 1)[1]
+        self.assertEqual(text.count(self.EVERY_FRAME_COUNT_OPEN), self.EVERY_FRAME_COUNT_REGIONS)
+        self.assertIn("'--expected-frames'", region)
+        self.assertIn("--expected-frames", (ROOT / "tools" / "profiling" / "make-contact-sheet.py").read_text(encoding="utf-8"), "the subject's own composer declares the option the job hands it")
+        base = (ROOT / "tools" / "profiling" / "make-contact-sheet.py").read_bytes()
+
+        def args_for(composer: bytes, count: str) -> str:
+            script = ("$composeArgs = @('composer.py', '--scale', '1')\n"
+                      f"{count}\n"
+                      "$contactSheetComposerPayload = [pscustomobject]@{ bytes = [Convert]::FromBase64String($env:COMPOSER_B64) }\n"
+                      + region + "\n$composeArgs -join '|'\n")
+            proc = run_pwsh(["-Command", script], env_extra={"COMPOSER_B64": base64.b64encode(composer).decode("ascii")})
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return proc.stdout.strip().splitlines()[-1]
+        self.assertEqual(args_for(base, "$ContactSheetFrameCount = 6"), "composer.py|--scale|1|--expected-frames|6")
+        self.assertEqual(args_for(b"parser.add_argument('--scale')\n", "$ContactSheetFrameCount = 6"), "composer.py|--scale|1", "an older composer that does not declare the option")
+        self.assertEqual(args_for(base, "$ContactSheetFrameCount = $null"), "composer.py|--scale|1", "no count (the compose snippet a unit test runs alone)")
 
     def test_the_other_existing_switches_are_still_byte_identical(self) -> None:
         self.assertByteIdenticalToBaseline("switches", ["-ContactSheet", "-ContactSheetFrames", "4", "-TelemetryArm", "LIGHT", "-DisablePaintPerSubmit"])
@@ -3560,7 +3591,7 @@ class EvidenceFactory(RunnerHarness):
             sheet = ev / "contact-sheet" / "sheet.png"
             raw_dir = ev / "contact-sheet" / "raw"
             # (r5: the writer publishes the count it ENUMERATED, never the one the spec asked for)
-            enumerated = sum(1 for p in raw_dir.iterdir() if p.is_file() and p.name.endswith(".png")) if raw_dir.is_dir() else 0
+            enumerated = sum(1 for p in raw_dir.iterdir() if p.is_file() and re.fullmatch(r"frame-[0-9]{2,}\.png", p.name)) if raw_dir.is_dir() else 0   # (frames only: the identity legs' diagnostics are not frames)
             info = {"path": str(sheet), "sha256": sha256_of(sheet), "frames": enumerated, "backend": backend, "rawFramesDir": str(ev / "contact-sheet" / "raw")} if sheet.exists() else None
             receipt["look"] = {"legType": "look", "lookFlavor": "classic", "contactSheet": info}
         return receipt
@@ -4944,6 +4975,64 @@ class ContactFramesAreTheRequestedCountTests(EvidenceFactory, ModuleMutationMixi
         cases = [self.receipt_over("sc", sidecar_short)[0], self.receipt_over("pn", png_short)[0]]
         for result in self.status_batch(self.repo, [(c, None) for c in cases]):
             self.expect(result, "INVALID", "five of one kind", "CONTACT_FRAME_COUNT_NOT_REQUESTED")
+
+    ANCILLARY = {"identity-pre-play.png": b"\x89PNG\r\n\x1a\nancillary-a", "identity-first-present.png": b"\x89PNG\r\n\x1a\nancillary-b", "identity.json": b'{"schema": "identity"}'}
+
+    def test_files_that_are_not_frames_are_not_counted_a_complete_strip_with_the_identity_diagnostics_stays_admissible(self) -> None:
+        """adversary r5 A3: the identity legs publish identity-pre-play.png, identity-first-present.png and identity.json beside the six pairs; the composer paints six tiles
+        and the leg is a six-frame strip, not an eight-PNG one."""
+        frames = {**stub_raw_frames(6), **self.ANCILLARY}
+        receipt, _ = self.receipt_over("anc", frames)
+        self.assertEqual(receipt["look"]["contactSheet"]["frames"], 6)
+        self.expect(self.status_batch(self.repo, [(receipt, None)])[0], "ADVISORY", "six frames plus the diagnostics")
+        self.write_artifacts(sheet=True, raw_frames=True, raw_frame_count=6)
+        raw = self.artifacts / "artifacts" / "contact-sheet" / "raw"
+        for name, data in self.ANCILLARY.items():
+            (raw / name).write_bytes(data)
+        proc, run = self.run_leg("ultra-magnus", self.spec, extra=["-Backend", "cpu"])[:2]
+        self.assertIsNotNone(run, proc.stdout + proc.stderr)
+        self.assertEqual(run["outcome"], "PASS", run["outcomeDetail"])
+        self.assertEqual(run["look"]["contactSheet"]["frames"], 6)
+
+    def test_a_frame_is_a_pair_five_pairs_plus_two_orphan_halves_is_not_six_frames(self) -> None:
+        """adversary r5 A4: frame-05.png with no sidecar and frame-06.json with no PNG make six PNG-or-JSON names of each kind, and no sixth frame."""
+        orphan = stub_raw_frames(5)
+        orphan["frame-05.png"] = b"\x89PNG\r\n\x1a\nhalf"
+        orphan["frame-06.json"] = json.dumps({"index": 6, "saved": True, "path": "frame-06.png", "capture_mode": "in_pass", "playback_path": True}).encode("utf-8")
+        ancillary_for_halves = {**stub_raw_frames(5), **self.ANCILLARY}   # (the same false six built from the identity names)
+        receipts = [self.receipt_over("orph", orphan)[0], self.receipt_over("orph2", ancillary_for_halves)[0]]
+        receipts[1]["look"]["contactSheet"]["frames"] = 6
+        for result in self.status_batch(self.repo, [(r, None) for r in receipts]):
+            self.expect(result, "INVALID", "orphan halves", "CONTACT_FRAME_COUNT_NOT_REQUESTED")
+        # a seventh complete pair is as wrong as a missing one
+        self.expect(self.status_batch(self.repo, [(self.receipt_over("seven", stub_raw_frames(7))[0], None)])[0], "INVALID", "seven of six", "CONTACT_FRAME_COUNT_NOT_REQUESTED")
+        # six pairs of the wrong numbers (frame-01 .. frame-06) are not frame-00 .. frame-05
+        shifted: dict[str, bytes] = {}
+        for i in range(1, 7):
+            shifted[f"frame-{i:02d}.png"] = b"\x89PNG\r\n\x1a\nshift" + str(i).encode()
+            shifted[f"frame-{i:02d}.json"] = json.dumps({"index": i, "saved": True, "path": f"frame-{i:02d}.png"}).encode("utf-8")
+        self.expect(self.status_batch(self.repo, [(self.receipt_over("shift", shifted)[0], None)])[0], "INVALID", "wrong numbers", "CONTACT_FRAME_COUNT_NOT_REQUESTED")
+
+    def test_a_composer_that_refused_the_partial_strip_ends_as_the_typed_count_refusal_not_as_a_tooling_problem(self) -> None:
+        """adversary r5 A5: the job turns the composer's exit 3 into the generic CONTACT_SHEET_COMPOSE_UNAVAILABLE marker; the collector knows the enumerated count."""
+        marker = "CONTACT_SHEET_COMPOSE_UNAVAILABLE composer exited 3 or did not write its outputs"
+        runs = {}
+        for k in (5, 6):
+            self.write_artifacts(sheet=False, compose_marker=marker, raw_frames=True, raw_frame_count=k)
+            proc, runs[k] = self.run_leg("ultra-magnus", self.spec, extra=["-Backend", "cpu"])[:2]
+            self.assertIsNotNone(runs[k], proc.stdout + proc.stderr)
+        self.assertEqual(runs[5]["outcome"], "INVALID", runs[5]["outcomeDetail"])
+        self.assertIn("CONTACT_FRAME_COUNT_NOT_REQUESTED", runs[5]["outcomeDetail"])
+        self.assertEqual(runs[6]["outcome"], "VENUE_TOOLING", "a complete strip over a venue that cannot compose is still a tooling condition: " + runs[6]["outcomeDetail"])
+
+    def test_the_count_rule_returns_a_verdict_for_any_requested_number(self) -> None:
+        """adversary r5 A8: a positive Int64 above Int32 once threw at the cast; a count above the 999 the rest of the module bounds is simply not compared (the shape refusal owns it)."""
+        script = ("$ErrorActionPreference = 'Stop'\n"
+                  "foreach ($n in @([long]2147483648, 1000, 999, 6)) { $v = Get-DvContactFrameCountVerdict -Names @() -Requested $n; Write-Output ('N=' + $n + ' OK=' + $v.ok + ' REQ=' + $v.requested) }\n")
+        proc = _ps_json(script, DV / "DualVenueRunner.psm1", {})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual([l.strip() for l in proc.stdout.splitlines() if l.startswith("N=")],
+                         ["N=2147483648 OK=True REQ=", "N=1000 OK=True REQ=", "N=999 OK=False REQ=999", "N=6 OK=False REQ=6"])
 
     def test_mutation_without_the_count_rule_one_of_six_is_accepted(self) -> None:
         mutated = self.mutated_module([('if (-not $countVerdict.ok) { $invalid.Add("CONTACT_FRAME_COUNT_NOT_REQUESTED: $($countVerdict.reason)") }', "")])
@@ -9474,6 +9563,9 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r5: the claim-shape predicate's regions, in every new job (cuda and cpu); the base predates them.
                 self.assertEqual((new_counts.pop("claim-shape"), old_counts.pop("claim-shape")),
                                  (GeneratorByteIdentityAndVariantTests.CLAIM_SHAPE_REGIONS, 0), name)
+                # EVERY-FRAME-VISUAL-LEG-SPEC-1 r5: the composer's --expected-frames region, in every new job; the base predates it.
+                self.assertEqual((new_counts.pop("every-frame-count"), old_counts.pop("every-frame-count")),
+                                 (GeneratorByteIdentityAndVariantTests.EVERY_FRAME_COUNT_REGIONS, 0), name)
                 self.assertEqual(new_counts, old_counts, f"{name}: the job without -LookReceiptPath carries the base generator's bracketed regions")
                 self.assertEqual(kept, old_kept, f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
                 self.assertNotIn(b"LookReceipt", new)

@@ -1088,7 +1088,9 @@ if ($outcome -in @('PASS', 'FAIL') -and $display.blocks) {
 # EVERY-FRAME-VISUAL-LEG-SPEC-1 r5 (sol r4 B1), FAIL CLOSED: a look leg whose raw directory enumerated a different number of frames than look.contactSheetFrames asked for
 # (frames vanished after the app's own completeness check and before publication listed them) is a typed INVALID, never a PASS or FAIL: the receipt names the count it
 # enumerated, and Test-DvReceiptValid refuses the same strip.
-if ($outcome -in @('PASS', 'FAIL') -and $isLook -and $null -ne $frameCountVerdict -and -not $frameCountVerdict.ok) {
+# (adversary r5 A5: a composer that REFUSED the partial strip surfaces as the generic compose-unavailable marker, which is VENUE_TOOLING above; the count the raw
+# directory enumerated is known, so that outcome ends as the typed count refusal too, never as a tooling problem)
+if (($outcome -in @('PASS', 'FAIL') -or ($outcome -ceq 'VENUE_TOOLING' -and $null -ne $composeUnavailable)) -and $isLook -and $null -ne $frameCountVerdict -and -not $frameCountVerdict.ok) {
     $detail = "INVALID: the job result was $outcome ($detail) but CONTACT_FRAME_COUNT_NOT_REQUESTED: $($frameCountVerdict.reason)"
     $outcome = 'INVALID'
 }
