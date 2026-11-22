@@ -3,6 +3,9 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLocale>
 #include <QRegularExpression>
 #include <QStandardPaths>
@@ -3640,8 +3643,41 @@ QString batchRenderedVideoCommandExecutableForDisplay(
 namespace
 {
 
-/* BATCH-FFMPEG-DEFAULT-APPDIR-LOOKUP-1. The packaged ffmpeg.exe/ffprobe.exe sit beside
- * MLVApp.exe, and QStandardPaths::findExecutable(name) searches PATH only. So a DEFAULT
+/* A file that exists but is not a non-empty regular file (an empty placeholder, a directory)
+ * is PROVEN unusable. A path that does not exist is not proven anything here (the caller's
+ * preflight decides), so it passes through unchanged. */
+bool batchRenderedVideoProvenUnusableFile(const QString & path)
+{
+    if( path.trimmed().isEmpty() )
+        return false;
+    const QFileInfo info(path);
+    return info.exists() && ( !info.isFile() || info.size() <= 0 );
+}
+
+/* DEFAULT-request PATH search (r2, A2): the PATH hit gets the same non-empty regular-file rule
+ * as an app-dir hit. QStandardPaths returns only the FIRST PATH hit, so when that one is proven
+ * unusable (e.g. the app dir is also on PATH and holds the rejected empty placeholder), the
+ * search continues one PATH directory at a time and takes the first usable file. */
+template <typename Resolve>
+QString batchRenderedVideoDefaultPathHit(const Resolve & resolve, const QString & name)
+{
+    const QString hit = resolve(name, QStringList());
+    if( !batchRenderedVideoProvenUnusableFile(hit) )
+        return hit;
+    const QStringList pathDirs = qEnvironmentVariable("PATH").split(
+        QDir::listSeparator(), Qt::SkipEmptyParts);
+    for( const QString & dir : pathDirs )
+    {
+        const QString next = resolve(name, QStringList{ dir });
+        if( !next.trimmed().isEmpty() && !batchRenderedVideoProvenUnusableFile(next) )
+            return next;
+    }
+    return QString();
+}
+
+/* BATCH-FFMPEG-DEFAULT-APPDIR-LOOKUP-1. The packaged ffmpeg.exe sits beside MLVApp.exe (the
+ * stock Windows zips ship ffmpeg.exe only; an ffprobe.exe there is one a user added, A8), and
+ * QStandardPaths::findExecutable(name) searches PATH only. So a DEFAULT
  * request (no --rendered-ffmpeg) looks in the application directory first and falls back to
  * PATH; an explicit request keeps the PATH-only lookup byte for byte. */
 template <typename Plan, typename FromResolvedPath>
@@ -3684,7 +3720,7 @@ Plan batchRenderedVideoBinaryPlanFromLookup(
         return plan;
     }
 
-    Plan plan = fromResolvedPath(defaultName, resolve(defaultName, QStringList()));
+    Plan plan = fromResolvedPath(defaultName, batchRenderedVideoDefaultPathHit(resolve, defaultName));
     plan.appDirSearchAttempted = true;
     if( !plan.foundOnPath )
     {
@@ -3739,7 +3775,12 @@ bool batchRenderedVideoFfmpegBinaryPlanUsableAtPreflight(
     /* A PATH hit is trusted as before. Anything else -- an app-dir hit, an explicit path, a
      * name nothing resolved -- must still exist when preflight runs, so a selection that
      * vanished after the lookup is a usage error (exit 2), never a failed spawn (A4). */
-    return plan.foundOnPath || QFileInfo(plan.resolvedExecutable).isFile();
+    if( plan.foundOnPath )
+        return true;
+    const QFileInfo info(plan.resolvedExecutable);
+    /* An app-dir hit keeps the lookup's non-empty rule at preflight too: one truncated to zero
+     * bytes after the lookup is refused here, not handed to the spawn (r2, A3). */
+    return info.isFile() && ( !plan.foundInAppDir || info.size() > 0 );
 }
 
 QString batchRenderedVideoFfmpegBinaryPlanSearchedLocations(
@@ -3776,7 +3817,9 @@ QString batchRenderedVideoOptionalMediaProbeExecutable(
     /* 2. An app-dir hit short-circuited the PATH search: a stale one gets it now. */
     if( probePlan.foundInAppDir && resolver )
     {
-        const QString pathHit = resolver(probePlan.requestedExecutable, QStringList());
+        /* Past a proven-unusable first hit too (r2, A2: the app dir may also be on PATH). */
+        const QString pathHit =
+            batchRenderedVideoDefaultPathHit(resolver, probePlan.requestedExecutable);
         if( batchRenderedVideoUsableProbeFile(pathHit) )
             return QDir::cleanPath(pathHit);
     }
@@ -3793,6 +3836,57 @@ QString batchRenderedVideoOptionalMediaProbeExecutable(
             return QDir::cleanPath(QFileInfo(candidate).absoluteFilePath());
     }
     return QString();
+}
+
+QString batchRenderedVideoAppDirSpawnRetryExecutable(
+    bool foundInAppDir,
+    const QString & failedExecutable,
+    const QString & defaultName,
+    const BatchRenderedVideoExecutableResolver & resolver)
+{
+    if( !foundInAppDir || !resolver )
+        return QString();
+    const QString pathHit = batchRenderedVideoDefaultPathHit(resolver, defaultName);
+    if( !batchRenderedVideoUsableProbeFile(pathHit) )
+        return QString();
+    /* The app dir may also be on PATH: retrying the very file that failed is no retry. */
+    const QString failed = QDir::cleanPath(QFileInfo(failedExecutable).absoluteFilePath());
+    const QString retry = QDir::cleanPath(QFileInfo(pathHit).absoluteFilePath());
+    if( QString::compare(failed, retry, Qt::CaseInsensitive) == 0 )
+        return QString();
+    return retry;
+}
+
+QString batchRenderedVideoAppDirSpawnRetryLogLine(
+    const QString & clip,
+    const QString & tool,
+    const QString & failedExecutable,
+    const QString & reason,
+    const QString & retryExecutable)
+{
+    return QStringLiteral("[BATCH] RENDER_BINARY_RETRY %1 tool=%2 first=app-dir:%3 first_reason=%4 retry=PATH:%5\n")
+        .arg(clip, tool, failedExecutable,
+             reason.trimmed().isEmpty() ? QStringLiteral("failed-to-start") : reason.trimmed(),
+             retryExecutable);
+}
+
+bool batchRenderedVideoMediaProbeJsonHasVideoFacts(
+    const QByteArray & json)
+{
+    QJsonParseError err{};
+    const QJsonDocument doc = QJsonDocument::fromJson(json, &err);
+    if( err.error != QJsonParseError::NoError || !doc.isObject() )
+        return false;
+    const QJsonObject root = doc.object();
+    if( !root.value(QStringLiteral("format")).isObject() )
+        return false;
+    for( const QJsonValue & value : root.value(QStringLiteral("streams")).toArray() )
+    {
+        if( value.toObject().value(QStringLiteral("codec_type")).toString()
+                == QStringLiteral("video") )
+            return true;
+    }
+    return false;
 }
 
 BatchRenderedVideoMediaProbeBinaryPlan

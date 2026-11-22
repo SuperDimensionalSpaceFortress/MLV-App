@@ -3,6 +3,7 @@
 
 #include "BatchTypes.h"
 
+#include <QByteArray>
 #include <QString>
 #include <QStringList>
 
@@ -1550,7 +1551,9 @@ BatchRenderedVideoExecutableResolver batchRenderedVideoSystemExecutableResolver(
 /* Pure lookup. Only the DEFAULT request (no request at all: empty or blank) searches
  * applicationDirectory first and falls back to PATH; any other request -- including the bare
  * name "ffmpeg" passed explicitly -- is resolved on PATH alone, exactly as
- * ...FromResolvedPath(request, resolver(request, {})) always did. */
+ * ...FromResolvedPath(request, resolver(request, {})) always did. The DEFAULT request's PATH
+ * hit must be a non-empty regular file too; a proven-unusable first hit is skipped and PATH is
+ * searched on, one directory at a time (r2, A2). */
 BatchRenderedVideoFfmpegBinaryPlan
 batchRenderedVideoFfmpegBinaryPlanFromLookup(
     const QString & requestedExecutable,
@@ -1564,7 +1567,8 @@ batchRenderedVideoFfmpegBinaryPlanFromCurrentEnvironment(
     const QString & requestedExecutable = QString())
 ;
 
-/* Preflight: a PATH hit, or a resolvedExecutable that is (still) a regular file. */
+/* Preflight: a PATH hit, or a resolvedExecutable that is (still) a regular file -- and, for an
+ * app-dir hit, still non-empty (r2, A3). */
 bool batchRenderedVideoFfmpegBinaryPlanUsableAtPreflight(
     const BatchRenderedVideoFfmpegBinaryPlan & plan)
 ;
@@ -1581,6 +1585,33 @@ QString batchRenderedVideoOptionalMediaProbeExecutable(
     const BatchRenderedVideoMediaProbeBinaryPlan & probePlan,
     const BatchRenderedVideoFfmpegBinaryPlan & ffmpegPlan,
     const BatchRenderedVideoExecutableResolver & resolver)
+;
+
+/* Spawn-time fallback (BATCH-FFMPEG-DEFAULT-APPDIR-LOOKUP-1 r2, A1/A3): a lookup cannot tell a
+ * bad image without running it. When a DEFAULT request's app-dir binary FAILED TO START, the
+ * caller retries ONCE with the binary this returns: the first non-empty regular PATH file for
+ * defaultName that is not the failed file. Empty (= no retry) for any selection that did not
+ * come from the app dir -- an explicit request or a PATH hit is never retried. */
+QString batchRenderedVideoAppDirSpawnRetryExecutable(
+    bool foundInAppDir,
+    const QString & failedExecutable,
+    const QString & defaultName,
+    const BatchRenderedVideoExecutableResolver & resolver)
+;
+
+/* The batch-log line naming both attempts of a spawn retry. */
+QString batchRenderedVideoAppDirSpawnRetryLogLine(
+    const QString & clip,
+    const QString & tool,
+    const QString & failedExecutable,
+    const QString & reason,
+    const QString & retryExecutable)
+;
+
+/* ffprobe -print_format json output counts as parsed facts only when it has a format object
+ * AND at least one video stream (A4: `{}` with exit 0 is not facts). */
+bool batchRenderedVideoMediaProbeJsonHasVideoFacts(
+    const QByteArray & json)
 ;
 
 BatchRenderedVideoMediaProbeBinaryPlan
