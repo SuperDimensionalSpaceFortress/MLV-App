@@ -394,6 +394,14 @@ TEST(ExportRenderedLookAssistWiring, RenderedAnalysisIsWiredUnconditionally)
     QString deadPrefix = body;
     deadPrefix.replace(QStringLiteral("ReceiptApplier::applyToMlv("), QStringLiteral("if (false) ReceiptApplier::applyToMlv("));
     ASSERT_FALSE(analysisIsWiredUnconditionally(deadPrefix));
+    // r6 (EXPORT-RENDERED-LOOK-ASSIST-WIRING-GUARD-EARLY-RETURN-1, r4 adversary A7 / sol r5): an unconditional exit ahead
+    // of the anchor makes the whole chain dead code, though every statement of it still sits at the body's top level.
+    QString earlyReturn = body;
+    earlyReturn.replace(QStringLiteral("ReceiptApplier::applyToMlv("), QStringLiteral("return 0; ReceiptApplier::applyToMlv("));
+    ASSERT_FALSE(analysisIsWiredUnconditionally(earlyReturn));
+    QString earlyThrow = body;
+    earlyThrow.replace(QStringLiteral("ReceiptApplier::applyToMlv("), QStringLiteral("throw 0; ReceiptApplier::applyToMlv("));
+    ASSERT_FALSE(analysisIsWiredUnconditionally(earlyThrow));
 }
 
 TEST(ExportRenderedLookAssistWiring, ACancelDuringTheAnalysisIsTheTypedCancellation)
@@ -448,6 +456,12 @@ TEST(ExportRenderedLookAssistWiring, APreEncodeFailureSamplesTheFlagAfterItsLine
     ASSERT_TRUE(secondIf > line);
     deadSecond.insert(secondIf, QStringLiteral("if (false) "));
     ASSERT_FALSE(preEncodeExitSamplesAroundTheLine(deadSecond));
+    // r6 (sibling of the early-return guard): an unconditional exit before the line leaves the line and the second
+    // sample dead, though both still sit at the helper's top level.
+    QString earlyReturn = helper;
+    earlyReturn.replace(QStringLiteral("BatchLogger::err( failureLine );"),
+                        QStringLiteral("return 0; BatchLogger::err( failureLine );"));
+    ASSERT_FALSE(preEncodeExitSamplesAroundTheLine(earlyReturn));
 }
 
 // r3 (r2 adversary A9 on 40efaff7): a RENDER_CANCELLED receipt names the partial as removed only when QFile::remove

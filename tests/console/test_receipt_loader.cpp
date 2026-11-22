@@ -341,6 +341,50 @@ TEST(ReceiptLoader, AValidOptOutSurvivesAMalformedNeighbour)
     }
 }
 
+// r6 (sol r5 B1 on feabee0a): a flag element nested inside another element is no value either. The compact walk steps
+// past the outer element and its handler used to read the inner zero, which the scan (direct children only) could not
+// undo; a later well-formed direct element is honoured by the scan's last-wins rule, toward off only.
+TEST(ReceiptLoader, ANestedFlagIsNoValue)
+{
+    const char *const on[] = {
+        "<receipt version=\"4\"><cutIn>1</cutIn><lookAssistEnabled><lookAssistEnabled>0</lookAssistEnabled>"
+        "</lookAssistEnabled></receipt>",
+        "<receipt version=\"4\"><cutIn>1</cutIn><lookAssistEnabled><lookAssistEnabled>0</lookAssistEnabled>"
+        "</lookAssistEnabled><lookAssistEnabled>1</lookAssistEnabled></receipt>",
+        "<receipt version=\"4\"><cutIn>1</cutIn><unknownFutureTag><lookAssistEnabled>0</lookAssistEnabled>"
+        "</unknownFutureTag></receipt>",
+        "<receipt version=\"4\"><cutIn>1</cutIn><unknownFutureTag><lookAssistEnabled>0</lookAssistEnabled>"
+        "</unknownFutureTag><lookAssistEnabled>1</lookAssistEnabled></receipt>",
+    };
+    for (const char *text : on)
+    {
+        ReceiptSettings receipt;
+        ASSERT_TRUE(loadReceiptText(QByteArray(text), &receipt));
+        ASSERT_EQ(1u, receipt.cutIn());
+        ASSERT_TRUE(receipt.lookAssistEnabled());
+    }
+    const char *const off[] = {
+        "<receipt version=\"4\"><cutIn>1</cutIn><lookAssistEnabled><lookAssistEnabled>0</lookAssistEnabled>"
+        "</lookAssistEnabled><lookAssistEnabled>0</lookAssistEnabled></receipt>",
+        "<receipt version=\"4\"><cutIn>1</cutIn><unknownFutureTag><lookAssistEnabled>1</lookAssistEnabled>"
+        "</unknownFutureTag><lookAssistEnabled>0</lookAssistEnabled></receipt>",
+        "<receipt version=\"4\"><lookAssistEnabled>0</lookAssistEnabled><lookAssistEnabled>"
+        "<lookAssistEnabled>1</lookAssistEnabled></lookAssistEnabled></receipt>",
+    };
+    for (const char *text : off)
+    {
+        ReceiptSettings receipt;
+        ASSERT_TRUE(loadReceiptText(QByteArray(text), &receipt));
+        ASSERT_FALSE(receipt.lookAssistEnabled());
+    }
+    // Indented, the handler reaches the outer element itself: a child element in it is the typed XML parse failure, as
+    // on base.
+    ReceiptSettings indented;
+    ASSERT_FALSE(loadReceiptText(QByteArrayLiteral(
+        "<receipt version=\"4\">\n  <lookAssistEnabled><lookAssistEnabled>0</lookAssistEnabled></lookAssistEnabled>\n"
+        "</receipt>\n"), &indented));
+}
+
 // The GUI's copy of the reader (MainWindow::readXmlElementsFromFile, not linked here) keeps the base walk and applies
 // the same opt-out scan after it (r2 B1/B2), observing every pass at the loop bottom (r3 A1).
 static const QString kOptOutScanCall = QStringLiteral(
@@ -349,11 +393,14 @@ static const QString kOptOutApply = QStringLiteral(
     "    if( optOutWatch.optOut( Rxml ) )\n"
     "        receipt->setLookAssistEnabled( false );");
 // r4 (sol r3 B1): both handlers read the value through the scan's own rule, so an element with no integer in it keeps
-// the current value in the walk exactly as in the scan.
+// the current value in the walk exactly as in the scan. r6 (sol r5 B1): both handlers take a value only from a direct
+// child of the receipt, so the GUI reader (no console seam) is pinned to the batch reader's guarded handler.
 static const QString kOptOutHandler = QStringLiteral(
     "            optOutWatch.sawLookAssistEnabled( Rxml );\n"
     "            bool lookAssistOn = true;\n"
-    "            if( ReceiptXmlWalk::lookAssistEnabledValue( Rxml->readElementText(), &lookAssistOn ) )\n"
+    "            const QString lookAssistText = Rxml->readElementText();\n"
+    "            if( optOutWatch.atDirectChild()\n"
+    "             && ReceiptXmlWalk::lookAssistEnabledValue( lookAssistText, &lookAssistOn ) )\n"
     "                receipt->setLookAssistEnabled( lookAssistOn );");
 
 // r3 (r2 adversary A3 on 40efaff7): the opt-out scan re-reads the bytes the walk parsed, never the file, so a file
