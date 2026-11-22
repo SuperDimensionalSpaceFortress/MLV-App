@@ -4139,6 +4139,38 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r3 import backup')) {
     Assert-That ($r3g.Host -ceq 'FROM-BUNDLE' -and $r3g.Failures.Count -eq 0) 'r3 import control: a host CLAUDE.md that was backed up and not touched since is still replaced by the newer bundle copy' "host=[$($r3g.Host)] failures=$($r3g.Failures -join ',')"
 }
 
+# ================================================================ IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 r4: the gate judges the backup that EXISTS, and only a file Import would copy
+# Sol r3 (head 55d670f1): (1) the backup was removed after it was made and before the host lock: the stored hash still matched the host, the file was replaced and the rollback copy was
+# deleted, leaving no copy of the old bytes; (2) a bundle file already excluded from the copy (here: larger than the scan limit) was refused as a failed backup because the timestamp-only
+# test ran before the source skip; (3) a host file that vanished between the existence probe and the timestamp read read as 1601-01-01 (older than anything), so a creation at a now-empty
+# path was refused. The replace now re-reads the backup file under the lock, the gate ignores a source Import will not copy, and a vanished host file is a creation, not a replacement.
+if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r4 import backup')) {
+    $r4Typed = { param($r) @($r.Failures | Where-Object { $_ -like 'IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED*CLAUDE.md*' }).Count }
+    # (a) the completed backup is removed after it was made and before the host is locked: the host file is not replaced (no copy of its bytes would survive the swap)
+    $r4a = Invoke-R3Import 'r4a' -3 0 $null { param($From, $To) Remove-Item -LiteralPath (Join-Path $script:StateRoot "backups\home-claude-$($script:stamp)\CLAUDE.md") -Force -ErrorAction SilentlyContinue }
+    Assert-That ($r4a.Host -ceq 'HOST-GOOD-CONTENT') 'r4 import: a host CLAUDE.md whose completed backup disappeared before the replace is NOT replaced (byte-identical)' "host=[$($r4a.Host)]`n$($r4a.Out)"
+    Assert-That ((& $r4Typed $r4a) -eq 1) 'r4 import: that refusal is the typed failure IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED' ($r4a.Failures -join ',')
+    # (a2) the backup file is replaced by other bytes: it no longer holds what was backed up, so the host file is not replaced either
+    $r4a2 = Invoke-R3Import 'r4a2' -3 0 $null { param($From, $To) [IO.File]::WriteAllText((Join-Path $script:StateRoot "backups\home-claude-$($script:stamp)\CLAUDE.md"), 'SOMETHING-ELSE') }
+    Assert-That ($r4a2.Host -ceq 'HOST-GOOD-CONTENT' -and (& $r4Typed $r4a2) -eq 1) 'r4 import: a backup file that no longer holds the backed-up bytes does not license the replace (typed failure, host untouched)' "host=[$($r4a2.Host)] failures=$($r4a2.Failures -join ',')"
+    # (b) a bundle CLAUDE.md over the scan limit is not copied at all; a directory at the backup name must not turn that skip into a failed backup
+    $r4b = Invoke-R3Import 'r4b' -3 0 {
+        param($st, $sp)
+        [void][IO.Directory]::CreateDirectory((Join-Path $st "backups\home-claude-$sp\CLAUDE.md"))
+        $big = [byte[]]::new(26214401); [Array]::Fill($big, [byte]97)
+        [IO.File]::WriteAllBytes((Join-Path $script:BundlePath 'home-claude\CLAUDE.md'), $big)
+    }
+    Assert-That ($r4b.Host -ceq 'HOST-GOOD-CONTENT') 'r4 import: an oversized bundle CLAUDE.md leaves the host file byte-identical' "host length=$($r4b.Host.Length)`n$($r4b.Out)"
+    Assert-That ((& $r4Typed $r4b) -eq 0 -and $r4b.Failures.Count -eq 0) 'r4 import: a bundle file Import skips for its size is NOT a failed backup (no IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED, exit 0)' ($r4b.Failures -join ',')
+    # (c) the host file is gone by the time the gate reads its timestamps (it is moved aside right after the existence probe) and its backup could not be made: the empty path is created, not refused
+    $r4c = Invoke-R3Import 'r4c' -3 0 {
+        param($st, $sp)
+        [void][IO.Directory]::CreateDirectory((Join-Path $st "backups\home-claude-$sp\CLAUDE.md"))
+        $script:ImportAfterHostProbeHook = { param($d) if (Test-Path -LiteralPath $d -PathType Leaf) { Move-Item -LiteralPath $d -Destination "$d.aside" } }
+    } $null { $script:ImportAfterHostProbeHook = $null; Remove-Item -LiteralPath "$($script:R3HostPath).aside" -Force -ErrorAction SilentlyContinue }
+    Assert-That ($r4c.Host -ceq 'FROM-BUNDLE' -and $r4c.Failures.Count -eq 0) 'r4 import: a host CLAUDE.md that vanished between the existence probe and the timestamp read is created from the bundle, not refused as an unavailable backup' "host=[$($r4c.Host)] failures=$($r4c.Failures -join ',')`n$($r4c.Out)"
+}
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 

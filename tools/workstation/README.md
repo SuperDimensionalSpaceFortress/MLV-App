@@ -110,9 +110,11 @@ run for a dry run. The new-machine phases refuse to run on VIRTUAL-TEN unless yo
    `IMPORT_BACKUP_FAILED <path>` names the cause. The rule is tied to the backup that was written, not to a
    check made at one moment: a host file is replaced only while it is locked and still holds exactly the
    bytes that were backed up, so a file that was absent while the backup ran and came back, or one saved
-   after the backup (even with an older timestamp than the bundle copy), is refused the same way. A file
-   the copy rules would keep anyway (`/XO`, the bundle copy is older) is still kept with no failure, held
-   or not. Fix what blocks the backup and re-run `-Phase Import`. A bundle
+   after the backup (even with an older timestamp than the bundle copy), is refused the same way, and so
+   is one whose backup file has gone missing or changed since it was written (the backup is read again
+   under the lock). A file the copy rules would keep anyway (`/XO`, the bundle copy is older) is still
+   kept with no failure, held or not; so is a bundle file the copy skips for its size or content, and a
+   host file that is gone by the time it is judged is simply created. Fix what blocks the backup and re-run `-Phase Import`. A bundle
    zip that `tar` cannot expand completely (a truncated copy) is `IMPORT_BUNDLE_EXPAND_FAILED <path>` (exit 1):
    nothing is snapshotted or copied from it, so copy the zip again and re-run.
 
