@@ -206,7 +206,7 @@ TEST(ReceiptLoader, AnIndentedExtensionAfterTheOptOutDoesNotOverwriteIt)
         "</receipt>\r\n"), &optIn));
     ASSERT_TRUE(optIn.lookAssistEnabled());
 
-    // The scan only ever lowers the flag: an extension opt-out base honoured stays honoured.
+    // With no plain element the walk's value stands: an extension opt-out base honoured stays honoured.
     ReceiptSettings extensionOff;
     ASSERT_TRUE(loadReceiptText(QByteArrayLiteral(
         "<receipt version=\"4\" xmlns:x=\"urn:metadata\">\n<x:lookAssistEnabled>0</x:lookAssistEnabled>\n<cutIn>4</cutIn>\n"
@@ -385,13 +385,39 @@ TEST(ReceiptLoader, ANestedFlagIsNoValue)
         "</receipt>\n"), &indented));
 }
 
+// r6 (adversary A1 on 624f97d7): the last plain direct element wins on or off in every layout. A direct 0, a nested 1
+// the compact walk stopped in, then a direct 1 stayed off; so did a compact 0 then 1 (indented reads on), and an
+// extension 0 after a plain 1 overwrote it.
+TEST(ReceiptLoader, TheLastDirectFlagWinsInEveryLayout)
+{
+    const char *const on[] = {
+        "<receipt version=\"4\"><lookAssistEnabled>0</lookAssistEnabled><unknownFutureTag><lookAssistEnabled>1"
+        "</lookAssistEnabled></unknownFutureTag><lookAssistEnabled>1</lookAssistEnabled></receipt>",
+        "<receipt version=\"4\"><lookAssistEnabled>0</lookAssistEnabled><lookAssistEnabled>1</lookAssistEnabled></receipt>",
+        "<receipt version=\"4\" xmlns:x=\"urn:metadata\">\n<lookAssistEnabled>1</lookAssistEnabled>\n"
+        "<x:lookAssistEnabled>0</x:lookAssistEnabled>\n</receipt>\n",
+    };
+    for (const char *text : on)
+    {
+        ReceiptSettings receipt;
+        ASSERT_TRUE(loadReceiptText(QByteArray(text), &receipt));
+        ASSERT_TRUE(receipt.lookAssistEnabled());
+    }
+    ReceiptSettings off;
+    ASSERT_TRUE(loadReceiptText(QByteArrayLiteral(
+        "<receipt version=\"4\"><lookAssistEnabled>1</lookAssistEnabled><lookAssistEnabled>0</lookAssistEnabled></receipt>"),
+        &off));
+    ASSERT_FALSE(off.lookAssistEnabled());
+}
+
 // The GUI's copy of the reader (MainWindow::readXmlElementsFromFile, not linked here) keeps the base walk and applies
 // the same opt-out scan after it (r2 B1/B2), observing every pass at the loop bottom (r3 A1).
 static const QString kOptOutScanCall = QStringLiteral(
     "        optOutWatch.endOfPass( Rxml );\n    }\n\n");
 static const QString kOptOutApply = QStringLiteral(
-    "    if( optOutWatch.optOut( Rxml ) )\n"
-    "        receipt->setLookAssistEnabled( false );");
+    "    bool lookAssistDirect = true;\n"
+    "    if( optOutWatch.lastDirectValue( Rxml, &lookAssistDirect ) )\n"
+    "        receipt->setLookAssistEnabled( lookAssistDirect );");
 // r4 (sol r3 B1): both handlers read the value through the scan's own rule, so an element with no integer in it keeps
 // the current value in the walk exactly as in the scan. r6 (sol r5 B1): both handlers take a value only from a direct
 // child of the receipt, so the GUI reader (no console seam) is pinned to the batch reader's guarded handler.

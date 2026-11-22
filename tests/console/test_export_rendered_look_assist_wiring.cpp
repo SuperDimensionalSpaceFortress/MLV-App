@@ -303,12 +303,20 @@ bool analysisIsWiredUnconditionally(const QString & body)
     const int applyEnd = callEnd(body, apply);
     const int lookAssistEnd = callEnd(body, lookAssist);
     if (applyEnd < 0 || lookAssistEnd < 0) return false;
+    // r6 (adversary A3 on 624f97d7): the analysis runs in a try whose catch frees the clip and is a failure exit, and
+    // nothing else sits between the catch and the verdict-guarded push.
+    const QString catchHead = QStringLiteral(
+        ";}catch(...){freeMlvObject(mlvObject);freeProcessingObject(processingObject);returnrenderedPreEncodeExit(");
+    const QString pushHead = QStringLiteral(");}if(lookAssistApplied){ReceiptApplier::");
+    const QString afterAnalysis = collapseSpaces(body.mid(lookAssistEnd, grade - lookAssistEnd));
+    if (!afterAnalysis.startsWith(catchHead) || !afterAnalysis.endsWith(pushHead)) return false;
+    const QString exitArguments = afterAnalysis.mid(catchHead.size(), afterAnalysis.size() - catchHead.size() - pushHead.size());
+    if (exitArguments.contains(QLatin1Char(';')) || exitArguments.contains(QLatin1Char('{')) || exitArguments.contains(QLatin1Char('}')))
+        return false;
     return collapseSpaces(body.mid(applyEnd, lookAssist - applyEnd))
-               == QStringLiteral(";BatchRenderCancelScopecancelScope;constboollookAssistApplied=")
+               == QStringLiteral(";BatchRenderCancelScopecancelScope;boollookAssistApplied=false;try{lookAssistApplied=")
         && collapseSpaces(callArguments(body, lookAssist))
-               == QStringLiteral("receipt,mlvObject,processingObject,CdngSequenceExport::lookAssistAnalysisFrameIndex(cutIn,cutIn)")
-        && collapseSpaces(body.mid(lookAssistEnd, grade - lookAssistEnd))
-               == QStringLiteral(";if(lookAssistApplied){ReceiptApplier::");
+               == QStringLiteral("receipt,mlvObject,processingObject,CdngSequenceExport::lookAssistAnalysisFrameIndex(cutIn,cutIn)");
 }
 
 const QString kCancelCheck = QStringLiteral("BatchRenderCancelScope::cancelled()");
@@ -393,8 +401,19 @@ TEST(ExportRenderedLookAssistWiring, RenderedAnalysisIsWiredUnconditionally)
     ASSERT_TRUE(analysisIsWiredUnconditionally(body));
     // The mutations the r1 reviewers showed passing the older checks now fail.
     QString deadBranch = body;
-    deadBranch.replace(QStringLiteral("const bool lookAssistApplied ="), QStringLiteral("if (false) {} const bool lookAssistApplied ="));
+    deadBranch.replace(QStringLiteral("bool lookAssistApplied = false;"), QStringLiteral("if (false) {} bool lookAssistApplied = false;"));
+    ASSERT_TRUE(deadBranch != body);
     ASSERT_FALSE(analysisIsWiredUnconditionally(deadBranch));
+    // r6 (adversary A3): a dead analysis inside the try, and a catch that swallows the exception and goes on, fail.
+    QString deadTry = body;
+    deadTry.replace(QStringLiteral("lookAssistApplied = ReceiptApplier::applyHeadlessLookAssist("),
+                    QStringLiteral("if (false) lookAssistApplied = ReceiptApplier::applyHeadlessLookAssist("));
+    ASSERT_TRUE(deadTry != body);
+    ASSERT_FALSE(analysisIsWiredUnconditionally(deadTry));
+    QString swallowed = body;
+    swallowed.replace(QStringLiteral("catch( ... )\n    {"), QStringLiteral("catch( ... )\n    { lookAssistApplied = false; }\n    if (false) {"));
+    ASSERT_TRUE(swallowed != body);
+    ASSERT_FALSE(analysisIsWiredUnconditionally(swallowed));
     QString zeroAnchor = body;
     zeroAnchor.replace(QStringLiteral("lookAssistAnalysisFrameIndex( cutIn, cutIn )"),
                        QStringLiteral("lookAssistAnalysisFrameIndex( cutIn, cutIn ) * 0u"));
@@ -463,8 +482,9 @@ TEST(ExportRenderedLookAssistWiring, APreEncodeFailureSamplesTheFlagAfterItsLine
     const QString helper = batchRunnerFunction(QStringLiteral("int renderedPreEncodeExit("));
     ASSERT_FALSE(helper.isEmpty());
     ASSERT_TRUE(preEncodeExitSamplesAroundTheLine(helper));
-    // Every failure exit between the analysis and the frame loop goes through it (four: plan, invocation, spawn, buffers).
-    ASSERT_EQ(4, countOccurrences(renderedBody(), QStringLiteral("return renderedPreEncodeExit(")));
+    // Every failure exit between the analysis and the frame loop goes through it (five: an analysis exception (r6
+    // adversary A3), plan, invocation, spawn, buffers).
+    ASSERT_EQ(5, countOccurrences(renderedBody(), QStringLiteral("return renderedPreEncodeExit(")));
     // The predicate catches the r2 shape (one sample, before the line) and a dead second sample.
     QString oneSample = helper;
     oneSample.replace(QStringLiteral("BatchLogger::err( failureLine );"), QStringLiteral("BatchLogger::err( failureLine ); return failureCode;"));
@@ -483,6 +503,30 @@ TEST(ExportRenderedLookAssistWiring, APreEncodeFailureSamplesTheFlagAfterItsLine
     earlyReturn.replace(QStringLiteral("BatchLogger::err( failureLine );"),
                         QStringLiteral("return 0; BatchLogger::err( failureLine );"));
     ASSERT_FALSE(preEncodeExitSamplesAroundTheLine(earlyReturn));
+}
+
+// r6 (adversary A2 on 624f97d7): the stale-partial removal never runs after a cancel already seen (an unconditional
+// flag check sits right before it), and the cancel before the spawn names a stale partial this run removed, or removes
+// and names one still there (a kept one gets the kept-file warning), instead of partial_removed=none.
+TEST(ExportRenderedLookAssistWiring, TheStalePartialRemovalIsAccountedOnACancel)
+{
+    const QString body = renderedBody();
+    const QString removal = QStringLiteral("const bool stalePartialRemoved = QFile::remove( partialPath );");
+    ASSERT_EQ(1, countOccurrences(body, removal));
+    const int removeAt = body.indexOf(removal);
+    const int checkAt = body.lastIndexOf(kCancelCheck, removeAt);
+    const int invocation = body.indexOf(QStringLiteral("if( partialPath.isEmpty() || arguments.isEmpty() )"));
+    ASSERT_TRUE(invocation >= 0 && checkAt > invocation && removeAt > checkAt);
+    ASSERT_TRUE(cancelGuardRunsAlways(body, checkAt));
+    ASSERT_TRUE(atTopLevelStatement(body, removeAt));
+    const int renderStart = body.indexOf(QStringLiteral("[BATCH] RENDER_START"));
+    const int spawnCheck = body.indexOf(kCancelCheck, renderStart);
+    const int spawn = body.indexOf(QStringLiteral("pipeline.start("));
+    ASSERT_TRUE(renderStart > removeAt && spawnCheck > renderStart && spawn > spawnCheck);
+    const QString branch = collapseSpaces(body.mid(spawnCheck, spawn - spawnCheck));
+    ASSERT_TRUE(branch.contains(QStringLiteral(
+        "constQStringstalePartial=stalePartialRemoved?partialPath:removeRenderedPartial(partialPath);"
+        "returnrenderedCancelledBeforeEncode(baseName,framesToExport,stalePartial);")));
 }
 
 // r3 (r2 adversary A9 on 40efaff7): a RENDER_CANCELLED receipt names the partial as removed only when QFile::remove
