@@ -83,6 +83,19 @@ _QMAKE_MUTATING_EXPANSION = re.compile(r"take_(?:first|last)|\$\$\{?[A-Za-z0-9_.
 # A denylist of writers is never complete: $$system(cmd, mode, stsvar) also writes into a variable it names (Qt's own
 # toolchain.prf does exactly that), so a value-side replace function is accepted only when it is known to read and nothing else
 # (opus r4). Every other name, including system and any function a feature file defines, is refused wherever it appears.
+# A driver option that takes its operand as the NEXT token consumes a following -fopenmp / -lomp as a directory, library or file
+# name, so the token sits in the variable yet never reaches the compiler as a flag (sol r5 A1). Spelled bare, in a live line of a
+# flag variable, such an option is refused: the model does not track which later token it eats.
+_QMAKE_SEPARATE_OPERAND_OPTION = re.compile(
+    r"-(?:[ABDFILTUVYbelouxz]|X[A-Za-z0-9_]*|include|imacros|isystem|iquote|idirafter|isysroot|iframework|iwithsysroot|iprefix|"
+    r"iwithprefix|iwithprefixbefore|cxx-isystem|framework|weak_framework|weak_library|arch|target|mllvm|rpath|install_name|"
+    r"current_version|compatibility_version|undefined|sectcreate|dylib_file|exported_symbols_list|unexported_symbols_list|"
+    r"macosx_version_min|macos_version_min|filelist|MF|MT|MQ|MJ|working-directory|include-pch|aux-info|specs|"
+    r"-sysroot|-target|-include|-include-directory)")
+# Every other QMAKE variable (QMAKE_RUN_CC*, QMAKE_CC_*, QMAKE_CXXFLAGS, QMAKE_EXTRA_COMPILERS, QMAKESPEC, ...) can change how
+# the C compile or the link is spelled, and the model reads none of them (sol r5 A2): an assignment to one is refused unless it is
+# one the project files use for something that touches neither line.
+_QMAKE_BENIGN_UNMODELED_VARIABLES = frozenset(("QMAKE_SUBSTITUTES",))
 _QMAKE_VALUE_FUNCTION_CALL = re.compile(r"\$\$\{?\s*([A-Za-z0-9_.]+)\s*\(")
 _QMAKE_READONLY_VALUE_FUNCTIONS = frozenset((
     "absolute_path", "basename", "cat", "clean_path", "dirname", "escape_expand", "files", "find", "first", "format_number",
@@ -333,12 +346,19 @@ def _qmake_simulate(
         condition = match.group("cond").rstrip(":").strip()
         state = _qmake_and([scope[0], _qmake_condition_state(condition, arch, seen)])
         if not watched(variable):
+            if (variable.startswith("QMAKE") and variable not in _QMAKE_BENIGN_UNMODELED_VARIABLES
+                    and state != _FALSE):
+                raise AssertionError("unsupported qmake construct (a QMAKE variable the model does not track, which can change "
+                                     "the C compile or link command): " + repr(statement))
             return
         if operator == "~=" or re.search(r"[$\"']|(?:^|\s)@", value):
             raise AssertionError("unsupported qmake construct (substitution, expansion, quoting or response file): "
                                  + repr(statement))
         if state == _FALSE:
             return
+        if operator != "-=" and any(_QMAKE_SEPARATE_OPERAND_OPTION.fullmatch(token) for token in tokens):
+            raise AssertionError("unsupported qmake construct (an option that takes the next token as its operand, which may be "
+                                 "the OpenMP flag it would then consume): " + repr(statement))
         certain = state == _TRUE
         local = scope[1] or _qmake_condition_is_arch_local(condition, arch)
         may_add = possible.setdefault(variable, set())
@@ -716,6 +736,53 @@ _MACX_PIN_REFUSED = (
     ("E-B1 a braced unknown replace function", _ARM64_LIVE, "SAVED = $${somethingElse(LIBS)}"),
     ("E-B1 $$system() in a tracked variable's own value", _ARM64_LIVE,
      "macx:equals(QT_ARCH, arm64):QMAKE_CFLAGS_RELEASE = $$system(true, lines, LIBS)"),
+    # sol r5 A1: a driver option that takes its operand as the NEXT token consumes a following -fopenmp / -lomp as a directory,
+    # library or file name, so the token is present in the variable but never reaches the compiler as a flag.
+    ("F-A1 -I consumes the -fopenmp after it (the repro)", _arm64_section(
+        "QMAKE_CFLAGS += -I -fopenmp", "QMAKE_LFLAGS += -L -fopenmp"), ""),
+    ("F-A1 -I on one line, -fopenmp on the next", _arm64_section(
+        "QMAKE_CFLAGS += -I", "QMAKE_CFLAGS += -fopenmp", "LIBS += -lomp"), ""),
+    ("F-A1 -L consumes the -lomp after it", _arm64_section("QMAKE_CFLAGS += -fopenmp", "LIBS += -L -lomp"), ""),
+    ("F-A1 -isystem consumes the -fopenmp after it", _arm64_section(
+        "QMAKE_CFLAGS += -isystem -fopenmp", "LIBS += -lomp"), ""),
+    ("F-A1 -framework consumes the -lomp after it", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp", "LIBS += -framework -lomp"), ""),
+    ("F-A1 -Xclang is an operand-taking option", _arm64_section(
+        "QMAKE_CFLAGS += -Xclang -fopenmp", "LIBS += -lomp"), ""),
+    ("F-A1 -o consumes the -fopenmp after it", _arm64_section(
+        "QMAKE_CFLAGS = -o -fopenmp", "LIBS += -lomp"), ""),
+    ("F-A1 --sysroot consumes the -fopenmp after it", _arm64_section(
+        "QMAKE_CFLAGS += --sysroot -fopenmp", "LIBS += -lomp"), ""),
+    ("F-A1 -arch consumes the -fopenmp after it", _arm64_section(
+        "QMAKE_CFLAGS *= -arch -fopenmp", "LIBS += -lomp"), ""),
+    # sol r5 A2: qmake writes the C compile recipe from the QMAKE_RUN_CC* templates and the QMAKE_CC_* pieces, none of which
+    # the model reads, so a -fno-openmp carried by any unmodeled QMAKE variable would pass. The class is "a control the model
+    # does not track": every assignment to a QMAKE variable it does not model is refused.
+    ("F-A2 QMAKE_RUN_CC carries -fno-openmp (the repro)", _ARM64_LIVE,
+     "macx:equals(QT_ARCH, arm64):QMAKE_RUN_CC = $(CC) -c $(CFLAGS) -fno-openmp $(INCPATH) -o $obj $src"),
+    ("F-A2 QMAKE_RUN_CC_IMP carries -fno-openmp", _ARM64_LIVE,
+     "macx:equals(QT_ARCH, arm64):QMAKE_RUN_CC_IMP = $(CC) -c $(CFLAGS) -fno-openmp $(INCPATH) -o $@ $<"),
+    ("F-A2 QMAKE_CC_O_FLAG carries -fno-openmp", _ARM64_LIVE,
+     "macx:equals(QT_ARCH, arm64):QMAKE_CC_O_FLAG = -fno-openmp -o"),
+    ("F-A2 QMAKE_RUN_CC unconditional", _ARM64_LIVE, "QMAKE_RUN_CC = $(CC) -fno-openmp"),
+    ("F-A2 QMAKE_RUN_CC under a condition the model cannot decide", _ARM64_LIVE,
+     "CONFIG(release, debug|release):QMAKE_RUN_CC = $(CC) -fno-openmp"),
+    ("F-A2 QMAKE_RUN_CC with +=", _ARM64_LIVE, "macx:equals(QT_ARCH, arm64):QMAKE_RUN_CC += -fno-openmp"),
+    ("F-A2 QMAKE_RUN_CC inside the branch", _ARM64_LIVE, _ARM64_BLOCK % "    QMAKE_RUN_CC = $(CC) -fno-openmp"),
+    ("F-A2 an extra compiler template", _ARM64_LIVE,
+     "macx:equals(QT_ARCH, arm64):QMAKE_EXTRA_COMPILERS += omp_off"),
+    ("F-A2 the compiler driver for C++ is not a modelled control either", _ARM64_LIVE,
+     "macx:equals(QT_ARCH, arm64):QMAKE_CXXFLAGS += -fno-openmp"),
+    ("F-A2 QMAKESPEC", _ARM64_LIVE, "macx:equals(QT_ARCH, arm64):QMAKESPEC = macx-g++"),
+)
+
+# QMAKE variables the project files use that change neither the C compile line nor the link line.
+_QMAKE_BENIGN_VARIABLE_LINES = (
+    "QMAKE_SUBSTITUTES += mlvapp_test_source_root",
+    "win32:QMAKE_RUN_CC = $(CC) -fno-openmp",
+    "QMAKE_CFLAGS_RELEASE -= -O2",
+    "macx:equals(QT_ARCH, arm64):QMAKE_CFLAGS += -g -Wall -I/opt/homebrew/opt/llvm/include -L/opt/lib -O3",
+    "QMAKE_CFLAGS += -Dfoo=1 -std=c99 -lomp",
 )
 
 # Value-side replace functions the model accepts: every one only reads its arguments (the project files the pin reads use
@@ -919,6 +986,15 @@ int main(void)
     def test_macos_arch_pin_model_still_reads_value_functions_that_only_read(self) -> None:
         """The allowlist is not a blanket refusal: a project using the read-only replace functions still gets judged."""
         for line in _READONLY_VALUE_FUNCTION_LINES:
+            for arch in ("arm64", "x86_64"):
+                with self.subTest(line + " " + arch):
+                    text = _MACX_PIN_TEMPLATE % {"arm64": _ARM64_LIVE, "tail": line}
+                    self.assertEqual(_macos_openmp_gaps(text, arch), [])
+
+    def test_macos_arch_pin_model_still_reads_benign_qmake_variables_and_joined_option_operands(self) -> None:
+        """The refusals of sol r5 are not blanket: QMAKE_SUBSTITUTES, a QMAKE control on a platform that is not macOS, and
+        options whose operand is joined to them (-I/path, -L/path, -Dfoo=1) are still judged, so the real projects pass."""
+        for line in _QMAKE_BENIGN_VARIABLE_LINES:
             for arch in ("arm64", "x86_64"):
                 with self.subTest(line + " " + arch):
                     text = _MACX_PIN_TEMPLATE % {"arm64": _ARM64_LIVE, "tail": line}
