@@ -174,6 +174,7 @@ SOURCES += \
     $$REPO_ROOT/tests/pipeline/test_dualiso_gpu_split_timing.cpp
 
 HEADERS += \
+    $$REPO_ROOT/src/batch/ReceiptXmlWalk.h \
     $$REPO_ROOT/src/processing/ThreadExitCache.h \
     $$REPO_ROOT/platform/qt/Debayered16ReconReusePolicy.h \
     $$REPO_ROOT/tests/common/minitest.h \

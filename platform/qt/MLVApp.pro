@@ -588,6 +588,7 @@ HEADERS += MainWindow.h \
     ../../src/batch/BatchLogger.h \
     ../../src/batch/ReceiptLoader.h \
     ../../src/batch/ReceiptApplier.h \
+    ../../src/batch/ReceiptXmlWalk.h \
     ../../src/batch/LookAssistAnalysis.h \
     FullscreenControlBarPolicy.h \
     FullscreenControlBar.h

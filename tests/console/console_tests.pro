@@ -130,6 +130,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_fullscreen_control_bar_wiring.cpp
 
 HEADERS += \
+    $$REPO_ROOT/src/batch/ReceiptXmlWalk.h \
     $$REPO_ROOT/platform/qt/FpmNameValidator.h \
     $$REPO_ROOT/platform/qt/AtomicFileReplace.h \
     $$REPO_ROOT/platform/qt/SyncDownloadWaiter.h \

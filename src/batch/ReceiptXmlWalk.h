@@ -1,39 +1,85 @@
 #ifndef RECEIPTXMLWALK_H
 #define RECEIPTXMLWALK_H
 
-/* The token walk of the receipt element readers (ReceiptLoader::parseXmlElements and
- * MainWindow::readXmlElementsFromFile). Every element handler there ends with readElementText()
- * then readNext(). In a receipt written with whitespace between elements that readNext() lands on
- * the whitespace; in a compact one (<cutIn>1</cutIn><lookAssistEnabled>0</lookAssistEnabled>) it
- * lands on the NEXT start element, and the loop's own readNext() used to step past it, so that
- * element was never read and the walk stopped at its end element (EXPORT-PRORES-LOOK-ASSIST-1,
- * adversary A1 on 76653777). next() at the top of the loop, settle() at the bottom: a start element
- * a handler has already stepped onto is handed to the next pass instead of being skipped. With
- * whitespace between elements the walk is token for token what it was. */
+/* The Look Assist opt-out of the receipt element readers (ReceiptLoader::parseXmlElements and
+ * MainWindow::readXmlElementsFromFile).
+ *
+ * Their token walk is base's, unchanged: every element handler ends with readElementText() then
+ * readNext(), so in a compact receipt (no whitespace between elements) it reads the first element,
+ * steps past the next one and stops at that one's end element. Reading the rest of a compact receipt
+ * changed fields such as cutIn/cutOut with Look Assist off, so the off path was no longer base's
+ * output (EXPORT-PRORES-LOOK-ASSIST-1 r2 B1, sol r1 on ed129ee1). What the walk misses that matters
+ * to this card is an opt-out: <cutIn>1</cutIn><lookAssistEnabled>0</lookAssistEnabled> left Look Assist
+ * on (adversary A1 on 76653777).
+ *
+ * plainLookAssistOptOut() therefore reads the receipt element again with a second reader on its own
+ * handle of the same file, which leaves the main reader's position and error state exactly as base
+ * leaves them. It looks only at the element's direct children in no namespace named lookAssistEnabled,
+ * so an extension such as <x:lookAssistEnabled> neither hides a later plain opt-out nor overwrites an
+ * earlier one (r2 B2). It answers true when the last such child says 0. The caller only ever turns
+ * Look Assist OFF on that answer, so every receipt base read as off stays off, and nothing else the
+ * walk read is touched. */
 
+#include <QFile>
+#include <QFileDevice>
 #include <QXmlStreamReader>
 
-class ReceiptXmlWalk
+namespace ReceiptXmlWalk
 {
-public:
-    void next( QXmlStreamReader *reader )
-    {
-        if( !m_reuse ) reader->readNext();
-        m_reuse = false;
-        m_tokenAt = reader->characterOffset();
-    }
 
-    // Only an element in no namespace is handed on: the handlers compare local names, so a compact
-    // <x:lookAssistEnabled> extension tag is stepped over exactly as before (adversary A5 on 16d54744).
-    void settle( QXmlStreamReader *reader )
-    {
-        m_reuse = reader->isStartElement() && reader->characterOffset() != m_tokenAt
-               && reader->namespaceUri().isEmpty();
-    }
+/* elementOffset: reader->characterOffset() taken while the main reader stands on the receipt
+ * (or session clip) start element whose children are read. False when the reader's device is not
+ * a named file, the file cannot be reopened, or the element is not found. A parse error ends the
+ * scan with what it read before the error. */
+inline bool plainLookAssistOptOut( QXmlStreamReader *reader, qint64 elementOffset )
+{
+    QFileDevice *device = qobject_cast<QFileDevice *>( reader->device() );
+    if( !device || device->fileName().isEmpty() ) return false;
 
-private:
-    bool m_reuse = false;
-    qint64 m_tokenAt = -1;
-};
+    QFile file( device->fileName() );
+    // The same Text flag as the main reader's handle, so both readers count the same characters.
+    if( !file.open( QIODevice::ReadOnly | ( device->openMode() & QIODevice::Text ) ) ) return false;
+
+    QXmlStreamReader scan( &file );
+    bool found = false;
+    while( !scan.atEnd() && !scan.hasError() )
+    {
+        scan.readNext();
+        if( scan.isStartElement() && scan.characterOffset() == elementOffset )
+        {
+            found = true;
+            break;
+        }
+    }
+    if( !found ) return false;
+
+    int depth = 0;      // 0: a direct child of the element
+    int lastValue = -1; // -1: no plain lookAssistEnabled child read
+    while( !scan.atEnd() && !scan.hasError() )
+    {
+        scan.readNext();
+        if( scan.hasError() ) break;
+        if( scan.isStartElement() )
+        {
+            if( depth == 0 && scan.namespaceUri().isEmpty()
+             && scan.name() == QLatin1String( "lookAssistEnabled" ) )
+            {
+                const QString text = scan.readElementText();
+                if( scan.hasError() ) break;
+                lastValue = ( text.toInt() != 0 ) ? 1 : 0; // the handlers' (bool)toInt()
+                continue;
+            }
+            ++depth;
+        }
+        else if( scan.isEndElement() )
+        {
+            if( depth == 0 ) break; // the element's own end
+            --depth;
+        }
+    }
+    return lastValue == 0;
+}
+
+} // namespace ReceiptXmlWalk
 
 #endif // RECEIPTXMLWALK_H

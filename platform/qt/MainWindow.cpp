@@ -16390,11 +16390,11 @@ void MainWindow::readXmlElementsFromFile(QXmlStreamReader *Rxml, ReceiptSettings
     receipt->setDualIsoEvCorrection( 1 );
     receipt->setDualIsoBlackDelta( -1 );
 
-    //Read tags (ReceiptXmlWalk: a compact receipt's next element is not skipped)
-    ReceiptXmlWalk walk;
+    //Read tags (the walk is base's; the element is kept for the opt-out scan below, ReceiptXmlWalk.h)
+    const qint64 receiptElementOffset = Rxml->characterOffset();
     while( !Rxml->atEnd() && !Rxml->isEndElement() )
     {
-        walk.next( Rxml );
+        Rxml->readNext();
 
         if( Rxml->isStartElement() && Rxml->name() == QString( "exposure" ) )
         {
@@ -17043,8 +17043,11 @@ void MainWindow::readXmlElementsFromFile(QXmlStreamReader *Rxml, ReceiptSettings
             Rxml->readElementText();
             Rxml->readNext();
         }
-        walk.settle( Rxml );
     }
+
+    //A plain opt-out the walk stepped past, or one a namespaced extension overwrote, still turns Look Assist off;
+    //it never turns it on (EXPORT-PRORES-LOOK-ASSIST-1 r2 B1/B2)
+    if( ReceiptXmlWalk::plainLookAssistOptOut( Rxml, receiptElementOffset ) ) receipt->setLookAssistEnabled( false );
 }
 
 //Write all receipt elements to xml
