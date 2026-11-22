@@ -370,6 +370,8 @@ try {
 
     # ---------------------------------------------------------------- adopt
     . ([scriptblock]::Create((Get-AgentFunctionText 'Invoke-AdoptStartedJob')))
+    # AGENT-JOB-MONITOR-CIM-WALK-1 r8 (sol r7 B6): the adopted timeout recovers a refused incomplete-stop note into its receipt through these two helpers.
+    foreach ($adoptHelper in @('New-JobDiagnosticTags', 'Get-LostJobDiagnostics')) { . ([scriptblock]::Create((Get-AgentFunctionText $adoptHelper))) }
     $PollSeconds = 0
     $script:Calls = [System.Collections.Generic.List[string]]::new()
     $script:IdentitySeq = $null

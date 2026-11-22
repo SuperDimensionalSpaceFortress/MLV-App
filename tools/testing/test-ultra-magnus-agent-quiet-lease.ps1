@@ -1935,7 +1935,7 @@ function Exit-HeavySlot {
         'lease-start-post-start-cleanup-throws')
     if (@($qjCases | Where-Object { Test-Case $_ }).Count -gt 0) {
         # STAGE-JOB-LEASE-EXEMPT-1 r2: Invoke-QueuedJob classifies the job through Get-GateExemptClass, which reads both patterns.
-        foreach ($name in @('Invoke-QueuedJob', 'Complete-AdmissionWaitMarker', 'Publish-GateUnlaunchedResult', 'Get-GateExemptClass', 'Get-AgentHeatRule', 'Get-LostJobDiagnostics')) { . ([scriptblock]::Create((Get-FunctionBody $name))) }
+        foreach ($name in @('Invoke-QueuedJob', 'Complete-AdmissionWaitMarker', 'Publish-GateUnlaunchedResult', 'Get-GateExemptClass', 'Get-AgentHeatRule', 'Get-LostJobDiagnostics', 'New-JobDiagnosticTags')) { . ([scriptblock]::Create((Get-FunctionBody $name))) }
         # BACHELOR-THERMAL-GATE-AGENT-THRESHOLD-PARITY-1 r2: Invoke-QueuedJob publishes Get-AgentHeatRule, which reads the agent's own heat params.
         $GateSustainedRows = [int]$paramDefaults['GateSustainedRows']; $GateMaxThrottledRows = [int]$paramDefaults['GateMaxThrottledRows']; $GateMeanMaxC = [double]$paramDefaults['GateMeanMaxC']; $GateFeedStaleSec = [int]$paramDefaults['GateFeedStaleSec']
         . ([scriptblock]::Create(((Get-FunctionBody 'Get-JobMetadata') -replace '^function Get-JobMetadata', 'function Get-JobMetadataReal')))
@@ -5862,6 +5862,8 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         # agent's measured gap never under-reads heavy-slot.py's gap between renew records.
         Assert-True (@($rsLong.slices | Where-Object { $_.sliceSec -lt 70 -or $_.sliceSec -gt 90 }).Count -eq 0 -and @($rsLong.slices).Count -eq 8) "renew-slow-monitor-slice: every repeated modelled monitor slice of the long matrix takes 70-90 s (8 slices): $rsLongTxt"
         Assert-True ($rsLong.failures -eq 0 -and $rsLong.slow -eq 0 -and $rsLong.ok -ge 4) "renew-slow-monitor-slice: with repeated 70-90 s slices the renews succeed, repeatedly (late is the only fault modelled): $rsLongTxt"
+        # r8 (sol r7 B8): the merge-base assertion on the 70-90 s matrix, restored UNCHANGED (same bound, same operands): test strength never drops.
+        Assert-True ($rsLong.okMaxGapSec -lt 90 -and $rsLong.checkMaxGapSec -lt 90) "renew-slow-monitor-slice: with 70-90 s monitor slices the gap between SUCCESSFUL renews stays < 90 s (stale limit $($script:LeaseRenewStaleSec) s); measured okMaxGapSec=$($rsLong.okMaxGapSec) checkMaxGapSec=$($rsLong.checkMaxGapSec): $rsLongTxt"
         Assert-True ($rsLong.okMaxGapSec -le ($script:LeaseRenewStaleSec - 8) -and $rsLong.checkMaxGapSec -le ($script:LeaseRenewStaleSec - 8)) "renew-slow-monitor-slice: with repeated 70-90 s monitor slices the gap between SUCCESSFUL renews stays at least 8 s under the stale limit ($($script:LeaseRenewStaleSec) s); measured okMaxGapSec=$($rsLong.okMaxGapSec) checkMaxGapSec=$($rsLong.checkMaxGapSec): $rsLongTxt"
         Assert-True ($rsLong.okMaxGapSec + 0.05 -ge $rsLong.recordMaxGapSec) "renew-slow-monitor-slice: with repeated 70-90 s slices the agent's measured gap does not under-read heavy-slot.py's gap between renew records (okMaxGapSec=$($rsLong.okMaxGapSec) recordMaxGapSec=$($rsLong.recordMaxGapSec))"
         # Pass 2 A3: matched against the REAL monitor loop (the while loop over $jobProcess in Invoke-QueuedJob's AST, comments excluded), so a
@@ -6049,12 +6051,17 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             function Stop-Process { [CmdletBinding()] param([int]$Id, [switch]$Force) $script:PrStopped.Add($Id) }
             $script:Log.Clear(); $script:DescendantWalkStaleLogged = $null
             $walk = @(Get-DescendantProcessIdentities -ParentProcessId 4000)
-            $orphans = @(Get-DescendantProcessIdentities -ParentProcessId 4100)
+            # r8 (sol r7 B1, hub decision): the exited root is the post-exit census's case, the one caller that passes -RootExited (it holds the root's handle).
+            $orphans = @(Get-DescendantProcessIdentities -ParentProcessId 4100 -RootExited)
+            # r8 (B1): the same table read by a LIVE caller (no -RootExited): rows naming 4100 with no row for 4100 are unverifiable, nothing is emitted.
+            $orphansLive = @(Get-DescendantProcessIdentities -ParentProcessId 4100)
+            $orphansLiveRec = $script:LastDescendantWalk
             $rootMs = [DateTimeOffset]::new($prBase.AddSeconds(10)).ToUnixTimeMilliseconds()
             $killed = @(Stop-ProcessTree -RootProcessId 4000 -RootStartEpochMs $rootMs)
             # adversary A1 (known limit): a skipped row is NAMED in agent.log, once per pid however many walks see it (the walk above and Stop-ProcessTree's both do).
             $skipLines = @($script:Log | Where-Object { $_ -match '^descendant-walk: skipped pid=' })
             [pscustomobject]@{ ids = (@($walk | ForEach-Object { [int]$_.processId }) -join ','); orphanIds = (@($orphans | ForEach-Object { [int]$_.processId }) -join ','); killed = ($killed -join ','); stopped = (@($script:PrStopped) -join ',')
+                orphanLiveIds = (@($orphansLive | ForEach-Object { [int]$_.processId }) -join ','); orphanLiveOk = $orphansLiveRec.ok; orphanLiveWhy = [string]$orphansLiveRec.why
                 skipped = (@($skipLines | ForEach-Object { if ($_ -match 'skipped pid=(\d+)') { $Matches[1] } }) -join ',')
                 note = [string]$script:ProcessTreeWalkNote; stopSkipLines = @($script:Log | Where-Object { $_ -match '^process-tree stop pid=4000: SKIPPED' }) }
         }
@@ -6062,6 +6069,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True ($prOut.ids -notmatch '4001' -and $prOut.ids -notmatch '4004') "cim-walk-pid-reuse: row 4001 (created 12:00:00, ParentProcessId 4000 whose pid now belongs to a process created 12:00:10) and its child 4004 are NOT descendants: $prTxt"
         Assert-True ($prOut.ids -eq '4003,4002,4005,4006') "cim-walk-pid-reuse: the real descendants stay (a child created the same instant as its parent, one with no CreationDate) in depth-first order: $prTxt"
         Assert-True ($prOut.orphanIds -eq '4102,4101') "cim-walk-pid-reuse: the orphans of a root that is no longer in the table are still descendants: $prTxt"
+        Assert-True ($prOut.orphanLiveIds -eq '' -and $prOut.orphanLiveOk -eq $false -and $prOut.orphanLiveWhy.Contains('no read returned a row for the root pid')) "cim-walk-pid-reuse: (r8 sol r7 B1) a LIVE caller (no -RootExited) reading the same table emits nothing under a root with no row (the pid may have been reused) and records why: $prTxt"
         # r5 (adversary pass 7 A3): 4006 has no CreationDate, so its identity proves no start: it is listed (above) but reads as not existing and is never stopped.
         Assert-True ($prOut.killed -eq '4003,4002,4005,4000' -and $prOut.stopped -eq $prOut.killed) "cim-walk-pid-reuse: Stop-ProcessTree (the cancel, lease-stop and timeout kill) stops the real descendants that have a readable start and the root, never the stale-edge process 4001 or its child 4004, and never 4006 (no CreationDate: no identity to verify): $prTxt"
         Assert-True ($prOut.skipped -eq '4001') "cim-walk-pid-reuse: the skipped stale-edge row 4001 (its subtree, 4004, is never reached) is named once in agent.log however many walks see it: skipped=[$($prOut.skipped)] $prTxt"
@@ -6130,10 +6138,16 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null; $script:DescendantWalkStaleLogged = $null
                 $script:PsEvents.Clear(); $script:PsFilterTimeouts.Clear()
                 # r3 (adversary pass 3 A1): the walk takes the root's RECORDED start (as every caller has it), so it reads no root row at all.
-                $walk = @(Get-DescendantProcessIdentities -ParentProcessId 7000 -RootStartEpochMs $rootMs -OnEach { $script:PsEvents.Add('tick') })
+                # r8 (sol r7 B1, hub decision): the EXITED root (gone1) is the post-exit census's case, so it is walked as that caller walks it (-RootExited).
+                $walk = @(if (@($gone).Count -gt 0) { Get-DescendantProcessIdentities -ParentProcessId 7000 -RootStartEpochMs $rootMs -RootExited -OnEach { $script:PsEvents.Add('tick') } } else { Get-DescendantProcessIdentities -ParentProcessId 7000 -RootStartEpochMs $rootMs -OnEach { $script:PsEvents.Add('tick') } })
                 $rowsOut["before-root-gone$(@($gone).Count)"] = [pscustomobject]@{ ids = (@($walk | ForEach-Object { [int]$_.processId }) -join ','); events = (@($script:PsEvents) -join ' > '); filterTimeouts = (@($script:PsFilterTimeouts) -join ',')
                     why = [string]$script:LastDescendantWalk.why }
             }
+            # r8 (sol r7 B1): the partial snapshot names the root as parent, the supplemental root-row read returns NO row, and the caller is LIVE: unverifiable.
+            $script:PsGone = @(7000)
+            $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null; $script:DescendantWalkStaleLogged = $null
+            $walk = @(Get-DescendantProcessIdentities -ParentProcessId 7000 -RootStartEpochMs $rootMs)
+            $rowsOut['before-root-gone1-live'] = [pscustomobject]@{ ids = (@($walk | ForEach-Object { [int]$_.processId }) -join ','); ok = $script:LastDescendantWalk.ok; why = [string]$script:LastDescendantWalk.why }
             $script:PsGone = @()
             # adversary A10: one snapshot failure is one physical agent.log line, whatever the provider's message holds.
             $script:PsMode = 'fail-multiline'
@@ -6184,6 +6198,8 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         # made once, because without the row a REUSED root pid cannot be told from the recorded process. The recorded start stays authoritative.)
         Assert-True ($b0.ids -eq '7005') "cim-walk-partial-snapshot: a snapshot that fails after a stale-edge row and BEFORE the root's own row still refuses the stale row (the root's start is the recorded one) and keeps the real child: ids=[$($b0.ids)] $psTxt"
         Assert-True ($b1.ids -eq '7005') "cim-walk-partial-snapshot: the root has EXITED (its row is in no read): the partial snapshot's child row is still found: ids=[$($b1.ids)] $psTxt"
+        $b1l = $psOut['before-root-gone1-live']
+        Assert-True ($b1l.ids -eq '' -and $b1l.ok -eq $false -and $b1l.why.Contains('no read returned a row for the root pid')) "cim-walk-partial-snapshot: (r8 sol r7 B1) the same reads for a LIVE caller (the supplemental root-row read returns no row): the root is unverifiable and 7005 is not emitted: $psTxt"
         # r5 (Grok G6): the failed snapshot lacks the root's own row, so the walk reads it ONCE (b0: the root is the recorded process, same start; b1: the root
         # exited, no row), between the same two ticks, inside the one budget; it is never a per-parent fallback.
         foreach ($bx in @($b0, $b1)) {
@@ -6279,12 +6295,21 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             # (a) + (b): the root 4200 (recorded start 12:00:00) has exited, so its row is in no read. 4201 (created 30 s BEFORE it) is a stale edge, 4202 a real child.
             $script:RtTable = @((New-RtProc 4201 4200 -30), (New-RtProc 4202 4200 5), (New-RtProc 4203 4201 -20))
             $script:Log.Clear(); $script:DescendantWalkStaleLogged = $null; $script:DescendantWalkFailLogTs = $null
-            $w = @(Get-DescendantProcessIdentities -ParentProcessId 4200 -RootStartEpochMs $rootMs)
+            # r8 (sol r7 B1, hub decision): an exited root is the post-exit census's case, walked as that caller walks it (-RootExited, the r3 G1 contract).
+            $w = @(Get-DescendantProcessIdentities -ParentProcessId 4200 -RootStartEpochMs $rootMs -RootExited)
             $o['exitedComplete'] = [pscustomobject]@{ ids = (& $ids $w); skipped = (@($script:LastDescendantWalk.skipped) -join ','); ok = $script:LastDescendantWalk.ok }
+            # r8 (sol r7 B1, the literal repro): a COMPLETE snapshot holds only 7331 (12:00:41) naming the recorded root 7330 (12:00:00); a LIVE caller: unverifiable.
+            $script:RtTable = @((New-RtProc 7331 7330 41))
+            $w = @(Get-DescendantProcessIdentities -ParentProcessId 7330 -RootStartEpochMs $rootMs)
+            $o['exitedCompleteLive'] = [pscustomobject]@{ ids = (& $ids $w); ok = $script:LastDescendantWalk.ok; why = [string]$script:LastDescendantWalk.why }
+            $script:RtTable = @((New-RtProc 4201 4200 -30), (New-RtProc 4202 4200 5), (New-RtProc 4203 4201 -20))
             $script:RtFail = 'simulated provider error after rows'
             $script:RtFilterRows = $true   # r5 (G6): the partial read lacks the root's row, so it is read once; the exited root answers with no row
-            $w = @(Get-DescendantProcessIdentities -ParentProcessId 4200 -RootStartEpochMs $rootMs)
+            $w = @(Get-DescendantProcessIdentities -ParentProcessId 4200 -RootStartEpochMs $rootMs -RootExited)
             $o['exitedPartial'] = [pscustomobject]@{ ids = (& $ids $w); skipped = (@($script:LastDescendantWalk.skipped) -join ','); ok = $script:LastDescendantWalk.ok; partial = $script:LastDescendantWalk.partial; rows = $script:LastDescendantWalk.rows }
+            # r8 (sol r7 B1, second repro): the partial snapshot, then an EMPTY supplemental root-row read, for a LIVE caller: unverifiable.
+            $w = @(Get-DescendantProcessIdentities -ParentProcessId 4200 -RootStartEpochMs $rootMs)
+            $o['exitedPartialLive'] = [pscustomobject]@{ ids = (& $ids $w); ok = $script:LastDescendantWalk.ok; why = [string]$script:LastDescendantWalk.why }
             $script:RtFilterRows = $false
             $script:RtFail = $null
             # (c) G1: pid 4300 now belongs to a process created 12:00:10 (it has its own child 4301, created 12:00:12). The REAL orphan 4302 was created 12:00:05
@@ -6355,12 +6380,12 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             # returning rows that name the root as parent but NOT the root's own row (so no per-parent fallback runs). The root's row is read by ONE bounded
             # ProcessId=<root> filtered read: g6Reused (a), g6Reused1ms (b), g6Unreadable (c), g6NoBudget / g6Clamp (c2, c3), g6Exited (d), g6SameStart (e).
             $g6Run = {
-                param($Table, $FullRows, [bool]$FilterOk, [int]$RootPid, $Deadline = $null, [int]$FullDelayMs = 0)
+                param($Table, $FullRows, [bool]$FilterOk, [int]$RootPid, $Deadline = $null, [int]$FullDelayMs = 0, [switch]$Exited)
                 $script:RtTable = @($Table); $script:RtFullRows = @($FullRows); $script:RtFail = 'partial read error after rows'
                 $script:RtFailEmpty = $false; $script:RtFilterRows = $FilterOk; $script:RtFilterThenFail = $false; $script:RtFullDelayMs = $FullDelayMs
                 $script:RtTimeouts.Clear(); $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null; $script:DescendantWalkStaleLogged = $null
                 # the outer @() keeps an EMPTY walk an empty array (an if-statement's result would unroll it to $null, which the ids reader counts as pid 0)
-                $g6W = @(if ($null -ne $Deadline) { Get-DescendantProcessIdentities -ParentProcessId $RootPid -RootStartEpochMs $rootMs -Deadline $Deadline } else { Get-DescendantProcessIdentities -ParentProcessId $RootPid -RootStartEpochMs $rootMs })
+                $g6W = @(if ($null -ne $Deadline) { Get-DescendantProcessIdentities -ParentProcessId $RootPid -RootStartEpochMs $rootMs -Deadline $Deadline -RootExited:$Exited } else { Get-DescendantProcessIdentities -ParentProcessId $RootPid -RootStartEpochMs $rootMs -RootExited:$Exited })
                 $g6Rec = $script:LastDescendantWalk
                 $script:RtFullDelayMs = 0; $script:RtFail = $null; $script:RtFullRows = $null
                 [pscustomobject]@{ ids = (& $ids $g6W); ok = $g6Rec.ok; partial = $g6Rec.partial; rows = $g6Rec.rows; why = [string]$g6Rec.why; queries = $script:RtTimeouts.Count; timeouts = (@($script:RtTimeouts) -join ',')
@@ -6377,7 +6402,9 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             # (c3) the root-row read starts while budget remains and takes the same clamp as the fallback (2 s left, the full read took 1.7 s: a 1 s bound).
             $o['g6Clamp'] = & $g6Run @((New-RtProc 4650 1 40), (New-RtProc 4651 4650 41)) @((New-RtProc 4651 4650 41)) $true 4650 ((Get-Date).AddSeconds(2)) 1700
             # (d) control: the root-row read returns NO row (the root exited, nothing holds its pid): the recorded start is authoritative and the real child is walked.
-            $o['g6Exited'] = & $g6Run @((New-RtProc 4631 4630 5)) @((New-RtProc 4631 4630 5)) $true 4630
+            # r8 (sol r7 B1, hub decision): only the post-exit census (-RootExited) takes the recorded start when no row comes back; a live caller cannot.
+            $o['g6Exited'] = & $g6Run @((New-RtProc 4631 4630 5)) @((New-RtProc 4631 4630 5)) $true 4630 -Exited
+            $o['g6ExitedLive'] = & $g6Run @((New-RtProc 4631 4630 5)) @((New-RtProc 4631 4630 5)) $true 4630
             # (e) control: the root-row read returns the SAME start (the same process): the children are walked.
             $o['g6SameStart'] = & $g6Run @((New-RtProc 4640 1 0), (New-RtProc 4641 4640 3)) @((New-RtProc 4641 4640 3)) $true 4640
             # r5 (adversary pass 6 A1, the null-start variant): the root-row read returns the root with NO readable CreationDate: it cannot be compared with the
@@ -6499,6 +6526,8 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         }
         $rtTxt = $rtOut | ConvertTo-Json -Depth 5 -Compress
         Assert-True ($rtOut['exitedComplete'].ids -eq '4202' -and $rtOut['exitedComplete'].skipped -eq '4201' -and $rtOut['exitedComplete'].ok -eq $true) "cim-walk-root-start: (b) a child created before the RECORDED start of an exited root is refused (and named in the walk record); the real child is walked: $rtTxt"
+        Assert-True ($rtOut['exitedCompleteLive'].ids -eq '' -and $rtOut['exitedCompleteLive'].ok -eq $false -and $rtOut['exitedCompleteLive'].why.Contains('no read returned a row for the root pid')) "cim-walk-root-start: (r8 sol r7 B1) a COMPLETE snapshot holding only 7331 (12:00:41) under the recorded root 7330, with no row for 7330, read by a LIVE caller: 7331 is NOT emitted and the walk is recorded unverifiable (ok=false): $rtTxt"
+        Assert-True ($rtOut['exitedPartialLive'].ids -eq '' -and $rtOut['exitedPartialLive'].ok -eq $false -and $rtOut['exitedPartialLive'].why.Contains('no read returned a row for the root pid')) "cim-walk-root-start: (r8 sol r7 B1) a partial snapshot and an EMPTY supplemental root-row read, for a LIVE caller: the child 4202 is NOT emitted: $rtTxt"
         Assert-True ($rtOut['exitedPartial'].ids -eq '4202' -and $rtOut['exitedPartial'].skipped -eq '4201' -and $rtOut['exitedPartial'].ok -eq $false -and $rtOut['exitedPartial'].partial -eq $true -and $rtOut['exitedPartial'].rows -eq 3) "cim-walk-root-start: (a) the root exited, the snapshot returned its child rows and then errored: the real child is still found, the stale one is still refused, and the record says PARTIAL: $rtTxt"
         Assert-True ($rtOut['reused'].ids -eq '4304,4302' -and $rtOut['reused'].skipped -eq '4303') "cim-walk-root-start: (c) G1, a root row whose start (12:00:10) differs from the recorded one (12:00:00) is ignored in favour of the recorded start: the orphan 4302 (12:00:05) and its child 4304 are emitted, the stale 4303 is skipped, the reuser's child 4301 (12:00:12) is not: $rtTxt"
         Assert-True (@($rtOut['reused'].reuseLines).Count -eq 1 -and $rtOut['reused'].reuseLines[0] -match 'pids=4301') "cim-walk-root-start: (c) the rows left out as the reuser's children are named in one agent.log line: $rtTxt"
@@ -6512,7 +6541,8 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         # r4 (adversary pass 4): A2, A3, A9, A1 on the real walk.
         Assert-True ($rtOut['reusedNear'].ids -eq '' -and $rtOut['reusedNear'].reuseLines -eq 1) "cim-walk-root-start: (A2) a process that took the root's pid 1.5 s after the recorded start (inside the identity checks' 2 s tolerance) is a reuser: its child 4501 is NOT walked and the reuse is named once: $rtTxt"
         $fb = $rtOut['fallback']
-        Assert-True ($fb.ids -eq '7102,7101' -and $fb.ok -eq $false -and $fb.partial -eq $true -and $fb.rows -eq 4 -and $fb.queries -eq 6 -and @($fb.logs).Count -eq 1 -and @($fb.logs)[0] -match 'fell back' -and @($fb.logs)[0] -match 'pid=7100') "cim-walk-root-start: (A3) the full-table read failed with no rows but the per-parent reads answer: the children 7101 and 7102 are found (1 full + the root's row + 3 per-parent queries... = 5), recorded PARTIAL with the 3 rows read, one log line says it fell back: $rtTxt"
+        # r8 (sol r7 B2): 7 queries = 1 full + the root's row + 3 per-parent reads + the re-read of 7101 after its children (its generation) + the root's re-read.
+        Assert-True ($fb.ids -eq '7102,7101' -and $fb.ok -eq $false -and $fb.partial -eq $true -and $fb.rows -eq 4 -and $fb.queries -eq 7 -and @($fb.logs).Count -eq 1 -and @($fb.logs)[0] -match 'fell back' -and @($fb.logs)[0] -match 'pid=7100') "cim-walk-root-start: (A3) the full-table read failed with no rows but the per-parent reads answer: the children 7101 and 7102 are found (1 full + the root's row + 3 per-parent reads + 7101 re-read + root re-read = 7 queries), recorded PARTIAL with the rows read, one log line says it fell back: $rtTxt"
         Assert-True ($rtOut['fallbackReused'].ids -eq '' -and $rtOut['fallbackReused'].reuseLines -eq 1) "cim-walk-root-start: (A2, pass 5) the fallback reads the root's own row: a replacement root (created 40 s after the recorded start) is a reuser and its child 4501 is not walked: $rtTxt"
         # r5 (Grok G6): a failed read holding the root's CHILDREN but not the root's own row reads that row once (no per-parent fallback), then decides.
         $g6a = $rtOut['g6Reused']
@@ -6527,6 +6557,8 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True ($g6k.queries -eq 2 -and $g6k.timeouts -ceq '2,1' -and $g6k.ids -eq '' -and $g6k.reuseLines -eq 1) "cim-walk-root-start: (G6 c3) the root-row read starts while budget remains and is bounded by what is left (2 s, then 1 s): timeouts=[$($g6k.timeouts)]: $rtTxt"
         $g6d = $rtOut['g6Exited']
         Assert-True ($g6d.ids -eq '4631' -and $g6d.reuseLines -eq 0 -and $g6d.ok -eq $false -and $g6d.partial -eq $true -and $g6d.queries -eq 2) "cim-walk-root-start: (G6 d) control: the root-row read returns no row (the root exited, the pid is free): the recorded start is authoritative and the real child is walked: $rtTxt"
+        $g6dl = $rtOut['g6ExitedLive']
+        Assert-True ($g6dl.ids -eq '' -and $g6dl.ok -eq $false -and $g6dl.queries -eq 2 -and $g6dl.why.Contains('no read returned a row for the root pid')) "cim-walk-root-start: (r8 sol r7 B1) the same reads for a LIVE caller: the root-row read returns no row, so the root may have been reused: unverifiable, 4631 is NOT emitted: $rtTxt"
         $g6e = $rtOut['g6SameStart']
         Assert-True ($g6e.ids -eq '4641' -and $g6e.reuseLines -eq 0 -and $g6e.queries -eq 2) "cim-walk-root-start: (G6 e) control: the root-row read returns the SAME start (the same process): the child is walked: $rtTxt"
         $g6f = $rtOut['g6NullStartPartial']
@@ -6647,13 +6679,14 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             [pscustomobject]@{
                 none = @(Get-LostJobDiagnostics -Stderr '' -CaptureDrainFailure $null -PostExitWalk $ldOk).Count
                 capLost = @(Get-LostJobDiagnostics -Stderr '' -CaptureDrainFailure 'capture failed' -PostExitWalk $null)
-                capKept = @(Get-LostJobDiagnostics -Stderr "x`noutput capture failed: capture failed (the job's stdout/stderr may be incomplete)`n" -CaptureDrainFailure 'capture failed' -PostExitWalk $null).Count
+                # r8 (sol r7 B5): a kept line is the agent's own, which carries the job's token for its kind
+                capKept = @(Get-LostJobDiagnostics -Stderr "x`noutput capture failed: capture failed (the job's stdout/stderr may be incomplete) [agent-diag 0000000000000c01]`n" -CaptureDrainFailure 'capture failed' -PostExitWalk $null -Tags @{ capture = ' [agent-diag 0000000000000c01]' }).Count
                 censusLost = @(Get-LostJobDiagnostics -Stderr 'job output' -CaptureDrainFailure $null -PostExitWalk $ldBad)
-                censusKept = @(Get-LostJobDiagnostics -Stderr 'post-exit descendant census PARTIAL (RPC error): ...' -CaptureDrainFailure $null -PostExitWalk $ldBad).Count
+                censusKept = @(Get-LostJobDiagnostics -Stderr "post-exit descendant census PARTIAL (RPC error): ... [agent-diag 0000000000000c02]`n" -CaptureDrainFailure $null -PostExitWalk $ldBad -Tags @{ census = ' [agent-diag 0000000000000c02]' }).Count
                 nullStderr = @(Get-LostJobDiagnostics -Stderr $null -CaptureDrainFailure 'c' -PostExitWalk $null).Count
                 # pass 7 A6: a child's own similar text is not the agent's line; a refused SKIPPED line is restored on its own
                 childPhrase = @(Get-LostJobDiagnostics -Stderr "child: post-exit descendant census retry queued`nchild: output capture failed: application cache only`n" -CaptureDrainFailure 'disk I/O fault' -PostExitWalk ([pscustomobject]@{ ok = $false; partial = $true; why = 'RPC unavailable'; skipped = @() }))
-                skippedLost = @(Get-LostJobDiagnostics -Stderr "post-exit descendant census PARTIAL (RPC unavailable): only the descendants found in the 3 process rows it returned`n" -CaptureDrainFailure $null -PostExitWalk ([pscustomobject]@{ ok = $false; partial = $true; why = 'RPC unavailable'; skipped = @(7501) }))
+                skippedLost = @(Get-LostJobDiagnostics -Stderr "post-exit descendant census PARTIAL (RPC unavailable): only the descendants found in the 3 process rows it returned [agent-diag 0000000000000c03]`n" -CaptureDrainFailure $null -PostExitWalk ([pscustomobject]@{ ok = $false; partial = $true; why = 'RPC unavailable'; skipped = @(7501) }) -Tags @{ census = ' [agent-diag 0000000000000c03]'; skipped = ' [agent-diag 0000000000000c04]' })
             }
         }
         Assert-True ($ldOut.none -eq 0 -and $ldOut.capLost.Count -eq 1 -and $ldOut.capLost[0].Contains('output capture failed: capture failed') -and $ldOut.capLost[0].Contains('could not be written') -and $ldOut.capKept -eq 0 -and $ldOut.censusLost.Count -eq 1 -and $ldOut.censusLost[0].Contains('PARTIAL (RPC error)') -and $ldOut.censusKept -eq 0 -and $ldOut.nullStderr -eq 1 -and $ldOut.childPhrase.Count -eq 2 -and $ldOut.childPhrase[0].Contains('disk I/O fault') -and $ldOut.childPhrase[1].Contains('RPC unavailable') -and $ldOut.skippedLost.Count -eq 1 -and $ldOut.skippedLost[0].Contains('SKIPPED pids=7501')) "cim-walk-root-start: (pass 6 A2, pass 7 A6) Get-LostJobDiagnostics returns exactly the diagnostics missing from the stderr the receipt read back (a refused capture-failure or census line), and nothing for ones that are there: $($ldOut | ConvertTo-Json -Compress -Depth 4)"
@@ -6730,7 +6763,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             # $script:FcFull: the answer of the full-table read ($null = it fails at once with no rows, so the walk falls back to per-parent reads).
             # $script:FcAns: filter -> array of answers, one per call of that filter (the last repeats). An answer is @{ rows = @(..); err = $null|'write'|'throw' };
             # rows are returned first, then the error is raised (the streamed-read shape the walk keeps rows from).
-            $script:FcFull = $null; $script:FcAns = @{}; $script:FcCalls = @{}; $script:FcStopped = [System.Collections.Generic.List[int]]::new()
+            $script:FcFull = $null; $script:FcAns = @{}; $script:FcCalls = @{}; $script:FcStopped = [System.Collections.Generic.List[int]]::new(); $script:FcDelay = @{}
             function Get-CimInstance {
                 [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter, [string[]]$Property, [uint32]$OperationTimeoutSec)
                 $ans = $null
@@ -6739,6 +6772,9 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                     if ($null -eq $list) { return }   # an unscripted filter answers with no row
                     $n = [int]$script:FcCalls[$Filter]; $script:FcCalls[$Filter] = $n + 1
                     $ans = @($list)[[Math]::Min($n, @($list).Count - 1)]
+                    # r8 (sol r7 B4): $script:FcDelay[filter] = ms to wait before the n-th answer of that filter (the last repeats): an answer that arrives late.
+                    $delays = $script:FcDelay[$Filter]
+                    if ($null -ne $delays) { $d = [int]@($delays)[[Math]::Min($n, @($delays).Count - 1)]; if ($d -gt 0) { Start-Sleep -Milliseconds $d } }
                 }
                 else {
                     if ($null -eq $script:FcFull) { Write-Error 'full-table read failed'; return }
@@ -6793,10 +6829,74 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             # adversary pass 9 A4: the post-exit UNVERIFIED line is recovered into the receipt when the err-file append is refused (the helper reads .unverified).
             . ([scriptblock]::Create((Get-FunctionBody 'Get-LostJobDiagnostics')))
             $ldWalk = [pscustomobject]@{ ok = $true; partial = $false; rows = 3; why = $null; rootPid = 7400; skipped = @(); unverified = @(7402) }
+            # r8 (sol r7 B5): "written" now means the agent's own line, carrying this job's token for the kind (the kept input is that line).
+            $ldHasTags = (Get-Command Get-LostJobDiagnostics).Parameters.ContainsKey('Tags')
+            $ldTags = @{ capture = ' [agent-diag c0ffee0000000001]'; census = ' [agent-diag c0ffee0000000002]'; unverified = ' [agent-diag c0ffee0000000003]'; skipped = ' [agent-diag c0ffee0000000004]'; stop = ' [agent-diag c0ffee0000000005]'; monitor = ' [agent-diag c0ffee0000000006]' }
+            $ld = { param([hashtable]$A) if ($ldHasTags) { @(Get-LostJobDiagnostics @A -Tags $ldTags) } else { @(Get-LostJobDiagnostics @A) } }
             $o['lostUnverified'] = [pscustomobject]@{
                 lost = @(Get-LostJobDiagnostics -Stderr 'worker finished' -CaptureDrainFailure $null -PostExitWalk $ldWalk)
-                kept = @(Get-LostJobDiagnostics -Stderr "worker finished`npost-exit descendant census UNVERIFIED pids=7402 (their parent row has no readable creation time)`n" -CaptureDrainFailure $null -PostExitWalk $ldWalk).Count
+                kept = @(& $ld @{ Stderr = "worker finished`npost-exit descendant census UNVERIFIED pids=7402 (their parent row has no readable creation time)$($ldTags['unverified'])`n"; CaptureDrainFailure = $null; PostExitWalk = $ldWalk }).Count
             }
+            # ---- r8 (FIX ROUND r8: sol r7 B2-B7, opus r7 DC-08c). Each case is the catalogue repro, RED on 92702fb3 (red-92702fb3.txt in the r8 run dir).
+            # B2 (sol): the fallback admits 7501 (12:00:01) under the root, then reads 7501's children AFTER a process created 12:00:40 took pid 7501: the read
+            # returns that process's child 7502 (12:00:41), and 7501 read again is the 12:00:40 process. 7502 must not be emitted (it is unverifiable).
+            $b2Ans = { param($Again) @{ 'ProcessId=7500' = @(@{ rows = @(New-FcProc 7500 1 0) }); 'ParentProcessId=7500' = @(@{ rows = @(New-FcProc 7501 7500 1) }); 'ParentProcessId=7501' = @(@{ rows = @(New-FcProc 7502 7501 41) }); 'ProcessId=7501' = @(@{ rows = @(New-FcProc 7501 7500 $Again) }) } }
+            $o['b2Sol'] = & $run 7500 $null (& $b2Ans 40) $false
+            $o['b2Control'] = & $run 7500 $null (& $b2Ans 1) $false
+            $o['b2Gone'] = & $run 7500 $null @{ 'ProcessId=7500' = @(@{ rows = @(New-FcProc 7500 1 0) }); 'ParentProcessId=7500' = @(@{ rows = @(New-FcProc 7501 7500 1) }); 'ParentProcessId=7501' = @(@{ rows = @(New-FcProc 7502 7501 41) }) } $false
+            # DC-08c (opus r7): the full read streams an UNRELATED 7601 (parent 9, created 12:00:30) and fails; the fallback returns the job's child that took pid
+            # 7601 with NO CreationDate under the root, and ParentProcessId=7601 returns 7602 (12:00:40, an orphan of the old 7601). 7602 must not be emitted.
+            $o['dc08c'] = & $run 7600 @{ rows = @(New-FcProc 7601 9 30); err = 'write' } @{ 'ProcessId=7600' = @(@{ rows = @(New-FcProc 7600 1 0) }); 'ParentProcessId=7600' = @(@{ rows = @(New-FcProc 7601 7600 $null) }); 'ParentProcessId=7601' = @(@{ rows = @(New-FcProc 7602 7601 40) }); 'ProcessId=7601' = @(@{ rows = @(New-FcProc 7601 7600 $null) }) } $false
+            # B3 (sol): recorded root start .123 (ms), the root row's precise start .1239, a child created at .1231 (before the root, inside the same millisecond).
+            $b3Root = New-FcProc 7700 1 0; $b3Root.CreationDate = $fcBase.AddTicks(1239000)
+            $b3Kid = New-FcProc 7701 7700 0; $b3Kid.CreationDate = $fcBase.AddTicks(1231000)
+            $b3Ok = New-FcProc 7702 7700 0; $b3Ok.CreationDate = $fcBase.AddTicks(1240000)
+            $script:FcFull = @{ rows = @($b3Root, $b3Kid, $b3Ok) }; $script:FcAns = @{}; $script:FcCalls = @{}
+            $script:Log.Clear(); $script:DescendantWalkStaleLogged = $null; $script:LastDescendantWalk = $null
+            $b3w = @(Get-DescendantProcessIdentities -ParentProcessId 7700 -RootStartEpochMs ([DateTimeOffset]::new($fcBase.AddTicks(1239000)).ToUnixTimeMilliseconds()))
+            $o['b3Sol'] = [pscustomobject]@{ ids = (& $ids $b3w); skipped = (@($script:LastDescendantWalk.skipped) -join ','); ok = $script:LastDescendantWalk.ok }
+            # B4 (sol): an answer that arrives AFTER the job's deadline. (a) the partial route: the failed full read returned the root's child 7801 (12:00:41) and
+            # not its row; the root-row read answers 1.2 s later with the recorded root, the deadline was 0.6 s away. (b) the fallback route: the root's re-read
+            # after the children answers late. Neither late answer may admit the child.
+            $b4Run = {
+                param([int]$RootPid, $Full, [hashtable]$Ans, [hashtable]$Delay)
+                $script:FcFull = $Full; $script:FcAns = $Ans; $script:FcCalls = @{}; $script:FcDelay = $Delay
+                $script:Log.Clear(); $script:DescendantWalkFailLogTs = $null; $script:LastDescendantWalk = $null
+                $b4w = @(Get-DescendantProcessIdentities -ParentProcessId $RootPid -RootStartEpochMs $rootMs -Deadline ((Get-Date).AddSeconds(0.6)))
+                $script:FcDelay = @{}
+                [pscustomobject]@{ ids = (& $ids $b4w); ok = $script:LastDescendantWalk.ok; why = [string]$script:LastDescendantWalk.why }
+            }
+            $o['b4Partial'] = & $b4Run 7800 @{ rows = @(New-FcProc 7801 7800 41); err = 'write' } @{ 'ProcessId=7800' = @(@{ rows = @(New-FcProc 7800 1 0) }) } @{ 'ProcessId=7800' = @(1200) }
+            $o['b4Recheck'] = & $b4Run 7820 $null @{ 'ProcessId=7820' = @(@{ rows = @(New-FcProc 7820 1 0) }); 'ParentProcessId=7820' = @(@{ rows = @(New-FcProc 7821 7820 3) }) } @{ 'ProcessId=7820' = @(0, 1200) }
+            $o['b4Control'] = & $b4Run 7840 $null @{ 'ProcessId=7840' = @(@{ rows = @(New-FcProc 7840 1 0) }); 'ParentProcessId=7840' = @(@{ rows = @(New-FcProc 7841 7840 3) }) } @{}
+            # B5 (sol): the job's own processes print the agent's diagnostic sentences (prefix and all) while the agent's appends are refused. With the agent's
+            # tokens none of them stands in for the agent's line: all four are recovered. The agent's own tagged lines are recognised (nothing recovered).
+            $b5Walk = [pscustomobject]@{ ok = $false; partial = $false; rows = 3; why = 'RPC unavailable'; rootPid = 7400; skipped = @(7501); unverified = @(7402) }
+            $b5Forged = "post-exit descendant census UNVERIFIED pids=7402 (worker text)`npost-exit descendant census SKIPPED pids=7501 (worker text)`npost-exit descendant census FAILED (RPC unavailable): worker text`noutput capture failed: disk fault (worker text)`n"
+            $b5Genuine = "output capture failed: disk fault (the job's stdout/stderr may be incomplete)$($ldTags['capture'])`npost-exit descendant census FAILED (RPC unavailable): only the descendants ... may still be running$($ldTags['census'])`npost-exit descendant census UNVERIFIED pids=7402 (their parent row ...)$($ldTags['unverified'])`npost-exit descendant census SKIPPED pids=7501 (created before ...)$($ldTags['skipped'])`n"
+            $o['b5'] = [pscustomobject]@{
+                forged = @(& $ld @{ Stderr = $b5Forged; CaptureDrainFailure = 'disk fault'; PostExitWalk = $b5Walk })
+                genuine = @(& $ld @{ Stderr = $b5Genuine; CaptureDrainFailure = 'disk fault'; PostExitWalk = $b5Walk }).Count
+                hasTags = $ldHasTags
+            }
+            # B6 (sol): a kill path's incomplete-stop note whose err-file append was refused (the err file holds only the job's own output).
+            $b6Note = '; DESCENDANT WALK FAILED (RPC unavailable): it listed no descendants, so only the root was targeted; descendants it did not list may still be running'
+            $ldHasStop = (Get-Command Get-LostJobDiagnostics).Parameters.ContainsKey('StopNote')
+            $o['b6'] = [pscustomobject]@{
+                lost = @(if ($ldHasStop) { & $ld @{ Stderr = 'job output'; CaptureDrainFailure = $null; PostExitWalk = $null; StopNote = $b6Note } } else { & $ld @{ Stderr = 'job output'; CaptureDrainFailure = $null; PostExitWalk = $null } })
+                kept = @(if ($ldHasStop) { & $ld @{ Stderr = "job output`ncancelled by mailbox request; killed process tree pids=7000$b6Note$($ldTags['stop'])`n"; CaptureDrainFailure = $null; PostExitWalk = $null; StopNote = $b6Note } } else { @() }).Count
+                childCopy = @(if ($ldHasStop) { & $ld @{ Stderr = "cancelled by mailbox request; killed process tree pids=7000$b6Note`n"; CaptureDrainFailure = $null; PostExitWalk = $null; StopNote = $b6Note } } else { @() }).Count
+            }
+            # B7 (sol): the stdout copy has ALREADY faulted (IOException) and the stderr copy is still pending: the drain reports the stdout fault, not the bound.
+            . ([scriptblock]::Create((Get-FunctionBody 'Complete-WindowlessRedirectedProcess')))
+            $b7Tcs = [System.Threading.Tasks.TaskCompletionSource[object]]::new()
+            $b7Launch = [pscustomobject]@{ OutCopy = [System.Threading.Tasks.Task]::FromException([System.IO.IOException]::new('stdout copy broke')); ErrCopy = $b7Tcs.Task; OutStream = [System.IO.MemoryStream]::new(); ErrStream = [System.IO.MemoryStream]::new() }
+            $b7e = $null
+            try { Complete-WindowlessRedirectedProcess -Launch $b7Launch -CaptureWaitMs 300 } catch { $b7e = $_.Exception.Message }
+            $b7Both = [pscustomobject]@{ OutCopy = [System.Threading.Tasks.Task]::CompletedTask; ErrCopy = $b7Tcs.Task; OutStream = [System.IO.MemoryStream]::new(); ErrStream = [System.IO.MemoryStream]::new() }
+            $b7p = $null
+            try { Complete-WindowlessRedirectedProcess -Launch $b7Both -CaptureWaitMs 300 } catch { $b7p = $_.Exception.Message }
+            $o['b7'] = [pscustomobject]@{ faulted = $b7e; pendingOnly = $b7p }
             $o
         }
         $fcTxt = $fcOut | ConvertTo-Json -Depth 6 -Compress
@@ -6824,6 +6924,41 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True ($g6x.ids -eq '' -and $g6x.ok -eq $false -and $g6x.why.Contains('the root row read failed') -and $g6x.why.Contains('children not walked')) "cim-walk-fail-closed: (pass 9 A3) the root-row read streams the recorded root row and THEN errors: the root is unverifiable and the child 4601 is NOT emitted (an error is never hidden by a row that came before it): $fcTxt"
         $lu = $fcOut['lostUnverified']
         Assert-True (@($lu.lost).Count -eq 1 -and $lu.lost[0] -match 'UNVERIFIED pids=7402' -and $lu.lost[0].Contains('could not be written') -and $lu.kept -eq 0) "cim-walk-fail-closed: (pass 9 A4) an UNVERIFIED census line the err file refused is recovered into the receipt (and not repeated when it was written): $fcTxt"
+        # ---- r8 (sol r7 B2-B7, opus r7 DC-08c)
+        $b2 = $fcOut['b2Sol']; $b2c = $fcOut['b2Control']; $b2g = $fcOut['b2Gone']
+        Assert-True ($b2.existing -eq '7501' -and $b2.unverified -eq '7502') "cim-walk-fail-closed: (r8 sol r7 B2) the fallback admitted 7501 (12:00:01); its children read returns 7502 (12:00:41) after a 12:00:40 process took pid 7501, and 7501 read again is that process: 7502 is NOT emitted and is named unverified: $fcTxt"
+        Assert-True ($b2g.existing -eq '7501' -and $b2g.unverified -eq '7502') "cim-walk-fail-closed: (r8 sol r7 B2) the same, but 7501 is GONE when read again (no row): 7502 is NOT emitted (unverified): $fcTxt"
+        Assert-True ($b2c.existing -eq '7502,7501' -and $b2c.unverified -eq '' -and $b2c.reads -match 'ProcessId=7501 x1') "cim-walk-fail-closed: (r8 B2 control) 7501 read again after its children is the same process (12:00:01): 7502 is walked, and the re-read was made once: $fcTxt"
+        $dc = $fcOut['dc08c']
+        Assert-True ($dc.existing -eq '' -and $dc.unverified -eq '7602') "cim-walk-fail-closed: (r8 opus r7 DC-08c) a failed full stream held an unrelated DATED 7601; the fallback's 7601 under the root has NO start: it never borrows the other row's start, so its child 7602 is NOT emitted (unverified): $fcTxt"
+        $b3 = $fcOut['b3Sol']
+        Assert-True ($b3.ids -eq '7702' -and $b3.skipped -eq '7701') "cim-walk-fail-closed: (r8 sol r7 B3) recorded root start .123 ms, the root row's precise start .1239: the child created at .1231 (before the root, in the same millisecond) is skipped as a stale edge, the one at .1240 is walked: $fcTxt"
+        Assert-True ($fcOut['b4Partial'].ids -eq '' -and $fcOut['b4Partial'].ok -eq $false -and $fcOut['b4Partial'].why -match 'after the job deadline') "cim-walk-fail-closed: (r8 sol r7 B4) the root-row read that answers 1.2 s after a 0.6 s deadline contributes no evidence: the child 7801 is NOT emitted and the record says why: $fcTxt"
+        Assert-True ($fcOut['b4Recheck'].ids -eq '' -and $fcOut['b4Recheck'].ok -eq $false -and $fcOut['b4Recheck'].why -match 'after the job deadline') "cim-walk-fail-closed: (r8 sol r7 B4) the fallback's root re-read that answers after the deadline: the child 7821 is NOT emitted: $fcTxt"
+        Assert-True ($fcOut['b4Control'].ids -eq '7841') "cim-walk-fail-closed: (r8 B4 control) the same reads, all answering before the deadline: the child 7841 is walked: $fcTxt"
+        $b5 = $fcOut['b5']
+        Assert-True ($b5.hasTags -and @($b5.forged).Count -eq 4 -and @($b5.forged | Where-Object { $_ -match 'UNVERIFIED pids=7402' }).Count -eq 1 -and @($b5.forged | Where-Object { $_ -match 'SKIPPED pids=7501' }).Count -eq 1 -and @($b5.forged | Where-Object { $_ -match 'census FAILED \(RPC unavailable\)' }).Count -eq 1 -and @($b5.forged | Where-Object { $_ -match 'output capture failed: disk fault' }).Count -eq 1 -and $b5.genuine -eq 0) "cim-walk-fail-closed: (r8 sol r7 B5) child output carrying the agent's diagnostic prefixes (UNVERIFIED, SKIPPED, failed census, capture) does not stand in for the agent's refused lines: all four are recovered; the agent's own tagged lines are recognised: $fcTxt"
+        $b6 = $fcOut['b6']
+        Assert-True (@($b6.lost).Count -eq 1 -and $b6.lost[0].Contains('DESCENDANT WALK FAILED (RPC unavailable)') -and $b6.lost[0].Contains('could not be written') -and $b6.kept -eq 0 -and $b6.childCopy -eq 1) "cim-walk-fail-closed: (r8 sol r7 B6) a kill path's incomplete-stop note whose append was refused is recovered into the receipt (and not when the agent's tagged line is there; an untagged copy does not count): $fcTxt"
+        $b7 = $fcOut['b7']
+        Assert-True ([string]$b7.faulted -match 'stdout copy broke' -and [string]$b7.pendingOnly -match 'did not finish within 0\.3 s') "cim-walk-fail-closed: (r8 sol r7 B7) a stdout copy that already FAULTED is reported as itself (the pending stderr copy's bound does not mask it); a pending copy alone still ends at the bound: $fcTxt"
+        # r8 (B1, B6) the wiring, read from the agent's AST: the post-exit census is the ONE caller passing -RootExited; Invoke-QueuedJob hands the receipt check
+        # its tokens and the kill path's stop note, and records that note right after each of its three Stop-ProcessTree calls; the adopted timeout does the same.
+        $r8Walks = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-DescendantProcessIdentities' }, $true))
+        $r8Exited = @($r8Walks | Where-Object { @($_.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'RootExited' }).Count -gt 0 })
+        $r8Qj = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-QueuedJob' }, $true)
+        $r8ExitedInQj = @($r8Exited | Where-Object { $_.Extent.StartOffset -ge $r8Qj.Extent.StartOffset -and $_.Extent.EndOffset -le $r8Qj.Extent.EndOffset })
+        Assert-True ($r8Walks.Count -eq 4 -and $r8Exited.Count -eq 1 -and $r8ExitedInQj.Count -eq 1 -and $r8Exited[0].Extent.Text -notmatch '-Deadline' -and $r8Exited[0].Extent.Text -notmatch '-OnEach') "cim-walk-fail-closed: (r8 sol r7 B1) of the agent's $($r8Walks.Count) walk calls exactly ONE passes -RootExited: the post-exit census in Invoke-QueuedJob (not the monitor slice): $(@($r8Exited | ForEach-Object { $_.Extent.Text }) -join ' | ')"
+        $r8Ld = @($r8Qj.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-LostJobDiagnostics' }, $true))
+        $r8LdHas = { param($Cmd, [string]$Name) @($Cmd.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq $Name }).Count -eq 1 }
+        $r8StopNotes = @($r8Qj.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -ceq '$jobStopNote' -and $n.Right.Extent.Text -ceq '[string]$script:ProcessTreeWalkNote' }, $true))
+        $r8Adopt = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-AdoptStartedJob' }, $true)
+        $r8AdoptLd = @($r8Adopt.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-LostJobDiagnostics' }, $true))
+        Assert-True ($r8Ld.Count -eq 1 -and (& $r8LdHas $r8Ld[0] 'Tags') -and (& $r8LdHas $r8Ld[0] 'StopNote') -and $r8StopNotes.Count -eq 3 -and $r8AdoptLd.Count -eq 1 -and (& $r8LdHas $r8AdoptLd[0] 'StopNote') -and (& $r8LdHas $r8AdoptLd[0] 'Tags')) "cim-walk-fail-closed: (r8 sol r7 B5, B6) the receipts check the agent's tokens and recover the stop note (queued job: calls=$($r8Ld.Count), stop notes kept after $($r8StopNotes.Count) of 3 kill paths; adopted timeout: calls=$($r8AdoptLd.Count))"
+        # r8 (B5) every err-file append of the two job paths carries its kind's token (an untagged agent line could not be told from a child's copy).
+        $r8Appends = @(@($r8Qj, $r8Adopt) | ForEach-Object { @($_.FindAll({ param($n) $n -is [System.Management.Automation.Language.PipelineAst] -and @($n.PipelineElements).Count -eq 2 -and $n.PipelineElements[1] -is [System.Management.Automation.Language.CommandAst] -and $n.PipelineElements[1].GetCommandName() -eq 'Add-Content' -and $n.PipelineElements[1].Extent.Text -match '\$(errFile|Marker\.errFile)\b' }, $true)) })
+        $r8Untagged = @($r8Appends | Where-Object { $_.PipelineElements[0].Extent.Text -notmatch '\$\(\$(diagTags|adoptedTags)\[''\w+''\]\)"$' })
+        Assert-True ($r8Appends.Count -ge 10 -and $r8Untagged.Count -eq 0) "cim-walk-fail-closed: (r8 sol r7 B5) all $($r8Appends.Count) err-file diagnostic appends of Invoke-QueuedJob and Invoke-AdoptStartedJob carry a token (untagged: $(@($r8Untagged | ForEach-Object { $_.Extent.Text.Substring(0, [Math]::Min(60, $_.Extent.Text.Length)) }) -join ' | '))"
         # pass 9 A6: the census line must not claim a descendant was "not targeted" when one already tracked during the run is still stopped.
         Assert-True ($code -notmatch 'census UNVERIFIED pids=[^"]*not targeted for stop') "cim-walk-fail-closed: (pass 9 A6) the post-exit UNVERIFIED line does not say the rows were 'not targeted for stop' (a descendant tracked in an earlier slice is still stopped)"
         $results.cimWalkFailClosed = $fcOut
@@ -6872,11 +7007,17 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             finally {
                 # r2 (sol 3, fable H3): stop ONLY the tree this case started, through the Process object it holds (Kill($true) ends the root and the
                 # processes below it); never a bare pid from a fresh walk (a pid reused after the walk would be a stranger).
-                try { $root.Kill($true) } catch { try { $root.Kill() } catch { } }
-                try { [void]$root.WaitForExit(10000) } catch { }
+                # r8 (sol r7 hardening): a tree stop that throws is REPORTED (the case fails below), never swallowed: on a fixture path that is not a plain
+                # drive path the command line carries no marker, so the suite's leak census could not see a surviving descendant.
+                $lvTeardownError = $null
+                try { $root.Kill($true) } catch { $lvTeardownError = "Kill(true) threw: $($_.Exception.Message)"; try { $root.Kill() } catch { } }
+                $lvExited = $false
+                try { $lvExited = [bool]$root.WaitForExit(10000) } catch { }
+                if (-not $lvExited -and $null -eq $lvTeardownError) { $lvTeardownError = 'the fixture root did not exit within 10 s of the tree stop' }
             }
-            [pscustomobject]@{ same = $same; marked = $marked; attempts = ($attempts - 1); legacyKeys = $legacyKeys; newKeys = $newKeys }
+            [pscustomobject]@{ same = $same; marked = $marked; attempts = ($attempts - 1); legacyKeys = $legacyKeys; newKeys = $newKeys; plainPath = $lvPlain; teardownError = $lvTeardownError }
         }
+        Assert-True ($null -eq $lvOut.teardownError) "cim-walk-live-parity: (r8 hardening) the fixture's tree stop succeeded (a failed stop is reported, never left as an unseen survivor; plainPath=$($lvOut.plainPath)): $($lvOut.teardownError)"
         Assert-True ($lvOut.same) "cim-walk-live-parity: the walk returns the same (processId, startUtc, imagePath) set as the legacy per-node walk on a live cmd -> cmd -> ping tree (the chain must contain the inner cmd.exe and ping.exe): $($lvOut | ConvertTo-Json -Depth 4 -Compress)"
         Assert-True ($lvOut.marked) "cim-walk-live-parity: the fixture's inner cmd.exe carries the fixture-path marker the outer leak census counts: $($lvOut | ConvertTo-Json -Depth 4 -Compress)"
         $results.cimWalkLiveParity = $lvOut
