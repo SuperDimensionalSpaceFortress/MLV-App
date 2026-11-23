@@ -1233,8 +1233,11 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         # batch wall 20 s / 30 frames, less processed16_total 56 + export_pipe_write 10 + (drain 100 + verify 200) / 30 frames
         self.assertAlmostEqual(st["untimedPerFrameMs"], 20000.0 / 30.0 - (56.0 + 10.0 + 300.0 / 30.0), places=3)
         self.assertAlmostEqual(st["untimedPerFrameMs"], 590.666667, places=3)
-        for name in ("clip open", "receipt apply", "probe", "publish"):
+        # (the card's list said "probe"; the decode / ffprobe / ffmpeg-dump probes run inside the timed export_verify block, BatchRunner.cpp verify section, so what stays
+        # untimed is the work before the first frame and the publish)
+        for name in ("clip open", "receipt apply", "ffmpeg start", "publish"):
             self.assertIn(name, st["untimed"])
+        self.assertIn("export_verify", st["untimed"])
         self.assertAlmostEqual(st["rows"]["llrawproc_dual_iso"]["meanMs"], 30.0)
         self.assertAlmostEqual(st["rows"]["export_pipe_write"]["meanMs"], 10.0)
         self.assertAlmostEqual(st["clipRows"]["export_pipe_drain"]["meanMs"], 100.0)

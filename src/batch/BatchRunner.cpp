@@ -5,6 +5,7 @@
 #include "ReceiptLoader.h"
 #include "ReceiptApplier.h"
 #include "WorkerThreadCount.h"
+#include "BatchRenderStageTiming.h"
 
 #include <QDir>
 #include <QFile>
@@ -530,6 +531,10 @@ int BatchRunner::exportRenderedVideoFile(
     const int workerThreads = mlvappEffectiveWorkerThreadCount();
     bool writeFailed = false;
     uint32_t framesWritten = 0;
+    /* EXPORT-RENDER-PIPE-TIMING-1: under MLVAPP_STAGE_TIMING only (the flag read once, here), export_scale and
+     * export_pipe_write per frame on the index processed16_total is noted with, export_pipe_drain and export_verify
+     * once on the clip's last frame. Off: no clock read and no note. */
+    const BatchRenderStageTiming stageTiming;
 
     /* Same iteration the GUI runs (MainWindow::startExportPipe): 0-based frame indices
      * over the 1-based receipt cut range. */
@@ -541,6 +546,7 @@ int BatchRunner::exportRenderedVideoFile(
 
         if( scaled )
         {
+            const double scaleStart = stageTiming.start();
             avir_scale_thread_pool scaling_pool;
             avir::CImageResizerVars vars; vars.ThreadPool = &scaling_pool;
             avir::CImageResizerParamsUltra roptions;
@@ -550,12 +556,16 @@ int BatchRunner::exportRenderedVideoFile(
                                        scaledBuffer,
                                        outWidth, outHeight,
                                        3, 0, &vars );
+            stageTiming.note( MLV_STAGE_EXPORT_SCALE, frameIndex, scaleStart );
         }
 
         const uint16_t *pixels = scaled ? scaledBuffer : frameBuffer;
         const size_t pixelCount = scaled ? scaledPixels : sourcePixels;
-        if( !pipeline.writeAll( reinterpret_cast<const char *>( pixels ),
-                                static_cast<qint64>( pixelCount * sizeof(uint16_t) ) ) )
+        const double pipeWriteStart = stageTiming.start();
+        const bool written = pipeline.writeAll( reinterpret_cast<const char *>( pixels ),
+                                                static_cast<qint64>( pixelCount * sizeof(uint16_t) ) );
+        stageTiming.note( MLV_STAGE_EXPORT_PIPE_WRITE, frameIndex, pipeWriteStart );
+        if( !written )
         {
             writeFailed = true;
             break;
@@ -581,7 +591,11 @@ int BatchRunner::exportRenderedVideoFile(
     if( cancelled || writeFailed )
         pipeline.cancel();
     else
+    {
+        const double drainStart = stageTiming.start();
         encoded = pipeline.finish();
+        stageTiming.note( MLV_STAGE_EXPORT_PIPE_DRAIN, cutOut - 1, drainStart );
+    }
 
     const QString diagnostics = pipeline.diagnostics().trimmed();
 
@@ -632,6 +646,8 @@ int BatchRunner::exportRenderedVideoFile(
     const QString ffmpegExecutable = plan.ffmpegCommandPlan.executable;
     QStringList failures;
 
+    /* EXPORT-RENDER-PIPE-TIMING-1: export_verify spans checks (a)-(c) below, noted whether or not they failed. */
+    const double verifyStart = stageTiming.start();
     const qint64 outputBytes = QFileInfo( partialPath ).size();
     if( outputBytes < static_cast<qint64>( plan.outputVerificationPlan.nonEmptyMinimumBytes ) )
         failures << QStringLiteral("output-bytes=%1").arg(outputBytes);
@@ -756,6 +772,7 @@ int BatchRunner::exportRenderedVideoFile(
                 .arg(facts.sampleAspectRatio);
         }
     }
+    stageTiming.note( MLV_STAGE_EXPORT_VERIFY, cutOut - 1, verifyStart );
 
     if( !failures.isEmpty() )
     {

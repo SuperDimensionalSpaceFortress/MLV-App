@@ -4665,11 +4665,19 @@ $script:ExportCdngProducerStages = @('raw_read', 'raw_decode', 'raw_unpack', 'll
 $script:ExportCdngWriterStages = @('disk_write', 'writer_queue_wait', 'writer_completion_lag')
 # The rendered (ProRes) path's MLVAPP_STAGE_TIMING stages (src/mlv/video_mlv.c). raw_uint16 (with its disk_read and decompress) and llrawproc are timed inside the
 # raw fetch getMlvRawFrameDebayered makes, so they NEST inside debayered_frame; debayered_frame and processing are the disjoint children of processed16_total.
-# The residual (loop wall per frame - processed16_total) is the pipe write to ffmpeg and its back-pressure. Drain and verify are not timed per stage.
-$script:ExportRenderedStages = @('raw_uint16', 'raw_uint16_disk_read', 'raw_uint16_decompress', 'llrawproc', 'debayered_frame', 'processing', 'processed16_total')
+# EXPORT-RENDER-PIPE-TIMING-1 (src/debug/StageTiming.h MLV_STAGE_LLRAWPROC_DUAL_ISO / MLV_STAGE_EXPORT_*): llrawproc_dual_iso is noted after every llrawproc note
+# (video_mlv.c mlv_note_llrawproc_dual_iso), so it nests inside llrawproc; export_scale (scaled frame plans only) and export_pipe_write are timed per frame by
+# BatchRunner.cpp AFTER getMlvProcessedFrame16 returns, so they are per-frame stages OUTSIDE processed16_total (no share of it); export_pipe_drain (finish) and
+# export_verify (the decode, geometry and probe checks) are timed once per clip, on its last frame. What the batch wall still holds untimed is the work before the
+# first frame (clip open, receipt apply, frame plan, buffer allocation, ffmpeg start) and the publish rename. A build before that card publishes none of the five.
+$script:ExportRenderedStages = @('raw_uint16', 'raw_uint16_disk_read', 'raw_uint16_decompress', 'llrawproc', 'llrawproc_dual_iso', 'debayered_frame', 'processing', 'processed16_total',
+    'export_scale', 'export_pipe_write')
 $script:ExportRenderedTopLevel = @('debayered_frame', 'processing')
-$script:ExportRenderedNesting = 'raw_uint16 (and its disk_read, decompress) and llrawproc nest inside debayered_frame; debayered_frame and processing are disjoint children of processed16_total, the share denominator'
+$script:ExportRenderedOutsideDenominator = @('export_scale', 'export_pipe_write')   # per frame, after processed16_total: published with no share
+$script:ExportRenderedClipStages = @('export_pipe_drain', 'export_verify')         # once per clip, on the last frame processed16_total is timed on
+$script:ExportRenderedNesting = 'raw_uint16 (and its disk_read, decompress) and llrawproc (and its llrawproc_dual_iso) nest inside debayered_frame; debayered_frame and processing are disjoint children of processed16_total, the share denominator; export_scale and export_pipe_write follow it per frame, export_pipe_drain and export_verify once per clip'
 $script:ExportSuccessor = 'EXPORT-RENDER-PIPE-TIMING-1'
+$script:ExportRenderPipeOlderBuild = "a build before $($script:ExportSuccessor)"
 $script:ExportEvidenceFiles = @('summary.json', 'batch.log', 'export-profile.json', 'stage-timing.log', 'output-manifest.json')
 
 # r8 fix 2 (adversary r8 A1): the PARENT/CHILD half of the stage schema. A published share is of work the stage's parent contains: a child whose mean exceeds its parent's is
@@ -4709,7 +4717,10 @@ function Get-DvTypeName {
 $script:ExportRenderedContainment = @(@('raw_uint16', 'debayered_frame'), @('raw_uint16_disk_read', 'raw_uint16'), @('raw_uint16_decompress', 'raw_uint16'), @('llrawproc', 'debayered_frame'),
     @('raw_uint16_disk_read', 'debayered_frame'), @('raw_uint16_decompress', 'debayered_frame'), @('debayered_frame', 'processed16_total'), @('processing', 'processed16_total'),
     # (adversary r13 A1 sibling: the same transitive pairs to the denominator, for a run that does not publish debayered_frame)
-    @('raw_uint16', 'processed16_total'), @('llrawproc', 'processed16_total'), @('raw_uint16_disk_read', 'processed16_total'), @('raw_uint16_decompress', 'processed16_total'))
+    @('raw_uint16', 'processed16_total'), @('llrawproc', 'processed16_total'), @('raw_uint16_disk_read', 'processed16_total'), @('raw_uint16_decompress', 'processed16_total'),
+    # (EXPORT-RENDER-PIPE-TIMING-1: the dual-ISO share of llrawproc, inside it and, for a run that does not publish an intermediate total, inside each ancestor. The pipe stages are
+    # NOT inside processed16_total: they are held inside the batch wall with it, below.)
+    @('llrawproc_dual_iso', 'llrawproc'), @('llrawproc_dual_iso', 'debayered_frame'), @('llrawproc_dual_iso', 'processed16_total'))
 $script:ExportCdngLlrawprocChildren = @('llrawproc_dark_frame', 'llrawproc_vertical_stripes', 'llrawproc_focus_pixels', 'llrawproc_bad_pixels', 'llrawproc_pattern_noise', 'llrawproc_pre_dualiso_fix',
     'llrawproc_dual_iso', 'llrawproc_chroma_smooth', 'llrawproc_shared_lock', 'llrawproc_dualiso_refine_lock', 'llrawproc_publish_lock', 'llrawproc_other')
 
@@ -5141,10 +5152,14 @@ function Test-DvExportStageLogRecords {
     # The rendered path's stage-timing log against the table above. Returns [pscustomobject]@{ perStage; problems }: perStage[stage][frame] = ms for each stage in
     # $script:ExportRenderedStages. A line that carries the tag and is not exactly one conforming record is a problem; a stage the reader does not know is checked
     # for shape and then ignored (it is another stage's record, not this one's).
+    # (EXPORT-RENDER-PIPE-TIMING-1: the once-per-clip stages in $script:ExportRenderedClipStages are kept apart, one entry per RECORD (frame, ms), never summed, so the
+    # caller can hold each to exactly one record: clipRecords[stage] = list of [pscustomobject]@{ frame; ms })
     param([string]$Text)
     $problems = [System.Collections.Generic.List[string]]::new()
     $perStage = @{}
     foreach ($name in $script:ExportRenderedStages) { $perStage[$name] = @{} }
+    $clipRecords = @{}
+    foreach ($name in $script:ExportRenderedClipStages) { $clipRecords[$name] = [System.Collections.Generic.List[object]]::new() }
     $bad = [System.Collections.Generic.List[string]]::new()
     $lineNo = 0
     foreach ($line in ($Text -split "`r?`n")) {
@@ -5158,8 +5173,9 @@ function Test-DvExportStageLogRecords {
             $why = Get-DvExportTimingProblem $ms
             if ($null -eq $why) {
                 $s = $hit.Groups['s'].Value
-                if (-not $perStage.ContainsKey($s)) { continue }
                 $f = $hit.Groups['f'].Value.TrimStart('0'); if ($f -eq '') { $f = '0' }
+                if ($clipRecords.ContainsKey($s)) { $clipRecords[$s].Add([pscustomobject]@{ frame = $f; ms = $ms }); continue }
+                if (-not $perStage.ContainsKey($s)) { continue }
                 $perStage[$s][$f] = $(if ($perStage[$s].ContainsKey($f)) { $perStage[$s][$f] + $ms } else { $ms })
             }
         }
@@ -5177,7 +5193,7 @@ function Test-DvExportStageLogRecords {
         }
     }
     if ($overflow.Count -gt 0) { $problems.Add("EXPORT_RECORD_INVALID: $($overflow.Count) accumulated per-frame stage timing(s) do not conform (first: $($overflow[0]))") }
-    [pscustomobject]@{ perStage = $perStage; problems = @($problems) }
+    [pscustomobject]@{ perStage = $perStage; clipRecords = $clipRecords; problems = @($problems) }
 }
 
 function Get-DvExportEvidence {
@@ -5187,7 +5203,8 @@ function Get-DvExportEvidence {
     stage-timing log, and the output manifest. Runs nothing and opens nothing. Returns [pscustomobject]@{ metrics; stages; problems; classMismatch; classDetail }:
       metrics   flat scalars the leg's criteria read: framesRequested, framesExported, exportFramesSkipped, exportFramesFailed, profileFramesSucceeded (CDNG),
                 profileFramesFailed (CDNG), stageFramesSeen (ProRes), dualIsoActiveFrames, dualIsoClassAgrees, outputFileCount, outputBytes, wallSeconds,
-                exportFps, largestStage, largestStageShare; a metric the format cannot carry is null with <metric>CouldNotCheck naming why;
+                exportFps, largestStage, largestStageShare, and (ProRes only, EXPORT-RENDER-PIPE-TIMING-1) renderPipeTimed; a metric the format or the build cannot
+                carry is null with <metric>CouldNotCheck naming why;
       stages    the per-stage table (denominator, rows with samples / meanMs / medianMs / share, writer rows for CDNG, nesting and residual for ProRes);
       problems  typed reasons the run is no measurement (EXPORT_PROFILE_ABSENT -- also a profile / stage log with no stage figure, EXPORT_OUTPUT_MISMATCH, EXPORT_OUTPUT_NOT_DELETED, EXPORT_PROFILE_FOREIGN, EXPORT_BATCH_LOG_UNREADABLE);
       classMismatch  the run's own dual-ISO evidence disagrees with the leg's dualIsoExpected (CLIP_CLASS_MISMATCH).
@@ -5337,8 +5354,13 @@ function Get-DvExportEvidence {
     }
     else {
         $m.profileFramesSucceeded = $null; $m['profileFramesSucceededCouldNotCheck'] = 'a ProRes export is timed by the stage-timing log, not the export stage profiler'
-        $why = "$($script:ExportSuccessor): the rendered export path records no dual-ISO stage, so a ProRes leg cannot read its clip's dual-ISO class"
+        # EXPORT-RENDER-PIPE-TIMING-1: the clip's dual-ISO class and renderPipeTimed are read from the stage log below; a log from an older build (or no log) leaves each
+        # null with its reason and adds NO problem, so a receipt written before that card re-derives the same outcome (the leg's criteria, not the reader, refuse it)
+        $why = "$($script:ExportRenderPipeOlderBuild): the rendered export path records no llrawproc_dual_iso stage, so a ProRes leg cannot read its clip's dual-ISO class"
+        $whyPipe = "$($script:ExportRenderPipeOlderBuild): the rendered export path times no export_pipe_write, export_pipe_drain or export_verify stage"
+        if ([string]::IsNullOrEmpty($StageLogText)) { $why = 'stage-timing.log is absent'; $whyPipe = $why }
         $m['dualIsoActiveFramesCouldNotCheck'] = $why; $m['dualIsoClassAgreesCouldNotCheck'] = $why
+        $m['renderPipeTimed'] = $null; $m['renderPipeTimedCouldNotCheck'] = $whyPipe
         $verified = @([regex]::Matches([string]$BatchLogText, '(?m)^\[BATCH\] RENDER_VERIFIED \S+ decoded_frames=(?<n>[0-9]{1,15})(?=\s|$)'))   # r15 (pass14 A2): the token ends at whitespace or the line end, so 480.5, 480-1 and 480/2 verify nothing (a word boundary also ends it at '.')
         if ($verified.Count -ne 1) { $problems.Add("EXPORT_OUTPUT_MISMATCH: batch.log carries $($verified.Count) RENDER_VERIFIED line(s); the batch's own verification of the .mov must pass exactly once") }
         elseif ($null -ne $m.framesExported -and [int64]$verified[0].Groups['n'].Value -ne $m.framesExported) { $problems.Add("EXPORT_OUTPUT_MISMATCH: the batch verified $($verified[0].Groups['n'].Value) decoded frame(s) but exported $($m.framesExported)") }
@@ -5358,19 +5380,43 @@ function Get-DvExportEvidence {
             $batchWall = $(if ($null -ne $m.framesExported -and $m.framesExported -gt 0 -and $null -ne $m.wallSeconds) { Get-DvExportRound ($m.wallSeconds * 1000.0 / $m.framesExported) } else { $null })
             $p16 = Get-DvExportStageRow -Values @($perStage['processed16_total'].Values) -Denominator $null
             $rowsOut = [ordered]@{}
-            foreach ($name in $script:ExportRenderedStages) { $rowsOut[$name] = Get-DvExportStageRow -Values @($perStage[$name].Values) -Denominator $p16.meanMs }
-            $untimed = $(if ($null -ne $batchWall -and $null -ne $p16.meanMs) { Get-DvExportRound ($batchWall - $p16.meanMs) } else { $null })
+            # (EXPORT-RENDER-PIPE-TIMING-1: export_scale and export_pipe_write follow processed16_total, so they are published with no share of it)
+            foreach ($name in $script:ExportRenderedStages) { $rowsOut[$name] = Get-DvExportStageRow -Values @($perStage[$name].Values) -Denominator $(if ($name -cin $script:ExportRenderedOutsideDenominator) { $null } else { $p16.meanMs }) }
+            $clipRecords = $records.clipRecords
+            $clipRowsOut = [ordered]@{}
+            foreach ($name in $script:ExportRenderedClipStages) { $clipRowsOut[$name] = Get-DvExportStageRow -Values @($clipRecords[$name] | ForEach-Object { $_.ms }) -Denominator $null }
+            # EXPORT-RENDER-PIPE-TIMING-1: the TIMED per-frame work is processed16_total plus the per-frame pipe stages plus the once-per-clip stages spread over the exported
+            # frames. A log with none of the pipe stages (a build before that card) times processed16_total alone, exactly as before.
+            $pipePresent = (@($script:ExportRenderedOutsideDenominator | Where-Object { $perStage[$_].Count -gt 0 }).Count + @($script:ExportRenderedClipStages | Where-Object { $clipRecords[$_].Count -gt 0 }).Count) -gt 0
+            $clipSumMs = [decimal]0; foreach ($name in $script:ExportRenderedClipStages) { foreach ($r in $clipRecords[$name]) { $clipSumMs += [decimal]$r.ms } }
+            $framesForClip = $(if ($null -ne $m.framesExported -and $m.framesExported -gt 0) { [decimal]$m.framesExported } else { $null })
+            $exactTimed = Get-DvExportExactMean @($perStage['processed16_total'].Values)
+            $roundedTimed = $p16.meanMs
+            if ($pipePresent -and $null -ne $exactTimed) {
+                foreach ($name in $script:ExportRenderedOutsideDenominator) {
+                    $e = Get-DvExportExactMean @($perStage[$name].Values)
+                    if ($null -ne $e) { $exactTimed += $e; $roundedTimed += $rowsOut[$name].meanMs }
+                }
+                if ($null -ne $framesForClip) { $exactTimed += $clipSumMs / $framesForClip; $roundedTimed += [double]($clipSumMs / $framesForClip) }
+                elseif ($clipSumMs -gt 0) { $exactTimed = $null; $roundedTimed = $null }   # (no exported-frame count to spread the clip stages over: nothing to compare)
+            }
+            $untimed = $(if ($null -ne $batchWall -and $null -ne $roundedTimed) { Get-DvExportRound ($batchWall - $roundedTimed) } else { $null })
             # r11 (sol r9 B2 (a)): the measured per-frame work is inside the batch's elapsed (typed INVALID otherwise); a residual the logging precision made slightly negative is 0, never a negative stage
-            $wallContainment = Get-DvExportWallContainmentProblem -WallSeconds $wallExact -Frames $m.framesExported -StageName 'processed16_total' -StageMeanMs (Get-DvExportExactMean @($perStage['processed16_total'].Values))
+            $timedName = $(if ($pipePresent) { 'timed_per_frame (processed16_total + export_scale + export_pipe_write + (export_pipe_drain + export_verify) / frames exported)' } else { 'processed16_total' })
+            $wallContainment = Get-DvExportWallContainmentProblem -WallSeconds $wallExact -Frames $m.framesExported -StageName $timedName -StageMeanMs $exactTimed
             if ($null -ne $wallContainment) { $problems.Add($wallContainment) }
             elseif ($null -ne $untimed -and $untimed -lt 0) { $untimed = 0.0 }
             $disjoint = $(if ($null -ne $rowsOut['debayered_frame'].meanMs -and $null -ne $rowsOut['processing'].meanMs) { Get-DvExportRound ($rowsOut['debayered_frame'].meanMs + $rowsOut['processing'].meanMs) } else { $null })
             $within = $(if ($null -ne $disjoint -and $null -ne $p16.meanMs -and $p16.meanMs -gt 0) { [math]::Abs($disjoint - $p16.meanMs) / $p16.meanMs -le 0.05 } else { $null })
             $largest = @($script:ExportRenderedTopLevel | Where-Object { $null -ne $rowsOut[$_].meanMs } | Sort-Object { -[double]$rowsOut[$_].meanMs } | Select-Object -First 1)
-            $stages = [ordered]@{ denominator = 'processed16_total'; denominatorMeanMs = $p16.meanMs; denominatorMedianMs = $p16.medianMs; rows = $rowsOut; nesting = $script:ExportRenderedNesting
+            $untimedText = $(if ($pipePresent) { "batch wall per frame minus processed16_total, export_scale, export_pipe_write and (export_pipe_drain + export_verify) / frames exported; what is left (clip open, receipt apply, frame plan and ffmpeg start before the first frame, and the publish) is not timed per stage by the app" }
+                             else { "$($script:ExportRenderPipeOlderBuild): batch wall per frame minus processed16_total (clip open, pipe write, ffmpeg back-pressure, finish and verify) is not timed per stage by the app" })
+            $drainVerifyText = $(if ($pipePresent) { 'export_pipe_drain and export_verify are timed once per clip (clipRows) and spread over the exported frames in untimedPerFrameMs' }
+                                 else { "$($script:ExportRenderPipeOlderBuild): the rendered path times no drain or verify stage" })
+            $stages = [ordered]@{ denominator = 'processed16_total'; denominatorMeanMs = $p16.meanMs; denominatorMedianMs = $p16.medianMs; rows = $rowsOut; clipRows = $clipRowsOut; nesting = $script:ExportRenderedNesting
                                   disjointSumMs = $disjoint; disjointWithin5Percent = $within; batchWallPerFrameMs = $batchWall; untimedPerFrameMs = $untimed
-                                  untimed = "$($script:ExportSuccessor): batch wall per frame minus processed16_total (clip open, pipe write, ffmpeg back-pressure, finish and verify) is not timed per stage by the app"
-                                  drainVerify = "$($script:ExportSuccessor): the rendered path times no drain or verify stage"
+                                  untimed = $untimedText
+                                  drainVerify = $drainVerifyText
                                   largestStage = $(if ($largest.Count) { [string]$largest[0] } else { $null }) }
             if ($largest.Count) { $m.largestStage = [string]$largest[0]; $m.largestStageShare = $rowsOut[[string]$largest[0]].share }
             # adversary r2 A2: processed16_total alone is no breakdown; both disjoint children (debayered_frame, processing) must be present and the denominator positive
@@ -5393,6 +5439,42 @@ function Get-DvExportEvidence {
                 $frames.Count -gt 0 -and ($frames.Count -ne $p16Frames.Count -or @($frames.Keys | Where-Object { -not $p16Frames.ContainsKey($_) }).Count -gt 0) })
             if ($m.stageFramesSeen -gt 0 -and $otherWindow.Count -gt 0) {
                 $problems.Add("EXPORT_STAGE_WINDOW_MISMATCH: stage-timing.log times $($otherWindow -join ' / ') on frames other than the $($p16Frames.Count) processed16_total is timed on, so their shares are of another window")
+            }
+            # EXPORT-RENDER-PIPE-TIMING-1: a once-per-clip stage, when present, is exactly ONE record (a second drain or verify is no one measurement of this clip: two
+            # records are never summed into one) on the last frame processed16_total is timed on (BatchRunner.cpp notes both with cutOut - 1)
+            $lastFrame = $(if ($p16Frames.Count -gt 0) { [string](@($p16Frames.Keys | ForEach-Object { [int64]$_ }) | Measure-Object -Maximum).Maximum } else { $null })
+            foreach ($name in $script:ExportRenderedClipStages) {
+                $recs = @($clipRecords[$name])
+                if ($recs.Count -gt 1) { $problems.Add("EXPORT_RECORD_INVALID: stage-timing.log records $name $($recs.Count) times; a clip runs it exactly once, so no one figure of it is this clip's") }
+                elseif ($recs.Count -eq 1 -and $null -ne $lastFrame -and [string]$recs[0].frame -cne $lastFrame) {
+                    $problems.Add("EXPORT_STAGE_WINDOW_MISMATCH: stage-timing.log records $name on frame $($recs[0].frame), not on the last frame ($lastFrame) processed16_total is timed on, so it is not this window's")
+                }
+            }
+            # the clip's dual-ISO class (mirrors the CDNG profile's llrawproc_dual_iso_ms rule): every timed frame carries the figure, active = ms > 0. Absent: an older build,
+            # null with the reason above and no problem. On another window than processed16_total's: null (the window check above has typed it).
+            $dual = $perStage['llrawproc_dual_iso']
+            if ($dual.Count -gt 0) {
+                $sameWindow = $p16Frames.Count -gt 0 -and $dual.Count -eq $p16Frames.Count -and @($dual.Keys | Where-Object { -not $p16Frames.ContainsKey($_) }).Count -eq 0
+                if (-not $sameWindow) {
+                    $m.dualIsoClassAgrees = $null; $m.dualIsoActiveFrames = $null
+                    $m['dualIsoActiveFramesCouldNotCheck'] = 'llrawproc_dual_iso is not timed on exactly the frames processed16_total is timed on (EXPORT_STAGE_WINDOW_MISMATCH), so the class is not readable'
+                    $m['dualIsoClassAgreesCouldNotCheck'] = $m['dualIsoActiveFramesCouldNotCheck']
+                }
+                else {
+                    $m.Remove('dualIsoActiveFramesCouldNotCheck'); $m.Remove('dualIsoClassAgreesCouldNotCheck')
+                    $active = @($dual.Values | Where-Object { [double]$_ -gt 0 }).Count
+                    $m.dualIsoActiveFrames = [int64]$active
+                    $agrees = $(if ($DualIsoExpected) { $active -eq $p16Frames.Count } else { $active -eq 0 })
+                    $m.dualIsoClassAgrees = $agrees
+                    if (-not $agrees) { $classMismatch = $true; $classDetail = "CLIP_CLASS_MISMATCH: dualIsoExpected is $($DualIsoExpected.ToString().ToLowerInvariant()) but $active of $($p16Frames.Count) timed frame(s) ran dual-ISO processing (llrawproc_dual_iso above 0 ms)" }
+                }
+            }
+            # renderPipeTimed: the pipe write on every frame processed16_total is timed on, and one drain and one verify. Absent (none of the three): an older build, null.
+            $pipeWrite = $perStage['export_pipe_write']
+            if ($pipeWrite.Count -gt 0 -or $clipRecords['export_pipe_drain'].Count -gt 0 -or $clipRecords['export_verify'].Count -gt 0) {
+                $m.Remove('renderPipeTimedCouldNotCheck')
+                $m.renderPipeTimed = ($p16Frames.Count -gt 0 -and $pipeWrite.Count -eq $p16Frames.Count -and @($pipeWrite.Keys | Where-Object { -not $p16Frames.ContainsKey($_) }).Count -eq 0 `
+                                      -and $clipRecords['export_pipe_drain'].Count -eq 1 -and $clipRecords['export_verify'].Count -eq 1)
             }
         }
     }
