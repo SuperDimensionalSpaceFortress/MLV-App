@@ -507,6 +507,13 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
   | a length refusal (`CLIP_TOO_SHORT`, `CLIP_LENGTH_UNKNOWN`, exit 47); an owner-footage or work-dir refusal (exit 19/20/21/22/24/28); no `RESULT=` line; any other token | `INVALID` |
   | `VENUE_NOT_QUIESCENT` (12) | `VENUE_NOT_QUIESCENT` |
 
+### Debayer quality legs (EXPORT-DEBAYER-QUALITY-1)
+
+A ProRes export leg may carry `export.quality` (`{captureOffsets, stages, tileSize, tilesPerClass}`). The timed export runs unchanged first. Then an
+untimed 24-frame pass runs with the pipeline-stage capture on, and `debayer_quality.py` scores the captures **on the venue**. The job publishes only
+`quality.json` (scalars, tile indices, `isoValue`, per-buffer sha256s) and deletes the captures by proof. The twelve legs, the metric definitions
+and the hub-side rule table are in [debayer-quality-legs.md](debayer-quality-legs.md).
+
 ## Requested scale and rendered scale
 
 A leg's `scaleFactor` is the playback scale it **requests**. It is not necessarily the scale the app **renders** at. Until PLAYBACK-CUDA-HONOUR-SCALE-1 the CUDA

@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "mlv-app/debayer-rule-table/v1",
+  "title": "Debayer rule table (EXPORT-DEBAYER-QUALITY-1)",
+  "description": "Built hub-side and offline by debayer_rule_table.py from published export quality receipts only. A class row is 'measured' only when all six debayers of every clip in it PASS with a captured quality pass; DEBAYER-ADVISOR-1 must never extrapolate into an 'unmeasured' row.",
+  "type": "object",
+  "required": ["schema", "card", "sourceCommit", "buildManifestSha256", "thresholds", "reference", "classes"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": { "const": "mlv-app/debayer-rule-table/v1" },
+    "card": { "const": "EXPORT-DEBAYER-QUALITY-1" },
+    "sourceCommit": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+    "buildManifestSha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+    "reference": { "const": "bilinear" },
+    "thresholds": {
+      "type": "object", "additionalProperties": false,
+      "required": ["falseColourVsClassMin", "noiseVsClassMin", "detailTieFraction", "fastestWithinFraction", "isoBandLowMax", "isoBandHighMin"],
+      "properties": {
+        "falseColourVsClassMin": { "type": "number", "exclusiveMinimum": 0 },
+        "noiseVsClassMin": { "type": "number", "exclusiveMinimum": 0 },
+        "detailTieFraction": { "type": "number", "minimum": 0 },
+        "fastestWithinFraction": { "type": "number", "minimum": 0 },
+        "isoBandLowMax": { "type": "integer", "minimum": 0 },
+        "isoBandHighMin": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "classes": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["classKey", "status", "clips", "stageBasis", "recommended", "fastestAcceptable", "perDebayer", "s3AgreesWithS4", "reason"],
+        "properties": {
+          "classKey": {
+            "type": "object", "additionalProperties": false, "required": ["dualIso", "isoBand"],
+            "properties": { "dualIso": { "type": "boolean" }, "isoBand": { "enum": ["dual", "low", "mid", "high", "unknown"] } }
+          },
+          "status": { "enum": ["measured", "unmeasured"] },
+          "clips": { "type": "array", "items": { "type": "string", "pattern": "^[A-Za-z][0-9]{2}-[0-9]{3,4}$" } },
+          "stageBasis": { "const": "S4_processing" },
+          "recommended": { "enum": [null, "amaze", "rcd", "dcb", "lmmse", "igv"] },
+          "fastestAcceptable": { "enum": [null, "amaze", "rcd", "dcb", "lmmse", "igv"] },
+          "perDebayer": {
+            "type": "object", "additionalProperties": false,
+            "properties": {
+              "bilinear": { "$ref": "#/$defs/perDebayer" }, "amaze": { "$ref": "#/$defs/perDebayer" }, "rcd": { "$ref": "#/$defs/perDebayer" },
+              "dcb": { "$ref": "#/$defs/perDebayer" }, "lmmse": { "$ref": "#/$defs/perDebayer" }, "igv": { "$ref": "#/$defs/perDebayer" }
+            }
+          },
+          "s3AgreesWithS4": { "type": ["boolean", "null"] },
+          "reason": { "type": "string", "minLength": 1 }
+        },
+        "allOf": [
+          { "if": { "properties": { "status": { "const": "unmeasured" } } },
+            "then": { "properties": { "recommended": { "const": null }, "fastestAcceptable": { "const": null }, "perDebayer": { "maxProperties": 0 }, "clips": { "maxItems": 0 } } },
+            "else": { "properties": { "perDebayer": { "required": ["bilinear", "amaze", "rcd", "dcb", "lmmse", "igv"] }, "clips": { "minItems": 1 } } } }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "ratio": { "type": ["number", "null"] },
+    "perDebayer": {
+      "type": "object", "additionalProperties": false,
+      "required": ["detailRatio", "noiseRatio", "chromaNoiseRatio", "falseColourRatio", "debayerMsMean", "debayerMsP10", "debayerMsP90", "exportWallSeconds", "receiptIds"],
+      "properties": {
+        "detailRatio": { "$ref": "#/$defs/ratio" }, "noiseRatio": { "$ref": "#/$defs/ratio" }, "chromaNoiseRatio": { "$ref": "#/$defs/ratio" },
+        "falseColourRatio": { "$ref": "#/$defs/ratio" }, "debayerMsMean": { "type": "number", "minimum": 0 }, "debayerMsP10": { "type": "number", "minimum": 0 },
+        "debayerMsP90": { "type": "number", "minimum": 0 }, "exportWallSeconds": { "type": "number", "minimum": 0 },
+        "receiptIds": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+      }
+    }
+  }
+}

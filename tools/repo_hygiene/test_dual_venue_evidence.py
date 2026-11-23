@@ -278,6 +278,9 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *FSTOGGLE_LEGS)
 # EXPORT-VENUE-LEG-1: the four export legs (two clips x CDNG lossless / ProRes); test_dual_venue_export_leg pins their shape.
 EXPORT_VENUE_LEGS = tuple(f"legs/m16-{clip}-export-{fmt}.json" for clip in ("1243", "1456") for fmt in ("cdng-lossless", "prores"))
 SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in EXPORT_VENUE_LEGS if rel not in SHIPPED_LEGS))
+# EXPORT-DEBAYER-QUALITY-1: the twelve ProRes debayer quality legs (two clips x six debayers); test_debayer_quality_legs pins their shape.
+DEBAYER_QUALITY_LEGS = tuple(f"legs/m16-{clip}-export-prores-debayer-{d}.json" for clip in ("1243", "1456") for d in ("bilinear", "amaze", "rcd", "dcb", "lmmse", "igv"))
+SHIPPED_LEGS = (*SHIPPED_LEGS, *DEBAYER_QUALITY_LEGS)
 assert len(set(SHIPPED_LEGS)) == len(SHIPPED_LEGS), "a shipped leg is listed twice"
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
@@ -7859,7 +7862,8 @@ class LegSpecSchemaTests(unittest.TestCase):
                 exempt += 1
                 continue
             self.assertEqual(leg["generatorArgs"].get("playbackConform"), "on" if "-conform-" in path.name else "off", path.name)
-        self.assertEqual(exempt, 2, "the two M16-1456 export legs are the only exempt ones")
+        # EXPORT-DEBAYER-QUALITY-1: plus the six M16-1456 debayer quality export legs (test_debayer_quality_legs pins them)
+        self.assertEqual(exempt, 8, "the eight M16-1456 export legs (two EXPORT-VENUE-LEG-1, six EXPORT-DEBAYER-QUALITY-1) are the only exempt ones")
 
     def test_each_hfr_conform_leg_is_its_display_cell_on_the_hfr_clip_on_cuda(self) -> None:
         """PLAYBACK-HFR-CONFORM-DEFAULT-1: a conform leg is its scale-1 display-matrix cell with only the legId, card, clip and backends (cuda) changed, so its

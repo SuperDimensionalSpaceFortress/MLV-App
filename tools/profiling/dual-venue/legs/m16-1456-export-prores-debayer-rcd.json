@@ -1,0 +1,36 @@
+{
+  "schema": "mlv-app/dual-venue-leg/v1",
+  "legId": "m16-1456-export-prores-debayer-rcd",
+  "card": "EXPORT-DEBAYER-QUALITY-1",
+  "legType": "export",
+  "clipId": "M16-1456",
+  "playSeconds": 10,
+  "backends": ["cpu"],
+  "scaleFactor": 1,
+  "generatorArgs": { "cpuQuiescenceThresholdPercent": 20 },
+  "timeouts": { "queueWaitSec": 1800, "extraClaimedWaitSec": 2400 },
+  "export": {
+    "format": "prores",
+    "maxFrames": 120,
+    "receipt": "look-receipts/export-owner-hq-nodualiso-debayer-rcd.marxml",
+    "receiptSha256": "41f0d7a0af238c9e16fb86224ae8b77606bb3ae06c25f8bb116cb946a0c9e6f5",
+    "dualIsoExpected": true,
+    "quality": { "captureOffsets": [3, 7, 11, 15, 19, 23], "stages": ["S2_post_dualiso", "S3_debayer", "S4_processing"], "tileSize": 64, "tilesPerClass": 16 }
+  },
+  "criteria": {
+    "acceptance": {
+      "cpu": [
+        { "metric": "framesExported", "op": "eq", "value": 120 },
+        { "metric": "exportFramesFailed", "op": "eq", "value": 0 },
+        { "metric": "stageFramesSeen", "op": "eq", "value": 120 }
+      ]
+    },
+    "supplementary": {
+      "cpu": [
+        { "metric": "framesExported", "op": "eq", "value": 120 },
+        { "metric": "exportFramesFailed", "op": "eq", "value": 0 },
+        { "metric": "stageFramesSeen", "op": "eq", "value": 120 }
+      ]
+    }
+  }
+}

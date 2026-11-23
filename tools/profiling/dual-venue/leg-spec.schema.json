@@ -104,8 +104,19 @@
         "maxFrames": { "type": "integer", "minimum": 24, "maximum": 100000, "description": "The MEASURED window: the batch exports exactly this many frames (--max-frames) and the receipt requires framesExported == maxFrames." },
         "receipt": { "type": "string", "pattern": "^look-receipts/[a-z0-9-]+\\.marxml$", "description": "The batch receipt (-r), relative to tools/profiling/dual-venue/, read as COMMITTED at the admission head." },
         "receiptSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "sha256 of the committed receipt bytes; a mismatch refuses the leg (LOOK_RECEIPT_UNBOUND)." },
-        "dualIsoExpected": { "type": "boolean", "description": "Whether the clip is dual-ISO. A run whose own evidence shows the other class ends INVALID CLIP_CLASS_MISMATCH." }
+        "dualIsoExpected": { "type": "boolean", "description": "Whether the clip is dual-ISO. A run whose own evidence shows the other class ends INVALID CLIP_CLASS_MISMATCH." },
+        "quality": {
+          "type": "object", "required": ["captureOffsets", "stages", "tileSize", "tilesPerClass"], "additionalProperties": false,
+          "properties": {
+            "captureOffsets": { "type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true, "items": { "type": "integer", "minimum": 0, "maximum": 23 }, "description": "Cut-in-relative frame offsets the untimed 24-frame quality run captures (MLVAPP_PIPELINE_CAPTURE_FRAMES holds at most 64: pipeline_stage_capture.c CAPTURE_FRAMES_MAX). The job adds the batch's cut-in base (BatchRunner.cpp: cutIn 0 reads as 1, frame index = cutIn - 1 + offset)." },
+            "stages": { "type": "array", "minItems": 2, "uniqueItems": true, "items": { "enum": ["S2_post_dualiso", "S3_debayer", "S4_processing"] }, "allOf": [ { "contains": { "const": "S2_post_dualiso" } }, { "contains": { "const": "S4_processing" } } ], "description": "Pipeline stages captured. S2_post_dualiso (the Bayer input, identical for every debayer of a clip) classifies the tiles; the rule is computed on S4_processing." },
+            "tileSize": { "type": "integer", "minimum": 8, "maximum": 512, "multipleOf": 2 },
+            "tilesPerClass": { "type": "integer", "minimum": 1, "maximum": 256 }
+          },
+          "description": "OPTIONAL (EXPORT-DEBAYER-QUALITY-1), prores only. After the TIMED export (unchanged: no capture variable is set, so exportWallSeconds and stage-timing.log are not affected), the job runs an UNTIMED 24-frame quality pass with the pipeline-stage capture on, scores the captures ON THE VENUE with debayer_quality.py (carried inline, sha256-verified) and publishes quality.json (scalars, tile indices, isoValue and per-buffer sha256s only), then deletes the captures. docs/debayer-quality-legs.md."
+        }
       },
+      "if": { "required": ["quality"] }, "then": { "properties": { "format": { "const": "prores" } } },
       "description": "Required when legType is 'export' (EXPORT-VENUE-LEG-1), refused on any other leg. An export leg runs one headless CPU batch export of the clip on the venue and publishes only its batch log, its stage profile or stage-timing log, an output manifest and summary.json; the exported frames never leave the venue. For an export leg playSeconds is the clip-length floor (the length gate the job applies to the clip, nothing is played) and maxFrames is the measured window."
     },
     "criteria": {

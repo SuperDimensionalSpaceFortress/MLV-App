@@ -609,6 +609,9 @@ try {
         if ($OfflineTestMode -and -not [string]::IsNullOrWhiteSpace($VenueTablePath)) { $gen['VenueTablePath'] = $VenueTablePath }
         $exportGenArgs = Get-DvProp $spec 'generatorArgs'
         if ($null -ne (Get-DvProp $exportGenArgs 'cpuQuiescenceThresholdPercent')) { $gen['CpuQuiescenceThresholdPercent'] = [double]$exportGenArgs.cpuQuiescenceThresholdPercent }
+        # EXPORT-DEBAYER-QUALITY-1: a quality leg hands the generator its export.quality (the untimed quality pass after the timed export)
+        $exportQuality = Get-DvProp $spec.export 'quality'
+        if ($null -ne $exportQuality) { $gen['QualityJson'] = ($exportQuality | ConvertTo-Json -Compress -Depth 4) }
     }
     try {
         $genOut = @(& $GeneratorScript @gen)
@@ -737,7 +740,7 @@ if ($isExport) {
     if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Container)) {
         $exportDir = Join-Path $evidenceDir 'export'
         Invoke-DvCollect 'mkdir' $exportDir { New-Item -ItemType Directory -Force -Path $exportDir | Out-Null }
-        foreach ($name in 'summary.json', 'batch.log', 'export-profile.json', 'stage-timing.log', 'output-manifest.json') {
+        foreach ($name in 'summary.json', 'batch.log', 'export-profile.json', 'stage-timing.log', 'output-manifest.json', 'quality.json') {   # quality.json: EXPORT-DEBAYER-QUALITY-1
             $src = Join-Path $artifactsShare $name
             if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { continue }
             $dst = Join-Path $exportDir $name
@@ -780,6 +783,19 @@ if ($isExport) {
     $exportOutcome = Get-DvExportOutcome -ResultToken $token -ExitCode $exitCode -Evidence $exportEvidence -Criteria $exportCriteria
     $exportFinal = $exportOutcome.outcome; $exportDetail = [string]$exportOutcome.detail
     if ($exportFinal -cin @('PASS', 'FAIL') -and $identityProblems.Count -gt 0) { $exportFinal = 'INVALID'; $exportDetail = "the job result derives $($exportOutcome.outcome) but the run does not bind: $($identityProblems -join '; ')" }
+    # EXPORT-DEBAYER-QUALITY-1: the quality pass's record (Get-DvExportQualityEvidence, the validator's reader). Captures left on the venue or a pass that measured nothing it
+    # should have make the leg INVALID; a venue without Python 3 is the quality verdict VENUE_TOOLING and the timed export's outcome stands.
+    $specQuality = Get-DvProp $spec.export 'quality'
+    if ($null -ne $specQuality) {
+        $qualityEvidence = Get-DvExportQualityEvidence -SpecQuality $specQuality -Summary $exportSummary -QualityText ([string]$exportTexts['quality.json']) `
+            -QualitySha256 $(if ($exportFiles.Contains('quality.json')) { [string]$exportFiles['quality.json'] } else { '' }) -TimedResult ([string]$token)
+        $receipt.export.quality = $qualityEvidence
+        if ($exportFinal -cin @('PASS', 'FAIL')) {
+            if ($null -ne $qualityEvidence.legInvalid) { $exportFinal = 'INVALID'; $exportDetail = [string]$qualityEvidence.legInvalid }
+            elseif ($qualityEvidence.verdict -ceq 'INVALID') { $exportFinal = 'INVALID'; $exportDetail = "EXPORT_QUALITY_INVALID: $($qualityEvidence.detail)" }
+        }
+        Write-Output ("DVE_EXPORT_QUALITY verdict={0} result={1} debayer={2}" -f $qualityEvidence.verdict, $qualityEvidence.result, $qualityEvidence.debayer)
+    }
     $receipt.export.verdict = $exportFinal
     Write-Output ("DVE_EXPORT format={0} framesExported={1} exportFps={2} largestStage={3} problems={4}" -f $spec.export.format, $exportEvidence.metrics.framesExported, $exportEvidence.metrics.exportFps, $exportEvidence.metrics.largestStage, @($exportEvidence.problems).Count)
     Complete-Receipt $exportFinal $exportDetail
