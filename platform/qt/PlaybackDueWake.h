@@ -539,6 +539,15 @@ public:
     /*! Test hook, r15 (r14 adversary A1): the runner sleep is descheduled this long at its entry, before its wait starts (the
      *  window in which a caller-side origin stamp and the sleep's own clock used to disagree). 0 (production): no pause. */
     void setRunnerSleepStartDelayMsForTest( int ms );
+    // PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 (test seam, off by default; never called by product code). The tests judge a sleep's
+    // exit and a delivery's send time on the values the product itself compared and stamped, never on a clock read taken after
+    // the fact (a scheduler pause between the product's decision and the test's read moved every such bound).
+    enum class RunnerSleepExit { None, TimedOut, ExpiredAfterDispatch, ExpiredAfterOtherWake, WaitFailed, WokenBySent };
+    void setTimingStampsForTest( bool on );                 // on: the records below are kept; off (default): nothing is recorded
+    RunnerSleepExit lastRunnerSleepExitForTest() const;     // how the last sleepForSmokeRunner left its loop (None: no recorded exit)
+    qint64 lastRunnerSleepExitElapsedMsForTest() const;     // its own QElapsedTimer value at that exit (-1: none)
+    double lastDeliveryFirstStampMsForTest() const;         // inside onFire: the wait thread's pre-send stamp (ms, QPC clock) of
+                                                            // every stamped native delivery, split OR unsplit; -1 otherwise
 
 private:
     struct Impl;

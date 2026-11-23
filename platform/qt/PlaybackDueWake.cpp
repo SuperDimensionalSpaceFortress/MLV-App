@@ -103,6 +103,12 @@ struct PlaybackDueWake::Impl
     bool failRunnerSleepWaitForTest = false;
     // r15 (r14 adversary A1): test seam, a GUI-thread deschedule at the sleep's entry (0 in production)
     int runnerSleepStartDelayMsForTest = 0;
+    // PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 (test seam, off in production): when on, how the last runner sleep left its loop and
+    // its own elapsed value there, and the pre-send stamp of the native delivery firing now (split or unsplit)
+    bool timingStampsForTest = false;
+    PlaybackDueWake::RunnerSleepExit runnerSleepExitForTest = PlaybackDueWake::RunnerSleepExit::None;
+    qint64 runnerSleepExitElapsedMsForTest = -1;
+    double firingFirstStampMsForTest = -1.0;
 #ifdef Q_OS_WIN
     std::vector<MSG> heldWakes;
 #endif
@@ -184,6 +190,7 @@ struct PlaybackDueWake::Impl
     {
         const qint64 postNs = ( postTicks > 0 && qpcFrequency > 0 ) ? ticksToNs( postTicks, qpcFrequency ) : -1;
         if( !gate.accept( generation, nowNs(), postNs ) || !onFire ) return;
+        if( timingStampsForTest ) firingFirstStampMsForTest = postNs >= 0 ? static_cast<double>( postNs ) / 1e6 : -1.0;
         const qint64 returnNs = ( postNs >= 0 && returnTicks >= postTicks ) ? ticksToNs( returnTicks, qpcFrequency ) : -1;
         firingPostMs = returnNs >= 0 ? static_cast<double>( returnNs ) / 1000000.0 : -1.0;
         firingFirstMs = returnNs >= 0 ? static_cast<double>( postNs ) / 1000000.0 : -1.0;
@@ -197,6 +204,7 @@ struct PlaybackDueWake::Impl
         firingPostMs = -1.0;
         firingFirstMs = -1.0;
         firingUnsplit = false;
+        if( timingStampsForTest ) firingFirstStampMsForTest = -1.0;
     }
 };
 
@@ -804,6 +812,13 @@ PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long
     const auto spanNowS = [this, nowS]() { return nowS ? nowS() : static_cast<double>( d->nowNs() ) / 1000000000.0; };
     d->runnerSleepDispatchNs = 0;
     d->runnerSleepDispatchSpans.clear();
+    if( d->timingStampsForTest ) { d->runnerSleepExitForTest = RunnerSleepExit::None; d->runnerSleepExitElapsedMsForTest = -1; }
+    // PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1: the test seam's record of how the loop below is left, and the elapsed value it judged
+    const auto noteExit = [this]( RunnerSleepExit exit, qint64 elapsedMs )
+    {
+        d->runnerSleepExitForTest = exit;
+        d->runnerSleepExitElapsedMsForTest = elapsedMs;
+    };
     if( !sendsNotify() ) return RunnerSleep::NotHandled;
     // r17 (r16 adversary A1 on 522f72c6): each slept segment goes to the caller's sink as it ends -- before a dispatch below
     // can close the window it ran in -- and the last one at the sleep's end (every return below)
@@ -838,9 +853,14 @@ PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long
             ++d->runnerSleepWaitFailed;
             const qint64 leftMs = static_cast<qint64>( waitMs ) - slept.elapsed();
             if( leftMs > 0 ) QThread::msleep( static_cast<unsigned long>( leftMs ) );
+            if( d->timingStampsForTest ) noteExit( RunnerSleepExit::WaitFailed, slept.elapsed() );
             break;
         }
-        if( result != WAIT_OBJECT_0 ) break;   // the timeout
+        if( result != WAIT_OBJECT_0 )   // the timeout
+        {
+            if( d->timingStampsForTest ) noteExit( RunnerSleepExit::TimedOut, slept.elapsed() );
+            break;
+        }
         if( HIWORD( GetQueueStatus( QS_SENDMESSAGE ) ) & QS_SENDMESSAGE )
         {
             // r2 G1: only the wake ends the sleep. The sent messages are dispatched here; the wake's window procedure holds
@@ -867,14 +887,27 @@ PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long
             if( d->heldWakes.size() > heldBefore )
             {
                 ++d->runnerSleepsWokenBySent;
+                if( d->timingStampsForTest ) noteExit( RunnerSleepExit::WokenBySent, slept.elapsed() );
                 return RunnerSleep::WokenBySent;
             }
             ++d->runnerSleepsWokenOther;
-            if( slept.hasExpired( static_cast<qint64>( waitMs ) ) ) break;
+            // PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1: QElapsedTimer's expiry test is quint64( elapsed() ) > quint64( timeout ): the
+            // same one read, kept so the test seam records the very value this decision compared
+            const qint64 checkMs = slept.elapsed();
+            if( static_cast<quint64>( checkMs ) > static_cast<quint64>( waitMs ) )
+            {
+                if( d->timingStampsForTest ) noteExit( RunnerSleepExit::ExpiredAfterDispatch, checkMs );
+                break;
+            }
             noteRunnerSleep( true );
             continue;
         }
-        if( slept.hasExpired( static_cast<qint64>( waitMs ) ) ) break;
+        const qint64 checkMs = slept.elapsed();   // as above: the one read the expiry test made
+        if( static_cast<quint64>( checkMs ) > static_cast<quint64>( waitMs ) )
+        {
+            if( d->timingStampsForTest ) noteExit( RunnerSleepExit::ExpiredAfterOtherWake, checkMs );
+            break;
+        }
     }
     noteRunnerSleep( false );
     segmentEnded = segments.sleepEnds( spanNowS(), &segmentStartS, &segmentEndS );
@@ -954,6 +987,29 @@ void PlaybackDueWake::setRunnerSleepWaitFailsForTest( bool fails )
 void PlaybackDueWake::setRunnerSleepStartDelayMsForTest( int ms )
 {
     d->runnerSleepStartDelayMsForTest = ms > 0 ? ms : 0;
+}
+
+void PlaybackDueWake::setTimingStampsForTest( bool on )
+{
+    d->timingStampsForTest = on;
+    d->runnerSleepExitForTest = RunnerSleepExit::None;
+    d->runnerSleepExitElapsedMsForTest = -1;
+    d->firingFirstStampMsForTest = -1.0;
+}
+
+PlaybackDueWake::RunnerSleepExit PlaybackDueWake::lastRunnerSleepExitForTest() const
+{
+    return d->runnerSleepExitForTest;
+}
+
+qint64 PlaybackDueWake::lastRunnerSleepExitElapsedMsForTest() const
+{
+    return d->runnerSleepExitElapsedMsForTest;
+}
+
+double PlaybackDueWake::lastDeliveryFirstStampMsForTest() const
+{
+    return d->firingFirstStampMsForTest;
 }
 
 const char *PlaybackDueWake::deliveryKindName() const
