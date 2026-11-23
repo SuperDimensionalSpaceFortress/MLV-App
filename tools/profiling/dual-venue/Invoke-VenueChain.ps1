@@ -296,24 +296,31 @@ function Close-LegTicket([string]$LegName, [string]$Event, [string]$Why) {
     if ($null -ne $script:ticket -and $null -ne $script:ticket.PSObject.Properties['pendingReleaseNonce'] -and [string]$script:ticket.pendingReleaseNonce -and -not $script:strandedClaimNonces.Contains([string]$script:ticket.pendingReleaseNonce)) {
         $script:strandedClaimNonces.Add([string]$script:ticket.pendingReleaseNonce)
     }
+    # r5 adversary pass 2 A1: an append can STALL on a share, so every diagnostic line of the close is collected and written only after every release and the ticket's removal and reset (below)
+    $closeLines = [System.Collections.Generic.List[string]]::new()
     foreach ($strandedNonce in @($script:strandedClaimNonces)) {
         $pendingRel = ''; try { $pendingRel = [string](Release-VenueClaim -Venue $Venue -Nonce $strandedNonce -ClaimDir $ClaimDir -MaxAttempts 3) } catch { $pendingRel = 'ERROR' }
         if ($pendingRel -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) {
             [void]$script:strandedClaimNonces.Remove($strandedNonce)
-            try { L "CLAIM_PENDING_RELEASE leg=$LegName nonce=$strandedNonce result=$pendingRel (a claim a give-back could not let go of, released as the ticket ends)" } catch { $null = $_ }   # r4 adversary A5: a log line that cannot be written never aborts the close (r7 A15)
+            $closeLines.Add("CLAIM_PENDING_RELEASE leg=$LegName nonce=$strandedNonce result=$pendingRel (a claim a give-back could not let go of, released as the ticket ends)")
         }
-        else { try { L "CLAIM_PENDING_RELEASE_NOT_RELEASED leg=$LegName nonce=$strandedNonce result=$pendingRel (the claim is STILL STANDING behind this chain; its nonce is kept and tried again at the next ticket close and at the chain's end)" } catch { $null = $_ } }
+        else { $closeLines.Add("CLAIM_PENDING_RELEASE_NOT_RELEASED leg=$LegName nonce=$strandedNonce result=$pendingRel (the claim is STILL STANDING behind this chain; its nonce is kept and tried again at the next ticket close and at the chain's end)") }
     }
-    if ($null -eq $script:ticket) { return }
-    # TAIL-1 r5 (sol r4 B1): a held chain.log made the TICKET_ENDED line throw after the ticket file was gone, the object still set, so the chain ended before its final nonce retry and CHAIN_RESULT. The line is
-    # best effort and the object is dropped in a finally. (A removal that itself throws still ends the chain as before: its live ticket must not outlast it in the line.)
-    # r5 adversary A5: the object is dropped BEFORE the line is written, so a line that stalls can no longer hold the reset behind it
-    $r = 'ERROR'; $endedName = [string]$script:ticket.name; $endedKeeps = $script:ticketKeeps
-    try { $r = [string](Remove-VenueTicket -Ticket $script:ticket) }
+    try {
+        if ($null -ne $script:ticket) {
+            # TAIL-1 r5 (sol r4 B1): a held chain.log made the TICKET_ENDED line throw after the ticket file was gone, the object still set, so the chain ended before its final nonce retry and CHAIN_RESULT. The object
+            # is dropped in a finally, before any line (r5 adversary A5). (A removal that itself throws still ends the chain as before: its live ticket must not outlast it in the line.)
+            $r = 'ERROR'; $endedName = [string]$script:ticket.name; $endedKeeps = $script:ticketKeeps
+            try { $r = [string](Remove-VenueTicket -Ticket $script:ticket) }
+            finally {
+                $script:ticket = $null
+                $script:ticketKeeps = 0
+                $closeLines.Add("$Event leg=$LegName ticket=$endedName result=$r reason=$Why keeps=$endedKeeps/$TicketKeepMax")
+            }
+        }
+    }
     finally {
-        $script:ticket = $null
-        $script:ticketKeeps = 0
-        try { L "$Event leg=$LegName ticket=$endedName result=$r reason=$Why keeps=$endedKeeps/$TicketKeepMax" } catch { $null = $_ }
+        foreach ($closeLine in $closeLines) { try { L $closeLine } catch { $null = $_ } }   # r4 adversary A5 / r7 A15: a line that cannot be written never aborts the close
     }
 }
 
@@ -616,11 +623,13 @@ foreach ($leg in $plan) {
 
 # TAIL-1 r4 K2: the last attempt at a claim a give-back could not let go of and no close has since released (a reader held the claim file through every earlier try); whatever still stands is recorded by its nonce, never dropped silently
 if ($null -ne $script:strandedClaimNonces) {
+    $endLines = [System.Collections.Generic.List[string]]::new()   # r5 adversary pass 2 A1: every release first, then the lines (an append can stall on a share)
     foreach ($strandedNonce in @($script:strandedClaimNonces)) {
         $strandedAnswer = ''; try { $strandedAnswer = [string](Release-VenueClaim -Venue $Venue -Nonce $strandedNonce -ClaimDir $ClaimDir -MaxAttempts 3) } catch { $strandedAnswer = 'ERROR' }
-        if ($strandedAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { [void]$script:strandedClaimNonces.Remove($strandedNonce); try { L "CLAIM_PENDING_RELEASE leg=chain-end nonce=$strandedNonce result=$strandedAnswer (released as the chain ends)" } catch { $null = $_ } }
-        else { try { L "CLAIM_PENDING_RELEASE_NOT_RELEASED leg=chain-end nonce=$strandedNonce result=$strandedAnswer (the claim is STILL STANDING; it breaks as dead-pid when this process exits, or at its expiry)" } catch { $null = $_ } }
+        if ($strandedAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { [void]$script:strandedClaimNonces.Remove($strandedNonce); $endLines.Add("CLAIM_PENDING_RELEASE leg=chain-end nonce=$strandedNonce result=$strandedAnswer (released as the chain ends)") }
+        else { $endLines.Add("CLAIM_PENDING_RELEASE_NOT_RELEASED leg=chain-end nonce=$strandedNonce result=$strandedAnswer (the claim is STILL STANDING; it breaks as dead-pid when this process exits, or at its expiry)") }
     }
+    foreach ($endLine in $endLines) { try { L $endLine } catch { $null = $_ } }
 }
 
 $summary = [ordered]@{
