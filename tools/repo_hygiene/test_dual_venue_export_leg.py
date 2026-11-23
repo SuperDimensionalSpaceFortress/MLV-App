@@ -1870,6 +1870,43 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         self.assertIs(zero["metrics"]["dualIsoClassAgrees"], False, zero)
         self.assertEqual(zero["metrics"]["dualIsoActiveFrames"], 0, zero)
 
+    # --- r3 fix 1: adversary pass 6 on 070ccd05 (A1, A2)
+    def test_adversary_r3f1_a1_a_global_trace2_target_or_a_redirect_variable_makes_the_reader_write_nothing(self) -> None:
+        """pass 6 A1: Invoke-DvGit removed every GIT_TRACE* variable, which also removed the caller's GIT_TRACE2_EVENT=0 and let a trace2.eventTarget in the global git
+        config (GIT_CONFIG_GLOBAL) name a file git appends to; and Git for Windows' GIT_REDIRECT_STDOUT / GIT_REDIRECT_STDERR sent git's output to a file the caller names.
+        git reads the trace2 environment before that config, so every trace target is forced off, and the redirect variables are dropped."""
+        with tempfile.TemporaryDirectory() as d:
+            event, normal, redirect_out, redirect_err = (Path(d) / n for n in ("event.txt", "normal.txt", "redirect-out.txt", "redirect-err.txt"))
+            cfg = Path(d) / "trace.gitconfig"
+            cfg.write_text(f"[trace2]\n\teventTarget = {event.as_posix()}\n\tnormalTarget = {normal.as_posix()}\n\tperfTarget = {normal.as_posix()}\n", encoding="utf-8")
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([self.ctl(buildId=self.head_sha())]), encoding="utf-8")
+            proc, got = run_pwsh_json("$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                                      f"@($cases | ForEach-Object {{ $c = $_; $e = {EVIDENCE_CALL}; [ordered]@{{ problems = @($e.problems) }} }}) "
+                                      "| ConvertTo-Json -Compress -Depth 8 -AsArray", DVE_CASES=str(path), GIT_CONFIG_GLOBAL=str(cfg), GIT_TRACE2_EVENT="0",
+                                      GIT_REDIRECT_STDOUT=str(redirect_out), GIT_REDIRECT_STDERR=str(redirect_err))
+            self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+            self.assertEqual(got[0]["problems"], [], got[0])
+            for f in (event, normal, redirect_out, redirect_err):
+                self.assertFalse(f.exists(), f"the reader's git wrote {f.name}")
+
+    def test_adversary_r3f1_a2_render_start_admits_the_producers_exponent_form_of_a_frame_rate(self) -> None:
+        """pass 6 A2: the producer formats the rate with QLocale::toString(double), the general format, which writes a rate under 1e-4 (or from 1e6) with an exponent:
+        sourceFpsNom 1 / sourceFpsDenom 100000 declares fps=1e-05, and r3 refused it as EXPORT_PROFILE_FOREIGN. A finite positive rate in that form is the producer's;
+        a non-finite, zero, negative or malformed one stays refused."""
+        s = self.CTL_START
+        good = [s.replace("fps=24", f) for f in ("fps=1e-05", "fps=1.5e-05", "fps=4.29497e+09", "fps=24")]
+        bad = [s.replace("fps=24", f) for f in ("fps=0e+00", "fps=-1e-05", "fps=1e-05e+01", "fps=1E-05", "fps=e-05", "fps=1e5", "fps=nan", "fps=1e+300")]
+        proc, got = evidence_cases([self.ctl(batch=self.ctl_batch(x)) for x in good + bad])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for x, g in zip(good, got[:len(good)]):
+            with self.subTest(start=x):
+                assert_clean_but_dual_iso_unknown(self, g)
+        for x, g in zip(bad, got[len(good):]):
+            with self.subTest(start=x):
+                self.assertEqual(g["outcome"], "INVALID", g)
+                self.assertTrue(any(p.startswith("EXPORT_PROFILE_FOREIGN") and "fps=" in p for p in g["problems"]), g)
+
     def test_r8_both_prores_leg_specs_gate_both_new_criteria(self) -> None:
         for name in ("m16-1243-export-prores", "m16-1456-export-prores"):
             spec = leg(name)
