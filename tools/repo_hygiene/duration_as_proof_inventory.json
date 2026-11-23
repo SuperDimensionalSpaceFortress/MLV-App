@@ -2011,6 +2011,36 @@
       ]
     },
     {
+      "path": "platform/qt/PlaybackInfoLabelPolicy.h",
+      "anchor": "const qint64 deadline = expectedFrameMs <= 0 ? kLabelPaintOwedMs",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-2 r4 (adversary r3 A3): labelPaintOwedDue selects the fixed kLabelPaintOwedMs deadline when the expected frame period is unknown (<= 0), else the period plus half. A deadline choice for when a stored label's owed paint is made; it never reads a duration as proof that a stage ran.",
+      "lines": [
+        251
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackInfoLabelPolicy.h",
+      "anchor": "const qint64 measured = meterEmaFrameMs > 0.0 ? qRound64 ( meterEmaFrameMs ) : 0 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-2 r4 (adversary r3 A3): labelPaintExpectedFrameMs treats a non-positive fps meter EMA (no interval measured yet) as unknown (0) so the target period is used. A sample-validity filter on an input of a label paint deadline, not a run-proof.",
+      "lines": [
+        262
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_info_label.cpp",
+      "anchor": "ASSERT_EQ ( 0 , playback_info_label :: labelPaintExpectedFrameMs ( 0.0 , 0.0 ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-2 r4 (adversary r3 A3, row R1c): pins that no target fps and no measured EMA give an unknown (0) expected frame period. A pure arithmetic assertion on a policy function over literals; no stage or clock runs.",
+      "lines": [
+        1978
+      ]
+    },
+    {
       "path": "tests/console/test_playback_fps_meter_policy.cpp",
       "anchor": "ASSERT_EQ ( 0.0 , smoothedFrameMs ( 42.0 , - 3 ) ) ;",
       "class": "not_run_proof_structural",
