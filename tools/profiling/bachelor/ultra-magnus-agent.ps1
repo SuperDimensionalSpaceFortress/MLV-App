@@ -705,9 +705,11 @@ function Get-DescendantProcessIdentities {
     # r11 (KEY3 r10 A1, sol r10 #3): the rows of a root-row read (the supplemental read and the fallback's re-read) are kept only when that read succeeded in
     # time; a row streamed by a read that then fails is not evidence. A pinned caller also takes no null-start root row as a reason to drop the children: the
     # pid cannot have changed hands, so the recorded start stands for it (the merge base walked the children).
-    # r11 (sol r10 #2): -StopBySec is the governing bound of the caller (seconds until a lease stop or a stop must take effect). When it is shorter than the
-    # full-table read's bound the walk is the merge base's filtered walk for that call (Get-DescendantProcessIdentitiesFiltered), so a slow full-table read
-    # never defers the decision or the stop past that bound. The one-snapshot read stays the default when time allows.
+    # r11 (sol r10 #2): -StopBySec is the governing bound of the caller (seconds until a lease stop or a stop must take effect; every stop passes 0, a stop
+    # is due now). When what is left of it at the moment the full read would start (after the opening tick) is not longer than the full-table read's bound,
+    # the walk reads no full table: it makes the merge base's per-parent filtered reads (the fallback below, with no node cap, inside the walk's one budget),
+    # under the same stale-edge, generation and root rules, and a read that fails or a budget that runs out is recorded (PARTIAL or FAILED) like a failed
+    # snapshot. So a slow full-table read never defers the decision or the stop past that bound. The one-snapshot read stays the default when time allows.
     # r8b (pass 11 A1): rows read for the root's pid at DIFFERENT starts (one read sees one process, a later read another) mean the pid changed hands between
     # the reads; a child read in between cannot be bound to a generation, so the root is unverifiable (the last row alone set the replacement boundary).
     # r8b (pass 11 A3): with no job deadline the walk's ONE budget plays the deadline's part: a supplemental read that answers after it is no evidence.
@@ -716,6 +718,7 @@ function Get-DescendantProcessIdentities {
 
     $snapshotTimeoutSec = [Math]::Min(30, [Math]::Max(1, $TimeoutSec))
     $script:LastDescendantWalk = $null   # a walk that ends early never leaves an earlier walk's record behind
+    $entryWatch = [System.Diagnostics.Stopwatch]::StartNew()   # r11 (adversary r11 A2): -StopBySec is counted from the call, so the opening tick spends it
     if ($null -ne $OnEach) { $null = & $OnEach }
     $all = New-Object 'System.Collections.Generic.List[object]'
     $snapshotError = $null
@@ -729,19 +732,21 @@ function Get-DescendantProcessIdentities {
         if ($leftSec -le 0) { $skipSnapshot = $true }
         else { $snapshotTimeoutSec = [int][Math]::Min(30.0, [Math]::Max(1.0, [Math]::Floor($leftSec))) }   # r4 (pass 5 A13): clamped as a double, so a far deadline cannot overflow the integer
     }
-    # r11 (sol r10 #2): a governing bound shorter than the full-table read's bound takes the merge base's filtered walk for this call (see the header). The
-    # record stays $null, as the merge base's walk left no record (a kill path then adds no walk note).
-    $stopByLeft = $null
-    if ($null -ne $StopBySec) { try { $stopByLeft = [double]$StopBySec } catch { $stopByLeft = 0.0 } }
-    if (-not $skipSnapshot -and $null -ne $stopByLeft -and $stopByLeft -lt $snapshotTimeoutSec) {
-        Get-DescendantProcessIdentitiesFiltered -ParentProcessId $ParentProcessId -OnEach $OnEach
-        return
+    # r11 (sol r10 #2; adversary r11 A1, A2, A8, A11): what is left of the governing bound now, after the opening tick. Not longer than the full read's bound:
+    # filtered mode (see the header): no full read, the per-parent reads below, recorded like any other walk.
+    $filteredMode = $false
+    if ($null -ne $StopBySec -and -not $skipSnapshot) {
+        $stopByLeft = 0.0
+        try { $stopByLeft = [double]$StopBySec - $entryWatch.Elapsed.TotalSeconds } catch { $stopByLeft = 0.0 }
+        $filteredMode = ($stopByLeft -le $snapshotTimeoutSec)
     }
     $walkWatch = [System.Diagnostics.Stopwatch]::StartNew()   # r4 (pass 5 A1): the full read and any fallback reads share ONE budget, $snapshotTimeoutSec
     # r5 (adversary pass 7 A4): what is left for a SUPPLEMENTAL read is the smaller of the walk's one budget and the time left to the job's deadline, read
     # now: the budget is a whole-second ceiling of the deadline distance, so a read that overran inside it must not start another past the deadline itself.
+    # r11 (adversary r11 A7): whole seconds of the budget too (floor), so a supplemental read's bound (the ceiling of this value) never reaches past the walk's
+    # one budget, and with under 1 s of it left no supplemental read starts.
     $readLeftSec = {
-        $leftBudget = $snapshotTimeoutSec - $walkWatch.Elapsed.TotalSeconds
+        $leftBudget = [Math]::Floor($snapshotTimeoutSec - $walkWatch.Elapsed.TotalSeconds)
         if ($null -ne $Deadline) {
             # r10 split (adversary r10 pass A1): whole seconds to the deadline (floor). A supplemental read is bounded by the ceiling of what this returns,
             # so it never reaches past the deadline; with under 1 s left none starts (the merge base never needed these reads, and one that answered late
@@ -768,6 +773,7 @@ function Get-DescendantProcessIdentities {
     if ($skipSnapshot) {
         $walkRecord = [pscustomobject]@{ ok = $false; partial = $false; rows = 0; why = 'the job deadline was reached before the snapshot was read'; rootPid = $ParentProcessId }
     }
+    elseif ($filteredMode) { }   # r11: no full read (see $filteredMode above)
     else {
         try { Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, CreationDate, ExecutablePath, CommandLine -OperationTimeoutSec $snapshotTimeoutSec -ErrorAction Stop | ForEach-Object { [void]$all.Add($_) } }
         catch { $snapshotError = ([string]$_.Exception.Message) -replace '\s*[\r\n]+\s*', ' ' }   # one physical log line (adversary A10)
@@ -791,7 +797,8 @@ function Get-DescendantProcessIdentities {
             try { if ($null -ne $relRow -and $null -ne $relRow.ParentProcessId -and [int]$relRow.ParentProcessId -eq $ParentProcessId -and [int]$relRow.ProcessId -ne $ParentProcessId) { $anyRelated = $true; break } } catch { continue }
         }
     }
-    if ($null -ne $snapshotError -and -not $anyRelated) {
+    $fbTruncated = $false   # r11: filtered mode only, parents left unread when the budget ran out
+    if ($filteredMode -or ($null -ne $snapshotError -and -not $anyRelated)) {
         # r4 (A3): the root's own row first (pass 5 A2: so a process that took the pid is seen as a reuser), then breadth-first per-parent reads, at most 32
         # nodes, all inside what is left of the ONE budget (pass 5 A1: a read starts only while budget remains and is bounded by it; the provider's own
         # 1 s floor is the only rounding). Each read is STREAMED (pass 5 A5), so rows returned before an error are kept; an error ends the fallback.
@@ -806,7 +813,7 @@ function Get-DescendantProcessIdentities {
         $fbNodes = 0
         # r11 (sol r10 #5): at most 32 parent reads. An unpinned walk spends one read on the root's row first (33 reads in all); a pinned or exited walk
         # makes no root read, so its loop stops after 32.
-        $fbMaxReads = if ($RootExited -or $RootPidPinned) { 32 } else { 33 }
+        $fbMaxReads = if ($filteredMode) { [int]::MaxValue } elseif ($RootExited -or $RootPidPinned) { 32 } else { 33 }   # filtered mode: no node cap (the merge base had none), only the budget
         $fbOther = New-Object 'System.Collections.Generic.List[int]'   # r5 (pass 7 A8): rows the FALLBACK itself returned for processes other than the root
         $fbRootRowSeen = $false     # r7 (sol r6 A2): the fallback's own first read returned a row for the root's pid
         # r8 (sol r7 B2, opus r7 DC-08c): "<pid>|<start ticks>" of each parent that was admitted with a start -> $true when its row, read again AFTER its
@@ -864,6 +871,7 @@ function Get-DescendantProcessIdentities {
                 $fbGenOk[$fbGenKey] = $fbSame
             }
         }
+        if ($filteredMode -and $null -eq $fbError -and $fbSteps.Count -gt 0) { $fbTruncated = $true }
         # r5 (pass 7 A2): the fallback reads the root's row, THEN its children, as separate reads: a root that exited and whose pid was reused between them
         # would leave the old root row standing. When children were found and no read failed, the root's row is read ONCE MORE (rows are appended, and the
         # last row for a pid is the one the reuse check sees). A row whose start differs from the first is the reuser; the re-read failing, or no time left
@@ -947,8 +955,14 @@ function Get-DescendantProcessIdentities {
     # -RootExited) already knows the answer is no, so for it none of them makes the root unverifiable: the children already read are walked (PARTIAL, with the
     # read's error in the record), as the merge base's walk did. A caller that holds no handle stays fail-closed.
     if (($RootExited -or $RootPidPinned) -and $null -ne $rootUnverifiable) {
-        if ($null -ne $fbChildrenError -and $null -eq $fbError) { $fbError = $fbChildrenError }
+        # r11 (adversary r11 A10): the cleared reason stays in the record (the read that failed, whichever it was).
+        if ($null -eq $fbError) { $fbError = $rootUnverifiable }
         $rootUnverifiable = $null
+    }
+    # r11 (adversary r11 A8): in filtered mode a filtered read that failed, or a budget that ran out with parents unread, is recorded like a failed snapshot
+    # (PARTIAL when the reads found descendants, else FAILED), so a kill path names it. The merge base's walk dropped such an error silently.
+    if ($filteredMode -and ($null -ne $fbError -or $fbTruncated)) {
+        $snapshotError = "the filtered walk (the governing bound was not longer than the $snapshotTimeoutSec s full read) did not finish$(if ($fbTruncated) { ": $($fbSteps.Count) parents left unread when its budget ran out" })"
     }
     # r8 (sol r7 B1, hub decision): a LIVE caller (no -RootExited) whose reads hold a row naming the root as parent but no row for the root's pid cannot
     # tell the recorded root from a process that took its pid after it exited: unverifiable, the same as the fallback's empty re-read. Only the post-exit
@@ -1187,22 +1201,6 @@ function Get-DescendantProcessIdentities {
     $script:LastDescendantWalk = $walkRecord   # published once, here (r3 Grok G3)
 }
 
-function Get-DescendantProcessIdentitiesFiltered {
-    # AGENT-JOB-MONITOR-CIM-WALK-1 r11 (sol r10 #2): the merge base's (ce80f515) walk, unchanged: one ParentProcessId=<pid> read per node, then that child's
-    # own identity, -OnEach before each query. Get-DescendantProcessIdentities hands a call to it when the caller's governing bound (-StopBySec) is shorter than
-    # the full-table read's bound, so that call costs what it cost on the merge base.
-    param([Parameter(Mandatory = $true)][int]$ParentProcessId, [scriptblock]$OnEach = $null)
-
-    if ($null -ne $OnEach) { $null = & $OnEach }
-    $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$ParentProcessId" -ErrorAction SilentlyContinue)
-    foreach ($child in $children) {
-        $childProcessId = [int]$child.ProcessId
-        Get-DescendantProcessIdentitiesFiltered -ParentProcessId $childProcessId -OnEach $OnEach
-        if ($null -ne $OnEach) { $null = & $OnEach }
-        Get-ProcessIdentity -ProcessId $childProcessId
-    }
-}
-
 function Stop-ProcessTree {
     param(
         [Parameter(Mandatory = $true)][int]$RootProcessId,
@@ -1213,8 +1211,8 @@ function Stop-ProcessTree {
         # lease wrapper). An open process handle keeps the pid from being reused, so the walk is -RootPidPinned: a root that exits between this stop's
         # identity check and the snapshot still has its children walked under the recorded start. Without it (a pid read from disk) the walk fails closed.
         $RootProcess = $null,
-        # r11 (sol r10 #2): the stop's governing bound, passed to the walk (-StopBySec). The lease stop and the timeout stop pass 0: the stop is due now, so
-        # the walk is the merge base's filtered walk and a slow full-table read never defers it.
+        # r11 (sol r10 #2, adversary r11 A3): the stop's governing bound, passed to the walk (-StopBySec). Every stop of the agent passes 0 (a stop is due now),
+        # so the walk is filtered (the merge base's per-parent reads) and a slow full-table read never defers it. A caller that passes nothing gets the snapshot.
         $StopBySec = $null
     )
 
@@ -1255,10 +1253,15 @@ function Stop-ProcessTree {
         $script:ProcessTreeWalkNote += "; $unverifiedText"
         Add-AgentLogLine "process-tree stop pid=${RootProcessId}: $unverifiedText"
     }
+    $identityIndex = -1
     foreach ($expected in $identities) {
+        $identityIndex++
         if (-not $expected.exists) { continue }
         try {
-            $match = Test-ProcessIdentityMatch -ProcessId ([int]$expected.processId) -ExpectedStartUtc $expected.startUtc -ExpectedStartEpochMs $expected.startEpochMs -ExpectedImagePath $expected.imagePath -RequireExactStart
+            # r11 (adversary r11 A6): the exact-start rule is for the DESCENDANTS (identities from one snapshot row). The root's own identity (the LAST element of
+            # $identities) was verified with the tolerant match above, as on the merge base; a root whose start cannot be read is still stopped once it passed.
+            $isRootIdentity = ($identityIndex -eq ($identities.Count - 1))
+            $match = Test-ProcessIdentityMatch -ProcessId ([int]$expected.processId) -ExpectedStartUtc $expected.startUtc -ExpectedStartEpochMs $expected.startEpochMs -ExpectedImagePath $expected.imagePath -RequireExactStart:(-not $isRootIdentity)
             if (-not $match.matches) {
                 Add-AgentLogLine "skipped changed process identity pid=$($expected.processId) reason=$($match.reason)"
                 continue
@@ -1411,7 +1414,9 @@ function Complete-WindowlessRedirectedProcess {
             if ($captureLeftMs -le 0) { break }
             [void][System.Threading.Tasks.Task]::WaitAny($copies.ToArray(), [Math]::Max(1, $captureLeftMs))
         }
-        foreach ($copyTask in $completedInOrder) { if ($copyTask.IsFaulted -or $copyTask.IsCanceled) { [void]$copyTask.GetAwaiter().GetResult() } }   # the earliest fault, as itself
+        # r11 (adversary r11 A9, DISTINGUISHED as pre-existing): the first fault in SCAN order, as itself. Copies that completed before the same scan are taken in
+        # field order (stdout first), as the merge base's drain did; the true earliest fault among them is successor CAPTURE-DRAIN-FAULT-ORDER-1.
+        foreach ($copyTask in $completedInOrder) { if ($copyTask.IsFaulted -or $copyTask.IsCanceled) { [void]$copyTask.GetAwaiter().GetResult() } }
         if ($copies.Count -gt 0) { throw "output capture did not finish within $([Math]::Round($CaptureWaitMs / 1000.0, 1)) s (a surviving descendant may hold the pipe open)" }
         $Launch.OutStream.Flush()
         $Launch.ErrStream.Flush()
@@ -2316,7 +2321,7 @@ function Invoke-AdoptStartedJob {
         $finalMatch = Test-ProcessIdentityMatch -ProcessId ([int]$Marker.childPid) -ExpectedStartUtc ([string]$Marker.childStartUtc) -ExpectedStartEpochMs $Marker.childStartEpochMs -ExpectedImagePath $Marker.childImagePath
         if ($finalMatch.matches) {
             $timedOut = $true
-            $killedProcessIds = @(Stop-ProcessTree -RootProcessId ([int]$Marker.childPid) -RootStartUtc ([string]$Marker.childStartUtc) -RootStartEpochMs $Marker.childStartEpochMs -RootImagePath $Marker.childImagePath)
+            $killedProcessIds = @(Stop-ProcessTree -RootProcessId ([int]$Marker.childPid) -RootStartUtc ([string]$Marker.childStartUtc) -RootStartEpochMs $Marker.childStartEpochMs -RootImagePath $Marker.childImagePath -StopBySec 0)   # r11 (adversary r11 A3): a stop is due now
             $adoptedStopNote = [string]$script:ProcessTreeWalkNote   # r8 (sol r7 B6): recovered into the receipt if the append below is refused
             "adopted child timed out after ${adoptedTimeoutSec}s; killed process tree pids=$($killedProcessIds -join ',')$($script:ProcessTreeWalkNote)$($adoptedTags['stop'])" |
                 Add-Content -Encoding ASCII -LiteralPath $Marker.errFile
@@ -3808,7 +3813,7 @@ function Stop-HeavySlotHolder {
     $killed = @()
     $stopNote = ""   # AGENT-JOB-MONITOR-CIM-WALK-1 r2 (adversary A5): the incomplete-walk note of this call's stop, if any
     if (-not $exited) {
-        $killed = @(Stop-ProcessTree -RootProcessId $Holder.pid -RootStartUtc $Holder.identity.startUtc -RootStartEpochMs $Holder.identity.startEpochMs -RootImagePath $Holder.identity.imagePath -RootProcess $p)   # r8b (pass 11 A2): the held handle pins the pid
+        $killed = @(Stop-ProcessTree -RootProcessId $Holder.pid -RootStartUtc $Holder.identity.startUtc -RootStartEpochMs $Holder.identity.startEpochMs -RootImagePath $Holder.identity.imagePath -RootProcess $p -StopBySec 0)   # r8b (pass 11 A2): the held handle pins the pid; r11 (A3): due now
         $stopNote = [string]$script:ProcessTreeWalkNote
         $exited = $p.WaitForExit(5000)
     }
@@ -3827,7 +3832,7 @@ function Stop-StaleHeavySlotHolders {
     foreach ($f in @(Get-ChildItem -LiteralPath $slotHolders -Filter "*.holder.json" -File -ErrorAction SilentlyContinue)) {
         $r = Read-JsonFile -Path $f.FullName
         if ($null -ne $r -and $r.pid -and $null -ne $r.startEpochMs -and (Get-ProcessIdentity -ProcessId ([int]$r.pid)).exists) {
-            $killed = @(Stop-ProcessTree -RootProcessId ([int]$r.pid) -RootStartEpochMs $r.startEpochMs)
+            $killed = @(Stop-ProcessTree -RootProcessId ([int]$r.pid) -RootStartEpochMs $r.startEpochMs -StopBySec 0)   # r11 (adversary r11 A3): due now
             Add-AgentLogLine "heavy-slot-gate: stale holder id=$($r.id) pid=$($r.pid) from agent pid=$($r.agentPid) stopped=$($killed -join ',')$($script:ProcessTreeWalkNote)"
         }
         Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
@@ -4366,7 +4371,9 @@ function Test-QuietLeaseOwnerPid {
     # ends the fallback before the wrapper's children are read. The merge base read ParentProcessId=<wrapper> and accepted the owner child.
     $leasePinned = $false
     if ($null -ne $Lease.proc) { try { $leasePinned = ([int]$Lease.proc.Id -eq [int]$Lease.pid) } catch { $leasePinned = $false } }   # a disposed object has no Id: not pinned
-    $kids = @(Get-DescendantProcessIdentities -ParentProcessId $Lease.pid -RootStartEpochMs $Lease.identity.startEpochMs -RootPidPinned:$leasePinned | Where-Object { $_.exists -and [int]$_.processId -eq $OwnerPid })
+    # r11 (adversary r11 A4): -StopBySec 0, the filtered walk: the question is one child of the wrapper, and a partial full read that returned the wrapper and
+    # another child but not the owner (no fallback runs for it) cannot prove a mismatch. The merge base read ParentProcessId=<wrapper> here.
+    $kids = @(Get-DescendantProcessIdentities -ParentProcessId $Lease.pid -RootStartEpochMs $Lease.identity.startEpochMs -RootPidPinned:$leasePinned -StopBySec 0 | Where-Object { $_.exists -and [int]$_.processId -eq $OwnerPid })
     if ($kids.Count -gt 0) {
         # AGENT-JOB-MONITOR-CIM-WALK-1 r2 (adversary A2): the walk's identity is a row of one snapshot, which an owner that exited while the snapshot
         # was read still appears in. This answer is cached by the caller, so the owner itself is read once more (one filtered query, on this
@@ -4730,7 +4737,7 @@ function Stop-QuietLease {
         $releaseRc = if ($r.done) { [string]$r.rc } else { "not-done ($($r.why))" }
         $exited = $p.WaitForExit(5000)
         if (-not $exited) {
-            $killed = @(Stop-ProcessTree -RootProcessId $Lease.pid -RootStartUtc $Lease.identity.startUtc -RootStartEpochMs $Lease.identity.startEpochMs -RootImagePath $Lease.identity.imagePath -RootProcess $p)   # r8b (pass 11 A2)
+            $killed = @(Stop-ProcessTree -RootProcessId $Lease.pid -RootStartUtc $Lease.identity.startUtc -RootStartEpochMs $Lease.identity.startEpochMs -RootImagePath $Lease.identity.imagePath -RootProcess $p -StopBySec 0)   # r8b (pass 11 A2); r11 (A3): due now
             $stopNote = [string]$script:ProcessTreeWalkNote
             $exited = $p.WaitForExit(5000)
         }
@@ -4760,7 +4767,7 @@ function Stop-StaleQuietLeases {
             if ($live.matches) {
                 $c = Start-HeavySlotCli -Arguments @("lease", "release", "--label", [string]$r.label)
                 $rel = Complete-HeavySlotCli -Call $c -TimeoutSec 30 -HeartbeatActivity "stale-lease-release"
-                $killed = @(Stop-ProcessTree -RootProcessId ([int]$r.pid) -RootStartEpochMs $r.startEpochMs)
+                $killed = @(Stop-ProcessTree -RootProcessId ([int]$r.pid) -RootStartEpochMs $r.startEpochMs -StopBySec 0)   # r11 (adversary r11 A3): due now
                 Add-AgentLogLine "quiet-lease: stale lease id=$($r.id) pid=$($r.pid) from agent pid=$($r.agentPid) releaseRc=$($rel.rc) stopped=$($killed -join ',')$($script:ProcessTreeWalkNote)"
             }
         }
@@ -5284,11 +5291,19 @@ function Test-JobExitedAfterDeadline {
     # monitor waited on the child up to the deadline, so a child that exited after it was still running when the loop ended: exit 124, timedOut=true. A census
     # that answers past the deadline must not turn that exit into a normal one, so the child's own exit time decides. $true when the job exited at or after
     # the deadline (or, when its exit time cannot be read, when the deadline has passed by now); $false when it is running or exited before the deadline.
+    # r11 (adversary r11 A5): compared in UTC. Invoke-QueuedJob passes a UTC deadline; ExitTime is local (from the kernel's UTC exit time), and its
+    # ToUniversalTime is exact across a DST change, where comparing local clock fields is not.
     param($Process, [Parameter(Mandatory = $true)][DateTime]$Deadline)
+    $deadlineUtc = if ($Deadline.Kind -eq [DateTimeKind]::Utc) { $Deadline } else { $Deadline.ToUniversalTime() }
     $hasExited = $false
     try { $hasExited = [bool]$Process.HasExited } catch { $hasExited = $false }
     if (-not $hasExited) { return $false }
-    try { return ([DateTime]$Process.ExitTime -ge $Deadline) } catch { return ((Get-Date) -ge $Deadline) }
+    try {
+        $exitTime = [DateTime]$Process.ExitTime
+        $exitUtc = if ($exitTime.Kind -eq [DateTimeKind]::Utc) { $exitTime } else { $exitTime.ToUniversalTime() }
+        return ($exitUtc -ge $deadlineUtc)
+    }
+    catch { return ([DateTime]::UtcNow -ge $deadlineUtc) }
 }
 
 function Invoke-QueuedJob {
@@ -5553,6 +5568,7 @@ function Invoke-QueuedJob {
         if (-not $launchedPersisted) { Add-AgentLogLine "launched marker job=$jobId pid=$($jobProcess.Id) not verified; the child runs, the marker still reads launching; retrying each slice" }
 
         $deadline = (Get-Date).AddSeconds($effectiveTimeoutSec)
+        $deadlineUtc = [DateTime]::UtcNow.AddSeconds($effectiveTimeoutSec)   # r11 (adversary r11 A5): the verdict's deadline, in UTC (see Test-JobExitedAfterDeadline)
         $waitSliceMs = [Math]::Max(250, [Math]::Min(5000, $PollSeconds * 1000))
         while (!$jobProcess.HasExited -and (Get-Date) -lt $deadline) {
             if (-not $launchedPersisted) {
@@ -5569,10 +5585,12 @@ function Invoke-QueuedJob {
             # reused; a root that exited just before the snapshot still has its children tracked for the post-exit cleanup, as the merge base's walk did.
             # r11 (sol r10 #2): a batch job's lease is the slice's other bound (the stop at its guard, Get-LeaseBatchJobStop below): the seconds left before that
             # stop are passed down, and a walk whose full-table read could outlast them is the merge base's filtered walk.
+            # r11 (adversary r11 A2): the remaining seconds are floored, and the guard trips once the floor reaches it (the true remainder under guard + 1), so
+            # the bound is remaining - guard - 1; the walk subtracts its own opening tick from it.
             $sliceStopBySec = $null
             if ($null -ne $script:Admission -and $null -ne $script:Admission.leaseBatch) {
                 $sliceLeaseLeft = Get-QuietLeaseRemainingSec -Lease $script:QuietLease
-                $sliceStopBySec = if ($null -eq $sliceLeaseLeft) { 0 } else { $sliceLeaseLeft - $script:LeaseBatchJobGuardSec }
+                $sliceStopBySec = if ($null -eq $sliceLeaseLeft) { 0 } else { $sliceLeaseLeft - $script:LeaseBatchJobGuardSec - 1 }
             }
             foreach ($descendant in @(Get-DescendantProcessIdentities -ParentProcessId $jobProcess.Id -RootStartEpochMs $marker.childStartEpochMs -Deadline $deadline -RootPidPinned -StopBySec $sliceStopBySec -OnEach { Invoke-QuietLeaseRenewTick })) {
                 if ($descendant.exists) {
@@ -5610,7 +5628,7 @@ function Invoke-QueuedJob {
         if ($cancelled) {
             $exit = 130
             # r8b (adversary pass 11 A2): -RootProcess: this agent holds the job child's handle, so a root that exits before the snapshot still has its children walked.
-            $killedProcessIds = @(Stop-ProcessTree -RootProcessId $jobProcess.Id -RootStartUtc $marker.childStartUtc -RootStartEpochMs $marker.childStartEpochMs -RootImagePath $marker.childImagePath -RootProcess $jobProcess)
+            $killedProcessIds = @(Stop-ProcessTree -RootProcessId $jobProcess.Id -RootStartUtc $marker.childStartUtc -RootStartEpochMs $marker.childStartEpochMs -RootImagePath $marker.childImagePath -RootProcess $jobProcess -StopBySec 0)   # r11 (adversary r11 A3): due now
             $jobStopNote = [string]$script:ProcessTreeWalkNote   # r8 (sol r7 B6): kept for the receipt, whatever the err file does with the line below
             try { Complete-WindowlessRedirectedProcess -Launch $launch } catch { $captureDrainFailure = $_.Exception.Message; Add-AgentLogLine "job output capture drain failed job=${jobId}: $captureDrainFailure" }   # r4 (A5): drain BEFORE the diagnostic is appended
             "cancelled by mailbox request; killed process tree pids=$($killedProcessIds -join ',')$($script:ProcessTreeWalkNote)$($diagTags['stop'])" |
@@ -5628,12 +5646,17 @@ function Invoke-QueuedJob {
                 Add-Content -Encoding ASCII -LiteralPath $errFile
             Add-AgentLogLine "quiet-lease: batch-job-stopped job=$jobId reason=$($leaseStop.reason) why=[$($leaseStop.why)] killed=$($killedProcessIds -join ',')$($script:ProcessTreeWalkNote)"
         }
-        # r11 (sol r10 #1): a job that exited AFTER its deadline (while a census answered past it) is a timeout, as on the merge base; see Test-JobExitedAfterDeadline.
-        elseif ($jobProcess.HasExited -and -not ($exitedAfterDeadline = Test-JobExitedAfterDeadline -Process $jobProcess -Deadline $deadline)) {
+        elseif ($jobProcess.HasExited) {
             $exit = $jobProcess.ExitCode
+            # r11 (sol r10 #1): a job that exited AFTER its deadline (while a census answered past it) is a timeout, exit 124 timedOut=true, as on the merge base
+            # (its monitor was still waiting on the child at the deadline); its descendants get this branch's census and stop (Stop-ProcessTree refuses a root
+            # that is no longer running). Decided in UTC (adversary r11 A5: a local-clock compare is wrong across a DST change).
+            $exitedAfterDeadline = Test-JobExitedAfterDeadline -Process $jobProcess -Deadline $deadlineUtc
+            if ($exitedAfterDeadline) { $timedOut = $true; $exit = 124 }
             # r8 (sol r7 B1, hub decision): the ONE caller that walks an exited root, and it still holds the root's process handle ($jobProcess is disposed
             # only in the finally below), so the pid cannot have been reused: -RootExited keeps the recorded start authoritative when the root's row is gone.
-            foreach ($descendant in @(Get-DescendantProcessIdentities -ParentProcessId $jobProcess.Id -RootStartEpochMs $marker.childStartEpochMs -RootExited)) {
+            # r11: after a late exit the stop is due now (-StopBySec 0, the filtered census).
+            foreach ($descendant in @(Get-DescendantProcessIdentities -ParentProcessId $jobProcess.Id -RootStartEpochMs $marker.childStartEpochMs -RootExited -StopBySec $(if ($exitedAfterDeadline) { 0 } else { $null }))) {
                 if ($descendant.exists) {
                     $trackedDescendants["$($descendant.processId):$($descendant.startEpochMs)"] = $descendant
                 }
@@ -5659,20 +5682,22 @@ function Invoke-QueuedJob {
                         Add-Content -Encoding ASCII -LiteralPath $errFile
                 }
             }
+            if ($exitedAfterDeadline) {
+                "timed out after ${effectiveTimeoutSec}s (the job exited after its deadline, while the monitor's descendant census was read); killed process tree pids=$($killedProcessIds -join ',')$($diagTags['stop'])" |
+                    Add-Content -Encoding ASCII -LiteralPath $errFile
+                if ($null -ne $script:Admission.stageCeiling -and $script:Admission.stageCeiling.clamped) {
+                    $jobCeilingNote = "STAGE_EXEMPT_CEILING_EXCEEDED: staging step ran past its ${effectiveTimeoutSec}s exempt ceiling (asked for $($script:Admission.stageCeiling.requestedSec)s); a lease-exempt job may not heat the host for longer"
+                    "$jobCeilingNote$($diagTags['ceiling'])" |
+                        Add-Content -Encoding ASCII -LiteralPath $errFile
+                    Add-AgentLogLine "heavy-slot-gate: STAGE_EXEMPT_CEILING_EXCEEDED job=$jobId ceiling=${effectiveTimeoutSec}s killed pids=$($killedProcessIds -join ',')"
+                }
+            }
         }
         else {
             $timedOut = $true
             $exit = 124
-            # r11 (sol r10 #2): -StopBySec 0: the deadline (or the stage ceiling) has passed, so the stop is due now and the walk is the merge base's filtered walk.
+            # r11 (sol r10 #2): -StopBySec 0: the deadline (or the stage ceiling) has passed, so the stop is due now and the walk is filtered.
             $killedProcessIds = @(Stop-ProcessTree -RootProcessId $jobProcess.Id -RootStartUtc $marker.childStartUtc -RootStartEpochMs $marker.childStartEpochMs -RootImagePath $marker.childImagePath -RootProcess $jobProcess -StopBySec 0)   # r8b (pass 11 A2)
-            if ($exitedAfterDeadline) {
-                # r11 (sol r10 #1): the root exited after its deadline, so Stop-ProcessTree refused it (not running). Its descendants are still stopped: those the
-                # slices tracked plus the merge base's filtered census of the exited root (the stop is due now), each re-checked by identity before the stop.
-                foreach ($descendant in @(Get-DescendantProcessIdentitiesFiltered -ParentProcessId $jobProcess.Id)) {
-                    if ($descendant.exists) { $trackedDescendants["$($descendant.processId):$($descendant.startEpochMs)"] = $descendant }
-                }
-                $killedProcessIds = @(@($killedProcessIds) + @(Stop-VerifiedProcessIdentities -Identities @($trackedDescendants.Values)))
-            }
             $jobStopNote = [string]$script:ProcessTreeWalkNote   # r8 (sol r7 B6)
             try { Complete-WindowlessRedirectedProcess -Launch $launch } catch { $captureDrainFailure = $_.Exception.Message; Add-AgentLogLine "job output capture drain failed job=${jobId}: $captureDrainFailure" }   # r4 (A5)
             "timed out after ${effectiveTimeoutSec}s; killed process tree pids=$($killedProcessIds -join ',')$($script:ProcessTreeWalkNote)$($diagTags['stop'])" |

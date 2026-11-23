@@ -118,7 +118,8 @@ $liftBatchR2 = @('Register-QuietLeaseRenewOk', 'Get-QuietLeaseRenewOkGapSec', 'C
     'Test-RenewGapFromWallUnknown')   # r6 (sol r5 B1): optional, so renew-gap-exhausted-start-pair-no-false-stop runs RED on dd5c99c5
 # lease-batch r3 (sol r2 B1, B2): the same, asserted by the r3 cases after they have shown the behaviour.
 $liftBatchR3 = @('Test-LeaseBatchClosePending', 'Get-LeaseBatchJobStop',
-    'Get-DescendantProcessIdentitiesFiltered', 'Test-JobExitedAfterDeadline')   # AGENT-JOB-MONITOR-CIM-WALK-1 r11: optional, so cim-walk-split-r11 runs RED on 3063a803
+    'Test-JobExitedAfterDeadline',   # AGENT-JOB-MONITOR-CIM-WALK-1 r11: optional, so cim-walk-split-r11 runs RED on 3063a803
+    'Get-DescendantProcessIdentitiesFiltered')   # r11: defined only on 655d355d (the first r11 commit); lifted there so its RED run exercises it
 $batchLifted = [System.Collections.Generic.List[string]]::new()
 foreach ($name in $liftBatch + $liftBatchR2 + $liftBatchR3) {
     $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
@@ -7234,11 +7235,12 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             # $script:R11Full: what the complete read does ('world' | a scriptblock). $script:R11Filter: filter -> scriptblock, called with the read's index for that
             # filter; an unscripted filter is answered from $script:R11World. $script:R11FullDelayMs delays the complete read (never past its bound).
             $script:R11World = @(); $script:R11Full = 'world'; $script:R11Filter = @{}; $script:R11N = @{}; $script:R11FullDelayMs = 0
-            $script:R11Reads = [System.Collections.Generic.List[string]]::new(); $script:R11Stopped = [System.Collections.Generic.List[int]]::new()
+            $script:R11Reads = [System.Collections.Generic.List[string]]::new(); $script:R11Stopped = [System.Collections.Generic.List[int]]::new(); $script:R11FBounds = [System.Collections.Generic.List[int]]::new()
             function Get-CimInstance {
                 [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter, [string[]]$Property, [uint32]$OperationTimeoutSec)
                 if ($PSBoundParameters.ContainsKey('Filter')) {
                     $script:R11Reads.Add($Filter)
+                    if ($PSBoundParameters.ContainsKey('OperationTimeoutSec')) { $script:R11FBounds.Add([int]$OperationTimeoutSec) }
                     if ($script:R11Filter.ContainsKey($Filter)) { $n = [int]$script:R11N[$Filter]; $script:R11N[$Filter] = $n + 1; & $script:R11Filter[$Filter] $n; return }
                     if ($Filter -match '^ProcessId=(\d+)$') { $want = [int]$Matches[1]; foreach ($r in $script:R11World) { if ([int]$r.ProcessId -eq $want) { $r } } }
                     elseif ($Filter -match '^ParentProcessId=(\d+)$') { $want = [int]$Matches[1]; foreach ($r in $script:R11World) { if ([int]$r.ParentProcessId -eq $want) { $r } } }
@@ -7255,7 +7257,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $reset = {
                 param($World, $Full = 'world', [hashtable]$Filter = @{})
                 $script:R11World = @($World); $script:R11Full = $Full; $script:R11Filter = $Filter; $script:R11N = @{}; $script:R11FullDelayMs = 0
-                $script:R11Reads.Clear(); $script:R11Stopped.Clear(); $script:Log.Clear()
+                $script:R11Reads.Clear(); $script:R11Stopped.Clear(); $script:R11FBounds.Clear(); $script:Log.Clear()
                 $script:LastDescendantWalk = $null; $script:DescendantWalkFailLogTs = $null; $script:DescendantWalkStaleLogged = $null; $script:DescendantWalkUnverifiedLogged = $null; $script:ProcessTreeWalkNote = ''
             }
             $ids = { param($w) (@($w | Where-Object { $null -ne $_ } | ForEach-Object { [int]$_.processId }) -join ',') }
@@ -7342,7 +7344,74 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 $hasParam = { param($c, [string]$p) @($c.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq $p }).Count -eq 1 }
                 $mon = @($qj.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-DescendantProcessIdentities' -and (& $hasParam $n 'OnEach') }, $true))
                 $stops = @($qj.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Stop-ProcessTree' }, $true))
-                [pscustomobject]@{ monitorBound = ($mon.Count -eq 1 -and (& $hasParam $mon[0] 'StopBySec')); stopsBound = @($stops | Where-Object { & $hasParam $_ 'StopBySec' }).Count; stops = $stops.Count }
+                # adversary r11 A3: EVERY stop of the agent is due now (adopted timeout, holder end, stale holder, lease end, stale lease, cancel, lease, timeout).
+                $allStops = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Stop-ProcessTree' }, $true))
+                # adversary r11 A2: the slice bound leaves the floor's second and the guard (remaining - guard - 1).
+                $sliceBound = [bool]($qj.Extent.Text -match '\$sliceLeaseLeft - \$script:LeaseBatchJobGuardSec - 1\b')
+                [pscustomobject]@{ monitorBound = ($mon.Count -eq 1 -and (& $hasParam $mon[0] 'StopBySec')); stopsBound = @($stops | Where-Object { & $hasParam $_ 'StopBySec' }).Count; stops = $stops.Count; allStops = $allStops.Count; allBound = @($allStops | Where-Object { & $hasParam $_ 'StopBySec' }).Count; sliceBound = $sliceBound }
+            }
+            # adversary r11 A1: a stop that is due now (filtered) keeps the stale-edge rule: 4001 (12:00:00) names root 4000 (recorded 12:00:10) as parent, a
+            # survivor of the pid's previous holder. It is not stopped.
+            & $try 'r11A1' {
+                $r11Ten = [DateTimeOffset]::new($r11Base.AddSeconds(10)).ToUnixTimeMilliseconds()
+                & $reset @((New-R11Proc 4000 1 10), (New-R11Proc 4001 4000 0))
+                $null = @(Stop-ProcessTree -RootProcessId 4000 -RootStartEpochMs $r11Ten -RootProcess ([pscustomobject]@{ Id = 4000 }) -StopBySec 0)
+                [pscustomobject]@{ stopped = (@($script:R11Stopped) -join ','); full = @($script:R11Reads | Where-Object { $_ -eq 'FULL' }).Count }
+            }
+            # adversary r11 A2: 31 s to the lease stop, but the opening tick takes 2 s: 29 s are left when the full read (30 s bound) would start, so it is filtered.
+            & $try 'r11A2' {
+                & $reset $tree
+                $w = @(Get-DescendantProcessIdentities -ParentProcessId 4000 -RootStartEpochMs $rootMs -Deadline ((Get-Date).AddSeconds(600)) -RootPidPinned -StopBySec 31 -OnEach { if (-not $script:R11Ticked) { $script:R11Ticked = $true; Start-Sleep -Milliseconds 2000 } })
+                $script:R11Ticked = $false
+                [pscustomobject]@{ ids = (& $ids $w); full = @($script:R11Reads | Where-Object { $_ -eq 'FULL' }).Count }
+            }
+            # adversary r11 A4: the held wrapper 7200 has children 7202 (helper) and 7201 (owner). The full read streams 7200 and 7202, then fails; the filtered
+            # ParentProcessId=7200 read returns both. The merge base accepts 7201.
+            & $try 'r11A4' {
+                & $reset @((New-R11Proc 7200 1 0), (New-R11Proc 7202 7200 1), (New-R11Proc 7201 7200 2)) { New-R11Proc 7200 1 0; New-R11Proc 7202 7200 1; throw 'RPC server unavailable' }
+                $chk = Test-QuietLeaseOwnerPid -Lease ([pscustomobject]@{ pid = 7200; proc = [pscustomobject]@{ Id = 7200 }; identity = [pscustomobject]@{ startEpochMs = $rootMs } }) -OwnerPid 7201
+                [pscustomobject]@{ ok = $chk.ok; why = [string]$chk.why }
+            }
+            # adversary r11 A5: the verdict is decided in UTC. Spring forward (2026-03-08, a US zone): the deadline is 08:00:15Z and the child exits at 08:00:01Z
+            # (03:00:01 local daylight time against a 02:00:15 local deadline): an exit before the deadline. Fall back (2026-11-01): the deadline is 06:59:40Z and
+            # the exit 07:00:10Z (01:00:10 local standard time): after it.
+            & $try 'r11A5' {
+                $springDl = [datetime]::new(2026, 3, 8, 8, 0, 15, [DateTimeKind]::Utc)
+                $springExit = [pscustomobject]@{ HasExited = $true; ExitTime = [datetime]::new(2026, 3, 8, 8, 0, 1, [DateTimeKind]::Utc).ToLocalTime() }
+                $fallDl = [datetime]::new(2026, 11, 1, 6, 59, 40, [DateTimeKind]::Utc)
+                $fallExit = [pscustomobject]@{ HasExited = $true; ExitTime = [datetime]::new(2026, 11, 1, 7, 0, 10, [DateTimeKind]::Utc).ToLocalTime() }
+                [pscustomobject]@{ spring = (Test-JobExitedAfterDeadline -Process $springExit -Deadline $springDl); fall = (Test-JobExitedAfterDeadline -Process $fallExit -Deadline $fallDl) }
+            }
+            # adversary r11 A6: a held job root whose every row has no CreationDate (the marker recorded no start) passes the tolerant root check and is stopped at
+            # its timeout, as on the merge base: the exact-start rule is for descendants only.
+            & $try 'r11A6' {
+                & $reset @([pscustomobject]@{ ProcessId = [uint32]4000; ParentProcessId = [uint32]1; CreationDate = $null; ExecutablePath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'; CommandLine = 'p 4000' })
+                $null = @(Stop-ProcessTree -RootProcessId 4000 -RootStartUtc $null -RootStartEpochMs $null -RootImagePath 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -RootProcess ([pscustomobject]@{ Id = 4000 }) -StopBySec 0)
+                [pscustomobject]@{ stopped = (@($script:R11Stopped) -join ',') }
+            }
+            # adversary r11 A7: a 2 s budget; the full read fails empty 0.9 s in, leaving 1.1 s: a supplemental read's bound is 1 s (whole seconds left), never 2.
+            & $try 'r11A7' {
+                & $reset @((New-R11Proc 4001 4000 1)) { throw 'full-table read failed' }; $script:R11FullDelayMs = 900
+                $null = @(Get-DescendantProcessIdentities -ParentProcessId 4000 -RootStartEpochMs $rootMs -RootPidPinned -TimeoutSec 2)
+                [pscustomobject]@{ bounds = (@($script:R11FBounds) -join ','); maxBound = $(if ($script:R11FBounds.Count -gt 0) { ($script:R11FBounds | Measure-Object -Maximum).Maximum } else { 0 }) }
+            }
+            # adversary r11 A8: a stop that is due now, whose filtered children read emits no row and a non-terminating RPC error, names the failed census.
+            & $try 'r11A8' {
+                & $reset @((New-R11Proc 4000 1 0)) 'world' @{ 'ParentProcessId=4000' = { param($n) Write-Error 'RPC unavailable' } }
+                $null = @(Stop-ProcessTree -RootProcessId 4000 -RootStartEpochMs $rootMs -RootProcess ([pscustomobject]@{ Id = 4000 }) -StopBySec 0)
+                [pscustomobject]@{ note = [string]$script:ProcessTreeWalkNote; ok = $script:LastDescendantWalk.ok }
+            }
+            # adversary r11 A10: the pinned walk keeps 4001 and its record names the root-row read that failed.
+            & $try 'r11A10' {
+                & $reset @((New-R11Proc 4001 4000 1)) { New-R11Proc 4001 4000 1; throw 'FULL RPC' } @{ 'ProcessId=4000' = { param($n) throw 'ROOT ACCESS DENIED' } }
+                $w = @(Get-DescendantProcessIdentities -ParentProcessId 4000 -RootStartEpochMs $rootMs -RootPidPinned)
+                [pscustomobject]@{ ids = (& $ids $w); why = [string]$script:LastDescendantWalk.why }
+            }
+            # adversary r11 A11: a filtered walk whose -OnEach runs a nested walk publishes its OWN record (root 4000), not the nested walk's (8000).
+            & $try 'r11A11' {
+                & $reset @((New-R11Proc 4000 1 0), (New-R11Proc 8000 1 0))
+                $null = @(Get-DescendantProcessIdentities -ParentProcessId 4000 -StopBySec 0 -OnEach { $null = @(Get-DescendantProcessIdentities -ParentProcessId 8000) })
+                [pscustomobject]@{ rootPid = $script:LastDescendantWalk.rootPid }
             }
             # sol r10 #1: the job's deadline passes while the monitor's census is read, and the child exits 0 400 ms after the deadline. The merge base's monitor was
             # still waiting on the child at the deadline: exit 124, timedOut=true. The verdict reads the child's exit time.
@@ -7352,9 +7421,10 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 $early = [pscustomobject]@{ HasExited = $true; ExitTime = $dl.AddMilliseconds(-100); ExitCode = 0 }
                 $running = [pscustomobject]@{ HasExited = $false }
                 $qj = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-QueuedJob' }, $true)
-                $normal = $qj.Find({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] -and @($n.Clauses | Where-Object { $_.Item1.Extent.Text -match '^\$jobProcess\.HasExited\b' }).Count -eq 1 }, $true)
-                $normalCond = if ($null -ne $normal) { [string](@($normal.Clauses | Where-Object { $_.Item1.Extent.Text -match '^\$jobProcess\.HasExited\b' })[0].Item1.Extent.Text) } else { '' }
-                [pscustomobject]@{ late = (Test-JobExitedAfterDeadline -Process $late -Deadline $dl); early = (Test-JobExitedAfterDeadline -Process $early -Deadline $dl); running = (Test-JobExitedAfterDeadline -Process $running -Deadline $dl); normalCond = $normalCond }
+                $normal = $qj.Find({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] -and @($n.Clauses | Where-Object { $_.Item1.Extent.Text -ceq '$jobProcess.HasExited' }).Count -eq 1 }, $true)
+                $normalBody = if ($null -ne $normal) { [string](@($normal.Clauses | Where-Object { $_.Item1.Extent.Text -ceq '$jobProcess.HasExited' })[0].Item2.Extent.Text) } else { '' }
+                $normalAsks = [bool]($normalBody -match 'Test-JobExitedAfterDeadline -Process \$jobProcess -Deadline \$deadlineUtc' -and $normalBody -match 'if \(\$exitedAfterDeadline\) \{ \$timedOut = \$true; \$exit = 124 \}')
+                [pscustomobject]@{ late = (Test-JobExitedAfterDeadline -Process $late -Deadline $dl); early = (Test-JobExitedAfterDeadline -Process $early -Deadline $dl); running = (Test-JobExitedAfterDeadline -Process $running -Deadline $dl); normalAsks = $normalAsks }
             }
             # sol r10 #8: a readable err file holding 8,000 copies of the untagged capture prefix, and the agent's own tagged append refused. The diagnostic is
             # recovered and the receipt path is not stalled (the merge base had no matcher; the match is now bounded).
@@ -7378,8 +7448,18 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True ($r11Out['b5Monitor'].ids -eq '4002,4001' -and $r11Out['b5Monitor'].reads -notmatch 'FULL' -and $r11Out['b5Monitor'].ms -lt 1500) "cim-walk-split-r11: (sol r10 #2) a monitor walk with 12 s to the lease stop takes the filtered walk (no 3 s complete read) and still tracks 4002 and 4001: $r11Txt"
         Assert-True ($r11Out['b5Stop'].stopped -eq '4002,4001,4000' -and $r11Out['b5Stop'].full -eq 0 -and $r11Out['b5Stop'].ms -lt 1500) "cim-walk-split-r11: (sol r10 #2) a stop that is due now walks filtered and stops the tree without waiting on the complete read: $r11Txt"
         Assert-True ($r11Out['b5Default'].fullWithBound -eq 1 -and $r11Out['b5Default'].reads2 -ceq 'FULL' -and $r11Out['b5Default'].ids1 -eq '4002,4001' -and $r11Out['b5Default'].ids2 -eq '4002,4001') "cim-walk-split-r11: (sol r10 #2) with time for it the one-snapshot read stays the default: $r11Txt"
-        Assert-True ($r11Out['b5Sites'].monitorBound -eq $true -and $r11Out['b5Sites'].stops -eq 3 -and $r11Out['b5Sites'].stopsBound -eq 2) "cim-walk-split-r11: (sol r10 #2) Invoke-QueuedJob passes the bound to its monitor walk and to its lease and timeout stops (not the cancel stop): $r11Txt"
-        Assert-True ($r11Out['b4'].late -eq $true -and $r11Out['b4'].early -eq $false -and $r11Out['b4'].running -eq $false -and $r11Out['b4'].normalCond -match 'Test-JobExitedAfterDeadline') "cim-walk-split-r11: (sol r10 #1) a child that exits after the deadline is a timeout (exit 124, timedOut) as on the merge base; one that exited before it is a normal exit, and Invoke-QueuedJob's normal-exit branch asks: $r11Txt"
+        Assert-True ($r11Out['b5Sites'].monitorBound -eq $true -and $r11Out['b5Sites'].stops -eq 3 -and $r11Out['b5Sites'].stopsBound -eq 3) "cim-walk-split-r11: (sol r10 #2) Invoke-QueuedJob passes the bound to its monitor walk and to all three of its stops: $r11Txt"
+        Assert-True ($r11Out['b5Sites'].allStops -ge 8 -and $r11Out['b5Sites'].allBound -eq $r11Out['b5Sites'].allStops -and $r11Out['b5Sites'].sliceBound -eq $true) "cim-walk-split-r11: (adversary r11 A3, A2) every Stop-ProcessTree call of the agent is due now (-StopBySec), and the slice's lease bound is remaining - guard - 1: $r11Txt"
+        Assert-True ($r11Out['b4'].late -eq $true -and $r11Out['b4'].early -eq $false -and $r11Out['b4'].running -eq $false -and $r11Out['b4'].normalAsks -eq $true) "cim-walk-split-r11: (sol r10 #1) a child that exits after the deadline is a timeout (exit 124, timedOut) as on the merge base; one that exited before it is a normal exit, and Invoke-QueuedJob's normal-exit branch asks with the UTC deadline: $r11Txt"
+        Assert-True ($r11Out['r11A1'].stopped -eq '4000' -and $r11Out['r11A1'].full -eq 0) "cim-walk-split-r11: (adversary r11 A1) a stop that is due now keeps the stale-edge rule: 4001, created before the recorded root, is not stopped: $r11Txt"
+        Assert-True ($r11Out['r11A2'].full -eq 0 -and $r11Out['r11A2'].ids -eq '4002,4001') "cim-walk-split-r11: (adversary r11 A2) the opening tick spends the governing bound: 31 s less a 2 s tick leaves 29 s, so no 30 s full read starts: $r11Txt"
+        Assert-True ($r11Out['r11A4'].ok -eq $true) "cim-walk-split-r11: (adversary r11 A4) a partial full read with the wrapper and another child cannot refuse the owner 7201 the filtered read finds (the merge base accepts it): $r11Txt"
+        Assert-True ($r11Out['r11A5'].spring -eq $false -and $r11Out['r11A5'].fall -eq $true) "cim-walk-split-r11: (adversary r11 A5) the exit-after-deadline verdict is decided in UTC across both DST changes: $r11Txt"
+        Assert-True ($r11Out['r11A6'].stopped -eq '4000') "cim-walk-split-r11: (adversary r11 A6) a held root with no readable start passes the tolerant root check and is stopped (the merge base stops it): $r11Txt"
+        Assert-True ($r11Out['r11A7'].maxBound -le 1 -and $r11Out['r11A7'].bounds -ne '') "cim-walk-split-r11: (adversary r11 A7) with 1.1 s of a 2 s budget left a supplemental read is bounded by 1 s, never 2: $r11Txt"
+        Assert-True ($r11Out['r11A8'].note -match 'DESCENDANT WALK FAILED' -and $r11Out['r11A8'].ok -eq $false) "cim-walk-split-r11: (adversary r11 A8) a due-now stop whose filtered children read fails names the failed census: $r11Txt"
+        Assert-True ($r11Out['r11A10'].ids -eq '4001' -and $r11Out['r11A10'].why -match 'ROOT ACCESS DENIED') "cim-walk-split-r11: (adversary r11 A10) the pinned walk keeps 4001 and its record names the failed root-row read: $r11Txt"
+        Assert-True ($r11Out['r11A11'].rootPid -eq 4000) "cim-walk-split-r11: (adversary r11 A11) a filtered walk publishes its own record, not a nested walk's: $r11Txt"
         Assert-True ($r11Out['regex'].lost -eq 1 -and $r11Out['regex'].ms -lt 3000) "cim-walk-split-r11: (sol r10 #8) 8,000 untagged prefixes with a refused append: the capture diagnostic is recovered and the check is bounded: $r11Txt"
         $results.cimWalkSplitR11 = $r11Out
     }

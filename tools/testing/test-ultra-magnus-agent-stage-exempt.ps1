@@ -69,9 +69,8 @@ $lift = @('Resolve-HeavySlotPython', 'Get-ProcessIdentity', 'Test-EpochMillisClo
     # r8 (sol r7 B5): Invoke-QueuedJob and Invoke-AdoptStartedJob tag their err-file diagnostics with tokens from this helper
     'New-JobDiagnosticTags')
 foreach ($name in $lift) { $fn = Find-Function $name; Assert-True ($null -ne $fn) "agent defines $name"; . ([scriptblock]::Create($fn.Extent.Text)) }
-# AGENT-JOB-MONITOR-CIM-WALK-1 r11 (sol r10 #1, #2): Invoke-QueuedJob's verdict and its lease and timeout stops call these; lifted when present, so an agent
-# without them still runs every case.
-foreach ($name in @('Test-JobExitedAfterDeadline', 'Get-DescendantProcessIdentitiesFiltered')) { $fn = Find-Function $name; if ($null -ne $fn) { . ([scriptblock]::Create($fn.Extent.Text)) } }
+# AGENT-JOB-MONITOR-CIM-WALK-1 r11 (sol r10 #1): Invoke-QueuedJob's normal-exit verdict calls it; lifted when present, so an agent without it still runs every case.
+foreach ($name in @('Test-JobExitedAfterDeadline')) { $fn = Find-Function $name; if ($null -ne $fn) { . ([scriptblock]::Create($fn.Extent.Text)) } }
 # The function under change: lifted when present, so a base agent runs every behavioural case and fails each on behaviour.
 $classifyFn = Find-Function 'Get-GateExemptClass'
 if ($null -ne $classifyFn) { . ([scriptblock]::Create($classifyFn.Extent.Text)) }
