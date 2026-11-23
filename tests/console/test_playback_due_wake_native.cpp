@@ -45,6 +45,12 @@
 #include <windows.h>
 #endif
 
+// PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 r10 (sol r9 B3 / luna key3 r9 B1): the timing-stamp seam is compiled only in this test
+// build (console_tests.pro DEFINES); the app build has none of it (SEAM1_TheTimingSeamIsCompiledOutOfTheAppBuild)
+#ifndef MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM
+#error "console_tests.pro must define MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM: these tests judge the PlaybackDueWake timing-stamp seam"
+#endif
+
 namespace
 {
 QString dueWakeRepoSource( const QString & relative )
@@ -140,6 +146,50 @@ QMap<QString, int> dueWakeClockCalls( const QString & code )
     QRegularExpressionMatchIterator it = clock.globalMatch( code );
     while( it.hasNext() ) ++calls[it.next().captured( 1 )];
     return calls;
+}
+
+// PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 r10 (sol r9 B3): the source as the APP build compiles it, where the seam macro is not
+// defined: each `#ifdef MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM` branch is cut (its own directives too) and its `#else` branch kept;
+// every other line, directive or not, is kept as it is (derive-r10.py in the r10 run dir: the same steps)
+QString dueWakeAppBuildView( const QString & source )
+{
+    struct Frame
+    {
+        bool seam;
+        bool inElse;
+    };
+    std::vector<Frame> frames;
+    QStringList kept;
+    for( const QString &line : source.split( QLatin1Char( '\n' ) ) )
+    {
+        const QString t = line.trimmed();
+        bool seamDirective = false;
+        if( t.startsWith( QLatin1Char( '#' ) ) )
+        {
+            const QString directive = t.mid( 1 ).trimmed();
+            if( directive.startsWith( QStringLiteral( "ifdef MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM" ) ) )
+            {
+                frames.push_back( { true, false } );
+                seamDirective = true;
+            }
+            else if( directive.startsWith( QStringLiteral( "if" ) ) ) frames.push_back( { false, false } );
+            else if( directive.startsWith( QStringLiteral( "el" ) ) && !frames.empty() && frames.back().seam )
+            {
+                frames.back().inElse = true;
+                seamDirective = true;
+            }
+            else if( directive.startsWith( QStringLiteral( "endif" ) ) && !frames.empty() )
+            {
+                seamDirective = frames.back().seam;
+                frames.pop_back();
+            }
+        }
+        if( seamDirective ) continue;
+        bool cut = false;
+        for( const Frame &frame : frames ) cut = cut || ( frame.seam && !frame.inElse );
+        if( !cut ) kept << line;
+    }
+    return kept.join( QLatin1Char( '\n' ) );
 }
 
 #ifdef Q_OS_WIN
@@ -2659,6 +2709,8 @@ struct R3A3Foreign
     int calls = 0;
     PlaybackGuiSleepTrace::At at { PlaybackGuiSleepTrace::State::Unknown, false, 0.0 };
     double handlerStartMs = -1.0;
+    double handlerEndMs = -1.0;                                       // r10 (sol r9 B2): the handler's own read as it returns
+    qint64 busyMs = 30;                                               // r10 (sol r9 B2): how long the handler works
 };
 R3A3Foreign *g_r3a3Foreign = nullptr;
 constexpr UINT kR3A3ForeignMessage = WM_USER + 0x52;
@@ -2673,7 +2725,8 @@ LRESULT CALLBACK r3a3ForeignProc( HWND hwnd, UINT message, WPARAM wParam, LPARAM
         QElapsedTimer busy;
         busy.start();
         volatile quint64 spin = 0;
-        while( busy.elapsed() < 30 ) ++spin;                      // >= 20 ms of real handler work
+        while( busy.elapsed() < g_r3a3Foreign->busyMs ) ++spin;   // >= 20 ms of real handler work
+        g_r3a3Foreign->handlerEndMs = dueWakeQpcNowMs();
         return 0;
     }
     return DefWindowProcW( hwnd, message, wParam, lParam );
@@ -2710,6 +2763,10 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
     // SEAM-1 (r7 adversary pass 12 A3): the cadence is judged on the product's own exit record (dueWakeObserveSleep) on every
     // sample the foreign send reached; the observation is repeated only for a send that missed the sleep
     wake.setTimingStampsForTest( true );
+    // r10 (sol r9 B2): the handler works 30 ms, and 72 ms (the catalogue's handler descheduled from ~10 to ~82 ms, the sleep
+    // running on to 150): the trace after the handler is read between the handler's OWN return and the sleep's return, never
+    // at a fixed offset from its start (handlerStartMs + 60 read Running inside a healthy 72 ms handler)
+    const auto observeForeign = [&]( qint64 busyMs ) {
     DueWakeSleepObservation foreignObservation { PlaybackDueWake::RunnerSleepExit::None, -1, false };
     bool judged = false;
     PlaybackGuiSleepTrace::At afterHandler { PlaybackGuiSleepTrace::State::Unknown, false, 0.0 };
@@ -2720,6 +2777,7 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
     {
         foreign = R3A3Foreign();
         foreign.wake = &wake;
+        foreign.busyMs = busyMs;
         wake.setGuiTraceActive( true );
         std::atomic<bool> sent { false };
         std::thread sender( [window, &sent]() {
@@ -2730,6 +2788,7 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
         QElapsedTimer t;
         t.start();
         slept = wake.sleepForSmokeRunner( 150, &dueWakeQpcNowS );
+        const double returnedMs = dueWakeQpcNowMs();                  // r10 (sol r9 B2): after the sleep's last trace note
         sleptMs = t.elapsed();
         sender.join();
         ASSERT_TRUE( dueWakeObserveSleep( wake, 150.0 ).met );        // SEAM-1 adversary pass A3: every sample, before the retry filter
@@ -2745,15 +2804,31 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
             PeekMessageW( &drain, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );
             continue;
         }
-        // after the sleep: the trace is back in RunnerSleep only while the runner really slept
-        afterHandler = wake.guiStateAt( foreign.handlerStartMs + 60.0 );
+        // r10 (sol r9 B2): the property "the sleep went back to RunnerSleep after the handler" exists only when the sleep had time
+        // left after its dispatch. On the product's own exit record, a dispatch that ran past the 150 ms left the loop at once
+        // (ExpiredAfterDispatch): no rest, nothing to observe, so that sample is observed again (its cadence was judged above).
+        // A sleep that did go on is judged on its trace between the handler's own return and the sleep's return (2 ms at least,
+        // so a rest of a few microseconds is not searched for at 10 us steps): somewhere in there it must read RunnerSleep.
+        const PlaybackDueWake::RunnerSleepExit sleepExit = wake.lastRunnerSleepExitForTest();
+        if( sleepExit == PlaybackDueWake::RunnerSleepExit::ExpiredAfterDispatch || !( foreign.handlerEndMs >= foreign.handlerStartMs )
+            || returnedMs - foreign.handlerEndMs < 2.0 )
+        {
+            wake.setGuiTraceActive( false );
+            continue;
+        }
+        afterHandler = wake.guiStateAt( ( foreign.handlerEndMs + returnedMs ) / 2.0 );   // reported if no RunnerSleep is found
+        for( double atMs = foreign.handlerEndMs; atMs <= returnedMs; atMs += 0.01 )
+        {
+            const PlaybackGuiSleepTrace::At at = wake.guiStateAt( atMs );
+            if( at.state != PlaybackGuiSleepTrace::State::RunnerSleep ) continue;
+            afterHandler = at;
+            break;
+        }
         wake.setGuiTraceActive( false );
         sentOk = sent.load();
         foreignObservation = dueWakeObserveSleep( wake, 150.0 );
         judged = true;
     }
-    g_r3a3Foreign = nullptr;
-    wake.setTimingStampsForTest( false );
     ASSERT_TRUE( judged );
     ASSERT_TRUE( sentOk );
     ASSERT_EQ( 1, foreign.calls );
@@ -2768,9 +2843,14 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
     ASSERT_TRUE( afterHandler.state == PlaybackGuiSleepTrace::State::RunnerSleep );
     // the handler's time is returned, so the caller's runner-sleep account excludes it
     const qint64 dispatchMs = wake.lastRunnerSleepDispatchNs() / 1000000;
-    ASSERT_TRUE( dispatchMs >= 28 );
+    ASSERT_TRUE( dispatchMs >= busyMs - 2 );
     ASSERT_TRUE( dispatchMs <= sleptMs );
     ASSERT_TRUE( sleptMs - dispatchMs <= 150 );
+    };
+    observeForeign( 30 );
+    observeForeign( 72 );                                              // r10 (sol r9 B2): the catalogue's long handler
+    g_r3a3Foreign = nullptr;
+    wake.setTimingStampsForTest( false );
     // a sleep that dispatched nothing returns 0
     ASSERT_TRUE( wake.sleepForSmokeRunner( 5 ) == PlaybackDueWake::RunnerSleep::Slept );
     ASSERT_EQ( static_cast<qint64>( 0 ), wake.lastRunnerSleepDispatchNs() );
@@ -3233,7 +3313,10 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     // configuration: a pump added only while the seam is off (a PeekMessageW in noteRunnerSleep( false ), armed and traced) ran
     // the handler before the old window's charge in no live case, since every judged sleep ran with the seam on. Off, the exit
     // record stays the setter's None / -1 (the seam records nothing) and every charge-order, window and span assertion is kept.
-    const auto judgeSentWait = [&]( bool armed, bool traced, bool stamped ) {
+    // r10 (sol r9 B1): and with a FOREIGN sent message first (`foreignFirst`: SendNotifyMessageW( window, WM_NULL ) at 8 ms, before
+    // the present at 20 ms), so the first dispatch is not the present's: the windows and the present's span are keyed on the
+    // dispatch the present's handler really ran in, never on dispatch 0
+    const auto judgeSentWait = [&]( bool armed, bool traced, bool stamped, bool foreignFirst ) {
     wake.setTimingStampsForTest( stamped );                           // also resets the exit record to None / -1
     std::unique_ptr<R17A1Windows> wp;
     std::vector<std::pair<double, double>> spans;
@@ -3262,7 +3345,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         g_r17A1ProbeRanMask = 0;
         std::fill( g_r17A1ProbeRunMs, g_r17A1ProbeRunMs + kR17A1MaxProbes, 0.0 );
         std::atomic<bool> sent { false };
-        std::thread sender( [window, &sent]() {
+        std::thread sender( [window, &sent, foreignFirst]() {
             const ULONGLONG giveUp = GetTickCount64() + 5000;
             bool entered = false;
             while( !entered && GetTickCount64() < giveUp )
@@ -3277,6 +3360,11 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
             // each send at an offset from the sender's own entry read, waited out on its clock (not a Sleep, whose granularity
             // could leave no probe near the end of the sleep)
             const auto waitUntil = []( double targetMs ) { while( dueWakeQpcNowMs() < targetMs ) Sleep( 0 ); };
+            if( foreignFirst )
+            {
+                waitUntil( seenMs + 8.0 );
+                SendNotifyMessageW( window, WM_NULL, 0, 0 );                // r10 (sol r9 B1): a foreign dispatch before the present
+            }
             waitUntil( seenMs + 20.0 );
             sent = SendNotifyMessageW( window, kR17A1ForeignMessage, 0, 0 ) != 0;
             WPARAM i = 0;
@@ -3353,6 +3441,22 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     // sink was handed those very endpoints, so a sink call shifted in time is caught too.
     // r7 (sol review r6, hardening): an EMPTY segment (a dispatch ending at the read the next begins at, or at the return) is
     // never handed out (PlaybackRunnerSleepSegments::take), so the expectation is built from the reads, not from dispatches + 1
+    // r10 (sol r9 B1): the window a segment belongs to is keyed on the dispatch the PRESENT's handler ran in -- the one recorded
+    // span that holds both of the handler's own reads -- never on dispatch 0: a foreign sent message (WM_NULL at 8 ms) dispatched
+    // before the present at 20 ms leaves window 0 open, so segments 0..presentDispatch go to window 0 and every later one to 1.
+    // The 50 ns round-trip tolerance is assertChargedBeforeHandler's below; spans are disjoint, so a ~2 ms handler fits one only.
+    constexpr double kPresentRoundTripMs = 0.00005;
+    size_t presentDispatch = dispatches;
+    size_t presentMatches = 0;
+    for( size_t k = 0; k < dispatches; ++k )
+    {
+        if( spans[k].first * 1000.0 <= handlerStartMs + kPresentRoundTripMs && handlerEndMs <= spans[k].second * 1000.0 + kPresentRoundTripMs )
+        {
+            presentDispatch = k;
+            ++presentMatches;
+        }
+    }
+    ASSERT_EQ( static_cast<size_t>( 1 ), presentMatches );            // the present ran inside exactly one dispatch the sleep recorded
     const size_t kNoSegment = static_cast<size_t>( -1 );
     std::vector<size_t> segmentOfDispatch( dispatches, kNoSegment );   // the segment the sink was handed when dispatch k began
     double chargedOld = 0.0;
@@ -3365,11 +3469,11 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         if( !( segmentEndS > segmentStartS ) ) continue;               // empty: never handed out
         ASSERT_TRUE( handed < w.segs.size() );
         const R17A1Windows::Segment &seg = w.segs[handed];
-        ASSERT_EQ( i == 0 ? 0 : 1, seg.window );
+        ASSERT_EQ( i <= presentDispatch ? 0 : 1, seg.window );          // r10 (sol r9 B1): before the present's dispatch, window 0
         ASSERT_TRUE( std::fabs( seg.startS - segmentStartS ) < 1e-9 );
         ASSERT_TRUE( std::fabs( seg.endS - segmentEndS ) < 1e-9 );
         if( i < dispatches ) segmentOfDispatch[i] = handed;
-        if( i == 0 ) chargedOld += segmentEndS - segmentStartS;
+        if( i <= presentDispatch ) chargedOld += segmentEndS - segmentStartS;
         else chargedNew += segmentEndS - segmentStartS;
         ++handed;
     }
@@ -3417,15 +3521,18 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         dispatchSpanS += spans[i].second - spans[i].first;
     }
     ASSERT_TRUE( std::fabs( w.chargedS[0] + w.chargedS[1] + dispatchSpanS - ( returnS - entryS ) ) < 1e-8 );
-    // the first dispatch span sits inside the handler's own reads' bracket: it began before the handler and ended after it
-    ASSERT_TRUE( spans[0].first * 1000.0 <= handlerStartMs + 0.5 );
-    ASSERT_TRUE( spans[0].second * 1000.0 >= handlerEndMs - 0.5 );
+    // the present's dispatch span sits inside the handler's own reads' bracket: it began before the handler and ended after it
+    // (r10, sol r9 B1: the present's span, which is dispatch 0 only when no other sent message came first)
+    ASSERT_TRUE( spans[presentDispatch].first * 1000.0 <= handlerStartMs + 0.5 );
+    ASSERT_TRUE( spans[presentDispatch].second * 1000.0 >= handlerEndMs - 0.5 );
     };
     for( const bool stamped : { false, true } )                       // SEAM-1 r4 (pass 3 A1): the production seam-off configuration first
     {
-        judgeSentWait( false, false, stamped );                        // the wake idle: at least one judged attempt
-        judgeSentWait( true, false, stamped );                         // SEAM-1 A4: the wake armed: at least one judged attempt
-        judgeSentWait( true, true, stamped );                          // pass 2 A2: armed with the GUI trace on
+        judgeSentWait( false, false, stamped, false );                 // the wake idle: at least one judged attempt
+        judgeSentWait( true, false, stamped, false );                  // SEAM-1 A4: the wake armed: at least one judged attempt
+        judgeSentWait( true, true, stamped, false );                   // pass 2 A2: armed with the GUI trace on
+        judgeSentWait( false, false, stamped, true );                  // r10 (sol r9 B1): a foreign WM_NULL dispatched before the present
+        judgeSentWait( true, true, stamped, true );                    // ...armed, traced
     }
     wake.setTimingStampsForTest( false );
     // a sleep no dispatch cuts is one segment, charged to the window open at its end; NotHandled hands out none
@@ -3488,7 +3595,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheRunnerSleepChargesEverySegmentThroughOneSinkA
     // lines, nothing between them; (2) the body calls exactly three dispatch* functions (dispatchBegins, dispatchPendingSentMessages,
     // dispatchEnded) and sets the in-dispatch flag exactly twice; (3) the body never reads the wake's arm state or gate, and names
     // its parameters only where it always did (derived, code only: segmentContext 4 -- signature, lambda capture, the sink call,
-    // Q_UNUSED; ms 4 -- signature, the two waitMs clamps, Q_UNUSED; waitMs 6). The live fixture also judges an armed sleep.
+    // Q_UNUSED; ms 4 -- signature, the two waitMs clamps, Q_UNUSED; waitMs 8, see below). The live fixture also judges an armed sleep.
     const QString code = dueWakeCodeOnly( sleep );
     QStringList codeLines;
     for( const QString &raw : code.split( QLatin1Char( '\n' ) ) )
@@ -3510,7 +3617,8 @@ TEST(PlaybackDueWakeSend, R17A1_TheRunnerSleepChargesEverySegmentThroughOneSinkA
     ASSERT_EQ( 0, code.count( QRegularExpression( QStringLiteral( "\\bgate\\b" ) ) ) );
     ASSERT_EQ( 4, code.count( QRegularExpression( QStringLiteral( "\\bsegmentContext\\b" ) ) ) );
     ASSERT_EQ( 4, code.count( QRegularExpression( QStringLiteral( "\\bms\\b" ) ) ) );
-    ASSERT_EQ( 6, code.count( QRegularExpression( QStringLiteral( "\\bwaitMs\\b" ) ) ) );
+    // r10 (sol r9 B3): 6 in the seam build, plus master's two hasExpired( waitMs ) checks kept as the app build's #else branches
+    ASSERT_EQ( 8, code.count( QRegularExpression( QStringLiteral( "\\bwaitMs\\b" ) ) ) );
     const QString mainWindow = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
     const QString helper = functionBody( mainWindow, QStringLiteral( "void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )" ),
                                          QStringLiteral( "void MainWindow::waitGuiThreadForSmokeEvents( int maxMs )" ) );
@@ -3578,6 +3686,8 @@ TEST(PlaybackDueWakeSend, SEAM1_TheTimingStampSeamIsOffByDefaultAndAddsNoClockRe
     expectedSleepClock[QStringLiteral( "spanNowS" )] = 4;
     expectedSleepClock[QStringLiteral( "nowS" )] = 1;
     expectedSleepClock[QStringLiteral( "nowNs" )] = 1;
+    // r10 (sol r9 B3): and master's two hasExpired expiry checks, now the app build's #else branches of the two checkMs reads
+    expectedSleepClock[QStringLiteral( "hasExpired" )] = 2;
     ASSERT_TRUE( sleepClock == expectedSleepClock );
     // ...and in the native delivery: the gate's one nowNs() read, nothing else (the stamp records the wait thread's own stamp)
     const QString deliver = functionBody( wakeSource, QStringLiteral( "    void deliverGeneration( quint32 generation, qint64 postTicks = 0, qint64 returnTicks = 0 )" ),
@@ -3596,8 +3706,9 @@ TEST(PlaybackDueWakeSend, SEAM1_TheTimingStampSeamIsOffByDefaultAndAddsNoClockRe
     const auto codeDigest = []( const QString & body ) {
         return QString::fromLatin1( QCryptographicHash::hash( dueWakeCodeOnly( body ).simplified().toUtf8(), QCryptographicHash::Sha256 ).toHex() );
     };
-    ASSERT_EQ( std::string( "262e9b0058ff985081ddbea1fbeac5403928f29396f78d3a9550a73f04edb1be" ), codeDigest( sleep ).toStdString() );
-    ASSERT_EQ( std::string( "230d95689ea43cc78f7f8df773d76aa461b292dad4f679a11a610375268bcc65" ), codeDigest( deliver ).toStdString() );
+    // r10 (sol r9 B3): re-derived with derive-r10.py (r10 run dir) after the seam lines moved under MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM
+    ASSERT_EQ( std::string( "da17a9e49544bbd04c0a1af2c1114ab6a7f7964b7c786e1ccc7f26a7354c3f76" ), codeDigest( sleep ).toStdString() );
+    ASSERT_EQ( std::string( "019ed08c0c559717f483eed8b7a95e4f03645991724d5b506061752a0b471892" ), codeDigest( deliver ).toStdString() );
     // ...and outside the two bodies, the file-wide names a wrapper or a macro would have to reuse (code only): the one wait call,
     // dispatchPendingSentMessages' definition and its two callers (the runner sleep, dispatchSentMessages), the three QPC reads
     // (frequency aside) the wait thread and the clock make, and the file's one #define
@@ -3609,7 +3720,10 @@ TEST(PlaybackDueWakeSend, SEAM1_TheTimingStampSeamIsOffByDefaultAndAddsNoClockRe
     ASSERT_EQ( 2, sleep.count( QStringLiteral( "const qint64 checkMs = slept.elapsed();" ) ) );
     ASSERT_EQ( 2, unflaggedExitStores );                                // the noteExit lambda's two stores, run only under the flag
     ASSERT_EQ( 1, sleep.count( QStringLiteral( "const auto noteExit = [this]( RunnerSleepExit exit, qint64 elapsedMs )" ) ) );
-    ASSERT_EQ( 0, sleep.count( QStringLiteral( "hasExpired(" ) ) );
+    // r10 (sol r9 B3): master's two hasExpired checks, kept verbatim as the #else (app build) branches of the two checkMs reads
+    ASSERT_EQ( 2, sleep.count( QStringLiteral( "#else\n            if( slept.hasExpired( static_cast<qint64>( waitMs ) ) ) break;\n#endif" ) )
+                  + sleep.count( QStringLiteral( "#else\n        if( slept.hasExpired( static_cast<qint64>( waitMs ) ) ) break;\n#endif" ) ) );
+    ASSERT_EQ( 2, sleep.count( QStringLiteral( "hasExpired(" ) ) );
     ASSERT_EQ( 2, sleep.count( QStringLiteral( "if( static_cast<quint64>( checkMs ) > static_cast<quint64>( waitMs ) )" ) ) );
     // the delivery's pre-send stamp record: written only under the Impl's flag, outside the setter and the declaration
     int stampStores = 0;
@@ -3666,6 +3780,60 @@ TEST(PlaybackDueWakeSend, SEAM1_TheTimingStampSeamIsOffByDefaultAndAddsNoClockRe
 #endif
 }
 
+TEST(PlaybackDueWakeSend, SEAM1_TheTimingSeamIsCompiledOutOfTheAppBuild)
+{
+    // PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 r10 (sol r9 B3 / luna key3 r9 B1, the round-tail ruling's step 5): with the flag off the
+    // seam still ran its flag loads and branches on the production path (two per accepted native delivery, up to three per runner
+    // sleep). The off path must execute nothing beyond master's, so the seam is compiled only where MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM
+    // is defined (console_tests.pro), and the app build compiles master's source: the source as the app build sees it (each seam
+    // #ifdef branch cut, its #else kept: dueWakeAppBuildView), comment-free and whitespace-collapsed, IS fork/master's, by SHA-256
+    // (derive-r10.py in the r10 run dir, fork/master 2b796198 -- re-derive when master edits either file). The disassembly of the
+    // app build's object against master's is in the r10 run dir (disasm-*.txt).
+    const QString cpp = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
+    const QString hdr = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.h" ) );
+    ASSERT_FALSE( cpp.isEmpty() );
+    ASSERT_FALSE( hdr.isEmpty() );
+    const auto appDigest = []( const QString & source ) {
+        return QString::fromLatin1( QCryptographicHash::hash( dueWakeNoComments( dueWakeAppBuildView( source ) ).simplified().toUtf8(),
+                                                              QCryptographicHash::Sha256 ).toHex() );
+    };
+    ASSERT_EQ( std::string( "ae2cad7bc536d51b2727a890c90d0031475099768c01878126631c4f1d0eb69a" ), appDigest( cpp ).toStdString() );
+    ASSERT_EQ( std::string( "2a6f46a2041befe951831158c9be6ada9414907bd86b415c395b1809f31bf5fd" ), appDigest( hdr ).toStdString() );
+    // ...so no seam name reaches the app build (the digest says it; this names the class directly)
+    const QString appCode = dueWakeNoComments( dueWakeAppBuildView( cpp ) ) + dueWakeNoComments( dueWakeAppBuildView( hdr ) );
+    for( const char *name : { "timingStampsForTest", "noteExit", "RunnerSleepExit", "runnerSleepExitForTest", "runnerSleepExitElapsedMsForTest",
+                              "firingFirstStampMsForTest", "checkMs", "setTimingStampsForTest", "lastRunnerSleepExitForTest",
+                              "lastRunnerSleepExitElapsedMsForTest", "lastDeliveryFirstStampMsForTest" } )
+        ASSERT_EQ( 0, appCode.count( QRegularExpression( QStringLiteral( "\\b%1\\b" ).arg( QString::fromLatin1( name ) ) ) ) );
+    // the macro is named only by plain #ifdef lines (an #ifndef, #if defined(...) or #define of it is outside the view's model)
+    for( const QString *source : { &cpp, &hdr } )
+    {
+        for( const QString &raw : source->split( QLatin1Char( '\n' ) ) )
+        {
+            const QString line = raw.trimmed();
+            if( !line.contains( QStringLiteral( "MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM" ) ) || line.startsWith( QStringLiteral( "//" ) ) ) continue;
+            ASSERT_TRUE( line == QStringLiteral( "#ifdef MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM" ) );
+        }
+    }
+    // the Impl's fields, the delivery's two stamp writes, the sleep's six (entry reset + noteExit, then one per way out of its
+    // loop), and one around the setter's and the three getters' definitions
+    ASSERT_EQ( 10, cpp.count( QStringLiteral( "\n#ifdef MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM\n" ) ) );
+    ASSERT_EQ( 1, hdr.count( QStringLiteral( "\n#ifdef MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM\n" ) ) );
+    // only the console test build defines it; the app's project never does
+    const QString appPro = dueWakeRepoSource( QStringLiteral( "platform/qt/MLVApp.pro" ) );
+    const QString testPro = dueWakeRepoSource( QStringLiteral( "tests/console/console_tests.pro" ) );
+    ASSERT_FALSE( appPro.isEmpty() );
+    ASSERT_FALSE( testPro.isEmpty() );
+    ASSERT_FALSE( appPro.contains( QStringLiteral( "MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM" ) ) );
+    ASSERT_EQ( 1, testPro.count( QStringLiteral( "\nDEFINES += MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM\n" ) ) );
+    // the view itself: a seam branch is cut with its directives, its #else kept, a nested plain #if inside it cut too
+    ASSERT_EQ( std::string( "a\nkeep\nz" ),
+               dueWakeAppBuildView( QStringLiteral( "a\n#ifdef MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM\nseam\n#ifdef Q_OS_WIN\nw\n#endif\n#else\nkeep\n#endif\nz" ) )
+                   .toStdString() );
+    ASSERT_EQ( std::string( "#ifdef Q_OS_WIN\nw\n#else\nv\n#endif" ),
+               dueWakeAppBuildView( QStringLiteral( "#ifdef Q_OS_WIN\nw\n#else\nv\n#endif" ) ).toStdString() );
+}
+
 TEST(PlaybackDueWakeSend, SEAM1_TheRunnerSleepCallClosureIsPinnedAndRunsNoMessagePumpBeforeItsCharge)
 {
     // PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 r4 (adversary pass 3 A1 on 91820e1e): a PeekMessageW( &pending, ..., PM_QS_SENDMESSAGE )
@@ -3697,7 +3865,7 @@ TEST(PlaybackDueWakeSend, SEAM1_TheRunnerSleepCallClosureIsPinnedAndRunsNoMessag
     static const ClosureBody kClosure[] = {
         { "sleepForSmokeRunner", false, "PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner(",
           "qint64 PlaybackDueWake::lastRunnerSleepDispatchNs() const",
-          "262e9b0058ff985081ddbea1fbeac5403928f29396f78d3a9550a73f04edb1be", "MsgWaitForMultipleObjectsEx=1,dispatchPendingSentMessages=1" },
+          "da17a9e49544bbd04c0a1af2c1114ab6a7f7964b7c786e1ccc7f26a7354c3f76", "MsgWaitForMultipleObjectsEx=1,dispatchPendingSentMessages=1" },
         { "sendsNotify", false, "bool PlaybackDueWake::sendsNotify() const", "PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner(",
           "fac07298323f6e29dc2a9a25e2a8d2aab74fac1b9c68db12dc48fde59390f122", "" },
         { "noteRunnerSleep", false, "void PlaybackDueWake::noteRunnerSleep( bool sleeping )",
@@ -3761,7 +3929,7 @@ TEST(PlaybackDueWakeSend, SEAM1_TheRunnerSleepCallClosureIsPinnedAndRunsNoMessag
     // QElapsedTimer start / elapsed / nsecsElapsed and QThread::msleep, std max / llround and the vector's clear / size / emplace_back
     ASSERT_EQ( std::string( "GetQueueStatus,HIWORD,MsgWaitForMultipleObjectsEx,PeekMessageW,PlaybackRunnerSleepSegments,Q_UNUSED,"
                             "QueryPerformanceCounter,chargeSegment,clear,dispatchBegins,dispatchEnded,dispatchPendingSentMessages,double,"
-                            "elapsed,emplace_back,llround,max,msleep,note,noteExit,noteRunnerSleep,nowMs,nowNs,nowS,nsecsElapsed,"
+                            "elapsed,emplace_back,hasExpired,llround,max,msleep,note,noteExit,noteRunnerSleep,nowMs,nowNs,nowS,nsecsElapsed,"
                             "segmentSink,segmentStartS,segments,sendsNotify,size,sleepEnds,sleepForSmokeRunner,slot,spanNowS,start,take,"
                             "ticksToNs" ),
                calls.join( QLatin1Char( ',' ) ).toStdString() );
