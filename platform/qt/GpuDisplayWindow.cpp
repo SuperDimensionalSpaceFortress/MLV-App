@@ -2142,6 +2142,15 @@ void GpuDisplayWindow::initializeGL()
     }
     // PLAYBACK-VSYNC-DEFAULT-1: refreshed on every (re)initialization, read with the context current.
     m_wglGetSwapIntervalExt = context() ? context()->getProcAddress("wglGetSwapIntervalEXT") : nullptr;
+    // LOOK-LABEL-PLAYBACK-INFO-2 r6 (adversary pass-8 A9): rendererDescription() feeds presented-frame renderer telemetry, so it
+    // follows every (re)initialized context; only the log line below is once per window.
+    if ( context() )
+    {
+        const GLubyte *currentRenderer = glGetString(GL_RENDERER);
+        m_rendererDescription = currentRenderer
+            ? QString::fromLatin1(reinterpret_cast<const char *>(currentRenderer))
+            : QStringLiteral("unknown");
+    }
 
     if ( m_loggedContext ) return;
 

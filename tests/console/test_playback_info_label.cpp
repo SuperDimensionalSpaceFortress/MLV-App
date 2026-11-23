@@ -1596,6 +1596,36 @@ TEST(PlaybackInfoLabel, InfoTwoR6A3RendererTelemetryNamesTheObservedRendererNotA
     ASSERT_TRUE(recorded.contains(QStringLiteral("m_lastPresentedGpuAmazeRendererDescription = readyFrame.gpuAmazeRendererDescription;")));
 }
 
+// INFO-2 r6 (adversary pass-8 A9, MainWindow.cpp:7238 via GpuDisplayViewport.cpp:1002 / GpuDisplayWindow.cpp:2146): the renderer the
+// r6 A3 sites read is cached by initializeGL, which returned before the assignment once its first context was logged. A replacement
+// context (NVIDIA destroyed, Intel UHD re-initialized) kept reporting the first GL_RENDERER. Both surfaces now refresh it on every
+// (re)initialization, before the once-per-surface log return.
+TEST(PlaybackInfoLabel, InfoTwoR6A9TheRendererDescriptionFollowsEveryReinitializedContext)
+{
+    const QString loggedReturn = QStringLiteral("if ( m_loggedContext ) return;");
+    const QString assignment = QStringLiteral("m_rendererDescription = currentRenderer");
+    const QStringList files = {QStringLiteral("platform/qt/GpuDisplayViewport.cpp"), QStringLiteral("platform/qt/GpuDisplayWindow.cpp")};
+    const QStringList signatures = {QStringLiteral("void GpuDisplayViewport::initializeGL("), QStringLiteral("void GpuDisplayWindow::initializeGL(")};
+    for ( int i = 0; i < files.size(); ++i )
+    {
+        const QString body = functionBody(readRepoFile(files.at(i)), signatures.at(i));
+        ASSERT_FALSE(body.isEmpty());
+        const int returnAt = body.indexOf(loggedReturn);
+        ASSERT_TRUE(returnAt >= 0);
+        const int refreshAt = body.indexOf(assignment);
+        ASSERT_TRUE(refreshAt >= 0);
+        ASSERT_TRUE(refreshAt < returnAt);   // refreshed on a re-initialized context, not only on the first one
+        ASSERT_TRUE(body.mid(0, refreshAt).contains(QStringLiteral("glGetString(GL_RENDERER)")));
+    }
+    // the two getters the r6 A3 sites call read exactly that member
+    ASSERT_TRUE(functionBody(readRepoFile(QStringLiteral("platform/qt/GpuDisplayViewport.cpp")),
+                             QStringLiteral("QString GpuDisplayViewport::rendererDescriptionFor("))
+                    .contains(QStringLiteral("viewport->m_rendererDescription")));
+    ASSERT_TRUE(functionBody(readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp")),
+                             QStringLiteral("QString GpuDisplayWindow::rendererDescription("))
+                    .contains(QStringLiteral("win->m_rendererDescription")));
+}
+
 // r21 (Grok G2): togglesFromSettings reads the six Show* keys, each default true, from the app's settings store; MainWindow's
 // settings load and the Edit-settings reload both call it. An isolated INI store (automation_settings) keeps the test off the registry.
 TEST(PlaybackInfoLabel, R21G2TogglesFromSettingsReadsTheSixKeysWithDefaultTrueAndTheLoadPathCallsIt)

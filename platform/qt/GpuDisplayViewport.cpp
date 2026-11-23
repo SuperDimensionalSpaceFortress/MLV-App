@@ -999,6 +999,17 @@ void GpuDisplayViewport::initializeGL()
         });
     }
 
+    // LOOK-LABEL-PLAYBACK-INFO-2 r6 (adversary pass-8 A9): presented-frame renderer telemetry reads m_rendererDescription
+    // (rendererDescriptionFor), so it follows every (re)initialized context; only the log line below is once per widget.
+    if ( QOpenGLContext *currentContext = context() )
+    {
+        QOpenGLFunctions *currentFunctions = currentContext->functions();
+        const GLubyte *currentRenderer = currentFunctions ? currentFunctions->glGetString(GL_RENDERER) : nullptr;
+        m_rendererDescription = currentRenderer
+            ? QString::fromLatin1(reinterpret_cast<const char *>(currentRenderer))
+            : QStringLiteral("unknown");
+    }
+
     if ( m_loggedContext ) return;
 
     QOpenGLContext *glContext = context();
