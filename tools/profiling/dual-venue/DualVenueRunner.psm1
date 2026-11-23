@@ -470,7 +470,9 @@ function Invoke-DvGit {
     # The repo is the one at $RepoRoot and nothing else: a GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE / object-store override in the
     # caller's environment would point git at a scratch repo whose "committed" files are whatever the caller wrote, and a replace
     # ref would swap a blob for another one under the same id (--no-replace-objects).
-    foreach ($name in @($psi.Environment.Keys | Where-Object { $_ -match '^GIT_(DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|COMMON_DIR|NAMESPACE|REPLACE_REF_BASE|NO_REPLACE_OBJECTS)$' })) { [void]$psi.Environment.Remove($name) }
+    # (EXPORT-RENDER-PIPE-TIMING-1 r2 fix 2, adversary A6 on c2da7e24: and no GIT_TRACE* variable, which makes git APPEND its trace to a file the caller names -- a read-only
+    # reader such as Get-DvExportEvidence must write nothing; tools/coordination/lane-dirty-save.ps1 suppresses the same side effect)
+    foreach ($name in @($psi.Environment.Keys | Where-Object { $_ -match '^GIT_(DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|COMMON_DIR|NAMESPACE|REPLACE_REF_BASE|NO_REPLACE_OBJECTS)$' -or $_ -match '^GIT_TRACE' })) { [void]$psi.Environment.Remove($name) }
     foreach ($a in (@('--no-replace-objects', '-C', $RepoRoot) + $GitArgs)) { [void]$psi.ArgumentList.Add($a) }
     $limit = Get-DvGitTimeoutMilliseconds
     # A fresh tag per call, inherited by everything git starts: how Stop-DvGitCall finds those children on Linux once their parent is gone.
@@ -5215,7 +5217,10 @@ function Get-DvRenderPipeBuildClass {
     param([AllowNull()][AllowEmptyString()][string]$BuildId, [string]$RepoRoot = '')
     if ([string]::IsNullOrEmpty($RepoRoot)) { $RepoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..')) }
     # (r2 fix 1, pass 4 A4: git and the runner accept a commit id in either case, so one build is one class however it is spelled)
-    if ([string]$BuildId -cnotmatch '^[0-9a-fA-F]{40}$') { return 'unknown' }
+    # (r2 fix 2, adversary A4 on c2da7e24: \z, not $, which also matched before a trailing newline; an id that is present but not one 40-hex token is 'malformed', which
+    # the reader types, never 'unknown')
+    if ([string]::IsNullOrEmpty($BuildId)) { return 'unknown' }
+    if ([string]$BuildId -cnotmatch '\A[0-9a-fA-F]{40}\z') { return 'malformed' }
     $BuildId = $BuildId.ToLowerInvariant()
     $key = "$RepoRoot|$BuildId|$($script:RenderPipeMarkerPath)"
     if ($script:RenderPipeBuildClassCache.ContainsKey($key)) { return $script:RenderPipeBuildClassCache[$key] }
@@ -5224,8 +5229,14 @@ function Get-DvRenderPipeBuildClass {
     $kind = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('cat-file', '-t', $BuildId)
     if ($kind.exitCode -ne 0 -or ([Text.Encoding]::ASCII.GetString($kind.bytes)).Trim() -cne 'commit') { return 'unknown' }
     $blob = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('cat-file', '-p', "${BuildId}:$($script:RenderPipeMarkerPath)")
-    if ($blob.exitCode -ne 0) { return 'unknown' }
-    $class = $(if ((ConvertTo-DvText $blob.bytes).Contains($script:RenderPipeMarker)) { 'emits' } else { 'older' })
+    if ($blob.exitCode -eq 0) { $class = $(if ((ConvertTo-DvText $blob.bytes).Contains($script:RenderPipeMarker)) { 'emits' } else { 'older' }) }
+    else {
+        # (r2 fix 2, adversary A4 on c2da7e24: a commit whose tree git READ and found without the header is a build before stage timing, so 'older'; a tree that lists it or
+        # that git could not read is still 'unknown')
+        $tree = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('ls-tree', '--name-only', $BuildId, '--', $script:RenderPipeMarkerPath)
+        if ($tree.exitCode -ne 0 -or ([Text.Encoding]::ASCII.GetString($tree.bytes)).Trim().Length -gt 0) { return 'unknown' }
+        $class = 'older'
+    }
     $script:RenderPipeBuildClassCache[$key] = $class
     $class
 }
@@ -5260,17 +5271,21 @@ function Test-DvExportStageLogRecords {
         if (-not $hit.Success) { $why = 'is not one record of the form frame=N stage=NAME ms=NUMBER'; $prev = $null }
         else {
             $ms = [double]::Parse($hit.Groups['ms'].Value, [Globalization.CultureInfo]::InvariantCulture)
+            # (r2 fix 2, adversary A5 on c2da7e24: the record's EXACT figure, [decimal] from its text: the ceiling is held on it (86400000.000000001 parsed to a double rounds onto
+            # the ceiling), and the clip stages are summed from it, so a wall limit is never met by digits the double dropped)
+            $msD = [decimal]::Parse($hit.Groups['ms'].Value, [Globalization.CultureInfo]::InvariantCulture)
             $why = Get-DvExportTimingProblem $ms
+            if ($null -eq $why -and $msD -gt [decimal]$script:ExportTimingMaxMs) { $why = "is past the $($script:ExportTimingMaxMs) ms ceiling" }
             if ($null -ne $why) { $prev = $null }
             if ($null -eq $why) {
                 $s = $hit.Groups['s'].Value
                 $f = $hit.Groups['f'].Value.TrimStart('0'); if ($f -eq '') { $f = '0' }
                 $before = $prev
                 $prev = [pscustomobject]@{ stage = $s; frame = $f; msText = $hit.Groups['ms'].Value; line = $lineNo }
-                if ($clipRecords.ContainsKey($s)) { $clipRecords[$s].Add([pscustomobject]@{ frame = $f; ms = $ms; line = $lineNo }); continue }
+                if ($clipRecords.ContainsKey($s)) { $clipRecords[$s].Add([pscustomobject]@{ frame = $f; ms = $ms; msD = $msD; line = $lineNo }); continue }
                 $lastPerFrameLine = $lineNo   # (r2 fix 1, pass 4 A1: ANY per-frame record, a stage this reader does not table included; the producer writes none after the drain)
+                $seq.Add([pscustomobject]@{ stage = $s; frame = $f; line = $lineNo })   # (r2 fix 2, adversary A1 on c2da7e24: untabled stages are frame records too)
                 if (-not $perStage.ContainsKey($s)) { continue }
-                $seq.Add([pscustomobject]@{ stage = $s; frame = $f; line = $lineNo })
                 if ($s -ceq 'llrawproc_dual_iso') { $dualRecs.Add([pscustomobject]@{ frame = $f; msText = $hit.Groups['ms'].Value; line = $lineNo; after = $before }) }
                 $perStage[$s][$f] = $(if ($perStage[$s].ContainsKey($f)) { $perStage[$s][$f] + $ms } else { $ms })
                 $recCount[$s][$f] = 1 + $(if ($recCount[$s].ContainsKey($f)) { $recCount[$s][$f] } else { 0 })
@@ -5316,20 +5331,30 @@ function Test-DvExportStageLogRecords {
     # r2 fix 1 (adversary A2 on 2bd239b8): the frame loop (BatchRunner.cpp:541-567) renders a frame (processed16_total last), then scales it when the plan is scaled, then
     # writes it to the pipe, and only then starts the next frame, in rising order. When the log carries the pipe or scale stage, that sequence is held: no pipe write or scale
     # before its frame's processed16_total, no scale after its pipe write, no record of a frame after its pipe write, and each frame closed before the next one renders.
+    # (r2 fix 2, adversary A1 on c2da7e24: as ONE block per frame. video_mlv.c notes processed16_total right after processing, last of the render (video_mlv.c:7656-7661), so after
+    # it only that frame's export_scale and then its export_pipe_write follow; a frame's first record opens its block, and no record of another frame comes before the write closes it)
     if (@($seq | Where-Object { $_.stage -ceq 'export_pipe_write' -or $_.stage -ceq 'export_scale' }).Count -gt 0) {
-        $order = $null; $rendered = @{}; $closed = @{}; $scaledF = @{}; $lastP16 = $null
+        $order = $null; $closed = @{}; $open = $null; $p16Done = $false; $scaleDone = $false; $lastClosed = $null
         foreach ($r in $seq) {
-            $fi = [int64]$r.frame
-            if ($closed.ContainsKey($r.frame)) { $order = "line $($r.line) records $($r.stage) for frame $($r.frame) after that frame's export_pipe_write"; break }
-            if ($r.stage -ceq 'export_pipe_write' -or $r.stage -ceq 'export_scale') {
-                if (-not $rendered.ContainsKey($r.frame)) { $order = "line $($r.line) records $($r.stage) for frame $($r.frame) before that frame's processed16_total"; break }
-                if ($r.stage -ceq 'export_scale') { $scaledF[$r.frame] = $true } else { $closed[$r.frame] = $true }
-                continue
+            $at = "line $($r.line) records $($r.stage) for frame $($r.frame)"
+            if ($closed.ContainsKey($r.frame)) { $order = "$at after that frame's export_pipe_write"; break }
+            $isWrite = $r.stage -ceq 'export_pipe_write'; $isScale = $r.stage -ceq 'export_scale'
+            if ($null -eq $open) {
+                if ($isWrite -or $isScale) { $order = "$at before that frame's processed16_total"; break }
+                if ($null -ne $lastClosed -and [int64]$r.frame -le $lastClosed) { $order = "$at after frame $lastClosed was written (frames run one at a time in rising order)"; break }
+                $open = $r.frame; $p16Done = $false; $scaleDone = $false
             }
-            if ($r.stage -ceq 'processed16_total') {
-                if ($null -ne $lastP16 -and ($fi -le $lastP16 -or -not $closed.ContainsKey([string]$lastP16))) { $order = "line $($r.line) renders frame $($r.frame) after frame $lastP16 (frames run one at a time in rising order, each written before the next)"; break }
-                $rendered[$r.frame] = $true; $lastP16 = $fi
+            elseif ($r.frame -cne $open) { $order = "$at while frame $open is not yet written (each frame is written before the next one renders)"; break }
+            if ($isWrite) {
+                if (-not $p16Done) { $order = "$at before that frame's processed16_total"; break }
+                $closed[$open] = $true; $lastClosed = [int64]$open; $open = $null
             }
+            elseif ($isScale) {
+                if (-not $p16Done -or $scaleDone) { $order = "$at $(if ($scaleDone) { 'twice' } else { "before that frame's processed16_total" })"; break }
+                $scaleDone = $true
+            }
+            elseif ($r.stage -ceq 'processed16_total') { $p16Done = $true }
+            elseif ($p16Done) { $order = "$at after that frame's processed16_total (the render's last note)"; break }
         }
         if ($null -ne $order) { $problems.Add("EXPORT_RECORD_INVALID: stage-timing.log is not in the frame loop's order (render, then export_scale, then export_pipe_write, frame by frame): $order") }
     }
@@ -5539,7 +5564,7 @@ function Get-DvExportEvidence {
             # EXPORT-RENDER-PIPE-TIMING-1: the TIMED per-frame work is processed16_total plus the per-frame pipe stages plus the once-per-clip stages spread over the exported
             # frames. A log with none of the pipe stages (a build before that card) times processed16_total alone, exactly as before.
             $pipePresent = (@($script:ExportRenderedOutsideDenominator | Where-Object { $perStage[$_].Count -gt 0 }).Count + @($script:ExportRenderedClipStages | Where-Object { $clipRecords[$_].Count -gt 0 }).Count) -gt 0
-            $clipSumMs = [decimal]0; foreach ($name in $script:ExportRenderedClipStages) { foreach ($r in $clipRecords[$name]) { $clipSumMs += [decimal]$r.ms } }
+            $clipSumMs = [decimal]0; foreach ($name in $script:ExportRenderedClipStages) { foreach ($r in $clipRecords[$name]) { $clipSumMs += [decimal]$r.msD } }   # (r2 fix 2, A5: exact)
             $framesForClip = $(if ($null -ne $m.framesExported -and $m.framesExported -gt 0) { [decimal]$m.framesExported } else { $null })
             $exactTimed = Get-DvExportExactMean @($perStage['processed16_total'].Values)
             $roundedTimed = $p16.meanMs
@@ -5644,6 +5669,9 @@ function Get-DvExportEvidence {
             # r2 (adversary A6 on a6f48506): the build identity decides too. A build whose own StageTiming.h defines this card's stages times them all, so a log of that build
             # with NONE of them is an incomplete capture (a stale or foreign stage log beside this build's batch log), never an older build's reading; and a log carrying them
             # beside a build that cannot emit them is not that build's log. A build this repo cannot name ('unknown': no 40-hex id, or no commit of it here) keeps the r1 reading.
+            if ($buildClass -ceq 'malformed') {
+                $problems.Add("EXPORT_PROFILE_FOREIGN: the expected build id is not one 40-hex commit id, so stage-timing.log cannot be bound to the build the job ran")
+            }
             if ($cardSeen.Count -gt 0 -and $buildClass -ceq 'older') {
                 $problems.Add("EXPORT_PROFILE_FOREIGN: stage-timing.log carries $($cardSeen -join ' / '), which build $ExpectedBuildId cannot emit (its src/debug/StageTiming.h defines no EXPORT-RENDER-PIPE-TIMING-1 stage), so the log is not the build's the job ran")
             }
