@@ -19612,7 +19612,8 @@ class DriftLegSpecTests(unittest.TestCase):
         margin_ms = int(re.search(r"constexpr int kPlaySafetyMarginMs = (\d+);", text).group(1))
         # r5 adversary pass 8 A4: the first frame is presented at FIRST_PRESENT_S and the pace then has to carry whole_frames - 1 transitions (the app counts the first frame
         # and 599 transitions for 10 s of 59.94), so the numerator is one less than the frame count.
-        return (math.ceil(play_seconds * clip_fps) - 1) / (play_seconds / fraction + margin_ms / 1000.0 - self.FIRST_PRESENT_S)
+        # (PlaybackFrameRange.h subtracts 1e-9 before the ceil, so 60.00000000001 fps x 10 s is still 600 frames; adversary pass 9 A2.)
+        return (math.ceil(play_seconds * clip_fps - 1e-9) - 1) / (play_seconds / fraction + margin_ms / 1000.0 - self.FIRST_PRESENT_S)
 
     def test_the_20_second_window_cannot_host_a_cap_one_leg_and_the_w10_family_can(self) -> None:
         """r4: five of the six cap-1 20 s CUDA legs ended PaceTooSlow (INVALID, uncounted). The floor a window sets on the CUDA (gated) backend is a function of the app's
@@ -19674,10 +19675,23 @@ class DriftLegSpecTests(unittest.TestCase):
             with self.subTest(leg=rel):
                 self.assertIn("-w10-visual-unpaced-", self.load(rel)["legId"])
         self.assertEqual(sorted(p.name for p in (DV / "legs").glob("*-visual-*.json")), sorted(Path(r).name for r in DRIFT_VISUAL_LEGS), "a '-visual-' leg outside the registered twins")
+        # adversary pass 9 A1: judge the DECODED legs and the legs' own spec ids, never the raw text (a JSON escape such as drift is the same string once decoded)
+        def walk(node):
+            if isinstance(node, str):
+                yield node
+            elif isinstance(node, dict):
+                for v in node.values():
+                    yield from walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    yield from walk(v)
         for path in sorted((DV / "legsets").glob("*.json")):
             with self.subTest(legset=path.name):
-                text = path.read_text(encoding="utf-8")
-                self.assertNotIn("m16-1457-drift-", text, "a drift leg (a visual twin above all) in a legset would print its fps as a measured matrix cell")
+                for value in walk(json.loads(path.read_text(encoding="utf-8"))):
+                    self.assertNotIn("m16-1457-drift-", value, "a drift leg (a visual twin above all) in a legset would print its fps as a measured matrix cell")
+                    if value.startswith("legs/") and (DV / value).is_file():
+                        self.assertNotEqual(self.load(value)["card"], "M16-1457-VENUE-BASELINE-DRIFT-1", f"{value} resolves to a drift leg")
+                        self.assertNotIn("-visual-", self.load(value)["legId"], f"{value} resolves to a visual twin")
 
     def test_the_pcore_arm_adds_only_the_affinity_keys_the_cap_and_the_two_partition_criteria(self) -> None:
         rel = "legs/m16-1457-drift-pcore12-unpaced-fullscreen-s1.json"
