@@ -2533,6 +2533,78 @@ $out | ConvertTo-Json -Compress
         for bad, state in r.items():
             self.assertEqual(state, "STALE", f"a ticket whose staleAfterSec is {bad!r} and whose heartbeat is 10 minutes old stayed live: {r}")
 
+    def test_tail1_r4_k1_every_lifetime_a_supported_writer_can_publish_is_judged_by_its_heartbeat_age_never_unreadable(self) -> None:
+        # r4 K1 (sol, opus, fable all agree): the r2 pass 3 A7 ceiling (staleAfterSec over 86400 is 'unreadable') said "the writers allow 1..86400", but Update-VenueTicket -StaleAfterSec is an unranged [int] and the chain
+        # publishes Get-VenueTicketProbeStaleSec's value through it: -ProbeAdmissionWaitSec 86400 with the default 600 s quiet wait gives 87630. A live, freshly heartbeated ticket read STALE and another requester reaped it.
+        # Every value the writer can carry (up to Int32) is a lifetime; the reader is bounded at what the refresh can carry, nothing narrower.
+        r = self.ps("""
+$cases = [ordered]@{
+  chainProbeAdmission86400 = [int](Get-VenueTicketProbeStaleSec -QuietMaxWaitSec 600 -AdmissionWaitSec 86400)
+  chainProbeMaxOperands = [int](Get-VenueTicketProbeStaleSec -QuietMaxWaitSec 86400 -AdmissionWaitSec 86400 -MarginSec 86400)
+  dayAndOneSecond = 86401
+  int32Max = 2147483647
+}
+$out = [ordered]@{}
+foreach ($k in $cases.Keys) {
+  $A = New-VenueTicket -Venue bachelor -RunDir ('run-' + $k) -ClaimDir $d -Phase waiting -StaleAfterSec 90
+  $u = [string](Update-VenueTicket -Ticket $A -Phase 'probing' -StaleAfterSec $cases[$k])
+  $fresh = @(Get-VenueTickets -Venue bachelor -ClaimDir $d | Where-Object { $_.name -ceq $A.name })[0]
+  $late = @(Get-VenueTickets -Venue bachelor -ClaimDir $d -NowUtc ([DateTime]::UtcNow.AddSeconds([double]$cases[$k] + 60.0)) | Where-Object { $_.name -ceq $A.name })[0]
+  $out[$k] = [pscustomobject]@{ secs = $cases[$k]; update = $u; freshState = [string]$fresh.state; freshReason = [string]$fresh.reason; lateState = [string]$late.state; lateReason = [string]$late.reason }
+  Remove-Item -LiteralPath $A.path -Force
+}
+$out | ConvertTo-Json -Compress -Depth 4
+""")
+        self.assertEqual(r["chainProbeAdmission86400"]["secs"], 87630, r)
+        for k, row in r.items():
+            self.assertEqual(row["update"], "OK", f"{k}: the writer refused a lifetime the chain publishes: {r}")
+            self.assertEqual((row["freshState"], row["freshReason"]), ("LIVE", ""), f"{k}: a live, freshly heartbeated ticket read stale, so another requester reaps it and the chain loses its place: {r}")
+            self.assertEqual((row["lateState"], row["lateReason"]), ("STALE", "heartbeat"), f"{k}: a ticket whose heartbeat is older than its lifetime must still go stale by heartbeat age: {r}")
+
+    def test_tail1_r4_k2_a_pending_claim_a_busy_close_could_not_let_go_of_is_kept_and_released_at_a_later_close(self) -> None:
+        # r4 K2 (sol): Close-LegTicket released the claim a give-back could not let go of ONCE (three opens), logged "released as the ticket ends" whatever the answer, and dropped the ticket object with the nonce on it, so a reader
+        # that held the claim file through those three opens left the claim standing behind this live chain with no reference to it. The nonce now outlives the ticket and is released at the next close. Lifted by its AST.
+        r = self.ps(f"""
+$ast = [Management.Automation.Language.Parser]::ParseFile('{RUNNER}', [ref]$null, [ref]$null)
+$fn = $ast.Find({{ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Close-LegTicket' }}, $true)
+Invoke-Expression $fn.Extent.Text
+$script:logs = [System.Collections.Generic.List[string]]::new()
+function L([string]$m) {{ $script:logs.Add($m) }}
+$Venue = 'bachelor'; $ClaimDir = $d; $TicketKeepMax = 2
+$cp = Join-Path $d 'bachelor.claim.json'
+$out = [ordered]@{{}}
+# (1) a reader holds the claim file through every open of the close: the release answers BUSY
+$g = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$script:ticket = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$script:ticket | Add-Member -NotePropertyName pendingReleaseNonce -NotePropertyValue ([string]$g.claim.nonce) -Force
+$script:ticketKeeps = 0
+$hold = [IO.File]::Open($cp, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+Close-LegTicket 'leg-1' 'TICKET_ENDED' 'test'
+$out['busyClaimLeft'] = (Test-Path -LiteralPath $cp)
+$out['busyLog'] = ($script:logs -join ' | ')
+$hold.Dispose()
+Close-LegTicket 'leg-2' 'TICKET_ENDED' 'test'   # no ticket is left: the kept nonce is still let go of
+$out['busyClaimAfterLaterClose'] = (Test-Path -LiteralPath $cp)
+# (2) the release THROWS at the close (the claim open is refused)
+$g2 = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$script:ticket = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$script:ticket | Add-Member -NotePropertyName pendingReleaseNonce -NotePropertyValue ([string]$g2.claim.nonce) -Force
+$script:ticketKeeps = 0
+function Release-VenueClaim {{ throw 'seam: the claim open is refused' }}
+Close-LegTicket 'leg-3' 'TICKET_ENDED' 'test'
+$out['throwClaimLeft'] = (Test-Path -LiteralPath $cp)
+Remove-Item -Path Function:\\Release-VenueClaim
+Close-LegTicket 'leg-4' 'TICKET_ENDED' 'test'
+$out['throwClaimAfterLaterClose'] = (Test-Path -LiteralPath $cp)
+$out | ConvertTo-Json -Compress
+""")
+        self.assertTrue(r["busyClaimLeft"], f"the seam did not hold the claim through the close: {r}")
+        self.assertNotIn("released as the ticket ends", r["busyLog"].replace("CLAIM_PENDING_RELEASE_NOT_RELEASED", ""), f"the close logged a release that did not happen: {r}")
+        self.assertIn("result=BUSY", r["busyLog"], r)
+        self.assertFalse(r["busyClaimAfterLaterClose"], f"the nonce of the claim a busy close could not let go of was dropped with the ticket: the claim stands behind this live chain: {r}")
+        self.assertTrue(r["throwClaimLeft"], r)
+        self.assertFalse(r["throwClaimAfterLaterClose"], f"the nonce was dropped when the release at the close threw: {r}")
+
     def give_back_scenario(self, name: str, release_seam: str, env: dict) -> dict:
         # the A7 line-up (B takes the claim as head while A is in cooldown, A flips to waiting while B holds it, so B must give the claim back), with ONE seam inside the give-back
         from unittest import mock
@@ -2550,6 +2622,17 @@ $out | ConvertTo-Json -Compress
         if release_seam == "reapall":
             # pass 3 A5: every ticket file is gone after the release, as an unreadable folder looks to the listing (it swallows the error and answers no rows)
             return ((brk, "                    if ($env:SEAM_REAP_ALL -and $back -ceq 'RELEASED') { Get-ChildItem -LiteralPath (Split-Path -Parent $t.path) -Filter '*.ticket.json' | Remove-Item -Force }\n" + brk),)
+        reap_all_loop = "                    if ($env:SEAM_REAP_ALL_IN_LOOP) { Get-ChildItem -LiteralPath (Split-Path -Parent $t.path) -Filter '*.ticket.json' | Remove-Item -Force }\n"
+        fail_listing = ("        foreach ($file in @(Get-ChildItem -LiteralPath $dir -Filter '*.ticket.json' -File -ErrorAction $listAction)) {\n",
+                        "        if ($env:SEAM_LIST_FAIL -and $ThrowOnListError) { throw 'seam: the ticket folder could not be listed' }\n        foreach ($file in @(Get-ChildItem -LiteralPath $dir -Filter '*.ticket.json' -File -ErrorAction $listAction)) {\n")
+        if release_seam == "denyreapall":
+            # r4 K3: the five give-backs all fail and EVERY ticket file is gone after them, from a folder that is still readable
+            return (deny, (brk, reap_all_loop + brk))
+        if release_seam == "reapallfail":
+            # r4 K3 guard: as reapall, but the listing made after the release throws (an unreadable folder)
+            return ((brk, "                    if ($env:SEAM_REAP_ALL -and $back -ceq 'RELEASED') { Get-ChildItem -LiteralPath (Split-Path -Parent $t.path) -Filter '*.ticket.json' | Remove-Item -Force; $env:SEAM_LIST_FAIL = '1' }\n" + brk), fail_listing)
+        if release_seam == "denyreapallfail":
+            return (deny, (brk, reap_all_loop + "                    if ($env:SEAM_REAP_ALL_IN_LOOP) { $env:SEAM_LIST_FAIL = '1' }\n" + brk), fail_listing)
         if release_seam == "denyreap":
             # pass 3 A4: the five give-backs all fail (the delete is refused) and B's own ticket is reaped inside them
             return (deny, (brk, "                    if ($env:SEAM_REAP_IN_LOOP) { Remove-Item -LiteralPath $t.path -Force -ErrorAction SilentlyContinue }\n" + brk))
@@ -2573,11 +2656,25 @@ $out | ConvertTo-Json -Compress
         self.assertEqual((r["state"], r["granted"]), ("QUEUED", False), r)
         self.assertEqual((r["queueCount"], r["position"]), (1, 0), f"the five-BUSY give-back returned the census made before its tries: {r}")
 
-    def test_tail1_r2_pass3_a5_an_empty_census_after_the_release_is_a_failed_read_and_keeps_the_earlier_one(self) -> None:
-        # pass 3 A5: the listing swallows an unreadable folder and answers no rows; A was just seen in the line, so "no rows" is not the truth, and it must not become an empty queue with position 0
+    def test_tail1_r4_k3_a_successful_census_that_finds_no_live_ticket_after_the_release_is_an_empty_line_not_the_earlier_one(self) -> None:
+        # r4 K3 (sol; r2 pass 3 A5 pinned the opposite): both tickets legitimately left a READABLE folder before the second census, so the line returned is empty and the caller's place is 0, in the released and in the five-BUSY
+        # branch alike. Only a read that FAILED (the listing throws) keeps the earlier census (test below).
         r = self.give_back_scenario("p3a5", "reapall", {"SEAM_REAP_ALL": "1"})
         self.assertEqual((r["state"], r["granted"]), ("QUEUED", False), r)
-        self.assertGreaterEqual(r["queueCount"], 1, f"an empty read replaced the census: {r}")
+        self.assertEqual((r["queueCount"], r["position"]), (0, 0), f"a successful census of an empty line reported the earlier queue and place: {r}")
+        r = self.give_back_scenario("k3busy", "denyreapall", {"SEAM_DENY_DELETE": "1", "SEAM_REAP_ALL_IN_LOOP": "1"})
+        self.assertEqual((r["state"], r["granted"]), ("QUEUED", False), r)
+        self.assertEqual((r["queueCount"], r["position"]), (0, 0), f"the five-BUSY give-back reported the earlier queue and place after an empty census: {r}")
+        self.assertTrue(r["pending"], f"the claim that could not be given back is not named on the ticket: {r}")
+
+    def test_tail1_r4_k3_a_census_whose_listing_failed_keeps_the_earlier_one(self) -> None:
+        # r4 K3 guard: the listing that cannot be read (here it throws) is a failed read, never an empty line: the earlier census stands, for both branches
+        r = self.give_back_scenario("k3fail", "reapallfail", {"SEAM_REAP_ALL": "1"})
+        self.assertEqual((r["state"], r["granted"]), ("QUEUED", False), r)
+        self.assertGreaterEqual(r["queueCount"], 1, f"a failed listing replaced the census: {r}")
+        r = self.give_back_scenario("k3failbusy", "denyreapallfail", {"SEAM_DENY_DELETE": "1", "SEAM_REAP_ALL_IN_LOOP": "1"})
+        self.assertEqual((r["state"], r["granted"]), ("QUEUED", False), r)
+        self.assertGreaterEqual(r["queueCount"], 1, f"a failed listing replaced the census in the five-BUSY branch: {r}")
 
     def test_tail1_r2_a10_a_give_back_whose_delete_is_refused_does_not_hand_the_claim_to_a_caller_that_is_not_the_head(self) -> None:
         # r1 adversary A10 (pre-existing): a Release-VenueClaim that THROWS (File.Delete refused) left the give-back through the outer catch and the grant was returned as TAKEN to B although the older A is ready. It counts
