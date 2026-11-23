@@ -3235,10 +3235,15 @@ double g_r17A1ProbeRunMs[kR17A1MaxProbes] = {};                        // when e
 // a correct charge. Bounded by the sender's own 5 s cutoff, so a sender that never sends the present cannot hang the test.
 bool g_r17A1PauseInForeign = false;
 std::atomic<bool> g_r17A1PresentSent { false };
+// FOREIGN-FIRST-FLOOR-1 adversary pass 1 A1: the handler records whether it really held the GUI, i.e. the present was NOT yet
+// queued when the WM_NULL dispatch reached it. A GUI that reached it only after the present was queued paused nothing inside the
+// dispatch, so that sample is not the paused row and is observed again.
+bool g_r17A1PauseHeld = false;
 LRESULT CALLBACK r17A1ForeignProc( HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam )
 {
     if( message == WM_NULL && g_r17A1PauseInForeign )
     {
+        g_r17A1PauseHeld = !g_r17A1PresentSent.load();
         const ULONGLONG giveUp = GetTickCount64() + 5000;
         while( !g_r17A1PresentSent.load() && GetTickCount64() < giveUp ) Sleep( 0 );
         return 0;
@@ -3361,6 +3366,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         g_r17A1ProbeRanMask = 0;
         std::fill( g_r17A1ProbeRunMs, g_r17A1ProbeRunMs + kR17A1MaxProbes, 0.0 );
         g_r17A1PresentSent = false;
+        g_r17A1PauseHeld = false;
         g_r17A1PauseInForeign = foreignFirst && pausedInForeign;
         foreignSentMs = 0.0;
         std::atomic<bool> sent { false };
@@ -3417,6 +3423,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         handlerStartMs = g_r17A1HandlerStartMs;
         handlerEndMs = g_r17A1HandlerEndMs;
         const bool handlerRan = g_r17A1HandlerRan;                     // also before the drain, which runs the handler too when a send missed
+        const bool pauseHeld = g_r17A1PauseHeld;                       // A1: also before the drain (a WM_NULL drained after the join holds nothing)
         ranProbes = g_r17A1ProbeRanMask;
         std::copy( g_r17A1ProbeRunMs, g_r17A1ProbeRunMs + kR17A1MaxProbes, probeRunMs );   // also before the drain
         // a send that missed the sleep is still queued: take it now (its handler sees no windows), so it cannot cut the next try
@@ -3432,7 +3439,9 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         // pass 2 A3: only a record of exactly ONE dispatch is the batched sample; an EMPTY record with the handler run is a product
         // that dropped its span, which is judged (and fails at dispatches >= 1 below), never retried away
         // SEAM-1 A1: no sender-side stamp gates the sample (the probe-liveness gates are gone; the exit record judges the sleep)
-        landed = handlerRan && !stamps.empty() && spans.size() != 1;
+        // FOREIGN-FIRST-FLOOR-1 adversary pass 1 A1: the paused row is judged only on a sample whose WM_NULL handler held the GUI
+        // while the present was queued (the handler's own observation, never the product's span record); otherwise it is retried
+        landed = handlerRan && !stamps.empty() && spans.size() != 1 && ( !( foreignFirst && pausedInForeign ) || pauseHeld );
     }
     ASSERT_TRUE( sentOk );
     ASSERT_TRUE( landed );                                             // the send fell inside one of the sleeps
@@ -3532,12 +3541,22 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     // CI-FLAKE-R17A1-FOREIGN-FIRST-FLOOR-1 (sol r10 B1, fable r10 B1): with a foreign WM_NULL first, the first dispatch is the
     // WM_NULL's, and a GUI pause inside it takes the present in that same dispatch, so the old window is correctly charged only
     // the time before the WM_NULL: a fixed 10 ms floor failed that healthy sleep. The floor follows a clock read the test took:
-    // the sender read its clock just before the WM_NULL send, the sleep's first dispatch cannot begin before that send, and the
-    // old window holds segment 0 ([entry, first dispatch begin]) at least. 1e-6: the /1000 then *1000 round trip.
+    // the sender read its clock just before the WM_NULL send, so neither the WM_NULL's nor the present's dispatch began before
+    // that read, and the old window holds every slept (non-dispatch) instant between the entry stamp and that read.
+    // Adversary pass 1 A2: a sent message from ANOTHER source dispatched before the read is no sleep either, so the floor is the
+    // time from entry to the read LESS every recorded dispatch's overlap with it (dispatch time is never charged to a window).
+    // 1e-5: the /1000 then *1000 round trips and the sums taken in another order than the reads.
     if( foreignFirst )
     {
         ASSERT_TRUE( foreignSentMs >= enteredMs );                      // the sender read after the sleep's entry stamp, so after the test's own entry read
-        ASSERT_TRUE( w.chargedS[0] * 1000.0 >= foreignSentMs - entryS * 1000.0 - 1e-6 );
+        const double entryMs = entryS * 1000.0;
+        double sleptBeforeSendMs = foreignSentMs - entryMs;
+        for( size_t k = 0; k < dispatches; ++k )
+        {
+            const double overlapMs = std::min( spans[k].second * 1000.0, foreignSentMs ) - std::max( spans[k].first * 1000.0, entryMs );
+            if( overlapMs > 0.0 ) sleptBeforeSendMs -= overlapMs;
+        }
+        ASSERT_TRUE( w.chargedS[0] * 1000.0 >= sleptBeforeSendMs - 1e-5 );
     }
     else ASSERT_TRUE( w.chargedS[0] * 1000.0 >= 10.0 );                // the sender waits 20 ms after the entry stamp: only later
     // the sleep is never cut short at a dispatch: it runs the requested 80 ms (late only lengthens it)
