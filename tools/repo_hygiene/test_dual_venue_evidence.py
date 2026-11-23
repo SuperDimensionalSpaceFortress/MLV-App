@@ -5083,7 +5083,8 @@ class ContactFramesAreTheRequestedCountTests(EvidenceFactory, ModuleMutationMixi
         for tag, frames in (("stray", stray), ("note", plus_note)):
             receipt, _ = self.receipt_over(tag, frames)
             receipt["look"]["contactSheet"]["frames"] = 6
-            self.expect(self.status_batch(self.repo, [(receipt, None)])[0], "INVALID", tag, "CONTACT_FRAME_COUNT_NOT_REQUESTED")
+            # (r7: frame-05 saved=false is now refused as an unsaved sidecar before the count is read, CONTACT_FRAME_SIDECAR_NOT_SAVED; either refusal is INVALID)
+            self.expect(self.status_batch(self.repo, [(receipt, None)])[0], "INVALID", tag, "CONTACT_FRAME_SIDECAR_NOT_SAVED" if tag == "stray" else "CONTACT_FRAME_COUNT_NOT_REQUESTED")
         import ast
         source = (ROOT / "tools" / "profiling" / "make-contact-sheet.py").read_text(encoding="utf-8")
         funcs = [n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == "check_expected_frame_stems"]
@@ -5167,6 +5168,16 @@ class ContactFramesAreTheRequestedCountTests(EvidenceFactory, ModuleMutationMixi
         proc = _ps_json(script, DV / "DualVenueRunner.psm1", {})
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("OK=False", proc.stdout)
+
+    def test_r7_a_listed_frame_that_is_empty_or_says_it_was_not_saved_is_not_a_frame(self) -> None:
+        """c54a57f6 A4: frame-05.png truncated to zero bytes, or frame-05.json rewritten to saved:false, before collection still hashed as listed and a six-frame claim stood."""
+        empty = stub_raw_frames(6)
+        empty["frame-05.png"] = b""
+        unsaved = stub_raw_frames(6)
+        unsaved["frame-05.json"] = json.dumps({"index": 5, "saved": False, "path": "frame-05.png"}).encode("utf-8")
+        got = self.status_batch(self.repo, [(self.receipt_over("emp", empty)[0], None), (self.receipt_over("uns", unsaved)[0], None)])
+        self.expect(got[0], "INVALID", "empty png", "CONTACT_FRAME_")
+        self.expect(got[1], "INVALID", "saved false", "CONTACT_FRAME_")
 
     def test_r7_a_sheet_with_no_raw_directory_is_the_typed_count_refusal(self) -> None:
         """c54a57f6 A6 companion: a sheet and no raw directory and no marker left frameCountVerdict null, so the leg skipped the typed refusal."""

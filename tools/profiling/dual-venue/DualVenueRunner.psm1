@@ -3331,6 +3331,7 @@ function Read-DvContactFrames {
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { $reasons.Add("CONTACT_FRAME_UNLISTED: the manifest lists '$($entry.name)' but the raw directory does not hold it"); continue }
         $bytes = [IO.File]::ReadAllBytes($path)
         if ((Get-DvSha256OfBytes $bytes) -cne $entry.sha256) { $reasons.Add("CONTACT_FRAME_HASH_MISMATCH: '$($entry.name)' does not hash to the sha256 the manifest lists"); continue }
+        if ($bytes.Length -eq 0 -and $entry.name -clike '*.png') { $reasons.Add("CONTACT_FRAME_EMPTY: the listed frame '$($entry.name)' has no bytes (r7, c54a57f6 A4)"); continue }
         $files.Add([pscustomobject]@{ name = $entry.name; sha256 = $entry.sha256; bytes = $bytes })
     }
     # A hash-listed sidecar names its frame's image (`path`); the composer used to follow that name wherever it pointed -- an absolute or parent-relative path
@@ -3339,6 +3340,10 @@ function Read-DvContactFrames {
     foreach ($f in @($files | Where-Object { $_.name -clike '*.json' })) {
         $stem = $f.name.Substring(0, $f.name.Length - '.json'.Length)
         try { $side = (ConvertTo-DvText $f.bytes) | ConvertFrom-Json -ErrorAction Stop } catch { $reasons.Add("CONTACT_FRAME_SIDECAR_UNPARSABLE: the listed sidecar '$($f.name)' is not valid JSON"); continue }
+        # (r7, c54a57f6 A4: the app writes `saved: true` for a frame it kept; a listed sidecar that SAYS anything else is not a frame, and a listed PNG with no bytes is not one either.
+        # A sidecar with no `saved` member at all is left as it was: the paired-seek stills and their in-pass partners carry none.)
+        $savedMember = $(if ($null -ne $side) { $side.PSObject.Properties['saved'] } else { $null })
+        if ($null -ne $savedMember -and $savedMember.Value -cne $true) { $reasons.Add("CONTACT_FRAME_SIDECAR_NOT_SAVED: the listed sidecar '$($f.name)' does not say saved true; a frame the app did not keep is not part of the strip") }
         $refPath = [string](Get-DvProp $side 'path')
         if ($refPath -ne '') {
             if ($refPath -cne ($stem + '.png')) { $reasons.Add("CONTACT_FRAME_SIDECAR_PATH: the listed sidecar '$($f.name)' names an image other than its own '$stem.png' (an absolute, parent-relative, nested or other-frame path); a sheet shows only the frames the manifest lists") }
