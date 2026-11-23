@@ -482,6 +482,9 @@ function Invoke-DvGit {
     foreach ($name in @($psi.Environment.Keys | Where-Object { $_ -match '^GIT_(DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|COMMON_DIR|NAMESPACE|REPLACE_REF_BASE|NO_REPLACE_OBJECTS)$' -or $_ -match '^GIT_TRACE' -or $_ -match '^GIT_REDIRECT_' })) { [void]$psi.Environment.Remove($name) }
     foreach ($name in @('GIT_TRACE', 'GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_TRACE2_PERF')) { $psi.Environment[$name] = '0' }
     if (-not [string]::IsNullOrEmpty($script:DvGitTraceFile)) { $psi.Environment['GIT_TRACE'] = $script:DvGitTraceFile }
+    # (r4, adversary A4 on 7c66c004: in a partial clone a read of a blob the clone lacks made git FETCH it from the promisor remote and write it into the object store, so
+    # a read-only reader wrote; git 2.44+ never lazy-fetches with this set, whatever the caller's environment says -- tools/coordination/lane-dirty-save.ps1:69 does the same)
+    $psi.Environment['GIT_NO_LAZY_FETCH'] = '1'
     foreach ($a in (@('--no-replace-objects', '-C', $RepoRoot) + $GitArgs)) { [void]$psi.ArgumentList.Add($a) }
     $limit = Get-DvGitTimeoutMilliseconds
     # A fresh tag per call, inherited by everything git starts: how Stop-DvGitCall finds those children on Linux once their parent is gone.
@@ -5248,6 +5251,17 @@ $script:RenderPipeMarkerPath = 'src/debug/StageTiming.h'
 $script:RenderPipeMarker = '#define MLV_STAGE_EXPORT_PIPE_WRITE'
 $script:RenderPipeBuildClassCache = [hashtable]::new([StringComparer]::Ordinal)
 
+function Test-DvRenderPipeMarkerDefined {
+    # (r4, adversary A6 on 7c66c004: a substring search read `# define MLV_STAGE_EXPORT_PIPE_WRITE ...`, legal preprocessor spacing, as 'older', and a header that only
+    # names the define in a comment as 'emits'.) True only when a directive line defines the macro: comments are removed first (block, then line), and the directive may
+    # carry blanks before and after its '#'.
+    param([AllowNull()][AllowEmptyString()][string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return $false }
+    $code = [regex]::Replace($Text, '(?s)/\*.*?\*/', ' ')
+    $code = [regex]::Replace($code, '//[^\r\n]*', '')
+    return [regex]::IsMatch($code, '(?m)^[ \t]*#[ \t]*define[ \t]+MLV_STAGE_EXPORT_PIPE_WRITE(?![A-Za-z0-9_])')
+}
+
 function Get-DvRenderPipeBuildClass {
     param([AllowNull()][AllowEmptyString()][string]$BuildId, [string]$RepoRoot = '')
     if ([string]::IsNullOrEmpty($RepoRoot)) { $RepoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..')) }
@@ -5264,7 +5278,7 @@ function Get-DvRenderPipeBuildClass {
     $kind = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('cat-file', '-t', $BuildId)
     if ($kind.exitCode -ne 0 -or ([Text.Encoding]::ASCII.GetString($kind.bytes)).Trim() -cne 'commit') { return 'unknown' }
     $blob = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('cat-file', '-p', "${BuildId}:$($script:RenderPipeMarkerPath)")
-    if ($blob.exitCode -eq 0) { $class = $(if ((ConvertTo-DvText $blob.bytes).Contains($script:RenderPipeMarker)) { 'emits' } else { 'older' }) }
+    if ($blob.exitCode -eq 0) { $class = $(if (Test-DvRenderPipeMarkerDefined (ConvertTo-DvText $blob.bytes)) { 'emits' } else { 'older' }) }
     else {
         # (r2 fix 2, adversary A4 on c2da7e24: a commit whose tree git READ and found without the header is a build before stage timing, so 'older'; a tree that lists it or
         # that git could not read is still 'unknown')
