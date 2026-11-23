@@ -1755,6 +1755,26 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         self.assertEqual(got, {name: want for name, (_, want) in cases.items()})
 
+    def test_adversary_r4_pass9_a5_the_define_is_read_in_translation_order(self) -> None:
+        """pass 9 A5 (on 724d72ff): a define spliced across lines with a backslash read 'older', and one inside `#if 0` or followed by `#undef` read 'emits'. Splices are joined
+        before comments go, a literal #if 0 / #else chain and the include guard are followed, the last live #define / #undef decides, and a define under a condition the
+        model cannot decide (#ifdef) is 'unknown'."""
+        cases = {"spliced": ('#define MLV_STAGE_EXPORT_PIPE_\\\nWRITE "export_pipe_write"\n', "emits"),
+                 "if_zero": ('#if 0\n#define MLV_STAGE_EXPORT_PIPE_WRITE "x"\n#endif\n', "older"),
+                 "undef_after": ('#define MLV_STAGE_EXPORT_PIPE_WRITE "x"\n#undef MLV_STAGE_EXPORT_PIPE_WRITE\n', "older"),
+                 "if_zero_else": ('#if 0\n#else\n#define MLV_STAGE_EXPORT_PIPE_WRITE "x"\n#endif\n', "emits"),
+                 "if_one_else": ('#if 1\n#else\n#define MLV_STAGE_EXPORT_PIPE_WRITE "x"\n#endif\n', "older"),
+                 "guarded": ('#ifndef G_H\n#define G_H\n#if defined(_WIN32)\n#  define X 1\n#endif\n#define MLV_STAGE_EXPORT_PIPE_WRITE "x"\n#endif\n', "emits"),
+                 "ifdef": ('#ifdef FOO\n#define MLV_STAGE_EXPORT_PIPE_WRITE "x"\n#endif\n', "unknown"),
+                 "unbalanced": ('#if 1\n#define MLV_STAGE_EXPORT_PIPE_WRITE "x"\n', "unknown")}
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            ids = {name: self.header_commit(repo, text) for name, (text, _) in cases.items()}
+            lines = "".join(f"$o['{name}'] = & $m {{ param($r, $id) Get-DvRenderPipeBuildClass -BuildId $id -RepoRoot $r }} '{repo}' '{sha}'\n" for name, sha in ids.items())
+            proc, got = run_pwsh_json("$m = Get-Module DualVenueRunner\n$o = [ordered]@{}\n" + lines + "$o | ConvertTo-Json -Compress")
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got, {name: want for name, (_, want) in cases.items()})
+
     def test_adversary_r4_a4_every_git_the_reader_runs_has_lazy_fetch_off(self) -> None:
         """pass 8 A4: in a partial clone the header read made git fetch the missing blob from the promisor remote and write it into the object store. Every Invoke-DvGit
         child runs with GIT_NO_LAZY_FETCH=1, also when the caller's environment sets it to 0 (a shell alias prints the value the child saw)."""
