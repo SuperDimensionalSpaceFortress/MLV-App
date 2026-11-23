@@ -89,6 +89,22 @@ def stage_log(frames: int) -> str:
 # clip on its last frame. llrawproc is 31 ms here so a 30 ms dual-ISO run fits inside it (raw_uint16 9 + llrawproc 31 = 40 still fits debayered_frame).
 PIPE_CRITERIA = ({"metric": "dualIsoClassAgrees", "op": "eq", "value": True}, {"metric": "renderPipeTimed", "op": "eq", "value": True})
 
+# EXPORT-RENDER-PIPE-TIMING-1 r3 (adversary A2 on c2da7e24): a llrawproc_dual_iso time above 0 ms is the ATTEMPT's (llrawproc.c:6019 times it, dualiso.c:7484-7487 can
+# refuse the reconstruction inside it), and the rendered path publishes no producer signal that the reconstruction APPLIED. So a timed dual-ISO run reads a typed UNKNOWN,
+# and on a dual-ISO leg the shipped criterion dualIsoClassAgrees eq true never passes (KNOWN GAP; successor EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1).
+DUALISO_UNKNOWN = "DUALISO_APPLIED_UNKNOWN"
+DUALISO_SUCCESSOR = "EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1"
+
+
+def assert_clean_but_dual_iso_unknown(tc: unittest.TestCase, g: dict) -> None:
+    """A clean log under the shipped ProRes criteria on a dual-ISO leg: no evidence problem, no class mismatch, and the verdict FAILs on dualIsoClassAgrees ALONE, with the
+    typed UNKNOWN as the reason (the r3 fail-closed reading). Every other shipped criterion met."""
+    tc.assertEqual(g["problems"], [], g)
+    tc.assertFalse(g["classMismatch"], g)
+    tc.assertEqual(g["outcome"], "FAIL", g)
+    tc.assertTrue(g["detail"].startswith(f"EXPORT_CAPTURED: dualIsoClassAgrees: {DUALISO_UNKNOWN}:"), g)
+    tc.assertNotIn("; ", g["detail"], "dualIsoClassAgrees is the only criterion that fails")
+
 
 def piped_stage_log(frames: int, dual_iso_ms: float = 30.0, llrawproc_ms: float = 31.0, pipe_ms: float = 10.0, drain_ms: float = 100.0, verify_ms: float = 200.0,
                     drain_count: int = 1, verify_count: int = 1, pipe_frames=None, scale_ms: float | None = None, dual_iso: bool = True) -> str:
@@ -1789,6 +1805,68 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
             self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
             self.assertEqual(got[0]["problems"], [], got[0])
             self.assertFalse(trace.exists(), "the reader wrote a git trace file")
+
+    # --- r3: adversary pass 5 on c2da7e24, A3 and A2 (A1, A4, A5 and A6 were fixed in 7882ec07)
+    def test_adversary_r3_a3_render_start_is_the_prores_producers_own_declaration(self) -> None:
+        """pass 5 A3: `RENDER_START ... codec=h264 container=mp4 source=0x0 output=0x0 ... fps=NaN` read PASS: the reader captured the codec, container and fps and dropped them.
+        A ProRes export's declaration is the rendered producer's: BatchRunner.cpp:471-478 prints plan.outputVerificationPlan.expectedCodec / expectedContainer, which
+        BatchRenderedVideoPlan.cpp:4026-4030 sets from batchRenderedVideoMediaProbeCodecName / ContainerName, i.e. BatchRenderedVideoPlan.h:1184 `return "prores";` and
+        :1196 `return "mov";`; source and output are getMlvWidth / getMlvHeight and a frame plan BatchRenderedVideoPlan.cpp:4502 refuses unless both are above 0; and fps is
+        batchRenderedVideoFfmpegFrameRateArgument (BatchRenderedVideoPlan.cpp:4521-4526, QLocale English toString of the clip's rate), a finite positive decimal."""
+        s = self.CTL_START
+        whole = s.replace("codec=prores container=mov source=1920x1080 output=1920x1080 scaled=false fps=24", "codec=h264 container=mp4 source=0x0 output=0x0 scaled=false fps=NaN")
+        self.assertNotEqual(whole, s)
+        bad = [whole, s.replace("codec=prores", "codec=h264"), s.replace("codec=prores", "codec=PRORES"), s.replace("container=mov", "container=mp4"),
+               s.replace("source=1920x1080 output=1920x1080", "source=0x0 output=0x0"), s.replace("source=1920x1080 output=1920x1080", "source=1920x0 output=1920x0"),
+               s.replace("source=1920x1080 output=1920x1080 scaled=false", "source=0x1080 output=1920x1080 scaled=true"),
+               s.replace("output=1920x1080 scaled=false", "output=1920x0 scaled=true"),
+               s.replace("fps=24", "fps=NaN"), s.replace("fps=24", "fps=inf"), s.replace("fps=24", "fps=0"), s.replace("fps=24", "fps=0.000"), s.replace("fps=24", "fps=-24"),
+               s.replace("fps=24", "fps=1e+300"), s.replace("fps=24", "fps=24,0")]
+        good = [s, s.replace("fps=24", "fps=23.976"), s.replace("fps=24", "fps=29.97")]
+        scaled_logs = {i for i, b in enumerate(bad) if "scaled=true" in b}
+        cases = [self.ctl(piped_stage_log(480, scale_ms=6.0) if i in scaled_logs else None, batch=self.ctl_batch(b)) for i, b in enumerate(bad)]
+        cases += [self.ctl(batch=self.ctl_batch(g)) for g in good]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for b, g in zip(bad, got[:len(bad)]):
+            with self.subTest(start=b):
+                self.assertEqual(g["outcome"], "INVALID", g)
+                self.assertTrue(any(p.startswith("EXPORT_PROFILE_FOREIGN") and "RENDER_START" in p for p in g["problems"]), g)
+        for g in got[len(bad):]:
+            assert_clean_but_dual_iso_unknown(self, g)
+
+    def test_adversary_r3_a2_a_dual_iso_time_above_zero_is_an_attempt_never_proof_it_applied(self) -> None:
+        """pass 5 A2: a receipt with dualIsoInterpolation 2 makes the CPU reconstruction refuse (dualiso.c:7484-7487) after llrawproc.c:6019 has started its timer, so the
+        failed attempt is timed above 0 ms and every frame read as dual-ISO: the leg PASSed with no frame reconstructed. The rendered path carries no producer signal that
+        the reconstruction APPLIED (successor EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1), so a time above 0 is typed UNKNOWN: never an active frame, never dualIsoClassAgrees
+        true, never PASS on that criterion. A time of exactly 0 on every frame still proves no reconstruction ran (the class mismatch on a dual-ISO leg stands), and a timed
+        attempt on a no-dual-ISO leg stays the class mismatch it was (no reconstruction was owed, and one was tried)."""
+        attempted = [self.ctl(), self.case(piped_stage_log(30)), self.case(piped_stage_log(30, dual_iso_ms=0.001)),
+                     self.case(piped_stage_log(30).replace("frame=0 stage=llrawproc_dual_iso ms=30.000", "frame=0 stage=llrawproc_dual_iso ms=0.000"))]
+        proc, got = evidence_cases(attempted + [self.case(piped_stage_log(30), dualIsoExpected=False), self.case(piped_stage_log(30, dual_iso_ms=0.0))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:len(attempted)]:
+            m = g["metrics"]
+            self.assertNotEqual(g["outcome"], "PASS", g)
+            self.assertIsNone(m["dualIsoActiveFrames"], g)
+            self.assertIsNone(m["dualIsoClassAgrees"], g)
+            for k in ("dualIsoActiveFramesCouldNotCheck", "dualIsoClassAgreesCouldNotCheck"):
+                self.assertTrue(m[k].startswith(f"{DUALISO_UNKNOWN}:"), g)
+                self.assertIn(DUALISO_SUCCESSOR, m[k])
+        for g in got[:3]:
+            assert_clean_but_dual_iso_unknown(self, g)
+        # (one frame at 0 among timed attempts: the class is not readable either way, and the window and schema stay clean)
+        self.assertEqual(got[3]["problems"], [], got[3])
+        nodual = got[len(attempted)]
+        self.assertEqual(nodual["outcome"], "INVALID", nodual)
+        self.assertTrue(nodual["classMismatch"], nodual)
+        self.assertIn("CLIP_CLASS_MISMATCH", nodual["detail"])
+        self.assertIn("attempted", nodual["detail"], "a time above 0 is an attempt, never a reconstruction that ran")
+        self.assertIsNone(nodual["metrics"]["dualIsoActiveFrames"], nodual)
+        zero = got[len(attempted) + 1]
+        self.assertEqual(zero["outcome"], "INVALID", zero)
+        self.assertIs(zero["metrics"]["dualIsoClassAgrees"], False, zero)
+        self.assertEqual(zero["metrics"]["dualIsoActiveFrames"], 0, zero)
 
     def test_r8_both_prores_leg_specs_gate_both_new_criteria(self) -> None:
         for name in ("m16-1243-export-prores", "m16-1456-export-prores"):
