@@ -113,15 +113,25 @@ def with_pipe_stages(log: str, frames: int, dual_iso_ms: float = 5.0) -> str:
     """EXPORT-RENDER-PIPE-TIMING-1 forced companion: a test that judges a hand-written log under the SHIPPED ProRes criteria (which now gate dualIsoClassAgrees and
     renderPipeTimed) appends what a build of that card emits: a small dual-ISO figure on every frame, a 1 ms pipe write per frame, one drain and one verify.
     (r2, adversary A4 on a6f48506: on a frame that carries llrawproc the dual-ISO record is written right after it, as video_mlv.c writes it; a frame without llrawproc gets it appended.)"""
-    out, paired = [], set()
-    for line in log.splitlines():
+    # (r2 fix 1, pass 4 A2: and the pipe write closes each frame, after its last render record, as the frame loop writes it)
+    out, paired, written = [], set(), set()
+    lines = log.splitlines()
+    frame_of = [int(m.group(1)) if (m := re.match(r"\[mlv-stage-timing\] frame=(\d+) ", l)) else None for l in lines]
+    for k, line in enumerate(lines):
         out.append(line)
         hit = re.match(r"\[mlv-stage-timing\] frame=(\d+) stage=llrawproc ms=", line)
         if hit and int(hit.group(1)) < frames:
             out.append(f"[mlv-stage-timing] frame={hit.group(1)} stage=llrawproc_dual_iso ms={dual_iso_ms:.3f}")
             paired.add(int(hit.group(1)))
+        f = frame_of[k]
+        if f is not None and f < frames and f not in written and (k + 1 == len(lines) or frame_of[k + 1] != f):
+            if f not in paired:
+                out.append(f"[mlv-stage-timing] frame={f} stage=llrawproc_dual_iso ms={dual_iso_ms:.3f}")
+                paired.add(f)
+            out.append(f"[mlv-stage-timing] frame={f} stage=export_pipe_write ms=1.000")
+            written.add(f)
     per_frame = "".join(f"[mlv-stage-timing] frame={i} stage=llrawproc_dual_iso ms={dual_iso_ms:.3f}\n" for i in range(frames) if i not in paired)
-    per_frame += "".join(f"[mlv-stage-timing] frame={i} stage=export_pipe_write ms=1.000\n" for i in range(frames))
+    per_frame += "".join(f"[mlv-stage-timing] frame={i} stage=export_pipe_write ms=1.000\n" for i in range(frames) if i not in written)
     return "\n".join(out) + "\n" + per_frame + f"[mlv-stage-timing] frame={frames - 1} stage=export_pipe_drain ms=1.000\n[mlv-stage-timing] frame={frames - 1} stage=export_verify ms=1.000\n"
 
 
@@ -1603,6 +1613,95 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         self.assertEqual(got[0]["outcome"], "INVALID", got[0])
         self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and "view-1" in p for p in got[0]["problems"]), got[0])
+
+    # --- r2 fix 1: adversary pass 4 on 2bd239b8 (A1-A6, advisory A9)
+    def test_adversary_r2f1_a1_an_unknown_stage_record_after_the_verify_is_out_of_order_too(self) -> None:
+        """pass 4 A1: a record of a stage the reader does not table (raw_uint16_copy) after export_verify did not move the last per-frame line, so the order check passed."""
+        proc, got = evidence_cases([self.ctl(piped_stage_log(480) + "[mlv-stage-timing] frame=479 stage=raw_uint16_copy ms=0.001\n")])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "INVALID", got[0])
+        self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "before the last per-frame record" in p for p in got[0]["problems"]), got[0])
+
+    def test_adversary_r2f1_a2_each_frame_renders_then_scales_then_writes_in_frame_order(self) -> None:
+        """pass 4 A2: frame 0's pipe write before its processed16_total, all frame blocks reversed, and export_scale after export_pipe_write all read PASS. The producer
+        completes processed16_total, then the optional scale, then the pipe write, frame by frame in rising order (BatchRunner.cpp:541-567)."""
+        base = piped_stage_log(480)
+        early = base.replace("[mlv-stage-timing] frame=0 stage=export_pipe_write ms=10.000\n", "").replace(
+            "[mlv-stage-timing] frame=0 stage=processed16_total ms=56.000\n", "[mlv-stage-timing] frame=0 stage=export_pipe_write ms=10.000\n[mlv-stage-timing] frame=0 stage=processed16_total ms=56.000\n")
+        lines = base.splitlines()
+        per, clip = lines[:-2], lines[-2:]
+        blocks = [per[i:i + 9] for i in range(0, len(per), 9)]
+        reversed_log = "\n".join([l for b in reversed(blocks) for l in b] + clip) + "\n"
+        scaled = piped_stage_log(480, scale_ms=6.0)
+        swapped = re.sub(r"(\[mlv-stage-timing\] frame=(\d+) stage=export_scale ms=6\.000)\n(\[mlv-stage-timing\] frame=\2 stage=export_pipe_write ms=10\.000)\n", r"\3\n\1\n", scaled)
+        sb = self.ctl_batch(self.CTL_START.replace("output=1920x1080 scaled=false", "output=1920x1440 scaled=true"))
+        proc, got = evidence_cases([self.ctl(early), self.ctl(reversed_log), self.ctl(swapped, batch=sb), self.ctl(scaled, batch=sb)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(len(blocks), 480)
+        for g in got[:3]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "export_pipe_write" in p and "order" in p for p in g["problems"]), g)
+        self.assertEqual(got[3]["outcome"], "PASS", got[3])
+
+    def test_adversary_r2f1_a3_render_start_dimensions_and_cut_fit_the_producer(self) -> None:
+        """pass 4 A3: output 1920x1440 beside source 1920x1080 with scaled=false read PASS with no scale owed (an unscaled plan's output IS its source), and a cut past the
+        producer's uint32 range (cutIn=4294967296) read PASS. A scaled plan may keep its size (a resize to the source dimensions), so that direction stays open."""
+        grown = self.CTL_START.replace("output=1920x1080", "output=1920x1440")
+        huge = self.CTL_START.replace("cutIn=1 cutOut=480", "cutIn=4294967296 cutOut=4294967775")
+        same_scaled = self.CTL_START.replace("scaled=false", "scaled=true")
+        cases = [self.ctl(batch=self.ctl_batch(grown)), self.ctl(self.shift(piped_stage_log(480), 4294967295), batch=self.ctl_batch(huge)),
+                 self.ctl(piped_stage_log(480, scale_ms=6.0), batch=self.ctl_batch(same_scaled))]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:2]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any("RENDER_START" in p for p in g["problems"]), g)
+        self.assertEqual(got[2]["outcome"], "PASS", got[2])
+
+    def test_adversary_r2f1_a4_a9_a_build_id_in_capitals_is_the_same_build_and_derive_in_any_case_derives(self) -> None:
+        """pass 4 A4 (and advisory A9): the uppercase spelling of the base commit read 'unknown' (PASS) where the lowercase read EXPORT_PROFILE_FOREIGN (INVALID); and
+        -RenderPipeBuildClass DERIVE skipped the lookup. One build is one class, however its id is spelled."""
+        import subprocess
+        base = "2b79619832444c0a63a8573d04f6cd02a4a113dc"
+        if subprocess.run(["git", "-C", str(ROOT), "cat-file", "-t", base], capture_output=True, text=True).stdout.strip() != "commit":
+            self.skipTest("the base commit is not in this clone (a shallow checkout)")
+        proc, got = evidence_cases([self.ctl(buildId=base.upper()), self.ctl(buildId=self.head_sha().upper(), stage=stage_log(480))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertTrue(any(p.startswith("EXPORT_PROFILE_FOREIGN") for p in got[0]["problems"]), got[0])
+        self.assertTrue(any(p.startswith("EXPORT_PROFILE_ABSENT") and "incomplete" in p for p in got[1]["problems"]), got[1])
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([self.ctl(buildId=base)]), encoding="utf-8")
+            proc, got = run_pwsh_json("$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                                      f"@($cases | ForEach-Object {{ $c = $_; $e = {EVIDENCE_CALL} -RenderPipeBuildClass DERIVE; [ordered]@{{ problems = @($e.problems) }} }}) "
+                                      "| ConvertTo-Json -Compress -Depth 8 -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertTrue(any(p.startswith("EXPORT_PROFILE_FOREIGN") for p in got[0]["problems"]), got[0])
+
+    def test_adversary_r2f1_a5_a_lookup_that_fails_is_never_cached_and_never_reads_older(self) -> None:
+        """pass 4 A5: a failed lookup was cached (unknown, or older when the header read failed), so one session kept that answer after the object became readable. Only a
+        header that was read decides a class; a seam that fails the header read once reads unknown, and the next call (seam restored) reads the real class."""
+        head = self.head_sha()
+        script = ("$m = Get-Module DualVenueRunner\n"
+                  "$first = & $m { param($id) $saved = $script:RenderPipeMarkerPath; $script:RenderPipeMarkerPath = 'src/debug/NoSuchHeader.h'; try { Get-DvRenderPipeBuildClass -BuildId $id } finally { $script:RenderPipeMarkerPath = $saved } } $env:DVE_HEAD\n"
+                  "$second = & $m { param($id) Get-DvRenderPipeBuildClass -BuildId $id } $env:DVE_HEAD\n"
+                  "$unknown1 = & $m { Get-DvRenderPipeBuildClass -BuildId ('0' * 40) }\n"
+                  "[ordered]@{ first = $first; second = $second; unknown = $unknown1 } | ConvertTo-Json -Compress")
+        proc, got = run_pwsh_json(script, DVE_HEAD=head)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got["first"], "unknown", "an unreadable header is no evidence of an older build")
+        self.assertEqual(got["second"], "emits", "and the failed read was not cached")
+        self.assertEqual(got["unknown"], "unknown")
+
+    def test_adversary_r2f1_a6_a_clip_name_that_only_looks_like_dones_is_another_clip(self) -> None:
+        """pass 4 A6: view-0 followed by U+200B in RENDER_START or RENDER_VERIFIED compared equal to DONE's view-0 under the culture-aware -cne. Names compare ordinally."""
+        zw = "view-0​"
+        cases = [self.ctl(batch=self.ctl_batch(self.CTL_START.replace("RENDER_START view-0", f"RENDER_START {zw}"))), self.ctl(batch=self.ctl_batch(verified_clip=zw))]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and "DONE" in p for p in g["problems"]), g)
 
     def test_r8_both_prores_leg_specs_gate_both_new_criteria(self) -> None:
         for name in ("m16-1243-export-prores", "m16-1456-export-prores"):
