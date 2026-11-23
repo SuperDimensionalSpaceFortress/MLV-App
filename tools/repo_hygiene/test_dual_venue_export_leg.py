@@ -116,9 +116,13 @@ def with_pipe_stages(log: str, frames: int, dual_iso_ms: float = 5.0) -> str:
     return log + per_frame + f"[mlv-stage-timing] frame={frames - 1} stage=export_pipe_drain ms=1.000\n[mlv-stage-timing] frame={frames - 1} stage=export_verify ms=1.000\n"
 
 
-def batch_log(exported: int, skipped: int = 0, elapsed: float = 20.0, verified: int | None = None) -> str:
+def batch_log(exported: int, skipped: int = 0, elapsed: float = 20.0, verified: int | None = None, scaled: bool | None = False) -> str:
     lines = ["[BATCH] Start", f"[BATCH] DONE view-0 exported={exported} skipped={skipped} elapsed={elapsed:.1f}"]
     if verified is not None:
+        # (EXPORT-RENDER-PIPE-TIMING-1 r1 fix 2: the rendered runner's own RENDER_START line, BatchRunner.cpp, which declares whether the frame plan is scaled; scaled=None omits it)
+        if scaled is not None:
+            lines.insert(1, f"[BATCH] RENDER_START view-0 codec=prores container=mov source=1x1 output=1x1 scaled={'true' if scaled else 'false'} fps=24 frames={exported} "
+                            f"cutIn=1 cutOut={exported} out=view-0.mov")
         lines.insert(1, f"[BATCH] RENDER_VERIFIED view-0 decoded_frames={verified} decoded_duration=10.000 decoded_frame_bytes=1 dimensions=1x1 bytes=9 "
                         "container_probe=ffmpeg.exe probe_source=ffmpeg-i codec=prores container=mov sar=1:1 dar=16:9")
     return "\n".join(lines) + "\n"
@@ -1245,7 +1249,7 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         self.assertEqual(st["largestStage"], "debayered_frame", "largestStage stays a share of processed16_total's top-level children")
         self.assertIsNone(st["rows"]["export_pipe_write"]["share"], "the pipe write is not inside processed16_total, so it is no share of it")
         # scaled: export_scale per frame is counted too
-        proc, got = evidence_cases([self.case(piped_stage_log(30, scale_ms=6.0))])
+        proc, got = evidence_cases([self.case(piped_stage_log(30, scale_ms=6.0), batch=batch_log(30, verified=30, scaled=True))])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         self.assertEqual(got[0]["outcome"], "PASS", got[0])
         self.assertAlmostEqual(got[0]["stages"]["untimedPerFrameMs"], 20000.0 / 30.0 - (56.0 + 6.0 + 10.0 + 10.0), places=3)
@@ -1282,7 +1286,7 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
 
     def test_r6_a_per_frame_pipe_stage_on_a_subset_of_frames_is_a_window_mismatch(self) -> None:
         cases = [self.case(piped_stage_log(30, pipe_frames=range(15))), self.case(piped_stage_log(30, pipe_frames=range(15)), criteria=[]),
-                 self.case(piped_stage_log(30, scale_ms=4.0).replace("frame=7 stage=export_scale ms=4.000\n", ""), criteria=[])]
+                 self.case(piped_stage_log(30, scale_ms=4.0).replace("frame=7 stage=export_scale ms=4.000\n", ""), batch=batch_log(30, verified=30, scaled=True), criteria=[])]
         proc, got = evidence_cases(cases)
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         for g in got:
@@ -1337,6 +1341,92 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
             self.assertEqual(g["outcome"], "INVALID", g)
             self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "the disjoint stages" in p and "llrawproc_dual_iso" in p for p in g["problems"]), g)
         self.assertEqual(got[2]["outcome"], "PASS", got[2])
+
+    @staticmethod
+    def rows_log(rows: tuple, frames: int = 480) -> str:
+        per = "".join(f"[mlv-stage-timing] frame={i} stage={s} ms={ms:.3f}\n" for i in range(frames) for s, ms in rows)
+        return per + f"[mlv-stage-timing] frame={frames - 1} stage=export_pipe_drain ms=100.000\n[mlv-stage-timing] frame={frames - 1} stage=export_verify ms=200.000\n"
+
+    def big(self, stage: str, frames: int = 480, **over) -> dict:
+        c = prores_case(maxFrames=frames, dualIsoExpected=True, stage=stage, batch=batch_log(frames, verified=frames, elapsed=60.0),
+                        criteria=leg("m16-1243-export-prores")["criteria"]["acceptance"]["cpu"])
+        c.update(over)
+        return c
+
+    def test_adversary_r1f2_a1_the_dual_iso_twin_group_is_not_judged_when_llrawproc_is_published(self) -> None:
+        """adversary A1 on 33f7a05a: the derived twin (raw_uint16 + llrawproc_dual_iso inside debayered_frame) fired beside a published llrawproc, where the dual-ISO figure is
+        INSIDE llrawproc and the real group already holds it: raw 23 + llrawproc 20 + dual-ISO 20.001 inside a 40 ms debayered_frame read INVALID. The twin stands in only for an
+        llrawproc the run did not publish."""
+        rows = (("raw_uint16", 23.0), ("llrawproc", 20.0), ("llrawproc_dual_iso", 20.001), ("debayered_frame", 40.0), ("processing", 15.0), ("processed16_total", 56.0),
+                ("export_pipe_write", 10.0))
+        proc, got = evidence_cases([self.big(self.rows_log(rows))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "PASS", got[0])
+        self.assertEqual(got[0]["problems"], [], got[0])
+
+    def test_adversary_r1f2_a3_the_render_start_scaled_flag_decides_whether_export_scale_is_owed(self) -> None:
+        """adversary A3 on 33f7a05a: the reader never read RENDER_START, so a scaled plan with no export_scale (its residual 6 ms high) and an unscaled plan carrying export_scale
+        (6 ms subtracted for work it declared none of) both read PASS. A build of this card declares scaled= and times export_scale on every frame exactly when it is true."""
+        def batch(scaled: bool, src: str, out: str) -> str:
+            return batch_log(480, verified=480, elapsed=60.0, scaled=None).replace(
+                "[BATCH] RENDER_VERIFIED", f"[BATCH] RENDER_START view-0 codec=prores container=mov source={src} output={out} scaled={'true' if scaled else 'false'} fps=24 "
+                                           "frames=480 cutIn=1 cutOut=480 out=view-0.mov\n[BATCH] RENDER_VERIFIED", 1)
+        scaled_log = piped_stage_log(480, scale_ms=6.0)
+        no_scale = "".join(l + "\n" for l in scaled_log.splitlines() if "stage=export_scale " not in l)
+        cases = [self.big(no_scale, batch=batch(True, "1920x1080", "1920x1440")), self.big(scaled_log, batch=batch(False, "1920x1080", "1920x1080")),
+                 self.big(scaled_log, batch=batch(True, "1920x1080", "1920x1440")), self.big(no_scale, batch=batch(False, "1920x1080", "1920x1080")),
+                 self.big(scaled_log, batch=batch_log(480, verified=480, elapsed=60.0, scaled=None))]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:2]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any("export_scale" in p and "scaled=" in p for p in g["problems"]), g)
+        for g in got[2:4]:
+            self.assertEqual(g["outcome"], "PASS", g)
+        self.assertAlmostEqual(got[2]["stages"]["untimedPerFrameMs"], 125.0 - (56.0 + 6.0 + 10.0 + 300.0 / 480.0), places=3)
+        self.assertEqual(got[4]["outcome"], "INVALID", got[4])
+        self.assertTrue(any("RENDER_START" in p for p in got[4]["problems"]), got[4])
+
+    def test_adversary_r1f2_a4_a_per_frame_stage_recorded_twice_on_one_frame_is_invalid(self) -> None:
+        """adversary A4 on 33f7a05a: per-frame records were SUMMED, so every export_pipe_write (or export_scale) repeated once doubled the subtracted work and still read PASS, and a
+        dual-ISO 0.000 row beside a 30.000 row on one frame read as an active frame. The producer notes each once per frame (llrawproc_dual_iso once per llrawproc record)."""
+        base = piped_stage_log(480)
+        dup_pipe = "".join(l + "\n" + (l + "\n" if "stage=export_pipe_write " in l else "") for l in base.splitlines())
+        scaled = piped_stage_log(480, scale_ms=6.0)
+        dup_scale = "".join(l + "\n" + (l + "\n" if "stage=export_scale " in l else "") for l in scaled.splitlines())
+        zero = piped_stage_log(480, dual_iso_ms=0.0)
+        dup_dual = "".join(l + "\n" + (l.replace("ms=0.000", "ms=30.000") + "\n" if "stage=llrawproc_dual_iso " in l else "") for l in zero.splitlines())
+        sb = batch_log(480, verified=480, elapsed=60.0, scaled=True)
+        proc, got = evidence_cases([self.big(dup_pipe), self.big(dup_scale, batch=sb), self.big(dup_dual), self.big(base)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g, stage in zip(got[:3], ("export_pipe_write", "export_scale", "llrawproc_dual_iso")):
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and stage in p and "per frame" in p for p in g["problems"]), (stage, g))
+        self.assertEqual(got[3]["outcome"], "PASS", got[3])
+
+    def test_adversary_r1f2_a5_a_log_with_some_of_this_cards_stages_is_an_incomplete_capture_not_an_older_build_or_a_fail(self) -> None:
+        """adversary A5 on 33f7a05a: a log that carries this card's pipe stages but no dual-ISO row kept the older-build reason, and one missing its drain (or verify) read a
+        product FAIL with no problem. Any of this card's stages is proof the build emits them all, so a missing one is an incomplete capture: INVALID, naming it."""
+        proc, got = evidence_cases([self.big(piped_stage_log(480, dual_iso=False)), self.big(piped_stage_log(480, drain_count=0)), self.big(piped_stage_log(480, verify_count=0)),
+                                    self.big(piped_stage_log(480).replace("stage=export_pipe_write", "stage=other_stage")),
+                                    self.big(stage_log(480) + "".join(f"[mlv-stage-timing] frame={i} stage=llrawproc_dual_iso ms=5.000\n" for i in range(480)))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g, stage in zip(got, ("llrawproc_dual_iso", "export_pipe_drain", "export_verify", "export_pipe_write", "export_pipe_write")):
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_PROFILE_ABSENT") and stage in p and "incomplete" in p for p in g["problems"]), (stage, g))
+            self.assertNotIn("a build before EXPORT-RENDER-PIPE-TIMING-1", json.dumps(g["metrics"]), g)
+        self.assertIs(got[1]["metrics"]["renderPipeTimed"], False)
+
+    def test_adversary_r1f2_a7_distinguish_a_frame_whose_raw_read_failed_carries_no_llrawproc_either_and_is_invalid(self) -> None:
+        """adversary A7 on 33f7a05a (DISTINGUISH): a raw-read failure returns before llrawproc runs, so that frame carries neither llrawproc nor llrawproc_dual_iso while
+        processed16_total is still timed. The base judge already holds llrawproc to processed16_total's frames, so the run is EXPORT_STAGE_WINDOW_MISMATCH: INVALID, never a
+        PASS with a dual-ISO class read from 479 of 480 frames."""
+        log = "".join(l + "\n" for l in piped_stage_log(480).splitlines() if not (l.startswith("[mlv-stage-timing] frame=17 stage=llrawproc")))
+        proc, got = evidence_cases([self.big(log)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "INVALID", got[0])
+        self.assertTrue(any(p.startswith("EXPORT_STAGE_WINDOW_MISMATCH") and "llrawproc" in p for p in got[0]["problems"]), got[0])
+        self.assertIsNone(got[0]["metrics"]["dualIsoClassAgrees"], got[0])
 
     def test_r8_both_prores_leg_specs_gate_both_new_criteria(self) -> None:
         for name in ("m16-1243-export-prores", "m16-1456-export-prores"):
@@ -2112,12 +2202,14 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
             (a / "export-profile.json").write_text(cdng_profile(frames, build_id=source_commit or self.sha) if profile_text is None else profile_text, encoding="utf-8")
         (a / "output-manifest.json").write_text(output_manifest(exported) if manifest is None else manifest, encoding="utf-8")
 
-    def validate(self, receipt: dict, spec: Path, dv: Path = DV, evidence_dir: str = "") -> dict:
+    def validate(self, receipt: dict, spec: Path, dv: Path = DV, evidence_dir: str = "", metrics_as_hashtable: bool = False) -> dict:
         rp = self.tmp / "receipt-under-test.json"
         rp.write_text(json.dumps(receipt), encoding="utf-8")
         ev = f" -EvidenceDir '{evidence_dir}'" if evidence_dir else ""
+        # (EXPORT-RENDER-PIPE-TIMING-1 r1 fix 2, adversary A2: the same metrics parsed -AsHashtable, as a caller that reads its receipt that way hands them over)
+        ht = "$r.metrics = ($r.metrics | ConvertTo-Json -Depth 20 | ConvertFrom-Json -AsHashtable)\n" if metrics_as_hashtable else ""
         proc, got = run_pwsh_json(f"Import-Module '{dv / 'DualVenueRunner.psm1'}' -Force\n"
-                                  f"$r = Get-Content -Raw '{rp}' | ConvertFrom-Json\n"
+                                  f"$r = Get-Content -Raw '{rp}' | ConvertFrom-Json\n{ht}"
                                   f"$v = Test-DvReceiptValid -Receipt $r -AllowOfflineTestMode -OfflineLegSpecBytes ([IO.File]::ReadAllBytes('{spec}')){ev}\n"
                                   "[ordered]@{ valid = $v.valid; status = $v.status; reasons = @($v.reasons) } | ConvertTo-Json -Compress")
         self.assertIsNotNone(got, proc.stdout + proc.stderr)
@@ -2378,6 +2470,9 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
         base["metrics"] = oracle["metrics"]
         base["export"]["stages"] = oracle["stages"]
         got = self.validate(base, spec)
+        self.assertEqual(got["status"], "VERIFIED_OFFLINE_TEST", got)
+        # r1 fix 2 (adversary A2 on 33f7a05a): the same base-shaped metrics parsed -AsHashtable are the same receipt (the shape test read PSCustomObject only)
+        got = self.validate(base, spec, metrics_as_hashtable=True)
         self.assertEqual(got["status"], "VERIFIED_OFFLINE_TEST", got)
         # the base shape is for old-format evidence only: the same base-shaped receipt over a log WITH the new stages is no re-derivation of it
         evdir = Path(receipt["evidence"]["localEvidenceDir"])
