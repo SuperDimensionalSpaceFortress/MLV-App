@@ -294,10 +294,11 @@ DRIFT_LEGS = {"legs/m16-1457-drift-t4-unpaced-fullscreen-s1.json": "legs/m16-145
 DRIFT_T1_LEGS = {"legs/m16-1457-drift-t1-unpaced-fullscreen-s1.json": None,
                  "legs/m16-1457-drift-t1-cool-unpaced-fullscreen-s1.json": "0x00003",
                  "legs/m16-1457-drift-t1-hot-unpaced-fullscreen-s1.json": "0x00030"}
-# r4, first sitting: those three legs and a 20 s window cannot be counted. The app's pace gate (PlaybackFrameRange.h playSafetyMs / playPaceProjectsPastBudget) gives a Play of W
-# seconds of a 59.94 fps clip a budget of W/0.5 + 15 s for 59.94 x W source frames, so W = 20 needs about 21.8 fps; the cap-1 legs ran 19.9 (plain) and 17.9 (cool core) fps and ended early,
-# PaceTooSlow -> INVALID_SOURCE_FRAMES, exit 14, uncounted (the 22 fps baseline itself sits 0.3 fps above that floor). HFR-10S-1 lets a clip of 50 fps or more play a 10 s window (the
-# schema floor), which needs about 17.1 fps. The w10 family below is the same four legs at playSeconds 10, plus the cap-16 comparison arm at the same window.
+# r4, first sitting: with a 20 s window those three legs are mostly uncountable on the CUDA backend. Its gated pace probe (PlaybackFrameRange.h playSafetyMs / playPaceProjectsPastBudget)
+# gives a Play of W seconds of a 59.94 fps clip a budget of W/0.5 + 15 s for 59.94 x W source frames, so W = 20 needs about 21.9 fps; five of the six cap-1 legs (19.9 plain, 17.9 to 18.4
+# pinned) ended early, PaceTooSlow -> INVALID_SOURCE_FRAMES, exit 14, uncounted (the 22 fps baseline sits 0.1 fps above that floor, and the one cap-1 leg that finished ran 21.912).
+# HFR-10S-1 lets a clip of 50 fps or more play a 10 s window (the schema floor), which needs about 17.3 fps. The w10 family below is the same four legs at playSeconds 10, plus the
+# cap-16 comparison arm at the same window.
 DRIFT_W10_LEGS = {"legs/m16-1457-drift-t1-w10-unpaced-fullscreen-s1.json": None,
                   "legs/m16-1457-drift-t1-cool-w10-unpaced-fullscreen-s1.json": "0x00003",
                   "legs/m16-1457-drift-t1-hot-w10-unpaced-fullscreen-s1.json": "0x00030",
@@ -19589,7 +19590,9 @@ class DriftLegSpecTests(unittest.TestCase):
                 self.assertEqual(list(self.load(rel)), list(source), "the source's keys in the source's order")
 
     # The slowest single-worker pace r4 measured with the 20 s window on Bachelor (OLD 4e306d0d, CUDA, 1457 fullscreen s1, cap 1 on one P-core's two logical CPUs): 17.923 fps
-    # (the cap-1 leg with no mask ran 19.856). Both ended early, PaceTooSlow -> exit 14, because a 20 s window needs about 21.8 fps.
+    # (the cap-1 leg with no mask ran 19.856 and 21.912). Five of the six 20 s cap-1 legs ended early, PaceTooSlow -> exit 14 (INVALID), because the CUDA backend's GATED pace probe
+    # gives a 20 s window a floor of about 21.9 fps; the sixth (21.912 fps) cleared it by 0.03 fps. A CPU-backend leg runs informational (PlayPaceMode::MeasuredInformational), has no
+    # such probe, and is not what these CUDA legs measure (r4 adversary pass 7 A1).
     SLOWEST_MEASURED_CAP1_FPS = 17.923
     FIRST_PRESENT_S = 0.26   # the measured first_present_ms of the cap-1 legs (258.263 ms): the budget runs from the Play trigger, the first frame comes this late
 
@@ -19603,8 +19606,9 @@ class DriftLegSpecTests(unittest.TestCase):
         return math.ceil(play_seconds * clip_fps) / (play_seconds / fraction + margin_ms / 1000.0 - self.FIRST_PRESENT_S)
 
     def test_the_20_second_window_cannot_host_a_cap_one_leg_and_the_w10_family_can(self) -> None:
-        """r4: the three cap-1 20 s legs ended PaceTooSlow (INVALID, uncounted). The floor a window sets is a function of the app's gate constants, so this
-        test computes it from the header: the 20 s window's floor is above every cap-1 pace measured, the 10 s window's floor is below all of them."""
+        """r4: five of the six cap-1 20 s CUDA legs ended PaceTooSlow (INVALID, uncounted). The floor a window sets on the CUDA (gated) backend is a function of the app's
+        gate constants, so this test computes it from the header: the 20 s window's floor is above every slower cap-1 pace measured, the 10 s window's floor is below
+        all of them. (CPU-backend legs are informational and have no such floor; these specs are benched on CUDA.)"""
         self.assertGreater(self.pace_floor_fps(20), 21.0)
         self.assertGreater(self.pace_floor_fps(20), self.SLOWEST_MEASURED_CAP1_FPS + 3.0)
         self.assertLess(self.pace_floor_fps(10), self.SLOWEST_MEASURED_CAP1_FPS)
