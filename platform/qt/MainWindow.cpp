@@ -2994,7 +2994,11 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
             const bool fpsWasMeasured = m_playbackInfoFpsShown > 0.0;
             // r3 pass-2 A1: frames stopped while playing (a draw happened, then none for > 500 ms). Once per stall: the reset
             // drops lastDrawTime, so hasDraw is false on the next idle tick. The next draw ends it.
-            const bool stallEntered = ui->actionPlay->isChecked() && hasDraw;
+            // INFO-2 r5 (r5 pass A3): only when the draw age is also past the label's expected-period deadline (read before the
+            // EMA is zeroed below), so a 1 fps Play's 500 ms meter reset is no label stall; the paint debt covers a real one.
+            const bool stallEntered = playback_info_label::labelFramesStallEntered( ui->actionPlay->isChecked(), hasDraw, presentationAgeWrapped,
+                hasDraw ? lastDrawTime.msecsTo( now ) : 0,
+                playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs ) );
             if( stallEntered ) m_playbackFramesStalled = true;
             else if( !ui->actionPlay->isChecked() ) m_playbackFramesStalled = false;
             m_playbackFpsEmaFrameMs = 0.0;

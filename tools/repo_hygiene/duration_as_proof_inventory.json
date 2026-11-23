@@ -2012,12 +2012,22 @@
     },
     {
       "path": "platform/qt/PlaybackInfoLabelPolicy.h",
-      "anchor": "const qint64 deadline = expectedFrameMs <= 0 ? kLabelPaintOwedMs",
+      "anchor": "if ( expectedFrameMs <= 0 ) return kLabelPaintOwedMs ;",
       "class": "value_fallback_select",
       "clock": "other",
-      "justification": "LOOK-LABEL-PLAYBACK-INFO-2 r4 (adversary r3 A3): labelPaintOwedDue selects the fixed kLabelPaintOwedMs deadline when the expected frame period is unknown (<= 0), else the period plus half. A deadline choice for when a stored label's owed paint is made; it never reads a duration as proof that a stage ran.",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-2 r4 (adversary r3 A3), moved by r5 (r5 pass A6) into labelPaintDeadlineMs: selects the fixed kLabelPaintOwedMs deadline when the expected frame period is unknown (<= 0), before any addition, else the (bounded) period plus half. A deadline choice for when a stored label's owed paint is made; it never reads a duration as proof that a stage ran.",
       "lines": [
-        256
+        253
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackInfoLabelPolicy.h",
+      "anchor": "return presentationAgeWrapped || msSinceLastDraw < 0 || msSinceLastDraw >= labelPaintDeadlineMs ( expectedFrameMs ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-2 r5 (r5 pass A3): labelFramesStallEntered decides whether the fps meter's reset is also a label stall (an immediate label repaint) by comparing the draw age with the label's expected-period deadline. A paint-timing choice for the corner label; it never reads a duration as proof that a stage ran.",
+      "lines": [
+        273
       ]
     },
     {

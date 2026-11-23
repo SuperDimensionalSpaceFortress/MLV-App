@@ -244,18 +244,33 @@ inline bool playingRelabelDeferred( bool playing, bool clockValid, qint64 elapse
  *  INFO-2 r4 (adversary r3 A3): the deadline is relative to the EXPECTED frame period (`expectedFrameMs`, from
  *  labelPaintExpectedFrameMs): kLabelPaintOwedMs when the period is unknown (<= 0), else max(kLabelPaintOwedMs, period + period/2),
  *  so a steady 10 fps Play (a frame every 100 ms) pays nothing while a stall still pays at 150 ms.
- *  INFO-2 r5 (adversary r4 A3): a period above kLabelPaintMaxExpectedFrameMs is clamped to it, so period + period/2 never
- *  overflows. */
+ *  INFO-2 r5 (adversary r4 A3, r5 pass A6): the deadline is labelPaintDeadlineMs, which selects the unknown-period floor before
+ *  any addition (INT64_MIN overflowed the old period + period/2) and clamps a period above kLabelPaintMaxExpectedFrameMs. */
 constexpr qint64 kLabelPaintOwedMs = 50;
 constexpr qint64 kLabelPaintMaxExpectedFrameMs = 1000000000;   // INFO-2 r5 (r4 A3): ~11.6 days; 1.5x of it fits a qint64
-inline bool labelPaintOwedDue( bool owed, bool framePresentedSinceStore, qint64 msSinceStore, qint64 expectedFrameMsIn )
+inline qint64 labelPaintDeadlineMs( qint64 expectedFrameMs )
 {
-    const qint64 expectedFrameMs = expectedFrameMsIn > kLabelPaintMaxExpectedFrameMs ? kLabelPaintMaxExpectedFrameMs
-                                                                                     : expectedFrameMsIn;
-    const qint64 relative = expectedFrameMs + expectedFrameMs / 2;
-    const qint64 deadline = expectedFrameMs <= 0 ? kLabelPaintOwedMs
-                                                 : ( relative > kLabelPaintOwedMs ? relative : kLabelPaintOwedMs );
-    return owed && !framePresentedSinceStore && msSinceStore >= deadline;
+    if( expectedFrameMs <= 0 ) return kLabelPaintOwedMs;
+    const qint64 period = expectedFrameMs > kLabelPaintMaxExpectedFrameMs ? kLabelPaintMaxExpectedFrameMs : expectedFrameMs;
+    const qint64 relative = period + period / 2;
+    return relative > kLabelPaintOwedMs ? relative : kLabelPaintOwedMs;
+}
+inline bool labelPaintOwedDue( bool owed, bool framePresentedSinceStore, qint64 msSinceStore, qint64 expectedFrameMs )
+{
+    return owed && !framePresentedSinceStore && msSinceStore >= labelPaintDeadlineMs( expectedFrameMs );
+}
+
+/*! \brief INFO-2 r5 (adversary r5 pass A3 on 976372d9): does the fps meter's reset enter a LABEL stall (m_playbackFramesStalled,
+ *  and the stored label pushed with a repaint)? The meter resets after its fixed kFpsMeterStallMs (500 ms) without a draw, which
+ *  at a 1 fps conform target is every frame: the reset at 512 ms painted the retained frame 496 ms before the paced one. The
+ *  label's stall uses its own expected-period deadline (labelPaintDeadlineMs, shared with the paint debt): playing, after a draw,
+ *  and the draw age at or past the deadline, negative (a wall-clock wrap) or the presentation age wrapped. At 24 fps (63 ms) and
+ *  10 fps (150 ms) the meter's reset is still a label stall; below 2 fps the stored label's paint debt pays instead. */
+inline bool labelFramesStallEntered( bool playing, bool hasDraw, bool presentationAgeWrapped, qint64 msSinceLastDraw,
+                                     qint64 expectedFrameMs )
+{
+    if( !playing || !hasDraw ) return false;
+    return presentationAgeWrapped || msSinceLastDraw < 0 || msSinceLastDraw >= labelPaintDeadlineMs( expectedFrameMs );
 }
 
 /*! \brief INFO-2 r4 (adversary r3 A3): the frame period a playing label's paint debt waits for: the larger of the target period

@@ -606,7 +606,8 @@ TEST(PlaybackInfoLabel, R3P2A1StalledFramesPaintTheStoredLabel)
         "const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn"
         " || m_playbackFramesStalled;")));
     const QString tick = functionBody(source, QStringLiteral("void MainWindow::timerFrameEvent("));
-    const int enteredAt = tick.indexOf(QStringLiteral("const bool stallEntered = ui->actionPlay->isChecked() && hasDraw;"));
+    // INFO-2 r5 (r5 pass A3): the stall entry reads the label's expected-period rule (InfoTwoR5A3b pins its arguments)
+    const int enteredAt = tick.indexOf(QStringLiteral("const bool stallEntered = playback_info_label::labelFramesStallEntered( ui->actionPlay->isChecked(), hasDraw,"));
     const int setAt = tick.indexOf(QStringLiteral("if( stallEntered ) m_playbackFramesStalled = true;"));
     const int pushAt = tick.indexOf(QStringLiteral("if( stallEntered && m_lookLabelFullscreenShown ) pushLookLabelOverlay();"));
     ASSERT_TRUE(enteredAt >= 0);
@@ -1168,7 +1169,7 @@ TEST(PlaybackInfoLabel, R13P15A2APlayToggleClearsThePreviousPlaysStall)
     // the push reads the flag for its repaint decision, and only an in-Play stall after a draw sets it again
     const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay( void )"));
     ASSERT_TRUE(push.contains(QStringLiteral("m_playbackFramesStalled;")));
-    ASSERT_TRUE(source.contains(QStringLiteral("const bool stallEntered = ui->actionPlay->isChecked() && hasDraw;")));
+    ASSERT_TRUE(source.contains(QStringLiteral("const bool stallEntered = playback_info_label::labelFramesStallEntered( ui->actionPlay->isChecked(), hasDraw,")));
     ASSERT_TRUE(source.contains(QStringLiteral("if( stallEntered ) m_playbackFramesStalled = true;")));
 }
 
@@ -2021,6 +2022,55 @@ TEST(PlaybackInfoLabel, InfoTwoR5A3EveryFinitePositiveRateMapsToItsPeriod)
     // R5f: an out-of-range expected period handed straight to the debt is clamped too (no signed overflow in period + period/2)
     ASSERT_FALSE(labelPaintOwedDue(true, false, cap + cap / 2 - 1, std::numeric_limits<qint64>::max()));
     ASSERT_TRUE(labelPaintOwedDue(true, false, cap + cap / 2, std::numeric_limits<qint64>::max()));
+}
+
+// INFO-2 r5 (adversary r5 pass A3 on 976372d9, introduced, major): the same 1 fps conform target, fullscreen GPU window, a draw at
+// 8 ms, the label stored at 250 ms and an idle tick at 512 ms (next handoff at 1008 ms). The 1500 ms debt declined, but the fps
+// meter's fixed 500 ms reset entered a label "stall" (m_playbackFramesStalled, and pushLookLabelOverlay with a repaint), an extra
+// paint of the retained frame 496 ms before the paced one. The label's stall is relative to the same expected-period deadline as its
+// paint debt; the meter's own reset is unchanged. Adversary r5 pass A6 (advisory): labelPaintOwedDue(true, false, 50, INT64_MIN)
+// added before it selected the unknown-period floor (signed overflow); labelPaintDeadlineMs selects the floor first.
+TEST(PlaybackInfoLabel, InfoTwoR5A3bTheLabelStallIsRelativeToTheExpectedFramePeriod)
+{
+    using playback_info_label::labelFramesStallEntered;
+    using playback_info_label::labelPaintDeadlineMs;
+    using playback_info_label::labelPaintExpectedFrameMs;
+    const qint64 oneFps = labelPaintExpectedFrameMs(1.0, 0.0);
+    // R5g: the adversary's literal: the 512 ms reset tick, 504 ms after the 8 ms draw, is no label stall at 1 fps
+    ASSERT_FALSE(labelFramesStallEntered(true, true, false, 512 - 8, oneFps));
+    ASSERT_FALSE(labelFramesStallEntered(true, true, false, 1499, oneFps));
+    ASSERT_TRUE(labelFramesStallEntered(true, true, false, 1500, oneFps));
+    // R5h: ordinary rates keep r3's stall entry at the meter's reset (the deadline is far under 500 ms)
+    ASSERT_TRUE(labelFramesStallEntered(true, true, false, 512 - 8, labelPaintExpectedFrameMs(24.0, 0.0)));
+    ASSERT_TRUE(labelFramesStallEntered(true, true, false, 512 - 8, labelPaintExpectedFrameMs(10.0, 0.0)));
+    ASSERT_TRUE(labelFramesStallEntered(true, true, false, 501, 0));   // unknown period: the 50 ms floor
+    // R5i: a wrapped presentation age, or a negative draw age, is a stall as the meter reads it; paused or no draw never is
+    ASSERT_TRUE(labelFramesStallEntered(true, true, true, 3, oneFps));
+    ASSERT_TRUE(labelFramesStallEntered(true, true, false, -86399000, oneFps));
+    ASSERT_FALSE(labelFramesStallEntered(false, true, false, 5000, oneFps));
+    ASSERT_FALSE(labelFramesStallEntered(true, false, false, 5000, oneFps));
+    // R5j (A6): the deadline selects the floor before any addition, and the debt and the stall share it
+    const qint64 cap = playback_info_label::kLabelPaintMaxExpectedFrameMs;
+    ASSERT_EQ(playback_info_label::kLabelPaintOwedMs, labelPaintDeadlineMs(std::numeric_limits<qint64>::min()));
+    ASSERT_EQ(playback_info_label::kLabelPaintOwedMs, labelPaintDeadlineMs(-1));
+    ASSERT_EQ(playback_info_label::kLabelPaintOwedMs, labelPaintDeadlineMs(0));
+    ASSERT_EQ(playback_info_label::kLabelPaintOwedMs, labelPaintDeadlineMs(10));
+    ASSERT_EQ(63, labelPaintDeadlineMs(42));
+    ASSERT_EQ(1500, labelPaintDeadlineMs(1000));
+    ASSERT_EQ(cap + cap / 2, labelPaintDeadlineMs(std::numeric_limits<qint64>::max()));
+    ASSERT_TRUE(playback_info_label::labelPaintOwedDue(true, false, 50, std::numeric_limits<qint64>::min()));
+    ASSERT_FALSE(playback_info_label::labelPaintOwedDue(true, false, 49, std::numeric_limits<qint64>::min()));
+    // R5k: the tick's reset reads the label rule with the expected period, before the reset zeroes the EMA
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString tick = functionBody(source, QStringLiteral("void MainWindow::timerFrameEvent("));
+    const int enteredAt = tick.indexOf(QStringLiteral(
+        "const bool stallEntered = playback_info_label::labelFramesStallEntered( ui->actionPlay->isChecked(), hasDraw, presentationAgeWrapped,\n"
+        "                hasDraw ? lastDrawTime.msecsTo( now ) : 0,\n"
+        "                playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs ) );"));
+    ASSERT_TRUE(enteredAt >= 0);
+    const int emaZeroAt = tick.indexOf(QStringLiteral("m_playbackFpsEmaFrameMs = 0.0;"), enteredAt);
+    ASSERT_TRUE(emaZeroAt > enteredAt);
+    ASSERT_FALSE(tick.contains(QStringLiteral("const bool stallEntered = ui->actionPlay->isChecked() && hasDraw;")));
 }
 
 // INFO-2 r2 (adversary pass 2 A2 on 9496cb72, introduced, major): 24 fps, start on paused frame 0, Cut Out 3, Loop off. Frames 1 and
