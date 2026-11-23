@@ -472,7 +472,11 @@ function Invoke-DvGit {
     # ref would swap a blob for another one under the same id (--no-replace-objects).
     # (EXPORT-RENDER-PIPE-TIMING-1 r2 fix 2, adversary A6 on c2da7e24: and no GIT_TRACE* variable, which makes git APPEND its trace to a file the caller names -- a read-only
     # reader such as Get-DvExportEvidence must write nothing; tools/coordination/lane-dirty-save.ps1 suppresses the same side effect)
-    foreach ($name in @($psi.Environment.Keys | Where-Object { $_ -match '^GIT_(DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|COMMON_DIR|NAMESPACE|REPLACE_REF_BASE|NO_REPLACE_OBJECTS)$' -or $_ -match '^GIT_TRACE' })) { [void]$psi.Environment.Remove($name) }
+    # (r3 fix 1, adversary A1 on 070ccd05: removing GIT_TRACE2* also removed a caller's GIT_TRACE2_EVENT=0, so a trace2.*Target in the global or system git config named
+    # the file instead; git reads those three from the environment BEFORE the config, so each is forced to 0 (off) below. Git for Windows' GIT_REDIRECT_STDIN / STDOUT /
+    # STDERR send git's streams to a file the caller names, so they are dropped too.)
+    foreach ($name in @($psi.Environment.Keys | Where-Object { $_ -match '^GIT_(DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|COMMON_DIR|NAMESPACE|REPLACE_REF_BASE|NO_REPLACE_OBJECTS)$' -or $_ -match '^GIT_TRACE' -or $_ -match '^GIT_REDIRECT_' })) { [void]$psi.Environment.Remove($name) }
+    foreach ($name in @('GIT_TRACE', 'GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_TRACE2_PERF')) { $psi.Environment[$name] = '0' }
     foreach ($a in (@('--no-replace-objects', '-C', $RepoRoot) + $GitArgs)) { [void]$psi.ArgumentList.Add($a) }
     $limit = Get-DvGitTimeoutMilliseconds
     # A fresh tag per call, inherited by everything git starts: how Stop-DvGitCall finds those children on Linux once their parent is gone.
@@ -5178,7 +5182,9 @@ $script:ExportRenderStartKeys = @('codec', 'container', 'source', 'output', 'sca
 # r3 (adversary A3 on c2da7e24): the ProRes producer's codec and container strings (BatchRenderedVideoPlan.h:1184 and :1196) and its fps form (a QLocale English decimal)
 $script:ExportRenderStartCodec = 'prores'
 $script:ExportRenderStartContainer = 'mov'
-$script:ExportRenderStartFps = '\A[0-9]{1,6}(?:\.[0-9]{1,9})?\z'
+# (r3 fix 1, adversary A2 on 070ccd05: QLocale::toString(double) is the general format, so a rate under 1e-4 or from 1e6 is written with QLocale English's exponent, a
+# lower-case e, a sign and at least two digits: 1e-05, 4.29497e+09)
+$script:ExportRenderStartFps = '\A[0-9]{1,6}(?:\.[0-9]{1,9})?(?:e[+-][0-9]{2,3})?\z'
 # r3 (adversary A2 on c2da7e24): the typed reason a ProRes run's dual-ISO class is not readable from a timed attempt, and the card that adds the producer's applied signal
 $script:ExportDualIsoAppliedUnknown = 'DUALISO_APPLIED_UNKNOWN'
 $script:ExportDualIsoAppliedSuccessor = 'successor EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1'
@@ -5215,7 +5221,7 @@ function Get-DvRenderStartDeclaration {
         return (& $no "EXPORT_PROFILE_FOREIGN: RENDER_START declares source=$($dims[0])x$($dims[1]) output=$($dims[2])x$($dims[3]); the rendered runner exports a clip with both dimensions above 0 and its frame plan refuses an output that is not (BatchRenderedVideoPlan.cpp), so the declaration is not of this export")
     }
     $fpsText = $hit.Groups['fps'].Value; $fps = [decimal]0
-    if (-not [regex]::IsMatch($fpsText, $script:ExportRenderStartFps) -or -not [decimal]::TryParse($fpsText, [Globalization.NumberStyles]::AllowDecimalPoint, [Globalization.CultureInfo]::InvariantCulture, [ref]$fps) -or $fps -le 0) {
+    if (-not [regex]::IsMatch($fpsText, $script:ExportRenderStartFps) -or -not [decimal]::TryParse($fpsText, ([Globalization.NumberStyles]::AllowDecimalPoint -bor [Globalization.NumberStyles]::AllowExponent), [Globalization.CultureInfo]::InvariantCulture, [ref]$fps) -or $fps -le 0) {
         return (& $no "EXPORT_PROFILE_FOREIGN: RENDER_START declares fps=$fpsText; the rendered runner declares the clip's frame rate as a finite decimal above 0 (batchRenderedVideoFfmpegFrameRateArgument), so the declaration is not of this export")
     }
     $n = [int64]$hit.Groups['n'].Value; $ci = [int64]$hit.Groups['ci'].Value; $co = [int64]$hit.Groups['co'].Value
