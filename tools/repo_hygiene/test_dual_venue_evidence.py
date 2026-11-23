@@ -34,6 +34,7 @@ import hashlib
 import inspect
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -19590,14 +19591,16 @@ class DriftLegSpecTests(unittest.TestCase):
     # The slowest single-worker pace r4 measured with the 20 s window on Bachelor (OLD 4e306d0d, CUDA, 1457 fullscreen s1, cap 1 on one P-core's two logical CPUs): 17.923 fps
     # (the cap-1 leg with no mask ran 19.856). Both ended early, PaceTooSlow -> exit 14, because a 20 s window needs about 21.8 fps.
     SLOWEST_MEASURED_CAP1_FPS = 17.923
+    FIRST_PRESENT_S = 0.26   # the measured first_present_ms of the cap-1 legs (258.263 ms): the budget runs from the Play trigger, the first frame comes this late
 
     def pace_floor_fps(self, play_seconds: int, clip_fps: float = 59.94) -> float:
-        """The pace the app's gate demands of a Play of `play_seconds` of a `clip_fps` clip, read from the constants in PlaybackFrameRange.h (playSafetyMs and
-        required_source_frames = seconds x native fps): frames / (seconds / kMinSustainedPaceFraction + kPlaySafetyMarginMs / 1000)."""
+        """The steady pace the app's gate demands of a Play of `play_seconds` of a `clip_fps` clip, read from the constants in PlaybackFrameRange.h (playSafetyMs and
+        required_source_frames = ceil(seconds x native fps), r4 adversary A3: whole frames, and the first present comes FIRST_PRESENT_S after the trigger):
+        frames / (seconds / kMinSustainedPaceFraction + kPlaySafetyMarginMs / 1000 - FIRST_PRESENT_S). 17.3 fps for 10 s, 21.9 fps for 20 s."""
         text = (Path(__file__).resolve().parents[2] / "platform" / "qt" / "PlaybackFrameRange.h").read_text(encoding="utf-8")
         fraction = float(re.search(r"constexpr double kMinSustainedPaceFraction = ([0-9.]+);", text).group(1))
         margin_ms = int(re.search(r"constexpr int kPlaySafetyMarginMs = (\d+);", text).group(1))
-        return play_seconds * clip_fps / (play_seconds / fraction + margin_ms / 1000.0)
+        return math.ceil(play_seconds * clip_fps) / (play_seconds / fraction + margin_ms / 1000.0 - self.FIRST_PRESENT_S)
 
     def test_the_20_second_window_cannot_host_a_cap_one_leg_and_the_w10_family_can(self) -> None:
         """r4: the three cap-1 20 s legs ended PaceTooSlow (INVALID, uncounted). The floor a window sets is a function of the app's gate constants, so this
@@ -19676,6 +19679,9 @@ class DriftLegSpecTests(unittest.TestCase):
                 self.assertEqual(bits & 0xFFF, bits, "a P-core logical CPU (0-11)")
                 first = (bits & -bits).bit_length() - 1
                 self.assertEqual(first % 2, 0, "the pair starts on an even logical CPU (2k, 2k+1)")
+                # r4 adversary A1: the two CPUs are ADJACENT (2k, 2k+1), the SMT-sibling layout Windows gives Bachelor's Alder Lake i9-12900HK (proved from the helper's per-CPU table
+                # against Core Temp's per-core load: correlation 0.999, the rival (k, k+6) order -0.57). {0, 2} or {0, 6} would be two cores and fail here.
+                self.assertEqual(bits >> first, 0b11, "adjacent logical CPUs only")
                 masks[rel] = bits
                 # the rest of the spec is the cap-1 leg's: only legId, the affinity keys and the two partition criteria differ
                 body = json.loads(json.dumps(spec))
