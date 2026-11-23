@@ -295,9 +295,9 @@ function Close-LegTicket([string]$LegName, [string]$Event, [string]$Why) {
         $pendingRel = ''; try { $pendingRel = [string](Release-VenueClaim -Venue $Venue -Nonce $strandedNonce -ClaimDir $ClaimDir -MaxAttempts 3) } catch { $pendingRel = 'ERROR' }
         if ($pendingRel -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) {
             [void]$script:strandedClaimNonces.Remove($strandedNonce)
-            L "CLAIM_PENDING_RELEASE leg=$LegName nonce=$strandedNonce result=$pendingRel (a claim a give-back could not let go of, released as the ticket ends)"
+            try { L "CLAIM_PENDING_RELEASE leg=$LegName nonce=$strandedNonce result=$pendingRel (a claim a give-back could not let go of, released as the ticket ends)" } catch { $null = $_ }   # r4 adversary A5: a log line that cannot be written never aborts the close (r7 A15)
         }
-        else { L "CLAIM_PENDING_RELEASE_NOT_RELEASED leg=$LegName nonce=$strandedNonce result=$pendingRel (the claim is STILL STANDING behind this chain; its nonce is kept and tried again at the next ticket close and at the chain's end)" }
+        else { try { L "CLAIM_PENDING_RELEASE_NOT_RELEASED leg=$LegName nonce=$strandedNonce result=$pendingRel (the claim is STILL STANDING behind this chain; its nonce is kept and tried again at the next ticket close and at the chain's end)" } catch { $null = $_ } }
     }
     if ($null -eq $script:ticket) { return }
     $r = Remove-VenueTicket -Ticket $script:ticket
@@ -607,8 +607,8 @@ foreach ($leg in $plan) {
 if ($null -ne $script:strandedClaimNonces) {
     foreach ($strandedNonce in @($script:strandedClaimNonces)) {
         $strandedAnswer = ''; try { $strandedAnswer = [string](Release-VenueClaim -Venue $Venue -Nonce $strandedNonce -ClaimDir $ClaimDir -MaxAttempts 3) } catch { $strandedAnswer = 'ERROR' }
-        if ($strandedAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { [void]$script:strandedClaimNonces.Remove($strandedNonce); L "CLAIM_PENDING_RELEASE leg=chain-end nonce=$strandedNonce result=$strandedAnswer (released as the chain ends)" }
-        else { L "CLAIM_PENDING_RELEASE_NOT_RELEASED leg=chain-end nonce=$strandedNonce result=$strandedAnswer (the claim is STILL STANDING; it breaks as dead-pid when this process exits, or at its expiry)" }
+        if ($strandedAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { [void]$script:strandedClaimNonces.Remove($strandedNonce); try { L "CLAIM_PENDING_RELEASE leg=chain-end nonce=$strandedNonce result=$strandedAnswer (released as the chain ends)" } catch { $null = $_ } }
+        else { try { L "CLAIM_PENDING_RELEASE_NOT_RELEASED leg=chain-end nonce=$strandedNonce result=$strandedAnswer (the claim is STILL STANDING; it breaks as dead-pid when this process exits, or at its expiry)" } catch { $null = $_ } }
     }
 }
 

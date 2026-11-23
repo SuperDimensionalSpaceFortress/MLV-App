@@ -369,8 +369,9 @@ function Get-VenueTickets {
     $rows = [System.Collections.Generic.List[object]]::new()
     $present = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $listAction = $(if ($ThrowOnListError) { 'Stop' } else { 'SilentlyContinue' })
-    if ($ThrowOnListError -and -not (Test-Path -LiteralPath $dir -PathType Container)) { throw "VENUE_TICKET_LIST_FAILED the ticket folder '$dir' is not readable" }
-    if (Test-Path -LiteralPath $dir -PathType Container) {
+    $dirThere = Test-Path -LiteralPath $dir -PathType Container   # ONE check (r4 adversary A1: a second one for the strict listing left a window in which a folder that went away answered no rows without an error)
+    if ($ThrowOnListError -and -not $dirThere) { throw "VENUE_TICKET_LIST_FAILED the ticket folder '$dir' is not readable" }
+    if ($dirThere) {
         foreach ($file in @(Get-ChildItem -LiteralPath $dir -Filter '*.ticket.json' -File -ErrorAction $listAction)) {
             $m = $script:TicketNameRx.Match($file.Name)
             if (-not $m.Success) { continue }
