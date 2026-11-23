@@ -111,20 +111,31 @@ def piped_stage_log(frames: int, dual_iso_ms: float = 30.0, llrawproc_ms: float 
 
 def with_pipe_stages(log: str, frames: int, dual_iso_ms: float = 5.0) -> str:
     """EXPORT-RENDER-PIPE-TIMING-1 forced companion: a test that judges a hand-written log under the SHIPPED ProRes criteria (which now gate dualIsoClassAgrees and
-    renderPipeTimed) appends what a build of that card emits: a small dual-ISO figure on every frame, a 1 ms pipe write per frame, one drain and one verify."""
-    per_frame = "".join(f"[mlv-stage-timing] frame={i} stage={s} ms={ms:.3f}\n" for i in range(frames) for s, ms in (("llrawproc_dual_iso", dual_iso_ms), ("export_pipe_write", 1.0)))
-    return log + per_frame + f"[mlv-stage-timing] frame={frames - 1} stage=export_pipe_drain ms=1.000\n[mlv-stage-timing] frame={frames - 1} stage=export_verify ms=1.000\n"
+    renderPipeTimed) appends what a build of that card emits: a small dual-ISO figure on every frame, a 1 ms pipe write per frame, one drain and one verify.
+    (r2, adversary A4 on a6f48506: on a frame that carries llrawproc the dual-ISO record is written right after it, as video_mlv.c writes it; a frame without llrawproc gets it appended.)"""
+    out, paired = [], set()
+    for line in log.splitlines():
+        out.append(line)
+        hit = re.match(r"\[mlv-stage-timing\] frame=(\d+) stage=llrawproc ms=", line)
+        if hit and int(hit.group(1)) < frames:
+            out.append(f"[mlv-stage-timing] frame={hit.group(1)} stage=llrawproc_dual_iso ms={dual_iso_ms:.3f}")
+            paired.add(int(hit.group(1)))
+    per_frame = "".join(f"[mlv-stage-timing] frame={i} stage=llrawproc_dual_iso ms={dual_iso_ms:.3f}\n" for i in range(frames) if i not in paired)
+    per_frame += "".join(f"[mlv-stage-timing] frame={i} stage=export_pipe_write ms=1.000\n" for i in range(frames))
+    return "\n".join(out) + "\n" + per_frame + f"[mlv-stage-timing] frame={frames - 1} stage=export_pipe_drain ms=1.000\n[mlv-stage-timing] frame={frames - 1} stage=export_verify ms=1.000\n"
 
 
 def batch_log(exported: int, skipped: int = 0, elapsed: float = 20.0, verified: int | None = None, scaled: bool | None = False) -> str:
-    lines = ["[BATCH] Start", f"[BATCH] DONE view-0 exported={exported} skipped={skipped} elapsed={elapsed:.1f}"]
+    lines = ["[BATCH] Start"]
     if verified is not None:
         # (EXPORT-RENDER-PIPE-TIMING-1 r1 fix 2: the rendered runner's own RENDER_START line, BatchRunner.cpp, which declares whether the frame plan is scaled; scaled=None omits it)
+        # (r2, adversary A5 on a6f48506: in the order BatchRunner.cpp writes them: RENDER_START before the frames, RENDER_VERIFIED after the verify, DONE last)
         if scaled is not None:
-            lines.insert(1, f"[BATCH] RENDER_START view-0 codec=prores container=mov source=1x1 output=1x1 scaled={'true' if scaled else 'false'} fps=24 frames={exported} "
-                            f"cutIn=1 cutOut={exported} out=view-0.mov")
-        lines.insert(1, f"[BATCH] RENDER_VERIFIED view-0 decoded_frames={verified} decoded_duration=10.000 decoded_frame_bytes=1 dimensions=1x1 bytes=9 "
-                        "container_probe=ffmpeg.exe probe_source=ffmpeg-i codec=prores container=mov sar=1:1 dar=16:9")
+            lines.append(f"[BATCH] RENDER_START view-0 codec=prores container=mov source=1x1 output=1x1 scaled={'true' if scaled else 'false'} fps=24 frames={exported} "
+                         f"cutIn=1 cutOut={exported} out=view-0.mov")
+        lines.append(f"[BATCH] RENDER_VERIFIED view-0 decoded_frames={verified} decoded_duration=10.000 decoded_frame_bytes=1 dimensions=1x1 bytes=9 "
+                     "container_probe=ffmpeg.exe probe_source=ffmpeg-i codec=prores container=mov sar=1:1 dar=16:9")
+    lines.append(f"[BATCH] DONE view-0 exported={exported} skipped={skipped} elapsed={elapsed:.1f}")
     return "\n".join(lines) + "\n"
 
 
@@ -1427,6 +1438,171 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         self.assertEqual(got[0]["outcome"], "INVALID", got[0])
         self.assertTrue(any(p.startswith("EXPORT_STAGE_WINDOW_MISMATCH") and "llrawproc" in p for p in got[0]["problems"]), got[0])
         self.assertIsNone(got[0]["metrics"]["dualIsoClassAgrees"], got[0])
+
+    # --- r2: adversary pass 3 on a6f48506 (A1-A6, advisory A8). The control is the adversary's own: 480 frames, cutIn=1 cutOut=480, the shipped acceptance criteria.
+    CTL_START = ("[BATCH] RENDER_START view-0 codec=prores container=mov source=1920x1080 output=1920x1080 scaled=false fps=24 frames=480 cutIn=1 cutOut=480 "
+                 "out=view-0.mov")
+
+    @classmethod
+    def ctl_batch(cls, start: str | None = None, verified_clip: str = "view-0", order: tuple = ("start", "verified", "done")) -> str:
+        lines = {"start": cls.CTL_START if start is None else start, "verified": f"[BATCH] RENDER_VERIFIED {verified_clip} decoded_frames=480",
+                 "done": "[BATCH] DONE view-0 exported=480 skipped=0 elapsed=60.0"}
+        return "\n".join(lines[k] for k in order) + "\n"
+
+    def ctl(self, stage: str | None = None, **over) -> dict:
+        c = self.big(piped_stage_log(480) if stage is None else stage, batch=self.ctl_batch())
+        c.update(over)
+        return c
+
+    @staticmethod
+    def head_sha() -> str:
+        import subprocess
+        return subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+
+    def test_adversary_r2_a1_the_legacy_shape_reads_zero_or_one_new_stage_under_strict_mode_and_stop(self) -> None:
+        """adversary A1 on a6f48506 (blocker): -LegacyRenderShape read .Count on a bare filter result, which under the module's Set-StrictMode -Version Latest throws
+        PropertyNotFoundStrict for zero or one matching stage. Called directly with ErrorActionPreference Stop, both must return: zero new stages -> the base shape (no
+        renderPipeTimed), one new stage -> this card's shape (and the incomplete capture typed)."""
+        one = stage_log(30) + "".join(f"[mlv-stage-timing] frame={i} stage=export_pipe_write ms=1.000\n" for i in range(30))
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([prores_case(dualIsoExpected=True, stage=stage_log(30)), prores_case(dualIsoExpected=True, stage=one)]), encoding="utf-8")
+            proc, got = run_pwsh_json("$ErrorActionPreference = 'Stop'\n$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                                      f"@($cases | ForEach-Object {{ $c = $_; try {{ $e = {EVIDENCE_CALL} -LegacyRenderShape; "
+                                      "[ordered]@{ threw = $null; metrics = $e.metrics; problems = @($e.problems) } } catch { [ordered]@{ threw = [string]$_.FullyQualifiedErrorId } } }) "
+                                      "| ConvertTo-Json -Compress -Depth 8 -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got:
+            self.assertIsNone(g["threw"], g)
+        self.assertNotIn("renderPipeTimed", got[0]["metrics"], "zero new stages: the base reader's shape")
+        self.assertEqual(got[0]["problems"], [], got[0])
+        self.assertIn("renderPipeTimed", got[1]["metrics"], "one new stage: this card's shape, never the base one")
+        self.assertTrue(any(p.startswith("EXPORT_PROFILE_ABSENT") and "incomplete" in p for p in got[1]["problems"]), got[1])
+
+    def test_adversary_r2_a2_render_start_is_read_whole_for_dones_clip(self) -> None:
+        """adversary A2 on a6f48506: the first scaled= token of any RENDER_START line was the declaration, so a conflicting second scaled=, a line cut short after scaled= and
+        another clip's line all read PASS. The line is read whole, in the producer's field order, for the clip DONE names."""
+        conflict = self.CTL_START.replace("output=1920x1080 scaled=false", "output=1920x1440 scaled=false scaled=true")
+        foreign = self.CTL_START.replace("RENDER_START view-0", "RENDER_START view-1")
+        cut = self.CTL_START.split(" fps=")[0]
+        doubled = self.CTL_START.replace(" out=view-0.mov", " cutIn=1 out=view-0.mov")
+        cases = [self.ctl(batch=self.ctl_batch(s)) for s in (conflict, foreign, cut, doubled)] + [self.ctl()]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:4]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any("RENDER_START" in p for p in g["problems"]), g)
+        self.assertTrue(any("view-1" in p and "DONE" in p for p in got[1]["problems"]), got[1])
+        self.assertEqual(got[4]["outcome"], "PASS", got[4])
+        self.assertEqual(got[4]["problems"], [], got[4])
+
+    @staticmethod
+    def shift(log: str, by: int) -> str:
+        return re.sub(r"frame=(\d+)", lambda m: f"frame={int(m.group(1)) + by}", log)
+
+    def test_adversary_r2_a3_the_frame_window_is_the_declared_cut_not_the_log(self) -> None:
+        """adversary A3 on a6f48506: the window came from the stage log itself, so frames 1..480 under cutIn=1 cutOut=480 read PASS (the producer's loop, BatchRunner.cpp:541,
+        times frames cutIn-1 .. cutOut-1 only), and a one-frame cut timed on frame 999999999999 read no problem. The control: a cut that starts at 5 is timed on 4..483."""
+        rows = (("raw_uint16", 9.0), ("llrawproc", 31.0), ("llrawproc_dual_iso", 30.0), ("debayered_frame", 40.0), ("processing", 15.0), ("processed16_total", 56.0), ("export_pipe_write", 10.0))
+        one = "".join(f"[mlv-stage-timing] frame=999999999999 stage={s} ms={ms:.3f}\n" for s, ms in rows)
+        one += "[mlv-stage-timing] frame=999999999999 stage=export_pipe_drain ms=1.000\n[mlv-stage-timing] frame=999999999999 stage=export_verify ms=1.000\n"
+        one_batch = ("[BATCH] RENDER_START view-0 codec=prores container=mov source=1x1 output=1x1 scaled=false fps=24 frames=1 cutIn=1 cutOut=1 out=view-0.mov\n"
+                     "[BATCH] RENDER_VERIFIED view-0 decoded_frames=1\n[BATCH] DONE view-0 exported=1 skipped=0 elapsed=1.0\n")
+        at5 = self.CTL_START.replace("cutIn=1 cutOut=480", "cutIn=5 cutOut=484")
+        cases = [self.ctl(self.shift(piped_stage_log(480), 1)), prores_case(maxFrames=1, dualIsoExpected=True, stage=one, batch=one_batch, criteria=[]),
+                 self.ctl(self.shift(piped_stage_log(480), 4), batch=self.ctl_batch(at5)), self.ctl(piped_stage_log(480), batch=self.ctl_batch(at5))]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in (got[0], got[1], got[3]):
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_STAGE_WINDOW_MISMATCH") and "cutIn" in p for p in g["problems"]), g)
+        self.assertEqual(got[2]["outcome"], "PASS", got[2])
+        self.assertEqual(got[2]["problems"], [], got[2])
+
+    def test_adversary_r2_a4_each_dual_iso_record_pairs_with_the_llrawproc_run_it_follows(self) -> None:
+        """adversary A4 on a6f48506: per-frame sums lost the pairing, so llrawproc 0 / dual-ISO 30 then llrawproc 31 / dual-ISO 0 on every frame summed to 31 / 30 and read all
+        480 frames active. Each dual-ISO record is the one right after an llrawproc record of its frame, inside that run. Controls: the producer's order, and a figure inside the slack."""
+        base = piped_stage_log(480)
+        def swap(line: str) -> str:
+            if " stage=llrawproc ms=" in line:
+                f = line.split("frame=")[1].split(" ")[0]
+                return (f"[mlv-stage-timing] frame={f} stage=llrawproc ms=0.000\n[mlv-stage-timing] frame={f} stage=llrawproc_dual_iso ms=30.000\n"
+                        f"[mlv-stage-timing] frame={f} stage=llrawproc ms=31.000\n[mlv-stage-timing] frame={f} stage=llrawproc_dual_iso ms=0.000\n")
+            return "" if " stage=llrawproc_dual_iso " in line else line + "\n"
+        finding = "".join(swap(l) for l in base.splitlines())
+        lines = base.splitlines()
+        moved = [l for l in lines if " stage=llrawproc_dual_iso " not in l]
+        moved = "\n".join(moved[:-2] + [l for l in lines if " stage=llrawproc_dual_iso " in l] + moved[-2:]) + "\n"
+        proc, got = evidence_cases([self.ctl(finding), self.ctl(moved), self.ctl(), self.ctl(piped_stage_log(480, dual_iso_ms=31.0, llrawproc_ms=30.0))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:2]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "llrawproc_dual_iso" in p and "follow" in p for p in g["problems"]), g)
+        for g in got[2:]:
+            self.assertEqual(g["outcome"], "PASS", g)
+
+    def test_adversary_r2_a5_clip_records_and_batch_lines_keep_the_producers_order(self) -> None:
+        """adversary A5 on a6f48506: export_verify moved to the first line, and RENDER_START moved below DONE, both read PASS; the fixture batch_log() itself wrote
+        RENDER_VERIFIED before RENDER_START. The drain and verify follow every per-frame record (verify after the drain), and RENDER_START, RENDER_VERIFIED and DONE keep their order."""
+        lines = piped_stage_log(480).splitlines()
+        verify_first = "\n".join([lines[-1]] + lines[:-1]) + "\n"
+        verify_before_drain = "\n".join(lines[:-2] + [lines[-1], lines[-2]]) + "\n"
+        drain_mid = "\n".join(lines[:100] + [lines[-2]] + lines[100:-2] + [lines[-1]]) + "\n"
+        cases = [self.ctl(verify_first), self.ctl(verify_before_drain), self.ctl(drain_mid), self.ctl(batch=self.ctl_batch(order=("verified", "done", "start"))),
+                 self.ctl(batch=self.ctl_batch(order=("verified", "start", "done")))]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:3]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and ("export_verify" in p or "export_pipe_drain" in p) for p in g["problems"]), g)
+        for g in got[3:]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any("RENDER_START" in p and ("DONE" in p or "order" in p) for p in g["problems"]), g)
+        text = batch_log(30, verified=30)
+        self.assertLess(text.index("RENDER_START"), text.index("RENDER_VERIFIED"))
+        self.assertLess(text.index("RENDER_VERIFIED"), text.index("[BATCH] DONE"))
+
+    def test_adversary_r2_a6_a_log_without_the_new_stages_from_a_build_that_emits_them_is_an_incomplete_capture(self) -> None:
+        """adversary A6 on a6f48506: with ExpectedBuildId this head and none of the new stages, the reader presumed an older build and the shipped criteria read FAIL with no
+        problem. A build whose own src/debug/StageTiming.h defines this card's stages times them all, so that log is an incomplete capture: INVALID, typed, with no older-build
+        reason. Removing only export_verify stays INVALID too."""
+        head = self.head_sha()
+        old = stage_log(480)
+        only_verify_gone = "".join(l + "\n" for l in piped_stage_log(480).splitlines() if " stage=export_verify " not in l)
+        proc, got = evidence_cases([self.ctl(old, buildId=head), self.ctl(only_verify_gone, buildId=head), self.ctl(buildId=head)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:2]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_PROFILE_ABSENT") and "incomplete" in p for p in g["problems"]), g)
+            self.assertNotIn("a build before EXPORT-RENDER-PIPE-TIMING-1", json.dumps(g["metrics"]), g)
+        self.assertTrue(any(head in p for p in got[0]["problems"]), got[0])
+        self.assertEqual(got[2]["outcome"], "PASS", got[2])
+
+    def test_adversary_r2_a6_distinguish_a_build_this_repo_cannot_name_keeps_the_r1_reading_and_an_older_build_cannot_carry_the_stages(self) -> None:
+        """A6, the distinguished half: a build id that is no commit of this repo (the fixtures' 'e' * 40, or a venue build from another tree) cannot be classed, so a log without
+        the new stages keeps the r1 reading (null metrics, refused by the criteria, never PASS). And the base commit 2b796198, which defines none of this card's stages, beside a
+        log carrying them is EXPORT_PROFILE_FOREIGN."""
+        proc, got = evidence_cases([self.ctl(stage_log(480), buildId=BUILD_ID)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertNotEqual(got[0]["outcome"], "PASS", got[0])
+        self.assertIsNone(got[0]["metrics"]["renderPipeTimed"], got[0])
+        import subprocess
+        base = "2b79619832444c0a63a8573d04f6cd02a4a113dc"
+        if subprocess.run(["git", "-C", str(ROOT), "cat-file", "-t", base], capture_output=True, text=True).stdout.strip() != "commit":
+            self.skipTest("the base commit is not in this clone (a shallow checkout)")
+        proc, got = evidence_cases([self.ctl(buildId=base), self.ctl(stage_log(480), buildId=base)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "INVALID", got[0])
+        self.assertTrue(any(p.startswith("EXPORT_PROFILE_FOREIGN") and base in p for p in got[0]["problems"]), got[0])
+        self.assertNotEqual(got[1]["outcome"], "PASS", got[1])
+        self.assertEqual(got[1]["problems"], [], "an older build's log raises no new problem")
+
+    def test_adversary_r2_a8_render_verified_is_of_the_clip_done_names(self) -> None:
+        """advisory A8 on a6f48506 (base defect, fixed in scope): RENDER_VERIFIED view-1 beside DONE view-0 read PASS."""
+        proc, got = evidence_cases([self.ctl(batch=self.ctl_batch(verified_clip="view-1"))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "INVALID", got[0])
+        self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and "view-1" in p for p in got[0]["problems"]), got[0])
 
     def test_r8_both_prores_leg_specs_gate_both_new_criteria(self) -> None:
         for name in ("m16-1243-export-prores", "m16-1456-export-prores"):
