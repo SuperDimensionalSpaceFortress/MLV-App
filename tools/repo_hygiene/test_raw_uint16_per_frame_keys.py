@@ -97,7 +97,9 @@ _QMAKE_ACCEPTED_OPTION = re.compile("|".join((
     r"-W(?![lap],)[A-Za-z0-9_+=.-]+",           # -Wall, -Wno-x, -Werror=x; never -Wl,/-Wa,/-Wp, (a joined option and its operand)
     r"-D[A-Za-z_][A-Za-z0-9_]*(?:=[^\s,]*)?",
     r"-[ILF][^\s,-][^\s,]*",                     # -I/path, -L/path, -F/path; the path is joined, never the next token
-    r"-l(?!azy_|to_)[A-Za-z0-9_+.-]+")))         # -lomp, -lgomp, -lc++; never ld64's -lazy_framework / -lazy_library / -lto_library
+    # -lomp, -lgomp, -lc++, -llibgomp-1. No `_`: every ld64 -l* option with a separate operand (-lazy_framework, -lazy_library,
+    # -lto_library, -load_hidden) has one, so a denylist of those four is replaced by the class (fable r7).
+    r"-l[A-Za-z0-9+.-]+")))
 # Every other QMAKE variable (QMAKE_RUN_CC*, QMAKE_CC_*, QMAKE_CXXFLAGS, QMAKE_EXTRA_COMPILERS, QMAKESPEC, ...) can change how
 # the C compile or the link is spelled, and the model reads none of them (sol r5 A2): an assignment to one is refused unless it is
 # one the project files use for something that touches neither line.
@@ -117,6 +119,9 @@ def _qmake_value_expansion_is_unsafe(value: str) -> bool:
         return True
     return any(name not in _QMAKE_READONLY_VALUE_FUNCTIONS for name in _QMAKE_VALUE_FUNCTION_CALL.findall(value))
 _QMAKE_MAX_INCLUDE_NESTING = 8
+# Nesting alone leaves k^7 reads for a fan-out of k, so the total number of include() files one judgement reads is bounded too
+# (fable r7 LJ92-PIN-INCLUDE-TOTAL-READ-BOUND-1). The project files the pin reads include a handful.
+_QMAKE_MAX_INCLUDE_READS = 64
 # CONFIG tokens a `+=` may add: none of them is a selector the model reads (macx, a platform name, debug/release).
 _QMAKE_BENIGN_CONFIG_TOKENS = frozenset(("c++11", "c++14", "c++17", "c++20", "console", "warn_on", "warn_off"))
 # Flag variables whose content can switch OpenMP off for the C compile (QMAKE_CFLAGS and its per-configuration forms) or
@@ -354,6 +359,7 @@ def _qmake_simulate(
     values: "dict[str, list[str]]" = {name: [] for name in _QMAKE_TRACKED_VARS}
     branch_local: "dict[str, set[str]]" = {name: set() for name in _QMAKE_TRACKED_VARS}
     possible: "dict[str, set[str]]" = {}
+    reads_made = [0]
 
     def watched(variable: str) -> bool:
         return (variable in values or bool(_QMAKE_COMPILE_FLAG_VARIABLE.fullmatch(variable))
@@ -442,6 +448,10 @@ def _qmake_simulate(
         if _qmake_include_leaves_checkout(target, checkout_root):
             raise AssertionError("unsupported qmake construct: include(" + relative + ") resolves outside the checkout (or through "
                                  "a link out of it); it is refused unread")
+        reads_made[0] += 1
+        if reads_made[0] > _QMAKE_MAX_INCLUDE_READS:
+            raise AssertionError("unsupported qmake construct: more than " + str(_QMAKE_MAX_INCLUDE_READS)
+                                 + " include() reads in one judgement (a fan-out of nested includes)")
         try:
             text = _read_qmake_file(target)
         except (OSError, UnicodeError) as error:
@@ -847,6 +857,21 @@ _MACX_PIN_REFUSED = (
     ("G-A1 a bare dash", _arm64_section("QMAKE_CFLAGS += - -fopenmp", "LIBS += -lomp"), ""),
     ("G-A1 -I with nothing joined to it, on the line before an inherited flag", _arm64_section(
         "QMAKE_CFLAGS += -I", "LIBS += -lomp"), "macx:QMAKE_CFLAGS += -fopenmp"),
+    # fable r7 R5-OPERAND-LIST: ld64's -load_hidden takes the next token as its archive path, and it hid behind the `-l<name>`
+    # spelling the same way -lazy_framework did. The class is "every ld64 -l* option with a separate operand": all four contain `_`,
+    # no library name the project links does, so `_` is not a character of the -l<name> alternative.
+    ("H-A1 -load_hidden consumes the -lomp after it (the repro)", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp", "LIBS += -load_hidden -lomp"), ""),
+    ("H-A1 -load_hidden consumes the -lgomp after it", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp", "LIBS += -load_hidden -lgomp"), ""),
+    ("H-A1 -load_hidden consumes the -llibgomp-1 after it", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp", "LIBS += -load_hidden -llibgomp-1"), ""),
+    ("H-A1 -load_hidden in QMAKE_LFLAGS consumes the -lomp after it", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp", "QMAKE_LFLAGS += -load_hidden -lomp", "LIBS += -lomp"), ""),
+    ("H-A1 -load_hidden on one line, -lomp on the next", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp", "LIBS += -load_hidden", "LIBS += -lomp"), ""),
+    ("H-A1 -load_hidden in the project's own other flag variable", _arm64_section(
+        "QMAKE_CFLAGS += -fopenmp -load_hidden", "LIBS += -lomp"), ""),
 )
 
 # QMAKE variables the project files use that change neither the C compile line nor the link line.
@@ -1279,6 +1304,52 @@ int main(void)
                     text = _MACX_PIN_TEMPLATE % {"arm64": _ARM64_LIVE, "tail": "include(" + name + ")"}
                     with self.assertRaisesRegex(AssertionError, "unsupported qmake construct"):
                         _macos_openmp_gaps(text, "arm64", root, checkout_root=root)
+
+    def test_macos_arch_pin_link_guard_is_tested_without_needing_the_symlink_right(self) -> None:
+        """fable r7 LJ92-PIN-LINK-GUARD-TEST-COVERAGE-1: the symlink test above skips on a host that cannot create a link, and
+        nothing exercised the junction branch, so deleting either check left the suite green there. A real directory stands in
+        for the link and the operating-system probe is told it is one, so both branches are judged on every host."""
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch) / "checkout"
+            (root / "sub" / "link").mkdir(parents=True)
+            (root / "sub" / "link" / "x.pri").write_text("", encoding="utf-8")
+            marked = os.path.join(os.path.abspath(str(root)), "sub", "link")
+            text = _MACX_PIN_TEMPLATE % {"arm64": _ARM64_LIVE, "tail": "include(link/x.pri)"}
+            self.assertEqual(_macos_openmp_gaps(text, "arm64", root / "sub", checkout_root=root), [], "a plain directory is fine")
+            real_islink, real_isjunction = os.path.islink, getattr(os.path, "isjunction", lambda _path: False)
+            for name, patched in (
+                    ("symlink", {"islink": lambda path: path == marked or real_islink(path)}),
+                    ("junction", {"isjunction": lambda path: path == marked or real_isjunction(path)})):
+                with self.subTest(name), mock.patch.multiple(os.path, create=True, **patched):
+                    with self.assertRaisesRegex(AssertionError, "unsupported qmake construct"):
+                        _macos_openmp_gaps(text, "arm64", root / "sub", checkout_root=root)
+
+    def test_macos_arch_pin_bounds_the_total_number_of_includes_it_reads(self) -> None:
+        """fable r7 LJ92-PIN-INCLUDE-TOTAL-READ-BOUND-1: nesting is bounded, the count is not: a chain with a fan-out of k at each
+        of seven levels costs k^7 reads. The total is bounded too, and the refusal comes before the budget is spent."""
+        fan_out = 4
+        reads: "list[Path]" = []
+
+        def spy(path: Path) -> str:
+            reads.append(path)
+            level = int(path.stem[1:])
+            return "include(a%d.pri)\n" % (level + 1) * fan_out if level < 7 else ""
+
+        text = _MACX_PIN_TEMPLATE % {"arm64": _ARM64_LIVE, "tail": "include(a0.pri)"}
+        with mock.patch.dict(globals(), {"_read_qmake_file": spy}):
+            with self.assertRaisesRegex(AssertionError, "unsupported qmake construct.*more than"):
+                _macos_openmp_gaps(text, "arm64", Path("proj"), checkout_root=Path("proj"))
+        self.assertLessEqual(len(reads), _QMAKE_MAX_INCLUDE_READS, "the refusal must come before the budget is overspent")
+
+    def test_macos_arch_pin_accepts_no_dash_l_option_that_carries_an_underscore(self) -> None:
+        """fable r7 R5-OPERAND-LIST, class form: every ld64 `-l*` option that takes its operand as the next token has an `_`
+        in its name; the library names the project links do not. So the -l<name> alternative must refuse any `_`."""
+        for token in ("-lazy_framework", "-lazy_library", "-lto_library", "-load_hidden", "-lfuture_option", "-l_x"):
+            with self.subTest(token):
+                self.assertIsNone(_QMAKE_ACCEPTED_OPTION.fullmatch(token))
+        for token in ("-lomp", "-lgomp", "-llibgomp-1", "-lc++", "-lm", "-lomp-west", "-lz.1"):
+            with self.subTest(token):
+                self.assertIsNotNone(_QMAKE_ACCEPTED_OPTION.fullmatch(token))
 
     def test_macos_arch_pin_still_follows_parent_and_nested_relative_includes(self) -> None:
         """The refusal above must not turn away the includes the real projects use (`../common/x.pri`, `sub/x.pri`)."""
