@@ -167,9 +167,19 @@ $deadline = $(if ($DeadlineUtc) { [DateTimeOffset]::Parse($DeadlineUtc, [Globali
 $pwshExe = [Environment]::ProcessPath
 if (-not $Purpose) { $Purpose = "Invoke-VenueChain $(Split-Path -Leaf $RunDir)" }
 
-function L([string]$Message) {
-    $line = "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $Message"
-    Add-Content -LiteralPath $ChainLog -Value $line
+function L([string]$Message, [switch]$Raw) {
+    # TAIL-1 r5 (sol r4 B1): chain.log is the chain's record, never its control. A log another handle holds against writes (a reader with FileShare.Read, a scan) made Add-Content throw, and under
+    # ErrorActionPreference Stop that throw ended the chain wherever the line was: at a ticket close before the final nonce retry, at the chain-end retry, or at CHAIN_RESULT itself. The write is tried a
+    # few times (50 ms apart, a transient hold lets go), then the line is said on stderr as CHAIN_LOG_WRITE_FAILED and the chain goes on; stdout always carries the line. -Raw writes $Message as it is
+    # (the CHAIN_RESULT line has no time stamp). Kept self-contained: the tests lift this function from the script by name.
+    $line = $(if ($Raw) { $Message } else { "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $Message" })
+    for ($logTry = 1; $logTry -le 3; $logTry++) {
+        try { Add-Content -LiteralPath $ChainLog -Value $line -ErrorAction Stop; break }
+        catch {
+            if ($logTry -lt 3) { [Threading.Thread]::Sleep(50) }
+            else { try { [Console]::Error.WriteLine("CHAIN_LOG_WRITE_FAILED path=$ChainLog error=$($_.Exception.Message) line=$line") } catch { $null = $_ } }
+        }
+    }
     Write-Output $line
 }
 
@@ -300,10 +310,15 @@ function Close-LegTicket([string]$LegName, [string]$Event, [string]$Why) {
         else { try { L "CLAIM_PENDING_RELEASE_NOT_RELEASED leg=$LegName nonce=$strandedNonce result=$pendingRel (the claim is STILL STANDING behind this chain; its nonce is kept and tried again at the next ticket close and at the chain's end)" } catch { $null = $_ } }
     }
     if ($null -eq $script:ticket) { return }
-    $r = Remove-VenueTicket -Ticket $script:ticket
-    L "$Event leg=$LegName ticket=$($script:ticket.name) result=$r reason=$Why keeps=$($script:ticketKeeps)/$TicketKeepMax"
-    $script:ticket = $null
-    $script:ticketKeeps = 0
+    # TAIL-1 r5 (sol r4 B1): a held chain.log made the TICKET_ENDED line throw after the ticket file was gone, the object still set, so the chain ended before its final nonce retry and CHAIN_RESULT. The line is
+    # best effort and the object is dropped in a finally. (A removal that itself throws still ends the chain as before: its live ticket must not outlast it in the line.)
+    $r = 'ERROR'
+    try { $r = [string](Remove-VenueTicket -Ticket $script:ticket) }
+    finally {
+        try { L "$Event leg=$LegName ticket=$($script:ticket.name) result=$r reason=$Why keeps=$($script:ticketKeeps)/$TicketKeepMax" } catch { $null = $_ }
+        $script:ticket = $null
+        $script:ticketKeeps = 0
+    }
 }
 
 # SUPPLEMENTARY LEGS (header item 6). Everything below is best-effort and OUTSIDE the chain's verdicts: its results go to $suppResults only (never $results, $exitCode, $stopReason or the
@@ -620,7 +635,7 @@ $summary = [ordered]@{
 }
 if ($streakStop) { $summary['unhealthyStop'] = $streakStop }
 $resultLine = 'CHAIN_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 6)
-Add-Content -LiteralPath $ChainLog -Value $resultLine
-Write-Output $resultLine
+L $resultLine -Raw   # TAIL-1 r5 B1: through L's bounded, non-throwing write, so a held chain.log can no longer end the chain before its typed result reaches stdout and its exit code
+
 Complete-VenueProcess -ExitCode $exitCode   # a share read abandoned at its timeout would otherwise keep this process alive until it ends
 exit $exitCode
