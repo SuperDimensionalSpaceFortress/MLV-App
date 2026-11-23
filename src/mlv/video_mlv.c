@@ -6976,6 +6976,12 @@ void getMlvRawFrameDebayered(mlvObject_t * video, uint64_t frameIndex, uint16_t 
     uint64_t pixels_count = frame_pixels;
     mlv_reset_last_raw_stage_telemetry();
     resetMlvLastDebayerStageMilliseconds();
+    /* CPU-S1-1457-HEAVY-SPEC-AND-STALE-FIELDS-1: the debayered-frame and processing records are this thread's last-run
+     * values, and the CPU Debayered16 route never refreshed them, so every playback_smoke.frame row of a cpu leg carried
+     * the render thread's first (warm-up) frame, not the frame's own (debayered_frame_ms 345.418 on all 475 rows of a
+     * 1243 s1 leg). A cache hit below runs no debayer, and this route runs no processing stage: both read 0 now. */
+    g_mlv_last_debayered_frame_ms = 0.0;
+    g_mlv_last_processing_ms = 0.0;
     mlv_cache_ensure_window(video, frameIndex);
     int copied_from_cache = 0;
     int cache_state = MLV_FRAME_NOT_CACHED;
@@ -7044,7 +7050,12 @@ void getMlvRawFrameDebayered(mlvObject_t * video, uint64_t frameIndex, uint16_t 
         return;
     }
 
+    /* The debayered-frame total contains this call's own decode and llrawproc, as every sibling route's does
+     * (RenderFrameThread subtracts the raw and llrawproc records to get debayer_exclusive_ms). */
+    const double debayer_start = mlv_stage_timing_now();
     get_mlv_raw_frame_debayered(video, frameIndex, raw_frame, current_frame, doesMlvAlwaysUseAmaze(video));
+    g_mlv_last_debayered_frame_ms = (mlv_stage_timing_now() - debayer_start) * 1000.0;
+    mlv_stage_timing_note_elapsed("debayered_frame", frameIndex, g_mlv_last_debayered_frame_ms);
     pthread_mutex_lock(&video->g_mutexFind);
     memcpy(outputFrame, video->rgb_raw_current_frame, frame_size);
     video->current_cached_frame_active = 1;
@@ -7077,13 +7088,18 @@ int getMlvRawFrameDebayeredFromReconnedRaw16(mlvObject_t * video,
     resetMlvLastDebayerStageMilliseconds();
     g_mlv_last_llrawproc_ms = 0.0;
     g_mlv_last_raw_float_convert_ms = 0.0;
+    /* CPU-S1-1457-HEAVY-SPEC-AND-STALE-FIELDS-1: no processing stage runs here, and the debayered-frame total is this
+     * call's own (below), never the render thread's last Processed8/Processed16 frame. */
+    g_mlv_last_debayered_frame_ms = 0.0;
+    g_mlv_last_processing_ms = 0.0;
     llrpResetLastRunTimingForCurrentThread();
 
     /* What getMlvRawFrameProcessedUint16 reports after its llrawproc run, from
      * the HQ dual-ISO state the recon ran under (r3: never the live object,
      * whose settings may have changed since the caller's admission check). */
     const int bit_shift = reconHqDualIso ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel);
-    return get_mlv_raw_frame_debayered_from_processed_raw_u16(
+    const double debayer_start = mlv_stage_timing_now();
+    const int debayered = get_mlv_raw_frame_debayered_from_processed_raw_u16(
         video,
         frameIndex,
         reconnedRawScratch,
@@ -7092,6 +7108,9 @@ int getMlvRawFrameDebayeredFromReconnedRaw16(mlvObject_t * video,
         bit_shift,
         getMlvCpuCores(video),
         "get_mlv_raw_frame_debayered_from_reconned_raw16");
+    g_mlv_last_debayered_frame_ms = (mlv_stage_timing_now() - debayer_start) * 1000.0;
+    mlv_stage_timing_note_elapsed("debayered_frame", frameIndex, g_mlv_last_debayered_frame_ms);
+    return debayered;
 }
 
 /* CPU-DEBAYERED16-HONOUR-SCALE-1: test-only error added to the reduced entry's
@@ -7160,10 +7179,15 @@ int getMlvRawFrameDebayeredFromReducedReconnedRaw16(mlvObject_t * video,
     resetMlvLastDebayerStageMilliseconds();
     g_mlv_last_llrawproc_ms = 0.0;
     g_mlv_last_raw_float_convert_ms = 0.0;
+    /* CPU-S1-1457-HEAVY-SPEC-AND-STALE-FIELDS-1: as getMlvRawFrameDebayeredFromReconnedRaw16 (no processing stage; the
+     * debayered-frame total is this call's own, set below). */
+    g_mlv_last_debayered_frame_ms = 0.0;
+    g_mlv_last_processing_ms = 0.0;
     llrpResetLastRunTimingForCurrentThread();
 
     const int bit_shift = (reconHqDualIso ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel))
                         + g_mlv_debayered16_reduced_bit_shift_error_for_testing;
+    const double debayer_start = mlv_stage_timing_now();
     /* debayerBasicU16 applies a nonzero bit shift to its input in place; the
      * caller's reduced Bayer is not read again after this frame. */
     debayerBasicU16RecordingKernelMilliseconds(outputFrame, (uint16_t *)reducedReconnedRaw, reducedWidth, reducedHeight,
@@ -7176,6 +7200,8 @@ int getMlvRawFrameDebayeredFromReducedReconnedRaw16(mlvObject_t * video,
     {
         memcpy(outputFrame + (size_t)y * row_words, last_row, row_words * sizeof(uint16_t));
     }
+    g_mlv_last_debayered_frame_ms = (mlv_stage_timing_now() - debayer_start) * 1000.0;
+    mlv_stage_timing_note_elapsed("debayered_frame", frameIndex, g_mlv_last_debayered_frame_ms);
     if (outWidth) *outWidth = out_w;
     if (outHeight) *outHeight = out_h;
     return 1;
