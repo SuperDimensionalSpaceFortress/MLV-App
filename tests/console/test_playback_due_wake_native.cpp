@@ -3241,15 +3241,19 @@ std::atomic<bool> g_r17A1PresentSent { false };
 // r2 (bite check): "held" is BOTH ends of the wait, never the entry read alone: the present was not queued when the handler began
 // AND was queued when it returned, so the present was queued while this dispatch held the GUI. An entry-only read stayed true for
 // a handler that returned at once (the pause removed), and that row passed without ever pausing.
+// r2 adversary pass 2 A2: the entry read is of a flag the sender raises BEFORE the present's send (g_r17A1PresentSending), never
+// of g_r17A1PresentSent, which it publishes only AFTER the send returned: a sender paused between the two left the present queued
+// while the entry read still said "not queued", and the row admitted a sample whose present was queued before the handler began.
+std::atomic<bool> g_r17A1PresentSending { false };
 bool g_r17A1PauseHeld = false;
 LRESULT CALLBACK r17A1ForeignProc( HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam )
 {
     if( message == WM_NULL && g_r17A1PauseInForeign )
     {
-        const bool queuedAtEntry = g_r17A1PresentSent.load();
+        const bool sendingAtEntry = g_r17A1PresentSending.load();     // false: the present's send had not begun when this dispatch did
         const ULONGLONG giveUp = GetTickCount64() + 5000;
         while( !g_r17A1PresentSent.load() && GetTickCount64() < giveUp ) Sleep( 0 );
-        g_r17A1PauseHeld = !queuedAtEntry && g_r17A1PresentSent.load();
+        g_r17A1PauseHeld = !sendingAtEntry && g_r17A1PresentSent.load();
         return 0;
     }
     if( message == kR17A1ProbeMessage )
@@ -3370,6 +3374,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         g_r17A1ProbeRanMask = 0;
         std::fill( g_r17A1ProbeRunMs, g_r17A1ProbeRunMs + kR17A1MaxProbes, 0.0 );
         g_r17A1PresentSent = false;
+        g_r17A1PresentSending = false;
         g_r17A1PauseHeld = false;
         g_r17A1PauseInForeign = foreignFirst && pausedInForeign;
         foreignSentMs = 0.0;
@@ -3396,6 +3401,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
                 SendNotifyMessageW( window, WM_NULL, 0, 0 );                // r10 (sol r9 B1): a foreign dispatch before the present
             }
             waitUntil( seenMs + 20.0 );
+            g_r17A1PresentSending = true;                              // r2 pass 2 A2: raised BEFORE the send (a paused handler's entry reads it)
             sent = SendNotifyMessageW( window, kR17A1ForeignMessage, 0, 0 ) != 0;
             g_r17A1PresentSent = true;                                 // the present is queued: a paused WM_NULL handler may return
             WPARAM i = 0;

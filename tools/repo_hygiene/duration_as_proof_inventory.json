@@ -2910,7 +2910,7 @@
       "clock": "qpc_stage_clock",
       "justification": "CI-FLAKE-R17A1-FOREIGN-FIRST-FLOOR-1 (adversary pass 1 A2): R17A1's foreign-first old-window floor is the time from the sleep's entry stamp to the sender's pre-send QPC read, less each recorded dispatch span's overlap with that interval. overlapMs is the length of an interval intersection, which is <= 0 when the span lies wholly outside the interval; the comparison only skips a span that does not intersect (nothing to subtract). A data-validity filter on an interval computation, never a run-proof: that the sleep and its dispatches ran is proven by the stamp count, the span record and the handler's own reads asserted around it.",
       "lines": [
-        3561
+        3567
       ]
     },
     {
