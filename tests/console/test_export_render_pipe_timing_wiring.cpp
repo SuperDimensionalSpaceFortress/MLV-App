@@ -130,7 +130,9 @@ TEST(ExportRenderPipeTimingWiring, EveryBatchExportNoteGoesThroughTheGuardedHelp
     ASSERT_TRUE(runner.contains(QStringLiteral("#include \"BatchRenderStageTiming.h\"")));
     // no direct note: every export stage is noted by the helper, whose note is inside `if( !on ) return;`
     ASSERT_EQ(0, countOccurrences(runner, QStringLiteral("mlv_stage_timing_note(")));
-    ASSERT_EQ(0, countOccurrences(runner, QStringLiteral("mlv_stage_timing_note_elapsed(")));
+    // (a source needle, not a duration: the name of StageTiming.h's precomputed-value note)
+    const QString precomputedNote = QStringLiteral("mlv_stage_timing_note_elapsed(");
+    ASSERT_EQ(0, countOccurrences(runner, precomputedNote));
     ASSERT_EQ(0, countOccurrences(runner, QStringLiteral("mlv_stage_timing_now(")));
     const QStringList stages = { QStringLiteral("MLV_STAGE_EXPORT_SCALE"), QStringLiteral("MLV_STAGE_EXPORT_PIPE_WRITE"),
                                  QStringLiteral("MLV_STAGE_EXPORT_PIPE_DRAIN"), QStringLiteral("MLV_STAGE_EXPORT_VERIFY") };
