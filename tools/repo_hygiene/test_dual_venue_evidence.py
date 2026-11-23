@@ -20109,6 +20109,22 @@ class DriftLegSpecTests(unittest.TestCase):
             self.assertIn("DVE_LEGSET_INVALID", got["why"])
             self.assertIn("legId", got["why"])
 
+    @requires_windows_pwsh
+    def test_the_planner_binds_the_whole_leaf_to_the_leg_id_ordinally(self) -> None:
+        """r11 (adversary r11 A1 on c65908cb): `EndsWith('.json')` is culture-aware and ignores a soft hyphen, so legs/m16-1243-speed.jso<U+00AD>n (a distinct file holding the
+        committed bytes) passed the suffix test, and GetFileNameWithoutExtension cut the look-alike suffix off, leaving a stem equal to the legId. The suffix test is now ordinal and
+        the WHOLE leaf must be <legId>.json."""
+        with tempfile.TemporaryDirectory(prefix="dve-leaf-ordinal-") as tmp:
+            root = Path(tmp) / "dual-venue"
+            shutil.copytree(DV, root)
+            for leaf in ("m16-1243-speed.jso­n", "m16-1243-speed­.json", "m16-1243-spee­d.json"):
+                with self.subTest(leaf=leaf.encode("unicode_escape").decode("ascii")):
+                    shutil.copyfile(DV / "legs" / "m16-1243-speed.json", root / "legs" / leaf)
+                    got = self.plan_one_leg_set(root, f"legs/{leaf}")
+                    self.assertEqual(got["planned"], 0, "a look-alike leaf of a committed spec planned")
+                    self.assertIn("DVE_LEGSET_INVALID", got["why"])
+            self.assertEqual(self.plan_one_leg_set(root, "legs/m16-1243-speed.json")["planned"], self.speed_backends(), "the control still plans")
+
     def test_every_committed_leg_spec_is_named_by_its_leg_id(self) -> None:
         """r11: the planner binds the name a set reaches to the bytes it read (Get-DvLegSetPlan refuses a spec whose file name is not <legId>.json). That is sound only while
         every committed spec meets it, so a new leg whose file and legId disagree fails here, not in a venue matrix."""

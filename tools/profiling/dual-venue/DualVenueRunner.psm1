@@ -670,7 +670,7 @@ function Find-DvCommittedLegSpec {
         # <mode> SP <type> SP <object> TAB <path>
         if ($row -cnotmatch '^[0-7]{6} blob (?<id>[0-9a-f]{40})\t(?<path>.+)$') { continue }
         $id = $Matches['id']; $path = $Matches['path'].Trim()
-        if (-not $path.EndsWith('.json')) { continue }
+        if (-not $path.EndsWith('.json', [StringComparison]::Ordinal)) { continue }   # (r11, adversary r11 A1 sibling: ordinal, so no ignorable code point passes as `.json`)
         # A blob id names its bytes for good, so a blob read once is not read again by the next lookup of this process: every lookup used to
         # re-read every blob of the directory (two git spawns each), which made finding all N shipped legs quadratic in N.
         # Keyed by repo AND blob id (CoS N1): a hit must not skip Get-DvBlobById's "a blob of this repository" check for a second repo
@@ -2748,7 +2748,8 @@ function Get-DvLegSetPlan {
     foreach ($ref in $legRefs) {
         $full = [IO.Path]::GetFullPath((Join-Path $dvDir ([string]$ref)))
         # a leg named by a set is always one of the committed specs under legs/ (production finds the spec a receipt names ONLY there)
-        if (-not $full.StartsWith($legsDir, [StringComparison]::OrdinalIgnoreCase) -or -not $full.EndsWith('.json') -or -not (Test-Path -LiteralPath $full -PathType Leaf)) {
+        # (r11, adversary r11 A1: the suffix test is ORDINAL; the culture-aware EndsWith ignored a soft hyphen, so `x.jso<U+00AD>n` passed it as `.json`)
+        if (-not $full.StartsWith($legsDir, [StringComparison]::OrdinalIgnoreCase) -or -not $full.EndsWith('.json', [StringComparison]::Ordinal) -or -not (Test-Path -LiteralPath $full -PathType Leaf)) {
             throw "DVE_LEGSET_INVALID '$ref' is not a leg spec under legs/"
         }
         # r10 (adversary r10 A2): a link that is already in place (the spec, or a directory on its way under legs/, legs/ itself included) is refused early, with its own message.
@@ -2774,7 +2775,10 @@ function Get-DvLegSetPlan {
         # test_every_committed_leg_spec_is_named_by_its_leg_id), so a file reached under any other name (a hard link, a renamed copy, or a link flipped in after the walk above)
         # is refused. That holds whatever its bytes say and whenever the flip lands. The comparison ignores case (Windows resolves LEGS\X.JSON to legs/x.json) and is ordinal,
         # never by culture. The child is pinned to $specSha256, so the bytes it runs are the bytes judged here.
-        if (-not [string]::Equals([IO.Path]::GetFileNameWithoutExtension($full), [string]$spec.legId, [StringComparison]::OrdinalIgnoreCase)) {
+        # (r11, adversary r11 A1: the WHOLE leaf is compared with "<legId>.json", never a stem GetFileNameWithoutExtension cut, which dropped a look-alike suffix; and the legId
+        # must be the schema's ASCII leg-id grammar (leg-spec.schema.json), so an ordinal case-insensitive match of the two is an ASCII-only match)
+        $specLegId = [string]$spec.legId
+        if ($specLegId -cnotmatch '^[a-z0-9][a-z0-9-]{1,62}$' -or -not [string]::Equals([IO.Path]::GetFileName($full), "$specLegId.json", [StringComparison]::OrdinalIgnoreCase)) {
             throw "DVE_LEGSET_INVALID '$ref' read as legId '$($spec.legId)': a committed leg spec is named <legId>.json, so a spec reached under another name (an alias, a hard link, a link swapped in) is refused"
         }
         $specs.Add([pscustomobject]@{ path = $full; spec = $spec; sha256 = $specSha256 })
