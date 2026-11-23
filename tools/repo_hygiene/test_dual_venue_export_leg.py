@@ -1320,6 +1320,24 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
             self.assertEqual(st["largestStage"], "debayered_frame")
             self.assertIsNone(g["metrics"]["dualIsoActiveFrames"])
 
+    def test_adversary_r1_a1_the_dual_iso_leaf_stands_in_for_an_unpublished_llrawproc_in_every_sum_group(self) -> None:
+        """adversary r1 A1 (00a7cf09): with llrawproc unpublished, llrawproc_dual_iso joined no disjoint group, so raw_uint16 30 + dual-ISO 30 (60 ms of disjoint work) inside a
+        40 ms debayered_frame read PASS. The dual-ISO leaf takes llrawproc's place in every group that holds llrawproc (inside debayered_frame and, without it, the denominator)."""
+        def log(rows: tuple) -> str:
+            per = "".join(f"[mlv-stage-timing] frame={i} stage={s} ms={ms:.3f}\n" for i in range(480) for s, ms in rows)
+            return per + "[mlv-stage-timing] frame=479 stage=export_pipe_drain ms=100.000\n[mlv-stage-timing] frame=479 stage=export_verify ms=200.000\n"
+        finding = (("raw_uint16", 30.0), ("llrawproc_dual_iso", 30.0), ("debayered_frame", 40.0), ("processing", 15.0), ("processed16_total", 56.0), ("export_pipe_write", 10.0))
+        no_debayer = (("raw_uint16", 30.0), ("llrawproc_dual_iso", 30.0), ("processing", 15.0), ("processed16_total", 56.0), ("export_pipe_write", 10.0))
+        control = (("raw_uint16", 9.0), ("llrawproc_dual_iso", 30.0), ("debayered_frame", 40.0), ("processing", 15.0), ("processed16_total", 56.0), ("export_pipe_write", 10.0))
+        shipped = leg("m16-1243-export-prores")["criteria"]["acceptance"]["cpu"]
+        cases = [prores_case(maxFrames=480, dualIsoExpected=True, stage=log(rows), batch=batch_log(480, verified=480, elapsed=60.0), criteria=shipped) for rows in (finding, no_debayer, control)]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:2]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "the disjoint stages" in p and "llrawproc_dual_iso" in p for p in g["problems"]), g)
+        self.assertEqual(got[2]["outcome"], "PASS", got[2])
+
     def test_r8_both_prores_leg_specs_gate_both_new_criteria(self) -> None:
         for name in ("m16-1243-export-prores", "m16-1456-export-prores"):
             spec = leg(name)
@@ -2337,6 +2355,43 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
                     # an absent or matching nested stage changes the stage table, so the receipt's own table no longer equals the re-derived one: still never a PASS
                     # that verifies as the ORIGINAL receipt; the point here is that the reader itself raises no window problem
                     self.assertFalse(any("EXPORT_STAGE_WINDOW_MISMATCH" in x for x in got["reasons"]), got)
+
+    def test_adversary_r1_a2_a_receipt_the_base_reader_wrote_still_rederives(self) -> None:
+        """adversary r1 A2 (00a7cf09): a ProRes receipt written before EXPORT-RENDER-PIPE-TIMING-1 (old-format stage log, the base leg criteria) stores the BASE reader's metrics and
+        stage table; the new reader added two metric fields, changed two reasons and the stage rows, so the unchanged evidence re-derived METRICS_NOT_FROM_EVIDENCE: INVALID. The
+        oracle is the base reader's own output (2b796198, tools/repo_hygiene/fixtures/export_prores_base_2b796198_evidence.json) for the exact fixture published here. A receipt of
+        this card's shape over the same evidence still verifies, and the base shape is never applied to a log that carries a new stage."""
+        oracle = json.loads((ROOT / "tools" / "repo_hygiene" / "fixtures" / "export_prores_base_2b796198_evidence.json").read_text(encoding="utf-8"))
+        spec_doc = leg(EXPORT_LEGS[1])
+        spec_doc["export"]["maxFrames"] = 30
+        for role in ("acceptance", "supplementary"):
+            spec_doc["criteria"][role]["cpu"] = [dict(c, value=30) if c["metric"] in ("framesExported", "stageFramesSeen") else c
+                                                 for c in spec_doc["criteria"][role]["cpu"] if c not in PIPE_CRITERIA]
+        spec = self.tmp / "prores-base-criteria.json"
+        spec.write_text(json.dumps(spec_doc), encoding="utf-8")
+        self.write_export_artifacts(30, fmt="prores", stage=stage_log(30))
+        proc, receipt, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
+        self.assertIsNotNone(receipt, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertEqual(self.validate(receipt, spec)["status"], "VERIFIED_OFFLINE_TEST", "this card's own receipt over old-format evidence")
+        base = json.loads(json.dumps(receipt))
+        base["metrics"] = oracle["metrics"]
+        base["export"]["stages"] = oracle["stages"]
+        got = self.validate(base, spec)
+        self.assertEqual(got["status"], "VERIFIED_OFFLINE_TEST", got)
+        # the base shape is for old-format evidence only: the same base-shaped receipt over a log WITH the new stages is no re-derivation of it
+        evdir = Path(receipt["evidence"]["localEvidenceDir"])
+        work = self.tmp / "ev-a2-new-stages"
+        if work.exists():
+            shutil.rmtree(work)
+        shutil.copytree(evdir, work)
+        raw = piped_stage_log(30).encode("utf-8")
+        (work / "export" / "stage-timing.log").write_bytes(raw)
+        forged = json.loads(json.dumps(base))
+        forged["export"]["files"]["stage-timing.log"] = hashlib.sha256(raw).hexdigest()
+        got = self.validate(forged, spec, evidence_dir=str(work))
+        self.assertEqual(got["status"], "INVALID", got)
+        self.assertTrue(any("METRICS_NOT_FROM_EVIDENCE" in r for r in got["reasons"]), got)
 
     def test_i5_the_llrawproc_total_is_held_inside_producer_frame_and_its_children_at_write_and_in_the_receipt_rederivation(self) -> None:
         """Dot I5-EXPORT-CDNG-TOTAL-CONTAINMENT (#838 ask 6967301971) through the WRITER (Invoke-VenueLeg) and the receipt VALIDATOR (Test-DvReceiptValid), each mutating ONLY the
