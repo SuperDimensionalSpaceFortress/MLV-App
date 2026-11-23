@@ -2808,6 +2808,37 @@ $o | ConvertTo-Json -Compress
         self.assertTrue(r["endedLine"], f"the TICKET_ENDED line did not reach stdout although the log could not take it: {r}")
         self.assertEqual((r["tailThrew"], r["strandedAfterTail"], r["claimLeft"]), ("", 0, False), f"the chain-end retry did not let go of the kept nonce with the log still held: {r}")
 
+    def test_tail1_r5_adv_a5_a_failed_chain_log_append_is_never_followed_by_a_second_one_and_never_holds_the_ticket_reset(self) -> None:
+        # r5 adversary A5 (introduced by the r5 B1 retry): after a failed append L made up to two more synchronous appends, and one on a share can stall (30 s in the pass's input) on the control thread, at a
+        # ticket close or before CHAIN_RESULT; the close also reset the ticket only AFTER its TICKET_ENDED line. Add-Content is shadowed: the first append fails, any later one would stall. One L call must make
+        # ONE append and still put its line on stdout first; the close must drop the ticket object before its line is written.
+        r = self.ps(f"""
+$ast = [Management.Automation.Language.Parser]::ParseFile('{RUNNER}', [ref]$null, [ref]$null)
+foreach ($name in 'L', 'Close-LegTicket') {{
+    $fn = $ast.Find({{ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $name }}, $true)
+    Invoke-Expression $fn.Extent.Text
+}}
+$script:appends = 0; $script:outBeforeAppend = $null; $script:emitted = [System.Collections.Generic.List[string]]::new()
+function Add-Content {{ param([string]$LiteralPath, $Value, $ErrorAction) $script:appends++; if ($script:appends -eq 1) {{ throw 'chain.log is held by another handle' }}; Start-Sleep -Milliseconds 2000 }}
+$ChainLog = Join-Path (Split-Path -Parent $d) 'chain.log'
+$sw = [Diagnostics.Stopwatch]::StartNew()
+L 'ONE_LINE x=1' 2>$null | ForEach-Object {{ if ($null -eq $script:outBeforeAppend) {{ $script:outBeforeAppend = ($script:appends -eq 0) }}; $script:emitted.Add([string]$_) }}
+$oneSec = $sw.Elapsed.TotalSeconds
+$o = [ordered]@{{ appends = $script:appends; outBeforeAppend = $script:outBeforeAppend; emitted = @($script:emitted); oneSec = [Math]::Round($oneSec, 2) }}
+# the close: a stub L records whether the ticket object was already dropped when its TICKET_ENDED line was written
+$Venue = 'bachelor'; $ClaimDir = $d; $TicketKeepMax = 2
+function L([string]$Message, [switch]$Raw) {{ if ($Message -like 'TICKET_ENDED*') {{ $script:ticketAtLine = ($null -ne $script:ticket) }} }}
+$script:ticket = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d; $script:ticketKeeps = 1; $script:ticketAtLine = $null
+Close-LegTicket 'leg-1' 'TICKET_ENDED' 'test'
+$o['ticketSetAtLine'] = $script:ticketAtLine
+$o | ConvertTo-Json -Compress
+""")
+        self.assertEqual(r["appends"], 1, f"a failed chain.log append was followed by another synchronous append (one that can stall on a share): {r}")
+        self.assertTrue(r["outBeforeAppend"], f"the line reached stdout only after the append returned: {r}")
+        self.assertEqual(len(r["emitted"]), 1, r)
+        self.assertTrue(r["emitted"][0].endswith("ONE_LINE x=1"), r)
+        self.assertIs(r["ticketSetAtLine"], False, f"the close still held the ticket reset behind its TICKET_ENDED line: {r}")
+
     def give_back_scenario(self, name: str, release_seam: str, env: dict) -> dict:
         # the A7 line-up (B takes the claim as head while A is in cooldown, A flips to waiting while B holds it, so B must give the claim back), with ONE seam inside the give-back
         from unittest import mock
