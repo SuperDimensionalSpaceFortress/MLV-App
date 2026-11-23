@@ -3229,8 +3229,20 @@ constexpr int kR17A1MaxProbes = 8;
 constexpr double kR17A1ProbeOffsetsMs[] = { 30.0, 36.0, 42.0, 48.0, 54.0 };
 unsigned g_r17A1ProbeRanMask = 0;
 double g_r17A1ProbeRunMs[kR17A1MaxProbes] = {};                        // when each probe's handler ran (QPC ms); read after the sleep returned
+// CI-FLAKE-R17A1-FOREIGN-FIRST-FLOOR-1 (sol r10 B1, fable r10 B1): the GUI paused INSIDE the foreign WM_NULL dispatch. While set,
+// the WM_NULL handler holds the GUI thread until the sender has queued the present, so the present is taken in that same
+// PeekMessageW (or the next dispatch, microseconds later): the old window is charged only the ~8 ms before the WM_NULL, which is
+// a correct charge. Bounded by the sender's own 5 s cutoff, so a sender that never sends the present cannot hang the test.
+bool g_r17A1PauseInForeign = false;
+std::atomic<bool> g_r17A1PresentSent { false };
 LRESULT CALLBACK r17A1ForeignProc( HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam )
 {
+    if( message == WM_NULL && g_r17A1PauseInForeign )
+    {
+        const ULONGLONG giveUp = GetTickCount64() + 5000;
+        while( !g_r17A1PresentSent.load() && GetTickCount64() < giveUp ) Sleep( 0 );
+        return 0;
+    }
     if( message == kR17A1ProbeMessage )
     {
         // r7 (sol review r6, hardening): a direct message with an index past the probe table is no probe (and a shift by >= the
@@ -3316,7 +3328,10 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     // r10 (sol r9 B1): and with a FOREIGN sent message first (`foreignFirst`: SendNotifyMessageW( window, WM_NULL ) at 8 ms, before
     // the present at 20 ms), so the first dispatch is not the present's: the windows and the present's span are keyed on the
     // dispatch the present's handler really ran in, never on dispatch 0
-    const auto judgeSentWait = [&]( bool armed, bool traced, bool stamped, bool foreignFirst ) {
+    // CI-FLAKE-R17A1-FOREIGN-FIRST-FLOOR-1 (sol r10 B1, fable r10 B1): and with the GUI PAUSED inside that WM_NULL dispatch
+    // (`pausedInForeign`, foreignFirst only): the present queued during the pause runs in the same dispatch, and the old window's
+    // correct charge is the ~8 ms before the WM_NULL
+    const auto judgeSentWait = [&]( bool armed, bool traced, bool stamped, bool foreignFirst, bool pausedInForeign ) {
     wake.setTimingStampsForTest( stamped );                           // also resets the exit record to None / -1
     std::unique_ptr<R17A1Windows> wp;
     std::vector<std::pair<double, double>> spans;
@@ -3344,6 +3359,8 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         g_r17A1HandlerRan = false;
         g_r17A1ProbeRanMask = 0;
         std::fill( g_r17A1ProbeRunMs, g_r17A1ProbeRunMs + kR17A1MaxProbes, 0.0 );
+        g_r17A1PresentSent = false;
+        g_r17A1PauseInForeign = foreignFirst && pausedInForeign;
         std::atomic<bool> sent { false };
         std::thread sender( [window, &sent, foreignFirst]() {
             const ULONGLONG giveUp = GetTickCount64() + 5000;
@@ -3367,6 +3384,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
             }
             waitUntil( seenMs + 20.0 );
             sent = SendNotifyMessageW( window, kR17A1ForeignMessage, 0, 0 ) != 0;
+            g_r17A1PresentSent = true;                                 // the present is queued: a paused WM_NULL handler may return
             WPARAM i = 0;
             for( const double offsetMs : kR17A1ProbeOffsetsMs )
             {
@@ -3401,6 +3419,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         // a send that missed the sleep is still queued: take it now (its handler sees no windows), so it cannot cut the next try
         MSG drain;
         PeekMessageW( &drain, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );
+        g_r17A1PauseInForeign = false;                                 // after the drain: a missed WM_NULL returns at once (the sender has joined)
         sentOk = sent.load();
         spans = wake.lastRunnerSleepDispatchSpansS();
         stamps = g_r17A1Stamps;
@@ -3528,11 +3547,12 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     };
     for( const bool stamped : { false, true } )                       // SEAM-1 r4 (pass 3 A1): the production seam-off configuration first
     {
-        judgeSentWait( false, false, stamped, false );                 // the wake idle: at least one judged attempt
-        judgeSentWait( true, false, stamped, false );                  // SEAM-1 A4: the wake armed: at least one judged attempt
-        judgeSentWait( true, true, stamped, false );                   // pass 2 A2: armed with the GUI trace on
-        judgeSentWait( false, false, stamped, true );                  // r10 (sol r9 B1): a foreign WM_NULL dispatched before the present
-        judgeSentWait( true, true, stamped, true );                    // ...armed, traced
+        judgeSentWait( false, false, stamped, false, false );          // the wake idle: at least one judged attempt
+        judgeSentWait( true, false, stamped, false, false );           // SEAM-1 A4: the wake armed: at least one judged attempt
+        judgeSentWait( true, true, stamped, false, false );            // pass 2 A2: armed with the GUI trace on
+        judgeSentWait( false, false, stamped, true, false );           // r10 (sol r9 B1): a foreign WM_NULL dispatched before the present
+        judgeSentWait( true, true, stamped, true, false );             // ...armed, traced
+        judgeSentWait( false, false, stamped, true, true );            // FOREIGN-FIRST-FLOOR-1 (sol/fable r10 B1): the GUI paused inside the WM_NULL dispatch
     }
     wake.setTimingStampsForTest( false );
     // a sleep no dispatch cuts is one segment, charged to the window open at its end; NotHandled hands out none
