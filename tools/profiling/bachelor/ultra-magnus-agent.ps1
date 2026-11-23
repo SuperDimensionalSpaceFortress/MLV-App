@@ -739,14 +739,19 @@ function Get-DescendantProcessIdentities {
         $stopByLeft = 0.0
         try { $stopByLeft = [double]$StopBySec - $entryWatch.Elapsed.TotalSeconds } catch { $stopByLeft = 0.0 }
         $filteredMode = ($stopByLeft -le $snapshotTimeoutSec)
+        # r11 (adversary r11 pass 2 A2): a positive bound (the monitor's lease stop) is also the filtered walk's ONE budget (whole seconds, at least 1), so
+        # every read of it, and the answer of each (late = no evidence), fits before the stop decision. A stop that is due now (0 or less) keeps the full
+        # budget: it reads as fast as the filtered reads go, as the merge base's stop walk did (it had no bound at all).
+        if ($filteredMode -and $stopByLeft -gt 0) { $snapshotTimeoutSec = [int][Math]::Min([double]$snapshotTimeoutSec, [Math]::Max(1.0, [Math]::Floor($stopByLeft))) }
     }
     $walkWatch = [System.Diagnostics.Stopwatch]::StartNew()   # r4 (pass 5 A1): the full read and any fallback reads share ONE budget, $snapshotTimeoutSec
     # r5 (adversary pass 7 A4): what is left for a SUPPLEMENTAL read is the smaller of the walk's one budget and the time left to the job's deadline, read
     # now: the budget is a whole-second ceiling of the deadline distance, so a read that overran inside it must not start another past the deadline itself.
-    # r11 (adversary r11 A7): whole seconds of the budget too (floor), so a supplemental read's bound (the ceiling of this value) never reaches past the walk's
-    # one budget, and with under 1 s of it left no supplemental read starts.
+    # r11 (adversary r11 A7, pass 2 A1): a supplemental read's bound is the WHOLE seconds left (floor), at least the provider's 1 s floor ($readBoundSec), so
+    # it never reaches past the budget by more than that floor, and only where the floor is necessary (under 1 s left; a 1 s budget still reads).
+    $readBoundSec = { param($left) [int][Math]::Min(30.0, [Math]::Max(1.0, [Math]::Floor([double]$left))) }
     $readLeftSec = {
-        $leftBudget = [Math]::Floor($snapshotTimeoutSec - $walkWatch.Elapsed.TotalSeconds)
+        $leftBudget = $snapshotTimeoutSec - $walkWatch.Elapsed.TotalSeconds
         if ($null -ne $Deadline) {
             # r10 split (adversary r10 pass A1): whole seconds to the deadline (floor). A supplemental read is bounded by the ceiling of what this returns,
             # so it never reaches past the deadline; with under 1 s left none starts (the merge base never needed these reads, and one that answered late
@@ -821,10 +826,13 @@ function Get-DescendantProcessIdentities {
         $fbGenOk = New-Object 'System.Collections.Generic.Dictionary[string,bool]'
         $fbAdmitStart = New-Object 'System.Collections.Generic.Dictionary[int,object]'
         while ($fbSteps.Count -gt 0 -and $fbNodes -lt $fbMaxReads) {
+            # r11 (adversary r11 pass 2 A3): the tick runs before each per-parent read, as the merge base's walk ticked before every query, so a renew due
+            # during a long filtered walk is started (and one that exited collected) between its reads.
+            if ($null -ne $OnEach) { $null = & $OnEach }
             $fbLeft = & $readLeftSec
             if ($fbLeft -le 0) { break }
             $fbFilter = $fbSteps.Dequeue(); $fbNodes++
-            $fbTimeout = [int][Math]::Min(30.0, [Math]::Max(1.0, [Math]::Ceiling($fbLeft)))
+            $fbTimeout = (& $readBoundSec $fbLeft)
             $fbIsChildren = $fbFilter.StartsWith('ParentProcessId=')
             $fbRead = New-Object 'System.Collections.Generic.List[object]'
             $fbReadError = $null
@@ -859,7 +867,7 @@ function Get-DescendantProcessIdentities {
                 if ($fbVerLeft -le 0) { continue }   # no time to re-read it: its children stay unverifiable
                 $fbVerRows = New-Object 'System.Collections.Generic.List[object]'
                 try {
-                    Get-CimInstance Win32_Process -Filter "ProcessId=$fbParentPid" -Property ProcessId, ParentProcessId, CreationDate, ExecutablePath, CommandLine -OperationTimeoutSec ([int][Math]::Min(30.0, [Math]::Max(1.0, [Math]::Ceiling($fbVerLeft)))) -ErrorAction Stop | ForEach-Object {
+                    Get-CimInstance Win32_Process -Filter "ProcessId=$fbParentPid" -Property ProcessId, ParentProcessId, CreationDate, ExecutablePath, CommandLine -OperationTimeoutSec (& $readBoundSec $fbVerLeft) -ErrorAction Stop | ForEach-Object {
                         if ($null -ne $_ -and $null -ne $_.ProcessId -and [int]$_.ProcessId -eq $fbParentPid) { $fbVerRows.Add($_) }
                     }
                 }
@@ -885,13 +893,14 @@ function Get-DescendantProcessIdentities {
         $fbRecheckEmpty = $false
         if ($fbOther.Count -gt 0 -and $null -ne $fbError) { $fbChildrenError = $fbError }
         if ($fbOther.Count -gt 0 -and $null -eq $fbError) {
+            if ($null -ne $OnEach) { $null = & $OnEach }   # r11 (pass 2 A3): before this read too
             $fbRecheckLeft = & $readLeftSec
             if ($fbRecheckLeft -le 0) { $fbRecheckError = 'no time left to re-read the root row after the children were read' }
             else {
                 $fbRecheckGot = $false
                 $fbRecheckRows = New-Object 'System.Collections.Generic.List[object]'   # r11 (KEY3 r10 A1): held back until the read is known to have succeeded in time
                 try {
-                    Get-CimInstance Win32_Process -Filter "ProcessId=$ParentProcessId" -Property ProcessId, ParentProcessId, CreationDate, ExecutablePath, CommandLine -OperationTimeoutSec ([int][Math]::Min(30.0, [Math]::Max(1.0, [Math]::Ceiling($fbRecheckLeft)))) -ErrorAction Stop | ForEach-Object {
+                    Get-CimInstance Win32_Process -Filter "ProcessId=$ParentProcessId" -Property ProcessId, ParentProcessId, CreationDate, ExecutablePath, CommandLine -OperationTimeoutSec (& $readBoundSec $fbRecheckLeft) -ErrorAction Stop | ForEach-Object {
                         $fbRecheckRow = $_
                         if ($null -ne $fbRecheckRow -and $null -ne $fbRecheckRow.ProcessId -and [int]$fbRecheckRow.ProcessId -eq $ParentProcessId) { $fbRecheckRows.Add($fbRecheckRow) }
                     }
@@ -929,7 +938,7 @@ function Get-DescendantProcessIdentities {
             $rrLeft = & $readLeftSec
             if ($rrLeft -le 0) { $rootUnverifiable = 'no budget left for the root row read' }
             else {
-                $rrTimeout = [int][Math]::Min(30.0, [Math]::Max(1.0, [Math]::Ceiling($rrLeft)))
+                $rrTimeout = (& $readBoundSec $rrLeft)
                 $rrError = $null
                 $rrRows = New-Object 'System.Collections.Generic.List[object]'   # r11 (KEY3 r10 A1): held back until the read is known to have succeeded in time
                 try {

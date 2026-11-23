@@ -118,8 +118,12 @@ $liftBatchR2 = @('Register-QuietLeaseRenewOk', 'Get-QuietLeaseRenewOkGapSec', 'C
     'Test-RenewGapFromWallUnknown')   # r6 (sol r5 B1): optional, so renew-gap-exhausted-start-pair-no-false-stop runs RED on dd5c99c5
 # lease-batch r3 (sol r2 B1, B2): the same, asserted by the r3 cases after they have shown the behaviour.
 $liftBatchR3 = @('Test-LeaseBatchClosePending', 'Get-LeaseBatchJobStop',
-    'Test-JobExitedAfterDeadline',   # AGENT-JOB-MONITOR-CIM-WALK-1 r11: optional, so cim-walk-split-r11 runs RED on 3063a803
-    'Get-DescendantProcessIdentitiesFiltered')   # r11: defined only on 655d355d (the first r11 commit); lifted there so its RED run exercises it
+    'Test-JobExitedAfterDeadline')   # AGENT-JOB-MONITOR-CIM-WALK-1 r11: optional, so cim-walk-split-r11 runs RED on 3063a803
+# r11: defined only on 655d355d (the first r11 commit); lifted there (and nowhere asserted) so the RED run of cim-walk-split-r11 on that head exercises it.
+foreach ($name in @('Get-DescendantProcessIdentitiesFiltered')) {
+    $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
+    if ($null -ne $fn) { . ([scriptblock]::Create($fn.Extent.Text)) }
+}
 $batchLifted = [System.Collections.Generic.List[string]]::new()
 foreach ($name in $liftBatch + $liftBatchR2 + $liftBatchR3) {
     $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
@@ -7240,7 +7244,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter, [string[]]$Property, [uint32]$OperationTimeoutSec)
                 if ($PSBoundParameters.ContainsKey('Filter')) {
                     $script:R11Reads.Add($Filter)
-                    if ($PSBoundParameters.ContainsKey('OperationTimeoutSec')) { $script:R11FBounds.Add([int]$OperationTimeoutSec) }
+                    if ($PSBoundParameters.ContainsKey('OperationTimeoutSec')) { $script:R11FBounds.Add([int]$OperationTimeoutSec); $script:R11LastBound = [int]$OperationTimeoutSec }
                     if ($script:R11Filter.ContainsKey($Filter)) { $n = [int]$script:R11N[$Filter]; $script:R11N[$Filter] = $n + 1; & $script:R11Filter[$Filter] $n; return }
                     if ($Filter -match '^ProcessId=(\d+)$') { $want = [int]$Matches[1]; foreach ($r in $script:R11World) { if ([int]$r.ProcessId -eq $want) { $r } } }
                     elseif ($Filter -match '^ParentProcessId=(\d+)$') { $want = [int]$Matches[1]; foreach ($r in $script:R11World) { if ([int]$r.ParentProcessId -eq $want) { $r } } }
@@ -7407,6 +7411,28 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 $w = @(Get-DescendantProcessIdentities -ParentProcessId 4000 -RootStartEpochMs $rootMs -RootPidPinned)
                 [pscustomobject]@{ ids = (& $ids $w); why = [string]$script:LastDescendantWalk.why }
             }
+            # adversary r11 pass 2 A1: a short job (1.6 s to its deadline, 1 s to the stop): the filtered walk's 1 s budget still reads (the provider's 1 s floor),
+            # so 4002 and 4001 are tracked, as the merge base's slice tracked them.
+            & $try 'r11p2A1' {
+                & $reset $tree
+                $w = @(Get-DescendantProcessIdentities -ParentProcessId 4000 -RootStartEpochMs $rootMs -Deadline ((Get-Date).AddMilliseconds(1600)) -RootPidPinned -StopBySec 1 -OnEach { })
+                [pscustomobject]@{ ids = (& $ids $w) }
+            }
+            # adversary r11 pass 2 A2: 3 s to the lease stop; the root re-read would answer after 5 s (never past its bound). The bound is the filtered walk's
+            # budget, so the walk returns within it (the late answer is no evidence; the held root keeps its child).
+            & $try 'r11p2A2' {
+                & $reset @((New-R11Proc 4000 1 0), (New-R11Proc 4001 4000 1)) 'world' @{ 'ProcessId=4000' = { param($n) Start-Sleep -Milliseconds ([Math]::Min(5000, [int]$script:R11LastBound * 1000)); New-R11Proc 4000 1 0 } }
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                $w = @(Get-DescendantProcessIdentities -ParentProcessId 4000 -RootStartEpochMs $rootMs -Deadline ((Get-Date).AddSeconds(600)) -RootPidPinned -StopBySec 3 -OnEach { })
+                [pscustomobject]@{ ids = (& $ids $w); ms = $sw.ElapsedMilliseconds }
+            }
+            # adversary r11 pass 2 A3: a ten-deep chain read by per-parent reads ticks the renew before each read (the merge base ticked before every query).
+            & $try 'r11p2A3' {
+                & $reset (@(New-R11Proc 4000 1 0) + @(1..10 | ForEach-Object { New-R11Proc (4000 + $_) (4000 + $_ - 1) $_ })) { throw 'full-table read failed' }
+                $script:R11Ticks = 0
+                $null = @(Get-DescendantProcessIdentities -ParentProcessId 4000 -RootStartEpochMs $rootMs -RootPidPinned -OnEach { $script:R11Ticks++ })
+                [pscustomobject]@{ ticks = $script:R11Ticks; parentReads = @($script:R11Reads | Where-Object { $_ -like 'ParentProcessId=*' }).Count }
+            }
             # adversary r11 A11: a filtered walk whose -OnEach runs a nested walk publishes its OWN record (root 4000), not the nested walk's (8000).
             & $try 'r11A11' {
                 & $reset @((New-R11Proc 4000 1 0), (New-R11Proc 8000 1 0))
@@ -7459,6 +7485,9 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True ($r11Out['r11A7'].maxBound -le 1 -and $r11Out['r11A7'].bounds -ne '') "cim-walk-split-r11: (adversary r11 A7) with 1.1 s of a 2 s budget left a supplemental read is bounded by 1 s, never 2: $r11Txt"
         Assert-True ($r11Out['r11A8'].note -match 'DESCENDANT WALK FAILED' -and $r11Out['r11A8'].ok -eq $false) "cim-walk-split-r11: (adversary r11 A8) a due-now stop whose filtered children read fails names the failed census: $r11Txt"
         Assert-True ($r11Out['r11A10'].ids -eq '4001' -and $r11Out['r11A10'].why -match 'ROOT ACCESS DENIED') "cim-walk-split-r11: (adversary r11 A10) the pinned walk keeps 4001 and its record names the failed root-row read: $r11Txt"
+        Assert-True ($r11Out['r11p2A1'].ids -eq '4002,4001') "cim-walk-split-r11: (adversary r11 pass 2 A1) a 1 s filtered budget still reads (the provider's 1 s floor) and tracks 4002 and 4001: $r11Txt"
+        Assert-True ($r11Out['r11p2A2'].ids -eq '4001' -and $r11Out['r11p2A2'].ms -lt 4000) "cim-walk-split-r11: (adversary r11 pass 2 A2) a 3 s lease bound is the filtered walk's budget: a 5 s root re-read cannot hold the decision past it: $r11Txt"
+        Assert-True ($r11Out['r11p2A3'].ticks -ge $r11Out['r11p2A3'].parentReads -and $r11Out['r11p2A3'].parentReads -ge 10) "cim-walk-split-r11: (adversary r11 pass 2 A3) the renew tick runs before each per-parent read: $r11Txt"
         Assert-True ($r11Out['r11A11'].rootPid -eq 4000) "cim-walk-split-r11: (adversary r11 A11) a filtered walk publishes its own record, not a nested walk's: $r11Txt"
         Assert-True ($r11Out['regex'].lost -eq 1 -and $r11Out['regex'].ms -lt 3000) "cim-walk-split-r11: (sol r10 #8) 8,000 untagged prefixes with a refused append: the capture diagnostic is recovered and the check is bounded: $r11Txt"
         $results.cimWalkSplitR11 = $r11Out
