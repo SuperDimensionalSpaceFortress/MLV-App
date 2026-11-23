@@ -456,6 +456,10 @@ $script:DvJobsOpened = 0
 $script:DvJobsClosed = 0
 # Where Invoke-DvGit collects git's stdout. Module-private seam: a test swaps in a sink that faults, to prove a faulted pipe read is typed.
 $script:DvGitNewSink = { [IO.MemoryStream]::new() }
+# The one GIT_TRACE file Invoke-DvGit names, '' for none. Module-private seam and NOT the caller's GIT_TRACE (which Invoke-DvGit drops, so a read-only reader appends to
+# nothing it was handed): a test sets it inside the module scope to count the gits a call runs. (r4, CI on c7ec3ab8: dropping the caller's GIT_TRACE left the spawn-count
+# tests of tools/repo_hygiene/test_dual_venue_git_calls.py with no trace, and the "no git ran" ones passing vacuously.)
+$script:DvGitTraceFile = ''
 
 function Invoke-DvGit {
     # Run git in $RepoRoot; returns exit code, stdout BYTES (a blob must not be re-encoded or newline-translated) and stderr.
@@ -477,6 +481,7 @@ function Invoke-DvGit {
     # STDERR send git's streams to a file the caller names, so they are dropped too.)
     foreach ($name in @($psi.Environment.Keys | Where-Object { $_ -match '^GIT_(DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|COMMON_DIR|NAMESPACE|REPLACE_REF_BASE|NO_REPLACE_OBJECTS)$' -or $_ -match '^GIT_TRACE' -or $_ -match '^GIT_REDIRECT_' })) { [void]$psi.Environment.Remove($name) }
     foreach ($name in @('GIT_TRACE', 'GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_TRACE2_PERF')) { $psi.Environment[$name] = '0' }
+    if (-not [string]::IsNullOrEmpty($script:DvGitTraceFile)) { $psi.Environment['GIT_TRACE'] = $script:DvGitTraceFile }
     foreach ($a in (@('--no-replace-objects', '-C', $RepoRoot) + $GitArgs)) { [void]$psi.ArgumentList.Add($a) }
     $limit = Get-DvGitTimeoutMilliseconds
     # A fresh tag per call, inherited by everything git starts: how Stop-DvGitCall finds those children on Linux once their parent is gone.
@@ -5263,8 +5268,9 @@ function Get-DvRenderPipeBuildClass {
     else {
         # (r2 fix 2, adversary A4 on c2da7e24: a commit whose tree git READ and found without the header is a build before stage timing, so 'older'; a tree that lists it or
         # that git could not read is still 'unknown')
-        $tree = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('ls-tree', '--name-only', $BuildId, '--', $script:RenderPipeMarkerPath)
-        if ($tree.exitCode -ne 0 -or ([Text.Encoding]::ASCII.GetString($tree.bytes)).Trim().Length -gt 0) { return 'unknown' }
+        # (r4, CI DG-GIT-PATHLIST on c7ec3ab8: -z, so the listing is NUL-terminated and never quoted; any byte at all is a listed path)
+        $tree = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('ls-tree', '-z', '--name-only', $BuildId, '--', $script:RenderPipeMarkerPath)
+        if ($tree.exitCode -ne 0 -or $tree.bytes.Length -gt 0) { return 'unknown' }
         $class = 'older'
     }
     $script:RenderPipeBuildClassCache[$key] = $class
@@ -5908,8 +5914,11 @@ function Test-DvExportReceiptValid {
             # old-format evidence it is re-derived in that reader's shape (a log that carries one of the new stages is re-derived in the new shape whatever the receipt says)
             $storedMetrics = Get-DvProp $Receipt 'metrics'
             # (r1 fix 2, adversary A2 on 33f7a05a: the same metrics parsed -AsHashtable are the same receipt, so an object of either kind, by its key set (Get-DvKeys))
-            $legacyShape = ([string]$specExport.format -ceq 'prores') -and ($storedMetrics -is [System.Management.Automation.PSCustomObject] -or $storedMetrics -is [System.Collections.IDictionary]) -and
-                           @(Get-DvKeys $storedMetrics) -cnotcontains 'renderPipeTimed'
+            # (r4, CI attr3 spliced-body scan on c7ec3ab8: the type test is an if condition, not an assignment's right-hand side, whose engine type literal the scan follows
+            # from every receiver of an unfoldable member name and reads as one that may reach the session state)
+            $legacyShape = $false
+            if (([string]$specExport.format -ceq 'prores') -and ($storedMetrics -is [System.Management.Automation.PSCustomObject] -or $storedMetrics -is [System.Collections.IDictionary]) -and
+                @(Get-DvKeys $storedMetrics) -cnotcontains 'renderPipeTimed') { $legacyShape = $true }
             $ev = Get-DvExportEvidence -Format ([string]$specExport.format) -MaxFrames ([int]$specExport.maxFrames) -DualIsoExpected ([bool]$specExport.dualIsoExpected) -ExpectedBuildId ([string](Get-DvProp $summary 'sourceCommit')) `
                 -ProfileText ([string]$texts['export-profile.json']) -StageLogText ([string]$texts['stage-timing.log']) -BatchLogText ([string]$texts['batch.log']) -OutputManifestText ([string]$texts['output-manifest.json']) `
                 -LegacyRenderShape:$legacyShape
