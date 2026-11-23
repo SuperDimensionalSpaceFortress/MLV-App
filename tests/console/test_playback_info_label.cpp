@@ -1483,10 +1483,17 @@ TEST(PlaybackInfoLabel, R21G1EveryPresenterBranchCarriesExactlyOneOfTheTwoGpuDeb
     const QString bilinearTrue = QStringLiteral("readyFrame.usedGpuBilinearDebayer = true;");
     const QString amazeFalse = QStringLiteral("readyFrame.usedGpuAmazeDebayer = false;");
     const QString bilinearFalse = QStringLiteral("readyFrame.usedGpuBilinearDebayer = false;");
-    // the writers: three AMaZE presenters (post-WB texture, RGB16 offscreen fallback, CUDA AMaZE readback fallback), two bilinear
+    // the writers: four AMaZE presenters (post-WB texture, the direct CUDA AMaZE post-WB texture handoff (INFO-2 r4, adversary r3
+    // pass-1 A10), RGB16 offscreen fallback, CUDA AMaZE readback fallback), two bilinear
     const QList<int> amazeSites = allIndexesOf(body, amazeTrue) + allIndexesOf(body, amazePresented);
     const QList<int> bilinearSites = allIndexesOf(body, bilinearTrue);
-    ASSERT_EQ(3, amazeSites.size());
+    ASSERT_EQ(4, amazeSites.size());
+    // A10: the direct CUDA AMaZE texture handoff branch (the one that names cuda_gl_rgba16_amaze_texture) writes the flag pair itself
+    const int cudaAmazeAt = body.indexOf(QStringLiteral("QStringLiteral(\"cuda_gl_rgba16_amaze_texture\")"));
+    ASSERT_TRUE(cudaAmazeAt >= 0);
+    const QString cudaAmazeBranch = enclosingBlock(body, cudaAmazeAt);
+    ASSERT_TRUE(cudaAmazeBranch.contains(amazeTrue));
+    ASSERT_TRUE(cudaAmazeBranch.contains(bilinearFalse));
     ASSERT_EQ(2, bilinearSites.size());
     for ( int at : amazeSites )
     {
@@ -1911,19 +1918,21 @@ TEST(PlaybackInfoLabel, InfoTwoR2A6EachToggleWritesOnlyItsOwnSettingsKey)
 // the flush), so the debt is armed by the store itself and a frame presented SINCE the store is what clears it.
 TEST(PlaybackInfoLabel, InfoTwoR2A7ADeferredPlayingRelabelIsVisibleWithinTheGatePlusATickWhenNoFrameArrives)
 {
-    // the policy: owed, no frame since the store, and the debt old enough
-    ASSERT_TRUE(playback_info_label::labelPaintOwedDue(true, false, playback_info_label::kLabelPaintOwedMs));
-    ASSERT_TRUE(playback_info_label::labelPaintOwedDue(true, false, 900));
-    ASSERT_FALSE(playback_info_label::labelPaintOwedDue(true, false, playback_info_label::kLabelPaintOwedMs - 1));   // a steady Play's frame comes sooner
-    ASSERT_FALSE(playback_info_label::labelPaintOwedDue(true, true, 900));    // a frame presented since the store carried the text
-    ASSERT_FALSE(playback_info_label::labelPaintOwedDue(false, false, 900));  // nothing stored
+    // the policy: owed, no frame since the store, and the debt old enough (INFO-2 r4 A3: relative to the expected frame period)
+    // the first frame of a Play at 24 fps (meter EMA 0): expected 42 ms, deadline max(50, 42 + 21) = 63
+    ASSERT_TRUE(playback_info_label::labelPaintOwedDue(true, false, 63, 42));
+    ASSERT_FALSE(playback_info_label::labelPaintOwedDue(true, false, 62, 42));   // a steady 24 fps Play's frame comes sooner
+    ASSERT_TRUE(playback_info_label::labelPaintOwedDue(true, false, 900, 42));
+    ASSERT_FALSE(playback_info_label::labelPaintOwedDue(true, true, 900, 42));    // a frame presented since the store carried the text
+    ASSERT_FALSE(playback_info_label::labelPaintOwedDue(false, false, 900, 42));  // nothing stored
+    ASSERT_TRUE(playback_info_label::labelPaintOwedDue(true, false, playback_info_label::kLabelPaintOwedMs, 0));   // no expected period known
     ASSERT_TRUE(playback_info_label::kLabelPaintOwedMs > 42);                 // one frame period at 24 fps never pays it
     // pass 2 A1's input: relabel paused at 0, a paused scrub presents at 220 (its age is 30 ms at the flush), Play at 230, flush at
     // 250 stores the text, the first Play frame is due at 1130. The debt is armed at 250 by the store, whatever the last
     // presentation's age was, so it is due by 250 + kLabelPaintOwedMs (a tick later), 800 ms before the frame.
     ASSERT_TRUE(playback_info_label::deferredRelabelDue(true, true, 250));
     const int storeAtMs = 250;
-    ASSERT_TRUE(playback_info_label::labelPaintOwedDue(true, false, (storeAtMs + playback_info_label::kLabelPaintOwedMs + 8) - storeAtMs));
+    ASSERT_TRUE(playback_info_label::labelPaintOwedDue(true, false, (storeAtMs + playback_info_label::kLabelPaintOwedMs + 8) - storeAtMs, 0));
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay("));
     ASSERT_TRUE(push.contains(QStringLiteral(
@@ -1938,7 +1947,8 @@ TEST(PlaybackInfoLabel, InfoTwoR2A7ADeferredPlayingRelabelIsVisibleWithinTheGate
         "const bool framePresentedSinceStore = m_playbackPresentedFrameCount != m_lookLabelPaintOwedPresentedCount;")));
     ASSERT_TRUE(settle.contains(QStringLiteral("if( !ui->actionPlay->isChecked() || framePresentedSinceStore )")));
     ASSERT_TRUE(settle.contains(QStringLiteral(
-        "if( playback_info_label::labelPaintOwedDue( owed, framePresentedSinceStore, m_lookLabelPaintOwedClock.elapsed() ) )")));
+        "if( playback_info_label::labelPaintOwedDue( owed, framePresentedSinceStore, m_lookLabelPaintOwedClock.elapsed(),\n"
+        "                                                playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs ) ) )")));
     ASSERT_TRUE(settle.contains(QStringLiteral("GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, true );")));
     // every tick, right after the gated flush
     const QString tick = functionBody(source, QStringLiteral("void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )"));
@@ -1948,6 +1958,24 @@ TEST(PlaybackInfoLabel, InfoTwoR2A7ADeferredPlayingRelabelIsVisibleWithinTheGate
     const QString header = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
     ASSERT_TRUE(header.contains(QStringLiteral("QElapsedTimer m_lookLabelPaintOwedClock;")));
     ASSERT_FALSE(source.contains(QStringLiteral("m_playbackPresentedClock")));   // the first answer's presentation-age clock is gone
+}
+
+// INFO-2 r4 (adversary r3 A3 on ce4a1a34): a native 10 fps clip in steady Play. The text is stored at 210 ms and the next frame is due
+// at 310 ms; the fixed 50 ms debt paid an extra label paint at 264 ms on every relabel, so a steady Play under 20 fps added a paint
+// of its own. The debt is relative to the expected frame period (the larger of the target period and the measured meter EMA), with
+// half a period of margin, and never below kLabelPaintOwedMs.
+TEST(PlaybackInfoLabel, InfoTwoR4A3TheLabelPaintDebtIsRelativeToTheExpectedFramePeriod)
+{
+    // R1a: the adversary's literal, stored at 210, checked at 264 (54 ms), 10 fps expected period 100 ms: no paint owed yet
+    ASSERT_FALSE(playback_info_label::labelPaintOwedDue(true, false, 264 - 210, 100));
+    // R1b: at 10 fps a real stall still pays, at 100 + 50 = 150 ms
+    ASSERT_FALSE(playback_info_label::labelPaintOwedDue(true, false, 149, 100));
+    ASSERT_TRUE(playback_info_label::labelPaintOwedDue(true, false, 150, 100));
+    // R1c: the expected period is the larger of the target period and the measured EMA
+    ASSERT_EQ(100, playback_info_label::labelPaintExpectedFrameMs(24.0, 100.0));   // a 24 fps target that plays at 10 fps
+    ASSERT_EQ(42, playback_info_label::labelPaintExpectedFrameMs(24.0, 0.0));
+    ASSERT_EQ(100, playback_info_label::labelPaintExpectedFrameMs(10.0, 0.0));
+    ASSERT_EQ(0, playback_info_label::labelPaintExpectedFrameMs(0.0, 0.0));
 }
 
 // INFO-2 r2 (adversary pass 2 A2 on 9496cb72, introduced, major): 24 fps, start on paused frame 0, Cut Out 3, Loop off. Frames 1 and

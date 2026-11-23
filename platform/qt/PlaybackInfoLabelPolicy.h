@@ -240,11 +240,27 @@ inline bool playingRelabelDeferred( bool playing, bool clockValid, qint64 elapse
  *  scrub, an earlier draw or none), no frame's paint is coming, so the owed paint is made. A frame presented since the store
  *  carries the text with its own paint and clears the debt. `owed` = a store is waiting (monotonic QElapsedTimer armed),
  *  `framePresentedSinceStore` = the presented-frame count moved since it was armed, `msSinceStore` = that timer's age. One frame
- *  period at 24 fps is 42 ms, so a steady Play never pays it. */
+ *  period at 24 fps is 42 ms, so a steady Play never pays it.
+ *  INFO-2 r4 (adversary r3 A3): the deadline is relative to the EXPECTED frame period (`expectedFrameMs`, from
+ *  labelPaintExpectedFrameMs): kLabelPaintOwedMs when the period is unknown (<= 0), else max(kLabelPaintOwedMs, period + period/2),
+ *  so a steady 10 fps Play (a frame every 100 ms) pays nothing while a stall still pays at 150 ms. */
 constexpr qint64 kLabelPaintOwedMs = 50;
-inline bool labelPaintOwedDue( bool owed, bool framePresentedSinceStore, qint64 msSinceStore )
+inline bool labelPaintOwedDue( bool owed, bool framePresentedSinceStore, qint64 msSinceStore, qint64 expectedFrameMs )
 {
-    return owed && !framePresentedSinceStore && msSinceStore >= kLabelPaintOwedMs;
+    const qint64 relative = expectedFrameMs + expectedFrameMs / 2;
+    const qint64 deadline = expectedFrameMs <= 0 ? kLabelPaintOwedMs
+                                                 : ( relative > kLabelPaintOwedMs ? relative : kLabelPaintOwedMs );
+    return owed && !framePresentedSinceStore && msSinceStore >= deadline;
+}
+
+/*! \brief INFO-2 r4 (adversary r3 A3): the frame period a playing label's paint debt waits for: the larger of the target period
+ *  ceil(1000 / playbackFps) (0 when playbackFps <= 1) and the measured fps meter EMA frame time (0 when <= 0), so a 24 fps
+ *  target that plays at 10 fps waits for its real 100 ms frames. Read only: the meter is not changed. */
+inline qint64 labelPaintExpectedFrameMs( double playbackFps, double meterEmaFrameMs )
+{
+    const qint64 target = playbackFps > 1.0 ? static_cast<qint64>( std::ceil( 1000.0 / playbackFps ) ) : 0;
+    const qint64 measured = meterEmaFrameMs > 0.0 ? qRound64( meterEmaFrameMs ) : 0;
+    return target > measured ? target : measured;
 }
 
 /*! \brief r3 adversary A1 (9c9941cd): does the presented frame's active scale belong to the requested scale? It compares the

@@ -6404,6 +6404,12 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
             if( framePresentedByViewport )
             {
                 gpuPlaybackReconNoReadbackPresented = true;
+                // INFO-2 r4 (adversary r3 pass-1 A10): the CUDA AMaZE kernel debayered this frame; the slot may carry the render
+                // thread's bilinear flag (or neither), so this branch writes the pair as the post-WB AMaZE texture presenter does.
+                readyFrame.usedGpuAmazeDebayer = true;
+                readyFrame.usedGpuBilinearDebayer = false;
+                readyFrame.gpuAmazeFallbackReason.clear();
+                readyFrame.gpuAmazeRendererDescription = texturePresentHandoffMode;
                 const QString sourcePrefix = gpuPlaybackReconAmazeTexturePresentedByWindow
                     ? QStringLiteral("gpu_window_")
                     : QString();
@@ -35001,7 +35007,8 @@ void MainWindow::flushPlaybackInfoIfDue( void )
 
 // INFO-2 r2 (adversary pass 1 A7, pass 2 A1): the paint a stored playing label is owed. pushLookLabelOverlay arms the debt when it
 // stores the text for the next frame's paint; a frame presented since carries the text (debt cleared), a Stop clears it, and when no
-// frame came within kLabelPaintOwedMs the label is painted now (setLookLabelIfActive paints only when the drawn text differs).
+// frame came within the expected frame period plus half (never under kLabelPaintOwedMs; INFO-2 r4 A3) the label is painted now
+// (setLookLabelIfActive paints only when the drawn text differs).
 void MainWindow::settleLookLabelPaintIfOwed( void )
 {
     const bool owed = m_lookLabelPaintOwedClock.isValid();
@@ -35012,7 +35019,8 @@ void MainWindow::settleLookLabelPaintIfOwed( void )
         m_lookLabelPaintOwedClock.invalidate();
         return;
     }
-    if( playback_info_label::labelPaintOwedDue( owed, framePresentedSinceStore, m_lookLabelPaintOwedClock.elapsed() ) )
+    if( playback_info_label::labelPaintOwedDue( owed, framePresentedSinceStore, m_lookLabelPaintOwedClock.elapsed(),
+                                                playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs ) ) )
     {
         m_lookLabelPaintOwedClock.invalidate();
         GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, true );
