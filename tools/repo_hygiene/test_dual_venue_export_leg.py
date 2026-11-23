@@ -84,6 +84,38 @@ def stage_log(frames: int) -> str:
     return "\n".join(out) + "\n"
 
 
+# EXPORT-RENDER-PIPE-TIMING-1: the stages a rendered export emits from that card on (src/debug/StageTiming.h MLV_STAGE_LLRAWPROC_DUAL_ISO, MLV_STAGE_EXPORT_*):
+# llrawproc_dual_iso (inside llrawproc) and export_pipe_write (plus export_scale when the frame plan is scaled) per frame, export_pipe_drain and export_verify once per
+# clip on its last frame. llrawproc is 31 ms here so a 30 ms dual-ISO run fits inside it (raw_uint16 9 + llrawproc 31 = 40 still fits debayered_frame).
+PIPE_CRITERIA = ({"metric": "dualIsoClassAgrees", "op": "eq", "value": True}, {"metric": "renderPipeTimed", "op": "eq", "value": True})
+
+
+def piped_stage_log(frames: int, dual_iso_ms: float = 30.0, llrawproc_ms: float = 31.0, pipe_ms: float = 10.0, drain_ms: float = 100.0, verify_ms: float = 200.0,
+                    drain_count: int = 1, verify_count: int = 1, pipe_frames=None, scale_ms: float | None = None, dual_iso: bool = True) -> str:
+    out = []
+    pipe_frames = range(frames) if pipe_frames is None else pipe_frames
+    for i in range(frames):
+        for name, ms in (("raw_uint16_disk_read", 3.0), ("raw_uint16_decompress", 5.0), ("raw_uint16", 9.0), ("llrawproc", llrawproc_ms),
+                         ("debayered_frame", 40.0), ("processing", 15.0), ("processed16_total", 56.0)):
+            out.append(f"[mlv-stage-timing] frame={i} stage={name} ms={ms:.3f}")
+            if name == "llrawproc" and dual_iso:
+                out.append(f"[mlv-stage-timing] frame={i} stage=llrawproc_dual_iso ms={dual_iso_ms:.3f}")
+        if scale_ms is not None:
+            out.append(f"[mlv-stage-timing] frame={i} stage=export_scale ms={scale_ms:.3f}")
+        if i in pipe_frames:
+            out.append(f"[mlv-stage-timing] frame={i} stage=export_pipe_write ms={pipe_ms:.3f}")
+    out += [f"[mlv-stage-timing] frame={frames - 1} stage=export_pipe_drain ms={drain_ms:.3f}"] * drain_count
+    out += [f"[mlv-stage-timing] frame={frames - 1} stage=export_verify ms={verify_ms:.3f}"] * verify_count
+    return "\n".join(out) + "\n"
+
+
+def with_pipe_stages(log: str, frames: int, dual_iso_ms: float = 5.0) -> str:
+    """EXPORT-RENDER-PIPE-TIMING-1 forced companion: a test that judges a hand-written log under the SHIPPED ProRes criteria (which now gate dualIsoClassAgrees and
+    renderPipeTimed) appends what a build of that card emits: a small dual-ISO figure on every frame, a 1 ms pipe write per frame, one drain and one verify."""
+    per_frame = "".join(f"[mlv-stage-timing] frame={i} stage={s} ms={ms:.3f}\n" for i in range(frames) for s, ms in (("llrawproc_dual_iso", dual_iso_ms), ("export_pipe_write", 1.0)))
+    return log + per_frame + f"[mlv-stage-timing] frame={frames - 1} stage=export_pipe_drain ms=1.000\n[mlv-stage-timing] frame={frames - 1} stage=export_verify ms=1.000\n"
+
+
 def batch_log(exported: int, skipped: int = 0, elapsed: float = 20.0, verified: int | None = None) -> str:
     lines = ["[BATCH] Start", f"[BATCH] DONE view-0 exported={exported} skipped={skipped} elapsed={elapsed:.1f}"]
     if verified is not None:
@@ -377,7 +409,9 @@ class ExportEvidenceTests(unittest.TestCase):
         self.assertAlmostEqual(ps["rows"]["debayered_frame"]["share"], 40.0 / 56.0, places=4)
         self.assertAlmostEqual(ps["batchWallPerFrameMs"], 20000.0 / 30.0, places=3)
         self.assertAlmostEqual(ps["untimedPerFrameMs"], 20000.0 / 30.0 - 56.0, places=3)
-        self.assertIn("EXPORT-RENDER-PIPE-TIMING-1", ps["untimed"])
+        # EXPORT-RENDER-PIPE-TIMING-1: a log with no pipe stage is a build before that card, and the text says what such a build leaves untimed
+        self.assertIn("a build before EXPORT-RENDER-PIPE-TIMING-1", ps["untimed"])
+        self.assertIn("pipe write", ps["untimed"])
         self.assertAlmostEqual(ps["disjointSumMs"], 55.0)
         self.assertTrue(ps["disjointWithin5Percent"])
         self.assertEqual(ps["largestStage"], "debayered_frame")
@@ -788,7 +822,8 @@ class ExportEvidenceTests(unittest.TestCase):
 
         def case(fmt: str, elapsed: float, n: int = frames) -> dict:
             if fmt == "prores":
-                return prores_case(maxFrames=n, stage=stage_log(n), batch=batch_log(n, verified=n, elapsed=elapsed), manifest=output_manifest(1, "mov"), criteria=shipped[fmt])
+                return prores_case(maxFrames=n, dualIsoExpected=True, stage=with_pipe_stages(stage_log(n), n), batch=batch_log(n, verified=n, elapsed=elapsed),
+                                   manifest=output_manifest(1, "mov"), criteria=shipped[fmt])
             return cdng_case(maxFrames=n, profile=cdng_profile(n), batch=batch_log(n, elapsed=elapsed), manifest=output_manifest(n), criteria=shipped[fmt])
         cases = [case(f, e) for f in ("prores", "cdng-lossless") for e in (0.0, 0.1, 60.0)]
         # tolerance: 30 frames of 56 ms is 1.68 s of work; an elapsed of 1.6 s is 5 % under (one decimal of logging, a clock's rounding), not a contradiction
@@ -841,7 +876,7 @@ class ExportEvidenceTests(unittest.TestCase):
         criteria = leg("m16-1243-export-prores")["criteria"]["acceptance"]["cpu"]
 
         def case(disk: float, decomp: float) -> dict:
-            return prores_case(maxFrames=480, stage=log(disk, decomp), batch=batch_log(480, verified=480, elapsed=60.0), criteria=criteria)
+            return prores_case(maxFrames=480, dualIsoExpected=True, stage=with_pipe_stages(log(disk, decomp), 480), batch=batch_log(480, verified=480, elapsed=60.0), criteria=criteria)
         proc, got = evidence_cases([case(900.0, 900.0), case(3.0, 5.0), case(30.0, 30.0)])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         self.assertEqual(got[0]["outcome"], "INVALID", got[0])
@@ -877,7 +912,7 @@ class ExportEvidenceTests(unittest.TestCase):
         criteria = leg("m16-1243-export-prores")["criteria"]["acceptance"]["cpu"]
 
         def case(rows: tuple) -> dict:
-            return prores_case(maxFrames=480, stage=log(rows), batch=batch_log(480, verified=480, elapsed=60.0), criteria=criteria)
+            return prores_case(maxFrames=480, dualIsoExpected=True, stage=with_pipe_stages(log(rows), 480), batch=batch_log(480, verified=480, elapsed=60.0), criteria=criteria)
         no_raw = (("processed16_total", 56.0), ("debayered_frame", 40.0), ("processing", 16.0), ("raw_uint16_disk_read", 25.0), ("raw_uint16_decompress", 10.0), ("llrawproc", 30.0))
         no_debayer = (("processed16_total", 56.0), ("processing", 16.0), ("raw_uint16", 40.0), ("llrawproc", 30.0))
         ok = (("processed16_total", 56.0), ("debayered_frame", 40.0), ("processing", 16.0), ("raw_uint16_disk_read", 5.0), ("raw_uint16_decompress", 5.0), ("llrawproc", 10.0))
@@ -1156,6 +1191,142 @@ class ExportEvidenceTests(unittest.TestCase):
                     self.assertIsNone(row_["r"], row_)
                 else:
                     self.assertIsNotNone(row_["r"], row_)
+
+
+@requires_windows_pwsh
+class ExportRenderPipeTimingTests(unittest.TestCase):
+    """EXPORT-RENDER-PIPE-TIMING-1: the rendered (ProRes) export emits llrawproc_dual_iso and export_pipe_write (export_scale when scaled) per frame and export_pipe_drain and
+    export_verify once per clip, under MLVAPP_STAGE_TIMING only. The judge reads them: a ProRes leg gains dualIsoClassAgrees (mirroring the CDNG profile's
+    llrawproc_dual_iso_ms rule) and renderPipeTimed, and untimedPerFrameMs no longer counts the pipe, drain and verify. A log from an older build keeps its old reading."""
+
+    SHIPPED = [{"metric": "framesExported", "op": "eq", "value": 30}, {"metric": "exportFramesFailed", "op": "eq", "value": 0},
+               {"metric": "stageFramesSeen", "op": "eq", "value": 30}] + [dict(c) for c in PIPE_CRITERIA]
+
+    def case(self, stage: str, **over) -> dict:
+        c = prores_case(dualIsoExpected=True, stage=stage, criteria=self.SHIPPED)
+        c.update(over)
+        return c
+
+    def test_r1_a_log_without_the_new_stages_is_never_pass_under_the_new_criteria(self) -> None:
+        proc, got = evidence_cases([self.case(stage_log(30)), self.case(stage_log(30), dualIsoExpected=False)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got:
+            self.assertNotEqual(g["outcome"], "PASS", g)
+            m = g["metrics"]
+            self.assertIsNone(m["dualIsoClassAgrees"], g)
+            self.assertIsNone(m["renderPipeTimed"], g)
+            self.assertIn("a build before EXPORT-RENDER-PIPE-TIMING-1", m["dualIsoClassAgreesCouldNotCheck"])
+            self.assertIn("a build before EXPORT-RENDER-PIPE-TIMING-1", m["renderPipeTimedCouldNotCheck"])
+            self.assertEqual(g["problems"], [], "an older build's log raises no new problem: the criteria, not the reader, refuse it")
+
+    def test_r2_a_log_with_the_new_stages_passes_and_untimed_is_the_batch_wall_less_the_timed_work(self) -> None:
+        proc, got = evidence_cases([self.case(piped_stage_log(30))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        g = got[0]
+        self.assertEqual(g["outcome"], "PASS", g)
+        m, st = g["metrics"], g["stages"]
+        self.assertIs(m["dualIsoClassAgrees"], True)
+        self.assertEqual(m["dualIsoActiveFrames"], 30)
+        self.assertIs(m["renderPipeTimed"], True)
+        self.assertNotIn("dualIsoClassAgreesCouldNotCheck", m)
+        self.assertNotIn("renderPipeTimedCouldNotCheck", m)
+        # batch wall 20 s / 30 frames, less processed16_total 56 + export_pipe_write 10 + (drain 100 + verify 200) / 30 frames
+        self.assertAlmostEqual(st["untimedPerFrameMs"], 20000.0 / 30.0 - (56.0 + 10.0 + 300.0 / 30.0), places=3)
+        self.assertAlmostEqual(st["untimedPerFrameMs"], 590.666667, places=3)
+        for name in ("clip open", "receipt apply", "probe", "publish"):
+            self.assertIn(name, st["untimed"])
+        self.assertAlmostEqual(st["rows"]["llrawproc_dual_iso"]["meanMs"], 30.0)
+        self.assertAlmostEqual(st["rows"]["export_pipe_write"]["meanMs"], 10.0)
+        self.assertAlmostEqual(st["clipRows"]["export_pipe_drain"]["meanMs"], 100.0)
+        self.assertAlmostEqual(st["clipRows"]["export_verify"]["meanMs"], 200.0)
+        self.assertEqual(st["largestStage"], "debayered_frame", "largestStage stays a share of processed16_total's top-level children")
+        self.assertIsNone(st["rows"]["export_pipe_write"]["share"], "the pipe write is not inside processed16_total, so it is no share of it")
+        # scaled: export_scale per frame is counted too
+        proc, got = evidence_cases([self.case(piped_stage_log(30, scale_ms=6.0))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "PASS", got[0])
+        self.assertAlmostEqual(got[0]["stages"]["untimedPerFrameMs"], 20000.0 / 30.0 - (56.0 + 6.0 + 10.0 + 10.0), places=3)
+
+    def test_r3_no_dual_iso_on_a_dual_iso_leg_is_a_clip_class_mismatch(self) -> None:
+        proc, got = evidence_cases([self.case(piped_stage_log(30, dual_iso_ms=0.0)), self.case(piped_stage_log(30), dualIsoExpected=False),
+                                    self.case(piped_stage_log(30, dual_iso_ms=0.0), dualIsoExpected=False)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:2]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertIn("CLIP_CLASS_MISMATCH", g["detail"])
+            self.assertTrue(g["classMismatch"])
+            self.assertIs(g["metrics"]["dualIsoClassAgrees"], False)
+        self.assertEqual(got[0]["metrics"]["dualIsoActiveFrames"], 0)
+        self.assertIs(got[2]["metrics"]["dualIsoClassAgrees"], True, got[2])   # control: no dual-ISO on a no-dual-ISO leg
+        self.assertEqual(got[2]["outcome"], "PASS", got[2])
+
+    def test_r4_a_dual_iso_figure_longer_than_its_llrawproc_is_a_containment_problem(self) -> None:
+        proc, got = evidence_cases([self.case(piped_stage_log(30, dual_iso_ms=35.0, llrawproc_ms=20.0)), self.case(piped_stage_log(30, dual_iso_ms=20.0, llrawproc_ms=20.0))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "INVALID", got[0])
+        self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "llrawproc_dual_iso" in p for p in got[0]["problems"]), got[0])
+        self.assertEqual(got[1]["outcome"], "PASS", got[1])
+
+    def test_r5_a_clip_stage_recorded_twice_or_on_another_frame_is_typed(self) -> None:
+        moved = piped_stage_log(30).replace("frame=29 stage=export_verify", "frame=3 stage=export_verify")
+        proc, got = evidence_cases([self.case(piped_stage_log(30, drain_count=2)), self.case(piped_stage_log(30, verify_count=3)), self.case(moved, criteria=[])])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g, stage in ((got[0], "export_pipe_drain"), (got[1], "export_verify")):
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and stage in p and "exactly once" in p for p in g["problems"]), g)
+        self.assertEqual(got[2]["outcome"], "INVALID", got[2])
+        self.assertTrue(any(p.startswith("EXPORT_STAGE_WINDOW_MISMATCH") and "export_verify" in p for p in got[2]["problems"]), got[2])
+
+    def test_r6_a_per_frame_pipe_stage_on_a_subset_of_frames_is_a_window_mismatch(self) -> None:
+        cases = [self.case(piped_stage_log(30, pipe_frames=range(15))), self.case(piped_stage_log(30, pipe_frames=range(15)), criteria=[]),
+                 self.case(piped_stage_log(30, scale_ms=4.0).replace("frame=7 stage=export_scale ms=4.000\n", ""), criteria=[])]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_STAGE_WINDOW_MISMATCH") for p in g["problems"]), g)
+        self.assertIs(got[1]["metrics"]["renderPipeTimed"], False)
+
+    def test_r6b_a_pipe_timed_on_every_frame_without_its_drain_or_verify_is_not_render_pipe_timed(self) -> None:
+        proc, got = evidence_cases([self.case(piped_stage_log(30, drain_count=0)), self.case(piped_stage_log(30, verify_count=0))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got:
+            self.assertIs(g["metrics"]["renderPipeTimed"], False, g)
+            self.assertNotEqual(g["outcome"], "PASS", g)
+
+    def test_r6c_the_pipe_and_clip_stages_are_held_inside_the_batch_wall(self) -> None:
+        # 30 frames, a 2.0 s wall = 66.7 ms per frame; processed16_total 56 fits alone, 56 + a 40 ms pipe write does not
+        proc, got = evidence_cases([self.case(piped_stage_log(30, pipe_ms=40.0, drain_ms=1.0, verify_ms=1.0), batch=batch_log(30, verified=30, elapsed=2.0), criteria=[]),
+                                    self.case(piped_stage_log(30, pipe_ms=1.0, drain_ms=1.0, verify_ms=900.0), batch=batch_log(30, verified=30, elapsed=2.0), criteria=[]),
+                                    self.case(piped_stage_log(30, pipe_ms=1.0, drain_ms=1.0, verify_ms=1.0), batch=batch_log(30, verified=30, elapsed=2.0), criteria=[])])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:2]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "batch_wall_per_frame" in p for p in g["problems"]), g)
+        self.assertEqual(got[2]["outcome"], "PASS", got[2])
+
+    def test_r7_back_compat_todays_log_and_criteria_read_exactly_as_before(self) -> None:
+        proc, got = evidence_cases([prores_case(), prores_case(dualIsoExpected=True), prores_case(criteria=[])])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got:
+            self.assertEqual(g["outcome"], "PASS", g)
+            self.assertEqual(g["problems"], [], g)
+            self.assertFalse(g["classMismatch"], g)
+            st = g["stages"]
+            self.assertAlmostEqual(st["untimedPerFrameMs"], 20000.0 / 30.0 - 56.0, places=3)
+            self.assertEqual(st["largestStage"], "debayered_frame")
+            self.assertIsNone(g["metrics"]["dualIsoActiveFrames"])
+
+    def test_r8_both_prores_leg_specs_gate_both_new_criteria(self) -> None:
+        for name in ("m16-1243-export-prores", "m16-1456-export-prores"):
+            spec = leg(name)
+            for role in ("acceptance", "supplementary"):
+                with self.subTest(leg=name, role=role):
+                    crit = spec["criteria"][role]["cpu"]
+                    for want in PIPE_CRITERIA:
+                        self.assertIn(want, crit)
+            self.assertIs(spec["export"]["dualIsoExpected"], True, name)
+            self.assertNotIn("forceLookAssist", json.dumps(spec), name)
 
 
 EXPORT_STUB_GENERATOR = r"""
@@ -1912,7 +2083,8 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
         (a / "batch.log").write_text(batch_log(exported), encoding="utf-8")
         if fmt == "prores":
             (a / "batch.log").write_text(batch_log(exported, verified=exported), encoding="utf-8")
-            (a / "stage-timing.log").write_text(stage_log(frames) if stage is None else stage, encoding="utf-8")
+            # (EXPORT-RENDER-PIPE-TIMING-1: the committed ProRes legs gate dualIsoClassAgrees and renderPipeTimed, so the default log is a build of that card's)
+            (a / "stage-timing.log").write_text(piped_stage_log(frames) if stage is None else stage, encoding="utf-8")
             (a / "output-manifest.json").write_text(output_manifest(1, "mov"), encoding="utf-8")
             return
         if profile:

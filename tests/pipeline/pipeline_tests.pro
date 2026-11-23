@@ -147,6 +147,7 @@ SOURCES += \
     $$REPO_ROOT/tests/pipeline/test_playback_scaling.cpp \
     $$REPO_ROOT/tests/pipeline/test_crash_forensics.cpp \
     $$REPO_ROOT/tests/pipeline/test_phase3_infrastructure.cpp \
+    $$REPO_ROOT/tests/pipeline/test_batch_render_stage_timing.cpp \
     $$REPO_ROOT/tests/pipeline/test_upstream_sync_hardening.cpp \
     $$REPO_ROOT/tests/pipeline/test_phase3_parity.cpp \
     $$REPO_ROOT/tests/pipeline/test_cdng_sequence_export.cpp \
