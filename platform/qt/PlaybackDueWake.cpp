@@ -858,7 +858,10 @@ PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long
         }
         if( result != WAIT_OBJECT_0 )   // the timeout
         {
-            if( d->timingStampsForTest ) noteExit( RunnerSleepExit::TimedOut, slept.elapsed() );
+            // SEAM-1 (adversary pass A1 on cd623269): a timeout is recorded as the interval this wait was ASKED to cover (its own
+            // start read plus the rest it requested), never a clock read after the wait returned: a pause there would lengthen a
+            // wait the product cut short
+            if( d->timingStampsForTest ) noteExit( RunnerSleepExit::TimedOut, sleptMs + static_cast<qint64>( restMs ) );
             break;
         }
         if( HIWORD( GetQueueStatus( QS_SENDMESSAGE ) ) & QS_SENDMESSAGE )

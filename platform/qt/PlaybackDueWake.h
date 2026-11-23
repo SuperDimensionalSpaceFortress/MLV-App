@@ -545,7 +545,8 @@ public:
     enum class RunnerSleepExit { None, TimedOut, ExpiredAfterDispatch, ExpiredAfterOtherWake, WaitFailed, WokenBySent };
     void setTimingStampsForTest( bool on );                 // on: the records below are kept; off (default): nothing is recorded
     RunnerSleepExit lastRunnerSleepExitForTest() const;     // how the last sleepForSmokeRunner left its loop (None: no recorded exit)
-    qint64 lastRunnerSleepExitElapsedMsForTest() const;     // its own QElapsedTimer value at that exit (-1: none)
+    qint64 lastRunnerSleepExitElapsedMsForTest() const;     // the elapsed value that exit decided on (-1: none); for TimedOut,
+                                                            // the interval the timed-out wait was asked to cover (start + rest)
     double lastDeliveryFirstStampMsForTest() const;         // inside onFire: the wait thread's pre-send stamp (ms, QPC clock) of
                                                             // every stamped native delivery, split OR unsplit; -1 otherwise
 
