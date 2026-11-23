@@ -260,3 +260,90 @@ TEST(ResizePlaybackPolicyWiring, TheStoppedRedrawAndTheLookAssistHoldAreUnchange
     ASSERT_TRUE(draw > audio);
     ASSERT_EQ(1, static_cast<int>(body.count(QStringLiteral("m_pAudioPlayback->stop();"))));
 }
+
+// REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r8 (the r7 venue run on 970ef3f9: observed=470 of 480; the pure rules are pinned by
+// PlaybackMeasuredLoopExit.TheVenueSequenceNeverStopsOnARawCountAndEveryFramePlayPresentsEveryWindowFrame): the wiring. Every-frame
+// Play acquires the oldest ready frame on BOTH ready-frame acquisitions; the pinned capture's present-path stop counts the distinct
+// pinned-window frames (never raw presents alone; the pinned raw-count statement is unchanged and stays a necessary condition) and
+// the exit-11 check judges the same ledger, armed from the frame after the counter's start frame.
+TEST(ResizePlaybackPolicyWiring, R8EveryFramePlayAcquiresOldestFirstAndThePinnedStopAndGateCountTheSameWindowFrames)
+{
+    const QString ready = mainWindowFunction(QStringLiteral("void MainWindow::drawFrameReady("));
+    ASSERT_FALSE(ready.isEmpty());
+    ASSERT_TRUE(ready.contains(QStringLiteral("playback_frame_range::playbackAcquiresOldestReadyFirst(")));
+    // r8 fix 1: a pinned capture's Play too, in drop-frame mode as well (a harmless extension; the venue's measured Play ran drop_frame=0)
+    ASSERT_TRUE(ready.contains(QStringLiteral(
+        "ui->actionPlay->isChecked(), ui->actionDropFrameMode->isChecked(), m_playbackSmokeTargetPresentedFrames > 0 );")));
+    ASSERT_TRUE(ready.contains(QStringLiteral("acquireLatestReadyFrame( &readyFrame, oldestReadyFirst )")));
+    ASSERT_TRUE(ready.contains(QRegularExpression(QStringLiteral(
+        "acquireLatestReadyFrameForPlaybackTarget\\(\\s*&readyFrame,\\s*activePlaybackTarget,\\s*activeGeneration,\\s*oldestReadyFirst\\s*\\)"))));
+
+    QString render = readRepoFile(QStringLiteral("platform/qt/RenderFrameThread.cpp"));
+    render.remove(QRegularExpression(QStringLiteral("//[^\\n]*")));
+    ASSERT_FALSE(render.isEmpty());
+    auto body = [&render](const char *signature) -> QString
+    {
+        const int at = render.indexOf(QString::fromLatin1(signature));
+        if (at < 0) return QString();
+        return render.mid(at, render.indexOf(QStringLiteral("\n}\n"), at) - at);
+    };
+    const QString targetAware = body("bool RenderFrameThread::acquireLatestReadyFrameForPlaybackTarget(");
+    ASSERT_TRUE(targetAware.contains(QStringLiteral(
+        "playback_frame_range::readySlotPreferred( oldestFirst, readySlotIndex >= 0, slot.requestSerial, chosenRequestSerial )")));
+    ASSERT_FALSE(targetAware.contains(QStringLiteral("slot.requestSerial >= latestRequestSerial")));
+    const QString plain = body("bool RenderFrameThread::acquireLatestReadyFrame(ReadyFrame *frame, bool oldestFirst)");
+    ASSERT_TRUE(plain.contains(QStringLiteral("oldestFirst ? findOldestReadySlotLocked() : findLatestReadySlotLocked()")));
+    ASSERT_TRUE(plain.contains(QStringLiteral("acquireReadySlotLocked( frame, readySlotIndex, !oldestFirst )")));
+
+    const QString note = mainWindowFunction(QStringLiteral("void MainWindow::notePlaybackSmokePresentedFrame("));
+    ASSERT_FALSE(note.isEmpty());
+    const int arm = note.indexOf(QStringLiteral(
+        "m_playbackSmokePinnedWindow.arm( playback_frame_range::pinnedWindowFirstFrame( m_sourceAdvance.startFrame ),"));
+    const int count = note.indexOf(QStringLiteral("m_playbackSmokePinnedWindow.notePresent( static_cast<int64_t>( displayFrame ) );"));
+    const int rawStop = note.indexOf(QStringLiteral("&& m_playbackSmokePresentedFrames >= m_playbackSmokeTargetPresentedFrames"));
+    const int windowGuard = note.indexOf(QStringLiteral(
+        "if( playback_frame_range::pinnedPresentStopCount( m_playbackSmokePinnedWindow ) < m_playbackSmokeTargetPresentedFrames )\n            return;"));
+    const int stop = note.indexOf(QStringLiteral("ui->actionPlay->setChecked( false );"), rawStop);
+    ASSERT_TRUE(arm > 0);
+    ASSERT_TRUE(count > arm);
+    ASSERT_TRUE(rawStop > count);
+    ASSERT_TRUE(windowGuard > rawStop);
+    ASSERT_TRUE(stop > windowGuard);
+
+    const QString mainWindow = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int smokeAt = mainWindow.indexOf(QStringLiteral("int MainWindow::runGuiPlaybackSmoke("));
+    const int observedAt = mainWindow.indexOf(QStringLiteral("playback_frame_range::pinnedWindowObservedFrames("), smokeAt);
+    const int judgedAt = mainWindow.indexOf(QStringLiteral("pinnedObservedFrames != m_playbackSmokeTargetPresentedFrames"), observedAt);
+    ASSERT_TRUE(smokeAt > 0);
+    ASSERT_TRUE(observedAt > smokeAt);
+    ASSERT_TRUE(judgedAt > observedAt);
+    ASSERT_FALSE(mainWindow.contains(QStringLiteral("m_playbackSmokeWindowPresentedFrames")));
+
+    // r8 fix 1 (adversary pass 8 on 77fa2218): the ledger is armed with the target (its identity frame start + N); the unpaced
+    // isolated hold waits for the identity frame (A1); a pin whose identity frame is not before the clip's last frame is refused
+    // before the measured Play (A2).
+    ASSERT_TRUE(note.contains(QStringLiteral("m_playRequiredSourceFrames, m_playbackSmokeTargetPresentedFrames );")));
+    const QString handling = mainWindowFunction(QStringLiteral("void MainWindow::playbackHandling("));
+    ASSERT_TRUE(handling.contains(QStringLiteral(
+        "if( m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() && programmaticPlayConsumed()\n"
+        "         && playback_frame_range::pinnedUnpacedHoldReached( m_playbackSmokeTargetPresentedFrames, m_sourceAdvance.consumed(),\n"
+        "                                                            m_playRequiredSourceFrames ) ) return;")));
+    const int floorAt = mainWindow.indexOf(QStringLiteral("presentedFramesTargetReachesFloor( options.targetPresentedFrames"), smokeAt);
+    const int identityAt = mainWindow.indexOf(QStringLiteral("playback_frame_range::pinnedIdentityFrameAdmitted("), smokeAt);
+    const int measuredPlayAt = mainWindow.indexOf(QStringLiteral("site=gui-smoke-measured reason=PINNED_FRAME_PAST_CLIP_END"), smokeAt);
+    ASSERT_TRUE(floorAt > smokeAt);
+    ASSERT_TRUE(identityAt > floorAt);
+    ASSERT_TRUE(measuredPlayAt > identityAt);
+
+    // r9 (adversary pass 9 A1 on 35a85cdd): the admission's last frame is the cut range the play gate judges and the engine plays
+    // (checkPlayableWindow: spinBoxCutIn, spinBoxCutOut, the clip's frames and the collapsed-range repair unless the environment
+    // disables it), never the raw cut-out; pass 9 A8: the diagnostic identity frame is computed in 64 bits.
+    const int lastFrameAt = mainWindow.indexOf(QStringLiteral(
+        "const int pinLastFrame = playback_frame_range::pinnedAdmissionLastFrame(\n"
+        "            ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(), totalFrames, !f3CutRangeRepairDisabledByEnvironment() );"), smokeAt);
+    ASSERT_TRUE(lastFrameAt > floorAt);
+    ASSERT_TRUE(identityAt > lastFrameAt);
+    ASSERT_FALSE(mainWindow.contains(QStringLiteral("const int pinLastFrame = ( pinCutOut > 0")));
+    ASSERT_TRUE(mainWindow.indexOf(QStringLiteral("static_cast<qlonglong>( pinStartFrame ) + options.targetPresentedFrames"),
+                                   identityAt) > identityAt);
+}

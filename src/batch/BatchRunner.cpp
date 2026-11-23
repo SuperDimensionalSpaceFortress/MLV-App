@@ -297,28 +297,16 @@ MediaProbeFacts mediaProbeFactsFromFfmpegDump(const QByteArray &dump)
     return facts;
 }
 
-/* Optional enrichment only. Looks on PATH first, then beside the resolved ffmpeg (the two
- * ship together in every standard distribution). Empty string means "not available", and
- * the caller degrades its REPORT, never its verdict. */
+/* Optional enrichment only. Uses the probe plan's hit (application directory, then PATH), then
+ * looks beside the resolved ffmpeg (the two ship together in every standard distribution); the
+ * rule lives in BatchRenderedVideoPlan.cpp (batchRenderedVideoOptionalMediaProbeExecutable) so
+ * the console tests pin it. Empty string means "not available", and the caller degrades its
+ * REPORT, never its verdict. */
 QString resolveOptionalMediaProbe(
     const BatchRenderedVideoMediaProbeBinaryPlan &probePlan,
     const BatchRenderedVideoFfmpegBinaryPlan &ffmpegPlan)
 {
-    if( probePlan.foundOnPath && !probePlan.resolvedExecutable.isEmpty() )
-        return probePlan.resolvedExecutable;
-
-    const QString siblingDir = QFileInfo( ffmpegPlan.resolvedExecutable ).absolutePath();
-    if( siblingDir.isEmpty() )
-        return QString();
-
-    for( const QString &candidate : QStringList{ siblingDir + QStringLiteral("/ffprobe.exe"),
-                                                 siblingDir + QStringLiteral("/ffprobe") } )
-    {
-        const QFileInfo info( candidate );
-        if( info.exists() && info.isFile() )
-            return QDir::cleanPath( info.absoluteFilePath() );
-    }
-    return QString();
+    return batchRenderedVideoOptionalMediaProbeExecutable( probePlan, ffmpegPlan );
 }
 
 } /* anonymous namespace */
@@ -1038,12 +1026,12 @@ int BatchRunner::run(const QString &inputPath, const QString &outputPath)
          * found, so an --rendered-ffmpeg typo would otherwise survive preflight and only
          * surface as a failed spawn (exit 4, "export failure"). It is a usage error:
          * report it as one, name what was searched, and exit 2 before touching the clip. */
-        if( !ffmpegBinaryPlan.foundOnPath
-         && !QFileInfo::exists( ffmpegBinaryPlan.resolvedExecutable ) )
+        if( !batchRenderedVideoFfmpegBinaryPlanUsableAtPreflight( ffmpegBinaryPlan ) )
         {
-            BatchLogger::err(QStringLiteral("[BATCH] ERROR: rendered-video export cannot find ffmpeg. requested=%1 resolved=%2 searched=PATH. Pass --rendered-ffmpeg <path-to-ffmpeg> or put ffmpeg on PATH.\n")
-                .arg(ffmpegBinaryPlan.requestedExecutable)
-                .arg(ffmpegBinaryPlan.resolvedExecutable));
+            BatchLogger::err(QStringLiteral("[BATCH] ERROR: rendered-video export cannot find ffmpeg. requested=%1 resolved=%2 searched=%3. Pass --rendered-ffmpeg <path-to-ffmpeg> or put ffmpeg on PATH.\n")
+                .arg(ffmpegBinaryPlan.requestedExecutable,
+                     ffmpegBinaryPlan.resolvedExecutable,
+                     batchRenderedVideoFfmpegBinaryPlanSearchedLocations(ffmpegBinaryPlan)));
             return 2;
         }
 
