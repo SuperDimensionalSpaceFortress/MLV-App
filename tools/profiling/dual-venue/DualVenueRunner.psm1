@@ -3371,15 +3371,15 @@ function Get-DvContactFrameCountVerdict {
     $pngStems = @($list | Where-Object { $_ -cmatch '^frame-[0-9]{2,}\.png$' } | ForEach-Object { $_.Substring(0, $_.Length - '.png'.Length) })
     $sidecarStems = @($list | Where-Object { $_ -cmatch '^frame-[0-9]{2,}\.json$' } | ForEach-Object { $_.Substring(0, $_.Length - '.json'.Length) })
     $wanted = $(if (($Requested -is [int] -or $Requested -is [long]) -and $Requested -ge 1 -and $Requested -le 999) { [int]$Requested } else { 0 })
-    $ok = $true
+    $stripIsExact = $true
     if ($wanted -gt 0) {
-        $expected = [System.Collections.Generic.HashSet[string]]::new([string[]]@(for ($i = 0; $i -lt $wanted; $i++) { 'frame-{0:D2}' -f $i }), [StringComparer]::Ordinal)
+        $wantedStems = [System.Collections.Generic.HashSet[string]]::new([string[]]@(for ($i = 0; $i -lt $wanted; $i++) { 'frame-{0:D2}' -f $i }), [StringComparer]::Ordinal)
         $havePng = [System.Collections.Generic.HashSet[string]]::new([string[]]$pngStems, [StringComparer]::Ordinal)
         $haveSidecar = [System.Collections.Generic.HashSet[string]]::new([string[]]$sidecarStems, [StringComparer]::Ordinal)
-        $ok = $havePng.SetEquals($expected) -and $haveSidecar.SetEquals($expected) -and $pngStems.Count -eq $wanted -and $sidecarStems.Count -eq $wanted -and $unexpected.Count -eq 0
+        $stripIsExact = $havePng.SetEquals($wantedStems) -and $haveSidecar.SetEquals($wantedStems) -and $pngStems.Count -eq $wanted -and $sidecarStems.Count -eq $wanted -and $unexpected.Count -eq 0
     }
-    $reason = $(if ($ok) { $null } else { "the leg asked for frame-00 .. frame-$('{0:D2}' -f ($wanted - 1)) ($wanted frame(s), each a PNG and its sidecar) but the strip holds $($pngStems.Count) frame PNG(s) and $($sidecarStems.Count) frame sidecar(s) that are not exactly those$(if ($unexpected.Count -gt 0) { " (and $($unexpected.Count) file(s) that are not frames: $(($unexpected | Select-Object -First 3) -join ', '))" }); a strip that is not the requested frames is not the leg's acceptance evidence" })
-    [pscustomobject]@{ ok = $ok; pngs = $pngStems.Count; sidecars = $sidecarStems.Count; requested = $(if ($wanted -eq 0) { $null } else { $wanted }); reason = $reason }
+    $reason = $(if ($stripIsExact) { $null } else { "the leg asked for frame-00 .. frame-$('{0:D2}' -f ($wanted - 1)) ($wanted frame(s), each a PNG and its sidecar) but the strip holds $($pngStems.Count) frame PNG(s) and $($sidecarStems.Count) frame sidecar(s) that are not exactly those$(if ($unexpected.Count -gt 0) { " (and $($unexpected.Count) file(s) that are not frames: $(($unexpected | Select-Object -First 3) -join ', '))" }); a strip that is not the requested frames is not the leg's acceptance evidence" })
+    [pscustomobject]@{ ok = $stripIsExact; pngs = $pngStems.Count; sidecars = $sidecarStems.Count; requested = $(if ($wanted -eq 0) { $null } else { $wanted }); reason = $reason }
 }
 
 # --- CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r6: the leg-spec SHAPE refusals, ONE predicate for the leg and the lease batch's preflight --------------
