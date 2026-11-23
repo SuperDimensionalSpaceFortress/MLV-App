@@ -2706,13 +2706,14 @@ function Test-DvVisualTwinName {
 function Test-DvPathHasLinkBelow {
     <#
     .SYNOPSIS
-    r10 (adversary r10 A2): is the file at $Path, or any directory between it and $Root (exclusive), a link (a reparse point: a symlink or a junction)? A link's own leaf says nothing about the
-    file it reads, so a twin-named target behind a neutral link name would pass a leaf check. Committed leg specs are plain files.
+    r10 (adversary r10 A2): is the file at $Path, or any directory between it and $Root, $Root ITSELF included (adversary r10 pass 2 A1: a legs/ that is a junction), a link (a reparse
+    point: a symlink or a junction)? A link's own leaf says nothing about the file it reads, so a twin-named target behind a neutral link name would pass a leaf check. Committed leg specs
+    and legs/ are plain files and a plain directory.
     #>
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Root)
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\')
     $p = [IO.Path]::GetFullPath($Path)
-    while ($p -and $p.Length -gt $rootFull.Length) {
+    while ($p -and $p.Length -ge $rootFull.Length) {
         if (([IO.File]::GetAttributes($p) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
         $p = [IO.Path]::GetDirectoryName($p)
     }
@@ -2756,6 +2757,8 @@ function Get-DvLegSetPlan {
         # Invoke-VenueLeg's -ExpectSpecSha256 takes), so the child that runs this entry is bound to the exact bytes the planner approved
         # (decoded exactly as File.ReadAllText does, BOM-detected, so a spec the base planner could read is still readable: adversary r7 A5)
         $specBytes = [IO.File]::ReadAllBytes($full)
+        # r10 (adversary r10 pass 2 A1): checked again AFTER the read, so a link put in place between the first check and the read is refused too
+        if (Test-DvPathHasLinkBelow -Path $full -Root $legsDir) { throw "DVE_LEGSET_INVALID '$ref' is a link (symlink or junction); a leg named by a set is a committed spec file under legs/" }
         $specSha256 = Get-DvSha256OfBytes $specBytes
         $specReader = [IO.StreamReader]::new([IO.MemoryStream]::new($specBytes), [Text.Encoding]::UTF8, $true)
         try { $specText = $specReader.ReadToEnd() } finally { $specReader.Dispose() }

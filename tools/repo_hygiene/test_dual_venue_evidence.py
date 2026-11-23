@@ -20032,6 +20032,21 @@ class DriftLegSpecTests(unittest.TestCase):
             self.assertEqual(self.plan_one_leg_set(root, "legs/m16-1243-speed.json")["planned"], self.speed_backends(), "the control still plans")
 
     @requires_windows_pwsh
+    def test_the_planner_refuses_a_legs_directory_that_is_itself_a_junction(self) -> None:
+        """r10 (adversary r10 pass 2 A1): the link walk stopped BELOW legs/, so a legs/ that is itself a junction to another directory planned the file it reached there."""
+        with tempfile.TemporaryDirectory(prefix="dve-legs-junction-") as tmp:
+            root = Path(tmp) / "dual-venue"
+            shutil.copytree(DV, root)
+            elsewhere = Path(tmp) / "elsewhere"
+            shutil.move(str(root / "legs"), str(elsewhere))
+            mk = subprocess.run(["cmd", "/c", "mklink", "/J", str(root / "legs"), str(elsewhere)], capture_output=True, text=True)
+            self.assertEqual(mk.returncode, 0, mk.stdout + mk.stderr)
+            self.assertTrue((root / "legs" / "m16-1243-speed.json").is_file(), "the junction resolves")
+            got = self.plan_one_leg_set(root, "legs/m16-1243-speed.json")
+            self.assertEqual(got["planned"], 0, "a spec reached through a junctioned legs/ planned")
+            self.assertIn("link", got["why"])
+
+    @requires_windows_pwsh
     def test_the_matrix_reader_never_turns_a_visual_twins_receipt_into_a_measured_speed_cell(self) -> None:
         """r6 B1, the READER half (sol r5: the four saved twin receipts rendered 1/1 measured): a row whose plan entry or receipt names a visual twin carries the outcome
         and no rates, whatever path the entry came through; the same receipt under an ordinary leg id is read normally (the control)."""
