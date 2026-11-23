@@ -175,6 +175,9 @@ if ($null -ne $setPlan) {
         foreach ($seam in 'ConsentPath', 'VenueTablePath', 'RepoRoot', 'WorkDir', 'UmRunScript', 'GeneratorScript') {
             if ($PSBoundParameters.ContainsKey($seam)) { $childArgs += @("-$seam", [string](Get-Variable -Name $seam -ValueOnly)) }
         }
+        # r7 (adversary r7 A2): a child that refuses (DVE_LEG_SPEC_CHANGED) exits non-zero BY DESIGN and its refusal is a row, so this walk must not inherit a caller's
+        # $PSNativeCommandUseErrorActionPreference = $true (with the Stop preference above it would turn that exit into a terminating error and end the walk before the typed row and the summary)
+        $PSNativeCommandUseErrorActionPreference = $false
         $childOut = @(& $pwshExe @childArgs 2>&1 | ForEach-Object { [string]$_ })
         $receiptPath = $null
         foreach ($childLine in $childOut) { if ($childLine -match '^DVE_RECEIPT_PATH=(?<p>.+)$') { $receiptPath = $Matches['p'].Trim() } }
@@ -183,9 +186,14 @@ if ($null -ne $setPlan) {
             try { $legReceipt = [IO.File]::ReadAllText($receiptPath) | ConvertFrom-Json } catch { $legReceipt = $null }
         }
         $row = Get-DvMatrixRow -PlanEntry $entry -Receipt $legReceipt
-        # r7: a child that refused because its spec's bytes are no longer the planned ones wrote no receipt; say so on its own typed line and in its row, so it is never read as a leg that merely failed
-        if ($null -eq $legReceipt -and @($childOut | Where-Object { $_ -match 'DVE_LEG_SPEC_CHANGED' }).Count -gt 0) {
-            Write-Output ('DVE_MATRIX_SPEC_CHANGED {0}/{1} repeat={2} cell={3} leg={4} planned_sha256={5} (the spec bytes changed after planning; the leg was refused and is no measurement)' -f $entry.seq, $total, $entry.repeat, $entry.cellId, $entry.legId, $entry.specSha256)
+        # r7: a child that refused because its spec's bytes are no longer the planned ones wrote no receipt; say so on its own typed line and in its row (outcome SPEC_CHANGED: it did not RUN, so the
+        # table's `ran` leaves it out), so it is never read as a leg that merely failed. Classified ONLY by the child's own whole-line stdout record naming THIS entry's planned hash (adversary r7 A1:
+        # a path or message that merely quotes the token DVE_LEG_SPEC_CHANGED, e.g. a receipt-write failure under a receipt root of that name, is not it)
+        $refusedRead = $null
+        foreach ($childLine in $childOut) { if ($childLine -cmatch '^DVE_LEG_SPEC_REFUSED planned_sha256=(?<p>[0-9a-f]{64}) read_sha256=(?<r>[0-9a-f]{64})$' -and $Matches['p'] -ceq [string]$entry.specSha256) { $refusedRead = $Matches['r'] } }
+        if ($null -eq $legReceipt -and $null -ne $refusedRead) {
+            Write-Output ('DVE_MATRIX_SPEC_CHANGED {0}/{1} repeat={2} cell={3} leg={4} planned_sha256={5} read_sha256={6} (the spec bytes changed after planning; the leg was refused and is no measurement)' -f $entry.seq, $total, $entry.repeat, $entry.cellId, $entry.legId, $entry.specSha256, $refusedRead)
+            $row.outcome = 'SPEC_CHANGED'
             $row.note = 'DVE_LEG_SPEC_CHANGED: the spec bytes changed after planning; the leg was refused before anything ran'
         }
         $rows.Add($row)
@@ -238,6 +246,8 @@ $specBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $LegSpec).Path)
 if ($ExpectSpecSha256) {
     # r19 (sol r18 B1): the bytes read above are the bytes this leg runs; they must be the ones the batch's budget preflight judged (raw sha256, no line-ending normalisation)
     $readSpecSha = ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData($specBytes)) -replace '-', '').ToLowerInvariant()
+    # r7 (adversary r7 A1): the typed STDOUT line a matrix parent classifies this refusal by (anchored, whole-line, both hashes): the throw text below can quote a path or other text, a line of its own cannot be spoofed by one
+    if ($readSpecSha -cne $ExpectSpecSha256) { Write-Output "DVE_LEG_SPEC_REFUSED planned_sha256=$ExpectSpecSha256 read_sha256=$readSpecSha" }
     if ($readSpecSha -cne $ExpectSpecSha256) { throw "DVE_LEG_SPEC_CHANGED the leg spec '$LegSpec' read as sha256 $readSpecSha, not the $ExpectSpecSha256 the lease batch's export budget preflight judged; nothing is generated or submitted" }
 }
 # Line endings are normalised on BOTH sides of the committed-spec lookup (Get-DvLegSpecSha256): on this VM's default checkout (autocrlf=true) the working

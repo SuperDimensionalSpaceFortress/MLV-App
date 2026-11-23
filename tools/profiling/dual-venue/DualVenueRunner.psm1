@@ -2735,9 +2735,12 @@ function Get-DvLegSetPlan {
         }
         # r7 (sol r6 INV-3): ONE read of the file's bytes serves both the judgment below and the plan entry's specSha256 (RAW sha256, no line-ending normalisation: the hash
         # Invoke-VenueLeg's -ExpectSpecSha256 takes), so the child that runs this entry is bound to the exact bytes the planner approved
+        # (decoded exactly as File.ReadAllText does, BOM-detected, so a spec the base planner could read is still readable: adversary r7 A5)
         $specBytes = [IO.File]::ReadAllBytes($full)
         $specSha256 = Get-DvSha256OfBytes $specBytes
-        $spec = [Text.Encoding]::UTF8.GetString($specBytes).TrimStart([char]0xFEFF) | ConvertFrom-Json
+        $specReader = [IO.StreamReader]::new([IO.MemoryStream]::new($specBytes), [Text.Encoding]::UTF8, $true)
+        try { $specText = $specReader.ReadToEnd() } finally { $specReader.Dispose() }
+        $spec = $specText | ConvertFrom-Json
         if ([string]$spec.clipId -cne $clipId -or [string]$spec.card -cne $card) { throw "DVE_LEGSET_INVALID leg '$($spec.legId)' does not name the set's clip and card" }
         # r6: refused by the RESOLVED spec (its legId and its file leaf), so no spelling of the reference gets a visual twin into a speed-cell matrix
         if ((Test-DvVisualTwinName $spec.legId) -or (Test-DvVisualTwinName ([IO.Path]::GetFileName($full)))) {
@@ -3141,6 +3144,8 @@ function ConvertTo-DvMatrixTable {
     foreach ($c in $Cells) {
         $mine = @($Rows | Where-Object { $_.cellId -ceq $c.cellId })
         $meas = @($mine | Where-Object { Test-DvMatrixRowMeasured -Row $_ })
+        # r7 (adversary r7 A3): a repeat the runner refused because its spec bytes changed after planning (row outcome SPEC_CHANGED) never ran: it is listed in `outcomes`, not counted in `ran`
+        $ranCount = @($mine | Where-Object { $_.outcome -cne 'SPEC_CHANGED' }).Count
         $pf = @($meas | ForEach-Object { $_.presentedFps })
         $range = $(if ($pf.Count -gt 0) { '(' + (& $f ($pf | Measure-Object -Minimum).Minimum 2) + '-' + (& $f ($pf | Measure-Object -Maximum).Maximum 2) + ')' } else { '' })
         $presented = ((& $f (Get-DvMedian $pf) 2) + ' ' + $range).Trim()
@@ -3149,7 +3154,7 @@ function ConvertTo-DvMatrixTable {
         $eff = @($mine | ForEach-Object { "$(Get-DvScaleLabel -Factor $c.scaleFactor)->$(Get-DvScaleLabel -Factor $_.effectiveScale)" } | Sort-Object -Unique) -join ','
         $win = @($mine | Where-Object { $_.windowSize } | ForEach-Object { if ($_.previewSize) { "$($_.windowSize) ($($_.previewSize))" } else { $_.windowSize } } | Sort-Object -Unique) -join ', '
         $outcomes = @($mine | ForEach-Object { $_.outcome } | Group-Object | Sort-Object Name | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', '
-        $lines.Add("| $($c.cellId) | $($c.backend) | $($c.displayMode) / $(if ($observed) { $observed } else { '-' }) | $eff | $(if ($win) { $win } else { '-' }) | $($meas.Count)/$($mine.Count) | $presented | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.timelineFpsAfterFirstPresent })) 2) | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.renderWorkMs })) 1) | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.dualIsoMs })) 1) | $(if ($outcomes) { $outcomes } else { '-' }) |")
+        $lines.Add("| $($c.cellId) | $($c.backend) | $($c.displayMode) / $(if ($observed) { $observed } else { '-' }) | $eff | $(if ($win) { $win } else { '-' }) | $($meas.Count)/$ranCount | $presented | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.timelineFpsAfterFirstPresent })) 2) | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.renderWorkMs })) 1) | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.dualIsoMs })) 1) | $(if ($outcomes) { $outcomes } else { '-' }) |")
     }
     $lines -join "`n"
 }

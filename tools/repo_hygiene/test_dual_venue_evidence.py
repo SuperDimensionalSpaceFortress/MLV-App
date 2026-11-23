@@ -6359,6 +6359,14 @@ class DisplayMatrixLegSetTests(unittest.TestCase):
         self.assertIn("| 1/2 | 4.00 (4.00-4.00) |", cpu, "one measurement of two runs; the INVALID repeat is counted in 'ran' and shows no numbers")
         self.assertTrue(cpu.endswith("INVALID x1, PASS x1 |"), cpu)
 
+    def test_a_refused_repeat_is_listed_in_the_outcomes_but_not_counted_as_run(self) -> None:
+        """adversary r7 A3: `measured / ran` counts the repeats that ran; a repeat refused for changed spec bytes (row outcome SPEC_CHANGED) did not."""
+        cells = [{"cellId": "cuda-windowed-s1", "backend": "cuda", "displayMode": "windowed", "scaleFactor": 1}]
+        rows = [self.row("cuda-windowed-s1", fps=12.0), self.row("cuda-windowed-s1", outcome="SPEC_CHANGED", fps=None, presentedFps=None, timelineFpsAfterFirstPresent=None, renderWorkMs=None, dualIsoMs=None)]
+        line = self.table(rows, cells).splitlines()[2]
+        self.assertIn("| 1/1 | 12.00 (12.00-12.00) |", line)
+        self.assertTrue(line.endswith("PASS x1, SPEC_CHANGED x1 |"), line)
+
     def test_the_scale_column_reads_as_resolution_labels_never_bare_factors(self) -> None:
         """SCALE-LABEL-CLARITY-1 r2: requested -> effective renders through the same mapping as the plan line and outcomeDetail (Get-DvScaleLabel); the
         internal receipt fields stay numeric. An unread effective scale ('UNKNOWN') says so; an off-preset factor is 'Custom res (1/N)'."""
@@ -6411,7 +6419,8 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
             self.artifacts = saved
         return f"X:\\stub\\agent\\outbox\\{name}"
 
-    def run_matrix(self, repeats: int, extra: list[str], placements: dict[str, str], dv: Path = DV):
+    def run_matrix(self, repeats: int, extra: list[str], placements: dict[str, str], dv: Path = DV, native_error_pref: bool = False):
+        """`native_error_pref`: run the script IN a session that has $PSNativeCommandUseErrorActionPreference = $true (a caller's preference the matrix walk inherits)."""
         by_leg = {}
         for cell in (c for c in MATRIX_CELLS if c.startswith("cuda-")):
             _, mode, scale = cell.split("-")
@@ -6422,11 +6431,15 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
         self.stub_cfg.write_text(json.dumps(cfg), encoding="utf-8")
         self.log.write_text("", encoding="utf-8")
         self.gen_log.write_text("", encoding="utf-8")
-        proc = run_pwsh(["-File", str(dv / "Invoke-VenueLeg.ps1"), "-Venue", "ultra-magnus", "-LegSet", "display-matrix", "-Repeats", str(repeats), "-SourceCommit", self.sha,
-                         "-BuildManifestSha256", self.build_sha, "-VenueTablePath", str(self.table), "-ReceiptRoot", str(self.receipts), "-OfflineTestMode",
-                         "-UmRunScript", str(self.um), "-GeneratorScript", str(self.gen), "-WorkDir", str(self.tmp / "work"), "-ConsentPath", str(self.consent),
-                         "-RepoRoot", str(ROOT), "-Actor", "unit-test", *extra], env_extra={"DVE_STUB": str(self.stub_cfg)})
-        return proc
+        script_args = ["-Venue", "ultra-magnus", "-LegSet", "display-matrix", "-Repeats", str(repeats), "-SourceCommit", self.sha,
+                       "-BuildManifestSha256", self.build_sha, "-VenueTablePath", str(self.table), "-ReceiptRoot", str(self.receipts), "-OfflineTestMode",
+                       "-UmRunScript", str(self.um), "-GeneratorScript", str(self.gen), "-WorkDir", str(self.tmp / "work"), "-ConsentPath", str(self.consent),
+                       "-RepoRoot", str(ROOT), "-Actor", "unit-test", *extra]
+        if native_error_pref:
+            quote = lambda a: a if a.startswith("-") else "'" + a.replace("'", "''") + "'"   # a parameter NAME stays bare, every value is a quoted literal
+            return run_pwsh(["-Command", "$PSNativeCommandUseErrorActionPreference = $true; & '" + str(dv / "Invoke-VenueLeg.ps1") + "' " + " ".join(quote(a) for a in script_args)],
+                            env_extra={"DVE_STUB": str(self.stub_cfg)})
+        return run_pwsh(["-File", str(dv / "Invoke-VenueLeg.ps1"), *script_args], env_extra={"DVE_STUB": str(self.stub_cfg)})
 
     def test_a_cuda_matrix_run_interleaves_the_cells_runs_every_leg_and_writes_one_table(self) -> None:
         bad_cell = "cuda-windowed-s2"   # asked for windowed; the app's log says it ran full screen
@@ -6486,34 +6499,69 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
         self.assertIsNone(row["presentedFps"], "a log that does not hash to the receipt is no measurement")
         self.assertIn("does not hash to the receipt", row["note"])
 
-    def test_a_leg_whose_spec_bytes_change_after_planning_is_refused_and_is_never_counted_as_a_speed_cell(self) -> None:
-        """r7 (sol r6 INV-3): the planner judged one spec and the child re-read the path later with no expected hash, so bytes swapped to a committed visual twin between
-        the plan and the child's read ran in an ordinary speed slot. The plan now carries the sha256 of the bytes it judged and the child is bound to it (-ExpectSpecSha256).
-        The swap is made by the first leg's generator stub, i.e. strictly after planning and before leg 2's child reads its spec."""
-        dv = self.mutated_runner([])   # a COPY of the runner tree: the swap must never touch the checked-in specs
-        twin_bytes = dv / "legs" / "m16-1457-drift-t1-w10-visual-unpaced-fullscreen-s1.json"
-        target = dv / "legs" / "m16-1243-display-windowed-s1.json"   # plan entry 2 of the cuda walk
-        swap = f"if (-not $env:DVE_NO_SWAP) {{ Copy-Item -LiteralPath '{twin_bytes}' -Destination '{target}' -Force }}\n"
+    def run_swapped_matrix(self, source_name: str, native_error_pref: bool = False):
+        """A cuda matrix run in a COPY of the runner tree (the swap must never touch the checked-in specs) whose first leg's generator stub overwrites the spec of plan entry 2
+        (cuda-windowed-s1) with the bytes of the committed spec `source_name`: strictly after planning, before leg 2's child reads its spec. Returns (proc, copy of dv, target path)."""
+        dv = self.mutated_runner([])
+        source = dv / "legs" / source_name
+        target = dv / "legs" / "m16-1243-display-windowed-s1.json"
+        swap = f"Copy-Item -LiteralPath '{source}' -Destination '{target}' -Force\n"
         anchor = "$cfg = Get-Content -LiteralPath $env:DVE_STUB -Raw | ConvertFrom-Json"
         self.assertEqual(STUB_GENERATOR.count(anchor), 1)
         self.gen = self.tmp / "gen-swap-stub.ps1"
         self.gen.write_text(STUB_GENERATOR.replace(anchor, swap + anchor, 1), encoding="utf-8")
-        proc = self.run_matrix(1, ["-Backend", "cuda"], {}, dv=dv)
+        proc = self.run_matrix(1, ["-Backend", "cuda"], {}, dv=dv, native_error_pref=native_error_pref)
+        self.assertEqual(target.read_bytes(), source.read_bytes(), "the fixture really swapped the planned spec's bytes")
+        return proc, dv, target
+
+    def assert_swapped_leg_refused(self, proc, receipts_root: Path, summary_rows: int = 6) -> str:
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual(target.read_bytes(), twin_bytes.read_bytes(), "the fixture really swapped the planned spec's bytes for the twin's")
         legs = [l for l in proc.stdout.splitlines() if l.startswith("DVE_MATRIX_LEG ")]
-        self.assertEqual(len(legs), 6, proc.stdout)
+        self.assertEqual(len(legs), summary_rows, proc.stdout)
         swapped = next(l for l in legs if "cell=cuda-windowed-s1 " in l)
-        self.assertIn("outcome=NO_RECEIPT", swapped, "the leg that read other bytes than the planner judged wrote no receipt")
+        self.assertIn("outcome=SPEC_CHANGED", swapped, "the leg that read other bytes than the planner judged wrote no receipt and is its own outcome")
         self.assertIn("receipt=none", swapped)
         self.assertTrue(any(l.startswith("DVE_MATRIX_SPEC_CHANGED ") and "cell=cuda-windowed-s1" in l for l in proc.stdout.splitlines()), "the refusal is a typed line\n" + proc.stdout)
-        receipts = [json.loads(p.read_text(encoding="utf-8")) for p in self.receipts.rglob("*.json")]
-        self.assertEqual([r["legId"] for r in receipts if "-visual-" in r["legId"]], [], "a visual twin ran in a speed slot")
+        receipts = [json.loads(p.read_text(encoding="utf-8")) for p in receipts_root.rglob("*.json")]
         self.assertEqual(len(receipts), 5, "the other five legs still ran and wrote their receipts")
         submitted = [l for l in self.log.read_text(encoding="utf-8").splitlines() if l.strip()]
-        self.assertFalse([l for l in submitted if "visual" in l], "the twin's job was submitted")
-        summary = Path(re.search(r"DVE_MATRIX_SUMMARY=(.+)", proc.stdout).group(1).strip()).read_text(encoding="utf-8")
-        self.assertIn("= 6 leg(s), 5 measured.", summary)
+        self.assertFalse([l for l in submitted if "windowed-s1" in l], "the swapped leg's job was submitted")
+        text = Path(re.search(r"DVE_MATRIX_SUMMARY=(.+)", proc.stdout).group(1).strip()).read_text(encoding="utf-8")
+        self.assertIn("= 6 leg(s), 5 measured.", text)
+        return text
+
+    def test_a_leg_whose_spec_bytes_change_after_planning_is_refused_and_is_never_counted_as_a_speed_cell(self) -> None:
+        """r7 (sol r6 INV-3): the planner judged one spec and the child re-read the path later with no expected hash, so bytes swapped to a committed visual twin between
+        the plan and the child's read ran in an ordinary speed slot. The plan now carries the sha256 of the bytes it judged and the child is bound to it (-ExpectSpecSha256)."""
+        proc, dv, target = self.run_swapped_matrix("m16-1457-drift-t1-w10-visual-unpaced-fullscreen-s1.json")
+        text = self.assert_swapped_leg_refused(proc, self.receipts)
+        receipts = [json.loads(p.read_text(encoding="utf-8")) for p in self.receipts.rglob("*.json")]
+        self.assertEqual([r["legId"] for r in receipts if "-visual-" in r["legId"]], [], "a visual twin ran in a speed slot")
+        # adversary r7 A3: the refused repeat did not run, so the cell's `measured / ran` is 0/0 and the outcomes column still says what happened
+        refused_row = next(l for l in text.splitlines() if l.startswith("| cuda-windowed-s1 "))
+        self.assertIn("| 0/0 |", refused_row)
+        self.assertTrue(refused_row.endswith("SPEC_CHANGED x1 |"), refused_row)
+
+    def test_the_matrix_walk_survives_a_callers_native_command_error_preference(self) -> None:
+        """adversary r7 A2: a caller that runs the script with $PSNativeCommandUseErrorActionPreference = $true made the child's by-design non-zero refusal exit a terminating
+        error in the parent walk (under its Stop preference): no typed row, no remaining walk, no summary. The walk now owns that preference."""
+        proc, dv, target = self.run_swapped_matrix("m16-1243-display-fullscreen-s1.json", native_error_pref=True)
+        self.assert_swapped_leg_refused(proc, self.receipts)
+
+    def test_a_child_that_merely_quotes_the_refusal_token_is_not_classified_as_a_spec_change(self) -> None:
+        """adversary r7 A1: the walk classified a no-receipt child by the substring DVE_LEG_SPEC_CHANGED anywhere in its output, so a receipt-write failure printing a receipt-root
+        PATH that contains the token read as 'the spec changed after planning'. Only the child's own whole-line DVE_LEG_SPEC_REFUSED record naming the entry's planned hash counts."""
+        self.receipts = self.tmp / "DVE_LEG_SPEC_CHANGED" / "receipts"
+        blocker = self.receipts / "DUAL-VENUE-DISPLAY-MATRIX-1" / "m16-1243-display-fullscreen-s1"
+        blocker.mkdir(parents=True)
+        (blocker / "ultra-magnus").write_text("a file where the receipt directory must go", encoding="utf-8")   # the first leg's receipt write fails
+        proc = self.run_matrix(1, ["-Backend", "cuda"], {})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        legs = [l for l in proc.stdout.splitlines() if l.startswith("DVE_MATRIX_LEG ")]
+        self.assertEqual(len(legs), 6, proc.stdout)
+        first = next(l for l in legs if "cell=cuda-fullscreen-s1 " in l)
+        self.assertIn("outcome=NO_RECEIPT", first, "the leg whose receipt could not be written is no receipt, not a changed spec")
+        self.assertFalse([l for l in proc.stdout.splitlines() if l.startswith("DVE_MATRIX_SPEC_CHANGED ")], proc.stdout)
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -19875,6 +19923,23 @@ class DriftLegSpecTests(unittest.TestCase):
         for entry in got:
             with self.subTest(seq=entry["seq"]):
                 self.assertEqual(entry["specSha256"], hashlib.sha256(Path(entry["specPath"]).read_bytes()).hexdigest())
+
+    @requires_windows_pwsh
+    def test_the_planner_still_reads_a_bom_encoded_spec_the_way_the_file_reader_does(self) -> None:
+        """adversary r7 A5: hashing the planner's read must not narrow what it decodes: a spec File.ReadAllText could read (a UTF-16 or UTF-8 byte-order mark) still plans, and
+        its entry carries the sha256 of the raw bytes."""
+        with tempfile.TemporaryDirectory(prefix="dve-bom-") as tmp:
+            root = Path(tmp) / "dual-venue"
+            shutil.copytree(DV, root)
+            target = root / "legs" / "m16-1243-display-windowed-s1.json"
+            text = target.read_text(encoding="utf-8")
+            for name, raw in (("utf16", b"\xff\xfe" + text.encode("utf-16-le")), ("utf8-bom", b"\xef\xbb\xbf" + text.encode("utf-8"))):
+                with self.subTest(encoding=name):
+                    target.write_bytes(raw)
+                    proc, got = run_pwsh_json(f"$p = Get-DvLegSetPlan -LegSetPath '{root / 'legsets' / 'display-matrix.json'}' -Backend cuda\n"
+                                              "@($p.plan | Where-Object { $_.cellId -ceq 'cuda-windowed-s1' } | ForEach-Object { [ordered]@{ legId = $_.legId; specSha256 = $_.specSha256 } }) | ConvertTo-Json -Compress -AsArray")
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertEqual(got, [{"legId": "m16-1243-display-windowed-s1", "specSha256": hashlib.sha256(raw).hexdigest()}])
 
     @staticmethod
     def write_json(path: Path, doc: object) -> Path:
