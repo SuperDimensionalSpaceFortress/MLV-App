@@ -6579,6 +6579,24 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
         self.assertFalse([l for l in proc.stdout.splitlines() if l.startswith("DVE_MATRIX_SPEC_CHANGED ")], proc.stdout)
         self.assertFalse([l for l in proc.stdout.splitlines() if l.startswith("DVE_MATRIX_SPEC_UNREADABLE ")], proc.stdout)
 
+    def test_a_refusal_record_on_the_childs_stderr_is_not_classified(self) -> None:
+        """r10 (adversary r10 A3): the walk merged the child's stderr into the lines it classified, so a generator that printed `DVE_LEG_SPEC_UNREADABLE planned_sha256=<hash>`
+        (or the REFUSED record) on stderr, after the spec WAS read, made a no-receipt leg read as a prelaunch refusal counting 0/0. Only the child's own STDOUT records count."""
+        planned = hashlib.sha256((DV / "legs" / "m16-1243-display-fullscreen-s1.json").read_bytes()).hexdigest()
+        blocker = self.receipts / "DUAL-VENUE-DISPLAY-MATRIX-1" / "m16-1243-display-fullscreen-s1"
+        blocker.mkdir(parents=True)
+        (blocker / "ultra-magnus").write_text("a file where the receipt directory must go", encoding="utf-8")   # the first leg's receipt write fails
+        anchor = "$cfg = Get-Content -LiteralPath $env:DVE_STUB -Raw | ConvertFrom-Json"
+        spoof = (f"[Console]::Error.WriteLine('DVE_LEG_SPEC_UNREADABLE planned_sha256={planned}')\n"
+                 f"[Console]::Error.WriteLine('DVE_LEG_SPEC_REFUSED planned_sha256={planned} read_sha256={'0' * 64}')\n")
+        self.gen = self.tmp / "gen-stderr-spoof-stub.ps1"
+        self.gen.write_text(STUB_GENERATOR.replace(anchor, spoof + anchor, 1), encoding="utf-8")
+        proc = self.run_matrix(1, ["-Backend", "cuda"], {})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        first = next(l for l in proc.stdout.splitlines() if l.startswith("DVE_MATRIX_LEG ") and "cell=cuda-fullscreen-s1 " in l)
+        self.assertIn("outcome=NO_RECEIPT", first, "a record on stderr is not the child's refusal\n" + proc.stdout)
+        self.assertFalse([l for l in proc.stdout.splitlines() if l.startswith(("DVE_MATRIX_SPEC_UNREADABLE ", "DVE_MATRIX_SPEC_CHANGED "))], proc.stdout)
+
     def run_unreadable_matrix(self, make_unreadable: str):
         """A cuda matrix run in a COPY of the runner tree whose first leg's generator stub makes the spec of plan entry 2 (cuda-windowed-s1) unreadable by `make_unreadable`
         (a PowerShell statement over $t, the spec path): strictly after planning, before leg 2's child reads its spec. Returns (proc, target path)."""
@@ -19942,6 +19960,76 @@ class DriftLegSpecTests(unittest.TestCase):
                     self.assertIn("DVE_LEGSET_INVALID", res["why"])
                     # an upper-case `.JSON` suffix is already refused earlier, as not being a leg spec (the runner's suffix check is case-sensitive); every other spelling is a twin
                     self.assertIn("is not a leg spec under legs/" if aliases[names.index(res["set"])].endswith(".JSON") else "visual twin", res["why"])
+
+    @staticmethod
+    def speed_backends() -> int:
+        """The control spec plans one cell per backend it lists."""
+        return len(json.loads((DV / "legs" / "m16-1243-speed.json").read_text(encoding="utf-8"))["backends"])
+
+    def plan_one_leg_set(self, root: Path, ref: str, culture: str = "") -> dict:
+        """Plan a one-leg set naming `ref` in the runner copy `root` (optionally under a thread culture); returns {planned, why}."""
+        spec = json.loads((DV / "legs" / "m16-1243-speed.json").read_text(encoding="utf-8"))
+        (root / "legsets" / "one.json").write_text(json.dumps({"schema": "mlv-app/dual-venue-legset/v1", "legSet": "one", "card": spec["card"], "clipId": spec["clipId"],
+                                                               "legs": [ref]}), encoding="utf-8")
+        set_culture = f"[Globalization.CultureInfo]::CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo('{culture}')\n" if culture else ""
+        proc = run_pwsh(["-Command", f"Import-Module '{root / 'DualVenueRunner.psm1'}' -Force\n" + set_culture +
+                         f"try {{ $p = Get-DvLegSetPlan -LegSetPath '{root / 'legsets' / 'one.json'}'; $r = [ordered]@{{ planned = @($p.plan).Count; why = '' }} }}\n"
+                         "catch { $r = [ordered]@{ planned = 0; why = $_.Exception.Message } }\n"
+                         "$r.culture = [Globalization.CultureInfo]::CurrentCulture.Name; $r | ConvertTo-Json -Compress"])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout)
+
+    @requires_windows_pwsh
+    def test_the_visual_twin_guard_is_culture_invariant(self) -> None:
+        """r10 (adversary r10 A1): `-match '(?i)-visual-'` folds case by the CURRENT culture, so under tr-TR an upper-case `VISUAL` (dotted I folds to dotless i) was not a twin:
+        LEGS\\M16-1243-SPEED-VISUAL-FULLSCREEN.json holding speed-spec bytes planned as a speed cell. The guard is now an ordinal, culture-free comparison."""
+        with tempfile.TemporaryDirectory(prefix="dve-twin-culture-") as tmp:
+            root = Path(tmp) / "dual-venue"
+            shutil.copytree(DV, root)
+            shutil.copyfile(DV / "legs" / "m16-1243-speed.json", root / "legs" / "M16-1243-SPEED-VISUAL-FULLSCREEN.json")
+            for culture in ("tr-TR", "en-US"):
+                with self.subTest(culture=culture):
+                    got = self.plan_one_leg_set(root, "LEGS\\M16-1243-SPEED-VISUAL-FULLSCREEN.json", culture)
+                    self.assertEqual(got["culture"], culture)
+                    self.assertEqual(got["planned"], 0, f"a twin file planned as a speed cell under {culture}")
+                    self.assertIn("visual twin", got["why"])
+            self.assertEqual(self.plan_one_leg_set(root, "legs/m16-1243-speed.json", "tr-TR")["planned"], self.speed_backends(), "the control still plans")
+            # the reader's row guard is the same predicate: an upper-case twin leg id carries no rate under tr-TR
+            proc = run_pwsh(["-Command", f"Import-Module '{root / 'DualVenueRunner.psm1'}' -Force\n"
+                             "[Globalization.CultureInfo]::CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo('tr-TR')\n"
+                             "$m = Get-Module DualVenueRunner\n"
+                             "@('M16-1243-SPEED-VISUAL-FULLSCREEN', 'm16-1243-speed-visual-fullscreen', 'M16-1243-SPEED-FULLSCREEN-S1') | ForEach-Object { [string](& $m { param($n) Test-DvVisualTwinName $n } $_) }"])
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.split(), ["True", "True", "False"])
+
+    @requires_windows_pwsh
+    def test_the_planner_refuses_a_leg_spec_that_is_a_link(self) -> None:
+        """r10 (adversary r10 A2): legs/capture-compat.json, a file symlink to a twin-named file, read the target's bytes but was judged by the LINK's neutral leaf. A leg a set
+        names is a committed spec FILE under legs/; a link (the file, or a directory on its way under legs/) is refused, whatever it points at."""
+        with tempfile.TemporaryDirectory(prefix="dve-twin-link-") as tmp:
+            root = Path(tmp) / "dual-venue"
+            shutil.copytree(DV, root)
+            twin = root / "legs" / "m16-1243-speed-visual-fullscreen.json"
+            shutil.copyfile(DV / "legs" / "m16-1243-speed.json", twin)
+            link = root / "legs" / "capture-compat.json"
+            try:
+                os.symlink(twin, link)
+            except OSError as exc:
+                self.skipTest(f"no symlink privilege on this host: {exc}")
+            got = self.plan_one_leg_set(root, "legs/capture-compat.json")
+            self.assertEqual(got["planned"], 0, "a link to a twin-named file planned as a speed cell")
+            self.assertIn("DVE_LEGSET_INVALID", got["why"])
+            self.assertIn("link", got["why"])
+            # a directory link under legs/ (a junction) is refused the same way
+            sub = root / "elsewhere"
+            sub.mkdir()
+            shutil.copyfile(DV / "legs" / "m16-1243-speed.json", sub / "m16-1243-speed.json")
+            mk = subprocess.run(["cmd", "/c", "mklink", "/J", str(root / "legs" / "jn"), str(sub)], capture_output=True, text=True)
+            self.assertEqual(mk.returncode, 0, mk.stdout + mk.stderr)
+            got = self.plan_one_leg_set(root, "legs/jn/m16-1243-speed.json")
+            self.assertEqual(got["planned"], 0, "a spec reached through a junction under legs/ planned")
+            self.assertIn("link", got["why"])
+            self.assertEqual(self.plan_one_leg_set(root, "legs/m16-1243-speed.json")["planned"], self.speed_backends(), "the control still plans")
 
     @requires_windows_pwsh
     def test_the_matrix_reader_never_turns_a_visual_twins_receipt_into_a_measured_speed_cell(self) -> None:

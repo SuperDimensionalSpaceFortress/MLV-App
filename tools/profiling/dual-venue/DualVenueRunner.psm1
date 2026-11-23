@@ -2699,7 +2699,24 @@ function Test-DvVisualTwinName {
     `LEGS\X.JSON` to the file `legs/x.json`).
     #>
     param([AllowNull()][AllowEmptyString()]$Name)
-    ([string]$Name) -match '(?i)-visual-'
+    # r10 (adversary r10 A1): an ORDINAL case-insensitive comparison, never the current culture's case folding (under tr-TR `-match '(?i)'` folds `I` to a dotless i, so `VISUAL` was missed)
+    ([string]$Name).IndexOf('-visual-', [StringComparison]::OrdinalIgnoreCase) -ge 0
+}
+
+function Test-DvPathHasLinkBelow {
+    <#
+    .SYNOPSIS
+    r10 (adversary r10 A2): is the file at $Path, or any directory between it and $Root (exclusive), a link (a reparse point: a symlink or a junction)? A link's own leaf says nothing about the
+    file it reads, so a twin-named target behind a neutral link name would pass a leaf check. Committed leg specs are plain files.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Root)
+    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $p = [IO.Path]::GetFullPath($Path)
+    while ($p -and $p.Length -gt $rootFull.Length) {
+        if (([IO.File]::GetAttributes($p) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
+        $p = [IO.Path]::GetDirectoryName($p)
+    }
+    $false
 }
 
 function Get-DvLegSetPlan {
@@ -2733,6 +2750,8 @@ function Get-DvLegSetPlan {
         if (-not $full.StartsWith($legsDir, [StringComparison]::OrdinalIgnoreCase) -or -not $full.EndsWith('.json') -or -not (Test-Path -LiteralPath $full -PathType Leaf)) {
             throw "DVE_LEGSET_INVALID '$ref' is not a leg spec under legs/"
         }
+        # r10 (adversary r10 A2): the identity judged below (legId and file leaf) must be the file's own: a link (the spec, or a directory on its way under legs/) is refused
+        if (Test-DvPathHasLinkBelow -Path $full -Root $legsDir) { throw "DVE_LEGSET_INVALID '$ref' is a link (symlink or junction); a leg named by a set is a committed spec file under legs/" }
         # r7 (sol r6 INV-3): ONE read of the file's bytes serves both the judgment below and the plan entry's specSha256 (RAW sha256, no line-ending normalisation: the hash
         # Invoke-VenueLeg's -ExpectSpecSha256 takes), so the child that runs this entry is bound to the exact bytes the planner approved
         # (decoded exactly as File.ReadAllText does, BOM-detected, so a spec the base planner could read is still readable: adversary r7 A5)
@@ -3079,7 +3098,9 @@ function Get-DvMatrixRow {
     if ($null -eq $Receipt) { $row.note = 'the leg wrote no receipt'; return [pscustomobject]$row }
     $row.outcome = [string](Get-DvProp $Receipt 'outcome'); $row.receiptId = [string](Get-DvProp $Receipt 'receiptId')
     # r6 (sol r5 B1): a visual twin's rates are never read, whichever path its plan entry or receipt came through (the entry's leg id and the receipt's leg id both count)
-    if ((Test-DvVisualTwinName (Get-DvProp $PlanEntry 'legId')) -or (Test-DvVisualTwinName (Get-DvProp $Receipt 'legId'))) {
+    # (r10, adversary r10 A2 sibling: the plan entry's spec file leaf counts too, as it does in the planner)
+    $entrySpecLeaf = $(if ([string](Get-DvProp $PlanEntry 'specPath')) { [IO.Path]::GetFileName([string](Get-DvProp $PlanEntry 'specPath')) } else { '' })
+    if ((Test-DvVisualTwinName (Get-DvProp $PlanEntry 'legId')) -or (Test-DvVisualTwinName (Get-DvProp $Receipt 'legId')) -or (Test-DvVisualTwinName $entrySpecLeaf)) {
         $row.note = 'a visual twin (capture-perturbed fps) is never a measured speed cell'; return [pscustomobject]$row
     }
     $display = Get-DvProp $Receipt 'display'

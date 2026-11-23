@@ -178,9 +178,12 @@ if ($null -ne $setPlan) {
         # r7 (adversary r7 A2): a child that refuses (DVE_LEG_SPEC_CHANGED) exits non-zero BY DESIGN and its refusal is a row, so this walk must not inherit a caller's
         # $PSNativeCommandUseErrorActionPreference = $true (with the Stop preference above it would turn that exit into a terminating error and end the walk before the typed row and the summary)
         $PSNativeCommandUseErrorActionPreference = $false
-        $childOut = @(& $pwshExe @childArgs 2>&1 | ForEach-Object { [string]$_ })
+        $childRaw = @(& $pwshExe @childArgs 2>&1)
+        $childOut = @($childRaw | ForEach-Object { [string]$_ })
+        # r10 (adversary r10 A3): a refusal is the child's own STDOUT record; a stderr line (an ErrorRecord here, e.g. from a generator) never classifies one
+        $childStdout = @($childRaw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { [string]$_ })
         $receiptPath = $null
-        foreach ($childLine in $childOut) { if ($childLine -match '^DVE_RECEIPT_PATH=(?<p>.+)$') { $receiptPath = $Matches['p'].Trim() } }
+        foreach ($childLine in $childStdout) { if ($childLine -match '^DVE_RECEIPT_PATH=(?<p>.+)$') { $receiptPath = $Matches['p'].Trim() } }
         $legReceipt = $null
         if ($receiptPath -and (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
             try { $legReceipt = [IO.File]::ReadAllText($receiptPath) | ConvertFrom-Json } catch { $legReceipt = $null }
@@ -190,7 +193,7 @@ if ($null -ne $setPlan) {
         # table's `ran` leaves it out), so it is never read as a leg that merely failed. Classified ONLY by the child's own whole-line stdout record naming THIS entry's planned hash (adversary r7 A1:
         # a path or message that merely quotes the token DVE_LEG_SPEC_CHANGED, e.g. a receipt-write failure under a receipt root of that name, is not it)
         $refusedRead = $null
-        foreach ($childLine in $childOut) { if ($childLine -cmatch '^DVE_LEG_SPEC_REFUSED planned_sha256=(?<p>[0-9a-f]{64}) read_sha256=(?<r>[0-9a-f]{64})$' -and $Matches['p'] -ceq [string]$entry.specSha256) { $refusedRead = $Matches['r'] } }
+        foreach ($childLine in $childStdout) { if ($childLine -cmatch '^DVE_LEG_SPEC_REFUSED planned_sha256=(?<p>[0-9a-f]{64}) read_sha256=(?<r>[0-9a-f]{64})$' -and $Matches['p'] -ceq [string]$entry.specSha256) { $refusedRead = $Matches['r'] } }
         if ($null -eq $legReceipt -and $null -ne $refusedRead) {
             Write-Output ('DVE_MATRIX_SPEC_CHANGED {0}/{1} repeat={2} cell={3} leg={4} planned_sha256={5} read_sha256={6} (the spec bytes changed after planning; the leg was refused and is no measurement)' -f $entry.seq, $total, $entry.repeat, $entry.cellId, $entry.legId, $entry.specSha256, $refusedRead)
             $row.outcome = 'SPEC_CHANGED'
@@ -199,7 +202,7 @@ if ($null -ne $setPlan) {
         # r10 (sol r9 item 1): the same shape for a planned spec the child could not read at launch (missing or unreadable): classified ONLY by the child's own whole-line record naming
         # THIS entry's planned hash; outcome SPEC_UNREADABLE is a prelaunch refusal, so the table's `ran` leaves it out (0/0, as SPEC_CHANGED), and it is never a NO_RECEIPT leg
         $unreadable = $false
-        foreach ($childLine in $childOut) { if ($childLine -cmatch '^DVE_LEG_SPEC_UNREADABLE planned_sha256=(?<p>[0-9a-f]{64})$' -and $Matches['p'] -ceq [string]$entry.specSha256) { $unreadable = $true } }
+        foreach ($childLine in $childStdout) { if ($childLine -cmatch '^DVE_LEG_SPEC_UNREADABLE planned_sha256=(?<p>[0-9a-f]{64})$' -and $Matches['p'] -ceq [string]$entry.specSha256) { $unreadable = $true } }
         if ($null -eq $legReceipt -and $null -eq $refusedRead -and $unreadable) {
             Write-Output ('DVE_MATRIX_SPEC_UNREADABLE {0}/{1} repeat={2} cell={3} leg={4} planned_sha256={5} (the planned spec could not be read at launch; the leg was refused and is no measurement)' -f $entry.seq, $total, $entry.repeat, $entry.cellId, $entry.legId, $entry.specSha256)
             $row.outcome = 'SPEC_UNREADABLE'
