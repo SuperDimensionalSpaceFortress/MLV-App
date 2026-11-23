@@ -3348,6 +3348,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     bool armedDuringSleep = false;
     bool sentOk = false;
     bool landed = false;
+    double foreignSentMs = 0.0;                                       // FOREIGN-FIRST-FLOOR-1: the sender's read just before the WM_NULL send
     for( int attempt = 0; attempt < kAttempts && !landed; ++attempt )
     {
         wp.reset( new R17A1Windows );
@@ -3361,8 +3362,9 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         std::fill( g_r17A1ProbeRunMs, g_r17A1ProbeRunMs + kR17A1MaxProbes, 0.0 );
         g_r17A1PresentSent = false;
         g_r17A1PauseInForeign = foreignFirst && pausedInForeign;
+        foreignSentMs = 0.0;
         std::atomic<bool> sent { false };
-        std::thread sender( [window, &sent, foreignFirst]() {
+        std::thread sender( [window, &sent, &foreignSentMs, foreignFirst]() {   // foreignSentMs is read only after the join
             const ULONGLONG giveUp = GetTickCount64() + 5000;
             bool entered = false;
             while( !entered && GetTickCount64() < giveUp )
@@ -3380,6 +3382,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
             if( foreignFirst )
             {
                 waitUntil( seenMs + 8.0 );
+                foreignSentMs = dueWakeQpcNowMs();                          // FOREIGN-FIRST-FLOOR-1: read BEFORE the send, so no dispatch of it began earlier
                 SendNotifyMessageW( window, WM_NULL, 0, 0 );                // r10 (sol r9 B1): a foreign dispatch before the present
             }
             waitUntil( seenMs + 20.0 );
@@ -3526,7 +3529,17 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         if( ( ranProbes & ( 1u << static_cast<unsigned>( i ) ) ) != 0u ) assertChargedBeforeHandler( probeRunMs[i] );
     ASSERT_TRUE( w.chargedS[0] * 1000.0 <= handlerStartMs - enteredMs + 0.5 );
     ASSERT_TRUE( w.chargedS[1] * 1000.0 <= returnedMs - handlerEndMs + 0.5 );
-    ASSERT_TRUE( w.chargedS[0] * 1000.0 >= 10.0 );                     // the sender waits 20 ms after the entry stamp: only later
+    // CI-FLAKE-R17A1-FOREIGN-FIRST-FLOOR-1 (sol r10 B1, fable r10 B1): with a foreign WM_NULL first, the first dispatch is the
+    // WM_NULL's, and a GUI pause inside it takes the present in that same dispatch, so the old window is correctly charged only
+    // the time before the WM_NULL: a fixed 10 ms floor failed that healthy sleep. The floor follows a clock read the test took:
+    // the sender read its clock just before the WM_NULL send, the sleep's first dispatch cannot begin before that send, and the
+    // old window holds segment 0 ([entry, first dispatch begin]) at least. 1e-6: the /1000 then *1000 round trip.
+    if( foreignFirst )
+    {
+        ASSERT_TRUE( foreignSentMs >= enteredMs );                      // the sender read after the sleep's entry stamp, so after the test's own entry read
+        ASSERT_TRUE( w.chargedS[0] * 1000.0 >= foreignSentMs - entryS * 1000.0 - 1e-6 );
+    }
+    else ASSERT_TRUE( w.chargedS[0] * 1000.0 >= 10.0 );                // the sender waits 20 ms after the entry stamp: only later
     // the sleep is never cut short at a dispatch: it runs the requested 80 ms (late only lengthens it)
     // (r5: the floor is the request less one timer tick; a 20x run read 76.1-79.2 ms here, so the former 79.0 failed 9 of 20)
     ASSERT_TRUE( ( returnS - entryS ) * 1000.0 >= dueWakeSleepFloorMs( 80.0 ) );
