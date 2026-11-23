@@ -2017,17 +2017,17 @@
       "clock": "other",
       "justification": "LOOK-LABEL-PLAYBACK-INFO-2 r4 (adversary r3 A3): labelPaintOwedDue selects the fixed kLabelPaintOwedMs deadline when the expected frame period is unknown (<= 0), else the period plus half. A deadline choice for when a stored label's owed paint is made; it never reads a duration as proof that a stage ran.",
       "lines": [
-        251
+        256
       ]
     },
     {
       "path": "platform/qt/PlaybackInfoLabelPolicy.h",
-      "anchor": "const qint64 measured = meterEmaFrameMs > 0.0 ? qRound64 ( meterEmaFrameMs ) : 0 ;",
+      "anchor": "if ( ! std :: isfinite ( periodMs ) || periodMs <= 0.0 ) return 0 ;",
       "class": "value_fallback_select",
       "clock": "other",
-      "justification": "LOOK-LABEL-PLAYBACK-INFO-2 r4 (adversary r3 A3): labelPaintExpectedFrameMs treats a non-positive fps meter EMA (no interval measured yet) as unknown (0) so the target period is used. A sample-validity filter on an input of a label paint deadline, not a run-proof.",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-2 r5 (adversary r4 A3): labelPaintPeriodMsOf treats a non-finite or non-positive period (no fps known, no meter interval measured yet) as unknown (0) and bounds the rest to kLabelPaintMaxExpectedFrameMs. A sample-validity filter on an input of a label paint deadline (it replaces r4's EMA-only filter), not a run-proof.",
       "lines": [
-        262
+        269
       ]
     },
     {
@@ -2037,7 +2037,57 @@
       "clock": "other",
       "justification": "LOOK-LABEL-PLAYBACK-INFO-2 r4 (adversary r3 A3, row R1c): pins that no target fps and no measured EMA give an unknown (0) expected frame period. A pure arithmetic assertion on a policy function over literals; no stage or clock runs.",
       "lines": [
-        1978
+        1979
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_info_label.cpp",
+      "anchor": "ASSERT_EQ ( 0 , labelPaintExpectedFrameMs ( 0.0 , 0.0 ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-2 r5 (adversary r4 A3, row R5c): pins that a zero rate with no measured EMA is the typed unknown (0) expected frame period. A pure arithmetic assertion on a policy function over literals; no stage or clock runs.",
+      "lines": [
+        2004
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_info_label.cpp",
+      "anchor": "ASSERT_EQ ( 0 , labelPaintExpectedFrameMs ( - 24.0 , 0.0 ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-2 r5 (adversary r4 A3, row R5c): pins that a negative rate is the typed unknown (0) expected frame period. A pure arithmetic assertion on a policy function over literals; no stage or clock runs.",
+      "lines": [
+        2005
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_info_label.cpp",
+      "anchor": "ASSERT_EQ ( 0 , labelPaintExpectedFrameMs ( nan , 0.0 ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-2 r5 (adversary r4 A3, row R5c): pins that a NaN rate is the typed unknown (0) expected frame period. A pure arithmetic assertion on a policy function over literals; no stage or clock runs.",
+      "lines": [
+        2006
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_info_label.cpp",
+      "anchor": "ASSERT_EQ ( 0 , labelPaintExpectedFrameMs ( inf , 0.0 ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-2 r5 (adversary r4 A3, row R5c): pins that an infinite rate is the typed unknown (0) expected frame period. A pure arithmetic assertion on a policy function over literals; no stage or clock runs.",
+      "lines": [
+        2007
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_info_label.cpp",
+      "anchor": "ASSERT_EQ ( 0 , labelPaintExpectedFrameMs ( - inf , 0.0 ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-2 r5 (adversary r4 A3, row R5c): pins that a negative infinite rate is the typed unknown (0) expected frame period. A pure arithmetic assertion on a policy function over literals; no stage or clock runs.",
+      "lines": [
+        2008
       ]
     },
     {

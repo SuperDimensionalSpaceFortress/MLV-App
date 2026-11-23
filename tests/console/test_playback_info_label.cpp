@@ -17,6 +17,7 @@
 #include <QTextStream>
 #include <QUuid>
 
+#include <limits>
 #include <string>
 
 #define ASSERT_QSTR_EQ(EXPECTED, ACTUAL) \
@@ -1976,6 +1977,50 @@ TEST(PlaybackInfoLabel, InfoTwoR4A3TheLabelPaintDebtIsRelativeToTheExpectedFrame
     ASSERT_EQ(42, playback_info_label::labelPaintExpectedFrameMs(24.0, 0.0));
     ASSERT_EQ(100, playback_info_label::labelPaintExpectedFrameMs(10.0, 0.0));
     ASSERT_EQ(0, playback_info_label::labelPaintExpectedFrameMs(0.0, 0.0));
+}
+
+// INFO-2 r5 (adversary r4 A3 on 9e5ada96, introduced, major): a 60 fps clip conformed to the accepted target 1 fps, handoffs at 8
+// and 1008 ms, EMA 0, a relabel stored at 250 ms and the debt checked at 304 ms. The mapping refused every rate <= 1 fps, so the
+// 1 fps period read as unknown, the deadline fell to 50 ms and an extra label paint landed 704 ms before the next paced frame. Every
+// finite positive rate maps to its period ceil(1000 / fps); only a non-finite or non-positive rate (or EMA) is the typed unknown 0.
+// The period is bounded by kLabelPaintMaxExpectedFrameMs, so no tiny rate overflows the qint64 cast or the 1.5x deadline.
+TEST(PlaybackInfoLabel, InfoTwoR5A3EveryFinitePositiveRateMapsToItsPeriod)
+{
+    using playback_info_label::labelPaintExpectedFrameMs;
+    using playback_info_label::labelPaintOwedDue;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    // R5a: the adversary's literal: target 1 fps, EMA 0 -> 1000 ms; checked 54 ms after the store: nothing owed
+    ASSERT_EQ(1000, labelPaintExpectedFrameMs(1.0, 0.0));
+    ASSERT_FALSE(labelPaintOwedDue(true, false, 304 - 250, labelPaintExpectedFrameMs(1.0, 0.0)));
+    ASSERT_FALSE(labelPaintOwedDue(true, false, 1499, labelPaintExpectedFrameMs(1.0, 0.0)));
+    ASSERT_TRUE(labelPaintOwedDue(true, false, 1500, labelPaintExpectedFrameMs(1.0, 0.0)));   // a real stall still pays
+    // R5b: low valid rates map to their own period (ceil)
+    ASSERT_EQ(42, labelPaintExpectedFrameMs(23.976, 0.0));
+    ASSERT_EQ(667, labelPaintExpectedFrameMs(1.5, 0.0));
+    ASSERT_EQ(2000, labelPaintExpectedFrameMs(0.5, 0.0));
+    ASSERT_EQ(1, labelPaintExpectedFrameMs(1000.0, 0.0));
+    // R5c: the typed unknown is only a non-finite or non-positive rate
+    ASSERT_EQ(0, labelPaintExpectedFrameMs(0.0, 0.0));
+    ASSERT_EQ(0, labelPaintExpectedFrameMs(-24.0, 0.0));
+    ASSERT_EQ(0, labelPaintExpectedFrameMs(nan, 0.0));
+    ASSERT_EQ(0, labelPaintExpectedFrameMs(inf, 0.0));
+    ASSERT_EQ(0, labelPaintExpectedFrameMs(-inf, 0.0));
+    // R5d: the EMA input follows the same rule (NaN / inf / <= 0 is unknown and never wins over a known target)
+    ASSERT_EQ(42, labelPaintExpectedFrameMs(24.0, nan));
+    ASSERT_EQ(42, labelPaintExpectedFrameMs(24.0, inf));
+    ASSERT_EQ(42, labelPaintExpectedFrameMs(24.0, -5.0));
+    ASSERT_EQ(1000, labelPaintExpectedFrameMs(nan, 1000.0));   // unknown target, measured 1 fps
+    // R5e: a tiny positive rate (or a huge EMA) is bounded, never an overflowed cast; the deadline stays ordered
+    const qint64 cap = playback_info_label::kLabelPaintMaxExpectedFrameMs;
+    ASSERT_EQ(cap, labelPaintExpectedFrameMs(1e-300, 0.0));
+    ASSERT_EQ(cap, labelPaintExpectedFrameMs(std::numeric_limits<double>::denorm_min(), 0.0));
+    ASSERT_EQ(cap, labelPaintExpectedFrameMs(24.0, 1e300));
+    ASSERT_FALSE(labelPaintOwedDue(true, false, cap, cap));
+    ASSERT_TRUE(labelPaintOwedDue(true, false, cap + cap / 2, cap));
+    // R5f: an out-of-range expected period handed straight to the debt is clamped too (no signed overflow in period + period/2)
+    ASSERT_FALSE(labelPaintOwedDue(true, false, cap + cap / 2 - 1, std::numeric_limits<qint64>::max()));
+    ASSERT_TRUE(labelPaintOwedDue(true, false, cap + cap / 2, std::numeric_limits<qint64>::max()));
 }
 
 // INFO-2 r2 (adversary pass 2 A2 on 9496cb72, introduced, major): 24 fps, start on paused frame 0, Cut Out 3, Loop off. Frames 1 and

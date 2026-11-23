@@ -243,10 +243,15 @@ inline bool playingRelabelDeferred( bool playing, bool clockValid, qint64 elapse
  *  period at 24 fps is 42 ms, so a steady Play never pays it.
  *  INFO-2 r4 (adversary r3 A3): the deadline is relative to the EXPECTED frame period (`expectedFrameMs`, from
  *  labelPaintExpectedFrameMs): kLabelPaintOwedMs when the period is unknown (<= 0), else max(kLabelPaintOwedMs, period + period/2),
- *  so a steady 10 fps Play (a frame every 100 ms) pays nothing while a stall still pays at 150 ms. */
+ *  so a steady 10 fps Play (a frame every 100 ms) pays nothing while a stall still pays at 150 ms.
+ *  INFO-2 r5 (adversary r4 A3): a period above kLabelPaintMaxExpectedFrameMs is clamped to it, so period + period/2 never
+ *  overflows. */
 constexpr qint64 kLabelPaintOwedMs = 50;
-inline bool labelPaintOwedDue( bool owed, bool framePresentedSinceStore, qint64 msSinceStore, qint64 expectedFrameMs )
+constexpr qint64 kLabelPaintMaxExpectedFrameMs = 1000000000;   // INFO-2 r5 (r4 A3): ~11.6 days; 1.5x of it fits a qint64
+inline bool labelPaintOwedDue( bool owed, bool framePresentedSinceStore, qint64 msSinceStore, qint64 expectedFrameMsIn )
 {
+    const qint64 expectedFrameMs = expectedFrameMsIn > kLabelPaintMaxExpectedFrameMs ? kLabelPaintMaxExpectedFrameMs
+                                                                                     : expectedFrameMsIn;
     const qint64 relative = expectedFrameMs + expectedFrameMs / 2;
     const qint64 deadline = expectedFrameMs <= 0 ? kLabelPaintOwedMs
                                                  : ( relative > kLabelPaintOwedMs ? relative : kLabelPaintOwedMs );
@@ -254,12 +259,26 @@ inline bool labelPaintOwedDue( bool owed, bool framePresentedSinceStore, qint64 
 }
 
 /*! \brief INFO-2 r4 (adversary r3 A3): the frame period a playing label's paint debt waits for: the larger of the target period
- *  ceil(1000 / playbackFps) (0 when playbackFps <= 1) and the measured fps meter EMA frame time (0 when <= 0), so a 24 fps
- *  target that plays at 10 fps waits for its real 100 ms frames. Read only: the meter is not changed. */
+ *  ceil(1000 / playbackFps) and the measured fps meter EMA frame time, so a 24 fps target that plays at 10 fps waits for its
+ *  real 100 ms frames. Read only: the meter is not changed.
+ *  INFO-2 r5 (adversary r4 A3): EVERY finite positive rate maps to its period (a 1 fps conform target is 1000 ms, 0.5 fps is
+ *  2000 ms); only a non-finite or non-positive rate (or EMA) is the typed unknown 0. Each period is clamped to
+ *  kLabelPaintMaxExpectedFrameMs in double before the cast, so a tiny rate or a huge EMA never overflows qint64. */
+inline qint64 labelPaintPeriodMsOf( double periodMs )
+{
+    if( !std::isfinite( periodMs ) || periodMs <= 0.0 ) return 0;
+    const double bounded = periodMs > static_cast<double>( kLabelPaintMaxExpectedFrameMs )
+                         ? static_cast<double>( kLabelPaintMaxExpectedFrameMs ) : periodMs;
+    return static_cast<qint64>( bounded );
+}
 inline qint64 labelPaintExpectedFrameMs( double playbackFps, double meterEmaFrameMs )
 {
-    const qint64 target = playbackFps > 1.0 ? static_cast<qint64>( std::ceil( 1000.0 / playbackFps ) ) : 0;
-    const qint64 measured = meterEmaFrameMs > 0.0 ? qRound64( meterEmaFrameMs ) : 0;
+    const bool rateKnown = std::isfinite( playbackFps ) && playbackFps > 0.0;
+    // 1000 / a denormal rate is +inf: a known rate whose period is past the bound, so it is the bound (never the unknown 0)
+    const double targetMs = rateKnown ? std::ceil( 1000.0 / playbackFps ) : 0.0;
+    const qint64 target = rateKnown ? ( std::isfinite( targetMs ) ? labelPaintPeriodMsOf( targetMs ) : kLabelPaintMaxExpectedFrameMs )
+                                    : 0;
+    const qint64 measured = labelPaintPeriodMsOf( std::isfinite( meterEmaFrameMs ) ? std::round( meterEmaFrameMs ) : 0.0 );
     return target > measured ? target : measured;
 }
 
