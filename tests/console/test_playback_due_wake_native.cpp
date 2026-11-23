@@ -3238,14 +3238,18 @@ std::atomic<bool> g_r17A1PresentSent { false };
 // FOREIGN-FIRST-FLOOR-1 adversary pass 1 A1: the handler records whether it really held the GUI, i.e. the present was NOT yet
 // queued when the WM_NULL dispatch reached it. A GUI that reached it only after the present was queued paused nothing inside the
 // dispatch, so that sample is not the paused row and is observed again.
+// r2 (bite check): "held" is BOTH ends of the wait, never the entry read alone: the present was not queued when the handler began
+// AND was queued when it returned, so the present was queued while this dispatch held the GUI. An entry-only read stayed true for
+// a handler that returned at once (the pause removed), and that row passed without ever pausing.
 bool g_r17A1PauseHeld = false;
 LRESULT CALLBACK r17A1ForeignProc( HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam )
 {
     if( message == WM_NULL && g_r17A1PauseInForeign )
     {
-        g_r17A1PauseHeld = !g_r17A1PresentSent.load();
+        const bool queuedAtEntry = g_r17A1PresentSent.load();
         const ULONGLONG giveUp = GetTickCount64() + 5000;
         while( !g_r17A1PresentSent.load() && GetTickCount64() < giveUp ) Sleep( 0 );
+        g_r17A1PauseHeld = !queuedAtEntry && g_r17A1PresentSent.load();
         return 0;
     }
     if( message == kR17A1ProbeMessage )
