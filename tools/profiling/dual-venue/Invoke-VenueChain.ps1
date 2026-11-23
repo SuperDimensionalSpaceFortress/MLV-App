@@ -284,13 +284,22 @@ $ticketPollStaleSec = [Math]::Max(10, 3 * $ClaimPollSec)
 $ticketProbeStaleSec = Get-VenueTicketProbeStaleSec -QuietMaxWaitSec $QuietMaxWaitSec -AdmissionWaitSec $ProbeAdmissionWaitSec -MarginSec $ticketPollStaleSec
 
 function Close-LegTicket([string]$LegName, [string]$Event, [string]$Why) {
-    if ($null -eq $script:ticket) { return }
-    # TAIL-1 r2 pass 3 A6: a claim a give-back could not let go of (A13: its nonce is on the ticket) is let go of BEFORE the ticket is removed and the object dropped, or the name that was kept for it is lost with the ticket
-    # and the claim stands behind a live pid until its expiry
-    if ($null -ne $script:ticket.PSObject.Properties['pendingReleaseNonce'] -and [string]$script:ticket.pendingReleaseNonce) {
-        $pendingRel = ''; try { $pendingRel = [string](Release-VenueClaim -Venue $Venue -Nonce ([string]$script:ticket.pendingReleaseNonce) -ClaimDir $ClaimDir -MaxAttempts 3) } catch { $pendingRel = 'ERROR' }
-        L "CLAIM_PENDING_RELEASE leg=$LegName ticket=$($script:ticket.name) result=$pendingRel (a claim a give-back could not let go of, released as the ticket ends)"
+    # TAIL-1 r2 pass 3 A6 + r4 K2: a claim a give-back could not let go of (A13: its nonce is on the ticket) is let go of BEFORE the ticket is removed and the object dropped. A release that is not an answer of "let go" (BUSY: a reader holds the
+    # claim file; ERROR: it threw) leaves the claim standing behind this live pid, so its nonce is KEPT in $script:strandedClaimNonces, outliving the ticket, and is tried again at every later close (even one with no ticket left) and at the chain's end.
+    # Kept inline (no helper): the tests lift this function from the script by name, alone.
+    if ($null -eq $script:strandedClaimNonces) { $script:strandedClaimNonces = [System.Collections.Generic.List[string]]::new() }
+    if ($null -ne $script:ticket -and $null -ne $script:ticket.PSObject.Properties['pendingReleaseNonce'] -and [string]$script:ticket.pendingReleaseNonce -and -not $script:strandedClaimNonces.Contains([string]$script:ticket.pendingReleaseNonce)) {
+        $script:strandedClaimNonces.Add([string]$script:ticket.pendingReleaseNonce)
     }
+    foreach ($strandedNonce in @($script:strandedClaimNonces)) {
+        $pendingRel = ''; try { $pendingRel = [string](Release-VenueClaim -Venue $Venue -Nonce $strandedNonce -ClaimDir $ClaimDir -MaxAttempts 3) } catch { $pendingRel = 'ERROR' }
+        if ($pendingRel -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) {
+            [void]$script:strandedClaimNonces.Remove($strandedNonce)
+            L "CLAIM_PENDING_RELEASE leg=$LegName nonce=$strandedNonce result=$pendingRel (a claim a give-back could not let go of, released as the ticket ends)"
+        }
+        else { L "CLAIM_PENDING_RELEASE_NOT_RELEASED leg=$LegName nonce=$strandedNonce result=$pendingRel (the claim is STILL STANDING behind this chain; its nonce is kept and tried again at the next ticket close and at the chain's end)" }
+    }
+    if ($null -eq $script:ticket) { return }
     $r = Remove-VenueTicket -Ticket $script:ticket
     L "$Event leg=$LegName ticket=$($script:ticket.name) result=$r reason=$Why keeps=$($script:ticketKeeps)/$TicketKeepMax"
     $script:ticket = $null
@@ -591,6 +600,15 @@ foreach ($leg in $plan) {
     if ($ran -and $legIndex -lt $plan.Count -and $null -eq $stopReason -and $CooldownSec -gt 0) {
         L "COOLDOWN ${CooldownSec} s (no claim held)"
         Start-Sleep -Seconds $CooldownSec
+    }
+}
+
+# TAIL-1 r4 K2: the last attempt at a claim a give-back could not let go of and no close has since released (a reader held the claim file through every earlier try); whatever still stands is recorded by its nonce, never dropped silently
+if ($null -ne $script:strandedClaimNonces) {
+    foreach ($strandedNonce in @($script:strandedClaimNonces)) {
+        $strandedAnswer = ''; try { $strandedAnswer = [string](Release-VenueClaim -Venue $Venue -Nonce $strandedNonce -ClaimDir $ClaimDir -MaxAttempts 3) } catch { $strandedAnswer = 'ERROR' }
+        if ($strandedAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { [void]$script:strandedClaimNonces.Remove($strandedNonce); L "CLAIM_PENDING_RELEASE leg=chain-end nonce=$strandedNonce result=$strandedAnswer (released as the chain ends)" }
+        else { L "CLAIM_PENDING_RELEASE_NOT_RELEASED leg=chain-end nonce=$strandedNonce result=$strandedAnswer (the claim is STILL STANDING; it breaks as dead-pid when this process exits, or at its expiry)" }
     }
 }
 

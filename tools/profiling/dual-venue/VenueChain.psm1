@@ -332,7 +332,9 @@ function Get-VenueTicketStaleReason {
     if ($null -eq (ConvertTo-VenueUtc $Ticket.createdUtc)) { return 'unreadable' }   # TAIL-1 r2 pass 2 A1: a refresh cannot carry a ticket whose createdUtc is not a time over (Update-VenueTicket answers LOST), so that ticket must not stay live beside its replacement
     $after = 0.0
     if ($null -eq $created -or $null -eq $beat -or -not [double]::TryParse([string]$Ticket.staleAfterSec, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$after)) { return 'unreadable' }
-    if (-not [double]::IsFinite($after) -or $after -le 0 -or $after -gt 86400) { return 'unreadable' }   # pass 3 A7: over a day is not a lifetime either (a refresh stores it as an Int32 and 1e20 overflowed to LOST while the census kept the row live); the writers allow 1..86400
+    # pass 3 A7 + r4 K1: the ceiling is the Int32 range, which is what EVERY writer can publish (a refresh stores the lifetime as an Int32: 1e20 overflowed it to LOST while the census kept the row live). It is NOT 86400: Update-VenueTicket -StaleAfterSec
+    # is an unranged [int], and the chain publishes Get-VenueTicketProbeStaleSec's value through it (87630 for -ProbeAdmissionWaitSec 86400; up to 259740 at the operands' maxima), so a live, freshly heartbeated probing ticket read 'unreadable' and was reaped.
+    if (-not [double]::IsFinite($after) -or $after -le 0 -or $after -gt [double][int]::MaxValue) { return 'unreadable' }
     # TAIL-1 r2 (pre-existing: pass 10 A11): the JSON string NaN or Infinity parses, and NaN / Infinity made "heartbeat age greater than the window" false for ever: a lifetime that is not a finite positive number is unreadable
     $started = Get-VenueProcessStartUtc $pidValue
     if ($null -eq $started) { return 'dead-pid' }
@@ -360,13 +362,16 @@ function Get-VenueTickets {
     The venue's line, oldest ticket first. One row per ticket: name, path, state (LIVE | STALE | BUSY = being rewritten, counts as live), reason, text, ticket (parsed),
     position (1-based among the non-stale tickets; 0 for a stale one), ageSec and heartbeatAgeSec ($null when unreadable).
     #>
-    param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '', $NowUtc = $null)
+    # r4 K3: -ThrowOnListError makes a listing that FAILS (the folder cannot be enumerated, or is gone) throw instead of answering no rows, so a caller can tell a read that failed from a successful read of an empty line
+    param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '', $NowUtc = $null, [switch]$ThrowOnListError)
     $now = Resolve-VenueNow $NowUtc
     $dir = Get-VenueTicketDir -Venue $Venue -ClaimDir $ClaimDir
     $rows = [System.Collections.Generic.List[object]]::new()
     $present = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $listAction = $(if ($ThrowOnListError) { 'Stop' } else { 'SilentlyContinue' })
+    if ($ThrowOnListError -and -not (Test-Path -LiteralPath $dir -PathType Container)) { throw "VENUE_TICKET_LIST_FAILED the ticket folder '$dir' is not readable" }
     if (Test-Path -LiteralPath $dir -PathType Container) {
-        foreach ($file in @(Get-ChildItem -LiteralPath $dir -Filter '*.ticket.json' -File -ErrorAction SilentlyContinue)) {
+        foreach ($file in @(Get-ChildItem -LiteralPath $dir -Filter '*.ticket.json' -File -ErrorAction $listAction)) {
             $m = $script:TicketNameRx.Match($file.Name)
             if (-not $m.Success) { continue }
             [void]$present.Add($file.FullName)
@@ -737,10 +742,11 @@ function Request-VenueClaim {
                     $seen = $null; try { $seen = Get-VenueClaim -Venue $Venue -ClaimDir $ClaimDir } catch { $seen = $null }
                     # r8 rule 7 (adversary r7 pass 3 A11): the queue returned is the census made AFTER the give-back, so the place returned is the caller's in that census (the snapshot's place could be one past it)
                     # TAIL-1 r2 A8 (pre-existing): the give-back can take most of a second (its retries sleep), and a ticket can be reaped in it, so the census made BEFORE the release is read again AFTER it; one that cannot be made keeps the earlier
-                    # pass 3 A4 + A5: classified at the caller's clock seam (-NowUtc; null = the real time NOW, not the time this request began), and an EMPTY answer is a read that failed (the listing swallows an unreadable folder, and A, the ticket that
-                    # made this give-back necessary, was just seen in it), so it keeps the earlier census
+                    # pass 3 A4: classified at the caller's clock seam (-NowUtc; null = the real time NOW, not the time this request began).
+                    # r4 K3 (replaces pass 3 A5's "an empty answer is a failed read"): a listing that FAILED throws (-ThrowOnListError) and keeps the earlier census; a SUCCESSFUL listing that finds no live ticket is an empty line (queue 0, place 0),
+                    # not the earlier queue the tickets have since left
                     $afterRelease = $after
-                    try { $fresh = @(Get-VenueTickets -Venue $Venue -ClaimDir $ClaimDir -NowUtc $NowUtc | Where-Object { $_.state -cne 'STALE' }); if ($fresh.Count -gt 0) { $afterRelease = $fresh } } catch { $afterRelease = $after }
+                    try { $afterRelease = @(Get-VenueTickets -Venue $Venue -ClaimDir $ClaimDir -NowUtc $NowUtc -ThrowOnListError | Where-Object { $_.state -cne 'STALE' }) } catch { $afterRelease = $after }
                     $myAfter = @($afterRelease | Where-Object { $_.name -ceq $t.name })
                     return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $(if ($seen) { $seen.claim }); path = $r.path; broken = @($r.broken); ticket = $t; queue = $afterRelease; position = $(if ($myAfter.Count -gt 0) { [int]$myAfter[0].position } else { 0 }); staleTickets = @($removed); note = '' }
                 }
@@ -748,9 +754,9 @@ function Request-VenueClaim {
                 # the claim that could not be given back is named on the ticket (pendingReleaseNonce), so it is not leaked, and the next poll made with this ticket lets go of it before anything else (the top of this function).
                 $t | Add-Member -NotePropertyName pendingReleaseNonce -NotePropertyValue ([string]$r.claim.nonce) -Force
                 $seenBusy = $null; try { $seenBusy = Get-VenueClaim -Venue $Venue -ClaimDir $ClaimDir } catch { $seenBusy = $null }
-                # pass 3 A4: the same fresh census as the released case (the five tries sleep for 1.5 s, in which a ticket can be reaped), with the same empty-read guard
+                # pass 3 A4 + r4 K3: the same fresh census as the released case (the five tries sleep for 1.5 s, in which a ticket can be reaped), with the same rule: a failed listing keeps the earlier census, a successful empty one is an empty line
                 $afterBusy = $after
-                try { $freshBusy = @(Get-VenueTickets -Venue $Venue -ClaimDir $ClaimDir -NowUtc $NowUtc | Where-Object { $_.state -cne 'STALE' }); if ($freshBusy.Count -gt 0) { $afterBusy = $freshBusy } } catch { $afterBusy = $after }
+                try { $afterBusy = @(Get-VenueTickets -Venue $Venue -ClaimDir $ClaimDir -NowUtc $NowUtc -ThrowOnListError | Where-Object { $_.state -cne 'STALE' }) } catch { $afterBusy = $after }
                 $myBusy = @($afterBusy | Where-Object { $_.name -ceq $t.name })
                 return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $(if ($seenBusy) { $seenBusy.claim }); path = $r.path; broken = @($r.broken); ticket = $t; queue = $afterBusy; position = $(if ($myBusy.Count -gt 0) { [int]$myBusy[0].position } else { 0 }); staleTickets = @($removed)
                     note = "CLAIM_GIVE_BACK_BUSY ticket=$($t.name) (the claim was granted behind an older ready ticket and could not be given back in 5 tries; queued, the next poll lets go of it)" }

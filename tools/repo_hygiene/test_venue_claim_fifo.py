@@ -2519,7 +2519,7 @@ $json = [pscustomobject]@{{ elapsed = $sw.Elapsed.TotalSeconds; answered = [bool
         r = self.ps("""
 $old = [DateTime]::UtcNow.AddSeconds(-600)
 $out = [ordered]@{}
-foreach ($bad in @('NaN', 'Infinity', '-Infinity', '0', '1e20', '2147483648', '86401')) {   # pass 3 A7: a lifetime over a day (the writers allow 1..86400) overflows the refresh's Int32 conversion
+foreach ($bad in @('NaN', 'Infinity', '-Infinity', '0', '1e20', '2147483648')) {   # pass 3 A7 + r4 K1: a lifetime past the Int32 range overflows the refresh's conversion (86401 is NOT in this list: the chain publishes lifetimes over a day, see the r4 K1 test)
   $t = New-VenueTicket -Venue bachelor -RunDir ('run-' + $bad) -ClaimDir $d -NowUtc $old -StaleAfterSec 90
   $j = Get-Content -LiteralPath $t.path -Raw | ConvertFrom-Json
   $j.staleAfterSec = $bad
@@ -2590,16 +2590,20 @@ $g2 = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d
 $script:ticket = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
 $script:ticket | Add-Member -NotePropertyName pendingReleaseNonce -NotePropertyValue ([string]$g2.claim.nonce) -Force
 $script:ticketKeeps = 0
-function Release-VenueClaim {{ throw 'seam: the claim open is refused' }}
+$script:refuseRelease = $true
+function Release-VenueClaim([string]$Venue, [string]$Nonce, [string]$ClaimDir, [int]$MaxAttempts) {{
+    if ($script:refuseRelease) {{ throw 'seam: the claim open is refused' }}
+    & (Get-Module VenueChain) {{ param($v, $n, $c, $m) Release-VenueClaim -Venue $v -Nonce $n -ClaimDir $c -MaxAttempts $m }} $Venue $Nonce $ClaimDir $MaxAttempts
+}}
 Close-LegTicket 'leg-3' 'TICKET_ENDED' 'test'
 $out['throwClaimLeft'] = (Test-Path -LiteralPath $cp)
-Remove-Item -Path Function:\\Release-VenueClaim
+$script:refuseRelease = $false
 Close-LegTicket 'leg-4' 'TICKET_ENDED' 'test'
 $out['throwClaimAfterLaterClose'] = (Test-Path -LiteralPath $cp)
 $out | ConvertTo-Json -Compress
 """)
         self.assertTrue(r["busyClaimLeft"], f"the seam did not hold the claim through the close: {r}")
-        self.assertNotIn("released as the ticket ends", r["busyLog"].replace("CLAIM_PENDING_RELEASE_NOT_RELEASED", ""), f"the close logged a release that did not happen: {r}")
+        self.assertNotIn("released as the ticket ends", r["busyLog"], f"the close logged a release that did not happen: {r}")
         self.assertIn("result=BUSY", r["busyLog"], r)
         self.assertFalse(r["busyClaimAfterLaterClose"], f"the nonce of the claim a busy close could not let go of was dropped with the ticket: the claim stands behind this live chain: {r}")
         self.assertTrue(r["throwClaimLeft"], r)
