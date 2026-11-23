@@ -4919,7 +4919,9 @@ $script:ExportRenderedSumGroups = @(@(@('debayered_frame', 'processing'), 'proce
 $script:ExportRenderedSumGroups = @(& {
         foreach ($g in $script:ExportRenderedSumGroups) { , $g }
         foreach ($g in $script:ExportRenderedSumGroups) {
-            if (@($g[0]) -ccontains 'llrawproc') { , @([string[]]@(@($g[0]) | ForEach-Object { if ($_ -ceq 'llrawproc') { 'llrawproc_dual_iso' } else { $_ } }), [string]$g[1]) }
+            # (r1 fix 2, adversary A1 on 33f7a05a: the twin's third element names the stage it stands in for, and the group is judged only when that stage is NOT published:
+            # beside a published llrawproc the dual-ISO figure is inside it, so raw 23 + llrawproc 20 + dual-ISO 20.001 is no 63 ms of disjoint work)
+            if (@($g[0]) -ccontains 'llrawproc') { , @([string[]]@(@($g[0]) | ForEach-Object { if ($_ -ceq 'llrawproc') { 'llrawproc_dual_iso' } else { $_ } }), [string]$g[1], 'llrawproc') }
         }
     })
 
@@ -4928,6 +4930,7 @@ function Get-DvExportContainmentProblem {
     # $Means: stage name -> mean ms ($null = absent).
     param($Means, $Pairs, $SumGroups = @())
     foreach ($group in $SumGroups) {
+        if (@($group).Count -gt 2 -and $null -ne $Means[[string]$group[2]]) { continue }   # (a twin group: the stage it stands in for is published, so the real group judges it)
         $present = @($group[0] | Where-Object { $null -ne $Means[$_] })
         $parent = $Means[[string]$group[1]]
         if ($present.Count -lt 2 -or $null -eq $parent) { continue }
@@ -5175,6 +5178,8 @@ function Test-DvExportStageLogRecords {
     $problems = [System.Collections.Generic.List[string]]::new()
     $perStage = @{}
     foreach ($name in $script:ExportRenderedStages) { $perStage[$name] = @{} }
+    $recCount = @{}
+    foreach ($name in $script:ExportRenderedStages) { $recCount[$name] = @{} }
     $clipRecords = @{}
     foreach ($name in $script:ExportRenderedClipStages) { $clipRecords[$name] = [System.Collections.Generic.List[object]]::new() }
     $bad = [System.Collections.Generic.List[string]]::new()
@@ -5194,6 +5199,7 @@ function Test-DvExportStageLogRecords {
                 if ($clipRecords.ContainsKey($s)) { $clipRecords[$s].Add([pscustomobject]@{ frame = $f; ms = $ms }); continue }
                 if (-not $perStage.ContainsKey($s)) { continue }
                 $perStage[$s][$f] = $(if ($perStage[$s].ContainsKey($f)) { $perStage[$s][$f] + $ms } else { $ms })
+                $recCount[$s][$f] = 1 + $(if ($recCount[$s].ContainsKey($f)) { $recCount[$s][$f] } else { 0 })
             }
         }
         if ($null -ne $why) { $bad.Add("line ${lineNo} $why") }
@@ -5210,6 +5216,17 @@ function Test-DvExportStageLogRecords {
         }
     }
     if ($overflow.Count -gt 0) { $problems.Add("EXPORT_RECORD_INVALID: $($overflow.Count) accumulated per-frame stage timing(s) do not conform (first: $($overflow[0]))") }
+    # EXPORT-RENDER-PIPE-TIMING-1 r1 fix 2 (adversary A4 on 33f7a05a): this card's per-frame stages are NOT summed figures: BatchRunner.cpp notes export_scale and
+    # export_pipe_write once per frame, and video_mlv.c notes llrawproc_dual_iso once after each llrawproc record. A repeat would double the work subtracted from the wall (or
+    # turn a 0.000 frame active), so a frame carries exactly one record of each (llrawproc_dual_iso: as many as llrawproc on that frame, one when llrawproc is absent).
+    $repeats = [System.Collections.Generic.List[string]]::new()
+    foreach ($name in @('export_scale', 'export_pipe_write', 'llrawproc_dual_iso')) {
+        foreach ($f in @($recCount[$name].Keys | Sort-Object { [int64]$_ })) {
+            $owed = $(if ($name -ceq 'llrawproc_dual_iso' -and $recCount['llrawproc'].ContainsKey($f)) { $recCount['llrawproc'][$f] } else { 1 })
+            if ($recCount[$name][$f] -ne $owed) { $repeats.Add("$name frame $f has $($recCount[$name][$f]) record(s), $owed owed") }
+        }
+    }
+    if ($repeats.Count -gt 0) { $problems.Add("EXPORT_RECORD_INVALID: $($repeats.Count) frame(s) carry another count of a once-per-frame stage than the producer notes per frame, so no one figure of it is that frame's (first: $($repeats[0]))") }
     [pscustomobject]@{ perStage = $perStage; clipRecords = $clipRecords; problems = @($problems) }
 }
 
@@ -5496,6 +5513,28 @@ function Get-DvExportEvidence {
                 $m.renderPipeTimed = ($p16Frames.Count -gt 0 -and $pipeWrite.Count -eq $p16Frames.Count -and @($pipeWrite.Keys | Where-Object { -not $p16Frames.ContainsKey($_) }).Count -eq 0 `
                                       -and $clipRecords['export_pipe_drain'].Count -eq 1 -and $clipRecords['export_verify'].Count -eq 1)
             }
+            # r1 fix 2 (adversary A5 on 33f7a05a): ANY of this card's stages is proof the build emits them all (video_mlv.c notes llrawproc_dual_iso beside every llrawproc note,
+            # BatchRunner.cpp notes the pipe write per frame and the drain and verify once per clip, all under the one MLVAPP_STAGE_TIMING switch), so a log carrying some
+            # and missing another is an INCOMPLETE capture: no older build (the older-build reasons are replaced) and no product result (INVALID, naming what is missing)
+            $cardRequired = @('llrawproc_dual_iso', 'export_pipe_write', 'export_pipe_drain', 'export_verify')
+            $hasStage = { param($n) if ($clipRecords.ContainsKey($n)) { $clipRecords[$n].Count -gt 0 } else { $perStage[$n].Count -gt 0 } }
+            $cardSeen = @(@($cardRequired) + @('export_scale') | Where-Object { & $hasStage $_ })
+            if ($cardSeen.Count -gt 0) {
+                $cardMissing = @($cardRequired | Where-Object { -not (& $hasStage $_) })
+                if ($cardMissing.Count -gt 0) {
+                    $incomplete = "the capture is incomplete: stage-timing.log carries $($cardSeen -join ' / ') of EXPORT-RENDER-PIPE-TIMING-1 but no $($cardMissing -join ' / '), and a build that times one times them all"
+                    $problems.Add("EXPORT_PROFILE_ABSENT: $incomplete, so the run reads no product result")
+                    if ($cardMissing -ccontains 'llrawproc_dual_iso') { $m['dualIsoActiveFramesCouldNotCheck'] = $incomplete; $m['dualIsoClassAgreesCouldNotCheck'] = $incomplete }
+                    if ($null -eq $m.renderPipeTimed) { $m['renderPipeTimedCouldNotCheck'] = $incomplete }
+                }
+                # r1 fix 2 (adversary A3 on 33f7a05a): the producer's own RENDER_START line (BatchRunner.cpp:471) declares scaled=true|false; export_scale is timed on every
+                # frame exactly when it is true (the window check above holds a partial one), so a scaled plan with none and an unscaled plan with some are other runs' figures
+                $starts = @([regex]::Matches([string]$BatchLogText, '(?m)^\[BATCH\] RENDER_START [^\r\n]*? scaled=(?<s>true|false)(?=\s|$)'))
+                $scale = $perStage['export_scale']
+                if ($starts.Count -ne 1) { $problems.Add("EXPORT_PROFILE_ABSENT: batch.log carries $($starts.Count) RENDER_START line(s) declaring scaled=; the rendered runner declares it once per clip, so whether export_scale is owed is not readable") }
+                elseif ($starts[0].Groups['s'].Value -ceq 'true' -and $scale.Count -eq 0) { $problems.Add('EXPORT_PROFILE_ABSENT: RENDER_START declares scaled=true but stage-timing.log times no export_scale; a scaled frame plan times it on every frame') }
+                elseif ($starts[0].Groups['s'].Value -ceq 'false' -and $scale.Count -gt 0) { $problems.Add("EXPORT_STAGE_WINDOW_MISMATCH: RENDER_START declares scaled=false but stage-timing.log times export_scale on $($scale.Count) frame(s); an unscaled frame plan runs no scale") }
+            }
         }
         # r1 fix 1 (adversary A2): the base reader's shape, for old-format evidence only (no log, or a log with none of the new stages). The problems and the outcome are the
         # same either way (an old-format log adds no problem); only the published metrics and stage table are projected back to the fields and texts the base wrote.
@@ -5648,7 +5687,9 @@ function Test-DvExportReceiptValid {
             # EXPORT-RENDER-PIPE-TIMING-1 r1 fix 1 (adversary A2): a ProRes receipt whose stored metrics carry no renderPipeTimed was written by a reader before that card; over
             # old-format evidence it is re-derived in that reader's shape (a log that carries one of the new stages is re-derived in the new shape whatever the receipt says)
             $storedMetrics = Get-DvProp $Receipt 'metrics'
-            $legacyShape = ([string]$specExport.format -ceq 'prores') -and $storedMetrics -is [System.Management.Automation.PSCustomObject] -and $null -eq $storedMetrics.PSObject.Properties['renderPipeTimed']
+            # (r1 fix 2, adversary A2 on 33f7a05a: the same metrics parsed -AsHashtable are the same receipt, so an object of either kind, by its key set (Get-DvKeys))
+            $legacyShape = ([string]$specExport.format -ceq 'prores') -and ($storedMetrics -is [System.Management.Automation.PSCustomObject] -or $storedMetrics -is [System.Collections.IDictionary]) -and
+                           @(Get-DvKeys $storedMetrics) -cnotcontains 'renderPipeTimed'
             $ev = Get-DvExportEvidence -Format ([string]$specExport.format) -MaxFrames ([int]$specExport.maxFrames) -DualIsoExpected ([bool]$specExport.dualIsoExpected) -ExpectedBuildId ([string](Get-DvProp $summary 'sourceCommit')) `
                 -ProfileText ([string]$texts['export-profile.json']) -StageLogText ([string]$texts['stage-timing.log']) -BatchLogText ([string]$texts['batch.log']) -OutputManifestText ([string]$texts['output-manifest.json']) `
                 -LegacyRenderShape:$legacyShape
