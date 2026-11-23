@@ -2690,6 +2690,18 @@ function Get-DvLookAssistEvidence {
 $script:LegSetSchema = 'mlv-app/dual-venue-legset/v1'
 $script:LegSetsRelativeDir = 'tools/profiling/dual-venue/legsets'
 
+function Test-DvVisualTwinName {
+    <#
+    .SYNOPSIS
+    M16-1457-VENUE-BASELINE-DRIFT-1 r6 (sol r5 B1, luna r5 B1): is this leg id or spec file name a VISUAL TWIN (its id carries the word `visual` between hyphens)? A twin is the
+    capture-on copy of a speed arm: its fps is observer-perturbed (the capture tail keeps playing unpaced past the measured window), so it is never a measured matrix speed cell.
+    Judged on the RESOLVED spec's own identity (its legId and its file leaf), never on the spelling of the reference that reached it, and case-folded (Windows resolves
+    `LEGS\X.JSON` to the file `legs/x.json`).
+    #>
+    param([AllowNull()][AllowEmptyString()]$Name)
+    ([string]$Name) -match '(?i)-visual-'
+}
+
 function Get-DvLegSetPlan {
     <#
     .SYNOPSIS
@@ -2723,6 +2735,10 @@ function Get-DvLegSetPlan {
         }
         $spec = [IO.File]::ReadAllText($full) | ConvertFrom-Json
         if ([string]$spec.clipId -cne $clipId -or [string]$spec.card -cne $card) { throw "DVE_LEGSET_INVALID leg '$($spec.legId)' does not name the set's clip and card" }
+        # r6: refused by the RESOLVED spec (its legId and its file leaf), so no spelling of the reference gets a visual twin into a speed-cell matrix
+        if ((Test-DvVisualTwinName $spec.legId) -or (Test-DvVisualTwinName ([IO.Path]::GetFileName($full)))) {
+            throw "DVE_LEGSET_INVALID leg '$($spec.legId)' is a visual twin: its fps is capture-perturbed and is never a measured matrix speed cell"
+        }
         $specs.Add([pscustomobject]@{ path = $full; spec = $spec })
     }
     $backends = [System.Collections.Generic.List[string]]::new()
@@ -3055,6 +3071,10 @@ function Get-DvMatrixRow {
     }
     if ($null -eq $Receipt) { $row.note = 'the leg wrote no receipt'; return [pscustomobject]$row }
     $row.outcome = [string](Get-DvProp $Receipt 'outcome'); $row.receiptId = [string](Get-DvProp $Receipt 'receiptId')
+    # r6 (sol r5 B1): a visual twin's rates are never read, whichever path its plan entry or receipt came through (the entry's leg id and the receipt's leg id both count)
+    if ((Test-DvVisualTwinName (Get-DvProp $PlanEntry 'legId')) -or (Test-DvVisualTwinName (Get-DvProp $Receipt 'legId'))) {
+        $row.note = 'a visual twin (capture-perturbed fps) is never a measured speed cell'; return [pscustomobject]$row
+    }
     $display = Get-DvProp $Receipt 'display'
     if ($null -ne $display) {
         $row.observedDisplay = [string](Get-DvProp $display 'observedMode')

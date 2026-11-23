@@ -19675,7 +19675,20 @@ class DriftLegSpecTests(unittest.TestCase):
             with self.subTest(leg=rel):
                 self.assertIn("-w10-visual-unpaced-", self.load(rel)["legId"])
         self.assertEqual(sorted(p.name for p in (DV / "legs").glob("*-visual-*.json")), sorted(Path(r).name for r in DRIFT_VISUAL_LEGS), "a '-visual-' leg outside the registered twins")
-        # adversary pass 9 A1: judge the DECODED legs and the legs' own spec ids, never the raw text (a JSON escape such as drift is the same string once decoded)
+        for path in sorted((DV / "legsets").glob("*.json")):
+            with self.subTest(legset=path.name):
+                self.assertEqual(self.legset_drift_violations(json.loads(path.read_text(encoding="utf-8"))), [])
+
+    @staticmethod
+    def legset_ref_key(value: str) -> str:
+        """r6 (sol r5 B1, luna r5 B1): the identity a leg reference NAMES on Windows, not the text it is written in: both separators folded, `.`, `..` and empty segments
+        resolved, case folded (the runner resolves `LEGS\\X.JSON` and `legs/./x.json` to the same file as `legs/x.json`)."""
+        import posixpath
+        return posixpath.normpath(value.replace("\\", "/")).casefold()
+
+    def legset_drift_violations(self, doc: object) -> list[str]:
+        """Every place a legset (judged as DECODED JSON, adversary pass 9 A1) names a drift leg, a visual twin above all: by the NORMALISED reference (r6), and by the spec
+        the reference resolves to (its card and its legId), never by the reference's own spelling."""
         def walk(node):
             if isinstance(node, str):
                 yield node
@@ -19685,13 +19698,114 @@ class DriftLegSpecTests(unittest.TestCase):
             elif isinstance(node, list):
                 for v in node:
                     yield from walk(v)
-        for path in sorted((DV / "legsets").glob("*.json")):
-            with self.subTest(legset=path.name):
-                for value in walk(json.loads(path.read_text(encoding="utf-8"))):
-                    self.assertNotIn("m16-1457-drift-", value, "a drift leg (a visual twin above all) in a legset would print its fps as a measured matrix cell")
-                    if value.startswith("legs/") and (DV / value).is_file():
-                        self.assertNotEqual(self.load(value)["card"], "M16-1457-VENUE-BASELINE-DRIFT-1", f"{value} resolves to a drift leg")
-                        self.assertNotIn("-visual-", self.load(value)["legId"], f"{value} resolves to a visual twin")
+        known = {f"legs/{p.name}".casefold(): p for p in (DV / "legs").glob("*.json")}
+        bad = []
+        for value in walk(doc):
+            key = self.legset_ref_key(value)
+            if "m16-1457-drift-" in key or "-visual-" in key:
+                bad.append(f"{value!r} names a drift leg or a visual twin (its fps would print as a measured matrix cell)")
+            if key in known:
+                spec = json.loads(known[key].read_text(encoding="utf-8"))
+                if spec["card"] == "M16-1457-VENUE-BASELINE-DRIFT-1":
+                    bad.append(f"{value!r} resolves to the drift leg {spec['legId']}")
+                if "-visual-" in spec["legId"].casefold():
+                    bad.append(f"{value!r} resolves to the visual twin {spec['legId']}")
+        return bad
+
+    # r6: the spellings Windows resolves to the same twin file (sol r5 B1: the first two; luna r5 B1: the upper-case suffix)
+    TWIN_ALIAS_FORMS = ("LEGS\\{NAME}.json", "LEGS/./{NAME}.json", "legs/{name}.JSON", "LEGS\\{NAME}.JSON", "legs/../legs/{name}.json", "legs//{name}.json",
+                        "Legs\\.\\{name}.json", "legs\\{name}.json")
+
+    def twin_aliases(self) -> list[str]:
+        out = []
+        for rel in DRIFT_VISUAL_LEGS:
+            name = Path(rel).stem
+            out.extend(form.format(name=name, NAME=name.upper()) for form in self.TWIN_ALIAS_FORMS)
+        return out
+
+    def test_the_legset_guard_judges_the_normalised_reference_so_no_path_alias_of_a_twin_passes_it(self) -> None:
+        aliases = self.twin_aliases()
+        self.assertEqual(len(aliases), len(DRIFT_VISUAL_LEGS) * len(self.TWIN_ALIAS_FORMS))
+        for alias in aliases:
+            with self.subTest(alias=alias):
+                self.assertTrue(self.legset_drift_violations({"legs": [alias]}), "the guard passed a twin's path alias")
+        # the control: an ordinary matrix leg, however it is spelled, is not a violation
+        for ok in ("legs/m16-1243-display-fullscreen-s1.json", "LEGS\\M16-1243-DISPLAY-FULLSCREEN-S1.JSON"):
+            self.assertEqual(self.legset_drift_violations({"legs": [ok]}), [], ok)
+
+    @requires_windows_pwsh
+    def test_the_matrix_planner_refuses_a_visual_twin_by_the_spec_it_resolves_to_however_the_reference_is_spelled(self) -> None:
+        """r6 B1, the RUNNER half: the guard above only watches the shipped legsets; the planner (Get-DvLegSetPlan) is what a lease plan or a hand-written set goes
+        through, so it refuses by the RESOLVED spec's identity (its legId and its file leaf), not by the reference string."""
+        aliases = self.twin_aliases() + [f"legs/{Path(rel).name}" for rel in DRIFT_VISUAL_LEGS]
+        with tempfile.TemporaryDirectory(prefix="dve-twin-set-") as tmp:
+            root = Path(tmp) / "dual-venue"
+            shutil.copytree(DV, root)
+            names = []
+            for i, alias in enumerate(aliases):
+                name = f"alias-{i:02d}"
+                names.append(name)
+                (root / "legsets" / f"{name}.json").write_text(json.dumps({"schema": "mlv-app/dual-venue-legset/v1", "legSet": name, "card": "M16-1457-VENUE-BASELINE-DRIFT-1",
+                                                                          "clipId": "M16-1457", "legs": [alias]}), encoding="utf-8")
+            control = {"schema": "mlv-app/dual-venue-legset/v1", "legSet": "control", "card": "M16-1457-VENUE-BASELINE-DRIFT-1", "clipId": "M16-1457",
+                       "legs": ["legs/m16-1457-drift-t1-w10-unpaced-fullscreen-s1.json"]}
+            (root / "legsets" / "control.json").write_text(json.dumps(control), encoding="utf-8")
+            proc, got = run_pwsh_json(f"$out = foreach ($f in Get-ChildItem -LiteralPath '{root / 'legsets'}' -Filter 'alias-*.json' | Sort-Object Name) {{\n"
+                                      "  try { $p = Get-DvLegSetPlan -LegSetPath $f.FullName; [ordered]@{ set = $f.BaseName; planned = @($p.plan).Count; why = '' } }\n"
+                                      "  catch { [ordered]@{ set = $f.BaseName; planned = 0; why = $_.Exception.Message } } }\n"
+                                      f"$c = Get-DvLegSetPlan -LegSetPath '{root / 'legsets' / 'control.json'}'\n"
+                                      "[ordered]@{ results = @($out); controlPlanned = @($c.plan).Count } | ConvertTo-Json -Compress -Depth 4")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(got["controlPlanned"], len(self.load("legs/m16-1457-drift-t1-w10-unpaced-fullscreen-s1.json")["backends"]),
+                             "the control (an untraced drift arm) still plans one cell per backend: only the twin is refused")
+            self.assertEqual(len(got["results"]), len(aliases))
+            for res in got["results"]:
+                with self.subTest(alias=aliases[names.index(res["set"])]):
+                    self.assertEqual(res["planned"], 0, "the planner accepted a visual twin as a matrix cell")
+                    self.assertIn("DVE_LEGSET_INVALID", res["why"])
+                    # an upper-case `.JSON` suffix is already refused earlier, as not being a leg spec (the runner's suffix check is case-sensitive); every other spelling is a twin
+                    self.assertIn("is not a leg spec under legs/" if aliases[names.index(res["set"])].endswith(".JSON") else "visual twin", res["why"])
+
+    @requires_windows_pwsh
+    def test_the_matrix_reader_never_turns_a_visual_twins_receipt_into_a_measured_speed_cell(self) -> None:
+        """r6 B1, the READER half (sol r5: the four saved twin receipts rendered 1/1 measured): a row whose plan entry or receipt names a visual twin carries the outcome
+        and no rates, whatever path the entry came through; the same receipt under an ordinary leg id is read normally (the control)."""
+        with tempfile.TemporaryDirectory(prefix="dve-twin-row-") as tmp:
+            ev = Path(tmp) / "ev"
+            (ev / "logs").mkdir(parents=True)
+            log = "playback_smoke.summary session=1 presented_fps=19.60 avg_render_work_ms=28.5\n"
+            (ev / "logs" / "smoke-run.log").write_text(log, encoding="utf-8", newline="")
+            sha = hashlib.sha256(log.encode("utf-8")).hexdigest()
+            twin = Path(next(iter(DRIFT_VISUAL_LEGS))).stem
+            cases = {"control": ("m16-1243-display-fullscreen-s1", "m16-1243-display-fullscreen-s1"),
+                     "entry-names-twin": (twin, "m16-1243-display-fullscreen-s1"),
+                     "receipt-names-twin": ("m16-1243-display-fullscreen-s1", twin),
+                     "upper-case-twin": (twin.upper(), twin.upper()),
+                     "no-entry-leg-id": (None, twin)}
+            spec = {k: {"entry": e, "receipt": r} for k, (e, r) in cases.items()}
+            proc, got = run_pwsh_json("$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES | ConvertFrom-Json\n"
+                                      "$rows = foreach ($p in $cases.PSObject.Properties) {\n"
+                                      "  $entry = [ordered]@{ seq = 1; repeat = 1; cellId = 'x'; backend = 'cuda'; displayMode = 'fullscreen'; scaleFactor = 1 }\n"
+                                      "  if ($p.Value.entry) { $entry.legId = [string]$p.Value.entry }\n"
+                                      "  $r = [pscustomobject]@{ outcome = 'PASS'; receiptId = 'rid'; legId = [string]$p.Value.receipt; evidence = [pscustomobject]@{ localEvidenceDir = $env:DVE_EV; logSha256 = $env:DVE_SHA } }\n"
+                                      "  $row = Get-DvMatrixRow -PlanEntry ([pscustomobject]$entry) -Receipt $r\n"
+                                      "  [ordered]@{ case = $p.Name; outcome = $row.outcome; presentedFps = $row.presentedFps; renderWorkMs = $row.renderWorkMs; note = $row.note } }\n"
+                                      "@($rows) | ConvertTo-Json -Compress -Depth 4 -AsArray",
+                                      DVE_CASES=str(self.write_json(Path(tmp) / "cases.json", spec)), DVE_EV=str(ev), DVE_SHA=sha)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            by = {r["case"]: r for r in got}
+            self.assertEqual(by["control"]["presentedFps"], 19.6, "the fixture reads a rate for an ordinary leg")
+            for case in ("entry-names-twin", "receipt-names-twin", "upper-case-twin", "no-entry-leg-id"):
+                with self.subTest(case=case):
+                    self.assertEqual(by[case]["outcome"], "PASS", "the outcome stays visible")
+                    self.assertIsNone(by[case]["presentedFps"], "a visual twin's fps is observer-perturbed and is never a measured cell")
+                    self.assertIsNone(by[case]["renderWorkMs"])
+                    self.assertIn("visual twin", by[case]["note"])
+
+    @staticmethod
+    def write_json(path: Path, doc: object) -> Path:
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        return path
 
     def test_the_pcore_arm_adds_only_the_affinity_keys_the_cap_and_the_two_partition_criteria(self) -> None:
         rel = "legs/m16-1457-drift-pcore12-unpaced-fullscreen-s1.json"
