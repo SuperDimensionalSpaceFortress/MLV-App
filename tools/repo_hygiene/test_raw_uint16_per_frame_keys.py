@@ -144,13 +144,33 @@ _QMAKE_MAX_FILE_BYTES = 1024 * 1024
 
 def _read_qmake_file(path: Path) -> str:
     """A .pro/.pri file as qmake sees its bytes: no universal-newline translation (a lone CR must stay a CR). Only a regular
-    file of sane size is read: a FIFO or device blocks a synchronous read with no deadline, and a huge file stalls the gate."""
-    status = path.stat()
-    if not stat.S_ISREG(status.st_mode):
-        raise OSError("not a regular file: " + str(path))
-    if status.st_size > _QMAKE_MAX_FILE_BYTES:
+    file of sane size is read: a FIFO or device blocks a synchronous read with no deadline, and a huge file stalls the gate.
+    The pathname is opened exactly once and every judgement is made on that descriptor (sol r8 B2: a stat() of the pathname
+    followed by a second open of it lets the file be replaced in between, by a larger file or by a link to a FIFO). The open is
+    non-blocking where the host has the flag, so a FIFO swapped in is refused by the type check instead of waited on, and the
+    read stops one byte past the limit whatever size the descriptor reported."""
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(str(path), flags)
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode):
+            raise OSError("not a regular file: " + str(path))
+        if status.st_size > _QMAKE_MAX_FILE_BYTES:
+            raise OSError("larger than " + str(_QMAKE_MAX_FILE_BYTES) + " bytes: " + str(path))
+        chunks = []
+        remaining = _QMAKE_MAX_FILE_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    finally:
+        os.close(descriptor)
+    data = b"".join(chunks)
+    if len(data) > _QMAKE_MAX_FILE_BYTES:
         raise OSError("larger than " + str(_QMAKE_MAX_FILE_BYTES) + " bytes: " + str(path))
-    return path.read_bytes().decode("utf-8")
+    return data.decode("utf-8")
 
 
 def _qmake_include_is_local(relative: str) -> bool:
@@ -341,6 +361,14 @@ def _qmake_condition_is_arch_local(condition: str, arch: str) -> bool:
     return any(_qmake_atom_is_arch_local(conjunct, arch) for conjunct in conjuncts)
 
 
+def _qmake_condition_has_macx(condition: str) -> bool:
+    """Whether a scope header or single-line prefix confines what it guards to macOS: `macx` is one of its AND-ed conjuncts. An OR
+    never does (`macx|linux` also guards Linux), and a header mixing both is read as not confining (sol r8 B1)."""
+    if not condition or len(_qmake_split_top(condition, "|")) > 1:
+        return False
+    return any(conjunct == "macx" for conjunct in _qmake_split_top(condition, ":"))
+
+
 def _qmake_simulate(
         pro_text: str, arch: str, source_dir: "Path | None" = None, seen: "set[str] | None" = None,
         checkout_root: Path = ROOT
@@ -365,7 +393,7 @@ def _qmake_simulate(
         return (variable in values or bool(_QMAKE_COMPILE_FLAG_VARIABLE.fullmatch(variable))
                 or bool(_QMAKE_LINK_FLAG_VARIABLE.fullmatch(variable)))
 
-    def apply(statement: str, scope: "tuple[str, bool]", depth: int, directory: "Path | None", nesting: int) -> None:
+    def apply(statement: str, scope: "tuple[str, bool, bool]", depth: int, directory: "Path | None", nesting: int) -> None:
         # Fail closed: a statement this model cannot read as `[conditions:]VARIABLE op value` is refused, never skipped.
         match = _QMAKE_ASSIGNMENT.match(statement)
         if not match:
@@ -405,7 +433,10 @@ def _qmake_simulate(
                                  "no operand or carry it joined; one that takes the next token as its operand would consume the "
                                  "OpenMP flag after it): " + repr(statement))
         certain = state == _TRUE
-        local = scope[1] or _qmake_condition_is_arch_local(condition, arch)
+        # A line is the QT_ARCH branch's own only where a macx scope AND a QT_ARCH=arch test both enclose it, in either order; an
+        # architecture block outside macx also guards Linux and Windows builds, so it earns no macOS credit (sol r8 B1).
+        local = ((scope[1] or _qmake_condition_has_macx(condition))
+                 and (scope[2] or _qmake_condition_is_arch_local(condition, arch)))
         may_add = possible.setdefault(variable, set())
         if operator in ("+=", "*="):
             may_add.update(tokens)
@@ -459,7 +490,7 @@ def _qmake_simulate(
         evaluate(text, target.parent, nesting + 1)
 
     def evaluate(text: str, directory: "Path | None", nesting: int) -> None:
-        scopes: "list[tuple[str, bool]]" = []
+        scopes: "list[tuple[str, bool, bool]]" = []
         buffer = ""
         in_reference = False
 
@@ -468,7 +499,7 @@ def _qmake_simulate(
             statement = buffer.strip()
             buffer = ""
             if statement:
-                apply(statement, scopes[-1] if scopes else (_TRUE, False), len(scopes), directory, nesting)
+                apply(statement, scopes[-1] if scopes else (_TRUE, False, False), len(scopes), directory, nesting)
 
         for char in _qmake_logical_text(text):
             if in_reference:
@@ -481,9 +512,10 @@ def _qmake_simulate(
                 header = buffer.strip()
                 own = _qmake_condition_state(header, arch, seen)
                 buffer = ""
-                parent_state, parent_local = scopes[-1] if scopes else (_TRUE, False)
+                parent_state, parent_macx, parent_arch = scopes[-1] if scopes else (_TRUE, False, False)
                 scopes.append((_qmake_and([parent_state, own]),
-                               parent_local or _qmake_condition_is_arch_local(header, arch)))
+                               parent_macx or _qmake_condition_has_macx(header),
+                               parent_arch or _qmake_condition_is_arch_local(header, arch)))
             elif char == "}":
                 flush()
                 if not scopes:
@@ -687,6 +719,27 @@ _MACX_PIN_CASES = (
     ("C-A9 an OR with a platform scope is not an architecture branch", _arm64_section(
         "QMAKE_CFLAGS += -fopenmp", "LIBS += -lomp", opener="macx|equals(QT_ARCH, arm64)"), "",
      [_LOCAL_COMPILE_GAP, _LOCAL_LINK_GAP]),
+    # sol r8 blocker 1: the QT_ARCH branch's own flag must come from a line that a macx scope AND the architecture test enclose.
+    # An architecture block (or prefix) outside macx also guards Linux and Windows builds, so it earns no macOS credit. The empty
+    # arm64 section leaves x86_64 as the only architecture branch inside macx.
+    ("R8-B1 the arm64 block moved to the top level", "",
+     "equals(QT_ARCH, arm64) {\n    QMAKE_CFLAGS += -fopenmp\n    LIBS += -L/opt/homebrew/opt/llvm/lib -lomp\n}",
+     [_LOCAL_COMPILE_GAP, _LOCAL_LINK_GAP]),
+    ("R8-B1 top-level inline architecture prefixes", "",
+     "equals(QT_ARCH, arm64):QMAKE_CFLAGS += -fopenmp\nequals(QT_ARCH, arm64):LIBS += -lomp",
+     [_LOCAL_COMPILE_GAP, _LOCAL_LINK_GAP]),
+    ("R8-B1 only the compile flag moved to a top-level architecture prefix", _arm64_section("LIBS += -lomp"),
+     "equals(QT_ARCH, arm64):QMAKE_CFLAGS += -fopenmp", [_LOCAL_COMPILE_GAP]),
+    ("R8-B1 an OR with another platform does not confine the arm64 block to macOS", "",
+     "macx|linux {\n    equals(QT_ARCH, arm64) {\n        QMAKE_CFLAGS += -fopenmp\n        LIBS += -lomp\n    }\n}",
+     [_LOCAL_COMPILE_GAP, _LOCAL_LINK_GAP]),
+    ("R8-B1 control: an architecture block outside with macx prefixes inside is still the branch's own", "",
+     "equals(QT_ARCH, arm64) {\n    macx:QMAKE_CFLAGS += -fopenmp\n    macx:LIBS += -lomp\n}", []),
+    ("R8-B1 control: an architecture prefix with macx after it is still the branch's own", "",
+     "equals(QT_ARCH, arm64):macx:QMAKE_CFLAGS += -fopenmp\nequals(QT_ARCH, arm64):macx:LIBS += -lomp", []),
+    ("R8-B1 control: nested macx inside an architecture block inside a top-level scope", "",
+     "true {\n    equals(QT_ARCH, arm64) {\n        macx {\n            QMAKE_CFLAGS += -fopenmp\n"
+     "            LIBS += -lomp\n        }\n    }\n}", []),
 )
 
 
@@ -1304,6 +1357,110 @@ int main(void)
                     text = _MACX_PIN_TEMPLATE % {"arm64": _ARM64_LIVE, "tail": "include(" + name + ")"}
                     with self.assertRaisesRegex(AssertionError, "unsupported qmake construct"):
                         _macos_openmp_gaps(text, "arm64", root, checkout_root=root)
+
+    def test_macos_arch_pin_gives_no_credit_to_an_x86_64_block_moved_outside_macx(self) -> None:
+        """sol r8 B1, the other architecture: the same move for x86_64 (arm64 stays intact inside macx) is x86_64's gap only."""
+        text = ("macx {\n    QMAKE_CFLAGS += -std=c99\n" + _ARM64_LIVE + "\n}\n"
+                "equals(QT_ARCH, x86_64) {\n    QMAKE_CFLAGS += -fopenmp\n    LIBS += -L/usr/local/opt/llvm/lib -lomp\n}\n")
+        self.assertEqual(_macos_openmp_gaps(text, "arm64"), [])
+        self.assertEqual(_macos_openmp_gaps(text, "x86_64"), [_LOCAL_COMPILE_GAP, _LOCAL_LINK_GAP])
+
+    def test_macos_arch_pin_gives_no_credit_to_an_included_architecture_block_outside_macx(self) -> None:
+        """sol r8 B1 through include(): an include() at the top level whose file holds the arm64 block is outside macx too."""
+        block = "equals(QT_ARCH, arm64) {\n    QMAKE_CFLAGS += -fopenmp\n    LIBS += -lomp\n}\n"
+        with tempfile.TemporaryDirectory() as scratch:
+            (Path(scratch) / "arch.pri").write_text(block, encoding="utf-8")
+            project = Path(scratch) / "sub" / "target.pro"
+            project.parent.mkdir()
+            project.write_text(_MACX_PIN_TEMPLATE % {"arm64": "", "tail": "include(../arch.pri)"}, encoding="utf-8")
+            self.assertEqual(
+                _project_openmp_gaps(project, "arm64", checkout_root=Path(scratch)), [_LOCAL_COMPILE_GAP, _LOCAL_LINK_GAP])
+
+    @staticmethod
+    def _stat_result(size: int, kind: int = stat.S_IFREG) -> os.stat_result:
+        return os.stat_result((kind | 0o644, 0, 0, 1, 0, 0, size, 0, 0, 0))
+
+    def test_macos_arch_pin_reader_judges_the_file_it_opened_not_the_pathname_it_checked(self) -> None:
+        """sol r8 B2: the pathname was stat()ed, then opened a second time by read_bytes(), so the file could be replaced between
+        the two (a larger file; a link to a FIFO that blocks the open). The reader now opens once and judges the descriptor: a
+        stat of the pathname that lies, or an fstat that lies, changes nothing, and the read itself stops one byte past the
+        limit."""
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            big = root / "big.pri"
+            big.write_bytes(b"#" * (_QMAKE_MAX_FILE_BYTES + 1))
+            small = root / "small.pri"
+            small.write_bytes(b"DEFINES += X\n")
+            lie_target = os.path.normcase(os.path.abspath(str(big)))
+            real_stat, real_path_stat = os.stat, Path.stat
+
+            def lying_stat(path, *args, **kwargs):
+                if os.path.normcase(os.path.abspath(str(path))) == lie_target:
+                    return self._stat_result(32)
+                return real_stat(path, *args, **kwargs)
+
+            def lying_path_stat(path, *args, **kwargs):
+                if os.path.normcase(os.path.abspath(str(path))) == lie_target:
+                    return self._stat_result(32)
+                return real_path_stat(path, *args, **kwargs)
+
+            with self.subTest("the pathname stat reports a 32-byte regular file, the open yields more than the limit"):
+                with mock.patch.object(os, "stat", lying_stat), mock.patch.object(Path, "stat", lying_path_stat):
+                    with self.assertRaisesRegex(OSError, "larger than"):
+                        _read_qmake_file(big)
+            with self.subTest("the descriptor itself reports 32 bytes: the read is still bounded"):
+                with mock.patch.object(os, "fstat", lambda _descriptor: self._stat_result(32)):
+                    with self.assertRaisesRegex(OSError, "larger than"):
+                        _read_qmake_file(big)
+            with self.subTest("the descriptor is not a regular file (a link swapped to a FIFO)"):
+                with mock.patch.object(os, "fstat", lambda _descriptor: self._stat_result(0, stat.S_IFIFO)):
+                    with self.assertRaisesRegex(OSError, "not a regular file"):
+                        _read_qmake_file(small)
+            with self.subTest("a file of exactly the limit is still read"):
+                exact = root / "exact.pri"
+                exact.write_bytes(b"#" * _QMAKE_MAX_FILE_BYTES)
+                self.assertEqual(len(_read_qmake_file(exact)), _QMAKE_MAX_FILE_BYTES)
+            with self.subTest("a small file is read through its single open, never by pathname again"):
+                def forbidden(*_args, **_kwargs):
+                    raise AssertionError("the pathname was used again after the open")
+                with mock.patch.object(Path, "stat", forbidden), mock.patch.object(Path, "read_bytes", forbidden), \
+                        mock.patch.object(Path, "open", forbidden), mock.patch.object(Path, "read_text", forbidden):
+                    self.assertEqual(_read_qmake_file(small), "DEFINES += X\n")
+            with self.subTest("the open asks not to block (a FIFO swapped in is refused, never waited on)"):
+                sentinel, seen_flags, real_open = 1 << 30, [], os.open
+
+                def recording_open(path, flags, *args, **kwargs):
+                    seen_flags.append(flags)
+                    return real_open(path, flags & ~sentinel, *args, **kwargs)
+
+                with mock.patch.object(os, "O_NONBLOCK", sentinel, create=True), mock.patch.object(os, "open", recording_open):
+                    _read_qmake_file(small)
+                self.assertEqual(len(seen_flags), 1, "exactly one open of the pathname")
+                self.assertTrue(seen_flags[0] & sentinel, "O_NONBLOCK must be among the open flags")
+
+    def test_macos_arch_pin_refuses_an_include_enlarged_between_the_check_and_the_open(self) -> None:
+        """sol r8 B2 end to end: direct and nested include(), where the pathname stat said 32 bytes and the open yields more than
+        the limit. The pin must refuse, not read the enlarged file and stay green."""
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            (root / "big.pri").write_bytes(b"#" * (_QMAKE_MAX_FILE_BYTES + 1))
+            (root / "outer.pri").write_text("include(big.pri)\n", encoding="utf-8")
+            lie_target = os.path.normcase(os.path.abspath(str(root / "big.pri")))
+            real_stat, real_path_stat = os.stat, Path.stat
+
+            def lying(real):
+                def stat_of(path, *args, **kwargs):
+                    if os.path.normcase(os.path.abspath(str(path))) == lie_target:
+                        return self._stat_result(32)
+                    return real(path, *args, **kwargs)
+                return stat_of
+
+            for name, include in (("direct", "include(big.pri)"), ("nested", "include(outer.pri)")):
+                with self.subTest(name):
+                    text = _MACX_PIN_TEMPLATE % {"arm64": _ARM64_LIVE, "tail": include}
+                    with mock.patch.object(os, "stat", lying(real_stat)), mock.patch.object(Path, "stat", lying(real_path_stat)):
+                        with self.assertRaisesRegex(AssertionError, "unsupported qmake construct.*larger than"):
+                            _macos_openmp_gaps(text, "arm64", root, checkout_root=root)
 
     def test_macos_arch_pin_link_guard_is_tested_without_needing_the_symlink_right(self) -> None:
         """fable r7 LJ92-PIN-LINK-GUARD-TEST-COVERAGE-1: the symlink test above skips on a host that cannot create a link, and
