@@ -312,6 +312,13 @@ DRIFT_VISUAL_LEGS = {"legs/m16-1457-drift-t1-w10-visual-unpaced-fullscreen-s1.js
                      "legs/m16-1457-drift-t16-w10-visual-unpaced-fullscreen-s1.json": None}
 DRIFT_LEGS = {**DRIFT_LEGS, **{rel: "legs/m16-1457-headroom-unpaced-fullscreen-s1.json" for rel in (*DRIFT_T1_LEGS, *DRIFT_W10_LEGS, *DRIFT_VISUAL_LEGS)}}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *DRIFT_LEGS)
+# CPU-S1-1457-HEAVY-SPEC-AND-STALE-FIELDS-1: the two cpu-only fullscreen s1 HEAVY legs with Look Assist ON, keyed to the tracked spec each one mirrors (UFI-1 successor C2):
+# the M16-1457 paced cuda s1 HEAVY leg with backend cpu, and the M16-1243 unpaced stage leg with backend cpu (the untracked X7 shape). Each differs from its source only in
+# legId, card, backends and the cpu criteria list; test_the_cpu_s1_heavy_legs_mirror_their_cuda_sources pins that.
+CPU_S1_HEAVY_LEGS = {"legs/m16-1457-native-cpu-fullscreen-s1-heavy.json": "legs/m16-1457-native-fullscreen-s1-heavy.json",
+                     "legs/m16-1243-headroom-stage-cpu-fullscreen-s1.json": "legs/m16-1243-headroom-stage-fullscreen-s1.json"}
+CPU_S1_HEAVY_UNPACED_LEG = "legs/m16-1243-headroom-stage-cpu-fullscreen-s1.json"   # the one unpaced (swap interval 0) leg of the pair: it carries presentTearingExpectedReason
+SHIPPED_LEGS = (*SHIPPED_LEGS, *CPU_S1_HEAVY_LEGS)
 assert len(set(SHIPPED_LEGS)) == len(SHIPPED_LEGS), "a shipped leg is listed twice"
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
@@ -7912,6 +7919,40 @@ class LegSpecSchemaTests(unittest.TestCase):
             with self.assertRaises(self.jsonschema.ValidationError, msg=key):
                 self.jsonschema.validate(bad, self.schema)
 
+    def test_the_cpu_s1_heavy_legs_mirror_their_cuda_sources(self) -> None:
+        """CPU-S1-1457-HEAVY-SPEC-AND-STALE-FIELDS-1: each cpu s1 HEAVY leg is its tracked cuda source with backend cpu, so the cpu arm has per-frame rows at the
+        scale the cuda legs run at (the 1457 cpu arm only existed at scale 2, and the 1243 cpu arm only as the LA-off LIGHT baseline or an untracked one-off).
+        Differences from the source: legId, card, backends and the cpu criteria list (no gpuFramesTotal: a cpu leg has no gpu frames). HEAVY, scale 1,
+        fullscreen and Look Assist ON (cinematic, gated on lookFlavorReported) are pinned here so no edit can quietly make one LIGHT, a different scale,
+        a cuda leg, or Look Assist off."""
+        self.assertEqual(len(CPU_S1_HEAVY_LEGS), 2)
+        for rel, source_rel in CPU_S1_HEAVY_LEGS.items():
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(spec, self.schema)
+            source = json.loads((DV / source_rel).read_text(encoding="utf-8"))
+            self.assertEqual(spec["legId"], Path(rel).stem, rel)
+            self.assertEqual(spec["card"], "CPU-S1-1457-HEAVY-SPEC-AND-STALE-FIELDS-1", rel)
+            self.assertEqual((spec["legType"], spec["backends"], spec["scaleFactor"], spec["displayMode"]), ("speed", ["cpu"], 1, "fullscreen"), rel)
+            self.assertEqual(spec["generatorArgs"]["telemetryArm"], "HEAVY", rel)
+            self.assertIs(spec["generatorArgs"]["forceLookAssist"], True, rel)
+            self.assertEqual(spec["generatorArgs"]["lookFlavor"], "cinematic", rel)
+            self.assertNotIn("disableLookAssist", spec["generatorArgs"], rel)
+            for role in ("acceptance", "supplementary"):
+                self.assertEqual(list(spec["criteria"][role]), ["cpu"], rel)
+                self.assertEqual(spec["criteria"][role]["cpu"], [{"metric": "lookAssistForced", "op": "eq", "value": True},
+                                                                 {"metric": "lookFlavorReported", "op": "eq", "value": "cinematic"}], f"{rel} {role}")
+            # the whole spec is the source's except those fields
+            expected = json.loads(json.dumps(source))
+            expected["legId"], expected["card"], expected["backends"] = spec["legId"], spec["card"], ["cpu"]
+            expected["criteria"] = spec["criteria"]
+            self.assertEqual(spec, expected, rel)
+            self.assertNotIn("gpuFramesTotal", json.dumps(spec["criteria"]), rel)
+            self.assertEqual(source["generatorArgs"]["telemetryArm"], "HEAVY", source_rel)
+            # clip ids only: a spec names a clip by id, never by a file name or a venue path
+            text = (DV / rel).read_text(encoding="utf-8")
+            self.assertNotIn(MLV_EXT, text, rel)
+            self.assertNotIn(":\\", text, rel)
+
     def test_the_lookahead_leg_is_the_owner_shape_pace_leg_at_depth_3(self) -> None:
         """PLAYBACK-BACHELOR-PRESENT-JITTER-1: the lookahead A/B's depth-3 arm differs from the owner-shape pace leg only in its legId and
         generatorArgs.playbackRenderLookaheadFrames."""
@@ -8213,12 +8254,12 @@ class LegSpecSchemaTests(unittest.TestCase):
         """CUDA-HEADROOM-1 r2: an unpaced leg at swap interval 0 presents with SyncInterval 0, so PresentMon reports AllowsTearing=1 (the hub's
         TEARING flag). Every headroom leg says so in presentTearingExpectedReason; no other leg carries it, and the schema refuses it on any leg
         that is not unpaced at swap interval 0, so the exemption can never reach a paced or vsync leg."""
-        for rel in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS, *DRIFT_LEGS):
+        for rel in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS, *DRIFT_LEGS, CPU_S1_HEAVY_UNPACED_LEG):
             spec = json.loads((DV / rel).read_text(encoding="utf-8"))
             self.jsonschema.validate(spec, self.schema)
             self.assertGreaterEqual(len(spec.get("presentTearingExpectedReason", "")), 12, rel)
         for path in sorted((DV / "legs").glob("*.json")):
-            if "legs/" + path.name not in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS, *DRIFT_LEGS):
+            if "legs/" + path.name not in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS, *DRIFT_LEGS, CPU_S1_HEAVY_UNPACED_LEG):
                 self.assertNotIn("presentTearingExpectedReason", json.loads(path.read_text(encoding="utf-8")), path.name)
         leg = json.loads((DV / HEADROOM_LEGS[0]).read_text(encoding="utf-8"))
         paced = {k: v for k, v in leg["generatorArgs"].items() if k != "unpaced"}
@@ -8371,6 +8412,11 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "CPU-S1-RECON-CHAIN-ATTRIBUTION-1":   # the Look Assist on arms of the chain attribution (the classic arm l never reaches this chain)
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-chainattr-(c|p|t12)-fullscreen-s1$", path.name)
+            elif spec["card"] == "CPU-S1-1457-HEAVY-SPEC-AND-STALE-FIELDS-1":   # the cpu fullscreen s1 HEAVY legs, Look Assist ON, named by their mirrored source
+                self.assertIn("legs/" + path.name, CPU_S1_HEAVY_LEGS, path.name)
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-(1457-native-cpu-fullscreen-s1-heavy|1243-headroom-stage-cpu-fullscreen-s1)$", path.name)
+                self.assertEqual(spec["backends"], ["cpu"], path.name)
             elif spec["card"] == "HFR-NATIVE-60FPS-FULLRES-1":   # the Look Assist ON control of the native s1 pair (its -nola twin is classic)
                 self.assert_hfr_native_s1_flavored_leg(spec, path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)

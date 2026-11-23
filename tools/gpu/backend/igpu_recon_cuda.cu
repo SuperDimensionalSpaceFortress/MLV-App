@@ -596,7 +596,10 @@ __global__ void k_alias_gauss(uint16_t* __restrict alias_map,
     + (AX(-2,-6)+AX(2,-6)+AX(-6,-2)+AX(6,-2)+AX(-6,2)+AX(6,2)+AX(-2,6)+AX(2,6)) * 111 / 1024
     + (AX(-2,-6)+AX(2,-6)+AX(-6,-2)+AX(6,-2)+AX(-6,2)+AX(6,2)+AX(-2,6)+AX(2,6)) * 57 / 1024;
     #undef AX
-    alias_map[x + (size_t)y*W] = (uint16_t)c;
+    /* c can exceed 65535 (tap weights sum to ~13.6): saturate exactly like the
+     * CPU (dualiso.c build_alias_map and build_alias_map_gaussian_row_avx2);
+     * a wrapping store turned a strong alias into a weak one (M16-1457 f86). */
+    alias_map[x + (size_t)y*W] = (uint16_t)imin(c, 0xFFFF);
 }
 
 __global__ void k_alias_gray(uint16_t* __restrict alias_map, int W, int H)
