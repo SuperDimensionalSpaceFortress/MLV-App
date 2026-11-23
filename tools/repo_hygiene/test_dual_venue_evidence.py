@@ -681,7 +681,10 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         base = (ROOT / "tools" / "profiling" / "make-contact-sheet.py").read_bytes()
 
         def args_for(composer: bytes, count: str) -> str:
-            script = ("$composeArgs = @('composer.py', '--scale', '1')\n"
+            # the region decodes the composer through the job's own embedded helper (the real module's function, not a stand-in)
+            module = (ROOT / "tools" / "profiling" / "bachelor" / "AttrCudaArtifacts.psm1").as_posix()
+            script = (f"Import-Module -Force -Name '{module}'\n"
+                      "$composeArgs = @('composer.py', '--scale', '1')\n"
                       f"{count}\n"
                       "$contactSheetComposerPayload = [pscustomobject]@{ bytes = [Convert]::FromBase64String($env:COMPOSER_B64) }\n"
                       + region + "\n$composeArgs -join '|'\n")
