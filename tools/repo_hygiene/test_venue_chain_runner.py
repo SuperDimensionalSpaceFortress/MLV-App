@@ -204,8 +204,8 @@ def chain_result(stdout: str) -> dict:
 # CI-FLAKE-VENUE-CHAIN-STALLED-CACHE-BOUND-1: the two output lines of the stalled-cache-read test, checked by ONE helper that the real test and the forced-timing rows
 # share. Each line is `UNREACHABLE [] no answer in <X> s[ (the call's end cut the 5 s bound short)] inside=<n>`: X is the wait the module gave the read (what was left of
 # the 2 s bound on the call's clock) and n is the whole call's wall time floored to seconds.
-STALLED_READ_LINE_CAPPED = re.compile(r"UNREACHABLE \[\] no answer in ([0-9]+(?:\.[0-9]{1,2})?) s \(the call's end cut the 5 s bound short\) inside=([0-9]+)")
-STALLED_READ_LINE_PLAIN = re.compile(r"UNREACHABLE \[\] no answer in ([0-9]+(?:\.[0-9]{1,2})?) s inside=([0-9]+)")
+STALLED_READ_LINE_CAPPED = re.compile(r"UNREACHABLE \[\] no answer in ([0-9]+(?:\.[0-9]{1,2})?) s \(the call's end cut the 5 s bound short\) inside=(0|[1-9][0-9]{0,8})")
+STALLED_READ_LINE_PLAIN = re.compile(r"UNREACHABLE \[\] no answer in ([0-9]+(?:\.[0-9]{1,2})?) s inside=(0|[1-9][0-9]{0,8})")
 
 
 def stalled_read_line_problem(line: str, capped: bool) -> "str | None":
@@ -1691,17 +1691,18 @@ class VenueChainSupplementaryTests(unittest.TestCase):
             f"New-Item -ItemType Directory -Force -Path '{share}\\inbox','{share}\\outbox' | Out-Null; Set-Content -LiteralPath '{share}\\inbox\\dve-1.job.ps1' -Value x; st @('dve-1')\n"
             f"Set-Content -LiteralPath '{share}\\outbox\\dve-1.result.json' -Value '{{}}'; st @('dve-1'); st @('dve-1', 'dve-2')\n"
             f"Set-Content -LiteralPath '{share}\\outbox\\dve-2.result.json' -Value '{{}}'; st @('dve-1', 'dve-2')\n"
-            "$t0 = [DateTime]::UtcNow\n"
+            "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
             f"$r = Get-VenueStagedBuildManifest -AgentShare '{share}' -SourceCommit '{SHA}' -TimeoutSec 5 -CallCapSec 2 -ProbeScript {{ param($p) [Threading.Thread]::Sleep(20000); 'late' }}\n"
-            "$capped = \"$($r.state) [$($r.sha256)] $($r.error) inside=$([int][Math]::Floor(([DateTime]::UtcNow - $t0).TotalSeconds))\"\n"
-            "$t0 = [DateTime]::UtcNow\n"
+            "$capped = \"$($r.state) [$($r.sha256)] $($r.error) inside=$([int][Math]::Floor($sw.Elapsed.TotalSeconds))\"\n"
+            "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
             f"$r = Get-VenueStagedBuildManifest -AgentShare '{share}' -SourceCommit '{SHA}' -TimeoutSec 2 -ProbeScript {{ param($p) [Threading.Thread]::Sleep(20000); 'late' }}\n"
             "$capped\n"
-            "\"$($r.state) [$($r.sha256)] $($r.error) inside=$([int][Math]::Floor(([DateTime]::UtcNow - $t0).TotalSeconds))\"\n"
+            "\"$($r.state) [$($r.sha256)] $($r.error) inside=$([int][Math]::Floor($sw.Elapsed.TotalSeconds))\"\n"
             "Complete-VenueProcess -ExitCode 7\nexit 7\n", encoding="utf-8")
-        t0 = time.time()
+        # monotonic clocks on both sides (adversary A1 on 128b768e): a clock that steps back during a 13 s stall would shrink `inside` and `elapsed` together
+        t0 = time.monotonic()
         r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=90)
-        elapsed = time.time() - t0
+        elapsed = time.monotonic() - t0
         lines = r.stdout.splitlines()
         # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r13 (adversary A1 on 5fe750fa, Grok G20): the read is given what is left of the 2 s bound on the call's clock, and
         # the message reports that wait (and, when the call's end visibly cut it, says so)
@@ -1774,6 +1775,27 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         for line, capped in refused:
             with self.subTest(line=line):
                 self.assertIsNotNone(stalled_read_line_problem(line, capped))
+
+    # Adversary A4/A5 on 128b768e: the whole-second field is pinned to the shape the fixture's Int32 emitter prints (no padding, bounded digits), and an out-of-shape field is
+    # REFUSED with a reason, never a ValueError out of int() (Python caps integer text at 4300 digits).
+    def test_the_stalled_read_line_check_refuses_an_out_of_shape_whole_second_field_with_a_reason(self) -> None:
+        for line, capped in [("UNREACHABLE [] no answer in 1.6 s inside=02", False),
+                             ("UNREACHABLE [] no answer in 1.6 s (the call's end cut the 5 s bound short) inside=02", True),
+                             ("UNREACHABLE [] no answer in 1.6 s inside=" + "9" * 4301, False),
+                             ("UNREACHABLE [] no answer in 1.6 s (the call's end cut the 5 s bound short) inside=" + "9" * 4301, True)]:
+            with self.subTest(line=line[:90]):
+                self.assertIsNotNone(stalled_read_line_problem(line, capped))
+
+    # Adversary A1 on 128b768e: both timers of the stalled-read test must be MONOTONIC. `inside` is read from a Stopwatch, and the python wall time from time.monotonic(),
+    # because a wall clock (DateTime.UtcNow, time.time()) that steps back during a stall shrinks both numbers, and with `inside=1` now legal a 13 s stall under an 11 s
+    # step-back would read inside=1 and elapsed < 16. The row reads the test's own source, since the clock step cannot be forced from outside the process.
+    def test_the_stalled_read_test_times_its_stalls_on_a_monotonic_clock(self) -> None:
+        import inspect
+        src = inspect.getsource(VenueChainSupplementaryTests.test_remote_job_ids_and_states_are_read_by_name_and_a_stalled_cache_read_keeps_its_bound)
+        for wall_clock in ("UtcNow", "Get-Date", "time.time()"):
+            self.assertNotIn(wall_clock, src, f"{wall_clock} is a wall clock: a step back during the stall hides it")
+        self.assertIn("[Diagnostics.Stopwatch]::StartNew()", src)
+        self.assertIn("time.monotonic()", src)
 
     # ---------------------------------------------------------------- mutations: the guards are what the scenarios rely on
     def test_mutation_opt_out_ignored_runs_ultra_magnus_anyway(self) -> None:
