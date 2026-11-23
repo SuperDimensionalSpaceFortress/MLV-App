@@ -697,6 +697,11 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         # adversary pass-9 A3: the flag's NAME in a comment or a string is not a declaration
         for decoy in (b"# reserved: --expected-frames\nparser.add_argument('--scale')\n", b"x = '--expected-frames'\n", b"    # parser.add_argument('--expected-frames')\n"):
             self.assertEqual(args_for(decoy, "$ContactSheetFrameCount = 6"), "composer.py|--scale|1", decoy.decode("ascii"))
+        # r7 (855ede6a A3 / c54a57f6 A2): a declaration line quoted inside a triple-quoted string is no declaration; an alias-first or space-before-paren declaration is one
+        triple = b'EXAMPLE = """\nusage:\nparser.add_argument(\'--expected-frames\')\n"""\nparser.add_argument(\'--scale\')\n'
+        self.assertEqual(args_for(triple, "$ContactSheetFrameCount = 6"), "composer.py|--scale|1", "a triple-quoted example")
+        for live in (b"parser.add_argument('-n', '--expected-frames', type=int)\n", b"parser.add_argument ('--expected-frames', type=int)\n", b'parser.add_argument(\n    "--expected-frames", type=int)\n'):
+            self.assertEqual(args_for(live, "$ContactSheetFrameCount = 6"), "composer.py|--scale|1|--expected-frames|6", live.decode("ascii"))
 
     def test_the_other_existing_switches_are_still_byte_identical(self) -> None:
         self.assertByteIdenticalToBaseline("switches", ["-ContactSheet", "-ContactSheetFrames", "4", "-TelemetryArm", "LIGHT", "-DisablePaintPerSubmit"])
@@ -1727,7 +1732,7 @@ class RunnerHarness:
     def write_artifacts(self, summary: dict | None = None, manifest: dict | None = None, source_frames: dict | None | bool = True,
                         nonce: str | None = NONCE, sheet: bool = False, line: dict | None = None, observed_nonce: str | None | bool = True,
                         manifest_nonce: str | None | bool = True, log: bool = True, result: bool = True, isolated: str | None = "run_scoped",
-                        declared_log_sha: str | None = None, compose_marker: str | None = None, raw_frames: bool = False, raw_frame_count: int | None = None,
+                        declared_log_sha: str | None = None, compose_marker: str | None = None, raw_frames: bool | None = None, raw_frame_count: int | None = None,
                         exact_summary: dict | None = None, extra_log_lines: list[str] | None = None,
                         look_assist_state: str | None = "look_assist_enabled=1") -> None:
         """Write the job's artifacts the way master's generator does, INCLUDING the run's own records the receipt is re-derived
@@ -1789,6 +1794,10 @@ class RunnerHarness:
         if compose_marker is not None:
             (self.artifacts / "contact-sheet").mkdir(exist_ok=True)
             (self.artifacts / "contact-sheet" / "compose-status.txt").write_text(compose_marker, encoding="utf-8")
+        # EVERY-FRAME-VISUAL-LEG-SPEC-1 r7 (c54a57f6 A6 companion): a sheet with no raw directory enumerates zero frames, which the runner now refuses as the typed count refusal.
+        # A job that kept a sheet kept its raw frames beside it, so a fixture with a sheet writes them unless a case says raw_frames=False.
+        if raw_frames is None:
+            raw_frames = sheet
         if raw_frames:
             raw = self.artifacts / "artifacts" / "contact-sheet" / "raw"
             raw.mkdir(parents=True, exist_ok=True)
@@ -5116,6 +5125,89 @@ class ContactFramesAreTheRequestedCountTests(EvidenceFactory, ModuleMutationMixi
         self.assertEqual([l.strip() for l in proc.stdout.splitlines() if l.startswith("N=")],
                          ["N=2147483648 OK=True REQ=", "N=1000 OK=True REQ=", "N=999 OK=False REQ=999", "N=6 OK=False REQ=6"])
 
+    # ---- r7 (adversary 855ede6a / c54a57f6 passes; one class: the count rule's inputs were not closed) ----------------------------------------------------------
+    def no_sheet_receipt(self, tag: str, frames: dict[str, bytes]) -> dict:
+        """A legacy LOOK FAIL: the job captured, the criteria failed, the local sheet is gone (or was never composed); the hash-listed pairs remain."""
+        receipt, ev = self.receipt_over(tag, frames)
+        (ev / "contact-sheet" / "sheet.png").unlink()
+        receipt["outcome"] = "FAIL"
+        receipt["look"]["contactSheet"] = None
+        return receipt
+
+    def test_r7_a_partial_strip_is_refused_by_final_validation_when_the_sheet_is_absent(self) -> None:
+        """855ede6a A2 / c54a57f6 A6: the count gate sat inside the sheet-present branch, so five hash-listed pairs with no sheet stayed an ADVISORY legacy FAIL."""
+        got = self.status_batch(self.repo, [(self.no_sheet_receipt("ns5", stub_raw_frames(5)), None), (self.no_sheet_receipt("ns6", stub_raw_frames(6)), None)])
+        self.expect(got[0], "INVALID", "five pairs, no sheet", "CONTACT_FRAME_COUNT_NOT_REQUESTED")
+        self.expect(got[1], "ADVISORY", "six pairs, no sheet (the control)")
+
+    def test_r7_a_committed_count_that_cannot_be_compared_fails_closed(self) -> None:
+        """855ede6a A6: look.contactSheetFrames 1000 (or the string "6") mapped to 'nothing to compare' and the one-pair strip was accepted."""
+        for label, value in (("thousand", 1000), ("string", "6")):
+            spec = self.write_spec(leg_type="look", contact_frames=6)
+            doc = json.loads(spec.read_text(encoding="utf-8"))
+            doc["look"]["contactSheetFrames"] = value
+            spec.write_text(json.dumps(doc), encoding="utf-8")
+            repo = self.prod_repo(leg_type="look", spec=spec)
+            ev = self.evidence(f"cmp-{label}", sheet=True, backend="cpu", leg_type="look", raw_frames=stub_raw_frames(1))
+            receipt = self.receipt_for(repo, ev, backend="cpu", leg_type="look", spec_path=spec)
+            self.expect(self.status_batch(repo, [(receipt, None)])[0], "INVALID", label, "CONTACT_FRAME_COUNT_NOT_REQUESTED")
+
+    def test_r7_the_receipts_frame_count_is_the_integer_the_runner_writes(self) -> None:
+        """855ede6a A7: frames [6] stringifies to 6 and ConvertTo-DvInt64 parsed it."""
+        receipt, _ = self.receipt_over("arr", stub_raw_frames(6))
+        receipt["look"]["contactSheet"]["frames"] = [6]
+        self.expect(self.status_batch(self.repo, [(receipt, None)])[0], "INVALID", "array", "CONTACT_SHEET_FRAMES_NOT_FROM_EVIDENCE")
+
+    def test_r7_a_directory_in_the_raw_listing_is_not_a_frame_and_is_not_ignored(self) -> None:
+        """c54a57f6 A5: the count helper dropped every '<name>\\' entry, so six pairs plus a stray directory read as exactly the requested strip."""
+        names = ", ".join(f"'frame-{i:02d}.{ext}'" for i in range(6) for ext in ("png", "json"))
+        script = ("$ErrorActionPreference = 'Stop'\n"
+                  f"$v = Get-DvContactFrameCountVerdict -Names @({names}, 'leftovers\\') -Requested 6\n"
+                  "Write-Output ('OK=' + $v.ok)\n")
+        proc = _ps_json(script, DV / "DualVenueRunner.psm1", {})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("OK=False", proc.stdout)
+
+    def test_r7_a_sheet_with_no_raw_directory_is_the_typed_count_refusal(self) -> None:
+        """c54a57f6 A6 companion: a sheet and no raw directory and no marker left frameCountVerdict null, so the leg skipped the typed refusal."""
+        self.write_artifacts(sheet=True, raw_frames=False)
+        proc, run = self.run_leg("ultra-magnus", self.spec, extra=["-Backend", "cpu"])[:2]
+        self.assertIsNotNone(run, proc.stdout + proc.stderr)
+        self.assertEqual(run["outcome"], "INVALID", run["outcomeDetail"])
+        self.assertIn("CONTACT_FRAME_COUNT_NOT_REQUESTED", run["outcomeDetail"])
+
+    def test_r7_a_composed_sheet_that_holds_fewer_tiles_than_the_raw_pairs_is_refused(self) -> None:
+        """855ede6a A5: a legacy composer (no --expected-frames) skipped an image that was absent while it composed; the sheet's own stats.json says how many tiles it holds."""
+        self.write_artifacts(sheet=True, raw_frames=True, raw_frame_count=6)
+        (self.artifacts / "contact-sheet").mkdir(parents=True, exist_ok=True)
+        (self.artifacts / "contact-sheet" / "stats.json").write_text(json.dumps({"schema": "contact-sheet-stats.v1", "tile_count": 5}), encoding="utf-8")
+        proc, run = self.run_leg("ultra-magnus", self.spec, extra=["-Backend", "cpu"])[:2]
+        self.assertIsNotNone(run, proc.stdout + proc.stderr)
+        self.assertEqual(run["outcome"], "INVALID", run["outcomeDetail"])
+        self.assertIn("CONTACT_FRAME_COUNT_NOT_REQUESTED", run["outcomeDetail"])
+
+    def test_r7_the_composer_paints_each_frame_from_its_own_png_and_never_raises_past_exit_3(self) -> None:
+        """855ede6a A4 / c54a57f6 A3: six sidecars that all name frame-00.png painted one image six times. c54a57f6 A8: a `null` sidecar or an unreadable image escaped as exit 1.
+        c54a57f6 A9: 101 canonical stems sorted lexically and a complete set read as a mismatch."""
+        import ast
+        import tempfile as _tempfile
+        source = (ROOT / "tools" / "profiling" / "make-contact-sheet.py").read_text(encoding="utf-8")
+        body = [n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name in ("check_expected_frame_image", "check_expected_frame_stems", "load_frames")]
+        self.assertEqual(sorted(n.name for n in body), ["check_expected_frame_image", "check_expected_frame_stems", "load_frames"])
+        namespace: dict = {"json": json, "sys": __import__("sys"), "Path": Path}
+        exec(compile(ast.Module(body=body, type_ignores=[]), "make-contact-sheet.py:r7", "exec"), namespace)
+        image_check = namespace["check_expected_frame_image"]
+        image_check("frame-03.png", "frame-03", 6)
+        image_check("anything.png", "frame-03", None)
+        with self.assertRaises(ValueError):
+            image_check("frame-00.png", "frame-03", 6)
+        namespace["check_expected_frame_stems"]([f"frame-{i:02d}" for i in range(101)], 101)
+        with _tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "frame-00.json").write_text("null", encoding="utf-8")
+            (Path(tmp) / "frame-01.json").write_text(json.dumps({"index": 1, "saved": True}), encoding="utf-8")
+            self.assertEqual([f["_stem"] for f in namespace["load_frames"](Path(tmp))], ["frame-01"], "a non-object sidecar is skipped like an unreadable one")
+        self.assertIn("except OSError", source[source.index("def compose_sheet"):source.index("def compose_pair_sheet") if "def compose_pair_sheet" in source else None], "an image that cannot be opened is exit 3, not a traceback")
+
     def test_mutation_without_the_count_rule_one_of_six_is_accepted(self) -> None:
         mutated = self.mutated_module([('if (-not $countVerdict.ok) { $invalid.Add("CONTACT_FRAME_COUNT_NOT_REQUESTED: $($countVerdict.reason)") }', "")])
         receipt, _ = self.receipt_over("mut", stub_raw_frames(1))
@@ -8422,46 +8514,29 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertGreaterEqual(spec["playSeconds"], 20, "M16-1243 is 23.976 fps: its play floor is 20 s")
             self.assertGreaterEqual(len(spec["presentTearingExpectedReason"]), 12)
 
-    def test_an_unpaced_speed_leg_cannot_keep_the_post_measurement_capture_tail(self) -> None:
-        """EVERY-FRAME-VISUAL-LEG-SPEC-1 r1 adversary A1 (blocker): an unpaced Play holds once the required source frames are consumed (MainWindow.cpp
-        playbackHandling), so the untimed capture tail of a speed leg shows ONE frame six times and the receipt still says verdict OK (sourceDifference
-        unknown). The schema, the runner and every committed spec refuse the combination: a speed leg with generatorArgs.unpaced true says visualCapture false."""
+    def test_an_unpaced_speed_leg_is_judged_as_at_the_merge_base_r7(self) -> None:
+        """EVERY-FRAME-VISUAL-LEG-SPEC-1 r7 (855ede6a A1 / c54a57f6 A1, introduced): the r1 rule that refused an unpaced speed leg with the capture tail was a SPEC-level
+        refusal only the leg and the lease batch could apply before a lease, so the chain (unchanged by this card) probed and claimed and the leg then threw
+        (LEG_FAILED, exit 7). The strip is a LOOK leg now, so the rule has no job here: the merge-base behaviour is restored. An unpaced speed leg is accepted by the schema,
+        the shape predicate and the request whatever its visualCapture says (every committed one still says false, with its reason)."""
         headroom = json.loads((DV / HEADROOM_LEGS[0]).read_text(encoding="utf-8"))
         self.jsonschema.validate(headroom, self.schema)
-        self.assertIs(headroom["visualCapture"], False)
         kept = {k: v for k, v in headroom.items() if k not in ("visualCapture", "visualCaptureOptOutReason")}
-        with self.assertRaises(self.jsonschema.ValidationError, msg="unpaced speed leg, capture absent (= on)"):
-            self.jsonschema.validate(kept, self.schema)
-        with self.assertRaises(self.jsonschema.ValidationError, msg="unpaced speed leg, capture true"):
-            self.jsonschema.validate(dict(kept, visualCapture=True), self.schema)
-        paced = dict(kept, generatorArgs={k: v for k, v in kept["generatorArgs"].items() if k not in ("unpaced", "swapInterval")})
-        paced.pop("presentTearingExpectedReason")
-        self.jsonschema.validate(paced, self.schema)   # a paced speed leg keeps the tail as before
+        self.jsonschema.validate(kept, self.schema)
+        self.jsonschema.validate(dict(kept, visualCapture=True), self.schema)
+        shape_script = ("Import-Module '%s' -Force; $s = Get-Content -Raw '%s' | ConvertFrom-Json -NoEnumerate; "
+                        "$r = Get-DvLegSpecShapeRefusal -Spec $s; if ($null -eq $r) { 'SHAPE_OK' } else { 'SHAPE_REFUSED: ' + $r }")
+        for label, spec in (("absent", kept), ("true", dict(kept, visualCapture=True)), ("compliant", headroom)):
+            with tempfile.TemporaryDirectory() as tmp:
+                spec_path = Path(tmp) / f"{label}.json"
+                spec_path.write_text(json.dumps(spec), encoding="utf-8")
+                shape = run_pwsh(["-NoProfile", "-Command", shape_script % (DV / "DualVenueRunner.psm1", spec_path)])
+                self.assertEqual(shape.returncode, 0, shape.stderr)
+                self.assertIn("SHAPE_OK", shape.stdout, f"{label}: {shape.stdout}")
         for path in sorted((DV / "legs").glob("*.json")):
             spec = json.loads(path.read_text(encoding="utf-8"))
             if spec["legType"] == "speed" and (spec.get("generatorArgs") or {}).get("unpaced") is True:
                 self.assertIs(spec.get("visualCapture"), False, path.name)
-        script = ("Import-Module '%s' -Force; $s = Get-Content -Raw '%s' | ConvertFrom-Json; "
-                  "try { $null = Get-DvVisualCaptureRequest -Spec $s; 'NOT_REFUSED' } catch { $_.Exception.Message }")
-        # adversary r1 pass 2 A1 (major, introduced): the refusal must also live in the SHAPE predicate, the one the leg (Invoke-VenueLeg) and every lease-batch /
-        # chain preflight (scalar -LegSpec, -LegSet, plan) call before a lease opens; Get-DvVisualCaptureRequest alone was reached only after the lease.
-        shape_script = ("Import-Module '%s' -Force; $s = Get-Content -Raw '%s' | ConvertFrom-Json -NoEnumerate; "
-                        "$r = Get-DvLegSpecShapeRefusal -Spec $s; if ($null -eq $r) { 'SHAPE_OK' } else { 'SHAPE_REFUSED: ' + $r }")
-        for label, spec in (("absent", kept), ("true", dict(kept, visualCapture=True)), ("compliant headroom spec", headroom)):
-            with tempfile.TemporaryDirectory() as tmp:
-                spec_path = Path(tmp) / f"{label.split()[0]}.json"
-                spec_path.write_text(json.dumps(spec), encoding="utf-8")
-                shape = run_pwsh(["-NoProfile", "-Command", shape_script % (DV / "DualVenueRunner.psm1", spec_path)])
-                self.assertEqual(shape.returncode, 0, shape.stderr)
-                if label == "compliant headroom spec":
-                    self.assertIn("SHAPE_OK", shape.stdout, label)
-                    continue
-                self.assertIn("SHAPE_REFUSED", shape.stdout, f"{label}: {shape.stdout}")
-                self.assertIn("unpaced speed leg", shape.stdout, label)
-                out = run_pwsh(["-NoProfile", "-Command", script % (DV / "DualVenueRunner.psm1", spec_path)])
-                self.assertEqual(out.returncode, 0, out.stderr)
-                self.assertIn("DVE_LEG_SPEC_INVALID", out.stdout, f"{label}: {out.stdout}")
-                self.assertNotIn("NOT_REFUSED", out.stdout, label)
 
     def test_a_speed_leg_capture_opt_out_needs_one_shared_non_blank_reason_before_a_lease_opens(self) -> None:
         """EVERY-FRAME-VISUAL-LEG-SPEC-1 r2 adversary A1 (major, introduced): m16-1243-headroom-unpaced-windowed-s1.json with visualCapture false and a

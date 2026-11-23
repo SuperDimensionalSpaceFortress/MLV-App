@@ -4569,7 +4569,8 @@ if ($ContactSheetEnabled -and $contactSheetDir -and (Test-Path -LiteralPath $con
             # (the receipt writer and validator still refuse a strip of the wrong count whichever composer ran)
             # ("declares" = an argparse declaration line, never the flag's name in a comment or a string: adversary pass-9 A3)
             # (the decode goes through the module's ConvertTo-AttrCudaUtf8String and the test through -cmatch, never a raw .NET member: the template stays inside attr3_publish_write_scan.ps1's R4 allowlist)
-            if (($ContactSheetFrameCount -is [int]) -and $ContactSheetFrameCount -ge 1 -and ((ConvertTo-AttrCudaUtf8String -Bytes $contactSheetComposerPayload.bytes) -cmatch '(?m)^\s*parser\.add_argument\(\s*[\x22\x27]--expected-frames[\x22\x27]')) {
+            # (r7, 855ede6a A3 / c54a57f6 A2: a triple-quoted block is cut out first, so an example line quoted in a docstring is no declaration; an alias before the flag and a space before the paren are still one)
+            if (($ContactSheetFrameCount -is [int]) -and $ContactSheetFrameCount -ge 1 -and (((ConvertTo-AttrCudaUtf8String -Bytes $contactSheetComposerPayload.bytes) -creplace '(?s)([\x22\x27])\1\1.*?\1\1\1', '') -cmatch '(?m)^\s*parser\.add_argument\s*\(\s*(?:[\x22\x27]-[^\x22\x27\s]*[\x22\x27]\s*,\s*)*[\x22\x27]--expected-frames[\x22\x27]')) {
                 $composeArgs += @('--expected-frames', [string]$ContactSheetFrameCount)
             }
             # EVERY-FRAME-VISUAL-LEG-SPEC-1 <<<

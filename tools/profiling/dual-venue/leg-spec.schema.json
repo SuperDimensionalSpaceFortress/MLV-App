@@ -124,8 +124,6 @@
                 "not": { "anyOf": [ { "required": ["look"] }, { "required": ["displayMode"] }, { "required": ["visualCapture"] }, { "required": ["visualCaptureOptOutReason"] }, { "required": ["acceptedEffectiveScale"] }, { "required": ["presentTearingExpectedReason"] } ] } },
       "else": { "not": { "required": ["export"] } } },
     { "if": { "properties": { "visualCapture": { "const": false } }, "required": ["visualCapture"] }, "then": { "required": ["visualCaptureOptOutReason"] }, "else": { "not": { "required": ["visualCaptureOptOutReason"] } } },
-    { "if": { "required": ["legType", "generatorArgs"], "properties": { "legType": { "const": "speed" }, "generatorArgs": { "required": ["unpaced"], "properties": { "unpaced": { "const": true } } } } },
-      "then": { "required": ["visualCapture"], "properties": { "visualCapture": { "const": false } } } },
     { "if": { "required": ["presentTearingExpectedReason"] }, "then": { "required": ["generatorArgs"], "properties": { "generatorArgs": { "required": ["unpaced", "swapInterval"], "properties": { "unpaced": { "const": true }, "swapInterval": { "const": 0 } } } } } },
     { "if": { "required": ["generatorArgs"], "properties": { "generatorArgs": { "required": ["midPlayWindowToggles"], "properties": { "midPlayWindowToggles": { "const": true } } } } }, "then": { "required": ["displayMode"], "properties": { "displayMode": { "const": "windowed" } } } },
     { "if": { "required": ["generatorArgs"], "properties": { "generatorArgs": { "required": ["lookReceipt"] } } }, "then": { "properties": { "legType": { "const": "speed" }, "generatorArgs": { "properties": { "forceLookAssist": { "const": true } } } } } }

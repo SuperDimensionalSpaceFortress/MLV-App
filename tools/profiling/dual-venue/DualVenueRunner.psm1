@@ -3366,8 +3366,10 @@ function Get-DvContactFrameCountVerdict {
     #>
     param($Names, $Requested)
     $ancillary = @('identity-pre-play.png', 'identity-first-present.png', 'identity.json')   # (what the app's writeFirstPresentIdentity publishes beside the frames)
-    $list = @(@($Names) | Where-Object { $null -ne $_ -and -not ([string]$_).EndsWith('\') } | ForEach-Object { [string]$_ })   # (a directory is refused by Read-DvContactFrames)
-    $unexpected = @($list | Where-Object { $_ -cnotmatch '^frame-[0-9]{2,}\.(png|json)$' -and $_ -cnotin $ancillary })
+    $cfvEveryEntry = @(@($Names) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+    $list = @($cfvEveryEntry | Where-Object { -not $_.EndsWith('\') })
+    # (r7, c54a57f6 A5: a directory ('<name>\') is neither a frame nor a diagnostic: it is a stray entry, counted as one, never filtered out of the strip)
+    $unexpected = @($cfvEveryEntry | Where-Object { $_.EndsWith('\') -or ($_ -cnotmatch '^frame-[0-9]{2,}\.(png|json)$' -and $_ -cnotin $ancillary) })
     $pngStems = @($list | Where-Object { $_ -cmatch '^frame-[0-9]{2,}\.png$' } | ForEach-Object { $_.Substring(0, $_.Length - '.png'.Length) })
     $sidecarStems = @($list | Where-Object { $_ -cmatch '^frame-[0-9]{2,}\.json$' } | ForEach-Object { $_.Substring(0, $_.Length - '.json'.Length) })
     $wanted = $(if (($Requested -is [int] -or $Requested -is [long]) -and $Requested -ge 1 -and $Requested -le 999) { [int]$Requested } else { 0 })
@@ -3507,10 +3509,8 @@ function Get-DvLegSpecShapeRefusal {
     $exportRefusal = Get-DvExportShapeRefusal -Spec $Spec -IsExportLeg ($null -ne $legTypeProp -and $legTypeProp.Value -ceq 'export')
     if ($null -ne $exportRefusal) { return $exportRefusal }
     $isLookLeg = ($null -ne $legTypeProp -and $legTypeProp.Value -ceq 'look')
-    # EVERY-FRAME-VISUAL-LEG-SPEC-1 r1 (adversary pass 2 A1): a SPEED leg that runs unpaced says visualCapture false (leg-spec.schema.json). The unpaced Play holds once its
-    # required source frames are consumed (MainWindow.cpp playbackHandling), so the untimed capture tail would show ONE frame six times and still read verdict OK.
-    # Refused here for the leg and every batch preflight alike (scalar, -LegSet and plan), before a lease opens. r2 (adversary A1): the WHOLE capture opt-out rule (a blank reason, a
-    # non-boolean flag, a reason without the opt-out too) is ONE function, Get-DvVisualCaptureOptOutRefusal, which Get-DvVisualCaptureRequest calls as well, so the two cannot disagree.
+    # EVERY-FRAME-VISUAL-LEG-SPEC-1 r2 (adversary A1): the WHOLE capture opt-out rule (a blank reason, a non-boolean flag, a reason without the opt-out) is ONE function,
+    # Get-DvVisualCaptureOptOutRefusal, which Get-DvVisualCaptureRequest calls as well, so the two cannot disagree. (r7: it no longer refuses an unpaced speed leg's capture tail.)
     $optOutRefusal = Get-DvVisualCaptureOptOutRefusal -Spec $Spec
     if ($null -ne $optOutRefusal) { return $optOutRefusal }
     # r7 (adversary r6 A2): a look leg reads look.* before its receipt exists, so a look leg with NO look is refused here too (it threw
@@ -3883,19 +3883,15 @@ function Get-DvVisualCaptureOptOutRefusal {
     The ONE decision on whether a spec's visual-capture opt-out is valid; $null when it is, else the refusal text. Get-DvLegSpecShapeRefusal (before any lease, claim or
     probe) and Get-DvVisualCaptureRequest (after the lease, which throws DVE_LEG_SPEC_INVALID with this text) both call it, so the two can never disagree
     (EVERY-FRAME-VISUAL-LEG-SPEC-1 r2 adversary A1: a reason of twelve spaces passed the pre-lease predicate and the request then threw after the lease was charged).
-    Rule order: an unpaced SPEED leg (not look, not export) whose visualCapture is not exactly false cannot keep the capture tail (an unpaced Play holds once
-    its source frames are consumed, so every tail capture is one frame); a visualCapture that is no boolean (an export leg too: the shape predicate and the request must
+    Rule order: a visualCapture that is no boolean (an export leg too: the shape predicate and the request must
     agree on it, r3 adversary A5); visualCapture false needs a reason that is a JSON string with a non-space character (ConvertFrom-Json turns an ISO-date-looking
     string into a [datetime], which is a string in the JSON and is accepted, r3 adversary A4); a reason without visualCapture false.
     #>
     param($Spec)
-    $legType = [string](Get-DvProp $Spec 'legType')
     $flag = $Spec.PSObject.Properties['visualCapture']
     $reason = $Spec.PSObject.Properties['visualCaptureOptOutReason']
-    $keepsTail = ($null -eq $flag -or $flag.Value -isnot [bool] -or $flag.Value)
-    if ($legType -cnotin @('look', 'export') -and $keepsTail -and ((Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'unpaced') -eq $true)) {
-        return 'an unpaced speed leg cannot keep the visual capture tail (the unpaced Play holds once its source frames are consumed, so every tail capture is one frame): set visualCapture false with a visualCaptureOptOutReason'
-    }
+    # (r7, adversary 855ede6a A1 / c54a57f6 A1: the r1 refusal of an unpaced speed leg that keeps the capture tail is gone, the merge-base behaviour is restored: the chain, which this
+    # card does not change, could not apply it before a claim, and the every-frame strip is a LOOK leg, so the rule had no job in this card)
     if ($null -ne $flag -and $flag.Value -isnot [bool]) { return 'visualCapture must be a boolean' }
     if ($null -ne $flag -and -not $flag.Value) {
         # r4 adversary A7: read the property value as it is. A subexpression or an `if` expression would enumerate a one-element array into the string inside it.
@@ -6076,16 +6072,23 @@ function Test-DvReceiptValid {
                     $sheet = Join-Path $ev.dir 'contact-sheet\sheet.png'
                     $claimed = [string](Get-DvProp (Get-DvProp (Get-DvProp $Receipt 'look') 'contactSheet') 'sha256')
                     if (-not ((Test-Path -LiteralPath $sheet -PathType Leaf) -and (Get-DvSha256OfFile $sheet) -ceq $claimed)) { $sheetOk = $false }
-                    else {
-                        # the raw frames the sheet pair would compose are accepted only as the hashed contact-frames manifest lists them
-                        $frames = Read-DvContactFrames -Receipt $Receipt -EvidenceDir $ev.dir
-                        foreach ($m in @($frames.reasons)) { $invalid.Add([string]$m) }
-                        # EVERY-FRAME-VISUAL-LEG-SPEC-1 r5 (sol r4 B1): a matching sheet hash over a manifest that lists fewer frames than the leg asked for is not the leg's
-                        # strip, and the count the receipt names is the one enumerated (Get-DvContactFrameCountVerdict), never the requested one
-                        if ($frames.ok) {
-                            $countVerdict = Get-DvContactFrameCountVerdict -Names @($frames.files | ForEach-Object { $_.name }) -Requested (Get-DvProp (Get-DvProp $spec 'look') 'contactSheetFrames')
-                            if (-not $countVerdict.ok) { $invalid.Add("CONTACT_FRAME_COUNT_NOT_REQUESTED: $($countVerdict.reason)") }
-                            $claimedFrames = ConvertTo-DvInt64 (Get-DvProp (Get-DvProp (Get-DvProp $Receipt 'look') 'contactSheet') 'frames')
+                    # the raw frames the sheet pair would compose are accepted only as the hashed contact-frames manifest lists them
+                    # (r7, 855ede6a A2 / c54a57f6 A6: a receipt that names a manifest is read for the COUNT whether or not its sheet is there, so a partial strip over a missing sheet is not an
+                    # ADVISORY legacy FAIL; the manifest's own refusals still count only beside a sheet)
+                    $frames = $null
+                    if ($sheetOk -or [string](Get-DvProp (Get-DvProp $Receipt 'evidence') 'contactFramesJsonSha256') -cmatch '^[0-9a-f]{64}$') { $frames = Read-DvContactFrames -Receipt $Receipt -EvidenceDir $ev.dir }
+                    if ($sheetOk) { foreach ($m in @($frames.reasons)) { $invalid.Add([string]$m) } }
+                    # EVERY-FRAME-VISUAL-LEG-SPEC-1 r5 (sol r4 B1): a matching sheet hash over a manifest that lists fewer frames than the leg asked for is not the leg's
+                    # strip, and the count the receipt names is the one enumerated (Get-DvContactFrameCountVerdict), never the requested one
+                    if ($null -ne $frames -and $frames.ok) {
+                        $countVerdict = Get-DvContactFrameCountVerdict -Names @($frames.files | ForEach-Object { $_.name }) -Requested (Get-DvProp (Get-DvProp $spec 'look') 'contactSheetFrames')
+                        if (-not $countVerdict.ok) { $invalid.Add("CONTACT_FRAME_COUNT_NOT_REQUESTED: $($countVerdict.reason)") }
+                        # (r7, 855ede6a A6: the committed count is a whole number from 1 to 999 or nothing can be compared, which is a refusal here, never an acceptance)
+                        elseif ($null -eq $countVerdict.requested) { $invalid.Add('CONTACT_FRAME_COUNT_NOT_REQUESTED: the committed look.contactSheetFrames is not a whole number the strip can be compared with') }
+                        if ($sheetOk) {
+                            # (r7, 855ede6a A7: the receipt's count is the integer the runner writes, never an array or a string that casts to one)
+                            $claimedFramesRaw = Get-DvProp (Get-DvProp (Get-DvProp $Receipt 'look') 'contactSheet') 'frames'
+                            $claimedFrames = $(if ($claimedFramesRaw -is [int] -or $claimedFramesRaw -is [long]) { [long]$claimedFramesRaw } else { $null })
                             if ($null -eq $claimedFrames -or $claimedFrames -ne $countVerdict.pngs) { $invalid.Add("CONTACT_SHEET_FRAMES_NOT_FROM_EVIDENCE: look.contactSheet.frames is not the $($countVerdict.pngs) frame(s) the hashed manifest enumerates") }
                         }
                     }

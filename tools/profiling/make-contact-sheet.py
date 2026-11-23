@@ -138,6 +138,9 @@ def load_frames(frames_dir):
         except (OSError, json.JSONDecodeError) as exc:
             print(f"[make-contact-sheet] WARNING: failed to read {json_path}: {exc}", file=sys.stderr)
             continue
+        if not isinstance(data, dict):
+            print(f"[make-contact-sheet] WARNING: skipping {json_path}: the sidecar is not a JSON object", file=sys.stderr)
+            continue
         if not data.get("saved", False):
             continue
         data["_stem"] = json_path.stem
@@ -420,8 +423,16 @@ def check_expected_frame_stems(stems, expected):
     if expected is None:
         return
     want = ["frame-%02d" % i for i in range(expected)]
-    if sorted(stems) != want:
+    # (compared as sorted lists of the SAME kind: `frame-100` sorts before `frame-11` lexically, so a complete 101-frame set must not be compared with the numeric order)
+    if sorted(stems) != sorted(want):
         raise ValueError(f"expected the saved frames {want[0]} .. {want[-1]} (the leg's requested frames) but found {sorted(stems)}; a strip that is not exactly the requested frames is not composed")
+
+
+def check_expected_frame_image(image_name, stem, expected):
+    """Refuse (ValueError) a tile whose image is not its own sidecar's `<stem>.png` when --expected-frames is set (builtins only). Six sidecars that each name frame-00.png
+    would otherwise paint ONE image six times and read as a six-frame strip. `expected` None accepts any image, the way the composer always behaved."""
+    if expected is not None and image_name != stem + ".png":
+        raise ValueError(f"the image for {stem} resolved to {image_name}, not {stem}.png; a strip whose tiles are not each their own frame is not composed")
 
 
 def compose_sheet(frames, frames_dir, args):
@@ -437,8 +448,12 @@ def compose_sheet(frames, frames_dir, args):
     first_image_path = _resolve_frame_image_path(frames[0], frames_dir)
     if first_image_path is None:
         raise ValueError(f"could not resolve image path for frame index {frames[0].get('index')}")
-    with Image.open(first_image_path) as probe:
-        aspect = probe.height / probe.width if probe.width else 1.0
+    try:
+        with Image.open(first_image_path) as probe:
+            aspect = probe.height / probe.width if probe.width else 1.0
+    except OSError as exc:
+        # (an image that was listed and then cannot be opened is a refused strip, exit 3 -- never a traceback)
+        raise ValueError(f"could not open the image of frame index {frames[0].get('index')}: {exc}") from exc
     tile_size = (TILE_TARGET_WIDTH, int(TILE_TARGET_WIDTH * aspect) + TILE_LABEL_HEIGHT)
 
     font = _load_font(13)
@@ -453,13 +468,17 @@ def compose_sheet(frames, frames_dir, args):
                 file=sys.stderr,
             )
             continue
-        with Image.open(image_path) as full_res:
-            stats = channel_stats(full_res)
-            stats["index"] = sidecar.get("index")
-            stats["display_frame"] = sidecar.get("display_frame")
-            stats["elapsed_ms"] = sidecar.get("elapsed_ms")
-            tile_stats.append(stats)
-            tiles.append(build_tile(full_res, sidecar, tile_size, font))
+        check_expected_frame_image(image_path.name, sidecar.get("_stem", ""), expected)
+        try:
+            with Image.open(image_path) as full_res:
+                stats = channel_stats(full_res)
+                stats["index"] = sidecar.get("index")
+                stats["display_frame"] = sidecar.get("display_frame")
+                stats["elapsed_ms"] = sidecar.get("elapsed_ms")
+                tile_stats.append(stats)
+                tiles.append(build_tile(full_res, sidecar, tile_size, font))
+        except OSError as exc:
+            raise ValueError(f"could not open the image of frame index {sidecar.get('index')}: {exc}") from exc
 
     if not tiles:
         raise ValueError("every sidecar's image failed to resolve; nothing to compose")

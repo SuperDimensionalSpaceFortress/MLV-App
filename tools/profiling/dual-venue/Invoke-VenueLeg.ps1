@@ -945,6 +945,10 @@ if ($isLook -and $artifactsShare) {
             Invoke-DvCollect 'write' $framesLocal { [IO.File]::WriteAllBytes($framesLocal, $framesBytes) }
             $receipt.evidence.contactFramesJsonSha256 = Get-DvSha256OfBytes $framesBytes
         }
+        else {
+            # (r7, c54a57f6 A6 companion: a sheet or a marker with NO raw directory enumerated zero frames, which is the typed count refusal, not a skipped check)
+            $frameCountVerdict = Get-DvContactFrameCountVerdict -Names @() -Requested $spec.look.contactSheetFrames
+        }
     }
     # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1: a look.pairedSeek leg's paused captures (the job's paired-seek\contact-sheet\raw), copied
     # beside the in-pass frames and listed by name with their sha256. Absent on the share: the receipt says so (pairedSeek.count 0, path null).
@@ -989,6 +993,16 @@ if ($isLook -and $artifactsShare) {
         Invoke-DvCollect 'copy' $sheetShare { Copy-Item -LiteralPath $sheetShare -Destination $sheetLocal }
         $sheetSha = Invoke-DvCollect 'hash' $sheetLocal { Get-DvSha256OfFile $sheetLocal }
         $sheetBytes = Invoke-DvCollect 'size' $sheetLocal { (Get-Item -LiteralPath $sheetLocal).Length }
+        # (r7, 855ede6a A5: a composer that skipped an image it could not resolve wrote a sheet of fewer tiles than the raw pairs; its own stats.json says how many it painted, and a
+        # sheet whose tile count is not the enumerated frame count is the typed count refusal)
+        $statsLocal = Join-Path $sheetDir 'stats.json'
+        if ($null -ne $frameCountVerdict -and $frameCountVerdict.ok -and (Test-Path -LiteralPath $statsLocal -PathType Leaf)) {
+            $tileCount = $null
+            try { $tileCount = (Get-Content -LiteralPath $statsLocal -Raw | ConvertFrom-Json -ErrorAction Stop).tile_count } catch { $tileCount = $null }
+            if (($tileCount -is [int] -or $tileCount -is [long]) -and [long]$tileCount -ne [long]$frameCountVerdict.pngs) {
+                $frameCountVerdict = [pscustomobject]@{ ok = $false; pngs = $frameCountVerdict.pngs; sidecars = $frameCountVerdict.sidecars; requested = $frameCountVerdict.requested; reason = "the composed sheet holds $tileCount tile(s) (its stats.json tile_count) but the strip enumerates $($frameCountVerdict.pngs) frame PNG(s); a sheet that does not show every enumerated frame is not the leg's strip" }
+            }
+        }
         $sheetInfo = [ordered]@{ path = $sheetLocal; sha256 = $sheetSha; bytes = $sheetBytes; frames = [int]$enumeratedFrames; backend = $Backend; rawFramesDir = $rawLocal }
         if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir)) {
             $sheetCopy = Join-Path $SheetCopyDir "sheet-$($spec.legId)-$Venue-$Backend-$lookFlavor.png"
