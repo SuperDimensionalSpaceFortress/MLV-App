@@ -2609,6 +2609,49 @@ $out | ConvertTo-Json -Compress
         self.assertTrue(r["throwClaimLeft"], r)
         self.assertFalse(r["throwClaimAfterLaterClose"], f"the nonce was dropped when the release at the close threw: {r}")
 
+    def test_tail1_r4_adv_a1_a_ticket_folder_that_goes_away_between_the_two_checks_of_a_strict_listing_throws(self) -> None:
+        # r4 adversary A1 (introduced by K3): -ThrowOnListError checked the folder once to throw and then again to enumerate, so a folder that became unavailable between the two answered no rows without an error (an "empty line").
+        # The module's Test-Path is shadowed so the second answer for the ticket folder is false; one check (or none shadowed) lists normally.
+        r = self.ps("""
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d
+& (Get-Module VenueChain) {
+    $script:dirChecks = 0
+    function script:Test-Path {
+        param([string]$LiteralPath, [string]$PathType)
+        $real = Microsoft.PowerShell.Management\\Test-Path -LiteralPath $LiteralPath -PathType $PathType
+        if ($LiteralPath -like '*bachelor.tickets') { $script:dirChecks++; if ($script:dirChecks -ge 2) { return $false } }
+        $real
+    }
+}
+$threw = $false; $rows = -1
+try { $rows = @(Get-VenueTickets -Venue bachelor -ClaimDir $d -ThrowOnListError).Count } catch { $threw = $true }
+[pscustomobject]@{ threw = $threw; rows = $rows } | ConvertTo-Json -Compress
+""")
+        self.assertNotEqual((r["threw"], r["rows"]), (False, 0), f"a folder that went away between the two checks answered an empty line without an error: {r}")
+
+    def test_tail1_r4_adv_a5_a_close_whose_diagnostic_line_cannot_be_written_still_ends_the_ticket_and_keeps_the_nonce(self) -> None:
+        # r4 adversary A5 (introduced by K2): the CLAIM_PENDING_RELEASE_NOT_RELEASED line is written before the ticket is removed; a chain.log that cannot be written (a handle held after the deadline line) made L throw there, so the close aborted
+        # before the ticket was removed and before the chain's final retry and result. A diagnostic line is best effort (r7 A15's rule): the ticket still ends and the nonce is still kept.
+        r = self.ps(f"""
+$ast = [Management.Automation.Language.Parser]::ParseFile('{RUNNER}', [ref]$null, [ref]$null)
+$fn = $ast.Find({{ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Close-LegTicket' }}, $true)
+Invoke-Expression $fn.Extent.Text
+function L([string]$m) {{ if ($m -like 'CLAIM_PENDING_RELEASE*') {{ throw 'chain.log is held by another handle' }} }}
+$Venue = 'bachelor'; $ClaimDir = $d; $TicketKeepMax = 2
+$cp = Join-Path $d 'bachelor.claim.json'
+$g = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$script:ticket = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$tp = $script:ticket.path
+$script:ticket | Add-Member -NotePropertyName pendingReleaseNonce -NotePropertyValue ([string]$g.claim.nonce) -Force
+$script:ticketKeeps = 0
+$hold = [IO.File]::Open($cp, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+$threw = $false; try {{ Close-LegTicket 'leg-1' 'TICKET_ENDED' 'test' }} catch {{ $threw = $true }}
+$hold.Dispose()
+[pscustomobject]@{{ threw = $threw; ticketFileLeft = (Test-Path -LiteralPath $tp); strandedKept = @($script:strandedClaimNonces).Count }} | ConvertTo-Json -Compress
+""")
+        self.assertFalse(r["threw"], f"an unwritable diagnostic line aborted the close: {r}")
+        self.assertEqual((r["ticketFileLeft"], r["strandedKept"]), (False, 1), f"the close stopped before the ticket was removed or the nonce kept: {r}")
+
     def give_back_scenario(self, name: str, release_seam: str, env: dict) -> dict:
         # the A7 line-up (B takes the claim as head while A is in cooldown, A flips to waiting while B holds it, so B must give the claim back), with ONE seam inside the give-back
         from unittest import mock
