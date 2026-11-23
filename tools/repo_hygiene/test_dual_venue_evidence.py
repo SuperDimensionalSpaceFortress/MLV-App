@@ -19610,7 +19610,9 @@ class DriftLegSpecTests(unittest.TestCase):
         text = (Path(__file__).resolve().parents[2] / "platform" / "qt" / "PlaybackFrameRange.h").read_text(encoding="utf-8")
         fraction = float(re.search(r"constexpr double kMinSustainedPaceFraction = ([0-9.]+);", text).group(1))
         margin_ms = int(re.search(r"constexpr int kPlaySafetyMarginMs = (\d+);", text).group(1))
-        return math.ceil(play_seconds * clip_fps) / (play_seconds / fraction + margin_ms / 1000.0 - self.FIRST_PRESENT_S)
+        # r5 adversary pass 8 A4: the first frame is presented at FIRST_PRESENT_S and the pace then has to carry whole_frames - 1 transitions (the app counts the first frame
+        # and 599 transitions for 10 s of 59.94), so the numerator is one less than the frame count.
+        return (math.ceil(play_seconds * clip_fps) - 1) / (play_seconds / fraction + margin_ms / 1000.0 - self.FIRST_PRESENT_S)
 
     def test_the_20_second_window_cannot_host_a_cap_one_leg_and_the_w10_family_can(self) -> None:
         """r4: five of the six cap-1 20 s CUDA legs ended PaceTooSlow (INVALID, uncounted). The floor a window sets on the CUDA (gated) backend is a function of the app's
@@ -19663,6 +19665,19 @@ class DriftLegSpecTests(unittest.TestCase):
                 body = {k: v for k, v in arm.items() if k not in ("visualCapture", "visualCaptureOptOutReason")}
                 self.assertEqual(dict(spec, legId=arm["legId"]), body)
                 self.assertEqual(list(spec), [k for k in arm if k not in ("visualCapture", "visualCaptureOptOutReason")], "the arm's keys in the arm's order")
+
+    def test_a_visual_twin_is_named_as_one_and_no_legset_can_report_it_as_a_speed_cell(self) -> None:
+        """r5 adversary pass 8 A1: a twin's receipt can read PASS with a bare observer-perturbed fps (the runner counts a NOT_CAPTURED leg, base behaviour shared by every
+        speed leg), and a legset's matrix table would print that fps as a measured cell. So (1) every twin says so in its legId (the reader that keeps its fps out of an arm
+        keys on '-visual-'), and (2) no legset in legsets/ lists a drift leg at all: a twin only ever runs through a lease plan whose rows are labelled by arm."""
+        for rel in DRIFT_VISUAL_LEGS:
+            with self.subTest(leg=rel):
+                self.assertIn("-w10-visual-unpaced-", self.load(rel)["legId"])
+        self.assertEqual(sorted(p.name for p in (DV / "legs").glob("*-visual-*.json")), sorted(Path(r).name for r in DRIFT_VISUAL_LEGS), "a '-visual-' leg outside the registered twins")
+        for path in sorted((DV / "legsets").glob("*.json")):
+            with self.subTest(legset=path.name):
+                text = path.read_text(encoding="utf-8")
+                self.assertNotIn("m16-1457-drift-", text, "a drift leg (a visual twin above all) in a legset would print its fps as a measured matrix cell")
 
     def test_the_pcore_arm_adds_only_the_affinity_keys_the_cap_and_the_two_partition_criteria(self) -> None:
         rel = "legs/m16-1457-drift-pcore12-unpaced-fullscreen-s1.json"
