@@ -356,6 +356,31 @@ class VenueChainRunnerTests(unittest.TestCase):
         self.assertIn("LANES blocking=1", out_b)
         self.assertNotIn("LEG_RAN", out_a + out_b)
 
+    def test_tail1_r5_b1_a_chain_log_held_against_writes_never_ends_the_chain_before_its_result(self) -> None:
+        # VENUE-FIFO-ADVERSARY-TAIL-1 r5 (sol r4 B1, class sweep): every chain.log write went through Add-Content under ErrorActionPreference Stop, so a log another handle held against writes (FileShare.Read
+        # only, as a reader or a scan holds it) ended the chain at the first line it wrote: at a ticket close before the final nonce retry, or at CHAIN_RESULT. The log is held for the whole run here; the
+        # chain must still run its leg, end 0 and print its typed CHAIN_RESULT, and say on stderr that the log could not be written.
+        import ctypes
+        from ctypes import wintypes
+        rd = self.case / "lane-held-log"
+        rd.mkdir(parents=True)
+        log = rd / "chain.log"
+        log.write_text("", encoding="utf-8")
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        h = k32.CreateFileW(str(log), 0x80000000, 0x1, None, 3, 0x80, None)   # GENERIC_READ, FILE_SHARE_READ only, OPEN_EXISTING
+        self.assertNotEqual(h, wintypes.HANDLE(-1).value, f"the fixture could not hold the log: {ctypes.get_last_error()}")
+        try:
+            r = self.run_chain(rd, [self.specs[0]])
+        finally:
+            k32.CloseHandle(h)
+        self.assertEqual(r.returncode, 0, f"a held chain.log ended the chain (exit {r.returncode}):\n{r.stdout}\n{r.stderr}")
+        res = chain_result(r.stdout)
+        self.assertEqual([l["status"] for l in res["legs"]], ["RAN"], r.stdout)
+        self.assertIn("CHAIN_LOG_WRITE_FAILED", r.stderr, f"the unwritten log lines were not said on stderr:\n{r.stderr}")
+
     def test_two_concurrent_chains_never_deadlock_and_the_second_runs_after_the_first_releases(self) -> None:
         rd_a, rd_b = self.case / "lane-A", self.case / "lane-B"
         env = self.env(FAKE_QUIET_SLEEP_PRE="1", FAKE_LEG_SLEEP="5")
