@@ -928,6 +928,29 @@ int dualisoAliasMapReinitDispatchForTesting(void)
     return g_dualiso_alias_use_avx2;
 }
 
+/* Test-only hook: put back a dispatch value a test saved from
+ * dualisoAliasMapAvx2Active(), without re-reading the environment (which may
+ * have changed since that value was cached). AVX2 is only set where this build
+ * has the kernels and the host supports them. Not in the public header; tests
+ * forward-declare it. */
+int dualisoAliasMapRestoreDispatchForTesting(int use_avx2);
+int dualisoAliasMapRestoreDispatchForTesting(int use_avx2)
+{
+    int restored = 0;
+    pthread_once(&g_dualiso_alias_dispatch_once, dualiso_alias_dispatch_init);
+#ifdef DUALISO_AVX2_AVAILABLE
+    if (use_avx2)
+    {
+        __builtin_cpu_init();
+        restored = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+    }
+#else
+    (void)use_avx2;
+#endif
+    g_dualiso_alias_use_avx2 = restored;
+    return g_dualiso_alias_use_avx2;
+}
+
 /* ====================================================================== *
  * Phase E1 — AMaZE edge-direction estimator AVX2 dispatch.
  *
@@ -4562,7 +4585,10 @@ static inline void build_alias_map(struct raw_info raw_info,
                 (alias_aux[x+0 + (y-6) * w] + alias_aux[x-6 + (y+0) * w] + alias_aux[x+6 + (y+0) * w] + alias_aux[x+0 + (y+6) * w]) * 139 / 1024 +
                 (alias_aux[x-2 + (y-6) * w] + alias_aux[x+2 + (y-6) * w] + alias_aux[x-6 + (y-2) * w] + alias_aux[x+6 + (y-2) * w] + alias_aux[x-6 + (y+2) * w] + alias_aux[x+6 + (y+2) * w] + alias_aux[x-2 + (y+6) * w] + alias_aux[x+2 + (y+6) * w]) * 111 / 1024 +
                 (alias_aux[x-2 + (y-6) * w] + alias_aux[x+2 + (y-6) * w] + alias_aux[x-6 + (y-2) * w] + alias_aux[x+6 + (y-2) * w] + alias_aux[x-6 + (y+2) * w] + alias_aux[x+6 + (y+2) * w] + alias_aux[x-2 + (y+6) * w] + alias_aux[x+2 + (y+6) * w]) * 57 / 1024;
-                alias_map[x + y * w] = c;
+                /* c can exceed 65535 (the 21 tap weights sum to ~13.6);
+                 * saturate like build_alias_map_gaussian_row_avx2 instead of
+                 * letting the uint16_t store wrap a strong alias to a weak one. */
+                alias_map[x + y * w] = MIN(c, 65535);
             }
         }
     }

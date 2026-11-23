@@ -200,8 +200,9 @@ TEST( RenderedVideoRunner, ArgumentsWithOutputPathRefuseUnreadyPlanOrEmptyPath )
  *
  * This is the level the defect actually lives at, so it is the level that is pinned. An
  * end-to-end test would need both a pre-existing output AND a resolvable ffprobe, which is
- * not reachable from this suite -- MLVApp ships no ffprobe and the resolver searches PATH
- * and the ffmpeg sibling directory, neither of which a console test controls.
+ * not reachable from this suite -- MLVApp ships no ffprobe and the resolver searches the
+ * application directory, PATH and the ffmpeg sibling directory, none of which a console test
+ * controls.
  * ------------------------------------------------------------------------- */
 
 /* [R-1], LANE-4 review of 29af0972..6d52f0ae, folded into this block per fable SEQ 1217 [2].
