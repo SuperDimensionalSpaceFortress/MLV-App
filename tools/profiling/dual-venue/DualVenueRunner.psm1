@@ -4678,6 +4678,14 @@ $script:ExportRenderedClipStages = @('export_pipe_drain', 'export_verify')      
 $script:ExportRenderedNesting = 'raw_uint16 (and its disk_read, decompress) and llrawproc (and its llrawproc_dual_iso) nest inside debayered_frame; debayered_frame and processing are disjoint children of processed16_total, the share denominator; export_scale and export_pipe_write follow it per frame, export_pipe_drain and export_verify once per clip'
 $script:ExportSuccessor = 'EXPORT-RENDER-PIPE-TIMING-1'
 $script:ExportRenderPipeOlderBuild = "a build before $($script:ExportSuccessor)"
+# r1 fix 1 (adversary A2 on 00a7cf09): the BASE reader's ProRes shape (2b796198), reproduced exactly for a receipt written before this card over old-format evidence
+# (Get-DvExportEvidence -LegacyRenderShape; Test-DvExportReceiptValid chooses it when the stored metrics carry no renderPipeTimed). Pinned by
+# tools/repo_hygiene/fixtures/export_prores_base_2b796198_evidence.json, the base reader's own output.
+$script:ExportRenderedLegacyStages = @('raw_uint16', 'raw_uint16_disk_read', 'raw_uint16_decompress', 'llrawproc', 'debayered_frame', 'processing', 'processed16_total')
+$script:ExportRenderedLegacyNesting = 'raw_uint16 (and its disk_read, decompress) and llrawproc nest inside debayered_frame; debayered_frame and processing are disjoint children of processed16_total, the share denominator'
+$script:ExportRenderedLegacyDualIso = "$($script:ExportSuccessor): the rendered export path records no dual-ISO stage, so a ProRes leg cannot read its clip's dual-ISO class"
+$script:ExportRenderedLegacyUntimed = "$($script:ExportSuccessor): batch wall per frame minus processed16_total (clip open, pipe write, ffmpeg back-pressure, finish and verify) is not timed per stage by the app"
+$script:ExportRenderedLegacyDrainVerify = "$($script:ExportSuccessor): the rendered path times no drain or verify stage"
 $script:ExportEvidenceFiles = @('summary.json', 'batch.log', 'export-profile.json', 'stage-timing.log', 'output-manifest.json')
 
 # r8 fix 2 (adversary r8 A1): the PARENT/CHILD half of the stage schema. A published share is of work the stage's parent contains: a child whose mean exceeds its parent's is
@@ -4905,6 +4913,15 @@ $script:ExportRenderedSumGroups = @(@(@('debayered_frame', 'processing'), 'proce
     # disk_read + decompress + its own remainder, so a leaf set uses raw_uint16 OR its two children, never both.)
     @(@('raw_uint16_disk_read', 'raw_uint16_decompress', 'llrawproc'), 'debayered_frame'),
     @(@('raw_uint16', 'llrawproc', 'processing'), 'processed16_total'), @(@('raw_uint16_disk_read', 'raw_uint16_decompress', 'llrawproc', 'processing'), 'processed16_total'))
+# EXPORT-RENDER-PIPE-TIMING-1 r1 fix 1 (adversary A1 on 00a7cf09): llrawproc_dual_iso is a LEAF of llrawproc, so a run that does not publish llrawproc holds the dual-ISO figure
+# in llrawproc's place: every group above that holds llrawproc gains a twin with llrawproc_dual_iso instead (raw_uint16 30 + dual-ISO 30 inside a 40 ms debayered_frame read PASS).
+# Derived, not hand-listed, so a group added above gets its twin too; with llrawproc published the twin is the weaker check and never the deciding one.
+$script:ExportRenderedSumGroups = @(& {
+        foreach ($g in $script:ExportRenderedSumGroups) { , $g }
+        foreach ($g in $script:ExportRenderedSumGroups) {
+            if (@($g[0]) -ccontains 'llrawproc') { , @([string[]]@(@($g[0]) | ForEach-Object { if ($_ -ceq 'llrawproc') { 'llrawproc_dual_iso' } else { $_ } }), [string]$g[1]) }
+        }
+    })
 
 function Get-DvExportContainmentProblem {
     # $null, or the EXPORT_STAGE_CONTAINMENT_MISMATCH problem naming the first child (and the count) whose mean exceeds its parent's, or the first disjoint group whose summed means do.
@@ -5211,7 +5228,10 @@ function Get-DvExportEvidence {
     #>
     param([Parameter(Mandatory)][string]$Format, [Parameter(Mandatory)][int]$MaxFrames, [Parameter(Mandatory)][bool]$DualIsoExpected, [string]$ExpectedBuildId = '',
           [AllowNull()][AllowEmptyString()][string]$ProfileText = '', [AllowNull()][AllowEmptyString()][string]$StageLogText = '',
-          [AllowNull()][AllowEmptyString()][string]$BatchLogText = '', [AllowNull()][AllowEmptyString()][string]$OutputManifestText = '')
+          [AllowNull()][AllowEmptyString()][string]$BatchLogText = '', [AllowNull()][AllowEmptyString()][string]$OutputManifestText = '',
+          # EXPORT-RENDER-PIPE-TIMING-1 r1 fix 1 (adversary A2): reproduce the base reader's ProRes metrics and stage table for a stage log that carries none of that card's stages
+          # (a receipt written before it re-derives equal); ignored for CDNG and for any log that carries one of them
+          [switch]$LegacyRenderShape)
     $problems = [System.Collections.Generic.List[string]]::new()
     $m = [ordered]@{ framesRequested = $MaxFrames; framesExported = $null; exportFramesSkipped = $null; exportFramesFailed = $null; profileFramesSucceeded = $null
                      profileFramesFailed = $null; stageFramesSeen = $null; dualIsoActiveFrames = $null; dualIsoClassAgrees = $null; outputFileCount = $null; outputBytes = $null
@@ -5477,6 +5497,28 @@ function Get-DvExportEvidence {
                                       -and $clipRecords['export_pipe_drain'].Count -eq 1 -and $clipRecords['export_verify'].Count -eq 1)
             }
         }
+        # r1 fix 1 (adversary A2): the base reader's shape, for old-format evidence only (no log, or a log with none of the new stages). The problems and the outcome are the
+        # same either way (an old-format log adds no problem); only the published metrics and stage table are projected back to the fields and texts the base wrote.
+        if ($LegacyRenderShape) {
+            $newStageSeen = $false
+            if (-not [string]::IsNullOrEmpty($StageLogText)) {
+                $newStageSeen = (@('llrawproc_dual_iso') + @($script:ExportRenderedOutsideDenominator) | Where-Object { $perStage[$_].Count -gt 0 }).Count -gt 0 -or
+                                (@($script:ExportRenderedClipStages) | Where-Object { $clipRecords[$_].Count -gt 0 }).Count -gt 0
+            }
+            if (-not $newStageSeen) {
+                $m.Remove('renderPipeTimed'); $m.Remove('renderPipeTimedCouldNotCheck')
+                $m['dualIsoActiveFramesCouldNotCheck'] = $script:ExportRenderedLegacyDualIso; $m['dualIsoClassAgreesCouldNotCheck'] = $script:ExportRenderedLegacyDualIso
+                if ($null -ne $stages) {
+                    $legacyRows = [ordered]@{}
+                    foreach ($name in $script:ExportRenderedLegacyStages) { $legacyRows[$name] = $stages.rows[$name] }
+                    $stages.rows = $legacyRows
+                    $stages.Remove('clipRows')
+                    $stages.nesting = $script:ExportRenderedLegacyNesting
+                    $stages.untimed = $script:ExportRenderedLegacyUntimed
+                    $stages.drainVerify = $script:ExportRenderedLegacyDrainVerify
+                }
+            }
+        }
     }
     [pscustomobject]@{ metrics = [pscustomobject]$m; stages = $stages; problems = @($problems); classMismatch = $classMismatch; classDetail = $classDetail; containmentAdvisory = [string[]]@($containmentAdvisory) }
 }
@@ -5603,8 +5645,13 @@ function Test-DvExportReceiptValid {
         # r8 (adversary r7 pass A4): the Int64 parse admits 2147483648, and the [int] narrowing below threw before this function could return its typed INVALID
         elseif ($exit -lt [int64][int]::MinValue -or $exit -gt [int64][int]::MaxValue) { $Invalid.Add('EVIDENCE_UNPARSABLE: um-run.json exitCode is outside the 32-bit range a process exit code has') }
         else {
+            # EXPORT-RENDER-PIPE-TIMING-1 r1 fix 1 (adversary A2): a ProRes receipt whose stored metrics carry no renderPipeTimed was written by a reader before that card; over
+            # old-format evidence it is re-derived in that reader's shape (a log that carries one of the new stages is re-derived in the new shape whatever the receipt says)
+            $storedMetrics = Get-DvProp $Receipt 'metrics'
+            $legacyShape = ([string]$specExport.format -ceq 'prores') -and $storedMetrics -is [System.Management.Automation.PSCustomObject] -and $null -eq $storedMetrics.PSObject.Properties['renderPipeTimed']
             $ev = Get-DvExportEvidence -Format ([string]$specExport.format) -MaxFrames ([int]$specExport.maxFrames) -DualIsoExpected ([bool]$specExport.dualIsoExpected) -ExpectedBuildId ([string](Get-DvProp $summary 'sourceCommit')) `
-                -ProfileText ([string]$texts['export-profile.json']) -StageLogText ([string]$texts['stage-timing.log']) -BatchLogText ([string]$texts['batch.log']) -OutputManifestText ([string]$texts['output-manifest.json'])
+                -ProfileText ([string]$texts['export-profile.json']) -StageLogText ([string]$texts['stage-timing.log']) -BatchLogText ([string]$texts['batch.log']) -OutputManifestText ([string]$texts['output-manifest.json']) `
+                -LegacyRenderShape:$legacyShape
             if (-not (Test-DvJsonEquivalent (Get-DvProp $Receipt 'metrics') (ConvertFrom-Json (ConvertTo-Json $ev.metrics -Depth 8 -Compress)))) { $Invalid.Add('METRICS_NOT_FROM_EVIDENCE: the receipt metrics are not the export metrics of the hashed files') }
             if (-not (Test-DvJsonEquivalent (Get-DvProp $exportBlock 'stages') $(if ($null -eq $ev.stages) { $null } else { ConvertFrom-Json (ConvertTo-Json $ev.stages -Depth 8 -Compress) }))) { $Invalid.Add('METRICS_NOT_FROM_EVIDENCE: export.stages is not the stage table of the hashed files') }
             $role = [string](Get-DvProp (Get-DvProp $Receipt 'venue') 'role')
