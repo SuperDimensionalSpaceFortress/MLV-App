@@ -6979,7 +6979,9 @@ void getMlvRawFrameDebayered(mlvObject_t * video, uint64_t frameIndex, uint16_t 
     /* CPU-S1-1457-HEAVY-SPEC-AND-STALE-FIELDS-1: the debayered-frame and processing records are this thread's last-run
      * values, and the CPU Debayered16 route never refreshed them, so every playback_smoke.frame row of a cpu leg carried
      * the render thread's first (warm-up) frame, not the frame's own (debayered_frame_ms 345.418 on all 475 rows of a
-     * 1243 s1 leg). A cache hit below runs no debayer, and this route runs no processing stage: both read 0 now. */
+     * 1243 s1 leg). A cache hit below runs no debayer, and this route runs no processing stage: both read 0 now. The three entries
+     * set the thread record only and publish no "debayered_frame" stage-timing record: getMlvProcessedFrame16_with_scale calls
+     * this entry inside its own published "debayered_frame" interval, so a second publish would count the nested work twice. */
     g_mlv_last_debayered_frame_ms = 0.0;
     g_mlv_last_processing_ms = 0.0;
     mlv_cache_ensure_window(video, frameIndex);
@@ -7055,7 +7057,6 @@ void getMlvRawFrameDebayered(mlvObject_t * video, uint64_t frameIndex, uint16_t 
     const double debayer_start = mlv_stage_timing_now();
     get_mlv_raw_frame_debayered(video, frameIndex, raw_frame, current_frame, doesMlvAlwaysUseAmaze(video));
     g_mlv_last_debayered_frame_ms = (mlv_stage_timing_now() - debayer_start) * 1000.0;
-    mlv_stage_timing_note_elapsed("debayered_frame", frameIndex, g_mlv_last_debayered_frame_ms);
     pthread_mutex_lock(&video->g_mutexFind);
     memcpy(outputFrame, video->rgb_raw_current_frame, frame_size);
     video->current_cached_frame_active = 1;
@@ -7109,7 +7110,6 @@ int getMlvRawFrameDebayeredFromReconnedRaw16(mlvObject_t * video,
         getMlvCpuCores(video),
         "get_mlv_raw_frame_debayered_from_reconned_raw16");
     g_mlv_last_debayered_frame_ms = (mlv_stage_timing_now() - debayer_start) * 1000.0;
-    mlv_stage_timing_note_elapsed("debayered_frame", frameIndex, g_mlv_last_debayered_frame_ms);
     return debayered;
 }
 
@@ -7201,7 +7201,6 @@ int getMlvRawFrameDebayeredFromReducedReconnedRaw16(mlvObject_t * video,
         memcpy(outputFrame + (size_t)y * row_words, last_row, row_words * sizeof(uint16_t));
     }
     g_mlv_last_debayered_frame_ms = (mlv_stage_timing_now() - debayer_start) * 1000.0;
-    mlv_stage_timing_note_elapsed("debayered_frame", frameIndex, g_mlv_last_debayered_frame_ms);
     if (outWidth) *outWidth = out_w;
     if (outHeight) *outHeight = out_h;
     return 1;
