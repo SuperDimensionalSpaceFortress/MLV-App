@@ -5179,6 +5179,25 @@ class ContactFramesAreTheRequestedCountTests(EvidenceFactory, ModuleMutationMixi
         self.expect(got[0], "INVALID", "empty png", "CONTACT_FRAME_")
         self.expect(got[1], "INVALID", "saved false", "CONTACT_FRAME_")
 
+    def test_r7_a_saved_value_must_be_the_json_boolean_and_a_committed_count_above_sixty_is_refused(self) -> None:
+        """pass f0c36fcc A1: saved:1 / "True" coerced to a match under -cne, and a root-array sidecar hid the member; A7: a committed count of 61 is not runnable (schema 1..60)."""
+        cases = []
+        for tag, sidecar in (("one", {"index": 5, "saved": 1, "path": "frame-05.png"}), ("text", {"index": 5, "saved": "True", "path": "frame-05.png"}),
+                             ("arr", [{"saved": False}, {"saved": False}])):
+            frames = stub_raw_frames(6)
+            frames["frame-05.json"] = json.dumps(sidecar).encode("utf-8")
+            cases.append((self.receipt_over(f"sv-{tag}", frames)[0], None))
+        for result in self.status_batch(self.repo, cases):
+            self.expect(result, "INVALID", "a saved value that is not true", "CONTACT_FRAME_")
+        spec = self.write_spec(leg_type="look", contact_frames=6)
+        doc = json.loads(spec.read_text(encoding="utf-8"))
+        doc["look"]["contactSheetFrames"] = 61
+        spec.write_text(json.dumps(doc), encoding="utf-8")
+        repo = self.prod_repo(leg_type="look", spec=spec)
+        ev = self.evidence("c61", sheet=True, backend="cpu", leg_type="look", raw_frames=stub_raw_frames(61))
+        receipt = self.receipt_for(repo, ev, backend="cpu", leg_type="look", spec_path=spec)
+        self.expect(self.status_batch(repo, [(receipt, None)])[0], "INVALID", "61 frames", "CONTACT_FRAME_COUNT_NOT_REQUESTED")
+
     def test_r7_a_sheet_with_no_raw_directory_is_the_typed_count_refusal(self) -> None:
         """c54a57f6 A6 companion: a sheet and no raw directory and no marker left frameCountVerdict null, so the leg skipped the typed refusal."""
         self.write_artifacts(sheet=True, raw_frames=False)
@@ -5197,14 +5216,24 @@ class ContactFramesAreTheRequestedCountTests(EvidenceFactory, ModuleMutationMixi
         self.assertEqual(run["outcome"], "INVALID", run["outcomeDetail"])
         self.assertIn("CONTACT_FRAME_COUNT_NOT_REQUESTED", run["outcomeDetail"])
 
+    def test_r7_a_stats_tile_count_that_is_not_a_whole_number_is_unreadable_evidence(self) -> None:
+        """pass f0c36fcc A4: tile_count "5" (a string) never set a mismatch."""
+        self.write_artifacts(sheet=True, raw_frames=True, raw_frame_count=6)
+        (self.artifacts / "contact-sheet").mkdir(parents=True, exist_ok=True)
+        (self.artifacts / "contact-sheet" / "stats.json").write_text(json.dumps({"schema": "contact-sheet-stats.v1", "tile_count": "6"}), encoding="utf-8")
+        proc, run = self.run_leg("ultra-magnus", self.spec, extra=["-Backend", "cpu"])[:2]
+        self.assertIsNotNone(run, proc.stdout + proc.stderr)
+        self.assertEqual(run["outcome"], "INVALID", run["outcomeDetail"])
+        self.assertIn("CONTACT_FRAME_COUNT_NOT_REQUESTED", run["outcomeDetail"])
+
     def test_r7_the_composer_paints_each_frame_from_its_own_png_and_never_raises_past_exit_3(self) -> None:
         """855ede6a A4 / c54a57f6 A3: six sidecars that all name frame-00.png painted one image six times. c54a57f6 A8: a `null` sidecar or an unreadable image escaped as exit 1.
         c54a57f6 A9: 101 canonical stems sorted lexically and a complete set read as a mismatch."""
         import ast
         import tempfile as _tempfile
         source = (ROOT / "tools" / "profiling" / "make-contact-sheet.py").read_text(encoding="utf-8")
-        body = [n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name in ("check_expected_frame_image", "check_expected_frame_stems", "load_frames")]
-        self.assertEqual(sorted(n.name for n in body), ["check_expected_frame_image", "check_expected_frame_stems", "load_frames"])
+        body = [n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name in ("check_expected_frame_image", "check_expected_frame_stems", "check_expected_frame_dir", "load_frames")]
+        self.assertEqual(sorted(n.name for n in body), ["check_expected_frame_dir", "check_expected_frame_image", "check_expected_frame_stems", "load_frames"])
         namespace: dict = {"json": json, "sys": __import__("sys"), "Path": Path}
         exec(compile(ast.Module(body=body, type_ignores=[]), "make-contact-sheet.py:r7", "exec"), namespace)
         image_check = namespace["check_expected_frame_image"]
@@ -5213,6 +5242,19 @@ class ContactFramesAreTheRequestedCountTests(EvidenceFactory, ModuleMutationMixi
         with self.assertRaises(ValueError):
             image_check("frame-00.png", "frame-03", 6)
         namespace["check_expected_frame_stems"]([f"frame-{i:02d}" for i in range(101)], 101)
+        # pass f0c36fcc A5: a sidecar path that leaves the frames dir is refused even when the resolved file's NAME is the frame's own
+        image_check("frame-00.png", "frame-00", 6, "frame-00.png")
+        with self.assertRaises(ValueError):
+            image_check("frame-00.png", "frame-00", 6, "../other/frame-00.png")
+        # pass f0c36fcc A10: the frames dir holds exactly the requested pairs and the identity diagnostics
+        dir_check = namespace["check_expected_frame_dir"]
+        pairs = [f"frame-{i:02d}.{e}" for i in range(6) for e in ("png", "json")]
+        dir_check(pairs, 6)
+        dir_check(pairs + ["identity-pre-play.png", "identity-first-present.png", "identity.json"], 6)
+        dir_check(["anything"], None)
+        for stray in (["leftovers.txt"], ["leftovers/"], ["frame-06.png", "frame-06.json"]):
+            with self.assertRaises(ValueError, msg=str(stray)):
+                dir_check(pairs + stray, 6)
         with _tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "frame-00.json").write_text("null", encoding="utf-8")
             (Path(tmp) / "frame-01.json").write_text(json.dumps({"index": 1, "saved": True}), encoding="utf-8")

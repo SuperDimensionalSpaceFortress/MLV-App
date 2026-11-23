@@ -3342,8 +3342,10 @@ function Read-DvContactFrames {
         try { $side = (ConvertTo-DvText $f.bytes) | ConvertFrom-Json -ErrorAction Stop } catch { $reasons.Add("CONTACT_FRAME_SIDECAR_UNPARSABLE: the listed sidecar '$($f.name)' is not valid JSON"); continue }
         # (r7, c54a57f6 A4: the app writes `saved: true` for a frame it kept; a listed sidecar that SAYS anything else is not a frame, and a listed PNG with no bytes is not one either.
         # A sidecar with no `saved` member at all is left as it was: the paired-seek stills and their in-pass partners carry none.)
-        $savedMember = $(if ($null -ne $side) { $side.PSObject.Properties['saved'] } else { $null })
-        if ($null -ne $savedMember -and $savedMember.Value -cne $true) { $reasons.Add("CONTACT_FRAME_SIDECAR_NOT_SAVED: the listed sidecar '$($f.name)' does not say saved true; a frame the app did not keep is not part of the strip") }
+        # (r7 pass f0c36fcc A1: the value must BE the JSON boolean true -- `1 -cne $true` and `'True' -cne $true` coerce to a match, and a root array hides the member -- so the type is tested, not compared)
+        if ($null -eq $side -or $side -is [System.Collections.IEnumerable] -or $side -isnot [pscustomobject]) { $reasons.Add("CONTACT_FRAME_SIDECAR_UNPARSABLE: the listed sidecar '$($f.name)' is not one JSON object"); continue }
+        $savedMember = $side.PSObject.Properties['saved']
+        if ($null -ne $savedMember -and ($savedMember.Value -isnot [bool] -or -not $savedMember.Value)) { $reasons.Add("CONTACT_FRAME_SIDECAR_NOT_SAVED: the listed sidecar '$($f.name)' does not say saved true; a frame the app did not keep is not part of the strip") }
         $refPath = [string](Get-DvProp $side 'path')
         if ($refPath -ne '') {
             if ($refPath -cne ($stem + '.png')) { $reasons.Add("CONTACT_FRAME_SIDECAR_PATH: the listed sidecar '$($f.name)' names an image other than its own '$stem.png' (an absolute, parent-relative, nested or other-frame path); a sheet shows only the frames the manifest lists") }
@@ -6089,7 +6091,8 @@ function Test-DvReceiptValid {
                         $countVerdict = Get-DvContactFrameCountVerdict -Names @($frames.files | ForEach-Object { $_.name }) -Requested (Get-DvProp (Get-DvProp $spec 'look') 'contactSheetFrames')
                         if (-not $countVerdict.ok) { $invalid.Add("CONTACT_FRAME_COUNT_NOT_REQUESTED: $($countVerdict.reason)") }
                         # (r7, 855ede6a A6: the committed count is a whole number from 1 to 999 or nothing can be compared, which is a refusal here, never an acceptance)
-                        elseif ($null -eq $countVerdict.requested) { $invalid.Add('CONTACT_FRAME_COUNT_NOT_REQUESTED: the committed look.contactSheetFrames is not a whole number the strip can be compared with') }
+                        # (pass f0c36fcc A7: the runnable range is the schema's 1 to 60, the leg shape predicate's and the generator's; the helper's 999 only bounds its own loop)
+                        elseif ($null -eq $countVerdict.requested -or $countVerdict.requested -gt 60) { $invalid.Add('CONTACT_FRAME_COUNT_NOT_REQUESTED: the committed look.contactSheetFrames is not a whole number from 1 to 60 the strip can be compared with') }
                         if ($sheetOk) {
                             # (r7, 855ede6a A7: the receipt's count is the integer the runner writes, never an array or a string that casts to one)
                             $claimedFramesRaw = Get-DvProp (Get-DvProp (Get-DvProp $Receipt 'look') 'contactSheet') 'frames'

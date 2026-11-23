@@ -999,8 +999,9 @@ if ($isLook -and $artifactsShare) {
         if ($null -ne $frameCountVerdict -and $frameCountVerdict.ok -and (Test-Path -LiteralPath $statsLocal -PathType Leaf)) {
             $tileCount = $null
             try { $tileCount = (Get-Content -LiteralPath $statsLocal -Raw | ConvertFrom-Json -ErrorAction Stop).tile_count } catch { $tileCount = $null }
-            if (($tileCount -is [int] -or $tileCount -is [long]) -and [long]$tileCount -ne [long]$frameCountVerdict.pngs) {
-                $frameCountVerdict = [pscustomobject]@{ ok = $false; pngs = $frameCountVerdict.pngs; sidecars = $frameCountVerdict.sidecars; requested = $frameCountVerdict.requested; reason = "the composed sheet holds $tileCount tile(s) (its stats.json tile_count) but the strip enumerates $($frameCountVerdict.pngs) frame PNG(s); a sheet that does not show every enumerated frame is not the leg's strip" }
+            # (pass f0c36fcc A4: a stats.json that is there but whose tile_count is not a whole JSON number -- "5", [5], 5.0, null -- is unreadable evidence, which refuses the strip like a different count does)
+            if ((-not ($tileCount -is [int] -or $tileCount -is [long])) -or [long]$tileCount -ne [long]$frameCountVerdict.pngs) {
+                $frameCountVerdict = [pscustomobject]@{ ok = $false; pngs = $frameCountVerdict.pngs; sidecars = $frameCountVerdict.sidecars; requested = $frameCountVerdict.requested; reason = "the composed sheet's stats.json tile_count is $(if ($tileCount -is [int] -or $tileCount -is [long]) { $tileCount } else { 'not a whole number' }) but the strip enumerates $($frameCountVerdict.pngs) frame PNG(s); a sheet that does not show every enumerated frame is not the leg's strip" }
             }
         }
         $sheetInfo = [ordered]@{ path = $sheetLocal; sha256 = $sheetSha; bytes = $sheetBytes; frames = [int]$enumeratedFrames; backend = $Backend; rawFramesDir = $rawLocal }

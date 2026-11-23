@@ -428,11 +428,32 @@ def check_expected_frame_stems(stems, expected):
         raise ValueError(f"expected the saved frames {want[0]} .. {want[-1]} (the leg's requested frames) but found {sorted(stems)}; a strip that is not exactly the requested frames is not composed")
 
 
-def check_expected_frame_image(image_name, stem, expected):
+def check_expected_frame_image(image_name, stem, expected, declared=None):
     """Refuse (ValueError) a tile whose image is not its own sidecar's `<stem>.png` when --expected-frames is set (builtins only). Six sidecars that each name frame-00.png
-    would otherwise paint ONE image six times and read as a six-frame strip. `expected` None accepts any image, the way the composer always behaved."""
-    if expected is not None and image_name != stem + ".png":
+    would otherwise paint ONE image six times and read as a six-frame strip. `declared` is the sidecar's own `path` text: a path other than `<stem>.png` (parent-relative,
+    absolute, nested) could resolve to a same-named file outside the frames dir, which only the file NAME would hide. `expected` None accepts any image, the way the composer
+    always behaved."""
+    if expected is None:
+        return
+    if image_name != stem + ".png":
         raise ValueError(f"the image for {stem} resolved to {image_name}, not {stem}.png; a strip whose tiles are not each their own frame is not composed")
+    if declared not in (None, "", stem + ".png"):
+        raise ValueError(f"the sidecar of {stem} names the image {declared!r}, not {stem}.png; a strip whose tiles are read from outside the frames dir is not composed")
+
+
+def check_expected_frame_dir(names, expected):
+    """Refuse (ValueError) a frames directory that holds anything but the requested `frame-NN.png` / `frame-NN.json` pairs and the app's three identity diagnostics, when
+    --expected-frames is set (builtins only; `names` are the top-level entry names, a directory listed as `<name>/`). The loader reads only `frame-*.json`, so a stray file, a
+    directory or an unsaved extra pair would otherwise be invisible to the count and stem checks. `expected` None accepts anything, the way the composer always behaved."""
+    if expected is None:
+        return
+    ancillary = ("identity-pre-play.png", "identity-first-present.png", "identity.json")
+    import re
+    stray = sorted(n for n in names if n.endswith("/") or (re.fullmatch(r"frame-[0-9]{2,}\.(png|json)", n) is None and n not in ancillary))
+    want = {"frame-%02d.%s" % (i, ext) for i in range(expected) for ext in ("png", "json")}
+    extra_frames = sorted(n for n in names if re.fullmatch(r"frame-[0-9]{2,}\.(png|json)", n) is not None and n not in want)
+    if stray or extra_frames:
+        raise ValueError(f"the frames dir holds entries that are not the requested frame pairs: {(stray + extra_frames)[:4]}; a strip that is not exactly the requested frames is not composed")
 
 
 def compose_sheet(frames, frames_dir, args):
@@ -468,7 +489,7 @@ def compose_sheet(frames, frames_dir, args):
                 file=sys.stderr,
             )
             continue
-        check_expected_frame_image(image_path.name, sidecar.get("_stem", ""), expected)
+        check_expected_frame_image(image_path.name, sidecar.get("_stem", ""), expected, sidecar.get("path", ""))
         try:
             with Image.open(image_path) as full_res:
                 stats = channel_stats(full_res)
@@ -698,6 +719,7 @@ def main():
 
     frames = load_frames(args.frames_dir)
     try:
+        check_expected_frame_dir([p.name + ("/" if p.is_dir() else "") for p in args.frames_dir.iterdir()], getattr(args, "expected_frames", None))
         sheet, tile_stats = compose_sheet(frames, args.frames_dir, args)
     except ValueError as exc:
         print(f"[make-contact-sheet] ERROR: {exc}", file=sys.stderr)
