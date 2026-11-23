@@ -2839,6 +2839,32 @@ $o | ConvertTo-Json -Compress
         self.assertTrue(r["emitted"][0].endswith("ONE_LINE x=1"), r)
         self.assertIs(r["ticketSetAtLine"], False, f"the close still held the ticket reset behind its TICKET_ENDED line: {r}")
 
+    def test_tail1_r5_pass2_a1_no_close_or_chain_end_diagnostic_is_written_before_every_release_and_the_reset(self) -> None:
+        # r5 adversary pass 2 A1: a chain.log append on a share can STALL (not fail), and the close wrote its CLAIM_PENDING_RELEASE* line before the ticket's removal and reset, the chain end before its next
+        # nonce's release. Every diagnostic line is now written only after every release and the reset. A stub L records, at its FIRST line, what had already been done.
+        r = self.ps(f"""
+$ast = [Management.Automation.Language.Parser]::ParseFile('{RUNNER}', [ref]$null, [ref]$null)
+$fn = $ast.Find({{ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Close-LegTicket' }}, $true)
+Invoke-Expression $fn.Extent.Text
+$tail = $ast.Find({{ param($n) $n -is [Management.Automation.Language.IfStatementAst] -and $n.Clauses[0].Item1.Extent.Text -ceq '$null -ne $script:strandedClaimNonces' }}, $true)
+$Venue = 'bachelor'; $ClaimDir = $d; $TicketKeepMax = 2
+$script:releases = 0; $script:first = $null
+function Release-VenueClaim([string]$Venue, [string]$Nonce, [string]$ClaimDir, [int]$MaxAttempts) {{ $script:releases++; 'BUSY' }}
+function L([string]$Message, [switch]$Raw) {{ if ($null -eq $script:first) {{ $script:first = [ordered]@{{ line = $Message; ticketSet = ($null -ne $script:ticket); releases = $script:releases }} }} }}
+$script:strandedClaimNonces = [System.Collections.Generic.List[string]]::new(); $script:strandedClaimNonces.Add('n-old')
+$script:ticket = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$script:ticket | Add-Member -NotePropertyName pendingReleaseNonce -NotePropertyValue 'n-new' -Force
+$script:ticketKeeps = 0
+Close-LegTicket 'leg-1' 'TICKET_ENDED' 'test'
+$o = [ordered]@{{ close = $script:first }}
+$script:releases = 0; $script:first = $null
+$null = Invoke-Expression $tail.Extent.Text
+$o['tail'] = $script:first
+$o | ConvertTo-Json -Compress -Depth 4
+""")
+        self.assertEqual((r["close"]["ticketSet"], r["close"]["releases"]), (False, 2), f"the close wrote a diagnostic line before every release and the ticket's reset: {r}")
+        self.assertEqual(r["tail"]["releases"], 2, f"the chain end wrote a diagnostic line before every kept nonce's release: {r}")
+
     def give_back_scenario(self, name: str, release_seam: str, env: dict) -> dict:
         # the A7 line-up (B takes the claim as head while A is in cooldown, A flips to waiting while B holds it, so B must give the claim back), with ONE seam inside the give-back
         from unittest import mock
