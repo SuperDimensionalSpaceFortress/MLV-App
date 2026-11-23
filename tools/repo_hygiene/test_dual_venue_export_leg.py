@@ -114,22 +114,33 @@ def with_pipe_stages(log: str, frames: int, dual_iso_ms: float = 5.0) -> str:
     renderPipeTimed) appends what a build of that card emits: a small dual-ISO figure on every frame, a 1 ms pipe write per frame, one drain and one verify.
     (r2, adversary A4 on a6f48506: on a frame that carries llrawproc the dual-ISO record is written right after it, as video_mlv.c writes it; a frame without llrawproc gets it appended.)"""
     # (r2 fix 1, pass 4 A2: and the pipe write closes each frame, after its last render record, as the frame loop writes it)
+    # (r2 fix 2, adversary A1 on c2da7e24: and processed16_total is the render's LAST note, video_mlv.c:7656-7661, so it is moved to the end of its frame's block)
     out, paired, written = [], set(), set()
-    lines = log.splitlines()
-    frame_of = [int(m.group(1)) if (m := re.match(r"\[mlv-stage-timing\] frame=(\d+) ", l)) else None for l in lines]
-    for k, line in enumerate(lines):
-        out.append(line)
-        hit = re.match(r"\[mlv-stage-timing\] frame=(\d+) stage=llrawproc ms=", line)
-        if hit and int(hit.group(1)) < frames:
-            out.append(f"[mlv-stage-timing] frame={hit.group(1)} stage=llrawproc_dual_iso ms={dual_iso_ms:.3f}")
-            paired.add(int(hit.group(1)))
-        f = frame_of[k]
-        if f is not None and f < frames and f not in written and (k + 1 == len(lines) or frame_of[k + 1] != f):
-            if f not in paired:
+    blocks: list = []
+    for l in log.splitlines():
+        m = re.match(r"\[mlv-stage-timing\] frame=(\d+) ", l)
+        f = int(m.group(1)) if m else None
+        if blocks and f is not None and blocks[-1][0] == f:
+            blocks[-1][1].append(l)
+        else:
+            blocks.append((f, [l]))
+    for f, ls in blocks:
+        if f is None or f >= frames or f in written:
+            out += ls
+            continue
+        for line in ls:
+            if " stage=processed16_total " in line:
+                continue
+            out.append(line)
+            if " stage=llrawproc " in line:
                 out.append(f"[mlv-stage-timing] frame={f} stage=llrawproc_dual_iso ms={dual_iso_ms:.3f}")
                 paired.add(f)
-            out.append(f"[mlv-stage-timing] frame={f} stage=export_pipe_write ms=1.000")
-            written.add(f)
+        if f not in paired:
+            out.append(f"[mlv-stage-timing] frame={f} stage=llrawproc_dual_iso ms={dual_iso_ms:.3f}")
+            paired.add(f)
+        out += [l for l in ls if " stage=processed16_total " in l]
+        out.append(f"[mlv-stage-timing] frame={f} stage=export_pipe_write ms=1.000")
+        written.add(f)
     per_frame = "".join(f"[mlv-stage-timing] frame={i} stage=llrawproc_dual_iso ms={dual_iso_ms:.3f}\n" for i in range(frames) if i not in paired)
     per_frame += "".join(f"[mlv-stage-timing] frame={i} stage=export_pipe_write ms=1.000\n" for i in range(frames) if i not in written)
     return "\n".join(out) + "\n" + per_frame + f"[mlv-stage-timing] frame={frames - 1} stage=export_pipe_drain ms=1.000\n[mlv-stage-timing] frame={frames - 1} stage=export_verify ms=1.000\n"
@@ -1683,7 +1694,8 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         header that was read decides a class; a seam that fails the header read once reads unknown, and the next call (seam restored) reads the real class."""
         head = self.head_sha()
         script = ("$m = Get-Module DualVenueRunner\n"
-                  "$first = & $m { param($id) $saved = $script:RenderPipeMarkerPath; $script:RenderPipeMarkerPath = 'src/debug/NoSuchHeader.h'; try { Get-DvRenderPipeBuildClass -BuildId $id } finally { $script:RenderPipeMarkerPath = $saved } } $env:DVE_HEAD\n"
+                  # (r2 fix 2: the seam is git not answering -- a header path the tree lacks now reads 'older', which is what that tree says)
+                  "$first = & $m { param($id) $saved = $script:DvGitExecutable; $script:DvGitExecutable = 'C:\\no-such-dir\\git-missing.exe'; try { Get-DvRenderPipeBuildClass -BuildId $id } finally { $script:DvGitExecutable = $saved } } $env:DVE_HEAD\n"
                   "$second = & $m { param($id) Get-DvRenderPipeBuildClass -BuildId $id } $env:DVE_HEAD\n"
                   "$unknown1 = & $m { Get-DvRenderPipeBuildClass -BuildId ('0' * 40) }\n"
                   "[ordered]@{ first = $first; second = $second; unknown = $unknown1 } | ConvertTo-Json -Compress")
@@ -1702,6 +1714,81 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         for g in got:
             self.assertEqual(g["outcome"], "INVALID", g)
             self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and "DONE" in p for p in g["problems"]), g)
+
+    # --- r2 fix 2: adversary pass 5 on c2da7e24 (A1, A4, A5, A6; A2 and A3 stay open for r3)
+    def test_adversary_r2f2_a1_each_frame_is_one_block_rendered_then_written(self) -> None:
+        """pass 5 A1: processing moved between frame 0's total and its write, frame 1's disk read before frame 0's write, an untabled record of frame 0 after its write, and an
+        untabled record of frame 9999 after the first record all read PASS. Each frame is one block: its render (processed16_total last), its scale, its write."""
+        lines = piped_stage_log(480).splitlines()
+        def idx(s: str) -> int:
+            return lines.index(s)
+        p0, w0 = idx("[mlv-stage-timing] frame=0 stage=processed16_total ms=56.000"), idx("[mlv-stage-timing] frame=0 stage=export_pipe_write ms=10.000")
+        proc0 = "[mlv-stage-timing] frame=0 stage=processing ms=15.000"
+        v1 = [l for l in lines if l != proc0]
+        v1.insert(v1.index("[mlv-stage-timing] frame=0 stage=export_pipe_write ms=10.000"), proc0)
+        d1 = "[mlv-stage-timing] frame=1 stage=raw_uint16_disk_read ms=3.000"
+        v2 = [l for l in lines if l != d1]
+        v2.insert(v2.index("[mlv-stage-timing] frame=0 stage=export_pipe_write ms=10.000"), d1)
+        v3 = lines[:w0 + 1] + ["[mlv-stage-timing] frame=0 stage=raw_uint16_copy ms=0.001"] + lines[w0 + 1:]
+        v4 = lines[:1] + ["[mlv-stage-timing] frame=9999 stage=raw_uint16_copy ms=0.001"] + lines[1:]
+        self.assertLess(p0, w0)
+        proc, got = evidence_cases([self.ctl("\n".join(v) + "\n") for v in (v1, v2, v3, v4)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "frame loop's order" in p for p in g["problems"]), g)
+
+    def test_adversary_r2f2_a4_a_build_id_with_a_newline_or_a_tree_without_the_header_is_classed(self) -> None:
+        """pass 5 A4: the base id with a trailing LF matched the '$' anchor and failed the lookup (unknown, PASS); and a commit whose tree has no src/debug/StageTiming.h read
+        unknown (PASS) beside a log carrying this card's stages. The first is a malformed id (EXPORT_PROFILE_FOREIGN), the second a build before stage timing (older, FOREIGN)."""
+        import subprocess
+        added = subprocess.run(["git", "-C", str(ROOT), "log", "--diff-filter=A", "--format=%H", "--", "src/debug/StageTiming.h"], capture_output=True, text=True).stdout.split()
+        cases = [self.ctl(buildId="2b79619832444c0a63a8573d04f6cd02a4a113dc\n")]
+        before = None
+        if added:
+            r = subprocess.run(["git", "-C", str(ROOT), "rev-parse", f"{added[-1]}^"], capture_output=True, text=True)
+            before = r.stdout.strip() if r.returncode == 0 else None
+        if before:
+            cases.append(self.ctl(buildId=before))
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_PROFILE_FOREIGN") for p in g["problems"]), g)
+        if not before:
+            self.skipTest("the commit before src/debug/StageTiming.h existed is not in this clone")
+
+    def test_adversary_r2f2_a5_the_ceiling_and_the_clip_sum_are_held_on_the_exact_record_figures(self) -> None:
+        """pass 5 A5: verify=86400000.000000001 rounded onto the ceiling as a double (no problem), and a verify figure 9.6e-6 ms past the wall limit was admitted because
+        the clip sum went through a double. Both are read exactly from the record text. Control: the same wall with verify a full increment under the limit."""
+        def log(drain: str, verify: str) -> str:
+            rows = (("raw_uint16", 9.0), ("llrawproc", 31.0), ("llrawproc_dual_iso", 30.0), ("debayered_frame", 40.0), ("processing", 15.0), ("processed16_total", 56.0), ("export_pipe_write", 10.0))
+            per = "".join(f"[mlv-stage-timing] frame={i} stage={s} ms={ms:.3f}\n" for i in range(24) for s, ms in rows)
+            return per + f"[mlv-stage-timing] frame=23 stage=export_pipe_drain ms={drain}\n[mlv-stage-timing] frame=23 stage=export_verify ms={verify}\n"
+        def batch(elapsed: str) -> str:
+            return ("[BATCH] RENDER_START view-0 codec=prores container=mov source=1x1 output=1x1 scaled=false fps=24 frames=24 cutIn=1 cutOut=24 out=view-0.mov\n"
+                    f"[BATCH] RENDER_VERIFIED view-0 decoded_frames=24\n[BATCH] DONE view-0 exported=24 skipped=0 elapsed={elapsed}\n")
+        mk = lambda d, v, e: prores_case(maxFrames=24, dualIsoExpected=True, stage=log(d, v), batch=batch(e), criteria=[])
+        proc, got = evidence_cases([mk("0.000", "86400000.000000001", "86400.0"), mk("778440.000", "3000000.000009601", "3600.0"), mk("778440.000", "2999999.999", "3600.0")])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "INVALID", got[0])
+        self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "ceiling" in p for p in got[0]["problems"]), got[0])
+        self.assertEqual(got[1]["outcome"], "INVALID", got[1])
+        self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p for p in got[1]["problems"]), got[1])
+        self.assertEqual(got[2]["outcome"], "PASS", got[2])
+
+    def test_adversary_r2f2_a6_the_reader_writes_no_git_trace_file(self) -> None:
+        """pass 5 A6: the reader now runs git, and Invoke-DvGit passed GIT_TRACE through, so an inherited GIT_TRACE=<path> made a read-only reader append to that file."""
+        with tempfile.TemporaryDirectory() as d:
+            trace = Path(d) / "trace.txt"
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([self.ctl(buildId=self.head_sha())]), encoding="utf-8")
+            proc, got = run_pwsh_json("$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                                      f"@($cases | ForEach-Object {{ $c = $_; $e = {EVIDENCE_CALL}; [ordered]@{{ problems = @($e.problems) }} }}) "
+                                      "| ConvertTo-Json -Compress -Depth 8 -AsArray", DVE_CASES=str(path), GIT_TRACE=str(trace), GIT_TRACE2=str(trace))
+            self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+            self.assertEqual(got[0]["problems"], [], got[0])
+            self.assertFalse(trace.exists(), "the reader wrote a git trace file")
 
     def test_r8_both_prores_leg_specs_gate_both_new_criteria(self) -> None:
         for name in ("m16-1243-export-prores", "m16-1456-export-prores"):
