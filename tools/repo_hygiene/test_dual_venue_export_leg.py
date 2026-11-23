@@ -1723,6 +1723,51 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         self.assertEqual(got["second"], "emits", "and the failed read was not cached")
         self.assertEqual(got["unknown"], "unknown")
 
+    # --- r4: adversary pass 8 on 7c66c004 (A4, A6; A1, A2, A3, A5 stay OPEN in the PR body)
+    @staticmethod
+    def header_commit(repo: Path, header: str) -> str:
+        import subprocess
+        def git(*args: str) -> str:
+            return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL).stdout.strip()
+        if not (repo / ".git").exists():
+            repo.mkdir(parents=True, exist_ok=True)
+            git("init", "-q"); git("config", "user.email", "unit@example.invalid"); git("config", "user.name", "unit"); git("config", "core.autocrlf", "false")
+        (repo / "src" / "debug").mkdir(parents=True, exist_ok=True)
+        (repo / "src" / "debug" / "StageTiming.h").write_bytes(header.encode())
+        git("add", "src"); git("commit", "-q", "-m", "header")
+        return git("rev-parse", "HEAD")
+
+    def test_adversary_r4_a6_the_marker_is_a_define_directive_not_a_substring(self) -> None:
+        """pass 8 A6: the build class searched the header for the literal `#define MLV_STAGE_EXPORT_PIPE_WRITE`, so legal preprocessor spacing read 'older' and a header that
+        names the define only in a comment read 'emits'. A directive defines it, whatever its blanks; a comment does not."""
+        cases = {"spaced": ('#ifndef H\n#  define MLV_STAGE_EXPORT_PIPE_WRITE "export_pipe_write"\n#endif\n', "emits"),
+                 "hash_gap": ('# define MLV_STAGE_EXPORT_PIPE_WRITE "export_pipe_write"\n', "emits"),
+                 "plain": ('#define MLV_STAGE_EXPORT_PIPE_WRITE   "export_pipe_write"\n', "emits"),
+                 "block_comment": ("/* #define MLV_STAGE_EXPORT_PIPE_WRITE */\n#define MLV_STAGE_DECODE \"decode\"\n", "older"),
+                 "multiline_comment": ("/*\n#define MLV_STAGE_EXPORT_PIPE_WRITE \"x\"\n*/\n", "older"),
+                 "line_comment": ("// #define MLV_STAGE_EXPORT_PIPE_WRITE\n", "older"),
+                 "longer_name": ("#define MLV_STAGE_EXPORT_PIPE_WRITE_OLD \"x\"\n", "older")}
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            ids = {name: self.header_commit(repo, text) for name, (text, _) in cases.items()}
+            lines = "".join(f"$o['{name}'] = & $m {{ param($r, $id) Get-DvRenderPipeBuildClass -BuildId $id -RepoRoot $r }} '{repo}' '{sha}'\n" for name, sha in ids.items())
+            proc, got = run_pwsh_json("$m = Get-Module DualVenueRunner\n$o = [ordered]@{}\n" + lines + "$o | ConvertTo-Json -Compress")
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got, {name: want for name, (_, want) in cases.items()})
+
+    def test_adversary_r4_a4_every_git_the_reader_runs_has_lazy_fetch_off(self) -> None:
+        """pass 8 A4: in a partial clone the header read made git fetch the missing blob from the promisor remote and write it into the object store. Every Invoke-DvGit
+        child runs with GIT_NO_LAZY_FETCH=1, also when the caller's environment sets it to 0 (a shell alias prints the value the child saw)."""
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            self.header_commit(repo, "#define MLV_STAGE_DECODE \"decode\"\n")
+            proc, got = run_pwsh_json("$m = Get-Module DualVenueRunner\n"
+                                      f"$r = & $m {{ param($root) Invoke-DvGit -RepoRoot $root -GitArgs @('-c', 'alias.dvlazy=!printf \"%s\" \"$GIT_NO_LAZY_FETCH\"', 'dvlazy') }} '{repo}'\n"
+                                      "[ordered]@{ exit = $r.exitCode; seen = [Text.Encoding]::ASCII.GetString($r.bytes) } | ConvertTo-Json -Compress",
+                                      GIT_NO_LAZY_FETCH="0")
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got, {"exit": 0, "seen": "1"})
+
     def test_adversary_r2f1_a6_a_clip_name_that_only_looks_like_dones_is_another_clip(self) -> None:
         """pass 4 A6: view-0 followed by U+200B in RENDER_START or RENDER_VERIFIED compared equal to DONE's view-0 under the culture-aware -cne. Names compare ordinally."""
         zw = "view-0​"
