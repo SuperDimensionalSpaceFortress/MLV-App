@@ -2235,7 +2235,7 @@ TEST(PlaybackDueWakeSend, D_AStaleSentWakeThroughTheWindowProcedureIsDroppedByTh
     bool firedStamped = false;                                        // ...and whether that delivery carried them
     bool firedUnsplit = false;                                        // ...or was taken before the return stamp was published
     double firedReceiveMs = -1.0;                                     // the GUI thread's own receive time (QPC ms)
-    double firedFirstStampMs = -1.0;                                  // SEAM-1 A2: the wait thread's pre-send stamp, split or unsplit
+    double firedPreSendStamp = -1.0;                                  // SEAM-1 A2: the wait thread's pre-send stamp, split or unsplit
     int firedStampMismatches = 0;                                     // a split delivery whose pre-send stamp is not its first stamp
     PlaybackDueWake *self = nullptr;
     PlaybackDueWake wake( nullptr, [&]() {
@@ -2246,8 +2246,8 @@ TEST(PlaybackDueWakeSend, D_AStaleSentWakeThroughTheWindowProcedureIsDroppedByTh
         firedStamped = stamp >= 0.0 && firedPostReturn >= 0.0;
         firedUnsplit = self->lastDeliveryUnsplit();
         firedPostFirstMs = stamp;
-        firedFirstStampMs = self->lastDeliveryFirstStampMsForTest();
-        if( firedStamped && firedFirstStampMs != stamp ) ++firedStampMismatches;
+        firedPreSendStamp = self->lastDeliveryFirstStampMsForTest();
+        if( firedStamped && firedPreSendStamp != stamp ) ++firedStampMismatches;
     }, PlaybackDueWakeDeliveryMode::SendNotify );
     self = &wake;
     wake.setTimingStampsForTest( true );
@@ -2262,7 +2262,7 @@ TEST(PlaybackDueWakeSend, D_AStaleSentWakeThroughTheWindowProcedureIsDroppedByTh
         firedStamped = false;
         firedUnsplit = false;
         firedReceiveMs = -1.0;
-        firedFirstStampMs = -1.0;
+        firedPreSendStamp = -1.0;
         wake.resetStrandedCounts();
         wake.arm( 0.5 );
         ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
@@ -2295,8 +2295,8 @@ TEST(PlaybackDueWakeSend, D_AStaleSentWakeThroughTheWindowProcedureIsDroppedByTh
         // SEAM-1 A2: an unsplit delivery's floor is the wait thread's own pre-send stamp, never the GUI's receive time
         ASSERT_EQ( 0, firedStampMismatches );                    // a split delivery's pre-send stamp IS its first stamp
         const ReplacementAttempt verdict = classifyReplacementAttempt( armCostNs,
-            replacementStampsOf( firedStamped, firedUnsplit, firedFirstStampMs >= 0.0 ),
-            ( ( firedUnsplit ? firedFirstStampMs : firedPostFirstMs ) - preArmMs ) * 1000000.0, ( firedPostReturn - preArmMs ) * 1000000.0,
+            replacementStampsOf( firedStamped, firedUnsplit, firedPreSendStamp >= 0.0 ),
+            ( ( firedUnsplit ? firedPreSendStamp : firedPostFirstMs ) - preArmMs ) * 1000000.0, ( firedPostReturn - preArmMs ) * 1000000.0,
             ( firedReceiveMs - preArmMs ) * 1000000.0 );
         ASSERT_FALSE( replacementAttemptFails( verdict ) );
         if( replacementAttemptProves( verdict ) ) ++proofs;
@@ -2836,7 +2836,7 @@ TEST(PlaybackDueWakeSend, R2A1_AStaleSentWakeInTheRunnerSleepIsNotHeldCountedOrA
     bool firedStamped = false;                                        // ...and whether that delivery carried them
     bool firedUnsplit = false;                                        // ...or was taken before the return stamp was published
     double firedReceiveMs = -1.0;                                     // the GUI thread's own receive time (QPC ms)
-    double firedFirstStampMs = -1.0;                                  // SEAM-1 A2: the wait thread's pre-send stamp, split or unsplit
+    double firedPreSendStamp = -1.0;                                  // SEAM-1 A2: the wait thread's pre-send stamp, split or unsplit
     int firedStampMismatches = 0;                                     // a split delivery whose pre-send stamp is not its first stamp
     PlaybackDueWake *self = nullptr;
     PlaybackDueWake wake( nullptr, [&]() {
@@ -2847,8 +2847,8 @@ TEST(PlaybackDueWakeSend, R2A1_AStaleSentWakeInTheRunnerSleepIsNotHeldCountedOrA
         firedStamped = stamp >= 0.0 && firedPostReturn >= 0.0;
         firedUnsplit = self->lastDeliveryUnsplit();
         firedPostFirstMs = stamp;
-        firedFirstStampMs = self->lastDeliveryFirstStampMsForTest();
-        if( firedStamped && firedFirstStampMs != stamp ) ++firedStampMismatches;
+        firedPreSendStamp = self->lastDeliveryFirstStampMsForTest();
+        if( firedStamped && firedPreSendStamp != stamp ) ++firedStampMismatches;
     }, PlaybackDueWakeDeliveryMode::SendNotify );
     self = &wake;
     // SEAM-1 (r7 adversary pass 12 A3): the stale wake is dispatched at the sleep's entry, and the sleep is judged on the product's
@@ -2885,7 +2885,7 @@ TEST(PlaybackDueWakeSend, R2A1_AStaleSentWakeInTheRunnerSleepIsNotHeldCountedOrA
         firedStamped = false;
         firedUnsplit = false;
         firedReceiveMs = -1.0;
-        firedFirstStampMs = -1.0;
+        firedPreSendStamp = -1.0;
         wake.resetStrandedCounts();
         wake.arm( 0.5 );
         ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
@@ -2913,8 +2913,8 @@ TEST(PlaybackDueWakeSend, R2A1_AStaleSentWakeInTheRunnerSleepIsNotHeldCountedOrA
         // SEAM-1 A2: an unsplit delivery's floor is the wait thread's own pre-send stamp, never the GUI's receive time
         ASSERT_EQ( 0, firedStampMismatches );                         // a split delivery's pre-send stamp IS its first stamp
         const ReplacementAttempt verdict = classifyReplacementAttempt( armCostNs,
-            replacementStampsOf( firedStamped, firedUnsplit, firedFirstStampMs >= 0.0 ),
-            ( ( firedUnsplit ? firedFirstStampMs : firedPostFirstMs ) - preArmMs ) * 1000000.0, ( firedPostReturn - preArmMs ) * 1000000.0,
+            replacementStampsOf( firedStamped, firedUnsplit, firedPreSendStamp >= 0.0 ),
+            ( ( firedUnsplit ? firedPreSendStamp : firedPostFirstMs ) - preArmMs ) * 1000000.0, ( firedPostReturn - preArmMs ) * 1000000.0,
             ( firedReceiveMs - preArmMs ) * 1000000.0 );
         ASSERT_FALSE( replacementAttemptFails( verdict ) );
         if( replacementAttemptProves( verdict ) ) ++proofs;
@@ -3448,10 +3448,10 @@ TEST(PlaybackDueWakeSend, SEAM1_TheTimingStampSeamIsOffByDefaultAndAddsNoClockRe
     {
         const QString mainWindow = dueWakeRepoSource( file );
         ASSERT_FALSE( mainWindow.isEmpty() );
-        ASSERT_EQ( 0, mainWindow.count( QStringLiteral( "setTimingStampsForTest" ) ) );
-        ASSERT_EQ( 0, mainWindow.count( QStringLiteral( "lastRunnerSleepExitForTest" ) ) );
-        ASSERT_EQ( 0, mainWindow.count( QStringLiteral( "lastRunnerSleepExitElapsedMsForTest" ) ) );
-        ASSERT_EQ( 0, mainWindow.count( QStringLiteral( "lastDeliveryFirstStampMsForTest" ) ) );
+        ASSERT_FALSE( mainWindow.contains( QStringLiteral( "setTimingStampsForTest" ) ) );
+        ASSERT_FALSE( mainWindow.contains( QStringLiteral( "lastRunnerSleepExitForTest" ) ) );
+        ASSERT_FALSE( mainWindow.contains( QStringLiteral( "lastRunnerSleepExitElapsedMsForTest" ) ) );
+        ASSERT_FALSE( mainWindow.contains( QStringLiteral( "lastDeliveryFirstStampMsForTest" ) ) );
     }
 #ifdef Q_OS_WIN
     // live: off by default nothing is recorded; on, a plain sleep records its own exit; the setter resets the records
@@ -3459,7 +3459,7 @@ TEST(PlaybackDueWakeSend, SEAM1_TheTimingStampSeamIsOffByDefaultAndAddsNoClockRe
     ASSERT_TRUE( wake.sleepForSmokeRunner( 20 ) == PlaybackDueWake::RunnerSleep::Slept );
     ASSERT_TRUE( wake.lastRunnerSleepExitForTest() == PlaybackDueWake::RunnerSleepExit::None );
     ASSERT_EQ( static_cast<qint64>( -1 ), wake.lastRunnerSleepExitElapsedMsForTest() );
-    ASSERT_TRUE( wake.lastDeliveryFirstStampMsForTest() < 0.0 );
+    ASSERT_TRUE( wake.lastDeliveryFirstStampMsForTest() == -1.0 );   // the exact "none" sentinel
     wake.setTimingStampsForTest( true );
     ASSERT_TRUE( wake.sleepForSmokeRunner( 20 ) == PlaybackDueWake::RunnerSleep::Slept );
     ASSERT_TRUE( wake.lastRunnerSleepExitForTest() != PlaybackDueWake::RunnerSleepExit::None );
