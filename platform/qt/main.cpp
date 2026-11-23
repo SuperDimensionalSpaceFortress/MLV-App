@@ -494,7 +494,7 @@ static int runBatch(QCoreApplication &app)
 
     QCommandLineOption renderedFfmpegOpt(
         QStringLiteral("rendered-ffmpeg"),
-        QStringLiteral("ffmpeg executable path or command name used for rendered export. Defaults to 'ffmpeg' on PATH; rendered export fails with an actionable error if it cannot be resolved."),
+        QStringLiteral("ffmpeg executable path or command name used for rendered export. Without this option, the ffmpeg beside the MLVApp executable is used, then 'ffmpeg' on PATH; a value given here is resolved on PATH or used as a path. Rendered export fails with an actionable error if it cannot be resolved."),
         QStringLiteral("path-or-name"));
     parser.addOption(renderedFfmpegOpt);
 

@@ -1466,6 +1466,125 @@ TEST(Debayered16ReconReuse, HonourScaleScaledFrameDoesNotInheritFullResDebayerSt
     }
 }
 
+// CPU-S1-1457-HEAVY-SPEC-AND-STALE-FIELDS-1: debayered_frame_ms and processing_ms are this thread's last-run
+// records. The CPU Debayered16 route's three entries (the full-size recon debayer, the reduced recon debayer and the
+// inline getMlvRawFrameDebayered) never refreshed them, so every playback_smoke.frame row of a cpu leg carried the
+// render thread's first frame (debayered_frame_ms 345.418 and processing_ms 14.416 on all 475 rows of a 1243 s1 leg),
+// which is not comparable with the cuda fields of the same name. Each entry now records its own debayer wall time and
+// zeroes processing (no processing stage runs on this route).
+struct FrameRecords
+{
+    double poisonFrameMs = 0.0, poisonProcessingMs = 0.0;
+    double frameMs = 0.0, processingMs = 0.0, kernelMs = 0.0;
+};
+
+// A scaled Processed8/Processed16 render is a route that publishes both records; run one until both read nonzero
+// (a different frame each time, so no cache serves it, on the scale-4 processed8 route and the scale-2 processed16 route).
+bool poisonFrameAndProcessingRecords(MlvPipelineFixture & fixture)
+{
+    double lastFrameMs = 0.0, lastProcessingMs = 0.0;
+    for (int i = 0; i < 16; ++i)
+    {
+        resetMlvCachedFrame(fixture.video());
+        const std::vector<uint8_t> out8 = fixture.renderFrame8Scaled(3 + static_cast<uint64_t>(i % 5), kCpuCores, 4);
+        lastFrameMs = getMlvLastDebayeredFrameMilliseconds();
+        lastProcessingMs = getMlvLastProcessingMilliseconds();
+        if (!out8.empty() && lastFrameMs > 0.0 && lastProcessingMs > 0.0) return true;
+        resetMlvCachedFrame(fixture.video());
+        const std::vector<uint16_t> out16 = fixture.renderFrame16Scaled(3 + static_cast<uint64_t>(i % 5), kCpuCores, 2);
+        lastFrameMs = getMlvLastDebayeredFrameMilliseconds();
+        lastProcessingMs = getMlvLastProcessingMilliseconds();
+        if (!out16.empty() && lastFrameMs > 0.0 && lastProcessingMs > 0.0) return true;
+    }
+    std::printf("[debayered16-honour-scale] poison: last scaled render read frame=%.4f processing=%.4f\n", lastFrameMs,
+                lastProcessingMs);
+    return false;
+}
+
+// Runs `entry` straight after the poison; the clock may tick coarsely, so a call may legitimately read 0 ms: retry
+// (re-poisoning) until the entry's own debayered-frame total reads nonzero, at most 64 times.
+template <class Entry>
+bool entryRecordsAfterPoison(MlvPipelineFixture & fixture, Entry entry, FrameRecords * r)
+{
+    for (int attempt = 0; attempt < 64; ++attempt)
+    {
+        if (!poisonFrameAndProcessingRecords(fixture))
+        {
+            std::printf("[debayered16-honour-scale] attempt %d: no scaled route published both records\n", attempt);
+            return false;
+        }
+        r->poisonFrameMs = getMlvLastDebayeredFrameMilliseconds();
+        r->poisonProcessingMs = getMlvLastProcessingMilliseconds();
+        if (!entry())
+        {
+            std::printf("[debayered16-honour-scale] attempt %d: the entry under test refused the frame\n", attempt);
+            return false;
+        }
+        r->frameMs = getMlvLastDebayeredFrameMilliseconds();
+        r->processingMs = getMlvLastProcessingMilliseconds();
+        r->kernelMs = getMlvLastDebayerKernelMilliseconds();
+        if (r->frameMs > 0.0) return true;
+    }
+    return true;
+}
+
+void expectOwnRecords(const char * what, const FrameRecords & r)
+{
+    std::printf("[debayered16-honour-scale] %s: poison frame=%.4f processing=%.4f -> frame=%.4f processing=%.4f kernel=%.4f\n",
+                what, r.poisonFrameMs, r.poisonProcessingMs, r.frameMs, r.processingMs, r.kernelMs);
+    ASSERT_TRUE(r.poisonFrameMs > 0.0);
+    ASSERT_TRUE(r.poisonProcessingMs > 0.0);
+    ASSERT_TRUE(r.processingMs == 0.0);           // no processing stage ran on this route: never the previous frame's
+    ASSERT_TRUE(r.frameMs != r.poisonFrameMs);    // the entry's own total, not the render thread's previous frame
+    ASSERT_TRUE(r.frameMs > 0.0);
+    // The kernel record is deliberately not compared with the frame total: it is timed with omp_get_wtime, whose tick is the
+    // system timer's (1 ms measured, more when nothing raised the timer resolution), the frame total with the QPC clock.
+}
+
+TEST(Debayered16ReconReuse, HonourScaleDebayered16EntriesRecordTheirOwnDebayeredFrameAndZeroProcessing)
+{
+    EnvGuard guard;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openLargeHq(fixture));
+    WorkerState worker;
+    const size_t n = fullPixels(fixture);
+    {
+        // The full-size recon debayer (getMlvRawFrameDebayeredFromReconnedRaw16), the s1 route.
+        FrameRecords r;
+        std::vector<uint16_t> rgb16;
+        ASSERT_TRUE(entryRecordsAfterPoison(fixture, [&]() { return controlDebayered16(fixture, 2, worker, &rgb16); }, &r));
+        expectOwnRecords("full-size reconned debayer", r);
+    }
+    for (const int scale : { 2, 4 })
+    {
+        // The reduced recon debayer (getMlvRawFrameDebayeredFromReducedReconnedRaw16), the s2/s4 route.
+        mlvDualIsoPreviewScaleRecon_t plan;
+        std::vector<uint16_t> reduced;
+        ASSERT_TRUE(reducedRecon(fixture, 2, scale, worker, &plan, &reduced));
+        std::vector<uint16_t> out(static_cast<size_t>(fixture.width() / scale) * static_cast<size_t>(fixture.height() / scale) * 3u);
+        const int hq = llrpHQDualIso(fixture.video()) ? 1 : 0;
+        FrameRecords r;
+        ASSERT_TRUE(entryRecordsAfterPoison(fixture, [&]() {
+            std::vector<uint16_t> bayer(reduced); // the entry shifts its input in place
+            int w = -1, h = -1;
+            return getMlvRawFrameDebayeredFromReducedReconnedRaw16(fixture.video(), 2, bayer.data(), plan.reducedWidth,
+                                                                   plan.reducedHeight, scale, out.data(), hq, &w, &h) == 1;
+        }, &r));
+        expectOwnRecords(scale == 2 ? "reduced reconned debayer x2" : "reduced reconned debayer x4", r);
+    }
+    {
+        // The inline route (getMlvRawFrameDebayered): it decodes and reconstructs for itself, so its total contains them.
+        FrameRecords r;
+        std::vector<uint16_t> rgb16(n * 3u, 0u);
+        ASSERT_TRUE(entryRecordsAfterPoison(fixture, [&]() {
+            resetMlvCachedFrame(fixture.video());
+            getMlvRawFrameDebayered(fixture.video(), 2, rgb16.data());
+            return true;
+        }, &r));
+        expectOwnRecords("inline getMlvRawFrameDebayered", r);
+    }
+}
+
 // The prep's reduced-source config: only a SourceAlreadyReduced decision at x2/x4 whose
 // source is exactly the clip divided by that scale; otherwise nothing is built.
 TEST(Debayered16ReconReuse, HonourScalePrepReducedSourceConfigOnlyForAnExactlyReducedSource)

@@ -972,8 +972,12 @@ TEST(PlaybackUnpacedWiring, TheMeasuredLoopChecksItsStopInBoundedSlicesOnlyWhenU
     // and the engine holds once the required frames are consumed, before any advance path (the loop wrap included)
     const QString handling = bodyBetween(source, QStringLiteral("void MainWindow::playbackHandling(int timeDiff)"),
                                          QStringLiteral("void MainWindow::showPerformanceProfilingDialog"));
+    // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r8 fix 1 (adversary A1 on 77fa2218): a pinned capture holds one frame later, on
+    // its identity frame start + N (pinnedUnpacedHoldReached); an unpinned run holds exactly as before
     const QString hold = QStringLiteral(
-        "if( m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() && programmaticPlayConsumed() ) return;");
+        "if( m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() && programmaticPlayConsumed()\n"
+        "         && playback_frame_range::pinnedUnpacedHoldReached( m_playbackSmokeTargetPresentedFrames, m_sourceAdvance.consumed(),\n"
+        "                                                            m_playRequiredSourceFrames ) ) return;");
     ASSERT_EQ(1, source.count(hold));
     const int holdAt = handling.indexOf(hold);
     ASSERT_TRUE(holdAt > handling.indexOf(QStringLiteral("const bool paceGuardArmedBeforeTick = m_playbackPaceGuard.armed();")));

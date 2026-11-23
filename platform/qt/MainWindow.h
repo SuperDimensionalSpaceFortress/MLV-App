@@ -1364,6 +1364,9 @@ private:
     int m_playbackSmokeStartQualityMode = 0;
     int m_playbackSmokeStartWorkerThreads = 0;
     int m_playbackSmokePresentedFrames = 0;
+    // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r8: the distinct pinned-window source frames shown, which the pinned capture's
+    // present-path stop, its measured-play loop and its exit-11 check all count (PlaybackFrameRange.h PinnedWindowPresents)
+    playback_frame_range::PinnedWindowPresents m_playbackSmokePinnedWindow;
     int m_playbackSmokeParityMatchCount = 0;
     int m_playbackSmokeTargetPresentedFrames = 0;
     int m_playbackSmokeFirstPresentedFrame = -1;
