@@ -878,7 +878,7 @@ function Invoke-BatchTicketCall([string]$Body, [hashtable]$Argument, [double]$Se
     # TAIL-1 r2 (pre-existing: pass 10 A3 / r9 A6): ONE elapsed-time bound per call. A stopwatch starts before the worker does and its end is the call's bound (or the room before -DeadlineUtc when that is less), so the
     # worker's start-up is inside the bound instead of added before the wait, and an answer seen after the end is never acted on (Invoke-VenueBoundedRead -Clock/-EndSec)
     $callClock = [Diagnostics.Stopwatch]::StartNew()
-    $callEndSec = [Math]::Min($Sec, ($deadline - [DateTime]::UtcNow).TotalSeconds)
+    $callEndSec = [Math]::Min([double]$Sec, ($deadline - [DateTime]::UtcNow).TotalSeconds)
     & (Get-Module VenueChain) { param($b, $a, $s, $c, $e) Invoke-VenueBoundedRead -ScriptText ('param($a) Import-Module $a.m -Force -DisableNameChecking; ' + $b) -Argument $a -TimeoutSec $s -Clock $c -EndSec $e -EndIsBoundEnd } $Body ($Argument + @{ m = (Join-Path $here 'VenueChain.psm1') }) $Sec $callClock $callEndSec
 }
 
