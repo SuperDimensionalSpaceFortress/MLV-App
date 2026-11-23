@@ -17,6 +17,7 @@
 #include "../../platform/qt/GpuPresentTailWindow.h"
 
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QRegularExpression>
 #include <QEventLoop>
 #include <QFile>
@@ -2574,11 +2575,16 @@ TEST(PlaybackDueWakeSend, G1_AForeignSentMessageInTheRunnerSleepIsNotAWakeAndThe
             sent = SendNotifyMessageW( window, WM_USER + 0x51, 0, 0 ) != 0;
         } );
         const ThreadJoinGuard senderGuard { sender };
+        const double beforeSleepMs = dueWakeQpcNowMs();
         const PlaybackDueWake::RunnerSleep slept = wake.sleepForSmokeRunner( 150, &dueWakeQpcNowS );
+        const double afterSleepMs = dueWakeQpcNowMs();
         sender.join();
         // SEAM-1 adversary pass A3 (cd623269): every sample's exit is judged before the retry filter below (which keys on a
         // product counter a defective product can leave at zero): a sleep the send missed still runs its whole interval
         ASSERT_TRUE( dueWakeObserveSleep( wake, 150.0 ).met );
+        // SEAM-1 adversary pass 2 A1 (48ad052b): and, independently of the product's record, this thread's own bracket of the call
+        // (one-sided: a pause only lengthens it), so a wait shortened below what the product recorded still fails
+        ASSERT_TRUE( afterSleepMs - beforeSleepMs >= dueWakeSleepFloorMs( 150.0 ) );
         if( wake.runnerSleepsWokenOther() == 0 )
         {
             // adversary pass 1 A4/A7: a sender that missed the whole sleep (its message queued after the sleep returned) left
@@ -2703,6 +2709,7 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
         sleptMs = t.elapsed();
         sender.join();
         ASSERT_TRUE( dueWakeObserveSleep( wake, 150.0 ).met );        // SEAM-1 adversary pass A3: every sample, before the retry filter
+        ASSERT_TRUE( static_cast<double>( sleptMs ) >= dueWakeSleepFloorMs( 150.0 ) );   // pass 2 A1: this thread's own one-sided bracket too
         if( foreign.calls == 0 )
         {
             // adversary pass 1 A4/A7: a sender that missed the whole sleep (its message queued after the sleep returned) left
@@ -2903,7 +2910,11 @@ TEST(PlaybackDueWakeSend, R2A1_AStaleSentWakeInTheRunnerSleepIsNotHeldCountedOrA
     wake.arm( 0.5 );
     ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
     wake.cancel();
+    const double beforeStaleSleepMs = dueWakeQpcNowMs();
     ASSERT_TRUE( wake.sleepForSmokeRunner( 60, &dueWakeQpcNowS ) == PlaybackDueWake::RunnerSleep::Slept );
+    // SEAM-1 adversary pass 2 A1 (48ad052b): this thread's own one-sided bracket of the call too (a pause only lengthens it), so a
+    // wait shortened below what the product recorded still fails
+    ASSERT_TRUE( dueWakeQpcNowMs() - beforeStaleSleepMs >= dueWakeSleepFloorMs( 60.0 ) );
     const DueWakeSleepObservation stale = dueWakeObserveSleep( wake, 60.0 );
     ASSERT_EQ( static_cast<quint64>( 0 ), wake.runnerSleepsWokenBySent() );
     ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenOther() );
@@ -3193,7 +3204,9 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     constexpr int kAttempts = 10;
     g_r17A1Stamps.reserve( 256 );                                     // the clock callback must never allocate (a throw there would std::terminate the sender's join)
     wake.setTimingStampsForTest( true );
-    const auto judgeSentWait = [&]( bool armed ) {
+    // SEAM-1 adversary pass 2 A2 (48ad052b): and with the GUI trace on (the smoke runner's real configuration: a dispatch hidden
+    // behind the trace flag ran in no live case, since the trace-on fixtures pass a null sink)
+    const auto judgeSentWait = [&]( bool armed, bool traced ) {
     std::unique_ptr<R17A1Windows> wp;
     std::vector<std::pair<double, double>> spans;
     std::vector<double> stamps;
@@ -3247,6 +3260,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         } );
         const ThreadJoinGuard senderGuard { sender };               // pass 1 A8: an exception inside the sleep unwinds through a joined thread
         if( armed ) wake.arm( 60000.0 );                              // SEAM-1 A4: armed for the whole sleep, never due inside it
+        if( traced ) wake.setGuiTraceActive( true );
         enteredMs = dueWakeQpcNowMs();
         slept = wake.sleepForSmokeRunner( 80, &r17A1RecordingNowS, &r17A1Charge, wp.get() );
         returnedMs = dueWakeQpcNowMs();
@@ -3254,6 +3268,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         sleepExit = wake.lastRunnerSleepExitForTest();                // the product's own exit decision and the value it compared
         exitMs = wake.lastRunnerSleepExitElapsedMsForTest();
         sender.join();
+        if( traced ) wake.setGuiTraceActive( false );
         // SEAM-1 adversary pass A3 (cd623269): EVERY sample's exit is judged, before any retry filter below: a sleep the send
         // missed still runs its whole 80 ms (it times out), so no sample -- batched, missed or landed -- can drop a cut-short exit
         ASSERT_TRUE( dueWakeSleepExitMet( sleepExit, exitMs, 80.0 ) );
@@ -3375,8 +3390,9 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     ASSERT_TRUE( spans[0].first * 1000.0 <= handlerStartMs + 0.5 );
     ASSERT_TRUE( spans[0].second * 1000.0 >= handlerEndMs - 0.5 );
     };
-    judgeSentWait( false );                                            // the wake idle: at least one judged attempt
-    judgeSentWait( true );                                             // SEAM-1 A4: the wake armed: at least one judged attempt
+    judgeSentWait( false, false );                                     // the wake idle: at least one judged attempt
+    judgeSentWait( true, false );                                      // SEAM-1 A4: the wake armed: at least one judged attempt
+    judgeSentWait( true, true );                                       // pass 2 A2: armed with the GUI trace on
     wake.setTimingStampsForTest( false );
     // a sleep no dispatch cuts is one segment, charged to the window open at its end; NotHandled hands out none
     R17A1Windows plain;
@@ -3536,6 +3552,26 @@ TEST(PlaybackDueWakeSend, SEAM1_TheTimingStampSeamIsOffByDefaultAndAddsNoClockRe
     const QMap<QString, int> deliverClock = dueWakeClockCalls( dueWakeCodeOnly( deliver ) );
     ASSERT_EQ( 1, deliverClock.size() );
     ASSERT_EQ( 1, deliverClock.value( QStringLiteral( "nowNs" ) ) );
+    // SEAM-1 adversary pass 2 A1-A3 (48ad052b): every pin above is a TEXT pattern, and each was routed around by a spelling it
+    // did not anticipate (a local lambda named MsgWaitForMultipleObjectsEx shortening the submitted timeout, a dispatch inside
+    // the charge lambda behind the GUI-trace flag, a parenthesized (::QueryPerformanceCounter)( &sample )). The class is "the
+    // off path does more than the reviewed code", so the two bodies are pinned EXACTLY: the SHA-256 of their comment-free,
+    // whitespace-collapsed code (dueWakeCodeOnly( body ).simplified()). Any added statement, call, read or branch changes it.
+    // Re-derive after a deliberate edit with derive-digests.py (PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 r2 run dir), the same
+    // normalization in Python, and re-review the off-path proof before updating these two constants.
+    const auto codeDigest = []( const QString & body ) {
+        return QString::fromLatin1( QCryptographicHash::hash( dueWakeCodeOnly( body ).simplified().toUtf8(), QCryptographicHash::Sha256 ).toHex() );
+    };
+    ASSERT_EQ( std::string( "262e9b0058ff985081ddbea1fbeac5403928f29396f78d3a9550a73f04edb1be" ), codeDigest( sleep ).toStdString() );
+    ASSERT_EQ( std::string( "230d95689ea43cc78f7f8df773d76aa461b292dad4f679a11a610375268bcc65" ), codeDigest( deliver ).toStdString() );
+    // ...and outside the two bodies, the file-wide names a wrapper or a macro would have to reuse (code only): the one wait call,
+    // dispatchPendingSentMessages' definition and its two callers (the runner sleep, dispatchSentMessages), the three QPC reads
+    // (frequency aside) the wait thread and the clock make, and the file's one #define
+    const QString wakeCode = dueWakeCodeOnly( wakeSource );
+    ASSERT_EQ( 1, wakeCode.count( QRegularExpression( QStringLiteral( "\\bMsgWaitForMultipleObjectsEx\\b" ) ) ) );
+    ASSERT_EQ( 3, wakeCode.count( QRegularExpression( QStringLiteral( "\\bdispatchPendingSentMessages\\b" ) ) ) );
+    ASSERT_EQ( 3, wakeCode.count( QRegularExpression( QStringLiteral( "\\bQueryPerformanceCounter\\b" ) ) ) );
+    ASSERT_EQ( 1, wakeCode.count( QRegularExpression( QStringLiteral( "\\bdefine\\b" ) ) ) );
     ASSERT_EQ( 2, sleep.count( QStringLiteral( "const qint64 checkMs = slept.elapsed();" ) ) );
     ASSERT_EQ( 2, unflaggedExitStores );                                // the noteExit lambda's two stores, run only under the flag
     ASSERT_EQ( 1, sleep.count( QStringLiteral( "const auto noteExit = [this]( RunnerSleepExit exit, qint64 elapsedMs )" ) ) );
