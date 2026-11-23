@@ -32,6 +32,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -109,6 +110,25 @@ QString dueWakeCodeOnly( const QString & body )
         if( comment >= 0 ) line.truncate( comment );
     }
     return lines.join( QLatin1Char( '\n' ) );
+}
+// PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 r4 (adversary pass 3 A1 on 91820e1e): the code of a body with every `//` tail cut first
+// (so a `/*` inside a line comment opens nothing) and then every /* ... */ span cut (an unclosed one runs to the end), so a
+// token or digest pin counts code only, never a doc comment's wording (derive-closure.py in the r4 run dir: the same steps)
+QString dueWakeNoComments( const QString & body )
+{
+    const QString code = dueWakeCodeOnly( body );
+    QString out;
+    int at = 0;
+    for( ;; )
+    {
+        const int open = code.indexOf( QStringLiteral( "/*" ), at );
+        if( open < 0 ) { out += code.mid( at ); break; }
+        out += code.mid( at, open - at );
+        const int close = code.indexOf( QStringLiteral( "*/" ), open + 2 );
+        if( close < 0 ) break;
+        at = close + 2;
+    }
+    return out;
 }
 // each clock-read call in a body, by name (the same vocabulary as derive-clock-tokens.py in the round's run dir)
 QMap<QString, int> dueWakeClockCalls( const QString & code )
@@ -2497,6 +2517,10 @@ TEST(PlaybackDueWakeSend, TheRunnerSleepIsTheSentWaitWithTheMsleepKeptForEveryOt
     ASSERT_EQ( 1, wakeSource.count( QStringLiteral(
         "const DWORD waitMs = ms >= static_cast<unsigned long>( INFINITE ) ? INFINITE - 1 : static_cast<DWORD>( ms );" ) ) );
     ASSERT_EQ( 1, wakeSource.count( QStringLiteral( "PeekMessageW( &msg, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );" ) ) );
+    // SEAM-1 r4 (adversary pass 3 A1 on 91820e1e): the exact text above is matched by that one spelling only, so a second pump
+    // spelled `PeekMessageW( &pending, ...` passed it. By TOKEN (code only, comments cut): the file names PeekMessage* once, in
+    // dispatchPendingSentMessages (the closure pin in SEAM1_TheRunnerSleepCallClosure... covers every other pump spelling)
+    ASSERT_EQ( 1, dueWakeNoComments( wakeSource ).count( QRegularExpression( QStringLiteral( "\\bPeekMessage\\w*\\b" ) ) ) );
 }
 
 TEST(PlaybackDueWakeSend, DeliveryKindIsTheSelectionAndDeliveryIsWhatTheArmsUsed)
@@ -3203,10 +3227,14 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     // a product that charges a segment after its dispatch only while armed is caught on the clock too, not only by the token pin.
     constexpr int kAttempts = 10;
     g_r17A1Stamps.reserve( 256 );                                     // the clock callback must never allocate (a throw there would std::terminate the sender's join)
-    wake.setTimingStampsForTest( true );
     // SEAM-1 adversary pass 2 A2 (48ad052b): and with the GUI trace on (the smoke runner's real configuration: a dispatch hidden
     // behind the trace flag ran in no live case, since the trace-on fixtures pass a null sink)
-    const auto judgeSentWait = [&]( bool armed, bool traced ) {
+    // SEAM-1 r4 (adversary pass 3 A1 on 91820e1e): and with the timing-stamp seam OFF (`stamped` false), the production
+    // configuration: a pump added only while the seam is off (a PeekMessageW in noteRunnerSleep( false ), armed and traced) ran
+    // the handler before the old window's charge in no live case, since every judged sleep ran with the seam on. Off, the exit
+    // record stays the setter's None / -1 (the seam records nothing) and every charge-order, window and span assertion is kept.
+    const auto judgeSentWait = [&]( bool armed, bool traced, bool stamped ) {
+    wake.setTimingStampsForTest( stamped );                           // also resets the exit record to None / -1
     std::unique_ptr<R17A1Windows> wp;
     std::vector<std::pair<double, double>> spans;
     std::vector<double> stamps;
@@ -3271,7 +3299,9 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         if( traced ) wake.setGuiTraceActive( false );
         // SEAM-1 adversary pass A3 (cd623269): EVERY sample's exit is judged, before any retry filter below: a sleep the send
         // missed still runs its whole 80 ms (it times out), so no sample -- batched, missed or landed -- can drop a cut-short exit
-        ASSERT_TRUE( dueWakeSleepExitMet( sleepExit, exitMs, 80.0 ) );
+        // SEAM-1 r4: with the seam off the record is exactly the setter's None / -1 (the floor on the caller clock below judges the length)
+        if( stamped ) ASSERT_TRUE( dueWakeSleepExitMet( sleepExit, exitMs, 80.0 ) );
+        else ASSERT_TRUE( sleepExit == PlaybackDueWake::RunnerSleepExit::None && exitMs == -1 );
         if( armed ) wake.cancel();
         g_r17A1Windows = nullptr;
         // the handler's own stamps, taken BEFORE the drain below (which runs the handler too, when the send missed the sleep)
@@ -3300,7 +3330,8 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     // SEAM-1 A1: the sleep was never cut short at a dispatch, on the product's own exit decision: an expiry check left the loop
     // only past the 80 ms on the elapsed value it compared, or the wait timed out (at most one timer tick early); no recorded
     // exit, a failed wait or a wake is not a full interval
-    ASSERT_TRUE( dueWakeSleepExitMet( sleepExit, exitMs, 80.0 ) );
+    if( stamped ) ASSERT_TRUE( dueWakeSleepExitMet( sleepExit, exitMs, 80.0 ) );
+    else ASSERT_TRUE( sleepExit == PlaybackDueWake::RunnerSleepExit::None && exitMs == -1 );
     ASSERT_TRUE( slept == PlaybackDueWake::RunnerSleep::Slept );
     R17A1Windows &w = *wp;
     // the dispatches the sleep recorded: the first send's, then each probe dispatch that was not taken in the same batch
@@ -3390,9 +3421,12 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     ASSERT_TRUE( spans[0].first * 1000.0 <= handlerStartMs + 0.5 );
     ASSERT_TRUE( spans[0].second * 1000.0 >= handlerEndMs - 0.5 );
     };
-    judgeSentWait( false, false );                                     // the wake idle: at least one judged attempt
-    judgeSentWait( true, false );                                      // SEAM-1 A4: the wake armed: at least one judged attempt
-    judgeSentWait( true, true );                                       // pass 2 A2: armed with the GUI trace on
+    for( const bool stamped : { false, true } )                       // SEAM-1 r4 (pass 3 A1): the production seam-off configuration first
+    {
+        judgeSentWait( false, false, stamped );                        // the wake idle: at least one judged attempt
+        judgeSentWait( true, false, stamped );                         // SEAM-1 A4: the wake armed: at least one judged attempt
+        judgeSentWait( true, true, stamped );                          // pass 2 A2: armed with the GUI trace on
+    }
     wake.setTimingStampsForTest( false );
     // a sleep no dispatch cuts is one segment, charged to the window open at its end; NotHandled hands out none
     R17A1Windows plain;
@@ -3630,4 +3664,129 @@ TEST(PlaybackDueWakeSend, SEAM1_TheTimingStampSeamIsOffByDefaultAndAddsNoClockRe
     ASSERT_FALSE( dueWakeSleepExitMet( X::WaitFailed, 200, 80.0 ) );
     ASSERT_FALSE( dueWakeSleepExitMet( X::WokenBySent, 200, 80.0 ) );
 #endif
+}
+
+TEST(PlaybackDueWakeSend, SEAM1_TheRunnerSleepCallClosureIsPinnedAndRunsNoMessagePumpBeforeItsCharge)
+{
+    // PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 r4 (adversary pass 3 A1 on 91820e1e): a PeekMessageW( &pending, ..., PM_QS_SENDMESSAGE )
+    // in noteRunnerSleep (seam off, armed, traced) ran a foreign handler before the old window's charge, and every pin accepted it:
+    // the two digests cover the sleep's and the delivery's bodies only, the file-wide counts named no PeekMessage*, and the exact-text
+    // Peek pin matched one spelling. The class is a pin that guards named tokens or chosen bodies, not every path that can dispatch
+    // messages before the charge. So the runner sleep's whole CALL CLOSURE in PlaybackDueWake.cpp / .h is pinned: (1) the SHA-256 of
+    // every closure body's comment-free, whitespace-collapsed code (dueWakeNoComments( body ).simplified()), so no statement, call or
+    // branch is added to any function the sleep reaches; (2) the call names of the closure are exactly the closure members, the
+    // sleep's three local lambdas, the caller's two callbacks and a fixed set of leaves; (3) each body's message-pump tokens BY NAME
+    // (so `(PeekMessageW)(`, `&PeekMessageW` or a wrapper count too): none outside the sleep's one wait and its one dispatch, and
+    // that dispatch's one PeekMessageW; (4) the file-wide pump-token maps and the leaf names a shadow definition would reuse. The live
+    // judge (R17A1_TheSentWait...) runs the same sleeps with the seam OFF too. Every value is derived with derive-closure.py in the r4
+    // run dir (the same normalization in Python); re-derive and re-review the off-path proof before changing any of them.
+    // OPEN, outside this card: the caller's callbacks (MainWindow's mlv_stage_timing_now lambda and chargeSmokeRunnerSleepSegmentSink).
+    const QString cpp = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
+    const QString hdr = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.h" ) );
+    ASSERT_FALSE( cpp.isEmpty() );
+    ASSERT_FALSE( hdr.isEmpty() );
+    struct ClosureBody
+    {
+        const char *name;
+        bool header;
+        const char *signature;
+        const char *next;
+        const char *digest;
+        const char *pumps;                                              // the body's pump tokens, "name=count" sorted, comma-joined
+    };
+    static const ClosureBody kClosure[] = {
+        { "sleepForSmokeRunner", false, "PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner(",
+          "qint64 PlaybackDueWake::lastRunnerSleepDispatchNs() const",
+          "262e9b0058ff985081ddbea1fbeac5403928f29396f78d3a9550a73f04edb1be", "MsgWaitForMultipleObjectsEx=1,dispatchPendingSentMessages=1" },
+        { "sendsNotify", false, "bool PlaybackDueWake::sendsNotify() const", "PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner(",
+          "fac07298323f6e29dc2a9a25e2a8d2aab74fac1b9c68db12dc48fde59390f122", "" },
+        { "noteRunnerSleep", false, "void PlaybackDueWake::noteRunnerSleep( bool sleeping )",
+          "PlaybackGuiSleepTrace::At PlaybackDueWake::guiStateAt( double ms ) const",
+          "2a09f646a880ce271b4b0d33d0c6995b7309ecd6de2c4a72e3e67e6b7bb4d955", "" },
+        { "Impl::nowMs", false, "    double nowMs() const {", "    PlaybackGuiSleepTrace::At guiStateAt( double ms ) const",
+          "737fc66e1a686eec951a4380eef63baebeaf5404b3bd9066b6960aa2f002212b", "" },
+        { "Impl::ticksToNs+nowNs", false, "    static qint64 ticksToNs( qint64 ticks, qint64 frequency )", "    // the notifier / Qt timer paths",
+          "29d88d7d3fb7ef1431271d5f55e20ec0414a9d22d088c51c301fe7ddafaa10d3", "" },
+        { "dispatchPendingSentMessages", false, "void dispatchPendingSentMessages()", "bool registerDueWakeWindowClass()",
+          "e75f2ca0ee7ba499bef7bedf96e4cd5f1943d1a35431b226e1f4449d9162cdcb", "PeekMessageW=1,dispatchPendingSentMessages=1" },
+        { "PlaybackGuiSleepTrace::note", true, "    void note( State entered, double ms )", "    At at( double ms ) const",
+          "6aa167329468c6c2f1545818d6c2077bb941d79ccf60d998cbfcbff74ebb65f7", "" },
+        { "PlaybackGuiSleepTrace::slot", true, "    static std::size_t slot( std::size_t index )", "    std::array<Entry, kCapacity> m_ring {};",
+          "7faf3263e46c512976f61e57c76bb4d72af3c0ba6cc2bed877a4faadd57ed6b9", "" },
+        { "PlaybackRunnerSleepSegments", true, "struct PlaybackRunnerSleepSegments", "\nclass PlaybackDueWake\n",
+          "42313e0096eccc1d8bb85239e5a168b71bce4795c1b2e8999b91df095bb084fc", "" },
+    };
+    // every name that can pump or dispatch messages, Win32 or Qt, or reach this wake's own delivery (matched as a NAME, call or not)
+    static const QRegularExpression pump( QStringLiteral(
+        "\\b(PeekMessage\\w*|GetMessage\\w*|DispatchMessage\\w*|TranslateMessage\\w*|SendMessage\\w*|SendNotifyMessage\\w*|"
+        "PostMessage\\w*|PostThreadMessage\\w*|MsgWaitForMultipleObjects\\w*|WaitMessage|CallWindowProc\\w*|DefWindowProc\\w*|"
+        "DialogBox\\w*|MessageBox\\w*|processEvents|sendPostedEvents|sendEvent|QEventLoop|exec|GetProcAddress|"
+        "dispatchPendingSentMessages|dispatchSentMessages|handleNativeMessage|holdWindowProcWake|dueWakeWindowProc|"
+        "onFire|deliverGeneration|deliverCurrent|deliverLostPost)\\b" ) );
+    const auto pumpMap = [&]( const QString & code ) {
+        QMap<QString, int> counts;
+        QRegularExpressionMatchIterator it = pump.globalMatch( code );
+        while( it.hasNext() ) ++counts[it.next().captured( 1 )];
+        QStringList parts;
+        for( auto entry = counts.cbegin(); entry != counts.cend(); ++entry )
+            parts << entry.key() + QLatin1Char( '=' ) + QString::number( entry.value() );
+        return parts.join( QLatin1Char( ',' ) );
+    };
+    static const QRegularExpression call( QStringLiteral( "\\b([A-Za-z_]\\w*)\\s*\\(" ) );
+    const QStringList keywords = { QStringLiteral( "if" ), QStringLiteral( "for" ), QStringLiteral( "while" ), QStringLiteral( "switch" ),
+                                   QStringLiteral( "return" ), QStringLiteral( "sizeof" ) };
+    QStringList calls;
+    for( const ClosureBody &entry : kClosure )
+    {
+        const QString body = functionBody( entry.header ? hdr : cpp, QString::fromLatin1( entry.signature ), QString::fromLatin1( entry.next ) );
+        ASSERT_FALSE( body.isEmpty() );
+        const QString code = dueWakeNoComments( body );
+        const QString digest = QString::fromLatin1(
+            QCryptographicHash::hash( code.simplified().toUtf8(), QCryptographicHash::Sha256 ).toHex() );
+        if( digest != QString::fromLatin1( entry.digest ) ) std::fprintf( stderr, "closure body %s digest %s\n", entry.name, qPrintable( digest ) );
+        ASSERT_EQ( std::string( entry.digest ), digest.toStdString() );
+        ASSERT_EQ( std::string( entry.pumps ), pumpMap( code ).toStdString() );
+        QRegularExpressionMatchIterator it = call.globalMatch( code );
+        while( it.hasNext() )
+        {
+            const QString name = it.next().captured( 1 );
+            if( !keywords.contains( name ) ) calls << name;
+        }
+    }
+    calls.removeDuplicates();
+    calls.sort();
+    // the closure members (the bodies above, with PlaybackRunnerSleepSegments' take / dispatchBegins / dispatchEnded / sleepEnds), the
+    // sleep's local lambdas (spanNowS, noteExit, chargeSegment) and its `segments` object, the caller's callbacks (nowS, segmentSink),
+    // and the leaves: Win32 GetQueueStatus / HIWORD / MsgWaitForMultipleObjectsEx / PeekMessageW / QueryPerformanceCounter, Qt
+    // QElapsedTimer start / elapsed / nsecsElapsed and QThread::msleep, std max / llround and the vector's clear / size / emplace_back
+    ASSERT_EQ( std::string( "GetQueueStatus,HIWORD,MsgWaitForMultipleObjectsEx,PeekMessageW,PlaybackRunnerSleepSegments,Q_UNUSED,"
+                            "QueryPerformanceCounter,chargeSegment,clear,dispatchBegins,dispatchEnded,dispatchPendingSentMessages,double,"
+                            "elapsed,emplace_back,llround,max,msleep,note,noteExit,noteRunnerSleep,nowMs,nowNs,nowS,nsecsElapsed,"
+                            "segmentSink,segmentStartS,segments,sendsNotify,size,sleepEnds,sleepForSmokeRunner,slot,spanNowS,start,take,"
+                            "ticksToNs" ),
+               calls.join( QLatin1Char( ',' ) ).toStdString() );
+    // file-wide (code only, comments cut): every pump token by name, so a pump added anywhere in either file -- a new helper the
+    // closure would have to call, a shadow of a closure name -- changes the map; and the leaf names a shadow definition or a
+    // macro would reuse
+    const QString cppCode = dueWakeNoComments( cpp );
+    const QString hdrCode = dueWakeNoComments( hdr );
+    ASSERT_EQ( std::string( "DefWindowProcW=1,GetProcAddress=2,MsgWaitForMultipleObjectsEx=1,PeekMessageW=1,PostMessageW=1,"
+                            "SendNotifyMessageW=1,deliverCurrent=4,deliverGeneration=3,deliverLostPost=1,dispatchPendingSentMessages=3,"
+                            "dispatchSentMessages=1,dueWakeWindowProc=2,handleNativeMessage=4,holdWindowProcWake=2,onFire=10" ),
+               pumpMap( cppCode ).toStdString() );
+    ASSERT_EQ( std::string( "deliverLostPost=1,dispatchSentMessages=1,handleNativeMessage=1,holdWindowProcWake=1,onFire=2" ),
+               pumpMap( hdrCode ).toStdString() );
+    const auto tokens = []( const QString & code, const char *name ) {
+        return code.count( QRegularExpression( QStringLiteral( "\\b%1\\b" ).arg( QString::fromLatin1( name ) ) ) );
+    };
+    ASSERT_EQ( 1, tokens( cppCode, "define" ) );
+    ASSERT_EQ( 1, tokens( cppCode, "GetQueueStatus" ) );
+    ASSERT_EQ( 1, tokens( cppCode, "HIWORD" ) );
+    ASSERT_EQ( 2, tokens( cppCode, "msleep" ) );
+    ASSERT_EQ( 3, tokens( cppCode, "QueryPerformanceCounter" ) );
+    ASSERT_EQ( 1, tokens( cppCode, "nsecsElapsed" ) );
+    ASSERT_EQ( 1, tokens( cppCode, "llround" ) );
+    ASSERT_EQ( 1, tokens( hdrCode, "define" ) );
+    for( const char *leaf : { "GetQueueStatus", "HIWORD", "msleep", "QueryPerformanceCounter", "nsecsElapsed", "llround" } )
+        ASSERT_EQ( 0, tokens( hdrCode, leaf ) );
 }
