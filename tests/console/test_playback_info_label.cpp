@@ -1524,10 +1524,10 @@ TEST(PlaybackInfoLabel, R21G4TheBayerPresenterBranchesSetTheGpuBilinearRendererD
     const QList<int> sites = allIndexesOf(body, bilinearTrue);
     ASSERT_EQ(2, sites.size());
     for ( int at : sites ) ASSERT_TRUE(enclosingBlock(body, at).contains(description));
-    // branch 1 names the handoff mode it just set (gl_r16_bilinear_shader)
+    // branch 1 sets its handoff mode (gl_r16_bilinear_shader), then names the presenter's observed GL renderer (INFO-2 r6 A3)
     const int shaderAt = body.indexOf(QStringLiteral("QStringLiteral(\"gl_r16_bilinear_shader\");"));
     ASSERT_TRUE(shaderAt >= 0);
-    const int descriptionAt = body.indexOf(QStringLiteral("readyFrame.gpuBilinearRendererDescription = texturePresentHandoffMode;"), shaderAt);
+    const int descriptionAt = body.indexOf(QStringLiteral("readyFrame.gpuBilinearRendererDescription = GpuDisplayViewport::rendererDescriptionFor( ui->graphicsView );"), shaderAt);
     ASSERT_TRUE(descriptionAt > shaderAt);
     // the one reader
     const QString recorded = functionBody(source, QStringLiteral("void MainWindow::recordPresentedFrame("));
@@ -1536,6 +1536,64 @@ TEST(PlaybackInfoLabel, R21G4TheBayerPresenterBranchesSetTheGpuBilinearRendererD
     const QString docs = readRepoFile(QStringLiteral("docs/13-testing-infrastructure.md"));
     ASSERT_FALSE(docs.contains(QStringLiteral("- `gpu_bilinear_debayer_active` stays `false`.")));
     ASSERT_TRUE(docs.contains(QStringLiteral("`gpu_bilinear_debayer_active` is `false` on a software renderer only because the probe reports unavailable")));
+}
+
+// INFO-2 r6 (adversary r5 pass-7 A3, MainWindow.cpp:7238; siblings :6454, :6416): the renderer telemetry the profile exports as
+// gpu_bilinear_debayer_renderer / gpu_amaze_debayer_renderer (read at recordPresentedFrame) names the observed GL renderer or compute
+// backend. Three presenter branches wrote a handoff-mode id there (gl_bayer16_bilinear_shader, gl_r16_bilinear_shader, the CUDA
+// AMaZE handoff mode), so an RTX 4090 frame exported "gl_bayer16_bilinear_shader" as its renderer. The handoff mode stays in
+// texturePresentHandoffMode / texturePresentSource only.
+TEST(PlaybackInfoLabel, InfoTwoR6A3RendererTelemetryNamesTheObservedRendererNotAHandoffMode)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString body = functionBody(source, QStringLiteral("void MainWindow::presentPlaybackPreparedFrame("));
+    ASSERT_FALSE(body.isEmpty());
+    const QString viewportRenderer = QStringLiteral("GpuDisplayViewport::rendererDescriptionFor( ui->graphicsView );");
+    // the CUDA AMaZE branch runs only when r16AmazeAvailability.available: its backend description is describeAmazeBackend's
+    const QString presenterRenderer = QStringLiteral(
+        "!r16AmazeAvailability.rendererDescription.isEmpty() ? r16AmazeAvailability.rendererDescription : "
+        "gpuPlaybackReconAmazeTexturePresentedByWindow ? GpuDisplayWindow::rendererDescription() : GpuDisplayViewport::rendererDescriptionFor( ui->graphicsView );");
+    // the observed sources: the presenter's out-param (GL_RENDERER or describeAmazeBackend), the probed CUDA AMaZE backend, or the
+    // presenting surface's GL_RENDERER
+    const QStringList observed = {QStringLiteral("textureRenderer;"), QStringLiteral("fallbackRenderer;"), viewportRenderer, presenterRenderer};
+    const QStringList fields = {QStringLiteral("readyFrame.gpuBilinearRendererDescription = "),
+                                QStringLiteral("readyFrame.gpuAmazeRendererDescription = ")};
+    int writes = 0;
+    for ( const QString &field : fields )
+    {
+        for ( int at : allIndexesOf(body, field) )
+        {
+            ++writes;
+            const int eol = body.indexOf(QLatin1Char('\n'), at);
+            const QString rhs = body.mid(at + field.size(), eol - at - field.size()).trimmed();
+            ASSERT_FALSE(rhs.startsWith(QStringLiteral("texturePresentHandoffMode")));   // a handoff mode is not a renderer
+            ASSERT_FALSE(rhs.startsWith(QStringLiteral("QStringLiteral(")));            // nor is a literal mode id
+            bool known = false;
+            for ( const QString &o : observed ) known = known || rhs.startsWith(o);
+            ASSERT_TRUE(known);
+        }
+    }
+    // post-WB texture, three fallbackRenderer writes, the CUDA AMaZE handoff, the R16 bilinear shader, the readback Bayer presenter
+    ASSERT_EQ(7, writes);
+    // the three r6 sites, each in the branch that names its handoff mode
+    const int readbackAt = body.indexOf(QStringLiteral("QStringLiteral(\"cpu16_readback_reconstructed_bayer\")"));
+    ASSERT_TRUE(readbackAt >= 0);
+    const int bayerPresentAt = body.lastIndexOf(QStringLiteral("GpuDisplayViewport::presentBayer16("), readbackAt);
+    ASSERT_TRUE(bayerPresentAt >= 0);
+    ASSERT_TRUE(body.mid(bayerPresentAt, readbackAt - bayerPresentAt).contains(QStringLiteral("readyFrame.gpuBilinearRendererDescription = ") + viewportRenderer));
+    const int r16At = body.indexOf(QStringLiteral("QStringLiteral(\"cuda_gl_r16_texture\");"));
+    ASSERT_TRUE(r16At >= 0);
+    ASSERT_TRUE(enclosingBlock(body, r16At).contains(QStringLiteral("readyFrame.gpuBilinearRendererDescription = ") + viewportRenderer));
+    const int cudaAmazeAt = body.indexOf(QStringLiteral("QStringLiteral(\"cuda_gl_rgba16_amaze_texture\")"));
+    ASSERT_TRUE(cudaAmazeAt >= 0);
+    const QString cudaAmazeBranch = enclosingBlock(body, cudaAmazeAt);
+    ASSERT_TRUE(cudaAmazeBranch.contains(QStringLiteral("readyFrame.gpuAmazeRendererDescription = ") + presenterRenderer));
+    // the handoff mode is kept where it belongs: texturePresentSource is still derived from it
+    ASSERT_TRUE(cudaAmazeBranch.contains(QStringLiteral("texturePresentHandoffMode == QStringLiteral(\"retained_device_bayer16\")")));
+    ASSERT_TRUE(body.contains(QStringLiteral("texturePresentHandoffMode =\n                    QStringLiteral(\"gl_r16_bilinear_shader\");")));
+    // and the one reader still records the field the profile exports
+    const QString recorded = functionBody(source, QStringLiteral("void MainWindow::recordPresentedFrame("));
+    ASSERT_TRUE(recorded.contains(QStringLiteral("m_lastPresentedGpuAmazeRendererDescription = readyFrame.gpuAmazeRendererDescription;")));
 }
 
 // r21 (Grok G2): togglesFromSettings reads the six Show* keys, each default true, from the app's settings store; MainWindow's

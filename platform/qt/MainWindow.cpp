@@ -6413,7 +6413,7 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                 readyFrame.usedGpuAmazeDebayer = true;
                 readyFrame.usedGpuBilinearDebayer = false;
                 readyFrame.gpuAmazeFallbackReason.clear();
-                readyFrame.gpuAmazeRendererDescription = texturePresentHandoffMode;
+                readyFrame.gpuAmazeRendererDescription = !r16AmazeAvailability.rendererDescription.isEmpty() ? r16AmazeAvailability.rendererDescription : gpuPlaybackReconAmazeTexturePresentedByWindow ? GpuDisplayWindow::rendererDescription() : GpuDisplayViewport::rendererDescriptionFor( ui->graphicsView );   // INFO-2 r6 A3: the CUDA AMaZE backend (describeAmazeBackend), else the presenter's GL_RENDERER; the handoff mode stays in texturePresentSource
                 const QString sourcePrefix = gpuPlaybackReconAmazeTexturePresentedByWindow
                     ? QStringLiteral("gpu_window_")
                     : QString();
@@ -6451,7 +6451,7 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                 gpuPlaybackReconNoReadbackPresented = true;
                 texturePresentHandoffMode =
                     QStringLiteral("gl_r16_bilinear_shader");
-                readyFrame.gpuBilinearRendererDescription = texturePresentHandoffMode;   // r21 (Grok G4): the one reader is recordPresentedFrame
+                readyFrame.gpuBilinearRendererDescription = GpuDisplayViewport::rendererDescriptionFor( ui->graphicsView );   // r21 (Grok G4) + INFO-2 r6 A3: the viewport's GL_RENDERER, not the handoff mode; read at recordPresentedFrame
                 texturePresentSource =
                     QStringLiteral("cuda_gl_r16_texture");
             }
@@ -7235,7 +7235,7 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
             /* LOOK-LABEL-PLAYBACK-INFO-1 r20 A1: the display shader debayers the Bayer texture on the GPU (bilinear). */
             readyFrame.usedGpuBilinearDebayer = true;
             readyFrame.usedGpuAmazeDebayer = false;
-            readyFrame.gpuBilinearRendererDescription = QStringLiteral("gl_bayer16_bilinear_shader");   // r21 (Grok G4): this branch's handoff mode
+            readyFrame.gpuBilinearRendererDescription = GpuDisplayViewport::rendererDescriptionFor( ui->graphicsView );   // r21 (Grok G4) + INFO-2 r6 A3: the viewport's GL_RENDERER, not a handoff-mode id
         }
         readyFrame.stageTimingTelemetry.insert(
             QStringLiteral("gpu_playback_recon_texture_present_active"),
