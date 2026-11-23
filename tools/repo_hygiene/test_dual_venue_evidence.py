@@ -303,7 +303,14 @@ DRIFT_W10_LEGS = {"legs/m16-1457-drift-t1-w10-unpaced-fullscreen-s1.json": None,
                   "legs/m16-1457-drift-t1-cool-w10-unpaced-fullscreen-s1.json": "0x00003",
                   "legs/m16-1457-drift-t1-hot-w10-unpaced-fullscreen-s1.json": "0x00030",
                   "legs/m16-1457-drift-t16-w10-unpaced-fullscreen-s1.json": None}
-DRIFT_LEGS = {**DRIFT_LEGS, **{rel: "legs/m16-1457-headroom-unpaced-fullscreen-s1.json" for rel in (*DRIFT_T1_LEGS, *DRIFT_W10_LEGS)}}
+# r5 (sol r4 BLOCKER: the cited arms had no opened strip): the visual twin of each w10 arm. Each is its w10 counterpart with only legId changed and the capture opt-out removed
+# (visualCapture / visualCaptureOptOutReason absent = the speed-leg default, on), so the same build keeps the picture the arm produced. A twin's fps is observer-perturbed (the
+# capture tail keeps playing unpaced past the measured window) and never stands in for its untraced speed leg.
+DRIFT_VISUAL_LEGS = {"legs/m16-1457-drift-t1-w10-visual-unpaced-fullscreen-s1.json": None,
+                     "legs/m16-1457-drift-t1-cool-w10-visual-unpaced-fullscreen-s1.json": "0x00003",
+                     "legs/m16-1457-drift-t1-hot-w10-visual-unpaced-fullscreen-s1.json": "0x00030",
+                     "legs/m16-1457-drift-t16-w10-visual-unpaced-fullscreen-s1.json": None}
+DRIFT_LEGS = {**DRIFT_LEGS, **{rel: "legs/m16-1457-headroom-unpaced-fullscreen-s1.json" for rel in (*DRIFT_T1_LEGS, *DRIFT_W10_LEGS, *DRIFT_VISUAL_LEGS)}}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *DRIFT_LEGS)
 assert len(set(SHIPPED_LEGS)) == len(SHIPPED_LEGS), "a shipped leg is listed twice"
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
@@ -8238,7 +8245,7 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "M16-1457-VENUE-BASELINE-DRIFT-1":   # the thread-cap sweep and the P-core arm of the 1457 baseline-drift bench, named by arm
                 self.assertIn("legs/" + path.name, DRIFT_LEGS, path.name)
                 self.assertEqual(spec["legId"], path.stem, path.name)
-                self.assertRegex(spec["legId"], r"^m16-1457-drift-(t(1|4|8|12|16)|t1-cool|t1-hot|pcore12|(t1|t1-cool|t1-hot|t16)-w10)-unpaced-fullscreen-s1$", path.name)
+                self.assertRegex(spec["legId"], r"^m16-1457-drift-(t(1|4|8|12|16)|t1-cool|t1-hot|pcore12|(t1|t1-cool|t1-hot|t16)-w10(-visual)?)-unpaced-fullscreen-s1$", path.name)
                 self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
                 self.assertEqual(spec["generatorArgs"]["swapInterval"], 0, path.name)
             elif spec["card"] == "CUDA-HEADROOM-UTIL-SAMPLER-1":   # the unpaced Cinematic utilisation-sampler leg (Look Assist forced on, the owner shape), named by cell
@@ -19635,6 +19642,28 @@ class DriftLegSpecTests(unittest.TestCase):
                 self.assertEqual(spec["card"], "M16-1457-VENUE-BASELINE-DRIFT-1")
                 self.assertEqual(dict(spec, legId=twin["legId"], playSeconds=twin["playSeconds"]), twin)
 
+    def test_each_visual_twin_is_its_w10_arm_with_only_the_leg_id_changed_and_the_capture_on(self) -> None:
+        """r5: sol r4 BLOCKER, the arms cited by the verdict had no opened strip. A visual twin keeps every byte of its w10 arm (the same cap, mask, window, criteria)
+        except legId, and drops the capture opt-out: an absent visualCapture means on for a speed leg (Get-DvVisualCaptureRequest), so no new runner key is needed."""
+        pairs = {"legs/m16-1457-drift-t1-w10-visual-unpaced-fullscreen-s1.json": "legs/m16-1457-drift-t1-w10-unpaced-fullscreen-s1.json",
+                 "legs/m16-1457-drift-t1-cool-w10-visual-unpaced-fullscreen-s1.json": "legs/m16-1457-drift-t1-cool-w10-unpaced-fullscreen-s1.json",
+                 "legs/m16-1457-drift-t1-hot-w10-visual-unpaced-fullscreen-s1.json": "legs/m16-1457-drift-t1-hot-w10-unpaced-fullscreen-s1.json",
+                 "legs/m16-1457-drift-t16-w10-visual-unpaced-fullscreen-s1.json": "legs/m16-1457-drift-t16-w10-unpaced-fullscreen-s1.json"}
+        self.assertEqual(set(pairs), set(DRIFT_VISUAL_LEGS))
+        for rel, arm_rel in pairs.items():
+            with self.subTest(leg=rel):
+                spec, arm = self.load(rel), self.load(arm_rel)
+                self.jsonschema.validate(spec, self.schema)
+                self.assertEqual(spec["legId"], Path(rel).stem)
+                self.assertEqual(spec["card"], "M16-1457-VENUE-BASELINE-DRIFT-1")
+                self.assertEqual(spec["legType"], "speed", "the capture only exists on a speed leg")
+                self.assertNotIn("visualCapture", spec, "absent means on")
+                self.assertNotIn("visualCaptureOptOutReason", spec)
+                self.assertIs(arm["visualCapture"], False, "the untraced arm keeps its opt-out: its fps must not be perturbed by the capture tail")
+                body = {k: v for k, v in arm.items() if k not in ("visualCapture", "visualCaptureOptOutReason")}
+                self.assertEqual(dict(spec, legId=arm["legId"]), body)
+                self.assertEqual(list(spec), [k for k in arm if k not in ("visualCapture", "visualCaptureOptOutReason")], "the arm's keys in the arm's order")
+
     def test_the_pcore_arm_adds_only_the_affinity_keys_the_cap_and_the_two_partition_criteria(self) -> None:
         rel = "legs/m16-1457-drift-pcore12-unpaced-fullscreen-s1.json"
         spec, source = self.load(rel), self.load(DRIFT_LEGS[rel])
@@ -19659,7 +19688,8 @@ class DriftLegSpecTests(unittest.TestCase):
         CPUs (Core Temp core k = logical CPUs 2k, 2k+1). Same mask size on both, so a speed gap between them is the core, not the mask width."""
         pcore = self.load("legs/m16-1457-drift-pcore12-unpaced-fullscreen-s1.json")
         for family, base_rel in ((DRIFT_T1_LEGS, "legs/m16-1457-drift-t1-unpaced-fullscreen-s1.json"),
-                                 (DRIFT_W10_LEGS, "legs/m16-1457-drift-t1-w10-unpaced-fullscreen-s1.json")):
+                                 (DRIFT_W10_LEGS, "legs/m16-1457-drift-t1-w10-unpaced-fullscreen-s1.json"),
+                                 (DRIFT_VISUAL_LEGS, "legs/m16-1457-drift-t1-w10-visual-unpaced-fullscreen-s1.json")):
             self.assert_single_core_family(family, self.load(base_rel), pcore)
 
     def assert_single_core_family(self, family: dict, t1: dict, pcore: dict) -> None:
