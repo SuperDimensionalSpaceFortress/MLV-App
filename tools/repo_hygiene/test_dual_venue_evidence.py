@@ -19671,6 +19671,9 @@ class DriftLegSpecTests(unittest.TestCase):
                 ga = spec["generatorArgs"]
                 self.assertEqual(ga["playbackMaxThreads"], 1)
                 self.assertEqual(ga["benchAffinityMask"], mask)
+                # r4 adversary A5: the expected value must not come from the same table the spec is checked against, or a swapped table passes. The cool leg is Core Temp c0
+                # (logical CPUs 0+1), the hot leg c2 (logical CPUs 4+5): literals, keyed by the leg's name.
+                self.assertEqual(int(ga["benchAffinityMask"], 16), 0x00003 if "-t1-cool-" in rel else 0x00030, rel)
                 self.assertIs(ga["corePartitionTelemetry"], True)
                 self.assertEqual(ga["corePartitionHelperMask"], pcore["generatorArgs"]["corePartitionHelperMask"], "the helper stays on the E-cores")
                 self.assertEqual(int(ga["benchAffinityMask"], 16) & int(ga["corePartitionHelperMask"], 16), 0, "the helper is never a bench CPU")
