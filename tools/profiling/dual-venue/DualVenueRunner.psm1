@@ -3145,7 +3145,8 @@ function ConvertTo-DvMatrixTable {
         $mine = @($Rows | Where-Object { $_.cellId -ceq $c.cellId })
         $meas = @($mine | Where-Object { Test-DvMatrixRowMeasured -Row $_ })
         # r7 (adversary r7 A3): a repeat the runner refused because its spec bytes changed after planning (row outcome SPEC_CHANGED) never ran: it is listed in `outcomes`, not counted in `ran`
-        $ranCount = @($mine | Where-Object { $_.outcome -cne 'SPEC_CHANGED' }).Count
+        # r10 (sol r9 item 1): SPEC_UNREADABLE (the planned spec could not be read at launch) is the same prelaunch refusal and is left out of `ran` the same way
+        $ranCount = @($mine | Where-Object { @('SPEC_CHANGED', 'SPEC_UNREADABLE') -cnotcontains [string]$_.outcome }).Count
         $pf = @($meas | ForEach-Object { $_.presentedFps })
         $range = $(if ($pf.Count -gt 0) { '(' + (& $f ($pf | Measure-Object -Minimum).Minimum 2) + '-' + (& $f ($pf | Measure-Object -Maximum).Maximum 2) + ')' } else { '' })
         $presented = ((& $f (Get-DvMedian $pf) 2) + ' ' + $range).Trim()

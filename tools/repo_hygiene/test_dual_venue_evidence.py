@@ -6374,6 +6374,14 @@ class DisplayMatrixLegSetTests(unittest.TestCase):
         self.assertIn("| 1/1 | 12.00 (12.00-12.00) |", line)
         self.assertTrue(line.endswith("PASS x1, SPEC_CHANGED x1 |"), line)
 
+    def test_an_unreadable_spec_refusal_is_listed_in_the_outcomes_but_not_counted_as_run(self) -> None:
+        """r10 (sol r9 item 1): a repeat refused because its planned spec could not be read at launch (row outcome SPEC_UNREADABLE) did not run either: 0/0, like SPEC_CHANGED."""
+        cells = [{"cellId": "cuda-windowed-s1", "backend": "cuda", "displayMode": "windowed", "scaleFactor": 1}]
+        rows = [self.row("cuda-windowed-s1", outcome="SPEC_UNREADABLE", fps=None, presentedFps=None, timelineFpsAfterFirstPresent=None, renderWorkMs=None, dualIsoMs=None)]
+        line = self.table(rows, cells).splitlines()[2]
+        self.assertIn("| 0/0 |", line)
+        self.assertTrue(line.endswith("SPEC_UNREADABLE x1 |"), line)
+
     def test_the_scale_column_reads_as_resolution_labels_never_bare_factors(self) -> None:
         """SCALE-LABEL-CLARITY-1 r2: requested -> effective renders through the same mapping as the plan line and outcomeDetail (Get-DvScaleLabel); the
         internal receipt fields stay numeric. An unread effective scale ('UNKNOWN') says so; an off-preset factor is 'Custom res (1/N)'."""
@@ -6569,6 +6577,52 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
         first = next(l for l in legs if "cell=cuda-fullscreen-s1 " in l)
         self.assertIn("outcome=NO_RECEIPT", first, "the leg whose receipt could not be written is no receipt, not a changed spec")
         self.assertFalse([l for l in proc.stdout.splitlines() if l.startswith("DVE_MATRIX_SPEC_CHANGED ")], proc.stdout)
+        self.assertFalse([l for l in proc.stdout.splitlines() if l.startswith("DVE_MATRIX_SPEC_UNREADABLE ")], proc.stdout)
+
+    def run_unreadable_matrix(self, make_unreadable: str):
+        """A cuda matrix run in a COPY of the runner tree whose first leg's generator stub makes the spec of plan entry 2 (cuda-windowed-s1) unreadable by `make_unreadable`
+        (a PowerShell statement over $t, the spec path): strictly after planning, before leg 2's child reads its spec. Returns (proc, target path)."""
+        dv = self.mutated_runner([])
+        target = dv / "legs" / "m16-1243-display-windowed-s1.json"
+        hook = f"$t = '{target}'\nif (Test-Path -LiteralPath $t -PathType Leaf) {{ {make_unreadable} }}\n"
+        anchor = "$cfg = Get-Content -LiteralPath $env:DVE_STUB -Raw | ConvertFrom-Json"
+        self.assertEqual(STUB_GENERATOR.count(anchor), 1)
+        self.gen = self.tmp / "gen-unreadable-stub.ps1"
+        self.gen.write_text(STUB_GENERATOR.replace(anchor, hook + anchor, 1), encoding="utf-8")
+        proc = self.run_matrix(1, ["-Backend", "cuda"], {}, dv=dv)
+        self.assertFalse(target.is_file(), "the fixture really made the planned spec unreadable")
+        return proc, target
+
+    def assert_unreadable_leg_refused(self, proc) -> None:
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        legs = [l for l in proc.stdout.splitlines() if l.startswith("DVE_MATRIX_LEG ")]
+        self.assertEqual(len(legs), 6, proc.stdout)
+        refused = next(l for l in legs if "cell=cuda-windowed-s1 " in l)
+        self.assertIn("outcome=SPEC_UNREADABLE", refused, "a planned spec the child could not read is a typed prelaunch refusal, not NO_RECEIPT\n" + proc.stdout)
+        self.assertIn("receipt=none", refused)
+        self.assertTrue(any(l.startswith("DVE_MATRIX_SPEC_UNREADABLE ") and "cell=cuda-windowed-s1" in l for l in proc.stdout.splitlines()), "the refusal is a typed line\n" + proc.stdout)
+        self.assertFalse([l for l in proc.stdout.splitlines() if l.startswith("DVE_MATRIX_SPEC_CHANGED ")], proc.stdout)
+        receipts = [json.loads(p.read_text(encoding="utf-8")) for p in self.receipts.rglob("*.json")]
+        self.assertEqual(len(receipts), 5, "the other five legs still ran and wrote their receipts")
+        submitted = [l for l in self.log.read_text(encoding="utf-8").splitlines() if l.strip()]
+        self.assertFalse([l for l in submitted if "windowed-s1" in l], "the unreadable leg's job was submitted")
+        text = Path(re.search(r"DVE_MATRIX_SUMMARY=(.+)", proc.stdout).group(1).strip()).read_text(encoding="utf-8")
+        self.assertIn("= 6 leg(s), 5 measured.", text)
+        row = next(l for l in text.splitlines() if l.startswith("| cuda-windowed-s1 "))
+        self.assertIn("| 0/0 |", row, "the refused repeat never ran (sol r9: it read 0/1)")
+        self.assertTrue(row.endswith("SPEC_UNREADABLE x1 |"), row)
+
+    def test_a_planned_spec_missing_at_child_launch_is_a_typed_prelaunch_refusal_that_counts_no_run(self) -> None:
+        """r10 (sol r9 item 1, its literal): plan cuda-windowed-s1 from its valid spec, then the planned path is absent when the child launches. The child exited at Resolve-Path
+        with no typed record, so the parent read NO_RECEIPT and 0/1 under `measured / ran`. It is now a visible prelaunch refusal (SPEC_UNREADABLE) counting 0/0, the shape of SPEC_CHANGED."""
+        proc, target = self.run_unreadable_matrix("Remove-Item -LiteralPath $t -Force")
+        self.assert_unreadable_leg_refused(proc)
+
+    def test_a_planned_spec_replaced_by_a_directory_is_a_typed_prelaunch_refusal_that_counts_no_run(self) -> None:
+        """r10 (class sibling of sol r9 item 1): the path still resolves but ReadAllBytes throws (a directory now sits there): the same SPEC_UNREADABLE refusal, 0/0."""
+        proc, target = self.run_unreadable_matrix("Remove-Item -LiteralPath $t -Force; New-Item -ItemType Directory -Path $t | Out-Null")
+        self.assertTrue(target.is_dir())
+        self.assert_unreadable_leg_refused(proc)
 
 
 # ---------------------------------------------------------------------------------------------------

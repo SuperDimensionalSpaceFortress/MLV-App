@@ -196,6 +196,15 @@ if ($null -ne $setPlan) {
             $row.outcome = 'SPEC_CHANGED'
             $row.note = 'DVE_LEG_SPEC_CHANGED: the spec bytes changed after planning; the leg was refused before anything ran'
         }
+        # r10 (sol r9 item 1): the same shape for a planned spec the child could not read at launch (missing or unreadable): classified ONLY by the child's own whole-line record naming
+        # THIS entry's planned hash; outcome SPEC_UNREADABLE is a prelaunch refusal, so the table's `ran` leaves it out (0/0, as SPEC_CHANGED), and it is never a NO_RECEIPT leg
+        $unreadable = $false
+        foreach ($childLine in $childOut) { if ($childLine -cmatch '^DVE_LEG_SPEC_UNREADABLE planned_sha256=(?<p>[0-9a-f]{64})$' -and $Matches['p'] -ceq [string]$entry.specSha256) { $unreadable = $true } }
+        if ($null -eq $legReceipt -and $null -eq $refusedRead -and $unreadable) {
+            Write-Output ('DVE_MATRIX_SPEC_UNREADABLE {0}/{1} repeat={2} cell={3} leg={4} planned_sha256={5} (the planned spec could not be read at launch; the leg was refused and is no measurement)' -f $entry.seq, $total, $entry.repeat, $entry.cellId, $entry.legId, $entry.specSha256)
+            $row.outcome = 'SPEC_UNREADABLE'
+            $row.note = 'DVE_LEG_SPEC_UNREADABLE: the planned spec could not be read at launch; the leg was refused before anything ran'
+        }
         $rows.Add($row)
         Write-Output ('DVE_MATRIX_LEG {0}/{1} repeat={2} cell={3} outcome={4} receipt={5}' -f $entry.seq, $total, $entry.repeat, $entry.cellId, $row.outcome, $(if ($receiptPath) { $receiptPath } else { 'none' }))
     }
@@ -242,7 +251,16 @@ if ($null -ne $table) {
     }
 }
 
-$specBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $LegSpec).Path)
+# r10 (sol r9 item 1): a leg bound to a planned hash whose spec is missing or unreadable at launch (deleted, or a directory now sits at the path) is a typed refusal too: the anchored
+# STDOUT record below names the planned hash, so a matrix parent shows it as SPEC_UNREADABLE (a prelaunch refusal that never ran), not a NO_RECEIPT leg counted in `ran`.
+# Nothing has been generated or submitted yet. Without -ExpectSpecSha256 (a single leg) the read error is rethrown unchanged.
+$specBytes = $null
+try { $specBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $LegSpec).Path) }
+catch {
+    if (-not $ExpectSpecSha256) { throw }
+    Write-Output "DVE_LEG_SPEC_UNREADABLE planned_sha256=$ExpectSpecSha256"
+    throw "DVE_LEG_SPEC_UNREADABLE the leg spec '$LegSpec' could not be read after planning ($($_.Exception.Message)); nothing is generated or submitted"
+}
 if ($ExpectSpecSha256) {
     # r19 (sol r18 B1): the bytes read above are the bytes this leg runs; they must be the ones the batch's budget preflight judged (raw sha256, no line-ending normalisation)
     $readSpecSha = ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData($specBytes)) -replace '-', '').ToLowerInvariant()
