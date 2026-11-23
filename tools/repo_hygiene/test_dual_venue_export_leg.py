@@ -885,7 +885,10 @@ class ExportEvidenceTests(unittest.TestCase):
         for (fmt, elapsed), g in zip([(f, e) for f in ("prores", "cdng-lossless") for e in (0.0, 0.1, 60.0)], got):
             with self.subTest(fmt=fmt, elapsed=elapsed):
                 if elapsed == 60.0:
-                    self.assertEqual(g["outcome"], "PASS", g)
+                    if fmt == "prores":   # (r3, adversary A2 on c2da7e24: the shipped dual-ISO criterion reads the typed UNKNOWN)
+                        assert_clean_but_dual_iso_unknown(self, g)
+                    else:
+                        self.assertEqual(g["outcome"], "PASS", g)
                     self.assertFalse(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p for p in g["problems"]), g)
                 else:
                     self.assertEqual(g["outcome"], "INVALID", g)
@@ -933,7 +936,7 @@ class ExportEvidenceTests(unittest.TestCase):
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         self.assertEqual(got[0]["outcome"], "INVALID", got[0])
         self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p for p in got[0]["problems"]), got[0])
-        self.assertEqual(got[1]["outcome"], "PASS", got[1])   # control: small nested stages
+        assert_clean_but_dual_iso_unknown(self, got[1])   # control: small nested stages (r3: clean, the shipped dual-ISO criterion UNKNOWN)
         self.assertEqual(got[2]["outcome"], "INVALID", got[2])   # 30 + 30 ms together do not fit a 41 ms parent beside... each fits, the SUM (60) does not
         self.assertTrue(any("the disjoint stages" in p for p in got[2]["problems"]), got[2])
 
@@ -974,7 +977,7 @@ class ExportEvidenceTests(unittest.TestCase):
             with self.subTest(case=i):
                 self.assertEqual(got[i]["outcome"], "INVALID", got[i])
                 self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "the disjoint stages" in p for p in got[i]["problems"]), got[i])
-        self.assertEqual(got[2]["outcome"], "PASS", got[2])
+        assert_clean_but_dual_iso_unknown(self, got[2])
 
     def test_r13_adversary_a2_cdng_disjoint_producer_work_is_held_inside_producer_frame_without_the_llrawproc_total(self) -> None:
         """adversary r13 A2: llrawproc_ms is an optional total. Without it raw_read 20 + dark_frame 30 + dual_iso 30 (80 ms of disjoint work) inside a 50 ms producer_frame read PASS,
@@ -1275,12 +1278,14 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         proc, got = evidence_cases([self.case(piped_stage_log(30))])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         g = got[0]
-        self.assertEqual(g["outcome"], "PASS", g)
+        # (r3, adversary A2 on c2da7e24: the log is clean and every other shipped criterion is met, but a dual-ISO time above 0 is an attempt, so the class is the typed
+        # UNKNOWN and the shipped dual-ISO criterion FAILs: KNOWN GAP until EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1)
+        assert_clean_but_dual_iso_unknown(self, g)
         m, st = g["metrics"], g["stages"]
-        self.assertIs(m["dualIsoClassAgrees"], True)
-        self.assertEqual(m["dualIsoActiveFrames"], 30)
+        self.assertIsNone(m["dualIsoClassAgrees"])
+        self.assertIsNone(m["dualIsoActiveFrames"])
         self.assertIs(m["renderPipeTimed"], True)
-        self.assertNotIn("dualIsoClassAgreesCouldNotCheck", m)
+        self.assertTrue(m["dualIsoClassAgreesCouldNotCheck"].startswith(DUALISO_UNKNOWN), m)
         self.assertNotIn("renderPipeTimedCouldNotCheck", m)
         # batch wall 20 s / 30 frames, less processed16_total 56 + export_pipe_write 10 + (drain 100 + verify 200) / 30 frames
         self.assertAlmostEqual(st["untimedPerFrameMs"], 20000.0 / 30.0 - (56.0 + 10.0 + 300.0 / 30.0), places=3)
@@ -1299,7 +1304,7 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         # scaled: export_scale per frame is counted too
         proc, got = evidence_cases([self.case(piped_stage_log(30, scale_ms=6.0), batch=batch_log(30, verified=30, scaled=True))])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
-        self.assertEqual(got[0]["outcome"], "PASS", got[0])
+        assert_clean_but_dual_iso_unknown(self, got[0])
         self.assertAlmostEqual(got[0]["stages"]["untimedPerFrameMs"], 20000.0 / 30.0 - (56.0 + 6.0 + 10.0 + 10.0), places=3)
 
     def test_r3_no_dual_iso_on_a_dual_iso_leg_is_a_clip_class_mismatch(self) -> None:
@@ -1320,7 +1325,7 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         self.assertEqual(got[0]["outcome"], "INVALID", got[0])
         self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "llrawproc_dual_iso" in p for p in got[0]["problems"]), got[0])
-        self.assertEqual(got[1]["outcome"], "PASS", got[1])
+        assert_clean_but_dual_iso_unknown(self, got[1])
 
     def test_r5_a_clip_stage_recorded_twice_or_on_another_frame_is_typed(self) -> None:
         moved = piped_stage_log(30).replace("frame=29 stage=export_verify", "frame=3 stage=export_verify")
@@ -1388,7 +1393,7 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         for g in got[:2]:
             self.assertEqual(g["outcome"], "INVALID", g)
             self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "the disjoint stages" in p and "llrawproc_dual_iso" in p for p in g["problems"]), g)
-        self.assertEqual(got[2]["outcome"], "PASS", got[2])
+        assert_clean_but_dual_iso_unknown(self, got[2])
 
     @staticmethod
     def rows_log(rows: tuple, frames: int = 480) -> str:
@@ -1409,8 +1414,7 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
                 ("export_pipe_write", 10.0))
         proc, got = evidence_cases([self.big(self.rows_log(rows))])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
-        self.assertEqual(got[0]["outcome"], "PASS", got[0])
-        self.assertEqual(got[0]["problems"], [], got[0])
+        assert_clean_but_dual_iso_unknown(self, got[0])
 
     def test_adversary_r1f2_a3_the_render_start_scaled_flag_decides_whether_export_scale_is_owed(self) -> None:
         """adversary A3 on 33f7a05a: the reader never read RENDER_START, so a scaled plan with no export_scale (its residual 6 ms high) and an unscaled plan carrying export_scale
@@ -1430,7 +1434,7 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
             self.assertEqual(g["outcome"], "INVALID", g)
             self.assertTrue(any("export_scale" in p and "scaled=" in p for p in g["problems"]), g)
         for g in got[2:4]:
-            self.assertEqual(g["outcome"], "PASS", g)
+            assert_clean_but_dual_iso_unknown(self, g)
         self.assertAlmostEqual(got[2]["stages"]["untimedPerFrameMs"], 125.0 - (56.0 + 6.0 + 10.0 + 300.0 / 480.0), places=3)
         self.assertEqual(got[4]["outcome"], "INVALID", got[4])
         self.assertTrue(any("RENDER_START" in p for p in got[4]["problems"]), got[4])
@@ -1450,7 +1454,7 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         for g, stage in zip(got[:3], ("export_pipe_write", "export_scale", "llrawproc_dual_iso")):
             self.assertEqual(g["outcome"], "INVALID", g)
             self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and stage in p and "per frame" in p for p in g["problems"]), (stage, g))
-        self.assertEqual(got[3]["outcome"], "PASS", got[3])
+        assert_clean_but_dual_iso_unknown(self, got[3])
 
     def test_adversary_r1f2_a5_a_log_with_some_of_this_cards_stages_is_an_incomplete_capture_not_an_older_build_or_a_fail(self) -> None:
         """adversary A5 on 33f7a05a: a log that carries this card's pipe stages but no dual-ISO row kept the older-build reason, and one missing its drain (or verify) read a
@@ -1530,8 +1534,7 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
             self.assertEqual(g["outcome"], "INVALID", g)
             self.assertTrue(any("RENDER_START" in p for p in g["problems"]), g)
         self.assertTrue(any("view-1" in p and "DONE" in p for p in got[1]["problems"]), got[1])
-        self.assertEqual(got[4]["outcome"], "PASS", got[4])
-        self.assertEqual(got[4]["problems"], [], got[4])
+        assert_clean_but_dual_iso_unknown(self, got[4])
 
     @staticmethod
     def shift(log: str, by: int) -> str:
@@ -1553,8 +1556,7 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         for g in (got[0], got[1], got[3]):
             self.assertEqual(g["outcome"], "INVALID", g)
             self.assertTrue(any(p.startswith("EXPORT_STAGE_WINDOW_MISMATCH") and "cutIn" in p for p in g["problems"]), g)
-        self.assertEqual(got[2]["outcome"], "PASS", got[2])
-        self.assertEqual(got[2]["problems"], [], got[2])
+        assert_clean_but_dual_iso_unknown(self, got[2])
 
     def test_adversary_r2_a4_each_dual_iso_record_pairs_with_the_llrawproc_run_it_follows(self) -> None:
         """adversary A4 on a6f48506: per-frame sums lost the pairing, so llrawproc 0 / dual-ISO 30 then llrawproc 31 / dual-ISO 0 on every frame summed to 31 / 30 and read all
@@ -1576,7 +1578,7 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
             self.assertEqual(g["outcome"], "INVALID", g)
             self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "llrawproc_dual_iso" in p and "follow" in p for p in g["problems"]), g)
         for g in got[2:]:
-            self.assertEqual(g["outcome"], "PASS", g)
+            assert_clean_but_dual_iso_unknown(self, g)
 
     def test_adversary_r2_a5_clip_records_and_batch_lines_keep_the_producers_order(self) -> None:
         """adversary A5 on a6f48506: export_verify moved to the first line, and RENDER_START moved below DONE, both read PASS; the fixture batch_log() itself wrote
@@ -1613,7 +1615,7 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
             self.assertTrue(any(p.startswith("EXPORT_PROFILE_ABSENT") and "incomplete" in p for p in g["problems"]), g)
             self.assertNotIn("a build before EXPORT-RENDER-PIPE-TIMING-1", json.dumps(g["metrics"]), g)
         self.assertTrue(any(head in p for p in got[0]["problems"]), got[0])
-        self.assertEqual(got[2]["outcome"], "PASS", got[2])
+        assert_clean_but_dual_iso_unknown(self, got[2])
 
     def test_adversary_r2_a6_distinguish_a_build_this_repo_cannot_name_keeps_the_r1_reading_and_an_older_build_cannot_carry_the_stages(self) -> None:
         """A6, the distinguished half: a build id that is no commit of this repo (the fixtures' 'e' * 40, or a venue build from another tree) cannot be classed, so a log without
@@ -1668,7 +1670,7 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         for g in got[:3]:
             self.assertEqual(g["outcome"], "INVALID", g)
             self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "export_pipe_write" in p and "order" in p for p in g["problems"]), g)
-        self.assertEqual(got[3]["outcome"], "PASS", got[3])
+        assert_clean_but_dual_iso_unknown(self, got[3])
 
     def test_adversary_r2f1_a3_render_start_dimensions_and_cut_fit_the_producer(self) -> None:
         """pass 4 A3: output 1920x1440 beside source 1920x1080 with scaled=false read PASS with no scale owed (an unscaled plan's output IS its source), and a cut past the
@@ -1683,7 +1685,7 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         for g in got[:2]:
             self.assertEqual(g["outcome"], "INVALID", g)
             self.assertTrue(any("RENDER_START" in p for p in g["problems"]), g)
-        self.assertEqual(got[2]["outcome"], "PASS", got[2])
+        assert_clean_but_dual_iso_unknown(self, got[2])
 
     def test_adversary_r2f1_a4_a9_a_build_id_in_capitals_is_the_same_build_and_derive_in_any_case_derives(self) -> None:
         """pass 4 A4 (and advisory A9): the uppercase spelling of the base commit read 'unknown' (PASS) where the lowercase read EXPORT_PROFILE_FOREIGN (INVALID); and
@@ -2857,7 +2859,10 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
         self.write_export_artifacts(30, fmt="prores")
         proc, good, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
         self.assertIsNotNone(good, proc.stdout[-3000:] + proc.stderr[-3000:])
-        self.assertEqual(good["outcome"], "PASS", good["outcomeDetail"])
+        # (r3, adversary A2 on c2da7e24: a clean receipt on the shipped dual-ISO leg FAILs on dualIsoClassAgrees alone, the typed UNKNOWN, and still verifies)
+        self.assertEqual(good["outcome"], "FAIL", good["outcomeDetail"])
+        self.assertTrue(good["outcomeDetail"].startswith(f"EXPORT_CAPTURED: dualIsoClassAgrees: {DUALISO_UNKNOWN}:"), good["outcomeDetail"])
+        self.assertNotIn("; ", good["outcomeDetail"])
         self.assertEqual(self.validate(good, spec)["status"], "VERIFIED_OFFLINE_TEST")
         for stage in ("raw_uint16", "raw_uint16_disk_read", "raw_uint16_decompress", "llrawproc"):
             for name, frames in (("singleton", [100]), ("disjoint", range(30, 60)), ("partial", range(15))):

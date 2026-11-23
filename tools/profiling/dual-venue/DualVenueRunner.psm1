@@ -5175,6 +5175,13 @@ function Test-DvExportCdngProfileRecords {
 # any line that began RENDER_START read a conflicting second scaled=, a line cut short after scaled= and another clip's line as a declaration.
 $script:ExportRenderStartLine = '(?m)^\[BATCH\] RENDER_START (?<clip>[^\r\n]+?) codec=(?<codec>\S+) container=(?<container>\S+) source=(?<sw>[0-9]{1,9})x(?<sh>[0-9]{1,9}) output=(?<ow>[0-9]{1,9})x(?<oh>[0-9]{1,9}) scaled=(?<s>true|false) fps=(?<fps>\S+) frames=(?<n>[0-9]{1,12}) cutIn=(?<ci>[0-9]{1,12}) cutOut=(?<co>[0-9]{1,12}) out=(?<out>[^\r\n]+?)\r?$'
 $script:ExportRenderStartKeys = @('codec', 'container', 'source', 'output', 'scaled', 'fps', 'frames', 'cutIn', 'cutOut', 'out')
+# r3 (adversary A3 on c2da7e24): the ProRes producer's codec and container strings (BatchRenderedVideoPlan.h:1184 and :1196) and its fps form (a QLocale English decimal)
+$script:ExportRenderStartCodec = 'prores'
+$script:ExportRenderStartContainer = 'mov'
+$script:ExportRenderStartFps = '\A[0-9]{1,6}(?:\.[0-9]{1,9})?\z'
+# r3 (adversary A2 on c2da7e24): the typed reason a ProRes run's dual-ISO class is not readable from a timed attempt, and the card that adds the producer's applied signal
+$script:ExportDualIsoAppliedUnknown = 'DUALISO_APPLIED_UNKNOWN'
+$script:ExportDualIsoAppliedSuccessor = 'successor EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1'
 
 function Get-DvRenderStartDeclaration {
     # The one RENDER_START line of a rendered export's batch log, for the clip DONE names. Returns [pscustomobject]@{ problem; scaled; cutIn; cutOut; frames; index }: problem is a
@@ -5194,6 +5201,23 @@ function Get-DvRenderStartDeclaration {
     $name = $hit.Groups['clip'].Value
     # (r2 fix 1, pass 4 A6: ORDINAL, so a name that only renders like DONE's -- view-0 and a zero-width space -- is another clip; -cne compares by culture)
     if ([string]::IsNullOrEmpty($Clip) -or -not [string]::Equals($name, $Clip, [StringComparison]::Ordinal)) { return (& $no "EXPORT_OUTPUT_MISMATCH: RENDER_START declares clip '$name' but DONE names '$Clip', so the declaration is not of this export") }
+    # r3 (adversary A3 on c2da7e24): the declaration is the ProRes producer's own. BatchRunner.cpp:471-478 prints plan.outputVerificationPlan.expectedCodec / expectedContainer,
+    # which BatchRenderedVideoPlan.cpp:4026-4030 sets from batchRenderedVideoMediaProbeCodecName / ContainerName: for ProRes / Mov those fall through to
+    # BatchRenderedVideoPlan.h:1184 `return "prores";` and :1196 `return "mov";`. Source is getMlvWidth / getMlvHeight and output the frame plan's, which
+    # BatchRenderedVideoPlan.cpp:4502 refuses unless both are above 0; fps is batchRenderedVideoFfmpegFrameRateArgument (BatchRenderedVideoPlan.cpp:4521-4526, QLocale
+    # English toString of the clip's rate): a finite positive decimal. `codec=h264 container=mp4 source=0x0 fps=NaN` read PASS before this: no ProRes export writes it.
+    $codec = $hit.Groups['codec'].Value; $container = $hit.Groups['container'].Value
+    if (-not [string]::Equals($codec, $script:ExportRenderStartCodec, [StringComparison]::Ordinal) -or -not [string]::Equals($container, $script:ExportRenderStartContainer, [StringComparison]::Ordinal)) {
+        return (& $no "EXPORT_PROFILE_FOREIGN: RENDER_START declares codec=$codec container=$container; a ProRes export's rendered runner declares codec=$($script:ExportRenderStartCodec) container=$($script:ExportRenderStartContainer) (BatchRenderedVideoPlan.h batchRenderedVideoCodecName / ContainerName), so the declaration is not of this export")
+    }
+    $dims = @('sw', 'sh', 'ow', 'oh' | ForEach-Object { [int64]$hit.Groups[$_].Value })
+    if (@($dims | Where-Object { $_ -le 0 }).Count -gt 0) {
+        return (& $no "EXPORT_PROFILE_FOREIGN: RENDER_START declares source=$($dims[0])x$($dims[1]) output=$($dims[2])x$($dims[3]); the rendered runner exports a clip with both dimensions above 0 and its frame plan refuses an output that is not (BatchRenderedVideoPlan.cpp), so the declaration is not of this export")
+    }
+    $fpsText = $hit.Groups['fps'].Value; $fps = [decimal]0
+    if (-not [regex]::IsMatch($fpsText, $script:ExportRenderStartFps) -or -not [decimal]::TryParse($fpsText, [Globalization.NumberStyles]::AllowDecimalPoint, [Globalization.CultureInfo]::InvariantCulture, [ref]$fps) -or $fps -le 0) {
+        return (& $no "EXPORT_PROFILE_FOREIGN: RENDER_START declares fps=$fpsText; the rendered runner declares the clip's frame rate as a finite decimal above 0 (batchRenderedVideoFfmpegFrameRateArgument), so the declaration is not of this export")
+    }
     $n = [int64]$hit.Groups['n'].Value; $ci = [int64]$hit.Groups['ci'].Value; $co = [int64]$hit.Groups['co'].Value
     # (r2 fix 1, pass 4 A3: the producer's cut is uint32, BatchRunner.cpp:356-357)
     if ($ci -lt 1 -or $co -lt $ci -or $co -gt [int64][uint32]::MaxValue -or $n -ne ($co - $ci + 1)) {
@@ -5634,7 +5658,8 @@ function Get-DvExportEvidence {
             if ($drainRecs.Count -eq 1 -and $verifyRecs.Count -eq 1 -and $verifyRecs[0].line -lt $drainRecs[0].line) {
                 $problems.Add("EXPORT_RECORD_INVALID: stage-timing.log records export_verify (line $($verifyRecs[0].line)) before export_pipe_drain (line $($drainRecs[0].line)); the producer verifies the .mov only after the encoder has drained")
             }
-            # the clip's dual-ISO class (mirrors the CDNG profile's llrawproc_dual_iso_ms rule): every timed frame carries the figure, active = ms > 0. Absent: an older build,
+            # the clip's dual-ISO class: every timed frame carries the figure; 0 ms on every frame = no reconstruction, any frame above 0 = UNKNOWN (r3, fail closed: an attempt's
+            # time is no applied reconstruction; the CDNG profile's active = ms > 0 rule above is EXPORT-VENUE-LEG-1's and is not changed here). Absent: an older build,
             # null with the reason above and no problem. On another window than processed16_total's: null (the window check above has typed it).
             $dual = $perStage['llrawproc_dual_iso']
             if ($dual.Count -gt 0) {
@@ -5645,12 +5670,28 @@ function Get-DvExportEvidence {
                     $m['dualIsoClassAgreesCouldNotCheck'] = $m['dualIsoActiveFramesCouldNotCheck']
                 }
                 else {
+                    # r3 (adversary A2 on c2da7e24): FAIL CLOSED. A time above 0 ms is the dual-ISO ATTEMPT's, never proof the reconstruction applied: llrawproc.c:6019 times
+                    # the attempt and dualiso.c:7484-7487 refuses a receipt's dualIsoInterpolation 2 inside it (the worker then restores the frame and publishes the elapsed
+                    # attempt), and the rendered path publishes no producer signal that it APPLIED. So a frame timed above 0 is no active frame: the class of a run with any
+                    # is a typed UNKNOWN (null, never PASS on dualIsoClassAgrees). A run timed 0 on every frame ran no reconstruction (the class is readable, as before), and
+                    # a no-dual-ISO leg whose run attempted dual-ISO is the class mismatch it was (one was tried where none was owed).
                     $m.Remove('dualIsoActiveFramesCouldNotCheck'); $m.Remove('dualIsoClassAgreesCouldNotCheck')
-                    $active = @($dual.Values | Where-Object { [double]$_ -gt 0 }).Count
-                    $m.dualIsoActiveFrames = [int64]$active
-                    $agrees = $(if ($DualIsoExpected) { $active -eq $p16Frames.Count } else { $active -eq 0 })
-                    $m.dualIsoClassAgrees = $agrees
-                    if (-not $agrees) { $classMismatch = $true; $classDetail = "CLIP_CLASS_MISMATCH: dualIsoExpected is $($DualIsoExpected.ToString().ToLowerInvariant()) but $active of $($p16Frames.Count) timed frame(s) ran dual-ISO processing (llrawproc_dual_iso above 0 ms)" }
+                    $attempted = @($dual.Values | Where-Object { [double]$_ -gt 0 }).Count
+                    if ($attempted -eq 0) {
+                        $m.dualIsoActiveFrames = [int64]0
+                        $agrees = -not $DualIsoExpected
+                        $m.dualIsoClassAgrees = $agrees
+                        if (-not $agrees) { $classMismatch = $true; $classDetail = "CLIP_CLASS_MISMATCH: dualIsoExpected is true but none of $($p16Frames.Count) timed frame(s) attempted dual-ISO processing (llrawproc_dual_iso 0 ms on every frame), so no frame was reconstructed" }
+                    }
+                    else {
+                        $unknown = "$($script:ExportDualIsoAppliedUnknown): llrawproc_dual_iso is above 0 ms on $attempted of $($p16Frames.Count) timed frame(s), and a time above 0 is the attempt's (llrawproc.c times it, dualiso.c can refuse the reconstruction inside it), so whether dual-ISO was applied is not readable until the producer publishes an applied signal ($($script:ExportDualIsoAppliedSuccessor))"
+                        $m.dualIsoActiveFrames = $null; $m['dualIsoActiveFramesCouldNotCheck'] = $unknown
+                        $m.dualIsoClassAgrees = $null; $m['dualIsoClassAgreesCouldNotCheck'] = $unknown
+                        if (-not $DualIsoExpected) {
+                            $m.dualIsoClassAgrees = $false; $m.Remove('dualIsoClassAgreesCouldNotCheck')
+                            $classMismatch = $true; $classDetail = "CLIP_CLASS_MISMATCH: dualIsoExpected is false but $attempted of $($p16Frames.Count) timed frame(s) attempted dual-ISO processing (llrawproc_dual_iso above 0 ms)"
+                        }
+                    }
                 }
             }
             # renderPipeTimed: the pipe write on every frame processed16_total is timed on, and one drain and one verify. Absent (none of the three): an older build, null.
