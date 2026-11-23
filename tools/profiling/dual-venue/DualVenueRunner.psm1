@@ -4669,7 +4669,8 @@ $script:ExportCdngWriterStages = @('disk_write', 'writer_queue_wait', 'writer_co
 # (video_mlv.c mlv_note_llrawproc_dual_iso), so it nests inside llrawproc; export_scale (scaled frame plans only) and export_pipe_write are timed per frame by
 # BatchRunner.cpp AFTER getMlvProcessedFrame16 returns, so they are per-frame stages OUTSIDE processed16_total (no share of it); export_pipe_drain (finish) and
 # export_verify (the decode, geometry and probe checks) are timed once per clip, on its last frame. What the batch wall still holds untimed is the work before the
-# first frame (clip open, receipt apply, frame plan, buffer allocation, ffmpeg start) and the publish rename. A build before that card publishes none of the five.
+# first frame (clip open, receipt apply, frame plan, buffer allocation, ffmpeg start), the diagnostics read and teardown between the drain and the verify (BatchRunner.cpp:600-605,
+# r2 advisory A7 on a6f48506), and the publish rename. A build before that card publishes none of the five.
 $script:ExportRenderedStages = @('raw_uint16', 'raw_uint16_disk_read', 'raw_uint16_decompress', 'llrawproc', 'llrawproc_dual_iso', 'debayered_frame', 'processing', 'processed16_total',
     'export_scale', 'export_pipe_write')
 $script:ExportRenderedTopLevel = @('debayered_frame', 'processing')
@@ -5168,6 +5169,59 @@ function Test-DvExportCdngProfileRecords {
     [pscustomobject]@{ rows = @($rows); ok = @($ok); problems = @($problems) }
 }
 
+# EXPORT-RENDER-PIPE-TIMING-1 r2 (adversary A2 on a6f48506): the rendered runner's RENDER_START line (BatchRunner.cpp:471), WHOLE and in its field order. The first scaled= token of
+# any line that began RENDER_START read a conflicting second scaled=, a line cut short after scaled= and another clip's line as a declaration.
+$script:ExportRenderStartLine = '(?m)^\[BATCH\] RENDER_START (?<clip>[^\r\n]+?) codec=(?<codec>\S+) container=(?<container>\S+) source=(?<sw>[0-9]{1,9})x(?<sh>[0-9]{1,9}) output=(?<ow>[0-9]{1,9})x(?<oh>[0-9]{1,9}) scaled=(?<s>true|false) fps=(?<fps>\S+) frames=(?<n>[0-9]{1,12}) cutIn=(?<ci>[0-9]{1,12}) cutOut=(?<co>[0-9]{1,12}) out=(?<out>[^\r\n]+?)\r?$'
+$script:ExportRenderStartKeys = @('codec', 'container', 'source', 'output', 'scaled', 'fps', 'frames', 'cutIn', 'cutOut', 'out')
+
+function Get-DvRenderStartDeclaration {
+    # The one RENDER_START line of a rendered export's batch log, for the clip DONE names. Returns [pscustomobject]@{ problem; scaled; cutIn; cutOut; frames; index }: problem is a
+    # typed reason (and the rest null) when there is not exactly one line, it is not in the producer's exact form, it names a field twice before out=, it is another clip's,
+    # or its frames= is not cutOut - cutIn + 1 over a 1-based cut; index is the line's offset in the text (the caller holds it before RENDER_VERIFIED and DONE).
+    param([AllowEmptyString()][string]$BatchLogText, [AllowNull()][AllowEmptyString()][string]$Clip)
+    $no = { param($why) [pscustomobject]@{ problem = $why; scaled = $null; cutIn = $null; cutOut = $null; frames = $null; index = $null } }
+    $lines = @([regex]::Matches([string]$BatchLogText, '(?m)^\[BATCH\] RENDER_START'))
+    $exact = @([regex]::Matches([string]$BatchLogText, $script:ExportRenderStartLine))
+    if ($lines.Count -ne 1 -or $exact.Count -ne 1) {
+        return (& $no "EXPORT_PROFILE_ABSENT: batch.log carries $($lines.Count) RENDER_START line(s), $($exact.Count) of them in the rendered runner's exact form (BatchRunner.cpp: <clip> codec= container= source=WxH output=WxH scaled=true|false fps= frames= cutIn= cutOut= out=); it declares one per clip, so whether export_scale is owed and the frame window are not readable")
+    }
+    $hit = $exact[0]
+    $head = $hit.Value.Substring(0, $hit.Groups['out'].Index - $hit.Index)
+    $repeated = @($script:ExportRenderStartKeys | Where-Object { [regex]::Matches($head, " $_=").Count -ne 1 })
+    if ($repeated.Count -gt 0) { return (& $no "EXPORT_PROFILE_ABSENT: RENDER_START names $($repeated -join ', ') more than once before out=; the rendered runner writes each field once, so the declaration is not readable") }
+    $name = $hit.Groups['clip'].Value
+    if ([string]::IsNullOrEmpty($Clip) -or $name -cne $Clip) { return (& $no "EXPORT_OUTPUT_MISMATCH: RENDER_START declares clip '$name' but DONE names '$Clip', so the declaration is not of this export") }
+    $n = [int64]$hit.Groups['n'].Value; $ci = [int64]$hit.Groups['ci'].Value; $co = [int64]$hit.Groups['co'].Value
+    if ($ci -lt 1 -or $co -lt $ci -or $n -ne ($co - $ci + 1)) {
+        return (& $no "EXPORT_PROFILE_ABSENT: RENDER_START declares frames=$n cutIn=$ci cutOut=$co; the rendered runner declares frames = cutOut - cutIn + 1 over a 1-based cut, so the frame window is not readable")
+    }
+    [pscustomobject]@{ problem = $null; scaled = ($hit.Groups['s'].Value -ceq 'true'); cutIn = $ci; cutOut = $co; frames = $n; index = $hit.Index }
+}
+
+# EXPORT-RENDER-PIPE-TIMING-1 r2 (adversary A6 on a6f48506): whether a build emits this card's stages, read from that commit's own src/debug/StageTiming.h in the repo this module
+# ships in (read-only git): 'emits' (it defines MLV_STAGE_EXPORT_PIPE_WRITE), 'older' (it does not, or has no such file), 'unknown' (no 40-hex id, no commit of this repo, or git
+# did not answer). Keyed by repo and id, so one process asks git once per build.
+$script:RenderPipeMarkerPath = 'src/debug/StageTiming.h'
+$script:RenderPipeMarker = '#define MLV_STAGE_EXPORT_PIPE_WRITE'
+$script:RenderPipeBuildClassCache = [hashtable]::new([StringComparer]::Ordinal)
+
+function Get-DvRenderPipeBuildClass {
+    param([AllowNull()][AllowEmptyString()][string]$BuildId, [string]$RepoRoot = '')
+    if ([string]::IsNullOrEmpty($RepoRoot)) { $RepoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..')) }
+    if ([string]$BuildId -cnotmatch '^[0-9a-f]{40}$') { return 'unknown' }
+    $key = "$RepoRoot|$BuildId"
+    if ($script:RenderPipeBuildClassCache.ContainsKey($key)) { return $script:RenderPipeBuildClassCache[$key] }
+    $class = 'unknown'
+    $kind = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('cat-file', '-t', $BuildId)
+    if ($kind.exitCode -eq 0 -and ([Text.Encoding]::ASCII.GetString($kind.bytes)).Trim() -ceq 'commit') {
+        $blob = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('cat-file', '-p', "${BuildId}:$($script:RenderPipeMarkerPath)")
+        if ($blob.exitCode -eq 0) { $class = $(if ((ConvertTo-DvText $blob.bytes).Contains($script:RenderPipeMarker)) { 'emits' } else { 'older' }) }
+        elseif ($blob.exitCode -gt 0) { $class = 'older' }   # (a commit with no such file; exit -1 is git not answering, which stays unknown)
+    }
+    if ($class -cne 'unknown' -or $kind.exitCode -gt 0) { $script:RenderPipeBuildClassCache[$key] = $class }   # (git not answering is asked again next time)
+    $class
+}
+
 function Test-DvExportStageLogRecords {
     # The rendered path's stage-timing log against the table above. Returns [pscustomobject]@{ perStage; problems }: perStage[stage][frame] = ms for each stage in
     # $script:ExportRenderedStages. A line that carries the tag and is not exactly one conforming record is a problem; a stage the reader does not know is checked
@@ -5183,21 +5237,31 @@ function Test-DvExportStageLogRecords {
     $clipRecords = @{}
     foreach ($name in $script:ExportRenderedClipStages) { $clipRecords[$name] = [System.Collections.Generic.List[object]]::new() }
     $bad = [System.Collections.Generic.List[string]]::new()
+    # r2 (adversary A4 + A5 on a6f48506): the producer writes ONE stream in order (StageTiming.h fprintf + fflush per note), so a record's place in it is evidence too: each
+    # llrawproc_dual_iso note is written right after the llrawproc note of its run (video_mlv.c mlv_note_llrawproc_dual_iso), and the drain and verify notes after every per-frame one
+    $prev = $null                                                  # the conforming record on the tagged line before this one (any stage), $null after a malformed one
+    $dualRecs = [System.Collections.Generic.List[object]]::new()   # each llrawproc_dual_iso record with the record it follows
+    $lastPerFrameLine = 0                                          # the line of the last record of a per-frame stage this reader knows
     $lineNo = 0
     foreach ($line in ($Text -split "`r?`n")) {
         $lineNo++
         if (-not $line.Contains($script:ExportStageLogTag)) { continue }
         $hit = [regex]::Match($line, $script:ExportStageLogRecord)
         $why = $null
-        if (-not $hit.Success) { $why = 'is not one record of the form frame=N stage=NAME ms=NUMBER' }
+        if (-not $hit.Success) { $why = 'is not one record of the form frame=N stage=NAME ms=NUMBER'; $prev = $null }
         else {
             $ms = [double]::Parse($hit.Groups['ms'].Value, [Globalization.CultureInfo]::InvariantCulture)
             $why = Get-DvExportTimingProblem $ms
+            if ($null -ne $why) { $prev = $null }
             if ($null -eq $why) {
                 $s = $hit.Groups['s'].Value
                 $f = $hit.Groups['f'].Value.TrimStart('0'); if ($f -eq '') { $f = '0' }
-                if ($clipRecords.ContainsKey($s)) { $clipRecords[$s].Add([pscustomobject]@{ frame = $f; ms = $ms }); continue }
+                $before = $prev
+                $prev = [pscustomobject]@{ stage = $s; frame = $f; msText = $hit.Groups['ms'].Value; line = $lineNo }
+                if ($clipRecords.ContainsKey($s)) { $clipRecords[$s].Add([pscustomobject]@{ frame = $f; ms = $ms; line = $lineNo }); continue }
                 if (-not $perStage.ContainsKey($s)) { continue }
+                $lastPerFrameLine = $lineNo
+                if ($s -ceq 'llrawproc_dual_iso') { $dualRecs.Add([pscustomobject]@{ frame = $f; msText = $hit.Groups['ms'].Value; line = $lineNo; after = $before }) }
                 $perStage[$s][$f] = $(if ($perStage[$s].ContainsKey($f)) { $perStage[$s][$f] + $ms } else { $ms })
                 $recCount[$s][$f] = 1 + $(if ($recCount[$s].ContainsKey($f)) { $recCount[$s][$f] } else { 0 })
             }
@@ -5227,7 +5291,19 @@ function Test-DvExportStageLogRecords {
         }
     }
     if ($repeats.Count -gt 0) { $problems.Add("EXPORT_RECORD_INVALID: $($repeats.Count) frame(s) carry another count of a once-per-frame stage than the producer notes per frame, so no one figure of it is that frame's (first: $($repeats[0]))") }
-    [pscustomobject]@{ perStage = $perStage; clipRecords = $clipRecords; problems = @($problems) }
+    # r2 (adversary A4 on a6f48506): per-frame SUMS lose the pairing (llrawproc 0 / dual-ISO 30 then llrawproc 31 / dual-ISO 0 summed to 31 / 30 and read every frame active). On a frame that
+    # carries llrawproc, each dual-ISO record is the record right after an llrawproc record of that frame and fits inside that one run (the containment slack, in [decimal]); with the
+    # per-frame counts above, every llrawproc run then has its own dual-ISO figure. (A frame with no llrawproc at all keeps the r1 rule: its dual-ISO leaf stands in for it in the sum groups.)
+    $unpaired = [System.Collections.Generic.List[string]]::new()
+    foreach ($d in $dualRecs) {
+        if (-not $perStage['llrawproc'].ContainsKey($d.frame)) { continue }
+        $a = $d.after
+        if ($null -eq $a -or $a.stage -cne 'llrawproc' -or $a.frame -cne $d.frame) { $unpaired.Add("line $($d.line) frame $($d.frame) does not follow an llrawproc record of that frame"); continue }
+        $child = [decimal]::Parse($d.msText, [Globalization.CultureInfo]::InvariantCulture); $parent = [decimal]::Parse($a.msText, [Globalization.CultureInfo]::InvariantCulture)
+        if ($child -gt $parent * $script:ExportStageContainToleranceD + $script:ExportStageContainSlackD + $script:ExportStageContainEpsilonD) { $unpaired.Add("line $($d.line) frame $($d.frame) is $($d.msText) ms inside the $($a.msText) ms llrawproc run it follows (line $($a.line))") }
+    }
+    if ($unpaired.Count -gt 0) { $problems.Add("EXPORT_RECORD_INVALID: $($unpaired.Count) llrawproc_dual_iso record(s) are not the dual-ISO share of the llrawproc run they follow (video_mlv.c notes it right after each llrawproc note, inside that run) (first: $($unpaired[0]))") }
+    [pscustomobject]@{ perStage = $perStage; clipRecords = $clipRecords; lastPerFrameLine = $lastPerFrameLine; problems = @($problems) }
 }
 
 function Get-DvExportEvidence {
@@ -5248,7 +5324,10 @@ function Get-DvExportEvidence {
           [AllowNull()][AllowEmptyString()][string]$BatchLogText = '', [AllowNull()][AllowEmptyString()][string]$OutputManifestText = '',
           # EXPORT-RENDER-PIPE-TIMING-1 r1 fix 1 (adversary A2): reproduce the base reader's ProRes metrics and stage table for a stage log that carries none of that card's stages
           # (a receipt written before it re-derives equal); ignored for CDNG and for any log that carries one of them
-          [switch]$LegacyRenderShape)
+          [switch]$LegacyRenderShape,
+          # r2 (adversary A6 on a6f48506): whether the build named by ExpectedBuildId emits this card's stages. 'derive' (the default, what both callers use) reads it from that
+          # commit's own src/debug/StageTiming.h (Get-DvRenderPipeBuildClass, read-only git); a test may name the class. ProRes only.
+          [ValidateSet('derive', 'emits', 'older', 'unknown')][string]$RenderPipeBuildClass = 'derive')
     $problems = [System.Collections.Generic.List[string]]::new()
     $m = [ordered]@{ framesRequested = $MaxFrames; framesExported = $null; exportFramesSkipped = $null; exportFramesFailed = $null; profileFramesSucceeded = $null
                      profileFramesFailed = $null; stageFramesSeen = $null; dualIsoActiveFrames = $null; dualIsoClassAgrees = $null; outputFileCount = $null; outputBytes = $null
@@ -5391,6 +5470,7 @@ function Get-DvExportEvidence {
     }
     else {
         $m.profileFramesSucceeded = $null; $m['profileFramesSucceededCouldNotCheck'] = 'a ProRes export is timed by the stage-timing log, not the export stage profiler'
+        $buildClass = $(if ($RenderPipeBuildClass -ceq 'derive') { Get-DvRenderPipeBuildClass -BuildId $ExpectedBuildId } else { $RenderPipeBuildClass })
         # EXPORT-RENDER-PIPE-TIMING-1: the clip's dual-ISO class and renderPipeTimed are read from the stage log below; a log from an older build (or no log) leaves each
         # null with its reason and adds NO problem, so a receipt written before that card re-derives the same outcome (the leg's criteria, not the reader, refuse it)
         $why = "$($script:ExportRenderPipeOlderBuild): the rendered export path records no llrawproc_dual_iso stage, so a ProRes leg cannot read its clip's dual-ISO class"
@@ -5398,9 +5478,12 @@ function Get-DvExportEvidence {
         if ([string]::IsNullOrEmpty($StageLogText)) { $why = 'stage-timing.log is absent'; $whyPipe = $why }
         $m['dualIsoActiveFramesCouldNotCheck'] = $why; $m['dualIsoClassAgreesCouldNotCheck'] = $why
         $m['renderPipeTimed'] = $null; $m['renderPipeTimedCouldNotCheck'] = $whyPipe
-        $verified = @([regex]::Matches([string]$BatchLogText, '(?m)^\[BATCH\] RENDER_VERIFIED \S+ decoded_frames=(?<n>[0-9]{1,15})(?=\s|$)'))   # r15 (pass14 A2): the token ends at whitespace or the line end, so 480.5, 480-1 and 480/2 verify nothing (a word boundary also ends it at '.')
+        $verified = @([regex]::Matches([string]$BatchLogText, '(?m)^\[BATCH\] RENDER_VERIFIED (?<clip>\S+) decoded_frames=(?<n>[0-9]{1,15})(?=\s|$)'))   # r15 (pass14 A2): the token ends at whitespace or the line end, so 480.5, 480-1 and 480/2 verify nothing (a word boundary also ends it at '.')
+        $doneClip = $(if ($done.Count -eq 1) { $done[0].Groups['base'].Value } else { $null })
         if ($verified.Count -ne 1) { $problems.Add("EXPORT_OUTPUT_MISMATCH: batch.log carries $($verified.Count) RENDER_VERIFIED line(s); the batch's own verification of the .mov must pass exactly once") }
         elseif ($null -ne $m.framesExported -and [int64]$verified[0].Groups['n'].Value -ne $m.framesExported) { $problems.Add("EXPORT_OUTPUT_MISMATCH: the batch verified $($verified[0].Groups['n'].Value) decoded frame(s) but exported $($m.framesExported)") }
+        # r2 (adversary advisory A8 on a6f48506): the verification is of the clip DONE names (BatchRunner.cpp prints both with the one baseName)
+        elseif ($null -ne $doneClip -and $verified[0].Groups['clip'].Value -cne $doneClip) { $problems.Add("EXPORT_OUTPUT_MISMATCH: batch.log verifies clip '$($verified[0].Groups['clip'].Value)' but DONE names '$doneClip', so the batch's own verification is not of this clip's .mov") }
         if ([string]::IsNullOrEmpty($StageLogText)) { $problems.Add('EXPORT_PROFILE_ABSENT: stage-timing.log is absent') }
         else {
             # r7: ONE schema (Test-DvExportStageLogRecords) -- every line that carries the tag is one conforming record, or the log is INVALID with a typed reason
@@ -5446,7 +5529,7 @@ function Get-DvExportEvidence {
             $disjoint = $(if ($null -ne $rowsOut['debayered_frame'].meanMs -and $null -ne $rowsOut['processing'].meanMs) { Get-DvExportRound ($rowsOut['debayered_frame'].meanMs + $rowsOut['processing'].meanMs) } else { $null })
             $within = $(if ($null -ne $disjoint -and $null -ne $p16.meanMs -and $p16.meanMs -gt 0) { [math]::Abs($disjoint - $p16.meanMs) / $p16.meanMs -le 0.05 } else { $null })
             $largest = @($script:ExportRenderedTopLevel | Where-Object { $null -ne $rowsOut[$_].meanMs } | Sort-Object { -[double]$rowsOut[$_].meanMs } | Select-Object -First 1)
-            $untimedText = $(if ($pipePresent) { "batch wall per frame minus processed16_total, export_scale, export_pipe_write and (export_pipe_drain + export_verify) / frames exported; what is left (clip open, receipt apply, frame plan and ffmpeg start before the first frame, and the publish) is not timed per stage by the app" }
+            $untimedText = $(if ($pipePresent) { "batch wall per frame minus processed16_total, export_scale, export_pipe_write and (export_pipe_drain + export_verify) / frames exported; what is left (clip open, receipt apply, frame plan and ffmpeg start before the first frame, the encoder diagnostics read and the frame-buffer and clip teardown between the drain and the verify, and the publish) is not timed per stage by the app" }
                              else { "$($script:ExportRenderPipeOlderBuild): batch wall per frame minus processed16_total (clip open, pipe write, ffmpeg back-pressure, finish and verify) is not timed per stage by the app" })
             $drainVerifyText = $(if ($pipePresent) { 'export_pipe_drain and export_verify are timed once per clip (clipRows) and spread over the exported frames in untimedPerFrameMs' }
                                  else { "$($script:ExportRenderPipeOlderBuild): the rendered path times no drain or verify stage" })
@@ -5486,6 +5569,14 @@ function Get-DvExportEvidence {
                 elseif ($recs.Count -eq 1 -and $null -ne $lastFrame -and [string]$recs[0].frame -cne $lastFrame) {
                     $problems.Add("EXPORT_STAGE_WINDOW_MISMATCH: stage-timing.log records $name on frame $($recs[0].frame), not on the last frame ($lastFrame) processed16_total is timed on, so it is not this window's")
                 }
+                # r2 (adversary A5 on a6f48506): and in the producer's order: the drain after the frame loop (BatchRunner.cpp pipeline.finish), the verify after the drain
+                elseif ($recs.Count -eq 1 -and $recs[0].line -lt $records.lastPerFrameLine) {
+                    $problems.Add("EXPORT_RECORD_INVALID: stage-timing.log records $name on line $($recs[0].line), before the last per-frame record (line $($records.lastPerFrameLine)); the producer notes it once after every frame is written, so it is not this clip's")
+                }
+            }
+            $drainRecs = @($clipRecords['export_pipe_drain']); $verifyRecs = @($clipRecords['export_verify'])
+            if ($drainRecs.Count -eq 1 -and $verifyRecs.Count -eq 1 -and $verifyRecs[0].line -lt $drainRecs[0].line) {
+                $problems.Add("EXPORT_RECORD_INVALID: stage-timing.log records export_verify (line $($verifyRecs[0].line)) before export_pipe_drain (line $($drainRecs[0].line)); the producer verifies the .mov only after the encoder has drained")
             }
             # the clip's dual-ISO class (mirrors the CDNG profile's llrawproc_dual_iso_ms rule): every timed frame carries the figure, active = ms > 0. Absent: an older build,
             # null with the reason above and no problem. On another window than processed16_total's: null (the window check above has typed it).
@@ -5519,30 +5610,53 @@ function Get-DvExportEvidence {
             $cardRequired = @('llrawproc_dual_iso', 'export_pipe_write', 'export_pipe_drain', 'export_verify')
             $hasStage = { param($n) if ($clipRecords.ContainsKey($n)) { $clipRecords[$n].Count -gt 0 } else { $perStage[$n].Count -gt 0 } }
             $cardSeen = @(@($cardRequired) + @('export_scale') | Where-Object { & $hasStage $_ })
-            if ($cardSeen.Count -gt 0) {
+            # r2 (adversary A6 on a6f48506): the build identity decides too. A build whose own StageTiming.h defines this card's stages times them all, so a log of that build
+            # with NONE of them is an incomplete capture (a stale or foreign stage log beside this build's batch log), never an older build's reading; and a log carrying them
+            # beside a build that cannot emit them is not that build's log. A build this repo cannot name ('unknown': no 40-hex id, or no commit of it here) keeps the r1 reading.
+            if ($cardSeen.Count -gt 0 -and $buildClass -ceq 'older') {
+                $problems.Add("EXPORT_PROFILE_FOREIGN: stage-timing.log carries $($cardSeen -join ' / '), which build $ExpectedBuildId cannot emit (its src/debug/StageTiming.h defines no EXPORT-RENDER-PIPE-TIMING-1 stage), so the log is not the build's the job ran")
+            }
+            if ($cardSeen.Count -gt 0 -or $buildClass -ceq 'emits') {
                 $cardMissing = @($cardRequired | Where-Object { -not (& $hasStage $_) })
                 if ($cardMissing.Count -gt 0) {
-                    $incomplete = "the capture is incomplete: stage-timing.log carries $($cardSeen -join ' / ') of EXPORT-RENDER-PIPE-TIMING-1 but no $($cardMissing -join ' / '), and a build that times one times them all"
+                    $incomplete = $(if ($cardSeen.Count -gt 0) { "the capture is incomplete: stage-timing.log carries $($cardSeen -join ' / ') of EXPORT-RENDER-PIPE-TIMING-1 but no $($cardMissing -join ' / '), and a build that times one times them all" }
+                                    else { "the capture is incomplete: build $ExpectedBuildId times every EXPORT-RENDER-PIPE-TIMING-1 stage (its src/debug/StageTiming.h defines them) but stage-timing.log carries no $($cardMissing -join ' / ')" })
                     $problems.Add("EXPORT_PROFILE_ABSENT: $incomplete, so the run reads no product result")
                     if ($cardMissing -ccontains 'llrawproc_dual_iso') { $m['dualIsoActiveFramesCouldNotCheck'] = $incomplete; $m['dualIsoClassAgreesCouldNotCheck'] = $incomplete }
                     if ($null -eq $m.renderPipeTimed) { $m['renderPipeTimedCouldNotCheck'] = $incomplete }
                 }
                 # r1 fix 2 (adversary A3 on 33f7a05a): the producer's own RENDER_START line (BatchRunner.cpp:471) declares scaled=true|false; export_scale is timed on every
                 # frame exactly when it is true (the window check above holds a partial one), so a scaled plan with none and an unscaled plan with some are other runs' figures
-                $starts = @([regex]::Matches([string]$BatchLogText, '(?m)^\[BATCH\] RENDER_START [^\r\n]*? scaled=(?<s>true|false)(?=\s|$)'))
+                # r2 (adversary A2, A3, A5 on a6f48506): the line is read WHOLE, in the producer's exact field order (Get-DvRenderStartDeclaration), for DONE's clip, before
+                # RENDER_VERIFIED and DONE; and its cut is the frame window: the producer's loop (BatchRunner.cpp:541) times frames cutIn-1 .. cutOut-1 and nothing else
+                $decl = Get-DvRenderStartDeclaration -BatchLogText ([string]$BatchLogText) -Clip $doneClip
                 $scale = $perStage['export_scale']
-                if ($starts.Count -ne 1) { $problems.Add("EXPORT_PROFILE_ABSENT: batch.log carries $($starts.Count) RENDER_START line(s) declaring scaled=; the rendered runner declares it once per clip, so whether export_scale is owed is not readable") }
-                elseif ($starts[0].Groups['s'].Value -ceq 'true' -and $scale.Count -eq 0) { $problems.Add('EXPORT_PROFILE_ABSENT: RENDER_START declares scaled=true but stage-timing.log times no export_scale; a scaled frame plan times it on every frame') }
-                elseif ($starts[0].Groups['s'].Value -ceq 'false' -and $scale.Count -gt 0) { $problems.Add("EXPORT_STAGE_WINDOW_MISMATCH: RENDER_START declares scaled=false but stage-timing.log times export_scale on $($scale.Count) frame(s); an unscaled frame plan runs no scale") }
+                if ($null -ne $decl.problem) { $problems.Add($decl.problem) }
+                else {
+                    if ($done.Count -eq 1 -and $decl.index -gt $done[0].Index) { $problems.Add('EXPORT_OUTPUT_MISMATCH: batch.log writes RENDER_START after DONE; the rendered runner declares the clip before it exports it, so the declaration is not of this export') }
+                    elseif ($verified.Count -eq 1 -and ($decl.index -gt $verified[0].Index -or ($done.Count -eq 1 -and $verified[0].Index -gt $done[0].Index))) {
+                        $problems.Add('EXPORT_OUTPUT_MISMATCH: batch.log does not write RENDER_START, RENDER_VERIFIED and DONE in the order the rendered runner writes them, so they are not one export')
+                    }
+                    if ($decl.scaled -and $scale.Count -eq 0) { $problems.Add('EXPORT_PROFILE_ABSENT: RENDER_START declares scaled=true but stage-timing.log times no export_scale; a scaled frame plan times it on every frame') }
+                    elseif (-not $decl.scaled -and $scale.Count -gt 0) { $problems.Add("EXPORT_STAGE_WINDOW_MISMATCH: RENDER_START declares scaled=false but stage-timing.log times export_scale on $($scale.Count) frame(s); an unscaled frame plan runs no scale") }
+                    $lo = $decl.cutIn - 1; $hi = $decl.cutOut - 1
+                    $outside = @($p16Frames.Keys | Where-Object { $k = [int64]$_; $k -lt $lo -or $k -gt $hi })
+                    if ($p16Frames.Count -ne $decl.frames -or $outside.Count -gt 0) {
+                        $problems.Add("EXPORT_STAGE_WINDOW_MISMATCH: stage-timing.log times processed16_total on $($p16Frames.Count) frame(s), $($outside.Count) of them outside frames $lo..$hi; RENDER_START declares cutIn=$($decl.cutIn) cutOut=$($decl.cutOut), and the producer's loop times frames cutIn-1 .. cutOut-1 only, so the log is of another window")
+                    }
+                }
             }
         }
         # r1 fix 1 (adversary A2): the base reader's shape, for old-format evidence only (no log, or a log with none of the new stages). The problems and the outcome are the
         # same either way (an old-format log adds no problem); only the published metrics and stage table are projected back to the fields and texts the base wrote.
-        if ($LegacyRenderShape) {
+        # (r2: never for a build that emits this card's stages: its receipt is of this shape, and its log without them is the incomplete capture typed above)
+        if ($LegacyRenderShape -and $buildClass -cne 'emits') {
             $newStageSeen = $false
             if (-not [string]::IsNullOrEmpty($StageLogText)) {
-                $newStageSeen = (@('llrawproc_dual_iso') + @($script:ExportRenderedOutsideDenominator) | Where-Object { $perStage[$_].Count -gt 0 }).Count -gt 0 -or
-                                (@($script:ExportRenderedClipStages) | Where-Object { $clipRecords[$_].Count -gt 0 }).Count -gt 0
+                # r2 (adversary A1 on a6f48506): each filter is wrapped in @(), so zero or one matching stage is an array with a Count under Set-StrictMode -Version Latest
+                # (a bare pipeline result is $null or a scalar, and .Count on it threw PropertyNotFoundStrict)
+                $newStageSeen = @(@('llrawproc_dual_iso') + @($script:ExportRenderedOutsideDenominator) | Where-Object { $perStage[$_].Count -gt 0 }).Count -gt 0 -or
+                                @(@($script:ExportRenderedClipStages) | Where-Object { $clipRecords[$_].Count -gt 0 }).Count -gt 0
             }
             if (-not $newStageSeen) {
                 $m.Remove('renderPipeTimed'); $m.Remove('renderPipeTimedCouldNotCheck')

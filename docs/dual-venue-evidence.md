@@ -476,10 +476,17 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
     (`EXPORT_STAGE_WINDOW_MISMATCH`); the pipe stages follow `processed16_total`, so they are published with no share of it (`largestStage` is unchanged). A once-per-clip stage
     recorded twice is `EXPORT_RECORD_INVALID`, and one on another frame is `EXPORT_STAGE_WINDOW_MISMATCH`; both are listed under `clipRows`. `processed16_total`, plus
     `export_scale` and `export_pipe_write`, plus (drain + verify) / frames exported, must fit inside the batch wall per frame. `untimedPerFrameMs` is the wall per frame minus that
-    sum, so what is left is clip open, receipt apply, frame plan, ffmpeg start and the publish. `dualIsoClassAgrees` / `dualIsoActiveFrames` follow the CDNG rule (active = ms > 0)
+    sum, so what is left is clip open, receipt apply, frame plan and ffmpeg start, the diagnostics read and teardown between the drain and the verify, and the publish.
+    `dualIsoClassAgrees` / `dualIsoActiveFrames` follow the CDNG rule (active = ms > 0)
     over `llrawproc_dual_iso`, and `renderPipeTimed` is true when the pipe write is on every timed frame with one drain and one verify. Both ProRes legs gate
     `dualIsoClassAgrees eq true` and `renderPipeTimed eq true`. A stage log from a build before that card has none of these stages: both metrics are null with a
     `CouldNotCheck` naming that, no problem is added, and `untimedPerFrameMs` is the wall per frame minus `processed16_total` as before.
+    From r2 the reader also holds the log to the producer's own sequence and declaration: each `llrawproc_dual_iso` record on a frame that carries `llrawproc` is the record
+    right after an `llrawproc` record of that frame and fits inside it; the drain follows every per-frame record and the verify follows the drain (`EXPORT_RECORD_INVALID`);
+    `RENDER_START` is read whole, once, for the clip `DONE` names, before `RENDER_VERIFIED` and `DONE`, and its cut is the frame window (the loop times frames
+    `cutIn - 1 .. cutOut - 1`, `EXPORT_STAGE_WINDOW_MISMATCH` otherwise). The build identity (the job summary's `sourceCommit`) is classed from that commit's own
+    `src/debug/StageTiming.h`: a build that defines these stages with a log carrying none of them is an incomplete capture (`EXPORT_PROFILE_ABSENT`), a build that does not
+    with a log carrying them is `EXPORT_PROFILE_FOREIGN`, and a build this repository cannot name keeps the reading above.
 * **Time budget** (`Get-ExportJobTimeBudget`): the job timeout is one margined identity read of the clip (at the measured cold rate), plus the quiescence
   samples (3 x 12 + 30 = 66 s), plus the export wait, plus a fixed 600 s margin. The export wait is `max(900, 4 x maxFrames)` s plus another identity-read
   allowance, for the app's own re-read. The export wait is the job's own `WaitForExit`, so the smoke runner's 3600 s process ceiling does not cap it.
