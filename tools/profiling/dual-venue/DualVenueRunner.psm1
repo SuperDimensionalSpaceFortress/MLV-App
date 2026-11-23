@@ -5256,10 +5256,57 @@ function Test-DvRenderPipeMarkerDefined {
     # names the define in a comment as 'emits'.) True only when a directive line defines the macro: comments are removed first (block, then line), and the directive may
     # carry blanks before and after its '#'.
     param([AllowNull()][AllowEmptyString()][string]$Text)
-    if ([string]::IsNullOrEmpty($Text)) { return $false }
-    $code = [regex]::Replace($Text, '(?s)/\*.*?\*/', ' ')
+    return ((Get-DvRenderPipeMarkerState $Text) -ceq 'defined')
+}
+
+function Get-DvRenderPipeMarkerState {
+    # (r4 fix 2, adversary A5 on 724d72ff: a directive spliced across lines with a backslash read undefined, and one inside `#if 0` or followed by `#undef` read defined.)
+    # Whether MLV_STAGE_EXPORT_PIPE_WRITE is defined at the end of the header, in the C translation order: line splices are joined first, then comments are removed, then
+    # the directives are read. 'defined' or 'undefined' when every #define / #undef of the macro sits where this model can decide it is live -- no conditional, the
+    # include guard (an outermost #ifndef G whose next directive is #define G), or a literal #if 0 / #if 1 chain with its #elif / #else -- and 'undecidable' otherwise
+    # (a define under #ifdef, an expression, an unbalanced chain), which the caller reads as 'unknown' and never caches.
+    param([AllowNull()][AllowEmptyString()][string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return 'undefined' }
+    $code = [regex]::Replace($Text, '\\\r?\n', '')
+    $code = [regex]::Replace($code, '(?s)/\*.*?\*/', ' ')
     $code = [regex]::Replace($code, '//[^\r\n]*', '')
-    return [regex]::IsMatch($code, '(?m)^[ \t]*#[ \t]*define[ \t]+MLV_STAGE_EXPORT_PIPE_WRITE(?![A-Za-z0-9_])')
+    $directives = [System.Collections.Generic.List[object]]::new()
+    foreach ($line in ($code -split '\r?\n')) {
+        $m = [regex]::Match($line, '^[ \t]*#[ \t]*([A-Za-z_]+)(.*)$')
+        if ($m.Success) { $directives.Add(@($m.Groups[1].Value, $m.Groups[2].Value.Trim())) }
+    }
+    $literal = { param($arg) if ($arg -match '^\(?[ \t]*0+[ \t]*\)?$') { 'off' } elseif ($arg -match '^\(?[ \t]*[1-9][0-9]*[ \t]*\)?$') { 'on' } else { 'unknown' } }
+    $stack = [System.Collections.Generic.List[hashtable]]::new()
+    $state = 'undefined'
+    for ($i = 0; $i -lt $directives.Count; $i++) {
+        $dir = $directives[$i][0]; $arg = $directives[$i][1]
+        $live = 'on'
+        foreach ($f in $stack) { if ($f.state -ceq 'off') { $live = 'off'; break } elseif ($f.state -ceq 'unknown') { $live = 'unknown' } }
+        if ($dir -ceq 'if') { $s = & $literal $arg; $stack.Add(@{ state = $s; literal = ($s -cne 'unknown'); taken = ($s -ceq 'on') }) }
+        elseif ($dir -ceq 'ifdef') { $stack.Add(@{ state = 'unknown'; literal = $false; taken = $false }) }
+        elseif ($dir -ceq 'ifndef') {
+            $guard = ($stack.Count -eq 0 -and $i + 1 -lt $directives.Count -and $directives[$i + 1][0] -ceq 'define' -and $arg -cmatch '^[A-Za-z_][A-Za-z0-9_]*$' -and
+                      $directives[$i + 1][1] -cmatch ('^' + [regex]::Escape($arg) + '(?![A-Za-z0-9_])'))
+            $stack.Add(@{ state = $(if ($guard) { 'on' } else { 'unknown' }); literal = $false; taken = $false })
+        }
+        elseif ($dir -ceq 'elif' -or $dir -ceq 'else') {
+            if ($stack.Count -eq 0) { return 'undecidable' }
+            $top = $stack[$stack.Count - 1]
+            if (-not $top.literal) { $top.state = 'unknown' }
+            elseif ($top.taken) { $top.state = 'off' }
+            else {
+                $s = $(if ($dir -ceq 'else') { 'on' } else { & $literal $arg })
+                $top.state = $s; $top.taken = ($s -ceq 'on'); if ($s -ceq 'unknown') { $top.literal = $false }
+            }
+        }
+        elseif ($dir -ceq 'endif') { if ($stack.Count -eq 0) { return 'undecidable' }; $stack.RemoveAt($stack.Count - 1) }
+        elseif (($dir -ceq 'define' -or $dir -ceq 'undef') -and $arg -cmatch '^MLV_STAGE_EXPORT_PIPE_WRITE(?![A-Za-z0-9_])') {
+            if ($live -ceq 'on') { $state = $(if ($dir -ceq 'define') { 'defined' } else { 'undefined' }) }
+            elseif ($live -ceq 'unknown') { $state = 'undecidable' }
+        }
+    }
+    if ($stack.Count -ne 0) { return 'undecidable' }
+    return $state
 }
 
 function Get-DvRenderPipeBuildClass {
@@ -5278,7 +5325,12 @@ function Get-DvRenderPipeBuildClass {
     $kind = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('cat-file', '-t', $BuildId)
     if ($kind.exitCode -ne 0 -or ([Text.Encoding]::ASCII.GetString($kind.bytes)).Trim() -cne 'commit') { return 'unknown' }
     $blob = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('cat-file', '-p', "${BuildId}:$($script:RenderPipeMarkerPath)")
-    if ($blob.exitCode -eq 0) { $class = $(if (Test-DvRenderPipeMarkerDefined (ConvertTo-DvText $blob.bytes)) { 'emits' } else { 'older' }) }
+    if ($blob.exitCode -eq 0) {
+        # (r4 fix 2, adversary A5: a header whose define this model cannot decide is 'unknown', never cached)
+        $markerState = Get-DvRenderPipeMarkerState (ConvertTo-DvText $blob.bytes)
+        if ($markerState -ceq 'undecidable') { return 'unknown' }
+        $class = $(if ($markerState -ceq 'defined') { 'emits' } else { 'older' })
+    }
     else {
         # (r2 fix 2, adversary A4 on c2da7e24: a commit whose tree git READ and found without the header is a build before stage timing, so 'older'; a tree that lists it or
         # that git could not read is still 'unknown')

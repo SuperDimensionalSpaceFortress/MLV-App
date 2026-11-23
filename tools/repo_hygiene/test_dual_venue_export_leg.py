@@ -1740,7 +1740,8 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
     def test_adversary_r4_a6_the_marker_is_a_define_directive_not_a_substring(self) -> None:
         """pass 8 A6: the build class searched the header for the literal `#define MLV_STAGE_EXPORT_PIPE_WRITE`, so legal preprocessor spacing read 'older' and a header that
         names the define only in a comment read 'emits'. A directive defines it, whatever its blanks; a comment does not."""
-        cases = {"spaced": ('#ifndef H\n#  define MLV_STAGE_EXPORT_PIPE_WRITE "export_pipe_write"\n#endif\n', "emits"),
+        # (r4 fix 2: the include guard is #ifndef H then #define H; a bare #ifndef H is a condition the model cannot decide, pinned 'unknown' by the pass 9 A5 test)
+        cases = {"spaced": ('#ifndef H\n#define H\n#  define MLV_STAGE_EXPORT_PIPE_WRITE "export_pipe_write"\n#endif\n', "emits"),
                  "hash_gap": ('# define MLV_STAGE_EXPORT_PIPE_WRITE "export_pipe_write"\n', "emits"),
                  "plain": ('#define MLV_STAGE_EXPORT_PIPE_WRITE   "export_pipe_write"\n', "emits"),
                  "block_comment": ("/* #define MLV_STAGE_EXPORT_PIPE_WRITE */\n#define MLV_STAGE_DECODE \"decode\"\n", "older"),
