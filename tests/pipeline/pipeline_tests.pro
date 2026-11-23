@@ -205,6 +205,7 @@ HEADERS += \
     $$REPO_ROOT/tests/pipeline/ojph_real_codec.h \
     $$REPO_ROOT/tests/pipeline/mlv_pipeline_fixture.h \
     $$REPO_ROOT/tests/pipeline/dualiso_mesh_metrics.h \
+    $$REPO_ROOT/tests/pipeline/dualiso_alias_gauss_saturation_fixture.h \
     $$REPO_ROOT/tests/pipeline/backend_parametric_fixture.h \
     $$REPO_ROOT/tests/pipeline/playback_path_test_state.h \
     $$REPO_ROOT/src/batch/BatchRenderedVideoPlan.h \
