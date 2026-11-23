@@ -2733,13 +2733,17 @@ function Get-DvLegSetPlan {
         if (-not $full.StartsWith($legsDir, [StringComparison]::OrdinalIgnoreCase) -or -not $full.EndsWith('.json') -or -not (Test-Path -LiteralPath $full -PathType Leaf)) {
             throw "DVE_LEGSET_INVALID '$ref' is not a leg spec under legs/"
         }
-        $spec = [IO.File]::ReadAllText($full) | ConvertFrom-Json
+        # r7 (sol r6 INV-3): ONE read of the file's bytes serves both the judgment below and the plan entry's specSha256 (RAW sha256, no line-ending normalisation: the hash
+        # Invoke-VenueLeg's -ExpectSpecSha256 takes), so the child that runs this entry is bound to the exact bytes the planner approved
+        $specBytes = [IO.File]::ReadAllBytes($full)
+        $specSha256 = Get-DvSha256OfBytes $specBytes
+        $spec = [Text.Encoding]::UTF8.GetString($specBytes).TrimStart([char]0xFEFF) | ConvertFrom-Json
         if ([string]$spec.clipId -cne $clipId -or [string]$spec.card -cne $card) { throw "DVE_LEGSET_INVALID leg '$($spec.legId)' does not name the set's clip and card" }
         # r6: refused by the RESOLVED spec (its legId and its file leaf), so no spelling of the reference gets a visual twin into a speed-cell matrix
         if ((Test-DvVisualTwinName $spec.legId) -or (Test-DvVisualTwinName ([IO.Path]::GetFileName($full)))) {
             throw "DVE_LEGSET_INVALID leg '$($spec.legId)' is a visual twin: its fps is capture-perturbed and is never a measured matrix speed cell"
         }
-        $specs.Add([pscustomobject]@{ path = $full; spec = $spec })
+        $specs.Add([pscustomobject]@{ path = $full; spec = $spec; sha256 = $specSha256 })
     }
     $backends = [System.Collections.Generic.List[string]]::new()
     foreach ($s in $specs) { foreach ($b in @($s.spec.backends)) { if ($b -notin $backends) { $backends.Add([string]$b) } } }
@@ -2753,7 +2757,7 @@ function Get-DvLegSetPlan {
             $cellId = $(if ([string](Get-DvProp $s.spec 'legType') -ceq 'export') { "$b-export-$([string]$s.spec.export.format)" } else { "$b-$mode-s$([int]$s.spec.scaleFactor)" })
             if ($seen.ContainsKey($cellId)) { throw "DVE_LEGSET_INVALID two legs of the set make the cell $cellId" }
             $seen[$cellId] = $true
-            $cells.Add([pscustomobject]@{ cellId = $cellId; legId = [string]$s.spec.legId; specPath = $s.path; backend = $b; displayMode = $mode; scaleFactor = [int]$s.spec.scaleFactor })
+            $cells.Add([pscustomobject]@{ cellId = $cellId; legId = [string]$s.spec.legId; specPath = $s.path; specSha256 = $s.sha256; backend = $b; displayMode = $mode; scaleFactor = [int]$s.spec.scaleFactor })
         }
     }
     $cellList = @($cells | Where-Object { [string]::IsNullOrEmpty($Backend) -or $_.backend -ceq $Backend })
@@ -2764,7 +2768,7 @@ function Get-DvLegSetPlan {
         $walk = $(if ($r % 2 -eq 1) { $cellList } else { @($cellList[($cellList.Count - 1)..0]) })
         foreach ($c in $walk) {
             $seq++
-            $plan.Add([pscustomobject]@{ seq = $seq; repeat = $r; cellId = $c.cellId; legId = $c.legId; specPath = $c.specPath; backend = $c.backend; displayMode = $c.displayMode; scaleFactor = $c.scaleFactor })
+            $plan.Add([pscustomobject]@{ seq = $seq; repeat = $r; cellId = $c.cellId; legId = $c.legId; specPath = $c.specPath; specSha256 = $c.specSha256; backend = $c.backend; displayMode = $c.displayMode; scaleFactor = $c.scaleFactor })
         }
     }
     [pscustomobject]@{ legSet = $setName; card = $card; clipId = $clipId; repeats = $Repeats; cells = @($cellList); plan = @($plan) }
@@ -3097,6 +3101,22 @@ function Get-DvMatrixRow {
     [pscustomobject]$row
 }
 
+function Test-DvMatrixRowMeasured {
+    <#
+    .SYNOPSIS
+    M16-1457-VENUE-BASELINE-DRIFT-1 r7 (sol r6 INV-2): is this matrix row a MEASUREMENT? Only a PASS or FAIL row that carries a presented-fps value is (the reader leaves the rates null for a
+    visual twin, a missing or swapped run log and every non-measurement outcome). The ONE predicate the table's `measured / ran` column and the summary header's `N measured` both use.
+    #>
+    param([Parameter(Mandatory)]$Row)
+    ($Row.outcome -cin @('PASS', 'FAIL')) -and ($null -ne $Row.presentedFps)
+}
+
+function Get-DvMatrixMeasuredCount {
+    # How many of these matrix rows are measurements (Test-DvMatrixRowMeasured): the summary header's count, equal to the sum of the table's per-cell numerators.
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Rows)
+    @($Rows | Where-Object { Test-DvMatrixRowMeasured -Row $_ }).Count
+}
+
 function Get-DvMedian {
     # The median of the numbers given ($null for none); an even count averages the middle two.
     param($Values)
@@ -3120,7 +3140,7 @@ function ConvertTo-DvMatrixTable {
     $lines.Add('|---|---|---|---|---|---|---|---|---|---|---|')
     foreach ($c in $Cells) {
         $mine = @($Rows | Where-Object { $_.cellId -ceq $c.cellId })
-        $meas = @($mine | Where-Object { $_.outcome -cin @('PASS', 'FAIL') -and $null -ne $_.presentedFps })
+        $meas = @($mine | Where-Object { Test-DvMatrixRowMeasured -Row $_ })
         $pf = @($meas | ForEach-Object { $_.presentedFps })
         $range = $(if ($pf.Count -gt 0) { '(' + (& $f ($pf | Measure-Object -Minimum).Minimum 2) + '-' + (& $f ($pf | Measure-Object -Maximum).Maximum 2) + ')' } else { '' })
         $presented = ((& $f (Get-DvMedian $pf) 2) + ' ' + $range).Trim()
@@ -6808,6 +6828,6 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Test-DvMatrixRowMeasured, Get-DvMatrixMeasuredCount, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt

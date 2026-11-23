@@ -167,6 +167,9 @@ if ($null -ne $setPlan) {
     foreach ($entry in $setPlan.plan) {
         $childArgs = @('-NoProfile', '-File', $PSCommandPath, '-Venue', $Venue, '-LegSpec', $entry.specPath, '-SourceCommit', $SourceCommit,
             '-BuildManifestSha256', $BuildManifestSha256, '-Backend', $entry.backend, '-ReceiptRoot', $ReceiptRoot, '-Actor', $Actor)
+        # r7 (sol r6 INV-3): the child runs the bytes the PLANNER approved or nothing. The planned sha256 of the spec (Get-DvLegSetPlan) is passed as -ExpectSpecSha256, so a path whose bytes
+        # changed between the plan and the child's read (a committed visual twin swapped in) is refused DVE_LEG_SPEC_CHANGED before anything is generated, submitted or receipted.
+        $childArgs += @('-ExpectSpecSha256', [string]$entry.specSha256)
         if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir)) { $childArgs += @('-SheetCopyDir', $SheetCopyDir) }
         if ($OfflineTestMode) { $childArgs += '-OfflineTestMode' }
         foreach ($seam in 'ConsentPath', 'VenueTablePath', 'RepoRoot', 'WorkDir', 'UmRunScript', 'GeneratorScript') {
@@ -180,13 +183,19 @@ if ($null -ne $setPlan) {
             try { $legReceipt = [IO.File]::ReadAllText($receiptPath) | ConvertFrom-Json } catch { $legReceipt = $null }
         }
         $row = Get-DvMatrixRow -PlanEntry $entry -Receipt $legReceipt
+        # r7: a child that refused because its spec's bytes are no longer the planned ones wrote no receipt; say so on its own typed line and in its row, so it is never read as a leg that merely failed
+        if ($null -eq $legReceipt -and @($childOut | Where-Object { $_ -match 'DVE_LEG_SPEC_CHANGED' }).Count -gt 0) {
+            Write-Output ('DVE_MATRIX_SPEC_CHANGED {0}/{1} repeat={2} cell={3} leg={4} planned_sha256={5} (the spec bytes changed after planning; the leg was refused and is no measurement)' -f $entry.seq, $total, $entry.repeat, $entry.cellId, $entry.legId, $entry.specSha256)
+            $row.note = 'DVE_LEG_SPEC_CHANGED: the spec bytes changed after planning; the leg was refused before anything ran'
+        }
         $rows.Add($row)
         Write-Output ('DVE_MATRIX_LEG {0}/{1} repeat={2} cell={3} outcome={4} receipt={5}' -f $entry.seq, $total, $entry.repeat, $entry.cellId, $row.outcome, $(if ($receiptPath) { $receiptPath } else { 'none' }))
     }
     $summaryDir = Join-Path (Split-Path -Parent $ReceiptRoot) "legset-summaries\$($setPlan.legSet)-$Venue-$runStamp"
     New-Item -ItemType Directory -Force -Path $summaryDir | Out-Null
     $table = ConvertTo-DvMatrixTable -Rows $rows.ToArray() -Cells @($setPlan.cells)
-    $measured = @($rows | Where-Object { $_.outcome -cin @('PASS', 'FAIL') }).Count
+    # r7 (sol r6 INV-2): the SAME predicate the table's `measured / ran` column uses (a PASS or FAIL row that carries a rate), so a visual twin's receipt is 0 measured here as in the table
+    $measured = Get-DvMatrixMeasuredCount -Rows $rows.ToArray()
     $head = @("# Leg set $($setPlan.legSet) on $Venue", '',
         "card $($setPlan.card), clip $($setPlan.clipId), source $($SourceCommit.Substring(0, 12)), build manifest $($BuildManifestSha256.Substring(0, 12)), $Repeats repeat(s) of $(@($setPlan.cells).Count) cell(s) = $total leg(s), $measured measured.",
         'Rates are read from each leg''s hashed app run log (median over the repeats). Only a PASS or FAIL receipt is a measurement; every other outcome is no signal and shows no numbers. Production receipts are ADVISORY (docs/dual-venue-evidence.md).', '')

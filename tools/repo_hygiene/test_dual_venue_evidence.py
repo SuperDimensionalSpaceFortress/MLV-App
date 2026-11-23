@@ -6411,7 +6411,7 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
             self.artifacts = saved
         return f"X:\\stub\\agent\\outbox\\{name}"
 
-    def run_matrix(self, repeats: int, extra: list[str], placements: dict[str, str]):
+    def run_matrix(self, repeats: int, extra: list[str], placements: dict[str, str], dv: Path = DV):
         by_leg = {}
         for cell in (c for c in MATRIX_CELLS if c.startswith("cuda-")):
             _, mode, scale = cell.split("-")
@@ -6422,7 +6422,7 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
         self.stub_cfg.write_text(json.dumps(cfg), encoding="utf-8")
         self.log.write_text("", encoding="utf-8")
         self.gen_log.write_text("", encoding="utf-8")
-        proc = run_pwsh(["-File", str(DV / "Invoke-VenueLeg.ps1"), "-Venue", "ultra-magnus", "-LegSet", "display-matrix", "-Repeats", str(repeats), "-SourceCommit", self.sha,
+        proc = run_pwsh(["-File", str(dv / "Invoke-VenueLeg.ps1"), "-Venue", "ultra-magnus", "-LegSet", "display-matrix", "-Repeats", str(repeats), "-SourceCommit", self.sha,
                          "-BuildManifestSha256", self.build_sha, "-VenueTablePath", str(self.table), "-ReceiptRoot", str(self.receipts), "-OfflineTestMode",
                          "-UmRunScript", str(self.um), "-GeneratorScript", str(self.gen), "-WorkDir", str(self.tmp / "work"), "-ConsentPath", str(self.consent),
                          "-RepoRoot", str(ROOT), "-Actor", "unit-test", *extra], env_extra={"DVE_STUB": str(self.stub_cfg)})
@@ -6485,6 +6485,35 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
         row = json.loads(out.stdout)
         self.assertIsNone(row["presentedFps"], "a log that does not hash to the receipt is no measurement")
         self.assertIn("does not hash to the receipt", row["note"])
+
+    def test_a_leg_whose_spec_bytes_change_after_planning_is_refused_and_is_never_counted_as_a_speed_cell(self) -> None:
+        """r7 (sol r6 INV-3): the planner judged one spec and the child re-read the path later with no expected hash, so bytes swapped to a committed visual twin between
+        the plan and the child's read ran in an ordinary speed slot. The plan now carries the sha256 of the bytes it judged and the child is bound to it (-ExpectSpecSha256).
+        The swap is made by the first leg's generator stub, i.e. strictly after planning and before leg 2's child reads its spec."""
+        dv = self.mutated_runner([])   # a COPY of the runner tree: the swap must never touch the checked-in specs
+        twin_bytes = dv / "legs" / "m16-1457-drift-t1-w10-visual-unpaced-fullscreen-s1.json"
+        target = dv / "legs" / "m16-1243-display-windowed-s1.json"   # plan entry 2 of the cuda walk
+        swap = f"if (-not $env:DVE_NO_SWAP) {{ Copy-Item -LiteralPath '{twin_bytes}' -Destination '{target}' -Force }}\n"
+        anchor = "$cfg = Get-Content -LiteralPath $env:DVE_STUB -Raw | ConvertFrom-Json"
+        self.assertEqual(STUB_GENERATOR.count(anchor), 1)
+        self.gen = self.tmp / "gen-swap-stub.ps1"
+        self.gen.write_text(STUB_GENERATOR.replace(anchor, swap + anchor, 1), encoding="utf-8")
+        proc = self.run_matrix(1, ["-Backend", "cuda"], {}, dv=dv)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(target.read_bytes(), twin_bytes.read_bytes(), "the fixture really swapped the planned spec's bytes for the twin's")
+        legs = [l for l in proc.stdout.splitlines() if l.startswith("DVE_MATRIX_LEG ")]
+        self.assertEqual(len(legs), 6, proc.stdout)
+        swapped = next(l for l in legs if "cell=cuda-windowed-s1 " in l)
+        self.assertIn("outcome=NO_RECEIPT", swapped, "the leg that read other bytes than the planner judged wrote no receipt")
+        self.assertIn("receipt=none", swapped)
+        self.assertTrue(any(l.startswith("DVE_MATRIX_SPEC_CHANGED ") and "cell=cuda-windowed-s1" in l for l in proc.stdout.splitlines()), "the refusal is a typed line\n" + proc.stdout)
+        receipts = [json.loads(p.read_text(encoding="utf-8")) for p in self.receipts.rglob("*.json")]
+        self.assertEqual([r["legId"] for r in receipts if "-visual-" in r["legId"]], [], "a visual twin ran in a speed slot")
+        self.assertEqual(len(receipts), 5, "the other five legs still ran and wrote their receipts")
+        submitted = [l for l in self.log.read_text(encoding="utf-8").splitlines() if l.strip()]
+        self.assertFalse([l for l in submitted if "visual" in l], "the twin's job was submitted")
+        summary = Path(re.search(r"DVE_MATRIX_SUMMARY=(.+)", proc.stdout).group(1).strip()).read_text(encoding="utf-8")
+        self.assertIn("= 6 leg(s), 5 measured.", summary)
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -19801,6 +19830,51 @@ class DriftLegSpecTests(unittest.TestCase):
                     self.assertIsNone(by[case]["presentedFps"], "a visual twin's fps is observer-perturbed and is never a measured cell")
                     self.assertIsNone(by[case]["renderWorkMs"])
                     self.assertIn("visual twin", by[case]["note"])
+
+    @requires_windows_pwsh
+    def test_the_matrix_header_counts_measured_cells_by_the_predicate_the_table_uses(self) -> None:
+        """r7 (sol r6 INV-2): the summary header counted any PASS/FAIL receipt as `measured` while the table needs a presented-fps value, so a twin receipt (rates nulled by the
+        reader) read `1 measured` in the header and `0/1` in the table. One function (Get-DvMatrixMeasuredCount, over Test-DvMatrixRowMeasured) now serves both."""
+        with tempfile.TemporaryDirectory(prefix="dve-hdr-") as tmp:
+            ev = Path(tmp) / "ev"
+            (ev / "logs").mkdir(parents=True)
+            log = "playback_smoke.summary session=1 presented_fps=19.60 avg_render_work_ms=28.5\n"
+            (ev / "logs" / "smoke-run.log").write_text(log, encoding="utf-8", newline="")
+            sha = hashlib.sha256(log.encode("utf-8")).hexdigest()
+            twin = Path(next(iter(DRIFT_VISUAL_LEGS))).stem
+            ordinary = "m16-1243-display-fullscreen-s1"
+            # (leg id, outcome, does the run log sit in the local evidence)
+            cases = [(ordinary, "PASS", True), (ordinary, "FAIL", True), (twin, "PASS", True), (twin, "FAIL", True), (ordinary, "PASS", False)]
+            doc = [{"leg": leg, "outcome": outcome, "log": has_log} for leg, outcome, has_log in cases]
+            proc, got = run_pwsh_json("$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES | ConvertFrom-Json\n"
+                                      "$rows = foreach ($c in $cases) {\n"
+                                      "  $entry = [pscustomobject]@{ seq = 1; repeat = 1; cellId = 'cuda-fullscreen-s1'; backend = 'cuda'; displayMode = 'fullscreen'; scaleFactor = 1; legId = [string]$c.leg }\n"
+                                      "  $dir = $(if ($c.log) { $env:DVE_EV } else { Join-Path $env:DVE_EV 'absent' })\n"
+                                      "  $r = [pscustomobject]@{ outcome = [string]$c.outcome; receiptId = 'rid'; legId = [string]$c.leg; evidence = [pscustomobject]@{ localEvidenceDir = $dir; logSha256 = $env:DVE_SHA } }\n"
+                                      "  Get-DvMatrixRow -PlanEntry $entry -Receipt $r }\n"
+                                      "$cells = @([pscustomobject]@{ cellId = 'cuda-fullscreen-s1'; backend = 'cuda'; displayMode = 'fullscreen'; scaleFactor = 1 })\n"
+                                      "$t = ConvertTo-DvMatrixTable -Rows @($rows) -Cells $cells\n"
+                                      "[ordered]@{ header = (Get-DvMatrixMeasuredCount -Rows @($rows)); table = $t } | ConvertTo-Json -Compress",
+                                      DVE_CASES=str(self.write_json(Path(tmp) / "cases.json", doc)), DVE_EV=str(ev), DVE_SHA=sha)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            in_table = re.search(r"\| (\d+)/(\d+) \|", got["table"].splitlines()[2])
+            self.assertEqual((in_table.group(1), in_table.group(2)), ("2", "5"), "the table counts the two ordinary rows that carry a rate, of five that ran")
+            self.assertEqual(got["header"], 2, "the header's measured count is the table's: a twin receipt (PASS or FAIL) is not measured in either place")
+        leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("Get-DvMatrixMeasuredCount -Rows", leg, "the header calls the shared predicate")
+        self.assertNotIn("$_.outcome -cin @('PASS', 'FAIL')", leg, "the header carries no predicate of its own")
+
+    @requires_windows_pwsh
+    def test_every_planned_leg_carries_the_sha256_of_the_spec_bytes_the_planner_judged(self) -> None:
+        """r7 (sol r6 INV-3): the plan binds the child to the planned bytes, so each entry names the RAW sha256 (no line-ending normalisation: the same hash the child's
+        -ExpectSpecSha256 check takes) of the spec file it was planned from."""
+        proc, got = run_pwsh_json(f"$p = Get-DvLegSetPlan -LegSetPath '{DV / 'legsets' / 'display-matrix.json'}' -Repeats 2\n"
+                                  "@($p.plan | ForEach-Object { [ordered]@{ seq = $_.seq; specPath = $_.specPath; specSha256 = $_.specSha256 } }) | ConvertTo-Json -Compress -AsArray")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(len(got), 24)
+        for entry in got:
+            with self.subTest(seq=entry["seq"]):
+                self.assertEqual(entry["specSha256"], hashlib.sha256(Path(entry["specPath"]).read_bytes()).hexdigest())
 
     @staticmethod
     def write_json(path: Path, doc: object) -> Path:
