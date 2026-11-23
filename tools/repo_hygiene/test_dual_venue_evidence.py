@@ -20047,6 +20047,78 @@ class DriftLegSpecTests(unittest.TestCase):
             self.assertIn("link", got["why"])
 
     @requires_windows_pwsh
+    def test_the_planner_refuses_a_hard_link_to_a_twin_named_file_by_the_bytes_it_read(self) -> None:
+        """r11 (adversary r10 pass 3 A2): an NTFS HARD link has no reparse bit, so legs/capture-compat.json, a second name for the twin-named file, passed both link walks and was
+        judged by its neutral leaf. The planner now judges the name by the bytes it read: a committed spec's file name IS its legId, and these bytes say m16-1243-speed."""
+        with tempfile.TemporaryDirectory(prefix="dve-twin-hardlink-") as tmp:
+            root = Path(tmp) / "dual-venue"
+            shutil.copytree(DV, root)
+            twin = root / "legs" / "m16-1243-speed-visual-fullscreen.json"
+            shutil.copyfile(DV / "legs" / "m16-1243-speed.json", twin)
+            alias = root / "legs" / "capture-compat.json"
+            os.link(twin, alias)
+            self.assertTrue(os.path.samefile(twin, alias), "the fixture made a real hard link")
+            got = self.plan_one_leg_set(root, "legs/capture-compat.json")
+            self.assertEqual(got["planned"], 0, "a hard link to a twin-named file planned as a speed cell")
+            self.assertIn("DVE_LEGSET_INVALID", got["why"])
+            self.assertIn("legId", got["why"])
+            # an ordinary file under another name holding a committed spec's bytes is the same alias, with or without a link (the A1 base state)
+            shutil.copyfile(DV / "legs" / "m16-1243-speed.json", root / "legs" / "plain-alias.json")
+            self.assertEqual(self.plan_one_leg_set(root, "legs/plain-alias.json")["planned"], 0, "a renamed copy of a committed spec planned")
+            self.assertEqual(self.plan_one_leg_set(root, "legs/m16-1243-speed.json")["planned"], self.speed_backends(), "the control still plans")
+
+    @requires_windows_pwsh
+    def test_the_planner_judges_the_bytes_it_read_when_a_link_is_flipped_in_between_its_checks(self) -> None:
+        """r11 (adversary r10 pass 3 A1): check-read-check. The path is an ordinary file at the first link walk, a symlink to an external twin-named file at the read, and an
+        ordinary file again at the second walk, so both walks passed and the planner planned the linked bytes. A module-scope seam on Test-DvPathHasLinkBelow makes that
+        interleaving exact. The planner now judges identity by the bytes it read, so the flip is refused whenever it lands."""
+        with tempfile.TemporaryDirectory(prefix="dve-twin-flip-") as tmp:
+            root = Path(tmp) / "dual-venue"
+            shutil.copytree(DV, root)
+            stock = json.loads((DV / "legs" / "m16-1243-speed.json").read_text(encoding="utf-8"))
+            target = root / "legs" / "capture-compat.json"
+            target.write_text(json.dumps(dict(stock, playSeconds=30), indent=2), encoding="utf-8")
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+            twin = outside / "m16-1243-speed-visual-fullscreen.json"
+            shutil.copyfile(DV / "legs" / "m16-1243-speed.json", twin)
+            ordinary = Path(tmp) / "ordinary.json"
+            shutil.copyfile(target, ordinary)
+            try:
+                os.symlink(twin, Path(tmp) / "probe-link.json")
+            except OSError as exc:
+                self.skipTest(f"no symlink privilege on this host: {exc}")
+            spec = json.loads((DV / "legs" / "m16-1243-speed.json").read_text(encoding="utf-8"))
+            (root / "legsets" / "one.json").write_text(json.dumps({"schema": "mlv-app/dual-venue-legset/v1", "legSet": "one", "card": spec["card"], "clipId": spec["clipId"],
+                                                                   "legs": ["legs/capture-compat.json"]}), encoding="utf-8")
+            proc = run_pwsh(["-Command", f"Import-Module '{root / 'DualVenueRunner.psm1'}' -Force\n"
+                             "$m = Get-Module DualVenueRunner\n"
+                             f"& $m {{ $script:FlipCalls = 0; $script:FlipPath = '{target}'; $script:FlipTwin = '{twin}'; $script:FlipOrdinary = '{ordinary}'\n"
+                             "  function script:Test-DvPathHasLinkBelow { param($Path, $Root)\n"
+                             "    $script:FlipCalls++\n"
+                             "    if ($script:FlipCalls -eq 1) { [IO.File]::Delete($script:FlipPath); $null = [IO.File]::CreateSymbolicLink($script:FlipPath, $script:FlipTwin) }\n"
+                             "    elseif ($script:FlipCalls -eq 2) { [IO.File]::Delete($script:FlipPath); [IO.File]::Copy($script:FlipOrdinary, $script:FlipPath) }\n"
+                             "    $false } }\n"
+                             f"try {{ $p = Get-DvLegSetPlan -LegSetPath '{root / 'legsets' / 'one.json'}'; $r = [ordered]@{{ planned = @($p.plan).Count; why = ''; sha = [string]$p.plan[0].specSha256 }} }}\n"
+                             "catch { $r = [ordered]@{ planned = 0; why = $_.Exception.Message; sha = '' } }\n"
+                             "$r.calls = & $m { $script:FlipCalls }; $r | ConvertTo-Json -Compress"])
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            got = json.loads(proc.stdout)
+            self.assertGreaterEqual(got["calls"], 1, "the seam ran: the link was flipped in after the first walk")
+            self.assertEqual(got["planned"], 0, f"the planner planned the bytes of a link flipped in between its checks (planned sha {got['sha']})")
+            self.assertIn("DVE_LEGSET_INVALID", got["why"])
+            self.assertIn("legId", got["why"])
+
+    def test_every_committed_leg_spec_is_named_by_its_leg_id(self) -> None:
+        """r11: the planner binds the name a set reaches to the bytes it read (Get-DvLegSetPlan refuses a spec whose file name is not <legId>.json). That is sound only while
+        every committed spec meets it, so a new leg whose file and legId disagree fails here, not in a venue matrix."""
+        specs = sorted((DV / "legs").glob("*.json"))
+        self.assertGreater(len(specs), 100)
+        for path in specs:
+            with self.subTest(leg=path.name):
+                self.assertEqual(json.loads(path.read_text(encoding="utf-8-sig"))["legId"], path.stem)
+
+    @requires_windows_pwsh
     def test_the_matrix_reader_never_turns_a_visual_twins_receipt_into_a_measured_speed_cell(self) -> None:
         """r6 B1, the READER half (sol r5: the four saved twin receipts rendered 1/1 measured): a row whose plan entry or receipt names a visual twin carries the outcome
         and no rates, whatever path the entry came through; the same receipt under an ordinary leg id is read normally (the control)."""

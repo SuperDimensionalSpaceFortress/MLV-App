@@ -2751,14 +2751,16 @@ function Get-DvLegSetPlan {
         if (-not $full.StartsWith($legsDir, [StringComparison]::OrdinalIgnoreCase) -or -not $full.EndsWith('.json') -or -not (Test-Path -LiteralPath $full -PathType Leaf)) {
             throw "DVE_LEGSET_INVALID '$ref' is not a leg spec under legs/"
         }
-        # r10 (adversary r10 A2): the identity judged below (legId and file leaf) must be the file's own: a link (the spec, or a directory on its way under legs/) is refused
+        # r10 (adversary r10 A2): a link that is already in place (the spec, or a directory on its way under legs/, legs/ itself included) is refused early, with its own message.
+        # r11: this walk is an early refusal only, NOT the identity judgment: a link swapped in after it, or a hard link (no reparse bit), passes it. The judgment is made below,
+        # from the bytes that were read.
         if (Test-DvPathHasLinkBelow -Path $full -Root $legsDir) { throw "DVE_LEGSET_INVALID '$ref' is a link (symlink or junction); a leg named by a set is a committed spec file under legs/" }
         # r7 (sol r6 INV-3): ONE read of the file's bytes serves both the judgment below and the plan entry's specSha256 (RAW sha256, no line-ending normalisation: the hash
         # Invoke-VenueLeg's -ExpectSpecSha256 takes), so the child that runs this entry is bound to the exact bytes the planner approved
         # (decoded exactly as File.ReadAllText does, BOM-detected, so a spec the base planner could read is still readable: adversary r7 A5)
+        # r11 (adversary r10 pass 3 A1, A2; hub ruling 20261123T2147Z): every identity judged here (legId, twin, the name the set reached, planned hash) comes from THESE bytes.
+        # r10's second link walk after this read is gone: a path probe cannot say what was read, and a link flipped in and out between two probes passed both.
         $specBytes = [IO.File]::ReadAllBytes($full)
-        # r10 (adversary r10 pass 2 A1): checked again AFTER the read, so a link put in place between the first check and the read is refused too
-        if (Test-DvPathHasLinkBelow -Path $full -Root $legsDir) { throw "DVE_LEGSET_INVALID '$ref' is a link (symlink or junction); a leg named by a set is a committed spec file under legs/" }
         $specSha256 = Get-DvSha256OfBytes $specBytes
         $specReader = [IO.StreamReader]::new([IO.MemoryStream]::new($specBytes), [Text.Encoding]::UTF8, $true)
         try { $specText = $specReader.ReadToEnd() } finally { $specReader.Dispose() }
@@ -2767,6 +2769,13 @@ function Get-DvLegSetPlan {
         # r6: refused by the RESOLVED spec (its legId and its file leaf), so no spelling of the reference gets a visual twin into a speed-cell matrix
         if ((Test-DvVisualTwinName $spec.legId) -or (Test-DvVisualTwinName ([IO.Path]::GetFileName($full)))) {
             throw "DVE_LEGSET_INVALID leg '$($spec.legId)' is a visual twin: its fps is capture-perturbed and is never a measured matrix speed cell"
+        }
+        # r11 (adversary r10 pass 3 A1, A2): the name the set reached is bound to the bytes read. Every committed spec under legs/ is named <legId>.json (pinned by
+        # test_every_committed_leg_spec_is_named_by_its_leg_id), so a file reached under any other name (a hard link, a renamed copy, or a link flipped in after the walk above)
+        # is refused. That holds whatever its bytes say and whenever the flip lands. The comparison ignores case (Windows resolves LEGS\X.JSON to legs/x.json) and is ordinal,
+        # never by culture. The child is pinned to $specSha256, so the bytes it runs are the bytes judged here.
+        if (-not [string]::Equals([IO.Path]::GetFileNameWithoutExtension($full), [string]$spec.legId, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "DVE_LEGSET_INVALID '$ref' read as legId '$($spec.legId)': a committed leg spec is named <legId>.json, so a spec reached under another name (an alias, a hard link, a link swapped in) is refused"
         }
         $specs.Add([pscustomobject]@{ path = $full; spec = $spec; sha256 = $specSha256 })
     }
