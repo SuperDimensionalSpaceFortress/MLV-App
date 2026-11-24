@@ -200,16 +200,17 @@ EVIDENCE_CALL = ("Get-DvExportEvidence -Format $c.format -MaxFrames ([int]$c.max
                  "-ProfileText ([string]$c.profile) -StageLogText ([string]$c.stage) -BatchLogText ([string]$c.batch) -OutputManifestText ([string]$c.manifest)")
 
 
-def evidence_cases(cases: list[dict]):
+def evidence_cases(cases: list[dict], prelude: str = "", **env: str):
+    # (EXPORT-RENDER-PIPE-TIMING-3 r2: prelude runs after the module import and before the cases, e.g. to widen a module table for a defence-in-depth row; env feeds it)
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "cases.json"
         path.write_text(json.dumps(cases), encoding="utf-8")
-        return run_pwsh_json("$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+        return run_pwsh_json(prelude + "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
                              f"@($cases | ForEach-Object {{ $c = $_; $e = {EVIDENCE_CALL}; "
                              "$o = Get-DvExportOutcome -ResultToken $c.token -ExitCode ([int]$c.exit) -Evidence $e -Criteria @($c.criteria); "
                              "[ordered]@{ metrics = $e.metrics; problems = @($e.problems); classMismatch = $e.classMismatch; stages = $e.stages; outcome = $o.outcome; detail = $o.detail; "
                              "containmentAdvisory = @($e.containmentAdvisory) } }) "
-                             "| ConvertTo-Json -Compress -Depth 8 -AsArray", DVE_CASES=str(path))
+                             "| ConvertTo-Json -Compress -Depth 8 -AsArray", DVE_CASES=str(path), **env)
 
 
 def cdng_case(**over) -> dict:
@@ -2497,10 +2498,12 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         c["manifest"] = output_manifest(1, "mov", clip=clip if leaf is None else leaf[:-4])
         return c
 
-    def t3_check(self, rows: list) -> None:
-        """rows: (label, case, expect) where expect is 'PASS' or (code prefix, [needles...])."""
-        proc, got = evidence_cases([c for _, c, _ in rows])
+    def t3_check(self, rows: list, prelude: str = "", **env: str) -> None:
+        """rows: (label, case, expect) where expect is 'PASS' or (code prefix, [needles...]). prelude / env go to evidence_cases (TIMING-3 r2)."""
+        proc, got = evidence_cases([c for _, c, _ in rows], prelude, **env)
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        # (TIMING-3 r2, sol r1 hardening: a result list short of its rows would let zip leave a fixture unasserted)
+        self.assertEqual(len(got), len(rows), proc.stdout[-3000:] + proc.stderr[-3000:])
         for (label, _, expect), g in zip(rows, got):
             with self.subTest(row=label):
                 if expect == "PASS":
@@ -2522,7 +2525,10 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
             ("B1-CDNG", cdng_case(batch=done(c), manifest=output_manifest(30, clip=c)), "PASS"),
             ("CDNG-WITNESS", cdng_case(batch=done("view-0"), manifest=output_manifest(30, clip="other-clip")),
              (BU, ["DONE names the clip 'view-0'", "'other-clip_000000.dng'", "CdngSequenceExport.cpp:269-280"])),
-            ("CDNG-WITNESS-DATED", cdng_case(batch=done("view-0"), manifest=json.dumps({**json.loads(output_manifest(30)), "first": {"name": "view-0_1_2026-11-24_0001_C0000_000000.dng", "bytes": 1000, "sha256": "1" * 64}, "last": {"name": "view-0_1_2026-11-24_0001_C0000_000029.dng", "bytes": 1000, "sha256": "2" * 64}})), "PASS"),
+            ("CDNG-WITNESS-DATED", cdng_case(batch=done("view-0"), manifest=json.dumps({**json.loads(output_manifest(30)), "first": {"name": "view-0_1_2026-11-24_0001_C0000_000000.dng", "bytes": 1000, "sha256": "1" * 64}, "last": {"name": "view-0_1_2026-11-24_0001_C0000_000029.dng", "bytes": 1000, "sha256": "2" * 64}})),
+             # (TIMING-3 r2, F1, design-ordered reversal: r1 read this PASS, but the batch route writes only <clip>_<frame6>.dng (BatchRunner.cpp:1393 CODEC_CNDG_DEFAULT),
+             # so these are the standard leaves of the clip view-0_1_2026-11-24_0001_C0000, not view-0's)
+             (BU, ["DONE names the clip 'view-0'", "'view-0_1_2026-11-24_0001_C0000_000000.dng'"])),
             ("CDNG-WITNESS-PREFIX", cdng_case(batch=done("view"), manifest=output_manifest(30, clip="view-0")), (BU, ["DONE names the clip 'view'"])),
             ("KEY3-H1-DOUBLE-SPACE", cdng_case(batch="[BATCH] DONE  exported=29 exported=30 skipped=0 elapsed=20.0\n"), (BU, ["DONE"])),
             ("KEY3-H1-SHAPE", cdng_case(batch="[BATCH] DONE view-0 exported=29x exported=30 skipped=0 elapsed=20.0\n"), (BU, ["DONE", "view-0 exported=29x"])),
@@ -2531,6 +2537,62 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
             ("CTL-PRORES-TAKE-ONE", self.t3_prores("take one"), "PASS"),
             ("CTL-R3-B4", cdng_case(batch="[BATCH] DONE view-0 exported=29 skipped=1 elapsed=40.0 exported=30 skipped=0 elapsed=20.0\n"), (BU, ["DONE", "elapsed="])),
         ])
+
+    # --- EXPORT-RENDER-PIPE-TIMING-3 r2 (sol r1 on ce790369, blocker; key3 r1 row 2): the CDNG witness binds only the leaf the batch route writes. The headless route
+    # passes CODEC_CNDG_DEFAULT (BatchRunner.cpp:1393), so CdngSequenceExport.cpp:269-271 names every frame <clip>_<frame6>.dng; the dated form (:275-280) is never
+    # written on it. Accepting the dated form let a standard leaf of clip view-0_1_2024-01-02_0001_C0000 certify DONE view-0, and a pair of one standard and one dated
+    # endpoint pass (F1). F2: the endpoint pair binds by its stem (the leaf less its trailing _<frame>.dng), which must be DONE's clip for both, so a re-widened leaf
+    # table still refuses both. Fixtures: sol's 480-frame shape under the shipped acceptance and supplementary criteria.
+    T3R2_DATED = "view-0_1_2024-01-02_0001_C0000"
+    # (elapsed=60.0 as sol's repro: 480 frames in 20 s is 41.7 ms a frame, under the fixture's 63 ms producer_frame, a containment mismatch of its own)
+    T3R2_DONE480 = "[BATCH] Start\n[BATCH] DONE view-0 exported=480 skipped=0 elapsed=60.0\n"
+    T3R2_WIDENED = r"\A(?:1_[0-9]{2,5}-[0-9]{2,5}-[0-9]{2,5}_0001_C0000_)?[0-9]{6,10}\.dng\z"   # r1's table, the form F1 removes
+
+    @staticmethod
+    def cdng_endpoints(count: int, first: str, last: str) -> str:
+        m = json.loads(output_manifest(count))
+        m["first"] = {"name": first, "bytes": 1000, "sha256": "1" * 64}
+        m["last"] = {"name": last, "bytes": 1000, "sha256": "2" * 64}
+        return json.dumps(m)
+
+    def t3r2_rows(self) -> list:
+        BU, dd = "EXPORT_BATCH_LOG_UNREADABLE", self.T3R2_DATED
+        spec = leg("m16-1243-export-cdng-lossless")
+        rows = []
+        for role in ("acceptance", "supplementary"):
+            crit = spec["criteria"][role]["cpu"]
+            case = lambda first, last: cdng_case(maxFrames=480, profile=cdng_profile(480), batch=self.T3R2_DONE480, manifest=self.cdng_endpoints(480, first, last), criteria=crit)
+            rows += [(f"{role}-CTL-480-OK", case("view-0_000000.dng", "view-0_000479.dng"), "PASS"),
+                     (f"{role}-SOL-B-CROSS-CLIP", case(f"{dd}_000000.dng", f"{dd}_000479.dng"), (BU, ["DONE names the clip 'view-0'", f"'{dd}_000"])),
+                     (f"{role}-SOL-B-MIXED", case("view-0_000000.dng", f"{dd}_000479.dng"), (BU, ["DONE names the clip 'view-0'", f"'{dd}_000479.dng'"]))]
+        a = "a_1_2026-11-24_0001_C0000"
+        done30 = lambda clip: f"[BATCH] DONE {clip} exported=30 skipped=0 elapsed=20.0\n"
+        rows += [("KEY3-R1-ROW2", cdng_case(batch=done30("a"), manifest=self.cdng_endpoints(30, f"{a}_000000.dng", f"{a}_000029.dng")), (BU, ["DONE names the clip 'a'", f"'{a}_0000"])),
+                 # (control: the same leaves ARE the standard leaves of the clip literally named a_1_2026-11-24_0001_C0000)
+                 ("CTL-KEY3-R1-ROW2-OWN-CLIP", cdng_case(batch=done30(a), manifest=self.cdng_endpoints(30, f"{a}_000000.dng", f"{a}_000029.dng")), "PASS"),
+                 ("CTL-B1-CDNG", cdng_case(batch=done30(self.T3_CLIP), manifest=output_manifest(30, clip=self.T3_CLIP)), "PASS")]
+        return rows
+
+    def test_t3_r2_sol_r1_the_cdng_witness_binds_only_the_leaf_the_batch_route_writes(self) -> None:
+        """sol r1 blocker (repro verbatim in shape) and key3 r1 row 2: a foreign clip's standard leaves read as view-0's dated leaves, and a mixed endpoint pair, both
+        read PASS under the shipped criteria. INVALID with the witness message (F1). Controls: the clean 480-frame run, the clip literally named by the dated stem,
+        sol r4 B1's `take elapsed=1.0`."""
+        self.t3_check(self.t3r2_rows())
+
+    def test_t3_r2_f2_the_endpoint_pair_binds_by_its_stem_even_under_a_widened_leaf_table(self) -> None:
+        """F2 (defence in depth): with $script:ExportCdngFrameLeaf re-widened to r1's dated alternation, the cross-clip and the mixed pair are still the witness
+        problem, because each endpoint's stem (the leaf less its trailing _<frame>.dng) must be DONE's clip. The message names both leaves."""
+        BU, dd = "EXPORT_BATCH_LOG_UNREADABLE", self.T3R2_DATED
+        rows = []
+        for label, case, expect in self.t3r2_rows():
+            if "CROSS-CLIP" in label:
+                expect = (BU, ["DONE names the clip 'view-0'", f"'{dd}_000000.dng'", f"'{dd}_000479.dng'"])
+            elif "MIXED" in label:
+                expect = (BU, ["DONE names the clip 'view-0'", "'view-0_000000.dng'", f"'{dd}_000479.dng'"])
+            elif label == "KEY3-R1-ROW2":
+                expect = (BU, ["DONE names the clip 'a'", "'a_1_2026-11-24_0001_C0000_000000.dng'", "'a_1_2026-11-24_0001_C0000_000029.dng'"])
+            rows.append((label, case, expect))
+        self.t3_check(rows, "& (Get-Module DualVenueRunner) { $script:ExportCdngFrameLeaf = $env:DVE_LEAF }\n", DVE_LEAF=self.T3R2_WIDENED)
 
     def test_t3_r1_b2_b3_a_verbatim_path_slot_holding_a_field_named_again_is_invalid(self) -> None:
         """sol r4 B2 / B3 (repro verbatim) and key3 r4 H2: `out=C:/a.mov out=D:/out/view-0.mov` read PASS (the manifest binds the last leaf), and so did
@@ -3900,6 +3962,8 @@ ConvertTo-Json -InputObject $out -Compress -Depth 4
                 central_cases.append(cdng_case(batch=batch, manifest=output_manifest(30, clip=leaves[0][:-len("_000000.dng")])))
         proc, central = evidence_cases(central_cases)
         self.assertIsNotNone(central, proc.stdout[-3000:] + proc.stderr[-3000:])
+        # (TIMING-3 r2, sol r1 hardening: every parity row gets both verdicts; a short list would let zip drop a row unasserted)
+        self.assertEqual((len(got), len(central)), (len(rows), len(rows)), (got, central))
         for (label, _, _, _, _, want_central, want_job), g, c in zip(rows, got, central):
             with self.subTest(row=label):
                 self.assertEqual(c["outcome"], want_central, c)
@@ -3918,6 +3982,7 @@ ConvertTo-Json -InputObject $out -Compress -Depth 4
         rows.append(("A3-UPPER-CDNG", "CDNG-LOSSLESS", 30, ["[BATCH] DONE view-0 exported=30 skipped=0 elapsed=20.0"], [f"other-clip_{k:06d}.dng" for k in range(30)]))
         rows.append(("A3-UPPER-CDNG-OK", "CDNG-LOSSLESS", 30, ["[BATCH] DONE view-0 exported=30 skipped=0 elapsed=20.0"], [f"view-0_{k:06d}.dng" for k in range(30)]))
         got = self.run_job_slice(rows)
+        self.assertEqual(len(got), len(rows), got)   # (TIMING-3 r2, sol r1 hardening: no row goes unasserted)
         for (label, *_), g in zip(rows, got):
             with self.subTest(row=label):
                 self.assertEqual(g["result"], "EXPORT_CAPTURED" if label.endswith("-OK") else "EXPORT_OUTPUT_MISMATCH", g)
@@ -3925,9 +3990,41 @@ ConvertTo-Json -InputObject $out -Compress -Depth 4
                    for label, fmt, _, ls, _ in rows if fmt == "prores"]
         proc, got = evidence_cases(central)
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(len(got), len(central), got)
         for g in got:
             self.assertEqual(g["outcome"], "INVALID", g)
             self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and "RENDER_VERIFIED" in p and "unchecked" in p for p in g["problems"]), g)
+
+    def test_t3_r2_sol_r1_the_job_refuses_a_foreign_or_mixed_cdng_leaf_as_the_central_reader_does(self) -> None:
+        """sol r1 blocker on the Bachelor caller (the job embeds Get-DvBatchExportBindingProblems and the leaf table): the frames found on disk are the standard leaves
+        of another clip (view-0_1_2024-01-02_0001_C0000), or 479 of view-0's plus one dated leaf (sorted last), under DONE view-0 exported=480; and key3 r1 row 2 (DONE a
+        with a_1_2026-11-24_0001_C0000_<frame>.dng). The job reads EXPORT_OUTPUT_MISMATCH, as the central reader reads INVALID on the same endpoints."""
+        dd = "view-0_1_2024-01-02_0001_C0000"
+        a = "a_1_2026-11-24_0001_C0000"
+        d480 = ["[BATCH] DONE view-0 exported=480 skipped=0 elapsed=60.0"]   # (sol's elapsed; 20 s is under the profile's producer_frame total)
+        rows = [("CTL-480-OK", "cdng-lossless", 480, d480, [f"view-0_{k:06d}.dng" for k in range(480)]),
+                ("SOL-B-CROSS-CLIP", "cdng-lossless", 480, d480, [f"{dd}_{k:06d}.dng" for k in range(480)]),
+                ("SOL-B-MIXED", "cdng-lossless", 480, d480, [f"view-0_{k:06d}.dng" for k in range(479)] + [f"{dd}_000479.dng"]),
+                ("KEY3-R1-ROW2", "cdng-lossless", 30, ["[BATCH] DONE a exported=30 skipped=0 elapsed=20.0"], [f"{a}_{k:06d}.dng" for k in range(30)]),
+                ("CTL-KEY3-R1-ROW2-OWN-CLIP-OK", "cdng-lossless", 30, [f"[BATCH] DONE {a} exported=30 skipped=0 elapsed=20.0"], [f"{a}_{k:06d}.dng" for k in range(30)])]
+        got = self.run_job_slice(rows)
+        self.assertEqual(len(got), len(rows), got)
+        central = []
+        for label, _, n, lines, leaves in rows:
+            m = json.loads(output_manifest(n))
+            m["first"], m["last"] = {"name": leaves[0], "bytes": 1000, "sha256": "1" * 64}, {"name": leaves[-1], "bytes": 1000, "sha256": "2" * 64}
+            central.append(cdng_case(maxFrames=n, profile=cdng_profile(n), batch="[BATCH] Start\n" + "\n".join(lines) + "\n", manifest=json.dumps(m),
+                                     criteria=[{"metric": "framesExported", "op": "eq", "value": n}]))
+        proc, cgot = evidence_cases(central)
+        self.assertIsNotNone(cgot, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(len(cgot), len(rows), cgot)
+        for (label, *_), g, c in zip(rows, got, cgot):
+            with self.subTest(row=label):
+                ok = label.endswith("-OK")
+                self.assertEqual(g["result"], "EXPORT_CAPTURED" if ok else "EXPORT_OUTPUT_MISMATCH", g)
+                self.assertEqual(c["outcome"], "PASS" if ok else "INVALID", c)
+                if not ok:
+                    self.assertTrue(any(p.startswith("EXPORT_BATCH_LOG_UNREADABLE") and "DONE names the clip" in p for p in c["problems"]), c)
 
     @staticmethod
     def t4_start() -> str:
