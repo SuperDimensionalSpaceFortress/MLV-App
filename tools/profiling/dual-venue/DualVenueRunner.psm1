@@ -5205,7 +5205,7 @@ $script:ExportBatchLineGrammar = [ordered]@{
                                          rest = 'container_probe'; right = @('probe_source=t', 'codec=t', 'container=t', 'sar=t', 'dar=t') }
 }
 # (a line of a kind that still holds one of these after its one trailing CR is trimmed is not in the kind's form: the producer writes none of them inside a line)
-$script:ExportBatchLineForbidden = '[\u0000-\u001F\u007F\u0085  ]'
+$script:ExportBatchLineForbidden = '[\u0000-\u001F\u007F\u0085\u2028\u2029]'
 
 function ConvertFrom-DvBatchLogLine {
     # (private) One batch.log line of kind $Kind, read by its row of $script:ExportBatchLineGrammar; $Clip is DONE's clip (RENDER_START / RENDER_VERIFIED only).
