@@ -5184,10 +5184,125 @@ function Test-DvExportCdngProfileRecords {
     [pscustomobject]@{ rows = @($rows); ok = @($ok); problems = @($problems) }
 }
 
-# EXPORT-RENDER-PIPE-TIMING-1 r2 (adversary A2 on a6f48506): the rendered runner's RENDER_START line (BatchRunner.cpp:471), WHOLE and in its field order. The first scaled= token of
-# any line that began RENDER_START read a conflicting second scaled=, a line cut short after scaled= and another clip's line as a declaration.
-$script:ExportRenderStartLine = '(?m)^\[BATCH\] RENDER_START (?<clip>[^\r\n]+?) codec=(?<codec>\S+) container=(?<container>\S+) source=(?<sw>[0-9]{1,9})x(?<sh>[0-9]{1,9}) output=(?<ow>[0-9]{1,9})x(?<oh>[0-9]{1,9}) scaled=(?<s>true|false) fps=(?<fps>\S+) frames=(?<n>[0-9]{1,12}) cutIn=(?<ci>[0-9]{1,12}) cutOut=(?<co>[0-9]{1,12}) out=(?<out>[^\r\n]+?)\r?$'
-$script:ExportRenderStartKeys = @('codec', 'container', 'source', 'output', 'scaled', 'fps', 'frames', 'cutIn', 'cutOut', 'out')
+# EXPORT-RENDER-PIPE-TIMING-2 r2 (fable / opus key3 / sol r7 on 18c52966): ONE line grammar for the three batch.log lines the export reader binds: RENDER_START
+# (BatchRunner.cpp:471), RENDER_VERIFIED (:803) and DONE (:821, :1130). A clip is completeBaseName (:324), so it may hold spaces and '=', and container_probe= prints
+# the probe path verbatim, so no field is ever found by searching a line for a marker (a field named again after the probe path, or a clip spelled like a key, defeated
+# that). Each kind is read by POSITION: DONE is peeled from the right (its clip is the non-empty rest); the clip DONE names binds the other two by ordinal prefix; then
+# 'left' is read left to right, one U+0020 apart, each token exactly <key>=<shape>; then 'rest' (out= / container_probe=) takes the rest of the line, from whose right
+# 'right' is peeled. Any other token at a position (a repeat, an unknown or case-changed key, an empty value, a double space) is not in the kind's form.
+$script:ExportBatchLineShapes = @{
+    t = '\A[^\s=]+\z'; u12 = '\A[0-9]{1,12}\z'; u15 = '\A[0-9]{1,15}\z'; u19 = '\A[0-9]{1,19}\z'; WxH = '\A[0-9]{1,9}x[0-9]{1,9}\z'
+    e = '\A[0-9]{1,12}(?:\.[0-9]{1,9})?\z'; scaled = '\A(?:true|false)\z'
+}
+$script:ExportBatchLineGrammar = [ordered]@{
+    DONE            = [pscustomobject]@{ code = 'EXPORT_BATCH_LOG_UNREADABLE'; form = "the batch runner's form (BatchRunner.cpp:821, :1130)"
+                                         left = @(); rest = $null; right = @('exported=u15', 'skipped=u15', 'elapsed=e') }
+    RENDER_START    = [pscustomobject]@{ code = 'EXPORT_PROFILE_ABSENT'; form = "the rendered runner's form (BatchRunner.cpp:471)"
+                                         left = @('codec=t', 'container=t', 'source=WxH', 'output=WxH', 'scaled=scaled', 'fps=t', 'frames=u12', 'cutIn=u12', 'cutOut=u12')
+                                         rest = 'out'; right = @() }
+    RENDER_VERIFIED = [pscustomobject]@{ code = 'EXPORT_OUTPUT_MISMATCH'; form = "the rendered runner's form (BatchRunner.cpp:803)"
+                                         left = @('decoded_frames=u15', 'decoded_duration=t', 'decoded_frame_bytes=u19', 'dimensions=WxH', 'bytes=u19')
+                                         rest = 'container_probe'; right = @('probe_source=t', 'codec=t', 'container=t', 'sar=t', 'dar=t') }
+}
+# (a line of a kind that still holds one of these after its one trailing CR is trimmed is not in the kind's form: the producer writes none of them inside a line)
+$script:ExportBatchLineForbidden = '[\u0000-\u001F\u007F\u0085  ]'
+
+function ConvertFrom-DvBatchLogLine {
+    # (private) One batch.log line of kind $Kind, read by its row of $script:ExportBatchLineGrammar; $Clip is DONE's clip (RENDER_START / RENDER_VERIFIED only).
+    # Returns [pscustomobject]@{ clip; fields; problem }: fields is an ordered dictionary of the value strings in the producer's order, or null and problem the typed
+    # reason, which names the kind, the field number, the key expected there and the token found.
+    param([Parameter(Mandatory)][string]$Kind, [AllowEmptyString()][string]$Line, [AllowNull()][AllowEmptyString()][string]$Clip)
+    $g = $script:ExportBatchLineGrammar[$Kind]
+    $fail = { param($why) [pscustomobject]@{ clip = $null; fields = $null; problem = "$($g.code): $Kind is not in $($g.form): $why" } }
+    $found = { param($tok) $(if ([string]::IsNullOrEmpty($tok)) { 'nothing' } else { "'$tok'" }) }
+    $isField = { param([string]$tok, [string]$spec) $k, $s = $spec.Split('='); $tok.StartsWith("$k=", [StringComparison]::Ordinal) -and [regex]::IsMatch($tok.Substring($k.Length + 1), $script:ExportBatchLineShapes[$s]) }
+    if ([regex]::IsMatch($Line, $script:ExportBatchLineForbidden)) { return (& $fail 'it holds a control or line-separator character (U+0000-U+001F, U+007F, U+0085, U+2028 or U+2029)') }
+    $tag = "[BATCH] $Kind "
+    $values = @{}
+    $field = 0
+    if ($null -eq $g.rest) {
+        if (-not $Line.StartsWith($tag, [StringComparison]::Ordinal)) { return (& $fail 'it expects one space and the clip after the tag') }
+        $body = $Line.Substring($tag.Length)
+    }
+    else {
+        $prefix = "$tag$Clip "
+        if ([string]::IsNullOrEmpty($Clip) -or -not $Line.StartsWith($prefix, [StringComparison]::Ordinal)) {
+            # (a diagnostic only: up to 120 chars of the line after its tag; the verdict is the ordinal prefix above)
+            $after = $(if ($Line.Length -gt $tag.Length) { $Line.Substring($tag.Length) } else { '' })
+            if ($after.Length -gt 120) { $after = $after.Substring(0, 120) }
+            return [pscustomobject]@{ clip = $null; fields = $null
+                                      problem = "EXPORT_OUTPUT_MISMATCH: $Kind is not of the clip DONE names ('$Clip'): the line after its tag reads '$after', and the rendered runner prints both with one baseName (BatchRunner.cpp:324), so it is not this export's" }
+        }
+        $pos = $prefix.Length
+        foreach ($spec in $g.left) {
+            $field++
+            $key = $spec.Split('=')[0]
+            $sp = $Line.IndexOf([char]' ', $pos)
+            $tok = $(if ($sp -ge 0) { $Line.Substring($pos, $sp - $pos) } else { $Line.Substring($pos) })
+            if (-not (& $isField $tok $spec)) { return (& $fail "at field $field it expects $key= and finds $(& $found $tok)") }
+            $values[$key] = $tok.Substring($key.Length + 1)
+            $pos = $(if ($sp -ge 0) { $sp + 1 } else { $Line.Length })
+        }
+        $field++
+        $rest = $Line.Substring($pos)
+        if (-not $rest.StartsWith("$($g.rest)=", [StringComparison]::Ordinal)) {
+            $sp = $rest.IndexOf([char]' ')
+            return (& $fail "at field $field it expects $($g.rest)= and finds $(& $found $(if ($sp -ge 0) { $rest.Substring(0, $sp) } else { $rest }))")
+        }
+        $body = $rest.Substring($g.rest.Length + 1)
+    }
+    $right = @($g.right)
+    for ($i = $right.Count - 1; $i -ge 0; $i--) {
+        $key = $right[$i].Split('=')[0]
+        $at = $body.LastIndexOf([char]' ')
+        $tok = $(if ($at -ge 0) { $body.Substring($at + 1) } else { $body })
+        if (-not (& $isField $tok $right[$i])) { return (& $fail "at field $($field + 1 + $i) it expects $key= and finds $(& $found $tok)") }
+        $values[$key] = $tok.Substring($key.Length + 1)
+        $body = $(if ($at -ge 0) { $body.Substring(0, $at) } else { '' })
+    }
+    if ([string]::IsNullOrEmpty($body)) { return (& $fail $(if ($null -eq $g.rest) { 'it names no clip before exported=' } else { "its $($g.rest)= value is empty" })) }
+    if ($null -eq $g.rest) { $Clip = $body } else { $values[$g.rest] = $body }
+    $fields = [ordered]@{}
+    foreach ($spec in @(@($g.left) + @($(if ($null -ne $g.rest) { "$($g.rest)=" })) + $right)) { $key = $spec.Split('=')[0]; $fields[$key] = $values[$key] }
+    [pscustomobject]@{ clip = $Clip; fields = $fields; problem = $null }
+}
+
+function ConvertFrom-DvBatchExportLog {
+    # EXPORT-RENDER-PIPE-TIMING-2 r2: the export's batch.log, read ONCE by the one line grammar above. The text is split once on LF (each line keeps its start offset in the
+    # text and loses ONE trailing CR); a line is of kind K when it starts, ordinal, with '[BATCH] K' and the next char is the line end or not [A-Za-z0-9_], and EVERY line
+    # of a kind counts toward its 'exactly one'. Returns [pscustomobject]@{ done; start; verified }, each [pscustomobject]@{ count; index; clip; fields; problem }: index is
+    # the one line's start offset (null unless count is 1), clip is DONE's clip, fields the ordered value strings (null when the line is not read), problem the one typed
+    # reason or null. RENDER_START and RENDER_VERIFIED are read for DONE's clip; with no one readable DONE line RENDER_START is EXPORT_OUTPUT_MISMATCH and
+    # RENDER_VERIFIED adds its count problem only (DONE's own problem says why).
+    param([AllowNull()][AllowEmptyString()][string]$BatchLogText)
+    $text = [string]$BatchLogText
+    $hits = @{}
+    foreach ($kind in $script:ExportBatchLineGrammar.Keys) { $hits[$kind] = [System.Collections.Generic.List[object]]::new() }
+    $offset = 0
+    foreach ($raw in $text.Split([char]"`n")) {
+        $line = $(if ($raw.EndsWith("`r", [StringComparison]::Ordinal)) { $raw.Substring(0, $raw.Length - 1) } else { $raw })
+        if ($line.StartsWith('[BATCH] ', [StringComparison]::Ordinal)) {
+            foreach ($kind in $script:ExportBatchLineGrammar.Keys) {
+                $tag = "[BATCH] $kind"
+                if ($line.StartsWith($tag, [StringComparison]::Ordinal) -and ($line.Length -eq $tag.Length -or -not [regex]::IsMatch([string]$line[$tag.Length], '\A[A-Za-z0-9_]\z'))) {
+                    $hits[$kind].Add([pscustomobject]@{ index = $offset; line = $line })
+                }
+            }
+        }
+        $offset += $raw.Length + 1
+    }
+    $part = { param($kind) [pscustomobject]@{ count = $hits[$kind].Count; index = $(if ($hits[$kind].Count -eq 1) { $hits[$kind][0].index } else { $null }); clip = $null; fields = $null; problem = $null } }
+    $read = { param($p, $kind, $clip) $r = ConvertFrom-DvBatchLogLine -Kind $kind -Line $hits[$kind][0].line -Clip $clip; $p.clip = $r.clip; $p.fields = $r.fields; $p.problem = $r.problem }
+    $done = & $part 'DONE'; $start = & $part 'RENDER_START'; $verified = & $part 'RENDER_VERIFIED'
+    if ($done.count -ne 1) { $done.problem = "EXPORT_BATCH_LOG_UNREADABLE: batch.log carries $($done.count) DONE line(s); one clip exports exactly one" }
+    else { & $read $done 'DONE' $null }
+    if ($start.count -ne 1) { $start.problem = "EXPORT_PROFILE_ABSENT: batch.log carries $($start.count) RENDER_START line(s); the rendered runner declares one per clip (BatchRunner.cpp:471), so whether export_scale is owed and the frame window are not readable" }
+    elseif ($null -eq $done.clip) { $start.problem = "EXPORT_OUTPUT_MISMATCH: RENDER_START is of no clip DONE names: batch.log carries no one DONE line in the batch runner's form, and the rendered runner prints both with one baseName (BatchRunner.cpp:324), so the declaration is not of this export" }
+    else { & $read $start 'RENDER_START' $done.clip }
+    if ($verified.count -ne 1) { $verified.problem = "EXPORT_OUTPUT_MISMATCH: batch.log carries $($verified.count) RENDER_VERIFIED line(s); the batch's own verification of the .mov must pass exactly once" }
+    elseif ($null -ne $done.clip) { & $read $verified 'RENDER_VERIFIED' $done.clip }
+    [pscustomobject]@{ done = $done; start = $start; verified = $verified }
+}
 # r3 (adversary A3 on c2da7e24): the ProRes producer's codec and container strings (BatchRenderedVideoPlan.h:1184 and :1196) and its fps form (a QLocale English decimal)
 $script:ExportRenderStartCodec = 'prores'
 $script:ExportRenderStartContainer = 'mov'
@@ -5200,68 +5315,31 @@ $script:ExportRenderStartFpsMax = [decimal]'4294970000'
 # r3 (adversary A2 on c2da7e24): the typed reason a ProRes run's dual-ISO class is not readable from a timed attempt, and the card that adds the producer's applied signal
 $script:ExportDualIsoAppliedUnknown = 'DUALISO_APPLIED_UNKNOWN'
 $script:ExportDualIsoAppliedSuccessor = 'successor EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1'
-# r6 (sol r5 B3): the rendered runner's RENDER_VERIFIED fields up to and including dimensions=, in its exact order and one space-delimited token each (BatchRunner.cpp:803:
-# <clip> decoded_frames= decoded_duration= decoded_frame_bytes= dimensions=%5x%6 bytes= container_probe= ...); dimensions= is the token between decoded_frame_bytes= and bytes=
-$script:ExportRenderVerifiedFields = '\A\[BATCH\] RENDER_VERIFIED (?<clip>\S+) decoded_frames=(?<n>[0-9]{1,15}) decoded_duration=\S+ decoded_frame_bytes=\S+ dimensions=(?<d>\S*) bytes=\S+(?: |\r?\z)'
-# r7 (sol r6 B1): container_probe= prints the probe path verbatim (BatchRunner.cpp:810), so the text from its first occurrence on is that value and never a field; every
-# field before it is written ONCE by the rendered runner (decoded_frames= decoded_duration= decoded_frame_bytes= dimensions= bytes=)
-$script:ExportRenderVerifiedProbeField = ' container_probe='
-
-function Get-DvRenderVerifiedRepeatedFields {
-    # r7 (sol r6 B1): the top-level fields of one RENDER_VERIFIED line (each key=value token after the clip, up to the first ' container_probe=' or the line end) that it
-    # names more than once, each as 'key= (v1 / v2 ...)'; empty when each is named once. The reader binds a field at its first position, so a second occurrence (equal or
-    # not) is a line the producer did not write: `dimensions=1920x1440 bytes=9 dimensions=1280x720` read PASS in r6. Keys compare ordinally (the producer's are lower case).
-    param([AllowEmptyString()][string]$Line)
-    $head = ([string]$Line).TrimEnd("`r")
-    $at = $head.IndexOf($script:ExportRenderVerifiedProbeField, [StringComparison]::Ordinal)
-    if ($at -ge 0) { $head = $head.Substring(0, $at) }
-    $values = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[string]]]::new([StringComparer]::Ordinal)
-    $order = [System.Collections.Generic.List[string]]::new()
-    # (tokens 0..2 are '[BATCH]', 'RENDER_VERIFIED' and the clip, which the caller binds to DONE's)
-    foreach ($tok in @($head.Split(' ') | Select-Object -Skip 3)) {
-        $kv = [regex]::Match([string]$tok, '\A(?<k>[A-Za-z_][A-Za-z0-9_]*)=(?<v>.*)\z')
-        if (-not $kv.Success) { continue }
-        $k = $kv.Groups['k'].Value
-        if (-not $values.ContainsKey($k)) { $values[$k] = [System.Collections.Generic.List[string]]::new(); $order.Add($k) }
-        $values[$k].Add($kv.Groups['v'].Value)
-    }
-    # (the caller wraps the call in @(), so none, one and several repeated fields are each an array with a Count)
-    foreach ($k in $order) { if ($values[$k].Count -gt 1) { "$k= ($($values[$k] -join ' / '))" } }
-}
-
 function Get-DvRenderStartDeclaration {
-    # The one RENDER_START line of a rendered export's batch log, for the clip DONE names. Returns [pscustomobject]@{ problem; scaled; cutIn; cutOut; frames; index }: problem is a
-    # typed reason (and the rest null) when there is not exactly one line, it is not in the producer's exact form, it names a field twice before out=, it is another clip's,
-    # or its frames= is not cutOut - cutIn + 1 over a 1-based cut; index is the line's offset in the text (the caller holds it before RENDER_VERIFIED and DONE).
-    param([AllowEmptyString()][string]$BatchLogText, [AllowNull()][AllowEmptyString()][string]$Clip)
+    # The one RENDER_START line of a rendered export's batch log, for the clip DONE names: the start part of ConvertFrom-DvBatchExportLog, which already holds it to
+    # exactly one line, to DONE's clip (ordinal prefix: view-0 and a zero-width space is another clip) and to the line grammar. Returns [pscustomobject]@{ problem; scaled;
+    # cutIn; cutOut; frames; index; out; output }: problem is a typed reason (and the rest null) when the part has one, or a parsed value is not the producer's (below), or
+    # its frames= is not cutOut - cutIn + 1 over a 1-based cut; index is the line's offset in the text (the caller holds it before RENDER_VERIFIED and DONE).
+    param([Parameter(Mandatory)]$Start)
     # (r5, sol r4 B3: out and output are returned too, so the caller binds the declaration to the manifest's file and the verified dimensions)
     $no = { param($why) [pscustomobject]@{ problem = $why; scaled = $null; cutIn = $null; cutOut = $null; frames = $null; index = $null; out = $null; output = $null } }
-    $lines = @([regex]::Matches([string]$BatchLogText, '(?m)^\[BATCH\] RENDER_START'))
-    $exact = @([regex]::Matches([string]$BatchLogText, $script:ExportRenderStartLine))
-    if ($lines.Count -ne 1 -or $exact.Count -ne 1) {
-        return (& $no "EXPORT_PROFILE_ABSENT: batch.log carries $($lines.Count) RENDER_START line(s), $($exact.Count) of them in the rendered runner's exact form (BatchRunner.cpp: <clip> codec= container= source=WxH output=WxH scaled=true|false fps= frames= cutIn= cutOut= out=); it declares one per clip, so whether export_scale is owed and the frame window are not readable")
-    }
-    $hit = $exact[0]
-    $head = $hit.Value.Substring(0, $hit.Groups['out'].Index - $hit.Index)
-    $repeated = @($script:ExportRenderStartKeys | Where-Object { [regex]::Matches($head, " $_=").Count -ne 1 })
-    if ($repeated.Count -gt 0) { return (& $no "EXPORT_PROFILE_ABSENT: RENDER_START names $($repeated -join ', ') more than once before out=; the rendered runner writes each field once, so the declaration is not readable") }
-    $name = $hit.Groups['clip'].Value
-    # (r2 fix 1, pass 4 A6: ORDINAL, so a name that only renders like DONE's -- view-0 and a zero-width space -- is another clip; -cne compares by culture)
-    if ([string]::IsNullOrEmpty($Clip) -or -not [string]::Equals($name, $Clip, [StringComparison]::Ordinal)) { return (& $no "EXPORT_OUTPUT_MISMATCH: RENDER_START declares clip '$name' but DONE names '$Clip', so the declaration is not of this export") }
+    if ($null -ne $Start.problem) { return (& $no $Start.problem) }
+    $f = $Start.fields
+    $sw, $sh = ([string]$f['source']).Split('x'); $ow, $oh = ([string]$f['output']).Split('x')
     # r3 (adversary A3 on c2da7e24): the declaration is the ProRes producer's own. BatchRunner.cpp:471-478 prints plan.outputVerificationPlan.expectedCodec / expectedContainer,
     # which BatchRenderedVideoPlan.cpp:4026-4030 sets from batchRenderedVideoMediaProbeCodecName / ContainerName: for ProRes / Mov those fall through to
     # BatchRenderedVideoPlan.h:1184 `return "prores";` and :1196 `return "mov";`. Source is getMlvWidth / getMlvHeight and output the frame plan's, which
     # BatchRenderedVideoPlan.cpp:4502 refuses unless both are above 0; fps is batchRenderedVideoFfmpegFrameRateArgument (BatchRenderedVideoPlan.cpp:4521-4526, QLocale
     # English toString of the clip's rate): a finite positive decimal. `codec=h264 container=mp4 source=0x0 fps=NaN` read PASS before this: no ProRes export writes it.
-    $codec = $hit.Groups['codec'].Value; $container = $hit.Groups['container'].Value
+    $codec = [string]$f['codec']; $container = [string]$f['container']
     if (-not [string]::Equals($codec, $script:ExportRenderStartCodec, [StringComparison]::Ordinal) -or -not [string]::Equals($container, $script:ExportRenderStartContainer, [StringComparison]::Ordinal)) {
         return (& $no "EXPORT_PROFILE_FOREIGN: RENDER_START declares codec=$codec container=$container; a ProRes export's rendered runner declares codec=$($script:ExportRenderStartCodec) container=$($script:ExportRenderStartContainer) (BatchRenderedVideoPlan.h batchRenderedVideoCodecName / ContainerName), so the declaration is not of this export")
     }
-    $dims = @('sw', 'sh', 'ow', 'oh' | ForEach-Object { [int64]$hit.Groups[$_].Value })
+    $dims = @($sw, $sh, $ow, $oh | ForEach-Object { [int64]$_ })
     if (@($dims | Where-Object { $_ -le 0 }).Count -gt 0) {
         return (& $no "EXPORT_PROFILE_FOREIGN: RENDER_START declares source=$($dims[0])x$($dims[1]) output=$($dims[2])x$($dims[3]); the rendered runner exports a clip with both dimensions above 0 and its frame plan refuses an output that is not (BatchRenderedVideoPlan.cpp), so the declaration is not of this export")
     }
-    $fpsText = $hit.Groups['fps'].Value; $fps = [decimal]0
+    $fpsText = [string]$f['fps']; $fps = [decimal]0
     if (-not [regex]::IsMatch($fpsText, $script:ExportRenderStartFps) -or -not [decimal]::TryParse($fpsText, ([Globalization.NumberStyles]::AllowDecimalPoint -bor [Globalization.NumberStyles]::AllowExponent), [Globalization.CultureInfo]::InvariantCulture, [ref]$fps) -or $fps -le 0) {
         return (& $no "EXPORT_PROFILE_FOREIGN: RENDER_START declares fps=$fpsText; the rendered runner declares the clip's frame rate as a finite decimal above 0 (batchRenderedVideoFfmpegFrameRateArgument), so the declaration is not of this export")
     }
@@ -5270,17 +5348,17 @@ function Get-DvRenderStartDeclaration {
     if ($fps -lt $script:ExportRenderStartFpsMin -or $fps -gt $script:ExportRenderStartFpsMax) {
         return (& $no "EXPORT_PROFILE_FOREIGN: RENDER_START declares fps=$fpsText; the rendered runner's rate is a uint32 numerator over a uint32 denominator ($($script:ExportRenderStartFpsMin) .. $($script:ExportRenderStartFpsMax) as it prints them), so the declaration is not of this export")
     }
-    $n = [int64]$hit.Groups['n'].Value; $ci = [int64]$hit.Groups['ci'].Value; $co = [int64]$hit.Groups['co'].Value
+    $n = [int64]$f['frames']; $ci = [int64]$f['cutIn']; $co = [int64]$f['cutOut']
     # (r2 fix 1, pass 4 A3: the producer's cut is uint32, BatchRunner.cpp:356-357)
     if ($ci -lt 1 -or $co -lt $ci -or $co -gt [int64][uint32]::MaxValue -or $n -ne ($co - $ci + 1)) {
         return (& $no "EXPORT_PROFILE_ABSENT: RENDER_START declares frames=$n cutIn=$ci cutOut=$co; the rendered runner declares frames = cutOut - cutIn + 1 over a 1-based uint32 cut, so the frame window is not readable")
     }
     # (r2 fix 1, pass 4 A3: an unscaled plan's output IS its source, BatchRenderedVideoPlan.cpp sets scaled whenever it resizes, stretches or aligns; a scaled plan may keep its size)
-    if ($hit.Groups['s'].Value -ceq 'false' -and ($hit.Groups['sw'].Value -cne $hit.Groups['ow'].Value -or $hit.Groups['sh'].Value -cne $hit.Groups['oh'].Value)) {
-        return (& $no "EXPORT_PROFILE_ABSENT: RENDER_START declares scaled=false with source=$($hit.Groups['sw'].Value)x$($hit.Groups['sh'].Value) but output=$($hit.Groups['ow'].Value)x$($hit.Groups['oh'].Value); an unscaled frame plan writes its source size, so whether export_scale is owed is not readable")
+    if ([string]$f['scaled'] -ceq 'false' -and ($sw -cne $ow -or $sh -cne $oh)) {
+        return (& $no "EXPORT_PROFILE_ABSENT: RENDER_START declares scaled=false with source=$($sw)x$($sh) but output=$($ow)x$($oh); an unscaled frame plan writes its source size, so whether export_scale is owed is not readable")
     }
-    [pscustomobject]@{ problem = $null; scaled = ($hit.Groups['s'].Value -ceq 'true'); cutIn = $ci; cutOut = $co; frames = $n; index = $hit.Index
-                       out = $hit.Groups['out'].Value; output = "$($hit.Groups['ow'].Value)x$($hit.Groups['oh'].Value)" }
+    [pscustomobject]@{ problem = $null; scaled = ([string]$f['scaled'] -ceq 'true'); cutIn = $ci; cutOut = $co; frames = $n; index = $Start.index
+                       out = [string]$f['out']; output = "$($ow)x$($oh)" }
 }
 
 # EXPORT-RENDER-PIPE-TIMING-1 r2 (adversary A6 on a6f48506): whether a build emits this card's stages, read from that commit's own src/debug/StageTiming.h in the repo this module
@@ -5542,22 +5620,25 @@ function Get-DvExportEvidence {
     $containmentAdvisory = @()   # (r18's advisory channel, kept EMPTY for the receipt shape the leg runner writes (receipt.export.containmentAdvisory): EXPORT-CDNG-STAGE-CONTAINMENT-1 r1 made the check gate again)
     # -- the batch log: exactly one DONE line for the one clip
     # (r7 A6: the counts are bounded to 15 digits, so a count that does not fit an int64 is no DONE line, typed below, and never an Int64 cast that throws)
-    $done = @([regex]::Matches([string]$BatchLogText, '(?m)^\[BATCH\] DONE (?<base>.+?) exported=(?<e>[0-9]{1,15}) skipped=(?<s>[0-9]{1,15}) elapsed=(?<t>[0-9]{1,12}(?:\.[0-9]{1,9})?)\r?$'))
+    # (EXPORT-RENDER-PIPE-TIMING-2 r2: the batch log is read ONCE, by the one line grammar (ConvertFrom-DvBatchExportLog), for DONE here and RENDER_START / RENDER_VERIFIED
+    # below; DONE is peeled from the right, exported= skipped= elapsed=, and its clip is the rest: the split the anchored DONE regex made, for CDNG too)
+    $batch = ConvertFrom-DvBatchExportLog -BatchLogText ([string]$BatchLogText)
+    $elapsedText = $(if ($null -ne $batch.done.fields) { [string]$batch.done.fields['elapsed'] } else { $null })
     if ([string]::IsNullOrEmpty($BatchLogText)) { $problems.Add('EXPORT_BATCH_LOG_UNREADABLE: batch.log is absent') }
-    elseif ($done.Count -ne 1) { $problems.Add("EXPORT_BATCH_LOG_UNREADABLE: batch.log carries $($done.Count) DONE line(s); one clip exports exactly one") }
+    elseif ($null -ne $batch.done.problem) { $problems.Add($batch.done.problem) }
     else {
-        $m.framesExported = [int64]$done[0].Groups['e'].Value
-        $m.exportFramesSkipped = [int64]$done[0].Groups['s'].Value
+        $m.framesExported = [int64]$batch.done.fields['exported']
+        $m.exportFramesSkipped = [int64]$batch.done.fields['skipped']
         $m.exportFramesFailed = $m.exportFramesSkipped
         # (EXPORT-CDNG-TOTAL-CONTAINMENT-1 r4 B1, opus r3: wallSeconds is the PUBLISHED figure, 6 decimals; the wall gates' limit is built from the exact matched elapsed, up to 9 decimals, never from it)
-        $wallExact = [decimal]::Parse($done[0].Groups['t'].Value, [Globalization.NumberStyles]::AllowDecimalPoint, [Globalization.CultureInfo]::InvariantCulture)
+        $wallExact = [decimal]::Parse($elapsedText, [Globalization.NumberStyles]::AllowDecimalPoint, [Globalization.CultureInfo]::InvariantCulture)
         # (EXPORT-RENDER-PIPE-TIMING-1 r5, sol r4 B4: the producer ROUNDS its elapsed to the places it prints -- BatchRunner.cpp DONE is QString::arg(ms / 1000.0, 0, 'f', 1), to
         # the nearest tenth -- so the run's wall is up to half of the last printed place longer than the figure: 348 ms prints elapsed=0.3. The wall gates hold the timed work
         # inside the LARGEST wall the figure admits, the figure plus half its last place (0.05 s at one decimal, 0.5 s at none), exact in [decimal].)
-        $wallPlaces = $(if ($done[0].Groups['t'].Value.Contains('.')) { $done[0].Groups['t'].Value.Split('.')[1].Length } else { 0 })
+        $wallPlaces = $(if ($elapsedText.Contains('.')) { $elapsedText.Split('.')[1].Length } else { 0 })
         $wallHalfPlace = [decimal]0.5; for ($k = 0; $k -lt $wallPlaces; $k++) { $wallHalfPlace = $wallHalfPlace / [decimal]10 }
         $wallExact = $wallExact + $wallHalfPlace
-        $m.wallSeconds = Get-DvExportRound ([double]::Parse($done[0].Groups['t'].Value, [Globalization.CultureInfo]::InvariantCulture))
+        $m.wallSeconds = Get-DvExportRound ([double]::Parse($elapsedText, [Globalization.CultureInfo]::InvariantCulture))
         $m.exportFps = $(if ($m.wallSeconds -gt 0) { Get-DvExportRound ($m.framesExported / $m.wallSeconds) } else { $null })
     }
     # -- the output manifest the job wrote before it deleted the exported files
@@ -5690,16 +5771,13 @@ function Get-DvExportEvidence {
         if ([string]::IsNullOrEmpty($StageLogText)) { $why = 'stage-timing.log is absent'; $whyPipe = $why }
         $m['dualIsoActiveFramesCouldNotCheck'] = $why; $m['dualIsoClassAgreesCouldNotCheck'] = $why
         $m['renderPipeTimed'] = $null; $m['renderPipeTimedCouldNotCheck'] = $whyPipe
-        $verified = @([regex]::Matches([string]$BatchLogText, '(?m)^\[BATCH\] RENDER_VERIFIED (?<clip>\S+) decoded_frames=(?<n>[0-9]{1,15})(?=\s|$)'))   # r15 (pass14 A2): the token ends at whitespace or the line end, so 480.5, 480-1 and 480/2 verify nothing (a word boundary also ends it at '.')
-        $doneClip = $(if ($done.Count -eq 1) { $done[0].Groups['base'].Value } else { $null })
-        # r7 (sol r6 B1): the one RENDER_VERIFIED line, read once for every field below; a field the producer writes once, named twice before container_probe=, is INVALID
-        $verifiedLine = $(if ($verified.Count -eq 1) { $verified[0].Value + ([string]$BatchLogText).Substring($verified[0].Index + $verified[0].Length).Split("`n")[0] } else { $null })
-        $verifiedRepeats = @(if ($null -ne $verifiedLine) { Get-DvRenderVerifiedRepeatedFields -Line $verifiedLine })
-        if ($verified.Count -ne 1) { $problems.Add("EXPORT_OUTPUT_MISMATCH: batch.log carries $($verified.Count) RENDER_VERIFIED line(s); the batch's own verification of the .mov must pass exactly once") }
-        elseif ($verifiedRepeats.Count -gt 0) { $problems.Add("EXPORT_OUTPUT_MISMATCH: RENDER_VERIFIED names $($verifiedRepeats -join ', ') more than once before container_probe=; the rendered runner writes each of those fields once (BatchRunner.cpp), so the line is not its verification of this .mov") }
-        elseif ($null -ne $m.framesExported -and [int64]$verified[0].Groups['n'].Value -ne $m.framesExported) { $problems.Add("EXPORT_OUTPUT_MISMATCH: the batch verified $($verified[0].Groups['n'].Value) decoded frame(s) but exported $($m.framesExported)") }
-        # r2 (adversary advisory A8 on a6f48506): the verification is of the clip DONE names (BatchRunner.cpp prints both with the one baseName)
-        elseif ($null -ne $doneClip -and -not [string]::Equals($verified[0].Groups['clip'].Value, $doneClip, [StringComparison]::Ordinal)) { $problems.Add("EXPORT_OUTPUT_MISMATCH: batch.log verifies clip '$($verified[0].Groups['clip'].Value)' but DONE names '$doneClip', so the batch's own verification is not of this clip's .mov") }
+        # EXPORT-RENDER-PIPE-TIMING-2 r2: the one RENDER_VERIFIED line, read by the line grammar (ConvertFrom-DvBatchExportLog) for the clip DONE names (r2 A8: the runner prints
+        # both with the one baseName): exactly one line of the kind, every field once at its position (decoded_frames= .. bytes= left to right, the probe trailer peeled from
+        # the right of the verbatim container_probe= path), each value of its shape (r15: 480.5, 480-1 and 480/2 are no u15), or EXPORT_OUTPUT_MISMATCH; with no one
+        # readable DONE line it adds its count problem only
+        $verified = $batch.verified
+        if ($null -ne $verified.problem) { $problems.Add($verified.problem) }
+        elseif ($null -ne $verified.fields -and $null -ne $m.framesExported -and [int64]$verified.fields['decoded_frames'] -ne $m.framesExported) { $problems.Add("EXPORT_OUTPUT_MISMATCH: the batch verified $($verified.fields['decoded_frames']) decoded frame(s) but exported $($m.framesExported)") }
         if ([string]::IsNullOrEmpty($StageLogText)) { $problems.Add('EXPORT_PROFILE_ABSENT: stage-timing.log is absent') }
         else {
             # r7: ONE schema (Test-DvExportStageLogRecords) -- every line that carries the tag is one conforming record, or the log is INVALID with a typed reason
@@ -5876,12 +5954,13 @@ function Get-DvExportEvidence {
                 # frame exactly when it is true (the window check above holds a partial one), so a scaled plan with none and an unscaled plan with some are other runs' figures
                 # r2 (adversary A2, A3, A5 on a6f48506): the line is read WHOLE, in the producer's exact field order (Get-DvRenderStartDeclaration), for DONE's clip, before
                 # RENDER_VERIFIED and DONE; and its cut is the frame window: the producer's loop (BatchRunner.cpp:541) times frames cutIn-1 .. cutOut-1 and nothing else
-                $decl = Get-DvRenderStartDeclaration -BatchLogText ([string]$BatchLogText) -Clip $doneClip
+                # (EXPORT-RENDER-PIPE-TIMING-2 r2: from the batch log's one read, ConvertFrom-DvBatchExportLog; the order check uses each line's parsed start offset)
+                $decl = Get-DvRenderStartDeclaration -Start $batch.start
                 $scale = $perStage['export_scale']
                 if ($null -ne $decl.problem) { $problems.Add($decl.problem) }
                 else {
-                    if ($done.Count -eq 1 -and $decl.index -gt $done[0].Index) { $problems.Add('EXPORT_OUTPUT_MISMATCH: batch.log writes RENDER_START after DONE; the rendered runner declares the clip before it exports it, so the declaration is not of this export') }
-                    elseif ($verified.Count -eq 1 -and ($decl.index -gt $verified[0].Index -or ($done.Count -eq 1 -and $verified[0].Index -gt $done[0].Index))) {
+                    if ($batch.done.count -eq 1 -and $decl.index -gt $batch.done.index) { $problems.Add('EXPORT_OUTPUT_MISMATCH: batch.log writes RENDER_START after DONE; the rendered runner declares the clip before it exports it, so the declaration is not of this export') }
+                    elseif ($batch.verified.count -eq 1 -and ($decl.index -gt $batch.verified.index -or ($batch.done.count -eq 1 -and $batch.verified.index -gt $batch.done.index))) {
                         $problems.Add('EXPORT_OUTPUT_MISMATCH: batch.log does not write RENDER_START, RENDER_VERIFIED and DONE in the order the rendered runner writes them, so they are not one export')
                     }
                     # r5 (sol r4 B3): the declaration is of THIS output. out= is the path the runner publishes the .mov to (BatchRunner.cpp finalPath), and the job's manifest
@@ -5896,15 +5975,10 @@ function Get-DvExportEvidence {
                     # r6 (sol r5 B3): dimensions= is a REQUIRED field read at the producer's token position (BatchRunner.cpp:803 writes it fifth after the tag, between
                     # decoded_frame_bytes= and bytes=), never by a substring scan of the whole line: a line without it at that position is not the producer's verification
                     # of this .mov (INVALID), and text after it (container_probe= prints the probe path verbatim, which may hold ' dimensions=') is never the field
-                    # (r7: a field named twice is refused above, at the line's one read; this binds the first and only dimensions=)
-                    if ($verified.Count -eq 1) {
-                        $verifiedFields = [regex]::Match($verifiedLine, $script:ExportRenderVerifiedFields)
-                        if (-not $verifiedFields.Success) {
-                            $problems.Add("EXPORT_OUTPUT_MISMATCH: RENDER_VERIFIED carries no dimensions= at the rendered runner's field position (BatchRunner.cpp: <clip> decoded_frames= decoded_duration= decoded_frame_bytes= dimensions=WxH bytes= ...), so the decoded .mov is not bound to RENDER_START output=$($decl.output)")
-                        }
-                        elseif (-not [string]::Equals($verifiedFields.Groups['d'].Value, [string]$decl.output, [StringComparison]::Ordinal)) {
-                            $problems.Add("EXPORT_OUTPUT_MISMATCH: RENDER_START declares output=$($decl.output) but RENDER_VERIFIED decoded dimensions=$($verifiedFields.Groups['d'].Value), so the declaration and the verification are not of one .mov")
-                        }
+                    # (EXPORT-RENDER-PIPE-TIMING-2 r2: the line grammar holds dimensions= to its one position and shape, so this binds the parsed field; a verification that
+                    # failed the grammar has its one problem above and adds nothing here)
+                    if ($null -ne $batch.verified.fields -and -not [string]::Equals([string]$batch.verified.fields['dimensions'], [string]$decl.output, [StringComparison]::Ordinal)) {
+                        $problems.Add("EXPORT_OUTPUT_MISMATCH: RENDER_START declares output=$($decl.output) but RENDER_VERIFIED decoded dimensions=$($batch.verified.fields['dimensions']), so the declaration and the verification are not of one .mov")
                     }
                     if ($decl.scaled -and $scale.Count -eq 0) { $problems.Add('EXPORT_PROFILE_ABSENT: RENDER_START declares scaled=true but stage-timing.log times no export_scale; a scaled frame plan times it on every frame') }
                     elseif (-not $decl.scaled -and $scale.Count -gt 0) { $problems.Add("EXPORT_STAGE_WINDOW_MISMATCH: RENDER_START declares scaled=false but stage-timing.log times export_scale on $($scale.Count) frame(s); an unscaled frame plan runs no scale") }
