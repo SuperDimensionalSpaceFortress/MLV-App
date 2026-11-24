@@ -3391,8 +3391,13 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     // correct charge is the ~8 ms before the WM_NULL
     // r3 (sol r2 B1): and with that pause held past every send (`coalesceInForeign`, pausedInForeign only): the WM_NULL, the present
     // and all five probes run in ONE dispatch, the sample the r2 admission discarded on every attempt
-    const auto judgeSentWait = [&]( bool armed, bool traced, bool stamped, bool foreignFirst, bool pausedInForeign, bool coalesceInForeign ) {
+    // r4 (sol r3 B1): `strayAfterHeld` (coalesceInForeign only) adds the pass 4 A1 stray after the held dispatch. Without it the
+    // coalesced row is the ONE-SPAN row: it admits only a one-span sample and asserts one span on the judged one, so the r2 gate
+    // (`spans.size() != 1`) restored can never pass it. The stray row alone could: its stray is a second span the old gate admits.
+    const auto judgeSentWait = [&]( bool armed, bool traced, bool stamped, bool foreignFirst, bool pausedInForeign, bool coalesceInForeign,
+                                    bool strayAfterHeld ) {
     const bool floorRow = foreignFirst && pausedInForeign;             // r3: the paused floor row, admitted on its own predicate below
+    const bool oneSpanRow = floorRow && coalesceInForeign && !strayAfterHeld;   // r4 (sol r3 B1): the coalesced row with no stray
     wake.setTimingStampsForTest( stamped );                           // also resets the exit record to None / -1
     std::unique_ptr<R17A1Windows> wp;
     std::vector<std::pair<double, double>> spans;
@@ -3419,6 +3424,10 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     int noStamps = 0;                                                 // the sleep made no caller-clock read
     int oneSpanInherited = 0;                                         // an inherited arm saw exactly one span: no second dispatch to witness
     int holdNotWitnessed = 0;                                         // the floor row's WM_NULL handler did not hold the GUI while the present was queued
+    // r4 (sol r3 B2): an attempt whose present was never sent (the sender's entry cutoff, or a failed SendNotifyMessageW) is its own
+    // reason, and the typed report below runs BEFORE any assertion on the send, so ten unsent attempts still name their reason
+    int notSent = 0;
+    int notOneSpan = 0;                                               // r4 (sol r3 B1): the one-span row saw more than one span
     for( int attempt = 0; attempt < kAttempts && !landed; ++attempt )
     {
         wp.reset( new R17A1Windows );
@@ -3444,8 +3453,9 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         g_r17A1CoalesceInForeign = floorRow && coalesceInForeign;
         foreignSentMs = 0.0;
         std::atomic<bool> sent { false };
-        const bool hostileExtras = g_r17A1CoalesceInForeign;          // r3 pass 4 A1/A5 inputs: the coalesced row also gets stray sends
-        std::thread sender( [window, &sent, &foreignSentMs, foreignFirst, hostileExtras]() {   // foreignSentMs is read only after the join
+        const bool hostileExtras = g_r17A1CoalesceInForeign;          // r3 pass 4 A5 input: the coalesced rows also get a second WM_NULL
+        const bool strayExtra = hostileExtras && strayAfterHeld;      // r4 (sol r3 B1): the pass 4 A1 stray, in the stray row only
+        std::thread sender( [window, &sent, &foreignSentMs, foreignFirst, hostileExtras, strayExtra]() {   // foreignSentMs is read only after the join
             const ULONGLONG giveUp = GetTickCount64() + 5000;
             g_r17A1SenderGiveUp = giveUp;                              // A7: published before any send, so the paused handler reads it
             bool entered = false;
@@ -3484,7 +3494,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
             }
             waitUntil( seenMs + 56.0 );                                // r3 (sol r2 B1): the coalescing row's GUI resumes at 56 ms
             g_r17A1ProbesSent = true;                                  // after the present's publication and every probe's send
-            if( hostileExtras )
+            if( strayExtra )
             {
                 // pass 4 A1 input: a stray sent message after the held batch's dispatch ENDED (the sleep's third clock read), so it
                 // is its own dispatch inside the sleep (sent by 75 ms at the latest; a stray that misses the sleep is drained)
@@ -3540,22 +3550,33 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         // dispatch to witness (exactly one span is its batched sample, observed again). The paused floor row needs only the
         // witnessed hold: the present and every probe coalescing into the held dispatch is a healthy, correctly charged sleep, and
         // one span is judged in full below like any other count (an empty record still reaches dispatches >= 1 and fails there)
+        // r4 (sol r3 B1): the one-span row admits only the one-span sample it exists to judge (a span from any other source is
+        // observed again), so a restored `spans.size() != 1` gate discards every attempt and fails it with a typed reason
         const bool inheritedAdmits = spans.size() != 1;
-        const bool floorAdmits = pauseHeld;
-        if( !handlerRan ) ++missedSend;
+        const bool floorAdmits = pauseHeld && ( !oneSpanRow || spans.size() == 1 );
+        if( !handlerRan )
+        {
+            if( sentOk ) ++missedSend;                                 // sent, but its handler ran only after the sleep returned
+            else ++notSent;                                            // r4 (sol r3 B2): never sent at all
+        }
         else if( stamps.empty() ) ++noStamps;
-        else if( floorRow && !floorAdmits ) ++holdNotWitnessed;
+        else if( floorRow && !pauseHeld ) ++holdNotWitnessed;
+        else if( floorRow && !floorAdmits ) ++notOneSpan;
         else if( !floorRow && !inheritedAdmits ) ++oneSpanInherited;
         landed = handlerRan && !stamps.empty() && ( floorRow ? floorAdmits : inheritedAdmits );
     }
-    ASSERT_TRUE( sentOk );
     // r3 (sol r2 B1): every attempt discarded is a loud failure naming why, never a vacuous pass
+    // r4 (sol r3 B2): and it is the FIRST check after the loop: the send assertion used to run before it, so a last attempt that
+    // never sent the present threw there and every count was lost. The send is asserted only on the landed attempt, below.
     if( !landed )
         ::minitest::fail( __FILE__, __LINE__, floorRow ? "R17A1_FLOOR_ROW_NOT_LANDED" : "R17A1_INHERITED_ARM_NOT_LANDED",
-                          "attempts=" + std::to_string( kAttempts ) + " missed_send=" + std::to_string( missedSend )
-                              + " no_stamps=" + std::to_string( noStamps ) + " hold_not_witnessed=" + std::to_string( holdNotWitnessed )
+                          "attempts=" + std::to_string( kAttempts ) + " not_sent=" + std::to_string( notSent )
+                              + " missed_send=" + std::to_string( missedSend ) + " no_stamps=" + std::to_string( noStamps )
+                              + " hold_not_witnessed=" + std::to_string( holdNotWitnessed )
+                              + " not_one_span=" + std::to_string( notOneSpan )
                               + " one_span_inherited=" + std::to_string( oneSpanInherited ) );
     ASSERT_TRUE( landed );                                             // the send fell inside one of the sleeps
+    ASSERT_TRUE( sentOk );                                             // the landed attempt's present was sent (its handler ran)
     ASSERT_TRUE( armed == armedDuringSleep );                         // SEAM-1 A4: the judged sleep ran with the wake as intended
     // SEAM-1 A1: the sleep was never cut short at a dispatch, on the product's own exit decision: an expiry check left the loop
     // only past the 80 ms on the elapsed value it compared, or the wait timed out (at most one timer tick early); no recorded
@@ -3611,6 +3632,9 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         ASSERT_TRUE( inPresentSpan( nullEnterMs ) );                   // the held WM_NULL ran in the present's dispatch
         ASSERT_EQ( ( 1u << 5 ) - 1u, ranProbes );                     // all five probes ran...
         for( int i = 0; i < 5; ++i ) ASSERT_TRUE( inPresentSpan( probeRunMs[i] ) );   // ...inside the held dispatch
+        // r4 (sol r3 B1): the one-span row judged a ONE-span sample (its admission took no other), so it is exactly the sample the
+        // r2 gate discarded: any admission that lets a two-span sample through to here fails, whichever line it is restored on
+        if( !strayAfterHeld ) ASSERT_EQ( static_cast<size_t>( 1 ), dispatches );
     }
     const size_t kNoSegment = static_cast<size_t>( -1 );
     std::vector<size_t> segmentOfDispatch( dispatches, kNoSegment );   // the segment the sink was handed when dispatch k began
@@ -3708,13 +3732,14 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     };
     for( const bool stamped : { false, true } )                       // SEAM-1 r4 (pass 3 A1): the production seam-off configuration first
     {
-        judgeSentWait( false, false, stamped, false, false, false );   // the wake idle: at least one judged attempt
-        judgeSentWait( true, false, stamped, false, false, false );    // SEAM-1 A4: the wake armed: at least one judged attempt
-        judgeSentWait( true, true, stamped, false, false, false );     // pass 2 A2: armed with the GUI trace on
-        judgeSentWait( false, false, stamped, true, false, false );    // r10 (sol r9 B1): a foreign WM_NULL dispatched before the present
-        judgeSentWait( true, true, stamped, true, false, false );      // ...armed, traced
-        judgeSentWait( false, false, stamped, true, true, false );     // FOREIGN-FIRST-FLOOR-1 (sol/fable r10 B1): the GUI paused inside the WM_NULL dispatch
-        judgeSentWait( false, false, stamped, true, true, true );      // r3 (sol r2 B1): ...paused past every send: one coalesced span
+        judgeSentWait( false, false, stamped, false, false, false, false );   // the wake idle: at least one judged attempt
+        judgeSentWait( true, false, stamped, false, false, false, false );    // SEAM-1 A4: the wake armed: at least one judged attempt
+        judgeSentWait( true, true, stamped, false, false, false, false );     // pass 2 A2: armed with the GUI trace on
+        judgeSentWait( false, false, stamped, true, false, false, false );    // r10 (sol r9 B1): a foreign WM_NULL dispatched before the present
+        judgeSentWait( true, true, stamped, true, false, false, false );      // ...armed, traced
+        judgeSentWait( false, false, stamped, true, true, false, false );     // FOREIGN-FIRST-FLOOR-1 (sol/fable r10 B1): the GUI paused inside the WM_NULL dispatch
+        judgeSentWait( false, false, stamped, true, true, true, false );      // r4 (sol r3 B1): ...paused past every send: exactly one coalesced span
+        judgeSentWait( false, false, stamped, true, true, true, true );       // r3 (sol r2 B1, pass 4 A1): ...and a stray after the held dispatch
     }
     wake.setTimingStampsForTest( false );
     // a sleep no dispatch cuts is one segment, charged to the window open at its end; NotHandled hands out none
