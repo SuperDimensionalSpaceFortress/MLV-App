@@ -5401,10 +5401,11 @@ function Get-DvRenderStartDeclaration {
                        out = [string]$f['out']; output = "$($ow)x$($oh)" }
 }
 
-# EXPORT-RENDER-PIPE-TIMING-3 r1 (rule G1): the rest of a CDNG frame leaf after `<clip>_`, as CdngSequenceExport.cpp:269-280 names it: <frame6>.dng (CODEC_CNDG_DEFAULT,
-# :269-271) or 1_<year>-<month>-<day>_0001_C0000_<frame6>.dng (:275-280). Each width is a minimum (QString::arg's field width): the year is tm_year + 1900 over a uint16 and
-# month / day are uint16 (mlv.h:201-203, macros.h:61-63), so up to five digits; the frame number is a uint32 (mlv_object.h:52), so up to ten.
-$script:ExportCdngFrameLeaf = '\A(?:1_[0-9]{2,5}-[0-9]{2,5}-[0-9]{2,5}_0001_C0000_)?[0-9]{6,10}\.dng\z'
+# EXPORT-RENDER-PIPE-TIMING-3 r1 (rule G1) / r2 (sol r1 blocker, key3 r1 row 2): the rest of a CDNG frame leaf after `<clip>_`, as the batch route names it. The headless
+# route passes CODEC_CNDG_DEFAULT (BatchRunner.cpp:1393), so CdngSequenceExport.cpp:269-271 writes <frame6>.dng and nothing else. The dated form
+# 1_<yy>-<mm>-<dd>_0001_C0000_<frame6>.dng (:275-280) is never written on this route; r1 accepted it, so a standard leaf of clip view-0_1_2024-01-02_0001_C0000 certified a
+# DONE naming view-0. The width is a minimum (QString::arg's field width): the frame number is a uint32 (mlv_object.h:52), so six to ten digits.
+$script:ExportCdngFrameLeaf = '\A[0-9]{6,10}\.dng\z'
 
 function Get-DvBatchExportBindingProblems {
     # EXPORT-RENDER-PIPE-TIMING-3 r1 (sol r4 B4): the ONE verdict that binds the batch log's lines to this export. The central reader (Get-DvExportEvidence) and the
@@ -5412,7 +5413,8 @@ function Get-DvBatchExportBindingProblems {
     # -OutputCount, -FirstName and -LastName are the output manifest's count and its first / last record's name (null when absent or not of that type); -ReadStart reads
     # RENDER_START (a ProRes route). Returns [pscustomobject]@{ problems; decl }:
     #   (a) G1, the CDNG clip witness: DONE's clip is positional (the text between the tag and the right-peeled trailer), never field-parsed, and every DNG leaf the
-    #       manifest names is <clip>_<frame>.dng. ProRes's witness is RENDER_START / RENDER_VERIFIED's ordinal prefix (ConvertFrom-DvBatchLogLine), which every ProRes
+    #       manifest names is <clip>_<frame>.dng, the one form the batch route writes (r2 F1), and both endpoints' stems are that clip (r2 F2: no mixed pair, no other
+    #       clip's leaves). ProRes's witness is RENDER_START / RENDER_VERIFIED's ordinal prefix (ConvertFrom-DvBatchLogLine), which every ProRes
     #       route of both callers requires. No output to bind (no manifest, count 0, a name that is not a string) is unbound: no problem here (the callers' own rules refuse
     #       a PASS there).
     #   (b) with -ReadStart: the declaration's problem (Get-DvRenderStartDeclaration) or, when it reads, the producer's line order, its out= leaf against the manifest's .mov
@@ -5431,6 +5433,18 @@ function Get-DvBatchExportBindingProblems {
             if (-not $bound) {
                 $problems.Add("EXPORT_BATCH_LOG_UNREADABLE: DONE names the clip '$clip', but output-manifest.json lists '$leaf', and the batch runner names each frame of that clip $($clip)_<frame>.dng (CdngSequenceExport.cpp:269-280), so the DONE line is not this export's")
                 break
+            }
+        }
+        # (r2 F2, defence in depth, independent of the leaf table: the two endpoints are one clip's frames in one form. Each endpoint's stem, the leaf less its trailing
+        # _<frame>.dng, must be DONE's clip, so a mixed pair or another clip's leaves are the witness problem even if the table is ever widened again)
+        if ($problems.Count -eq 0 -and $FirstName -is [string] -and $LastName -is [string]) {
+            $stemsAreClip = $true
+            foreach ($leaf in @($FirstName, $LastName)) {
+                $m = [regex]::Match($leaf, '\A(.*)_[0-9]{6,10}\.dng\z')
+                if (-not $m.Success -or -not [string]::Equals($m.Groups[1].Value, $clip, [StringComparison]::Ordinal)) { $stemsAreClip = $false }
+            }
+            if (-not $stemsAreClip) {
+                $problems.Add("EXPORT_BATCH_LOG_UNREADABLE: DONE names the clip '$clip', but output-manifest.json lists '$FirstName' and '$LastName', and the batch runner names each frame of that clip $($clip)_<frame>.dng (CdngSequenceExport.cpp:269-280), so the DONE line is not this export's")
             }
         }
     }
@@ -6075,8 +6089,11 @@ function Get-DvExportEvidence {
                 # (EXPORT-RENDER-PIPE-TIMING-2 r2: the line grammar holds dimensions= to its one position and shape, so this binds the parsed field; a verification that
                 # failed the grammar has its one problem above and adds nothing here)
                 # EXPORT-RENDER-PIPE-TIMING-3 r1 (sol r4 B4, ONE verdict): the declaration, the order, the out= leaf and the dimensions binding above are
-                # Get-DvBatchExportBindingProblems (moved there verbatim, same messages and order), which the Bachelor job calls too, so the venue never reads EXPORT_CAPTURED
-                # where this reader reads INVALID. scaled= and the frame window stay here, on its decl, only when the declaration reads.
+                # Get-DvBatchExportBindingProblems (moved there verbatim, same messages and order), which the Bachelor job calls too. The two agree on a PRESENT
+                # RENDER_START and on the CDNG witness; they differ on an ABSENT one: this route requires RENDER_START, while the job reads it only when present
+                # (-ReadStart count>0), so the job can say EXPORT_CAPTURED where this reader says INVALID. The receipt still reads INVALID, since the leg's verdict is this
+                # reader's re-derivation (Invoke-VenueLeg.ps1:760-765), and an emitting app always prints RENDER_START on the rendered route (BatchRunner.cpp:471)
+                # (TIMING-3 r2 F3, key3 r1 row 1). scaled= and the frame window stay here, on its decl, only when the declaration reads.
                 $bind = Get-DvBatchExportBindingProblems -Batch $batch -Format $Format -OutputCount $mCount -FirstName $mFirstName -LastName $mLastName -ReadStart:$true
                 $decl = $bind.decl
                 $scale = $perStage['export_scale']
