@@ -253,8 +253,11 @@ class VenueFixtureModuleCopyTests(unittest.TestCase):
                       "& (Get-Module VenueChain) { Get-VenueClaimShapeSource }")
             r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
             self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
-            self.assertIn("VENUE_CLAIM_PREDICATE_UNREADABLE", r.stdout + r.stderr)
-            self.assertIn("AttrCudaArtifacts.psm1", r.stdout + r.stderr)
+            # TAIL-1 r6 (sol r5 H1): pwsh wraps a long error line at the console width, which can split a token (a long temp path put the wrap inside the file name); the tokens are matched with every
+            # whitespace run removed (with the "| " gutter ConciseView puts at the start of each continued line), so the check no longer depends on where the line was wrapped
+            unwrapped = re.sub(r"\s+(?:\|\s+)?", "", r.stdout + r.stderr)
+            self.assertIn("VENUE_CLAIM_PREDICATE_UNREADABLE", unwrapped, r.stdout + r.stderr)
+            self.assertIn("AttrCudaArtifacts.psm1", unwrapped, r.stdout + r.stderr)
 
     def test_ci_b1_control_a_scratch_copy_without_its_siblings_stops_on_the_import(self) -> None:
         # the failure the hosted run hit: with only the module copied, the import stops before any mutation under test
@@ -380,6 +383,21 @@ class VenueChainRunnerTests(unittest.TestCase):
         res = chain_result(r.stdout)
         self.assertEqual([l["status"] for l in res["legs"]], ["RAN"], r.stdout)
         self.assertIn("CHAIN_LOG_WRITE_FAILED", r.stderr, f"the unwritten log lines were not said on stderr:\n{r.stderr}")
+
+    def test_tail1_r6_b1_a_stalled_chain_result_append_never_holds_the_process_exit(self) -> None:
+        # TAIL-1 r6 (sol r5 B1, second half of its row): the CHAIN_RESULT append STALLS (90 s here: a share that stops answering). r5 put the result on stdout first, but the append still held the process
+        # exit for as long as it stalled. Only that append is made to stall (a copy of the runner). Expected: exit 0 with the typed CHAIN_RESULT, inside a bound far under the stall, and the flush timeout said on stderr.
+        anchor = "try { Add-Content -LiteralPath $ChainLog -Value $line -ErrorAction Stop }"
+        runner = self.mutated_runner(anchor, "if ($line -like 'CHAIN_RESULT=*') { [Threading.Thread]::Sleep(90000) }; " + anchor, count=1)
+        rd = self.case / "lane-stalled-log"
+        t0 = time.monotonic()
+        r = self.run_chain(rd, [self.specs[0]], runner=runner)
+        took = time.monotonic() - t0
+        self.assertEqual(r.returncode, 0, f"exit {r.returncode}:\n{r.stdout}\n{r.stderr}")
+        res = chain_result(r.stdout)
+        self.assertEqual([l["status"] for l in res["legs"]], ["RAN"], r.stdout)
+        self.assertLess(took, 60.0, f"a stalled CHAIN_RESULT append held the chain's exit for {took:.1f} s (the stall is 90 s):\n{r.stderr}")
+        self.assertIn("CHAIN_LOG_FLUSH_TIMEOUT", r.stderr, f"the writer that did not finish was not said on stderr:\n{r.stderr}")
 
     def test_two_concurrent_chains_never_deadlock_and_the_second_runs_after_the_first_releases(self) -> None:
         rd_a, rd_b = self.case / "lane-A", self.case / "lane-B"

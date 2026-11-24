@@ -2833,7 +2833,9 @@ Close-LegTicket 'leg-1' 'TICKET_ENDED' 'test'
 $o['ticketSetAtLine'] = $script:ticketAtLine
 $o | ConvertTo-Json -Compress
 """)
-        self.assertEqual(r["appends"], 1, f"a failed chain.log append was followed by another synchronous append (one that can stall on a share): {r}")
+        # TAIL-1 r6 (sol r5 B1): stricter than r5's "one append": L makes NO append on the caller's thread (the shadow is the caller's), it queues the line to its writer runspace, so no append of any count can stall the chain
+        self.assertEqual(r["appends"], 0, f"L appended to chain.log on the caller's thread (an append that stalls on a share then holds the chain): {r}")
+        self.assertLess(r["oneSec"], 3.0, f"one L call took {r['oneSec']} s (the first call opens the writer runspace; no append is waited for): {r}")
         self.assertTrue(r["outBeforeAppend"], f"the line reached stdout only after the append returned: {r}")
         self.assertEqual(len(r["emitted"]), 1, r)
         self.assertTrue(r["emitted"][0].endswith("ONE_LINE x=1"), r)
@@ -2864,6 +2866,78 @@ $o | ConvertTo-Json -Compress -Depth 4
 """)
         self.assertEqual((r["close"]["ticketSet"], r["close"]["releases"]), (False, 2), f"the close wrote a diagnostic line before every release and the ticket's reset: {r}")
         self.assertEqual(r["tail"]["releases"], 2, f"the chain end wrote a diagnostic line before every kept nonce's release: {r}")
+
+    def test_tail1_r6_b1_a_stalled_chain_log_append_never_holds_the_close_the_chain_end_retry_or_the_result(self) -> None:
+        # TAIL-1 r6 (sol r5 B1, its literal row): a pending nonce answers BUSY at the final ticket close and the first chain.log append STALLS (8 s here, a share that stops answering). The REAL L and Close-LegTicket are
+        # lifted, with ONLY the append made to stall (the one Add-Content statement, wherever L runs it). The close, the chain-end retry (lifted by its condition, the claim freed by then) and the CHAIN_RESULT
+        # line must each return at once, the kept nonce must be let go at the chain end, and the bounded flush must give up on the stalled writer inside its bound.
+        r = self.ps(f"""
+$ast = [Management.Automation.Language.Parser]::ParseFile('{RUNNER}', [ref]$null, [ref]$null)
+$anchor = 'try {{ Add-Content -LiteralPath $ChainLog -Value $line -ErrorAction Stop }}'
+foreach ($name in 'L', 'Close-LegTicket') {{
+    $text = $ast.Find({{ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $name }}, $true).Extent.Text
+    if ($name -ceq 'L') {{
+        if (([regex]::Matches($text, [regex]::Escape($anchor))).Count -ne 1) {{ throw 'stall anchor moved: L has no single chain.log append' }}
+        $text = $text.Replace($anchor, '[Threading.Thread]::Sleep(8000); ' + $anchor)
+    }}
+    Invoke-Expression $text
+}}
+$tail = $ast.Find({{ param($n) $n -is [Management.Automation.Language.IfStatementAst] -and $n.Clauses[0].Item1.Extent.Text -ceq '$null -ne $script:strandedClaimNonces' }}, $true)
+$Venue = 'bachelor'; $ClaimDir = $d; $TicketKeepMax = 2
+$ChainLog = Join-Path (Split-Path -Parent $d) 'chain-stall.log'
+$cp = Join-Path $d 'bachelor.claim.json'
+$g = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$script:ticket = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$script:ticket | Add-Member -NotePropertyName pendingReleaseNonce -NotePropertyValue ([string]$g.claim.nonce) -Force
+$script:ticketKeeps = 0
+$hold = [IO.File]::Open($cp, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$null = @(Close-LegTicket 'leg-1' 'TICKET_ENDED' 'test' 2>$null)
+$o = [ordered]@{{ closeSec = [Math]::Round($sw.Elapsed.TotalSeconds, 2); ticketSet = ($null -ne $script:ticket); strandedAfterClose = @($script:strandedClaimNonces).Count }}
+$hold.Dispose()
+$sw.Restart(); $null = Invoke-Expression $tail.Extent.Text 2>$null
+$o['tailSec'] = [Math]::Round($sw.Elapsed.TotalSeconds, 2); $o['strandedAfterTail'] = @($script:strandedClaimNonces).Count; $o['claimLeft'] = (Test-Path -LiteralPath $cp)
+$sw.Restart(); $resultOut = @(L 'CHAIN_RESULT={{}}' -Raw 2>$null)
+$o['resultSec'] = [Math]::Round($sw.Elapsed.TotalSeconds, 2); $o['resultOnStdout'] = (@($resultOut) -ccontains 'CHAIN_RESULT={{}}')
+if ((Get-Command L).Parameters.ContainsKey('Flush')) {{ $sw.Restart(); $o['flushed'] = [bool](L -Flush -FlushSec 1 2>$null); $o['flushSec'] = [Math]::Round($sw.Elapsed.TotalSeconds, 2) }} else {{ $o['flushed'] = 'no -Flush'; $o['flushSec'] = $null }}
+$o | ConvertTo-Json -Compress
+""")
+        self.assertLess(r["closeSec"], 4.0, f"a stalled chain.log append held the ticket close (sol r5 B1): {r}")
+        self.assertEqual((r["ticketSet"], r["strandedAfterClose"]), (False, 1), r)
+        self.assertLess(r["tailSec"], 4.0, f"a stalled chain.log append held the chain-end nonce retry: {r}")
+        self.assertEqual((r["strandedAfterTail"], r["claimLeft"]), (0, False), f"the chain end did not let go of the kept nonce: {r}")
+        self.assertLess(r["resultSec"], 1.0, f"the CHAIN_RESULT line waited on a stalled append: {r}")
+        self.assertTrue(r["resultOnStdout"], r)
+        self.assertIs(r["flushed"], False, f"the flush must report the stalled writer as not finished: {r}")
+        self.assertLess(r["flushSec"], 2.5, f"the flush did not give up on the stalled writer inside its bound: {r}")
+
+    def test_tail1_r6_b2_a_queued_give_back_naming_the_batchs_own_claim_is_let_go_before_the_deadline_stop(self) -> None:
+        # TAIL-1 r6 (sol r5 B2 = adversary pass 2 A2, its literal row): the batch's own request is granted, A13's give-back answers BUSY five times (a reader holds the claim; here the seam answers BUSY), so the
+        # answer is QUEUED with the batch's nonce N on its ticket, and the deadline then comes before the next poll (-ClaimPollSec 60). Only that next poll let go of N, so the batch ended DEADLINE with N
+        # standing behind it. Expected: N is let go, bounded, before the typed stop, and the batch still ends DEADLINE (exit 3) with its receipt.
+        import shutil
+        text = MODULE.read_text(encoding="utf-8")
+        cond = "            if ($headAfter.Count -gt 0 -and $headAfter[0].name -cne $t.name) {\n"
+        rel = "                    try { $back = [string](Release-VenueClaim -Venue $Venue -Nonce $r.claim.nonce -ClaimDir $ClaimDir) } catch { $back = 'BUSY' }\n"
+        for a in (cond, rel):
+            self.assertEqual(text.count(a), 1, f"give-back seam anchor moved: {a!r}")
+        text = text.replace(cond, "            if ($env:SEAM_GIVE_BACK_BUSY -or ($headAfter.Count -gt 0 -and $headAfter[0].name -cne $t.name)) {\n")
+        text = text.replace(rel, "                    if ($env:SEAM_GIVE_BACK_BUSY) { $back = 'BUSY' } else { try { $back = [string](Release-VenueClaim -Venue $Venue -Nonce $r.claim.nonce -ClaimDir $ClaimDir) } catch { $back = 'BUSY' } }\n")
+        runner = copy_with_siblings(LEASE_RUNNER, Path(tempfile.mkdtemp(prefix="gbq-", dir=self.case)))
+        (runner.parent / MODULE.name).write_text(text, encoding="utf-8")
+        (runner.parent.parent / "bachelor").mkdir(exist_ok=True)
+        shutil.copy2(DV.parent / "bachelor" / "ultra-magnus-agent.ps1", runner.parent.parent / "bachelor" / "ultra-magnus-agent.ps1")
+        p = self.start_batch("Q", claim_poll=60, runner=runner, deadline_sec=45, SEAM_GIVE_BACK_BUSY="1")
+        p.wait(timeout=150)
+        out = Path(p.out_path).read_text(encoding="utf-8", errors="replace")   # type: ignore[attr-defined]
+        log = self.batch_log(p)
+        self.assertIn("CLAIM_GIVE_BACK_BUSY", log + "\n" + out, f"the batch never got the QUEUED give-back answer (the seam is wrong):\n{log}\n{out}")
+        self.assertEqual(p.returncode, 3, f"the batch must end DEADLINE (exit 3):\n{log}\n{out}")
+        self.assertFalse(self.claim_path.exists(), f"the batch ended DEADLINE with its own claim (the QUEUED answer's nonce) still standing:\n{log}\n{out}")
+        self.assertRegex(log + "\n" + out, r"CLAIM_PENDING_RELEASE batch=\d+ nonce=\S+ result=RELEASED why=deadline", f"the release of the batch's own claim was not said:\n{log}\n{out}")
+        receipt = Path(p.run_dir) / "batch-01.json"   # type: ignore[attr-defined]
+        self.assertTrue(receipt.exists(), f"no batch receipt:\n{log}\n{out}")
+        self.assertEqual(json.loads(receipt.read_text(encoding="utf-8-sig")).get("endReason"), "DEADLINE", receipt.read_text(encoding="utf-8-sig"))
 
     def give_back_scenario(self, name: str, release_seam: str, env: dict) -> dict:
         # the A7 line-up (B takes the claim as head while A is in cooldown, A flips to waiting while B holds it, so B must give the claim back), with ONE seam inside the give-back
