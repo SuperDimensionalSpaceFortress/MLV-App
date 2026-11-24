@@ -366,6 +366,23 @@ class ReceiptValidatorReportsTheDisplayPathTests(unittest.TestCase):
             with self.subTest("normaliser: " + label):
                 self.assertEqual(norm[label], unknown("probe-block-malformed"), norm[label])
 
+    def test_successor1_r1_adversary_a1_a3_the_key_union_is_ordinal_and_a_key_named_keys_shadows_nothing(self) -> None:
+        """SUCCESSOR-1 r1 adversary A1: Select-Object -Unique merged a soft-hyphenated display name into the real one, hiding an extra display entry.
+        A3: a dictionary key named `Keys` shadowed .Keys, so a mixed or padded typed unknown read as exactly {state, reason}."""
+        base = good_block()
+        extra = dict(base["activeDisplays"][0], adapterName="In­tel(R) Iris(R) Xe Graphics")
+        self.assertEqual(block_state(dict(base, activeDisplays=base["activeDisplays"] + [extra]))["state"], "malformed")
+        got = pwsh_json("$out = [ordered]@{}\n"
+                        "$u = [ordered]@{ state = 'unknown'; reason = 'denied'; Keys = @('state', 'reason'); extra = 1 }\n"
+                        "$out.wholeUnknown = (Test-DvDisplayPathBlock -Block $u).state\n"
+                        "$b = $env:DVE_BLOCK | ConvertFrom-Json -AsHashtable; $b['powerPlan'] = $u; $out.leafUnknown = (Test-DvDisplayPathBlock -Block $b).state\n"
+                        "$b = $env:DVE_BLOCK | ConvertFrom-Json -AsHashtable; $b['state'] = 'unknown'; $b['Keys'] = @(); $out.block = (Test-DvDisplayPathBlock -Block $b).state\n"
+                        "$b = $env:DVE_BLOCK | ConvertFrom-Json -AsHashtable; $b['os']['state'] = 'unknown'; $b['os']['Keys'] = @(); $out.os = (Test-DvDisplayPathBlock -Block $b).state\n"
+                        "$b = $env:DVE_BLOCK | ConvertFrom-Json -AsHashtable; $b['adapters'][0]['state'] = 'unknown'; $b['adapters'][0]['Keys'] = @(); $out.entry = (Test-DvDisplayPathBlock -Block $b).state\n"
+                        "$b = $env:DVE_BLOCK | ConvertFrom-Json -AsHashtable; $out.control = (Test-DvDisplayPathBlock -Block $b).state\n"
+                        "$out | ConvertTo-Json -Compress", {"DVE_BLOCK": json.dumps(base)})
+        self.assertEqual(got, {"wholeUnknown": "malformed", "leafUnknown": "malformed", "block": "malformed", "os": "malformed", "entry": "malformed", "control": "present"}, got)
+
     def test_successor1_w4_an_explicit_null_venue_is_malformed_not_absent(self) -> None:
         """SUCCESSOR-1 W4 (r3 adversary A6): Get-DvProp gives $null both for a missing member and for an explicit null, so `"venue": null` read as absent. A venue
         that is THERE must be an object; a receipt with no venue member, or a venue whose displayPath is null or missing, stays absent."""
@@ -478,7 +495,9 @@ Import-Module '__MODULE__' -Force
 $jobText = New-DvHealthProbeJobText -AgentRoot 'C:\mlvtmp\mlv-agent'
 $endLine = @($jobText -split "`r?`n" | Where-Object { $_.StartsWith('if ($script:DvDisplayPathAbandoned)') })[0]
 $sw = [Diagnostics.Stopwatch]::StartNew()
-$block = Get-DvDisplayPathBounded -BudgetSec ([int]$env:DVE_BUDGET) -WorkerPrelude ([IO.File]::ReadAllText($env:DVE_PRELUDE_FILE))
+. $env:DVE_PRELUDE_FILE
+$stand = [ordered]@{ 'Get-CimInstance' = ${function:Get-CimInstance}.ToString(); 'Get-ItemProperty' = ${function:Get-ItemProperty}.ToString() }
+$block = Get-DvDisplayPathBounded -BudgetSec ([int]$env:DVE_BUDGET) -WorkerFunctions $stand
 $ms = $sw.ElapsedMilliseconds
 $rt = ($block | ConvertTo-Json -Depth 8 -Compress) | ConvertFrom-Json
 $v = Test-DvDisplayPathBlock -Block $rt

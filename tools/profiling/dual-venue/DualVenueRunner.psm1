@@ -6507,13 +6507,17 @@ function Get-DvDisplayPathBounded {
     # SUCCESSOR-1 W1 (r3 adversary A1): -OperationTimeoutSec does not bound every CIM wait and nothing bounds Get-ItemProperty, so one hung provider call held the
     # probe past its budget and the job past the agent's 120 s. The reader runs in a worker runspace and is waited on for the budget and no longer. A read still in
     # flight then is abandoned: the block is its typed unknown and $script:DvDisplayPathAbandoned tells the job to end its own process once it has printed its line
-    # (the abandoned pipeline would otherwise keep the process alive). -WorkerPrelude is the tests' door (text the worker runs first); the job passes none.
-    param([int]$BudgetSec = 15, [string]$WorkerPrelude = '')
+    # (the abandoned pipeline would otherwise keep the process alive). -WorkerFunctions is the tests' door (name -> body of a function the worker also defines: their
+    # stand-in reads); the job passes none. r1 adversary A4: the worker gets its functions as session-state entries and runs one named command, never a built script text.
+    param([int]$BudgetSec = 15, [System.Collections.IDictionary]$WorkerFunctions = $null)
     $BudgetSec = [math]::Max(0, [math]::Min(15, $BudgetSec))
     if ($BudgetSec -lt 1) { return (Get-DvDisplayPath -BudgetSec 0) }   # a spent budget asks nothing, so there is nothing to wait on
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    $ps = [powershell]::Create()
-    $null = $ps.AddScript($WorkerPrelude + "`r`nfunction Get-DvDisplayPath {`r`n" + ${function:Get-DvDisplayPath}.ToString() + "`r`n}`r`nGet-DvDisplayPath -BudgetSec " + $BudgetSec)
+    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('Get-DvDisplayPath', ${function:Get-DvDisplayPath}.ToString()))
+    if ($null -ne $WorkerFunctions) { foreach ($e in $WorkerFunctions.GetEnumerator()) { $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new([string]$e.Key, [string]$e.Value)) } }
+    $ps = [powershell]::Create($iss)
+    $null = $ps.AddCommand('Get-DvDisplayPath').AddParameter('BudgetSec', $BudgetSec)
     $handle = $ps.BeginInvoke()
     $waitMs = [int][math]::Floor([math]::Max(0.0, $BudgetSec * 1000.0 - $sw.Elapsed.TotalMilliseconds))
     if (-not $handle.AsyncWaitHandle.WaitOne($waitMs)) {
@@ -6558,7 +6562,8 @@ function Test-DvDisplayPathUnknown {
     # r3 (A4): the reason is a text leaf, so a reason that reads back as a [datetime] is still a reason.
     param($Value)
     if (-not (Test-DvDisplayPathIsObject $Value)) { return $false }
-    $names = @($(if ($Value -is [System.Collections.IDictionary]) { @($Value.Keys) } else { @($Value.PSObject.Properties | ForEach-Object { $_.Name }) }) | ForEach-Object { [string]$_ })
+    # SUCCESSOR-1 r1 adversary A3: a dictionary's own key named Keys shadows .Keys, so its keys are read from its enumerator
+    $names = @($(if ($Value -is [System.Collections.IDictionary]) { @($Value.GetEnumerator() | ForEach-Object { $_.Key }) } else { @($Value.PSObject.Properties | ForEach-Object { $_.Name }) }) | ForEach-Object { [string]$_ })
     if ($names.Count -ne 2) { return $false }
     $hasState = $false; $hasReason = $false
     foreach ($n in $names) {
@@ -6575,7 +6580,7 @@ function Test-DvDisplayPathHasUnknownMember {
     # SUCCESSOR-1 W3 (r3 adversary A5): an object of the schema (the block, os, a table entry) has no `state` or `reason` member. One that has either and is not
     # exactly a typed unknown is the contradictory mixed shape (an unknown marker beside ordinary fields), refused in any letter case.
     param($Value)
-    $names = @($(if ($Value -is [System.Collections.IDictionary]) { @($Value.Keys) } else { @($Value.PSObject.Properties | ForEach-Object { $_.Name }) }) | ForEach-Object { [string]$_ })
+    $names = @($(if ($Value -is [System.Collections.IDictionary]) { @($Value.GetEnumerator() | ForEach-Object { $_.Key }) } else { @($Value.PSObject.Properties | ForEach-Object { $_.Name }) }) | ForEach-Object { [string]$_ })
     @($names | Where-Object { [string]::Equals($_, 'state', [System.StringComparison]::OrdinalIgnoreCase) -or [string]::Equals($_, 'reason', [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
 }
 
@@ -6663,7 +6668,11 @@ function Test-DvDisplayPathBlock {
             elseif (Test-DvDisplayPathUnknown $rawName) { $haveUnknown++ }
         }
         if ($wantUnknown -ne $haveUnknown) { $problems.Add("activeDisplays and adapters disagree about the adapters whose name is a typed unknown: $wantUnknown active adapter(s), $haveUnknown display entr(ies)") }
-        foreach ($k in @($want.Keys) + @($have.Keys) | Select-Object -Unique) {
+        # SUCCESSOR-1 r1 adversary A1: Select-Object -Unique compares linguistically (a soft hyphen vanishes), so the union of the keys is an ordinal set
+        $allKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+        foreach ($e in $want.GetEnumerator()) { $null = $allKeys.Add($e.Key) }   # never .Keys: a key named Keys would shadow it (r1 adversary A3)
+        foreach ($e in $have.GetEnumerator()) { $null = $allKeys.Add($e.Key) }
+        foreach ($k in $allKeys) {
             $w = $(if ($want.ContainsKey($k)) { $want[$k] } else { 0 }); $h = $(if ($have.ContainsKey($k)) { $have[$k] } else { 0 })
             if ($w -ne $h) { $problems.Add("activeDisplays and adapters disagree about '$k': $w adapter(s) with an active output, $h display entr(ies)") }
         }
