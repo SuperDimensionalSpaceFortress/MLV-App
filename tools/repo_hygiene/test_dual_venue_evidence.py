@@ -7534,7 +7534,7 @@ exit 0
         dv = self.mutated_runner([("VenueChain.psm1", self.BP_WAITMS_ANCHOR, pause + self.BP_WAITMS_ANCHOR)])
         got = run_pwsh(["-Command", f"Import-Module '{dv / 'VenueChain.psm1'}' -Force -DisableNameChecking; "
                         f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep -Milliseconds 2000; exit 0') -TimeoutSec 1 -CleanupWaitMs 2000; "
-                        "\"H4$($r.timedOut) $($r.lateExit) [$($r.killAttempted)] [$($r.killErrored)] $($r.killConfirmed)\""], env_extra={"DVT_PREWAIT_PAUSE_MS": "6000"}, timeout=120)
+                        "\"H4 $($r.timedOut) $($r.lateExit) [$($r.killAttempted)] [$($r.killErrored)] $($r.killConfirmed)\""], env_extra={"DVT_PREWAIT_PAUSE_MS": "6000"}, timeout=120)
         line = [l for l in got.stdout.splitlines() if l.startswith("H4 ")]
         self.assertEqual(line, ["H4 True True [False] [False] True"], "a child that exited on its own after its bound was not told apart from a killed one (old: no killAttempted)\n" + got.stdout + got.stderr)
         body = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
@@ -7586,7 +7586,8 @@ exit 0
         self.assertEqual(chain.count("catch { [Console]::Error.WriteLine("), 0, "a chain-log fallback writes stderr synchronously (old: :490, :638, :684)")
         self.assertGreaterEqual(chain.count("catch { Write-ChainDiagnostic "), 4)
 
-    W1_LOC_ANCHOR = "    if (-not [VenueLeaseBatchFinalPath]::LocateWithin($full, 0, $ms, [ref]$phys, [ref]$key)) { return $null }\n"
+    # (b2 r2: the location read now ends at one absolute instant (LocateUntil), so the pause sits after the allowance's sample, before the path is made full)
+    W1_LOC_ANCHOR = "    $full = try { [IO.Path]::GetFullPath($Path) } catch { return $null }\n"
     W1_SWEEP_ANCHOR = "        $h = $ps.BeginInvoke()\n"
 
     def test_planned_hash_bind_b2_r1_w1_an_answer_arriving_inside_the_deadline_reserve_is_no_answer(self) -> None:

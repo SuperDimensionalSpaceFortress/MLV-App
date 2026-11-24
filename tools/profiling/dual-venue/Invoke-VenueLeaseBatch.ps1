@@ -500,10 +500,33 @@ public static class VenueLeaseBatchFinalPath {
     // delayMs is the offline -GuardReadDelay seam (0 in production). false = no answer in time, or the read failed (the path cannot be opened now).
     public static bool LocateWithin(string path, int delayMs, int timeoutMs, out string physical, out string key) {
         physical = null; key = null;
-        System.Threading.Tasks.Task<string[]> t = System.Threading.Tasks.Task.Run(() => { if (delayMs > 0) { System.Threading.Thread.Sleep(delayMs); } uint l; string k = Identity(path, out l); return new string[] { Resolve(path), k }; });
+        System.Threading.Tasks.Task<string[]> t = StartLocate(path, delayMs, long.MaxValue);
         try { if (!t.Wait(timeoutMs)) { return false; } } catch (AggregateException) { return false; }
         physical = t.Result[0]; key = t.Result[1];
         return true;
+    }
+    // DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r2 (adversary pass 3 A3 on 372d1bfd): the same read ended at ONE absolute instant (UTC ticks) instead of a relative allowance the
+    // caller sampled earlier: it starts nothing at or past it, the task itself opens nothing once it passed (a queued task that runs late), and the wait is sliced (250 ms) against it.
+    static System.Threading.Tasks.Task<string[]> StartLocate(string path, int delayMs, long endUtcTicks) {
+        return System.Threading.Tasks.Task.Run(() => { if (DateTime.UtcNow.Ticks >= endUtcTicks) { throw new TimeoutException("the end passed before the read started"); } if (delayMs > 0) { System.Threading.Thread.Sleep(delayMs); } uint l; string k = Identity(path, out l); return new string[] { Resolve(path), k }; });
+    }
+    public static bool LocateUntil(string path, int delayMs, long endUtcTicks, out string physical, out string key) {
+        physical = null; key = null;
+        if (DateTime.UtcNow.Ticks >= endUtcTicks) { return false; }
+        System.Threading.Tasks.Task<string[]> t = StartLocate(path, delayMs, endUtcTicks);
+        if (!WaitUntil(t, endUtcTicks)) { return false; }
+        physical = t.Result[0]; key = t.Result[1];
+        return true;
+    }
+    // true only when t completed without a fault before endUtcTicks; each slice re-reads the clock, so a caller paused before a slice waits at most one slice past the end
+    public static bool WaitUntil(System.Threading.Tasks.Task t, long endUtcTicks) {
+        try {
+            while (true) {
+                long left = (endUtcTicks - DateTime.UtcNow.Ticks) / TimeSpan.TicksPerMillisecond;
+                if (left <= 0) { return false; }
+                if (t.Wait((int)Math.Min(250L, left))) { return true; }
+            }
+        } catch (AggregateException) { return false; }
     }
     // r6 (sol r5 B1 = key3 r5 B1): TEMP's final path, then the identity of each folder in ancestors that exists ("" for one that does not), read on a pool thread the caller waits for
     // with Finish and gives up on at its bound, so a TEMP that reaches a -RunDir that stopped answering (a junction into it, a second name for it) cannot hold the caller.
@@ -713,8 +736,19 @@ function Get-InputUnresolvedCodeWithin([string]$Path, [switch]$SkipRead) {
         $null = $ps.AddCommand('Get-InputUnresolvedCode').AddParameter('Path', [string]$Path).AddParameter('SkipRead', [bool]$SkipRead)
         $ms = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min(3600.0, (Get-SpecReadBoundSec))) * 1000.0)
         if ($ms -le 0) { return 'INPUT_UNREADABLE' }
+        # b2 r2 (adversary pass 3 A3 on 372d1bfd): ONE absolute end (the allowance, under the room before -DeadlineUtc less the reserve read again now); nothing starts at or past it
+        # and the wait is sliced (250 ms) against it, so a pause after the sample above never waits the stale allowance
+        $endUtc = [DateTime]::UtcNow.AddMilliseconds([double]$ms)
+        $dlU = Get-Variable -Name deadline -ValueOnly -ErrorAction Ignore
+        if ($dlU -is [datetime]) { $dlEnd = [DateTime]::UtcNow.AddSeconds(($dlU - [DateTime]::UtcNow).TotalSeconds - 2.0); if ($dlEnd -lt $endUtc) { $endUtc = $dlEnd } }
+        if ([DateTime]::UtcNow -ge $endUtc) { return 'INPUT_UNREADABLE' }
         $h = $ps.BeginInvoke()
-        if (-not $h.AsyncWaitHandle.WaitOne($ms)) {
+        while (-not $h.IsCompleted) {
+            $leftMs = ($endUtc - [DateTime]::UtcNow).TotalMilliseconds
+            if ($leftMs -le 0) { break }
+            [void]$h.AsyncWaitHandle.WaitOne([int][Math]::Ceiling([Math]::Min(250.0, [double]$leftMs)))
+        }
+        if (-not $h.IsCompleted) {
             $abandoned = $true
             try { & (Get-Module VenueChain) { $script:VenueAbandonedReads++ } } catch { $null = $_ }
             try { $null = $ps.BeginStop($null, $null) } catch { $null = $_ }
@@ -847,6 +881,7 @@ function Invoke-ClaimRetryRequest {
             why = "no claim request was made: $([Math]::Round([Math]::Max(0.0, $room), 2)) s were left before -DeadlineUtc, under the $($script:ClaimRetryRequestMinSec) s a retry's request starts with" }
     }
     $timeoutSec = [Math]::Min([double]($room - $script:ClaimRetryRequestReserveSec), [double]$script:ClaimRetryRequestMaxSec)
+    $reqEndUtc = [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, [double]$timeoutSec))   # b2 r2 (A3 class): the wait's one end
     $boundWhat = $(if ($timeoutSec -lt $room - $script:ClaimRetryRequestReserveSec) { "the most a retry's request is waited for" } else { "the time left before -DeadlineUtc less $($script:ClaimRetryRequestReserveSec) s" })
     $state = [hashtable]::Synchronized(@{ lock = [object]::new(); decided = $false; abandoned = $false; late = $false; result = $null; error = $null; release = $null })
     $ps = $null; $started = $false; $ended = $false; $decided = $false
@@ -855,7 +890,9 @@ function Invoke-ClaimRetryRequest {
         [void]$ps.AddScript($script:ClaimRetryRequestWorker.ToString())
         [void]$ps.AddArgument(@{ chainModule = (Join-Path $here 'VenueChain.psm1'); request = $RequestArgs; lateAfterUtc = $DeadlineUtc; state = $state })
         $async = $ps.BeginInvoke(); $started = $true
-        $ended = $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($timeoutSec))
+        # b2 r2 (adversary pass 3 A3 class): sliced against ONE end fixed when $timeoutSec was sampled, so a pause before the wait never waits the stale bound past it
+        while (-not $async.IsCompleted) { $reqLeft = $reqEndUtc - [DateTime]::UtcNow; if ($reqLeft.TotalSeconds -le 0) { break }; [void]$async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds([Math]::Min(0.25, [double]$reqLeft.TotalSeconds))) }
+        $ended = $async.IsCompleted
     } finally {
         if ($started) {
             [Threading.Monitor]::Enter($state.lock)
@@ -945,6 +982,7 @@ function Invoke-ClaimRetryRelease([DateTime]$DeadlineUtc, [string]$Nonce) {
     $answered = $false; $why = 'ended before it answered'
     try {
         $sec = [Math]::Min([double](($DeadlineUtc - [DateTime]::UtcNow).TotalSeconds - $script:ClaimRetryRefusalTailSec), [double]$script:ClaimRetryRequestReserveSec)
+        $relEndUtc = [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, [double]$sec))   # b2 r2 (A3 class): the wait's one end
         if ($sec -le 0) { & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }; $why = 'had no time left before -DeadlineUtc'; return "NO_ROOM (no time was left before -DeadlineUtc to release it; the claim still names this process, so it is broken as dead-pid once the process exits)" }
         $ps = $null; $abandoned = $false
         try {
@@ -952,7 +990,9 @@ function Invoke-ClaimRetryRelease([DateTime]$DeadlineUtc, [string]$Nonce) {
             [void]$ps.AddScript($script:ClaimRetryReleaseWorker.ToString())
             [void]$ps.AddArgument(@{ chainModule = (Join-Path $here 'VenueChain.psm1'); venue = $Venue; nonce = $Nonce; claimDir = $ClaimDir })
             $async = $ps.BeginInvoke()
-            if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($sec))) {
+            # b2 r2 (adversary pass 3 A3 class): sliced against ONE end fixed at the sample above, so a pause before the wait never waits the stale $sec past it
+            while (-not $async.IsCompleted) { $relLeft = $relEndUtc - [DateTime]::UtcNow; if ($relLeft.TotalSeconds -le 0) { break }; [void]$async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds([Math]::Min(0.25, [double]$relLeft.TotalSeconds))) }
+            if (-not $async.IsCompleted) {
                 # a worker still running is a live thread the host would wait for at exit: counted, asked to stop, never joined or disposed (Dispose() would wait for it)
                 $abandoned = $true
                 & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }
@@ -1057,6 +1097,9 @@ function Invoke-InputGuard {
     # far past such a room); the content check then refuses with $gb.code before any content read. A location check still running then fails closed, typed $gb.code.
     $noRoom = $left -lt $script:GuardReadMinSec
     $bound = $(if ($noRoom) { 2 } else { $left + 0.5 })
+    # b2 r2 (adversary pass 3 A3 sibling :1071 on 372d1bfd): the wait ends at ONE point on the guard budget's own clock, fixed here with the sample above, and is sliced against it
+    # below, so a pause between this sample and the wait never waits the stale bound past the budget
+    $guardEndSec = $gb.clock.Elapsed.TotalSeconds + [double]$bound
     $prog = [hashtable]::Synchronized(@{ locationsDone = $false; item = 0; at = 'the start of the guard'; steps = [Collections.ArrayList]::Synchronized([Collections.ArrayList]::new()) })
     $vars = @{ guardedInputs = $script:guardedInputs; guardBudget = $gb; guardProgress = $prog; GuardReadMinSec = $script:GuardReadMinSec; guardDelaySeam = $script:guardDelaySeam; legPlanMode = $legPlanMode; AgentShare = $AgentShare
         stagedBuildProbe = $stagedBuildProbe; artifactProbe = $artifactProbe; RunDir = $RunDir; Venue = $Venue; ClaimDir = $ClaimDir; here = $here; ClaimDirPath = $script:ClaimDirPath
@@ -1069,7 +1112,12 @@ function Invoke-InputGuard {
         [void]$ps.AddScript($script:GuardWorker.ToString())
         [void]$ps.AddArgument(@{ chainModule = (Join-Path $here 'VenueChain.psm1'); runnerModule = $(if ($legPlanMode) { Join-Path $here 'DualVenueRunner.psm1' } else { '' }); vars = $vars })
         $async = $ps.BeginInvoke()
-        if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($bound))) {
+        while (-not $async.IsCompleted) {
+            $guardLeft = $guardEndSec - $gb.clock.Elapsed.TotalSeconds
+            if ($guardLeft -le 0) { break }
+            [void]$async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds([Math]::Min(0.25, [double]$guardLeft)))
+        }
+        if (-not $async.IsCompleted) {
             $abandoned = $true
             & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }
             try { [void]$ps.BeginStop($null, $null) } catch { }
@@ -1513,11 +1561,22 @@ public static class VenueLeaseBatchBoundedReadR4 {
             using (System.IO.MemoryStream ms = new System.IO.MemoryStream()) { fs.CopyTo(ms); return new object[] { ms.ToArray(), key }; }
         }
     }
-    public static int ReadWithin(string path, int delayMs, int timeoutMs, out byte[] bytes, out string key, out string error) {
+    // DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r2 (adversary pass 3 A3 on 372d1bfd): the read ends at ONE absolute instant (UTC ticks), never a relative allowance the caller sampled
+    // before a pause: nothing starts at or past it, the task opens nothing once it passed, and the wait is sliced (250 ms) against it. 0 OK, 1 FAILED (the read threw), 2 TIMEOUT.
+    public static int ReadUntil(string path, int delayMs, long endUtcTicks, out byte[] bytes, out string key, out string error) {
         bytes = null; key = null; error = null;
-        if (timeoutMs <= 0) { return 2; }
-        System.Threading.Tasks.Task<object[]> t = System.Threading.Tasks.Task.Run(() => { if (delayMs > 0) { System.Threading.Thread.Sleep(delayMs); } return ReadWithKey(path); });
-        try { if (!t.Wait(timeoutMs)) { return 2; } } catch (AggregateException e) { error = e.InnerException != null ? e.InnerException.Message : e.Message; return 1; }
+        if (DateTime.UtcNow.Ticks >= endUtcTicks) { return 2; }
+        System.Threading.Tasks.Task<object[]> t = System.Threading.Tasks.Task.Run(() => { if (DateTime.UtcNow.Ticks >= endUtcTicks) { throw new TimeoutException("the end passed before the read started"); } if (delayMs > 0) { System.Threading.Thread.Sleep(delayMs); } return ReadWithKey(path); });
+        try {
+            while (true) {
+                long left = (endUtcTicks - DateTime.UtcNow.Ticks) / TimeSpan.TicksPerMillisecond;
+                if (left <= 0) { return 2; }
+                if (t.Wait((int)Math.Min(250L, left))) { break; }
+            }
+        } catch (AggregateException e) {
+            if (e.InnerException is TimeoutException) { return 2; }
+            error = e.InnerException != null ? e.InnerException.Message : e.Message; return 1;
+        }
         bytes = (byte[])t.Result[0]; key = (string)t.Result[1];
         return 0;
     }
@@ -1536,7 +1595,12 @@ public static class VenueLeaseBatchBoundedReadR4 {
     # last step before the read starts, so a caller descheduled after sampling never waits on its old allowance
     $dlR = Get-Variable -Name deadline -ValueOnly -ErrorAction Ignore
     if ($dlR -is [datetime]) { $ms = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min([double]$ms, (($dlR - [DateTime]::UtcNow).TotalSeconds - 2.0) * 1000.0))) }
-    $rc = [VenueLeaseBatchBoundedReadR4]::ReadWithin($full, $DelayMs, $ms, [ref]$b, [ref]$k, [ref]$e)
+    # b2 r2 (adversary pass 3 A3 on 372d1bfd): the allowance above is turned into ONE absolute end here (the room before -DeadlineUtc less the reserve is read again, now), and
+    # the read and its wait end at it (ReadUntil), so a pause after any sample costs no wait past the deadline's reserve. A type an older copy of this script loaded in this
+    # process (no ReadUntil) is no answer: TIMEOUT, never an unbounded read.
+    $endUtc = [DateTime]::UtcNow.AddMilliseconds([double]$ms)
+    if ($dlR -is [datetime]) { $dlEnd = [DateTime]::UtcNow.AddSeconds(($dlR - [DateTime]::UtcNow).TotalSeconds - 2.0); if ($dlEnd -lt $endUtc) { $endUtc = $dlEnd } }
+    $rc = try { [VenueLeaseBatchBoundedReadR4]::ReadUntil($full, $DelayMs, $endUtc.Ticks, [ref]$b, [ref]$k, [ref]$e) } catch { $b = $null; $k = ''; $e = $null; 2 }
     $dlA = Get-Variable -Name deadline -ValueOnly -ErrorAction Ignore
     if ($rc -ne 2 -and $dlA -is [datetime] -and ($dlA - [DateTime]::UtcNow).TotalSeconds -lt 2.0) { $rc = 2; $b = $null; $k = ''; $e = $null }   # b2 r1 (pass 8 A5): an answer inside the deadline's reserve is no answer
     [pscustomobject]@{ state = @('OK', 'FAILED', 'TIMEOUT')[$rc]; bytes = $b; key = [string]$k; error = $e }
@@ -1551,7 +1615,13 @@ function Get-InputLocationWithin([string]$Path) {
     if ($ms -le 0) { return $null }
     $phys = $null; $key = $null
     $full = try { [IO.Path]::GetFullPath($Path) } catch { return $null }
-    if (-not [VenueLeaseBatchFinalPath]::LocateWithin($full, 0, $ms, [ref]$phys, [ref]$key)) { return $null }
+    # b2 r2 (adversary pass 3 A3 on 372d1bfd): ONE absolute end (the allowance, under the room before -DeadlineUtc less the reserve read again now); the read and its wait end at
+    # it (LocateUntil), so a pause after the sample above never waits the stale allowance. An older loaded type without LocateUntil is no answer.
+    $endUtc = [DateTime]::UtcNow.AddMilliseconds([double]$ms)
+    $dlL = Get-Variable -Name deadline -ValueOnly -ErrorAction Ignore
+    if ($dlL -is [datetime]) { $dlEnd = [DateTime]::UtcNow.AddSeconds(($dlL - [DateTime]::UtcNow).TotalSeconds - 2.0); if ($dlEnd -lt $endUtc) { $endUtc = $dlEnd } }
+    $located = try { [VenueLeaseBatchFinalPath]::LocateUntil($full, 0, $endUtc.Ticks, [ref]$phys, [ref]$key) } catch { $false }
+    if (-not $located) { return $null }
     $dlA = Get-Variable -Name deadline -ValueOnly -ErrorAction Ignore
     if ($dlA -is [datetime] -and ($dlA - [DateTime]::UtcNow).TotalSeconds -lt 2.0) { return $null }   # b2 r1 (pass 8 A5): an answer inside the deadline's reserve is no answer
     [pscustomobject]@{ phys = $phys; key = $key }
@@ -3097,8 +3167,11 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $legCode = $lp.exit   # b2 r1 (pass 8 A7): the child's own return is read FIRST, before any evidence write
                 # b2 r1 (pass 8 A7; pass 2 A5 on bf5ebeb2): the .out.txt is evidence only and is written on VenueChain's bounded read (a worker given up on after 2 s, counted as every
                 # abandoned read is), so a -RunDir share that stalls the write holds neither the classification nor the cleanup
+                # b2 r2 (adversary pass 3 A6 on 372d1bfd): the worker never writes THROUGH the name the guard asked about (a hard link or a file made there after the guard, during the
+                # worker's setup, was opened and overwritten): it writes a fresh, unguessable name beside it (CreateNew: nothing can already be there) and renames it over the name,
+                # which replaces that directory entry only, never the file another name still reaches
                 if (Test-RunDirWrite $out) {
-                    $owr = try { Invoke-VenueBoundedRead -ScriptText 'param($a) $out = $a.p; $text = $a.t; try { [IO.File]::WriteAllText($out, $text, [Text.UTF8Encoding]::new($false)); "OK" } catch { "FAILED " + $_.Exception.Message }' -Argument @{ p = $out; t = $text } -TimeoutSec 2 } catch { [pscustomobject]@{ answered = $true; value = @(); error = ($_.Exception.Message -replace '\s+', ' ') } }
+                    $owr = try { Invoke-VenueBoundedRead -ScriptText 'param($a) $final = $a.p; $out = $final + ".b2r2-" + [Guid]::NewGuid().ToString("N") + ".tmp"; $text = $a.t; try { $fs = [IO.File]::Open($out, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None); $fs.Dispose(); [IO.File]::WriteAllText($out, $text, [Text.UTF8Encoding]::new($false)); [IO.File]::Move($out, $final, $true); "OK" } catch { $m = $_.Exception.Message; try { [IO.File]::Delete($out) } catch { $null = $_ }; "FAILED " + $m }' -Argument @{ p = $out; t = $text } -TimeoutSec 2 } catch { [pscustomobject]@{ answered = $true; value = @(); error = ($_.Exception.Message -replace '\s+', ' ') } }
                     $owv = @($owr.value | ForEach-Object { [string]$_ })
                     $wfLine = $(if (-not $owr.answered) { "LEG_OUT_WRITE_TIMEOUT leg=$($leg.name) path=$out (no answer in 2 s; evidence only: the leg is classified from its own captured output)" }
                         elseif ($owv -notcontains 'OK') { "LEG_OUT_WRITE_FAILED leg=$($leg.name) path=$out reason=$((($owv -join ' ') + ' ' + [string]$owr.error).Trim() -replace '^FAILED ', '' -replace '\s+', ' ') (evidence only: the leg is classified from its own captured output)" } else { '' })
