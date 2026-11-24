@@ -2367,6 +2367,154 @@ TEST(PlaybackInfoLabel, InfoTwoR8LabelStallTheCpuViewportHonoursTheSameRepaintDe
     ASSERT_TRUE(handover.indexOf(QStringLiteral("viewport()->update();"), owedAt) > owedAt);
 }
 
+// INFO-2 r9 (sol r8 A3 on 2b195b9e, blocker): a second store must not move an unpaid label-paint debt EARLIER. Sol's row: fullscreen
+// at a 24 fps target, EMA 450 ms, the meter's withdrawal at draw age 512 ms (its debt's floor 450, deadline 675 ms), an accepted async
+// look landing at 520 ms, equal serials, no hand-over by 600 ms. The landing's push (pushLookLabelOverlay) cleared the floor and
+// re-armed the clock at 520, so the settle read the zeroed EMA's 42 ms (deadline 63 ms) and paid at 584 ms: a retained-frame paint on
+// the GPU window (setLookLabelIfActive -> update()) and a label-rect paint on the CPU viewport (setLookLabel -> viewport()->update),
+// both from the same shared debt. The rule lives once in the push: a store that JOINS an unpaid debt (no frame presented since its
+// arm) keeps the arm time and never lowers the floor; every arm records the period it reads, so no later EMA zeroing shrinks it.
+TEST(PlaybackInfoLabel, InfoTwoR9A3ControlTheArithmeticAndTheDeclinedStoreOnBothSurfaces)
+{
+    using playback_info_label::labelPaintExpectedFrameMs;
+    using playback_info_label::labelPaintOwedDue;
+    using playback_info_label::labelPaintOwedExpectedMs;
+    // R9a (control): sol's literal numbers on the existing policy. Withdrawal at 512 with floor 450: the debt is due at 512 + 675.
+    const qint64 floorMs = labelPaintExpectedFrameMs(24.0, 450.0);
+    const qint64 afterReset = labelPaintExpectedFrameMs(24.0, 0.0);
+    ASSERT_EQ(450, floorMs);
+    ASSERT_EQ(42, afterReset);
+    ASSERT_FALSE(labelPaintOwedDue(true, false, 584 - 512, labelPaintOwedExpectedMs(floorMs, afterReset)));
+    ASSERT_TRUE(labelPaintOwedDue(true, false, 1187 - 512, labelPaintOwedExpectedMs(floorMs, afterReset)));
+    // R9a (control): the defect's arithmetic. Re-armed at 520 with the floor cleared, the debt was due at 520 + 63 = 583.
+    ASSERT_TRUE(labelPaintOwedDue(true, false, 584 - 520, labelPaintOwedExpectedMs(0, afterReset)));
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay("));
+    // R9d (control, both surfaces): the one push hands the same repaintNow to the GPU window and to the CPU viewport, and the debt
+    // rule runs between them on the push's repaintNow alone (no surface condition).
+    const int gpuSetAt = push.indexOf(QStringLiteral("GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, repaintNow );"));
+    const int invalidateAt = push.indexOf(QStringLiteral("    if( repaintNow ) m_lookLabelPaintOwedClock.invalidate();\n"));
+    const int cpuSetAt = push.indexOf(QStringLiteral(
+        "ui->graphicsView->setLookLabel( gpuWindow ? QString() : m_lookLabelOverlayText, repaintNow );"));
+    ASSERT_TRUE(gpuSetAt >= 0);
+    ASSERT_TRUE(invalidateAt > gpuSetAt);
+    ASSERT_TRUE(cpuSetAt > invalidateAt);
+    // R9e (control, GPU window): a declined store queues no paint (the text waits for the next frame's paint)
+    const QString gpu = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const QString gpuSetter = functionBody(gpu, QStringLiteral("bool GpuDisplayWindow::setLookLabelIfActive(const QString &text, bool repaintNow)"));
+    ASSERT_TRUE(gpuSetter.contains(QStringLiteral("win->m_lookLabelText = text;\n    if ( repaintNow ) win->update();")));
+    // R9e (control, CPU viewport): a declined change stores and queues nothing (cpuLabelPaint None with equal serials)
+    ASSERT_EQ(static_cast<int>(playback_info_label::CpuLabelPaint::None),
+              static_cast<int>(playback_info_label::cpuLabelPaint(false, false, false)));
+}
+
+TEST(PlaybackInfoLabel, InfoTwoR9A3PushAStoreThatJoinsAnUnpaidDebtKeepsItsArmAndFloor)
+{
+    // R9b (RED on 2b195b9e): the shared push. It never clears the floor outside an arm, it asks the one store rule whether this
+    // store joins an unpaid debt (the debt's clock valid, no frame presented since its arm), it takes the floor that rule returns,
+    // and only an arm restarts the clock and the presented count.
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay("));
+    ASSERT_FALSE(push.contains(QStringLiteral("m_lookLabelPaintOwedExpectedFloorMs = 0;")));
+    const int ruleAt = push.indexOf(QStringLiteral(
+        "const playback_info_label::LabelPaintOwedStore store = playback_info_label::labelPaintOwedStore(\n"
+        "            m_lookLabelPaintOwedClock.isValid(), m_playbackPresentedFrameCount != m_lookLabelPaintOwedPresentedCount,\n"
+        "            m_lookLabelPaintOwedExpectedFloorMs,\n"
+        "            playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs ) );"));
+    const int takeAt = push.indexOf(QStringLiteral("m_lookLabelPaintOwedExpectedFloorMs = store.floorMs;"));
+    const int armIfAt = push.indexOf(QStringLiteral("if( store.arm )"));
+    const int startAt = push.indexOf(QStringLiteral("m_lookLabelPaintOwedClock.start();"));
+    const int countAt = push.indexOf(QStringLiteral("m_lookLabelPaintOwedPresentedCount = m_playbackPresentedFrameCount;"));
+    ASSERT_TRUE(ruleAt >= 0);
+    ASSERT_TRUE(takeAt > ruleAt);
+    ASSERT_TRUE(armIfAt > takeAt);
+    ASSERT_TRUE(startAt > armIfAt);
+    ASSERT_TRUE(countAt > startAt);
+    ASSERT_EQ(1, static_cast<int>(push.count(QStringLiteral("m_lookLabelPaintOwedClock.start();"))));
+    ASSERT_EQ(1, static_cast<int>(source.count(QStringLiteral("m_lookLabelPaintOwedClock.start();"))));
+}
+
+TEST(PlaybackInfoLabel, InfoTwoR9A3ResetTheMeterResetOnlyRaisesAnUnpaidDebtsFloor)
+{
+    // R9c (RED on 2b195b9e): the meter reset raises the debt's floor and never lowers it (a reset joining an unpaid debt whose arm
+    // read a larger period keeps it).
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString tick = functionBody(source, QStringLiteral("void MainWindow::timerFrameEvent("));
+    ASSERT_TRUE(tick.contains(QStringLiteral(
+        "if( m_lookLabelPaintOwedClock.isValid() ) m_lookLabelPaintOwedExpectedFloorMs = playback_info_label::labelPaintOwedExpectedMs(\n"
+        "                    m_lookLabelPaintOwedExpectedFloorMs, labelExpectedBeforeResetMs );")));
+    ASSERT_FALSE(source.contains(QStringLiteral("m_lookLabelPaintOwedExpectedFloorMs = labelExpectedBeforeResetMs;")));
+}
+
+// INFO-2 r9 (sol r8 A4 on 2b195b9e, blocker): a Stop must PAY an unpaid label-paint debt, never drop it. Sol's row: CPU fullscreen,
+// ShowFps=false, a Baseline -> Cinematic look change stored while playing (no paint of its own), Stop before the next hand-over, the
+// stopped refresh 900 ms later. The Stop's relabel composes the same text (no rate shown), so updatePlaybackInfoLabel returns before
+// any push; the next settle saw !isChecked and only invalidated the debt, so neither setter was reached and "Look: Baseline" stayed on
+// screen until the stopped frame's refresh. The GPU window's setter shares that settle. The one settle rule: a frame since the store
+// carried the text (clear); stopped, or playing past the deadline, pays both surfaces at once; and the Stop itself runs the settle.
+TEST(PlaybackInfoLabel, InfoTwoR9A4ControlTheSkippedPushAndBothSurfacesPaymentBranches)
+{
+    // R9f (control): the Stop's push, when there is one, repaints at once (stopped), so only a skipped push leaves a debt
+    const bool stoppedRepaintNow = !false || false || false || false;
+    ASSERT_TRUE(stoppedRepaintNow);
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString info = functionBody(source, QStringLiteral("void MainWindow::updatePlaybackInfoLabel("));
+    ASSERT_TRUE(info.contains(QStringLiteral(
+        "if( overlay == m_playbackInfoText && twin == m_playbackInfoStatusText && gpuWindow == m_lookLabelOverlayGpuWindow )")));
+    // R9i (control, GPU window): the payment of an equal text repaints only when the drawn text differs
+    const QString gpu = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const QString gpuSetter = functionBody(gpu, QStringLiteral("bool GpuDisplayWindow::setLookLabelIfActive(const QString &text, bool repaintNow)"));
+    ASSERT_TRUE(gpuSetter.contains(QStringLiteral("if ( repaintNow && win->m_lookLabelDrawnText != text ) win->update();")));
+    // R9i (control, CPU viewport): the payment of an unchanged text proceeds only while a change is owed, and repaints its rects
+    const QString zoom = readRepoFile(QStringLiteral("platform/qt/GraphicsZoomView.cpp"));
+    const QString cpuSetter = functionBody(zoom, QStringLiteral("void GraphicsZoomView::setLookLabel(const QString &text, bool repaintNow)"));
+    ASSERT_TRUE(cpuSetter.contains(QStringLiteral("if( !changed && !( repaintNow && m_lookLabelPaintOwed ) ) return;")));
+    ASSERT_EQ(static_cast<int>(playback_info_label::CpuLabelPaint::LabelRects),
+              static_cast<int>(playback_info_label::cpuLabelPaint(true, false, false)));
+}
+
+TEST(PlaybackInfoLabel, InfoTwoR9A4SettleAStoppedSettlePaysBothSurfacesAndNeverDropsTheDebt)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    // R9g (RED on 2b195b9e): the settle never drops a debt while stopped. One step rule decides Keep / Clear / PayNow from the
+    // Play state, a frame since the store and the deadline; Keep returns with the debt intact, Clear returns after invalidating it,
+    // and PayNow reaches both surfaces' setters with repaintNow.
+    const QString settle = functionBody(source, QStringLiteral("void MainWindow::settleLookLabelPaintIfOwed( void )"));
+    ASSERT_FALSE(settle.contains(QStringLiteral("if( !ui->actionPlay->isChecked() || framePresentedSinceStore )")));
+    const int stepAt = settle.indexOf(QStringLiteral(
+        "const playback_info_label::LabelPaintOwedStep step = playback_info_label::labelPaintOwedStep(\n"
+        "        owed, ui->actionPlay->isChecked(), framePresentedSinceStore, m_lookLabelPaintOwedClock.elapsed(),\n"
+        "        playback_info_label::labelPaintOwedExpectedMs( m_lookLabelPaintOwedExpectedFloorMs,\n"
+        "            playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs ) ) );"));
+    const int keepAt = settle.indexOf(QStringLiteral("if( step == playback_info_label::LabelPaintOwedStep::Keep ) return;"));
+    const int invalidateAt = settle.indexOf(QStringLiteral("m_lookLabelPaintOwedClock.invalidate();"));
+    const int clearAt = settle.indexOf(QStringLiteral("if( step == playback_info_label::LabelPaintOwedStep::Clear ) return;"));
+    // both surfaces: the GPU window (equal text, drawn text differs: update()) and the CPU viewport (owed: its stored rects)
+    const int gpuPayAt = settle.indexOf(QStringLiteral("GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, true );"));
+    const int cpuPayAt = settle.indexOf(QStringLiteral(
+        "ui->graphicsView->setLookLabel( GpuDisplayWindow::isActive() ? QString() : m_lookLabelOverlayText, true );"));
+    ASSERT_TRUE(stepAt >= 0);
+    ASSERT_TRUE(keepAt > stepAt);
+    ASSERT_TRUE(invalidateAt > keepAt);
+    ASSERT_TRUE(clearAt > invalidateAt);
+    ASSERT_TRUE(gpuPayAt > clearAt);
+    ASSERT_TRUE(cpuPayAt > gpuPayAt);
+    ASSERT_EQ(3, static_cast<int>(settle.count(QStringLiteral("return;"))));   // nothing owed, Keep and Clear: the only early exits
+}
+
+TEST(PlaybackInfoLabel, InfoTwoR9A4StopTheStopRunsTheSettleRightAfterItsRelabel)
+{
+    // R9h (RED on 2b195b9e): the Stop runs that settle itself, right after its relabel (whose equal composition may push nothing),
+    // so the payment is queued at the Stop and never waits for a tick, a Look Assist session or the stopped frame's render.
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString toggled = functionBody(source, QStringLiteral("void MainWindow::on_actionPlay_toggled(bool checked)"));
+    const int relabelAt = toggled.indexOf(QStringLiteral("    m_playbackFramesStalled = false;\n    updatePlaybackInfoLabel();\n"));
+    const int stopSettleAt = toggled.indexOf(QStringLiteral("    settleLookLabelPaintIfOwed();"));
+    ASSERT_TRUE(relabelAt >= 0);
+    ASSERT_TRUE(stopSettleAt > relabelAt);
+    ASSERT_TRUE(stopSettleAt < toggled.indexOf(QStringLiteral("cancelPlaybackDueWake();")));
+}
+
 // INFO-2 r2 (adversary pass 2 A2 on 9496cb72, introduced, major): 24 fps, start on paused frame 0, Cut Out 3, Loop off. Frames 1 and
 // 2 hand off at 8 and 117 ms; the frame-2 request consumes the first stamp, then the next advance stops Play. The Play toggle set the
 // meter's seen count to the presentation count at the STOP as well as at the start, dropping the final 109 ms interval. It does so
