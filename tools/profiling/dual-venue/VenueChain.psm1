@@ -2019,7 +2019,7 @@ function Invoke-VenueBoundedProcess {
     must not leave a child behind reads it.
     #>
     param([Parameter(Mandatory)][string]$FilePath, [Parameter(Mandatory)][string[]]$ArgumentList, [Parameter(Mandatory)][ValidateRange(1, 86400)][int]$TimeoutSec,
-          [ValidateRange(100, 60000)][int]$CleanupWaitMs = 15000, [Nullable[datetime]]$DeadlineUtc = $null)
+          [ValidateRange(100, 60000)][int]$CleanupWaitMs = 15000, [Nullable[datetime]]$DeadlineUtc = $null, [ValidateRange(0, 86400)][int]$MinRoomSec = 0)
     # r11 (adversary r11 A5, A6): after the bound, the kill wait and both stream waits share ONE budget ($CleanupWaitMs: they used to add up to 3 x 15 s past a caller's deadline), and a tree kill
     # that threw is never "confirmed" because the root happened to exit: killConfirmed needs no kill error AND the root gone.
     # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A2): -DeadlineUtc, when given, is an ABSOLUTE bound on top of the relative -TimeoutSec. It is asked as the last
@@ -2029,18 +2029,29 @@ function Invoke-VenueBoundedProcess {
     $psi = [Diagnostics.ProcessStartInfo]::new($FilePath)
     foreach ($a in $ArgumentList) { [void]$psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
-    if ($null -ne $dlUtc -and [DateTime]::UtcNow -ge $dlUtc) { return [pscustomobject]@{ exit = $null; timedOut = $true; notStarted = $true; killConfirmed = $true; stdout = ''; stderr = '' } }
+    # r4 fix 2 (adversary pass 6 A1): -MinRoomSec, the caller's own floor of room, is asked HERE, at the last clock read before the start (a caller descheduled after its own
+    # check used to start the child with less room than its floor promised)
+    if ($null -ne $dlUtc -and ($dlUtc - [DateTime]::UtcNow).TotalSeconds -lt [Math]::Max(0.000001, [double]$MinRoomSec)) { return [pscustomobject]@{ exit = $null; timedOut = $true; notStarted = $true; lateStart = $false; lateExit = $false; killConfirmed = $true; stdout = ''; stderr = '' } }
     $p = [Diagnostics.Process]::Start($psi)
     $p.StandardInput.Close()
     $outTask = $p.StandardOutput.ReadToEndAsync(); $errTask = $p.StandardError.ReadToEndAsync()
+    # r4 fix 2 (adversary pass 6 A2): the child's OWN start and exit instants (the OS's) are compared with -DeadlineUtc, not the parent's clock reads around them: a child the
+    # OS started at or past it (a pause between the check above and the start), or one that exited after it (a parent that resumed late and polled an already-exited child),
+    # is a timeout, never a success. A child started late is killed at once.
+    $lateStart = $false; $lateExit = $false
+    if ($null -ne $dlUtc) { try { $lateStart = ($p.StartTime.ToUniversalTime() -ge $dlUtc) } catch { $lateStart = ([DateTime]::UtcNow -ge $dlUtc) } }
     $waitMs = [double]$TimeoutSec * 1000.0
     if ($null -ne $dlUtc) { $waitMs = [Math]::Min($waitMs, [Math]::Max(0.0, ($dlUtc - [DateTime]::UtcNow).TotalMilliseconds)) }
-    $timedOut = -not $p.WaitForExit([int][Math]::Floor($waitMs))
+    $timedOut = $(if ($lateStart) { $true } else { -not $p.WaitForExit([int][Math]::Floor($waitMs)) })
+    if (-not $timedOut -and $null -ne $dlUtc) {
+        try { $lateExit = ($p.ExitTime.ToUniversalTime() -gt $dlUtc) } catch { $lateExit = ([DateTime]::UtcNow -gt $dlUtc) }
+        if ($lateExit) { $timedOut = $true }
+    }
     $killErrored = $false
     $cleanup = [Diagnostics.Stopwatch]::StartNew()
-    if ($timedOut) { try { $p.Kill($true) } catch { $killErrored = $true }; [void]$p.WaitForExit($CleanupWaitMs) }
+    if ($timedOut -and -not $p.HasExited) { try { $p.Kill($true) } catch { $killErrored = $true }; [void]$p.WaitForExit($CleanupWaitMs) }
     [void]$outTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds)); [void]$errTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds))
-    [pscustomobject]@{ exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut; notStarted = $false; killConfirmed = $(if ($timedOut) { (-not $killErrored) -and [bool]$p.HasExited } else { $true })
+    [pscustomobject]@{ exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut; notStarted = $false; lateStart = $lateStart; lateExit = $lateExit; killConfirmed = $(if ($timedOut) { (-not $killErrored) -and [bool]$p.HasExited } else { $true })
         stdout = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' }); stderr = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' }) }
 }
 

@@ -696,6 +696,25 @@ function Get-InputUnresolvedCode([string]$Path, [switch]$SkipRead) {
     'INPUT_UNREADABLE'
 }
 
+function Get-InputUnresolvedCodeWithin([string]$Path, [switch]$SkipRead) {
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 fix 2 (adversary pass 6 A4): Get-InputUnresolvedCode's opens are synchronous, so the pre-claim sweep asks it on a worker runspace
+    # and gives up on it at the room left before -DeadlineUtc (Get-SpecReadBoundSec): no answer in that room is INPUT_UNREADABLE (an input that will not answer), never a wait past
+    # the deadline. The worker is abandoned, not joined, at its bound (a stopped pipeline could itself wait on the stalled open).
+    $ms = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min(3600.0, (Get-SpecReadBoundSec))) * 1000.0)
+    if ($ms -le 0) { return 'INPUT_UNREADABLE' }
+    $defs = foreach ($fn in 'Get-PhysicalPath', 'Get-FileIdentity', 'Test-NothingAtName', 'Get-InputUnresolvedCode') { "function $fn {`n$((Get-Item -LiteralPath "function:$fn").Definition)`n}" }
+    $ps = [powershell]::Create()
+    try {
+        $null = $ps.AddScript(($defs -join "`n") + "`nGet-InputUnresolvedCode ([string]`$args[0]) -SkipRead:([bool]`$args[1])`n").AddArgument($Path).AddArgument([bool]$SkipRead)
+        $h = $ps.BeginInvoke()
+        if (-not $h.AsyncWaitHandle.WaitOne($ms)) { $null = $ps.BeginStop($null, $null); return 'INPUT_UNREADABLE' }
+        $r = @($ps.EndInvoke($h))
+        $code = $(if ($r.Count) { [string]$r[-1] } else { 'INPUT_UNREADABLE' })
+        $ps.Dispose()
+        return $code
+    } catch { return 'INPUT_UNREADABLE' }
+}
+
 function Test-NothingAtName([string]$Path) {
     # r6 (adversary r6 A1): $true only when the file system says nothing is at $Path (file or folder not found). Access denied, a sharing violation or any other error is an entry
     # that is there but will not answer, never "gone" (Get-Item and Test-Path said gone for a lookup that was denied). A link is the entry itself: its target is not followed.
@@ -1479,6 +1498,11 @@ public static class VenueLeaseBatchBoundedReadR4 {
         bytes = (byte[])t.Result[0]; key = (string)t.Result[1];
         return 0;
     }
+    // r4 fix 2 (adversary pass 6 A6 sibling): a diagnostic line on stderr, on a pool thread waited for at most timeoutMs (a full stderr pipe cannot hold the caller)
+    public static bool ErrorLineWithin(string line, int timeoutMs) {
+        System.Threading.Tasks.Task t = System.Threading.Tasks.Task.Run(() => Console.Error.WriteLine(line));
+        try { return t.Wait(timeoutMs); } catch (AggregateException) { return false; }
+    }
 }
 '@
     }
@@ -1606,6 +1630,8 @@ function Get-ExportBudgetRefusal([string]$Path) {
     if ($boundFloor -lt 1) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight was not started, $([Math]::Round([Math]::Max(0.0, $room), 1)) s were left before -DeadlineUtc (less $($script:ExportBudgetPreflightReserveSec) s)" }
     $boundSec = [int]$boundFloor   # (in range: the floor is between 1 and the 120 s cap)
     $bp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-PreflightBudgetOnly', '-ClipId', $clipId, '-Format', $format, '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs -DeadlineUtc (Get-ExportBudgetChildDeadline)
+    # r4 fix 2 (adversary pass 6 A3): a child the absolute bound never let start is said to be never started, not killed
+    if ($bp.notStarted) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight was not started (its room before -DeadlineUtc, less $($script:ExportBudgetPreflightReserveSec) s, had ended by its start); nothing was started, so nothing was killed" }
     if ($bp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight did not answer in $boundSec s and was killed ($(if ($bp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))" }
     $text = (@($bp.stdout, $bp.stderr) | Where-Object { $_ }) -join "`n"
     if ($text -match '(?m)DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED[^\r\n]*') { return 'EXPORT_TIME_BUDGET_EXCEEDED', "'$Path' cannot be run: $($Matches[0] -replace '\s+', ' ')" }
@@ -1619,6 +1645,7 @@ function Get-ExportBudgetRefusal([string]$Path) {
     if ($boundFloor -lt 1) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor was not started, $([Math]::Round([Math]::Max(0.0, $room), 1)) s were left before -DeadlineUtc (less $($script:ExportBudgetPreflightReserveSec) s)" }
     $boundSec = [int]$boundFloor
     $fp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-DescribeTimeBudgetBytes', '0', '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs -DeadlineUtc (Get-ExportBudgetChildDeadline)
+    if ($fp.notStarted) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor was not started (its room before -DeadlineUtc had ended by its start); nothing was started, so nothing was killed" }   # r4 fix 2 (A3 sibling)
     if ($fp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor did not answer in $boundSec s and was killed ($(if ($fp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))" }
     $floorText = (@($fp.stdout, $fp.stderr) | Where-Object { $_ }) -join "`n"
     if ($floorText -match '(?m)DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED[^\r\n]*') { return 'EXPORT_TIME_BUDGET_EXCEEDED', "'$Path' cannot be run: the clip did not resolve here, and the clip-independent floor alone (a 0-byte clip) is refused: $($Matches[0] -replace '\s+', ' ')" }
@@ -1743,7 +1770,7 @@ if ($legPlanMode) {
     }
 } elseif ($LegSet) {
     Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force
-    $sp = try { Get-DvLegSetPlan -LegSetPath (Join-Path $here "legsets\$LegSet.json") -Repeats $Repeats -Backend $(if ($Backend) { $Backend } else { '' }) } catch { Stop-Usage $_.Exception.Message }
+    $sp = try { Get-DvLegSetPlan -LegSetPath (Join-Path $here "legsets\$LegSet.json") -Repeats $Repeats -Backend $(if ($Backend) { $Backend } else { '' }) -WithFileKey } catch { Stop-Usage $_.Exception.Message }
     foreach ($e in $sp.plan) {
         $shapeRefusal = Get-ScalarLegShapeRefusal ([string]$e.specPath)   # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r8 (adversary r8 A3): before the lease, as -LegPlan does
         if ($shapeRefusal -clike 'SPEC_READ_TIMEOUT *') { Stop-Usage $shapeRefusal }   # r19 (sol r18 B2 sibling): the read's own typed code
@@ -1756,7 +1783,12 @@ if ($legPlanMode) {
         if ([string]$script:SpecBudgetSha256[[string]$e.specPath] -cne [string]$e.specSha256) {
             Stop-Usage "SPEC_CHANGED_AFTER_PREFLIGHT '$($e.specPath)' cannot be run: the leg spec read as sha256 $([string]$script:SpecBudgetSha256[[string]$e.specPath]) after the leg-set planner judged sha256 $($e.specSha256) (planned_sha256=$($e.specSha256)); no claim or lease is taken on bytes the planner did not judge"
         }
-        $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend; specSha256 = [string]$e.specSha256; fileKey = [string]$script:SpecBudgetFileKey[[string]$e.specPath] })   # r4 (pass 5 A1, A3): off the judged read's own handle
+        # r4 fix 2 (adversary pass 6 A5): and the file they came from must be the one the planner judged (its own read's handle, -WithFileKey): one file judged by the planner as
+        # two specs, then replaced by two files holding those bytes, would otherwise pass both digest checks and land in two groups
+        if ([string]$script:SpecBudgetFileKey[[string]$e.specPath] -cne [string]$e.specFileKey) {
+            Stop-Usage "SPEC_CHANGED_AFTER_PREFLIGHT '$($e.specPath)' cannot be run: the leg-set planner judged its bytes from file $($e.specFileKey) but the preflight's budget read came from file $([string]$script:SpecBudgetFileKey[[string]$e.specPath]) (planned_sha256=$($e.specSha256)); no claim or lease is taken on a file the planner did not judge"
+        }
+        $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend; specSha256 = [string]$e.specSha256; fileKey = [string]$e.specFileKey })   # r4 (pass 5 A1, A3; pass 6 A5): the planner's judged file, equal to the budget read's
     }
 } else {
     Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force
@@ -1823,7 +1855,8 @@ foreach ($g in $script:guardedInputs) {
     $g | Add-Member -NotePropertyName accepted -NotePropertyValue $acc
     if ($null -eq $acc) {
         # (an input that did not answer in the room left is INPUT_UNREADABLE at once: Get-InputUnresolvedCode's own opens are synchronous and would hold the preflight on it again)
-        $code = $(if ($askTimedOut) { 'INPUT_UNREADABLE' } else { Get-InputUnresolvedCode $g.path -SkipRead:($g.kind -ceq 'build') }); if (-not $code) { $code = 'INPUT_UNREADABLE' }
+        # r4 fix 2 (adversary pass 6 A4): three FAST faults leave the diagnostic to run, and its opens are synchronous: it is bounded by the same room (Get-InputUnresolvedCodeWithin)
+        $code = $(if ($askTimedOut) { 'INPUT_UNREADABLE' } else { Get-InputUnresolvedCodeWithin $g.path -SkipRead:($g.kind -ceq 'build') }); if (-not $code) { $code = 'INPUT_UNREADABLE' }
         $label = $(if ($g.kind -ceq 'plan') { 'the plan file' } elseif ($g.kind -ceq 'build') { 'the staged build manifest' } else { 'the leg spec' })
         Stop-InputIsOutput ([pscustomobject]@{ kind = 'unresolved'; input = $g.kind; item = $g.item; code = $code; path = $g.path; why = "$label '$($g.path)' could not be identified as it was accepted (no destination could be compared with it)" })
     }
@@ -3025,7 +3058,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $legReturnTs = [Diagnostics.Stopwatch]::GetTimestamp()   # r6 (adversary-848f6559.json A1): the child's return; the idle anchor is placed from the leg job's own result below
                 $text =[string]$lp.stdout + [string]$lp.stderr   # r7: read from the child, never back from the file, whose write the guard may refuse
                 # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A4 sibling :2963): evidence only; a write that throws is said on stderr and never replaces the leg's classification
-                if (Test-RunDirWrite $out) { try { [IO.File]::WriteAllText($out, $text, [Text.UTF8Encoding]::new($false)) } catch { [Console]::Error.WriteLine("LEG_OUT_WRITE_FAILED leg=$($leg.name) path=$out reason=$($_.Exception.Message -replace '\s+', ' ') (evidence only: the leg is classified from its own captured output)") } }
+                if (Test-RunDirWrite $out) { try { [IO.File]::WriteAllText($out, $text, [Text.UTF8Encoding]::new($false)) } catch { $wfLine = "LEG_OUT_WRITE_FAILED leg=$($leg.name) path=$out reason=$($_.Exception.Message -replace '\s+', ' ') (evidence only: the leg is classified from its own captured output)"; try { $null = [VenueLeaseBatchBoundedReadR4]::ErrorLineWithin($wfLine, 2000) } catch { $null = $_ } } }   # r4 fix 2 (pass 6 A6): bounded
                 $legCode = $lp.exit
                 $legSec = [int]([DateTime]::UtcNow - $tLeg).TotalSeconds
                 # a leg killed at the lease's end says nothing about how long a leg takes

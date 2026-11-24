@@ -6813,7 +6813,7 @@ exit 0
 
     # The lease batch, -LegSet: a COPY of the batch whose planner call is followed by the fixture's swap (the race the preflight must survive), and whose plan stage ends
     # the run by printing the hash each leg child would be bound to (the leg's -ExpectSpecSha256: SpecBudgetSha256), so no claim, lease or venue is involved.
-    BATCH_PLAN_ANCHOR = '    $sp = try { Get-DvLegSetPlan -LegSetPath (Join-Path $here "legsets\\$LegSet.json") -Repeats $Repeats -Backend $(if ($Backend) { $Backend } else { \'\' }) } catch { Stop-Usage $_.Exception.Message }\n'
+    BATCH_PLAN_ANCHOR = '    $sp = try { Get-DvLegSetPlan -LegSetPath (Join-Path $here "legsets\\$LegSet.json") -Repeats $Repeats -Backend $(if ($Backend) { $Backend } else { \'\' }) -WithFileKey } catch { Stop-Usage $_.Exception.Message }\n'
     BATCH_SWAP = ("    if ($env:DVT_SWAP_TO) { if ($env:DVT_SWAP_MODE -eq 'touch') { [IO.File]::SetLastWriteTimeUtc($env:DVT_SWAP_TO, [DateTime]::UtcNow.AddMinutes(7)) } "
                   "else { [IO.File]::Copy($env:DVT_SWAP_FROM, $env:DVT_SWAP_TO, $true) } }   # TEST FIXTURE: the bytes change after the planner read them\n")
     BATCH_STOP_ANCHOR = "# r11 (sol r10 blocker 2): every generated output name is checked HERE"
@@ -7286,6 +7286,126 @@ exit 0
         self.assertEqual([l for l in self.fixture_legs() if l["venue"] == "ultra-magnus"], [],
                          "a supplementary child started with a cap under 60 s after the late cut (old)\n" + proc.stdout + proc.stderr)
         self.assertTrue(any("SUPPLEMENTARY_SKIPPED" in l and "reason=DEADLINE_NEAR" in l and "at the launch" in l for l in proc.stdout.splitlines()), proc.stdout)
+
+    # r4 fix 2 (adversary pass 6 on dff66411): A1 the 60 s floor was asked only by the caller, before the helper's own last clock read; A2 a child that exited after -DeadlineUtc,
+    # polled by a parent that resumed late, was returned as a success; A3 a child the bound never started was reported as killed; A4 the sweep's diagnostic after three fast
+    # faults was synchronous; A5 the set planner dropped the identity of the file it judged; A6 a transcript diagnostic on a full stderr pipe blocked the chain.
+    def test_planned_hash_bind_r4_p6_a1_bounded_process_asks_the_callers_room_floor_at_its_own_start(self) -> None:
+        mod = DV / "VenueChain.psm1"
+        got = run_pwsh(["-Command", f"Import-Module '{mod}' -Force -DisableNameChecking; "
+                        f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Write-Output started') -TimeoutSec 60 -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(30)) -MinRoomSec 60; "
+                        "\"P6A1 $($r.notStarted) $($r.timedOut) [$($r.stdout.Trim())]\""], timeout=120)
+        line = [l for l in got.stdout.splitlines() if l.startswith("P6A1 ")]
+        self.assertEqual(line, ["P6A1 True True []"], "30 s of room under a 60 s floor started the child (old: -MinRoomSec unknown, the child ran)\n" + got.stdout + got.stderr)
+
+    def test_planned_hash_bind_r4_p6_a2_a_child_that_exited_after_the_deadline_is_a_timeout_even_when_the_parent_polls_late(self) -> None:
+        late = ("    Start-Sleep -Milliseconds ([int]$env:DVT_PARENT_PAUSE_MS)   # TEST FIXTURE: the parent is descheduled after the start\n"
+                "    $waitMs = [double]$TimeoutSec * 1000.0\n")
+        dv = self.mutated_runner([("VenueChain.psm1", "    $waitMs = [double]$TimeoutSec * 1000.0\n", late)])
+        got = run_pwsh(["-Command", f"Import-Module '{dv / 'VenueChain.psm1'}' -Force -DisableNameChecking; "
+                        f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep -Milliseconds 2500; Write-Output done') -TimeoutSec 60 -CleanupWaitMs 2000 -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(2)); "
+                        "\"P6A2 $($r.timedOut) $($r.exit)\""], env_extra={"DVT_PARENT_PAUSE_MS": "6000"}, timeout=120)
+        line = [l for l in got.stdout.splitlines() if l.startswith("P6A2 ")]
+        self.assertEqual(len(line), 1, got.stdout + got.stderr)
+        self.assertEqual(line[0].split()[1], "True", f"a child that exited after -DeadlineUtc was returned as a success (old: timedOut False, exit 0): {line[0]}")
+
+    def test_planned_hash_bind_r4_p6_a3_an_export_child_never_started_is_not_reported_as_killed(self) -> None:
+        body = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
+        fn = body[body.index("function Get-ExportBudgetRefusal("):body.index("function Get-ScalarLegShapeRefusal(")]
+        for child in ("$bp", "$fp"):
+            with self.subTest(child=child):
+                self.assertIn(f"if ({child}.notStarted) {{", fn, "a child the absolute bound refused to start went to the 'was killed (kill confirmed)' branch (old)")
+                self.assertLess(fn.index(f"if ({child}.notStarted) {{"), fn.index(f"if ({child}.timedOut) {{"), "the never-started branch must come before the timed-out one")
+        self.assertEqual(fn.count("nothing was started, so nothing was killed"), 2, fn)
+
+    BATCH_LOC_ANCHOR = "    if (-not ('VenueLeaseBatchFinalPath' -as [type])) { try { $null = Get-PhysicalPath $here } catch { return $null } }   # (Get-PhysicalPath loads the native type)\n"
+    BATCH_LOC_FAST_FAULT = ("    if ($env:DVT_ID_STALL_ARMED -and [IO.Path]::GetFileName($Path) -ceq 'pace.json') { return $null }   # TEST FIXTURE: each bounded location attempt faults at once\n"
+                            + BATCH_LOC_ANCHOR)
+    BATCH_UNRESOLVED_ANCHOR = "    try {\n        $null = Get-PhysicalPath $Path; $null = Get-FileIdentity $Path\n        if ([IO.Directory]::Exists($Path)) { return 'INPUT_UNREADABLE' }\n"
+    BATCH_UNRESOLVED_STALL = ("    if ($env:DVT_ID_STALL_ARMED -and [IO.Path]::GetFileName($Path) -ceq 'pace.json') { $u = [DateTimeOffset]::Parse($env:DVT_ID_STALL_UNTIL, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime; "
+                              "while ([DateTime]::UtcNow -lt $u) { Start-Sleep -Milliseconds 200 } }   # TEST FIXTURE: the diagnostic's metadata open stalls\n" + BATCH_UNRESOLVED_ANCHOR)
+
+    def test_planned_hash_bind_r4_p6_a4_the_sweeps_diagnostic_after_fast_faults_never_holds_the_preflight_past_the_deadline(self) -> None:
+        from datetime import datetime, timedelta, timezone
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.BATCH_LOC_ANCHOR, self.BATCH_LOC_FAST_FAULT),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_UNRESOLVED_ANCHOR, self.BATCH_UNRESOLVED_STALL),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_LEGSPEC_BUDGET_ANCHOR, self.BATCH_ID_STALL_ARM)])
+        spec = self.tmp / "stall-p6" / "pace.json"
+        spec.parent.mkdir()
+        shutil.copyfile(dv / "legs" / self.SWAP_FIRST, spec)
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=90)
+        until = deadline + timedelta(seconds=60)
+        fake = self.tmp / "batch-fake-script.ps1"
+        fake.write_text("exit 0\n", encoding="utf-8")
+        cmd = (f"& '{dv / 'Invoke-VenueLeaseBatch.ps1'}' -Venue bachelor -LegSpec '{spec}' -Backend cuda -RunDir '{self.tmp / 'batch-run'}' -SourceCommit {self.sha} "
+               f"-BuildManifestSha256 {self.build_sha} -UmRunScript '{self.um}' -QuietScript '{fake}' -LegScript '{fake}' -ClaimDir '{self.tmp / 'claims'}' "
+               f"-AgentShare '{self.share}' -DeadlineUtc {deadline.strftime('%Y-%m-%dT%H:%M:%SZ')}; exit $LASTEXITCODE")
+        proc = run_pwsh(["-Command", cmd], env_extra={"DVT_ID_STALL_UNTIL": until.strftime("%Y-%m-%dT%H:%M:%SZ")}, timeout=420)
+        ended = datetime.now(timezone.utc)
+        self.assertLess(ended, deadline, f"the sweep's diagnostic held the preflight {(ended - deadline).total_seconds():.0f} s past -DeadlineUtc (old: a synchronous open)\n" + proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("INPUT_UNREADABLE", proc.stdout + proc.stderr)
+        self.assertFalse((self.tmp / "claims").exists() and any((self.tmp / "claims").iterdir()), "no claim is taken")
+
+    def test_planned_hash_bind_r4_p6_a5_legset_one_file_the_planner_judged_as_two_specs_then_split_is_refused_before_any_claim(self) -> None:
+        plan_seam = ("        if ($env:DVT_PLAN_F_WINDOWED -and [IO.Path]::GetFileName($full) -ceq 'm16-1457-native-windowed-s1.json') { [IO.File]::WriteAllBytes($full, [IO.File]::ReadAllBytes($env:DVT_PLAN_F_WINDOWED)) }   # TEST FIXTURE: F holds the windowed bytes for this read\n"
+                     "        if (Test-DvPathHasLinkBelow -Path $full -Root $legsDir) {")
+        split = ("    foreach ($e in $sp.plan) {\n        if ($env:DVT_PLAN_F_WINDOWED -and -not $script:dvtSplit) { $script:dvtSplit = $true; foreach ($pair in @(@($env:DVT_PLAN_FULL_LEAF, $env:DVT_PLAN_F_FULL), @('m16-1457-native-windowed-s1.json', $env:DVT_PLAN_F_WINDOWED))) { "
+                 "$t = Join-Path $here ('legs\\' + $pair[0]); [IO.File]::Delete($t); [IO.File]::Copy($pair[1], $t) } }   # TEST FIXTURE: two separate files, the same bytes\n"
+                 "        $shapeRefusal = Get-ScalarLegShapeRefusal ([string]$e.specPath)")
+        dv = self.mutated_runner([("DualVenueRunner.psm1", "        if (Test-DvPathHasLinkBelow -Path $full -Root $legsDir) {", plan_seam),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_LOOP_ANCHOR, split),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_PRECLAIM_ANCHOR, self.BATCH_PRECLAIM_STOP)])
+        full_b, win_b = self.tmp / "full-bytes.json", self.tmp / "windowed-bytes.json"
+        shutil.copyfile(dv / "legs" / self.SWAP_FIRST, full_b)
+        shutil.copyfile(dv / "legs" / self.SWAP_TARGET, win_b)
+        (dv / "legs" / self.SWAP_TARGET).unlink()
+        os.link(dv / "legs" / self.SWAP_FIRST, dv / "legs" / self.SWAP_TARGET)   # both names are F, holding the fullscreen bytes for the first planner read
+        from datetime import datetime, timedelta, timezone
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fake = self.tmp / "batch-fake-script.ps1"
+        fake.write_text("exit 0\n", encoding="utf-8")
+        proc = run_pwsh(["-File", str(dv / "Invoke-VenueLeaseBatch.ps1"), "-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-RunDir", str(self.tmp / "batch-run"),
+                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake),
+                         "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline],
+                        env_extra={"DVT_PLAN_F_WINDOWED": str(win_b), "DVT_PLAN_F_FULL": str(full_b), "DVT_PLAN_FULL_LEAF": self.SWAP_FIRST}, timeout=420)
+        self.assertEqual(((dv / "legs" / self.SWAP_FIRST).read_bytes(), (dv / "legs" / self.SWAP_TARGET).read_bytes()), (full_b.read_bytes(), win_b.read_bytes()), "the fixture split F into two files")
+        self.assertEqual([l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ")], [],
+                         "the planner judged one file F as two specs, and the batch reached the claim once the names were split (old)\n" + proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertTrue(any(l.startswith("BATCH_USAGE SPEC_CHANGED_AFTER_PREFLIGHT ") for l in proc.stderr.splitlines()), proc.stderr)
+
+    CHAIN_BLOCKING_STDERR = ("$results = [System.Collections.Generic.List[object]]::new()\n$exitCode = 0\n",
+                             "if ($env:DVT_BLOCK_STDERR_PREFIX) { Add-Type -TypeDefinition @'\n"
+                             "public class DvtBlockingErr : System.IO.TextWriter {\n"
+                             "    System.IO.TextWriter inner; string prefix;\n"
+                             "    public DvtBlockingErr(System.IO.TextWriter i, string p) { inner = i; prefix = p; }\n"
+                             "    public override System.Text.Encoding Encoding { get { return inner.Encoding; } }\n"
+                             "    public override void Write(char c) { inner.Write(c); }\n"
+                             "    public override void WriteLine(string s) { if (s != null && s.StartsWith(prefix)) { System.Threading.Thread.Sleep(System.Threading.Timeout.Infinite); } inner.WriteLine(s); }\n"
+                             "}\n'@\n[Console]::SetError([DvtBlockingErr]::new([Console]::Error, $env:DVT_BLOCK_STDERR_PREFIX)) }   # TEST FIXTURE: a stderr pipe nobody reads, full\n"
+                             "$results = [System.Collections.Generic.List[object]]::new()\n$exitCode = 0\n")
+
+    def test_planned_hash_bind_r4_p6_a6_a_transcript_diagnostic_on_a_full_stderr_pipe_never_holds_the_chain(self) -> None:
+        import stat
+        dv = self.mutated_runner([("Invoke-VenueChain.ps1", *self.CHAIN_BLOCKING_STDERR)])
+        run = self.tmp / "chain-run"
+        run.mkdir()
+        locked = run / "quiet-01-m16-1457-native-fullscreen-s1-cuda-under-claim.out.txt"
+        locked.write_text("held by the fixture\n", encoding="utf-8")
+        os.chmod(locked, stat.S_IREAD)
+        self.addCleanup(lambda: os.chmod(locked, stat.S_IREAD | stat.S_IWRITE) if locked.exists() else None)
+        fx = self.chain_fixture(dv, None, None)
+        fx["env"]["DVT_BLOCK_STDERR_PREFIX"] = "QUIET_OUT_WRITE_"
+        try:
+            proc = run_pwsh(["-File", str(dv / "Invoke-VenueChain.ps1"), "-Venue", "bachelor", "-LegSpec", str(dv / "legs" / self.SWAP_FIRST), "-Backend", "cuda", "-NoSupplementary",
+                             "-RunDir", str(run), "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-ClaimDir", str(self.tmp / "claims"), "-QuietScript", str(fx["quiet"]),
+                             "-LegScript", str(fx["leg"]), "-CooldownSec", "0", "-ClaimPollSec", "1"], env_extra=fx["env"], timeout=150)
+        except subprocess.TimeoutExpired as e:
+            self.fail(f"the chain blocked on the probe transcript's stderr diagnostic and never finished (old): {e}")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
+        self.assertEqual([(r["status"], r["verdict"]) for r in result["legs"]], [("RAN", "QUIET")], result["legs"])
 
 
 # ---------------------------------------------------------------------------------------------------
