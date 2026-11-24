@@ -97,7 +97,33 @@ struct FakeStamp // a monotonic stamp with injected milliseconds
     long long ms;
     bool isValid() const { return valid; }
     long long msecsTo( const FakeStamp & other ) const { return other.ms - ms; }
+    long long msecsSinceReference() const { return ms; }
 };
+
+// QElapsedTimer's own contract at nanosecond grain: msecsTo truncates the DIFFERENCE, msecsSinceReference
+// truncates the stamp itself (both toward zero; the stamps here are positive).
+struct FakeNsStamp
+{
+    long long ns;
+    bool isValid() const { return true; }
+    long long msecsTo( const FakeNsStamp & other ) const { return ( other.ns - ns ) / 1000000; }
+    long long msecsSinceReference() const { return ns / 1000000; }
+};
+
+// timerFrameEvent's drop-frame clock: each tick reads timeDiff = age( lastTime, tick ), and an idle tick
+// re-arms lastTime a little AFTER the tick (the work between them). Returns the summed timeDiff over n polls.
+long long summedIdleTickTimeDiffMs( long long pollNs, long long tickOffsetNs, long long reArmOffsetNs, int polls )
+{
+    long long sum = 0;
+    FakeNsStamp lastTime{ reArmOffsetNs };
+    for( int i = 1; i <= polls; ++i )
+    {
+        const FakeNsStamp tick{ i * pollNs + tickOffsetNs };
+        sum += stampAgeMs( lastTime, tick );
+        lastTime = FakeNsStamp{ i * pollNs + reArmOffsetNs };
+    }
+    return sum;
+}
 } // namespace
 
 TEST(PlaybackFpsMeterPolicy, StampAgeIsTheMonotonicIntervalZeroWhenUnstartedAndSaturated)
@@ -105,8 +131,14 @@ TEST(PlaybackFpsMeterPolicy, StampAgeIsTheMonotonicIntervalZeroWhenUnstartedAndS
     ASSERT_EQ(42, stampAgeMs(FakeStamp{ true, 10 }, FakeStamp{ true, 52 }));
     ASSERT_EQ(0, stampAgeMs(FakeStamp{ false, 10 }, FakeStamp{ true, 52 }));  // never-started then
     ASSERT_EQ(0, stampAgeMs(FakeStamp{ true, 10 }, FakeStamp{ false, 52 }));  // never-started now
-    ASSERT_EQ(INT_MAX, stampAgeMs(FakeStamp{ true, 0 }, FakeStamp{ true, 3000000000LL }));
-    ASSERT_EQ(INT_MIN, stampAgeMs(FakeStamp{ true, 0 }, FakeStamp{ true, -3000000000LL }));
+    // adversary r1 A3 (c7c88bf8): saturated at INT_MAX, a 24.8-day suspension asked the drop-frame loop for
+    // 4294967294 frames at 2000 fps. The age saturates at one day, the most the wall-clock type ever returned.
+    ASSERT_EQ(86400000, stampAgeMs(FakeStamp{ true, 0 }, FakeStamp{ true, 3000000000LL }));
+    ASSERT_EQ(-86400000, stampAgeMs(FakeStamp{ true, 0 }, FakeStamp{ true, -3000000000LL }));
+    ASSERT_EQ(86400000, stampAgeMs(FakeStamp{ true, 0 }, FakeStamp{ true, 2147484647LL }));
+    ASSERT_EQ(86400000, stampAgeMs(FakeStamp{ true, 0 }, FakeStamp{ true, 86400001LL }));
+    ASSERT_EQ(86399999, stampAgeMs(FakeStamp{ true, 0 }, FakeStamp{ true, 86399999LL }));
+    ASSERT_TRUE(2000.0 * stampAgeMs(FakeStamp{ true, 0 }, FakeStamp{ true, 2147484647LL }) / 1000.0 < 2147483647.0);
     // a monotonic pair either side of midnight is just 30 ms: no stall, a real sample, no wrap
     const int age = stampAgeMs(FakeStamp{ true, 86399990LL }, FakeStamp{ true, 86400020LL });
     ASSERT_EQ(30, age);
@@ -125,4 +157,18 @@ TEST(PlaybackFpsMeterPolicy, StampAgeOnARealElapsedTimer)
     ASSERT_EQ(0, stampAgeMs(never, a));
     a.invalidate();
     ASSERT_EQ(0, stampAgeMs(a, b));
+}
+
+// adversary r1 A2 (c7c88bf8): truncating the DIFFERENCE (msecsTo) loses up to 1 ms on every tick, and the idle
+// re-arm makes that every tick. The wall clock this replaced truncated each STAMP, so the summed timeDiff kept
+// up with real time. The age must keep that grain.
+TEST(PlaybackFpsMeterPolicy, StampAgeKeepsTheStampGrainSoIdleReArmedTicksKeepUpWithRealTime)
+{
+    // MLVAPP_PLAYBACK_TIMER_POLL_MS=1, due wake off: ticks at n+0.100 ms, idle re-arms at n+0.200 ms.
+    // Each age is 0.9 ms of real time; msecsTo read 0 every tick and drop-frame never advanced.
+    ASSERT_EQ(42LL, summedIdleTickTimeDiffMs(1000000LL, 100000LL, 200000LL, 42));
+    // the 8 ms default poll: each post-idle interval is 7.9 ms; msecsTo read 7 (playback ran 1/8 slow)
+    ASSERT_EQ(8LL * 42LL, summedIdleTickTimeDiffMs(8000000LL, 100000LL, 200000LL, 42));
+    // one age is still whole stamps: 0.2 ms -> 1.1 ms crosses one millisecond boundary
+    ASSERT_EQ(1, stampAgeMs(FakeNsStamp{ 200000LL }, FakeNsStamp{ 1100000LL }));
 }
