@@ -868,7 +868,7 @@ function Invoke-StrandedTicketRetry([string]$Why) {
     }
 }
 
-function Invoke-PendingClaimRelease([string]$Why, [switch]$StderrOnly) {
+function Invoke-PendingClaimRelease([string]$Why, [switch]$StderrOnly, [switch]$Deferred) {
     # TAIL-1 r6 (sol r5 B2 = adversary pass 2 A2): a request answered QUEUED after A13's give-back stayed BUSY five times names THIS batch's own claim on its ticket (pendingReleaseNonce); only the next poll let go of
     # it. A typed stop with no claim held (DEADLINE, an input-guard refusal, a request that threw) has no next poll, so the claim kept the older ready ticket waiting until this process exited or the claim expired.
     # Every such stop lets go of it FIRST, bounded as the late grant's release is (VenueChain's Invoke-VenueLateRelease: the reserve, one call capped at 1.5 s, the probe at 1.0 s), and then says what happened.
@@ -883,9 +883,12 @@ function Invoke-PendingClaimRelease([string]$Why, [switch]$StderrOnly) {
     } catch { $pendingAnswer = 'ERROR'; $pendingUnanswered = $true }
     $let = $pendingAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')
     if ($let) { $t.pendingReleaseNonce = '' }
-    elseif ($pendingUnanswered -or $pendingAnswer -cin @('NO_ANSWER', 'ERROR')) { Disable-RunDirWrites "the release of a claim a give-back could not let go of was not answered ($pendingAnswer)" }
+    # r6 adversary A3 (d714aae4): ANY call that did not answer turns the suppression on, also when the probe after it answered RELEASED: the claim share stalled, and -RunDir may be on it
+    if ($pendingUnanswered -or $pendingAnswer -cin @('NO_ANSWER', 'ERROR')) { Disable-RunDirWrites "a release of a claim a give-back could not let go of did not answer ($pendingAnswer)" }
     $pendingLine = $(if ($let) { "CLAIM_PENDING_RELEASE batch=$batchNo nonce=$pendingNonce result=$pendingAnswer why=$Why (a claim a give-back could not let go of, released before the typed stop)" }
         else { "CLAIM_PENDING_RELEASE_NOT_RELEASED batch=$batchNo nonce=$pendingNonce result=$pendingAnswer why=$Why (the claim still names this batch until its owner exits or it expires)" })
+    # r6 adversary A2: -Deferred returns the line for the caller to write later (the release runs before any batch.log line of its turn)
+    if ($Deferred) { return $pendingLine }
     if ($StderrOnly) { try { [Console]::Error.WriteLine($pendingLine) } catch { } } else { LogBest $pendingLine }
 }
 
@@ -1015,6 +1018,10 @@ $script:ClaimRetryRequestWorker = {
     try { $S.decided = $true; $late = $S.abandoned -or ($null -ne $r -and $r.granted -and [DateTime]::UtcNow -ge $A.lateAfterUtc); $S.late = $late; $S.result = $r; $S.error = $err }
     finally { [Threading.Monitor]::Exit($S.lock) }
     if ($late -and $null -ne $r -and $r.granted) { try { $S.release = [string](Release-VenueClaim -Venue $A.request.Venue -Nonce $r.claim.nonce -ClaimDir $A.request.ClaimDir) } catch { $S.release = "THREW $($_.Exception.Message -replace '\s+', ' ')" } }
+    elseif ($S.abandoned -and $null -ne $r -and -not $r.granted -and $null -ne $r.PSObject.Properties['ticket'] -and $null -ne $r.ticket -and $null -ne $r.ticket.PSObject.Properties['pendingReleaseNonce'] -and [string]$r.ticket.pendingReleaseNonce) {
+        # TAIL-1 r6 (adversary A4 on d714aae4): a QUEUED answer whose ticket names this batch's own claim (A13's give-back stayed BUSY) reaches nobody once the caller gave up, so this worker lets go of that claim too
+        try { $S.release = [string](Release-VenueClaim -Venue $A.request.Venue -Nonce ([string]$r.ticket.pendingReleaseNonce) -ClaimDir $A.request.ClaimDir) } catch { $S.release = "THREW $($_.Exception.Message -replace '\s+', ' ')" }
+    }
 }
 # r7: the release of a claim granted on a retry, on its worker (Invoke-ClaimRetryRelease, its one reader)
 $script:ClaimRetryReleaseWorker = {
@@ -2414,6 +2421,12 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         $grantReadUtc = [DateTime]::UtcNow
         if (-not $req.granted) { if ($script:claimWait.denied -eq 0) { $script:claimWait.startUtc = $grantReadUtc }; $script:claimWait.denied++; $script:claimWait.endUtc = $null }
         elseif ($script:claimWait.denied -gt 0) { $script:claimWait.endUtc = $grantReadUtc }
+        # TAIL-1 r6 (adversary A2 on d714aae4): a QUEUED answer that names this batch's own claim (A13) with no poll left before the deadline is let go of NOW, before the guard and every batch.log line of this turn
+        # (a synchronous append that stalls there would hold it); the line it returns is written with the turn's ticket note, once the guard has vouched for batch.log. A no-op without a pending nonce.
+        if (-not $req.granted -and [DateTime]::UtcNow.AddSeconds($ClaimPollSec) -ge $deadline) {
+            $pendingReleaseLine = Invoke-PendingClaimRelease 'no-poll-left' -Deferred
+            if ($pendingReleaseLine) { $ticketNote = $(if ($ticketNote) { "$ticketNote | " } else { '' }) + $pendingReleaseLine }
+        }
         # r3 (adversary r3 A1): the request can take time of its own (BUSY retries on a locked claim file), so a retry's room is asked once more now: gone, no pass starts, and the
         # pass that did not finish, still unvouched, is the refusal below
         $requestUnanswered = $(if ([string]$req.state -cin @('REQUEST_NO_ROOM', 'REQUEST_NO_ANSWER', 'REQUEST_LATE_GRANT')) { [string]$req.why } else { '' })
@@ -2445,7 +2458,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # TAIL-1 r2 A4 (+ pass 3 A3): a release that was NOT answered (the claim share stopped answering: a worker timed out, in ANY of its calls, even when the probe after it was answered BUSY) turns the write suppression on,
                 # as Invoke-ClaimRetryRelease does, so the log line below (L / LogBest) cannot probe batch.log on that same failed share unbounded before the deadline result. Said on stderr only from then on. A BUSY answer
                 # alone is an answer: the share is up, the log is written.
-                if (($late.anyUnanswered -and $lateAnswer -cnotin @('RELEASED', 'ABSENT', 'NOT_OURS')) -or $lateAnswer -cin @('NO_ANSWER', 'ERROR')) { Disable-RunDirWrites "the late release of a claim granted at or after the deadline was not answered ($lateAnswer)" }
+                # TAIL-1 r6 (adversary A3 on d714aae4, sibling; was r5 OPEN pass 2 A3): ANY unanswered call turns it on, also when the probe after it answered RELEASED
+                if ($late.anyUnanswered -or $lateAnswer -cin @('NO_ANSWER', 'ERROR')) { Disable-RunDirWrites "a call of the late release of a claim granted at or after the deadline did not answer ($lateAnswer)" }
             }
             if ($lateAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { LogBest "CLAIM_LATE_GRANT batch=$batchNo (the claim was granted at or after the deadline: let go, not used)" }
             else { LogBest "CLAIM_LATE_GRANT_NOT_RELEASED batch=$batchNo answer=$lateAnswer (the claim was granted at or after the deadline and is NOT known to be let go: it still names this batch until its expiry or its owner's exit)" }

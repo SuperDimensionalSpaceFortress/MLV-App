@@ -2987,7 +2987,8 @@ $o | ConvertTo-Json -Compress
         self.assertIn("CLAIM_GIVE_BACK_BUSY", log + "\n" + out, f"the batch never got the QUEUED give-back answer (the seam is wrong):\n{log}\n{out}")
         self.assertEqual(p.returncode, 3, f"the batch must end DEADLINE (exit 3):\n{log}\n{out}")
         self.assertFalse(self.claim_path.exists(), f"the batch ended DEADLINE with its own claim (the QUEUED answer's nonce) still standing:\n{log}\n{out}")
-        self.assertRegex(log + "\n" + out, r"CLAIM_PENDING_RELEASE batch=\d+ nonce=\S+ result=RELEASED why=deadline", f"the release of the batch's own claim was not said:\n{log}\n{out}")
+        # r6 adversary A2: let go right after the request when no poll is left (why=no-poll-left), else at the DEADLINE stop (why=deadline)
+        self.assertRegex(log + "\n" + out, r"CLAIM_PENDING_RELEASE batch=\d+ nonce=\S+ result=RELEASED why=(?:no-poll-left|deadline)", f"the release of the batch's own claim was not said:\n{log}\n{out}")
         receipt = Path(p.run_dir) / "batch-01.json"   # type: ignore[attr-defined]
         self.assertTrue(receipt.exists(), f"no batch receipt:\n{log}\n{out}")
         self.assertEqual(json.loads(receipt.read_text(encoding="utf-8-sig")).get("endReason"), "DEADLINE", receipt.read_text(encoding="utf-8-sig"))

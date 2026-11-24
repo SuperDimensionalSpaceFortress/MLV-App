@@ -4460,6 +4460,12 @@ UNRESOLVED_EXECUTED_SITES = {
          "Invoke-Bounded runs its caller's [scriptblock] on a worker runspace; both callers in this file pass a { } literal (a Test-Path / "
          "Get-FileHash read), which the AST scans as code"),
     ],
+    "tools/profiling/dual-venue/Invoke-VenueChain.ps1": [
+        ("[void]$logPs.AddScript({ param($Lines, $ChainLog)",
+         "VENUE-FIFO-ADVERSARY-TAIL-1 r6 (sol r5 B1): L hands the queued chain.log lines to a short write pipeline on its own writer runspace, so an append that stalls "
+         "on a share never holds the chain. The executed text is the .ToString() of the { } literal written in place inside L (its only writer), which the AST scans "
+         "as code: one Add-Content -LiteralPath per line onto the chain's own -ChainLog path and a stderr line when it fails; it launches nothing"),
+    ],
     "tools/profiling/dual-venue/Invoke-VenueLeaseBatch.ps1": [
         ("[scriptblock]::Create([IO.File]::ReadAllText($StagedBuildProbeScript))",
          "LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r2 offline test seam: the text of the -StagedBuildProbeScript file its caller names. :195 refuses both seams "
