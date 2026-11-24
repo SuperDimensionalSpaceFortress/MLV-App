@@ -2367,6 +2367,90 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
                 self.assertEqual(g["outcome"], "INVALID", g)
                 self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and "RENDER_VERIFIED" in p for p in g["problems"]), g)
 
+    # --- EXPORT-RENDER-PIPE-TIMING-2 r4 (sol r3 on 5aa6629a, B1-B4): each row is a malformed line the r2 grammar still read as valid evidence.
+    # The producer's no-probe trailer (BatchRunner.cpp:810-819): container_probe=unavailable, then probe_source=none and four 'unchecked' facts.
+    T4_NO_PROBE = " probe_source=none codec=unchecked container=unchecked sar=unchecked dar=unchecked"
+
+    @classmethod
+    def t4_no_probe(cls, between: str = "", trailer: str | None = None, probe: str = "unavailable") -> str:
+        return f"{cls.t2_head()} dimensions=1920x1440 bytes=9 container_probe={probe}{between}{cls.T4_NO_PROBE if trailer is None else trailer}"
+
+    def test_t2_r4_b1_a_field_between_the_no_probe_sentinel_and_its_trailer_is_invalid(self) -> None:
+        """sol r3 B1 (repro verbatim): on an otherwise clean emitting one-frame export, dimensions=1280x720 after container_probe=unavailable and before
+        probe_source=none read PASS, renderPipeTimed=true, problems=[]; a repeated probe_source and an extra separator at that boundary passed too. 'unavailable' is the
+        producer's fixed sentinel and is printed only with probe_source=none and four 'unchecked' facts, so the sentinel binds its trailer both ways. Controls: the
+        producer's own no-probe line, and a parsed probe's verbatim path holding field-like text (F9 / F10 above), stay clean."""
+        rows = [("NP-OK", self.t4_no_probe(), "PASS"),
+                ("B1", self.t4_no_probe(" dimensions=1280x720"), "INVALID"),
+                ("B1-PS-REPEAT", self.t4_no_probe(" probe_source=none"), "INVALID"),
+                ("B1-PS-CONFLICT", self.t4_no_probe(" probe_source=ffprobe-json"), "INVALID"),
+                ("B1-SEPARATOR", self.t4_no_probe(" "), "INVALID"),
+                ("B1-FACTS", self.t4_no_probe(trailer=self.T2_TRAILER.replace("ffprobe-json", "none")), "INVALID"),
+                ("B1-SENTINEL-PARSED", self.t4_no_probe(trailer=self.T2_TRAILER), "INVALID"),
+                ("B1-PATH-NONE", self.t4_no_probe(probe="C:/kit/ffprobe.exe"), "INVALID")]
+        proc, got = evidence_cases([self.t2_case(self.t2_start(), [v], self.t2_done()) for _, v, _ in rows])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for (label, _, expect), g in zip(rows, got):
+            with self.subTest(row=label):
+                if expect == "PASS":
+                    self.assertEqual((g["problems"], g["outcome"]), ([], "PASS"), g)
+                    self.assertIs(g["metrics"]["renderPipeTimed"], True, g)
+                else:
+                    self.assertEqual(g["outcome"], "INVALID", g)
+                    self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and "RENDER_VERIFIED" in p and "container_probe=" in p for p in g["problems"]), g)
+
+    def test_t2_r4_b4_a_second_done_count_triplet_is_invalid_on_cdng(self) -> None:
+        """sol r3 B4 (repro verbatim): a valid 30-frame CDNG fixture with `DONE view-0 exported=29 skipped=1 elapsed=40.0 exported=30 skipped=0 elapsed=20.0` read PASS:
+        the first triplet was absorbed into the clip, and CDNG has no RENDER_START to bind the clip as ProRes does. A DONE field named again just before the peeled
+        trailer is a repeat (any route). Sibling rows: a repeated elapsed= alone, a repeated skipped= alone, and the ProRes route. Controls: the clean fixture, and a
+        one-token clip spelled like a DONE key (a legal completeBaseName; the clip is required, so it is no repeat)."""
+        two = "[BATCH] Start\n[BATCH] DONE view-0 exported=29 skipped=1 elapsed=40.0 exported=30 skipped=0 elapsed=20.0\n"
+        rows = [("CDNG-OK", cdng_case(), "PASS", None),
+                ("B4", cdng_case(batch=two), "INVALID", "elapsed="),
+                ("B4-ELAPSED", cdng_case(batch="[BATCH] DONE view-0 elapsed=40.0 exported=30 skipped=0 elapsed=20.0\n"), "INVALID", "elapsed="),
+                ("B4-SKIPPED", cdng_case(batch="[BATCH] DONE view-0 skipped=1 exported=30 skipped=0 elapsed=20.0\n"), "INVALID", "skipped="),
+                ("B4-PRORES", self.t2_case(self.t2_start(), [self.t2_verified()], "[BATCH] DONE view-0 exported=1 skipped=0 elapsed=1.0 exported=1 skipped=0 elapsed=1.0"),
+                 "INVALID", "elapsed="),
+                ("CDNG-CLIP-KEY", cdng_case(batch="[BATCH] DONE elapsed=1.0 exported=30 skipped=0 elapsed=20.0\n"), "PASS", None)]
+        proc, got = evidence_cases([c for _, c, _, _ in rows])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for (label, _, expect, key), g in zip(rows, got):
+            with self.subTest(row=label):
+                if expect == "PASS":
+                    self.assertEqual((g["problems"], g["outcome"]), ([], "PASS"), g)
+                else:
+                    self.assertEqual(g["outcome"], "INVALID", g)
+                    self.assertTrue(any(p.startswith("EXPORT_BATCH_LOG_UNREADABLE") and "DONE" in p and key in p for p in g["problems"]), g)
+
+    def test_t2_r4_b3_a_present_render_start_is_read_by_the_grammar_on_an_older_or_unknown_build(self) -> None:
+        """sol r3 B3 (repro verbatim): with the older build 2b796198 and otherwise valid older-format evidence, output=1280x720 inserted just before out= on a line
+        already carrying output=1x1 read PASS with no problem, and so did `RENDER_START:`: the declaration was read only when the build emits this card's stages. A
+        PRESENT RENDER_START is now read by the one grammar and the declaration's own checks on every ProRes route; an absent one on an older build adds nothing (a
+        receipt from before RENDER_START re-derives the same). The same holds for a build this repo cannot name ('unknown')."""
+        import subprocess
+        base = "2b79619832444c0a63a8573d04f6cd02a4a113dc"
+        if subprocess.run(["git", "-C", str(ROOT), "cat-file", "-t", base], capture_output=True, text=True).stdout.strip() != "commit":
+            self.skipTest("the base commit is not in this clone (a shallow checkout)")
+        old = stage_log(480)
+        dup = self.CTL_START.replace(" out=", " output=1280x720 out=")
+        colon = self.CTL_START.replace("RENDER_START view-0 ", "RENDER_START: view-0 ")
+        no_start = self.ctl_batch().split("\n", 1)[1]
+        rows = []
+        for build in (base, BUILD_ID):
+            rows += [(f"{build[:8]}-OK", self.ctl(old, buildId=build), "PASS"),
+                     (f"{build[:8]}-NO-START", self.ctl(old, buildId=build, batch=no_start), "PASS"),
+                     (f"{build[:8]}-B3-DUP-OUTPUT", self.ctl(old, buildId=build, batch=self.ctl_batch(start=dup)), "INVALID"),
+                     (f"{build[:8]}-B3-COLON", self.ctl(old, buildId=build, batch=self.ctl_batch(start=colon)), "INVALID")]
+        proc, got = evidence_cases([c for _, c, _ in rows])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for (label, _, expect), g in zip(rows, got):
+            with self.subTest(row=label):
+                if expect == "PASS":
+                    self.assertEqual(g["problems"], [], "an older build's valid (or absent) declaration raises no problem")
+                else:
+                    self.assertEqual(g["outcome"], "INVALID", g)
+                    self.assertTrue(any("RENDER_START" in p and (p.startswith("EXPORT_PROFILE_ABSENT") or p.startswith("EXPORT_OUTPUT_MISMATCH")) for p in g["problems"]), g)
+
 
 EXPORT_STUB_GENERATOR = r"""
 param($SourceCommit,$BuildManifestSha256,$ClipId,$OutFile,$RepoRoot,$Venue,$Backend,$CpuQuiescenceThresholdPercent,$VenueTablePath,$PlaySeconds,$Format,$MaxFrames,$ReceiptPath,$DualIsoExpected,$ExpectReceiptSha256)
@@ -3548,6 +3632,94 @@ class ExportJobGeneratorTests(unittest.TestCase):
         got = json.loads(proc.stdout)
         self.assertEqual(got["missing"], [], got["missing"])
         self.assertIn("ConvertTo-AttrCudaFileIdObject", got["embedded"], "Get-AttrCudaFileId's callee must ride with it")
+
+    # EXPORT-RENDER-PIPE-TIMING-2 r4 (sol r3 B2): the job's classification block, run as the job runs it, over batch logs the central reader refuses
+    T4_JOB_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+$d = & $env:DVE_JOB -DescribeTemplate
+$t = [string]$d.template
+$a = $t.IndexOf('$logText = '); $b = $t.IndexOf('$exitFor = @{')
+if ($a -lt 0 -or $b -le $a) { throw 'the template no longer carries the classification block this test runs' }
+$slice = $t.Substring($a, $b - $a)
+$grammar = $(if ($null -ne $d.PSObject.Properties['batchLineGrammar']) { [string]$d.batchLineGrammar } else { '' })
+function Write-JobTrace { param($m) }
+function Get-AttrCudaFileSha256Blocks { param($Path, $TracePath, $Label) [pscustomobject]@{ sha256 = ('0' * 64) } }
+. ([scriptblock]::Create($grammar))
+$block = [scriptblock]::Create($slice)
+$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json
+$out = @(foreach ($c in $cases) {
+    $Work = [string]$c.work; $batchLog = Join-Path $Work 'batch.log'; $profilePath = Join-Path $Work 'export-profile.json'; $stageLog = Join-Path $Work 'stage-timing.log'
+    $outDir = Join-Path $Work 'out'; $Trace = Join-Path $Work 'trace.txt'
+    $Format = [string]$c.format; $MaxFrames = [int]$c.maxFrames; $timedOut = $false; $killConfirmed = $true; $appExitCode = 0
+    $result = $null; $exported = $null
+    try { . $block; [ordered]@{ result = $result; exported = $exported; grammar = $grammar.Length } } catch { [ordered]@{ result = 'THREW'; exported = $null; error = [string]$_; grammar = $grammar.Length } }
+})
+ConvertTo-Json -InputObject $out -Compress -Depth 4
+"""
+
+    def test_t2_r4_b2_the_bachelor_classifier_reads_the_batch_log_by_the_modules_one_grammar(self) -> None:
+        """sol r3 B2 (repro verbatim): with a successful process, one .mov, one exported frame and a stage log, Bachelor given only `RENDER_VERIFIED view-0
+        decoded_frames=1` classified EXPORT_CAPTURED (exit 0) where the central reader returned INVALID; a duplicate field after the trailer passed too, and a count of
+        9223372036854775808 threw before the result was published. The emitted job now carries the module's own line grammar (ConvertFrom-DvBatchLogLine /
+        ConvertFrom-DvBatchExportLog and their tables, extracted verbatim from DualVenueRunner.psm1, never re-typed) and classifies DONE and RENDER_VERIFIED by it, so a
+        line the central reader refuses is EXPORT_OUTPUT_MISMATCH at the venue too, typed, never a throw. Sibling: sol B4's two DONE triplets on CDNG."""
+        start, done, ok = self.t4_start(), "[BATCH] DONE view-0 exported=1 skipped=0 elapsed=1.0", self.t4_verified()
+        cdng_two = "[BATCH] DONE view-0 exported=29 skipped=1 elapsed=40.0 exported=30 skipped=0 elapsed=20.0"
+        rows = [("PRORES-OK", "prores", 1, [start, ok, done], "EXPORT_CAPTURED"),
+                ("B2-TRUNCATED", "prores", 1, [start, "[BATCH] RENDER_VERIFIED view-0 decoded_frames=1", done], "EXPORT_OUTPUT_MISMATCH"),
+                ("B2-AFTER-TRAILER", "prores", 1, [start, ok + " dimensions=1280x720", done], "EXPORT_OUTPUT_MISMATCH"),
+                ("B2-OVERSIZED", "prores", 1, [start, ok.replace("decoded_frames=1 ", "decoded_frames=9223372036854775808 "), done], "EXPORT_OUTPUT_MISMATCH"),
+                ("CDNG-OK", "cdng-lossless", 30, ["[BATCH] DONE view-0 exported=30 skipped=0 elapsed=20.0"], "EXPORT_CAPTURED"),
+                ("B2-CDNG-TWO-TRIPLETS", "cdng-lossless", 30, [cdng_two], "EXPORT_CAPTURED_NOT")]
+        with tempfile.TemporaryDirectory() as d:
+            cases = []
+            for i, (label, fmt, frames, lines, _) in enumerate(rows):
+                work = Path(d) / f"w{i}"
+                (work / "out").mkdir(parents=True)
+                (work / "batch.log").write_text("[BATCH] Start\n" + "\n".join(lines) + "\n", encoding="utf-8", newline="")
+                if fmt == "prores":
+                    (work / "stage-timing.log").write_text(piped_stage_log(1), encoding="utf-8")
+                    (work / "out" / "view-0.mov").write_bytes(b"\0" * 9)
+                else:
+                    (work / "export-profile.json").write_text(cdng_profile(frames), encoding="utf-8")
+                    for k in range(frames):
+                        (work / "out" / f"view-0_{k:06d}.dng").write_bytes(b"\0" * 4)
+                cases.append({"work": str(work), "format": fmt, "maxFrames": frames})
+            (Path(d) / "cases.json").write_text(json.dumps(cases), encoding="utf-8")
+            harness = Path(d) / "harness.ps1"
+            harness.write_text(self.T4_JOB_HARNESS, encoding="utf-8")
+            proc = run_pwsh(["-File", str(harness)], env_extra={"DVE_JOB": str(EXPORT_JOB), "DVE_CASES": str(Path(d) / "cases.json")})
+        self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
+        got = json.loads(proc.stdout)
+        for (label, _, _, _, expect), g in zip(rows, got):
+            with self.subTest(row=label):
+                if expect == "EXPORT_CAPTURED_NOT":
+                    self.assertEqual(g["result"], "EXPORT_OUTPUT_MISMATCH", g)
+                else:
+                    self.assertEqual(g["result"], expect, g)
+        # the job's grammar is the module's, byte for byte (extracted, never re-typed), and the classifier keeps no regex of its own over the batch log
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        proc = run_pwsh(["-Command", f"$d = & '{EXPORT_JOB}' -DescribeTemplate; [ordered]@{{ grammar = [string]$d.batchLineGrammar; template = [string]$d.template }} | ConvertTo-Json -Compress"])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        described = json.loads(proc.stdout)
+        for name in ("ConvertFrom-DvBatchLogLine", "ConvertFrom-DvBatchExportLog"):
+            m = re.search(rf"(?ms)^function {name} \{{.*?^\}}", module)
+            self.assertIsNotNone(m, name)
+            self.assertIn(m.group(0).replace("\r\n", "\n"), described["grammar"].replace("\r\n", "\n"), f"the job's {name} is not the module's")
+        for var in ("$script:ExportBatchLineShapes = ", "$script:ExportBatchLineGrammar = ", "$script:ExportBatchLineForbidden = "):
+            line = next(l for l in module.splitlines() if l.startswith(var))
+            self.assertIn(line, described["grammar"], var)
+        self.assertNotIn("[regex]::Matches($logText", described["template"], "the job classifies the batch log by the module's grammar alone")
+
+    @staticmethod
+    def t4_start() -> str:
+        return ("[BATCH] RENDER_START view-0 codec=prores container=mov source=1920x1080 output=1920x1440 scaled=true fps=24 frames=1 cutIn=1 cutOut=1 "
+                "out=view-0.mov")
+
+    @staticmethod
+    def t4_verified() -> str:
+        return ("[BATCH] RENDER_VERIFIED view-0 decoded_frames=1 decoded_duration=0.042 decoded_frame_bytes=1 dimensions=1920x1440 bytes=9 "
+                "container_probe=C:/kit/ffprobe.exe probe_source=ffprobe-json codec=prores container=mov sar=1:1 dar=4:3")
 
     def test_the_app_never_inherits_the_venue_agents_mlvapp_environment(self) -> None:
         """adversary r2 A1 (on c3768da1): the export child inherited the agent's environment, so MLVAPP_GPU_EXPORT=1 on a CUDA venue made the 'cpu' leg a GPU
