@@ -2268,23 +2268,42 @@ $closedUtc = [DateTime]::UtcNow
     def reader_let_go_before_an_open(self, r: dict, slow_full_call_ms: int) -> bool:
         # TAIL-1 r5 (sol r4 H2): True when the observer let go of the claim file BEFORE a release call that opens the file started (every call when the full calls run as they ship; only the single-open
         # probe when slow_full_call_ms makes a full call answer BUSY without touching the file). That call's opens all came after the let-go, so a claim left behind is then the batch's fault.
+        # TAIL-1 r6 (sol r5 B4): a call is logged at its ENTRY and then opens the file several times (Remove-VenueClaimIfUnchanged: opens at 0, 50, 150, 300, 500 ms for -MaxAttempts 5, sleeps never shorter
+        # than asked), so its last open is at entry + 25 * N * (N - 1) ms at the earliest. A reader that let go before THAT met an open, so the run is the batch's to answer for: entry alone discarded a call
+        # entered at .600 whose later opens (.700 ...) came after a let-go at .650.
         closed = self.utc_of(r["holder"]["closedUtc"])
         opening = [c for c in r["releaseCalls"] if not slow_full_call_ms or c.endswith("max=1")]
-        return any(self.utc_of(c.split()[0]) > closed for c in opening)
+        return any(self.utc_of(c.split()[0]) + timedelta(seconds=self.last_open_offset_sec(c)) > closed for c in opening)
+
+    @staticmethod
+    def last_open_offset_sec(call: str) -> float:
+        import re
+        m = re.search(r"max=(\d+)\s*$", call)
+        n = int(m.group(1)) if m else 5
+        return 0.025 * n * (n - 1)
 
     def observed_late_grant(self, observe_close_ms: int, slow_full_call_ms: int = 0, prefix: str = "L", attempts: int = 3, **kw) -> dict:
         # TAIL-1 r5 (sol r4 H2): the observer lets go observe_close_ms after it SEES the first release call logged, and under concurrent suite load it can see it (or wake) late, so it let go after the batch's
         # last open: the bound measured from the retry's start was spent, and BUSY is then the contracted answer (r4's concurrent run: CLAIM_LATE_GRANT_NOT_RELEASED answer=BUSY, the case passing alone).
         # Such a run proves nothing either way and is run again (up to `attempts`); a run whose reader let go before an open, or whose claim was let go, is returned for the caller's assertions.
+        # TAIL-1 r6 (sol r5 B4): a discarded run is KEPT (r["discarded"]), so what it measured besides the claim (its typed DEADLINE receipt: g18_cell_faults) is still asserted, never erased by a clean retry
         runs = []
         for i in range(attempts):
             r = self.late_grant_scenario(hold=False, observe_close_ms=observe_close_ms, slow_full_call_ms=slow_full_call_ms, name=prefix if i == 0 else f"{prefix}{i}", **kw)
             if not r["claimLeft"] or self.reader_let_go_before_an_open(r, slow_full_call_ms):
                 r["attempts"] = i + 1
+                r["discarded"] = runs
                 return r
-            runs.append({"closedUtc": r["holder"]["closedUtc"], "releaseCalls": r["releaseCalls"]})
+            runs.append(r)
             self.claim_path.unlink(missing_ok=True)   # the batch has exited; its claim must not meet the next run's observer
-        self.fail(f"inconclusive under load: in {attempts} runs the reader let go only after the batch's last open of the claim file: {runs}")
+        self.fail(f"inconclusive under load: in {attempts} runs the reader let go only after the batch's last open of the claim file: {[{'closedUtc': x['holder']['closedUtc'], 'releaseCalls': x['releaseCalls']} for x in runs]}")
+
+    def g18_cell_faults(self, r: dict, d_ms: int) -> list:
+        # the cell's receipt faults over EVERY run it made: the returned one and each one the H2 retry discarded
+        faults = list(self.deadline_receipt_faults(r, d_ms))
+        for k, dr in enumerate(r.get("discarded", [])):
+            faults += [f"discarded run {k + 1}: {f}" for f in self.deadline_receipt_faults(dr, d_ms)]
+        return faults
 
     # TAIL-1 r5 (sol r4 B2): the G18 matrix (LATE_RELEASE_SWEEP) times the helper only; these cells drive the REAL batch through the same late grant and time its typed DEADLINE receipt
     G18_BATCH_CELLS = ((650, 680), (650, 0), (725, 750))   # (reader lets go at L ms, full call lasts D ms; 0 = the call as it ships, which answers BUSY at 0.5 s)
@@ -2313,7 +2332,7 @@ $closedUtc = [DateTime]::UtcNow
         for k, (l_ms, d_ms) in enumerate(self.G18_BATCH_CELLS):
             with self.subTest(l_ms=l_ms, d_ms=d_ms):
                 r = self.observed_late_grant(l_ms, slow_full_call_ms=d_ms, prefix=f"G{k}")
-                self.assertEqual(self.deadline_receipt_faults(r, d_ms), [], f"L={l_ms} D={d_ms}:\n{r['log']}\n{r['out']}")
+                self.assertEqual(self.g18_cell_faults(r, d_ms), [], f"L={l_ms} D={d_ms}:\n{r['log']}\n{r['out']}")
                 self.assertFalse(r["claimLeft"], f"L={l_ms} D={d_ms}: the reader let go before an open and the claim was left behind: {r['releaseCalls']} {r['holder']}")
 
     def test_tail1_r5_b2_a_deadline_receipt_delayed_past_the_bound_fails_its_batch_path_cell(self) -> None:
@@ -2322,6 +2341,36 @@ $closedUtc = [DateTime]::UtcNow
         r = self.late_grant_scenario(hold=False, observe_close_ms=650, slow_full_call_ms=680, name="GD", receipt_delay_ms=int(bound * 1000) + 1000)
         faults = self.deadline_receipt_faults(r, 680)
         self.assertTrue(any("DEADLINE receipt landed" in f for f in faults), f"a DEADLINE receipt delayed past the bound was not seen by its cell: {faults}\n{r['log']}")
+
+    @staticmethod
+    def b4_stamp(sec: float) -> str:
+        return (datetime(2026, 11, 24, 1, 0, 0, tzinfo=timezone.utc) + timedelta(seconds=sec)).strftime("%Y-%m-%dT%H:%M:%S.%f") + "0Z"
+
+    def test_tail1_r6_b4_the_h2_retry_never_discards_a_run_whose_reader_let_go_before_a_calls_later_opens(self) -> None:
+        # sol r5 B4, first literal row: a full call enters at .600 s and opens the file again after that (.700 s ...), the reader lets go at .650 s and the claim is still left. That run is a loss the caller must
+        # assert, never a retry. Neighbours: a single-open probe entered before the let-go met nothing after it (retry); one entered after it did (returned).
+        s = self.b4_stamp
+        self.assertTrue(self.reader_let_go_before_an_open({"holder": {"closedUtc": s(0.650)}, "releaseCalls": [f"{s(0.600)} max=5"]}, 0),
+                        "a full call entered at .600 s opens the file until about 1.1 s; a reader that let go at .650 s was met by those opens, so a claim left behind must fail, not be retried")
+        self.assertFalse(self.reader_let_go_before_an_open({"holder": {"closedUtc": s(0.650)}, "releaseCalls": [f"{s(0.600)} max=1"]}, 0), "a probe's one open came before the let-go")
+        self.assertTrue(self.reader_let_go_before_an_open({"holder": {"closedUtc": s(0.650)}, "releaseCalls": [f"{s(0.750)} max=1"]}, 0), "a probe entered after the let-go met it")
+
+    def test_tail1_r6_b4_a_discarded_runs_overdue_receipt_still_fails_its_g18_cell(self) -> None:
+        # sol r5 B4, second literal row: the first run's reader lets go at .800 s, after the last open (.750 s), so the run is inconclusive and retried; but its typed DEADLINE receipt landed 8.00 s past the
+        # deadline against a 4.13 s bound. A clean second run must not erase that: the cell reports the discarded run's overrun.
+        from unittest import mock
+        s = self.b4_stamp
+        deadline = datetime(2026, 11, 24, 1, 0, 0, tzinfo=timezone.utc)
+        late = {"claimLeft": True, "holder": {"closedUtc": s(0.800)}, "releaseCalls": [f"{s(0.000)} max=5", f"{s(0.750)} max=1"], "exit": 3,
+                "receipt": {"endReason": "DEADLINE"}, "receiptUtc": deadline + timedelta(seconds=8.0), "deadline": deadline}
+        clean = {"claimLeft": False, "holder": {"closedUtc": s(0.650)}, "releaseCalls": [f"{s(0.000)} max=5"], "exit": 3,
+                 "receipt": {"endReason": "DEADLINE"}, "receiptUtc": deadline + timedelta(seconds=1.0), "deadline": deadline}
+        self.assertAlmostEqual(self.deadline_receipt_bound_sec(680), 4.13, places=2)
+        with mock.patch.object(self, "late_grant_scenario", side_effect=[late, clean]):
+            r = self.observed_late_grant(650, slow_full_call_ms=680, prefix="B4")
+        self.assertIs(r, clean, "the fixture must have retried the inconclusive first run")
+        faults = self.g18_cell_faults(r, 680)
+        self.assertTrue(any("discarded run 1" in f and "DEADLINE receipt landed 8.00 s" in f for f in faults), f"a clean retry erased the first run's overdue DEADLINE receipt: {faults}")
 
     def test_r10_g14_an_unheld_late_grant_is_let_go_and_logged_so(self) -> None:
         # the other half of the behaviour: nobody holds the claim file, the release answers at once, the claim is gone and the line says "let go"
