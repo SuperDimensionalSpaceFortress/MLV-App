@@ -204,6 +204,29 @@ def chain_result(stdout: str) -> dict:
     return json.loads(lines[-1][len("CHAIN_RESULT="):])
 
 
+# CI-FLAKE-VENUE-CHAIN-STALLED-CACHE-BOUND-1: the two output lines of the stalled-cache-read test, checked by ONE helper that the real test and the forced-timing rows
+# share. Each line is `UNREACHABLE [] no answer in <X> s[ (the call's end cut the 5 s bound short)] inside=<n>`: X is the wait the module gave the read (what was left of
+# the 2 s bound on the call's clock) and n is the whole call's wall time floored to seconds.
+STALLED_READ_LINE_CAPPED = re.compile(r"UNREACHABLE \[\] no answer in ([0-9]+(?:\.[0-9]{1,2})?) s \(the call's end cut the 5 s bound short\) inside=(0|[1-9][0-9]{0,8})")
+STALLED_READ_LINE_PLAIN = re.compile(r"UNREACHABLE \[\] no answer in ([0-9]+(?:\.[0-9]{1,2})?) s inside=(0|[1-9][0-9]{0,8})")
+
+
+def stalled_read_line_problem(line: str, capped: bool) -> "str | None":
+    """None when the line is a bounded stall, else why not. capped: the -TimeoutSec 5 -CallCapSec 2 line (X in [1.0, 2.0)); plain: the -TimeoutSec 2 line (X in [1.0, 2.0])."""
+    m = (STALLED_READ_LINE_CAPPED if capped else STALLED_READ_LINE_PLAIN).fullmatch(line)
+    if m is None:
+        return f"not the {'capped' if capped else 'plain'} stalled-read line: {line!r}"
+    waited, inside = float(m.group(1)), int(m.group(2))
+    if not (1.0 <= waited and (waited < 2.0 if capped else waited <= 2.0)):
+        return f"the read waited {waited} s, outside its 2 s bound: {line!r}"
+    # inside is the whole call's wall time floored to seconds, and the wait X (what was left of the 2 s bound on the call's clock) is at most that call's time, so a call
+    # that returns under 2.000 s floors to 1 while X still prints 1.0-2.0 (r9: `no answer in 2 s inside=1`). The lower bound is therefore 1, not 2, whatever X is in
+    # its accepted range. The upper bound stays tight: 4 and up means the read outlived its 2 s bound by more than a second of slack (a 20 s stall prints inside=20).
+    if not 1 <= inside <= 3:
+        return f"inside={inside} is not within 1..3 for a read bounded at 2 s (waited {waited} s): {line!r}"
+    return None
+
+
 @requires_windows_pwsh
 class VenueFixtureModuleCopyTests(unittest.TestCase):
     """BACHELOR-THERMAL-GATE-WAIT-1 r14 (CI-B1): the scratch copies the mutation fixtures run must carry every sibling module VenueChain.psm1 imports."""
@@ -1714,17 +1737,18 @@ class VenueChainSupplementaryTests(unittest.TestCase):
             f"New-Item -ItemType Directory -Force -Path '{share}\\inbox','{share}\\outbox' | Out-Null; Set-Content -LiteralPath '{share}\\inbox\\dve-1.job.ps1' -Value x; st @('dve-1')\n"
             f"Set-Content -LiteralPath '{share}\\outbox\\dve-1.result.json' -Value '{{}}'; st @('dve-1'); st @('dve-1', 'dve-2')\n"
             f"Set-Content -LiteralPath '{share}\\outbox\\dve-2.result.json' -Value '{{}}'; st @('dve-1', 'dve-2')\n"
-            "$t0 = [DateTime]::UtcNow\n"
+            "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
             f"$r = Get-VenueStagedBuildManifest -AgentShare '{share}' -SourceCommit '{SHA}' -TimeoutSec 5 -CallCapSec 2 -ProbeScript {{ param($p) [Threading.Thread]::Sleep(20000); 'late' }}\n"
-            "$capped = \"$($r.state) [$($r.sha256)] $($r.error) inside=$([int][Math]::Floor(([DateTime]::UtcNow - $t0).TotalSeconds))\"\n"
-            "$t0 = [DateTime]::UtcNow\n"
+            "$capped = \"$($r.state) [$($r.sha256)] $($r.error) inside=$([int][Math]::Floor($sw.Elapsed.TotalSeconds))\"\n"
+            "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
             f"$r = Get-VenueStagedBuildManifest -AgentShare '{share}' -SourceCommit '{SHA}' -TimeoutSec 2 -ProbeScript {{ param($p) [Threading.Thread]::Sleep(20000); 'late' }}\n"
             "$capped\n"
-            "\"$($r.state) [$($r.sha256)] $($r.error) inside=$([int][Math]::Floor(([DateTime]::UtcNow - $t0).TotalSeconds))\"\n"
+            "\"$($r.state) [$($r.sha256)] $($r.error) inside=$([int][Math]::Floor($sw.Elapsed.TotalSeconds))\"\n"
             "Complete-VenueProcess -ExitCode 7\nexit 7\n", encoding="utf-8")
-        t0 = time.time()
+        # monotonic clocks on both sides (adversary A1 on 128b768e): a clock that steps back during a 13 s stall would shrink `inside` and `elapsed` together
+        t0 = time.monotonic()
         r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=90)
-        elapsed = time.time() - t0
+        elapsed = time.monotonic() - t0
         lines = r.stdout.splitlines()
         # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r13 (adversary A1 on 5fe750fa, Grok G20): the read is given what is left of the 2 s bound on the call's clock, and
         # the message reports that wait (and, when the call's end visibly cut it, says so)
@@ -1733,12 +1757,8 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         # r16 (Grok G22 on #814): the clause means "a cap cut the bound short", so it is printed only when the clamp came from something other than the bound itself.
         # -TimeoutSec 5 -CallCapSec 2: the cap set the read's end, so the clause names the 5 s bound it cut (EXACT form). Plain -TimeoutSec 2: the end is the bound's
         # own end, so a timeout is a plain timeout and carries NO clause (r14's pin required the clause here, on every timeout).
-        m = re.fullmatch(r"UNREACHABLE \[\] no answer in ([0-9]+(?:\.[0-9]{1,2})?) s \(the call's end cut the 5 s bound short\) inside=[23]", lines[-2] if len(lines) > 1 else "")
-        self.assertIsNotNone(m, r.stdout + r.stderr)
-        self.assertTrue(1.0 <= float(m.group(1)) < 2.0, r.stdout + r.stderr)
-        m = re.fullmatch(r"UNREACHABLE \[\] no answer in ([0-9]+(?:\.[0-9]{1,2})?) s inside=[23]", lines[-1] if lines else "")
-        self.assertIsNotNone(m, r.stdout + r.stderr)
-        self.assertTrue(1.0 <= float(m.group(1)) <= 2.0, r.stdout + r.stderr)
+        self.assertIsNone(stalled_read_line_problem(lines[-2] if len(lines) > 1 else "", capped=True), r.stdout + r.stderr)
+        self.assertIsNone(stalled_read_line_problem(lines[-1] if lines else "", capped=False), r.stdout + r.stderr)
         self.assertLess(elapsed, 16, f"a stalled read broke its bound: the whole process took {elapsed:.1f}s with two 20 s stuck reads, each bounded at 2 s")
         self.assertEqual(r.returncode, 7)
         self.assertEqual(lines[:-2], [
@@ -1751,6 +1771,77 @@ class VenueChainSupplementaryTests(unittest.TestCase):
             "NOT_FINISHED",                          # one of two results landed
             "FINISHED",                              # both
         ], r.stdout + r.stderr)
+
+    # CI-FLAKE-VENUE-CHAIN-STALLED-CACHE-BOUND-1: forced-timing rows for the line check above. The module hands the read what is left of the 2 s bound on the call's clock
+    # (VenueChain.psm1 Invoke-VenueBoundedRead: waitSec = EndSec - Clock.Elapsed), so a wait of 1.0-2.0 s is legal, and the whole call floors to inside=1 whenever it
+    # returns under 2.000 s (r9, `no answer in 2 s inside=1`: a wait of 1.995 s prints as 2 and the wall clock was a hair under 2.0). The old check pinned inside to 2 or 3,
+    # so it refused a wait it accepted in the other field. These rows feed the exact lines, with no timing involved.
+    @staticmethod
+    def _legacy_stalled_read_line_ok(line: str, capped: bool) -> bool:
+        """The check as it stood before this card (frozen, so the rows can show it refusing the failing shape)."""
+        pat = (r"UNREACHABLE \[\] no answer in ([0-9]+(?:\.[0-9]{1,2})?) s \(the call's end cut the 5 s bound short\) inside=[23]" if capped
+               else r"UNREACHABLE \[\] no answer in ([0-9]+(?:\.[0-9]{1,2})?) s inside=[23]")
+        m = re.fullmatch(pat, line)
+        return m is not None and 1.0 <= float(m.group(1)) and (float(m.group(1)) < 2.0 if capped else float(m.group(1)) <= 2.0)
+
+    def test_the_stalled_read_line_check_accepts_a_wait_under_two_seconds_that_floors_to_inside_1(self) -> None:
+        shapes = [
+            ("UNREACHABLE [] no answer in 1.6 s (the call's end cut the 5 s bound short) inside=1", True),
+            ("UNREACHABLE [] no answer in 1.6 s inside=1", False),
+            ("UNREACHABLE [] no answer in 2 s inside=1", False),   # the r9 line, verbatim
+            ("UNREACHABLE [] no answer in 1.99 s (the call's end cut the 5 s bound short) inside=1", True),
+            ("UNREACHABLE [] no answer in 1 s inside=1", False),
+        ]
+        for line, capped in shapes:
+            with self.subTest(line=line):
+                self.assertFalse(self._legacy_stalled_read_line_ok(line, capped), "the old check refused this shape (the defect)")
+                self.assertIsNone(stalled_read_line_problem(line, capped))
+
+    def test_the_stalled_read_line_check_keeps_accepting_the_usual_shapes(self) -> None:
+        for line, capped in [("UNREACHABLE [] no answer in 1.98 s (the call's end cut the 5 s bound short) inside=2", True), ("UNREACHABLE [] no answer in 2 s inside=2", False),
+                             ("UNREACHABLE [] no answer in 1.5 s inside=3", False), ("UNREACHABLE [] no answer in 1.5 s (the call's end cut the 5 s bound short) inside=3", True)]:
+            with self.subTest(line=line):
+                self.assertTrue(self._legacy_stalled_read_line_ok(line, capped))
+                self.assertIsNone(stalled_read_line_problem(line, capped))
+
+    def test_the_stalled_read_line_check_still_refuses_a_stall_the_bound_did_not_cut(self) -> None:
+        refused = [
+            ("UNREACHABLE [] no answer in 2 s inside=20", False),                                                     # a read that waited the full 20 s
+            ("UNREACHABLE [] no answer in 1.6 s (the call's end cut the 5 s bound short) inside=20", True),
+            ("UNREACHABLE [] no answer in 1.6 s inside=4", False),                                                    # the bound plus more than a second of slack
+            ("UNREACHABLE [] no answer in 1.6 s inside=0", False),                                                    # shorter than the wait it reports
+            ("UNREACHABLE [] no answer in 20 s inside=20", False),                                                    # the wait itself unbounded
+            ("UNREACHABLE [] no answer in 0.5 s inside=1", False),                                                    # waited under the 1 s floor
+            ("UNREACHABLE [] no answer in 2 s (the call's end cut the 5 s bound short) inside=2", True),              # a capped wait is under 2.0
+            ("UNREACHABLE [] no answer in 1.6 s inside=1", True),                                                     # the capped line must name the cut
+            ("UNREACHABLE [] no answer in 1.6 s (the call's end cut the 5 s bound short) inside=1", False),           # the plain line carries no clause
+            ("UNREACHABLE [] no answer in 1.6 s inside=", False),
+            ("", False),
+        ]
+        for line, capped in refused:
+            with self.subTest(line=line):
+                self.assertIsNotNone(stalled_read_line_problem(line, capped))
+
+    # Adversary A4/A5 on 128b768e: the whole-second field is pinned to the shape the fixture's Int32 emitter prints (no padding, bounded digits), and an out-of-shape field is
+    # REFUSED with a reason, never a ValueError out of int() (Python caps integer text at 4300 digits).
+    def test_the_stalled_read_line_check_refuses_an_out_of_shape_whole_second_field_with_a_reason(self) -> None:
+        for line, capped in [("UNREACHABLE [] no answer in 1.6 s inside=02", False),
+                             ("UNREACHABLE [] no answer in 1.6 s (the call's end cut the 5 s bound short) inside=02", True),
+                             ("UNREACHABLE [] no answer in 1.6 s inside=" + "9" * 4301, False),
+                             ("UNREACHABLE [] no answer in 1.6 s (the call's end cut the 5 s bound short) inside=" + "9" * 4301, True)]:
+            with self.subTest(line=line[:90]):
+                self.assertIsNotNone(stalled_read_line_problem(line, capped))
+
+    # Adversary A1 on 128b768e: both timers of the stalled-read test must be MONOTONIC. `inside` is read from a Stopwatch, and the python wall time from time.monotonic(),
+    # because a wall clock (DateTime.UtcNow, time.time()) that steps back during a stall shrinks both numbers, and with `inside=1` now legal a 13 s stall under an 11 s
+    # step-back would read inside=1 and elapsed < 16. The row reads the test's own source, since the clock step cannot be forced from outside the process.
+    def test_the_stalled_read_test_times_its_stalls_on_a_monotonic_clock(self) -> None:
+        import inspect
+        src = inspect.getsource(VenueChainSupplementaryTests.test_remote_job_ids_and_states_are_read_by_name_and_a_stalled_cache_read_keeps_its_bound)
+        for wall_clock in ("UtcNow", "Get-Date", "time.time()"):
+            self.assertNotIn(wall_clock, src, f"{wall_clock} is a wall clock: a step back during the stall hides it")
+        self.assertIn("[Diagnostics.Stopwatch]::StartNew()", src)
+        self.assertIn("time.monotonic()", src)
 
     # ---------------------------------------------------------------- mutations: the guards are what the scenarios rely on
     def test_mutation_opt_out_ignored_runs_ultra_magnus_anyway(self) -> None:
