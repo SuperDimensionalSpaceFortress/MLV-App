@@ -2376,8 +2376,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         }
         # adversary A5: ticket work (the creation, each heartbeat, a retake) is bounded to 5 s per call but is not inside the wait; when it carried the clock to -DeadlineUtc or past it, no claim request starts.
         if ([DateTime]::UtcNow -ge $deadline) {
-            Invoke-PendingClaimRelease 'deadline'   # TAIL-1 r6 B2 class sweep: a no-op unless the ticket names a claim of this batch's own (every typed stop with no claim held lets go of it first)
             $b.endReason = 'DEADLINE'; $b.endDetail = "lease-$($bw.reason.ToLowerInvariant())-wait: the wait and its ticket work ended at or after the deadline, so no claim was asked for"
+            Invoke-PendingClaimRelease 'deadline'   # TAIL-1 r6 B2 class sweep: a no-op unless the ticket names a claim of this batch's own (every typed stop with no claim held lets go of it before its line)
             Set-Stop 'DEADLINE' 3
             LogBest "BATCH_END batch=$batchNo token=$token reason=DEADLINE detail=$($b.endDetail)"
             $b.logWriteFailures = $script:logWriteFailures; Write-BatchReceipt $b
@@ -2421,9 +2421,10 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         $grantReadUtc = [DateTime]::UtcNow
         if (-not $req.granted) { if ($script:claimWait.denied -eq 0) { $script:claimWait.startUtc = $grantReadUtc }; $script:claimWait.denied++; $script:claimWait.endUtc = $null }
         elseif ($script:claimWait.denied -gt 0) { $script:claimWait.endUtc = $grantReadUtc }
-        # TAIL-1 r6 (adversary A2 on d714aae4): a QUEUED answer that names this batch's own claim (A13) with no poll left before the deadline is let go of NOW, before the guard and every batch.log line of this turn
-        # (a synchronous append that stalls there would hold it); the line it returns is written with the turn's ticket note, once the guard has vouched for batch.log. A no-op without a pending nonce.
-        if (-not $req.granted -and [DateTime]::UtcNow.AddSeconds($ClaimPollSec) -ge $deadline) {
+        # TAIL-1 r6 (adversary A2 on d714aae4, A1 on 462555c5): a QUEUED answer that names this batch's own claim (A13) is let go of NOW, whatever room is left, before the guard (which can take most of the room)
+        # and every batch.log line of this turn (a synchronous append that stalls there would hold it): that claim is owed to an older ready ticket, so nothing waits for a next poll. The line it returns is
+        # written with the turn's ticket note, once the guard has vouched for batch.log. A no-op without a pending nonce.
+        if (-not $req.granted) {
             $pendingReleaseLine = Invoke-PendingClaimRelease 'no-poll-left' -Deferred
             if ($pendingReleaseLine) { $ticketNote = $(if ($ticketNote) { "$ticketNote | " } else { '' }) + $pendingReleaseLine }
         }

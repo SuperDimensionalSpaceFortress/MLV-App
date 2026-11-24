@@ -3041,6 +3041,29 @@ $o | ConvertTo-Json -Compress
         self.assertLess(vanished - appeared, 15.0, f"the batch's own claim stood {vanished - appeared:.1f} s: a stalled batch.log line held its release:\n{out}")
         self.assertEqual(p.returncode, 3, out)
 
+    def test_tail1_r6_adv2_a1_the_batchs_own_pending_claim_is_let_go_at_once_even_when_a_poll_still_fits(self) -> None:
+        # r6 adversary pass 2 A1 (on 462555c5): the release after the request was gated on "no poll left", so with a poll that still fits (-ClaimPollSec 5, 45 s to the deadline) the guard and then a batch.log
+        # line that stalls 40 s held N until the next poll's own release. Expected: N gone within seconds of the claim being created, whatever room is left.
+        import time
+        runner = self.give_back_busy_runner("gbp-", log_stall_sec=40)
+        p = self.start_batch("QP", claim_poll=5, runner=runner, deadline_sec=45, SEAM_GIVE_BACK_BUSY="1")
+        t0 = time.monotonic(); appeared = vanished = None
+        while time.monotonic() - t0 < 120:
+            exists = self.claim_path.exists()
+            if exists and appeared is None:
+                appeared = time.monotonic()
+            if appeared is not None and not exists:
+                vanished = time.monotonic()
+                break
+            if p.poll() is not None and appeared is None:
+                break
+            time.sleep(0.05)
+        p.wait(timeout=180)
+        out = Path(p.out_path).read_text(encoding="utf-8", errors="replace")   # type: ignore[attr-defined]
+        self.assertIsNotNone(appeared, f"the batch never held the claim:\n{out}")
+        self.assertIsNotNone(vanished, f"the batch's own claim was never let go:\n{out}")
+        self.assertLess(vanished - appeared, 15.0, f"the batch's own claim stood {vanished - appeared:.1f} s with a poll still to come: a stalled batch.log line held its release:\n{out}")
+
     def test_tail1_r6_adv_a3_an_unanswered_late_release_call_turns_suppression_on_even_when_the_probe_released(self) -> None:
         # r6 adversary A3 (+ its sibling, OPEN pass 2 A3 of r5): a full release call that never answered (the claim share stalled) left the write suppression OFF when the final probe then answered RELEASED, so
         # the line after it probed batch.log on what may be that same share. Any unanswered call now turns it on. The full calls stall 25 s; the probe runs as it ships and releases the claim.
