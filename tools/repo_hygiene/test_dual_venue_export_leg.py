@@ -183,13 +183,15 @@ def verified_line(frames: int, dims: str, clip: str = "view-0") -> str:
             " container_probe=C:/venue/ffmpeg/bin/ffprobe.exe probe_source=ffprobe-json codec=prores container=mov sar=1:1 dar=4:3")
 
 
-def output_manifest(count: int, kind: str = "dng") -> str:
+def output_manifest(count: int, kind: str = "dng", clip: str = "view-0") -> str:
     # r19 (sol r18 B3): the endpoint records carry their byte size, as export-stage-job.ps1 writes them, and agree with totalBytes (one file: first and last are that file)
     # (EXPORT-RENDER-PIPE-TIMING-1 r5, sol r4 B3 forced companion: a .mov manifest names the file the fixtures' RENDER_START out=view-0.mov declares, as export-stage-job.ps1
     # lists the leaf of the one .mov it found; the reader now binds the two)
-    one = "view-0.mov" if kind == "mov" else "a"
+    # (EXPORT-RENDER-PIPE-TIMING-3 r1 forced companion: a .dng manifest names the frames of the clip DONE names, <clip>_<frame6>.dng, as CdngSequenceExport.cpp:269-271
+    # writes them, since DONE's clip is now bound to that witness)
+    one = f"{clip}.mov" if kind == "mov" else f"{clip}_000000.dng"
     first = {"name": one, "bytes": 1000, "sha256": "1" * 64} if count > 0 else None
-    last = ({"name": one, "bytes": 1000, "sha256": "1" * 64} if count == 1 else {"name": "b", "bytes": 1000, "sha256": "2" * 64}) if count > 0 else None
+    last = ({"name": one, "bytes": 1000, "sha256": "1" * 64} if count == 1 else {"name": f"{clip}_{count - 1:06d}.dng", "bytes": 1000, "sha256": "2" * 64}) if count > 0 else None
     return json.dumps({"schema": "export-stage-output-manifest.v1", "kind": kind, "count": count, "totalBytes": count * 1000,
                        "first": first, "last": last, "deleted": True})
 
@@ -212,7 +214,7 @@ def evidence_cases(cases: list[dict]):
 
 def cdng_case(**over) -> dict:
     c = {"format": "cdng-lossless", "maxFrames": 30, "dualIsoExpected": True, "buildId": BUILD_ID, "profile": cdng_profile(30), "stage": None,
-         "batch": batch_log(30), "manifest": output_manifest(30), "token": "EXPORT_CAPTURED", "exit": 0,
+         "batch": batch_log(30), "manifest": output_manifest(30, clip="view-0"), "token": "EXPORT_CAPTURED", "exit": 0,
          "criteria": [{"metric": "framesExported", "op": "eq", "value": 30}, {"metric": "exportFramesFailed", "op": "eq", "value": 0},
                       {"metric": "profileFramesSucceeded", "op": "eq", "value": 30}, {"metric": "dualIsoClassAgrees", "op": "eq", "value": True}]}
     c.update(over)
@@ -744,8 +746,8 @@ class ExportEvidenceTests(unittest.TestCase):
         def manifest(count: int, kind: str, total: int, first, last) -> str:
             return json.dumps({"schema": "export-stage-output-manifest.v1", "kind": kind, "count": count, "totalBytes": total, "first": first, "last": last, "deleted": True})
         one = {"name": "view-0.mov", "bytes": 1000, "sha256": "1" * 64}
-        a = {"name": "000000.dng", "bytes": 1000, "sha256": "1" * 64}
-        b = {"name": "000029.dng", "bytes": 1000, "sha256": "2" * 64}
+        a = {"name": "view-0_000000.dng", "bytes": 1000, "sha256": "1" * 64}   # (TIMING-3 r1 forced companion: the DONE clip's frame leaves)
+        b = {"name": "view-0_000029.dng", "bytes": 1000, "sha256": "2" * 64}
         cases = [prores_case(manifest=manifest(1, "mov", 1, one, one)),                                             # 0 sol repro: MOV total 1, a 1000-byte file
                  cdng_case(manifest=manifest(30, "dng", 1, a, b)),                                                  # 1 sol repro: DNG total 1, two 1000-byte endpoints
                  prores_case(manifest=manifest(1, "mov", 1000, one, {**one, "name": "other.mov"})),                 # 2 one file, two names
@@ -775,7 +777,7 @@ class ExportEvidenceTests(unittest.TestCase):
         into a double, whose rounding read the sum as within totalBytes 9223372036854775807, so a manifest whose endpoints use the whole total read PASS. The sums are exact now."""
         top = 9223372036854775807
         doc = {"schema": "export-stage-output-manifest.v1", "kind": "dng", "count": 30, "totalBytes": top, "deleted": True,
-               "first": {"name": "000000.dng", "bytes": top - 1, "sha256": "1" * 64}, "last": {"name": "000029.dng", "bytes": 1, "sha256": "2" * 64}}
+               "first": {"name": "view-0_000000.dng", "bytes": top - 1, "sha256": "1" * 64}, "last": {"name": "view-0_000029.dng", "bytes": 1, "sha256": "2" * 64}}
         proc, got = evidence_cases([cdng_case(manifest=json.dumps(doc))])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         self.assertEqual(got[0]["outcome"], "INVALID", got[0])
@@ -2319,12 +2321,15 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
             row("F6", (OM, RV, None), v=V0.replace(" probe_source=", "\u2028probe_source=")),
             row("F7", "PASS", c="my clip"),
             row("F8", "PASS", joiner="\r\n"),
-            row("F9", "PASS", v=V(probe="C:/kit dimensions=1280x720 decoded_frames=30 bytes=0/ffprobe.exe")),
-            row("F10", "PASS", v=V(probe="C:/a probe_source=none codec=h264 container=mp4 sar=2:1 dar=1:1")),
+            # (EXPORT-RENDER-PIPE-TIMING-3 r1, rule G2, sol r4 B3 / key3 r4 H2: reversal of the r2 design. A space-delimited component of the verbatim probe path that reads
+            # as a field of its line in that field's shape is that field named again, so the line is refused fail-closed; field-like text NOT of the field's shape stays clean)
+            row("F9", (OM, RV, "container_probe="), v=V(probe="C:/kit dimensions=1280x720 decoded_frames=30 bytes=0/ffprobe.exe")),
+            row("F10", (OM, RV, "container_probe="), v=V(probe="C:/a probe_source=none codec=h264 container=mp4 sar=2:1 dar=1:1")),
             row("F11", (OM, RS, "out="), s=S0 + " codec=h264"),
             row("F12", (BU, DN, "exported="), d=D0 + " exported=1"),
             # (r4, sol r3 B4 forced companion: the repeated triplet is now refused by DONE's own grammar, before the clip is bound to RENDER_VERIFIED's)
-            row("F13", (BU, DN, "exported="), d="[BATCH] DONE view-0 exported=30 skipped=0 elapsed=1.0 exported=1 skipped=0 elapsed=1.0"),
+            # (TIMING-3 r1, rule G1: DONE's clip is positional, never field-parsed, and is BOUND to the ProRes witness: RENDER_VERIFIED's ordinal prefix refuses it)
+            row("F13", (OM, RV, "view-0 exported=30 skipped=0 elapsed=1.0"), d="[BATCH] DONE view-0 exported=30 skipped=0 elapsed=1.0 exported=1 skipped=0 elapsed=1.0"),
             row("F14", (PA, RS, "out="), s=S0.replace(" out=", " output=1280x720 out=")),
         ]
 
@@ -2385,7 +2390,8 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         """sol r3 B1 (repro verbatim): on an otherwise clean emitting one-frame export, dimensions=1280x720 after container_probe=unavailable and before
         probe_source=none read PASS, renderPipeTimed=true, problems=[]; a repeated probe_source and an extra separator at that boundary passed too. 'unavailable' is the
         producer's fixed sentinel and is printed only with probe_source=none and four 'unchecked' facts, so the sentinel binds its trailer both ways. Controls: the
-        producer's own no-probe line, and a parsed probe's verbatim path holding field-like text (F9 / F10 above), stay clean."""
+        producer's own no-probe line stays clean. (TIMING-3 r1: F9 / F10 above are no longer controls: by rule G2 a probe path component that reads as a
+        field of the line in its shape is that field named again, INVALID; `container_probe=C:/kit dimensions=archive/ffprobe.exe` is the clean control now.)"""
         rows = [("NP-OK", self.t4_no_probe(), "PASS"),
                 ("B1", self.t4_no_probe(" dimensions=1280x720"), "INVALID"),
                 ("B1-PS-REPEAT", self.t4_no_probe(" probe_source=none"), "INVALID"),
@@ -2415,21 +2421,25 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
                 ("B4", cdng_case(batch=two), "INVALID", "elapsed="),
                 ("B4-ELAPSED", cdng_case(batch="[BATCH] DONE view-0 elapsed=40.0 exported=30 skipped=0 elapsed=20.0\n"), "INVALID", "elapsed="),
                 ("B4-SKIPPED", cdng_case(batch="[BATCH] DONE view-0 skipped=1 exported=30 skipped=0 elapsed=20.0\n"), "INVALID", "skipped="),
+                # (TIMING-3 r1, rule G1: the ProRes route refuses it by its witness, RENDER_START / RENDER_VERIFIED's ordinal prefix, naming DONE's clip text)
                 ("B4-PRORES", self.t2_case(self.t2_start(), [self.t2_verified()], "[BATCH] DONE view-0 exported=1 skipped=0 elapsed=1.0 exported=1 skipped=0 elapsed=1.0"),
-                 "INVALID", "elapsed="),
+                 "INVALID-PRORES", "view-0 exported=1 skipped=0 elapsed=1.0"),
                 # (r4 adversary pass 2 A1 on 2d8e9bf2, input verbatim: an extra separator before the second triplet left an empty last token and bypassed the check)
                 ("A1-SEPARATOR", cdng_case(batch="[BATCH] DONE owner-clip exported=29 skipped=1 elapsed=40.0  exported=30 skipped=0 elapsed=20.0\n"), "INVALID", "elapsed="),
                 # (r4 adversary pass 3 A1 on 68f078d6, input shape verbatim on the 30-frame fixture: a triplet buried in the clip, followed by more clip text)
                 ("A1P3-BURIED", cdng_case(batch="[BATCH] DONE view-0 exported=29 skipped=1 elapsed=40.0 x exported=30 skipped=0 elapsed=20.0\n"), "INVALID", "elapsed="),
                 ("A1P3-LEADING", cdng_case(batch="[BATCH] DONE exported=29 x exported=30 skipped=0 elapsed=20.0\n"), "INVALID", "exported="),
-                ("CDNG-CLIP-SPACE", cdng_case(batch="[BATCH] DONE my clip exported=30 skipped=0 elapsed=20.0\n"), "PASS", None),
-                ("CDNG-CLIP-KEY", cdng_case(batch="[BATCH] DONE elapsed=1.0 exported=30 skipped=0 elapsed=20.0\n"), "PASS", None)]
+                ("CDNG-CLIP-SPACE", cdng_case(batch="[BATCH] DONE my clip exported=30 skipped=0 elapsed=20.0\n", manifest=output_manifest(30, clip="my clip")), "PASS", None),
+                ("CDNG-CLIP-KEY", cdng_case(batch="[BATCH] DONE elapsed=1.0 exported=30 skipped=0 elapsed=20.0\n", manifest=output_manifest(30, clip="elapsed=1.0")), "PASS", None)]
         proc, got = evidence_cases([c for _, c, _, _ in rows])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         for (label, _, expect, key), g in zip(rows, got):
             with self.subTest(row=label):
                 if expect == "PASS":
                     self.assertEqual((g["problems"], g["outcome"]), ([], "PASS"), g)
+                elif expect == "INVALID-PRORES":
+                    self.assertEqual(g["outcome"], "INVALID", g)
+                    self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and ("RENDER_START" in p or "RENDER_VERIFIED" in p) and key in p for p in g["problems"]), g)
                 else:
                     self.assertEqual(g["outcome"], "INVALID", g)
                     self.assertTrue(any(p.startswith("EXPORT_BATCH_LOG_UNREADABLE") and "DONE" in p and key in p for p in g["problems"]), g)
@@ -2469,6 +2479,91 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
                 else:
                     self.assertEqual(g["outcome"], "INVALID", g)
                     self.assertTrue(any("RENDER_START" in p and p.split(":")[0] in ("EXPORT_PROFILE_ABSENT", "EXPORT_OUTPUT_MISMATCH", "EXPORT_STAGE_WINDOW_MISMATCH") for p in g["problems"]), g)
+
+    # --- EXPORT-RENDER-PIPE-TIMING-3 r1 (sol r4 on 14a9b47b, B1-B3, H-ISO; key3 r4 H1 / H2): rule G. G1 DONE's clip is positional, never field-parsed, and bound to a
+    # witness per format (ProRes: RENDER_START / RENDER_VERIFIED's ordinal prefix; CDNG: each DNG leaf the manifest names is <clip>_<frame>.dng). G2 every field key
+    # at most once per line: a space-delimited token of a verbatim path slot (out= / container_probe=) that reads as a field of its line in its shape is that field
+    # named again. G3 the no-probe sentinel rule is unchanged.
+    T3_CLIP = "take elapsed=1.0"
+
+    @classmethod
+    def t3_prores(cls, clip: str = "view-0", start: str | None = None, verified: str | None = None, done: str | None = None, leaf: str | None = None) -> dict:
+        s = cls.t2_start(clip).replace("out=view-0.mov", f"out={clip}.mov") if start is None else start
+        c = cls.t2_case(s, [cls.t2_verified(clip) if verified is None else verified], cls.t2_done(clip) if done is None else done)
+        c["manifest"] = output_manifest(1, "mov", clip=clip if leaf is None else leaf[:-4])
+        return c
+
+    def t3_check(self, rows: list) -> None:
+        """rows: (label, case, expect) where expect is 'PASS' or (code prefix, [needles...])."""
+        proc, got = evidence_cases([c for _, c, _ in rows])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for (label, _, expect), g in zip(rows, got):
+            with self.subTest(row=label):
+                if expect == "PASS":
+                    self.assertEqual((g["problems"], g["outcome"]), ([], "PASS"), g)
+                else:
+                    code, needles = expect
+                    self.assertEqual(g["outcome"], "INVALID", g)
+                    self.assertTrue(any(p.startswith(code) and all(n in p for n in needles) for p in g["problems"]), g)
+
+    def test_t3_r1_b1_a_clip_holding_field_text_is_the_clip_bound_to_its_witness(self) -> None:
+        """sol r4 B1 (repro verbatim): the batch runner writes the clip as completeBaseName (BatchRunner.cpp:324), so `take elapsed=1.0.MLV` writes DONE take
+        elapsed=1.0 exported=30 skipped=0 elapsed=20.0; the r4 clip-token scan read it INVALID. The clip is positional and bound (G1). CDNG-WITNESS: a DONE of
+        another clip than the manifest's leaves is refused by the CDNG witness (CdngSequenceExport.cpp:269-280). key3 r4 H1 rows are closed by the class."""
+        BU = "EXPORT_BATCH_LOG_UNREADABLE"
+        c = self.T3_CLIP
+        done = lambda clip: f"[BATCH] DONE {clip} exported=30 skipped=0 elapsed=20.0\n"
+        self.t3_check([
+            ("B1-PRORES", self.t3_prores(c), "PASS"),
+            ("B1-CDNG", cdng_case(batch=done(c), manifest=output_manifest(30, clip=c)), "PASS"),
+            ("CDNG-WITNESS", cdng_case(batch=done("view-0"), manifest=output_manifest(30, clip="other-clip")),
+             (BU, ["DONE names the clip 'view-0'", "'other-clip_000000.dng'", "CdngSequenceExport.cpp:269-280"])),
+            ("CDNG-WITNESS-DATED", cdng_case(batch=done("view-0"), manifest=json.dumps({**json.loads(output_manifest(30)), "first": {"name": "view-0_1_2026-11-24_0001_C0000_000000.dng", "bytes": 1000, "sha256": "1" * 64}, "last": {"name": "view-0_1_2026-11-24_0001_C0000_000029.dng", "bytes": 1000, "sha256": "2" * 64}})), "PASS"),
+            ("CDNG-WITNESS-PREFIX", cdng_case(batch=done("view"), manifest=output_manifest(30, clip="view-0")), (BU, ["DONE names the clip 'view'"])),
+            ("KEY3-H1-DOUBLE-SPACE", cdng_case(batch="[BATCH] DONE  exported=29 exported=30 skipped=0 elapsed=20.0\n"), (BU, ["DONE"])),
+            ("KEY3-H1-SHAPE", cdng_case(batch="[BATCH] DONE view-0 exported=29x exported=30 skipped=0 elapsed=20.0\n"), (BU, ["DONE", "view-0 exported=29x"])),
+            ("CTL-TAKE-ONE", cdng_case(batch=done("take one"), manifest=output_manifest(30, clip="take one")), "PASS"),
+            ("CTL-ONE-TOKEN", cdng_case(batch=done("elapsed=1.0"), manifest=output_manifest(30, clip="elapsed=1.0")), "PASS"),
+            ("CTL-PRORES-TAKE-ONE", self.t3_prores("take one"), "PASS"),
+            ("CTL-R3-B4", cdng_case(batch="[BATCH] DONE view-0 exported=29 skipped=1 elapsed=40.0 exported=30 skipped=0 elapsed=20.0\n"), (BU, ["DONE", "elapsed="])),
+        ])
+
+    def test_t3_r1_b2_b3_a_verbatim_path_slot_holding_a_field_named_again_is_invalid(self) -> None:
+        """sol r4 B2 / B3 (repro verbatim) and key3 r4 H2: `out=C:/a.mov out=D:/out/view-0.mov` read PASS (the manifest binds the last leaf), and so did
+        `container_probe=C:/kit/ffprobe.exe container_probe=D:/alt/ffprobe.exe`, a `dimensions=1280x720` or a `codec=h264` before probe_source=, and a repeated
+        probe_source=ffprobe-json. G2: every field key at most once per line. Controls: `out=C:/my exports/view-0.mov` and `container_probe=C:/kit
+        dimensions=archive/ffprobe.exe` (field-like text not of the field's shape)."""
+        OM, PA = "EXPORT_OUTPUT_MISMATCH", "EXPORT_PROFILE_ABSENT"
+        V = self.t2_verified
+        two_out = self.t2_start().replace("out=view-0.mov", "out=C:/a.mov out=D:/out/view-0.mov")
+        rows = [
+            ("B2-EMITTING", self.t3_prores(start=two_out), (PA, ["RENDER_START", "out=", "'out=D:/out/view-0.mov'"])),
+            ("B3-PROBE", self.t3_prores(verified=V(probe="C:/kit/ffprobe.exe container_probe=D:/alt/ffprobe.exe")), (OM, ["RENDER_VERIFIED", "container_probe="])),
+            ("B3-DIMENSIONS", self.t3_prores(verified=V(probe="C:/kit/ffprobe.exe dimensions=1280x720")), (OM, ["RENDER_VERIFIED", "container_probe=", "dimensions="])),
+            ("B3-CODEC", self.t3_prores(verified=V(probe="C:/kit/ffprobe.exe codec=h264")), (OM, ["RENDER_VERIFIED", "container_probe=", "codec="])),
+            ("KEY3-H2-PROBE-SOURCE", self.t3_prores(verified=self.t2_head() + " dimensions=1920x1440 bytes=9 container_probe=C:/kit/ffprobe.exe probe_source=ffprobe-json"
+                                                   " probe_source=ffprobe-json codec=prores container=mov sar=1:1 dar=4:3"),
+             (OM, ["RENDER_VERIFIED", "container_probe=", "probe_source="])),
+            ("CTL-OUT-SPACE", self.t3_prores(start=self.t2_start().replace("out=view-0.mov", "out=C:/my exports/view-0.mov")), "PASS"),
+            ("CTL-PROBE-DIR", self.t3_prores(verified=V(probe="C:/kit dimensions=archive/ffprobe.exe")), "PASS"),
+            ("CTL-NO-PROBE", self.t3_prores(verified=self.t4_no_probe()), "PASS"),
+        ]
+        import subprocess
+        base = "2b79619832444c0a63a8573d04f6cd02a4a113dc"
+        if subprocess.run(["git", "-C", str(ROOT), "cat-file", "-t", base], capture_output=True, text=True).stdout.strip() == "commit":
+            rows.append(("B2-OLDER", self.ctl(stage_log(480), buildId=base, batch=self.ctl_batch(start=self.CTL_START.replace("out=view-0.mov", "out=C:/a.mov out=D:/out/view-0.mov"))),
+                         (PA, ["RENDER_START", "out="])))
+        self.t3_check(rows)
+
+    def test_t3_r1_h_iso_a_line_separator_inside_a_value_is_refused_by_the_character_rule(self) -> None:
+        """sol r4 hardening EXPORT-BATCH-LINE-FORBIDDEN-CLASS-ISOLATING-ROW-1 (PIN): U+2028, U+2029 and U+0085, written as escapes, placed INSIDE the probe path, the
+        out= path and the clip (not on a boundary the positional grammar refuses on its own) are refused by the control-character rule, which names itself."""
+        rows = []
+        for name, ch in (("U+2028", "\u2028"), ("U+2029", "\u2029"), ("U+0085", "\u0085")):
+            rows += [(f"{name}-PROBE", self.t3_prores(verified=self.t2_verified(probe=f"C:/kit{ch}/ffprobe.exe")), ("EXPORT_OUTPUT_MISMATCH", ["control or line-separator character"])),
+                     (f"{name}-OUT", self.t3_prores(start=self.t2_start().replace("out=view-0.mov", f"out=C:/out{ch}/view-0.mov")), ("EXPORT_PROFILE_ABSENT", ["control or line-separator character"])),
+                     (f"{name}-CLIP", self.t3_prores(clip=f"view{ch}-0"), ("EXPORT_BATCH_LOG_UNREADABLE", ["control or line-separator character"]))]
+        self.t3_check(rows)
 
 
 EXPORT_STUB_GENERATOR = r"""
@@ -3292,7 +3387,7 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
         hashed manifest is swapped for one with the SAME count and totalBytes (so the metrics still match) but endpoints that cannot fit inside that total does not verify."""
         spec = self.export_spec(maxframes=30)
         bad = json.dumps({"schema": "export-stage-output-manifest.v1", "kind": "dng", "count": 30, "totalBytes": 1,
-                          "first": {"name": "000000.dng", "bytes": 1000, "sha256": "1" * 64}, "last": {"name": "000029.dng", "bytes": 1000, "sha256": "2" * 64}, "deleted": True})
+                          "first": {"name": "view-0_000000.dng", "bytes": 1000, "sha256": "1" * 64}, "last": {"name": "view-0_000029.dng", "bytes": 1000, "sha256": "2" * 64}, "deleted": True})
         self.write_export_artifacts(30, manifest=bad)
         proc, receipt, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
         self.assertIsNotNone(receipt, proc.stdout[-3000:] + proc.stderr[-3000:])
@@ -3729,6 +3824,83 @@ ConvertTo-Json -InputObject $out -Compress -Depth 4
             line = next(l for l in module.splitlines() if l.startswith(var))
             self.assertIn(line, described["grammar"], var)
         self.assertNotIn("[regex]::Matches($logText", described["template"], "the job classifies the batch log by the module's grammar alone")
+
+    def run_job_slice(self, rows: list) -> list:
+        """rows: (label, fmt, frames, lines, leaves). Runs the emitted job's classification slice over each (T4 harness) and returns its result dicts."""
+        with tempfile.TemporaryDirectory() as d:
+            cases = []
+            for i, (label, fmt, frames, lines, leaves) in enumerate(rows):
+                work = Path(d) / f"w{i}"
+                (work / "out").mkdir(parents=True)
+                (work / "batch.log").write_text("[BATCH] Start\n" + "\n".join(lines) + "\n", encoding="utf-8", newline="")
+                if fmt == "prores":
+                    (work / "stage-timing.log").write_text(piped_stage_log(1, scale_ms=6.0), encoding="utf-8")
+                else:
+                    (work / "export-profile.json").write_text(cdng_profile(frames), encoding="utf-8")
+                for leaf in leaves:
+                    (work / "out" / leaf).write_bytes(b"\0" * 9)
+                cases.append({"work": str(work), "format": fmt, "maxFrames": frames})
+            (Path(d) / "cases.json").write_text(json.dumps(cases), encoding="utf-8")
+            harness = Path(d) / "harness.ps1"
+            harness.write_text(self.T4_JOB_HARNESS, encoding="utf-8")
+            proc = run_pwsh(["-File", str(harness)], env_extra={"DVE_JOB": str(EXPORT_JOB), "DVE_CASES": str(Path(d) / "cases.json")})
+        self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
+        return json.loads(proc.stdout)
+
+    @classmethod
+    def t3_parity_rows(cls) -> list:
+        """(label, fmt, frames, batch lines, output leaves, central outcome, job result) for EXPORT-RENDER-PIPE-TIMING-3 r1's one verdict (sol r4 B4)."""
+        S, V = cls.t4_start(), cls.t4_verified()
+        D = "[BATCH] DONE view-0 exported=1 skipped=0 elapsed=1.0"
+        tk = "take elapsed=1.0"
+        mov = ["view-0.mov"]
+        dng = lambda clip: [f"{clip}_{k:06d}.dng" for k in range(30)]
+        cd = lambda clip: f"[BATCH] DONE {clip} exported=30 skipped=0 elapsed=20.0"
+        OM = "EXPORT_OUTPUT_MISMATCH"
+        trailer = " probe_source=ffprobe-json codec=prores container=mov sar=1:1 dar=4:3"
+        vhead = "[BATCH] RENDER_VERIFIED view-0 decoded_frames=1 decoded_duration=0.042 decoded_frame_bytes=1 dimensions=1920x1440 bytes=9 container_probe="
+        return [
+            ("PRORES-OK", "prores", 1, [S, V, D], mov, "PASS", "EXPORT_CAPTURED"),
+            ("B1-BACHELOR", "prores", 1, [S.replace("RENDER_START view-0 ", f"RENDER_START {tk} ").replace("out=view-0.mov", f"out={tk}.mov"),
+                                         V.replace("RENDER_VERIFIED view-0 ", f"RENDER_VERIFIED {tk} "), D.replace("DONE view-0 ", f"DONE {tk} ")], [f"{tk}.mov"], "PASS", "EXPORT_CAPTURED"),
+            ("B2", "prores", 1, [S.replace("out=view-0.mov", "out=C:/a.mov out=D:/out/view-0.mov"), V, D], mov, "INVALID", OM),
+            ("B3-PROBE", "prores", 1, [S, f"{vhead}C:/kit/ffprobe.exe container_probe=D:/alt/ffprobe.exe{trailer}", D], mov, "INVALID", OM),
+            ("B3-DIMENSIONS", "prores", 1, [S, f"{vhead}C:/kit/ffprobe.exe dimensions=1280x720{trailer}", D], mov, "INVALID", OM),
+            ("B3-CODEC", "prores", 1, [S, f"{vhead}C:/kit/ffprobe.exe codec=h264{trailer}", D], mov, "INVALID", OM),
+            ("B4", "prores", 1, [S.replace("output=1920x1440", "output=1920x1440 output=1280x720"), V, D], mov, "INVALID", OM),
+            ("B4-CODEC", "prores", 1, [S.replace("codec=prores", "codec=h264"), V, D], mov, "INVALID", OM),
+            ("B4-OUT", "prores", 1, [S.replace("out=view-0.mov", "out=foreign.mov"), V, D], mov, "INVALID", OM),
+            ("KEY3-H2", "prores", 1, [S, f"{vhead}C:/kit/ffprobe.exe probe_source=ffprobe-json probe_source=ffprobe-json codec=prores container=mov sar=1:1 dar=4:3", D], mov, "INVALID", OM),
+            ("CDNG-OK", "cdng-lossless", 30, [cd("view-0")], dng("view-0"), "PASS", "EXPORT_CAPTURED"),
+            ("B1-CDNG", "cdng-lossless", 30, [cd(tk)], dng(tk), "PASS", "EXPORT_CAPTURED"),
+            ("CDNG-TWO-TRIPLETS", "cdng-lossless", 30, ["[BATCH] DONE view-0 exported=29 skipped=1 elapsed=40.0 exported=30 skipped=0 elapsed=20.0"], dng("view-0"), "INVALID", OM),
+            ("CDNG-WITNESS", "cdng-lossless", 30, [cd("view-0")], dng("other-clip"), "INVALID", OM),
+            ("KEY3-H1-DOUBLE-SPACE", "cdng-lossless", 30, ["[BATCH] DONE  exported=29 exported=30 skipped=0 elapsed=20.0"], dng("view-0"), "INVALID", OM),
+            ("KEY3-H1-SHAPE", "cdng-lossless", 30, ["[BATCH] DONE view-0 exported=29x exported=30 skipped=0 elapsed=20.0"], dng("view-0"), "INVALID", OM),
+        ]
+
+    def test_t3_r1_b4_one_verdict_the_job_and_the_central_reader_agree_on_every_row(self) -> None:
+        """sol r4 B4 (repro verbatim): with matching DONE / RENDER_VERIFIED counts, one .mov, a stage log and exit 0, a RENDER_START with adjacent
+        output=1920x1440 output=1280x720 read INVALID centrally but EXPORT_CAPTURED (exit 0) at Bachelor: the job consumed only DONE and RENDER_VERIFIED. ONE verdict
+        now: the job calls the module's Get-DvBatchExportBindingProblems (embedded verbatim) as the central reader does, so on every row (central outcome == PASS)
+        == (job result == EXPORT_CAPTURED). Siblings: RENDER_START codec=h264 and out=foreign.mov, sol r4 B1-B3, the CDNG witness, key3 r4 H1 / H2."""
+        rows = self.t3_parity_rows()
+        got = self.run_job_slice([(l, f, n, ls, lv) for l, f, n, ls, lv, _, _ in rows])
+        central_cases = []
+        for _, fmt, n, lines, leaves, _, _ in rows:
+            batch = "[BATCH] Start\n" + "\n".join(lines) + "\n"
+            if fmt == "prores":
+                central_cases.append(prores_case(maxFrames=1, dualIsoExpected=True, stage=piped_stage_log(1, scale_ms=6.0), batch=batch, criteria=[],
+                                                 manifest=output_manifest(1, "mov", clip=leaves[0][:-4])))
+            else:
+                central_cases.append(cdng_case(batch=batch, manifest=output_manifest(30, clip=leaves[0][:-len("_000000.dng")])))
+        proc, central = evidence_cases(central_cases)
+        self.assertIsNotNone(central, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for (label, _, _, _, _, want_central, want_job), g, c in zip(rows, got, central):
+            with self.subTest(row=label):
+                self.assertEqual(c["outcome"], want_central, c)
+                self.assertEqual(g["result"], want_job, g)
+                self.assertEqual(c["outcome"] == "PASS", g["result"] == "EXPORT_CAPTURED", (c, g))
 
     @staticmethod
     def t4_start() -> str:
