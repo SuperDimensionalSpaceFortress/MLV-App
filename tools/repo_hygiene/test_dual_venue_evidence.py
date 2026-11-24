@@ -7530,10 +7530,11 @@ exit 0
 
     def test_planned_hash_bind_b2_r1_h4_a_late_self_exit_is_reported_as_late_not_as_killed(self) -> None:
         pause = "    if ($env:DVT_PREWAIT_PAUSE_MS) { Start-Sleep -Milliseconds ([int]$env:DVT_PREWAIT_PAUSE_MS) }   # TEST FIXTURE: the parent reaches the wait late\n"
-        dv = self.mutated_runner([("VenueChain.psm1", self.BP_WAIT_ANCHOR, pause + self.BP_WAIT_ANCHOR)])
+        # (b2 r2: the pause sits before the wait's first derivation; the wait is now sliced, so the old one-shot wait line is no anchor)
+        dv = self.mutated_runner([("VenueChain.psm1", self.BP_WAITMS_ANCHOR, pause + self.BP_WAITMS_ANCHOR)])
         got = run_pwsh(["-Command", f"Import-Module '{dv / 'VenueChain.psm1'}' -Force -DisableNameChecking; "
                         f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep -Milliseconds 2000; exit 0') -TimeoutSec 1 -CleanupWaitMs 2000; "
-                        "\"H4 $($r.timedOut) $($r.lateExit) [$($r.killAttempted)] [$($r.killErrored)] $($r.killConfirmed)\""], env_extra={"DVT_PREWAIT_PAUSE_MS": "6000"}, timeout=120)
+                        "\"H4$($r.timedOut) $($r.lateExit) [$($r.killAttempted)] [$($r.killErrored)] $($r.killConfirmed)\""], env_extra={"DVT_PREWAIT_PAUSE_MS": "6000"}, timeout=120)
         line = [l for l in got.stdout.splitlines() if l.startswith("H4 ")]
         self.assertEqual(line, ["H4 True True [False] [False] True"], "a child that exited on its own after its bound was not told apart from a killed one (old: no killAttempted)\n" + got.stdout + got.stderr)
         body = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
@@ -7634,6 +7635,182 @@ exit 0
                         "catch { 'V1N refused ' + ($_.Exception.Message -replace '\\s+', ' ') }"], timeout=120)
         self.assertIn("its file could not be identified", got.stdout, "an empty key (off Windows) still reaches the caller's own refusal\n" + got.stdout + got.stderr)
         self.assertNotIn("no usable file identity", got.stdout, got.stdout)
+
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r2 (adversary pass 3 on 372d1bfd): A1 the bounded wait was computed once, so a pause right before WaitForExit ran a stale wait past
+    # -DeadlineUtc and past the relative bound; A2 a backward wall-clock step, or an exit time that will not read, made a child the parent observed past its bound read as timely;
+    # A14 a late self-exit skipped the tree and confirmed the kill from the root alone; A3 each bounded preflight read waited on an allowance sampled before a pause; A4 the
+    # chain log's synchronous append held the NOT_RUN DEADLINE path before the claim release and CHAIN_RESULT; A6 the batch transcript worker wrote through a name created after
+    # the post-child guard; A7 Complete-VenueProcess flushed a stderr writer another thread held. Each pause, clock step or stall is injected by a mutated copy at an anchor the
+    # old and the new text share (no host-speed reliance; every elapsed bound keeps at least 1 s of margin on both sides).
+    BP_WAITCALL_ANCHOR = "-not $p.WaitForExit("
+    BP_WAITMS_ANCHOR = "    $waitMs = [double]$TimeoutSec * 1000.0\n"
+
+    def test_planned_hash_bind_b2_r2_a1_a_pause_right_before_the_wait_never_runs_a_stale_wait_past_either_bound(self) -> None:
+        once = "-not $(if ($env:DVT_A1_PAUSE_MS) { Start-Sleep -Milliseconds ([int]$env:DVT_A1_PAUSE_MS); $env:DVT_A1_PAUSE_MS = '' }; $p).WaitForExit("   # TEST FIXTURE: ONE pause right before the wait
+        dv = self.mutated_runner([("VenueChain.psm1", self.BP_WAITCALL_ANCHOR, once)])
+        got = run_pwsh(["-Command", f"Import-Module '{dv / 'VenueChain.psm1'}' -Force -DisableNameChecking; "
+                        "$env:DVT_A1_PAUSE_MS = '6000'; $sw = [Diagnostics.Stopwatch]::StartNew(); "
+                        f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 20') -TimeoutSec 60 -CleanupWaitMs 1500 -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(5)) -MinRoomSec 1; "
+                        "\"A1D $($r.timedOut) $([Math]::Round($sw.Elapsed.TotalSeconds, 2))\"; "
+                        "$env:DVT_A1_PAUSE_MS = '5000'; $sw = [Diagnostics.Stopwatch]::StartNew(); "
+                        f"$s = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 20') -TimeoutSec 4 -CleanupWaitMs 1500; "
+                        "\"A1R $($s.timedOut) $([Math]::Round($sw.Elapsed.TotalSeconds, 2))\""], timeout=180)
+        lines = {l.split()[0]: l.split()[1:] for l in got.stdout.splitlines() if l.startswith(("A1D ", "A1R "))}
+        self.assertEqual(sorted(lines), ["A1D", "A1R"], got.stdout + got.stderr)
+        self.assertEqual((lines["A1D"][0], lines["A1R"][0]), ("True", "True"), lines)
+        self.assertLess(float(lines["A1D"][1]), 9.2, f"a 6 s pause right before the wait still waited the ~4.9 s it had computed, past the 5 s -DeadlineUtc (old: about 11 s): {lines}")
+        self.assertLess(float(lines["A1R"][1]), 7.8, f"a 5 s pause right before the wait still waited the ~4 s it had computed, past the 4 s bound (old: about 9 s): {lines}")
+
+    def test_planned_hash_bind_b2_r2_a2_a_child_the_parent_observed_past_its_bound_is_late_whatever_the_os_instants_say(self) -> None:
+        late = "    if ($env:DVT_A2_PAUSE_MS) { Start-Sleep -Milliseconds ([int]$env:DVT_A2_PAUSE_MS) }   # TEST FIXTURE: the parent first polls the child long after it exited\n"
+        exit_anchor = "$p.ExitTime.ToUniversalTime()"
+        cases = {"backward-step": exit_anchor + ".AddSeconds(-60)",   # the host clock stepped 60 s back between the OS start and exit
+                 "unreadable-exit": "$(throw 'TEST FIXTURE: the OS exit time will not read')"}
+        for name, repl in cases.items():
+            with self.subTest(case=name):
+                dv = self.mutated_runner([("VenueChain.psm1", self.BP_WAITMS_ANCHOR, late + self.BP_WAITMS_ANCHOR), ("VenueChain.psm1", exit_anchor, repl)])
+                got = run_pwsh(["-Command", f"Import-Module '{dv / 'VenueChain.psm1'}' -Force -DisableNameChecking; "
+                                f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep -Milliseconds 2000; exit 0') -TimeoutSec 1 -CleanupWaitMs 2000; "
+                                "\"A2 $($r.timedOut) $($r.lateExit) [$($r.exit)]\""], env_extra={"DVT_A2_PAUSE_MS": "7000"}, timeout=120)
+                line = [l for l in got.stdout.splitlines() if l.startswith("A2 ")]
+                self.assertEqual(line, ["A2 True True []"], f"a child that ran about 2 s under a 1 s bound, polled at 7 s, was accepted ({name}; old: timedOut False, exit 0)\n" + got.stdout + got.stderr)
+
+    def test_planned_hash_bind_b2_r2_a14_a_late_self_exit_never_confirms_a_kill_while_a_descendant_still_runs(self) -> None:
+        late = "    if ($env:DVT_A14_PAUSE_MS) { Start-Sleep -Milliseconds ([int]$env:DVT_A14_PAUSE_MS) }   # TEST FIXTURE: the parent first polls after the root exited\n"
+        dv = self.mutated_runner([("VenueChain.psm1", self.BP_WAITMS_ANCHOR, late + self.BP_WAITMS_ANCHOR)])
+        pid_file = self.tmp / "a14-descendant.pid"
+        child = self.tmp / "a14-child.ps1"   # the root: starts a descendant that inherits its stdout, then exits on its own after its 1 s bound
+        child.write_text("$d = Start-Process -FilePath 'C:\\Windows\\System32\\PING.EXE' -ArgumentList '-n','40','127.0.0.1' -NoNewWindow -PassThru\n"
+                         f"[IO.File]::WriteAllText('{pid_file}', [string]$d.Id)\nStart-Sleep -Milliseconds 1500\nexit 0\n", encoding="utf-8")
+        probe = self.tmp / "a14-probe.ps1"
+        probe.write_text(
+            f"Import-Module '{dv / 'VenueChain.psm1'}' -Force -DisableNameChecking\n"
+            f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-File','{child}') -TimeoutSec 1 -CleanupWaitMs 1000\n"
+            f"$dpid = [int]([IO.File]::ReadAllText('{pid_file}'))\n"
+            "$alive = $null -ne (Get-Process -Id $dpid -ErrorAction Ignore)\n"
+            "\"A14 $($r.timedOut) $($r.killConfirmed) $alive\"\n"
+            "if ($alive) { Stop-Process -Id $dpid -Force -ErrorAction Ignore }   # the test's own cleanup (its pipe would hold this process's caller)\n", encoding="utf-8")
+        got = run_pwsh(["-File", str(probe)], env_extra={"DVT_A14_PAUSE_MS": "7000"}, timeout=120)
+        line = [l for l in got.stdout.splitlines() if l.startswith("A14 ")]
+        self.assertEqual(len(line), 1, got.stdout + got.stderr)
+        timed_out, confirmed, alive = line[0].split()[1:]
+        self.assertEqual(timed_out, "True", line[0])
+        self.assertFalse(confirmed == "True" and alive == "True", f"killConfirmed read the root alone while its descendant still held the child's stdout (old: True with the descendant alive): {line[0]}")
+
+    A3_SPEC_ANCHOR = "    if ($dlR -is [datetime]) { $ms = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min([double]$ms, (($dlR - [DateTime]::UtcNow).TotalSeconds - 2.0) * 1000.0))) }\n"
+    A3_LOC_ANCHOR = "    $full = try { [IO.Path]::GetFullPath($Path) } catch { return $null }\n"
+    A3_DIAG_ANCHOR = "        if ($ms -le 0) { return 'INPUT_UNREADABLE' }\n"
+    A3_LOC_STALL = ("if (delayMs > 0) { System.Threading.Thread.Sleep(delayMs); } uint l;", "System.Threading.Thread.Sleep(30000); uint l;")
+
+    def test_planned_hash_bind_b2_r2_a3_a_pause_after_a_bounded_read_sampled_its_allowance_never_waits_past_the_deadline_reserve(self) -> None:
+        # A3: each bounded preflight read sampled its allowance before its task started; a pause after the sample ran the full stale wait. The read itself never answers (a
+        # stalled share: the spec read's delay seam, the location task's mutated sleep, the diagnostic's fixture open), so each returns at the end of its wait.
+        pause = "    if ($env:DVT_A3_PAUSE_MS) { Start-Sleep -Milliseconds ([int]$env:DVT_A3_PAUSE_MS) }   # TEST FIXTURE: descheduled after the allowance was sampled\n"
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.A3_SPEC_ANCHOR, self.A3_SPEC_ANCHOR + pause), ("Invoke-VenueLeaseBatch.ps1", self.A3_LOC_ANCHOR, self.A3_LOC_ANCHOR + pause),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.A3_DIAG_ANCHOR, self.A3_DIAG_ANCHOR + "    " + pause), ("Invoke-VenueLeaseBatch.ps1", *self.A3_LOC_STALL)])
+        spec = self.tmp / "a3-spec.json"
+        spec.write_text("{}", encoding="utf-8")
+        probe = self.tmp / "a3-probe.ps1"
+        probe.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{dv / 'VenueChain.psm1'}' -Force -DisableNameChecking\n"
+            f"$here = '{dv}'\n"
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{dv / 'Invoke-VenueLeaseBatch.ps1'}', [ref]$null, [ref]$null)\n"
+            "foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {\n"
+            "    if ($f.Name -cin @('Read-SpecBytesWithin', 'Get-InputLocationWithin', 'Get-InputUnresolvedCodeWithin', 'Get-SpecReadBoundSec', 'Get-PhysicalPath', 'Get-FileIdentity', 'Test-NothingAtName')) { . ([scriptblock]::Create($f.Extent.Text)) } }\n"
+            "function Get-InputUnresolvedCode([string]$Path, [switch]$SkipRead) { Start-Sleep -Seconds 30; '' }   # TEST FIXTURE: an open that never answers\n"
+            "$null = Get-PhysicalPath $here   # loads the native type before any clock starts\n"
+            "$env:DVT_A3_PAUSE_MS = '4000'\n"
+            "$deadline = [DateTime]::UtcNow.AddSeconds(8); $sw = [Diagnostics.Stopwatch]::StartNew()\n"
+            f"$r = Read-SpecBytesWithin '{spec}' 30 30000\n"
+            "$t1 = $sw.Elapsed.TotalSeconds\n"
+            "$deadline = [DateTime]::UtcNow.AddSeconds(8); $sw = [Diagnostics.Stopwatch]::StartNew()\n"
+            f"$loc = Get-InputLocationWithin '{spec}'\n"
+            "$t2 = $sw.Elapsed.TotalSeconds\n"
+            "$deadline = [DateTime]::UtcNow.AddSeconds(8); $sw = [Diagnostics.Stopwatch]::StartNew()\n"
+            f"$code = Get-InputUnresolvedCodeWithin '{spec}'\n"
+            "$t3 = $sw.Elapsed.TotalSeconds\n"
+            "\"A3 $($r.state) $($null -eq $loc) [$code] $([Math]::Round($t1, 2)) $([Math]::Round($t2, 2)) $([Math]::Round($t3, 2))\"\n"
+            "[Environment]::Exit(0)\n", encoding="utf-8")
+        got = run_pwsh(["-File", str(probe)], timeout=180)
+        line = [l for l in got.stdout.splitlines() if l.startswith("A3 ")]
+        self.assertEqual(len(line), 1, got.stdout + got.stderr)
+        state, no_loc, code, t1, t2, t3 = line[0].split()[1:]
+        self.assertEqual((state, no_loc, code), ("TIMEOUT", "True", "[INPUT_UNREADABLE]"), line[0])
+        for name, t in (("spec read", t1), ("location read", t2), ("unresolved diagnostic", t3)):
+            self.assertLess(float(t), 8.0, f"the {name} waited its stale ~6 s allowance after a 4 s pause, past the 6 s end of its room (-DeadlineUtc less the 2 s reserve; old: about 10 s): {line[0]}")
+
+    A4_L_STALL = ("function L([string]$Message) {\n"
+                  "    $script:ChainLogAppendDelayMs = $(if ($Message -clike 'LEG * NOT_RUN DEADLINE *') { 120000 } else { 0 })   # TEST FIXTURE: the ChainLog share stops answering, without throwing, for this one append\n"
+                  "    function Add-Content { if ($script:ChainLogAppendDelayMs -gt 0) { Start-Sleep -Milliseconds $script:ChainLogAppendDelayMs }; Microsoft.PowerShell.Management\\Add-Content @args }   # (the same stall, for a synchronous append)\n")
+
+    def test_planned_hash_bind_b2_r2_a4_a_chain_log_append_that_stops_answering_holds_neither_the_claim_release_nor_chain_result(self) -> None:
+        from datetime import datetime, timedelta, timezone
+        dv = self.mutated_runner([("Invoke-VenueChain.ps1", self.CHAIN_LAUNCH_CHECK,
+                                   self.CHAIN_LAUNCH_CHECK + "            $deadline = [DateTime]::UtcNow.AddMilliseconds(300); Start-Sleep -Milliseconds 1000   # TEST FIXTURE: the deadline passes after the check\n"),
+                                  ("Invoke-VenueChain.ps1", "function L([string]$Message) {\n", self.A4_L_STALL)])
+        fx = self.chain_fixture(dv, None, None)
+        run = self.tmp / "a4-chain-run"
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=300)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            proc = run_pwsh(["-File", str(dv / "Invoke-VenueChain.ps1"), "-Venue", "bachelor", "-LegSpec", str(dv / "legs" / self.SWAP_FIRST), "-Backend", "cuda", "-NoSupplementary",
+                             "-RunDir", str(run), "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-ClaimDir", str(self.tmp / "claims"), "-QuietScript", str(fx["quiet"]),
+                             "-LegScript", str(fx["leg"]), "-CooldownSec", "0", "-ClaimPollSec", "1", "-DeadlineUtc", deadline], env_extra=fx["env"], timeout=90)
+        except subprocess.TimeoutExpired as e:
+            self.fail(f"the NOT_RUN DEADLINE line's chain-log append held the claim release and CHAIN_RESULT (old: a synchronous Add-Content): {e}\n{e.stdout}")
+        results = [l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")]
+        self.assertEqual(len(results), 1, proc.stdout + proc.stderr)
+        result = json.loads(results[-1][len("CHAIN_RESULT="):])
+        self.assertEqual([(r["status"], r["verdict"]) for r in result["legs"]], [("NOT_RUN", "DEADLINE")], proc.stdout)
+        self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+        self.assertTrue(any(" CLAIM_RELEASED leg=" in l for l in proc.stdout.splitlines()), "the claim was released after the stalled append\n" + proc.stdout)
+        self.assertIn("CHAIN_LOG_APPEND_TIMEOUT", proc.stderr, "the stalled append is said once, bounded, on stderr")
+        self.assertEqual(self.fixture_legs(), [], "no leg child ran")
+
+    def test_planned_hash_bind_b2_r2_a6_the_batch_transcript_worker_never_writes_through_a_name_made_after_the_guard(self) -> None:
+        # A6: the post-child guard asked about an absent transcript name; a hard link to an accepted spec made at that name before the worker opened it was written THROUGH
+        # (WriteAllText opens the existing file). The worker's own text is lifted from the runner and run against exactly that name.
+        body = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
+        at = body.index("[IO.File]::WriteAllText($out, $text, [Text.UTF8Encoding]::new($false))")
+        line = body[body.rindex("\n", 0, at) + 1:body.index("\n", at)]
+        m = re.search(r"-ScriptText '((?:[^']|'')*)'", line)
+        self.assertIsNotNone(m, line)
+        accepted = self.tmp / "a6-fx-b.json"
+        accepted.write_text('{"legId": "fx-b"}', encoding="utf-8")
+        before = accepted.read_bytes()
+        out = self.tmp / "a6-run" / "leg-01-fx-a.out.txt"
+        out.parent.mkdir()
+        os.link(accepted, out)   # the name made in the gap: another name for the accepted spec
+        probe = self.tmp / "a6-probe.ps1"
+        probe.write_text("$sb = [scriptblock]::Create('" + m.group(1) + "')\n"
+                         f"$r = & $sb @{{ p = '{out}'; t = 'TRANSCRIPT OF LEG 1' }}\n"
+                         "\"A6 $r\"\n", encoding="utf-8")
+        got = run_pwsh(["-File", str(probe)], timeout=60)
+        self.assertTrue(any(l.startswith("A6 ") for l in got.stdout.splitlines()), got.stdout + got.stderr)
+        self.assertEqual(accepted.read_bytes(), before, f"the transcript was written through a hard link onto the accepted spec (old: WriteAllText on the existing name)\n{got.stdout}")
+
+    def test_planned_hash_bind_b2_r2_a7_complete_venue_process_exits_while_another_thread_holds_the_stderr_writer(self) -> None:
+        probe = self.tmp / "a7-probe.ps1"
+        probe.write_text(
+            f"Import-Module '{DV / 'VenueChain.psm1'}' -Force -DisableNameChecking\n"
+            "Add-Type -TypeDefinition 'public static class A7StuckStderr { public static void Start(string s) { System.Threading.Tasks.Task.Run(() => System.Console.Error.WriteLine(s)); } }'\n"
+            "[A7StuckStderr]::Start([string]::new([char]'x', 4MB))   # TEST FIXTURE: an abandoned diagnostic stuck inside the synchronized stderr writer (a full pipe nobody reads)\n"
+            "[Threading.Thread]::Sleep(1500)\n"
+            "& (Get-Module VenueChain) { $script:VenueAbandonedReads = 1 }\n"
+            "[Console]::Out.WriteLine('A7 exiting')\n"
+            "Complete-VenueProcess -ExitCode 5\n"
+            "[Console]::Out.WriteLine('A7 returned')\n", encoding="utf-8")
+        p = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            rc = p.wait(timeout=40)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+            self.fail("Complete-VenueProcess never exited: its flush waited on the stderr writer another thread held (old: a synchronous [Console]::Error.Flush())")
+        finally:
+            p.stdout.close()
+            p.stderr.close()
+        self.assertEqual(rc, 5)
 
 
 # ---------------------------------------------------------------------------------------------------
