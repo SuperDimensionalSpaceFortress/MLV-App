@@ -304,6 +304,83 @@ class ReceiptValidatorReportsTheDisplayPathTests(unittest.TestCase):
         self.assertEqual(block_state(base)["state"], "present")
         self.assertEqual(block_state(all_unknown_block())["state"], "present")
 
+    def test_successor1_w2_a_name_that_is_a_typed_unknown_stays_in_the_table_match(self) -> None:
+        """SUCCESSOR-1 W2 (r3 adversary A2): a name that was a typed unknown dropped out of the A5 match, so an active adapter with no display entry (or a display
+        entry with no adapter) passed. An unknown name is still a name: the unknown-named active adapters and the unknown-named display entries must agree in number."""
+        base = good_block()
+        intel, nvidia = base["adapters"]
+        display = base["activeDisplays"][0]
+        nameless = unknown("not-reported")
+        bad = {
+            "an active adapter named by an unknown, no display entry": dict(base, adapters=[dict(intel, name=nameless), nvidia], activeDisplays=[]),
+            "a display entry named by an unknown, no adapter": dict(base, adapters=[], activeDisplays=[dict(display, adapterName=nameless)]),
+            "two unknown-named display entries for one unknown-named active adapter": dict(
+                base, adapters=[dict(intel, name=nameless), nvidia], activeDisplays=[dict(display, adapterName=nameless), dict(display, adapterName=nameless)]),
+            "an unknown-named display entry where the active adapter has a name": dict(base, activeDisplays=[dict(display, adapterName=nameless)]),
+        }
+        receipts = {label: receipt_with(block) for label, block in bad.items()}
+        paired = dict(base, adapters=[dict(intel, name=nameless), nvidia], activeDisplays=[dict(display, adapterName=nameless)])
+        receipts["control: one unknown-named active adapter, one unknown-named display entry"] = receipt_with(paired)
+        got = validate_many(receipts)
+        for label in bad:
+            with self.subTest(label):
+                self.assertEqual((got[label]["valid"], got[label]["displayPath"]), (False, "malformed"), got[label])
+                self.assertTrue(any(r.startswith("DISPLAY_PATH_MALFORMED") for r in got[label]["reasons"]), got[label])
+        control = got["control: one unknown-named active adapter, one unknown-named display entry"]
+        self.assertEqual((control["valid"], control["displayPath"]), (True, "present"), control)
+
+    def test_successor1_w3_an_unknown_marker_beside_ordinary_fields_is_malformed(self) -> None:
+        """SUCCESSOR-1 W3 (r3 adversary A5): `state`/`reason` added to an object that also carries its complete ordinary fields fell through to ordinary validation and
+        passed. A typed unknown is exactly {state, reason}; an object of the schema that carries either member (in any letter case) is the contradictory mixed shape."""
+        marker = {"state": "unknown", "reason": "denied"}
+
+        def marked_everywhere(node):
+            if isinstance(node, dict):
+                return dict({k: marked_everywhere(v) for k, v in node.items()}, **marker)
+            if isinstance(node, list):
+                return [marked_everywhere(v) for v in node]
+            return node
+
+        base = good_block()
+        bad = {
+            "every object of the block": marked_everywhere(base),
+            "the whole block": dict(base, **marker),
+            "os": dict(base, os=dict(base["os"], **marker)),
+            "an adapter entry": dict(base, adapters=[dict(base["adapters"][0], **marker), base["adapters"][1]]),
+            "a display entry": dict(base, activeDisplays=[dict(base["activeDisplays"][0], **marker)]),
+            "only a state on os": dict(base, os=dict(base["os"], state="unknown")),
+            "only a reason on the block": dict(base, reason="denied"),
+            "a State (other case) on os": dict(base, os=dict(base["os"], State="unknown")),
+        }
+        receipts = {label: receipt_with(block) for label, block in bad.items()}
+        got = validate_many(receipts)
+        for label in bad:
+            with self.subTest(label):
+                self.assertEqual((got[label]["valid"], got[label]["displayPath"]), (False, "malformed"), got[label])
+        # the runner's normaliser calls the same checker: a mixed block from a probe becomes the typed unknown, never a present block
+        probes = {label: json.dumps(dict(HEALTHY_PROBE, displayPath=block)) for label, block in bad.items()}
+        norm = pwsh_json("$in = $env:DVE_PROBES | ConvertFrom-Json -AsHashtable\n$out = [ordered]@{}\n"
+                         "foreach ($k in @($in.Keys)) { $out[$k] = ConvertTo-DvDisplayPath -Probe ($in[$k] | ConvertFrom-Json) }\n$out | ConvertTo-Json -Compress -Depth 10",
+                         {"DVE_PROBES": json.dumps(probes)})
+        for label in bad:
+            with self.subTest("normaliser: " + label):
+                self.assertEqual(norm[label], unknown("probe-block-malformed"), norm[label])
+
+    def test_successor1_w4_an_explicit_null_venue_is_malformed_not_absent(self) -> None:
+        """SUCCESSOR-1 W4 (r3 adversary A6): Get-DvProp gives $null both for a missing member and for an explicit null, so `"venue": null` read as absent. A venue
+        that is THERE must be an object; a receipt with no venue member, or a venue whose displayPath is null or missing, stays absent."""
+        explicit = {"schema": "mlv-app/dual-venue-receipt/v1", "outcome": "UNRESOLVED", "venue": None, "subject": {}}
+        missing = {"schema": "mlv-app/dual-venue-receipt/v1", "outcome": "UNRESOLVED", "subject": {}}
+        null_block = {"schema": "mlv-app/dual-venue-receipt/v1", "outcome": "UNRESOLVED", "venue": {"displayPath": None}, "subject": {}}
+        got = validate_many({"explicit": explicit, "explicit PASS": dict(explicit, outcome="PASS"), "missing": missing, "null block": null_block})
+        for label in ("explicit", "explicit PASS"):
+            with self.subTest(label):
+                self.assertEqual((got[label]["valid"], got[label]["displayPath"]), (False, "malformed"), got[label])
+                self.assertTrue(any(r.startswith("DISPLAY_PATH_MALFORMED") for r in got[label]["reasons"]), got[label])
+        for label in ("missing", "null block"):
+            with self.subTest(label):
+                self.assertEqual((got[label]["status"], got[label]["valid"], got[label]["displayPath"]), ("NO_SIGNAL", True, "absent"), got[label])
+
 
 COLLECTOR_HARNESS = r"""
 $ErrorActionPreference = 'Stop'
@@ -369,6 +446,60 @@ def run_collector(mode: str = "ok", sleep_ms: int = 0, budget: int | None = None
     try:
         return json.loads(proc.stdout)
     except ValueError:
+        raise AssertionError(proc.stdout + proc.stderr)
+
+
+# SUCCESSOR-1 W1 (r3 adversary A1): the job runs the collector through Get-DvDisplayPathBounded, whose worker sees the reads the prelude defines. A read that blocks
+# in native code ([Threading.Thread]::Sleep ignores -OperationTimeoutSec and a pipeline stop, as a hung registry or WMI provider call does) must cost the job the budget
+# and no more: the block is its typed unknown, and the job's own last line still ends the process with the abandoned read in flight.
+BOUNDED_PRELUDE = r"""
+function Get-CimInstance {
+    [CmdletBinding()] param([string]$ClassName, [string]$Namespace = '', [string]$Filter = '', [int]$OperationTimeoutSec = 0)
+    if ($env:DVE_BLOCK_AT -eq $ClassName) { [System.Threading.Thread]::Sleep([int]$env:DVE_BLOCK_MS) }
+    switch ($ClassName) {
+        'Win32_VideoController' { return @([pscustomobject]@{ Name = 'Intel(R) Iris(R) Xe Graphics'; DriverVersion = '31.0.101.5186'; DriverDate = [datetime]::new(2024, 6, 12, 0, 0, 0, [DateTimeKind]::Utc); PNPDeviceID = 'PCI\VEN_8086'; CurrentRefreshRate = 59; CurrentHorizontalResolution = 3840; CurrentVerticalResolution = 2400 }) }
+        'Win32_OperatingSystem' { return @([pscustomobject]@{ LastBootUpTime = [datetime]::new(2026, 11, 21, 9, 0, 0, [DateTimeKind]::Utc) }) }
+        'Win32_PowerPlan' { return @([pscustomobject]@{ ElementName = 'Balanced'; IsActive = $true }) }
+        'Win32_QuickFixEngineering' { return @([pscustomobject]@{ HotFixID = 'KB1' }) }
+    }
+    @()
+}
+function Get-ItemProperty {
+    [CmdletBinding()] param([string]$LiteralPath, [string]$Path)
+    if ($env:DVE_BLOCK_AT -eq 'registry') { [System.Threading.Thread]::Sleep([int]$env:DVE_BLOCK_MS) }
+    [pscustomobject]@{ CurrentBuild = '26100'; UBR = 4770 }
+}
+"""
+
+BOUNDED_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+Import-Module '__MODULE__' -Force
+. ([scriptblock]::Create((Get-DvDisplayPathCollectorSource)))
+$jobText = New-DvHealthProbeJobText -AgentRoot 'C:\mlvtmp\mlv-agent'
+$endLine = @($jobText -split "`r?`n" | Where-Object { $_.StartsWith('if ($script:DvDisplayPathAbandoned)') })[0]
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$block = Get-DvDisplayPathBounded -BudgetSec ([int]$env:DVE_BUDGET) -WorkerPrelude ([IO.File]::ReadAllText($env:DVE_PRELUDE_FILE))
+$ms = $sw.ElapsedMilliseconds
+$rt = ($block | ConvertTo-Json -Depth 8 -Compress) | ConvertFrom-Json
+$v = Test-DvDisplayPathBlock -Block $rt
+[Console]::Out.WriteLine(([ordered]@{ block = $block; elapsedMs = $ms; state = $v.state; endLine = [string]$endLine } | ConvertTo-Json -Depth 12 -Compress))
+if ($endLine) { . ([scriptblock]::Create($endLine)) }
+"""
+
+
+def run_bounded(block_at: str = "", block_ms: int = 0, budget: int = 3) -> tuple[dict, float]:
+    import time
+    with tempfile.TemporaryDirectory(prefix="dv-displaypath-bounded-") as d:
+        script = Path(d) / "harness.ps1"
+        script.write_text(BOUNDED_HARNESS.replace("__MODULE__", str(MODULE)), encoding="utf-8")
+        prelude = Path(d) / "prelude.ps1"
+        prelude.write_text(BOUNDED_PRELUDE, encoding="utf-8")
+        started = time.monotonic()
+        proc = run_pwsh(["-File", str(script)], env_extra={"DVE_BLOCK_AT": block_at, "DVE_BLOCK_MS": str(block_ms), "DVE_BUDGET": str(budget), "DVE_PRELUDE_FILE": str(prelude)})
+        wall = time.monotonic() - started
+    try:
+        return json.loads(proc.stdout.strip().splitlines()[-1]), wall
+    except (ValueError, IndexError):
         raise AssertionError(proc.stdout + proc.stderr)
 
 
@@ -507,6 +638,25 @@ class CollectorNeverFailsOrDelaysTheLegTests(unittest.TestCase):
         self.assertEqual({k: v for k, v in got.items() if k != "expr"},
                          {"0": 15, "90.4": 14, "90.6": 14, "104.2": 0, "104.99": 0, "105": 0, "300": 0}, got)
 
+    def test_successor1_w1_a_read_that_blocks_past_the_budget_gives_the_blocks_typed_unknown_on_time(self) -> None:
+        """SUCCESSOR-1 W1 (r3 adversary A1): a synchronous registry or CIM read that blocks for 40 s against a 3 s budget. The bounded collector returns the block's
+        typed unknown inside the budget, and the process (the health job, on the venue) still ends with the read in flight, long before the read would return."""
+        for where in ("registry", "Win32_OperatingSystem", "Win32_VideoController"):
+            with self.subTest(where):
+                got, wall = run_bounded(block_at=where, block_ms=40000, budget=3)
+                self.assertEqual(got["block"], {"state": "unknown", "reason": "budget-exceeded"}, got)
+                self.assertEqual(got["state"], "present", got)
+                self.assertLess(got["elapsedMs"], 4500, got)
+                self.assertTrue(got["endLine"], "the probe job has no line that ends it after an abandoned read")
+                self.assertLess(wall, 30.0, f"the process waited for the blocked read ({wall:.1f} s)")
+
+    def test_successor1_w1_a_read_inside_the_budget_still_gives_the_full_block(self) -> None:
+        got, _ = run_bounded()
+        self.assertEqual(got["state"], "present", got)
+        self.assertEqual(got["block"]["os"], {"build": "26100", "ubr": 4770, "lastBootUtc": "2026-11-21T09:00:00Z", "hotfixCount": 1}, got)
+        self.assertEqual(got["block"]["powerPlan"], "Balanced", got)
+        self.assertEqual(got["block"]["activeDisplays"][0]["refreshHz"], 59, got)
+
     def test_the_slowest_probe_runs_last_so_a_stall_in_it_costs_the_others_nothing(self) -> None:
         got = run_collector()
         classes = [c["class"] for c in got["calls"]]
@@ -559,6 +709,15 @@ class HealthProbeCarriesTheCollectorTests(unittest.TestCase):
         self.assertGreater(got["printAt"], got["assignAt"])
         # a block nests probe > displayPath > adapters > entry > unknown > reason: the probe's JSON depth must reach it or ConvertTo-Json flattens it to a string
         self.assertGreaterEqual(int(got["depth"]), 7, got)
+
+    def test_successor1_w1_the_job_runs_the_collector_bounded_and_ends_itself_after_an_abandoned_read(self) -> None:
+        """SUCCESSOR-1 W1 (r3 adversary A1): the job calls the bounded collector (never the bare reader) and, after it prints its line, ends the process when a read
+        was abandoned, so a hung provider call can neither delay the DVE_PROBE line nor keep the job alive to the agent's 120 s kill."""
+        got = pwsh_json("$p = New-DvHealthProbeJobText -AgentRoot 'C:\\mlvtmp\\mlv-agent'\n$lines = @($p -split \"`r?`n\")\n"
+                        "$assign = @($lines | Where-Object { $_.StartsWith('$probe.displayPath = ') })[0]\n"
+                        "[ordered]@{ assign = [string]$assign; printAt = $p.IndexOf('DVE_PROBE='); endAt = $p.IndexOf('if ($script:DvDisplayPathAbandoned)') } | ConvertTo-Json -Compress")
+        self.assertIn("Get-DvDisplayPathBounded -BudgetSec ", got["assign"], got)
+        self.assertGreater(got["endAt"], got["printAt"], got)
 
     def test_a_collector_that_throws_cannot_stop_the_probe(self) -> None:
         got = pwsh_json("$p = New-DvHealthProbeJobText -AgentRoot 'C:\\mlvtmp\\mlv-agent'\n"
