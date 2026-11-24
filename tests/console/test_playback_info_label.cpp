@@ -2182,11 +2182,16 @@ TEST(PlaybackInfoLabel, InfoTwoR5A3bTheLabelStallIsRelativeToTheExpectedFramePer
     // R5k: the tick's reset reads the label rule with the expected period, before the reset zeroes the EMA
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString tick = functionBody(source, QStringLiteral("void MainWindow::timerFrameEvent("));
+    // INFO-2 r9 (adversary pass 13 A4): the period now goes through labelPaintStallExpectedMs (an unpaid debt's floor holds)
     const int enteredAt = tick.indexOf(QStringLiteral(
         "const bool stallEntered = playback_info_label::labelFramesStallEntered( ui->actionPlay->isChecked(), hasDraw, presentationAgeWrapped,\n"
         "                hasDraw ? lastDrawTime.msecsTo( now ) : 0,\n"
-        "                playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs ) );"));
-    ASSERT_TRUE(enteredAt >= 0);
+        "                labelStallExpectedMs );"));
+    const int periodAt = tick.indexOf(QStringLiteral(
+        "const qint64 labelStallExpectedMs = playback_info_label::labelPaintStallExpectedMs( m_lookLabelPaintOwedClock.isValid(),\n"
+        "                m_lookLabelPaintOwedExpectedFloorMs, playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs ) );"));
+    ASSERT_TRUE(periodAt >= 0);
+    ASSERT_TRUE(enteredAt > periodAt);
     const int emaZeroAt = tick.indexOf(QStringLiteral("m_playbackFpsEmaFrameMs = 0.0;"), enteredAt);
     ASSERT_TRUE(emaZeroAt > enteredAt);
     ASSERT_FALSE(tick.contains(QStringLiteral("const bool stallEntered = ui->actionPlay->isChecked() && hasDraw;")));
@@ -2664,6 +2669,45 @@ TEST(PlaybackInfoLabel, InfoTwoR9A3A4TheSharedDebtTimelines)
     ASSERT_FALSE(labelPaintOwedStore(true, false, 450, 0).arm);
     ASSERT_EQ(450, labelPaintOwedStore(true, false, 450, -5).floorMs);
     ASSERT_EQ(1000, labelPaintOwedStore(true, false, 450, 1000).floorMs);
+}
+
+// INFO-2 r9 (adversary pass 13 A4 on a5b5ed51, introduced, major): a 60 fps clip conformed to a saved 1 fps target, a draw at 0 ms, a
+// resolution relabel stored at 450 ms (debt floor 1000, deadline 1500 ms), the 24 fps target from 488 ms, no hand-over before the
+// meter's reset at 512 ms. The reset tested the label stall against the new 42 ms period (deadline 63 ms), entered it, and its
+// repaint-now push (pushLookLabelOverlay: m_playbackFramesStalled) paid the debt 62 ms after the store on both surfaces. The stall
+// test now reads the unpaid debt's own period (labelPaintStallExpectedMs); with nothing owed it reads the period now, as before.
+TEST(PlaybackInfoLabel, InfoTwoR9AdvA4TheResetsStallNeverPaysAnUnpaidDebtBeforeItsDeadline)
+{
+    using playback_info_label::labelFramesStallEntered;
+    using playback_info_label::labelPaintExpectedFrameMs;
+    using playback_info_label::labelPaintStallExpectedMs;
+    const qint64 oneFps = labelPaintExpectedFrameMs(1.0, 0.0);
+    const qint64 target24 = labelPaintExpectedFrameMs(24.0, 0.0);
+    ASSERT_EQ(1000, oneFps);
+    ASSERT_EQ(42, target24);
+    // the relabel at 450 arms under the 1 fps period
+    SharedLabelDebt debt;
+    debt.store(false, 450, 7, oneFps);
+    ASSERT_EQ(1000, debt.floorMs);
+    // the defect: the 24 fps period alone enters a stall at draw age 512
+    ASSERT_TRUE(labelFramesStallEntered(true, true, false, 512, target24));
+    // the fix: the unpaid debt's period (1000, deadline 1500) holds, so 512 is no stall and the debt pays at 450 + 1500
+    ASSERT_EQ(1000, labelPaintStallExpectedMs(debt.armed, debt.floorMs, target24));
+    ASSERT_FALSE(labelFramesStallEntered(true, true, false, 512, labelPaintStallExpectedMs(debt.armed, debt.floorMs, target24)));
+    ASSERT_TRUE(labelFramesStallEntered(true, true, false, 1500, labelPaintStallExpectedMs(debt.armed, debt.floorMs, target24)));
+    ASSERT_EQ(stepOf(playback_info_label::LabelPaintOwedStep::Keep), stepOf(debt.settle(true, 1949, 7, target24)));
+    ASSERT_EQ(stepOf(playback_info_label::LabelPaintOwedStep::PayNow), stepOf(debt.settle(true, 1950, 7, target24)));
+    // controls: nothing owed reads the period now (an ordinary 24 fps reset is still a stall); a wrap is still a stall
+    ASSERT_EQ(42, labelPaintStallExpectedMs(false, 1000, target24));
+    ASSERT_TRUE(labelFramesStallEntered(true, true, false, 512, labelPaintStallExpectedMs(false, 1000, target24)));
+    ASSERT_TRUE(labelFramesStallEntered(true, true, true, 3, labelPaintStallExpectedMs(true, 1000, target24)));
+    ASSERT_EQ(450, labelPaintStallExpectedMs(true, 42, 450));   // a larger period now wins over a smaller floor
+    // the wiring: the reset's stall reads that period, and nothing else feeds labelFramesStallEntered in MainWindow
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "const qint64 labelStallExpectedMs = playback_info_label::labelPaintStallExpectedMs( m_lookLabelPaintOwedClock.isValid(),")));
+    ASSERT_EQ(1, static_cast<int>(source.count(QStringLiteral("playback_info_label::labelFramesStallEntered("))));
+    ASSERT_EQ(1, static_cast<int>(source.count(QStringLiteral("labelStallExpectedMs );"))));
 }
 
 // INFO-2 r2 (adversary pass 2 A2 on 9496cb72, introduced, major): 24 fps, start on paused frame 0, Cut Out 3, Loop off. Frames 1 and

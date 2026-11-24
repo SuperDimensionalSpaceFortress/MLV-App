@@ -329,6 +329,16 @@ inline LabelPaintOwedStore labelPaintOwedStore( bool owedUnpaid, bool framePrese
     return { false, labelPaintOwedExpectedMs( floorMs, now ) };
 }
 
+/*! \brief INFO-2 r9 (adversary pass 13 A4 on a5b5ed51): the expected period the fps meter's reset tests a LABEL stall against
+ *  (labelFramesStallEntered). With an unpaid debt it is the debt's own (labelPaintOwedExpectedMs of its floor and the period read
+ *  now), so the stall's repaint-now push never pays that debt before the deadline it was stored under: a 1 fps target's relabel
+ *  stored at 450 ms (floor 1000, deadline 1500 ms), a 24 fps target from 488 ms, and the reset at draw age 512 ms read the new 42 ms
+ *  period, entered a stall and painted 62 ms after the store. Nothing owed: the period read now, as before. */
+inline qint64 labelPaintStallExpectedMs( bool owedUnpaid, qint64 floorMs, qint64 currentMs )
+{
+    return owedUnpaid ? labelPaintOwedExpectedMs( floorMs, currentMs ) : currentMs;
+}
+
 /*! \brief INFO-2 r9 (sol r8 A4 on 2b195b9e): the one settle step of the shared paint debt. Nothing owed: Keep (nothing to do). A
  *  frame presented since the store carried the text: Clear. Stopped: PayNow, at once on both surfaces: r2-r8 only cleared the debt
  *  at a Stop, so a change the Stop's equal composition did not push again (ShowFps off, Baseline -> Cinematic stored while playing)

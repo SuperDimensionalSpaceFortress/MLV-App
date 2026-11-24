@@ -2022,6 +2022,36 @@
     },
     {
       "path": "platform/qt/PlaybackInfoLabelPolicy.h",
+      "anchor": "const qint64 now = expectedNowMs > 0 ? expectedNowMs : 0 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-2 r9 (sol r8 A3, adversary pass 13 A1): labelPaintOwedStore treats an unknown (<= 0) expected frame period as no floor (0) before it records the period an arm read as the label paint debt's floor or joins it to an unpaid debt's floor. A deadline input for when a stored corner label's owed paint is made; it never reads a duration as proof that a stage ran.",
+      "lines": [
+        327
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_info_label.cpp",
+      "anchor": "ASSERT_EQ ( 0 , labelPaintOwedStore ( false , false , 450 , 0 ) . floorMs ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-2 r9 (sol r8 A3, adversary pass 13 A1, row T8): pins that an arm with an unknown (0) expected frame period records no floor. A pure arithmetic assertion on a policy function over literals; no stage or clock runs.",
+      "lines": [
+        2666
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_info_label.cpp",
+      "anchor": "ASSERT_EQ ( 0 , labelPaintOwedStore ( false , false , 450 , - 5 ) . floorMs ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-2 r9 (sol r8 A3, adversary pass 13 A1, row T8): pins that an arm with a negative expected frame period is the typed unknown and records no floor. A pure arithmetic assertion on a policy function over literals; no stage or clock runs.",
+      "lines": [
+        2667
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackInfoLabelPolicy.h",
       "anchor": "return presentationAgeWrapped || msSinceLastDraw < 0 || msSinceLastDraw >= labelPaintDeadlineMs ( expectedFrameMs ) ;",
       "class": "value_fallback_select",
       "clock": "other",

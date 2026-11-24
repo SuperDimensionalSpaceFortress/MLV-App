@@ -2996,9 +2996,14 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
             // drops lastDrawTime, so hasDraw is false on the next idle tick. The next draw ends it.
             // INFO-2 r5 (r5 pass A3): only when the draw age is also past the label's expected-period deadline (read before the
             // EMA is zeroed below), so a 1 fps Play's 500 ms meter reset is no label stall; the paint debt covers a real one.
+            // INFO-2 r9 (adversary pass 13 A4 on a5b5ed51): and past the deadline an UNPAID label debt was stored under (its floor), so a
+            // 1 fps target's relabel stored at 450 ms, a 24 fps target from 488 ms and this reset at 512 ms is no stall: the stall's
+            // repaint-now push paid that debt 62 ms after its store, on the new 63 ms deadline instead of its own 1500 ms one.
+            const qint64 labelStallExpectedMs = playback_info_label::labelPaintStallExpectedMs( m_lookLabelPaintOwedClock.isValid(),
+                m_lookLabelPaintOwedExpectedFloorMs, playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs ) );
             const bool stallEntered = playback_info_label::labelFramesStallEntered( ui->actionPlay->isChecked(), hasDraw, presentationAgeWrapped,
                 hasDraw ? lastDrawTime.msecsTo( now ) : 0,
-                playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs ) );
+                labelStallExpectedMs );
             // INFO-2 r7 (pass 10 A3): the expected period this reset read before zeroing the EMA; the floor of its withdrawal's debt
             const qint64 labelExpectedBeforeResetMs = playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs );
             if( stallEntered ) m_playbackFramesStalled = true;
