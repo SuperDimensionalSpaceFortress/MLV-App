@@ -2019,7 +2019,16 @@ function Invoke-VenueBoundedProcess {
     must not leave a child behind reads it.
     #>
     param([Parameter(Mandatory)][string]$FilePath, [Parameter(Mandatory)][string[]]$ArgumentList, [Parameter(Mandatory)][ValidateRange(1, 86400)][int]$TimeoutSec,
-          [ValidateRange(100, 60000)][int]$CleanupWaitMs = 15000, [Nullable[datetime]]$DeadlineUtc = $null, [ValidateRange(0, 86400)][int]$MinRoomSec = 0)
+          [ValidateRange(100, 60000)][int]$CleanupWaitMs = 15000, [Nullable[datetime]]$DeadlineUtc = $null, [ValidateRange(0, 86400)][int]$MinRoomSec = 0,
+          [Nullable[datetime]]$StartNotAfterUtc = $null)
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r1 (adversary pass 8 A1-A4): the relative bound runs on a Stopwatch started just before Process.Start, so its elapsed is never less
+    # than the child's own runtime (A1) and a wall-clock step cannot read a child the parent saw exit in time as late (A2). -StartNotAfterUtc (A3) bounds the START only: asked at
+    # the last clock read before Process.Start (at or past it: .notStarted, no child) and against the OS StartTime (at or past it: .lateStart, killed at once); it never bounds the
+    # wait or the exit, so a child that started in time runs to -TimeoutSec. RESIDUAL, carried to VENUE-LEG-CHILD-START-NOT-AFTER-GATE-1 (Guard:
+    # tools/profiling/dual-venue/Invoke-VenueLeg.ps1): a pause between that check and Process.Start still lets a child start; it is judged late from its OS StartTime and killed
+    # at once, but anything it did in that instant is not undone. The result also says whether a kill was attempted (.killAttempted) and whether it threw (.killErrored) (A4);
+    # .killConfirmed keeps its meaning, no child left behind.
+    $snaUtc = $(if ($null -ne $StartNotAfterUtc) { ([datetime]$StartNotAfterUtc).ToUniversalTime() } else { $null })
     # r11 (adversary r11 A5, A6): after the bound, the kill wait and both stream waits share ONE budget ($CleanupWaitMs: they used to add up to 3 x 15 s past a caller's deadline), and a tree kill
     # that threw is never "confirmed" because the root happened to exit: killConfirmed needs no kill error AND the root gone.
     # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A2): -DeadlineUtc, when given, is an ABSOLUTE bound on top of the relative -TimeoutSec. It is asked as the last
@@ -2031,7 +2040,9 @@ function Invoke-VenueBoundedProcess {
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
     # r4 fix 2 (adversary pass 6 A1): -MinRoomSec, the caller's own floor of room, is asked HERE, at the last clock read before the start (a caller descheduled after its own
     # check used to start the child with less room than its floor promised)
-    if ($null -ne $dlUtc -and ($dlUtc - [DateTime]::UtcNow).TotalSeconds -lt [Math]::Max(0.000001, [double]$MinRoomSec)) { return [pscustomobject]@{ exit = $null; timedOut = $true; notStarted = $true; lateStart = $false; lateExit = $false; killConfirmed = $true; stdout = ''; stderr = '' } }
+    if ($null -ne $dlUtc -and ($dlUtc - [DateTime]::UtcNow).TotalSeconds -lt [Math]::Max(0.000001, [double]$MinRoomSec)) { return [pscustomobject]@{ exit = $null; timedOut = $true; notStarted = $true; lateStart = $false; lateExit = $false; killConfirmed = $true; killAttempted = $false; killErrored = $false; stdout = ''; stderr = '' } }
+    if ($null -ne $snaUtc -and [DateTime]::UtcNow -ge $snaUtc) { return [pscustomobject]@{ exit = $null; timedOut = $true; notStarted = $true; lateStart = $false; lateExit = $false; killConfirmed = $true; killAttempted = $false; killErrored = $false; stdout = ''; stderr = '' } }
+    $runClock = [Diagnostics.Stopwatch]::StartNew()
     $p = [Diagnostics.Process]::Start($psi)
     $p.StandardInput.Close()
     $outTask = $p.StandardOutput.ReadToEndAsync(); $errTask = $p.StandardError.ReadToEndAsync()
@@ -2045,24 +2056,29 @@ function Invoke-VenueBoundedProcess {
     $startUtc = [DateTime]::UtcNow
     try { $startUtc = $p.StartTime.ToUniversalTime() } catch { $startUtc = [DateTime]::UtcNow }
     if ($null -ne $dlUtc) { $lateStart = ($startUtc -gt $dlUtc.AddSeconds(-[double]$MinRoomSec)) -or ($startUtc -ge $dlUtc) }
+    if ($null -ne $snaUtc -and $startUtc -ge $snaUtc) { $lateStart = $true }
     $waitMs = [double]$TimeoutSec * 1000.0
+    $waitMs = [Math]::Max(0.0, [double]$waitMs - $runClock.Elapsed.TotalMilliseconds)   # b2 r1 (A1): what is left of the bound, never a fresh one
     # (hosted CI on 19ce35fd, test_artifact_preflight_r10_no_dual_venue_math_min_or_max_rounds_a_double_through_an_integer_first_operand: the first operand is a double in its own text)
     if ($null -ne $dlUtc) { $waitMs = [Math]::Min([double]$waitMs, [Math]::Max(0.0, ($dlUtc - [DateTime]::UtcNow).TotalMilliseconds)) }
     $timedOut = $(if ($lateStart) { $true } else { -not $p.WaitForExit([int][Math]::Floor($waitMs)) })
+    $observedSec = $runClock.Elapsed.TotalSeconds
     if (-not $timedOut) {
         # r5 (adversary pass 7 A2): the OS exit is judged against BOTH bounds: -DeadlineUtc and the child's own start plus -TimeoutSec (a parent that resumed late and polled an
         # already-exited child read success for a child that outran its relative cap)
         # (the relative bound is judged only from the OS's two instants; an exit time that will not read falls back to the parent's clock for the absolute bound alone)
         $exitUtc = $null; $osExit = $true
         try { $exitUtc = $p.ExitTime.ToUniversalTime() } catch { $exitUtc = [DateTime]::UtcNow; $osExit = $false }
-        $lateExit = ($osExit -and ($exitUtc - $startUtc).TotalSeconds -gt [double]$TimeoutSec) -or ($null -ne $dlUtc -and $exitUtc -gt $dlUtc)
+        # b2 r1 (A2): the relative bound is late only when the parent's own Stopwatch saw the exit past it AND the OS's two instants agree; a parent that observed the exit in
+        # time is never read late by a wall-clock step. The absolute bound stays judged on the OS exit instant.
+        $lateExit = (($observedSec -gt [double]$TimeoutSec) -and $osExit -and ($exitUtc - $startUtc).TotalSeconds -gt [double]$TimeoutSec) -or ($null -ne $dlUtc -and $exitUtc -gt $dlUtc)
         if ($lateExit) { $timedOut = $true }
     }
-    $killErrored = $false
+    $killErrored = $false; $killAttempted = $false
     $cleanup = [Diagnostics.Stopwatch]::StartNew()
-    if ($timedOut -and -not $p.HasExited) { try { $p.Kill($true) } catch { $killErrored = $true }; [void]$p.WaitForExit($CleanupWaitMs) }
+    if ($timedOut -and -not $p.HasExited) { $killAttempted = $true; try { $p.Kill($true) } catch { $killErrored = $true }; [void]$p.WaitForExit($CleanupWaitMs) }
     [void]$outTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds)); [void]$errTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds))
-    [pscustomobject]@{ exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut; notStarted = $false; lateStart = $lateStart; lateExit = $lateExit; killConfirmed = $(if ($timedOut) { (-not $killErrored) -and [bool]$p.HasExited } else { $true })
+    [pscustomobject]@{ exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut; notStarted = $false; lateStart = $lateStart; lateExit = $lateExit; killAttempted = $killAttempted; killErrored = $killErrored; killConfirmed = $(if ($timedOut) { (-not $killErrored) -and [bool]$p.HasExited } else { $true })
         stdout = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' }); stderr = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' }) }
 }
 

@@ -7537,14 +7537,20 @@ exit 0
         line = [l for l in got.stdout.splitlines() if l.startswith("H4 ")]
         self.assertEqual(line, ["H4 True True [False] [False] True"], "a child that exited on its own after its bound was not told apart from a killed one (old: no killAttempted)\n" + got.stdout + got.stderr)
         body = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
+        self.assertIn("function Format-BoundedChildEnd(", body, "one formatter says how a timed-out bounded child ended (old: every timeout read 'was killed')")
+        fmt = body[body.index("function Format-BoundedChildEnd("):body.index("function Get-ExportBudgetRefusal(")]
+        for said in ("(late; no kill was needed)", "the kill failed (not confirmed)", "started after its room ended and was killed at once"):
+            self.assertIn(said, fmt)
         fn = body[body.index("function Get-ExportBudgetRefusal("):body.index("function Get-ScalarLegShapeRefusal(")]
-        self.assertEqual(fn.count("(late; no kill was needed)"), 2, "both export children say a late self-exit was late, not killed")
-        self.assertEqual(fn.count("the kill failed (not confirmed)"), 2, "both export children say a failed kill failed")
-        self.assertIn("(late; no kill was needed)", body[body.index("$b.endReason = 'LEASE_EXPIRED'"):], "the LEASE_EXPIRED detail tells a late self-exit from a kill")
+        self.assertEqual((fn.count("Format-BoundedChildEnd $bp $boundSec"), fn.count("Format-BoundedChildEnd $fp $boundSec")), (1, 1), "both export children use it")
+        self.assertNotIn("did not answer in $boundSec s and was killed (", fn)
+        tail = body[body.index("$b.endReason = 'LEASE_EXPIRED'") - 400:]
+        self.assertIn("Format-BoundedChildEnd $lp $legBoundSec", tail[:1200], "the LEASE_EXPIRED detail tells a late self-exit from a kill")
+        self.assertNotIn("killed with its process tree at the lease's end", body)
 
     def test_planned_hash_bind_b2_r1_v1_the_planner_refuses_a_reader_answer_that_is_not_a_string_ok_and_a_file_key(self) -> None:
         legset = DV / "legsets" / f"{self.SWAP_LEGSET}.json"
-        cases = {"array-state": "state = @('OK'); bytes = [IO.File]::ReadAllBytes($p); key = ''", "whitespace-key": "state = 'OK'; bytes = [IO.File]::ReadAllBytes($p); key = ' '",
+        cases = {"array-state": "state = @('OK'); bytes = [IO.File]::ReadAllBytes($p); key = '0000abcd:0000000000000001'", "whitespace-key": "state = 'OK'; bytes = [IO.File]::ReadAllBytes($p); key = ' '",
                  "array-key": "state = 'OK'; bytes = [IO.File]::ReadAllBytes($p); key = @('0000abcd:0000000000000001')"}
         for name, fields in cases.items():
             with self.subTest(answer=name):
@@ -7557,7 +7563,8 @@ exit 0
         got = run_pwsh(["-Command", f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force; "
                         f"try {{ $null = Get-DvLegSetPlan -LegSetPath '{legset}' -WithFileKey -FileKeyReader {{ param($p) [pscustomobject]@{{ state = 'OK'; bytes = [IO.File]::ReadAllBytes($p); key = ''; error = $null }} }}; 'V1N admitted' }} "
                         "catch { 'V1N refused ' + ($_.Exception.Message -replace '\\s+', ' ') }"], timeout=120)
-        self.assertIn("V1N admitted", got.stdout, "an empty key (off Windows) still reaches the caller's own refusal\n" + got.stdout + got.stderr)
+        self.assertIn("its file could not be identified", got.stdout, "an empty key (off Windows) still reaches the caller's own refusal\n" + got.stdout + got.stderr)
+        self.assertNotIn("no usable file identity", got.stdout, got.stdout)
 
 
 # ---------------------------------------------------------------------------------------------------

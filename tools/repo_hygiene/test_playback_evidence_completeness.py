@@ -347,8 +347,10 @@ CONSUMER_ACTS_ON_EXIT: dict[str, str] = {
         r"\$exitCode\s*=\s*\[int\]\$run\.result\.exitCode[\s\S]*?if\s*\(\$exitCode\s+-ne\s+0\s+-and\s+\$resolved\.outcome\s+-eq\s+'CAPTURED'\)\s*\{",
     # VENUE-CHAIN-RUNNER-1 r2: runs each leg through Invoke-VenueLeg.ps1 and publishes CHAIN_RESULT; a leg process that exits non-zero is
     # LEG_FAILED / INVALID and the chain exits 7, whatever DVE_OUTCOME the dead leg printed (never recorded as a RAN leg).
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r1 (A3): the leg is a bounded child started under -StartNotAfterUtc; its exit code is the child's own ($lp.exit).
     "tools/profiling/dual-venue/Invoke-VenueChain.ps1":
-        r"\$legCode\s*=\s*\$LASTEXITCODE[\s\S]*?if\s*\(\$legCode\s+-ne\s+0\)\s*\{[\s\S]*?'LEG_FAILED'[\s\S]*?\$exitCode\s*=\s*7\b",
+        r"\$lp\s*=\s*Invoke-VenueBoundedProcess\s+-FilePath\s+\$pwshExe\s+-ArgumentList\s+\$lArgs\b[^\n]*-StartNotAfterUtc\s+\$deadline[\s\S]*?\$legCode\s*=\s*\$\(if\s*\(\$legTimedOut\)\s*\{\s*\$null\s*\}\s*else\s*\{\s*\$lp\.exit\s*\}\)"
+        r"[\s\S]*?if\s*\(\$legTimedOut\s+-or\s+\$legCode\s+-ne\s+0\)\s*\{[\s\S]*?'LEG_FAILED'[\s\S]*?\$exitCode\s*=\s*7\b",
     # BACHELOR-LEASE-BATCH-LEGS-1: the same rule for the lease-batch runner: a leg process that exits non-zero is LEG_FAILED / INVALID (never RAN,
     # never counted) and the run exits 7. r3 (sol r2 B2): the exit code is the bounded leg child's own ($lp.exit), not $LASTEXITCODE.
     "tools/profiling/dual-venue/Invoke-VenueLeaseBatch.ps1":

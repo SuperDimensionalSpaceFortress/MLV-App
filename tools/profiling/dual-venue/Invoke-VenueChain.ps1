@@ -639,10 +639,24 @@ foreach ($leg in $plan) {
             # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r3 (adversary pass 2 A1, A6): the leg child's output is CAPTURED (2>&1: its stdout lines are strings, its stderr lines
             # ErrorRecords), and every reading below (outcome, receipt path, detail, the spec refusal) is made from THIS child's own STDOUT. The RunDir-named file is shared by
             # every chain on this -RunDir (two venues' chains name a leg alike), so it is written after the leg as evidence only and never read back; a stderr line classifies nothing.
-            $legRaw = @(& $pwshExe @lArgs 2>&1)
-            $legCode = $LASTEXITCODE
-            $legLines = @($legRaw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { [string]$_ })
-            $ow = Write-ChainEvidence $out @($legRaw | ForEach-Object { [string]$_ })   # bounded (r3 fix 2, A2): never holds the claim's release
+            # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r1 (adversary pass 8 A3): the child is started by Invoke-VenueBoundedProcess with -StartNotAfterUtc $deadline, so a pause between
+            # the check above and the start can no longer start it late: the helper asks the deadline at its own last clock read (notStarted) and against the child's OS StartTime
+            # (lateStart: killed at once). The bound is on the START only (-TimeoutSec 86400): a leg that started in time is never killed at the deadline, as before. A pause inside
+            # the helper between its check and Process.Start is the residual CARRIED to VENUE-LEG-CHILD-START-NOT-AFTER-GATE-1 (Guard: tools/profiling/dual-venue/Invoke-VenueLeg.ps1).
+            $lp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $lArgs -TimeoutSec 86400 -StartNotAfterUtc $deadline
+            if ($lp.notStarted -or $lp.lateStart) {
+                $why = $(if ($lp.notStarted) { 'deadline-at-leg-launch' } else { 'deadline-at-child-start' })
+                $killedIds = @(Get-VenueRemoteJobIds -Text ([string]$lp.stdout)) -join ','
+                $stopReason = 'DEADLINE'; $exitCode = 3; Add-Result $leg 'NOT_RUN' @{ verdict = 'DEADLINE'; reason = $why }
+                $dLine = "LEG $($leg.name) NOT_RUN DEADLINE reason=$why ($(if ($lp.notStarted) { '-DeadlineUtc passed before the child started' } else { "the OS started the child at or past -DeadlineUtc: killed at once ($(if ($lp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED' }))" }))$(if ($killedIds) { " jobIds=$killedIds" })"
+                try { L $dLine } catch { [Console]::Error.WriteLine($dLine) }
+                break
+            }
+            # stdout alone classifies (r3); the transcript is stdout plus stderr, as the supplementary child's is
+            $legTimedOut = [bool]$lp.timedOut
+            $legCode = $(if ($legTimedOut) { $null } else { $lp.exit })
+            $legLines = @(([string]$lp.stdout) -split "`r?`n")
+            $ow = Write-ChainEvidence $out @([string]$lp.stdout + "`n--- stderr ---`n" + [string]$lp.stderr)   # bounded (r3 fix 2, A2): never holds the claim's release
             # r3 fix 3 (adversary pass 4 A2): the write's failure is said on STDERR only: a chain-log append could stall on the very share that stalled the write, before the
             # leg is classified and its claim released
             if ($ow -cne 'OK') { Write-ChainDiagnostic "LEG_OUT_WRITE_$ow leg=$($leg.name) path=$out (evidence only: the leg is classified from its own captured output)" }   # r4 fix 2 (pass 6 A6): bounded
@@ -652,11 +666,12 @@ foreach ($leg in $plan) {
             $receipt = $(if ($p -and $p -match '^DVE_RECEIPT_PATH=(.+)$') { $Matches[1].Trim() } else { $null })
             $dl = $legLines | Where-Object { $_ -match '^DVE_DETAIL=' } | Select-Object -Last 1
             $detail = $(if ($dl) { ($dl -replace '^DVE_DETAIL=', '').Trim() } else { '' })
-            if ($legCode -ne 0) {
+            if ($legTimedOut -or $legCode -ne 0) {
                 # Invoke-VenueLeg exits 0 whenever it wrote a receipt (any outcome, INVALID included); non-zero means it died without one. Whatever
                 # DVE_OUTCOME it printed before dying is not evidence: the leg is LEG_FAILED / INVALID, never RAN, and the chain exits 7. It goes on to the next leg.
                 Add-Result $leg 'LEG_FAILED' @{ verdict = $re.verdict; quietMean = $re.mean; outcome = 'INVALID'; printedOutcome = $outcome; legExit = $legCode; receipt = $null }
-                L "LEG $($leg.name) LEG_FAILED exit=$legCode outcome=INVALID printedOutcome=$outcome verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) (the leg exited non-zero: no usable receipt)"
+                if ($legTimedOut) { L "LEG $($leg.name) LEG_FAILED TIMEOUT outcome=INVALID printedOutcome=$outcome verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) (the leg did not exit within its 86400 s bound and was killed ($(if ($lp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED' })): no usable receipt)" }
+                else { L "LEG $($leg.name) LEG_FAILED exit=$legCode outcome=INVALID printedOutcome=$outcome verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) (the leg exited non-zero: no usable receipt)" }
                 # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1: a leg that refused other bytes than the planned ones (or could not read the planned spec) is named on its own typed line and in its
                 # result (specRefusal). It stays LEG_FAILED / INVALID, exit 7, so the label never turns a leg into a measurement either way. The record is read from this child's
                 # own STDOUT only (r3), from a leg that wrote no receipt line, as a whole anchored line naming this leg's planned hash.

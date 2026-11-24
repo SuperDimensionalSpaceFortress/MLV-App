@@ -1591,6 +1591,16 @@ function Get-ExportBudgetChildDeadline {
     $deadline.ToUniversalTime().AddSeconds(-$script:ExportBudgetPreflightReserveSec).AddMilliseconds(-$script:ExportBudgetPreflightCleanupMs)
 }
 
+function Format-BoundedChildEnd($Run, [int]$BoundSec) {
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r1 (adversary pass 8 A4): how a timed-out bounded child ended, as it happened (Invoke-VenueBoundedProcess .lateStart, .lateExit,
+    # .killAttempted, .killErrored, .killConfirmed). A child that exited on its own after its bound was never killed, and a kill that threw is never "killed".
+    $kc = $(if ($Run.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' })
+    if ($Run.lateStart) { return "started after its room ended and was killed at once ($kc)" }
+    if ($Run.lateExit -and -not $Run.killAttempted) { return "exited on its own after its $BoundSec s bound (late; no kill was needed)" }
+    if ($Run.killErrored) { return "did not answer in $BoundSec s and the kill failed (not confirmed)" }
+    "did not answer in $BoundSec s and was killed ($kc)"
+}
+
 function Get-ExportBudgetRefusal([string]$Path) {
     # r8 (adversary r7 A3): an export leg whose job budget the agent would refuse (DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED: the submitted timeout passes the agent's 86400 s cap) used to be
     # refused only by the generator Invoke-VenueLeg runs AFTER the batch's lease was open, so an impossible window spent a lease (and its 30 min cooldown) on a refusal known in advance.
@@ -1648,7 +1658,7 @@ function Get-ExportBudgetRefusal([string]$Path) {
     $bp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-PreflightBudgetOnly', '-ClipId', $clipId, '-Format', $format, '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs -DeadlineUtc (Get-ExportBudgetChildDeadline) -MinRoomSec 1   # r5 (pass 7 A1): the 1 s floor, at the child's OS start
     # r4 fix 2 (adversary pass 6 A3): a child the absolute bound never let start is said to be never started, not killed
     if ($bp.notStarted) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight was not started (its room before -DeadlineUtc, less $($script:ExportBudgetPreflightReserveSec) s, had ended by its start); nothing was started, so nothing was killed" }
-    if ($bp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight did not answer in $boundSec s and was killed ($(if ($bp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))" }
+    if ($bp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight $(Format-BoundedChildEnd $bp $boundSec)" }   # b2 r1 (pass 8 A4)
     $text = (@($bp.stdout, $bp.stderr) | Where-Object { $_ }) -join "`n"
     if ($text -match '(?m)DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED[^\r\n]*') { return 'EXPORT_TIME_BUDGET_EXCEEDED', "'$Path' cannot be run: $($Matches[0] -replace '\s+', ' ')" }
     if ($bp.exit -eq 0) { return '', '' }
@@ -1662,7 +1672,7 @@ function Get-ExportBudgetRefusal([string]$Path) {
     $boundSec = [int]$boundFloor
     $fp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-DescribeTimeBudgetBytes', '0', '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs -DeadlineUtc (Get-ExportBudgetChildDeadline) -MinRoomSec 1   # r5 (pass 7 A1 sibling)
     if ($fp.notStarted) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor was not started (its room before -DeadlineUtc had ended by its start); nothing was started, so nothing was killed" }   # r4 fix 2 (A3 sibling)
-    if ($fp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor did not answer in $boundSec s and was killed ($(if ($fp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))" }
+    if ($fp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor $(Format-BoundedChildEnd $fp $boundSec)" }   # b2 r1 (A4 sibling)
     $floorText = (@($fp.stdout, $fp.stderr) | Where-Object { $_ }) -join "`n"
     if ($floorText -match '(?m)DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED[^\r\n]*') { return 'EXPORT_TIME_BUDGET_EXCEEDED', "'$Path' cannot be run: the clip did not resolve here, and the clip-independent floor alone (a 0-byte clip) is refused: $($Matches[0] -replace '\s+', ' ')" }
     # (adversary pass 19 A1: the floor reads no clip, so a floor child that ends with no answer -- a nonzero exit and no marker, e.g. its module import held without read sharing -- is
@@ -3078,7 +3088,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A4 sibling :2963): evidence only; a write that throws is said on stderr and never replaces the leg's classification
                 if (Test-RunDirWrite $out) { try { [IO.File]::WriteAllText($out, $text, [Text.UTF8Encoding]::new($false)) } catch { $wfLine = "LEG_OUT_WRITE_FAILED leg=$($leg.name) path=$out reason=$($_.Exception.Message -replace '\s+', ' ') (evidence only: the leg is classified from its own captured output)"; try { $null = [VenueLeaseBatchBoundedReadR4]::ErrorLineWithin($wfLine, 2000) } catch { $null = $_ } } }   # r4 fix 2 (pass 6 A6): bounded
                 $legCode = $lp.exit
-                $legSec = [int]([DateTime]::UtcNow - $tLeg).TotalSeconds
+                $legSec = [int](($legReturnTs - $tLegTs) / [Diagnostics.Stopwatch]::Frequency)   # b2 r1 (pass 8 A2 sibling): the Stopwatch, never the wall clock
                 # a leg killed at the lease's end says nothing about how long a leg takes
                 if (-not $lp.timedOut -and $legSec -gt $legBudget) { $legBudget = [Math]::Min(2700, $legSec) }
                 $legLines = @($text -split "`r?`n")
@@ -3096,8 +3106,10 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEASE_EXPIRED'; outcome = 'INVALID'; class = 'LEASE_EXPIRED'; counted = $false; printedOutcome = $outcome; jobId = $legJobId; legSec = $legSec; legBoundSec = $legBoundSec; cancel = $cx.state; heatAtProbe = $th.firstHeat; heatAtProbeText = $th.firstHeatText }   # r6 (adversary r6 A2): a launched row keeps the reading the spread measures heavy keys from
                     $b.legs.Add([pscustomobject]$row); Add-Result $leg 'LEASE_EXPIRED' $row; $pending.RemoveAt(0)
                     Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
-                    $b.endReason = 'LEASE_EXPIRED'; $b.endDetail = "leg $($leg.name) was still running at the lease's end ($legSec s, bound $legBoundSec s): killed with its process tree; job $legJobId cancel=$($cx.state)$(if ($cx.error) { " ($($cx.error))" })"
-                    L "LEG $($leg.name) LEASE_EXPIRED batch=$batchNo legSec=$legSec boundSec=$legBoundSec outcome=INVALID counted=False jobId=$legJobId cancel=$($cx.state) (killed with its process tree at the lease's end)"
+                    # b2 r1 (pass 8 A4): what happened to the child is said as it happened (a late self-exit was not killed; a kill that threw is not confirmed)
+                    $legEnd = Format-BoundedChildEnd $lp $legBoundSec
+                    $b.endReason = 'LEASE_EXPIRED'; $b.endDetail = "leg $($leg.name) did not finish inside the lease ($legSec s, bound $legBoundSec s): it $legEnd; job $legJobId cancel=$($cx.state)$(if ($cx.error) { " ($($cx.error))" })"
+                    L "LEG $($leg.name) LEASE_EXPIRED batch=$batchNo legSec=$legSec boundSec=$legBoundSec outcome=INVALID counted=False jobId=$legJobId cancel=$($cx.state) (at the lease's end it $legEnd)"
                     if ($exitCode -eq 0) { $exitCode = 7 }
                     break
                 }
