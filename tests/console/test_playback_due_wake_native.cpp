@@ -3398,6 +3398,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
                                     bool strayAfterHeld ) {
     const bool floorRow = foreignFirst && pausedInForeign;             // r3: the paused floor row, admitted on its own predicate below
     const bool oneSpanRow = floorRow && coalesceInForeign && !strayAfterHeld;   // r4 (sol r3 B1): the coalesced row with no stray
+    const bool strayRow = floorRow && coalesceInForeign && strayAfterHeld;      // r4 adversary pass 7 A1: the coalesced row with the stray
     wake.setTimingStampsForTest( stamped );                           // also resets the exit record to None / -1
     std::unique_ptr<R17A1Windows> wp;
     std::vector<std::pair<double, double>> spans;
@@ -3428,6 +3429,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     // reason, and the typed report below runs BEFORE any assertion on the send, so ten unsent attempts still name their reason
     int notSent = 0;
     int notOneSpan = 0;                                               // r4 (sol r3 B1): the one-span row saw more than one span
+    int strayNotSeparate = 0;                                         // r4 pass 7 A1: the stray row's stray ran in no dispatch after the held one
     for( int attempt = 0; attempt < kAttempts && !landed; ++attempt )
     {
         wp.reset( new R17A1Windows );
@@ -3552,8 +3554,20 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         // one span is judged in full below like any other count (an empty record still reaches dispatches >= 1 and fails there)
         // r4 (sol r3 B1): the one-span row admits only the one-span sample it exists to judge (a span from any other source is
         // observed again), so a restored `spans.size() != 1` gate discards every attempt and fails it with a typed reason
+        // r4 adversary pass 7 A1: the stray row admits only a sample whose stray ran inside the sleep in its OWN dispatch, one that
+        // began after the held WM_NULL's entry read: a stray that missed the sleep (the sender descheduled past 80 ms) or one the
+        // held batch took witnessed no separate dispatch, and is observed again
+        bool straySeparate = false;
+        if( strayRow && strayRan )
+        {
+            constexpr double kStrayRoundTripMs = 0.00005;              // assertChargedBeforeHandler's tolerance
+            for( const auto &span : spans )
+                if( span.first * 1000.0 <= strayRunMs + kStrayRoundTripMs && strayRunMs <= span.second * 1000.0 + kStrayRoundTripMs
+                    && span.first * 1000.0 > nullEnterMs )
+                    straySeparate = true;
+        }
         const bool inheritedAdmits = spans.size() != 1;
-        const bool floorAdmits = pauseHeld && ( !oneSpanRow || spans.size() == 1 );
+        const bool floorAdmits = pauseHeld && ( !oneSpanRow || spans.size() == 1 ) && ( !strayRow || straySeparate );
         if( !handlerRan )
         {
             if( sentOk ) ++missedSend;                                 // sent, but its handler ran only after the sleep returned
@@ -3561,7 +3575,8 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         }
         else if( stamps.empty() ) ++noStamps;
         else if( floorRow && !pauseHeld ) ++holdNotWitnessed;
-        else if( floorRow && !floorAdmits ) ++notOneSpan;
+        else if( oneSpanRow && spans.size() != 1 ) ++notOneSpan;
+        else if( strayRow && !straySeparate ) ++strayNotSeparate;
         else if( !floorRow && !inheritedAdmits ) ++oneSpanInherited;
         landed = handlerRan && !stamps.empty() && ( floorRow ? floorAdmits : inheritedAdmits );
     }
@@ -3574,6 +3589,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
                               + " missed_send=" + std::to_string( missedSend ) + " no_stamps=" + std::to_string( noStamps )
                               + " hold_not_witnessed=" + std::to_string( holdNotWitnessed )
                               + " not_one_span=" + std::to_string( notOneSpan )
+                              + " stray_not_separate=" + std::to_string( strayNotSeparate )
                               + " one_span_inherited=" + std::to_string( oneSpanInherited ) );
     ASSERT_TRUE( landed );                                             // the send fell inside one of the sleeps
     ASSERT_TRUE( sentOk );                                             // the landed attempt's present was sent (its handler ran)
@@ -3635,6 +3651,17 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         // r4 (sol r3 B1): the one-span row judged a ONE-span sample (its admission took no other), so it is exactly the sample the
         // r2 gate discarded: any admission that lets a two-span sample through to here fails, whichever line it is restored on
         if( !strayAfterHeld ) ASSERT_EQ( static_cast<size_t>( 1 ), dispatches );
+        // r4 adversary pass 7 A1: the stray row judged a sample whose stray ran in exactly one dispatch AFTER the held one, so the
+        // stray's own dispatch (and its charge order, below) is really witnessed
+        if( strayAfterHeld )
+        {
+            ASSERT_TRUE( strayRan );
+            size_t strayMatches = 0;
+            for( size_t k = presentDispatch + 1; k < dispatches; ++k )
+                if( spans[k].first * 1000.0 <= strayRunMs + kPresentRoundTripMs && strayRunMs <= spans[k].second * 1000.0 + kPresentRoundTripMs )
+                    ++strayMatches;
+            ASSERT_EQ( static_cast<size_t>( 1 ), strayMatches );
+        }
     }
     const size_t kNoSegment = static_cast<size_t>( -1 );
     std::vector<size_t> segmentOfDispatch( dispatches, kNoSegment );   // the segment the sink was handed when dispatch k began
