@@ -263,7 +263,12 @@ $ErrorActionPreference = 'Stop'
 # raw quiet launch's documented non-zero exits into a terminating error. Every raw launch here reads $LASTEXITCODE itself.
 $PSNativeCommandUseErrorActionPreference = $false
 $here = $PSScriptRoot
-Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking
+# b3 r1 (adversary pass 5 A8 on a73430b2): the VenueChain module object is bound once, here, and every call into its own scope goes through $script:VenueChainModule. By name,
+# `Get-Module VenueChain` answers EVERY same-name module in the session (-Force keeps one imported from another path, another worktree's copy), and `& ($script:VenueChainModule ?? (Get-Module VenueChain)) { }`
+# then throws ('VenueChain VenueChain' is not recognized). A test harness that lifts one function of this file imports VenueChain itself and never runs this line, so each call site
+# falls back to the lookup by name (`??`) only when the binding is absent.
+Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking -PassThru -OutVariable VenueChainImported | Out-Null
+$script:VenueChainModule = $VenueChainImported[0]
 Import-Module (Join-Path $here 'VenueThermalGate.psm1') -Force
 Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force -DisableNameChecking   # LEASE-BATCH-RECEIPT-ROOT-1: Test-DvUnderClaudeState, the leg's own receipt-root rule
 # r9 (sol r8 B2): every thermal-helper call passes its optional parameters explicitly (the dispatch grace below, the Stopwatch now), so an ambient $PSDefaultParameterValues
@@ -750,7 +755,7 @@ function Get-InputUnresolvedCodeWithin([string]$Path, [switch]$SkipRead) {
         }
         if (-not $h.IsCompleted) {
             $abandoned = $true
-            try { & (Get-Module VenueChain) { $script:VenueAbandonedReads++ } } catch { $null = $_ }
+            try { & ($script:VenueChainModule ?? (Get-Module VenueChain)) { $script:VenueAbandonedReads++ } } catch { $null = $_ }
             try { $null = $ps.BeginStop($null, $null) } catch { $null = $_ }
             return 'INPUT_UNREADABLE'
         }
@@ -898,7 +903,7 @@ function Invoke-ClaimRetryRequest {
             [Threading.Monitor]::Enter($state.lock)
             try { if (-not $state.decided) { $state.abandoned = $true }; $decided = $state.decided } finally { [Threading.Monitor]::Exit($state.lock) }
             # a worker still running is a live thread the host would wait for at exit: counted, never joined or disposed (Dispose() would wait for it)
-            if (-not $ended) { & (Get-Module VenueChain) { $script:VenueAbandonedReads++ } }
+            if (-not $ended) { & ($script:VenueChainModule ?? (Get-Module VenueChain)) { $script:VenueAbandonedReads++ } }
         }
         if ($null -ne $ps -and (-not $started -or $ended)) { $ps.Dispose() }
     }
@@ -955,7 +960,7 @@ function Invoke-BatchTicketCall([string]$Body, [hashtable]$Argument, [double]$Se
     # r8 rule 5 (adversary r7 pass 3 A3): the ONE deadline gate, immediately before EACH ticket call (every create, heartbeat, end, stranded retry and retake starts here): a call is started only with more than 6 s left
     # before -DeadlineUtc (it is bounded to 5 s), so a sequence of calls in one loop turn can never carry the batch past the deadline the turn was checked against. Not started: not answered, nothing was sent.
     if (($deadline - [DateTime]::UtcNow).TotalSeconds -le 6.0) { return [pscustomobject]@{ answered = $false; value = $null; error = 'NO_ROOM less than 6 s were left before -DeadlineUtc, so the ticket call was not started' } }
-    & (Get-Module VenueChain) { param($b, $a, $s) Invoke-VenueBoundedRead -ScriptText ('param($a) Import-Module $a.m -Force -DisableNameChecking; ' + $b) -Argument $a -TimeoutSec $s } $Body ($Argument + @{ m = (Join-Path $here 'VenueChain.psm1') }) $Sec
+    & ($script:VenueChainModule ?? (Get-Module VenueChain)) { param($b, $a, $s) Invoke-VenueBoundedRead -ScriptText ('param($a) Import-Module $a.m -Force -DisableNameChecking; ' + $b) -Argument $a -TimeoutSec $s } $Body ($Argument + @{ m = (Join-Path $here 'VenueChain.psm1') }) $Sec
 }
 
 function Invoke-ClaimRetryRelease([DateTime]$DeadlineUtc, [string]$Nonce) {
@@ -983,7 +988,7 @@ function Invoke-ClaimRetryRelease([DateTime]$DeadlineUtc, [string]$Nonce) {
     try {
         $sec = [Math]::Min([double](($DeadlineUtc - [DateTime]::UtcNow).TotalSeconds - $script:ClaimRetryRefusalTailSec), [double]$script:ClaimRetryRequestReserveSec)
         $relEndUtc = [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, [double]$sec))   # b2 r2 (A3 class): the wait's one end
-        if ($sec -le 0) { & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }; $why = 'had no time left before -DeadlineUtc'; return "NO_ROOM (no time was left before -DeadlineUtc to release it; the claim still names this process, so it is broken as dead-pid once the process exits)" }
+        if ($sec -le 0) { & ($script:VenueChainModule ?? (Get-Module VenueChain)) { $script:VenueAbandonedReads++ }; $why = 'had no time left before -DeadlineUtc'; return "NO_ROOM (no time was left before -DeadlineUtc to release it; the claim still names this process, so it is broken as dead-pid once the process exits)" }
         $ps = $null; $abandoned = $false
         try {
             $ps = [powershell]::Create()
@@ -995,7 +1000,7 @@ function Invoke-ClaimRetryRelease([DateTime]$DeadlineUtc, [string]$Nonce) {
             if (-not $async.IsCompleted) {
                 # a worker still running is a live thread the host would wait for at exit: counted, asked to stop, never joined or disposed (Dispose() would wait for it)
                 $abandoned = $true
-                & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }
+                & ($script:VenueChainModule ?? (Get-Module VenueChain)) { $script:VenueAbandonedReads++ }
                 try { [void]$ps.BeginStop($null, $null) } catch { }
                 $why = "did not answer in $([Math]::Round($sec, 2)) s"
                 return "NO_ANSWER (no answer in $([Math]::Round($sec, 2)) s)"
@@ -1081,7 +1086,7 @@ $script:GuardWorker = {
     foreach ($k in $A.vars.Keys) { Set-Variable -Name $k -Value $A.vars[$k] -Scope Global }
     $hit = Get-InputOutputRefusal
     # the share reads this worker itself gave up on: the caller adds them to its own count, so Complete-VenueProcess still exits at once
-    [pscustomobject]@{ hit = $hit; abandoned = (& (Get-Module VenueChain) { $script:VenueAbandonedReads }) }
+    [pscustomobject]@{ hit = $hit; abandoned = (& ($script:VenueChainModule ?? (Get-Module VenueChain)) { $script:VenueAbandonedReads }) }
 }
 
 function Invoke-InputGuard {
@@ -1119,7 +1124,7 @@ function Invoke-InputGuard {
         }
         if (-not $async.IsCompleted) {
             $abandoned = $true
-            & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }
+            & ($script:VenueChainModule ?? (Get-Module VenueChain)) { $script:VenueAbandonedReads++ }
             try { [void]$ps.BeginStop($null, $null) } catch { }
             # r3 (adversary r3 A2): a pass that had already been answered with a failure is that failure, refused on this poll as ever, not a read to try again: noAnswer stays off
             # #705 r14 (adversary r14 A1): a worker given up on is still in a read of an input's share (a spec, a manifest or its artifacts, all on the shares the inputs live on), so where
@@ -1131,7 +1136,7 @@ function Invoke-InputGuard {
         }
         $out = @($ps.EndInvoke($async))
         $n = $(if ($out.Count -gt 0) { [int]$out[-1].abandoned } else { 0 })
-        if ($n -gt 0) { & (Get-Module VenueChain) { param($k) $script:VenueAbandonedReads += $k } $n }
+        if ($n -gt 0) { & ($script:VenueChainModule ?? (Get-Module VenueChain)) { param($k) $script:VenueAbandonedReads += $k } $n }
         if ($out.Count -gt 0) {
             $h = $out[-1].hit
             # r4 (sol, fable, opus r3): the same answer as the abandon branch above, for a worker that returned: a pass already answered with a failure that then ended on no room or a read given up on
@@ -1454,12 +1459,12 @@ function Get-InputContentRefusal {
             $verifyArtifacts = -not ($null -ne $script:guardBudget -and $script:guardBudget.artifactsOff)
             # r12 (#704 merge): nor at a receipt write (Test-ReceiptWriteSuppressed): the legs already ran, and the artifacts were hashed under the claim and after the open
             if ($script:receiptGuardActive) { $verifyArtifacts = $false }
-            $abandonedBefore = & (Get-Module VenueChain) { $script:VenueAbandonedReads }; $shareClock = [Diagnostics.Stopwatch]::StartNew()
+            $abandonedBefore = & ($script:VenueChainModule ?? (Get-Module VenueChain)) { $script:VenueAbandonedReads }; $shareClock = [Diagnostics.Stopwatch]::StartNew()
             $st = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $g.commit -TimeoutSec $share -VerifyArtifacts:$verifyArtifacts -ArtifactMinSec $script:GuardReadMinSec -ProbeScript $stagedBuildProbe -ArtifactProbeScript $artifactProbe -CallBudgetClock $shareClock0 -CallBudgetEndSec $shareEndSec
             $within = $(if ($null -ne $script:guardBudget) { "a $([Math]::Round($share, 2)) s share of $($script:guardBudget.what)" } else { "a ${share} s bound" })
             # #705 r14 (adversary r14 A1 sibling): a bounded manifest read or hash given up on under a guard budget is a read still held on the manifest's share, so its location is
             # left unknown as Invoke-InputGuard leaves it for a worker given up on (a "no time left" refusal gave up on no read, and keeps the location it verified)
-            $gaveUp = ($null -ne $script:guardBudget) -and ((& (Get-Module VenueChain) { $script:VenueAbandonedReads }) -gt $abandonedBefore)
+            $gaveUp = ($null -ne $script:guardBudget) -and ((& ($script:VenueChainModule ?? (Get-Module VenueChain)) { $script:VenueAbandonedReads }) -gt $abandonedBefore)
             # r5 adversary A1 (sol r4 B2 sibling): a manifest read that answered and left the hash no room (VenueChain: artifactsUnhashed, under 2 s left of THIS read's share, no read given up on)
             # is a no-room hit like the two above (noRoom: its refusal reads no input again). The share's own remainder, measured from before the call, never the budget's (pass 2 A1: the
             # share is capped at 330 s, so a 1000 s budget still had 671 s when the share ran out). An artifact read that ERRORED with room left stays an answered failure.
@@ -2618,7 +2623,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         }
         catch {
             if ($unfinished -eq 0) {
-                if ((& (Get-Module VenueChain) { $script:VenueAbandonedReads }) -gt 0) { [Console]::Error.WriteLine("the claim request threw: $($_.Exception.Message -replace '\s+', ' ')"); try { Complete-VenueProcess -ExitCode 1 } catch { } }
+                if ((& ($script:VenueChainModule ?? (Get-Module VenueChain)) { $script:VenueAbandonedReads }) -gt 0) { [Console]::Error.WriteLine("the claim request threw: $($_.Exception.Message -replace '\s+', ' ')"); try { Complete-VenueProcess -ExitCode 1 } catch { } }
                 throw
             }
             $requestThrew = $_.Exception.Message -replace '\s+', ' '
@@ -3173,7 +3178,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # b2 r3 (adversary pass 4 A1 on 8b4b6d8c): Invoke-VenueBoundedRead is VenueChain's own (not exported), so it is called in the module's scope as :958 does; called
                 # by name from here it never resolved, and every transcript landed in the catch below (LEG_OUT_WRITE_FAILED, no .out.txt)
                 if (Test-RunDirWrite $out) {
-                    $owr = try { & (Get-Module VenueChain) { param($t, $a, $s) Invoke-VenueBoundedRead -ScriptText $t -Argument $a -TimeoutSec $s } 'param($a) $final = $a.p; $out = $final + ".b2r2-" + [Guid]::NewGuid().ToString("N") + ".tmp"; $text = $a.t; try { $fs = [IO.File]::Open($out, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None); $fs.Dispose(); [IO.File]::WriteAllText($out, $text, [Text.UTF8Encoding]::new($false)); [IO.File]::Move($out, $final, $true); "OK" } catch { $m = $_.Exception.Message; try { [IO.File]::Delete($out) } catch { $null = $_ }; "FAILED " + $m }' @{ p = $out; t = $text } 2 } catch { [pscustomobject]@{ answered = $true; value = @(); error = ($_.Exception.Message -replace '\s+', ' ') } }
+                    $owr = try { & ($script:VenueChainModule ?? (Get-Module VenueChain)) { param($t, $a, $s) Invoke-VenueBoundedRead -ScriptText $t -Argument $a -TimeoutSec $s } 'param($a) $final = $a.p; $out = $final + ".b2r2-" + [Guid]::NewGuid().ToString("N") + ".tmp"; $text = $a.t; try { $fs = [IO.File]::Open($out, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None); $fs.Dispose(); [IO.File]::WriteAllText($out, $text, [Text.UTF8Encoding]::new($false)); [IO.File]::Move($out, $final, $true); "OK" } catch { $m = $_.Exception.Message; try { [IO.File]::Delete($out) } catch { $null = $_ }; "FAILED " + $m }' @{ p = $out; t = $text } 2 } catch { [pscustomobject]@{ answered = $true; value = @(); error = ($_.Exception.Message -replace '\s+', ' ') } }
                     $owv = @($owr.value | ForEach-Object { [string]$_ })
                     $wfLine = $(if (-not $owr.answered) { "LEG_OUT_WRITE_TIMEOUT leg=$($leg.name) path=$out (no answer in 2 s; evidence only: the leg is classified from its own captured output)" }
                         elseif ($owv -notcontains 'OK') { "LEG_OUT_WRITE_FAILED leg=$($leg.name) path=$out reason=$((($owv -join ' ') + ' ' + [string]$owr.error).Trim() -replace '^FAILED ', '' -replace '\s+', ' ') (evidence only: the leg is classified from its own captured output)" } else { '' })

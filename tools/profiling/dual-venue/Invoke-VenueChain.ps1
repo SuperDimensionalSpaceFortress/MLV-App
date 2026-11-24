@@ -117,7 +117,11 @@ $ErrorActionPreference = 'Stop'
 # $LASTEXITCODE themselves, as Invoke-VenueLeg's matrix walk does.
 $PSNativeCommandUseErrorActionPreference = $false
 $here = $PSScriptRoot
-Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking
+# b3 r1 (adversary pass 5 A8 sibling on a73430b2): the VenueChain module object is bound once, here, as Invoke-VenueLeaseBatch.ps1 does; by name, `Get-Module VenueChain` answers
+# every same-name module in the session (-Force keeps one imported from another path) and `& (Get-Module VenueChain) { }` throws. A harness that lifts one function and never
+# runs this line falls back to the lookup by name (`??`).
+Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking -PassThru -OutVariable VenueChainImported | Out-Null
+$script:VenueChainModule = $VenueChainImported[0]
 
 function Stop-Usage([string]$Message) { [Console]::Error.WriteLine("CHAIN_USAGE $Message"); exit 2 }
 
@@ -196,7 +200,7 @@ function Add-ChainLogLine([string]$Line) {
     }
     # b2 r3 (adversary pass 4 A1 sibling on 8b4b6d8c): Invoke-VenueBoundedRead is VenueChain's own (not exported), so it is called in the module's scope, as the batch does;
     # called by name from here it never resolved, so every L threw and the unguarded CHAIN_START ended the chain before CHAIN_RESULT
-    $ar = try { & (Get-Module VenueChain) { param($t, $a, $s) Invoke-VenueBoundedRead -ScriptText $t -Argument $a -TimeoutSec $s } 'param($a) if ($a.d -gt 0) { [Threading.Thread]::Sleep($a.d) }; try { [IO.File]::AppendAllText($a.p, $a.t, [Text.UTF8Encoding]::new($false)); "OK" } catch { "FAILED " + $_.Exception.Message }' @{ p = $ChainLog; t = $Line + [Environment]::NewLine; d = $script:ChainLogAppendDelayMs } 2 } catch { [pscustomobject]@{ answered = $true; value = @("FAILED $($_.Exception.Message)"); error = $null } }
+    $ar = try { & ($script:VenueChainModule ?? (Get-Module VenueChain)) { param($t, $a, $s) Invoke-VenueBoundedRead -ScriptText $t -Argument $a -TimeoutSec $s } 'param($a) if ($a.d -gt 0) { [Threading.Thread]::Sleep($a.d) }; try { [IO.File]::AppendAllText($a.p, $a.t, [Text.UTF8Encoding]::new($false)); "OK" } catch { "FAILED " + $_.Exception.Message }' @{ p = $ChainLog; t = $Line + [Environment]::NewLine; d = $script:ChainLogAppendDelayMs } 2 } catch { [pscustomobject]@{ answered = $true; value = @("FAILED $($_.Exception.Message)"); error = $null } }
     if (-not $ar.answered) { return 'TIMEOUT' }
     $av = @($ar.value | ForEach-Object { [string]$_ })
     if ($av -ccontains 'OK') { return 'OK' }
