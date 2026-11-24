@@ -4506,8 +4506,9 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r7 import staging')) {
         $all = [IO.File]::ReadAllBytes($script:R7Zip); $cut = [byte[]]::new([int]($all.Length * 0.6)); [Array]::Copy($all, $cut, $cut.Length); [IO.File]::WriteAllBytes($script:R7Zip, $cut)
         $script:BundlePath = $script:R7Zip; Set-Variable -Name BundlePath -Scope 1 -Value $script:R7Zip
     } $null {
-        $kept = Join-Path $script:MlvTmp "migrate-in\bundle-$($script:stamp)\home-claude\CLAUDE.md"
-        $script:R7Partial = $(if (Test-Path -LiteralPath $kept) { (Get-Item -LiteralPath $kept).Length } else { -1 })
+        # the expansion folder carries a random suffix since adversary pass 1 A3: every folder of this run's expansions
+        $kept = @(Get-ChildItem -LiteralPath (Join-Path $script:MlvTmp 'migrate-in') -Directory -Filter "bundle-$($script:stamp)*" -ErrorAction SilentlyContinue | ForEach-Object { Join-Path $_.FullName 'home-claude\CLAUDE.md' } | Where-Object { Test-Path -LiteralPath $_ })
+        $script:R7Partial = $(if ($kept.Count -eq 1) { (Get-Item -LiteralPath $kept[0]).Length } else { -1 })
         New-R7Zip $script:R7Zip ([ordered]@{ 'MANIFEST.txt' = $r7Manifest; 'home-claude/other-note.txt' = $r7Ascii.GetBytes('only note') })
         $null = (Invoke-PhaseImport *>&1 | Out-String)
     }
@@ -4604,6 +4605,14 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r7 import staging')) {
         $script:Cmdlet = $stub
     } $null { $script:Cmdlet = $script:R7SaveCmdlet; if (Test-Path -LiteralPath "$($script:BundlePath).away") { Move-Item -LiteralPath "$($script:BundlePath).away" -Destination $script:BundlePath } }
     Assert-That ((& $r7Typed $r7h 'IMPORT_SNAPSHOT_FAILED') -eq 1 -and $r7h.Host -ceq 'HOST-GOOD-CONTENT') 'r7 import (adversary A4): a bundle folder that vanished before the snapshot is the typed failure IMPORT_SNAPSHOT_FAILED, not a completed empty snapshot' "failures=$($r7h.Failures -join ',')`n$($r7h.Out)"
+    # A5: a path through a loopback share of this machine resolves to the physical file (the protected set is keyed by it); the administrative C$ share exists on a default Windows install
+    $r7cShare = @(Get-CimInstance -ClassName Win32_Share -Filter 'Name=''C$''' -ErrorAction SilentlyContinue)
+    if ($r7cShare.Count -eq 1 -and $r7cShare[0].Path) {
+        $r7uWant = Get-ImportRealPath 'C:\Windows\r7-share-probe\CLAUDE.md'
+        $r7uA = Get-ImportRealPath '\\localhost\C$\Windows\r7-share-probe\CLAUDE.md'; $r7uB = Get-ImportRealPath "\\$env:COMPUTERNAME\C`$\Windows\r7-share-probe\CLAUDE.md"
+        Assert-That ($r7uA -ieq $r7uWant -and $r7uB -ieq $r7uWant) 'r7 import (adversary A5): a path through a loopback share (\\localhost\C$ or \\<this machine>\C$) resolves to the physical file, so a protected file is not reachable through the share' "localhost=[$r7uA] computer=[$r7uB] want=[$r7uWant]"
+        Assert-That ((Get-ImportRealPath '\\some-other-machine\share\a\CLAUDE.md') -ieq '\\some-other-machine\share\a\CLAUDE.md') 'r7 import (adversary A5): a share of another machine stays as it is' ''
+    } else { Write-Host 'SKIP r7 import (adversary A5): no administrative C$ share on this machine' }
     # A6: a host file whose bytes cannot be read, renamed away while the gate reads the bundle file, is a creation (no silent skip)
     $script:R7Rot = $null
     $r7f = & $r6Run 'r7f' 'ROTATION.md' ($r6Utf8.GetBytes('FROM-BUNDLE')) 'HOST-OLD' {

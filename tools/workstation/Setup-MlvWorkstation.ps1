@@ -378,6 +378,9 @@ function Invoke-Native {
         $psi = [System.Diagnostics.ProcessStartInfo]::new($Exe)
         foreach ($a in @($Arguments)) { $psi.ArgumentList.Add($a) }
         $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        # r7 (adversary pass 1 A1): a native command run by PowerShell follows PowerShell's location (a relative -BundlePath is read from there); a child started here follows the process directory unless told
+        $psLoc = Get-Location
+        if ($psLoc.Provider.Name -eq 'FileSystem') { $psi.WorkingDirectory = $psLoc.ProviderPath }
         # r7 (sol r6 T-01): started through the same trace scrubber as the unbounded launch, so a GIT_TRACE* destination the parent holds is not inherited (the child may run git)
         $child = Invoke-GitTraceScrubbed { [System.Diagnostics.Process]::Start($psi) }
         try {
@@ -389,7 +392,9 @@ function Invoke-Native {
                 $stopWait = $(if ($script:NativeStopWaitSec) { [int]$script:NativeStopWaitSec } else { 10 })
                 $stopped = $false
                 try { $stopped = $child.WaitForExit($stopWait * 1000) } catch { $stopped = $false }
-                if ($stopped) { throw "$Exe did not finish within $TimeoutSec s (it was stopped)" }
+                # r7 (adversary pass 1 A7): a kill that FAILED is reported even when the child then exited by itself (a process it started may still run)
+                if ($stopped -and -not $killWhy) { throw "$Exe did not finish within $TimeoutSec s (it was stopped)" }
+                if ($stopped) { throw "$Exe did not finish within $TimeoutSec s; the kill failed ($killWhy), the child exited on its own, and a process it started may still be running" }
                 throw "$Exe did not finish within $TimeoutSec s and could NOT be stopped (it may still be running$(if ($killWhy) { "; the kill failed: $killWhy" }))"
             }
             $child.WaitForExit()
@@ -2673,26 +2678,26 @@ function Get-ArchiveCredentialHits {
     return $hits.ToArray()
 }
 
-# p5 A9: a private copy of a bundle FOLDER. Import scans and then copies; between the two a writer could swap the file, so both work from this
-# snapshot, which only this run can write to. Returns the snapshot path.
 # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 r7 (sol r6 blocker): the name of a staging folder (the bundle expansion, the import snapshot) that NO earlier attempt of this run has touched. The stamp
 # is shared by every phase of one run, so a second phase (or a retry after a failure) used to reuse the first attempt's folder, and tar / robocopy /E ADD to a folder: a file a failed attempt had
-# left there (a partly written CLAUDE.md) stayed and was copied over the host. A folder that already exists is never reused and never deleted here (the removal can itself be denied): the next
-# free name (<base>.2, .3, ...) is taken. Returns $null when none of the 99 names is free (the caller fails typed). A dangling link at a name counts as taken.
+# left there (a partly written CLAUDE.md) stayed and was copied over the host. The name carries a random suffix (adversary pass 1 A3: a "pick the next free name" scheme is a check followed by a
+# create, and a folder can appear or come back between the two), so no earlier attempt, and no other process, has a folder of that name; the folder is never deleted to make room (the removal can
+# itself be denied). The folder is still created only if it does not exist (the callers throw otherwise).
 function Get-FreshImportStagingPath {
     param([string]$Base)
-    foreach ($n in 1..99) {
-        $c = $(if ($n -eq 1) { $Base } else { "$Base.$n" })
-        if ($null -eq (Get-Item -LiteralPath $c -Force -ErrorAction SilentlyContinue)) { return $c }
-    }
-    return $null
+    return ("{0}-{1}" -f $Base, [guid]::NewGuid().ToString('N').Substring(0, 12))
 }
 
+# p5 A9: a private copy of a bundle FOLDER. Import scans and then copies; between the two a writer could swap the file, so both work from this
+# snapshot, which only this run can write to. Returns the snapshot path.
 function New-ImportSnapshot {
     param([string]$From, [string]$To)
     # r7: the snapshot is built in a folder this call creates; one that already exists holds files of an earlier attempt, which /E would keep
     if ([IO.Directory]::Exists($To) -or [IO.File]::Exists($To)) { throw "the snapshot folder $To already exists (it may hold files of an earlier attempt)" }
+    # r7 (adversary pass 1 A4): a bundle folder that is gone is a failed snapshot. The robocopy wrapper only warns about a missing source and returns, which used to end this step as 'done'.
+    if (-not (Test-Path -LiteralPath $From -PathType Container)) { throw "the bundle folder $From does not exist, so no snapshot of it can be made" }
     [void][IO.Directory]::CreateDirectory($To)
+    $script:ImportSnapshotOwned = $To   # r7 (adversary pass 1 A2): from here this call owns the folder; only an owned folder is removed when the snapshot fails
     Invoke-Robocopy $From $To @() @('/E', '/COPY:DAT')
     return $To
 }
@@ -3490,6 +3495,8 @@ function Invoke-ImportRobocopy {
                     $srcVerdict = Get-ImportEarlySourceVerdict -Source $e -HostLength $hostLen
                 }
                 if ($srcVerdict.ReadFailed -or ($srcVerdict.Why -and $srcVerdict.Why.StartsWith('bundle file is damaged'))) { $inSkipSet = $false }
+                # r7 (adversary pass 1 A6): the source read above is a new moment: a host file that went away DURING it is a creation, not a skip (the look at the top of this block is older than the read)
+                if ($inSkipSet -and -not (Test-ImportHostFileExists $dest)) { $inSkipSet = $false }
             }
             if ($inSkipSet) { continue }
             try { $r = Copy-ImportFileLocked -Source $e -Dest $dest -ExcludeNewer $exN -ExcludeOlder $exO -ExcludeChanged $exC }
@@ -3526,6 +3533,7 @@ function Invoke-ImportRobocopy {
 }
 
 $script:ImportSkippedDest = [System.Collections.Generic.List[string]]::new()
+$script:ImportSnapshotOwned = $null   # r7: the snapshot folder the current step created itself (New-ImportSnapshot); the failure cleanup removes only that
 $script:NativeKillHook = $null; $script:NativeStopWaitSec = $null; $script:NativeOutputGraceSec = $null   # r7: test seams of Invoke-Native -TimeoutSec (a kill that fails; the waits after it); unset = the real behaviour
 $script:ImportExpandDone = $false     # r6: set by the 'Expand' step itself, once tar ended without a failure (Invoke-PhaseImport)
 $script:ImportSnapshotDone = $false   # r6: set by the 'Snapshot' step itself, once the snapshot was made completely
@@ -3611,6 +3619,14 @@ function Get-ImportRealPath {
         # reached through the alias drive is keyed by its physical path, as one reached through a junction is.
         $sub = Get-ImportSubstTarget $root
         if ($sub) { return (Get-ImportRealPath (Join-Path $sub $full.Substring($root.Length)) ($Depth + 1)) }
+        # r7 (adversary pass 1 A5): a share of THIS machine is an alias of a local folder too (\\localhost\Fixture\a is D:\Fixture\a): the share's local path is substituted, so a protected file reached
+        # through a loopback share is keyed by its physical path. A share of another machine is not this host's file and stays as it is.
+        $um = [regex]::Match($full, '^\\\\([^\\?]+)\\([^\\]+)(\\.*)?$')
+        if ($um.Success -and (@('localhost', '127.0.0.1', '::1', '.', "$env:COMPUTERNAME") -contains $um.Groups[1].Value)) {
+            $shareName = $um.Groups[2].Value.Replace("'", "''")
+            $share = @(Get-CimInstance -ClassName Win32_Share -Filter "Name='$shareName'" -ErrorAction Stop)
+            if ($share.Count -eq 1 -and $share[0].Path) { return (Get-ImportRealPath ([IO.Path]::Combine($share[0].Path, $um.Groups[3].Value.TrimStart('\'))) ($Depth + 1)) }
+        }
         $cur = $root
         foreach ($part in @($full.Substring($root.Length).Split([char[]]@('\', '/'), [StringSplitOptions]::RemoveEmptyEntries))) {
             $next = Join-Path $cur $part
@@ -3788,19 +3804,19 @@ function Invoke-PhaseImport {
     $src = $BundlePath
     if ((Get-Item -LiteralPath $BundlePath).PSIsContainer -eq $false) {
         # r7 (sol r6 blocker): a folder no earlier attempt of this run touched (the stamp is shared by every phase, and tar ADDS to a folder: a partly written file of a failed first expansion stayed
-        # and was copied over the host after a second, valid expansion that does not contain it). A name that cannot be found is the typed failure below, not a reuse.
+        # and was copied over the host after a second, valid expansion that does not contain it).
         $src = Get-FreshImportStagingPath (Join-Path $MlvTmp "migrate-in\bundle-$stamp")
         # r6 (adversary pass 2 A1): the expansion counts as done only when THIS step ran it to its end (a flag the step itself sets). A failure count (a step that failed) and a folder that exists
         # (left by an earlier, failed phase of the same run, which shares the stamp) are not proof: a declined step adds no failure and leaves that folder to be read as this run's expansion.
         $script:ImportExpandDone = $false
-        if ($src) { Invoke-Step "Expand $BundlePath to $src" {
+        Invoke-Step "Expand $BundlePath to $src" {
             # r7: this step creates the folder; one that appeared since the name was chosen is not entered
             if ([IO.Directory]::Exists($src) -or [IO.File]::Exists($src)) { throw "the expansion folder $src already exists (it may hold files of an earlier attempt)" }
             [void][IO.Directory]::CreateDirectory($src)
             # r6 (sol r5, hardening): bounded (15 min): a read that stalls inside tar fails the step, and the typed IMPORT_BUNDLE_EXPAND_FAILED below follows, instead of waiting for ever
             [void](Invoke-Native -Exe (Join-Path $env:SystemRoot 'System32\tar.exe') -Arguments @('-x', '-f', $BundlePath, '-C', $src) -TimeoutSec 900)
             $script:ImportExpandDone = $true
-        } }
+        }
         # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1: tar exits non-zero on a truncated or damaged zip AFTER leaving partly written files in the expanded folder; nothing of such a
         # bundle is snapshotted or copied (the run fails, exit 1). A -WhatIf preview expands nothing and never records a failure.
         if (-not $WhatIfPreference -and -not $script:ImportExpandDone) {
@@ -3820,11 +3836,13 @@ function Invoke-PhaseImport {
         # whole test, so a partial snapshot fed every copy below. A failed step is the typed IMPORT_SNAPSHOT_FAILED, the partial folder is removed, and nothing is imported.
         # r6 (adversary pass 2 A1): complete means THIS step ran New-ImportSnapshot to its end (a flag the step sets): a declined step adds no failure, and a folder of the snapshot's name left by an
         # earlier phase of the same run (the stamp is shared) is not this run's snapshot.
-        $script:ImportSnapshotDone = $false
-        if ($importSnapshot) { Invoke-Step "Snapshot the bundle to $importSnapshot (the scan and the copy read the same bytes)" { [void](New-ImportSnapshot -From $src -To $importSnapshot); $script:ImportSnapshotDone = $true } }
-        if (-not $script:ImportSnapshotDone -or -not (Test-Path -LiteralPath $importSnapshot -PathType Container)) {
+        $script:ImportSnapshotDone = $false; $script:ImportSnapshotOwned = $null
+        Invoke-Step "Snapshot the bundle to $importSnapshot (the scan and the copy read the same bytes)" { [void](New-ImportSnapshot -From $src -To $importSnapshot); $script:ImportSnapshotDone = $true }
+        # r7 (adversary pass 1 A4): the snapshot must hold the manifest the source was accepted by (a source that vanished leaves an empty folder that a bare 'done' flag would pass)
+        if (-not $script:ImportSnapshotDone -or -not (Test-Path -LiteralPath $importSnapshot -PathType Container) -or -not (Test-Path -LiteralPath (Join-Path $importSnapshot 'MANIFEST.txt') -PathType Leaf)) {
             Add-TypedFailure -Failure 'IMPORT_SNAPSHOT_FAILED' -Line 'IMPORT_SNAPSHOT_FAILED the bundle snapshot could not be made completely; nothing was imported'
-            if ($importSnapshot -and (Test-Path -LiteralPath $importSnapshot)) { try { Remove-Item -LiteralPath $importSnapshot -Recurse -Force -ErrorAction Stop } catch { Write-LogSafe "could not remove the partial import snapshot $importSnapshot : $($_.Exception.Message)" 'WARN' } }
+            # r7 (adversary pass 1 A2): only a folder THIS step created is removed (a declined step, or a folder that was already there, owns nothing)
+            if ($script:ImportSnapshotOwned -ceq $importSnapshot -and (Test-Path -LiteralPath $importSnapshot)) { try { Remove-Item -LiteralPath $importSnapshot -Recurse -Force -ErrorAction Stop } catch { Write-LogSafe "could not remove the partial import snapshot $importSnapshot : $($_.Exception.Message)" 'WARN' } }
             return
         }
         $src = $importSnapshot
