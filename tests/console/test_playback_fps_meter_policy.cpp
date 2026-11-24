@@ -2,14 +2,17 @@
 
 #include "../../platform/qt/PlaybackFpsMeterPolicy.h"
 
+#include <QElapsedTimer>
 #include <QTime>
 
+#include <climits>
 #include <cmath>
 
 using playback_fps_meter::fpsMeterShouldReset;
 using playback_fps_meter::fpsMeterStalled;
 using playback_fps_meter::kFpsMeterStallMs;
 using playback_fps_meter::smoothedFrameMs;
+using playback_fps_meter::stampAgeMs;
 
 // ---- fps meter: the interval is draw-to-draw, so an 8 ms poll cannot masquerade as the rate ----
 
@@ -82,4 +85,44 @@ TEST(PlaybackFpsMeterPolicy, CharacterizationWallClockAcrossADstEndFreezesAllThr
     ASSERT_FALSE(fpsMeterShouldReset(true, true, age));
     ASSERT_EQ(42.0, smoothedFrameMs(42.0, age));
     ASSERT_FALSE(age >= 250);
+}
+
+// ---- PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1: stampAgeMs, the one age every timerFrameEvent gate reads ----
+
+namespace
+{
+struct FakeStamp // a monotonic stamp with injected milliseconds
+{
+    bool valid;
+    long long ms;
+    bool isValid() const { return valid; }
+    long long msecsTo( const FakeStamp & other ) const { return other.ms - ms; }
+};
+} // namespace
+
+TEST(PlaybackFpsMeterPolicy, StampAgeIsTheMonotonicIntervalZeroWhenUnstartedAndSaturated)
+{
+    ASSERT_EQ(42, stampAgeMs(FakeStamp{ true, 10 }, FakeStamp{ true, 52 }));
+    ASSERT_EQ(0, stampAgeMs(FakeStamp{ false, 10 }, FakeStamp{ true, 52 }));  // never-started then
+    ASSERT_EQ(0, stampAgeMs(FakeStamp{ true, 10 }, FakeStamp{ false, 52 }));  // never-started now
+    ASSERT_EQ(INT_MAX, stampAgeMs(FakeStamp{ true, 0 }, FakeStamp{ true, 3000000000LL }));
+    ASSERT_EQ(INT_MIN, stampAgeMs(FakeStamp{ true, 0 }, FakeStamp{ true, -3000000000LL }));
+    // a monotonic pair either side of midnight is just 30 ms: no stall, a real sample, no wrap
+    const int age = stampAgeMs(FakeStamp{ true, 86399990LL }, FakeStamp{ true, 86400020LL });
+    ASSERT_EQ(30, age);
+    ASSERT_FALSE(fpsMeterShouldReset(true, true, age));
+}
+
+TEST(PlaybackFpsMeterPolicy, StampAgeOnARealElapsedTimer)
+{
+    QElapsedTimer never;
+    ASSERT_FALSE(never.isValid());
+    ASSERT_EQ(0, stampAgeMs(never, never));
+    QElapsedTimer a;
+    a.start();
+    const QElapsedTimer b = a;
+    ASSERT_EQ(0, stampAgeMs(a, b));
+    ASSERT_EQ(0, stampAgeMs(never, a));
+    a.invalidate();
+    ASSERT_EQ(0, stampAgeMs(a, b));
 }

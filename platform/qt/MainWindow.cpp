@@ -2956,6 +2956,14 @@ static int mlvappStartPlaybackTimer( QObject *owner, double framerate )
                               timerType );
 }
 
+// PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1: the fps meter and drop-frame tick clock (monotonic, never the wall clock).
+static QElapsedTimer mlvappMonotonicNow()
+{
+    QElapsedTimer now;
+    now.start();
+    return now;
+}
+
 void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
 {
     const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::TimerFrame );
@@ -2963,18 +2971,18 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     // No render starts during a Look Assist analysis. m_frameChanged stays set, so the first tick after landing draws.
     if( m_lookAssistPump.sessionOpen() ) return;
 
-    static QTime lastTime;              //Last Time a picture was rendered
-    static QTime lastDrawTime;          //Last Time a frame was DRAWN (fps meter only; lastTime is re-armed on idle ticks)
+    static QElapsedTimer lastTime;              //Last Time a picture was rendered (monotonic)
+    static QElapsedTimer lastDrawTime;          //Last Time a frame was DRAWN (fps meter only; lastTime is re-armed on idle ticks)
     static int timeDiff = 0;           //TimeDiff between 2 rendered frames in Playback
 
     //Zero the fps meter when paused, before the first draw, or stalled. Runs on EVERY tick, including
     //the still-drawing early returns below: a busy render must not leave the previous fps on screen.
     //Touches only the meter state, never lastTime, so drop-frame pacing is unchanged.
-    const auto resetFpsMeterIfIdle = [this]( const QTime & now )
+    const auto resetFpsMeterIfIdle = [this]( const QElapsedTimer & now )
     {
         const bool hasDraw = lastDrawTime.isValid();
         if( playback_fps_meter::fpsMeterShouldReset( ui->actionPlay->isChecked(), hasDraw,
-                                                     hasDraw ? lastDrawTime.msecsTo( now ) : 0 ) )
+                                                     hasDraw ? playback_fps_meter::stampAgeMs( lastDrawTime, now ) : 0 ) )
         {
             const QString playbackFpsText = playback_conform::playbackFpsStatusText(
                 0.0, getMlvFramerate( m_pMlvObject ), getPlaybackFramerate() );
@@ -2984,8 +2992,8 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
                 m_lastPlaybackFpsStatusText = playbackFpsText;
             }
             m_playbackFpsEmaFrameMs = 0.0;
-            m_lastPlaybackFpsStatusUpdateTime = QTime();
-            lastDrawTime = QTime();
+            m_lastPlaybackFpsStatusUpdateTime.invalidate();
+            lastDrawTime.invalidate();
         }
     };
 
@@ -3014,7 +3022,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
                         .arg( ui->horizontalSliderPosition->value() ),
                     true );
             }
-            resetFpsMeterIfIdle( QTime::currentTime() );
+            resetFpsMeterIfIdle( mlvappMonotonicNow() );
             //On setup slider priority
             if( !ui->actionPlay->isChecked() )
             {
@@ -3031,8 +3039,8 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     if( !m_exportQueue.empty() ) return;
 
     //Time measurement
-    QTime nowTime = QTime::currentTime();
-    timeDiff = lastTime.msecsTo( nowTime );
+    QElapsedTimer nowTime = mlvappMonotonicNow();
+    timeDiff = playback_fps_meter::stampAgeMs( lastTime, nowTime );
     // An early predictive tick is rounded up to a frame period, and a render-thread stall is never one giant
     // catch-up step. The round-up alone outran native pace on a fast GPU: playbackHandling()'s
     // m_playbackPaceGuard is the ceiling (PlaybackNativePaceGuard.h).
@@ -3116,7 +3124,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
 
         //fps measurement: draw-to-draw interval. lastTime is re-armed on every idle poll tick (it
         //feeds the drop-frame elapsed time), so it cannot serve here -- see playback_fps_meter::smoothedFrameMs.
-        const int measuredFrameMs = lastDrawTime.isValid() ? lastDrawTime.msecsTo( nowTime ) : 0;
+        const int measuredFrameMs = playback_fps_meter::stampAgeMs( lastDrawTime, nowTime );
         lastDrawTime = nowTime;
         if( timeDiff != 0 )
         {
@@ -3124,7 +3132,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
                 playback_fps_meter::smoothedFrameMs( m_playbackFpsEmaFrameMs, measuredFrameMs );
             const bool shouldUpdateFpsText =
                 !m_lastPlaybackFpsStatusUpdateTime.isValid()
-                || m_lastPlaybackFpsStatusUpdateTime.msecsTo( nowTime ) >= 250;
+                || playback_fps_meter::stampAgeMs( m_lastPlaybackFpsStatusUpdateTime, nowTime ) >= 250;
             if( shouldUpdateFpsText && m_playbackFpsEmaFrameMs > 0.0 )
             {
                 const double smoothedFps = 1000.0 / m_playbackFpsEmaFrameMs;
@@ -3160,7 +3168,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
         //An idle poll tick between two draws is normal while playing (8 ms poll, ~42 ms frame
         //period at 24 fps): only paused or stalled playback zeroes the fps meter.
         resetFpsMeterIfIdle( nowTime );
-        lastTime = QTime::currentTime(); //do that for calculation of timeDiff for DropFrameMode;
+        lastTime.start(); //do that for calculation of timeDiff for DropFrameMode;
 
     }
 }

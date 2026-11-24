@@ -12,8 +12,25 @@
 #ifndef PLAYBACKFPSMETERPOLICY_H
 #define PLAYBACKFPSMETERPOLICY_H
 
+#include <climits>
+
 namespace playback_fps_meter
 {
+
+/*! Milliseconds from \a then to \a now on the stamps' own clock, 0 when either was never
+ *  started (QElapsedTimer::msecsTo is undefined on an invalid timer; the wall-clock type this
+ *  replaced returned 0), saturated to int so every read site keeps its int milliseconds. The meter
+ *  passes QElapsedTimer stamps: a monotonic clock, so midnight, a DST change or a wall-clock
+ *  step never reaches an age. */
+template <class Stamp>
+inline int stampAgeMs( const Stamp & then, const Stamp & now )
+{
+    if( !then.isValid() || !now.isValid() ) return 0;
+    const long long ms = static_cast<long long>( then.msecsTo( now ) );
+    if( ms > INT_MAX ) return INT_MAX;
+    if( ms < INT_MIN ) return INT_MIN;
+    return static_cast<int>( ms );
+}
 
 /*! No draw for longer than this and the meter reads 0 and restarts. */
 inline constexpr int kFpsMeterStallMs = 500;

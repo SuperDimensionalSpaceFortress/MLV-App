@@ -871,7 +871,7 @@ private:
     QLabel *m_pFpsStatus;
     QString m_lastPlaybackFpsStatusText;
     double m_playbackFpsEmaFrameMs = 0.0;
-    QTime m_lastPlaybackFpsStatusUpdateTime;
+    QElapsedTimer m_lastPlaybackFpsStatusUpdateTime;
     QLabel *m_pFrameNumber;
     QLabel *m_pChosenDebayer;
     QLabel *m_pLookLabelStatus = nullptr;   // LOOK-FULLSCREEN-PARITY-1: the current look, windowed
