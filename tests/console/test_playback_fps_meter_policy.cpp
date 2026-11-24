@@ -188,7 +188,7 @@ TEST(PlaybackFpsMeterPolicy, OneTickNeverAsksForMoreFramesThanTheLoopCanCount)
     ASSERT_TRUE(unbounded.position >= 1.0);
     // bounded: the same suspension lands inside the wrap range [wrapAt - width, wrapAt) = [0, 1)
     const int bounded = frameBoundedTickTimeDiffMs(kMaxStampAgeMs, 25000.0);
-    ASSERT_EQ(40000, bounded);
+    ASSERT_EQ(40000000, bounded); // 1e9 frames at 25000 fps
     ASSERT_TRUE(25000.0 * bounded / 1000.0 <= kMaxTickFrames);
     const playback_frame_range::DropFrameTickResult tick =
         playback_frame_range::advanceDropFrameTick(0.0, 25000.0 * bounded / 1000.0, 1, 2, true);
@@ -199,7 +199,7 @@ TEST(PlaybackFpsMeterPolicy, OneTickNeverAsksForMoreFramesThanTheLoopCanCount)
     ASSERT_EQ(232, huge);
     ASSERT_TRUE(4294967295.0 * huge / 1000.0 <= kMaxTickFrames);
     ASSERT_EQ(1, frameBoundedTickTimeDiffMs(kMaxStampAgeMs, 1.0e13));
-    ASSERT_EQ(-40000, frameBoundedTickTimeDiffMs(-kMaxStampAgeMs, 25000.0));
+    ASSERT_EQ(-40000000, frameBoundedTickTimeDiffMs(-kMaxStampAgeMs, 25000.0));
     // every ordinary tick is unchanged
     ASSERT_EQ(8, frameBoundedTickTimeDiffMs(8, 1000000.0));
     ASSERT_EQ(42, frameBoundedTickTimeDiffMs(42, 24.0));
