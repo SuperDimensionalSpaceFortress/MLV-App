@@ -4613,6 +4613,21 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r7 import staging')) {
         Assert-That ($r7uA -ieq $r7uWant -and $r7uB -ieq $r7uWant) 'r7 import (adversary A5): a path through a loopback share (\\localhost\C$ or \\<this machine>\C$) resolves to the physical file, so a protected file is not reachable through the share' "localhost=[$r7uA] computer=[$r7uB] want=[$r7uWant]"
         Assert-That ((Get-ImportRealPath '\\some-other-machine\share\a\CLAUDE.md') -ieq '\\some-other-machine\share\a\CLAUDE.md') 'r7 import (adversary A5): a share of another machine stays as it is' ''
     } else { Write-Host 'SKIP r7 import (adversary A5): no administrative C$ share on this machine' }
+    # pass 2 A1: a staging folder is created EXCLUSIVELY (a name that exists, whoever made it, is refused: no 'absent a moment ago, then create' window)
+    $r7xDir = Join-Path (New-Scratch 'r7-excl') 'fresh'; $r7xFirst = ''; $r7xSecond = ''
+    try { New-ExclusiveDirectory $r7xDir } catch { $r7xFirst = $_.Exception.Message }
+    $r7xMarker = Join-Path $r7xDir 'foreign.txt'; if (Test-Path -LiteralPath $r7xDir) { [IO.File]::WriteAllText($r7xMarker, 'FOREIGN') }
+    try { New-ExclusiveDirectory $r7xDir } catch { $r7xSecond = $_.Exception.Message }
+    Assert-That ((-not $r7xFirst) -and (Test-Path -LiteralPath $r7xDir -PathType Container) -and $r7xSecond -match '183' -and (Test-Path -LiteralPath $r7xMarker)) 'r7 import (adversary pass 2 A1): a staging folder is created exclusively (a folder that exists is refused with Win32 error 183 and left untouched)' "first=[$r7xFirst] second=[$r7xSecond]"
+    # pass 2 A2 (DISTINGUISHED, not reproduced: [IO.Path]::GetFullPath, the first step of Get-ImportRealPath, already expands an 8.3 short name; probe-a2.ps1 gave equal=True on the previous head). Kept as a regression guard:
+    # a protected file reached through its 8.3 short name resolves to the long-name path it is registered under
+    $r7sDir = New-Scratch 'r7-short'; $r7sLong = Join-Path $r7sDir 'settings-long-name-r7.json'; [IO.File]::WriteAllText($r7sLong, '{}')
+    $r7sShortName = ''
+    try { $r7sShortName = (New-Object -ComObject Scripting.FileSystemObject).GetFile($r7sLong).ShortName } catch { }
+    if ($r7sShortName -and $r7sShortName -ine 'settings-long-name-r7.json') {
+        $r7sGot = Get-ImportRealPath (Join-Path $r7sDir $r7sShortName); $r7sWant = Get-ImportRealPath $r7sLong
+        Assert-That ($r7sGot -ieq $r7sWant -and $r7sWant -like '*settings-long-name-r7.json') 'r7 import (adversary pass 2 A2): a path spelled with an 8.3 short name resolves to the long-name path, so a protected file is not reachable through it' "got=[$r7sGot] want=[$r7sWant] short=[$r7sShortName]"
+    } else { Write-Host 'SKIP r7 import (adversary pass 2 A2): this volume has no 8.3 short names' }
     # A6: a host file whose bytes cannot be read, renamed away while the gate reads the bundle file, is a creation (no silent skip)
     $script:R7Rot = $null
     $r7f = & $r6Run 'r7f' 'ROTATION.md' ($r6Utf8.GetBytes('FROM-BUNDLE')) 'HOST-OLD' {

@@ -2688,15 +2688,29 @@ function Get-FreshImportStagingPath {
     return ("{0}-{1}" -f $Base, [guid]::NewGuid().ToString('N').Substring(0, 12))
 }
 
+# r7 (adversary pass 2 A1): a folder created ATOMICALLY: the call fails when the name already exists. [IO.Directory]::CreateDirectory succeeds on an existing folder, so 'it did not exist a moment
+# ago, then create it' is a window in which another process can publish files under the name and have them read as this attempt's. CreateDirectoryW reports ERROR_ALREADY_EXISTS (183) instead.
+function New-ExclusiveDirectory {
+    param([string]$Path)
+    if (-not ('MlvImport.NativeDir' -as [type])) {
+        Add-Type -Namespace MlvImport -Name NativeDir -MemberDefinition '[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)] public static extern bool CreateDirectoryW(string lpPathName, System.IntPtr lpSecurityAttributes);'
+    }
+    $full = [IO.Path]::GetFullPath($Path)
+    [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($full))
+    if (-not [MlvImport.NativeDir]::CreateDirectoryW($full, [IntPtr]::Zero)) {
+        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "the folder $full could not be created exclusively (Win32 error $err$(if ($err -eq 183) { ': it already exists and may hold files of an earlier attempt or of another process' }))"
+    }
+}
+
 # p5 A9: a private copy of a bundle FOLDER. Import scans and then copies; between the two a writer could swap the file, so both work from this
 # snapshot, which only this run can write to. Returns the snapshot path.
 function New-ImportSnapshot {
     param([string]$From, [string]$To)
-    # r7: the snapshot is built in a folder this call creates; one that already exists holds files of an earlier attempt, which /E would keep
-    if ([IO.Directory]::Exists($To) -or [IO.File]::Exists($To)) { throw "the snapshot folder $To already exists (it may hold files of an earlier attempt)" }
     # r7 (adversary pass 1 A4): a bundle folder that is gone is a failed snapshot. The robocopy wrapper only warns about a missing source and returns, which used to end this step as 'done'.
     if (-not (Test-Path -LiteralPath $From -PathType Container)) { throw "the bundle folder $From does not exist, so no snapshot of it can be made" }
-    [void][IO.Directory]::CreateDirectory($To)
+    # r7: the snapshot is built in a folder this call creates itself (exclusively): one that already exists holds files of an earlier attempt or of another process, which /E would keep
+    New-ExclusiveDirectory $To
     $script:ImportSnapshotOwned = $To   # r7 (adversary pass 1 A2): from here this call owns the folder; only an owned folder is removed when the snapshot fails
     Invoke-Robocopy $From $To @() @('/E', '/COPY:DAT')
     return $To
@@ -3810,9 +3824,8 @@ function Invoke-PhaseImport {
         # (left by an earlier, failed phase of the same run, which shares the stamp) are not proof: a declined step adds no failure and leaves that folder to be read as this run's expansion.
         $script:ImportExpandDone = $false
         Invoke-Step "Expand $BundlePath to $src" {
-            # r7: this step creates the folder; one that appeared since the name was chosen is not entered
-            if ([IO.Directory]::Exists($src) -or [IO.File]::Exists($src)) { throw "the expansion folder $src already exists (it may hold files of an earlier attempt)" }
-            [void][IO.Directory]::CreateDirectory($src)
+            # r7: this step creates the folder itself, exclusively; one that appeared since the name was chosen is not entered
+            New-ExclusiveDirectory $src
             # r6 (sol r5, hardening): bounded (15 min): a read that stalls inside tar fails the step, and the typed IMPORT_BUNDLE_EXPAND_FAILED below follows, instead of waiting for ever
             [void](Invoke-Native -Exe (Join-Path $env:SystemRoot 'System32\tar.exe') -Arguments @('-x', '-f', $BundlePath, '-C', $src) -TimeoutSec 900)
             $script:ImportExpandDone = $true
