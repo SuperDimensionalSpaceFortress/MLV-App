@@ -178,8 +178,11 @@ def batch_log(exported: int, skipped: int = 0, elapsed: float = 20.0, verified: 
 
 def output_manifest(count: int, kind: str = "dng") -> str:
     # r19 (sol r18 B3): the endpoint records carry their byte size, as export-stage-job.ps1 writes them, and agree with totalBytes (one file: first and last are that file)
-    first = {"name": "a", "bytes": 1000, "sha256": "1" * 64} if count > 0 else None
-    last = ({"name": "a", "bytes": 1000, "sha256": "1" * 64} if count == 1 else {"name": "b", "bytes": 1000, "sha256": "2" * 64}) if count > 0 else None
+    # (EXPORT-RENDER-PIPE-TIMING-1 r5, sol r4 B3 forced companion: a .mov manifest names the file the fixtures' RENDER_START out=view-0.mov declares, as export-stage-job.ps1
+    # lists the leaf of the one .mov it found; the reader now binds the two)
+    one = "view-0.mov" if kind == "mov" else "a"
+    first = {"name": one, "bytes": 1000, "sha256": "1" * 64} if count > 0 else None
+    last = ({"name": one, "bytes": 1000, "sha256": "1" * 64} if count == 1 else {"name": "b", "bytes": 1000, "sha256": "2" * 64}) if count > 0 else None
     return json.dumps({"schema": "export-stage-output-manifest.v1", "kind": kind, "count": count, "totalBytes": count * 1000,
                        "first": first, "last": last, "deleted": True})
 
@@ -1317,8 +1320,12 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
             self.assertTrue(g["classMismatch"])
             self.assertIs(g["metrics"]["dualIsoClassAgrees"], False)
         self.assertEqual(got[0]["metrics"]["dualIsoActiveFrames"], 0)
-        self.assertIs(got[2]["metrics"]["dualIsoClassAgrees"], True, got[2])   # control: no dual-ISO on a no-dual-ISO leg
-        self.assertEqual(got[2]["outcome"], "PASS", got[2])
+        # (r5, sol r4 B8 forced companion: 0.000 on every frame is a ROUNDED figure, so on a no-dual-ISO leg it cannot show that no attempt ran: the typed UNKNOWN, never
+        # agreement, and no class mismatch either)
+        self.assertIsNone(got[2]["metrics"]["dualIsoClassAgrees"], got[2])
+        self.assertFalse(got[2]["classMismatch"], got[2])
+        self.assertIn(DUALISO_UNKNOWN, got[2]["metrics"]["dualIsoClassAgreesCouldNotCheck"], got[2])
+        self.assertEqual(got[2]["problems"], [], got[2])
 
     def test_r4_a_dual_iso_figure_longer_than_its_llrawproc_is_a_containment_problem(self) -> None:
         proc, got = evidence_cases([self.case(piped_stage_log(30, dual_iso_ms=35.0, llrawproc_ms=20.0)), self.case(piped_stage_log(30, dual_iso_ms=20.0, llrawproc_ms=20.0))])
@@ -1420,7 +1427,8 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         """adversary A3 on 33f7a05a: the reader never read RENDER_START, so a scaled plan with no export_scale (its residual 6 ms high) and an unscaled plan carrying export_scale
         (6 ms subtracted for work it declared none of) both read PASS. A build of this card declares scaled= and times export_scale on every frame exactly when it is true."""
         def batch(scaled: bool, src: str, out: str) -> str:
-            return batch_log(480, verified=480, elapsed=60.0, scaled=None).replace(
+            # (r5, sol r4 B3 forced companion: the verified dimensions are the declared output's, as the producer's RENDER_VERIFIED prints outWidth x outHeight)
+            return batch_log(480, verified=480, elapsed=60.0, scaled=None).replace(" dimensions=1x1 ", f" dimensions={out} ").replace(
                 "[BATCH] RENDER_VERIFIED", f"[BATCH] RENDER_START view-0 codec=prores container=mov source={src} output={out} scaled={'true' if scaled else 'false'} fps=24 "
                                            "frames=480 cutIn=1 cutOut=480 out=view-0.mov\n[BATCH] RENDER_VERIFIED", 1)
         scaled_log = piped_stage_log(480, scale_ms=6.0)
@@ -1853,7 +1861,9 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
             return ("[BATCH] RENDER_START view-0 codec=prores container=mov source=1x1 output=1x1 scaled=false fps=24 frames=24 cutIn=1 cutOut=24 out=view-0.mov\n"
                     f"[BATCH] RENDER_VERIFIED view-0 decoded_frames=24\n[BATCH] DONE view-0 exported=24 skipped=0 elapsed={elapsed}\n")
         mk = lambda d, v, e: prores_case(maxFrames=24, dualIsoExpected=True, stage=log(d, v), batch=batch(e), criteria=[])
-        proc, got = evidence_cases([mk("0.000", "86400000.000000001", "86400.0"), mk("778440.000", "3000000.000009601", "3600.0"), mk("778440.000", "2999999.999", "3600.0")])
+        # (r5, sol r4 B4 forced companion: the wall limit is built from the largest wall elapsed=3600.0 rounds from, 3600.05 s, so the verify figure 9.6e-6 ms past it is
+        # 52.5 ms higher: 0.05 s over 24 frames is 2.083 ms per frame, times the 1.05 tolerance 2.1875 ms, times 24 frames)
+        proc, got = evidence_cases([mk("0.000", "86400000.000000001", "86400.0"), mk("778440.000", "3000052.500009601", "3600.0"), mk("778440.000", "3000052.499", "3600.0")])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         self.assertEqual(got[0]["outcome"], "INVALID", got[0])
         self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "ceiling" in p for p in got[0]["problems"]), got[0])
@@ -1983,6 +1993,130 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
                         self.assertIn(want, crit)
             self.assertIs(spec["export"]["dualIsoExpected"], True, name)
             self.assertNotIn("forceLookAssist", json.dumps(spec), name)
+
+    # --- r5: sol r4 on 54abfe1a, B2 B3 B4 B8 B9 (each from sol's literal row; hub ruling HUB-TICK 20261124T0042Z)
+    def test_r5_sol_b2_a_second_render_total_or_a_frame_never_written_is_invalid(self) -> None:
+        """sol r4 B2: a second processed16_total of 20 ms on frame 0, between its export_scale and its export_pipe_write, was summed into the timed work (76 ms, untimed
+        20 ms lower) with no problem; and a record of frame 1 after a one-frame cut's write, before the drain, opened a frame that nothing closed. Both are INVALID.
+        Controls: the producer's own logs."""
+        scaled = self.ctl_batch(self.CTL_START.replace("scaled=false", "scaled=true"))
+        base = piped_stage_log(480, scale_ms=6.0)
+        dup = base.replace("[mlv-stage-timing] frame=0 stage=export_scale ms=6.000\n",
+                           "[mlv-stage-timing] frame=0 stage=export_scale ms=6.000\n[mlv-stage-timing] frame=0 stage=processed16_total ms=20.000\n", 1)
+        self.assertNotEqual(dup, base)
+        one = piped_stage_log(1)
+        extra = one.replace("[mlv-stage-timing] frame=0 stage=export_pipe_drain", "[mlv-stage-timing] frame=1 stage=raw_uint16_copy ms=0.001\n[mlv-stage-timing] frame=0 stage=export_pipe_drain", 1)
+        self.assertNotEqual(extra, one)
+        one_batch = ("[BATCH] RENDER_START view-0 codec=prores container=mov source=1x1 output=1x1 scaled=false fps=24 frames=1 cutIn=1 cutOut=1 out=view-0.mov\n"
+                     "[BATCH] RENDER_VERIFIED view-0 decoded_frames=1\n[BATCH] DONE view-0 exported=1 skipped=0 elapsed=1.0\n")
+        mk1 = lambda s: prores_case(maxFrames=1, dualIsoExpected=True, stage=s, batch=one_batch, criteria=[])
+        proc, got = evidence_cases([self.ctl(dup, batch=scaled), mk1(extra), self.ctl(base, batch=scaled), mk1(one)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "INVALID", got[0])
+        self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "processed16_total" in p and "twice" in p for p in got[0]["problems"]), got[0])
+        self.assertEqual(got[1]["outcome"], "INVALID", got[1])
+        self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "frame 1" in p and "never written" in p for p in got[1]["problems"]), got[1])
+        assert_clean_but_dual_iso_unknown(self, got[2])
+        self.assertEqual(got[3]["problems"], [], got[3])
+
+    def test_r5_sol_b3_the_declaration_names_this_exports_mov_and_its_verified_dimensions(self) -> None:
+        """sol r4 B3: out=foreign.mov beside a manifest that lists view-0.mov, and RENDER_START output=1920x1440 beside RENDER_VERIFIED dimensions=1920x1080, each read no
+        problem. Both are EXPORT_OUTPUT_MISMATCH. Controls: an absolute out= path whose leaf is the manifest's file, and the verified dimensions equal to the declared output."""
+        verified = "[BATCH] RENDER_VERIFIED view-0 decoded_frames=480 decoded_duration=20.000 decoded_frame_bytes=1 dimensions={d} bytes=9 codec=prores container=mov"
+        done = "[BATCH] DONE view-0 exported=480 skipped=0 elapsed=60.0"
+        def batch(start: str, dims: str) -> str:
+            return "\n".join((start, verified.format(d=dims), done)) + "\n"
+        start = self.CTL_START
+        foreign = start.replace("out=view-0.mov", "out=foreign.mov")
+        absolute = start.replace("out=view-0.mov", "out=C:/venue/work/out/view-0.mov")
+        wide = start.replace("output=1920x1080 scaled=false", "output=1920x1440 scaled=true")
+        scaled_log = piped_stage_log(480, scale_ms=6.0)
+        proc, got = evidence_cases([self.ctl(batch=batch(foreign, "1920x1080")), self.ctl(scaled_log, batch=batch(wide, "1920x1080")),
+                                    self.ctl(scaled_log, batch=batch(wide, "1920x1440 dimensions=1920x1080")),
+                                    self.ctl(batch=batch(absolute, "1920x1080")), self.ctl(scaled_log, batch=batch(wide, "1920x1440"))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g, what in zip(got[:3], ("foreign.mov", "dimensions=1920x1080", "dimensions=")):
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and what in p for p in g["problems"]), g)
+        for g in got[3:]:
+            assert_clean_but_dual_iso_unknown(self, g)
+
+    @staticmethod
+    def small_log(frames: int, p16: str = "11.000", drain: str = "25.000", verify: str = "30.000", children: tuple = (("raw_uint16", 2.0), ("llrawproc", 3.0), ("llrawproc_dual_iso", 2.5), ("debayered_frame", 8.0), ("processing", 3.0)), pipe: str = "1.000") -> str:
+        per = "".join("".join(f"[mlv-stage-timing] frame={i} stage={s} ms={ms:.3f}\n" for s, ms in children) + f"[mlv-stage-timing] frame={i} stage=processed16_total ms={p16}\n"
+                      f"[mlv-stage-timing] frame={i} stage=export_pipe_write ms={pipe}\n" for i in range(frames))
+        return per + f"[mlv-stage-timing] frame={frames - 1} stage=export_pipe_drain ms={drain}\n[mlv-stage-timing] frame={frames - 1} stage=export_verify ms={verify}\n"
+
+    @staticmethod
+    def small_batch(frames: int, elapsed: str) -> str:
+        return (f"[BATCH] RENDER_START view-0 codec=prores container=mov source=1x1 output=1x1 scaled=false fps=24 frames={frames} cutIn=1 cutOut={frames} out=view-0.mov\n"
+                f"[BATCH] RENDER_VERIFIED view-0 decoded_frames={frames}\n[BATCH] DONE view-0 exported={frames} skipped=0 elapsed={elapsed}\n")
+
+    def test_r5_sol_b4_the_wall_is_the_largest_one_the_printed_elapsed_rounds_from(self) -> None:
+        """sol r4 B4 (rounding): 24 frames and 343 ms of timed work inside a 348 ms wall, which DONE prints as elapsed=0.3 (BatchRunner.cpp rounds to tenths), read INVALID.
+        The wall gate holds the work inside the largest wall the figure rounds from (0.35 s). Controls: the same work at elapsed=0.348 reads clean, and elapsed=0.2 (a wall
+        of at most 0.25 s, shorter than the work) stays INVALID."""
+        log = self.small_log(24)
+        mk = lambda e: prores_case(maxFrames=24, dualIsoExpected=True, stage=log, batch=self.small_batch(24, e), criteria=[])
+        proc, got = evidence_cases([mk("0.3"), mk("0.348"), mk("0.2")])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["problems"], [], got[0])
+        self.assertEqual(got[1]["problems"], [], got[1])
+        self.assertEqual(got[2]["outcome"], "INVALID", got[2])
+        self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "batch_wall_per_frame" in p for p in got[2]["problems"]), got[2])
+
+    def test_r5_sol_b4_the_wall_limit_is_held_on_the_exact_record_figures_at_the_decimal_bound(self) -> None:
+        """sol r4 B4 (decimal bound): 24 render totals one digit past the wall limit, with every pipe time 0.000, read PASS: the totals went through a double, which keeps about
+        15 digits, so 3500001.000000401 read as 3500001.0000004. sol's row is at elapsed=80000.0, whose limit r5 builds from the 80000.05 s wall that figure rounds from; the
+        same bound is held here at a 9-decimal elapsed, where half its last place is 5e-10 s: the first 9-decimal total past the exact limit is INVALID, the last one at or
+        under it is clean."""
+        from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+        elapsed = "80000.000000000"
+        wall = (Decimal(elapsed) + Decimal("0.0000000005")) * 1000 / 24
+        limit = wall * Decimal("1.05") + Decimal("1.0") + Decimal("0.0000004")
+        over = limit.quantize(Decimal("0.000000001"), rounding=ROUND_CEILING)
+        if over == limit:
+            over += Decimal("0.000000001")
+        at = limit.quantize(Decimal("0.000000001"), rounding=ROUND_FLOOR)
+        # the bite: at 15 significant digits (what [decimal][double] keeps) the over-limit total is not past the limit
+        self.assertLessEqual(Decimal(format(float(over), ".15g")), limit, "this row no longer exercises the double's lost digits")
+        mk = lambda t: prores_case(maxFrames=24, dualIsoExpected=True, stage=self.small_log(24, p16=str(t), drain="0.000", verify="0.000", pipe="0.000"),
+                                   batch=self.small_batch(24, elapsed), criteria=[])
+        proc, got = evidence_cases([mk(over), mk(at)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "INVALID", (str(over), str(limit), got[0]))
+        self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "batch_wall_per_frame" in p for p in got[0]["problems"]), got[0])
+        self.assertEqual(got[1]["problems"], [], (str(at), got[1]))
+
+    def test_r5_sol_b8_a_rounded_zero_dual_iso_figure_is_no_proof_that_no_attempt_ran(self) -> None:
+        """sol r4 B8: StageTiming.h prints %.3f, so an attempt of 0.0004 ms prints 0.000; with dualIsoExpected=false a log of 0.000 on every frame read agreement (PASS).
+        It is the typed UNKNOWN. Control: on a dual-ISO leg the same log is still the class mismatch (0 ms on every frame: nothing was reconstructed)."""
+        log = piped_stage_log(480, dual_iso_ms=0.0)
+        proc, got = evidence_cases([self.ctl(log, dualIsoExpected=False), self.ctl(log)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["problems"], [], got[0])
+        self.assertFalse(got[0]["classMismatch"], got[0])
+        self.assertIsNone(got[0]["metrics"]["dualIsoClassAgrees"], got[0])
+        self.assertNotEqual(got[0]["outcome"], "PASS", got[0])
+        self.assertIn(DUALISO_UNKNOWN, got[0]["metrics"]["dualIsoClassAgreesCouldNotCheck"], got[0])
+        self.assertTrue(got[1]["classMismatch"], got[1])
+        self.assertEqual(got[1]["outcome"], "INVALID", got[1])
+
+    def test_r5_sol_b9_a_frame_rate_outside_a_uint32_ratio_is_foreign(self) -> None:
+        """sol r4 B9: fps=1e+20 read no problem, but the producer's rate is the clip's uint32 numerator over its uint32 denominator, printed to six significant digits.
+        Controls: both ends of that range as QLocale prints them."""
+        s = self.CTL_START
+        good = [s.replace("fps=24", f) for f in ("fps=4.29497e+09", "fps=2.32831e-10")]
+        bad = [s.replace("fps=24", f) for f in ("fps=1e+20", "fps=4.29498e+09", "fps=2.3283e-10")]
+        proc, got = evidence_cases([self.ctl(batch=self.ctl_batch(x)) for x in good + bad])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for x, g in zip(good, got[:len(good)]):
+            with self.subTest(start=x):
+                assert_clean_but_dual_iso_unknown(self, g)
+        for x, g in zip(bad, got[len(good):]):
+            with self.subTest(start=x):
+                self.assertEqual(g["outcome"], "INVALID", g)
+                self.assertTrue(any(p.startswith("EXPORT_PROFILE_FOREIGN") and "fps=" in p for p in g["problems"]), g)
 
 
 EXPORT_STUB_GENERATOR = r"""
@@ -2450,12 +2584,15 @@ class CdngTotalContainmentTests(unittest.TestCase):
     def test_a_mean_a_full_emitted_increment_over_the_exact_limit_is_refused_and_one_at_the_limit_is_not(self) -> None:
         """r3 B1 (sol r2 INV-4, literal inputs): the comparator rounded BOTH sides to the writers' 6 decimals before comparing, so a mean over the limit by one full emitted increment
         (1e-6 ms; 128 frames of elapsed=12.3 -> limit 101.8984375, producer timings split 101.898438 / 101.898439 -> mean 101.8984385, both round to 101.898438) read PASS at every gate that uses
-        it. The same literal input at each: the CDNG and ProRes wall gates, the CDNG mean-pair gate, the disjoint-mean gate and the per-frame sum. Each has a control exactly AT its limit."""
+        it. The same literal input at each: the CDNG and ProRes wall gates, the CDNG mean-pair gate, the disjoint-mean gate and the per-frame sum. Each has a control exactly AT its limit.
+        (EXPORT-RENDER-PIPE-TIMING-1 r5, sol r4 B4 forced companion: the wall gates now hold the work inside the largest wall the printed elapsed rounds from, the figure plus
+        half its last place; elapsed=12.3 is a wall of up to 12.35 s. The wall rows print the same 12.3 s to nine places, 12.300000000, whose half place, 5e-10 s, moves
+        the limit by 4.1e-9 ms, under a tenth of the one-increment overrun this test holds.)"""
         def wall(lo: float, hi: float) -> dict:
             doc = json.loads(cdng_profile(128))
             for i, r in enumerate(doc["frames"]):
                 r["producer_frame_ms"] = lo if i < 64 else hi
-            return cdng_case(maxFrames=128, profile=json.dumps(doc), batch=batch_log(128, elapsed=12.3), manifest=output_manifest(128), criteria=[])
+            return cdng_case(maxFrames=128, profile=json.dumps(doc), batch=batch_log(128, elapsed=12.3).replace("elapsed=12.3", "elapsed=12.300000000"), manifest=output_manifest(128), criteria=[])
 
         def prores_wall(lo: float, hi: float) -> dict:
             out = []
@@ -2463,7 +2600,7 @@ class CdngTotalContainmentTests(unittest.TestCase):
                 p16 = lo if i < 64 else hi
                 for name, ms in (("raw_uint16_disk_read", 0.0), ("raw_uint16_decompress", 0.0), ("raw_uint16", 0.0), ("llrawproc", 0.0), ("debayered_frame", p16), ("processing", 0.0), ("processed16_total", p16)):
                     out.append(f"[mlv-stage-timing] frame={i} stage={name} ms={ms:.6f}")
-            return prores_case(maxFrames=128, stage="\n".join(out) + "\n", batch=batch_log(128, verified=128, elapsed=12.3), criteria=[])
+            return prores_case(maxFrames=128, stage="\n".join(out) + "\n", batch=batch_log(128, verified=128, elapsed=12.3).replace("elapsed=12.3", "elapsed=12.300000000"), criteria=[])
 
         def pair(lo: float, hi: float) -> dict:   # producer 40.000030, raw_read split lo / hi (limit 43.0000315)
             return cdng_case(dualIsoExpected=False, criteria=[], profile=cdng_total_profile(zero=True, set_rows={"producer_frame_ms": 40.00003}, per_frame={i: {"raw_read_ms": lo if i % 2 == 0 else hi} for i in range(30)}))

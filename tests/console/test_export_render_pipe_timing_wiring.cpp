@@ -150,3 +150,33 @@ TEST(ExportRenderPipeTimingWiring, EveryBatchExportNoteGoesThroughTheGuardedHelp
     ASSERT_TRUE(firstStatement(functionBody(helper, QStringLiteral("void note("))) == QStringLiteral("if( !on ) return;"));
     ASSERT_TRUE(firstStatement(functionBody(helper, QStringLiteral("double start() const"))) == QStringLiteral("return on ? mlv_stage_timing_now() : 0.0;"));
 }
+
+// r5 (sol r4 B5): the avir worker pool joins its threads in its destructor (platform/qt/avir/ThreadPool.h), so a note
+// written inside the pool's scope stops the clock before that join and leaves it in the untimed residual. The pool, the
+// resizer and its vars live in a block that closes BEFORE the export_scale note, and the clock starts before that block.
+TEST(ExportRenderPipeTimingWiring, TheScaleStampTimesTheWorkerPoolTeardown)
+{
+    const QString runner = readRepoFile(QStringLiteral("src/batch/BatchRunner.cpp"));
+    const int start = runner.indexOf(QStringLiteral("const double scaleStart = stageTiming.start();"));
+    const int pool = runner.indexOf(QStringLiteral("avir_scale_thread_pool scaling_pool;"));
+    const int note = runner.indexOf(QStringLiteral("stageTiming.note( MLV_STAGE_EXPORT_SCALE, frameIndex, scaleStart );"));
+    ASSERT_TRUE(start > 0);
+    ASSERT_TRUE(pool > start);
+    ASSERT_TRUE(note > pool);
+    ASSERT_EQ(1, countOccurrences(runner, QStringLiteral("avir_scale_thread_pool scaling_pool;")));
+    // the pool's enclosing block opens between the clock start and the pool, and closes between the pool and the note
+    int depth = 0;
+    for (int i = start; i < pool; ++i) {
+        if (runner.at(i) == QLatin1Char('{')) ++depth;
+        else if (runner.at(i) == QLatin1Char('}')) --depth;
+    }
+    if (depth < 1) std::cerr << "the worker pool is not in a block of its own after the clock start (BatchRunner.cpp)\n";
+    ASSERT_TRUE(depth >= 1);
+    const int poolDepth = depth;
+    for (int i = pool; i < note; ++i) {
+        if (runner.at(i) == QLatin1Char('{')) ++depth;
+        else if (runner.at(i) == QLatin1Char('}')) --depth;
+    }
+    if (depth >= poolDepth) std::cerr << "the export_scale note is inside the worker pool's scope (BatchRunner.cpp)\n";
+    ASSERT_TRUE(depth < poolDepth);
+}
