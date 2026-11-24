@@ -5278,7 +5278,9 @@ function ConvertFrom-DvBatchLogLine {
         }
         $values[$g.rest] = $body
         $on = @($sentinel.Keys | Where-Object { [string]::Equals([string]$values[$_], [string]$sentinel[$_], [StringComparison]::Ordinal) })
-        if ($on -ccontains $g.rest -or $on -ccontains 'probe_source') {
+        # (TIMING-3 r1, adversary pass 1 A2 on 23d3920a: ANY one of the six no-probe values binds the other five, not only container_probe= / probe_source=: a real probe
+        # with codec=unchecked, container=unchecked, sar=unchecked or dar=unchecked read PASS; the producer prints 'unchecked' only with no probe)
+        if ($on.Count -gt 0) {
             $off = @($sentinel.Keys | Where-Object { $on -cnotcontains $_ })
             if ($off.Count -gt 0) {
                 $want = @($sentinel.Keys | ForEach-Object { "$_=$($sentinel[$_])" }) -join ' '
@@ -5421,7 +5423,8 @@ function Get-DvBatchExportBindingProblems {
     $problems = [System.Collections.Generic.List[string]]::new()
     $decl = $null
     $clip = $Batch.done.clip
-    if ($Format -ceq 'cdng-lossless' -and $clip -is [string] -and ($OutputCount -is [int] -or $OutputCount -is [long]) -and $OutputCount -gt 0) {
+    # (adversary pass 1 A3 on 23d3920a: the job's generator ValidateSet admits CDNG-LOSSLESS and every job branch compares case-insensitively, so this one does too)
+    if ($Format -eq 'cdng-lossless' -and $clip -is [string] -and ($OutputCount -is [int] -or $OutputCount -is [long]) -and $OutputCount -gt 0) {
         foreach ($leaf in @($FirstName, $LastName)) {
             if ($leaf -isnot [string]) { continue }
             $bound = $leaf.StartsWith("$($clip)_", [StringComparison]::Ordinal) -and [regex]::IsMatch($leaf.Substring($clip.Length + 1), $script:ExportCdngFrameLeaf)
