@@ -2736,11 +2736,14 @@ function Read-DvBytesWithFileKey([string]$Path, $Reader) {
     $r = & $Reader ([IO.Path]::GetFullPath($Path))
     $r = @($r)
     if ($r.Count -ne 1 -or $null -eq $r[0]) { throw "the file-key reader gave no single answer" }
-    $state = [string]$r[0].state
-    if ($state -ceq 'TIMEOUT') { throw "the read did not answer within the time left before -DeadlineUtc" }
-    if ($state -cne 'OK') { throw "the read failed ($([string]$r[0].error -replace '\s+', ' '))" }
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r1 (adversary pass 8 A10, sol r5 hardening 2): the answer is read as it is, never coerced: state is a string 'OK' and key a string,
+    # either '' (no identity here: the caller's own refusal names it, as off Windows) or the volume:file-index form; @('OK'), ' ' or an array key is refused
+    $state = $r[0].state; $key = $r[0].key
+    if ($state -is [string] -and $state -ceq 'TIMEOUT') { throw "the read did not answer within the time left before -DeadlineUtc" }
+    if (-not ($state -is [string] -and $state -ceq 'OK')) { throw "the read failed ($([string]$r[0].error -replace '\s+', ' '))" }
     if ($r[0].bytes -isnot [byte[]]) { throw "the read answered no bytes" }
-    [pscustomobject]@{ bytes = [byte[]]$r[0].bytes; key = [string]$r[0].key }
+    if (-not ($key -is [string] -and ($key -ceq '' -or $key -cmatch '^[0-9a-f]{8}:[0-9a-f]{16}\z'))) { throw "the read answered no usable file identity" }
+    [pscustomobject]@{ bytes = [byte[]]$r[0].bytes; key = $key }
 }
 
 function Get-DvLegSetPlan {
