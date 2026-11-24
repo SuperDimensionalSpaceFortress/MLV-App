@@ -175,3 +175,57 @@ TEST(PlaybackFpsMeterWiring, MonotonicClockAndResetWiringRejectTheirMutations)
         "        resetFpsMeterIfIdle( nowTime );\n"
         "        lastTime.start(); //do that for calculation of timeDiff for DropFrameMode;\n")));
 }
+
+// adversary r2 A7 (3bb01140): the cap pin accepted a dead `if( false )` line in front of the cap, and the reset pin
+// accepted `|| true` after the policy call (both pins stopped short of the statement's end). Each pin now holds the
+// whole statement and its neighbours contiguously, and each rejects its mutation applied in memory to the real source.
+namespace
+{
+bool frameCapIsLive(const QString & body)
+{
+    return body.contains(QStringLiteral(
+        "ui->actionPlay->isChecked(), hadPendingAdvance );\n"
+        "    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 (adversary r2 A1): one tick never asks the drop-frame loop for more frames than\n"
+        "    // it can count (a long suspension at a high source rate); every ordinary tick is unchanged.\n"
+        "    timeDiff = playback_fps_meter::frameBoundedTickTimeDiffMs( timeDiff, getPlaybackFramerate() );\n"
+        "\n"
+        "    //Playback\n"));
+}
+
+bool fpsResetIsConditional(const QString & body)
+{
+    return body.contains(QStringLiteral(
+        "        const bool hasDraw = lastDrawTime.isValid();\n"
+        "        if( playback_fps_meter::fpsMeterShouldReset( ui->actionPlay->isChecked(), hasDraw,\n")
+        + QString(53, QLatin1Char(' '))
+        + QStringLiteral(
+        "hasDraw ? playback_fps_meter::stampAgeMs( lastDrawTime, now ) : 0 ) )\n"
+        "        {\n"
+        "            const QString playbackFpsText = playback_conform::playbackFpsStatusText(\n"));
+}
+} // namespace
+
+TEST(PlaybackFpsMeterWiring, CapAndResetPinsRejectADeadCapAndAnUnconditionalReset)
+{
+    const QString body = timerFrameEventBody();
+    ASSERT_FALSE(body.isEmpty());
+    ASSERT_TRUE(frameCapIsLive(body));
+    ASSERT_TRUE(fpsResetIsConditional(body));
+
+    const QString capLine = QStringLiteral(
+        "    timeDiff = playback_fps_meter::frameBoundedTickTimeDiffMs( timeDiff, getPlaybackFramerate() );\n");
+    ASSERT_EQ(1, body.count(capLine));
+    QString deadCap = body;
+    deadCap.replace(capLine, QStringLiteral("    if( false )\n") + capLine);
+    ASSERT_FALSE(frameCapIsLive(deadCap));
+
+    const QString resetTail = QStringLiteral("stampAgeMs( lastDrawTime, now ) : 0 ) )\n");
+    ASSERT_EQ(1, body.count(resetTail));
+    QString alwaysReset = body;
+    alwaysReset.replace(resetTail, QStringLiteral("stampAgeMs( lastDrawTime, now ) : 0 ) || true )\n"));
+    ASSERT_FALSE(fpsResetIsConditional(alwaysReset));
+    QString alwaysResetFront = body;
+    alwaysResetFront.replace(QStringLiteral("if( playback_fps_meter::fpsMeterShouldReset("),
+                             QStringLiteral("if( true || playback_fps_meter::fpsMeterShouldReset("));
+    ASSERT_FALSE(fpsResetIsConditional(alwaysResetFront));
+}

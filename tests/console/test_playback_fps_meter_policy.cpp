@@ -207,3 +207,62 @@ TEST(PlaybackFpsMeterPolicy, OneTickNeverAsksForMoreFramesThanTheLoopCanCount)
     ASSERT_EQ(1, frameBoundedTickTimeDiffMs(1, 25000.0));
     ASSERT_EQ(7, frameBoundedTickTimeDiffMs(7, 0.0)); // no rate: nothing to bound
 }
+
+// PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r3 (adversary pass 4 on 3bb01140).
+// A1: a 1e9-frame bound still let a width-1 Loop cut take about 1e9 laps in one tick, and the wrap recorder
+// (PlaybackWrapRecorder::noteEngineWrap) loops and appends once per lap on the GUI thread. The LAP WORK is bounded.
+// A2: the reciprocal rounds, so the bounded age must be re-checked with the call site's own expression
+// (MainWindow::playbackHandling: framerate * (double)timeDiff / 1000.0).
+// A3: past the rate where even 1 ms exceeds the cap, the tick asks for nothing rather than breach it.
+TEST(PlaybackFpsMeterPolicy, OneTickBoundsItsLoopLapWorkAndItsRoundedRequest)
+{
+    using playback_fps_meter::frameBoundedTickTimeDiffMs;
+    using playback_fps_meter::kMaxStampAgeMs;
+    using playback_fps_meter::kMaxTickFrames;
+    // A1: a one-day suspension at a 25000 fps source on Loop cut 1..2 (width 1)
+    const playback_frame_range::DropFrameTickResult lapTick = playback_frame_range::advanceDropFrameTick(
+        0.0, 25000.0 * frameBoundedTickTimeDiffMs(86400000, 25000.0) / 1000.0, 1, 2, true);
+    ASSERT_TRUE(lapTick.wrapped);
+    ASSERT_TRUE(lapTick.wrapLaps <= 1000000);
+    ASSERT_TRUE(lapTick.position >= 0.0 && lapTick.position < 1.0);
+    // the pre-existing class: a wall-clock age just after local midnight (base QTime, about +86,398,000 ms) is the same loop
+    const playback_frame_range::DropFrameTickResult midnightTick = playback_frame_range::advanceDropFrameTick(
+        0.0, 25000.0 * frameBoundedTickTimeDiffMs(86398000, 25000.0) / 1000.0, 1, 2, true);
+    ASSERT_TRUE(midnightTick.wrapLaps <= 1000000);
+    // ...and the wrap recorder's per-lap work for that tick is bounded with it (reached only once the laps are bounded:
+    // a failed ASSERT throws, so the RED tree never appends a billion laps here)
+    playback_frame_range::PlaybackWrapRecorder recorder;
+    recorder.noteEngineWrap(lapTick.wrapWidth, lapTick.wrapLaps);
+    ASSERT_TRUE(recorder.engineWrapWidths.size() <= 1000000u);
+}
+
+TEST(PlaybackFpsMeterPolicy, OneTickBoundIsRecheckedWithTheCallSitesOwnRoundedExpression)
+{
+    using playback_fps_meter::frameBoundedTickTimeDiffMs;
+    using playback_fps_meter::kMaxStampAgeMs;
+    using playback_fps_meter::kMaxTickFrames;
+    // A2: 781250000/821 fps, age 1,050,881 ms: the reciprocal rounded to 1,050,880 ms, 1e9 + 1 ulp frames
+    const double rate = 781250000.0 / 821.0;
+    const int up = frameBoundedTickTimeDiffMs(1050881, rate);
+    const int down = frameBoundedTickTimeDiffMs(-1050881, rate);
+    ASSERT_TRUE(rate * (double)up / 1000.0 <= kMaxTickFrames);
+    ASSERT_TRUE(rate * (double)down / 1000.0 >= -kMaxTickFrames);
+    ASSERT_TRUE(rate * (double)up / 1000.0 <= 1000000.0);
+    ASSERT_EQ(-up, down);
+    // the same rounding at the 1e6 bound, at a plausible rate: 96250/539 fps (178.57), whose reciprocal rounds UP
+    const double plausible = 96250.0 / 539.0;
+    const int p = frameBoundedTickTimeDiffMs(kMaxStampAgeMs, plausible);
+    ASSERT_TRUE(plausible * (double)p / 1000.0 <= 1000000.0);
+    ASSERT_TRUE(plausible * (double)( p + 1 ) / 1000.0 > 1000000.0); // and it is the largest such age
+    ASSERT_EQ(-p, frameBoundedTickTimeDiffMs(-kMaxStampAgeMs, plausible));
+}
+
+TEST(PlaybackFpsMeterPolicy, OneTickAsksForNothingWhenEvenOneMillisecondIsPastTheBound)
+{
+    using playback_fps_meter::frameBoundedTickTimeDiffMs;
+    using playback_fps_meter::kMaxStampAgeMs;
+    // A3: even 1 ms is past the cap here: ask for nothing, either way
+    ASSERT_EQ(0, frameBoundedTickTimeDiffMs(kMaxStampAgeMs, 1.0e13));
+    ASSERT_EQ(0, frameBoundedTickTimeDiffMs(-kMaxStampAgeMs, 1.0e13));
+    ASSERT_TRUE(4294967295.0 * (double)frameBoundedTickTimeDiffMs(kMaxStampAgeMs, 4294967295.0) / 1000.0 <= 1000000.0);
+}
