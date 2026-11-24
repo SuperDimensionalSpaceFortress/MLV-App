@@ -2174,6 +2174,67 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         self.assertIn("rounded", g["detail"])
         self.assertIsNone(re.search(r"none of .*attempted|no (?:dual-ISO )?attempt ran|did not attempt", g["detail"]), g["detail"])
 
+    # --- r7: sol r6 on b8445c52, the one blocker only (a top-level RENDER_VERIFIED field named twice; hub ruling HUB-TICK 20261124T0602Z)
+    R7_START = ("[BATCH] RENDER_START view-0 codec=prores container=mov source=1920x1080 output=1920x1440 scaled=true fps=24 frames=1 cutIn=1 cutOut=1 "
+                "out=view-0.mov")
+    R7_DONE = "[BATCH] DONE view-0 exported=1 skipped=0 elapsed=1.0"
+    R7_HEAD = "[BATCH] RENDER_VERIFIED view-0 decoded_frames=1 decoded_duration=0.042 decoded_frame_bytes=1"
+
+    @classmethod
+    def r7_rows(cls) -> tuple:
+        """(bad, good) RENDER_VERIFIED lines for one complete one-frame emitting ProRes capture declaring output=1920x1440. bad: a field the rendered runner writes once
+        (BatchRunner.cpp:803, every field before container_probe=) named twice at top level, sol r6's literal row first. good: the producer's own line, and one whose
+        verbatim probe path holds field-like text (r6 B3: never the field)."""
+        h = cls.R7_HEAD
+        bad = [f"{h} dimensions=1920x1440 bytes=9 dimensions=1280x720 container_probe=C:/kit/ffprobe.exe",   # sol r6's literal row
+               f"{h} dimensions=1920x1440 bytes=9 dimensions=1920x1440 container_probe=C:/kit/ffprobe.exe",  # the predecessor (b02a6634) rejected any second dimensions=
+               f"{h} dimensions=1920x1440 bytes=9 dimensions=1280x720",                                      # no probe field at all: the whole line is top level
+               f"{h} dimensions=1920x1440 bytes=9 decoded_frames=30 container_probe=C:/kit/ffprobe.exe",
+               f"{h} dimensions=1920x1440 bytes=9 bytes=0 container_probe=C:/kit/ffprobe.exe",
+               f"{h} dimensions=1920x1440 bytes=9 decoded_duration=9.000 container_probe=C:/kit/ffprobe.exe",
+               f"{h} dimensions=1920x1440 bytes=9 decoded_frame_bytes=7 container_probe=C:/kit/ffprobe.exe",
+               f"{h} dimensions=1920x1440 dimensions=1280x720 bytes=9 container_probe=C:/kit/ffprobe.exe"]   # r6 row: before bytes=, already INVALID
+        tail = " probe_source=ffprobe-json codec=prores container=mov sar=1:1 dar=4:3"
+        good = [f"{h} dimensions=1920x1440 bytes=9 container_probe=C:/kit/ffprobe.exe{tail}",
+                f"{h} dimensions=1920x1440 bytes=9 container_probe=C:/kit dimensions=1280x720 decoded_frames=30 bytes=0/ffprobe.exe{tail}"]
+        return bad, good
+
+    def r7_case(self, verified: str, start: str | None = None, done: str | None = None) -> dict:
+        batch = "\n".join((self.R7_START if start is None else start, verified, self.R7_DONE if done is None else done)) + "\n"
+        return prores_case(maxFrames=1, dualIsoExpected=True, stage=piped_stage_log(1, scale_ms=6.0), batch=batch, criteria=[])
+
+    def test_r7_sol_b1_a_top_level_render_verified_field_named_twice_is_invalid(self) -> None:
+        """sol r6 B1: a complete one-frame emitting ProRes capture declaring output=1920x1440 whose RENDER_VERIFIED carries `dimensions=1920x1440 bytes=9
+        dimensions=1280x720 container_probe=C:/kit/ffprobe.exe` read PASS under empty criteria (renderPipeTimed=true, problems=[]): the r6 token reader stopped at bytes=,
+        and the predecessor's whole-line count had rejected the second value. The class: every field the rendered runner writes once before container_probe= (whose value
+        is a verbatim path) named twice at top level is EXPORT_OUTPUT_MISMATCH, whatever field it is. Controls: the producer's own line, and field-like text inside the
+        probe path (r6 B3), stay clean."""
+        bad, good = self.r7_rows()
+        proc, got = evidence_cases([self.r7_case(v) for v in bad + good])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for v, g in zip(bad, got[:len(bad)]):
+            with self.subTest(verified=v):
+                self.assertEqual(g["outcome"], "INVALID", g)
+                self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and "RENDER_VERIFIED" in p for p in g["problems"]), g)
+        for v, g in zip(good, got[len(bad):]):
+            with self.subTest(verified=v):
+                self.assertEqual(g["problems"], [], g)
+                self.assertFalse(g["classMismatch"], g)
+                self.assertIs(g["metrics"]["renderPipeTimed"], True, g)
+                self.assertEqual(g["outcome"], "PASS", g)
+
+    def test_r7_sol_b1_sweep_render_start_and_done_already_refuse_a_contradictory_repeat(self) -> None:
+        """r7 sibling sweep (no fix owed): RENDER_START counts each key once before out= (Get-DvRenderStartDeclaration), and DONE is anchored at both ends, so a repeated
+        exported= moves into DONE's clip name, which is then not the clip RENDER_START and RENDER_VERIFIED name. Both read INVALID before and after r7."""
+        ok = f"{self.R7_HEAD} dimensions=1920x1440 bytes=9 container_probe=C:/kit/ffprobe.exe"
+        start2 = self.R7_START.replace(" out=view-0.mov", " output=1280x720 out=view-0.mov")
+        done2 = "[BATCH] DONE view-0 exported=30 skipped=0 elapsed=1.0 exported=1 skipped=0 elapsed=1.0"
+        proc, got = evidence_cases([self.r7_case(ok, start=start2), self.r7_case(ok, done=done2)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith(("EXPORT_PROFILE_ABSENT", "EXPORT_OUTPUT_MISMATCH")) for p in g["problems"]), g)
+
 
 EXPORT_STUB_GENERATOR = r"""
 param($SourceCommit,$BuildManifestSha256,$ClipId,$OutFile,$RepoRoot,$Venue,$Backend,$CpuQuiescenceThresholdPercent,$VenueTablePath,$PlaySeconds,$Format,$MaxFrames,$ReceiptPath,$DualIsoExpected,$ExpectReceiptSha256)
