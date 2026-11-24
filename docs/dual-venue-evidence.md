@@ -501,11 +501,12 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
     reads as a field of its line in that field's shape is refused, never read as PASS (`C:/kit dimensions=archive/ffprobe.exe` is still clean). The job builds both paths
     under its scratch root from validated tokens. *G3:* the no-probe sentinel rule is unchanged and runs first. *One verdict:* the line order, the `out=` leaf, the verified
     dimensions and the CDNG clip witness are one module function, `Get-DvBatchExportBindingProblems`. The central reader and the Bachelor job
-    (`export-stage-job.ps1`, which embeds it verbatim with the declaration reader and its tables) both call it, so on a present `RENDER_START` and on the CDNG witness a
-    run read `INVALID` centrally is `EXPORT_OUTPUT_MISMATCH` at the venue, never `EXPORT_CAPTURED`. An absent `RENDER_START` is the one difference (r2, key3 r1 row 1):
-    the job reads it only when present (`-ReadStart` with a count above 0), while the central reader requires it on an emitting build's pipe route. The receipt still
-    reads `INVALID`, because the leg's verdict is the central re-derivation (`Invoke-VenueLeg.ps1:760-765`), and the app always prints the line on the rendered route
-    (`BatchRunner.cpp:471`).
+    (`export-stage-job.ps1`, which embeds it verbatim with the declaration reader and its tables) both call it, so a run whose shared bindings fail is
+    `EXPORT_OUTPUT_MISMATCH` at the venue, never `EXPORT_CAPTURED`. Parity covers those bindings only (READER-HARDENING-1 r1, sol r2 B2). Three checks are
+    central-only, so the job can print `EXPORT_CAPTURED` where the central reader returns `INVALID`: an absent `RENDER_START` (the job reads it only when present,
+    key3 r1 row 1), `scaled=true` with no `export_scale` timed (`EXPORT_PROFILE_ABSENT`), and timing outside `cutIn` / `cutOut` (`EXPORT_STAGE_WINDOW_MISMATCH`;
+    the last two are pinned by a test). The receipt still reads `INVALID`: the leg's verdict is the central re-derivation (`Invoke-VenueLeg.ps1:760`, `:780`).
+    CDNG `<frame>` (sol r2 B1) is a `uint32` padded to six digits: six digits, or seven to ten with no leading zero, at most `4294967295`.
     From r3 `RENDER_START` must also be the ProRes producer's own declaration: `codec=prores container=mov` (the strings `BatchRenderedVideoPlan.h` names for ProRes and
     Mov), source and output dimensions above 0, and an fps that is a finite decimal above 0. Anything else is `EXPORT_PROFILE_FOREIGN`.
     **Dual-ISO fails closed (r3, KNOWN GAP).** A `llrawproc_dual_iso` time above 0 is the time of the dual-ISO *attempt*. `llrawproc.c` times the attempt, and `dualiso.c`

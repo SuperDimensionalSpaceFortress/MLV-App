@@ -377,6 +377,7 @@ try {
     # RENDER_START (its grammar, the declaration's checks, the order, the .mov leaf and the verified dimensions) on ProRes, so on those bindings a run the central reader
     # reads INVALID is never EXPORT_CAPTURED here. (r2 F3, key3 r1 row 1: an ABSENT RENDER_START is read only centrally, which requires it on an emitting build's pipe
     # route; the receipt still reads INVALID by the central re-derivation, Invoke-VenueLeg.ps1:760-765, and the app always prints it there, BatchRunner.cpp:471)
+    # (READER-HARDENING-1 r1, sol r2 B2: parity is on those shared bindings only; export_scale and the stage window are central-only checks too)
     $bind = Get-DvBatchExportBindingProblems -Batch $batchRead -Format $Format -OutputCount $outputs.Count -FirstName $(if ($null -ne $manifest.first) { $manifest.first.name } else { $null }) `
         -LastName $(if ($null -ne $manifest.last) { $manifest.last.name } else { $null }) -ReadStart ($Format -eq 'prores' -and $batchRead.start.count -gt 0)
     $outputAgrees =if ($Format -eq 'cdng-lossless') { $null -ne $exported -and $outputs.Count -eq $exported } else { $outputs.Count -eq 1 -and $null -ne $verifiedFrames -and $null -ne $exported -and $verifiedFrames -eq $exported }
