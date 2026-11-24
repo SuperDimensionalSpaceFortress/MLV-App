@@ -2870,7 +2870,37 @@
       "clock": "qpc_stage_clock",
       "justification": "CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1 (sol r5 B1): handlerStartMs and handlerEndMs are TIMESTAMPS (the fixture handler's QPC reads), and -1 is their 'handler never ran' sentinel. The guard fails a sample whose handler reads are unset before the R3A3 trace scan can start from -1 ms. It compares no duration. That the handler ran is proven by its own call count (foreign.calls), which is the admission witness.",
       "lines": [
-        2933
+        3068
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "const bool seen = tagSeenMs >= 0.0 ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r2 (sol r1 B1): tagSeenMs is a TIMESTAMP (the WH_CALLWNDPROC hook's QPC read of the tagged WM_NULL reaching the wake's window), and -1 is its 'the hook never saw it' sentinel. The comparison only separates the observed case from the sentinel; no duration is compared. An observed read is then validated against the product's dispatch span record (a span must contain it, or the record is lost), which is the run-proof.",
+      "lines": [
+        2747
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "if ( dueWakeRedR1Gate ( ) ) return literalRow && tagSeenMs >= 0.0 && wokenOtherDelta > 0 && ! spansS . empty ( ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r2 (sol r1 B1): the opt-in RED replay (MLV_R17A1_RED_R1_GATE=1) of bebd354c's credit rule. tagSeenMs >= 0.0 reads the hook timestamp's 'never saw it' sentinel (-1), standing in for bebd354c's boolean witness; wokenOtherDelta is a dispatch count. No duration is compared. The replay only fails more samples than the fix, and never runs unless the variable is exactly 1.",
+      "lines": [
+        2763
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "&& g_r3a3LiteralSeenMs < 0.0 )",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r2 (sol r1 B1): g_r3a3LiteralSeenMs is a TIMESTAMP, and -1 is its 'not seen yet' sentinel. The hook stamps only the first time it sees the tagged WM_NULL, so a later dispatch of the same tag cannot move the read. It compares no duration and proves nothing ran; the span record that must contain the read is the proof.",
+      "lines": [
+        2826
       ]
     },
     {
@@ -2920,7 +2950,7 @@
       "clock": "qpc_stage_clock",
       "justification": "CI-FLAKE-R17A1-FOREIGN-FIRST-FLOOR-1 (adversary pass 1 A2): R17A1's foreign-first old-window floor is the time from the sleep's entry stamp to the sender's pre-send QPC read, less each recorded dispatch span's overlap with that interval. overlapMs is the length of an interval intersection, which is <= 0 when the span lies wholly outside the interval; the comparison only skips a span that does not intersect (nothing to subtract). A data-validity filter on an interval computation, never a run-proof: that the sleep and its dispatches ran is proven by the stamp count, the span record and the handler's own reads asserted around it.",
       "lines": [
-        3567
+        4221
       ]
     },
     {

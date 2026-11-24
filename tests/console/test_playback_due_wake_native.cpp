@@ -2726,6 +2726,75 @@ TEST(PlaybackDueWakeSend, G1_AForeignSentMessageInTheRunnerSleepIsNotAWakeAndThe
 #endif
 }
 
+namespace {
+// CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r2 (sol r1 B1/B2): the RED seam MLV_R17A1_RED_R1_GATE=1 replays bebd354c's R3A3
+// literal-attempt gate (a boolean hook witness, credited on any non-empty record, never checked against it) and its literal sender
+// (it sent the fixture message at its cutoff even when the sleep had not returned). Each replay only fails more, never fewer.
+bool dueWakeRedR1Gate()
+{
+    const char *value = std::getenv( "MLV_R17A1_RED_R1_GATE" );
+    return value && std::string( value ) == "1";
+}
+
+// r2 (sol r1 B1): the literal attempt's tagged WM_NULL is witnessed by the hook's own QPC read (ms on the caller clock the spans
+// come back on, seconds), taken as the window procedure is about to take it. NotSeen: the hook never saw it (the send missed the
+// sleep, so the product could not record it). Recorded: one recorded dispatch span contains the read. Lost: the hook saw the
+// dispatch and no span contains it -- a span elsewhere ([22, 22.2] ms for a read at 8.2 ms) or no span at all is a lost record,
+// never a sample to retry.
+enum class R3A3LiteralRecord { NotSeen, Recorded, Lost };
+R3A3LiteralRecord r3a3LiteralRecord( double tagSeenMs, const std::vector<std::pair<double, double>> &spansS )
+{
+    const bool seen = tagSeenMs >= 0.0;                               // -1 is the hook's "never saw it" sentinel
+    if( dueWakeRedR1Gate() ) return seen ? R3A3LiteralRecord::Recorded : R3A3LiteralRecord::NotSeen;
+    if( !seen ) return R3A3LiteralRecord::NotSeen;
+    constexpr double kRoundTripMs = 0.00005;                          // assertChargedBeforeHandler's tolerance
+    for( const auto &span : spansS )
+        if( span.first * 1000.0 <= tagSeenMs + kRoundTripMs && tagSeenMs <= span.second * 1000.0 + kRoundTripMs )
+            return R3A3LiteralRecord::Recorded;
+    return R3A3LiteralRecord::Lost;
+}
+
+// r2 (sol r1 B1/B2): a literal attempt the fixture handler missed is credited as the literal row only when its OWN tagged dispatch
+// is in the record (the hook's read inside a recorded span, counted by the product) and the fixture's send really followed the
+// sleep's return. A send the literal sender withheld at its cutoff (the sleep had not returned) is retried, never credited.
+bool r3a3LiteralCredited( bool literalRow, bool fixtureWithheld, double tagSeenMs, quint64 wokenOtherDelta,
+                          const std::vector<std::pair<double, double>> &spansS )
+{
+    if( dueWakeRedR1Gate() ) return literalRow && tagSeenMs >= 0.0 && wokenOtherDelta > 0 && !spansS.empty();
+    return literalRow && !fixtureWithheld && wokenOtherDelta > 0 && r3a3LiteralRecord( tagSeenMs, spansS ) == R3A3LiteralRecord::Recorded;
+}
+}
+
+TEST(PlaybackDueWakeSend, R3A3_TheLiteralDispatchIsCreditedOnlyFromASpanThatContainsTheHooksOwnRead)
+{
+    // sol r1 B1, its literal rows (hook read at 8.2 ms, the fixture handler never ran, so foreign.calls = 0): the record must
+    // contain the read before the attempt may be retried or credited as the literal row
+    const double tagMs = 8.2;
+    // literal 1: count = 1, the only span is [22, 22.2] ms -- it excludes the read, so the dispatch record is lost
+    ASSERT_TRUE( r3a3LiteralRecord( tagMs, { { 0.022, 0.0222 } } ) == R3A3LiteralRecord::Lost );
+    ASSERT_FALSE( r3a3LiteralCredited( true, false, tagMs, 1, { { 0.022, 0.0222 } } ) );
+    // literal 2: count = 0, spans [] -- an observed dispatch with no record is a typed loss, never a retry
+    ASSERT_TRUE( r3a3LiteralRecord( tagMs, {} ) == R3A3LiteralRecord::Lost );
+    ASSERT_FALSE( r3a3LiteralCredited( true, false, tagMs, 0, {} ) );
+    // the healthy row: a span that contains the read is the tagged dispatch, and it is credited
+    ASSERT_TRUE( r3a3LiteralRecord( tagMs, { { 0.0081, 0.0083 } } ) == R3A3LiteralRecord::Recorded );
+    ASSERT_TRUE( r3a3LiteralCredited( true, false, tagMs, 1, { { 0.0081, 0.0083 } } ) );
+    // ...and one of two chronological spans may hold it
+    ASSERT_TRUE( r3a3LiteralRecord( tagMs, { { 0.0081, 0.0083 }, { 0.022, 0.0222 } } ) == R3A3LiteralRecord::Recorded );
+    // a span ending just before the read, or starting just after it, does not contain it
+    ASSERT_TRUE( r3a3LiteralRecord( tagMs, { { 0.0080, 0.0081 } } ) == R3A3LiteralRecord::Lost );
+    ASSERT_TRUE( r3a3LiteralRecord( tagMs, { { 0.0083, 0.0090 } } ) == R3A3LiteralRecord::Lost );
+    // a hook that never saw the tag has nothing to account: the attempt is retried, uncredited
+    ASSERT_TRUE( r3a3LiteralRecord( -1.0, {} ) == R3A3LiteralRecord::NotSeen );
+    ASSERT_FALSE( r3a3LiteralCredited( true, false, -1.0, 1, { { 0.0081, 0.0083 } } ) );
+    // sol r1 B2: a fixture send the literal sender withheld at its cutoff is never the literal row, however healthy the record
+    ASSERT_FALSE( r3a3LiteralCredited( true, true, tagMs, 1, { { 0.0081, 0.0083 } } ) );
+    // a non-literal attempt (the fixture's own observation) is never credited as the literal row
+    ASSERT_FALSE( r3a3LiteralCredited( false, false, tagMs, 1, { { 0.0081, 0.0083 } } ) );
+    // a product that recorded the span but did not count the dispatch is not credited either
+    ASSERT_FALSE( r3a3LiteralCredited( true, false, tagMs, 0, { { 0.0081, 0.0083 } } ) );
+}
+
 #ifdef Q_OS_WIN
 namespace {
 // r3 A3: a GUI-thread window whose handler does real work, so the runner sleep's dispatch of its sent message takes time
@@ -2745,14 +2814,17 @@ constexpr UINT kR3A3ForeignMessage = WM_USER + 0x52;
 // it reaching the wake's window. A WM_NULL from any other sender, or to any other window, is not the literal attempt's dispatch.
 constexpr LPARAM kR3A3LiteralNullTag = 0x52A31;
 HWND g_r3a3LiteralWindow = nullptr;
-bool g_r3a3LiteralSeen = false;
+// r2 (sol r1 B1): the hook's own QPC read (ms) of the tagged WM_NULL reaching the window, -1 until it sees it. A timestamp, not a
+// boolean: the read takes part in record validation (r3a3LiteralRecord), so a span that excludes it is never its dispatch.
+double g_r3a3LiteralSeenMs = -1.0;
 LRESULT CALLBACK r3a3LiteralHook( int code, WPARAM wParam, LPARAM lParam )
 {
     if( code == HC_ACTION )
     {
         const CWPSTRUCT *cwp = reinterpret_cast<const CWPSTRUCT *>( lParam );
-        if( cwp && g_r3a3LiteralWindow && cwp->hwnd == g_r3a3LiteralWindow && cwp->message == WM_NULL && cwp->lParam == kR3A3LiteralNullTag )
-            g_r3a3LiteralSeen = true;
+        if( cwp && g_r3a3LiteralWindow && cwp->hwnd == g_r3a3LiteralWindow && cwp->message == WM_NULL && cwp->lParam == kR3A3LiteralNullTag
+            && g_r3a3LiteralSeenMs < 0.0 )
+            g_r3a3LiteralSeenMs = dueWakeQpcNowMs();
     }
     return CallNextHookEx( nullptr, code, wParam, lParam );
 }
@@ -2836,29 +2908,61 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
     const R3A3HookGuard literalHook { SetWindowsHookExW( WH_CALLWNDPROC, r3a3LiteralHook, nullptr, GetCurrentThreadId() ) };
     ASSERT_TRUE( literalHook.hook != nullptr );                       // pass 2 A1: the literal WM_NULL's own witness
     g_r3a3LiteralWindow = wakeWindow;
-    for( int attempt = 0; attempt < kSleepObservationAttempts + 2 && !judged; ++attempt )
+    // r2 (sol r1 B2): the literal sender's cutoff WITHHOLDS the fixture send while the sleep has not returned (as judgeSentWait's
+    // entry cutoff does), so a GUI thread paused before sleep entry past the cutoff never lets both messages land inside the sleep.
+    // Its literal row is a standing first attempt: the GUI thread holds off sleep entry until the sender has decided (its cutoff is
+    // kR3A3PausedCutoffMs here, the 5 s one otherwise, the same code path). That attempt must be withheld and retried, never admitted.
+    // A withheld attempt gives back its literal budget and adds one observation, at most kR3A3WithheldRetries times.
+    constexpr ULONGLONG kR3A3PausedCutoffMs = 30;
+    constexpr int kR3A3WithheldRetries = 3;                           // the standing paused row plus two real >5 s stalls
+    int withheldRetried = 0;
+    bool pausedRowWithheld = false;
+    for( int attempt = 0; attempt < kSleepObservationAttempts + 2 + withheldRetried && !judged; ++attempt )
     {
-        g_r3a3LiteralSeen = false;
+        g_r3a3LiteralSeenMs = -1.0;
         foreign = R3A3Foreign();
         foreign.wake = &wake;
         foreign.busyMs = busyMs;
         wake.setGuiTraceActive( true );
         std::atomic<bool> sent { false };
         std::atomic<bool> sleepReturned { false };
-        const bool unrelatedFirst = unrelatedRetried == 0 && unrelatedTried < 2;
+        std::atomic<bool> withheld { false };
+        std::atomic<bool> senderDecided { false };
+        const bool pausedRow = attempt == 0;                          // r2 (sol r1 B2): the GUI paused past the sender's cutoff
+        const bool unrelatedFirst = !pausedRow && unrelatedRetried == 0 && unrelatedTried < 2;
         if( unrelatedFirst ) ++unrelatedTried;
-        std::thread sender( [window, wakeWindow, unrelatedFirst, &sent, &sleepReturned]() {
-            if( unrelatedFirst )
+        const bool literalSender = pausedRow || unrelatedFirst;
+        const ULONGLONG cutoffMs = pausedRow ? kR3A3PausedCutoffMs : 5000;
+        const bool redR1Gate = dueWakeRedR1Gate();
+        std::thread sender( [window, wakeWindow, literalSender, cutoffMs, redR1Gate, &sent, &sleepReturned, &withheld, &senderDecided]() {
+            if( literalSender )
             {
                 Sleep( 8 );
                 SendNotifyMessageW( wakeWindow, WM_NULL, 0, kR3A3LiteralNullTag );   // the unrelated dispatch, inside the sleep
-                const ULONGLONG giveUp = GetTickCount64() + 5000;
+                const ULONGLONG giveUp = GetTickCount64() + cutoffMs;
                 while( !sleepReturned.load() && GetTickCount64() < giveUp ) Sleep( 1 );   // the fixture send misses the sleep
+                // r2 (sol r1 B2): at the cutoff with the sleep still running, the fixture message is never sent (it would land
+                // inside the sleep beside the tagged one); the attempt is retried. MLV_R17A1_RED_R1_GATE=1 replays bebd354c's send.
+                if( !sleepReturned.load() && !redR1Gate )
+                {
+                    withheld = true;
+                    senderDecided = true;
+                    return;
+                }
             }
             else Sleep( 5 );
             sent = SendNotifyMessageW( window, kR3A3ForeignMessage, 0, 0 ) != 0;
+            senderDecided = true;
         } );
         const ThreadJoinGuard senderGuard { sender };
+        if( pausedRow )
+        {
+            // the GUI thread paused after the sender's creation and before sleep entry, past the sender's cutoff: Sleep takes no
+            // sent message, so the tagged WM_NULL (and, on bebd354c, the fixture's) waits for the sleep's own dispatch
+            const ULONGLONG pauseGiveUp = GetTickCount64() + 10000;
+            while( !senderDecided.load() && GetTickCount64() < pauseGiveUp ) Sleep( 1 );
+            ASSERT_TRUE( senderDecided.load() );
+        }
         const quint64 wokenOtherBefore = wake.runnerSleepsWokenOther();   // r5 class sweep (pass 11 A1): the product's own count, as a delta
         const quint64 wokenBySentBefore = wake.runnerSleepsWokenBySent();
         QElapsedTimer t;
@@ -2898,6 +3002,24 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
                     ASSERT_TRUE( inOneSpan );
                 }
             }
+            // r2 (sol r1 B1): the hook's own read of this attempt's tagged WM_NULL (taken before the drain below can dispatch a late
+            // one) takes part too: a span is the tagged dispatch's only when it contains that read, and an observed dispatch no span
+            // contains (an unrelated span elsewhere, or count 0 and spans []) is a lost record -- typed, never retried away
+            if( r3a3LiteralRecord( g_r3a3LiteralSeenMs, recordSpans ) == R3A3LiteralRecord::Lost )
+            {
+                wake.setGuiTraceActive( false );
+                std::string spansText;
+                for( const auto &span : recordSpans )
+                    spansText += "[" + std::to_string( span.first * 1000.0 ) + "," + std::to_string( span.second * 1000.0 ) + "]";
+                const std::string detail = "attempt=" + std::to_string( attempt ) + " tag_seen_ms=" + std::to_string( g_r3a3LiteralSeenMs )
+                                           + " counted=" + std::to_string( counted ) + " calls=" + std::to_string( foreign.calls )
+                                           + " spans_ms=" + spansText;
+                MSG drain;                                            // the missed send, so it reaches no later sleep
+                PeekMessageW( &drain, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );
+                g_r3a3Foreign = nullptr;
+                wake.setTimingStampsForTest( false );
+                ::minitest::fail( __FILE__, __LINE__, "R3A3_LITERAL_DISPATCH_RECORD_LOST", detail );
+            }
         }
         // CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1 (sol r5 B1): admitted on the fixture's OWN handler witness only. The record
         // was accounted just above (count == spans, every handler inside one span), so a span or count left here with calls == 0 is
@@ -2910,9 +3032,22 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
         if( r3a3Retry )
         {
             // pass A2: the unrelated dispatch was witnessed in the sleep; pass 2 A1: and it was THIS attempt's own tagged WM_NULL to
-            // the wake's window (the hook's read, taken before the drain below can dispatch a late one)
-            if( unrelatedFirst && g_r3a3LiteralSeen && wake.runnerSleepsWokenOther() > wokenOtherBefore && !wake.lastRunnerSleepDispatchSpansS().empty() )
+            // the wake's window (the hook's read, taken before the drain below can dispatch a late one). r2 (sol r1 B1): credited
+            // only from a recorded span that contains that read; r2 (sol r1 B2): never when the sender withheld the fixture send
+            if( r3a3LiteralCredited( unrelatedFirst, withheld.load(), g_r3a3LiteralSeenMs, wake.runnerSleepsWokenOther() - wokenOtherBefore,
+                                     wake.lastRunnerSleepDispatchSpansS() ) )
                 ++unrelatedRetried;
+            // r2 (sol r1 B2): a withheld fixture send is the literal observation retried: it gives back its literal budget and
+            // adds one observation (bounded), so a GUI stall past the 5 s cutoff never spends the real observation's attempts
+            if( withheld.load() )
+            {
+                if( pausedRow ) pausedRowWithheld = true;
+                if( withheldRetried < kR3A3WithheldRetries )
+                {
+                    ++withheldRetried;
+                    if( unrelatedFirst ) --unrelatedTried;
+                }
+            }
             // adversary pass 1 A4/A7: a sender that missed the whole sleep (its message queued after the sleep returned) left
             // nothing to judge and a pending sent message behind. Take it now, so it cannot reach the next attempt's sleep and
             // double that attempt's handler calls, and observe again. Keyed on the handler's own call count, not on the span
@@ -2967,6 +3102,7 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
     }
     ASSERT_TRUE( judged );
     ASSERT_EQ( 1, unrelatedRetried );                                 // r1 (sol r5 B1): the literal row ran, was accounted, and was retried
+    ASSERT_TRUE( pausedRowWithheld );                                 // r2 (sol r1 B2): the paused row withheld its fixture send, then retried
     ASSERT_TRUE( sentOk );
     ASSERT_EQ( 1, foreign.calls );
     ASSERT_TRUE( slept == PlaybackDueWake::RunnerSleep::Slept );
