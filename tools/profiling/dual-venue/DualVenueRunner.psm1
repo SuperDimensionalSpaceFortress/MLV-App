@@ -5266,10 +5266,12 @@ function ConvertFrom-DvBatchLogLine {
     if ([string]::IsNullOrEmpty($body)) { return (& $fail $(if ($null -eq $g.rest) { 'it names no clip before exported=' } else { "its $($g.rest)= value is empty" })) }
     # r4 (sol r3 B4): a field of the peeled trailer named again just before it is a repeat, not clip text (DONE view-0 exported=29 skipped=1 elapsed=40.0 exported=30 ...
     # read the first triplet as the clip, and CDNG has no RENDER_START to bind the clip). A one-token clip spelled like a key is the clip (DONE requires one), so it stays.
+    # (adversary pass 2 A1 on 2d8e9bf2: the last token is the last NON-EMPTY one, so an extra separator before the trailer does not hide the repeat)
     if ($null -eq $g.rest) {
-        $at = $body.LastIndexOf([char]' ')
+        $lead = $body.TrimEnd([char]' ')
+        $at = $lead.LastIndexOf([char]' ')
         if ($at -ge 0) {
-            $tok = $body.Substring($at + 1)
+            $tok = $lead.Substring($at + 1)
             foreach ($spec in $right) {
                 if (& $isField $tok $spec) { return (& $fail "before field $($field + 1) ($($right[0].Split('=')[0])=) it finds '$tok', which names $($spec.Split('=')[0])= again (the producer writes each field once, after the clip)") }
             }
@@ -5972,7 +5974,8 @@ function Get-DvExportEvidence {
             if ($cardSeen.Count -gt 0 -and $buildClass -ceq 'older') {
                 $problems.Add("EXPORT_PROFILE_FOREIGN: stage-timing.log carries $($cardSeen -join ' / '), which build $ExpectedBuildId cannot emit (its src/debug/StageTiming.h defines no EXPORT-RENDER-PIPE-TIMING-1 stage), so the log is not the build's the job ran")
             }
-            if ($cardSeen.Count -gt 0 -or $buildClass -ceq 'emits') {
+            $pipeRoute = ($cardSeen.Count -gt 0 -or $buildClass -ceq 'emits')
+            if ($pipeRoute) {
                 $cardMissing = @($cardRequired | Where-Object { -not (& $hasStage $_) })
                 if ($cardMissing.Count -gt 0) {
                     $incomplete = $(if ($cardSeen.Count -gt 0) { "the capture is incomplete: stage-timing.log carries $($cardSeen -join ' / ') of EXPORT-RENDER-PIPE-TIMING-1 but no $($cardMissing -join ' / '), and a build that times one times them all" }
@@ -5981,6 +5984,12 @@ function Get-DvExportEvidence {
                     if ($cardMissing -ccontains 'llrawproc_dual_iso') { $m['dualIsoActiveFramesCouldNotCheck'] = $incomplete; $m['dualIsoClassAgreesCouldNotCheck'] = $incomplete }
                     if ($null -eq $m.renderPipeTimed) { $m['renderPipeTimedCouldNotCheck'] = $incomplete }
                 }
+            }
+            # EXPORT-RENDER-PIPE-TIMING-2 r4 (sol r3 B3; adversary pass 2 A4 on 2d8e9bf2): on an older or unnamed build with none of this card's stages, a PRESENT
+            # RENDER_START is read too, by the one grammar, the declaration's own checks and the same bindings (order, the manifest's .mov, the verified dimensions, the
+            # timed window: the older producer prints the same line, BatchRunner.cpp:470 on 2b796198, and runs the same loop); an absent one adds nothing there, so a
+            # receipt from a build before the declaration re-derives the same. Only scaled= stays with this card's route: an older build times no export_scale.
+            if ($pipeRoute -or $batch.start.count -gt 0) {
                 # r1 fix 2 (adversary A3 on 33f7a05a): the producer's own RENDER_START line (BatchRunner.cpp:471) declares scaled=true|false; export_scale is timed on every
                 # frame exactly when it is true (the window check above holds a partial one), so a scaled plan with none and an unscaled plan with some are other runs' figures
                 # r2 (adversary A2, A3, A5 on a6f48506): the line is read WHOLE, in the producer's exact field order (Get-DvRenderStartDeclaration), for DONE's clip, before
@@ -6011,22 +6020,14 @@ function Get-DvExportEvidence {
                     if ($null -ne $batch.verified.fields -and -not [string]::Equals([string]$batch.verified.fields['dimensions'], [string]$decl.output, [StringComparison]::Ordinal)) {
                         $problems.Add("EXPORT_OUTPUT_MISMATCH: RENDER_START declares output=$($decl.output) but RENDER_VERIFIED decoded dimensions=$($batch.verified.fields['dimensions']), so the declaration and the verification are not of one .mov")
                     }
-                    if ($decl.scaled -and $scale.Count -eq 0) { $problems.Add('EXPORT_PROFILE_ABSENT: RENDER_START declares scaled=true but stage-timing.log times no export_scale; a scaled frame plan times it on every frame') }
-                    elseif (-not $decl.scaled -and $scale.Count -gt 0) { $problems.Add("EXPORT_STAGE_WINDOW_MISMATCH: RENDER_START declares scaled=false but stage-timing.log times export_scale on $($scale.Count) frame(s); an unscaled frame plan runs no scale") }
+                    if ($pipeRoute -and $decl.scaled -and $scale.Count -eq 0) { $problems.Add('EXPORT_PROFILE_ABSENT: RENDER_START declares scaled=true but stage-timing.log times no export_scale; a scaled frame plan times it on every frame') }
+                    elseif ($pipeRoute -and -not $decl.scaled -and $scale.Count -gt 0) { $problems.Add("EXPORT_STAGE_WINDOW_MISMATCH: RENDER_START declares scaled=false but stage-timing.log times export_scale on $($scale.Count) frame(s); an unscaled frame plan runs no scale") }
                     $lo = $decl.cutIn - 1; $hi = $decl.cutOut - 1
                     $outside = @($p16Frames.Keys | Where-Object { $k = [int64]$_; $k -lt $lo -or $k -gt $hi })
                     if ($p16Frames.Count -ne $decl.frames -or $outside.Count -gt 0) {
                         $problems.Add("EXPORT_STAGE_WINDOW_MISMATCH: stage-timing.log times processed16_total on $($p16Frames.Count) frame(s), $($outside.Count) of them outside frames $lo..$hi; RENDER_START declares cutIn=$($decl.cutIn) cutOut=$($decl.cutOut), and the producer's loop times frames cutIn-1 .. cutOut-1 only, so the log is of another window")
                     }
                 }
-            }
-            elseif ($batch.start.count -gt 0) {
-                # EXPORT-RENDER-PIPE-TIMING-2 r4 (sol r3 B3): on an older or unnamed build with none of this card's stages, a PRESENT RENDER_START is still read by the one
-                # grammar and the declaration's own checks (a duplicate output=, `RENDER_START:`, a second line or a foreign codec is INVALID); an absent one adds nothing,
-                # so a receipt from a build before the declaration re-derives the same. The bindings to this card's stages (scaled= against export_scale, the cut against
-                # the timed window) stay with the branch above: an older build times no export_scale.
-                $declOlder = Get-DvRenderStartDeclaration -Start $batch.start
-                if ($null -ne $declOlder.problem) { $problems.Add($declOlder.problem) }
             }
         }
         # r1 fix 1 (adversary A2): the base reader's shape, for old-format evidence only (no log, or a log with none of the new stages). The problems and the outcome are the
