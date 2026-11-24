@@ -176,6 +176,11 @@ def batch_log(exported: int, skipped: int = 0, elapsed: float = 20.0, verified: 
     return "\n".join(lines) + "\n"
 
 
+def verified_line(frames: int, dims: str, clip: str = "view-0") -> str:
+    """EXPORT-RENDER-PIPE-TIMING-1 r6 (sol r5 B3 forced companion): a RENDER_VERIFIED line with the producer's fields through dimensions= in its order (BatchRunner.cpp:803)."""
+    return f"[BATCH] RENDER_VERIFIED {clip} decoded_frames={frames} decoded_duration=1.000 decoded_frame_bytes=1 dimensions={dims} bytes=9"
+
+
 def output_manifest(count: int, kind: str = "dng") -> str:
     # r19 (sol r18 B3): the endpoint records carry their byte size, as export-stage-job.ps1 writes them, and agree with totalBytes (one file: first and last are that file)
     # (EXPORT-RENDER-PIPE-TIMING-1 r5, sol r4 B3 forced companion: a .mov manifest names the file the fixtures' RENDER_START out=view-0.mov declares, as export-stage-job.ps1
@@ -1494,7 +1499,10 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
 
     @classmethod
     def ctl_batch(cls, start: str | None = None, verified_clip: str = "view-0", order: tuple = ("start", "verified", "done")) -> str:
-        lines = {"start": cls.CTL_START if start is None else start, "verified": f"[BATCH] RENDER_VERIFIED {verified_clip} decoded_frames=480",
+        # (r6, sol r5 B3 forced companion: RENDER_VERIFIED carries the producer's required fields through dimensions=, which is the declared output's)
+        start = cls.CTL_START if start is None else start
+        out = re.search(r" output=(\S+)", start)
+        lines = {"start": start, "verified": verified_line(480, out.group(1) if out else "1920x1080", clip=verified_clip),
                  "done": "[BATCH] DONE view-0 exported=480 skipped=0 elapsed=60.0"}
         return "\n".join(lines[k] for k in order) + "\n"
 
@@ -1555,8 +1563,8 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         one = "".join(f"[mlv-stage-timing] frame=999999999999 stage={s} ms={ms:.3f}\n" for s, ms in rows)
         one += "[mlv-stage-timing] frame=999999999999 stage=export_pipe_drain ms=1.000\n[mlv-stage-timing] frame=999999999999 stage=export_verify ms=1.000\n"
         one_batch = ("[BATCH] RENDER_START view-0 codec=prores container=mov source=1x1 output=1x1 scaled=false fps=24 frames=1 cutIn=1 cutOut=1 out=view-0.mov\n"
-                     "[BATCH] RENDER_VERIFIED view-0 decoded_frames=1\n[BATCH] DONE view-0 exported=1 skipped=0 elapsed=1.0\n")
-        at5 = self.CTL_START.replace("cutIn=1 cutOut=480", "cutIn=5 cutOut=484")
+                     f"{verified_line(1, '1x1')}\n[BATCH] DONE view-0 exported=1 skipped=0 elapsed=1.0\n")
+        at5 =self.CTL_START.replace("cutIn=1 cutOut=480", "cutIn=5 cutOut=484")
         cases = [self.ctl(self.shift(piped_stage_log(480), 1)), prores_case(maxFrames=1, dualIsoExpected=True, stage=one, batch=one_batch, criteria=[]),
                  self.ctl(self.shift(piped_stage_log(480), 4), batch=self.ctl_batch(at5)), self.ctl(piped_stage_log(480), batch=self.ctl_batch(at5))]
         proc, got = evidence_cases(cases)
@@ -1859,7 +1867,7 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
             return per + f"[mlv-stage-timing] frame=23 stage=export_pipe_drain ms={drain}\n[mlv-stage-timing] frame=23 stage=export_verify ms={verify}\n"
         def batch(elapsed: str) -> str:
             return ("[BATCH] RENDER_START view-0 codec=prores container=mov source=1x1 output=1x1 scaled=false fps=24 frames=24 cutIn=1 cutOut=24 out=view-0.mov\n"
-                    f"[BATCH] RENDER_VERIFIED view-0 decoded_frames=24\n[BATCH] DONE view-0 exported=24 skipped=0 elapsed={elapsed}\n")
+                    f"{verified_line(24, '1x1')}\n[BATCH] DONE view-0 exported=24 skipped=0 elapsed={elapsed}\n")
         mk = lambda d, v, e: prores_case(maxFrames=24, dualIsoExpected=True, stage=log(d, v), batch=batch(e), criteria=[])
         # (r5, sol r4 B4 forced companion: the wall limit is built from the largest wall elapsed=3600.0 rounds from, 3600.05 s, so the verify figure 9.6e-6 ms past it is
         # 52.5 ms higher: 0.05 s over 24 frames is 2.083 ms per frame, times the 1.05 tolerance 2.1875 ms, times 24 frames)
@@ -2008,8 +2016,8 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         extra = one.replace("[mlv-stage-timing] frame=0 stage=export_pipe_drain", "[mlv-stage-timing] frame=1 stage=raw_uint16_copy ms=0.001\n[mlv-stage-timing] frame=0 stage=export_pipe_drain", 1)
         self.assertNotEqual(extra, one)
         one_batch = ("[BATCH] RENDER_START view-0 codec=prores container=mov source=1x1 output=1x1 scaled=false fps=24 frames=1 cutIn=1 cutOut=1 out=view-0.mov\n"
-                     "[BATCH] RENDER_VERIFIED view-0 decoded_frames=1\n[BATCH] DONE view-0 exported=1 skipped=0 elapsed=1.0\n")
-        mk1 = lambda s: prores_case(maxFrames=1, dualIsoExpected=True, stage=s, batch=one_batch, criteria=[])
+                     f"{verified_line(1, '1x1')}\n[BATCH] DONE view-0 exported=1 skipped=0 elapsed=1.0\n")
+        mk1 =lambda s: prores_case(maxFrames=1, dualIsoExpected=True, stage=s, batch=one_batch, criteria=[])
         proc, got = evidence_cases([self.ctl(dup, batch=scaled), mk1(extra), self.ctl(base, batch=scaled), mk1(one)])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         self.assertEqual(got[0]["outcome"], "INVALID", got[0])
@@ -2050,7 +2058,7 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
     @staticmethod
     def small_batch(frames: int, elapsed: str) -> str:
         return (f"[BATCH] RENDER_START view-0 codec=prores container=mov source=1x1 output=1x1 scaled=false fps=24 frames={frames} cutIn=1 cutOut={frames} out=view-0.mov\n"
-                f"[BATCH] RENDER_VERIFIED view-0 decoded_frames={frames}\n[BATCH] DONE view-0 exported={frames} skipped=0 elapsed={elapsed}\n")
+                f"{verified_line(frames, '1x1')}\n[BATCH] DONE view-0 exported={frames} skipped=0 elapsed={elapsed}\n")
 
     def test_r5_sol_b4_the_wall_is_the_largest_one_the_printed_elapsed_rounds_from(self) -> None:
         """sol r4 B4 (rounding): 24 frames and 343 ms of timed work inside a 348 ms wall, which DONE prints as elapsed=0.3 (BatchRunner.cpp rounds to tenths), read INVALID.

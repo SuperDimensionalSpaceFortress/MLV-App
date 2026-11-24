@@ -5200,6 +5200,9 @@ $script:ExportRenderStartFpsMax = [decimal]'4294970000'
 # r3 (adversary A2 on c2da7e24): the typed reason a ProRes run's dual-ISO class is not readable from a timed attempt, and the card that adds the producer's applied signal
 $script:ExportDualIsoAppliedUnknown = 'DUALISO_APPLIED_UNKNOWN'
 $script:ExportDualIsoAppliedSuccessor = 'successor EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1'
+# r6 (sol r5 B3): the rendered runner's RENDER_VERIFIED fields up to and including dimensions=, in its exact order and one space-delimited token each (BatchRunner.cpp:803:
+# <clip> decoded_frames= decoded_duration= decoded_frame_bytes= dimensions=%5x%6 bytes= container_probe= ...); dimensions= is the token between decoded_frame_bytes= and bytes=
+$script:ExportRenderVerifiedFields = '\A\[BATCH\] RENDER_VERIFIED (?<clip>\S+) decoded_frames=(?<n>[0-9]{1,15}) decoded_duration=\S+ decoded_frame_bytes=\S+ dimensions=(?<d>\S*) bytes=\S+(?: |\r?\z)'
 
 function Get-DvRenderStartDeclaration {
     # The one RENDER_START line of a rendered export's batch log, for the clip DONE names. Returns [pscustomobject]@{ problem; scaled; cutIn; cutOut; frames; index }: problem is a
@@ -5789,7 +5792,8 @@ function Get-DvExportEvidence {
                         if ($DualIsoExpected) {
                             $m.dualIsoActiveFrames = [int64]0
                             $m.dualIsoClassAgrees = $false
-                            $classMismatch = $true; $classDetail = "CLIP_CLASS_MISMATCH: dualIsoExpected is true but none of $($p16Frames.Count) timed frame(s) attempted dual-ISO processing (llrawproc_dual_iso 0 ms on every frame), so no frame was reconstructed"
+                            # r6 (sol r5 B8): the detail reports the observed ROUNDED figure and what it shows (no reconstruction), never that no attempt ran
+                            $classMismatch = $true; $classDetail = "CLIP_CLASS_MISMATCH: dualIsoExpected is true but llrawproc_dual_iso reads 0.000 ms on every one of $($p16Frames.Count) timed frame(s); the figure is rounded to the microsecond (StageTiming.h %.3f), so it shows that no frame was reconstructed (a reconstruction takes far longer than half a microsecond), not whether a shorter dual-ISO attempt ran"
                         }
                         else {
                             $zero = "$($script:ExportDualIsoAppliedUnknown): llrawproc_dual_iso reads 0.000 ms on every one of $($p16Frames.Count) timed frame(s), and the figure is rounded to the microsecond (StageTiming.h %.3f), so it cannot show that no dual-ISO attempt ran until the producer publishes an applied signal ($($script:ExportDualIsoAppliedSuccessor))"
@@ -5860,11 +5864,18 @@ function Get-DvExportEvidence {
                     if ($firstName -is [string] -and -not [string]::Equals($outLeaf, $firstName, [StringComparison]::Ordinal)) {
                         $problems.Add("EXPORT_OUTPUT_MISMATCH: RENDER_START declares out=$($decl.out), whose file is '$outLeaf', but output-manifest.json lists '$firstName', so the declaration is not of this export's .mov")
                     }
-                    $verifiedLine = $(if ($verified.Count -eq 1) { $verified[0].Value + ([string]$BatchLogText).Substring($verified[0].Index + $verified[0].Length).Split("`n")[0] } else { '' })
-                    $verifiedDims = @([regex]::Matches($verifiedLine, ' dimensions=(?<d>[^\s]*)'))
-                    $dimsText = @($verifiedDims | ForEach-Object { $_.Groups['d'].Value })
-                    if ($verifiedDims.Count -gt 0 -and ($verifiedDims.Count -ne 1 -or -not [string]::Equals($dimsText[0], [string]$decl.output, [StringComparison]::Ordinal))) {
-                        $problems.Add("EXPORT_OUTPUT_MISMATCH: RENDER_START declares output=$($decl.output) but RENDER_VERIFIED decoded dimensions=$($dimsText -join ' / '), so the declaration and the verification are not of one .mov")
+                    # r6 (sol r5 B3): dimensions= is a REQUIRED field read at the producer's token position (BatchRunner.cpp:803 writes it fifth after the tag, between
+                    # decoded_frame_bytes= and bytes=), never by a substring scan of the whole line: a line without it at that position is not the producer's verification
+                    # of this .mov (INVALID), and text after it (container_probe= prints the probe path verbatim, which may hold ' dimensions=') is never the field
+                    if ($verified.Count -eq 1) {
+                        $verifiedLine = $verified[0].Value + ([string]$BatchLogText).Substring($verified[0].Index + $verified[0].Length).Split("`n")[0]
+                        $verifiedFields = [regex]::Match($verifiedLine, $script:ExportRenderVerifiedFields)
+                        if (-not $verifiedFields.Success) {
+                            $problems.Add("EXPORT_OUTPUT_MISMATCH: RENDER_VERIFIED carries no dimensions= at the rendered runner's field position (BatchRunner.cpp: <clip> decoded_frames= decoded_duration= decoded_frame_bytes= dimensions=WxH bytes= ...), so the decoded .mov is not bound to RENDER_START output=$($decl.output)")
+                        }
+                        elseif (-not [string]::Equals($verifiedFields.Groups['d'].Value, [string]$decl.output, [StringComparison]::Ordinal)) {
+                            $problems.Add("EXPORT_OUTPUT_MISMATCH: RENDER_START declares output=$($decl.output) but RENDER_VERIFIED decoded dimensions=$($verifiedFields.Groups['d'].Value), so the declaration and the verification are not of one .mov")
+                        }
                     }
                     if ($decl.scaled -and $scale.Count -eq 0) { $problems.Add('EXPORT_PROFILE_ABSENT: RENDER_START declares scaled=true but stage-timing.log times no export_scale; a scaled frame plan times it on every frame') }
                     elseif (-not $decl.scaled -and $scale.Count -gt 0) { $problems.Add("EXPORT_STAGE_WINDOW_MISMATCH: RENDER_START declares scaled=false but stage-timing.log times export_scale on $($scale.Count) frame(s); an unscaled frame plan runs no scale") }

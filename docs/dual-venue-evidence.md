@@ -497,9 +497,13 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
     From r5 a run timed `0.000` on every frame is not read as agreement on a **no**-dual-ISO leg either: the figure is rounded to the microsecond (`StageTiming.h` `%.3f`),
     so an attempt under half a microsecond prints it too. That leg's `dualIsoClassAgrees` is null with `DUALISO_APPLIED_UNKNOWN`, while a dual-ISO leg's all-zero run is still
     `CLIP_CLASS_MISMATCH` (no reconstruction takes under half a microsecond).
+    From r6 that mismatch's detail reports the observed rounded figure (`0.000 ms on every one of N timed frame(s)`) and what it shows (no frame was reconstructed). It
+    makes no claim that no attempt ran, since the rounded timer cannot show that.
     **r5 evidence binding.** The frame loop's order now also refuses a second `processed16_total` on one frame and a frame that is recorded but never written
     (`EXPORT_RECORD_INVALID`). `RENDER_START` `out=` must name the `.mov` the output manifest lists (the file leaf of the path), and `RENDER_VERIFIED` `dimensions=` must be
-    the declared `output=`; otherwise `EXPORT_OUTPUT_MISMATCH`. The declared fps lies inside the producer's uint32-over-uint32 range as QLocale prints it
+    the declared `output=`; otherwise `EXPORT_OUTPUT_MISMATCH`. From r6 `dimensions=` is a required field, read at the producer's token position (between
+    `decoded_frame_bytes=` and `bytes=`, `BatchRunner.cpp`). A line without it there is `EXPORT_OUTPUT_MISMATCH`. Text later on the line, such as a
+    `container_probe=` path that contains ` dimensions=`, never counts as the field. The declared fps lies inside the producer's uint32-over-uint32 range as QLocale prints it
     (`2.32831e-10 .. 4.29497e+09`); otherwise `EXPORT_PROFILE_FOREIGN`. The wall gates (CDNG and ProRes) build their limit from the largest wall the printed `DONE elapsed`
     rounds from, the figure plus half its last printed place (`elapsed=0.3` is a wall up to 0.35 s; the producer prints tenths), and the ProRes means are taken over each
     record's exact decimal figure, never a double. `export_scale` is stamped after the avir worker pool's scope closes, so it includes the pool's join.
