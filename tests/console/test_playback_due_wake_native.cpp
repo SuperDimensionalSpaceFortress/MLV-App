@@ -3211,6 +3211,53 @@ TEST(PlaybackDueWakeSend, R17A1_EachRunnerSleepSegmentIsChargedToTheWindowItRanI
     ASSERT_TRUE( std::fabs( newTiming.runner_sleep_ms - 4.0 ) < 1e-9 );
 }
 
+namespace {
+// CI-FLAKE-R17A1-FOREIGN-FIRST-FLOOR-1 r5 (sol r4 B1): the dispatch-record accounting of ONE sleep, checked on every attempt that
+// proves a dispatch ran BEFORE any admission gate may discard it. The sleep reads the caller clock at its entry, at each
+// dispatch's begin and end, and at its return, and records one span per dispatch on those very reads; every handler that ran
+// inside the sleep ran inside one of those spans. Returns "" when the record accounts for every dispatch, otherwise why not.
+// An admission gate that skipped such a sample first (the r4 one-span and separate-stray gates did) let a clean retry hide a
+// product that dropped a span record.
+std::string r17A1DispatchRecordGap( const std::vector<double> &stampsS, const std::vector<std::pair<double, double>> &spansS,
+                                    const std::vector<double> &handlerReadsMs )
+{
+    if( spansS.empty() ) return "spans=0 (a dispatch ran, none recorded)";
+    if( stampsS.size() != 2 + 2 * spansS.size() )
+        return "stamps=" + std::to_string( stampsS.size() ) + " spans=" + std::to_string( spansS.size() ) + " (expected stamps=2+2*spans)";
+    for( size_t i = 0; i < spansS.size(); ++i )
+        if( !( std::fabs( spansS[i].first - stampsS[2 * i + 1] ) < 1e-9 ) || !( std::fabs( spansS[i].second - stampsS[2 * i + 2] ) < 1e-9 ) )
+            return "span " + std::to_string( i ) + " is not the reads around its dispatch";
+    constexpr double kRoundTripMs = 0.00005;                          // assertChargedBeforeHandler's tolerance
+    for( const double readMs : handlerReadsMs )
+    {
+        bool inSpan = false;
+        for( const auto &span : spansS )
+            if( span.first * 1000.0 <= readMs + kRoundTripMs && readMs <= span.second * 1000.0 + kRoundTripMs ) inSpan = true;
+        if( !inSpan ) return "a handler read at " + std::to_string( readMs ) + " ms lies in no recorded span";
+    }
+    return std::string();
+}
+}
+
+TEST(PlaybackDueWakeSend, R17A1_ADispatchThatRanIsAccountedBeforeAnyAdmissionMayDiscardIt)
+{
+    // sol r4 B1, the literal rows (caller stamps and spans in seconds, handler reads in ms)
+    // (a) the no-stray arm: the held dispatch [8.1, 59] ran (stamps [0, 8.1, 59, 80], the present's handler inside it), spans []
+    const std::vector<double> heldStamps { 0.0, 0.0081, 0.059, 0.080 };
+    const std::vector<double> heldReads { 20.0, 22.0 };
+    ASSERT_FALSE( r17A1DispatchRecordGap( heldStamps, {}, heldReads ).empty() );
+    ASSERT_TRUE( r17A1DispatchRecordGap( heldStamps, { { 0.0081, 0.059 } }, heldReads ).empty() );   // the healthy record
+    // (b) the stray at 60.2 ms in its own dispatch [60.1, 60.3]: all six stamps kept, its returned span omitted
+    const std::vector<double> strayStamps { 0.0, 0.0081, 0.059, 0.0601, 0.0603, 0.080 };
+    const std::vector<double> strayReads { 20.0, 22.0, 60.2 };
+    ASSERT_FALSE( r17A1DispatchRecordGap( strayStamps, { { 0.0081, 0.059 } }, strayReads ).empty() );
+    ASSERT_TRUE( r17A1DispatchRecordGap( strayStamps, { { 0.0081, 0.059 }, { 0.0601, 0.0603 } }, strayReads ).empty() );
+    // the same loss with the stray's two stamps dropped too: the counts agree, but the stray's read lies in no recorded span
+    ASSERT_FALSE( r17A1DispatchRecordGap( heldStamps, { { 0.0081, 0.059 } }, strayReads ).empty() );
+    // a span shifted off the reads around its dispatch
+    ASSERT_FALSE( r17A1DispatchRecordGap( heldStamps, { { 0.0082, 0.059 } }, heldReads ).empty() );
+}
+
 #ifdef Q_OS_WIN
 namespace {
 R17A1Windows *g_r17A1Windows = nullptr;
@@ -3365,6 +3412,8 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     // ran, so there is nothing to measure), the observation is retried. The retry keys on the HANDLER's own stamps, never on
     // the sleep's span record: an attempt whose handler ran is judged in full below, so a product that dropped the span (or a
     // stamp, or a segment) fails here instead of being retried away. A pass can never come from a missed send.
+    // r5 (sol r4 B1): that holds for EVERY admission gate, not only the handler's: an attempt that proves a dispatch ran has its
+    // dispatch record accounted before any gate may discard it (r17A1DispatchRecordGap, in the loop below).
     // r4 (sol review r3, blocker 2; adversary pass 1 A1/A4, pass 2 A1/A2): after the first send the sender puts out probes at
     // fixed offsets (kR17A1ProbeOffsetsMs: every 6 ms from 30 to 54 ms), so the sleep dispatches more than once and the charge
     // order is proved for every dispatch. Two sends taken in one dispatch (a GUI pause) are no failure: the assertions below
@@ -3540,6 +3589,31 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         sentOk = sent.load();
         spans = wake.lastRunnerSleepDispatchSpansS();
         stamps = g_r17A1Stamps;
+        // r5 (sol r4 B1): an attempt that PROVES a dispatch ran inside the sleep (a handler ran before the drain, or the caller
+        // clock or the span record shows one) has its dispatch record accounted HERE, before any admission gate below may discard
+        // it: the r4 one-span and separate-stray gates skipped a sample whose record had lost a span (stamps [0, 8.1, 59, 80] with
+        // spans [], or the stray's own span omitted), and a clean retry passed the row. Admission may skip only an attempt that
+        // proves no dispatch ran, or one whose record is whole. The landed attempt is judged in full again after the loop.
+        const bool dispatchProven = handlerRan || nullRan || strayRan || ranProbes != 0u || stamps.size() > 2 || !spans.empty();
+        if( dispatchProven )
+        {
+            std::vector<double> ranReadsMs;
+            if( handlerRan )
+            {
+                ranReadsMs.push_back( handlerStartMs );
+                ranReadsMs.push_back( handlerEndMs );
+            }
+            if( nullRan ) ranReadsMs.push_back( nullEnterMs );
+            if( strayRan ) ranReadsMs.push_back( strayRunMs );
+            for( int i = 0; i < kR17A1MaxProbes; ++i )
+                if( ( ranProbes & ( 1u << static_cast<unsigned>( i ) ) ) != 0u ) ranReadsMs.push_back( probeRunMs[i] );
+            const std::string recordGap = r17A1DispatchRecordGap( stamps, spans, ranReadsMs );
+            if( !recordGap.empty() )
+            {
+                ::minitest::fail( __FILE__, __LINE__, "R17A1_DISPATCH_RECORD_LOST", "attempt=" + std::to_string( attempt ) + " " + recordGap );
+                return;
+            }
+        }
         // judged when the first handler ran in the sleep; otherwise the sender missed the sleep and it is retried -- never passed.
         // adversary pass 1 A5: and the sleep dispatched at least TWICE: with every send taken in one batch (a GUI pause before the
         // first dispatch) there is no second dispatch whose charge-before-handler order could be observed, so it is observed again
