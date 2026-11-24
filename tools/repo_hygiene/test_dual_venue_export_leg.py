@@ -402,16 +402,21 @@ class ExportEvidenceTests(unittest.TestCase):
             with self.subTest(reader_token=token):
                 self.assertTrue(any("RENDER_VERIFIED" in p for p in row["problems"]), row)
                 self.assertNotEqual(row["outcome"], "PASS", row)
-        # the emitted job's own pattern, taken from its source and run over the same lines
-        job_pattern = re.search(r"'(\(\?m\)\^\\\[BATCH\\\] RENDER_VERIFIED[^']*)'", EXPORT_JOB.read_text(encoding="utf-8"))
-        self.assertIsNotNone(job_pattern, "export-stage-job.ps1 no longer carries the RENDER_VERIFIED pattern this test reads")
+        # the emitted job reads the line by the reader's own grammar (EXPORT-RENDER-PIPE-TIMING-2 r4, sol r3 B2 forced companion: the job's private RENDER_VERIFIED regex
+        # this test used to run is gone; the grammar it embeds is the module's, and its classification over such lines is ExportJobGeneratorTests'
+        # test_t2_r4_b2_the_bachelor_classifier_reads_the_batch_log_by_the_modules_one_grammar), so the parsed decoded_frames below is the one the job compares
+        job = EXPORT_JOB.read_text(encoding="utf-8")
+        self.assertIn("$batchRead = ConvertFrom-DvBatchExportLog -BatchLogText $logText", job)
+        self.assertIn("$batchRead.verified.fields['decoded_frames']", job)
         lines = [batch_log(480, verified=t) for t in (480,) + MALFORMED_DECODED_FRAME_TOKENS]
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "lines.json"
             path.write_text(json.dumps(lines), encoding="utf-8")
-            proc, counts = run_pwsh_json("$p = $env:DVE_PATTERN\n$lines = Get-Content -Raw -LiteralPath $env:DVE_LINES -Encoding utf8 | ConvertFrom-Json\n"
-                                         "@($lines | ForEach-Object { @([regex]::Matches([string]$_, $p)).Count }) | ConvertTo-Json -Compress -AsArray",
-                                         DVE_PATTERN=job_pattern.group(1), DVE_LINES=str(path))
+            proc, counts = run_pwsh_json("$lines = Get-Content -Raw -LiteralPath $env:DVE_LINES -Encoding utf8 | ConvertFrom-Json\n"
+                                         "$m = Get-Module DualVenueRunner\n"
+                                         "@($lines | ForEach-Object { $v = (& $m { param($t) ConvertFrom-DvBatchExportLog -BatchLogText $t } ([string]$_)).verified; "
+                                         "$(if ($null -eq $v.problem) { 1 } else { 0 }) }) | ConvertTo-Json -Compress -AsArray",
+                                         DVE_LINES=str(path))
         self.assertIsNotNone(counts, proc.stdout[-2000:] + proc.stderr[-2000:])
         self.assertEqual(counts, [1] + [0] * len(MALFORMED_DECODED_FRAME_TOKENS), "the job reads a malformed decoded_frames token as a verification")
 
@@ -2318,7 +2323,8 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
             row("F10", "PASS", v=V(probe="C:/a probe_source=none codec=h264 container=mp4 sar=2:1 dar=1:1")),
             row("F11", (OM, RS, "out="), s=S0 + " codec=h264"),
             row("F12", (BU, DN, "exported="), d=D0 + " exported=1"),
-            row("F13", (OM, RV, "exported="), d="[BATCH] DONE view-0 exported=30 skipped=0 elapsed=1.0 exported=1 skipped=0 elapsed=1.0"),
+            # (r4, sol r3 B4 forced companion: the repeated triplet is now refused by DONE's own grammar, before the clip is bound to RENDER_VERIFIED's)
+            row("F13", (BU, DN, "exported="), d="[BATCH] DONE view-0 exported=30 skipped=0 elapsed=1.0 exported=1 skipped=0 elapsed=1.0"),
             row("F14", (PA, RS, "out="), s=S0.replace(" out=", " output=1280x720 out=")),
         ]
 

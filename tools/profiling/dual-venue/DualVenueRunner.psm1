@@ -5202,7 +5202,10 @@ $script:ExportBatchLineGrammar = [ordered]@{
                                          rest = 'out'; right = @() }
     RENDER_VERIFIED = [pscustomobject]@{ code = 'EXPORT_OUTPUT_MISMATCH'; form = "the rendered runner's form (BatchRunner.cpp:803)"
                                          left = @('decoded_frames=u15', 'decoded_duration=t', 'decoded_frame_bytes=u19', 'dimensions=WxH', 'bytes=u19')
-                                         rest = 'container_probe'; right = @('probe_source=t', 'codec=t', 'container=t', 'sar=t', 'dar=t') }
+                                         rest = 'container_probe'; right = @('probe_source=t', 'codec=t', 'container=t', 'sar=t', 'dar=t')
+                                         # (r4, sol r3 B1: with no probe the producer prints these six values together and only together, BatchRunner.cpp:810-819;
+                                         # 'unavailable' is a fixed sentinel, never a path, so text after it is a field named again)
+                                         sentinel = [ordered]@{ container_probe = 'unavailable'; probe_source = 'none'; codec = 'unchecked'; container = 'unchecked'; sar = 'unchecked'; dar = 'unchecked' } }
 }
 # (a line of a kind that still holds one of these after its one trailing CR is trimmed is not in the kind's form: the producer writes none of them inside a line)
 $script:ExportBatchLineForbidden = '[\u0000-\u001F\u007F\u0085\u2028\u2029]'
@@ -5261,6 +5264,34 @@ function ConvertFrom-DvBatchLogLine {
         $body = $(if ($at -ge 0) { $body.Substring(0, $at) } else { '' })
     }
     if ([string]::IsNullOrEmpty($body)) { return (& $fail $(if ($null -eq $g.rest) { 'it names no clip before exported=' } else { "its $($g.rest)= value is empty" })) }
+    # r4 (sol r3 B4): a field of the peeled trailer named again just before it is a repeat, not clip text (DONE view-0 exported=29 skipped=1 elapsed=40.0 exported=30 ...
+    # read the first triplet as the clip, and CDNG has no RENDER_START to bind the clip). A one-token clip spelled like a key is the clip (DONE requires one), so it stays.
+    if ($null -eq $g.rest) {
+        $at = $body.LastIndexOf([char]' ')
+        if ($at -ge 0) {
+            $tok = $body.Substring($at + 1)
+            foreach ($spec in $right) {
+                if (& $isField $tok $spec) { return (& $fail "before field $($field + 1) ($($right[0].Split('=')[0])=) it finds '$tok', which names $($spec.Split('=')[0])= again (the producer writes each field once, after the clip)") }
+            }
+        }
+    }
+    # r4 (sol r3 B1): the no-probe sentinel binds its trailer both ways, and is the whole value: text after 'unavailable' is a field named again, not a path
+    $sentinel = $(if ($null -ne $g.PSObject.Properties['sentinel']) { $g.sentinel } else { $null })
+    if ($null -ne $sentinel) {
+        $mark = [string]$sentinel[$g.rest]
+        if ($body.StartsWith("$mark ", [StringComparison]::Ordinal)) {
+            return (& $fail "its $($g.rest)= value is the no-probe sentinel '$mark' followed by $(& $found $body.Substring($mark.Length + 1)); the producer prints the sentinel alone (BatchRunner.cpp:810), so that text is a field named again")
+        }
+        $values[$g.rest] = $body
+        $on = @($sentinel.Keys | Where-Object { [string]::Equals([string]$values[$_], [string]$sentinel[$_], [StringComparison]::Ordinal) })
+        if ($on -ccontains $g.rest -or $on -ccontains 'probe_source') {
+            $off = @($sentinel.Keys | Where-Object { $on -cnotcontains $_ })
+            if ($off.Count -gt 0) {
+                $want = @($sentinel.Keys | ForEach-Object { "$_=$($sentinel[$_])" }) -join ' '
+                return (& $fail "it carries $(@($on | ForEach-Object { "$_=$($sentinel[$_])" }) -join ' ') but $(@($off | ForEach-Object { "$_=$($values[$_])" }) -join ' '); with no probe the producer prints $want together (BatchRunner.cpp:810-819), so the line is no one verification")
+            }
+        }
+    }
     if ($null -eq $g.rest) { $Clip = $body } else { $values[$g.rest] = $body }
     $fields = [ordered]@{}
     foreach ($spec in @(@($g.left) + @($(if ($null -ne $g.rest) { "$($g.rest)=" })) + $right)) { $key = $spec.Split('=')[0]; $fields[$key] = $values[$key] }
@@ -5988,6 +6019,14 @@ function Get-DvExportEvidence {
                         $problems.Add("EXPORT_STAGE_WINDOW_MISMATCH: stage-timing.log times processed16_total on $($p16Frames.Count) frame(s), $($outside.Count) of them outside frames $lo..$hi; RENDER_START declares cutIn=$($decl.cutIn) cutOut=$($decl.cutOut), and the producer's loop times frames cutIn-1 .. cutOut-1 only, so the log is of another window")
                     }
                 }
+            }
+            elseif ($batch.start.count -gt 0) {
+                # EXPORT-RENDER-PIPE-TIMING-2 r4 (sol r3 B3): on an older or unnamed build with none of this card's stages, a PRESENT RENDER_START is still read by the one
+                # grammar and the declaration's own checks (a duplicate output=, `RENDER_START:`, a second line or a foreign codec is INVALID); an absent one adds nothing,
+                # so a receipt from a build before the declaration re-derives the same. The bindings to this card's stages (scaled= against export_scale, the cut against
+                # the timed window) stay with the branch above: an older build times no export_scale.
+                $declOlder = Get-DvRenderStartDeclaration -Start $batch.start
+                if ($null -ne $declOlder.problem) { $problems.Add($declOlder.problem) }
             }
         }
         # r1 fix 1 (adversary A2): the base reader's shape, for old-format evidence only (no log, or a log with none of the new stages). The problems and the outcome are the
