@@ -33,6 +33,7 @@
 #include "../../src/batch/LookAssistAnalysis.h"   // LookAssistFlavor, and the LookAssistAppliedMarker member below
 #include "LookAssistAnalysisPump.h"
 #include "LookLabelPolicy.h"                        // look_label::LabelGrade member below (r16)
+#include "PlaybackInfoLabelPolicy.h"                // playback_info_label::Toggles member below
 #include "ViewerCursorSurfaces.h"                   // PLAYER-CURSOR-AUTOHIDE-1 viewer_idle members below
 #include "ViewerDoubleClickPolicy.h"                // viewer_dblclick::Gate member below (PLAYER-DOUBLECLICK-FULLSCREEN-1)
 #include "SessionModel.h"
@@ -871,13 +872,66 @@ private:
     QLabel *m_pFpsStatus;
     QString m_lastPlaybackFpsStatusText;
     double m_playbackFpsEmaFrameMs = 0.0;
+    bool m_playbackFpsMeterNewPlay = false;   // r12 (adversary pass 13 A2): the next draw is a new Play's first (feeds no interval)
+    quint64 m_playbackPresentedFrameCount = 0;           // r21 (adversary pass 20 A3): frames recordPresentedFrame has recorded
+    quint64 m_playbackFpsMeterSeenPresentedCount = 0;    // r21: the count the fps meter last stepped on; a draw feeds it only when this moved
     QTime m_lastPlaybackFpsStatusUpdateTime;
+    QTime m_playbackFpsMeterPresentedStamp;       // INFO-2 r2 (pass 1 A2): wall time recordPresentedFrame ran for the latest presented frame (the handoff)
+    QElapsedTimer m_lookLabelPaintOwedClock;      // INFO-2 r2 (pass 1 A7): armed when a playing relabel stored its text for the next paint (monotonic); invalid = no debt
+    quint64 m_lookLabelPaintOwedPresentedCount = 0;   // INFO-2 r2: the presented-frame count when it was armed; a frame since carries the text
+    qint64 m_lookLabelPaintOwedExpectedFloorMs = 0;   // INFO-2 r7 (pass 10 A3): the fps meter reset's pre-zeroing period; the debt never waits less
+    QTime m_playbackFpsMeterPrevPresentedStamp;   // INFO-2 r2: the presentation stamp the meter last stepped on (the interval's start)
     QLabel *m_pFrameNumber;
     QLabel *m_pChosenDebayer;
     QLabel *m_pLookLabelStatus = nullptr;   // LOOK-FULLSCREEN-PARITY-1: the current look, windowed
     QString m_lookLabelText;                // the text both labels show (updateLookLabel)
     bool m_lookLabelFullscreenShown = false;
     bool m_lookLabelShowInFullscreen = true; // the persisted "Show Look Label in Fullscreen" setting
+    // LOOK-LABEL-PLAYBACK-INFO-1 (updatePlaybackInfoLabel): the info lines, the corner text actually pushed, the twin.
+    QLabel *m_pPlaybackInfoStatus = nullptr;
+    QString m_playbackInfoText;             // overlay form (with fps)
+    QString m_playbackInfoStatusText;       // status-bar twin form (no fps)
+    QString m_lookLabelOverlayText;         // what the corner surface was asked to draw (look line + info lines)
+    bool m_lookLabelOverlayGpuWindow = false;
+    playback_info_label::Toggles m_playbackInfoToggles;
+    // r1 adversary A1: the rate the label shows, a snapshot written ONLY at the fps meter's 250 ms gate and its reset.
+    double m_playbackInfoFpsShown = 0.0;
+    bool m_playbackInfoInputsDirty = false;  // an info input changed while playing; flushPlaybackInfoIfDue relabels (r1 pass-3 A2)
+    QElapsedTimer m_playbackInfoRelabelClock; // r2 A1: monotonic, restarted by every relabel; the deferred relabel's 250 ms gate
+    bool m_playbackInfoRateWithdrawn = false; // r2 pass-2 A2: a measured rate was reset; the next overlay push repaints at once
+    bool m_playbackFramesStalled = false;     // r3 pass-2 A1: playing, but no draw for > 500 ms; overlay pushes repaint at once
+    // r1 adversary A1/A3: the info inputs last relabelled for (refreshPlaybackInfoOnInputChange compares them, ints only).
+    struct PlaybackInfoInputs
+    {
+        int pipelineStatus = -1;
+        bool scopeCaveat = false;
+        int requestedScale = 0;
+        int presentedScale = 0;
+        bool requestContextValid = false;
+        int requestContextScale = 0;
+        bool gpuAmaze = false;
+        bool gpuBilinear = false;
+        int presentedRoute = 0;   // r12 adversary A1: the presented frame's CPU render-path code (a proxy route relabels)
+        int debayerScale = 0;     // r13 adversary pass 15 A1: a prep frame's debayer scale (presentedPlaybackDebayerScale)
+        QString debayer;          // INFO-2 r1 (pass 21 A1): the debayer name the label shows (playbackInfoDebayerName)
+        bool dualIsoOn = false;   // INFO-2 r2 (pass 1 A5): the displayed image's Dual-ISO state (playbackInfoDualIsoOn)
+        double playbackRate = 0.0;   // INFO-2 r2 (pass 1 A8): the effective conform rate (getPlaybackFramerate) the fps field shows
+        bool operator==( const PlaybackInfoInputs &o ) const
+        {
+            return pipelineStatus == o.pipelineStatus && scopeCaveat == o.scopeCaveat && requestedScale == o.requestedScale
+                && presentedScale == o.presentedScale && requestContextValid == o.requestContextValid
+                && requestContextScale == o.requestContextScale && gpuAmaze == o.gpuAmaze && gpuBilinear == o.gpuBilinear
+                && presentedRoute == o.presentedRoute
+                && debayerScale == o.debayerScale
+                && debayer == o.debayer
+                && dualIsoOn == o.dualIsoOn
+                && playbackRate == o.playbackRate;   // presentedFrameScaleOf is a function of presentedScale + requestContextValid, both keyed
+        }
+    };
+    PlaybackInfoInputs m_playbackInfoInputs;
+    QString m_lookLabelPlayingShown;        // the last drawn corner text sampled at the fps hook while playing
+    QString m_lookLabelPlayingSurface;
+    int m_lookLabelPlayingSamples = 0;
     bool m_doubleClickViewerFullscreen = true; // PLAYER-DOUBLECLICK-FULLSCREEN-1: the persisted "Double-Click Viewer Toggles Fullscreen" setting
     viewer_dblclick::Gate m_viewerDoubleClickGate; // first-press tool record for the viewer double-click
     viewer_dblclick::ViewerState viewerDoubleClickState( const QObject *target, const QPointF &pos ) const;
@@ -1039,7 +1093,7 @@ private:
         bool envHq = false;
         int envPreviewOverride = -2;
         bool aggressivePreviewActive = false;
-        int lastPresentedPlaybackScaleFactorActive = -1;
+        int lastPresentedPlaybackScaleFactorActive = -1;   // r12 (pass 14 A1): presentedPlaybackScaleShown(), the scale the label shows
         bool lastPresentedRequestContextValid = false;
         int lastPresentedRequestScaleFactor = -1;
         int phase3Tier = -1;
@@ -2381,6 +2435,32 @@ private:
     // The look label text actually on screen now, and where ("fullscreen_gpu_window",
     // "fullscreen_cpu_viewport", "windowed_status_bar" or "none"): the receipt's lookLabelShown.
     QString lookLabelShownText( QString *surface );
+    // LOOK-LABEL-PLAYBACK-INFO-1: the info lines under the fullscreen look label (pipeline, scale, debayer, fps, Dual-ISO,
+    // resolution) and their status-bar twin (no fps). Change-only: composes only while the overlay is shown or the twin is
+    // visible, and pushes only when a text or the overlay route changed.
+    // r3: forceWithdrawal (only the fps meter's reset of a measured rate) skips the playing gate.
+    void updatePlaybackInfoLabel( bool forceWithdrawal = false );
+    void flushPlaybackInfoIfDue( void );
+    void settleLookLabelPaintIfOwed( void );   // INFO-2 r2 (pass 1 A7, pass 2 A1): the paint a stored playing label is owed when no frame comes
+    // The one push of the look label (plus the info lines in fullscreen) to the status bar and the corner surfaces.
+    void pushLookLabelOverlay( void );
+    playback_info_label::Facts playbackInfoFacts( void );
+    bool playbackInfoLiveDualIsoOn( void ) const;    // INFO-2 r2 (pass 1 A5): Dual-ISO applied by the live settings (the next frame's request)
+    bool playbackInfoDualIsoOn( void ) const;        // INFO-2 r2 (pass 1 A5): the displayed image's own (the presented frame's context)
+    QString playbackInfoDebayerName( void ) const;   // INFO-2 r1 (pass 21 A1): the shown debayer name, also the relabel key's
+    // r12 adversary A1: the presented frame's CPU render-path code, read from its own telemetry (0 = full recon or unknown).
+    int presentedPlaybackRouteCode( void ) const;
+    // r12 pass-13 A1: the presented frame's shown scale (a CPU prep frame: the render's achieved size times the prep's factor).
+    int presentedPlaybackScaleShown( void ) const;
+    // r13 adversary pass 15 A1: the scale a CPU prep frame was debayered at (the render's achieved size; 0 = not a prep frame).
+    int presentedPlaybackDebayerScale( void ) const;
+    // r13 adversary pass 16 A1: an unreduced CPU-debayered frame's achieved scale (0 = not such a frame).
+    int presentedPlaybackUnreducedCpuDebayerScale( void ) const;
+    // The presented pipeline status and the scope caveat, shared by the toolbar indicator and the info label.
+    void presentedGpuPlaybackPipelineStatus( GpuPlaybackPipelineStatus &status, bool &scopePerformanceCaveat ) const;
+    // r1 adversary A1/A3: relabels only when a pipeline/scale/debayer input changed (int compares; safe per presented frame).
+    void refreshPlaybackInfoOnInputChange( GpuPlaybackPipelineStatus status, bool scopePerformanceCaveat );
+    void setPlaybackInfoToggle( bool playback_info_label::Toggles::*field, bool on );
     void setGradientMask( void );
     uint16_t autoCorrectRawBlackLevel( void );
     uint16_t autoCorrectRawWhiteLevel( void );

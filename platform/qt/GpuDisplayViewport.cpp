@@ -22,7 +22,9 @@
 #include <QGraphicsPixmapItem>
 #include <QGraphicsScene>
 #include <QGraphicsView>
+#include <QMetaObject>
 #include <QOpenGLContext>
+#include <QPainter>
 #include <QPalette>
 #include <QPolygonF>
 #include <QSurfaceFormat>
@@ -997,6 +999,17 @@ void GpuDisplayViewport::initializeGL()
         });
     }
 
+    // LOOK-LABEL-PLAYBACK-INFO-2 r6 (adversary pass-8 A9): presented-frame renderer telemetry reads m_rendererDescription
+    // (rendererDescriptionFor), so it follows every (re)initialized context; only the log line below is once per widget.
+    if ( QOpenGLContext *currentContext = context() )
+    {
+        QOpenGLFunctions *currentFunctions = currentContext->functions();
+        const GLubyte *currentRenderer = currentFunctions ? currentFunctions->glGetString(GL_RENDERER) : nullptr;
+        m_rendererDescription = currentRenderer
+            ? QString::fromLatin1(reinterpret_cast<const char *>(currentRenderer))
+            : QStringLiteral("unknown");
+    }
+
     if ( m_loggedContext ) return;
 
     QOpenGLContext *glContext = context();
@@ -1153,6 +1166,18 @@ void GpuDisplayViewport::paintGL()
     // HFR-NATIVE-60FPS-FULLRES-1 r29 (adversary A1 on cf403dba): this paint drew that serial; the conform tracker credits it now
     if ( m_paintedSerialValid ) playback_paint_credit::notePainted( m_paintedSerial );
     m_composedPaint.notePaint( m_paintedSerial );   // r30 (adversary A1 on 71104385): the gate's paint check; not inside an offscreen grab
+
+    // LOOK-LABEL-PLAYBACK-INFO-1 r21 (adversary pass 20 A1): eventFilter consumes the Paint event while a frame is pending, so
+    // QGraphicsView::paintEvent never runs and GraphicsZoomView::drawForeground never draws the look label or the playback-info
+    // lines over the frame. The view's one label routine draws them here, over the frame just drawn. Invoked by name: the view is
+    // a GraphicsZoomView in the app, and a plain QGraphicsView (gui_tests, which does not link it) simply has no such method.
+    // No QPainter (a begin/end on the FBO per paint) unless the view holds a label to draw.
+    bool labelWanted = false;
+    if ( QMetaObject::invokeMethod(m_view, "hasLookLabel", Qt::DirectConnection, Q_RETURN_ARG(bool, labelWanted)) && labelWanted )
+    {
+        QPainter labelPainter(this);
+        QMetaObject::invokeMethod(m_view, "paintLookLabel", Qt::DirectConnection, Q_ARG(QPainter *, &labelPainter));
+    }
 
     // Bug A on-screen present A/B (V4): force the dGPU to flush/complete this frame
     // before Qt blits the FBO and presents it, in case the Optimus cross-adapter

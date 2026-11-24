@@ -122,6 +122,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_present_trace.cpp \
     $$REPO_ROOT/tests/console/test_playback_scopes_during_playback.cpp \
     $$REPO_ROOT/tests/console/test_playback_scale_label.cpp \
+    $$REPO_ROOT/tests/console/test_playback_info_label.cpp \
     $$REPO_ROOT/tests/console/test_visual_capture_source_difference.cpp \
     $$REPO_ROOT/tests/console/test_viewer_idle_wiring.cpp \
     $$REPO_ROOT/tests/console/test_viewer_idle_policy.cpp \
@@ -169,6 +170,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackSourceAdvanceTracker.h \
     $$REPO_ROOT/platform/qt/PlaybackAchievedScalePolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackScaleLabel.h \
+    $$REPO_ROOT/platform/qt/PlaybackInfoLabelPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackLookaheadLoopPositionPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackFpsMeterPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackDecodeRenderOverlap.h \

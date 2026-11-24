@@ -7,6 +7,7 @@
 #include "../../platform/qt/GpuWindowViewerInputForwarder.h"
 #include "../../platform/qt/GpuPreviewProcessing.h"
 #include "../../platform/qt/Histogram.h"
+#include "../../platform/qt/LookLabelOverlay.h"
 #include "../../platform/qt/MainWindowGpuPreviewPolicy.h"
 #include "../../platform/qt/PlaybackScopesDuringPlayback.h"
 #include "../../platform/qt/PlayerShortcutBinding.h"
@@ -29,6 +30,7 @@
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFontInfo>
+#include <QFontMetrics>
 #include <QFrame>
 #include <QGraphicsPixmapItem>
 #include <QGraphicsScene>
@@ -47,6 +49,8 @@
 #include <QOpenGLFunctions>
 #include <QPalette>
 #include <QPaintEvent>
+#include <QPainter>
+#include <QPainterPath>
 #include <QPlainTextEdit>
 #include <QPointer>
 #include <QScopeGuard>
@@ -754,6 +758,8 @@ private slots:
     void scopesLabelDispatchesRawWaveformExactly();
     void scopesLabelDispatchesRawParadeExactly();
     void scopesLabelDispatchesRawVectorScopeExactly();
+    void lookLabelOverlaySingleLineIsUnchanged();
+    void lookLabelOverlayGrowsWithLineCount();
     void glWindowViewerInput_picksMapToSceneAndRespectArming();
     void glWindowViewerInput_contextMenuOnPlatformTriggerOnly();
     void glWindowViewerInput_dragAndDropReachTheHooks();
@@ -765,6 +771,81 @@ private slots:
     void glWindowViewerInput_getterRefusesWhileAFrameIsHandedOver();
     void glWindowViewerInput_getterRecordsThePaintedPicture();
 };
+
+namespace
+{
+// LOOK-LABEL-PLAYBACK-INFO-1: renderLookLabelOverlayImage as it was on f9ff24b7 (one line only), the reference the
+// multi-line renderer must reproduce byte for byte for a single line.
+QImage legacyLookLabelOverlayImage( const QString &text, int fontPx )
+{
+    if( text.isEmpty() || fontPx <= 0 ) return QImage();
+    QFont font( QStringLiteral( "Segoe UI" ) );
+    font.setPixelSize( fontPx );
+    font.setWeight( QFont::DemiBold );
+    const QFontMetrics metrics( font );
+    const int padX = qMax( 4, qRound( fontPx * 0.55 ) );
+    const int padY = qMax( 2, qRound( fontPx * 0.30 ) );
+    const int textWidth = metrics.horizontalAdvance( text );
+    const QSize size( textWidth + 2 * padX, metrics.height() + 2 * padY );
+    QImage image( size, QImage::Format_ARGB32_Premultiplied );
+    image.fill( Qt::transparent );
+    QPainter painter( &image );
+    painter.setRenderHint( QPainter::Antialiasing, true );
+    painter.setRenderHint( QPainter::TextAntialiasing, true );
+    const qreal radius = size.height() * 0.28;
+    QPainterPath backing;
+    backing.addRoundedRect( QRectF( 0.5, 0.5, size.width() - 1.0, size.height() - 1.0 ), radius, radius );
+    painter.fillPath( backing, QColor( 0, 0, 0, 140 ) );
+    painter.setPen( QColor( 255, 255, 255, 40 ) );
+    painter.drawPath( backing );
+    painter.setFont( font );
+    const QRect textRect( padX, padY, textWidth, metrics.height() );
+    painter.setPen( QColor( 0, 0, 0, 160 ) );
+    painter.drawText( textRect.translated( 0, qMax( 1, fontPx / 20 ) ), Qt::AlignLeft | Qt::AlignVCenter, text );
+    painter.setPen( QColor( 255, 255, 255, 235 ) );
+    painter.drawText( textRect, Qt::AlignLeft | Qt::AlignVCenter, text );
+    painter.end();
+    return image;
+}
+} // namespace
+
+void GuiSmokeTest::lookLabelOverlaySingleLineIsUnchanged()
+{
+    const QString texts[] = { QStringLiteral( "Look: Cinematic" ), QStringLiteral( "Look: Off" ),
+                              QStringLiteral( "Look: Baseline (fallback)" ) };
+    const int sizes[] = { 14, 20, 40, 64 };
+    for( const QString &text : texts )
+    {
+        for( const int px : sizes )
+        {
+            const QImage now = renderLookLabelOverlayImage( text, px );
+            const QImage before = legacyLookLabelOverlayImage( text, px );
+            QCOMPARE( now.size(), before.size() );
+            QCOMPARE( now.format(), before.format() );
+            QVERIFY2( now == before, qPrintable( QStringLiteral( "pixels differ for '%1' at %2 px" ).arg( text ).arg( px ) ) );
+        }
+    }
+    QVERIFY( renderLookLabelOverlayImage( QString(), 20 ).isNull() );
+}
+
+void GuiSmokeTest::lookLabelOverlayGrowsWithLineCount()
+{
+    const int px = 20;
+    const QImage one = renderLookLabelOverlayImage( QStringLiteral( "Look: Cinematic" ), px );
+    const QImage two = renderLookLabelOverlayImage( QStringLiteral( "Look: Cinematic\nGPU display GPU Tex NR" ), px );
+    const QImage three = renderLookLabelOverlayImage(
+        QStringLiteral( "Look: Cinematic\nGPU display GPU Tex NR\n24.0/24 fps DF on 1920x1080" ), px );
+    QVERIFY( !one.isNull() && !two.isNull() && !three.isNull() );
+    QFont font( QStringLiteral( "Segoe UI" ) );
+    font.setPixelSize( px );
+    font.setWeight( QFont::DemiBold );
+    const int step = QFontMetrics( font ).lineSpacing();
+    QCOMPARE( two.height(), one.height() + step );
+    QCOMPARE( three.height(), one.height() + 2 * step );
+    // Width is the widest line's.
+    QVERIFY( three.width() >= two.width() );
+    QVERIFY( two.width() >= one.width() );
+}
 
 void GuiSmokeTest::checkedStateUpdatesPalette()
 {

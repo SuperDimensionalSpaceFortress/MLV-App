@@ -8,6 +8,7 @@
 #include "GraphicsZoomView.h"
 #include "LookLabelOverlay.h"
 #include "LookLabelPolicy.h"
+#include "PlaybackInfoLabelPolicy.h"
 #include "PlaybackSourceAdvanceTracker.h"
 #include <QCursor>
 #include <QPainter>
@@ -50,21 +51,45 @@ bool GraphicsZoomView::isZoomEnabled()
 }
 
 //LOOK-FULLSCREEN-PARITY-1: set the corner look label ("" hides it); repaints once
-void GraphicsZoomView::setLookLabel(const QString &text)
+//LOOK-LABEL-PLAYBACK-INFO-1: only the union of the old and new label rects, never the whole viewport -- unless a handed-over
+//frame is still waiting for its paint: paintEvent credits that frame as on screen (r28-r30), so that paint must draw all of it.
+//INFO-2 r8 (sol r7 LABEL-STALL): and only when pushLookLabelOverlay's repaintNow asks it (playback_info_label::cpuLabelPaint), as on
+//the GPU window. A declined change is stored and owed: the next frame's hand-over (notePixmapPresentSerial) or the paint debt (the
+//same text again with repaintNow) repaints the rects the screen still shows the old label in.
+void GraphicsZoomView::setLookLabel(const QString &text, bool repaintNow)
 {
-    if( m_lookLabelText == text ) return;
+    const bool changed = m_lookLabelText != text;
+    if( !changed && !( repaintNow && m_lookLabelPaintOwed ) ) return;
+    QRect dirty = m_lookLabelOwedRect.united( refreshLookLabelPixmap() );
     m_lookLabelText = text;
+    if( changed ) dirty = dirty.united( refreshLookLabelPixmap() );
+    switch( playback_info_label::cpuLabelPaint( repaintNow, m_pixmapPendingSerial != m_pixmapPaintedSerial, dirty.isEmpty() ) )
+    {
+    case playback_info_label::CpuLabelPaint::None:
+        m_lookLabelPaintOwed = true;
+        m_lookLabelOwedRect = dirty;
+        return;
+    case playback_info_label::CpuLabelPaint::LabelRects: viewport()->update( dirty ); break;
+    case playback_info_label::CpuLabelPaint::WholeViewport: viewport()->update(); break;
+    }
+    m_lookLabelPaintOwed = false;
+    m_lookLabelOwedRect = QRect();
+}
+
+//INFO-2 r8: the hand-over's paint is already queued and credits this frame (r28), so an owed label change widens it to the whole
+//viewport: the stored text reaches the screen with the frame, adding no paint of its own.
+void GraphicsZoomView::notePixmapPresentSerial(quint64 serial)
+{
+    m_pixmapPendingSerial = serial;
+    if( !m_lookLabelPaintOwed ) return;
+    m_lookLabelPaintOwed = false;
+    m_lookLabelOwedRect = QRect();
     viewport()->update();
 }
 
-//Blit the cached look label in the viewport's bottom-right corner. The frame's own repaints
-//touch only the picture, so the label is redrawn when its region is exposed, not per frame.
-void GraphicsZoomView::drawForeground(QPainter *painter, const QRectF &rect)
+QRect GraphicsZoomView::refreshLookLabelPixmap()
 {
-    QGraphicsView::drawForeground( painter, rect );
-    m_lookLabelDrawnText.clear();
-    if( m_lookLabelText.isEmpty() ) return;
-
+    if( m_lookLabelText.isEmpty() ) return QRect();
     const qreal dpr = viewport()->devicePixelRatioF();
     const QSize deviceSize( qRound( viewport()->width() * dpr ), qRound( viewport()->height() * dpr ) );
     const int fontPx = look_label::fontPixels( deviceSize.height() );
@@ -76,7 +101,34 @@ void GraphicsZoomView::drawForeground(QPainter *painter, const QRectF &rect)
         m_lookLabelPixmapFontPx = fontPx;
         m_lookLabelPixmapDpr = dpr;
     }
-    if( m_lookLabelPixmap.isNull() ) return;
+    if( m_lookLabelPixmap.isNull() ) return QRect();
+    const QRect deviceRect = look_label::overlayRect( deviceSize, m_lookLabelPixmap.size(),
+                                                      look_label::marginPixels( fontPx ) );
+    if( deviceRect.isEmpty() ) return QRect();
+    // Logical pixels, widened by one so a fractional dpr never leaves an undrawn edge.
+    return QRectF( deviceRect.x() / dpr, deviceRect.y() / dpr, deviceRect.width() / dpr, deviceRect.height() / dpr )
+        .toAlignedRect().adjusted( -1, -1, 1, 1 );
+}
+
+//Blit the cached look label in the viewport's bottom-right corner. The frame's own repaints
+//touch only the picture, so the label is redrawn when its region is exposed, not per frame.
+void GraphicsZoomView::drawForeground(QPainter *painter, const QRectF &rect)
+{
+    QGraphicsView::drawForeground( painter, rect );
+    paintLookLabel( painter );
+}
+
+//LOOK-LABEL-PLAYBACK-INFO-1 r21 (adversary pass 20 A1): the one label drawing routine. drawForeground (the CPU viewport's paint)
+//and GpuDisplayViewport::paintGL (the GPU widget viewport consumes the Paint event, so drawForeground never runs there) both call it.
+void GraphicsZoomView::paintLookLabel(QPainter *painter)
+{
+    m_lookLabelDrawnText.clear();
+    if( m_lookLabelText.isEmpty() ) return;
+
+    const qreal dpr = viewport()->devicePixelRatioF();
+    const QSize deviceSize( qRound( viewport()->width() * dpr ), qRound( viewport()->height() * dpr ) );
+    const int fontPx = look_label::fontPixels( deviceSize.height() );
+    if( refreshLookLabelPixmap().isEmpty() ) return;
     const QRect deviceRect = look_label::overlayRect( deviceSize, m_lookLabelPixmap.size(),
                                                       look_label::marginPixels( fontPx ) );
     if( deviceRect.isEmpty() ) return;

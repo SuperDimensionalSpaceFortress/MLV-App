@@ -205,8 +205,11 @@ public:
      * bottom-right corner (empty text = no label). The label is rasterised once per change
      * of text or framebuffer height and kept as a texture; every paint composites that one
      * cached quad over the frame, so captures (grabPresentedFramebufferIfActive) see exactly
-     * what the screen shows. GUI-thread only; false when no window is active. */
-    static bool setLookLabelIfActive(const QString &text);
+     * what the screen shows. GUI-thread only; false when no window is active.
+     * LOOK-LABEL-PLAYBACK-INFO-1: `repaintNow` false (MainWindow passes it while playing) only
+     * stores the text: the next frame's paintGL() draws it, so the label adds no paint (swap
+     * telemetry, playback_paint_credit and the composed-paint count are unaffected). */
+    static bool setLookLabelIfActive(const QString &text, bool repaintNow = true);
     /* The label text the most recent paintGL() actually drew ("" when it drew none). */
     static QString lookLabelDrawnTextIfActive(void);
 
