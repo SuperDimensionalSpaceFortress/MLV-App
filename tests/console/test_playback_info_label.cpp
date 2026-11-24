@@ -1853,7 +1853,7 @@ TEST(PlaybackInfoLabel, InfoTwoR1A5TheDebayerAttributionReadsThePresentedFramesS
     f.requestedScale = 4;
     f.presentedScale = 1;
     f.presentedValid = playback_info_label::presentedScaleBelongsToRequest(true, 1, f.requestedScale, f.presentedScale);
-    ASSERT_FALSE(f.presentedValid);   // the scale field keeps the toolbar's rule (the asked scale until the frame follows)
+    ASSERT_FALSE(f.presentedValid);   // the scale field now names the retained frame's own scale (presentedFrameScale) while the change is pending, never the asked one (LOOK-LABEL-SCALE-FIELD-PRESENTED-1 r1, sol r9 INV-3)
     f.presentedFrameScale = playback_info_label::presentedFrameScaleOf(true, f.presentedScale);
     ASSERT_QSTR_EQ(QStringLiteral("LMMSE"), playback_info_label::debayerField(f));   // the retained frame was debayered full size
     // the other direction: the retained frame is Quarter while the live request went back to Full
@@ -1876,6 +1876,134 @@ TEST(PlaybackInfoLabel, InfoTwoR1A5TheDebayerAttributionReadsThePresentedFramesS
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString facts = functionBody(source, QStringLiteral("playback_info_label::Facts MainWindow::playbackInfoFacts( void )"));
     ASSERT_TRUE(facts.contains(QStringLiteral("facts.presentedFrameScale = playback_info_label::presentedFrameScaleOf( m_lastPresentedRequestContextValid, activeScale );")));
+}
+
+namespace
+{
+
+// LOOK-LABEL-SCALE-FIELD-PRESENTED-1 r1 (sol r9 INV-3): the facts playbackInfoFacts builds for a (requested, retained, context)
+// triple: requested = the live policy scale, retained = presentedPlaybackScaleShown() (activeScale), context = the presented
+// request's own policy scale (m_lastPresentedRequestContext.playbackScaleFactorPolicy), with a presented request context.
+playback_info_label::Facts pendingScaleFacts(int requested, int retained, int context)
+{
+    playback_info_label::Facts f = cpuFullScaleFacts(QStringLiteral("LMMSE"));
+    const bool contextValid = true;
+    f.requestedScale = requested;
+    f.presentedScale = retained;
+    f.presentedValid = playback_info_label::presentedScaleBelongsToRequest(contextValid, context, f.requestedScale, retained);
+    f.presentedFrameScale = playback_info_label::presentedFrameScaleOf(contextValid, retained);
+    return f;
+}
+
+// Both info surfaces' first line: the fullscreen corner (fps included) and the status-bar twin (no fps).
+QString cornerLineA(const playback_info_label::Facts &f)
+{
+    return playback_info_label::compose(f, playback_info_label::Toggles(), true).section(QLatin1Char('\n'), 0, 0);
+}
+
+QString twinLineA(const playback_info_label::Facts &f)
+{
+    return playback_info_label::compose(f, playback_info_label::Toggles(), false).section(QLatin1Char('\n'), 0, 0);
+}
+
+} // namespace
+
+// Sol r9 INV-3 row 1, (requested, retained, context) = (4,1,1): paused on a valid x1 frame, x4 selected, the replacement render
+// not presented yet. The Full frame is still on screen; the scale field read the request ("Quarter"). It names the frame: Full.
+TEST(PlaybackInfoLabel, ScaleFieldPresentedR1Row1PendingQuarterOverFullFrameReadsFull)
+{
+    const playback_info_label::Facts f = pendingScaleFacts(4, 1, 1);
+    ASSERT_FALSE(f.presentedValid);
+    ASSERT_QSTR_EQ(QStringLiteral("Full"), playback_info_label::scaleField(f));
+    const QString lineA = QStringLiteral("CPU display CPU") + dot() + QStringLiteral("Full") + dot() + QStringLiteral("LMMSE");
+    ASSERT_QSTR_EQ(lineA, cornerLineA(f));
+    ASSERT_QSTR_EQ(lineA, twinLineA(f));
+}
+
+// Sol r9 INV-3 row 2, (1,4,4): the retained frame is Quarter while the request went back to Full. The field read "Full"; it
+// names the Quarter frame, and the debayer field (already the frame's own scale) keeps "LMMSE->Scaled".
+TEST(PlaybackInfoLabel, ScaleFieldPresentedR1Row2PendingFullOverQuarterFrameReadsQuarter)
+{
+    const playback_info_label::Facts f = pendingScaleFacts(1, 4, 4);
+    ASSERT_FALSE(f.presentedValid);
+    ASSERT_QSTR_EQ(QStringLiteral("Quarter"), playback_info_label::scaleField(f));
+    const QString lineA = QStringLiteral("CPU display CPU") + dot() + QStringLiteral("Quarter") + dot() + QStringLiteral("LMMSE->Scaled");
+    ASSERT_QSTR_EQ(lineA, cornerLineA(f));
+    ASSERT_QSTR_EQ(lineA, twinLineA(f));
+}
+
+// Sol r9 INV-3 row 3, (4,1,4), the CONTROL: the frame of the matching request presented Full (asked -> shown), and that arrow
+// stays exactly as it was.
+TEST(PlaybackInfoLabel, ScaleFieldPresentedR1Row3MatchingRequestKeepsQuarterToFull)
+{
+    const playback_info_label::Facts f = pendingScaleFacts(4, 1, 4);
+    ASSERT_TRUE(f.presentedValid);
+    ASSERT_QSTR_EQ(QStringLiteral("Quarter->Full"), playback_info_label::scaleField(f));
+    const QString lineA = QStringLiteral("CPU display CPU") + dot() + QStringLiteral("Quarter->Full") + dot() + QStringLiteral("LMMSE");
+    ASSERT_QSTR_EQ(lineA, cornerLineA(f));
+    ASSERT_QSTR_EQ(lineA, twinLineA(f));
+}
+
+// Controls on both sides of the fix (they pass before and after it): the matched frame, the request that left the frame's
+// context (the arrow clears and the field names the frame), the texture-route clamp, no presented context at all, and an
+// unknown request (the field is omitted).
+TEST(PlaybackInfoLabel, ScaleFieldPresentedR1ArrowClearsControls)
+{
+    const playback_info_label::Facts matched = pendingScaleFacts(4, 4, 4);
+    ASSERT_QSTR_EQ(QStringLiteral("Quarter"), playback_info_label::scaleField(matched));
+    ASSERT_QSTR_EQ(QStringLiteral("CPU display CPU") + dot() + QStringLiteral("Quarter") + dot() + QStringLiteral("LMMSE->Scaled"),
+                   cornerLineA(matched));
+    ASSERT_QSTR_EQ(cornerLineA(matched), twinLineA(matched));
+
+    const playback_info_label::Facts left = pendingScaleFacts(1, 1, 4);
+    ASSERT_FALSE(left.presentedValid);
+    ASSERT_QSTR_EQ(QStringLiteral("Full"), playback_info_label::scaleField(left));
+    ASSERT_QSTR_EQ(QStringLiteral("CPU display CPU") + dot() + QStringLiteral("Full") + dot() + QStringLiteral("LMMSE"), cornerLineA(left));
+    ASSERT_QSTR_EQ(cornerLineA(left), twinLineA(left));
+
+    const playback_info_label::Facts clamp = pendingScaleFacts(8, 1, 8);
+    ASSERT_TRUE(clamp.presentedValid);
+    ASSERT_QSTR_EQ(QStringLiteral("Eighth->Full"), playback_info_label::scaleField(clamp));
+    ASSERT_QSTR_EQ(QStringLiteral("CPU display CPU") + dot() + QStringLiteral("Eighth->Full") + dot() + QStringLiteral("LMMSE"),
+                   cornerLineA(clamp));
+    ASSERT_QSTR_EQ(cornerLineA(clamp), twinLineA(clamp));
+
+    // no presented frame: nothing else is on screen, so the field names what will be produced (the request)
+    playback_info_label::Facts none = cpuFullScaleFacts(QStringLiteral("LMMSE"));
+    none.requestedScale = 4;
+    none.presentedValid = false;
+    none.presentedFrameScale = 0;
+    none.presentedScale = 0;
+    ASSERT_QSTR_EQ(QStringLiteral("Quarter"), playback_info_label::scaleField(none));
+    ASSERT_QSTR_EQ(QStringLiteral("CPU display CPU") + dot() + QStringLiteral("Quarter") + dot() + QStringLiteral("LMMSE->Scaled"),
+                   cornerLineA(none));
+    ASSERT_QSTR_EQ(cornerLineA(none), twinLineA(none));
+
+    // an unknown request: the scale field is omitted on both surfaces, even with a retained frame
+    const playback_info_label::Facts unknown = pendingScaleFacts(0, 1, 4);
+    ASSERT_TRUE(playback_info_label::scaleField(unknown).isEmpty());
+    ASSERT_QSTR_EQ(QStringLiteral("CPU display CPU") + dot() + QStringLiteral("LMMSE"), cornerLineA(unknown));
+    ASSERT_QSTR_EQ(cornerLineA(unknown), twinLineA(unknown));
+}
+
+// The one Facts both surfaces read: playbackInfoFacts fills presentedValid and presentedFrameScale from the presented request
+// context, and updatePlaybackInfoLabel composes the corner and the twin from that same facts object.
+TEST(PlaybackInfoLabel, ScaleFieldPresentedR1BothSurfacesReadTheOneFacts)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString facts = functionBody(source, QStringLiteral("playback_info_label::Facts MainWindow::playbackInfoFacts( void )"));
+    ASSERT_FALSE(facts.isEmpty());
+    ASSERT_TRUE(facts.contains(QStringLiteral(
+        "facts.presentedFrameScale = playback_info_label::presentedFrameScaleOf( m_lastPresentedRequestContextValid, activeScale );")));
+    ASSERT_TRUE(facts.contains(QStringLiteral(
+        "facts.presentedValid = playback_info_label::presentedScaleBelongsToRequest(\n"
+        "        m_lastPresentedRequestContextValid, m_lastPresentedRequestContext.playbackScaleFactorPolicy,\n"
+        "        facts.requestedScale, activeScale );")));
+    ASSERT_TRUE(facts.contains(QStringLiteral("facts.presentedScale = activeScale;")));
+    const QString update = functionBody(source, QStringLiteral("void MainWindow::updatePlaybackInfoLabel("));
+    ASSERT_FALSE(update.isEmpty());
+    ASSERT_TRUE(update.contains(QStringLiteral("playback_info_label::compose( facts, m_playbackInfoToggles, true )")));
+    ASSERT_TRUE(update.contains(QStringLiteral("playback_info_label::compose( facts, m_playbackInfoToggles, false )")));
 }
 
 // INFO-2 r2 (adversary pass 1 A2 on b056b902, introduced, major): a 24 fps clip, successful handoffs at 8 and 117 ms, observing
