@@ -57,12 +57,16 @@ inline int stampAgeMs( const Stamp & then, const Stamp & now )
  *  age at a 25000 fps source asked for 2.16e9 frames). The bound is on the LAP WORK too, not only on that count: a tick
  *  that wraps a width-1 cut makes one lap per frame, and PlaybackWrapRecorder::noteEngineWrap records every lap on the
  *  GUI thread (one increment and one append each; pass 4 A1 on 3bb01140: a 1e9 bound made that 1e9 appends, 4 GB).
- *  1e6 frames is at most 1e6 laps (about 4 MB, once per long suspension) and is more than 11 hours of catch-up at
- *  24 fps, so no ordinary tick is cut. */
-inline constexpr double kMaxTickFrames = 1000000.0;
+ *  At most 1e6 laps per tick (about 4 MB, once per long suspension): the frame bound is 1e6 less the slack a tick adds
+ *  on its way to the laps (r3 pass A1 on 8743841f: a position already inside the cut adds one lap and the double sum
+ *  can round up one more, so 0.9999999999999999 + 1e6 made 1,000,001 width-1 laps; conform debt adds at most
+ *  kConformMaxDebtFrames = 8). 999,990 frames is more than 11 hours of catch-up at 24 fps. */
+inline constexpr double kMaxTickFrames = 999990.0;
 
-/*! The tick's elapsed milliseconds, cut so that \a framerate * ms / 1000 stays within +-kMaxTickFrames. Every ordinary
- *  tick is unchanged (8 ms at even 1e6 fps is 8000 frames); only a long suspension is cut. The cut is re-checked with
+/*! The tick's elapsed milliseconds, cut so that \a framerate * ms / 1000 stays within +-kMaxTickFrames. An ordinary
+ *  8 ms tick is unchanged at any source rate up to 124,998,750 fps (no camera records within five orders of magnitude
+ *  of it); past that rate an ordinary tick is cut to at most kMaxTickFrames, which still lands inside a Loop cut (r3 pass A2 on
+ *  8743841f: 150,000,000 fps, 8 ms -> 6 ms). Below it only a long suspension is cut. The cut is re-checked with
  *  the call site's own expression (MainWindow::playbackHandling: framerate * (double)timeDiff / 1000.0), because the
  *  reciprocal rounds (pass 4 A2: 781250000/821 fps made 1,050,880 ms, one double step over the bound). A positive age
  *  stays at least 1 ms, so the fps meter's `timeDiff != 0` gate is unchanged, except past 1e9 fps, where even 1 ms is
