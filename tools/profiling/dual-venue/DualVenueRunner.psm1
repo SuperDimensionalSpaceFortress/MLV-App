@@ -5203,6 +5203,31 @@ $script:ExportDualIsoAppliedSuccessor = 'successor EXPORT-RENDER-DUALISO-APPLIED
 # r6 (sol r5 B3): the rendered runner's RENDER_VERIFIED fields up to and including dimensions=, in its exact order and one space-delimited token each (BatchRunner.cpp:803:
 # <clip> decoded_frames= decoded_duration= decoded_frame_bytes= dimensions=%5x%6 bytes= container_probe= ...); dimensions= is the token between decoded_frame_bytes= and bytes=
 $script:ExportRenderVerifiedFields = '\A\[BATCH\] RENDER_VERIFIED (?<clip>\S+) decoded_frames=(?<n>[0-9]{1,15}) decoded_duration=\S+ decoded_frame_bytes=\S+ dimensions=(?<d>\S*) bytes=\S+(?: |\r?\z)'
+# r7 (sol r6 B1): container_probe= prints the probe path verbatim (BatchRunner.cpp:810), so the text from its first occurrence on is that value and never a field; every
+# field before it is written ONCE by the rendered runner (decoded_frames= decoded_duration= decoded_frame_bytes= dimensions= bytes=)
+$script:ExportRenderVerifiedProbeField = ' container_probe='
+
+function Get-DvRenderVerifiedRepeatedFields {
+    # r7 (sol r6 B1): the top-level fields of one RENDER_VERIFIED line (each key=value token after the clip, up to the first ' container_probe=' or the line end) that it
+    # names more than once, each as 'key= (v1 / v2 ...)'; empty when each is named once. The reader binds a field at its first position, so a second occurrence (equal or
+    # not) is a line the producer did not write: `dimensions=1920x1440 bytes=9 dimensions=1280x720` read PASS in r6. Keys compare ordinally (the producer's are lower case).
+    param([AllowEmptyString()][string]$Line)
+    $head = ([string]$Line).TrimEnd("`r")
+    $at = $head.IndexOf($script:ExportRenderVerifiedProbeField, [StringComparison]::Ordinal)
+    if ($at -ge 0) { $head = $head.Substring(0, $at) }
+    $values = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[string]]]::new([StringComparer]::Ordinal)
+    $order = [System.Collections.Generic.List[string]]::new()
+    # (tokens 0..2 are '[BATCH]', 'RENDER_VERIFIED' and the clip, which the caller binds to DONE's)
+    foreach ($tok in @($head.Split(' ') | Select-Object -Skip 3)) {
+        $kv = [regex]::Match([string]$tok, '\A(?<k>[A-Za-z_][A-Za-z0-9_]*)=(?<v>.*)\z')
+        if (-not $kv.Success) { continue }
+        $k = $kv.Groups['k'].Value
+        if (-not $values.ContainsKey($k)) { $values[$k] = [System.Collections.Generic.List[string]]::new(); $order.Add($k) }
+        $values[$k].Add($kv.Groups['v'].Value)
+    }
+    # (the caller wraps the call in @(), so none, one and several repeated fields are each an array with a Count)
+    foreach ($k in $order) { if ($values[$k].Count -gt 1) { "$k= ($($values[$k] -join ' / '))" } }
+}
 
 function Get-DvRenderStartDeclaration {
     # The one RENDER_START line of a rendered export's batch log, for the clip DONE names. Returns [pscustomobject]@{ problem; scaled; cutIn; cutOut; frames; index }: problem is a
@@ -5667,7 +5692,11 @@ function Get-DvExportEvidence {
         $m['renderPipeTimed'] = $null; $m['renderPipeTimedCouldNotCheck'] = $whyPipe
         $verified = @([regex]::Matches([string]$BatchLogText, '(?m)^\[BATCH\] RENDER_VERIFIED (?<clip>\S+) decoded_frames=(?<n>[0-9]{1,15})(?=\s|$)'))   # r15 (pass14 A2): the token ends at whitespace or the line end, so 480.5, 480-1 and 480/2 verify nothing (a word boundary also ends it at '.')
         $doneClip = $(if ($done.Count -eq 1) { $done[0].Groups['base'].Value } else { $null })
+        # r7 (sol r6 B1): the one RENDER_VERIFIED line, read once for every field below; a field the producer writes once, named twice before container_probe=, is INVALID
+        $verifiedLine = $(if ($verified.Count -eq 1) { $verified[0].Value + ([string]$BatchLogText).Substring($verified[0].Index + $verified[0].Length).Split("`n")[0] } else { $null })
+        $verifiedRepeats = @(if ($null -ne $verifiedLine) { Get-DvRenderVerifiedRepeatedFields -Line $verifiedLine })
         if ($verified.Count -ne 1) { $problems.Add("EXPORT_OUTPUT_MISMATCH: batch.log carries $($verified.Count) RENDER_VERIFIED line(s); the batch's own verification of the .mov must pass exactly once") }
+        elseif ($verifiedRepeats.Count -gt 0) { $problems.Add("EXPORT_OUTPUT_MISMATCH: RENDER_VERIFIED names $($verifiedRepeats -join ', ') more than once before container_probe=; the rendered runner writes each of those fields once (BatchRunner.cpp), so the line is not its verification of this .mov") }
         elseif ($null -ne $m.framesExported -and [int64]$verified[0].Groups['n'].Value -ne $m.framesExported) { $problems.Add("EXPORT_OUTPUT_MISMATCH: the batch verified $($verified[0].Groups['n'].Value) decoded frame(s) but exported $($m.framesExported)") }
         # r2 (adversary advisory A8 on a6f48506): the verification is of the clip DONE names (BatchRunner.cpp prints both with the one baseName)
         elseif ($null -ne $doneClip -and -not [string]::Equals($verified[0].Groups['clip'].Value, $doneClip, [StringComparison]::Ordinal)) { $problems.Add("EXPORT_OUTPUT_MISMATCH: batch.log verifies clip '$($verified[0].Groups['clip'].Value)' but DONE names '$doneClip', so the batch's own verification is not of this clip's .mov") }
@@ -5867,8 +5896,8 @@ function Get-DvExportEvidence {
                     # r6 (sol r5 B3): dimensions= is a REQUIRED field read at the producer's token position (BatchRunner.cpp:803 writes it fifth after the tag, between
                     # decoded_frame_bytes= and bytes=), never by a substring scan of the whole line: a line without it at that position is not the producer's verification
                     # of this .mov (INVALID), and text after it (container_probe= prints the probe path verbatim, which may hold ' dimensions=') is never the field
+                    # (r7: a field named twice is refused above, at the line's one read; this binds the first and only dimensions=)
                     if ($verified.Count -eq 1) {
-                        $verifiedLine = $verified[0].Value + ([string]$BatchLogText).Substring($verified[0].Index + $verified[0].Length).Split("`n")[0]
                         $verifiedFields = [regex]::Match($verifiedLine, $script:ExportRenderVerifiedFields)
                         if (-not $verifiedFields.Success) {
                             $problems.Add("EXPORT_OUTPUT_MISMATCH: RENDER_VERIFIED carries no dimensions= at the rendered runner's field position (BatchRunner.cpp: <clip> decoded_frames= decoded_duration= decoded_frame_bytes= dimensions=WxH bytes= ...), so the decoded .mov is not bound to RENDER_START output=$($decl.output)")
