@@ -177,8 +177,10 @@ def batch_log(exported: int, skipped: int = 0, elapsed: float = 20.0, verified: 
 
 
 def verified_line(frames: int, dims: str, clip: str = "view-0") -> str:
-    """EXPORT-RENDER-PIPE-TIMING-1 r6 (sol r5 B3 forced companion): a RENDER_VERIFIED line with the producer's fields through dimensions= in its order (BatchRunner.cpp:803)."""
-    return f"[BATCH] RENDER_VERIFIED {clip} decoded_frames={frames} decoded_duration=1.000 decoded_frame_bytes=1 dimensions={dims} bytes=9"
+    """EXPORT-RENDER-PIPE-TIMING-1 r6 (sol r5 B3 forced companion): a RENDER_VERIFIED line with the producer's fields through dimensions= in its order (BatchRunner.cpp:803).
+    (EXPORT-RENDER-PIPE-TIMING-2 r2 forced companion: and the producer's whole trailer, container_probe= .. dar=, which the one line grammar requires.)"""
+    return (f"[BATCH] RENDER_VERIFIED {clip} decoded_frames={frames} decoded_duration=1.000 decoded_frame_bytes=1 dimensions={dims} bytes=9"
+            " container_probe=C:/venue/ffmpeg/bin/ffprobe.exe probe_source=ffprobe-json codec=prores container=mov sar=1:1 dar=4:3")
 
 
 def output_manifest(count: int, kind: str = "dng") -> str:
@@ -2030,7 +2032,9 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
     def test_r5_sol_b3_the_declaration_names_this_exports_mov_and_its_verified_dimensions(self) -> None:
         """sol r4 B3: out=foreign.mov beside a manifest that lists view-0.mov, and RENDER_START output=1920x1440 beside RENDER_VERIFIED dimensions=1920x1080, each read no
         problem. Both are EXPORT_OUTPUT_MISMATCH. Controls: an absolute out= path whose leaf is the manifest's file, and the verified dimensions equal to the declared output."""
-        verified = "[BATCH] RENDER_VERIFIED view-0 decoded_frames=480 decoded_duration=20.000 decoded_frame_bytes=1 dimensions={d} bytes=9 codec=prores container=mov"
+        # (EXPORT-RENDER-PIPE-TIMING-2 r2 forced companion: the producer's whole trailer, container_probe= .. dar=, which the one line grammar requires)
+        verified = ("[BATCH] RENDER_VERIFIED view-0 decoded_frames=480 decoded_duration=20.000 decoded_frame_bytes=1 dimensions={d} bytes=9"
+                    " container_probe=C:/venue/ffmpeg/bin/ffprobe.exe probe_source=ffprobe-json codec=prores container=mov sar=1:1 dar=4:3")
         done = "[BATCH] DONE view-0 exported=480 skipped=0 elapsed=60.0"
         def batch(start: str, dims: str) -> str:
             return "\n".join((start, verified.format(d=dims), done)) + "\n"
@@ -2226,14 +2230,130 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
     def test_r7_sol_b1_sweep_render_start_and_done_already_refuse_a_contradictory_repeat(self) -> None:
         """r7 sibling sweep (no fix owed): RENDER_START counts each key once before out= (Get-DvRenderStartDeclaration), and DONE is anchored at both ends, so a repeated
         exported= moves into DONE's clip name, which is then not the clip RENDER_START and RENDER_VERIFIED name. Both read INVALID before and after r7."""
-        ok = f"{self.R7_HEAD} dimensions=1920x1440 bytes=9 container_probe=C:/kit/ffprobe.exe"
+        # (EXPORT-RENDER-PIPE-TIMING-2 r2 forced companion: the ok line carries the producer's whole trailer, so each row fails on the line it names and nothing else)
+        ok = f"{self.R7_HEAD} dimensions=1920x1440 bytes=9 container_probe=C:/kit/ffprobe.exe{self.T2_TRAILER}"
         start2 = self.R7_START.replace(" out=view-0.mov", " output=1280x720 out=view-0.mov")
         done2 = "[BATCH] DONE view-0 exported=30 skipped=0 elapsed=1.0 exported=1 skipped=0 elapsed=1.0"
-        proc, got = evidence_cases([self.r7_case(ok, start=start2), self.r7_case(ok, done=done2)])
+        proc, got = evidence_cases([self.r7_case(ok, start=start2), self.r7_case(ok, done=done2), self.r7_case(ok)])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
-        for g in got:
+        for g in got[:2]:
             self.assertEqual(g["outcome"], "INVALID", g)
-            self.assertTrue(any(p.startswith(("EXPORT_PROFILE_ABSENT", "EXPORT_OUTPUT_MISMATCH")) for p in g["problems"]), g)
+        self.assertTrue(any(p.startswith("EXPORT_PROFILE_ABSENT") and "RENDER_START" in p for p in got[0]["problems"]), got[0])
+        self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and "DONE" in p for p in got[1]["problems"]), got[1])
+        self.assertEqual((got[2]["problems"], got[2]["outcome"]), ([], "PASS"), got[2])
+
+    # --- EXPORT-RENDER-PIPE-TIMING-2 r2: ONE line grammar for RENDER_START / RENDER_VERIFIED / DONE (fable / opus key3 / sol r7 on 18c52966: a field after the
+    # verbatim probe path, or a clip spelled like a key, defeated the marker search). Each row is one complete one-frame emitting ProRes capture under empty criteria.
+    T2_TRAILER = " probe_source=ffprobe-json codec=prores container=mov sar=1:1 dar=4:3"
+
+    @staticmethod
+    def t2_start(c: str = "view-0") -> str:
+        return (f"[BATCH] RENDER_START {c} codec=prores container=mov source=1920x1080 output=1920x1440 scaled=true fps=24 frames=1 cutIn=1 cutOut=1 "
+                "out=view-0.mov")
+
+    @staticmethod
+    def t2_head(c: str = "view-0") -> str:
+        return f"[BATCH] RENDER_VERIFIED {c} decoded_frames=1 decoded_duration=0.042 decoded_frame_bytes=1"
+
+    @classmethod
+    def t2_verified(cls, c: str = "view-0", probe: str = "C:/kit/ffprobe.exe") -> str:
+        return f"{cls.t2_head(c)} dimensions=1920x1440 bytes=9 container_probe={probe}{cls.T2_TRAILER}"
+
+    @staticmethod
+    def t2_done(c: str = "view-0") -> str:
+        return f"[BATCH] DONE {c} exported=1 skipped=0 elapsed=1.0"
+
+    @classmethod
+    def t2_rows(cls) -> list:
+        """(label, start, verified lines, done, joiner, expect) where expect is 'PASS' or (code, kind, key or None)."""
+        S, H, V, D, TR = cls.t2_start, cls.t2_head, cls.t2_verified, cls.t2_done, cls.T2_TRAILER
+        V0, S0, D0 = V(), S(), D()
+        RV, RS, DN = "RENDER_VERIFIED", "RENDER_START", "DONE"
+        OM, PA, BU = "EXPORT_OUTPUT_MISMATCH", "EXPORT_PROFILE_ABSENT", "EXPORT_BATCH_LOG_UNREADABLE"
+        cp = "container_probe=x"
+        k1 = f"{H(cp)} dimensions=1920x1440 bytes=9 dimensions=1280x720 container_probe=C:/kit/ffprobe.exe"
+        k4 = f"{cls.R7_HEAD} dimensions=1920x1440 bytes=9 dimensions=1280x720 container_probe=C:/kit/ffprobe.exe"
+        def row(label, expect, v=None, c="view-0", s=None, d=None, extra=(), joiner="\n"):
+            return (label, S(c) if s is None else s, [V(c) if v is None else v, *extra], D(c) if d is None else d, joiner, expect)
+        return [
+            row("K1", (OM, RV, "dimensions="), v=k1, c=cp),
+            row("K1t", (OM, RV, "dimensions="), v=k1 + TR, c=cp),
+            row("K2", (OM, RV, "dimensions="), v=V0 + " dimensions=1280x720"),
+            row("K3a", (OM, RV, "decoded_frames="), v=V0 + " decoded_frames=30"),
+            row("K3b", (OM, RV, "codec="), v=V0 + " codec=h264"),
+            row("K4", (OM, RV, "dimensions="), v=k4),
+            row("K4t", (OM, RV, "dimensions="), v=k4 + TR),
+            row("BY-L", (OM, RV, "bytes="), v=f"{H()} dimensions=1920x1440 bytes=0 bytes=9 container_probe=C:/kit/ffprobe.exe{TR}"),
+            row("BY-T", (OM, RV, "bytes="), v=V0 + " bytes=0"),
+            row("BY-C+", "PASS", c="bytes=0"),
+            row("BY-C-", (OM, RV, "bytes="), v=V("bytes=0") + " bytes=0", c="bytes=0"),
+            row("DF-L", (OM, RV, "decoded_frames="),
+                v=f"[BATCH] RENDER_VERIFIED view-0 decoded_frames=1 decoded_frames=1 decoded_duration=0.042 decoded_frame_bytes=1 dimensions=1920x1440 bytes=9 "
+                  f"container_probe=C:/kit/ffprobe.exe{TR}"),
+            row("DF-C+", "PASS", c="decoded_frames=1"),
+            row("DF-C-", (OM, RV, "decoded_frames="), v=V("decoded_frames=1") + " decoded_frames=30", c="decoded_frames=1"),
+            row("CO-LV", (OM, RV, "codec="), v=V0.replace(" codec=prores ", " codec=h264 codec=prores ")),
+            row("CO-LS", (PA, RS, "codec="), s=S0.replace("codec=prores container=mov", "codec=prores codec=h264 container=mov")),
+            row("CO-C+", "PASS", c="codec=h264"),
+            row("CO-C-", (OM, RV, "codec="), v=V("codec=h264") + " codec=h264", c="codec=h264"),
+            row("DI-L", (OM, RV, "dimensions="), v=f"{H()} dimensions=1280x720 dimensions=1920x1440 bytes=9 container_probe=C:/kit/ffprobe.exe{TR}"),
+            row("DI-C+", "PASS", c="dimensions=1280x720"),
+            row("DI-C-", (OM, RV, "dimensions="), v=V("dimensions=1280x720") + " dimensions=1280x720", c="dimensions=1280x720"),
+            row("CT-LV", (OM, RV, "container="), v=V0.replace(" container=mov sar=", " container=mp4 container=mov sar=")),
+            row("CT-LS", (PA, RS, "container="), s=S0.replace("container=mov source=", "container=mov container=mp4 source=")),
+            row("CT-T", (OM, RV, "container="), v=V0 + " container=mp4"),
+            row("CT-C+", "PASS", c="container=mp4"),
+            row("CT-C-", (OM, RV, "container="), v=V("container=mp4") + " container=mp4", c="container=mp4"),
+            row("CP-T", (OM, RV, "container_probe="), v=V0 + " container_probe=D:/x/ffprobe.exe"),
+            row("CP-C+", "PASS", c=cp),
+            row("F1", (OM, RV, None), v=f"{H()} dimensions=1920x1440 bytes=9 x\tdimensions=1280x720 container_probe=C:/kit/ffprobe.exe{TR}"),
+            row("F2", (OM, RV, "container_probe="), v=f"{H()} dimensions=1920x1440 bytes=9 DIMENSIONS=1280x720 container_probe=C:/kit/ffprobe.exe{TR}"),
+            row("F3", (OM, RV, "bytes="), v=f"{H()} dimensions=1920x1440 bytes=9;dimensions=1280x720 container_probe=C:/kit/ffprobe.exe{TR}"),
+            row("F4", (OM, RV, "container_probe="), v=f"{H()} dimensions=1920x1440 bytes=9 extra=1 container_probe=C:/kit/ffprobe.exe{TR}"),
+            row("F5", (OM, RV, None), extra=("[BATCH] RENDER_VERIFIED garbage",)),
+            row("F6", (OM, RV, None), v=V0.replace(" probe_source=", "\u2028probe_source=")),
+            row("F7", "PASS", c="my clip"),
+            row("F8", "PASS", joiner="\r\n"),
+            row("F9", "PASS", v=V(probe="C:/kit dimensions=1280x720 decoded_frames=30 bytes=0/ffprobe.exe")),
+            row("F10", "PASS", v=V(probe="C:/a probe_source=none codec=h264 container=mp4 sar=2:1 dar=1:1")),
+            row("F11", (OM, RS, "out="), s=S0 + " codec=h264"),
+            row("F12", (BU, DN, "exported="), d=D0 + " exported=1"),
+            row("F13", (OM, RV, "exported="), d="[BATCH] DONE view-0 exported=30 skipped=0 elapsed=1.0 exported=1 skipped=0 elapsed=1.0"),
+            row("F14", (PA, RS, "out="), s=S0.replace(" out=", " output=1280x720 out=")),
+        ]
+
+    @staticmethod
+    def t2_case(start: str, verified: list, done: str, joiner: str = "\n") -> dict:
+        batch = joiner.join([start, *verified, done]) + joiner
+        return prores_case(maxFrames=1, dualIsoExpected=True, stage=piped_stage_log(1, scale_ms=6.0), batch=batch, criteria=[])
+
+    def test_t2_r2_one_line_grammar_binds_every_field_at_its_position(self) -> None:
+        """EXPORT-RENDER-PIPE-TIMING-2 r2: the reader takes RENDER_START, RENDER_VERIFIED and DONE apart by ONE positional grammar (BatchRunner.cpp:471, :803, :821),
+        so a field named again after its position (after the verbatim probe path too), an unknown or case-changed key, a tab-joined or ;-joined token, a control or
+        line-separator character, or a second line of the kind is INVALID with the kind's code, and a clip spelled like a key (a legal completeBaseName) or holding a
+        space, CRLF framing and field-like text inside the probe path are clean."""
+        rows = self.t2_rows()
+        proc, got = evidence_cases([self.t2_case(s, v, d, j) for _, s, v, d, j, _ in rows])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for (label, _, _, _, _, expect), g in zip(rows, got):
+            with self.subTest(row=label):
+                if expect == "PASS":
+                    self.assertEqual(g["problems"], [], g)
+                    self.assertIs(g["metrics"]["renderPipeTimed"], True, g)
+                    self.assertEqual(g["outcome"], "PASS", g)
+                else:
+                    code, kind, key = expect
+                    self.assertEqual(g["outcome"], "INVALID", g)
+                    self.assertTrue(any(p.startswith(code) and kind in p and (key is None or key in p) for p in g["problems"]), g)
+
+    def test_t2_r2_a_grammar_message_names_the_kind_the_expected_key_and_the_token_found(self) -> None:
+        """The grammar's message is the design's: kind, field number, expected key and the token found; and a verification that fails the grammar adds no second
+        (dimensions binding) problem."""
+        k4 = f"{self.R7_HEAD} dimensions=1920x1440 bytes=9 dimensions=1280x720 container_probe=C:/kit/ffprobe.exe{self.T2_TRAILER}"
+        proc, got = evidence_cases([self.t2_case(self.t2_start(), [k4], self.t2_done())])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["problems"], ["EXPORT_OUTPUT_MISMATCH: RENDER_VERIFIED is not in the rendered runner's form (BatchRunner.cpp:803): at field 6 it expects "
+                                              "container_probe= and finds 'dimensions=1280x720'"], got[0])
 
 
 EXPORT_STUB_GENERATOR = r"""
