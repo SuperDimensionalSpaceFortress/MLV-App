@@ -155,8 +155,10 @@ class DrainedPopen:
                 # https://bugs.python.org/issue25942: the SIGINT also reached the child; do not block on it (Popen.wait / communicate zero the allowance once they used it)
                 wait_secs = getattr(self._proc, "_sigint_wait_secs", SIGINT_WAIT_SEC)
                 if wait_secs > 0:
+                    # VENUE-FIXTURE-DRAINEDPOPEN-STDLIB-PARITY-1 r1 (sol r11 B2): the LOW-LEVEL wait, once, as Popen.__exit__ makes it. The public wait() answers an interrupt
+                    # with a second low-level wait before it re-raises, so a second Ctrl+C at the first one was retried instead of reaching the caller at once.
                     try:
-                        self._proc.wait(timeout=wait_secs)
+                        self._proc._wait(timeout=wait_secs)
                     except subprocess.TimeoutExpired:
                         pass
                 self._proc._sigint_wait_secs = 0   # type: ignore[attr-defined]  # noted as done, as Popen.__exit__ notes it
@@ -209,18 +211,24 @@ def run_tree_bounded(*popenargs, input: object = None, capture_output: bool = Fa
     """subprocess.run with the same arguments and result, whose `timeout` IS a bound on Windows (see the module doc): on expiry the whole tree is killed and
     subprocess.TimeoutExpired is raised within about timeout + 2 x TREE_KILL_BOUND_SEC + TREE_COLLECT_BOUND_SEC. With no timeout, or off Windows (POSIX run() reads
     the pipes itself and only waits for the killed root), it IS subprocess.run."""
-    argv, flags, rest = popen_arguments(*popenargs, **kwargs)   # r11 (sol r10 B2): the caller's creationflags, positional or keyword, composed once
-    if timeout is None or os.name != "nt":
-        return subprocess.run(argv, input=input, capture_output=capture_output, timeout=timeout, check=check, creationflags=no_window_flags(flags), **rest)
+    # VENUE-FIXTURE-DRAINEDPOPEN-STDLIB-PARITY-1 r1 (sol r11 B1): subprocess.run's own argument checks, on the arguments AS THE CALLER GAVE THEM (run() looks in its **kwargs, where a
+    # positional stdin / stdout / stderr is not): an explicit keyword stdin / stdout / stderr beside input / capture_output is a ValueError, and a positional one is a duplicate
+    # value for Popen, a TypeError -- popen_arguments binds the same names Popen does, so it raises that TypeError here. Both come BEFORE any child starts. (r11 checked the BOUND
+    # values, which made a positional None read as "not given" and the call launch.)
+    wanted = dict(kwargs)
     if input is not None:
-        if rest.get("stdin") is not None:
+        if wanted.get("stdin") is not None:
             raise ValueError("stdin and input arguments may not both be used.")
-        rest["stdin"] = subprocess.PIPE
+        wanted["stdin"] = subprocess.PIPE
     if capture_output:
-        if rest.get("stdout") is not None or rest.get("stderr") is not None:
+        if wanted.get("stdout") is not None or wanted.get("stderr") is not None:
             raise ValueError("stdout and stderr arguments may not be used with capture_output.")
-        rest["stdout"] = subprocess.PIPE
-        rest["stderr"] = subprocess.PIPE
+        wanted["stdout"] = subprocess.PIPE
+        wanted["stderr"] = subprocess.PIPE
+    argv, flags, rest = popen_arguments(*popenargs, **wanted)   # r11 (sol r10 B2): the caller's creationflags, positional or keyword, composed once
+    if timeout is None or os.name != "nt":
+        _, _, given = popen_arguments(*popenargs, **kwargs)   # subprocess.run applies input / capture_output itself, to the caller's own arguments
+        return subprocess.run(argv, input=input, capture_output=capture_output, timeout=timeout, check=check, creationflags=no_window_flags(flags), **given)
     proc = subprocess.Popen(argv, creationflags=no_window_flags(flags), **rest)
     try:
         out, err = communicate_tree_bounded(proc, timeout, input)

@@ -10973,6 +10973,102 @@ class TreeBoundedRunTests(unittest.TestCase):
                     with self.assertRaises(TypeError):
                         call(wrapper)
 
+    # VENUE-FIXTURE-DRAINEDPOPEN-STDLIB-PARITY-1 r1 (sol r11 B1 + B2 on 892138fc, both in r11's own edit of venue_fixture_modules.py). The class: r11 re-bound the caller's
+    # arguments and then checked the BOUND values, so a positional stream argument read as "not given" and a second interrupt was retried by the public wait().
+    def _parity_started_children(self) -> tuple:
+        real = subprocess.Popen
+        started: list = []
+
+        def recorder(*args, **kwargs):
+            proc = real(*args, **kwargs)   # an argument error (TypeError) is raised here, before any child exists
+            started.append(proc)
+            return proc
+
+        return started, recorder
+
+    def test_parity_b1_duplicate_stream_bindings_raise_the_stdlibs_error_before_any_child_starts(self) -> None:
+        pipe = subprocess.PIPE
+        argv = [sys.executable, "-c", "pass"]
+        cases = (("input with stdin=PIPE", (argv,), {"stdin": pipe, "input": b"x"}, ValueError),
+                 ("capture_output with stdout=PIPE", (argv,), {"stdout": pipe, "capture_output": True}, ValueError),
+                 ("capture_output with stderr=PIPE", (argv,), {"stderr": pipe, "capture_output": True}, ValueError),
+                 ("input with a positional stdin=None (sol's literal call)", (argv, -1, None, None), {"input": b"x"}, TypeError),
+                 ("capture_output with a positional stdout=None (sol's literal call)", (argv, -1, None, None, None), {"capture_output": True}, TypeError),
+                 ("capture_output with a positional stderr=None", (argv, -1, None, None, None, None), {"capture_output": True}, TypeError))
+        for label, args, kwargs, expected in cases:
+            started, recorder = self._parity_started_children()
+            with mock.patch.object(subprocess, "Popen", recorder):
+                with self.assertRaises(expected, msg=f"subprocess.run: {label}"):
+                    subprocess.run(*args, **kwargs)   # the reference: what CPython raises for this call
+            self.assertEqual(started, [], f"{label}: the reference started a child (the scenario is wrong)")
+            for timeout in (None, 5):
+                with self.subTest(case=label, timeout=timeout):
+                    started, recorder = self._parity_started_children()
+                    with mock.patch.object(subprocess, "Popen", recorder):
+                        with self.assertRaises(expected) as caught:
+                            run_tree_bounded(*args, timeout=timeout, **kwargs)
+                    self.assertIs(type(caught.exception), expected)
+                    for child in started:
+                        child.kill()
+                        child.wait(timeout=60)
+                    self.assertEqual(started, [], f"{label}: a child was started before the argument error")
+
+    def test_parity_b1_a_drained_popen_refuses_a_duplicate_stream_binding_before_any_child_starts(self) -> None:
+        # DrainedPopen has no input= / capture_output=; what applies is Popen's own duplicate-value and unknown-keyword TypeErrors
+        argv = [sys.executable, "-c", "pass"]
+        for label, args, kwargs in (("positional stdin and stdin=", (argv, -1, None, None), {"stdin": subprocess.PIPE}),
+                                    ("positional stdout and stdout=", (argv, -1, None, None, None), {"stdout": subprocess.PIPE}),
+                                    ("input= is not a Popen argument", (argv,), {"input": b"x"})):
+            with self.subTest(case=label):
+                started, recorder = self._parity_started_children()
+                with mock.patch.object(subprocess, "Popen", recorder):
+                    with self.assertRaises(TypeError):
+                        DrainedPopen(*args, **kwargs)
+                for child in started:
+                    child.kill()
+                    child.wait(timeout=60)
+                self.assertEqual(started, [], f"{label}: a child was started before the argument error")
+
+    def test_parity_b1_a_none_stream_by_keyword_still_lets_input_and_capture_output_through(self) -> None:
+        # CPython reads stdin=None / stdout=None BY KEYWORD as "not given": the same calls launch and answer
+        argv = [sys.executable, "-c", "import sys; sys.stdout.write('out:' + sys.stdin.read())"]
+        for timeout in (None, 5):
+            with self.subTest(timeout=timeout):
+                got = run_tree_bounded(argv, stdin=None, input="abc", capture_output=True, text=True, timeout=timeout)
+                want = subprocess.run(argv, stdin=None, input="abc", capture_output=True, text=True, timeout=60)
+                self.assertEqual((got.returncode, got.stdout), (want.returncode, want.stdout))
+                self.assertEqual(got.stdout, "out:abc")
+                got = run_tree_bounded(argv, input="abc", stdout=None, stderr=None, capture_output=True, text=True, timeout=timeout)
+                self.assertEqual(got.stdout, "out:abc")
+
+    def test_parity_b2_a_second_keyboard_interrupt_in_the_context_exit_propagates_after_one_low_level_wait(self) -> None:
+        # CPython Popen.__exit__ calls the LOW-LEVEL _wait(timeout=_sigint_wait_secs) once on the interrupt path and lets the interrupt go; the public wait() answers an
+        # interrupt with a second _wait, so a second interrupt at the first _wait must reach the caller after ONE call. The reference is a plain Popen.
+        def scenario(proc, held) -> tuple:
+            waits: list = []
+
+            def second_interrupt(*args, **kwargs):
+                waits.append((args, kwargs))
+                raise KeyboardInterrupt("second")
+
+            held._wait = second_interrupt   # type: ignore[method-assign]
+            try:
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    with proc:
+                        raise KeyboardInterrupt("first")
+            finally:
+                del held._wait
+            return caught.exception.args, len(waits)
+
+        plain = subprocess.Popen(self._R11_SLEEPER, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(plain.wait)
+        self.addCleanup(plain.kill)
+        self.assertEqual(scenario(plain, plain), (("second",), 1), "the reference Popen did not behave as expected (the scenario is wrong)")
+        drained = DrainedPopen(self._R11_SLEEPER, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(drained.wait)
+        self.addCleanup(drained.kill)
+        self.assertEqual(scenario(drained, drained._proc), (("second",), 1), "DrainedPopen retried the child wait after the second interrupt")
+
 
 if __name__ == "__main__":
     unittest.main()
