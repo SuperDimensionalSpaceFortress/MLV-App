@@ -1809,7 +1809,7 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
 
     def test_adversary_r2f1_a6_a_clip_name_that_only_looks_like_dones_is_another_clip(self) -> None:
         """pass 4 A6: view-0 followed by U+200B in RENDER_START or RENDER_VERIFIED compared equal to DONE's view-0 under the culture-aware -cne. Names compare ordinally."""
-        zw = "view-0​"
+        zw = "view-0\u200b"
         cases = [self.ctl(batch=self.ctl_batch(self.CTL_START.replace("RENDER_START view-0", f"RENDER_START {zw}"))), self.ctl(batch=self.ctl_batch(verified_clip=zw))]
         proc, got = evidence_cases(cases)
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
@@ -2358,7 +2358,7 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
     def test_t2_r3_each_unicode_line_separator_in_a_batch_line_is_refused(self) -> None:
         """EXPORT-RENDER-PIPE-TIMING-2 r3 (CI red on 61c6d229: the forbidden-character class carried U+2028 and U+2029 as literal characters, so the module was not
         ASCII): U+2028, U+2029 and U+0085, each written here as an escape, inside a RENDER_VERIFIED line are refused as on 61c6d229 (the escape change must not weaken it)."""
-        chars = {"U+2028": " ", "U+2029": " ", "U+0085": "\u0085"}
+        chars = {"U+2028": "\u2028", "U+2029": "\u2029", "U+0085": "\u0085"}
         v0 = self.t2_verified()
         proc, got = evidence_cases([self.t2_case(self.t2_start(), [v0.replace(" probe_source=", f"{ch}probe_source=")], self.t2_done()) for ch in chars.values()])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
