@@ -2790,6 +2790,8 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
             sent = SendNotifyMessageW( window, kR3A3ForeignMessage, 0, 0 ) != 0;
         } );
         const ThreadJoinGuard senderGuard { sender };
+        const quint64 wokenOtherBefore = wake.runnerSleepsWokenOther();   // r5 class sweep (pass 11 A1): the product's own count, as a delta
+        const quint64 wokenBySentBefore = wake.runnerSleepsWokenBySent();
         QElapsedTimer t;
         t.start();
         slept = wake.sleepForSmokeRunner( 150, &dueWakeQpcNowS );
@@ -2798,6 +2800,28 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
         sender.join();
         ASSERT_TRUE( dueWakeObserveSleep( wake, 150.0 ).met );        // SEAM-1 adversary pass A3: every sample, before the retry filter
         ASSERT_TRUE( static_cast<double>( sleptMs ) >= dueWakeSleepFloorMs( 150.0 ) );   // pass 2 A1: this thread's own one-sided bracket too
+        // CI-FLAKE-R17A1-FOREIGN-FIRST-FLOOR-1 r5 class sweep (adversary pass 11 A1): a sample whose handler ran, or whose product
+        // count or span record shows a dispatch, has its dispatch record accounted BEFORE any retry gate below may discard it (the
+        // ExpiredAfterDispatch and short-rest gates retried a handler-ran sample with spans []): the spans are exactly the product's
+        // count, and the handler's own two reads lie inside one recorded span (an unrelated span cannot stand in for its dispatch)
+        {
+            const std::vector<std::pair<double, double>> recordSpans = wake.lastRunnerSleepDispatchSpansS();
+            const size_t counted = static_cast<size_t>( ( wake.runnerSleepsWokenOther() - wokenOtherBefore )
+                                                        + ( wake.runnerSleepsWokenBySent() - wokenBySentBefore ) );
+            if( foreign.calls != 0 || counted != 0 || !recordSpans.empty() )
+            {
+                ASSERT_EQ( counted, recordSpans.size() );
+                if( foreign.calls != 0 )
+                {
+                    constexpr double kRoundTripMs = 0.00005;              // assertChargedBeforeHandler's tolerance
+                    bool inOneSpan = false;
+                    for( const auto &span : recordSpans )
+                        if( span.first * 1000.0 <= foreign.handlerStartMs + kRoundTripMs && foreign.handlerEndMs <= span.second * 1000.0 + kRoundTripMs )
+                            inOneSpan = true;
+                    ASSERT_TRUE( inOneSpan );
+                }
+            }
+        }
         // CI-FLAKE-R17A1-FOREIGN-FIRST-FLOOR-1 r5 (pass 9 A1 sibling): retried only when NEITHER the handler NOR the product's span
         // record shows a dispatch in the sleep: a recorded dispatch whose handler never counted fails foreign.calls below instead
         if( foreign.calls == 0 && wake.lastRunnerSleepDispatchSpansS().empty() )
@@ -3628,6 +3652,10 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         sentOk = sent.load();
         spans = wake.lastRunnerSleepDispatchSpansS();
         stamps = g_r17A1Stamps;
+        // r5 class sweep (adversary pass 11 A4): EVERY sample's length is judged on the caller clock before any retry gate, not only
+        // the landed one's: with the seam off the exit record is None / -1 and judges nothing, so a short sleep retried away hid
+        if( stamps.size() >= 2 ) ASSERT_TRUE( ( stamps.back() - stamps.front() ) * 1000.0 >= dueWakeSleepFloorMs( 80.0 ) );
+        else ASSERT_TRUE( returnedMs - enteredMs >= dueWakeSleepFloorMs( 80.0 ) );   // no caller-clock reads: the test's own bracket
         // r5 RED seam (sol r4 B1's literal rows, replayable on the exact head with no rebuild): MLV_R17A1_RED_DROP_RECORD=held drops
         // the one-span row's span record on its first held one-span attempt (stamps [entry, begin, end, return], spans []), =stray
         // drops the stray row's own stray span (all six stamps kept). It only ever REMOVES a record, so set it can only fail the
