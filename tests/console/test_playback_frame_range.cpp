@@ -4986,3 +4986,19 @@ TEST( PlayPaceBudgetKnifeEdge, TheBudgetIsSizedFromTheAdmittedFramesAtTheStatedF
     ASSERT_EQ( playSafetyMs( 20.0, PlayPaceMode::Gated, v.requiredFrames ), std::llround( v.wallBudgetSeconds * 1000.0 ) );
     ASSERT_EQ( 94867, std::llround( v.wallBudgetSeconds * 1000.0 ) );
 }
+
+TEST( PlayPaceBudgetKnifeEdge, A3TheCpuInformationalCeilingIsNeverWidenedByTheFrameTerm )
+{
+    // adversary r1 A3 (ecfaadfb), its input: a 600 fps clip, 10 s, -CpuPlayPaceInformational -> 6000 required frames. The CPU ceiling stays
+    // requested / (1/30) + 15 s = 315 s; the frame term belongs to the Gated budget only.
+    ASSERT_EQ( 315000, playSafetyMs( 10.0, PlayPaceMode::MeasuredInformational, 6000 ) );   // RED on ecfaadfb: 414934
+    const PlayableWindowVerdict c = evaluatePlayableWindow( 0, 1, 6000, 6000, 600.0, 10.0, playback_frame_range::kFloorFromNativeFps, true,
+                                                            playback_frame_range::kPaceIsNative, PlayPaceMode::MeasuredInformational );
+    ASSERT_EQ( 6000, c.requiredFrames );
+    ASSERT_EQ( 315.0, c.wallBudgetSeconds );                                                  // RED on ecfaadfb: 414.934
+    // the observation of the finding: 5700 frames at 315000 ms while playing is the typed ceiling, not Continue
+    ASSERT_TRUE( evaluatePlayStop( 5700, c.requiredFrames, true, 315000, playSafetyMs( 10.0, PlayPaceMode::MeasuredInformational, c.requiredFrames ),
+                                   PlayPaceMode::MeasuredInformational, playback_frame_range::PlayPaceHistory() ) == PlayStopState::SafetyTimeout );
+    // the Gated budget of the same window still carries the frame term
+    ASSERT_EQ( 414934, playSafetyMs( 10.0, PlayPaceMode::Gated, 6000 ) );
+}

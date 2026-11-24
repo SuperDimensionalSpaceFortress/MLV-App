@@ -143,9 +143,9 @@ class M161457Generator(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls._tmp.cleanup()
 
-    def generate(self, script: Path, out_name: str) -> tuple[int, str, dict | None, str]:
+    def generate(self, script: Path, out_name: str, clip_id: str = "M16-1457", extra: str = "") -> tuple[int, str, dict | None, str]:
         out = self.tmp / out_name
-        command = (f"$r = @(& '{script}' -SourceCommit '{self.head}' -BuildManifestSha256 '{'ab' * 32}' -ClipId 'M16-1457' -Backend cuda "
+        command = (f"$r = @(& '{script}' -SourceCommit '{self.head}' -BuildManifestSha256 '{'ab' * 32}' -ClipId '{clip_id}' -Backend cuda {extra} "
                    f"-RepoRoot '{self.repo}' -OutFile '{out}' | Where-Object {{ $_.PSObject.Properties['recommendedJobTimeoutSec'] }}); "
                    "$r | Select-Object recommendedJobTimeoutSec, smokeProcessTimeoutMs | ConvertTo-Json -Compress")
         proc = run_pwsh(["-Command", command])
@@ -178,6 +178,23 @@ class M161457Generator(unittest.TestCase):
         self.assertIn(f"smokeCeilingClamped=True appReadAllowanceSec={SMOKE_CEILING_SEC - generator_fixed_smoke_sec}", first_trace)
         self.assertIn("clip=$ClipId", first_trace)
         self.assertIn("CPU-LEG-SMOKE-CEILING-1: this leg's smoke timeout is held", message)
+
+    def test_a1_the_native_fps_bound_never_refuses_a_gated_leg_whose_floor_allowance_fits(self) -> None:
+        # adversary r1 A1 (ecfaadfb), its input: -ClipId M16-1243 -Backend cuda -PlaySeconds 25 -ColdReadMBps 0.95. The no-margin re-read is
+        # ceil(3238.2 / 0.95) = 3409 s; the 60 fps bound's allowance (115 s) leaves 3392 s and threw, the 40 s floor leaves 3467 s. The bound only ever
+        # widens a budget: when it alone would refuse, the leg keeps the floor allowance (a faster clip then ends as a typed runner timeout).
+        size = clip_bytes("M16-1243")
+        self.assertEqual(math.ceil(size / 1048576.0 / 0.95), 3409)
+        code, message, budget, job = self.generate(GENERATOR, "a1.job.ps1", "M16-1243", "-PlaySeconds 25 -ColdReadMBps 0.95")
+        self.assertEqual(code, 0, message)                                    # RED on ecfaadfb: ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING
+        self.assertEqual(budget["smokeProcessTimeoutMs"], 3600000)
+        first_trace = next(line for line in lf(job).splitlines() if line.startswith("Write-JobTrace \"job start "))
+        self.assertIn(f"smokeCeilingClamped=True appReadAllowanceSec={SMOKE_CEILING_SEC - (60 + 40 + 3 + 30)}", first_trace)
+        self.assertIn("PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: the 60 fps bound", message)
+        # a leg that cannot fit even the floor allowance is still refused with the same typed token
+        code, message, budget, job = self.generate(GENERATOR, "a1-slow.job.ps1", "M16-1243", "-PlaySeconds 25 -ColdReadMBps 0.9")
+        self.assertNotEqual(code, 0)
+        self.assertIn(TOKEN, message)
 
     def test_mutation_the_master_generator_with_the_request_confined_to_the_cpu_block_refuses_the_leg(self) -> None:
         text = lf(GENERATOR.read_text(encoding="utf-8"))

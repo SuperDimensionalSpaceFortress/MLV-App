@@ -1009,11 +1009,37 @@ class OffscreenProbeAndParityTests(unittest.TestCase):
                 proc = _pwsh(f". {_q(GATE)}; Get-GuiSmokePlaySafetyMs -Seconds {seconds} -NativeFps {fps}")
                 self.assertEqual(proc.stdout.strip(), str(expected), proc.stdout + proc.stderr)
 
+    @requires_pwsh
+    def test_the_frame_term_counts_the_frames_the_app_admits_and_only_in_gated_mode(self) -> None:
+        # adversary r1 on ecfaadfb. A2: -Seconds 880 -TargetPresentedFrames 600 on a 60 fps clip -- the app requests min(880, 600 / 60) = 10 s
+        # (smokePlayRequestSeconds) and admits ceil(max(10 s HFR floor, 10) x 60) = 600 frames, so the frame term is 54 934 ms and the budget
+        # stays 880 / 0.5 + 15 s = 1 775 000 ms (it was 3 626 934, over the runner's 3 600 000 ceiling). A3: the CPU-informational ceiling is
+        # requested / (1/30) + 15 s whatever the frames (600 fps x 10 s: 315 000, not 414 934).
+        table = (("-Seconds 880 -NativeFps 60 -TargetPresentedFrames 600", 1775000),
+                 ("-Seconds 600000 -NativeFps 59.94 -TargetPresentedFrames 600", 1200015000),
+                 ("-Seconds 20 -NativeFps 59.94 -TargetPresentedFrames 2400", 94867),
+                 ("-Seconds 20 -NativeFps 59.94 -TargetPresentedFrames 0", 94867),
+                 ("-Seconds 10 -NativeFps 600 -CpuPaceInformational", 315000),
+                 ("-Seconds 25 -NativeFps 59.94 -CpuPaceInformational", 765000),
+                 ("-Seconds 10 -NativeFps 600", 414934))
+        for args, expected in table:
+            with self.subTest(args=args):
+                proc = _pwsh(f". {_q(GATE)}; Get-GuiSmokePlaySafetyMs {args}")
+                self.assertEqual(proc.stdout.strip(), str(expected), proc.stdout + proc.stderr)
+
+    def test_every_launcher_sizes_the_frame_term_from_the_window_the_app_requests(self) -> None:
+        # adversary r1 A2 siblings: the launcher that ends Play early on presented frames passes that target too.
+        runner = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("-NativeFps $clipNativeFpsForBudget -TargetPresentedFrames $TargetPresentedFrames -CpuPaceInformational:$CpuPlayPaceInformational) +", runner)
+        capture = (ROOT / "tools" / "profiling" / "capture-reference-frame.ps1").read_text(encoding="utf-8")
+        self.assertIn("(Get-GuiSmokePlaySafetyMs -Seconds $Seconds -NativeFps $clipLengthGate.fps -TargetPresentedFrames $PresentedFrames)", capture)
+        self.assertIn("$proc.WaitForExit($captureWaitMs)", capture)
+
     def test_the_runners_process_budget_starts_from_the_apps_safety_net(self) -> None:
         text = RUNNER.read_text(encoding="utf-8")
         # CPU-LOOK-LEG-PACE-ABORT-1: the same derivation, with the CPU ceiling only under the runner's own -CpuPlayPaceInformational.
         # PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: and from the clip-length gate's native fps, so it covers the app's frame-sized budget.
-        self.assertIn("(Get-GuiSmokePlaySafetyMs -Seconds $Seconds -NativeFps $clipNativeFpsForBudget -CpuPaceInformational:$CpuPlayPaceInformational) +", text)
+        self.assertIn("(Get-GuiSmokePlaySafetyMs -Seconds $Seconds -NativeFps $clipNativeFpsForBudget -TargetPresentedFrames $TargetPresentedFrames -CpuPaceInformational:$CpuPlayPaceInformational) +", text)
         self.assertIn('$clipNativeFpsForBudget = [double](Get-ObjectPropertyValue $clipLengthGate "fps")', text)
         self.assertLess(text.index("$clipLengthGate = Test-GuiSmokeClipLength"), text.index("$clipNativeFpsForBudget = "))
 
