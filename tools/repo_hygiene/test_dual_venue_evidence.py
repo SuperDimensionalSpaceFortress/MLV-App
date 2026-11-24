@@ -7548,6 +7548,38 @@ exit 0
         self.assertIn("Format-BoundedChildEnd $lp $legBoundSec", tail[:1200], "the LEASE_EXPIRED detail tells a late self-exit from a kill")
         self.assertNotIn("killed with its process tree at the lease's end", body)
 
+    W1_LOC_ANCHOR = "    if (-not [VenueLeaseBatchFinalPath]::LocateWithin($full, 0, $ms, [ref]$phys, [ref]$key)) { return $null }\n"
+    W1_SWEEP_ANCHOR = "        $h = $ps.BeginInvoke()\n"
+
+    def test_planned_hash_bind_b2_r1_w1_an_answer_arriving_inside_the_deadline_reserve_is_no_answer(self) -> None:
+        # W1 = A5: each bounded primitive's allowance is sampled before it runs; a pause after sampling let an answer land inside the 2 s reserve before -DeadlineUtc (or past it)
+        # and be acted on. The spec read is given a stale allowance; the location read and the sweep worker are paused after sampling (mutated copy). None may answer.
+        pause = "    if ($env:DVT_W1_PAUSE_MS) { Start-Sleep -Milliseconds ([int]$env:DVT_W1_PAUSE_MS) }   # TEST FIXTURE: descheduled after the allowance was sampled\n"
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.W1_LOC_ANCHOR, pause + self.W1_LOC_ANCHOR), ("Invoke-VenueLeaseBatch.ps1", self.W1_SWEEP_ANCHOR, "    " + pause + self.W1_SWEEP_ANCHOR)])
+        spec = self.tmp / "w1-spec.json"
+        spec.write_text("{}", encoding="utf-8")
+        probe = self.tmp / "w1-probe.ps1"
+        probe.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{dv / 'VenueChain.psm1'}' -Force -DisableNameChecking\n"
+            f"$here = '{dv}'\n"
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{dv / 'Invoke-VenueLeaseBatch.ps1'}', [ref]$null, [ref]$null)\n"
+            "foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {\n"
+            "    if ($f.Name -cin @('Read-SpecBytesWithin', 'Get-InputLocationWithin', 'Get-InputUnresolvedCodeWithin', 'Get-SpecReadBoundSec', 'Test-SpecReadArrivedLate', 'Get-PhysicalPath', 'Get-FileIdentity', 'Test-NothingAtName')) { . ([scriptblock]::Create($f.Extent.Text)) } }\n"
+            "function Get-InputUnresolvedCode([string]$Path, [switch]$SkipRead) { '' }   # TEST FIXTURE: the diagnostic answers at once: nothing to refuse\n"
+            f"$deadline = [DateTime]::UtcNow.AddSeconds(4); $env:DVT_W1_PAUSE_MS = ''\n"
+            f"$r = Read-SpecBytesWithin '{spec}' 3.99 3000   # an allowance sampled when ~6 s were left; the read answers at about 3 s, 1 s before -DeadlineUtc\n"
+            "$deadline = [DateTime]::UtcNow.AddSeconds(6); $env:DVT_W1_PAUSE_MS = '5000'\n"
+            f"$loc = Get-InputLocationWithin '{spec}'\n"
+            "$deadline = [DateTime]::UtcNow.AddSeconds(6)\n"
+            f"$code = Get-InputUnresolvedCodeWithin '{spec}'\n"
+            "\"W1 $($r.state) $($null -eq $r.bytes) $($null -eq $loc) [$code]\"\n"
+            "[Environment]::Exit(0)\n", encoding="utf-8")
+        got = run_pwsh(["-File", str(probe)], timeout=120)
+        line = [l for l in got.stdout.splitlines() if l.startswith("W1 ")]
+        self.assertEqual(line, ["W1 TIMEOUT True True [INPUT_UNREADABLE]"],
+                         "an answer that arrived inside the 2 s reserve before -DeadlineUtc was acted on (old: OK, a location, an empty code)\n" + got.stdout + got.stderr)
+
     def test_planned_hash_bind_b2_r1_v1_the_planner_refuses_a_reader_answer_that_is_not_a_string_ok_and_a_file_key(self) -> None:
         legset = DV / "legsets" / f"{self.SWAP_LEGSET}.json"
         cases = {"array-state": "state = @('OK'); bytes = [IO.File]::ReadAllBytes($p); key = '0000abcd:0000000000000001'", "whitespace-key": "state = 'OK'; bytes = [IO.File]::ReadAllBytes($p); key = ' '",

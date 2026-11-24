@@ -721,6 +721,7 @@ function Get-InputUnresolvedCodeWithin([string]$Path, [switch]$SkipRead) {
             return 'INPUT_UNREADABLE'
         }
         $r = @($ps.EndInvoke($h))
+        if (Test-SpecReadArrivedLate) { return 'INPUT_UNREADABLE' }   # b2 r1 (pass 8 A5): the worker answered, inside the reserve: no answer (disposed normally, not abandoned)
         return $(if ($r.Count) { [string]$r[-1] } else { 'INPUT_UNREADABLE' })
     } catch { return 'INPUT_UNREADABLE' }
     finally { if ($null -ne $ps -and -not $abandoned) { try { $ps.Dispose() } catch { $null = $_ } } }
@@ -1470,6 +1471,13 @@ function Get-SpecReadBoundSec {
     [Math]::Min([double]$cap, ($dl - [DateTime]::UtcNow).TotalSeconds - 2.0)
 }
 
+function Test-SpecReadArrivedLate {
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r1 (adversary pass 8 A5): each bounded read's allowance is sampled before it runs, so a caller descheduled after sampling could take
+    # an answer that arrived inside the refusal's reserve before -DeadlineUtc (Get-SpecReadBoundSec's 2 s), or past it. Judged when the answer ARRIVES: $true means no answer.
+    $dl = Get-Variable -Name deadline -ValueOnly -ErrorAction Ignore
+    ($dl -is [datetime]) -and (($dl - [DateTime]::UtcNow).TotalSeconds -lt 2.0)
+}
+
 function Read-SpecBytesWithin([string]$Path, [double]$BoundSec, [int]$DelayMs = 0) {
     # r19 (sol r18 B2): a leg spec's bytes read on a pool thread and given up on after $BoundSec, so a share that stopped answering cannot hold the caller past -DeadlineUtc (a
     # synchronous ReadAllBytes could, before any remaining-room check ran). state OK (bytes), FAILED (error: the read threw) or TIMEOUT (no answer in the bound, or no bound left).
@@ -1526,6 +1534,7 @@ public static class VenueLeaseBatchBoundedReadR4 {
     $b = $null; $k = $null; $e = $null
     $full = try { [IO.Path]::GetFullPath($Path) } catch { return [pscustomobject]@{ state = 'FAILED'; bytes = $null; key = ''; error = ($_.Exception.Message -replace '\s+', ' ') } }
     $rc = [VenueLeaseBatchBoundedReadR4]::ReadWithin($full, $DelayMs, $ms, [ref]$b, [ref]$k, [ref]$e)
+    if ($rc -ne 2 -and (Test-SpecReadArrivedLate)) { $rc = 2; $b = $null; $k = ''; $e = $null }   # b2 r1 (pass 8 A5): an answer inside the deadline's reserve is no answer
     [pscustomobject]@{ state = @('OK', 'FAILED', 'TIMEOUT')[$rc]; bytes = $b; key = [string]$k; error = $e }
 }
 
@@ -1539,6 +1548,7 @@ function Get-InputLocationWithin([string]$Path) {
     $phys = $null; $key = $null
     $full = try { [IO.Path]::GetFullPath($Path) } catch { return $null }
     if (-not [VenueLeaseBatchFinalPath]::LocateWithin($full, 0, $ms, [ref]$phys, [ref]$key)) { return $null }
+    if (Test-SpecReadArrivedLate) { return $null }   # b2 r1 (pass 8 A5)
     [pscustomobject]@{ phys = $phys; key = $key }
 }
 
