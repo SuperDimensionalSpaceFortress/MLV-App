@@ -329,14 +329,17 @@ inline LabelPaintOwedStore labelPaintOwedStore( bool owedUnpaid, bool framePrese
     return { false, labelPaintOwedExpectedMs( floorMs, now ) };
 }
 
-/*! \brief INFO-2 r9 (adversary pass 13 A4 on a5b5ed51): the expected period the fps meter's reset tests a LABEL stall against
- *  (labelFramesStallEntered). With an unpaid debt it is the debt's own (labelPaintOwedExpectedMs of its floor and the period read
- *  now), so the stall's repaint-now push never pays that debt before the deadline it was stored under: a 1 fps target's relabel
- *  stored at 450 ms (floor 1000, deadline 1500 ms), a 24 fps target from 488 ms, and the reset at draw age 512 ms read the new 42 ms
- *  period, entered a stall and painted 62 ms after the store. Nothing owed: the period read now, as before. */
-inline qint64 labelPaintStallExpectedMs( bool owedUnpaid, qint64 floorMs, qint64 currentMs )
+/*! \brief INFO-2 r9 (adversary pass 13 A4 on a5b5ed51, pass 14 A3 on 2adbdc1f): must the fps meter's reset decline a LABEL stall
+ *  (labelFramesStallEntered) because an unpaid paint debt is not yet due? The stall's repaint-now push pays that debt on both
+ *  surfaces, so a stall entered before the debt's own STORE-relative deadline paid it early: a 1 fps target's relabel stored at
+ *  450 ms (floor 1000, deadline 1950 ms), a 24 fps target from 488 ms and the reset at draw age 512 ms (pass 13 A4); a 3 fps target's
+ *  relabel stored at 450 ms (floor 334, deadline 951 ms) and the reset at draw age 512 ms past the draw-relative 501 ms (pass 14 A3).
+ *  `owedUnpaid` = a debt is armed, `framePresentedSinceStore` = a frame carried it already, `msSinceStore` = its age,
+ *  `owedExpectedMs` = labelPaintOwedExpectedMs of its floor and the period now. True = the debt waits for its deadline (the settle
+ *  pays it there, and a later store in the same stall joins it); a due or carried debt, or none, leaves the stall test as it was. */
+inline bool labelStallWaitsForOwedPaint( bool owedUnpaid, bool framePresentedSinceStore, qint64 msSinceStore, qint64 owedExpectedMs )
 {
-    return owedUnpaid ? labelPaintOwedExpectedMs( floorMs, currentMs ) : currentMs;
+    return owedUnpaid && !framePresentedSinceStore && !labelPaintOwedDue( true, false, msSinceStore, owedExpectedMs );
 }
 
 /*! \brief INFO-2 r9 (sol r8 A4 on 2b195b9e): the one settle step of the shared paint debt. Nothing owed: Keep (nothing to do). A
