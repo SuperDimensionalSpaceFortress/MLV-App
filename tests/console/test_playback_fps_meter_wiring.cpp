@@ -161,9 +161,11 @@ TEST(PlaybackFpsMeterWiring, MonotonicClockAndResetWiringRejectTheirMutations)
         "            }\n"
         "            resetFpsMeterIfIdle( mlvappMonotonicNow() );\n"
         "            //On setup slider priority\n")));
-    // adversary r2 A1 (894b938d): the shaped tick is bounded in frames before playbackHandling reads it, exactly once
+    // adversary r2 A1 (894b938d): the shaped tick is bounded in frames before playbackHandling reads it, exactly once.
+    // r4 (pass 5 A2 on b70f718d): only the Drop Frame request reads the tick as frames, so Normal mode passes no rate and
+    // keeps its whole tick (the fps meter's `timeDiff != 0` gate stays open at any source rate, as on the base).
     const QString boundLine = QStringLiteral(
-        "    timeDiff = playback_fps_meter::frameBoundedTickTimeDiffMs( timeDiff, getPlaybackFramerate() );\n");
+        "    timeDiff = playback_fps_meter::frameBoundedTickTimeDiffMs( timeDiff, ui->actionDropFrameMode->isChecked() ? getPlaybackFramerate() : 0.0 );\n");
     const int boundAt = body.indexOf(boundLine);
     const int handlingAt = body.indexOf(QStringLiteral("    playbackHandling( timeDiff );"));
     ASSERT_TRUE(boundAt > shapedAt);
@@ -187,7 +189,8 @@ bool frameCapIsLive(const QString & body)
         "ui->actionPlay->isChecked(), hadPendingAdvance );\n"
         "    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 (adversary r2 A1): one tick never asks the drop-frame loop for more frames than\n"
         "    // it can count (a long suspension at a high source rate); every ordinary tick is unchanged.\n"
-        "    timeDiff = playback_fps_meter::frameBoundedTickTimeDiffMs( timeDiff, getPlaybackFramerate() );\n"
+        "    // r4 (pass 5 A2): only the Drop Frame request reads the tick as frames, so Normal mode keeps its whole tick (fps meter).\n"
+        "    timeDiff = playback_fps_meter::frameBoundedTickTimeDiffMs( timeDiff, ui->actionDropFrameMode->isChecked() ? getPlaybackFramerate() : 0.0 );\n"
         "\n"
         "    //Playback\n"));
 }
@@ -213,7 +216,7 @@ TEST(PlaybackFpsMeterWiring, CapAndResetPinsRejectADeadCapAndAnUnconditionalRese
     ASSERT_TRUE(fpsResetIsConditional(body));
 
     const QString capLine = QStringLiteral(
-        "    timeDiff = playback_fps_meter::frameBoundedTickTimeDiffMs( timeDiff, getPlaybackFramerate() );\n");
+        "    timeDiff = playback_fps_meter::frameBoundedTickTimeDiffMs( timeDiff, ui->actionDropFrameMode->isChecked() ? getPlaybackFramerate() : 0.0 );\n");
     ASSERT_EQ(1, body.count(capLine));
     QString deadCap = body;
     deadCap.replace(capLine, QStringLiteral("    if( false )\n") + capLine);

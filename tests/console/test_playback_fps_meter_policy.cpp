@@ -182,10 +182,12 @@ TEST(PlaybackFpsMeterPolicy, OneTickNeverAsksForMoreFramesThanTheLoopCanCount)
     using playback_fps_meter::frameBoundedTickTimeDiffMs;
     using playback_fps_meter::kMaxStampAgeMs;
     using playback_fps_meter::kMaxTickFrames;
-    // CHARACTERIZATION of the defect: the unbounded request leaves the cut
+    // r2 CHARACTERIZATION of the defect was: the unbounded request leaves the cut (INT_MAX - 1 laps). r4 (pass 5 A1 on
+    // b70f718d): advanceDropFrameTick bounds its own laps, so even the unbounded request lands inside [0, 1) now
     const playback_frame_range::DropFrameTickResult unbounded =
         playback_frame_range::advanceDropFrameTick(0.0, 25000.0 * kMaxStampAgeMs / 1000.0, 1, 2, true);
-    ASSERT_TRUE(unbounded.position >= 1.0);
+    ASSERT_TRUE(unbounded.position >= 0.0 && unbounded.position < 1.0);
+    ASSERT_TRUE(unbounded.wrapLaps <= 1000000);
     // bounded: the same suspension lands inside the wrap range [wrapAt - width, wrapAt) = [0, 1)
     const int bounded = frameBoundedTickTimeDiffMs(kMaxStampAgeMs, 25000.0);
     ASSERT_EQ(39999, bounded); // r3: 999990 frames at 25000 fps (the 1e9 bound was 40000000 ms)
@@ -313,4 +315,55 @@ TEST(PlaybackFpsMeterPolicy, OneTickAsksForNothingWhenEvenOneMillisecondIsPastTh
     ASSERT_EQ(0, frameBoundedTickTimeDiffMs(kMaxStampAgeMs, 1.0e13));
     ASSERT_EQ(0, frameBoundedTickTimeDiffMs(-kMaxStampAgeMs, 1.0e13));
     ASSERT_TRUE(4294967295.0 * (double)frameBoundedTickTimeDiffMs(kMaxStampAgeMs, 4294967295.0) / 1000.0 <= 1000000.0);
+}
+
+// r4 (pass 5 A2 on b70f718d), CHARACTERIZATION of the exact cutoff the contract states: a positive tick keeps at least
+// 1 ms up to kMaxTickFrames * 1000 = 999,990,000 fps and asks for nothing past it (the contract used to say 1e9).
+TEST(PlaybackFpsMeterPolicy, APositiveTickKeepsOneMillisecondUpToTheStatedCutoffRate)
+{
+    using playback_fps_meter::frameBoundedTickTimeDiffMs;
+    using playback_fps_meter::kMaxTickFrames;
+    ASSERT_TRUE(kMaxTickFrames * 1000.0 == 999990000.0);
+    ASSERT_TRUE(frameBoundedTickTimeDiffMs(8, 999990000.0) == 1);
+    ASSERT_TRUE(frameBoundedTickTimeDiffMs(-8, 999990000.0) == -1);
+    ASSERT_TRUE(frameBoundedTickTimeDiffMs(8, 999990001.0) == 0);
+    ASSERT_TRUE(frameBoundedTickTimeDiffMs(8, 0.0) == 8); // Normal mode passes no rate: its tick is never cut
+}
+
+// r4 (pass 5 A1 on b70f718d): the drop-frame position can be stale and outside the cut (a seek while Drop Frame was on,
+// Drop Frame off, a seek and a new cut, Drop Frame on: the normalizer clamps it to the clip, not the cut). From position
+// 20 on Loop cut 1..2 a 999,990-frame tick made 1,000,010 width-1 laps. advanceDropFrameTick bounds its own laps from
+// any start; an ordinary tick from a stale start keeps the base arithmetic exactly.
+TEST(PlaybackFpsMeterPolicy, OneTickLapsStayWithinTheBoundFromAStaleStartOutsideTheCut)
+{
+    const playback_frame_range::DropFrameTickResult stale =
+        playback_frame_range::advanceDropFrameTick(20.0, 999990.0, 1, 2, true);
+    ASSERT_TRUE(stale.wrapped);
+    ASSERT_TRUE(stale.wrapLaps <= 1000000);
+    ASSERT_TRUE(stale.position >= 0.0 && stale.position < 1.0);
+    // a stale start far past the cut (a long clip) with an ordinary request
+    const playback_frame_range::DropFrameTickResult far =
+        playback_frame_range::advanceDropFrameTick(3000000.0, 0.25, 1, 2, true);
+    ASSERT_TRUE(far.wrapLaps <= 1000000);
+    ASSERT_TRUE(far.position >= 0.0 && far.position < 1.0);
+    // conform (presentLastFrame: wrap past the last frame by the cut's frame count) with the most debt a tick carries
+    const playback_frame_range::DropFrameTickResult conformed = playback_frame_range::advanceDropFrameTick(
+        20.0, 999990.0 + playback_frame_range::kConformMaxDebtFrames, 1, 2, true, true);
+    ASSERT_TRUE(conformed.wrapLaps <= 1000000);
+    ASSERT_TRUE(conformed.position >= 0.0 && conformed.position < 2.0);
+    // an unbounded request (an infinite delta) still lands inside the cut
+    const playback_frame_range::DropFrameTickResult endless =
+        playback_frame_range::advanceDropFrameTick(0.0, HUGE_VAL, 1, 2, true);
+    ASSERT_TRUE(endless.wrapLaps <= 1000000);
+    ASSERT_TRUE(endless.position >= 0.0 && endless.position < 1.0);
+    // an ordinary tick from a stale start is unchanged: 20.1 wraps 20 laps to 0.1
+    const playback_frame_range::DropFrameTickResult ordinary =
+        playback_frame_range::advanceDropFrameTick(20.0, 0.1, 1, 2, true);
+    ASSERT_EQ(20, ordinary.wrapLaps);
+    ASSERT_TRUE(std::fabs(ordinary.position - 0.1) < 1e-9);
+    // ...and so is a tick inside the cut that wraps exactly 1,000,000 laps (the bound itself is admitted)
+    const playback_frame_range::DropFrameTickResult atBound =
+        playback_frame_range::advanceDropFrameTick(0.5, 1000000.0, 1, 2, true);
+    ASSERT_EQ(1000000, atBound.wrapLaps);
+    ASSERT_TRUE(std::fabs(atBound.position - 0.5) < 1e-6);
 }
