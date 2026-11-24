@@ -3246,14 +3246,34 @@ std::atomic<bool> g_r17A1PresentSent { false };
 // while the entry read still said "not queued", and the row admitted a sample whose present was queued before the handler began.
 std::atomic<bool> g_r17A1PresentSending { false };
 bool g_r17A1PauseHeld = false;
+// CI-FLAKE-R17A1-FOREIGN-FIRST-FLOOR-1 r3 (sol r2 B1): sol's literal coalescing schedule, driven by the test's own handler, never
+// by the scheduler: while set, the paused WM_NULL handler holds the GUI until the sender has queued the present (20 ms) AND every
+// probe (30..54 ms) and reached 56 ms, so one PeekMessageW takes the WM_NULL, the present and all five probes: ONE recorded span.
+// That healthy sleep is correctly charged (the old window holds the ~8 ms before the WM_NULL) and must be judged, never discarded.
+bool g_r17A1CoalesceInForeign = false;
+std::atomic<bool> g_r17A1ProbesSent { false };                        // published by the sender at 56 ms, after its last probe's send
+// r3 (sol r2 H1): the hold's completion is read ONCE per pass, and credited only when a cutoff check taken AFTER that read still
+// places it before giveUp (the sender's own admission rule, :entered): a flag published after the 5 s cutoff, before a separate
+// final load, is never credited as held
+bool r17A1HoldUntil( const std::atomic<bool> &flag, ULONGLONG giveUp )
+{
+    for( ;; )
+    {
+        const bool seen = flag.load();
+        const bool beforeCutoff = GetTickCount64() < giveUp;           // read after the flag: true means the flag read came before the cutoff
+        if( seen ) return beforeCutoff;
+        if( !beforeCutoff ) return false;
+        Sleep( 0 );
+    }
+}
 LRESULT CALLBACK r17A1ForeignProc( HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam )
 {
     if( message == WM_NULL && g_r17A1PauseInForeign )
     {
         const bool sendingAtEntry = g_r17A1PresentSending.load();     // false: the present's send had not begun when this dispatch did
         const ULONGLONG giveUp = GetTickCount64() + 5000;
-        while( !g_r17A1PresentSent.load() && GetTickCount64() < giveUp ) Sleep( 0 );
-        g_r17A1PauseHeld = !sendingAtEntry && g_r17A1PresentSent.load();
+        // the sender publishes g_r17A1ProbesSent only after g_r17A1PresentSent (seq_cst), so holding for the probes also held the present
+        g_r17A1PauseHeld = !sendingAtEntry && r17A1HoldUntil( g_r17A1CoalesceInForeign ? g_r17A1ProbesSent : g_r17A1PresentSent, giveUp );
         return 0;
     }
     if( message == kR17A1ProbeMessage )
@@ -3344,7 +3364,10 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     // CI-FLAKE-R17A1-FOREIGN-FIRST-FLOOR-1 (sol r10 B1, fable r10 B1): and with the GUI PAUSED inside that WM_NULL dispatch
     // (`pausedInForeign`, foreignFirst only): the present queued during the pause runs in the same dispatch, and the old window's
     // correct charge is the ~8 ms before the WM_NULL
-    const auto judgeSentWait = [&]( bool armed, bool traced, bool stamped, bool foreignFirst, bool pausedInForeign ) {
+    // r3 (sol r2 B1): and with that pause held past every send (`coalesceInForeign`, pausedInForeign only): the WM_NULL, the present
+    // and all five probes run in ONE dispatch, the sample the r2 admission discarded on every attempt
+    const auto judgeSentWait = [&]( bool armed, bool traced, bool stamped, bool foreignFirst, bool pausedInForeign, bool coalesceInForeign ) {
+    const bool floorRow = foreignFirst && pausedInForeign;             // r3: the paused floor row, admitted on its own predicate below
     wake.setTimingStampsForTest( stamped );                           // also resets the exit record to None / -1
     std::unique_ptr<R17A1Windows> wp;
     std::vector<std::pair<double, double>> spans;
@@ -3362,6 +3385,11 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     bool sentOk = false;
     bool landed = false;
     double foreignSentMs = 0.0;                                       // FOREIGN-FIRST-FLOOR-1: the sender's read just before the WM_NULL send
+    // r3 (sol r2 B1): why each discarded attempt was discarded, so a row that discards all ten fails with a typed reason
+    int missedSend = 0;                                               // the present's handler never ran inside the sleep
+    int noStamps = 0;                                                 // the sleep made no caller-clock read
+    int oneSpanInherited = 0;                                         // an inherited arm saw exactly one span: no second dispatch to witness
+    int holdNotWitnessed = 0;                                         // the floor row's WM_NULL handler did not hold the GUI while the present was queued
     for( int attempt = 0; attempt < kAttempts && !landed; ++attempt )
     {
         wp.reset( new R17A1Windows );
@@ -3376,7 +3404,9 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         g_r17A1PresentSent = false;
         g_r17A1PresentSending = false;
         g_r17A1PauseHeld = false;
-        g_r17A1PauseInForeign = foreignFirst && pausedInForeign;
+        g_r17A1ProbesSent = false;
+        g_r17A1PauseInForeign = floorRow;
+        g_r17A1CoalesceInForeign = floorRow && coalesceInForeign;
         foreignSentMs = 0.0;
         std::atomic<bool> sent { false };
         std::thread sender( [window, &sent, &foreignSentMs, foreignFirst]() {   // foreignSentMs is read only after the join
@@ -3410,6 +3440,8 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
                 waitUntil( seenMs + offsetMs );
                 SendNotifyMessageW( window, kR17A1ProbeMessage, i++, 0 );   // a dispatch source only: no stamp is judged
             }
+            waitUntil( seenMs + 56.0 );                                // r3 (sol r2 B1): the coalescing row's GUI resumes at 56 ms
+            g_r17A1ProbesSent = true;                                  // after the present's publication and every probe's send
         } );
         const ThreadJoinGuard senderGuard { sender };               // pass 1 A8: an exception inside the sleep unwinds through a joined thread
         if( armed ) wake.arm( 60000.0 );                              // SEAM-1 A4: armed for the whole sleep, never due inside it
@@ -3451,9 +3483,25 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         // SEAM-1 A1: no sender-side stamp gates the sample (the probe-liveness gates are gone; the exit record judges the sleep)
         // FOREIGN-FIRST-FLOOR-1 adversary pass 1 A1: the paused row is judged only on a sample whose WM_NULL handler held the GUI
         // while the present was queued (the handler's own observation, never the product's span record); otherwise it is retried
-        landed = handlerRan && !stamps.empty() && spans.size() != 1 && ( !( foreignFirst && pausedInForeign ) || pauseHeld );
+        // r3 (sol r2 B1): the two admissions are SPLIT, and the shared one is not loosened. An inherited arm still needs a second
+        // dispatch to witness (exactly one span is its batched sample, observed again). The paused floor row needs only the
+        // witnessed hold: the present and every probe coalescing into the held dispatch is a healthy, correctly charged sleep, and
+        // one span is judged in full below like any other count (an empty record still reaches dispatches >= 1 and fails there)
+        const bool inheritedAdmits = spans.size() != 1;
+        const bool floorAdmits = pauseHeld;
+        if( !handlerRan ) ++missedSend;
+        else if( stamps.empty() ) ++noStamps;
+        else if( floorRow && !floorAdmits ) ++holdNotWitnessed;
+        else if( !floorRow && !inheritedAdmits ) ++oneSpanInherited;
+        landed = handlerRan && !stamps.empty() && ( floorRow ? floorAdmits : inheritedAdmits );
     }
     ASSERT_TRUE( sentOk );
+    // r3 (sol r2 B1): every attempt discarded is a loud failure naming why, never a vacuous pass
+    if( !landed )
+        ::minitest::fail( __FILE__, __LINE__, floorRow ? "R17A1_FLOOR_ROW_NOT_LANDED" : "R17A1_INHERITED_ARM_NOT_LANDED",
+                          "attempts=" + std::to_string( kAttempts ) + " missed_send=" + std::to_string( missedSend )
+                              + " no_stamps=" + std::to_string( noStamps ) + " hold_not_witnessed=" + std::to_string( holdNotWitnessed )
+                              + " one_span_inherited=" + std::to_string( oneSpanInherited ) );
     ASSERT_TRUE( landed );                                             // the send fell inside one of the sleeps
     ASSERT_TRUE( armed == armedDuringSleep );                         // SEAM-1 A4: the judged sleep ran with the wake as intended
     // SEAM-1 A1: the sleep was never cut short at a dispatch, on the product's own exit decision: an expiry check left the loop
@@ -3466,6 +3514,13 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     // the dispatches the sleep recorded: the first send's, then each probe dispatch that was not taken in the same batch
     const size_t dispatches = spans.size();
     ASSERT_TRUE( dispatches >= 1 );
+    // r3 (sol r2 B1): the coalescing row really is the one-span sample: its handler held the GUI past every send, so the WM_NULL,
+    // the present and every probe ran in the one PeekMessageW (dispatchPendingSentMessages) -- the row proves that sample is judged
+    if( floorRow && coalesceInForeign )
+    {
+        ASSERT_EQ( static_cast<size_t>( 1 ), dispatches );
+        ASSERT_EQ( ( 1u << 5 ) - 1u, ranProbes );                     // all five probes ran, inside the held dispatch
+    }
     // the reads the sleep made on the caller clock: its entry, each dispatch's begin and end, and its return
     ASSERT_EQ( 2 + 2 * dispatches, stamps.size() );
     const double entryS = stamps[0];
@@ -3589,12 +3644,13 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     };
     for( const bool stamped : { false, true } )                       // SEAM-1 r4 (pass 3 A1): the production seam-off configuration first
     {
-        judgeSentWait( false, false, stamped, false, false );          // the wake idle: at least one judged attempt
-        judgeSentWait( true, false, stamped, false, false );           // SEAM-1 A4: the wake armed: at least one judged attempt
-        judgeSentWait( true, true, stamped, false, false );            // pass 2 A2: armed with the GUI trace on
-        judgeSentWait( false, false, stamped, true, false );           // r10 (sol r9 B1): a foreign WM_NULL dispatched before the present
-        judgeSentWait( true, true, stamped, true, false );             // ...armed, traced
-        judgeSentWait( false, false, stamped, true, true );            // FOREIGN-FIRST-FLOOR-1 (sol/fable r10 B1): the GUI paused inside the WM_NULL dispatch
+        judgeSentWait( false, false, stamped, false, false, false );   // the wake idle: at least one judged attempt
+        judgeSentWait( true, false, stamped, false, false, false );    // SEAM-1 A4: the wake armed: at least one judged attempt
+        judgeSentWait( true, true, stamped, false, false, false );     // pass 2 A2: armed with the GUI trace on
+        judgeSentWait( false, false, stamped, true, false, false );    // r10 (sol r9 B1): a foreign WM_NULL dispatched before the present
+        judgeSentWait( true, true, stamped, true, false, false );      // ...armed, traced
+        judgeSentWait( false, false, stamped, true, true, false );     // FOREIGN-FIRST-FLOOR-1 (sol/fable r10 B1): the GUI paused inside the WM_NULL dispatch
+        judgeSentWait( false, false, stamped, true, true, true );      // r3 (sol r2 B1): ...paused past every send: one coalesced span
     }
     wake.setTimingStampsForTest( false );
     // a sleep no dispatch cuts is one segment, charged to the window open at its end; NotHandled hands out none
