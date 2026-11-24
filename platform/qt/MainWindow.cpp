@@ -3048,7 +3048,8 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
                                                            ui->actionPlay->isChecked(), hadPendingAdvance );
     // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 (adversary r2 A1): one tick never asks the drop-frame loop for more frames than
     // it can count (a long suspension at a high source rate); every ordinary tick is unchanged.
-    timeDiff = playback_fps_meter::frameBoundedTickTimeDiffMs( timeDiff, getPlaybackFramerate() );
+    // r4 (pass 5 A2): only the Drop Frame request reads the tick as frames, so Normal mode keeps its whole tick (fps meter).
+    timeDiff = playback_fps_meter::frameBoundedTickTimeDiffMs( timeDiff, ui->actionDropFrameMode->isChecked() ? getPlaybackFramerate() : 0.0 );
 
     //Playback
     const bool frameChangedBeforePlayback = m_frameChanged;

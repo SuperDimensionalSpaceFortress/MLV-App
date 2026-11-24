@@ -60,7 +60,9 @@ inline int stampAgeMs( const Stamp & then, const Stamp & now )
  *  At most 1e6 laps per tick (about 4 MB, once per long suspension): the frame bound is 1e6 less the slack a tick adds
  *  on its way to the laps (r3 pass A1 on 8743841f: a position already inside the cut adds one lap and the double sum
  *  can round up one more, so 0.9999999999999999 + 1e6 made 1,000,001 width-1 laps; conform debt adds at most
- *  kConformMaxDebtFrames = 8). 999,990 frames is more than 11 hours of catch-up at 24 fps. */
+ *  kConformMaxDebtFrames = 8). 999,990 frames is more than 11 hours of catch-up at 24 fps. This bound covers a tick that
+ *  starts inside the cut; a stale start outside it (r4 pass 5 A1) is bounded where the laps are counted, in
+ *  playback_frame_range::advanceDropFrameTick (at most 1e6 laps from any start). */
 inline constexpr double kMaxTickFrames = 999990.0;
 
 /*! The tick's elapsed milliseconds, cut so that \a framerate * ms / 1000 stays within +-kMaxTickFrames. An ordinary
@@ -69,8 +71,10 @@ inline constexpr double kMaxTickFrames = 999990.0;
  *  8743841f: 150,000,000 fps, 8 ms -> 6 ms). Below it only a long suspension is cut. The cut is re-checked with
  *  the call site's own expression (MainWindow::playbackHandling: framerate * (double)timeDiff / 1000.0), because the
  *  reciprocal rounds (pass 4 A2: 781250000/821 fps made 1,050,880 ms, one double step over the bound). A positive age
- *  stays at least 1 ms, so the fps meter's `timeDiff != 0` gate is unchanged, except past 1e9 fps, where even 1 ms is
- *  over the bound and the tick asks for nothing (pass 4 A3). */
+ *  stays at least 1 ms up to exactly kMaxTickFrames * 1000 = 999,990,000 fps; past that rate even 1 ms is over the bound
+ *  and the tick asks for nothing (pass 4 A3; r4 pass 5 A2 on b70f718d: the cutoff was misstated as 1e9). MainWindow passes
+ *  the rate only for the Drop Frame request (Normal mode passes 0, so its tick and the fps meter's `timeDiff != 0` gate
+ *  are unchanged at any rate). */
 inline int frameBoundedTickTimeDiffMs( int timeDiffMs, double framerate )
 {
     if( !( framerate > 0.0 ) || timeDiffMs == 0 ) return timeDiffMs;
