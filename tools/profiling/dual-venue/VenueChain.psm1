@@ -2082,6 +2082,23 @@ function Invoke-VenueBoundedProcess {
         stdout = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' }); stderr = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' }) }
 }
 
+function Format-VenueBoundedChildEnd {
+    <#
+    .SYNOPSIS
+    DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r1 (adversary pass 8 A4; pass 1 A3 on ebfde5a3): how a timed-out Invoke-VenueBoundedProcess child ended, as it happened. A kill that
+    threw is said first (never "killed"); a child no kill was attempted on (it exited on its own: late, or between the bound and the kill) is never "killed"; only an attempted
+    kill that did not throw is "killed", confirmed or not.
+    #>
+    param([Parameter(Mandatory)]$Run, [Parameter(Mandatory)][int]$BoundSec)
+    $what = $(if ($Run.lateStart) { 'started after its room ended' } else { "did not answer in $BoundSec s" })
+    if ($Run.killErrored) { return "$what and the kill failed (not confirmed)" }
+    if (-not $Run.killAttempted) {
+        if ($Run.lateExit) { return "exited on its own after its $BoundSec s bound (late; no kill was needed)" }
+        return "$what, then exited on its own before the kill (no kill was needed)"
+    }
+    "$what and was killed$(if ($Run.lateStart) { ' at once' }) ($(if ($Run.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))"
+}
+
 function Get-VenueDriverScriptMissing {
     <#
     .SYNOPSIS
@@ -2097,7 +2114,7 @@ function Get-VenueDriverScriptMissing {
     return ''
 }
 
-Export-ModuleMember -Function New-VenueCapsProbeId, Get-VenueDriverScriptMissing, Get-VenueMainRoot, Get-VenueClaimPath, Get-VenueClaim, Get-VenueClaimStaleReason, Request-VenueClaim, Release-VenueClaim,
+Export-ModuleMember -Function New-VenueCapsProbeId, Get-VenueDriverScriptMissing, Format-VenueBoundedChildEnd, Get-VenueMainRoot, Get-VenueClaimPath, Get-VenueClaim, Get-VenueClaimStaleReason, Request-VenueClaim, Release-VenueClaim,
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
     Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueStagedArtifactNames, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,

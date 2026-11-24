@@ -7513,7 +7513,7 @@ exit 0
                          "a child the OS started past -StartNotAfterUtc ran, or the start bound cut a child that started in time (old: no -StartNotAfterUtc)\n" + got.stdout + got.stderr)
 
     CHAIN_LAUNCH_CHECK = ("            if ([DateTime]::UtcNow -ge $deadline) { $stopReason = 'DEADLINE'; $exitCode = 3; Add-Result $leg 'NOT_RUN' @{ verdict = 'DEADLINE'; reason = 'deadline-at-leg-launch' }; "
-                          "try { L \"LEG $($leg.name) NOT_RUN DEADLINE reason=deadline-at-leg-launch (-DeadlineUtc passed before the child started)\" } catch { [Console]::Error.WriteLine(\"LEG $($leg.name) NOT_RUN DEADLINE reason=deadline-at-leg-launch\") }; break }\n")
+                          "try { L \"LEG $($leg.name) NOT_RUN DEADLINE reason=deadline-at-leg-launch (-DeadlineUtc passed before the child started)\" } catch { Write-ChainDiagnostic \"LEG $($leg.name) NOT_RUN DEADLINE reason=deadline-at-leg-launch\" }; break }\n")
 
     def test_planned_hash_bind_b2_r1_h3_a_pause_after_the_last_launch_check_never_starts_the_primary_leg_past_the_deadline(self) -> None:
         dv = self.mutated_runner([("Invoke-VenueChain.ps1", self.CHAIN_LAUNCH_CHECK,
@@ -7537,16 +7537,53 @@ exit 0
         line = [l for l in got.stdout.splitlines() if l.startswith("H4 ")]
         self.assertEqual(line, ["H4 True True [False] [False] True"], "a child that exited on its own after its bound was not told apart from a killed one (old: no killAttempted)\n" + got.stdout + got.stderr)
         body = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
-        self.assertIn("function Format-BoundedChildEnd(", body, "one formatter says how a timed-out bounded child ended (old: every timeout read 'was killed')")
-        fmt = body[body.index("function Format-BoundedChildEnd("):body.index("function Get-ExportBudgetRefusal(")]
-        for said in ("(late; no kill was needed)", "the kill failed (not confirmed)", "started after its room ended and was killed at once"):
-            self.assertIn(said, fmt)
+        mod = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
+        self.assertIn("function Format-VenueBoundedChildEnd {", mod, "one formatter says how a timed-out bounded child ended (old: every timeout read 'was killed')")
         fn = body[body.index("function Get-ExportBudgetRefusal("):body.index("function Get-ScalarLegShapeRefusal(")]
-        self.assertEqual((fn.count("Format-BoundedChildEnd $bp $boundSec"), fn.count("Format-BoundedChildEnd $fp $boundSec")), (1, 1), "both export children use it")
+        self.assertEqual((fn.count("Format-VenueBoundedChildEnd $bp $boundSec"), fn.count("Format-VenueBoundedChildEnd $fp $boundSec")), (1, 1), "both export children use it")
         self.assertNotIn("did not answer in $boundSec s and was killed (", fn)
         tail = body[body.index("$b.endReason = 'LEASE_EXPIRED'") - 400:]
-        self.assertIn("Format-BoundedChildEnd $lp $legBoundSec", tail[:1200], "the LEASE_EXPIRED detail tells a late self-exit from a kill")
+        self.assertIn("Format-VenueBoundedChildEnd $lp $legBoundSec", tail[:1200], "the LEASE_EXPIRED detail tells a late self-exit from a kill")
         self.assertNotIn("killed with its process tree at the lease's end", body)
+
+    def test_planned_hash_bind_b2_r1_p1_a3_the_formatter_never_says_killed_when_no_kill_happened_or_the_kill_threw(self) -> None:
+        # pass 1 A3 on ebfde5a3: a child that exited between WaitForExit's false and HasExited (no kill attempted) read "was killed (kill confirmed)", and a late start whose
+        # kill threw read "killed at once"
+        mod = DV / "VenueChain.psm1"
+        rec = "[pscustomobject]@{{ timedOut = $true; lateStart = ${ls}; lateExit = ${le}; killAttempted = ${ka}; killErrored = ${ke}; killConfirmed = ${kc} }}"
+        cases = {"exited-before-kill": (rec.format(ls="false", le="false", ka="false", ke="false", kc="true"), "did not answer in 60 s, then exited on its own before the kill (no kill was needed)"),
+                 "late-start-kill-threw": (rec.format(ls="true", le="false", ka="true", ke="true", kc="false"), "started after its room ended and the kill failed (not confirmed)"),
+                 "late-self-exit": (rec.format(ls="false", le="true", ka="false", ke="false", kc="true"), "exited on its own after its 60 s bound (late; no kill was needed)"),
+                 "killed": (rec.format(ls="false", le="false", ka="true", ke="false", kc="true"), "did not answer in 60 s and was killed (kill confirmed)")}
+        for name, (r, want) in cases.items():
+            with self.subTest(record=name):
+                got = run_pwsh(["-Command", f"Import-Module '{mod}' -Force -DisableNameChecking; 'P1A3 ' + (Format-VenueBoundedChildEnd -Run ({r}) -BoundSec 60)"], timeout=60)
+                line = [l for l in got.stdout.splitlines() if l.startswith("P1A3 ")]
+                self.assertEqual(line, ["P1A3 " + want], got.stdout + got.stderr)
+        chain = (DV / "Invoke-VenueChain.ps1").read_text(encoding="utf-8")
+        self.assertEqual(chain.count("Format-VenueBoundedChildEnd $lp 86400"), 2, "the chain's late-start and timeout lines use the same formatter")
+
+    def test_planned_hash_bind_b2_r1_p1_a1_the_bounded_reads_call_no_runner_function_the_guard_worker_is_not_handed(self) -> None:
+        # pass 1 A1 on ebfde5a3: Read-SpecBytesWithin called a helper of its own that $script:GuardWorkerFunctions did not hand to the guard worker, so a successful read there
+        # threw a missing command and refused a valid run. Every runner function named in a handed-over function's body must itself be handed over.
+        import re
+        body = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
+        defined = set(re.findall(r"(?m)^function ([A-Za-z][\w-]*)", body))
+        assign = body[body.index("$script:GuardWorkerFunctions = @("):body.index("$script:GuardWorker = {")]
+        handed = set(re.findall(r"'([A-Za-z][\w-]*)'", assign))
+        for fn in ("Read-SpecBytesWithin", "Get-SpecReadBoundSec", "Get-InputUnresolvedCode", "Get-BytesSha256"):
+            with self.subTest(function=fn):
+                start = body.index(f"function {fn}")
+                text = body[start:body.index("\nfunction ", start + 1)]
+                code = "\n".join(l.split("#", 1)[0] for l in text.splitlines()[1:])
+                called = {n for n in defined if re.search(rf"(?<![\w-]){re.escape(n)}(?![\w-])", code)} - {fn}
+                self.assertEqual(sorted(called - handed), [], f"{fn} calls runner functions the guard worker is not handed (old: Test-SpecReadArrivedLate)")
+
+    def test_planned_hash_bind_b2_r1_p1_a4_no_chain_log_fallback_writes_stderr_synchronously(self) -> None:
+        # pass 1 A4 on ebfde5a3: the NOT_RUN DEADLINE and spec-refusal log fallbacks wrote stderr synchronously, so a full unread pipe held the claim release and the typed result
+        chain = (DV / "Invoke-VenueChain.ps1").read_text(encoding="utf-8")
+        self.assertEqual(chain.count("catch { [Console]::Error.WriteLine("), 0, "a chain-log fallback writes stderr synchronously (old: :490, :638, :684)")
+        self.assertGreaterEqual(chain.count("catch { Write-ChainDiagnostic "), 4)
 
     W1_LOC_ANCHOR = "    if (-not [VenueLeaseBatchFinalPath]::LocateWithin($full, 0, $ms, [ref]$phys, [ref]$key)) { return $null }\n"
     W1_SWEEP_ANCHOR = "        $h = $ps.BeginInvoke()\n"

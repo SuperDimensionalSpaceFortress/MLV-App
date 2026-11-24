@@ -487,7 +487,7 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
         # the bounded, non-throwing Write-ChainEvidence (a read-only or stalled file used to throw here and turn the typed refusal into SUPPLEMENTARY_ERROR, or hold the claim release)
         $sw = Write-ChainEvidence $sOut @($sr.stdout + $(if ($sr.stderr) { "`n--- stderr ---`n$($sr.stderr)" } else { '' }))
         if ($sw -cne 'OK') { Write-ChainDiagnostic "SUPPLEMENTARY_OUT_WRITE_$sw leg=$($Leg.name) path=$sOut (evidence only: the supplementary child is classified from its own captured output)" }
-        if ($sSpecRefusal) { try { L "$sSpecRefusal venue=$suppVenue role=supplementary (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)" } catch { [Console]::Error.WriteLine("$sSpecRefusal venue=$suppVenue role=supplementary (chain log write failed: $($_.Exception.Message -replace '\s+', ' '))") } }
+        if ($sSpecRefusal) { try { L "$sSpecRefusal venue=$suppVenue role=supplementary (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)" } catch { Write-ChainDiagnostic "$sSpecRefusal venue=$suppVenue role=supplementary (chain log write failed: $($_.Exception.Message -replace '\s+', ' '))" } }   # b2 r1 (pass 1 A4): bounded
         # Whatever the leg printed, a leg that died or timed out is INVALID evidence, never a measurement (the Bachelor rule); and nothing here is read as a timing verdict.
         $shownOutcome = $(if ($sStatus -ceq 'RAN') { $sOutcome } else { 'INVALID' })
         $extra = @{ quietVerdict = $sq.verdict; quietMean = $sq.mean; outcome = $shownOutcome; printedOutcome = $sOutcome; legExit = $sr.exit; timedOut = $sr.timedOut; receipt = $sReceipt; receiptRole = $sRole
@@ -635,7 +635,7 @@ foreach ($leg in $plan) {
             L "LEG $($leg.name) RUN verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) spec=$($leg.spec) backend=$(if ($leg.backend) { $leg.backend } else { 'spec' })"
             # r3 fix 2 / fix 3 (adversary pass 3 A2, pass 4 A1): the under-claim probe, its transcript write or the RUN line's append above can end after -DeadlineUtc (each can
             # stall on a share), so the deadline is asked again as the LAST step before the child starts: no leg starts at or past it.
-            if ([DateTime]::UtcNow -ge $deadline) { $stopReason = 'DEADLINE'; $exitCode = 3; Add-Result $leg 'NOT_RUN' @{ verdict = 'DEADLINE'; reason = 'deadline-at-leg-launch' }; try { L "LEG $($leg.name) NOT_RUN DEADLINE reason=deadline-at-leg-launch (-DeadlineUtc passed before the child started)" } catch { [Console]::Error.WriteLine("LEG $($leg.name) NOT_RUN DEADLINE reason=deadline-at-leg-launch") }; break }
+            if ([DateTime]::UtcNow -ge $deadline) { $stopReason = 'DEADLINE'; $exitCode = 3; Add-Result $leg 'NOT_RUN' @{ verdict = 'DEADLINE'; reason = 'deadline-at-leg-launch' }; try { L "LEG $($leg.name) NOT_RUN DEADLINE reason=deadline-at-leg-launch (-DeadlineUtc passed before the child started)" } catch { Write-ChainDiagnostic "LEG $($leg.name) NOT_RUN DEADLINE reason=deadline-at-leg-launch" }; break }
             # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r3 (adversary pass 2 A1, A6): the leg child's output is CAPTURED (2>&1: its stdout lines are strings, its stderr lines
             # ErrorRecords), and every reading below (outcome, receipt path, detail, the spec refusal) is made from THIS child's own STDOUT. The RunDir-named file is shared by
             # every chain on this -RunDir (two venues' chains name a leg alike), so it is written after the leg as evidence only and never read back; a stderr line classifies nothing.
@@ -648,7 +648,7 @@ foreach ($leg in $plan) {
                 $why = $(if ($lp.notStarted) { 'deadline-at-leg-launch' } else { 'deadline-at-child-start' })
                 $killedIds = @(Get-VenueRemoteJobIds -Text ([string]$lp.stdout)) -join ','
                 $stopReason = 'DEADLINE'; $exitCode = 3; Add-Result $leg 'NOT_RUN' @{ verdict = 'DEADLINE'; reason = $why }
-                $dLine = "LEG $($leg.name) NOT_RUN DEADLINE reason=$why ($(if ($lp.notStarted) { '-DeadlineUtc passed before the child started' } else { "the OS started the child at or past -DeadlineUtc: killed at once ($(if ($lp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED' }))" }))$(if ($killedIds) { " jobIds=$killedIds" })"
+                $dLine = "LEG $($leg.name) NOT_RUN DEADLINE reason=$why ($(if ($lp.notStarted) { '-DeadlineUtc passed before the child started' } else { "the OS started the child at or past -DeadlineUtc: it $(Format-VenueBoundedChildEnd $lp 86400)" }))$(if ($killedIds) { " jobIds=$killedIds" })"
                 try { L $dLine } catch { Write-ChainDiagnostic $dLine }   # bounded, never throws: a failing log append costs neither the typed result nor exit 3
                 break
             }
@@ -670,7 +670,7 @@ foreach ($leg in $plan) {
                 # Invoke-VenueLeg exits 0 whenever it wrote a receipt (any outcome, INVALID included); non-zero means it died without one. Whatever
                 # DVE_OUTCOME it printed before dying is not evidence: the leg is LEG_FAILED / INVALID, never RAN, and the chain exits 7. It goes on to the next leg.
                 Add-Result $leg 'LEG_FAILED' @{ verdict = $re.verdict; quietMean = $re.mean; outcome = 'INVALID'; printedOutcome = $outcome; legExit = $legCode; receipt = $null }
-                if ($legTimedOut) { L "LEG $($leg.name) LEG_FAILED TIMEOUT outcome=INVALID printedOutcome=$outcome verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) (the leg did not exit within its 86400 s bound and was killed ($(if ($lp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED' })): no usable receipt)" }
+                if ($legTimedOut) { L "LEG $($leg.name) LEG_FAILED TIMEOUT outcome=INVALID printedOutcome=$outcome verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) (the leg $(Format-VenueBoundedChildEnd $lp 86400): no usable receipt)" }
                 else { L "LEG $($leg.name) LEG_FAILED exit=$legCode outcome=INVALID printedOutcome=$outcome verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) (the leg exited non-zero: no usable receipt)" }
                 # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1: a leg that refused other bytes than the planned ones (or could not read the planned spec) is named on its own typed line and in its
                 # result (specRefusal). It stays LEG_FAILED / INVALID, exit 7, so the label never turns a leg into a measurement either way. The record is read from this child's
@@ -681,7 +681,7 @@ foreach ($leg in $plan) {
                 if ($specRefusal) {
                     $results[$results.Count - 1] | Add-Member -NotePropertyName specRefusal -NotePropertyValue (($specRefusal -split ' ', 2)[0]) -Force
                     try { L "$specRefusal (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)" }
-                    catch { [Console]::Error.WriteLine("$specRefusal (chain log write failed: $($_.Exception.Message -replace '\s+', ' '))") }
+                    catch { Write-ChainDiagnostic "$specRefusal (chain log write failed: $($_.Exception.Message -replace '\s+', ' '))" }   # b2 r1 (pass 1 A4): bounded
                 }
             } else {
                 $preLoad = Get-LegPreLoadMean $receipt
