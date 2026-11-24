@@ -873,23 +873,52 @@ function Invoke-PendingClaimRelease([string]$Why, [switch]$StderrOnly, [switch]$
     # it. A typed stop with no claim held (DEADLINE, an input-guard refusal, a request that threw) has no next poll, so the claim kept the older ready ticket waiting until this process exited or the claim expired.
     # Every such stop lets go of it FIRST, bounded as the late grant's release is (VenueChain's Invoke-VenueLateRelease: the reserve, one call capped at 1.5 s, the probe at 1.0 s), and then says what happened.
     # A release that was not answered turns the write suppression on, as the late grant's does. -StderrOnly: the line goes to stderr only (the input-guard refusal, whose input may be batch.log itself).
+    # TAIL-1 r7 (adversary pass 10 A1, A2 on 3c51d262): the release now runs on ONE worker per nonce (Start-PendingClaimReleaseWorker), which keeps trying until the claim is let go, this
+    # process exits, or -ClaimTtlSec has passed (the claim has expired by then). A1: a reader that held the claim through the bounded wait below and lets go DURING a later synchronous line of
+    # the turn (a batch.log append that stalls) no longer leaves the claim standing until the next poll: the worker lets go of it within a try. A2: the caller waits for that worker ONCE per
+    # nonce, the same allowance as before (the reserve less the refusal's tail, one call's 1.5 s and the probe's 1.0 s); every later typed stop for the same nonce (the DEADLINE tail, the
+    # input-guard refusal) reads what the worker has answered so far and starts no second allowance. A call that did not answer inside its 1.5 s (or that threw) turns the suppression on.
     $t = $script:batchTicket
     if ($null -eq $t -or $null -eq $t.PSObject.Properties['pendingReleaseNonce'] -or -not [string]$t.pendingReleaseNonce) { return }
     $pendingNonce = [string]$t.pendingReleaseNonce
-    $pendingAnswer = 'ERROR'; $pendingUnanswered = $true
-    try {
-        $pending = Invoke-VenueLateRelease -Venue $Venue -Nonce $pendingNonce -ClaimDir $ClaimDir -BoundSec ([double]($script:ClaimRetryRequestReserveSec - $script:ClaimRetryRefusalTailSec)) -CallCapSec 1.5 -ProbeCapSec 1.0 -Call $null -Clock $null -Sleep $null
-        $pendingAnswer = [string]$pending.answer; $pendingUnanswered = [bool]$pending.anyUnanswered
-    } catch { $pendingAnswer = 'ERROR'; $pendingUnanswered = $true }
-    $let = $pendingAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')
+    $pr = $script:pendingClaimRelease
+    if ($null -eq $pr -or $pr.nonce -cne $pendingNonce) { $pr = Start-PendingClaimReleaseWorker $pendingNonce; $script:pendingClaimRelease = $pr }
+    $S = $pr.state
+    if (-not $pr.waited) {
+        $pr.waited = $true
+        $waitSec = [double]($script:ClaimRetryRequestReserveSec - $script:ClaimRetryRefusalTailSec) + 1.5 + 1.0
+        if ($null -ne $pr.async) { try { [void]$pr.async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($waitSec)) } catch { } }
+        # still running once the caller stops waiting: a live thread the host would wait for at exit, so it is counted (Complete-VenueProcess then exits at once); never joined or disposed
+        if (-not $S.ended) { & (Get-Module VenueChain) { $script:VenueAbandonedReads++ } }
+    }
+    $pendingAnswer = $(if ($S.released) { [string]$S.answer } elseif ([string]$S.answer) { [string]$S.answer } else { 'NO_ANSWER' })
+    $callOpenMs = [double]$S.callStartMs
+    $pendingUnanswered = $S.threw -or $S.slowCall -or ($callOpenMs -ge 0 -and ($S.clock.Elapsed.TotalMilliseconds - $callOpenMs) -gt 1500) -or -not [string]$S.answer
+    $let = [bool]$S.released
     if ($let) { $t.pendingReleaseNonce = '' }
-    # r6 adversary A3 (d714aae4): ANY call that did not answer turns the suppression on, also when the probe after it answered RELEASED: the claim share stalled, and -RunDir may be on it
+    # r6 adversary A3 (d714aae4): ANY call that did not answer turns the suppression on, also when a later try answered RELEASED: the claim share stalled, and -RunDir may be on it
     if ($pendingUnanswered -or $pendingAnswer -cin @('NO_ANSWER', 'ERROR')) { Disable-RunDirWrites "a release of a claim a give-back could not let go of did not answer ($pendingAnswer)" }
     $pendingLine = $(if ($let) { "CLAIM_PENDING_RELEASE batch=$batchNo nonce=$pendingNonce result=$pendingAnswer why=$Why (a claim a give-back could not let go of, released before the typed stop)" }
-        else { "CLAIM_PENDING_RELEASE_NOT_RELEASED batch=$batchNo nonce=$pendingNonce result=$pendingAnswer why=$Why (the claim still names this batch until its owner exits or it expires)" })
+        else { "CLAIM_PENDING_RELEASE_NOT_RELEASED batch=$batchNo nonce=$pendingNonce result=$pendingAnswer why=$Why (its worker keeps trying to let go of it while this process runs; the claim still names this batch until then, its owner's exit or its expiry)" })
     # r6 adversary A2: -Deferred returns the line for the caller to write later (the release runs before any batch.log line of its turn)
     if ($Deferred) { return $pendingLine }
     if ($StderrOnly) { try { [Console]::Error.WriteLine($pendingLine) } catch { } } else { LogBest $pendingLine }
+}
+
+$script:pendingClaimRelease = $null
+function Start-PendingClaimReleaseWorker([string]$Nonce) {
+    # TAIL-1 r7 (adversary pass 10 A1): the one worker that lets go of a claim of this batch's own a give-back left standing (Invoke-PendingClaimRelease, its one caller). It tries
+    # Release-VenueClaim until an answer that leaves no claim of this nonce (RELEASED, ABSENT, NOT_OURS: the nonce check makes a try after another let go of it harmless), this process exits,
+    # or -ClaimTtlSec has passed. It never throws: a worker that could not be started is a state that answered nothing (threw), which turns the suppression on.
+    $state = [hashtable]::Synchronized(@{ clock = [Diagnostics.Stopwatch]::StartNew(); callStartMs = -1.0; answer = ''; released = $false; threw = $false; slowCall = $false; ended = $false; tries = 0 })
+    $pr = @{ nonce = $Nonce; state = $state; ps = $null; async = $null; waited = $false }
+    try {
+        $pr.ps = [powershell]::Create()
+        [void]$pr.ps.AddScript($script:PendingClaimReleaseWorker.ToString())
+        [void]$pr.ps.AddArgument(@{ chainModule = (Join-Path $here 'VenueChain.psm1'); venue = $Venue; nonce = $Nonce; claimDir = $ClaimDir; untilUtc = [DateTime]::UtcNow.AddSeconds([Math]::Max(5, [double]$ClaimTtlSec)); state = $state })
+        $pr.async = $pr.ps.BeginInvoke()
+    } catch { $state.threw = $true; $state.answer = "ERROR $($_.Exception.Message -replace '\s+', ' ')"; $state.ended = $true }
+    $pr
 }
 
 function Invoke-BatchTicketCall([string]$Body, [hashtable]$Argument, [double]$Sec = 5) {
@@ -1022,6 +1051,26 @@ $script:ClaimRetryRequestWorker = {
         # TAIL-1 r6 (adversary A4 on d714aae4): a QUEUED answer whose ticket names this batch's own claim (A13's give-back stayed BUSY) reaches nobody once the caller gave up, so this worker lets go of that claim too
         try { $S.release = [string](Release-VenueClaim -Venue $A.request.Venue -Nonce ([string]$r.ticket.pendingReleaseNonce) -ClaimDir $A.request.ClaimDir) } catch { $S.release = "THREW $($_.Exception.Message -replace '\s+', ' ')" }
     }
+}
+# TAIL-1 r7 (adversary pass 10 A1): the release of a claim a give-back left standing, on its worker (Start-PendingClaimReleaseWorker, its one reader). It records each call's start on the
+# shared clock (callStartMs, -1 between calls) so the caller can tell a call in flight past its 1.5 s from a share that answered BUSY; a call that took longer than that is slowCall.
+$script:PendingClaimReleaseWorker = {
+    param($A)
+    $S = $A.state
+    try {
+        Import-Module $A.chainModule -Force -DisableNameChecking -ErrorAction Stop
+        while ([DateTime]::UtcNow -lt $A.untilUtc) {
+            $S.callStartMs = $S.clock.Elapsed.TotalMilliseconds
+            # (the answer is $ans, never $a: PowerShell names are case-blind, so $a IS $A, this worker's argument)
+            $ans = try { [string](Release-VenueClaim -Venue $A.venue -Nonce $A.nonce -ClaimDir $A.claimDir) } catch { $S.threw = $true; "ERROR $($_.Exception.Message -replace '\s+', ' ')" }
+            if (($S.clock.Elapsed.TotalMilliseconds - $S.callStartMs) -gt 1500) { $S.slowCall = $true }
+            $S.callStartMs = -1.0; $S.tries++
+            if ($ans -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { $S.answer = $ans; $S.released = $true; break }
+            $S.answer = $ans
+            [Threading.Thread]::Sleep(100)
+        }
+    } catch { $S.threw = $true; $S.answer = "ERROR $($_.Exception.Message -replace '\s+', ' ')" }
+    finally { $S.callStartMs = -1.0; $S.ended = $true }
 }
 # r7: the release of a claim granted on a retry, on its worker (Invoke-ClaimRetryRelease, its one reader)
 $script:ClaimRetryReleaseWorker = {

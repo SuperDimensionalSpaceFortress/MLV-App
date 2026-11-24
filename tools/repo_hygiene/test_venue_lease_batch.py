@@ -564,7 +564,21 @@ def psq(value: object) -> str:
     return "".join(c * 2 if c in PS_SINGLE_QUOTES else c for c in str(value))
 
 
-_WALL_CLOCK_READ = re.compile(r"UtcNow|Get-Date|\[DateTime\]::Now|\[datetime\]::Now", re.IGNORECASE)
+# TAIL-1 r7 (hosted CI red on 3c51d262, run 45312704530: 'Invoke-PendingClaimRelease' is not recognized): the claim-loop harnesses lifted the loop with a HAND-LISTED set of the
+# runner's functions, so a function the loop came to call (r6's Invoke-PendingClaimRelease) was missing in memory while the runner itself defines it at script scope. This lifts the
+# loop ($loop) and EVERY script-level function of the runner it reaches, transitively, from the source: a function the loop calls is never left out by a list. Each harness defines its
+# stubs AFTER this, so a stub still replaces the real function of its name. Expects $ast (the runner's parsed file).
+LIFT_CLAIM_LOOP = (
+    "$loop = $ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.WhileStatementAst] -and $x.Body.Extent.Text.Contains('Request-VenueClaim') }, $true) | Select-Object -Last 1\n"
+    "$runnerDefs = @{}; foreach ($s in $ast.EndBlock.Statements) { if ($s -is [System.Management.Automation.Language.FunctionDefinitionAst]) { $runnerDefs[$s.Name] = $s } }\n"
+    "$lifted = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase); $toWalk = [Collections.Generic.Queue[object]]::new(); $toWalk.Enqueue($loop)\n"
+    "while ($toWalk.Count -gt 0) { foreach ($c in $toWalk.Dequeue().FindAll({ param($x) $x -is [System.Management.Automation.Language.CommandAst] }, $true)) { $cn = $c.GetCommandName(); "
+    "if ($cn -and $runnerDefs.ContainsKey($cn) -and $lifted.Add($cn)) { $toWalk.Enqueue($runnerDefs[$cn]) } } }\n"
+    "foreach ($cn in $lifted) { . ([scriptblock]::Create($runnerDefs[$cn].Extent.Text)) }\n"
+)
+
+
+_WALL_CLOCK_READ =re.compile(r"UtcNow|Get-Date|\[DateTime\]::Now|\[datetime\]::Now", re.IGNORECASE)
 _WAIT_TIMING_NAME = re.compile(r"\$deadline\b|\$gateEnd\b|\$waitCutoff\b|\$now\b|waitedSec|-\s*\$t0\b|\$wu\b|\$wts\b", re.IGNORECASE)
 
 
@@ -7558,8 +7572,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # lands past the deadline. On 38d61585 that started another request; here the loop ends (DEADLINE, as ever), and with an on-time sleep it still polls.
         def requests(setup: str) -> int:
             script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
-                      "$loop = $ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.WhileStatementAst] -and $x.Body.Extent.Text.Contains('Request-VenueClaim') }, $true) | Select-Object -Last 1\n"
-                      "foreach ($n in 'Test-ClaimWaitRetryRoom', 'Get-ClaimWaitUnfinishedText') { $f = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true); if ($f) { . ([scriptblock]::Create($f.Extent.Text)) } }\n"
+                      + LIFT_CLAIM_LOOP +
                       "$script:requests = 0; $script:ClaimWaitUnfinishedMax = 3; $script:ClaimWaitNoAnswerMax = 3; $script:ClaimWaitGuardSec = 30; $script:receiptGuardHit = $null; $script:claimWait = @{ denied = 0; startUtc = $null; endUtc = $null }\n"
                       "$claim = $null; $lastHolder = ''; $unfinished = 0; $noAnswers = 0; $batchNo = 1; $Venue = 'bachelor'; $RunDir = 'r'; $Purpose = 'p'; $ClaimDir = 'c'; $ClaimTtlSec = 60; $ClaimRenewSec = 15; $ClaimPollSec = 1\n"
                       "function Request-VenueClaim { $script:requests++; [pscustomobject]@{ granted = $false; broken = @(); claim = $null; state = 'held' } }\n"
@@ -7837,8 +7850,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # request's error named in it, and no second guard runs. With nothing unfinished the throw stays the throw it always was.
         def run(setup: str) -> dict:
             script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
-                      "$loop = $ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.WhileStatementAst] -and $x.Body.Extent.Text.Contains('Request-VenueClaim') }, $true) | Select-Object -Last 1\n"
-                      "foreach ($n in 'Test-ClaimWaitRetryRoom', 'Get-ClaimWaitUnfinishedText') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
+                      + LIFT_CLAIM_LOOP +
                       "Import-Module ([IO.Path]::Combine('" + psq(RUNNER.parent) + "', 'VenueChain.psm1')) -Force -DisableNameChecking\n"
                       "$script:requests = 0; $script:guards = 0; $script:refused = ''; $script:thrown = ''; $script:ClaimWaitUnfinishedMax = 3; $script:ClaimWaitGuardSec = 1; $script:receiptGuardHit = $null; $script:claimWait = @{ denied = 0; startUtc = $null; endUtc = $null }\n"
                       "$claim = $null; $lastHolder = ''; $unfinished = 0; $noAnswers = 0; $batchNo = 1; $Venue = 'bachelor'; $RunDir = 'r'; $Purpose = 'p'; $ClaimDir = 'c'; $ClaimTtlSec = 60; $ClaimRenewSec = 15; $ClaimPollSec = 1; $batches = @()\n"
@@ -7874,8 +7886,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             "function Request-VenueClaim { param($Venue, $RunDir, $Purpose, $TtlSec, $ClaimDir) [IO.File]::AppendAllText('" + log + "\\requests.log', \"w`n\"); " + retry + " }\n"
             "function Release-VenueClaim { param($Venue, $Nonce, $ClaimDir) " + release + "[IO.File]::AppendAllText('" + log + "\\releases.log', \"worker:$Nonce`n\"); 'RELEASED' }\n", encoding="utf-8")
         script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
-                  "$loop = $ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.WhileStatementAst] -and $x.Body.Extent.Text.Contains('Request-VenueClaim') }, $true) | Select-Object -Last 1\n"
-                  "foreach ($n in 'Test-ClaimWaitRetryRoom', 'Get-ClaimWaitUnfinishedText', 'Invoke-ClaimRetryRequest', 'Invoke-ClaimRetryRelease') { $f = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true); if ($f) { . ([scriptblock]::Create($f.Extent.Text)) } }\n"
+                  + LIFT_CLAIM_LOOP +
                   # r7: every $script:ClaimRetry* value (the workers, the grace and tail) and the guard's read minimum, as the runner sets them
                   "foreach ($a in $ast.EndBlock.Statements) { if ($a -is [System.Management.Automation.Language.AssignmentStatementAst] -and ($a.Left.Extent.Text -clike '$script:ClaimRetry*' -or $a.Left.Extent.Text -ceq '$script:GuardReadMinSec')) { . ([scriptblock]::Create($a.Extent.Text)) } }\n"
                   "Import-Module ([IO.Path]::Combine('" + psq(RUNNER.parent) + "', 'VenueChain.psm1')) -Force -DisableNameChecking\n"

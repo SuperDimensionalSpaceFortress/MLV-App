@@ -2993,9 +2993,11 @@ $o | ConvertTo-Json -Compress
         self.assertTrue(receipt.exists(), f"no batch receipt:\n{log}\n{out}")
         self.assertEqual(json.loads(receipt.read_text(encoding="utf-8-sig")).get("endReason"), "DEADLINE", receipt.read_text(encoding="utf-8-sig"))
 
-    def give_back_busy_runner(self, prefix: str, log_stall_sec: int = 0) -> Path:
+    def give_back_busy_runner(self, prefix: str, log_stall_sec: int = 0, release_seam: bool = False) -> Path:
         # the B2 seam (A13's give-back answers BUSY five times, so the answer is QUEUED with the batch's own nonce on its ticket); with log_stall_sec, the batch.log append of the line that carries the
-        # CLAIM_GIVE_BACK_BUSY note (the first line after that request) stalls that long
+        # CLAIM_GIVE_BACK_BUSY note (the first line after that request) stalls that long (r7: it first writes $env:SEAM_STALL_MARK when that is set, so a test knows the append has begun).
+        # r7 release_seam: Release-VenueClaim itself answers BUSY while the file $env:SEAM_RELEASE_BUSY_WHILE exists (a reader holding the claim file), and logs each call's start to
+        # $env:SEAM_RELEASE_CALLS and then stalls $env:SEAM_RELEASE_STALL_SEC seconds when that is set (a claim share that stopped answering)
         import shutil
         text = MODULE.read_text(encoding="utf-8")
         cond = "            if ($headAfter.Count -gt 0 -and $headAfter[0].name -cne $t.name) {\n"
@@ -3004,13 +3006,19 @@ $o | ConvertTo-Json -Compress
             self.assertEqual(text.count(a), 1, f"give-back seam anchor moved: {a!r}")
         text = text.replace(cond, "            if ($env:SEAM_GIVE_BACK_BUSY -or ($headAfter.Count -gt 0 -and $headAfter[0].name -cne $t.name)) {\n")
         text = text.replace(rel, "                    if ($env:SEAM_GIVE_BACK_BUSY) { $back = 'BUSY' } else { try { $back = [string](Release-VenueClaim -Venue $Venue -Nonce $r.claim.nonce -ClaimDir $ClaimDir) } catch { $back = 'BUSY' } }\n")
+        if release_seam:
+            body = "    $path = Get-VenueClaimPath -Venue $Venue -ClaimDir $ClaimDir\n    switch (Remove-VenueClaimIfUnchanged -Path $path -ExpectedNonce $Nonce -MaxAttempts $MaxAttempts) {\n"
+            self.assertEqual(text.count(body), 1, "Release-VenueClaim seam anchor moved")
+            text = text.replace(body, "    if ($env:SEAM_RELEASE_CALLS) { [IO.File]::AppendAllText($env:SEAM_RELEASE_CALLS, \"$([DateTime]::UtcNow.ToString('o'))`n\") }\n"
+                                      "    if ($env:SEAM_RELEASE_STALL_SEC) { Start-Sleep -Seconds ([int]$env:SEAM_RELEASE_STALL_SEC) }\n"
+                                      "    if ($env:SEAM_RELEASE_BUSY_WHILE -and [IO.File]::Exists($env:SEAM_RELEASE_BUSY_WHILE)) { Start-Sleep -Milliseconds 100; return 'BUSY' }\n" + body)
         runner = copy_with_siblings(LEASE_RUNNER, Path(tempfile.mkdtemp(prefix=prefix, dir=self.case)))
         (runner.parent / MODULE.name).write_text(text, encoding="utf-8")
         if log_stall_sec:
             rtext = runner.read_text(encoding="utf-8")
             anchor = "try { Add-Content -LiteralPath $batchLog -Value $line }"
             self.assertEqual(rtext.count(anchor), 1, "batch.log append seam anchor moved")
-            runner.write_text(rtext.replace(anchor, "if ($line -like '*CLAIM_GIVE_BACK_BUSY*') { Start-Sleep -Seconds %d }; " % log_stall_sec + anchor), encoding="utf-8")
+            runner.write_text(rtext.replace(anchor, "if ($line -like '*CLAIM_GIVE_BACK_BUSY*') { if ($env:SEAM_STALL_MARK) { [IO.File]::WriteAllText($env:SEAM_STALL_MARK, '1') }; Start-Sleep -Seconds %d }; " % log_stall_sec + anchor), encoding="utf-8")
         (runner.parent.parent / "bachelor").mkdir(exist_ok=True)
         shutil.copy2(DV.parent / "bachelor" / "ultra-magnus-agent.ps1", runner.parent.parent / "bachelor" / "ultra-magnus-agent.ps1")
         return runner
@@ -3063,6 +3071,61 @@ $o | ConvertTo-Json -Compress
         self.assertIsNotNone(appeared, f"the batch never held the claim:\n{out}")
         self.assertIsNotNone(vanished, f"the batch's own claim was never let go:\n{out}")
         self.assertLess(vanished - appeared, 15.0, f"the batch's own claim stood {vanished - appeared:.1f} s with a poll still to come: a stalled batch.log line held its release:\n{out}")
+
+    def test_tail1_r7_a1_a_pending_claim_still_busy_after_its_eager_release_is_let_go_while_a_batch_log_line_stalls(self) -> None:
+        # adversary pass 10 A1 on 3c51d262 (its literal row): a reader holds the batch's own claim through every give-back AND the eager release after the request (here: Release-VenueClaim answers BUSY
+        # while a hold file exists), the first CLAIM_GIVE_BACK_BUSY batch.log append then stalls 40 s, and the reader lets go 100 ms into that append. The eager release had given up (BUSY), so the
+        # claim stood behind the stalled line until the next poll (~45 s). Expected: it is let go within seconds of the reader letting go, long before the stall ends.
+        import time
+        runner = self.give_back_busy_runner("gbh-", log_stall_sec=40, release_seam=True)
+        hold, mark = self.case / "reader-holds.flag", self.case / "append-began.flag"
+        hold.write_text("1", encoding="utf-8")
+        calls = self.case / "release-calls-h.log"
+        p = self.start_batch("QH", claim_poll=5, runner=runner, deadline_sec=60, SEAM_GIVE_BACK_BUSY="1", SEAM_RELEASE_BUSY_WHILE=str(hold), SEAM_STALL_MARK=str(mark), SEAM_RELEASE_CALLS=str(calls))
+        t0 = time.monotonic(); appeared = lifted = vanished = None
+        while time.monotonic() - t0 < 120:
+            exists = self.claim_path.exists()
+            if exists and appeared is None:
+                appeared = time.monotonic()
+            if lifted is None and mark.exists():
+                time.sleep(0.1)
+                hold.unlink()
+                lifted = time.monotonic()
+            if lifted is not None and appeared is not None and not self.claim_path.exists():
+                vanished = time.monotonic()
+                break
+            if p.poll() is not None:
+                break
+            time.sleep(0.05)
+        p.wait(timeout=180)
+        out = Path(p.out_path).read_text(encoding="utf-8", errors="replace")   # type: ignore[attr-defined]
+        self.assertIsNotNone(appeared, f"the batch never held the claim:\n{out}")
+        self.assertIsNotNone(lifted, f"the CLAIM_GIVE_BACK_BUSY append never began (the seam is wrong):\n{out}")
+        self.assertIsNotNone(vanished, f"the batch's own claim was never let go:\n{out}")
+        tries = calls.read_text(encoding="utf-8").split() if calls.exists() else []
+        self.assertLess(vanished - lifted, 10.0, f"the batch's own claim stood {vanished - lifted:.1f} s after its reader let go: the stalled batch.log line held its release (release calls: {tries}):\n{out}")
+
+    def test_tail1_r7_a2_the_deadline_stop_starts_no_second_release_allowance_for_the_pending_claim(self) -> None:
+        # adversary pass 10 A2 on 3c51d262: a QUEUED give-back names the batch's own claim, no poll fits before the deadline (-ClaimPollSec 60), and the claim share stops answering (every Release-VenueClaim
+        # call stalls 30 s). The eager release after the request spent its bounded allowance, and the DEADLINE stop then started a SECOND fresh one before its typed result (also the input-guard refusal).
+        # Expected: one allowance for that claim; no release call starts after it; the run ends inside that one allowance (about 3.25 s) plus the turn's own work.
+        from datetime import datetime as _dt
+        import time
+        runner = self.give_back_busy_runner("gbd-", release_seam=True)
+        calls = self.case / "release-calls.log"
+        p = self.start_batch("QD", claim_poll=60, runner=runner, deadline_sec=40, SEAM_GIVE_BACK_BUSY="1", SEAM_RELEASE_CALLS=str(calls), SEAM_RELEASE_STALL_SEC="30")
+        p.wait(timeout=150)
+        ended = _dt.now(timezone.utc)
+        out = Path(p.out_path).read_text(encoding="utf-8", errors="replace")   # type: ignore[attr-defined]
+        self.assertIn("CLAIM_GIVE_BACK_BUSY", self.batch_log(p) + "\n" + out, f"the QUEUED give-back answer was not reached (the seam is wrong):\n{out}")
+        self.assertEqual(p.returncode, 3, f"the batch must end DEADLINE (exit 3):\n{out}")
+        starts = [_dt.fromisoformat(s.strip()[:26] + "+00:00") for s in calls.read_text(encoding="utf-8").splitlines() if s.strip()] if calls.exists() else []
+        self.assertTrue(starts, f"no release of the pending claim was started:\n{out}")
+        first = starts[0]
+        late = [round((s - first).total_seconds(), 2) for s in starts if (s - first).total_seconds() > 3.5]
+        self.assertEqual(late, [], f"a release call started after the first allowance was spent (a second fresh allowance): {late}\n{out}")
+        self.assertLess((ended - first).total_seconds(), 6.0, f"the run spent {(ended - first).total_seconds():.1f} s after the pending claim's first release call (two allowances):\n{out}")
+        self.assertIn("CLAIM_PENDING_RELEASE_NOT_RELEASED", out + "\n" + self.batch_log(p), out)
 
     def test_tail1_r6_adv_a3_an_unanswered_late_release_call_turns_suppression_on_even_when_the_probe_released(self) -> None:
         # r6 adversary A3 (+ its sibling, OPEN pass 2 A3 of r5): a full release call that never answered (the claim share stalled) left the write suppression OFF when the final probe then answered RELEASED, so
