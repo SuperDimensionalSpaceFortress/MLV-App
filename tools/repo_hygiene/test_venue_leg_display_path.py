@@ -420,7 +420,8 @@ function Get-CimInstance {
         'Win32_OperatingSystem' { return @([pscustomobject]@{ LastBootUpTime = [datetime]::Parse($script:fx.boot).ToLocalTime() }) }
         # DVE_PLAN, when set, is the plan name as CIM gives it (a string): the fixture's own ConvertFrom-Json would read a time-looking name as a [datetime]
         'Win32_PowerPlan' { return @([pscustomobject]@{ ElementName = $(if ($env:DVE_PLAN) { [string]$env:DVE_PLAN } else { $script:fx.plan }); IsActive = $true }) }
-        'Win32_QuickFixEngineering' { return @(1..[int]$script:fx.hotfixes | ForEach-Object { [pscustomobject]@{ HotFixID = "KB$_" } }) }
+        # SUCCESSOR-2 (pass-2 advisory A10): 1..0 is the two numbers 1 and 0 in PowerShell, so a zero-hotfix fixture gave two rows
+        'Win32_QuickFixEngineering' { $script:lastReadUtc = [datetime]::UtcNow; return @(if ([int]$script:fx.hotfixes -gt 0) { 1..[int]$script:fx.hotfixes | ForEach-Object { [pscustomobject]@{ HotFixID = "KB$_" } } }) }
     }
     @()
 }
@@ -428,15 +429,18 @@ function Get-ItemProperty {
     [CmdletBinding()] param([string]$LiteralPath, [string]$Path)
     $script:regCalls++
     if ($script:mode -eq 'fail' -or $script:mode -eq 'deny') { throw 'Requested registry access is not allowed' }
-    [pscustomobject]@{ CurrentBuild = '26100'; UBR = 4770 }
+    # SUCCESSOR-2 W5: DVE_UBR, when set, is the UBR the registry gives (a signed DWORD read back as an [int] can be negative)
+    [pscustomobject]@{ CurrentBuild = '26100'; UBR = $(if ($env:DVE_UBR) { [int]$env:DVE_UBR } else { 4770 }) }
 }
+$script:lastReadUtc = $null
 $sw = [Diagnostics.Stopwatch]::StartNew()
 $budget = if ($env:DVE_BUDGET) { [int]$env:DVE_BUDGET } else { 15 }
 $block = Get-DvDisplayPath -BudgetSec $budget
 $ms = $sw.ElapsedMilliseconds
 $roundTrip = ($block | ConvertTo-Json -Depth 8 -Compress) | ConvertFrom-Json
 $verdict = Test-DvDisplayPathBlock -Block $roundTrip
-[ordered]@{ block = $block; calls = @($script:calls.ToArray()); regCalls = $script:regCalls; elapsedMs = $ms; state = $verdict.state; problems = @($verdict.problems) } | ConvertTo-Json -Depth 12 -Compress
+$lastRead = $(if ($null -ne $script:lastReadUtc) { $script:lastReadUtc.ToString('o', [Globalization.CultureInfo]::InvariantCulture) } else { $null })
+[ordered]@{ block = $block; calls = @($script:calls.ToArray()); regCalls = $script:regCalls; elapsedMs = $ms; state = $verdict.state; problems = @($verdict.problems); lastReadUtc = $lastRead } | ConvertTo-Json -Depth 12 -Compress
 """
 
 BACHELOR_FIXTURE = {
@@ -450,10 +454,12 @@ BACHELOR_FIXTURE = {
 }
 
 
-def run_collector(mode: str = "ok", sleep_ms: int = 0, budget: int | None = None, fixture: dict | None = None, plan: str | None = None) -> dict:
+def run_collector(mode: str = "ok", sleep_ms: int = 0, budget: int | None = None, fixture: dict | None = None, plan: str | None = None, ubr: int | None = None) -> dict:
     env = {"DVE_MODE": mode, "DVE_SLEEP_MS": str(sleep_ms), "DVE_FIXTURE": json.dumps(fixture or BACHELOR_FIXTURE)}
     if plan is not None:
         env["DVE_PLAN"] = plan
+    if ubr is not None:
+        env["DVE_UBR"] = str(ubr)
     if budget is not None:
         env["DVE_BUDGET"] = str(budget)
     with tempfile.TemporaryDirectory(prefix="dv-displaypath-") as d:
@@ -857,9 +863,10 @@ class VenueLegReceiptTests(RunnerHarness, unittest.TestCase):
 @requires_windows_pwsh
 class SchemaAndDocsTests(unittest.TestCase):
     def test_the_receipt_skeleton_names_the_field(self) -> None:
+        # SUCCESSOR-2 W3 (pass-2 A4): a new receipt never says absent; until the probe answers its block is the typed unknown probe-not-run
         got = pwsh_json("$r = New-DvReceipt -Card 'c' -LegId 'l' -DeclaredVenue 'bachelor' -Role 'supplementary' -Actor 'a' -Method 'm' -MethodBlobId 'b' -Backend 'cuda' -LookFlavor $null\n"
                         "[ordered]@{ has = $r['venue'].Contains('displayPath'); value = $r['venue']['displayPath'] } | ConvertTo-Json -Compress")
-        self.assertEqual(got, {"has": True, "value": None})
+        self.assertEqual(got, {"has": True, "value": unknown("probe-not-run")})
 
     def test_the_evidence_doc_describes_every_field(self) -> None:
         doc = (ROOT / "docs" / "dual-venue-evidence.md").read_text(encoding="utf-8")
@@ -881,6 +888,174 @@ class SchemaAndDocsTests(unittest.TestCase):
     def test_the_sheet_pair_record_lists_the_block_as_unbound(self) -> None:
         text = (DV / "New-VenueSheetPair.ps1").read_text(encoding="utf-8")
         self.assertIn("'venue.displayPath'", text)
+
+
+# SUCCESSOR-2 W1 (pass-2 A2): the bounded wrapper reads its clock again after the wait. -Clock is any object with an .Elapsed [timespan]; this one returns the
+# DVE_CLOCK readings in order (the last one repeats), so a late completion and a budget spent before the worker starts are both exact, not a race.
+CLOCK_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+Import-Module '__MODULE__' -Force
+. ([scriptblock]::Create((Get-DvDisplayPathCollectorSource)))
+. $env:DVE_PRELUDE_FILE
+$stand = [ordered]@{ 'Get-CimInstance' = ${function:Get-CimInstance}.ToString(); 'Get-ItemProperty' = ${function:Get-ItemProperty}.ToString() }
+$global:dveReads = [System.Collections.Generic.Queue[double]]::new()
+foreach ($x in ($env:DVE_CLOCK -split ',')) { $global:dveReads.Enqueue([double]::Parse($x, [Globalization.CultureInfo]::InvariantCulture)) }
+$global:dveReadCount = 0
+$clock = [pscustomobject]@{}
+$clock | Add-Member -MemberType ScriptProperty -Name Elapsed -Value { $global:dveReadCount++; [timespan]::FromSeconds($(if ($global:dveReads.Count -gt 1) { $global:dveReads.Dequeue() } else { $global:dveReads.Peek() })) }
+$out = [ordered]@{}
+try { $out.block = Get-DvDisplayPathBounded -BudgetSec 15 -WorkerFunctions $stand -Clock $clock } catch { $out.threw = [string]$_.Exception.Message }
+$out.reads = $global:dveReadCount
+$out | ConvertTo-Json -Depth 12 -Compress
+"""
+
+
+def run_clocked(readings: str) -> dict:
+    with tempfile.TemporaryDirectory(prefix="dv-displaypath-clock-") as d:
+        script = Path(d) / "harness.ps1"
+        script.write_text(CLOCK_HARNESS.replace("__MODULE__", str(MODULE)), encoding="utf-8")
+        prelude = Path(d) / "prelude.ps1"
+        prelude.write_text(BOUNDED_PRELUDE, encoding="utf-8")
+        proc = run_pwsh(["-File", str(script)], env_extra={"DVE_CLOCK": readings, "DVE_PRELUDE_FILE": str(prelude), "DVE_BLOCK_AT": "", "DVE_BLOCK_MS": "0"})
+    try:
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise AssertionError(proc.stdout + proc.stderr)
+
+
+def dup_key_text(base: dict, path: list, key: str, first, second) -> str:
+    """JSON text of `base` where the object at `path` carries `key` twice: first `first`, then `second` (json.dumps cannot write a duplicate key)."""
+    marker = "__DVE_DUP_MARKER__"
+    node = base
+    for p in path:
+        node = node[p]
+    node[marker] = 0
+    text = json.dumps(base)
+    return text.replace(f'"{marker}": 0', f'"{key}": {json.dumps(first)}, "{key}": {json.dumps(second)}')
+
+
+@requires_windows_pwsh
+class Successor2Tests(unittest.TestCase):
+    def test_w1_a_result_that_lands_after_the_budget_is_budget_exceeded(self) -> None:
+        """pass-2 A2: the worker completes, but the caller reads its clock again after the wait and finds 15.3 s gone of a 15 s budget: the block is the typed unknown."""
+        got = run_clocked("0,0,15.3")
+        self.assertNotIn("threw", got, got)
+        self.assertEqual(got["block"], unknown("budget-exceeded"), got)
+
+    def test_w1_a_budget_spent_before_the_worker_starts_starts_nothing(self) -> None:
+        got = run_clocked("15.3")
+        self.assertNotIn("threw", got, got)
+        self.assertEqual(got["block"], unknown("budget-exceeded"), got)
+
+    def test_w1_a_result_inside_the_budget_is_the_block(self) -> None:
+        got = run_clocked("0,0,1.0")
+        self.assertNotIn("threw", got, got)
+        self.assertEqual(got["block"]["powerPlan"], "Balanced", got)
+
+    def test_w2_a_duplicate_key_in_the_block_is_malformed_in_the_receipt_text(self) -> None:
+        """pass-2 A3: ConvertFrom-Json keeps the last of two exact-name keys, so a doubled field read as one. Given the receipt's text, the validator refuses it."""
+        cases = {
+            "state twice": dup_key_text(receipt_with({}), ["venue", "displayPath"], "state", "present", "unknown").replace('"displayPath": {', '"displayPath": {"reason": "x", ', 1),
+            "sampledBefore twice": dup_key_text(receipt_with(good_block()), ["venue", "displayPath"], "sampledBefore", "during-measurement", SAMPLED_BEFORE),
+            "deep: an adapter field twice": dup_key_text(receipt_with(good_block()), ["venue", "displayPath", "adapters", 0], "driverVersion", "1", "2"),
+            "venue twice": dup_key_text({"schema": "mlv-app/dual-venue-receipt/v1", "outcome": "UNRESOLVED", "subject": {}}, [], "venue", [1], {}),
+            "displayPath twice": dup_key_text(receipt_with(None), ["venue"], "displayPath", 5, good_block()),
+        }
+        control = json.dumps(receipt_with(good_block()))
+        with tempfile.TemporaryDirectory(prefix="dv-displaypath-dup-") as d:
+            path = Path(d) / "texts.json"
+            path.write_text(json.dumps(dict(cases, control=control)), encoding="utf-8")
+            got = pwsh_json("$in = [IO.File]::ReadAllText($env:DVE_TEXTS_FILE) | ConvertFrom-Json -AsHashtable\n$out = [ordered]@{}\n"
+                            "foreach ($k in @($in.Keys)) { try { $r = $in[$k] | ConvertFrom-Json; $v = Test-DvReceiptValid -Receipt $r -ReceiptText $in[$k]\n"
+                            "  $out[$k] = [ordered]@{ valid = $v.valid; displayPath = $v.displayPath; reasons = @($v.reasons) } } catch { $out[$k] = [ordered]@{ threw = [string]$_.Exception.Message } } }\n"
+                            "$out | ConvertTo-Json -Compress -Depth 5", {"DVE_TEXTS_FILE": str(path)})
+        for label in cases:
+            with self.subTest(label):
+                self.assertEqual((got[label].get("valid"), got[label].get("displayPath")), (False, "malformed"), got[label])
+                self.assertTrue(any("duplicate" in r for r in got[label]["reasons"]), got[label])
+        self.assertEqual((got["control"]["valid"], got["control"]["displayPath"]), (True, "present"), got["control"])
+
+    def test_w2_a_duplicate_key_in_the_probe_line_is_a_malformed_probe_block(self) -> None:
+        dup_state = dup_key_text(dict(HEALTHY_PROBE, displayPath={}), ["displayPath"], "state", "present", "unknown").replace('"displayPath": {', '"displayPath": {"reason": "x", ', 1)
+        dup_deep = dup_key_text(dict(HEALTHY_PROBE, displayPath=good_block()), ["displayPath", "os"], "ubr", 1, 2)
+        dup_root = dup_key_text(dict(HEALTHY_PROBE), [], "displayPath", 5, good_block())
+        good = json.dumps(dict(HEALTHY_PROBE, displayPath=good_block()))
+        got = pwsh_json("$in = $env:DVE_LINES | ConvertFrom-Json -AsHashtable\n$out = [ordered]@{}\n"
+                        "foreach ($k in @($in.Keys)) { $p = ConvertFrom-DvProbeStdout (\"noise`r`nDVE_PROBE=\" + $in[$k] + \"`r`n\"); $out[$k] = ConvertTo-DvDisplayPath -Probe $p }\n"
+                        "$out | ConvertTo-Json -Compress -Depth 10",
+                        {"DVE_LINES": json.dumps({"state": dup_state, "deep": dup_deep, "root": dup_root, "good": good})})
+        for label in ("state", "deep", "root"):
+            with self.subTest(label):
+                self.assertEqual(got[label], unknown("probe-block-malformed"), got[label])
+        self.assertEqual(got["good"]["powerPlan"], "Balanced", got["good"])
+
+    def test_w4_collected_utc_is_not_before_the_last_read_returned(self) -> None:
+        """pass-2 A5: collectedUtc was stamped before the first read, so a mode that changed during the reads was dated to a time it did not yet exist."""
+        got = run_collector(sleep_ms=700)
+        from datetime import datetime, timezone
+        stamp = datetime.strptime(got["block"]["collectedUtc"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        last = datetime.fromisoformat(got["lastReadUtc"][:26].rstrip("Z")).replace(tzinfo=timezone.utc)
+        self.assertGreaterEqual(stamp, last, got)
+        self.assertEqual(got["state"], "present", got)
+
+    def test_w5_a_negative_number_from_the_provider_is_that_leafs_typed_unknown_and_the_block_survives(self) -> None:
+        """pass-2 A6: UBR=-1 (and a refresh rate of -1) was emitted as data; the validator then refused it and the runner dropped the whole block."""
+        video = [dict(BACHELOR_FIXTURE["video"][0], CurrentRefreshRate=-1), BACHELOR_FIXTURE["video"][1]]
+        got = run_collector(fixture=dict(BACHELOR_FIXTURE, video=video), ubr=-1)
+        block = got["block"]
+        self.assertEqual(block["os"]["ubr"], unknown("out-of-range"), block)
+        self.assertEqual(block["activeDisplays"][0]["refreshHz"], unknown("out-of-range"), block)
+        self.assertEqual(block["activeDisplays"][0]["horizontalResolution"], 3840, block)
+        self.assertEqual(block["os"]["build"], "26100", block)
+        self.assertEqual(got["state"], "present", got)
+        normalised = pwsh_json("$p = $env:DVE_PROBE | ConvertFrom-Json\nConvertTo-DvDisplayPath -Probe $p | ConvertTo-Json -Depth 10 -Compress",
+                               {"DVE_PROBE": json.dumps(dict(HEALTHY_PROBE, displayPath=block))})
+        self.assertEqual(normalised["powerPlan"], "Balanced", normalised)
+
+    def test_advisory_a10_a_zero_hotfix_fixture_has_no_hotfix(self) -> None:
+        got = run_collector(fixture=dict(BACHELOR_FIXTURE, hotfixes=0))
+        self.assertEqual(got["block"]["os"]["hotfixCount"], 0, got)
+
+    def test_w6_a_proof_io_failure_does_not_hide_the_display_path_verdict(self) -> None:
+        """pass-2 A7: the core validator's proof I/O threw before the displayPath check ran, so a malformed block surfaced as a sharing exception (or, in the writer,
+        DVE_EVIDENCE_VALIDATION_IO). The block is judged first; a malformed one is INVALID with its own reason and the I/O failure beside it. A good block keeps the throw."""
+        script = ("& (Get-Module DualVenueRunner) { function script:Test-DvReceiptValidCore { param($Receipt, $RepoRoot, $EvidenceDir, [switch]$AllowOfflineTestMode, $OfflineLegSpecBytes)\n"
+                  "  throw \"Exception calling ReadAllBytes: The process cannot access the file 'C:\\x\\summary.json' because it is being used by another process.\" } }\n"
+                  "$out = [ordered]@{}\n"
+                  "foreach ($k in 'bad', 'good') { $r = $(if ($k -eq 'bad') { $env:DVE_BAD } else { $env:DVE_GOOD }) | ConvertFrom-Json\n"
+                  "  try { $v = Test-DvReceiptValid -Receipt $r; $out[$k] = [ordered]@{ status = $v.status; valid = $v.valid; displayPath = $v.displayPath; reasons = @($v.reasons) } }\n"
+                  "  catch { $out[$k] = [ordered]@{ threw = [string]$_.Exception.Message } } }\n"
+                  "$out | ConvertTo-Json -Compress -Depth 5")
+        got = pwsh_json(script, {"DVE_BAD": json.dumps(receipt_with(5, outcome="PASS")), "DVE_GOOD": json.dumps(receipt_with(good_block(), outcome="PASS"))})
+        bad = got["bad"]
+        self.assertNotIn("threw", bad, bad)
+        self.assertEqual((bad["status"], bad["valid"], bad["displayPath"]), ("INVALID", False, "malformed"), bad)
+        self.assertTrue(bad["reasons"][0].startswith("DISPLAY_PATH_MALFORMED"), bad)
+        self.assertTrue(any(r.startswith("EVIDENCE_VALIDATION_IO") for r in bad["reasons"]), bad)
+        self.assertIn("threw", got["good"], got["good"])
+
+
+@requires_windows_pwsh
+class Successor2VenueLegTests(RunnerHarness, unittest.TestCase):
+    """SUCCESSOR-2 W3 (pass-2 A4): a probe that printed no DVE_PROBE line, or never returned, leaves the typed unknown on the receipt, never absent."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+
+    def test_w3_a_probe_with_no_dve_probe_line_is_typed_unknown_not_absent(self) -> None:
+        self.um.write_text(STUB_UM_RUN.replace("return [pscustomobject]@{ exitCode = 0; stdout = ('DVE_PROBE=' + ($cfg.probe | ConvertTo-Json -Compress)) }",
+                                               "return [pscustomobject]@{ exitCode = 1; stdout = '' }"), encoding="utf-8")
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), probe=dict(HEALTHY_PROBE))
+        self.assertEqual(receipt["outcome"], "VENUE_UNHEALTHY", receipt)
+        self.assertEqual(receipt["venue"]["displayPath"], unknown("probe-did-not-report"), receipt["venue"])
+
+    def test_w3_a_probe_that_never_returned_is_typed_unknown_not_absent(self) -> None:
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), probe=dict(HEALTHY_PROBE), health_mode="unresolved")
+        self.assertEqual(receipt["venue"]["displayPath"], unknown("probe-did-not-report"), receipt["venue"])
+
+    def test_w3_a_leg_refused_before_the_probe_says_probe_not_run(self) -> None:
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), probe=dict(HEALTHY_PROBE), gen_refusal="PLAYBACK_ATTR3_OWNER_NOT_CONSENTED the table has no such clip")
+        self.assertEqual(receipt["venue"]["displayPath"], unknown("probe-not-run"), receipt["venue"])
 
 
 if __name__ == "__main__":
