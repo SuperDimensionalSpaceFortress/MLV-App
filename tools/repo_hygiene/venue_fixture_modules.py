@@ -22,7 +22,12 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 from pathlib import Path
+
+# every spawn below carries the hidden-window flag (MLV-LANE-CONSOLE-HIDDEN-1: tools/repo_hygiene/test_hidden_spawn_flags.py scans this module): no_window_flags ORs
+# CREATE_NO_WINDOW into a flag the caller already passes (CREATE_NEW_PROCESS_GROUP) instead of replacing it, as runtime_floor_suites does.
+from .hidden_spawn import no_window_flags
 
 # each cleanup step after a timeout is bounded too: the tree kill, the root's reap, and the read of what the pipes still hold
 TREE_KILL_BOUND_SEC = 30.0
@@ -35,7 +40,8 @@ def kill_tree(proc: subprocess.Popen) -> str:
     problems: list[str] = []
     if os.name == "nt":
         try:
-            tk = subprocess.Popen(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            tk = subprocess.Popen(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  creationflags=no_window_flags())
             try:
                 # r8 adversary A7 (1564db75): a non-zero taskkill (access denied, a root already gone) is a tree kill NOT confirmed, never a clean note
                 code = tk.wait(timeout=TREE_KILL_BOUND_SEC)
@@ -83,8 +89,10 @@ def communicate_tree_bounded(proc: subprocess.Popen, timeout: float, input: obje
         raise expired from None
 
 
-class DrainedPopen(subprocess.Popen):
-    """subprocess.Popen whose PIPE streams are read from the moment it starts, each on a daemon thread, so a child that writes more than a pipe holds (about 4 KB on Windows)
+class DrainedPopen:
+    """A subprocess.Popen (held, not subclassed: test_hidden_spawn_flags REPORTS a spawn API as a base class, where its calls cannot be followed; every attribute not defined
+    here is the held Popen's, so pid, args, stdin, stdout, returncode, poll, wait, kill, send_signal and the `with` form read as they do on a Popen) whose PIPE streams are read
+    from the moment it starts, each on a daemon thread, so a child that writes more than a pipe holds (about 4 KB on Windows)
     never blocks on a write while the test waits on its progress (a batch.log line, a probe call) before it calls communicate().
 
     r8 (test_artifact_preflight_r5_l05_...: 9.8 s alone, 300 s under load in the r8 timing run): the runner wrote 6402 bytes to an undrained stdout pipe before and after the
@@ -93,18 +101,38 @@ class DrainedPopen(subprocess.Popen):
     grandchild that still holds a pipe is not waited for), and returns what was read; a second call after a timeout returns the rest."""
 
     def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+        self._proc = subprocess.Popen(*args, creationflags=no_window_flags(kwargs.pop("creationflags", 0)), **kwargs)
         self._drain_bufs: dict[str, list] = {}
         self._drain_threads: list = []
-        import threading
         for name in ("stdout", "stderr"):
-            stream = getattr(self, name)
+            stream = getattr(self._proc, name)
             if stream is not None:
                 buf: list = []
                 self._drain_bufs[name] = buf
                 t = threading.Thread(target=self._drain, args=(stream, buf), daemon=True)
                 t.start()
                 self._drain_threads.append(t)
+
+    def __getattr__(self, name: str):
+        # only reached for a name this class does not define; `_proc` itself is never forwarded (an instance whose Popen did not start would recurse)
+        if name == "_proc":
+            raise AttributeError(name)
+        return getattr(self._proc, name)
+
+    def __enter__(self) -> "DrainedPopen":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        # Popen.__exit__ minus the pipe closes the drain threads own: close stdin, wait for the child
+        if self._proc.stdin is not None:
+            try:
+                self._proc.stdin.close()
+            except OSError:
+                pass
+        self._proc.wait()
+
+    def __repr__(self) -> str:
+        return f"DrainedPopen({self._proc!r})"
 
     @staticmethod
     def _drain(stream, buf: list) -> None:
@@ -129,17 +157,17 @@ class DrainedPopen(subprocess.Popen):
             if buf is None:
                 return None
             parts = list(buf)
-            return (type(parts[0])() if parts else ("" if self.text_mode else b"")).join(parts)
+            return (type(parts[0])() if parts else ("" if self._proc.text_mode else b"")).join(parts)
         return joined("stdout"), joined("stderr")
 
     def communicate(self, input=None, timeout=None):   # noqa: A002 (Popen's own parameter name)
-        if input is not None and self.stdin is not None:
+        if input is not None and self._proc.stdin is not None:
             try:
-                self.stdin.write(input)
-                self.stdin.close()
+                self._proc.stdin.write(input)
+                self._proc.stdin.close()
             except (BrokenPipeError, OSError, ValueError):
                 pass
-        self.wait(timeout=timeout)
+        self._proc.wait(timeout=timeout)
         for t in self._drain_threads:
             t.join(TREE_COLLECT_BOUND_SEC)
         return self.drained_output()
@@ -150,7 +178,8 @@ def run_tree_bounded(*popenargs, input: object = None, capture_output: bool = Fa
     subprocess.TimeoutExpired is raised within about timeout + 2 x TREE_KILL_BOUND_SEC + TREE_COLLECT_BOUND_SEC. With no timeout, or off Windows (POSIX run() reads
     the pipes itself and only waits for the killed root), it IS subprocess.run."""
     if timeout is None or os.name != "nt":
-        return subprocess.run(*popenargs, input=input, capture_output=capture_output, timeout=timeout, check=check, **kwargs)
+        return subprocess.run(*popenargs, input=input, capture_output=capture_output, timeout=timeout, check=check,
+                              creationflags=no_window_flags(kwargs.pop("creationflags", 0)), **kwargs)
     if input is not None:
         if kwargs.get("stdin") is not None:
             raise ValueError("stdin and input arguments may not both be used.")
@@ -160,7 +189,7 @@ def run_tree_bounded(*popenargs, input: object = None, capture_output: bool = Fa
             raise ValueError("stdout and stderr arguments may not be used with capture_output.")
         kwargs["stdout"] = subprocess.PIPE
         kwargs["stderr"] = subprocess.PIPE
-    proc = subprocess.Popen(*popenargs, **kwargs)
+    proc = subprocess.Popen(*popenargs, creationflags=no_window_flags(kwargs.pop("creationflags", 0)), **kwargs)
     try:
         out, err = communicate_tree_bounded(proc, timeout, input)
     except subprocess.TimeoutExpired:
