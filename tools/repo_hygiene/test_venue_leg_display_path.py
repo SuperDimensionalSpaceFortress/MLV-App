@@ -169,7 +169,8 @@ COLLECTOR_HARNESS = r"""
 $ErrorActionPreference = 'Stop'
 Import-Module '__MODULE__' -Force
 . ([scriptblock]::Create((Get-DvDisplayPathCollectorSource)))
-$script:calls = New-Object System.Collections.Generic.List[object]
+# ::new(), never New-Object: on PowerShell 7.6 a List[object] made by New-Object throws "Argument types do not match" under @($list), and the final report below wraps it that way
+$script:calls = [System.Collections.Generic.List[object]]::new()
 $script:mode = $env:DVE_MODE
 $script:sleepMs = [int]$env:DVE_SLEEP_MS
 $script:fx = $env:DVE_FIXTURE | ConvertFrom-Json
@@ -320,7 +321,9 @@ class CollectorChangesNothingTests(unittest.TestCase):
         verbs = sorted({m.group(0) for m in self.WRITE_VERBS.finditer(code)})
         self.assertEqual(verbs, [], f"the display-path collector must be read-only; found {verbs}")
         self.assertNotRegex(code, r"(?i)powercfg|setactive|\bsc\.exe|netsh|reg\s+(add|delete)|bcdedit|wmic|Invoke-CimMethod|Set-CimInstance|Start-Process")
-        called = sorted(set(re.findall(r"\b(Get-[A-Za-z]+)\b", code)))
+        # the commands it CALLS: the collector's own `function Get-DvDisplayPath` declaration names it, it is not a call, so drop declarations before looking
+        calls_only = re.sub(r"(?im)^\s*function\s+[A-Za-z][\w-]*", "", code)
+        called = sorted(set(re.findall(r"\b(Get-[A-Za-z]+)\b", calls_only)))
         self.assertEqual(called, ["Get-CimInstance", "Get-ItemProperty"], called)
 
     def test_the_source_parses_clean(self) -> None:
