@@ -6663,6 +6663,8 @@ if ($env:DVT_SWAP_TO -and -not (Test-Path -LiteralPath $env:DVT_SWAP_DONE) -and 
 }
 "QUIET mean=5.0% threshold=$ThresholdPercent% waitedSec=1"; exit 0
 """
+    # r3 fix 2 (adversary pass 3 A2): DVT_QUIET_SLEEP_UNTIL holds the UNDER-CLAIM probe (-MaxWaitSec 0) until that instant, so it ends after the chain's -DeadlineUtc
+    CHAIN_FAKE_QUIET = CHAIN_FAKE_QUIET.replace('"QUIET mean=5.0%', "if ($MaxWaitSec -eq 0 -and $env:DVT_QUIET_SLEEP_UNTIL) { $u = [DateTimeOffset]::Parse($env:DVT_QUIET_SLEEP_UNTIL, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime; while ([DateTime]::UtcNow -lt $u) { Start-Sleep -Milliseconds 200 } }\n\"QUIET mean=5.0%", 1)
 
     # Invoke-VenueLeg stand-in with the real leg's -ExpectSpecSha256 contract (Invoke-VenueLeg.ps1: the RAW bytes' sha256; on a mismatch the anchored STDOUT record
     # `DVE_LEG_SPEC_REFUSED planned_sha256=<p> read_sha256=<r>`, then the DVE_LEG_SPEC_CHANGED throw, before anything is generated; pinned against the real leg's text below).
@@ -6704,9 +6706,9 @@ exit 0
             env.update({"DVT_SWAP_TO": str(target), "DVT_SWAP_FROM": str(source or target), "DVT_SWAP_MODE": mode, "DVT_SWAP_VENUE": venue})
         return {"quiet": quiet, "leg": leg, "env": env}
 
-    def run_fixture_chain(self, dv: Path, fx: dict, legs: list[str], *extra: str, sha: str | None = None) -> subprocess.CompletedProcess:
+    def run_fixture_chain(self, dv: Path, fx: dict, legs: list[str], *extra: str, sha: str | None = None, deadline: str | None = None) -> subprocess.CompletedProcess:
         from datetime import datetime, timedelta, timezone
-        deadline = (datetime.now(timezone.utc) + timedelta(seconds=300)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        deadline = deadline or (datetime.now(timezone.utc) + timedelta(seconds=300)).strftime("%Y-%m-%dT%H:%M:%SZ")
         self.chain_run = self.tmp / "chain-run"
         return run_pwsh(["-File", str(dv / "Invoke-VenueChain.ps1"), "-Venue", "bachelor", *legs, "-RunDir", str(self.chain_run), "-SourceCommit", sha or self.sha,
                          "-BuildManifestSha256", self.build_sha, "-ClaimDir", str(self.tmp / "claims"), "-QuietScript", str(fx["quiet"]), "-LegScript", str(fx["leg"]),
@@ -7059,6 +7061,52 @@ exit 0
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         bound = [l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ")]
         self.assertEqual(bound, [f"DVT_PLANNED spec=A.json bound={fsha} own={fsha}", f"DVT_PLANNED spec=a.json bound={wsha} own={wsha}"], proc.stdout + proc.stderr)
+
+    # r3 fix 2 (adversary pass 3 on 3482fc82, A1): with ordinal keys, ONE file reached by two spellings (Pace.json, pace.json on a case-insensitive volume) is two keys, so
+    # bytes rewritten between the two entries' preflights passed the per-string check and were found only by the guard's re-read AFTER the claim. The fixture rewrites the file
+    # in place as the second spelling's preflight starts; the stop fixture sits after the identity check, where the claim would be taken next.
+    BATCH_SPELL_ANCHOR = "    foreach ($ref in $LegSpec) {\n        $path = Resolve-LegSpecPath $ref ''\n"
+    BATCH_SPELL_SWAP = ("    foreach ($ref in $LegSpec) {\n        if ($env:DVT_SPELL_SWAP -and [string]::Equals([IO.Path]::GetFileName($ref), 'pace.json', [StringComparison]::Ordinal)) { [IO.File]::Copy($env:DVT_SPELL_SWAP, $ref, $true) }   # TEST FIXTURE\n"
+                        "        $path = Resolve-LegSpecPath $ref ''\n")
+    BATCH_PRECLAIM_ANCHOR = "if ($LegSet) { $hit = Get-InputOutputRefusal; if ($hit) { Stop-InputIsOutput $hit } }\n"
+    BATCH_PRECLAIM_STOP = ("foreach ($pl in $plan) { \"DVT_PLANNED spec=$([IO.Path]::GetFileName([string]$pl.spec)) own=$([string]$pl.specSha256)\" }; exit 0   # TEST FIXTURE\n"
+                           + BATCH_PRECLAIM_ANCHOR)
+
+    def test_planned_hash_bind_r3_fix2_a1_batch_one_file_under_two_spellings_judged_as_two_specs_is_refused_before_any_claim(self) -> None:
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.BATCH_SPELL_ANCHOR, self.BATCH_SPELL_SWAP),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_PRECLAIM_ANCHOR, self.BATCH_PRECLAIM_STOP)])
+        spell_dir = self.tmp / "spell"
+        spell_dir.mkdir()
+        upper = spell_dir / "Pace.json"
+        shutil.copyfile(dv / "legs" / self.SWAP_FIRST, upper)
+        rewrite = self.tmp / "rewrite-bytes.json"
+        shutil.copyfile(dv / "legs" / self.SWAP_TARGET, rewrite)
+        lower = spell_dir / "pace.json"
+        self.assertTrue(lower.exists(), "this volume folds case: pace.json is Pace.json")
+        fsha, wsha = hashlib.sha256(upper.read_bytes()).hexdigest(), hashlib.sha256(rewrite.read_bytes()).hexdigest()
+        proc = self.run_case_batch(dv, [upper, lower], {"DVT_SPELL_SWAP": str(rewrite)})
+        self.assertEqual(hashlib.sha256(upper.read_bytes()).hexdigest(), wsha, "the fixture really rewrote the one file between the two preflights")
+        self.assertEqual([l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ")], [],
+                         f"the batch reached the claim with one file judged as {fsha} and {wsha} (old: two DVT_PLANNED lines, exit 0)\n" + proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        refusal = [l for l in proc.stderr.splitlines() if l.startswith("BATCH_USAGE SPEC_CHANGED_AFTER_PREFLIGHT ")]
+        self.assertEqual(len(refusal), 1, proc.stderr)
+        self.assertIn(f"is the same file as '{upper}', which was judged as sha256 {fsha}, but this entry's preflight judged sha256 {wsha}", refusal[0])
+        self.assertFalse((self.tmp / "claims").exists() and any((self.tmp / "claims").iterdir()), "no claim is taken")
+
+    def test_planned_hash_bind_r3_fix2_a2_chain_launches_no_leg_once_the_deadline_passed_under_the_claim(self) -> None:
+        """A2: the under-claim probe (or a transcript write after it) can end past -DeadlineUtc; the leg was launched with no recheck. It is NOT_RUN DEADLINE, exit 3, no child."""
+        from datetime import datetime, timedelta, timezone
+        dv = self.mutated_runner([])
+        fx = self.chain_fixture(dv, None, None)
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=45)
+        fx["env"]["DVT_QUIET_SLEEP_UNTIL"] = (deadline + timedelta(seconds=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        proc = self.run_fixture_chain(dv, fx, ["-LegSpec", str(dv / "legs" / self.SWAP_FIRST), "-Backend", "cuda", "-NoSupplementary"],
+                                      deadline=deadline.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        self.assertEqual(self.fixture_legs(), [], "a leg child was launched after -DeadlineUtc\n" + proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+        result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
+        self.assertEqual([(r["status"], r["verdict"], r["reason"]) for r in result["legs"]], [("NOT_RUN", "DEADLINE", "deadline-at-leg-launch")], result["legs"])
 
 
 # ---------------------------------------------------------------------------------------------------

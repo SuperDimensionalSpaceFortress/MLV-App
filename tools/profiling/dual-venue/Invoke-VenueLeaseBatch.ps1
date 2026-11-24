@@ -1761,6 +1761,20 @@ foreach ($g in $script:guardedInputs) {
         Stop-InputIsOutput ([pscustomobject]@{ kind = 'unresolved'; input = $g.kind; item = $g.item; code = $code; path = $g.path; why = "$label '$($g.path)' could not be identified as it was accepted (no destination could be compared with it)" })
     }
 }
+# DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r3 fix 2 (adversary pass 3 A1): the digest tables are keyed by the path STRING (ordinal, so two files on a case-sensitive directory stay
+# two), and the check after the plan compares each entry with its own string's binding. The same FILE reached by two spellings (Pace.json and pace.json on a case-insensitive
+# volume, or a hard link) is two strings, so it is compared HERE by the file identity just accepted: every entry naming one file must have been judged as the same bytes, before
+# any claim or lease (the guard's re-read after the claim would only find it once the claim was taken).
+$specByFile = [Collections.Hashtable]::new([StringComparer]::Ordinal)
+foreach ($g in @($script:guardedInputs | Where-Object { $_.kind -ceq 'spec' })) {
+    $fileKey = [string]$g.accepted.key
+    if (-not $specByFile.ContainsKey($fileKey)) { $specByFile[$fileKey] = $g; continue }
+    $firstSpec = $specByFile[$fileKey]
+    if ([string]$firstSpec.specSha256 -cne [string]$g.specSha256) {
+        $msg = "'$($g.path)' cannot be run: it is the same file as '$($firstSpec.path)', which was judged as sha256 $($firstSpec.specSha256), but this entry's preflight judged sha256 $($g.specSha256) (planned_sha256=$($firstSpec.specSha256)); no claim or lease is taken on one file judged as two specs"
+        if ($legPlanMode) { Stop-PlanRefused 'SPEC_CHANGED_AFTER_PREFLIGHT' $g.item $msg } else { Stop-Usage "SPEC_CHANGED_AFTER_PREFLIGHT $msg" }
+    }
+}
 if ($LegSet) { $hit = Get-InputOutputRefusal; if ($hit) { Stop-InputIsOutput $hit } }
 # r5 (sol r4 B1, key3 H-B): -RunDir's physical path and file identity as the preflight found them, read ONCE here, before any claim. A guard that gave up on a location read
 # (locationUnknown) may have given up on -RunDir itself, so Test-OpenOutputAlias then never reads -RunDir again unbounded (a stalled UNC or junction would hold it). r7 (sol r6 B2):

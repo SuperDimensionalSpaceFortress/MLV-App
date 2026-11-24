@@ -218,6 +218,29 @@ function Get-LegSpecRefusalLine([string[]]$StdoutLines, [object]$Leg) {
     ''
 }
 
+$script:EvidenceWriteBoundMs = 2000
+function Write-ChainEvidence([string]$Path, [string[]]$Lines) {
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r3 fix 2 (adversary pass 3 A2): a child's transcript is evidence only, so its write never holds the chain: it runs on a pool thread
+    # and is waited for at most $script:EvidenceWriteBoundMs (a -RunDir share that stops answering delays neither a probe's answer, the leg's launch nor the claim's release by more).
+    # 'OK' | 'FAILED <why>' | 'TIMEOUT' (the write may still land later; nothing reads it back).
+    if (-not ('VenueChainEvidenceWrite' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+public static class VenueChainEvidenceWrite {
+    public static int WriteWithin(string path, string[] lines, int timeoutMs, out string error) {
+        error = null;
+        System.Threading.Tasks.Task t = System.Threading.Tasks.Task.Run(() => System.IO.File.WriteAllLines(path, lines));
+        try { if (!t.Wait(timeoutMs)) { return 2; } } catch (AggregateException e) { error = e.InnerException != null ? e.InnerException.Message : e.Message; return 1; }
+        return 0;
+    }
+}
+'@
+    }
+    $we = $null
+    $rc = try { [VenueChainEvidenceWrite]::WriteWithin($Path, [string[]]@($Lines), $script:EvidenceWriteBoundMs, [ref]$we) } catch { $we = $_.Exception.Message; 1 }
+    @('OK', "FAILED $($we -replace '\s+', ' ')", 'TIMEOUT')[$rc]
+}
+
 $results = [System.Collections.Generic.List[object]]::new()
 $exitCode = 0
 $stopReason = $null
@@ -256,8 +279,9 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec, [str
     # file is shared by every chain on this -RunDir (two venues' chains name a leg alike), so it is written after the probe as evidence only and never read back.
     $qRaw = @(& $pwshExe @qArgs 2>&1)
     $code = $LASTEXITCODE
-    $lines = @($qRaw | ForEach-Object { [string]$_ })
-    try { [IO.File]::WriteAllLines($out, [string[]]$lines) } catch { $null = $_ }   # evidence only: a file that cannot be written never changes the verdict read above
+    # r3 fix 2 (adversary pass 3 A6): the verdict is the probe's STDOUT (Wait-VenueQuiet's Write-Gate); a stderr line is in the transcript and decides nothing
+    $lines = @($qRaw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { [string]$_ })
+    $null = Write-ChainEvidence $out @($qRaw | ForEach-Object { [string]$_ })   # evidence only, bounded (r3 fix 2, A2): a file that cannot be written, or a share that stalls, never changes or delays the verdict
     $v = $lines | Where-Object { $_ -match '^(QUIET|COOLDOWN_UNMET) mean=' } | Select-Object -Last 1
     $u = $lines | Where-Object { $_ -like 'VENUE_QUIET_UNKNOWN *' } | Select-Object -Last 1
     $ff = $lines | Where-Object { $_ -match '^FOREIGN_FLOOR ' } | Select-Object -Last 1   # BACHELOR-VENUE-FOREIGN-FLOOR-FAST-FAIL-1 r3: the early-exit marker survives into the leg class
@@ -556,7 +580,9 @@ foreach ($leg in $plan) {
                 $exitCode = 6; if ($OnUnknown -ceq 'Stop') { $stopReason = 'VENUE_QUIET_UNKNOWN' }
                 break
             }
-            # (e) the leg
+            # (e) the leg. r3 fix 2 (adversary pass 3 A2): the under-claim probe can end after -DeadlineUtc (it, or anything after it, can stall), so the deadline is asked
+            # again at the launch itself: no leg starts past it.
+            if ([DateTime]::UtcNow -ge $deadline) { $stopReason = 'DEADLINE'; $exitCode = 3; Add-Result $leg 'NOT_RUN' @{ verdict = 'DEADLINE'; reason = 'deadline-at-leg-launch' }; L "LEG $($leg.name) NOT_RUN DEADLINE reason=deadline-at-leg-launch (the under-claim probe ended after -DeadlineUtc)"; break }
             $out = Join-Path $RunDir "leg-$($leg.name).out.txt"
             $lArgs = @('-NoProfile', '-NonInteractive', '-File', $LegScript, '-Venue', $Venue, '-LegSpec', $leg.spec, '-SourceCommit', $SourceCommit, '-BuildManifestSha256', $BuildManifestSha256)
             if ($leg.backend) { $lArgs += @('-Backend', $leg.backend) }
@@ -571,8 +597,8 @@ foreach ($leg in $plan) {
             $legRaw = @(& $pwshExe @lArgs 2>&1)
             $legCode = $LASTEXITCODE
             $legLines = @($legRaw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { [string]$_ })
-            try { [IO.File]::WriteAllLines($out, [string[]]@($legRaw | ForEach-Object { [string]$_ })) }
-            catch { $ow = "LEG_OUT_WRITE_FAILED leg=$($leg.name) path=$out ($($_.Exception.Message -replace '\s+', ' ')) (evidence only: the leg is classified from its own captured output)"; try { L $ow } catch { [Console]::Error.WriteLine($ow) } }
+            $ow = Write-ChainEvidence $out @($legRaw | ForEach-Object { [string]$_ })   # bounded (r3 fix 2, A2): never holds the claim's release
+            if ($ow -cne 'OK') { $ow = "LEG_OUT_WRITE_$ow leg=$($leg.name) path=$out (evidence only: the leg is classified from its own captured output)"; try { L $ow } catch { [Console]::Error.WriteLine($ow) } }
             $o = $legLines | Where-Object { $_ -match '^DVE_OUTCOME=(\S+)' } | Select-Object -Last 1
             $outcome = $(if ($o -and $o -match '^DVE_OUTCOME=(\S+)') { $Matches[1] } else { 'NONE' })
             $p = $legLines | Where-Object { $_ -match '^DVE_RECEIPT_PATH=(.+)$' } | Select-Object -Last 1
