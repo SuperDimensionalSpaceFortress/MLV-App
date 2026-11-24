@@ -167,26 +167,55 @@ if ($null -ne $setPlan) {
     foreach ($entry in $setPlan.plan) {
         $childArgs = @('-NoProfile', '-File', $PSCommandPath, '-Venue', $Venue, '-LegSpec', $entry.specPath, '-SourceCommit', $SourceCommit,
             '-BuildManifestSha256', $BuildManifestSha256, '-Backend', $entry.backend, '-ReceiptRoot', $ReceiptRoot, '-Actor', $Actor)
+        # r7 (sol r6 INV-3): the child runs the bytes the PLANNER approved or nothing. The planned sha256 of the spec (Get-DvLegSetPlan) is passed as -ExpectSpecSha256, so a path whose bytes
+        # changed between the plan and the child's read (a committed visual twin swapped in) is refused DVE_LEG_SPEC_CHANGED before anything is generated, submitted or receipted.
+        $childArgs += @('-ExpectSpecSha256', [string]$entry.specSha256)
         if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir)) { $childArgs += @('-SheetCopyDir', $SheetCopyDir) }
         if ($OfflineTestMode) { $childArgs += '-OfflineTestMode' }
         foreach ($seam in 'ConsentPath', 'VenueTablePath', 'RepoRoot', 'WorkDir', 'UmRunScript', 'GeneratorScript') {
             if ($PSBoundParameters.ContainsKey($seam)) { $childArgs += @("-$seam", [string](Get-Variable -Name $seam -ValueOnly)) }
         }
-        $childOut = @(& $pwshExe @childArgs 2>&1 | ForEach-Object { [string]$_ })
+        # r7 (adversary r7 A2): a child that refuses (DVE_LEG_SPEC_CHANGED) exits non-zero BY DESIGN and its refusal is a row, so this walk must not inherit a caller's
+        # $PSNativeCommandUseErrorActionPreference = $true (with the Stop preference above it would turn that exit into a terminating error and end the walk before the typed row and the summary)
+        $PSNativeCommandUseErrorActionPreference = $false
+        $childRaw = @(& $pwshExe @childArgs 2>&1)
+        $childOut = @($childRaw | ForEach-Object { [string]$_ })
+        # r10 (adversary r10 A3): a refusal is the child's own STDOUT record; a stderr line (an ErrorRecord here, e.g. from a generator) never classifies one
+        $childStdout = @($childRaw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { [string]$_ })
         $receiptPath = $null
-        foreach ($childLine in $childOut) { if ($childLine -match '^DVE_RECEIPT_PATH=(?<p>.+)$') { $receiptPath = $Matches['p'].Trim() } }
+        foreach ($childLine in $childStdout) { if ($childLine -match '^DVE_RECEIPT_PATH=(?<p>.+)$') { $receiptPath = $Matches['p'].Trim() } }
         $legReceipt = $null
         if ($receiptPath -and (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
             try { $legReceipt = [IO.File]::ReadAllText($receiptPath) | ConvertFrom-Json } catch { $legReceipt = $null }
         }
         $row = Get-DvMatrixRow -PlanEntry $entry -Receipt $legReceipt
+        # r7: a child that refused because its spec's bytes are no longer the planned ones wrote no receipt; say so on its own typed line and in its row (outcome SPEC_CHANGED: it did not RUN, so the
+        # table's `ran` leaves it out), so it is never read as a leg that merely failed. Classified ONLY by the child's own whole-line stdout record naming THIS entry's planned hash (adversary r7 A1:
+        # a path or message that merely quotes the token DVE_LEG_SPEC_CHANGED, e.g. a receipt-write failure under a receipt root of that name, is not it)
+        $refusedRead = $null
+        foreach ($childLine in $childStdout) { if ($childLine -cmatch '^DVE_LEG_SPEC_REFUSED planned_sha256=(?<p>[0-9a-f]{64}) read_sha256=(?<r>[0-9a-f]{64})$' -and $Matches['p'] -ceq [string]$entry.specSha256) { $refusedRead = $Matches['r'] } }
+        if ($null -eq $legReceipt -and $null -ne $refusedRead) {
+            Write-Output ('DVE_MATRIX_SPEC_CHANGED {0}/{1} repeat={2} cell={3} leg={4} planned_sha256={5} read_sha256={6} (the spec bytes changed after planning; the leg was refused and is no measurement)' -f $entry.seq, $total, $entry.repeat, $entry.cellId, $entry.legId, $entry.specSha256, $refusedRead)
+            $row.outcome = 'SPEC_CHANGED'
+            $row.note = 'DVE_LEG_SPEC_CHANGED: the spec bytes changed after planning; the leg was refused before anything ran'
+        }
+        # r10 (sol r9 item 1): the same shape for a planned spec the child could not read at launch (missing or unreadable): classified ONLY by the child's own whole-line record naming
+        # THIS entry's planned hash; outcome SPEC_UNREADABLE is a prelaunch refusal, so the table's `ran` leaves it out (0/0, as SPEC_CHANGED), and it is never a NO_RECEIPT leg
+        $unreadable = $false
+        foreach ($childLine in $childStdout) { if ($childLine -cmatch '^DVE_LEG_SPEC_UNREADABLE planned_sha256=(?<p>[0-9a-f]{64})$' -and $Matches['p'] -ceq [string]$entry.specSha256) { $unreadable = $true } }
+        if ($null -eq $legReceipt -and $null -eq $refusedRead -and $unreadable) {
+            Write-Output ('DVE_MATRIX_SPEC_UNREADABLE {0}/{1} repeat={2} cell={3} leg={4} planned_sha256={5} (the planned spec could not be read at launch; the leg was refused and is no measurement)' -f $entry.seq, $total, $entry.repeat, $entry.cellId, $entry.legId, $entry.specSha256)
+            $row.outcome = 'SPEC_UNREADABLE'
+            $row.note = 'DVE_LEG_SPEC_UNREADABLE: the planned spec could not be read at launch; the leg was refused before anything ran'
+        }
         $rows.Add($row)
         Write-Output ('DVE_MATRIX_LEG {0}/{1} repeat={2} cell={3} outcome={4} receipt={5}' -f $entry.seq, $total, $entry.repeat, $entry.cellId, $row.outcome, $(if ($receiptPath) { $receiptPath } else { 'none' }))
     }
     $summaryDir = Join-Path (Split-Path -Parent $ReceiptRoot) "legset-summaries\$($setPlan.legSet)-$Venue-$runStamp"
     New-Item -ItemType Directory -Force -Path $summaryDir | Out-Null
     $table = ConvertTo-DvMatrixTable -Rows $rows.ToArray() -Cells @($setPlan.cells)
-    $measured = @($rows | Where-Object { $_.outcome -cin @('PASS', 'FAIL') }).Count
+    # r7 (sol r6 INV-2): the SAME predicate the table's `measured / ran` column uses (a PASS or FAIL row that carries a rate), so a visual twin's receipt is 0 measured here as in the table
+    $measured = Get-DvMatrixMeasuredCount -Rows $rows.ToArray()
     $head = @("# Leg set $($setPlan.legSet) on $Venue", '',
         "card $($setPlan.card), clip $($setPlan.clipId), source $($SourceCommit.Substring(0, 12)), build manifest $($BuildManifestSha256.Substring(0, 12)), $Repeats repeat(s) of $(@($setPlan.cells).Count) cell(s) = $total leg(s), $measured measured.",
         'Rates are read from each leg''s hashed app run log (median over the repeats). Only a PASS or FAIL receipt is a measurement; every other outcome is no signal and shows no numbers. Production receipts are ADVISORY (docs/dual-venue-evidence.md).', '')
@@ -225,10 +254,21 @@ if ($null -ne $table) {
     }
 }
 
-$specBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $LegSpec).Path)
+# r10 (sol r9 item 1): a leg bound to a planned hash whose spec is missing or unreadable at launch (deleted, or a directory now sits at the path) is a typed refusal too: the anchored
+# STDOUT record below names the planned hash, so a matrix parent shows it as SPEC_UNREADABLE (a prelaunch refusal that never ran), not a NO_RECEIPT leg counted in `ran`.
+# Nothing has been generated or submitted yet. Without -ExpectSpecSha256 (a single leg) the read error is rethrown unchanged.
+$specBytes = $null
+try { $specBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $LegSpec).Path) }
+catch {
+    if (-not $ExpectSpecSha256) { throw }
+    Write-Output "DVE_LEG_SPEC_UNREADABLE planned_sha256=$ExpectSpecSha256"
+    throw "DVE_LEG_SPEC_UNREADABLE the leg spec '$LegSpec' could not be read after planning ($($_.Exception.Message)); nothing is generated or submitted"
+}
 if ($ExpectSpecSha256) {
     # r19 (sol r18 B1): the bytes read above are the bytes this leg runs; they must be the ones the batch's budget preflight judged (raw sha256, no line-ending normalisation)
     $readSpecSha = ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData($specBytes)) -replace '-', '').ToLowerInvariant()
+    # r7 (adversary r7 A1): the typed STDOUT line a matrix parent classifies this refusal by (anchored, whole-line, both hashes): the throw text below can quote a path or other text, a line of its own cannot be spoofed by one
+    if ($readSpecSha -cne $ExpectSpecSha256) { Write-Output "DVE_LEG_SPEC_REFUSED planned_sha256=$ExpectSpecSha256 read_sha256=$readSpecSha" }
     if ($readSpecSha -cne $ExpectSpecSha256) { throw "DVE_LEG_SPEC_CHANGED the leg spec '$LegSpec' read as sha256 $readSpecSha, not the $ExpectSpecSha256 the lease batch's export budget preflight judged; nothing is generated or submitted" }
 }
 # Line endings are normalised on BOTH sides of the committed-spec lookup (Get-DvLegSpecSha256): on this VM's default checkout (autocrlf=true) the working
