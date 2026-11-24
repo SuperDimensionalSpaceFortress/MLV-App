@@ -2720,39 +2720,27 @@ function Test-DvPathHasLinkBelow {
     $false
 }
 
-function Read-DvBytesWithFileKey([string]$Path) {
-    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 fix 2 (adversary pass 6 A5): a file's bytes and its identity (volume serial + file index, the key Invoke-VenueLeaseBatch.ps1's
-    # bounded read records) from ONE FileStream, so the identity is the file the bytes came from. key '' when the handle will not identify. Compiled on first use only
-    # (Get-DvLegSetPlan -WithFileKey), in a scope whose $PSDefaultParameterValues is empty.
-    if (-not ('DvLegSetFileKeyRead' -as [type])) {
-        $PSDefaultParameterValues = @{}
-        Add-Type -ErrorAction Stop -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-using Microsoft.Win32.SafeHandles;
-public static class DvLegSetFileKeyRead {
-    [StructLayout(LayoutKind.Sequential)]
-    struct FileTime { public uint Low; public uint High; }
-    [StructLayout(LayoutKind.Sequential)]
-    struct ByHandleFileInformation {
-        public uint Attributes; public FileTime Created; public FileTime Accessed; public FileTime Written;
-        public uint VolumeSerial; public uint SizeHigh; public uint SizeLow; public uint Links; public uint IndexHigh; public uint IndexLow;
-    }
-    [DllImport("kernel32.dll", SetLastError = true)]
-    static extern bool GetFileInformationByHandle(SafeFileHandle handle, out ByHandleFileInformation info);
-    public static byte[] Read(string path, out string key) {
-        using (System.IO.FileStream fs = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.Read)) {
-            ByHandleFileInformation info;
-            key = GetFileInformationByHandle(fs.SafeFileHandle, out info) ? (info.VolumeSerial.ToString("x8") + ":" + info.IndexHigh.ToString("x8") + info.IndexLow.ToString("x8")) : "";
-            using (System.IO.MemoryStream ms = new System.IO.MemoryStream()) { fs.CopyTo(ms); return ms.ToArray(); }
-        }
-    }
-}
-'@
-    }
-    $k = $null
-    $b = [DvLegSetFileKeyRead]::Read([IO.Path]::GetFullPath($Path), [ref]$k)
-    [pscustomobject]@{ bytes = $b; key = [string]$k }
+function Read-DvBytesWithFileKey([string]$Path, $Reader) {
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 fix 2 (adversary pass 6 A5): a file's bytes and its identity (volume serial + file index) from ONE handle, so the identity is the
+    # file the bytes came from (Get-DvLegSetPlan -FileKeyReader).
+    # r5 (hosted CI on 19ce35fd): r4 compiled its own kernel32 reader here. That broke two pinned contracts: test_attr3_spliced_body_scan (this module named the parameter-defaults
+    # variable around the compile, which unbinds every extractor call the splice scan reads in this file; a [powershell] compile runspace instead makes every computed member a
+    # receiver that may reach the session state, the same unproven binding), and the off-Windows read (no kernel32: the read threw). The module now compiles NOTHING: the CALLER
+    # hands over its reader, and the batch hands over its own bounded read (Read-SpecBytesWithin: one FileStream gives the bytes and the key, on a pool thread given up on at the
+    # room left before -DeadlineUtc), so the planner's read is the batch's judged read, and (adversary pass 7 A7) it is bounded by the same deadline as every other spec read.
+    # The reader answers [pscustomobject]@{ state; bytes; key; error }: state OK with bytes, else the read failed (FAILED) or did not answer in its bound (TIMEOUT).
+    # Anything else (no answer, no bytes, no key) is refused by the caller below, never read as an empty spec or an unidentified file.
+    # (the reader is checked to be a script block by its type's NAME: a [scriptblock] type literal in this file makes the splice scan read every computed member as one that may
+    # reach the session state, test_the_dual_venue_runner_scans_inside_its_runtime_pin; a command name is never invoked here)
+    if ($null -eq $Reader -or $Reader.GetType().FullName -cne 'System.Management.Automation.ScriptBlock') { throw 'the file-key reader is not a script block' }
+    $r = & $Reader ([IO.Path]::GetFullPath($Path))
+    $r = @($r)
+    if ($r.Count -ne 1 -or $null -eq $r[0]) { throw "the file-key reader gave no single answer" }
+    $state = [string]$r[0].state
+    if ($state -ceq 'TIMEOUT') { throw "the read did not answer within the time left before -DeadlineUtc" }
+    if ($state -cne 'OK') { throw "the read failed ($([string]$r[0].error -replace '\s+', ' '))" }
+    if ($r[0].bytes -isnot [byte[]]) { throw "the read answered no bytes" }
+    [pscustomobject]@{ bytes = [byte[]]$r[0].bytes; key = [string]$r[0].key }
 }
 
 function Get-DvLegSetPlan {
@@ -2768,7 +2756,9 @@ function Get-DvLegSetPlan {
     #>
     # -WithFileKey (DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 fix 2, adversary pass 6 A5): each spec's bytes are read through ONE handle that also gives the file's volume + index
     # (specFileKey on every cell and plan entry), so a caller can prove its own later reads came from the file the planner judged. Without it the read is as before and specFileKey is ''.
-    param([Parameter(Mandatory)][string]$LegSetPath, [ValidateRange(1, 20)][int]$Repeats = 1, [string]$Backend = '', [switch]$WithFileKey)
+    # r5: -FileKeyReader is the caller's own reader (Read-DvBytesWithFileKey says why); -WithFileKey without one is refused.
+    param([Parameter(Mandatory)][string]$LegSetPath, [ValidateRange(1, 20)][int]$Repeats = 1, [string]$Backend = '', [switch]$WithFileKey, $FileKeyReader = $null)
+    if ($WithFileKey -and $null -eq $FileKeyReader) { throw 'DVE_LEGSET_INVALID -WithFileKey needs -FileKeyReader (the caller reads each spec through one handle that also identifies its file)' }
     if (-not (Test-Path -LiteralPath $LegSetPath -PathType Leaf)) { throw "DVE_LEGSET_INVALID no leg set at the given path" }
     $setDir = Split-Path -Parent (Resolve-Path -LiteralPath $LegSetPath).Path
     $dvDir = Split-Path -Parent $setDir
@@ -2799,7 +2789,7 @@ function Get-DvLegSetPlan {
         # r11 (adversary r10 pass 3 A1, A2; hub ruling 20261123T2147Z): every identity judged here (legId, twin, the name the set reached, planned hash) comes from THESE bytes.
         # r10's second link walk after this read is gone: a path probe cannot say what was read, and a link flipped in and out between two probes passed both.
         $specFileKey = ''
-        if ($WithFileKey) { $kr = Read-DvBytesWithFileKey $full; $specBytes = [byte[]]$kr.bytes; $specFileKey = [string]$kr.key; if (-not $specFileKey) { throw "DVE_LEGSET_INVALID '$ref' was read but its file could not be identified (the planner binds each entry to the file it judged)" } }
+        if ($WithFileKey) { $kr = try { Read-DvBytesWithFileKey $full $FileKeyReader } catch { throw "DVE_LEGSET_INVALID '$ref' could not be read by the planner: $($_.Exception.Message)" }; $specBytes = [byte[]]$kr.bytes; $specFileKey = [string]$kr.key; if (-not $specFileKey) { throw "DVE_LEGSET_INVALID '$ref' was read but its file could not be identified (the planner binds each entry to the file it judged)" } }
         else { $specBytes = [IO.File]::ReadAllBytes($full) }
         $specSha256 = Get-DvSha256OfBytes $specBytes
         $specReader = [IO.StreamReader]::new([IO.MemoryStream]::new($specBytes), [Text.Encoding]::UTF8, $true)

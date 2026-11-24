@@ -6813,7 +6813,7 @@ exit 0
 
     # The lease batch, -LegSet: a COPY of the batch whose planner call is followed by the fixture's swap (the race the preflight must survive), and whose plan stage ends
     # the run by printing the hash each leg child would be bound to (the leg's -ExpectSpecSha256: SpecBudgetSha256), so no claim, lease or venue is involved.
-    BATCH_PLAN_ANCHOR = '    $sp = try { Get-DvLegSetPlan -LegSetPath (Join-Path $here "legsets\\$LegSet.json") -Repeats $Repeats -Backend $(if ($Backend) { $Backend } else { \'\' }) -WithFileKey } catch { Stop-Usage $_.Exception.Message }\n'
+    BATCH_PLAN_ANCHOR = '    $sp = try { Get-DvLegSetPlan -LegSetPath (Join-Path $here "legsets\\$LegSet.json") -Repeats $Repeats -Backend $(if ($Backend) { $Backend } else { \'\' }) -WithFileKey -FileKeyReader { param($p) Read-SpecBytesWithin $p (Get-SpecReadBoundSec) } } catch { Stop-Usage $_.Exception.Message }\n'
     BATCH_SWAP = ("    if ($env:DVT_SWAP_TO) { if ($env:DVT_SWAP_MODE -eq 'touch') { [IO.File]::SetLastWriteTimeUtc($env:DVT_SWAP_TO, [DateTime]::UtcNow.AddMinutes(7)) } "
                   "else { [IO.File]::Copy($env:DVT_SWAP_FROM, $env:DVT_SWAP_TO, $true) } }   # TEST FIXTURE: the bytes change after the planner read them\n")
     BATCH_STOP_ANCHOR = "# r11 (sol r10 blocker 2): every generated output name is checked HERE"
@@ -7406,6 +7406,70 @@ exit 0
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
         self.assertEqual([(r["status"], r["verdict"]) for r in result["legs"]], [("RAN", "QUIET")], result["legs"])
+
+    # r5 (adversary pass 7 on 19ce35fd): A1 the room floor was asked on the parent's clock before Process.Start, and the child's OS start was compared with the bare deadline,
+    # so a pause between them started a child with less room than -MinRoomSec promised; A2 an exit was compared with -DeadlineUtc only, never with the child's own start plus
+    # -TimeoutSec; A5 the sweep's abandoned diagnostic worker was not counted in VenueAbandonedReads; A7 the set planner's judged read had no deadline bound.
+    BP_START_ANCHOR = "    $p = [Diagnostics.Process]::Start($psi)\n"
+    BP_START_PAUSE = ("    if ($env:DVT_PRESTART_PAUSE_MS) { Start-Sleep -Milliseconds ([int]$env:DVT_PRESTART_PAUSE_MS) }   # TEST FIXTURE: the parent is descheduled after the room check\n"
+                      + BP_START_ANCHOR)
+
+    def test_planned_hash_bind_r5_a1_a_child_the_os_started_inside_the_callers_room_floor_is_a_late_start(self) -> None:
+        dv = self.mutated_runner([("VenueChain.psm1", self.BP_START_ANCHOR, self.BP_START_PAUSE)])
+        got = run_pwsh(["-Command", f"Import-Module '{dv / 'VenueChain.psm1'}' -Force -DisableNameChecking; "
+                        f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep -Milliseconds 1500; Write-Output ran') -TimeoutSec 60 -CleanupWaitMs 2000 "
+                        "-DeadlineUtc ([DateTime]::UtcNow.AddSeconds(10)) -MinRoomSec 6; "
+                        "\"R5A1 $($r.notStarted) $($r.lateStart) $($r.timedOut) [$($r.stdout.Trim())]\""], env_extra={"DVT_PRESTART_PAUSE_MS": "6000"}, timeout=120)
+        line = [l for l in got.stdout.splitlines() if l.startswith("R5A1 ")]
+        self.assertEqual(line, ["R5A1 False True True []"],
+                         "the check saw 10 s of room, the OS started the child with about 4 s under a 6 s floor, and it ran (old: lateStart False, timedOut False)\n" + got.stdout + got.stderr)
+
+    def test_planned_hash_bind_r5_a2_an_exit_past_the_childs_own_start_plus_its_relative_bound_is_a_timeout(self) -> None:
+        late = ("    if ($env:DVT_PARENT_PAUSE_MS) { Start-Sleep -Milliseconds ([int]$env:DVT_PARENT_PAUSE_MS) }   # TEST FIXTURE: the parent is descheduled after the start\n"
+                "    $waitMs = [double]$TimeoutSec * 1000.0\n")
+        dv = self.mutated_runner([("VenueChain.psm1", "    $waitMs = [double]$TimeoutSec * 1000.0\n", late)])
+        got = run_pwsh(["-Command", f"Import-Module '{dv / 'VenueChain.psm1'}' -Force -DisableNameChecking; "
+                        f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep -Milliseconds 3500; Write-Output done') -TimeoutSec 1 -CleanupWaitMs 2000; "
+                        "\"R5A2 $($r.timedOut) $($r.lateExit) [$($r.exit)]\""], env_extra={"DVT_PARENT_PAUSE_MS": "7000"}, timeout=120)
+        line = [l for l in got.stdout.splitlines() if l.startswith("R5A2 ")]
+        self.assertEqual(line, ["R5A2 True True []"],
+                         "a child that ran 3.5 s under a 1 s bound was returned as a success because the parent polled it late (old: timedOut False, exit 0)\n" + got.stdout + got.stderr)
+
+    def test_planned_hash_bind_r5_a5_the_sweeps_abandoned_diagnostic_worker_is_counted_for_the_process_exit(self) -> None:
+        probe = self.tmp / "r5a5-probe.ps1"
+        probe.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{DV / 'VenueChain.psm1'}' -Force -DisableNameChecking\n"
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{DV / 'Invoke-VenueLeaseBatch.ps1'}', [ref]$null, [ref]$null)\n"
+            "foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {\n"
+            "    if ($f.Name -cin @('Get-InputUnresolvedCodeWithin', 'Get-SpecReadBoundSec', 'Get-PhysicalPath', 'Get-FileIdentity', 'Test-NothingAtName')) { . ([scriptblock]::Create($f.Extent.Text)) } }\n"
+            "function Get-InputUnresolvedCode([string]$Path, [switch]$SkipRead) { Start-Sleep -Seconds 30; '' }   # TEST FIXTURE: an open that never answers\n"
+            "$deadline = [DateTime]::UtcNow.AddSeconds(5)\n"
+            "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
+            "$code = Get-InputUnresolvedCodeWithin 'C:\\no-such-dir\\spec.json'\n"
+            "\"R5A5 $code $([int]$sw.Elapsed.TotalSeconds) $(& (Get-Module VenueChain) { $script:VenueAbandonedReads })\"\n"
+            "[Environment]::Exit(0)\n", encoding="utf-8")
+        got = run_pwsh(["-File", str(probe)], timeout=120)
+        line = [l for l in got.stdout.splitlines() if l.startswith("R5A5 ")]
+        self.assertEqual(len(line), 1, got.stdout + got.stderr)
+        code, sec, abandoned = line[0].split()[1:]
+        self.assertEqual(code, "INPUT_UNREADABLE", line[0])
+        self.assertLess(int(sec), 5, f"the worker was not given up on at the room before -DeadlineUtc: {line[0]}")
+        self.assertEqual(abandoned, "1", f"the abandoned diagnostic worker was not counted in VenueAbandonedReads (old: 0, so the process exit could wait on it): {line[0]}")
+
+    def test_planned_hash_bind_r5_a7_the_set_planners_judged_read_is_the_callers_bounded_read(self) -> None:
+        legset = DV / "legsets" / f"{self.SWAP_LEGSET}.json"
+        got = run_pwsh(["-Command", f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force; "
+                        f"try {{ $null = Get-DvLegSetPlan -LegSetPath '{legset}' -WithFileKey -FileKeyReader {{ param($p) [pscustomobject]@{{ state = 'TIMEOUT'; bytes = $null; key = ''; error = $null }} }}; 'R5A7 admitted' }} "
+                        "catch { 'R5A7 refused ' + ($_.Exception.Message -replace '\\s+', ' ') }; "
+                        f"try {{ $null = Get-DvLegSetPlan -LegSetPath '{legset}' -WithFileKey; 'R5A7N admitted' }} catch {{ 'R5A7N refused ' + ($_.Exception.Message -replace '\\s+', ' ') }}"], timeout=120)
+        lines = [l for l in got.stdout.splitlines() if l.startswith("R5A7")]
+        self.assertEqual(len(lines), 2, got.stdout + got.stderr)
+        self.assertTrue(lines[0].startswith("R5A7 refused DVE_LEGSET_INVALID ") and "did not answer within the time left before -DeadlineUtc" in lines[0],
+                        f"the planner's judged read ignored the caller's bounded reader (old: no -FileKeyReader, an unbounded read of its own): {lines[0]}")
+        self.assertTrue(lines[1].startswith("R5A7N refused DVE_LEGSET_INVALID -WithFileKey needs -FileKeyReader"), lines[1])
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertNotIn("DvLegSetFileKeyRead", module, "the module compiles no file-key reader of its own (r5: the caller's bounded read is the one judged read)")
 
 
 # ---------------------------------------------------------------------------------------------------

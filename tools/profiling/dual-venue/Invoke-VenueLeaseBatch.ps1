@@ -700,19 +700,30 @@ function Get-InputUnresolvedCodeWithin([string]$Path, [switch]$SkipRead) {
     # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 fix 2 (adversary pass 6 A4): Get-InputUnresolvedCode's opens are synchronous, so the pre-claim sweep asks it on a worker runspace
     # and gives up on it at the room left before -DeadlineUtc (Get-SpecReadBoundSec): no answer in that room is INPUT_UNREADABLE (an input that will not answer), never a wait past
     # the deadline. The worker is abandoned, not joined, at its bound (a stopped pipeline could itself wait on the stalled open).
-    $ms = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min(3600.0, (Get-SpecReadBoundSec))) * 1000.0)
-    if ($ms -le 0) { return 'INPUT_UNREADABLE' }
-    $defs = foreach ($fn in 'Get-PhysicalPath', 'Get-FileIdentity', 'Test-NothingAtName', 'Get-InputUnresolvedCode') { "function $fn {`n$((Get-Item -LiteralPath "function:$fn").Definition)`n}" }
-    $ps = [powershell]::Create()
+    # r5 (hosted CI on 19ce35fd, test_launcher_census_*: an AddScript of a string built at run time is an unclassified launch site): the worker runs the function BY NAME
+    # (AddCommand), its four functions handed over as SessionStateFunctionEntry, as Invoke-InputGuard hands its own; no string is executed.
+    # r5 (adversary pass 7 A4): the bound is the deadline's room read AFTER the worker is set up, the last clock read before it starts, so the setup's cost is inside the bound.
+    # r5 (adversary pass 7 A5): a worker given up on is counted in VenueChain's VenueAbandonedReads, as every abandoned share read is, so Complete-VenueProcess exits the
+    # process at once instead of waiting on the stalled open at exit.
+    $ps = $null; $abandoned = $false
     try {
-        $null = $ps.AddScript(($defs -join "`n") + "`nGet-InputUnresolvedCode ([string]`$args[0]) -SkipRead:([bool]`$args[1])`n").AddArgument($Path).AddArgument([bool]$SkipRead)
+        $iss = [initialsessionstate]::CreateDefault()
+        foreach ($fn in 'Get-PhysicalPath', 'Get-FileIdentity', 'Test-NothingAtName', 'Get-InputUnresolvedCode') { $iss.Commands.Add([Management.Automation.Runspaces.SessionStateFunctionEntry]::new($fn, (Get-Item -LiteralPath "function:$fn").Definition)) }
+        $ps = [powershell]::Create($iss)
+        $null = $ps.AddCommand('Get-InputUnresolvedCode').AddParameter('Path', [string]$Path).AddParameter('SkipRead', [bool]$SkipRead)
+        $ms = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min(3600.0, (Get-SpecReadBoundSec))) * 1000.0)
+        if ($ms -le 0) { return 'INPUT_UNREADABLE' }
         $h = $ps.BeginInvoke()
-        if (-not $h.AsyncWaitHandle.WaitOne($ms)) { $null = $ps.BeginStop($null, $null); return 'INPUT_UNREADABLE' }
+        if (-not $h.AsyncWaitHandle.WaitOne($ms)) {
+            $abandoned = $true
+            try { & (Get-Module VenueChain) { $script:VenueAbandonedReads++ } } catch { $null = $_ }
+            try { $null = $ps.BeginStop($null, $null) } catch { $null = $_ }
+            return 'INPUT_UNREADABLE'
+        }
         $r = @($ps.EndInvoke($h))
-        $code = $(if ($r.Count) { [string]$r[-1] } else { 'INPUT_UNREADABLE' })
-        $ps.Dispose()
-        return $code
+        return $(if ($r.Count) { [string]$r[-1] } else { 'INPUT_UNREADABLE' })
     } catch { return 'INPUT_UNREADABLE' }
+    finally { if ($null -ne $ps -and -not $abandoned) { try { $ps.Dispose() } catch { $null = $_ } } }
 }
 
 function Test-NothingAtName([string]$Path) {
@@ -1485,8 +1496,13 @@ public static class VenueLeaseBatchBoundedReadR4 {
     static object[] ReadWithKey(string path) {
         // FileShare.Read, as File.ReadAllBytes opens: a writer holding the file refuses the read, as before
         using (System.IO.FileStream fs = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.Read)) {
-            ByHandleFileInformation info;
-            string key = GetFileInformationByHandle(fs.SafeFileHandle, out info) ? (info.VolumeSerial.ToString("x8") + ":" + info.IndexHigh.ToString("x8") + info.IndexLow.ToString("x8")) : "";
+            // r5 (hosted CI on 19ce35fd, ubuntu shards: every BatchPreflightParityTests row read 'not a JSON object'): kernel32 is Windows only. Elsewhere the call throws
+            // DllNotFoundException, which failed the whole read; the bytes are still the bytes, so off Windows the key is '' (a caller that needs the key refuses, as before)
+            string key = "";
+            if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows)) {
+                ByHandleFileInformation info;
+                key = GetFileInformationByHandle(fs.SafeFileHandle, out info) ? (info.VolumeSerial.ToString("x8") + ":" + info.IndexHigh.ToString("x8") + info.IndexLow.ToString("x8")) : "";
+            }
             using (System.IO.MemoryStream ms = new System.IO.MemoryStream()) { fs.CopyTo(ms); return new object[] { ms.ToArray(), key }; }
         }
     }
@@ -1629,7 +1645,7 @@ function Get-ExportBudgetRefusal([string]$Path) {
     $boundFloor = [Math]::Floor([Math]::Min([double]$script:ExportBudgetPreflightCapSec, $room))
     if ($boundFloor -lt 1) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight was not started, $([Math]::Round([Math]::Max(0.0, $room), 1)) s were left before -DeadlineUtc (less $($script:ExportBudgetPreflightReserveSec) s)" }
     $boundSec = [int]$boundFloor   # (in range: the floor is between 1 and the 120 s cap)
-    $bp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-PreflightBudgetOnly', '-ClipId', $clipId, '-Format', $format, '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs -DeadlineUtc (Get-ExportBudgetChildDeadline)
+    $bp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-PreflightBudgetOnly', '-ClipId', $clipId, '-Format', $format, '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs -DeadlineUtc (Get-ExportBudgetChildDeadline) -MinRoomSec 1   # r5 (pass 7 A1): the 1 s floor, at the child's OS start
     # r4 fix 2 (adversary pass 6 A3): a child the absolute bound never let start is said to be never started, not killed
     if ($bp.notStarted) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight was not started (its room before -DeadlineUtc, less $($script:ExportBudgetPreflightReserveSec) s, had ended by its start); nothing was started, so nothing was killed" }
     if ($bp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight did not answer in $boundSec s and was killed ($(if ($bp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))" }
@@ -1644,7 +1660,7 @@ function Get-ExportBudgetRefusal([string]$Path) {
     $boundFloor = [Math]::Floor([Math]::Min([double]$script:ExportBudgetPreflightCapSec, $room))
     if ($boundFloor -lt 1) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor was not started, $([Math]::Round([Math]::Max(0.0, $room), 1)) s were left before -DeadlineUtc (less $($script:ExportBudgetPreflightReserveSec) s)" }
     $boundSec = [int]$boundFloor
-    $fp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-DescribeTimeBudgetBytes', '0', '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs -DeadlineUtc (Get-ExportBudgetChildDeadline)
+    $fp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-DescribeTimeBudgetBytes', '0', '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs -DeadlineUtc (Get-ExportBudgetChildDeadline) -MinRoomSec 1   # r5 (pass 7 A1 sibling)
     if ($fp.notStarted) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor was not started (its room before -DeadlineUtc had ended by its start); nothing was started, so nothing was killed" }   # r4 fix 2 (A3 sibling)
     if ($fp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor did not answer in $boundSec s and was killed ($(if ($fp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))" }
     $floorText = (@($fp.stdout, $fp.stderr) | Where-Object { $_ }) -join "`n"
@@ -1770,7 +1786,9 @@ if ($legPlanMode) {
     }
 } elseif ($LegSet) {
     Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force
-    $sp = try { Get-DvLegSetPlan -LegSetPath (Join-Path $here "legsets\$LegSet.json") -Repeats $Repeats -Backend $(if ($Backend) { $Backend } else { '' }) -WithFileKey } catch { Stop-Usage $_.Exception.Message }
+    # r5 (hosted CI on 19ce35fd; adversary pass 7 A7): the planner reads each spec through THIS script's bounded read (one FileStream gives the bytes and the key, given up on at
+    # the room left before -DeadlineUtc), so the planner's judged read is bounded like every other spec read and the module compiles nothing of its own
+    $sp = try { Get-DvLegSetPlan -LegSetPath (Join-Path $here "legsets\$LegSet.json") -Repeats $Repeats -Backend $(if ($Backend) { $Backend } else { '' }) -WithFileKey -FileKeyReader { param($p) Read-SpecBytesWithin $p (Get-SpecReadBoundSec) } } catch { Stop-Usage $_.Exception.Message }
     foreach ($e in $sp.plan) {
         $shapeRefusal = Get-ScalarLegShapeRefusal ([string]$e.specPath)   # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r8 (adversary r8 A3): before the lease, as -LegPlan does
         if ($shapeRefusal -clike 'SPEC_READ_TIMEOUT *') { Stop-Usage $shapeRefusal }   # r19 (sol r18 B2 sibling): the read's own typed code

@@ -9301,18 +9301,20 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     def test_r5_adv_a1_a_throw_after_a_leg_ran_does_not_record_that_leg_as_not_run(self) -> None:
         # adversary r5 A1: the new batch catch left the leg whose child had completed (its output file could not be written) in pending, and the summary then said
         # NOT_RUN for a leg that ran. The leg is recorded LEG_FAILED / reason BATCH_ERROR (its result is unknown); only the legs never started are NOT_RUN.
+        # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 fix 1 (adversary pass 5 A4 sibling): the leg's .out.txt is evidence only, written after the leg is classified from its own
+        # captured output, and a write that throws is said on stderr (LEG_OUT_WRITE_FAILED). This injection (a folder squatting on that file) therefore no longer throws after the
+        # leg ran: the leg is RAN from its own output and the batch goes on. What r5 A1 pinned still holds: no leg whose child ran is ever recorded NOT_RUN.
         self.run_dir.mkdir(parents=True, exist_ok=True)
         (self.run_dir / "leg-01-fx-a-cpu-A-b01-a1.out.txt").mkdir()
         a = self.commit_a
         r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", a), self.item(self.specs[1], "A", a)]))
-        self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
-        self.assertEqual(len(self.leg_calls()), 1, "the first leg's child ran")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(len(self.leg_calls()), 2, "both legs' children ran")
         res = batch_result(r.stdout)
-        self.assertEqual([(l["name"], l["status"]) for l in res["legs"]], [("01-fx-a-cpu-A", "LEG_FAILED"), ("02-fx-b-cpu-A", "NOT_RUN")], res["legs"])
-        self.assertEqual((res["ran"], res["failed"], res["notRun"], res["stopReason"]), (0, 1, 1, "BATCH_ERROR"))
-        self.assertEqual(res["legs"][0]["reason"], "BATCH_ERROR")
-        [b] = self.batches()
-        self.assertEqual([(l["name"], l["status"]) for l in b["legs"]], [("01-fx-a-cpu-A", "LEG_FAILED")])
+        self.assertEqual([(l["name"], l["status"]) for l in res["legs"]], [("01-fx-a-cpu-A", "RAN"), ("02-fx-b-cpu-A", "RAN")], res["legs"])
+        self.assertEqual((res["ran"], res["failed"], res["notRun"], res["stopReason"]), (2, 0, 0, None))
+        self.assertIn("LEG_OUT_WRITE_FAILED leg=01-fx-a-cpu-A", r.stderr)
+        self.assertIn("evidence only: the leg is classified from its own captured output", r.stderr)
         self.assertFalse(self.claim_path.exists(), "the claim was left behind")
 
     def test_r5_adv_a2_a_staged_build_the_leg_job_would_reject_is_refused_before_the_claim_and_the_lease(self) -> None:

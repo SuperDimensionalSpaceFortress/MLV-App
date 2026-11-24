@@ -2038,13 +2038,24 @@ function Invoke-VenueBoundedProcess {
     # r4 fix 2 (adversary pass 6 A2): the child's OWN start and exit instants (the OS's) are compared with -DeadlineUtc, not the parent's clock reads around them: a child the
     # OS started at or past it (a pause between the check above and the start), or one that exited after it (a parent that resumed late and polled an already-exited child),
     # is a timeout, never a success. A child started late is killed at once.
+    # r5 (adversary pass 7 A1 on 19ce35fd): the start is judged against the caller's FLOOR, not the bare deadline: an OS start later than -DeadlineUtc less -MinRoomSec (a pause
+    # between the room check above and Process.Start) left the child less room than the floor promised, so it is a late start too, killed at once. The OS's own StartTime is the
+    # instant judged; when it will not read, the parent's clock now (later than the start, so never kinder).
     $lateStart = $false; $lateExit = $false
-    if ($null -ne $dlUtc) { try { $lateStart = ($p.StartTime.ToUniversalTime() -ge $dlUtc) } catch { $lateStart = ([DateTime]::UtcNow -ge $dlUtc) } }
+    $startUtc = [DateTime]::UtcNow
+    try { $startUtc = $p.StartTime.ToUniversalTime() } catch { $startUtc = [DateTime]::UtcNow }
+    if ($null -ne $dlUtc) { $lateStart = ($startUtc -gt $dlUtc.AddSeconds(-[double]$MinRoomSec)) -or ($startUtc -ge $dlUtc) }
     $waitMs = [double]$TimeoutSec * 1000.0
-    if ($null -ne $dlUtc) { $waitMs = [Math]::Min($waitMs, [Math]::Max(0.0, ($dlUtc - [DateTime]::UtcNow).TotalMilliseconds)) }
+    # (hosted CI on 19ce35fd, test_artifact_preflight_r10_no_dual_venue_math_min_or_max_rounds_a_double_through_an_integer_first_operand: the first operand is a double in its own text)
+    if ($null -ne $dlUtc) { $waitMs = [Math]::Min([double]$waitMs, [Math]::Max(0.0, ($dlUtc - [DateTime]::UtcNow).TotalMilliseconds)) }
     $timedOut = $(if ($lateStart) { $true } else { -not $p.WaitForExit([int][Math]::Floor($waitMs)) })
-    if (-not $timedOut -and $null -ne $dlUtc) {
-        try { $lateExit = ($p.ExitTime.ToUniversalTime() -gt $dlUtc) } catch { $lateExit = ([DateTime]::UtcNow -gt $dlUtc) }
+    if (-not $timedOut) {
+        # r5 (adversary pass 7 A2): the OS exit is judged against BOTH bounds: -DeadlineUtc and the child's own start plus -TimeoutSec (a parent that resumed late and polled an
+        # already-exited child read success for a child that outran its relative cap)
+        # (the relative bound is judged only from the OS's two instants; an exit time that will not read falls back to the parent's clock for the absolute bound alone)
+        $exitUtc = $null; $osExit = $true
+        try { $exitUtc = $p.ExitTime.ToUniversalTime() } catch { $exitUtc = [DateTime]::UtcNow; $osExit = $false }
+        $lateExit = ($osExit -and ($exitUtc - $startUtc).TotalSeconds -gt [double]$TimeoutSec) -or ($null -ne $dlUtc -and $exitUtc -gt $dlUtc)
         if ($lateExit) { $timedOut = $true }
     }
     $killErrored = $false
