@@ -6125,7 +6125,10 @@ function Test-DvReceiptValid {
     #>
     param([Parameter(Mandatory)]$Receipt, [string]$RepoRoot = '', [string]$EvidenceDir = '', [switch]$AllowOfflineTestMode, [byte[]]$OfflineLegSpecBytes = $null)
     $result = Test-DvReceiptValidCore @PSBoundParameters
-    $display = Test-DvDisplayPathBlock -Block (Get-DvProp (Get-DvProp $Receipt 'venue') 'displayPath')
+    $venueNode = Get-DvProp $Receipt 'venue'
+    # a venue that is present but not an object (an array, a number) cannot be said to carry no block: that is a malformed record, never `absent`
+    $display = $(if ($null -ne $venueNode -and -not (Test-DvDisplayPathIsObject $venueNode)) { [pscustomobject]@{ state = 'malformed'; problems = @('venue is not an object') } }
+                 else { Test-DvDisplayPathBlock -Block (Get-DvProp $venueNode 'displayPath') })
     if ($display.state -ceq 'malformed') {
         $result.reasons = @('DISPLAY_PATH_MALFORMED: venue.displayPath: ' + ($display.problems -join '; ')) + @($result.reasons)
         $result.status = 'INVALID'
@@ -6407,7 +6410,9 @@ function Get-DvDisplayPathCollectorSource {
     @'
 function Get-DvDisplayPath {
     param([int]$BudgetSec = 15)
+    $BudgetSec = [math]::Max(0, [math]::Min(15, $BudgetSec))   # a caller can only tighten the 15 s bound, never loosen it
     $sw = [Diagnostics.Stopwatch]::StartNew()
+    $invariant = [Globalization.CultureInfo]::InvariantCulture
     $unknown = {
         param($why)
         $r = ([string]$why -replace '\s+', ' ').Trim()
@@ -6417,7 +6422,7 @@ function Get-DvDisplayPath {
     }
     $text = { param($v) if ($null -eq $v -or ([string]$v).Trim().Length -eq 0) { & $unknown 'not-reported' } else { [string]$v } }
     $int = { param($v) if ($null -eq $v) { & $unknown 'not-reported' } else { try { [int]$v } catch { & $unknown 'not-an-integer' } } }
-    $utc = { param($d) if ($d -is [datetime]) { $d.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { & $unknown 'not-reported' } }
+    $utc = { param($d) if ($d -is [datetime]) { $d.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', $invariant) } else { & $unknown 'not-reported' } }
     $cim = {
         param([string]$Class, [string]$Namespace = '', [string]$Filter = '')
         $left = [int][math]::Floor($BudgetSec - $sw.Elapsed.TotalSeconds)
@@ -6425,10 +6430,13 @@ function Get-DvDisplayPath {
         $a = @{ ClassName = $Class; OperationTimeoutSec = $left; ErrorAction = 'Stop' }
         if ($Namespace) { $a['Namespace'] = $Namespace }
         if ($Filter) { $a['Filter'] = $Filter }
-        , @(Get-CimInstance @a)
+        $got = @(Get-CimInstance @a)
+        # an answer that came back after the cap is not an answer: the block's whole-time bound holds, so the field is a typed unknown
+        if ($sw.Elapsed.TotalSeconds -gt $BudgetSec) { throw 'budget-exceeded' }
+        , $got
     }
     try {
-        $block = [ordered]@{ schema = 'mlv-app/venue-display-path/v1'; collectedUtc = [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'); adapters = $null; activeDisplays = $null; os = $null; powerPlan = $null }
+        $block = [ordered]@{ schema = 'mlv-app/venue-display-path/v1'; collectedUtc = [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', $invariant); adapters = $null; activeDisplays = $null; os = $null; powerPlan = $null }
 
         # video adapters, and which of them has an active output (a refresh rate or a width the controller reports)
         $rows = $null; $rowsWhy = ''
@@ -6452,7 +6460,11 @@ function Get-DvDisplayPath {
 
         # Windows build + UBR (registry, local and instant), last boot (CIM), installed hotfix count (CIM, slowest: last)
         $reg = $null; $regWhy = 'registry-unreadable'
-        try { $reg = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop } catch { $regWhy = 'registry-unreadable: ' + $_.Exception.Message }
+        if (($BudgetSec - $sw.Elapsed.TotalSeconds) -lt 1) { $regWhy = 'budget-exhausted' }   # the registry read is local and instant, but it still obeys the bound
+        else {
+            try { $reg = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop } catch { $regWhy = 'registry-unreadable: ' + $_.Exception.Message }
+            if ($null -ne $reg -and $sw.Elapsed.TotalSeconds -gt $BudgetSec) { $reg = $null; $regWhy = 'budget-exceeded' }
+        }
         $regField = {
             param($name, $asInt)
             if ($null -eq $reg) { return (& $unknown $regWhy) }
@@ -6492,13 +6504,28 @@ function Test-DvDisplayPathIsObject {
     ($Value -is [System.Collections.IDictionary]) -or ($Value -is [System.Management.Automation.PSCustomObject])
 }
 
+function Test-DvDisplayPathText {
+    # A string that IS the expected text, by ordinal comparison. PowerShell's -ceq / -cne are culture-aware and ignore zero-width and soft-hyphen characters,
+    # and an untyped left operand is coerced or filtered (an array, a bool), so a name that must match exactly goes through here.
+    param($Value, [string]$Expected)
+    ($Value -is [string]) -and [string]::Equals([string]$Value, $Expected, [System.StringComparison]::Ordinal)
+}
+
 function Test-DvDisplayPathUnknown {
-    # A well-formed typed unknown: exactly `{state:'unknown'; reason:<1..200 chars>}`.
+    # A well-formed typed unknown: exactly the two members `{state:'unknown'; reason:<1..200 chars>}` and nothing else.
     param($Value)
     if (-not (Test-DvDisplayPathIsObject $Value)) { return $false }
+    $names = @($(if ($Value -is [System.Collections.IDictionary]) { @($Value.Keys) } else { @($Value.PSObject.Properties | ForEach-Object { $_.Name }) }) | ForEach-Object { [string]$_ })
+    if ($names.Count -ne 2) { return $false }
+    $hasState = $false; $hasReason = $false
+    foreach ($n in $names) {
+        if ([string]::Equals($n, 'state', [System.StringComparison]::Ordinal)) { $hasState = $true }
+        elseif ([string]::Equals($n, 'reason', [System.StringComparison]::Ordinal)) { $hasReason = $true }
+    }
+    if (-not ($hasState -and $hasReason)) { return $false }
     $state = Get-DvProp $Value 'state'
     $reason = Get-DvProp $Value 'reason'
-    ($state -is [string]) -and ($state -ceq 'unknown') -and ($reason -is [string]) -and ($reason.Trim().Length -gt 0) -and ($reason.Length -le 200)
+    (Test-DvDisplayPathText $state 'unknown') -and ($reason -is [string]) -and ($reason.Trim().Length -gt 0) -and ($reason.Length -le 200)
 }
 
 function Test-DvDisplayPathLeaf {
@@ -6510,8 +6537,9 @@ function Test-DvDisplayPathLeaf {
         'int' { return ((($Value -is [int]) -or ($Value -is [long])) -and ($Value -ge 0)) }
         'bool' { return ($Value -is [bool]) }
         'utc' {
-            if ($Value -is [datetime]) { return $true }   # ConvertFrom-Json reads an ISO date as a DateTime
-            if ($Value -isnot [string] -or $Value -cnotmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,7})?Z$') { return $false }
+            # ConvertFrom-Json reads an ISO date as a DateTime: only a UTC one (a `...Z` spelling) is a UTC time; a zone-less (Unspecified) or offset (Local) one is the reader's clock
+            if ($Value -is [datetime]) { return ($Value.Kind -eq [System.DateTimeKind]::Utc) }
+            if ($Value -isnot [string] -or $Value -cnotmatch '\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,7})?Z\z') { return $false }
             $parsed = [datetime]::MinValue
             return [datetime]::TryParse($Value, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)
         }
@@ -6531,7 +6559,7 @@ function Test-DvDisplayPathBlock {
     if (Test-DvDisplayPathUnknown $Block) { return (& $result 'present' @()) }
     $problems = [System.Collections.Generic.List[string]]::new()
     if (-not (Test-DvDisplayPathIsObject $Block)) { return (& $result 'malformed' @('the block is neither an object nor a typed unknown')) }
-    if ((Get-DvProp $Block 'schema') -cne $script:DisplayPathSchema) { $problems.Add("schema is not $script:DisplayPathSchema") }
+    if (-not (Test-DvDisplayPathText (Get-DvProp $Block 'schema') $script:DisplayPathSchema)) { $problems.Add("schema is not the string $script:DisplayPathSchema") }
     if (-not (Test-DvDisplayPathLeaf (Get-DvProp $Block 'collectedUtc') 'utc')) { $problems.Add('collectedUtc is not a UTC time') }
     $tables = @(
         @{ name = 'adapters'; fields = @(@('name', 'string'), @('driverVersion', 'string'), @('driverDate', 'utc'), @('pnpDeviceId', 'string'), @('hasActiveOutput', 'bool')) },
@@ -6545,6 +6573,21 @@ function Test-DvDisplayPathBlock {
             foreach ($f in $t.fields) {
                 if (-not (Test-DvDisplayPathLeaf (Get-DvProp $list[$i] $f[0]) $f[1])) { $problems.Add("$($t.name)[$i].$($f[0]) is not a $($f[1]) or a typed unknown") }
             }
+        }
+    }
+    # the two tables describe the same adapters: one activeDisplays entry per adapter that has an active output, under that adapter's name (when both are readable lists)
+    $adaptersList = Get-DvProp $Block 'adapters'
+    $displaysList = Get-DvProp $Block 'activeDisplays'
+    if (($adaptersList -is [System.Array]) -and ($displaysList -is [System.Array]) -and $problems.Count -eq 0) {
+        $want = @{}; $have = @{}
+        foreach ($a in $adaptersList) {
+            if ((Get-DvProp $a 'hasActiveOutput') -eq $true -and (Get-DvProp $a 'name') -is [string]) { $want[[string](Get-DvProp $a 'name')] = 1 + [int]$want[[string](Get-DvProp $a 'name')] }
+        }
+        foreach ($d in $displaysList) {
+            if ((Get-DvProp $d 'adapterName') -is [string]) { $have[[string](Get-DvProp $d 'adapterName')] = 1 + [int]$have[[string](Get-DvProp $d 'adapterName')] }
+        }
+        foreach ($k in @($want.Keys) + @($have.Keys) | Select-Object -Unique) {
+            if ([int]$want[$k] -ne [int]$have[$k]) { $problems.Add("activeDisplays and adapters disagree about '$k': $([int]$want[$k]) adapter(s) with an active output, $([int]$have[$k]) display entr(ies)") }
         }
     }
     $os = Get-DvProp $Block 'os'
@@ -6563,7 +6606,8 @@ function Test-DvDisplayPathBlock {
 function ConvertTo-DvDisplayPathUtcText {
     # ConvertFrom-Json reads every ISO date it sees as a [datetime]; the receipt keeps UTC text. In place, depth-first.
     param($Node)
-    if ($Node -is [datetime]) { return $Node.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
+    # Only a UTC-kind date becomes UTC text; a zone-less or offset one stays a [datetime] and the block validator refuses it (it is the reader's clock, not the venue's UTC instant).
+    if ($Node -is [datetime]) { if ($Node.Kind -eq [System.DateTimeKind]::Utc) { return $Node.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture) } else { return $Node } }
     if ($Node -is [System.Management.Automation.PSCustomObject]) {
         foreach ($p in @($Node.PSObject.Properties)) { $p.Value = ConvertTo-DvDisplayPathUtcText $p.Value }
         return $Node
@@ -6607,6 +6651,7 @@ function New-DvHealthProbeJobText {
     $sessionLockedSource = Get-AttrCudaEmbeddedFunctionSource -Name @('Get-AttrCudaSessionLocked')
     $body = @"
 `$ErrorActionPreference = 'Stop'
+`$dveJobSw = [Diagnostics.Stopwatch]::StartNew()
 `$AgentRoot = '$root'
 `$probe = [ordered]@{ schema = 'mlv-app/dual-venue-health-probe/v1' }
 `$sw = [Diagnostics.Stopwatch]::StartNew()
@@ -6640,7 +6685,7 @@ try { Add-Type -AssemblyName System.Windows.Forms; `$probe.displayDevice = [stri
     $displayPathSource = Get-DvDisplayPathCollectorSource
     $body + "`r`n" + $sessionLockedSource + "`r`n" + '$probe.sessionLocked = Get-AttrCudaSessionLocked' + "`r`n" +
         $displayPathSource + "`r`n" +
-        '$probe.displayPath = $(try { Get-DvDisplayPath } catch { [ordered]@{ state = ''unknown''; reason = ''collector-error'' } })' + "`r`n" +
+        '$probe.displayPath = $(try { Get-DvDisplayPath -BudgetSec ([int][math]::Max(0, [math]::Min(15, 105 - $dveJobSw.Elapsed.TotalSeconds))) } catch { [ordered]@{ state = ''unknown''; reason = ''collector-error'' } })' + "`r`n" +
         'Write-Output (''DVE_PROBE='' + ($probe | ConvertTo-Json -Compress -Depth 8))' + "`r`n"
 }
 

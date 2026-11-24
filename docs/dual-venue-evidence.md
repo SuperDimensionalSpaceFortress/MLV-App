@@ -673,7 +673,13 @@ state: Bachelor drives its only display through the Intel Iris Xe (3840x2400 at 
 Every leg receipt now carries `venue.displayPath`, collected by the **health probe** on the venue at leg time. The collection is **read-only** (CIM reads and one
 registry read; it sets, starts and writes nothing, and uses no `powercfg`) and bounded: the whole block has a **15 s** budget and every CIM call carries what is
 left of it, so the slowest query (the hotfix count) runs last. Any probe that fails, times out or is denied is a typed `{"state":"unknown","reason":"<short>"}` for
-that field. It never fails the leg, never delays it past the bound and never changes its verdict.
+that field. It never fails the leg, never delays it past the bound and never changes its verdict. A read that returns after the cap is a typed unknown too
+(`budget-exceeded`), and the budget is also what is left of 105 s of the health job's own 120 s, so the block can never push the probe's single `DVE_PROBE` line past
+the agent's deadline.
+
+**When it is sampled.** The block is a sample taken by the health probe, **before** the measurement job is submitted; the job then waits in the agent's queue and
+admission. It is not read again during the run, so it says what the venue drove at `collectedUtc`, not what it drove for every frame of the measurement. A display
+mode that changes between the sample and the run is not seen; compare `collectedUtc` with the leg's own start time before trusting it as the state of the run.
 
 | Field | Meaning |
 |---|---|
@@ -688,7 +694,10 @@ Every leaf is its value or a typed unknown; `adapters`, `activeDisplays` and `os
 
 Validator (`Test-DvReceiptValid`): the result's `displayPath` is `absent` (no block: an older receipt, still **valid**, and `displayPath=absent` is all that
 changes), `present` (a well-formed block, one whose every probe failed included: **valid**) or `malformed` (**`INVALID`**, reason `DISPLAY_PATH_MALFORMED`, on every
-outcome). The block is written to no hashed artifact, so it is listed under `unbound` (`DISPLAY_PATH_UNBOUND`, and `venue.displayPath` in a sheet-pair record).
+outcome). The block is written to no hashed artifact, so it is listed under `unbound` (`DISPLAY_PATH_UNBOUND`, and `venue.displayPath` in a sheet-pair record); the validator
+adds that entry only to a receipt whose core result already lists unbound claims (a PASS / FAIL path), so a NO_SIGNAL receipt carries the block without the entry. A venue
+that is not an object, a schema that is not the exact string, a time that is not a `...Z` UTC spelling, a typed unknown with any member besides `state` and `reason`, and an
+`activeDisplays` table that does not match the adapters' `hasActiveOutput` flags are all `malformed`.
 Read a regression across two legs by comparing these blocks first: a different active adapter, refresh rate, boot time, UBR or power plan is a venue change, not a code one.
 
 ## How to read the evidence
