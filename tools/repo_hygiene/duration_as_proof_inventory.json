@@ -2870,7 +2870,7 @@
       "clock": "qpc_stage_clock",
       "justification": "CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1 (sol r5 B1): handlerStartMs and handlerEndMs are TIMESTAMPS (the fixture handler's QPC reads), and -1 is their 'handler never ran' sentinel. The guard fails a sample whose handler reads are unset before the R3A3 trace scan can start from -1 ms. It compares no duration. That the handler ran is proven by its own call count (foreign.calls), which is the admission witness.",
       "lines": [
-        2879
+        2891
       ]
     },
     {

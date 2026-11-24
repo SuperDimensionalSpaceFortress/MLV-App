@@ -54,13 +54,25 @@
 
 namespace
 {
+// CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1 (adversary pass A1 on e60d41b6): translation phase 2 -- every backslash that ends a
+// physical line (GCC also splices across trailing blanks after it) joins that line to the next, before any comment or directive
+// exists. A `// \` line before an `#else` therefore comments that `#else` out in the compiled source, yet every pin that read
+// the physical lines still saw the directive. Every source pin reads through dueWakeRepoSource, so each one now sees the
+// compiler's logical lines. The pinned production files contain no line splice, so this changes no pinned text.
+QString dueWakeSpliceLines( const QString & text )
+{
+    static const QRegularExpression splice( QStringLiteral( "\\\\[ \\t\\f\\v]*\\n" ) );
+    QString out = text;
+    out.remove( splice );
+    return out;
+}
 QString dueWakeRepoSource( const QString & relative )
 {
     const QString path = repo_file_path( relative );
     QFile file( path );
     if( path.isEmpty() || !file.open( QIODevice::ReadOnly | QIODevice::Text ) ) return QString();
     QTextStream stream( &file );
-    return stream.readAll();
+    return dueWakeSpliceLines( stream.readAll() );
 }
 
 // CI-FLAKE-PLAYBACK-DUE-WAKE-R17A1-TIMING-1 r5 (20x run on a loaded host: the R17A1 sink test read 76.1-79.2 ms for an 80 ms
@@ -4297,6 +4309,35 @@ TEST(PlaybackDueWakeSend, SEAM1_TheTimingStampSeamIsOffByDefaultAndAddsNoClockRe
     ASSERT_FALSE( dueWakeSleepExitMet( X::WaitFailed, 200, 80.0 ) );
     ASSERT_FALSE( dueWakeSleepExitMet( X::WokenBySent, 200, 80.0 ) );
 #endif
+}
+
+TEST(PlaybackDueWakeSend, SEAM1_ASplicedCommentCannotHideAnAppBuildDirectiveFromThePins)
+{
+    // CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1, adversary pass A1 on e60d41b6, its input: a physical line `// \` inserted
+    // just before each `#else` of PlaybackDueWake.cpp. The compiler splices it onto the `#else`, so both seam `#else` branches
+    // (the app build's expiry checks) are cut from the app build. The app-build digest view of the physical lines did not change.
+    const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
+    ASSERT_FALSE( source.isEmpty() );
+    ASSERT_TRUE( dueWakeSpliceLines( source ) == source );            // the pinned file has no line splice: its pins are unchanged
+    QStringList hostile;
+    int inserted = 0;
+    for( const QString &line : source.split( QLatin1Char( '\n' ) ) )
+    {
+        if( line.trimmed() == QStringLiteral( "#else" ) )
+        {
+            hostile << QStringLiteral( "// \\" );
+            ++inserted;
+        }
+        hostile << line;
+    }
+    ASSERT_TRUE( inserted >= 2 );
+    const QString hostileText = hostile.join( QLatin1Char( '\n' ) );
+    const auto appView = []( const QString &text ) { return dueWakeNoComments( dueWakeAppBuildView( text ) ).simplified(); };
+    ASSERT_TRUE( appView( hostileText ) == appView( source ) );        // the r5 reader's blind spot: physical lines, same view
+    ASSERT_FALSE( appView( dueWakeSpliceLines( hostileText ) ) == appView( source ) );   // read as compiled, the cut branches show
+    // trailing blanks after the backslash splice too (GCC), and a backslash that does not end its line splices nothing
+    ASSERT_EQ( std::string( "// #else" ), dueWakeSpliceLines( QStringLiteral( "// \\  \n#else" ) ).toStdString() );
+    ASSERT_EQ( std::string( "a \\ b\nc" ), dueWakeSpliceLines( QStringLiteral( "a \\ b\nc" ) ).toStdString() );
 }
 
 TEST(PlaybackDueWakeSend, SEAM1_TheTimingSeamIsCompiledOutOfTheAppBuild)
