@@ -110,6 +110,10 @@ param(
     [string]$LegScript = ''
 )
 $ErrorActionPreference = 'Stop'
+# DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r2 (adversary A3): a caller's $PSNativeCommandUseErrorActionPreference = $true is inherited by `& script`, and with Stop it turns a
+# leg's or quiet probe's documented non-zero exit (a spec refusal, exit 6) into a terminating error before the typed result and the next leg. The raw launches below read
+# $LASTEXITCODE themselves, as Invoke-VenueLeg's matrix walk does.
+$PSNativeCommandUseErrorActionPreference = $false
 $here = $PSScriptRoot
 Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking
 
@@ -191,7 +195,8 @@ if ($LegSet) {
         # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1: ONE read of the spec's bytes names the leg AND gives the sha256 its child is bound to (RAW bytes, no line-ending normalisation:
         # the hash Invoke-VenueLeg's -ExpectSpecSha256 takes), decoded BOM-detected as File.ReadAllText does. Bytes that cannot be read here are a usage refusal before any claim:
         # an unread spec has no planned hash to bind the child to.
-        $specBytes = try { [IO.File]::ReadAllBytes($path) } catch { Stop-Usage "LEG_SPEC_UNREADABLE '$path' could not be read to plan it ($($_.Exception.Message -replace '\s+', ' '))" }
+        # (r2, adversary A2: a direct assignment, so an empty file is a zero-length array; `$x = try { <empty array> }` enumerates it to $null and the hash then threw)
+        try { [byte[]]$specBytes = [IO.File]::ReadAllBytes($path) } catch { Stop-Usage "LEG_SPEC_UNREADABLE '$path' could not be read to plan it ($($_.Exception.Message -replace '\s+', ' '))" }
         $specSha256 = ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData([byte[]]$specBytes)) -replace '-', '').ToLowerInvariant()
         $legId = try { $rdr = [IO.StreamReader]::new([IO.MemoryStream]::new([byte[]]$specBytes), [Text.Encoding]::UTF8, $true); try { [string](($rdr.ReadToEnd() | ConvertFrom-Json).legId) } finally { $rdr.Dispose() } } catch { '' }
         if ($legId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$') { $legId = [IO.Path]::GetFileNameWithoutExtension($path) }
@@ -408,7 +413,8 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
         $sStatus = $(if ($sr.timedOut) { 'TIMEOUT' } elseif ($sr.exit -ne 0) { 'FAILED' } else { 'RAN' })
         # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1: a supplementary child that refused other bytes than the planned ones says so on its own typed line (classified from its stdout only)
         $sSpecRefusal = $(if ($sStatus -ceq 'FAILED' -and -not $sReceipt) { Get-LegSpecRefusalLine $sLines $Leg } else { '' })
-        if ($sSpecRefusal) { L "$sSpecRefusal venue=$suppVenue role=supplementary (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)" }
+        # (r2, adversary A5: the label's log write may fail; it never replaces the observed child failure recorded by Add-SuppResult below)
+        if ($sSpecRefusal) { try { L "$sSpecRefusal venue=$suppVenue role=supplementary (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)" } catch { [Console]::Error.WriteLine("$sSpecRefusal venue=$suppVenue role=supplementary (chain log write failed: $($_.Exception.Message -replace '\s+', ' '))") } }
         # Whatever the leg printed, a leg that died or timed out is INVALID evidence, never a measurement (the Bachelor rule); and nothing here is read as a timing verdict.
         $shownOutcome = $(if ($sStatus -ceq 'RAN') { $sOutcome } else { 'INVALID' })
         $extra = @{ quietVerdict = $sq.verdict; quietMean = $sq.mean; outcome = $shownOutcome; printedOutcome = $sOutcome; legExit = $sr.exit; timedOut = $sr.timedOut; receipt = $sReceipt; receiptRole = $sRole
@@ -571,12 +577,14 @@ foreach ($leg in $plan) {
                 # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1: a leg that refused other bytes than the planned ones (or could not read the planned spec) is named on its own typed line and in its
                 # result (specRefusal). It stays LEG_FAILED / INVALID, exit 7, so the label never turns a leg into a measurement either way. The out file holds both of the leg's
                 # streams (*>), so the record is read only from a leg that wrote no receipt line, as a whole anchored line naming this leg's planned hash.
+                # (r2, adversary A5: the exit code is set BEFORE the label, and the label's log write may fail without costing the result, CHAIN_RESULT or the next leg)
+                if ($exitCode -eq 0) { $exitCode = 7 }
                 $specRefusal = $(if (-not $receipt) { Get-LegSpecRefusalLine $legLines $leg } else { '' })
                 if ($specRefusal) {
                     $results[$results.Count - 1] | Add-Member -NotePropertyName specRefusal -NotePropertyValue (($specRefusal -split ' ', 2)[0]) -Force
-                    L "$specRefusal (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)"
+                    try { L "$specRefusal (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)" }
+                    catch { [Console]::Error.WriteLine("$specRefusal (chain log write failed: $($_.Exception.Message -replace '\s+', ' '))") }
                 }
-                if ($exitCode -eq 0) { $exitCode = 7 }
             } else {
                 $preLoad = Get-LegPreLoadMean $receipt
                 # a FOREIGN_FLOOR early exit in ANY probe of the leg (either phase, any attempt, GATE_BUSY retries included) leaves it contended: a later QUIET reading never promotes it to a counted class

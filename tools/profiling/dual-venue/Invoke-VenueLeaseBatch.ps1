@@ -259,6 +259,9 @@ param(
     [string]$GuardReadDelay = ''
 )
 $ErrorActionPreference = 'Stop'
+# DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r2 (adversary A3 sibling): a caller's $PSNativeCommandUseErrorActionPreference = $true is inherited by `& script`; with Stop it would turn the
+# raw quiet launch's documented non-zero exits into a terminating error. Every raw launch here reads $LASTEXITCODE itself.
+$PSNativeCommandUseErrorActionPreference = $false
 $here = $PSScriptRoot
 Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking
 Import-Module (Join-Path $here 'VenueThermalGate.psm1') -Force
@@ -1629,7 +1632,8 @@ if ($legPlanMode) {
             if ($specRefusal[0]) { Stop-PlanRefused $specRefusal[0] $n $specRefusal[1] }
             $budgetRefusal = Get-ExportBudgetRefusal $path   # r8 (adversary r7 A3): an export window the agent's job cap refuses is refused HERE, before any claim or lease
             if ($budgetRefusal[0]) { Stop-PlanRefused $budgetRefusal[0] $n $budgetRefusal[1] }
-            $items.Add([pscustomobject]@{ item = $n; legId = (Get-LegSpecId $path); spec = $path; backend = $be.ToLowerInvariant(); arm = $arm; sourceCommit = $sc.ToLowerInvariant(); buildManifestSha256 = $ms.ToLowerInvariant() })
+            $items.Add([pscustomobject]@{ item = $n; legId = (Get-LegSpecId $path); spec = $path; backend = $be.ToLowerInvariant(); arm = $arm; sourceCommit = $sc.ToLowerInvariant(); buildManifestSha256 = $ms.ToLowerInvariant()
+                    specSha256 = [string]$script:SpecBudgetSha256[$path] })   # r2 (adversary A1 class): THIS item's judged bytes
         }
         # Each build once (the read Invoke-VenueChain's supplementary leg makes): staged on the venue, and with exactly the manifest the item names.
         $builds = [ordered]@{}
@@ -1665,7 +1669,7 @@ if ($legPlanMode) {
         }
         foreach ($it in $ordered) {
             $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}-{3}' -f ($plan.Count + 1), $it.legId, $it.backend, $it.arm); spec = $it.spec; backend = $it.backend
-                    arm = $it.arm; sourceCommit = $it.sourceCommit; buildManifestSha256 = $it.buildManifestSha256; planItem = $it.item })
+                    arm = $it.arm; sourceCommit = $it.sourceCommit; buildManifestSha256 = $it.buildManifestSha256; planItem = $it.item; specSha256 = $it.specSha256 })
         }
         $planRecord = [ordered]@{ schema = 'mlv-app/venue-lease-leg-plan-run/v1'; legPlan = $planPath; order = $PlanOrder; arms = @($plan | ForEach-Object { $_.arm } | Select-Object -Unique)
             legs = @($plan | ForEach-Object { [ordered]@{ name = $_.name; planItem = $_.planItem; arm = $_.arm; backend = $_.backend; sourceCommit = $_.sourceCommit; buildManifestSha256 = $_.buildManifestSha256; spec = $_.spec } })
@@ -1690,7 +1694,7 @@ if ($legPlanMode) {
         if ([string]$script:SpecBudgetSha256[[string]$e.specPath] -cne [string]$e.specSha256) {
             Stop-Usage "SPEC_CHANGED_AFTER_PREFLIGHT '$($e.specPath)' cannot be run: the leg spec read as sha256 $([string]$script:SpecBudgetSha256[[string]$e.specPath]) after the leg-set planner judged sha256 $($e.specSha256) (planned_sha256=$($e.specSha256)); no claim or lease is taken on bytes the planner did not judge"
         }
-        $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend })
+        $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend; specSha256 = [string]$e.specSha256 })
     }
 } else {
     Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force
@@ -1708,9 +1712,20 @@ if ($legPlanMode) {
         $budgetRefusal = Get-ExportBudgetRefusal $path   # r8 (adversary r7 A3): before any claim or lease, as -LegPlan does
         if ($budgetRefusal[0]) { Stop-Usage "$($budgetRefusal[0]) $($budgetRefusal[1])" }
         $legId = Get-LegSpecId $path
+        $judgedSha = [string]$script:SpecBudgetSha256[$path]   # r2 (adversary A1 class): THIS entry's judged bytes
         for ($r = 1; $r -le $Repeats; $r++) {
-            $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f ($plan.Count + 1), $legId, $(if ($Backend) { $Backend } else { 'spec' })); spec = $path; backend = $(if ($Backend) { $Backend } else { '' }) })
+            $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f ($plan.Count + 1), $legId, $(if ($Backend) { $Backend } else { 'spec' })); spec = $path; backend = $(if ($Backend) { $Backend } else { '' }); specSha256 = $judgedSha })
         }
+    }
+}
+# DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r2 (adversary A1): the input guard and the leg child below are bound through the PATH-keyed SpecBudgetSha256, which holds the LAST
+# preflight read of a path. A path named by two entries (a set, a -LegSpec list or a plan naming it twice) whose bytes changed between their preflights would bind the first
+# entry (planned and judged as other bytes) to the second's. Every entry must have been judged as the bytes its path is bound to, in every form, before any claim or lease.
+foreach ($leg in $plan) {
+    $boundSha = [string]$script:SpecBudgetSha256[[string]$leg.spec]
+    if ([string]$leg.specSha256 -cne $boundSha) {
+        $msg = "'$($leg.spec)' cannot be run: leg $($leg.name) was judged as sha256 $($leg.specSha256) but a later preflight read of the same path judged sha256 $boundSha (planned_sha256=$($leg.specSha256)); no claim or lease is taken on bytes this leg's checks did not judge"
+        if ($legPlanMode) { Stop-PlanRefused 'SPEC_CHANGED_AFTER_PREFLIGHT' $leg.planItem $msg } else { Stop-Usage "SPEC_CHANGED_AFTER_PREFLIGHT $msg" }
     }
 }
 # r11 (sol r10 blocker 2): every generated output name is checked HERE, before any claim, for every form: a leg name built from an accepted spec's own basename (the legId fallback) and a
