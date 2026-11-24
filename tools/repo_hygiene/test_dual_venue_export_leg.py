@@ -2118,6 +2118,54 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
                 self.assertEqual(g["outcome"], "INVALID", g)
                 self.assertTrue(any(p.startswith("EXPORT_PROFILE_FOREIGN") and "fps=" in p for p in g["problems"]), g)
 
+    # --- r6: sol r5 on b02a6634, B3 and B8 only (each from sol's literal row; hub ruling HUB-TICK 20261124T0412Z)
+    @staticmethod
+    def producer_verified(frames: int, dims: str | None, probe: str = "C:/venue/ffmpeg/bin/ffprobe.exe", clip: str = "view-0") -> str:
+        """The rendered runner's RENDER_VERIFIED line in its exact field order (BatchRunner.cpp:803): dims=None leaves the dimensions= field out."""
+        d = "" if dims is None else f" dimensions={dims}"
+        return (f"[BATCH] RENDER_VERIFIED {clip} decoded_frames={frames} decoded_duration=20.000 decoded_frame_bytes=1{d} bytes=9 container_probe={probe} "
+                "probe_source=ffprobe-json codec=prores container=mov sar=1:1 dar=4:3")
+
+    def test_r6_sol_b3_the_verified_dimensions_are_the_producers_required_field_read_by_token_position(self) -> None:
+        """sol r5 B3: (a) a complete emitting ProRes capture declaring output=1920x1440 whose RENDER_VERIFIED line carries no dimensions= read PASS under empty criteria (the
+        geometry check ran only when some ' dimensions=' substring was found); (b) a valid dimensions=1920x1440 beside container_probe=C:/test/kit dimensions=archive/ffprobe.exe
+        (a field-like token inside the probe path, which BatchRunner.cpp:803-810 prints verbatim) read INVALID. The producer writes dimensions= as the fifth field after the
+        tag, so the reader takes it from that token position: missing (or not at that position) is EXPORT_OUTPUT_MISMATCH, and later text never counts as the field."""
+        wide = self.CTL_START.replace("output=1920x1080 scaled=false", "output=1920x1440 scaled=true")
+        done = "[BATCH] DONE view-0 exported=480 skipped=0 elapsed=60.0"
+        def batch(verified: str) -> str:
+            return "\n".join((wide, verified, done)) + "\n"
+        scaled_log = piped_stage_log(480, scale_ms=6.0)
+        moved = self.producer_verified(480, None).replace(" bytes=9 ", " bytes=9 dimensions=1920x1440 ")
+        bad = [self.producer_verified(480, None), self.producer_verified(480, ""), moved]
+        good = [self.producer_verified(480, "1920x1440", probe="C:/test/kit dimensions=archive/ffprobe.exe"), self.producer_verified(480, "1920x1440")]
+        proc, got = evidence_cases([self.ctl(scaled_log, batch=batch(v), criteria=[]) for v in bad] + [self.ctl(scaled_log, batch=batch(v)) for v in good])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for v, g in zip(bad, got[:len(bad)]):
+            with self.subTest(verified=v):
+                self.assertEqual(g["outcome"], "INVALID", g)
+                self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and "RENDER_VERIFIED" in p and "dimensions=" in p for p in g["problems"]), g)
+        for v, g in zip(good, got[len(bad):]):
+            with self.subTest(verified=v):
+                assert_clean_but_dual_iso_unknown(self, g)
+
+    def test_r6_sol_b8_a_rounded_zero_on_a_dual_iso_leg_keeps_the_mismatch_and_claims_no_unattempted_frame(self) -> None:
+        """sol r5 B8: a rejected attempt of 0.0004 ms writes llrawproc_dual_iso ms=0.000 (StageTiming.h:223 %.3f) on a dualIsoExpected=true leg, and the verdict detail said
+        none of the timed frames ATTEMPTED dual-ISO, which the rounded timer cannot show. The mismatch outcome stays (no reconstruction is that short); the detail reports
+        the observed rounded figure and makes no claim about attempts."""
+        log = piped_stage_log(480, dual_iso_ms=0.0)
+        proc, got = evidence_cases([self.ctl(log)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        g = got[0]
+        self.assertEqual(g["outcome"], "INVALID", g)
+        self.assertTrue(g["classMismatch"], g)
+        self.assertIs(g["metrics"]["dualIsoClassAgrees"], False, g)
+        self.assertEqual(g["metrics"]["dualIsoActiveFrames"], 0, g)
+        self.assertTrue(g["detail"].startswith("CLIP_CLASS_MISMATCH: "), g)
+        self.assertIn("0.000 ms on every one of 480 timed frame(s)", g["detail"])
+        self.assertIn("rounded", g["detail"])
+        self.assertIsNone(re.search(r"none of .*attempted|no (?:dual-ISO )?attempt ran|did not attempt", g["detail"]), g["detail"])
+
 
 EXPORT_STUB_GENERATOR = r"""
 param($SourceCommit,$BuildManifestSha256,$ClipId,$OutFile,$RepoRoot,$Venue,$Backend,$CpuQuiescenceThresholdPercent,$VenueTablePath,$PlaySeconds,$Format,$MaxFrames,$ReceiptPath,$DualIsoExpected,$ExpectReceiptSha256)
