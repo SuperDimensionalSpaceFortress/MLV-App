@@ -2260,7 +2260,7 @@ TEST(PlaybackInfoLabel, InfoTwoR7A3TheWithdrawalsPaintDebtKeepsThePeriodTheReset
     // R7h: no floor (0) is the current period; a larger current period wins over a floor
     ASSERT_EQ(42, labelPaintOwedExpectedMs(0, 42));
     ASSERT_EQ(1000, labelPaintOwedExpectedMs(450, 1000));
-    ASSERT_EQ(0, labelPaintOwedExpectedMs(0, 0));
+    ASSERT_EQ(7, labelPaintOwedExpectedMs(7, 0));   // a floor over an unknown current period
     // R7i: the wiring. The reset reads the period before it zeroes the EMA, raises the floor only after its forced relabel armed a
     // debt, every push clears the floor before it arms, and the settle reads floor and current
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
