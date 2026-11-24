@@ -5266,14 +5266,16 @@ function ConvertFrom-DvBatchLogLine {
     if ([string]::IsNullOrEmpty($body)) { return (& $fail $(if ($null -eq $g.rest) { 'it names no clip before exported=' } else { "its $($g.rest)= value is empty" })) }
     # r4 (sol r3 B4): a field of the peeled trailer named again just before it is a repeat, not clip text (DONE view-0 exported=29 skipped=1 elapsed=40.0 exported=30 ...
     # read the first triplet as the clip, and CDNG has no RENDER_START to bind the clip). A one-token clip spelled like a key is the clip (DONE requires one), so it stays.
-    # (adversary pass 2 A1 on 2d8e9bf2: the last token is the last NON-EMPTY one, so an extra separator before the trailer does not hide the repeat)
+    # (adversary pass 2 A1 on 2d8e9bf2: an extra separator before the trailer does not hide the repeat; pass 3 A1 on 68f078d6: nor does text after a buried triplet, so
+    # EVERY token of a clip of more than one token is checked, not only its last)
     if ($null -eq $g.rest) {
-        $lead = $body.TrimEnd([char]' ')
-        $at = $lead.LastIndexOf([char]' ')
-        if ($at -ge 0) {
-            $tok = $lead.Substring($at + 1)
-            foreach ($spec in $right) {
-                if (& $isField $tok $spec) { return (& $fail "before field $($field + 1) ($($right[0].Split('=')[0])=) it finds '$tok', which names $($spec.Split('=')[0])= again (the producer writes each field once, after the clip)") }
+        $clipTokens = @($body.Split([char]' ') | Where-Object { $_.Length -gt 0 })
+        if ($clipTokens.Count -gt 1) {
+            [array]::Reverse($clipTokens)   # (the repeat nearest the trailer is the one named)
+            foreach ($tok in $clipTokens) {
+                foreach ($spec in $right) {
+                    if (& $isField $tok $spec) { return (& $fail "before field $($field + 1) ($($right[0].Split('=')[0])=) its clip holds '$tok', which names $($spec.Split('=')[0])= again (the producer writes each field once, after the clip)") }
+                }
             }
         }
     }

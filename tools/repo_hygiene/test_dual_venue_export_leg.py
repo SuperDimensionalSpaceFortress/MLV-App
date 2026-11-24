@@ -2419,6 +2419,10 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
                  "INVALID", "elapsed="),
                 # (r4 adversary pass 2 A1 on 2d8e9bf2, input verbatim: an extra separator before the second triplet left an empty last token and bypassed the check)
                 ("A1-SEPARATOR", cdng_case(batch="[BATCH] DONE owner-clip exported=29 skipped=1 elapsed=40.0  exported=30 skipped=0 elapsed=20.0\n"), "INVALID", "elapsed="),
+                # (r4 adversary pass 3 A1 on 68f078d6, input shape verbatim on the 30-frame fixture: a triplet buried in the clip, followed by more clip text)
+                ("A1P3-BURIED", cdng_case(batch="[BATCH] DONE view-0 exported=29 skipped=1 elapsed=40.0 x exported=30 skipped=0 elapsed=20.0\n"), "INVALID", "elapsed="),
+                ("A1P3-LEADING", cdng_case(batch="[BATCH] DONE exported=29 x exported=30 skipped=0 elapsed=20.0\n"), "INVALID", "exported="),
+                ("CDNG-CLIP-SPACE", cdng_case(batch="[BATCH] DONE my clip exported=30 skipped=0 elapsed=20.0\n"), "PASS", None),
                 ("CDNG-CLIP-KEY", cdng_case(batch="[BATCH] DONE elapsed=1.0 exported=30 skipped=0 elapsed=20.0\n"), "PASS", None)]
         proc, got = evidence_cases([c for _, c, _, _ in rows])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
