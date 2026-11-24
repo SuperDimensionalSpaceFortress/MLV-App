@@ -41,6 +41,8 @@ from pathlib import Path
 from unittest import mock
 
 from tools.repo_hygiene.venue_fixture_modules import copy_cross_tree_modules
+# VENUE-FIFO-ADVERSARY-TAIL-1 r8: every subprocess.run of this file is run_tree_bounded (the same call; on Windows a timeout kills the whole tree), see venue_fixture_modules
+from tools.repo_hygiene.venue_fixture_modules import run_tree_bounded
 
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
@@ -827,7 +829,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
 
     def run_batch(self, specs: list[Path] | None = None, *extra: str, **env: str) -> subprocess.CompletedProcess:
         args, e = self.batch_cmd(specs, *extra, **env)
-        return subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
+        return run_tree_bounded(args, capture_output=True, text=True, timeout=600, env=e)
 
     def batch_cmd(self, specs: list[Path] | None = None, *extra: str, **env: str) -> tuple[list[str], dict]:
         e = dict(os.environ)
@@ -1400,7 +1402,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             "$out['beforeFloor'] = (Get-AgentJobEndTs $obs $floor ([DateTime]::UtcNow.AddSeconds(-60).ToString('o'))) -eq $floor\n"
             "$out | ConvertTo-Json -Compress\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(json.loads(out.stdout), {"ahead": True, "unreadable": True, "absent": True, "past": True, "beforeFloor": True})
 
@@ -1422,7 +1424,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             "$a = Get-AgentJobEndTs $t0Ts $floor ($t0.AddSeconds(-2).ToString('o'))\n"
             "[ordered]@{ statements = $stmts.Count; lateSec = [Math]::Round(($a - $trueEnd) / [double]$f, 3); atOrAboveFloor = ($a -ge $floor) } | ConvertTo-Json -Compress\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout)
         # r10 (sol r9b 9a56fa7a-A1): the helper reads no clock at all now (the send, floored at the observation), so its body may be one statement; the pause bound still holds
@@ -1457,7 +1459,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             "}\n"
             "$out | ConvertTo-Json -Compress\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=180)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=180)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(json.loads(out.stdout), {
             "receipt_nullThenObject": "ABSENT", "ledger_nullThenObject": 0,
@@ -1504,7 +1506,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             "}\n"
             "$out | ConvertTo-Json -Compress -Depth 4\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=240)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=240)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout)
         for k in ("idle", "room", "thermal"):
@@ -1554,7 +1556,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             "})\n"
             "[ordered]@{ cut = $cut; runs = $runs } | ConvertTo-Json -Compress -Depth 4\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=240)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=240)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout)
         self.assertGreaterEqual(got["cut"], 8, got)
@@ -1594,7 +1596,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             "$p = Get-AgentJobEndTs $obs $floor ([DateTime]::UtcNow.AddSeconds(-6).ToString('o')) ([DateTime]::UtcNow.AddSeconds(-8).ToString('o')); $out['pastUnchanged'] = ($p -ge $floor) -and ($p -le $now - 5 * $f)\n"
             "$out | ConvertTo-Json -Compress\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(json.loads(out.stdout), {"aheadRuntimeIsTheSend": True, "aheadLongRuntimeIsTheSend": True, "aheadStartedNull": True, "aheadStartedAbsent": True,
                                                   "aheadStartedUnreadable": True, "aheadStartedAfterEnd": True, "aheadStartedArray": True, "pastUnchanged": True})
@@ -1633,7 +1635,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             "$fn = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Get-AgentJobEndTs' }, $true)\n"
             "[ordered]@{ cases = $n; bad = @($bad); sol = $sol; readsAgentOrWallClock = [bool](((@($fn.Parameters | ForEach-Object { $_.Extent.Text }) + @($fn.Body.EndBlock.Statements | ForEach-Object { $_.Extent.Text })) -join \"`n\") -match 'UtcNow|Get-Date|ConvertTo-AgentUtc|EndedUtc|StartedUtc') } | ConvertTo-Json -Compress -Depth 4\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout)
         self.assertEqual(got["cases"], 64, got)
@@ -1712,7 +1714,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             "$f = [Diagnostics.Stopwatch]::Frequency; $t0 = [DateTime]::new(2000, 1, 1, 0, 0, 0, [DateTimeKind]::Utc); $t0Ts = [Diagnostics.Stopwatch]::GetTimestamp() - 5 * $f\n"
             "[Math]::Round(((Get-WaitNowUtc) - $t0).TotalSeconds, 1)\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertLess(abs(float(out.stdout.strip()) - 5.0), 0.5, out.stdout)
 
@@ -1730,7 +1732,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             ". ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Get-WaitNowUtc' }, $true).Extent.Text))\n"
             "[ordered]@{ order = @($top | ForEach-Object { ($_ -split '=')[0].Trim() }); aheadSec = [Math]::Round(((Get-WaitNowUtc) - [DateTime]::UtcNow).TotalSeconds, 3) } | ConvertTo-Json -Compress\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout)
         self.assertGreaterEqual(got["aheadSec"], -0.3, f"a pause between Wait-VenueQuiet's two clock reads put Get-WaitNowUtc behind real time (every deadline ends that late): {got}")
@@ -1761,7 +1763,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             "}\n"
             "$out | ConvertTo-Json -Compress -Depth 4\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout)
         for key in ("deadlineSec", "gateEndSec"):
@@ -1875,7 +1877,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             "$out['arrayGivesTheSend'] = (Get-AgentJobEndTs $obs $floor ($e.ToString('o')) $st) -eq $floor\n"
             "$out | ConvertTo-Json -Compress\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(json.loads(out.stdout), {"psoArray": True, "dictArray": True, "scalar": True, "missing": True, "notOneObject": True, "arrayGivesTheSend": True})
 
@@ -1911,7 +1913,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
                 "$bad = @(foreach ($c in $calls) { foreach ($e in $c.CommandElements) { if ($e -is [System.Management.Automation.Language.CommandParameterAst] -and $declared -cnotcontains $e.ParameterName) { \"$($c.Extent.StartLineNumber):-$($e.ParameterName)\" } } })\n"
                 "[ordered]@{ calls = $calls.Count; declared = $declared; bad = $bad } | ConvertTo-Json -Compress\n"
             )
-            out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+            out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
             self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
             return json.loads(out.stdout)
         r = offenders(RUNNER)
@@ -1996,7 +1998,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             "$out['dict'] = (Get-AdmissionLeaseBatch ([pscustomobject]@{ admission = [pscustomobject]@{ leaseBatch = [ordered]@{ token = 't'; leaseId = 'L1' } } })).state\n"
             "$out | ConvertTo-Json -Compress\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(json.loads(out.stdout), {
             "object": "OBJECT|INVALID|True", "array": "MALFORMED|INVALID|False", "nullplus": "MALFORMED|INVALID|False", "nested": "MALFORMED|INVALID|False",
@@ -2117,7 +2119,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             "$rd = { param($id) $x = Read-VenueLeaseBatchReceipt -AgentShare $s -Token '0123456789ab' -LeaseId $id; \"$($x.state):$($x.record.endReason)\" }\n"
             "[ordered]@{ exact = (& $rd 'L1'); shyMid = (& $rd ('L' + $shy + '1')); lead = (& $rd ' L1'); empty = (& $rd ''); blank = (& $rd ' ') } | ConvertTo-Json -Compress\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(json.loads(out.stdout), {"exact": "FOUND:closed", "shyMid": "ABSENT:", "lead": "ABSENT:", "empty": "ABSENT:", "blank": "ABSENT:"})
 
@@ -2172,7 +2174,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             "$led = @(Read-VenueLeaseLedger -Venue 'v' -ClaimDir $cd -SinceUtc '2000-01-01T00:00:00Z')\n"
             "[ordered]@{ exact = (& $rd '2026-10-30T10:00:00Z'); dotZero = (& $rd '2026-10-30T10:00:00.0Z'); offset = (& $rd '2026-10-30T10:00:00+00:00'); ledger = [string]$led[0].leaseId } | ConvertTo-Json -Compress\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(json.loads(out.stdout), {"exact": "FOUND:closed", "dotZero": "FOUND:other", "offset": "ABSENT:", "ledger": "2026-10-30T10:00:00.0Z"})
 
@@ -2298,7 +2300,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         for extra, needle in ((["-LeaseBudgetWindowSec", "3600"], "LEASE_CAP_RELAXED"),
                               (["-LeaseCapSec", "2701"], "LeaseCapSec"), (["-RenewGapMaxSec", "121"], "RenewGapMaxSec"), (["-LeaseBudgetSec", "10801"], "LeaseBudgetSec")):
             with self.subTest(extra=extra):
-                out = subprocess.run(base + extra, capture_output=True, text=True, timeout=120)
+                out = run_tree_bounded(base + extra, capture_output=True, text=True, timeout=120)
                 self.assertNotEqual(out.returncode, 0, out.stdout + out.stderr)
                 self.assertIn(needle, out.stdout + out.stderr)
         self.assertFalse(self.claim_path.exists())
@@ -2316,7 +2318,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             arr = ", ".join(f"[pscustomobject]@{{ startUtc = '{s}'; endUtc = '{e}' }}" for s, e in leases)
             script += f"$w = Get-VenueLeaseBudgetWait -Leases @({arr}) -NowUtc $now; $o['{name}'] = [ordered]@{{ reason = $w.reason; waitSec = $w.waitSec; usedSec = $w.usedSec }}\n"
         script += "$o | ConvertTo-Json -Compress -Depth 4\n"
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout)
         self.assertEqual(got["none"], {"reason": "NONE", "waitSec": 0, "usedSec": 0})
@@ -2440,7 +2442,7 @@ $o['fb-budget-looser'] = Test-Caps $fb 1800 $false 9000 $true $false
 $o['fb-tighter'] = Test-Caps $fb 2400 $true 3000 $true $false
 $o | ConvertTo-Json -Compress
 """
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout)
         self.assertEqual(got["live"], "live 300 9720 2700")
@@ -2471,7 +2473,7 @@ foreach ($w in 10800, 21600, 86400, 3600, 600) {{
 }}
 $o | ConvertTo-Json -Compress -Depth 4
 """
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout)
         self.assertEqual(got["w10800"]["budgetSec"], 5400)
@@ -2500,7 +2502,7 @@ foreach ($t in '{caps(1440)}', '{caps(2880)}', '{caps(10080)}', '{caps(0.5)}', '
 }}
 $o | ConvertTo-Json -Compress
 """
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout)
         self.assertEqual(got["c0"], "live 86400")
@@ -2514,7 +2516,7 @@ $o | ConvertTo-Json -Compress
 $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
 [ordered]@{{ ids = $ids; distinct = @($ids | Select-Object -Unique).Count }} | ConvertTo-Json -Compress
 """
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout)
         self.assertEqual(got["distinct"], 40, "40 ids built back to back (the same second) must all differ")
@@ -2660,7 +2662,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
             f"$v = Get-JobNotAfterVerdict -Metadata ([pscustomobject]@{{ notAfterUtc = '{not_after_utc}' }}) -Sidecar (Read-JobNotAfterSidecar -JobId '{job_id}')\n"
             "[ordered]@{ state = $v.state; source = $v.source; livenessState = $v.livenessState; livenessSeq = $v.livenessSeq; why = $v.why } | ConvertTo-Json -Compress\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         return json.loads(out.stdout)
 
@@ -2697,7 +2699,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
             live = self._agent_verdict(side_dir, job, far)
             self.assertEqual((live["state"], live["livenessState"], live["source"]), ("open", "live", "meta"), live)
             self.assertIsNone(p.poll(), "the runner is still waiting on its open")
-            subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+            run_tree_bounded(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
             p.wait(timeout=60)
             killed_at = datetime.now(timezone.utc)
             time.sleep(1.5)   # a write in flight at the kill lands, or not
@@ -2713,7 +2715,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
             self.assertFalse(_pid_alive(p.pid), "the killed runner is gone")
         finally:
             if p.poll() is None:
-                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                run_tree_bounded(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
                 p.wait(timeout=60)
             p.stdout.close()
             p.stderr.close()
@@ -2920,7 +2922,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
                 time.sleep(0.5)
             self.assertIsNone(p.poll(), "the run is still in its open's wait at TTL + 10 s")
             script = f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n$c = Get-VenueClaim -Venue bachelor -ClaimDir '{psq(self.claims)}'\n[ordered]@{{ state = $c.state; reason = $c.reason; nonce = $c.claim.nonce }} | ConvertTo-Json -Compress\n"
-            out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+            out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
             self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
             seen = json.loads(out.stdout)
             self.assertEqual((seen["state"], seen["reason"], seen["nonce"]), ("LIVE", None, c0["nonce"]), seen)
@@ -2931,7 +2933,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
             so, se = p.communicate(timeout=300)
         finally:
             if p.poll() is None:
-                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                run_tree_bounded(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
                 p.wait(timeout=60)
         self.assertEqual(p.returncode, 0, so + se)
         [b] = self.batches()
@@ -2955,7 +2957,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
             f"$gone = Update-VenueClaim -Venue bachelor -Nonce $c.claim.nonce -TtlSec 600 -ClaimDir '{psq(self.claims)}'\n"
             "[ordered]@{ other = $other.state; same = $same; mine = $mine.state; live = $after.state; ttlLeft = [int](($after.claim.expiresUtc.ToUniversalTime() - [DateTime]::UtcNow).TotalSeconds); rel = $rel; gone = $gone.state } | ConvertTo-Json -Compress\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout)
         self.assertEqual((got["other"], got["same"], got["mine"], got["live"], got["rel"], got["gone"]), ("NOT_OURS", True, "RENEWED", "LIVE", "RELEASED", "ABSENT"), got)
@@ -2965,7 +2967,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
     def _deny_writes(self, folder: Path) -> None:
         """The first sidecar write fails: this user may not create files in the folder (a deny ACE). Removed again at cleanup."""
         who = f"{os.environ['USERDOMAIN']}\\{os.environ['USERNAME']}"
-        subprocess.run(["icacls", str(folder), "/deny", f"{who}:(OI)(CI)(WD,AD)"], check=True, capture_output=True, text=True, timeout=60)
+        run_tree_bounded(["icacls", str(folder), "/deny", f"{who}:(OI)(CI)(WD,AD)"], check=True, capture_output=True, text=True, timeout=60)
         self.addCleanup(subprocess.run, ["icacls", str(folder), "/remove:d", who], capture_output=True, text=True, timeout=60)
 
     def _assert_no_open_submitted(self, r: subprocess.CompletedProcess, first: str) -> dict:
@@ -3010,7 +3012,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
                 time.sleep(0.1)
             time.sleep(2)
             if p.poll() is None:
-                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                run_tree_bounded(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
             p.wait(timeout=60)
             time.sleep(2)   # anything in flight at the kill lands, or not
             inbox = self.share / "inbox"
@@ -3020,7 +3022,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
             self.assertFalse(_pid_alive(p.pid))
         finally:
             if p.poll() is None:
-                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                run_tree_bounded(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
                 p.wait(timeout=60)
             p.stdout.close()
             p.stderr.close()
@@ -3140,7 +3142,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
             f"  noSidecar = Test-VenueJobLivenessReadback -AgentShare '{psq(self.share)}' -JobId 'j1'\n"
             "} | ConvertTo-Json -Compress -Depth 4\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout)
         self.assertEqual((got["noFns"]["live"], got["noFile"]["live"], got["noSidecar"]["live"]), (False, False, False), got)
@@ -3173,7 +3175,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
             "[ordered]@{ live = $r.live; state = $r.state; livenessState = $r.livenessState; error = $r.error; ms = $t.ElapsedMilliseconds } | ConvertTo-Json -Compress\n"
             "Complete-VenueProcess -ExitCode 0\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=100)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=100)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout.strip().splitlines()[-1])
         self.assertEqual((got["live"], got["state"], got["livenessState"]), (False, "UNKNOWN", "UNKNOWN"), got)
@@ -3285,14 +3287,14 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         # the real failure, no seam: <RunDir>\batch-jobs denies this user "create files" (the caps probe fails there too and reads the fallback caps)
         jobs = self.run_dir / "batch-jobs"
         jobs.mkdir(parents=True)
-        user = subprocess.run(["whoami"], capture_output=True, text=True, timeout=60).stdout.strip()
-        deny = subprocess.run(["icacls", str(jobs), "/deny", f"{user}:(WD)"], capture_output=True, text=True, timeout=60)
+        user = run_tree_bounded(["whoami"], capture_output=True, text=True, timeout=60).stdout.strip()
+        deny = run_tree_bounded(["icacls", str(jobs), "/deny", f"{user}:(WD)"], capture_output=True, text=True, timeout=60)
         if deny.returncode != 0:
             self.skipTest(f"icacls could not deny file creation: {deny.stdout} {deny.stderr}")
         try:
             r = self.run_batch([self.specs[0]], "-CancelReconcileSec", "3")
         finally:
-            subprocess.run(["icacls", str(jobs), "/remove:d", user], capture_output=True, text=True, timeout=60)
+            run_tree_bounded(["icacls", str(jobs), "/remove:d", user], capture_output=True, text=True, timeout=60)
         self._assert_open_never_submitted(r)
 
     def test_r16_b1_control_an_open_that_reached_um_run_and_stays_unreconciled_is_still_charged_a_full_lease(self) -> None:
@@ -3380,7 +3382,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
             f"[ordered]@{{ leg = Get-LeaseBatchToken '{stem}'; health = Get-LeaseBatchToken '{stem}-health'; healthLight = ('{stem}-health' -match $p); legLight = ('{stem}' -match $p)\n"
             "  open = Get-LeaseBatchToken 'lease-batch-open-20261023T184200Z-lb0123456789ab'; close = Test-LeaseBatchCloseJobId 'lease-batch-close-20261023T184200Z-lb0123456789ab' } | ConvertTo-Json -Compress\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout)
         self.assertEqual(got, {"leg": "0123456789ab", "health": None, "healthLight": True, "legLight": False, "open": "0123456789ab", "close": True})
@@ -3406,7 +3408,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
             "  bad = (Get-VenueJobResult -AgentShare $s -JobId '..\\x').state; rec = (Read-VenueLeaseBatchReceipt -AgentShare $s -Token '0123456789ab' -LeaseId 'L1').record.endReason\n"
             "  none = (Read-VenueLeaseBatchReceipt -AgentShare $s -Token '0123456789ab' -LeaseId 'L9').state; nofile = (Read-VenueLeaseBatchReceipt -AgentShare $s -Token 'ffffffffffff' -LeaseId 'L1').state } | ConvertTo-Json -Compress\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(json.loads(out.stdout), {"found": "L1", "absent": "ABSENT", "bad": "UNKNOWN", "rec": "closed", "none": "ABSENT", "nofile": "ABSENT"})
 
@@ -3429,7 +3431,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
             f"$rd = {{ param($id) $x = Read-VenueLeaseBatchReceipt -AgentShare $s -Token '{t}' -LeaseId $id; \"$($x.state):$($x.record.endReason)\" }}\n"
             "$o = [ordered]@{}; foreach ($id in 'L1','L2','L3','L4','L5','L6','L7','L8','L9') { $o[$id] = & $rd $id }; $o | ConvertTo-Json -Compress\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         want = {"L1": "FOUND:idle"} | {f"L{i}": "ABSENT:" for i in range(2, 10)}
         self.assertEqual(json.loads(out.stdout), want)
@@ -3450,7 +3452,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
             f"$rd = {{ param($id) $x = Read-VenueLeaseBatchReceipt -AgentShare $s -Token '{t}' -LeaseId $id; \"$($x.state):$($x.record.endReason)\" }}\n"
             "[ordered]@{ L1 = (& $rd 'L1'); one = (& $rd '1'); arr = (& $rd '[\"L1\"]') } | ConvertTo-Json -Compress\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(json.loads(out.stdout), {"L1": "FOUND:idle", "one": "ABSENT:", "arr": "ABSENT:"})
 
@@ -3532,7 +3534,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
 
     def run_plan(self, plan: Path, *extra: str, **env: str) -> subprocess.CompletedProcess:
         args, e = self.plan_cmd(plan, *extra, **env)
-        return subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
+        return run_tree_bounded(args, capture_output=True, text=True, timeout=600, env=e)
 
     def leg_calls(self) -> list[dict]:
         return [json.loads(l) for l in self.leg_args.read_text(encoding="utf-8").splitlines() if l.strip()] if self.leg_args.exists() else []
@@ -3682,7 +3684,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             "$items = 'AAaa'.ToCharArray() | ForEach-Object -Begin { $i = 0 } -Process { $i++; [pscustomobject]@{ arm = [string]$_; n = $i } }\n"
             "(@(Get-VenueInterleavedLegPlan -Items @($items)) | ForEach-Object { \"$($_.arm)$($_.n)\" }) -join ' '\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(out.stdout.strip(), "A1 a3 A2 a4")
 
@@ -3789,7 +3791,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         script = (f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
                   f"$r = Request-VenueClaim -Venue bachelor -RunDir 'C:\\other-run' -Purpose foreign -TtlSec 3600 -ClaimDir '{psq(self.claims)}' -OwnerPid {os.getpid()}\n"
                   "$r.granted\n")
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.stdout.strip(), "True", out.stdout + out.stderr)
         r = self.run_plan(self.ab_block_plan(), "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=8)))
         self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
@@ -3833,7 +3835,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         (self.run_dir / "leg-plan.json").mkdir()
         args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
         try:
-            r = subprocess.run(args, capture_output=True, text=True, timeout=90, env=e)
+            r = run_tree_bounded(args, capture_output=True, text=True, timeout=90, env=e)
         except subprocess.TimeoutExpired as ex:
             self.fail(f"the process did not end within 90 s (the claim keeper outlived the throw): {ex.stdout!r}")
         self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
@@ -3957,7 +3959,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         done, t, state = self._lock_log_while_the_runner_is_paused(self.run_dir / "batch.log", paused, locked)
         t0 = time.monotonic()
         try:
-            r = subprocess.run(args, capture_output=True, text=True, timeout=90, env=e)
+            r = run_tree_bounded(args, capture_output=True, text=True, timeout=90, env=e)
         except subprocess.TimeoutExpired as ex:
             self.fail(f"the process did not end within 90 s: {ex.stdout!r}")
         finally:
@@ -3984,7 +3986,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         seed = (f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
                 f"$r = Request-VenueClaim -Venue bachelor -RunDir 'C:\\dead-run' -Purpose dead -TtlSec 3600 -ClaimDir '{psq(self.claims)}' -OwnerPid {os.getpid()}\n"
                 "$r.granted\n")
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", seed], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", seed], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.stdout.strip(), "True", out.stdout + out.stderr)
         # the owner is gone (a pid no process has): the next claim request breaks it as dead-pid, the way the STEAL fake leaves a foreign claim
         self.claim_path.write_text(re.sub(r'"ownerPid":\s*\d+', '"ownerPid":99999999', self.claim_path.read_text(encoding="utf-8")), encoding="utf-8")
@@ -3992,7 +3994,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         runner = self._patched_runner(anchor, anchor + "    if ($Message -like 'CLAIM_STALE_BROKEN*') { throw 'simulated log failure' }\n")
         args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
         args[args.index("-File") + 1] = str(runner)
-        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=120, env=e)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertFalse(self.claim_path.exists(), "the claim was left behind")
         res = batch_result(r.stdout)
@@ -4022,7 +4024,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         runner = self._patched_runner(anchor, "try { throw 'simulated result-line append failure'; Add-Content -LiteralPath $batchLog -Value $resultLine }")
         args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
         args[args.index("-File") + 1] = str(runner)
-        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=120, env=e)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(batch_result(r.stdout)["ran"], 4)
         self.assertIn("BATCH_LOG_FAILED the batch log cannot be written (simulated result-line append failure)", r.stderr)
@@ -4035,7 +4037,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
         args[args.index("-File") + 1] = str(runner)
         e = dict(e, FAKE_QUIET_MODES="QUIET,IDLE,QUIET")
-        r = subprocess.run(args, capture_output=True, text=True, timeout=180, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=180, env=e)
         res = batch_result(r.stdout)
         # r3 (Grok G5): the stop reason is pinned (this slot compared it with itself): the idle end is a batch end, never a run stop, so the run ends with none
         self.assertEqual((r.returncode, res["stopReason"], res["ran"], res["notRun"]), (0, None, 4, 0), r.stdout + r.stderr)
@@ -4049,7 +4051,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave", "-DeadlineUtc", dl)
         args[args.index("-File") + 1] = str(runner)
         e = dict(e, FAKE_QUIET_MODES="PASTDEADLINE", FAKE_DEADLINE_UTC=dl)
-        r = subprocess.run(args, capture_output=True, text=True, timeout=180, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=180, env=e)
         res = batch_result(r.stdout)
         self.assertEqual((r.returncode, res["stopReason"], res["ran"]), (3, "DEADLINE", 0), r.stdout + r.stderr)
         self.assertEqual(self.batches()[0]["endReason"], "DEADLINE", self.batches()[0])
@@ -4061,7 +4063,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         runner = self._patched_runner(anchor, "try { throw [IO.IOException]::new('locked'); Add-Content -LiteralPath $batchLog -Value $resultLine }")
         args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
         args[args.index("-File") + 1] = str(runner)
-        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=120, env=e)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         res = batch_result(r.stdout)
         self.assertEqual(res["ran"], 4)
@@ -4075,7 +4077,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         runner = self._patched_runner(anchor, anchor + "    if ($Message -like 'BATCH_END*') { throw [IO.IOException]::new('locked') }\n")
         args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
         args[args.index("-File") + 1] = str(runner)
-        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=120, env=e)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         res = batch_result(r.stdout)
         self.assertEqual(res["ran"], 4)
@@ -4097,7 +4099,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         runner = self._patched_runner(anchor, anchor + "    if ($Message -like 'BATCH_END*') { throw [IO.IOException]::new('locked') }\n")
         args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
         args[args.index("-File") + 1] = str(runner)
-        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=120, env=e)
         self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
         [b] = self.batches()
         self.assertEqual((b["endReason"], b["preOpenWait"]["reason"]), ("DEADLINE", "BUDGET"))
@@ -4190,7 +4192,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         args[args.index("-File") + 1] = str(runner)
         done, t, state = self._lock_log_while_the_runner_is_paused(self.run_dir / "batch.log", paused, locked)
         try:
-            r = subprocess.run(args, capture_output=True, text=True, timeout=90, env=e)
+            r = run_tree_bounded(args, capture_output=True, text=True, timeout=90, env=e)
         except subprocess.TimeoutExpired as ex:
             self.fail(f"the process did not end within 90 s: {ex.stdout!r}")
         finally:
@@ -4230,7 +4232,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         args[args.index("-File") + 1] = str(runner)
         done, t, state = self._lock_log_while_the_runner_is_paused(self.run_dir / "batch.log", paused, locked, give_up_s)
         try:
-            r = subprocess.run(args, capture_output=True, text=True, timeout=90, env=e)
+            r = run_tree_bounded(args, capture_output=True, text=True, timeout=90, env=e)
         except subprocess.TimeoutExpired as ex:
             self.fail(f"the process did not end within 90 s: {ex.stdout!r}")
         finally:
@@ -4265,7 +4267,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         lines = [f"$v = '{psq(s)}'; ($v.ToCharArray() | ForEach-Object {{ [int]$_ }}) -join ','" for s in samples]
         script = self.case / "psq-probe.ps1"
         script.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
-        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=120)
+        r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(r.stdout.split(), [",".join(str(ord(c)) for c in s) for s in samples], r.stdout + r.stderr)
 
@@ -4379,7 +4381,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     def _two_batch_plan_refused_at_batch_2(self, inject: str) -> tuple[subprocess.CompletedProcess, Path]:
         args, e, patch = self._two_batch_plan(inject)
         args[args.index("-File") + 1] = str(self._patched_runner(*patch))
-        return subprocess.run(args, capture_output=True, text=True, timeout=120, env=e), self.case / "fx-b-copy.json"
+        return run_tree_bounded(args, capture_output=True, text=True, timeout=120, env=e), self.case / "fx-b-copy.json"
 
     def test_r3_adv_a1_a_refusal_line_that_cannot_be_logged_is_in_the_count_the_summary_reports(self) -> None:
         # adversary r3 pass 2 A1: the summary was printed BEFORE Stop-PlanRefused tried its own log line, and that append's failure was swallowed uncounted, so the authoritative
@@ -4436,7 +4438,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         args, e, _ = self._two_batch_plan("")
         anchor_l = "function L([string]$Message) {\n"
         args[args.index("-File") + 1] = str(self._patched_runner(anchor_l, anchor_l + "    " + inject + "\n"))
-        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=120, env=e)
         self.assertTrue(snap.exists(), "the link was made inside the diagnostic (the case under test)\n" + r.stdout + r.stderr)
         self.assertEqual((self.run_dir / "batch-01.json").read_bytes(), snap.read_bytes(), "the receipt rewrite went through the new link and overwrote the accepted input\n" + r.stdout + r.stderr)
         self.assertIn("BATCH_RECEIPT_WRITE_SKIPPED batch=1 ", r.stderr)
@@ -4462,7 +4464,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             undo = f"[IO.File]::Delete('{ps2}'); [IO.File]::Copy('{psq(original)}', '{ps2}')"
             patches.append((guard_old, f"        if ($batchNo -eq 2) {{ {undo} }}\n" + guard_old))
         args[args.index("-File") + 1] = str(self._patched_runner(*patches[0], *patches[1:]))
-        return subprocess.run(args, capture_output=True, text=True, timeout=120, env=e), spec2, original
+        return run_tree_bounded(args, capture_output=True, text=True, timeout=120, env=e), spec2, original
 
     def test_r4_adv2_a1_the_jsonl_line_is_not_appended_to_an_input_that_became_a_link_to_batches_jsonl_during_the_diagnostic(self) -> None:
         # adversary r4 pass 2 A1: the batches.jsonl append (and the pre-claim deadline path's receipt writes) had no alias guard, only the rewrite did. batch-01.json is a directory, so its
@@ -4500,7 +4502,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         anchor_l = "function L([string]$Message) {\n"
         args, e, _ = self._two_batch_plan("")
         args[args.index("-File") + 1] = str(self._patched_runner(anchor_l, anchor_l + "    if ($Message.StartsWith('RECEIPT_PERSIST_FAILED', [StringComparison]::Ordinal)) { throw [IO.IOException]::new('locked') }\n"))
-        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=120, env=e)
         self.assertEqual(r.returncode, 13, r.stdout + r.stderr)
         self.assertGreaterEqual(json.loads((self.run_dir / "batch-01.json").read_text(encoding="utf-8"))["logWriteFailures"], 1, "batch-01.json was rewritten with the diagnostic's log failure")
         self.assertNotIn("BATCH_RECEIPT_WRITE_SKIPPED", r.stderr)
@@ -4531,7 +4533,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         else:
             new = anchor + ("            " if anchor == self._PRECLAIM_DEADLINE else "        ") + inject + "\n"
         args[args.index("-File") + 1] = str(self._patched_runner(anchor, new))
-        return subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+        return run_tree_bounded(args, capture_output=True, text=True, timeout=240, env=e)
 
     def _r5_assert_suppressed(self, res: dict, reason: str, batches: tuple = (1,)) -> None:
         got = sorted((f["batch"], Path(f["file"]).name) for f in res["receiptPersistFailures"])
@@ -4652,7 +4654,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["receiptPersistFailures"]), (2, "INPUT_UNREADABLE", 1, []))
                 self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr)
                 self.assertTrue((self.run_dir / "batch-01.json").is_file())
-                subprocess.run(["icacls", str(spec), "/reset"], capture_output=True)
+                run_tree_bounded(["icacls", str(spec), "/reset"], capture_output=True)
 
     def test_r5b_adv_a2_a_plan_missing_only_while_one_guard_ran_is_no_alias_and_suppresses_nothing(self) -> None:
         # adversary r5b A2: the guard failed to open the plan (moved away in a save-as-rename), the plan was back before Get-InputUnresolvedCode probed it, and that stale failure was
@@ -4667,7 +4669,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         restore = anchor + f"    if ([IO.File]::Exists('{away}')) {{ [IO.File]::Move('{away}', '{p}') }}\n"
         new = f"        if ($true) {{ [IO.File]::Move('{p}', '{away}') }}\n" + self._FINAL_RECEIPT
         args[args.index("-File") + 1] = str(self._patched_runner(self._FINAL_RECEIPT, new, (anchor, restore)))
-        r = subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=240, env=e)
         self.assertTrue(plan.is_file() and not Path(str(plan) + ".away").exists(), "the plan was moved away and back (the case under test)\n" + r.stdout + r.stderr)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         res = batch_result(r.stdout)
@@ -4714,7 +4716,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
 
     def _rpf06_run(self, args: list[str], e: dict, inject: str, *more: tuple[str, str]) -> subprocess.CompletedProcess:
         args[args.index("-File") + 1] = str(self._patched_runner(self._FINAL_RECEIPT, f"        if ($true) {{ {inject} }}\n" + self._FINAL_RECEIPT, *more))
-        return subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+        return run_tree_bounded(args, capture_output=True, text=True, timeout=240, env=e)
 
     def _rpf06_assert_typed_and_written(self, r: subprocess.CompletedProcess) -> dict:
         self.assertEqual(r.returncode, 2, "an output that could not be inspected was not its own typed stop\n" + r.stdout + r.stderr)
@@ -4944,7 +4946,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                     self.assertFalse((self.run_dir / "batch-01.json").exists())
                 finally:
                     for p in (target.parent, target):
-                        subprocess.run(["icacls", str(p), "/remove:d", os.environ.get("USERDOMAIN", "") + "\\" + os.environ.get("USERNAME", "")], capture_output=True)
+                        run_tree_bounded(["icacls", str(p), "/remove:d", os.environ.get("USERDOMAIN", "") + "\\" + os.environ.get("USERNAME", "")], capture_output=True)
 
     def test_r6_adv2_a1_a_log_that_is_an_input_whose_own_path_will_not_resolve_is_never_written(self) -> None:
         # adversary r6 pass 2 A1: the spec's own path stops resolving (as a share that now denies it; injected, since a share needs admin) while the file is batch.log by another name.
@@ -5005,7 +5007,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                     out, err = p.communicate(timeout=300)
                 finally:
                     if p.poll() is None:
-                        subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                        run_tree_bounded(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
                         p.communicate(timeout=60)
                 self.assertFalse(spec.exists(), "A stays absent (the case under test)")
                 self.assertEqual(old.read_bytes(), snap, "a write landed in the accepted input through batch.log\n" + out + err)
@@ -5020,7 +5022,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         orig, cur, snap = self.case / "r7" / "orig", self.case / "r7" / "cur", self.case / "r7-spec.snap"
         orig.mkdir(parents=True)
         (orig / "batch-01.json").write_bytes(self.specs[0].read_bytes())
-        subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", f"New-Item -ItemType Junction -Path '{psq(cur)}' -Value '{psq(orig)}' | Out-Null"], check=True, capture_output=True)
+        run_tree_bounded([PWSH, "-NoProfile", "-NonInteractive", "-Command", f"New-Item -ItemType Junction -Path '{psq(cur)}' -Value '{psq(orig)}' | Out-Null"], check=True, capture_output=True)
         spec = cur / "batch-01.json"
         args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
         s, c = psq(spec), psq(cur)
@@ -5057,7 +5059,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                     # injected denial is a process-wide flag (as a real denied lookup reaches every thread)
                     patches.append((self._RPF06_RESOLVE, f"if ($env:MLV_TEST_RPF06_DENY_SPEC -and $Path -ieq '{s}') {{ throw [UnauthorizedAccessException]::new('injected: access to the input path is denied') }}; " + self._RPF06_RESOLVE))
                 args[args.index("-File") + 1] = str(self._patched_runner(*patches[0], *patches[1:]))
-                r = subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+                r = run_tree_bounded(args, capture_output=True, text=True, timeout=240, env=e)
                 self.assertTrue(snap.exists(), "batch.log was relinked to the input (the case under test)\n" + r.stdout + r.stderr)
                 self.assertEqual(target.read_bytes(), snap.read_bytes(), "the summary was appended into the accepted input\n" + r.stdout + r.stderr)
                 code = "INPUT_UNREADABLE" if how == "denied" else "INPUT_VANISHED"
@@ -5097,7 +5099,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 indent = re.match(r"\s*", anchor).group(0)
                 inject = f"{indent}if (-not $script:r7Done) {{ $script:r7Done = $true; {make.format(b=psq(b))}; Copy-Item -LiteralPath '{psq(b)}' -Destination '{psq(snap)}' }}\n"
                 args[args.index("-File") + 1] = str(self._patched_runner(anchor, inject + anchor))
-                r = subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+                r = run_tree_bounded(args, capture_output=True, text=True, timeout=240, env=e)
                 self.assertTrue(snap.exists(), "the destination was linked to the spec (the case under test)\n" + r.stdout + r.stderr)
                 self.assertEqual(b.read_bytes(), snap.read_bytes(), f"the {name} writer wrote into the accepted input\n" + r.stdout + r.stderr)
                 self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
@@ -5121,7 +5123,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         indent = re.match(r"\s*", anchor).group(0)
         inject = f"{indent}if (-not $script:r8Done) {{ $script:r8Done = $true; {make.format(b=psq(b))}; Copy-Item -LiteralPath '{psq(b)}' -Destination '{psq(snap)}' }}\n"
         args[args.index("-File") + 1] = str(self._patched_runner(anchor, inject + anchor))
-        return subprocess.run(args, capture_output=True, text=True, timeout=240, env=e), b, snap
+        return run_tree_bounded(args, capture_output=True, text=True, timeout=240, env=e), b, snap
 
     def _r8_open_jobs_written(self) -> list[str]:
         jobs = self.run_dir / "batch-jobs"
@@ -5250,7 +5252,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         after = "if ($LegSet) { $hit = Get-InputOutputRefusal; if ($hit) { Stop-InputIsOutput $hit } }"
         args[args.index("-File") + 1] = str(self._patched_runner(before, f"Move-Item -LiteralPath '{psq(a)}' -Destination '{psq(away)}'\n" + before,
                                                                  (after, f"Move-Item -LiteralPath '{psq(away)}' -Destination '{psq(a)}'\n" + after)))
-        r = subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=240, env=e)
         out = r.stdout + r.stderr
         self.assertEqual(r.returncode, 2, out)
         self.assertIn("LEG_PLAN_REFUSED reason=INPUT_VANISHED item=1 ", r.stderr)
@@ -5267,9 +5269,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         log = self.run_dir / "batch.log"
         log.write_bytes(plan.read_bytes())
         snap = log.read_bytes()
-        subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", self._rpf06_dangling(self.run_dir / "gate.log")], check=True, capture_output=True)
+        run_tree_bounded([PWSH, "-NoProfile", "-NonInteractive", "-Command", self._rpf06_dangling(self.run_dir / "gate.log")], check=True, capture_output=True)
         args, e = self.plan_cmd(log)
-        r = subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=240, env=e)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("LEG_PLAN_REFUSED reason=OUTPUT_ZONE_UNRESOLVED", r.stderr)
         self.assertEqual(log.read_bytes(), snap, "the refusal line was appended into the plan file\n" + r.stdout + r.stderr)
@@ -5494,7 +5496,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
 
         done, t, state = self._lock_log_while_the_runner_is_paused(self.run_dir / "batch.log", Delayed(), locked, give_up_s=60)
         try:
-            r = subprocess.run(args, capture_output=True, text=True, timeout=90, env=e)
+            r = run_tree_bounded(args, capture_output=True, text=True, timeout=90, env=e)
             t.join(30)
         finally:
             done.set()
@@ -5519,7 +5521,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         script = self.case / "pause-snippet.ps1"
         script.write_text("function Test-Path { param([string]$LiteralPath) Start-Sleep -Seconds 2; $true }\n"
                           f"$batchLog = '{psq(log)}'\n$Message = 'CLAIM_TAKEN batch=1'\n" + snippet + "\n'done'\n", encoding="utf-8-sig")
-        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=120)
+        r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         expired, ack = self.case / self._EXPIRED_MARKER, self.case / self._ACK_MARKER
         self.assertTrue(expired.exists(), "a look that returned after the window is an expired pause")
@@ -5562,7 +5564,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         runner = self._patched_runner(anchor, "if ($Message -like 'CLAIM_TAKEN*') { throw [IO.IOException]::new('locked') }; " + anchor)
         args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
         args[args.index("-File") + 1] = str(runner)
-        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=120, env=e)
         self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
         res = batch_result(r.stdout)
         self.assertEqual((res["exitCode"], res["stopReason"]), (12, "BATCH_ERROR"))
@@ -5580,7 +5582,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         runner = self._patched_runner(anchor, "Invoke-VenueBoundedProcess -FilePath (Join-Path $RunDir 'no-such-pwsh.exe') -ArgumentList $lArgs")
         args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]))
         args[args.index("-File") + 1] = str(runner)
-        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=120, env=e)
         self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
         self.assertEqual(self.leg_calls(), [], "no child was started")
         res = batch_result(r.stdout)
@@ -5737,7 +5739,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
         args, e = self.batch_cmd([spec], "-ExportBudgetScript", str(fake))
         args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
-        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=120, env=e)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("-ExportBudgetScript is an offline test seam", r.stderr)
         self.assertEqual(self.kinds(), [])
@@ -5790,7 +5792,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             reset()
             args, e = self.batch_cmd([over], "-ExportBudgetScript", str(fake), "-ExportBudgetSpecReadFault", FAKE_BUDGET_PID_FILE=str(called))
             args[args.index("-LegSpec"):args.index("-LegSpec") + 2] = ["-LegSet", legset_name]
-            r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
+            r = run_tree_bounded(args, capture_output=True, text=True, timeout=600, env=e)
             assert_refused("-LegSet", r, "BATCH_USAGE SPEC_READ_FAILED")
         finally:
             legset_path.unlink(missing_ok=True)
@@ -5799,7 +5801,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         reset()
         args, e = self.batch_cmd([over], "-ExportBudgetSpecReadFault")
         args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
-        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=120, env=e)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("-ExportBudgetSpecReadFault is an offline test seam", r.stderr)
         self.assertEqual(self.kinds(), [])
@@ -5982,7 +5984,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # the seam is refused with the real um-run.ps1
         args, e = self.batch_cmd([spec], "-ExportBudgetSpecReadDelaySec", "5")
         args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
-        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=120, env=e)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("-ExportBudgetSpecReadDelaySec is an offline test seam", r.stderr)
 
@@ -6009,7 +6011,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         def assert_child_gone(mode: str, r: subprocess.CompletedProcess) -> None:
             self.assertTrue(pid_file.exists(), f"{mode}: the stand-in never started, so the kill path was not exercised: {r.stderr}")
             pid = pid_file.read_text(encoding="utf-8").strip().lstrip("﻿")
-            alive = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True, timeout=60).stdout
+            alive = run_tree_bounded(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True, timeout=60).stdout
             self.assertNotRegex(alive, rf"\b{re.escape(pid)}\b", f"{mode}: the hung preflight child {pid} was left running")
 
         def assert_nothing_started(mode: str, r: subprocess.CompletedProcess) -> None:
@@ -6042,7 +6044,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             reset()
             args, e = self.batch_cmd([spec], "-ExportBudgetScript", str(fake), "-DeadlineUtc", longer(), FAKE_BUDGET_PID_FILE=str(pid_file))
             args[args.index("-LegSpec"):args.index("-LegSpec") + 2] = ["-LegSet", legset_name]
-            r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
+            r = run_tree_bounded(args, capture_output=True, text=True, timeout=600, env=e)
             assert_nothing_started("-LegSet", r)
             self.assertIn("BATCH_USAGE EXPORT_BUDGET_PREFLIGHT_TIMEOUT", r.stderr)
         finally:
@@ -6145,7 +6147,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     # of it, -RunDir itself, a runner-owned directory that is a link) and the fail-closed case. Each asserts the physical file is byte-unchanged and nothing was submitted.
     def _junction(self, link: Path, target: Path) -> None:
         target.mkdir(parents=True, exist_ok=True)
-        r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True, timeout=60)
+        r = run_tree_bounded(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
     def _assert_alias_refused(self, r: subprocess.CompletedProcess, physical: Path, before: str, marker: str) -> None:
@@ -6308,12 +6310,12 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         spec_text = self.specs[0].read_text(encoding="utf-8")
         args, e = self.plan_cmd(plan)
         args[args.index("-File") + 1] = str(runner)
-        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=120, env=e)
         self._assert_alias_refused(r, self.specs[0], spec_text, "LEG_PLAN_REFUSED reason=LEG_PLAN_IS_RUN_OUTPUT")
         self.assertIn("cannot be resolved to a physical path", r.stderr)
         args, e = self.batch_cmd([self.specs[0]])
         args[args.index("-File") + 1] = str(runner)
-        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=120, env=e)
         self._assert_alias_refused(r, self.specs[0], spec_text, "BATCH_USAGE LEG_SPEC_IS_RUN_OUTPUT")
         self.assertIn("cannot be resolved to a physical path", r.stderr)
 
@@ -6457,8 +6459,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     def _foreign_live_claim(self) -> None:
         # a LIVE claim of another owner: a real sleeping process, its real start time (Get-VenueClaimStaleReason finds a live owner and the claim not yet expired)
         holder = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"])
-        self.addCleanup(lambda: holder.poll() is None and subprocess.run(["taskkill", "/PID", str(holder.pid), "/T", "/F"], capture_output=True, text=True, timeout=60))
-        t = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", f"(Get-Process -Id {holder.pid}).StartTime.ToUniversalTime().ToString('o')"],
+        self.addCleanup(lambda: holder.poll() is None and run_tree_bounded(["taskkill", "/PID", str(holder.pid), "/T", "/F"], capture_output=True, text=True, timeout=60))
+        t = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", f"(Get-Process -Id {holder.pid}).StartTime.ToUniversalTime().ToString('o')"],
                            capture_output=True, text=True, timeout=60)
         self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
         now = datetime.now(timezone.utc)
@@ -6506,7 +6508,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             so, se = p.communicate(timeout=240)
         finally:
             if p.poll() is None:
-                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                run_tree_bounded(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
                 p.wait(timeout=60)
         return p.returncode, so, se
 
@@ -6622,7 +6624,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             so, se = p.communicate(timeout=240)
         finally:
             if p.poll() is None:
-                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                run_tree_bounded(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
                 p.wait(timeout=60)
         return p.returncode, so, se
 
@@ -6707,7 +6709,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     def _plan_with_share(self, share: Path) -> subprocess.CompletedProcess:
         args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]))
         args[args.index("-AgentShare") + 1] = str(share)
-        return subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
+        return run_tree_bounded(args, capture_output=True, text=True, timeout=600, env=e)
 
     def test_r13_a2_a_staged_build_manifest_reached_by_a_loopback_unc_agent_share_inside_a_runner_owned_directory_is_refused(self) -> None:
         # the share is <RunDir>\quiet (a directory the runner writes), named \\localhost\C$\...\quiet: the manifest's UNC path shares no prefix with the local -RunDir, one link, no reparse point
@@ -6818,7 +6820,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         for key, call in calls.items():
             lines.append("try { $null = " + call + "; $out['" + key + "'] = 'BOUND' } catch { $out['" + key + "'] = if ($_.FullyQualifiedErrorId -like 'ParameterArgumentValidationError*') { 'REFUSED' } else { 'OTHER:' + $_.FullyQualifiedErrorId } }")
         lines += ["ConvertTo-Json -Compress -InputObject $out", "Complete-VenueProcess -ExitCode 0"]
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "\n".join(lines)], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "\n".join(lines)], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         return json.loads(out.stdout.strip().splitlines()[-1])
 
@@ -6921,7 +6923,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             "}\n"
             "$lines = @(& $w $items | ForEach-Object { [string]$_ })\n"
             "ConvertTo-Json -Compress -InputObject @{ lines = $lines; tp = @($global:tp) }\n")
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, case + "\n" + out.stdout + out.stderr)
         got = json.loads(out.stdout.strip().splitlines()[-1])
         return [":".join(line.split(":")[:2]) for line in got["lines"]], [t.removesuffix(".bin") for t in got["tp"]]
@@ -7015,7 +7017,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{c}' -TimeoutSec 3 -VerifyArtifacts -ArtifactProbeScript {{ param($i) [Threading.Thread]::Sleep(25000); 'late' }}\n"
                   "ConvertTo-Json -Compress -InputObject @{ state = $r.state; sec = [int]$sw.Elapsed.TotalSeconds; error = [string]$r.error }\n"
                   "Complete-VenueProcess -ExitCode 0\n")
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout.strip().splitlines()[-1])
         self.assertEqual(got["state"], "UNREACHABLE", got)
@@ -7035,7 +7037,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   f"-ProbeScript {{ {manifest_probe} }} -ArtifactProbeScript {{ param($i) [Threading.Thread]::Sleep(900) }}\n"
                   "ConvertTo-Json -Compress -InputObject @{ state = $r.state; ms = [int]$sw.Elapsed.TotalMilliseconds; error = [string]$r.error }\n"
                   "Complete-VenueProcess -ExitCode 0\n")
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout.strip().splitlines()[-1])
         self.assertEqual(got["state"], "UNREACHABLE", got)
@@ -7118,7 +7120,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         probe.write_text("param($p) ''\n", encoding="utf-8")
         args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-ArtifactProbeScript", str(probe))
         args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
-        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=120, env=e)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("BATCH_USAGE -StagedBuildProbeScript and -ArtifactProbeScript are offline test seams", r.stderr)
         self.assertEqual(self.kinds(), [])
@@ -7212,7 +7214,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             so, se = p.communicate(timeout=240)
         finally:
             if p.poll() is None:
-                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                run_tree_bounded(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
                 p.wait(timeout=60)
         self.assertEqual(p.returncode, 2, so + se)
         self.assertRegex(se, r"LEG_PLAN_REFUSED reason=(LEG_BUDGET_EXCEEDS_LEASE|BUILD_MANIFEST_MISMATCH) item=1 ")
@@ -7433,7 +7435,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             p.wait(timeout=timeout_s)
         finally:
             if p.poll() is None:
-                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                run_tree_bounded(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
                 p.wait(timeout=60)
         for t in readers:
             t.join(timeout=30)
@@ -7453,7 +7455,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   "$outcome = 'READ_AGAIN'\n"
                   "foreach ($i in 1) { . ([scriptblock]::Create($branch.Extent.Text)); $outcome = 'REFUSAL' }\n"
                   "[pscustomobject]@{ outcome = $outcome; slept = $script:slept; why = $hit.why } | ConvertTo-Json -Compress\n")
-        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         return json.loads(r.stdout.strip().splitlines()[-1])
 
@@ -7505,7 +7507,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # the control: every read stalls past the guard's 30 s, the foreign claim never lets go. The same typed reason, after three reads in a row and never at the deadline.
         args, e = self._claim_wait_cmd("-GuardReadDelay", "claim:existence=40")
         t0 = time.monotonic()
-        r = subprocess.run(args, capture_output=True, text=True, timeout=200, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=200, env=e)
         took = time.monotonic() - t0
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 the guard's reads did not finish within the claim wait", r.stderr)
@@ -7523,7 +7525,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     def test_artifact_preflight_claim_wait_a_read_with_no_answer_at_the_deadline_refuses_typed_not_deadline(self) -> None:
         # no poll is left to read again in: the run ends in the refusal, because DEADLINE's own log line and receipt would write into a -RunDir nobody vouched for
         args, e = self._claim_wait_cmd("-GuardReadDelay", "claim:existence=40", "-ClaimPollSec", "20", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=45)))
-        r = subprocess.run(args, capture_output=True, text=True, timeout=200, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=200, env=e)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
         self.assertIn("(no answer on 1 read in a row while no claim was held)", r.stderr)
@@ -7546,7 +7548,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # typed, at the first read, and nothing else is read.
         args, e = self._claim_wait_cmd("-GuardReadDelay", "claim:existence=40", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=40)))
         t0 = time.monotonic()
-        r = subprocess.run(args, capture_output=True, text=True, timeout=200, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=200, env=e)
         took = time.monotonic() - t0
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
@@ -7584,7 +7586,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                       f"{setup}\n"
                       ". ([scriptblock]::Create($loop.Extent.Text))\n"
                       "\"requests=$script:requests\"\n")
-            r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+            r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             return int(re.search(r"requests=([0-9]+)", r.stdout).group(1))
         self.assertEqual(requests("$overshootSec = 4; $deadline = [DateTime]::UtcNow.AddSeconds(3)"), 1)
@@ -7676,7 +7678,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   "}\n"
                   # a read given up on is a live thread the host would wait for
                   "[Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject @($out))); [Console]::Out.Flush(); [Environment]::Exit(0)\n")
-        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         return json.loads(r.stdout.strip().splitlines()[-1])
 
@@ -7747,7 +7749,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   "    [pscustomobject]@{ mode = $mode; case = $case; code = $h.code; item = $h.item; noAnswer = [bool]$h.noAnswer; why = $h.why }\n"
                   "} }\n"
                   "[Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject @($out)))\n")
-        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         got = {(d["mode"], d["case"]): d for d in json.loads(r.stdout.strip().splitlines()[-1])}
         self.assertEqual(len(got), 8, got)
@@ -7825,7 +7827,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   "        logText = $(if ([IO.File]::Exists($batchLog)) { [IO.File]::ReadAllText($batchLog) } else { $null }) }\n"
                   "} }\n"
                   "[Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject @($out)))\n")
-        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         got = json.loads(r.stdout.strip().splitlines()[-1])
         self.assertEqual(len(got), 6, got)
@@ -7863,7 +7865,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                       f"{setup}\n"
                       "try { . ([scriptblock]::Create($loop.Extent.Text)) } catch { if ($_.Exception.Message -cne 'REFUSED') { $script:thrown = $_.Exception.Message } }\n"
                       "[pscustomobject]@{ requests = $script:requests; guards = $script:guards; refused = $script:refused; thrown = $script:thrown } | ConvertTo-Json -Compress\n")
-            r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+            r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             return json.loads(r.stdout.strip().splitlines()[-1])
         # r6: the retry's request runs on its bounded worker, which rethrows what the request threw
@@ -7913,7 +7915,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   "    budgets = @($script:budgets); budgetRooms = @($script:budgetRooms); aliasedAtRefusal = [bool]$script:aliasedAtRefusal; probes = [int]$script:probes } | ConvertTo-Json -Compress)); [Console]::Out.Flush()\n"
                   "[Environment]::Exit(0)\n")
         try:
-            r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=60)
+            r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=60)
         except subprocess.TimeoutExpired:
             self.fail(f"the claim loop did not end in 60 s (a deadline of {deadline_sec} s): the retry's claim request is not bounded")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -7972,7 +7974,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   "$r = Invoke-ClaimRetryRequest -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(30)) -RequestArgs @{ Venue = 'bachelor'; RunDir = 'r'; Purpose = 'p'; TtlSec = 60; ClaimDir = 'c' }\n"
                   f"$s = [Diagnostics.Stopwatch]::StartNew(); while ($s.Elapsed.TotalSeconds -lt 8 -and -not (Test-Path '{psq(stub)}\\releases.log')) {{ [Threading.Thread]::Sleep(100) }}\n"
                   f"[Console]::Out.WriteLine(([pscustomobject]@{{ granted = [bool]$r.granted; state = $r.state; why = $r.why; releases = @(if (Test-Path '{psq(stub)}\\releases.log') {{ [IO.File]::ReadAllLines('{psq(stub)}\\releases.log') }}) }} | ConvertTo-Json -Compress)); [Console]::Out.Flush(); [Environment]::Exit(0)\n")
-        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=60)
+        r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         edge = json.loads(r.stdout.strip().splitlines()[-1])
         self.assertEqual((edge["granted"], edge["state"], edge["releases"]), (False, "REQUEST_LATE_GRANT", ["worker:edge-n"]), edge)
@@ -8051,7 +8053,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   "    [pscustomobject]@{ nonce = $c[0]; sec = $sw.Elapsed.TotalSeconds; result = [string]$r; aliased = [bool]$script:RunOutputAliased; abandoned = (& (Get-Module VenueChain) { $script:VenueAbandonedReads }) - $before } }\n"
                   "[Threading.Thread]::Sleep(300)\n"
                   f"[Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject @{{ cases = @($out); log = @(if (Test-Path '{psq(stub)}\\releases.log') {{ [IO.File]::ReadAllLines('{psq(stub)}\\releases.log') }}) }})); [Console]::Out.Flush(); [Environment]::Exit(0)\n")
-        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=60)
+        r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         got = json.loads(r.stdout.strip().splitlines()[-1])
         past, short, ok = got["cases"]
@@ -8164,7 +8166,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   "$script:guardBudget = New-GuardBudget 3 'the test room' 'SHARE_UNREACHABLE' $false 'claim' $true\n"
                   "$h = Get-InputContentRefusal\n"
                   "[pscustomobject]@{ noAnswer = [bool]$h.noAnswer; hasFlag = ($null -ne $h.PSObject.Properties['readAbandoned']); readAbandoned = [bool]$h.readAbandoned; answered = (Get-GuardTimingText $prog $script:guardBudget ([bool]$h.readAbandoned)); givenUp = (Get-GuardTimingText $prog $script:guardBudget $true) } | ConvertTo-Json -Compress\n")
-        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         d = json.loads(r.stdout.strip().splitlines()[-1])
         self.assertTrue(d["noAnswer"], "it still reads again next poll")
@@ -8271,7 +8273,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             so, se = p.communicate(timeout=240)
         finally:
             if p.poll() is None:
-                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                run_tree_bounded(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
                 p.wait(timeout=60)
         self.assertGreaterEqual(denied_polls, 3, f"three more denied polls re-read the manifest (the manifest check is kept while no claim is held): {so + se}")
         self.assertEqual(at_held, 1, f"only the one-time preflight hashed before the first denied poll ended; the denied poll hashed too: {lines(artifact_calls)}")
@@ -8294,7 +8296,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                                   + f"[IO.File]::AppendAllText('{artifact_calls}', $w + [Environment]::NewLine)\n", encoding="utf-8")
         args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]),
                                 "-StagedBuildProbeScript", str(manifest_probe), "-ArtifactProbeScript", str(artifact_probe))
-        r = subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=240, env=e)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         calls = artifact_calls.read_text(encoding="utf-8").split() if artifact_calls.exists() else []
         # the preflight and the claim guard (before the open), then the post-open guard: nothing at the receipts
@@ -8361,7 +8363,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             so, se = p.communicate(timeout=240)
         finally:
             if p.poll() is None:
-                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                run_tree_bounded(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
                 p.wait(timeout=60)
         made = [x.name for x in new.iterdir() if x.name.startswith("venue-lease-batch-close-")]
         self.assertEqual(made, [], f"the close redirect was made inside the current -RunDir: {made}\n{se}")
@@ -8392,12 +8394,12 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             try:
                 so, se = p.communicate(timeout=120)
             except subprocess.TimeoutExpired:
-                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                run_tree_bounded(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
                 so, se = p.communicate(timeout=60)
                 self.fail(f"the run did not end in 120 s:\n{so}\n{se}")
         finally:
             if p.poll() is None:
-                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                run_tree_bounded(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
                 p.wait(timeout=60)
         return so, se, new, p.returncode
 
@@ -8444,7 +8446,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             so, se = p.communicate(timeout=240)
         finally:
             if p.poll() is None:
-                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                run_tree_bounded(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
                 p.wait(timeout=60)
         self.assertNotIn("GUARD_READ_DELAY_SEAM", se, "-RunDir was read again on the main thread after the guard could not resolve it")
         self.assertEqual(p.returncode, 2, so + se)
@@ -8630,7 +8632,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   "$hit = Get-InputContentRefusal\n"
                   "ConvertTo-Json -Compress -InputObject @{ code = [string]$hit.code; why = [string]$hit.why; noAnswer = [bool]$hit.noAnswer; ms = [int]$script:guardBudget.clock.Elapsed.TotalMilliseconds }\n"
                   "Complete-VenueProcess -ExitCode 0\n")
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout.strip().splitlines()[-1])
         got["reads"] = len(reads.read_text(encoding="utf-8").split()) if reads.exists() else 0
@@ -8690,7 +8692,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   f"$stepped = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{self.commit_a}' -TimeoutSec 30 -ProbeScript $probe -CallBudgetClock $sw -CallBudgetEndSec ($sw.Elapsed.TotalSeconds + 30)\n"
                   "ConvertTo-Json -Compress -InputObject @{ spent = $spent.state; spentError = [string]$spent.error; room = $room.state; nightly = $nightly.state; nightlyError = [string]$nightly.error; stepped = $stepped.state }\n"
                   "Complete-VenueProcess -ExitCode 0\n")
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout.strip().splitlines()[-1])
         self.assertEqual(got["spent"], "UNREACHABLE", got)
@@ -8710,7 +8712,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{self.commit_a}' -TimeoutSec 30 -ProbeScript {{ param($p) ('a' * 64) }} {budget_args}\n"
                   "ConvertTo-Json -Compress -InputObject @{ state = $r.state; error = [string]$r.error; sec = $sw.Elapsed.TotalSeconds }\n"
                   "Complete-VenueProcess -ExitCode 0\n")
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         return json.loads(out.stdout.strip().splitlines()[-1])
 
@@ -8744,7 +8746,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{self.commit_a}' -TimeoutSec 20 -ProbeScript {{ param($p) [Threading.Thread]::Sleep(3000); ('a' * 64) }} -CallBudgetClock $sw -CallBudgetEndSec $end\n"
                   "ConvertTo-Json -Compress -InputObject @{ state = $r.state; sec = $t.Elapsed.TotalSeconds }\n"
                   "Complete-VenueProcess -ExitCode 0\n")
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout.strip().splitlines()[-1])
         self.assertEqual(got["state"], "UNREACHABLE", got)
@@ -8811,7 +8813,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{c}' -TimeoutSec 30 -VerifyArtifacts -ArtifactTimeoutSec 1 -ArtifactMinSec 2\n"
                   "ConvertTo-Json -Compress -InputObject @{ state = $r.state; error = [string]$r.error; problem = [string]$r.artifactProblem }\n"
                   "Complete-VenueProcess -ExitCode 0\n")
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout.strip().splitlines()[-1])
         self.assertEqual(got["state"], "UNREACHABLE", got)
@@ -8820,7 +8822,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertRegex(got["error"], r"no time is left before the hash's end \([\d.]+ s into the call\) to start it \([\d.]+ s left, under 2\)")
         # control: the same build with room for every file is STAGED and matches
         script = script.replace(" -ArtifactTimeoutSec 1 -ArtifactMinSec 2", "")
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         got = json.loads(out.stdout.strip().splitlines()[-1])
         self.assertEqual((got["state"], got["problem"]), ("STAGED", ""), got)
 
@@ -8881,7 +8883,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         script = ("$left = 1.999; $TimeoutSec = 3; $ArtifactMinSec = 2; $path = 'p'\n"
                   "$r = & { " + line.strip() + " }\n"
                   "ConvertTo-Json -Compress -InputObject @{ error = [string]$r.error }\n")
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         error = json.loads(out.stdout.strip().splitlines()[-1])["error"]
         m = re.search(r"\((\d+(?:\.\d+)?) s left, under 2\)", error)
@@ -8919,7 +8921,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     def test_artifact_preflight_r4_the_guard_read_delay_seam_is_refused_with_the_real_um_run_and_checked_for_shape(self) -> None:
         args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-GuardReadDelay", "open:spec=5")
         args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
-        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=120, env=e)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("BATCH_USAGE -GuardReadDelay is an offline test seam", r.stderr)
         # r4 adversary A3: a non-ASCII decimal digit (U+0661) is refused typed, not accepted by \d and thrown on by [int]
@@ -8946,7 +8948,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         script = (f"Import-Module '{ROOT / 'tools' / 'profiling' / 'bachelor' / 'AttrCudaArtifacts.psm1'}' -Force -DisableNameChecking\n"
                   "$n = Get-AttrCudaArtifactNames -SourceCommit ('3' * 40)\n"
                   "ConvertTo-Json -Compress -InputObject ([ordered]@{ exe = $n.exeName; dll = $n.reconName; packageZip = $n.packageZipName })\n")
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         for label, name in json.loads(out.stdout).items():
             self.assertEqual(self.artifact_path("3" * 40, label).name, name, label)
@@ -8976,7 +8978,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             so, se = p.communicate(timeout=240)
         finally:
             if p.poll() is None:
-                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                run_tree_bounded(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
                 p.wait(timeout=60)
         self.assertEqual(p.returncode, 2, so + se)
         self.assertIn("LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ", se)
@@ -9028,7 +9030,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             so, se = p.communicate(timeout=300)
         finally:
             if p.poll() is None:
-                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                run_tree_bounded(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
                 p.wait(timeout=60)
         self.assertEqual(hashlib.sha256(spec.read_bytes()).hexdigest(), before, "the accepted input is byte-unchanged: nothing was appended through the alias")
         self.assertEqual(p.returncode, code, so + se)
@@ -9063,7 +9065,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             return p.communicate(timeout=300)
         finally:
             if p.poll() is None:
-                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                run_tree_bounded(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
                 p.wait(timeout=60)
 
     def _open_token(self) -> str:
@@ -9168,7 +9170,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 so, _ = p.communicate(timeout=300)
             finally:
                 if p.poll() is None:
-                    subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                    run_tree_bounded(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
                     p.wait(timeout=60)
         se = err.read_text(encoding="utf-8")
         self.assertEqual(hashlib.sha256(spec.read_bytes()).hexdigest(), before)
@@ -9297,7 +9299,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         script = self.case / "trim-probe.ps1"
         script.write_text(text[start:end] + "\n" + "\n".join(
             f"'{raw}' + ' => ' + (Remove-TrailingSeparator '{raw}')" for raw in ("C:\\", "C:\\\\", "d:\\", "C:\\run\\", "C:\\run", "\\\\srv\\share\\", "C:\\a\\b\\\\")) + "\n", encoding="ascii")
-        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=120)
+        r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         got = [l for l in r.stdout.splitlines() if " => " in l]
         self.assertEqual(got, ["C:\\ => C:\\", "C:\\\\ => C:\\", "d:\\ => d:\\", "C:\\run\\ => C:\\run", "C:\\run => C:\\run", "\\\\srv\\share\\ => \\\\srv\\share", "C:\\a\\b\\\\ => C:\\a\\b"])
@@ -9376,7 +9378,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         script = (f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
                   f"$r = Get-VenueStagedBuildManifest -AgentShare '{psq(self.share)}' -SourceCommit '{c}' -TimeoutSec 30\n"
                   "ConvertTo-Json -Compress -InputObject @{ state = $r.state; sha = $r.sha256; problem = $r.contentProblem }\n")
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         import hashlib
         self.assertEqual(json.loads(out.stdout), {"state": "STAGED", "sha": hashlib.sha256(p.read_bytes()).hexdigest(), "problem": ""})
@@ -9402,7 +9404,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                           f"$r = Get-VenueStagedBuildManifest -AgentShare '{psq(self.share)}' -SourceCommit '{c}' -TimeoutSec 30\n"
                           f"$oracle = try {{ $null -ne ([IO.File]::ReadAllText('{psq(p)}') | ConvertFrom-Json) }} catch {{ $false }}\n"
                           "ConvertTo-Json -Compress -InputObject @{ state = $r.state; problem = [string]$r.contentProblem; validatorParses = $oracle }\n")
-                out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+                out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
                 self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
                 got = json.loads(out.stdout)
                 self.assertEqual(got["state"], "STAGED")
@@ -9418,13 +9420,13 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             "$one = [object[]]::new(1); $one[0] = $items[0]\n"
             "[ordered]@{ one = @(Get-VenueInterleavedLegPlan -Items $one).Count; two = @(Get-VenueInterleavedLegPlan -Items $items).Count } | ConvertTo-Json -Compress\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(json.loads(out.stdout), {"one": 1, "two": 2})
 
     def test_the_plan_and_the_scalar_form_are_mutually_exclusive(self) -> None:
         args, e = self.plan_cmd(self.ab_block_plan(), "-SourceCommit", SHA)
-        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=120, env=e)
         self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(self.kinds(), [])
 
@@ -9435,7 +9437,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             "function S($items) { (@(Get-VenueInterleavedLegPlan -Items $items) | ForEach-Object { \"$($_.arm)$($_.n)\" }) -join ' ' }\n"
             "[ordered]@{ block = S (P 'AABB'); uneven = S (P 'AAAB'); three = S (P 'AABBCC'); one = S (P 'AAA'); mixed = S (P 'ABBA') } | ConvertTo-Json -Compress\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(json.loads(out.stdout), {"block": "A1 B3 A2 B4", "uneven": "A1 B4 A2 A3", "three": "A1 B3 C5 A2 B4 C6", "one": "A1 A2 A3", "mixed": "A1 B2 A4 B3"})
 
@@ -9567,7 +9569,7 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
 
     def test_a_relative_receipt_root_is_forwarded_as_a_full_path(self) -> None:
         args, e = self.batch_cmd(None, "-ReceiptRoot", os.path.join("rel", ".claude-state", "dual-venue", "receipts"))
-        r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=e, cwd=str(self.case))
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=600, env=e, cwd=str(self.case))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         want = self.long_form(self.case / "rel" / ".claude-state" / "dual-venue" / "receipts")
         self.assertEqual(self.leg_calls(), [f"bound=True root={want}"] * 2)
@@ -9584,7 +9586,7 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
         runner, rest = args[i + 1], args[i + 2:]
         call = " ".join(x if re.fullmatch(r"-[A-Za-z][A-Za-z0-9]*", x) else f"'{psq(x)}'" for x in rest)
         command = f"Set-Location -LiteralPath '{psq(ps_dir)}'; & '{psq(runner)}' {call}; exit $LASTEXITCODE"
-        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True, text=True, timeout=600, env=e, cwd=str(proc_dir))
+        r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True, text=True, timeout=600, env=e, cwd=str(proc_dir))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         want = ps_dir / "rel" / ".claude-state" / "dual-venue" / "receipts"
         self.assertEqual(self.leg_calls(), [f"bound=True root={self.long_form(want)}"] * 2, r.stdout + r.stderr)
@@ -9626,7 +9628,7 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
 
     @staticmethod
     def old_comparison_accepts(component: str) -> bool:
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", f"[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); ('{psq(component)}' -ceq '.claude-state')"],
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", f"[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); ('{psq(component)}' -ceq '.claude-state')"],
                              capture_output=True, text=True, encoding="utf-8", timeout=120)
         return out.stdout.strip() == "True"
 
@@ -9656,7 +9658,7 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
                     f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
                     + leg_receipt_root_guard_ps(leg, root)
                 )
-                out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, encoding="utf-8", timeout=120)
+                out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, encoding="utf-8", timeout=120)
                 self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
                 self.assertTrue(out.stdout.strip().startswith("REFUSED DVE_RECEIPT_ROOT_MUST_STAY_LOCAL"), out.stdout + out.stderr)
 
@@ -9666,7 +9668,7 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
             "[ordered]@{ plain = (Test-DvUnderClaudeState -Path 'C:\\x\\.claude-state\\dual-venue\\receipts'); fwd = (Test-DvUnderClaudeState -Path 'C:/x/.claude-state/a'); "
             "caseDiffers = (Test-DvUnderClaudeState -Path 'C:\\x\\.Claude-State\\a'); substring = (Test-DvUnderClaudeState -Path 'C:\\x\\x.claude-state\\a') } | ConvertTo-Json -Compress\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(json.loads(out.stdout), {"plain": True, "fwd": True, "caseDiffers": False, "substring": False})
 
@@ -9696,7 +9698,7 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
                     f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
                     + leg_receipt_root_guard_ps(leg, root)
                 )
-                out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, encoding="utf-8", timeout=120)
+                out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, encoding="utf-8", timeout=120)
                 self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
                 self.assertTrue(out.stdout.strip().startswith("REFUSED DVE_RECEIPT_ROOT_MUST_STAY_LOCAL"), out.stdout + out.stderr)
 
@@ -9714,7 +9716,7 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
             "  configured = ($null -ne (Test-DvLocalReceiptRoot -Path '\\\\bachelor\\mlv-agent\\.claude-state\\r'))\n"
             "} | ConvertTo-Json -Compress\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(json.loads(out.stdout), {
             "localPlain": True, "localFwd": True, "localLongPrefix": True,
@@ -9749,7 +9751,7 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
             "foreach ($p in $cases.PSObject.Properties) { $out[$p.Name] = Test-DvLocalReceiptRoot -Path ([string]$p.Value) -AgentShares $shares }\n"
             "$out | ConvertTo-Json -Compress\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, encoding="utf-8", timeout=180)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, encoding="utf-8", timeout=180)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         return json.loads(out.stdout)
 
@@ -9769,7 +9771,7 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
         )
 
     def run_ps(self, script: str, cwd: Path | None = None) -> str:
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, encoding="utf-8", timeout=180, cwd=None if cwd is None else str(cwd))
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, encoding="utf-8", timeout=180, cwd=None if cwd is None else str(cwd))
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         return out.stdout.strip()
 
@@ -9826,7 +9828,7 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
         state.mkdir()
         links = {}
         for name, target in (("to-share", share), ("to-other", other)):
-            made = subprocess.run(["cmd", "/c", "mklink", "/J", str(state / name), str(target)], capture_output=True, text=True)
+            made = run_tree_bounded(["cmd", "/c", "mklink", "/J", str(state / name), str(target)], capture_output=True, text=True)
             if made.returncode != 0:
                 self.skipTest("cannot create a directory junction: " + made.stdout + made.stderr)
             links[name] = state / name
@@ -9943,7 +9945,7 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
         base = self.clean_base()
         real = base / "real-share-dir"
         (real / "inner").mkdir(parents=True)
-        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(base / "share-link"), str(real)], capture_output=True, text=True)
+        made = run_tree_bounded(["cmd", "/c", "mklink", "/J", str(base / "share-link"), str(real)], capture_output=True, text=True)
         if made.returncode != 0:
             self.skipTest("cannot create a directory junction: " + made.stdout + made.stderr)
         elsewhere = base / "elsewhere"
@@ -9978,7 +9980,7 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
         state = base / ".claude-state"
         state.mkdir()
         for name, tgt in (("to-target", target), ("to-marked", marked)):
-            made = subprocess.run(["cmd", "/c", "mklink", "/J", str(state / name), str(tgt)], capture_output=True, text=True)
+            made = run_tree_bounded(["cmd", "/c", "mklink", "/J", str(state / name), str(tgt)], capture_output=True, text=True)
             if made.returncode != 0:
                 self.skipTest("cannot create a directory junction: " + made.stdout + made.stderr)
         got = self.judge(["C:\\fake\\agent-share"], {"via-junction": str(state / "to-target" / "receipts"), "via-junction-marked": str(state / "to-marked" / "receipts"),
@@ -10003,7 +10005,7 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
     # ---- r6 CONVERGENCE (Grok G7 6546677256 = Dot 6546717175 = r5 ADV-A3; r5 ADV-A1, ADV-A2, ADV-A4): ONE invariant, judged on the spelling AND on the FINAL link-resolved path,
     # which is the path returned and the path written. Fixtures are real junctions under a clean base OUTSIDE .claude-state.
     def make_junction(self, link: Path, target: Path) -> Path:
-        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True)
+        made = run_tree_bounded(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True)
         if made.returncode != 0:
             self.skipTest("cannot create a directory junction: " + made.stdout + made.stderr)
         return link
@@ -10646,7 +10648,7 @@ class ScalarSpecGuardSeamTests(unittest.TestCase):
                   f"$script:guardBudget = New-GuardBudget {room} 'the {seam} room' 'SHARE_UNREACHABLE' $false '{seam}'\n"
                   "$hit = Get-InputContentRefusal\n"
                   "ConvertTo-Json -Compress -InputObject @{ code = [string]$hit.code; noRoom = [bool]$hit.noRoom }\n")
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         return json.loads(out.stdout.strip().splitlines()[-1])
 
@@ -10700,7 +10702,7 @@ class LeaseEndUtcTimezoneTests(unittest.TestCase):
             "  missing = Delta $null\n"
             "} | ConvertTo-Json -Compress\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         assert out.returncode == 0, out.stdout + out.stderr
         return json.loads(out.stdout)
 
@@ -10778,7 +10780,7 @@ class LeaseEndUtcTimezoneTests(unittest.TestCase):
             "  array = Show @('2026-10-25T01:19:14.7209943Z')\n"
             "} | ConvertTo-Json -Compress\n"
         )
-        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        out = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout)
         for shape in ("utcKind", "localKind", "unspecifiedKind", "offsetMinus5", "offsetPlus530", "stringOffset", "stringZ", "stringNoZone", "json", "jsonOffset"):
@@ -10787,6 +10789,44 @@ class LeaseEndUtcTimezoneTests(unittest.TestCase):
         for shape in ("null", "garbage", "number", "array"):
             with self.subTest(shape=shape):
                 self.assertIsNone(got[shape], f"{shape} is no instant: {got}")
+
+
+# VENUE-FIFO-ADVERSARY-TAIL-1 r8 (hosted run 45330079260 attempt 1: "windows unittest heavy 1/14" cancelled at the 50 min job cap with no test failed and its log lost; attempt 2
+# of the same head ran the part in 1652 s): a timeout of this file's (and test_venue_claim_fifo's, test_venue_chain_runner's) subprocess calls was no bound on Windows once the
+# child had a child. subprocess.run killed the root and then waited, with no timeout, for the last writer of the captured pipes, and the runners under test start pwsh children
+# that inherit them. run_tree_bounded (venue_fixture_modules) kills the whole tree. The child here starts a grandchild that holds the pipes for 45 s: subprocess.run(timeout=4)
+# returned after about 45 s (measured on this head: 25.4 s for a 25 s grandchild and timeout=3); run_tree_bounded raises within its bound and leaves no grandchild.
+@requires_windows_pwsh
+class TreeBoundedRunTests(unittest.TestCase):
+    def test_a_timeout_ends_the_whole_tree_even_while_a_grandchild_holds_the_pipes(self) -> None:
+        case = Path(tempfile.mkdtemp(prefix="tree-bounded-"))
+        self.addCleanup(shutil.rmtree, case, True)
+        pid_file = case / "grandchild.pid"
+        # `$PID: the grandchild's own pid (the outer pwsh expands an unescaped $PID inside its double quotes)
+        inner = f"[IO.File]::WriteAllText('{psq(pid_file)}', [string]`$PID); [Console]::Out.WriteLine('grandchild up'); Start-Sleep -Seconds 45"
+        outer = f"& '{psq(PWSH)}' -NoLogo -NoProfile -NonInteractive -Command \"{inner}\"; Start-Sleep -Seconds 90"
+        t0 = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired) as caught:
+            run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", outer], capture_output=True, text=True, timeout=4)
+        took = time.monotonic() - t0
+        self.assertLess(took, 30.0, f"the timeout took {took:.1f} s to raise: the wait after the kill waited for the grandchild holding the pipes")
+        self.assertEqual(getattr(caught.exception, "tree_kill_note", None), "", "the tree kill and the pipe read both went as planned")
+        self.assertTrue(pid_file.exists(), "the grandchild never started (the scenario is wrong)")
+        gpid = int(pid_file.read_text(encoding="utf-8").strip())
+        alive = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", f"[bool](Get-Process -Id {gpid} -ErrorAction SilentlyContinue)"],
+                                 capture_output=True, text=True, timeout=60)
+        self.assertEqual(alive.stdout.strip(), "False", f"grandchild {gpid} outlived the tree kill")
+
+    def test_an_answer_inside_the_bound_is_what_subprocess_run_returns(self) -> None:
+        # the same CompletedProcess (args, code, both streams), input on stdin, and check=True's CalledProcessError
+        argv = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$in = [Console]::In.ReadToEnd(); [Console]::Out.Write('out:' + $in); [Console]::Error.Write('err'); exit 3"]
+        got = run_tree_bounded(argv, input="abc", capture_output=True, text=True, timeout=60)
+        want = subprocess.run(argv, input="abc", capture_output=True, text=True, timeout=60)
+        self.assertEqual((got.args, got.returncode, got.stdout, got.stderr), (want.args, want.returncode, want.stdout, want.stderr))
+        self.assertEqual((got.returncode, got.stdout, got.stderr), (3, "out:abc", "err"))
+        with self.assertRaises(subprocess.CalledProcessError) as caught:
+            run_tree_bounded(argv, input="x", capture_output=True, text=True, timeout=60, check=True)
+        self.assertEqual((caught.exception.returncode, caught.exception.output, caught.exception.stderr), (3, "out:x", "err"))
 
 
 if __name__ == "__main__":

@@ -34,6 +34,9 @@ from pathlib import Path
 
 from tools.repo_hygiene import test_venue_chain_runner as base
 from tools.repo_hygiene.venue_fixture_modules import copy_with_siblings
+# VENUE-FIFO-ADVERSARY-TAIL-1 r8: every subprocess.run of this file is run_tree_bounded (the same call; on Windows a timeout kills the whole tree), and run_reaped's
+# wait after its timeout is communicate_tree_bounded's, see venue_fixture_modules
+from tools.repo_hygiene.venue_fixture_modules import communicate_tree_bounded, run_tree_bounded
 
 DV = Path(os.environ["VENUE_CLAIM_FIFO_DV_DIR"]) if os.environ.get("VENUE_CLAIM_FIFO_DV_DIR") else base.DV
 RUNNER = DV / "Invoke-VenueChain.ps1"
@@ -88,7 +91,7 @@ class VenueClaimFifoTests(unittest.TestCase):
         """Run a PowerShell scenario that imports the module and prints one JSON line last."""
         f = self.case / f"scenario-{len(list(self.case.glob('scenario-*.ps1')))}.ps1"
         f.write_text(f"$ErrorActionPreference = 'Stop'\nImport-Module '{module or MODULE}' -Force -DisableNameChecking\n$d = '{self.claims}'\n{script}\n", encoding="utf-8")
-        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(f)], capture_output=True, text=True, timeout=120)
+        r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(f)], capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
             raise AssertionError(f"scenario failed ({r.returncode}):\n{r.stdout}\n{r.stderr}")
         return json.loads([l for l in r.stdout.splitlines() if l.strip()][-1])
@@ -279,7 +282,7 @@ $plain = Request-VenueClaim -Venue bachelor -RunDir 'run-L2' -ClaimDir $d
         self.ps(f"$A = New-VenueTicket -Venue bachelor -RunDir 'C:\\runs\\lane-A' -Purpose 'leg one' -ClaimDir $d -OwnerPid {live.pid}\nStart-Sleep -Milliseconds 30\n"
                 f"$B = New-VenueTicket -Venue bachelor -RunDir 'C:\\runs\\lane-B' -ClaimDir $d -OwnerPid {live.pid}\n"
                 f"$c = Request-VenueClaim -Venue bachelor -RunDir 'C:\\runs\\lane-A' -ClaimDir $d -Ticket $A -OwnerPid {live.pid}\n'{{}}'")
-        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(RUNNER), "-ClaimStatus", "-Venue", "bachelor", "-ClaimDir", str(self.claims)],
+        r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(RUNNER), "-ClaimStatus", "-Venue", "bachelor", "-ClaimDir", str(self.claims)],
                            capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         lines = r.stdout.splitlines()
@@ -310,7 +313,7 @@ $plain = Request-VenueClaim -Venue bachelor -RunDir 'run-L2' -ClaimDir $d
 
     def test_a_gate_busy_under_claim_keeps_the_ticket_and_the_leg_still_runs(self) -> None:
         rd = self.case / "lane-K"
-        p = subprocess.run(self.chain_args(rd, self.specs[0]), capture_output=True, text=True, timeout=240, env=self.env(FAKE_QUIET_MODES="QUIET,BUSY,QUIET,QUIET"))
+        p = run_tree_bounded(self.chain_args(rd, self.specs[0]), capture_output=True, text=True, timeout=240, env=self.env(FAKE_QUIET_MODES="QUIET,BUSY,QUIET,QUIET"))
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         log = self.chain_log(rd)
         taken = [l for l in log if " TICKET_TAKEN " in l]
@@ -327,7 +330,7 @@ $plain = Request-VenueClaim -Venue bachelor -RunDir 'run-L2' -ClaimDir $d
 
     def test_a_chain_that_is_not_quiet_after_its_one_kept_probe_gives_its_place_up(self) -> None:
         rd = self.case / "lane-D"
-        p = subprocess.run(self.chain_args(rd, self.specs[0]), capture_output=True, text=True, timeout=240, env=self.env(FAKE_QUIET_MODES="QUIET,BUSY,BUSY,QUIET,QUIET"))
+        p = run_tree_bounded(self.chain_args(rd, self.specs[0]), capture_output=True, text=True, timeout=240, env=self.env(FAKE_QUIET_MODES="QUIET,BUSY,BUSY,QUIET,QUIET"))
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         log = self.chain_log(rd)
         self.assertEqual(len([l for l in log if " TICKET_TAKEN " in l]), 2, "after the second GATE_BUSY the place is given up and a new ticket taken: " + "\n".join(log))
@@ -339,7 +342,7 @@ $plain = Request-VenueClaim -Venue bachelor -RunDir 'run-L2' -ClaimDir $d
         self.ps(f"$A = New-VenueTicket -Venue bachelor -RunDir 'run-dead' -ClaimDir $d -OwnerPid {dead.pid}\n'{{}}'")
         dead.kill(); dead.wait()
         rd = self.case / "lane-S"
-        p = subprocess.run(self.chain_args(rd, self.specs[0]), capture_output=True, text=True, timeout=240, env=self.env())
+        p = run_tree_bounded(self.chain_args(rd, self.specs[0]), capture_output=True, text=True, timeout=240, env=self.env())
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         removed = [l for l in self.chain_log(rd) if " TICKET_STALE_REMOVED " in l]
         self.assertEqual(len(removed), 1, removed)
@@ -422,7 +425,7 @@ $plain = Request-VenueClaim -Venue bachelor -RunDir 'run-L2' -ClaimDir $d
         fake.write_text(self.PROBE_DUMP_FAKE, encoding="utf-8")
         dump = self.case / "ticket-dump.log"
         rd = self.case / "lane-P"
-        p = subprocess.run(self.chain_args(rd, self.specs[0], runner=runner, quiet=fake, extra=extra), capture_output=True, text=True, timeout=240,
+        p = run_tree_bounded(self.chain_args(rd, self.specs[0], runner=runner, quiet=fake, extra=extra), capture_output=True, text=True, timeout=240,
                            env=self.env(FAKE_QUIET_MODES="QUIET,BUSY,QUIET,QUIET", FAKE_TICKET_DUMP=str(dump)))
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         rows = [l.split(" ", 2) for l in dump.read_text(encoding="utf-8").splitlines()]
@@ -548,7 +551,7 @@ $declared = @(Get-ParamNames (Get-Ast $UmRun) '*')
     def ast_json(self, script: str, *args: str) -> dict:
         f = self.case / f"ast-{len(list(self.case.glob('ast-*.ps1')))}.ps1"
         f.write_text(script, encoding="utf-8")
-        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(f), *args], capture_output=True, text=True, timeout=120)
+        r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(f), *args], capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
             raise AssertionError(f"AST scenario failed ({r.returncode}):\n{r.stdout}\n{r.stderr}")
         return json.loads([l for l in r.stdout.splitlines() if l.strip()][-1])
@@ -594,7 +597,7 @@ $declared = @(Get-ParamNames (Get-Ast $UmRun) '*')
         """The REAL Wait-VenueQuiet.ps1, Live set, against a share that does not exist: it stops at GATE_UNREADABLE (exit 4) before any probe job is written or
         submitted, so no venue, no claim and no um-run is involved. WorkDir and share are scratch paths under the test's temp dir."""
         share = self.case / "no-such-agent-share"
-        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(QUIET), "-Venue", "bachelor", "-WorkDir", str(self.case / "quiet-work"),
+        r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(QUIET), "-Venue", "bachelor", "-WorkDir", str(self.case / "quiet-work"),
                             "-AgentShare", str(share), "-AllowShareOverride", "-MaxWaitSec", "5", "-MaxGateSec", "5", "-ReadAttempts", "1", "-ReadBackoffSec", "0", *extra],
                            capture_output=True, text=True, timeout=120)
         self.assertFalse(share.exists(), "the probe must not create the share")
@@ -653,7 +656,7 @@ exit $LASTEXITCODE
             argv = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(wrapper), "-Quiet", str(QUIET), "-ParamsJson", json.dumps(rest), "-ShiftHours", str(shift_hours),
                     "-WaitUntilUtc", until]
         t = time.monotonic()
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=180)
+        r = run_tree_bounded(argv, capture_output=True, text=True, timeout=180)
         return r, time.monotonic() - t
 
     def assert_nothing_dispatched(self, share: Path) -> None:
@@ -715,13 +718,12 @@ exit $LASTEXITCODE
 
     @staticmethod
     def run_reaped(p: subprocess.Popen, timeout: float) -> tuple[str, bool]:
+        # r8: the wait after a timeout is bounded (p.kill() then a bare communicate() waited for every grandchild holding the pipes)
         try:
-            out, err = p.communicate(timeout=timeout)
+            out, err = communicate_tree_bounded(p, timeout)
             return out + err, False
-        except subprocess.TimeoutExpired:
-            p.kill()
-            out, err = p.communicate()
-            return out + err, True
+        except subprocess.TimeoutExpired as exc:
+            return (exc.output or "") + (exc.stderr or ""), True
 
     def test_r11_adv_d38e2ab8_a1_a_gate_that_waited_past_the_cutoff_submits_no_probe(self) -> None:
         # adversary-d38e2ab8.json A1: the cutoffs clamp $deadline / $gateEnd (Wait-VenueQuiet.ps1 :285-301), but the queue gate returned CLEAR BEFORE any expiry check, and the
@@ -767,11 +769,11 @@ exit $LASTEXITCODE
                 self.assertRegex(text, r"(?m)^GATE_CUTOFF quiet-probe bachelor waitedSec=\d+ ", text)
 
     def qpc_now(self) -> int:
-        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Diagnostics.Stopwatch]::GetTimestamp()"], capture_output=True, text=True, timeout=60)
+        r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Diagnostics.Stopwatch]::GetTimestamp()"], capture_output=True, text=True, timeout=60)
         return int(r.stdout.strip())
 
     def qpc_hz(self) -> int:
-        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Diagnostics.Stopwatch]::Frequency"], capture_output=True, text=True, timeout=60)
+        r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Diagnostics.Stopwatch]::Frequency"], capture_output=True, text=True, timeout=60)
         return int(r.stdout.strip())
 
     def test_r11_adv_7fdbd64d_a1_a_zero_wait_cutoff_keeps_the_first_measurement(self) -> None:
@@ -1008,7 +1010,7 @@ class VenueLeaseBatchFifoTests(unittest.TestCase):
     def ps(self, script: str, module: Path | None = None) -> dict:
         f = self.case / f"scenario-{len(list(self.case.glob('scenario-*.ps1')))}.ps1"
         f.write_text(f"$ErrorActionPreference = 'Stop'\nImport-Module '{module or MODULE}' -Force -DisableNameChecking\n$d = '{self.claims}'\n{script}\n", encoding="utf-8")
-        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(f)], capture_output=True, text=True, timeout=120)
+        r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(f)], capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
             raise AssertionError(f"scenario failed ({r.returncode}):\n{r.stdout}\n{r.stderr}")
         return json.loads([l for l in r.stdout.splitlines() if l.strip()][-1])
@@ -1990,7 +1992,7 @@ $none = [pscustomobject]@{ claimedUtc = 'not a date' }
                   "$deadline = [DateTime]::UtcNow.AddSeconds(60)\n$far = Invoke-BatchTicketCall '1' @{}\n$out.farAnswered = [bool]$far.answered\n[pscustomobject]$out | ConvertTo-Json -Compress\n")
         f = self.case / "gate.ps1"
         f.write_text(script, encoding="utf-8")
-        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(f)], capture_output=True, text=True, timeout=120)
+        p = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(f)], capture_output=True, text=True, timeout=120)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         r = json.loads([l for l in p.stdout.splitlines() if l.strip()][-1])
         self.assertFalse(r["nearAnswered"], f"a ticket call started with 3 s left before the deadline: {r}")
@@ -2172,7 +2174,7 @@ $closedUtc = [DateTime]::UtcNow
                           .replace("@@MOD@@", str(MODULE)).replace("@@D@@", str(self.claims)))
             f = self.case / f"late-grant-holder-{name}.ps1"
             f.write_text(script, encoding="utf-8")
-            holder = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(f)], capture_output=True, text=True, timeout=150)
+            holder = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(f)], capture_output=True, text=True, timeout=150)
             self.assertEqual(holder.returncode, 0, f"the claim-file holder failed:\n{holder.stdout}\n{holder.stderr}")
         p.wait(timeout=150)
         endUtc = datetime.now(timezone.utc)

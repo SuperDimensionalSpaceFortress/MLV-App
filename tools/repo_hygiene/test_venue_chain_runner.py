@@ -31,6 +31,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tools.repo_hygiene.venue_fixture_modules import copy_with_siblings, cross_tree_modules, sibling_modules
+# VENUE-FIFO-ADVERSARY-TAIL-1 r8: every subprocess.run of this file is run_tree_bounded (the same call; on Windows a timeout kills the whole tree), see venue_fixture_modules
+from tools.repo_hygiene.venue_fixture_modules import run_tree_bounded
 
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
@@ -187,7 +189,7 @@ def utc_iso(dt: datetime) -> str:
 
 
 def pwsh_text(command: str) -> str:
-    return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True, text=True, timeout=60, check=True).stdout.strip()
+    return run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True, text=True, timeout=60, check=True).stdout.strip()
 
 
 def process_start_iso(pid: int) -> str:
@@ -208,7 +210,7 @@ class VenueFixtureModuleCopyTests(unittest.TestCase):
     def import_copy(self, folder: Path) -> subprocess.CompletedProcess:
         script = (f"$ErrorActionPreference = 'Stop'; Import-Module '{folder / MODULE.name}' -Force -DisableNameChecking\n"
                   "& (Get-Module VenueChain) { (Get-Command ConvertFrom-VenueJsonRawIdentity).Module.Path }")
-        return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        return run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
 
     def test_ci_b1_the_derived_sibling_set_names_the_raw_json_module(self) -> None:
         self.assertIn("VenueRawJson.psm1", [p.name for p in sibling_modules(MODULE)])
@@ -237,7 +239,7 @@ class VenueFixtureModuleCopyTests(unittest.TestCase):
             scratch.write_text(scratch.read_text(encoding="utf-8").replace("function Get-AttrCudaBuildManifestClaimSha256 {", "function Get-AttrCudaBuildManifestClaimSha256 {\n" + marker, 1), encoding="utf-8")
             script = (f"$ErrorActionPreference = 'Stop'; Import-Module '{folder / MODULE.name}' -Force -DisableNameChecking\n"
                       "& (Get-Module VenueChain) { Get-VenueClaimShapeSource }")
-            r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+            r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertIn(marker, r.stdout, "the scratch module read the predicate from somewhere other than its own scratch tree")
 
@@ -251,7 +253,7 @@ class VenueFixtureModuleCopyTests(unittest.TestCase):
             shutil.copy2(MODULE, folder / MODULE.name)
             script = (f"$ErrorActionPreference = 'Stop'; Import-Module '{folder / MODULE.name}' -Force -DisableNameChecking\n"
                       "& (Get-Module VenueChain) { Get-VenueClaimShapeSource }")
-            r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+            r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
             self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
             # TAIL-1 r6 (sol r5 H1): pwsh wraps a long error line at the console width, which can split a token (a long temp path put the wrap inside the file name); the tokens are matched with every
             # whitespace run removed (with the "| " gutter ConciseView puts at the start of each continued line), so the check no longer depends on where the line was wrapped
@@ -309,7 +311,7 @@ class VenueChainRunnerTests(unittest.TestCase):
                 "-CooldownSec", "0", "-ClaimPollSec", "1", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=deadline_sec)), *extra]
 
     def run_chain(self, run_dir: Path, specs: list[Path], *extra: str, env: dict | None = None, runner: Path = RUNNER, deadline_sec: int = 120, quiet: Path | None = None) -> subprocess.CompletedProcess:
-        return subprocess.run(self.chain_args(run_dir, specs, *extra, runner=runner, deadline_sec=deadline_sec, quiet=quiet), capture_output=True, text=True, timeout=300, env=env or self.env())
+        return run_tree_bounded(self.chain_args(run_dir, specs, *extra, runner=runner, deadline_sec=deadline_sec, quiet=quiet), capture_output=True, text=True, timeout=300, env=env or self.env())
 
     def leg_calls(self) -> list[str]:
         return self.leg_log.read_text(encoding="utf-8").splitlines() if self.leg_log.exists() else []
@@ -688,7 +690,7 @@ class VenueChainRunnerTests(unittest.TestCase):
     def table(self, now: str, *extra: str) -> tuple[dict, dict]:
         a, b = self.case / "a-gate.log", self.case / "b-gate.log"
         a.write_text(self.GATE_A, encoding="utf-8"); b.write_text(self.GATE_B, encoding="utf-8")
-        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(RUNNER), "-QuietRateTable", "-Venue", "bachelor",
+        r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(RUNNER), "-QuietRateTable", "-Venue", "bachelor",
                             "-GateLogPath", f"{a},{b}", "-NowUtc", now, *extra], capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         rows = {}
@@ -1000,7 +1002,7 @@ class VenueChainRunnerTests(unittest.TestCase):
         cmd = (f"Import-Module '{MODULE}' -Force -DisableNameChecking; "
                f"$a = Get-VenueDriverScriptMissing -Path @('{present}'); $b = Get-VenueDriverScriptMissing -Path @('{present}', '{gone}'); "
                "\"A=[$a]\"; \"B=[$b]\"")
-        r = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120)
+        r = run_tree_bounded(["pwsh", "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("A=[]", r.stdout)
         self.assertIn(f"B=[VENUE_DRIVER_SCRIPT_MISSING path={gone}]", r.stdout)
@@ -1132,7 +1134,7 @@ class VenueChainSupplementaryTests(unittest.TestCase):
                 "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=deadline_sec)), *extra]
 
     def run_chain(self, run_dir: Path, specs: list[Path], *extra: str, env: dict | None = None, runner: Path = RUNNER, share: Path | None = None, venue: str = "bachelor") -> subprocess.CompletedProcess:
-        return subprocess.run(self.chain_args(run_dir, specs, *extra, runner=runner, share=share, venue=venue), capture_output=True, text=True, timeout=300, env=env or self.env())
+        return run_tree_bounded(self.chain_args(run_dir, specs, *extra, runner=runner, share=share, venue=venue), capture_output=True, text=True, timeout=300, env=env or self.env())
 
     def starts(self) -> list[tuple[str, str, str]]:
         """(leaf, venue, manifest8) per START, in order."""
@@ -1683,7 +1685,7 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         rd = self.case / "lane-REALLEG"
         args = self.chain_args(rd, [spec], "-SupplementaryHeldSec", "0", "-TestSupplementaryCapSec", "10")
         args[args.index("-LegScript") + 1] = str(wrapper)
-        r = subprocess.run(args, capture_output=True, text=True, timeout=300, env=self.env(DVE_STUB=str(stub_cfg), FAKE_UM_STUB_LOG=str(um_log), FAKE_UM_SHARE=str(self.um_share)))
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=300, env=self.env(DVE_STUB=str(stub_cfg), FAKE_UM_STUB_LOG=str(um_log), FAKE_UM_SHARE=str(self.um_share)))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         sup = chain_result(r.stdout)["supplementary"]
         leg_out = next(rd.glob("leg-*-ultra-magnus-supplementary.out.txt"), None)
@@ -1720,7 +1722,7 @@ class VenueChainSupplementaryTests(unittest.TestCase):
             "\"$($r.state) [$($r.sha256)] $($r.error) inside=$([int][Math]::Floor(([DateTime]::UtcNow - $t0).TotalSeconds))\"\n"
             "Complete-VenueProcess -ExitCode 7\nexit 7\n", encoding="utf-8")
         t0 = time.time()
-        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=90)
+        r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=90)
         elapsed = time.time() - t0
         lines = r.stdout.splitlines()
         # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r13 (adversary A1 on 5fe750fa, Grok G20): the read is given what is left of the 2 s bound on the call's clock, and
