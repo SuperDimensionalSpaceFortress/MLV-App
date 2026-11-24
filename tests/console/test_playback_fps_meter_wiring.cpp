@@ -116,3 +116,53 @@ TEST(PlaybackFpsMeterWiring, MeterAndTickClocksAreMonotonic)
     ASSERT_TRUE(header.contains(QStringLiteral("QElapsedTimer m_lastPlaybackFpsStatusUpdateTime;")));
     ASSERT_FALSE(header.contains(QStringLiteral("QTime m_lastPlaybackFpsStatusUpdateTime;")));
 }
+
+// adversary r1 A6 (c7c88bf8): the pins above passed a mlvappMonotonicNow() that never starts its timer (every
+// stamp invalid, every age 0), a timeDiff overwritten after its stampAgeMs assignment with a difference of
+// QDateTime::currentMSecsSinceEpoch() samples, an unconditional (`true ||`) reset and a dead busy-path reset call.
+TEST(PlaybackFpsMeterWiring, MonotonicClockAndResetWiringRejectTheirMutations)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_FALSE(source.isEmpty());
+    // the clock helper, exactly: a started QElapsedTimer and nothing else
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "static QElapsedTimer mlvappMonotonicNow()\n"
+        "{\n"
+        "    QElapsedTimer now;\n"
+        "    now.start();\n"
+        "    return now;\n"
+        "}\n")));
+    ASSERT_EQ(1, source.count(QStringLiteral("static QElapsedTimer mlvappMonotonicNow()")));
+
+    const QString body = timerFrameEventBody();
+    ASSERT_FALSE(body.isEmpty());
+    // no other clock reaches the tick
+    ASSERT_FALSE(body.contains(QStringLiteral("QDateTime")));
+    ASSERT_FALSE(body.contains(QStringLiteral("currentMSecsSinceEpoch")));
+    ASSERT_FALSE(body.contains(QStringLiteral("currentTime")));
+    // the age reaches the shaping call untouched: no other timeDiff write between the two
+    const QString ageLine = QStringLiteral("timeDiff = playback_fps_meter::stampAgeMs( lastTime, nowTime );");
+    const int ageAt = body.indexOf(ageLine);
+    const int shapedAt = body.indexOf(QStringLiteral("timeDiff = playback_native_pace::shapedTickTimeDiffMs( timeDiff,"));
+    ASSERT_TRUE(ageAt >= 0);
+    ASSERT_EQ(1, body.count(ageLine));
+    ASSERT_TRUE(shapedAt > ageAt);
+    ASSERT_FALSE(body.mid(ageAt + ageLine.size(), shapedAt - (ageAt + ageLine.size())).contains(QStringLiteral("timeDiff")));
+    // the tick stamp is taken just before the age, from the helper
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "    QElapsedTimer nowTime = mlvappMonotonicNow();\n"
+        "    timeDiff = playback_fps_meter::stampAgeMs( lastTime, nowTime );\n")));
+    // the reset is guarded by the policy itself (no `true ||` in front of it)
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "        if( playback_fps_meter::fpsMeterShouldReset( ui->actionPlay->isChecked(), hasDraw,\n")));
+    // the busy-path reset is a plain statement right after the trace block, not behind a dead condition
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "                    true );\n"
+        "            }\n"
+        "            resetFpsMeterIfIdle( mlvappMonotonicNow() );\n"
+        "            //On setup slider priority\n")));
+    // ...and the idle-branch reset likewise runs on every idle tick, right before the re-arm
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "        resetFpsMeterIfIdle( nowTime );\n"
+        "        lastTime.start(); //do that for calculation of timeDiff for DropFrameMode;\n")));
+}

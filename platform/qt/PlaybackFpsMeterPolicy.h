@@ -17,19 +17,39 @@
 namespace playback_fps_meter
 {
 
+/*! The largest age stampAgeMs returns either way: one day. The wall-clock type the meter used to
+ *  read never returned more (its msecsTo stays inside +-86,400,000 ms), so every reader of the
+ *  age (the drop-frame loop, the pace guard, the slider) sees only the range it was built for, and
+ *  a long process suspension cannot ask for billions of frames. */
+inline constexpr int kMaxStampAgeMs = 86400000;
+
 /*! Milliseconds from \a then to \a now on the stamps' own clock, 0 when either was never
  *  started (QElapsedTimer::msecsTo is undefined on an invalid timer; the wall-clock type this
- *  replaced returned 0), saturated to int so every read site keeps its int milliseconds. The meter
- *  passes QElapsedTimer stamps: a monotonic clock, so midnight, a DST change or a wall-clock
- *  step never reaches an age. */
+ *  replaced returned 0), saturated to +-kMaxStampAgeMs. The meter passes QElapsedTimer stamps: a
+ *  monotonic clock, so midnight, a DST change or a wall-clock step never reaches an age.
+ *
+ *  The age subtracts the two stamps' OWN whole milliseconds (msecsSinceReference), never msecsTo:
+ *  msecsTo truncates the DIFFERENCE, and because the idle tick re-arms lastTime a little after each
+ *  tick, that loss would repeat on every tick (a 1 ms poll reads 0 forever; the 8 ms default reads
+ *  7 and drop-frame runs 1/8 slow). Whole stamps telescope, so summed ages keep up with real time,
+ *  as the wall-clock stamps did. The difference is taken in unsigned arithmetic, so it is defined
+ *  for any pair of stamps. */
 template <class Stamp>
 inline int stampAgeMs( const Stamp & then, const Stamp & now )
 {
     if( !then.isValid() || !now.isValid() ) return 0;
-    const long long ms = static_cast<long long>( then.msecsTo( now ) );
-    if( ms > INT_MAX ) return INT_MAX;
-    if( ms < INT_MIN ) return INT_MIN;
-    return static_cast<int>( ms );
+    const long long thenMs = static_cast<long long>( then.msecsSinceReference() );
+    const long long nowMs = static_cast<long long>( now.msecsSinceReference() );
+    const unsigned long long thenU = static_cast<unsigned long long>( thenMs );
+    const unsigned long long nowU = static_cast<unsigned long long>( nowMs );
+    const unsigned long long limit = static_cast<unsigned long long>( kMaxStampAgeMs );
+    if( nowMs >= thenMs )
+    {
+        const unsigned long long forward = nowU - thenU;
+        return forward > limit ? kMaxStampAgeMs : static_cast<int>( forward );
+    }
+    const unsigned long long backward = thenU - nowU;
+    return backward > limit ? -kMaxStampAgeMs : -static_cast<int>( backward );
 }
 
 /*! No draw for longer than this and the meter reads 0 and restarts. */

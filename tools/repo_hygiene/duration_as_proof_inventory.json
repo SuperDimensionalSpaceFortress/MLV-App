@@ -2813,6 +2813,57 @@
       ]
     },
     {
+      "path": "tests/console/test_playback_fps_meter_policy.cpp",
+      "anchor": "ASSERT_EQ ( 0 , stampAgeMs ( FakeStamp { false , 10 } , FakeStamp { true , 52 } ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1: asserts stampAgeMs's own contract value on injected or same-instant stamps; no stage-ran inference. A never-started 'then' stamp reads age 0 (the wall-clock type it replaced returned 0).",
+      "lines": [
+        132
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_fps_meter_policy.cpp",
+      "anchor": "ASSERT_EQ ( 0 , stampAgeMs ( FakeStamp { true , 10 } , FakeStamp { false , 52 } ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1: asserts stampAgeMs's own contract value on injected or same-instant stamps; no stage-ran inference. A never-started 'now' stamp reads age 0.",
+      "lines": [
+        133
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_fps_meter_policy.cpp",
+      "anchor": "ASSERT_EQ ( 0 , stampAgeMs ( never , never ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1: asserts stampAgeMs's own contract value on injected or same-instant stamps; no stage-ran inference. Two default (invalid) QElapsedTimer stamps read age 0.",
+      "lines": [
+        152
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_fps_meter_policy.cpp",
+      "anchor": "ASSERT_EQ ( 0 , stampAgeMs ( a , b ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1: asserts stampAgeMs's own contract value on injected or same-instant stamps; no stage-ran inference. b is a copy of a (the same instant), and after a.invalidate() the never-started rule applies; both read age 0.",
+      "lines": [
+        156,
+        159
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_fps_meter_policy.cpp",
+      "anchor": "ASSERT_EQ ( 0 , stampAgeMs ( never , a ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1: asserts stampAgeMs's own contract value on injected or same-instant stamps; no stage-ran inference. A never-started 'then' against a started QElapsedTimer reads age 0.",
+      "lines": [
+        157
+      ]
+    },
+    {
       "path": "platform/qt/MainWindow.cpp",
       "anchor": "if ( postMs >= 0.0 )",
       "class": "value_fallback_select",
