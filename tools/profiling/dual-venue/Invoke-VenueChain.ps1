@@ -167,15 +167,71 @@ $deadline = $(if ($DeadlineUtc) { [DateTimeOffset]::Parse($DeadlineUtc, [Globali
 $pwshExe = [Environment]::ProcessPath
 if (-not $Purpose) { $Purpose = "Invoke-VenueChain $(Split-Path -Leaf $RunDir)" }
 
-function L([string]$Message, [switch]$Raw) {
+function L([string]$Message, [switch]$Raw, [switch]$Flush, [double]$FlushSec = 5.0) {
     # TAIL-1 r5 (sol r4 B1): chain.log is the chain's record, never its control. A log another handle holds against writes (a reader with FileShare.Read, a scan) made Add-Content throw, and under
     # ErrorActionPreference Stop that throw ended the chain wherever the line was: at a ticket close before the final nonce retry, at the chain-end retry, or at CHAIN_RESULT itself. The line goes to stdout
-    # FIRST, then ONE append is made; a failed append is said on stderr as CHAIN_LOG_WRITE_FAILED and the chain goes on. (r5 adversary A5: no retry, so a failed append is never followed by a second
-    # synchronous one that can stall on a share.) -Raw writes $Message as it is (the CHAIN_RESULT line has no time stamp). Kept self-contained: the tests lift this function from the script by name.
-    $line = $(if ($Raw) { $Message } else { "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $Message" })
-    Write-Output $line
-    try { Add-Content -LiteralPath $ChainLog -Value $line -ErrorAction Stop }
-    catch { try { [Console]::Error.WriteLine("CHAIN_LOG_WRITE_FAILED path=$ChainLog error=$($_.Exception.Message) line=$line") } catch { $null = $_ } }
+    # FIRST; a failed append is said on stderr as CHAIN_LOG_WRITE_FAILED and the chain goes on. (r5 adversary A5: no retry.) -Raw writes $Message as it is (the CHAIN_RESULT line has no time stamp).
+    # TAIL-1 r6 (sol r5 B1): an append that STALLS (a share that stops answering) held the control thread at the close, before the chain-end nonce retry, and at CHAIN_RESULT before the exit. No append
+    # is made on this thread any more. The line is queued, and the queued lines are appended, in order, by ONE short write pipeline at a time on a writer runspace of their own (opened on the first line).
+    # While a write is in flight the next lines wait behind it in the queue and the caller goes on; each later call starts the next write once the one before has ended. Nothing runs on the runspace
+    # between writes, so only a write that is still stalled can keep the process alive at its end. -Flush writes what is queued and waits at most -FlushSec in all; it returns $false when a write did
+    # not end in it (CHAIN_LOG_FLUSH_TIMEOUT on stderr), and the caller then ends the process at once. Kept self-contained: the tests lift this function from the script by name.
+    if (-not $Flush) {
+        $line = $(if ($Raw) { $Message } else { "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $Message" })
+        Write-Output $line
+    }
+    $w = $script:chainLogWriter
+    if ($null -eq $w) {
+        if ($Flush) { return $true }
+        try {
+            $logRs = [runspacefactory]::CreateRunspace()
+            $logRs.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::UseNewThread   # each write on a thread of its own that ends with it
+            $logRs.Open()
+            $w = [pscustomobject]@{ runspace = $logRs; path = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ChainLog); pending = [System.Collections.Generic.List[string]]::new(); ps = $null; async = $null }
+            $script:chainLogWriter = $w
+        } catch {
+            try { [Console]::Error.WriteLine("CHAIN_LOG_WRITE_FAILED path=$ChainLog error=the log writer could not be started: $($_.Exception.Message) line=$line") } catch { $null = $_ }
+            return
+        }
+    }
+    if (-not $Flush) { $w.pending.Add($line) }
+    $flushClock = [Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        if ($null -ne $w.ps) {
+            if (-not $w.async.IsCompleted) {
+                if (-not $Flush) { return }   # a write is in flight: this line waits behind it; the caller never does
+                $left = $FlushSec - $flushClock.Elapsed.TotalSeconds
+                if ($left -le 0 -or -not $w.async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($left))) {
+                    try { [Console]::Error.WriteLine("CHAIN_LOG_FLUSH_TIMEOUT path=$($w.path) queued=$($w.pending.Count) waitedSec=$FlushSec (a chain.log write did not end; every line is on stdout)") } catch { $null = $_ }
+                    return $false
+                }
+            }
+            try { $null = $w.ps.EndInvoke($w.async) } catch { $null = $_ }   # the write says its own failures on stderr
+            try { $w.ps.Dispose() } catch { $null = $_ }
+            $w.ps = $null; $w.async = $null
+        }
+        if ($w.pending.Count -eq 0) { if ($Flush) { return $true }; return }
+        $batch = $w.pending.ToArray(); $w.pending.Clear()
+        try {
+            $logPs = [powershell]::Create(); $logPs.Runspace = $w.runspace
+            [void]$logPs.AddScript({
+                param($Lines, $ChainLog)
+                foreach ($line in $Lines) {
+                    try { Add-Content -LiteralPath $ChainLog -Value $line -ErrorAction Stop }
+                    catch { try { [Console]::Error.WriteLine("CHAIN_LOG_WRITE_FAILED path=$ChainLog error=$($_.Exception.Message) line=$line") } catch { $null = $_ } }
+                }
+            }.ToString()).AddArgument($batch).AddArgument($w.path)
+            $w.async = $logPs.BeginInvoke(); $w.ps = $logPs
+        } catch {
+            foreach ($lost in $batch) { try { [Console]::Error.WriteLine("CHAIN_LOG_WRITE_FAILED path=$($w.path) error=the write could not be started: $($_.Exception.Message) line=$lost") } catch { $null = $_ } }
+        }
+        if (-not $Flush) { return }
+    }
+}
+# TAIL-1 r6 (sol r5 B1): a chain that ends on an unhandled error still hands its queued lines to chain.log, bounded, before it stops as it always did; a write that is still stalled then cannot hold the exit
+trap {
+    if ($null -ne $script:chainLogWriter -and -not (L -Flush)) { try { [Console]::Error.WriteLine("CHAIN_ABORTED $($_.Exception.Message)") } catch { $null = $_ }; [Console]::Out.Flush(); [Console]::Error.Flush(); [Environment]::Exit(1) }
+    break
 }
 
 # The planned legs: name, spec path, backend ('' = whatever the spec lists, as Invoke-VenueLeg does with no -Backend).
@@ -640,7 +696,10 @@ $summary = [ordered]@{
 }
 if ($streakStop) { $summary['unhealthyStop'] = $streakStop }
 $resultLine = 'CHAIN_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 6)
-L $resultLine -Raw   # TAIL-1 r5 B1: through L's bounded, non-throwing write, so a held chain.log can no longer end the chain before its typed result reaches stdout and its exit code
+L $resultLine -Raw   # TAIL-1 r5 B1: through L, which never throws and (r6) never appends on this thread, so a held or stalled chain.log cannot keep the typed result from stdout or the exit code
 
+# TAIL-1 r6 (sol r5 B1): the queued lines are handed to chain.log for at most 5 s; a writer that does not finish in it (an append stalled on a share) is left behind and the process exits now
+$logFlushed = L -Flush
 Complete-VenueProcess -ExitCode $exitCode   # a share read abandoned at its timeout would otherwise keep this process alive until it ends
+if (-not $logFlushed) { [Console]::Out.Flush(); [Console]::Error.Flush(); [Environment]::Exit($exitCode) }
 exit $exitCode

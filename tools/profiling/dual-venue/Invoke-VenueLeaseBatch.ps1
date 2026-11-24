@@ -868,6 +868,27 @@ function Invoke-StrandedTicketRetry([string]$Why) {
     }
 }
 
+function Invoke-PendingClaimRelease([string]$Why, [switch]$StderrOnly) {
+    # TAIL-1 r6 (sol r5 B2 = adversary pass 2 A2): a request answered QUEUED after A13's give-back stayed BUSY five times names THIS batch's own claim on its ticket (pendingReleaseNonce); only the next poll let go of
+    # it. A typed stop with no claim held (DEADLINE, an input-guard refusal, a request that threw) has no next poll, so the claim kept the older ready ticket waiting until this process exited or the claim expired.
+    # Every such stop lets go of it FIRST, bounded as the late grant's release is (VenueChain's Invoke-VenueLateRelease: the reserve, one call capped at 1.5 s, the probe at 1.0 s), and then says what happened.
+    # A release that was not answered turns the write suppression on, as the late grant's does. -StderrOnly: the line goes to stderr only (the input-guard refusal, whose input may be batch.log itself).
+    $t = $script:batchTicket
+    if ($null -eq $t -or $null -eq $t.PSObject.Properties['pendingReleaseNonce'] -or -not [string]$t.pendingReleaseNonce) { return }
+    $pendingNonce = [string]$t.pendingReleaseNonce
+    $pendingAnswer = 'ERROR'; $pendingUnanswered = $true
+    try {
+        $pending = Invoke-VenueLateRelease -Venue $Venue -Nonce $pendingNonce -ClaimDir $ClaimDir -BoundSec ([double]($script:ClaimRetryRequestReserveSec - $script:ClaimRetryRefusalTailSec)) -CallCapSec 1.5 -ProbeCapSec 1.0 -Call $null -Clock $null -Sleep $null
+        $pendingAnswer = [string]$pending.answer; $pendingUnanswered = [bool]$pending.anyUnanswered
+    } catch { $pendingAnswer = 'ERROR'; $pendingUnanswered = $true }
+    $let = $pendingAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')
+    if ($let) { $t.pendingReleaseNonce = '' }
+    elseif ($pendingUnanswered -or $pendingAnswer -cin @('NO_ANSWER', 'ERROR')) { Disable-RunDirWrites "the release of a claim a give-back could not let go of was not answered ($pendingAnswer)" }
+    $pendingLine = $(if ($let) { "CLAIM_PENDING_RELEASE batch=$batchNo nonce=$pendingNonce result=$pendingAnswer why=$Why (a claim a give-back could not let go of, released before the typed stop)" }
+        else { "CLAIM_PENDING_RELEASE_NOT_RELEASED batch=$batchNo nonce=$pendingNonce result=$pendingAnswer why=$Why (the claim still names this batch until its owner exits or it expires)" })
+    if ($StderrOnly) { try { [Console]::Error.WriteLine($pendingLine) } catch { } } else { LogBest $pendingLine }
+}
+
 function Invoke-BatchTicketCall([string]$Body, [hashtable]$Argument, [double]$Sec = 5) {
     # adversary r3 pass 2 (A1, A4): every ticket call outside Request-VenueClaim (create, heartbeat, remove) runs on ONE bounded worker (VenueChain's Invoke-VenueBoundedRead, 5 s, abandoned and
     # counted like every other claim-folder read), so a stalled claim folder cannot hold the batch or its deadline. $Body is the worker's script text; it sees VenueChain imported and
@@ -2348,6 +2369,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         }
         # adversary A5: ticket work (the creation, each heartbeat, a retake) is bounded to 5 s per call but is not inside the wait; when it carried the clock to -DeadlineUtc or past it, no claim request starts.
         if ([DateTime]::UtcNow -ge $deadline) {
+            Invoke-PendingClaimRelease 'deadline'   # TAIL-1 r6 B2 class sweep: a no-op unless the ticket names a claim of this batch's own (every typed stop with no claim held lets go of it first)
             $b.endReason = 'DEADLINE'; $b.endDetail = "lease-$($bw.reason.ToLowerInvariant())-wait: the wait and its ticket work ended at or after the deadline, so no claim was asked for"
             Set-Stop 'DEADLINE' 3
             LogBest "BATCH_END batch=$batchNo token=$token reason=DEADLINE detail=$($b.endDetail)"
@@ -2382,6 +2404,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         }
         catch {
             if ($unfinished -eq 0) {
+                Invoke-PendingClaimRelease 'request-threw' -StderrOnly   # TAIL-1 r6 B2: an earlier poll's QUEUED answer can still name this batch's own claim; the throw below ends the run (the helper never throws)
                 if ((& (Get-Module VenueChain) { $script:VenueAbandonedReads }) -gt 0) { [Console]::Error.WriteLine("the claim request threw: $($_.Exception.Message -replace '\s+', ' ')"); try { Complete-VenueProcess -ExitCode 1 } catch { } }
                 throw
             }
@@ -2484,6 +2507,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         if ($hit) {
             # the ticket is left to be reaped as dead-pid (the process ends in this refusal): no claim-folder I/O ahead of the bounded release and the typed refusal
             if ($req.granted) { try { [void]$(if ($grantedOnRetry) { Invoke-ClaimRetryRelease $deadline $req.claim.nonce } else { Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir }) } catch { } }
+            else { Invoke-PendingClaimRelease 'input-guard-refusal' -StderrOnly }   # TAIL-1 r6 B2: a QUEUED answer can still name this batch's own claim
             # r3 (opus r2b H3): once a batch receipt exists, this refusal ends the run like any other stop: the summary (receiptPersistFailures included) is printed before the typed
             # exit 2. A location hit turns the write suppression on first (Test-OpenOutputAlias's rule): the refused input may be batch.log itself, so nothing more goes into -RunDir.
             # r3 pass 3 (adversary r3 A1): the summary runs inside the refusal, AFTER its own log line, so the logWriteFailures it reports counts that line too.
@@ -2521,7 +2545,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         if ([DateTime]::UtcNow -ge $deadline) { break }
     }
     if ($null -eq $claim) {
-        # the ticket is left to be reaped as dead-pid (the run ends here): no claim-folder I/O ahead of the DEADLINE receipt
+        # the ticket is left to be reaped as dead-pid (the run ends here): no claim-folder I/O ahead of the DEADLINE receipt but the one bounded release of a claim of this batch's own that a give-back left standing (TAIL-1 r6 B2)
+        Invoke-PendingClaimRelease 'deadline'
         $b.endReason = 'DEADLINE'; $b.endDetail = 'claim-held'; Set-Stop 'DEADLINE' 3
         LogBest "BATCH_END batch=$batchNo token=$token reason=DEADLINE detail=claim-held"   # r7 (sol r6b): the line is tried before the receipt snapshots logWriteFailures
         $b.logWriteFailures = $script:logWriteFailures; Write-BatchReceipt $b
