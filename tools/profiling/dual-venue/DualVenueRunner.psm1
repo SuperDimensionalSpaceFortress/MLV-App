@@ -5120,7 +5120,8 @@ function Get-DvExportExactMean {
     # (Get-DvExportStageRow); a containment gate reads this instead, so 29 frames at the documented 5 % + 1 ms tolerance and one a hair inside it are not turned INVALID by a mean rounded before it is compared.
     param($Values)
     # (a [decimal], summed exactly: a double mean of repeated decimals is a hair off the decimal it equals; adversary pass A2 on 62dff0fa)
-    $v = @($Values | Where-Object { $null -eq (Get-DvExportTimingProblem $_) } | ForEach-Object { [decimal][double]$_ })
+    # (EXPORT-RENDER-PIPE-TIMING-1 r5, sol r4 B4: a [decimal] value -- the stage log's exact record figure -- is kept as it is; only a double is converted)
+    $v = @($Values | Where-Object { $null -eq (Get-DvExportTimingProblem $_) } | ForEach-Object { if ($_ -is [decimal]) { $_ } else { [decimal][double]$_ } })
     if ($v.Count -eq 0) { return $null }
     $sum = [decimal]0; foreach ($x in $v) { $sum += $x }
     $sum / [decimal]$v.Count
@@ -5193,6 +5194,9 @@ $script:ExportRenderStartContainer = 'mov'
 # (r3 fix 1, adversary A2 on 070ccd05: QLocale::toString(double) is the general format, so a rate under 1e-4 or from 1e6 is written with QLocale English's exponent, a
 # lower-case e, a sign and at least two digits: 1e-05, 4.29497e+09)
 $script:ExportRenderStartFps = '\A[0-9]{1,6}(?:\.[0-9]{1,9})?(?:e[+-][0-9]{2,3})?\z'
+# (r5, sol r4 B9: the range of a uint32 / uint32 rate, each end as QLocale's six significant digits print it)
+$script:ExportRenderStartFpsMin = [decimal]'0.000000000232831'
+$script:ExportRenderStartFpsMax = [decimal]'4294970000'
 # r3 (adversary A2 on c2da7e24): the typed reason a ProRes run's dual-ISO class is not readable from a timed attempt, and the card that adds the producer's applied signal
 $script:ExportDualIsoAppliedUnknown = 'DUALISO_APPLIED_UNKNOWN'
 $script:ExportDualIsoAppliedSuccessor = 'successor EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1'
@@ -5202,7 +5206,8 @@ function Get-DvRenderStartDeclaration {
     # typed reason (and the rest null) when there is not exactly one line, it is not in the producer's exact form, it names a field twice before out=, it is another clip's,
     # or its frames= is not cutOut - cutIn + 1 over a 1-based cut; index is the line's offset in the text (the caller holds it before RENDER_VERIFIED and DONE).
     param([AllowEmptyString()][string]$BatchLogText, [AllowNull()][AllowEmptyString()][string]$Clip)
-    $no = { param($why) [pscustomobject]@{ problem = $why; scaled = $null; cutIn = $null; cutOut = $null; frames = $null; index = $null } }
+    # (r5, sol r4 B3: out and output are returned too, so the caller binds the declaration to the manifest's file and the verified dimensions)
+    $no = { param($why) [pscustomobject]@{ problem = $why; scaled = $null; cutIn = $null; cutOut = $null; frames = $null; index = $null; out = $null; output = $null } }
     $lines = @([regex]::Matches([string]$BatchLogText, '(?m)^\[BATCH\] RENDER_START'))
     $exact = @([regex]::Matches([string]$BatchLogText, $script:ExportRenderStartLine))
     if ($lines.Count -ne 1 -or $exact.Count -ne 1) {
@@ -5232,6 +5237,11 @@ function Get-DvRenderStartDeclaration {
     if (-not [regex]::IsMatch($fpsText, $script:ExportRenderStartFps) -or -not [decimal]::TryParse($fpsText, ([Globalization.NumberStyles]::AllowDecimalPoint -bor [Globalization.NumberStyles]::AllowExponent), [Globalization.CultureInfo]::InvariantCulture, [ref]$fps) -or $fps -le 0) {
         return (& $no "EXPORT_PROFILE_FOREIGN: RENDER_START declares fps=$fpsText; the rendered runner declares the clip's frame rate as a finite decimal above 0 (batchRenderedVideoFfmpegFrameRateArgument), so the declaration is not of this export")
     }
+    # (r5, sol r4 B9: the rate is the clip's uint32 numerator over its uint32 denominator (mlv.h sourceFpsNom / sourceFpsDenom), so it lies in 1/4294967295 .. 4294967295,
+    # printed to six significant digits (QLocale): 2.32831e-10 .. 4.29497e+09. fps=1e+20 is no rate that producer can declare.)
+    if ($fps -lt $script:ExportRenderStartFpsMin -or $fps -gt $script:ExportRenderStartFpsMax) {
+        return (& $no "EXPORT_PROFILE_FOREIGN: RENDER_START declares fps=$fpsText; the rendered runner's rate is a uint32 numerator over a uint32 denominator ($($script:ExportRenderStartFpsMin) .. $($script:ExportRenderStartFpsMax) as it prints them), so the declaration is not of this export")
+    }
     $n = [int64]$hit.Groups['n'].Value; $ci = [int64]$hit.Groups['ci'].Value; $co = [int64]$hit.Groups['co'].Value
     # (r2 fix 1, pass 4 A3: the producer's cut is uint32, BatchRunner.cpp:356-357)
     if ($ci -lt 1 -or $co -lt $ci -or $co -gt [int64][uint32]::MaxValue -or $n -ne ($co - $ci + 1)) {
@@ -5241,7 +5251,8 @@ function Get-DvRenderStartDeclaration {
     if ($hit.Groups['s'].Value -ceq 'false' -and ($hit.Groups['sw'].Value -cne $hit.Groups['ow'].Value -or $hit.Groups['sh'].Value -cne $hit.Groups['oh'].Value)) {
         return (& $no "EXPORT_PROFILE_ABSENT: RENDER_START declares scaled=false with source=$($hit.Groups['sw'].Value)x$($hit.Groups['sh'].Value) but output=$($hit.Groups['ow'].Value)x$($hit.Groups['oh'].Value); an unscaled frame plan writes its source size, so whether export_scale is owed is not readable")
     }
-    [pscustomobject]@{ problem = $null; scaled = ($hit.Groups['s'].Value -ceq 'true'); cutIn = $ci; cutOut = $co; frames = $n; index = $hit.Index }
+    [pscustomobject]@{ problem = $null; scaled = ($hit.Groups['s'].Value -ceq 'true'); cutIn = $ci; cutOut = $co; frames = $n; index = $hit.Index
+                       out = $hit.Groups['out'].Value; output = "$($hit.Groups['ow'].Value)x$($hit.Groups['oh'].Value)" }
 }
 
 # EXPORT-RENDER-PIPE-TIMING-1 r2 (adversary A6 on a6f48506): whether a build emits this card's stages, read from that commit's own src/debug/StageTiming.h in the repo this module
@@ -5353,6 +5364,8 @@ function Test-DvExportStageLogRecords {
     $problems = [System.Collections.Generic.List[string]]::new()
     $perStage = @{}
     foreach ($name in $script:ExportRenderedStages) { $perStage[$name] = @{} }
+    $perStageD = @{}
+    foreach ($name in $script:ExportRenderedStages) { $perStageD[$name] = @{} }
     $recCount = @{}
     foreach ($name in $script:ExportRenderedStages) { $recCount[$name] = @{} }
     $clipRecords = @{}
@@ -5390,6 +5403,9 @@ function Test-DvExportStageLogRecords {
                 if (-not $perStage.ContainsKey($s)) { continue }
                 if ($s -ceq 'llrawproc_dual_iso') { $dualRecs.Add([pscustomobject]@{ frame = $f; msText = $hit.Groups['ms'].Value; line = $lineNo; after = $before }) }
                 $perStage[$s][$f] = $(if ($perStage[$s].ContainsKey($f)) { $perStage[$s][$f] + $ms } else { $ms })
+                # (r5, sol r4 B4: and the EXACT [decimal] sum beside it, which the containment means read: a double keeps about 15 digits, so 3500001.000000401 read as
+                # 3500001.0000004 and passed a limit it is past)
+                $perStageD[$s][$f] = $(if ($perStageD[$s].ContainsKey($f)) { $perStageD[$s][$f] + $msD } else { $msD })
                 $recCount[$s][$f] = 1 + $(if ($recCount[$s].ContainsKey($f)) { $recCount[$s][$f] } else { 0 })
             }
         }
@@ -5455,12 +5471,16 @@ function Test-DvExportStageLogRecords {
                 if (-not $p16Done -or $scaleDone) { $order = "$at $(if ($scaleDone) { 'twice' } else { "before that frame's processed16_total" })"; break }
                 $scaleDone = $true
             }
-            elseif ($r.stage -ceq 'processed16_total') { $p16Done = $true }
+            # (r5, sol r4 B2: a second processed16_total of an open frame is a second render total, which the sums above add into the timed work; the render notes it once)
+            elseif ($r.stage -ceq 'processed16_total') { if ($p16Done) { $order = "$at twice (the render notes its total once per frame)"; break }; $p16Done = $true }
             elseif ($p16Done) { $order = "$at after that frame's processed16_total (the render's last note)"; break }
         }
+        # (r5, sol r4 B2: a frame opened after the last write and never written -- a record of frame 1 after a one-frame cut's write -- is no frame of the loop: the loop writes
+        # every frame it renders before the next one or the drain)
+        if ($null -eq $order -and $null -ne $open) { $order = "frame $open is recorded but never written (no export_pipe_write closes it)" }
         if ($null -ne $order) { $problems.Add("EXPORT_RECORD_INVALID: stage-timing.log is not in the frame loop's order (render, then export_scale, then export_pipe_write, frame by frame): $order") }
     }
-    [pscustomobject]@{ perStage = $perStage; clipRecords = $clipRecords; lastPerFrameLine = $lastPerFrameLine; problems = @($problems) }
+    [pscustomobject]@{ perStage = $perStage; perStageD = $perStageD; clipRecords = $clipRecords; lastPerFrameLine = $lastPerFrameLine; problems = @($problems) }
 }
 
 function Get-DvExportEvidence {
@@ -5490,7 +5510,7 @@ function Get-DvExportEvidence {
                      profileFramesFailed = $null; stageFramesSeen = $null; dualIsoActiveFrames = $null; dualIsoClassAgrees = $null; outputFileCount = $null; outputBytes = $null
                      wallSeconds = $null; exportFps = $null; largestStage = $null; largestStageShare = $null }
     $classMismatch = $false; $classDetail = $null
-    $wallExact = $null   # the DONE elapsed exactly as the log wrote it, [decimal]; null when there is no single DONE line (the wall gates then have nothing to compare)
+    $wallExact = $null   # the DONE elapsed exactly as the log wrote it plus half its last printed place (r5: the largest wall that figure rounds from), [decimal]; null when there is no single DONE line (the wall gates then have nothing to compare)
     $containmentAdvisory = @()   # (r18's advisory channel, kept EMPTY for the receipt shape the leg runner writes (receipt.export.containmentAdvisory): EXPORT-CDNG-STAGE-CONTAINMENT-1 r1 made the check gate again)
     # -- the batch log: exactly one DONE line for the one clip
     # (r7 A6: the counts are bounded to 15 digits, so a count that does not fit an int64 is no DONE line, typed below, and never an Int64 cast that throws)
@@ -5503,6 +5523,12 @@ function Get-DvExportEvidence {
         $m.exportFramesFailed = $m.exportFramesSkipped
         # (EXPORT-CDNG-TOTAL-CONTAINMENT-1 r4 B1, opus r3: wallSeconds is the PUBLISHED figure, 6 decimals; the wall gates' limit is built from the exact matched elapsed, up to 9 decimals, never from it)
         $wallExact = [decimal]::Parse($done[0].Groups['t'].Value, [Globalization.NumberStyles]::AllowDecimalPoint, [Globalization.CultureInfo]::InvariantCulture)
+        # (EXPORT-RENDER-PIPE-TIMING-1 r5, sol r4 B4: the producer ROUNDS its elapsed to the places it prints -- BatchRunner.cpp DONE is QString::arg(ms / 1000.0, 0, 'f', 1), to
+        # the nearest tenth -- so the run's wall is up to half of the last printed place longer than the figure: 348 ms prints elapsed=0.3. The wall gates hold the timed work
+        # inside the LARGEST wall the figure admits, the figure plus half its last place (0.05 s at one decimal, 0.5 s at none), exact in [decimal].)
+        $wallPlaces = $(if ($done[0].Groups['t'].Value.Contains('.')) { $done[0].Groups['t'].Value.Split('.')[1].Length } else { 0 })
+        $wallHalfPlace = [decimal]0.5; for ($k = 0; $k -lt $wallPlaces; $k++) { $wallHalfPlace = $wallHalfPlace / [decimal]10 }
+        $wallExact = $wallExact + $wallHalfPlace
         $m.wallSeconds = Get-DvExportRound ([double]::Parse($done[0].Groups['t'].Value, [Globalization.CultureInfo]::InvariantCulture))
         $m.exportFps = $(if ($m.wallSeconds -gt 0) { Get-DvExportRound ($m.framesExported / $m.wallSeconds) } else { $null })
     }
@@ -5668,11 +5694,12 @@ function Get-DvExportEvidence {
             $pipePresent = (@($script:ExportRenderedOutsideDenominator | Where-Object { $perStage[$_].Count -gt 0 }).Count + @($script:ExportRenderedClipStages | Where-Object { $clipRecords[$_].Count -gt 0 }).Count) -gt 0
             $clipSumMs = [decimal]0; foreach ($name in $script:ExportRenderedClipStages) { foreach ($r in $clipRecords[$name]) { $clipSumMs += [decimal]$r.msD } }   # (r2 fix 2, A5: exact)
             $framesForClip = $(if ($null -ne $m.framesExported -and $m.framesExported -gt 0) { [decimal]$m.framesExported } else { $null })
-            $exactTimed = Get-DvExportExactMean @($perStage['processed16_total'].Values)
+            $perStageD = $records.perStageD   # (r5, sol r4 B4: the exact record figures)
+            $exactTimed = Get-DvExportExactMean @($perStageD['processed16_total'].Values)
             $roundedTimed = $p16.meanMs
             if ($pipePresent -and $null -ne $exactTimed) {
                 foreach ($name in $script:ExportRenderedOutsideDenominator) {
-                    $e = Get-DvExportExactMean @($perStage[$name].Values)
+                    $e = Get-DvExportExactMean @($perStageD[$name].Values)
                     if ($null -ne $e) { $exactTimed += $e; $roundedTimed += $rowsOut[$name].meanMs }
                 }
                 if ($null -ne $framesForClip) { $exactTimed += $clipSumMs / $framesForClip; $roundedTimed += [double]($clipSumMs / $framesForClip) }
@@ -5704,7 +5731,7 @@ function Get-DvExportEvidence {
             # decompress, llrawproc) is timed on exactly processed16_total's frames or on none at all (a stage the app did not run is absent, never partial)
             # r8 fix 2 (adversary r8 A1): and each stage's mean is inside the stage that contains it (the rendered stage tree in $script:ExportRenderedContainment)
             $means = @{}
-            foreach ($name in $script:ExportRenderedStages) { $means[$name] = Get-DvExportExactMean @($perStage[$name].Values) }   # (unrounded: sol r1 B3)
+            foreach ($name in $script:ExportRenderedStages) { $means[$name] = Get-DvExportExactMean @($perStageD[$name].Values) }   # (unrounded: sol r1 B3; exact record figures: r5, sol r4 B4)
             $containment = Get-DvExportContainmentProblem -Means $means -Pairs $script:ExportRenderedContainment -SumGroups $script:ExportRenderedSumGroups
             if ($null -ne $containment) { $problems.Add($containment) }
             $p16Frames = $perStage['processed16_total']
@@ -5756,10 +5783,19 @@ function Get-DvExportEvidence {
                     $m.Remove('dualIsoActiveFramesCouldNotCheck'); $m.Remove('dualIsoClassAgreesCouldNotCheck')
                     $attempted = @($dual.Values | Where-Object { [double]$_ -gt 0 }).Count
                     if ($attempted -eq 0) {
-                        $m.dualIsoActiveFrames = [int64]0
-                        $agrees = -not $DualIsoExpected
-                        $m.dualIsoClassAgrees = $agrees
-                        if (-not $agrees) { $classMismatch = $true; $classDetail = "CLIP_CLASS_MISMATCH: dualIsoExpected is true but none of $($p16Frames.Count) timed frame(s) attempted dual-ISO processing (llrawproc_dual_iso 0 ms on every frame), so no frame was reconstructed" }
+                        # r5 (sol r4 B8): a 0.000 figure is a ROUNDED one (StageTiming.h prints %.3f), so an attempt under half a microsecond prints it too: 0 ms on every frame
+                        # proves no frame was RECONSTRUCTED (a reconstruction is far longer), which is the dual-ISO leg's mismatch, but never that no attempt ran, so a
+                        # no-dual-ISO leg's agreement is not readable from it (UNKNOWN until the producer's applied signal, as above)
+                        if ($DualIsoExpected) {
+                            $m.dualIsoActiveFrames = [int64]0
+                            $m.dualIsoClassAgrees = $false
+                            $classMismatch = $true; $classDetail = "CLIP_CLASS_MISMATCH: dualIsoExpected is true but none of $($p16Frames.Count) timed frame(s) attempted dual-ISO processing (llrawproc_dual_iso 0 ms on every frame), so no frame was reconstructed"
+                        }
+                        else {
+                            $zero = "$($script:ExportDualIsoAppliedUnknown): llrawproc_dual_iso reads 0.000 ms on every one of $($p16Frames.Count) timed frame(s), and the figure is rounded to the microsecond (StageTiming.h %.3f), so it cannot show that no dual-ISO attempt ran until the producer publishes an applied signal ($($script:ExportDualIsoAppliedSuccessor))"
+                            $m.dualIsoActiveFrames = $null; $m['dualIsoActiveFramesCouldNotCheck'] = $zero
+                            $m.dualIsoClassAgrees = $null; $m['dualIsoClassAgreesCouldNotCheck'] = $zero
+                        }
                     }
                     else {
                         $unknown = "$($script:ExportDualIsoAppliedUnknown): llrawproc_dual_iso is above 0 ms on $attempted of $($p16Frames.Count) timed frame(s), and a time above 0 is the attempt's (llrawproc.c times it, dualiso.c can refuse the reconstruction inside it), so whether dual-ISO was applied is not readable until the producer publishes an applied signal ($($script:ExportDualIsoAppliedSuccessor))"
@@ -5814,6 +5850,21 @@ function Get-DvExportEvidence {
                     if ($done.Count -eq 1 -and $decl.index -gt $done[0].Index) { $problems.Add('EXPORT_OUTPUT_MISMATCH: batch.log writes RENDER_START after DONE; the rendered runner declares the clip before it exports it, so the declaration is not of this export') }
                     elseif ($verified.Count -eq 1 -and ($decl.index -gt $verified[0].Index -or ($done.Count -eq 1 -and $verified[0].Index -gt $done[0].Index))) {
                         $problems.Add('EXPORT_OUTPUT_MISMATCH: batch.log does not write RENDER_START, RENDER_VERIFIED and DONE in the order the rendered runner writes them, so they are not one export')
+                    }
+                    # r5 (sol r4 B3): the declaration is of THIS output. out= is the path the runner publishes the .mov to (BatchRunner.cpp finalPath), and the job's manifest
+                    # names the one .mov it found (export-stage-job.ps1 first.name, the file's leaf): another leaf is another export's declaration. RENDER_VERIFIED's dimensions=
+                    # are the decoded .mov's (outWidth x outHeight, the frame plan's), so they are the declared output= or the two lines are not one export.
+                    $outLeaf = [regex]::Split([string]$decl.out, '[\\/]')[-1]
+                    $first = $(if ($null -ne $manifest) { Get-DvProp $manifest 'first' } else { $null })
+                    $firstName = $(if ($first -is [System.Management.Automation.PSCustomObject]) { Get-DvProp $first 'name' } else { $null })
+                    if ($firstName -is [string] -and -not [string]::Equals($outLeaf, $firstName, [StringComparison]::Ordinal)) {
+                        $problems.Add("EXPORT_OUTPUT_MISMATCH: RENDER_START declares out=$($decl.out), whose file is '$outLeaf', but output-manifest.json lists '$firstName', so the declaration is not of this export's .mov")
+                    }
+                    $verifiedLine = $(if ($verified.Count -eq 1) { $verified[0].Value + ([string]$BatchLogText).Substring($verified[0].Index + $verified[0].Length).Split("`n")[0] } else { '' })
+                    $verifiedDims = @([regex]::Matches($verifiedLine, ' dimensions=(?<d>[^\s]*)'))
+                    $dimsText = @($verifiedDims | ForEach-Object { $_.Groups['d'].Value })
+                    if ($verifiedDims.Count -gt 0 -and ($verifiedDims.Count -ne 1 -or -not [string]::Equals($dimsText[0], [string]$decl.output, [StringComparison]::Ordinal))) {
+                        $problems.Add("EXPORT_OUTPUT_MISMATCH: RENDER_START declares output=$($decl.output) but RENDER_VERIFIED decoded dimensions=$($dimsText -join ' / '), so the declaration and the verification are not of one .mov")
                     }
                     if ($decl.scaled -and $scale.Count -eq 0) { $problems.Add('EXPORT_PROFILE_ABSENT: RENDER_START declares scaled=true but stage-timing.log times no export_scale; a scaled frame plan times it on every frame') }
                     elseif (-not $decl.scaled -and $scale.Count -gt 0) { $problems.Add("EXPORT_STAGE_WINDOW_MISMATCH: RENDER_START declares scaled=false but stage-timing.log times export_scale on $($scale.Count) frame(s); an unscaled frame plan runs no scale") }

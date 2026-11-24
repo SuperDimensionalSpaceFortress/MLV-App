@@ -465,7 +465,7 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
     worker call** (inside `producer_frame_ms` when there is no bracket): `EXPORT_STAGE_CONTAINMENT_MISMATCH`. Every containment comparison (means, disjoint groups, pairs, the wall, each frame) is made in
     unrounded decimal arithmetic on exact decimal means against the exact limit (5 % + 1 ms) plus ONE epsilon of 4e-7 ms, four tenths of the 1e-6 ms the writers emit (the published rows keep their
     6-place means and the 6-place `wallSeconds`, but the gate never rounds the limit and the figure to that precision first: that let an overrun of a full emitted increment read PASS; the wall limit is
-    built from the DONE `elapsed` exactly as the log wrote it, up to 9 decimals, never from the rounded `wallSeconds`; the epsilon is a policy choice, not a correction of decimal arithmetic), so a figure exactly at the documented tolerance
+    built from the DONE `elapsed` exactly as the log wrote it, up to 9 decimals, plus half its last printed place (r5 of `EXPORT-RENDER-PIPE-TIMING-1`), never from the rounded `wallSeconds`; the epsilon is a policy choice, not a correction of decimal arithmetic), so a figure exactly at the documented tolerance
     is accepted at any magnitude and a mean a sub-precision hair (under four tenths of an increment) past it is not refused, while an overrun of half an increment or more is. Writer, receipt re-derivation and the reader share `Get-DvExportEvidence`, so all three apply it under empty and shipped criteria.
   * ProRes: the denominator is the mean `processed16_total`, the timed per-frame work. The top-level stages are `debayered_frame` and `processing`.
     `raw_uint16` and `llrawproc` nest inside `debayered_frame`, and `llrawproc_dual_iso` nests inside `llrawproc`. The batch's `DONE elapsed` starts before the clip opens
@@ -494,6 +494,15 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
     dual-ISO leg the shipped `dualIsoClassAgrees eq true` then fails on that typed reason, and no ProRes leg can PASS until successor
     `EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1` adds the applied signal. A run timed 0 on every frame ran no reconstruction: the class is readable (a dual-ISO leg is
     `CLIP_CLASS_MISMATCH`). A no-dual-ISO leg whose run attempted dual-ISO stays `CLIP_CLASS_MISMATCH`. The CDNG profile's `active = ms > 0` rule above is unchanged.
+    From r5 a run timed `0.000` on every frame is not read as agreement on a **no**-dual-ISO leg either: the figure is rounded to the microsecond (`StageTiming.h` `%.3f`),
+    so an attempt under half a microsecond prints it too. That leg's `dualIsoClassAgrees` is null with `DUALISO_APPLIED_UNKNOWN`, while a dual-ISO leg's all-zero run is still
+    `CLIP_CLASS_MISMATCH` (no reconstruction takes under half a microsecond).
+    **r5 evidence binding.** The frame loop's order now also refuses a second `processed16_total` on one frame and a frame that is recorded but never written
+    (`EXPORT_RECORD_INVALID`). `RENDER_START` `out=` must name the `.mov` the output manifest lists (the file leaf of the path), and `RENDER_VERIFIED` `dimensions=` must be
+    the declared `output=`; otherwise `EXPORT_OUTPUT_MISMATCH`. The declared fps lies inside the producer's uint32-over-uint32 range as QLocale prints it
+    (`2.32831e-10 .. 4.29497e+09`); otherwise `EXPORT_PROFILE_FOREIGN`. The wall gates (CDNG and ProRes) build their limit from the largest wall the printed `DONE elapsed`
+    rounds from, the figure plus half its last printed place (`elapsed=0.3` is a wall up to 0.35 s; the producer prints tenths), and the ProRes means are taken over each
+    record's exact decimal figure, never a double. `export_scale` is stamped after the avir worker pool's scope closes, so it includes the pool's join.
 * **Time budget** (`Get-ExportJobTimeBudget`): the job timeout is one margined identity read of the clip (at the measured cold rate), plus the quiescence
   samples (3 x 12 + 30 = 66 s), plus the export wait, plus a fixed 600 s margin. The export wait is `max(900, 4 x maxFrames)` s plus another identity-read
   allowance, for the app's own re-read. The export wait is the job's own `WaitForExit`, so the smoke runner's 3600 s process ceiling does not cap it.

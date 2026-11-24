@@ -547,15 +547,19 @@ int BatchRunner::exportRenderedVideoFile(
         if( scaled )
         {
             const double scaleStart = stageTiming.start();
-            avir_scale_thread_pool scaling_pool;
-            avir::CImageResizerVars vars; vars.ThreadPool = &scaling_pool;
-            avir::CImageResizerParamsUltra roptions;
-            avir::CImageResizer<> image_resizer( 16, 0, roptions );
-            image_resizer.resizeImage( frameBuffer,
-                                       srcWidth, srcHeight, 0,
-                                       scaledBuffer,
-                                       outWidth, outHeight,
-                                       3, 0, &vars );
+            /* The resizer's own scope: its worker pool joins in the destructor
+             * (ThreadPool.h), so the note after the closing brace times that join too. */
+            {
+                avir_scale_thread_pool scaling_pool;
+                avir::CImageResizerVars vars; vars.ThreadPool = &scaling_pool;
+                avir::CImageResizerParamsUltra roptions;
+                avir::CImageResizer<> image_resizer( 16, 0, roptions );
+                image_resizer.resizeImage( frameBuffer,
+                                           srcWidth, srcHeight, 0,
+                                           scaledBuffer,
+                                           outWidth, outHeight,
+                                           3, 0, &vars );
+            }
             stageTiming.note( MLV_STAGE_EXPORT_SCALE, frameIndex, scaleStart );
         }
 
