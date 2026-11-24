@@ -422,6 +422,12 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
         $sArgs += @('-ExpectSpecSha256', [string]$Leg.specSha256)   # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1: the supplementary child runs the planned bytes or nothing
         if ($SheetCopyDir) { $sArgs += @('-SheetCopyDir', $SheetCopyDir) }
         L "LEG $($Leg.name) SUPPLEMENTARY_RUN venue=$suppVenue role=supplementary trigger=$Trigger quietVerdict=$($sq.verdict) quietMean=$(Format-Mean $sq.mean) capSec=$capSec umManifestSha256=$($built.sha256) spec=$($Leg.spec) backend=$(if ($Leg.backend) { $Leg.backend } else { 'spec' })"
+        # r3 fix 3 (adversary pass 4 A1 sibling): the append above can stall; the cap is cut to the room left NOW, the last step before the child starts (production only: the
+        # offline -TestSupplementaryCapSec seam keeps its own bound), and no room left is no launch
+        if ($TestSupplementaryCapSec -eq 0) {
+            $capSec = [Math]::Min($capSec, [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalSeconds))
+            if ($capSec -lt 1) { Write-SuppSkip $Leg $Trigger 'DEADLINE_NEAR' "remainingSec=$capSec at the launch" $false; return }
+        }
         $sr = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $sArgs -TimeoutSec $capSec
         if ($sr.timedOut) {
             # Arm the unresolved-job guard at once, BEFORE any fallible step (the output write below, the receipt read, the share reads): the client was killed, the job it submitted was not,
@@ -580,9 +586,7 @@ foreach ($leg in $plan) {
                 $exitCode = 6; if ($OnUnknown -ceq 'Stop') { $stopReason = 'VENUE_QUIET_UNKNOWN' }
                 break
             }
-            # (e) the leg. r3 fix 2 (adversary pass 3 A2): the under-claim probe can end after -DeadlineUtc (it, or anything after it, can stall), so the deadline is asked
-            # again at the launch itself: no leg starts past it.
-            if ([DateTime]::UtcNow -ge $deadline) { $stopReason = 'DEADLINE'; $exitCode = 3; Add-Result $leg 'NOT_RUN' @{ verdict = 'DEADLINE'; reason = 'deadline-at-leg-launch' }; L "LEG $($leg.name) NOT_RUN DEADLINE reason=deadline-at-leg-launch (the under-claim probe ended after -DeadlineUtc)"; break }
+            # (e) the leg
             $out = Join-Path $RunDir "leg-$($leg.name).out.txt"
             $lArgs = @('-NoProfile', '-NonInteractive', '-File', $LegScript, '-Venue', $Venue, '-LegSpec', $leg.spec, '-SourceCommit', $SourceCommit, '-BuildManifestSha256', $BuildManifestSha256)
             if ($leg.backend) { $lArgs += @('-Backend', $leg.backend) }
@@ -591,6 +595,9 @@ foreach ($leg in $plan) {
             $lArgs += @('-ExpectSpecSha256', [string]$leg.specSha256)
             if ($SheetCopyDir) { $lArgs += @('-SheetCopyDir', $SheetCopyDir) }
             L "LEG $($leg.name) RUN verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) spec=$($leg.spec) backend=$(if ($leg.backend) { $leg.backend } else { 'spec' })"
+            # r3 fix 2 / fix 3 (adversary pass 3 A2, pass 4 A1): the under-claim probe, its transcript write or the RUN line's append above can end after -DeadlineUtc (each can
+            # stall on a share), so the deadline is asked again as the LAST step before the child starts: no leg starts at or past it.
+            if ([DateTime]::UtcNow -ge $deadline) { $stopReason = 'DEADLINE'; $exitCode = 3; Add-Result $leg 'NOT_RUN' @{ verdict = 'DEADLINE'; reason = 'deadline-at-leg-launch' }; try { L "LEG $($leg.name) NOT_RUN DEADLINE reason=deadline-at-leg-launch (-DeadlineUtc passed before the child started)" } catch { [Console]::Error.WriteLine("LEG $($leg.name) NOT_RUN DEADLINE reason=deadline-at-leg-launch") }; break }
             # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r3 (adversary pass 2 A1, A6): the leg child's output is CAPTURED (2>&1: its stdout lines are strings, its stderr lines
             # ErrorRecords), and every reading below (outcome, receipt path, detail, the spec refusal) is made from THIS child's own STDOUT. The RunDir-named file is shared by
             # every chain on this -RunDir (two venues' chains name a leg alike), so it is written after the leg as evidence only and never read back; a stderr line classifies nothing.
@@ -598,7 +605,9 @@ foreach ($leg in $plan) {
             $legCode = $LASTEXITCODE
             $legLines = @($legRaw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { [string]$_ })
             $ow = Write-ChainEvidence $out @($legRaw | ForEach-Object { [string]$_ })   # bounded (r3 fix 2, A2): never holds the claim's release
-            if ($ow -cne 'OK') { $ow = "LEG_OUT_WRITE_$ow leg=$($leg.name) path=$out (evidence only: the leg is classified from its own captured output)"; try { L $ow } catch { [Console]::Error.WriteLine($ow) } }
+            # r3 fix 3 (adversary pass 4 A2): the write's failure is said on STDERR only: a chain-log append could stall on the very share that stalled the write, before the
+            # leg is classified and its claim released
+            if ($ow -cne 'OK') { [Console]::Error.WriteLine("LEG_OUT_WRITE_$ow leg=$($leg.name) path=$out (evidence only: the leg is classified from its own captured output)") }
             $o = $legLines | Where-Object { $_ -match '^DVE_OUTCOME=(\S+)' } | Select-Object -Last 1
             $outcome = $(if ($o -and $o -match '^DVE_OUTCOME=(\S+)') { $Matches[1] } else { 'NONE' })
             $p = $legLines | Where-Object { $_ -match '^DVE_RECEIPT_PATH=(.+)$' } | Select-Object -Last 1

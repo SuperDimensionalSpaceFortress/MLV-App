@@ -7108,6 +7108,49 @@ exit 0
         result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
         self.assertEqual([(r["status"], r["verdict"], r["reason"]) for r in result["legs"]], [("NOT_RUN", "DEADLINE", "deadline-at-leg-launch")], result["legs"])
 
+    def test_planned_hash_bind_r3_fix3_a1_chain_launches_no_leg_when_the_run_line_append_ends_past_the_deadline(self) -> None:
+        """Pass 4 A1: the deadline was asked BEFORE the leg's RUN line, whose chain-log append can stall; it is now the last step before the child starts."""
+        from datetime import datetime, timedelta, timezone
+        stall = ("function L([string]$Message) {\n    if ($env:DVT_RUNLOG_SLEEP_UNTIL -and $Message -clike 'LEG * RUN *') { $u = [DateTimeOffset]::Parse($env:DVT_RUNLOG_SLEEP_UNTIL, "
+                 "[Globalization.CultureInfo]::InvariantCulture).UtcDateTime; while ([DateTime]::UtcNow -lt $u) { Start-Sleep -Milliseconds 200 } }   # TEST FIXTURE: the append stalls\n")
+        dv = self.mutated_runner([("Invoke-VenueChain.ps1", "function L([string]$Message) {\n", stall)])
+        fx = self.chain_fixture(dv, None, None)
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=45)
+        fx["env"]["DVT_RUNLOG_SLEEP_UNTIL"] = (deadline + timedelta(seconds=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        proc = self.run_fixture_chain(dv, fx, ["-LegSpec", str(dv / "legs" / self.SWAP_FIRST), "-Backend", "cuda", "-NoSupplementary"],
+                                      deadline=deadline.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        self.assertEqual(self.fixture_legs(), [], "a leg child was launched after -DeadlineUtc\n" + proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+
+    # Pass 4 A3: entries were grouped by the identity the LATER sweep read, so a name re-pointed at another file between an entry's judged read and the sweep split one judged
+    # file into two groups. pace-a.json and pace-b.json are hard links to F: F holds A through entry 1's preflight, B (written in place) through entry 2's; then pace-b.json is
+    # re-pointed at a separate file G holding B and A is put back in F, before the sweep. Both entries judged F, as A and as B: refused before any claim.
+    BATCH_LINK_SWAP = ("    foreach ($ref in $LegSpec) {\n        if ($env:DVT_LINK_B -and [IO.Path]::GetFileName($ref) -ceq 'pace-b.json') { [IO.File]::WriteAllBytes($ref, [IO.File]::ReadAllBytes($env:DVT_LINK_B)) }   # TEST FIXTURE: F gets B in place\n"
+                       "        $path = Resolve-LegSpecPath $ref ''\n")
+    BATCH_AFTER_PLAN_ANCHOR = "# DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r2 (adversary A1): the input guard and the leg child below are bound through the PATH-keyed SpecBudgetSha256, which holds the LAST\n"
+    BATCH_LINK_REPOINT = ("if ($env:DVT_LINK_B) { $pb = Join-Path $env:DVT_LINK_DIR 'pace-b.json'; [IO.File]::Delete($pb); [IO.File]::Copy($env:DVT_LINK_B, $pb); "
+                          "[IO.File]::WriteAllBytes((Join-Path $env:DVT_LINK_DIR 'pace-a.json'), [IO.File]::ReadAllBytes($env:DVT_LINK_A)) }   # TEST FIXTURE: pace-b.json is now G, F holds A again\n"
+                          + BATCH_AFTER_PLAN_ANCHOR)
+
+    def test_planned_hash_bind_r3_fix3_a3_batch_two_hard_links_judged_as_two_specs_are_refused_even_when_one_is_repointed_before_the_sweep(self) -> None:
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.BATCH_SPELL_ANCHOR, self.BATCH_LINK_SWAP),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_AFTER_PLAN_ANCHOR, self.BATCH_LINK_REPOINT),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_PRECLAIM_ANCHOR, self.BATCH_PRECLAIM_STOP)])
+        link_dir = self.tmp / "links"
+        link_dir.mkdir()
+        a_bytes, b_bytes = self.tmp / "a-bytes.json", self.tmp / "b-bytes.json"
+        shutil.copyfile(dv / "legs" / self.SWAP_FIRST, a_bytes)
+        shutil.copyfile(dv / "legs" / self.SWAP_TARGET, b_bytes)
+        pa, pb = link_dir / "pace-a.json", link_dir / "pace-b.json"
+        shutil.copyfile(a_bytes, pa)
+        os.link(pa, pb)
+        proc = self.run_case_batch(dv, [pa, pb], {"DVT_LINK_A": str(a_bytes), "DVT_LINK_B": str(b_bytes), "DVT_LINK_DIR": str(link_dir)})
+        self.assertEqual((pa.read_bytes(), pb.read_bytes()), (a_bytes.read_bytes(), b_bytes.read_bytes()), "the fixture re-pointed pace-b.json and restored F")
+        self.assertEqual([l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ")], [],
+                         "the batch reached the claim with one file judged as two specs (old: the sweep saw F and G)\n" + proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertTrue(any(l.startswith("BATCH_USAGE SPEC_CHANGED_AFTER_PREFLIGHT ") and "is the same file as" in l for l in proc.stderr.splitlines()), proc.stderr)
+
 
 # ---------------------------------------------------------------------------------------------------
 # VENUE-QUIET-UNKNOWN-PROBE-FAILS-1: Wait-VenueQuiet.ps1 used to print `COOLDOWN_UNMET mean=UNKNOWN` and exit 0 when the venue probe was unavailable or failed, and

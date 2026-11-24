@@ -1460,6 +1460,13 @@ public static class VenueLeaseBatchBoundedRead {
     [pscustomobject]@{ state = @('OK', 'FAILED', 'TIMEOUT')[$rc]; bytes = $b; error = $e }
 }
 
+function Get-JudgedFileKey([string]$Path) {
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r3 fix 3 (adversary pass 4 A3): the volume + file index of the file at $Path, read right after an entry's last judged read, so entries are
+    # grouped by the file their bytes came from; '' when it cannot be read (the guard's identity sweep before the claim refuses an input that will not identify)
+    # (Get-PhysicalPath first: it loads the native type Get-FileIdentity calls)
+    try { $null = Get-PhysicalPath $Path; [string](Get-FileIdentity $Path).key } catch { '' }
+}
+
 function Get-BytesSha256([byte[]]$Bytes) {
     # r19 (sol r18 B1): the RAW bytes' sha256 (no line-ending normalisation): the binding is to the exact bytes judged, and Invoke-VenueLeg -ExpectSpecSha256 hashes its read the same way
     $h = [Security.Cryptography.SHA256]::Create()
@@ -1634,8 +1641,9 @@ if ($legPlanMode) {
             if ($specRefusal[0]) { Stop-PlanRefused $specRefusal[0] $n $specRefusal[1] }
             $budgetRefusal = Get-ExportBudgetRefusal $path   # r8 (adversary r7 A3): an export window the agent's job cap refuses is refused HERE, before any claim or lease
             if ($budgetRefusal[0]) { Stop-PlanRefused $budgetRefusal[0] $n $budgetRefusal[1] }
+            $judgedKey = Get-JudgedFileKey $path   # r3 fix 3 (adversary pass 4 A3): the file THIS item's bytes were judged from, read right after its last judged read
             $items.Add([pscustomobject]@{ item = $n; legId = (Get-LegSpecId $path); spec = $path; backend = $be.ToLowerInvariant(); arm = $arm; sourceCommit = $sc.ToLowerInvariant(); buildManifestSha256 = $ms.ToLowerInvariant()
-                    specSha256 = [string]$script:SpecBudgetSha256[$path] })   # r2 (adversary A1 class): THIS item's judged bytes
+                    specSha256 = [string]$script:SpecBudgetSha256[$path]; fileKey = $judgedKey })   # r2 (adversary A1 class): THIS item's judged bytes
         }
         # Each build once (the read Invoke-VenueChain's supplementary leg makes): staged on the venue, and with exactly the manifest the item names.
         $builds = [ordered]@{}
@@ -1671,7 +1679,7 @@ if ($legPlanMode) {
         }
         foreach ($it in $ordered) {
             $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}-{3}' -f ($plan.Count + 1), $it.legId, $it.backend, $it.arm); spec = $it.spec; backend = $it.backend
-                    arm = $it.arm; sourceCommit = $it.sourceCommit; buildManifestSha256 = $it.buildManifestSha256; planItem = $it.item; specSha256 = $it.specSha256 })
+                    arm = $it.arm; sourceCommit = $it.sourceCommit; buildManifestSha256 = $it.buildManifestSha256; planItem = $it.item; specSha256 = $it.specSha256; fileKey = $it.fileKey })
         }
         $planRecord = [ordered]@{ schema = 'mlv-app/venue-lease-leg-plan-run/v1'; legPlan = $planPath; order = $PlanOrder; arms = @($plan | ForEach-Object { $_.arm } | Select-Object -Unique)
             legs = @($plan | ForEach-Object { [ordered]@{ name = $_.name; planItem = $_.planItem; arm = $_.arm; backend = $_.backend; sourceCommit = $_.sourceCommit; buildManifestSha256 = $_.buildManifestSha256; spec = $_.spec } })
@@ -1696,7 +1704,7 @@ if ($legPlanMode) {
         if ([string]$script:SpecBudgetSha256[[string]$e.specPath] -cne [string]$e.specSha256) {
             Stop-Usage "SPEC_CHANGED_AFTER_PREFLIGHT '$($e.specPath)' cannot be run: the leg spec read as sha256 $([string]$script:SpecBudgetSha256[[string]$e.specPath]) after the leg-set planner judged sha256 $($e.specSha256) (planned_sha256=$($e.specSha256)); no claim or lease is taken on bytes the planner did not judge"
         }
-        $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend; specSha256 = [string]$e.specSha256 })
+        $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend; specSha256 = [string]$e.specSha256; fileKey = (Get-JudgedFileKey ([string]$e.specPath)) })   # r3 fix 3 (A3)
     }
 } else {
     Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force
@@ -1713,10 +1721,11 @@ if ($legPlanMode) {
         if ($shapeRefusal) { Stop-Usage "LEG_SPEC_INVALID '$path' cannot be run: $shapeRefusal" }
         $budgetRefusal = Get-ExportBudgetRefusal $path   # r8 (adversary r7 A3): before any claim or lease, as -LegPlan does
         if ($budgetRefusal[0]) { Stop-Usage "$($budgetRefusal[0]) $($budgetRefusal[1])" }
+        $judgedKey = Get-JudgedFileKey $path   # r3 fix 3 (adversary pass 4 A3): the file THIS entry's bytes were judged from, read right after its last judged read
         $legId = Get-LegSpecId $path
         $judgedSha = [string]$script:SpecBudgetSha256[$path]   # r2 (adversary A1 class): THIS entry's judged bytes
         for ($r = 1; $r -le $Repeats; $r++) {
-            $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f ($plan.Count + 1), $legId, $(if ($Backend) { $Backend } else { 'spec' })); spec = $path; backend = $(if ($Backend) { $Backend } else { '' }); specSha256 = $judgedSha })
+            $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f ($plan.Count + 1), $legId, $(if ($Backend) { $Backend } else { 'spec' })); spec = $path; backend = $(if ($Backend) { $Backend } else { '' }); specSha256 = $judgedSha; fileKey = $judgedKey })
         }
     }
 }
@@ -1742,7 +1751,7 @@ foreach ($leg in $plan) {
 # r11 (sol r10 blocker 3): the validated inputs, kept for the re-check once the claim is held (Get-InputOutputRefusal). A -LegSet's specs are inputs too, so they are checked now as well.
 $script:guardedInputs = [System.Collections.Generic.List[object]]::new()
 if ($legPlanMode) { $script:guardedInputs.Add([pscustomobject]@{ path = $planPath; kind = 'plan'; item = 0 }) }
-foreach ($p in $plan) { $script:guardedInputs.Add([pscustomobject]@{ path = $p.spec; kind = 'spec'; item = $(if ($legPlanMode) { $p.planItem } else { 0 }); backend = $p.backend; specSha256 = [string]$p.specSha256 }) }   # r19 (sol r18 B1): the judged bytes' sha256; r3 (A2 class): THIS entry's own, never a path-keyed lookup
+foreach ($p in $plan) { $script:guardedInputs.Add([pscustomobject]@{ path = $p.spec; kind = 'spec'; item = $(if ($legPlanMode) { $p.planItem } else { 0 }); backend = $p.backend; specSha256 = [string]$p.specSha256; fileKey = [string]$p.fileKey }) }   # r19 (sol r18 B1): the judged bytes' sha256; r3 (A2 class): THIS entry's own, never a path-keyed lookup
 # r12 (adversary r12 A1): and each staged build manifest the plan reads (-LegPlan only; the scalar form's one build is read inside the leg job, after the lease)
 if ($legPlanMode) { foreach ($b in $builds.GetEnumerator()) { $first = @($items | Where-Object { [string]::Equals([string]$_.sourceCommit, [string]$b.Key, [StringComparison]::Ordinal) })[0]; $script:guardedInputs.Add([pscustomobject]@{ path = $b.Value.path; kind = 'build'; item = $first.item; commit = $b.Key; sha256 = $first.buildManifestSha256 }) } }
 # r6 pass 3 (adversary r6 pass 2 A1): each input's physical path and file identity as accepted (the preflight guard just resolved it), for Get-WriteDestinationHit
@@ -1765,9 +1774,11 @@ foreach ($g in $script:guardedInputs) {
 # two), and the check after the plan compares each entry with its own string's binding. The same FILE reached by two spellings (Pace.json and pace.json on a case-insensitive
 # volume, or a hard link) is two strings, so it is compared HERE by the file identity just accepted: every entry naming one file must have been judged as the same bytes, before
 # any claim or lease (the guard's re-read after the claim would only find it once the claim was taken).
+# r3 fix 3 (adversary pass 4 A3): grouped by the identity each entry recorded right after ITS judged read (Get-JudgedFileKey), not this later sweep's: a name re-pointed at another
+# file between the two would otherwise split one judged file into two groups. An entry with no recorded identity falls back to the sweep's (the sweep refused an unidentifiable one).
 $specByFile = [Collections.Hashtable]::new([StringComparer]::Ordinal)
 foreach ($g in @($script:guardedInputs | Where-Object { $_.kind -ceq 'spec' })) {
-    $fileKey = [string]$g.accepted.key
+    $fileKey = $(if ($g.fileKey) { [string]$g.fileKey } else { [string]$g.accepted.key })
     if (-not $specByFile.ContainsKey($fileKey)) { $specByFile[$fileKey] = $g; continue }
     $firstSpec = $specByFile[$fileKey]
     if ([string]$firstSpec.specSha256 -cne [string]$g.specSha256) {
