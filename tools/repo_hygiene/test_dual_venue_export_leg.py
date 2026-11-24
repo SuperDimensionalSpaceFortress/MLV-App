@@ -3906,6 +3906,29 @@ ConvertTo-Json -InputObject $out -Compress -Depth 4
                 self.assertEqual(g["result"], want_job, g)
                 self.assertEqual(c["outcome"] == "PASS", g["result"] == "EXPORT_CAPTURED", (c, g))
 
+    def test_t3_r1_adversary_a2_a3_on_23d3920a(self) -> None:
+        """TIMING-3 r1 adversary pass 1 on 23d3920a (inputs verbatim in shape). A2: a RENDER_VERIFIED with a real probe and ONE trailer value set to its no-probe
+        sentinel (codec=unchecked, container=unchecked, sar=unchecked or dar=unchecked) read PASS; the producer prints the six no-probe values together and only together
+        (BatchRunner.cpp:810-819), so any one of them binds the rest. A3: the generator's ValidateSet admits `-Format CDNG-LOSSLESS` and the job's branches compare
+        case-insensitively, but the binding verdict compared case-sensitively, so a DONE of another clip than the frames found read EXPORT_CAPTURED."""
+        S, V = self.t4_start(), self.t4_verified()
+        D = "[BATCH] DONE view-0 exported=1 skipped=0 elapsed=1.0"
+        rows = [(f"A2-{k}", "prores", 1, [S, V.replace(f" {k}={v} ", f" {k}=unchecked ") if k != "dar" else V.replace(" dar=4:3", " dar=unchecked"), D], ["view-0.mov"])
+                for k, v in (("codec", "prores"), ("container", "mov"), ("sar", "1:1"), ("dar", "4:3"))]
+        rows.append(("A3-UPPER-CDNG", "CDNG-LOSSLESS", 30, ["[BATCH] DONE view-0 exported=30 skipped=0 elapsed=20.0"], [f"other-clip_{k:06d}.dng" for k in range(30)]))
+        rows.append(("A3-UPPER-CDNG-OK", "CDNG-LOSSLESS", 30, ["[BATCH] DONE view-0 exported=30 skipped=0 elapsed=20.0"], [f"view-0_{k:06d}.dng" for k in range(30)]))
+        got = self.run_job_slice(rows)
+        for (label, *_), g in zip(rows, got):
+            with self.subTest(row=label):
+                self.assertEqual(g["result"], "EXPORT_CAPTURED" if label.endswith("-OK") else "EXPORT_OUTPUT_MISMATCH", g)
+        central = [prores_case(maxFrames=1, dualIsoExpected=True, stage=piped_stage_log(1, scale_ms=6.0), batch="[BATCH] Start\n" + "\n".join(ls) + "\n", criteria=[])
+                   for label, fmt, _, ls, _ in rows if fmt == "prores"]
+        proc, got = evidence_cases(central)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and "RENDER_VERIFIED" in p and "unchecked" in p for p in g["problems"]), g)
+
     @staticmethod
     def t4_start() -> str:
         return ("[BATCH] RENDER_START view-0 codec=prores container=mov source=1920x1080 output=1920x1440 scaled=true fps=24 frames=1 cutIn=1 cutOut=1 "
