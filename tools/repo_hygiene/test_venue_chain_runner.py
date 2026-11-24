@@ -31,8 +31,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tools.repo_hygiene.venue_fixture_modules import copy_with_siblings, cross_tree_modules, sibling_modules
-# VENUE-FIFO-ADVERSARY-TAIL-1 r8: every subprocess.run of this file is run_tree_bounded (the same call; on Windows a timeout kills the whole tree), see venue_fixture_modules
-from tools.repo_hygiene.venue_fixture_modules import run_tree_bounded
+# VENUE-FIFO-ADVERSARY-TAIL-1 r8: every subprocess.run of this file is run_tree_bounded (the same call; on Windows a timeout kills the whole tree), and a chain Popen
+# whose pipe is read only at communicate() is a DrainedPopen (two chains run at once: one waited on while the other's pipe filled), see venue_fixture_modules
+from tools.repo_hygiene.venue_fixture_modules import DrainedPopen, run_tree_bounded
 
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
@@ -351,8 +352,8 @@ class VenueChainRunnerTests(unittest.TestCase):
         b = root / "fleet-runs" / "lane-B" / "tools" / "chain-b.ps1"   # a chain*.ps1 under fleet-runs: what waiter A's scan matches
         b.write_text(OLD_WAITER_B, encoding="utf-8")
         base = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File"]
-        pa = subprocess.Popen([*base, str(a), "-Root", str(root), "-Self", "lane-A", "-MaxSec", "10"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        pb = subprocess.Popen([*base, str(b), "-Root", str(root), "-Self", "lane-B", "-MaxSec", "10"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        pa = DrainedPopen([*base, str(a), "-Root", str(root), "-Self", "lane-A", "-MaxSec", "10"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        pb = DrainedPopen([*base, str(b), "-Root", str(root), "-Self", "lane-B", "-MaxSec", "10"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         out_a, _ = pa.communicate(timeout=120)
         out_b, _ = pb.communicate(timeout=120)
         # each saw the other as the venue owner, and neither ever ran its leg
@@ -404,8 +405,8 @@ class VenueChainRunnerTests(unittest.TestCase):
     def test_two_concurrent_chains_never_deadlock_and_the_second_runs_after_the_first_releases(self) -> None:
         rd_a, rd_b = self.case / "lane-A", self.case / "lane-B"
         env = self.env(FAKE_QUIET_SLEEP_PRE="1", FAKE_LEG_SLEEP="5")
-        pa = subprocess.Popen(self.chain_args(rd_a, [self.specs[0]]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
-        pb = subprocess.Popen(self.chain_args(rd_b, [self.specs[1]]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+        pa = DrainedPopen(self.chain_args(rd_a, [self.specs[0]]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+        pb = DrainedPopen(self.chain_args(rd_b, [self.specs[1]]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
         out_a, _ = pa.communicate(timeout=240)
         out_b, _ = pb.communicate(timeout=240)
         self.assertEqual((pa.returncode, pb.returncode), (0, 0), out_a + "\n----\n" + out_b)
@@ -648,7 +649,7 @@ class VenueChainRunnerTests(unittest.TestCase):
     def test_live_claim_released_by_its_owner_lets_the_waiter_run(self) -> None:
         self.write_claim(os.getpid(), process_start_iso(os.getpid()), datetime.now(timezone.utc) + timedelta(hours=3))
         rd = self.case / "lane-R"
-        p = subprocess.Popen(self.chain_args(rd, [self.specs[0]], deadline_sec=90), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=self.env())
+        p = DrainedPopen(self.chain_args(rd, [self.specs[0]], deadline_sec=90), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=self.env())
         t0 = time.time()
         while time.time() - t0 < 60 and not ((rd / "chain.log").exists() and "CLAIM_HELD" in (rd / "chain.log").read_text(encoding="utf-8")):
             time.sleep(0.25)
@@ -1296,7 +1297,7 @@ class VenueChainSupplementaryTests(unittest.TestCase):
                                       "runDir": "C:\\elsewhere\\lane-OTHER", "purpose": "fixture", "claimedUtc": utc_iso(datetime.now(timezone.utc)),
                                       "expiresUtc": utc_iso(datetime.now(timezone.utc) + timedelta(hours=3)), "nonce": "b-fixture"}), encoding="utf-8")
         rd = self.case / "lane-LINE"
-        p = subprocess.Popen(self.chain_args(rd, self.specs[:1], "-SupplementaryHeldSec", "2"), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=self.env())
+        p = DrainedPopen(self.chain_args(rd, self.specs[:1], "-SupplementaryHeldSec", "2"), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=self.env())
         t0 = time.time()
         while time.time() - t0 < 90 and not any(" SUPPLEMENTARY_RAN " in l for l in (self.chain_log(rd) if (rd / "chain.log").exists() else [])):
             time.sleep(0.25)

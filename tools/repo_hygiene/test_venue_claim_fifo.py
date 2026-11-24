@@ -34,9 +34,9 @@ from pathlib import Path
 
 from tools.repo_hygiene import test_venue_chain_runner as base
 from tools.repo_hygiene.venue_fixture_modules import copy_with_siblings
-# VENUE-FIFO-ADVERSARY-TAIL-1 r8: every subprocess.run of this file is run_tree_bounded (the same call; on Windows a timeout kills the whole tree), and run_reaped's
-# wait after its timeout is communicate_tree_bounded's, see venue_fixture_modules
-from tools.repo_hygiene.venue_fixture_modules import communicate_tree_bounded, run_tree_bounded
+# VENUE-FIFO-ADVERSARY-TAIL-1 r8: every subprocess.run of this file is run_tree_bounded (the same call; on Windows a timeout kills the whole tree), run_reaped's
+# wait after its timeout is communicate_tree_bounded's, and a gate Popen whose pipes are read only at communicate() is a DrainedPopen, see venue_fixture_modules
+from tools.repo_hygiene.venue_fixture_modules import DrainedPopen, communicate_tree_bounded, run_tree_bounded
 
 DV = Path(os.environ["VENUE_CLAIM_FIFO_DV_DIR"]) if os.environ.get("VENUE_CLAIM_FIFO_DV_DIR") else base.DV
 RUNNER = DV / "Invoke-VenueChain.ps1"
@@ -748,7 +748,7 @@ exit $LASTEXITCODE
                     extra = ["-WaitUntilTs", str(self.qpc_now() + cutoff_sec * hz)]
                 argv = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(QUIET), "-Venue", "bachelor", "-WorkDir", str(work), "-GateLog", str(log), "-AgentShare",
                         str(share), "-AllowShareOverride", "-MaxWaitSec", "240", "-MaxGateSec", "240", "-GatePollSec", "30", "-ReadAttempts", "1", "-ReadBackoffSec", "0", *extra]
-                p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                p = DrainedPopen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 seen_busy = False
                 t = time.monotonic()
                 while time.monotonic() - t < cutoff_sec - 1 and p.poll() is None:
@@ -790,7 +790,7 @@ exit $LASTEXITCODE
                 work = self.case / f"quiet-work-zero-{name}"
                 argv = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(QUIET), "-Venue", "bachelor", "-WorkDir", str(work), "-AgentShare", str(share),
                         "-AllowShareOverride", "-MaxWaitSec", "0", "-MaxGateSec", "240", "-GatePollSec", "1", "-ReadAttempts", "1", "-ReadBackoffSec", "0", *extra]
-                text, hung = self.run_reaped(subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), 120)
+                text, hung = self.run_reaped(DrainedPopen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), 120)
                 self.assertFalse(hung, text)
                 written = sorted(q.name for q in work.glob("venue-quiet-probe-*.job.ps1")) if work.exists() else []
                 self.assertEqual(len(written), 1, f"the first measurement of a zero wait was refused: {text}")
@@ -877,7 +877,7 @@ $probe = [ordered]@{ schema = 'mlv-app/venue-quiet-probe/v1'; host = 'BACHELOR';
                 argv = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(quiet), "-Venue", "bachelor", "-WorkDir", str(self.case / f"quiet-work-a2-{name}"),
                         "-AgentShare", str(share), "-AllowShareOverride", "-MaxWaitSec", "240", "-MaxGateSec", "240", "-GatePollSec", "1", "-RecheckSec", "1",
                         "-ReadAttempts", "1", "-ReadBackoffSec", "0", "-ForeignFloorProbes", "0", *extra]
-                text, hung = self.run_reaped(subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), 120)
+                text, hung = self.run_reaped(DrainedPopen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), 120)
                 self.assertFalse(hung, text)
                 starts = self.umrun_call_starts(root)
                 self.assertGreaterEqual(len(starts), 2, f"the re-probe was never submitted: {text}")
@@ -902,7 +902,7 @@ $probe = [ordered]@{ schema = 'mlv-app/venue-quiet-probe/v1'; host = 'BACHELOR';
         argv = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(quiet), "-Venue", "bachelor", "-WorkDir", str(work), "-GateLog", str(log), "-AgentShare",
                 str(share), "-AllowShareOverride", "-MaxWaitSec", "240", "-MaxGateSec", "240", "-GatePollSec", "1", "-ReadAttempts", "1", "-ReadBackoffSec", "0",
                 "-WaitUntilUtc", utc_iso(cutoff)]
-        p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        p = DrainedPopen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         seen_busy = False
         t = time.monotonic()
         while time.monotonic() - t < 10 and p.poll() is None:
@@ -931,7 +931,7 @@ $probe = [ordered]@{ schema = 'mlv-app/venue-quiet-probe/v1'; host = 'BACHELOR';
         argv = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(quiet), "-Venue", "bachelor", "-WorkDir", str(self.case / "quiet-work-a2-zero"),
                 "-AgentShare", str(share), "-AllowShareOverride", "-MaxWaitSec", "0", "-MaxGateSec", "240", "-GatePollSec", "1", "-ReadAttempts", "1", "-ReadBackoffSec", "0",
                 "-WaitUntilUtc", utc_iso(datetime.now(timezone.utc) - timedelta(seconds=1))]
-        text, hung = self.run_reaped(subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), 120)
+        text, hung = self.run_reaped(DrainedPopen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), 120)
         self.assertFalse(hung, text)
         self.assertEqual(len(self.umrun_call_starts(root)), 1, text)
         self.assertNotIn("GATE_CUTOFF", text)

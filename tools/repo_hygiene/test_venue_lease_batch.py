@@ -41,8 +41,9 @@ from pathlib import Path
 from unittest import mock
 
 from tools.repo_hygiene.venue_fixture_modules import copy_cross_tree_modules
-# VENUE-FIFO-ADVERSARY-TAIL-1 r8: every subprocess.run of this file is run_tree_bounded (the same call; on Windows a timeout kills the whole tree), see venue_fixture_modules
-from tools.repo_hygiene.venue_fixture_modules import run_tree_bounded
+# VENUE-FIFO-ADVERSARY-TAIL-1 r8: every subprocess.run of this file is run_tree_bounded (the same call; on Windows a timeout kills the whole tree), and every runner Popen
+# whose pipes nobody reads until communicate() is a DrainedPopen (its pipes are read from the start, so the runner never stalls on a full pipe), see venue_fixture_modules
+from tools.repo_hygiene.venue_fixture_modules import DrainedPopen, run_tree_bounded
 
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
@@ -2672,7 +2673,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         # aliveUntilUtc passes and the agent's own verdict for the open turns passed (source=sidecar), so its wait ends and its request is released (the
         # agent side of this is batch-runner-killed-liveness in test-ultra-magnus-agent-quiet-lease.ps1). RED: the runner writes no sidecar.
         args, e = self.batch_cmd([self.specs[0]], "-LivenessWindowSec", "6", "-LivenessRenewSec", "1", FAKE_OPEN_SLEEP="200")
-        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        p = DrainedPopen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
         side_dir = self.share / "notafter"
         try:
             def read_side() -> dict | None:
@@ -2911,7 +2912,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         release = self.case / "open.release"
         release.unlink(missing_ok=True)
         args, e = self.batch_cmd([self.specs[0]], "-ClaimTtlSec", "60", FAKE_OPEN_SLEEP="120", FAKE_OPEN_RELEASE=str(release))
-        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        p = DrainedPopen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
         try:
             end = time.monotonic() + 60
             while not self.claim_path.exists() and time.monotonic() < end:
@@ -3004,7 +3005,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         # submitted would be blocked in um-run (FAKE_OPEN_SLEEP). No OPEN job file is ever in the agent's inbox. RED on 3da8db54: the open is in the inbox.
         self._deny_writes(self.share / "notafter")
         args, e = self.batch_cmd([self.specs[0]], FAKE_OPEN_SLEEP="200")
-        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        p = DrainedPopen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
         try:
             log = self.run_dir / "batch.log"
             end = time.monotonic() + 60
@@ -4996,7 +4997,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 old = spec.with_name("fx-a.json.old")
                 args, e = (self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), FAKE_OPEN_SLEEP="8") if form == "plan"
                            else self.batch_cmd([spec], FAKE_OPEN_SLEEP="8"))
-                p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+                p = DrainedPopen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
                 try:
                     self._r7_wait_for_event(p, "OPENWAIT")
                     os.rename(spec, old)
@@ -6500,7 +6501,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.fail("the open never reached its wait")
 
     def _alias_during_claim_wait(self, args: list[str], e: dict, spec: Path, alias: Path) -> tuple[int, str, str]:
-        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        p = DrainedPopen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         try:
             self._wait_for_log("CLAIM_HELD")
             os.link(spec, alias)
@@ -6615,7 +6616,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
 
     # r12 pass 2 (adversary r12 A2'): what the preflight validated must still hold when the claim is taken, or the leg throws / refuses after the lease opened.
     def _during_claim_wait(self, args: list[str], e: dict, change, release: bool = True) -> tuple[int, str, str]:
-        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        p = DrainedPopen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         try:
             self._wait_for_log("CLAIM_HELD")
             change()
@@ -7205,7 +7206,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         manifest = self.share / "cache" / f"playback-attr-3-cuda-{self.commit_a[:12]}-build.json"
         args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-LeaseCapSec", "95", "-LegBudgetSec", "60", "-LeaseMarginSec", "0",
                                 FAKE_OPEN_SLEEP="6", FAKE_LEASE_REMAIN="60")
-        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        p = DrainedPopen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         try:
             self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
             self._wait_for_open_wait()   # r15: the open's wait itself, never a fixed sleep after the read-back line
@@ -7417,6 +7418,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     def _run_acting_on_stderr(self, args: list[str], e: dict, marker: str, act, timeout_s: float = 240) -> tuple[int, str, str, float]:
         # the run's stderr is read as it comes, and act() runs once on the first line carrying marker: a no-answer poll writes nothing into -RunDir, so stderr is all a case can wait on
         t0 = time.monotonic()
+        # (a plain Popen: this case's own two readers below drain both pipes from the start, r8's DrainedPopen would race them)
         p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         lines: list[str] = []
         out: list[str] = []
@@ -8257,7 +8259,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self._foreign_live_claim()
         args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]),
                                 "-StagedBuildProbeScript", str(manifest_probe), "-ArtifactProbeScript", str(artifact_probe))
-        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        p = DrainedPopen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         try:
             self._wait_for_log("CLAIM_HELD")
             # the reset after the one-time preflight (Dot): CLAIM_HELD is logged after the first denied poll's guard, so the preflight's one hash is all there may be by now
@@ -8352,7 +8354,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.run_dir = link
         args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-LeaseCapSec", "75", "-LegBudgetSec", "60", "-LeaseMarginSec", "0",
                                 "-GuardReadDelay", "open:identity=25", FAKE_OPEN_SLEEP="6", TEMP=str(new), TMP=str(new))
-        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        p = DrainedPopen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         try:
             self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
             # r15 (hosted CI 40963950528): the open's job file is written into -RunDir\batch-jobs AFTER the read-back line, so a repoint made at that line raced it and, on a slow
@@ -8383,7 +8385,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.run_dir = link
         args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-LeaseCapSec", "75", "-LegBudgetSec", "60", "-LeaseMarginSec", "0",
                                 "-GuardReadDelay", guard_delay, FAKE_OPEN_SLEEP="6", TEMP=str(new), TMP=str(new))
-        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        p = DrainedPopen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         try:
             self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
             # r15: inside the open's wait, after its job file is written (see the r5 adversary A1 case above)
@@ -8437,7 +8439,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         release = self._open_release()
         args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-LeaseCapSec", "75", "-LegBudgetSec", "60", "-LeaseMarginSec", "0",
                                 "-GuardReadDelay", "open:rundir=3", FAKE_OPEN_SLEEP="60", FAKE_OPEN_RELEASE=str(release))
-        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        p = DrainedPopen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         try:
             self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
             self._wait_for_open_wait()
@@ -8968,7 +8970,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         shutil.copy2(self.specs[0], spec)
         before = spec.read_text(encoding="utf-8")
         args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), FAKE_OPEN_SLEEP="12")
-        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        p = DrainedPopen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         try:
             # the last line before um-run blocks (FAKE_OPEN_SLEEP); a link made before it is written through at once, the race no re-check closes
             self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
@@ -9020,7 +9022,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # r8: the open blocks until the link is made (FAKE_OPEN_RELEASE) -- 60 s is only its bound -- instead of for a fixed 12 s
         release = self._open_release()
         args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), *extra, FAKE_OPEN_SLEEP="60", FAKE_OPEN_RELEASE=str(release), FAKE_OPEN_MODES=mode)
-        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        p = DrainedPopen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         try:
             self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
             self._wait_for_open_wait()
@@ -9055,7 +9057,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), *extra, FAKE_OPEN_SLEEP="12", FAKE_OPEN_MODES=mode, **(env or {}))
         if claim_dir is not None:
             args[args.index("-ClaimDir") + 1] = str(claim_dir)
-        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        p = DrainedPopen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
         self._wait_for_open_wait()   # r15: the open's wait itself, never a fixed sleep after the read-back line
         return p, spec, hashlib.sha256
@@ -9150,7 +9152,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), FAKE_OPEN_SLEEP="12", FAKE_OPEN_MODES="gatehold")
         err = self.case / "r14-adv2-a1.err.txt"
         with open(err, "w", encoding="utf-8") as ef:
-            p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=ef, text=True, env=e)
+            p = DrainedPopen(args, stdout=subprocess.PIPE, stderr=ef, text=True, env=e)
             try:
                 self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
                 self._wait_for_open_wait()   # r15: the open's wait itself, never a fixed sleep after the read-back line
@@ -10827,6 +10829,27 @@ class TreeBoundedRunTests(unittest.TestCase):
         with self.assertRaises(subprocess.CalledProcessError) as caught:
             run_tree_bounded(argv, input="x", capture_output=True, text=True, timeout=60, check=True)
         self.assertEqual((caught.exception.returncode, caught.exception.output, caught.exception.stderr), (3, "out:x", "err"))
+
+    def test_r8_adv_a7_a_tree_kill_that_taskkill_refused_is_never_a_clean_note(self) -> None:
+        # adversary A7 (1564db75): taskkill's non-zero exit was dropped, so a tree kill that did not happen read as one that did. Here the root is already gone (taskkill exits 128)
+        from tools.repo_hygiene.venue_fixture_modules import kill_tree
+        p = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 0"])
+        p.wait(timeout=60)
+        note = kill_tree(p)
+        self.assertIn("taskkill exited", note, f"a refused tree kill left the note {note!r}")
+
+    def test_r8_a_drained_popen_never_stalls_a_child_that_writes_past_the_pipe_before_anyone_reads(self) -> None:
+        # the l05 shape: the child writes 64 KB (far past a Windows pipe's ~4 KB) and then exits, while the test does not read until it is done. A plain Popen's child blocks on
+        # the write and never exits; a DrainedPopen's child exits at once, and communicate() returns every byte
+        argv = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "1..1024 | ForEach-Object { [Console]::Out.WriteLine('x' * 63) }; [Console]::Error.WriteLine('done')"]
+        p = DrainedPopen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            p.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            kill_note = __import__("tools.repo_hygiene.venue_fixture_modules", fromlist=["kill_tree"]).kill_tree(p)
+            self.fail(f"the child did not exit in 60 s with nobody reading its pipe: it stalled on a full pipe ({kill_note})")
+        out, err = p.communicate(timeout=60)
+        self.assertEqual((len(out.splitlines()), err.strip()), (1024, "done"))
 
 
 if __name__ == "__main__":

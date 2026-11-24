@@ -37,7 +37,10 @@ def kill_tree(proc: subprocess.Popen) -> str:
         try:
             tk = subprocess.Popen(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:
-                tk.wait(timeout=TREE_KILL_BOUND_SEC)
+                # r8 adversary A7 (1564db75): a non-zero taskkill (access denied, a root already gone) is a tree kill NOT confirmed, never a clean note
+                code = tk.wait(timeout=TREE_KILL_BOUND_SEC)
+                if code != 0:
+                    problems.append(f"taskkill exited {code}")
             except subprocess.TimeoutExpired:
                 tk.kill()
                 problems.append(f"taskkill did not exit in {TREE_KILL_BOUND_SEC:g} s")
@@ -66,11 +69,80 @@ def communicate_tree_bounded(proc: subprocess.Popen, timeout: float, input: obje
             out, err = proc.communicate(timeout=TREE_COLLECT_BOUND_SEC)
         except subprocess.TimeoutExpired:
             note = "; ".join(x for x in (note, f"a pipe was still held {TREE_COLLECT_BOUND_SEC:g} s after the tree kill") if x)
+            # r8 adversary A8 (1564db75): a stream that DID reach its end is kept when only the other is still held. CPython's Windows communicate() reads each pipe whole on its
+            # own thread into proc._stdout_buff / proc._stderr_buff (one item, at EOF) and raises with neither; a DrainedPopen keeps what it has read in .drained_output()
+            if isinstance(proc, DrainedPopen):
+                out, err = proc.drained_output()
+            else:
+                out = (getattr(proc, "_stdout_buff", None) or [out])[0]
+                err = (getattr(proc, "_stderr_buff", None) or [err])[0]
         except (OSError, ValueError):
             pass   # the pipes are closed: nothing more to read
         expired = subprocess.TimeoutExpired(proc.args, timeout, output=out, stderr=err)
         expired.tree_kill_note = note   # type: ignore[attr-defined]
         raise expired from None
+
+
+class DrainedPopen(subprocess.Popen):
+    """subprocess.Popen whose PIPE streams are read from the moment it starts, each on a daemon thread, so a child that writes more than a pipe holds (about 4 KB on Windows)
+    never blocks on a write while the test waits on its progress (a batch.log line, a probe call) before it calls communicate().
+
+    r8 (test_artifact_preflight_r5_l05_...: 9.8 s alone, 300 s under load in the r8 timing run): the runner wrote 6402 bytes to an undrained stdout pipe before and after the
+    case's wait for three denied polls; past the pipe's size it stalled on a write, so the polls stopped and the case sat out its 120 s and 240 s bounds.
+    communicate(input, timeout) waits for the process (raising subprocess.TimeoutExpired as Popen.communicate does), then for the readers within TREE_COLLECT_BOUND_SEC (a
+    grandchild that still holds a pipe is not waited for), and returns what was read; a second call after a timeout returns the rest."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._drain_bufs: dict[str, list] = {}
+        self._drain_threads: list = []
+        import threading
+        for name in ("stdout", "stderr"):
+            stream = getattr(self, name)
+            if stream is not None:
+                buf: list = []
+                self._drain_bufs[name] = buf
+                t = threading.Thread(target=self._drain, args=(stream, buf), daemon=True)
+                t.start()
+                self._drain_threads.append(t)
+
+    @staticmethod
+    def _drain(stream, buf: list) -> None:
+        try:
+            while True:
+                # a line at a time (a text read(n) holds back what it read until n characters or EOF), so drained_output() after a timeout has every finished line
+                chunk = stream.readline()
+                if not chunk:
+                    break
+                buf.append(chunk)
+        except (OSError, ValueError):
+            return   # closed under the reader
+        try:
+            stream.close()   # EOF: the last writer is gone, nothing more can arrive
+        except (OSError, ValueError):
+            pass
+
+    def drained_output(self) -> tuple:
+        """(stdout, stderr) as read so far; None for a stream that is not a PIPE."""
+        def joined(name: str):
+            buf = self._drain_bufs.get(name)
+            if buf is None:
+                return None
+            parts = list(buf)
+            return (type(parts[0])() if parts else ("" if self.text_mode else b"")).join(parts)
+        return joined("stdout"), joined("stderr")
+
+    def communicate(self, input=None, timeout=None):   # noqa: A002 (Popen's own parameter name)
+        if input is not None and self.stdin is not None:
+            try:
+                self.stdin.write(input)
+                self.stdin.close()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+        self.wait(timeout=timeout)
+        for t in self._drain_threads:
+            t.join(TREE_COLLECT_BOUND_SEC)
+        return self.drained_output()
 
 
 def run_tree_bounded(*popenargs, input: object = None, capture_output: bool = False, timeout: float | None = None, check: bool = False, **kwargs) -> subprocess.CompletedProcess:
