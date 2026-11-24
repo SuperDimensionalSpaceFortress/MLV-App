@@ -4490,6 +4490,10 @@ UNRESOLVED_EXECUTED_SITES = {
          "LEASE-BATCH-CLAIM-WAIT-GUARD-READ-REFUSAL-1 r7: Invoke-ClaimRetryRelease lets go a claim granted on a retry on a worker runspace bounded by the room before -DeadlineUtc. "
          "$script:ClaimRetryReleaseWorker is a { } literal of this file (its only writer), which the AST scans as code: it imports VenueChain.psm1 beside this file and calls "
          "Release-VenueClaim, which deletes the claim file and launches nothing"),
+        ("[void]$pr.ps.AddScript($script:PendingClaimReleaseWorker.ToString())",
+         "VENUE-FIFO-ADVERSARY-TAIL-1 r7 (adversary pass 10 A1, A2): Start-PendingClaimReleaseWorker lets go of a claim of the batch's own that a give-back left standing on ONE worker "
+         "runspace per nonce, which retries until the claim is let go, the process exits or -ClaimTtlSec passes. $script:PendingClaimReleaseWorker is a { } literal of this file "
+         "(its only writer), which the AST scans as code: it imports VenueChain.psm1 beside this file and calls Release-VenueClaim, which deletes the claim file and launches nothing"),
     ],
     "tools/profiling/dual-venue/Invoke-VenueStageNightly.ps1": [
         ("[void]$ps.AddScript($Script.ToString())",
@@ -4609,9 +4613,9 @@ def test_launcher_census_the_lease_batch_probe_seams_are_classified_per_site_and
     text = (REPO / path).read_text(encoding="utf-8")
     inventory = {path: UNRESOLVED_EXECUTED_SITES[path]}
     # r4: plus the guard worker's AddScript (Invoke-InputGuard), a { } literal of this file; LEASE-BATCH-CLAIM-WAIT-GUARD-READ-REFUSAL-1 r7: plus the retry claim request's and
-    # release's workers, { } literals of this file too
-    assert len(inventory[path]) == 5
-    for name in ("$script:ClaimRetryRequestWorker", "$script:ClaimRetryReleaseWorker"):
+    # release's workers, { } literals of this file too; VENUE-FIFO-ADVERSARY-TAIL-1 r7: plus the pending claim release's worker, a { } literal of this file too
+    assert len(inventory[path]) == 6
+    for name in ("$script:ClaimRetryRequestWorker", "$script:ClaimRetryReleaseWorker", "$script:PendingClaimReleaseWorker"):
         assert text.count(f"{name} = ") == 1, f"the {name} literal has one writer"
         assert f"\n{name} = {{\n" in text, f"the {name} writer is a top-level {{ }} literal"
     assert not _census_problems({path: text}, {}, {}, kinds=("unresolved",), unresolved_inventory=inventory)
