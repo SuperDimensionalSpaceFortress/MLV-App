@@ -6399,6 +6399,10 @@ function Get-DvHealthVerdict {
 # is a typed `{state:'unknown'; reason}` for that field and never fails or delays the leg: the whole block has a 15 s budget and every CIM call carries what is left.
 # A receipt without the block stays valid (older receipts exist) and the validator says `displayPath=absent`; a present but malformed block is INVALID.
 $script:DisplayPathSchema = 'mlv-app/venue-display-path/v1'
+# r3 (adversary r2 A7): the block describes the display path at SUBMIT time: the health probe samples it before the measurement job is submitted (then it waits in
+# the agent's queue and admission). The block carries that moment as `sampledBefore` with its `collectedUtc`; a measurement-side sample is successor
+# VENUE-LEG-DISPLAY-PATH-MEASUREMENT-SIDE-1.
+$script:DisplayPathSampledBefore = 'measurement-submit'
 
 function Get-DvDisplayPathCollectorSource {
     <#
@@ -6436,7 +6440,7 @@ function Get-DvDisplayPath {
         , $got
     }
     try {
-        $block = [ordered]@{ schema = 'mlv-app/venue-display-path/v1'; collectedUtc = [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', $invariant); adapters = $null; activeDisplays = $null; os = $null; powerPlan = $null }
+        $block = [ordered]@{ schema = 'mlv-app/venue-display-path/v1'; sampledBefore = 'measurement-submit'; collectedUtc =[datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', $invariant); adapters = $null; activeDisplays = $null; os = $null; powerPlan = $null }
 
         # video adapters, and which of them has an active output (a refresh rate or a width the controller reports)
         $rows = $null; $rowsWhy = ''
@@ -6511,8 +6515,20 @@ function Test-DvDisplayPathText {
     ($Value -is [string]) -and [string]::Equals([string]$Value, $Expected, [System.StringComparison]::Ordinal)
 }
 
+function Get-DvDisplayPathTextValue {
+    # r3 (adversary r2 A4, route (b)): the value of a TEXT leaf as text, or $null when it is not one. Every receipt reader parses with ConvertFrom-Json, which reads a
+    # string that looks like a time ("2026-11-24T00:00:00Z": a power plan, an adapter or a reason named like one) as a [datetime]. That [datetime] IS the round-tripped
+    # text leaf, so it is accepted here, as its round-trip ('o') spelling in the invariant culture; the two tables' names round-trip alike, so they still compare.
+    # Only the leaves the schema calls text come through here: a UTC-time leaf keeps its own strict rule (Test-DvDisplayPathLeaf 'utc').
+    param($Value)
+    if ($Value -is [string]) { return $Value }
+    if ($Value -is [datetime]) { return $Value.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) }
+    $null
+}
+
 function Test-DvDisplayPathUnknown {
     # A well-formed typed unknown: exactly the two members `{state:'unknown'; reason:<1..200 chars>}` and nothing else.
+    # r3 (A4): the reason is a text leaf, so a reason that reads back as a [datetime] is still a reason.
     param($Value)
     if (-not (Test-DvDisplayPathIsObject $Value)) { return $false }
     $names = @($(if ($Value -is [System.Collections.IDictionary]) { @($Value.Keys) } else { @($Value.PSObject.Properties | ForEach-Object { $_.Name }) }) | ForEach-Object { [string]$_ })
@@ -6524,7 +6540,7 @@ function Test-DvDisplayPathUnknown {
     }
     if (-not ($hasState -and $hasReason)) { return $false }
     $state = Get-DvProp $Value 'state'
-    $reason = Get-DvProp $Value 'reason'
+    $reason = Get-DvDisplayPathTextValue (Get-DvProp $Value 'reason')
     (Test-DvDisplayPathText $state 'unknown') -and ($reason -is [string]) -and ($reason.Trim().Length -gt 0) -and ($reason.Length -le 200)
 }
 
@@ -6533,7 +6549,7 @@ function Test-DvDisplayPathLeaf {
     param($Value, [string]$Kind)
     if ($Kind -cne 'bool' -and (Test-DvDisplayPathUnknown $Value)) { return $true }
     switch ($Kind) {
-        'string' { return (($Value -is [string]) -and ($Value.Trim().Length -gt 0) -and ($Value.Length -le 500)) }
+        'string' { $t = Get-DvDisplayPathTextValue $Value; return (($t -is [string]) -and ($t.Trim().Length -gt 0) -and ($t.Length -le 500)) }
         'int' { return ((($Value -is [int]) -or ($Value -is [long])) -and ($Value -ge 0)) }
         'bool' { return ($Value -is [bool]) }
         'utc' {
@@ -6560,6 +6576,8 @@ function Test-DvDisplayPathBlock {
     $problems = [System.Collections.Generic.List[string]]::new()
     if (-not (Test-DvDisplayPathIsObject $Block)) { return (& $result 'malformed' @('the block is neither an object nor a typed unknown')) }
     if (-not (Test-DvDisplayPathText (Get-DvProp $Block 'schema') $script:DisplayPathSchema)) { $problems.Add("schema is not the string $script:DisplayPathSchema") }
+    # r3 (adversary r2 A7): the block is the health probe's sample, taken before the measurement job is submitted, and it must say so (the exact string)
+    if (-not (Test-DvDisplayPathText (Get-DvProp $Block 'sampledBefore') $script:DisplayPathSampledBefore)) { $problems.Add("sampledBefore is not the string $script:DisplayPathSampledBefore") }
     if (-not (Test-DvDisplayPathLeaf (Get-DvProp $Block 'collectedUtc') 'utc')) { $problems.Add('collectedUtc is not a UTC time') }
     $tables = @(
         @{ name = 'adapters'; fields = @(@('name', 'string'), @('driverVersion', 'string'), @('driverDate', 'utc'), @('pnpDeviceId', 'string'), @('hasActiveOutput', 'bool')) },
@@ -6579,15 +6597,20 @@ function Test-DvDisplayPathBlock {
     $adaptersList = Get-DvProp $Block 'adapters'
     $displaysList = Get-DvProp $Block 'activeDisplays'
     if (($adaptersList -is [System.Array]) -and ($displaysList -is [System.Array]) -and $problems.Count -eq 0) {
-        $want = @{}; $have = @{}
+        # r3 (A4): a name is compared as its text value, so a name that reads back as a [datetime] still counts (ordinal keys: a case-sensitive dictionary)
+        $want = [System.Collections.Generic.Dictionary[string, int]]::new([System.StringComparer]::Ordinal)
+        $have = [System.Collections.Generic.Dictionary[string, int]]::new([System.StringComparer]::Ordinal)
         foreach ($a in $adaptersList) {
-            if ((Get-DvProp $a 'hasActiveOutput') -eq $true -and (Get-DvProp $a 'name') -is [string]) { $want[[string](Get-DvProp $a 'name')] = 1 + [int]$want[[string](Get-DvProp $a 'name')] }
+            $n = Get-DvDisplayPathTextValue (Get-DvProp $a 'name')
+            if ((Get-DvProp $a 'hasActiveOutput') -eq $true -and $n -is [string]) { $want[$n] = 1 + $(if ($want.ContainsKey($n)) { $want[$n] } else { 0 }) }
         }
         foreach ($d in $displaysList) {
-            if ((Get-DvProp $d 'adapterName') -is [string]) { $have[[string](Get-DvProp $d 'adapterName')] = 1 + [int]$have[[string](Get-DvProp $d 'adapterName')] }
+            $n = Get-DvDisplayPathTextValue (Get-DvProp $d 'adapterName')
+            if ($n -is [string]) { $have[$n] = 1 + $(if ($have.ContainsKey($n)) { $have[$n] } else { 0 }) }
         }
         foreach ($k in @($want.Keys) + @($have.Keys) | Select-Object -Unique) {
-            if ([int]$want[$k] -ne [int]$have[$k]) { $problems.Add("activeDisplays and adapters disagree about '$k': $([int]$want[$k]) adapter(s) with an active output, $([int]$have[$k]) display entr(ies)") }
+            $w = $(if ($want.ContainsKey($k)) { $want[$k] } else { 0 }); $h = $(if ($have.ContainsKey($k)) { $have[$k] } else { 0 })
+            if ($w -ne $h) { $problems.Add("activeDisplays and adapters disagree about '$k': $w adapter(s) with an active output, $h display entr(ies)") }
         }
     }
     $os = Get-DvProp $Block 'os'
@@ -6682,17 +6705,21 @@ try { Add-Type -AssemblyName System.Windows.Forms; `$probe.displayDevice = [stri
     # The embedded function is concatenated, never interpolated: its own `$` must reach the venue as written.
     # VENUE-LEG-DISPLAY-PATH-RECEIPT-1: the read-only display-path collector rides in the same job; a collector that throws still leaves a typed unknown, never a failed probe.
     # The JSON depth reaches probe > displayPath > adapters > entry > field > unknown (a shallower one would flatten the block to a string).
+    # r3 W1: every operand of the budget is a double and the result is FLOORED: an integer first operand picks the Int32 overload, which rounded 14.6 s left up to 15 s.
     $displayPathSource = Get-DvDisplayPathCollectorSource
     $body + "`r`n" + $sessionLockedSource + "`r`n" + '$probe.sessionLocked = Get-AttrCudaSessionLocked' + "`r`n" +
         $displayPathSource + "`r`n" +
-        '$probe.displayPath = $(try { Get-DvDisplayPath -BudgetSec ([int][math]::Max(0, [math]::Min(15, 105 - $dveJobSw.Elapsed.TotalSeconds))) } catch { [ordered]@{ state = ''unknown''; reason = ''collector-error'' } })' + "`r`n" +
+        '$probe.displayPath = $(try { Get-DvDisplayPath -BudgetSec ([int][math]::Floor([math]::Max(0.0, [math]::Min(15.0, 105.0 - $dveJobSw.Elapsed.TotalSeconds)))) } catch { [ordered]@{ state = ''unknown''; reason = ''collector-error'' } })' + "`r`n" +
         'Write-Output (''DVE_PROBE='' + ($probe | ConvertTo-Json -Compress -Depth 8))' + "`r`n"
 }
 
 function ConvertFrom-DvProbeStdout([string]$Stdout) {
+    # r3 (adversary r2 A4): the probe carries no time but displayPath's; where the host has -DateKind String (pwsh 7.5+) every string stays the text the venue sent, so a
+    # text leaf named like a time reaches the receipt unchanged. An older host still reads it as a [datetime], which the block validator accepts at a text leaf (route (b)).
+    $raw = (Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')
     foreach ($line in ($Stdout -split "`r?`n")) {
         if ($line.StartsWith('DVE_PROBE=')) {
-            try { return ($line.Substring('DVE_PROBE='.Length) | ConvertFrom-Json) } catch { return $null }
+            try { if ($raw) { return ($line.Substring('DVE_PROBE='.Length) | ConvertFrom-Json -DateKind String) } else { return ($line.Substring('DVE_PROBE='.Length) | ConvertFrom-Json) } } catch { return $null }
         }
     }
     $null

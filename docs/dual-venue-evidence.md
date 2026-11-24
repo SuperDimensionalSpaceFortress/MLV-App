@@ -680,10 +680,13 @@ the agent's deadline.
 **When it is sampled.** The block is a sample taken by the health probe, **before** the measurement job is submitted; the job then waits in the agent's queue and
 admission. It is not read again during the run, so it says what the venue drove at `collectedUtc`, not what it drove for every frame of the measurement. A display
 mode that changes between the sample and the run is not seen; compare `collectedUtc` with the leg's own start time before trusting it as the state of the run.
+The block says so itself: it carries `sampledBefore` = `"measurement-submit"` next to `collectedUtc`, and the validator requires that exact string, so the block
+describes the display path **at submit time**, never "during the run". A measurement-side sample is successor VENUE-LEG-DISPLAY-PATH-MEASUREMENT-SIDE-1.
 
 | Field | Meaning |
 |---|---|
 | `schema`, `collectedUtc` | `mlv-app/venue-display-path/v1`; when the probe read it (UTC text) |
+| `sampledBefore` | always `"measurement-submit"`: the sample was taken by the health probe before the measurement job was submitted |
 | `adapters` | every `Win32_VideoController`: `name`, `driverVersion`, `driverDate` (ISO 8601 UTC), `pnpDeviceId`, `hasActiveOutput` (true when the controller reports a refresh rate or a width) |
 | `activeDisplays` | one entry per adapter with an active output: `adapterName`, `refreshHz`, `horizontalResolution`, `verticalResolution` |
 | `os` | `build` and `ubr` (registry `CurrentBuild` / `UBR`), `lastBootUtc` (ISO 8601 UTC), `hotfixCount` (`Win32_QuickFixEngineering`) |
@@ -697,7 +700,11 @@ changes), `present` (a well-formed block, one whose every probe failed included:
 outcome). The block is written to no hashed artifact, so it is listed under `unbound` (`DISPLAY_PATH_UNBOUND`, and `venue.displayPath` in a sheet-pair record); the validator
 adds that entry only to a receipt whose core result already lists unbound claims (a PASS / FAIL path), so a NO_SIGNAL receipt carries the block without the entry. A venue
 that is not an object, a schema that is not the exact string, a time that is not a `...Z` UTC spelling, a typed unknown with any member besides `state` and `reason`, and an
-`activeDisplays` table that does not match the adapters' `hasActiveOutput` flags are all `malformed`.
+`activeDisplays` table that does not match the adapters' `hasActiveOutput` flags are all `malformed`; so is a block without the exact `sampledBefore`.
+A text leaf that looks like a time (a power plan, an adapter or a reason named `2026-11-24T00:00:00Z`) stays a text leaf: every receipt reader parses with
+`ConvertFrom-Json`, which hands such text back as a `[datetime]`, and the validator accepts that round-tripped value at a text leaf (and compares adapter names by
+it), so a reload never turns a NO_SIGNAL or valid block INVALID. The runner's own probe-line parse keeps the exact text where the host has `-DateKind String`
+(pwsh 7.5+). Moving every venue receipt reader to `-DateKind String` is successor VENUE-RECEIPT-READER-DATEKIND-STRING-1.
 Read a regression across two legs by comparing these blocks first: a different active adapter, refresh rate, boot time, UBR or power plan is a venue change, not a code one.
 
 ## How to read the evidence
