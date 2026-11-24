@@ -2355,6 +2355,18 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         self.assertEqual(got[0]["problems"], ["EXPORT_OUTPUT_MISMATCH: RENDER_VERIFIED is not in the rendered runner's form (BatchRunner.cpp:803): at field 6 it expects "
                                               "container_probe= and finds 'dimensions=1280x720'"], got[0])
 
+    def test_t2_r3_each_unicode_line_separator_in_a_batch_line_is_refused(self) -> None:
+        """EXPORT-RENDER-PIPE-TIMING-2 r3 (CI red on 61c6d229: the forbidden-character class carried U+2028 and U+2029 as literal characters, so the module was not
+        ASCII): U+2028, U+2029 and U+0085, each written here as an escape, inside a RENDER_VERIFIED line are refused as on 61c6d229 (the escape change must not weaken it)."""
+        chars = {"U+2028": " ", "U+2029": " ", "U+0085": "\u0085"}
+        v0 = self.t2_verified()
+        proc, got = evidence_cases([self.t2_case(self.t2_start(), [v0.replace(" probe_source=", f"{ch}probe_source=")], self.t2_done()) for ch in chars.values()])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for (name, _), g in zip(chars.items(), got):
+            with self.subTest(char=name):
+                self.assertEqual(g["outcome"], "INVALID", g)
+                self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and "RENDER_VERIFIED" in p for p in g["problems"]), g)
+
 
 EXPORT_STUB_GENERATOR = r"""
 param($SourceCommit,$BuildManifestSha256,$ClipId,$OutFile,$RepoRoot,$Venue,$Backend,$CpuQuiescenceThresholdPercent,$VenueTablePath,$PlaySeconds,$Format,$MaxFrames,$ReceiptPath,$DualIsoExpected,$ExpectReceiptSha256)
