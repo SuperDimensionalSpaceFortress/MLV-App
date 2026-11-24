@@ -6642,6 +6642,210 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
         self.assertTrue(target.is_dir())
         self.assert_unreadable_leg_refused(proc)
 
+    # ------------------------------------------------------------------------------------------------------------------------------------------
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 (sol r6 INV-3, the two siblings of #892): Invoke-VenueChain.ps1 planned a leg (the set planner, or its own -LegSpec read) and
+    # launched the leg child with no expected hash, and Invoke-VenueLeaseBatch.ps1 -LegSet bound its child to the bytes its budget read judged, not the ones the set planner
+    # judged. Bytes swapped after planning (an ordinary speed spec's path holding a committed visual twin's bytes) ran in the planned speed slot. Both now hand the leg the
+    # planner's sha256 (the batch refuses a mismatch before any claim), and the chain names the leg's refusal on its own typed line.
+    SWAP_LEGSET = "hfr-native-m16-1457"
+    SWAP_TARGET = "m16-1457-native-windowed-s1.json"         # plan entry 2 of the set: an ordinary speed leg
+    SWAP_SOURCE = "m16-1457-drift-t1-w10-visual-unpaced-fullscreen-s1.json"   # a committed visual twin
+
+    # Wait-VenueQuiet stand-in: QUIET at once. It runs before every leg, i.e. strictly AFTER the chain planned, so it is where the fixture changes the planned spec: once,
+    # on the first probe for DVT_SWAP_VENUE (any venue when unset): `copy` puts DVT_SWAP_FROM's bytes at DVT_SWAP_TO, `touch` moves only DVT_SWAP_TO's mtime.
+    CHAIN_FAKE_QUIET = r"""
+param([string]$Venue, [string]$WorkDir, [string]$GateLog, [double]$ThresholdPercent = 20, [int]$MaxWaitSec = 1800, [int]$RecheckSec = 90, [int]$MaxAdmissionWaitSec = 0)
+New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+if ($env:DVT_SWAP_TO -and -not (Test-Path -LiteralPath $env:DVT_SWAP_DONE) -and (-not $env:DVT_SWAP_VENUE -or $env:DVT_SWAP_VENUE -eq $Venue)) {
+    if ($env:DVT_SWAP_MODE -eq 'touch') { [IO.File]::SetLastWriteTimeUtc($env:DVT_SWAP_TO, [DateTime]::UtcNow.AddMinutes(7)) } else { [IO.File]::Copy($env:DVT_SWAP_FROM, $env:DVT_SWAP_TO, $true) }
+    Set-Content -LiteralPath $env:DVT_SWAP_DONE -Value $Venue
+}
+"QUIET mean=5.0% threshold=$ThresholdPercent% waitedSec=1"; exit 0
+"""
+
+    # Invoke-VenueLeg stand-in with the real leg's -ExpectSpecSha256 contract (Invoke-VenueLeg.ps1: the RAW bytes' sha256; on a mismatch the anchored STDOUT record
+    # `DVE_LEG_SPEC_REFUSED planned_sha256=<p> read_sha256=<r>`, then the DVE_LEG_SPEC_CHANGED throw, before anything is generated; pinned against the real leg's text below).
+    # Logs what it READ (the legId inside the bytes) and the hash it was handed; a leg that runs writes a receipt naming the legId it read.
+    CHAIN_FAKE_LEG = r"""
+param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '', [string]$ExpectSpecSha256 = '')
+$bytes = [IO.File]::ReadAllBytes($LegSpec)
+$readSpecSha = ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData($bytes)) -replace '-', '').ToLowerInvariant()
+$legId = [string](([Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json).legId)
+Add-Content -LiteralPath $env:DVT_LEG_LOG -Value ("LEG venue={0} leaf={1} read={2} expect={3} legId={4}" -f $Venue, (Split-Path -Leaf $LegSpec), $readSpecSha, $(if ($ExpectSpecSha256) { $ExpectSpecSha256 } else { 'none' }), $legId)
+if ($ExpectSpecSha256) {
+    if ($readSpecSha -cne $ExpectSpecSha256) { Write-Output "DVE_LEG_SPEC_REFUSED planned_sha256=$ExpectSpecSha256 read_sha256=$readSpecSha" }
+    if ($readSpecSha -cne $ExpectSpecSha256) { throw "DVE_LEG_SPEC_CHANGED the leg spec '$LegSpec' read as sha256 $readSpecSha, not $ExpectSpecSha256; nothing is generated or submitted" }
+}
+$rdir = Join-Path $env:DVT_LEG_ROOT ('receipts\' + $Venue); New-Item -ItemType Directory -Force -Path $rdir | Out-Null
+$rp = Join-Path $rdir ([guid]::NewGuid().ToString() + '.json')
+Set-Content -LiteralPath $rp -Value ('{"legId":"' + $legId + '","venue":{"role":"' + $(if ($Venue -eq 'ultra-magnus') { 'supplementary' } else { 'acceptance' }) + '"}}')
+'DVE_OUTCOME=PASS'
+"DVE_RECEIPT_PATH=$rp"
+exit 0
+"""
+
+    def chain_fixture(self, dv: Path, target: Path | None, source: Path | None, mode: str = "copy", venue: str = "") -> dict:
+        quiet = self.tmp / "chain-fake-quiet.ps1"
+        quiet.write_text(self.CHAIN_FAKE_QUIET, encoding="utf-8")
+        leg = self.tmp / "chain-fake-leg.ps1"
+        leg.write_text(self.CHAIN_FAKE_LEG, encoding="utf-8")
+        self.leg_log = self.tmp / "chain-leg.log"
+        env = {"DVT_LEG_LOG": str(self.leg_log), "DVT_LEG_ROOT": str(self.tmp / "chain-legs"), "DVT_SWAP_DONE": str(self.tmp / "swap.done")}
+        if target is not None:
+            env.update({"DVT_SWAP_TO": str(target), "DVT_SWAP_FROM": str(source or target), "DVT_SWAP_MODE": mode, "DVT_SWAP_VENUE": venue})
+        return {"quiet": quiet, "leg": leg, "env": env}
+
+    def run_fixture_chain(self, dv: Path, fx: dict, legs: list[str], *extra: str, sha: str | None = None) -> subprocess.CompletedProcess:
+        from datetime import datetime, timedelta, timezone
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=300)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.chain_run = self.tmp / "chain-run"
+        return run_pwsh(["-File", str(dv / "Invoke-VenueChain.ps1"), "-Venue", "bachelor", *legs, "-RunDir", str(self.chain_run), "-SourceCommit", sha or self.sha,
+                         "-BuildManifestSha256", self.build_sha, "-ClaimDir", str(self.tmp / "claims"), "-QuietScript", str(fx["quiet"]), "-LegScript", str(fx["leg"]),
+                         "-CooldownSec", "0", "-ClaimPollSec", "1", "-DeadlineUtc", deadline, *extra], env_extra=fx["env"], timeout=420)
+
+    def fixture_legs(self) -> list[dict]:
+        rows = []
+        for l in (self.leg_log.read_text(encoding="utf-8").splitlines() if self.leg_log.exists() else []):
+            rows.append(dict(kv.split("=", 1) for kv in l.split()[1:]))
+        return rows
+
+    def chain_set_run(self, mode: str | None):
+        """A -LegSet chain over hfr-native-m16-1457 (two ordinary speed legs) in a COPY of the runner tree. `mode`: None (nothing changes), 'copy' (plan entry 2's path gets
+        the committed visual twin's bytes after planning) or 'touch' (only its mtime moves). Returns (proc, target, planned sha256 of the target, twin's sha256)."""
+        dv = self.mutated_runner([])
+        target = dv / "legs" / self.SWAP_TARGET
+        source = dv / "legs" / self.SWAP_SOURCE
+        planned = hashlib.sha256(target.read_bytes()).hexdigest()
+        fx = self.chain_fixture(dv, None if mode is None else target, source, mode or "copy")
+        proc = self.run_fixture_chain(dv, fx, ["-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-NoSupplementary"])
+        if mode == "copy":
+            self.assertEqual(target.read_bytes(), source.read_bytes(), "the fixture really swapped the planned spec's bytes")
+        return proc, target, planned, hashlib.sha256(source.read_bytes()).hexdigest()
+
+    def test_planned_hash_bind_chain_a_legset_leg_whose_bytes_become_a_visual_twin_after_planning_is_refused(self) -> None:
+        proc, target, planned, twin = self.chain_set_run("copy")
+        legs = self.fixture_legs()
+        self.assertEqual(len(legs), 2, proc.stdout + proc.stderr)
+        swapped = next(l for l in legs if l["leaf"] == self.SWAP_TARGET)
+        self.assertEqual(swapped["expect"], planned, "the leg child must be handed the planner's sha256 (-ExpectSpecSha256)\n" + proc.stdout)
+        self.assertEqual(swapped["read"], twin)
+        receipts = [json.loads(p.read_text(encoding="utf-8")) for p in (self.tmp / "chain-legs").rglob("*.json")]
+        self.assertEqual([r["legId"] for r in receipts if "-visual-" in r["legId"]], [], "a visual twin ran in a speed slot")
+        self.assertEqual(len(receipts), 1, "the unchanged leg still ran")
+        result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
+        row = next(r for r in result["legs"] if r["spec"].endswith(self.SWAP_TARGET))
+        self.assertEqual((row["status"], row["outcome"], row.get("specRefusal")), ("LEG_FAILED", "INVALID", "DVE_CHAIN_SPEC_CHANGED"), row)
+        self.assertEqual(proc.returncode, 7, proc.stdout + proc.stderr)
+        typed = [l for l in proc.stdout.splitlines() if " DVE_CHAIN_SPEC_CHANGED " in l]
+        self.assertEqual(len(typed), 1, proc.stdout)
+        self.assertIn(f"planned_sha256={planned} read_sha256={twin}", typed[0])
+
+    def test_planned_hash_bind_chain_control_an_unchanged_legset_spec_still_runs(self) -> None:
+        proc, target, planned, twin = self.chain_set_run(None)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        legs = self.fixture_legs()
+        self.assertEqual(len(legs), 2)
+        self.assertTrue(all(l["expect"] == l["read"] for l in legs), legs)
+        self.assertFalse([l for l in proc.stdout.splitlines() if "DVE_CHAIN_SPEC_" in l], proc.stdout)
+
+    def test_planned_hash_bind_chain_control_an_mtime_only_change_still_runs(self) -> None:
+        proc, target, planned, twin = self.chain_set_run("touch")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue((self.tmp / "swap.done").exists(), "the fixture really moved the mtime after planning")
+        legs = self.fixture_legs()
+        self.assertEqual([l["read"] == l["expect"] for l in legs], [True, True], legs)
+        self.assertFalse([l for l in proc.stdout.splitlines() if "DVE_CHAIN_SPEC_" in l], proc.stdout)
+
+    def test_planned_hash_bind_chain_a_legspec_leg_is_bound_to_the_bytes_it_was_named_from(self) -> None:
+        """The chain's -LegSpec form reads each spec once to name the leg; the child is bound to THOSE bytes, so a swap after the read is refused, not run under the old name."""
+        dv = self.mutated_runner([])
+        target, source = dv / "legs" / self.SWAP_TARGET, dv / "legs" / self.SWAP_SOURCE
+        planned = hashlib.sha256(target.read_bytes()).hexdigest()
+        fx = self.chain_fixture(dv, target, source)
+        proc = self.run_fixture_chain(dv, fx, ["-LegSpec", str(target), "-Backend", "cuda", "-NoSupplementary"])
+        legs = self.fixture_legs()
+        self.assertEqual(len(legs), 1, proc.stdout + proc.stderr)
+        self.assertEqual(legs[0]["expect"], planned, "the -LegSpec leg's child must be handed the sha256 of the bytes it was planned from\n" + proc.stdout)
+        self.assertEqual(proc.returncode, 7, proc.stdout + proc.stderr)
+        self.assertTrue(any(" DVE_CHAIN_SPEC_CHANGED leg=01-m16-1457-native-windowed-s1-cuda " in l for l in proc.stdout.splitlines()), proc.stdout)
+
+    def test_planned_hash_bind_chain_a_supplementary_leg_is_bound_to_the_planned_bytes(self) -> None:
+        """The chain's ultra-magnus supplementary child re-read the leg spec after planning with no expected hash: the fixture swaps the bytes at the first ultra-magnus probe,
+        after the Bachelor leg ran on the planned bytes."""
+        dv = self.mutated_runner([])
+        spec = self.tmp / "supp-leg.json"
+        spec.write_text(json.dumps({"legId": "supp-leg", "backends": ["cpu"], "criteria": {"acceptance": {"cpu": []}, "supplementary": {"cpu": []}}}), encoding="utf-8")
+        twin = self.tmp / "supp-leg-visual-twin.json"
+        twin.write_text(json.dumps({"legId": "supp-leg-visual-twin", "backends": ["cpu"], "criteria": {"acceptance": {"cpu": []}, "supplementary": {"cpu": []}}}), encoding="utf-8")
+        planned = hashlib.sha256(spec.read_bytes()).hexdigest()
+        um_share = self.tmp / "um-share"
+        (um_share / "cache").mkdir(parents=True)
+        (um_share / "cache" / f"playback-attr-3-cuda-{self.sha[:12]}-build.json").write_text('{"fixture":"staged-on-ultra-magnus"}', encoding="utf-8")
+        fx = self.chain_fixture(dv, spec, twin, venue="ultra-magnus")
+        proc = self.run_fixture_chain(dv, fx, ["-LegSpec", str(spec), "-SupplementaryAgentShare", str(um_share)])
+        legs = self.fixture_legs()
+        supp = [l for l in legs if l["venue"] == "ultra-magnus"]
+        self.assertEqual(len(supp), 1, proc.stdout + proc.stderr)
+        self.assertEqual(supp[0]["expect"], planned, "the supplementary child must be handed the planner's sha256\n" + proc.stdout)
+        self.assertEqual([l["expect"] == l["read"] for l in legs if l["venue"] == "bachelor"], [True])
+        self.assertTrue(any(" DVE_CHAIN_SPEC_CHANGED " in l and "role=supplementary" in l for l in proc.stdout.splitlines()), proc.stdout)
+        receipts = [json.loads(p.read_text(encoding="utf-8")) for p in (self.tmp / "chain-legs").rglob("*.json")]
+        self.assertEqual([r["legId"] for r in receipts], ["supp-leg"], "the swapped bytes never ran on ultra-magnus")
+
+    def test_planned_hash_bind_the_fixture_leg_mirrors_the_real_legs_refusal_record(self) -> None:
+        """The stand-in's refusal is the real leg's: the same anchored stdout record and the same throw token, so the parents' classification is tested against the real text."""
+        leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn('Write-Output "DVE_LEG_SPEC_REFUSED planned_sha256=$ExpectSpecSha256 read_sha256=$readSpecSha"', leg)
+        self.assertIn("throw \"DVE_LEG_SPEC_CHANGED the leg spec '$LegSpec' read as sha256 $readSpecSha", leg)
+        self.assertIn('Write-Output "DVE_LEG_SPEC_UNREADABLE planned_sha256=$ExpectSpecSha256"', leg)
+        self.assertIn("[ValidatePattern('^[0-9a-f]{64}\\z')][string]$ExpectSpecSha256", leg, "the real leg takes the planned hash on every leg, not only a lease batch's")
+
+    # The lease batch, -LegSet: a COPY of the batch whose planner call is followed by the fixture's swap (the race the preflight must survive), and whose plan stage ends
+    # the run by printing the hash each leg child would be bound to (the leg's -ExpectSpecSha256: SpecBudgetSha256), so no claim, lease or venue is involved.
+    BATCH_PLAN_ANCHOR = '    $sp = try { Get-DvLegSetPlan -LegSetPath (Join-Path $here "legsets\\$LegSet.json") -Repeats $Repeats -Backend $(if ($Backend) { $Backend } else { \'\' }) } catch { Stop-Usage $_.Exception.Message }\n'
+    BATCH_SWAP = ("    if ($env:DVT_SWAP_TO) { if ($env:DVT_SWAP_MODE -eq 'touch') { [IO.File]::SetLastWriteTimeUtc($env:DVT_SWAP_TO, [DateTime]::UtcNow.AddMinutes(7)) } "
+                  "else { [IO.File]::Copy($env:DVT_SWAP_FROM, $env:DVT_SWAP_TO, $true) } }   # TEST FIXTURE: the bytes change after the planner read them\n")
+    BATCH_STOP_ANCHOR = "# r11 (sol r10 blocker 2): every generated output name is checked HERE"
+    BATCH_STOP = ("foreach ($pl in $plan) { \"DVT_PLANNED spec=$([IO.Path]::GetFileName([string]$pl.spec)) bound=$([string]$script:SpecBudgetSha256[[string]$pl.spec])\" }; exit 0   # TEST FIXTURE\n"
+                  + BATCH_STOP_ANCHOR)
+
+    def batch_set_run(self, mode: str | None):
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.BATCH_PLAN_ANCHOR, self.BATCH_PLAN_ANCHOR + self.BATCH_SWAP),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_STOP_ANCHOR, self.BATCH_STOP)])
+        target, source = dv / "legs" / self.SWAP_TARGET, dv / "legs" / self.SWAP_SOURCE
+        planned = hashlib.sha256(target.read_bytes()).hexdigest()
+        env = {} if mode is None else {"DVT_SWAP_TO": str(target), "DVT_SWAP_FROM": str(source), "DVT_SWAP_MODE": mode}
+        from datetime import datetime, timedelta, timezone
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fake = self.tmp / "batch-fake-script.ps1"
+        fake.write_text("exit 0\n", encoding="utf-8")
+        proc = run_pwsh(["-File", str(dv / "Invoke-VenueLeaseBatch.ps1"), "-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-RunDir", str(self.tmp / "batch-run"),
+                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake),
+                         "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline], env_extra=env, timeout=420)
+        if mode == "copy":
+            self.assertEqual(target.read_bytes(), source.read_bytes(), "the fixture really swapped the planned spec's bytes")
+        return proc, planned, hashlib.sha256(source.read_bytes()).hexdigest()
+
+    def test_planned_hash_bind_batch_a_legset_leg_whose_bytes_become_a_visual_twin_after_planning_is_refused_before_any_claim(self) -> None:
+        proc, planned, twin = self.batch_set_run("copy")
+        bound = [l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ") and self.SWAP_TARGET in l]
+        self.assertEqual(bound, [], "the leg would have been bound to the swapped bytes' hash (old: bound=<twin sha>)\n" + proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        refusal = [l for l in proc.stderr.splitlines() if l.startswith("BATCH_USAGE SPEC_CHANGED_AFTER_PREFLIGHT ")]
+        self.assertEqual(len(refusal), 1, proc.stderr)
+        self.assertIn(f"read as sha256 {twin} after the leg-set planner judged sha256 {planned} (planned_sha256={planned})", refusal[0])
+        self.assertFalse((self.tmp / "claims").exists() and any((self.tmp / "claims").iterdir()), "no claim is taken")
+
+    def test_planned_hash_bind_batch_control_an_unchanged_or_touched_legset_spec_still_plans_bound_to_the_planner(self) -> None:
+        for mode in (None, "touch"):
+            with self.subTest(mode=mode):
+                if mode == "touch":
+                    self.make_harness()   # a fresh tree: mutated_runner's copy is named by its mutations
+                proc, planned, twin = self.batch_set_run(mode)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                bound = [l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ") and self.SWAP_TARGET in l]
+                self.assertEqual(bound, [f"DVT_PLANNED spec={self.SWAP_TARGET} bound={planned}"], proc.stdout + proc.stderr)
+
 
 # ---------------------------------------------------------------------------------------------------
 # VENUE-QUIET-UNKNOWN-PROBE-FAILS-1: Wait-VenueQuiet.ps1 used to print `COOLDOWN_UNMET mean=UNKNOWN` and exit 0 when the venue probe was unavailable or failed, and
