@@ -11069,6 +11069,48 @@ class TreeBoundedRunTests(unittest.TestCase):
         self.addCleanup(drained.kill)
         self.assertEqual(scenario(drained, drained._proc), (("second",), 1), "DrainedPopen retried the child wait after the second interrupt")
 
+    def test_parity_a7_capture_output_is_read_once_as_subprocess_run_reads_it(self) -> None:
+        # adversary r1 A7 (introduced by this round's validation): run() evaluates `if capture_output:` once; the wrapper evaluated it twice, so an object true on its first test
+        # and false after it captured nothing on the delegated branch
+        class _FlipsAfterFirstTest:
+            def __init__(self) -> None:
+                self.tests = 0
+
+            def __bool__(self) -> bool:
+                self.tests += 1
+                return self.tests == 1
+
+        def bindings(call) -> dict:
+            seen: list = []
+
+            class _Fake:
+                def __init__(self, *args, **kwargs) -> None:
+                    seen.append({k: v for k, v in kwargs.items() if k in ("stdout", "stderr")})
+                    self.args, self.returncode, self.pid = args[0], 0, 0
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc) -> bool:
+                    return False
+
+                def communicate(self, input=None, timeout=None):   # noqa: A002
+                    return None, None
+
+                def poll(self) -> int:
+                    return 0
+
+            with mock.patch.object(subprocess, "Popen", _Fake):
+                call(_FlipsAfterFirstTest())
+            self.assertEqual(len(seen), 1)
+            return seen[0]
+
+        want = bindings(lambda flag: subprocess.run(["fixture"], capture_output=flag))
+        self.assertEqual(want, {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}, "the reference did not capture (the scenario is wrong)")
+        for timeout in (None, 5):
+            with self.subTest(timeout=timeout):
+                self.assertEqual(bindings(lambda flag: run_tree_bounded(["fixture"], capture_output=flag, timeout=timeout)), want)
+
 
 if __name__ == "__main__":
     unittest.main()

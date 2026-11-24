@@ -215,6 +215,7 @@ def run_tree_bounded(*popenargs, input: object = None, capture_output: bool = Fa
     # positional stdin / stdout / stderr is not): an explicit keyword stdin / stdout / stderr beside input / capture_output is a ValueError, and a positional one is a duplicate
     # value for Popen, a TypeError -- popen_arguments binds the same names Popen does, so it raises that TypeError here. Both come BEFORE any child starts. (r11 checked the BOUND
     # values, which made a positional None read as "not given" and the call launch.)
+    capture_output = bool(capture_output)   # adversary r1 A7: run() tests it once; an object that answers differently the second time must not drop the capture
     wanted = dict(kwargs)
     if input is not None:
         if wanted.get("stdin") is not None:
