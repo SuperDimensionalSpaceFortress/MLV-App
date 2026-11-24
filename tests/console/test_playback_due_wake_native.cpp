@@ -33,6 +33,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -3479,6 +3480,7 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     int notSent = 0;
     int notOneSpan = 0;                                               // r4 (sol r3 B1): the one-span row saw more than one span
     int strayNotSeparate = 0;                                         // r4 pass 7 A1: the stray row's stray ran in no dispatch after the held one
+    bool redDropped = false;                                          // r5 RED seam: at most one record dropped per row
     for( int attempt = 0; attempt < kAttempts && !landed; ++attempt )
     {
         wp.reset( new R17A1Windows );
@@ -3589,6 +3591,30 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         sentOk = sent.load();
         spans = wake.lastRunnerSleepDispatchSpansS();
         stamps = g_r17A1Stamps;
+        // r5 RED seam (sol r4 B1's literal rows, replayable on the exact head with no rebuild): MLV_R17A1_RED_DROP_RECORD=held drops
+        // the one-span row's span record on its first held one-span attempt (stamps [entry, begin, end, return], spans []), =stray
+        // drops the stray row's own stray span (all six stamps kept). It only ever REMOVES a record, so set it can only fail the
+        // row (R17A1_DISPATCH_RECORD_LOST below), never pass one; unset, nothing changes.
+        if( !redDropped )
+        {
+            const char *redDrop = std::getenv( "MLV_R17A1_RED_DROP_RECORD" );
+            const std::string redMode = redDrop ? redDrop : "";
+            if( redMode == "held" && oneSpanRow && handlerRan && pauseHeld && spans.size() == 1 && stamps.size() == 4 )
+            {
+                spans.clear();
+                redDropped = true;
+            }
+            if( redMode == "stray" && strayRow && strayRan && pauseHeld )
+            {
+                for( size_t k = 0; k < spans.size() && !redDropped; ++k )
+                    if( spans[k].first * 1000.0 > nullEnterMs && spans[k].first * 1000.0 <= strayRunMs + 0.00005 && strayRunMs <= spans[k].second * 1000.0 + 0.00005 )
+                    {
+                        spans.erase( spans.begin() + static_cast<std::ptrdiff_t>( k ) );
+                        redDropped = true;
+                    }
+            }
+            if( redDropped ) std::fprintf( stderr, "R17A1_RED_DROP_RECORD mode=%s attempt=%d stamps=%zu spans=%zu\n", redMode.c_str(), attempt, stamps.size(), spans.size() );
+        }
         // r5 (sol r4 B1): an attempt that PROVES a dispatch ran inside the sleep (a handler ran before the drain, or the caller
         // clock or the span record shows one) has its dispatch record accounted HERE, before any admission gate below may discard
         // it: the r4 one-span and separate-stray gates skipped a sample whose record had lost a span (stamps [0, 8.1, 59, 80] with
