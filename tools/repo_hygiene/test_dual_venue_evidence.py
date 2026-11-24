@@ -7471,6 +7471,94 @@ exit 0
         module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
         self.assertNotIn("DvLegSetFileKeyRead", module, "the module compiles no file-key reader of its own (r5: the caller's bounded read is the one judged read)")
 
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r1 (adversary pass 8 on 907406a4): H1 = A1 the relative wait was granted afresh after the parent reached it, H2 = A2 a wall-clock
+    # step between the OS start and exit read a timely child late, H3 = A3 the primary leg child was started by `& pwsh` with no start bound, H4 = A4 a late self-exit was
+    # reported as killed, V1 = A10 the planner's reader answer was coerced to a string. Each pause, clock step or answer is injected by a mutated copy (no host-speed reliance).
+    BP_STARTED_ANCHOR = "    $p = [Diagnostics.Process]::Start($psi)\n"
+    BP_WAIT_ANCHOR = "    $timedOut = $(if ($lateStart) { $true } else { -not $p.WaitForExit([int][Math]::Floor($waitMs)) })\n"
+
+    def test_planned_hash_bind_b2_r1_h1_the_relative_bound_counts_from_before_the_start_not_from_the_wait(self) -> None:
+        dv = self.mutated_runner([("VenueChain.psm1", self.BP_STARTED_ANCHOR, self.BP_STARTED_ANCHOR + "    Start-Sleep -Milliseconds 2500   # TEST FIXTURE: the parent is descheduled after the start\n")])
+        got = run_pwsh(["-Command", f"Import-Module '{dv / 'VenueChain.psm1'}' -Force -DisableNameChecking; $sw = [Diagnostics.Stopwatch]::StartNew(); "
+                        f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 10') -TimeoutSec 3 -CleanupWaitMs 1000; "
+                        "\"H1 $($r.timedOut) $([Math]::Round($sw.Elapsed.TotalSeconds, 2))\""], timeout=120)
+        line = [l for l in got.stdout.splitlines() if l.startswith("H1 ")]
+        self.assertEqual(len(line), 1, got.stdout + got.stderr)
+        self.assertEqual(line[0].split()[1], "True", line[0])
+        self.assertLess(float(line[0].split()[2]), 4.5, f"a 2.5 s pause after the start was granted a fresh 3 s wait (old: about 5.5 s of child runtime): {line[0]}")
+
+    def test_planned_hash_bind_b2_r1_h2_a_wall_clock_step_never_reads_a_timely_exit_as_late(self) -> None:
+        anchor = "$p.ExitTime.ToUniversalTime()"
+        dv = self.mutated_runner([("VenueChain.psm1", anchor, anchor + ".AddSeconds(120)")])   # the host clock stepped 120 s forward between the OS start and exit
+        got = run_pwsh(["-Command", f"Import-Module '{dv / 'VenueChain.psm1'}' -Force -DisableNameChecking; "
+                        f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep -Milliseconds 1000; exit 0') -TimeoutSec 60 -CleanupWaitMs 2000; "
+                        "\"H2 $($r.timedOut) [$($r.exit)] $($r.lateExit)\""], timeout=120)
+        line = [l for l in got.stdout.splitlines() if l.startswith("H2 ")]
+        self.assertEqual(line, ["H2 False [0] False"], "a child that exited 0 in about 1 s under a 60 s bound was read late by a wall-clock step (old: timedOut True)\n" + got.stdout + got.stderr)
+
+    def test_planned_hash_bind_b2_r1_h3_a_start_not_after_bound_refuses_a_late_start_and_never_bounds_the_wait(self) -> None:
+        pause = "    if ($env:DVT_PRESTART_PAUSE_MS) { Start-Sleep -Milliseconds ([int]$env:DVT_PRESTART_PAUSE_MS) }   # TEST FIXTURE: a pause before the start\n"
+        dv = self.mutated_runner([("VenueChain.psm1", self.BP_STARTED_ANCHOR, pause + self.BP_STARTED_ANCHOR)])
+        probe = (f"Import-Module '{dv / 'VenueChain.psm1'}' -Force -DisableNameChecking; "
+                 "try { $env:DVT_PRESTART_PAUSE_MS = '3000'; "
+                 f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep -Milliseconds 1500; Write-Output ran') -TimeoutSec 60 -CleanupWaitMs 2000 -StartNotAfterUtc ([DateTime]::UtcNow.AddSeconds(1)); "
+                 "\"H3H $($r.notStarted) $($r.lateStart) $($r.timedOut) $($r.killAttempted) [$($r.stdout.Trim())]\"; $env:DVT_PRESTART_PAUSE_MS = ''; "
+                 "$n = Invoke-VenueBoundedProcess -FilePath 'C:\\no-such-dir\\never-started.exe' -ArgumentList @('x') -TimeoutSec 60 -StartNotAfterUtc ([DateTime]::UtcNow.AddSeconds(-1)); "
+                 "\"H3N $($n.notStarted) $($n.timedOut)\"; "
+                 f"$w = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep -Milliseconds 4000; exit 0') -TimeoutSec 60 -CleanupWaitMs 2000 -StartNotAfterUtc ([DateTime]::UtcNow.AddSeconds(2)); "
+                 "\"H3W $($w.timedOut) [$($w.exit)]\" } catch { 'H3H error ' + ($_.Exception.Message -replace '\\s+', ' ') }")
+        got = run_pwsh(["-Command", probe], timeout=180)
+        lines = [l for l in got.stdout.splitlines() if l.startswith("H3")]
+        self.assertEqual(lines, ["H3H False True True True []", "H3N True True", "H3W False [0]"],
+                         "a child the OS started past -StartNotAfterUtc ran, or the start bound cut a child that started in time (old: no -StartNotAfterUtc)\n" + got.stdout + got.stderr)
+
+    CHAIN_LAUNCH_CHECK = ("            if ([DateTime]::UtcNow -ge $deadline) { $stopReason = 'DEADLINE'; $exitCode = 3; Add-Result $leg 'NOT_RUN' @{ verdict = 'DEADLINE'; reason = 'deadline-at-leg-launch' }; "
+                          "try { L \"LEG $($leg.name) NOT_RUN DEADLINE reason=deadline-at-leg-launch (-DeadlineUtc passed before the child started)\" } catch { [Console]::Error.WriteLine(\"LEG $($leg.name) NOT_RUN DEADLINE reason=deadline-at-leg-launch\") }; break }\n")
+
+    def test_planned_hash_bind_b2_r1_h3_a_pause_after_the_last_launch_check_never_starts_the_primary_leg_past_the_deadline(self) -> None:
+        dv = self.mutated_runner([("Invoke-VenueChain.ps1", self.CHAIN_LAUNCH_CHECK,
+                                   self.CHAIN_LAUNCH_CHECK + "            $deadline = [DateTime]::UtcNow.AddMilliseconds(300); Start-Sleep -Milliseconds 1000   # TEST FIXTURE: the deadline passes after the check\n")])
+        fx = self.chain_fixture(dv, None, None)
+        proc = self.run_fixture_chain(dv, fx, ["-LegSpec", str(dv / "legs" / self.SWAP_FIRST), "-Backend", "cuda", "-NoSupplementary"])
+        results = [l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")]
+        self.assertEqual(len(results), 1, proc.stdout + proc.stderr)
+        result = json.loads(results[-1][len("CHAIN_RESULT="):])
+        self.assertEqual([(r["status"], r["verdict"]) for r in result["legs"]], [("NOT_RUN", "DEADLINE")], "the primary leg started past -DeadlineUtc and was accepted (old: RAN)\n" + proc.stdout)
+        self.assertEqual(self.fixture_legs(), [], "no leg child ran")
+        self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+        self.assertTrue(any("NOT_RUN DEADLINE reason=deadline-at-leg-launch" in l for l in proc.stdout.splitlines()), proc.stdout)
+
+    def test_planned_hash_bind_b2_r1_h4_a_late_self_exit_is_reported_as_late_not_as_killed(self) -> None:
+        pause = "    if ($env:DVT_PREWAIT_PAUSE_MS) { Start-Sleep -Milliseconds ([int]$env:DVT_PREWAIT_PAUSE_MS) }   # TEST FIXTURE: the parent reaches the wait late\n"
+        dv = self.mutated_runner([("VenueChain.psm1", self.BP_WAIT_ANCHOR, pause + self.BP_WAIT_ANCHOR)])
+        got = run_pwsh(["-Command", f"Import-Module '{dv / 'VenueChain.psm1'}' -Force -DisableNameChecking; "
+                        f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep -Milliseconds 2000; exit 0') -TimeoutSec 1 -CleanupWaitMs 2000; "
+                        "\"H4 $($r.timedOut) $($r.lateExit) [$($r.killAttempted)] [$($r.killErrored)] $($r.killConfirmed)\""], env_extra={"DVT_PREWAIT_PAUSE_MS": "6000"}, timeout=120)
+        line = [l for l in got.stdout.splitlines() if l.startswith("H4 ")]
+        self.assertEqual(line, ["H4 True True [False] [False] True"], "a child that exited on its own after its bound was not told apart from a killed one (old: no killAttempted)\n" + got.stdout + got.stderr)
+        body = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
+        fn = body[body.index("function Get-ExportBudgetRefusal("):body.index("function Get-ScalarLegShapeRefusal(")]
+        self.assertEqual(fn.count("(late; no kill was needed)"), 2, "both export children say a late self-exit was late, not killed")
+        self.assertEqual(fn.count("the kill failed (not confirmed)"), 2, "both export children say a failed kill failed")
+        self.assertIn("(late; no kill was needed)", body[body.index("$b.endReason = 'LEASE_EXPIRED'"):], "the LEASE_EXPIRED detail tells a late self-exit from a kill")
+
+    def test_planned_hash_bind_b2_r1_v1_the_planner_refuses_a_reader_answer_that_is_not_a_string_ok_and_a_file_key(self) -> None:
+        legset = DV / "legsets" / f"{self.SWAP_LEGSET}.json"
+        cases = {"array-state": "state = @('OK'); bytes = [IO.File]::ReadAllBytes($p); key = ''", "whitespace-key": "state = 'OK'; bytes = [IO.File]::ReadAllBytes($p); key = ' '",
+                 "array-key": "state = 'OK'; bytes = [IO.File]::ReadAllBytes($p); key = @('0000abcd:0000000000000001')"}
+        for name, fields in cases.items():
+            with self.subTest(answer=name):
+                got = run_pwsh(["-Command", f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force; "
+                                f"try {{ $null = Get-DvLegSetPlan -LegSetPath '{legset}' -WithFileKey -FileKeyReader {{ param($p) [pscustomobject]@{{ {fields}; error = $null }} }}; 'V1 admitted' }} "
+                                "catch { 'V1 refused ' + ($_.Exception.Message -replace '\\s+', ' ') }"], timeout=120)
+                line = [l for l in got.stdout.splitlines() if l.startswith("V1 ")]
+                self.assertEqual(len(line), 1, got.stdout + got.stderr)
+                self.assertTrue(line[0].startswith("V1 refused DVE_LEGSET_INVALID "), f"a {name} answer was coerced and admitted (old): {line[0]}")
+        got = run_pwsh(["-Command", f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force; "
+                        f"try {{ $null = Get-DvLegSetPlan -LegSetPath '{legset}' -WithFileKey -FileKeyReader {{ param($p) [pscustomobject]@{{ state = 'OK'; bytes = [IO.File]::ReadAllBytes($p); key = ''; error = $null }} }}; 'V1N admitted' }} "
+                        "catch { 'V1N refused ' + ($_.Exception.Message -replace '\\s+', ' ') }"], timeout=120)
+        self.assertIn("V1N admitted", got.stdout, "an empty key (off Windows) still reaches the caller's own refusal\n" + got.stdout + got.stderr)
+
 
 # ---------------------------------------------------------------------------------------------------
 # VENUE-QUIET-UNKNOWN-PROBE-FAILS-1: Wait-VenueQuiet.ps1 used to print `COOLDOWN_UNMET mean=UNKNOWN` and exit 0 when the venue probe was unavailable or failed, and

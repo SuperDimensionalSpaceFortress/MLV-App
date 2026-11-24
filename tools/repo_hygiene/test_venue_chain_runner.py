@@ -356,6 +356,34 @@ class VenueChainRunnerTests(unittest.TestCase):
         self.assertIn("LANES blocking=1", out_b)
         self.assertNotIn("LEG_RAN", out_a + out_b)
 
+    def test_planned_hash_bind_b2_r1_t1_a_failed_or_empty_scan_never_reads_as_no_other_chain(self) -> None:
+        # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r1 T1 (shard run 45402473576 class): pid=18100 in the red was the fixture's OWN waiter B (the scan keeps only command lines
+        # holding this test's temp $Root). Waiter A read the process table with -ErrorAction SilentlyContinue, so one failed or empty scan under load read as "no other chain" and
+        # A printed LEG_RAN while B still ran. The scan is replaced here by a stub (no live process but the fixture's own two is read): a failed scan (a non-terminating error,
+        # the shape -ErrorAction SilentlyContinue swallowed) and an empty one. Neither may run the leg while B's .started marker stands and its .ended marker is absent.
+        anchor = "param([string]$Root, [string]$Self, [int]$MaxSec = 10)\n"
+        self.assertEqual(OLD_WAITER_A.count(anchor), 1, "T1 anchor moved")
+        stubs = {"failed": ("function Get-CimInstance { [CmdletBinding()] param([Parameter(Position = 0)]$ClassName, $Filter) Write-Error 'injected scan failure' }   # TEST FIXTURE\n", "SCAN_FAILED "),
+                 "empty": ("function Get-CimInstance { [CmdletBinding()] param([Parameter(Position = 0)]$ClassName, $Filter) }   # TEST FIXTURE: a scan that answers nothing\n", "SCAN_INCOMPLETE ")}
+        base = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File"]
+        for kind, (stub, marker) in stubs.items():
+            with self.subTest(scan=kind):
+                root = self.case / f"t1-{kind}"
+                for lane in ("lane-A", "lane-B"):
+                    (root / "fleet-runs" / lane / "tools").mkdir(parents=True)
+                    (root / "fleet-runs" / lane / "prompt.md").write_text("run the legs on Bachelor", encoding="utf-8")
+                a = root / "fleet-runs" / "lane-A" / "tools" / "venue-wait-then-chain.ps1"
+                a.write_text(OLD_WAITER_A.replace(anchor, anchor + stub), encoding="utf-8")
+                b = root / "fleet-runs" / "lane-B" / "tools" / "chain-b.ps1"
+                b.write_text(OLD_WAITER_B, encoding="utf-8")
+                pa = subprocess.Popen([*base, str(a), "-Root", str(root), "-Self", "lane-A", "-MaxSec", "4"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                pb = subprocess.Popen([*base, str(b), "-Root", str(root), "-Self", "lane-B", "-MaxSec", "4"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                out_a, _ = pa.communicate(timeout=120)
+                out_b, _ = pb.communicate(timeout=120)
+                self.assertNotIn("LEG_RAN", out_a, f"waiter A read a {kind} scan as 'no other chain' and ran its leg while B still ran (old)\n" + out_a + "\n----\n" + out_b)
+                self.assertIn(marker, out_a, out_a)
+                self.assertEqual(pa.returncode, 9, out_a)
+
     def test_two_concurrent_chains_never_deadlock_and_the_second_runs_after_the_first_releases(self) -> None:
         rd_a, rd_b = self.case / "lane-A", self.case / "lane-B"
         env = self.env(FAKE_QUIET_SLEEP_PRE="1", FAKE_LEG_SLEEP="5")

@@ -9316,6 +9316,29 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertIn("LEG_OUT_WRITE_FAILED leg=01-fx-a-cpu-A", r.stderr)
         self.assertIn("evidence only: the leg is classified from its own captured output", r.stderr)
         self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+        # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r1 T3 (sol r5 hardening 1, opus key3 H4): the persisted per-batch receipt is checked on its own, so a right BATCH_RESULT
+        # with the completed leg rows missing from batch-01.json fails here
+        per = json.loads((self.run_dir / "batch-01.json").read_text(encoding="utf-8"))
+        self.assertEqual([(l["name"], l["status"]) for l in per["legs"]], [("01-fx-a-cpu-A", "RAN"), ("02-fx-b-cpu-A", "RAN")], per["legs"])
+
+    def test_planned_hash_bind_b2_r1_t3_a_throw_after_a_completed_child_is_recorded_leg_failed_batch_error(self) -> None:
+        # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r1 T3: the r5 A1 record path, injected directly now that the .out.txt write no longer throws: a mutated copy of the runner throws
+        # right after the first leg's child returned. That leg is LEG_FAILED / BATCH_ERROR (its result is unknown), the leg never started is NOT_RUN, and batch-01.json says so.
+        anchor = "                $legReturnTs = [Diagnostics.Stopwatch]::GetTimestamp()"
+        self.assertEqual(RUNNER.read_text(encoding="utf-8").count(anchor), 1, "T3 anchor moved")
+        self._mirror_with_bad_sidecar(runner_patches=((anchor, anchor + "; if ($env:DVT_THROW_AFTER_CHILD) { throw 'injected throw after a completed child' }   # TEST FIXTURE"),))
+        self.plan_runner = self.runner
+        a = self.commit_a
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", a), self.item(self.specs[1], "A", a)]), DVT_THROW_AFTER_CHILD="1")
+        self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+        self.assertEqual(len(self.leg_calls()), 1, "the first leg's child ran, the second never started")
+        res = batch_result(r.stdout)
+        self.assertEqual([(l["name"], l["status"]) for l in res["legs"]], [("01-fx-a-cpu-A", "LEG_FAILED"), ("02-fx-b-cpu-A", "NOT_RUN")], res["legs"])
+        self.assertEqual((res["ran"], res["failed"], res["notRun"], res["stopReason"]), (0, 1, 1, "BATCH_ERROR"))
+        self.assertEqual(res["legs"][0]["reason"], "BATCH_ERROR")
+        per = json.loads((self.run_dir / "batch-01.json").read_text(encoding="utf-8"))
+        self.assertEqual([(l["name"], l["status"]) for l in per["legs"]], [("01-fx-a-cpu-A", "LEG_FAILED")], per["legs"])
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind")
 
     def test_r5_adv_a2_a_staged_build_the_leg_job_would_reject_is_refused_before_the_claim_and_the_lease(self) -> None:
         # adversary r5 A2: preflight read the staged manifest's sha256 only. The leg job's validator (Assert-AttrCudaBuildManifest) also needs the manifest to declare
