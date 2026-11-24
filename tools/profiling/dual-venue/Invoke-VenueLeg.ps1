@@ -695,6 +695,9 @@ try {
     $receipt.venue.gpuNames = @($probe.gpuNames)
     $receipt.venue.driverVersion = $probe.driverVersion
     $receipt.venue.displayDevice = $probe.displayDevice
+    # VENUE-LEG-DISPLAY-PATH-RECEIPT-1: the display path the venue drove (adapters, active displays, OS build / boot, power plan), read-only. A block that is missing or malformed
+    # becomes a typed unknown (ConvertTo-DvDisplayPath never throws); nothing here reads it into the health verdict, so it can never change what the leg says.
+    $receipt.venue.displayPath = ConvertTo-DvDisplayPath -Probe $probe
     $receipt.venue.instrumentDigests.presentmon = $probe.presentmonSha256
 
     # P6: one source of truth for which venue a host is.

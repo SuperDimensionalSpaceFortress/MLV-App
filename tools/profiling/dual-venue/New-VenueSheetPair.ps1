@@ -119,7 +119,7 @@ $record = [ordered]@{
     advisory = $true
     evidenceStatus = 'ADVISORY'
     advisoryNote = 'both receipts re-derive from committed consent and hashed run evidence, but no venue-held anchor exists (VENUE_ANCHOR_ABSENT): a diagnostic sheet, never a PASS'
-    unbound = @('subject.clipContentSha256', 'venue.hostName', 'venue.gpuNames')
+    unbound = @('subject.clipContentSha256', 'venue.hostName', 'venue.gpuNames', 'venue.displayPath')
     localOnly = 'never committed, attached to a PR, published to the bus or as an artifact'
     cudaReceiptId = $cuda.receiptId; cpuReceiptId = $cpu.receiptId
     # The scale each side asked for and rendered at (re-derived by the validator above): a pair whose sides rendered at different scales shows a SCALE difference

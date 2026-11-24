@@ -5625,10 +5625,11 @@ function Test-DvExportReceiptValid {
     [pscustomobject]@{ valid = ($status -in @('VERIFIED', 'VERIFIED_OFFLINE_TEST')); status = $status; reasons = $reasons; unbound = $Unbound; evidenceDir = $dir; legType = 'export' }
 }
 
-function Test-DvReceiptValid {
+function Test-DvReceiptValidCore {
     <#
     .SYNOPSIS
-    Is this receipt valid EVIDENCE? In PRODUCTION never: the best it can be is ADVISORY (see below). Every claim a PASS/FAIL receipt makes is RE-DERIVED from a committed blob or a hashed artifact; no
+    (VENUE-LEG-DISPLAY-PATH-RECEIPT-1: this is the validator every caller reaches through Test-DvReceiptValid, defined right after this function, which adds the
+    venue.displayPath report and nothing else.) Is this receipt valid EVIDENCE? In PRODUCTION never: the best it can be is ADVISORY (see below). Every claim a PASS/FAIL receipt makes is RE-DERIVED from a committed blob or a hashed artifact; no
     field the receipt asserts about itself is an input. Returns [pscustomobject]@{ valid; status; reasons; unbound } where status is
     ADVISORY (a PRODUCTION receipt whose every claim re-derives: valid=false, reason VENUE_ANCHOR_ABSENT -- no venue-held anchor exists, so a
     production receipt is never VERIFIED and is never a usable PASS), VERIFIED_OFFLINE_TEST (offline harness only), NO_SIGNAL (any other
@@ -6114,6 +6115,29 @@ function Test-DvReceiptValid {
     [pscustomobject]@{ valid = ($status -in @('VERIFIED', 'VERIFIED_OFFLINE_TEST')); status = $status; reasons = $reasons; unbound = $unbound; evidenceDir = $ev.dir; legType = $(if ($null -ne $spec) { [string](Get-DvProp $spec 'legType') } else { $null }) }
 }
 
+function Test-DvReceiptValid {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-DISPLAY-PATH-RECEIPT-1: the receipt validator. Test-DvReceiptValidCore (above; its help is the contract) plus ONE report on venue.displayPath, the display path
+    the venue drove at leg time, as the result's `displayPath`: 'absent' (an older receipt: still valid, nothing changes), 'present' (a well-formed block, a block whose every
+    probe failed included) or 'malformed' (INVALID, reason DISPLAY_PATH_MALFORMED, on every outcome: a bad block is a bad record whether or not the leg carried a signal).
+    The block is collected by the venue probe and written to no hashed artifact, so a present block on a receipt that lists `unbound` claims is listed there too.
+    #>
+    param([Parameter(Mandatory)]$Receipt, [string]$RepoRoot = '', [string]$EvidenceDir = '', [switch]$AllowOfflineTestMode, [byte[]]$OfflineLegSpecBytes = $null)
+    $result = Test-DvReceiptValidCore @PSBoundParameters
+    $display = Test-DvDisplayPathBlock -Block (Get-DvProp (Get-DvProp $Receipt 'venue') 'displayPath')
+    if ($display.state -ceq 'malformed') {
+        $result.reasons = @('DISPLAY_PATH_MALFORMED: venue.displayPath: ' + ($display.problems -join '; ')) + @($result.reasons)
+        $result.status = 'INVALID'
+        $result.valid = $false
+    }
+    elseif ($display.state -ceq 'present' -and @($result.unbound).Count -gt 0) {
+        $result.unbound = @($result.unbound) + 'DISPLAY_PATH_UNBOUND: venue.displayPath is collected by the venue probe and written to no hashed artifact; it is recorded, never trusted'
+    }
+    Add-Member -InputObject $result -NotePropertyName displayPath -NotePropertyValue $display.state -Force
+    $result
+}
+
 # --- the job's notAfterUtc (LEASE-NOT-AFTER-SINGLE-LEG-SUBMITTERS-1) --------------------------------
 # um-run.ps1's own -MaxAdmissionWaitSec default. A submitter that does not choose one passes this by name, so the wait it bounds is the wait um-run uses
 # (test_venue_not_after.py reads the default out of um-run.ps1's param block and pins the two equal).
@@ -6364,6 +6388,209 @@ function Get-DvHealthVerdict {
     [pscustomobject]@{ healthy = ($reasons.Count -eq 0); reasons = @($reasons); detail = $detail }
 }
 
+# --- venue.displayPath (VENUE-LEG-DISPLAY-PATH-RECEIPT-1) -------------------------------------------------------------------------
+# The m16-1457-native-fullscreen-s1 CUDA control on Bachelor went from 59.56 fps (display p50 16.67 ms) to 38.78 fps (33.22 ms) with a byte-identical exe, clip,
+# spec, launch and environment (BACHELOR-1457-NATIVE-GUI-LATE-ENV-DIFF-1 r1): Bachelor drives its only display through the Intel Iris Xe (3840x2400 at 59 Hz) with
+# the NVIDIA GPU headless, and Windows Update rebooted it. No receipt recorded any of that. Every leg receipt now carries `venue.displayPath`, collected READ-ONLY
+# on the venue at leg time by the health probe (CIM reads and one registry read; nothing is set, started or written). A probe that fails, times out or is denied
+# is a typed `{state:'unknown'; reason}` for that field and never fails or delays the leg: the whole block has a 15 s budget and every CIM call carries what is left.
+# A receipt without the block stays valid (older receipts exist) and the validator says `displayPath=absent`; a present but malformed block is INVALID.
+$script:DisplayPathSchema = 'mlv-app/venue-display-path/v1'
+
+function Get-DvDisplayPathCollectorSource {
+    <#
+    .SYNOPSIS
+    The text of Get-DvDisplayPath, the venue-side collector, embedded verbatim in the health probe job (New-DvHealthProbeJobText) and dot-sourced by the tests.
+    READ-ONLY: Get-CimInstance (each call bounded by -OperationTimeoutSec from what is left of the 15 s budget) and one Get-ItemProperty on the CurrentVersion key.
+    The slowest query (Win32_QuickFixEngineering) runs last, so a stall in it costs nothing else. No power-plan write verb, no process, no file.
+    #>
+    @'
+function Get-DvDisplayPath {
+    param([int]$BudgetSec = 15)
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $unknown = {
+        param($why)
+        $r = ([string]$why -replace '\s+', ' ').Trim()
+        if ($r.Length -gt 120) { $r = $r.Substring(0, 120) }
+        if ($r.Length -eq 0) { $r = 'error' }
+        [ordered]@{ state = 'unknown'; reason = $r }
+    }
+    $text = { param($v) if ($null -eq $v -or ([string]$v).Trim().Length -eq 0) { & $unknown 'not-reported' } else { [string]$v } }
+    $int = { param($v) if ($null -eq $v) { & $unknown 'not-reported' } else { try { [int]$v } catch { & $unknown 'not-an-integer' } } }
+    $utc = { param($d) if ($d -is [datetime]) { $d.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { & $unknown 'not-reported' } }
+    $cim = {
+        param([string]$Class, [string]$Namespace = '', [string]$Filter = '')
+        $left = [int][math]::Floor($BudgetSec - $sw.Elapsed.TotalSeconds)
+        if ($left -lt 1) { throw 'budget-exhausted' }
+        $a = @{ ClassName = $Class; OperationTimeoutSec = $left; ErrorAction = 'Stop' }
+        if ($Namespace) { $a['Namespace'] = $Namespace }
+        if ($Filter) { $a['Filter'] = $Filter }
+        , @(Get-CimInstance @a)
+    }
+    try {
+        $block = [ordered]@{ schema = 'mlv-app/venue-display-path/v1'; collectedUtc = [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'); adapters = $null; activeDisplays = $null; os = $null; powerPlan = $null }
+
+        # video adapters, and which of them has an active output (a refresh rate or a width the controller reports)
+        $rows = $null; $rowsWhy = ''
+        try { $rows = & $cim 'Win32_VideoController' } catch { $rowsWhy = [string]$_.Exception.Message }
+        if ($null -eq $rows) {
+            $block.adapters = & $unknown $rowsWhy
+            $block.activeDisplays = & $unknown ('adapters-unreadable: ' + $rowsWhy)
+        } else {
+            $adapters = [System.Collections.Generic.List[object]]::new()
+            $displays = [System.Collections.Generic.List[object]]::new()
+            foreach ($v in @($rows)) {
+                $active = ($null -ne $v.CurrentRefreshRate) -or ($null -ne $v.CurrentHorizontalResolution)
+                $adapters.Add([ordered]@{ name = (& $text $v.Name); driverVersion = (& $text $v.DriverVersion); driverDate = (& $utc $v.DriverDate); pnpDeviceId = (& $text $v.PNPDeviceID); hasActiveOutput = [bool]$active })
+                if ($active) {
+                    $displays.Add([ordered]@{ adapterName = (& $text $v.Name); refreshHz = (& $int $v.CurrentRefreshRate); horizontalResolution = (& $int $v.CurrentHorizontalResolution); verticalResolution = (& $int $v.CurrentVerticalResolution) })
+                }
+            }
+            $block.adapters = @($adapters)
+            $block.activeDisplays = @($displays)
+        }
+
+        # Windows build + UBR (registry, local and instant), last boot (CIM), installed hotfix count (CIM, slowest: last)
+        $reg = $null; $regWhy = 'registry-unreadable'
+        try { $reg = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop } catch { $regWhy = 'registry-unreadable: ' + $_.Exception.Message }
+        $regField = {
+            param($name, $asInt)
+            if ($null -eq $reg) { return (& $unknown $regWhy) }
+            $p = $reg.PSObject.Properties[$name]
+            if ($null -eq $p) { return (& $unknown 'not-reported') }
+            if ($asInt) { & $int $p.Value } else { & $text $p.Value }
+        }
+        $bootAt = $null
+        try {
+            $osRows = & $cim 'Win32_OperatingSystem'
+            if (@($osRows).Count -eq 0) { throw 'no-rows' }
+            $bootAt = & $utc (@($osRows)[0].LastBootUpTime)
+        } catch { $bootAt = & $unknown $_.Exception.Message }
+        $block.os = [ordered]@{ build = (& $regField 'CurrentBuild' $false); ubr = (& $regField 'UBR' $true); lastBootUtc = $bootAt; hotfixCount = $null }
+
+        # the active power plan, by CIM (never powercfg, never a setting)
+        try {
+            $plans = & $cim 'Win32_PowerPlan' 'root\cimv2\power' 'IsActive = True'
+            if (@($plans).Count -eq 0) { throw 'no-active-plan' }
+            $block.powerPlan = & $text (@($plans)[0].ElementName)
+        } catch { $block.powerPlan = & $unknown $_.Exception.Message }
+
+        try {
+            $fixes = & $cim 'Win32_QuickFixEngineering'
+            $block.os.hotfixCount = @($fixes).Count
+        } catch { $block.os.hotfixCount = & $unknown $_.Exception.Message }
+        $block
+    } catch {
+        & $unknown ('collector-error: ' + $_.Exception.Message)
+    }
+}
+'@
+}
+
+function Test-DvDisplayPathIsObject {
+    param($Value)
+    ($Value -is [System.Collections.IDictionary]) -or ($Value -is [System.Management.Automation.PSCustomObject])
+}
+
+function Test-DvDisplayPathUnknown {
+    # A well-formed typed unknown: exactly `{state:'unknown'; reason:<1..200 chars>}`.
+    param($Value)
+    if (-not (Test-DvDisplayPathIsObject $Value)) { return $false }
+    $state = Get-DvProp $Value 'state'
+    $reason = Get-DvProp $Value 'reason'
+    ($state -is [string]) -and ($state -ceq 'unknown') -and ($reason -is [string]) -and ($reason.Trim().Length -gt 0) -and ($reason.Length -le 200)
+}
+
+function Test-DvDisplayPathLeaf {
+    # One field: a value of its Kind (string | int | utc | bool) or, except for bool, a typed unknown.
+    param($Value, [string]$Kind)
+    if ($Kind -cne 'bool' -and (Test-DvDisplayPathUnknown $Value)) { return $true }
+    switch ($Kind) {
+        'string' { return (($Value -is [string]) -and ($Value.Trim().Length -gt 0) -and ($Value.Length -le 500)) }
+        'int' { return ((($Value -is [int]) -or ($Value -is [long])) -and ($Value -ge 0)) }
+        'bool' { return ($Value -is [bool]) }
+        'utc' {
+            if ($Value -is [datetime]) { return $true }   # ConvertFrom-Json reads an ISO date as a DateTime
+            if ($Value -isnot [string] -or $Value -cnotmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,7})?Z$') { return $false }
+            $parsed = [datetime]::MinValue
+            return [datetime]::TryParse($Value, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)
+        }
+    }
+    $false
+}
+
+function Test-DvDisplayPathBlock {
+    <#
+    .SYNOPSIS
+    The state of a receipt's venue.displayPath: absent (null / not there: an older receipt, valid), present (a well-formed block, or a typed unknown for the whole
+    block) or malformed (problems say where). Every field is its value or a typed unknown, so a block whose every probe failed is present.
+    #>
+    param($Block)
+    $result = { param($state, $problems) [pscustomobject]@{ state = $state; problems = @($problems) } }
+    if ($null -eq $Block) { return (& $result 'absent' @()) }
+    if (Test-DvDisplayPathUnknown $Block) { return (& $result 'present' @()) }
+    $problems = [System.Collections.Generic.List[string]]::new()
+    if (-not (Test-DvDisplayPathIsObject $Block)) { return (& $result 'malformed' @('the block is neither an object nor a typed unknown')) }
+    if ((Get-DvProp $Block 'schema') -cne $script:DisplayPathSchema) { $problems.Add("schema is not $script:DisplayPathSchema") }
+    if (-not (Test-DvDisplayPathLeaf (Get-DvProp $Block 'collectedUtc') 'utc')) { $problems.Add('collectedUtc is not a UTC time') }
+    $tables = @(
+        @{ name = 'adapters'; fields = @(@('name', 'string'), @('driverVersion', 'string'), @('driverDate', 'utc'), @('pnpDeviceId', 'string'), @('hasActiveOutput', 'bool')) },
+        @{ name = 'activeDisplays'; fields = @(@('adapterName', 'string'), @('refreshHz', 'int'), @('horizontalResolution', 'int'), @('verticalResolution', 'int')) })
+    foreach ($t in $tables) {
+        $list = Get-DvProp $Block $t.name
+        if (Test-DvDisplayPathUnknown $list) { continue }
+        if ($list -isnot [System.Array]) { $problems.Add("$($t.name) is neither a list nor a typed unknown"); continue }
+        for ($i = 0; $i -lt $list.Count; $i++) {
+            if (-not (Test-DvDisplayPathIsObject $list[$i])) { $problems.Add("$($t.name)[$i] is not an object"); continue }
+            foreach ($f in $t.fields) {
+                if (-not (Test-DvDisplayPathLeaf (Get-DvProp $list[$i] $f[0]) $f[1])) { $problems.Add("$($t.name)[$i].$($f[0]) is not a $($f[1]) or a typed unknown") }
+            }
+        }
+    }
+    $os = Get-DvProp $Block 'os'
+    if (-not (Test-DvDisplayPathUnknown $os)) {
+        if (-not (Test-DvDisplayPathIsObject $os)) { $problems.Add('os is neither an object nor a typed unknown') }
+        else {
+            foreach ($f in @(@('build', 'string'), @('ubr', 'int'), @('lastBootUtc', 'utc'), @('hotfixCount', 'int'))) {
+                if (-not (Test-DvDisplayPathLeaf (Get-DvProp $os $f[0]) $f[1])) { $problems.Add("os.$($f[0]) is not a $($f[1]) or a typed unknown") }
+            }
+        }
+    }
+    if (-not (Test-DvDisplayPathLeaf (Get-DvProp $Block 'powerPlan') 'string')) { $problems.Add('powerPlan is not a plan name or a typed unknown') }
+    (& $result $(if ($problems.Count -gt 0) { 'malformed' } else { 'present' }) $problems.ToArray())
+}
+
+function ConvertTo-DvDisplayPathUtcText {
+    # ConvertFrom-Json reads every ISO date it sees as a [datetime]; the receipt keeps UTC text. In place, depth-first.
+    param($Node)
+    if ($Node -is [datetime]) { return $Node.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
+    if ($Node -is [System.Management.Automation.PSCustomObject]) {
+        foreach ($p in @($Node.PSObject.Properties)) { $p.Value = ConvertTo-DvDisplayPathUtcText $p.Value }
+        return $Node
+    }
+    if ($Node -is [System.Array]) {
+        for ($i = 0; $i -lt $Node.Count; $i++) { $Node[$i] = ConvertTo-DvDisplayPathUtcText $Node[$i] }
+        return , $Node
+    }
+    $Node
+}
+
+function ConvertTo-DvDisplayPath {
+    <#
+    .SYNOPSIS
+    The receipt's venue.displayPath from the health probe's reply. Never throws and never changes a leg's verdict: a probe that did not report a block is
+    `{state:'unknown'; reason:'probe-did-not-report'}`, one that reported a malformed block is `{... 'probe-block-malformed'}`.
+    #>
+    param($Probe)
+    try {
+        $raw = Get-DvProp $Probe 'displayPath'
+        if ($null -eq $raw) { return [ordered]@{ state = 'unknown'; reason = 'probe-did-not-report' } }
+        $raw = ConvertTo-DvDisplayPathUtcText $raw
+        if ((Test-DvDisplayPathBlock -Block $raw).state -ceq 'present') { return $raw }
+    } catch { }
+    [ordered]@{ state = 'unknown'; reason = 'probe-block-malformed' }
+}
+
 function New-DvHealthProbeJobText {
     <#
     .SYNOPSIS
@@ -6408,8 +6635,13 @@ try { Add-Type -AssemblyName System.Windows.Forms; `$probe.displayDevice = [stri
 `$probe.presentmonSha256 = `$(if (Test-Path -LiteralPath `$pm -PathType Leaf) { (Get-FileHash -LiteralPath `$pm -Algorithm SHA256).Hash.ToLowerInvariant() } else { `$null })
 "@
     # The embedded function is concatenated, never interpolated: its own `$` must reach the venue as written.
+    # VENUE-LEG-DISPLAY-PATH-RECEIPT-1: the read-only display-path collector rides in the same job; a collector that throws still leaves a typed unknown, never a failed probe.
+    # The JSON depth reaches probe > displayPath > adapters > entry > field > unknown (a shallower one would flatten the block to a string).
+    $displayPathSource = Get-DvDisplayPathCollectorSource
     $body + "`r`n" + $sessionLockedSource + "`r`n" + '$probe.sessionLocked = Get-AttrCudaSessionLocked' + "`r`n" +
-        'Write-Output (''DVE_PROBE='' + ($probe | ConvertTo-Json -Compress -Depth 4))' + "`r`n"
+        $displayPathSource + "`r`n" +
+        '$probe.displayPath = $(try { Get-DvDisplayPath } catch { [ordered]@{ state = ''unknown''; reason = ''collector-error'' } })' + "`r`n" +
+        'Write-Output (''DVE_PROBE='' + ($probe | ConvertTo-Json -Compress -Depth 8))' + "`r`n"
 }
 
 function ConvertFrom-DvProbeStdout([string]$Stdout) {
@@ -6774,6 +7006,8 @@ function New-DvReceipt {
         venue = [ordered]@{
             name = $DeclaredVenue; role = $Role; declared = $DeclaredVenue; detected = $null; hostName = $null
             gpuNames = @(); driverVersion = $null; displayDevice = $null
+            # VENUE-LEG-DISPLAY-PATH-RECEIPT-1: the display path the venue drove at leg time (adapters, active displays, OS build / boot, power plan); null on a receipt written before the probe answered
+            displayPath = $null
             instrumentDigests = [ordered]@{ presentmon = $null; scorer = $null }
         }
         actor = $Actor
@@ -6872,5 +7106,5 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Test-DvMatrixRowMeasured, Get-DvMatrixMeasuredCount, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
-    New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
+    New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout, Get-DvDisplayPathCollectorSource, Test-DvDisplayPathBlock, ConvertTo-DvDisplayPath,
     Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt

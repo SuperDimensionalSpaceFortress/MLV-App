@@ -663,6 +663,34 @@ pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueStageNightly.ps1 [-
   (`.claude-state\hub-autopilot\disk-floor.ps1`, `host-commit-gate.ps1`): exit 3 with the gate's own text, and a missing gate is
   `GATE_UNAVAILABLE`. It bounds every child by `-MaxTotalSec`. The typed exit table is in the script header.
 
+## The display path the venue drove (`venue.displayPath`, VENUE-LEG-DISPLAY-PATH-RECEIPT-1)
+
+Why it exists: the `m16-1457-native-fullscreen-s1` CUDA control on Bachelor went from 59.56 fps (PresentMon display p50 16.67 ms) to 38.78 fps (p50
+33.22 ms) with a byte-identical exe, clip, spec, launch arguments and environment (BACHELOR-1457-NATIVE-GUI-LATE-ENV-DIFF-1 r1). The difference was venue
+state: Bachelor drives its only display through the Intel Iris Xe (3840x2400 at 59 Hz) with the NVIDIA GPU headless, and Windows Update rebooted it on
+2026-11-21. No receipt recorded any of that (`venue.driverVersion` is the first video controller's driver only).
+
+Every leg receipt now carries `venue.displayPath`, collected by the **health probe** on the venue at leg time. The collection is **read-only** (CIM reads and one
+registry read; it sets, starts and writes nothing, and uses no `powercfg`) and bounded: the whole block has a **15 s** budget and every CIM call carries what is
+left of it, so the slowest query (the hotfix count) runs last. Any probe that fails, times out or is denied is a typed `{"state":"unknown","reason":"<short>"}` for
+that field. It never fails the leg, never delays it past the bound and never changes its verdict.
+
+| Field | Meaning |
+|---|---|
+| `schema`, `collectedUtc` | `mlv-app/venue-display-path/v1`; when the probe read it (UTC text) |
+| `adapters` | every `Win32_VideoController`: `name`, `driverVersion`, `driverDate` (ISO 8601 UTC), `pnpDeviceId`, `hasActiveOutput` (true when the controller reports a refresh rate or a width) |
+| `activeDisplays` | one entry per adapter with an active output: `adapterName`, `refreshHz`, `horizontalResolution`, `verticalResolution` |
+| `os` | `build` and `ubr` (registry `CurrentBuild` / `UBR`), `lastBootUtc` (ISO 8601 UTC), `hotfixCount` (`Win32_QuickFixEngineering`) |
+| `powerPlan` | the active power plan's name (`root\cimv2\power` `Win32_PowerPlan`, `IsActive`) |
+
+Every leaf is its value or a typed unknown; `adapters`, `activeDisplays` and `os` may be a typed unknown whole, and so may the block (the runner writes
+`probe-did-not-report` when the probe sent none, `probe-block-malformed` when it sent a malformed one). `hasActiveOutput` is always a boolean.
+
+Validator (`Test-DvReceiptValid`): the result's `displayPath` is `absent` (no block: an older receipt, still **valid**, and `displayPath=absent` is all that
+changes), `present` (a well-formed block, one whose every probe failed included: **valid**) or `malformed` (**`INVALID`**, reason `DISPLAY_PATH_MALFORMED`, on every
+outcome). The block is written to no hashed artifact, so it is listed under `unbound` (`DISPLAY_PATH_UNBOUND`, and `venue.displayPath` in a sheet-pair record).
+Read a regression across two legs by comparing these blocks first: a different active adapter, refresh rate, boot time, UBR or power plan is a venue change, not a code one.
+
 ## How to read the evidence
 
 * **Acceptance** reads only receipts whose `venue.role` is `acceptance` for the card, and only `PASS`/`FAIL`.
