@@ -194,7 +194,9 @@ function Add-ChainLogLine([string]$Line) {
         $rc = try { [VenueChainEvidenceWriteB2]::AppendWithin($ChainLog, $Line + [Environment]::NewLine, $script:ChainLogAppendDelayMs, $script:EvidenceWriteBoundMs, [ref]$we) } catch { $we = $_.Exception.Message; 1 }
         return @('OK', "FAILED $($we -replace '\s+', ' ')", 'TIMEOUT')[$rc]
     }
-    $ar = try { Invoke-VenueBoundedRead -ScriptText 'param($a) if ($a.d -gt 0) { [Threading.Thread]::Sleep($a.d) }; try { [IO.File]::AppendAllText($a.p, $a.t, [Text.UTF8Encoding]::new($false)); "OK" } catch { "FAILED " + $_.Exception.Message }' -Argument @{ p = $ChainLog; t = $Line + [Environment]::NewLine; d = $script:ChainLogAppendDelayMs } -TimeoutSec 2 } catch { [pscustomobject]@{ answered = $true; value = @("FAILED $($_.Exception.Message)"); error = $null } }
+    # b2 r3 (adversary pass 4 A1 sibling on 8b4b6d8c): Invoke-VenueBoundedRead is VenueChain's own (not exported), so it is called in the module's scope, as the batch does;
+    # called by name from here it never resolved, so every L threw and the unguarded CHAIN_START ended the chain before CHAIN_RESULT
+    $ar = try { & (Get-Module VenueChain) { param($t, $a, $s) Invoke-VenueBoundedRead -ScriptText $t -Argument $a -TimeoutSec $s } 'param($a) if ($a.d -gt 0) { [Threading.Thread]::Sleep($a.d) }; try { [IO.File]::AppendAllText($a.p, $a.t, [Text.UTF8Encoding]::new($false)); "OK" } catch { "FAILED " + $_.Exception.Message }' @{ p = $ChainLog; t = $Line + [Environment]::NewLine; d = $script:ChainLogAppendDelayMs } 2 } catch { [pscustomobject]@{ answered = $true; value = @("FAILED $($_.Exception.Message)"); error = $null } }
     if (-not $ar.answered) { return 'TIMEOUT' }
     $av = @($ar.value | ForEach-Object { [string]$_ })
     if ($av -ccontains 'OK') { return 'OK' }

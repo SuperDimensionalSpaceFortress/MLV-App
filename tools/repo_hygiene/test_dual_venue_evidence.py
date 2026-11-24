@@ -7774,7 +7774,8 @@ exit 0
         body = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
         at = body.index("[IO.File]::WriteAllText($out, $text, [Text.UTF8Encoding]::new($false))")
         line = body[body.rindex("\n", 0, at) + 1:body.index("\n", at)]
-        m = re.search(r"-ScriptText '((?:[^']|'')*)'", line)
+        # b2 r3 (forced companion of the A1 fix): the worker text is now the first single-quoted argument of the module-scope call, not a -ScriptText literal
+        m = re.search(r"'(param\(\$a\) \$final(?:[^']|'')*)'", line)
         self.assertIsNotNone(m, line)
         accepted = self.tmp / "a6-fx-b.json"
         accepted.write_text('{"legId": "fx-b"}', encoding="utf-8")
