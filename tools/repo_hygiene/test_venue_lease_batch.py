@@ -10851,6 +10851,128 @@ class TreeBoundedRunTests(unittest.TestCase):
         out, err = p.communicate(timeout=60)
         self.assertEqual((len(out.splitlines()), err.strip()), (1024, "done"))
 
+    # VENUE-FIFO-ADVERSARY-TAIL-1 r11 (sol r10 B1 + B2 on ee1cc010, both in r10's own repair of venue_fixture_modules.py): the held-Popen DrainedPopen and the creationflags
+    # wrappers must behave as subprocess.Popen / subprocess.run do. The child is a plain `py -3 -c` sleeper: no pwsh, no venue, no MLVApp.
+    _R11_SLEEPER = [sys.executable, "-c", "import time; time.sleep(8)"]
+    # Popen's documented positional order up to creationflags (the 14th): args, bufsize, executable, stdin, stdout, stderr, preexec_fn, close_fds, shell, cwd, env,
+    # universal_newlines, startupinfo, creationflags (sol's literal tuple, with the caller's flag value at the end)
+    _R11_CREATIONFLAGS_POSITION = 13
+
+    def _r11_positional(self, flags: int) -> tuple:
+        return ([sys.executable, "-c", "pass"], -1, None, None, None, None, None, True, False, None, None, None, None, flags)
+
+    def _r11_recorded_spawns(self) -> tuple:
+        real = subprocess.Popen
+        calls: list = []
+
+        def recorder(*args, **kwargs):
+            calls.append((args, kwargs))
+            return real(*args, **kwargs)
+
+        return calls, recorder
+
+    def _r11_flags_that_reached_popen(self, call: tuple) -> int:
+        args, kwargs = call
+        in_position = len(args) > self._R11_CREATIONFLAGS_POSITION
+        self.assertFalse(in_position and "creationflags" in kwargs, "creationflags reached Popen twice (positional and keyword)")
+        return args[self._R11_CREATIONFLAGS_POSITION] if in_position else kwargs.get("creationflags", 0)
+
+    def test_r11_b1_a_keyboard_interrupt_in_a_drained_popen_with_block_is_a_brief_wait_not_the_childs_whole_run(self) -> None:
+        # sol r10 B1: Popen.__exit__ waits only _sigint_wait_secs (0.25 s) on a KeyboardInterrupt and lets it propagate; the held-Popen wrapper waited for the child to END
+        p = DrainedPopen(self._R11_SLEEPER, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(p.wait)
+        self.addCleanup(p.kill)
+        t0 = time.monotonic()
+        with self.assertRaises(KeyboardInterrupt):
+            with p:
+                raise KeyboardInterrupt
+        took = time.monotonic() - t0
+        self.assertLess(took, 1.0, f"the interrupt took {took:.2f} s to propagate: __exit__ waited for the child to end")
+        self.assertIsNone(p.poll(), "the child was expected to still be running (a brief wait, never a kill): the scenario is wrong")
+        p.kill()
+        p.wait(timeout=60)
+        self.assertIsNotNone(p.returncode, "the child was not reaped")
+
+    def test_r11_b1_a_stdin_that_cannot_flush_raises_out_of_the_with_block_after_the_child_is_reaped(self) -> None:
+        # sol r10 B1: Popen.__exit__ closes stdin inside try/finally, waits, and lets the close error propagate; the wrapper swallowed it
+        p = DrainedPopen([sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(p.wait)
+        self.addCleanup(p.kill)
+        real_stdin = p.stdin
+
+        class _Unflushable:
+            def close(self) -> None:
+                real_stdin.close()   # the child's EOF: it ends, as a child whose stdin cannot flush still does once the pipe is gone
+                raise BrokenPipeError("flush failed")
+
+        with self.assertRaises(BrokenPipeError):
+            with p:
+                p._proc.stdin = _Unflushable()
+        self.assertIsNotNone(p.returncode, "the child was not reaped before the close error propagated")
+
+    def test_r11_b2_a_positional_creationflags_launches_with_the_hidden_flag_composed_into_it(self) -> None:
+        # sol r10 B2: the wrappers added their own creationflags= keyword, so a caller's 14th positional argument raised "multiple values for creationflags"
+        from tools.repo_hygiene.hidden_spawn import no_window_flags
+        flag_values = [0] + ([subprocess.CREATE_NEW_PROCESS_GROUP] if os.name == "nt" else [])
+        for flags in flag_values:
+            for label in ("DrainedPopen", "run_tree_bounded", "run_tree_bounded timeout=5"):
+                with self.subTest(flags=flags, wrapper=label):
+                    calls, recorder = self._r11_recorded_spawns()
+                    with mock.patch.object(subprocess, "Popen", recorder):
+                        if label == "DrainedPopen":
+                            p = DrainedPopen(*self._r11_positional(flags))
+                            self.assertEqual(p.wait(timeout=60), 0)
+                        else:
+                            kwargs = {"timeout": 5} if label.endswith("timeout=5") else {}
+                            self.assertEqual(run_tree_bounded(*self._r11_positional(flags), **kwargs).returncode, 0)
+                    self.assertEqual(len(calls), 1, f"{label} started {len(calls)} processes")
+                    reached = self._r11_flags_that_reached_popen(calls[0])
+                    self.assertEqual(reached, no_window_flags(flags), f"{label}: flags {flags:#x} reached Popen as {reached:#x}")
+                    self.assertEqual(reached & flags, flags, f"{label}: the caller's bits {flags:#x} were lost ({reached:#x})")
+
+    @unittest.skipUnless(os.name == "nt", "creationflags is a Windows argument")
+    def test_r11_b2_a_keyword_creationflags_keeps_the_callers_bit_and_gains_the_hidden_one(self) -> None:
+        from tools.repo_hygiene.hidden_spawn import no_window_flags
+        group = subprocess.CREATE_NEW_PROCESS_GROUP
+        argv = [sys.executable, "-c", "pass"]
+        for label in ("DrainedPopen", "run_tree_bounded", "run_tree_bounded timeout=5"):
+            with self.subTest(wrapper=label):
+                calls, recorder = self._r11_recorded_spawns()
+                with mock.patch.object(subprocess, "Popen", recorder):
+                    if label == "DrainedPopen":
+                        self.assertEqual(DrainedPopen(argv, creationflags=group).wait(timeout=60), 0)
+                    else:
+                        kwargs = {"timeout": 5} if label.endswith("timeout=5") else {}
+                        self.assertEqual(run_tree_bounded(argv, creationflags=group, **kwargs).returncode, 0)
+                self.assertEqual(len(calls), 1)
+                reached = self._r11_flags_that_reached_popen(calls[0])
+                self.assertEqual(reached, no_window_flags(group))
+                self.assertTrue(reached & group and reached & subprocess.CREATE_NO_WINDOW, f"{label}: {reached:#x}")
+
+    def test_r11_b2_popen_arguments_follows_the_installed_popens_positional_order_and_keywords(self) -> None:
+        import inspect
+        from tools.repo_hygiene.venue_fixture_modules import popen_arguments
+        real = inspect.signature(subprocess.Popen).parameters
+        mine = inspect.signature(popen_arguments).parameters
+        positional = [n for n, p in real.items() if p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD]
+        self.assertEqual([n for n, p in mine.items() if p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD], positional,
+                         "popen_arguments no longer lists subprocess.Popen's positional parameters in its order: a positional creationflags would bind to the wrong name")
+        self.assertEqual(positional.index("creationflags"), self._R11_CREATIONFLAGS_POSITION)
+        keyword_only = {n for n, p in real.items() if p.kind is inspect.Parameter.KEYWORD_ONLY}
+        _, _, rest = popen_arguments(["x"], **{n: None for n in keyword_only})
+        self.assertEqual(set(rest), keyword_only, "a keyword-only Popen argument was dropped or renamed")
+
+    def test_r11_b2_the_wrappers_still_refuse_what_popen_refuses(self) -> None:
+        # the same call shapes Popen raises TypeError for stay a TypeError (a second value for creationflags, one argument too many, an unknown keyword)
+        argv = [sys.executable, "-c", "pass"]
+        for label, call in (("duplicate creationflags", lambda w: w(*self._r11_positional(0), creationflags=0)),
+                            ("too many positionals", lambda w: w(*self._r11_positional(0), True, False, (), 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)),
+                            ("unknown keyword", lambda w: w(argv, no_such_popen_argument=1))):
+            for wrapper in (DrainedPopen, run_tree_bounded, lambda *a, **k: run_tree_bounded(*a, timeout=5, **k)):
+                with self.subTest(case=label, wrapper=getattr(wrapper, "__name__", "timed")):
+                    with self.assertRaises(TypeError):
+                        call(wrapper)
+
 
 if __name__ == "__main__":
     unittest.main()

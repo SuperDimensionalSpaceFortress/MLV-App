@@ -89,6 +89,25 @@ def communicate_tree_bounded(proc: subprocess.Popen, timeout: float, input: obje
         raise expired from None
 
 
+_UNSET = object()
+SIGINT_WAIT_SEC = 0.25   # subprocess.Popen._sigint_wait_secs: how long a `with` block interrupted by Ctrl+C waits for the child before it lets the interrupt go
+
+
+def popen_arguments(args, bufsize=_UNSET, executable=_UNSET, stdin=_UNSET, stdout=_UNSET, stderr=_UNSET, preexec_fn=_UNSET, close_fds=_UNSET, shell=_UNSET, cwd=_UNSET,
+                    env=_UNSET, universal_newlines=_UNSET, startupinfo=_UNSET, creationflags=0, restore_signals=_UNSET, start_new_session=_UNSET, pass_fds=_UNSET,
+                    **keyword_only) -> tuple:
+    """Bind a caller's Popen arguments the way subprocess.Popen binds them (its documented positional order, creationflags the 14th), so the hidden-window flag is composed into
+    the caller's own creationflags wherever the caller put it, positional or keyword, and is passed once (r11, sol r10 B2: a wrapper that added its own `creationflags=` keyword
+    made a caller's positional one a "multiple values" TypeError). Returns (args, creationflags, every other argument the caller gave, by keyword). The same TypeErrors as Popen's
+    for a duplicate value, an unknown keyword or too many positionals; a test pins this order against the installed subprocess.Popen."""
+    given = (("bufsize", bufsize), ("executable", executable), ("stdin", stdin), ("stdout", stdout), ("stderr", stderr), ("preexec_fn", preexec_fn), ("close_fds", close_fds),
+             ("shell", shell), ("cwd", cwd), ("env", env), ("universal_newlines", universal_newlines), ("startupinfo", startupinfo), ("restore_signals", restore_signals),
+             ("start_new_session", start_new_session), ("pass_fds", pass_fds))
+    rest = {name: value for name, value in given if value is not _UNSET}
+    rest.update(keyword_only)
+    return args, creationflags, rest
+
+
 class DrainedPopen:
     """A subprocess.Popen (held, not subclassed: test_hidden_spawn_flags REPORTS a spawn API as a base class, where its calls cannot be followed; every attribute not defined
     here is the held Popen's, so pid, args, stdin, stdout, returncode, poll, wait, kill, send_signal and the `with` form read as they do on a Popen) whose PIPE streams are read
@@ -101,7 +120,8 @@ class DrainedPopen:
     grandchild that still holds a pipe is not waited for), and returns what was read; a second call after a timeout returns the rest."""
 
     def __init__(self, *args, **kwargs) -> None:
-        self._proc = subprocess.Popen(*args, creationflags=no_window_flags(kwargs.pop("creationflags", 0)), **kwargs)
+        argv, flags, rest = popen_arguments(*args, **kwargs)
+        self._proc = subprocess.Popen(argv, creationflags=no_window_flags(flags), **rest)
         self._drain_bufs: dict[str, list] = {}
         self._drain_threads: list = []
         for name in ("stdout", "stderr"):
@@ -122,14 +142,26 @@ class DrainedPopen:
     def __enter__(self) -> "DrainedPopen":
         return self
 
-    def __exit__(self, *exc_info) -> None:
-        # Popen.__exit__ minus the pipe closes the drain threads own: close stdin, wait for the child
-        if self._proc.stdin is not None:
-            try:
+    def __exit__(self, exc_type, value, traceback) -> None:
+        # subprocess.Popen.__exit__ (CPython Lib/subprocess.py), minus the closes of stdout and stderr: the drain threads own those, and a close from here blocks on the
+        # reader's buffer lock while a thread sits in readline() on a live child (so delegating to the held Popen's __exit__ would hang exactly the interrupted case below).
+        # r11 (sol r10 B1): (1) stdin is closed inside try/finally, so the wait always happens and a flush failure (BrokenPipeError) propagates after it; (2) on a
+        # KeyboardInterrupt the wait is the brief _sigint_wait_secs one, never the child's whole run, and the interrupt goes on.
+        try:
+            if self._proc.stdin:
                 self._proc.stdin.close()
-            except OSError:
-                pass
-        self._proc.wait()
+        finally:
+            if exc_type == KeyboardInterrupt:
+                # https://bugs.python.org/issue25942: the SIGINT also reached the child; do not block on it (Popen.wait / communicate zero the allowance once they used it)
+                wait_secs = getattr(self._proc, "_sigint_wait_secs", SIGINT_WAIT_SEC)
+                if wait_secs > 0:
+                    try:
+                        self._proc.wait(timeout=wait_secs)
+                    except subprocess.TimeoutExpired:
+                        pass
+                self._proc._sigint_wait_secs = 0   # type: ignore[attr-defined]  # noted as done, as Popen.__exit__ notes it
+            else:
+                self._proc.wait()
 
     def __repr__(self) -> str:
         return f"DrainedPopen({self._proc!r})"
@@ -177,19 +209,19 @@ def run_tree_bounded(*popenargs, input: object = None, capture_output: bool = Fa
     """subprocess.run with the same arguments and result, whose `timeout` IS a bound on Windows (see the module doc): on expiry the whole tree is killed and
     subprocess.TimeoutExpired is raised within about timeout + 2 x TREE_KILL_BOUND_SEC + TREE_COLLECT_BOUND_SEC. With no timeout, or off Windows (POSIX run() reads
     the pipes itself and only waits for the killed root), it IS subprocess.run."""
+    argv, flags, rest = popen_arguments(*popenargs, **kwargs)   # r11 (sol r10 B2): the caller's creationflags, positional or keyword, composed once
     if timeout is None or os.name != "nt":
-        return subprocess.run(*popenargs, input=input, capture_output=capture_output, timeout=timeout, check=check,
-                              creationflags=no_window_flags(kwargs.pop("creationflags", 0)), **kwargs)
+        return subprocess.run(argv, input=input, capture_output=capture_output, timeout=timeout, check=check, creationflags=no_window_flags(flags), **rest)
     if input is not None:
-        if kwargs.get("stdin") is not None:
+        if rest.get("stdin") is not None:
             raise ValueError("stdin and input arguments may not both be used.")
-        kwargs["stdin"] = subprocess.PIPE
+        rest["stdin"] = subprocess.PIPE
     if capture_output:
-        if kwargs.get("stdout") is not None or kwargs.get("stderr") is not None:
+        if rest.get("stdout") is not None or rest.get("stderr") is not None:
             raise ValueError("stdout and stderr arguments may not be used with capture_output.")
-        kwargs["stdout"] = subprocess.PIPE
-        kwargs["stderr"] = subprocess.PIPE
-    proc = subprocess.Popen(*popenargs, creationflags=no_window_flags(kwargs.pop("creationflags", 0)), **kwargs)
+        rest["stdout"] = subprocess.PIPE
+        rest["stderr"] = subprocess.PIPE
+    proc = subprocess.Popen(argv, creationflags=no_window_flags(flags), **rest)
     try:
         out, err = communicate_tree_bounded(proc, timeout, input)
     except subprocess.TimeoutExpired:
