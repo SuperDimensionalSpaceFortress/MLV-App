@@ -285,6 +285,16 @@ inline bool rateWithdrawalRepaintsNow( bool playing, bool labelStallEntered )
     return !playing || labelStallEntered;
 }
 
+/*! \brief INFO-2 r7 (adversary pass 10 A3 on 71d28ec9): the expected period a stored label's paint debt waits for: the larger of
+ *  the period read now and the floor its store recorded. The fps meter's reset stores the withdrawn text AFTER it zeroed the EMA,
+ *  so the period read at settle time fell from the measured one (a 24 fps target playing at 2.2 fps: 450 ms, deadline 675 ms) to
+ *  the target's 42 ms (deadline 63 ms), and the debt painted at draw age 576 ms, before the deadline that reset had declined. The
+ *  reset records the period it read before the zeroing as the debt's floor; every other store records 0 (no floor). */
+inline qint64 labelPaintOwedExpectedMs( qint64 floorMs, qint64 currentMs )
+{
+    return floorMs > currentMs ? floorMs : currentMs;
+}
+
 /*! \brief INFO-2 r4 (adversary r3 A3): the frame period a playing label's paint debt waits for: the larger of the target period
  *  ceil(1000 / playbackFps) and the measured fps meter EMA frame time, so a 24 fps target that plays at 10 fps waits for its
  *  real 100 ms frames. Read only: the meter is not changed.

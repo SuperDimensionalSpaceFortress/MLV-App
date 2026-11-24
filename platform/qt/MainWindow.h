@@ -879,6 +879,7 @@ private:
     QTime m_playbackFpsMeterPresentedStamp;       // INFO-2 r2 (pass 1 A2): wall time recordPresentedFrame ran for the latest presented frame (the handoff)
     QElapsedTimer m_lookLabelPaintOwedClock;      // INFO-2 r2 (pass 1 A7): armed when a playing relabel stored its text for the next paint (monotonic); invalid = no debt
     quint64 m_lookLabelPaintOwedPresentedCount = 0;   // INFO-2 r2: the presented-frame count when it was armed; a frame since carries the text
+    qint64 m_lookLabelPaintOwedExpectedFloorMs = 0;   // INFO-2 r7 (pass 10 A3): the fps meter reset's pre-zeroing period; the debt never waits less
     QTime m_playbackFpsMeterPrevPresentedStamp;   // INFO-2 r2: the presentation stamp the meter last stepped on (the interval's start)
     QLabel *m_pFrameNumber;
     QLabel *m_pChosenDebayer;

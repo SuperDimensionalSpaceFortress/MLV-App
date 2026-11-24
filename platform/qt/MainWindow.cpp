@@ -2999,6 +2999,8 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
             const bool stallEntered = playback_info_label::labelFramesStallEntered( ui->actionPlay->isChecked(), hasDraw, presentationAgeWrapped,
                 hasDraw ? lastDrawTime.msecsTo( now ) : 0,
                 playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs ) );
+            // INFO-2 r7 (pass 10 A3): the expected period this reset read before zeroing the EMA; the floor of its withdrawal's debt
+            const qint64 labelExpectedBeforeResetMs = playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs );
             if( stallEntered ) m_playbackFramesStalled = true;
             else if( !ui->actionPlay->isChecked() ) m_playbackFramesStalled = false;
             m_playbackFpsEmaFrameMs = 0.0;
@@ -3014,6 +3016,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
                 if( playback_info_label::rateWithdrawalRepaintsNow( ui->actionPlay->isChecked(), stallEntered ) )
                     m_playbackInfoRateWithdrawn = true;   // r2 pass-2 A2: the push that carries this withdrawal repaints at once
                 updatePlaybackInfoLabel( true );      // r3 (adversary r2 c65933cb A2): at once, never deferred by the playing gate
+                if( m_lookLabelPaintOwedClock.isValid() ) m_lookLabelPaintOwedExpectedFloorMs = labelExpectedBeforeResetMs;   // r7 pass 10 A3
             }
             // r3 pass-2 A1: a label stored for the next frame's paint (a relabel while playing) is painted now: no frame follows.
             if( stallEntered && m_lookLabelFullscreenShown ) pushLookLabelOverlay();
@@ -34793,6 +34796,7 @@ void MainWindow::pushLookLabelOverlay( void )
     // INFO-2 r2 (pass 1 A7, pass 2 A1): a text stored for the next frame's paint is owed that paint. settleLookLabelPaintIfOwed (every
     // tick) makes it when no frame was presented within kLabelPaintOwedMs of this store, whatever the stall history: the deferred
     // change is visible within the gate plus a few ticks even when the first frame of a Play is late. A repaint now settles the debt.
+    m_lookLabelPaintOwedExpectedFloorMs = 0;   // INFO-2 r7 (pass 10 A3): no floor unless the fps meter's reset made this store
     if( repaintNow || !gpuWindow ) m_lookLabelPaintOwedClock.invalidate();
     else
     {
@@ -35027,7 +35031,8 @@ void MainWindow::settleLookLabelPaintIfOwed( void )
         return;
     }
     if( playback_info_label::labelPaintOwedDue( owed, framePresentedSinceStore, m_lookLabelPaintOwedClock.elapsed(),
-                                                playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs ) ) )
+                                                playback_info_label::labelPaintOwedExpectedMs( m_lookLabelPaintOwedExpectedFloorMs,
+                                                    playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs ) ) ) )
     {
         m_lookLabelPaintOwedClock.invalidate();
         GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, true );

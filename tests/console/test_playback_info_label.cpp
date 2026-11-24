@@ -2062,7 +2062,8 @@ TEST(PlaybackInfoLabel, InfoTwoR2A7ADeferredPlayingRelabelIsVisibleWithinTheGate
     ASSERT_TRUE(settle.contains(QStringLiteral("if( !ui->actionPlay->isChecked() || framePresentedSinceStore )")));
     ASSERT_TRUE(settle.contains(QStringLiteral(
         "if( playback_info_label::labelPaintOwedDue( owed, framePresentedSinceStore, m_lookLabelPaintOwedClock.elapsed(),\n"
-        "                                                playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs ) ) )")));
+        "                                                playback_info_label::labelPaintOwedExpectedMs( m_lookLabelPaintOwedExpectedFloorMs,\n"
+        "                                                    playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs ) ) ) )")));
     ASSERT_TRUE(settle.contains(QStringLiteral("GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, true );")));
     // every tick, right after the gated flush
     const QString tick = functionBody(source, QStringLiteral("void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )"));
@@ -2232,6 +2233,58 @@ TEST(PlaybackInfoLabel, InfoTwoR7LabelStallTheMeterResetPaintsNoLabelBeforeTheLa
     ASSERT_TRUE(push.contains(QStringLiteral(
         "const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn"
         " || m_playbackFramesStalled;")));
+}
+
+// INFO-2 r7 (adversary pass 10 A3 on 71d28ec9, introduced, major): fullscreen GPU window, a 24 fps target playing at 2.2 fps (EMA
+// 450 ms), the meter's reset at draw age 512 ms and no handoff before 600 ms. The reset read a 675 ms deadline and stored the withdrawn
+// text, but it had zeroed the EMA first, so the stored label's debt read the 24 fps target alone (63 ms) and painted at draw age 576 ms.
+// The reset records the period it read before the zeroing as the debt's floor; settle waits for the larger of floor and current.
+TEST(PlaybackInfoLabel, InfoTwoR7A3TheWithdrawalsPaintDebtKeepsThePeriodTheResetRead)
+{
+    using playback_info_label::labelFramesStallEntered;
+    using playback_info_label::labelPaintExpectedFrameMs;
+    using playback_info_label::labelPaintOwedDue;
+    using playback_info_label::labelPaintOwedExpectedMs;
+    using playback_info_label::rateWithdrawalRepaintsNow;
+    // R7g: the adversary's literal row
+    const qint64 beforeReset = labelPaintExpectedFrameMs(24.0, 450.0);
+    ASSERT_EQ(450, beforeReset);
+    ASSERT_FALSE(rateWithdrawalRepaintsNow(true, labelFramesStallEntered(true, true, false, 512, beforeReset)));
+    const qint64 afterReset = labelPaintExpectedFrameMs(24.0, 0.0);
+    ASSERT_EQ(42, afterReset);
+    ASSERT_TRUE(labelPaintOwedDue(true, false, 576 - 512, afterReset));   // the defect: the zeroed EMA shrank the debt to 63 ms
+    ASSERT_EQ(450, labelPaintOwedExpectedMs(beforeReset, afterReset));
+    ASSERT_FALSE(labelPaintOwedDue(true, false, 576 - 512, labelPaintOwedExpectedMs(beforeReset, afterReset)));
+    ASSERT_FALSE(labelPaintOwedDue(true, false, 674, labelPaintOwedExpectedMs(beforeReset, afterReset)));
+    ASSERT_TRUE(labelPaintOwedDue(true, false, 675, labelPaintOwedExpectedMs(beforeReset, afterReset)));
+    // R7h: no floor (0) is the current period; a larger current period wins over a floor
+    ASSERT_EQ(42, labelPaintOwedExpectedMs(0, 42));
+    ASSERT_EQ(1000, labelPaintOwedExpectedMs(450, 1000));
+    ASSERT_EQ(0, labelPaintOwedExpectedMs(0, 0));
+    // R7i: the wiring. The reset reads the period before it zeroes the EMA, raises the floor only after its forced relabel armed a
+    // debt, every push clears the floor before it arms, and the settle reads floor and current
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString tick = functionBody(source, QStringLiteral("void MainWindow::timerFrameEvent("));
+    const int readAt = tick.indexOf(QStringLiteral(
+        "const qint64 labelExpectedBeforeResetMs = playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs );"));
+    const int zeroAt = tick.indexOf(QStringLiteral("m_playbackFpsEmaFrameMs = 0.0;"), readAt);
+    const int forcedAt = tick.indexOf(QStringLiteral("updatePlaybackInfoLabel( true );"));
+    const int floorAt = tick.indexOf(QStringLiteral(
+        "if( m_lookLabelPaintOwedClock.isValid() ) m_lookLabelPaintOwedExpectedFloorMs = labelExpectedBeforeResetMs;"));
+    ASSERT_TRUE(readAt >= 0);
+    ASSERT_TRUE(zeroAt > readAt);
+    ASSERT_TRUE(forcedAt > zeroAt);
+    ASSERT_TRUE(floorAt > forcedAt);
+    ASSERT_EQ(1, static_cast<int>(source.count(QStringLiteral("m_lookLabelPaintOwedExpectedFloorMs = labelExpectedBeforeResetMs;"))));
+    const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay("));
+    const int clearAt = push.indexOf(QStringLiteral("m_lookLabelPaintOwedExpectedFloorMs = 0;"));
+    const int armAt = push.indexOf(QStringLiteral("m_lookLabelPaintOwedClock.start();"));
+    ASSERT_TRUE(clearAt >= 0);
+    ASSERT_TRUE(armAt > clearAt);
+    const QString settle = functionBody(source, QStringLiteral("void MainWindow::settleLookLabelPaintIfOwed( void )"));
+    ASSERT_TRUE(settle.contains(QStringLiteral("playback_info_label::labelPaintOwedExpectedMs( m_lookLabelPaintOwedExpectedFloorMs,")));
+    ASSERT_TRUE(readRepoFile(QStringLiteral("platform/qt/MainWindow.h"))
+                    .contains(QStringLiteral("qint64 m_lookLabelPaintOwedExpectedFloorMs = 0;")));
 }
 
 // INFO-2 r2 (adversary pass 2 A2 on 9496cb72, introduced, major): 24 fps, start on paused frame 0, Cut Out 3, Loop off. Frames 1 and
