@@ -9321,6 +9321,24 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         per = json.loads((self.run_dir / "batch-01.json").read_text(encoding="utf-8"))
         self.assertEqual([(l["name"], l["status"]) for l in per["legs"]], [("01-fx-a-cpu-A", "RAN"), ("02-fx-b-cpu-A", "RAN")], per["legs"])
 
+    def test_planned_hash_bind_b2_r3_a1_the_real_runner_writes_each_leg_transcript(self) -> None:
+        # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r3 (adversary pass 4 A1 on 8b4b6d8c, CONFIRMED): the leg transcript worker was called by name from the script, but
+        # VenueChain.psm1 does not export Invoke-VenueBoundedRead, so every call landed in its catch (LEG_OUT_WRITE_FAILED, no .out.txt ever written). This row drives the REAL
+        # runner, unmutated and with no harness forwarding into the module (pass-4 A12: the r2 row ran the worker text directly): each completed leg's .out.txt exists and
+        # holds what its child printed, nothing says LEG_OUT_WRITE_*, no fresh temp name is left behind, and BATCH_RESULT is reached.
+        a = self.commit_a
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", a), self.item(self.specs[1], "A", a)]))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual([(l["name"], l["status"]) for l in res["legs"]], [("01-fx-a-cpu-A", "RAN"), ("02-fx-b-cpu-A", "RAN")], res["legs"])
+        self.assertNotIn("LEG_OUT_WRITE_", r.stderr)
+        for name in ("01-fx-a-cpu-A", "02-fx-b-cpu-A"):
+            outs = list(self.run_dir.glob(f"leg-{name}-b01-a*.out.txt"))   # the attempt ordinal runs across the batch's launches (a1, a2)
+            self.assertEqual(len(outs), 1, f"A1: leg {name}'s .out.txt was not written ({outs}); stderr: {r.stderr}")
+            self.assertTrue(outs[0].is_file(), outs[0])
+            self.assertIn("DVE_OUTCOME=PASS", outs[0].read_text(encoding="utf-8"))
+        self.assertEqual(list(self.run_dir.glob("*.b2r2-*.tmp")), [], "a fresh transcript name was left behind")
+
     def test_planned_hash_bind_b2_r1_t3_a_throw_after_a_completed_child_is_recorded_leg_failed_batch_error(self) -> None:
         # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r1 T3: the r5 A1 record path, injected directly now that the .out.txt write no longer throws: a mutated copy of the runner throws
         # right after the first leg's child returned. That leg is LEG_FAILED / BATCH_ERROR (its result is unknown), the leg never started is NOT_RUN, and batch-01.json says so.

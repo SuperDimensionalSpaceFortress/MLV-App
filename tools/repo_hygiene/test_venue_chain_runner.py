@@ -602,12 +602,29 @@ class VenueChainRunnerTests(unittest.TestCase):
         self.assertEqual([l["status"] for l in chain_result(r.stdout)["legs"]], ["NOT_RUN", "LEG_FAILED"])
 
     def test_mutation_leg_exit_code_ignored_records_the_dead_leg_as_ran(self) -> None:
-        runner = self.mutated_runner("if ($legCode -ne 0) {", "if ($false) {", count=1)
+        # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r3 (forced companion): r1 H3 made the leg-exit test `if ($legTimedOut -or $legCode -ne 0) {` (a timed-out primary leg is
+        # LEG_FAILED too); the mutant still drops the whole test, so the dead leg is recorded RAN
+        runner = self.mutated_runner("if ($legTimedOut -or $legCode -ne 0) {", "if ($false) {", count=1)
         r = self.run_chain(self.case / "lane-FM", self.specs[:2], runner=runner, env=self.env(FAKE_LEG_FAIL_LEAF="fx-b.json", FAKE_LEG_FAIL_CODE="3"))
         res = chain_result(r.stdout)
         self.assertEqual(r.returncode, 0, "the mutant must reproduce the defect: a dead leg and a clean chain exit")
         self.assertEqual([l["status"] for l in res["legs"]], ["RAN", "RAN"])
         self.assertEqual((res["legs"][1]["outcome"], res["legs"][1]["legExit"]), ("PASS", 3))
+
+    def test_planned_hash_bind_b2_r3_a1_with_no_compiled_writer_the_chain_log_fallback_reaches_chain_result(self) -> None:
+        # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r3 (adversary pass 4 A1 sibling Invoke-VenueChain.ps1:197): with the compiled writer unavailable, every chain-log line goes
+        # through VenueChain's Invoke-VenueBoundedRead, which the module does not export. Called by name from the script it never resolved, L threw on CHAIN_START and the chain
+        # ended before CHAIN_RESULT. The REAL runner; only its one compile is made to fail (a fresh pwsh never has the type loaded).
+        anchor = "            Add-Type -ErrorAction Stop -TypeDefinition @'"
+        runner = self.mutated_runner(anchor, "            throw 'injected compile failure (TEST FIXTURE)'\n" + anchor, count=1)
+        rd = self.case / "lane-A1W"
+        r = self.run_chain(rd, self.specs[:1], runner=runner)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([l["status"] for l in chain_result(r.stdout)["legs"]], ["RAN"])
+        log = self.chain_log(rd)
+        self.assertTrue(any(" CHAIN_EVIDENCE_WRITER_UNAVAILABLE " in l and "injected compile failure" in l for l in log), log)
+        self.assertTrue(any(" CHAIN_START " in l for l in log), log)
+        self.assertTrue(log and log[-1].startswith("CHAIN_RESULT="), log)
 
     # ---------------------------------------------------------------- the claim
     def _stale_case(self, reason: str, pid: int, created: str, expires: datetime) -> None:
