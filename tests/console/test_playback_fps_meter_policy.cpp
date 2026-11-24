@@ -188,7 +188,7 @@ TEST(PlaybackFpsMeterPolicy, OneTickNeverAsksForMoreFramesThanTheLoopCanCount)
     ASSERT_TRUE(unbounded.position >= 1.0);
     // bounded: the same suspension lands inside the wrap range [wrapAt - width, wrapAt) = [0, 1)
     const int bounded = frameBoundedTickTimeDiffMs(kMaxStampAgeMs, 25000.0);
-    ASSERT_EQ(40000, bounded); // r3: 1e6 frames at 25000 fps (the 1e9 bound was 40000000 ms)
+    ASSERT_EQ(39999, bounded); // r3: 999990 frames at 25000 fps (the 1e9 bound was 40000000 ms)
     ASSERT_TRUE(25000.0 * bounded / 1000.0 <= kMaxTickFrames);
     const playback_frame_range::DropFrameTickResult tick =
         playback_frame_range::advanceDropFrameTick(0.0, 25000.0 * bounded / 1000.0, 1, 2, true);
@@ -199,13 +199,13 @@ TEST(PlaybackFpsMeterPolicy, OneTickNeverAsksForMoreFramesThanTheLoopCanCount)
     ASSERT_TRUE(huge >= 0 && huge < 1);
     ASSERT_TRUE(4294967295.0 * huge / 1000.0 <= kMaxTickFrames);
     ASSERT_TRUE(1.0e13 * frameBoundedTickTimeDiffMs(kMaxStampAgeMs, 1.0e13) / 1000.0 <= kMaxTickFrames);
-    ASSERT_EQ(-40000, frameBoundedTickTimeDiffMs(-kMaxStampAgeMs, 25000.0));
+    ASSERT_EQ(-39999, frameBoundedTickTimeDiffMs(-kMaxStampAgeMs, 25000.0));
     // every ordinary tick is unchanged
     ASSERT_EQ(8, frameBoundedTickTimeDiffMs(8, 1000000.0));
     ASSERT_EQ(42, frameBoundedTickTimeDiffMs(42, 24.0));
     ASSERT_EQ(3600000, frameBoundedTickTimeDiffMs(3600000, 24.0)); // an hour at 24 fps is 86400 frames
-    // r3: a whole day at 24 fps is 2073600 frames, so it is cut to 1e6 frames (41,666,666 ms, about 11.6 h)
-    ASSERT_EQ(41666666, frameBoundedTickTimeDiffMs(kMaxStampAgeMs, 24.0));
+    // r3: a whole day at 24 fps is 2073600 frames, so it is cut to 999990 frames (41,666,250 ms, about 11.6 h)
+    ASSERT_EQ(41666250, frameBoundedTickTimeDiffMs(kMaxStampAgeMs, 24.0));
     ASSERT_EQ(1, frameBoundedTickTimeDiffMs(1, 25000.0));
     ASSERT_EQ(7, frameBoundedTickTimeDiffMs(7, 0.0)); // no rate: nothing to bound
 }
@@ -238,6 +238,46 @@ TEST(PlaybackFpsMeterPolicy, OneTickBoundsItsLoopLapWorkAndItsRoundedRequest)
     ASSERT_TRUE(recorder.engineWrapWidths.size() <= 1000000u);
 }
 
+// r3 pass A1 on 8743841f: a position already inside the cut adds a lap, and the double sum rounds up one more. 100 fps,
+// Loop cut 1..2, ten 0.1-frame grants leave 0.9999999999999999, then a 10,000,010 ms suspension: a 1e6-frame request made
+// 1,000,001 laps. The frame bound leaves room for that slack and for the conform debt (kConformMaxDebtFrames).
+TEST(PlaybackFpsMeterPolicy, OneTickLapsStayWithinTheBoundFromAnywhereInTheCut)
+{
+    using playback_fps_meter::frameBoundedTickTimeDiffMs;
+    double position = 0.0;
+    for (int i = 0; i < 10; ++i) position += 0.1;
+    ASSERT_TRUE(position > 0.0 && position < 1.0);
+    const double request = 100.0 * (double)frameBoundedTickTimeDiffMs(10000010, 100.0) / 1000.0;
+    const playback_frame_range::DropFrameTickResult tick =
+        playback_frame_range::advanceDropFrameTick(position, request, 1, 2, true);
+    ASSERT_TRUE(tick.wrapped);
+    ASSERT_TRUE(tick.wrapLaps <= 1000000);
+    ASSERT_TRUE(tick.position >= 0.0 && tick.position < 1.0);
+    // ...with the most conform debt a tick can carry on top of its grant (conformDropFrameDelta)
+    const playback_frame_range::DropFrameTickResult debtTick = playback_frame_range::advanceDropFrameTick(
+        position, request + playback_frame_range::kConformMaxDebtFrames, 1, 2, true);
+    ASSERT_TRUE(debtTick.wrapLaps <= 1000000);
+}
+
+// r3 pass A2 on 8743841f, CHARACTERIZATION of the stated rate range: an ordinary 8 ms tick is unchanged up to
+// 124,998,750 fps. Past it (the loader accepts MLVI's quotient unchecked: 150,000,000 fps) the tick is cut to the
+// frame bound, and the Loop still lands inside the cut.
+TEST(PlaybackFpsMeterPolicy, OrdinaryTicksAreUnchangedUpToTheStatedRateAndCutInsideTheLoopPastIt)
+{
+    using playback_fps_meter::frameBoundedTickTimeDiffMs;
+    using playback_fps_meter::kMaxTickFrames;
+    ASSERT_EQ(8, frameBoundedTickTimeDiffMs(8, 124998750.0));
+    ASSERT_EQ(8, frameBoundedTickTimeDiffMs(8, 120000000.0));
+    const int cut = frameBoundedTickTimeDiffMs(8, 150000000.0);
+    ASSERT_EQ(6, cut);
+    ASSERT_TRUE(150000000.0 * (double)cut / 1000.0 <= kMaxTickFrames);
+    const playback_frame_range::DropFrameTickResult tick =
+        playback_frame_range::advanceDropFrameTick(0.0, 150000000.0 * (double)cut / 1000.0, 1, 120, true);
+    ASSERT_TRUE(tick.wrapped);
+    ASSERT_TRUE(tick.position >= 0.0 && tick.position < 119.0);
+    ASSERT_TRUE(tick.wrapLaps <= 1000000);
+}
+
 TEST(PlaybackFpsMeterPolicy, OneTickBoundIsRecheckedWithTheCallSitesOwnRoundedExpression)
 {
     using playback_fps_meter::frameBoundedTickTimeDiffMs;
@@ -251,12 +291,18 @@ TEST(PlaybackFpsMeterPolicy, OneTickBoundIsRecheckedWithTheCallSitesOwnRoundedEx
     ASSERT_TRUE(rate * (double)down / 1000.0 >= -kMaxTickFrames);
     ASSERT_TRUE(rate * (double)up / 1000.0 <= 1000000.0);
     ASSERT_EQ(-up, down);
-    // the same rounding at the 1e6 bound, at a plausible rate: 96250/539 fps (178.57), whose reciprocal rounds UP
+    // the same rounding at the bound: 96250/539 fps (178.57) rounded UP at a 1e6 bound, 25000/35 fps (714.29) at 999990
     const double plausible = 96250.0 / 539.0;
     const int p = frameBoundedTickTimeDiffMs(kMaxStampAgeMs, plausible);
-    ASSERT_TRUE(plausible * (double)p / 1000.0 <= 1000000.0);
-    ASSERT_TRUE(plausible * (double)( p + 1 ) / 1000.0 > 1000000.0); // and it is the largest such age
+    ASSERT_TRUE(plausible * (double)p / 1000.0 <= kMaxTickFrames);
+    ASSERT_TRUE(plausible * (double)( p + 1 ) / 1000.0 > kMaxTickFrames); // and it is the largest such age
     ASSERT_EQ(-p, frameBoundedTickTimeDiffMs(-kMaxStampAgeMs, plausible));
+    const double rounding = 25000.0 / 35.0;
+    const int q = frameBoundedTickTimeDiffMs(kMaxStampAgeMs, rounding);
+    ASSERT_EQ(1399985, q); // the reciprocal gives 1399986 ms, 999990.0000000001 frames
+    ASSERT_TRUE(rounding * (double)q / 1000.0 <= kMaxTickFrames);
+    ASSERT_TRUE(rounding * (double)( q + 1 ) / 1000.0 > kMaxTickFrames);
+    ASSERT_EQ(-q, frameBoundedTickTimeDiffMs(-kMaxStampAgeMs, rounding));
 }
 
 TEST(PlaybackFpsMeterPolicy, OneTickAsksForNothingWhenEvenOneMillisecondIsPastTheBound)
