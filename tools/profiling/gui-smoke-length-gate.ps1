@@ -977,7 +977,9 @@ function Get-GuiSmokePlaySafetyMs {
     $byFraction = [int64][Math]::Ceiling([Math]::Max(0.0, $Seconds) * 1000.0 / $fraction) + $script:GuiSmokePlaySafetyMarginMs
     $byFrames = [int64]0
     if (-not $CpuPaceInformational -and $Seconds -gt 0 -and $NativeFps -gt 0) {
-        $requestedSeconds = if ($TargetPresentedFrames -gt 0) { [Math]::Min($Seconds, [double]$TargetPresentedFrames / $NativeFps) } else { $Seconds }
+        # Adversary pass 2 A3: the app takes --seconds as qRound(seconds x 1000) ms (main.cpp options.durationMs), so the frames are counted from that.
+        $appSeconds = [Math]::Round($Seconds * 1000.0, [MidpointRounding]::AwayFromZero) / 1000.0
+        $requestedSeconds = if ($TargetPresentedFrames -gt 0) { [Math]::Min($appSeconds, [double]$TargetPresentedFrames / $NativeFps) } else { $appSeconds }
         $frames = [int64][Math]::Ceiling([Math]::Max((Get-GuiSmokeMinPlaySeconds -NativeFps $NativeFps), $requestedSeconds) * $NativeFps - 1e-9)
         if ($frames -gt 1) { $byFrames = [int64][Math]::Ceiling(($frames - 1) * 1000.0 / $script:GuiSmokeGatedPaceFloorFps) + $script:GuiSmokePlaySafetyMarginMs }
     }

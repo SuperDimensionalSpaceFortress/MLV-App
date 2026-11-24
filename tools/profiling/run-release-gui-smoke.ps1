@@ -1772,9 +1772,14 @@ $derivedProcessTimeoutMs = [Math]::Ceiling(
     [Math]::Max(0, $ScreenshotCaptureTimeoutMs) +
     $(if ($ExerciseClipLifecycleStress) { [Math]::Max(0, $StressSwitchAtMs) + 60000 } else { 30000 })
 )
-if ($derivedProcessTimeoutMs -gt 3600000) {
+# Adversary pass 2 A2: the frame term only widens the budget, never refuses a workload. The ceiling is checked against the budget WITHOUT it
+# (the base budget, the same refusal as before), and the widened budget is then held at the ceiling; a Play that outruns it ends at the hard
+# limit below as a typed timeout, never a pass.
+$frameTermExcessMs = (Get-GuiSmokePlaySafetyMs -Seconds $Seconds -NativeFps $clipNativeFpsForBudget -TargetPresentedFrames $TargetPresentedFrames -CpuPaceInformational:$CpuPlayPaceInformational) - (Get-GuiSmokePlaySafetyMs -Seconds $Seconds -CpuPaceInformational:$CpuPlayPaceInformational)
+if (($derivedProcessTimeoutMs - $frameTermExcessMs) -gt 3600000) {
     throw "Derived GUI-smoke process timeout exceeds the 3600000 ms safety ceiling; pass a smaller bounded workload."
 }
+$derivedProcessTimeoutMs = [Math]::Min(3600000, $derivedProcessTimeoutMs)
 # VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r6 (sol r5 B1): the process's HARD deadline is derived from the LEG (leg budget + a 120 s setup/teardown
 # allowance, -LegHardLimitAllowanceMs to widen it) and capped by -ProcessTimeoutMs, never equal to a job-sized -ProcessTimeoutMs by itself. It is the
 # one budget every wait below uses (no log yet, a growing log, the finalize, the receipt), so a short leg under a one-hour job timeout ends at its

@@ -433,7 +433,8 @@ class CaptureReferenceFrameLauncherTests(_LauncherCase):
     def test_the_kill_path_passes_the_kill_into_the_verdict(self) -> None:
         text = CAPTURE.read_text(encoding="utf-8")
         self.assertIn("-KilledByLauncher $captureKilled", text)
-        self.assertRegex(text, r"WaitForExit\(\$captureBudgetMs\)\)\s*\{\s*\$captureKilled = \$true")
+        # PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1 (adversary r1 A2 sibling): the wait is the Int32-bounded $captureWaitMs derived from $captureBudgetMs.
+        self.assertRegex(text, r"WaitForExit\(\$captureWaitMs\)\)\s*\{\s*\$captureKilled = \$true")
 
 
 @requires_pwsh

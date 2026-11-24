@@ -662,6 +662,21 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         stripped, counts = cls.strip_regions(text)
         return stripped, counts["leg-terminals"]
 
+    @staticmethod
+    def with_gated_play_allowance(text: str, extra: list[str]) -> str:
+        """PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: the generator's Gated play allowance is the app's frame-sized budget at the 60 fps bound
+        (test_cpu_leg_smoke_ceiling.gated_play_sec), not the baseline's max(40, PlaySeconds). That moves the baseline's smoke timeout, and the PresentMon
+        window derived from it, by exactly the difference, and nothing else. Both value lines must be there exactly once; any other change still fails."""
+        from tools.repo_hygiene.test_cpu_leg_smoke_ceiling import gated_play_sec  # lazy: that module imports this one
+        play = int(extra[extra.index("-PlaySeconds") + 1]) if "-PlaySeconds" in extra else \
+            int(re.search(r"\[int\]\$PlaySeconds = (\d+),", GENERATOR.read_text(encoding="utf-8")).group(1))
+        delta_sec = gated_play_sec(play) - max(40, play)
+        for pattern, scale in ((r"^\$PresentMonTimedSeconds = (\d+)$", 1), (r"^\$SmokeProcessTimeoutMs = (\d+)$", 1000)):
+            found = re.findall(pattern, text, flags=re.MULTILINE)
+            assert len(found) == 1, f"the baseline's {pattern} value line moved: update with_gated_play_allowance"
+            text = re.sub(pattern, lambda m: m.group(0).replace(m.group(1), str(int(m.group(1)) + delta_sec * scale)), text, count=1, flags=re.MULTILINE)
+        return text
+
     def assertByteIdenticalToBaseline(self, name: str, extra: list[str]) -> None:
         if not self.baseline_available:
             self.skipTest(f"baseline commit {BASELINE_COMMIT[:12]} is not in this clone")
@@ -669,6 +684,7 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         old = self.generate(self.baseline_root / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1", f"old-{name}.job.ps1", extra)
         stripped, new_counts = self.strip_regions(new.read_text(encoding="utf-8"))
         old_stripped, old_counts = self.strip_regions(self.without_claim_shape_replaced_baseline(old.read_text(encoding="utf-8")))
+        old_stripped = self.with_gated_play_allowance(old_stripped, extra)
         self.assertEqual((new_counts["claim-shape"], old_counts["claim-shape"]), (self.CLAIM_SHAPE_REGIONS, 0), "the default job carries exactly the pinned number of bracketed VENUE-STAGE-CLAIM-SHAPE-1 regions; the baseline predates them")
         self.assertEqual(new_counts["leg-terminals"], 4, "the default job carries exactly the four bracketed DVE-LEG-TERMINALS-1 regions (the wait-failure block and its two summary fields, the smoke-failure block and its one summary field)")
         self.assertEqual(old_counts["leg-terminals"], 4, "the baseline carries the same four")
@@ -9428,6 +9444,9 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 # base generator's bytes, and the base carries the same regions as the new job (it is the pinned KEEPALIVE-FAILURE-PUBLISH-LAST-1 generator).
                 kept, new_counts = GeneratorByteIdentityAndVariantTests.strip_regions(new.decode("utf-8"))
                 old_kept, old_counts = GeneratorByteIdentityAndVariantTests.strip_regions(GeneratorByteIdentityAndVariantTests.without_claim_shape_replaced_baseline(old.decode("utf-8")))
+                # PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: a Gated (cuda) job's play allowance is the app's frame-sized budget; the cpu branch's is unchanged.
+                if not name.startswith("cpu"):
+                    old_kept = GeneratorByteIdentityAndVariantTests.with_gated_play_allowance(old_kept, extra)
                 self.assertGreater(new_counts["session-locked"], 0)
                 # PLAYBACK-VSYNC-DEFAULT-1's regions: present in the new job and in the base generator (the pinned GPU-PREF-REGISTRY-STOP-AND-PRUNE-1 commit), at their pinned count.
                 self.assertEqual((new_counts.pop("playback-vsync"), old_counts.pop("playback-vsync")),

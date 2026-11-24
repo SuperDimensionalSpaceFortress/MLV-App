@@ -1157,20 +1157,32 @@ $timeBudgetArgs['ShareSmokeCeiling'] = $true
 # 59.94): a clip above it ends as a typed runner timeout, never a pass.
 $gatedBudgetNativeFpsBound = 60.0
 $gatedPlayFloorSeconds = [int]$timeBudgetArgs['PlaySeconds']
-$timeBudgetArgs['PlaySeconds'] = [int][Math]::Max($timeBudgetArgs['PlaySeconds'],
-    [Math]::Ceiling((Get-GuiSmokePlaySafetyMs -Seconds $PlaySeconds -NativeFps $gatedBudgetNativeFpsBound) / 1000.0))
 # Adversary r1 A1: the bound is an UPPER estimate (the clip's own fps is not known here), so it may only widen a budget, never refuse a leg on
 # its own. When the bound's allowance alone would make the shared smoke ceiling refuse the input (ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING) but
 # the floor allowance fits, the leg keeps the floor allowance; a clip whose own Play budget then outruns the runner's deadline ends as a typed
 # runner timeout, never a pass. An input that cannot fit even the floor allowance is still refused by the derivation below, with the same token.
-if (-not $cpuPlayPaceInformational -and $timeBudgetArgs['PlaySeconds'] -gt $gatedPlayFloorSeconds) {
-    try {
-        [void](Get-AttrCudaLegTimeBudget -InputBytes $clipBytesForBudget @timeBudgetArgs)
-    } catch {
-        if (-not ([string]$_.Exception.Message).StartsWith('ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING')) { throw }
-        Write-Warning ("PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: the $gatedBudgetNativeFpsBound fps bound's play allowance ($($timeBudgetArgs['PlaySeconds']) s) does not fit " +
-            "this input under the smoke ceiling; the leg keeps the $gatedPlayFloorSeconds s floor allowance (a clip whose own budget outruns it ends as a typed runner timeout).")
-        $timeBudgetArgs['PlaySeconds'] = $gatedPlayFloorSeconds
+# Adversary pass 2 A1: an allowance past the derivation's own PlaySeconds range (3600 s) cannot fit the 3600 s smoke ceiling either, so it keeps
+# the floor without calling it (a call would be a binding error, not the typed token). A4: the note is information, not a warning, so a
+# caller's -WarningAction Stop cannot end the generator on a leg the base budget admits; the floor is restored before it is written.
+if (-not $cpuPlayPaceInformational) {
+    $gatedBoundPlaySeconds = [int64][Math]::Max($gatedPlayFloorSeconds,
+        [Math]::Ceiling((Get-GuiSmokePlaySafetyMs -Seconds $PlaySeconds -NativeFps $gatedBudgetNativeFpsBound) / 1000.0))
+    if ($gatedBoundPlaySeconds -gt $gatedPlayFloorSeconds) {
+        $gatedBoundFits = $false
+        if ($gatedBoundPlaySeconds -le 3600) {
+            $timeBudgetArgs['PlaySeconds'] = [int]$gatedBoundPlaySeconds
+            try {
+                [void](Get-AttrCudaLegTimeBudget -InputBytes $clipBytesForBudget @timeBudgetArgs)
+                $gatedBoundFits = $true
+            } catch {
+                if (-not ([string]$_.Exception.Message).StartsWith('ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING')) { throw }
+            }
+        }
+        if (-not $gatedBoundFits) {
+            $timeBudgetArgs['PlaySeconds'] = $gatedPlayFloorSeconds
+            Write-Information -MessageData ("PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: the $gatedBudgetNativeFpsBound fps bound's play allowance ($gatedBoundPlaySeconds s) does not fit " +
+                "this input under the smoke ceiling; the leg keeps the $gatedPlayFloorSeconds s floor allowance (a clip whose own budget outruns it ends as a typed runner timeout).") -InformationAction Continue
+        }
     }
 }
 # CPU-LOOK-LEG-PACE-ABORT-1: a cpu leg's Play may run to the CPU ceiling (Get-GuiSmokePlaySafetyMs -CpuPaceInformational: requested / (1/30)
