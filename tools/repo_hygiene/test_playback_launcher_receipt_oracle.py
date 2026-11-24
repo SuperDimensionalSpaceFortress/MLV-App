@@ -970,6 +970,10 @@ class OffscreenProbeAndParityTests(unittest.TestCase):
         gate = GATE.read_text(encoding="utf-8")
         self.assertIn(f"$script:GuiSmokeMinSustainedPaceFraction = {fraction}", gate)
         self.assertIn(f"$script:GuiSmokePlaySafetyMarginMs = {margin}", gate)
+        # PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: the stated floor fps the Gated budget sizes the admitted frames with.
+        floor_fps = float(re.search(r"constexpr double kGatedPaceFloorFps = ([0-9.]+);", header).group(1))
+        self.assertEqual(floor_fps, 15.0)
+        self.assertIn(f"$script:GuiSmokeGatedPaceFloorFps = {floor_fps}", gate)
 
     def test_the_powershell_play_floor_mirrors_the_cpp_derivation(self) -> None:
         # PLAYBACK-CLIP-LENGTH-HFR-10S-1: one derivation (minPlayWindowSeconds); every PowerShell carrier mirrors its constants.
@@ -992,6 +996,17 @@ class OffscreenProbeAndParityTests(unittest.TestCase):
         for seconds, expected in ((20, 55000), (24, 63000), (40, 95000)):
             proc = _pwsh(f". {_q(GATE)}; Get-GuiSmokePlaySafetyMs -Seconds {seconds}")
             self.assertEqual(int(proc.stdout.strip()), expected, proc.stdout + proc.stderr)
+
+    @requires_pwsh
+    def test_the_powershell_safety_budget_sizes_the_admitted_frames_like_the_app(self) -> None:
+        # PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: max(requested / 0.5 + 15 s, ceil((frames - 1) / kGatedPaceFloorFps) + 15 s), frames = ceil(s x native fps).
+        # The C++ values (tests/console/test_playback_frame_range.cpp PlayPaceBudgetKnifeEdge); a clip at 30 fps or below keeps today's budget.
+        table = ((20, 59.94, 94867), (10, 59.94, 54934), (25, 59.94, 114867),
+                 (20, 24.0, 55000), (20, 30.0, 55000), (25, 29.97, 65000), (20, 0.0, 55000))
+        for seconds, fps, expected in table:
+            with self.subTest(seconds=seconds, fps=fps):
+                proc = _pwsh(f". {_q(GATE)}; Get-GuiSmokePlaySafetyMs -Seconds {seconds} -NativeFps {fps}")
+                self.assertEqual(proc.stdout.strip(), str(expected), proc.stdout + proc.stderr)
 
     def test_the_runners_process_budget_starts_from_the_apps_safety_net(self) -> None:
         text = RUNNER.read_text(encoding="utf-8")

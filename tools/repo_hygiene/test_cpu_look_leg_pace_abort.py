@@ -215,6 +215,11 @@ class CpuPaceLaunchers(unittest.TestCase):
         self.assertIn(f"$script:GuiSmokeCpuInformationalMinPaceFraction = {'1.0 / 30.0'}", self.gate)
         self.assertEqual(check_gate_text(self.gate), [])
 
+    def test_the_powershell_gate_mirrors_the_cpp_gated_pace_floor(self) -> None:
+        # PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: the Gated budget also sizes the admitted frames at kGatedPaceFloorFps; the twin carries the same number.
+        floor_fps = float(re.search(r"constexpr double kGatedPaceFloorFps = ([0-9.]+);", HEADER.read_text(encoding="utf-8")).group(1))
+        self.assertIn(f"$script:GuiSmokeGatedPaceFloorFps = {floor_fps}", self.gate)
+
     @requires_windows_pwsh
     def test_the_powershell_budget_is_the_formula_the_app_uses_in_both_modes(self) -> None:
         for seconds in (20, 25, 40):

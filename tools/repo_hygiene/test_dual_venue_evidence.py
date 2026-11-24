@@ -19801,21 +19801,25 @@ class DriftLegSpecTests(unittest.TestCase):
     def pace_floor_fps(self, play_seconds: int, clip_fps: float = 59.94) -> float:
         """The steady pace the app's gate demands of a Play of `play_seconds` of a `clip_fps` clip, read from the constants in PlaybackFrameRange.h (playSafetyMs and
         required_source_frames = ceil(seconds x native fps), r4 adversary A3: whole frames, and the first present comes FIRST_PRESENT_S after the trigger):
-        frames / (seconds / kMinSustainedPaceFraction + kPlaySafetyMarginMs / 1000 - FIRST_PRESENT_S). 17.3 fps for 10 s, 21.9 fps for 20 s."""
+        (frames - 1) / (budget - FIRST_PRESENT_S), budget = max(seconds / kMinSustainedPaceFraction, ceil((frames - 1) x 1000 / kGatedPaceFloorFps) / 1000) + kPlaySafetyMarginMs / 1000
+        (PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: the budget is also sized from the admitted frames at the stated floor fps). 11.0 fps for 10 s, 12.7 fps for 20 s."""
         text = (Path(__file__).resolve().parents[2] / "platform" / "qt" / "PlaybackFrameRange.h").read_text(encoding="utf-8")
         fraction = float(re.search(r"constexpr double kMinSustainedPaceFraction = ([0-9.]+);", text).group(1))
         margin_ms = int(re.search(r"constexpr int kPlaySafetyMarginMs = (\d+);", text).group(1))
+        floor_fps = float(re.search(r"constexpr double kGatedPaceFloorFps = ([0-9.]+);", text).group(1))
         # r5 adversary pass 8 A4: the first frame is presented at FIRST_PRESENT_S and the pace then has to carry whole_frames - 1 transitions (the app counts the first frame
         # and 599 transitions for 10 s of 59.94), so the numerator is one less than the frame count.
         # (PlaybackFrameRange.h subtracts 1e-9 before the ceil, so 60.00000000001 fps x 10 s is still 600 frames; adversary pass 9 A2.)
-        return (math.ceil(play_seconds * clip_fps - 1e-9) - 1) / (play_seconds / fraction + margin_ms / 1000.0 - self.FIRST_PRESENT_S)
+        frames = math.ceil(play_seconds * clip_fps - 1e-9)
+        budget_ms = max(int(play_seconds / fraction * 1000.0), math.ceil((frames - 1) * 1000.0 / floor_fps)) + margin_ms
+        return (frames - 1) / (budget_ms / 1000.0 - self.FIRST_PRESENT_S)
 
-    def test_the_20_second_window_cannot_host_a_cap_one_leg_and_the_w10_family_can(self) -> None:
-        """r4: five of the six cap-1 20 s CUDA legs ended PaceTooSlow (INVALID, uncounted). The floor a window sets on the CUDA (gated) backend is a function of the app's
-        gate constants, so this test computes it from the header: the 20 s window's floor is above every slower cap-1 pace measured, the 10 s window's floor is below
-        all of them. (CPU-backend legs are informational and have no such floor; these specs are benched on CUDA.)"""
-        self.assertGreater(self.pace_floor_fps(20), 21.0)
-        self.assertGreater(self.pace_floor_fps(20), self.SLOWEST_MEASURED_CAP1_FPS + 3.0)
+    def test_the_20_second_window_now_hosts_a_cap_one_leg_as_the_w10_family_does(self) -> None:
+        """r4: five of the six cap-1 20 s CUDA legs ended PaceTooSlow (INVALID, uncounted) under a 20 s floor of about 21.9 fps. PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1
+        sizes the Gated budget from the admitted frames at kGatedPaceFloorFps, so the floor a window sets on the CUDA (gated) backend -- computed here from the header -- is
+        below every cap-1 pace measured for both windows. (CPU-backend legs are informational and have no such floor; these specs are benched on CUDA.)"""
+        self.assertLess(self.pace_floor_fps(20), 13.0)
+        self.assertLess(self.pace_floor_fps(20), self.SLOWEST_MEASURED_CAP1_FPS - 3.0)
         self.assertLess(self.pace_floor_fps(10), self.SLOWEST_MEASURED_CAP1_FPS)
         for rel in DRIFT_W10_LEGS:
             with self.subTest(leg=rel):
