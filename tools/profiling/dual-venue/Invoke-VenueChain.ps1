@@ -29,6 +29,8 @@
 #      (30) on at least -MinWindowProbes probes and a later hour within -WindowHorizonHours is at or above it, the chain waits (unclaimed) for that hour.
 #   5. LOG. -ChainLog (default <RunDir>\chain.log): one line per event, UTC stamp first; the last line is CHAIN_RESULT=<json> (also printed on stdout).
 #      The leg's own output goes to <RunDir>\leg-<name>.out.txt, each probe's to <RunDir>\quiet-<name>-<phase>.out.txt, probes append to <RunDir>\gate.log.
+#      Both .out.txt files are written when their child ends, as evidence only: each child is classified from its own captured output, never from a file another chain on the
+#      same -RunDir can also write (DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r3).
 #   6. SUPPLEMENTARY LEGS (VENUE-UM-SUPPLEMENTARY-WHEN-BACHELOR-HELD-1; owner directive 2026-10-18: every playback chain ALSO runs its legs on ultra-magnus when that agent is idle).
 #      Only a -Venue bachelor chain, ON by default, off with -NoSupplementary. The same leg is offered on ultra-magnus (role supplementary) (a) after each Bachelor leg ran, and (b) once a leg
 #      has waited more than -SupplementaryHeldSec (1800), checked each time the wait loop comes round (queue/heat gate that returns GATE_BUSY, claim line) AND once more when a Bachelor pre-claim
@@ -250,9 +252,12 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec, [str
     }
     $qArgs = @('-NoProfile', '-NonInteractive', '-File', $QuietScript, '-Venue', $pv, '-WorkDir', (Join-Path $RunDir 'quiet'), '-GateLog', (Join-Path $RunDir 'gate.log'),
         '-ThresholdPercent', [string]$ThresholdPercent, '-MaxWaitSec', [string]$MaxWaitSec, '-RecheckSec', [string]$RecheckSec, '-MaxAdmissionWaitSec', [string]$ProbeAdmissionWaitSec)
-    & $pwshExe @qArgs *> $out
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r3 (adversary pass 2 A1 sibling): the probe's output is CAPTURED from its own child and read from that capture. The RunDir-named
+    # file is shared by every chain on this -RunDir (two venues' chains name a leg alike), so it is written after the probe as evidence only and never read back.
+    $qRaw = @(& $pwshExe @qArgs 2>&1)
     $code = $LASTEXITCODE
-    $lines = @(if (Test-Path -LiteralPath $out) { Get-Content -LiteralPath $out })
+    $lines = @($qRaw | ForEach-Object { [string]$_ })
+    try { [IO.File]::WriteAllLines($out, [string[]]$lines) } catch { $null = $_ }   # evidence only: a file that cannot be written never changes the verdict read above
     $v = $lines | Where-Object { $_ -match '^(QUIET|COOLDOWN_UNMET) mean=' } | Select-Object -Last 1
     $u = $lines | Where-Object { $_ -like 'VENUE_QUIET_UNKNOWN *' } | Select-Object -Last 1
     $ff = $lines | Where-Object { $_ -match '^FOREIGN_FLOOR ' } | Select-Object -Last 1   # BACHELOR-VENUE-FOREIGN-FLOOR-FAST-FAIL-1 r3: the early-exit marker survives into the leg class
@@ -560,9 +565,14 @@ foreach ($leg in $plan) {
             $lArgs += @('-ExpectSpecSha256', [string]$leg.specSha256)
             if ($SheetCopyDir) { $lArgs += @('-SheetCopyDir', $SheetCopyDir) }
             L "LEG $($leg.name) RUN verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) spec=$($leg.spec) backend=$(if ($leg.backend) { $leg.backend } else { 'spec' })"
-            & $pwshExe @lArgs *> $out
+            # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r3 (adversary pass 2 A1, A6): the leg child's output is CAPTURED (2>&1: its stdout lines are strings, its stderr lines
+            # ErrorRecords), and every reading below (outcome, receipt path, detail, the spec refusal) is made from THIS child's own STDOUT. The RunDir-named file is shared by
+            # every chain on this -RunDir (two venues' chains name a leg alike), so it is written after the leg as evidence only and never read back; a stderr line classifies nothing.
+            $legRaw = @(& $pwshExe @lArgs 2>&1)
             $legCode = $LASTEXITCODE
-            $legLines = @(if (Test-Path -LiteralPath $out) { Get-Content -LiteralPath $out })
+            $legLines = @($legRaw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { [string]$_ })
+            try { [IO.File]::WriteAllLines($out, [string[]]@($legRaw | ForEach-Object { [string]$_ })) }
+            catch { $ow = "LEG_OUT_WRITE_FAILED leg=$($leg.name) path=$out ($($_.Exception.Message -replace '\s+', ' ')) (evidence only: the leg is classified from its own captured output)"; try { L $ow } catch { [Console]::Error.WriteLine($ow) } }
             $o = $legLines | Where-Object { $_ -match '^DVE_OUTCOME=(\S+)' } | Select-Object -Last 1
             $outcome = $(if ($o -and $o -match '^DVE_OUTCOME=(\S+)') { $Matches[1] } else { 'NONE' })
             $p = $legLines | Where-Object { $_ -match '^DVE_RECEIPT_PATH=(.+)$' } | Select-Object -Last 1
@@ -575,8 +585,8 @@ foreach ($leg in $plan) {
                 Add-Result $leg 'LEG_FAILED' @{ verdict = $re.verdict; quietMean = $re.mean; outcome = 'INVALID'; printedOutcome = $outcome; legExit = $legCode; receipt = $null }
                 L "LEG $($leg.name) LEG_FAILED exit=$legCode outcome=INVALID printedOutcome=$outcome verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) (the leg exited non-zero: no usable receipt)"
                 # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1: a leg that refused other bytes than the planned ones (or could not read the planned spec) is named on its own typed line and in its
-                # result (specRefusal). It stays LEG_FAILED / INVALID, exit 7, so the label never turns a leg into a measurement either way. The out file holds both of the leg's
-                # streams (*>), so the record is read only from a leg that wrote no receipt line, as a whole anchored line naming this leg's planned hash.
+                # result (specRefusal). It stays LEG_FAILED / INVALID, exit 7, so the label never turns a leg into a measurement either way. The record is read from this child's
+                # own STDOUT only (r3), from a leg that wrote no receipt line, as a whole anchored line naming this leg's planned hash.
                 # (r2, adversary A5: the exit code is set BEFORE the label, and the label's log write may fail without costing the result, CHAIN_RESULT or the next leg)
                 if ($exitCode -eq 0) { $exitCode = 7 }
                 $specRefusal = $(if (-not $receipt) { Get-LegSpecRefusalLine $legLines $leg } else { '' })

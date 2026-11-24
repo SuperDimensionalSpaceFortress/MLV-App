@@ -5933,7 +5933,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertLess(read_at, check_at)
         self.assertLess(check_at, leg.index("$spec = [Text.Encoding]::UTF8.GetString($specBytes) | ConvertFrom-Json -NoEnumerate"), "the check runs on the one read, before the spec is used")
         batch = RUNNER.read_text(encoding="utf-8")
-        self.assertIn("$lArgs += @('-ExpectSpecSha256', [string]$script:SpecBudgetSha256[[string]$leg.spec])", batch)
+        # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r3 (adversary pass 2 A2): the entry's OWN judged sha256 (proved equal to its path's binding before any claim), never a path-keyed lookup
+        self.assertIn("$lArgs += @('-ExpectSpecSha256', [string]$leg.specSha256)", batch)
 
     def test_r19_b2_a_stalled_budget_spec_read_is_bounded_by_the_deadline_and_refused_before_the_claim(self) -> None:
         # EXPORT-VENUE-LEG-1 r19 (sol r18 B2 = pass20-A2): the budget preflight's own read of the spec was a synchronous ReadAllBytes BEFORE the remaining-room check, so a share that

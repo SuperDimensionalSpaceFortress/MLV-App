@@ -6650,6 +6650,7 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
     SWAP_LEGSET = "hfr-native-m16-1457"
     SWAP_TARGET = "m16-1457-native-windowed-s1.json"         # plan entry 2 of the set: an ordinary speed leg
     SWAP_SOURCE = "m16-1457-drift-t1-w10-visual-unpaced-fullscreen-s1.json"   # a committed visual twin
+    SWAP_FIRST = "m16-1457-native-fullscreen-s1.json"        # plan entry 1 of the set (r3, adversary pass 2 A7: a leg runs after it)
 
     # Wait-VenueQuiet stand-in: QUIET at once. It runs before every leg, i.e. strictly AFTER the chain planned, so it is where the fixture changes the planned spec: once,
     # on the first probe for DVT_SWAP_VENUE (any venue when unset): `copy` puts DVT_SWAP_FROM's bytes at DVT_SWAP_TO, `touch` moves only DVT_SWAP_TO's mtime.
@@ -6657,7 +6658,7 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
 param([string]$Venue, [string]$WorkDir, [string]$GateLog, [double]$ThresholdPercent = 20, [int]$MaxWaitSec = 1800, [int]$RecheckSec = 90, [int]$MaxAdmissionWaitSec = 0)
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 if ($env:DVT_SWAP_TO -and -not (Test-Path -LiteralPath $env:DVT_SWAP_DONE) -and (-not $env:DVT_SWAP_VENUE -or $env:DVT_SWAP_VENUE -eq $Venue)) {
-    if ($env:DVT_SWAP_MODE -eq 'touch') { [IO.File]::SetLastWriteTimeUtc($env:DVT_SWAP_TO, [DateTime]::UtcNow.AddMinutes(7)) } else { [IO.File]::Copy($env:DVT_SWAP_FROM, $env:DVT_SWAP_TO, $true) }
+    if ($env:DVT_SWAP_MODE -eq 'touch') { [IO.File]::SetLastWriteTimeUtc($env:DVT_SWAP_TO, [DateTime]::UtcNow.AddMinutes(7)) } elseif ($env:DVT_SWAP_MODE -eq 'delete') { [IO.File]::Delete($env:DVT_SWAP_TO) } else { [IO.File]::Copy($env:DVT_SWAP_FROM, $env:DVT_SWAP_TO, $true) }
     Set-Content -LiteralPath $env:DVT_SWAP_DONE -Value $Venue
 }
 "QUIET mean=5.0% threshold=$ThresholdPercent% waitedSec=1"; exit 0
@@ -6668,14 +6669,22 @@ if ($env:DVT_SWAP_TO -and -not (Test-Path -LiteralPath $env:DVT_SWAP_DONE) -and 
     # Logs what it READ (the legId inside the bytes) and the hash it was handed; a leg that runs writes a receipt naming the legId it read.
     CHAIN_FAKE_LEG = r"""
 param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '', [string]$ExpectSpecSha256 = '')
-$bytes = [IO.File]::ReadAllBytes($LegSpec)
+# r3 (adversary pass 2 A7): DVT_LEG_STDERR_REFUSAL prints the unreadable record on STDERR only and exits 1 (no stdout record: a parent must not classify it)
+if ($env:DVT_LEG_STDERR_REFUSAL) { [Console]::Error.WriteLine("DVE_LEG_SPEC_UNREADABLE planned_sha256=$ExpectSpecSha256"); exit 1 }
+# r3 (adversary pass 2 A8): the real leg's order (Invoke-VenueLeg.ps1): ONE read in a try (a failed read is the unreadable record, then the throw), then the hash comparison, THEN the parse
+try { $bytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $LegSpec).Path) }
+catch {
+    if (-not $ExpectSpecSha256) { throw }
+    Write-Output "DVE_LEG_SPEC_UNREADABLE planned_sha256=$ExpectSpecSha256"
+    throw "DVE_LEG_SPEC_UNREADABLE the leg spec '$LegSpec' could not be read after planning ($($_.Exception.Message)); nothing is generated or submitted"
+}
 $readSpecSha = ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData($bytes)) -replace '-', '').ToLowerInvariant()
-$legId = [string](([Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json).legId)
-Add-Content -LiteralPath $env:DVT_LEG_LOG -Value ("LEG venue={0} leaf={1} read={2} expect={3} legId={4}" -f $Venue, (Split-Path -Leaf $LegSpec), $readSpecSha, $(if ($ExpectSpecSha256) { $ExpectSpecSha256 } else { 'none' }), $legId)
+Add-Content -LiteralPath $env:DVT_LEG_LOG -Value ("LEG venue={0} leaf={1} read={2} expect={3}" -f $Venue, (Split-Path -Leaf $LegSpec), $readSpecSha, $(if ($ExpectSpecSha256) { $ExpectSpecSha256 } else { 'none' }))
 if ($ExpectSpecSha256) {
     if ($readSpecSha -cne $ExpectSpecSha256) { Write-Output "DVE_LEG_SPEC_REFUSED planned_sha256=$ExpectSpecSha256 read_sha256=$readSpecSha" }
     if ($readSpecSha -cne $ExpectSpecSha256) { throw "DVE_LEG_SPEC_CHANGED the leg spec '$LegSpec' read as sha256 $readSpecSha, not $ExpectSpecSha256; nothing is generated or submitted" }
 }
+$legId = [string](([Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json).legId)
 $rdir = Join-Path $env:DVT_LEG_ROOT ('receipts\' + $Venue); New-Item -ItemType Directory -Force -Path $rdir | Out-Null
 $rp = Join-Path $rdir ([guid]::NewGuid().ToString() + '.json')
 Set-Content -LiteralPath $rp -Value ('{"legId":"' + $legId + '","venue":{"role":"' + $(if ($Venue -eq 'ultra-magnus') { 'supplementary' } else { 'acceptance' }) + '"}}')
@@ -6891,7 +6900,8 @@ exit 0
     def test_planned_hash_bind_r2_a3_chain_called_with_native_error_preference_still_types_the_refusal_and_runs_the_next_leg(self) -> None:
         """A3: a caller's $PSNativeCommandUseErrorActionPreference = $true reached the raw leg launch and turned the refusal's exit 1 into a terminating error."""
         dv = self.mutated_runner([])
-        target, source = dv / "legs" / self.SWAP_TARGET, dv / "legs" / self.SWAP_SOURCE
+        # r3 (adversary pass 2 A7): the FIRST plan entry is the one changed, so the next-leg assertion observes a leg that runs AFTER the refusal
+        target, source = dv / "legs" / self.SWAP_FIRST, dv / "legs" / self.SWAP_SOURCE
         planned = hashlib.sha256(target.read_bytes()).hexdigest()
         fx = self.chain_fixture(dv, target, source)
         from datetime import datetime, timedelta, timezone
@@ -6903,24 +6913,152 @@ exit 0
         proc = run_pwsh(["-Command", f"$PSNativeCommandUseErrorActionPreference = $true; & '{dv / 'Invoke-VenueChain.ps1'}' {quoted}; exit $LASTEXITCODE"], env_extra=fx["env"], timeout=420)
         self.assertEqual(proc.returncode, 7, proc.stdout + proc.stderr)
         result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
-        row = next(r for r in result["legs"] if r["spec"].endswith(self.SWAP_TARGET))
+        row = next(r for r in result["legs"] if r["spec"].endswith(self.SWAP_FIRST))
         self.assertEqual((row["status"], row.get("specRefusal")), ("LEG_FAILED", "DVE_CHAIN_SPEC_CHANGED"), row)
-        self.assertEqual(len(self.fixture_legs()), 2, "the next leg still ran")
+        self.assertEqual([l["leaf"] for l in self.fixture_legs()], [self.SWAP_FIRST, self.SWAP_TARGET], "the next leg still ran")
+        self.assertEqual(next(r for r in result["legs"] if r["spec"].endswith(self.SWAP_TARGET))["status"], "RAN", result["legs"])
         self.assertTrue(any(f"planned_sha256={planned}" in l and " DVE_CHAIN_SPEC_CHANGED " in l for l in proc.stdout.splitlines()), proc.stdout)
 
     def test_planned_hash_bind_r2_a5_chain_a_failing_label_log_write_keeps_the_result_the_exit_code_and_the_next_leg(self) -> None:
         """A5: the new label's log write could throw (a locked ChainLog) after LEG_FAILED was appended and skip exit 7, CHAIN_RESULT and the rest of the walk."""
         lock = ("function L([string]$Message) {\n    if ($Message -clike 'DVE_CHAIN_SPEC_*') { throw 'TEST FIXTURE: the chain log is locked' }\n")
         dv = self.mutated_runner([("Invoke-VenueChain.ps1", "function L([string]$Message) {\n", lock)])
-        target, source = dv / "legs" / self.SWAP_TARGET, dv / "legs" / self.SWAP_SOURCE
+        target, source = dv / "legs" / self.SWAP_FIRST, dv / "legs" / self.SWAP_SOURCE   # r3 (A7): the first entry, so a leg runs after the refusal
         fx = self.chain_fixture(dv, target, source)
         proc = self.run_fixture_chain(dv, fx, ["-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-NoSupplementary"])
         self.assertEqual(proc.returncode, 7, proc.stdout + proc.stderr)
         result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
-        row = next(r for r in result["legs"] if r["spec"].endswith(self.SWAP_TARGET))
+        row = next(r for r in result["legs"] if r["spec"].endswith(self.SWAP_FIRST))
         self.assertEqual((row["status"], row["outcome"], row.get("specRefusal")), ("LEG_FAILED", "INVALID", "DVE_CHAIN_SPEC_CHANGED"), row)
-        self.assertEqual(len(self.fixture_legs()), 2, "the next leg still ran")
+        self.assertEqual([l["leaf"] for l in self.fixture_legs()], [self.SWAP_FIRST, self.SWAP_TARGET], "the next leg still ran")
+        self.assertEqual(next(r for r in result["legs"] if r["spec"].endswith(self.SWAP_TARGET))["status"], "RAN", result["legs"])
         self.assertIn("DVE_CHAIN_SPEC_CHANGED", proc.stderr, "the label still reaches the operator when the log write fails")
+
+    # r3 (adversary pass 2 on 5ef85bc6, A1): the chain read its leg child's outcome, receipt and spec refusal back from <RunDir>\leg-<name>.out.txt, and its probes' verdicts
+    # from quiet-<name>-<phase>.out.txt. Two chains on one -RunDir (two venues) name a leg alike, so another chain's child could write that file between this child's exit
+    # and this parent's read. The fixture writes it there (the other chain's transcript) right after this child exits; the chain must classify from its OWN child's output.
+    LEG_FOREIGN_OUT = ("            $legCode = $LASTEXITCODE\n",
+                       "            $legCode = $LASTEXITCODE\n            if ($env:DVT_FOREIGN_LEG_OUT) { [IO.File]::Copy($env:DVT_FOREIGN_LEG_OUT, $out, $true) }   # TEST FIXTURE: the other chain's leg wrote this file\n")
+    QUIET_FOREIGN_OUT = ("    $code = $LASTEXITCODE\n",
+                         "    $code = $LASTEXITCODE\n    if ($env:DVT_FOREIGN_QUIET_OUT) { [IO.File]::Copy($env:DVT_FOREIGN_QUIET_OUT, $out, $true) }   # TEST FIXTURE: the other chain's probe wrote this file\n")
+
+    def test_planned_hash_bind_r3_a1_chain_classifies_each_leg_from_its_own_child_not_the_shared_rundir_file(self) -> None:
+        dv = self.mutated_runner([("Invoke-VenueChain.ps1", *self.LEG_FOREIGN_OUT)])
+        target, source = dv / "legs" / self.SWAP_FIRST, dv / "legs" / self.SWAP_SOURCE
+        planned = hashlib.sha256(target.read_bytes()).hexdigest()
+        foreign_receipt = self.tmp / "other-chain-receipt.json"
+        foreign_receipt.write_text('{"legId":"other-chain","venue":{"role":"acceptance"}}', encoding="utf-8")
+        foreign = self.tmp / "other-chain-leg.out.txt"
+        foreign.write_text(f"DVE_OUTCOME=PASS\nDVE_RECEIPT_PATH={foreign_receipt}\n", encoding="utf-8")
+        fx = self.chain_fixture(dv, target, source)
+        fx["env"]["DVT_FOREIGN_LEG_OUT"] = str(foreign)
+        proc = self.run_fixture_chain(dv, fx, ["-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-NoSupplementary"])
+        result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
+        refused = next(r for r in result["legs"] if r["spec"].endswith(self.SWAP_FIRST))
+        self.assertEqual((refused["status"], refused.get("specRefusal")), ("LEG_FAILED", "DVE_CHAIN_SPEC_CHANGED"),
+                         "this chain's refused leg was read from the other chain's transcript (old: no specRefusal)\n" + json.dumps(refused))
+        self.assertTrue(any(f"planned_sha256={planned}" in l and " DVE_CHAIN_SPEC_CHANGED " in l for l in proc.stdout.splitlines()), proc.stdout)
+        ran = next(r for r in result["legs"] if r["spec"].endswith(self.SWAP_TARGET))
+        self.assertEqual(ran["status"], "RAN", ran)
+        self.assertNotEqual(ran["receipt"], str(foreign_receipt), "the RAN leg took the other chain's receipt path")
+        self.assertEqual(json.loads(Path(ran["receipt"]).read_text(encoding="utf-8"))["legId"], "m16-1457-native-windowed-s1", ran)
+        self.assertEqual(proc.returncode, 7, proc.stdout + proc.stderr)
+
+    def test_planned_hash_bind_r3_a1_sibling_chain_reads_each_probe_verdict_from_its_own_child(self) -> None:
+        dv = self.mutated_runner([("Invoke-VenueChain.ps1", *self.QUIET_FOREIGN_OUT)])
+        foreign = self.tmp / "other-chain-quiet.out.txt"
+        foreign.write_text("COOLDOWN_UNMET mean=80.0% threshold=20% waitedSec=1\n", encoding="utf-8")
+        fx = self.chain_fixture(dv, None, None)
+        fx["env"]["DVT_FOREIGN_QUIET_OUT"] = str(foreign)
+        proc = self.run_fixture_chain(dv, fx, ["-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-NoSupplementary"])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
+        got = [(r["status"], r["verdict"], r["quietMean"], r["preClaimVerdict"], r["preClaimMean"]) for r in result["legs"]]
+        self.assertEqual(got, [("RAN", "QUIET", 5.0, "QUIET", 5.0)] * 2, "a probe verdict was read from the other chain's probe transcript (old: COOLDOWN_UNMET 80.0)")
+
+    def test_planned_hash_bind_r3_a6_a_refusal_record_on_the_leg_childs_stderr_only_classifies_nothing(self) -> None:
+        """A6: the merged *> transcript erased the stream, so a bare stderr line DVE_LEG_SPEC_UNREADABLE was labelled DVE_CHAIN_SPEC_UNREADABLE; only the child's STDOUT record classifies."""
+        dv = self.mutated_runner([])
+        fx = self.chain_fixture(dv, None, None)
+        fx["env"]["DVT_LEG_STDERR_REFUSAL"] = "1"
+        proc = self.run_fixture_chain(dv, fx, ["-LegSpec", str(dv / "legs" / self.SWAP_FIRST), "-Backend", "cuda", "-NoSupplementary"])
+        self.assertEqual(proc.returncode, 7, proc.stdout + proc.stderr)
+        result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
+        self.assertEqual([(r["status"], r.get("specRefusal")) for r in result["legs"]], [("LEG_FAILED", None)], result["legs"])
+        self.assertFalse([l for l in proc.stdout.splitlines() if "DVE_CHAIN_SPEC_" in l], proc.stdout)
+
+    def test_planned_hash_bind_r3_a8_a_planned_spec_deleted_or_cut_to_one_byte_before_its_leg_is_typed(self) -> None:
+        """A8: the fixture leg now mirrors the real one's read-then-hash-then-parse order, so these two rows test the chain against the real protocol."""
+        for mode, want in (("delete", "DVE_CHAIN_SPEC_UNREADABLE"), ("copy", "DVE_CHAIN_SPEC_CHANGED")):
+            with self.subTest(mode=mode):
+                self.make_harness()
+                dv = self.mutated_runner([])
+                target = dv / "legs" / self.SWAP_FIRST
+                one_byte = self.tmp / "one-byte.json"
+                one_byte.write_bytes(b"{")
+                fx = self.chain_fixture(dv, target, one_byte, mode=mode)
+                proc = self.run_fixture_chain(dv, fx, ["-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-NoSupplementary"])
+                self.assertEqual(proc.returncode, 7, proc.stdout + proc.stderr)
+                result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
+                rows = [(Path(r["spec"]).name, r["status"], r.get("specRefusal")) for r in result["legs"]]
+                self.assertEqual(rows, [(self.SWAP_FIRST, "LEG_FAILED", want), (self.SWAP_TARGET, "RAN", None)], proc.stdout + proc.stderr)
+
+    # r3 (adversary pass 2 on 5ef85bc6, A2): SpecBudgetSha256 / SpecShapeSha256 were @{} (case-insensitive keys). On a case-sensitive directory A.json and a.json are two
+    # files; the second read overwrote the first's digest and the per-entry check refused a spec nobody changed. The simulated form maps each EXACT path string to its own file
+    # at the batch's one spec-read seam (Read-SpecBytesWithin), as a case-sensitive directory would; the real form makes one, where the host lets it.
+    BATCH_CASE_READ_ANCHOR = "    $ms = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min(3600.0, $BoundSec)) * 1000.0)\n"
+    BATCH_CASE_READ = ("    if ($env:DVT_CASE_LEAF -and [string]::Equals([IO.Path]::GetFileName($Path), $env:DVT_CASE_LEAF, [StringComparison]::Ordinal)) { $Path = $env:DVT_CASE_BYTES }   # TEST FIXTURE: a case-sensitive directory\n"
+                       + BATCH_CASE_READ_ANCHOR)
+    BATCH_STOP_OWN = ("foreach ($pl in $plan) { \"DVT_PLANNED spec=$([IO.Path]::GetFileName([string]$pl.spec)) bound=$([string]$script:SpecBudgetSha256[[string]$pl.spec]) own=$([string]$pl.specSha256)\" }; exit 0   # TEST FIXTURE\n"
+                      + BATCH_STOP_ANCHOR)
+
+    def run_case_batch(self, dv: Path, specs: list[Path], env: dict) -> subprocess.CompletedProcess:
+        from datetime import datetime, timedelta, timezone
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fake = self.tmp / "batch-fake-script.ps1"
+        fake.write_text("exit 0\n", encoding="utf-8")
+        legspec = ["-LegSpec", ",".join("'" + str(s).replace("'", "''") + "'" for s in specs)]
+        cmd = (f"& '{dv / 'Invoke-VenueLeaseBatch.ps1'}' -Venue bachelor -LegSpec {legspec[1]} -Backend cuda -RunDir '{self.tmp / 'batch-run'}' -SourceCommit {self.sha} "
+               f"-BuildManifestSha256 {self.build_sha} -UmRunScript '{self.um}' -QuietScript '{fake}' -LegScript '{fake}' -ClaimDir '{self.tmp / 'claims'}' "
+               f"-AgentShare '{self.share}' -DeadlineUtc {deadline}; exit $LASTEXITCODE")
+        return run_pwsh(["-Command", cmd], env_extra=env, timeout=420)
+
+    def test_planned_hash_bind_r3_a2_batch_two_specs_whose_paths_differ_only_in_case_are_two_entries_each_bound_to_its_own_bytes(self) -> None:
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.BATCH_CASE_READ_ANCHOR, self.BATCH_CASE_READ),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_STOP_ANCHOR, self.BATCH_STOP_OWN)])
+        case_dir = self.tmp / "case"
+        case_dir.mkdir()
+        upper = case_dir / "A.json"   # the one file on this (case-insensitive) volume; the map serves a.json's own bytes, as a case-sensitive directory holds them
+        shutil.copyfile(dv / "legs" / self.SWAP_FIRST, upper)
+        lower_bytes = case_dir.parent / "lower-bytes.json"
+        shutil.copyfile(dv / "legs" / self.SWAP_TARGET, lower_bytes)
+        lower = case_dir / "a.json"
+        fsha, wsha = hashlib.sha256(upper.read_bytes()).hexdigest(), hashlib.sha256(lower_bytes.read_bytes()).hexdigest()
+        proc = self.run_case_batch(dv, [upper, lower], {"DVT_CASE_LEAF": "a.json", "DVT_CASE_BYTES": str(lower_bytes)})
+        self.assertEqual(proc.returncode, 0, "two distinct files were refused as one changed spec (old: SPEC_CHANGED_AFTER_PREFLIGHT)\n" + proc.stdout + proc.stderr)
+        bound = [l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ")]
+        self.assertEqual(bound, [f"DVT_PLANNED spec=A.json bound={fsha} own={fsha}", f"DVT_PLANNED spec=a.json bound={wsha} own={wsha}"], proc.stdout + proc.stderr)
+
+    def test_planned_hash_bind_r3_a2_batch_real_case_sensitive_directory(self) -> None:
+        """The adversary's literal input on a real case-sensitive directory (fsutil setCaseSensitiveInfo needs admin or developer mode: skipped where the host refuses it)."""
+        case_dir = self.tmp / "case-real"
+        case_dir.mkdir()
+        fs = subprocess.run(["fsutil", "file", "setCaseSensitiveInfo", str(case_dir), "enable"], capture_output=True, text=True)
+        probe = case_dir / "x.txt"
+        probe.write_text("1", encoding="utf-8")
+        if fs.returncode != 0 or (case_dir / "X.txt").exists():
+            self.skipTest(f"this host cannot make a case-sensitive directory: {(fs.stdout + fs.stderr).strip()}")
+        probe.unlink()
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.BATCH_STOP_ANCHOR, self.BATCH_STOP_OWN)])
+        upper, lower = case_dir / "A.json", case_dir / "a.json"
+        shutil.copyfile(dv / "legs" / self.SWAP_FIRST, upper)
+        shutil.copyfile(dv / "legs" / self.SWAP_TARGET, lower)
+        fsha, wsha = hashlib.sha256(upper.read_bytes()).hexdigest(), hashlib.sha256(lower.read_bytes()).hexdigest()
+        self.assertNotEqual(fsha, wsha)
+        proc = self.run_case_batch(dv, [upper, lower], {})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        bound = [l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ")]
+        self.assertEqual(bound, [f"DVT_PLANNED spec=A.json bound={fsha} own={fsha}", f"DVT_PLANNED spec=a.json bound={wsha} own={wsha}"], proc.stdout + proc.stderr)
 
 
 # ---------------------------------------------------------------------------------------------------

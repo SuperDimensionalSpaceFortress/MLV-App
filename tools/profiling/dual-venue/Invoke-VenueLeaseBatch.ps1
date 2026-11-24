@@ -300,8 +300,10 @@ $script:ExportBudgetPreflightReserveSec = 2
 $script:ExportBudgetPreflightCleanupMs = 1500   # (adversary r11 A6: the one budget the killed child's kill wait and stream waits share, taken out of the room before the bound is set)
 # r19 (sol r18 B1): the sha256 of the leg spec bytes the export-budget preflight judged, by spec path (Get-ExportBudgetRefusal records it). Every later read of that spec before a
 # lease or a leg is compared with it (Get-InputContentRefusal, and the leg itself through -ExpectSpecSha256), so a lease is never spent on bytes the budget did not judge.
-$script:SpecBudgetSha256 = @{}
-$script:SpecShapeSha256 = @{}   # (and of the bytes the preflight's shape check judged, which the budget's read must equal)
+# DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r3 (adversary pass 2 A2): ORDINAL keys. A PowerShell @{} folds case, so on a case-sensitive directory two distinct files A.json and
+# a.json shared one digest and the second read overwrote the first's (a false SPEC_CHANGED_AFTER_PREFLIGHT before the claim, and the guard and child bound to the other file's bytes).
+$script:SpecBudgetSha256 = [Collections.Hashtable]::new([StringComparer]::Ordinal)
+$script:SpecShapeSha256 = [Collections.Hashtable]::new([StringComparer]::Ordinal)   # (and of the bytes the preflight's shape check judged, which the budget's read must equal)
 foreach ($s in @($StagedBuildProbeScript, $ArtifactProbeScript) | Where-Object { $_ }) { if (-not (Test-Path -LiteralPath $s -PathType Leaf)) { Stop-Usage "no script at '$s'" } }
 $stagedBuildProbe = $(if ($StagedBuildProbeScript) { [scriptblock]::Create([IO.File]::ReadAllText($StagedBuildProbeScript)) } else { $null })
 $artifactProbe = $(if ($ArtifactProbeScript) { [scriptblock]::Create([IO.File]::ReadAllText($ArtifactProbeScript)) } else { $null })
@@ -1740,7 +1742,7 @@ foreach ($leg in $plan) {
 # r11 (sol r10 blocker 3): the validated inputs, kept for the re-check once the claim is held (Get-InputOutputRefusal). A -LegSet's specs are inputs too, so they are checked now as well.
 $script:guardedInputs = [System.Collections.Generic.List[object]]::new()
 if ($legPlanMode) { $script:guardedInputs.Add([pscustomobject]@{ path = $planPath; kind = 'plan'; item = 0 }) }
-foreach ($p in $plan) { $script:guardedInputs.Add([pscustomobject]@{ path = $p.spec; kind = 'spec'; item = $(if ($legPlanMode) { $p.planItem } else { 0 }); backend = $p.backend; specSha256 = [string]$script:SpecBudgetSha256[[string]$p.spec] }) }   # r19 (sol r18 B1): the judged bytes' sha256
+foreach ($p in $plan) { $script:guardedInputs.Add([pscustomobject]@{ path = $p.spec; kind = 'spec'; item = $(if ($legPlanMode) { $p.planItem } else { 0 }); backend = $p.backend; specSha256 = [string]$p.specSha256 }) }   # r19 (sol r18 B1): the judged bytes' sha256; r3 (A2 class): THIS entry's own, never a path-keyed lookup
 # r12 (adversary r12 A1): and each staged build manifest the plan reads (-LegPlan only; the scalar form's one build is read inside the leg job, after the lease)
 if ($legPlanMode) { foreach ($b in $builds.GetEnumerator()) { $first = @($items | Where-Object { [string]::Equals([string]$_.sourceCommit, [string]$b.Key, [StringComparison]::Ordinal) })[0]; $script:guardedInputs.Add([pscustomobject]@{ path = $b.Value.path; kind = 'build'; item = $first.item; commit = $b.Key; sha256 = $first.buildManifestSha256 }) } }
 # r6 pass 3 (adversary r6 pass 2 A1): each input's physical path and file identity as accepted (the preflight guard just resolved it), for Get-WriteDestinationHit
@@ -2899,7 +2901,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $lArgs = @('-NoProfile', '-NonInteractive', '-File', $LegScript, '-Venue', $Venue, '-LegSpec', $leg.spec, '-SourceCommit', $leg.sourceCommit, '-BuildManifestSha256', $leg.buildManifestSha256, '-LeaseBatch', $token)
                 if ($leg.backend) { $lArgs += @('-Backend', $leg.backend) }
                 # r19 (sol r18 B1): the leg itself compares the bytes IT reads with the ones the export-budget preflight judged, and refuses before anything is generated or submitted
-                if ($script:SpecBudgetSha256[[string]$leg.spec]) { $lArgs += @('-ExpectSpecSha256', [string]$script:SpecBudgetSha256[[string]$leg.spec]) }
+                # r3 (adversary pass 2 A2 class): THIS entry's own judged sha256 (every form carries it, and the plan check above proved it is the one its path was bound to)
+                if ($leg.specSha256) { $lArgs += @('-ExpectSpecSha256', [string]$leg.specSha256) }
                 if ($SheetCopyDir) { $lArgs += @('-SheetCopyDir', $SheetCopyDir) }
                 if ($ReceiptRoot) { $lArgs += @('-ReceiptRoot', $ReceiptRoot) }   # LEASE-BATCH-RECEIPT-ROOT-1: the one leg call site, so an in-lease retry forwards it too; empty adds no argument
                 L "LEG $($leg.name) RUN batch=$batchNo lease=$($b.leaseId) quietMean=$(Format-Mean $q.mean) roomSec=$room legBudgetSec=$legBudget spec=$($leg.spec) backend=$(if ($leg.backend) { $leg.backend } else { 'spec' })$(if ($legPlanMode) { " arm=$($leg.arm) sourceCommit=$($leg.sourceCommit) buildManifestSha256=$($leg.buildManifestSha256)" })"
