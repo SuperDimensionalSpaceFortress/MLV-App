@@ -3172,7 +3172,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
         //An idle poll tick between two draws is normal while playing (8 ms poll, ~42 ms frame
         //period at 24 fps): only paused or stalled playback zeroes the fps meter.
         resetFpsMeterIfIdle( nowTime );
-        lastTime.start(); //do that for calculation of timeDiff for DropFrameMode;
+        lastTime = nowTime; //do that for calculation of timeDiff for DropFrameMode (the tick's own stamp: ages telescope);
 
     }
 }

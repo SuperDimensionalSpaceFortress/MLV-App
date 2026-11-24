@@ -2900,7 +2900,17 @@
       "clock": "other",
       "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 (adversary r2 A1) frameBoundedTickTimeDiffMs: keeps the sign of an over-long tick while cutting its magnitude to the frame bound. A sign select on the drop-frame request; never a run-proof.",
       "lines": [
-        87
+        93
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackFpsMeterPolicy.h",
+      "anchor": "const long long tickMagnitude = timeDiffMs > 0 ? static_cast < long long > ( timeDiffMs ) : - static_cast < long long > ( timeDiffMs ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r4 iteration 2 (adversary pass 7 A1) frameBoundedTickTimeDiffMs: the tick's magnitude in 64 bits (so INT_MIN negates safely), the ceiling the step-up to the largest accepted age never passes. An absolute-value select on the drop-frame request; never a run-proof.",
+      "lines": [
+        90
       ]
     },
     {

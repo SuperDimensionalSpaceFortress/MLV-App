@@ -84,6 +84,12 @@ inline int frameBoundedTickTimeDiffMs( int timeDiffMs, double framerate )
     int magnitude = boundedMs >= static_cast<double>( kMaxStampAgeMs )
         ? kMaxStampAgeMs : static_cast<int>( boundedMs );
     while( magnitude > 0 && framerate * static_cast<double>( magnitude ) / 1000.0 > kMaxTickFrames ) --magnitude;
+    // r4 iteration 2 (pass 7 A1 on 7a0f5a1c): the reciprocal can also round DOWN (27777500/1771 fps kept 63755 ms where the
+    // call site's expression accepts 63756 ms), so step up to the LARGEST whole millisecond that expression accepts, never
+    // past the tick's own magnitude or one day.
+    const long long tickMagnitude = timeDiffMs > 0 ? static_cast<long long>( timeDiffMs ) : -static_cast<long long>( timeDiffMs );
+    while( magnitude < kMaxStampAgeMs && static_cast<long long>( magnitude ) < tickMagnitude
+        && framerate * static_cast<double>( magnitude + 1 ) / 1000.0 <= kMaxTickFrames ) ++magnitude;
     return timeDiffMs > 0 ? magnitude : -magnitude;
 }
 

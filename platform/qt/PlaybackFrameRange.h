@@ -319,12 +319,16 @@ inline DropFrameTickResult advanceDropFrameTick(
             // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r4 (adversary pass 5 A1 on b70f718d): at most kMaxLoopLapsPerTick laps from ANY
             // start. MainWindow records every lap (PlaybackWrapRecorder::noteEngineWrap, one append each), and the frame bound on the
             // request (playback_fps_meter::kMaxTickFrames) cannot see a stale start: the normalizer clamps a stale position to the
-            // clip, not the cut, so 20 on cut 1..2 plus 999,990 frames made 1,000,010 laps. A tick that would wrap more lands on
-            // the cut's first frame after exactly that many laps (the rest is dropped, as a skipped backlog is); every tick of up
-            // to that many laps is unchanged, bit for bit. An infinite delta lands there too.
+            // clip, not the cut, so 20 on cut 1..2 plus 999,990 frames made 1,000,010 laps. Only the DELTA is cut (iteration 2,
+            // pass 7 A2 on 7a0f5a1c: cutting the position made a negative advance from a far stale start): a tick that would wrap
+            // more stops at the last position of the 1e6th lap (the rest of the delta is dropped, as a skipped backlog is), so
+            // position - before + wrapWidth * wrapLaps is still the advance it made. A start already past the limit keeps the base
+            // arithmetic (its laps are the stale start's own on any tick: PLAYBACK-WRAP-RECORDER-RUNLENGTH-1). Every tick of up to
+            // that many laps is unchanged, bit for bit. An infinite delta stops there too.
             constexpr double kMaxLoopLapsPerTick = 1000000.0;
-            if( result.position >= wrapAt + kMaxLoopLapsPerTick * width )
-                result.position = wrapAt + ( kMaxLoopLapsPerTick - 1.0 ) * width;
+            const double lapLimit = wrapAt + kMaxLoopLapsPerTick * width;   // laps <= kMaxLoopLapsPerTick iff position < lapLimit
+            if( result.position >= lapLimit && currentPosition < lapLimit )
+                result.position = std::max( currentPosition, lapLimit - width );
             laps = std::floor( ( result.position - wrapAt ) / width ) + 1.0;
             laps = std::min( std::max( laps, 1.0 ), static_cast<double>( std::numeric_limits<int>::max() - 1 ) );
             // the division's rounding: never one lap too many, never one too few
