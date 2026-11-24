@@ -670,7 +670,7 @@ function Find-DvCommittedLegSpec {
         # <mode> SP <type> SP <object> TAB <path>
         if ($row -cnotmatch '^[0-7]{6} blob (?<id>[0-9a-f]{40})\t(?<path>.+)$') { continue }
         $id = $Matches['id']; $path = $Matches['path'].Trim()
-        if (-not $path.EndsWith('.json')) { continue }
+        if (-not $path.EndsWith('.json', [StringComparison]::Ordinal)) { continue }   # (r11, adversary r11 A1 sibling: ordinal, so no ignorable code point passes as `.json`)
         # A blob id names its bytes for good, so a blob read once is not read again by the next lookup of this process: every lookup used to
         # re-read every blob of the directory (two git spawns each), which made finding all N shipped legs quadratic in N.
         # Keyed by repo AND blob id (CoS N1): a hit must not skip Get-DvBlobById's "a blob of this repository" check for a second repo
@@ -2735,6 +2735,36 @@ function Get-DvLookAssistEvidence {
 $script:LegSetSchema = 'mlv-app/dual-venue-legset/v1'
 $script:LegSetsRelativeDir = 'tools/profiling/dual-venue/legsets'
 
+function Test-DvVisualTwinName {
+    <#
+    .SYNOPSIS
+    M16-1457-VENUE-BASELINE-DRIFT-1 r6 (sol r5 B1, luna r5 B1): is this leg id or spec file name a VISUAL TWIN (its id carries the word `visual` between hyphens)? A twin is the
+    capture-on copy of a speed arm: its fps is observer-perturbed (the capture tail keeps playing unpaced past the measured window), so it is never a measured matrix speed cell.
+    Judged on the RESOLVED spec's own identity (its legId and its file leaf), never on the spelling of the reference that reached it, and case-folded (Windows resolves
+    `LEGS\X.JSON` to the file `legs/x.json`).
+    #>
+    param([AllowNull()][AllowEmptyString()]$Name)
+    # r10 (adversary r10 A1): an ORDINAL case-insensitive comparison, never the current culture's case folding (under tr-TR `-match '(?i)'` folds `I` to a dotless i, so `VISUAL` was missed)
+    ([string]$Name).IndexOf('-visual-', [StringComparison]::OrdinalIgnoreCase) -ge 0
+}
+
+function Test-DvPathHasLinkBelow {
+    <#
+    .SYNOPSIS
+    r10 (adversary r10 A2): is the file at $Path, or any directory between it and $Root, $Root ITSELF included (adversary r10 pass 2 A1: a legs/ that is a junction), a link (a reparse
+    point: a symlink or a junction)? A link's own leaf says nothing about the file it reads, so a twin-named target behind a neutral link name would pass a leaf check. Committed leg specs
+    and legs/ are plain files and a plain directory.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Root)
+    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $p = [IO.Path]::GetFullPath($Path)
+    while ($p -and $p.Length -ge $rootFull.Length) {
+        if (([IO.File]::GetAttributes($p) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
+        $p = [IO.Path]::GetDirectoryName($p)
+    }
+    $false
+}
+
 function Get-DvLegSetPlan {
     <#
     .SYNOPSIS
@@ -2763,12 +2793,40 @@ function Get-DvLegSetPlan {
     foreach ($ref in $legRefs) {
         $full = [IO.Path]::GetFullPath((Join-Path $dvDir ([string]$ref)))
         # a leg named by a set is always one of the committed specs under legs/ (production finds the spec a receipt names ONLY there)
-        if (-not $full.StartsWith($legsDir, [StringComparison]::OrdinalIgnoreCase) -or -not $full.EndsWith('.json') -or -not (Test-Path -LiteralPath $full -PathType Leaf)) {
+        # (r11, adversary r11 A1: the suffix test is ORDINAL; the culture-aware EndsWith ignored a soft hyphen, so `x.jso<U+00AD>n` passed it as `.json`)
+        if (-not $full.StartsWith($legsDir, [StringComparison]::OrdinalIgnoreCase) -or -not $full.EndsWith('.json', [StringComparison]::Ordinal) -or -not (Test-Path -LiteralPath $full -PathType Leaf)) {
             throw "DVE_LEGSET_INVALID '$ref' is not a leg spec under legs/"
         }
-        $spec = [IO.File]::ReadAllText($full) | ConvertFrom-Json
+        # r10 (adversary r10 A2): a link that is already in place (the spec, or a directory on its way under legs/, legs/ itself included) is refused early, with its own message.
+        # r11: this walk is an early refusal only, NOT the identity judgment: a link swapped in after it, or a hard link (no reparse bit), passes it. The judgment is made below,
+        # from the bytes that were read.
+        if (Test-DvPathHasLinkBelow -Path $full -Root $legsDir) { throw "DVE_LEGSET_INVALID '$ref' is a link (symlink or junction); a leg named by a set is a committed spec file under legs/" }
+        # r7 (sol r6 INV-3): ONE read of the file's bytes serves both the judgment below and the plan entry's specSha256 (RAW sha256, no line-ending normalisation: the hash
+        # Invoke-VenueLeg's -ExpectSpecSha256 takes), so the child that runs this entry is bound to the exact bytes the planner approved
+        # (decoded exactly as File.ReadAllText does, BOM-detected, so a spec the base planner could read is still readable: adversary r7 A5)
+        # r11 (adversary r10 pass 3 A1, A2; hub ruling 20261123T2147Z): every identity judged here (legId, twin, the name the set reached, planned hash) comes from THESE bytes.
+        # r10's second link walk after this read is gone: a path probe cannot say what was read, and a link flipped in and out between two probes passed both.
+        $specBytes = [IO.File]::ReadAllBytes($full)
+        $specSha256 = Get-DvSha256OfBytes $specBytes
+        $specReader = [IO.StreamReader]::new([IO.MemoryStream]::new($specBytes), [Text.Encoding]::UTF8, $true)
+        try { $specText = $specReader.ReadToEnd() } finally { $specReader.Dispose() }
+        $spec = $specText | ConvertFrom-Json
         if ([string]$spec.clipId -cne $clipId -or [string]$spec.card -cne $card) { throw "DVE_LEGSET_INVALID leg '$($spec.legId)' does not name the set's clip and card" }
-        $specs.Add([pscustomobject]@{ path = $full; spec = $spec })
+        # r6: refused by the RESOLVED spec (its legId and its file leaf), so no spelling of the reference gets a visual twin into a speed-cell matrix
+        if ((Test-DvVisualTwinName $spec.legId) -or (Test-DvVisualTwinName ([IO.Path]::GetFileName($full)))) {
+            throw "DVE_LEGSET_INVALID leg '$($spec.legId)' is a visual twin: its fps is capture-perturbed and is never a measured matrix speed cell"
+        }
+        # r11 (adversary r10 pass 3 A1, A2): the name the set reached is bound to the bytes read. Every committed spec under legs/ is named <legId>.json (pinned by
+        # test_every_committed_leg_spec_is_named_by_its_leg_id), so a file reached under any other name (a hard link, a renamed copy, or a link flipped in after the walk above)
+        # is refused. That holds whatever its bytes say and whenever the flip lands. The comparison ignores case (Windows resolves LEGS\X.JSON to legs/x.json) and is ordinal,
+        # never by culture. The child is pinned to $specSha256, so the bytes it runs are the bytes judged here.
+        # (r11, adversary r11 A1: the WHOLE leaf is compared with "<legId>.json", never a stem GetFileNameWithoutExtension cut, which dropped a look-alike suffix; and the legId
+        # must be the schema's ASCII leg-id grammar (leg-spec.schema.json), so an ordinal case-insensitive match of the two is an ASCII-only match)
+        $specLegId = [string]$spec.legId
+        if ($specLegId -cnotmatch '^[a-z0-9][a-z0-9-]{1,62}$' -or -not [string]::Equals([IO.Path]::GetFileName($full), "$specLegId.json", [StringComparison]::OrdinalIgnoreCase)) {
+            throw "DVE_LEGSET_INVALID '$ref' read as legId '$($spec.legId)': a committed leg spec is named <legId>.json, so a spec reached under another name (an alias, a hard link, a link swapped in) is refused"
+        }
+        $specs.Add([pscustomobject]@{ path = $full; spec = $spec; sha256 = $specSha256 })
     }
     $backends = [System.Collections.Generic.List[string]]::new()
     foreach ($s in $specs) { foreach ($b in @($s.spec.backends)) { if ($b -notin $backends) { $backends.Add([string]$b) } } }
@@ -2782,7 +2840,7 @@ function Get-DvLegSetPlan {
             $cellId = $(if ([string](Get-DvProp $s.spec 'legType') -ceq 'export') { "$b-export-$([string]$s.spec.export.format)" } else { "$b-$mode-s$([int]$s.spec.scaleFactor)" })
             if ($seen.ContainsKey($cellId)) { throw "DVE_LEGSET_INVALID two legs of the set make the cell $cellId" }
             $seen[$cellId] = $true
-            $cells.Add([pscustomobject]@{ cellId = $cellId; legId = [string]$s.spec.legId; specPath = $s.path; backend = $b; displayMode = $mode; scaleFactor = [int]$s.spec.scaleFactor })
+            $cells.Add([pscustomobject]@{ cellId = $cellId; legId = [string]$s.spec.legId; specPath = $s.path; specSha256 = $s.sha256; backend = $b; displayMode = $mode; scaleFactor = [int]$s.spec.scaleFactor })
         }
     }
     $cellList = @($cells | Where-Object { [string]::IsNullOrEmpty($Backend) -or $_.backend -ceq $Backend })
@@ -2793,7 +2851,7 @@ function Get-DvLegSetPlan {
         $walk = $(if ($r % 2 -eq 1) { $cellList } else { @($cellList[($cellList.Count - 1)..0]) })
         foreach ($c in $walk) {
             $seq++
-            $plan.Add([pscustomobject]@{ seq = $seq; repeat = $r; cellId = $c.cellId; legId = $c.legId; specPath = $c.specPath; backend = $c.backend; displayMode = $c.displayMode; scaleFactor = $c.scaleFactor })
+            $plan.Add([pscustomobject]@{ seq = $seq; repeat = $r; cellId = $c.cellId; legId = $c.legId; specPath = $c.specPath; specSha256 = $c.specSha256; backend = $c.backend; displayMode = $c.displayMode; scaleFactor = $c.scaleFactor })
         }
     }
     [pscustomobject]@{ legSet = $setName; card = $card; clipId = $clipId; repeats = $Repeats; cells = @($cellList); plan = @($plan) }
@@ -3103,6 +3161,12 @@ function Get-DvMatrixRow {
     }
     if ($null -eq $Receipt) { $row.note = 'the leg wrote no receipt'; return [pscustomobject]$row }
     $row.outcome = [string](Get-DvProp $Receipt 'outcome'); $row.receiptId = [string](Get-DvProp $Receipt 'receiptId')
+    # r6 (sol r5 B1): a visual twin's rates are never read, whichever path its plan entry or receipt came through (the entry's leg id and the receipt's leg id both count)
+    # (r10, adversary r10 A2 sibling: the plan entry's spec file leaf counts too, as it does in the planner)
+    $entrySpecLeaf = $(if ([string](Get-DvProp $PlanEntry 'specPath')) { [IO.Path]::GetFileName([string](Get-DvProp $PlanEntry 'specPath')) } else { '' })
+    if ((Test-DvVisualTwinName (Get-DvProp $PlanEntry 'legId')) -or (Test-DvVisualTwinName (Get-DvProp $Receipt 'legId')) -or (Test-DvVisualTwinName $entrySpecLeaf)) {
+        $row.note = 'a visual twin (capture-perturbed fps) is never a measured speed cell'; return [pscustomobject]$row
+    }
     $display = Get-DvProp $Receipt 'display'
     if ($null -ne $display) {
         $row.observedDisplay = [string](Get-DvProp $display 'observedMode')
@@ -3123,6 +3187,22 @@ function Get-DvMatrixRow {
     $rates = Get-DvMatrixRates -LogText ([Text.Encoding]::UTF8.GetString($bytes))
     foreach ($k in $rates.Keys) { $row[$k] = $rates[$k] }
     [pscustomobject]$row
+}
+
+function Test-DvMatrixRowMeasured {
+    <#
+    .SYNOPSIS
+    M16-1457-VENUE-BASELINE-DRIFT-1 r7 (sol r6 INV-2): is this matrix row a MEASUREMENT? Only a PASS or FAIL row that carries a presented-fps value is (the reader leaves the rates null for a
+    visual twin, a missing or swapped run log and every non-measurement outcome). The ONE predicate the table's `measured / ran` column and the summary header's `N measured` both use.
+    #>
+    param([Parameter(Mandatory)]$Row)
+    ($Row.outcome -cin @('PASS', 'FAIL')) -and ($null -ne $Row.presentedFps)
+}
+
+function Get-DvMatrixMeasuredCount {
+    # How many of these matrix rows are measurements (Test-DvMatrixRowMeasured): the summary header's count, equal to the sum of the table's per-cell numerators.
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Rows)
+    @($Rows | Where-Object { Test-DvMatrixRowMeasured -Row $_ }).Count
 }
 
 function Get-DvMedian {
@@ -3148,7 +3228,10 @@ function ConvertTo-DvMatrixTable {
     $lines.Add('|---|---|---|---|---|---|---|---|---|---|---|')
     foreach ($c in $Cells) {
         $mine = @($Rows | Where-Object { $_.cellId -ceq $c.cellId })
-        $meas = @($mine | Where-Object { $_.outcome -cin @('PASS', 'FAIL') -and $null -ne $_.presentedFps })
+        $meas = @($mine | Where-Object { Test-DvMatrixRowMeasured -Row $_ })
+        # r7 (adversary r7 A3): a repeat the runner refused because its spec bytes changed after planning (row outcome SPEC_CHANGED) never ran: it is listed in `outcomes`, not counted in `ran`
+        # r10 (sol r9 item 1): SPEC_UNREADABLE (the planned spec could not be read at launch) is the same prelaunch refusal and is left out of `ran` the same way
+        $ranCount = @($mine | Where-Object { @('SPEC_CHANGED', 'SPEC_UNREADABLE') -cnotcontains [string]$_.outcome }).Count
         $pf = @($meas | ForEach-Object { $_.presentedFps })
         $range = $(if ($pf.Count -gt 0) { '(' + (& $f ($pf | Measure-Object -Minimum).Minimum 2) + '-' + (& $f ($pf | Measure-Object -Maximum).Maximum 2) + ')' } else { '' })
         $presented = ((& $f (Get-DvMedian $pf) 2) + ' ' + $range).Trim()
@@ -3157,7 +3240,7 @@ function ConvertTo-DvMatrixTable {
         $eff = @($mine | ForEach-Object { "$(Get-DvScaleLabel -Factor $c.scaleFactor)->$(Get-DvScaleLabel -Factor $_.effectiveScale)" } | Sort-Object -Unique) -join ','
         $win = @($mine | Where-Object { $_.windowSize } | ForEach-Object { if ($_.previewSize) { "$($_.windowSize) ($($_.previewSize))" } else { $_.windowSize } } | Sort-Object -Unique) -join ', '
         $outcomes = @($mine | ForEach-Object { $_.outcome } | Group-Object | Sort-Object Name | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', '
-        $lines.Add("| $($c.cellId) | $($c.backend) | $($c.displayMode) / $(if ($observed) { $observed } else { '-' }) | $eff | $(if ($win) { $win } else { '-' }) | $($meas.Count)/$($mine.Count) | $presented | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.timelineFpsAfterFirstPresent })) 2) | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.renderWorkMs })) 1) | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.dualIsoMs })) 1) | $(if ($outcomes) { $outcomes } else { '-' }) |")
+        $lines.Add("| $($c.cellId) | $($c.backend) | $($c.displayMode) / $(if ($observed) { $observed } else { '-' }) | $eff | $(if ($win) { $win } else { '-' }) | $($meas.Count)/$ranCount | $presented | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.timelineFpsAfterFirstPresent })) 2) | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.renderWorkMs })) 1) | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.dualIsoMs })) 1) | $(if ($outcomes) { $outcomes } else { '-' }) |")
     }
     $lines -join "`n"
 }
@@ -6836,6 +6919,6 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Test-DvMatrixRowMeasured, Get-DvMatrixMeasuredCount, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt
