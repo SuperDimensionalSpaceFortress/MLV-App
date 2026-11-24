@@ -285,6 +285,23 @@ inline bool rateWithdrawalRepaintsNow( bool playing, bool labelStallEntered )
     return !playing || labelStallEntered;
 }
 
+/*! \brief INFO-2 r8 (sol r7 LABEL-STALL on 37257de5, the CPU viewport): the paint a corner-label change queues on the CPU viewport
+ *  (GraphicsZoomView::setLookLabel). `repaintNow` is pushLookLabelOverlay's one decision, the same the GPU window's setter honours
+ *  (stopped, a withdrawal that hides the label, rateWithdrawalRepaintsNow, a label stall); r7 passed it to the GPU window only, so a
+ *  CPU fullscreen Play at a 1 fps target still queued a label-rect paint at the meter's 512 ms reset, ~1 s before the deadline.
+ *  `framePaintPending` = a handed-over frame still waits for its paint (pending != painted serial): that paint is already queued
+ *  and credits the frame as on screen (r28), so the change widens it to the whole viewport and adds no paint of its own. Otherwise a
+ *  declined repaint queues NOTHING: the text is stored, the change is owed, and it rides on the next frame's hand-over (the whole
+ *  viewport, as r28 requires) or on the paint debt (settleLookLabelPaintIfOwed). A repaint now covers the old and new label rects
+ *  (`labelRectsEmpty`: no rect known, the whole viewport). */
+enum class CpuLabelPaint { None, LabelRects, WholeViewport };
+inline CpuLabelPaint cpuLabelPaint( bool repaintNow, bool framePaintPending, bool labelRectsEmpty )
+{
+    if( framePaintPending ) return CpuLabelPaint::WholeViewport;
+    if( !repaintNow ) return CpuLabelPaint::None;
+    return labelRectsEmpty ? CpuLabelPaint::WholeViewport : CpuLabelPaint::LabelRects;
+}
+
 /*! \brief INFO-2 r7 (adversary pass 10 A3 on 71d28ec9): the expected period a stored label's paint debt waits for: the larger of
  *  the period read now and the floor its store recorded. The fps meter's reset stores the withdrawn text AFTER it zeroed the EMA,
  *  so the period read at settle time fell from the measured one (a 24 fps target playing at 2.2 fps: 450 ms, deadline 675 ms) to

@@ -34797,13 +34797,14 @@ void MainWindow::pushLookLabelOverlay( void )
     // tick) makes it when no frame was presented within kLabelPaintOwedMs of this store, whatever the stall history: the deferred
     // change is visible within the gate plus a few ticks even when the first frame of a Play is late. A repaint now settles the debt.
     m_lookLabelPaintOwedExpectedFloorMs = 0;   // INFO-2 r7 (pass 10 A3): no floor unless the fps meter's reset made this store
-    if( repaintNow || !gpuWindow ) m_lookLabelPaintOwedClock.invalidate();
+    // INFO-2 r8 (sol r7 LABEL-STALL): the CPU viewport honours the same decision and stores a declined change, so it is owed too.
+    if( repaintNow ) m_lookLabelPaintOwedClock.invalidate();
     else
     {
         m_lookLabelPaintOwedClock.start();
         m_lookLabelPaintOwedPresentedCount = m_playbackPresentedFrameCount;
     }
-    ui->graphicsView->setLookLabel( gpuWindow ? QString() : m_lookLabelOverlayText );
+    ui->graphicsView->setLookLabel( gpuWindow ? QString() : m_lookLabelOverlayText, repaintNow );
 }
 
 // INFO-2 r1 (adversary pass 21 A1 on deebf5bb): the debayer name the label shows, the one reader for the label's facts and for
@@ -35036,6 +35037,8 @@ void MainWindow::settleLookLabelPaintIfOwed( void )
     {
         m_lookLabelPaintOwedClock.invalidate();
         GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, true );
+        // INFO-2 r8: the CPU viewport's owed change (the same text it stored; it paints only while one is owed)
+        ui->graphicsView->setLookLabel( GpuDisplayWindow::isActive() ? QString() : m_lookLabelOverlayText, true );
     }
 }
 

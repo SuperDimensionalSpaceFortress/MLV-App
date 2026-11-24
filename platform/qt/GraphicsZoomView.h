@@ -33,7 +33,10 @@ public:
     void setCrossCursorActive(bool on);
     // LOOK-FULLSCREEN-PARITY-1: the "current look" label in the viewport's bottom-right corner
     // (empty = none). Rasterised once per change of text or size, blitted in drawForeground().
-    void setLookLabel(const QString &text);
+    // INFO-2 r8 (sol r7 LABEL-STALL): `repaintNow` is pushLookLabelOverlay's decision, the one the GPU window's setter honours;
+    // false stores the text with no paint of its own (playback_info_label::cpuLabelPaint), owed to the next frame's hand-over or
+    // to the paint debt, which repaints an owed change with the same text and `repaintNow` true.
+    void setLookLabel(const QString &text, bool repaintNow);
     // The label text the most recent viewport paint drew ("" when it drew none).
     QString lookLabelDrawnText(void) const { return m_lookLabelDrawnText; }
     // LOOK-LABEL-PLAYBACK-INFO-1 r21 (adversary pass 20 A1): blits the cached label in the viewport's corner with `painter` (viewport
@@ -53,7 +56,8 @@ public:
     // present notes the request serial it handed the pixmap item; the next viewport paint draws it. Whether a frame with that serial
     // (or a later one) was handed over and not yet painted. r30 fix iteration 1 (adversary A2 on fad36acf): any other pixmap (the
     // clip-open placeholder) is noted as serial 0, so its paint never copies the frame it replaced.
-    void notePixmapPresentSerial(quint64 serial) { m_pixmapPendingSerial = serial; }
+    // INFO-2 r8: a label change stored without a paint (setLookLabel, repaintNow false) rides on this hand-over's paint.
+    void notePixmapPresentSerial(quint64 serial);
     bool pixmapPaintPendingForSerial(quint64 serial) const
     {
         // r30 (adversary A1 on 71104385): a composed paint, never m_pixmapPaintedSerial (an offscreen viewport grab promotes it)
@@ -91,6 +95,9 @@ protected:
     qreal m_lookLabelPixmapDpr = 0.0;
     QPixmap m_lookLabelPixmap;
     QString m_lookLabelDrawnText;
+    // INFO-2 r8: a label change stored with no paint: owed, and the viewport rects (old and new label) it must repaint.
+    bool m_lookLabelPaintOwed = false;
+    QRect m_lookLabelOwedRect;
     quint64 m_pixmapPendingSerial = 0;
     quint64 m_pixmapPaintedSerial = 0;
     playback_paint_credit::ComposedPaintSerial m_pixmapComposedPaint;   // r30: the pixmap serial last painted ON SCREEN

@@ -2049,8 +2049,9 @@ TEST(PlaybackInfoLabel, InfoTwoR2A7ADeferredPlayingRelabelIsVisibleWithinTheGate
     ASSERT_TRUE(playback_info_label::labelPaintOwedDue(true, false, (storeAtMs + playback_info_label::kLabelPaintOwedMs + 8) - storeAtMs, 0));
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay("));
+    // INFO-2 r8 (sol r7 LABEL-STALL): both surfaces store a declined change, so the debt is armed on the CPU viewport too
     ASSERT_TRUE(push.contains(QStringLiteral(
-        "    if( repaintNow || !gpuWindow ) m_lookLabelPaintOwedClock.invalidate();\n"
+        "    if( repaintNow ) m_lookLabelPaintOwedClock.invalidate();\n"
         "    else\n"
         "    {\n"
         "        m_lookLabelPaintOwedClock.start();\n"
@@ -2285,6 +2286,85 @@ TEST(PlaybackInfoLabel, InfoTwoR7A3TheWithdrawalsPaintDebtKeepsThePeriodTheReset
     ASSERT_TRUE(settle.contains(QStringLiteral("playback_info_label::labelPaintOwedExpectedMs( m_lookLabelPaintOwedExpectedFloorMs,")));
     ASSERT_TRUE(readRepoFile(QStringLiteral("platform/qt/MainWindow.h"))
                     .contains(QStringLiteral("qint64 m_lookLabelPaintOwedExpectedFloorMs = 0;")));
+}
+
+// INFO-2 r8 (sol r7 LABEL-STALL on 37257de5, blocker): the r7 row on the CPU viewport. Fullscreen CPU Play, a 1 fps conform target,
+// a previously measured 23.9 fps, the meter's reset at draw age 512 ms, equal pending and painted pixmap serials. r7's rule declined
+// the immediate repaint and the GPU window stored the text, but pushLookLabelOverlay never passed that decision to
+// GraphicsZoomView::setLookLabel, which queued viewport()->update( dirty ) ~1 s before the 1500 ms deadline. The CPU setter now
+// honours the same repaintNow: it stores the change (owed to the next frame's hand-over or to the paint debt, armed on both surfaces).
+TEST(PlaybackInfoLabel, InfoTwoR8LabelStallTheCpuViewportHonoursTheSameRepaintDecision)
+{
+    using playback_info_label::CpuLabelPaint;
+    using playback_info_label::cpuLabelPaint;
+    using playback_info_label::labelFramesStallEntered;
+    using playback_info_label::labelPaintExpectedFrameMs;
+    using playback_info_label::labelPaintOwedDue;
+    using playback_info_label::rateWithdrawalRepaintsNow;
+    // R8a: sol's literal INV-1 CPU row through the push's decision (its repaintNow expression, pinned by R7f)
+    const bool playing = true;
+    const bool overlayEmpty = false;   // the label is shown, only the rate is withdrawn
+    const bool stalled = labelFramesStallEntered(playing, true, false, 512, labelPaintExpectedFrameMs(1.0, 1000.0 / 23.9));
+    ASSERT_FALSE(stalled);
+    const bool withdrawn = rateWithdrawalRepaintsNow(playing, stalled);
+    ASSERT_FALSE(withdrawn);
+    const bool repaintNow = !playing || overlayEmpty || withdrawn || stalled;
+    ASSERT_FALSE(repaintNow);
+    const bool equalSerials = false;   // pending == painted: no handed-over frame waits for a paint
+    ASSERT_EQ(static_cast<int>(CpuLabelPaint::None), static_cast<int>(cpuLabelPaint(repaintNow, equalSerials, false)));
+    ASSERT_EQ(static_cast<int>(CpuLabelPaint::None), static_cast<int>(cpuLabelPaint(repaintNow, equalSerials, true)));
+    // the stored text's debt (now armed on the CPU viewport too) pays at the 1500 ms deadline, not before
+    ASSERT_FALSE(labelPaintOwedDue(true, false, 1499, labelPaintExpectedFrameMs(1.0, 0.0)));
+    ASSERT_TRUE(labelPaintOwedDue(true, false, 1500, labelPaintExpectedFrameMs(1.0, 0.0)));
+    // R8b: INV-1 row 3, stopped: the immediate paint stays (the label rects, or the whole viewport when no rect is known)
+    const bool stoppedRepaintNow = !false || overlayEmpty || rateWithdrawalRepaintsNow(false, false) || false;
+    ASSERT_TRUE(stoppedRepaintNow);
+    ASSERT_EQ(static_cast<int>(CpuLabelPaint::LabelRects), static_cast<int>(cpuLabelPaint(stoppedRepaintNow, false, false)));
+    ASSERT_EQ(static_cast<int>(CpuLabelPaint::WholeViewport), static_cast<int>(cpuLabelPaint(stoppedRepaintNow, false, true)));
+    // R8c: a real label stall repaints at once; a frame already waiting for its paint is widened (r28), adding no paint
+    ASSERT_EQ(static_cast<int>(CpuLabelPaint::LabelRects), static_cast<int>(cpuLabelPaint(true, false, false)));
+    ASSERT_EQ(static_cast<int>(CpuLabelPaint::WholeViewport), static_cast<int>(cpuLabelPaint(false, true, false)));
+    ASSERT_EQ(static_cast<int>(CpuLabelPaint::WholeViewport), static_cast<int>(cpuLabelPaint(true, true, false)));
+    // R8d: the wiring. The push hands the CPU setter its one repaintNow and arms the debt whatever the surface.
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay("));
+    ASSERT_TRUE(push.contains(QStringLiteral(
+        "ui->graphicsView->setLookLabel( gpuWindow ? QString() : m_lookLabelOverlayText, repaintNow );")));
+    ASSERT_TRUE(push.contains(QStringLiteral("    if( repaintNow ) m_lookLabelPaintOwedClock.invalidate();\n")));
+    ASSERT_FALSE(push.contains(QStringLiteral("!gpuWindow ) m_lookLabelPaintOwedClock.invalidate();")));
+    // the debt pays the CPU viewport's owed change as well as the GPU window's
+    const QString settle = functionBody(source, QStringLiteral("void MainWindow::settleLookLabelPaintIfOwed( void )"));
+    const int gpuPayAt = settle.indexOf(QStringLiteral("GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, true );"));
+    const int cpuPayAt = settle.indexOf(QStringLiteral(
+        "ui->graphicsView->setLookLabel( GpuDisplayWindow::isActive() ? QString() : m_lookLabelOverlayText, true );"));
+    ASSERT_TRUE(gpuPayAt >= 0);
+    ASSERT_TRUE(cpuPayAt > gpuPayAt);
+    ASSERT_EQ(2, static_cast<int>(source.count(QStringLiteral("ui->graphicsView->setLookLabel("))));
+    // R8e: the CPU setter. No default argument (a caller cannot drop the decision), the one policy call, and no update() but the
+    // two the policy selects; a declined change stores the owed rects and returns before them.
+    const QString header = readRepoFile(QStringLiteral("platform/qt/GraphicsZoomView.h"));
+    ASSERT_TRUE(header.contains(QStringLiteral("void setLookLabel(const QString &text, bool repaintNow);")));
+    ASSERT_TRUE(header.contains(QStringLiteral("void notePixmapPresentSerial(quint64 serial);")));
+    const QString zoom = readRepoFile(QStringLiteral("platform/qt/GraphicsZoomView.cpp"));
+    const QString setter = functionBody(zoom, QStringLiteral("void GraphicsZoomView::setLookLabel(const QString &text, bool repaintNow)"));
+    const int ruleAt = setter.indexOf(QStringLiteral(
+        "switch( playback_info_label::cpuLabelPaint( repaintNow, m_pixmapPendingSerial != m_pixmapPaintedSerial, dirty.isEmpty() ) )"));
+    const int noneAt = setter.indexOf(QStringLiteral("case playback_info_label::CpuLabelPaint::None:"));
+    const int rectsAt = setter.indexOf(QStringLiteral("case playback_info_label::CpuLabelPaint::LabelRects: viewport()->update( dirty ); break;"));
+    const int wholeAt = setter.indexOf(QStringLiteral("case playback_info_label::CpuLabelPaint::WholeViewport: viewport()->update(); break;"));
+    ASSERT_TRUE(ruleAt >= 0);
+    ASSERT_TRUE(noneAt > ruleAt);
+    ASSERT_TRUE(rectsAt > noneAt);
+    ASSERT_TRUE(wholeAt > rectsAt);
+    ASSERT_EQ(2, static_cast<int>(setter.count(QStringLiteral("update("))));
+    const QString declined = setter.mid(noneAt, rectsAt - noneAt);
+    ASSERT_TRUE(declined.contains(QStringLiteral("m_lookLabelPaintOwed = true;")));
+    ASSERT_TRUE(declined.contains(QStringLiteral("return;")));
+    // the owed change rides on the next frame's hand-over (the whole viewport: that paint credits the frame, r28)
+    const QString handover = functionBody(zoom, QStringLiteral("void GraphicsZoomView::notePixmapPresentSerial(quint64 serial)"));
+    const int owedAt = handover.indexOf(QStringLiteral("if( !m_lookLabelPaintOwed ) return;"));
+    ASSERT_TRUE(owedAt >= 0);
+    ASSERT_TRUE(handover.indexOf(QStringLiteral("viewport()->update();"), owedAt) > owedAt);
 }
 
 // INFO-2 r2 (adversary pass 2 A2 on 9496cb72, introduced, major): 24 fps, start on paused frame 0, Cut Out 3, Loop off. Frames 1 and
