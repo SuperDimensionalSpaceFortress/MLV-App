@@ -35,7 +35,8 @@ struct Facts
     bool presentedValid = false;      // presentedScale belongs to the requested scale's frames
     int presentedFrameScale = 0;      // INFO-2 r1 (pass 21 A5): the scale the PRESENTED frame was rendered at, independent of the live
                                       // request (presentedValid compares against it); 0 = no valid presented frame, debayerField then
-                                      // falls back to presentedScale / requestedScale.
+                                      // falls back to presentedScale / requestedScale. LOOK-LABEL-SCALE-FIELD-PRESENTED-1 r1 (sol r9
+                                      // INV-3): scaleField reads it too, so a pending scale change names the retained frame's scale.
     QString debayer;                 // the chosen debayer's menu text ("" = omitted)
     bool debayerOnGpu = false;
     QString gpuDebayer;               // r3: the algorithm the GPU ran for the presented frame ("AMaZE", "Bilinear"; "" = none)
@@ -99,6 +100,9 @@ inline QString scaleField( const Facts &facts )
         return PlaybackScaleLabel::fractionWord( facts.requestedScale ) + QStringLiteral( "->" )
              + PlaybackScaleLabel::fractionWord( facts.presentedScale );
     }
+    // LOOK-LABEL-SCALE-FIELD-PRESENTED-1 r1 (sol r9 INV-3): a pending scale change leaves the retained frame of another
+    // request on screen; the field names that frame's own scale, as debayerField does, never the request it does not show.
+    if( !facts.presentedValid && facts.presentedFrameScale > 0 ) return PlaybackScaleLabel::fractionWord( facts.presentedFrameScale );
     return PlaybackScaleLabel::fractionWord( facts.requestedScale );
 }
 
