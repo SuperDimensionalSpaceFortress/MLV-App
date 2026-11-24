@@ -330,6 +330,37 @@ TEST(PlaybackFpsMeterPolicy, APositiveTickKeepsOneMillisecondUpToTheStatedCutoff
     ASSERT_TRUE(frameBoundedTickTimeDiffMs(8, 0.0) == 8); // Normal mode passes no rate: its tick is never cut
 }
 
+// r4 iteration 2 (pass 7 A1 on 7a0f5a1c): the reciprocal can round DOWN, so the cut kept 63755 ms where the call site's
+// own expression accepts 63756 ms (exactly 999,990 frames at 27777500/1771 fps). The cut keeps the LARGEST accepted age.
+TEST(PlaybackFpsMeterPolicy, TheBoundKeepsTheLargestAgeTheCallSiteAccepts)
+{
+    using playback_fps_meter::frameBoundedTickTimeDiffMs;
+    using playback_fps_meter::kMaxTickFrames;
+    const double rate = 27777500.0 / 1771.0;
+    ASSERT_TRUE(rate * 63756.0 / 1000.0 <= kMaxTickFrames);
+    ASSERT_TRUE(rate * 63757.0 / 1000.0 > kMaxTickFrames);
+    ASSERT_EQ(63756, frameBoundedTickTimeDiffMs(63757, rate));
+    ASSERT_EQ(-63756, frameBoundedTickTimeDiffMs(-63757, rate));
+    ASSERT_EQ(63756, frameBoundedTickTimeDiffMs(playback_fps_meter::kMaxStampAgeMs, rate));
+}
+
+// r4 iteration 2 (pass 7 A3 on 7a0f5a1c), CHARACTERIZATION of the telescoping rule the idle branch now follows: when
+// lastTime takes the tick's OWN stamp (as the draw branch always did), the summed whole-stamp ages are the elapsed time
+// whatever the poll phase: 1 ms polls at n + 0.9 ms sum to 42 ms over 42 polls (a fresh re-arm at n + 1.1 ms read 0).
+TEST(PlaybackFpsMeterPolicy, TickStampReArmTelescopesSoIdlePollsKeepUpWithRealTime)
+{
+    long long sum = 0;
+    FakeNsStamp last{ 900000LL };
+    for (int i = 1; i <= 42; ++i)
+    {
+        const FakeNsStamp tick{ i * 1000000LL + 900000LL };
+        sum += stampAgeMs(last, tick);
+        last = tick;
+    }
+    ASSERT_EQ(42LL, sum);
+    ASSERT_TRUE(summedIdleTickTimeDiffMs(1000000LL, 900000LL, 1100000LL, 42) < 42LL); // the fresh re-arm the base and r3 used lost it
+}
+
 // r4 (pass 5 A1 on b70f718d): the drop-frame position can be stale and outside the cut (a seek while Drop Frame was on,
 // Drop Frame off, a seek and a new cut, Drop Frame on: the normalizer clamps it to the clip, not the cut). From position
 // 20 on Loop cut 1..2 a 999,990-frame tick made 1,000,010 width-1 laps. advanceDropFrameTick bounds its own laps from
@@ -341,11 +372,24 @@ TEST(PlaybackFpsMeterPolicy, OneTickLapsStayWithinTheBoundFromAStaleStartOutside
     ASSERT_TRUE(stale.wrapped);
     ASSERT_TRUE(stale.wrapLaps <= 1000000);
     ASSERT_TRUE(stale.position >= 0.0 && stale.position < 1.0);
-    // a stale start far past the cut (a long clip) with an ordinary request
+    // r4 iteration 2 (pass 7 A2 on 7a0f5a1c): only the DELTA is cut, so the tick's advance is reconstructed exactly
+    // (position - before + wrapWidth * wrapLaps is what the slip histogram and the paint tracker read) and never negative
+    const double staleGranted = stale.position - 20.0 + (double)stale.wrapWidth * stale.wrapLaps;
+    ASSERT_TRUE(staleGranted >= 0.0 && staleGranted <= 999990.0);
+    // a stale start already a million laps past the cut keeps the base arithmetic: 1000001 + 2.4 wraps 1000003 laps to
+    // 0.4 and grants 2.4 (7a0f5a1c landed on 0 after 1e6 laps and reported -1). The laps of the stale start ALONE are the
+    // base's on any tick (PRE-EXISTING; O(1) lap recording is PLAYBACK-WRAP-RECORDER-RUNLENGTH-1)
+    const playback_frame_range::DropFrameTickResult farStale =
+        playback_frame_range::advanceDropFrameTick(1000001.0, 2.4, 1, 2, true);
+    ASSERT_EQ(1000003, farStale.wrapLaps);
+    const double farGranted = farStale.position - 1000001.0 + (double)farStale.wrapWidth * farStale.wrapLaps;
+    ASSERT_TRUE(std::fabs(farGranted - 2.4) < 1e-6);
+    ASSERT_TRUE(farStale.position >= 0.0 && farStale.position < 1.0);
+    // PRE-EXISTING characterization: a stale start far past the cut (a long clip) with an ordinary request
     const playback_frame_range::DropFrameTickResult far =
         playback_frame_range::advanceDropFrameTick(3000000.0, 0.25, 1, 2, true);
-    ASSERT_TRUE(far.wrapLaps <= 1000000);
-    ASSERT_TRUE(far.position >= 0.0 && far.position < 1.0);
+    ASSERT_EQ(3000000, far.wrapLaps);
+    ASSERT_TRUE(std::fabs(far.position - 0.25) < 1e-6);
     // conform (presentLastFrame: wrap past the last frame by the cut's frame count) with the most debt a tick carries
     const playback_frame_range::DropFrameTickResult conformed = playback_frame_range::advanceDropFrameTick(
         20.0, 999990.0 + playback_frame_range::kConformMaxDebtFrames, 1, 2, true, true);

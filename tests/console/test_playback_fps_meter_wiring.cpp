@@ -110,7 +110,9 @@ TEST(PlaybackFpsMeterWiring, MeterAndTickClocksAreMonotonic)
         "playback_fps_meter::stampAgeMs( m_lastPlaybackFpsStatusUpdateTime, nowTime ) >= 250")));
     // the tick and the busy-path reset read the monotonic clock, never the time of day
     ASSERT_TRUE(body.contains(QStringLiteral("QElapsedTimer nowTime = mlvappMonotonicNow();")));
-    ASSERT_TRUE(body.contains(QStringLiteral("lastTime.start();")));
+    // r4 iteration 2 (pass 7 A3): lastTime only ever takes a tick's own stamp (never a fresh re-arm), so ages telescope
+    ASSERT_FALSE(body.contains(QStringLiteral("lastTime.start();")));
+    ASSERT_EQ(2, body.count(QStringLiteral("lastTime = nowTime;")));
 
     const QString header = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
     ASSERT_TRUE(header.contains(QStringLiteral("QElapsedTimer m_lastPlaybackFpsStatusUpdateTime;")));
@@ -175,7 +177,7 @@ TEST(PlaybackFpsMeterWiring, MonotonicClockAndResetWiringRejectTheirMutations)
     // ...and the idle-branch reset likewise runs on every idle tick, right before the re-arm
     ASSERT_TRUE(body.contains(QStringLiteral(
         "        resetFpsMeterIfIdle( nowTime );\n"
-        "        lastTime.start(); //do that for calculation of timeDiff for DropFrameMode;\n")));
+        "        lastTime = nowTime; //do that for calculation of timeDiff for DropFrameMode (the tick's own stamp: ages telescope);\n")));
 }
 
 // adversary r2 A7 (3bb01140): the cap pin accepted a dead `if( false )` line in front of the cap, and the reset pin
