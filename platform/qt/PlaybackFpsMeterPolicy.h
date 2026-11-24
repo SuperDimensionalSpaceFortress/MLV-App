@@ -54,21 +54,28 @@ inline int stampAgeMs( const Stamp & then, const Stamp & now )
 
 /*! The most frames one drop-frame tick may ask for. advanceDropFrameTick (PlaybackFrameRange.h) counts Loop laps in an
  *  int, capped at INT_MAX - 1, so a request past that leaves the position outside the cut (adversary r2 A1: a one-day
- *  age at a 25000 fps source asked for 2.16e9 frames). 1e9 stays below that cap for any cut width of at least one frame. */
-inline constexpr double kMaxTickFrames = 1000000000.0;
+ *  age at a 25000 fps source asked for 2.16e9 frames). The bound is on the LAP WORK too, not only on that count: a tick
+ *  that wraps a width-1 cut makes one lap per frame, and PlaybackWrapRecorder::noteEngineWrap records every lap on the
+ *  GUI thread (one increment and one append each; pass 4 A1 on 3bb01140: a 1e9 bound made that 1e9 appends, 4 GB).
+ *  1e6 frames is at most 1e6 laps (about 4 MB, once per long suspension) and is more than 11 hours of catch-up at
+ *  24 fps, so no ordinary tick is cut. */
+inline constexpr double kMaxTickFrames = 1000000.0;
 
 /*! The tick's elapsed milliseconds, cut so that \a framerate * ms / 1000 stays within +-kMaxTickFrames. Every ordinary
- *  tick is unchanged (8 ms at even 1e6 fps is 8000 frames); only a long suspension at a high source rate is cut, and a
- *  positive age stays at least 1 ms, so the fps meter's `timeDiff != 0` gate is unchanged. */
+ *  tick is unchanged (8 ms at even 1e6 fps is 8000 frames); only a long suspension is cut. The cut is re-checked with
+ *  the call site's own expression (MainWindow::playbackHandling: framerate * (double)timeDiff / 1000.0), because the
+ *  reciprocal rounds (pass 4 A2: 781250000/821 fps made 1,050,880 ms, one double step over the bound). A positive age
+ *  stays at least 1 ms, so the fps meter's `timeDiff != 0` gate is unchanged, except past 1e9 fps, where even 1 ms is
+ *  over the bound and the tick asks for nothing (pass 4 A3). */
 inline int frameBoundedTickTimeDiffMs( int timeDiffMs, double framerate )
 {
     if( !( framerate > 0.0 ) || timeDiffMs == 0 ) return timeDiffMs;
     const double frames = framerate * static_cast<double>( timeDiffMs ) / 1000.0;
     if( frames <= kMaxTickFrames && frames >= -kMaxTickFrames ) return timeDiffMs;
-    double boundedMs = kMaxTickFrames * 1000.0 / framerate;
-    if( boundedMs < 1.0 ) boundedMs = 1.0;
-    const int magnitude = boundedMs >= static_cast<double>( kMaxStampAgeMs )
+    const double boundedMs = kMaxTickFrames * 1000.0 / framerate;
+    int magnitude = boundedMs >= static_cast<double>( kMaxStampAgeMs )
         ? kMaxStampAgeMs : static_cast<int>( boundedMs );
+    while( magnitude > 0 && framerate * static_cast<double>( magnitude ) / 1000.0 > kMaxTickFrames ) --magnitude;
     return timeDiffMs > 0 ? magnitude : -magnitude;
 }
 

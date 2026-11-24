@@ -188,22 +188,24 @@ TEST(PlaybackFpsMeterPolicy, OneTickNeverAsksForMoreFramesThanTheLoopCanCount)
     ASSERT_TRUE(unbounded.position >= 1.0);
     // bounded: the same suspension lands inside the wrap range [wrapAt - width, wrapAt) = [0, 1)
     const int bounded = frameBoundedTickTimeDiffMs(kMaxStampAgeMs, 25000.0);
-    ASSERT_EQ(40000000, bounded); // 1e9 frames at 25000 fps
+    ASSERT_EQ(40000, bounded); // r3: 1e6 frames at 25000 fps (the 1e9 bound was 40000000 ms)
     ASSERT_TRUE(25000.0 * bounded / 1000.0 <= kMaxTickFrames);
     const playback_frame_range::DropFrameTickResult tick =
         playback_frame_range::advanceDropFrameTick(0.0, 25000.0 * bounded / 1000.0, 1, 2, true);
     ASSERT_TRUE(tick.wrapped);
     ASSERT_TRUE(tick.position >= 0.0 && tick.position < 1.0);
-    // the largest MLV rate (uint32 numerator over 1) is bounded too, at no less than 1 ms
+    // the largest MLV rate (uint32 numerator over 1) is bounded too; r3 A3: past 1e9 fps even 1 ms is over the bound
     const int huge = frameBoundedTickTimeDiffMs(kMaxStampAgeMs, 4294967295.0);
-    ASSERT_EQ(232, huge);
+    ASSERT_TRUE(huge >= 0 && huge < 1);
     ASSERT_TRUE(4294967295.0 * huge / 1000.0 <= kMaxTickFrames);
-    ASSERT_EQ(1, frameBoundedTickTimeDiffMs(kMaxStampAgeMs, 1.0e13));
-    ASSERT_EQ(-40000000, frameBoundedTickTimeDiffMs(-kMaxStampAgeMs, 25000.0));
+    ASSERT_TRUE(1.0e13 * frameBoundedTickTimeDiffMs(kMaxStampAgeMs, 1.0e13) / 1000.0 <= kMaxTickFrames);
+    ASSERT_EQ(-40000, frameBoundedTickTimeDiffMs(-kMaxStampAgeMs, 25000.0));
     // every ordinary tick is unchanged
     ASSERT_EQ(8, frameBoundedTickTimeDiffMs(8, 1000000.0));
     ASSERT_EQ(42, frameBoundedTickTimeDiffMs(42, 24.0));
-    ASSERT_EQ(kMaxStampAgeMs, frameBoundedTickTimeDiffMs(kMaxStampAgeMs, 24.0));
+    ASSERT_EQ(3600000, frameBoundedTickTimeDiffMs(3600000, 24.0)); // an hour at 24 fps is 86400 frames
+    // r3: a whole day at 24 fps is 2073600 frames, so it is cut to 1e6 frames (41,666,666 ms, about 11.6 h)
+    ASSERT_EQ(41666666, frameBoundedTickTimeDiffMs(kMaxStampAgeMs, 24.0));
     ASSERT_EQ(1, frameBoundedTickTimeDiffMs(1, 25000.0));
     ASSERT_EQ(7, frameBoundedTickTimeDiffMs(7, 0.0)); // no rate: nothing to bound
 }

@@ -2864,6 +2864,26 @@
       ]
     },
     {
+      "path": "tests/console/test_playback_fps_meter_policy.cpp",
+      "anchor": "ASSERT_EQ ( 0 , frameBoundedTickTimeDiffMs ( kMaxStampAgeMs , 1.0 e13 ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r3 (adversary pass 4 A3): asserts frameBoundedTickTimeDiffMs's own contract value on an injected age and rate; no stage-ran inference. Past 1e9 fps even 1 ms is over the frame bound, so a positive over-long tick asks for 0 ms.",
+      "lines": [
+        267
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_fps_meter_policy.cpp",
+      "anchor": "ASSERT_EQ ( 0 , frameBoundedTickTimeDiffMs ( - kMaxStampAgeMs , 1.0 e13 ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r3 (adversary pass 4 A3): asserts frameBoundedTickTimeDiffMs's own contract value on an injected age and rate; no stage-ran inference. The negative mirror of the 1e13 fps row: a negative over-long tick also asks for 0 ms.",
+      "lines": [
+        268
+      ]
+    },
+    {
       "path": "platform/qt/PlaybackFpsMeterPolicy.h",
       "anchor": "if ( ! ( framerate > 0.0 ) || timeDiffMs == 0 ) return timeDiffMs ;",
       "class": "value_fallback_select",
