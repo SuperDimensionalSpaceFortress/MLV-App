@@ -2799,14 +2799,16 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
     PlaybackDueWake::RunnerSleep slept = PlaybackDueWake::RunnerSleep::NotHandled;
     qint64 sleptMs = 0;
     bool sentOk = false;
-    int unrelatedRetried = 0;                                         // r1 (sol r5 B1): the literal first attempts that were retried
+    int unrelatedRetried = 0;                                         // r1 (sol r5 B1): literal attempts whose unrelated dispatch was witnessed, then retried
+    int unrelatedTried = 0;
     // CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1 (sol r5 B1), its literal row as a standing first attempt: an unrelated WM_NULL to
     // the wake's own window ~8 ms into the 150 ms sleep (one healthy dispatch the product counts and records), and the fixture's
     // send held until the sleep has returned (it queues after the return: calls=0, count=1, spans=1, TimedOut). That sample must be
-    // accounted, then retried on the fixture's own witness; r5 admitted it to the trace scan with both handler reads still -1. One
-    // extra attempt keeps the real observation's own attempt budget.
+    // accounted, then retried on the fixture's own witness; r5 admitted it to the trace scan with both handler reads still -1.
+    // Adversary pass A2 on e60d41b6: the literal attempt counts only when its unrelated dispatch was witnessed in the sleep (the
+    // product counted and recorded it), and it is tried at most twice; the two extra attempts keep the real observation's budget.
     const HWND wakeWindow = reinterpret_cast<HWND>( wake.nativeWindow() );
-    for( int attempt = 0; attempt < kSleepObservationAttempts + 1 && !judged; ++attempt )
+    for( int attempt = 0; attempt < kSleepObservationAttempts + 2 && !judged; ++attempt )
     {
         foreign = R3A3Foreign();
         foreign.wake = &wake;
@@ -2814,7 +2816,8 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
         wake.setGuiTraceActive( true );
         std::atomic<bool> sent { false };
         std::atomic<bool> sleepReturned { false };
-        const bool unrelatedFirst = attempt == 0;
+        const bool unrelatedFirst = unrelatedRetried == 0 && unrelatedTried < 2;
+        if( unrelatedFirst ) ++unrelatedTried;
         std::thread sender( [window, wakeWindow, unrelatedFirst, &sent, &sleepReturned]() {
             if( unrelatedFirst )
             {
@@ -2870,7 +2873,8 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
                                                    : foreign.calls == 0;
         if( r3a3Retry )
         {
-            if( unrelatedFirst ) ++unrelatedRetried;
+            if( unrelatedFirst && wake.runnerSleepsWokenOther() > wokenOtherBefore && !wake.lastRunnerSleepDispatchSpansS().empty() )
+                ++unrelatedRetried;                                    // pass A2: the unrelated dispatch was witnessed in the sleep
             // adversary pass 1 A4/A7: a sender that missed the whole sleep (its message queued after the sleep returned) left
             // nothing to judge and a pending sent message behind. Take it now, so it cannot reach the next attempt's sleep and
             // double that attempt's handler calls, and observe again. Keyed on the handler's own call count, not on the span
