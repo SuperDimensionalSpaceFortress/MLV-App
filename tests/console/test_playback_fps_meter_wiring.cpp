@@ -161,6 +161,15 @@ TEST(PlaybackFpsMeterWiring, MonotonicClockAndResetWiringRejectTheirMutations)
         "            }\n"
         "            resetFpsMeterIfIdle( mlvappMonotonicNow() );\n"
         "            //On setup slider priority\n")));
+    // adversary r2 A1 (894b938d): the shaped tick is bounded in frames before playbackHandling reads it, exactly once
+    const QString boundLine = QStringLiteral(
+        "    timeDiff = playback_fps_meter::frameBoundedTickTimeDiffMs( timeDiff, getPlaybackFramerate() );\n");
+    const int boundAt = body.indexOf(boundLine);
+    const int handlingAt = body.indexOf(QStringLiteral("    playbackHandling( timeDiff );"));
+    ASSERT_TRUE(boundAt > shapedAt);
+    ASSERT_EQ(1, body.count(boundLine));
+    ASSERT_TRUE(handlingAt > boundAt);
+    ASSERT_FALSE(body.mid(boundAt + boundLine.size(), handlingAt - (boundAt + boundLine.size())).contains(QStringLiteral("timeDiff")));
     // ...and the idle-branch reset likewise runs on every idle tick, right before the re-arm
     ASSERT_TRUE(body.contains(QStringLiteral(
         "        resetFpsMeterIfIdle( nowTime );\n"

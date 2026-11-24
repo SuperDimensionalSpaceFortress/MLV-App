@@ -1,6 +1,7 @@
 #include "../common/minitest.h"
 
 #include "../../platform/qt/PlaybackFpsMeterPolicy.h"
+#include "../../platform/qt/PlaybackFrameRange.h"
 
 #include <QElapsedTimer>
 #include <QTime>
@@ -171,4 +172,38 @@ TEST(PlaybackFpsMeterPolicy, StampAgeKeepsTheStampGrainSoIdleReArmedTicksKeepUpW
     ASSERT_EQ(8LL * 42LL, summedIdleTickTimeDiffMs(8000000LL, 100000LL, 200000LL, 42));
     // one age is still whole stamps: 0.2 ms -> 1.1 ms crosses one millisecond boundary
     ASSERT_EQ(1, stampAgeMs(FakeNsStamp{ 200000LL }, FakeNsStamp{ 1100000LL }));
+}
+
+// adversary r2 A1 (894b938d): the one-day cap alone still let a 25000 fps source ask for 2.16e9 frames after a long
+// suspension; advanceDropFrameTick caps its Loop laps at INT_MAX - 1, so the position left the cut (12516353 for cut 1..2).
+// One tick's request is bounded in frames, for any source rate.
+TEST(PlaybackFpsMeterPolicy, OneTickNeverAsksForMoreFramesThanTheLoopCanCount)
+{
+    using playback_fps_meter::frameBoundedTickTimeDiffMs;
+    using playback_fps_meter::kMaxStampAgeMs;
+    using playback_fps_meter::kMaxTickFrames;
+    // CHARACTERIZATION of the defect: the unbounded request leaves the cut
+    const playback_frame_range::DropFrameTickResult unbounded =
+        playback_frame_range::advanceDropFrameTick(0.0, 25000.0 * kMaxStampAgeMs / 1000.0, 1, 2, true);
+    ASSERT_TRUE(unbounded.position >= 1.0);
+    // bounded: the same suspension lands inside the wrap range [wrapAt - width, wrapAt) = [0, 1)
+    const int bounded = frameBoundedTickTimeDiffMs(kMaxStampAgeMs, 25000.0);
+    ASSERT_EQ(40000, bounded);
+    ASSERT_TRUE(25000.0 * bounded / 1000.0 <= kMaxTickFrames);
+    const playback_frame_range::DropFrameTickResult tick =
+        playback_frame_range::advanceDropFrameTick(0.0, 25000.0 * bounded / 1000.0, 1, 2, true);
+    ASSERT_TRUE(tick.wrapped);
+    ASSERT_TRUE(tick.position >= 0.0 && tick.position < 1.0);
+    // the largest MLV rate (uint32 numerator over 1) is bounded too, at no less than 1 ms
+    const int huge = frameBoundedTickTimeDiffMs(kMaxStampAgeMs, 4294967295.0);
+    ASSERT_EQ(232, huge);
+    ASSERT_TRUE(4294967295.0 * huge / 1000.0 <= kMaxTickFrames);
+    ASSERT_EQ(1, frameBoundedTickTimeDiffMs(kMaxStampAgeMs, 1.0e13));
+    ASSERT_EQ(-40000, frameBoundedTickTimeDiffMs(-kMaxStampAgeMs, 25000.0));
+    // every ordinary tick is unchanged
+    ASSERT_EQ(8, frameBoundedTickTimeDiffMs(8, 1000000.0));
+    ASSERT_EQ(42, frameBoundedTickTimeDiffMs(42, 24.0));
+    ASSERT_EQ(kMaxStampAgeMs, frameBoundedTickTimeDiffMs(kMaxStampAgeMs, 24.0));
+    ASSERT_EQ(1, frameBoundedTickTimeDiffMs(1, 25000.0));
+    ASSERT_EQ(7, frameBoundedTickTimeDiffMs(7, 0.0)); // no rate: nothing to bound
 }

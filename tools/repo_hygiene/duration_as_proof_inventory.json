@@ -2864,6 +2864,26 @@
       ]
     },
     {
+      "path": "platform/qt/PlaybackFpsMeterPolicy.h",
+      "anchor": "if ( ! ( framerate > 0.0 ) || timeDiffMs == 0 ) return timeDiffMs ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 (adversary r2 A1) frameBoundedTickTimeDiffMs: with no positive rate or a zero tick there is no frame request to bound, so the tick's milliseconds pass through unchanged. Bounds an input of the drop-frame request; never decides whether any stage ran.",
+      "lines": [
+        65
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackFpsMeterPolicy.h",
+      "anchor": "return timeDiffMs > 0 ? magnitude : - magnitude ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 (adversary r2 A1) frameBoundedTickTimeDiffMs: keeps the sign of an over-long tick while cutting its magnitude to the frame bound. A sign select on the drop-frame request; never a run-proof.",
+      "lines": [
+        72
+      ]
+    },
+    {
       "path": "platform/qt/MainWindow.cpp",
       "anchor": "if ( postMs >= 0.0 )",
       "class": "value_fallback_select",
