@@ -141,10 +141,18 @@ FRAME:
   holding that many frames **and** an engine pace that can consume them inside the safety budget.
 - Every automation stop waits on `programmaticPlayState` (source frames consumed). A wall clock survives only as the
   safety net, and its expiry is a typed failure. The net **scales with the pace the venue must sustain**:
-  `requested / kMinSustainedPaceFraction (0.5) + kPlaySafetyMarginMs (15 s)`, i.e. 55 s for a 20 s window. A venue that
-  holds under half the native pace is refused up front when its engine pace is known (`PLAY_PACE_TOO_SLOW`, before
-  Play) and ends early with the **same** token when the pace only shows once Play runs -- never a run that can only time
-  out.
+  `max(requested / kMinSustainedPaceFraction (0.5), ceil((required_source_frames - 1) / kGatedPaceFloorFps (15 fps))) +
+  kPlaySafetyMarginMs (15 s)` (`playSafetyMs( requested, mode, required_source_frames )`; PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1).
+  The gate therefore never demands more than `min(0.5 x native fps, 15 fps)`. For a clip at 30 fps or below the first term
+  is the larger one and the net is unchanged: 55 s for a 20 s window. Above 30 fps the admitted frames set it: 20 s of
+  M16-1457 (59.94 fps, 1199 frames) gets `1198 / 15 + 15 s = 94.867 s`. The old 55 s sat within a second of that clip's
+  own baseline run (22.0 fps = 54.5 s), so 10 of 14 drift legs on 2026-11-24 ended `PLAY_PACE_TOO_SLOW` at 17.85-20.24 fps with
+  no stall. 15 fps sits below the slowest 1457 CUDA mode measured (17.85 fps). The change affects measurement only: no user
+  playback path reads this budget, and no window that is refused today (`CLIP_TOO_SHORT`, `PLAY_DURATION_TOO_SHORT`,
+  `required_source_frames`) is admitted. A venue under that floor is refused up front when its engine pace is known
+  (`PLAY_PACE_TOO_SLOW`, before Play), and it ends early with the **same** token when the pace only shows once Play runs. It is
+  never a run that can only time out. Launchers mirror the rule with `Get-GuiSmokePlaySafetyMs -NativeFps`
+  (`$script:GuiSmokeGatedPaceFloorFps`).
 - **The in-Play pace probe** (`playPaceProjectsPastBudget`, reached by every automation wait through
   `programmaticPlayState`; Gated mode only) is judged after 8 s of Play and two frames. It asks whether the run can
   still finish: the elapsed wall clock, with every wait and stall so far counted once, plus the REMAINING steps at the
@@ -232,10 +240,12 @@ HUB RULING 2026-10-30T22:17:51Z (#420): a clip above 30 fps plays at the 24 fps 
 still SOURCE seconds at the native fps (the 2026-10-15 amendment above). `checkPlayableWindow`, the GUI-smoke clip guard, the
 `--presented-frames` check and `Test-GuiSmokeClipLength` all measure with the clip's native fps; only the engine pace
 (`getPlaybackFramerate()`) is the conform rate. The receipt oracles already count in this unit. A conformed Play therefore takes longer
-on the clock, inside the same budget `requested / 0.5 + 15 s`. A 25 s window on M16-1457 (1667 frames at 59.94) needs 1499 source
-frames: 62.4 s at 24 fps, inside 65 s. M16-1456 (16.2 s) cannot hold a 25 s window. Under a 24 fps conform, a native rate above
-62.4 fps (for a 25 s window), 66 fps (20 s) or 84 fps (10 s) cannot reach the window inside the budget. Such a Play is refused
-`PLAY_PACE_TOO_SLOW` before it starts (fail closed). No venue clip today is above 59.94 fps.
+on the clock, inside the same budget (`max(requested / 0.5, (required_source_frames - 1) / 15 fps) + 15 s`, above). A 25 s window on
+M16-1457 (1667 frames at 59.94) needs 1499 source frames: 62.4 s at 24 fps, inside 114.867 s (65 s before PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1).
+M16-1456 (16.2 s) cannot hold a 25 s window. Since the frame-sized budget demands at most 15 fps, a 24 fps conform reaches any
+native rate's window inside the budget. An engine pace that cannot cover the frames inside it still cannot, and that Play is refused
+`PLAY_PACE_TOO_SLOW` before it starts (fail closed). Examples: 12 fps on 20 s of M16-1457 needs 99.8 s against 94.867 s, and a
+12 fps conform of a 120 fps clip's 10 s window needs 99.9 s against 94.934 s. No venue clip today is above 59.94 fps.
 
 ### Typed refusals and exit codes
 

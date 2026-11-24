@@ -621,7 +621,8 @@ class VisiblePlaybackLauncherStaticTests(unittest.TestCase):
 
     def test_the_process_budget_is_the_apps_safety_net_not_the_capture_schedule(self) -> None:
         code = _strip_comments(self.TEXT)
-        self.assertIn("(Get-GuiSmokePlaySafetyMs -Seconds $Seconds)", code)
+        # PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: the budget is sized from the clip's native fps (the app's admitted frames)
+        self.assertIn("(Get-GuiSmokePlaySafetyMs -Seconds $Seconds -NativeFps $clipLengthGate.fps)", code)
         self.assertNotRegex(code, r"Start-Sleep -Milliseconds \(\$SettleMs \+ \$Captures")
 
     def test_the_verdict_is_acted_on_with_exit_43(self) -> None:
@@ -1011,7 +1012,10 @@ class OffscreenProbeAndParityTests(unittest.TestCase):
     def test_the_runners_process_budget_starts_from_the_apps_safety_net(self) -> None:
         text = RUNNER.read_text(encoding="utf-8")
         # CPU-LOOK-LEG-PACE-ABORT-1: the same derivation, with the CPU ceiling only under the runner's own -CpuPlayPaceInformational.
-        self.assertIn("(Get-GuiSmokePlaySafetyMs -Seconds $Seconds -CpuPaceInformational:$CpuPlayPaceInformational) +", text)
+        # PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: and from the clip-length gate's native fps, so it covers the app's frame-sized budget.
+        self.assertIn("(Get-GuiSmokePlaySafetyMs -Seconds $Seconds -NativeFps $clipNativeFpsForBudget -CpuPaceInformational:$CpuPlayPaceInformational) +", text)
+        self.assertIn('$clipNativeFpsForBudget = [double](Get-ObjectPropertyValue $clipLengthGate "fps")', text)
+        self.assertLess(text.index("$clipLengthGate = Test-GuiSmokeClipLength"), text.index("$clipNativeFpsForBudget = "))
 
     def test_the_rule_doc_documents_the_source_frame_class_its_tokens_and_the_launchers(self) -> None:
         doc = DOC.read_text(encoding="utf-8")

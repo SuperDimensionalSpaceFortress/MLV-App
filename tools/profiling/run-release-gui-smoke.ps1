@@ -1757,10 +1757,13 @@ $effectiveExpectedVisualScaleRequest = if ($ExpectedVisualScaleRequest -eq -2) {
     $ExpectedVisualScaleRequest
 }
 
-# ENFORCE-3 r2: the app's own wall-clock safety net for the window is requested / 0.5 + 15 s (it ends the Play with a
-# typed failure inside it), so the runner's process budget starts from that, never from the bare window.
+# ENFORCE-3 r2: the app's own wall-clock safety net for the window is max(requested / 0.5 + 15 s, ceil((frames - 1) / kGatedPaceFloorFps)
+# + 15 s), frames = ceil(requested x native fps) (PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1; it ends the Play with a typed failure inside it),
+# so the runner's process budget starts from that, never from the bare window. The native fps is the clip-length gate's header fps (read
+# above, before anything launches); a launch-only probe skips the gate and never plays, so its fps is 0 and the frame term is 0.
+$clipNativeFpsForBudget = [double](Get-ObjectPropertyValue $clipLengthGate "fps")
 $derivedProcessTimeoutMs = [Math]::Ceiling(
-    (Get-GuiSmokePlaySafetyMs -Seconds $Seconds -CpuPaceInformational:$CpuPlayPaceInformational) +
+    (Get-GuiSmokePlaySafetyMs -Seconds $Seconds -NativeFps $clipNativeFpsForBudget -CpuPaceInformational:$CpuPlayPaceInformational) +
     [Math]::Max(0, $SettleMs) +
     [Math]::Max(0, $SettleCpuMaxMs) +
     [Math]::Max(0, $ScreenshotDelayMs) +

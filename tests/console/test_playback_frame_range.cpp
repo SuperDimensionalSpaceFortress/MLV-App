@@ -849,13 +849,21 @@ TEST( HfrPlayFloor, AConformedPlayCannotStretchAShortHfrClipIntoALongerWindow )
 
 TEST( HfrPlayFloor, AConformTooSlowForTheSourceWindowIsRefusedBeforePlay )
 {
-    // The ruling's recorded side effect, fail closed: a 120 fps clip conformed to 24 needs 1200 source frames for its
-    // 10 s floor, 1199 / 24 = 50 s of Play, over the 10 / 0.5 + 15 = 35 s budget: PLAY_PACE_TOO_SLOW before Play.
+    // The ruling's recorded side effect, fail closed: a 120 fps clip needs 1200 source frames for its 10 s floor.
+    // PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: the Gated budget is sized from those frames at kGatedPaceFloorFps,
+    // max( 10 / 0.5, 1199 / 15 ) + 15 s = 94.934 s. A 12 fps conform needs 1199 / 12 = 99.9 s of Play, over it:
+    // PLAY_PACE_TOO_SLOW before Play. (A 24 fps conform, 50 s, was refused under the old 35 s budget and is now admitted:
+    // the floor the gate demands of a 120 fps clip is 15 fps, never 60.)
     const PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, 3000, 3000, 120.0, 10.0,
-                                                            playback_frame_range::kFloorFromNativeFps, true, 24.0 );
+                                                            playback_frame_range::kFloorFromNativeFps, true, 12.0 );
     ASSERT_FALSE( v.ok );
     ASSERT_EQ( std::string( "PLAY_PACE_TOO_SLOW" ), std::string( v.reason ) );
     ASSERT_EQ( 1200, v.requiredFrames );
+    ASSERT_EQ( 94.934, v.wallBudgetSeconds );
+    const PlayableWindowVerdict conform24 = evaluatePlayableWindow( 0, 1, 3000, 3000, 120.0, 10.0,
+                                                                    playback_frame_range::kFloorFromNativeFps, true, 24.0 );
+    ASSERT_TRUE( conform24.ok );
+    ASSERT_EQ( 1200, conform24.requiredFrames );
 }
 
 TEST( HfrPlayFloor, AnHfrClipLoopedToReachTenSecondsIsRefusedAndNeverCountsAsPlayed )

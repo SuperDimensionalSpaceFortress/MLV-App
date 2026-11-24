@@ -730,13 +730,22 @@ struct SourceFrameAdvanceCounter
 // The wall-clock safety net every automation wait carries. It is NOT the stop: running into it is a typed
 // failure (PLAY_SAFETY_TIMEOUT). It SCALES with the pace the venue must sustain (r2, fable H1): the engine is only
 // required to hold kMinSustainedPaceFraction of the clip's native fps, so the budget for `requested` seconds of
-// footage is requested / kMinSustainedPaceFraction + kPlaySafetyMarginMs. A venue below that floor is refused up front
+// footage is requested / kMinSustainedPaceFraction + kPlaySafetyMarginMs (at least: above 30 fps the admitted frames at
+// kGatedPaceFloorFps set it, see below and playSafetyMs). A venue below that floor is refused up front
 // when its engine pace is known (evaluatePlayableWindow: PLAY_PACE_TOO_SLOW) and ends early with the SAME typed token
 // when the pace only shows once Play runs (playPaceProjectsPastBudget) -- never a run that can only time out.
 // The runner's own process budget (gui-smoke-length-gate.ps1 Get-GuiSmokePlaySafetyMs) uses the same formula.
 constexpr double kMinSustainedPaceFraction = 0.5;
 constexpr int kPlaySafetyMarginMs = 15000;
 constexpr int64_t kPaceProbeMs = 8000;   // the measured pace is only trusted after this much Play wall clock
+// PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: the Gated budget never asks the engine for more than
+// min( kMinSustainedPaceFraction x native fps, kGatedPaceFloorFps ) source frames per second. For a clip at 30 fps or below the
+// fraction term is the larger budget and nothing changes; above 30 fps (59.94: half native is 29.97 fps) the ADMITTED source-frame
+// count is also budgeted at this floor -- 20 s of M16-1457 is 1199 frames, (1199 - 1) / 15 + 15 s = 94.867 s instead of 55 s,
+// which its baseline (22.0 fps = 54.5 s) sat within a second of. 15 fps is below the slowest 1457 CUDA mode measured (17.85 fps,
+// sweep r1 T1COOL; 17.923, r4). Measurement-only: no user playback path reads this budget.
+// tools/profiling/gui-smoke-length-gate.ps1 mirrors it ($script:GuiSmokeGatedPaceFloorFps; a parity test compares them).
+constexpr double kGatedPaceFloorFps = 15.0;
 
 // CPU-LOOK-LEG-PACE-ABORT-1: a CPU-backend leg's frame rate is informational (docs/dual-venue-evidence.md), so its pace
 // is MEASURED, never gated. PlayPaceMode::MeasuredInformational is armed only by the launcher's MLVAPP_PLAY_PACE_MODE
@@ -757,10 +766,17 @@ inline PlayPaceMode playPaceModeFromEnvironmentValue( const char *value )
 {
     return value && std::string( value ) == "informational" ? PlayPaceMode::MeasuredInformational : PlayPaceMode::Gated;
 }
-inline int64_t playSafetyMs( double requestedSeconds, PlayPaceMode mode = PlayPaceMode::Gated )
+// requiredSourceFrames: the frames the admitted Play must consume (PlayableWindowVerdict::requiredFrames, MainWindow
+// m_playRequiredSourceFrames). 0 (the default) or 1 leaves the budget exactly requested / fraction + margin; otherwise the budget is
+// at least ceil( (frames - 1) / kGatedPaceFloorFps ) + margin, so the steady pace the gate demands is never above kGatedPaceFloorFps.
+inline int64_t playSafetyMs( double requestedSeconds, PlayPaceMode mode = PlayPaceMode::Gated, int64_t requiredSourceFrames = 0 )
 {
-    return static_cast<int64_t>( std::max( 0.0, requestedSeconds ) / minSustainedPaceFractionFor( mode ) * 1000.0 )
+    const int64_t byFraction = static_cast<int64_t>( std::max( 0.0, requestedSeconds ) / minSustainedPaceFractionFor( mode ) * 1000.0 )
          + kPlaySafetyMarginMs;
+    const int64_t byFrames = requiredSourceFrames > 1
+        ? static_cast<int64_t>( std::ceil( static_cast<double>( requiredSourceFrames - 1 ) * 1000.0 / kGatedPaceFloorFps ) ) + kPlaySafetyMarginMs
+        : 0;
+    return std::max( byFraction, byFrames );
 }
 
 // The pace actually measured so far: source-frame steps advanced per second of Play wall clock. 0 when not measurable
@@ -1566,7 +1582,7 @@ inline PlayableWindowVerdict evaluatePlayableWindow(
     // Pace: the engine must be able to consume requiredFrames inside the caller's safety budget. Computed before
     // any verdict so even a refusal reports the pace the gate measured with.
     v.paceFps = paceFps == kPaceIsNative ? fps : paceFps;
-    v.wallBudgetSeconds = static_cast<double>( playSafetyMs( requestedSeconds, paceMode ) ) / 1000.0;
+    v.wallBudgetSeconds = static_cast<double>( playSafetyMs( requestedSeconds, paceMode, v.requiredFrames ) ) / 1000.0;
     v.wallNeededSeconds = v.paceFps > 0.0
         ? static_cast<double>( std::max<int64_t>( 0, v.requiredFrames - 1 ) ) / v.paceFps
         : 0.0;

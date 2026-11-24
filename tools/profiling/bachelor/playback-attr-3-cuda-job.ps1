@@ -1150,6 +1150,14 @@ $timeBudgetArgs['PlaySeconds'] = [int][Math]::Max(40, $PlaySeconds)
 # runner's 3600 s only holds the app's re-read, bounded at the measured cold rate with no margin (see Get-AttrCudaLegTimeBudget). A fixture reads no input and never clamps;
 # an input that fits the unshared budget is unchanged.
 $timeBudgetArgs['ShareSmokeCeiling'] = $true
+# PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: a GATED leg's Play may run to the app's frame-sized budget (Get-GuiSmokePlaySafetyMs -NativeFps:
+# max(requested / 0.5 + 15 s, ceil((ceil(requested x fps) - 1) / kGatedPaceFloorFps) + 15 s); 94.9 s for 20 s of M16-1457), so the smoke-process
+# timeout, the PresentMon capture ceiling and the um-run -TimeoutSec derived from it cover that budget the way the CPU branch below covers its
+# ceiling. This generator has no native-fps input, so the frame term is bounded with the highest native fps of any tracked leg clip (M16-1457 is
+# 59.94): a clip above it ends as a typed runner timeout, never a pass.
+$gatedBudgetNativeFpsBound = 60.0
+$timeBudgetArgs['PlaySeconds'] = [int][Math]::Max($timeBudgetArgs['PlaySeconds'],
+    [Math]::Ceiling((Get-GuiSmokePlaySafetyMs -Seconds $PlaySeconds -NativeFps $gatedBudgetNativeFpsBound) / 1000.0))
 # CPU-LOOK-LEG-PACE-ABORT-1: a cpu leg's Play may run to the CPU ceiling (Get-GuiSmokePlaySafetyMs -CpuPaceInformational: requested / (1/30)
 # + 15 s), so the smoke-process timeout, the PresentMon capture ceiling and the um-run -TimeoutSec derived from it must cover that ceiling
 # -- one derivation (the runner's), never a second hard-coded number.

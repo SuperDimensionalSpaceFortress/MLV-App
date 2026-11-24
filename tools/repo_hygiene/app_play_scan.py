@@ -98,7 +98,7 @@ REVIEWED_PLAY_STOPS = {
 PINNED_STOP_STATEMENTS = {
     "MainWindow::MainWindow": (
         "const playback_frame_range::PlayStopState autoplayState = programmaticPlayState( autoplayClock->elapsed(), "
-        "playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() ) ); "
+        "playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode(), m_playRequiredSourceFrames ) ); "
         "if( autoplayState == playback_frame_range::PlayStopState::Continue ) return; autoplayPoll->stop(); "
         "autoplayPoll->deleteLater(); if( ui->actionPlay->isChecked() ) { ui->actionPlay->setChecked( false ); "
         "on_actionPlay_triggered( false ); }",
@@ -126,7 +126,7 @@ PINNED_STOP_STATEMENTS = {
         ".arg( automationRunNonce() );",
     ),
     "MainWindow::runHeadlessPlaybackProfile": (
-        "const qint64 autoSettleSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() ); "
+        "const qint64 autoSettleSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode(), m_playRequiredSourceFrames ); "
         "playback_frame_range::PlayStopState autoSettleState = playback_frame_range::PlayStopState::Continue; "
         "while( ( autoSettleState = programmaticPlayState( autoSettleClock.elapsed(), autoSettleSafetyMs ) ) "
         "== playback_frame_range::PlayStopState::Continue ) { qApp->processEvents( QEventLoop::AllEvents ); "
@@ -134,7 +134,7 @@ PINNED_STOP_STATEMENTS = {
         "if( autoSettleState != playback_frame_range::PlayStopState::Reached )",
         "&& !m_lastLookAssistDiagnosticsValid && playback_frame_range::lookAssistSettleNeedsOwnPlay( "
         "m_programmaticPlayLedger.admitted ) ) {",
-        "const qint64 playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() ); "
+        "const qint64 playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode(), m_playRequiredSourceFrames ); "
         "while( ( playActionState = programmaticPlayState( playActionClock.elapsed(), playActionSafetyMs ) ) "
         "== playback_frame_range::PlayStopState::Continue ) { qApp->processEvents( QEventLoop::AllEvents ); "
         "sleepGuiThreadForSmokeRunner( 10 ); } playActionEndedEarly = playActionState == playback_frame_range::PlayStopState::EndedEarly;",

@@ -67,6 +67,21 @@ def _bytes(mb: float) -> int:
     return int(mb * 1048576)
 
 
+GATED_BUDGET_NATIVE_FPS_BOUND = 60.0      # playback-attr-3-cuda-job.ps1 $gatedBudgetNativeFpsBound (the highest native fps of any tracked leg clip)
+GATED_BOUND_LINE = "$gatedBudgetNativeFpsBound = 60.0"
+
+
+def gated_play_sec(play_seconds: int) -> int:
+    """The generator's GATED play allowance (PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1): the 40 s floor, or the app's frame-sized Gated budget at the generator's
+    native-fps bound, max(requested / kMinSustainedPaceFraction, ceil((ceil(requested x 60) - 1) / kGatedPaceFloorFps)) + margin, whichever is larger. 115 s for 25 s."""
+    text = HEADER.read_text(encoding="utf-8")
+    gate = header_constants(text)
+    floor_fps = float(re.search(r"constexpr double kGatedPaceFloorFps = ([0-9.]+);", text).group(1))
+    frames = math.ceil(play_seconds * GATED_BUDGET_NATIVE_FPS_BOUND - 1e-9)
+    budget_ms = max(expected_budget_ms(play_seconds, gate["gated_fraction"], gate["margin_ms"]), math.ceil((frames - 1) * 1000.0 / floor_fps) + gate["margin_ms"])
+    return max(40, play_seconds, math.ceil(budget_ms / 1000.0))
+
+
 # --- the pure check on the generator text (mutation-tested below) -------------------------------------------------------------------------------
 def confine_request_to_cpu_block(text: str) -> str:
     """The generator as it was on master before HFR-NATIVE-M16-1457-TIMEBUDGET-1: the one request line sits at the end of the CPU-informational block."""
@@ -374,11 +389,19 @@ class NoFixtureJobOfAnyBackendClamps(unittest.TestCase):
             with self.subTest(name):
                 play = int(extra[extra.index("-PlaySeconds") + 1]) if "-PlaySeconds" in extra else 25        # the generator's own default
                 job, out = self.generate(GENERATOR, f"cuda-{name}.job.ps1", extra)
-                self.assertEqual(check_unshared_job(job, out, self.unshared_budget(max(40, play)), cpu_markers_allowed=False), [], name)
+                self.assertEqual(check_unshared_job(job, out, self.unshared_budget(gated_play_sec(play)), cpu_markers_allowed=False), [], name)
+
+    def test_the_gated_play_allowance_covers_the_apps_frame_sized_budget(self) -> None:
+        # PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: 25 s at the 60 fps bound is 1500 frames, (1500 - 1) / 15 + 15 s = 114.934 s -> 115 s (was the 40 s floor);
+        # 20 s of M16-1457 (59.94 fps, the app's 94.867 s budget) is covered by the 20 s allowance at the bound, 95 s.
+        self.assertEqual(gated_play_sec(25), 115)
+        self.assertEqual(gated_play_sec(20), 95)
+        self.assertEqual(gated_play_sec(30), 135)
+        self.assertEqual(lf(GENERATOR.read_text(encoding="utf-8")).count(GATED_BOUND_LINE + "\n"), 1)
 
     def test_mutation_a_cuda_job_that_traces_a_clamp_or_takes_another_budget_is_caught(self) -> None:
         job, out = self.generate(GENERATOR, "cuda-base.job.ps1", [])
-        unshared = self.unshared_budget(40)
+        unshared = self.unshared_budget(gated_play_sec(25))
         self.assertEqual(check_unshared_job(job, out, unshared, cpu_markers_allowed=False), [])
         smoke_ms, presentmon_sec = job_timeouts(job)
         mutants = {
@@ -397,7 +420,7 @@ class NoFixtureJobOfAnyBackendClamps(unittest.TestCase):
         mutant = self.mutant_generator("cuda-traces-clamp", lambda g, m: (self.replaced_once(
             g, CLAMP_TRACE_EXPRESSION, 'SMOKE_CEILING_TRACE = " smokeCeilingClamped=True appReadAllowanceSec=0"'), m))
         job, out = self.generate(mutant, "mutant-cuda-clamp.job.ps1", [])
-        self.assertTrue(check_unshared_job(job, out, self.unshared_budget(40), cpu_markers_allowed=False), "(a) did not go red on a CUDA job that traces a clamp")
+        self.assertTrue(check_unshared_job(job, out, self.unshared_budget(gated_play_sec(25)), cpu_markers_allowed=False), "(a) did not go red on a CUDA job that traces a clamp")
 
     def test_mutation_confining_the_switch_to_the_cpu_block_again_is_caught(self) -> None:
         # the master shape: the request line back at the end of the CPU-informational block, so a CUDA leg never gets the shared ceiling (M16-1457 is refused again)

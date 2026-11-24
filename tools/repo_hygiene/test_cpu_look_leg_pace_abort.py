@@ -75,7 +75,7 @@ def check_gate_text(text: str) -> list[str]:
     problems = []
     if "$script:GuiSmokeCpuInformationalMinPaceFraction = 1.0 / 30.0" not in text:
         problems.append("the gate does not mirror the C++ CPU ceiling fraction")
-    if "param([Parameter(Mandatory = $true)][double]$Seconds, [switch]$CpuPaceInformational)" not in text:
+    if "param([Parameter(Mandatory = $true)][double]$Seconds, [switch]$CpuPaceInformational, [double]$NativeFps = 0)" not in text:
         problems.append("Get-GuiSmokePlaySafetyMs has no -CpuPaceInformational switch")
     if "$fraction = if ($CpuPaceInformational) { $script:GuiSmokeCpuInformationalMinPaceFraction } else { $script:GuiSmokeMinSustainedPaceFraction }" not in text:
         problems.append("the CPU ceiling is not selected by the switch alone")
@@ -96,7 +96,7 @@ def check_runner_text(text: str) -> list[str]:
         problems.append("an ambient pace-mode variable is not stripped from the app's environment")
     if 'if ($CpuPlayPaceInformational) { $envBlock[$script:GuiSmokePaceModeEnvironment] = "informational" }' not in text:
         problems.append("the switch does not set the pace mode in the app's environment")
-    if "(Get-GuiSmokePlaySafetyMs -Seconds $Seconds -CpuPaceInformational:$CpuPlayPaceInformational) +" not in text:
+    if "(Get-GuiSmokePlaySafetyMs -Seconds $Seconds -NativeFps $clipNativeFpsForBudget -CpuPaceInformational:$CpuPlayPaceInformational) +" not in text:
         problems.append("the derived process timeout ignores the CPU ceiling")
     if "cpuPaceInformational = [bool]$CpuPlayPaceInformational" not in text:
         problems.append("the result does not record the pace mode")
@@ -188,8 +188,8 @@ def check_main_window_text(text: str) -> list[str]:
     problems = []
     if 'qgetenv( "MLVAPP_PLAY_PACE_MODE" )' not in text:
         problems.append("the app does not read the pace mode")
-    if text.count("playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() )") != 4:
-        problems.append("a safety-net budget ignores the pace mode")
+    if text.count("playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode(), m_playRequiredSourceFrames )") != 4:
+        problems.append("a safety-net budget ignores the pace mode or the admitted frames")
     if "elapsedMs, safetyMs, automationPlayPaceMode(), m_playPaceHistory );" not in text:
         problems.append("the stop decision ignores the pace mode")
     if "enginePaceFps > 0.0 ? enginePaceFps : -1.0, automationPlayPaceMode() );" not in text:
@@ -258,7 +258,7 @@ class CpuPaceLaunchers(unittest.TestCase):
     def test_mutation_gate(self) -> None:
         self._assert_each_mutant_is_caught(self.gate, check_gate_text, {
             "fraction drifts": ("= 1.0 / 30.0", "= 1.0 / 2.0"),
-            "the switch is dropped": ("[double]$Seconds, [switch]$CpuPaceInformational)", "[double]$Seconds)"),
+            "the switch is dropped": ("[double]$Seconds, [switch]$CpuPaceInformational,", "[double]$Seconds,"),
             "the ceiling is always used": ("$fraction = if ($CpuPaceInformational) {", "$fraction = if ($true) {"),
             "extra environment passes": ("if ($pairKey -eq $script:GuiSmokePaceModeEnvironment) {", "if ($false) {"),
             "inherited passes": ("if (([string]$name).ToUpperInvariant() -eq $script:GuiSmokePaceModeEnvironment) {", "if ($false) {"),
