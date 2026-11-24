@@ -1560,7 +1560,8 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         text = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
         body = text[text.index("function Invoke-VenueBoundedProcess"):text.index("function Get-VenueDriverScriptMissing")]
         self.assertIn("try { $p.Kill($true) } catch { $killErrored = $true }", body, "a tree kill that threw is recorded, not swallowed")
-        self.assertIn("killConfirmed = $(if ($timedOut) { (-not $killErrored) -and [bool]$p.HasExited } else { $true })", body)
+        # (DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r2, adversary pass 3 A14: confirmed from the TREE, so both of the child's streams at end of file too)
+        self.assertIn("killConfirmed = $(if ($timedOut) { (-not $killErrored) -and [bool]$p.HasExited -and $outTask.IsCompleted -and $errTask.IsCompleted } else { $true })", body)
 
     def test_staged_manifest_states(self) -> None:
         q = f"Import-Module '{MODULE}' -Force -DisableNameChecking; $r = Get-VenueStagedBuildManifest -AgentShare '{{}}' -SourceCommit '{SHA}' -TimeoutSec 20; \"$($r.state) $($r.sha256)\""
