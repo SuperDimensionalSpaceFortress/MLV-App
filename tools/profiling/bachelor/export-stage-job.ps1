@@ -59,8 +59,10 @@ $ArtifactsModule = Join-Path $PSScriptRoot 'AttrCudaArtifacts.psm1'
 $OwnerFootageModule = Join-Path $PSScriptRoot 'AttrCudaOwnerFootage.psm1'
 # EXPORT-RENDER-PIPE-TIMING-2 r4 (sol r3 B2): the central reader's one batch.log line grammar, embedded from the module that owns it (Get-BatchLineGrammarText)
 $DualVenueModule = Join-Path $PSScriptRoot '..\dual-venue\DualVenueRunner.psm1'
-$BatchLineGrammarTables = @('$script:ExportBatchLineShapes', '$script:ExportBatchLineGrammar', '$script:ExportBatchLineForbidden')
-$BatchLineGrammarFunctions = @('ConvertFrom-DvBatchLogLine', 'ConvertFrom-DvBatchExportLog')
+# (EXPORT-RENDER-PIPE-TIMING-3 r1, sol r4 B4: and the reader's ONE binding verdict, Get-DvBatchExportBindingProblems, with the declaration reader and the tables they read)
+$BatchLineGrammarTables = @('$script:ExportBatchLineShapes', '$script:ExportBatchLineGrammar', '$script:ExportBatchLineForbidden', '$script:ExportRenderStartCodec',
+    '$script:ExportRenderStartContainer', '$script:ExportRenderStartFps', '$script:ExportRenderStartFpsMin', '$script:ExportRenderStartFpsMax', '$script:ExportCdngFrameLeaf')
+$BatchLineGrammarFunctions = @('ConvertFrom-DvBatchLogLine', 'ConvertFrom-DvBatchExportLog', 'Get-DvRenderStartDeclaration', 'Get-DvBatchExportBindingProblems')
 # The job-side conventions the playback job template defines, extracted from that template (never re-typed here).
 $SharedTemplateFunctions = @('Assert-UnderMlvTmp', 'Save-Json', 'Write-JobTrace', 'Get-Sha', 'Get-Mean')
 # The AttrCuda helpers the job calls directly; their callees are added by closure below.
@@ -371,11 +373,16 @@ try {
         $manifest.first = [ordered]@{ name = $outputs[0].Name; bytes = $outputs[0].Length; sha256 = (Get-AttrCudaFileSha256Blocks -Path $outputs[0].FullName -TracePath $Trace -Label 'output-first').sha256 }
         $manifest.last = [ordered]@{ name = $outputs[-1].Name; bytes = $outputs[-1].Length; sha256 = (Get-AttrCudaFileSha256Blocks -Path $outputs[-1].FullName -TracePath $Trace -Label 'output-last').sha256 }
     }
-    $outputAgrees = if ($Format -eq 'cdng-lossless') { $null -ne $exported -and $outputs.Count -eq $exported } else { $outputs.Count -eq 1 -and $null -ne $verifiedFrames -and $null -ne $exported -and $verifiedFrames -eq $exported }
+    # EXPORT-RENDER-PIPE-TIMING-3 r1 (sol r4 B4): the central reader's ONE binding verdict (embedded verbatim): DONE's clip against the CDNG frames found, and a present
+    # RENDER_START (its grammar, the declaration's checks, the order, the .mov leaf and the verified dimensions) on ProRes, so a run the central reader reads INVALID is
+    # never EXPORT_CAPTURED here
+    $bind = Get-DvBatchExportBindingProblems -Batch $batchRead -Format $Format -OutputCount $outputs.Count -FirstName $(if ($null -ne $manifest.first) { $manifest.first.name } else { $null }) `
+        -LastName $(if ($null -ne $manifest.last) { $manifest.last.name } else { $null }) -ReadStart ($Format -eq 'prores' -and $batchRead.start.count -gt 0)
+    $outputAgrees =if ($Format -eq 'cdng-lossless') { $null -ne $exported -and $outputs.Count -eq $exported } else { $outputs.Count -eq 1 -and $null -ne $verifiedFrames -and $null -ne $exported -and $verifiedFrames -eq $exported }
     $result = $(if ($timedOut -and -not $killConfirmed) { 'EXPORT_KILL_UNCONFIRMED' }
         elseif ($timedOut) { 'EXPORT_TIMEOUT' }
         elseif ($appExitCode -ne 0) { 'EXPORT_EXIT_NONZERO' }
-        elseif ($null -eq $exported) { 'EXPORT_OUTPUT_MISMATCH' }
+        elseif ($null -eq $exported -or @($bind.problems).Count -gt 0) { 'EXPORT_OUTPUT_MISMATCH' }
         elseif ($exported -eq 0) { 'EXPORT_NO_FRAMES' }
         elseif ($exported -lt $MaxFrames) { 'EXPORT_FRAMES_SHORT' }
         elseif (-not $stagePresent) { 'EXPORT_PROFILE_ABSENT' }

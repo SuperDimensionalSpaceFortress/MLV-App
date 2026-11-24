@@ -2206,8 +2206,11 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
                f"{h} dimensions=1920x1440 bytes=9 decoded_frame_bytes=7 container_probe=C:/kit/ffprobe.exe",
                f"{h} dimensions=1920x1440 dimensions=1280x720 bytes=9 container_probe=C:/kit/ffprobe.exe"]   # r6 row: before bytes=, already INVALID
         tail = " probe_source=ffprobe-json codec=prores container=mov sar=1:1 dar=4:3"
+        # (EXPORT-RENDER-PIPE-TIMING-3 r1 forced companion, rule G2: a probe path component that reads as a field of the line in its shape is that field named again,
+        # so the r6 B3 field-like-path control is INVALID now; a component not of the field's shape stays the clean control)
+        bad.append(f"{h} dimensions=1920x1440 bytes=9 container_probe=C:/kit dimensions=1280x720 decoded_frames=30 bytes=0/ffprobe.exe{tail}")
         good = [f"{h} dimensions=1920x1440 bytes=9 container_probe=C:/kit/ffprobe.exe{tail}",
-                f"{h} dimensions=1920x1440 bytes=9 container_probe=C:/kit dimensions=1280x720 decoded_frames=30 bytes=0/ffprobe.exe{tail}"]
+                f"{h} dimensions=1920x1440 bytes=9 container_probe=C:/kit dimensions=archive/ffprobe.exe{tail}"]
         return bad, good
 
     def r7_case(self, verified: str, start: str | None = None, done: str | None = None) -> dict:
@@ -2325,7 +2328,8 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
             # as a field of its line in that field's shape is that field named again, so the line is refused fail-closed; field-like text NOT of the field's shape stays clean)
             row("F9", (OM, RV, "container_probe="), v=V(probe="C:/kit dimensions=1280x720 decoded_frames=30 bytes=0/ffprobe.exe")),
             row("F10", (OM, RV, "container_probe="), v=V(probe="C:/a probe_source=none codec=h264 container=mp4 sar=2:1 dar=1:1")),
-            row("F11", (OM, RS, "out="), s=S0 + " codec=h264"),
+            # (TIMING-3 r1 forced companion, rule G2: the field named again inside the out= slot is refused by RENDER_START's own grammar code, before the leaf binding)
+            row("F11", (PA, RS, "out="), s=S0 + " codec=h264"),
             row("F12", (BU, DN, "exported="), d=D0 + " exported=1"),
             # (r4, sol r3 B4 forced companion: the repeated triplet is now refused by DONE's own grammar, before the clip is bound to RENDER_VERIFIED's)
             # (TIMING-3 r1, rule G1: DONE's clip is positional, never field-parsed, and is BOUND to the ProRes witness: RENDER_VERIFIED's ordinal prefix refuses it)

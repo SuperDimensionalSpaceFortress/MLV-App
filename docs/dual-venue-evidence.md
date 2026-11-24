@@ -479,13 +479,28 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
     sum, so what is left is clip open, receipt apply, frame plan and ffmpeg start, the diagnostics read and teardown between the drain and the verify, and the publish.
     `dualIsoClassAgrees` / `dualIsoActiveFrames` are read over `llrawproc_dual_iso` (from r3 they fail closed, see below), and `renderPipeTimed` is true when the pipe write is on every timed frame with one drain and one verify. Both ProRes legs gate
     `dualIsoClassAgrees eq true` and `renderPipeTimed eq true`. A stage log from a build before that card has none of these stages: both metrics are null with a
-    `CouldNotCheck` naming that, no problem is added, and `untimedPerFrameMs` is the wall per frame minus `processed16_total` as before.
+    `CouldNotCheck` naming that, no problem is added, and `untimedPerFrameMs` is the wall per frame minus `processed16_total` as before. **One exception
+    (`EXPORT-RENDER-PIPE-TIMING-2` r4, sol r4 H-DOC):** a PRESENT `RENDER_START` is read by the line grammar and its bindings on every ProRes route, an older or unnamed
+    build included (`DualVenueRunner.psm1`, `if ($pipeRoute -or $batch.start.count -gt 0)`), and the capture is `INVALID` when it fails; an absent one adds nothing there.
     From r2 the reader also holds the log to the producer's own sequence and declaration: each `llrawproc_dual_iso` record on a frame that carries `llrawproc` is the record
     right after an `llrawproc` record of that frame and fits inside it; the drain follows every per-frame record and the verify follows the drain (`EXPORT_RECORD_INVALID`);
     `RENDER_START` is read whole, once, for the clip `DONE` names, before `RENDER_VERIFIED` and `DONE`, and its cut is the frame window (the loop times frames
     `cutIn - 1 .. cutOut - 1`, `EXPORT_STAGE_WINDOW_MISMATCH` otherwise). The build identity (the job summary's `sourceCommit`) is classed from that commit's own
     `src/debug/StageTiming.h`: a build that defines these stages with a log carrying none of them is an incomplete capture (`EXPORT_PROFILE_ABSENT`), a build that does not
-    with a log carrying them is `EXPORT_PROFILE_FOREIGN`, and a build this repository cannot name keeps the reading above.
+    with a log carrying them is `EXPORT_PROFILE_FOREIGN`, and a build this repository cannot name keeps the reading above (with the same exception: a present
+    `RENDER_START` that fails the grammar or its bindings is `INVALID` on an older or unnamed build too).
+    **Batch-line rule G and one verdict (`EXPORT-RENDER-PIPE-TIMING-3` r1, sol r4 B1-B4).** The producer prints the clip, `out=` and `container_probe=` unescaped, so a
+    line alone is ambiguous; the writer is not changed. *G1:* `DONE`'s clip is positional (the text between the tag and the right-peeled `exported= skipped= elapsed=`), never
+    field-parsed, so `take elapsed=1.0` is a legal clip. It is bound to a witness per format: on ProRes, `RENDER_START` and `RENDER_VERIFIED` must start with
+    `<tag> <clip> ` (every ProRes route requires `RENDER_VERIFIED`); on CDNG, every DNG leaf the manifest names (`first.name`, `last.name`) is `<clip>_<frame>.dng` in one of
+    the two forms `CdngSequenceExport.cpp:269-280` writes, or the capture is `EXPORT_BATCH_LOG_UNREADABLE`. No output to bind (no manifest, count 0) adds nothing. *G2:*
+    every field key appears at most once per line. A space-delimited token of the verbatim `out=` / `container_probe=` value that starts with that key's `=`, or with another
+    key of the line followed by a value of that field's shape, is that field named again (`INVALID`). The domain is fail-closed: a real path whose space-delimited component
+    reads as a field of its line in that field's shape is refused, never read as PASS (`C:/kit dimensions=archive/ffprobe.exe` is still clean). The job builds both paths
+    under its scratch root from validated tokens. *G3:* the no-probe sentinel rule is unchanged and runs first. *One verdict:* the line order, the `out=` leaf, the verified
+    dimensions and the CDNG clip witness are one module function, `Get-DvBatchExportBindingProblems`. The central reader and the Bachelor job
+    (`export-stage-job.ps1`, which embeds it verbatim with the declaration reader and its tables) both call it, so a run read `INVALID` centrally is
+    `EXPORT_OUTPUT_MISMATCH` at the venue, never `EXPORT_CAPTURED`.
     From r3 `RENDER_START` must also be the ProRes producer's own declaration: `codec=prores container=mov` (the strings `BatchRenderedVideoPlan.h` names for ProRes and
     Mov), source and output dimensions above 0, and an fps that is a finite decimal above 0. Anything else is `EXPORT_PROFILE_FOREIGN`.
     **Dual-ISO fails closed (r3, KNOWN GAP).** A `llrawproc_dual_iso` time above 0 is the time of the dual-ISO *attempt*. `llrawproc.c` times the attempt, and `dualiso.c`

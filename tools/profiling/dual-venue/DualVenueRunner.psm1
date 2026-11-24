@@ -5264,22 +5264,12 @@ function ConvertFrom-DvBatchLogLine {
         $body = $(if ($at -ge 0) { $body.Substring(0, $at) } else { '' })
     }
     if ([string]::IsNullOrEmpty($body)) { return (& $fail $(if ($null -eq $g.rest) { 'it names no clip before exported=' } else { "its $($g.rest)= value is empty" })) }
-    # r4 (sol r3 B4): a field of the peeled trailer named again just before it is a repeat, not clip text (DONE view-0 exported=29 skipped=1 elapsed=40.0 exported=30 ...
-    # read the first triplet as the clip, and CDNG has no RENDER_START to bind the clip). A one-token clip spelled like a key is the clip (DONE requires one), so it stays.
-    # (adversary pass 2 A1 on 2d8e9bf2: an extra separator before the trailer does not hide the repeat; pass 3 A1 on 68f078d6: nor does text after a buried triplet, so
-    # EVERY token of a clip of more than one token is checked, not only its last)
-    if ($null -eq $g.rest) {
-        $clipTokens = @($body.Split([char]' ') | Where-Object { $_.Length -gt 0 })
-        if ($clipTokens.Count -gt 1) {
-            [array]::Reverse($clipTokens)   # (the repeat nearest the trailer is the one named)
-            foreach ($tok in $clipTokens) {
-                foreach ($spec in $right) {
-                    if (& $isField $tok $spec) { return (& $fail "before field $($field + 1) ($($right[0].Split('=')[0])=) its clip holds '$tok', which names $($spec.Split('=')[0])= again (the producer writes each field once, after the clip)") }
-                }
-            }
-        }
-    }
-    # r4 (sol r3 B1): the no-probe sentinel binds its trailer both ways, and is the whole value: text after 'unavailable' is a field named again, not a path
+    # EXPORT-RENDER-PIPE-TIMING-3 r1 (rule G1, sol r4 B1): DONE's clip is POSITIONAL, the text between the tag and the right-peeled trailer, and is never field-parsed:
+    # completeBaseName (BatchRunner.cpp:324) may hold ' elapsed=1.0' (take elapsed=1.0.MLV), so the r4 clip-token scan refused a legal clip. A repeated triplet moved into
+    # the clip (sol r3 B4) is refused by the clip's WITNESS instead: ProRes RENDER_START / RENDER_VERIFIED's ordinal prefix below, CDNG the manifest's frame leaves
+    # (Get-DvBatchExportBindingProblems). The line alone is ambiguous: no reader-only rule both reads B1 PASS and refuses r3 B4.
+    # r4 (sol r3 B1), rule G3 (unchanged, before G2): the no-probe sentinel binds its trailer both ways, and is the whole value: text after 'unavailable' is a field named
+    # again, not a path
     $sentinel = $(if ($null -ne $g.PSObject.Properties['sentinel']) { $g.sentinel } else { $null })
     if ($null -ne $sentinel) {
         $mark = [string]$sentinel[$g.rest]
@@ -5293,6 +5283,19 @@ function ConvertFrom-DvBatchLogLine {
             if ($off.Count -gt 0) {
                 $want = @($sentinel.Keys | ForEach-Object { "$_=$($sentinel[$_])" }) -join ' '
                 return (& $fail "it carries $(@($on | ForEach-Object { "$_=$($sentinel[$_])" }) -join ' ') but $(@($off | ForEach-Object { "$_=$($values[$_])" }) -join ' '); with no probe the producer prints $want together (BatchRunner.cpp:810-819), so the line is no one verification")
+            }
+        }
+    }
+    # EXPORT-RENDER-PIPE-TIMING-3 r1 (rule G2, sol r4 B2 / B3, key3 r4 H2): every field key at most once per line. The verbatim path slot (out= / container_probe=) is
+    # split on single U+0020; a token that starts with <rest key>= (any value), or with <k>= for a key k of the kind's left / right lists and whose remainder is of that
+    # field's shape, is that field named again (`out=C:/a.mov out=D:/out/view-0.mov` and `container_probe=C:/kit/ffprobe.exe dimensions=1280x720 ...` read PASS before).
+    # Domain, fail-closed (INVALID, never PASS): a real path with a space-delimited component that reads as a field of its line in that field's shape is refused; the job
+    # builds both paths under its scratch root from validated tokens (export-stage-job.ps1). DONE has no such slot, and its clip is never scanned (G1 above).
+    if ($null -ne $g.rest) {
+        foreach ($tok in $body.Split([char]' ')) {
+            if ($tok.StartsWith("$($g.rest)=", [StringComparison]::Ordinal)) { return (& $fail "its $($g.rest)= value holds '$tok', which names $($g.rest)= again (the producer writes each field once, at its position)") }
+            foreach ($spec in @(@($g.left) + $right)) {
+                if (& $isField $tok $spec) { return (& $fail "its $($g.rest)= value holds '$tok', which names $($spec.Split('=')[0])= again (the producer writes each field once, at its position)") }
             }
         }
     }
@@ -5394,6 +5397,59 @@ function Get-DvRenderStartDeclaration {
     }
     [pscustomobject]@{ problem = $null; scaled = ([string]$f['scaled'] -ceq 'true'); cutIn = $ci; cutOut = $co; frames = $n; index = $Start.index
                        out = [string]$f['out']; output = "$($ow)x$($oh)" }
+}
+
+# EXPORT-RENDER-PIPE-TIMING-3 r1 (rule G1): the rest of a CDNG frame leaf after `<clip>_`, as CdngSequenceExport.cpp:269-280 names it: <frame6>.dng (CODEC_CNDG_DEFAULT,
+# :269-271) or 1_<year>-<month>-<day>_0001_C0000_<frame6>.dng (:275-280). Each width is a minimum (QString::arg's field width): the year is tm_year + 1900 over a uint16 and
+# month / day are uint16 (mlv.h:201-203, macros.h:61-63), so up to five digits; the frame number is a uint32 (mlv_object.h:52), so up to ten.
+$script:ExportCdngFrameLeaf = '\A(?:1_[0-9]{2,5}-[0-9]{2,5}-[0-9]{2,5}_0001_C0000_)?[0-9]{6,10}\.dng\z'
+
+function Get-DvBatchExportBindingProblems {
+    # EXPORT-RENDER-PIPE-TIMING-3 r1 (sol r4 B4): the ONE verdict that binds the batch log's lines to this export. The central reader (Get-DvExportEvidence) and the
+    # Bachelor export-stage job (which embeds this function verbatim) both call it, so neither re-derives it. -Batch is the ConvertFrom-DvBatchExportLog result;
+    # -OutputCount, -FirstName and -LastName are the output manifest's count and its first / last record's name (null when absent or not of that type); -ReadStart reads
+    # RENDER_START (a ProRes route). Returns [pscustomobject]@{ problems; decl }:
+    #   (a) G1, the CDNG clip witness: DONE's clip is positional (the text between the tag and the right-peeled trailer), never field-parsed, and every DNG leaf the
+    #       manifest names is <clip>_<frame>.dng. ProRes's witness is RENDER_START / RENDER_VERIFIED's ordinal prefix (ConvertFrom-DvBatchLogLine), which every ProRes
+    #       route of both callers requires. No output to bind (no manifest, count 0, a name that is not a string) is unbound: no problem here (the callers' own rules refuse
+    #       a PASS there).
+    #   (b) with -ReadStart: the declaration's problem (Get-DvRenderStartDeclaration) or, when it reads, the producer's line order, its out= leaf against the manifest's .mov
+    #       and its output= against RENDER_VERIFIED's dimensions=; decl is that declaration (the caller keeps scaled= and the frame window on it).
+    # It calls no module-private helper and no git.
+    param([Parameter(Mandatory)]$Batch, [Parameter(Mandatory)][string]$Format, [AllowNull()][object]$OutputCount, [AllowNull()][object]$FirstName,
+          [AllowNull()][object]$LastName, [bool]$ReadStart = $false)
+    $problems = [System.Collections.Generic.List[string]]::new()
+    $decl = $null
+    $clip = $Batch.done.clip
+    if ($Format -ceq 'cdng-lossless' -and $clip -is [string] -and ($OutputCount -is [int] -or $OutputCount -is [long]) -and $OutputCount -gt 0) {
+        foreach ($leaf in @($FirstName, $LastName)) {
+            if ($leaf -isnot [string]) { continue }
+            $bound = $leaf.StartsWith("$($clip)_", [StringComparison]::Ordinal) -and [regex]::IsMatch($leaf.Substring($clip.Length + 1), $script:ExportCdngFrameLeaf)
+            if (-not $bound) {
+                $problems.Add("EXPORT_BATCH_LOG_UNREADABLE: DONE names the clip '$clip', but output-manifest.json lists '$leaf', and the batch runner names each frame of that clip $($clip)_<frame>.dng (CdngSequenceExport.cpp:269-280), so the DONE line is not this export's")
+                break
+            }
+        }
+    }
+    if ($ReadStart) {
+        # (moved verbatim from Get-DvExportEvidence's ProRes route, r2 / r5 / r6 / TIMING-2 r4: same messages, same order)
+        $decl = Get-DvRenderStartDeclaration -Start $Batch.start
+        if ($null -ne $decl.problem) { $problems.Add($decl.problem) }
+        else {
+            if ($batch.done.count -eq 1 -and $decl.index -gt $batch.done.index) { $problems.Add('EXPORT_OUTPUT_MISMATCH: batch.log writes RENDER_START after DONE; the rendered runner declares the clip before it exports it, so the declaration is not of this export') }
+            elseif ($batch.verified.count -eq 1 -and ($decl.index -gt $batch.verified.index -or ($batch.done.count -eq 1 -and $batch.verified.index -gt $batch.done.index))) {
+                $problems.Add('EXPORT_OUTPUT_MISMATCH: batch.log does not write RENDER_START, RENDER_VERIFIED and DONE in the order the rendered runner writes them, so they are not one export')
+            }
+            $outLeaf = [regex]::Split([string]$decl.out, '[\\/]')[-1]
+            if ($FirstName -is [string] -and -not [string]::Equals($outLeaf, $FirstName, [StringComparison]::Ordinal)) {
+                $problems.Add("EXPORT_OUTPUT_MISMATCH: RENDER_START declares out=$($decl.out), whose file is '$outLeaf', but output-manifest.json lists '$FirstName', so the declaration is not of this export's .mov")
+            }
+            if ($null -ne $batch.verified.fields -and -not [string]::Equals([string]$batch.verified.fields['dimensions'], [string]$decl.output, [StringComparison]::Ordinal)) {
+                $problems.Add("EXPORT_OUTPUT_MISMATCH: RENDER_START declares output=$($decl.output) but RENDER_VERIFIED decoded dimensions=$($batch.verified.fields['dimensions']), so the declaration and the verification are not of one .mov")
+            }
+        }
+    }
+    [pscustomobject]@{ problems = [string[]]@($problems); decl = $decl }
 }
 
 # EXPORT-RENDER-PIPE-TIMING-1 r2 (adversary A6 on a6f48506): whether a build emits this card's stages, read from that commit's own src/debug/StageTiming.h in the repo this module
@@ -5705,6 +5761,16 @@ function Get-DvExportEvidence {
             if (-not ($deleted -is [bool] -and $deleted)) { $problems.Add('EXPORT_OUTPUT_NOT_DELETED: output-manifest.json does not record the exported footage as deleted from the venue (deleted is not true), so derived owner footage may remain there') }
         }
     }
+    # EXPORT-RENDER-PIPE-TIMING-3 r1 (rule G1): the manifest's first / last record names, for the one verdict (Get-DvBatchExportBindingProblems) that binds DONE's clip
+    # to its CDNG witness here and RENDER_START on the ProRes route below; the Bachelor job calls the same function with the names it wrote
+    $mFirst = $(if ($null -ne $manifest) { Get-DvProp $manifest 'first' } else { $null }); $mLast = $(if ($null -ne $manifest) { Get-DvProp $manifest 'last' } else { $null })
+    $mFirstName = $(if ($mFirst -is [System.Management.Automation.PSCustomObject]) { Get-DvProp $mFirst 'name' } else { $null })
+    $mLastName = $(if ($mLast -is [System.Management.Automation.PSCustomObject]) { Get-DvProp $mLast 'name' } else { $null })
+    $mCount = $(if ($null -ne $manifest) { Get-DvExportInt64 (Get-DvProp $manifest 'count') } else { $null })
+    if ($Format -ceq 'cdng-lossless') {
+        $bind = Get-DvBatchExportBindingProblems -Batch $batch -Format $Format -OutputCount $mCount -FirstName $mFirstName -LastName $mLastName -ReadStart:$false
+        foreach ($p in $bind.problems) { $problems.Add($p) }
+    }
     $stages = $null
     if ($Format -ceq 'cdng-lossless') {
         $m.stageFramesSeen = $null; $m['stageFramesSeenCouldNotCheck'] = 'a CDNG export is timed by the export stage profiler, not the stage-timing log'
@@ -5997,31 +6063,22 @@ function Get-DvExportEvidence {
                 # r2 (adversary A2, A3, A5 on a6f48506): the line is read WHOLE, in the producer's exact field order (Get-DvRenderStartDeclaration), for DONE's clip, before
                 # RENDER_VERIFIED and DONE; and its cut is the frame window: the producer's loop (BatchRunner.cpp:541) times frames cutIn-1 .. cutOut-1 and nothing else
                 # (EXPORT-RENDER-PIPE-TIMING-2 r2: from the batch log's one read, ConvertFrom-DvBatchExportLog; the order check uses each line's parsed start offset)
-                $decl = Get-DvRenderStartDeclaration -Start $batch.start
+                # r5 (sol r4 B3): the declaration is of THIS output. out= is the path the runner publishes the .mov to (BatchRunner.cpp finalPath), and the job's manifest
+                # names the one .mov it found (export-stage-job.ps1 first.name, the file's leaf): another leaf is another export's declaration. RENDER_VERIFIED's dimensions=
+                # are the decoded .mov's (outWidth x outHeight, the frame plan's), so they are the declared output= or the two lines are not one export.
+                # r6 (sol r5 B3): dimensions= is a REQUIRED field read at the producer's token position (BatchRunner.cpp:803 writes it fifth after the tag, between
+                # decoded_frame_bytes= and bytes=), never by a substring scan of the whole line: a line without it at that position is not the producer's verification
+                # of this .mov (INVALID), and text after it (container_probe= prints the probe path verbatim, which may hold ' dimensions=') is never the field
+                # (EXPORT-RENDER-PIPE-TIMING-2 r2: the line grammar holds dimensions= to its one position and shape, so this binds the parsed field; a verification that
+                # failed the grammar has its one problem above and adds nothing here)
+                # EXPORT-RENDER-PIPE-TIMING-3 r1 (sol r4 B4, ONE verdict): the declaration, the order, the out= leaf and the dimensions binding above are
+                # Get-DvBatchExportBindingProblems (moved there verbatim, same messages and order), which the Bachelor job calls too, so the venue never reads EXPORT_CAPTURED
+                # where this reader reads INVALID. scaled= and the frame window stay here, on its decl, only when the declaration reads.
+                $bind = Get-DvBatchExportBindingProblems -Batch $batch -Format $Format -OutputCount $mCount -FirstName $mFirstName -LastName $mLastName -ReadStart:$true
+                $decl = $bind.decl
                 $scale = $perStage['export_scale']
-                if ($null -ne $decl.problem) { $problems.Add($decl.problem) }
-                else {
-                    if ($batch.done.count -eq 1 -and $decl.index -gt $batch.done.index) { $problems.Add('EXPORT_OUTPUT_MISMATCH: batch.log writes RENDER_START after DONE; the rendered runner declares the clip before it exports it, so the declaration is not of this export') }
-                    elseif ($batch.verified.count -eq 1 -and ($decl.index -gt $batch.verified.index -or ($batch.done.count -eq 1 -and $batch.verified.index -gt $batch.done.index))) {
-                        $problems.Add('EXPORT_OUTPUT_MISMATCH: batch.log does not write RENDER_START, RENDER_VERIFIED and DONE in the order the rendered runner writes them, so they are not one export')
-                    }
-                    # r5 (sol r4 B3): the declaration is of THIS output. out= is the path the runner publishes the .mov to (BatchRunner.cpp finalPath), and the job's manifest
-                    # names the one .mov it found (export-stage-job.ps1 first.name, the file's leaf): another leaf is another export's declaration. RENDER_VERIFIED's dimensions=
-                    # are the decoded .mov's (outWidth x outHeight, the frame plan's), so they are the declared output= or the two lines are not one export.
-                    $outLeaf = [regex]::Split([string]$decl.out, '[\\/]')[-1]
-                    $first = $(if ($null -ne $manifest) { Get-DvProp $manifest 'first' } else { $null })
-                    $firstName = $(if ($first -is [System.Management.Automation.PSCustomObject]) { Get-DvProp $first 'name' } else { $null })
-                    if ($firstName -is [string] -and -not [string]::Equals($outLeaf, $firstName, [StringComparison]::Ordinal)) {
-                        $problems.Add("EXPORT_OUTPUT_MISMATCH: RENDER_START declares out=$($decl.out), whose file is '$outLeaf', but output-manifest.json lists '$firstName', so the declaration is not of this export's .mov")
-                    }
-                    # r6 (sol r5 B3): dimensions= is a REQUIRED field read at the producer's token position (BatchRunner.cpp:803 writes it fifth after the tag, between
-                    # decoded_frame_bytes= and bytes=), never by a substring scan of the whole line: a line without it at that position is not the producer's verification
-                    # of this .mov (INVALID), and text after it (container_probe= prints the probe path verbatim, which may hold ' dimensions=') is never the field
-                    # (EXPORT-RENDER-PIPE-TIMING-2 r2: the line grammar holds dimensions= to its one position and shape, so this binds the parsed field; a verification that
-                    # failed the grammar has its one problem above and adds nothing here)
-                    if ($null -ne $batch.verified.fields -and -not [string]::Equals([string]$batch.verified.fields['dimensions'], [string]$decl.output, [StringComparison]::Ordinal)) {
-                        $problems.Add("EXPORT_OUTPUT_MISMATCH: RENDER_START declares output=$($decl.output) but RENDER_VERIFIED decoded dimensions=$($batch.verified.fields['dimensions']), so the declaration and the verification are not of one .mov")
-                    }
+                foreach ($p in $bind.problems) { $problems.Add($p) }
+                if ($null -eq $decl.problem) {
                     if ($pipeRoute -and $decl.scaled -and $scale.Count -eq 0) { $problems.Add('EXPORT_PROFILE_ABSENT: RENDER_START declares scaled=true but stage-timing.log times no export_scale; a scaled frame plan times it on every frame') }
                     elseif ($pipeRoute -and -not $decl.scaled -and $scale.Count -gt 0) { $problems.Add("EXPORT_STAGE_WINDOW_MISMATCH: RENDER_START declares scaled=false but stage-timing.log times export_scale on $($scale.Count) frame(s); an unscaled frame plan runs no scale") }
                     $lo = $decl.cutIn - 1; $hi = $decl.cutOut - 1
