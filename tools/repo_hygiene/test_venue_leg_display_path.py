@@ -27,6 +27,10 @@ from tools.repo_hygiene.test_dual_venue_evidence import (
 
 MODULE = DV / "DualVenueRunner.psm1"
 SCHEMA = "mlv-app/venue-display-path/v1"
+# r3 (A7): the block is the health probe's sample, taken BEFORE the measurement job is submitted; the block says so in a field the validator requires
+SAMPLED_BEFORE = "measurement-submit"
+# r3 (A4): text that ConvertFrom-Json reads as a [datetime] on reload (a power plan, an adapter, a reason named like a time)
+TIME_LOOKING_TEXT = ("2026-11-24T00:00:00Z", "2026-11-24T03:00:00-04:00", "2026-11-24T12:00:00", "2026-11-24T00:00:00.5Z")
 
 
 def unknown(reason: str) -> dict:
@@ -37,6 +41,7 @@ def good_block() -> dict:
     """What the collector writes on Bachelor after the 2026-11-21 reboot: Intel Iris Xe drives the display, the NVIDIA RTX 3060 is headless."""
     return {
         "schema": SCHEMA,
+        "sampledBefore": SAMPLED_BEFORE,
         "collectedUtc": "2026-11-24T16:40:00Z",
         "adapters": [
             {"name": "Intel(R) Iris(R) Xe Graphics", "driverVersion": "31.0.101.5186", "driverDate": "2024-06-12T00:00:00Z",
@@ -56,6 +61,7 @@ def all_unknown_block() -> dict:
     """Every probe failed: each field is a typed unknown, the block still has its shape."""
     return {
         "schema": SCHEMA,
+        "sampledBefore": SAMPLED_BEFORE,
         "collectedUtc": "2026-11-24T16:40:00Z",
         "adapters": unknown("RPC server unavailable"),
         "activeDisplays": unknown("adapters-unreadable"),
@@ -90,6 +96,19 @@ def validate(receipt: dict) -> dict:
 def block_state(block) -> dict:
     return pwsh_json("$b = $env:DVE_BLOCK | ConvertFrom-Json\n$v = Test-DvDisplayPathBlock -Block $b\n[ordered]@{ state = $v.state; problems = @($v.problems) } | ConvertTo-Json -Compress",
                      {"DVE_BLOCK": json.dumps(block)})
+
+
+def validate_many(receipts: dict) -> dict:
+    """validate() for many receipts in one pwsh: each receipt is its own JSON text, read back by ConvertFrom-Json exactly as a receipt reader reads a file."""
+    texts = {label: json.dumps(r) for label, r in receipts.items()}
+    with tempfile.TemporaryDirectory(prefix="dv-displaypath-many-") as d:
+        path = Path(d) / "receipts.json"   # dozens of receipts do not fit in one environment variable (32767 characters)
+        path.write_text(json.dumps(texts), encoding="utf-8")
+        return pwsh_json("$in = [IO.File]::ReadAllText($env:DVE_RECEIPTS_FILE) | ConvertFrom-Json -AsHashtable\n$out = [ordered]@{}\n"
+                         "foreach ($k in @($in.Keys)) { $r = $in[$k] | ConvertFrom-Json; $v = Test-DvReceiptValid -Receipt $r\n"
+                         "  $out[$k] = [ordered]@{ status = $v.status; valid = $v.valid; displayPath = $v.displayPath; reasons = @($v.reasons) } }\n"
+                         "$out | ConvertTo-Json -Compress -Depth 5",
+                         {"DVE_RECEIPTS_FILE": str(path)})
 
 
 @requires_windows_pwsh
@@ -222,6 +241,69 @@ class ReceiptValidatorReportsTheDisplayPathTests(unittest.TestCase):
         # the block is collected by the venue probe and written to no hashed artifact: the validator says so, as it does for hostName / gpuNames
         self.assertTrue(any(u.startswith("DISPLAY_PATH_UNBOUND") for u in present["unbound"]), present)
 
+    def test_adversary_r2_a4_a_text_leaf_that_looks_like_a_time_survives_a_receipt_reload(self) -> None:
+        """r2 adversary A4 (closed in r3, route (b)): every receipt reader uses ConvertFrom-Json, which reads `2026-11-24T00:00:00Z` (a power plan, an adapter or a
+        reason named like a time) as a [datetime]. The block's validator accepts that round-tripped value at a TEXT leaf, so reload never turns NO_SIGNAL into INVALID."""
+        cases = {}
+        for text in TIME_LOOKING_TEXT:
+            b = good_block()
+            b["powerPlan"] = text
+            cases[f"powerPlan={text}"] = b
+            b = good_block()
+            b["adapters"][0]["name"] = text
+            b["activeDisplays"][0]["adapterName"] = text
+            cases[f"active adapter name={text}"] = b
+            b = good_block()
+            b["adapters"][1]["driverVersion"] = text
+            b["adapters"][1]["pnpDeviceId"] = text
+            b["os"]["build"] = text
+            cases[f"driverVersion/pnpDeviceId/build={text}"] = b
+            b = good_block()
+            b["powerPlan"] = unknown(text)
+            b["os"] = unknown(text)
+            cases[f"unknown reason={text}"] = b
+            cases[f"whole-block unknown reason={text}"] = unknown(text)
+        receipts = {}
+        for label, block in cases.items():
+            receipts[label + " NO_SIGNAL"] = receipt_with(block)
+            receipts[label + " PASS"] = receipt_with(block, outcome="PASS")
+        got = validate_many(receipts)
+        for label in receipts:
+            with self.subTest(label):
+                v = got[label]
+                self.assertEqual(v["displayPath"], "present", v)
+                self.assertFalse(any(r.startswith("DISPLAY_PATH_MALFORMED") for r in v["reasons"]), v)
+                if label.endswith("NO_SIGNAL"):
+                    self.assertEqual((v["status"], v["valid"]), ("NO_SIGNAL", True), v)
+
+    def test_adversary_r2_a4_a_time_looking_name_still_has_to_match_between_the_tables(self) -> None:
+        """r3: the A5 name match compares the round-tripped names as text, so one adapter named like a time still needs its own display entry."""
+        b = good_block()
+        b["adapters"][0]["name"] = TIME_LOOKING_TEXT[0]
+        self.assertEqual(block_state(b)["state"], "malformed")
+        b["activeDisplays"][0]["adapterName"] = TIME_LOOKING_TEXT[1]
+        self.assertEqual(block_state(b)["state"], "malformed")
+        b["activeDisplays"][0]["adapterName"] = TIME_LOOKING_TEXT[0]
+        self.assertEqual(block_state(b)["state"], "present")
+
+    def test_adversary_r2_a7_the_block_says_it_was_sampled_before_the_measurement_was_submitted(self) -> None:
+        """r2 adversary A7 (closed in r3 by a binding field): the block is the health probe's pre-submit sample, and a present block must say so."""
+        base = good_block()
+        bad = {
+            "sampledBefore is missing": {k: v for k, v in base.items() if k != "sampledBefore"},
+            "sampledBefore names another moment": dict(base, sampledBefore="measurement-end"),
+            "sampledBefore is not a string": dict(base, sampledBefore=True),
+            "sampledBefore is a typed unknown": dict(base, sampledBefore=unknown("x")),
+            "sampledBefore carries a zero-width character": dict(base, sampledBefore="measurement-​submit"),
+        }
+        for label, block in bad.items():
+            with self.subTest(label):
+                got = block_state(block)
+                self.assertEqual(got["state"], "malformed", got)
+                self.assertTrue(any("sampledBefore" in p for p in got["problems"]), got)
+        self.assertEqual(block_state(base)["state"], "present")
+        self.assertEqual(block_state(all_unknown_block())["state"], "present")
+
 
 COLLECTOR_HARNESS = r"""
 $ErrorActionPreference = 'Stop'
@@ -242,7 +324,8 @@ function Get-CimInstance {
     switch ($ClassName) {
         'Win32_VideoController' { return @($script:fx.video) }
         'Win32_OperatingSystem' { return @([pscustomobject]@{ LastBootUpTime = [datetime]::Parse($script:fx.boot).ToLocalTime() }) }
-        'Win32_PowerPlan' { return @([pscustomobject]@{ ElementName = $script:fx.plan; IsActive = $true }) }
+        # DVE_PLAN, when set, is the plan name as CIM gives it (a string): the fixture's own ConvertFrom-Json would read a time-looking name as a [datetime]
+        'Win32_PowerPlan' { return @([pscustomobject]@{ ElementName = $(if ($env:DVE_PLAN) { [string]$env:DVE_PLAN } else { $script:fx.plan }); IsActive = $true }) }
         'Win32_QuickFixEngineering' { return @(1..[int]$script:fx.hotfixes | ForEach-Object { [pscustomobject]@{ HotFixID = "KB$_" } }) }
     }
     @()
@@ -273,8 +356,10 @@ BACHELOR_FIXTURE = {
 }
 
 
-def run_collector(mode: str = "ok", sleep_ms: int = 0, budget: int | None = None, fixture: dict | None = None) -> dict:
+def run_collector(mode: str = "ok", sleep_ms: int = 0, budget: int | None = None, fixture: dict | None = None, plan: str | None = None) -> dict:
     env = {"DVE_MODE": mode, "DVE_SLEEP_MS": str(sleep_ms), "DVE_FIXTURE": json.dumps(fixture or BACHELOR_FIXTURE)}
+    if plan is not None:
+        env["DVE_PLAN"] = plan
     if budget is not None:
         env["DVE_BUDGET"] = str(budget)
     with tempfile.TemporaryDirectory(prefix="dv-displaypath-") as d:
@@ -318,6 +403,22 @@ class CollectorReadsTheBachelorShapeTests(unittest.TestCase):
         self.assertIn("Win32_PowerPlan", [c["class"] for c in got["calls"]])
         plan = [c for c in got["calls"] if c["class"] == "Win32_PowerPlan"][0]
         self.assertEqual(plan["ns"], "root\\cimv2\\power")
+
+    def test_adversary_r2_a7_the_collector_says_its_sample_was_taken_before_the_measurement_submit(self) -> None:
+        """r2 adversary A7 (r3): the collector runs in the health probe, before the measurement job is submitted; its block carries that moment and when it read."""
+        for mode in ("ok", "fail"):
+            with self.subTest(mode):
+                got = run_collector(mode=mode)
+                self.assertEqual(got["block"]["sampledBefore"], SAMPLED_BEFORE, got)
+                self.assertRegex(got["block"]["collectedUtc"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+                self.assertEqual(got["state"], "present", got)
+
+    def test_adversary_r2_a4_a_power_plan_named_like_a_time_survives_the_round_trip(self) -> None:
+        for text in TIME_LOOKING_TEXT:
+            with self.subTest(text):
+                got = run_collector(plan=text)
+                self.assertEqual(got["block"]["powerPlan"], text, got)
+                self.assertEqual(got["state"], "present", got)   # after the harness's ConvertTo-Json / ConvertFrom-Json round trip
 
     def test_no_adapter_at_all_is_an_empty_list_not_a_failure(self) -> None:
         got = run_collector(fixture=dict(BACHELOR_FIXTURE, video=[]))
@@ -385,11 +486,26 @@ class CollectorNeverFailsOrDelaysTheLegTests(unittest.TestCase):
         text = pwsh_json("[ordered]@{ text = (New-DvHealthProbeJobText -AgentRoot 'C:\\mlvtmp\\mlv-agent') } | ConvertTo-Json -Compress")["text"]
         clock = text.find("$dveJobSw = [Diagnostics.Stopwatch]::StartNew()")
         first_work = text.find("$probe = [ordered]@{")
-        call = re.search(r"Get-DvDisplayPath -BudgetSec \(\[int\]\[math\]::Max\(0, \[math\]::Min\(15, (\d+) - \$dveJobSw\.Elapsed\.TotalSeconds\)\)\)", text)
+        call = re.search(r"Get-DvDisplayPath -BudgetSec \(.*?(\d+)(?:\.0)? - \$dveJobSw\.Elapsed\.TotalSeconds", text)
         self.assertGreaterEqual(clock, 0, "the job has no job-wide stopwatch")
         self.assertLess(clock, first_work, "the job clock must start before the preamble does any work")
         self.assertIsNotNone(call, "the collector is called with a budget taken from the job clock")
         self.assertLessEqual(int(call.group(1)), 110, call.group(0))
+
+    def test_r3_w1_the_job_hands_the_collector_the_floor_of_what_is_left_never_a_rounded_up_second(self) -> None:
+        """r3 W1: `[math]::Min(15, 105 - <double>)` picked the Int32 overload and ROUNDED the double, so 14.6 s left became a 15 s budget (and the venue lease-batch
+        preflight refuses an integer first operand). The expression is lifted from the job text and run against a job clock at fixed elapsed times."""
+        got = pwsh_json("$t = New-DvHealthProbeJobText -AgentRoot 'C:\\mlvtmp\\mlv-agent'\n"
+                        "$line = @($t -split \"`r?`n\" | Where-Object { $_.StartsWith('$probe.displayPath = ') })[0]\n"
+                        "$expr = [regex]::Match($line, '-BudgetSec (.+?) \\} catch').Groups[1].Value\n"
+                        "$out = [ordered]@{ expr = $expr }\n"
+                        "foreach ($e in 0.0, 90.4, 90.6, 104.2, 104.99, 105.0, 300.0) {\n"
+                        "  $dveJobSw = [pscustomobject]@{ Elapsed = [timespan]::FromSeconds($e) }\n"
+                        "  $out[[string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0}', $e)] = & ([scriptblock]::Create($expr)) }\n"
+                        "$out | ConvertTo-Json -Compress")
+        self.assertTrue(got["expr"], got)
+        self.assertEqual({k: v for k, v in got.items() if k != "expr"},
+                         {"0": 15, "90.4": 14, "90.6": 14, "104.2": 0, "104.99": 0, "105": 0, "300": 0}, got)
 
     def test_the_slowest_probe_runs_last_so_a_stall_in_it_costs_the_others_nothing(self) -> None:
         got = run_collector()
@@ -481,6 +597,32 @@ class RunnerNormalisesTheProbeBlockTests(unittest.TestCase):
                 got = self.normalise(dict(HEALTHY_PROBE, displayPath=dict(good_block(), collectedUtc=value)))
                 self.assertEqual(got["block"], unknown("probe-block-malformed"), got)
 
+    def test_adversary_r2_a4_a_time_looking_text_leaf_survives_the_probe_line_and_a_reload(self) -> None:
+        """r2 adversary A4 (r3): the runner parses the probe's `DVE_PROBE=` line itself (ConvertFrom-DvProbeStdout). A text leaf named like a time keeps its exact text
+        where the host's ConvertFrom-Json has -DateKind String (pwsh 7.5+), and on every host the block stays present through the write and a reload."""
+        blocks = {}
+        for text in TIME_LOOKING_TEXT:
+            b = good_block()
+            b["powerPlan"] = text
+            b["adapters"][1]["driverVersion"] = text
+            blocks[text] = b
+        got = pwsh_json("$in = $env:DVE_BLOCKS | ConvertFrom-Json -AsHashtable\n$out = [ordered]@{ hasDateKind = (Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind') }\n"
+                        "foreach ($k in @($in.Keys)) {\n"
+                        "  $p = ConvertFrom-DvProbeStdout (\"noise`r`nDVE_PROBE=\" + $in[$k] + \"`r`n\")\n"
+                        "  $b = ConvertTo-DvDisplayPath -Probe $p\n"
+                        "  $written = $b | ConvertTo-Json -Depth 8 -Compress\n"
+                        "  $out[$k] = [ordered]@{ written = $written; state = (Test-DvDisplayPathBlock -Block ($written | ConvertFrom-Json)).state } }\n"
+                        "$out | ConvertTo-Json -Compress -Depth 4",
+                        {"DVE_BLOCKS": json.dumps({k: json.dumps(dict(HEALTHY_PROBE, displayPath=b)) for k, b in blocks.items()})})
+        for text, block in blocks.items():
+            with self.subTest(text):
+                v = got[text]
+                written = json.loads(v["written"])
+                self.assertEqual(v["state"], "present", v)
+                self.assertNotEqual(written, unknown("probe-block-malformed"), v)
+                if got["hasDateKind"]:
+                    self.assertEqual(written, block, v)
+
     def test_adversary_r2_a6_the_utc_text_does_not_depend_on_the_readers_culture(self) -> None:
         """r2 adversary A6: under th-TH the same DateTime formats as year 2569; every formatter takes the invariant culture."""
         got = pwsh_json("[Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::new('th-TH')\n"
@@ -547,6 +689,14 @@ class SchemaAndDocsTests(unittest.TestCase):
                       '"state":"unknown"', "15 s", "read-only"):
             with self.subTest(token):
                 section = doc.split("venue.displayPath", 1)[1]
+                self.assertIn(token, section)
+
+    def test_adversary_r2_a7_a4_the_doc_says_the_block_is_the_display_path_at_submit_time(self) -> None:
+        """r3: the doc names the binding field, says the block describes the display path at submit time, and that a time-looking text leaf stays a text leaf."""
+        section = (ROOT / "docs" / "dual-venue-evidence.md").read_text(encoding="utf-8").split("venue.displayPath", 1)[1].split("\n## ", 1)[0]
+        for token in ("`sampledBefore`", '"measurement-submit"', "at submit time", "VENUE-LEG-DISPLAY-PATH-MEASUREMENT-SIDE-1",
+                      "looks like a time", "VENUE-RECEIPT-READER-DATEKIND-STRING-1"):
+            with self.subTest(token):
                 self.assertIn(token, section)
 
     def test_the_sheet_pair_record_lists_the_block_as_unbound(self) -> None:
