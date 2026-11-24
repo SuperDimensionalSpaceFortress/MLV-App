@@ -273,6 +273,18 @@ inline bool labelFramesStallEntered( bool playing, bool hasDraw, bool presentati
     return presentationAgeWrapped || msSinceLastDraw < 0 || msSinceLastDraw >= labelPaintDeadlineMs( expectedFrameMs );
 }
 
+/*! \brief INFO-2 r7 (sol r6 LABEL-STALL on db3b7ef5): does the fps meter's reset of a measured corner rate repaint the label at
+ *  once (m_playbackInfoRateWithdrawn)? Stopped, or a label stall (labelFramesStallEntered: the draw age at or past the label's
+ *  expected-period deadline, or wrapped): yes, no frame follows to carry it. Playing short of that deadline: no. r5 made the stall
+ *  follow the deadline but left the withdrawal on the meter's fixed 500 ms reset, so a measured rate, a 1 fps conform target and an
+ *  idle tick 512 ms after the draw still queued a retained-frame paint ~1 s before the 1500 ms deadline. The withdrawn text is then
+ *  only stored for the next frame's paint, and the stored label's paint debt (labelPaintOwedDue, the same deadline) pays when that
+ *  frame never comes. `labelStallEntered` is labelFramesStallEntered's answer for the same reset. */
+inline bool rateWithdrawalRepaintsNow( bool playing, bool labelStallEntered )
+{
+    return !playing || labelStallEntered;
+}
+
 /*! \brief INFO-2 r4 (adversary r3 A3): the frame period a playing label's paint debt waits for: the larger of the target period
  *  ceil(1000 / playbackFps) and the measured fps meter EMA frame time, so a 24 fps target that plays at 10 fps waits for its
  *  real 100 ms frames. Read only: the meter is not changed.

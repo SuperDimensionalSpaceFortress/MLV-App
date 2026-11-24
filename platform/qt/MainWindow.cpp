@@ -3009,7 +3009,10 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
             // LOOK-LABEL-PLAYBACK-INFO-1: once per reset of a measured rate (this branch runs every idle tick).
             if( fpsWasMeasured && m_lookLabelFullscreenShown && m_playbackInfoToggles.fps )
             {
-                m_playbackInfoRateWithdrawn = true;   // r2 pass-2 A2: the push that carries this withdrawal repaints at once
+                // INFO-2 r7 (sol r6 LABEL-STALL): a repaint at once only when stopped or a label stall; a playing reset short of the
+                // label's deadline (a 1 fps target's 500 ms reset) stores the withdrawn text for the next frame and the paint debt pays.
+                if( playback_info_label::rateWithdrawalRepaintsNow( ui->actionPlay->isChecked(), stallEntered ) )
+                    m_playbackInfoRateWithdrawn = true;   // r2 pass-2 A2: the push that carries this withdrawal repaints at once
                 updatePlaybackInfoLabel( true );      // r3 (adversary r2 c65933cb A2): at once, never deferred by the playing gate
             }
             // r3 pass-2 A1: a label stored for the next frame's paint (a relabel while playing) is painted now: no frame follows.

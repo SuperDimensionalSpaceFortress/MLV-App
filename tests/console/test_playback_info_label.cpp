@@ -2161,6 +2161,55 @@ TEST(PlaybackInfoLabel, InfoTwoR5A3bTheLabelStallIsRelativeToTheExpectedFramePer
     ASSERT_FALSE(tick.contains(QStringLiteral("const bool stallEntered = ui->actionPlay->isChecked() && hasDraw;")));
 }
 
+// INFO-2 r7 (sol r6 LABEL-STALL on db3b7ef5, blocker): fullscreen GPU window, a measured rate (23.9 fps), then a 1 fps conform target
+// from settings, and an idle tick at draw age 512 ms. r5's stall helper declined (the label's deadline is 1500 ms), but the fps
+// meter's fixed 500 ms reset still withdrew the rate with m_playbackInfoRateWithdrawn, so the push queued a retained-frame paint at
+// once (MainWindow.cpp pushLookLabelOverlay repaintNow, GpuDisplayWindow::setLookLabelIfActive update()). The withdrawal repaints at
+// once only when stopped or a label stall; otherwise its text is stored for the next frame and the paint debt pays at the deadline.
+TEST(PlaybackInfoLabel, InfoTwoR7LabelStallTheMeterResetPaintsNoLabelBeforeTheLabelDeadline)
+{
+    using playback_info_label::labelFramesStallEntered;
+    using playback_info_label::labelPaintExpectedFrameMs;
+    using playback_info_label::labelPaintOwedDue;
+    using playback_info_label::rateWithdrawalRepaintsNow;
+    // R7a: sol's literal row. The expected period reads the target (1000 ms) over the measured EMA (1000 / 23.9 = 41.8 ms).
+    const qint64 expected = labelPaintExpectedFrameMs(1.0, 1000.0 / 23.9);
+    ASSERT_EQ(1000, expected);
+    const bool stallAt512 = labelFramesStallEntered(true, true, false, 512, expected);
+    ASSERT_FALSE(stallAt512);
+    ASSERT_FALSE(rateWithdrawalRepaintsNow(true, stallAt512));
+    // R7b: the stored text's debt (armed at the 512 ms reset; the EMA is zeroed by then) pays only at the 1500 ms deadline
+    const qint64 expectedAfterReset = labelPaintExpectedFrameMs(1.0, 0.0);
+    ASSERT_FALSE(labelPaintOwedDue(true, false, 1499, expectedAfterReset));
+    ASSERT_TRUE(labelPaintOwedDue(true, false, 1500, expectedAfterReset));
+    // R7c: a real stall, a stop, a wrap and an ordinary 24 fps reset still repaint at once
+    ASSERT_TRUE(rateWithdrawalRepaintsNow(true, labelFramesStallEntered(true, true, false, 1500, expected)));
+    ASSERT_TRUE(rateWithdrawalRepaintsNow(false, false));
+    ASSERT_TRUE(rateWithdrawalRepaintsNow(true, labelFramesStallEntered(true, true, true, 3, expected)));
+    ASSERT_TRUE(rateWithdrawalRepaintsNow(true, labelFramesStallEntered(true, true, false, 512, labelPaintExpectedFrameMs(24.0, 0.0))));
+    // R7d: the playing reset of a measured rate short of the deadline (and Play before its first draw) adds no paint
+    ASSERT_FALSE(rateWithdrawalRepaintsNow(true, labelFramesStallEntered(true, false, false, 0, expected)));
+    // R7e: the wiring. The flag that makes pushLookLabelOverlay repaint at once is set only through the rule, with this reset's
+    // stall answer, and the forced (store or paint) relabel follows it unconditionally.
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString tick = functionBody(source, QStringLiteral("void MainWindow::timerFrameEvent("));
+    const int enteredAt = tick.indexOf(QStringLiteral("const bool stallEntered = playback_info_label::labelFramesStallEntered("));
+    const int ruleAt = tick.indexOf(QStringLiteral(
+        "if( playback_info_label::rateWithdrawalRepaintsNow( ui->actionPlay->isChecked(), stallEntered ) )\n"
+        "                    m_playbackInfoRateWithdrawn = true;"));
+    const int forcedAt = tick.indexOf(QStringLiteral("updatePlaybackInfoLabel( true );"));
+    ASSERT_TRUE(enteredAt >= 0);
+    ASSERT_TRUE(ruleAt > enteredAt);
+    ASSERT_TRUE(forcedAt > ruleAt);
+    ASSERT_EQ(1, static_cast<int>(source.count(QStringLiteral("m_playbackInfoRateWithdrawn = true;"))));
+    ASSERT_EQ(1, static_cast<int>(source.count(QStringLiteral("playback_info_label::rateWithdrawalRepaintsNow("))));
+    // R7f: the push's repaint causes are unchanged, so the flag (now deadline-gated) and the stall are the only playing triggers
+    const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay("));
+    ASSERT_TRUE(push.contains(QStringLiteral(
+        "const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn"
+        " || m_playbackFramesStalled;")));
+}
+
 // INFO-2 r2 (adversary pass 2 A2 on 9496cb72, introduced, major): 24 fps, start on paused frame 0, Cut Out 3, Loop off. Frames 1 and
 // 2 hand off at 8 and 117 ms; the frame-2 request consumes the first stamp, then the next advance stops Play. The Play toggle set the
 // meter's seen count to the presentation count at the STOP as well as at the start, dropping the final 109 ms interval. It does so
