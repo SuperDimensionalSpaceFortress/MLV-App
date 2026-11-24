@@ -2678,6 +2678,8 @@ TEST(PlaybackDueWakeSend, G1_AForeignSentMessageInTheRunnerSleepIsNotAWakeAndThe
         ASSERT_EQ( static_cast<quint64>( 0 ), wake.runnerSleepsWokenBySent() );
         ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenOther() );
         ASSERT_EQ( 0, fired );
+        // r5 adversary pass 10 A1: the admitted dispatch has its span record too (the product's count alone admitted spans [])
+        ASSERT_EQ( static_cast<size_t>( wake.runnerSleepsWokenOther() ), wake.lastRunnerSleepDispatchSpansS().size() );
         foreignObservation = dueWakeObserveSleep( wake, 150.0 );
         judged = true;
     }
@@ -2831,6 +2833,8 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
         }
         wake.setGuiTraceActive( false );
         sentOk = sent.load();
+        // r5 adversary pass 10 A1 (sibling): the handler ran inside the sleep, so its dispatch has a span record (calls=1 admitted spans [])
+        ASSERT_FALSE( wake.lastRunnerSleepDispatchSpansS().empty() );
         foreignObservation = dueWakeObserveSleep( wake, 150.0 );
         judged = true;
     }
