@@ -3016,7 +3016,10 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
                 if( playback_info_label::rateWithdrawalRepaintsNow( ui->actionPlay->isChecked(), stallEntered ) )
                     m_playbackInfoRateWithdrawn = true;   // r2 pass-2 A2: the push that carries this withdrawal repaints at once
                 updatePlaybackInfoLabel( true );      // r3 (adversary r2 c65933cb A2): at once, never deferred by the playing gate
-                if( m_lookLabelPaintOwedClock.isValid() ) m_lookLabelPaintOwedExpectedFloorMs = labelExpectedBeforeResetMs;   // r7 pass 10 A3
+                // r7 pass 10 A3; INFO-2 r9 (sol r8 A3): raises the debt's floor, never lowers it (the store may have joined a debt armed
+                // under a longer period)
+                if( m_lookLabelPaintOwedClock.isValid() ) m_lookLabelPaintOwedExpectedFloorMs = playback_info_label::labelPaintOwedExpectedMs(
+                    m_lookLabelPaintOwedExpectedFloorMs, labelExpectedBeforeResetMs );
             }
             // r3 pass-2 A1: a label stored for the next frame's paint (a relabel while playing) is painted now: no frame follows.
             if( stallEntered && m_lookLabelFullscreenShown ) pushLookLabelOverlay();
@@ -33911,6 +33914,9 @@ void MainWindow::on_actionPlay_toggled(bool checked)
     // new Play's "--" relabel repaint the retained paused frame at once; a stall of this Play is set again after its own draw.
     m_playbackFramesStalled = false;
     updatePlaybackInfoLabel();
+    // INFO-2 r9 (sol r8 A4): a Stop pays a label change stored while playing, at once on both surfaces: the relabel above composes
+    // the same text when no rate is shown and pushes nothing, so without this the old label stayed until the stopped frame's refresh.
+    settleLookLabelPaintIfOwed();
     // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: a pending due wake belongs to the clock just reset; the counters are
     // per Play, and only the fallback timer raises the timer resolution, for the duration of Play.
     cancelPlaybackDueWake();
@@ -34796,13 +34802,23 @@ void MainWindow::pushLookLabelOverlay( void )
     // INFO-2 r2 (pass 1 A7, pass 2 A1): a text stored for the next frame's paint is owed that paint. settleLookLabelPaintIfOwed (every
     // tick) makes it when no frame was presented within kLabelPaintOwedMs of this store, whatever the stall history: the deferred
     // change is visible within the gate plus a few ticks even when the first frame of a Play is late. A repaint now settles the debt.
-    m_lookLabelPaintOwedExpectedFloorMs = 0;   // INFO-2 r7 (pass 10 A3): no floor unless the fps meter's reset made this store
     // INFO-2 r8 (sol r7 LABEL-STALL): the CPU viewport honours the same decision and stores a declined change, so it is owed too.
     if( repaintNow ) m_lookLabelPaintOwedClock.invalidate();
     else
     {
-        m_lookLabelPaintOwedClock.start();
-        m_lookLabelPaintOwedPresentedCount = m_playbackPresentedFrameCount;
+        // INFO-2 r9 (sol r8 A3): the one store rule for both surfaces. A store that joins an unpaid debt keeps its arm time and
+        // floor (r7-r8 cleared the floor and restarted the clock, so a look landing 8 ms after the meter's withdrawal paid at the
+        // zeroed EMA's 63 ms deadline); an arm records the period it reads as the floor (r7: the fps meter's reset raises it).
+        const playback_info_label::LabelPaintOwedStore store = playback_info_label::labelPaintOwedStore(
+            m_lookLabelPaintOwedClock.isValid(), m_playbackPresentedFrameCount != m_lookLabelPaintOwedPresentedCount,
+            m_lookLabelPaintOwedExpectedFloorMs,
+            playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs ) );
+        m_lookLabelPaintOwedExpectedFloorMs = store.floorMs;
+        if( store.arm )
+        {
+            m_lookLabelPaintOwedClock.start();
+            m_lookLabelPaintOwedPresentedCount = m_playbackPresentedFrameCount;
+        }
     }
     ui->graphicsView->setLookLabel( gpuWindow ? QString() : m_lookLabelOverlayText, repaintNow );
 }
@@ -35018,28 +35034,25 @@ void MainWindow::flushPlaybackInfoIfDue( void )
 }
 
 // INFO-2 r2 (adversary pass 1 A7, pass 2 A1): the paint a stored playing label is owed. pushLookLabelOverlay arms the debt when it
-// stores the text for the next frame's paint; a frame presented since carries the text (debt cleared), a Stop clears it, and when no
-// frame came within the expected frame period plus half (never under kLabelPaintOwedMs; INFO-2 r4 A3) the label is painted now
-// (setLookLabelIfActive paints only when the drawn text differs).
+// stores the text for the next frame's paint; a frame presented since carries the text (debt cleared), and when no frame came within
+// the expected frame period plus half (never under kLabelPaintOwedMs; INFO-2 r4 A3) the label is painted now (setLookLabelIfActive
+// paints only when the drawn text differs). INFO-2 r9 (sol r8 A4): a Stop PAYS it at once (labelPaintOwedStep); r2-r8 cleared it,
+// so a change the Stop's equal composition did not push again stayed off both surfaces until the stopped frame's refresh.
 void MainWindow::settleLookLabelPaintIfOwed( void )
 {
     const bool owed = m_lookLabelPaintOwedClock.isValid();
     if( !owed ) return;
     const bool framePresentedSinceStore = m_playbackPresentedFrameCount != m_lookLabelPaintOwedPresentedCount;
-    if( !ui->actionPlay->isChecked() || framePresentedSinceStore )
-    {
-        m_lookLabelPaintOwedClock.invalidate();
-        return;
-    }
-    if( playback_info_label::labelPaintOwedDue( owed, framePresentedSinceStore, m_lookLabelPaintOwedClock.elapsed(),
-                                                playback_info_label::labelPaintOwedExpectedMs( m_lookLabelPaintOwedExpectedFloorMs,
-                                                    playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs ) ) ) )
-    {
-        m_lookLabelPaintOwedClock.invalidate();
-        GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, true );
-        // INFO-2 r8: the CPU viewport's owed change (the same text it stored; it paints only while one is owed)
-        ui->graphicsView->setLookLabel( GpuDisplayWindow::isActive() ? QString() : m_lookLabelOverlayText, true );
-    }
+    const playback_info_label::LabelPaintOwedStep step = playback_info_label::labelPaintOwedStep(
+        owed, ui->actionPlay->isChecked(), framePresentedSinceStore, m_lookLabelPaintOwedClock.elapsed(),
+        playback_info_label::labelPaintOwedExpectedMs( m_lookLabelPaintOwedExpectedFloorMs,
+            playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs ) ) );
+    if( step == playback_info_label::LabelPaintOwedStep::Keep ) return;
+    m_lookLabelPaintOwedClock.invalidate();
+    if( step == playback_info_label::LabelPaintOwedStep::Clear ) return;   // the frame presented since the store carried the text
+    GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, true );
+    // INFO-2 r8: the CPU viewport's owed change (the same text it stored; it paints only while one is owed)
+    ui->graphicsView->setLookLabel( GpuDisplayWindow::isActive() ? QString() : m_lookLabelOverlayText, true );
 }
 
 void MainWindow::setPlaybackInfoToggle( bool playback_info_label::Toggles::*field, bool on )

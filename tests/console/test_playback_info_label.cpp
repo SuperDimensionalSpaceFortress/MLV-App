@@ -2049,22 +2049,27 @@ TEST(PlaybackInfoLabel, InfoTwoR2A7ADeferredPlayingRelabelIsVisibleWithinTheGate
     ASSERT_TRUE(playback_info_label::labelPaintOwedDue(true, false, (storeAtMs + playback_info_label::kLabelPaintOwedMs + 8) - storeAtMs, 0));
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay("));
-    // INFO-2 r8 (sol r7 LABEL-STALL): both surfaces store a declined change, so the debt is armed on the CPU viewport too
+    // INFO-2 r8 (sol r7 LABEL-STALL): both surfaces store a declined change, so the debt is armed on the CPU viewport too.
+    // INFO-2 r9 (sol r8 A3): the arm sits inside the one store rule (InfoTwoR9A3Push* pins its shape)
     ASSERT_TRUE(push.contains(QStringLiteral(
         "    if( repaintNow ) m_lookLabelPaintOwedClock.invalidate();\n"
         "    else\n"
-        "    {\n"
-        "        m_lookLabelPaintOwedClock.start();\n"
-        "        m_lookLabelPaintOwedPresentedCount = m_playbackPresentedFrameCount;\n"
-        "    }")));
+        "    {\n")));
+    ASSERT_TRUE(push.contains(QStringLiteral(
+        "        if( store.arm )\n"
+        "        {\n"
+        "            m_lookLabelPaintOwedClock.start();\n"
+        "            m_lookLabelPaintOwedPresentedCount = m_playbackPresentedFrameCount;\n"
+        "        }")));
     const QString settle = functionBody(source, QStringLiteral("void MainWindow::settleLookLabelPaintIfOwed( void )"));
     ASSERT_TRUE(settle.contains(QStringLiteral(
         "const bool framePresentedSinceStore = m_playbackPresentedFrameCount != m_lookLabelPaintOwedPresentedCount;")));
-    ASSERT_TRUE(settle.contains(QStringLiteral("if( !ui->actionPlay->isChecked() || framePresentedSinceStore )")));
+    // INFO-2 r9 (sol r8 A4): one step rule (labelPaintOwedStep) reads the Play state, the frame since the store and the deadline
     ASSERT_TRUE(settle.contains(QStringLiteral(
-        "if( playback_info_label::labelPaintOwedDue( owed, framePresentedSinceStore, m_lookLabelPaintOwedClock.elapsed(),\n"
-        "                                                playback_info_label::labelPaintOwedExpectedMs( m_lookLabelPaintOwedExpectedFloorMs,\n"
-        "                                                    playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs ) ) ) )")));
+        "playback_info_label::labelPaintOwedStep(\n"
+        "        owed, ui->actionPlay->isChecked(), framePresentedSinceStore, m_lookLabelPaintOwedClock.elapsed(),\n"
+        "        playback_info_label::labelPaintOwedExpectedMs( m_lookLabelPaintOwedExpectedFloorMs,\n"
+        "            playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs ) ) );")));
     ASSERT_TRUE(settle.contains(QStringLiteral("GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, true );")));
     // every tick, right after the gated flush
     const QString tick = functionBody(source, QStringLiteral("void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )"));
@@ -2263,22 +2268,23 @@ TEST(PlaybackInfoLabel, InfoTwoR7A3TheWithdrawalsPaintDebtKeepsThePeriodTheReset
     ASSERT_EQ(1000, labelPaintOwedExpectedMs(450, 1000));
     ASSERT_EQ(7, labelPaintOwedExpectedMs(7, 0));   // a floor over an unknown current period
     // R7i: the wiring. The reset reads the period before it zeroes the EMA, raises the floor only after its forced relabel armed a
-    // debt, every push clears the floor before it arms, and the settle reads floor and current
+    // debt, the push sets the floor (from the one store rule, INFO-2 r9) before it arms, and the settle reads floor and current
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString tick = functionBody(source, QStringLiteral("void MainWindow::timerFrameEvent("));
     const int readAt = tick.indexOf(QStringLiteral(
         "const qint64 labelExpectedBeforeResetMs = playback_info_label::labelPaintExpectedFrameMs( getPlaybackFramerate(), m_playbackFpsEmaFrameMs );"));
     const int zeroAt = tick.indexOf(QStringLiteral("m_playbackFpsEmaFrameMs = 0.0;"), readAt);
     const int forcedAt = tick.indexOf(QStringLiteral("updatePlaybackInfoLabel( true );"));
+    // INFO-2 r9 (sol r8 A3): the raise never lowers the floor (InfoTwoR9A3Reset* pins the full statement)
     const int floorAt = tick.indexOf(QStringLiteral(
-        "if( m_lookLabelPaintOwedClock.isValid() ) m_lookLabelPaintOwedExpectedFloorMs = labelExpectedBeforeResetMs;"));
+        "if( m_lookLabelPaintOwedClock.isValid() ) m_lookLabelPaintOwedExpectedFloorMs = playback_info_label::labelPaintOwedExpectedMs("));
     ASSERT_TRUE(readAt >= 0);
     ASSERT_TRUE(zeroAt > readAt);
     ASSERT_TRUE(forcedAt > zeroAt);
     ASSERT_TRUE(floorAt > forcedAt);
-    ASSERT_EQ(1, static_cast<int>(source.count(QStringLiteral("m_lookLabelPaintOwedExpectedFloorMs = labelExpectedBeforeResetMs;"))));
+    ASSERT_EQ(1, static_cast<int>(source.count(QStringLiteral("m_lookLabelPaintOwedExpectedFloorMs, labelExpectedBeforeResetMs );"))));
     const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay("));
-    const int clearAt = push.indexOf(QStringLiteral("m_lookLabelPaintOwedExpectedFloorMs = 0;"));
+    const int clearAt = push.indexOf(QStringLiteral("m_lookLabelPaintOwedExpectedFloorMs = store.floorMs;"));
     const int armAt = push.indexOf(QStringLiteral("m_lookLabelPaintOwedClock.start();"));
     ASSERT_TRUE(clearAt >= 0);
     ASSERT_TRUE(armAt > clearAt);
@@ -2513,6 +2519,151 @@ TEST(PlaybackInfoLabel, InfoTwoR9A4StopTheStopRunsTheSettleRightAfterItsRelabel)
     ASSERT_TRUE(relabelAt >= 0);
     ASSERT_TRUE(stopSettleAt > relabelAt);
     ASSERT_TRUE(stopSettleAt < toggled.indexOf(QStringLiteral("cancelPlaybackDueWake();")));
+}
+
+namespace
+{
+
+// INFO-2 r9: the one paint debt the GPU window and the CPU viewport share (MainWindow's arm clock, presented count and floor), driven
+// only through the policy rules, in the order pushLookLabelOverlay (store), the fps meter's reset (raise) and settleLookLabelPaintIfOwed
+// (step) apply them. InfoTwoR9A3Push*, InfoTwoR9A3Reset* and InfoTwoR9A4Settle* pin that wiring; a PayNow step reaches both
+// surfaces' setters with repaintNow (GPU: equal text, drawn text differs -> update(); CPU: owed -> its stored rects; R9i pins both).
+struct SharedLabelDebt
+{
+    bool armed = false;
+    qint64 armedAtMs = 0;
+    quint64 armedPresented = 0;
+    qint64 floorMs = 0;
+    void store(bool repaintNow, qint64 nowMs, quint64 presented, qint64 expectedNowMs)
+    {
+        if ( repaintNow ) { armed = false; return; }
+        const playback_info_label::LabelPaintOwedStore s =
+            playback_info_label::labelPaintOwedStore(armed, presented != armedPresented, floorMs, expectedNowMs);
+        floorMs = s.floorMs;
+        if ( s.arm ) { armed = true; armedAtMs = nowMs; armedPresented = presented; }
+    }
+    void resetRaises(qint64 beforeResetMs)
+    {
+        if ( armed ) floorMs = playback_info_label::labelPaintOwedExpectedMs(floorMs, beforeResetMs);
+    }
+    playback_info_label::LabelPaintOwedStep settle(bool playing, qint64 nowMs, quint64 presented, qint64 expectedNowMs)
+    {
+        const playback_info_label::LabelPaintOwedStep step = playback_info_label::labelPaintOwedStep(
+            armed, playing, presented != armedPresented, nowMs - armedAtMs,
+            playback_info_label::labelPaintOwedExpectedMs(floorMs, expectedNowMs));
+        if ( step != playback_info_label::LabelPaintOwedStep::Keep ) armed = false;
+        return step;
+    }
+};
+
+int stepOf(playback_info_label::LabelPaintOwedStep s) { return static_cast<int>(s); }
+
+} // namespace
+
+// INFO-2 r9 (sol r8 A3 + A4): the literal timelines on the shared debt. Draw at 0 ms, 24 fps target, EMA 450 ms before the meter's
+// reset (labelPaintExpectedFrameMs 450) and the target's 42 ms after it; the presented-frame count is 7 until a frame comes.
+TEST(PlaybackInfoLabel, InfoTwoR9A3A4TheSharedDebtTimelines)
+{
+    using playback_info_label::LabelPaintOwedStep;
+    using playback_info_label::labelPaintExpectedFrameMs;
+    using playback_info_label::labelPaintOwedStore;
+    using playback_info_label::labelPaintOwedStep;
+    const qint64 beforeReset = labelPaintExpectedFrameMs(24.0, 450.0);
+    const qint64 afterReset = labelPaintExpectedFrameMs(24.0, 0.0);
+    ASSERT_EQ(450, beforeReset);
+    ASSERT_EQ(42, afterReset);
+    // T1 (A3, sol's row): withdrawal stored at 512 (the EMA already zeroed), the reset raises the floor to 450, the async look landing
+    // at 520 joins the unpaid debt. No paint at 584 (r8's), nor anywhere before 512 + 675 = 1187; paid at 1187.
+    {
+        SharedLabelDebt debt;
+        debt.store(false, 512, 7, afterReset);
+        debt.resetRaises(beforeReset);
+        debt.store(false, 520, 7, afterReset);
+        ASSERT_EQ(450, debt.floorMs);
+        ASSERT_EQ(512, debt.armedAtMs);
+        for ( qint64 t = 528; t < 1187; t += 8 )
+            ASSERT_EQ(stepOf(LabelPaintOwedStep::Keep), stepOf(debt.settle(true, t, 7, afterReset)));
+        ASSERT_EQ(stepOf(LabelPaintOwedStep::PayNow), stepOf(debt.settle(true, 1187, 7, afterReset)));
+        ASSERT_EQ(stepOf(LabelPaintOwedStep::Keep), stepOf(debt.settle(true, 1195, 7, afterReset)));   // paid once
+    }
+    // T2 (A3, the landing BEFORE the reset): the look store at 500 arms under EMA 450 (floor 450), the reset at 512 adds the
+    // withdrawal to it. Paid at 500 + 675 = 1175, never on the zeroed EMA's 63 ms.
+    {
+        SharedLabelDebt debt;
+        debt.store(false, 500, 7, beforeReset);
+        debt.store(false, 512, 7, afterReset);
+        debt.resetRaises(beforeReset);
+        ASSERT_EQ(stepOf(LabelPaintOwedStep::Keep), stepOf(debt.settle(true, 563, 7, afterReset)));
+        ASSERT_EQ(stepOf(LabelPaintOwedStep::Keep), stepOf(debt.settle(true, 1174, 7, afterReset)));
+        ASSERT_EQ(stepOf(LabelPaintOwedStep::PayNow), stepOf(debt.settle(true, 1175, 7, afterReset)));
+    }
+    // T3 (A3 sibling, ShowFps off: the reset withdraws nothing and raises nothing): a look store at 500 under EMA 450 keeps the floor
+    // its arm read, so the EMA zeroing at 512 does not move its 675 ms deadline to 63 ms (r8 paid at 563).
+    {
+        SharedLabelDebt debt;
+        debt.store(false, 500, 7, beforeReset);
+        ASSERT_EQ(stepOf(LabelPaintOwedStep::Keep), stepOf(debt.settle(true, 563, 7, afterReset)));
+        ASSERT_EQ(stepOf(LabelPaintOwedStep::PayNow), stepOf(debt.settle(true, 1175, 7, afterReset)));
+    }
+    // T4 (A3, a run of stores never postpones): a store every 40 ms from 512 on still pays at 1187
+    {
+        SharedLabelDebt debt;
+        debt.store(false, 512, 7, afterReset);
+        debt.resetRaises(beforeReset);
+        LabelPaintOwedStep last = LabelPaintOwedStep::Keep;
+        qint64 paidAt = -1;
+        for ( qint64 t = 520; t <= 1300 && paidAt < 0; t += 8 )
+        {
+            if ( ( t - 520 ) % 40 == 0 ) debt.store(false, t, 7, afterReset);
+            last = debt.settle(true, t, 7, afterReset);
+            if ( last == LabelPaintOwedStep::PayNow ) paidAt = t;
+        }
+        ASSERT_EQ(1192, paidAt);   // the first 8 ms tick at or past 1187
+    }
+    // T5 (control): a frame presented since the arm carried the text (Clear); the next store re-arms with the period read now
+    {
+        SharedLabelDebt debt;
+        debt.store(false, 512, 7, afterReset);
+        debt.resetRaises(beforeReset);
+        ASSERT_EQ(stepOf(LabelPaintOwedStep::Clear), stepOf(debt.settle(true, 700, 8, afterReset)));
+        debt.store(false, 710, 8, afterReset);
+        ASSERT_EQ(710, debt.armedAtMs);
+        ASSERT_EQ(42, debt.floorMs);
+        ASSERT_EQ(stepOf(LabelPaintOwedStep::Keep), stepOf(debt.settle(true, 772, 8, afterReset)));
+        ASSERT_EQ(stepOf(LabelPaintOwedStep::PayNow), stepOf(debt.settle(true, 773, 8, afterReset)));
+        // a store joining a debt whose frame came but was not settled yet re-arms (that frame could not carry the new text)
+        SharedLabelDebt joined;
+        joined.store(false, 100, 3, beforeReset);
+        joined.store(false, 140, 4, afterReset);
+        ASSERT_EQ(140, joined.armedAtMs);
+        ASSERT_EQ(42, joined.floorMs);
+    }
+    // T6 (A4, sol's row): Baseline -> Cinematic stored at 100 while playing (fps off), Stop at 120 before any hand-over. The Stop's
+    // equal composition pushes nothing; its settle pays at once (both surfaces), not at the stopped frame's refresh 900 ms later.
+    {
+        SharedLabelDebt debt;
+        debt.store(false, 100, 3, afterReset);
+        ASSERT_EQ(stepOf(LabelPaintOwedStep::PayNow), stepOf(debt.settle(false, 120, 3, afterReset)));
+        ASSERT_FALSE(debt.armed);
+        ASSERT_EQ(stepOf(LabelPaintOwedStep::Keep), stepOf(debt.settle(false, 1020, 4, afterReset)));   // nothing left at the refresh
+    }
+    // T7 (controls): stopped with a frame since the store clears; nothing owed keeps; a repaint-now push pays and disarms
+    ASSERT_EQ(stepOf(LabelPaintOwedStep::Clear), stepOf(labelPaintOwedStep(true, false, true, 3, afterReset)));
+    ASSERT_EQ(stepOf(LabelPaintOwedStep::Keep), stepOf(labelPaintOwedStep(false, false, false, 900, afterReset)));
+    ASSERT_EQ(stepOf(LabelPaintOwedStep::Keep), stepOf(labelPaintOwedStep(false, true, false, 900, afterReset)));
+    {
+        SharedLabelDebt debt;
+        debt.store(false, 100, 3, afterReset);
+        debt.store(true, 110, 3, afterReset);
+        ASSERT_FALSE(debt.armed);
+    }
+    // T8 (bounds): an unknown period (0 or negative) arms with no floor; a join keeps a floor over an unknown period
+    ASSERT_EQ(0, labelPaintOwedStore(false, false, 450, 0).floorMs);
+    ASSERT_EQ(0, labelPaintOwedStore(false, false, 450, -5).floorMs);
+    ASSERT_TRUE(labelPaintOwedStore(false, false, 450, 0).arm);
+    ASSERT_FALSE(labelPaintOwedStore(true, false, 450, 0).arm);
+    ASSERT_EQ(450, labelPaintOwedStore(true, false, 450, -5).floorMs);
+    ASSERT_EQ(1000, labelPaintOwedStore(true, false, 450, 1000).floorMs);
 }
 
 // INFO-2 r2 (adversary pass 2 A2 on 9496cb72, introduced, major): 24 fps, start on paused frame 0, Cut Out 3, Loop off. Frames 1 and

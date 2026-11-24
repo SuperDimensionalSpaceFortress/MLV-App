@@ -306,10 +306,42 @@ inline CpuLabelPaint cpuLabelPaint( bool repaintNow, bool framePaintPending, boo
  *  the period read now and the floor its store recorded. The fps meter's reset stores the withdrawn text AFTER it zeroed the EMA,
  *  so the period read at settle time fell from the measured one (a 24 fps target playing at 2.2 fps: 450 ms, deadline 675 ms) to
  *  the target's 42 ms (deadline 63 ms), and the debt painted at draw age 576 ms, before the deadline that reset had declined. The
- *  reset records the period it read before the zeroing as the debt's floor; every other store records 0 (no floor). */
+ *  reset raises the debt's floor to the period it read before the zeroing. INFO-2 r9 (sol r8 A3): every arm records the period it
+ *  reads as the floor and no store or reset lowers it (labelPaintOwedStore); r7-r8 gave every other store a floor of 0. */
 inline qint64 labelPaintOwedExpectedMs( qint64 floorMs, qint64 currentMs )
 {
     return floorMs > currentMs ? floorMs : currentMs;
+}
+
+/*! \brief INFO-2 r9 (sol r8 A3 on 2b195b9e): what a declined (stored) label change does to the one paint debt both surfaces share
+ *  (the GPU window and the CPU viewport). `owedUnpaid` = a debt is armed, `framePresentedSinceArm` = a frame was presented since
+ *  that arm (it could not carry this text), `floorMs` = the debt's floor, `expectedNowMs` = labelPaintExpectedFrameMs read now.
+ *  Nothing unpaid (or a frame came since the arm): ARM, with the period read now as the floor, so a later meter reset that zeroes
+ *  the EMA never shrinks the deadline this store was made under. A store that JOINS an unpaid debt keeps its arm time and never
+ *  lowers its floor: r8 cleared the floor and restarted the clock on every store, so a look landing 8 ms after the meter's
+ *  withdrawal (24 fps target, EMA 450 ms, floor 450, deadline 675 ms) re-armed on the zeroed EMA's 63 ms deadline and paid at
+ *  draw age 584 ms; and a run of stores postponed the paint it owed. */
+struct LabelPaintOwedStore { bool arm; qint64 floorMs; };
+inline LabelPaintOwedStore labelPaintOwedStore( bool owedUnpaid, bool framePresentedSinceArm, qint64 floorMs, qint64 expectedNowMs )
+{
+    const qint64 now = expectedNowMs > 0 ? expectedNowMs : 0;
+    if( !owedUnpaid || framePresentedSinceArm ) return { true, now };
+    return { false, labelPaintOwedExpectedMs( floorMs, now ) };
+}
+
+/*! \brief INFO-2 r9 (sol r8 A4 on 2b195b9e): the one settle step of the shared paint debt. Nothing owed: Keep (nothing to do). A
+ *  frame presented since the store carried the text: Clear. Stopped: PayNow, at once on both surfaces: r2-r8 only cleared the debt
+ *  at a Stop, so a change the Stop's equal composition did not push again (ShowFps off, Baseline -> Cinematic stored while playing)
+ *  stayed off screen until the stopped frame's refresh. Playing: PayNow at the deadline (labelPaintOwedDue), else Keep. */
+enum class LabelPaintOwedStep { Keep, Clear, PayNow };
+inline LabelPaintOwedStep labelPaintOwedStep( bool owed, bool playing, bool framePresentedSinceStore, qint64 msSinceStore,
+                                              qint64 expectedFrameMs )
+{
+    if( !owed ) return LabelPaintOwedStep::Keep;
+    if( framePresentedSinceStore ) return LabelPaintOwedStep::Clear;
+    if( !playing ) return LabelPaintOwedStep::PayNow;
+    return labelPaintOwedDue( owed, framePresentedSinceStore, msSinceStore, expectedFrameMs ) ? LabelPaintOwedStep::PayNow
+                                                                                              : LabelPaintOwedStep::Keep;
 }
 
 /*! \brief INFO-2 r4 (adversary r3 A3): the frame period a playing label's paint debt waits for: the larger of the target period
