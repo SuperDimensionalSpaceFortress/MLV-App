@@ -1532,6 +1532,10 @@ public static class VenueLeaseBatchBoundedReadR4 {
     $ms = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min(3600.0, $BoundSec)) * 1000.0)
     $b = $null; $k = $null; $e = $null
     $full = try { [IO.Path]::GetFullPath($Path) } catch { return [pscustomobject]@{ state = 'FAILED'; bytes = $null; key = ''; error = ($_.Exception.Message -replace '\s+', ' ') } }
+    # b2 r1 (adversary pass 2 A3 on bf5ebeb2): the caller's -BoundSec was sampled before this call; the room before -DeadlineUtc (less the 2 s reserve) is asked again as the
+    # last step before the read starts, so a caller descheduled after sampling never waits on its old allowance
+    $dlR = Get-Variable -Name deadline -ValueOnly -ErrorAction Ignore
+    if ($dlR -is [datetime]) { $ms = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min([double]$ms, (($dlR - [DateTime]::UtcNow).TotalSeconds - 2.0) * 1000.0))) }
     $rc = [VenueLeaseBatchBoundedReadR4]::ReadWithin($full, $DelayMs, $ms, [ref]$b, [ref]$k, [ref]$e)
     $dlA = Get-Variable -Name deadline -ValueOnly -ErrorAction Ignore
     if ($rc -ne 2 -and $dlA -is [datetime] -and ($dlA - [DateTime]::UtcNow).TotalSeconds -lt 2.0) { $rc = 2; $b = $null; $k = ''; $e = $null }   # b2 r1 (pass 8 A5): an answer inside the deadline's reserve is no answer
@@ -3090,8 +3094,16 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $legReturnTs = [Diagnostics.Stopwatch]::GetTimestamp()   # r6 (adversary-848f6559.json A1): the child's return; the idle anchor is placed from the leg job's own result below
                 $text =[string]$lp.stdout + [string]$lp.stderr   # r7: read from the child, never back from the file, whose write the guard may refuse
                 # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A4 sibling :2963): evidence only; a write that throws is said on stderr and never replaces the leg's classification
-                if (Test-RunDirWrite $out) { try { [IO.File]::WriteAllText($out, $text, [Text.UTF8Encoding]::new($false)) } catch { $wfLine = "LEG_OUT_WRITE_FAILED leg=$($leg.name) path=$out reason=$($_.Exception.Message -replace '\s+', ' ') (evidence only: the leg is classified from its own captured output)"; try { $null = [VenueLeaseBatchBoundedReadR4]::ErrorLineWithin($wfLine, 2000) } catch { $null = $_ } } }   # r4 fix 2 (pass 6 A6): bounded
-                $legCode = $lp.exit
+                $legCode = $lp.exit   # b2 r1 (pass 8 A7): the child's own return is read FIRST, before any evidence write
+                # b2 r1 (pass 8 A7; pass 2 A5 on bf5ebeb2): the .out.txt is evidence only and is written on VenueChain's bounded read (a worker given up on after 2 s, counted as every
+                # abandoned read is), so a -RunDir share that stalls the write holds neither the classification nor the cleanup
+                if (Test-RunDirWrite $out) {
+                    $owr = try { Invoke-VenueBoundedRead -ScriptText 'param($a) $out = $a.p; $text = $a.t; try { [IO.File]::WriteAllText($out, $text, [Text.UTF8Encoding]::new($false)); "OK" } catch { "FAILED " + $_.Exception.Message }' -Argument @{ p = $out; t = $text } -TimeoutSec 2 } catch { [pscustomobject]@{ answered = $true; value = @(); error = ($_.Exception.Message -replace '\s+', ' ') } }
+                    $owv = @($owr.value | ForEach-Object { [string]$_ })
+                    $wfLine = $(if (-not $owr.answered) { "LEG_OUT_WRITE_TIMEOUT leg=$($leg.name) path=$out (no answer in 2 s; evidence only: the leg is classified from its own captured output)" }
+                        elseif ($owv -notcontains 'OK') { "LEG_OUT_WRITE_FAILED leg=$($leg.name) path=$out reason=$((($owv -join ' ') + ' ' + [string]$owr.error).Trim() -replace '^FAILED ', '' -replace '\s+', ' ') (evidence only: the leg is classified from its own captured output)" } else { '' })
+                    if ($wfLine) { try { $null = [VenueLeaseBatchBoundedReadR4]::ErrorLineWithin($wfLine, 2000) } catch { $null = $_ } }   # r4 fix 2 (pass 6 A6): bounded
+                }
                 $legSec = [int](($legReturnTs - $tLegTs) / [Diagnostics.Stopwatch]::Frequency)   # b2 r1 (pass 8 A2 sibling): the Stopwatch, never the wall clock
                 # a leg killed at the lease's end says nothing about how long a leg takes
                 if (-not $lp.timedOut -and $legSec -gt $legBudget) { $legBudget = [Math]::Min(2700, $legSec) }

@@ -266,7 +266,8 @@ public static class VenueChainEvidenceWrite {
         $script:EvidenceWriterReady = [bool]('VenueChainEvidenceWrite' -as [type])
         if (-not $script:EvidenceWriterReady) { $script:EvidenceWriterError = 'the bounded transcript writer did not load' }
     } catch { $script:EvidenceWriterError = "the bounded transcript writer could not be compiled: $($_.Exception.Message)" }
-    if (-not $script:EvidenceWriterReady) { [Console]::Error.WriteLine("CHAIN_EVIDENCE_WRITER_UNAVAILABLE $($script:EvidenceWriterError -replace '\s+', ' ') (child transcripts are skipped; every child is still classified from its own captured output)") }
+    # b2 r1 (adversary pass 2 A4 on bf5ebeb2): said in the chain log, never synchronously on stderr (a full unread pipe held the start before the first probe); best effort
+    if (-not $script:EvidenceWriterReady) { try { L "CHAIN_EVIDENCE_WRITER_UNAVAILABLE $($script:EvidenceWriterError -replace '\s+', ' ') (child transcripts are skipped; every child is still classified from its own captured output)" } catch { $null = $_ } }
 }
 
 $results = [System.Collections.Generic.List[object]]::new()
