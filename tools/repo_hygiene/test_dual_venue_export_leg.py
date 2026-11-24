@@ -2417,6 +2417,8 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
                 ("B4-SKIPPED", cdng_case(batch="[BATCH] DONE view-0 skipped=1 exported=30 skipped=0 elapsed=20.0\n"), "INVALID", "skipped="),
                 ("B4-PRORES", self.t2_case(self.t2_start(), [self.t2_verified()], "[BATCH] DONE view-0 exported=1 skipped=0 elapsed=1.0 exported=1 skipped=0 elapsed=1.0"),
                  "INVALID", "elapsed="),
+                # (r4 adversary pass 2 A1 on 2d8e9bf2, input verbatim: an extra separator before the second triplet left an empty last token and bypassed the check)
+                ("A1-SEPARATOR", cdng_case(batch="[BATCH] DONE owner-clip exported=29 skipped=1 elapsed=40.0  exported=30 skipped=0 elapsed=20.0\n"), "INVALID", "elapsed="),
                 ("CDNG-CLIP-KEY", cdng_case(batch="[BATCH] DONE elapsed=1.0 exported=30 skipped=0 elapsed=20.0\n"), "PASS", None)]
         proc, got = evidence_cases([c for _, c, _, _ in rows])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
@@ -2447,6 +2449,13 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
                      (f"{build[:8]}-NO-START", self.ctl(old, buildId=build, batch=no_start), "PASS"),
                      (f"{build[:8]}-B3-DUP-OUTPUT", self.ctl(old, buildId=build, batch=self.ctl_batch(start=dup)), "INVALID"),
                      (f"{build[:8]}-B3-COLON", self.ctl(old, buildId=build, batch=self.ctl_batch(start=colon)), "INVALID")]
+            # (r4 adversary pass 2 A4 on 2d8e9bf2: a present declaration on the older route binds as on the emitting one: the producer's order, the manifest's .mov, the
+            # verified dimensions and the timed window; scaled= alone stays with the emitting route, since an older build times no export_scale)
+            done = "[BATCH] DONE view-0 exported=480 skipped=0 elapsed=60.0"
+            rows += [(f"{build[:8]}-A4-ORDER", self.ctl(old, buildId=build, batch=self.ctl_batch(order=("done", "verified", "start"))), "INVALID"),
+                     (f"{build[:8]}-A4-OUT", self.ctl(old, buildId=build, batch=self.ctl_batch(start=self.CTL_START.replace("out=view-0.mov", "out=other.mov"))), "INVALID"),
+                     (f"{build[:8]}-A4-DIMS", self.ctl(old, buildId=build, batch=f"{self.CTL_START}\n{verified_line(480, '1920x1440')}\n{done}\n"), "INVALID"),
+                     (f"{build[:8]}-A4-WINDOW", self.ctl(old, buildId=build, batch=self.ctl_batch(start=self.CTL_START.replace("cutIn=1 cutOut=480", "cutIn=101 cutOut=580"))), "INVALID")]
         proc, got = evidence_cases([c for _, c, _ in rows])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         for (label, _, expect), g in zip(rows, got):
@@ -2455,7 +2464,7 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
                     self.assertEqual(g["problems"], [], "an older build's valid (or absent) declaration raises no problem")
                 else:
                     self.assertEqual(g["outcome"], "INVALID", g)
-                    self.assertTrue(any("RENDER_START" in p and (p.startswith("EXPORT_PROFILE_ABSENT") or p.startswith("EXPORT_OUTPUT_MISMATCH")) for p in g["problems"]), g)
+                    self.assertTrue(any("RENDER_START" in p and p.split(":")[0] in ("EXPORT_PROFILE_ABSENT", "EXPORT_OUTPUT_MISMATCH", "EXPORT_STAGE_WINDOW_MISMATCH") for p in g["problems"]), g)
 
 
 EXPORT_STUB_GENERATOR = r"""
