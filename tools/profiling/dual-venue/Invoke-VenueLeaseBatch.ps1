@@ -304,6 +304,11 @@ $script:ExportBudgetPreflightCleanupMs = 1500   # (adversary r11 A6: the one bud
 # a.json shared one digest and the second read overwrote the first's (a false SPEC_CHANGED_AFTER_PREFLIGHT before the claim, and the guard and child bound to the other file's bytes).
 $script:SpecBudgetSha256 = [Collections.Hashtable]::new([StringComparer]::Ordinal)
 $script:SpecShapeSha256 = [Collections.Hashtable]::new([StringComparer]::Ordinal)   # (and of the bytes the preflight's shape check judged, which the budget's read must equal)
+# DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A1, A3): the volume + file index of the file each judged read's bytes came from, taken from the SAME open handle the
+# bytes were read through (Read-SpecBytesWithin's .key), never from a second open of the path afterwards (a name re-pointed between the two opens recorded another file, and that
+# second open was unbounded). Written by the read that judged the bytes, read by the caller right after it, so it is this entry's own.
+$script:SpecBudgetFileKey = [Collections.Hashtable]::new([StringComparer]::Ordinal)
+$script:SpecShapeFileKey = [Collections.Hashtable]::new([StringComparer]::Ordinal)
 foreach ($s in @($StagedBuildProbeScript, $ArtifactProbeScript) | Where-Object { $_ }) { if (-not (Test-Path -LiteralPath $s -PathType Leaf)) { Stop-Usage "no script at '$s'" } }
 $stagedBuildProbe = $(if ($StagedBuildProbeScript) { [scriptblock]::Create([IO.File]::ReadAllText($StagedBuildProbeScript)) } else { $null })
 $artifactProbe = $(if ($ArtifactProbeScript) { [scriptblock]::Create([IO.File]::ReadAllText($ArtifactProbeScript)) } else { $null })
@@ -433,6 +438,7 @@ function Get-PhysicalPath([string]$Path) {
     # r10 (adversary r9 A1): the path the file system opens for $Path, every junction, symlink, subst and 8.3 spelling resolved (GetFinalPathNameByHandle), so two spellings
     # of one file compare equal. THE one resolver of every comparison below. Throws when the path cannot be opened (the caller refuses: an unknown location is not a safe one).
     if (-not ('VenueLeaseBatchFinalPath' -as [type])) {
+        $PSDefaultParameterValues = @{}   # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A5 sibling :435): a caller's Add-Type defaults (OutputAssembly, ...) never reach this compile
         Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
@@ -1438,33 +1444,62 @@ function Read-SpecBytesWithin([string]$Path, [double]$BoundSec, [int]$DelayMs = 
     # r19 (sol r18 B2): a leg spec's bytes read on a pool thread and given up on after $BoundSec, so a share that stopped answering cannot hold the caller past -DeadlineUtc (a
     # synchronous ReadAllBytes could, before any remaining-room check ran). state OK (bytes), FAILED (error: the read threw) or TIMEOUT (no answer in the bound, or no bound left).
     # $DelayMs is the offline -ExportBudgetSpecReadDelaySec seam (0 in production).
-    if (-not ('VenueLeaseBatchBoundedRead' -as [type])) {
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A1, A3): ONE FileStream gives both the bytes and the identity (GetFileInformationByHandle on its own handle,
+    # before the read), inside the same bounded pool-thread task. .key is '' when the handle will not identify; the bytes are still returned (a caller that needs the key refuses).
+    # (The type name carries the r4 shape: the r19 type of the same name, with no key, may already be loaded in this process by an older copy of this script.)
+    if (-not ('VenueLeaseBatchBoundedReadR4' -as [type])) {
+        $PSDefaultParameterValues = @{}   # r4 (adversary pass 5 A5 sibling :1441): a caller's Add-Type defaults (OutputAssembly, ...) never reach this compile
         Add-Type -TypeDefinition @'
 using System;
-public static class VenueLeaseBatchBoundedRead {
-    public static int ReadWithin(string path, int delayMs, int timeoutMs, out byte[] bytes, out string error) {
-        bytes = null; error = null;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class VenueLeaseBatchBoundedReadR4 {
+    [StructLayout(LayoutKind.Sequential)]
+    struct FileTime { public uint Low; public uint High; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct ByHandleFileInformation {
+        public uint Attributes; public FileTime Created; public FileTime Accessed; public FileTime Written;
+        public uint VolumeSerial; public uint SizeHigh; public uint SizeLow; public uint Links; public uint IndexHigh; public uint IndexLow;
+    }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetFileInformationByHandle(SafeFileHandle handle, out ByHandleFileInformation info);
+    static object[] ReadWithKey(string path) {
+        // FileShare.Read, as File.ReadAllBytes opens: a writer holding the file refuses the read, as before
+        using (System.IO.FileStream fs = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.Read)) {
+            ByHandleFileInformation info;
+            string key = GetFileInformationByHandle(fs.SafeFileHandle, out info) ? (info.VolumeSerial.ToString("x8") + ":" + info.IndexHigh.ToString("x8") + info.IndexLow.ToString("x8")) : "";
+            using (System.IO.MemoryStream ms = new System.IO.MemoryStream()) { fs.CopyTo(ms); return new object[] { ms.ToArray(), key }; }
+        }
+    }
+    public static int ReadWithin(string path, int delayMs, int timeoutMs, out byte[] bytes, out string key, out string error) {
+        bytes = null; key = null; error = null;
         if (timeoutMs <= 0) { return 2; }
-        System.Threading.Tasks.Task<byte[]> t = System.Threading.Tasks.Task.Run(() => { if (delayMs > 0) { System.Threading.Thread.Sleep(delayMs); } return System.IO.File.ReadAllBytes(path); });
+        System.Threading.Tasks.Task<object[]> t = System.Threading.Tasks.Task.Run(() => { if (delayMs > 0) { System.Threading.Thread.Sleep(delayMs); } return ReadWithKey(path); });
         try { if (!t.Wait(timeoutMs)) { return 2; } } catch (AggregateException e) { error = e.InnerException != null ? e.InnerException.Message : e.Message; return 1; }
-        bytes = t.Result;
+        bytes = (byte[])t.Result[0]; key = (string)t.Result[1];
         return 0;
     }
 }
 '@
     }
     $ms = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min(3600.0, $BoundSec)) * 1000.0)
-    $b = $null; $e = $null
-    $full = try { [IO.Path]::GetFullPath($Path) } catch { return [pscustomobject]@{ state = 'FAILED'; bytes = $null; error = ($_.Exception.Message -replace '\s+', ' ') } }
-    $rc = [VenueLeaseBatchBoundedRead]::ReadWithin($full, $DelayMs, $ms, [ref]$b, [ref]$e)
-    [pscustomobject]@{ state = @('OK', 'FAILED', 'TIMEOUT')[$rc]; bytes = $b; error = $e }
+    $b = $null; $k = $null; $e = $null
+    $full = try { [IO.Path]::GetFullPath($Path) } catch { return [pscustomobject]@{ state = 'FAILED'; bytes = $null; key = ''; error = ($_.Exception.Message -replace '\s+', ' ') } }
+    $rc = [VenueLeaseBatchBoundedReadR4]::ReadWithin($full, $DelayMs, $ms, [ref]$b, [ref]$k, [ref]$e)
+    [pscustomobject]@{ state = @('OK', 'FAILED', 'TIMEOUT')[$rc]; bytes = $b; key = [string]$k; error = $e }
 }
 
-function Get-JudgedFileKey([string]$Path) {
-    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r3 fix 3 (adversary pass 4 A3): the volume + file index of the file at $Path, read right after an entry's last judged read, so entries are
-    # grouped by the file their bytes came from; '' when it cannot be read (the guard's identity sweep before the claim refuses an input that will not identify)
-    # (Get-PhysicalPath first: it loads the native type Get-FileIdentity calls)
-    try { $null = Get-PhysicalPath $Path; [string](Get-FileIdentity $Path).key } catch { '' }
+function Get-InputLocationWithin([string]$Path) {
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A3 siblings :1763 :1793): an input's final path and identity read on a pool thread (LocateWithin) and given up on
+    # at the room left before -DeadlineUtc (Get-SpecReadBoundSec), so a share that stopped answering cannot hold the preflight past it. $null = no answer in time, or no answer at all
+    # (the caller's refusal for an input that will not identify, unchanged).
+    if (-not ('VenueLeaseBatchFinalPath' -as [type])) { try { $null = Get-PhysicalPath $here } catch { return $null } }   # (Get-PhysicalPath loads the native type)
+    $ms = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min(3600.0, (Get-SpecReadBoundSec))) * 1000.0)
+    if ($ms -le 0) { return $null }
+    $phys = $null; $key = $null
+    $full = try { [IO.Path]::GetFullPath($Path) } catch { return $null }
+    if (-not [VenueLeaseBatchFinalPath]::LocateWithin($full, 0, $ms, [ref]$phys, [ref]$key)) { return $null }
+    [pscustomobject]@{ phys = $phys; key = $key }
 }
 
 function Get-BytesSha256([byte[]]$Bytes) {
@@ -1493,6 +1528,7 @@ function Get-LegSpecRefusal([string]$Path, [string]$Backend, [double]$BoundSec =
     # r20: and the third element of a '' answer, so the content guard compares THESE bytes with the judged ones (one read, after master's own typed refusals)
     $judgedSha = Get-BytesSha256 $specRead.bytes
     if ($script:SpecShapeSha256 -is [hashtable]) { $script:SpecShapeSha256[$Path] = $judgedSha }
+    if ($script:SpecShapeFileKey -is [hashtable]) { $script:SpecShapeFileKey[$Path] = [string]$specRead.key }   # r4 (pass 5 A1): the file these bytes came from, off the same handle
     $shapeRefusal = Get-DvLegSpecShapeRefusal -Spec $spec
     if ($null -ne $shapeRefusal) { return 'LEG_SPEC_INVALID', "'$Path' cannot be run: $shapeRefusal" }
     if ($spec.schema -ne 'mlv-app/dual-venue-leg/v1') { return 'LEG_SPEC_INVALID', "'$Path' schema is '$($spec.schema)', expected mlv-app/dual-venue-leg/v1" }
@@ -1506,6 +1542,13 @@ function Get-LegSpecRefusal([string]$Path, [string]$Backend, [double]$BoundSec =
         if ([string]::IsNullOrEmpty([string]$spec.legId)) { throw 'the spec has no legId (Invoke-VenueLeg binds it to New-DvReceipt, which refuses an empty one)' }
     } catch { return 'LEG_SPEC_INVALID', "'$Path' cannot be run: $($_.Exception.Message -replace '\s+', ' ')" }
     return '', '', $judgedSha
+}
+
+function Get-ExportBudgetChildDeadline {
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A2 siblings :1557 :1570): the ABSOLUTE end of an export-budget child, the room's own end (-DeadlineUtc less the
+    # refusal's reserve and the kill/stream cleanup budget), handed to Invoke-VenueBoundedProcess so a parent descheduled after the room was cut neither starts the child late nor
+    # waits its full relative bound past it (a child not started is .timedOut: the caller's EXPORT_BUDGET_PREFLIGHT_TIMEOUT)
+    $deadline.ToUniversalTime().AddSeconds(-$script:ExportBudgetPreflightReserveSec).AddMilliseconds(-$script:ExportBudgetPreflightCleanupMs)
 }
 
 function Get-ExportBudgetRefusal([string]$Path) {
@@ -1535,7 +1578,15 @@ function Get-ExportBudgetRefusal([string]$Path) {
     if ($script:SpecShapeSha256.ContainsKey($Path) -and [string]$script:SpecShapeSha256[$Path] -cne $judgedSha) {
         return 'SPEC_CHANGED_AFTER_PREFLIGHT', "'$Path' cannot be run: the leg spec changed between the preflight's shape check (sha256 $($script:SpecShapeSha256[$Path])) and its export budget read (sha256 $judgedSha); no claim or lease is taken on bytes no single check judged"
     }
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A1): the file these judged bytes came from, off the handle they were read through. A read that will not identify
+    # is refused (the entries are grouped by it before the claim), and so is a budget read from another file than the shape check's (two judged reads, two files).
+    $judgedKey = [string]$specRead.key
+    if (-not $judgedKey) { return 'SPEC_READ_FAILED', "'$Path' cannot be run: the export budget preflight read the leg spec but could not identify the file its bytes came from, so it cannot be compared with the other entries; no claim or lease is taken on it" }
+    if ($script:SpecShapeFileKey.ContainsKey($Path) -and [string]$script:SpecShapeFileKey[$Path] -cne $judgedKey) {
+        return 'SPEC_CHANGED_AFTER_PREFLIGHT', "'$Path' cannot be run: the preflight's shape check read file $($script:SpecShapeFileKey[$Path]) and its export budget read file $judgedKey (the name was re-pointed between them); no claim or lease is taken on bytes no single file supplied"
+    }
     $script:SpecBudgetSha256[$Path] = $judgedSha
+    $script:SpecBudgetFileKey[$Path] = $judgedKey
     try { $spec = [Text.Encoding]::UTF8.GetString($specBytes) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop }
     catch { return 'SPEC_READ_FAILED', "'$Path' cannot be run: the leg spec no longer parses on the export budget preflight's read ($($_.Exception.Message -replace '\s+', ' ')), so its job budget is unchecked; no claim or lease is taken on it" }
     if ($spec -isnot [System.Management.Automation.PSCustomObject]) { return 'SPEC_READ_FAILED', "'$Path' cannot be run: the leg spec is no longer one JSON object on the export budget preflight's read, so its job budget is unchecked; no claim or lease is taken on it" }
@@ -1554,7 +1605,7 @@ function Get-ExportBudgetRefusal([string]$Path) {
     $boundFloor = [Math]::Floor([Math]::Min([double]$script:ExportBudgetPreflightCapSec, $room))
     if ($boundFloor -lt 1) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight was not started, $([Math]::Round([Math]::Max(0.0, $room), 1)) s were left before -DeadlineUtc (less $($script:ExportBudgetPreflightReserveSec) s)" }
     $boundSec = [int]$boundFloor   # (in range: the floor is between 1 and the 120 s cap)
-    $bp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-PreflightBudgetOnly', '-ClipId', $clipId, '-Format', $format, '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs
+    $bp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-PreflightBudgetOnly', '-ClipId', $clipId, '-Format', $format, '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs -DeadlineUtc (Get-ExportBudgetChildDeadline)
     if ($bp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight did not answer in $boundSec s and was killed ($(if ($bp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))" }
     $text = (@($bp.stdout, $bp.stderr) | Where-Object { $_ }) -join "`n"
     if ($text -match '(?m)DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED[^\r\n]*') { return 'EXPORT_TIME_BUDGET_EXCEEDED', "'$Path' cannot be run: $($Matches[0] -replace '\s+', ' ')" }
@@ -1567,7 +1618,7 @@ function Get-ExportBudgetRefusal([string]$Path) {
     $boundFloor = [Math]::Floor([Math]::Min([double]$script:ExportBudgetPreflightCapSec, $room))
     if ($boundFloor -lt 1) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor was not started, $([Math]::Round([Math]::Max(0.0, $room), 1)) s were left before -DeadlineUtc (less $($script:ExportBudgetPreflightReserveSec) s)" }
     $boundSec = [int]$boundFloor
-    $fp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-DescribeTimeBudgetBytes', '0', '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs
+    $fp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-DescribeTimeBudgetBytes', '0', '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs -DeadlineUtc (Get-ExportBudgetChildDeadline)
     if ($fp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor did not answer in $boundSec s and was killed ($(if ($fp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))" }
     $floorText = (@($fp.stdout, $fp.stderr) | Where-Object { $_ }) -join "`n"
     if ($floorText -match '(?m)DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED[^\r\n]*') { return 'EXPORT_TIME_BUDGET_EXCEEDED', "'$Path' cannot be run: the clip did not resolve here, and the clip-independent floor alone (a 0-byte clip) is refused: $($Matches[0] -replace '\s+', ' ')" }
@@ -1593,6 +1644,7 @@ function Get-ScalarLegShapeRefusal([string]$Path) {
     try { $spec = [Text.Encoding]::UTF8.GetString($specRead.bytes) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop }
     catch { return "the leg spec is not valid JSON ($($_.Exception.Message -replace '\s+', ' '))" }
     $script:SpecShapeSha256[$Path] = Get-BytesSha256 $specRead.bytes  # r19 (sol r18 B1 sibling): the bytes this shape check judged
+    $script:SpecShapeFileKey[$Path] = [string]$specRead.key   # r4 (pass 5 A1): and the file they came from, off the same handle
     try { $refusal = Get-DvLegSpecShapeRefusal -Spec $spec } catch { return "the leg spec cannot be shape-checked ($($_.Exception.Message -replace '\s+', ' '))" }
     $(if ($null -ne $refusal) { [string]$refusal } else { '' })
 }
@@ -1641,7 +1693,7 @@ if ($legPlanMode) {
             if ($specRefusal[0]) { Stop-PlanRefused $specRefusal[0] $n $specRefusal[1] }
             $budgetRefusal = Get-ExportBudgetRefusal $path   # r8 (adversary r7 A3): an export window the agent's job cap refuses is refused HERE, before any claim or lease
             if ($budgetRefusal[0]) { Stop-PlanRefused $budgetRefusal[0] $n $budgetRefusal[1] }
-            $judgedKey = Get-JudgedFileKey $path   # r3 fix 3 (adversary pass 4 A3): the file THIS item's bytes were judged from, read right after its last judged read
+            $judgedKey = [string]$script:SpecBudgetFileKey[$path]   # r4 (adversary pass 5 A1, A3): the file THIS item's judged bytes came from, off the handle that read them
             $items.Add([pscustomobject]@{ item = $n; legId = (Get-LegSpecId $path); spec = $path; backend = $be.ToLowerInvariant(); arm = $arm; sourceCommit = $sc.ToLowerInvariant(); buildManifestSha256 = $ms.ToLowerInvariant()
                     specSha256 = [string]$script:SpecBudgetSha256[$path]; fileKey = $judgedKey })   # r2 (adversary A1 class): THIS item's judged bytes
         }
@@ -1704,7 +1756,7 @@ if ($legPlanMode) {
         if ([string]$script:SpecBudgetSha256[[string]$e.specPath] -cne [string]$e.specSha256) {
             Stop-Usage "SPEC_CHANGED_AFTER_PREFLIGHT '$($e.specPath)' cannot be run: the leg spec read as sha256 $([string]$script:SpecBudgetSha256[[string]$e.specPath]) after the leg-set planner judged sha256 $($e.specSha256) (planned_sha256=$($e.specSha256)); no claim or lease is taken on bytes the planner did not judge"
         }
-        $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend; specSha256 = [string]$e.specSha256; fileKey = (Get-JudgedFileKey ([string]$e.specPath)) })   # r3 fix 3 (A3)
+        $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend; specSha256 = [string]$e.specSha256; fileKey = [string]$script:SpecBudgetFileKey[[string]$e.specPath] })   # r4 (pass 5 A1, A3): off the judged read's own handle
     }
 } else {
     Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force
@@ -1721,7 +1773,7 @@ if ($legPlanMode) {
         if ($shapeRefusal) { Stop-Usage "LEG_SPEC_INVALID '$path' cannot be run: $shapeRefusal" }
         $budgetRefusal = Get-ExportBudgetRefusal $path   # r8 (adversary r7 A3): before any claim or lease, as -LegPlan does
         if ($budgetRefusal[0]) { Stop-Usage "$($budgetRefusal[0]) $($budgetRefusal[1])" }
-        $judgedKey = Get-JudgedFileKey $path   # r3 fix 3 (adversary pass 4 A3): the file THIS entry's bytes were judged from, read right after its last judged read
+        $judgedKey = [string]$script:SpecBudgetFileKey[$path]   # r4 (adversary pass 5 A1, A3): the file THIS entry's judged bytes came from, off the handle that read them
         $legId = Get-LegSpecId $path
         $judgedSha = [string]$script:SpecBudgetSha256[$path]   # r2 (adversary A1 class): THIS entry's judged bytes
         for ($r = 1; $r -le $Repeats; $r++) {
@@ -1759,13 +1811,19 @@ if ($legPlanMode) { foreach ($b in $builds.GetEnumerator()) { $first = @($items 
 # is asked again (a save-as-rename's moment), at most three times, and one that still will not is refused here, before any claim, in its unresolved type.
 foreach ($g in $script:guardedInputs) {
     $acc = $null
+    $askTimedOut = $false
     for ($ask = 1; $ask -le 3 -and $null -eq $acc; $ask++) {
-        $acc = $(try { [pscustomobject]@{ phys = (Get-PhysicalPath $g.path); key = (Get-FileIdentity $g.path).key } } catch { $null })
+        # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A3 sibling :1763): bounded by the room before -DeadlineUtc (Get-InputLocationWithin), never a synchronous open
+        $askStart = [DateTime]::UtcNow; $askBound = Get-SpecReadBoundSec
+        $acc = Get-InputLocationWithin $g.path
+        $askTimedOut = ($null -eq $acc -and ([DateTime]::UtcNow - $askStart).TotalSeconds -ge [Math]::Max(0.0, $askBound))
+        if ($askTimedOut) { break }
         if ($null -eq $acc -and $ask -lt 3) { Start-Sleep -Milliseconds 200 }
     }
     $g | Add-Member -NotePropertyName accepted -NotePropertyValue $acc
     if ($null -eq $acc) {
-        $code = Get-InputUnresolvedCode $g.path -SkipRead:($g.kind -ceq 'build'); if (-not $code) { $code = 'INPUT_UNREADABLE' }
+        # (an input that did not answer in the room left is INPUT_UNREADABLE at once: Get-InputUnresolvedCode's own opens are synchronous and would hold the preflight on it again)
+        $code = $(if ($askTimedOut) { 'INPUT_UNREADABLE' } else { Get-InputUnresolvedCode $g.path -SkipRead:($g.kind -ceq 'build') }); if (-not $code) { $code = 'INPUT_UNREADABLE' }
         $label = $(if ($g.kind -ceq 'plan') { 'the plan file' } elseif ($g.kind -ceq 'build') { 'the staged build manifest' } else { 'the leg spec' })
         Stop-InputIsOutput ([pscustomobject]@{ kind = 'unresolved'; input = $g.kind; item = $g.item; code = $code; path = $g.path; why = "$label '$($g.path)' could not be identified as it was accepted (no destination could be compared with it)" })
     }
@@ -1774,11 +1832,16 @@ foreach ($g in $script:guardedInputs) {
 # two), and the check after the plan compares each entry with its own string's binding. The same FILE reached by two spellings (Pace.json and pace.json on a case-insensitive
 # volume, or a hard link) is two strings, so it is compared HERE by the file identity just accepted: every entry naming one file must have been judged as the same bytes, before
 # any claim or lease (the guard's re-read after the claim would only find it once the claim was taken).
-# r3 fix 3 (adversary pass 4 A3): grouped by the identity each entry recorded right after ITS judged read (Get-JudgedFileKey), not this later sweep's: a name re-pointed at another
-# file between the two would otherwise split one judged file into two groups. An entry with no recorded identity falls back to the sweep's (the sweep refused an unidentifiable one).
+# r3 fix 3 (adversary pass 4 A3): grouped by the identity each entry recorded with ITS judged read, not this later sweep's: a name re-pointed at another file between the two would
+# otherwise split one judged file into two groups. r4 (adversary pass 5 A1): that identity is read off the SAME handle as the judged bytes (Read-SpecBytesWithin), so no re-point
+# between a byte read and an identity open exists. An entry with no recorded identity is refused (never the sweep's later identity in its place: that is another open, maybe another file).
 $specByFile = [Collections.Hashtable]::new([StringComparer]::Ordinal)
 foreach ($g in @($script:guardedInputs | Where-Object { $_.kind -ceq 'spec' })) {
-    $fileKey = $(if ($g.fileKey) { [string]$g.fileKey } else { [string]$g.accepted.key })
+    $fileKey = [string]$g.fileKey
+    if (-not $fileKey) {
+        $msg = "'$($g.path)' cannot be run: no file identity was recorded with its judged read, so it cannot be compared with the other entries; no claim or lease is taken on it"
+        if ($legPlanMode) { Stop-PlanRefused 'SPEC_CHANGED_AFTER_PREFLIGHT' $g.item $msg } else { Stop-Usage "SPEC_CHANGED_AFTER_PREFLIGHT $msg" }
+    }
     if (-not $specByFile.ContainsKey($fileKey)) { $specByFile[$fileKey] = $g; continue }
     $firstSpec = $specByFile[$fileKey]
     if ([string]$firstSpec.specSha256 -cne [string]$g.specSha256) {
@@ -1790,7 +1853,8 @@ if ($LegSet) { $hit = Get-InputOutputRefusal; if ($hit) { Stop-InputIsOutput $hi
 # r5 (sol r4 B1, key3 H-B): -RunDir's physical path and file identity as the preflight found them, read ONCE here, before any claim. A guard that gave up on a location read
 # (locationUnknown) may have given up on -RunDir itself, so Test-OpenOutputAlias then never reads -RunDir again unbounded (a stalled UNC or junction would hold it). r7 (sol r6 B2):
 # after the open these only add a spelling refusal of TEMP there; they never stand in for where -RunDir is now (a re-read that does not answer fails the redirect closed).
-$script:runDirKnown = $(try { [pscustomobject]@{ physical = (Get-PhysicalPath $RunDir); idKey = (Get-FileIdentity $RunDir).key } } catch { $null })
+# DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A3 sibling :1793): bounded by the room before -DeadlineUtc (Get-InputLocationWithin); no answer is $null, as a throw was
+$script:runDirKnown = $(try { $rdLoc = Get-InputLocationWithin $RunDir; if ($null -eq $rdLoc) { $null } else { [pscustomobject]@{ physical = $rdLoc.phys; idKey = $rdLoc.key } } } catch { $null })
 $script:tempSeamPlan = Get-TempReadSeamPlan   # r6: offline seam only ($null in production, no read)
 # The scalar form's one build rides on every leg, so each leg is launched with its own build in either form.
 if (-not $legPlanMode) { foreach ($p in $plan) { $p | Add-Member -NotePropertyName sourceCommit -NotePropertyValue $SourceCommit; $p | Add-Member -NotePropertyName buildManifestSha256 -NotePropertyValue $BuildManifestSha256 } }
@@ -2960,7 +3024,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 }
                 $legReturnTs = [Diagnostics.Stopwatch]::GetTimestamp()   # r6 (adversary-848f6559.json A1): the child's return; the idle anchor is placed from the leg job's own result below
                 $text =[string]$lp.stdout + [string]$lp.stderr   # r7: read from the child, never back from the file, whose write the guard may refuse
-                if (Test-RunDirWrite $out) { [IO.File]::WriteAllText($out, $text, [Text.UTF8Encoding]::new($false)) }
+                # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A4 sibling :2963): evidence only; a write that throws is said on stderr and never replaces the leg's classification
+                if (Test-RunDirWrite $out) { try { [IO.File]::WriteAllText($out, $text, [Text.UTF8Encoding]::new($false)) } catch { [Console]::Error.WriteLine("LEG_OUT_WRITE_FAILED leg=$($leg.name) path=$out reason=$($_.Exception.Message -replace '\s+', ' ') (evidence only: the leg is classified from its own captured output)") } }
                 $legCode = $lp.exit
                 $legSec = [int]([DateTime]::UtcNow - $tLeg).TotalSeconds
                 # a leg killed at the lease's end says nothing about how long a leg takes

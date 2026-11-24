@@ -7151,6 +7151,142 @@ exit 0
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
         self.assertTrue(any(l.startswith("BATCH_USAGE SPEC_CHANGED_AFTER_PREFLIGHT ") and "is the same file as" in l for l in proc.stderr.splitlines()), proc.stderr)
 
+    # r4 (adversary pass 5 on 087dde22, A1): the identity was read by a SECOND open of the path after the byte read's handle had closed, so a name re-pointed between the two
+    # recorded another file for the bytes. The fixture re-points pace-b.json AFTER entry 2's judged reads and BEFORE the point where r3 opened it again for the identity.
+    BATCH_LEGSPEC_BUDGET_ANCHOR = ("        $budgetRefusal = Get-ExportBudgetRefusal $path   # r8 (adversary r7 A3): before any claim or lease, as -LegPlan does\n"
+                                   "        if ($budgetRefusal[0]) { Stop-Usage \"$($budgetRefusal[0]) $($budgetRefusal[1])\" }\n")
+    BATCH_LINK_REPOINT_AFTER_READ = (BATCH_LEGSPEC_BUDGET_ANCHOR
+                                     + "        if ($env:DVT_LINK_B -and [IO.Path]::GetFileName($path) -ceq 'pace-b.json') { [IO.File]::Delete($path); [IO.File]::Copy($env:DVT_LINK_B, $path); "
+                                     "[IO.File]::WriteAllBytes((Join-Path $env:DVT_LINK_DIR 'pace-a.json'), [IO.File]::ReadAllBytes($env:DVT_LINK_A)) }   # TEST FIXTURE: re-pointed between the byte read and r3's identity open\n")
+
+    def test_planned_hash_bind_r4_a1_batch_identity_comes_from_the_handle_that_read_the_judged_bytes(self) -> None:
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.BATCH_SPELL_ANCHOR, self.BATCH_LINK_SWAP),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_LEGSPEC_BUDGET_ANCHOR, self.BATCH_LINK_REPOINT_AFTER_READ),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_PRECLAIM_ANCHOR, self.BATCH_PRECLAIM_STOP)])
+        link_dir = self.tmp / "links-r4"
+        link_dir.mkdir()
+        a_bytes, b_bytes = self.tmp / "a-bytes.json", self.tmp / "b-bytes.json"
+        shutil.copyfile(dv / "legs" / self.SWAP_FIRST, a_bytes)
+        shutil.copyfile(dv / "legs" / self.SWAP_TARGET, b_bytes)
+        pa, pb = link_dir / "pace-a.json", link_dir / "pace-b.json"
+        shutil.copyfile(a_bytes, pa)
+        os.link(pa, pb)
+        proc = self.run_case_batch(dv, [pa, pb], {"DVT_LINK_A": str(a_bytes), "DVT_LINK_B": str(b_bytes), "DVT_LINK_DIR": str(link_dir)})
+        self.assertEqual((pa.read_bytes(), pb.read_bytes()), (a_bytes.read_bytes(), b_bytes.read_bytes()), "the fixture re-pointed pace-b.json and restored F")
+        self.assertEqual([l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ")], [],
+                         "one file F was judged as A and as B, but entry 2 recorded G's identity from a second open (old: two DVT_PLANNED lines, exit 0)\n" + proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertTrue(any(l.startswith("BATCH_USAGE SPEC_CHANGED_AFTER_PREFLIGHT ") and "is the same file as" in l for l in proc.stderr.splitlines()), proc.stderr)
+
+    # r4 (adversary pass 5 A3): the same second open ran synchronously on the caller, so a share that stopped answering on it held the preflight past -DeadlineUtc. The
+    # fixture stalls every Get-FileIdentity call on pace.json once its judged reads are done (as a metadata open that stalls on SMB), until well past the deadline.
+    BATCH_ID_STALL_ANCHOR = "    [uint32]$links = 0\n    $key = [VenueLeaseBatchFinalPath]::Identity("
+    BATCH_ID_STALL = ("    if ($env:DVT_ID_STALL_ARMED -and [IO.Path]::GetFileName($Path) -ceq 'pace.json') { $u = [DateTimeOffset]::Parse($env:DVT_ID_STALL_UNTIL, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime; "
+                      "while ([DateTime]::UtcNow -lt $u) { Start-Sleep -Milliseconds 200 } }   # TEST FIXTURE: the identity open stalls\n" + BATCH_ID_STALL_ANCHOR)
+    BATCH_ID_STALL_ARM = BATCH_LEGSPEC_BUDGET_ANCHOR + "        $env:DVT_ID_STALL_ARMED = '1'   # TEST FIXTURE: the judged reads are done\n"
+
+    def test_planned_hash_bind_r4_a3_batch_a_stalled_identity_open_after_the_judged_read_never_holds_the_preflight_past_the_deadline(self) -> None:
+        from datetime import datetime, timedelta, timezone
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.BATCH_ID_STALL_ANCHOR, self.BATCH_ID_STALL),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_LEGSPEC_BUDGET_ANCHOR, self.BATCH_ID_STALL_ARM),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_PRECLAIM_ANCHOR, self.BATCH_PRECLAIM_STOP)])
+        spec = self.tmp / "stall" / "pace.json"
+        spec.parent.mkdir()
+        shutil.copyfile(dv / "legs" / self.SWAP_FIRST, spec)
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=90)
+        until = deadline + timedelta(seconds=60)
+        fake = self.tmp / "batch-fake-script.ps1"
+        fake.write_text("exit 0\n", encoding="utf-8")
+        cmd = (f"& '{dv / 'Invoke-VenueLeaseBatch.ps1'}' -Venue bachelor -LegSpec '{spec}' -Backend cuda -RunDir '{self.tmp / 'batch-run'}' -SourceCommit {self.sha} "
+               f"-BuildManifestSha256 {self.build_sha} -UmRunScript '{self.um}' -QuietScript '{fake}' -LegScript '{fake}' -ClaimDir '{self.tmp / 'claims'}' "
+               f"-AgentShare '{self.share}' -DeadlineUtc {deadline.strftime('%Y-%m-%dT%H:%M:%SZ')}; exit $LASTEXITCODE")
+        proc = run_pwsh(["-Command", cmd], env_extra={"DVT_ID_STALL_UNTIL": until.strftime("%Y-%m-%dT%H:%M:%SZ")}, timeout=420)
+        ended = datetime.now(timezone.utc)
+        self.assertLess(ended, deadline, f"the preflight ended {(ended - deadline).total_seconds():.0f} s past -DeadlineUtc on a stalled identity open (old: held until the stall ended)\n" + proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual([l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ")], [f"DVT_PLANNED spec=pace.json own={hashlib.sha256(spec.read_bytes()).hexdigest()}"], proc.stdout)
+
+    def test_planned_hash_bind_r4_a2_bounded_process_honours_an_absolute_deadline(self) -> None:
+        """A2: Invoke-VenueBoundedProcess waited a RELATIVE bound from after Process.Start; -DeadlineUtc is an absolute bound at the start and at the wait."""
+        mod = DV / "VenueChain.psm1"
+        got = run_pwsh(["-Command", f"Import-Module '{mod}' -Force -DisableNameChecking; $sw = [Diagnostics.Stopwatch]::StartNew(); "
+                        f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 20') -TimeoutSec 60 -CleanupWaitMs 2000 -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(3)); "
+                        "$t = [int]$sw.Elapsed.TotalSeconds; "
+                        "$n = Invoke-VenueBoundedProcess -FilePath 'C:\\no-such-dir\\never-started.exe' -ArgumentList @('x') -TimeoutSec 60 -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(-1)); "
+                        "\"R4A2 $($r.timedOut) $($r.notStarted) $t $($n.notStarted) $($n.timedOut) $($n.killConfirmed)\""], timeout=180)
+        line = [l for l in got.stdout.splitlines() if l.startswith("R4A2 ")]
+        self.assertEqual(len(line), 1, got.stdout + got.stderr)
+        parts = line[0].split()
+        self.assertEqual(parts[1:3], ["True", "False"], line[0])
+        self.assertLess(int(parts[3]), 12, f"the child ran past the absolute deadline: {line[0]}")
+        self.assertEqual(parts[4:], ["True", "True", "True"], "a deadline already passed starts no child (the missing exe would have thrown)")
+
+    def r4_supp_fixture(self, mutations: list[tuple[str, str, str]]):
+        dv = self.mutated_runner(mutations)
+        spec = self.tmp / "supp-leg.json"
+        spec.write_text(json.dumps({"legId": "supp-leg", "backends": ["cpu"], "criteria": {"acceptance": {"cpu": []}, "supplementary": {"cpu": []}}}), encoding="utf-8")
+        twin = self.tmp / "supp-leg-visual-twin.json"
+        twin.write_text(json.dumps({"legId": "supp-leg-visual-twin", "backends": ["cpu"], "criteria": {"acceptance": {"cpu": []}, "supplementary": {"cpu": []}}}), encoding="utf-8")
+        um_share = self.tmp / "um-share"
+        (um_share / "cache").mkdir(parents=True)
+        (um_share / "cache" / f"playback-attr-3-cuda-{self.sha[:12]}-build.json").write_text('{"fixture":"staged-on-ultra-magnus"}', encoding="utf-8")
+        return dv, spec, twin, um_share
+
+    def test_planned_hash_bind_r4_a4_supplementary_refusal_is_typed_when_its_transcript_cannot_be_written(self) -> None:
+        """A4: the supplementary transcript was a synchronous, throwing WriteAllText BEFORE classification: a read-only file turned the typed refusal into SUPPLEMENTARY_ERROR."""
+        import stat
+        dv, spec, twin, um_share = self.r4_supp_fixture([])
+        run = self.tmp / "chain-run"
+        run.mkdir()
+        locked = run / "leg-01-supp-leg-spec-ultra-magnus-supplementary.out.txt"
+        locked.write_text("held by the fixture\n", encoding="utf-8")
+        os.chmod(locked, stat.S_IREAD)
+        self.addCleanup(lambda: os.chmod(locked, stat.S_IREAD | stat.S_IWRITE) if locked.exists() else None)
+        fx = self.chain_fixture(dv, spec, twin, venue="ultra-magnus")
+        proc = self.run_fixture_chain(dv, fx, ["-LegSpec", str(spec), "-SupplementaryAgentShare", str(um_share)])
+        out = proc.stdout.splitlines()
+        self.assertFalse([l for l in out if "SUPPLEMENTARY_SKIPPED" in l and "reason=SUPPLEMENTARY_ERROR" in l],
+                         "the read-only transcript ended the supplementary leg as SUPPLEMENTARY_ERROR (old)\n" + proc.stdout + proc.stderr)
+        self.assertTrue(any(" DVE_CHAIN_SPEC_CHANGED " in l and "role=supplementary" in l for l in out), proc.stdout + proc.stderr)
+        self.assertTrue(any(l.startswith("SUPPLEMENTARY_OUT_WRITE_FAILED ") for l in proc.stderr.splitlines()), proc.stderr)
+
+    def test_planned_hash_bind_r4_a5_chain_survives_a_callers_add_type_output_assembly_default(self) -> None:
+        """A5: the transcript writer's Add-Type ran outside any try with the caller's $PSDefaultParameterValues; an OutputAssembly default naming an existing read-only file ended the chain."""
+        import stat
+        dv = self.mutated_runner([])
+        dll = self.tmp / "existing.dll"
+        dll.write_bytes(b"not an assembly")
+        os.chmod(dll, stat.S_IREAD)
+        self.addCleanup(lambda: os.chmod(dll, stat.S_IREAD | stat.S_IWRITE))
+        fx = self.chain_fixture(dv, None, None)
+        from datetime import datetime, timedelta, timezone
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=300)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        args = ["-Venue", "bachelor", "-LegSpec", str(dv / "legs" / self.SWAP_FIRST), "-Backend", "cuda", "-NoSupplementary", "-RunDir", str(self.tmp / "chain-run"), "-SourceCommit", self.sha,
+                "-BuildManifestSha256", self.build_sha, "-ClaimDir", str(self.tmp / "claims"), "-QuietScript", str(fx["quiet"]), "-LegScript", str(fx["leg"]),
+                "-CooldownSec", "0", "-ClaimPollSec", "1", "-DeadlineUtc", deadline]
+        quoted = " ".join(a if a.startswith("-") and " " not in a else "'" + a.replace("'", "''") + "'" for a in args)
+        proc = run_pwsh(["-Command", f"$PSDefaultParameterValues['Add-Type:OutputAssembly'] = '{dll}'; & '{dv / 'Invoke-VenueChain.ps1'}' {quoted}; exit $LASTEXITCODE"], env_extra=fx["env"], timeout=420)
+        results = [l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")]
+        self.assertEqual(len(results), 1, "no CHAIN_RESULT: the transcript writer's compile ended the chain (old)\n" + proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads(results[-1][len("CHAIN_RESULT="):])
+        self.assertEqual([(r["status"], r["verdict"]) for r in result["legs"]], [("RAN", "QUIET")], result["legs"])
+
+    def test_planned_hash_bind_r4_a2_supplementary_keeps_the_60_s_floor_after_the_late_cut(self) -> None:
+        """A2: the late cut after the SUPPLEMENTARY_RUN append admitted a 1-59 s cap below the 60 s guard. The append stalls until 30 s before -DeadlineUtc: no child starts."""
+        from datetime import datetime, timedelta, timezone
+        stall = ("function L([string]$Message) {\n    if ($env:DVT_SUPPRUN_SLEEP_UNTIL -and $Message -clike 'LEG * SUPPLEMENTARY_RUN *') { $u = [DateTimeOffset]::Parse($env:DVT_SUPPRUN_SLEEP_UNTIL, "
+                 "[Globalization.CultureInfo]::InvariantCulture).UtcDateTime; while ([DateTime]::UtcNow -lt $u) { Start-Sleep -Milliseconds 200 } }   # TEST FIXTURE: the append stalls\n")
+        dv, spec, twin, um_share = self.r4_supp_fixture([("Invoke-VenueChain.ps1", "function L([string]$Message) {\n", stall)])
+        fx = self.chain_fixture(dv, None, None)
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=150)
+        fx["env"]["DVT_SUPPRUN_SLEEP_UNTIL"] = (deadline - timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        proc = self.run_fixture_chain(dv, fx, ["-LegSpec", str(spec), "-SupplementaryAgentShare", str(um_share)], deadline=deadline.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        self.assertTrue(any("SUPPLEMENTARY_RUN" in l for l in proc.stdout.splitlines()), "the fixture never reached the supplementary launch\n" + proc.stdout + proc.stderr)
+        self.assertEqual([l for l in self.fixture_legs() if l["venue"] == "ultra-magnus"], [],
+                         "a supplementary child started with a cap under 60 s after the late cut (old)\n" + proc.stdout + proc.stderr)
+        self.assertTrue(any("SUPPLEMENTARY_SKIPPED" in l and "reason=DEADLINE_NEAR" in l and "at the launch" in l for l in proc.stdout.splitlines()), proc.stdout)
+
 
 # ---------------------------------------------------------------------------------------------------
 # VENUE-QUIET-UNKNOWN-PROBE-FAILS-1: Wait-VenueQuiet.ps1 used to print `COOLDOWN_UNMET mean=UNKNOWN` and exit 0 when the venue probe was unavailable or failed, and

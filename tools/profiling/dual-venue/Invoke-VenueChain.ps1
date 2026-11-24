@@ -222,9 +222,24 @@ $script:EvidenceWriteBoundMs = 2000
 function Write-ChainEvidence([string]$Path, [string[]]$Lines) {
     # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r3 fix 2 (adversary pass 3 A2): a child's transcript is evidence only, so its write never holds the chain: it runs on a pool thread
     # and is waited for at most $script:EvidenceWriteBoundMs (a -RunDir share that stops answering delays neither a probe's answer, the leg's launch nor the claim's release by more).
-    # 'OK' | 'FAILED <why>' | 'TIMEOUT' (the write may still land later; nothing reads it back).
-    if (-not ('VenueChainEvidenceWrite' -as [type])) {
-        Add-Type -TypeDefinition @'
+    # 'OK' | 'FAILED <why>' | 'TIMEOUT' (the write may still land later; nothing reads it back) | 'SKIPPED <why>' (the bounded writer could not be compiled at start: no transcript).
+    # r4 (adversary pass 5 A5): the writer is compiled ONCE at script start (below), never here, so nothing in this helper can throw past its caller.
+    if (-not $script:EvidenceWriterReady) { return "SKIPPED $($script:EvidenceWriterError -replace '\s+', ' ')" }
+    $we = $null
+    $rc = try { [VenueChainEvidenceWrite]::WriteWithin($Path, [string[]]@($Lines), $script:EvidenceWriteBoundMs, [ref]$we) } catch { $we = $_.Exception.Message; 1 }
+    @('OK', "FAILED $($we -replace '\s+', ' ')", 'TIMEOUT')[$rc]
+}
+# DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A5): Write-ChainEvidence's Add-Type used to run on the first probe's transcript, outside any try, under this script's
+# ErrorActionPreference Stop and with the CALLER's $PSDefaultParameterValues (an Add-Type:OutputAssembly default naming an existing file made it throw: no probe verdict, no
+# CHAIN_RESULT). It is compiled here, once, before any child, inside a try and a child scope whose $PSDefaultParameterValues is empty. A compile that still fails leaves the chain
+# running with no transcripts (Write-ChainEvidence answers SKIPPED; every transcript is evidence only and nothing reads one back), said once on stderr.
+$script:EvidenceWriterReady = [bool]('VenueChainEvidenceWrite' -as [type])
+$script:EvidenceWriterError = ''
+if (-not $script:EvidenceWriterReady) {
+    try {
+        & {
+            $PSDefaultParameterValues = @{}
+            Add-Type -ErrorAction Stop -TypeDefinition @'
 using System;
 public static class VenueChainEvidenceWrite {
     public static int WriteWithin(string path, string[] lines, int timeoutMs, out string error) {
@@ -235,10 +250,11 @@ public static class VenueChainEvidenceWrite {
     }
 }
 '@
-    }
-    $we = $null
-    $rc = try { [VenueChainEvidenceWrite]::WriteWithin($Path, [string[]]@($Lines), $script:EvidenceWriteBoundMs, [ref]$we) } catch { $we = $_.Exception.Message; 1 }
-    @('OK', "FAILED $($we -replace '\s+', ' ')", 'TIMEOUT')[$rc]
+        }
+        $script:EvidenceWriterReady = [bool]('VenueChainEvidenceWrite' -as [type])
+        if (-not $script:EvidenceWriterReady) { $script:EvidenceWriterError = 'the bounded transcript writer did not load' }
+    } catch { $script:EvidenceWriterError = "the bounded transcript writer could not be compiled: $($_.Exception.Message)" }
+    if (-not $script:EvidenceWriterReady) { [Console]::Error.WriteLine("CHAIN_EVIDENCE_WRITER_UNAVAILABLE $($script:EvidenceWriterError -replace '\s+', ' ') (child transcripts are skipped; every child is still classified from its own captured output)") }
 }
 
 $results = [System.Collections.Generic.List[object]]::new()
@@ -281,7 +297,8 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec, [str
     $code = $LASTEXITCODE
     # r3 fix 2 (adversary pass 3 A6): the verdict is the probe's STDOUT (Wait-VenueQuiet's Write-Gate); a stderr line is in the transcript and decides nothing
     $lines = @($qRaw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { [string]$_ })
-    $null = Write-ChainEvidence $out @($qRaw | ForEach-Object { [string]$_ })   # evidence only, bounded (r3 fix 2, A2): a file that cannot be written, or a share that stalls, never changes or delays the verdict
+    $qw = Write-ChainEvidence $out @($qRaw | ForEach-Object { [string]$_ })   # evidence only, bounded (r3 fix 2, A2): a file that cannot be written, or a share that stalls, never changes or delays the verdict
+    if ($qw -cne 'OK') { [Console]::Error.WriteLine("QUIET_OUT_WRITE_$qw probe=$Name phase=$Phase path=$out (evidence only: the probe is classified from its own captured output)") }   # r4 (pass 5 A6): said on stderr, as the leg's is
     $v = $lines | Where-Object { $_ -match '^(QUIET|COOLDOWN_UNMET) mean=' } | Select-Object -Last 1
     $u = $lines | Where-Object { $_ -like 'VENUE_QUIET_UNKNOWN *' } | Select-Object -Last 1
     $ff = $lines | Where-Object { $_ -match '^FOREIGN_FLOOR ' } | Select-Object -Last 1   # BACHELOR-VENUE-FOREIGN-FLOOR-FAST-FAIL-1 r3: the early-exit marker survives into the leg class
@@ -424,18 +441,22 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
         L "LEG $($Leg.name) SUPPLEMENTARY_RUN venue=$suppVenue role=supplementary trigger=$Trigger quietVerdict=$($sq.verdict) quietMean=$(Format-Mean $sq.mean) capSec=$capSec umManifestSha256=$($built.sha256) spec=$($Leg.spec) backend=$(if ($Leg.backend) { $Leg.backend } else { 'spec' })"
         # r3 fix 3 (adversary pass 4 A1 sibling): the append above can stall; the cap is cut to the room left NOW, the last step before the child starts (production only: the
         # offline -TestSupplementaryCapSec seam keeps its own bound), and no room left is no launch
+        # r4 (adversary pass 5 A2): the 60 s floor holds after this late cut too (it admitted 1-59 s), and the bounded wait is also given the ABSOLUTE deadline: it starts no child at
+        # or past it and kills one still running at it, whatever its relative bound (a parent descheduled between this cut and the child's start used to get the full relative wait)
+        $suppDeadline = $null
         if ($TestSupplementaryCapSec -eq 0) {
             $capSec = [Math]::Min($capSec, [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalSeconds))
-            if ($capSec -lt 1) { Write-SuppSkip $Leg $Trigger 'DEADLINE_NEAR' "remainingSec=$capSec at the launch" $false; return }
+            if ($capSec -lt 60) { Write-SuppSkip $Leg $Trigger 'DEADLINE_NEAR' "remainingSec=$capSec at the launch" $false; return }
+            $suppDeadline = $deadline
         }
-        $sr = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $sArgs -TimeoutSec $capSec
+        $sr = $(if ($null -ne $suppDeadline) { Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $sArgs -TimeoutSec $capSec -DeadlineUtc $suppDeadline } else { Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $sArgs -TimeoutSec $capSec })
+        if ($sr.notStarted) { Write-SuppSkip $Leg $Trigger 'DEADLINE_NEAR' "remainingSec=0 at the child's start (-DeadlineUtc passed before it started)" $false; return }
         if ($sr.timedOut) {
             # Arm the unresolved-job guard at once, BEFORE any fallible step (the output write below, the receipt read, the share reads): the client was killed, the job it submitted was not,
             # and an exception from here on must leave the venue read as busy-or-unknown, never idle. Armed with no ids first, so even a failure reading the ids fails closed.
             $script:suppRemote = @{ leg = $Leg.name; jobIds = @(); state = 'UNKNOWN' }
             $script:suppRemote.jobIds = @(Get-VenueRemoteJobIds -Text $sr.stdout)
         }
-        [IO.File]::WriteAllText($sOut, $sr.stdout + $(if ($sr.stderr) { "`n--- stderr ---`n$($sr.stderr)" } else { '' }))
         $sLines = @($sr.stdout -split "`r?`n")
         $so = $sLines | Where-Object { $_ -match '^DVE_OUTCOME=(\S+)' } | Select-Object -Last 1
         $sOutcome = $(if ($so -and $so -match '^DVE_OUTCOME=(\S+)') { $Matches[1] } else { 'NONE' })
@@ -449,6 +470,10 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
         # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1: a supplementary child that refused other bytes than the planned ones says so on its own typed line (classified from its stdout only)
         $sSpecRefusal = $(if ($sStatus -ceq 'FAILED' -and -not $sReceipt) { Get-LegSpecRefusalLine $sLines $Leg } else { '' })
         # (r2, adversary A5: the label's log write may fail; it never replaces the observed child failure recorded by Add-SuppResult below)
+        # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A4): the child is classified above from its own captured stdout BEFORE its transcript is written, and the write is
+        # the bounded, non-throwing Write-ChainEvidence (a read-only or stalled file used to throw here and turn the typed refusal into SUPPLEMENTARY_ERROR, or hold the claim release)
+        $sw = Write-ChainEvidence $sOut @($sr.stdout + $(if ($sr.stderr) { "`n--- stderr ---`n$($sr.stderr)" } else { '' }))
+        if ($sw -cne 'OK') { [Console]::Error.WriteLine("SUPPLEMENTARY_OUT_WRITE_$sw leg=$($Leg.name) path=$sOut (evidence only: the supplementary child is classified from its own captured output)") }
         if ($sSpecRefusal) { try { L "$sSpecRefusal venue=$suppVenue role=supplementary (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)" } catch { [Console]::Error.WriteLine("$sSpecRefusal venue=$suppVenue role=supplementary (chain log write failed: $($_.Exception.Message -replace '\s+', ' '))") } }
         # Whatever the leg printed, a leg that died or timed out is INVALID evidence, never a measurement (the Bachelor rule); and nothing here is read as a timing verdict.
         $shownOutcome = $(if ($sStatus -ceq 'RAN') { $sOutcome } else { 'INVALID' })
