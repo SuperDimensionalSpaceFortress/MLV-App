@@ -1575,6 +1575,23 @@ TEST(PlaybackInfoLabel, InfoTwoR6A3RendererTelemetryNamesTheObservedRendererNotA
     }
     // post-WB texture, three fallbackRenderer writes, the CUDA AMaZE handoff, the R16 bilinear shader, the readback Bayer presenter
     ASSERT_EQ(7, writes);
+    // r7 (opus key3 r6 hardening): a write through a reference or pointer alias escapes the direct-write scan above
+    // ("QString &d = readyFrame.gpuBilinearRendererDescription; d = texturePresentHandoffMode;" kept writes == 7)
+    const QStringList members = {QStringLiteral("gpuBilinearRendererDescription"), QStringLiteral("gpuAmazeRendererDescription")};
+    for ( const QString &member : members )
+    {
+        ASSERT_FALSE(body.contains(QStringLiteral("&readyFrame.") + member));
+        ASSERT_FALSE(body.contains(QStringLiteral("& readyFrame.") + member));
+        ASSERT_FALSE(body.contains(QStringLiteral("&( readyFrame.") + member));
+        for ( const QString &line : body.split(QLatin1Char('\n')) )
+        {
+            if ( !line.contains(member) ) continue;
+            ASSERT_FALSE(line.contains(QStringLiteral("QString &")) || line.contains(QStringLiteral("QString&"))
+                         || line.contains(QStringLiteral("QString *")) || line.contains(QStringLiteral("QString*"))
+                         || line.contains(QStringLiteral("auto &")) || line.contains(QStringLiteral("auto&"))
+                         || line.contains(QStringLiteral("auto *")) || line.contains(QStringLiteral("auto*")));
+        }
+    }
     // the three r6 sites, each in the branch that names its handoff mode
     const int readbackAt = body.indexOf(QStringLiteral("QStringLiteral(\"cpu16_readback_reconstructed_bayer\")"));
     ASSERT_TRUE(readbackAt >= 0);
@@ -1606,6 +1623,9 @@ TEST(PlaybackInfoLabel, InfoTwoR6A9TheRendererDescriptionFollowsEveryReinitializ
     const QString assignment = QStringLiteral("m_rendererDescription = currentRenderer");
     const QStringList files = {QStringLiteral("platform/qt/GpuDisplayViewport.cpp"), QStringLiteral("platform/qt/GpuDisplayWindow.cpp")};
     const QStringList signatures = {QStringLiteral("void GpuDisplayViewport::initializeGL("), QStringLiteral("void GpuDisplayWindow::initializeGL(")};
+    // r7 (opus key3 r6 hardening): the refresh's own guard is exactly the context check ("if ( false && context() )" stayed green)
+    const QStringList guards = {QStringLiteral("if ( QOpenGLContext *currentContext = context() )\n    {"),
+                                QStringLiteral("if ( context() )\n    {")};
     for ( int i = 0; i < files.size(); ++i )
     {
         const QString body = functionBody(readRepoFile(files.at(i)), signatures.at(i));
@@ -1616,6 +1636,10 @@ TEST(PlaybackInfoLabel, InfoTwoR6A9TheRendererDescriptionFollowsEveryReinitializ
         ASSERT_TRUE(refreshAt >= 0);
         ASSERT_TRUE(refreshAt < returnAt);   // refreshed on a re-initialized context, not only on the first one
         ASSERT_TRUE(body.mid(0, refreshAt).contains(QStringLiteral("glGetString(GL_RENDERER)")));
+        const int guardAt = body.lastIndexOf(QStringLiteral("if ("), refreshAt);
+        ASSERT_TRUE(guardAt >= 0);
+        ASSERT_TRUE(body.mid(guardAt).startsWith(guards.at(i)));
+        ASSERT_EQ(1, static_cast<int>(body.count(assignment)));   // no second, differently guarded copy
     }
     // the two getters the r6 A3 sites call read exactly that member
     ASSERT_TRUE(functionBody(readRepoFile(QStringLiteral("platform/qt/GpuDisplayViewport.cpp")),
