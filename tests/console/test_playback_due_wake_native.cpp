@@ -2740,6 +2740,31 @@ struct R3A3Foreign
 };
 R3A3Foreign *g_r3a3Foreign = nullptr;
 constexpr UINT kR3A3ForeignMessage = WM_USER + 0x52;
+// CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1 (adversary pass 2 A1 on e1b2051f): the literal attempt's OWN WM_NULL carries this
+// tag, and a thread-local WH_CALLWNDPROC hook (called before a window procedure takes a message sent to this thread) witnesses
+// it reaching the wake's window. A WM_NULL from any other sender, or to any other window, is not the literal attempt's dispatch.
+constexpr LPARAM kR3A3LiteralNullTag = 0x52A31;
+HWND g_r3a3LiteralWindow = nullptr;
+bool g_r3a3LiteralSeen = false;
+LRESULT CALLBACK r3a3LiteralHook( int code, WPARAM wParam, LPARAM lParam )
+{
+    if( code == HC_ACTION )
+    {
+        const CWPSTRUCT *cwp = reinterpret_cast<const CWPSTRUCT *>( lParam );
+        if( cwp && g_r3a3LiteralWindow && cwp->hwnd == g_r3a3LiteralWindow && cwp->message == WM_NULL && cwp->lParam == kR3A3LiteralNullTag )
+            g_r3a3LiteralSeen = true;
+    }
+    return CallNextHookEx( nullptr, code, wParam, lParam );
+}
+struct R3A3HookGuard
+{
+    HHOOK hook;
+    ~R3A3HookGuard()
+    {
+        if( hook ) UnhookWindowsHookEx( hook );
+        g_r3a3LiteralWindow = nullptr;
+    }
+};
 LRESULT CALLBACK r3a3ForeignProc( HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam )
 {
     if( message == kR3A3ForeignMessage && g_r3a3Foreign )
@@ -2808,8 +2833,12 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
     // Adversary pass A2 on e60d41b6: the literal attempt counts only when its unrelated dispatch was witnessed in the sleep (the
     // product counted and recorded it), and it is tried at most twice; the two extra attempts keep the real observation's budget.
     const HWND wakeWindow = reinterpret_cast<HWND>( wake.nativeWindow() );
+    const R3A3HookGuard literalHook { SetWindowsHookExW( WH_CALLWNDPROC, r3a3LiteralHook, nullptr, GetCurrentThreadId() ) };
+    ASSERT_TRUE( literalHook.hook != nullptr );                       // pass 2 A1: the literal WM_NULL's own witness
+    g_r3a3LiteralWindow = wakeWindow;
     for( int attempt = 0; attempt < kSleepObservationAttempts + 2 && !judged; ++attempt )
     {
+        g_r3a3LiteralSeen = false;
         foreign = R3A3Foreign();
         foreign.wake = &wake;
         foreign.busyMs = busyMs;
@@ -2822,7 +2851,7 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
             if( unrelatedFirst )
             {
                 Sleep( 8 );
-                SendNotifyMessageW( wakeWindow, WM_NULL, 0, 0 );      // the unrelated dispatch, inside the sleep
+                SendNotifyMessageW( wakeWindow, WM_NULL, 0, kR3A3LiteralNullTag );   // the unrelated dispatch, inside the sleep
                 const ULONGLONG giveUp = GetTickCount64() + 5000;
                 while( !sleepReturned.load() && GetTickCount64() < giveUp ) Sleep( 1 );   // the fixture send misses the sleep
             }
@@ -2852,6 +2881,13 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
             if( foreign.calls != 0 || counted != 0 || !recordSpans.empty() )
             {
                 ASSERT_EQ( counted, recordSpans.size() );
+                // adversary pass 2 A5 on e1b2051f: and in the product's chronological order, each span on ordered reads (the
+                // R17A1 sibling r17A1DispatchRecordGap already rejects a backwards record): [[19.9, 50.1], [8.1, 8.2]] ms fails here
+                for( size_t i = 0; i < recordSpans.size(); ++i )
+                {
+                    ASSERT_TRUE( recordSpans[i].first <= recordSpans[i].second );
+                    if( i > 0 ) ASSERT_TRUE( recordSpans[i - 1].second <= recordSpans[i].first );
+                }
                 if( foreign.calls != 0 )
                 {
                     constexpr double kRoundTripMs = 0.00005;              // assertChargedBeforeHandler's tolerance
@@ -2873,8 +2909,10 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
                                                    : foreign.calls == 0;
         if( r3a3Retry )
         {
-            if( unrelatedFirst && wake.runnerSleepsWokenOther() > wokenOtherBefore && !wake.lastRunnerSleepDispatchSpansS().empty() )
-                ++unrelatedRetried;                                    // pass A2: the unrelated dispatch was witnessed in the sleep
+            // pass A2: the unrelated dispatch was witnessed in the sleep; pass 2 A1: and it was THIS attempt's own tagged WM_NULL to
+            // the wake's window (the hook's read, taken before the drain below can dispatch a late one)
+            if( unrelatedFirst && g_r3a3LiteralSeen && wake.runnerSleepsWokenOther() > wokenOtherBefore && !wake.lastRunnerSleepDispatchSpansS().empty() )
+                ++unrelatedRetried;
             // adversary pass 1 A4/A7: a sender that missed the whole sleep (its message queued after the sleep returned) left
             // nothing to judge and a pending sent message behind. Take it now, so it cannot reach the next attempt's sleep and
             // double that attempt's handler calls, and observe again. Keyed on the handler's own call count, not on the span
@@ -3360,8 +3398,11 @@ struct R17A1SampleJudgement
 };
 R17A1SampleJudgement r17A1JudgeRecordThenLength( const std::vector<double> &stampsS, const std::vector<std::pair<double, double>> &spansS,
                                                  const std::vector<std::pair<double, double>> &handlerReadsMs, size_t countedDispatches,
-                                                 bool dispatchProven, double bracketMs, double floorMs )
+                                                 bool dispatchProven, double bracketMs, double floorMs, bool clockSupplied = false )
 {
+    // adversary pass 2 A3 on e1b2051f: a sleep handed a caller clock reads it at least at its entry and its return, so an EMPTY
+    // record from such a sleep lost both reads; it is never judged on the bracket (which a dispatch-free 80 ms timeout passes)
+    if( clockSupplied && stampsS.empty() ) return { "R17A1_DISPATCH_RECORD_LOST", "stamps=0 (the supplied caller clock was never read)" };
     if( dispatchProven )
     {
         const std::string gap = r17A1DispatchRecordGap( stampsS, spansS, handlerReadsMs, countedDispatches );
@@ -3399,6 +3440,9 @@ TEST(PlaybackDueWakeSend, R17A1_ALostReadIsARecordLossNeverAShortSleep)
     ASSERT_TRUE( r17A1JudgeRecordThenLength( { 0.0, 0.080 }, {}, {}, 0, false, 80.0, floorMs ).tag.empty() );
     ASSERT_TRUE( r17A1JudgeRecordThenLength( {}, {}, {}, 0, false, 80.0, floorMs ).tag.empty() );
     ASSERT_EQ( std::string( "R17A1_SLEEP_SHORT" ), r17A1JudgeRecordThenLength( {}, {}, {}, 0, false, 20.0, floorMs ).tag );
+    // adversary pass 2 A3, its input: the live clock was supplied, a dispatch-free timeout, an 80 ms bracket, and both reads lost
+    ASSERT_EQ( std::string( "R17A1_DISPATCH_RECORD_LOST" ), r17A1JudgeRecordThenLength( {}, {}, {}, 0, false, 80.0, floorMs, true ).tag );
+    ASSERT_TRUE( r17A1JudgeRecordThenLength( { 0.0, 0.080 }, {}, {}, 0, false, 80.0, floorMs, true ).tag.empty() );
     // the record is judged before the length even when both fail: spans [] after a proven dispatch, and the sleep short too
     ASSERT_EQ( std::string( "R17A1_DISPATCH_RECORD_LOST" ),
                r17A1JudgeRecordThenLength( { 0.0, 0.0081, 0.059, 0.060 }, {}, heldReads, 1, true, 60.0, floorMs ).tag );
@@ -3753,8 +3797,8 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         // SEAM-1 adversary pass A3 (cd623269): EVERY sample's exit is judged, before any retry filter below: a sleep the send
         // missed still runs its whole 80 ms (it times out), so no sample -- batched, missed or landed -- can drop a cut-short exit
         // SEAM-1 r4: with the seam off the record is exactly the setter's None / -1 (the floor on the caller clock below judges the length)
-        if( stamped ) ASSERT_TRUE( dueWakeSleepExitMet( sleepExit, exitMs, 80.0 ) );
-        else ASSERT_TRUE( sleepExit == PlaybackDueWake::RunnerSleepExit::None && exitMs == -1 );
+        // adversary pass 2 A4 on e1b2051f: that exit judgement is a duration floor too, so it now runs right AFTER the dispatch
+        // record's judgement below (still before every retry gate): a lost read with exitMs=59 is R17A1_DISPATCH_RECORD_LOST first
         if( armed ) wake.cancel();
         g_r17A1Windows = nullptr;
         // the handler's own stamps, taken BEFORE the drain below (which runs the handler too, when the send missed the sleep)
@@ -3834,13 +3878,16 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
             for( int i = 0; i < kR17A1MaxProbes; ++i )
                 if( ( ranProbes & ( 1u << static_cast<unsigned>( i ) ) ) != 0u ) ranReadsMs.emplace_back( probeRunMs[i], probeRunMs[i] );
             const R17A1SampleJudgement judged = r17A1JudgeRecordThenLength( stamps, spans, ranReadsMs, countedDispatches, dispatchProven,
-                                                                            returnedMs - enteredMs, dueWakeSleepFloorMs( 80.0 ) );
+                                                                            returnedMs - enteredMs, dueWakeSleepFloorMs( 80.0 ), true );
             if( !judged.tag.empty() )
             {
                 ::minitest::fail( __FILE__, __LINE__, judged.tag, "attempt=" + std::to_string( attempt ) + " " + judged.detail );
                 return;
             }
         }
+        // the product's own exit record, judged on EVERY sample (SEAM-1 adversary pass A3), after its dispatch record (pass 2 A4)
+        if( stamped ) ASSERT_TRUE( dueWakeSleepExitMet( sleepExit, exitMs, 80.0 ) );
+        else ASSERT_TRUE( sleepExit == PlaybackDueWake::RunnerSleepExit::None && exitMs == -1 );
         // judged when the first handler ran in the sleep; otherwise the sender missed the sleep and it is retried -- never passed.
         // adversary pass 1 A5: and the sleep dispatched at least TWICE: with every send taken in one batch (a GUI pause before the
         // first dispatch) there is no second dispatch whose charge-before-handler order could be observed, so it is observed again
