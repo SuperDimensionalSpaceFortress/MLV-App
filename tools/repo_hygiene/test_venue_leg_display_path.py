@@ -133,6 +133,64 @@ class ReceiptValidatorReportsTheDisplayPathTests(unittest.TestCase):
                 self.assertEqual((got["status"], got["valid"], got["displayPath"]), ("INVALID", False, "malformed"), got)
                 self.assertTrue(any(r.startswith("DISPLAY_PATH_MALFORMED") for r in got["reasons"]), got)
 
+    def test_adversary_r2_a2_a8_names_are_exact_strings_and_a_typed_unknown_has_only_its_two_members(self) -> None:
+        """r2 adversary A2 / A8: -cne / -ceq coerce an untyped left operand and ignore zero-width and soft-hyphen characters; a typed unknown is exactly {state, reason}."""
+        base = good_block()
+        bad = {
+            "schema is true": dict(base, schema=True),
+            "schema is an empty list": dict(base, schema=[]),
+            "schema is a list holding the string": dict(base, schema=[SCHEMA]),
+            "schema carries a soft hyphen": dict(base, schema=SCHEMA.replace("display-path", "display-pa­th")),
+            "the whole block is an unknown with an extra member": {"state": "unknown", "reason": "denied", "adapters": 17},
+            "the whole block is an unknown with a zero-width character": {"state": "un​known", "reason": "denied"},
+            "os is an unknown with an extra member": dict(base, os={"state": "unknown", "reason": "denied", "build": "26100"}),
+            "powerPlan is an unknown with a zero-width character": dict(base, powerPlan={"state": "un​known", "reason": "denied"}),
+        }
+        for label, block in bad.items():
+            with self.subTest(label):
+                got = block_state(block)
+                self.assertEqual(got["state"], "malformed", got)
+
+    def test_adversary_r2_a3_only_a_utc_spelling_is_a_utc_time(self) -> None:
+        """r2 adversary A3: a zone-less or offset time is read on the reader's clock (ConvertFrom-Json hands the validator a DateTime); `$` also matched before a final newline."""
+        spellings = {"zone-less": "2026-11-24T12:00:00", "an offset": "2026-11-24T08:00:00-04:00", "a trailing newline": "2026-11-24T12:00:00Z\n"}
+        for label, value in spellings.items():
+            for where in ("collectedUtc", "driverDate", "lastBootUtc"):
+                with self.subTest(label, where=where):
+                    block = json.loads(json.dumps(good_block()))
+                    if where == "collectedUtc":
+                        block["collectedUtc"] = value
+                    elif where == "driverDate":
+                        block["adapters"][0]["driverDate"] = value
+                    else:
+                        block["os"]["lastBootUtc"] = value
+                    got = block_state(block)
+                    self.assertEqual(got["state"], "malformed", got)
+        self.assertEqual(block_state(good_block())["state"], "present")
+
+    def test_adversary_r2_a5_the_display_table_must_match_the_adapters_flags(self) -> None:
+        """r2 adversary A5: activeDisplays is one entry per adapter whose hasActiveOutput is true, under that adapter's name."""
+        base = good_block()
+        intel, nvidia = base["adapters"]
+        bad = {
+            "a display for an adapter flagged inactive": dict(base, adapters=[dict(intel, hasActiveOutput=False), nvidia]),
+            "a display named for the headless adapter": dict(base, activeDisplays=[dict(base["activeDisplays"][0], adapterName=nvidia["name"])]),
+            "an active adapter with no display entry": dict(base, activeDisplays=[]),
+            "two display entries for one adapter": dict(base, activeDisplays=[base["activeDisplays"][0], base["activeDisplays"][0]]),
+        }
+        for label, block in bad.items():
+            with self.subTest(label):
+                self.assertEqual(block_state(block)["state"], "malformed", label)
+        headless = dict(base, adapters=[dict(intel, hasActiveOutput=False), nvidia], activeDisplays=[])
+        self.assertEqual(block_state(headless)["state"], "present")
+
+    def test_adversary_r2_a9_a_venue_that_is_not_an_object_is_malformed_not_absent(self) -> None:
+        """r2 adversary A9: Get-DvProp on an array finds nothing, which read as `absent`."""
+        rec = {"schema": "mlv-app/dual-venue-receipt/v1", "outcome": "UNRESOLVED", "venue": [{"displayPath": 7}], "subject": {}}
+        got = validate(rec)
+        self.assertEqual((got["valid"], got["displayPath"]), (False, "malformed"), got)
+        self.assertTrue(any(r.startswith("DISPLAY_PATH_MALFORMED") for r in got["reasons"]), got)
+
     def test_a_block_whose_every_probe_failed_is_valid_and_present(self) -> None:
         got = validate(receipt_with(all_unknown_block()))
         self.assertEqual((got["status"], got["valid"], got["displayPath"]), ("NO_SIGNAL", True, "present"), got)
@@ -171,6 +229,7 @@ Import-Module '__MODULE__' -Force
 . ([scriptblock]::Create((Get-DvDisplayPathCollectorSource)))
 # ::new(), never New-Object: on PowerShell 7.6 a List[object] made by New-Object throws "Argument types do not match" under @($list), and the final report below wraps it that way
 $script:calls = [System.Collections.Generic.List[object]]::new()
+$script:regCalls = 0
 $script:mode = $env:DVE_MODE
 $script:sleepMs = [int]$env:DVE_SLEEP_MS
 $script:fx = $env:DVE_FIXTURE | ConvertFrom-Json
@@ -190,6 +249,7 @@ function Get-CimInstance {
 }
 function Get-ItemProperty {
     [CmdletBinding()] param([string]$LiteralPath, [string]$Path)
+    $script:regCalls++
     if ($script:mode -eq 'fail' -or $script:mode -eq 'deny') { throw 'Requested registry access is not allowed' }
     [pscustomobject]@{ CurrentBuild = '26100'; UBR = 4770 }
 }
@@ -199,7 +259,7 @@ $block = Get-DvDisplayPath -BudgetSec $budget
 $ms = $sw.ElapsedMilliseconds
 $roundTrip = ($block | ConvertTo-Json -Depth 8 -Compress) | ConvertFrom-Json
 $verdict = Test-DvDisplayPathBlock -Block $roundTrip
-[ordered]@{ block = $block; calls = @($script:calls); elapsedMs = $ms; state = $verdict.state; problems = @($verdict.problems) } | ConvertTo-Json -Depth 12 -Compress
+[ordered]@{ block = $block; calls = @($script:calls.ToArray()); regCalls = $script:regCalls; elapsedMs = $ms; state = $verdict.state; problems = @($verdict.problems) } | ConvertTo-Json -Depth 12 -Compress
 """
 
 BACHELOR_FIXTURE = {
@@ -295,6 +355,42 @@ class CollectorNeverFailsOrDelaysTheLegTests(unittest.TestCase):
             self.assertLessEqual(call["timeout"], 3)
         self.assertEqual(got["state"], "present")
 
+    def test_adversary_r2_a1_an_answer_that_returns_after_the_cap_is_a_typed_unknown_and_nothing_starts_after_it(self) -> None:
+        """r2 adversary A1: one call that takes 1.5 s against a 1 s budget: its answer is `budget-exceeded`, then no CIM call and no registry read starts."""
+        got = run_collector(sleep_ms=2500, budget=2)
+        block = got["block"]
+        self.assertEqual(block["adapters"], {"state": "unknown", "reason": "budget-exceeded"}, got)
+        self.assertEqual(len(got["calls"]), 1, got["calls"])
+        self.assertEqual(got["regCalls"], 0, got)
+        self.assertEqual(block["os"]["build"], {"state": "unknown", "reason": "budget-exhausted"}, got)
+        self.assertEqual(block["os"]["hotfixCount"], {"state": "unknown", "reason": "budget-exhausted"}, got)
+        self.assertLess(got["elapsedMs"], 3600, got)
+        self.assertEqual(got["state"], "present", got)
+
+    def test_adversary_r2_a1_a_spent_budget_asks_nothing(self) -> None:
+        got = run_collector(budget=0)
+        self.assertEqual(got["calls"], [], got)
+        self.assertEqual(got["regCalls"], 0, got)
+        self.assertEqual(got["block"]["adapters"], {"state": "unknown", "reason": "budget-exhausted"}, got)
+        self.assertEqual(got["state"], "present", got)
+
+    def test_adversary_r2_a11_a_caller_cannot_loosen_the_15_second_bound(self) -> None:
+        got = run_collector(budget=60)
+        self.assertGreaterEqual(len(got["calls"]), 4, got["calls"])
+        for call in got["calls"]:
+            self.assertLessEqual(call["timeout"], 15, call)
+
+    def test_adversary_r2_a1_the_probe_job_gives_the_collector_only_what_is_left_of_the_job(self) -> None:
+        """r2 adversary A1: the collector used to get a fresh 15 s after a health preamble that can reach 119 s of the agent's 120 s: its budget is now what is left of 105 s of the job's own clock."""
+        text = pwsh_json("[ordered]@{ text = (New-DvHealthProbeJobText -AgentRoot 'C:\\mlvtmp\\mlv-agent') } | ConvertTo-Json -Compress")["text"]
+        clock = text.find("$dveJobSw = [Diagnostics.Stopwatch]::StartNew()")
+        first_work = text.find("$probe = [ordered]@{")
+        call = re.search(r"Get-DvDisplayPath -BudgetSec \(\[int\]\[math\]::Max\(0, \[math\]::Min\(15, (\d+) - \$dveJobSw\.Elapsed\.TotalSeconds\)\)\)", text)
+        self.assertGreaterEqual(clock, 0, "the job has no job-wide stopwatch")
+        self.assertLess(clock, first_work, "the job clock must start before the preamble does any work")
+        self.assertIsNotNone(call, "the collector is called with a budget taken from the job clock")
+        self.assertLessEqual(int(call.group(1)), 110, call.group(0))
+
     def test_the_slowest_probe_runs_last_so_a_stall_in_it_costs_the_others_nothing(self) -> None:
         got = run_collector()
         classes = [c["class"] for c in got["calls"]]
@@ -322,6 +418,8 @@ class CollectorChangesNothingTests(unittest.TestCase):
         self.assertEqual(verbs, [], f"the display-path collector must be read-only; found {verbs}")
         self.assertNotRegex(code, r"(?i)powercfg|setactive|\bsc\.exe|netsh|reg\s+(add|delete)|bcdedit|wmic|Invoke-CimMethod|Set-CimInstance|Start-Process")
         # the commands it CALLS: the collector's own `function Get-DvDisplayPath` declaration names it, it is not a call, so drop declarations before looking
+        # r2 adversary A6: every time the collector writes goes through the invariant culture (th-TH would write the year 2569)
+        self.assertNotRegex(code, r"ToString\('yyyy-MM-ddTHH:mm:ssZ'\)")
         calls_only = re.sub(r"(?im)^\s*function\s+[A-Za-z][\w-]*", "", code)
         called = sorted(set(re.findall(r"\b(Get-[A-Za-z]+)\b", calls_only)))
         self.assertEqual(called, ["Get-CimInstance", "Get-ItemProperty"], called)
@@ -348,7 +446,7 @@ class HealthProbeCarriesTheCollectorTests(unittest.TestCase):
 
     def test_a_collector_that_throws_cannot_stop_the_probe(self) -> None:
         got = pwsh_json("$p = New-DvHealthProbeJobText -AgentRoot 'C:\\mlvtmp\\mlv-agent'\n"
-                        "[ordered]@{ guarded = [bool]($p -match '(?s)try \\{ Get-DvDisplayPath \\} catch') } | ConvertTo-Json -Compress")
+                        "[ordered]@{ guarded = [bool]($p -match '(?s)try \\{ Get-DvDisplayPath( -BudgetSec [^}]*)? \\} catch') } | ConvertTo-Json -Compress")
         self.assertTrue(got["guarded"])
 
 
@@ -375,6 +473,21 @@ class RunnerNormalisesTheProbeBlockTests(unittest.TestCase):
         got = self.normalise(dict(HEALTHY_PROBE, displayPath=good_block()))
         self.assertEqual(got["block"], good_block())
         self.assertEqual(got["state"], "present")
+
+    def test_adversary_r2_a3_a_zone_less_or_offset_time_is_not_turned_into_a_utc_instant(self) -> None:
+        """r2 adversary A3: a zone-less time was rewritten on the reviewing host's clock (12:00 became 18:00Z there) and kept as a valid block."""
+        for label, value in (("zone-less", "2026-11-24T12:00:00"), ("an offset", "2026-11-24T08:00:00-04:00")):
+            with self.subTest(label):
+                got = self.normalise(dict(HEALTHY_PROBE, displayPath=dict(good_block(), collectedUtc=value)))
+                self.assertEqual(got["block"], unknown("probe-block-malformed"), got)
+
+    def test_adversary_r2_a6_the_utc_text_does_not_depend_on_the_readers_culture(self) -> None:
+        """r2 adversary A6: under th-TH the same DateTime formats as year 2569; every formatter takes the invariant culture."""
+        got = pwsh_json("[Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::new('th-TH')\n"
+                        "$d = [datetime]::SpecifyKind([datetime]::new(2026, 11, 24, 12, 0, 0), [DateTimeKind]::Utc)\n"
+                        "$text = & (Get-Module DualVenueRunner) { param($x) ConvertTo-DvDisplayPathUtcText $x } $d\n"
+                        "[ordered]@{ text = $text } | ConvertTo-Json -Compress")
+        self.assertEqual(got["text"], "2026-11-24T12:00:00Z", got)
 
 
 @requires_windows_pwsh
