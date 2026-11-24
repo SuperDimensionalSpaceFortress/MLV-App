@@ -40,7 +40,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from tools.repo_hygiene.venue_fixture_modules import copy_cross_tree_modules
+from tools.repo_hygiene.venue_fixture_modules import copy_cross_tree_modules, copy_with_siblings
 
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
@@ -9338,6 +9338,29 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             self.assertTrue(outs[0].is_file(), outs[0])
             self.assertIn("DVE_OUTCOME=PASS", outs[0].read_text(encoding="utf-8"))
         self.assertEqual(list(self.run_dir.glob("*.b2r2-*.tmp")), [], "a fresh transcript name was left behind")
+
+    def test_planned_hash_bind_b3_r1_a8_a_second_same_name_venuechain_in_the_session_still_writes_each_leg_transcript(self) -> None:
+        # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r1 (adversary pass 5 A8 on a73430b2): the runner reached VenueChain's own scope with `& (Get-Module VenueChain)`, but the
+        # runner's `Import-Module -Force` keeps a same-name module imported from another path (another worktree's copy), so Get-Module answers TWO modules and the call throws
+        # CommandNotFoundException ('VenueChain VenueChain'); the transcript worker landed in its catch (LEG_OUT_WRITE_FAILED). The REAL runner, run in a session that first
+        # imports a byte-identical VenueChain copy from a second folder: each leg's .out.txt is written and BATCH_RESULT is reached.
+        other = copy_with_siblings(MODULE, self.case / "other-tree" / "dual-venue")
+        a = self.commit_a
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", a), self.item(self.specs[1], "A", a)]))
+        i = args.index("-File")
+        call = " ".join(x if re.fullmatch(r"-[A-Za-z]\w*", x) else "'" + psq(x) + "'" for x in args[i + 2:])
+        ps = (f"Import-Module '{psq(other)}' -DisableNameChecking; if (@(Get-Module VenueChain).Count -ne 1) {{ [Console]::Error.WriteLine('FIXTURE: no second module'); exit 97 }}; "
+              f"& '{psq(args[i + 1])}' {call}")
+        r = subprocess.run([*args[:i], "-Command", ps], capture_output=True, text=True, timeout=600, env=e)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("VenueChain VenueChain", r.stdout + r.stderr)
+        self.assertNotIn("LEG_OUT_WRITE_", r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual([(l["name"], l["status"]) for l in res["legs"]], [("01-fx-a-cpu-A", "RAN"), ("02-fx-b-cpu-A", "RAN")], res["legs"])
+        for name in ("01-fx-a-cpu-A", "02-fx-b-cpu-A"):
+            outs = list(self.run_dir.glob(f"leg-{name}-b01-a*.out.txt"))
+            self.assertEqual(len(outs), 1, f"A8: leg {name}'s .out.txt was not written ({outs}); stderr: {r.stderr}")
+            self.assertIn("DVE_OUTCOME=PASS", outs[0].read_text(encoding="utf-8"))
 
     def test_planned_hash_bind_b2_r1_t3_a_throw_after_a_completed_child_is_recorded_leg_failed_batch_error(self) -> None:
         # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r1 T3: the r5 A1 record path, injected directly now that the .out.txt write no longer throws: a mutated copy of the runner throws

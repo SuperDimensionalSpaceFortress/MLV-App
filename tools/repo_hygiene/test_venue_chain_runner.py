@@ -626,6 +626,30 @@ class VenueChainRunnerTests(unittest.TestCase):
         self.assertTrue(any(" CHAIN_START " in l for l in log), log)
         self.assertTrue(log and log[-1].startswith("CHAIN_RESULT="), log)
 
+    def test_planned_hash_bind_b3_r1_a8_a_second_same_name_venuechain_in_the_session_the_chain_log_fallback_reaches_chain_result(self) -> None:
+        # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r1 (adversary pass 5 A8 sibling Invoke-VenueChain.ps1:199): the fallback reached VenueChain's scope with
+        # `& (Get-Module VenueChain)`; the runner's `Import-Module -Force` keeps a same-name module imported from another path, so Get-Module answers TWO modules, the call
+        # throws ('VenueChain VenueChain'), L throws on CHAIN_START and the chain ends before CHAIN_RESULT. The r3 row's runner (only its compile made to fail), run in a session
+        # that first imports a byte-identical VenueChain copy from a second folder.
+        anchor = "            Add-Type -ErrorAction Stop -TypeDefinition @'"
+        runner = self.mutated_runner(anchor, "            throw 'injected compile failure (TEST FIXTURE)'\n" + anchor, count=1)
+        other = copy_with_siblings(MODULE, self.case / "other-tree" / "dual-venue")
+        rd = self.case / "lane-A8W"
+        args = self.chain_args(rd, self.specs[:1], runner=runner)
+        i = args.index("-File")
+        q = lambda v: "'" + str(v).replace("'", "''") + "'"
+        call = " ".join(x if re.fullmatch(r"-[A-Za-z]\w*", x) else q(x) for x in args[i + 2:])
+        ps = (f"Import-Module {q(other)} -DisableNameChecking; if (@(Get-Module VenueChain).Count -ne 1) {{ [Console]::Error.WriteLine('FIXTURE: no second module'); exit 97 }}; "
+              f"& {q(args[i + 1])} {call}")
+        r = subprocess.run([*args[:i], "-Command", ps], capture_output=True, text=True, timeout=300, env=self.env())
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("VenueChain VenueChain", r.stdout + r.stderr)
+        self.assertEqual([l["status"] for l in chain_result(r.stdout)["legs"]], ["RAN"])
+        log = self.chain_log(rd)
+        self.assertTrue(any(" CHAIN_EVIDENCE_WRITER_UNAVAILABLE " in l for l in log), log)
+        self.assertTrue(any(" CHAIN_START " in l for l in log), log)
+        self.assertTrue(log and log[-1].startswith("CHAIN_RESULT="), log)
+
     # ---------------------------------------------------------------- the claim
     def _stale_case(self, reason: str, pid: int, created: str, expires: datetime) -> None:
         fixture = self.write_claim(pid, created, expires)
