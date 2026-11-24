@@ -649,7 +649,7 @@ foreach ($leg in $plan) {
                 $killedIds = @(Get-VenueRemoteJobIds -Text ([string]$lp.stdout)) -join ','
                 $stopReason = 'DEADLINE'; $exitCode = 3; Add-Result $leg 'NOT_RUN' @{ verdict = 'DEADLINE'; reason = $why }
                 $dLine = "LEG $($leg.name) NOT_RUN DEADLINE reason=$why ($(if ($lp.notStarted) { '-DeadlineUtc passed before the child started' } else { "the OS started the child at or past -DeadlineUtc: killed at once ($(if ($lp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED' }))" }))$(if ($killedIds) { " jobIds=$killedIds" })"
-                try { L $dLine } catch { [Console]::Error.WriteLine($dLine) }
+                try { L $dLine } catch { Write-ChainDiagnostic $dLine }   # bounded, never throws: a failing log append costs neither the typed result nor exit 3
                 break
             }
             # stdout alone classifies (r3); the transcript is stdout plus stderr, as the supplementary child's is
