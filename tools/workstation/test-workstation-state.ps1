@@ -4559,6 +4559,65 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r7 import staging')) {
     $r7gSec = [int]$r7gSw.Elapsed.TotalSeconds; $script:NativeOutputGraceSec = $null
     Assert-That ($r7gThrown -match 'output' -and $r7gSec -lt 20) 'r7 hardening (sol r6 F-02): output collection is bounded once the child has exited (a descendant that keeps the pipe open fails the call)' "thrown=[$r7gThrown] seconds=$r7gSec"
     $script:Failures.Clear()
+    # ---- adversary pass 1 (head 15d0e2d0)
+    # A1: a bounded child runs in PowerShell's location (a relative -BundlePath is read from there), not in the process directory
+    $r7wd = New-Scratch 'r7-wd'; $r7wdOut = Join-Path (New-Scratch 'r7-wdout') 'cwd.txt'; $r7wdThrown = ''
+    Push-Location -LiteralPath $r7wd
+    try { [void](Invoke-Native -Exe $r7pw -Arguments @('-NoProfile', '-Command', "[IO.File]::WriteAllText('$r7wdOut', (Get-Location).Path)") -TimeoutSec 60) } catch { $r7wdThrown = $_.Exception.Message } finally { Pop-Location }
+    $r7wdSaw = $(if (Test-Path -LiteralPath $r7wdOut) { [IO.File]::ReadAllText($r7wdOut) } else { '<child did not run>' })
+    Assert-That ($r7wdSaw -ieq [IO.Path]::GetFullPath($r7wd) -and -not $r7wdThrown) 'r7 hardening (adversary A1): a bounded native child starts in PowerShell''s current location' "child=[$r7wdSaw] want=[$r7wd] thrown=[$r7wdThrown]"
+    # A7: a failed kill is reported even when the child then exits by itself during the wait
+    $script:NativeKillHook = { param($child) throw 'access denied (test)' }
+    $r7kThrown = ''
+    try { [void](Invoke-Native -Exe $r7pw -Arguments @('-NoProfile', '-Command', 'Start-Sleep -Milliseconds 3500') -TimeoutSec 2) } catch { $r7kThrown = $_.Exception.Message }
+    $script:NativeKillHook = $null
+    Assert-That ($r7kThrown -match 'kill failed' -and $r7kThrown -notmatch '\(it was stopped\)') 'r7 hardening (adversary A7): a kill that failed is named even when the child exited during the wait' "thrown=[$r7kThrown]"
+    # A3: two attempts never share a staging name
+    $r7base = Join-Path (New-Scratch 'r7-names') 'import-snapshot-x'
+    Assert-That ((Get-FreshImportStagingPath $r7base) -cne (Get-FreshImportStagingPath $r7base) -and -not (Test-Path -LiteralPath (Get-FreshImportStagingPath $r7base))) 'r7 import (adversary A3): every staging attempt gets its own folder name (no name is picked twice, so no check-then-create window on a shared name)'
+    $r7exist = New-Scratch 'r7-exist-snap'; $r7src = New-Scratch 'r7-exist-src'; [IO.File]::WriteAllText((Join-Path $r7src 'a.txt'), 'x'); $r7exThrown = ''
+    try { [void](New-ImportSnapshot -From $r7src -To $r7exist) } catch { $r7exThrown = $_.Exception.Message }
+    Assert-That ($r7exThrown -match 'already exists') 'r7 import (adversary A3): a snapshot is never made into a folder that already exists' "thrown=[$r7exThrown]"
+    # A2: a declined snapshot step removes nothing: a folder another process published at the displayed path is not this step's
+    $script:R7Keep = $null
+    $r7i = Invoke-R3Import 'r7i' -3 0 {
+        param($st, $sp)
+        $script:R7SaveCmdlet = $script:Cmdlet
+        $stub = [pscustomobject]@{}
+        Add-Member -InputObject $stub -MemberType ScriptMethod -Name ShouldProcess -Value {
+            param($target, $action)
+            if ($action -like 'Snapshot the bundle*') {
+                if ($action -match 'Snapshot the bundle to (.+?) \(the scan') { $d = $Matches[1]; [void][IO.Directory]::CreateDirectory($d); $script:R7Keep = Join-Path $d 'keep.txt'; [IO.File]::WriteAllText($script:R7Keep, 'KEEP') }
+                return $false
+            }
+            return $true
+        }
+        $script:Cmdlet = $stub
+    } $null { $script:Cmdlet = $script:R7SaveCmdlet }
+    Assert-That ($script:R7Keep -and (Test-Path -LiteralPath $script:R7Keep) -and (& $r7Typed $r7i 'IMPORT_SNAPSHOT_FAILED') -eq 1 -and $r7i.Host -ceq 'HOST-GOOD-CONTENT') 'r7 import (adversary A2): a declined snapshot step never deletes a folder it did not create (the typed failure stands, the other folder is intact)' "keep=[$script:R7Keep] failures=$($r7i.Failures -join ',')`n$($r7i.Out)"
+    # A4: a bundle folder that disappears at the snapshot prompt is a failed snapshot, not a 'done' empty one
+    $r7h = Invoke-R3Import 'r7h' -3 0 {
+        param($st, $sp)
+        $script:R7SaveCmdlet = $script:Cmdlet
+        $stub = [pscustomobject]@{}
+        Add-Member -InputObject $stub -MemberType ScriptMethod -Name ShouldProcess -Value { param($target, $action) if ($action -like 'Snapshot the bundle*') { Move-Item -LiteralPath $script:BundlePath -Destination "$($script:BundlePath).away" }; return $true }
+        $script:Cmdlet = $stub
+    } $null { $script:Cmdlet = $script:R7SaveCmdlet; if (Test-Path -LiteralPath "$($script:BundlePath).away") { Move-Item -LiteralPath "$($script:BundlePath).away" -Destination $script:BundlePath } }
+    Assert-That ((& $r7Typed $r7h 'IMPORT_SNAPSHOT_FAILED') -eq 1 -and $r7h.Host -ceq 'HOST-GOOD-CONTENT') 'r7 import (adversary A4): a bundle folder that vanished before the snapshot is the typed failure IMPORT_SNAPSHOT_FAILED, not a completed empty snapshot' "failures=$($r7h.Failures -join ',')`n$($r7h.Out)"
+    # A6: a host file whose bytes cannot be read, renamed away while the gate reads the bundle file, is a creation (no silent skip)
+    $script:R7Rot = $null
+    $r7f = & $r6Run 'r7f' 'ROTATION.md' ($r6Utf8.GetBytes('FROM-BUNDLE')) 'HOST-OLD' {
+        param($st, $sp)
+        $script:R7Rot = Join-Path (& $r6Dir) 'ROTATION.md'
+        & icacls.exe $script:R7Rot /deny '*S-1-1-0:(RD)' 2>&1 | Out-Null
+        $script:ImportAfterEarlySourceReadHook = { param($p) if ((Split-Path -Leaf $p) -ceq 'ROTATION.md' -and (Test-Path -LiteralPath $script:R7Rot -PathType Leaf)) { Move-Item -LiteralPath $script:R7Rot -Destination "$($script:R7Rot).aside" } }
+    } {
+        $script:ImportAfterEarlySourceReadHook = $null
+        & icacls.exe "$($script:R7Rot).aside" /remove:d '*S-1-1-0' 2>&1 | Out-Null
+        Remove-Item -LiteralPath "$($script:R7Rot).aside" -Force -ErrorAction SilentlyContinue
+    }
+    Assert-That ($script:R6After -ceq 'FROM-BUNDLE') 'r7 import (adversary A6): an unreadable host file that went away while the gate read the bundle file is created from the bundle, not skipped' "rotation=[$($script:R6After)] failures=$($r7f.Failures -join ',')`n$($r7f.Out)"
+    $script:Failures.Clear()
 }
 
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
