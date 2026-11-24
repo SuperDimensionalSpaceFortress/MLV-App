@@ -175,8 +175,30 @@ if (-not $Purpose) { $Purpose = "Invoke-VenueChain $(Split-Path -Leaf $RunDir)" 
 
 function L([string]$Message) {
     $line = "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $Message"
-    Add-Content -LiteralPath $ChainLog -Value $line
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r2 (adversary pass 3 A4 on 372d1bfd): the chain-log append is BOUNDED (Add-ChainLogLine). A synchronous Add-Content on a ChainLog
+    # share that stops answering without throwing held every path behind it, the NOT_RUN DEADLINE line before the claim release and CHAIN_RESULT included. An append that
+    # fails still throws, as before (every caller's own try/catch keeps its meaning); one that does not answer in time is said once on stderr, bounded, and the line still goes out.
+    $aw = Add-ChainLogLine $line
+    if ($aw -clike 'FAILED *') { throw "the chain log append failed: $($aw.Substring(7))" }
+    if ($aw -cne 'OK') { Write-ChainDiagnostic "CHAIN_LOG_APPEND_$aw path=$ChainLog (the line is on stdout; the chain goes on)" }
     Write-Output $line
+}
+
+$script:ChainLogAppendDelayMs = 0   # offline test seam only (the bounded append's pool thread waits this long first, as a stalled share does); production leaves it 0
+function Add-ChainLogLine([string]$Line) {
+    # b2 r2 (A4): one chain-log line appended on a pool thread (the compiled writer below) and waited for at most $script:EvidenceWriteBoundMs; without the compiled writer, on a
+    # worker runspace given up on after 2 s (Invoke-VenueBoundedRead: an abandoned one is counted, so Complete-VenueProcess ends the process). Never throws.
+    # 'OK' | 'FAILED <why>' | 'TIMEOUT' (the append may still land later)
+    if ($script:EvidenceWriterReady) {
+        $we = $null
+        $rc = try { [VenueChainEvidenceWriteB2]::AppendWithin($ChainLog, $Line + [Environment]::NewLine, $script:ChainLogAppendDelayMs, $script:EvidenceWriteBoundMs, [ref]$we) } catch { $we = $_.Exception.Message; 1 }
+        return @('OK', "FAILED $($we -replace '\s+', ' ')", 'TIMEOUT')[$rc]
+    }
+    $ar = try { Invoke-VenueBoundedRead -ScriptText 'param($a) if ($a.d -gt 0) { [Threading.Thread]::Sleep($a.d) }; try { [IO.File]::AppendAllText($a.p, $a.t, [Text.UTF8Encoding]::new($false)); "OK" } catch { "FAILED " + $_.Exception.Message }' -Argument @{ p = $ChainLog; t = $Line + [Environment]::NewLine; d = $script:ChainLogAppendDelayMs } -TimeoutSec 2 } catch { [pscustomobject]@{ answered = $true; value = @("FAILED $($_.Exception.Message)"); error = $null } }
+    if (-not $ar.answered) { return 'TIMEOUT' }
+    $av = @($ar.value | ForEach-Object { [string]$_ })
+    if ($av -ccontains 'OK') { return 'OK' }
+    "FAILED $((($av -join ' ') + ' ' + [string]$ar.error).Trim() -replace '^FAILED ', '' -replace '\s+', ' ')"
 }
 
 # The planned legs: name, spec path, backend ('' = whatever the spec lists, as Invoke-VenueLeg does with no -Backend).
@@ -226,7 +248,7 @@ function Write-ChainEvidence([string]$Path, [string[]]$Lines) {
     # r4 (adversary pass 5 A5): the writer is compiled ONCE at script start (below), never here, so nothing in this helper can throw past its caller.
     if (-not $script:EvidenceWriterReady) { return "SKIPPED $($script:EvidenceWriterError -replace '\s+', ' ')" }
     $we = $null
-    $rc = try { [VenueChainEvidenceWrite]::WriteWithin($Path, [string[]]@($Lines), $script:EvidenceWriteBoundMs, [ref]$we) } catch { $we = $_.Exception.Message; 1 }
+    $rc = try { [VenueChainEvidenceWriteB2]::WriteWithin($Path, [string[]]@($Lines), $script:EvidenceWriteBoundMs, [ref]$we) } catch { $we = $_.Exception.Message; 1 }
     @('OK', "FAILED $($we -replace '\s+', ' ')", 'TIMEOUT')[$rc]
 }
 
@@ -234,13 +256,14 @@ function Write-ChainDiagnostic([string]$Line) {
     # r4 fix 2 (adversary pass 6 A6): a transcript-write diagnostic said on stderr, bounded like the write itself ($script:EvidenceWriteBoundMs), so it holds neither the child's
     # classification nor the claim's release. With no compiled writer it is skipped (that was said once at start). Never throws.
     if (-not $script:EvidenceWriterReady) { return }
-    try { $null = [VenueChainEvidenceWrite]::ErrorLineWithin($Line, $script:EvidenceWriteBoundMs) } catch { $null = $_ }
+    try { $null = [VenueChainEvidenceWriteB2]::ErrorLineWithin($Line, $script:EvidenceWriteBoundMs) } catch { $null = $_ }
 }
 # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A5): Write-ChainEvidence's Add-Type used to run on the first probe's transcript, outside any try, under this script's
 # ErrorActionPreference Stop and with the CALLER's $PSDefaultParameterValues (an Add-Type:OutputAssembly default naming an existing file made it throw: no probe verdict, no
 # CHAIN_RESULT). It is compiled here, once, before any child, inside a try and a child scope whose $PSDefaultParameterValues is empty. A compile that still fails leaves the chain
 # running with no transcripts (Write-ChainEvidence answers SKIPPED; every transcript is evidence only and nothing reads one back), said once on stderr.
-$script:EvidenceWriterReady = [bool]('VenueChainEvidenceWrite' -as [type])
+# b2 r2 (adversary pass 3 A4): the type carries the r2 shape (AppendWithin) in its name, so a same-named type an older copy of this script loaded in this process is never used
+$script:EvidenceWriterReady = [bool]('VenueChainEvidenceWriteB2' -as [type])
 $script:EvidenceWriterError = ''
 if (-not $script:EvidenceWriterReady) {
     try {
@@ -248,7 +271,15 @@ if (-not $script:EvidenceWriterReady) {
             $PSDefaultParameterValues = @{}
             Add-Type -ErrorAction Stop -TypeDefinition @'
 using System;
-public static class VenueChainEvidenceWrite {
+public static class VenueChainEvidenceWriteB2 {
+    // b2 r2 (adversary pass 3 A4 on 372d1bfd): one chain-log line appended on a pool thread and waited for at most timeoutMs (a ChainLog share that stops answering without
+    // throwing cannot hold the caller); delayMs is the offline test seam (0 in production). 0 OK, 1 FAILED (error says why), 2 TIMEOUT (the append may still land later).
+    public static int AppendWithin(string path, string text, int delayMs, int timeoutMs, out string error) {
+        error = null;
+        System.Threading.Tasks.Task t = System.Threading.Tasks.Task.Run(() => { if (delayMs > 0) { System.Threading.Thread.Sleep(delayMs); } System.IO.File.AppendAllText(path, text); });
+        try { if (!t.Wait(timeoutMs)) { return 2; } } catch (AggregateException e) { error = e.InnerException != null ? e.InnerException.Message : e.Message; return 1; }
+        return 0;
+    }
     public static int WriteWithin(string path, string[] lines, int timeoutMs, out string error) {
         error = null;
         System.Threading.Tasks.Task t = System.Threading.Tasks.Task.Run(() => System.IO.File.WriteAllLines(path, lines));
@@ -263,7 +294,7 @@ public static class VenueChainEvidenceWrite {
 }
 '@
         }
-        $script:EvidenceWriterReady = [bool]('VenueChainEvidenceWrite' -as [type])
+        $script:EvidenceWriterReady = [bool]('VenueChainEvidenceWriteB2' -as [type])
         if (-not $script:EvidenceWriterReady) { $script:EvidenceWriterError = 'the bounded transcript writer did not load' }
     } catch { $script:EvidenceWriterError = "the bounded transcript writer could not be compiled: $($_.Exception.Message)" }
     # b2 r1 (adversary pass 2 A4 on bf5ebeb2): said in the chain log, never synchronously on stderr (a full unread pipe held the start before the first probe); best effort
@@ -734,7 +765,9 @@ $summary = [ordered]@{
 }
 if ($streakStop) { $summary['unhealthyStop'] = $streakStop }
 $resultLine = 'CHAIN_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 6)
-Add-Content -LiteralPath $ChainLog -Value $resultLine
+# b2 r2 (adversary pass 3 A4 sibling): the typed result goes out FIRST, and its chain-log copy is the bounded append (a stalled ChainLog never holds CHAIN_RESULT)
 Write-Output $resultLine
+$rw = Add-ChainLogLine $resultLine
+if ($rw -cne 'OK') { Write-ChainDiagnostic "CHAIN_LOG_APPEND_$($rw -replace '\s+', ' ') path=$ChainLog line=CHAIN_RESULT (the result is on stdout)" }
 Complete-VenueProcess -ExitCode $exitCode   # a share read abandoned at its timeout would otherwise keep this process alive until it ends
 exit $exitCode
