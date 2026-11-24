@@ -102,6 +102,44 @@ run for a dry run. The new-machine phases refuse to run on VIRTUAL-TEN unless yo
    rules would keep anyway (it is newer, `/XO`) is not opened and is not a failure. A host file Import
    cannot read for any other reason (access denied, over 25 MiB) still counts as carrying a credential.
 
+   **No backup, no replace (IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1).** Before the copy, Import backs
+   up the host `~/.claude/CLAUDE.md` and `settings.json` under `<StateRoot>\backups\home-claude-<stamp>`. A
+   host file whose backup cannot be made (a write failure, a folder at the backup name, a held or unreadable
+   file, a backups folder that cannot be created) is left byte for byte as it is: the bundle copy is not
+   applied and the run records `IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED <path>` (exit 1); the log line
+   `IMPORT_BACKUP_FAILED <path>` names the cause. The rule is tied to the backup that was written, not to a
+   check made at one moment: a host file is replaced only while it is locked and still holds exactly the
+   bytes that were backed up, so a file that was absent while the backup ran and came back, or one saved
+   after the backup (even with an older timestamp than the bundle copy), is refused the same way, and so
+   is one whose backup file has gone missing or changed since it was written (the backup is held open
+   without delete sharing from the moment it is written, and read again under the lock). A backup step
+   declined with `-Confirm`, and a host file reached through a junction, are protected the same way. A file the copy rules would keep anyway (`/XO`, the bundle copy is older) is still
+   kept with no failure, held or not; so is a bundle file the copy skips for its size or content, and a
+   host file that is gone by the time it is judged is simply created. Fix what blocks the backup and re-run `-Phase Import`. A bundle
+   zip that `tar` cannot expand completely (a truncated copy) is `IMPORT_BUNDLE_EXPAND_FAILED <path>` (exit 1):
+   nothing is snapshotted or copied from it, so copy the zip again and re-run (the `tar` expansion is
+   bounded to 15 minutes: a stalled read fails the step instead of waiting for ever). A snapshot that fails
+   part way (robocopy exit 8) is `IMPORT_SNAPSHOT_FAILED` (exit 1): the partial snapshot is removed and
+   nothing is copied. A bundle `settings.json` or `settings.local.json`
+   that is not valid UTF-8 (a UTF-16 file is refused) holding one JSON object, and a zero-byte bundle file
+   whose host counterpart holds bytes, are `IMPORT_SOURCE_DAMAGED_NOT_REPLACED <path>` (exit 1) wherever the
+   copy rules would write the file (a host file that is newer is kept with no failure, as before):
+   the host file stays as it is (also when the host file itself cannot be read), so copy the bundle again.
+   A bundle file that cannot be read is `IMPORT_COPY_FAILED <path>`. Every typed failure is registered before
+   its line is logged, and every log line of the Import phase is written through a guard, so a log that
+   cannot be written never hides the cause or stops the copy. A backup is never overwritten: a second Import
+   phase of the same run (`-Phase Import,Import`) writes its backup of a file beside the first phase's as
+   `<name>.2`, so the original host bytes stay recoverable. Each expansion and each snapshot is made in a
+   folder no earlier attempt of the run touched (`bundle-<stamp>-<random>`; the same for
+   `import-snapshot-<stamp>-<random>`): a file a failed attempt left behind is never read by the next one,
+   so it can never replace a host file. An expansion folder (it is never removed by the script) and a snapshot
+   folder whose removal was denied stay on disk; remove them by hand when you no longer need them. A failed
+   snapshot removes only the folder that step created, and a bundle folder that vanished before the snapshot
+   is `IMPORT_SNAPSHOT_FAILED`. A path to a protected host file through a share of this machine
+   (`\\localhost\<share>\...`) is treated as the local file it names. A native command run with a time bound
+   starts in PowerShell's current location, without any `GIT_TRACE*` variable, is reported as `could NOT be
+   stopped` (or `the kill failed`) when the kill fails, and its output is collected for at most 30 s after it exits.
+
    **Remote URLs and git tracing (r17).** Every line the script prints or logs redacts a URL's user part
    up to the last `@` before the host, so an unencoded `@` in a password leaks nothing. It also drops
    everything after a `?` or `#` and prints `?***` (a query-string token, a fragment). Every native git
