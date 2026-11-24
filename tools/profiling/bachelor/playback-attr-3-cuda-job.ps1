@@ -1156,8 +1156,23 @@ $timeBudgetArgs['ShareSmokeCeiling'] = $true
 # ceiling. This generator has no native-fps input, so the frame term is bounded with the highest native fps of any tracked leg clip (M16-1457 is
 # 59.94): a clip above it ends as a typed runner timeout, never a pass.
 $gatedBudgetNativeFpsBound = 60.0
+$gatedPlayFloorSeconds = [int]$timeBudgetArgs['PlaySeconds']
 $timeBudgetArgs['PlaySeconds'] = [int][Math]::Max($timeBudgetArgs['PlaySeconds'],
     [Math]::Ceiling((Get-GuiSmokePlaySafetyMs -Seconds $PlaySeconds -NativeFps $gatedBudgetNativeFpsBound) / 1000.0))
+# Adversary r1 A1: the bound is an UPPER estimate (the clip's own fps is not known here), so it may only widen a budget, never refuse a leg on
+# its own. When the bound's allowance alone would make the shared smoke ceiling refuse the input (ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING) but
+# the floor allowance fits, the leg keeps the floor allowance; a clip whose own Play budget then outruns the runner's deadline ends as a typed
+# runner timeout, never a pass. An input that cannot fit even the floor allowance is still refused by the derivation below, with the same token.
+if (-not $cpuPlayPaceInformational -and $timeBudgetArgs['PlaySeconds'] -gt $gatedPlayFloorSeconds) {
+    try {
+        [void](Get-AttrCudaLegTimeBudget -InputBytes $clipBytesForBudget @timeBudgetArgs)
+    } catch {
+        if (-not ([string]$_.Exception.Message).StartsWith('ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING')) { throw }
+        Write-Warning ("PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: the $gatedBudgetNativeFpsBound fps bound's play allowance ($($timeBudgetArgs['PlaySeconds']) s) does not fit " +
+            "this input under the smoke ceiling; the leg keeps the $gatedPlayFloorSeconds s floor allowance (a clip whose own budget outruns it ends as a typed runner timeout).")
+        $timeBudgetArgs['PlaySeconds'] = $gatedPlayFloorSeconds
+    }
+}
 # CPU-LOOK-LEG-PACE-ABORT-1: a cpu leg's Play may run to the CPU ceiling (Get-GuiSmokePlaySafetyMs -CpuPaceInformational: requested / (1/30)
 # + 15 s), so the smoke-process timeout, the PresentMon capture ceiling and the um-run -TimeoutSec derived from it must cover that ceiling
 # -- one derivation (the runner's), never a second hard-coded number.

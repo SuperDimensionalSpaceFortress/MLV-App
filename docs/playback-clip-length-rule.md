@@ -149,7 +149,7 @@ FRAME:
   own baseline run (22.0 fps = 54.5 s), so 10 of 14 drift legs on 2026-11-24 ended `PLAY_PACE_TOO_SLOW` at 17.85-20.24 fps with
   no stall. 15 fps sits below the slowest 1457 CUDA mode measured (17.85 fps). The change affects measurement only: no user
   playback path reads this budget, and no window that is refused today (`CLIP_TOO_SHORT`, `PLAY_DURATION_TOO_SHORT`,
-  `required_source_frames`) is admitted. A venue under that floor is refused up front when its engine pace is known
+  `required_source_frames`) is admitted. A venue whose pace cannot consume the admitted frames inside that budget is refused up front when its engine pace is known
   (`PLAY_PACE_TOO_SLOW`, before Play), and it ends early with the **same** token when the pace only shows once Play runs. It is
   never a run that can only time out. Launchers mirror the rule with `Get-GuiSmokePlaySafetyMs -NativeFps`
   (`$script:GuiSmokeGatedPaceFloorFps`).

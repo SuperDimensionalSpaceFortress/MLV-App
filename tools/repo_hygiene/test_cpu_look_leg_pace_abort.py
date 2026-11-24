@@ -75,7 +75,7 @@ def check_gate_text(text: str) -> list[str]:
     problems = []
     if "$script:GuiSmokeCpuInformationalMinPaceFraction = 1.0 / 30.0" not in text:
         problems.append("the gate does not mirror the C++ CPU ceiling fraction")
-    if "param([Parameter(Mandatory = $true)][double]$Seconds, [switch]$CpuPaceInformational, [double]$NativeFps = 0)" not in text:
+    if "param([Parameter(Mandatory = $true)][double]$Seconds, [switch]$CpuPaceInformational, [double]$NativeFps = 0, [int]$TargetPresentedFrames = 0)" not in text:
         problems.append("Get-GuiSmokePlaySafetyMs has no -CpuPaceInformational switch")
     if "$fraction = if ($CpuPaceInformational) { $script:GuiSmokeCpuInformationalMinPaceFraction } else { $script:GuiSmokeMinSustainedPaceFraction }" not in text:
         problems.append("the CPU ceiling is not selected by the switch alone")
@@ -96,7 +96,7 @@ def check_runner_text(text: str) -> list[str]:
         problems.append("an ambient pace-mode variable is not stripped from the app's environment")
     if 'if ($CpuPlayPaceInformational) { $envBlock[$script:GuiSmokePaceModeEnvironment] = "informational" }' not in text:
         problems.append("the switch does not set the pace mode in the app's environment")
-    if "(Get-GuiSmokePlaySafetyMs -Seconds $Seconds -NativeFps $clipNativeFpsForBudget -CpuPaceInformational:$CpuPlayPaceInformational) +" not in text:
+    if "(Get-GuiSmokePlaySafetyMs -Seconds $Seconds -NativeFps $clipNativeFpsForBudget -TargetPresentedFrames $TargetPresentedFrames -CpuPaceInformational:$CpuPlayPaceInformational) +" not in text:
         problems.append("the derived process timeout ignores the CPU ceiling")
     if "cpuPaceInformational = [bool]$CpuPlayPaceInformational" not in text:
         problems.append("the result does not record the pace mode")

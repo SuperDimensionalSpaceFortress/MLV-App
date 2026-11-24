@@ -731,7 +731,7 @@ struct SourceFrameAdvanceCounter
 // failure (PLAY_SAFETY_TIMEOUT). It SCALES with the pace the venue must sustain (r2, fable H1): the engine is only
 // required to hold kMinSustainedPaceFraction of the clip's native fps, so the budget for `requested` seconds of
 // footage is requested / kMinSustainedPaceFraction + kPlaySafetyMarginMs (at least: above 30 fps the admitted frames at
-// kGatedPaceFloorFps set it, see below and playSafetyMs). A venue below that floor is refused up front
+// kGatedPaceFloorFps set it, see below and playSafetyMs). A venue too slow to consume the frames inside it is refused up front
 // when its engine pace is known (evaluatePlayableWindow: PLAY_PACE_TOO_SLOW) and ends early with the SAME typed token
 // when the pace only shows once Play runs (playPaceProjectsPastBudget) -- never a run that can only time out.
 // The runner's own process budget (gui-smoke-length-gate.ps1 Get-GuiSmokePlaySafetyMs) uses the same formula.
@@ -767,13 +767,14 @@ inline PlayPaceMode playPaceModeFromEnvironmentValue( const char *value )
     return value && std::string( value ) == "informational" ? PlayPaceMode::MeasuredInformational : PlayPaceMode::Gated;
 }
 // requiredSourceFrames: the frames the admitted Play must consume (PlayableWindowVerdict::requiredFrames, MainWindow
-// m_playRequiredSourceFrames). 0 (the default) or 1 leaves the budget exactly requested / fraction + margin; otherwise the budget is
-// at least ceil( (frames - 1) / kGatedPaceFloorFps ) + margin, so the steady pace the gate demands is never above kGatedPaceFloorFps.
+// m_playRequiredSourceFrames). 0 (the default) or 1 leaves the budget exactly requested / fraction + margin; otherwise a GATED budget
+// is at least ceil( (frames - 1) / kGatedPaceFloorFps ) + margin, so the steady pace the gate demands is never above kGatedPaceFloorFps.
+// The CPU-informational ceiling (MeasuredInformational) is never widened by the frame term (adversary r1 A3).
 inline int64_t playSafetyMs( double requestedSeconds, PlayPaceMode mode = PlayPaceMode::Gated, int64_t requiredSourceFrames = 0 )
 {
     const int64_t byFraction = static_cast<int64_t>( std::max( 0.0, requestedSeconds ) / minSustainedPaceFractionFor( mode ) * 1000.0 )
          + kPlaySafetyMarginMs;
-    const int64_t byFrames = requiredSourceFrames > 1
+    const int64_t byFrames = mode == PlayPaceMode::Gated && requiredSourceFrames > 1
         ? static_cast<int64_t>( std::ceil( static_cast<double>( requiredSourceFrames - 1 ) * 1000.0 / kGatedPaceFloorFps ) ) + kPlaySafetyMarginMs
         : 0;
     return std::max( byFraction, byFrames );

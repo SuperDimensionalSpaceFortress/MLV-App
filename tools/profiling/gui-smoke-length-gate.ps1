@@ -965,16 +965,22 @@ $script:GuiSmokePaceModeEnvironment = 'MLVAPP_PLAY_PACE_MODE'
 
 function Get-GuiSmokePlaySafetyMs {
     # The wall-clock safety net of an evidence Play of `Seconds` of footage: max(requested / 0.5 + 15 s,
-    # ceil((frames - 1) / kGatedPaceFloorFps) + 15 s), frames = ceil(Seconds x NativeFps) (PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1;
-    # without -NativeFps, or a non-positive one, the frame term is 0 and the budget is requested / 0.5 + 15 s exactly). The app ends the
-    # Play on its own typed failure inside this; a launcher's own process budget is this plus the open/settle time.
-    # -CpuPaceInformational: the CPU leg's ceiling instead (requested / (1/30) + 15 s, and the same frame term); the one derivation the
-    # runner, the dual-venue job's smoke timeout and its um-run timeout all read.
-    param([Parameter(Mandatory = $true)][double]$Seconds, [switch]$CpuPaceInformational, [double]$NativeFps = 0)
+    # ceil((frames - 1) / kGatedPaceFloorFps) + 15 s) (PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1). frames are the source frames the app
+    # admits: ceil(max(the clip's floor, the window it requests) x NativeFps), and the window it requests is min(Seconds, N / NativeFps) when
+    # -TargetPresentedFrames N ends the Play early (smokePlayRequestSeconds; adversary r1 A2), else Seconds. Without -NativeFps, or a
+    # non-positive one, the frame term is 0 and the budget is requested / 0.5 + 15 s exactly. The app ends the Play on its own typed failure
+    # inside this; a launcher's own process budget is this plus the open/settle time.
+    # -CpuPaceInformational: the CPU leg's ceiling instead (requested / (1/30) + 15 s), never widened by the frame term (adversary r1 A3);
+    # the one derivation the runner, the dual-venue job's smoke timeout and its um-run timeout all read.
+    param([Parameter(Mandatory = $true)][double]$Seconds, [switch]$CpuPaceInformational, [double]$NativeFps = 0, [int]$TargetPresentedFrames = 0)
     $fraction = if ($CpuPaceInformational) { $script:GuiSmokeCpuInformationalMinPaceFraction } else { $script:GuiSmokeMinSustainedPaceFraction }
     $byFraction = [int64][Math]::Ceiling([Math]::Max(0.0, $Seconds) * 1000.0 / $fraction) + $script:GuiSmokePlaySafetyMarginMs
-    $frames = if ($Seconds -gt 0 -and $NativeFps -gt 0) { [int64][Math]::Ceiling($Seconds * $NativeFps - 1e-9) } else { [int64]0 }
-    $byFrames = if ($frames -gt 1) { [int64][Math]::Ceiling(($frames - 1) * 1000.0 / $script:GuiSmokeGatedPaceFloorFps) + $script:GuiSmokePlaySafetyMarginMs } else { [int64]0 }
+    $byFrames = [int64]0
+    if (-not $CpuPaceInformational -and $Seconds -gt 0 -and $NativeFps -gt 0) {
+        $requestedSeconds = if ($TargetPresentedFrames -gt 0) { [Math]::Min($Seconds, [double]$TargetPresentedFrames / $NativeFps) } else { $Seconds }
+        $frames = [int64][Math]::Ceiling([Math]::Max((Get-GuiSmokeMinPlaySeconds -NativeFps $NativeFps), $requestedSeconds) * $NativeFps - 1e-9)
+        if ($frames -gt 1) { $byFrames = [int64][Math]::Ceiling(($frames - 1) * 1000.0 / $script:GuiSmokeGatedPaceFloorFps) + $script:GuiSmokePlaySafetyMarginMs }
+    }
     return [int64][Math]::Max($byFraction, $byFrames)
 }
 
