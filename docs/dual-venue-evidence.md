@@ -675,7 +675,13 @@ registry read; it sets, starts and writes nothing, and uses no `powercfg`) and b
 left of it, so the slowest query (the hotfix count) runs last. Any probe that fails, times out or is denied is a typed `{"state":"unknown","reason":"<short>"}` for
 that field. It never fails the leg, never delays it past the bound and never changes its verdict. A read that returns after the cap is a typed unknown too
 (`budget-exceeded`), and the budget is also what is left of 105 s of the health job's own 120 s, so the block can never push the probe's single `DVE_PROBE` line past
-the agent's deadline.
+the agent's deadline. A read that never returns (a hung registry or WMI provider call ignores `-OperationTimeoutSec`) cannot hold the probe either: the job runs
+the collector in a worker runspace (`Get-DvDisplayPathBounded`) and waits for the budget and no longer. The block is then `{"state":"unknown","reason":"budget-exceeded"}`
+as a whole, and the job ends its own process after it has printed its `DVE_PROBE` line, so the abandoned read cannot keep the job alive to the agent's kill.
+
+A block or an object inside it (`os`, a table entry) that carries `state` or `reason` beside its ordinary fields is malformed: a typed unknown has those two members and
+no other. An adapter or display name that is a typed unknown still counts in the adapters/activeDisplays match. A receipt with `"venue": null` is malformed; only a
+receipt with no `venue` member, or a null or missing `displayPath`, is `displayPath=absent`.
 
 **When it is sampled.** The block is a sample taken by the health probe, **before** the measurement job is submitted; the job then waits in the agent's queue and
 admission. It is not read again during the run, so it says what the venue drove at `collectedUtc`, not what it drove for every frame of the measurement. A display

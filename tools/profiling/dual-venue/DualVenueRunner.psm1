@@ -6127,7 +6127,9 @@ function Test-DvReceiptValid {
     $result = Test-DvReceiptValidCore @PSBoundParameters
     $venueNode = Get-DvProp $Receipt 'venue'
     # a venue that is present but not an object (an array, a number) cannot be said to carry no block: that is a malformed record, never `absent`
-    $display = $(if ($null -ne $venueNode -and -not (Test-DvDisplayPathIsObject $venueNode)) { [pscustomobject]@{ state = 'malformed'; problems = @('venue is not an object') } }
+    # SUCCESSOR-1 W4 (r3 adversary A6): an explicit `"venue": null` is a venue that is there and is not an object (malformed); only a missing venue member is absent
+    $display = $(if ($null -eq $venueNode -and (Test-DvDisplayPathHasMember $Receipt 'venue')) { [pscustomobject]@{ state = 'malformed'; problems = @('venue is null') } }
+                 elseif ($null -ne $venueNode -and -not (Test-DvDisplayPathIsObject $venueNode)) { [pscustomobject]@{ state = 'malformed'; problems = @('venue is not an object') } }
                  else { Test-DvDisplayPathBlock -Block (Get-DvProp $venueNode 'displayPath') })
     if ($display.state -ceq 'malformed') {
         $result.reasons = @('DISPLAY_PATH_MALFORMED: venue.displayPath: ' + ($display.problems -join '; ')) + @($result.reasons)
@@ -6500,6 +6502,31 @@ function Get-DvDisplayPath {
         & $unknown ('collector-error: ' + $_.Exception.Message)
     }
 }
+
+function Get-DvDisplayPathBounded {
+    # SUCCESSOR-1 W1 (r3 adversary A1): -OperationTimeoutSec does not bound every CIM wait and nothing bounds Get-ItemProperty, so one hung provider call held the
+    # probe past its budget and the job past the agent's 120 s. The reader runs in a worker runspace and is waited on for the budget and no longer. A read still in
+    # flight then is abandoned: the block is its typed unknown and $script:DvDisplayPathAbandoned tells the job to end its own process once it has printed its line
+    # (the abandoned pipeline would otherwise keep the process alive). -WorkerPrelude is the tests' door (text the worker runs first); the job passes none.
+    param([int]$BudgetSec = 15, [string]$WorkerPrelude = '')
+    $BudgetSec = [math]::Max(0, [math]::Min(15, $BudgetSec))
+    if ($BudgetSec -lt 1) { return (Get-DvDisplayPath -BudgetSec 0) }   # a spent budget asks nothing, so there is nothing to wait on
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $ps = [powershell]::Create()
+    $null = $ps.AddScript($WorkerPrelude + "`r`nfunction Get-DvDisplayPath {`r`n" + ${function:Get-DvDisplayPath}.ToString() + "`r`n}`r`nGet-DvDisplayPath -BudgetSec " + $BudgetSec)
+    $handle = $ps.BeginInvoke()
+    $waitMs = [int][math]::Floor([math]::Max(0.0, $BudgetSec * 1000.0 - $sw.Elapsed.TotalMilliseconds))
+    if (-not $handle.AsyncWaitHandle.WaitOne($waitMs)) {
+        $script:DvDisplayPathAbandoned = $true
+        try { $null = $ps.BeginStop($null, $null) } catch { }
+        return [ordered]@{ state = 'unknown'; reason = 'budget-exceeded' }
+    }
+    $out = @()
+    try { $out = @($ps.EndInvoke($handle)) } catch { $out = @() }
+    $ps.Dispose()
+    if ($out.Count -ne 1 -or $null -eq $out[0]) { return [ordered]@{ state = 'unknown'; reason = 'collector-error' } }
+    $out[0]
+}
 '@
 }
 
@@ -6544,6 +6571,22 @@ function Test-DvDisplayPathUnknown {
     (Test-DvDisplayPathText $state 'unknown') -and ($reason -is [string]) -and ($reason.Trim().Length -gt 0) -and ($reason.Length -le 200)
 }
 
+function Test-DvDisplayPathHasUnknownMember {
+    # SUCCESSOR-1 W3 (r3 adversary A5): an object of the schema (the block, os, a table entry) has no `state` or `reason` member. One that has either and is not
+    # exactly a typed unknown is the contradictory mixed shape (an unknown marker beside ordinary fields), refused in any letter case.
+    param($Value)
+    $names = @($(if ($Value -is [System.Collections.IDictionary]) { @($Value.Keys) } else { @($Value.PSObject.Properties | ForEach-Object { $_.Name }) }) | ForEach-Object { [string]$_ })
+    @($names | Where-Object { [string]::Equals($_, 'state', [System.StringComparison]::OrdinalIgnoreCase) -or [string]::Equals($_, 'reason', [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
+}
+
+function Test-DvDisplayPathHasMember {
+    # SUCCESSOR-1 W4 (r3 adversary A6): Get-DvProp gives $null both for a missing member and for an explicit null; this tells them apart.
+    param($Object, [string]$Name)
+    if ($null -eq $Object) { return $false }
+    if ($Object -is [System.Collections.IDictionary]) { return $Object.Contains($Name) }
+    $null -ne $Object.PSObject.Properties[$Name]
+}
+
 function Test-DvDisplayPathLeaf {
     # One field: a value of its Kind (string | int | utc | bool) or, except for bool, a typed unknown.
     param($Value, [string]$Kind)
@@ -6575,6 +6618,7 @@ function Test-DvDisplayPathBlock {
     if (Test-DvDisplayPathUnknown $Block) { return (& $result 'present' @()) }
     $problems = [System.Collections.Generic.List[string]]::new()
     if (-not (Test-DvDisplayPathIsObject $Block)) { return (& $result 'malformed' @('the block is neither an object nor a typed unknown')) }
+    if (Test-DvDisplayPathHasUnknownMember $Block) { $problems.Add('the block carries state/reason beside its fields: a typed unknown has those two members and no other') }
     if (-not (Test-DvDisplayPathText (Get-DvProp $Block 'schema') $script:DisplayPathSchema)) { $problems.Add("schema is not the string $script:DisplayPathSchema") }
     # r3 (adversary r2 A7): the block is the health probe's sample, taken before the measurement job is submitted, and it must say so (the exact string)
     if (-not (Test-DvDisplayPathText (Get-DvProp $Block 'sampledBefore') $script:DisplayPathSampledBefore)) { $problems.Add("sampledBefore is not the string $script:DisplayPathSampledBefore") }
@@ -6588,6 +6632,7 @@ function Test-DvDisplayPathBlock {
         if ($list -isnot [System.Array]) { $problems.Add("$($t.name) is neither a list nor a typed unknown"); continue }
         for ($i = 0; $i -lt $list.Count; $i++) {
             if (-not (Test-DvDisplayPathIsObject $list[$i])) { $problems.Add("$($t.name)[$i] is not an object"); continue }
+            if (Test-DvDisplayPathHasUnknownMember $list[$i]) { $problems.Add("$($t.name)[$i] carries state/reason beside its fields") }
             foreach ($f in $t.fields) {
                 if (-not (Test-DvDisplayPathLeaf (Get-DvProp $list[$i] $f[0]) $f[1])) { $problems.Add("$($t.name)[$i].$($f[0]) is not a $($f[1]) or a typed unknown") }
             }
@@ -6600,14 +6645,24 @@ function Test-DvDisplayPathBlock {
         # r3 (A4): a name is compared as its text value, so a name that reads back as a [datetime] still counts (ordinal keys: a case-sensitive dictionary)
         $want = [System.Collections.Generic.Dictionary[string, int]]::new([System.StringComparer]::Ordinal)
         $have = [System.Collections.Generic.Dictionary[string, int]]::new([System.StringComparer]::Ordinal)
+        # SUCCESSOR-1 W2 (r3 adversary A2): a name that is a typed unknown is still a row; it used to drop out of both maps. Unknown-named active adapters and
+        # unknown-named display entries are counted on their own and must agree in number (the collector writes both from the same Name, so they pair).
+        $wantUnknown = 0; $haveUnknown = 0
         foreach ($a in $adaptersList) {
-            $n = Get-DvDisplayPathTextValue (Get-DvProp $a 'name')
-            if ((Get-DvProp $a 'hasActiveOutput') -eq $true -and $n -is [string]) { $want[$n] = 1 + $(if ($want.ContainsKey($n)) { $want[$n] } else { 0 }) }
+            $rawName = Get-DvProp $a 'name'
+            $n = Get-DvDisplayPathTextValue $rawName
+            if ((Get-DvProp $a 'hasActiveOutput') -eq $true) {
+                if ($n -is [string]) { $want[$n] = 1 + $(if ($want.ContainsKey($n)) { $want[$n] } else { 0 }) }
+                elseif (Test-DvDisplayPathUnknown $rawName) { $wantUnknown++ }
+            }
         }
         foreach ($d in $displaysList) {
-            $n = Get-DvDisplayPathTextValue (Get-DvProp $d 'adapterName')
+            $rawName = Get-DvProp $d 'adapterName'
+            $n = Get-DvDisplayPathTextValue $rawName
             if ($n -is [string]) { $have[$n] = 1 + $(if ($have.ContainsKey($n)) { $have[$n] } else { 0 }) }
+            elseif (Test-DvDisplayPathUnknown $rawName) { $haveUnknown++ }
         }
+        if ($wantUnknown -ne $haveUnknown) { $problems.Add("activeDisplays and adapters disagree about the adapters whose name is a typed unknown: $wantUnknown active adapter(s), $haveUnknown display entr(ies)") }
         foreach ($k in @($want.Keys) + @($have.Keys) | Select-Object -Unique) {
             $w = $(if ($want.ContainsKey($k)) { $want[$k] } else { 0 }); $h = $(if ($have.ContainsKey($k)) { $have[$k] } else { 0 })
             if ($w -ne $h) { $problems.Add("activeDisplays and adapters disagree about '$k': $w adapter(s) with an active output, $h display entr(ies)") }
@@ -6617,6 +6672,7 @@ function Test-DvDisplayPathBlock {
     if (-not (Test-DvDisplayPathUnknown $os)) {
         if (-not (Test-DvDisplayPathIsObject $os)) { $problems.Add('os is neither an object nor a typed unknown') }
         else {
+            if (Test-DvDisplayPathHasUnknownMember $os) { $problems.Add('os carries state/reason beside its fields') }
             foreach ($f in @(@('build', 'string'), @('ubr', 'int'), @('lastBootUtc', 'utc'), @('hotfixCount', 'int'))) {
                 if (-not (Test-DvDisplayPathLeaf (Get-DvProp $os $f[0]) $f[1])) { $problems.Add("os.$($f[0]) is not a $($f[1]) or a typed unknown") }
             }
@@ -6709,14 +6765,16 @@ try { Add-Type -AssemblyName System.Windows.Forms; `$probe.displayDevice = [stri
     $displayPathSource = Get-DvDisplayPathCollectorSource
     $body + "`r`n" + $sessionLockedSource + "`r`n" + '$probe.sessionLocked = Get-AttrCudaSessionLocked' + "`r`n" +
         $displayPathSource + "`r`n" +
-        '$probe.displayPath = $(try { Get-DvDisplayPath -BudgetSec ([int][math]::Floor([math]::Max(0.0, [math]::Min(15.0, 105.0 - $dveJobSw.Elapsed.TotalSeconds)))) } catch { [ordered]@{ state = ''unknown''; reason = ''collector-error'' } })' + "`r`n" +
-        'Write-Output (''DVE_PROBE='' + ($probe | ConvertTo-Json -Compress -Depth 8))' + "`r`n"
+        '$probe.displayPath = $(try { Get-DvDisplayPathBounded -BudgetSec ([int][math]::Floor([math]::Max(0.0, [math]::Min(15.0, 105.0 - $dveJobSw.Elapsed.TotalSeconds)))) } catch { [ordered]@{ state = ''unknown''; reason = ''collector-error'' } })' + "`r`n" +
+        'Write-Output (''DVE_PROBE='' + ($probe | ConvertTo-Json -Compress -Depth 8))' + "`r`n" +
+        'if ($script:DvDisplayPathAbandoned) { [Console]::Out.Flush(); [Environment]::Exit(0) }' + "`r`n"
 }
 
 function ConvertFrom-DvProbeStdout([string]$Stdout) {
     # r3 (adversary r2 A4): the probe carries no time but displayPath's; where the host has -DateKind String (pwsh 7.5+) every string stays the text the venue sent, so a
     # text leaf named like a time reaches the receipt unchanged. An older host still reads it as a [datetime], which the block validator accepts at a text leaf (route (b)).
-    $raw = (Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')
+    # SUCCESSOR-1 W0: -DateKind arrived in pwsh 7.5; a version test, not a Get-Command result, so the splice scan can still bind this module's extractor call.
+    $raw = ($PSVersionTable.PSVersion -ge [version]'7.5')
     foreach ($line in ($Stdout -split "`r?`n")) {
         if ($line.StartsWith('DVE_PROBE=')) {
             try { if ($raw) { return ($line.Substring('DVE_PROBE='.Length) | ConvertFrom-Json -DateKind String) } else { return ($line.Substring('DVE_PROBE='.Length) | ConvertFrom-Json) } } catch { return $null }

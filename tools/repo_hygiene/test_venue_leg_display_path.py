@@ -482,7 +482,7 @@ $block = Get-DvDisplayPathBounded -BudgetSec ([int]$env:DVE_BUDGET) -WorkerPrelu
 $ms = $sw.ElapsedMilliseconds
 $rt = ($block | ConvertTo-Json -Depth 8 -Compress) | ConvertFrom-Json
 $v = Test-DvDisplayPathBlock -Block $rt
-[Console]::Out.WriteLine(([ordered]@{ block = $block; elapsedMs = $ms; state = $v.state; endLine = [string]$endLine } | ConvertTo-Json -Depth 12 -Compress))
+Write-Output ([ordered]@{ block = $block; elapsedMs = $ms; state = $v.state; endLine = [string]$endLine } | ConvertTo-Json -Depth 12 -Compress)
 if ($endLine) { . ([scriptblock]::Create($endLine)) }
 """
 
@@ -617,7 +617,7 @@ class CollectorNeverFailsOrDelaysTheLegTests(unittest.TestCase):
         text = pwsh_json("[ordered]@{ text = (New-DvHealthProbeJobText -AgentRoot 'C:\\mlvtmp\\mlv-agent') } | ConvertTo-Json -Compress")["text"]
         clock = text.find("$dveJobSw = [Diagnostics.Stopwatch]::StartNew()")
         first_work = text.find("$probe = [ordered]@{")
-        call = re.search(r"Get-DvDisplayPath -BudgetSec \(.*?(\d+)(?:\.0)? - \$dveJobSw\.Elapsed\.TotalSeconds", text)
+        call = re.search(r"Get-DvDisplayPath(?:Bounded)? -BudgetSec \(.*?(\d+)(?:\.0)? - \$dveJobSw\.Elapsed\.TotalSeconds", text)   # SUCCESSOR-1 W1: the bounded entry
         self.assertGreaterEqual(clock, 0, "the job has no job-wide stopwatch")
         self.assertLess(clock, first_work, "the job clock must start before the preamble does any work")
         self.assertIsNotNone(call, "the collector is called with a budget taken from the job clock")
@@ -688,7 +688,8 @@ class CollectorChangesNothingTests(unittest.TestCase):
         self.assertNotRegex(code, r"ToString\('yyyy-MM-ddTHH:mm:ssZ'\)")
         calls_only = re.sub(r"(?im)^\s*function\s+[A-Za-z][\w-]*", "", code)
         called = sorted(set(re.findall(r"\b(Get-[A-Za-z]+)\b", calls_only)))
-        self.assertEqual(called, ["Get-CimInstance", "Get-ItemProperty"], called)
+        # SUCCESSOR-1 W1: Get-DvDisplayPathBounded runs the collector's own reader (Get-DvDisplayPath) in its worker; no other command is called
+        self.assertEqual(called, ["Get-CimInstance", "Get-DvDisplayPath", "Get-ItemProperty"], called)
 
     def test_the_source_parses_clean(self) -> None:
         got = pwsh_json("$t = Get-DvDisplayPathCollectorSource\n$tok = $null; $err = $null\n[void][System.Management.Automation.Language.Parser]::ParseInput($t, [ref]$tok, [ref]$err)\n"
@@ -721,7 +722,7 @@ class HealthProbeCarriesTheCollectorTests(unittest.TestCase):
 
     def test_a_collector_that_throws_cannot_stop_the_probe(self) -> None:
         got = pwsh_json("$p = New-DvHealthProbeJobText -AgentRoot 'C:\\mlvtmp\\mlv-agent'\n"
-                        "[ordered]@{ guarded = [bool]($p -match '(?s)try \\{ Get-DvDisplayPath( -BudgetSec [^}]*)? \\} catch') } | ConvertTo-Json -Compress")
+                        "[ordered]@{ guarded = [bool]($p -match '(?s)try \\{ Get-DvDisplayPath(Bounded)?( -BudgetSec [^}]*)? \\} catch') } | ConvertTo-Json -Compress")
         self.assertTrue(got["guarded"])
 
 
