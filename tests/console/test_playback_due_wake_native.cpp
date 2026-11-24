@@ -3261,7 +3261,11 @@ bool g_r17A1NullSeen = false;
 // r3 adversary pass 4 A7 (advisory): the hold is bounded by the SENDER's own 5 s cutoff (published before its first send), never a
 // second cutoff taken at the handler's entry; 0 (no sender) credits nothing
 std::atomic<ULONGLONG> g_r17A1SenderGiveUp { 0 };
-constexpr UINT kR17A1StrayMessage = WM_USER + 0x55;                  // A1 input: a sent message no handler here knows (DefWindowProcW)
+constexpr UINT kR17A1StrayMessage = WM_USER + 0x55;                  // A1 input: a sent message the fixture only stamps
+// r3 adversary pass 5 A2 (and sol r2 H2): the first WM_NULL's and the stray's handlers record when they ran, so the charge-before-
+// handler proof covers THEIR dispatches too (a WM_NULL-only dispatch, the held one, the stray's), not only the present's and probes'
+bool g_r17A1StrayRan = false;
+double g_r17A1StrayRunMs = 0.0;
 // r3 (sol r2 H1): the hold's completion is read ONCE per pass, and credited only when a cutoff check taken AFTER that read still
 // places it before giveUp (the sender's own admission rule, :entered): a flag published after the 5 s cutoff, before a separate
 // final load, is never credited as held
@@ -3278,16 +3282,22 @@ bool r17A1HoldUntil( const std::atomic<bool> &flag, ULONGLONG giveUp )
 }
 LRESULT CALLBACK r17A1ForeignProc( HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam )
 {
-    if( message == WM_NULL && g_r17A1PauseInForeign )
+    if( message == kR17A1StrayMessage )
+    {
+        g_r17A1StrayRunMs = dueWakeQpcNowMs();                         // pass 5 A2: its dispatch's charge order is proved too
+        g_r17A1StrayRan = true;
+        return 0;
+    }
+    if( message == WM_NULL )
     {
         if( g_r17A1NullSeen ) return 0;                                // A5: a later WM_NULL holds nothing and writes no witness
         g_r17A1NullSeen = true;
-        g_r17A1NullEnterMs = dueWakeQpcNowMs();                        // A1: inside the held dispatch, before the hold
+        g_r17A1NullEnterMs = dueWakeQpcNowMs();                        // A1: inside the held dispatch, before the hold; pass 5 A2/H2: every row's first WM_NULL
+        if( !g_r17A1PauseInForeign ) return 0;                         // an unpaused foreign row: the WM_NULL is only stamped
         const bool sendingAtEntry = g_r17A1PresentSending.load();     // false: the present's send had not begun when this dispatch did
         const ULONGLONG giveUp = g_r17A1SenderGiveUp.load();          // A7: the sender's own cutoff
         // the sender publishes g_r17A1ProbesSent only after g_r17A1PresentSent (seq_cst), so holding for the probes also held the present
-        g_r17A1PauseHeld = !sendingAtEntry && r17A1HoldUntil( g_r17A1CoalesceInForeign ? g_r17A1ProbesSent : g_r17A1PresentSent, giveUp );
-        return 0;
+        g_r17A1PauseHeld = !sendingAtEntry && r17A1HoldUntil( g_r17A1CoalesceInForeign ? g_r17A1ProbesSent : g_r17A1PresentSent, giveUp );        return 0;
     }
     if( message == kR17A1ProbeMessage )
     {
@@ -3400,7 +3410,10 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     bool sentOk = false;
     bool landed = false;
     double foreignSentMs = 0.0;                                       // FOREIGN-FIRST-FLOOR-1: the sender's read just before the WM_NULL send
-    double nullEnterMs = 0.0;                                         // r3 pass 4 A1: the paused WM_NULL handler's entry read
+    double nullEnterMs = 0.0;                                         // r3 pass 4 A1: the first WM_NULL handler's entry read
+    bool nullRan = false;                                             // pass 5 A2: that handler ran inside the sleep
+    bool strayRan = false;                                            // pass 5 A2: the coalesced row's stray ran inside the sleep
+    double strayRunMs = 0.0;
     // r3 (sol r2 B1): why each discarded attempt was discarded, so a row that discards all ten fails with a typed reason
     int missedSend = 0;                                               // the present's handler never ran inside the sleep
     int noStamps = 0;                                                 // the sleep made no caller-clock read
@@ -3424,6 +3437,8 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         g_r17A1ProbesSent = false;
         g_r17A1NullEnterMs = 0.0;
         g_r17A1NullSeen = false;
+        g_r17A1StrayRan = false;
+        g_r17A1StrayRunMs = 0.0;
         g_r17A1SenderGiveUp = 0;
         g_r17A1PauseInForeign = floorRow;
         g_r17A1CoalesceInForeign = floorRow && coalesceInForeign;
@@ -3501,6 +3516,9 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         const bool handlerRan = g_r17A1HandlerRan;                     // also before the drain, which runs the handler too when a send missed
         const bool pauseHeld = g_r17A1PauseHeld;                       // A1: also before the drain (a WM_NULL drained after the join holds nothing)
         nullEnterMs = g_r17A1NullEnterMs;                              // r3 pass 4 A1: also before the drain
+        nullRan = g_r17A1NullSeen;                                     // pass 5 A2: before the drain (a WM_NULL drained after the sleep is not judged)
+        strayRan = g_r17A1StrayRan;
+        strayRunMs = g_r17A1StrayRunMs;
         ranProbes = g_r17A1ProbeRanMask;
         std::copy( g_r17A1ProbeRunMs, g_r17A1ProbeRunMs + kR17A1MaxProbes, probeRunMs );   // also before the drain
         // a send that missed the sleep is still queued: take it now (its handler sees no windows), so it cannot cut the next try
@@ -3642,6 +3660,11 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     assertChargedBeforeHandler( handlerStartMs );
     for( int i = 0; i < kR17A1MaxProbes; ++i )
         if( ( ranProbes & ( 1u << static_cast<unsigned>( i ) ) ) != 0u ) assertChargedBeforeHandler( probeRunMs[i] );
+    // r3 adversary pass 5 A2 (sol r2 H2): the first WM_NULL's dispatch (a WM_NULL-only one in the unpaused foreign rows, the held
+    // one in the paused rows) and the stray's dispatch are proved the same way: a segment charged late, after the WM_NULL or the
+    // stray ran, fails here even when every later handler still sees it charged
+    if( nullRan ) assertChargedBeforeHandler( nullEnterMs );
+    if( strayRan ) assertChargedBeforeHandler( strayRunMs );
     ASSERT_TRUE( w.chargedS[0] * 1000.0 <= handlerStartMs - enteredMs + 0.5 );
     ASSERT_TRUE( w.chargedS[1] * 1000.0 <= returnedMs - handlerEndMs + 0.5 );
     // CI-FLAKE-R17A1-FOREIGN-FIRST-FLOOR-1 (sol r10 B1, fable r10 B1): with a foreign WM_NULL first, the first dispatch is the
