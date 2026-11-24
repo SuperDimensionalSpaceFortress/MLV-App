@@ -2594,6 +2594,45 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
             rows.append((label, case, expect))
         self.t3_check(rows, "& (Get-Module DualVenueRunner) { $script:ExportCdngFrameLeaf = $env:DVE_LEAF }\n", DVE_LEAF=self.T3R2_WIDENED)
 
+    # --- EXPORT-PIPE-EVIDENCE-READER-HARDENING-1 r1 (sol r2 on f31c1b88, B1 blocker and H1). The headless route passes CODEC_CNDG_DEFAULT (BatchRunner.cpp:1393) and
+    # CdngSequenceExport.cpp:269-271 prints getMlvFrameNumber, a uint32 (macros.h:35, mlv_object.h:52), with QString::arg's field width 6 and fill '0'. So the suffix is
+    # exactly six digits (0 .. 999999, zero-padded) or seven to ten digits with no leading zero, at most 4294967295. Anything else is a name the writer cannot print.
+    T3H_BAD = (("SOL-R2-B1-OVERPAD", "view-0_0000000.dng", "view-0_0000479.dng"), ("SOL-R2-B1-OVERFLOW", "view-0_4294967296.dng", "view-0_9999999999.dng"))
+    T3H_PIN = (("PIN-UINT32-MAX", "view-0_4294967294.dng", "view-0_4294967295.dng"), ("PIN-SIX", "view-0_000000.dng", "view-0_000479.dng"),
+               ("PIN-SEVEN", "view-0_999999.dng", "view-0_1000000.dng"))
+
+    def t3h_case(self, first: str, last: str, crit) -> dict:
+        return cdng_case(maxFrames=480, profile=cdng_profile(480), batch=self.T3R2_DONE480, manifest=self.cdng_endpoints(480, first, last), criteria=crit)
+
+    def t3h_rows(self, pins: bool = True) -> list:
+        BU = "EXPORT_BATCH_LOG_UNREADABLE"
+        spec = leg("m16-1243-export-cdng-lossless")
+        rows = []
+        for role in ("acceptance", "supplementary"):
+            crit = spec["criteria"][role]["cpu"]
+            rows += [(f"{role}-{label}", self.t3h_case(first, last, crit), (BU, ["DONE names the clip 'view-0'", f"'{first}'", f"'{last}'"])) for label, first, last in self.T3H_BAD]
+            if pins:
+                rows += [(f"{role}-{label}", self.t3h_case(first, last, crit), "PASS") for label, first, last in self.T3H_PIN]
+        return rows
+
+    def test_reader_hardening_1_r1_sol_r2_b1_a_frame_suffix_the_writer_cannot_print_is_invalid(self) -> None:
+        """sol r2 B1 (repro verbatim): with DONE view-0 exported=480 and otherwise valid evidence, view-0_0000000.dng / view-0_0000479.dng (overpadded) and
+        view-0_4294967296.dng / view-0_9999999999.dng (past UINT32_MAX) read PASS under both shipped criterion sets. INVALID now, by the witness. PIN: the uint32 top,
+        the six-digit form and the first seven-digit number stay PASS."""
+        self.t3_check(self.t3h_rows())
+
+    def test_reader_hardening_1_r1_sol_r2_b1_the_stem_check_refuses_them_under_a_widened_leaf_table(self) -> None:
+        """B1 defence in depth: with $script:ExportCdngFrameLeaf re-widened to r1's table, the stem check (independent of the table) holds the same writer number."""
+        self.t3_check(self.t3h_rows(pins=False), "& (Get-Module DualVenueRunner) { $script:ExportCdngFrameLeaf = $env:DVE_LEAF }\n", DVE_LEAF=self.T3R2_WIDENED)
+
+    def test_reader_hardening_1_r1_sol_r2_h1_the_mixed_pair_diagnostic_names_both_endpoints(self) -> None:
+        """sol r2 H1 (repro verbatim): first view-0_000000.dng, last view-0_1_2024-01-02_0001_C0000_000479.dng, DONE view-0: INVALID, and the shipped problem names
+        BOTH leaves (it named only the offending one). Both endpoint orders."""
+        BU, dd = "EXPORT_BATCH_LOG_UNREADABLE", self.T3R2_DATED
+        crit = leg("m16-1243-export-cdng-lossless")["criteria"]["acceptance"]["cpu"]
+        a, b = "view-0_000000.dng", f"{dd}_000479.dng"
+        self.t3_check([(label, self.t3h_case(x, y, crit), (BU, ["DONE names the clip 'view-0'", f"'{x}'", f"'{y}'"])) for label, x, y in (("SOL-R2-H1", a, b), ("SOL-R2-H1-REVERSED", b, a))])
+
     def test_t3_r1_b2_b3_a_verbatim_path_slot_holding_a_field_named_again_is_invalid(self) -> None:
         """sol r4 B2 / B3 (repro verbatim) and key3 r4 H2: `out=C:/a.mov out=D:/out/view-0.mov` read PASS (the manifest binds the last leaf), and so did
         `container_probe=C:/kit/ffprobe.exe container_probe=D:/alt/ffprobe.exe`, a `dimensions=1280x720` or a `codec=h264` before probe_source=, and a repeated
@@ -3891,8 +3930,9 @@ ConvertTo-Json -InputObject $out -Compress -Depth 4
             self.assertIn(line, described["grammar"], var)
         self.assertNotIn("[regex]::Matches($logText", described["template"], "the job classifies the batch log by the module's grammar alone")
 
-    def run_job_slice(self, rows: list) -> list:
-        """rows: (label, fmt, frames, lines, leaves). Runs the emitted job's classification slice over each (T4 harness) and returns its result dicts."""
+    def run_job_slice(self, rows: list, stages: list | None = None) -> list:
+        """rows: (label, fmt, frames, lines, leaves). Runs the emitted job's classification slice over each (T4 harness) and returns its result dicts.
+        stages (READER-HARDENING-1 r1): an optional per-row ProRes stage-timing.log text; None keeps the default one-frame scaled log."""
         with tempfile.TemporaryDirectory() as d:
             cases = []
             for i, (label, fmt, frames, lines, leaves) in enumerate(rows):
@@ -3900,7 +3940,8 @@ ConvertTo-Json -InputObject $out -Compress -Depth 4
                 (work / "out").mkdir(parents=True)
                 (work / "batch.log").write_text("[BATCH] Start\n" + "\n".join(lines) + "\n", encoding="utf-8", newline="")
                 if fmt == "prores":
-                    (work / "stage-timing.log").write_text(piped_stage_log(1, scale_ms=6.0), encoding="utf-8")
+                    stage = piped_stage_log(1, scale_ms=6.0) if stages is None or stages[i] is None else stages[i]
+                    (work / "stage-timing.log").write_text(stage, encoding="utf-8")
                 else:
                     (work / "export-profile.json").write_text(cdng_profile(frames), encoding="utf-8")
                 for leaf in leaves:
@@ -4025,6 +4066,58 @@ ConvertTo-Json -InputObject $out -Compress -Depth 4
                 self.assertEqual(c["outcome"], "PASS" if ok else "INVALID", c)
                 if not ok:
                     self.assertTrue(any(p.startswith("EXPORT_BATCH_LOG_UNREADABLE") and "DONE names the clip" in p for p in c["problems"]), c)
+
+    def test_reader_hardening_1_r1_sol_r2_b1_the_job_refuses_a_frame_number_the_writer_cannot_print(self) -> None:
+        """sol r2 B1 on the Bachelor caller (the job embeds Get-DvBatchExportBindingProblems and $script:ExportCdngFrameLeaf): 480 frames found on disk named
+        view-0_<7 digits>.dng (overpadded), or past UINT32_MAX ending view-0_9999999999.dng, under DONE view-0 exported=480. EXPORT_OUTPUT_MISMATCH at the job and
+        INVALID centrally on the same endpoints. PIN: the 480 frames up to 4294967295 and the six-digit run read EXPORT_CAPTURED / PASS."""
+        d480 = ["[BATCH] DONE view-0 exported=480 skipped=0 elapsed=60.0"]
+        rows = [("SOL-R2-B1-OVERPAD", "cdng-lossless", 480, d480, [f"view-0_{k:07d}.dng" for k in range(480)]),
+                ("SOL-R2-B1-OVERFLOW", "cdng-lossless", 480, d480, [f"view-0_{4294967296 + k}.dng" for k in range(479)] + ["view-0_9999999999.dng"]),
+                ("PIN-UINT32-MAX-OK", "cdng-lossless", 480, d480, [f"view-0_{4294967295 - 479 + k}.dng" for k in range(480)]),
+                ("PIN-SIX-OK", "cdng-lossless", 480, d480, [f"view-0_{k:06d}.dng" for k in range(480)])]
+        got = self.run_job_slice(rows)
+        self.assertEqual(len(got), len(rows), got)
+        central = []
+        for label, _, n, lines, leaves in rows:
+            m = json.loads(output_manifest(n))
+            m["first"], m["last"] = {"name": leaves[0], "bytes": 1000, "sha256": "1" * 64}, {"name": leaves[-1], "bytes": 1000, "sha256": "2" * 64}
+            central.append(cdng_case(maxFrames=n, profile=cdng_profile(n), batch="[BATCH] Start\n" + "\n".join(lines) + "\n", manifest=json.dumps(m),
+                                     criteria=[{"metric": "framesExported", "op": "eq", "value": n}]))
+        proc, cgot = evidence_cases(central)
+        self.assertIsNotNone(cgot, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(len(cgot), len(rows), cgot)
+        for (label, *_, leaves), g, c in zip(rows, got, cgot):
+            with self.subTest(row=label):
+                ok = label.endswith("-OK")
+                self.assertEqual(g["result"], "EXPORT_CAPTURED" if ok else "EXPORT_OUTPUT_MISMATCH", g)
+                self.assertEqual(c["outcome"], "PASS" if ok else "INVALID", c)
+                if not ok:
+                    self.assertTrue(any(p.startswith("EXPORT_BATCH_LOG_UNREADABLE") and f"'{leaves[0]}'" in p and f"'{leaves[-1]}'" in p for p in c["problems"]), c)
+
+    def test_reader_hardening_1_r1_sol_r2_b2_pin_the_job_checks_the_shared_bindings_only(self) -> None:
+        """sol r2 B2 (PIN, documents the gap; repro verbatim): a one-frame ProRes capture whose RENDER_START declares scaled=true, with matching verification and
+        .mov, and a timing log complete but for export_scale, reads INVALID / EXPORT_PROFILE_ABSENT centrally and EXPORT_CAPTURED (exit 0) at the job; so does the
+        cutIn=2 cutOut=2 declaration over timing on frame 0 (central EXPORT_STAGE_WINDOW_MISMATCH). The job holds the SHARED bindings only; the receipt stays INVALID
+        by the central re-derivation (Invoke-VenueLeg.ps1). If the job ever checks these, this pin flips and docs/dual-venue-evidence.md is updated with it."""
+        S, V = self.t4_start(), self.t4_verified()
+        D = "[BATCH] DONE view-0 exported=1 skipped=0 elapsed=1.0"
+        rows = [("SOL-R2-B2-NO-SCALE", [S, V, D], piped_stage_log(1), "EXPORT_PROFILE_ABSENT", "export_scale"),
+                ("SOL-R2-B2-SHIFTED-WINDOW", [S.replace("cutIn=1 cutOut=1", "cutIn=2 cutOut=2"), V, D], piped_stage_log(1, scale_ms=6.0), "EXPORT_STAGE_WINDOW_MISMATCH", "cutIn=2 cutOut=2"),
+                ("CTL-PRORES-OK", [S, V, D], piped_stage_log(1, scale_ms=6.0), None, None)]
+        got = self.run_job_slice([(label, "prores", 1, lines, ["view-0.mov"]) for label, lines, *_ in rows], stages=[st for _, _, st, *_ in rows])
+        proc, central = evidence_cases([prores_case(maxFrames=1, dualIsoExpected=True, stage=st, batch="[BATCH] Start\n" + "\n".join(lines) + "\n", criteria=[],
+                                                    manifest=output_manifest(1, "mov")) for _, lines, st, *_ in rows])
+        self.assertIsNotNone(central, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual((len(got), len(central)), (len(rows), len(rows)), (got, central))
+        for (label, _, _, code, needle), g, c in zip(rows, got, central):
+            with self.subTest(row=label):
+                self.assertEqual(g["result"], "EXPORT_CAPTURED", g)
+                if code is None:
+                    self.assertEqual(c["outcome"], "PASS", c)
+                else:
+                    self.assertEqual(c["outcome"], "INVALID", c)
+                    self.assertTrue(any(p.startswith(code) and needle in p for p in c["problems"]), c)
 
     @staticmethod
     def t4_start() -> str:
