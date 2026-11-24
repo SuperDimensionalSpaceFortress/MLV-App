@@ -1027,6 +1027,29 @@ class OffscreenProbeAndParityTests(unittest.TestCase):
                 proc = _pwsh(f". {_q(GATE)}; Get-GuiSmokePlaySafetyMs {args}")
                 self.assertEqual(proc.stdout.strip(), str(expected), proc.stdout + proc.stderr)
 
+    def test_pass2_a3_the_frame_term_counts_the_window_the_app_rounds_to_whole_milliseconds(self) -> None:
+        # adversary pass 2 A3 (2746b12b): the app takes --seconds as qRound(seconds x 1000) ms (main.cpp options.durationMs), so 20.0334 s at 60 fps
+        # is 20.033 s and ceil(20.033 x 60) = 1202 admitted frames -> ceil(1201 / 15 s) + 15 s = 95 067 ms; counting 1203 frames gave 95 134.
+        proc = _pwsh(f". {_q(GATE)}; Get-GuiSmokePlaySafetyMs -Seconds 20.0334 -NativeFps 60")
+        self.assertEqual(proc.stdout.strip(), "95067", proc.stdout + proc.stderr)
+
+    def test_pass2_a2_the_frame_term_only_widens_the_runners_budget_up_to_the_ceiling(self) -> None:
+        # adversary pass 2 A2 (2746b12b): the frame term may never refuse a workload the base budget admits. The runner's own budget block runs
+        # with M16-1457's 59.94 fps, -Seconds 20 and -SettleCpuMaxMs 3480000: base 55 000 + 3 480 000 + 30 000 = 3 565 000 fits; the widened
+        # 3 604 867 threw. It is now held at the 3 600 000 ceiling (the hard limit then ends an overrun as a typed timeout). A workload whose base
+        # budget is over the ceiling is still refused with the same message.
+        text = RUNNER.read_text(encoding="utf-8")
+        block = text[text.index("$clipNativeFpsForBudget = "):text.index("$effectiveProcessTimeoutMs = ")]
+        prelude = (f". {_q(GATE)}; function Get-ObjectPropertyValue($o, $n) {{ $o.$n }}; $clipLengthGate = [pscustomobject]@{{ fps = 59.94 }}; "
+                   "$Seconds = 20.0; $TargetPresentedFrames = 0; $CpuPlayPaceInformational = $false; $SettleMs = 0; $ScreenshotDelayMs = 0; "
+                   "$ScreenshotWindowWaitMs = 0; $ScreenshotCaptureTimeoutMs = 0; $ExerciseClipLifecycleStress = $false; $StressSwitchAtMs = 0; ")
+        for settle_cpu, expected in ((3480000, "3600000"), (0, "124867")):
+            with self.subTest(settle_cpu=settle_cpu):
+                proc = _pwsh(prelude + f"$SettleCpuMaxMs = {settle_cpu}; " + block + "; [string][int64]$derivedProcessTimeoutMs")
+                self.assertEqual(proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "", expected, proc.stdout + proc.stderr)
+        proc = _pwsh(prelude + "$SettleCpuMaxMs = 3520000; " + block)
+        self.assertIn("exceeds the 3600000 ms safety ceiling", proc.stdout + proc.stderr)
+
     def test_every_launcher_sizes_the_frame_term_from_the_window_the_app_requests(self) -> None:
         # adversary r1 A2 siblings: the launcher that ends Play early on presented frames passes that target too.
         runner = RUNNER.read_text(encoding="utf-8")

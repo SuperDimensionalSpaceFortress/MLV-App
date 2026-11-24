@@ -196,6 +196,20 @@ class M161457Generator(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertIn(TOKEN, message)
 
+    def test_pass2_a1_a_bound_allowance_past_the_derivations_range_keeps_the_floor(self) -> None:
+        # adversary pass 2 A1 (2746b12b): -PlaySeconds 897 makes the 60 fps bound's allowance 3603 s, past Get-AttrCudaLegTimeBudget's
+        # [ValidateRange(0, 3600)] PlaySeconds, so the probe threw a parameter-binding error before the typed fallback. Base emits the job.
+        code, message, budget, job = self.generate(GENERATOR, "p2a1.job.ps1", "M16-1243", "-PlaySeconds 897 -ColdReadMBps 100")
+        self.assertEqual(code, 0, message)
+        self.assertIn("PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: the 60 fps bound", message)
+
+    def test_pass2_a4_the_fallback_note_is_not_a_warning_a_caller_can_escalate(self) -> None:
+        # adversary pass 2 A4 (2746b12b): with -WarningAction Stop the fallback's Write-Warning terminated the generator before the floor allowance
+        # was restored. -PlaySeconds 500 -ColdReadMBps 2 fits on base with no warning, so it must still emit the job.
+        code, message, budget, job = self.generate(GENERATOR, "p2a4.job.ps1", "M16-1243", "-PlaySeconds 500 -ColdReadMBps 2 -WarningAction Stop")
+        self.assertEqual(code, 0, message)
+        self.assertIn("PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: the 60 fps bound", message)
+
     def test_mutation_the_master_generator_with_the_request_confined_to_the_cpu_block_refuses_the_leg(self) -> None:
         text = lf(GENERATOR.read_text(encoding="utf-8"))
         self.assertEqual(text.count(CLAMP_REQUEST + "\n"), 1)
