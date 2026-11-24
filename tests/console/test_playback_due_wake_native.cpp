@@ -75,6 +75,15 @@ double dueWakeSleepFloorMs( double requestedMs )
     return std::max( 1.0, requestedMs - kSleepTimerTickSlackMs );
 }
 
+// CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1: the RED seam MLV_R17A1_RED_R5_ORDER=1 replays 303c7191's (r5's) judgement order
+// at the two sites sol r5 blocked (the R3A3 admission gate and judgeSentWait's length-before-record read), so either literal row
+// shows its r5 failure on the exact head with no rebuild. Each replay only fails more samples than the fix does, never fewer.
+bool dueWakeRedR5Order()
+{
+    const char *value = std::getenv( "MLV_R17A1_RED_R5_ORDER" );
+    return value && std::string( value ) == "1";
+}
+
 // PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 (r7 adversary pass 12 A1/A3): a sleep's exit is judged on the value the product itself
 // compared when it left its loop (PlaybackDueWake::setTimingStampsForTest), never on a clock read taken after the fact: a
 // scheduler pause between the product's decision and a later read (the sleep's final caller-clock read, a sender's post-call
@@ -2778,15 +2787,31 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
     PlaybackDueWake::RunnerSleep slept = PlaybackDueWake::RunnerSleep::NotHandled;
     qint64 sleptMs = 0;
     bool sentOk = false;
-    for( int attempt = 0; attempt < kSleepObservationAttempts && !judged; ++attempt )
+    int unrelatedRetried = 0;                                         // r1 (sol r5 B1): the literal first attempts that were retried
+    // CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1 (sol r5 B1), its literal row as a standing first attempt: an unrelated WM_NULL to
+    // the wake's own window ~8 ms into the 150 ms sleep (one healthy dispatch the product counts and records), and the fixture's
+    // send held until the sleep has returned (it queues after the return: calls=0, count=1, spans=1, TimedOut). That sample must be
+    // accounted, then retried on the fixture's own witness; r5 admitted it to the trace scan with both handler reads still -1. One
+    // extra attempt keeps the real observation's own attempt budget.
+    const HWND wakeWindow = reinterpret_cast<HWND>( wake.nativeWindow() );
+    for( int attempt = 0; attempt < kSleepObservationAttempts + 1 && !judged; ++attempt )
     {
         foreign = R3A3Foreign();
         foreign.wake = &wake;
         foreign.busyMs = busyMs;
         wake.setGuiTraceActive( true );
         std::atomic<bool> sent { false };
-        std::thread sender( [window, &sent]() {
-            Sleep( 5 );
+        std::atomic<bool> sleepReturned { false };
+        const bool unrelatedFirst = attempt == 0;
+        std::thread sender( [window, wakeWindow, unrelatedFirst, &sent, &sleepReturned]() {
+            if( unrelatedFirst )
+            {
+                Sleep( 8 );
+                SendNotifyMessageW( wakeWindow, WM_NULL, 0, 0 );      // the unrelated dispatch, inside the sleep
+                const ULONGLONG giveUp = GetTickCount64() + 5000;
+                while( !sleepReturned.load() && GetTickCount64() < giveUp ) Sleep( 1 );   // the fixture send misses the sleep
+            }
+            else Sleep( 5 );
             sent = SendNotifyMessageW( window, kR3A3ForeignMessage, 0, 0 ) != 0;
         } );
         const ThreadJoinGuard senderGuard { sender };
@@ -2796,6 +2821,7 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
         t.start();
         slept = wake.sleepForSmokeRunner( 150, &dueWakeQpcNowS );
         const double returnedMs = dueWakeQpcNowMs();                  // r10 (sol r9 B2): after the sleep's last trace note
+        sleepReturned = true;
         sleptMs = t.elapsed();
         sender.join();
         ASSERT_TRUE( dueWakeObserveSleep( wake, 150.0 ).met );        // SEAM-1 adversary pass A3: every sample, before the retry filter
@@ -2822,10 +2848,17 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
                 }
             }
         }
-        // CI-FLAKE-R17A1-FOREIGN-FIRST-FLOOR-1 r5 (pass 9 A1 sibling): retried only when NEITHER the handler NOR the product's span
-        // record shows a dispatch in the sleep: a recorded dispatch whose handler never counted fails foreign.calls below instead
-        if( foreign.calls == 0 && wake.lastRunnerSleepDispatchSpansS().empty() )
+        // CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1 (sol r5 B1): admitted on the fixture's OWN handler witness only. The record
+        // was accounted just above (count == spans, every handler inside one span), so a span or count left here with calls == 0 is
+        // an unrelated dispatch (a WM_NULL to the wake's own window) the product correctly recorded, and the fixture's send missed
+        // the sleep: it is drained and observed again. r5 admitted on "calls OR spans", which an unrelated dispatch satisfies, and
+        // scanned the trace from the fixture's unset -1 read. A fixture handler that never runs in any attempt exhausts the loop
+        // and fails `judged`. MLV_R17A1_RED_R5_ORDER=1 replays r5's gate (the guard before the scan then fails the sample).
+        const bool r3a3Retry = dueWakeRedR5Order() ? ( foreign.calls == 0 && wake.lastRunnerSleepDispatchSpansS().empty() )
+                                                   : foreign.calls == 0;
+        if( r3a3Retry )
         {
+            if( unrelatedFirst ) ++unrelatedRetried;
             // adversary pass 1 A4/A7: a sender that missed the whole sleep (its message queued after the sleep returned) left
             // nothing to judge and a pending sent message behind. Take it now, so it cannot reach the next attempt's sleep and
             // double that attempt's handler calls, and observe again. Keyed on the handler's own call count, not on the span
@@ -2840,6 +2873,22 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
         // (ExpiredAfterDispatch): no rest, nothing to observe, so that sample is observed again (its cadence was judged above).
         // A sleep that did go on is judged on its trace between the handler's own return and the sleep's return (2 ms at least,
         // so a rest of a few microseconds is not searched for at 10 us steps): somewhere in there it must read RunnerSleep.
+        // r1 (sol r5 B1): a -1 handler read never reaches the trace scan below. Past the witness gate the handler ran (on this
+        // thread, inside the sleep), so it wrote both reads; a sample admitted without them fails here, typed, instead of scanning
+        // from -1 ms on the QPC coordinate (hundreds of millions of trace queries) and failing calls == 1 after the loop
+        if( !( foreign.calls >= 1 && foreign.handlerStartMs >= 0.0 && foreign.handlerEndMs >= foreign.handlerStartMs ) )
+        {
+            wake.setGuiTraceActive( false );
+            const std::string detail = "attempt=" + std::to_string( attempt ) + " calls=" + std::to_string( foreign.calls )
+                                       + " handler_start_ms=" + std::to_string( foreign.handlerStartMs ) + " handler_end_ms="
+                                       + std::to_string( foreign.handlerEndMs ) + " spans="
+                                       + std::to_string( wake.lastRunnerSleepDispatchSpansS().size() );
+            MSG drain;                                                // the missed send, so it reaches no later sleep
+            PeekMessageW( &drain, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );
+            g_r3a3Foreign = nullptr;
+            wake.setTimingStampsForTest( false );
+            ::minitest::fail( __FILE__, __LINE__, "R3A3_ADMITTED_WITHOUT_HANDLER_WITNESS", detail );
+        }
         const PlaybackDueWake::RunnerSleepExit sleepExit = wake.lastRunnerSleepExitForTest();
         if( sleepExit == PlaybackDueWake::RunnerSleepExit::ExpiredAfterDispatch || !( foreign.handlerEndMs >= foreign.handlerStartMs )
             || returnedMs - foreign.handlerEndMs < 2.0 )
@@ -2863,6 +2912,7 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
         judged = true;
     }
     ASSERT_TRUE( judged );
+    ASSERT_EQ( 1, unrelatedRetried );                                 // r1 (sol r5 B1): the literal row ran, was accounted, and was retried
     ASSERT_TRUE( sentOk );
     ASSERT_EQ( 1, foreign.calls );
     ASSERT_TRUE( slept == PlaybackDueWake::RunnerSleep::Slept );
@@ -3279,6 +3329,63 @@ std::string r17A1DispatchRecordGap( const std::vector<double> &stampsS, const st
     }
     return std::string();
 }
+
+// CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1 (sol r5 B2): ONE sample's record, THEN its length, in that order. r5 judged the
+// length first, on stamps.back() - stamps.front(), so a sample whose return read was lost (stamps [0, 8.1, 59] ms, one span
+// [8.1, 59], count 1, a real 80 ms sleep) failed the 64 ms floor as a "short sleep" and never reached R17A1_DISPATCH_RECORD_LOST.
+// Now: a sample that proves a dispatch ran is accounted first (r17A1DispatchRecordGap); any caller-clock record that is not whole
+// (stamps != 2 + 2 * spans, proven or not) is a lost read, typed as such; the length is read off the caller clock only from a
+// whole record (its first and last reads are the entry and the return), and from the test's own bracket when there are no reads.
+// Returns { tag, detail }; an empty tag means the record is whole and the sleep ran at least floorMs.
+struct R17A1SampleJudgement
+{
+    std::string tag;
+    std::string detail;
+};
+R17A1SampleJudgement r17A1JudgeRecordThenLength( const std::vector<double> &stampsS, const std::vector<std::pair<double, double>> &spansS,
+                                                 const std::vector<std::pair<double, double>> &handlerReadsMs, size_t countedDispatches,
+                                                 bool dispatchProven, double bracketMs, double floorMs )
+{
+    if( dispatchProven )
+    {
+        const std::string gap = r17A1DispatchRecordGap( stampsS, spansS, handlerReadsMs, countedDispatches );
+        if( !gap.empty() ) return { "R17A1_DISPATCH_RECORD_LOST", gap };
+    }
+    if( !stampsS.empty() && stampsS.size() != 2 + 2 * spansS.size() )
+        return { "R17A1_DISPATCH_RECORD_LOST", "stamps=" + std::to_string( stampsS.size() ) + " spans=" + std::to_string( spansS.size() )
+                                                   + " (expected stamps=2+2*spans; a lost read is never a short sleep)" };
+    const bool callerClock = !stampsS.empty();
+    const double lengthMs = callerClock ? ( stampsS.back() - stampsS.front() ) * 1000.0 : bracketMs;
+    if( !( lengthMs >= floorMs ) )
+        return { "R17A1_SLEEP_SHORT", "length_ms=" + std::to_string( lengthMs ) + " floor_ms=" + std::to_string( floorMs )
+                                          + ( callerClock ? " (entry to return on the caller clock)" : " (the test's own bracket)" ) };
+    return {};
+}
+}
+
+TEST(PlaybackDueWakeSend, R17A1_ALostReadIsARecordLossNeverAShortSleep)
+{
+    // CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1, sol r5 B2's literal row: a real 80 ms sleep, the recorded dispatch [8.1, 59] ms,
+    // the present's handler [20, 22] ms, count 1, caller stamps [0, 8.1, 59] ms with the return read missing. Expected
+    // R17A1_DISPATCH_RECORD_LOST; r5's order read 59 ms as the sleep's length and failed the 64 ms floor first.
+    using Reads = std::vector<std::pair<double, double>>;
+    const double floorMs = dueWakeSleepFloorMs( 80.0 );
+    const Reads heldReads { { 20.0, 22.0 } };
+    const R17A1SampleJudgement lostReturn = r17A1JudgeRecordThenLength( { 0.0, 0.0081, 0.059 }, { { 0.0081, 0.059 } }, heldReads, 1, true, 80.0, floorMs );
+    ASSERT_EQ( std::string( "R17A1_DISPATCH_RECORD_LOST" ), lostReturn.tag );
+    // the healthy record of the same sleep, and a whole record of a sleep that really was short
+    ASSERT_TRUE( r17A1JudgeRecordThenLength( { 0.0, 0.0081, 0.059, 0.080 }, { { 0.0081, 0.059 } }, heldReads, 1, true, 80.0, floorMs ).tag.empty() );
+    ASSERT_EQ( std::string( "R17A1_SLEEP_SHORT" ),
+               r17A1JudgeRecordThenLength( { 0.0, 0.0081, 0.059, 0.060 }, { { 0.0081, 0.059 } }, heldReads, 1, true, 80.0, floorMs ).tag );
+    // the same loss on a sample with no dispatch witnessed (entry read only): still a lost read, never a short sleep
+    ASSERT_EQ( std::string( "R17A1_DISPATCH_RECORD_LOST" ), r17A1JudgeRecordThenLength( { 0.0 }, {}, {}, 0, false, 80.0, floorMs ).tag );
+    // [entry, return] of a sleep that dispatched nothing; and no caller-clock reads at all, judged on the test's own bracket
+    ASSERT_TRUE( r17A1JudgeRecordThenLength( { 0.0, 0.080 }, {}, {}, 0, false, 80.0, floorMs ).tag.empty() );
+    ASSERT_TRUE( r17A1JudgeRecordThenLength( {}, {}, {}, 0, false, 80.0, floorMs ).tag.empty() );
+    ASSERT_EQ( std::string( "R17A1_SLEEP_SHORT" ), r17A1JudgeRecordThenLength( {}, {}, {}, 0, false, 20.0, floorMs ).tag );
+    // the record is judged before the length even when both fail: spans [] after a proven dispatch, and the sleep short too
+    ASSERT_EQ( std::string( "R17A1_DISPATCH_RECORD_LOST" ),
+               r17A1JudgeRecordThenLength( { 0.0, 0.0081, 0.059, 0.060 }, {}, heldReads, 1, true, 60.0, floorMs ).tag );
 }
 
 TEST(PlaybackDueWakeSend, R17A1_ADispatchThatRanIsAccountedBeforeAnyAdmissionMayDiscardIt)
@@ -3652,14 +3759,13 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         sentOk = sent.load();
         spans = wake.lastRunnerSleepDispatchSpansS();
         stamps = g_r17A1Stamps;
-        // r5 class sweep (adversary pass 11 A4): EVERY sample's length is judged on the caller clock before any retry gate, not only
-        // the landed one's: with the seam off the exit record is None / -1 and judges nothing, so a short sleep retried away hid
-        if( stamps.size() >= 2 ) ASSERT_TRUE( ( stamps.back() - stamps.front() ) * 1000.0 >= dueWakeSleepFloorMs( 80.0 ) );
-        else ASSERT_TRUE( returnedMs - enteredMs >= dueWakeSleepFloorMs( 80.0 ) );   // no caller-clock reads: the test's own bracket
         // r5 RED seam (sol r4 B1's literal rows, replayable on the exact head with no rebuild): MLV_R17A1_RED_DROP_RECORD=held drops
         // the one-span row's span record on its first held one-span attempt (stamps [entry, begin, end, return], spans []), =stray
         // drops the stray row's own stray span (all six stamps kept). It only ever REMOVES a record, so set it can only fail the
         // row (R17A1_DISPATCH_RECORD_LOST below), never pass one; unset, nothing changes.
+        // CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1 (sol r5 B2): =return drops the RETURN read of that same held one-span
+        // attempt (stamps [entry, begin, end], the span kept): sol r5 B2's literal row. It runs before the record and the length are
+        // judged, so it replays the order r5 got wrong (r5 read the held dispatch's end as the sleep's return: a "short sleep")
         if( !redDropped )
         {
             const char *redDrop = std::getenv( "MLV_R17A1_RED_DROP_RECORD" );
@@ -3667,6 +3773,11 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
             if( redMode == "held" && oneSpanRow && handlerRan && pauseHeld && spans.size() == 1 && stamps.size() == 4 )
             {
                 spans.clear();
+                redDropped = true;
+            }
+            if( redMode == "return" && oneSpanRow && handlerRan && pauseHeld && spans.size() == 1 && stamps.size() == 4 )
+            {
+                stamps.pop_back();
                 redDropped = true;
             }
             if( redMode == "stray" && strayRow && strayRan && pauseHeld )
@@ -3686,9 +3797,19 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
         // spans [], or the stray's own span omitted), and a clean retry passed the row. Admission may skip only an attempt that
         // proves no dispatch ran, or one whose record is whole. The landed attempt is judged in full again after the loop.
         // pass 9 A1: the product's own count of the dispatches proves one too (an uninstrumented dispatch has no fixture witness)
+        // r5 class sweep (adversary pass 11 A4): EVERY sample's length is judged before any retry gate, not only the landed one's:
+        // with the seam off the exit record is None / -1 and judges nothing, so a short sleep retried away hid.
+        // CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1 (sol r5 B2): and the length is judged AFTER the record, by
+        // r17A1JudgeRecordThenLength: r5 read stamps.back() - stamps.front() first, so a lost return read (stamps [0, 8.1, 59])
+        // failed as a 59 ms "short sleep" before the record check could name it. The length is read on the caller clock only
+        // off a whole record; a record that is not whole is a lost read (R17A1_DISPATCH_RECORD_LOST), proven dispatch or not.
+        // RED seam MLV_R17A1_RED_R5_ORDER=1 (test only): replays r5's length-first read on this head, so sol r5 B2's row
+        // (MLV_R17A1_RED_DROP_RECORD=return) shows its r5 failure. It only ADDS a check ahead of the judgement, so set it can only
+        // fail a row, never pass one; unset, nothing changes.
+        if( dueWakeRedR5Order() && stamps.size() >= 2 )
+            ASSERT_TRUE( ( stamps.back() - stamps.front() ) * 1000.0 >= dueWakeSleepFloorMs( 80.0 ) );
         const bool dispatchProven = handlerRan || nullRan || strayRan || ranProbes != 0u || stamps.size() > 2 || !spans.empty()
                                     || countedDispatches != 0;
-        if( dispatchProven )
         {
             std::vector<std::pair<double, double>> ranReadsMs;
             if( handlerRan ) ranReadsMs.emplace_back( handlerStartMs, handlerEndMs );   // pass 9 A6: the whole handler, in one span
@@ -3696,10 +3817,11 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
             if( strayRan ) ranReadsMs.emplace_back( strayRunMs, strayRunMs );
             for( int i = 0; i < kR17A1MaxProbes; ++i )
                 if( ( ranProbes & ( 1u << static_cast<unsigned>( i ) ) ) != 0u ) ranReadsMs.emplace_back( probeRunMs[i], probeRunMs[i] );
-            const std::string recordGap = r17A1DispatchRecordGap( stamps, spans, ranReadsMs, countedDispatches );
-            if( !recordGap.empty() )
+            const R17A1SampleJudgement judged = r17A1JudgeRecordThenLength( stamps, spans, ranReadsMs, countedDispatches, dispatchProven,
+                                                                            returnedMs - enteredMs, dueWakeSleepFloorMs( 80.0 ) );
+            if( !judged.tag.empty() )
             {
-                ::minitest::fail( __FILE__, __LINE__, "R17A1_DISPATCH_RECORD_LOST", "attempt=" + std::to_string( attempt ) + " " + recordGap );
+                ::minitest::fail( __FILE__, __LINE__, judged.tag, "attempt=" + std::to_string( attempt ) + " " + judged.detail );
                 return;
             }
         }
