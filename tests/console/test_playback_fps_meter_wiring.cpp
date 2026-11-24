@@ -7,6 +7,7 @@
 #include "../common/repo_paths.h"
 
 #include <QFile>
+#include <QRegularExpression>
 #include <QString>
 #include <QTextStream>
 
@@ -44,20 +45,20 @@ TEST(PlaybackFpsMeterWiring, FpsMeterMeasuresDrawToDrawAndIdleTicksDoNotRestartI
 {
     const QString body = timerFrameEventBody();
     ASSERT_FALSE(body.isEmpty());
-    ASSERT_TRUE(body.contains(QStringLiteral("static QTime lastDrawTime;")));
+    ASSERT_TRUE(body.contains(QStringLiteral("static QElapsedTimer lastDrawTime;")));
     ASSERT_TRUE(body.contains(QStringLiteral(
-        "const int measuredFrameMs = lastDrawTime.isValid() ? lastDrawTime.msecsTo( nowTime ) : 0;")));
+        "const int measuredFrameMs = playback_fps_meter::stampAgeMs( lastDrawTime, nowTime );")));
     ASSERT_TRUE(body.contains(QStringLiteral("playback_fps_meter::smoothedFrameMs(")));
     // the old measurement off the idle-re-armed lastTime is gone
     ASSERT_FALSE(body.contains(QStringLiteral("const int measuredFrameMs = lastTime.msecsTo( nowTime );")));
     // the reset policy lives in one pure function, called with the real play state and draw age
     // (exact text: a `true ||` or dropped operand cannot slip through)
-    const int lambdaAt = body.indexOf(QStringLiteral("const auto resetFpsMeterIfIdle = [this]( const QTime & now )"));
+    const int lambdaAt = body.indexOf(QStringLiteral("const auto resetFpsMeterIfIdle = [this]( const QElapsedTimer & now )"));
     ASSERT_TRUE(lambdaAt >= 0);
     const QString lambda = body.mid(lambdaAt);
     const int policyAt = lambda.indexOf(QStringLiteral(
         "playback_fps_meter::fpsMeterShouldReset( ui->actionPlay->isChecked(), hasDraw,\n"
-        "                                                     hasDraw ? lastDrawTime.msecsTo( now ) : 0 )"));
+        "                                                     hasDraw ? playback_fps_meter::stampAgeMs( lastDrawTime, now ) : 0 )"));
     const int zeroAt = lambda.indexOf(QStringLiteral("m_playbackFpsEmaFrameMs = 0.0;"));
     ASSERT_TRUE(policyAt >= 0);
     ASSERT_TRUE(zeroAt > policyAt); // the reset sits inside the guarded block, not before it
@@ -79,7 +80,7 @@ TEST(PlaybackFpsMeterWiring, FpsMeterResetRunsOnTheStillDrawingEarlyReturnPath)
     ASSERT_TRUE(busyAt >= 0);
     ASSERT_TRUE(busyEnd > busyAt);
     const QString busy = body.mid(busyAt, busyEnd - busyAt);
-    const int callAt = busy.indexOf(QStringLiteral("resetFpsMeterIfIdle( QTime::currentTime() );"));
+    const int callAt = busy.indexOf(QStringLiteral("resetFpsMeterIfIdle( mlvappMonotonicNow() );"));
     const int firstReturnAt = busy.indexOf(QStringLiteral("return;"));
     ASSERT_TRUE(callAt >= 0);
     ASSERT_TRUE(firstReturnAt > callAt); // evaluated before either early return
@@ -87,4 +88,31 @@ TEST(PlaybackFpsMeterWiring, FpsMeterResetRunsOnTheStillDrawingEarlyReturnPath)
     const int idleAt = body.indexOf(QStringLiteral("timer_frame.idle"));
     ASSERT_TRUE(idleAt >= 0);
     ASSERT_TRUE(body.mid(idleAt).contains(QStringLiteral("resetFpsMeterIfIdle( nowTime );")));
+}
+
+// PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1: the meter, stall and drop-frame tick ages were taken off the wall
+// clock (time of day, msecsTo kept inside +-86,400,000 ms). Across midnight an age read about -86,399,970,
+// across a DST end about -3,600,000: the status fps froze, a stall never zeroed it, and the unpaced
+// automation path asked for about -2 M frames. Every age now comes off a monotonic QElapsedTimer stamp
+// through playback_fps_meter::stampAgeMs (0 for a never-started stamp, saturated to int).
+TEST(PlaybackFpsMeterWiring, MeterAndTickClocksAreMonotonic)
+{
+    const QString body = timerFrameEventBody();
+    ASSERT_FALSE(body.isEmpty());
+    ASSERT_FALSE(body.contains(QRegularExpression(QStringLiteral("\\bQTime\\b"))));
+    ASSERT_TRUE(body.contains(QStringLiteral("static QElapsedTimer lastTime;")));
+    ASSERT_TRUE(body.contains(QStringLiteral("static QElapsedTimer lastDrawTime;")));
+    ASSERT_FALSE(body.contains(QStringLiteral(".msecsTo(")));
+    ASSERT_TRUE(body.contains(QStringLiteral("playback_fps_meter::stampAgeMs( lastTime, nowTime )")));
+    ASSERT_TRUE(body.contains(QStringLiteral("playback_fps_meter::stampAgeMs( lastDrawTime, nowTime )")));
+    ASSERT_TRUE(body.contains(QStringLiteral("playback_fps_meter::stampAgeMs( lastDrawTime, now )")));
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "playback_fps_meter::stampAgeMs( m_lastPlaybackFpsStatusUpdateTime, nowTime ) >= 250")));
+    // the tick and the busy-path reset read the monotonic clock, never the time of day
+    ASSERT_TRUE(body.contains(QStringLiteral("QElapsedTimer nowTime = mlvappMonotonicNow();")));
+    ASSERT_TRUE(body.contains(QStringLiteral("lastTime.start();")));
+
+    const QString header = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
+    ASSERT_TRUE(header.contains(QStringLiteral("QElapsedTimer m_lastPlaybackFpsStatusUpdateTime;")));
+    ASSERT_FALSE(header.contains(QStringLiteral("QTime m_lastPlaybackFpsStatusUpdateTime;")));
 }

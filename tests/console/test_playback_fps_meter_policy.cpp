@@ -2,6 +2,8 @@
 
 #include "../../platform/qt/PlaybackFpsMeterPolicy.h"
 
+#include <QTime>
+
 #include <cmath>
 
 using playback_fps_meter::fpsMeterShouldReset;
@@ -58,4 +60,26 @@ TEST(PlaybackFpsMeterPolicy, ResetsWhenPausedBeforeAnyDrawOrStalledButNotBetween
     // the sol r1 repro: label at 24 fps, a render stays busy 900 ms -> stale, must reset
     ASSERT_TRUE(fpsMeterShouldReset(true, true, 900));
     ASSERT_TRUE(fpsMeterShouldReset(true, true, kFpsMeterStallMs + 1));
+}
+
+// ---- PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1: CHARACTERIZATION of the wall clock the meter used to read ----
+// These rows pin what a time-of-day stamp does at the three gates (stall check, EMA sample, 250 ms status
+// throttle). They pass on both trees: they document the defect, the wiring row forbids the clock.
+
+TEST(PlaybackFpsMeterPolicy, CharacterizationWallClockAcrossMidnightFreezesAllThreeGates)
+{
+    const int age = QTime(23, 59, 59, 990).msecsTo(QTime(0, 0, 0, 20)); // 30 ms of real time
+    ASSERT_EQ(-86399970, age);
+    ASSERT_FALSE(fpsMeterShouldReset(true, true, age)); // a stall is never seen
+    ASSERT_EQ(42.0, smoothedFrameMs(42.0, age));        // the sample is dropped
+    ASSERT_FALSE(age >= 250);                           // the status text never refreshes
+}
+
+TEST(PlaybackFpsMeterPolicy, CharacterizationWallClockAcrossADstEndFreezesAllThreeGates)
+{
+    const int age = QTime(2, 0, 0, 10).msecsTo(QTime(1, 0, 0, 50)); // 40 ms of real time, clock set back 1 h
+    ASSERT_EQ(-3599960, age);
+    ASSERT_FALSE(fpsMeterShouldReset(true, true, age));
+    ASSERT_EQ(42.0, smoothedFrameMs(42.0, age));
+    ASSERT_FALSE(age >= 250);
 }
