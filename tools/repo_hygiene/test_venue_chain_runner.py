@@ -123,21 +123,32 @@ $me = Get-Process -Id $PID
 @{ state = 'running'; containment = @{ runnerPid = $PID; runnerCreatedUtc = $me.StartTime.ToUniversalTime().ToString('o') } } | ConvertTo-Json | Set-Content (Join-Path $lane 'opus-001.receipt.json')
 Set-Content (Join-Path $Root "$Self.started") 'x'
 while (@(Get-ChildItem $Root -Filter '*.started').Count -lt 2) { Start-Sleep -Milliseconds 200 }
+$peer = @(Get-ChildItem $Root -Filter '*.started' | Where-Object { $_.BaseName -ne $Self })[0].BaseName
+# DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r1 T1: the fixture's own peer is its ground truth. A scan that throws is SCAN_FAILED and one that answers without the peer while the
+# peer's .started marker stands and its .ended marker is absent is SCAN_INCOMPLETE: both count as blocked, never as "no other chain" (a loaded host's empty CIM answer read as one)
 function Other-Chains {
-    @(Get-CimInstance Win32_Process -Filter "Name='pwsh.exe' OR Name='powershell.exe'" -ErrorAction SilentlyContinue | Where-Object {
+    try { $all = @(Get-CimInstance Win32_Process -Filter "Name='pwsh.exe' OR Name='powershell.exe'" -ErrorAction Stop) } catch { return [pscustomobject]@{ failed = ($_.Exception.Message -replace '\s+', ' '); rows = @() } }
+    [pscustomobject]@{ failed = $null; rows = @($all | Where-Object {
         $c = [string]$_.CommandLine
         $c -and $c.Contains($Root) -and $c -notmatch [regex]::Escape($Self) -and
         ($c -match '\\fleet-runs\\[^"]*\\(chain[^\\"]*|leg[^\\"]*|run-leg[^\\"]*)\.ps1' -or $c -match 'Invoke-VenueLeg\.ps1')
-    })
+    }) }
 }
-$t0 = Get-Date
-while (((Get-Date) - $t0).TotalSeconds -lt $MaxSec) {
-    $o = Other-Chains
-    if ($o.Count -gt 0) { "OTHER_CHAIN_LIVE " + (($o | ForEach-Object { "pid=$($_.ProcessId)" }) -join ' '); Start-Sleep -Seconds 1; continue }
-    'LEG_RAN'; exit 0
-}
-"OLD_RULE_TIMEOUT blockedSec=$([int]((Get-Date) - $t0).TotalSeconds)"
-exit 9
+try {
+    $t0 = Get-Date
+    while (((Get-Date) - $t0).TotalSeconds -lt $MaxSec) {
+        $o = Other-Chains
+        if ($o.failed) { "SCAN_FAILED $($o.failed)"; Start-Sleep -Seconds 1; continue }
+        if ($o.rows.Count -gt 0) { "OTHER_CHAIN_LIVE " + (($o.rows | ForEach-Object { "pid=$($_.ProcessId)" }) -join ' '); Start-Sleep -Seconds 1; continue }
+        if ((Test-Path (Join-Path $Root "$peer.started")) -and -not (Test-Path (Join-Path $Root "$peer.ended"))) { "SCAN_INCOMPLETE peer=$peer (its .started stands, no .ended)"; Start-Sleep -Seconds 1; continue }
+        'LEG_RAN'; exit 0
+    }
+    "OLD_RULE_TIMEOUT blockedSec=$([int]((Get-Date) - $t0).TotalSeconds)"
+    # each waiter stays alive until its peer's window ended too, so neither window outlasts the other's process
+    Set-Content (Join-Path $Root "$Self.done") 'x'
+    $w = Get-Date; while (-not (Test-Path (Join-Path $Root "$peer.done")) -and ((Get-Date) - $w).TotalSeconds -lt 30) { Start-Sleep -Milliseconds 200 }
+    exit 9
+} finally { Set-Content (Join-Path $Root "$Self.ended") 'x' }
 """
 
 # B = BACKLOG-1 r1c quiet.ps1:19-49 (Test-AliveAt + Get-LaneScan) and 65-76: wait while any OTHER live lane (receipt state=running, pid alive at its
@@ -171,14 +182,19 @@ function Get-LaneScan {
     }
     $rows
 }
-$t0 = Get-Date
-while (((Get-Date) - $t0).TotalSeconds -lt $MaxSec) {
-    $lb = @(Get-LaneScan | Where-Object blocking).Count
-    if ($lb -gt 0) { "LANES blocking=$lb"; Start-Sleep -Seconds 1; continue }
-    'LEG_RAN'; exit 0
-}
-"OLD_RULE_TIMEOUT blockedSec=$([int]((Get-Date) - $t0).TotalSeconds)"
-exit 9
+$peer = @(Get-ChildItem $Root -Filter '*.started' | Where-Object { $_.BaseName -ne $Self })[0].BaseName
+try {
+    $t0 = Get-Date
+    while (((Get-Date) - $t0).TotalSeconds -lt $MaxSec) {
+        $lb = @(Get-LaneScan | Where-Object blocking).Count
+        if ($lb -gt 0) { "LANES blocking=$lb"; Start-Sleep -Seconds 1; continue }
+        'LEG_RAN'; exit 0
+    }
+    "OLD_RULE_TIMEOUT blockedSec=$([int]((Get-Date) - $t0).TotalSeconds)"
+    Set-Content (Join-Path $Root "$Self.done") 'x'
+    $w = Get-Date; while (-not (Test-Path (Join-Path $Root "$peer.done")) -and ((Get-Date) - $w).TotalSeconds -lt 30) { Start-Sleep -Milliseconds 200 }
+    exit 9
+} finally { Set-Content (Join-Path $Root "$Self.ended") 'x' }   # T1: the peer's ground truth that this waiter is gone
 """
 
 
