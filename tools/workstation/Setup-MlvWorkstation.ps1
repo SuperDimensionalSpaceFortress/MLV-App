@@ -378,14 +378,26 @@ function Invoke-Native {
         $psi = [System.Diagnostics.ProcessStartInfo]::new($Exe)
         foreach ($a in @($Arguments)) { $psi.ArgumentList.Add($a) }
         $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
-        $child = [System.Diagnostics.Process]::Start($psi)
+        # r7 (sol r6 T-01): started through the same trace scrubber as the unbounded launch, so a GIT_TRACE* destination the parent holds is not inherited (the child may run git)
+        $child = Invoke-GitTraceScrubbed { [System.Diagnostics.Process]::Start($psi) }
         try {
             $outTask = $child.StandardOutput.ReadToEndAsync(); $errTask = $child.StandardError.ReadToEndAsync()
             if (-not $child.WaitForExit([int][Math]::Min([long]$TimeoutSec * 1000, [long][int]::MaxValue))) {   # clamped: the wait takes an Int32 of milliseconds (adversary pass 2 A11)
-                try { $child.Kill($true) } catch { }
-                throw "$Exe did not finish within $TimeoutSec s (it was stopped)"
+                # r7 (sol r6 F-02): the kill is checked, not assumed. A kill that threw, or a child still alive after a short wait, is reported as not stopped.
+                $killWhy = ''
+                try { if ($script:NativeKillHook) { & $script:NativeKillHook $child } else { $child.Kill($true) } } catch { $killWhy = $_.Exception.Message }
+                $stopWait = $(if ($script:NativeStopWaitSec) { [int]$script:NativeStopWaitSec } else { 10 })
+                $stopped = $false
+                try { $stopped = $child.WaitForExit($stopWait * 1000) } catch { $stopped = $false }
+                if ($stopped) { throw "$Exe did not finish within $TimeoutSec s (it was stopped)" }
+                throw "$Exe did not finish within $TimeoutSec s and could NOT be stopped (it may still be running$(if ($killWhy) { "; the kill failed: $killWhy" }))"
             }
             $child.WaitForExit()
+            # r7 (sol r6 F-02): the child has exited, but a descendant it started can keep the output pipes open; the read of them has its own bound (30 s) instead of waiting for ever
+            $grace = $(if ($script:NativeOutputGraceSec) { [int]$script:NativeOutputGraceSec } else { 30 })
+            if (-not [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($outTask, $errTask), $grace * 1000)) {
+                throw "$Exe exited but its output was still open after $grace s (a process it started may hold the pipe); the output was not collected"
+            }
             $out = @(($outTask.Result + $errTask.Result) -split "\r?\n")
             $code = $child.ExitCode
         } finally { $child.Dispose() }
@@ -2663,8 +2675,23 @@ function Get-ArchiveCredentialHits {
 
 # p5 A9: a private copy of a bundle FOLDER. Import scans and then copies; between the two a writer could swap the file, so both work from this
 # snapshot, which only this run can write to. Returns the snapshot path.
+# IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 r7 (sol r6 blocker): the name of a staging folder (the bundle expansion, the import snapshot) that NO earlier attempt of this run has touched. The stamp
+# is shared by every phase of one run, so a second phase (or a retry after a failure) used to reuse the first attempt's folder, and tar / robocopy /E ADD to a folder: a file a failed attempt had
+# left there (a partly written CLAUDE.md) stayed and was copied over the host. A folder that already exists is never reused and never deleted here (the removal can itself be denied): the next
+# free name (<base>.2, .3, ...) is taken. Returns $null when none of the 99 names is free (the caller fails typed). A dangling link at a name counts as taken.
+function Get-FreshImportStagingPath {
+    param([string]$Base)
+    foreach ($n in 1..99) {
+        $c = $(if ($n -eq 1) { $Base } else { "$Base.$n" })
+        if ($null -eq (Get-Item -LiteralPath $c -Force -ErrorAction SilentlyContinue)) { return $c }
+    }
+    return $null
+}
+
 function New-ImportSnapshot {
     param([string]$From, [string]$To)
+    # r7: the snapshot is built in a folder this call creates; one that already exists holds files of an earlier attempt, which /E would keep
+    if ([IO.Directory]::Exists($To) -or [IO.File]::Exists($To)) { throw "the snapshot folder $To already exists (it may hold files of an earlier attempt)" }
     [void][IO.Directory]::CreateDirectory($To)
     Invoke-Robocopy $From $To @() @('/E', '/COPY:DAT')
     return $To
@@ -3499,6 +3526,7 @@ function Invoke-ImportRobocopy {
 }
 
 $script:ImportSkippedDest = [System.Collections.Generic.List[string]]::new()
+$script:NativeKillHook = $null; $script:NativeStopWaitSec = $null; $script:NativeOutputGraceSec = $null   # r7: test seams of Invoke-Native -TimeoutSec (a kill that fails; the waits after it); unset = the real behaviour
 $script:ImportExpandDone = $false     # r6: set by the 'Expand' step itself, once tar ended without a failure (Invoke-PhaseImport)
 $script:ImportSnapshotDone = $false   # r6: set by the 'Snapshot' step itself, once the snapshot was made completely
 $script:ImportBackupLastWhy = ''      # r6: the cause Copy-CleanBackupFile recorded for its last failure (named in IMPORT_BACKUP_FAILED)
@@ -3759,16 +3787,20 @@ function Invoke-PhaseImport {
     }
     $src = $BundlePath
     if ((Get-Item -LiteralPath $BundlePath).PSIsContainer -eq $false) {
-        $src = Join-Path $MlvTmp "migrate-in\bundle-$stamp"
+        # r7 (sol r6 blocker): a folder no earlier attempt of this run touched (the stamp is shared by every phase, and tar ADDS to a folder: a partly written file of a failed first expansion stayed
+        # and was copied over the host after a second, valid expansion that does not contain it). A name that cannot be found is the typed failure below, not a reuse.
+        $src = Get-FreshImportStagingPath (Join-Path $MlvTmp "migrate-in\bundle-$stamp")
         # r6 (adversary pass 2 A1): the expansion counts as done only when THIS step ran it to its end (a flag the step itself sets). A failure count (a step that failed) and a folder that exists
         # (left by an earlier, failed phase of the same run, which shares the stamp) are not proof: a declined step adds no failure and leaves that folder to be read as this run's expansion.
         $script:ImportExpandDone = $false
-        Invoke-Step "Expand $BundlePath to $src" {
+        if ($src) { Invoke-Step "Expand $BundlePath to $src" {
+            # r7: this step creates the folder; one that appeared since the name was chosen is not entered
+            if ([IO.Directory]::Exists($src) -or [IO.File]::Exists($src)) { throw "the expansion folder $src already exists (it may hold files of an earlier attempt)" }
             [void][IO.Directory]::CreateDirectory($src)
             # r6 (sol r5, hardening): bounded (15 min): a read that stalls inside tar fails the step, and the typed IMPORT_BUNDLE_EXPAND_FAILED below follows, instead of waiting for ever
             [void](Invoke-Native -Exe (Join-Path $env:SystemRoot 'System32\tar.exe') -Arguments @('-x', '-f', $BundlePath, '-C', $src) -TimeoutSec 900)
             $script:ImportExpandDone = $true
-        }
+        } }
         # IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1: tar exits non-zero on a truncated or damaged zip AFTER leaving partly written files in the expanded folder; nothing of such a
         # bundle is snapshotted or copied (the run fails, exit 1). A -WhatIf preview expands nothing and never records a failure.
         if (-not $WhatIfPreference -and -not $script:ImportExpandDone) {
@@ -3782,16 +3814,17 @@ function Invoke-PhaseImport {
     # whatever happens to the bundle folder in between. Removed again after the copy.
     $importSnapshot = $null
     if (-not $WhatIfPreference) {
-        $importSnapshot = Join-Path $StateRoot "import-snapshot-$stamp"
+        # r7 (sol r6 blocker): a fresh folder too, for the same reason (robocopy /E never removes a file an earlier snapshot attempt left, and its removal can have been denied)
+        $importSnapshot = Get-FreshImportStagingPath (Join-Path $StateRoot "import-snapshot-$stamp")
         # r6 (sol r5 B5): a snapshot is COMPLETE only when its step ended without a failure. Robocopy exits 8 after leaving part of the tree in the folder, and the folder's presence used to be the
         # whole test, so a partial snapshot fed every copy below. A failed step is the typed IMPORT_SNAPSHOT_FAILED, the partial folder is removed, and nothing is imported.
         # r6 (adversary pass 2 A1): complete means THIS step ran New-ImportSnapshot to its end (a flag the step sets): a declined step adds no failure, and a folder of the snapshot's name left by an
         # earlier phase of the same run (the stamp is shared) is not this run's snapshot.
         $script:ImportSnapshotDone = $false
-        Invoke-Step "Snapshot the bundle to $importSnapshot (the scan and the copy read the same bytes)" { [void](New-ImportSnapshot -From $src -To $importSnapshot); $script:ImportSnapshotDone = $true }
+        if ($importSnapshot) { Invoke-Step "Snapshot the bundle to $importSnapshot (the scan and the copy read the same bytes)" { [void](New-ImportSnapshot -From $src -To $importSnapshot); $script:ImportSnapshotDone = $true } }
         if (-not $script:ImportSnapshotDone -or -not (Test-Path -LiteralPath $importSnapshot -PathType Container)) {
             Add-TypedFailure -Failure 'IMPORT_SNAPSHOT_FAILED' -Line 'IMPORT_SNAPSHOT_FAILED the bundle snapshot could not be made completely; nothing was imported'
-            if (Test-Path -LiteralPath $importSnapshot) { try { Remove-Item -LiteralPath $importSnapshot -Recurse -Force -ErrorAction Stop } catch { Write-LogSafe "could not remove the partial import snapshot $importSnapshot : $($_.Exception.Message)" 'WARN' } }
+            if ($importSnapshot -and (Test-Path -LiteralPath $importSnapshot)) { try { Remove-Item -LiteralPath $importSnapshot -Recurse -Force -ErrorAction Stop } catch { Write-LogSafe "could not remove the partial import snapshot $importSnapshot : $($_.Exception.Message)" 'WARN' } }
             return
         }
         $src = $importSnapshot

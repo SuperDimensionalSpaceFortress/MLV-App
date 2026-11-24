@@ -129,7 +129,13 @@ run for a dry run. The new-machine phases refuse to run on VIRTUAL-TEN unless yo
    its line is logged, and every log line of the Import phase is written through a guard, so a log that
    cannot be written never hides the cause or stops the copy. A backup is never overwritten: a second Import
    phase of the same run (`-Phase Import,Import`) writes its backup of a file beside the first phase's as
-   `<name>.2`, so the original host bytes stay recoverable.
+   `<name>.2`, so the original host bytes stay recoverable. Each expansion and each snapshot is made in a
+   folder no earlier attempt of the run touched (`bundle-<stamp>`, then `bundle-<stamp>.2` and so on; the
+   same for `import-snapshot-<stamp>`): a file a failed attempt left behind is never read by the next one,
+   so it can never replace a host file. An expansion folder (it is never removed by the script) and a snapshot
+   folder whose removal was denied stay on disk; remove them by hand when you no longer need them. A native command run with a time bound is started
+   without any `GIT_TRACE*` variable, is reported as `could NOT be stopped` when the kill fails, and its
+   output is collected for at most 30 s after it exits.
 
    **Remote URLs and git tracing (r17).** Every line the script prints or logs redacts a URL's user part
    up to the last `@` before the host, so an unencoded `@` in a password leaks nothing. It also drops

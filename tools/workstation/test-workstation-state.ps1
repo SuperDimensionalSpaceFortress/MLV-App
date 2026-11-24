@@ -4476,6 +4476,91 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r6 import backup')) {
     $script:Failures.Clear()
 }
 
+# ================================================================ IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 r7: a staging folder is FRESH for the attempt that reads it
+# Sol r6 (head 767e51b1): the r6 completion flags prove that the latest expansion / snapshot FINISHED, not that its folder holds only that attempt's files. -Phase Import,Import (or a
+# retry after a snapshot whose cleanup was denied) shares one stamp, so the folder name is the same: tar and robocopy /E add to it and never remove what a failed earlier attempt left,
+# and a partial CLAUDE.md from the failed attempt was copied over the good host file. Each attempt now reads a folder no earlier attempt of the run touched.
+# Hardening (same review): the bounded native launch scrubs GIT_TRACE*, says truthfully whether the child was stopped, and bounds its output collection.
+function New-R7Zip([string]$Path, $Entries) {
+    Add-Type -AssemblyName System.IO.Compression
+    $fs = [IO.File]::Create($Path)
+    try {
+        $za = [IO.Compression.ZipArchive]::new($fs, [IO.Compression.ZipArchiveMode]::Create, $true)
+        try {
+            foreach ($k in $Entries.Keys) {
+                $b = $Entries[$k]; $en = $za.CreateEntry($k, [IO.Compression.CompressionLevel]::NoCompression); $es = $en.Open(); try { $es.Write($b, 0, $b.Length) } finally { $es.Dispose() }
+            }
+        } finally { $za.Dispose() }
+    } finally { $fs.Dispose() }
+}
+if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r7 import staging')) {
+    $r7Typed = { param($r, $name) @($r.Failures | Where-Object { $_ -like "$name*" }).Count }
+    $r7Ascii = [Text.Encoding]::ASCII
+    $r7Manifest = $r7Ascii.GetBytes('mlv-migrate-bundle v1')
+    # (1) the repro of the review: phase 1 expands a ZIP truncated inside CLAUDE.md (tar leaves a partial member and exits non-zero); before phase 2 the ZIP is replaced by a valid bundle that omits CLAUDE.md
+    $script:R7Zip = Join-Path (New-Scratch 'r7a-zip') 'bundle.zip'; $script:R7Partial = -1; $script:R7Entries = $null
+    $r7Big = $r7Ascii.GetBytes(('plain instruction line for the claude home file' + "`n") * 8200)
+    $r7a = Invoke-R3Import 'r7a' -3 0 {
+        param($st, $sp)
+        New-R7Zip $script:R7Zip ([ordered]@{ 'MANIFEST.txt' = $r7Manifest; 'home-claude/CLAUDE.md' = $r7Big })
+        $all = [IO.File]::ReadAllBytes($script:R7Zip); $cut = [byte[]]::new([int]($all.Length * 0.6)); [Array]::Copy($all, $cut, $cut.Length); [IO.File]::WriteAllBytes($script:R7Zip, $cut)
+        $script:BundlePath = $script:R7Zip; Set-Variable -Name BundlePath -Scope 1 -Value $script:R7Zip
+    } $null {
+        $kept = Join-Path $script:MlvTmp "migrate-in\bundle-$($script:stamp)\home-claude\CLAUDE.md"
+        $script:R7Partial = $(if (Test-Path -LiteralPath $kept) { (Get-Item -LiteralPath $kept).Length } else { -1 })
+        New-R7Zip $script:R7Zip ([ordered]@{ 'MANIFEST.txt' = $r7Manifest; 'home-claude/other-note.txt' = $r7Ascii.GetBytes('only note') })
+        $null = (Invoke-PhaseImport *>&1 | Out-String)
+    }
+    Assert-That ($script:R7Partial -gt 0) 'r7 import precondition: the failed first expansion left a partial, non-empty CLAUDE.md in its folder' "partial length=$($script:R7Partial)"
+    Assert-That ($r7a.Host -ceq 'HOST-GOOD-CONTENT') 'r7 import (sol r6 blocker): a second phase that expands a valid bundle without CLAUDE.md never copies the partial CLAUDE.md the failed first expansion left (host byte-identical)' "hostLength=$($r7a.Host.Length) failures=$($r7a.Failures -join ',')"
+    Assert-That ((& $r7Typed $r7a 'IMPORT_BUNDLE_EXPAND_FAILED') -eq 1) 'r7 import: the failed first expansion stays the one typed failure of the run (exit 1)' ($r7a.Failures -join ',')
+    # (2) the retained folder as a fact (no tar involved): a folder of this run's expansion name already holds a newer CLAUDE.md the valid bundle lacks
+    $script:R7ZipB = Join-Path (New-Scratch 'r7b-zip') 'bundle.zip'
+    $r7b = Invoke-R3Import 'r7b' -3 0 {
+        param($st, $sp)
+        New-R7Zip $script:R7ZipB ([ordered]@{ 'MANIFEST.txt' = $r7Manifest; 'home-claude/other-note.txt' = $r7Ascii.GetBytes('only note') })
+        $script:BundlePath = $script:R7ZipB; Set-Variable -Name BundlePath -Scope 1 -Value $script:R7ZipB
+        $old = Join-Path $script:MlvTmp "migrate-in\bundle-$sp\home-claude"; [void][IO.Directory]::CreateDirectory($old)
+        [IO.File]::WriteAllText((Join-Path $old 'CLAUDE.md'), 'RETAINED-PARTIAL')
+    } $null $null
+    Assert-That ($r7b.Host -ceq 'HOST-GOOD-CONTENT' -and $r7b.Failures.Count -eq 0) 'r7 import: files an earlier attempt left in the expansion folder never reach the host (the valid bundle has no CLAUDE.md, so the host keeps its own, with no failure)' "host=[$($r7b.Host)] failures=$($r7b.Failures -join ',')`n$($r7b.Out)"
+    # (3) the sibling: the import snapshot's folder was left by a failed snapshot whose removal was denied; the retry's bundle lacks that member
+    $r7c = Invoke-R3Import 'r7c' -3 0 {
+        param($st, $sp)
+        Remove-Item -LiteralPath (Join-Path $script:BundlePath 'home-claude\CLAUDE.md') -Force
+        [IO.File]::WriteAllText((Join-Path $script:BundlePath 'home-claude\other-note.txt'), 'only note')
+        $old = Join-Path $st "import-snapshot-$sp\home-claude"; [void][IO.Directory]::CreateDirectory($old)
+        [IO.File]::WriteAllText((Join-Path $old 'CLAUDE.md'), 'RETAINED-SNAPSHOT'); [IO.File]::WriteAllText((Join-Path (Split-Path -Parent $old) 'MANIFEST.txt'), 'mlv-migrate-bundle v1')
+    } $null $null
+    Assert-That ($r7c.Host -ceq 'HOST-GOOD-CONTENT' -and $r7c.Failures.Count -eq 0) 'r7 import (sibling): a snapshot folder an earlier attempt left behind never supplies a member the bundle lacks (host keeps its own CLAUDE.md, no failure)' "host=[$($r7c.Host)] failures=$($r7c.Failures -join ',')`n$($r7c.Out)"
+    # control: with nothing left behind the newer bundle CLAUDE.md still replaces the older host file
+    $r7d = Invoke-R3Import 'r7d' -3 0 $null $null $null
+    Assert-That ($r7d.Host -ceq 'FROM-BUNDLE' -and $r7d.Failures.Count -eq 0) 'r7 import control: a clean run still applies the newer bundle CLAUDE.md' "host=[$($r7d.Host)] failures=$($r7d.Failures -join ',')"
+    $script:Failures.Clear()
+    # hardening T-01: the BOUNDED native launch hands the child no GIT_TRACE* variable (the unbounded launch already scrubs them), and restores the parent's value
+    $r7pw = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
+    $r7env = Join-Path (New-Scratch 'r7-env') 'child-env.txt'; $r7sv = $env:GIT_TRACE; $env:GIT_TRACE = 'C:\r7-trace-destination.log'
+    $r7eThrown = ''
+    try { [void](Invoke-Native -Exe $r7pw -Arguments @('-NoProfile', '-Command', "[IO.File]::WriteAllText('$r7env', [string]`$env:GIT_TRACE)") -TimeoutSec 60) } catch { $r7eThrown = $_.Exception.Message }
+    $r7after = $env:GIT_TRACE; $env:GIT_TRACE = $r7sv
+    $r7childSaw = $(if (Test-Path -LiteralPath $r7env) { [IO.File]::ReadAllText($r7env) } else { '<child did not run>' })
+    Assert-That ($r7childSaw -ceq '' -and $r7after -ceq 'C:\r7-trace-destination.log' -and -not $r7eThrown) 'r7 hardening (sol r6 T-01): a bounded native child inherits no GIT_TRACE* destination and the parent keeps its own value' "child=[$r7childSaw] parent=[$r7after] thrown=[$r7eThrown]"
+    # hardening F-02: a kill that fails must not be reported as 'it was stopped'
+    $script:NativeKillHook = { param($child) throw 'access denied (test)' }; $script:NativeStopWaitSec = 2
+    $r7fThrown = ''
+    try { [void](Invoke-Native -Exe $r7pw -Arguments @('-NoProfile', '-Command', 'Start-Sleep -Seconds 8') -TimeoutSec 2) } catch { $r7fThrown = $_.Exception.Message }
+    $script:NativeKillHook = $null; $script:NativeStopWaitSec = $null
+    Assert-That ($r7fThrown -match 'did not finish within 2' -and $r7fThrown -match 'could NOT be stopped' -and $r7fThrown -notmatch '\(it was stopped\)') 'r7 hardening (sol r6 F-02): a timeout whose kill failed says the child could not be stopped, not that it was' "thrown=[$r7fThrown]"
+    # hardening F-02: a child that exits while a descendant holds its output pipe does not hold the run for ever
+    $script:NativeOutputGraceSec = 3
+    $r7gThrown = ''; $r7gSw = [Diagnostics.Stopwatch]::StartNew()
+    $r7gCmd = '$p = [Diagnostics.ProcessStartInfo]::new("' + $r7pw + '"); $p.ArgumentList.Add("-NoProfile"); $p.ArgumentList.Add("-Command"); $p.ArgumentList.Add("Start-Sleep -Seconds 25"); $p.UseShellExecute = $false; [void][Diagnostics.Process]::Start($p); exit 0'
+    try { [void](Invoke-Native -Exe $r7pw -Arguments @('-NoProfile', '-Command', $r7gCmd) -TimeoutSec 60) } catch { $r7gThrown = $_.Exception.Message }
+    $r7gSec = [int]$r7gSw.Elapsed.TotalSeconds; $script:NativeOutputGraceSec = $null
+    Assert-That ($r7gThrown -match 'output' -and $r7gSec -lt 20) 'r7 hardening (sol r6 F-02): output collection is bounded once the child has exited (a descendant that keeps the pipe open fails the call)' "thrown=[$r7gThrown] seconds=$r7gSec"
+    $script:Failures.Clear()
+}
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 
