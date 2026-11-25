@@ -1338,6 +1338,141 @@ class Successor2Tests(unittest.TestCase):
                 self.assertEqual(pattern.findall(text), [], name)
                 self.assertIn("ConvertFrom-DvReceiptText", text, name)
 
+    # -- SUCCESSOR-3 r3 (sol r2 B1, B2; opus key3 r2 B1) ---------------------------------------------------------------------------------------------------------
+    def test_successor3_r3_sol_b1_a_dropped_venue_copy_is_judged_as_it_is_never_unwrapped(self) -> None:
+        """sol r2 B1: the A7 check on a venue copy the recovery dropped peeled one-element arrays, so a parse failure under venue[0] (not venue.displayPath) was
+        blamed on the display path. A dropped copy that is not an object is parsed as it is. The literal inputs of the verdict."""
+        cases = {
+            "dropped venue array, reserved member": '{"outcome":"UNRESOLVED","venue":[{"displayPath":{"PSObject":1}}],"Venue":{"name":"bachelor"}}',
+            "dropped venue nested array, two casings": '{"outcome":"UNRESOLVED","venue":[[{"displayPath":5,"DisplayPath":{}}]],"Venue":{"name":"bachelor"}}',
+        }
+        # the class (key3 r2 H3, RECEIPT-TEXT-RECOVERY-ATTRIBUTION-1): when the recovery dropped nothing (no venue copy, no displayPath member), a text the
+        # rewrite happens to cure is still the parser's own failure. The rewrite is stubbed to "cure" it, as a reader difference would.
+        cured = ("& (Get-Module DualVenueRunner) { function script:Get-DvJsonRootObjectWithout { param([AllowEmptyString()][string]$Text, [string]$Name, [string]$Under = '', [switch]$NoUnwrap)\n"
+                 "  if ($NoUnwrap) { return $null }; '{\"outcome\":\"PASS\"}' } }\n")
+        got = pwsh_json("$in = $env:DVE_TEXTS | ConvertFrom-Json -AsHashtable\n$out = [ordered]@{}\n"
+                        "foreach ($k in @($in.Keys)) { try { $r = ConvertFrom-DvReceiptText -Text $in[$k]; $out[$k] = [ordered]@{ venue = [string]$r.Venue.name; dp = [string]$r.Venue.displayPath } }\n"
+                        "  catch { $out[$k] = 'threw: ' + $_.FullyQualifiedErrorId } }\n" + cured +
+                        "foreach ($k in 'no venue', 'one venue without a block') { $t = $(if ($k -eq 'no venue') { '{\"outcome\":\"PASS\",\"Outcome\":\"FAIL\"}' } else { '{\"outcome\":\"PASS\",\"Outcome\":\"FAIL\",\"venue\":{\"name\":\"b\"}}' })\n"
+                        "  try { $r = ConvertFrom-DvReceiptText -Text $t; $out[$k] = 'recovered' } catch { $out[$k] = 'threw: ' + $_.FullyQualifiedErrorId } }\n"
+                        "$out | ConvertTo-Json -Compress -Depth 5", {"DVE_TEXTS": json.dumps(cases)})
+        for label in cases:
+            with self.subTest(label):
+                self.assertIsInstance(got[label], str, f"{label}: recovered and blamed on the display path: {got[label]}")
+                self.assertTrue(got[label].startswith("threw:"), got[label])
+                self.assertNotIn("DisplayPath", got[label])
+        self.assertIn("PSObjectMembersMembersAddReservedName", got["dropped venue array, reserved member"], got)
+        for label in ("no venue", "one venue without a block"):
+            with self.subTest(label):
+                self.assertTrue(str(got[label]).startswith("threw:"), f"{label}: {got[label]}")
+
+    def _pair_run(self, script: str, paths: dict, base: Path, trio: bool = False, dv: Path | None = None):
+        dv = dv or DV
+        if script == "sheet":
+            return run_pwsh(["-File", str(dv / "New-VenueSheetPair.ps1"), "-CudaReceipt", str(paths["cuda"]), "-CpuReceipt", str(paths["cpu"]), "-OutDir", str(base / "sheets")])
+        args = ["-File", str(dv / "New-VenueFlavorPair.ps1"), "-ClassicReceipt", str(paths["classic"]), "-CinematicReceipt", str(paths["cinematic"]), "-OutDir", str(base / "pair")]
+        if trio:
+            args += ["-FilmReceipt", str(paths["film"])]
+        return run_pwsh(args)
+
+    def test_successor3_r3_sol_b2_a_recovered_or_null_venue_is_refused_as_malformed_before_any_identity_gate(self) -> None:
+        """sol r2 B2: with `"venue":{...},"Venue":null` the recovery keeps the null venue, and the flavor pair / trio venue gate (PAIR_VENUE_OR_CARD_DIFFERS) and
+        Baseline's identity gate (NOT_VALIDATED RECEIPT_IDENTITY_MISMATCH) answered before the validator's DISPLAY_PATH_MALFORMED. The display path is judged
+        right after each receipt is read, before any gate that reads the venue. A plain `"venue": null` is the same class."""
+        good = '"displayPath": ' + json.dumps(good_block())
+        tails = {"Venue null after a venue": 'ROOT:"Venue": null'}
+        for label, tail in tails.items():
+            # flavor pair (the classic side) and trio (the film side), both otherwise matching PASS receipts
+            for trio in (False, True):
+                with self.subTest(label=label, reader="flavor", trio=trio), tempfile.TemporaryDirectory(prefix="dv-r3-b2-flavor-") as d:
+                    base = Path(d) / ".claude-state"
+                    base.mkdir()
+                    bad_side = "film" if trio else "classic"
+                    paths = {}
+                    for flavor in ("classic", "cinematic", "film"):
+                        paths[flavor] = base / f"{flavor}.json"
+                        paths[flavor].write_text(self._b2_receipt_text(tail if flavor == bad_side else good, receiptId=f"rc-{flavor}", lookFlavor=flavor), encoding="utf-8")
+                    proc = self._pair_run("flavor", paths, base, trio=trio)
+                    self.assertNotIn("PAIR_VENUE_OR_CARD_DIFFERS", proc.stdout + proc.stderr)
+                    self._assert_typed_display_refusal(proc, f"{label} flavor trio={trio}")
+            with self.subTest(label=label, reader="sheet"), tempfile.TemporaryDirectory(prefix="dv-r3-b2-sheet-") as d:
+                base = Path(d) / ".claude-state"
+                base.mkdir()
+                paths = {"cuda": base / "cuda.json", "cpu": base / "cpu.json"}
+                paths["cuda"].write_text(self._b2_receipt_text(good, receiptId="rc-cuda", backend="cuda"), encoding="utf-8")
+                paths["cpu"].write_text(self._b2_receipt_text(tail, receiptId="rc-cpu"), encoding="utf-8")
+                self._assert_typed_display_refusal(self._pair_run("sheet", paths, base), f"{label} sheet")
+            with self.subTest(label=label, reader="baseline"), tempfile.TemporaryDirectory(prefix="dv-r3-b2-baseline-") as d:
+                path = Path(d) / "rc-base.json"
+                path.write_text(self._b2_receipt_text(tail, receiptId="rc-base", startedUtc="__NOW__"), encoding="utf-8")
+                script = (f"Import-Module '{MODULE}' -Force\n"
+                          f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{DV / 'Invoke-VenueBaseline.ps1'}', [ref]$null, [ref]$null)\n"
+                          "$fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Get-RowFigures' }, $true)\n"
+                          ". ([scriptblock]::Create($fn.Extent.Text))\n"
+                          f"$Venue = 'bachelor'; $manifest = '{'ab' * 32}'; $repo = '{ROOT}'; $ValidatorScript = ''; $startedUtc = [DateTime]::UtcNow.AddSeconds(-2)\n"
+                          "$p = $env:DVE_RECEIPT_FILE\n"
+                          "[IO.File]::WriteAllText($p, [IO.File]::ReadAllText($p).Replace('__NOW__', [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')))\n"
+                          "$f = Get-RowFigures $p ([pscustomobject]@{ legId = 'm16-1243-look-scale2' }) 'cpu'\n"
+                          "Write-Output ('DVE_OUT=' + ([ordered]@{ identity = $f.identity; rejected = $f.rejected; verification = $f.verification } | ConvertTo-Json -Compress -Depth 5))\n")
+                proc = run_pwsh(["-Command", script], env_extra={"DVE_RECEIPT_FILE": str(path)})
+                line = next((l for l in proc.stdout.splitlines() if l.startswith("DVE_OUT=")), None)
+                self.assertIsNotNone(line, proc.stdout + proc.stderr)
+                got = json.loads(line[len("DVE_OUT="):])
+                self.assertIsNone(got["identity"], got)
+                self.assertEqual((got["verification"]["status"], got["rejected"]), ("INVALID", "INVALID"), got)
+                self.assertTrue(got["verification"]["reasons"][0].startswith("DISPLAY_PATH_MALFORMED"), got)
+
+    def _stubbed_core_tree(self, d: str) -> Path:
+        """The two pair scripts beside a copy of the module whose core validator is the W0 shape of the blanket revocation filter at HEAD (an empty blanket list
+        under StrictMode: a statement error the core survives, then its own CONSENT_REVOKED), at the same relative path so the scripts' repo root resolves."""
+        dv = Path(d) / "tools" / "profiling" / "dual-venue"
+        dv.mkdir(parents=True)
+        text = MODULE.read_text(encoding="utf-8")
+        anchor = "function Test-DvReceiptValidCore {"
+        self.assertEqual(text.count(anchor), 1)
+        stub = ("function Test-DvReceiptValidCore {\n    param($Receipt, $RepoRoot, $EvidenceDir, [switch]$AllowOfflineTestMode, $OfflineLegSpecBytes)\n    Set-StrictMode -Version Latest\n"
+                "    $kept = $false\n    $kept = (@(@(, @()) | Where-Object { $null -ne $_ -and [string]$_.ownerSentenceSha256 -ceq 'x' }).Count -gt 0)\n"
+                "    [pscustomobject]@{ valid = $false; status = 'INVALID'; reasons = @('CONSENT_REVOKED: the owner record this receipt was admitted on is no longer committed at HEAD'); unbound = @(); evidenceDir = $null; legType = $null }\n}\n"
+                "function Test-DvReceiptValidCoreReplacedByTheStub {")
+        (dv / "DualVenueRunner.psm1").write_text(text.replace(anchor, stub), encoding="utf-8")
+        # venues.json: the OutDir locality check reads the venue shares from beside the module and refuses when it cannot
+        for name in ("New-VenueSheetPair.ps1", "New-VenueFlavorPair.ps1", "venues.json"):
+            (dv / name).write_bytes((DV / name).read_bytes())
+        return dv
+
+    def test_successor3_r3_key3_b1_a_statement_error_the_core_survives_reaches_the_pair_readers_typed_refusal(self) -> None:
+        """opus key3 r2 B1: r2 wrapped Test-DvReceiptValid in a `try` in both pair readers, so a statement error the core survives (the blanket revocation filter
+        over an empty blanket list, psm1 `ownerSentenceSha256`) unwound to the reader's catch and was rethrown raw (PropertyNotFound) instead of the core's typed
+        CONSENT_REVOKED reaching PAIR_RECEIPT_INVALID. The W0 class (test_successor3_w0_...) at the pair readers, with a good and an absent block."""
+        blocks = {"good block": '"displayPath": ' + json.dumps(good_block()), "absent block": '"rack": "r1"'}
+        with tempfile.TemporaryDirectory(prefix="dv-r3-k3-") as d:
+            dv = self._stubbed_core_tree(d)
+            for label, tail in blocks.items():
+                with self.subTest(label=label, reader="sheet"):
+                    base = Path(d) / f"s-{len(label)}" / ".claude-state"
+                    base.mkdir(parents=True)
+                    paths = {"cuda": base / "cuda.json", "cpu": base / "cpu.json"}
+                    paths["cuda"].write_text(self._b2_receipt_text(tail, receiptId="rc-cuda", backend="cuda"), encoding="utf-8")
+                    paths["cpu"].write_text(self._b2_receipt_text(tail, receiptId="rc-cpu"), encoding="utf-8")
+                    proc = self._pair_run("sheet", paths, base, dv=dv)
+                    out = proc.stdout + proc.stderr
+                    self.assertNotEqual(proc.returncode, 0, out)
+                    self.assertNotIn("ownerSentenceSha256", out, out)
+                    self.assertIn("PAIR_RECEIPT_INVALID receipt rc-cuda is not valid evidence: CONSENT_REVOKED", out, out)
+                for trio in (False, True):
+                    with self.subTest(label=label, reader="flavor", trio=trio):
+                        base = Path(d) / f"f-{len(label)}-{trio}" / ".claude-state"
+                        base.mkdir(parents=True)
+                        paths = {}
+                        for flavor in ("classic", "cinematic", "film"):
+                            paths[flavor] = base / f"{flavor}.json"
+                            paths[flavor].write_text(self._b2_receipt_text(tail, receiptId=f"rc-{flavor}", lookFlavor=flavor), encoding="utf-8")
+                        proc = self._pair_run("flavor", paths, base, trio=trio, dv=dv)
+                        out = proc.stdout + proc.stderr
+                        self.assertNotEqual(proc.returncode, 0, out)
+                        self.assertNotIn("ownerSentenceSha256", out, out)
+                        self.assertIn("PAIR_RECEIPT_INVALID receipt rc-classic is not valid evidence: CONSENT_REVOKED", out, out)
+
 
 @requires_windows_pwsh
 class Successor2VenueLegTests(RunnerHarness, unittest.TestCase):
