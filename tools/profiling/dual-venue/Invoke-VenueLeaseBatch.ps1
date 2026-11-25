@@ -745,7 +745,8 @@ function Get-InputUnresolvedCodeWithin([string]$Path, [switch]$SkipRead) {
         # and the wait is sliced (250 ms) against it, so a pause after the sample above never waits the stale allowance
         $endUtc = [DateTime]::UtcNow.AddMilliseconds([double]$ms)
         $dlU = Get-Variable -Name deadline -ValueOnly -ErrorAction Ignore
-        if ($dlU -is [datetime]) { $dlEnd = [DateTime]::UtcNow.AddSeconds(($dlU - [DateTime]::UtcNow).TotalSeconds - 2.0); if ($dlEnd -lt $endUtc) { $endUtc = $dlEnd } }
+        # BATCH-3 r2 (p6 A4 sibling, same expression): the room is clamped to [0, 3600] s before it is added to now (no un-representable DateTime)
+        if ($dlU -is [datetime]) { $dlEnd = [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, [Math]::Min(3600.0, ($dlU - [DateTime]::UtcNow).TotalSeconds - 2.0))); if ($dlEnd -lt $endUtc) { $endUtc = $dlEnd } }
         if ([DateTime]::UtcNow -ge $endUtc) { return 'INPUT_UNREADABLE' }
         $h = $ps.BeginInvoke()
         while (-not $h.IsCompleted) {
@@ -1604,7 +1605,9 @@ public static class VenueLeaseBatchBoundedReadR4 {
     # the read and its wait end at it (ReadUntil), so a pause after any sample costs no wait past the deadline's reserve. A type an older copy of this script loaded in this
     # process (no ReadUntil) is no answer: TIMEOUT, never an unbounded read.
     $endUtc = [DateTime]::UtcNow.AddMilliseconds([double]$ms)
-    if ($dlR -is [datetime]) { $dlEnd = [DateTime]::UtcNow.AddSeconds(($dlR - [DateTime]::UtcNow).TotalSeconds - 2.0); if ($dlEnd -lt $endUtc) { $endUtc = $dlEnd } }
+    # BATCH-3 r2 (CI 45506989386, p6 A4 LEASE-BATCH-DEADLINE-MINVALUE-CLAMP-1): the room is clamped to [0, 3600] s BEFORE it is added to now, so a -DeadlineUtc near
+    # DateTime.MinValue (or MaxValue) never throws "un-representable DateTime"; a room <= 0 ends the read now (the allowance above is already 0), one > 3600 s never wins over it
+    if ($dlR -is [datetime]) { $dlEnd = [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, [Math]::Min(3600.0, ($dlR - [DateTime]::UtcNow).TotalSeconds - 2.0))); if ($dlEnd -lt $endUtc) { $endUtc = $dlEnd } }
     $rc = try { [VenueLeaseBatchBoundedReadR4]::ReadUntil($full, $DelayMs, $endUtc.Ticks, [ref]$b, [ref]$k, [ref]$e) } catch { $b = $null; $k = ''; $e = $null; 2 }
     $dlA = Get-Variable -Name deadline -ValueOnly -ErrorAction Ignore
     if ($rc -ne 2 -and $dlA -is [datetime] -and ($dlA - [DateTime]::UtcNow).TotalSeconds -lt 2.0) { $rc = 2; $b = $null; $k = ''; $e = $null }   # b2 r1 (pass 8 A5): an answer inside the deadline's reserve is no answer
@@ -1624,7 +1627,8 @@ function Get-InputLocationWithin([string]$Path) {
     # it (LocateUntil), so a pause after the sample above never waits the stale allowance. An older loaded type without LocateUntil is no answer.
     $endUtc = [DateTime]::UtcNow.AddMilliseconds([double]$ms)
     $dlL = Get-Variable -Name deadline -ValueOnly -ErrorAction Ignore
-    if ($dlL -is [datetime]) { $dlEnd = [DateTime]::UtcNow.AddSeconds(($dlL - [DateTime]::UtcNow).TotalSeconds - 2.0); if ($dlEnd -lt $endUtc) { $endUtc = $dlEnd } }
+    # BATCH-3 r2 (p6 A4 sibling, same expression): the room is clamped to [0, 3600] s before it is added to now (no un-representable DateTime)
+    if ($dlL -is [datetime]) { $dlEnd = [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, [Math]::Min(3600.0, ($dlL - [DateTime]::UtcNow).TotalSeconds - 2.0))); if ($dlEnd -lt $endUtc) { $endUtc = $dlEnd } }
     $located = try { [VenueLeaseBatchFinalPath]::LocateUntil($full, 0, $endUtc.Ticks, [ref]$phys, [ref]$key) } catch { $false }
     if (-not $located) { return $null }
     $dlA = Get-Variable -Name deadline -ValueOnly -ErrorAction Ignore

@@ -6939,8 +6939,13 @@ exit 0
     # r3 (adversary pass 2 on 5ef85bc6, A1): the chain read its leg child's outcome, receipt and spec refusal back from <RunDir>\leg-<name>.out.txt, and its probes' verdicts
     # from quiet-<name>-<phase>.out.txt. Two chains on one -RunDir (two venues) name a leg alike, so another chain's child could write that file between this child's exit
     # and this parent's read. The fixture writes it there (the other chain's transcript) right after this child exits; the chain must classify from its OWN child's output.
-    LEG_FOREIGN_OUT = ("            $legCode = $LASTEXITCODE\n",
-                       "            $legCode = $LASTEXITCODE\n            if ($env:DVT_FOREIGN_LEG_OUT) { [IO.File]::Copy($env:DVT_FOREIGN_LEG_OUT, $out, $true) }   # TEST FIXTURE: the other chain's leg wrote this file\n")
+    # BATCH-3 r2 (CI 45506989386): BATCH-2 r1 moved the leg onto Invoke-VenueBoundedProcess, so the old `$legCode = $LASTEXITCODE` anchor is gone. The other chain's
+    # transcript now lands right AFTER this chain's own evidence write, so the RunDir file holds ONLY the foreign leg's lines when the classification below runs: any read back
+    # of that file (instead of this child's captured stdout) takes its PASS and its receipt path.
+    LEG_FOREIGN_OUT_ANCHOR = ("            $ow = Write-ChainEvidence $out @([string]$lp.stdout + \"`n--- stderr ---`n\" + [string]$lp.stderr)"
+                              "   # bounded (r3 fix 2, A2): never holds the claim's release\n")
+    LEG_FOREIGN_OUT = (LEG_FOREIGN_OUT_ANCHOR,
+                       LEG_FOREIGN_OUT_ANCHOR + "            if ($env:DVT_FOREIGN_LEG_OUT) { [IO.File]::Copy($env:DVT_FOREIGN_LEG_OUT, $out, $true) }   # TEST FIXTURE: the other chain's leg wrote this file\n")
     QUIET_FOREIGN_OUT = ("    $code = $LASTEXITCODE\n",
                          "    $code = $LASTEXITCODE\n    if ($env:DVT_FOREIGN_QUIET_OUT) { [IO.File]::Copy($env:DVT_FOREIGN_QUIET_OUT, $out, $true) }   # TEST FIXTURE: the other chain's probe wrote this file\n")
 

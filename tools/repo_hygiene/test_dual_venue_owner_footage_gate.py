@@ -230,6 +230,13 @@ ROUTE_DELETE_ALLOWED = {
         "(the `$made` flag is set only after that open succeeded; retried for up to 1 s while a reader holds it) when writing or flushing its body then failed, so a half-made ticket of the same owner never stays in the line. $path is "
         "<ClaimDir>\\<venue>.tickets\\<19 digits>-p<pid>-<start ticks>.ticket.json, built in the same loop iteration from the claim folder and the owner's pid and start ticks (the board's "
         "claim folder, never a venue share); fixed-name leaf, no wildcard, no -Recurse, never a name this call did not create.",
+    ("Invoke-VenueLeaseBatch.ps1", r"""$owr = try { & ($script:VenueChainModule ?? (Get-Module VenueChain)) { param($t, $a, $s) Invoke-VenueBoundedRead -ScriptText $t -Argument $a -TimeoutSec $s } 'param($a) $final = $a.p; $out = $final + ".b2r2-" + [Guid]::NewGuid().ToString("N") + ".tmp"; $text = $a.t; try { $fs = [IO.File]::Open($out, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None); $fs.Dispose(); [IO.File]::WriteAllText($out, $text, [Text.UTF8Encoding]::new($false)); [IO.File]::Move($out, $final, $true); "OK" } catch { $m = $_.Exception.Message; try { [IO.File]::Delete($out) } catch { $null = $_ }; "FAILED " + $m }' @{ p = $out; t = $text } 2 } catch { [pscustomobject]@{ answered = $true; value = @(); error = ($_.Exception.Message -replace '\s+', ' ') } }"""):
+        "DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r2 (adversary pass 3 A6), listed in BATCH-3 r2 (CI 45506989386): the lease batch's per-leg evidence transcript writer. "
+        "The destination $final = $a.p is the batch's $out, assigned once just before the leg as Join-Path $RunDir \"leg-<leg name>-b<NN>-a<N>.out.txt\" (this run's own "
+        "-RunDir, never a venue share or a clip folder) and asked about by Test-RunDirWrite right before this line; the leaf always ends in .out.txt, so it can never be the "
+        "name of an .MLV clip. The Move's source and the Delete's only target are $final + \".b2r2-<32 hex>.tmp\", a fresh GUID name this worker opened with FileMode.CreateNew "
+        "a moment earlier (nothing can already be there), removed only when the write or the rename failed. Fixed-name leaves, no wildcard, no -Recurse; the leg's clip is "
+        "never an argument here (the batch reads only the leg child's captured stdout and stderr).",
 }
 
 TRAILING_COMMENT = re.compile(r"\s+#\s.*$")
@@ -469,6 +476,32 @@ class RouteDeleteSurfaceTests(unittest.TestCase):
                     target.write_bytes(original + b"\n" + payload.encode("utf-8") + b"\n")
                     caught = route_hits(route_sources(profiling)) - set(ROUTE_DELETE_ALLOWED)
                     self.assertIn(("UmRunDrop.psm1", payload), caught, payload)
+                finally:
+                    target.write_bytes(original)
+
+    def test_mutation_the_lease_batch_transcript_entry_is_one_exact_line(self) -> None:
+        # BATCH-3 r2: the Invoke-VenueLeaseBatch.ps1 transcript-writer entry is an exact line, never a pattern: the same writer deleting or moving any other
+        # target ($final itself, a clip), or a bare primitive in the batch, still fails the guard. Mutates a copy, never the real file.
+        listed = next(line for name, line in ROUTE_DELETE_ALLOWED if name == "Invoke-VenueLeaseBatch.ps1")
+        with tempfile.TemporaryDirectory() as tmp:
+            profiling = Path(tmp) / "profiling"
+            shutil.copytree(PROFILING / "dual-venue", profiling / "dual-venue")
+            for name in ROUTE_PS_SOURCES + ROUTE_PY_SOURCES:
+                shutil.copyfile(PROFILING / name, profiling / name)
+            self.assertEqual(sorted(route_hits(route_sources(profiling)) - set(ROUTE_DELETE_ALLOWED)), [], "the unmutated copy must pass")
+            for payload in (
+                listed.replace("[IO.File]::Delete($out)", "[IO.File]::Delete($final)"),
+                listed.replace("[IO.File]::Move($out, $final, $true)", "[IO.File]::Move($out, $clip, $true)"),
+                "[IO.File]::Delete($out)",
+                "Remove-Item -LiteralPath $out -Force",
+            ):
+                self.assertNotEqual(payload, listed)
+                target = profiling / "dual-venue" / "Invoke-VenueLeaseBatch.ps1"
+                original = target.read_bytes()
+                try:
+                    target.write_bytes(original + b"\n" + payload.encode("utf-8") + b"\n")
+                    caught = route_hits(route_sources(profiling)) - set(ROUTE_DELETE_ALLOWED)
+                    self.assertIn(("Invoke-VenueLeaseBatch.ps1", payload), caught, payload)
                 finally:
                     target.write_bytes(original)
 
