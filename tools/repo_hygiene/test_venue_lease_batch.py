@@ -5768,7 +5768,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         assert_refused("-LegPlan", r, "LEG_PLAN_REFUSED reason=SPEC_READ_FAILED item=1 ")
         # -LegSet: a set under legsets/ naming an over-cap copy beside it (the real legsets/ directory is the only place the batch reads one; both removed in the finally)
         over_in_legs = DV / "legs" / f"{legset_name}.json"
-        over_in_legs.write_text(json.dumps(doc), encoding="utf-8")
+        # (named by its legId: M16-1457-VENUE-BASELINE-DRIFT-1 r11, the set planner refuses a spec whose file name is not <legId>.json)
+        over_in_legs.write_text(json.dumps(dict(doc, legId=legset_name)), encoding="utf-8")
         legset_path.write_text(json.dumps({"schema": "mlv-app/dual-venue-legset/v1", "legSet": legset_name, "card": doc["card"], "clipId": doc["clipId"],
                                            "description": "r18 test stand-in, removed by the test", "legs": [f"legs/{legset_name}.json"]}), encoding="utf-8")
         try:

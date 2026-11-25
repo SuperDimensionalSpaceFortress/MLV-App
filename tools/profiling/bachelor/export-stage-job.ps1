@@ -57,6 +57,12 @@ $PlaybackGenerator = Join-Path $PSScriptRoot 'playback-attr-3-cuda-job.ps1'
 $LengthGatePath = Join-Path $PSScriptRoot '..\gui-smoke-length-gate.ps1'
 $ArtifactsModule = Join-Path $PSScriptRoot 'AttrCudaArtifacts.psm1'
 $OwnerFootageModule = Join-Path $PSScriptRoot 'AttrCudaOwnerFootage.psm1'
+# EXPORT-RENDER-PIPE-TIMING-2 r4 (sol r3 B2): the central reader's one batch.log line grammar, embedded from the module that owns it (Get-BatchLineGrammarText)
+$DualVenueModule = Join-Path $PSScriptRoot '..\dual-venue\DualVenueRunner.psm1'
+# (EXPORT-RENDER-PIPE-TIMING-3 r1, sol r4 B4: and the reader's ONE binding verdict, Get-DvBatchExportBindingProblems, with the declaration reader and the tables they read)
+$BatchLineGrammarTables = @('$script:ExportBatchLineShapes', '$script:ExportBatchLineGrammar', '$script:ExportBatchLineForbidden', '$script:ExportRenderStartCodec',
+    '$script:ExportRenderStartContainer', '$script:ExportRenderStartFps', '$script:ExportRenderStartFpsMin', '$script:ExportRenderStartFpsMax', '$script:ExportCdngFrameLeaf')
+$BatchLineGrammarFunctions = @('ConvertFrom-DvBatchLogLine', 'ConvertFrom-DvBatchExportLog', 'Get-DvRenderStartDeclaration', 'Get-DvBatchExportBindingProblems')
 # The job-side conventions the playback job template defines, extracted from that template (never re-typed here).
 $SharedTemplateFunctions = @('Assert-UnderMlvTmp', 'Save-Json', 'Write-JobTrace', 'Get-Sha', 'Get-Mean')
 # The AttrCuda helpers the job calls directly; their callees are added by closure below.
@@ -102,6 +108,8 @@ $Trace = Join-Path $Root "logs\$JobId.trace.txt"
 __EMBEDDED_FUNCTIONS__
 # --- the playback job template's own conventions, extracted from playback-attr-3-cuda-job.ps1 ---------------------------------------------------------------------
 __SHARED_FUNCTIONS__
+# --- the batch.log line grammar, extracted VERBATIM from tools/profiling/dual-venue/DualVenueRunner.psm1 (EXPORT-RENDER-PIPE-TIMING-2 r4, sol r3 B2) ---------------
+__BATCH_LINE_GRAMMAR__
 # ------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 foreach ($check in @(@{ path = $Root; label = 'Root' }, @{ path = $Work; label = 'Work' }, @{ path = $Pub; label = 'Pub' })) { Assert-UnderMlvTmp $check.path $check.label }
@@ -349,9 +357,11 @@ try {
     # r8 fix 3 (adversary r8 pass 10 A3): a survivor of an unconfirmed kill may hold the log (or the stage record) without read sharing. Reading or copying it must never cost the typed
     # EXPORT_KILL_UNCONFIRMED terminal, so the read is guarded (an unreadable log is no log: the classification below decides from the timeout first) and each publish copy is best effort.
     $logText = try { if (Test-Path -LiteralPath $batchLog -PathType Leaf) { [IO.File]::ReadAllText($batchLog) } else { '' } } catch { Write-JobTrace "step export batch.log read error=$([string]$_.CategoryInfo.Reason)"; '' }
-    $done = @([regex]::Matches($logText, '(?m)^\[BATCH\] DONE .+? exported=(?<e>[0-9]+) skipped=(?<s>[0-9]+) elapsed=[0-9.]+\r?$'))
-    $exported = if ($done.Count -eq 1) { [int64]$done[0].Groups['e'].Value } else { $null }
-    $verified = @([regex]::Matches($logText, '(?m)^\[BATCH\] RENDER_VERIFIED \S+ decoded_frames=(?<n>[0-9]+)(?=\s|$)'))   # r15 (pass14 A2): the token ends at whitespace or the line end (a word boundary also ends it at '.', so 480.5 read as 480)
+    # EXPORT-RENDER-PIPE-TIMING-2 r4 (sol r3 B2): DONE and RENDER_VERIFIED are read by the central reader's ONE line grammar (embedded above, never re-typed), so a line
+    # that reader refuses (a truncated verification, a field after the trailer, a count past u15, two DONE triplets) is no export here either, typed, never a throw
+    $batchRead = ConvertFrom-DvBatchExportLog -BatchLogText $logText
+    $exported = if ($null -eq $batchRead.done.problem -and $null -ne $batchRead.done.fields) { [int64]$batchRead.done.fields['exported'] } else { $null }
+    $verifiedFrames = if ($null -eq $batchRead.verified.problem -and $null -ne $batchRead.verified.fields) { [int64]$batchRead.verified.fields['decoded_frames'] } else { $null }
     $stageEvidence = if ($Format -eq 'cdng-lossless') { $profilePath } else { $stageLog }
     # (adversary r11 A3: the same best-effort rule for the stage record's size: a survivor of an unconfirmed kill can remove or lock it between Test-Path and Get-Item, which threw into the finally
     # and cost the typed terminal; an unreadable record is an absent one, and the classification below decides from the timeout first)
@@ -369,11 +379,18 @@ try {
         $manifest.first = [ordered]@{ name = $outputs[0].Name; bytes = $outputs[0].Length; sha256 = (Get-AttrCudaFileSha256Blocks -Path $outputs[0].FullName -TracePath $Trace -Label 'output-first').sha256 }
         $manifest.last = [ordered]@{ name = $outputs[-1].Name; bytes = $outputs[-1].Length; sha256 = (Get-AttrCudaFileSha256Blocks -Path $outputs[-1].FullName -TracePath $Trace -Label 'output-last').sha256 }
     }
-    $outputAgrees = if ($Format -eq 'cdng-lossless') { $null -ne $exported -and $outputs.Count -eq $exported } else { $outputs.Count -eq 1 -and $verified.Count -eq 1 -and $null -ne $exported -and [int64]$verified[0].Groups['n'].Value -eq $exported }
+    # EXPORT-RENDER-PIPE-TIMING-3 r1 (sol r4 B4): the central reader's ONE binding verdict (embedded verbatim): DONE's clip against the CDNG frames found, and a present
+    # RENDER_START (its grammar, the declaration's checks, the order, the .mov leaf and the verified dimensions) on ProRes, so on those bindings a run the central reader
+    # reads INVALID is never EXPORT_CAPTURED here. (r2 F3, key3 r1 row 1: an ABSENT RENDER_START is read only centrally, which requires it on an emitting build's pipe
+    # route; the receipt still reads INVALID by the central re-derivation, Invoke-VenueLeg.ps1:760-765, and the app always prints it there, BatchRunner.cpp:471)
+    # (READER-HARDENING-1 r1, sol r2 B2: parity is on those shared bindings only; export_scale and the stage window are central-only checks too)
+    $bind = Get-DvBatchExportBindingProblems -Batch $batchRead -Format $Format -OutputCount $outputs.Count -FirstName $(if ($null -ne $manifest.first) { $manifest.first.name } else { $null }) `
+        -LastName $(if ($null -ne $manifest.last) { $manifest.last.name } else { $null }) -ReadStart ($Format -eq 'prores' -and $batchRead.start.count -gt 0)
+    $outputAgrees =if ($Format -eq 'cdng-lossless') { $null -ne $exported -and $outputs.Count -eq $exported } else { $outputs.Count -eq 1 -and $null -ne $verifiedFrames -and $null -ne $exported -and $verifiedFrames -eq $exported }
     $result = $(if ($timedOut -and -not $killConfirmed) { 'EXPORT_KILL_UNCONFIRMED' }
         elseif ($timedOut) { 'EXPORT_TIMEOUT' }
         elseif ($appExitCode -ne 0) { 'EXPORT_EXIT_NONZERO' }
-        elseif ($null -eq $exported) { 'EXPORT_OUTPUT_MISMATCH' }
+        elseif ($null -eq $exported -or @($bind.problems).Count -gt 0) { 'EXPORT_OUTPUT_MISMATCH' }
         elseif ($exported -eq 0) { 'EXPORT_NO_FRAMES' }
         elseif ($exported -lt $MaxFrames) { 'EXPORT_FRAMES_SHORT' }
         elseif (-not $stagePresent) { 'EXPORT_PROFILE_ABSENT' }
@@ -424,6 +441,26 @@ function Get-SharedTemplateFunctionText {
         if (-not $m.Success) { throw "DUAL_VENUE_EXPORT_TEMPLATE_FUNCTION_ABSENT the playback template defines no $name" }
         $m.Value
     }) -join "`r`n`r`n"
+}
+
+function Get-BatchLineGrammarText {
+    # EXPORT-RENDER-PIPE-TIMING-2 r4 (sol r3 B2): the central reader's batch.log line grammar -- its three tables and its two readers -- taken VERBATIM from
+    # DualVenueRunner.psm1's own AST (the source text of each statement), so the venue job classifies DONE and RENDER_VERIFIED by the same grammar, never a copy
+    $tokens = $null; $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($DualVenueModule, [ref]$tokens, [ref]$errors)
+    if (@($errors).Count -gt 0) { throw 'DUAL_VENUE_EXPORT_GRAMMAR_ABSENT DualVenueRunner.psm1 does not parse' }
+    $parts = [System.Collections.Generic.List[string]]::new()
+    foreach ($name in $BatchLineGrammarTables) {
+        $def = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -ceq $name }, $false))
+        if ($def.Count -ne 1) { throw "DUAL_VENUE_EXPORT_GRAMMAR_ABSENT DualVenueRunner.psm1 assigns no single $name" }
+        $parts.Add($def[0].Extent.Text)
+    }
+    foreach ($name in $BatchLineGrammarFunctions) {
+        $def = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $name }, $false))
+        if ($def.Count -ne 1) { throw "DUAL_VENUE_EXPORT_GRAMMAR_ABSENT DualVenueRunner.psm1 defines no single $name" }
+        $parts.Add($def[0].Extent.Text)
+    }
+    $parts -join "`r`n`r`n"
 }
 
 function Get-ExportEmbedding {
@@ -483,8 +520,10 @@ if ($DescribeTimeBudgetBytes -ge 0) {
 $ast = Get-PlaybackGeneratorAst
 $sharedText = Get-SharedTemplateFunctionText -Ast $ast
 $embedding = Get-ExportEmbedding -SharedText $sharedText
+$batchLineGrammar = Get-BatchLineGrammarText
 if ($DescribeTemplate) {
-    return [pscustomobject]@{ template = $template; embedded = @($embedding.names); unresolved = @($embedding.unresolved); shared = $SharedTemplateFunctions; lengthGateEmbedded = $template.Contains('__LENGTH_GATE_BASE64__') }
+    return [pscustomobject]@{ template = $template; embedded = @($embedding.names); unresolved = @($embedding.unresolved); shared = $SharedTemplateFunctions; lengthGateEmbedded = $template.Contains('__LENGTH_GATE_BASE64__')
+                              batchLineGrammar = $batchLineGrammar }
 }
 
 # --- generation ------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -570,6 +609,7 @@ $tokens = [ordered]@{
     SCRATCH_ROOT = $scratchRoot
     EMBEDDED_FUNCTIONS = $embedding.text
     SHARED_FUNCTIONS = $sharedText
+    BATCH_LINE_GRAMMAR = $batchLineGrammar
 }
 # (one pass: a substituted value is never rescanned; the embedded and shared texts carry __SCRATCH_ROOT__ themselves, so they are expanded first)
 $tokens.EMBEDDED_FUNCTIONS = $embedding.text

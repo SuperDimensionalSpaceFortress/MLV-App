@@ -65,6 +65,7 @@ def cdng_profile(frames: int, dual_iso_ms: float = 30.0, success: bool = True, b
         stage["raw_read_ms"] = 4.0
         stage["llrawproc_dual_iso_ms"] = dual_iso_ms
         stage["llrawproc_ms"] = 40.0   # r8: the llrawproc total contains its llrawproc_* children (the 30 ms dual-ISO one included)
+        stage["llrawproc_other_ms"] = 4.0   # EXPORT-CDNG-TOTAL-CONTAINMENT-1: dng.c:579-604 sets other = total - the seven timed children (6 x 1 + 30 = 36), so 36 + 4 = the 40 ms total
         stage["dng_compress_encode_ms"] = 10.0
         stage["producer_frame_ms"] = 62.0 + (i % 3)   # r11: the 19 producer stages below total 60 ms, so producer_frame (which contains them all) is at least that
         row = {"clip": "view-0", "frame_index": i, "raw_input_state": "x", "raw_output_state": "y", "success": success and i >= failed}
@@ -83,18 +84,114 @@ def stage_log(frames: int) -> str:
     return "\n".join(out) + "\n"
 
 
-def batch_log(exported: int, skipped: int = 0, elapsed: float = 20.0, verified: int | None = None) -> str:
-    lines = ["[BATCH] Start", f"[BATCH] DONE view-0 exported={exported} skipped={skipped} elapsed={elapsed:.1f}"]
+# EXPORT-RENDER-PIPE-TIMING-1: the stages a rendered export emits from that card on (src/debug/StageTiming.h MLV_STAGE_LLRAWPROC_DUAL_ISO, MLV_STAGE_EXPORT_*):
+# llrawproc_dual_iso (inside llrawproc) and export_pipe_write (plus export_scale when the frame plan is scaled) per frame, export_pipe_drain and export_verify once per
+# clip on its last frame. llrawproc is 31 ms here so a 30 ms dual-ISO run fits inside it (raw_uint16 9 + llrawproc 31 = 40 still fits debayered_frame).
+PIPE_CRITERIA = ({"metric": "dualIsoClassAgrees", "op": "eq", "value": True}, {"metric": "renderPipeTimed", "op": "eq", "value": True})
+
+# EXPORT-RENDER-PIPE-TIMING-1 r3 (adversary A2 on c2da7e24): a llrawproc_dual_iso time above 0 ms is the ATTEMPT's (llrawproc.c:6019 times it, dualiso.c:7484-7487 can
+# refuse the reconstruction inside it), and the rendered path publishes no producer signal that the reconstruction APPLIED. So a timed dual-ISO run reads a typed UNKNOWN,
+# and on a dual-ISO leg the shipped criterion dualIsoClassAgrees eq true never passes (KNOWN GAP; successor EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1).
+DUALISO_UNKNOWN = "DUALISO_APPLIED_UNKNOWN"
+DUALISO_SUCCESSOR = "EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1"
+
+
+def assert_clean_but_dual_iso_unknown(tc: unittest.TestCase, g: dict) -> None:
+    """A clean log under the shipped ProRes criteria on a dual-ISO leg: no evidence problem, no class mismatch, and the verdict FAILs on dualIsoClassAgrees ALONE, with the
+    typed UNKNOWN as the reason (the r3 fail-closed reading). Every other shipped criterion met."""
+    tc.assertEqual(g["problems"], [], g)
+    tc.assertFalse(g["classMismatch"], g)
+    tc.assertEqual(g["outcome"], "FAIL", g)
+    tc.assertTrue(g["detail"].startswith(f"EXPORT_CAPTURED: dualIsoClassAgrees: {DUALISO_UNKNOWN}:"), g)
+    tc.assertNotIn("; ", g["detail"], "dualIsoClassAgrees is the only criterion that fails")
+
+
+def piped_stage_log(frames: int, dual_iso_ms: float = 30.0, llrawproc_ms: float = 31.0, pipe_ms: float = 10.0, drain_ms: float = 100.0, verify_ms: float = 200.0,
+                    drain_count: int = 1, verify_count: int = 1, pipe_frames=None, scale_ms: float | None = None, dual_iso: bool = True) -> str:
+    out = []
+    pipe_frames = range(frames) if pipe_frames is None else pipe_frames
+    for i in range(frames):
+        for name, ms in (("raw_uint16_disk_read", 3.0), ("raw_uint16_decompress", 5.0), ("raw_uint16", 9.0), ("llrawproc", llrawproc_ms),
+                         ("debayered_frame", 40.0), ("processing", 15.0), ("processed16_total", 56.0)):
+            out.append(f"[mlv-stage-timing] frame={i} stage={name} ms={ms:.3f}")
+            if name == "llrawproc" and dual_iso:
+                out.append(f"[mlv-stage-timing] frame={i} stage=llrawproc_dual_iso ms={dual_iso_ms:.3f}")
+        if scale_ms is not None:
+            out.append(f"[mlv-stage-timing] frame={i} stage=export_scale ms={scale_ms:.3f}")
+        if i in pipe_frames:
+            out.append(f"[mlv-stage-timing] frame={i} stage=export_pipe_write ms={pipe_ms:.3f}")
+    out += [f"[mlv-stage-timing] frame={frames - 1} stage=export_pipe_drain ms={drain_ms:.3f}"] * drain_count
+    out += [f"[mlv-stage-timing] frame={frames - 1} stage=export_verify ms={verify_ms:.3f}"] * verify_count
+    return "\n".join(out) + "\n"
+
+
+def with_pipe_stages(log: str, frames: int, dual_iso_ms: float = 5.0) -> str:
+    """EXPORT-RENDER-PIPE-TIMING-1 forced companion: a test that judges a hand-written log under the SHIPPED ProRes criteria (which now gate dualIsoClassAgrees and
+    renderPipeTimed) appends what a build of that card emits: a small dual-ISO figure on every frame, a 1 ms pipe write per frame, one drain and one verify.
+    (r2, adversary A4 on a6f48506: on a frame that carries llrawproc the dual-ISO record is written right after it, as video_mlv.c writes it; a frame without llrawproc gets it appended.)"""
+    # (r2 fix 1, pass 4 A2: and the pipe write closes each frame, after its last render record, as the frame loop writes it)
+    # (r2 fix 2, adversary A1 on c2da7e24: and processed16_total is the render's LAST note, video_mlv.c:7656-7661, so it is moved to the end of its frame's block)
+    out, paired, written = [], set(), set()
+    blocks: list = []
+    for l in log.splitlines():
+        m = re.match(r"\[mlv-stage-timing\] frame=(\d+) ", l)
+        f = int(m.group(1)) if m else None
+        if blocks and f is not None and blocks[-1][0] == f:
+            blocks[-1][1].append(l)
+        else:
+            blocks.append((f, [l]))
+    for f, ls in blocks:
+        if f is None or f >= frames or f in written:
+            out += ls
+            continue
+        for line in ls:
+            if " stage=processed16_total " in line:
+                continue
+            out.append(line)
+            if " stage=llrawproc " in line:
+                out.append(f"[mlv-stage-timing] frame={f} stage=llrawproc_dual_iso ms={dual_iso_ms:.3f}")
+                paired.add(f)
+        if f not in paired:
+            out.append(f"[mlv-stage-timing] frame={f} stage=llrawproc_dual_iso ms={dual_iso_ms:.3f}")
+            paired.add(f)
+        out += [l for l in ls if " stage=processed16_total " in l]
+        out.append(f"[mlv-stage-timing] frame={f} stage=export_pipe_write ms=1.000")
+        written.add(f)
+    per_frame = "".join(f"[mlv-stage-timing] frame={i} stage=llrawproc_dual_iso ms={dual_iso_ms:.3f}\n" for i in range(frames) if i not in paired)
+    per_frame += "".join(f"[mlv-stage-timing] frame={i} stage=export_pipe_write ms=1.000\n" for i in range(frames) if i not in written)
+    return "\n".join(out) + "\n" + per_frame + f"[mlv-stage-timing] frame={frames - 1} stage=export_pipe_drain ms=1.000\n[mlv-stage-timing] frame={frames - 1} stage=export_verify ms=1.000\n"
+
+
+def batch_log(exported: int, skipped: int = 0, elapsed: float = 20.0, verified: int | None = None, scaled: bool | None = False) -> str:
+    lines = ["[BATCH] Start"]
     if verified is not None:
-        lines.insert(1, f"[BATCH] RENDER_VERIFIED view-0 decoded_frames={verified} decoded_duration=10.000 decoded_frame_bytes=1 dimensions=1x1 bytes=9 "
-                        "container_probe=ffmpeg.exe probe_source=ffmpeg-i codec=prores container=mov sar=1:1 dar=16:9")
+        # (EXPORT-RENDER-PIPE-TIMING-1 r1 fix 2: the rendered runner's own RENDER_START line, BatchRunner.cpp, which declares whether the frame plan is scaled; scaled=None omits it)
+        # (r2, adversary A5 on a6f48506: in the order BatchRunner.cpp writes them: RENDER_START before the frames, RENDER_VERIFIED after the verify, DONE last)
+        if scaled is not None:
+            lines.append(f"[BATCH] RENDER_START view-0 codec=prores container=mov source=1x1 output=1x1 scaled={'true' if scaled else 'false'} fps=24 frames={exported} "
+                         f"cutIn=1 cutOut={exported} out=view-0.mov")
+        lines.append(f"[BATCH] RENDER_VERIFIED view-0 decoded_frames={verified} decoded_duration=10.000 decoded_frame_bytes=1 dimensions=1x1 bytes=9 "
+                     "container_probe=ffmpeg.exe probe_source=ffmpeg-i codec=prores container=mov sar=1:1 dar=16:9")
+    lines.append(f"[BATCH] DONE view-0 exported={exported} skipped={skipped} elapsed={elapsed:.1f}")
     return "\n".join(lines) + "\n"
 
 
-def output_manifest(count: int, kind: str = "dng") -> str:
+def verified_line(frames: int, dims: str, clip: str = "view-0") -> str:
+    """EXPORT-RENDER-PIPE-TIMING-1 r6 (sol r5 B3 forced companion): a RENDER_VERIFIED line with the producer's fields through dimensions= in its order (BatchRunner.cpp:803).
+    (EXPORT-RENDER-PIPE-TIMING-2 r2 forced companion: and the producer's whole trailer, container_probe= .. dar=, which the one line grammar requires.)"""
+    return (f"[BATCH] RENDER_VERIFIED {clip} decoded_frames={frames} decoded_duration=1.000 decoded_frame_bytes=1 dimensions={dims} bytes=9"
+            " container_probe=C:/venue/ffmpeg/bin/ffprobe.exe probe_source=ffprobe-json codec=prores container=mov sar=1:1 dar=4:3")
+
+
+def output_manifest(count: int, kind: str = "dng", clip: str = "view-0") -> str:
     # r19 (sol r18 B3): the endpoint records carry their byte size, as export-stage-job.ps1 writes them, and agree with totalBytes (one file: first and last are that file)
-    first = {"name": "a", "bytes": 1000, "sha256": "1" * 64} if count > 0 else None
-    last = ({"name": "a", "bytes": 1000, "sha256": "1" * 64} if count == 1 else {"name": "b", "bytes": 1000, "sha256": "2" * 64}) if count > 0 else None
+    # (EXPORT-RENDER-PIPE-TIMING-1 r5, sol r4 B3 forced companion: a .mov manifest names the file the fixtures' RENDER_START out=view-0.mov declares, as export-stage-job.ps1
+    # lists the leaf of the one .mov it found; the reader now binds the two)
+    # (EXPORT-RENDER-PIPE-TIMING-3 r1 forced companion: a .dng manifest names the frames of the clip DONE names, <clip>_<frame6>.dng, as CdngSequenceExport.cpp:269-271
+    # writes them, since DONE's clip is now bound to that witness)
+    one = f"{clip}.mov" if kind == "mov" else f"{clip}_000000.dng"
+    first = {"name": one, "bytes": 1000, "sha256": "1" * 64} if count > 0 else None
+    last = ({"name": one, "bytes": 1000, "sha256": "1" * 64} if count == 1 else {"name": f"{clip}_{count - 1:06d}.dng", "bytes": 1000, "sha256": "2" * 64}) if count > 0 else None
     return json.dumps({"schema": "export-stage-output-manifest.v1", "kind": kind, "count": count, "totalBytes": count * 1000,
                        "first": first, "last": last, "deleted": True})
 
@@ -103,21 +200,22 @@ EVIDENCE_CALL = ("Get-DvExportEvidence -Format $c.format -MaxFrames ([int]$c.max
                  "-ProfileText ([string]$c.profile) -StageLogText ([string]$c.stage) -BatchLogText ([string]$c.batch) -OutputManifestText ([string]$c.manifest)")
 
 
-def evidence_cases(cases: list[dict]):
+def evidence_cases(cases: list[dict], prelude: str = "", **env: str):
+    # (EXPORT-RENDER-PIPE-TIMING-3 r2: prelude runs after the module import and before the cases, e.g. to widen a module table for a defence-in-depth row; env feeds it)
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "cases.json"
         path.write_text(json.dumps(cases), encoding="utf-8")
-        return run_pwsh_json("$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+        return run_pwsh_json(prelude + "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
                              f"@($cases | ForEach-Object {{ $c = $_; $e = {EVIDENCE_CALL}; "
                              "$o = Get-DvExportOutcome -ResultToken $c.token -ExitCode ([int]$c.exit) -Evidence $e -Criteria @($c.criteria); "
                              "[ordered]@{ metrics = $e.metrics; problems = @($e.problems); classMismatch = $e.classMismatch; stages = $e.stages; outcome = $o.outcome; detail = $o.detail; "
                              "containmentAdvisory = @($e.containmentAdvisory) } }) "
-                             "| ConvertTo-Json -Compress -Depth 8 -AsArray", DVE_CASES=str(path))
+                             "| ConvertTo-Json -Compress -Depth 8 -AsArray", DVE_CASES=str(path), **env)
 
 
 def cdng_case(**over) -> dict:
     c = {"format": "cdng-lossless", "maxFrames": 30, "dualIsoExpected": True, "buildId": BUILD_ID, "profile": cdng_profile(30), "stage": None,
-         "batch": batch_log(30), "manifest": output_manifest(30), "token": "EXPORT_CAPTURED", "exit": 0,
+         "batch": batch_log(30), "manifest": output_manifest(30, clip="view-0"), "token": "EXPORT_CAPTURED", "exit": 0,
          "criteria": [{"metric": "framesExported", "op": "eq", "value": 30}, {"metric": "exportFramesFailed", "op": "eq", "value": 0},
                       {"metric": "profileFramesSucceeded", "op": "eq", "value": 30}, {"metric": "dualIsoClassAgrees", "op": "eq", "value": True}]}
     c.update(over)
@@ -307,16 +405,21 @@ class ExportEvidenceTests(unittest.TestCase):
             with self.subTest(reader_token=token):
                 self.assertTrue(any("RENDER_VERIFIED" in p for p in row["problems"]), row)
                 self.assertNotEqual(row["outcome"], "PASS", row)
-        # the emitted job's own pattern, taken from its source and run over the same lines
-        job_pattern = re.search(r"'(\(\?m\)\^\\\[BATCH\\\] RENDER_VERIFIED[^']*)'", EXPORT_JOB.read_text(encoding="utf-8"))
-        self.assertIsNotNone(job_pattern, "export-stage-job.ps1 no longer carries the RENDER_VERIFIED pattern this test reads")
+        # the emitted job reads the line by the reader's own grammar (EXPORT-RENDER-PIPE-TIMING-2 r4, sol r3 B2 forced companion: the job's private RENDER_VERIFIED regex
+        # this test used to run is gone; the grammar it embeds is the module's, and its classification over such lines is ExportJobGeneratorTests'
+        # test_t2_r4_b2_the_bachelor_classifier_reads_the_batch_log_by_the_modules_one_grammar), so the parsed decoded_frames below is the one the job compares
+        job = EXPORT_JOB.read_text(encoding="utf-8")
+        self.assertIn("$batchRead = ConvertFrom-DvBatchExportLog -BatchLogText $logText", job)
+        self.assertIn("$batchRead.verified.fields['decoded_frames']", job)
         lines = [batch_log(480, verified=t) for t in (480,) + MALFORMED_DECODED_FRAME_TOKENS]
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "lines.json"
             path.write_text(json.dumps(lines), encoding="utf-8")
-            proc, counts = run_pwsh_json("$p = $env:DVE_PATTERN\n$lines = Get-Content -Raw -LiteralPath $env:DVE_LINES -Encoding utf8 | ConvertFrom-Json\n"
-                                         "@($lines | ForEach-Object { @([regex]::Matches([string]$_, $p)).Count }) | ConvertTo-Json -Compress -AsArray",
-                                         DVE_PATTERN=job_pattern.group(1), DVE_LINES=str(path))
+            proc, counts = run_pwsh_json("$lines = Get-Content -Raw -LiteralPath $env:DVE_LINES -Encoding utf8 | ConvertFrom-Json\n"
+                                         "$m = Get-Module DualVenueRunner\n"
+                                         "@($lines | ForEach-Object { $v = (& $m { param($t) ConvertFrom-DvBatchExportLog -BatchLogText $t } ([string]$_)).verified; "
+                                         "$(if ($null -eq $v.problem) { 1 } else { 0 }) }) | ConvertTo-Json -Compress -AsArray",
+                                         DVE_LINES=str(path))
         self.assertIsNotNone(counts, proc.stdout[-2000:] + proc.stderr[-2000:])
         self.assertEqual(counts, [1] + [0] * len(MALFORMED_DECODED_FRAME_TOKENS), "the job reads a malformed decoded_frames token as a verification")
 
@@ -376,7 +479,9 @@ class ExportEvidenceTests(unittest.TestCase):
         self.assertAlmostEqual(ps["rows"]["debayered_frame"]["share"], 40.0 / 56.0, places=4)
         self.assertAlmostEqual(ps["batchWallPerFrameMs"], 20000.0 / 30.0, places=3)
         self.assertAlmostEqual(ps["untimedPerFrameMs"], 20000.0 / 30.0 - 56.0, places=3)
-        self.assertIn("EXPORT-RENDER-PIPE-TIMING-1", ps["untimed"])
+        # EXPORT-RENDER-PIPE-TIMING-1: a log with no pipe stage is a build before that card, and the text says what such a build leaves untimed
+        self.assertIn("a build before EXPORT-RENDER-PIPE-TIMING-1", ps["untimed"])
+        self.assertIn("pipe write", ps["untimed"])
         self.assertAlmostEqual(ps["disjointSumMs"], 55.0)
         self.assertTrue(ps["disjointWithin5Percent"])
         self.assertEqual(ps["largestStage"], "debayered_frame")
@@ -642,8 +747,8 @@ class ExportEvidenceTests(unittest.TestCase):
         def manifest(count: int, kind: str, total: int, first, last) -> str:
             return json.dumps({"schema": "export-stage-output-manifest.v1", "kind": kind, "count": count, "totalBytes": total, "first": first, "last": last, "deleted": True})
         one = {"name": "view-0.mov", "bytes": 1000, "sha256": "1" * 64}
-        a = {"name": "000000.dng", "bytes": 1000, "sha256": "1" * 64}
-        b = {"name": "000029.dng", "bytes": 1000, "sha256": "2" * 64}
+        a = {"name": "view-0_000000.dng", "bytes": 1000, "sha256": "1" * 64}   # (TIMING-3 r1 forced companion: the DONE clip's frame leaves)
+        b = {"name": "view-0_000029.dng", "bytes": 1000, "sha256": "2" * 64}
         cases = [prores_case(manifest=manifest(1, "mov", 1, one, one)),                                             # 0 sol repro: MOV total 1, a 1000-byte file
                  cdng_case(manifest=manifest(30, "dng", 1, a, b)),                                                  # 1 sol repro: DNG total 1, two 1000-byte endpoints
                  prores_case(manifest=manifest(1, "mov", 1000, one, {**one, "name": "other.mov"})),                 # 2 one file, two names
@@ -673,7 +778,7 @@ class ExportEvidenceTests(unittest.TestCase):
         into a double, whose rounding read the sum as within totalBytes 9223372036854775807, so a manifest whose endpoints use the whole total read PASS. The sums are exact now."""
         top = 9223372036854775807
         doc = {"schema": "export-stage-output-manifest.v1", "kind": "dng", "count": 30, "totalBytes": top, "deleted": True,
-               "first": {"name": "000000.dng", "bytes": top - 1, "sha256": "1" * 64}, "last": {"name": "000029.dng", "bytes": 1, "sha256": "2" * 64}}
+               "first": {"name": "view-0_000000.dng", "bytes": top - 1, "sha256": "1" * 64}, "last": {"name": "view-0_000029.dng", "bytes": 1, "sha256": "2" * 64}}
         proc, got = evidence_cases([cdng_case(manifest=json.dumps(doc))])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         self.assertEqual(got[0]["outcome"], "INVALID", got[0])
@@ -787,7 +892,8 @@ class ExportEvidenceTests(unittest.TestCase):
 
         def case(fmt: str, elapsed: float, n: int = frames) -> dict:
             if fmt == "prores":
-                return prores_case(maxFrames=n, stage=stage_log(n), batch=batch_log(n, verified=n, elapsed=elapsed), manifest=output_manifest(1, "mov"), criteria=shipped[fmt])
+                return prores_case(maxFrames=n, dualIsoExpected=True, stage=with_pipe_stages(stage_log(n), n), batch=batch_log(n, verified=n, elapsed=elapsed),
+                                   manifest=output_manifest(1, "mov"), criteria=shipped[fmt])
             return cdng_case(maxFrames=n, profile=cdng_profile(n), batch=batch_log(n, elapsed=elapsed), manifest=output_manifest(n), criteria=shipped[fmt])
         cases = [case(f, e) for f in ("prores", "cdng-lossless") for e in (0.0, 0.1, 60.0)]
         # tolerance: 30 frames of 56 ms is 1.68 s of work; an elapsed of 1.6 s is 5 % under (one decimal of logging, a clock's rounding), not a contradiction
@@ -797,7 +903,10 @@ class ExportEvidenceTests(unittest.TestCase):
         for (fmt, elapsed), g in zip([(f, e) for f in ("prores", "cdng-lossless") for e in (0.0, 0.1, 60.0)], got):
             with self.subTest(fmt=fmt, elapsed=elapsed):
                 if elapsed == 60.0:
-                    self.assertEqual(g["outcome"], "PASS", g)
+                    if fmt == "prores":   # (r3, adversary A2 on c2da7e24: the shipped dual-ISO criterion reads the typed UNKNOWN)
+                        assert_clean_but_dual_iso_unknown(self, g)
+                    else:
+                        self.assertEqual(g["outcome"], "PASS", g)
                     self.assertFalse(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p for p in g["problems"]), g)
                 else:
                     self.assertEqual(g["outcome"], "INVALID", g)
@@ -840,12 +949,12 @@ class ExportEvidenceTests(unittest.TestCase):
         criteria = leg("m16-1243-export-prores")["criteria"]["acceptance"]["cpu"]
 
         def case(disk: float, decomp: float) -> dict:
-            return prores_case(maxFrames=480, stage=log(disk, decomp), batch=batch_log(480, verified=480, elapsed=60.0), criteria=criteria)
+            return prores_case(maxFrames=480, dualIsoExpected=True, stage=with_pipe_stages(log(disk, decomp), 480), batch=batch_log(480, verified=480, elapsed=60.0), criteria=criteria)
         proc, got = evidence_cases([case(900.0, 900.0), case(3.0, 5.0), case(30.0, 30.0)])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         self.assertEqual(got[0]["outcome"], "INVALID", got[0])
         self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p for p in got[0]["problems"]), got[0])
-        self.assertEqual(got[1]["outcome"], "PASS", got[1])   # control: small nested stages
+        assert_clean_but_dual_iso_unknown(self, got[1])   # control: small nested stages (r3: clean, the shipped dual-ISO criterion UNKNOWN)
         self.assertEqual(got[2]["outcome"], "INVALID", got[2])   # 30 + 30 ms together do not fit a 41 ms parent beside... each fits, the SUM (60) does not
         self.assertTrue(any("the disjoint stages" in p for p in got[2]["problems"]), got[2])
 
@@ -876,7 +985,7 @@ class ExportEvidenceTests(unittest.TestCase):
         criteria = leg("m16-1243-export-prores")["criteria"]["acceptance"]["cpu"]
 
         def case(rows: tuple) -> dict:
-            return prores_case(maxFrames=480, stage=log(rows), batch=batch_log(480, verified=480, elapsed=60.0), criteria=criteria)
+            return prores_case(maxFrames=480, dualIsoExpected=True, stage=with_pipe_stages(log(rows), 480), batch=batch_log(480, verified=480, elapsed=60.0), criteria=criteria)
         no_raw = (("processed16_total", 56.0), ("debayered_frame", 40.0), ("processing", 16.0), ("raw_uint16_disk_read", 25.0), ("raw_uint16_decompress", 10.0), ("llrawproc", 30.0))
         no_debayer = (("processed16_total", 56.0), ("processing", 16.0), ("raw_uint16", 40.0), ("llrawproc", 30.0))
         ok = (("processed16_total", 56.0), ("debayered_frame", 40.0), ("processing", 16.0), ("raw_uint16_disk_read", 5.0), ("raw_uint16_decompress", 5.0), ("llrawproc", 10.0))
@@ -886,7 +995,7 @@ class ExportEvidenceTests(unittest.TestCase):
             with self.subTest(case=i):
                 self.assertEqual(got[i]["outcome"], "INVALID", got[i])
                 self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "the disjoint stages" in p for p in got[i]["problems"]), got[i])
-        self.assertEqual(got[2]["outcome"], "PASS", got[2])
+        assert_clean_but_dual_iso_unknown(self, got[2])
 
     def test_r13_adversary_a2_cdng_disjoint_producer_work_is_held_inside_producer_frame_without_the_llrawproc_total(self) -> None:
         """adversary r13 A2: llrawproc_ms is an optional total. Without it raw_read 20 + dark_frame 30 + dual_iso 30 (80 ms of disjoint work) inside a 50 ms producer_frame read PASS,
@@ -956,8 +1065,8 @@ class ExportEvidenceTests(unittest.TestCase):
             profiles.append(profile({"producer_frame_ms": 100.0, "llrawproc_ms": 100.0, child: 80.0, "llrawproc_dual_iso_ms": 1.0, "llrawproc_other_ms": 19.0, "llrawproc_publish_lock_ms": 80.0}))
             profiles.append(profile({"producer_frame_ms": 100.0, child: 80.0, "llrawproc_dual_iso_ms": 1.0, "llrawproc_other_ms": 19.0, "llrawproc_publish_lock_ms": 80.0}, drop_total=True))
         refine = profile({"producer_frame_ms": 100.0, "llrawproc_ms": 100.0, "llrawproc_dark_frame_ms": 80.0, "llrawproc_dual_iso_ms": 1.0, "llrawproc_other_ms": 19.0, "llrawproc_dualiso_refine_lock_ms": 80.0})
-        control = profile({"producer_frame_ms": 120.0, "llrawproc_ms": 100.0, "llrawproc_dark_frame_ms": 20.0, "llrawproc_dual_iso_ms": 1.0, "llrawproc_other_ms": 69.0,
-                           "llrawproc_publish_lock_ms": 10.0, "llrawproc_dualiso_refine_lock_ms": 10.0, "llrawproc_shared_lock_ms": 20.0})   # (r17: pass17 A1, see the r13 control)
+        control = profile({"producer_frame_ms": 120.0, "llrawproc_ms": 100.0, "llrawproc_dark_frame_ms": 20.0, "llrawproc_dual_iso_ms": 1.0, "llrawproc_other_ms": 79.0,
+                           "llrawproc_publish_lock_ms": 10.0, "llrawproc_dualiso_refine_lock_ms": 10.0, "llrawproc_shared_lock_ms": 20.0})   # (r17: pass17 A1, see the r13 control; EXPORT-CDNG-TOTAL-CONTAINMENT-1: other = total 100 - the 21 ms of timed children, as dng.c:579-604 writes it)
         proc, got = evidence_cases([cdng_case(dualIsoExpected=True, profile=p, criteria=[]) for p in profiles + [refine, control]])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         for i in range(len(profiles) + 1):
@@ -1155,6 +1264,1411 @@ class ExportEvidenceTests(unittest.TestCase):
                     self.assertIsNone(row_["r"], row_)
                 else:
                     self.assertIsNotNone(row_["r"], row_)
+
+
+@requires_windows_pwsh
+class ExportRenderPipeTimingTests(unittest.TestCase):
+    """EXPORT-RENDER-PIPE-TIMING-1: the rendered (ProRes) export emits llrawproc_dual_iso and export_pipe_write (export_scale when scaled) per frame and export_pipe_drain and
+    export_verify once per clip, under MLVAPP_STAGE_TIMING only. The judge reads them: a ProRes leg gains dualIsoClassAgrees (mirroring the CDNG profile's
+    llrawproc_dual_iso_ms rule) and renderPipeTimed, and untimedPerFrameMs no longer counts the pipe, drain and verify. A log from an older build keeps its old reading."""
+
+    SHIPPED = [{"metric": "framesExported", "op": "eq", "value": 30}, {"metric": "exportFramesFailed", "op": "eq", "value": 0},
+               {"metric": "stageFramesSeen", "op": "eq", "value": 30}] + [dict(c) for c in PIPE_CRITERIA]
+
+    def case(self, stage: str, **over) -> dict:
+        c = prores_case(dualIsoExpected=True, stage=stage, criteria=self.SHIPPED)
+        c.update(over)
+        return c
+
+    def test_r1_a_log_without_the_new_stages_is_never_pass_under_the_new_criteria(self) -> None:
+        proc, got = evidence_cases([self.case(stage_log(30)), self.case(stage_log(30), dualIsoExpected=False)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got:
+            self.assertNotEqual(g["outcome"], "PASS", g)
+            m = g["metrics"]
+            self.assertIsNone(m["dualIsoClassAgrees"], g)
+            self.assertIsNone(m["renderPipeTimed"], g)
+            self.assertIn("a build before EXPORT-RENDER-PIPE-TIMING-1", m["dualIsoClassAgreesCouldNotCheck"])
+            self.assertIn("a build before EXPORT-RENDER-PIPE-TIMING-1", m["renderPipeTimedCouldNotCheck"])
+            self.assertEqual(g["problems"], [], "an older build's log raises no new problem: the criteria, not the reader, refuse it")
+
+    def test_r2_a_log_with_the_new_stages_passes_and_untimed_is_the_batch_wall_less_the_timed_work(self) -> None:
+        proc, got = evidence_cases([self.case(piped_stage_log(30))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        g = got[0]
+        # (r3, adversary A2 on c2da7e24: the log is clean and every other shipped criterion is met, but a dual-ISO time above 0 is an attempt, so the class is the typed
+        # UNKNOWN and the shipped dual-ISO criterion FAILs: KNOWN GAP until EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1)
+        assert_clean_but_dual_iso_unknown(self, g)
+        m, st = g["metrics"], g["stages"]
+        self.assertIsNone(m["dualIsoClassAgrees"])
+        self.assertIsNone(m["dualIsoActiveFrames"])
+        self.assertIs(m["renderPipeTimed"], True)
+        self.assertTrue(m["dualIsoClassAgreesCouldNotCheck"].startswith(DUALISO_UNKNOWN), m)
+        self.assertNotIn("renderPipeTimedCouldNotCheck", m)
+        # batch wall 20 s / 30 frames, less processed16_total 56 + export_pipe_write 10 + (drain 100 + verify 200) / 30 frames
+        self.assertAlmostEqual(st["untimedPerFrameMs"], 20000.0 / 30.0 - (56.0 + 10.0 + 300.0 / 30.0), places=3)
+        self.assertAlmostEqual(st["untimedPerFrameMs"], 590.666667, places=3)
+        # (the card's list said "probe"; the decode / ffprobe / ffmpeg-dump probes run inside the timed export_verify block, BatchRunner.cpp verify section, so what stays
+        # untimed is the work before the first frame and the publish)
+        for name in ("clip open", "receipt apply", "ffmpeg start", "publish"):
+            self.assertIn(name, st["untimed"])
+        self.assertIn("export_verify", st["untimed"])
+        self.assertAlmostEqual(st["rows"]["llrawproc_dual_iso"]["meanMs"], 30.0)
+        self.assertAlmostEqual(st["rows"]["export_pipe_write"]["meanMs"], 10.0)
+        self.assertAlmostEqual(st["clipRows"]["export_pipe_drain"]["meanMs"], 100.0)
+        self.assertAlmostEqual(st["clipRows"]["export_verify"]["meanMs"], 200.0)
+        self.assertEqual(st["largestStage"], "debayered_frame", "largestStage stays a share of processed16_total's top-level children")
+        self.assertIsNone(st["rows"]["export_pipe_write"]["share"], "the pipe write is not inside processed16_total, so it is no share of it")
+        # scaled: export_scale per frame is counted too
+        proc, got = evidence_cases([self.case(piped_stage_log(30, scale_ms=6.0), batch=batch_log(30, verified=30, scaled=True))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        assert_clean_but_dual_iso_unknown(self, got[0])
+        self.assertAlmostEqual(got[0]["stages"]["untimedPerFrameMs"], 20000.0 / 30.0 - (56.0 + 6.0 + 10.0 + 10.0), places=3)
+
+    def test_r3_no_dual_iso_on_a_dual_iso_leg_is_a_clip_class_mismatch(self) -> None:
+        proc, got = evidence_cases([self.case(piped_stage_log(30, dual_iso_ms=0.0)), self.case(piped_stage_log(30), dualIsoExpected=False),
+                                    self.case(piped_stage_log(30, dual_iso_ms=0.0), dualIsoExpected=False)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:2]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertIn("CLIP_CLASS_MISMATCH", g["detail"])
+            self.assertTrue(g["classMismatch"])
+            self.assertIs(g["metrics"]["dualIsoClassAgrees"], False)
+        self.assertEqual(got[0]["metrics"]["dualIsoActiveFrames"], 0)
+        # (r5, sol r4 B8 forced companion: 0.000 on every frame is a ROUNDED figure, so on a no-dual-ISO leg it cannot show that no attempt ran: the typed UNKNOWN, never
+        # agreement, and no class mismatch either)
+        self.assertIsNone(got[2]["metrics"]["dualIsoClassAgrees"], got[2])
+        self.assertFalse(got[2]["classMismatch"], got[2])
+        self.assertIn(DUALISO_UNKNOWN, got[2]["metrics"]["dualIsoClassAgreesCouldNotCheck"], got[2])
+        self.assertEqual(got[2]["problems"], [], got[2])
+
+    def test_r4_a_dual_iso_figure_longer_than_its_llrawproc_is_a_containment_problem(self) -> None:
+        proc, got = evidence_cases([self.case(piped_stage_log(30, dual_iso_ms=35.0, llrawproc_ms=20.0)), self.case(piped_stage_log(30, dual_iso_ms=20.0, llrawproc_ms=20.0))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "INVALID", got[0])
+        self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "llrawproc_dual_iso" in p for p in got[0]["problems"]), got[0])
+        assert_clean_but_dual_iso_unknown(self, got[1])
+
+    def test_r5_a_clip_stage_recorded_twice_or_on_another_frame_is_typed(self) -> None:
+        moved = piped_stage_log(30).replace("frame=29 stage=export_verify", "frame=3 stage=export_verify")
+        proc, got = evidence_cases([self.case(piped_stage_log(30, drain_count=2)), self.case(piped_stage_log(30, verify_count=3)), self.case(moved, criteria=[])])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g, stage in ((got[0], "export_pipe_drain"), (got[1], "export_verify")):
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and stage in p and "exactly once" in p for p in g["problems"]), g)
+        self.assertEqual(got[2]["outcome"], "INVALID", got[2])
+        self.assertTrue(any(p.startswith("EXPORT_STAGE_WINDOW_MISMATCH") and "export_verify" in p for p in got[2]["problems"]), got[2])
+
+    def test_r6_a_per_frame_pipe_stage_on_a_subset_of_frames_is_a_window_mismatch(self) -> None:
+        cases = [self.case(piped_stage_log(30, pipe_frames=range(15))), self.case(piped_stage_log(30, pipe_frames=range(15)), criteria=[]),
+                 self.case(piped_stage_log(30, scale_ms=4.0).replace("frame=7 stage=export_scale ms=4.000\n", ""), batch=batch_log(30, verified=30, scaled=True), criteria=[])]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_STAGE_WINDOW_MISMATCH") for p in g["problems"]), g)
+        self.assertIs(got[1]["metrics"]["renderPipeTimed"], False)
+
+    def test_r6b_a_pipe_timed_on_every_frame_without_its_drain_or_verify_is_not_render_pipe_timed(self) -> None:
+        proc, got = evidence_cases([self.case(piped_stage_log(30, drain_count=0)), self.case(piped_stage_log(30, verify_count=0))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got:
+            self.assertIs(g["metrics"]["renderPipeTimed"], False, g)
+            self.assertNotEqual(g["outcome"], "PASS", g)
+
+    def test_r6c_the_pipe_and_clip_stages_are_held_inside_the_batch_wall(self) -> None:
+        # 30 frames, a 2.0 s wall = 66.7 ms per frame; processed16_total 56 fits alone, 56 + a 40 ms pipe write does not
+        proc, got = evidence_cases([self.case(piped_stage_log(30, pipe_ms=40.0, drain_ms=1.0, verify_ms=1.0), batch=batch_log(30, verified=30, elapsed=2.0), criteria=[]),
+                                    self.case(piped_stage_log(30, pipe_ms=1.0, drain_ms=1.0, verify_ms=900.0), batch=batch_log(30, verified=30, elapsed=2.0), criteria=[]),
+                                    self.case(piped_stage_log(30, pipe_ms=1.0, drain_ms=1.0, verify_ms=1.0), batch=batch_log(30, verified=30, elapsed=2.0), criteria=[])])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:2]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "batch_wall_per_frame" in p for p in g["problems"]), g)
+        self.assertEqual(got[2]["outcome"], "PASS", got[2])
+
+    def test_r7_back_compat_todays_log_and_criteria_read_exactly_as_before(self) -> None:
+        proc, got = evidence_cases([prores_case(), prores_case(dualIsoExpected=True), prores_case(criteria=[])])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got:
+            self.assertEqual(g["outcome"], "PASS", g)
+            self.assertEqual(g["problems"], [], g)
+            self.assertFalse(g["classMismatch"], g)
+            st = g["stages"]
+            self.assertAlmostEqual(st["untimedPerFrameMs"], 20000.0 / 30.0 - 56.0, places=3)
+            self.assertEqual(st["largestStage"], "debayered_frame")
+            self.assertIsNone(g["metrics"]["dualIsoActiveFrames"])
+
+    def test_adversary_r1_a1_the_dual_iso_leaf_stands_in_for_an_unpublished_llrawproc_in_every_sum_group(self) -> None:
+        """adversary r1 A1 (00a7cf09): with llrawproc unpublished, llrawproc_dual_iso joined no disjoint group, so raw_uint16 30 + dual-ISO 30 (60 ms of disjoint work) inside a
+        40 ms debayered_frame read PASS. The dual-ISO leaf takes llrawproc's place in every group that holds llrawproc (inside debayered_frame and, without it, the denominator)."""
+        def log(rows: tuple) -> str:
+            per = "".join(f"[mlv-stage-timing] frame={i} stage={s} ms={ms:.3f}\n" for i in range(480) for s, ms in rows)
+            return per + "[mlv-stage-timing] frame=479 stage=export_pipe_drain ms=100.000\n[mlv-stage-timing] frame=479 stage=export_verify ms=200.000\n"
+        finding = (("raw_uint16", 30.0), ("llrawproc_dual_iso", 30.0), ("debayered_frame", 40.0), ("processing", 15.0), ("processed16_total", 56.0), ("export_pipe_write", 10.0))
+        no_debayer = (("raw_uint16", 30.0), ("llrawproc_dual_iso", 30.0), ("processing", 15.0), ("processed16_total", 56.0), ("export_pipe_write", 10.0))
+        control = (("raw_uint16", 9.0), ("llrawproc_dual_iso", 30.0), ("debayered_frame", 40.0), ("processing", 15.0), ("processed16_total", 56.0), ("export_pipe_write", 10.0))
+        shipped = leg("m16-1243-export-prores")["criteria"]["acceptance"]["cpu"]
+        cases = [prores_case(maxFrames=480, dualIsoExpected=True, stage=log(rows), batch=batch_log(480, verified=480, elapsed=60.0), criteria=shipped) for rows in (finding, no_debayer, control)]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:2]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "the disjoint stages" in p and "llrawproc_dual_iso" in p for p in g["problems"]), g)
+        assert_clean_but_dual_iso_unknown(self, got[2])
+
+    @staticmethod
+    def rows_log(rows: tuple, frames: int = 480) -> str:
+        per = "".join(f"[mlv-stage-timing] frame={i} stage={s} ms={ms:.3f}\n" for i in range(frames) for s, ms in rows)
+        return per + f"[mlv-stage-timing] frame={frames - 1} stage=export_pipe_drain ms=100.000\n[mlv-stage-timing] frame={frames - 1} stage=export_verify ms=200.000\n"
+
+    def big(self, stage: str, frames: int = 480, **over) -> dict:
+        c = prores_case(maxFrames=frames, dualIsoExpected=True, stage=stage, batch=batch_log(frames, verified=frames, elapsed=60.0),
+                        criteria=leg("m16-1243-export-prores")["criteria"]["acceptance"]["cpu"])
+        c.update(over)
+        return c
+
+    def test_adversary_r1f2_a1_the_dual_iso_twin_group_is_not_judged_when_llrawproc_is_published(self) -> None:
+        """adversary A1 on 33f7a05a: the derived twin (raw_uint16 + llrawproc_dual_iso inside debayered_frame) fired beside a published llrawproc, where the dual-ISO figure is
+        INSIDE llrawproc and the real group already holds it: raw 23 + llrawproc 20 + dual-ISO 20.001 inside a 40 ms debayered_frame read INVALID. The twin stands in only for an
+        llrawproc the run did not publish."""
+        rows = (("raw_uint16", 23.0), ("llrawproc", 20.0), ("llrawproc_dual_iso", 20.001), ("debayered_frame", 40.0), ("processing", 15.0), ("processed16_total", 56.0),
+                ("export_pipe_write", 10.0))
+        proc, got = evidence_cases([self.big(self.rows_log(rows))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        assert_clean_but_dual_iso_unknown(self, got[0])
+
+    def test_adversary_r1f2_a3_the_render_start_scaled_flag_decides_whether_export_scale_is_owed(self) -> None:
+        """adversary A3 on 33f7a05a: the reader never read RENDER_START, so a scaled plan with no export_scale (its residual 6 ms high) and an unscaled plan carrying export_scale
+        (6 ms subtracted for work it declared none of) both read PASS. A build of this card declares scaled= and times export_scale on every frame exactly when it is true."""
+        def batch(scaled: bool, src: str, out: str) -> str:
+            # (r5, sol r4 B3 forced companion: the verified dimensions are the declared output's, as the producer's RENDER_VERIFIED prints outWidth x outHeight)
+            return batch_log(480, verified=480, elapsed=60.0, scaled=None).replace(" dimensions=1x1 ", f" dimensions={out} ").replace(
+                "[BATCH] RENDER_VERIFIED", f"[BATCH] RENDER_START view-0 codec=prores container=mov source={src} output={out} scaled={'true' if scaled else 'false'} fps=24 "
+                                           "frames=480 cutIn=1 cutOut=480 out=view-0.mov\n[BATCH] RENDER_VERIFIED", 1)
+        scaled_log = piped_stage_log(480, scale_ms=6.0)
+        no_scale = "".join(l + "\n" for l in scaled_log.splitlines() if "stage=export_scale " not in l)
+        cases = [self.big(no_scale, batch=batch(True, "1920x1080", "1920x1440")), self.big(scaled_log, batch=batch(False, "1920x1080", "1920x1080")),
+                 self.big(scaled_log, batch=batch(True, "1920x1080", "1920x1440")), self.big(no_scale, batch=batch(False, "1920x1080", "1920x1080")),
+                 self.big(scaled_log, batch=batch_log(480, verified=480, elapsed=60.0, scaled=None))]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:2]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any("export_scale" in p and "scaled=" in p for p in g["problems"]), g)
+        for g in got[2:4]:
+            assert_clean_but_dual_iso_unknown(self, g)
+        self.assertAlmostEqual(got[2]["stages"]["untimedPerFrameMs"], 125.0 - (56.0 + 6.0 + 10.0 + 300.0 / 480.0), places=3)
+        self.assertEqual(got[4]["outcome"], "INVALID", got[4])
+        self.assertTrue(any("RENDER_START" in p for p in got[4]["problems"]), got[4])
+
+    def test_adversary_r1f2_a4_a_per_frame_stage_recorded_twice_on_one_frame_is_invalid(self) -> None:
+        """adversary A4 on 33f7a05a: per-frame records were SUMMED, so every export_pipe_write (or export_scale) repeated once doubled the subtracted work and still read PASS, and a
+        dual-ISO 0.000 row beside a 30.000 row on one frame read as an active frame. The producer notes each once per frame (llrawproc_dual_iso once per llrawproc record)."""
+        base = piped_stage_log(480)
+        dup_pipe = "".join(l + "\n" + (l + "\n" if "stage=export_pipe_write " in l else "") for l in base.splitlines())
+        scaled = piped_stage_log(480, scale_ms=6.0)
+        dup_scale = "".join(l + "\n" + (l + "\n" if "stage=export_scale " in l else "") for l in scaled.splitlines())
+        zero = piped_stage_log(480, dual_iso_ms=0.0)
+        dup_dual = "".join(l + "\n" + (l.replace("ms=0.000", "ms=30.000") + "\n" if "stage=llrawproc_dual_iso " in l else "") for l in zero.splitlines())
+        sb = batch_log(480, verified=480, elapsed=60.0, scaled=True)
+        proc, got = evidence_cases([self.big(dup_pipe), self.big(dup_scale, batch=sb), self.big(dup_dual), self.big(base)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g, stage in zip(got[:3], ("export_pipe_write", "export_scale", "llrawproc_dual_iso")):
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and stage in p and "per frame" in p for p in g["problems"]), (stage, g))
+        assert_clean_but_dual_iso_unknown(self, got[3])
+
+    def test_adversary_r1f2_a5_a_log_with_some_of_this_cards_stages_is_an_incomplete_capture_not_an_older_build_or_a_fail(self) -> None:
+        """adversary A5 on 33f7a05a: a log that carries this card's pipe stages but no dual-ISO row kept the older-build reason, and one missing its drain (or verify) read a
+        product FAIL with no problem. Any of this card's stages is proof the build emits them all, so a missing one is an incomplete capture: INVALID, naming it."""
+        proc, got = evidence_cases([self.big(piped_stage_log(480, dual_iso=False)), self.big(piped_stage_log(480, drain_count=0)), self.big(piped_stage_log(480, verify_count=0)),
+                                    self.big(piped_stage_log(480).replace("stage=export_pipe_write", "stage=other_stage")),
+                                    self.big(stage_log(480) + "".join(f"[mlv-stage-timing] frame={i} stage=llrawproc_dual_iso ms=5.000\n" for i in range(480)))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g, stage in zip(got, ("llrawproc_dual_iso", "export_pipe_drain", "export_verify", "export_pipe_write", "export_pipe_write")):
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_PROFILE_ABSENT") and stage in p and "incomplete" in p for p in g["problems"]), (stage, g))
+            self.assertNotIn("a build before EXPORT-RENDER-PIPE-TIMING-1", json.dumps(g["metrics"]), g)
+        self.assertIs(got[1]["metrics"]["renderPipeTimed"], False)
+
+    def test_adversary_r1f2_a7_distinguish_a_frame_whose_raw_read_failed_carries_no_llrawproc_either_and_is_invalid(self) -> None:
+        """adversary A7 on 33f7a05a (DISTINGUISH): a raw-read failure returns before llrawproc runs, so that frame carries neither llrawproc nor llrawproc_dual_iso while
+        processed16_total is still timed. The base judge already holds llrawproc to processed16_total's frames, so the run is EXPORT_STAGE_WINDOW_MISMATCH: INVALID, never a
+        PASS with a dual-ISO class read from 479 of 480 frames."""
+        log = "".join(l + "\n" for l in piped_stage_log(480).splitlines() if not (l.startswith("[mlv-stage-timing] frame=17 stage=llrawproc")))
+        proc, got = evidence_cases([self.big(log)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "INVALID", got[0])
+        self.assertTrue(any(p.startswith("EXPORT_STAGE_WINDOW_MISMATCH") and "llrawproc" in p for p in got[0]["problems"]), got[0])
+        self.assertIsNone(got[0]["metrics"]["dualIsoClassAgrees"], got[0])
+
+    # --- r2: adversary pass 3 on a6f48506 (A1-A6, advisory A8). The control is the adversary's own: 480 frames, cutIn=1 cutOut=480, the shipped acceptance criteria.
+    CTL_START = ("[BATCH] RENDER_START view-0 codec=prores container=mov source=1920x1080 output=1920x1080 scaled=false fps=24 frames=480 cutIn=1 cutOut=480 "
+                 "out=view-0.mov")
+
+    @classmethod
+    def ctl_batch(cls, start: str | None = None, verified_clip: str = "view-0", order: tuple = ("start", "verified", "done")) -> str:
+        # (r6, sol r5 B3 forced companion: RENDER_VERIFIED carries the producer's required fields through dimensions=, which is the declared output's)
+        start = cls.CTL_START if start is None else start
+        out = re.search(r" output=(\S+)", start)
+        lines = {"start": start, "verified": verified_line(480, out.group(1) if out else "1920x1080", clip=verified_clip),
+                 "done": "[BATCH] DONE view-0 exported=480 skipped=0 elapsed=60.0"}
+        return "\n".join(lines[k] for k in order) + "\n"
+
+    def ctl(self, stage: str | None = None, **over) -> dict:
+        c = self.big(piped_stage_log(480) if stage is None else stage, batch=self.ctl_batch())
+        c.update(over)
+        return c
+
+    @staticmethod
+    def head_sha() -> str:
+        import subprocess
+        return subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+
+    def test_adversary_r2_a1_the_legacy_shape_reads_zero_or_one_new_stage_under_strict_mode_and_stop(self) -> None:
+        """adversary A1 on a6f48506 (blocker): -LegacyRenderShape read .Count on a bare filter result, which under the module's Set-StrictMode -Version Latest throws
+        PropertyNotFoundStrict for zero or one matching stage. Called directly with ErrorActionPreference Stop, both must return: zero new stages -> the base shape (no
+        renderPipeTimed), one new stage -> this card's shape (and the incomplete capture typed)."""
+        one = stage_log(30) + "".join(f"[mlv-stage-timing] frame={i} stage=export_pipe_write ms=1.000\n" for i in range(30))
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([prores_case(dualIsoExpected=True, stage=stage_log(30)), prores_case(dualIsoExpected=True, stage=one)]), encoding="utf-8")
+            proc, got = run_pwsh_json("$ErrorActionPreference = 'Stop'\n$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                                      f"@($cases | ForEach-Object {{ $c = $_; try {{ $e = {EVIDENCE_CALL} -LegacyRenderShape; "
+                                      "[ordered]@{ threw = $null; metrics = $e.metrics; problems = @($e.problems) } } catch { [ordered]@{ threw = [string]$_.FullyQualifiedErrorId } } }) "
+                                      "| ConvertTo-Json -Compress -Depth 8 -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got:
+            self.assertIsNone(g["threw"], g)
+        self.assertNotIn("renderPipeTimed", got[0]["metrics"], "zero new stages: the base reader's shape")
+        self.assertEqual(got[0]["problems"], [], got[0])
+        self.assertIn("renderPipeTimed", got[1]["metrics"], "one new stage: this card's shape, never the base one")
+        self.assertTrue(any(p.startswith("EXPORT_PROFILE_ABSENT") and "incomplete" in p for p in got[1]["problems"]), got[1])
+
+    def test_adversary_r2_a2_render_start_is_read_whole_for_dones_clip(self) -> None:
+        """adversary A2 on a6f48506: the first scaled= token of any RENDER_START line was the declaration, so a conflicting second scaled=, a line cut short after scaled= and
+        another clip's line all read PASS. The line is read whole, in the producer's field order, for the clip DONE names."""
+        conflict = self.CTL_START.replace("output=1920x1080 scaled=false", "output=1920x1440 scaled=false scaled=true")
+        foreign = self.CTL_START.replace("RENDER_START view-0", "RENDER_START view-1")
+        cut = self.CTL_START.split(" fps=")[0]
+        doubled = self.CTL_START.replace(" out=view-0.mov", " cutIn=1 out=view-0.mov")
+        cases = [self.ctl(batch=self.ctl_batch(s)) for s in (conflict, foreign, cut, doubled)] + [self.ctl()]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:4]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any("RENDER_START" in p for p in g["problems"]), g)
+        self.assertTrue(any("view-1" in p and "DONE" in p for p in got[1]["problems"]), got[1])
+        assert_clean_but_dual_iso_unknown(self, got[4])
+
+    @staticmethod
+    def shift(log: str, by: int) -> str:
+        return re.sub(r"frame=(\d+)", lambda m: f"frame={int(m.group(1)) + by}", log)
+
+    def test_adversary_r2_a3_the_frame_window_is_the_declared_cut_not_the_log(self) -> None:
+        """adversary A3 on a6f48506: the window came from the stage log itself, so frames 1..480 under cutIn=1 cutOut=480 read PASS (the producer's loop, BatchRunner.cpp:541,
+        times frames cutIn-1 .. cutOut-1 only), and a one-frame cut timed on frame 999999999999 read no problem. The control: a cut that starts at 5 is timed on 4..483."""
+        rows = (("raw_uint16", 9.0), ("llrawproc", 31.0), ("llrawproc_dual_iso", 30.0), ("debayered_frame", 40.0), ("processing", 15.0), ("processed16_total", 56.0), ("export_pipe_write", 10.0))
+        one = "".join(f"[mlv-stage-timing] frame=999999999999 stage={s} ms={ms:.3f}\n" for s, ms in rows)
+        one += "[mlv-stage-timing] frame=999999999999 stage=export_pipe_drain ms=1.000\n[mlv-stage-timing] frame=999999999999 stage=export_verify ms=1.000\n"
+        one_batch = ("[BATCH] RENDER_START view-0 codec=prores container=mov source=1x1 output=1x1 scaled=false fps=24 frames=1 cutIn=1 cutOut=1 out=view-0.mov\n"
+                     f"{verified_line(1, '1x1')}\n[BATCH] DONE view-0 exported=1 skipped=0 elapsed=1.0\n")
+        at5 =self.CTL_START.replace("cutIn=1 cutOut=480", "cutIn=5 cutOut=484")
+        cases = [self.ctl(self.shift(piped_stage_log(480), 1)), prores_case(maxFrames=1, dualIsoExpected=True, stage=one, batch=one_batch, criteria=[]),
+                 self.ctl(self.shift(piped_stage_log(480), 4), batch=self.ctl_batch(at5)), self.ctl(piped_stage_log(480), batch=self.ctl_batch(at5))]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in (got[0], got[1], got[3]):
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_STAGE_WINDOW_MISMATCH") and "cutIn" in p for p in g["problems"]), g)
+        assert_clean_but_dual_iso_unknown(self, got[2])
+
+    def test_adversary_r2_a4_each_dual_iso_record_pairs_with_the_llrawproc_run_it_follows(self) -> None:
+        """adversary A4 on a6f48506: per-frame sums lost the pairing, so llrawproc 0 / dual-ISO 30 then llrawproc 31 / dual-ISO 0 on every frame summed to 31 / 30 and read all
+        480 frames active. Each dual-ISO record is the one right after an llrawproc record of its frame, inside that run. Controls: the producer's order, and a figure inside the slack."""
+        base = piped_stage_log(480)
+        def swap(line: str) -> str:
+            if " stage=llrawproc ms=" in line:
+                f = line.split("frame=")[1].split(" ")[0]
+                return (f"[mlv-stage-timing] frame={f} stage=llrawproc ms=0.000\n[mlv-stage-timing] frame={f} stage=llrawproc_dual_iso ms=30.000\n"
+                        f"[mlv-stage-timing] frame={f} stage=llrawproc ms=31.000\n[mlv-stage-timing] frame={f} stage=llrawproc_dual_iso ms=0.000\n")
+            return "" if " stage=llrawproc_dual_iso " in line else line + "\n"
+        finding = "".join(swap(l) for l in base.splitlines())
+        lines = base.splitlines()
+        moved = [l for l in lines if " stage=llrawproc_dual_iso " not in l]
+        moved = "\n".join(moved[:-2] + [l for l in lines if " stage=llrawproc_dual_iso " in l] + moved[-2:]) + "\n"
+        proc, got = evidence_cases([self.ctl(finding), self.ctl(moved), self.ctl(), self.ctl(piped_stage_log(480, dual_iso_ms=31.0, llrawproc_ms=30.0))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:2]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "llrawproc_dual_iso" in p and "follow" in p for p in g["problems"]), g)
+        for g in got[2:]:
+            assert_clean_but_dual_iso_unknown(self, g)
+
+    def test_adversary_r2_a5_clip_records_and_batch_lines_keep_the_producers_order(self) -> None:
+        """adversary A5 on a6f48506: export_verify moved to the first line, and RENDER_START moved below DONE, both read PASS; the fixture batch_log() itself wrote
+        RENDER_VERIFIED before RENDER_START. The drain and verify follow every per-frame record (verify after the drain), and RENDER_START, RENDER_VERIFIED and DONE keep their order."""
+        lines = piped_stage_log(480).splitlines()
+        verify_first = "\n".join([lines[-1]] + lines[:-1]) + "\n"
+        verify_before_drain = "\n".join(lines[:-2] + [lines[-1], lines[-2]]) + "\n"
+        drain_mid = "\n".join(lines[:100] + [lines[-2]] + lines[100:-2] + [lines[-1]]) + "\n"
+        cases = [self.ctl(verify_first), self.ctl(verify_before_drain), self.ctl(drain_mid), self.ctl(batch=self.ctl_batch(order=("verified", "done", "start"))),
+                 self.ctl(batch=self.ctl_batch(order=("verified", "start", "done")))]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:3]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and ("export_verify" in p or "export_pipe_drain" in p) for p in g["problems"]), g)
+        for g in got[3:]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any("RENDER_START" in p and ("DONE" in p or "order" in p) for p in g["problems"]), g)
+        text = batch_log(30, verified=30)
+        self.assertLess(text.index("RENDER_START"), text.index("RENDER_VERIFIED"))
+        self.assertLess(text.index("RENDER_VERIFIED"), text.index("[BATCH] DONE"))
+
+    def test_adversary_r2_a6_a_log_without_the_new_stages_from_a_build_that_emits_them_is_an_incomplete_capture(self) -> None:
+        """adversary A6 on a6f48506: with ExpectedBuildId this head and none of the new stages, the reader presumed an older build and the shipped criteria read FAIL with no
+        problem. A build whose own src/debug/StageTiming.h defines this card's stages times them all, so that log is an incomplete capture: INVALID, typed, with no older-build
+        reason. Removing only export_verify stays INVALID too."""
+        head = self.head_sha()
+        old = stage_log(480)
+        only_verify_gone = "".join(l + "\n" for l in piped_stage_log(480).splitlines() if " stage=export_verify " not in l)
+        proc, got = evidence_cases([self.ctl(old, buildId=head), self.ctl(only_verify_gone, buildId=head), self.ctl(buildId=head)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:2]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_PROFILE_ABSENT") and "incomplete" in p for p in g["problems"]), g)
+            self.assertNotIn("a build before EXPORT-RENDER-PIPE-TIMING-1", json.dumps(g["metrics"]), g)
+        self.assertTrue(any(head in p for p in got[0]["problems"]), got[0])
+        assert_clean_but_dual_iso_unknown(self, got[2])
+
+    def test_adversary_r2_a6_distinguish_a_build_this_repo_cannot_name_keeps_the_r1_reading_and_an_older_build_cannot_carry_the_stages(self) -> None:
+        """A6, the distinguished half: a build id that is no commit of this repo (the fixtures' 'e' * 40, or a venue build from another tree) cannot be classed, so a log without
+        the new stages keeps the r1 reading (null metrics, refused by the criteria, never PASS). And the base commit 2b796198, which defines none of this card's stages, beside a
+        log carrying them is EXPORT_PROFILE_FOREIGN."""
+        proc, got = evidence_cases([self.ctl(stage_log(480), buildId=BUILD_ID)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertNotEqual(got[0]["outcome"], "PASS", got[0])
+        self.assertIsNone(got[0]["metrics"]["renderPipeTimed"], got[0])
+        import subprocess
+        base = "2b79619832444c0a63a8573d04f6cd02a4a113dc"
+        if subprocess.run(["git", "-C", str(ROOT), "cat-file", "-t", base], capture_output=True, text=True).stdout.strip() != "commit":
+            self.skipTest("the base commit is not in this clone (a shallow checkout)")
+        proc, got = evidence_cases([self.ctl(buildId=base), self.ctl(stage_log(480), buildId=base)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "INVALID", got[0])
+        self.assertTrue(any(p.startswith("EXPORT_PROFILE_FOREIGN") and base in p for p in got[0]["problems"]), got[0])
+        self.assertNotEqual(got[1]["outcome"], "PASS", got[1])
+        self.assertEqual(got[1]["problems"], [], "an older build's log raises no new problem")
+
+    def test_adversary_r2_a8_render_verified_is_of_the_clip_done_names(self) -> None:
+        """advisory A8 on a6f48506 (base defect, fixed in scope): RENDER_VERIFIED view-1 beside DONE view-0 read PASS."""
+        proc, got = evidence_cases([self.ctl(batch=self.ctl_batch(verified_clip="view-1"))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "INVALID", got[0])
+        self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and "view-1" in p for p in got[0]["problems"]), got[0])
+
+    # --- r2 fix 1: adversary pass 4 on 2bd239b8 (A1-A6, advisory A9)
+    def test_adversary_r2f1_a1_an_unknown_stage_record_after_the_verify_is_out_of_order_too(self) -> None:
+        """pass 4 A1: a record of a stage the reader does not table (raw_uint16_copy) after export_verify did not move the last per-frame line, so the order check passed."""
+        proc, got = evidence_cases([self.ctl(piped_stage_log(480) + "[mlv-stage-timing] frame=479 stage=raw_uint16_copy ms=0.001\n")])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "INVALID", got[0])
+        self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "before the last per-frame record" in p for p in got[0]["problems"]), got[0])
+
+    def test_adversary_r2f1_a2_each_frame_renders_then_scales_then_writes_in_frame_order(self) -> None:
+        """pass 4 A2: frame 0's pipe write before its processed16_total, all frame blocks reversed, and export_scale after export_pipe_write all read PASS. The producer
+        completes processed16_total, then the optional scale, then the pipe write, frame by frame in rising order (BatchRunner.cpp:541-567)."""
+        base = piped_stage_log(480)
+        early = base.replace("[mlv-stage-timing] frame=0 stage=export_pipe_write ms=10.000\n", "").replace(
+            "[mlv-stage-timing] frame=0 stage=processed16_total ms=56.000\n", "[mlv-stage-timing] frame=0 stage=export_pipe_write ms=10.000\n[mlv-stage-timing] frame=0 stage=processed16_total ms=56.000\n")
+        lines = base.splitlines()
+        per, clip = lines[:-2], lines[-2:]
+        blocks = [per[i:i + 9] for i in range(0, len(per), 9)]
+        reversed_log = "\n".join([l for b in reversed(blocks) for l in b] + clip) + "\n"
+        scaled = piped_stage_log(480, scale_ms=6.0)
+        swapped = re.sub(r"(\[mlv-stage-timing\] frame=(\d+) stage=export_scale ms=6\.000)\n(\[mlv-stage-timing\] frame=\2 stage=export_pipe_write ms=10\.000)\n", r"\3\n\1\n", scaled)
+        sb = self.ctl_batch(self.CTL_START.replace("output=1920x1080 scaled=false", "output=1920x1440 scaled=true"))
+        proc, got = evidence_cases([self.ctl(early), self.ctl(reversed_log), self.ctl(swapped, batch=sb), self.ctl(scaled, batch=sb)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(len(blocks), 480)
+        for g in got[:3]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "export_pipe_write" in p and "order" in p for p in g["problems"]), g)
+        assert_clean_but_dual_iso_unknown(self, got[3])
+
+    def test_adversary_r2f1_a3_render_start_dimensions_and_cut_fit_the_producer(self) -> None:
+        """pass 4 A3: output 1920x1440 beside source 1920x1080 with scaled=false read PASS with no scale owed (an unscaled plan's output IS its source), and a cut past the
+        producer's uint32 range (cutIn=4294967296) read PASS. A scaled plan may keep its size (a resize to the source dimensions), so that direction stays open."""
+        grown = self.CTL_START.replace("output=1920x1080", "output=1920x1440")
+        huge = self.CTL_START.replace("cutIn=1 cutOut=480", "cutIn=4294967296 cutOut=4294967775")
+        same_scaled = self.CTL_START.replace("scaled=false", "scaled=true")
+        cases = [self.ctl(batch=self.ctl_batch(grown)), self.ctl(self.shift(piped_stage_log(480), 4294967295), batch=self.ctl_batch(huge)),
+                 self.ctl(piped_stage_log(480, scale_ms=6.0), batch=self.ctl_batch(same_scaled))]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:2]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any("RENDER_START" in p for p in g["problems"]), g)
+        assert_clean_but_dual_iso_unknown(self, got[2])
+
+    def test_adversary_r2f1_a4_a9_a_build_id_in_capitals_is_the_same_build_and_derive_in_any_case_derives(self) -> None:
+        """pass 4 A4 (and advisory A9): the uppercase spelling of the base commit read 'unknown' (PASS) where the lowercase read EXPORT_PROFILE_FOREIGN (INVALID); and
+        -RenderPipeBuildClass DERIVE skipped the lookup. One build is one class, however its id is spelled."""
+        import subprocess
+        base = "2b79619832444c0a63a8573d04f6cd02a4a113dc"
+        if subprocess.run(["git", "-C", str(ROOT), "cat-file", "-t", base], capture_output=True, text=True).stdout.strip() != "commit":
+            self.skipTest("the base commit is not in this clone (a shallow checkout)")
+        proc, got = evidence_cases([self.ctl(buildId=base.upper()), self.ctl(buildId=self.head_sha().upper(), stage=stage_log(480))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertTrue(any(p.startswith("EXPORT_PROFILE_FOREIGN") for p in got[0]["problems"]), got[0])
+        self.assertTrue(any(p.startswith("EXPORT_PROFILE_ABSENT") and "incomplete" in p for p in got[1]["problems"]), got[1])
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([self.ctl(buildId=base)]), encoding="utf-8")
+            proc, got = run_pwsh_json("$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                                      f"@($cases | ForEach-Object {{ $c = $_; $e = {EVIDENCE_CALL} -RenderPipeBuildClass DERIVE; [ordered]@{{ problems = @($e.problems) }} }}) "
+                                      "| ConvertTo-Json -Compress -Depth 8 -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertTrue(any(p.startswith("EXPORT_PROFILE_FOREIGN") for p in got[0]["problems"]), got[0])
+
+    def test_adversary_r2f1_a5_a_lookup_that_fails_is_never_cached_and_never_reads_older(self) -> None:
+        """pass 4 A5: a failed lookup was cached (unknown, or older when the header read failed), so one session kept that answer after the object became readable. Only a
+        header that was read decides a class; a seam that fails the header read once reads unknown, and the next call (seam restored) reads the real class."""
+        head = self.head_sha()
+        script = ("$m = Get-Module DualVenueRunner\n"
+                  # (r2 fix 2: the seam is git not answering -- a header path the tree lacks now reads 'older', which is what that tree says)
+                  "$first = & $m { param($id) $saved = $script:DvGitExecutable; $script:DvGitExecutable = 'C:\\no-such-dir\\git-missing.exe'; try { Get-DvRenderPipeBuildClass -BuildId $id } finally { $script:DvGitExecutable = $saved } } $env:DVE_HEAD\n"
+                  "$second = & $m { param($id) Get-DvRenderPipeBuildClass -BuildId $id } $env:DVE_HEAD\n"
+                  "$unknown1 = & $m { Get-DvRenderPipeBuildClass -BuildId ('0' * 40) }\n"
+                  "[ordered]@{ first = $first; second = $second; unknown = $unknown1 } | ConvertTo-Json -Compress")
+        proc, got = run_pwsh_json(script, DVE_HEAD=head)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got["first"], "unknown", "an unreadable header is no evidence of an older build")
+        self.assertEqual(got["second"], "emits", "and the failed read was not cached")
+        self.assertEqual(got["unknown"], "unknown")
+
+    # --- r4: adversary pass 8 on 7c66c004 (A4, A6; A1, A2, A3, A5 stay OPEN in the PR body)
+    @staticmethod
+    def header_commit(repo: Path, header: str) -> str:
+        import subprocess
+        def git(*args: str) -> str:
+            return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL).stdout.strip()
+        if not (repo / ".git").exists():
+            repo.mkdir(parents=True, exist_ok=True)
+            git("init", "-q"); git("config", "user.email", "unit@example.invalid"); git("config", "user.name", "unit"); git("config", "core.autocrlf", "false")
+        (repo / "src" / "debug").mkdir(parents=True, exist_ok=True)
+        (repo / "src" / "debug" / "StageTiming.h").write_bytes(header.encode())
+        git("add", "src"); git("commit", "-q", "-m", "header")
+        return git("rev-parse", "HEAD")
+
+    def test_adversary_r4_a6_the_marker_is_a_define_directive_not_a_substring(self) -> None:
+        """pass 8 A6: the build class searched the header for the literal `#define MLV_STAGE_EXPORT_PIPE_WRITE`, so legal preprocessor spacing read 'older' and a header that
+        names the define only in a comment read 'emits'. A directive defines it, whatever its blanks; a comment does not."""
+        # (r4 fix 2: the include guard is #ifndef H then #define H; a bare #ifndef H is a condition the model cannot decide, pinned 'unknown' by the pass 9 A5 test)
+        cases = {"spaced": ('#ifndef H\n#define H\n#  define MLV_STAGE_EXPORT_PIPE_WRITE "export_pipe_write"\n#endif\n', "emits"),
+                 "hash_gap": ('# define MLV_STAGE_EXPORT_PIPE_WRITE "export_pipe_write"\n', "emits"),
+                 "plain": ('#define MLV_STAGE_EXPORT_PIPE_WRITE   "export_pipe_write"\n', "emits"),
+                 "block_comment": ("/* #define MLV_STAGE_EXPORT_PIPE_WRITE */\n#define MLV_STAGE_DECODE \"decode\"\n", "older"),
+                 "multiline_comment": ("/*\n#define MLV_STAGE_EXPORT_PIPE_WRITE \"x\"\n*/\n", "older"),
+                 "line_comment": ("// #define MLV_STAGE_EXPORT_PIPE_WRITE\n", "older"),
+                 "longer_name": ("#define MLV_STAGE_EXPORT_PIPE_WRITE_OLD \"x\"\n", "older")}
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            ids = {name: self.header_commit(repo, text) for name, (text, _) in cases.items()}
+            lines = "".join(f"$o['{name}'] = & $m {{ param($r, $id) Get-DvRenderPipeBuildClass -BuildId $id -RepoRoot $r }} '{repo}' '{sha}'\n" for name, sha in ids.items())
+            proc, got = run_pwsh_json("$m = Get-Module DualVenueRunner\n$o = [ordered]@{}\n" + lines + "$o | ConvertTo-Json -Compress")
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got, {name: want for name, (_, want) in cases.items()})
+
+    def test_adversary_r4_pass9_a5_the_define_is_read_in_translation_order(self) -> None:
+        """pass 9 A5 (on 724d72ff): a define spliced across lines with a backslash read 'older', and one inside `#if 0` or followed by `#undef` read 'emits'. Splices are joined
+        before comments go, a literal #if 0 / #else chain and the include guard are followed, the last live #define / #undef decides, and a define under a condition the
+        model cannot decide (#ifdef) is 'unknown'."""
+        cases = {"spliced": ('#define MLV_STAGE_EXPORT_PIPE_\\\nWRITE "export_pipe_write"\n', "emits"),
+                 "if_zero": ('#if 0\n#define MLV_STAGE_EXPORT_PIPE_WRITE "x"\n#endif\n', "older"),
+                 "undef_after": ('#define MLV_STAGE_EXPORT_PIPE_WRITE "x"\n#undef MLV_STAGE_EXPORT_PIPE_WRITE\n', "older"),
+                 "if_zero_else": ('#if 0\n#else\n#define MLV_STAGE_EXPORT_PIPE_WRITE "x"\n#endif\n', "emits"),
+                 "if_one_else": ('#if 1\n#else\n#define MLV_STAGE_EXPORT_PIPE_WRITE "x"\n#endif\n', "older"),
+                 "guarded": ('#ifndef G_H\n#define G_H\n#if defined(_WIN32)\n#  define X 1\n#endif\n#define MLV_STAGE_EXPORT_PIPE_WRITE "x"\n#endif\n', "emits"),
+                 "ifdef": ('#ifdef FOO\n#define MLV_STAGE_EXPORT_PIPE_WRITE "x"\n#endif\n', "unknown"),
+                 "unbalanced": ('#if 1\n#define MLV_STAGE_EXPORT_PIPE_WRITE "x"\n', "unknown")}
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            ids = {name: self.header_commit(repo, text) for name, (text, _) in cases.items()}
+            lines = "".join(f"$o['{name}'] = & $m {{ param($r, $id) Get-DvRenderPipeBuildClass -BuildId $id -RepoRoot $r }} '{repo}' '{sha}'\n" for name, sha in ids.items())
+            proc, got = run_pwsh_json("$m = Get-Module DualVenueRunner\n$o = [ordered]@{}\n" + lines + "$o | ConvertTo-Json -Compress")
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got, {name: want for name, (_, want) in cases.items()})
+
+    def test_adversary_r4_a4_every_git_the_reader_runs_has_lazy_fetch_off(self) -> None:
+        """pass 8 A4: in a partial clone the header read made git fetch the missing blob from the promisor remote and write it into the object store. Every Invoke-DvGit
+        child runs with GIT_NO_LAZY_FETCH=1, also when the caller's environment sets it to 0 (a shell alias prints the value the child saw)."""
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            self.header_commit(repo, "#define MLV_STAGE_DECODE \"decode\"\n")
+            proc, got = run_pwsh_json("$m = Get-Module DualVenueRunner\n"
+                                      f"$r = & $m {{ param($root) Invoke-DvGit -RepoRoot $root -GitArgs @('-c', 'alias.dvlazy=!printf \"%s\" \"$GIT_NO_LAZY_FETCH\"', 'dvlazy') }} '{repo}'\n"
+                                      "[ordered]@{ exit = $r.exitCode; seen = [Text.Encoding]::ASCII.GetString($r.bytes) } | ConvertTo-Json -Compress",
+                                      GIT_NO_LAZY_FETCH="0")
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got, {"exit": 0, "seen": "1"})
+
+    def test_adversary_r2f1_a6_a_clip_name_that_only_looks_like_dones_is_another_clip(self) -> None:
+        """pass 4 A6: view-0 followed by U+200B in RENDER_START or RENDER_VERIFIED compared equal to DONE's view-0 under the culture-aware -cne. Names compare ordinally."""
+        zw = "view-0\u200b"
+        cases = [self.ctl(batch=self.ctl_batch(self.CTL_START.replace("RENDER_START view-0", f"RENDER_START {zw}"))), self.ctl(batch=self.ctl_batch(verified_clip=zw))]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and "DONE" in p for p in g["problems"]), g)
+
+    # --- r2 fix 2: adversary pass 5 on c2da7e24 (A1, A4, A5, A6; A2 and A3 stay open for r3)
+    def test_adversary_r2f2_a1_each_frame_is_one_block_rendered_then_written(self) -> None:
+        """pass 5 A1: processing moved between frame 0's total and its write, frame 1's disk read before frame 0's write, an untabled record of frame 0 after its write, and an
+        untabled record of frame 9999 after the first record all read PASS. Each frame is one block: its render (processed16_total last), its scale, its write."""
+        lines = piped_stage_log(480).splitlines()
+        def idx(s: str) -> int:
+            return lines.index(s)
+        p0, w0 = idx("[mlv-stage-timing] frame=0 stage=processed16_total ms=56.000"), idx("[mlv-stage-timing] frame=0 stage=export_pipe_write ms=10.000")
+        proc0 = "[mlv-stage-timing] frame=0 stage=processing ms=15.000"
+        v1 = [l for l in lines if l != proc0]
+        v1.insert(v1.index("[mlv-stage-timing] frame=0 stage=export_pipe_write ms=10.000"), proc0)
+        d1 = "[mlv-stage-timing] frame=1 stage=raw_uint16_disk_read ms=3.000"
+        v2 = [l for l in lines if l != d1]
+        v2.insert(v2.index("[mlv-stage-timing] frame=0 stage=export_pipe_write ms=10.000"), d1)
+        v3 = lines[:w0 + 1] + ["[mlv-stage-timing] frame=0 stage=raw_uint16_copy ms=0.001"] + lines[w0 + 1:]
+        v4 = lines[:1] + ["[mlv-stage-timing] frame=9999 stage=raw_uint16_copy ms=0.001"] + lines[1:]
+        self.assertLess(p0, w0)
+        proc, got = evidence_cases([self.ctl("\n".join(v) + "\n") for v in (v1, v2, v3, v4)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "frame loop's order" in p for p in g["problems"]), g)
+
+    def test_adversary_r2f2_a4_a_build_id_with_a_newline_or_a_tree_without_the_header_is_classed(self) -> None:
+        """pass 5 A4: the base id with a trailing LF matched the '$' anchor and failed the lookup (unknown, PASS); and a commit whose tree has no src/debug/StageTiming.h read
+        unknown (PASS) beside a log carrying this card's stages. The first is a malformed id (EXPORT_PROFILE_FOREIGN), the second a build before stage timing (older, FOREIGN)."""
+        import subprocess
+        added = subprocess.run(["git", "-C", str(ROOT), "log", "--diff-filter=A", "--format=%H", "--", "src/debug/StageTiming.h"], capture_output=True, text=True).stdout.split()
+        cases = [self.ctl(buildId="2b79619832444c0a63a8573d04f6cd02a4a113dc\n")]
+        before = None
+        if added:
+            r = subprocess.run(["git", "-C", str(ROOT), "rev-parse", f"{added[-1]}^"], capture_output=True, text=True)
+            before = r.stdout.strip() if r.returncode == 0 else None
+        if before:
+            cases.append(self.ctl(buildId=before))
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_PROFILE_FOREIGN") for p in g["problems"]), g)
+        if not before:
+            self.skipTest("the commit before src/debug/StageTiming.h existed is not in this clone")
+
+    def test_adversary_r2f2_a5_the_ceiling_and_the_clip_sum_are_held_on_the_exact_record_figures(self) -> None:
+        """pass 5 A5: verify=86400000.000000001 rounded onto the ceiling as a double (no problem), and a verify figure 9.6e-6 ms past the wall limit was admitted because
+        the clip sum went through a double. Both are read exactly from the record text. Control: the same wall with verify a full increment under the limit."""
+        def log(drain: str, verify: str) -> str:
+            rows = (("raw_uint16", 9.0), ("llrawproc", 31.0), ("llrawproc_dual_iso", 30.0), ("debayered_frame", 40.0), ("processing", 15.0), ("processed16_total", 56.0), ("export_pipe_write", 10.0))
+            per = "".join(f"[mlv-stage-timing] frame={i} stage={s} ms={ms:.3f}\n" for i in range(24) for s, ms in rows)
+            return per + f"[mlv-stage-timing] frame=23 stage=export_pipe_drain ms={drain}\n[mlv-stage-timing] frame=23 stage=export_verify ms={verify}\n"
+        def batch(elapsed: str) -> str:
+            return ("[BATCH] RENDER_START view-0 codec=prores container=mov source=1x1 output=1x1 scaled=false fps=24 frames=24 cutIn=1 cutOut=24 out=view-0.mov\n"
+                    f"{verified_line(24, '1x1')}\n[BATCH] DONE view-0 exported=24 skipped=0 elapsed={elapsed}\n")
+        mk = lambda d, v, e: prores_case(maxFrames=24, dualIsoExpected=True, stage=log(d, v), batch=batch(e), criteria=[])
+        # (r5, sol r4 B4 forced companion: the wall limit is built from the largest wall elapsed=3600.0 rounds from, 3600.05 s, so the verify figure 9.6e-6 ms past it is
+        # 52.5 ms higher: 0.05 s over 24 frames is 2.083 ms per frame, times the 1.05 tolerance 2.1875 ms, times 24 frames)
+        proc, got = evidence_cases([mk("0.000", "86400000.000000001", "86400.0"), mk("778440.000", "3000052.500009601", "3600.0"), mk("778440.000", "3000052.499", "3600.0")])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "INVALID", got[0])
+        self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "ceiling" in p for p in got[0]["problems"]), got[0])
+        self.assertEqual(got[1]["outcome"], "INVALID", got[1])
+        self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p for p in got[1]["problems"]), got[1])
+        self.assertEqual(got[2]["outcome"], "PASS", got[2])
+
+    def test_adversary_r2f2_a6_the_reader_writes_no_git_trace_file(self) -> None:
+        """pass 5 A6: the reader now runs git, and Invoke-DvGit passed GIT_TRACE through, so an inherited GIT_TRACE=<path> made a read-only reader append to that file."""
+        with tempfile.TemporaryDirectory() as d:
+            trace = Path(d) / "trace.txt"
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([self.ctl(buildId=self.head_sha())]), encoding="utf-8")
+            proc, got = run_pwsh_json("$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                                      f"@($cases | ForEach-Object {{ $c = $_; $e = {EVIDENCE_CALL}; [ordered]@{{ problems = @($e.problems) }} }}) "
+                                      "| ConvertTo-Json -Compress -Depth 8 -AsArray", DVE_CASES=str(path), GIT_TRACE=str(trace), GIT_TRACE2=str(trace))
+            self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+            self.assertEqual(got[0]["problems"], [], got[0])
+            self.assertFalse(trace.exists(), "the reader wrote a git trace file")
+
+    # --- r3: adversary pass 5 on c2da7e24, A3 and A2 (A1, A4, A5 and A6 were fixed in 7882ec07)
+    def test_adversary_r3_a3_render_start_is_the_prores_producers_own_declaration(self) -> None:
+        """pass 5 A3: `RENDER_START ... codec=h264 container=mp4 source=0x0 output=0x0 ... fps=NaN` read PASS: the reader captured the codec, container and fps and dropped them.
+        A ProRes export's declaration is the rendered producer's: BatchRunner.cpp:471-478 prints plan.outputVerificationPlan.expectedCodec / expectedContainer, which
+        BatchRenderedVideoPlan.cpp:4026-4030 sets from batchRenderedVideoMediaProbeCodecName / ContainerName, i.e. BatchRenderedVideoPlan.h:1184 `return "prores";` and
+        :1196 `return "mov";`; source and output are getMlvWidth / getMlvHeight and a frame plan BatchRenderedVideoPlan.cpp:4502 refuses unless both are above 0; and fps is
+        batchRenderedVideoFfmpegFrameRateArgument (BatchRenderedVideoPlan.cpp:4521-4526, QLocale English toString of the clip's rate), a finite positive decimal."""
+        s = self.CTL_START
+        whole = s.replace("codec=prores container=mov source=1920x1080 output=1920x1080 scaled=false fps=24", "codec=h264 container=mp4 source=0x0 output=0x0 scaled=false fps=NaN")
+        self.assertNotEqual(whole, s)
+        bad = [whole, s.replace("codec=prores", "codec=h264"), s.replace("codec=prores", "codec=PRORES"), s.replace("container=mov", "container=mp4"),
+               s.replace("source=1920x1080 output=1920x1080", "source=0x0 output=0x0"), s.replace("source=1920x1080 output=1920x1080", "source=1920x0 output=1920x0"),
+               s.replace("source=1920x1080 output=1920x1080 scaled=false", "source=0x1080 output=1920x1080 scaled=true"),
+               s.replace("output=1920x1080 scaled=false", "output=1920x0 scaled=true"),
+               s.replace("fps=24", "fps=NaN"), s.replace("fps=24", "fps=inf"), s.replace("fps=24", "fps=0"), s.replace("fps=24", "fps=0.000"), s.replace("fps=24", "fps=-24"),
+               s.replace("fps=24", "fps=1e+300"), s.replace("fps=24", "fps=24,0")]
+        good = [s, s.replace("fps=24", "fps=23.976"), s.replace("fps=24", "fps=29.97")]
+        scaled_logs = {i for i, b in enumerate(bad) if "scaled=true" in b}
+        cases = [self.ctl(piped_stage_log(480, scale_ms=6.0) if i in scaled_logs else None, batch=self.ctl_batch(b)) for i, b in enumerate(bad)]
+        cases += [self.ctl(batch=self.ctl_batch(g)) for g in good]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for b, g in zip(bad, got[:len(bad)]):
+            with self.subTest(start=b):
+                self.assertEqual(g["outcome"], "INVALID", g)
+                self.assertTrue(any(p.startswith("EXPORT_PROFILE_FOREIGN") and "RENDER_START" in p for p in g["problems"]), g)
+        for g in got[len(bad):]:
+            assert_clean_but_dual_iso_unknown(self, g)
+
+    def test_adversary_r3_a2_a_dual_iso_time_above_zero_is_an_attempt_never_proof_it_applied(self) -> None:
+        """pass 5 A2: a receipt with dualIsoInterpolation 2 makes the CPU reconstruction refuse (dualiso.c:7484-7487) after llrawproc.c:6019 has started its timer, so the
+        failed attempt is timed above 0 ms and every frame read as dual-ISO: the leg PASSed with no frame reconstructed. The rendered path carries no producer signal that
+        the reconstruction APPLIED (successor EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1), so a time above 0 is typed UNKNOWN: never an active frame, never dualIsoClassAgrees
+        true, never PASS on that criterion. A time of exactly 0 on every frame still proves no reconstruction ran (the class mismatch on a dual-ISO leg stands), and a timed
+        attempt on a no-dual-ISO leg stays the class mismatch it was (no reconstruction was owed, and one was tried)."""
+        attempted = [self.ctl(), self.case(piped_stage_log(30)), self.case(piped_stage_log(30, dual_iso_ms=0.001)),
+                     self.case(piped_stage_log(30).replace("frame=0 stage=llrawproc_dual_iso ms=30.000", "frame=0 stage=llrawproc_dual_iso ms=0.000"))]
+        proc, got = evidence_cases(attempted + [self.case(piped_stage_log(30), dualIsoExpected=False), self.case(piped_stage_log(30, dual_iso_ms=0.0))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:len(attempted)]:
+            m = g["metrics"]
+            self.assertNotEqual(g["outcome"], "PASS", g)
+            self.assertIsNone(m["dualIsoActiveFrames"], g)
+            self.assertIsNone(m["dualIsoClassAgrees"], g)
+            for k in ("dualIsoActiveFramesCouldNotCheck", "dualIsoClassAgreesCouldNotCheck"):
+                self.assertTrue(m[k].startswith(f"{DUALISO_UNKNOWN}:"), g)
+                self.assertIn(DUALISO_SUCCESSOR, m[k])
+        for g in got[:3]:
+            assert_clean_but_dual_iso_unknown(self, g)
+        # (one frame at 0 among timed attempts: the class is not readable either way, and the window and schema stay clean)
+        self.assertEqual(got[3]["problems"], [], got[3])
+        nodual = got[len(attempted)]
+        self.assertEqual(nodual["outcome"], "INVALID", nodual)
+        self.assertTrue(nodual["classMismatch"], nodual)
+        self.assertIn("CLIP_CLASS_MISMATCH", nodual["detail"])
+        self.assertIn("attempted", nodual["detail"], "a time above 0 is an attempt, never a reconstruction that ran")
+        self.assertIsNone(nodual["metrics"]["dualIsoActiveFrames"], nodual)
+        zero = got[len(attempted) + 1]
+        self.assertEqual(zero["outcome"], "INVALID", zero)
+        self.assertIs(zero["metrics"]["dualIsoClassAgrees"], False, zero)
+        self.assertEqual(zero["metrics"]["dualIsoActiveFrames"], 0, zero)
+
+    # --- r3 fix 1: adversary pass 6 on 070ccd05 (A1, A2)
+    def test_adversary_r3f1_a1_a_global_trace2_target_or_a_redirect_variable_makes_the_reader_write_nothing(self) -> None:
+        """pass 6 A1: Invoke-DvGit removed every GIT_TRACE* variable, which also removed the caller's GIT_TRACE2_EVENT=0 and let a trace2.eventTarget in the global git
+        config (GIT_CONFIG_GLOBAL) name a file git appends to; and Git for Windows' GIT_REDIRECT_STDOUT / GIT_REDIRECT_STDERR sent git's output to a file the caller names.
+        git reads the trace2 environment before that config, so every trace target is forced off, and the redirect variables are dropped."""
+        with tempfile.TemporaryDirectory() as d:
+            event, normal, redirect_out, redirect_err = (Path(d) / n for n in ("event.txt", "normal.txt", "redirect-out.txt", "redirect-err.txt"))
+            cfg = Path(d) / "trace.gitconfig"
+            cfg.write_text(f"[trace2]\n\teventTarget = {event.as_posix()}\n\tnormalTarget = {normal.as_posix()}\n\tperfTarget = {normal.as_posix()}\n", encoding="utf-8")
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([self.ctl(buildId=self.head_sha())]), encoding="utf-8")
+            proc, got = run_pwsh_json("$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                                      f"@($cases | ForEach-Object {{ $c = $_; $e = {EVIDENCE_CALL}; [ordered]@{{ problems = @($e.problems) }} }}) "
+                                      "| ConvertTo-Json -Compress -Depth 8 -AsArray", DVE_CASES=str(path), GIT_CONFIG_GLOBAL=str(cfg), GIT_TRACE2_EVENT="0",
+                                      GIT_REDIRECT_STDOUT=str(redirect_out), GIT_REDIRECT_STDERR=str(redirect_err))
+            self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+            self.assertEqual(got[0]["problems"], [], got[0])
+            for f in (event, normal, redirect_out, redirect_err):
+                self.assertFalse(f.exists(), f"the reader's git wrote {f.name}")
+
+    def test_adversary_r3f1_a2_render_start_admits_the_producers_exponent_form_of_a_frame_rate(self) -> None:
+        """pass 6 A2: the producer formats the rate with QLocale::toString(double), the general format, which writes a rate under 1e-4 (or from 1e6) with an exponent:
+        sourceFpsNom 1 / sourceFpsDenom 100000 declares fps=1e-05, and r3 refused it as EXPORT_PROFILE_FOREIGN. A finite positive rate in that form is the producer's;
+        a non-finite, zero, negative or malformed one stays refused."""
+        s = self.CTL_START
+        good = [s.replace("fps=24", f) for f in ("fps=1e-05", "fps=1.5e-05", "fps=4.29497e+09", "fps=24")]
+        bad = [s.replace("fps=24", f) for f in ("fps=0e+00", "fps=-1e-05", "fps=1e-05e+01", "fps=1E-05", "fps=e-05", "fps=1e5", "fps=nan", "fps=1e+300")]
+        proc, got = evidence_cases([self.ctl(batch=self.ctl_batch(x)) for x in good + bad])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for x, g in zip(good, got[:len(good)]):
+            with self.subTest(start=x):
+                assert_clean_but_dual_iso_unknown(self, g)
+        for x, g in zip(bad, got[len(good):]):
+            with self.subTest(start=x):
+                self.assertEqual(g["outcome"], "INVALID", g)
+                self.assertTrue(any(p.startswith("EXPORT_PROFILE_FOREIGN") and "fps=" in p for p in g["problems"]), g)
+
+    def test_r8_both_prores_leg_specs_gate_both_new_criteria(self) -> None:
+        for name in ("m16-1243-export-prores", "m16-1456-export-prores"):
+            spec = leg(name)
+            for role in ("acceptance", "supplementary"):
+                with self.subTest(leg=name, role=role):
+                    crit = spec["criteria"][role]["cpu"]
+                    for want in PIPE_CRITERIA:
+                        self.assertIn(want, crit)
+            self.assertIs(spec["export"]["dualIsoExpected"], True, name)
+            self.assertNotIn("forceLookAssist", json.dumps(spec), name)
+
+    # --- r5: sol r4 on 54abfe1a, B2 B3 B4 B8 B9 (each from sol's literal row; hub ruling HUB-TICK 20261124T0042Z)
+    def test_r5_sol_b2_a_second_render_total_or_a_frame_never_written_is_invalid(self) -> None:
+        """sol r4 B2: a second processed16_total of 20 ms on frame 0, between its export_scale and its export_pipe_write, was summed into the timed work (76 ms, untimed
+        20 ms lower) with no problem; and a record of frame 1 after a one-frame cut's write, before the drain, opened a frame that nothing closed. Both are INVALID.
+        Controls: the producer's own logs."""
+        scaled = self.ctl_batch(self.CTL_START.replace("scaled=false", "scaled=true"))
+        base = piped_stage_log(480, scale_ms=6.0)
+        dup = base.replace("[mlv-stage-timing] frame=0 stage=export_scale ms=6.000\n",
+                           "[mlv-stage-timing] frame=0 stage=export_scale ms=6.000\n[mlv-stage-timing] frame=0 stage=processed16_total ms=20.000\n", 1)
+        self.assertNotEqual(dup, base)
+        one = piped_stage_log(1)
+        extra = one.replace("[mlv-stage-timing] frame=0 stage=export_pipe_drain", "[mlv-stage-timing] frame=1 stage=raw_uint16_copy ms=0.001\n[mlv-stage-timing] frame=0 stage=export_pipe_drain", 1)
+        self.assertNotEqual(extra, one)
+        one_batch = ("[BATCH] RENDER_START view-0 codec=prores container=mov source=1x1 output=1x1 scaled=false fps=24 frames=1 cutIn=1 cutOut=1 out=view-0.mov\n"
+                     f"{verified_line(1, '1x1')}\n[BATCH] DONE view-0 exported=1 skipped=0 elapsed=1.0\n")
+        mk1 =lambda s: prores_case(maxFrames=1, dualIsoExpected=True, stage=s, batch=one_batch, criteria=[])
+        proc, got = evidence_cases([self.ctl(dup, batch=scaled), mk1(extra), self.ctl(base, batch=scaled), mk1(one)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "INVALID", got[0])
+        self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "processed16_total" in p and "twice" in p for p in got[0]["problems"]), got[0])
+        self.assertEqual(got[1]["outcome"], "INVALID", got[1])
+        self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "frame 1" in p and "never written" in p for p in got[1]["problems"]), got[1])
+        assert_clean_but_dual_iso_unknown(self, got[2])
+        self.assertEqual(got[3]["problems"], [], got[3])
+
+    def test_r5_sol_b3_the_declaration_names_this_exports_mov_and_its_verified_dimensions(self) -> None:
+        """sol r4 B3: out=foreign.mov beside a manifest that lists view-0.mov, and RENDER_START output=1920x1440 beside RENDER_VERIFIED dimensions=1920x1080, each read no
+        problem. Both are EXPORT_OUTPUT_MISMATCH. Controls: an absolute out= path whose leaf is the manifest's file, and the verified dimensions equal to the declared output."""
+        # (EXPORT-RENDER-PIPE-TIMING-2 r2 forced companion: the producer's whole trailer, container_probe= .. dar=, which the one line grammar requires)
+        verified = ("[BATCH] RENDER_VERIFIED view-0 decoded_frames=480 decoded_duration=20.000 decoded_frame_bytes=1 dimensions={d} bytes=9"
+                    " container_probe=C:/venue/ffmpeg/bin/ffprobe.exe probe_source=ffprobe-json codec=prores container=mov sar=1:1 dar=4:3")
+        done = "[BATCH] DONE view-0 exported=480 skipped=0 elapsed=60.0"
+        def batch(start: str, dims: str) -> str:
+            return "\n".join((start, verified.format(d=dims), done)) + "\n"
+        start = self.CTL_START
+        foreign = start.replace("out=view-0.mov", "out=foreign.mov")
+        absolute = start.replace("out=view-0.mov", "out=C:/venue/work/out/view-0.mov")
+        wide = start.replace("output=1920x1080 scaled=false", "output=1920x1440 scaled=true")
+        scaled_log = piped_stage_log(480, scale_ms=6.0)
+        proc, got = evidence_cases([self.ctl(batch=batch(foreign, "1920x1080")), self.ctl(scaled_log, batch=batch(wide, "1920x1080")),
+                                    self.ctl(scaled_log, batch=batch(wide, "1920x1440 dimensions=1920x1080")),
+                                    self.ctl(batch=batch(absolute, "1920x1080")), self.ctl(scaled_log, batch=batch(wide, "1920x1440"))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g, what in zip(got[:3], ("foreign.mov", "dimensions=1920x1080", "dimensions=")):
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and what in p for p in g["problems"]), g)
+        for g in got[3:]:
+            assert_clean_but_dual_iso_unknown(self, g)
+
+    @staticmethod
+    def small_log(frames: int, p16: str = "11.000", drain: str = "25.000", verify: str = "30.000", children: tuple = (("raw_uint16", 2.0), ("llrawproc", 3.0), ("llrawproc_dual_iso", 2.5), ("debayered_frame", 8.0), ("processing", 3.0)), pipe: str = "1.000") -> str:
+        per = "".join("".join(f"[mlv-stage-timing] frame={i} stage={s} ms={ms:.3f}\n" for s, ms in children) + f"[mlv-stage-timing] frame={i} stage=processed16_total ms={p16}\n"
+                      f"[mlv-stage-timing] frame={i} stage=export_pipe_write ms={pipe}\n" for i in range(frames))
+        return per + f"[mlv-stage-timing] frame={frames - 1} stage=export_pipe_drain ms={drain}\n[mlv-stage-timing] frame={frames - 1} stage=export_verify ms={verify}\n"
+
+    @staticmethod
+    def small_batch(frames: int, elapsed: str) -> str:
+        return (f"[BATCH] RENDER_START view-0 codec=prores container=mov source=1x1 output=1x1 scaled=false fps=24 frames={frames} cutIn=1 cutOut={frames} out=view-0.mov\n"
+                f"{verified_line(frames, '1x1')}\n[BATCH] DONE view-0 exported={frames} skipped=0 elapsed={elapsed}\n")
+
+    def test_r5_sol_b4_the_wall_is_the_largest_one_the_printed_elapsed_rounds_from(self) -> None:
+        """sol r4 B4 (rounding): 24 frames and 343 ms of timed work inside a 348 ms wall, which DONE prints as elapsed=0.3 (BatchRunner.cpp rounds to tenths), read INVALID.
+        The wall gate holds the work inside the largest wall the figure rounds from (0.35 s). Controls: the same work at elapsed=0.348 reads clean, and elapsed=0.2 (a wall
+        of at most 0.25 s, shorter than the work) stays INVALID."""
+        log = self.small_log(24)
+        mk = lambda e: prores_case(maxFrames=24, dualIsoExpected=True, stage=log, batch=self.small_batch(24, e), criteria=[])
+        proc, got = evidence_cases([mk("0.3"), mk("0.348"), mk("0.2")])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["problems"], [], got[0])
+        self.assertEqual(got[1]["problems"], [], got[1])
+        self.assertEqual(got[2]["outcome"], "INVALID", got[2])
+        self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "batch_wall_per_frame" in p for p in got[2]["problems"]), got[2])
+
+    def test_r5_sol_b4_the_wall_limit_is_held_on_the_exact_record_figures_at_the_decimal_bound(self) -> None:
+        """sol r4 B4 (decimal bound): 24 render totals one digit past the wall limit, with every pipe time 0.000, read PASS: the totals went through a double, which keeps about
+        15 digits, so 3500001.000000401 read as 3500001.0000004. sol's row is at elapsed=80000.0, whose limit r5 builds from the 80000.05 s wall that figure rounds from; the
+        same bound is held here at a 9-decimal elapsed, where half its last place is 5e-10 s: the first 9-decimal total past the exact limit is INVALID, the last one at or
+        under it is clean."""
+        from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+        elapsed = "80000.000000000"
+        wall = (Decimal(elapsed) + Decimal("0.0000000005")) * 1000 / 24
+        limit = wall * Decimal("1.05") + Decimal("1.0") + Decimal("0.0000004")
+        over = limit.quantize(Decimal("0.000000001"), rounding=ROUND_CEILING)
+        if over == limit:
+            over += Decimal("0.000000001")
+        at = limit.quantize(Decimal("0.000000001"), rounding=ROUND_FLOOR)
+        # the bite: at 15 significant digits (what [decimal][double] keeps) the over-limit total is not past the limit
+        self.assertLessEqual(Decimal(format(float(over), ".15g")), limit, "this row no longer exercises the double's lost digits")
+        mk = lambda t: prores_case(maxFrames=24, dualIsoExpected=True, stage=self.small_log(24, p16=str(t), drain="0.000", verify="0.000", pipe="0.000"),
+                                   batch=self.small_batch(24, elapsed), criteria=[])
+        proc, got = evidence_cases([mk(over), mk(at)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "INVALID", (str(over), str(limit), got[0]))
+        self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "batch_wall_per_frame" in p for p in got[0]["problems"]), got[0])
+        self.assertEqual(got[1]["problems"], [], (str(at), got[1]))
+
+    def test_r5_sol_b8_a_rounded_zero_dual_iso_figure_is_no_proof_that_no_attempt_ran(self) -> None:
+        """sol r4 B8: StageTiming.h prints %.3f, so an attempt of 0.0004 ms prints 0.000; with dualIsoExpected=false a log of 0.000 on every frame read agreement (PASS).
+        It is the typed UNKNOWN. Control: on a dual-ISO leg the same log is still the class mismatch (0 ms on every frame: nothing was reconstructed)."""
+        log = piped_stage_log(480, dual_iso_ms=0.0)
+        proc, got = evidence_cases([self.ctl(log, dualIsoExpected=False), self.ctl(log)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["problems"], [], got[0])
+        self.assertFalse(got[0]["classMismatch"], got[0])
+        self.assertIsNone(got[0]["metrics"]["dualIsoClassAgrees"], got[0])
+        self.assertNotEqual(got[0]["outcome"], "PASS", got[0])
+        self.assertIn(DUALISO_UNKNOWN, got[0]["metrics"]["dualIsoClassAgreesCouldNotCheck"], got[0])
+        self.assertTrue(got[1]["classMismatch"], got[1])
+        self.assertEqual(got[1]["outcome"], "INVALID", got[1])
+
+    def test_r5_sol_b9_a_frame_rate_outside_a_uint32_ratio_is_foreign(self) -> None:
+        """sol r4 B9: fps=1e+20 read no problem, but the producer's rate is the clip's uint32 numerator over its uint32 denominator, printed to six significant digits.
+        Controls: both ends of that range as QLocale prints them."""
+        s = self.CTL_START
+        good = [s.replace("fps=24", f) for f in ("fps=4.29497e+09", "fps=2.32831e-10")]
+        bad = [s.replace("fps=24", f) for f in ("fps=1e+20", "fps=4.29498e+09", "fps=2.3283e-10")]
+        proc, got = evidence_cases([self.ctl(batch=self.ctl_batch(x)) for x in good + bad])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for x, g in zip(good, got[:len(good)]):
+            with self.subTest(start=x):
+                assert_clean_but_dual_iso_unknown(self, g)
+        for x, g in zip(bad, got[len(good):]):
+            with self.subTest(start=x):
+                self.assertEqual(g["outcome"], "INVALID", g)
+                self.assertTrue(any(p.startswith("EXPORT_PROFILE_FOREIGN") and "fps=" in p for p in g["problems"]), g)
+
+    # --- r6: sol r5 on b02a6634, B3 and B8 only (each from sol's literal row; hub ruling HUB-TICK 20261124T0412Z)
+    @staticmethod
+    def producer_verified(frames: int, dims: str | None, probe: str = "C:/venue/ffmpeg/bin/ffprobe.exe", clip: str = "view-0") -> str:
+        """The rendered runner's RENDER_VERIFIED line in its exact field order (BatchRunner.cpp:803): dims=None leaves the dimensions= field out."""
+        d = "" if dims is None else f" dimensions={dims}"
+        return (f"[BATCH] RENDER_VERIFIED {clip} decoded_frames={frames} decoded_duration=20.000 decoded_frame_bytes=1{d} bytes=9 container_probe={probe} "
+                "probe_source=ffprobe-json codec=prores container=mov sar=1:1 dar=4:3")
+
+    def test_r6_sol_b3_the_verified_dimensions_are_the_producers_required_field_read_by_token_position(self) -> None:
+        """sol r5 B3: (a) a complete emitting ProRes capture declaring output=1920x1440 whose RENDER_VERIFIED line carries no dimensions= read PASS under empty criteria (the
+        geometry check ran only when some ' dimensions=' substring was found); (b) a valid dimensions=1920x1440 beside container_probe=C:/test/kit dimensions=archive/ffprobe.exe
+        (a field-like token inside the probe path, which BatchRunner.cpp:803-810 prints verbatim) read INVALID. The producer writes dimensions= as the fifth field after the
+        tag, so the reader takes it from that token position: missing (or not at that position) is EXPORT_OUTPUT_MISMATCH, and later text never counts as the field."""
+        wide = self.CTL_START.replace("output=1920x1080 scaled=false", "output=1920x1440 scaled=true")
+        done = "[BATCH] DONE view-0 exported=480 skipped=0 elapsed=60.0"
+        def batch(verified: str) -> str:
+            return "\n".join((wide, verified, done)) + "\n"
+        scaled_log = piped_stage_log(480, scale_ms=6.0)
+        moved = self.producer_verified(480, None).replace(" bytes=9 ", " bytes=9 dimensions=1920x1440 ")
+        bad = [self.producer_verified(480, None), self.producer_verified(480, ""), moved]
+        good = [self.producer_verified(480, "1920x1440", probe="C:/test/kit dimensions=archive/ffprobe.exe"), self.producer_verified(480, "1920x1440")]
+        proc, got = evidence_cases([self.ctl(scaled_log, batch=batch(v), criteria=[]) for v in bad] + [self.ctl(scaled_log, batch=batch(v)) for v in good])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for v, g in zip(bad, got[:len(bad)]):
+            with self.subTest(verified=v):
+                self.assertEqual(g["outcome"], "INVALID", g)
+                self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and "RENDER_VERIFIED" in p and "dimensions=" in p for p in g["problems"]), g)
+        for v, g in zip(good, got[len(bad):]):
+            with self.subTest(verified=v):
+                assert_clean_but_dual_iso_unknown(self, g)
+
+    def test_r6_sol_b8_a_rounded_zero_on_a_dual_iso_leg_keeps_the_mismatch_and_claims_no_unattempted_frame(self) -> None:
+        """sol r5 B8: a rejected attempt of 0.0004 ms writes llrawproc_dual_iso ms=0.000 (StageTiming.h:223 %.3f) on a dualIsoExpected=true leg, and the verdict detail said
+        none of the timed frames ATTEMPTED dual-ISO, which the rounded timer cannot show. The mismatch outcome stays (no reconstruction is that short); the detail reports
+        the observed rounded figure and makes no claim about attempts."""
+        log = piped_stage_log(480, dual_iso_ms=0.0)
+        proc, got = evidence_cases([self.ctl(log)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        g = got[0]
+        self.assertEqual(g["outcome"], "INVALID", g)
+        self.assertTrue(g["classMismatch"], g)
+        self.assertIs(g["metrics"]["dualIsoClassAgrees"], False, g)
+        self.assertEqual(g["metrics"]["dualIsoActiveFrames"], 0, g)
+        self.assertTrue(g["detail"].startswith("CLIP_CLASS_MISMATCH: "), g)
+        self.assertIn("0.000 ms on every one of 480 timed frame(s)", g["detail"])
+        self.assertIn("rounded", g["detail"])
+        self.assertIsNone(re.search(r"none of .*attempted|no (?:dual-ISO )?attempt ran|did not attempt", g["detail"]), g["detail"])
+
+    # --- r7: sol r6 on b8445c52, the one blocker only (a top-level RENDER_VERIFIED field named twice; hub ruling HUB-TICK 20261124T0602Z)
+    R7_START = ("[BATCH] RENDER_START view-0 codec=prores container=mov source=1920x1080 output=1920x1440 scaled=true fps=24 frames=1 cutIn=1 cutOut=1 "
+                "out=view-0.mov")
+    R7_DONE = "[BATCH] DONE view-0 exported=1 skipped=0 elapsed=1.0"
+    R7_HEAD = "[BATCH] RENDER_VERIFIED view-0 decoded_frames=1 decoded_duration=0.042 decoded_frame_bytes=1"
+
+    @classmethod
+    def r7_rows(cls) -> tuple:
+        """(bad, good) RENDER_VERIFIED lines for one complete one-frame emitting ProRes capture declaring output=1920x1440. bad: a field the rendered runner writes once
+        (BatchRunner.cpp:803, every field before container_probe=) named twice at top level, sol r6's literal row first. good: the producer's own line, and one whose
+        verbatim probe path holds field-like text (r6 B3: never the field)."""
+        h = cls.R7_HEAD
+        bad = [f"{h} dimensions=1920x1440 bytes=9 dimensions=1280x720 container_probe=C:/kit/ffprobe.exe",   # sol r6's literal row
+               f"{h} dimensions=1920x1440 bytes=9 dimensions=1920x1440 container_probe=C:/kit/ffprobe.exe",  # the predecessor (b02a6634) rejected any second dimensions=
+               f"{h} dimensions=1920x1440 bytes=9 dimensions=1280x720",                                      # no probe field at all: the whole line is top level
+               f"{h} dimensions=1920x1440 bytes=9 decoded_frames=30 container_probe=C:/kit/ffprobe.exe",
+               f"{h} dimensions=1920x1440 bytes=9 bytes=0 container_probe=C:/kit/ffprobe.exe",
+               f"{h} dimensions=1920x1440 bytes=9 decoded_duration=9.000 container_probe=C:/kit/ffprobe.exe",
+               f"{h} dimensions=1920x1440 bytes=9 decoded_frame_bytes=7 container_probe=C:/kit/ffprobe.exe",
+               f"{h} dimensions=1920x1440 dimensions=1280x720 bytes=9 container_probe=C:/kit/ffprobe.exe"]   # r6 row: before bytes=, already INVALID
+        tail = " probe_source=ffprobe-json codec=prores container=mov sar=1:1 dar=4:3"
+        # (EXPORT-RENDER-PIPE-TIMING-3 r1 forced companion, rule G2: a probe path component that reads as a field of the line in its shape is that field named again,
+        # so the r6 B3 field-like-path control is INVALID now; a component not of the field's shape stays the clean control)
+        bad.append(f"{h} dimensions=1920x1440 bytes=9 container_probe=C:/kit dimensions=1280x720 decoded_frames=30 bytes=0/ffprobe.exe{tail}")
+        good = [f"{h} dimensions=1920x1440 bytes=9 container_probe=C:/kit/ffprobe.exe{tail}",
+                f"{h} dimensions=1920x1440 bytes=9 container_probe=C:/kit dimensions=archive/ffprobe.exe{tail}"]
+        return bad, good
+
+    def r7_case(self, verified: str, start: str | None = None, done: str | None = None) -> dict:
+        batch = "\n".join((self.R7_START if start is None else start, verified, self.R7_DONE if done is None else done)) + "\n"
+        return prores_case(maxFrames=1, dualIsoExpected=True, stage=piped_stage_log(1, scale_ms=6.0), batch=batch, criteria=[])
+
+    def test_r7_sol_b1_a_top_level_render_verified_field_named_twice_is_invalid(self) -> None:
+        """sol r6 B1: a complete one-frame emitting ProRes capture declaring output=1920x1440 whose RENDER_VERIFIED carries `dimensions=1920x1440 bytes=9
+        dimensions=1280x720 container_probe=C:/kit/ffprobe.exe` read PASS under empty criteria (renderPipeTimed=true, problems=[]): the r6 token reader stopped at bytes=,
+        and the predecessor's whole-line count had rejected the second value. The class: every field the rendered runner writes once before container_probe= (whose value
+        is a verbatim path) named twice at top level is EXPORT_OUTPUT_MISMATCH, whatever field it is. Controls: the producer's own line, and field-like text inside the
+        probe path (r6 B3), stay clean."""
+        bad, good = self.r7_rows()
+        proc, got = evidence_cases([self.r7_case(v) for v in bad + good])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for v, g in zip(bad, got[:len(bad)]):
+            with self.subTest(verified=v):
+                self.assertEqual(g["outcome"], "INVALID", g)
+                self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and "RENDER_VERIFIED" in p for p in g["problems"]), g)
+        for v, g in zip(good, got[len(bad):]):
+            with self.subTest(verified=v):
+                self.assertEqual(g["problems"], [], g)
+                self.assertFalse(g["classMismatch"], g)
+                self.assertIs(g["metrics"]["renderPipeTimed"], True, g)
+                self.assertEqual(g["outcome"], "PASS", g)
+
+    def test_r7_sol_b1_sweep_render_start_and_done_already_refuse_a_contradictory_repeat(self) -> None:
+        """r7 sibling sweep (no fix owed): RENDER_START counts each key once before out= (Get-DvRenderStartDeclaration), and DONE is anchored at both ends, so a repeated
+        exported= moves into DONE's clip name, which is then not the clip RENDER_START and RENDER_VERIFIED name. Both read INVALID before and after r7."""
+        # (EXPORT-RENDER-PIPE-TIMING-2 r2 forced companion: the ok line carries the producer's whole trailer, so each row fails on the line it names and nothing else)
+        ok = f"{self.R7_HEAD} dimensions=1920x1440 bytes=9 container_probe=C:/kit/ffprobe.exe{self.T2_TRAILER}"
+        start2 = self.R7_START.replace(" out=view-0.mov", " output=1280x720 out=view-0.mov")
+        done2 = "[BATCH] DONE view-0 exported=30 skipped=0 elapsed=1.0 exported=1 skipped=0 elapsed=1.0"
+        proc, got = evidence_cases([self.r7_case(ok, start=start2), self.r7_case(ok, done=done2), self.r7_case(ok)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:2]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+        self.assertTrue(any(p.startswith("EXPORT_PROFILE_ABSENT") and "RENDER_START" in p for p in got[0]["problems"]), got[0])
+        self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and "DONE" in p for p in got[1]["problems"]), got[1])
+        self.assertEqual((got[2]["problems"], got[2]["outcome"]), ([], "PASS"), got[2])
+
+    # --- EXPORT-RENDER-PIPE-TIMING-2 r2: ONE line grammar for RENDER_START / RENDER_VERIFIED / DONE (fable / opus key3 / sol r7 on 18c52966: a field after the
+    # verbatim probe path, or a clip spelled like a key, defeated the marker search). Each row is one complete one-frame emitting ProRes capture under empty criteria.
+    T2_TRAILER = " probe_source=ffprobe-json codec=prores container=mov sar=1:1 dar=4:3"
+
+    @staticmethod
+    def t2_start(c: str = "view-0") -> str:
+        return (f"[BATCH] RENDER_START {c} codec=prores container=mov source=1920x1080 output=1920x1440 scaled=true fps=24 frames=1 cutIn=1 cutOut=1 "
+                "out=view-0.mov")
+
+    @staticmethod
+    def t2_head(c: str = "view-0") -> str:
+        return f"[BATCH] RENDER_VERIFIED {c} decoded_frames=1 decoded_duration=0.042 decoded_frame_bytes=1"
+
+    @classmethod
+    def t2_verified(cls, c: str = "view-0", probe: str = "C:/kit/ffprobe.exe") -> str:
+        return f"{cls.t2_head(c)} dimensions=1920x1440 bytes=9 container_probe={probe}{cls.T2_TRAILER}"
+
+    @staticmethod
+    def t2_done(c: str = "view-0") -> str:
+        return f"[BATCH] DONE {c} exported=1 skipped=0 elapsed=1.0"
+
+    @classmethod
+    def t2_rows(cls) -> list:
+        """(label, start, verified lines, done, joiner, expect) where expect is 'PASS' or (code, kind, key or None)."""
+        S, H, V, D, TR = cls.t2_start, cls.t2_head, cls.t2_verified, cls.t2_done, cls.T2_TRAILER
+        V0, S0, D0 = V(), S(), D()
+        RV, RS, DN = "RENDER_VERIFIED", "RENDER_START", "DONE"
+        OM, PA, BU = "EXPORT_OUTPUT_MISMATCH", "EXPORT_PROFILE_ABSENT", "EXPORT_BATCH_LOG_UNREADABLE"
+        cp = "container_probe=x"
+        k1 = f"{H(cp)} dimensions=1920x1440 bytes=9 dimensions=1280x720 container_probe=C:/kit/ffprobe.exe"
+        k4 = f"{cls.R7_HEAD} dimensions=1920x1440 bytes=9 dimensions=1280x720 container_probe=C:/kit/ffprobe.exe"
+        def row(label, expect, v=None, c="view-0", s=None, d=None, extra=(), joiner="\n"):
+            return (label, S(c) if s is None else s, [V(c) if v is None else v, *extra], D(c) if d is None else d, joiner, expect)
+        return [
+            row("K1", (OM, RV, "dimensions="), v=k1, c=cp),
+            row("K1t", (OM, RV, "dimensions="), v=k1 + TR, c=cp),
+            row("K2", (OM, RV, "dimensions="), v=V0 + " dimensions=1280x720"),
+            row("K3a", (OM, RV, "decoded_frames="), v=V0 + " decoded_frames=30"),
+            row("K3b", (OM, RV, "codec="), v=V0 + " codec=h264"),
+            row("K4", (OM, RV, "dimensions="), v=k4),
+            row("K4t", (OM, RV, "dimensions="), v=k4 + TR),
+            row("BY-L", (OM, RV, "bytes="), v=f"{H()} dimensions=1920x1440 bytes=0 bytes=9 container_probe=C:/kit/ffprobe.exe{TR}"),
+            row("BY-T", (OM, RV, "bytes="), v=V0 + " bytes=0"),
+            row("BY-C+", "PASS", c="bytes=0"),
+            row("BY-C-", (OM, RV, "bytes="), v=V("bytes=0") + " bytes=0", c="bytes=0"),
+            row("DF-L", (OM, RV, "decoded_frames="),
+                v=f"[BATCH] RENDER_VERIFIED view-0 decoded_frames=1 decoded_frames=1 decoded_duration=0.042 decoded_frame_bytes=1 dimensions=1920x1440 bytes=9 "
+                  f"container_probe=C:/kit/ffprobe.exe{TR}"),
+            row("DF-C+", "PASS", c="decoded_frames=1"),
+            row("DF-C-", (OM, RV, "decoded_frames="), v=V("decoded_frames=1") + " decoded_frames=30", c="decoded_frames=1"),
+            row("CO-LV", (OM, RV, "codec="), v=V0.replace(" codec=prores ", " codec=h264 codec=prores ")),
+            row("CO-LS", (PA, RS, "codec="), s=S0.replace("codec=prores container=mov", "codec=prores codec=h264 container=mov")),
+            row("CO-C+", "PASS", c="codec=h264"),
+            row("CO-C-", (OM, RV, "codec="), v=V("codec=h264") + " codec=h264", c="codec=h264"),
+            row("DI-L", (OM, RV, "dimensions="), v=f"{H()} dimensions=1280x720 dimensions=1920x1440 bytes=9 container_probe=C:/kit/ffprobe.exe{TR}"),
+            row("DI-C+", "PASS", c="dimensions=1280x720"),
+            row("DI-C-", (OM, RV, "dimensions="), v=V("dimensions=1280x720") + " dimensions=1280x720", c="dimensions=1280x720"),
+            row("CT-LV", (OM, RV, "container="), v=V0.replace(" container=mov sar=", " container=mp4 container=mov sar=")),
+            row("CT-LS", (PA, RS, "container="), s=S0.replace("container=mov source=", "container=mov container=mp4 source=")),
+            row("CT-T", (OM, RV, "container="), v=V0 + " container=mp4"),
+            row("CT-C+", "PASS", c="container=mp4"),
+            row("CT-C-", (OM, RV, "container="), v=V("container=mp4") + " container=mp4", c="container=mp4"),
+            row("CP-T", (OM, RV, "container_probe="), v=V0 + " container_probe=D:/x/ffprobe.exe"),
+            row("CP-C+", "PASS", c=cp),
+            row("F1", (OM, RV, None), v=f"{H()} dimensions=1920x1440 bytes=9 x\tdimensions=1280x720 container_probe=C:/kit/ffprobe.exe{TR}"),
+            row("F2", (OM, RV, "container_probe="), v=f"{H()} dimensions=1920x1440 bytes=9 DIMENSIONS=1280x720 container_probe=C:/kit/ffprobe.exe{TR}"),
+            row("F3", (OM, RV, "bytes="), v=f"{H()} dimensions=1920x1440 bytes=9;dimensions=1280x720 container_probe=C:/kit/ffprobe.exe{TR}"),
+            row("F4", (OM, RV, "container_probe="), v=f"{H()} dimensions=1920x1440 bytes=9 extra=1 container_probe=C:/kit/ffprobe.exe{TR}"),
+            row("F5", (OM, RV, None), extra=("[BATCH] RENDER_VERIFIED garbage",)),
+            row("F6", (OM, RV, None), v=V0.replace(" probe_source=", "\u2028probe_source=")),
+            row("F7", "PASS", c="my clip"),
+            row("F8", "PASS", joiner="\r\n"),
+            # (EXPORT-RENDER-PIPE-TIMING-3 r1, rule G2, sol r4 B3 / key3 r4 H2: reversal of the r2 design. A space-delimited component of the verbatim probe path that reads
+            # as a field of its line in that field's shape is that field named again, so the line is refused fail-closed; field-like text NOT of the field's shape stays clean)
+            row("F9", (OM, RV, "container_probe="), v=V(probe="C:/kit dimensions=1280x720 decoded_frames=30 bytes=0/ffprobe.exe")),
+            row("F10", (OM, RV, "container_probe="), v=V(probe="C:/a probe_source=none codec=h264 container=mp4 sar=2:1 dar=1:1")),
+            # (TIMING-3 r1 forced companion, rule G2: the field named again inside the out= slot is refused by RENDER_START's own grammar code, before the leaf binding)
+            row("F11", (PA, RS, "out="), s=S0 + " codec=h264"),
+            row("F12", (BU, DN, "exported="), d=D0 + " exported=1"),
+            # (r4, sol r3 B4 forced companion: the repeated triplet is now refused by DONE's own grammar, before the clip is bound to RENDER_VERIFIED's)
+            # (TIMING-3 r1, rule G1: DONE's clip is positional, never field-parsed, and is BOUND to the ProRes witness: RENDER_VERIFIED's ordinal prefix refuses it)
+            row("F13", (OM, RV, "view-0 exported=30 skipped=0 elapsed=1.0"), d="[BATCH] DONE view-0 exported=30 skipped=0 elapsed=1.0 exported=1 skipped=0 elapsed=1.0"),
+            row("F14", (PA, RS, "out="), s=S0.replace(" out=", " output=1280x720 out=")),
+        ]
+
+    @staticmethod
+    def t2_case(start: str, verified: list, done: str, joiner: str = "\n") -> dict:
+        batch = joiner.join([start, *verified, done]) + joiner
+        return prores_case(maxFrames=1, dualIsoExpected=True, stage=piped_stage_log(1, scale_ms=6.0), batch=batch, criteria=[])
+
+    def test_t2_r2_one_line_grammar_binds_every_field_at_its_position(self) -> None:
+        """EXPORT-RENDER-PIPE-TIMING-2 r2: the reader takes RENDER_START, RENDER_VERIFIED and DONE apart by ONE positional grammar (BatchRunner.cpp:471, :803, :821),
+        so a field named again after its position (after the verbatim probe path too), an unknown or case-changed key, a tab-joined or ;-joined token, a control or
+        line-separator character, or a second line of the kind is INVALID with the kind's code, and a clip spelled like a key (a legal completeBaseName) or holding a
+        space, CRLF framing and field-like text inside the probe path are clean."""
+        rows = self.t2_rows()
+        proc, got = evidence_cases([self.t2_case(s, v, d, j) for _, s, v, d, j, _ in rows])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for (label, _, _, _, _, expect), g in zip(rows, got):
+            with self.subTest(row=label):
+                if expect == "PASS":
+                    self.assertEqual(g["problems"], [], g)
+                    self.assertIs(g["metrics"]["renderPipeTimed"], True, g)
+                    self.assertEqual(g["outcome"], "PASS", g)
+                else:
+                    code, kind, key = expect
+                    self.assertEqual(g["outcome"], "INVALID", g)
+                    self.assertTrue(any(p.startswith(code) and kind in p and (key is None or key in p) for p in g["problems"]), g)
+
+    def test_t2_r2_a_grammar_message_names_the_kind_the_expected_key_and_the_token_found(self) -> None:
+        """The grammar's message is the design's: kind, field number, expected key and the token found; and a verification that fails the grammar adds no second
+        (dimensions binding) problem."""
+        k4 = f"{self.R7_HEAD} dimensions=1920x1440 bytes=9 dimensions=1280x720 container_probe=C:/kit/ffprobe.exe{self.T2_TRAILER}"
+        proc, got = evidence_cases([self.t2_case(self.t2_start(), [k4], self.t2_done())])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["problems"], ["EXPORT_OUTPUT_MISMATCH: RENDER_VERIFIED is not in the rendered runner's form (BatchRunner.cpp:803): at field 6 it expects "
+                                              "container_probe= and finds 'dimensions=1280x720'"], got[0])
+
+    def test_t2_r3_each_unicode_line_separator_in_a_batch_line_is_refused(self) -> None:
+        """EXPORT-RENDER-PIPE-TIMING-2 r3 (CI red on 61c6d229: the forbidden-character class carried U+2028 and U+2029 as literal characters, so the module was not
+        ASCII): U+2028, U+2029 and U+0085, each written here as an escape, inside a RENDER_VERIFIED line are refused as on 61c6d229 (the escape change must not weaken it)."""
+        chars = {"U+2028": "\u2028", "U+2029": "\u2029", "U+0085": "\u0085"}
+        v0 = self.t2_verified()
+        proc, got = evidence_cases([self.t2_case(self.t2_start(), [v0.replace(" probe_source=", f"{ch}probe_source=")], self.t2_done()) for ch in chars.values()])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for (name, _), g in zip(chars.items(), got):
+            with self.subTest(char=name):
+                self.assertEqual(g["outcome"], "INVALID", g)
+                self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and "RENDER_VERIFIED" in p for p in g["problems"]), g)
+
+    # --- EXPORT-RENDER-PIPE-TIMING-2 r4 (sol r3 on 5aa6629a, B1-B4): each row is a malformed line the r2 grammar still read as valid evidence.
+    # The producer's no-probe trailer (BatchRunner.cpp:810-819): container_probe=unavailable, then probe_source=none and four 'unchecked' facts.
+    T4_NO_PROBE = " probe_source=none codec=unchecked container=unchecked sar=unchecked dar=unchecked"
+
+    @classmethod
+    def t4_no_probe(cls, between: str = "", trailer: str | None = None, probe: str = "unavailable") -> str:
+        return f"{cls.t2_head()} dimensions=1920x1440 bytes=9 container_probe={probe}{between}{cls.T4_NO_PROBE if trailer is None else trailer}"
+
+    def test_t2_r4_b1_a_field_between_the_no_probe_sentinel_and_its_trailer_is_invalid(self) -> None:
+        """sol r3 B1 (repro verbatim): on an otherwise clean emitting one-frame export, dimensions=1280x720 after container_probe=unavailable and before
+        probe_source=none read PASS, renderPipeTimed=true, problems=[]; a repeated probe_source and an extra separator at that boundary passed too. 'unavailable' is the
+        producer's fixed sentinel and is printed only with probe_source=none and four 'unchecked' facts, so the sentinel binds its trailer both ways. Controls: the
+        producer's own no-probe line stays clean. (TIMING-3 r1: F9 / F10 above are no longer controls: by rule G2 a probe path component that reads as a
+        field of the line in its shape is that field named again, INVALID; `container_probe=C:/kit dimensions=archive/ffprobe.exe` is the clean control now.)"""
+        rows = [("NP-OK", self.t4_no_probe(), "PASS"),
+                ("B1", self.t4_no_probe(" dimensions=1280x720"), "INVALID"),
+                ("B1-PS-REPEAT", self.t4_no_probe(" probe_source=none"), "INVALID"),
+                ("B1-PS-CONFLICT", self.t4_no_probe(" probe_source=ffprobe-json"), "INVALID"),
+                ("B1-SEPARATOR", self.t4_no_probe(" "), "INVALID"),
+                ("B1-FACTS", self.t4_no_probe(trailer=self.T2_TRAILER.replace("ffprobe-json", "none")), "INVALID"),
+                ("B1-SENTINEL-PARSED", self.t4_no_probe(trailer=self.T2_TRAILER), "INVALID"),
+                ("B1-PATH-NONE", self.t4_no_probe(probe="C:/kit/ffprobe.exe"), "INVALID")]
+        proc, got = evidence_cases([self.t2_case(self.t2_start(), [v], self.t2_done()) for _, v, _ in rows])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for (label, _, expect), g in zip(rows, got):
+            with self.subTest(row=label):
+                if expect == "PASS":
+                    self.assertEqual((g["problems"], g["outcome"]), ([], "PASS"), g)
+                    self.assertIs(g["metrics"]["renderPipeTimed"], True, g)
+                else:
+                    self.assertEqual(g["outcome"], "INVALID", g)
+                    self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and "RENDER_VERIFIED" in p and "container_probe=" in p for p in g["problems"]), g)
+
+    def test_t2_r4_b4_a_second_done_count_triplet_is_invalid_on_cdng(self) -> None:
+        """sol r3 B4 (repro verbatim): a valid 30-frame CDNG fixture with `DONE view-0 exported=29 skipped=1 elapsed=40.0 exported=30 skipped=0 elapsed=20.0` read PASS:
+        the first triplet was absorbed into the clip, and CDNG has no RENDER_START to bind the clip as ProRes does. A DONE field named again just before the peeled
+        trailer is a repeat (any route). Sibling rows: a repeated elapsed= alone, a repeated skipped= alone, and the ProRes route. Controls: the clean fixture, and a
+        one-token clip spelled like a DONE key (a legal completeBaseName; the clip is required, so it is no repeat)."""
+        two = "[BATCH] Start\n[BATCH] DONE view-0 exported=29 skipped=1 elapsed=40.0 exported=30 skipped=0 elapsed=20.0\n"
+        rows = [("CDNG-OK", cdng_case(), "PASS", None),
+                ("B4", cdng_case(batch=two), "INVALID", "elapsed="),
+                ("B4-ELAPSED", cdng_case(batch="[BATCH] DONE view-0 elapsed=40.0 exported=30 skipped=0 elapsed=20.0\n"), "INVALID", "elapsed="),
+                ("B4-SKIPPED", cdng_case(batch="[BATCH] DONE view-0 skipped=1 exported=30 skipped=0 elapsed=20.0\n"), "INVALID", "skipped="),
+                # (TIMING-3 r1, rule G1: the ProRes route refuses it by its witness, RENDER_START / RENDER_VERIFIED's ordinal prefix, naming DONE's clip text)
+                ("B4-PRORES", self.t2_case(self.t2_start(), [self.t2_verified()], "[BATCH] DONE view-0 exported=1 skipped=0 elapsed=1.0 exported=1 skipped=0 elapsed=1.0"),
+                 "INVALID-PRORES", "view-0 exported=1 skipped=0 elapsed=1.0"),
+                # (r4 adversary pass 2 A1 on 2d8e9bf2, input verbatim: an extra separator before the second triplet left an empty last token and bypassed the check)
+                ("A1-SEPARATOR", cdng_case(batch="[BATCH] DONE owner-clip exported=29 skipped=1 elapsed=40.0  exported=30 skipped=0 elapsed=20.0\n"), "INVALID", "elapsed="),
+                # (r4 adversary pass 3 A1 on 68f078d6, input shape verbatim on the 30-frame fixture: a triplet buried in the clip, followed by more clip text)
+                ("A1P3-BURIED", cdng_case(batch="[BATCH] DONE view-0 exported=29 skipped=1 elapsed=40.0 x exported=30 skipped=0 elapsed=20.0\n"), "INVALID", "elapsed="),
+                ("A1P3-LEADING", cdng_case(batch="[BATCH] DONE exported=29 x exported=30 skipped=0 elapsed=20.0\n"), "INVALID", "exported="),
+                ("CDNG-CLIP-SPACE", cdng_case(batch="[BATCH] DONE my clip exported=30 skipped=0 elapsed=20.0\n", manifest=output_manifest(30, clip="my clip")), "PASS", None),
+                ("CDNG-CLIP-KEY", cdng_case(batch="[BATCH] DONE elapsed=1.0 exported=30 skipped=0 elapsed=20.0\n", manifest=output_manifest(30, clip="elapsed=1.0")), "PASS", None)]
+        proc, got = evidence_cases([c for _, c, _, _ in rows])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for (label, _, expect, key), g in zip(rows, got):
+            with self.subTest(row=label):
+                if expect == "PASS":
+                    self.assertEqual((g["problems"], g["outcome"]), ([], "PASS"), g)
+                elif expect == "INVALID-PRORES":
+                    self.assertEqual(g["outcome"], "INVALID", g)
+                    self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and ("RENDER_START" in p or "RENDER_VERIFIED" in p) and key in p for p in g["problems"]), g)
+                else:
+                    self.assertEqual(g["outcome"], "INVALID", g)
+                    self.assertTrue(any(p.startswith("EXPORT_BATCH_LOG_UNREADABLE") and "DONE" in p and key in p for p in g["problems"]), g)
+
+    def test_t2_r4_b3_a_present_render_start_is_read_by_the_grammar_on_an_older_or_unknown_build(self) -> None:
+        """sol r3 B3 (repro verbatim): with the older build 2b796198 and otherwise valid older-format evidence, output=1280x720 inserted just before out= on a line
+        already carrying output=1x1 read PASS with no problem, and so did `RENDER_START:`: the declaration was read only when the build emits this card's stages. A
+        PRESENT RENDER_START is now read by the one grammar and the declaration's own checks on every ProRes route; an absent one on an older build adds nothing (a
+        receipt from before RENDER_START re-derives the same). The same holds for a build this repo cannot name ('unknown')."""
+        import subprocess
+        base = "2b79619832444c0a63a8573d04f6cd02a4a113dc"
+        if subprocess.run(["git", "-C", str(ROOT), "cat-file", "-t", base], capture_output=True, text=True).stdout.strip() != "commit":
+            self.skipTest("the base commit is not in this clone (a shallow checkout)")
+        old = stage_log(480)
+        dup = self.CTL_START.replace(" out=", " output=1280x720 out=")
+        colon = self.CTL_START.replace("RENDER_START view-0 ", "RENDER_START: view-0 ")
+        no_start = self.ctl_batch().split("\n", 1)[1]
+        rows = []
+        for build in (base, BUILD_ID):
+            rows += [(f"{build[:8]}-OK", self.ctl(old, buildId=build), "PASS"),
+                     (f"{build[:8]}-NO-START", self.ctl(old, buildId=build, batch=no_start), "PASS"),
+                     (f"{build[:8]}-B3-DUP-OUTPUT", self.ctl(old, buildId=build, batch=self.ctl_batch(start=dup)), "INVALID"),
+                     (f"{build[:8]}-B3-COLON", self.ctl(old, buildId=build, batch=self.ctl_batch(start=colon)), "INVALID")]
+            # (r4 adversary pass 2 A4 on 2d8e9bf2: a present declaration on the older route binds as on the emitting one: the producer's order, the manifest's .mov, the
+            # verified dimensions and the timed window; scaled= alone stays with the emitting route, since an older build times no export_scale)
+            done = "[BATCH] DONE view-0 exported=480 skipped=0 elapsed=60.0"
+            rows += [(f"{build[:8]}-A4-ORDER", self.ctl(old, buildId=build, batch=self.ctl_batch(order=("done", "verified", "start"))), "INVALID"),
+                     (f"{build[:8]}-A4-OUT", self.ctl(old, buildId=build, batch=self.ctl_batch(start=self.CTL_START.replace("out=view-0.mov", "out=other.mov"))), "INVALID"),
+                     (f"{build[:8]}-A4-DIMS", self.ctl(old, buildId=build, batch=f"{self.CTL_START}\n{verified_line(480, '1920x1440')}\n{done}\n"), "INVALID"),
+                     (f"{build[:8]}-A4-WINDOW", self.ctl(old, buildId=build, batch=self.ctl_batch(start=self.CTL_START.replace("cutIn=1 cutOut=480", "cutIn=101 cutOut=580"))), "INVALID")]
+        proc, got = evidence_cases([c for _, c, _ in rows])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for (label, _, expect), g in zip(rows, got):
+            with self.subTest(row=label):
+                if expect == "PASS":
+                    self.assertEqual(g["problems"], [], "an older build's valid (or absent) declaration raises no problem")
+                else:
+                    self.assertEqual(g["outcome"], "INVALID", g)
+                    self.assertTrue(any("RENDER_START" in p and p.split(":")[0] in ("EXPORT_PROFILE_ABSENT", "EXPORT_OUTPUT_MISMATCH", "EXPORT_STAGE_WINDOW_MISMATCH") for p in g["problems"]), g)
+
+    # --- EXPORT-RENDER-PIPE-TIMING-3 r1 (sol r4 on 14a9b47b, B1-B3, H-ISO; key3 r4 H1 / H2): rule G. G1 DONE's clip is positional, never field-parsed, and bound to a
+    # witness per format (ProRes: RENDER_START / RENDER_VERIFIED's ordinal prefix; CDNG: each DNG leaf the manifest names is <clip>_<frame>.dng). G2 every field key
+    # at most once per line: a space-delimited token of a verbatim path slot (out= / container_probe=) that reads as a field of its line in its shape is that field
+    # named again. G3 the no-probe sentinel rule is unchanged.
+    T3_CLIP = "take elapsed=1.0"
+
+    @classmethod
+    def t3_prores(cls, clip: str = "view-0", start: str | None = None, verified: str | None = None, done: str | None = None, leaf: str | None = None) -> dict:
+        s = cls.t2_start(clip).replace("out=view-0.mov", f"out={clip}.mov") if start is None else start
+        c = cls.t2_case(s, [cls.t2_verified(clip) if verified is None else verified], cls.t2_done(clip) if done is None else done)
+        c["manifest"] = output_manifest(1, "mov", clip=clip if leaf is None else leaf[:-4])
+        return c
+
+    def t3_check(self, rows: list, prelude: str = "", **env: str) -> None:
+        """rows: (label, case, expect) where expect is 'PASS' or (code prefix, [needles...]). prelude / env go to evidence_cases (TIMING-3 r2)."""
+        proc, got = evidence_cases([c for _, c, _ in rows], prelude, **env)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        # (TIMING-3 r2, sol r1 hardening: a result list short of its rows would let zip leave a fixture unasserted)
+        self.assertEqual(len(got), len(rows), proc.stdout[-3000:] + proc.stderr[-3000:])
+        for (label, _, expect), g in zip(rows, got):
+            with self.subTest(row=label):
+                if expect == "PASS":
+                    self.assertEqual((g["problems"], g["outcome"]), ([], "PASS"), g)
+                else:
+                    code, needles = expect
+                    self.assertEqual(g["outcome"], "INVALID", g)
+                    self.assertTrue(any(p.startswith(code) and all(n in p for n in needles) for p in g["problems"]), g)
+
+    def test_t3_r1_b1_a_clip_holding_field_text_is_the_clip_bound_to_its_witness(self) -> None:
+        """sol r4 B1 (repro verbatim): the batch runner writes the clip as completeBaseName (BatchRunner.cpp:324), so `take elapsed=1.0.MLV` writes DONE take
+        elapsed=1.0 exported=30 skipped=0 elapsed=20.0; the r4 clip-token scan read it INVALID. The clip is positional and bound (G1). CDNG-WITNESS: a DONE of
+        another clip than the manifest's leaves is refused by the CDNG witness (CdngSequenceExport.cpp:269-280). key3 r4 H1 rows are closed by the class."""
+        BU = "EXPORT_BATCH_LOG_UNREADABLE"
+        c = self.T3_CLIP
+        done = lambda clip: f"[BATCH] DONE {clip} exported=30 skipped=0 elapsed=20.0\n"
+        self.t3_check([
+            ("B1-PRORES", self.t3_prores(c), "PASS"),
+            ("B1-CDNG", cdng_case(batch=done(c), manifest=output_manifest(30, clip=c)), "PASS"),
+            ("CDNG-WITNESS", cdng_case(batch=done("view-0"), manifest=output_manifest(30, clip="other-clip")),
+             (BU, ["DONE names the clip 'view-0'", "'other-clip_000000.dng'", "CdngSequenceExport.cpp:269-280"])),
+            ("CDNG-WITNESS-DATED", cdng_case(batch=done("view-0"), manifest=json.dumps({**json.loads(output_manifest(30)), "first": {"name": "view-0_1_2026-11-24_0001_C0000_000000.dng", "bytes": 1000, "sha256": "1" * 64}, "last": {"name": "view-0_1_2026-11-24_0001_C0000_000029.dng", "bytes": 1000, "sha256": "2" * 64}})),
+             # (TIMING-3 r2, F1, design-ordered reversal: r1 read this PASS, but the batch route writes only <clip>_<frame6>.dng (BatchRunner.cpp:1393 CODEC_CNDG_DEFAULT),
+             # so these are the standard leaves of the clip view-0_1_2026-11-24_0001_C0000, not view-0's)
+             (BU, ["DONE names the clip 'view-0'", "'view-0_1_2026-11-24_0001_C0000_000000.dng'"])),
+            ("CDNG-WITNESS-PREFIX", cdng_case(batch=done("view"), manifest=output_manifest(30, clip="view-0")), (BU, ["DONE names the clip 'view'"])),
+            ("KEY3-H1-DOUBLE-SPACE", cdng_case(batch="[BATCH] DONE  exported=29 exported=30 skipped=0 elapsed=20.0\n"), (BU, ["DONE"])),
+            ("KEY3-H1-SHAPE", cdng_case(batch="[BATCH] DONE view-0 exported=29x exported=30 skipped=0 elapsed=20.0\n"), (BU, ["DONE", "view-0 exported=29x"])),
+            ("CTL-TAKE-ONE", cdng_case(batch=done("take one"), manifest=output_manifest(30, clip="take one")), "PASS"),
+            ("CTL-ONE-TOKEN", cdng_case(batch=done("elapsed=1.0"), manifest=output_manifest(30, clip="elapsed=1.0")), "PASS"),
+            ("CTL-PRORES-TAKE-ONE", self.t3_prores("take one"), "PASS"),
+            ("CTL-R3-B4", cdng_case(batch="[BATCH] DONE view-0 exported=29 skipped=1 elapsed=40.0 exported=30 skipped=0 elapsed=20.0\n"), (BU, ["DONE", "elapsed="])),
+        ])
+
+    # --- EXPORT-RENDER-PIPE-TIMING-3 r2 (sol r1 on ce790369, blocker; key3 r1 row 2): the CDNG witness binds only the leaf the batch route writes. The headless route
+    # passes CODEC_CNDG_DEFAULT (BatchRunner.cpp:1393), so CdngSequenceExport.cpp:269-271 names every frame <clip>_<frame6>.dng; the dated form (:275-280) is never
+    # written on it. Accepting the dated form let a standard leaf of clip view-0_1_2024-01-02_0001_C0000 certify DONE view-0, and a pair of one standard and one dated
+    # endpoint pass (F1). F2: the endpoint pair binds by its stem (the leaf less its trailing _<frame>.dng), which must be DONE's clip for both, so a re-widened leaf
+    # table still refuses both. Fixtures: sol's 480-frame shape under the shipped acceptance and supplementary criteria.
+    T3R2_DATED = "view-0_1_2024-01-02_0001_C0000"
+    # (elapsed=60.0 as sol's repro: 480 frames in 20 s is 41.7 ms a frame, under the fixture's 63 ms producer_frame, a containment mismatch of its own)
+    T3R2_DONE480 = "[BATCH] Start\n[BATCH] DONE view-0 exported=480 skipped=0 elapsed=60.0\n"
+    T3R2_WIDENED = r"\A(?:1_[0-9]{2,5}-[0-9]{2,5}-[0-9]{2,5}_0001_C0000_)?[0-9]{6,10}\.dng\z"   # r1's table, the form F1 removes
+
+    @staticmethod
+    def cdng_endpoints(count: int, first: str, last: str) -> str:
+        m = json.loads(output_manifest(count))
+        m["first"] = {"name": first, "bytes": 1000, "sha256": "1" * 64}
+        m["last"] = {"name": last, "bytes": 1000, "sha256": "2" * 64}
+        return json.dumps(m)
+
+    def t3r2_rows(self) -> list:
+        BU, dd = "EXPORT_BATCH_LOG_UNREADABLE", self.T3R2_DATED
+        spec = leg("m16-1243-export-cdng-lossless")
+        rows = []
+        for role in ("acceptance", "supplementary"):
+            crit = spec["criteria"][role]["cpu"]
+            case = lambda first, last: cdng_case(maxFrames=480, profile=cdng_profile(480), batch=self.T3R2_DONE480, manifest=self.cdng_endpoints(480, first, last), criteria=crit)
+            rows += [(f"{role}-CTL-480-OK", case("view-0_000000.dng", "view-0_000479.dng"), "PASS"),
+                     (f"{role}-SOL-B-CROSS-CLIP", case(f"{dd}_000000.dng", f"{dd}_000479.dng"), (BU, ["DONE names the clip 'view-0'", f"'{dd}_000"])),
+                     (f"{role}-SOL-B-MIXED", case("view-0_000000.dng", f"{dd}_000479.dng"), (BU, ["DONE names the clip 'view-0'", f"'{dd}_000479.dng'"]))]
+        a = "a_1_2026-11-24_0001_C0000"
+        done30 = lambda clip: f"[BATCH] DONE {clip} exported=30 skipped=0 elapsed=20.0\n"
+        rows += [("KEY3-R1-ROW2", cdng_case(batch=done30("a"), manifest=self.cdng_endpoints(30, f"{a}_000000.dng", f"{a}_000029.dng")), (BU, ["DONE names the clip 'a'", f"'{a}_0000"])),
+                 # (control: the same leaves ARE the standard leaves of the clip literally named a_1_2026-11-24_0001_C0000)
+                 ("CTL-KEY3-R1-ROW2-OWN-CLIP", cdng_case(batch=done30(a), manifest=self.cdng_endpoints(30, f"{a}_000000.dng", f"{a}_000029.dng")), "PASS"),
+                 ("CTL-B1-CDNG", cdng_case(batch=done30(self.T3_CLIP), manifest=output_manifest(30, clip=self.T3_CLIP)), "PASS")]
+        return rows
+
+    def test_t3_r2_sol_r1_the_cdng_witness_binds_only_the_leaf_the_batch_route_writes(self) -> None:
+        """sol r1 blocker (repro verbatim in shape) and key3 r1 row 2: a foreign clip's standard leaves read as view-0's dated leaves, and a mixed endpoint pair, both
+        read PASS under the shipped criteria. INVALID with the witness message (F1). Controls: the clean 480-frame run, the clip literally named by the dated stem,
+        sol r4 B1's `take elapsed=1.0`."""
+        self.t3_check(self.t3r2_rows())
+
+    def test_t3_r2_f2_the_endpoint_pair_binds_by_its_stem_even_under_a_widened_leaf_table(self) -> None:
+        """F2 (defence in depth): with $script:ExportCdngFrameLeaf re-widened to r1's dated alternation, the cross-clip and the mixed pair are still the witness
+        problem, because each endpoint's stem (the leaf less its trailing _<frame>.dng) must be DONE's clip. The message names both leaves."""
+        BU, dd = "EXPORT_BATCH_LOG_UNREADABLE", self.T3R2_DATED
+        rows = []
+        for label, case, expect in self.t3r2_rows():
+            if "CROSS-CLIP" in label:
+                expect = (BU, ["DONE names the clip 'view-0'", f"'{dd}_000000.dng'", f"'{dd}_000479.dng'"])
+            elif "MIXED" in label:
+                expect = (BU, ["DONE names the clip 'view-0'", "'view-0_000000.dng'", f"'{dd}_000479.dng'"])
+            elif label == "KEY3-R1-ROW2":
+                expect = (BU, ["DONE names the clip 'a'", "'a_1_2026-11-24_0001_C0000_000000.dng'", "'a_1_2026-11-24_0001_C0000_000029.dng'"])
+            rows.append((label, case, expect))
+        self.t3_check(rows, "& (Get-Module DualVenueRunner) { $script:ExportCdngFrameLeaf = $env:DVE_LEAF }\n", DVE_LEAF=self.T3R2_WIDENED)
+
+    # --- EXPORT-PIPE-EVIDENCE-READER-HARDENING-1 r1 (sol r2 on f31c1b88, B1 blocker and H1). The headless route passes CODEC_CNDG_DEFAULT (BatchRunner.cpp:1393) and
+    # CdngSequenceExport.cpp:269-271 prints getMlvFrameNumber, a uint32 (macros.h:35, mlv_object.h:52), with QString::arg's field width 6 and fill '0'. So the suffix is
+    # exactly six digits (0 .. 999999, zero-padded) or seven to ten digits with no leading zero, at most 4294967295. Anything else is a name the writer cannot print.
+    T3H_BAD = (("SOL-R2-B1-OVERPAD", "view-0_0000000.dng", "view-0_0000479.dng"), ("SOL-R2-B1-OVERFLOW", "view-0_4294967296.dng", "view-0_9999999999.dng"))
+    T3H_PIN = (("PIN-UINT32-MAX", "view-0_4294967294.dng", "view-0_4294967295.dng"), ("PIN-SIX", "view-0_000000.dng", "view-0_000479.dng"),
+               ("PIN-SEVEN", "view-0_999999.dng", "view-0_1000000.dng"))
+
+    def t3h_case(self, first: str, last: str, crit) -> dict:
+        return cdng_case(maxFrames=480, profile=cdng_profile(480), batch=self.T3R2_DONE480, manifest=self.cdng_endpoints(480, first, last), criteria=crit)
+
+    def t3h_rows(self, pins: bool = True) -> list:
+        BU = "EXPORT_BATCH_LOG_UNREADABLE"
+        spec = leg("m16-1243-export-cdng-lossless")
+        rows = []
+        for role in ("acceptance", "supplementary"):
+            crit = spec["criteria"][role]["cpu"]
+            rows += [(f"{role}-{label}", self.t3h_case(first, last, crit), (BU, ["DONE names the clip 'view-0'", f"'{first}'", f"'{last}'"])) for label, first, last in self.T3H_BAD]
+            if pins:
+                rows += [(f"{role}-{label}", self.t3h_case(first, last, crit), "PASS") for label, first, last in self.T3H_PIN]
+        return rows
+
+    def test_reader_hardening_1_r1_sol_r2_b1_a_frame_suffix_the_writer_cannot_print_is_invalid(self) -> None:
+        """sol r2 B1 (repro verbatim): with DONE view-0 exported=480 and otherwise valid evidence, view-0_0000000.dng / view-0_0000479.dng (overpadded) and
+        view-0_4294967296.dng / view-0_9999999999.dng (past UINT32_MAX) read PASS under both shipped criterion sets. INVALID now, by the witness. PIN: the uint32 top,
+        the six-digit form and the first seven-digit number stay PASS."""
+        self.t3_check(self.t3h_rows())
+
+    def test_reader_hardening_1_r1_sol_r2_b1_the_stem_check_refuses_them_under_a_widened_leaf_table(self) -> None:
+        """B1 defence in depth: with $script:ExportCdngFrameLeaf re-widened to r1's table, the stem check (independent of the table) holds the same writer number."""
+        self.t3_check(self.t3h_rows(pins=False), "& (Get-Module DualVenueRunner) { $script:ExportCdngFrameLeaf = $env:DVE_LEAF }\n", DVE_LEAF=self.T3R2_WIDENED)
+
+    def test_reader_hardening_1_r1_sol_r2_h1_the_mixed_pair_diagnostic_names_both_endpoints(self) -> None:
+        """sol r2 H1 (repro verbatim): first view-0_000000.dng, last view-0_1_2024-01-02_0001_C0000_000479.dng, DONE view-0: INVALID, and the shipped problem names
+        BOTH leaves (it named only the offending one). Both endpoint orders."""
+        BU, dd = "EXPORT_BATCH_LOG_UNREADABLE", self.T3R2_DATED
+        crit = leg("m16-1243-export-cdng-lossless")["criteria"]["acceptance"]["cpu"]
+        a, b = "view-0_000000.dng", f"{dd}_000479.dng"
+        self.t3_check([(label, self.t3h_case(x, y, crit), (BU, ["DONE names the clip 'view-0'", f"'{x}'", f"'{y}'"])) for label, x, y in (("SOL-R2-H1", a, b), ("SOL-R2-H1-REVERSED", b, a))])
+
+    def test_t3_r1_b2_b3_a_verbatim_path_slot_holding_a_field_named_again_is_invalid(self) -> None:
+        """sol r4 B2 / B3 (repro verbatim) and key3 r4 H2: `out=C:/a.mov out=D:/out/view-0.mov` read PASS (the manifest binds the last leaf), and so did
+        `container_probe=C:/kit/ffprobe.exe container_probe=D:/alt/ffprobe.exe`, a `dimensions=1280x720` or a `codec=h264` before probe_source=, and a repeated
+        probe_source=ffprobe-json. G2: every field key at most once per line. Controls: `out=C:/my exports/view-0.mov` and `container_probe=C:/kit
+        dimensions=archive/ffprobe.exe` (field-like text not of the field's shape)."""
+        OM, PA = "EXPORT_OUTPUT_MISMATCH", "EXPORT_PROFILE_ABSENT"
+        V = self.t2_verified
+        two_out = self.t2_start().replace("out=view-0.mov", "out=C:/a.mov out=D:/out/view-0.mov")
+        rows = [
+            ("B2-EMITTING", self.t3_prores(start=two_out), (PA, ["RENDER_START", "out=", "'out=D:/out/view-0.mov'"])),
+            ("B3-PROBE", self.t3_prores(verified=V(probe="C:/kit/ffprobe.exe container_probe=D:/alt/ffprobe.exe")), (OM, ["RENDER_VERIFIED", "container_probe="])),
+            ("B3-DIMENSIONS", self.t3_prores(verified=V(probe="C:/kit/ffprobe.exe dimensions=1280x720")), (OM, ["RENDER_VERIFIED", "container_probe=", "dimensions="])),
+            ("B3-CODEC", self.t3_prores(verified=V(probe="C:/kit/ffprobe.exe codec=h264")), (OM, ["RENDER_VERIFIED", "container_probe=", "codec="])),
+            ("KEY3-H2-PROBE-SOURCE", self.t3_prores(verified=self.t2_head() + " dimensions=1920x1440 bytes=9 container_probe=C:/kit/ffprobe.exe probe_source=ffprobe-json"
+                                                   " probe_source=ffprobe-json codec=prores container=mov sar=1:1 dar=4:3"),
+             (OM, ["RENDER_VERIFIED", "container_probe=", "probe_source="])),
+            ("CTL-OUT-SPACE", self.t3_prores(start=self.t2_start().replace("out=view-0.mov", "out=C:/my exports/view-0.mov")), "PASS"),
+            ("CTL-PROBE-DIR", self.t3_prores(verified=V(probe="C:/kit dimensions=archive/ffprobe.exe")), "PASS"),
+            ("CTL-NO-PROBE", self.t3_prores(verified=self.t4_no_probe()), "PASS"),
+        ]
+        import subprocess
+        base = "2b79619832444c0a63a8573d04f6cd02a4a113dc"
+        if subprocess.run(["git", "-C", str(ROOT), "cat-file", "-t", base], capture_output=True, text=True).stdout.strip() == "commit":
+            rows.append(("B2-OLDER", self.ctl(stage_log(480), buildId=base, batch=self.ctl_batch(start=self.CTL_START.replace("out=view-0.mov", "out=C:/a.mov out=D:/out/view-0.mov"))),
+                         (PA, ["RENDER_START", "out="])))
+        self.t3_check(rows)
+
+    def test_t3_r1_h_iso_a_line_separator_inside_a_value_is_refused_by_the_character_rule(self) -> None:
+        """sol r4 hardening EXPORT-BATCH-LINE-FORBIDDEN-CLASS-ISOLATING-ROW-1 (PIN): U+2028, U+2029 and U+0085, written as escapes, placed INSIDE the probe path, the
+        out= path and the clip (not on a boundary the positional grammar refuses on its own) are refused by the control-character rule, which names itself."""
+        rows = []
+        for name, ch in (("U+2028", "\u2028"), ("U+2029", "\u2029"), ("U+0085", "\u0085")):
+            rows += [(f"{name}-PROBE", self.t3_prores(verified=self.t2_verified(probe=f"C:/kit{ch}/ffprobe.exe")), ("EXPORT_OUTPUT_MISMATCH", ["control or line-separator character"])),
+                     (f"{name}-OUT", self.t3_prores(start=self.t2_start().replace("out=view-0.mov", f"out=C:/out{ch}/view-0.mov")), ("EXPORT_PROFILE_ABSENT", ["control or line-separator character"])),
+                     (f"{name}-CLIP", self.t3_prores(clip=f"view{ch}-0"), ("EXPORT_BATCH_LOG_UNREADABLE", ["control or line-separator character"]))]
+        self.t3_check(rows)
 
 
 EXPORT_STUB_GENERATOR = r"""
@@ -1448,6 +2962,273 @@ def table_vs_export_problems(table: list, derived: dict) -> list:
     return problems
 
 
+def cdng_total_profile(build_id: str = BUILD_ID, zero: bool = False, set_rows: dict | None = None, per_frame: dict | None = None, drop: tuple = (), drop_llrawproc: bool = False) -> str:
+    """EXPORT-CDNG-TOTAL-CONTAINMENT-1: a 30-frame CDNG profile. zero: every producer and llrawproc stage 0 first (the boundary cases). set_rows: fields set on every frame.
+    per_frame: frame position -> fields set on that frame only. drop: fields removed from every frame. drop_llrawproc: no llrawproc stage at all (the required dual-ISO field stays, at 0)."""
+    doc = json.loads(cdng_profile(30, dual_iso_ms=0.0 if zero else 30.0, build_id=build_id))
+    for r in doc["frames"]:
+        if zero:
+            for k in CDNG_STAGES:
+                if k not in ("writer_queue_wait_ms", "writer_completion_lag_ms", "disk_write_ms"):
+                    r[k] = 0.0
+        if drop_llrawproc:
+            for k in [k for k in r if k.startswith("llrawproc") and k != "llrawproc_dual_iso_ms"]:
+                del r[k]
+            r["llrawproc_dual_iso_ms"] = 0.0
+        r.update(set_rows or {})
+        for k in drop:
+            r.pop(k, None)
+    for i, fields in (per_frame or {}).items():
+        doc["frames"][i].update(fields)
+    return json.dumps(doc)
+
+
+CONTAINMENT = "EXPORT_STAGE_CONTAINMENT_MISMATCH"
+SUM_MISMATCH = "EXPORT_STAGE_SUM_MISMATCH"
+RECORD_INVALID = "EXPORT_RECORD_INVALID"
+# (name, cdng_total_profile arguments, the typed reason, text the problem must name). Dot I5 (#838 ask 6967301971): ONLY llrawproc_ms changes (40 -> 900) beside producer frames of 62 / 63 / 64 ms.
+TOTAL_CONTAINMENT_BAD = (
+    ("dot_i5_only_the_total_changes_40_to_900", dict(set_rows={"llrawproc_ms": 900.0}), CONTAINMENT, "llrawproc"),
+    # a single frame's total past its producer frame (130 ms in 63 ms) that the 30-frame mean (43 ms) hides; its other_ms is its remainder, so only the aggregate-parent pair can see it
+    ("one_frame_total_past_its_producer_frame_the_mean_hides", dict(per_frame={7: {"llrawproc_ms": 130.0, "llrawproc_other_ms": 94.0}}), CONTAINMENT, "frame_index 7"),
+    # a total inside producer_frame (60 of 63 ms) that the llrawproc children (7 timed 36 + other 4 = 40 ms) do not hold
+    ("total_inside_producer_frame_but_past_its_children", dict(set_rows={"llrawproc_ms": 60.0}), SUM_MISMATCH, "llrawproc_ms"),
+    # the children's own sum past the bracket that contains them on ONE frame (110 ms of children inside a 40 ms total): nesting is violated on that frame, whatever the mean says
+    ("one_frame_children_past_the_total_the_mean_hides", dict(per_frame={7: {"llrawproc_dual_iso_ms": 100.0}}), SUM_MISMATCH, "frame_index 7"),
+    # tolerance is 5 % + 1 ms: against a 100 ms parent (or 100 ms of children) 106.0 is the last honest figure
+    ("pair_just_above_tolerance", dict(zero=True, set_rows={"producer_frame_ms": 100.0, "llrawproc_ms": 106.5, "llrawproc_dual_iso_ms": 100.0, "llrawproc_other_ms": 6.5}), CONTAINMENT, "llrawproc_ms"),
+    ("sum_just_above_tolerance", dict(zero=True, set_rows={"producer_frame_ms": 120.0, "llrawproc_ms": 106.5, "llrawproc_dual_iso_ms": 100.0}), SUM_MISMATCH, "llrawproc_ms"),
+    # r2 (opus H3 / fable H4): the tenth-rule boundary (4 of 30 refused, 3 of 30 a control) and a whole frame's worker total BELOW its children (the second disjunct of the identity)
+    ("bracket_past_its_children_on_four_of_thirty_frames", dict(per_frame={i: {"llrawproc_ms": 60.0} for i in range(4)}), SUM_MISMATCH, "llrawproc_ms"),
+    ("worker_total_below_its_children_on_one_frame", dict(per_frame={7: {"llrawproc_total_ms": 10.0}}), SUM_MISMATCH, "llrawproc_total_ms"),
+    # r2 fix 1 A4 (adversary pass on 62dff0fa): the worker is the call the llrawproc_ms bracket wraps (dng.c:2619), so a worker total past the bracket (and past producer_frame_ms when the bracket is
+    # absent) is outside the work that contains it, whether the remainder is omitted (36 ms of present children cannot refute 900), or all eight figures are present and agree with the worker (41 / 44)
+    ("a4_worker_total_past_the_bracket_other_omitted", dict(drop=("llrawproc_other_ms",), per_frame={7: {"llrawproc_total_ms": 900.0}}), CONTAINMENT, "frame_index 7"),
+    ("a4_worker_total_past_the_bracket_agreeing_with_its_children", dict(per_frame={7: {"llrawproc_other_ms": 5.0, "llrawproc_total_ms": 44.0}}), CONTAINMENT, "frame_index 7"),
+    ("a4_worker_total_past_producer_frame_bracket_absent", dict(drop=("llrawproc_other_ms", "llrawproc_ms"), per_frame={7: {"llrawproc_total_ms": 900.0}}), CONTAINMENT, "frame_index 7"),
+    # a systematic gap, not a hiccup: the bracket 20 ms past its children on 5 of 30 frames (more than a tenth of them)
+    ("bracket_past_its_children_on_a_sixth_of_the_frames", dict(per_frame={i: {"llrawproc_ms": 60.0} for i in range(5)}), SUM_MISMATCH, "llrawproc_ms"),
+    # adversary A4 (pre-existing, in scope): the worker's own total (llrawproc_total_ms, dng.c:588) is the exact identity other = max(0, total - timed children), so a total of 900 ms
+    # beside 40 ms of children is a forged field whatever llrawproc_ms says
+    ("worker_total_past_its_children_on_one_frame", dict(per_frame={7: {"llrawproc_total_ms": 900.0}}), SUM_MISMATCH, "llrawproc_total_ms"),
+    # EXPORT-CDNG-TOTAL-CONTAINMENT-1 r2 B1 (sol r1 INV-4): a PRESENT worker total that is not a conforming timing is a typed record problem, never "absent" (each read PASS on 29b664c2)
+    ("worker_total_is_a_string", dict(per_frame={7: {"llrawproc_total_ms": "900"}}), RECORD_INVALID, "llrawproc_total_ms"),
+    ("worker_total_is_null", dict(per_frame={7: {"llrawproc_total_ms": None}}), RECORD_INVALID, "llrawproc_total_ms"),
+    ("worker_total_is_an_array", dict(per_frame={7: {"llrawproc_total_ms": [900]}}), RECORD_INVALID, "llrawproc_total_ms"),
+    ("worker_total_is_past_the_ceiling", dict(per_frame={7: {"llrawproc_total_ms": 86400001}}), RECORD_INVALID, "llrawproc_total_ms"),
+    ("worker_total_is_negative", dict(per_frame={7: {"llrawproc_total_ms": -1.0}}), RECORD_INVALID, "llrawproc_total_ms"),
+    ("worker_total_is_a_boolean", dict(per_frame={7: {"llrawproc_total_ms": True}}), RECORD_INVALID, "llrawproc_total_ms"),
+    # B2 (sol r1 INV-2): llrawproc_other_ms omitted throughout, so the sum is not derivable, but the children that ARE present (36 ms + a 100 ms dual-ISO on frame 7 = 106 ms) are a lower bound
+    # that a 40 ms bracket (and a 40 ms worker total) cannot hold
+    ("other_omitted_one_frame_children_lower_bound_past_the_total", dict(drop=("llrawproc_other_ms",), per_frame={7: {"llrawproc_dual_iso_ms": 100.0}}), SUM_MISMATCH, "frame_index 7"),
+    ("other_omitted_children_lower_bound_past_the_worker_total", dict(drop=("llrawproc_other_ms", "llrawproc_ms"), per_frame={7: {"llrawproc_dual_iso_ms": 100.0, "llrawproc_total_ms": 40.0}}),
+     SUM_MISMATCH, "llrawproc_total_ms"),
+    ("other_omitted_worker_total_below_the_present_children", dict(drop=("llrawproc_other_ms",), per_frame={7: {"llrawproc_total_ms": 10.0}}), SUM_MISMATCH, "llrawproc_total_ms"),
+    # a second child omitted too: the lower bound is still of what is present
+    ("two_children_omitted_the_rest_past_the_total", dict(drop=("llrawproc_other_ms", "llrawproc_dark_frame_ms"), per_frame={7: {"llrawproc_dual_iso_ms": 100.0}}), SUM_MISMATCH, "frame_index 7"),
+)
+TOTAL_CONTAINMENT_CONTROLS = (
+    ("normal", dict(), {}),
+    ("total_absent_children_present", dict(drop=("llrawproc_ms",)), {}),
+    ("other_absent_the_sum_cannot_be_derived", dict(drop=("llrawproc_other_ms",)), {}),
+    ("one_frame_total_inside_both_parents", dict(per_frame={7: {"llrawproc_ms": 60.0, "llrawproc_other_ms": 24.0}}), {}),
+    # a bracket longer than its children on ONE frame (60 ms beside 40 ms of children) is bracket entry/exit time the worker's clock does not see: a systematic-gap rule (more than a tenth
+    # of the frames), which one frame does not meet. r2 (opus H3 / fable H4 boundary): 3 of 30 frames is exactly a tenth and is accepted; 4 of 30 is refused (bad case below)
+    ("one_frame_bracket_longer_than_its_children_is_under_a_tenth_of_the_frames", dict(per_frame={7: {"llrawproc_ms": 60.0}}), {}),
+    ("three_of_thirty_frames_bracket_longer_than_its_children_is_exactly_a_tenth", dict(per_frame={i: {"llrawproc_ms": 60.0} for i in range(3)}), {}),
+    # adversary A1: ONE scheduler pause outside the worker clock (100 ms in the bracket and the producer, none in the children) must not void correct evidence: the mean moves by 3.3 ms
+    ("one_scheduler_pause_outside_the_worker_clock", dict(per_frame={7: {"llrawproc_ms": 140.0, "producer_frame_ms": 163.0}}), {}),
+    # adversary A2: equality at 5 % + 1 ms is accepted when the figures are decimals the binary product lands a hair under (40.00046 * 1.05 + 1 = 43.000482999999996 < 43.000483)
+    ("pair_at_tolerance_with_decimal_figures", dict(zero=True, set_rows={"producer_frame_ms": 40.00046, "llrawproc_ms": 43.000483, "llrawproc_dual_iso_ms": 43.000483}), {}),
+    ("sum_at_tolerance_with_decimal_figures", dict(zero=True, set_rows={"producer_frame_ms": 120.0, "llrawproc_ms": 32.50021, "llrawproc_dual_iso_ms": 30.0002}), {}),
+    ("worker_total_agrees_with_its_children", dict(set_rows={"llrawproc_total_ms": 40.0}), {}),
+    # r2 fix 1 A4 control: the worker total at the bracket's own tolerance (43 ms inside a 40 ms bracket, children 36 + other 7 = 43) is inside it
+    ("worker_total_at_the_bracket_tolerance", dict(per_frame={7: {"llrawproc_other_ms": 7.0, "llrawproc_total_ms": 43.0}}), {}),
+    # r2 fix 1 A2 (adversary pass on 62dff0fa): a figure exactly at the decimal limit is accepted at HIGH MAGNITUDE too, where a binary double product is several ulps (3.7e-9 ms at 2e7) past the
+    # decimal: 20000000.00038 * 1.05 + 1 = 21000001.000399 on every frame, and the mean of 30 such figures. The batch elapsed is long enough that the wall is not what is held.
+    ("every_frame_at_the_decimal_limit_at_high_magnitude",
+     dict(zero=True, set_rows={"producer_frame_ms": 20000000.00038, "llrawproc_ms": 21000001.000399, "llrawproc_dual_iso_ms": 21000001.000399}),
+     dict(batch=batch_log(30, elapsed=1000000.0))),
+    # r2 fix 1 A3: the wall gate has the same published-precision slack as every pair: 29 frames at the wall's limit (3.3333 ms/frame * 1.05 + 1 = 4.5) and one 9 nanoseconds over it is a mean 0.3 ns past the limit
+    # (below the 6-decimal precision the figures are written at), which the means rounded to that precision accepted and an unrounded comparison refused
+    ("wall_gate_mean_a_sub_precision_hair_past_the_limit",
+     dict(zero=True, set_rows={"producer_frame_ms": 4.5, "llrawproc_ms": 1.0, "llrawproc_dual_iso_ms": 1.0}, per_frame={0: {"producer_frame_ms": 4.500009}}),
+     dict(batch=batch_log(30, elapsed=0.1))),
+    # r2 B2 controls: the lower bound only judges what is PRESENT: children inside the bracket and the worker total with the remainder omitted stay valid
+    ("other_omitted_worker_total_agrees_with_the_present_children", dict(drop=("llrawproc_other_ms",), set_rows={"llrawproc_total_ms": 40.0}), {}),
+    ("other_omitted_present_children_just_inside_the_tolerance", dict(zero=True, drop=("llrawproc_other_ms",), set_rows={"producer_frame_ms": 120.0, "llrawproc_ms": 106.0, "llrawproc_dual_iso_ms": 100.0}), {}),
+    # r2 B3 (sol r1 INV-5): 29 frames at the documented 5 % + 1 ms tolerance (producer 40, bracket 43, children 43) and one frame a hair inside it: the means (40.0000093, 43.0000098) sit AT the
+    # tolerance; rounded to 6 places before the gate (40.000009 -> 43.00000945 < 43.00001) they read INVALID on 29b664c2
+    ("every_frame_at_the_tolerance_the_rounded_means_must_not_reject",
+     dict(zero=True, set_rows={"producer_frame_ms": 40.0, "llrawproc_ms": 43.0, "llrawproc_dual_iso_ms": 43.0},
+          per_frame={0: {"producer_frame_ms": 40.00028, "llrawproc_ms": 43.000294, "llrawproc_dual_iso_ms": 43.000294}}), {}),
+    ("pair_at_tolerance", dict(zero=True, set_rows={"producer_frame_ms": 100.0, "llrawproc_ms": 106.0, "llrawproc_dual_iso_ms": 100.0, "llrawproc_other_ms": 6.0}), {}),
+    ("sum_at_tolerance", dict(zero=True, set_rows={"producer_frame_ms": 120.0, "llrawproc_ms": 106.0, "llrawproc_dual_iso_ms": 100.0}), {}),
+    # a clip with no llrawproc stage at all (permitted absence: the app ran none of it) stays valid
+    ("no_llrawproc_stage_at_all", dict(drop_llrawproc=True), dict(dualIsoExpected=False, criteria=[{"metric": "framesExported", "op": "eq", "value": 30},
+                                                                                                    {"metric": "exportFramesFailed", "op": "eq", "value": 0},
+                                                                                                    {"metric": "profileFramesSucceeded", "op": "eq", "value": 30}])),
+)
+
+
+@requires_windows_pwsh
+class CdngTotalContainmentTests(unittest.TestCase):
+    """EXPORT-CDNG-TOTAL-CONTAINMENT-1 (Dot I5-EXPORT-CDNG-TOTAL-CONTAINMENT on #838, ask 6967301971): the llrawproc TOTAL is held inside producer_frame on every frame and
+    agrees with the llrawproc children it is the sum of, under empty and shipped criteria. The writer and the receipt re-derivation read the same reader (ExportRunnerTests)."""
+
+    def test_the_total_is_held_inside_producer_frame_and_agrees_with_its_children_under_empty_and_shipped_criteria(self) -> None:
+        cases = []
+        for _name, kw, _code, _needle in TOTAL_CONTAINMENT_BAD:
+            cases.append(cdng_case(profile=cdng_total_profile(**kw), criteria=[]))
+            cases.append(cdng_case(profile=cdng_total_profile(**kw)))
+        for _name, kw, over in TOTAL_CONTAINMENT_CONTROLS:
+            cases.append(cdng_case(profile=cdng_total_profile(**kw), **over))
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for n, (name, _kw, code, needle) in enumerate(TOTAL_CONTAINMENT_BAD):
+            for which, row in (("empty criteria", got[2 * n]), ("shipped criteria", got[2 * n + 1])):
+                with self.subTest(case=name, criteria=which):
+                    self.assertEqual(row["outcome"], "INVALID", row)
+                    self.assertTrue(any(p.startswith(code + ": ") and needle in p for p in row["problems"]), row)
+        for n, (name, _kw, _over) in enumerate(TOTAL_CONTAINMENT_CONTROLS):
+            row = got[2 * len(TOTAL_CONTAINMENT_BAD) + n]
+            with self.subTest(control=name):
+                self.assertEqual((row["problems"], row["outcome"]), ([], "PASS"), row)
+
+    def test_a_timing_that_is_a_json_object_with_a_getType_key_is_a_typed_record_problem_not_a_throw(self) -> None:
+        """r2 fix 1 A1 (adversary pass on 62dff0fa): a JSON OBJECT {"GetType": null} where a timing belongs made the schema's own diagnostic (`$Value.GetType().Name`) throw, so the writer recorded
+        RUNNER_ERROR and a direct receipt re-derivation threw. A present value of any shape, on the worker total or on any other timing field, is typed EXPORT_RECORD_INVALID. Kept apart from the
+        table test: a throw loses every case of its run."""
+        hostile = {"GetType": None}
+        fields = ("llrawproc_total_ms", "raw_read_ms", "producer_frame_ms", "llrawproc_ms")
+        proc, got = evidence_cases([cdng_case(profile=cdng_total_profile(per_frame={7: {f: hostile}}), criteria=[]) for f in fields]
+                                   + [cdng_case(profile=cdng_total_profile(per_frame={7: {"llrawproc_total_ms": {"GetType": "x"}}}), criteria=[])])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        # (a case that throws inside the ForEach-Object yields no row, so every case must have one: a short list is the throw)
+        self.assertEqual(len(got), len(fields) + 1, (len(got), proc.stderr[-3000:]))
+        # (under the harness's default preference the failed method call is a non-terminating error and the reason prints "is a , not a JSON number"; under Stop, as the writer runs, it throws)
+        self.assertNotIn("Method invocation failed", proc.stderr + proc.stdout)
+        for f, row in zip(fields + ("llrawproc_total_ms",), got):
+            with self.subTest(field=f):
+                self.assertFalse(any("is a , not" in p for p in row["problems"]), row)
+                self.assertEqual(row["outcome"], "INVALID", row)
+                self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID: ") and f in p for p in row["problems"]), row)
+
+    def test_the_rendered_path_gates_read_unrounded_means_so_a_log_at_the_tolerance_is_not_rejected(self) -> None:
+        """r2 B3 (sol r1 INV-5), the rendered sibling of the CDNG case: 29 frames of processed16_total 40 / debayered_frame 43 (processing 0) and one frame a hair inside the 5 % + 1 ms
+        tolerance. The means (40.0000093, 43.0000098) are AT the tolerance; rounded to 6 places before the gate they read EXPORT_STAGE_CONTAINMENT_MISMATCH. One frame genuinely past it is
+        still refused."""
+        def log(first_p16: float, first_deb: float, rest_deb: float = 43.0) -> str:
+            out = []
+            for i in range(30):
+                p16, deb = (first_p16, first_deb) if i == 0 else (40.0, rest_deb)
+                for name, ms in (("raw_uint16_disk_read", 3.0), ("raw_uint16_decompress", 5.0), ("raw_uint16", 9.0), ("llrawproc", 20.0), ("debayered_frame", deb), ("processing", 0.0), ("processed16_total", p16)):
+                    out.append(f"[mlv-stage-timing] frame={i} stage={name} ms={ms:.6f}")
+            return "\n".join(out) + "\n"
+        proc, got = evidence_cases([prores_case(stage=log(40.00028, 43.000294)), prores_case(stage=log(40.0, 43.5, rest_deb=43.5))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual((got[0]["problems"], got[0]["outcome"]), ([], "PASS"), got[0])
+        # (control: every frame past the tolerance, a mean of 43.5 beside 40, is still refused)
+        self.assertEqual(got[1]["outcome"], "INVALID", got[1])
+        self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p for p in got[1]["problems"]), got[1])
+
+
+    def test_a_mean_a_full_emitted_increment_over_the_exact_limit_is_refused_and_one_at_the_limit_is_not(self) -> None:
+        """r3 B1 (sol r2 INV-4, literal inputs): the comparator rounded BOTH sides to the writers' 6 decimals before comparing, so a mean over the limit by one full emitted increment
+        (1e-6 ms; 128 frames of elapsed=12.3 -> limit 101.8984375, producer timings split 101.898438 / 101.898439 -> mean 101.8984385, both round to 101.898438) read PASS at every gate that uses
+        it. The same literal input at each: the CDNG and ProRes wall gates, the CDNG mean-pair gate, the disjoint-mean gate and the per-frame sum. Each has a control exactly AT its limit.
+        (EXPORT-RENDER-PIPE-TIMING-1 r5, sol r4 B4 forced companion: the wall gates now hold the work inside the largest wall the printed elapsed rounds from, the figure plus
+        half its last place; elapsed=12.3 is a wall of up to 12.35 s. The wall rows print the same 12.3 s to nine places, 12.300000000, whose half place, 5e-10 s, moves
+        the limit by 4.1e-9 ms, under a tenth of the one-increment overrun this test holds.)"""
+        def wall(lo: float, hi: float) -> dict:
+            doc = json.loads(cdng_profile(128))
+            for i, r in enumerate(doc["frames"]):
+                r["producer_frame_ms"] = lo if i < 64 else hi
+            return cdng_case(maxFrames=128, profile=json.dumps(doc), batch=batch_log(128, elapsed=12.3).replace("elapsed=12.3", "elapsed=12.300000000"), manifest=output_manifest(128), criteria=[])
+
+        def prores_wall(lo: float, hi: float) -> dict:
+            out = []
+            for i in range(128):
+                p16 = lo if i < 64 else hi
+                for name, ms in (("raw_uint16_disk_read", 0.0), ("raw_uint16_decompress", 0.0), ("raw_uint16", 0.0), ("llrawproc", 0.0), ("debayered_frame", p16), ("processing", 0.0), ("processed16_total", p16)):
+                    out.append(f"[mlv-stage-timing] frame={i} stage={name} ms={ms:.6f}")
+            return prores_case(maxFrames=128, stage="\n".join(out) + "\n", batch=batch_log(128, verified=128, elapsed=12.3).replace("elapsed=12.3", "elapsed=12.300000000"), criteria=[])
+
+        def pair(lo: float, hi: float) -> dict:   # producer 40.000030, raw_read split lo / hi (limit 43.0000315)
+            return cdng_case(dualIsoExpected=False, criteria=[], profile=cdng_total_profile(zero=True, set_rows={"producer_frame_ms": 40.00003}, per_frame={i: {"raw_read_ms": lo if i % 2 == 0 else hi} for i in range(30)}))
+
+        def disjoint(lo: float, hi: float) -> dict:   # producer 40.000030, raw_read 20, compress split lo / hi (sum limit 43.0000315)
+            return cdng_case(dualIsoExpected=False, criteria=[], profile=cdng_total_profile(zero=True, set_rows={"producer_frame_ms": 40.00003, "raw_read_ms": 20.0},
+                                                                                           per_frame={i: {"dng_compress_encode_ms": lo if i % 2 == 0 else hi} for i in range(30)}))
+
+        def frame_sum(bracket: float, children: float) -> dict:   # bracket 60.00001 beside children 64.000011: over the exact limit 64.0000105 by 5e-7
+            return cdng_case(criteria=[], profile=cdng_total_profile(zero=True, set_rows={"producer_frame_ms": 100.0, "llrawproc_ms": bracket, "llrawproc_dual_iso_ms": children}))
+
+        bad = (("cdng_wall_gate", wall(101.898438, 101.898439), CONTAINMENT, "producer_frame"),
+               ("prores_wall_gate", prores_wall(101.898438, 101.898439), CONTAINMENT, "processed16_total"),
+               ("cdng_mean_pair_gate", pair(43.000032, 43.000033), CONTAINMENT, "raw_read"),
+               ("cdng_disjoint_mean_gate", disjoint(23.000032, 23.000033), CONTAINMENT, "disjoint stages"),
+               ("per_frame_sum_over_by_half_an_increment", frame_sum(60.00001, 64.000011), SUM_MISMATCH, "llrawproc_ms"))
+        controls = (("cdng_wall_gate_at_the_limit", wall(101.898437, 101.898438)),
+                    ("prores_wall_gate_at_the_limit", prores_wall(101.898437, 101.898438)),
+                    ("cdng_mean_pair_gate_at_the_limit", pair(43.000031, 43.000032)),
+                    ("cdng_disjoint_mean_gate_at_the_limit", disjoint(23.000031, 23.000032)),
+                    ("per_frame_sum_at_the_limit", frame_sum(60.00002, 64.000021)))
+        proc, got = evidence_cases([c for _n, c, _code, _needle in bad] + [c for _n, c in controls])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(len(got), len(bad) + len(controls), (len(got), proc.stderr[-3000:]))
+        for (name, _c, code, needle), row in zip(bad, got):
+            with self.subTest(case=name):
+                self.assertEqual(row["outcome"], "INVALID", row)
+                self.assertTrue(any(p.startswith(code + ": ") and needle in p for p in row["problems"]), row)
+        for (name, _c), row in zip(controls, got[len(bad):]):
+            with self.subTest(control=name):
+                self.assertEqual((row["problems"], row["outcome"]), ([], "PASS"), row)
+
+    def test_the_wall_gate_limit_is_built_from_the_exact_done_elapsed_never_the_rounded_published_figure(self) -> None:
+        """r4 B1 (opus r3, DEFECT_CLASS rounded-gate-input, literal inputs): the DONE regex accepts up to 9 decimals of elapsed, but the wall limit was built from wallSeconds, which is
+        rounded to 6 decimals for publication. elapsed=12.2999996 rounds to 12.3, so the limit moved from the exact 101.89843421875 (+ the 4e-7 epsilon) to 101.8984375 and a mean of 101.8984375
+        read PASS at both wall gates (CDNG producer_frame, ProRes processed16_total). The same input at each, a one-frame run (elapsed=0.0999996, mean 105.9999), and controls at the exact limit."""
+        def exact(text: str) -> str:
+            return batch_log(128, elapsed=12.3).replace("elapsed=12.3", f"elapsed={text}")
+
+        def cdng_wall(lo: float, hi: float, elapsed: str = "12.2999996") -> dict:
+            doc = json.loads(cdng_profile(128))
+            for i, r in enumerate(doc["frames"]):
+                r["producer_frame_ms"] = lo if i < 64 else hi
+            return cdng_case(maxFrames=128, profile=json.dumps(doc), batch=exact(elapsed), manifest=output_manifest(128), criteria=[])
+
+        def prores_wall(lo: float, hi: float, elapsed: str = "12.2999996") -> dict:
+            out = []
+            for i in range(128):
+                p16 = lo if i < 64 else hi
+                for name, ms in (("raw_uint16_disk_read", 0.0), ("raw_uint16_decompress", 0.0), ("raw_uint16", 0.0), ("llrawproc", 0.0), ("debayered_frame", p16), ("processing", 0.0), ("processed16_total", p16)):
+                    out.append(f"[mlv-stage-timing] frame={i} stage={name} ms={ms:.6f}")
+            return prores_case(maxFrames=128, stage="\n".join(out) + "\n", batch=batch_log(128, verified=128, elapsed=12.3).replace("elapsed=12.3", f"elapsed={elapsed}"), criteria=[])
+
+        def one_frame() -> dict:   # exact limit 99.9996 * 1.05 + 1 = 105.99958 (+ 4e-7); the rounded elapsed 0.1 gives 106.0
+            doc = json.loads(cdng_profile(1))
+            doc["frames"][0]["producer_frame_ms"] = 105.9999
+            return cdng_case(maxFrames=1, profile=json.dumps(doc), batch=batch_log(1, elapsed=0.1).replace("elapsed=0.1", "elapsed=0.0999996"), manifest=output_manifest(1), criteria=[])
+
+        bad = (("cdng_wall_gate_3_increments_over", cdng_wall(101.898437, 101.898438), "producer_frame"),
+               ("prores_wall_gate_3_increments_over", prores_wall(101.898437, 101.898438), "processed16_total"),
+               ("cdng_one_frame_elapsed_0_0999996", one_frame(), "producer_frame"))
+        controls = (("cdng_wall_gate_at_the_exact_limit", cdng_wall(101.898434, 101.898435)),
+                    ("prores_wall_gate_at_the_exact_limit", prores_wall(101.898434, 101.898435)),
+                    ("cdng_wall_gate_nine_decimals_that_round_to_itself", cdng_wall(101.898437, 101.898438, elapsed="12.300000000")))
+        proc, got = evidence_cases([c for _n, c, _needle in bad] + [c for _n, c in controls])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(len(got), len(bad) + len(controls), (len(got), proc.stderr[-3000:]))
+        for (name, _c, needle), row in zip(bad, got):
+            with self.subTest(case=name):
+                self.assertEqual(row["outcome"], "INVALID", row)
+                self.assertTrue(any(p.startswith(CONTAINMENT + ": ") and needle in p for p in row["problems"]), row)
+        for (name, _c), row in zip(controls, got[len(bad):]):
+            with self.subTest(control=name):
+                self.assertEqual((row["problems"], row["outcome"]), ([], "PASS"), row)
+
+
 @requires_windows_pwsh
 class CdngStageContainmentGateTests(unittest.TestCase):
     """EXPORT-CDNG-STAGE-CONTAINMENT-1 (split from EXPORT-VENUE-LEG-1 / #838 by the hub STOP RULE of 2026-11-18T17:26:25Z): the six members #838 found one round at a time, each
@@ -1502,7 +3283,7 @@ class CdngStageContainmentGateTests(unittest.TestCase):
             row = {"producer_frame_ms": 100.0, child: 80.0, "llrawproc_dual_iso_ms": 1.0, "llrawproc_other_ms": 19.0, "llrawproc_publish_lock_ms": 80.0, "llrawproc_shared_lock_ms": 80.0}
             bad += [cdng_zero_profile({**row, "llrawproc_ms": 100.0}), cdng_zero_profile(row, drop_total=True)]
         got = self.run_cases(bad + [cdng_zero_profile({"producer_frame_ms": 120.0, "llrawproc_ms": 100.0, "llrawproc_dark_frame_ms": 20.0, "llrawproc_dual_iso_ms": 1.0,
-                                                       "llrawproc_other_ms": 69.0, "llrawproc_publish_lock_ms": 10.0, "llrawproc_dualiso_refine_lock_ms": 10.0,
+                                                       "llrawproc_other_ms": 79.0, "llrawproc_publish_lock_ms": 10.0, "llrawproc_dualiso_refine_lock_ms": 10.0,
                                                        "llrawproc_shared_lock_ms": 20.0})])
         for i in range(len(bad)):
             with self.subTest(case=i):
@@ -1633,7 +3414,7 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
 
     def write_export_artifacts(self, frames: int, profile: bool = True, venue: str = "bachelor", fmt: str = "cdng-lossless",
                                exported: int | None = None, result: str = "EXPORT_CAPTURED", observed_venue: str | None = None, stage: str | None = None,
-                               source_commit: str | None = None, manifest: str | None = None) -> None:
+                               source_commit: str | None = None, manifest: str | None = None, profile_text: str | None = None) -> None:
         a = self.artifacts
         if a.exists():
             shutil.rmtree(a)
@@ -1647,19 +3428,22 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
         (a / "batch.log").write_text(batch_log(exported), encoding="utf-8")
         if fmt == "prores":
             (a / "batch.log").write_text(batch_log(exported, verified=exported), encoding="utf-8")
-            (a / "stage-timing.log").write_text(stage_log(frames) if stage is None else stage, encoding="utf-8")
+            # (EXPORT-RENDER-PIPE-TIMING-1: the committed ProRes legs gate dualIsoClassAgrees and renderPipeTimed, so the default log is a build of that card's)
+            (a / "stage-timing.log").write_text(piped_stage_log(frames) if stage is None else stage, encoding="utf-8")
             (a / "output-manifest.json").write_text(output_manifest(1, "mov"), encoding="utf-8")
             return
         if profile:
-            (a / "export-profile.json").write_text(cdng_profile(frames, build_id=source_commit or self.sha), encoding="utf-8")
+            (a / "export-profile.json").write_text(cdng_profile(frames, build_id=source_commit or self.sha) if profile_text is None else profile_text, encoding="utf-8")
         (a / "output-manifest.json").write_text(output_manifest(exported) if manifest is None else manifest, encoding="utf-8")
 
-    def validate(self, receipt: dict, spec: Path, dv: Path = DV, evidence_dir: str = "") -> dict:
+    def validate(self, receipt: dict, spec: Path, dv: Path = DV, evidence_dir: str = "", metrics_as_hashtable: bool = False) -> dict:
         rp = self.tmp / "receipt-under-test.json"
         rp.write_text(json.dumps(receipt), encoding="utf-8")
         ev = f" -EvidenceDir '{evidence_dir}'" if evidence_dir else ""
+        # (EXPORT-RENDER-PIPE-TIMING-1 r1 fix 2, adversary A2: the same metrics parsed -AsHashtable, as a caller that reads its receipt that way hands them over)
+        ht = "$r.metrics = ($r.metrics | ConvertTo-Json -Depth 20 | ConvertFrom-Json -AsHashtable)\n" if metrics_as_hashtable else ""
         proc, got = run_pwsh_json(f"Import-Module '{dv / 'DualVenueRunner.psm1'}' -Force\n"
-                                  f"$r = Get-Content -Raw '{rp}' | ConvertFrom-Json\n"
+                                  f"$r = Get-Content -Raw '{rp}' | ConvertFrom-Json\n{ht}"
                                   f"$v = Test-DvReceiptValid -Receipt $r -AllowOfflineTestMode -OfflineLegSpecBytes ([IO.File]::ReadAllBytes('{spec}')){ev}\n"
                                   "[ordered]@{ valid = $v.valid; status = $v.status; reasons = @($v.reasons) } | ConvertTo-Json -Compress")
         self.assertIsNotNone(got, proc.stdout + proc.stderr)
@@ -1708,7 +3492,7 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
         hashed manifest is swapped for one with the SAME count and totalBytes (so the metrics still match) but endpoints that cannot fit inside that total does not verify."""
         spec = self.export_spec(maxframes=30)
         bad = json.dumps({"schema": "export-stage-output-manifest.v1", "kind": "dng", "count": 30, "totalBytes": 1,
-                          "first": {"name": "000000.dng", "bytes": 1000, "sha256": "1" * 64}, "last": {"name": "000029.dng", "bytes": 1000, "sha256": "2" * 64}, "deleted": True})
+                          "first": {"name": "view-0_000000.dng", "bytes": 1000, "sha256": "1" * 64}, "last": {"name": "view-0_000029.dng", "bytes": 1000, "sha256": "2" * 64}, "deleted": True})
         self.write_export_artifacts(30, manifest=bad)
         proc, receipt, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
         self.assertIsNotNone(receipt, proc.stdout[-3000:] + proc.stderr[-3000:])
@@ -1867,7 +3651,10 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
         self.write_export_artifacts(30, fmt="prores")
         proc, good, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
         self.assertIsNotNone(good, proc.stdout[-3000:] + proc.stderr[-3000:])
-        self.assertEqual(good["outcome"], "PASS", good["outcomeDetail"])
+        # (r3, adversary A2 on c2da7e24: a clean receipt on the shipped dual-ISO leg FAILs on dualIsoClassAgrees alone, the typed UNKNOWN, and still verifies)
+        self.assertEqual(good["outcome"], "FAIL", good["outcomeDetail"])
+        self.assertTrue(good["outcomeDetail"].startswith(f"EXPORT_CAPTURED: dualIsoClassAgrees: {DUALISO_UNKNOWN}:"), good["outcomeDetail"])
+        self.assertNotIn("; ", good["outcomeDetail"])
         self.assertEqual(self.validate(good, spec)["status"], "VERIFIED_OFFLINE_TEST")
         for stage in ("raw_uint16", "raw_uint16_disk_read", "raw_uint16_decompress", "llrawproc"):
             for name, frames in (("singleton", [100]), ("disjoint", range(30, 60)), ("partial", range(15))):
@@ -1897,6 +3684,90 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
                     # an absent or matching nested stage changes the stage table, so the receipt's own table no longer equals the re-derived one: still never a PASS
                     # that verifies as the ORIGINAL receipt; the point here is that the reader itself raises no window problem
                     self.assertFalse(any("EXPORT_STAGE_WINDOW_MISMATCH" in x for x in got["reasons"]), got)
+
+    def test_adversary_r1_a2_a_receipt_the_base_reader_wrote_still_rederives(self) -> None:
+        """adversary r1 A2 (00a7cf09): a ProRes receipt written before EXPORT-RENDER-PIPE-TIMING-1 (old-format stage log, the base leg criteria) stores the BASE reader's metrics and
+        stage table; the new reader added two metric fields, changed two reasons and the stage rows, so the unchanged evidence re-derived METRICS_NOT_FROM_EVIDENCE: INVALID. The
+        oracle is the base reader's own output (2b796198, tools/repo_hygiene/fixtures/export_prores_base_2b796198_evidence.json) for the exact fixture published here. A receipt of
+        this card's shape over the same evidence still verifies, and the base shape is never applied to a log that carries a new stage."""
+        oracle = json.loads((ROOT / "tools" / "repo_hygiene" / "fixtures" / "export_prores_base_2b796198_evidence.json").read_text(encoding="utf-8"))
+        spec_doc = leg(EXPORT_LEGS[1])
+        spec_doc["export"]["maxFrames"] = 30
+        for role in ("acceptance", "supplementary"):
+            spec_doc["criteria"][role]["cpu"] = [dict(c, value=30) if c["metric"] in ("framesExported", "stageFramesSeen") else c
+                                                 for c in spec_doc["criteria"][role]["cpu"] if c not in PIPE_CRITERIA]
+        spec = self.tmp / "prores-base-criteria.json"
+        spec.write_text(json.dumps(spec_doc), encoding="utf-8")
+        self.write_export_artifacts(30, fmt="prores", stage=stage_log(30))
+        proc, receipt, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
+        self.assertIsNotNone(receipt, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertEqual(self.validate(receipt, spec)["status"], "VERIFIED_OFFLINE_TEST", "this card's own receipt over old-format evidence")
+        base = json.loads(json.dumps(receipt))
+        base["metrics"] = oracle["metrics"]
+        base["export"]["stages"] = oracle["stages"]
+        got = self.validate(base, spec)
+        self.assertEqual(got["status"], "VERIFIED_OFFLINE_TEST", got)
+        # r1 fix 2 (adversary A2 on 33f7a05a): the same base-shaped metrics parsed -AsHashtable are the same receipt (the shape test read PSCustomObject only)
+        got = self.validate(base, spec, metrics_as_hashtable=True)
+        self.assertEqual(got["status"], "VERIFIED_OFFLINE_TEST", got)
+        # the base shape is for old-format evidence only: the same base-shaped receipt over a log WITH the new stages is no re-derivation of it
+        evdir = Path(receipt["evidence"]["localEvidenceDir"])
+        work = self.tmp / "ev-a2-new-stages"
+        if work.exists():
+            shutil.rmtree(work)
+        shutil.copytree(evdir, work)
+        raw = piped_stage_log(30).encode("utf-8")
+        (work / "export" / "stage-timing.log").write_bytes(raw)
+        forged = json.loads(json.dumps(base))
+        forged["export"]["files"]["stage-timing.log"] = hashlib.sha256(raw).hexdigest()
+        got = self.validate(forged, spec, evidence_dir=str(work))
+        self.assertEqual(got["status"], "INVALID", got)
+        self.assertTrue(any("METRICS_NOT_FROM_EVIDENCE" in r for r in got["reasons"]), got)
+
+    def test_i5_the_llrawproc_total_is_held_inside_producer_frame_and_its_children_at_write_and_in_the_receipt_rederivation(self) -> None:
+        """Dot I5-EXPORT-CDNG-TOTAL-CONTAINMENT (#838 ask 6967301971) through the WRITER (Invoke-VenueLeg) and the receipt VALIDATOR (Test-DvReceiptValid), each mutating ONLY the
+        llrawproc total (or one frame's): a typed INVALID at write time (never PASS), and a good receipt whose hashed export-profile.json is rewritten to that profile (every sha256
+        claim updated to match) does not verify. A matching profile and a permitted absent total verify, written by the writer and re-derived by the validator."""
+        spec = self.export_spec(maxframes=30)
+        bad = [b for b in TOTAL_CONTAINMENT_BAD if b[0] in ("dot_i5_only_the_total_changes_40_to_900", "one_frame_total_past_its_producer_frame_the_mean_hides",
+                                                             "total_inside_producer_frame_but_past_its_children", "one_frame_children_past_the_total_the_mean_hides",
+                                                             "worker_total_is_a_string", "other_omitted_one_frame_children_lower_bound_past_the_total")]   # (r2 B1, B2: the same reader at write and re-derivation)
+        self.assertEqual(len(bad), 6)
+        controls = {"normal": cdng_total_profile(self.sha), "total_absent": cdng_total_profile(self.sha, drop=("llrawproc_ms",))}
+        for name, text in controls.items():
+            with self.subTest(control=name, via="writer"):
+                self.write_export_artifacts(30, profile_text=text)
+                proc, receipt, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
+                self.assertIsNotNone(receipt, proc.stdout[-3000:] + proc.stderr[-3000:])
+                self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+                self.assertEqual(self.validate(receipt, spec)["status"], "VERIFIED_OFFLINE_TEST")
+        for name, kw, code, needle in bad:
+            with self.subTest(case=name, via="writer"):
+                self.write_export_artifacts(30, profile_text=cdng_total_profile(self.sha, **kw))
+                proc, receipt, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
+                self.assertIsNotNone(receipt, proc.stdout[-3000:] + proc.stderr[-3000:])
+                self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+                self.assertIn(code, receipt["outcomeDetail"])
+        # the validator: a good receipt, its hashed profile rewritten, the claim updated to match
+        self.write_export_artifacts(30)
+        proc, good, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
+        self.assertIsNotNone(good, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(good["outcome"], "PASS", good["outcomeDetail"])
+        evdir = Path(good["evidence"]["localEvidenceDir"])
+        for name, kw, code, needle in bad:
+            with self.subTest(case=name, via="validator"):
+                work = self.tmp / f"ev-i5-{name}"
+                if work.exists():
+                    shutil.rmtree(work)
+                shutil.copytree(evdir, work)
+                raw = cdng_total_profile(self.sha, **kw).encode("utf-8")
+                (work / "export" / "export-profile.json").write_bytes(raw)
+                r = json.loads(json.dumps(good))
+                r["export"]["files"]["export-profile.json"] = hashlib.sha256(raw).hexdigest()
+                got = self.validate(r, spec, evidence_dir=str(work))
+                self.assertEqual(got["status"], "INVALID", got)
+                self.assertTrue(any(code in x for x in got["reasons"]), got)
 
     def test_a_profile_missing_on_a_captured_run_is_invalid(self) -> None:
         spec = self.export_spec(maxframes=30)
@@ -1980,6 +3851,283 @@ class ExportJobGeneratorTests(unittest.TestCase):
         got = json.loads(proc.stdout)
         self.assertEqual(got["missing"], [], got["missing"])
         self.assertIn("ConvertTo-AttrCudaFileIdObject", got["embedded"], "Get-AttrCudaFileId's callee must ride with it")
+
+    # EXPORT-RENDER-PIPE-TIMING-2 r4 (sol r3 B2): the job's classification block, run as the job runs it, over batch logs the central reader refuses
+    T4_JOB_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+$d = & $env:DVE_JOB -DescribeTemplate
+$t = [string]$d.template
+$a = $t.IndexOf('$logText = '); $b = $t.IndexOf('$exitFor = @{')
+if ($a -lt 0 -or $b -le $a) { throw 'the template no longer carries the classification block this test runs' }
+$slice = $t.Substring($a, $b - $a)
+$grammar = $(if ($null -ne $d.PSObject.Properties['batchLineGrammar']) { [string]$d.batchLineGrammar } else { '' })
+function Write-JobTrace { param($m) }
+function Get-AttrCudaFileSha256Blocks { param($Path, $TracePath, $Label) [pscustomobject]@{ sha256 = ('0' * 64) } }
+. ([scriptblock]::Create($grammar))
+$block = [scriptblock]::Create($slice)
+$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json
+$out = @(foreach ($c in $cases) {
+    $Work = [string]$c.work; $batchLog = Join-Path $Work 'batch.log'; $profilePath = Join-Path $Work 'export-profile.json'; $stageLog = Join-Path $Work 'stage-timing.log'
+    $outDir = Join-Path $Work 'out'; $Trace = Join-Path $Work 'trace.txt'
+    $Format = [string]$c.format; $MaxFrames = [int]$c.maxFrames; $timedOut = $false; $killConfirmed = $true; $appExitCode = 0
+    $result = $null; $exported = $null
+    try { . $block; [ordered]@{ result = $result; exported = $exported; grammar = $grammar.Length } } catch { [ordered]@{ result = 'THREW'; exported = $null; error = [string]$_; grammar = $grammar.Length } }
+})
+ConvertTo-Json -InputObject $out -Compress -Depth 4
+"""
+
+    def test_t2_r4_b2_the_bachelor_classifier_reads_the_batch_log_by_the_modules_one_grammar(self) -> None:
+        """sol r3 B2 (repro verbatim): with a successful process, one .mov, one exported frame and a stage log, Bachelor given only `RENDER_VERIFIED view-0
+        decoded_frames=1` classified EXPORT_CAPTURED (exit 0) where the central reader returned INVALID; a duplicate field after the trailer passed too, and a count of
+        9223372036854775808 threw before the result was published. The emitted job now carries the module's own line grammar (ConvertFrom-DvBatchLogLine /
+        ConvertFrom-DvBatchExportLog and their tables, extracted verbatim from DualVenueRunner.psm1, never re-typed) and classifies DONE and RENDER_VERIFIED by it, so a
+        line the central reader refuses is EXPORT_OUTPUT_MISMATCH at the venue too, typed, never a throw. Sibling: sol B4's two DONE triplets on CDNG."""
+        start, done, ok = self.t4_start(), "[BATCH] DONE view-0 exported=1 skipped=0 elapsed=1.0", self.t4_verified()
+        cdng_two = "[BATCH] DONE view-0 exported=29 skipped=1 elapsed=40.0 exported=30 skipped=0 elapsed=20.0"
+        rows = [("PRORES-OK", "prores", 1, [start, ok, done], "EXPORT_CAPTURED"),
+                ("B2-TRUNCATED", "prores", 1, [start, "[BATCH] RENDER_VERIFIED view-0 decoded_frames=1", done], "EXPORT_OUTPUT_MISMATCH"),
+                ("B2-AFTER-TRAILER", "prores", 1, [start, ok + " dimensions=1280x720", done], "EXPORT_OUTPUT_MISMATCH"),
+                ("B2-OVERSIZED", "prores", 1, [start, ok.replace("decoded_frames=1 ", "decoded_frames=9223372036854775808 "), done], "EXPORT_OUTPUT_MISMATCH"),
+                ("CDNG-OK", "cdng-lossless", 30, ["[BATCH] DONE view-0 exported=30 skipped=0 elapsed=20.0"], "EXPORT_CAPTURED"),
+                ("B2-CDNG-TWO-TRIPLETS", "cdng-lossless", 30, [cdng_two], "EXPORT_CAPTURED_NOT")]
+        with tempfile.TemporaryDirectory() as d:
+            cases = []
+            for i, (label, fmt, frames, lines, _) in enumerate(rows):
+                work = Path(d) / f"w{i}"
+                (work / "out").mkdir(parents=True)
+                (work / "batch.log").write_text("[BATCH] Start\n" + "\n".join(lines) + "\n", encoding="utf-8", newline="")
+                if fmt == "prores":
+                    (work / "stage-timing.log").write_text(piped_stage_log(1), encoding="utf-8")
+                    (work / "out" / "view-0.mov").write_bytes(b"\0" * 9)
+                else:
+                    (work / "export-profile.json").write_text(cdng_profile(frames), encoding="utf-8")
+                    for k in range(frames):
+                        (work / "out" / f"view-0_{k:06d}.dng").write_bytes(b"\0" * 4)
+                cases.append({"work": str(work), "format": fmt, "maxFrames": frames})
+            (Path(d) / "cases.json").write_text(json.dumps(cases), encoding="utf-8")
+            harness = Path(d) / "harness.ps1"
+            harness.write_text(self.T4_JOB_HARNESS, encoding="utf-8")
+            proc = run_pwsh(["-File", str(harness)], env_extra={"DVE_JOB": str(EXPORT_JOB), "DVE_CASES": str(Path(d) / "cases.json")})
+        self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
+        got = json.loads(proc.stdout)
+        for (label, _, _, _, expect), g in zip(rows, got):
+            with self.subTest(row=label):
+                if expect == "EXPORT_CAPTURED_NOT":
+                    self.assertEqual(g["result"], "EXPORT_OUTPUT_MISMATCH", g)
+                else:
+                    self.assertEqual(g["result"], expect, g)
+        # the job's grammar is the module's, byte for byte (extracted, never re-typed), and the classifier keeps no regex of its own over the batch log
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        proc = run_pwsh(["-Command", f"$d = & '{EXPORT_JOB}' -DescribeTemplate; [ordered]@{{ grammar = [string]$d.batchLineGrammar; template = [string]$d.template }} | ConvertTo-Json -Compress"])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        described = json.loads(proc.stdout)
+        for name in ("ConvertFrom-DvBatchLogLine", "ConvertFrom-DvBatchExportLog"):
+            m = re.search(rf"(?ms)^function {name} \{{.*?^\}}", module)
+            self.assertIsNotNone(m, name)
+            self.assertIn(m.group(0).replace("\r\n", "\n"), described["grammar"].replace("\r\n", "\n"), f"the job's {name} is not the module's")
+        for var in ("$script:ExportBatchLineShapes = ", "$script:ExportBatchLineGrammar = ", "$script:ExportBatchLineForbidden = "):
+            line = next(l for l in module.splitlines() if l.startswith(var))
+            self.assertIn(line, described["grammar"], var)
+        self.assertNotIn("[regex]::Matches($logText", described["template"], "the job classifies the batch log by the module's grammar alone")
+
+    def run_job_slice(self, rows: list, stages: list | None = None) -> list:
+        """rows: (label, fmt, frames, lines, leaves). Runs the emitted job's classification slice over each (T4 harness) and returns its result dicts.
+        stages (READER-HARDENING-1 r1): an optional per-row ProRes stage-timing.log text; None keeps the default one-frame scaled log."""
+        with tempfile.TemporaryDirectory() as d:
+            cases = []
+            for i, (label, fmt, frames, lines, leaves) in enumerate(rows):
+                work = Path(d) / f"w{i}"
+                (work / "out").mkdir(parents=True)
+                (work / "batch.log").write_text("[BATCH] Start\n" + "\n".join(lines) + "\n", encoding="utf-8", newline="")
+                if fmt == "prores":
+                    stage = piped_stage_log(1, scale_ms=6.0) if stages is None or stages[i] is None else stages[i]
+                    (work / "stage-timing.log").write_text(stage, encoding="utf-8")
+                else:
+                    (work / "export-profile.json").write_text(cdng_profile(frames), encoding="utf-8")
+                for leaf in leaves:
+                    (work / "out" / leaf).write_bytes(b"\0" * 9)
+                cases.append({"work": str(work), "format": fmt, "maxFrames": frames})
+            (Path(d) / "cases.json").write_text(json.dumps(cases), encoding="utf-8")
+            harness = Path(d) / "harness.ps1"
+            harness.write_text(self.T4_JOB_HARNESS, encoding="utf-8")
+            proc = run_pwsh(["-File", str(harness)], env_extra={"DVE_JOB": str(EXPORT_JOB), "DVE_CASES": str(Path(d) / "cases.json")})
+        self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
+        return json.loads(proc.stdout)
+
+    @classmethod
+    def t3_parity_rows(cls) -> list:
+        """(label, fmt, frames, batch lines, output leaves, central outcome, job result) for EXPORT-RENDER-PIPE-TIMING-3 r1's one verdict (sol r4 B4)."""
+        S, V = cls.t4_start(), cls.t4_verified()
+        D = "[BATCH] DONE view-0 exported=1 skipped=0 elapsed=1.0"
+        tk = "take elapsed=1.0"
+        mov = ["view-0.mov"]
+        dng = lambda clip: [f"{clip}_{k:06d}.dng" for k in range(30)]
+        cd = lambda clip: f"[BATCH] DONE {clip} exported=30 skipped=0 elapsed=20.0"
+        OM = "EXPORT_OUTPUT_MISMATCH"
+        trailer = " probe_source=ffprobe-json codec=prores container=mov sar=1:1 dar=4:3"
+        vhead = "[BATCH] RENDER_VERIFIED view-0 decoded_frames=1 decoded_duration=0.042 decoded_frame_bytes=1 dimensions=1920x1440 bytes=9 container_probe="
+        return [
+            ("PRORES-OK", "prores", 1, [S, V, D], mov, "PASS", "EXPORT_CAPTURED"),
+            ("B1-BACHELOR", "prores", 1, [S.replace("RENDER_START view-0 ", f"RENDER_START {tk} ").replace("out=view-0.mov", f"out={tk}.mov"),
+                                         V.replace("RENDER_VERIFIED view-0 ", f"RENDER_VERIFIED {tk} "), D.replace("DONE view-0 ", f"DONE {tk} ")], [f"{tk}.mov"], "PASS", "EXPORT_CAPTURED"),
+            ("B2", "prores", 1, [S.replace("out=view-0.mov", "out=C:/a.mov out=D:/out/view-0.mov"), V, D], mov, "INVALID", OM),
+            ("B3-PROBE", "prores", 1, [S, f"{vhead}C:/kit/ffprobe.exe container_probe=D:/alt/ffprobe.exe{trailer}", D], mov, "INVALID", OM),
+            ("B3-DIMENSIONS", "prores", 1, [S, f"{vhead}C:/kit/ffprobe.exe dimensions=1280x720{trailer}", D], mov, "INVALID", OM),
+            ("B3-CODEC", "prores", 1, [S, f"{vhead}C:/kit/ffprobe.exe codec=h264{trailer}", D], mov, "INVALID", OM),
+            ("B4", "prores", 1, [S.replace("output=1920x1440", "output=1920x1440 output=1280x720"), V, D], mov, "INVALID", OM),
+            ("B4-CODEC", "prores", 1, [S.replace("codec=prores", "codec=h264"), V, D], mov, "INVALID", OM),
+            ("B4-OUT", "prores", 1, [S.replace("out=view-0.mov", "out=foreign.mov"), V, D], mov, "INVALID", OM),
+            ("KEY3-H2", "prores", 1, [S, f"{vhead}C:/kit/ffprobe.exe probe_source=ffprobe-json probe_source=ffprobe-json codec=prores container=mov sar=1:1 dar=4:3", D], mov, "INVALID", OM),
+            ("CDNG-OK", "cdng-lossless", 30, [cd("view-0")], dng("view-0"), "PASS", "EXPORT_CAPTURED"),
+            ("B1-CDNG", "cdng-lossless", 30, [cd(tk)], dng(tk), "PASS", "EXPORT_CAPTURED"),
+            ("CDNG-TWO-TRIPLETS", "cdng-lossless", 30, ["[BATCH] DONE view-0 exported=29 skipped=1 elapsed=40.0 exported=30 skipped=0 elapsed=20.0"], dng("view-0"), "INVALID", OM),
+            ("CDNG-WITNESS", "cdng-lossless", 30, [cd("view-0")], dng("other-clip"), "INVALID", OM),
+            ("KEY3-H1-DOUBLE-SPACE", "cdng-lossless", 30, ["[BATCH] DONE  exported=29 exported=30 skipped=0 elapsed=20.0"], dng("view-0"), "INVALID", OM),
+            ("KEY3-H1-SHAPE", "cdng-lossless", 30, ["[BATCH] DONE view-0 exported=29x exported=30 skipped=0 elapsed=20.0"], dng("view-0"), "INVALID", OM),
+        ]
+
+    def test_t3_r1_b4_one_verdict_the_job_and_the_central_reader_agree_on_every_row(self) -> None:
+        """sol r4 B4 (repro verbatim): with matching DONE / RENDER_VERIFIED counts, one .mov, a stage log and exit 0, a RENDER_START with adjacent
+        output=1920x1440 output=1280x720 read INVALID centrally but EXPORT_CAPTURED (exit 0) at Bachelor: the job consumed only DONE and RENDER_VERIFIED. ONE verdict
+        now: the job calls the module's Get-DvBatchExportBindingProblems (embedded verbatim) as the central reader does, so on every row (central outcome == PASS)
+        == (job result == EXPORT_CAPTURED). Siblings: RENDER_START codec=h264 and out=foreign.mov, sol r4 B1-B3, the CDNG witness, key3 r4 H1 / H2."""
+        rows = self.t3_parity_rows()
+        got = self.run_job_slice([(l, f, n, ls, lv) for l, f, n, ls, lv, _, _ in rows])
+        central_cases = []
+        for _, fmt, n, lines, leaves, _, _ in rows:
+            batch = "[BATCH] Start\n" + "\n".join(lines) + "\n"
+            if fmt == "prores":
+                central_cases.append(prores_case(maxFrames=1, dualIsoExpected=True, stage=piped_stage_log(1, scale_ms=6.0), batch=batch, criteria=[],
+                                                 manifest=output_manifest(1, "mov", clip=leaves[0][:-4])))
+            else:
+                central_cases.append(cdng_case(batch=batch, manifest=output_manifest(30, clip=leaves[0][:-len("_000000.dng")])))
+        proc, central = evidence_cases(central_cases)
+        self.assertIsNotNone(central, proc.stdout[-3000:] + proc.stderr[-3000:])
+        # (TIMING-3 r2, sol r1 hardening: every parity row gets both verdicts; a short list would let zip drop a row unasserted)
+        self.assertEqual((len(got), len(central)), (len(rows), len(rows)), (got, central))
+        for (label, _, _, _, _, want_central, want_job), g, c in zip(rows, got, central):
+            with self.subTest(row=label):
+                self.assertEqual(c["outcome"], want_central, c)
+                self.assertEqual(g["result"], want_job, g)
+                self.assertEqual(c["outcome"] == "PASS", g["result"] == "EXPORT_CAPTURED", (c, g))
+
+    def test_t3_r1_adversary_a2_a3_on_23d3920a(self) -> None:
+        """TIMING-3 r1 adversary pass 1 on 23d3920a (inputs verbatim in shape). A2: a RENDER_VERIFIED with a real probe and ONE trailer value set to its no-probe
+        sentinel (codec=unchecked, container=unchecked, sar=unchecked or dar=unchecked) read PASS; the producer prints the six no-probe values together and only together
+        (BatchRunner.cpp:810-819), so any one of them binds the rest. A3: the generator's ValidateSet admits `-Format CDNG-LOSSLESS` and the job's branches compare
+        case-insensitively, but the binding verdict compared case-sensitively, so a DONE of another clip than the frames found read EXPORT_CAPTURED."""
+        S, V = self.t4_start(), self.t4_verified()
+        D = "[BATCH] DONE view-0 exported=1 skipped=0 elapsed=1.0"
+        rows = [(f"A2-{k}", "prores", 1, [S, V.replace(f" {k}={v} ", f" {k}=unchecked ") if k != "dar" else V.replace(" dar=4:3", " dar=unchecked"), D], ["view-0.mov"])
+                for k, v in (("codec", "prores"), ("container", "mov"), ("sar", "1:1"), ("dar", "4:3"))]
+        rows.append(("A3-UPPER-CDNG", "CDNG-LOSSLESS", 30, ["[BATCH] DONE view-0 exported=30 skipped=0 elapsed=20.0"], [f"other-clip_{k:06d}.dng" for k in range(30)]))
+        rows.append(("A3-UPPER-CDNG-OK", "CDNG-LOSSLESS", 30, ["[BATCH] DONE view-0 exported=30 skipped=0 elapsed=20.0"], [f"view-0_{k:06d}.dng" for k in range(30)]))
+        got = self.run_job_slice(rows)
+        self.assertEqual(len(got), len(rows), got)   # (TIMING-3 r2, sol r1 hardening: no row goes unasserted)
+        for (label, *_), g in zip(rows, got):
+            with self.subTest(row=label):
+                self.assertEqual(g["result"], "EXPORT_CAPTURED" if label.endswith("-OK") else "EXPORT_OUTPUT_MISMATCH", g)
+        central = [prores_case(maxFrames=1, dualIsoExpected=True, stage=piped_stage_log(1, scale_ms=6.0), batch="[BATCH] Start\n" + "\n".join(ls) + "\n", criteria=[])
+                   for label, fmt, _, ls, _ in rows if fmt == "prores"]
+        proc, got = evidence_cases(central)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(len(got), len(central), got)
+        for g in got:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") and "RENDER_VERIFIED" in p and "unchecked" in p for p in g["problems"]), g)
+
+    def test_t3_r2_sol_r1_the_job_refuses_a_foreign_or_mixed_cdng_leaf_as_the_central_reader_does(self) -> None:
+        """sol r1 blocker on the Bachelor caller (the job embeds Get-DvBatchExportBindingProblems and the leaf table): the frames found on disk are the standard leaves
+        of another clip (view-0_1_2024-01-02_0001_C0000), or 479 of view-0's plus one dated leaf (sorted last), under DONE view-0 exported=480; and key3 r1 row 2 (DONE a
+        with a_1_2026-11-24_0001_C0000_<frame>.dng). The job reads EXPORT_OUTPUT_MISMATCH, as the central reader reads INVALID on the same endpoints."""
+        dd = "view-0_1_2024-01-02_0001_C0000"
+        a = "a_1_2026-11-24_0001_C0000"
+        d480 = ["[BATCH] DONE view-0 exported=480 skipped=0 elapsed=60.0"]   # (sol's elapsed; 20 s is under the profile's producer_frame total)
+        rows = [("CTL-480-OK", "cdng-lossless", 480, d480, [f"view-0_{k:06d}.dng" for k in range(480)]),
+                ("SOL-B-CROSS-CLIP", "cdng-lossless", 480, d480, [f"{dd}_{k:06d}.dng" for k in range(480)]),
+                ("SOL-B-MIXED", "cdng-lossless", 480, d480, [f"view-0_{k:06d}.dng" for k in range(479)] + [f"{dd}_000479.dng"]),
+                ("KEY3-R1-ROW2", "cdng-lossless", 30, ["[BATCH] DONE a exported=30 skipped=0 elapsed=20.0"], [f"{a}_{k:06d}.dng" for k in range(30)]),
+                ("CTL-KEY3-R1-ROW2-OWN-CLIP-OK", "cdng-lossless", 30, [f"[BATCH] DONE {a} exported=30 skipped=0 elapsed=20.0"], [f"{a}_{k:06d}.dng" for k in range(30)])]
+        got = self.run_job_slice(rows)
+        self.assertEqual(len(got), len(rows), got)
+        central = []
+        for label, _, n, lines, leaves in rows:
+            m = json.loads(output_manifest(n))
+            m["first"], m["last"] = {"name": leaves[0], "bytes": 1000, "sha256": "1" * 64}, {"name": leaves[-1], "bytes": 1000, "sha256": "2" * 64}
+            central.append(cdng_case(maxFrames=n, profile=cdng_profile(n), batch="[BATCH] Start\n" + "\n".join(lines) + "\n", manifest=json.dumps(m),
+                                     criteria=[{"metric": "framesExported", "op": "eq", "value": n}]))
+        proc, cgot = evidence_cases(central)
+        self.assertIsNotNone(cgot, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(len(cgot), len(rows), cgot)
+        for (label, *_), g, c in zip(rows, got, cgot):
+            with self.subTest(row=label):
+                ok = label.endswith("-OK")
+                self.assertEqual(g["result"], "EXPORT_CAPTURED" if ok else "EXPORT_OUTPUT_MISMATCH", g)
+                self.assertEqual(c["outcome"], "PASS" if ok else "INVALID", c)
+                if not ok:
+                    self.assertTrue(any(p.startswith("EXPORT_BATCH_LOG_UNREADABLE") and "DONE names the clip" in p for p in c["problems"]), c)
+
+    def test_reader_hardening_1_r1_sol_r2_b1_the_job_refuses_a_frame_number_the_writer_cannot_print(self) -> None:
+        """sol r2 B1 on the Bachelor caller (the job embeds Get-DvBatchExportBindingProblems and $script:ExportCdngFrameLeaf): 480 frames found on disk named
+        view-0_<7 digits>.dng (overpadded), or past UINT32_MAX ending view-0_9999999999.dng, under DONE view-0 exported=480. EXPORT_OUTPUT_MISMATCH at the job and
+        INVALID centrally on the same endpoints. PIN: the 480 frames up to 4294967295 and the six-digit run read EXPORT_CAPTURED / PASS."""
+        d480 = ["[BATCH] DONE view-0 exported=480 skipped=0 elapsed=60.0"]
+        rows = [("SOL-R2-B1-OVERPAD", "cdng-lossless", 480, d480, [f"view-0_{k:07d}.dng" for k in range(480)]),
+                ("SOL-R2-B1-OVERFLOW", "cdng-lossless", 480, d480, [f"view-0_{4294967296 + k}.dng" for k in range(479)] + ["view-0_9999999999.dng"]),
+                ("PIN-UINT32-MAX-OK", "cdng-lossless", 480, d480, [f"view-0_{4294967295 - 479 + k}.dng" for k in range(480)]),
+                ("PIN-SIX-OK", "cdng-lossless", 480, d480, [f"view-0_{k:06d}.dng" for k in range(480)])]
+        got = self.run_job_slice(rows)
+        self.assertEqual(len(got), len(rows), got)
+        central = []
+        for label, _, n, lines, leaves in rows:
+            m = json.loads(output_manifest(n))
+            m["first"], m["last"] = {"name": leaves[0], "bytes": 1000, "sha256": "1" * 64}, {"name": leaves[-1], "bytes": 1000, "sha256": "2" * 64}
+            central.append(cdng_case(maxFrames=n, profile=cdng_profile(n), batch="[BATCH] Start\n" + "\n".join(lines) + "\n", manifest=json.dumps(m),
+                                     criteria=[{"metric": "framesExported", "op": "eq", "value": n}]))
+        proc, cgot = evidence_cases(central)
+        self.assertIsNotNone(cgot, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(len(cgot), len(rows), cgot)
+        for (label, *_, leaves), g, c in zip(rows, got, cgot):
+            with self.subTest(row=label):
+                ok = label.endswith("-OK")
+                self.assertEqual(g["result"], "EXPORT_CAPTURED" if ok else "EXPORT_OUTPUT_MISMATCH", g)
+                self.assertEqual(c["outcome"], "PASS" if ok else "INVALID", c)
+                if not ok:
+                    self.assertTrue(any(p.startswith("EXPORT_BATCH_LOG_UNREADABLE") and f"'{leaves[0]}'" in p and f"'{leaves[-1]}'" in p for p in c["problems"]), c)
+
+    def test_reader_hardening_1_r1_sol_r2_b2_pin_the_job_checks_the_shared_bindings_only(self) -> None:
+        """sol r2 B2 (PIN, documents the gap; repro verbatim): a one-frame ProRes capture whose RENDER_START declares scaled=true, with matching verification and
+        .mov, and a timing log complete but for export_scale, reads INVALID / EXPORT_PROFILE_ABSENT centrally and EXPORT_CAPTURED (exit 0) at the job; so does the
+        cutIn=2 cutOut=2 declaration over timing on frame 0 (central EXPORT_STAGE_WINDOW_MISMATCH). The job holds the SHARED bindings only; the receipt stays INVALID
+        by the central re-derivation (Invoke-VenueLeg.ps1). If the job ever checks these, this pin flips and docs/dual-venue-evidence.md is updated with it."""
+        S, V = self.t4_start(), self.t4_verified()
+        D = "[BATCH] DONE view-0 exported=1 skipped=0 elapsed=1.0"
+        rows = [("SOL-R2-B2-NO-SCALE", [S, V, D], piped_stage_log(1), "EXPORT_PROFILE_ABSENT", "export_scale"),
+                ("SOL-R2-B2-SHIFTED-WINDOW", [S.replace("cutIn=1 cutOut=1", "cutIn=2 cutOut=2"), V, D], piped_stage_log(1, scale_ms=6.0), "EXPORT_STAGE_WINDOW_MISMATCH", "cutIn=2 cutOut=2"),
+                ("CTL-PRORES-OK", [S, V, D], piped_stage_log(1, scale_ms=6.0), None, None)]
+        got = self.run_job_slice([(label, "prores", 1, lines, ["view-0.mov"]) for label, lines, *_ in rows], stages=[st for _, _, st, *_ in rows])
+        proc, central = evidence_cases([prores_case(maxFrames=1, dualIsoExpected=True, stage=st, batch="[BATCH] Start\n" + "\n".join(lines) + "\n", criteria=[],
+                                                    manifest=output_manifest(1, "mov")) for _, lines, st, *_ in rows])
+        self.assertIsNotNone(central, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual((len(got), len(central)), (len(rows), len(rows)), (got, central))
+        for (label, _, _, code, needle), g, c in zip(rows, got, central):
+            with self.subTest(row=label):
+                self.assertEqual(g["result"], "EXPORT_CAPTURED", g)
+                if code is None:
+                    self.assertEqual(c["outcome"], "PASS", c)
+                else:
+                    self.assertEqual(c["outcome"], "INVALID", c)
+                    self.assertTrue(any(p.startswith(code) and needle in p for p in c["problems"]), c)
+
+    @staticmethod
+    def t4_start() -> str:
+        return ("[BATCH] RENDER_START view-0 codec=prores container=mov source=1920x1080 output=1920x1440 scaled=true fps=24 frames=1 cutIn=1 cutOut=1 "
+                "out=view-0.mov")
+
+    @staticmethod
+    def t4_verified() -> str:
+        return ("[BATCH] RENDER_VERIFIED view-0 decoded_frames=1 decoded_duration=0.042 decoded_frame_bytes=1 dimensions=1920x1440 bytes=9 "
+                "container_probe=C:/kit/ffprobe.exe probe_source=ffprobe-json codec=prores container=mov sar=1:1 dar=4:3")
 
     def test_the_app_never_inherits_the_venue_agents_mlvapp_environment(self) -> None:
         """adversary r2 A1 (on c3768da1): the export child inherited the agent's environment, so MLVAPP_GPU_EXPORT=1 on a CUDA venue made the 'cpu' leg a GPU

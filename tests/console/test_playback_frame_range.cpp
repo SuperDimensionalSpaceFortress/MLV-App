@@ -3,6 +3,15 @@
 #include "../../platform/qt/PlaybackNativePaceGuard.h"
 #include "../../platform/qt/PlaybackSourceAdvanceTracker.h"
 
+#include "../common/repo_paths.h"
+
+#include <QFile>
+#include <QString>
+#include <QTextStream>
+#include <QtCore/qnumeric.h>
+// Qt's keyword macro `forever` (qforeach.h, pulled in by QString) would rewrite this file's own `forever` identifiers.
+#undef forever
+
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -4085,4 +4094,964 @@ TEST( PlaybackConformDropFrame, R24A1TheCarriedDebtIsBoundedAndClearedWithoutCon
         ASSERT_TRUE( sameBits( playback_frame_range::conformDropFrameDelta( 1152.8, granted, true ),
                                playback_frame_range::conformDropFrameDelta( 1152.8, granted, true, none ) ) );
     }
+}
+// REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1: the gui-smoke measured-play loop's stop decision for a frame-pinned capture.
+// A timeline Reached is seen before the in-flight frames have presented; the loop must wait for the presented count.
+TEST( PlaybackMeasuredLoopExit, ReachedWaitsForThePresentedCountOfAFramePinnedCapture )
+{
+    using playback_frame_range::PlayStopState;
+    using playback_frame_range::measuredPlayLoopShouldStop;
+    // Arguments: ( state, stressPending, target, presented, requiredSourceFrames, playStillRunning, consumedSourceFrames ). A
+    // pinned capture's admitted window is 600 source frames here (required == target), the shape the capture script requests.
+    // (Reached, target 600, presented 598) -> continue: the defect (master broke here, exit 11 with 0 frames written)
+    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 598, 600, true, 600 ) );
+    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 597, 600, true, 600 ) );
+    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 0, 600, true, 600 ) );
+    // (Reached, 600, 600) -> stop: exactly N
+    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 600, 600, true, 600 ) );
+    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 600, 600, false, 603 ) );
+    // (not Reached, 600, 600) -> stop. This is NOT the present-path stop: that one fires only once programmaticPlayConsumed()
+    // is true (MainWindow.cpp, the present path's `&& programmaticPlayConsumed()` clause), so after it stops Play the
+    // evaluatePlayStop state is Reached with Play no longer running (asserted just above), never EndedEarly. EndedEarly is a
+    // Play that ended BEFORE the source frames were consumed (the engine's own end, a user stop): the loop stops on it at once,
+    // whatever the count. And a Continue (Play still running) is never a stop on its own.
+    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::EndedEarly, false, 600, 600, 600, false, 590 ) );
+    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Continue, false, 600, 600, 600, true, 590 ) );
+    // target 0 (an unpinned play) with Reached -> stop, whatever the presented count, window, run state or timeline: unchanged
+    for( const int64_t presented : { int64_t( 0 ), int64_t( 1 ), int64_t( 598 ), int64_t( 600 ), int64_t( 1000 ) } )
+        for( const int64_t required : { int64_t( 0 ), int64_t( 480 ), int64_t( 600 ) } )
+            for( const bool running : { false, true } )
+                for( const int64_t pastWindow : { int64_t( 0 ), int64_t( 3 ), int64_t( 1000 ) } )
+                    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 0, presented, required, running,
+                                                             required + pastWindow ) );
+    // the timeout -> stop, pinned or not, short of the target or not: the safety net still bounds the loop
+    for( const int64_t target : { int64_t( 0 ), int64_t( 600 ) } )
+        for( const int64_t presented : { int64_t( 0 ), int64_t( 598 ), int64_t( 600 ) } )
+            for( const bool running : { false, true } )
+            {
+                ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::SafetyTimeout, false, target, presented, 600, running, 600 ) );
+                ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::EndedEarly, false, target, presented, 600, running, 590 ) );
+                ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::PaceTooSlow, false, target, presented, 600, running, 590 ) );
+            }
+    // the clip-lifecycle stress still holds a Reached back, pinned or not; the other stops are not held back
+    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Reached, true, 0, 0, 600, true, 600 ) );
+    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Reached, true, 600, 600, 600, true, 600 ) );
+    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::SafetyTimeout, true, 600, 598, 600, true, 600 ) );
+}
+
+// adversary A2 (7f0f6d58): a pinned target beyond the admitted window (--seconds shorter than N / fps: 20 s at 24 fps admits 480
+// source frames, the target is 600) was never reachable inside the window; the loop keeps today's decision (stop at the Reached,
+// the exit-11 mismatch) and never plays on past the admitted window. The wait is only for a target the window covers.
+TEST( PlaybackMeasuredLoopExit, ATargetBeyondTheAdmittedWindowStopsAtTheReachedAsBefore )
+{
+    using playback_frame_range::PlayStopState;
+    using playback_frame_range::measuredPlayLoopShouldStop;
+    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 480, 480, true, 480 ) );
+    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 478, 480, true, 480 ) );
+    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 601, 598, 600, true, 600 ) );
+    // the window covers the target (required >= target): the wait applies
+    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 598, 601, true, 601 ) );
+    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Reached, false, 480, 478, 480, true, 480 ) );
+}
+
+// adversary A3 (7f0f6d58): presents can only still arrive while Play runs. A Play that already ended (the cut-out stop) with the
+// count short is the terminal exit-11 mismatch at once, not a wait for a frozen count that ends as PLAY_SAFETY_TIMEOUT (exit 14).
+TEST( PlaybackMeasuredLoopExit, APlayThatAlreadyEndedWithAShortCountStopsAtOnce )
+{
+    using playback_frame_range::PlayStopState;
+    using playback_frame_range::measuredPlayLoopShouldStop;
+    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 480, 479, 480, false, 480 ) );
+    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 0, 600, false, 600 ) );
+    // while Play still runs the same observation waits
+    ASSERT_TRUE( !measuredPlayLoopShouldStop( PlayStopState::Reached, false, 480, 479, 480, true, 480 ) );
+}
+
+TEST( PlaybackMeasuredLoopExit, TheLoopOutlastsATimelineReachedAndEndsAtExactlyNOrTheSafetyTimeout )
+{
+    using playback_frame_range::PlayStopState;
+    // The real decision (evaluatePlayStop) feeding the predicate, with 3 frames still in flight when the timeline
+    // consumes its 600th source frame. The old loop (break on Reached) ends at 598; the new one ends at 600.
+    // static constexpr: std::min binds these by reference, which would ODR-use an automatic local inside the captureless
+    // lambda below (ill-formed; adversary A1 on 7f0f6d58). A static has no capture to need.
+    static constexpr int64_t kTarget = 600, kRequired = 600, kSafetyMs = 35000;
+    auto run = []( int64_t target, int64_t firstPresentMs, bool oldRule, int64_t *endedAtMs ) -> int64_t
+    {
+        int64_t presented = 0;
+        for( int64_t ms = 0;; ms += 10 )
+        {
+            const int64_t consumed = std::min<int64_t>( kRequired, ms / 10 );                      // the timeline: 1 frame / 10 ms
+            presented = ms < firstPresentMs ? 0 : std::min<int64_t>( kRequired, ( ms - firstPresentMs ) / 10 + 1 );   // lags
+            const PlayStopState s = playback_frame_range::evaluatePlayStop( consumed, kRequired, true, ms, kSafetyMs );
+            const bool stop = oldRule ? ( s != PlayStopState::Continue )
+                                      : playback_frame_range::measuredPlayLoopShouldStop( s, false, target, presented, kRequired, true,
+                                                                                          consumed );
+            if( stop ) { *endedAtMs = ms; return presented; }
+        }
+    };
+    int64_t endedAt = 0;
+    ASSERT_EQ( 598, run( kTarget, 30, true, &endedAt ) );     // master: stops 2 short at the Reached, the exit-11 shape
+    ASSERT_TRUE( run( kTarget, 30, true, &endedAt ) < kTarget );
+    ASSERT_EQ( kTarget, run( kTarget, 30, false, &endedAt ) );
+    ASSERT_TRUE( endedAt <= kSafetyMs );
+    // unpinned: both rules end at the same observation with the same count, byte for byte
+    int64_t endedOld = 0, endedNew = 0;
+    ASSERT_EQ( run( 0, 30, true, &endedOld ), run( 0, 30, false, &endedNew ) );
+    ASSERT_EQ( endedOld, endedNew );
+    // a pinned target that is never presented (the present path never fires) ends at the SAFETY TIMEOUT, never a hang:
+    // evaluatePlayStop turns a Reached seen past the deadline into SafetyTimeout, which the predicate always stops on.
+    ASSERT_TRUE( playback_frame_range::evaluatePlayStop( 600, kRequired, true, kSafetyMs + 1, kSafetyMs ) == PlayStopState::SafetyTimeout );
+    ASSERT_TRUE( playback_frame_range::measuredPlayLoopShouldStop( PlayStopState::SafetyTimeout, false, kTarget, 598, kRequired, true,
+                                                                   kRequired ) );
+}
+
+// r3 (Grok CoS G1 on ee8f00bc): a simulated measured-play loop shared by the lag and stall tests below. One poll per 10 ms;
+// the timeline consumes one source frame per poll (consumed = ms / 10). Two timeline models:
+//  - Paced: the timeline runs on past the admitted window while Play runs (the paced playbackHandling tick);
+//  - Hold: the timeline holds at the window (playbackHandling's unpaced isolated hold once programmaticPlayConsumed()).
+// `lag` frames are in flight: source frame k is due to present at ( k + lag ) * 10 ms, so the highest source frame whose present
+// is due is due = max( 0, ms / 10 - lag ), capped at the window in the Hold model (no source frame past the window is decoded).
+// presentedOf( due ) is the present path's COUNT for that (identity for a pure lag; a stall freezes it, drops skip some); no
+// present arrives once Play stopped. The present-path stop is modelled as MainWindow.cpp
+// does it: once presented >= target, the source frames are consumed and Play is still checked, Play stops (the count is
+// then frozen). playEndsAtConsumed > 0: the engine ends Play itself (cut-out) once the timeline reaches that frame.
+// Rules: Old = master's inline break (any non-Continue state, the existing test's model); R2 = this card's r2 predicate,
+// i.e. the r3 predicate NOT told how far the timeline ran (consumed pinned to the window); New = the r3 predicate as wired.
+namespace measured_loop_r3
+{
+using playback_frame_range::PlayStopState;
+enum class Rule { Old, R2, New };
+enum class Timeline { Paced, Hold };
+struct LoopEnd { int64_t presented = 0; int64_t consumed = 0; int64_t ms = 0;
+                 PlayStopState state = PlayStopState::Continue; bool playRunning = true; };
+constexpr int64_t kSafetyMs = 35000;
+template<typename PresentedOf>
+LoopEnd run( Rule rule, Timeline timeline, int64_t target, int64_t required, int64_t lag, int64_t playEndsAtConsumed,
+             PresentedOf presentedOf )
+{
+    LoopEnd e;
+    bool playRunning = true;
+    int64_t presented = 0, consumed = 0;
+    for( int64_t ms = 0;; ms += 10 )
+    {
+        if( playRunning )
+        {
+            consumed = ms / 10;
+            if( timeline == Timeline::Hold ) consumed = std::min( consumed, required );
+            if( playEndsAtConsumed > 0 && consumed >= playEndsAtConsumed ) { consumed = playEndsAtConsumed; playRunning = false; }
+            int64_t due = std::max<int64_t>( 0, ms / 10 - lag );
+            if( timeline == Timeline::Hold ) due = std::min( due, required );
+            presented = presentedOf( due );
+            if( playRunning && target > 0 && presented >= target && consumed >= required ) playRunning = false;  // present stop
+        }
+        const PlayStopState s = playback_frame_range::evaluatePlayStop( consumed, required, playRunning, ms, kSafetyMs );
+        bool stop = false;
+        switch( rule )
+        {
+        case Rule::Old: stop = s != PlayStopState::Continue; break;
+        case Rule::R2:
+            stop = playback_frame_range::measuredPlayLoopShouldStop( s, false, target, presented, required, playRunning, required );
+            break;
+        case Rule::New:
+            stop = playback_frame_range::measuredPlayLoopShouldStop( s, false, target, presented, required, playRunning, consumed );
+            break;
+        }
+        if( stop )
+        {
+            e.presented = presented; e.consumed = consumed; e.ms = ms; e.state = s; e.playRunning = playRunning;
+            return e;
+        }
+    }
+}
+// a pure lag: every due source frame presents, one present per frame (presented == due)
+inline int64_t everyDueFramePresents( int64_t due ) { return due; }
+}
+
+// G1(a): the frames in flight at the Reached, parameterized. For 1 to 6 frames in flight, and for a lag larger than the whole
+// remaining window (6 in flight on a 4-frame window, so nothing has presented at the Reached), the r3 rule ends at exactly the
+// target and the old inline rule ends short by the lag -- on both timeline models.
+TEST( PlaybackMeasuredLoopExit, TheLagParameterizedLoopEndsAtExactlyTheTargetWhereTheOldRuleEndsShort )
+{
+    using namespace measured_loop_r3;
+    struct Case { int64_t target; int64_t lag; };
+    const Case cases[] = { { 600, 1 }, { 600, 2 }, { 600, 3 }, { 600, 4 }, { 600, 5 }, { 600, 6 }, { 4, 6 } };
+    int checked = 0;
+    for( const Case &c : cases )
+        for( const Timeline timeline : { Timeline::Paced, Timeline::Hold } )
+        {
+            const int64_t lag = c.lag;
+            const LoopEnd fresh = run( Rule::New, timeline, c.target, c.target, lag, 0, everyDueFramePresents );
+            ASSERT_EQ( c.target, fresh.presented );
+            ASSERT_TRUE( fresh.state == PlayStopState::Reached );
+            ASSERT_TRUE( fresh.ms <= kSafetyMs );
+            ASSERT_TRUE( fresh.consumed - c.target <= lag );                  // ran past the window by the in-flight frames only
+            ASSERT_TRUE( fresh.consumed - c.target < playback_frame_range::kMeasuredPlayMaxFramesInFlight );
+            const LoopEnd old = run( Rule::Old, timeline, c.target, c.target, lag, 0, everyDueFramePresents );
+            ASSERT_TRUE( old.presented < c.target );                          // the exit-11 shape
+            // by value: ASSERT_EQ binds `const auto &`, and std::max returns a reference to its (temporary) argument
+            const int64_t oldPresentedAtTheReached = std::max<int64_t>( 0, c.target - lag );
+            ASSERT_EQ( oldPresentedAtTheReached, old.presented );
+            ASSERT_EQ( c.target, old.consumed );                              // it broke at the first Reached
+            ++checked;
+        }
+    ASSERT_EQ( 14, checked );
+}
+
+// G1(b): presents stall or skip after the Reached while Play still runs. The loop must end by the Play-ended / exit-11 shape
+// (state Reached, presented short of the target) or by the SafetyTimeout, and never run the timeline on past the admitted window
+// beyond the frames that can be in flight (kMeasuredPlayMaxFramesInFlight). RED on r2's predicate, which was not told how far
+// the timeline ran: on a paced timeline it played on to the SafetyTimeout, 2900 source frames past the window.
+TEST( PlaybackMeasuredLoopExit, StalledOrSkippedPresentsAfterTheReachedNeverPlayPastTheAdmittedWindow )
+{
+    using namespace measured_loop_r3;
+    using playback_frame_range::kMeasuredPlayMaxFramesInFlight;
+    static constexpr int64_t kTarget = 600, kRequired = 600, kLag = 3;
+    // the count freezes 2 short (598) while Play still runs
+    auto frozen = []( int64_t due ) { return std::min<int64_t>( kRequired - 2, due ); };
+    // the present path never reaches N: it never presents at all
+    auto never = []( int64_t ) { return int64_t( 0 ); };
+    // presents skip after the Reached: past source frame 597 only every 8th due frame presents (drops)
+    auto skipping = []( int64_t due )
+    {
+        return due <= kRequired - kLag ? due : ( kRequired - kLag ) + ( due - ( kRequired - kLag ) ) / 8;
+    };
+    struct Stall { const char *name; int64_t ( *presentedOf )( int64_t ); };
+    const Stall stalls[] = { { "frozen", frozen }, { "never", never }, { "skipping", skipping } };
+    int checked = 0;
+    for( const Stall &st : stalls )
+    {
+        // Paced: the r3 rule stops at the observation that sees the timeline kMeasuredPlayMaxFramesInFlight past the window,
+        // Play still running, the count short -> the exit-11 mismatch.
+        const LoopEnd paced = run( Rule::New, Timeline::Paced, kTarget, kRequired, kLag, 0, st.presentedOf );
+        ASSERT_TRUE( paced.state == PlayStopState::Reached );
+        ASSERT_TRUE( paced.playRunning );
+        ASSERT_TRUE( paced.presented < kTarget );
+        ASSERT_EQ( kRequired + kMeasuredPlayMaxFramesInFlight, paced.consumed );
+        ASSERT_TRUE( paced.ms <= kSafetyMs );
+        // r2's rule (not told how far the timeline ran) played on past the window: to the SafetyTimeout for a frozen or absent
+        // count, or until it made up the dropped presents with source frames from past the pinned window (skipping: 24 past).
+        const LoopEnd r2 = run( Rule::R2, Timeline::Paced, kTarget, kRequired, kLag, 0, st.presentedOf );
+        ASSERT_TRUE( r2.state == PlayStopState::SafetyTimeout || r2.presented == kTarget );
+        ASSERT_TRUE( r2.consumed - kRequired > kMeasuredPlayMaxFramesInFlight );   // the defect r3 fixes
+        // Hold: the timeline never leaves the window, so the wait is bounded by the SafetyTimeout alone, at the window
+        const LoopEnd held = run( Rule::New, Timeline::Hold, kTarget, kRequired, kLag, 0, st.presentedOf );
+        ASSERT_TRUE( held.state == PlayStopState::SafetyTimeout );
+        ASSERT_TRUE( held.presented < kTarget );
+        ASSERT_EQ( kRequired, held.consumed );
+        ASSERT_TRUE( held.ms <= kSafetyMs + 10 );
+        // the engine ends Play itself (cut-out) 2 frames past the window while the count is short: the Play-ended path ends the
+        // loop at that very observation (Reached, Play no longer running, the count short -> exit 11), never a wait
+        const LoopEnd cut = run( Rule::New, Timeline::Paced, kTarget, kRequired, kLag, kRequired + 2, st.presentedOf );
+        ASSERT_TRUE( cut.state == PlayStopState::Reached );
+        ASSERT_TRUE( !cut.playRunning );
+        ASSERT_TRUE( cut.presented < kTarget );
+        ASSERT_EQ( kRequired + 2, cut.consumed );
+        ASSERT_EQ( ( kRequired + 2 ) * 10, cut.ms );
+        ++checked;
+    }
+    ASSERT_EQ( 3, checked );
+}
+
+// r4 (Grok G4 on c5a5d488 = adversary pass 3 A1 on 38c05d4b, reopened by the revert of 6e9145fb): a simulated measured-play
+// loop that tracks WHICH source frame each present shows. Paced timeline from source frame `start`: at poll ms the playhead is
+// on start + ms / 10 and consumed = ms / 10 + 1 (the start frame included). `lag` frames are in flight: source frame k presents
+// at ( k - start + lag ) * 10 ms, in order, except the one `dropped` frame, which never presents (a drop-frame tick that skips
+// it). The present-path stop is modelled as MainWindow.cpp does it: once presented >= target, the source frames are consumed
+// and Play is still checked, Play stops on THAT present (the slider is pinned to its frame). The loop's stop is the wired
+// predicate; the run's success is the strict exit-11 check, judged on pinnedCaptureObservedFrames with the in-window count the
+// present path keeps (sourceFrameInsideAdmittedWindow).
+namespace measured_loop_r4
+{
+using playback_frame_range::PlayStopState;
+struct PinnedEnd { int64_t presented = 0; int64_t windowPresented = 0; int64_t lastFrame = -1; int64_t consumed = 0; int64_t ms = 0;
+                   PlayStopState state = PlayStopState::Continue; bool playRunning = true; int64_t observed = 0; bool success = false; };
+constexpr int64_t kSafetyMs = 35000;
+inline PinnedEnd run( int64_t start, int64_t target, int64_t required, int64_t lag, int64_t dropped )
+{
+    PinnedEnd e;
+    bool playRunning = true;
+    int64_t presented = 0, windowPresented = 0, lastFrame = -1, consumed = 0, next = start;
+    for( int64_t ms = 0;; ms += 10 )
+    {
+        if( playRunning )
+        {
+            consumed = ms / 10 + 1;
+            const int64_t dueLast = start + ms / 10 - lag;
+            for( ; playRunning && next <= dueLast; ++next )
+            {
+                if( next == dropped ) continue;
+                ++presented;
+                if( playback_frame_range::sourceFrameInsideAdmittedWindow( next, true, start, required ) ) ++windowPresented;
+                lastFrame = next;
+                if( target > 0 && presented >= target && consumed >= required ) playRunning = false;   // the present stop
+            }
+        }
+        const PlayStopState s = playback_frame_range::evaluatePlayStop( consumed, required, playRunning, ms, kSafetyMs );
+        if( playback_frame_range::measuredPlayLoopShouldStop( s, false, target, presented, required, playRunning, consumed ) )
+        {
+            e.presented = presented; e.windowPresented = windowPresented; e.lastFrame = lastFrame; e.consumed = consumed; e.ms = ms;
+            e.state = s; e.playRunning = playRunning;
+            e.observed = playback_frame_range::pinnedCaptureObservedFrames( target, presented, windowPresented );
+            e.success = target > 0 && e.observed == target;
+            return e;
+        }
+    }
+}
+}
+
+// G4: ONE dropped present after the first Reached, on the Paced timeline. The frames still in flight at the Reached are the
+// last `lag` frames of the admitted window; dropping any one of them leaves the count one short, the wait (correctly) keeps
+// Play running, and the first source frame PAST the window (start + required) completes the count and stops Play. The loop
+// must never report success on that: the run ends by the not-met path (exit 11, observed = target - 1). The count-only rule
+// (c5a5d488's strict check) passed it -- the silent wrong frame where master failed loudly with exit 11. Also adversary pass
+// 3 A1's own input (frame 100 dropped long before the Reached), two window starts (0 and 240), and the no-drop controls.
+TEST( PlaybackMeasuredLoopExit, ADroppedPresentAfterTheReachedIsNeverMadeUpByAFramePastTheAdmittedWindow )
+{
+    using namespace measured_loop_r4;
+    using playback_frame_range::kMeasuredPlayMaxFramesInFlight;
+    static constexpr int64_t kTarget = 600, kRequired = 600;
+    int dropAfterReached = 0, dropBeforeReached = 0, controls = 0;
+    for( const int64_t start : { int64_t( 0 ), int64_t( 240 ) } )
+    {
+        const int64_t windowLast = start + kRequired - 1;
+        for( int64_t lag = 0; lag <= 6; ++lag )
+        {
+            // the control: nothing dropped, the count completes on the window's last frame, and that is a success
+            const PinnedEnd ok = run( start, kTarget, kRequired, lag, -1 );
+            ASSERT_TRUE( ok.success );
+            ASSERT_EQ( kTarget, ok.observed );
+            ASSERT_EQ( windowLast, ok.lastFrame );
+            ASSERT_TRUE( ok.state == PlayStopState::Reached );
+            ++controls;
+            // the drops: each frame still in flight at the first Reached (lag of them), then pass 3 A1's frame 100
+            std::vector<int64_t> drops;
+            for( int64_t k = windowLast - lag + 1; k <= windowLast; ++k ) drops.push_back( k );
+            drops.push_back( start + 100 );
+            for( const int64_t dropped : drops )
+            {
+                const PinnedEnd e = run( start, kTarget, kRequired, lag, dropped );
+                ASSERT_EQ( kTarget, e.presented );                    // the raw count did reach N ...
+                ASSERT_EQ( windowLast + 1, e.lastFrame );              // ... on the first source frame past the window
+                ASSERT_TRUE( e.lastFrame >= start + kRequired );
+                ASSERT_TRUE( e.presented == kTarget );                 // so the count-only rule (c5a5d488) called it a success
+                ASSERT_TRUE( !e.success );                             // never a success: the not-met path, exit 11
+                ASSERT_EQ( kTarget - 1, e.observed );                  // `not met; target=600 observed=599`
+                ASSERT_TRUE( e.state == PlayStopState::Reached );
+                ASSERT_TRUE( !e.playRunning );
+                ASSERT_TRUE( e.consumed - kRequired < kMeasuredPlayMaxFramesInFlight );   // the wait did see it (the defect's path)
+                ASSERT_TRUE( e.ms <= kSafetyMs );
+                if( dropped == start + 100 ) ++dropBeforeReached; else ++dropAfterReached;
+            }
+        }
+    }
+    ASSERT_EQ( 2 * ( 1 + 2 + 3 + 4 + 5 + 6 ), dropAfterReached );
+    ASSERT_EQ( 14, dropBeforeReached );
+    ASSERT_EQ( 14, controls );
+
+    // Grok's witness: the wait itself still runs on (the predicate is not the guard) ...
+    for( int64_t c = 600; c <= 615; ++c )
+        ASSERT_TRUE( !playback_frame_range::measuredPlayLoopShouldStop( PlayStopState::Reached, false, 600, 599, 600, true, c ) );
+    // ... and a present of ANY source frame from 600 to 615 is outside the 0..599 window, so it never counts toward the capture
+    for( int64_t frame = 600; frame <= 615; ++frame )
+        ASSERT_TRUE( !playback_frame_range::sourceFrameInsideAdmittedWindow( frame, true, 0, 600 ) );
+    ASSERT_TRUE( playback_frame_range::sourceFrameInsideAdmittedWindow( 599, true, 0, 600 ) );
+    ASSERT_TRUE( playback_frame_range::sourceFrameInsideAdmittedWindow( 0, true, 0, 600 ) );
+    // the window has a LOWER bound too, and a seek during the wait moves neither end (adversary pass 4 A4 / A5 on 6e9145fb):
+    // A4: window 0..599, a forward seek to 700 during the wait: 700 is past the window, whatever highWater became
+    ASSERT_TRUE( !playback_frame_range::sourceFrameInsideAdmittedWindow( 700, true, 0, 600 ) );
+    // A5: window 240..839 (start 240, 600 required): a backward seek's 120 is below it, 839 is its last frame, 840 is past it
+    ASSERT_TRUE( !playback_frame_range::sourceFrameInsideAdmittedWindow( 120, true, 240, 600 ) );
+    ASSERT_TRUE( !playback_frame_range::sourceFrameInsideAdmittedWindow( 239, true, 240, 600 ) );
+    ASSERT_TRUE( playback_frame_range::sourceFrameInsideAdmittedWindow( 240, true, 240, 600 ) );
+    ASSERT_TRUE( playback_frame_range::sourceFrameInsideAdmittedWindow( 839, true, 240, 600 ) );
+    ASSERT_TRUE( !playback_frame_range::sourceFrameInsideAdmittedWindow( 840, true, 240, 600 ) );
+    // no admitted window, or an unarmed counter: nothing is inside (fail closed)
+    ASSERT_TRUE( !playback_frame_range::sourceFrameInsideAdmittedWindow( 10, true, 0, 0 ) );
+    ASSERT_TRUE( !playback_frame_range::sourceFrameInsideAdmittedWindow( 10, false, 0, 600 ) );
+    // pass 6 A8 (minor): no inclusive end is formed, so a window near INT64_MAX does not overflow
+    const int64_t nearMax = std::numeric_limits<int64_t>::max() - 10;
+    ASSERT_TRUE( playback_frame_range::sourceFrameInsideAdmittedWindow( std::numeric_limits<int64_t>::max(), true, nearMax, 600 ) );
+    ASSERT_TRUE( !playback_frame_range::sourceFrameInsideAdmittedWindow( std::numeric_limits<int64_t>::max(), true, 0, 600 ) );
+}
+
+// Adversary pass 6 on bcac2010 (A1, A2; both major, introduced by bcac2010's rule, which judged only the LAST present: a
+// completing present outside the window made the count read one short, nothing else). A present sequence is folded the way the
+// present path counts it (raw count, in-window count, last frame) and judged by pinnedCaptureObservedFrames. Each A-item input
+// is RED on bcac2010's rule (modelled in-test as lastOnlyRule) and GREEN on the in-window count.
+namespace measured_loop_r4
+{
+struct Fold { int64_t presented = 0; int64_t windowPresented = 0; int64_t last = -1; };
+inline Fold fold( const std::vector<int64_t> &frames, int64_t start, int64_t required )
+{
+    Fold f;
+    for( const int64_t frame : frames )
+    {
+        ++f.presented;
+        if( playback_frame_range::sourceFrameInsideAdmittedWindow( frame, true, start, required ) ) ++f.windowPresented;
+        f.last = frame;
+    }
+    return f;
+}
+inline std::vector<int64_t> framesFromTo( int64_t first, int64_t last )
+{
+    std::vector<int64_t> v;
+    for( int64_t k = first; k <= last; ++k ) v.push_back( k );
+    return v;
+}
+// bcac2010's rule: the raw count, less one when the LAST present lay outside [start, start + required - 1]
+inline int64_t lastOnlyRule( const Fold &f, int64_t start, int64_t required )
+{
+    return ( f.last < start || f.last > start + required - 1 ) ? f.presented - 1 : f.presented;
+}
+}
+TEST( PlaybackMeasuredLoopExit, ASeekOutOfTheWindowOrARawCountAboveNIsNeverThePinnedCapture )
+{
+    using namespace measured_loop_r4;
+    using playback_frame_range::pinnedCaptureObservedFrames;
+    static constexpr int64_t kTarget = 600, kRequired = 600;
+    // A1: frames 0..598 (599 presents), a backward seek presents 100, then frame 700 completes the stop: raw 601
+    std::vector<int64_t> a1 = framesFromTo( 0, 598 );
+    a1.push_back( 100 );
+    a1.push_back( 700 );
+    const Fold f1 = fold( a1, 0, kRequired );
+    ASSERT_EQ( 601, f1.presented );
+    ASSERT_EQ( 600, f1.windowPresented );
+    ASSERT_EQ( kTarget, lastOnlyRule( f1, 0, kRequired ) );                              // RED on bcac2010: a success
+    ASSERT_TRUE( pinnedCaptureObservedFrames( kTarget, f1.presented, f1.windowPresented ) != kTarget );
+    ASSERT_EQ( 601, pinnedCaptureObservedFrames( kTarget, f1.presented, f1.windowPresented ) );   // `observed=601`, as master
+    // A2: frames 0..596 (597), a seek presents 700, then back: 598 and 599 complete the count. raw 600, last 599 (inside)
+    std::vector<int64_t> a2 = framesFromTo( 0, 596 );
+    a2.push_back( 700 );
+    a2.push_back( 598 );
+    a2.push_back( 599 );
+    const Fold f2 = fold( a2, 0, kRequired );
+    ASSERT_EQ( 600, f2.presented );
+    ASSERT_EQ( 599, f2.windowPresented );
+    ASSERT_EQ( 599, f2.last );
+    ASSERT_EQ( kTarget, lastOnlyRule( f2, 0, kRequired ) );                              // RED on bcac2010: a success
+    ASSERT_EQ( 599, pinnedCaptureObservedFrames( kTarget, f2.presented, f2.windowPresented ) );   // `observed=599`
+    // the same two shapes on an offset window 240..839
+    std::vector<int64_t> a2Offset = framesFromTo( 240, 836 );
+    a2Offset.push_back( 120 );
+    a2Offset.push_back( 838 );
+    a2Offset.push_back( 839 );
+    const Fold f3 = fold( a2Offset, 240, kRequired );
+    ASSERT_EQ( 600, f3.presented );
+    ASSERT_TRUE( pinnedCaptureObservedFrames( kTarget, f3.presented, f3.windowPresented ) != kTarget );
+    // controls: every present inside the window is judged exactly as before this card (the raw count)
+    const Fold ok = fold( framesFromTo( 0, 599 ), 0, kRequired );
+    ASSERT_EQ( kTarget, pinnedCaptureObservedFrames( kTarget, ok.presented, ok.windowPresented ) );
+    std::vector<int64_t> repaint = framesFromTo( 0, 599 );
+    repaint.push_back( 599 );                                                            // a repaint inside: raw 601, all inside
+    const Fold rp = fold( repaint, 0, kRequired );
+    ASSERT_EQ( 601, pinnedCaptureObservedFrames( kTarget, rp.presented, rp.windowPresented ) );
+    const Fold shortRun = fold( framesFromTo( 0, 597 ), 0, kRequired );
+    ASSERT_EQ( 598, pinnedCaptureObservedFrames( kTarget, shortRun.presented, shortRun.windowPresented ) );
+    // the pure rule: equal to the target only when presented == windowPresented == target
+    for( int64_t presented = 595; presented <= 605; ++presented )
+        for( int64_t windowPresented = 590; windowPresented <= presented; ++windowPresented )
+        {
+            const bool met = pinnedCaptureObservedFrames( kTarget, presented, windowPresented ) == kTarget;
+            ASSERT_EQ( presented == kTarget && windowPresented == kTarget, met );
+        }
+}
+
+// r8 (the r7 venue run on 970ef3f9: Bachelor, clip id M16-1243, startFrame 120, gate wb_locked, target 480, exit 11 with
+// `target=480 observed=470`, `10 of 480 presents ... outside the admitted window starting at frame 120 (last presented frame 609)`).
+// The app log of that job shows Play presenting 121..609 with 9 frames skipped by drawFrameReady's
+// forward-only guard (`draw_frame_ready.skip_backward`): 325 334 339 347 350 420 428 450 599. For each, request_state of the NEXT
+// frame's request reads render_thread_rendering_at_request=0 and ready_slot_count_at_request=1: the skipped frame was already
+// rendered and READY when the next one finished, and the acquire took the newer one first. Frame 120 was on screen when Play began
+// (paused present), and Play's first tick advances off it, so no Play present ever shows it, while r4's window [120, 599] counted it:
+// a run with no fault at all could reach only 479 in-window presents. The present path stopped Play on the RAW count (480 at frame
+// 609) while the gate judged the in-window count (470).
+// The replay: Play presents from start + 1 (`firstPlayFrame` overrides it); the playhead leads the present by kTimelineLead frames;
+// at each frame in `bothReadyAt` that frame and the next are both ready at one acquire, readySlotPreferred picks one (frames double
+// as request serials: f was requested before f + 1), the other is acquired next, and the forward-only guard skips it when it is
+// older than the frame on screen. The present-path stop is modelled as MainWindow.cpp wires it: the raw count reached the target,
+// the source frames are consumed, AND pinnedPresentStopCount reached the target.
+// r8 fix 1 (adversary pass 8 on 77fa2218; the measured venue Play ran drop_frame=0 -- `playback_smoke.start drop_frame=0` -- and the
+// `automation.pacing_isolated ... drop_frame=1` line is logged at gui-smoke-entry, before the capture's drop-frame-off setting
+// applies, so oldest-first for a pinned capture in drop-frame mode is a harmless extension, not the venue's cause). The replay also
+// models the measured-play loop's poll after each present (measuredPlayLoopShouldStop on the Reached state once the counter has
+// consumed the required frames, fed pinnedPresentStopCount as runGuiPlaybackSmoke feeds it), and `holdFrame` the unpaced
+// isolated hold (the playhead never passes it).
+namespace measured_loop_r8
+{
+using playback_frame_range::PinnedWindowPresents;
+struct Replay { PinnedWindowPresents w; int64_t raw = 0; int64_t last = -1; int64_t skipped = 0; bool stopped = false;
+                bool loopStopped = false; int64_t stopFrame = -1; int64_t observed = 0; bool met = false; };
+constexpr int64_t kTimelineLead = 2;
+inline bool contains( const std::vector<int64_t> &v, int64_t x )
+{
+    for( const int64_t y : v ) if( y == x ) return true;
+    return false;
+}
+inline Replay replay( int64_t start, int64_t target, int64_t required, int64_t lastFrame, const std::vector<int64_t> &bothReadyAt,
+                      bool oldestFirst, int64_t firstPlayFrame = -1, int64_t holdFrame = -1 )
+{
+    Replay r;
+    auto present = [&]( int64_t frame )
+    {
+        if( r.stopped ) return;
+        if( r.last >= 0 && frame < r.last ) { ++r.skipped; return; }   // drawFrameReady's forward-only guard (skip_backward)
+        r.last = frame;
+        ++r.raw;
+        r.w.arm( playback_frame_range::pinnedWindowFirstFrame( start ), required, target );
+        r.w.notePresent( frame );
+        const int64_t playhead = holdFrame >= 0 && frame + kTimelineLead > holdFrame ? holdFrame : frame + kTimelineLead;
+        const int64_t consumed = playhead - start + 1;
+        if( target > 0 && r.raw >= target && consumed >= required
+         && playback_frame_range::pinnedPresentStopCount( r.w ) >= target )
+        {
+            r.stopped = true;
+            r.stopFrame = frame;
+            return;
+        }
+        if( consumed >= required
+         && playback_frame_range::measuredPlayLoopShouldStop( playback_frame_range::PlayStopState::Reached, false, target,
+                                                              playback_frame_range::pinnedPresentStopCount( r.w ), required, true,
+                                                              consumed ) )
+        {
+            r.stopped = r.loopStopped = true;
+            r.stopFrame = frame;
+        }
+    };
+    for( int64_t f = firstPlayFrame >= 0 ? firstPlayFrame : start + 1; f <= lastFrame && !r.stopped; ++f )
+    {
+        if( contains( bothReadyAt, f ) )
+        {
+            const bool newerFirst = playback_frame_range::readySlotPreferred( oldestFirst, true, static_cast<uint64_t>( f + 1 ),
+                                                                              static_cast<uint64_t>( f ) );
+            present( newerFirst ? f + 1 : f );
+            present( newerFirst ? f : f + 1 );
+            ++f;
+        }
+        else
+            present( f );
+    }
+    r.observed = playback_frame_range::pinnedWindowObservedFrames( target, r.w );
+    r.met = target > 0 && r.observed == target;
+    return r;
+}
+}
+
+TEST( PlaybackMeasuredLoopExit, TheVenueSequenceNeverStopsOnARawCountAndEveryFramePlayPresentsEveryWindowFrame )
+{
+    using namespace measured_loop_r8;
+    static constexpr int64_t kStart = 120, kTarget = 480, kRequired = 480;
+    const std::vector<int64_t> venuePairs = { 325, 334, 339, 347, 350, 420, 428, 450, 599 };
+
+    // 0. On r4's window [120, 599] the venue sequence is the hub's reading: 480 presents, the last at frame 609, 10 window frames
+    //    missing (120 and the nine skipped) and 10 presents past the window.
+    {
+        std::vector<int64_t> presents;
+        for( int64_t f = kStart + 1; f <= 609; ++f )
+            if( !contains( venuePairs, f ) ) presents.push_back( f );
+        int64_t inWindow = 0;
+        for( const int64_t f : presents )
+            if( playback_frame_range::sourceFrameInsideAdmittedWindow( f, true, kStart, kRequired ) ) ++inWindow;
+        ASSERT_EQ( 480, static_cast<int64_t>( presents.size() ) );
+        ASSERT_EQ( 470, inWindow );
+        ASSERT_EQ( 10, kRequired - inWindow );
+    }
+
+    // 1. The venue run as it ran (newest ready frame first). The stop must NOT fire on the raw count (970ef3f9 stopped Play on the
+    //    480th raw present, frame 609): at 600 only 471 distinct pinned-window frames ([121, 600]: 121..600 less the nine skipped)
+    //    were shown. r8 fix 1 (adversary A7): the first present outside the window (601) loses the capture for good, so the
+    //    measured-play loop ends the wait there -- on the not-met path -- instead of letting Play run on toward 16 frames past it.
+    const Replay venue = replay( kStart, kTarget, kRequired, 609, venuePairs, false );
+    ASSERT_EQ( 9, venue.skipped );
+    ASSERT_TRUE( venue.stopped );                                      // RED on 77fa2218: no stop through 609
+    ASSERT_TRUE( venue.loopStopped );                                  // the loop's stop, never the present path's count
+    ASSERT_EQ( 601, venue.stopFrame );
+    ASSERT_EQ( 472, venue.raw );
+    ASSERT_EQ( 121, venue.w.windowStart );
+    ASSERT_EQ( 471, venue.w.distinct );
+    ASSERT_EQ( 1, venue.w.outside );
+    ASSERT_EQ( 471, venue.observed );
+    ASSERT_TRUE( !venue.met );
+
+    // 2. The same ready pairs, acquired the way a pinned capture now acquires (oldest ready first; in drop-frame mode too, a harmless
+    //    extension: the venue's measured Play ran drop_frame=0): no frame is skipped, the 480th distinct pinned-window frame is 600 (= start + N, the frame the capture
+    //    script names), Play stops on it, nothing outside the window was presented, and the capture is met.
+    const bool pinnedDropFramePlayOldestFirst = playback_frame_range::playbackAcquiresOldestReadyFirst( true, true, true );
+    ASSERT_TRUE( pinnedDropFramePlayOldestFirst );                     // RED on 77fa2218: drop-frame Play took the newest first
+    const Replay ordered = replay( kStart, kTarget, kRequired, 609, venuePairs, pinnedDropFramePlayOldestFirst );
+    ASSERT_EQ( 0, ordered.skipped );
+    ASSERT_TRUE( ordered.stopped );
+    ASSERT_EQ( kStart + kTarget, ordered.stopFrame );
+    ASSERT_EQ( kTarget, ordered.raw );
+    ASSERT_EQ( 0, ordered.w.outside );
+    ASSERT_EQ( 0, ordered.w.repeats );
+    ASSERT_EQ( kTarget, ordered.w.distinct );
+    ASSERT_EQ( kTarget, ordered.observed );
+    ASSERT_TRUE( ordered.met );
+
+    // 3. A perfect every-frame run (nothing ready out of order): Play presents 121..600 and that is met. On 970ef3f9 (window
+    //    [120, 599]) the 480th raw present was 600, outside its window, and only 479 counted: a run with no fault failed exit 11.
+    const Replay perfect = replay( kStart, kTarget, kRequired, 640, {}, true );
+    ASSERT_TRUE( perfect.stopped );
+    ASSERT_EQ( 600, perfect.stopFrame );
+    ASSERT_EQ( 480, perfect.raw );
+    ASSERT_EQ( 0, perfect.w.outside );
+    ASSERT_TRUE( perfect.met );
+    // and on any window start (0, 240) and lead
+    for( const int64_t start : { int64_t( 0 ), int64_t( 240 ) } )
+    {
+        const Replay p = replay( start, kTarget, kRequired, start + 700, {}, true );
+        ASSERT_TRUE( p.met );
+        ASSERT_EQ( start + kTarget, p.stopFrame );
+    }
+
+    // 4. A Play that ALSO presents the start frame (adversary A3: drop-frame Play's first tick can grant less than a frame, and the
+    //    start refresh submits it). It is the frame already on screen when Play began: a REPEAT, never a pinned-window frame and
+    //    never an out-of-window present, so the run is judged on 121..600 like any other and is met; it is never counted.
+    const Replay withStart = replay( kStart, kTarget, kRequired, 640, {}, true, kStart );
+    ASSERT_TRUE( withStart.stopped );
+    ASSERT_EQ( 600, withStart.stopFrame );
+    ASSERT_EQ( 0, withStart.w.outside );                               // RED on 77fa2218: outside 1, observed 481
+    ASSERT_EQ( 1, withStart.w.repeats );
+    ASSERT_EQ( kTarget, withStart.w.distinct );
+    ASSERT_EQ( kTarget, withStart.observed );
+    ASSERT_TRUE( withStart.met );
+
+    // 5. A repeated present of a window frame is never counted again, and a present outside the window never counts.
+    PinnedWindowPresents w;
+    w.arm( playback_frame_range::pinnedWindowFirstFrame( kStart ), kRequired, kTarget );
+    ASSERT_EQ( 121, w.windowStart );
+    ASSERT_EQ( 600, w.identityFrame );
+    ASSERT_EQ( 0, w.distinct );
+    w.notePresent( 300 );
+    w.notePresent( 300 );
+    w.notePresent( 121 );
+    w.notePresent( 121 );
+    ASSERT_EQ( 2, w.distinct );
+    ASSERT_EQ( 2, w.repeats );
+    ASSERT_EQ( 2, playback_frame_range::pinnedPresentStopCount( w ) );
+    w.notePresent( 120 );                                              // the start frame after a window present: outside (r9 A3)
+    ASSERT_EQ( 2, w.repeats );                                         // RED on eaa5c9e0: 3 (a repeat at any time)
+    ASSERT_EQ( 1, w.outside );
+    w.notePresent( 601 );
+    w.notePresent( 600 );
+    ASSERT_EQ( 3, w.distinct );
+    ASSERT_EQ( 2, w.outside );
+    // the arm is once: a later arm never moves the window or resets the count
+    w.arm( 0, 10, 10 );
+    ASSERT_EQ( 121, w.windowStart );
+    ASSERT_EQ( 3, w.distinct );
+    // an unarmed ledger counts nothing inside (fail closed)
+    PinnedWindowPresents unarmed;
+    unarmed.notePresent( 121 );
+    ASSERT_EQ( 0, unarmed.distinct );
+    ASSERT_EQ( 1, unarmed.outside );
+    // N in-window frames plus an out-of-window present is never met (observed above the target, as before this round)
+    PinnedWindowPresents over;
+    over.arm( 1, 3, 3 );
+    over.notePresent( 1 );
+    over.notePresent( 7 );
+    over.notePresent( 2 );
+    over.notePresent( 3 );
+    ASSERT_EQ( 3, over.distinct );
+    ASSERT_EQ( 4, playback_frame_range::pinnedWindowObservedFrames( 3, over ) );
+
+    // 6. The acquire order: oldest first in every-frame Play and in a pinned capture's Play (drop-frame or not); unpinned drop-frame
+    //    Play and a paused redraw keep the newest first.
+    ASSERT_TRUE( playback_frame_range::playbackAcquiresOldestReadyFirst( true, false, false ) );
+    ASSERT_TRUE( playback_frame_range::playbackAcquiresOldestReadyFirst( true, false, true ) );
+    ASSERT_TRUE( !playback_frame_range::playbackAcquiresOldestReadyFirst( true, true, false ) );
+    ASSERT_TRUE( !playback_frame_range::playbackAcquiresOldestReadyFirst( false, false, true ) );
+    ASSERT_TRUE( !playback_frame_range::playbackAcquiresOldestReadyFirst( false, true, true ) );
+    ASSERT_TRUE( playback_frame_range::readySlotPreferred( true, false, 9, 0 ) );     // the first ready slot is always taken
+    ASSERT_TRUE( playback_frame_range::readySlotPreferred( false, false, 9, 0 ) );
+    ASSERT_TRUE( playback_frame_range::readySlotPreferred( true, true, 210, 211 ) );   // oldest first: 325 (serial 210) wins
+    ASSERT_TRUE( !playback_frame_range::readySlotPreferred( true, true, 211, 210 ) );
+    ASSERT_TRUE( playback_frame_range::readySlotPreferred( false, true, 211, 210 ) );  // newest first: unchanged
+    ASSERT_TRUE( !playback_frame_range::readySlotPreferred( false, true, 210, 211 ) );
+}
+
+// r8 fix 1 (adversary pass 8 on 77fa2218): the pinned window [start + 1, start + N] and everything that bounds the Play agree on
+// it. Each block is RED on 77fa2218's rules (the RED stubs) and green on the fix.
+TEST( PlaybackMeasuredLoopExit, R8Fix1TheCaptureEndsOnItsIdentityFrameAndNeverWaitsOnALostCapture )
+{
+    using namespace measured_loop_r8;
+    using playback_frame_range::PinnedWindowPresents;
+    static constexpr int64_t kStart = 120, kTarget = 480, kRequired = 480;
+
+    // A1: the unpaced isolated hold. The counter counts the start frame, so it has consumed the required 480 frames at 599; a
+    //     pinned capture holds only once the playhead is on the identity frame 600 (consumed 481), so 600 is presented and met.
+    //     77fa2218 held at 599: 600 was never presented, 479 distinct, no stop until the safety timeout.
+    int64_t holdFrame = -1;
+    for( int64_t p = kStart; p < kStart + 2 * kRequired && holdFrame < 0; ++p )
+    {
+        const int64_t consumed = p - kStart + 1;
+        if( consumed >= kRequired && playback_frame_range::pinnedUnpacedHoldReached( kTarget, consumed, kRequired ) )
+            holdFrame = p;
+    }
+    ASSERT_EQ( kStart + kTarget, holdFrame );                          // RED on 77fa2218: 599
+    const Replay unpaced = replay( kStart, kTarget, kRequired, holdFrame, {}, true, -1, holdFrame );
+    ASSERT_TRUE( unpaced.stopped );
+    ASSERT_EQ( kStart + kTarget, unpaced.stopFrame );
+    ASSERT_TRUE( unpaced.met );
+    // an unpinned run holds exactly as before, at the required source frames
+    ASSERT_TRUE( playback_frame_range::pinnedUnpacedHoldReached( 0, kRequired, kRequired ) );
+    ASSERT_TRUE( !playback_frame_range::pinnedUnpacedHoldReached( kTarget, kRequired, kRequired ) );
+    ASSERT_TRUE( playback_frame_range::pinnedUnpacedHoldReached( kTarget, kRequired + 1, kRequired ) );
+
+    // A2: the identity frame start + N must exist and lie before the clip's last frame (the engine's end-of-clip stop can end Play
+    //     before the last frame's present is credited). A 480-frame clip (last index 479) or a 481-frame one from frame 0 is
+    //     refused up front; the venue (from 120, cut-out 937) is admitted; an unpinned run is never refused here.
+    ASSERT_TRUE( !playback_frame_range::pinnedIdentityFrameAdmitted( 0, 480, 479 ) );   // RED on 77fa2218: admitted
+    ASSERT_TRUE( !playback_frame_range::pinnedIdentityFrameAdmitted( 0, 480, 480 ) );
+    ASSERT_TRUE( playback_frame_range::pinnedIdentityFrameAdmitted( 0, 480, 481 ) );
+    ASSERT_TRUE( playback_frame_range::pinnedIdentityFrameAdmitted( kStart, kTarget, 936 ) );
+    ASSERT_TRUE( !playback_frame_range::pinnedIdentityFrameAdmitted( 500, 480, 936 ) );
+    ASSERT_TRUE( playback_frame_range::pinnedIdentityFrameAdmitted( 0, 0, 10 ) );
+    ASSERT_TRUE( !playback_frame_range::pinnedIdentityFrameAdmitted( 900, 480, 10 ) );  // start past the last frame
+
+    // A4: N distinct window frames whose LAST present is not the identity frame (a backfill of 4 after 5) never stops Play and is
+    //     never met: the capture would save frame 4, not start + N. A later present of the identity frame credits it.
+    PinnedWindowPresents backfill;
+    backfill.arm( 1, 5, 5 );
+    for( const int64_t f : { int64_t( 1 ), int64_t( 2 ), int64_t( 3 ), int64_t( 5 ), int64_t( 4 ) } ) backfill.notePresent( f );
+    ASSERT_EQ( 5, backfill.distinct );
+    ASSERT_EQ( 4, playback_frame_range::pinnedPresentStopCount( backfill ) );          // RED on 77fa2218: 5, Play stopped on 4
+    ASSERT_EQ( 4, playback_frame_range::pinnedWindowObservedFrames( 5, backfill ) );   // RED on 77fa2218: 5, met
+    backfill.notePresent( 5 );                                                         // a repeat of the identity frame
+    ASSERT_EQ( 5, playback_frame_range::pinnedPresentStopCount( backfill ) );
+    ASSERT_EQ( 5, playback_frame_range::pinnedWindowObservedFrames( 5, backfill ) );
+
+    // A7: once a present fell outside the window the capture can never be met, so the stop count reaches the target and the
+    //     measured-play loop ends at its next Reached poll (consumed only 1 past the window: the timeline was seeked to 900) on the
+    //     not-met path, instead of waiting while consumed() -- which never counts a seek -- stays under 16 past the window.
+    PinnedWindowPresents seeked;
+    seeked.arm( 121, 480, 480 );
+    for( int64_t f = 121; f <= 598; ++f ) seeked.notePresent( f );
+    seeked.notePresent( 900 );
+    seeked.notePresent( 901 );
+    ASSERT_EQ( 480, playback_frame_range::pinnedPresentStopCount( seeked ) );          // RED on 77fa2218: 478
+    ASSERT_TRUE( playback_frame_range::measuredPlayLoopShouldStop( playback_frame_range::PlayStopState::Reached, false, 480,
+                                                                   playback_frame_range::pinnedPresentStopCount( seeked ), 480,
+                                                                   true, 481 ) );
+    ASSERT_EQ( 478, playback_frame_range::pinnedWindowObservedFrames( 480, seeked ) );
+}
+
+// r9 (adversary pass 9 on 35a85cdd, route b of the REFERENCE-FRAME-PIN-BY-SOURCE-INDEX-1 design review). Each block is RED on
+// eaa5c9e0's rules (the RED stub) and green on the fix.
+TEST( PlaybackMeasuredLoopExit, R9TheAdmissionJudgesThePlayedCutRangeAndTheStartFrameIsARepeatOnlyBeforeTheWindow )
+{
+    using playback_frame_range::PinnedWindowPresents;
+    static constexpr int64_t kStart = 120, kTarget = 480, kRequired = 480;
+
+    // A1: the pinned identity admission reads the cut range the engine plays and the play gate judges (engineCutRangeForPlay with
+    //     the collapsed-range repair), never the raw cut-out. A collapsed range (cutIn == cutOut == 121) of a 1000-frame clip plays
+    //     to frame 999 with the repair on, so start 120 + 480 = 600 is admitted (master admits and plays it); with the repair off
+    //     the engine stops at the raw cut-out (last frame 120), so the pin is refused.
+    const int repairedLast = playback_frame_range::pinnedAdmissionLastFrame( 121, 121, 1000, true );
+    ASSERT_EQ( 999, repairedLast );                                    // RED on eaa5c9e0: 120 (the raw cut-out)
+    ASSERT_TRUE( playback_frame_range::pinnedIdentityFrameAdmitted( kStart, kTarget, repairedLast ) );
+    const int rawLast = playback_frame_range::pinnedAdmissionLastFrame( 121, 121, 1000, false );
+    ASSERT_EQ( 120, rawLast );
+    ASSERT_TRUE( !playback_frame_range::pinnedIdentityFrameAdmitted( kStart, kTarget, rawLast ) );
+    // the venue's range (cut-out 937) is the same either way, and admitted
+    ASSERT_EQ( 936, playback_frame_range::pinnedAdmissionLastFrame( 1, 937, 1000, true ) );
+    ASSERT_EQ( 936, playback_frame_range::pinnedAdmissionLastFrame( 1, 937, 1000, false ) );
+    ASSERT_TRUE( playback_frame_range::pinnedIdentityFrameAdmitted( kStart, kTarget, 936 ) );
+    // an inverted range the engine leaves alone (repair off: cut-out 200 before the cut-in 500) ends at the raw cut-out: refused
+    ASSERT_EQ( 199, playback_frame_range::pinnedAdmissionLastFrame( 500, 200, 1000, false ) );
+    ASSERT_TRUE( !playback_frame_range::pinnedIdentityFrameAdmitted( kStart, kTarget,
+                                                                     playback_frame_range::pinnedAdmissionLastFrame( 500, 200, 1000, false ) ) );
+    // with the repair on the gate and the engine play an inverted range to the clip end, so the admission agrees with them
+    ASSERT_EQ( 999, playback_frame_range::pinnedAdmissionLastFrame( 500, 200, 1000, true ) );
+    // no clip (an invalid range): -1, refused (fail closed)
+    ASSERT_EQ( -1, playback_frame_range::pinnedAdmissionLastFrame( 121, 121, 0, true ) );
+    ASSERT_EQ( -1, playback_frame_range::pinnedAdmissionLastFrame( 121, 121, 0, false ) );
+    ASSERT_TRUE( !playback_frame_range::pinnedIdentityFrameAdmitted( kStart, kTarget,
+                                                                     playback_frame_range::pinnedAdmissionLastFrame( 121, 121, 0, true ) ) );
+    ASSERT_TRUE( !playback_frame_range::pinnedIdentityFrameAdmitted( 0, kTarget, -1 ) );
+    // an unpinned run is still never refused
+    ASSERT_TRUE( playback_frame_range::pinnedIdentityFrameAdmitted( kStart, 0, -1 ) );
+
+    // A3: the start frame (windowStart - 1) is exempt as a repeat ONLY before the first counted present: it is the frame on screen
+    //     when Play began. After a window present, a present of it is a seek back out of the window: outside (fail closed).
+    PinnedWindowPresents scrub;
+    scrub.arm( playback_frame_range::pinnedWindowFirstFrame( kStart ), kRequired, kTarget );
+    for( int64_t f = 121; f <= 130; ++f ) scrub.notePresent( f );
+    ASSERT_EQ( 10, scrub.distinct );
+    scrub.notePresent( 120 );
+    ASSERT_EQ( 1, scrub.outside );                                     // RED on eaa5c9e0: 0 (counted as a repeat)
+    ASSERT_EQ( 0, scrub.repeats );
+    ASSERT_EQ( kTarget, playback_frame_range::pinnedPresentStopCount( scrub ) );        // a lost capture ends the wait at once
+    // kept: before any window present the start frame is a repeat, never outside
+    PinnedWindowPresents opening;
+    opening.arm( playback_frame_range::pinnedWindowFirstFrame( kStart ), kRequired, kTarget );
+    opening.notePresent( 120 );
+    ASSERT_EQ( 1, opening.repeats );
+    ASSERT_EQ( 0, opening.outside );
+    opening.notePresent( 120 );
+    ASSERT_EQ( 2, opening.repeats );
+    ASSERT_EQ( 0, opening.outside );
+    opening.notePresent( 121 );
+    ASSERT_EQ( 1, opening.distinct );
+    ASSERT_EQ( 0, opening.outside );
+    // an outside present first also ends the exemption
+    PinnedWindowPresents outsideFirst;
+    outsideFirst.arm( 121, 480, 480 );
+    outsideFirst.notePresent( 900 );
+    outsideFirst.notePresent( 120 );
+    ASSERT_EQ( 2, outsideFirst.outside );                              // RED on eaa5c9e0: 1
+    ASSERT_EQ( 0, outsideFirst.repeats );
+}
+
+// GUI-SMOKE-ARG-RANGE-OVERFLOW-1 (#881, Grok G7): inputs the GUI cannot produce must still give the mathematically correct
+// answer with no signed overflow. The inputs go through a volatile so the compiler cannot fold the old UB away at compile time.
+namespace
+{
+int64_t argOverflowOpaque( int64_t v )
+{
+    volatile int64_t held = v;
+    return held;
+}
+}
+
+// pass 7 A7: sourceFrameInsideAdmittedWindow( 0, true, INT64_MIN, 1 ) formed 0 - INT64_MIN.
+TEST( PlaybackFrameRangeArgOverflow, AdmittedWindowExtremeInputsNoOverflow )
+{
+    using playback_frame_range::sourceFrameInsideAdmittedWindow;
+    const int64_t kMin = std::numeric_limits<int64_t>::min();
+    const int64_t kMax = std::numeric_limits<int64_t>::max();
+    // frame - start is 2^63: far past a 1-frame window
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( 0 ), true, argOverflowOpaque( kMin ), 1 ) );   // RED: true
+    // frame - start is 2^64 - 1: past even the widest window
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( kMax ), true, argOverflowOpaque( kMin ),
+                                                   argOverflowOpaque( kMax ) ) );                                        // RED: true
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( 1 ), true, argOverflowOpaque( -kMax ),
+                                                   argOverflowOpaque( kMax ) ) );                                        // RED: true
+    // the exact edges of the widest window [INT64_MIN, INT64_MIN + INT64_MAX - 1] = [INT64_MIN, -2]
+    ASSERT_TRUE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( kMin ), true, argOverflowOpaque( kMin ), kMax ) );
+    ASSERT_TRUE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( -2 ), true, argOverflowOpaque( kMin ), kMax ) );
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( -1 ), true, argOverflowOpaque( kMin ), kMax ) );
+    // one-frame windows at both ends of the range
+    ASSERT_TRUE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( kMax ), true, argOverflowOpaque( kMax ), 1 ) );
+    ASSERT_TRUE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( kMin ), true, argOverflowOpaque( kMin ), 1 ) );
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( kMin ), true, argOverflowOpaque( kMax ), kMax ) );
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( kMax ), true, argOverflowOpaque( kMax ), 0 ) );
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( kMax ), false, argOverflowOpaque( kMax ), 1 ) );
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( 0 ), true, argOverflowOpaque( 0 ), kMin ) );
+
+    // in-range controls: the pinned window [121, 600] of a 480-frame requirement, unchanged
+    ASSERT_TRUE( sourceFrameInsideAdmittedWindow( 121, true, 121, 480 ) );
+    ASSERT_TRUE( sourceFrameInsideAdmittedWindow( 600, true, 121, 480 ) );
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( 601, true, 121, 480 ) );
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( 120, true, 121, 480 ) );
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( 300, false, 121, 480 ) );
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( 300, true, 121, 0 ) );
+    // every small input where the old expression cannot overflow: the same answer as the old expression
+    for( int64_t frame = -8; frame <= 8; ++frame )
+        for( int64_t start = -6; start <= 6; ++start )
+            for( int64_t required = -2; required <= 6; ++required )
+                for( int armed = 0; armed <= 1; ++armed )
+                {
+                    const bool before = armed != 0 && required > 0 && frame >= start && frame - start < required;
+                    ASSERT_EQ( before, sourceFrameInsideAdmittedWindow( frame, armed != 0, start, required ) );
+                }
+}
+
+// SIBLING_SWEEP (same function family, same shape): measuredPlayLoopShouldStop formed consumed - required, which overflows for
+// consumed near INT64_MIN. A timeline that has not reached the window is not past it: the Reached wait still waits.
+TEST( PlaybackFrameRangeArgOverflow, MeasuredPlayLoopConsumedExtremeNoOverflow )
+{
+    using playback_frame_range::PlayStopState;
+    using playback_frame_range::measuredPlayLoopShouldStop;
+    const int64_t kMin = std::numeric_limits<int64_t>::min();
+    const int64_t kMax = std::numeric_limits<int64_t>::max();
+    ASSERT_FALSE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 480, 479, argOverflowOpaque( 480 ), true,
+                                              argOverflowOpaque( kMin ) ) );                                          // RED: true
+    ASSERT_FALSE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, kMax - 1, 0, argOverflowOpaque( kMax ), true,
+                                              argOverflowOpaque( -2 ) ) );                                            // RED: true
+    // far past the window at the top of the range: stop (consumed - required >= 16, no overflow before or after)
+    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 480, 479, 480, true, kMax ) );
+    // in-range controls, unchanged: 15 past waits, 16 past stops
+    ASSERT_FALSE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 480, 479, 480, true, 495 ) );
+    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 480, 479, 480, true, 496 ) );
+    ASSERT_FALSE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 480, 479, 480, true, 0 ) );
+    for( int64_t consumed = -40; consumed <= 40; ++consumed )
+        for( int64_t required = 1; required <= 24; ++required )
+        {
+            const int64_t target = required;
+            const bool before = !( target > 0 && 0 < target && target <= required && consumed - required < 16 );
+            ASSERT_EQ( before, measuredPlayLoopShouldStop( PlayStopState::Reached, false, target, 0, required, true, consumed ) );
+        }
+}
+
+// pass 6 A7: --gui-smoke-playback --seconds 2147483.648 reached qRound( 2147483648.0 ), outside int. main.cpp refuses (exit 2)
+// every --seconds whose milliseconds do not fit GuiPlaybackSmokeOptions::durationMs (an int), and NaN / inf; a value it admits
+// keeps today's qRound( seconds * 1000.0 ).
+TEST( PlaybackFrameRangeArgOverflow, SmokeSecondsFitDurationMs )
+{
+    using playback_frame_range::smokeSecondsFitDurationMs;
+    ASSERT_FALSE( smokeSecondsFitDurationMs( 2147483.648 ) );
+    ASSERT_FALSE( smokeSecondsFitDurationMs( 1e300 ) );
+    ASSERT_FALSE( smokeSecondsFitDurationMs( std::numeric_limits<double>::infinity() ) );
+    ASSERT_FALSE( smokeSecondsFitDurationMs( -std::numeric_limits<double>::infinity() ) );
+    ASSERT_FALSE( smokeSecondsFitDurationMs( std::numeric_limits<double>::quiet_NaN() ) );
+    ASSERT_FALSE( smokeSecondsFitDurationMs( -2147483.649 ) );
+    // controls: --seconds 2 -> durationMs 2000; the largest admitted value rounds to INT_MAX exactly
+    ASSERT_TRUE( smokeSecondsFitDurationMs( 2.0 ) );
+    ASSERT_EQ( 2000, qRound( 2.0 * 1000.0 ) );
+    ASSERT_TRUE( smokeSecondsFitDurationMs( 20.0 ) );
+    ASSERT_EQ( 20000, qRound( 20.0 * 1000.0 ) );
+    ASSERT_TRUE( smokeSecondsFitDurationMs( 2147483.647 ) );
+    ASSERT_EQ( std::numeric_limits<int>::max(), qRound( 2147483.647 * 1000.0 ) );
+    // r1 adversary A2: past 2147483.647 but still rounding to INT_MAX is admitted (and safe)
+    ASSERT_TRUE( smokeSecondsFitDurationMs( 2147483.6474 ) );
+    ASSERT_EQ( std::numeric_limits<int>::max(), qRound( 2147483.6474 * 1000.0 ) );
+}
+
+// r1 adversary A1: the --seconds tokens main.cpp reads, through the same QString::toDouble. Qt reports a decimal overflow
+// (1e309) as ok=false with an infinity, and -inf / -2147483.649 are also <= 0, so the "--seconds must be greater than 0" check
+// would claim them first. Every one of them must be refused as out of range, which needs the range check to run first.
+TEST( PlaybackFrameRangeArgOverflow, SmokeSecondsQtTokensOutOfRange )
+{
+    using playback_frame_range::smokeSecondsFitDurationMs;
+    const char *const outOfRange[] = { "1e309", "-1e309", "-inf", "inf", "nan", "-2147483.649", "2147483.648", " 2147483.648\n" };
+    for( const char *token : outOfRange )
+    {
+        bool ok = true;
+        const double seconds = QString::fromLatin1( token ).toDouble( &ok );
+        ASSERT_FALSE( smokeSecondsFitDurationMs( seconds ) );
+    }
+    const char *const inRange[] = { "2", "20", "0", "abc", "-5" };   // in range: left to the existing checks
+    for( const char *token : inRange )
+    {
+        bool ok = false;
+        const double seconds = QString::fromLatin1( token ).toDouble( &ok );
+        ASSERT_TRUE( smokeSecondsFitDurationMs( seconds ) );
+    }
+}
+
+// r1 adversary A1/A2/A3/A7: main.cpp needs a full GUI build, so its wiring is read as text (as
+// test_gui_smoke_display_select_wiring.cpp does). The range refusal runs after the parse and BEFORE the "> 0" check, so an
+// out-of-range token is refused by its own typed reason (A1); it prints the trimmed token (A7) and the cap it really
+// enforces (A2); and removing the call fails here (A3).
+TEST( PlaybackFrameRangeArgOverflow, MainRefusesSecondsOutOfRangeFirst )
+{
+    const QString path = repo_file_path( QStringLiteral( "platform/qt/main.cpp" ) );
+    ASSERT_FALSE( path.isEmpty() );
+    QFile file( path );
+    ASSERT_TRUE( file.open( QIODevice::ReadOnly | QIODevice::Text ) );
+    const QString source = QTextStream( &file ).readAll();
+    const int parse = source.indexOf( QStringLiteral( "const double seconds = parser.value(secondsOpt).toDouble(&ok);" ) );
+    const int range = source.indexOf( QStringLiteral( "if (!playback_frame_range::smokeSecondsFitDurationMs(seconds))" ) );
+    const int positive = source.indexOf( QStringLiteral( "ERROR: --seconds must be greater than 0." ) );
+    const int convert = source.indexOf( QStringLiteral( "options.durationMs = qRound(seconds * 1000.0);" ) );
+    ASSERT_TRUE( parse >= 0 && range >= 0 && positive >= 0 && convert >= 0 );
+    ASSERT_TRUE( parse < range );
+    ASSERT_TRUE( range < positive );                                   // RED on d9c1e61b: the range check came after
+    ASSERT_TRUE( positive < convert );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "smokeSecondsFitDurationMs(" ) ) );
+    const QString refusal = source.mid( range, source.indexOf( QStringLiteral( "return 2;" ), range ) - range );
+    ASSERT_TRUE( refusal.contains( QStringLiteral( "SECONDS_OUT_OF_RANGE" ) ) );
+    ASSERT_TRUE( refusal.contains( QStringLiteral( "parser.value(secondsOpt).trimmed()" ) ) );       // RED: raw token
+    ASSERT_TRUE( refusal.contains( QStringLiteral( "at most 2147483647" ) ) );                       // RED: 2147483.647
+    ASSERT_FALSE( source.contains( QStringLiteral( "at most 2147483.647" ) ) );
 }

@@ -2373,6 +2373,8 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
             ("platform/qt/MainWindow.cpp", "postEvent"): 1,
             ("platform/qt/FocusPixelMapManager.cpp", "notify"): 3,
             ("platform/qt/SyncDownloadWaiter.h", "notify"): 2,
+            # PLAYER-FULLSCREEN-CONTROL-BAR-1 r3: the CPU bar's wheel re-dispatch to the viewport (a delivered clone).
+            ("platform/qt/FullscreenControlBar.cpp", "sendEvent"): 1,
         })
 
     def test_the_two_pinned_postevent_sites_pass(self) -> None:
@@ -3137,8 +3139,31 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
                 self._mutated(restart, restart + "\n    while( playbackClock.elapsed() < 20000 && ui->actionPlay->isChecked() ) { qApp->processEvents(); }"),
             "the retired wall-clock predicate":
                 self._mutated(restart, restart + "\n    const bool wallClockFloor = playHoldReachedFloor( playbackClock.elapsed() );"),
+            # REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1: the loop's stop decision is measuredPlayLoopShouldStop (its states are
+            # exercised by PlaybackMeasuredLoopExit in test_playback_frame_range.cpp); the call must still see the real state and
+            # the real presented counts, or a pinned capture is back to breaking on a timeline Reached (exit 11).
             "the measured loop ignores an engine that ended early":
-                self._mutated("|| measuredState == playback_frame_range::PlayStopState::EndedEarly\n", "\n"),
+                self._mutated_re(r"measuredPlayLoopShouldStop\(\s*measuredState,",
+                                 "measuredPlayLoopShouldStop( measuredState == playback_frame_range::PlayStopState::EndedEarly "
+                                 "? playback_frame_range::PlayStopState::Continue : measuredState,"),
+            "the measured loop stops on a timeline Reached before the pinned presented count": self._mutated_re(
+                r"m_playbackSmokeTargetPresentedFrames,\s*playback_frame_range::pinnedPresentStopCount\(\s*m_playbackSmokePinnedWindow\s*\),\s*m_playRequiredSourceFrames,\s*ui->actionPlay->isChecked\(\),\s*m_sourceAdvance\.consumed\(\)\s*\)\s*\)\s*\{\s*break;",
+                "0, 0, 0, false, 0 ) ) { break;"),
+            # r8 (the r7 venue run, observed=470 of 480): the loop counts the distinct window frames shown, never raw presents
+            "the measured loop counts raw presents again": self._mutated_re(
+                r"playback_frame_range::pinnedPresentStopCount\(\s*m_playbackSmokePinnedWindow\s*\),\s*m_playRequiredSourceFrames,",
+                "m_playbackSmokePresentedFrames, m_playRequiredSourceFrames,"),
+            # adversary A2/A3 on 7f0f6d58: the loop is told the admitted window and whether Play still runs
+            "the measured loop is no longer told the admitted window": self._mutated_re(
+                r"pinnedPresentStopCount\(\s*m_playbackSmokePinnedWindow\s*\),\s*m_playRequiredSourceFrames,",
+                "pinnedPresentStopCount( m_playbackSmokePinnedWindow ), INT64_MAX,"),
+            "the measured loop is no longer told whether Play still runs": self._mutated_re(
+                r"pinnedPresentStopCount\(\s*m_playbackSmokePinnedWindow\s*\),\s*m_playRequiredSourceFrames,\s*ui->actionPlay->isChecked\(\),",
+                "pinnedPresentStopCount( m_playbackSmokePinnedWindow ), m_playRequiredSourceFrames, true,"),
+            # r3 (Grok G1(b) on ee8f00bc): the loop is told how far the timeline has run, or a stalled present plays on past the window
+            "the measured loop is no longer told how far the timeline has run": self._mutated_re(
+                r"ui->actionPlay->isChecked\(\),\s*m_sourceAdvance\.consumed\(\)\s*\)\s*\)\s*\{\s*break;",
+                "ui->actionPlay->isChecked(), m_playRequiredSourceFrames ) ) { break;"),
             # the engine counts, the gate paces, the stop waits
             "the presented-frames stop no longer waits for the source frames": self._mutated_re(
                 r"\n\s*&& programmaticPlayConsumed\(\)\s*// ENFORCE-3: N presented frames[^\n]*", ""),
@@ -3203,6 +3228,46 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
         problems = scan_app_play_sources(self._mutated(anchor, anchor + "\n        ui->actionPlay->setChecked( false );"))
         self.assertTrue(problems, "the scan did not go red on a resize stop")
         self.assertTrue(any("unreviewed Play stop in MainWindow::resizeEvent" in p for p in problems), problems)
+
+    # PLAYER-FULLSCREEN-CONTROL-BAR-1 r3: the bar's Play button is one reviewed user-input trigger, pinned as the WHOLE
+    # fullscreenBarInput body; the bar reads the play state only through isChecked() (no connect on the action).
+    _BAR_TOGGLE = "case fullscreen_bar::Action::TogglePlay: ui->actionPlay->trigger(); fullscreenBarSyncPlayState(); break;"
+
+    def test_player_fullscreen_control_bar_1_the_bar_input_body_is_pinned(self) -> None:
+        self.assertIn("bool MainWindow::fullscreenBarInput(", PINNED_HELPER_BODIES)
+        self.assertEqual(scan_app_play_sources(self.sources), [])
+
+    def test_player_fullscreen_control_bar_1_a_second_trigger_in_the_bar_input_changes_the_pin(self) -> None:
+        problems = scan_app_play_sources(self._mutated(
+            self._BAR_TOGGLE, self._BAR_TOGGLE.replace("trigger();", "trigger(); ui->actionPlay->trigger();", 1)))
+        self.assertTrue(any("pinned helper body changed" in p and "fullscreenBarInput" in p for p in problems), problems)
+
+    def test_player_fullscreen_control_bar_1_a_trigger_on_another_action_changes_the_pin(self) -> None:
+        problems = scan_app_play_sources(self._mutated(
+            "case fullscreen_bar::Action::PrevFrame: ui->actionPreviousFrame->trigger(); break;",
+            "case fullscreen_bar::Action::PrevFrame: ui->actionPlay->trigger(); break;"))
+        self.assertTrue(any("pinned helper body changed" in p and "fullscreenBarInput" in p for p in problems), problems)
+
+    def test_player_fullscreen_control_bar_1_a_connect_on_the_play_action_is_unreviewed(self) -> None:
+        # The r2 head's feed (hosted CI run 44773031416): a connect on the Play action in the bar's show path.
+        anchor = "m_fullscreenBarFrameFeed = true;"
+        problems = scan_app_play_sources(self._mutated(anchor, "m_fullscreenBarPlayFeed = connect( ui->actionPlay, "
+                                                       "&QAction::toggled, this, [this]( bool ) { fullscreenBarFeed(); } );\n"
+                                                       "        " + anchor))
+        self.assertTrue(any("unreviewed use of the Play action" in p and "&QAction::toggled" in p for p in problems), problems)
+
+    def test_player_fullscreen_control_bar_1_a_second_dispatch_in_the_bar_widget_is_unreviewed(self) -> None:
+        bar = "platform/qt/FullscreenControlBar.cpp"
+        self.assertEqual(PINNED_EVENT_SITES[(bar, "sendEvent")], 1)
+        anchor = "    QCoreApplication::sendEvent( target, &copy );"
+        problems = scan_app_play_sources(self._mutated(anchor, anchor + "\n" + anchor, path=bar))
+        self.assertTrue(any("event dispatch sendEvent in platform/qt/FullscreenControlBar.cpp x2" in p for p in problems),
+                        problems)
+
+    def test_player_fullscreen_control_bar_1_a_trigger_outside_the_pinned_body_is_unreviewed(self) -> None:
+        anchor = "void MainWindow::fullscreenBarSyncPlayState( void )\n{"
+        problems = scan_app_play_sources(self._mutated(anchor, anchor + "\n    ui->actionPlay->trigger();"))
+        self.assertTrue(any("unreviewed use of the Play action" in p for p in problems), problems)
 
     def test_player_toolbar_transport_buttons_1_the_stop_button_is_one_reviewed_user_input_stop(self) -> None:
         # PLAYER-TOOLBAR-TRANSPORT-BUTTONS-1: the Stop button seeks to cut in, then pauses (the closeEvent user-pause form).

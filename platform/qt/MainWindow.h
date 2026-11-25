@@ -76,6 +76,7 @@
 #include "PlaybackConformPolicy.h"
 #include "PlaybackSourceAdvanceTracker.h"
 #include "batch/BatchTypes.h"
+#include "FullscreenControlBarPolicy.h"   // PLAYER-FULLSCREEN-CONTROL-BAR-1 fullscreen_bar members below
 #include <atomic>
 #include <deque>
 #include <functional>
@@ -96,6 +97,7 @@ class QAction;
 class QElapsedTimer;
 class QScreen;
 class QWindow;
+class FullscreenControlBarWidget;
 
 class MainWindow : public QMainWindow
 {
@@ -935,6 +937,23 @@ private:
     QPointF m_viewerIdleLastGlobal;
     bool m_viewerIdleHaveLast = false;
     viewer_idle::PointerWatch m_viewerIdlePointer;
+    // PLAYER-FULLSCREEN-CONTROL-BAR-1: the fullscreen control bar on the idle clock above (no second timer).
+    void viewerIdleApplyShown( bool shown, bool byActivity );
+    bool fullscreenBarShown( void ) const;
+    void fullscreenBarSetShown( bool shown );
+    void fullscreenBarFeed( int frameIndex = -1 );
+    void fullscreenBarSyncPlayState( void );
+    bool fullscreenBarHeld( void ) const;
+    bool fullscreenBarInput( const fullscreen_bar::Layout &layout, QEvent *event, const QPointF &devicePos, bool fromWidget );
+    bool fullscreenBarRouteGpuEvent( QObject *watched, QEvent *event );
+    void fullscreenBarEmitSummary( void );
+    FullscreenControlBarWidget *m_fullscreenBarWidget = nullptr;
+    QMetaObject::Connection m_fullscreenBarSliderFeed;
+    bool m_fullscreenBarFrameFeed = false;   // true only while shown: drawFrameNumberLabel feeds each presented frame
+    fullscreen_bar::InputState m_fullscreenBarInput;
+    QPoint m_fullscreenBarEntryPos;
+    bool m_fullscreenBarSawMove = false;
+    bool m_fullscreenBarSummaryEmitted = false;
     bool m_inOpeningProcess;
     bool m_setSliders;
     int m_timerId;
@@ -1292,6 +1311,9 @@ private:
     int m_playbackSmokeStartQualityMode = 0;
     int m_playbackSmokeStartWorkerThreads = 0;
     int m_playbackSmokePresentedFrames = 0;
+    // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r8: the distinct pinned-window source frames shown, which the pinned capture's
+    // present-path stop, its measured-play loop and its exit-11 check all count (PlaybackFrameRange.h PinnedWindowPresents)
+    playback_frame_range::PinnedWindowPresents m_playbackSmokePinnedWindow;
     int m_playbackSmokeParityMatchCount = 0;
     int m_playbackSmokeTargetPresentedFrames = 0;
     int m_playbackSmokeFirstPresentedFrame = -1;

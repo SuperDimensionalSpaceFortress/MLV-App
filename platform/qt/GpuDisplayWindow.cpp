@@ -10,6 +10,7 @@
 #include "GpuFieldTelemetry.h"
 #include "LookLabelOverlay.h"
 #include "LookLabelPolicy.h"
+#include "FullscreenControlBar.h"
 #include "PlaybackEnvFlags.h"
 #include "PlaybackRouteStagedSlotPolicy.h"
 #include "PreviewPaintTiming.h"
@@ -2268,6 +2269,10 @@ void GpuDisplayWindow::cleanupGLResources()
     delete m_lookLabelTexture;
     m_lookLabelTexture = nullptr;
     m_lookLabelTextureDirty = true;
+    // PLAYER-FULLSCREEN-CONTROL-BAR-1: the bar texture is context-bound too; the next shown paint rasterises it again.
+    delete m_controlBarTexture;
+    m_controlBarTexture = nullptr;
+    m_controlBar.dropRaster();
 
     if ( madeCurrent ) doneCurrent();
 
@@ -2483,6 +2488,9 @@ void GpuDisplayWindow::paintGL()
         }
         if ( !m_loggedPaint )
         { qInfo() << "gpu_window paintGL: no texture/program yet (clearing)."; m_loggedPaint = true; }
+        // PLAYER-FULLSCREEN-CONTROL-BAR-1 (adversary r1 A4): the bar's clicks are routed with or without a frame, so
+        // it is drawn here too; returns at once while hidden.
+        drawControlBar(fbw, fbh);
         return;
     }
 
@@ -2546,6 +2554,7 @@ void GpuDisplayWindow::paintGL()
     // LOOK-FULLSCREEN-PARITY-1: after the frame, before the capture readback below, so a
     // capture holds exactly what the screen shows.
     drawLookLabel(fbw, fbh);
+    drawControlBar(fbw, fbh);   // PLAYER-FULLSCREEN-CONTROL-BAR-1: returns at once while the bar is hidden
 
     // Promote whichever route (QImage upload or GPU-recon texture) most recently
     // supplied pending state into "presented" -- runs for EVERY real paintGL() draw,
@@ -2623,4 +2632,144 @@ void GpuDisplayWindow::paintGL()
             ++rbCounter;
         }
     }
+}
+
+// PLAYER-FULLSCREEN-CONTROL-BAR-1: the fullscreen control bar on the GL path. Hidden costs one bool test per paint:
+// no raster, no upload, no GL state change. Shown: the whole bar is rasterised and uploaded once per size and play
+// state; a changed timecode string re-rasterises only its cell, uploaded into the same texture; the playhead is one
+// scissored rectangle fill. Same orientation and 1:1 device-pixel mapping as the look label.
+void GpuDisplayWindow::drawControlBar(int fbw, int fbh)
+{
+    if ( !m_controlBar.shown() ) return;
+    if ( fbw <= 0 || fbh <= 0 ) return;
+    const fullscreen_bar::Layout layout = fullscreen_bar::layoutFor(QSize(fbw, fbh));
+    if ( layout.bar.isEmpty() ) return;
+    ensureProgram();
+    if ( !m_program ) return;
+
+    const fullscreen_bar::Feed &feed = m_controlBar.feed();
+    fullscreen_bar::Raster need = m_controlBar.rasterFor(layout.bar.size());
+    if ( need == fullscreen_bar::Raster::Timecode && ( !m_controlBarTexture || m_controlBarImage.isNull() ) )
+    {
+        need = fullscreen_bar::Raster::Full;
+    }
+    if ( need == fullscreen_bar::Raster::Full )
+    {
+        m_controlBarImage = renderFullscreenControlBar(layout, feed);
+        m_controlBar.noteRaster(need, layout.bar.size());
+        if ( m_controlBarImage.isNull() ) return;
+        if ( !m_controlBarTexture
+          || m_controlBarTexture->width() != m_controlBarImage.width()
+          || m_controlBarTexture->height() != m_controlBarImage.height() )
+        {
+            delete m_controlBarTexture;
+            m_controlBarTexture = new QOpenGLTexture(QOpenGLTexture::Target2D);
+            m_controlBarTexture->setFormat(QOpenGLTexture::RGBA8_UNorm);
+            m_controlBarTexture->setSize(m_controlBarImage.width(), m_controlBarImage.height());
+            m_controlBarTexture->setMipLevels(1);
+            m_controlBarTexture->allocateStorage(QOpenGLTexture::RGBA, QOpenGLTexture::UInt8);
+            m_controlBarTexture->setWrapMode(QOpenGLTexture::ClampToEdge);
+            m_controlBarTexture->setMinMagFilters(QOpenGLTexture::Nearest, QOpenGLTexture::Nearest);
+        }
+        m_controlBarTexture->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt8, m_controlBarImage.constBits());
+        m_controlBar.noteUpload();
+    }
+    else if ( need == fullscreen_bar::Raster::Timecode )
+    {
+        const QImage cell = renderFullscreenControlBarTimecode(layout, feed.timecode);
+        m_controlBar.noteRaster(need, layout.bar.size());
+        if ( !cell.isNull() )
+        {
+            const QPoint at = layout.timecode.topLeft() - layout.bar.topLeft();
+            // Keep the CPU copy whole too, so a later full upload of it is never stale.
+            for ( int y = 0; y < cell.height(); ++y )
+            {
+                std::memcpy(m_controlBarImage.scanLine(at.y() + y) + at.x() * 4, cell.constScanLine(y),
+                            static_cast<size_t>(cell.width()) * 4);
+            }
+            m_controlBarTexture->bind(0);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, at.x(), at.y(), cell.width(), cell.height(),
+                            GL_RGBA, GL_UNSIGNED_BYTE, cell.constBits());
+            m_controlBarTexture->release();
+            m_controlBar.noteUpload();
+        }
+    }
+    if ( !m_controlBarTexture ) return;
+
+    const QRect rect = layout.bar;
+    const float left = 2.0f * rect.x() / fbw - 1.0f;
+    const float right = 2.0f * (rect.x() + rect.width()) / fbw - 1.0f;
+    const float top = 1.0f - 2.0f * rect.y() / fbh;
+    const float bottom = 1.0f - 2.0f * (rect.y() + rect.height()) / fbh;
+    // Screen-top is texture v=0 (QImage row 0), as for the frame and the look label.
+    const float verts[16] = {
+        left,  top,    0.0f, 0.0f,
+        right, top,    1.0f, 0.0f,
+        left,  bottom, 0.0f, 1.0f,
+        right, bottom, 1.0f, 1.0f,
+    };
+    // Opaque: no blending (paintGL leaves GL_BLEND disabled after the label).
+    m_program->bind();
+    m_controlBarTexture->bind(0);
+    m_program->setUniformValue("frameTexture", 0);
+    const int posLoc = m_program->attributeLocation("position");
+    const int texLoc = m_program->attributeLocation("texCoord");
+    m_program->enableAttributeArray(posLoc);
+    m_program->enableAttributeArray(texLoc);
+    m_program->setAttributeArray(posLoc, GL_FLOAT, verts, 2, 4 * sizeof(float));
+    m_program->setAttributeArray(texLoc, GL_FLOAT, verts + 2, 2, 4 * sizeof(float));
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    m_program->disableAttributeArray(posLoc);
+    m_program->disableAttributeArray(texLoc);
+    m_controlBarTexture->release();
+    m_program->release();
+
+    // The playhead: one rectangle (a scissored clear; GL's origin is bottom-left).
+    const QRect head = fullscreen_bar::playheadRect(layout, feed.frame, feed.totalFrames);
+    if ( !head.isEmpty() )
+    {
+        const QColor c = fullscreenControlBarPlayheadColor();
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(head.x(), fbh - (head.y() + head.height()), head.width(), head.height());
+        glClearColor(static_cast<float>(c.redF()), static_cast<float>(c.greenF()), static_cast<float>(c.blueF()), 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDisable(GL_SCISSOR_TEST);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    }
+}
+
+bool GpuDisplayWindow::setControlBarStateIfActive(bool shown, const fullscreen_bar::Feed &feed, qint64 nowMs)
+{
+    GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
+    if ( !win || QThread::currentThread() != win->thread() ) return false;
+    const bool changedShown = shown ? win->m_controlBar.show(nowMs) : win->m_controlBar.hide(nowMs);
+    const bool changedFeed = win->m_controlBar.noteFeed(feed);   // a no-op while hidden
+    // A show or hide asks for one paint even while playing (adversary r1 pass 3 A1): the next frame's paint may be far
+    // off (a slow decode, a stall), and a show and hide both between two paints would never be seen. A feed-only
+    // change (position, timecode, play state) while playing is drawn by the next frame's paint; paused, one paint.
+    if ( changedShown || ( changedFeed && !feed.playing ) ) win->update();
+    return true;
+}
+
+fullscreen_bar::Layout GpuDisplayWindow::controlBarLayoutIfActive()
+{
+    GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
+    if ( !win ) return fullscreen_bar::Layout();
+    const qreal dpr = win->devicePixelRatio();
+    // The same framebuffer size paintGL() computes.
+    return fullscreen_bar::layoutFor(QSize(static_cast<int>(win->width() * dpr), static_cast<int>(win->height() * dpr)));
+}
+
+void GpuDisplayWindow::controlBarBeginSessionIfActive(qint64 nowMs)
+{
+    GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
+    if ( !win || QThread::currentThread() != win->thread() ) return;
+    win->m_controlBar.beginSession(nowMs);
+}
+
+fullscreen_bar::Counters GpuDisplayWindow::controlBarSessionIfActive(qint64 nowMs)
+{
+    GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
+    return win ? win->m_controlBar.session(nowMs) : fullscreen_bar::Counters();
 }

@@ -34,6 +34,7 @@ import hashlib
 import inspect
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -270,9 +271,54 @@ HFR_NATIVE_S1_LEGS = ("legs/m16-1457-native-fullscreen-s1.json", "legs/m16-1457-
 # HFR-NATIVE-60FPS-FULLRES-1 r30 (merge of master into #420): #420 already ships the pair in HFR_NATIVE_LEGS, so each file is listed once (a duplicate
 # made LineEndingsCannotHideACommittedFileTests unlink the same checked-out file twice).
 SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in HFR_NATIVE_S1_LEGS if rel not in SHIPPED_LEGS))
+# VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1: the mid-play window-toggle twins of the two windowed M16-1457 native cells (generatorArgs.midPlayWindowToggles true ->
+# MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES), keyed to the cell each one twins. They differ from it only in legId, card, that key and the three windowToggles* criteria.
+FSTOGGLE_LEGS = {"legs/m16-1457-native-windowed-s2-fstoggle.json": "legs/m16-1457-native-windowed-s2.json",
+                 "legs/m16-1457-native-windowed-s1-fstoggle.json": "legs/m16-1457-native-windowed-s1.json"}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *FSTOGGLE_LEGS)
 # EXPORT-VENUE-LEG-1: the four export legs (two clips x CDNG lossless / ProRes); test_dual_venue_export_leg pins their shape.
 EXPORT_VENUE_LEGS = tuple(f"legs/m16-{clip}-export-{fmt}.json" for clip in ("1243", "1456") for fmt in ("cdng-lossless", "prores"))
 SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in EXPORT_VENUE_LEGS if rel not in SHIPPED_LEGS))
+# M16-1457-VENUE-BASELINE-DRIFT-1 r3: the thread-cap sweep (worker cap 4 / 8 / 12 / 16, each its own spec; the existing no-cap m16-1457-headroom-unpaced-fullscreen-s1 is the
+# 'auto' arm: the app chooses its own worker count (16 on Bachelor's 20 logical CPUs in the 2026-11-22 r3 run logs, but nothing in the spec pins it), so the 16 arm is explicit too) and the P-core-only arm
+# of the Bachelor baseline-drift bench, keyed to the leg each one copies. Unpaced swap-interval-0 legs, so they carry presentTearingExpectedReason like their source.
+# DriftLegSpecTests pins the shape: only legId, card, generatorArgs.playbackMaxThreads (and, for the P-core arm, the affinity keys and two criteria) differ.
+DRIFT_LEGS = {"legs/m16-1457-drift-t4-unpaced-fullscreen-s1.json": "legs/m16-1457-headroom-unpaced-fullscreen-s1.json",
+              "legs/m16-1457-drift-t8-unpaced-fullscreen-s1.json": "legs/m16-1457-headroom-unpaced-fullscreen-s1.json",
+              "legs/m16-1457-drift-t12-unpaced-fullscreen-s1.json": "legs/m16-1457-headroom-unpaced-fullscreen-s1.json",
+              "legs/m16-1457-drift-t16-unpaced-fullscreen-s1.json": "legs/m16-1457-headroom-unpaced-fullscreen-s1.json",
+              "legs/m16-1457-drift-pcore12-unpaced-fullscreen-s1.json": "legs/m16-1457-headroom-unpaced-fullscreen-s1.json"}
+# r4: the serial-vs-cooling split. A worker cap of 1 (the schema floor) on its own, and the same single worker pinned to ONE physical P-core (its two logical CPUs):
+# the cool one (Core Temp c0 = logical CPUs 0+1, mask 0x00003) and the hot one (Core Temp c2 = logical CPUs 4+5, mask 0x00030). The mapping is Core Temp core k = logical
+# CPUs 2k and 2k+1 (r4 proved it: Core Temp's P12-a per-core load against the helper's per-CPU utilisation, correlation 0.999; the rival orders correlate -0.57 and -0.41).
+DRIFT_T1_LEGS = {"legs/m16-1457-drift-t1-unpaced-fullscreen-s1.json": None,
+                 "legs/m16-1457-drift-t1-cool-unpaced-fullscreen-s1.json": "0x00003",
+                 "legs/m16-1457-drift-t1-hot-unpaced-fullscreen-s1.json": "0x00030"}
+# r4, first sitting: with a 20 s window those three legs are mostly uncountable on the CUDA backend. Its gated pace probe (PlaybackFrameRange.h playSafetyMs / playPaceProjectsPastBudget)
+# gives a Play of W seconds of a 59.94 fps clip a budget of W/0.5 + 15 s for 59.94 x W source frames, so W = 20 needs about 21.9 fps; five of the six cap-1 legs (19.9 plain, 17.9 to 18.4
+# pinned) ended early, PaceTooSlow -> INVALID_SOURCE_FRAMES, exit 14, uncounted (the 22 fps baseline sits 0.1 fps above that floor, and the one cap-1 leg that finished ran 21.912).
+# HFR-10S-1 lets a clip of 50 fps or more play a 10 s window (the schema floor), which needs about 17.3 fps. The w10 family below is the same four legs at playSeconds 10, plus the
+# cap-16 comparison arm at the same window.
+DRIFT_W10_LEGS = {"legs/m16-1457-drift-t1-w10-unpaced-fullscreen-s1.json": None,
+                  "legs/m16-1457-drift-t1-cool-w10-unpaced-fullscreen-s1.json": "0x00003",
+                  "legs/m16-1457-drift-t1-hot-w10-unpaced-fullscreen-s1.json": "0x00030",
+                  "legs/m16-1457-drift-t16-w10-unpaced-fullscreen-s1.json": None}
+# r5 (sol r4 BLOCKER: the cited arms had no opened strip): the visual twin of each w10 arm. Each is its w10 counterpart with only legId changed and the capture opt-out removed
+# (visualCapture / visualCaptureOptOutReason absent = the speed-leg default, on), so the same build keeps the picture the arm produced. A twin's fps is observer-perturbed (the
+# capture tail keeps playing unpaced past the measured window) and never stands in for its untraced speed leg.
+DRIFT_VISUAL_LEGS = {"legs/m16-1457-drift-t1-w10-visual-unpaced-fullscreen-s1.json": None,
+                     "legs/m16-1457-drift-t1-cool-w10-visual-unpaced-fullscreen-s1.json": "0x00003",
+                     "legs/m16-1457-drift-t1-hot-w10-visual-unpaced-fullscreen-s1.json": "0x00030",
+                     "legs/m16-1457-drift-t16-w10-visual-unpaced-fullscreen-s1.json": None}
+DRIFT_LEGS = {**DRIFT_LEGS, **{rel: "legs/m16-1457-headroom-unpaced-fullscreen-s1.json" for rel in (*DRIFT_T1_LEGS, *DRIFT_W10_LEGS, *DRIFT_VISUAL_LEGS)}}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *DRIFT_LEGS)
+# CPU-S1-1457-HEAVY-SPEC-AND-STALE-FIELDS-1: the two cpu-only fullscreen s1 HEAVY legs with Look Assist ON, keyed to the tracked spec each one mirrors (UFI-1 successor C2):
+# the M16-1457 paced cuda s1 HEAVY leg with backend cpu, and the M16-1243 unpaced stage leg with backend cpu (the untracked X7 shape). Each differs from its source only in
+# legId, card, backends and the cpu criteria list; test_the_cpu_s1_heavy_legs_mirror_their_cuda_sources pins that.
+CPU_S1_HEAVY_LEGS = {"legs/m16-1457-native-cpu-fullscreen-s1-heavy.json": "legs/m16-1457-native-fullscreen-s1-heavy.json",
+                     "legs/m16-1243-headroom-stage-cpu-fullscreen-s1.json": "legs/m16-1243-headroom-stage-fullscreen-s1.json"}
+CPU_S1_HEAVY_UNPACED_LEG = "legs/m16-1243-headroom-stage-cpu-fullscreen-s1.json"   # the one unpaced (swap interval 0) leg of the pair: it carries presentTearingExpectedReason
+SHIPPED_LEGS = (*SHIPPED_LEGS, *CPU_S1_HEAVY_LEGS)
 assert len(set(SHIPPED_LEGS)) == len(SHIPPED_LEGS), "a shipped leg is listed twice"
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
@@ -1212,6 +1258,64 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                         "the mapping must sit outside the forceLookAssist branch")
         schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["dueWakeDeliveryPost"]["type"], "boolean")
+
+    def test_the_mid_play_window_toggles_reach_the_apps_env_and_the_summary_only_when_asked(self) -> None:
+        """VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1: -MidPlayWindowToggles adds MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES to the app's env list exactly once
+        and the windowToggles* scalars to the success summary (one region, bracketed); absent, the job is the text it was. The runner maps
+        generatorArgs.midPlayWindowToggles true for any leg (outside the forceLookAssist branch); the schema types it as a boolean."""
+        windowed = ["-DisplayMode", "windowed"]   # adversary A4: the switch needs a windowed job, and -DisplayMode windowed itself edits the template
+        plain = self.generate(GENERATOR, "mpwt-plain.job.ps1", windowed).read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertNotIn("MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES", plain)
+        self.assertNotIn("windowTogglesDriven", plain)
+        job = self.generate(GENERATOR, "mpwt-on.job.ps1", [*windowed, "-MidPlayWindowToggles"])
+        self.assertEqual(self.parse_errors(job), 0)
+        text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
+        line = "    'MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES=fs_on@4000,fs_off@8000,restore@12000,maximize@16000',\n"
+        self.assertEqual(text.count("MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES"), 1)
+        self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, text)
+        for key in ("windowTogglesRequested", "windowTogglesDriven", "windowTogglesKeptPlaying", "windowTogglesAdvanced", "windowToggleEvidenceReason"):
+            self.assertEqual(text.count(f"    {key} = $windowToggleEvidence."), 1, key)
+        self.assertEqual(text.count("Get-AttrCudaWindowToggleEvidence -LogText $rawLog"), 1)
+        opened, closed = "# VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 >>>", "# VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 <<<"
+        self.assertEqual(text.count(opened), 2)
+        self.assertEqual(text.count(closed), 2)
+        stripped = re.sub(r"[ \t]*" + re.escape(opened) + r"\n.*?[ \t]*" + re.escape(closed) + r"\n", "", text.replace(line, ""), flags=re.S)
+        self.assertEqual(stripped, plain, "the switch's env line and its two brackets are the only difference from the plain job")
+        # the evidence reader is embedded only into the job that asks (inside the first bracketed region), so a plain job stays the pinned baseline's bytes
+        self.assertNotIn("Get-AttrCudaWindowToggleEvidence", plain)
+        self.assertEqual(text.count("function Get-AttrCudaWindowToggleEvidence"), 1)
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = ("if ($spec.generatorArgs.PSObject.Properties['midPlayWindowToggles'] -and $spec.generatorArgs.midPlayWindowToggles -is [bool] "
+                   "-and $spec.generatorArgs.midPlayWindowToggles) { $gen['MidPlayWindowToggles'] = $true }")
+        self.assertEqual(runner.count(mapping), 1)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["midPlayWindowToggles"]["type"], "boolean")
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("'dueWakeDeliveryPost', 'midPlayWindowToggles')", module)
+        # adversary A5: the request evidence gates the leg and re-derives in the receipt validator, and is exported
+        self.assertIn("$windowToggleRequestVerdict = Get-DvWindowToggleRequestEvidence -Spec $spec -LogText $ev.logText", module)
+        self.assertIn("Get-DvWindowToggleRequestEvidence", module.split("Export-ModuleMember", 1)[1])
+        self.assertIn("$windowToggleRequestVerdict = Get-DvWindowToggleRequestEvidence -Spec $spec -LogText $runLogText", runner)
+
+    def test_the_mid_play_window_toggles_on_a_fullscreen_generation_are_refused(self) -> None:
+        """Adversary A4 on ead7bbdb: -MidPlayWindowToggles without -DisplayMode windowed (the fullscreen default) throws, so no job clears its own toggles."""
+        out = self.tmp / "mpwt-fullscreen.job.ps1"
+        proc = run_pwsh(self.generator_command(GENERATOR, out, ["-MidPlayWindowToggles"]))
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("DUAL_VENUE_MID_PLAY_WINDOW_TOGGLES_NOT_WINDOWED", proc.stdout + proc.stderr)
+        self.assertFalse(out.exists())
+
+    def test_a_job_template_without_the_env_list_site_refuses_the_mid_play_window_toggles(self) -> None:
+        """The anchor must match exactly once, or the generator throws DUAL_VENUE_MID_PLAY_WINDOW_TOGGLES_ANCHOR_MISSING (never a silent no-env job)."""
+        source = GENERATOR.read_text(encoding="utf-8")
+        anchor = '[regex]"(?<ind>[ \\t]*)\'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1\',(?<nl>\\r?\\n)"'
+        start = source.index("if ($MidPlayWindowToggles) {")
+        arm = source[start:source.index("$wtOpen = ", start)]   # the arm's env-line half: up to where the summary region begins
+        self.assertIn(anchor, arm, "the toggle arm's own anchor, the one the throw below guards")
+        self.assertIn("if ($windowToggleEnvAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_MID_PLAY_WINDOW_TOGGLES_ANCHOR_MISSING", arm)
+        self.assertLess(arm.index("DUAL_VENUE_MID_PLAY_WINDOW_TOGGLES_ANCHOR_MISSING"), arm.index("$windowToggleEnvAnchor.Replace($text"), "the throw comes before the edit")
 
     def test_the_team_partition_reaches_the_apps_env_only_when_asked(self) -> None:
         """CPU-S1-FS-SPIKE-TEAM-PARTITION-1: -ReconOmpThreads r -PrepOmpThreads p add MLVAPP_PLAYBACK_RECON_OMP_THREADS=r and MLVAPP_PLAYBACK_PREP_OMP_THREADS=p
@@ -6262,6 +6366,22 @@ class DisplayMatrixLegSetTests(unittest.TestCase):
         self.assertIn("| 1/2 | 4.00 (4.00-4.00) |", cpu, "one measurement of two runs; the INVALID repeat is counted in 'ran' and shows no numbers")
         self.assertTrue(cpu.endswith("INVALID x1, PASS x1 |"), cpu)
 
+    def test_a_refused_repeat_is_listed_in_the_outcomes_but_not_counted_as_run(self) -> None:
+        """adversary r7 A3: `measured / ran` counts the repeats that ran; a repeat refused for changed spec bytes (row outcome SPEC_CHANGED) did not."""
+        cells = [{"cellId": "cuda-windowed-s1", "backend": "cuda", "displayMode": "windowed", "scaleFactor": 1}]
+        rows = [self.row("cuda-windowed-s1", fps=12.0), self.row("cuda-windowed-s1", outcome="SPEC_CHANGED", fps=None, presentedFps=None, timelineFpsAfterFirstPresent=None, renderWorkMs=None, dualIsoMs=None)]
+        line = self.table(rows, cells).splitlines()[2]
+        self.assertIn("| 1/1 | 12.00 (12.00-12.00) |", line)
+        self.assertTrue(line.endswith("PASS x1, SPEC_CHANGED x1 |"), line)
+
+    def test_an_unreadable_spec_refusal_is_listed_in_the_outcomes_but_not_counted_as_run(self) -> None:
+        """r10 (sol r9 item 1): a repeat refused because its planned spec could not be read at launch (row outcome SPEC_UNREADABLE) did not run either: 0/0, like SPEC_CHANGED."""
+        cells = [{"cellId": "cuda-windowed-s1", "backend": "cuda", "displayMode": "windowed", "scaleFactor": 1}]
+        rows = [self.row("cuda-windowed-s1", outcome="SPEC_UNREADABLE", fps=None, presentedFps=None, timelineFpsAfterFirstPresent=None, renderWorkMs=None, dualIsoMs=None)]
+        line = self.table(rows, cells).splitlines()[2]
+        self.assertIn("| 0/0 |", line)
+        self.assertTrue(line.endswith("SPEC_UNREADABLE x1 |"), line)
+
     def test_the_scale_column_reads_as_resolution_labels_never_bare_factors(self) -> None:
         """SCALE-LABEL-CLARITY-1 r2: requested -> effective renders through the same mapping as the plan line and outcomeDetail (Get-DvScaleLabel); the
         internal receipt fields stay numeric. An unread effective scale ('UNKNOWN') says so; an off-preset factor is 'Custom res (1/N)'."""
@@ -6314,7 +6434,8 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
             self.artifacts = saved
         return f"X:\\stub\\agent\\outbox\\{name}"
 
-    def run_matrix(self, repeats: int, extra: list[str], placements: dict[str, str]):
+    def run_matrix(self, repeats: int, extra: list[str], placements: dict[str, str], dv: Path = DV, native_error_pref: bool = False):
+        """`native_error_pref`: run the script IN a session that has $PSNativeCommandUseErrorActionPreference = $true (a caller's preference the matrix walk inherits)."""
         by_leg = {}
         for cell in (c for c in MATRIX_CELLS if c.startswith("cuda-")):
             _, mode, scale = cell.split("-")
@@ -6325,11 +6446,15 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
         self.stub_cfg.write_text(json.dumps(cfg), encoding="utf-8")
         self.log.write_text("", encoding="utf-8")
         self.gen_log.write_text("", encoding="utf-8")
-        proc = run_pwsh(["-File", str(DV / "Invoke-VenueLeg.ps1"), "-Venue", "ultra-magnus", "-LegSet", "display-matrix", "-Repeats", str(repeats), "-SourceCommit", self.sha,
-                         "-BuildManifestSha256", self.build_sha, "-VenueTablePath", str(self.table), "-ReceiptRoot", str(self.receipts), "-OfflineTestMode",
-                         "-UmRunScript", str(self.um), "-GeneratorScript", str(self.gen), "-WorkDir", str(self.tmp / "work"), "-ConsentPath", str(self.consent),
-                         "-RepoRoot", str(ROOT), "-Actor", "unit-test", *extra], env_extra={"DVE_STUB": str(self.stub_cfg)})
-        return proc
+        script_args = ["-Venue", "ultra-magnus", "-LegSet", "display-matrix", "-Repeats", str(repeats), "-SourceCommit", self.sha,
+                       "-BuildManifestSha256", self.build_sha, "-VenueTablePath", str(self.table), "-ReceiptRoot", str(self.receipts), "-OfflineTestMode",
+                       "-UmRunScript", str(self.um), "-GeneratorScript", str(self.gen), "-WorkDir", str(self.tmp / "work"), "-ConsentPath", str(self.consent),
+                       "-RepoRoot", str(ROOT), "-Actor", "unit-test", *extra]
+        if native_error_pref:
+            quote = lambda a: a if a.startswith("-") else "'" + a.replace("'", "''") + "'"   # a parameter NAME stays bare, every value is a quoted literal
+            return run_pwsh(["-Command", "$PSNativeCommandUseErrorActionPreference = $true; & '" + str(dv / "Invoke-VenueLeg.ps1") + "' " + " ".join(quote(a) for a in script_args)],
+                            env_extra={"DVE_STUB": str(self.stub_cfg)})
+        return run_pwsh(["-File", str(dv / "Invoke-VenueLeg.ps1"), *script_args], env_extra={"DVE_STUB": str(self.stub_cfg)})
 
     def test_a_cuda_matrix_run_interleaves_the_cells_runs_every_leg_and_writes_one_table(self) -> None:
         bad_cell = "cuda-windowed-s2"   # asked for windowed; the app's log says it ran full screen
@@ -6388,6 +6513,134 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
         row = json.loads(out.stdout)
         self.assertIsNone(row["presentedFps"], "a log that does not hash to the receipt is no measurement")
         self.assertIn("does not hash to the receipt", row["note"])
+
+    def run_swapped_matrix(self, source_name: str, native_error_pref: bool = False):
+        """A cuda matrix run in a COPY of the runner tree (the swap must never touch the checked-in specs) whose first leg's generator stub overwrites the spec of plan entry 2
+        (cuda-windowed-s1) with the bytes of the committed spec `source_name`: strictly after planning, before leg 2's child reads its spec. Returns (proc, copy of dv, target path)."""
+        dv = self.mutated_runner([])
+        source = dv / "legs" / source_name
+        target = dv / "legs" / "m16-1243-display-windowed-s1.json"
+        swap = f"Copy-Item -LiteralPath '{source}' -Destination '{target}' -Force\n"
+        anchor = "$cfg = Get-Content -LiteralPath $env:DVE_STUB -Raw | ConvertFrom-Json"
+        self.assertEqual(STUB_GENERATOR.count(anchor), 1)
+        self.gen = self.tmp / "gen-swap-stub.ps1"
+        self.gen.write_text(STUB_GENERATOR.replace(anchor, swap + anchor, 1), encoding="utf-8")
+        proc = self.run_matrix(1, ["-Backend", "cuda"], {}, dv=dv, native_error_pref=native_error_pref)
+        self.assertEqual(target.read_bytes(), source.read_bytes(), "the fixture really swapped the planned spec's bytes")
+        return proc, dv, target
+
+    def assert_swapped_leg_refused(self, proc, receipts_root: Path, summary_rows: int = 6) -> str:
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        legs = [l for l in proc.stdout.splitlines() if l.startswith("DVE_MATRIX_LEG ")]
+        self.assertEqual(len(legs), summary_rows, proc.stdout)
+        swapped = next(l for l in legs if "cell=cuda-windowed-s1 " in l)
+        self.assertIn("outcome=SPEC_CHANGED", swapped, "the leg that read other bytes than the planner judged wrote no receipt and is its own outcome")
+        self.assertIn("receipt=none", swapped)
+        self.assertTrue(any(l.startswith("DVE_MATRIX_SPEC_CHANGED ") and "cell=cuda-windowed-s1" in l for l in proc.stdout.splitlines()), "the refusal is a typed line\n" + proc.stdout)
+        receipts = [json.loads(p.read_text(encoding="utf-8")) for p in receipts_root.rglob("*.json")]
+        self.assertEqual(len(receipts), 5, "the other five legs still ran and wrote their receipts")
+        submitted = [l for l in self.log.read_text(encoding="utf-8").splitlines() if l.strip()]
+        self.assertFalse([l for l in submitted if "windowed-s1" in l], "the swapped leg's job was submitted")
+        text = Path(re.search(r"DVE_MATRIX_SUMMARY=(.+)", proc.stdout).group(1).strip()).read_text(encoding="utf-8")
+        self.assertIn("= 6 leg(s), 5 measured.", text)
+        return text
+
+    def test_a_leg_whose_spec_bytes_change_after_planning_is_refused_and_is_never_counted_as_a_speed_cell(self) -> None:
+        """r7 (sol r6 INV-3): the planner judged one spec and the child re-read the path later with no expected hash, so bytes swapped to a committed visual twin between
+        the plan and the child's read ran in an ordinary speed slot. The plan now carries the sha256 of the bytes it judged and the child is bound to it (-ExpectSpecSha256)."""
+        proc, dv, target = self.run_swapped_matrix("m16-1457-drift-t1-w10-visual-unpaced-fullscreen-s1.json")
+        text = self.assert_swapped_leg_refused(proc, self.receipts)
+        receipts = [json.loads(p.read_text(encoding="utf-8")) for p in self.receipts.rglob("*.json")]
+        self.assertEqual([r["legId"] for r in receipts if "-visual-" in r["legId"]], [], "a visual twin ran in a speed slot")
+        # adversary r7 A3: the refused repeat did not run, so the cell's `measured / ran` is 0/0 and the outcomes column still says what happened
+        refused_row = next(l for l in text.splitlines() if l.startswith("| cuda-windowed-s1 "))
+        self.assertIn("| 0/0 |", refused_row)
+        self.assertTrue(refused_row.endswith("SPEC_CHANGED x1 |"), refused_row)
+
+    def test_the_matrix_walk_survives_a_callers_native_command_error_preference(self) -> None:
+        """adversary r7 A2: a caller that runs the script with $PSNativeCommandUseErrorActionPreference = $true made the child's by-design non-zero refusal exit a terminating
+        error in the parent walk (under its Stop preference): no typed row, no remaining walk, no summary. The walk now owns that preference."""
+        proc, dv, target = self.run_swapped_matrix("m16-1243-display-fullscreen-s1.json", native_error_pref=True)
+        self.assert_swapped_leg_refused(proc, self.receipts)
+
+    def test_a_child_that_merely_quotes_the_refusal_token_is_not_classified_as_a_spec_change(self) -> None:
+        """adversary r7 A1: the walk classified a no-receipt child by the substring DVE_LEG_SPEC_CHANGED anywhere in its output, so a receipt-write failure printing a receipt-root
+        PATH that contains the token read as 'the spec changed after planning'. Only the child's own whole-line DVE_LEG_SPEC_REFUSED record naming the entry's planned hash counts."""
+        self.receipts = self.tmp / "DVE_LEG_SPEC_CHANGED" / "receipts"
+        blocker = self.receipts / "DUAL-VENUE-DISPLAY-MATRIX-1" / "m16-1243-display-fullscreen-s1"
+        blocker.mkdir(parents=True)
+        (blocker / "ultra-magnus").write_text("a file where the receipt directory must go", encoding="utf-8")   # the first leg's receipt write fails
+        proc = self.run_matrix(1, ["-Backend", "cuda"], {})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        legs = [l for l in proc.stdout.splitlines() if l.startswith("DVE_MATRIX_LEG ")]
+        self.assertEqual(len(legs), 6, proc.stdout)
+        first = next(l for l in legs if "cell=cuda-fullscreen-s1 " in l)
+        self.assertIn("outcome=NO_RECEIPT", first, "the leg whose receipt could not be written is no receipt, not a changed spec")
+        self.assertFalse([l for l in proc.stdout.splitlines() if l.startswith("DVE_MATRIX_SPEC_CHANGED ")], proc.stdout)
+        self.assertFalse([l for l in proc.stdout.splitlines() if l.startswith("DVE_MATRIX_SPEC_UNREADABLE ")], proc.stdout)
+
+    def test_a_refusal_record_on_the_childs_stderr_is_not_classified(self) -> None:
+        """r10 (adversary r10 A3): the walk merged the child's stderr into the lines it classified, so a generator that printed `DVE_LEG_SPEC_UNREADABLE planned_sha256=<hash>`
+        (or the REFUSED record) on stderr, after the spec WAS read, made a no-receipt leg read as a prelaunch refusal counting 0/0. Only the child's own STDOUT records count."""
+        planned = hashlib.sha256((DV / "legs" / "m16-1243-display-fullscreen-s1.json").read_bytes()).hexdigest()
+        blocker = self.receipts / "DUAL-VENUE-DISPLAY-MATRIX-1" / "m16-1243-display-fullscreen-s1"
+        blocker.mkdir(parents=True)
+        (blocker / "ultra-magnus").write_text("a file where the receipt directory must go", encoding="utf-8")   # the first leg's receipt write fails
+        anchor = "$cfg = Get-Content -LiteralPath $env:DVE_STUB -Raw | ConvertFrom-Json"
+        spoof = (f"[Console]::Error.WriteLine('DVE_LEG_SPEC_UNREADABLE planned_sha256={planned}')\n"
+                 f"[Console]::Error.WriteLine('DVE_LEG_SPEC_REFUSED planned_sha256={planned} read_sha256={'0' * 64}')\n")
+        self.gen = self.tmp / "gen-stderr-spoof-stub.ps1"
+        self.gen.write_text(STUB_GENERATOR.replace(anchor, spoof + anchor, 1), encoding="utf-8")
+        proc = self.run_matrix(1, ["-Backend", "cuda"], {})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        first = next(l for l in proc.stdout.splitlines() if l.startswith("DVE_MATRIX_LEG ") and "cell=cuda-fullscreen-s1 " in l)
+        self.assertIn("outcome=NO_RECEIPT", first, "a record on stderr is not the child's refusal\n" + proc.stdout)
+        self.assertFalse([l for l in proc.stdout.splitlines() if l.startswith(("DVE_MATRIX_SPEC_UNREADABLE ", "DVE_MATRIX_SPEC_CHANGED "))], proc.stdout)
+
+    def run_unreadable_matrix(self, make_unreadable: str):
+        """A cuda matrix run in a COPY of the runner tree whose first leg's generator stub makes the spec of plan entry 2 (cuda-windowed-s1) unreadable by `make_unreadable`
+        (a PowerShell statement over $t, the spec path): strictly after planning, before leg 2's child reads its spec. Returns (proc, target path)."""
+        dv = self.mutated_runner([])
+        target = dv / "legs" / "m16-1243-display-windowed-s1.json"
+        hook = f"$t = '{target}'\nif (Test-Path -LiteralPath $t -PathType Leaf) {{ {make_unreadable} }}\n"
+        anchor = "$cfg = Get-Content -LiteralPath $env:DVE_STUB -Raw | ConvertFrom-Json"
+        self.assertEqual(STUB_GENERATOR.count(anchor), 1)
+        self.gen = self.tmp / "gen-unreadable-stub.ps1"
+        self.gen.write_text(STUB_GENERATOR.replace(anchor, hook + anchor, 1), encoding="utf-8")
+        proc = self.run_matrix(1, ["-Backend", "cuda"], {}, dv=dv)
+        self.assertFalse(target.is_file(), "the fixture really made the planned spec unreadable")
+        return proc, target
+
+    def assert_unreadable_leg_refused(self, proc) -> None:
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        legs = [l for l in proc.stdout.splitlines() if l.startswith("DVE_MATRIX_LEG ")]
+        self.assertEqual(len(legs), 6, proc.stdout)
+        refused = next(l for l in legs if "cell=cuda-windowed-s1 " in l)
+        self.assertIn("outcome=SPEC_UNREADABLE", refused, "a planned spec the child could not read is a typed prelaunch refusal, not NO_RECEIPT\n" + proc.stdout)
+        self.assertIn("receipt=none", refused)
+        self.assertTrue(any(l.startswith("DVE_MATRIX_SPEC_UNREADABLE ") and "cell=cuda-windowed-s1" in l for l in proc.stdout.splitlines()), "the refusal is a typed line\n" + proc.stdout)
+        self.assertFalse([l for l in proc.stdout.splitlines() if l.startswith("DVE_MATRIX_SPEC_CHANGED ")], proc.stdout)
+        receipts = [json.loads(p.read_text(encoding="utf-8")) for p in self.receipts.rglob("*.json")]
+        self.assertEqual(len(receipts), 5, "the other five legs still ran and wrote their receipts")
+        submitted = [l for l in self.log.read_text(encoding="utf-8").splitlines() if l.strip()]
+        self.assertFalse([l for l in submitted if "windowed-s1" in l], "the unreadable leg's job was submitted")
+        text = Path(re.search(r"DVE_MATRIX_SUMMARY=(.+)", proc.stdout).group(1).strip()).read_text(encoding="utf-8")
+        self.assertIn("= 6 leg(s), 5 measured.", text)
+        row = next(l for l in text.splitlines() if l.startswith("| cuda-windowed-s1 "))
+        self.assertIn("| 0/0 |", row, "the refused repeat never ran (sol r9: it read 0/1)")
+        self.assertTrue(row.endswith("SPEC_UNREADABLE x1 |"), row)
+
+    def test_a_planned_spec_missing_at_child_launch_is_a_typed_prelaunch_refusal_that_counts_no_run(self) -> None:
+        """r10 (sol r9 item 1, its literal): plan cuda-windowed-s1 from its valid spec, then the planned path is absent when the child launches. The child exited at Resolve-Path
+        with no typed record, so the parent read NO_RECEIPT and 0/1 under `measured / ran`. It is now a visible prelaunch refusal (SPEC_UNREADABLE) counting 0/0, the shape of SPEC_CHANGED."""
+        proc, target = self.run_unreadable_matrix("Remove-Item -LiteralPath $t -Force")
+        self.assert_unreadable_leg_refused(proc)
+
+    def test_a_planned_spec_replaced_by_a_directory_is_a_typed_prelaunch_refusal_that_counts_no_run(self) -> None:
+        """r10 (class sibling of sol r9 item 1): the path still resolves but ReadAllBytes throws (a directory now sits there): the same SPEC_UNREADABLE refusal, 0/0."""
+        proc, target = self.run_unreadable_matrix("Remove-Item -LiteralPath $t -Force; New-Item -ItemType Directory -Path $t | Out-Null")
+        self.assertTrue(target.is_dir())
+        self.assert_unreadable_leg_refused(proc)
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -7738,6 +7991,40 @@ class LegSpecSchemaTests(unittest.TestCase):
             with self.assertRaises(self.jsonschema.ValidationError, msg=key):
                 self.jsonschema.validate(bad, self.schema)
 
+    def test_the_cpu_s1_heavy_legs_mirror_their_cuda_sources(self) -> None:
+        """CPU-S1-1457-HEAVY-SPEC-AND-STALE-FIELDS-1: each cpu s1 HEAVY leg is its tracked cuda source with backend cpu, so the cpu arm has per-frame rows at the
+        scale the cuda legs run at (the 1457 cpu arm only existed at scale 2, and the 1243 cpu arm only as the LA-off LIGHT baseline or an untracked one-off).
+        Differences from the source: legId, card, backends and the cpu criteria list (no gpuFramesTotal: a cpu leg has no gpu frames). HEAVY, scale 1,
+        fullscreen and Look Assist ON (cinematic, gated on lookFlavorReported) are pinned here so no edit can quietly make one LIGHT, a different scale,
+        a cuda leg, or Look Assist off."""
+        self.assertEqual(len(CPU_S1_HEAVY_LEGS), 2)
+        for rel, source_rel in CPU_S1_HEAVY_LEGS.items():
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(spec, self.schema)
+            source = json.loads((DV / source_rel).read_text(encoding="utf-8"))
+            self.assertEqual(spec["legId"], Path(rel).stem, rel)
+            self.assertEqual(spec["card"], "CPU-S1-1457-HEAVY-SPEC-AND-STALE-FIELDS-1", rel)
+            self.assertEqual((spec["legType"], spec["backends"], spec["scaleFactor"], spec["displayMode"]), ("speed", ["cpu"], 1, "fullscreen"), rel)
+            self.assertEqual(spec["generatorArgs"]["telemetryArm"], "HEAVY", rel)
+            self.assertIs(spec["generatorArgs"]["forceLookAssist"], True, rel)
+            self.assertEqual(spec["generatorArgs"]["lookFlavor"], "cinematic", rel)
+            self.assertNotIn("disableLookAssist", spec["generatorArgs"], rel)
+            for role in ("acceptance", "supplementary"):
+                self.assertEqual(list(spec["criteria"][role]), ["cpu"], rel)
+                self.assertEqual(spec["criteria"][role]["cpu"], [{"metric": "lookAssistForced", "op": "eq", "value": True},
+                                                                 {"metric": "lookFlavorReported", "op": "eq", "value": "cinematic"}], f"{rel} {role}")
+            # the whole spec is the source's except those fields
+            expected = json.loads(json.dumps(source))
+            expected["legId"], expected["card"], expected["backends"] = spec["legId"], spec["card"], ["cpu"]
+            expected["criteria"] = spec["criteria"]
+            self.assertEqual(spec, expected, rel)
+            self.assertNotIn("gpuFramesTotal", json.dumps(spec["criteria"]), rel)
+            self.assertEqual(source["generatorArgs"]["telemetryArm"], "HEAVY", source_rel)
+            # clip ids only: a spec names a clip by id, never by a file name or a venue path
+            text = (DV / rel).read_text(encoding="utf-8")
+            self.assertNotIn(MLV_EXT, text, rel)
+            self.assertNotIn(":\\", text, rel)
+
     def test_the_lookahead_leg_is_the_owner_shape_pace_leg_at_depth_3(self) -> None:
         """PLAYBACK-BACHELOR-PRESENT-JITTER-1: the lookahead A/B's depth-3 arm differs from the owner-shape pace leg only in its legId and
         generatorArgs.playbackRenderLookaheadFrames."""
@@ -8039,12 +8326,12 @@ class LegSpecSchemaTests(unittest.TestCase):
         """CUDA-HEADROOM-1 r2: an unpaced leg at swap interval 0 presents with SyncInterval 0, so PresentMon reports AllowsTearing=1 (the hub's
         TEARING flag). Every headroom leg says so in presentTearingExpectedReason; no other leg carries it, and the schema refuses it on any leg
         that is not unpaced at swap interval 0, so the exemption can never reach a paced or vsync leg."""
-        for rel in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS):
+        for rel in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS, *DRIFT_LEGS, CPU_S1_HEAVY_UNPACED_LEG):
             spec = json.loads((DV / rel).read_text(encoding="utf-8"))
             self.jsonschema.validate(spec, self.schema)
             self.assertGreaterEqual(len(spec.get("presentTearingExpectedReason", "")), 12, rel)
         for path in sorted((DV / "legs").glob("*.json")):
-            if "legs/" + path.name not in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS):
+            if "legs/" + path.name not in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS, *DRIFT_LEGS, CPU_S1_HEAVY_UNPACED_LEG):
                 self.assertNotIn("presentTearingExpectedReason", json.loads(path.read_text(encoding="utf-8")), path.name)
         leg = json.loads((DV / HEADROOM_LEGS[0]).read_text(encoding="utf-8"))
         paced = {k: v for k, v in leg["generatorArgs"].items() if k != "unpaced"}
@@ -8145,12 +8432,26 @@ class LegSpecSchemaTests(unittest.TestCase):
                 # (VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 added a12 and b1-12-pcore: A and B1 at a worker-thread cap of 12)
                 self.assertRegex(spec["legId"], r"^m16-1243-partition-(a|b1-pcore|b2-pcore-eload|a12|b1-12-pcore)-unpaced-windowed-s1$", path.name)
                 self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
+            elif spec["card"] == "M16-1457-VENUE-BASELINE-DRIFT-1":   # the thread-cap sweep and the P-core arm of the 1457 baseline-drift bench, named by arm
+                self.assertIn("legs/" + path.name, DRIFT_LEGS, path.name)
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1457-drift-(t(1|4|8|12|16)|t1-cool|t1-hot|pcore12|(t1|t1-cool|t1-hot|t16)-w10(-visual)?)-unpaced-fullscreen-s1$", path.name)
+                self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
+                self.assertEqual(spec["generatorArgs"]["swapInterval"], 0, path.name)
             elif spec["card"] == "CUDA-HEADROOM-UTIL-SAMPLER-1":   # the unpaced Cinematic utilisation-sampler leg (Look Assist forced on, the owner shape), named by cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertEqual(spec["legId"], "m16-1243-utilsample-unpaced-windowed-s1", path.name)
                 self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
                 self.assertEqual(spec["generatorArgs"]["swapInterval"], 0, path.name)
                 self.assertIs(spec["generatorArgs"]["utilSample"], True, path.name)
+            elif spec["card"] == "VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1":   # the mid-play window-toggle twins of the windowed M16-1457 native s1/s2 cells
+                self.assertIn("legs/" + path.name, FSTOGGLE_LEGS, path.name)
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1457-native-windowed-s[12]-fstoggle$", path.name)
+                self.assertEqual(spec["displayMode"], "windowed", path.name)
+                self.assertEqual(spec["backends"], ["cuda"], path.name)
+                self.assertIs(spec["generatorArgs"]["midPlayWindowToggles"], True, path.name)
+                self.assertIs(spec["generatorArgs"]["forceLookAssist"], True, path.name)   # Look Assist ON (D4b, the owner shape)
             elif spec["card"] == "CUDA-HEADROOM-24-60-UTIL-FULLSCREEN-SPECS-1":   # the fullscreen s1/s2 utilisation-sampler copies of four tracked legs
                 rel = "legs/" + path.name
                 self.assertIn(rel, UTIL_FULLSCREEN_LEGS, path.name)
@@ -8183,6 +8484,11 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "CPU-S1-RECON-CHAIN-ATTRIBUTION-1":   # the Look Assist on arms of the chain attribution (the classic arm l never reaches this chain)
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-chainattr-(c|p|t12)-fullscreen-s1$", path.name)
+            elif spec["card"] == "CPU-S1-1457-HEAVY-SPEC-AND-STALE-FIELDS-1":   # the cpu fullscreen s1 HEAVY legs, Look Assist ON, named by their mirrored source
+                self.assertIn("legs/" + path.name, CPU_S1_HEAVY_LEGS, path.name)
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-(1457-native-cpu-fullscreen-s1-heavy|1243-headroom-stage-cpu-fullscreen-s1)$", path.name)
+                self.assertEqual(spec["backends"], ["cpu"], path.name)
             elif spec["card"] == "HFR-NATIVE-60FPS-FULLRES-1":   # the Look Assist ON control of the native s1 pair (its -nola twin is classic)
                 self.assert_hfr_native_s1_flavored_leg(spec, path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
@@ -15556,6 +15862,1251 @@ class ReconReleaseDeferredEvidenceTests(unittest.TestCase):
         self.assertEqual((v["counts"]["deferred"], v["counts"]["drained"], v["counts"]["maxDepth"], v["counts"]["outstandingAtStop"]), (412, 412, 2, 0))
 
 
+class MidPlayWindowToggleLegSpecTests(unittest.TestCase):
+    """VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1: the two mid-play window-toggle legs are named generatorArgs.midPlayWindowToggles twins of the windowed
+    M16-1457 native cells; the schema keeps the key off a fullscreen leg, and no other leg sets it."""
+
+    GATES = [{"metric": "windowTogglesDriven", "op": "eq", "value": 4}, {"metric": "windowTogglesKeptPlaying", "op": "eq", "value": 4},
+             {"metric": "windowTogglesAdvanced", "op": "eq", "value": 4},
+             # adversary A2 on ead7bbdb: the requested count and the parser's own reason are gated too, so an anomaly or a fifth toggle never passes
+             {"metric": "windowTogglesRequested", "op": "eq", "value": 4}, {"metric": "windowToggleEvidenceReason", "op": "eq", "value": "ok"}]
+
+    def setUp(self) -> None:
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema is required")
+        self.jsonschema = jsonschema
+        self.schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+
+    def test_each_twin_differs_from_its_cell_only_in_leg_id_card_the_key_and_the_three_gates(self) -> None:
+        self.assertEqual(len(FSTOGGLE_LEGS), 2, "the card's two legs: windowed s2 first, then s1")
+        for rel, cell_rel in FSTOGGLE_LEGS.items():
+            with self.subTest(leg=rel):
+                twin = json.loads((DV / rel).read_text(encoding="utf-8"))
+                cell = json.loads((DV / cell_rel).read_text(encoding="utf-8"))
+                self.jsonschema.validate(twin, self.schema)
+                self.assertNotIn("midPlayWindowToggles", cell["generatorArgs"], cell_rel)
+                self.assertEqual(twin["legId"], cell["legId"] + "-fstoggle")
+                self.assertEqual(twin["card"], "VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1")
+                self.assertIs(twin["generatorArgs"].pop("midPlayWindowToggles"), True)
+                for role in ("acceptance", "supplementary"):
+                    # the cell's three criteria stay, in order, then the three toggle gates
+                    self.assertEqual(twin["criteria"][role]["cuda"], cell["criteria"][role]["cuda"] + self.GATES, role)
+                    twin["criteria"][role]["cuda"] = cell["criteria"][role]["cuda"]
+                self.assertEqual(dict(twin, legId=cell["legId"], card=cell["card"]), cell)
+                self.assertEqual(list(twin), list(cell), "the cell's keys in the cell's order")
+                self.assertTrue(cell["generatorArgs"].get("forceLookAssist"), "Look Assist ON (D4b)")
+                self.assertEqual(cell["generatorArgs"].get("lookFlavor"), "cinematic")
+                self.assertEqual(cell["displayMode"], "windowed")
+
+    def test_no_other_leg_sets_the_key(self) -> None:
+        for path in sorted((DV / "legs").glob("*.json")):
+            if "legs/" + path.name in FSTOGGLE_LEGS:
+                continue
+            with self.subTest(leg=path.name):
+                self.assertNotIn("midPlayWindowToggles", json.loads(path.read_text(encoding="utf-8")).get("generatorArgs") or {})
+
+    def test_the_key_must_be_a_json_boolean(self) -> None:
+        twin = json.loads((DV / next(iter(FSTOGGLE_LEGS))).read_text(encoding="utf-8"))
+        for bad in (0, 1, "1", "true", None):
+            with self.subTest(value=repr(bad)):
+                with self.assertRaises(self.jsonschema.ValidationError):
+                    self.jsonschema.validate(dict(twin, generatorArgs=dict(twin["generatorArgs"], midPlayWindowToggles=bad)), self.schema)
+
+    def test_the_schema_refuses_the_key_on_a_fullscreen_leg_or_one_with_no_display_mode(self) -> None:
+        twin = json.loads((DV / next(iter(FSTOGGLE_LEGS))).read_text(encoding="utf-8"))
+        self.jsonschema.validate(twin, self.schema)
+        with self.assertRaises(self.jsonschema.ValidationError):
+            self.jsonschema.validate(dict(twin, displayMode="fullscreen"), self.schema)
+        absent = {k: v for k, v in twin.items() if k != "displayMode"}
+        with self.assertRaises(self.jsonschema.ValidationError):
+            self.jsonschema.validate(absent, self.schema)
+        # a fullscreen leg that does not set the key is untouched by the rule
+        plain = json.loads((DV / "legs/m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        self.jsonschema.validate(plain, self.schema)
+        # adversary A5 (advisory): an explicit false is no request, so the live validator and the schema agree on it
+        self.jsonschema.validate(dict(plain, generatorArgs=dict(plain["generatorArgs"], midPlayWindowToggles=False)), self.schema)
+
+    def test_the_legs_are_the_card_s_pair_in_the_card_s_order(self) -> None:
+        self.assertEqual(list(FSTOGGLE_LEGS)[0], "legs/m16-1457-native-windowed-s2-fstoggle.json")
+        for rel in FSTOGGLE_LEGS:
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.assertEqual((spec["backends"], spec["displayMode"], spec["playSeconds"]), (["cuda"], "windowed", 25))
+            self.assertNotIn("visualCapture", spec, "visual capture stays at its default (on)")
+
+
+@requires_windows_pwsh
+class WindowToggleEvidenceTests(unittest.TestCase):
+    """Get-AttrCudaWindowToggleEvidence over the raw run log, and the new legs' criteria on the scalars it yields (VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1)."""
+
+    KINDS = ("fs_on", "fs_off", "restore", "maximize")
+    # window size at each toggle's begin and end: maximized 1920x1040 -> fullscreen 1920x1080 -> maximized -> normal 1280x693 -> maximized
+    SIZES = (("1920x1040", "1920x1080"), ("1920x1080", "1920x1040"), ("1920x1040", "1280x693"), ("1280x693", "1920x1040"))
+    # (fullscreen, maximized) at each toggle's begin and end: fs_on enters fullscreen, fs_off leaves it for maximized, restore is normal, maximize is maximized
+    FLAGS = ((((0, 1)), ((1, 0))), (((1, 0)), ((0, 1))), (((0, 1)), ((0, 0))), (((0, 0)), ((0, 1))))
+
+    @classmethod
+    def toggle(cls, i: int, phase: str, *, play: int = 1, pos: int | None = None, serial: int | None = None, window: str | None = None, kind: str | None = None,
+               position: str | None = None) -> str:
+        if phase == "begin":
+            pos = 100 * i + 10 if pos is None else pos
+            serial = 1000 * i + 100 if serial is None else serial
+            window = cls.SIZES[i][0] if window is None else window
+            return (f"gui_smoke.window_toggle phase=begin index={i} kind={kind or cls.KINDS[i]} at_ms={4000 * (i + 1)} elapsed_ms={4000 * (i + 1) + 7} "
+                    f"play_checked={play} position={position or pos} presented_serial={serial} window={window} fullscreen={cls.FLAGS[i][0][0]} maximized={cls.FLAGS[i][0][1]}")
+        pos = 100 * i + 60 if pos is None else pos
+        serial = 1000 * i + 600 if serial is None else serial
+        window = cls.SIZES[i][1] if window is None else window
+        return (f"gui_smoke.window_toggle phase=end index={i} kind={kind or cls.KINDS[i]} elapsed_ms={4000 * (i + 1) + 2007} "
+                f"play_checked={play} position={position or pos} presented_serial={serial} window={window} fullscreen={cls.FLAGS[i][1][0]} maximized={cls.FLAGS[i][1][1]}")
+
+    KEEP = "interaction_trace event=resize.keep_playing width=1920 height=1080 fullscreen=1"
+    # r5: the app's own records with a ` (` inside a quoted value (no location suffix: a venue build writes none, LogLineField.h:86-89)
+    R5_S1_RECORD = ('playback_smoke.gpu_dualiso_recon_scale_summary session=3 reduced_recon_frames=0 full_recon_frames=0 recon_scale_last=0 session_scale=1 '
+                    'session_reason="preview scale 1 (full resolution)" fallback_reason_last="" clip_dims_busy_refusals=0 retained_outstanding=3')
+    R5_CONFORM_RECORD = ('playback_smoke.summary session=3 reason=ok elapsed_ms=25000 presented_frames=599 presented_fps=23.96 frame_telemetry=1 '
+                         'gui_fps_status_text="Playback: 24 fps (59.94 -> 24)" gui_fps_status_value=24 avg_playback_prep_pre_enqueue_ms=0.1')
+    R5_FALLBACK_RECORD = ('playback_smoke.cpu_dualiso_recon_scale_summary session=3 reduced_recon_frames=0 full_recon_frames=0 recon_scale_last=0 avg_fullres_fixes_ms=0 '
+                          'avg_downsample_ms=0 fallback_reason_last="transform (upside down) enabled" notch_frames=0 avg_notch_ms=0')
+
+    @classmethod
+    def log(cls, *, drop_keep: int | None = None, mutate=None, summary: str | None = "gui_smoke.window_toggles requested=4 driven=4 reason=ok", prefix=()) -> str:
+        lines = [*prefix, "playback_smoke.measured_session id=3"]
+        for i in range(4):
+            begin, end = cls.toggle(i, "begin"), cls.toggle(i, "end")
+            if mutate:
+                begin, end = mutate(i, begin, end)
+            lines += [begin, "playback_smoke.frame session=3 n=1"]
+            if i != drop_keep:
+                lines += [cls.KEEP]
+            lines += [end]
+        if summary:
+            lines.append(summary)
+        return "\n".join(lines)
+
+    def run_cases(self, logs: list[str], sessions: list[str] | None = None) -> list[dict]:
+        with tempfile.TemporaryDirectory(prefix="wt-ev-") as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([{"log": log, "session": (sessions[n] if sessions else "3")} for n, log in enumerate(logs)]), encoding="utf-8")
+            script = (f"$ErrorActionPreference = 'Stop'; Import-Module '{ATTR_MODULE}' -Force; Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n"
+                      "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                      "$specs = @('m16-1457-native-windowed-s2-fstoggle', 'm16-1457-native-windowed-s1-fstoggle') | ForEach-Object { [IO.File]::ReadAllText('"
+                      f"{DV}/legs/' + $_ + '.json') | ConvertFrom-Json }}\n"
+                      "@($cases | ForEach-Object {\n"
+                      "  $e = Get-AttrCudaWindowToggleEvidence -LogText ([string]$_.log) -MeasuredSessionId ([string]$_.session)\n"
+                      "  $summary = [ordered]@{ result = 'MEASUREMENT_CAPTURED'; lookAssistForced = $true; gpuFramesTotal = 599; lookFlavorReported = 'cinematic'\n"
+                      "    windowTogglesRequested = $e.requested; windowTogglesDriven = $e.driven; windowTogglesKeptPlaying = $e.keptPlaying; windowTogglesAdvanced = $e.advanced\n"
+                      "    windowToggleEvidenceReason = $e.reason }\n"
+                      "  $metrics = Get-DvVerbatimMetrics -Summary (($summary | ConvertTo-Json -Depth 4) | ConvertFrom-Json) -EvidenceManifest $null\n"
+                      "  $passes = @($specs | ForEach-Object { (Test-DvCriteria -Criteria $_.criteria.acceptance.cuda -Metrics $metrics).pass -and (Test-DvCriteria -Criteria $_.criteria.supplementary.cuda -Metrics $metrics).pass })\n"
+                      "  [ordered]@{ e = $e; passes = $passes }\n"
+                      "}) | ConvertTo-Json -Compress -Depth 6 -AsArray")
+            proc = run_pwsh(["-Command", script], env_extra={"DVE_CASES": str(path)})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_the_toggle_table(self) -> None:
+        ok = self.log()
+        cases = {
+            "all four keep playing and advance": (ok, (4, 4, 4, 4), True),
+            "no keep_playing record between toggle 2's begin and end": (self.log(drop_keep=2), (4, 4, 3, 4), False),
+            "no toggle record at all": ("playback_smoke.measured_session id=3\nplayback_smoke.frame session=3 n=1", (0, 0, 0, 0), False),
+            "an empty log": ("", (0, 0, 0, 0), False),
+            "a duplicate begin of toggle 1 (it counts for nothing, driven included)": (
+                self.log(mutate=lambda i, b, e: (b + "\n" + b if i == 1 else b, e)), (4, 3, 3, 3), False),
+            "a duplicate end of toggle 3": (self.log(mutate=lambda i, b, e: (b, e + "\n" + e if i == 3 else e)), (4, 3, 3, 3), False),
+            "a keep_playing record only BEFORE its toggle's begin": (
+                self.log(drop_keep=0, mutate=lambda i, b, e: (self.KEEP + "\n" + b if i == 0 else b, e)), (4, 4, 3, 4), False),
+            "Play unchecked at the end of toggle 0": (self.log(mutate=lambda i, b, e: (b, self.toggle(0, "end", play=0) if i == 0 else e)), (4, 4, 3, 4), False),
+            "the window did not change size in toggle 2": (
+                self.log(mutate=lambda i, b, e: (b, self.toggle(2, "end", window=self.SIZES[2][0]) if i == 2 else e)), (4, 4, 3, 4), False),
+            "fs_off ends at the size fs_on ended at": (
+                self.log(mutate=lambda i, b, e: (b, self.toggle(1, "end", window=self.SIZES[0][1]) if i == 1 else e)), (4, 4, 3, 4), False),
+            "position did not advance in toggle 3": (
+                self.log(mutate=lambda i, b, e: (b, self.toggle(3, "end", pos=310) if i == 3 else e)), (4, 4, 4, 3), False),
+            "presented_serial did not advance in toggle 0": (
+                self.log(mutate=lambda i, b, e: (b, self.toggle(0, "end", serial=100) if i == 0 else e)), (4, 4, 4, 3), False),
+            "an unparseable position in toggle 1": (
+                self.log(mutate=lambda i, b, e: (self.toggle(1, "begin", position="abc") if i == 1 else b, e)), (4, 3, 3, 3), False),
+            "toggle 2's end logged before its begin": (
+                self.log(mutate=lambda i, b, e: (e, b) if i == 2 else (b, e)), (4, 3, 3, 3), False),
+            "an end of another kind": (self.log(mutate=lambda i, b, e: (b, self.toggle(1, "end", kind="restore") if i == 1 else e)), (4, 3, 3, 3), False),
+            "records of an earlier session before the measured session's (first) marker are not read": (
+                self.log(prefix=(self.toggle(0, "begin"), self.toggle(0, "begin"), "playback_smoke.measured_session id=2")), (4, 4, 4, 4), True),
+            "A1: a log prefix and a location suffix whose path holds position=0 (the suffix is not the record)": (
+                self.log(mutate=lambda i, b, e: ("[2026-11-18T16:00:00.000Z] [INFO] [0x1a2c] " + b + " (C:/build position=0 sandbox/platform/qt/MainWindow.cpp:10901)",
+                                                 "[2026-11-18T16:00:09.000Z] [INFO] [0x1a2c] " + e + " (C:/build position=0 sandbox/platform/qt/MainWindow.cpp:10938)")), (4, 4, 4, 4), True),
+            "A1: a key repeated inside one begin record makes the toggle count for nothing": (
+                self.log(mutate=lambda i, b, e: (b + " position=0" if i == 1 else b, e)), (4, 3, 3, 3), False),
+            "a marker that does not start the record body is no record": (
+                self.log(summary=("echo gui_smoke.window_toggle phase=begin index=0 kind=fs_on at_ms=1 elapsed_ms=1 play_checked=1 position=1 presented_serial=1 window=1x1 "
+                                  "fullscreen=0 maximized=0\ngui_smoke.window_toggles requested=4 driven=4 reason=ok")), (4, 4, 4, 4), True),
+            "A2: a duplicate summary line is an anomaly (the criteria refuse it through the reason)": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=ok\ngui_smoke.window_toggles requested=4 driven=4 reason=ok"), (4, 4, 4, 4), False),
+            "A2: a fifth toggle: requested 5 and an unfinished index 4": (
+                self.log(summary=("gui_smoke.window_toggle phase=begin index=4 kind=restore at_ms=24000 elapsed_ms=24007 play_checked=1 position=510 presented_serial=5100 "
+                                  "window=1920x1040 fullscreen=0 maximized=1\ngui_smoke.window_toggles requested=5 driven=4 reason=incomplete")), (5, 4, 4, 4), False),
+            "A3: fs_off begins and ends at the same size (it never left the fullscreen size either way)": (
+                self.log(mutate=lambda i, b, e: (self.toggle(1, "begin", window="1920x1040") if i == 1 else b, self.toggle(1, "end", window="1920x1040") if i == 1 else e)),
+                (4, 4, 3, 4), False),
+            "A3: fs_off ends at the fullscreen size fs_on ended at, though it began elsewhere": (
+                self.log(mutate=lambda i, b, e: (self.toggle(1, "begin", window="1280x693") if i == 1 else b, self.toggle(1, "end", window="1920x1080") if i == 1 else e)),
+                (4, 4, 3, 4), False),
+            "A2: every kind replaced by restore (a kind outside its index's schedule)": (
+                self.log(mutate=lambda i, b, e: (b.replace(f"kind={self.KINDS[i]}", "kind=restore"), e.replace(f"kind={self.KINDS[i]}", "kind=restore"))), (4, 1, 1, 1), False),
+            "A2: fs_on replaced by an unknown kind": (
+                self.log(mutate=lambda i, b, e: (b.replace("kind=fs_on", "kind=unknown"), e.replace("kind=fs_on", "kind=unknown"))), (4, 3, 3, 3), False),
+            "A2: every fullscreen and maximized flag 0": (
+                self.log(mutate=lambda i, b, e: (b.replace("fullscreen=1", "fullscreen=0").replace("maximized=1", "maximized=0"),
+                                                 e.replace("fullscreen=1", "fullscreen=0").replace("maximized=1", "maximized=0"))), (4, 4, 1, 4), False),
+            "A2: every elapsed_ms 0 (no settle interval)": (
+                self.log(mutate=lambda i, b, e: (re.sub(r"elapsed_ms=\d+", "elapsed_ms=0", b), re.sub(r"elapsed_ms=\d+", "elapsed_ms=0", e))), (4, 4, 0, 4), False),
+            "A3: a summary repeating requested= (the first is not consumed)": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=ok requested=5"), (4, 4, 4, 4), False),
+            "A3: a contradictory summary (driven=0 reason=incomplete)": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=0 reason=incomplete"), (4, 4, 4, 4), False),
+            "A3: no summary at all": (self.log(summary=None), (4, 4, 4, 4), False),
+            "A3: a summary with a reason outside ok / incomplete": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=not_windowed"), (4, 4, 4, 4), False),
+            # r3 (the r2 keys' B1-B3, each case changes ONLY the field under attack)
+            "B1: requested=driven=4 over four healthy toggles, only reason=incomplete (the reason is carried through, never rebuilt into ok)": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=incomplete"), (4, 4, 4, 4), False),
+            "B1: reason=ok but driven short of requested (an ok summary that contradicts itself)": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=3 reason=ok"), (4, 4, 4, 4), False),
+            "B2: an empty duplicate position= on toggle 1's begin record": (
+                self.log(mutate=lambda i, b, e: (b + " position=" if i == 1 else b, e)), (4, 3, 3, 3), False),
+            "B2: an empty duplicate presented_serial= on toggle 2's end record": (
+                self.log(mutate=lambda i, b, e: (b, e + " presented_serial=" if i == 2 else e)), (4, 3, 3, 3), False),
+            "B2: an empty duplicate requested= on the summary": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=ok requested="), (4, 4, 4, 4), False),
+            "B2: an empty duplicate reason= on the summary": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=ok reason="), (4, 4, 4, 4), False),
+            "B3: the summary directly after the measured-session marker, before every toggle record": (
+                self.log(summary=None).replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\ngui_smoke.window_toggles requested=4 driven=4 reason=ok\n", 1),
+                (4, 4, 4, 4), False),
+            "B3: the summary between toggle 2 and toggle 3": (
+                self.log(summary=None).replace(self.toggle(3, "begin"), "gui_smoke.window_toggles requested=4 driven=4 reason=ok\n" + self.toggle(3, "begin"), 1), (4, 4, 4, 4), False),
+            "A5: no measured_session marker and no session id (zero markers is not one session)": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "", 1), (4, 4, 4, 4), False),
+            # r3 adversary pass on 1f00a482 (A1-A5): each case changes ONLY the field under attack
+            "r3-A1: a parenthesised tail on the summary that is no location (`(reason=incomplete)`)": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=ok (reason=incomplete)"), (4, 4, 4, 4), False),
+            "r3-A1: a tail on toggle 1's begin record that is no location": (
+                self.log(mutate=lambda i, b, e: (b + " (position=0)" if i == 1 else b, e)), (4, 3, 3, 3), False),
+            "r3-A1: a keep_playing record whose tail is no location counts for nothing": (
+                self.log(drop_keep=2, mutate=lambda i, b, e: (b + "\n" + self.KEEP + " (not-a-location)" if i == 2 else b, e)), (4, 4, 3, 4), False),
+            "r3-A1: a real location tail on the summary is still cut": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=ok (C:/build x/MainWindow.cpp:10975)"), (4, 4, 4, 4), True),
+            "r3-A2: a fifth toggle record with index= before phase= after the summary": (
+                self.log() + "\ngui_smoke.window_toggle index=4 phase=begin kind=restore at_ms=24000 elapsed_ms=24007 play_checked=1 position=410 presented_serial=4100 "
+                             "window=1920x1040 fullscreen=0 maximized=1", (5, 4, 4, 4), False),
+            "r3-A3: toggle 1's end window with padded zeros (01920x01080) is no changed size": (
+                self.log(mutate=lambda i, b, e: (b, self.toggle(1, "end", window="01920x01080") if i == 1 else e)), (4, 3, 3, 3), False),
+            "r3-A4: a playback_smoke record of another session right after the marker closes the measured window": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.start session=4 position=10\n", 1), (0, 0, 0, 0), False),
+            "r3-A5: position=10 inside a quoted diagnostic value is no field": (
+                self.log(mutate=lambda i, b, e: (b.replace("position=10 ", 'diagnostic="lost position=10 tail" ', 1) if i == 0 else b, e)), (4, 3, 3, 3), False),
+            "r3-A5: a stray bare word on the summary makes it unreadable": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=ok extra"), (4, 4, 4, 4), False),
+            # r3 adversary pass on 90451806 (A1, A2): a keep_playing record is validated like a toggle record; every session= of a playback_smoke record is read
+            "r3-b-A1: every keep_playing record repeats event= (a repeated key makes the record unusable, so it is no keep evidence)": (
+                self.log().replace(self.KEEP, self.KEEP + " event=resize.redraw_stopped"), (4, 4, 0, 4), False),
+            "r3-b-A1: every keep_playing record carries an empty duplicate event=": (
+                self.log().replace(self.KEEP, self.KEEP + " event="), (4, 4, 0, 4), False),
+            "r3-b-A1: every keep_playing record carries a quoted field": (
+                self.log().replace(self.KEEP, self.KEEP + ' diagnostic="x"'), (4, 4, 0, 4), False),
+            "r3-b-A2: `session=4 session=3` after the marker (the later session=3 does not hide session=4)": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.start session=4 session=3\n", 1), (0, 0, 0, 0), False),
+            "r3-b-A2: session=4 with a quoted `session=3` after it": (
+                self.log().replace("playback_smoke.measured_session id=3\n", 'playback_smoke.measured_session id=3\nplayback_smoke.start session=4 diagnostic="lost session=3 tail"\n', 1),
+                (0, 0, 0, 0), False),
+            # r4 adversary pass on 16530f5b (A1): a session boundary record whose cut tail is no location is unreadable, never "the rest of the record"; the keys are read in any case
+            "r4-A1: `playback_smoke.frame session=3 (session=4)` right after the marker (the cut tail may hide a foreign session)": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.frame session=3 (session=4)\n", 1),
+                (0, 0, 0, 0), False),
+            "r4-A1: `playback_smoke.frame session=3 SESSION=4` right after the marker (the key is read in any case)": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.frame session=3 SESSION=4\n", 1),
+                (0, 0, 0, 0), False),
+            "r4-A1: a marker `id=3 (id=4)` is no readable marker of session 3": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3 (id=4)\n", 1), (4, 4, 4, 4), False),
+            # r4 adversary pass on 0b915c19 (A1, A3; A2 is the culture test below): every id= of a marker is read, and a key glued to a non-ASCII letter (the Kelvin sign folds to k under
+            # ignore-case) is still a key
+            "r4b-A1: a marker `id=3 id=4` supplies no clean measured session": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3 id=4\n", 1), (4, 4, 4, 4), False),
+            "r4b-A3: `playback_smoke.frame session=3 <Kelvin sign>session=4` right after the marker closes the window": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.frame session=3 " + chr(0x212A) + "session=4\n", 1),
+                (0, 0, 0, 0), False),
+            # r11 (sol r10 A1): every "later marker" row below now reads (0, 0, 0, 0), not (4, 4, 4, 4): the window starts at the FIRST marker of the session, and a later
+            # unclean marker is an unreadable boundary that closes it there (before r11 the later marker, the LAST one of id 3, restarted the window); still never ok
+            "r4b-A3: a later marker `id=3 <Kelvin sign>id=4` declares two ids (the Kelvin sign is no name character), so it is unreadable and names itself": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3 " + chr(0x212A) + "id=4\n", 1),
+                (0, 0, 0, 0), False),
+            "r4-A1: a boundary record with a REAL location tail is still read and the window stays open": (
+                self.log().replace("playback_smoke.measured_session id=3\n",
+                                   "playback_smoke.measured_session id=3 (C:/b x/MainWindow.cpp:10)\nplayback_smoke.frame session=3 n=1 (C:/b x/MainWindow.cpp:11)\n", 1),
+                (4, 4, 4, 4), True),
+            # r5 (opus/fable key3 r4 B1 on 292d4279): the location suffix is found structurally (the first ` (` OUTSIDE a quoted `key="..."` value, closing `:<digits>)` at the end of the
+            # line), never by the first ` (` of the body. The three record texts below are the app's own (MainWindow.cpp:24849 / :32233-32247 / :31312 / :32217; the first is
+            # smoke-run.log:2697 of lane-HFR-NATIVE-M16-1457-VENUE-EVIDENCE-MINI3-1-r6-20261117T0237Z bfdd7bb0 with its session id 1 -> 3); a venue build writes NO location suffix
+            "r5-B1: the real s1 scale-1 record (session_reason=\"preview scale 1 (full resolution)\", no location suffix) is record content, not a boundary": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\n" + self.R5_S1_RECORD + "\n", 1), (4, 4, 4, 4), True),
+            "r5-B1: the same record behind the log prefix": (
+                self.log().replace("playback_smoke.measured_session id=3\n",
+                                   "[2026-11-17T02:59:54.750Z] [INFO] [0x1fac4] playback_smoke.measured_session id=3\n[2026-11-17T03:00:20.032Z] [INFO] [0x1fac4] " + self.R5_S1_RECORD + "\n", 1),
+                (4, 4, 4, 4), True),
+            "r5-B1: the same record with its real location suffix after the quoted value": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\n" + self.R5_S1_RECORD + " (C:/b x/MainWindow.cpp:24849)\n", 1),
+                (4, 4, 4, 4), True),
+            "r5-B1: a conformed playback_smoke.summary (gui_fps_status_text=\"Playback: 24 fps (59.94 -> 24)\")": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\n" + self.R5_CONFORM_RECORD + "\n", 1), (4, 4, 4, 4), True),
+            "r5-B1: the conformed summary with its real location suffix": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\n" + self.R5_CONFORM_RECORD + " (C:/b x/MainWindow.cpp:31312)\n", 1),
+                (4, 4, 4, 4), True),
+            "r5-B1: a cpu_dualiso summary whose fallback_reason_last=\"...\" value holds ` (`": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\n" + self.R5_FALLBACK_RECORD + "\n", 1), (4, 4, 4, 4), True),
+            "r5-B1: a quoted value with ` (` and a real location suffix of ANOTHER session still closes the window": (
+                self.log().replace("playback_smoke.measured_session id=3\n",
+                                   "playback_smoke.measured_session id=3\n" + self.R5_S1_RECORD.replace("session=3", "session=4") + " (C:/b x/MainWindow.cpp:24849)\n", 1), (0, 0, 0, 0), False),
+            "r5-B1: a quoted value with ` (` followed by a tail that is no location (`(session=4)`) is still an unreadable boundary": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\n" + self.R5_S1_RECORD + " (session=4)\n", 1), (0, 0, 0, 0), False),
+            "r5-B1: a quoted span that holds an `=` and ` (` (`note=\"a (session=4) b\"`) is no quoted value, so its tail is no location": (
+                self.log().replace("playback_smoke.measured_session id=3\n", 'playback_smoke.measured_session id=3\nplayback_smoke.frame session=3 note="a (session=4) b"\n', 1),
+                (0, 0, 0, 0), False),
+            # r5 adversary pass on 732bcb96 (A1, A2): a measured_session record that names another session by session= closes the window too; a toggle begins no earlier than the
+            # previous toggle's end on the producer's one elapsed clock
+            "r5-A1: `playback_smoke.measured_session session=4` right after the marker closes the window": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session session=4\n", 1), (0, 0, 0, 0), False),
+            "r5-A1: a bare `playback_smoke.measured_session` (no id=) right after the marker is an unreadable boundary": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session\n", 1), (0, 0, 0, 0), False),
+            "r5-A1: a marker `id=3 session=4` is no clean marker of session 3": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3 session=4\n", 1), (4, 4, 4, 4), False),
+            "r5-A1: a later marker `id=3 session=4` is no clean marker of session 3 either": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3 session=4\n", 1), (0, 0, 0, 0), False),
+            "r5-A2: toggle 1 begins (elapsed_ms=1) before toggle 0 ended (elapsed_ms=6007) on the one producer clock": (
+                self.log().replace("elapsed_ms=8007", "elapsed_ms=1").replace("elapsed_ms=10007", "elapsed_ms=2001"), (4, 3, 3, 3), False),
+            # r5 adversary pass on 129eb94b (A1): the records are split on the plain space only, so a TAB (or any other character outside printable ASCII) inside a value hid a `key=`
+            # and a bare CR hid a whole record in one line; a counted record holding such a character is unusable, and a bare CR ends a line
+            "r5b-A1: a TAB inside an extra summary value hides `requested=5`": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=ok extra=x\trequested=5"), (4, 4, 4, 4), False),
+            "r5b-A1: a TAB inside an extra begin value hides `position=999`": (
+                self.log(mutate=lambda i, b, e: (b + " extra=x\tposition=999" if i == 0 else b, e)), (4, 3, 3, 3), False),
+            "r5b-A1: a TAB inside an extra keep_playing value hides `event=resize.redraw_stopped`": (
+                self.log().replace(self.KEEP, self.KEEP + " extra=x\tevent=resize.redraw_stopped"), (4, 4, 0, 4), False),
+            "r5b-A1: a bare CR after the summary hides a duplicate begin of toggle 0 in the same physical line": (
+                self.log() + " extra=x\r" + self.toggle(0, "begin"), (4, 3, 3, 3), False),
+            "r5b-A1: a no-break space (U+00A0) inside an extra begin value hides `position=999`": (
+                self.log(mutate=lambda i, b, e: (b + " extra=x" + chr(0xA0) + "position=999" if i == 0 else b, e)), (4, 3, 3, 3), False),
+            # r7 (r6 adversary pass on 1ee5e122, A2): ONE measured_session marker reader. Its tokens are split on any run of spaces or TABs, and a key stated more than once
+            # (id= or any other, any case) is session-boundary-unreadable however it is spaced; a marker spaced other than the app's one plain space is unreadable too
+            "r7-A2: the adversary's later marker `  id=3 id=3` (a doubled space before id=, id stated twice)": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session  id=3 id=3\n", 1), (0, 0, 0, 0), False),
+            "r7-A2: the adversary's later marker with a TAB before id= (`\\tid=3 id=3`)": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session\tid=3 id=3\n", 1), (0, 0, 0, 0), False),
+            "r7-A2: a later marker with id stated twice across a TAB (`id=3\\tid=3`)": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3\tid=3\n", 1), (0, 0, 0, 0), False),
+            "r7-A2: the canonical one-space duplicate `id=3 id=3` (the control the adversary compared with)": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3 id=3\n", 1), (0, 0, 0, 0), False),
+            "r7-A2: a later marker `id=3  ID=3` (the key in another case, a doubled space between)": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3  ID=3\n", 1), (0, 0, 0, 0), False),
+            "r7-A2: a later marker that states another key twice (`id=3 x=1 x=1`)": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3 x=1 x=1\n", 1), (0, 0, 0, 0), False),
+            "r7-A2 sibling :7472/:7478: the ONLY marker spaced with a doubled space (`  id=3`) is no clean marker": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session  id=3\n", 1), (4, 4, 4, 4), False),
+            "r7-A2 sibling :7472/:7478: the ONLY marker spaced with a TAB (`\\tid=3`) is no clean marker": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session\tid=3\n", 1), (4, 4, 4, 4), False),
+            "r7-A2 sibling :7478: the ONLY marker with a doubled-space duplicate (`  id=3 id=3`)": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session  id=3 id=3\n", 1), (4, 4, 4, 4), False),
+            "r7-A2 sibling :7501: a later doubled-space marker of ANOTHER session (`  id=4`) closes the window": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session  id=4\n", 1), (0, 0, 0, 0), False),
+            "r7-A2 sibling :7501: a later TAB-spaced marker that also names session= (`\\tid=3\\tsession=4`) is no clean marker": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session\tid=3\tsession=4\n", 1), (0, 0, 0, 0), False),
+            # r7 adversary pass on be8fb7b6 (A2): a record name ends at ANY non-name character, never only at whitespace; a name not followed by one plain space or the line end
+            # makes its record unusable (a toggle / summary) or an unreadable boundary (a measured_session marker or any playback_smoke record)
+            "r7b-A2: the adversary's appended `gui_smoke.window_toggles: requested=4 driven=0 reason=incomplete` is a second summary": (
+                self.log() + "\ngui_smoke.window_toggles: requested=4 driven=0 reason=incomplete", (4, 4, 4, 4), False),
+            "r7b-A2: the adversary's appended duplicate begin of toggle 0 spelled `gui_smoke.window_toggle: ...`": (
+                self.log() + "\n" + self.toggle(0, "begin").replace("gui_smoke.window_toggle ", "gui_smoke.window_toggle: "), (4, 3, 3, 3), False),
+            "r7b-A2: the adversary's later marker `playback_smoke.measured_session:id=4` closes the window": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session:id=4\n", 1), (0, 0, 0, 0), False),
+            "r7b-A2 sibling :7561: the ONLY summary spelled with a TAB after its name is unreadable": (
+                self.log(summary="gui_smoke.window_toggles\trequested=4 driven=4 reason=ok"), (4, 4, 4, 4), False),
+            "r7b-A2 sibling :7561: a toggle 1 begin spelled `gui_smoke.window_toggle:` counts for nothing": (
+                self.log(mutate=lambda i, b, e: (b.replace("gui_smoke.window_toggle ", "gui_smoke.window_toggle:") if i == 1 else b, e)), (4, 3, 3, 3), False),
+            "r7b-A2 sibling :7524/:7532: `playback_smoke.start:session=4` right after the marker closes the window": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.start:session=4\n", 1), (0, 0, 0, 0), False),
+            "r7b-A2 sibling :7524/:7532: `playback_smoke.frame,session=3` (a comma after the name) is an unreadable boundary": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.frame,session=3\n", 1), (0, 0, 0, 0), False),
+            "r7b-A2 control: a longer record name (`gui_smoke.window_toggles_note x=1`) is another record, not a summary": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=ok\ngui_smoke.window_toggles_note x=1"), (4, 4, 4, 4), True),
+            "r7-A2 control: a log prefix and the app's one-space marker still read clean": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "[2026-11-19T08:00:00.000Z] [INFO] [0x1a2c] playback_smoke.measured_session id=3\n", 1), (4, 4, 4, 4), True),
+            "A4: the measured session is 2 and the toggles belong to session 3 after its marker": (
+                self.log(prefix=("playback_smoke.measured_session id=2", "playback_smoke.summary session=2 source_advanced=600")), (0, 0, 0, 0), False),
+            "two toggles only (the loop exit cut the rest short)": (
+                "\n".join(self.log(summary="gui_smoke.window_toggles requested=4 driven=2 reason=incomplete").split("\n")[:11] +
+                          ["gui_smoke.window_toggles requested=4 driven=2 reason=incomplete"]), (4, 2, 2, 2), False),
+        }
+        sessions = ["2" if name.startswith("A4:") else "" if name.startswith("A5:") else "3" for name in cases]
+        out = self.run_cases([log for log, _, _ in cases.values()], sessions)
+        self.assertEqual(len(out), len(cases))
+        for (name, (log, expected, passes)), got in zip(cases.items(), out, strict=True):
+            with self.subTest(case=name):
+                e = got["e"]
+                self.assertEqual((e["requested"], e["driven"], e["keptPlaying"], e["advanced"]), expected, e)
+                self.assertEqual(got["passes"], [passes, passes], f"{name}: {e}")
+                self.assertEqual(e["reason"] == "ok", passes, e)
+
+    def test_adversary_r4_a2_the_boundary_and_request_readers_do_not_depend_on_the_host_culture(self) -> None:
+        """r4 adversary pass on 0b915c19 (A2): under tr-TR an upper-case I does not fold to i, so an upper-case marker, an upper-case key or an upper-case toggle record was not
+        read and a foreign session (or an inherited toggle) went unseen. The letter i is written as a class in the boundary and request patterns."""
+        marker = "playback_smoke.measured_session id=3\n"
+        logs = {
+            "key SESSION=4": self.log().replace(marker, marker + "playback_smoke.frame session=3 SESSION=4\n", 1),
+            "upper-case marker": self.log().replace(marker, marker + "PLAYBACK_SMOKE.MEASURED_SESSION ID=4\n", 1),
+            "upper-case measured_session with id=4": self.log().replace(marker, marker + "playback_smoke.MEASURED_SESSION id=4\n", 1),
+        }
+        script = ("$ErrorActionPreference = 'Stop'; [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('tr-TR')\n"
+                  f"Import-Module '{ATTR_MODULE}' -Force; Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n"
+                  "$cases = $env:DVE_LOGS | ConvertFrom-Json\n"
+                  "$out = [ordered]@{ culture = [System.Globalization.CultureInfo]::CurrentCulture.Name }\n"
+                  "foreach ($p in $cases.PSObject.Properties) { $e = Get-AttrCudaWindowToggleEvidence -LogText ([string]$p.Value) -MeasuredSessionId '3'; $out[$p.Name] = $e.reason }\n"
+                  "$spec = [pscustomobject]@{ generatorArgs = [pscustomobject]@{} }\n"
+                  "$out['request-blocks'] = (Get-DvWindowToggleRequestEvidence -Spec $spec -LogText 'GUI_SMOKE.WINDOW_TOGGLE phase=begin index=0').blocks\n"
+                  "$out | ConvertTo-Json -Compress")
+        proc, out = run_pwsh_json(script, DVE_LOGS=json.dumps(logs))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out["culture"], "tr-TR")
+        for name in logs:
+            with self.subTest(case=name):
+                self.assertNotEqual(out[name], "ok", f"{name}: a foreign session read as the measured one")
+        self.assertTrue(out["request-blocks"], "an upper-case GUI_SMOKE.WINDOW_TOGGLE record is a toggle record under tr-TR too")
+
+    def test_adversary_r5_a3_a_duplicate_toggle_record_with_an_upper_case_i_is_counted_under_tr_tr(self) -> None:
+        """r5 adversary pass on 732bcb96 (A3): under tr-TR an upper-case I does not fold to i, so `guI_smoke.wIndow_toggle` (a duplicate begin of toggle 0, appended after the summary)
+        was not read as a toggle record: no duplicate, no post-summary record. The three record-name patterns write the letter i as the class [Ii]."""
+        toggle = self.toggle(0, "begin")
+        logs = {
+            "an upper-case I duplicate begin after the summary": self.log() + "\n" + toggle.replace("gui_smoke.window_toggle", "guI_smoke.wIndow_toggle"),
+            "an upper-case I summary after the last toggle (a second summary)": self.log() + "\n" + "guI_smoke.wIndow_toggles requested=4 driven=4 reason=ok",
+        }
+        script = ("$ErrorActionPreference = 'Stop'; [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('tr-TR')\n"
+                  f"Import-Module '{ATTR_MODULE}' -Force\n"
+                  "$cases = $env:DVE_LOGS | ConvertFrom-Json\n"
+                  "$out = [ordered]@{ culture = [System.Globalization.CultureInfo]::CurrentCulture.Name }\n"
+                  "foreach ($p in $cases.PSObject.Properties) { $e = Get-AttrCudaWindowToggleEvidence -LogText ([string]$p.Value) -MeasuredSessionId '3'; $out[$p.Name] = $e.reason }\n"
+                  "$out | ConvertTo-Json -Compress")
+        proc, out = run_pwsh_json(script, DVE_LOGS=json.dumps(logs))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out["culture"], "tr-TR")
+        for name in logs:
+            with self.subTest(case=name):
+                self.assertNotEqual(out[name], "ok", f"{name}: an upper-case I record went unread")
+
+    def test_adversary_a4_the_live_validator_refuses_the_key_on_a_leg_that_is_not_windowed(self) -> None:
+        windowed = json.loads((DV / "legs/m16-1457-native-windowed-s2-fstoggle.json").read_text(encoding="utf-8"))
+        fullscreen = json.loads((DV / "legs/m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        fullscreen["generatorArgs"]["midPlayWindowToggles"] = True
+        no_mode = {k: v for k, v in windowed.items() if k != "displayMode"}
+        for name, spec, refused in (("a windowed leg", windowed, False), ("a fullscreen leg", fullscreen, True), ("no display mode (the fullscreen default)", no_mode, True),
+                                    ("the key false on a fullscreen leg", dict(fullscreen, generatorArgs=dict(fullscreen["generatorArgs"], midPlayWindowToggles=False)), False)):
+            with self.subTest(case=name):
+                proc, out = run_pwsh_json("$s = $env:DVE_SPEC | ConvertFrom-Json\n@{ r = (Get-DvLegSpecShapeRefusal -Spec $s) } | ConvertTo-Json -Compress", DVE_SPEC=json.dumps(spec))
+                self.assertIsNotNone(out, proc.stdout + proc.stderr)
+                if refused:
+                    self.assertIn("midPlayWindowToggles needs displayMode", out["r"] or "")
+                else:
+                    self.assertIsNone(out["r"])
+
+    def test_adversary_a5_a_leg_that_names_no_toggles_is_invalid_when_its_log_shows_them(self) -> None:
+        toggle = self.toggle(0, "begin")
+        summary = "gui_smoke.window_toggles requested=4 driven=4 reason=ok"
+        refusal = "gui_smoke.window_toggles requested=4 driven=0 reason=not_windowed"
+        asks = self.fstoggle_spec()
+        cases = (("an ordinary leg, toggles in its log", {}, toggle, True),
+                 ("an ordinary leg, the summary line only", {}, summary, True),
+                 ("an ordinary leg, the app's not_windowed refusal", {}, refusal, True),
+                 ("an ordinary leg behind a log prefix and a location suffix", {}, "[2026-11-18T16:00:00.000Z] [INFO] [0x1a2c] " + toggle + " (C:/x/MainWindow.cpp:10901)", True),
+                 ("an ordinary leg, a clean log", {}, "playback_smoke.measured_session id=3\nplayback_smoke.frame session=3 n=1", False),
+                 ("an ordinary leg, the marker inside another record's location path", {}, "playback_smoke.frame session=3 n=1 (C:/gui_smoke.window_toggle phase=begin/x.cpp:1)", False),
+                 ("an ordinary leg, a marker that does not start the body", {}, "echo " + toggle, False),
+                 ("a leg that asks, with toggles", asks, toggle + "\n" + summary, False),
+                 ("a leg whose key is false, with toggles", {"generatorArgs": {"midPlayWindowToggles": False}}, toggle, True),
+                 # r7 (r6 adversary pass on 1ee5e122, A1): a bare CR ends a record exactly like LF and CRLF, in the one shared splitter (Get-DvLogRecordBodies)
+                 ("r7-A1: the adversary's input, the toggle summary CR-joined behind a frame record", {}, "playback_smoke.frame session=3 n=1\r" + summary, True),
+                 ("r7-A1 control: the same records LF-joined", {}, "playback_smoke.frame session=3 n=1\n" + summary, True),
+                 ("r7-A1 control: the same records CRLF-joined", {}, "playback_smoke.frame session=3 n=1\r\n" + summary, True),
+                 ("r7-A1: a toggle record CR-joined behind a frame record, behind the log prefix", {},
+                  "[2026-11-19T08:00:00.000Z] [INFO] [0x1a2c] playback_smoke.frame session=3 n=1\r[2026-11-19T08:00:01.000Z] [INFO] [0x1a2c] " + toggle, True),
+                 ("r7-A1: a toggle record CR-joined behind a record whose location suffix holds ` (`", {},
+                  "playback_smoke.frame session=3 n=1 (C:/b x/MainWindow.cpp:1)\r" + toggle, True),
+                 ("r7-A1: a CR-joined toggle record on a leg that asks is judged by its criteria, not here", asks, "playback_smoke.frame session=3 n=1\r" + toggle, False),
+                 # r7 adversary pass on be8fb7b6 (A1): the request reader's record name ends at ANY non-name character or the line end, never only at a literal space
+                 ("r7b-A1: the adversary's summary with a TAB after its name", {}, "gui_smoke.window_toggles\trequested=4 driven=4 reason=ok", True),
+                 ("r7b-A1: the adversary's bare summary name", {}, "gui_smoke.window_toggles", True),
+                 ("r7b-A1: the adversary's TAB input on a leg whose key is false", {"generatorArgs": {"midPlayWindowToggles": False}},
+                  "gui_smoke.window_toggles\trequested=4 driven=4 reason=ok", True),
+                 ("r7b-A1: a toggle record glued to a colon", {}, "gui_smoke.window_toggle: phase=begin index=0", True),
+                 ("r7b-A1: the bare toggle name behind the log prefix", {}, "[2026-11-19T08:00:00.000Z] [INFO] [0x1a2c] gui_smoke.window_toggle", True),
+                 ("r7b-A1 control: a longer record name is another record", {}, "gui_smoke.window_toggles_note x=1", False))
+        proc, out = run_pwsh_evidence_cases("Get-DvWindowToggleRequestEvidence", [(spec, log) for _, spec, log, _ in cases])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, _, blocks), v in zip(cases, out, strict=True):
+            with self.subTest(case=name):
+                self.assertEqual(v["blocks"], blocks, v)
+
+    def test_r7_a1_a_bare_cr_ends_a_record_in_the_one_shared_splitter(self) -> None:
+        """r7 (r6 adversary pass on 1ee5e122, A1, sibling DualVenueRunner.psm1:2936): Get-DvLogRecordBodies split on LF only (`r?`n), so a bare CR left a whole record behind
+        the body before it. A record ends at CRLF, a bare CR or a bare LF, everywhere the runner reads run-log records: the look-assist reader's raw lines (:2517) split by
+        the same rule, index for index. Every gate reaches the toggle request reader through it (Test-DvReceiptValid :5765, Invoke-VenueLeg.ps1:1153)."""
+        proc, out = run_pwsh_json("$t = [string]($env:DVE_LOG | ConvertFrom-Json)\n"
+                                  "$b = & (Get-Module DualVenueRunner) { param([string]$x) Get-DvLogRecordBodies -LogText $x } $t\n"
+                                  "@{ bodies = @($b) } | ConvertTo-Json -Compress",
+                                  DVE_LOG=json.dumps("a session=1\rb session=2\r\nc session=3\nd session=4 (C:/x/y.cpp:1)\re"))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out["bodies"], ["a session=1", "b session=2", "c session=3", "d session=4", "e"])
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertEqual(re.findall(r"\$script:DvLogLineBreak = '([^']*)'", module), [r"\r\n|\r|\n"], "one shared line-break rule")
+        bodies = module.split("function Get-DvLogRecordBodies", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("$LogText -split $script:DvLogLineBreak", bodies)
+        self.assertNotIn('-split "`r?`n"', bodies)
+        self.assertIn("$rawLines = $LogText -split $script:DvLogLineBreak", module)
+        self.assertNotIn('$rawLines = $LogText -split "`r?`n"', module)
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("$windowToggleRequestVerdict = Get-DvWindowToggleRequestEvidence -Spec $spec -LogText $runLogText", runner)
+        self.assertIn("$windowToggleRequestVerdict = Get-DvWindowToggleRequestEvidence -Spec $spec -LogText $ev.logText", module)
+
+    R7_A2_LOG_MARKER = "playback_smoke.measured_session  id=3 id=3"
+
+    def test_r7_a2_the_reconcile_gate_refuses_ok_scalars_over_a_doubled_space_duplicate_marker(self) -> None:
+        """r7 (r6 adversary pass on 1ee5e122, A2, siblings DualVenueRunner.psm1:2066 / :5768 and Invoke-VenueLeg.ps1:1159): the reconcile gate re-derives the scalars with
+        Get-AttrCudaWindowToggleEvidence, so ok scalars over the adversary's log (a later `  id=3 id=3` marker) are not what the log derives and the leg is INVALID."""
+        asks = self.fstoggle_spec()
+        ok = {"windowTogglesRequested": 4, "windowTogglesDriven": 4, "windowTogglesKeptPlaying": 4, "windowTogglesAdvanced": 4, "windowToggleEvidenceReason": "ok"}
+        marker = "playback_smoke.measured_session id=3\n"
+        logs = (("the adversary's doubled space", self.log().replace(marker, marker + self.R7_A2_LOG_MARKER + "\n", 1), "session-boundary-unreadable"),
+                ("a TAB instead of the doubled space", self.log().replace(marker, marker + "playback_smoke.measured_session\tid=3 id=3\n", 1), "session-boundary-unreadable"),
+                # r7 adversary pass on be8fb7b6 (A2, siblings :2066 / :5773 / Invoke-VenueLeg.ps1:1159): a colon-spelled record name is still a record
+                ("a colon-spelled second summary", self.log() + "\ngui_smoke.window_toggles: requested=4 driven=0 reason=incomplete", "duplicate-window-toggles-summary"),
+                ("a colon-spelled later marker of session 4", self.log().replace(marker, marker + "playback_smoke.measured_session:id=4\n", 1), "session-boundary-unreadable"))
+        with tempfile.TemporaryDirectory(prefix="wt-r7-") as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([{"spec": asks, "log": log, "metrics": ok} for _, log, _ in logs]), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                "@($cases | ForEach-Object { $r = Get-DvWindowToggleReconcileEvidence -Spec $_.spec -LogText ([string]$_.log) -Metrics $_.metrics\n"
+                "  [ordered]@{ blocks = $r.blocks; reason = $r.reason; derived = [string]$r.derived.reason } }) | ConvertTo-Json -Compress -Depth 5 -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, why), got in zip(logs, out, strict=True):
+            with self.subTest(case=name):
+                self.assertTrue(got["blocks"], got)
+                self.assertIn(why, got["derived"])
+
+    def test_r7_a2_the_job_embedded_reader_refuses_a_doubled_space_duplicate_marker(self) -> None:
+        """r7 (r6 adversary pass on 1ee5e122, A2, siblings playback-attr-3-cuda-job.ps1:6583 / :6586): the toggle job embeds the reader's source extracted from the module
+        (Get-AttrCudaEmbeddedFunctionSource) and calls it on the raw log; the EMBEDDED copy, defined alone in a fresh scope, refuses the adversary's marker too."""
+        marker = "playback_smoke.measured_session id=3\n"
+        logs = {"doubled": self.log().replace(marker, marker + self.R7_A2_LOG_MARKER + "\n", 1),
+                "tab": self.log().replace(marker, marker + "playback_smoke.measured_session\tid=3 id=3\n", 1),
+                "clean": self.log()}
+        script = ("$ErrorActionPreference = 'Stop'\n"
+                  f"$m = Import-Module '{ATTR_MODULE}' -Force -PassThru -DisableNameChecking\n"
+                  f"$src = & $m {{ Get-AttrCudaEmbeddedFunctionSource -ModulePath '{ATTR_MODULE}' -Name @('Get-AttrCudaWindowToggleEvidence') }}\n"
+                  "Remove-Module $m.Name -Force\n"
+                  "if (Get-Command Get-AttrCudaWindowToggleEvidence -ErrorAction SilentlyContinue) { throw 'the module reader is still loaded' }\n"
+                  ". ([scriptblock]::Create([string]$src))\n"
+                  "$cases = $env:DVE_LOGS | ConvertFrom-Json\n"
+                  "$out = [ordered]@{}\n"
+                  "foreach ($p in $cases.PSObject.Properties) { $out[$p.Name] = (Get-AttrCudaWindowToggleEvidence -LogText ([string]$p.Value) -MeasuredSessionId '3').reason }\n"
+                  "$out | ConvertTo-Json -Compress")
+        proc = run_pwsh(["-Command", script], env_extra={"DVE_LOGS": json.dumps(logs)})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["clean"], "ok", out)
+        for name in ("doubled", "tab"):
+            with self.subTest(case=name):
+                self.assertIn("session-boundary-unreadable", out[name], out)
+
+    # r8 (keys sol / fable / opus key3 r7 B1 on 152845be; catalogue row DC-01b: `<name><U+212A> rest` -> the record is counted, unusable or unreadable, never
+    # skipped): under PowerShell's case-insensitive -match .NET folds U+212A (Kelvin sign) and U+0130 into [A-Za-z0-9_], so a record name glued to one of them
+    # read as a LONGER name and the record was skipped. Every record-name class and terminator is now ASCII matched case-sensitively, (?-i:[A-Za-z0-9_]).
+    R8_FOLDS = (("U+212A", "K"), ("U+0130", "İ"))
+    R8_MARKER = "playback_smoke.measured_session id=3\n"
+
+    def r8_reader_rows(self) -> list[tuple[str, str, str | None, int | None]]:
+        """(site and character, log, anomaly the reason must name or None, driven count or None): one row per reader site per folding character."""
+        rows = []
+        for label, ch in self.R8_FOLDS:
+            rows += [
+                (f"AttrCudaArtifacts summary terminator, {label} (the keys' repro)",
+                 self.log() + f"\ngui_smoke.window_toggles{ch} requested=4 driven=0 reason=incomplete", "duplicate-window-toggles-summary", None),
+                (f"AttrCudaArtifacts toggle terminator, a duplicate begin of toggle 1 named with {label}",
+                 self.log(mutate=lambda i, b, e, ch=ch: (b + "\n" + b.replace("gui_smoke.window_toggle ", f"gui_smoke.window_toggle{ch} ", 1) if i == 1 else b, e)),
+                 None, 3),
+                (f"AttrCudaArtifacts marker terminator, the measured marker itself named with {label}",
+                 self.log().replace(self.R8_MARKER, f"playback_smoke.measured_session{ch} id=3\n", 1), "session-boundary-unreadable", None),
+                (f"AttrCudaArtifacts marker terminator, a later marker of session 4 named with {label} (the keys' repro)",
+                 self.log().replace(self.R8_MARKER, self.R8_MARKER + f"playback_smoke.measured_session{ch} id=4\n", 1), "session-boundary-unreadable", None),
+                (f"AttrCudaArtifacts generic playback name, {label} glued after it",
+                 self.log().replace(self.R8_MARKER, self.R8_MARKER + f"playback_smoke.frame{ch} n=1\n", 1), "session-boundary-unreadable", None),
+                (f"AttrCudaArtifacts generic playback name, {label} at its start (a name that begins with it is a record too)",
+                 self.log().replace(self.R8_MARKER, self.R8_MARKER + f"playback_smoke.{ch}frame session=4\n", 1), "session-boundary-unreadable", None),
+            ]
+        return rows
+
+    def test_r8_b1_a_record_name_glued_to_a_folding_character_is_counted_never_skipped(self) -> None:
+        """r8 (keys r7 B1, sites AttrCudaArtifacts.psm1 marker / generic name / summary / toggle selectors): each row's record is counted, so the reason is not ok,
+        neither shipped leg passes, and the row's own anomaly (or driven count) shows WHICH reader counted it."""
+        rows = self.r8_reader_rows()
+        out = self.run_cases([self.log()] + [log for _, log, _, _ in rows])
+        self.assertEqual(out[0]["e"]["reason"], "ok", out[0])
+        self.assertEqual(out[0]["passes"], [True, True], out[0])
+        for (name, _, why, driven), got in zip(rows, out[1:], strict=True):
+            with self.subTest(case=name):
+                self.assertNotEqual(got["e"]["reason"], "ok", got)
+                self.assertEqual(got["passes"], [False, False], got)
+                if why is not None:
+                    self.assertIn(why, got["e"]["reason"], got)
+                if driven is not None:
+                    self.assertEqual(got["e"]["driven"], driven, got)
+
+    R13_MARKER = "playback_smoke.measured_session id=3\n"
+
+    def test_r13_a1_a_session_declaration_the_app_never_writes_closes_the_window_never_leaves_it_open(self) -> None:
+        """r13 (sol r12 A1 on c69927ab, input: `playback_smoke.start session =4` after the measured marker, which read 4/4/4/4/ok): a playback_smoke record whose tail
+        carries a standalone word `session` that is not the key of a `session=` declaration (a space before the `=`, a colon, the bare word, a quoted key, any case, a
+        TAB), and a `playback_smoke.start` that declares no session at all, are unreadable boundaries: each closes the window and names itself; a healthy log and a record
+        that states `session=3` stay ok. (r14: a name merely containing the word, `session_id=9`, was a good row here; under the r14 whitelist it is an unreadable
+        boundary and moved to test_r14_a1's bad rows.)"""
+        bad = ("playback_smoke.start session =4 position=10", "playback_smoke.start session:4 position=10", "playback_smoke.start session",
+               "playback_smoke.start SESSION =4", "playback_smoke.start position=0 session\t=4", "playback_smoke.pace_summary position=0 session =3",
+               # r13b (sol r12 A1 on c52cc719): a quoted key, a start record that declares no session at all, a second session word the key count does not cover, and a
+               # value `session` (the app writes none; the reader fails closed on it)
+               'playback_smoke.start "session"=4 position=10', "playback_smoke.start", "playback_smoke.start position=10", "playback_smoke.start session=3 session =4",
+               'playback_smoke.pace_summary "session"=3 position=1', "playback_smoke.pace_summary note=session position=1")
+        good = ("playback_smoke.start session=3 position=10", "playback_smoke.pace_summary position=1")
+        logs = [self.log()] + [self.log().replace(self.R13_MARKER, self.R13_MARKER + line + "\n", 1) for line in bad + good]
+        out = self.run_cases(logs)
+        self.assertEqual(out[0]["e"]["reason"], "ok", out[0])
+        for line, got in zip(bad, out[1:1 + len(bad)], strict=True):
+            with self.subTest(case=line):
+                self.assertNotEqual(got["e"]["reason"], "ok", got)
+                self.assertIn("session-boundary-unreadable", got["e"]["reason"], got)
+                self.assertEqual(got["passes"], [False, False], got)
+        for line, got in zip(good, out[1 + len(bad):], strict=True):
+            with self.subTest(case=line):
+                self.assertEqual(got["e"]["reason"], "ok", got)
+                self.assertEqual(got["passes"], [True, True], got)
+
+    def test_r14_a1_a_session_text_outside_the_anchored_grammar_is_an_unreadable_boundary(self) -> None:
+        """r14 (keys opus / sol r13 B1 on 5e0fa99f, input: `playback_smoke.start note=session=3` after the measured marker, which read 4/4/4/4/ok; hub ruling
+        20261120T1007Z: a whitelist, not another lexer): after the measured marker a playback_smoke record that holds the text `session` anywhere (any case, inside
+        any key or value), and every `playback_smoke.start`, is readable ONLY in the runner's anchored grammar (DualVenueRunner.psm1 summary / due-wake readers):
+        the record name, one space, `session=<digits>` as the first key, then a space or the line end, with the word `session` stated once. Anything else closes the
+        window and names session-boundary-unreadable, so neither shipped leg passes; the app's own records stay ok."""
+        bad = ("playback_smoke.start note=session=3", "playback_smoke.start x:session=3", "playback_smoke.start -session=3",
+               "playback_smoke.start Session=3", "playback_smoke.start foo_session=3", 'playback_smoke.start "x"session=3',
+               "playback_smoke.pace_summary session_id=9 position=1", "playback_smoke.frame note=session=3 index=1",
+               "playback_smoke.start session=3 note=session=3", "playback_smoke.start position=10 session=3", "playback_smoke.start session=3=4",
+               "playback_smoke.start session=3x position=10", "PLAYBACK_SMOKE.start session=3", "playback_smoke.start session=3\tposition=10",
+               "playback_smoke.frame index=1 SESSION=3")
+        good = ("playback_smoke.start session=3 position=10", "playback_smoke.start session=3", "playback_smoke.pace_summary position=1",
+                'playback_smoke.gpu_dualiso_recon_scale_summary session=3 session_scale=2 session_reason="preview scale 1 (full resolution)"')
+        logs = [self.log()] + [self.log().replace(self.R13_MARKER, self.R13_MARKER + line + "\n", 1) for line in bad + good]
+        out = self.run_cases(logs)
+        self.assertEqual(out[0]["e"]["reason"], "ok", out[0])
+        for line, got in zip(bad, out[1:1 + len(bad)], strict=True):
+            with self.subTest(case=line):
+                self.assertNotEqual(got["e"]["reason"], "ok", got)
+                self.assertIn("session-boundary-unreadable", got["e"]["reason"], got)
+                self.assertEqual(got["passes"], [False, False], got)
+        for line, got in zip(good, out[1 + len(bad):], strict=True):
+            with self.subTest(case=line):
+                self.assertEqual(got["e"]["reason"], "ok", got)
+                self.assertEqual(got["passes"], [True, True], got)
+
+    def test_r8_b1_the_request_reader_counts_a_toggle_name_glued_to_a_folding_character(self) -> None:
+        """r8 (keys r7 B1, site DualVenueRunner.psm1 Get-DvWindowToggleRequestEvidence): an ordinary leg whose log carries a toggle-named record glued to U+212A or
+        U+0130 blocks (the keys' repro: `gui_smoke.window_toggles<U+212A> requested=4 driven=4 reason=ok` gave mentions=0 blocks=false)."""
+        cases = []
+        for label, ch in self.R8_FOLDS:
+            cases += [(f"the keys' summary repro, {label}", {}, f"gui_smoke.window_toggles{ch} requested=4 driven=4 reason=ok", True),
+                      (f"a toggle record, {label}", {}, f"gui_smoke.window_toggle{ch} phase=begin index=0", True),
+                      (f"a toggle record behind the log prefix, {label}", {"generatorArgs": {"midPlayWindowToggles": False}},
+                       f"[2026-11-19T13:00:00.000Z] [INFO] [0x1a2c] gui_smoke.window_toggle{ch} phase=begin index=0", True)]
+        cases.append(("control: a longer ASCII record name is another record", {}, "gui_smoke.window_toggles_note x=1", False))
+        proc, out = run_pwsh_evidence_cases("Get-DvWindowToggleRequestEvidence", [(spec, log) for _, spec, log, _ in cases])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, _, blocks), v in zip(cases, out, strict=True):
+            with self.subTest(case=name):
+                self.assertEqual(v["blocks"], blocks, v)
+
+    def test_r8_b1_the_reconcile_gate_and_the_job_embedded_reader_refuse_the_folding_spellings(self) -> None:
+        """r8 (keys r7 B1, propagation sites DualVenueRunner.psm1 Get-DvWindowToggleReconcileEvidence, used by Test-DvReceiptValid and Invoke-VenueLeg.ps1, and the
+        job generator's embedded copy, playback-attr-3-cuda-job.ps1): ok scalars over the keys' logs are INVALID, and the embedded reader does not derive ok."""
+        asks = self.fstoggle_spec()
+        ok = {"windowTogglesRequested": 4, "windowTogglesDriven": 4, "windowTogglesKeptPlaying": 4, "windowTogglesAdvanced": 4, "windowToggleEvidenceReason": "ok"}
+        rows = self.r8_reader_rows()
+        with tempfile.TemporaryDirectory(prefix="wt-r8-") as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([{"spec": asks, "log": log, "metrics": ok} for _, log, _, _ in rows]), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                "@($cases | ForEach-Object { $r = Get-DvWindowToggleReconcileEvidence -Spec $_.spec -LogText ([string]$_.log) -Metrics $_.metrics\n"
+                "  [ordered]@{ blocks = $r.blocks; derived = [string]$r.derived.reason } }) | ConvertTo-Json -Compress -Depth 5 -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, _, _), got in zip(rows, out, strict=True):
+            with self.subTest(gate="reconcile", case=name):
+                self.assertTrue(got["blocks"], got)
+                self.assertNotEqual(got["derived"], "ok", got)
+        logs = {"clean": self.log(), **{f"row{n}": log for n, (_, log, _, _) in enumerate(rows)}}
+        script = ("$ErrorActionPreference = 'Stop'\n"
+                  f"$m = Import-Module '{ATTR_MODULE}' -Force -PassThru -DisableNameChecking\n"
+                  f"$src = & $m {{ Get-AttrCudaEmbeddedFunctionSource -ModulePath '{ATTR_MODULE}' -Name @('Get-AttrCudaWindowToggleEvidence') }}\n"
+                  "Remove-Module $m.Name -Force\n"
+                  "if (Get-Command Get-AttrCudaWindowToggleEvidence -ErrorAction SilentlyContinue) { throw 'the module reader is still loaded' }\n"
+                  ". ([scriptblock]::Create([string]$src))\n"
+                  "$cases = $env:DVE_LOGS | ConvertFrom-Json\n"
+                  "$out = [ordered]@{}\n"
+                  "foreach ($p in $cases.PSObject.Properties) { $out[$p.Name] = (Get-AttrCudaWindowToggleEvidence -LogText ([string]$p.Value) -MeasuredSessionId '3').reason }\n"
+                  "$out | ConvertTo-Json -Compress")
+        proc = run_pwsh(["-Command", script], env_extra={"DVE_LOGS": json.dumps(logs)})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        embedded = json.loads(proc.stdout)
+        self.assertEqual(embedded["clean"], "ok", embedded)
+        for n, (name, _, _, _) in enumerate(rows):
+            with self.subTest(gate="embedded job reader", case=name):
+                self.assertNotEqual(embedded[f"row{n}"], "ok", embedded)
+
+    def test_r8_b1_every_record_name_class_of_the_toggle_readers_is_case_sensitive_ascii(self) -> None:
+        """r8 (keys r7 B1, the CLASS): the toggle reader holds ONE name-character definition, (?-i:[A-Za-z0-9_]) (its own copy: the job embeds its source), and no
+        bare [A-Za-z0-9_] is left as a record-name class or terminator inside a -match; the request reader uses the module's $script:DvNameChar."""
+        attr = ATTR_MODULE.read_text(encoding="utf-8")
+        reader = attr.split("function Get-AttrCudaWindowToggleEvidence", 1)[1].split("\nfunction ", 1)[0]
+        self.assertEqual(reader.count("$nameChar = '(?-i:[A-Za-z0-9_])'"), 1)
+        for bare in ("(?![A-Za-z0-9_])", "(?<![A-Za-z0-9_])", "\\.[A-Za-z0-9_]+"):
+            with self.subTest(reader="Get-AttrCudaWindowToggleEvidence", bare=bare):
+                self.assertNotIn(bare, reader)
+        for use in ("ndow_toggles(?!' + $nameChar + ')", "ndow_toggle(?!' + $nameChar + ')", "measured_sess[Ii]on(?!' + $nameChar + ')",
+                    "'^playback_smoke\\.' + $nameChar + '+( |$)'"):
+            with self.subTest(reader="Get-AttrCudaWindowToggleEvidence", use=use):
+                self.assertIn(use, reader)
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        request = module.split("function Get-DvWindowToggleRequestEvidence", 1)[1].split("\nfunction ", 1)[0]
+        self.assertNotIn("(?![A-Za-z0-9_])", request)
+        self.assertIn("ndow_toggles?(?!' + $script:DvNameChar + ')", request)
+        self.assertEqual(re.findall(r"\$script:DvNameChar = '([^']*)'", module), ["(?-i:[A-Za-z0-9_])"])
+
+    # r10 (r9 adversary A1 on 373dcb57, schedule adherence): the reader never read at_ms, so the r9 repro below (only the elapsed_ms pairs changed) read 4/4/4/4/ok and
+    # passed both fstoggle legs. Each helper call changes ONLY the field under attack.
+    @staticmethod
+    def r10_at(b: str, e: str, *, begin_ms: int | None = None, end_ms: int | None = None, at_ms: str | None = None, end_extra: str = "") -> tuple[str, str]:
+        if begin_ms is not None:
+            b = re.sub(r"elapsed_ms=\d+", f"elapsed_ms={begin_ms}", b)
+        if end_ms is not None:
+            e = re.sub(r"elapsed_ms=\d+", f"elapsed_ms={end_ms}", e)
+        if at_ms is not None:
+            # at_ms is the whole replacement text of ` at_ms=<n>` (an empty string drops the field)
+            b = re.sub(r" at_ms=\d+", lambda _m: at_ms, b)
+        return b, e + end_extra
+
+    def r10_rows(self) -> list[tuple[str, str, str, tuple[int, int, int, int]]]:
+        at = self.r10_at
+        return [
+            ("the r9 repro: begin/end elapsed_ms (0,2000),(2000,4000),(4000,6000),(6000,8000) under at_ms 4000/8000/12000/16000",
+             self.log(mutate=lambda i, b, e: at(b, e, begin_ms=2000 * i, end_ms=2000 * i + 2000)), "toggle-0:began-before-at-ms", (4, 4, 0, 4)),
+            ("toggle 2 begins 1 ms before its at_ms (elapsed_ms=11999, at_ms=12000)",
+             self.log(mutate=lambda i, b, e: at(b, e, begin_ms=11999, end_ms=14006) if i == 2 else (b, e)), "toggle-2:began-before-at-ms", (4, 4, 3, 4)),
+            ("toggle 0 states at_ms=4001, off the job's schedule, and begins after it",
+             self.log(mutate=lambda i, b, e: at(b, e, at_ms=" at_ms=4001") if i == 0 else (b, e)), "toggle-0:off-schedule-at-ms", (4, 4, 3, 4)),
+            ("every at_ms restated as the r9 repro's early times (0/2000/4000/6000) with matching elapsed_ms: self-consistent, not the hook's schedule",
+             self.log(mutate=lambda i, b, e: at(b, e, begin_ms=2000 * i, end_ms=2000 * i + 2000, at_ms=f" at_ms={2000 * i}")), "toggle-3:off-schedule-at-ms", (4, 4, 0, 4)),
+            ("toggle 1's at_ms with a leading zero (08000)",
+             self.log(mutate=lambda i, b, e: at(b, e, at_ms=" at_ms=08000") if i == 1 else (b, e)), "toggle-1:unparseable-record", (4, 3, 3, 3)),
+            ("toggle 1's at_ms with a sign (+8000)",
+             self.log(mutate=lambda i, b, e: at(b, e, at_ms=" at_ms=+8000") if i == 1 else (b, e)), "toggle-1:unparseable-record", (4, 3, 3, 3)),
+            ("toggle 1's at_ms empty",
+             self.log(mutate=lambda i, b, e: at(b, e, at_ms=" at_ms=") if i == 1 else (b, e)), "toggle-1:unparseable-record", (4, 3, 3, 3)),
+            ("toggle 1's begin with no at_ms at all",
+             self.log(mutate=lambda i, b, e: at(b, e, at_ms="") if i == 1 else (b, e)), "toggle-1:unparseable-record", (4, 3, 3, 3)),
+            ("toggle 1's at_ms of ten digits (the app's grammar allows at most 9)",
+             self.log(mutate=lambda i, b, e: at(b, e, at_ms=" at_ms=1000000000") if i == 1 else (b, e)), "toggle-1:unparseable-record", (4, 3, 3, 3)),
+            ("toggle 2's at_ms written as a decimal fraction (12000.0)",
+             self.log(mutate=lambda i, b, e: at(b, e, at_ms=" at_ms=12000.0") if i == 2 else (b, e)), "toggle-2:unparseable-record", (4, 3, 3, 3)),
+            ("toggle 1's at_ms stated twice",
+             self.log(mutate=lambda i, b, e: (b + " at_ms=8000", e) if i == 1 else (b, e)), "toggle-1:unparseable-record", (4, 3, 3, 3)),
+            ("toggle 3's END record carries an at_ms (the app writes it on the begin record only)",
+             self.log(mutate=lambda i, b, e: at(b, e, end_extra=" at_ms=16000") if i == 3 else (b, e)), "toggle-3:unparseable-record", (4, 3, 3, 3)),
+        ]
+
+    def r10_controls(self) -> list[tuple[str, str]]:
+        at = self.r10_at
+        return [
+            ("every toggle begins exactly at its at_ms", self.log(mutate=lambda i, b, e: at(b, e, begin_ms=4000 * (i + 1), end_ms=4000 * (i + 1) + 2000))),
+            ("toggle 3 begins 1500 ms after its at_ms (an overdue toggle begins late, never early)",
+             self.log(mutate=lambda i, b, e: at(b, e, begin_ms=17500, end_ms=19500) if i == 3 else (b, e))),
+        ]
+
+    def test_r10_a1_a_toggle_that_begins_before_or_off_its_scheduled_at_ms_is_not_kept(self) -> None:
+        """r10 (r9 adversary A1, site AttrCudaArtifacts.psm1 Get-AttrCudaWindowToggleEvidence): a toggle is kept only when its begin's at_ms is the job's schedule for
+        its index and its begin elapsed_ms is no earlier than it; a begin record needs one canonical decimal at_ms= and an end record carries none."""
+        rows = self.r10_rows()
+        controls = self.r10_controls()
+        out = self.run_cases([self.log()] + [log for _, log in controls] + [log for _, log, _, _ in rows])
+        self.assertEqual(out[0]["e"]["reason"], "ok", out[0])
+        self.assertEqual(out[0]["passes"], [True, True], out[0])
+        for (name, _), got in zip(controls, out[1:1 + len(controls)], strict=True):
+            with self.subTest(control=name):
+                self.assertEqual(got["e"]["reason"], "ok", got)
+                self.assertEqual(got["passes"], [True, True], got)
+        for (name, _, why, counts), got in zip(rows, out[1 + len(controls):], strict=True):
+            with self.subTest(case=name):
+                e = got["e"]
+                self.assertEqual((e["requested"], e["driven"], e["keptPlaying"], e["advanced"]), counts, got)
+                self.assertIn(why, e["reason"], got)
+                self.assertEqual(got["passes"], [False, False], got)
+
+    def test_r10_a1_the_reconcile_gate_and_the_job_embedded_reader_refuse_an_off_schedule_toggle(self) -> None:
+        """r10 (r9 adversary A1, siblings DualVenueRunner.psm1 Get-DvWindowToggleReconcileEvidence (used by Test-DvReceiptValid and Invoke-VenueLeg.ps1) and the job
+        generator's embedded copy, playback-attr-3-cuda-job.ps1): ok scalars over every r10 row are INVALID, and the embedded reader does not derive ok."""
+        asks = self.fstoggle_spec()
+        ok = {"windowTogglesRequested": 4, "windowTogglesDriven": 4, "windowTogglesKeptPlaying": 4, "windowTogglesAdvanced": 4, "windowToggleEvidenceReason": "ok"}
+        rows = self.r10_rows()
+        with tempfile.TemporaryDirectory(prefix="wt-r10-") as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([{"spec": asks, "log": log, "metrics": ok} for _, log, _, _ in rows]), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                "@($cases | ForEach-Object { $r = Get-DvWindowToggleReconcileEvidence -Spec $_.spec -LogText ([string]$_.log) -Metrics $_.metrics\n"
+                "  [ordered]@{ blocks = $r.blocks; derived = [string]$r.derived.reason } }) | ConvertTo-Json -Compress -Depth 5 -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, why, _), got in zip(rows, out, strict=True):
+            with self.subTest(gate="reconcile", case=name):
+                self.assertTrue(got["blocks"], got)
+                self.assertIn(why, got["derived"], got)
+        logs = {"clean": self.log(), **{f"row{n}": log for n, (_, log, _, _) in enumerate(rows)}}
+        script = ("$ErrorActionPreference = 'Stop'\n"
+                  f"$m = Import-Module '{ATTR_MODULE}' -Force -PassThru -DisableNameChecking\n"
+                  f"$src = & $m {{ Get-AttrCudaEmbeddedFunctionSource -ModulePath '{ATTR_MODULE}' -Name @('Get-AttrCudaWindowToggleEvidence') }}\n"
+                  "Remove-Module $m.Name -Force\n"
+                  "if (Get-Command Get-AttrCudaWindowToggleEvidence -ErrorAction SilentlyContinue) { throw 'the module reader is still loaded' }\n"
+                  ". ([scriptblock]::Create([string]$src))\n"
+                  "$cases = $env:DVE_LOGS | ConvertFrom-Json\n"
+                  "$out = [ordered]@{}\n"
+                  "foreach ($p in $cases.PSObject.Properties) { $out[$p.Name] = (Get-AttrCudaWindowToggleEvidence -LogText ([string]$p.Value) -MeasuredSessionId '3').reason }\n"
+                  "$out | ConvertTo-Json -Compress")
+        proc = run_pwsh(["-Command", script], env_extra={"DVE_LOGS": json.dumps(logs)})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        embedded = json.loads(proc.stdout)
+        self.assertEqual(embedded["clean"], "ok", embedded)
+        for n, (name, _, why, _) in enumerate(rows):
+            with self.subTest(gate="embedded job reader", case=name):
+                self.assertIn(why, embedded[f"row{n}"], embedded)
+        # every consumer reaches the ONE reader: the receipt validator and the leg writer through the reconcile gate, the job through the embedded source
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        reconcile = module.split("function Get-DvWindowToggleReconcileEvidence", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("Get-AttrCudaWindowToggleEvidence -LogText", reconcile)
+        validator = module.split("function Test-DvReceiptValid", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("Get-DvWindowToggleReconcileEvidence -Spec $spec -LogText $ev.logText -Metrics $metrics", validator)
+        leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("Get-DvWindowToggleReconcileEvidence -Spec $spec -LogText $runLogText -Metrics $receipt.metrics", leg)
+        job = (ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8")
+        self.assertIn("-Name @('Get-AttrCudaWindowToggleEvidence')", job)
+
+    def test_r10_a1_the_readers_schedule_is_the_jobs_and_the_hook_writes_at_ms_on_the_begin_record_only(self) -> None:
+        """r10 (r9 adversary A1, the CLASS): the schedule the reader holds (kinds and at_ms per index) is taken from the code, never restated: it equals the job's one
+        MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES value, and the hook (MainWindow.cpp stepWindowToggles) begins a toggle only once its clock reaches at_ms and writes
+        at_ms on the begin record, not the end record."""
+        job = (ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8")
+        values = re.findall(r"MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES=([^'\s]+)'", job)
+        self.assertEqual(len(values), 1, values)
+        schedule = [entry.split("@") for entry in values[0].split(",")]
+        attr = ATTR_MODULE.read_text(encoding="utf-8")
+        reader = attr.split("function Get-AttrCudaWindowToggleEvidence", 1)[1].split("\nfunction ", 1)[0]
+        kinds = re.findall(r"\$expectedKinds = @\(([^)]*)\)", reader)
+        ats = re.findall(r"\$expectedAtMs = @\(([^)]*)\)", reader)
+        self.assertEqual(len(kinds), 1, kinds)
+        self.assertEqual(len(ats), 1, ats)
+        self.assertEqual([k.strip().strip("'") for k in kinds[0].split(",")], [k for k, _ in schedule])
+        self.assertEqual([int(a) for a in ats[0].split(",")], [int(a) for _, a in schedule])
+        self.assertEqual([k for k, _ in schedule], list(self.KINDS))
+        self.assertEqual([int(a) for _, a in schedule], [4000 * (i + 1) for i in range(4)])
+        self.assertIn("'^(?:0|[1-9][0-9]{0,8})$'", reader)
+        self.assertIn("off-schedule-at-ms", reader)
+        self.assertIn("began-before-at-ms", reader)
+        main = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8", errors="replace")
+        self.assertIn("if( toggleNowMs < toggle.atMs ) return;", main)
+        self.assertIn('"gui_smoke.window_toggle phase=begin index=%1 kind=%2 at_ms=%3 elapsed_ms=%4 %5"', main)
+        self.assertIn('"gui_smoke.window_toggle phase=end index=%1 kind=%2 elapsed_ms=%3 %4"', main)
+        header = (ROOT / "platform" / "qt" / "SmokeWindowToggleSchedule.h").read_text(encoding="utf-8")
+        self.assertIn("if( msText.empty() || msText.size() > 9 ) return detail::reject( \"bad_ms\" );", header)
+
+    R11_MARKER = "playback_smoke.measured_session id=3\n"
+
+    @staticmethod
+    def fstoggle_spec() -> dict:
+        """r11 (r11 adversary A1): a requested leg is the committed s1 fstoggle spec, whose criteria bind the five scalars (Get-DvWindowToggleCriteriaGap)."""
+        return json.loads((DV / "legs" / "m16-1457-native-windowed-s1-fstoggle.json").read_text(encoding="utf-8"))
+
+    def test_r11_adv_a1_a_requested_leg_whose_criteria_do_not_bind_the_toggle_scalars_is_invalid(self) -> None:
+        """r11 (r11 adversary A1 on b82002ec, site DualVenueRunner.psm1 Get-DvWindowToggleReconcileEvidence; siblings Invoke-VenueLeg.ps1:1159 and Test-DvReceiptValid,
+        which both call it): an honest non-ok proof is failed only by the criteria, so a requested leg whose criteria drop any of the five bindings is INVALID."""
+        full = self.fstoggle_spec()
+        def without(metric: str) -> dict:
+            spec = json.loads(json.dumps(full))
+            for set_name in ("acceptance", "supplementary"):
+                for role, rows in spec["criteria"][set_name].items():
+                    spec["criteria"][set_name][role] = [r for r in rows if r.get("metric") != metric]
+            return spec
+        incomplete = self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=incomplete")
+        repeated = self.log().replace("\ngui_smoke.window_toggles ", "\n" + self.R11_MARKER + "gui_smoke.window_toggles ", 1)
+        no_accept = json.loads(json.dumps(full))
+        del no_accept["criteria"]["acceptance"]
+        # r11b (r11 adversary A1 on 7d6aea0a): an empty supplementary set, and both sets keyed by a backend the spec does not name
+        empty_supp = json.loads(json.dumps(full))
+        empty_supp["criteria"]["supplementary"] = {}
+        cpu_keyed = json.loads(json.dumps(full))
+        for set_name in ("acceptance", "supplementary"):
+            cpu_keyed["criteria"][set_name] = {"cpu": cpu_keyed["criteria"][set_name]["cuda"]}
+        cases = [
+            ("r11b adversary input 1: criteria.supplementary = {}", empty_supp, incomplete, True),
+            ("r11b adversary input 2: both sets keyed cpu while backends = [cuda]", cpu_keyed, incomplete, True),
+            ("adversary input 1: windowToggleEvidenceReason removed, an honest reason=incomplete", without("windowToggleEvidenceReason"), incomplete, True),
+            ("adversary input 2: windowToggleEvidenceReason removed, a repeated measured_session marker", without("windowToggleEvidenceReason"), repeated, True),
+            ("windowTogglesKeptPlaying removed", without("windowTogglesKeptPlaying"), incomplete, True),
+            ("criteria.acceptance absent", no_accept, incomplete, True),
+            ("control: the committed spec over an honest reason=incomplete (a FAIL by the criteria, not INVALID)", full, incomplete, False),
+            ("control: the committed spec over a healthy log", full, self.log(), False),
+        ]
+        with tempfile.TemporaryDirectory(prefix="wt-r11adv-") as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([{"spec": spec, "log": log} for _, spec, log, _ in cases]), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                f"Import-Module '{ATTR_MODULE}' -Force\n"
+                "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                "@($cases | ForEach-Object {\n"
+                "  $e = Get-AttrCudaWindowToggleEvidence -LogText ([string]$_.log) -MeasuredSessionId '3'\n"
+                "  $m = [pscustomobject]@{ windowTogglesRequested = $e.requested; windowTogglesDriven = $e.driven; windowTogglesKeptPlaying = $e.keptPlaying; windowTogglesAdvanced = $e.advanced; windowToggleEvidenceReason = $e.reason }\n"
+                "  $r = Get-DvWindowToggleReconcileEvidence -Spec $_.spec -LogText ([string]$_.log) -Metrics $m\n"
+                "  [ordered]@{ blocks = $r.blocks; reason = [string]$r.reason }\n"
+                "}) | ConvertTo-Json -Compress -Depth 5 -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, _, blocks), got in zip(cases, out, strict=True):
+            with self.subTest(case=name):
+                self.assertEqual(got["blocks"], blocks, got)
+                if blocks:
+                    self.assertIn("WINDOW_TOGGLES_CRITERIA_UNBOUND", got["reason"], got)
+
+    def r12_multi_backend_cases(self) -> list[tuple[str, dict, str | None]]:
+        """r12 (sol r11 B1 on d3b176e3): (name, spec, the typed gap text expected, or None for no gap). Sol's repro: the committed s1 fstoggle spec with its cuda
+        criteria rows copied to cpu in BOTH sets, in both backend orders; then the same spec with one selected backend's array removed or its binding dropped."""
+        full = self.fstoggle_spec()
+        def multi(order: list[str], drop: tuple[str, str] | None = None, unbind: tuple[str, str] | None = None) -> dict:
+            spec = json.loads(json.dumps(full))
+            spec["backends"] = list(order)
+            for set_name in ("acceptance", "supplementary"):
+                cuda_rows = spec["criteria"][set_name]["cuda"]
+                spec["criteria"][set_name]["cpu"] = json.loads(json.dumps(cuda_rows))
+            if drop is not None:
+                del spec["criteria"][drop[0]][drop[1]]
+            if unbind is not None:
+                rows = spec["criteria"][unbind[0]][unbind[1]]
+                spec["criteria"][unbind[0]][unbind[1]] = [r for r in rows if r.get("metric") != "windowToggleEvidenceReason"]
+            return spec
+        return [
+            ("sol r11 B1 repro: backends [cpu, cuda], complete bindings in both sets -> no criteria gap", multi(["cpu", "cuda"]), None),
+            ("sol r11 B1 repro: backends [cuda, cpu], complete bindings in both sets -> no criteria gap", multi(["cuda", "cpu"]), None),
+            ("control: the committed single-cuda spec -> no criteria gap", full, None),
+            ("backends [cpu, cuda] with criteria.supplementary.cpu removed -> refusal naming cpu", multi(["cpu", "cuda"], drop=("supplementary", "cpu")),
+             "criteria.supplementary has no cpu array"),
+            ("backends [cuda, cpu] with criteria.acceptance.cuda removed -> refusal naming cuda", multi(["cuda", "cpu"], drop=("acceptance", "cuda")),
+             "criteria.acceptance has no cuda array"),
+            ("backends [cpu, cuda] with criteria.acceptance.cpu not binding windowToggleEvidenceReason -> refusal", multi(["cpu", "cuda"], unbind=("acceptance", "cpu")),
+             "criteria.acceptance.cpu does not bind windowToggleEvidenceReason eq ok"),
+            # r12 adversary A1 on 3f7bf31b (its input: the committed spec with backends [null, "cuda"], both complete cuda arrays kept): a null entry is refused, never
+            # skipped (the leg's default backend is the FIRST entry, Invoke-VenueLeg.ps1, so a skipped null admitted a leg that fails late)
+            ("r12 adversary A1: backends [null, cuda] -> refusal", dict(full, backends=[None, "cuda"]), "backends holds an entry that is not a backend name (null)"),
+            ("backends [cuda, null] -> refusal", dict(full, backends=["cuda", None]), "backends holds an entry that is not a backend name (null)"),
+            ("backends [\"\", cuda] -> refusal", dict(full, backends=["", "cuda"]), "backends holds an entry that is not a backend name (\"\")"),
+            ("backends [7, cuda] -> refusal", dict(full, backends=[7, "cuda"]), "backends holds an entry that is not a backend name (7)"),
+        ]
+
+    def test_r12_sol_b1_a_multi_backend_spec_is_judged_per_backend_never_as_one_joined_name(self) -> None:
+        """r12 (sol r11 B1 on d3b176e3, site DualVenueRunner.psm1 Get-DvWindowToggleCriteriaGap; reached by Get-DvWindowToggleReconcileEvidence, which the leg writer
+        Invoke-VenueLeg.ps1 and Test-DvReceiptValid both call): Get-DvProp hands the backends array over as ONE pipeline object, and a [string] cast of it joined
+        ["cpu","cuda"] into 'cpu cuda'. The guard iterates the backend values: complete multi-backend bindings in either order are no gap, and a missing or unbound
+        selected-backend array is still the typed refusal."""
+        cases = self.r12_multi_backend_cases()
+        with tempfile.TemporaryDirectory(prefix="wt-r12b1-") as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([{"spec": spec, "log": self.log()} for _, spec, _ in cases]), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                f"Import-Module '{ATTR_MODULE}' -Force\n"
+                "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                "@($cases | ForEach-Object {\n"
+                "  $e = Get-AttrCudaWindowToggleEvidence -LogText ([string]$_.log) -MeasuredSessionId '3'\n"
+                "  $m = [pscustomobject]@{ windowTogglesRequested = $e.requested; windowTogglesDriven = $e.driven; windowTogglesKeptPlaying = $e.keptPlaying; windowTogglesAdvanced = $e.advanced; windowToggleEvidenceReason = $e.reason }\n"
+                "  $r = Get-DvWindowToggleReconcileEvidence -Spec $_.spec -LogText ([string]$_.log) -Metrics $m\n"
+                "  [ordered]@{ blocks = $r.blocks; reason = [string]$r.reason }\n"
+                "}) | ConvertTo-Json -Compress -Depth 5 -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, gap), got in zip(cases, out, strict=True):
+            with self.subTest(gate="reconcile", case=name):
+                if gap is None:
+                    self.assertFalse(got["blocks"], got)
+                    self.assertNotIn("cpu cuda", got["reason"], got)
+                    self.assertNotIn("cuda cpu", got["reason"], got)
+                else:
+                    self.assertTrue(got["blocks"], got)
+                    self.assertIn("WINDOW_TOGGLES_CRITERIA_UNBOUND", got["reason"], got)
+                    self.assertIn(gap, got["reason"], got)
+
+    def test_r14_adv_a1_a_binding_value_the_evaluator_cannot_match_is_unbound_never_a_late_fail(self) -> None:
+        """r14 (r14 adversary A1 on 1376a142, input: the committed s1 fstoggle spec with windowTogglesDriven's value 4 -> [4] in acceptance.cuda and
+        supplementary.cuda, over a healthy log): Get-DvWindowToggleCriteriaGap read the value through a [string] cast, so [4] read '4' and the spec was admitted,
+        while Test-DvCriteria compares the RAW value (4 -eq @(4) is false) and failed a healthy capture late. A binding counts only when its value is the JSON
+        scalar the evaluator matches: a number for the four counts (as DualVenueRunner.psm1's framesExported binding reads it), a string for the reason. Every
+        non-scalar spelling is the typed WINDOW_TOGGLES_CRITERIA_UNBOUND refusal; a spec the guard admits passes Test-DvCriteria on a healthy log in both sets."""
+        full = self.fstoggle_spec()
+        def with_value(metric: str, value: object, sets: tuple[str, ...] = ("acceptance", "supplementary")) -> dict:
+            spec = json.loads(json.dumps(full))
+            for set_name in sets:
+                for row in spec["criteria"][set_name]["cuda"]:
+                    if row.get("metric") == metric:
+                        row["value"] = value
+            return spec
+        counts = ("windowTogglesRequested", "windowTogglesDriven", "windowTogglesKeptPlaying", "windowTogglesAdvanced")
+        cases = []
+        for metric in counts:
+            cases += [(f"adversary input: {metric} value [4] in both sets", with_value(metric, [4]), True),
+                      (f"{metric} value [4] in supplementary only", with_value(metric, [4], ("supplementary",)), True)]
+        cases += [("windowTogglesDriven value [[4]]", with_value("windowTogglesDriven", [[4]]), True),
+                  ('windowTogglesDriven value ["4"]', with_value("windowTogglesDriven", ["4"]), True),
+                  ('windowTogglesDriven value "4" (a string, not the number the evaluator reads)', with_value("windowTogglesDriven", "4"), True),
+                  ("windowTogglesDriven value {\"v\": 4}", with_value("windowTogglesDriven", {"v": 4}), True),
+                  ("windowTogglesDriven value true", with_value("windowTogglesDriven", True), True),
+                  ('windowToggleEvidenceReason value ["ok"]', with_value("windowToggleEvidenceReason", ["ok"]), True),
+                  ("control: the committed spec", full, False),
+                  ("control: windowTogglesDriven value 4.0 (a JSON number)", with_value("windowTogglesDriven", 4.0), False)]
+        with tempfile.TemporaryDirectory(prefix="wt-r14adv-") as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([{"spec": spec, "log": self.log()} for _, spec, _ in cases]), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                f"Import-Module '{ATTR_MODULE}' -Force\n"
+                "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                "@($cases | ForEach-Object {\n"
+                "  $e = Get-AttrCudaWindowToggleEvidence -LogText ([string]$_.log) -MeasuredSessionId '3'\n"
+                "  $m = [pscustomobject]@{ windowTogglesRequested = $e.requested; windowTogglesDriven = $e.driven; windowTogglesKeptPlaying = $e.keptPlaying; windowTogglesAdvanced = $e.advanced; windowToggleEvidenceReason = $e.reason; lookAssistForced = $true; gpuFramesTotal = 599; lookFlavorReported = 'cinematic' }\n"
+                "  $r = Get-DvWindowToggleReconcileEvidence -Spec $_.spec -LogText ([string]$_.log) -Metrics $m\n"
+                "  $a = Test-DvCriteria -Criteria $_.spec.criteria.acceptance.cuda -Metrics $m\n"
+                "  $s = Test-DvCriteria -Criteria $_.spec.criteria.supplementary.cuda -Metrics $m\n"
+                "  [ordered]@{ blocks = $r.blocks; reason = [string]$r.reason; passes = @([bool]$a.pass, [bool]$s.pass) }\n"
+                "}) | ConvertTo-Json -Compress -Depth 5 -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, blocks), got in zip(cases, out, strict=True):
+            with self.subTest(case=name):
+                self.assertEqual(got["blocks"], blocks, got)
+                if blocks:
+                    self.assertIn("WINDOW_TOGGLES_CRITERIA_UNBOUND", got["reason"], got)
+                else:
+                    self.assertEqual(got["passes"], [True, True], got)
+
+    def test_r12_fable_note_the_preflight_refuses_an_unbound_criteria_set_with_the_reconcilers_typed_reason(self) -> None:
+        """r12 (fable r11 hardening note on d3b176e3: the preflight shape refusal did not catch an empty criteria.supplementary that the reconciler later reads as
+        WINDOW_TOGGLES_CRITERIA_UNBOUND): Get-DvLegSpecShapeRefusal, the leg's and every batch preflight's live check, refuses a requested leg whose criteria do not
+        bind the five scalars for every backend it names, with the SAME typed reason, before a lease opens; a complete binding (single or multi-backend) is admitted."""
+        empty_supp = self.fstoggle_spec()
+        empty_supp["criteria"]["supplementary"] = {}
+        cases = [(name, spec, gap) for name, spec, gap in self.r12_multi_backend_cases()]
+        cases.append(("fable r11 note: criteria.supplementary = {} -> refusal", empty_supp, "criteria.supplementary has no cuda array"))
+        with tempfile.TemporaryDirectory(prefix="wt-r12pre-") as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([{"spec": spec} for _, spec, _ in cases]), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                "@($cases | ForEach-Object { [ordered]@{ r = [string](Get-DvLegSpecShapeRefusal -Spec $_.spec) } }) | ConvertTo-Json -Compress -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, gap), got in zip(cases, out, strict=True):
+            with self.subTest(gate="preflight", case=name):
+                if gap is None:
+                    self.assertEqual(got["r"], "", got)
+                else:
+                    self.assertIn("WINDOW_TOGGLES_CRITERIA_UNBOUND", got["r"], got)
+                    self.assertIn(gap, got["r"], got)
+
+    def r11_a1_rows(self) -> list[tuple[str, str, str, str, tuple[int, int, int, int]]]:
+        """r11 (sol r10 A1 and opus key3 r10 B1 on 7fc447b9): (name, log, session, typed reason, counts). The window is the FIRST marker of the session, closed at the
+        next marker of ANY other id; a second marker of the same id is itself evidence of a broken session (the app writes one per process), so it names itself."""
+        m = self.R11_MARKER
+        b0 = self.toggle(0, "begin")
+        return [
+            ("sol r10 A1 / opus r10 trace 2: a duplicate toggle-0 begin before a repeated id=3 marker is seen, never erased",
+             self.log().replace(m, m + b0 + "\n" + m, 1), "3", "measured-session-marker-repeated", (4, 3, 3, 3)),
+            ("sol r10 A1 / opus r10 trace 1: id=3, then a foreign id=4, then a repeated id=3 and the healthy log (the window closed at id=4 stays closed)",
+             m + "playback_smoke.measured_session id=4\n" + self.log(), "3", "measured-session-marker-repeated", (0, 0, 0, 0)),
+            ("a repeated id=3 marker after the toggles and before the summary (no duplicate record): the repeat alone is non-ok",
+             self.log().replace("\ngui_smoke.window_toggles ", "\n" + m + "gui_smoke.window_toggles ", 1), "3", "measured-session-marker-repeated", (4, 4, 4, 4)),
+            ("no explicit id: a duplicate toggle-0 begin before a repeated id=3 marker (the window is the first marker's)",
+             self.log().replace(m, m + b0 + "\n" + m, 1), "", "measured-session-marker-repeated", (4, 3, 3, 3)),
+        ]
+
+    def test_r11_a1_a_repeated_matching_marker_never_reopens_or_replaces_the_measured_window(self) -> None:
+        """r11 (sol r10 A1, opus key3 r10 B1, site AttrCudaArtifacts.psm1 Get-AttrCudaWindowToggleEvidence): an explicit -MeasuredSessionId binds the FIRST marker of
+        that id, the window closes at the next marker of another id, and a repeated marker of the window's id makes the proof non-ok with a typed reason."""
+        rows = self.r11_a1_rows()
+        out = self.run_cases([self.log(), self.log()] + [log for _, log, _, _, _ in rows], sessions=["3", ""] + [s for _, _, s, _, _ in rows])
+        for got in out[:2]:
+            self.assertEqual(got["e"]["reason"], "ok", got)
+            self.assertEqual(got["passes"], [True, True], got)
+        for (name, _, _, why, counts), got in zip(rows, out[2:], strict=True):
+            with self.subTest(case=name):
+                e = got["e"]
+                self.assertEqual((e["requested"], e["driven"], e["keptPlaying"], e["advanced"]), counts, got)
+                self.assertIn(why, e["reason"], got)
+                self.assertEqual(got["passes"], [False, False], got)
+        # the docstring and the window comment state the same rule the code runs
+        reader = ATTR_MODULE.read_text(encoding="utf-8").split("function Get-AttrCudaWindowToggleEvidence", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("measured-session-marker-repeated", reader)
+        self.assertNotIn("the last marker starts the window", reader)
+
+    def test_r11_a1_the_reconcile_gate_and_the_job_embedded_reader_refuse_a_repeated_marker(self) -> None:
+        """r11 (sol r10 A1 siblings: DualVenueRunner.psm1 Get-DvWindowToggleReconcileEvidence, used by Test-DvReceiptValid and Invoke-VenueLeg.ps1, and the job's
+        embedded copy, playback-attr-3-cuda-job.ps1): ok scalars over every r11 A1 row are INVALID, and the embedded reader names the repeated marker."""
+        asks = self.fstoggle_spec()
+        ok = {"windowTogglesRequested": 4, "windowTogglesDriven": 4, "windowTogglesKeptPlaying": 4, "windowTogglesAdvanced": 4, "windowToggleEvidenceReason": "ok"}
+        rows = [r for r in self.r11_a1_rows() if r[2] == "3"]
+        with tempfile.TemporaryDirectory(prefix="wt-r11-") as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([{"spec": asks, "log": log, "metrics": ok} for _, log, _, _, _ in rows]), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                "@($cases | ForEach-Object { $r = Get-DvWindowToggleReconcileEvidence -Spec $_.spec -LogText ([string]$_.log) -Metrics $_.metrics\n"
+                "  [ordered]@{ blocks = $r.blocks; derived = [string]$r.derived.reason } }) | ConvertTo-Json -Compress -Depth 5 -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, _, why, _), got in zip(rows, out, strict=True):
+            with self.subTest(gate="reconcile", case=name):
+                self.assertTrue(got["blocks"], got)
+                self.assertIn(why, got["derived"], got)
+        logs = {"clean": self.log(), **{f"row{n}": log for n, (_, log, _, _, _) in enumerate(rows)}}
+        script = ("$ErrorActionPreference = 'Stop'\n"
+                  f"$m = Import-Module '{ATTR_MODULE}' -Force -PassThru -DisableNameChecking\n"
+                  f"$src = & $m {{ Get-AttrCudaEmbeddedFunctionSource -ModulePath '{ATTR_MODULE}' -Name @('Get-AttrCudaWindowToggleEvidence') }}\n"
+                  "Remove-Module $m.Name -Force\n"
+                  "if (Get-Command Get-AttrCudaWindowToggleEvidence -ErrorAction SilentlyContinue) { throw 'the module reader is still loaded' }\n"
+                  ". ([scriptblock]::Create([string]$src))\n"
+                  "$cases = $env:DVE_LOGS | ConvertFrom-Json\n"
+                  "$out = [ordered]@{}\n"
+                  "foreach ($p in $cases.PSObject.Properties) { $out[$p.Name] = (Get-AttrCudaWindowToggleEvidence -LogText ([string]$p.Value) -MeasuredSessionId '3').reason }\n"
+                  "$out | ConvertTo-Json -Compress")
+        proc = run_pwsh(["-Command", script], env_extra={"DVE_LOGS": json.dumps(logs)})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        embedded = json.loads(proc.stdout)
+        self.assertEqual(embedded["clean"], "ok", embedded)
+        for n, (name, _, _, why, _) in enumerate(rows):
+            with self.subTest(gate="embedded job reader", case=name):
+                self.assertIn(why, embedded[f"row{n}"], embedded)
+
+    def test_r11_a2_an_unreadable_measured_session_refuses_requested_toggle_proof(self) -> None:
+        """r11 (sol r10 A2, opus key3 r10 H1, site DualVenueRunner.psm1 Get-DvWindowToggleReconcileEvidence): when Get-DvSmokeSummaryFields reads the measured session
+        as UNREADABLE, the reconcile gate refuses the toggle proof with a typed reason and never hands an empty id to the reader's automatic session selection."""
+        asks = self.fstoggle_spec()
+        ok = {"windowTogglesRequested": 4, "windowTogglesDriven": 4, "windowTogglesKeptPlaying": 4, "windowTogglesAdvanced": 4, "windowToggleEvidenceReason": "ok"}
+        m = self.R11_MARKER
+        cases = [
+            ("sol r10 A2: id=3x and session=3x (the reader would auto-select the only marker, 3x)", self.log().replace("id=3", "id=3x").replace("session=3", "session=3x"), ok),
+            ("a first marker id=3.5", self.log().replace(m, "playback_smoke.measured_session id=3.5\n", 1), ok),
+            ("a first marker id=3x over metrics the auto-selecting reader would derive", self.log().replace("id=3", "id=3x").replace("session=3", "session=3x"), "DERIVE"),
+        ]
+        with tempfile.TemporaryDirectory(prefix="wt-r11a2-") as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([{"spec": asks, "log": log, "metrics": metrics} for _, log, metrics in cases]
+                                       + [{"spec": asks, "log": self.log(), "metrics": ok}]), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                f"Import-Module '{ATTR_MODULE}' -Force\n"
+                "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                "@($cases | ForEach-Object {\n"
+                "  $m = $_.metrics\n"
+                "  if ($m -is [string]) { $e = Get-AttrCudaWindowToggleEvidence -LogText ([string]$_.log) -MeasuredSessionId ''\n"
+                "    $m = [pscustomobject]@{ windowTogglesRequested = $e.requested; windowTogglesDriven = $e.driven; windowTogglesKeptPlaying = $e.keptPlaying; windowTogglesAdvanced = $e.advanced; windowToggleEvidenceReason = $e.reason } }\n"
+                "  $s = Get-DvSmokeSummaryFields -LogText ([string]$_.log)\n"
+                "  $r = Get-DvWindowToggleReconcileEvidence -Spec $_.spec -LogText ([string]$_.log) -Metrics $m\n"
+                "  [ordered]@{ unreadable = $s.sessionUnreadable; blocks = $r.blocks; reason = [string]$r.reason; derived = [string]$r.derived.reason }\n"
+                "}) | ConvertTo-Json -Compress -Depth 5 -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual((out[-1]["unreadable"], out[-1]["blocks"], out[-1]["derived"]), (False, False, "ok"), out[-1])
+        for (name, _, _), got in zip(cases, out[:-1], strict=True):
+            with self.subTest(case=name):
+                self.assertTrue(got["unreadable"], got)
+                self.assertTrue(got["blocks"], got)
+                self.assertIn("WINDOW_TOGGLES_SESSION_UNREADABLE", got["reason"], got)
+                self.assertIn("measured-session-unreadable", got["derived"], got)
+
+    def test_r3_b4_a_requested_leg_must_back_its_scalars_with_the_hashed_run_log(self) -> None:
+        """r3 B4 (sol): requested-toggle success is reconciled with the hashed run log, in the writer and in receipt validation, by the one shared reader
+        Get-DvWindowToggleReconcileEvidence (the log's own derivation, never the summary scalars, decides)."""
+        asks = self.fstoggle_spec()
+        good = self.log()
+        summary = "gui_smoke.window_toggles requested=4 driven=4 reason=ok"
+        ok = {"windowTogglesRequested": 4, "windowTogglesDriven": 4, "windowTogglesKeptPlaying": 4, "windowTogglesAdvanced": 4, "windowToggleEvidenceReason": "ok"}
+        no_toggles = "\n".join(line for line in good.split("\n") if not line.startswith("gui_smoke.window_toggle"))
+        no_keep = "\n".join(line for line in good.split("\n") if not line.startswith("interaction_trace event=resize.keep_playing"))
+        cases = (("scalars the log backs", asks, good, ok, False),
+                 ("toggle records removed, the scalars kept (the log-hash reference refreshed)", asks, no_toggles, ok, True),
+                 ("only the summary line kept", asks, no_toggles + "\n" + summary, ok, True),
+                 ("the keep_playing lines removed, the scalars kept", asks, no_keep, ok, True),
+                 ("one scalar (driven) the log does not back", asks, good, dict(ok, windowTogglesDriven=3), True),
+                 ("the reason scalar the log does not back", asks, self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=incomplete"), ok, True),
+                 ("the scalars absent from the metrics", asks, good, {}, True),
+                 ("no run log at all", asks, "", ok, True),
+                 ("an honest failure: the scalars are exactly what the log derives (a FAIL by the criteria, not INVALID)", asks, self.log(drop_keep=2), "DERIVE", False),
+                 ("a leg that does not ask is not judged here", {}, no_toggles, {}, False))
+        with tempfile.TemporaryDirectory(prefix="wt-b4-") as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([{"spec": spec, "log": log, "metrics": metrics} for _, spec, log, metrics, _ in cases]), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                f"Import-Module '{ATTR_MODULE}' -Force\n"
+                "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                "@($cases | ForEach-Object {\n"
+                "  $m = $_.metrics\n"
+                "  if ($m -is [string]) { $e = Get-AttrCudaWindowToggleEvidence -LogText ([string]$_.log) -MeasuredSessionId '3'\n"
+                "    $m = [pscustomobject]@{ windowTogglesRequested = $e.requested; windowTogglesDriven = $e.driven; windowTogglesKeptPlaying = $e.keptPlaying; windowTogglesAdvanced = $e.advanced; windowToggleEvidenceReason = $e.reason } }\n"
+                "  $r = Get-DvWindowToggleReconcileEvidence -Spec $_.spec -LogText ([string]$_.log) -Metrics $m\n"
+                "  [ordered]@{ blocks = $r.blocks; reason = $r.reason }\n"
+                "}) | ConvertTo-Json -Compress -Depth 5 -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, _, _, blocks), got in zip(cases, out, strict=True):
+            with self.subTest(case=name):
+                self.assertEqual(got["blocks"], blocks, got)
+                if blocks:
+                    self.assertIn("WINDOW_TOGGLES_NOT_FROM_LOG", got["reason"])
+
+    def test_r3_b4_the_writer_and_the_receipt_validator_both_gate_on_the_reconcile_reader(self) -> None:
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("$windowToggleReconcileVerdict = Get-DvWindowToggleReconcileEvidence -Spec $spec -LogText $ev.logText -Metrics $metrics", module)
+        self.assertIn('if ($windowToggleReconcileVerdict.blocks) { $invalid.Add($windowToggleReconcileVerdict.reason) }', module)
+        self.assertIn("Get-DvWindowToggleReconcileEvidence", module.split("Export-ModuleMember", 1)[1])
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("$windowToggleReconcileVerdict = Get-DvWindowToggleReconcileEvidence -Spec $spec -LogText $runLogText -Metrics $receipt.metrics", runner)
+        self.assertIn("$outcome -in @('PASS', 'FAIL') -and $windowToggleReconcileVerdict.blocks", runner)
+
+    def test_a_summary_without_the_scalars_fails_both_legs_criteria(self) -> None:
+        script = (f"$ErrorActionPreference = 'Stop'; Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n"
+                  "$out = foreach ($leg in @('m16-1457-native-windowed-s2-fstoggle', 'm16-1457-native-windowed-s1-fstoggle')) {\n"
+                  f"  $spec = [IO.File]::ReadAllText('{DV}/legs/' + $leg + '.json') | ConvertFrom-Json\n"
+                  "  $m = [pscustomobject]@{ lookAssistForced = $true; gpuFramesTotal = 599; lookFlavorReported = 'cinematic' }\n"
+                  "  $a = Test-DvCriteria -Criteria $spec.criteria.acceptance.cuda -Metrics $m\n"
+                  "  $s = Test-DvCriteria -Criteria $spec.criteria.supplementary.cuda -Metrics $m\n"
+                  "  [ordered]@{ a = $a.pass; s = $s.pass; failures = @($a.failures) }\n"
+                  "}\n"
+                  "@($out) | ConvertTo-Json -Compress -Depth 4 -AsArray")
+        proc = run_pwsh(["-Command", script])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        for got in json.loads(proc.stdout):
+            self.assertEqual((got["a"], got["s"]), (False, False))
+            self.assertEqual(sorted(f.split(":")[0] for f in got["failures"]),
+                             ["windowToggleEvidenceReason", "windowTogglesAdvanced", "windowTogglesDriven", "windowTogglesKeptPlaying", "windowTogglesRequested"])
+
+
 class DueWakeDeliveryLegSpecTests(unittest.TestCase):
     """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1: the isolation arm of the due-wake delivery A/B is a named generatorArgs key; each isolation
     twin differs from the cell it twins only in legId and that key, so no receipted cell changes a byte."""
@@ -18208,6 +19759,577 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         calls = re.findall(r"Test-DvCriteria -Criteria \$criteria -Metrics ([^\r\n]+)", leg + "\n" + mod)
         self.assertEqual(calls, ["(Get-DvCriteriaMetrics -Metrics $receipt.metrics -Playback $receipt.playback)",
                                  "(Get-DvCriteriaMetrics -Metrics $metrics -Playback $derived)"], calls)
+
+
+class DriftLegSpecTests(unittest.TestCase):
+    """M16-1457-VENUE-BASELINE-DRIFT-1 r3: each drift leg is the tracked 1457 fullscreen s1 headroom leg with only legId, card and generatorArgs.playbackMaxThreads
+    changed (the P-core arm also carries the 1243 b1-12-pcore arm's affinity keys and its two partition criteria), so a worker-cap sweep on the Bachelor
+    venue differs from the 16-thread baseline leg in the cap alone."""
+
+    def setUp(self) -> None:
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema is required")
+        self.jsonschema = jsonschema
+        self.schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+
+    def load(self, rel: str) -> dict:
+        return json.loads((DV / rel).read_text(encoding="utf-8"))
+
+    def test_each_cap_leg_is_its_source_except_the_leg_id_the_card_and_the_cap(self) -> None:
+        caps = {"legs/m16-1457-drift-t1-unpaced-fullscreen-s1.json": 1,
+                "legs/m16-1457-drift-t4-unpaced-fullscreen-s1.json": 4, "legs/m16-1457-drift-t8-unpaced-fullscreen-s1.json": 8,
+                "legs/m16-1457-drift-t12-unpaced-fullscreen-s1.json": 12, "legs/m16-1457-drift-t16-unpaced-fullscreen-s1.json": 16}
+        for rel, cap in caps.items():
+            with self.subTest(leg=rel):
+                spec, source = self.load(rel), self.load(DRIFT_LEGS[rel])
+                self.jsonschema.validate(spec, self.schema)
+                self.assertEqual(spec["legId"], Path(rel).stem)
+                self.assertEqual(spec["card"], "M16-1457-VENUE-BASELINE-DRIFT-1")
+                self.assertEqual(spec["generatorArgs"].pop("playbackMaxThreads"), cap)
+                self.assertEqual(dict(spec, legId=source["legId"], card=source["card"]), source)
+                self.assertEqual(list(self.load(rel)), list(source), "the source's keys in the source's order")
+
+    # The slowest single-worker pace r4 measured with the 20 s window on Bachelor (OLD 4e306d0d, CUDA, 1457 fullscreen s1, cap 1 on one P-core's two logical CPUs): 17.923 fps
+    # (the cap-1 leg with no mask ran 19.856 and 21.912). Five of the six 20 s cap-1 legs ended early, PaceTooSlow -> exit 14 (INVALID), because the CUDA backend's GATED pace probe
+    # gives a 20 s window a floor of about 21.9 fps; the sixth (21.912 fps) cleared it by 0.03 fps. A CPU-backend leg runs informational (PlayPaceMode::MeasuredInformational), has no
+    # such probe, and is not what these CUDA legs measure (r4 adversary pass 7 A1).
+    SLOWEST_MEASURED_CAP1_FPS = 17.923
+    FIRST_PRESENT_S = 0.26   # the measured first_present_ms of the cap-1 legs (258.263 ms): the budget runs from the Play trigger, the first frame comes this late
+
+    def pace_floor_fps(self, play_seconds: int, clip_fps: float = 59.94) -> float:
+        """The steady pace the app's gate demands of a Play of `play_seconds` of a `clip_fps` clip, read from the constants in PlaybackFrameRange.h (playSafetyMs and
+        required_source_frames = ceil(seconds x native fps), r4 adversary A3: whole frames, and the first present comes FIRST_PRESENT_S after the trigger):
+        frames / (seconds / kMinSustainedPaceFraction + kPlaySafetyMarginMs / 1000 - FIRST_PRESENT_S). 17.3 fps for 10 s, 21.9 fps for 20 s."""
+        text = (Path(__file__).resolve().parents[2] / "platform" / "qt" / "PlaybackFrameRange.h").read_text(encoding="utf-8")
+        fraction = float(re.search(r"constexpr double kMinSustainedPaceFraction = ([0-9.]+);", text).group(1))
+        margin_ms = int(re.search(r"constexpr int kPlaySafetyMarginMs = (\d+);", text).group(1))
+        # r5 adversary pass 8 A4: the first frame is presented at FIRST_PRESENT_S and the pace then has to carry whole_frames - 1 transitions (the app counts the first frame
+        # and 599 transitions for 10 s of 59.94), so the numerator is one less than the frame count.
+        # (PlaybackFrameRange.h subtracts 1e-9 before the ceil, so 60.00000000001 fps x 10 s is still 600 frames; adversary pass 9 A2.)
+        return (math.ceil(play_seconds * clip_fps - 1e-9) - 1) / (play_seconds / fraction + margin_ms / 1000.0 - self.FIRST_PRESENT_S)
+
+    def test_the_20_second_window_cannot_host_a_cap_one_leg_and_the_w10_family_can(self) -> None:
+        """r4: five of the six cap-1 20 s CUDA legs ended PaceTooSlow (INVALID, uncounted). The floor a window sets on the CUDA (gated) backend is a function of the app's
+        gate constants, so this test computes it from the header: the 20 s window's floor is above every slower cap-1 pace measured, the 10 s window's floor is below
+        all of them. (CPU-backend legs are informational and have no such floor; these specs are benched on CUDA.)"""
+        self.assertGreater(self.pace_floor_fps(20), 21.0)
+        self.assertGreater(self.pace_floor_fps(20), self.SLOWEST_MEASURED_CAP1_FPS + 3.0)
+        self.assertLess(self.pace_floor_fps(10), self.SLOWEST_MEASURED_CAP1_FPS)
+        for rel in DRIFT_W10_LEGS:
+            with self.subTest(leg=rel):
+                spec = self.load(rel)
+                self.assertEqual(spec["playSeconds"], 10, "the schema floor, allowed for a 50 fps or faster clip (HFR-10S-1); 1457 is 59.94 fps")
+                self.assertLess(self.pace_floor_fps(spec["playSeconds"]), self.SLOWEST_MEASURED_CAP1_FPS)
+        for rel in DRIFT_T1_LEGS:
+            with self.subTest(leg=rel):
+                self.assertEqual(self.load(rel)["playSeconds"], 20, "the first-sitting legs keep the window they ran with (their INVALID receipts name it)")
+
+    def test_each_w10_leg_is_its_20_second_counterpart_with_only_the_window_changed(self) -> None:
+        pairs = {"legs/m16-1457-drift-t1-w10-unpaced-fullscreen-s1.json": "legs/m16-1457-drift-t1-unpaced-fullscreen-s1.json",
+                 "legs/m16-1457-drift-t1-cool-w10-unpaced-fullscreen-s1.json": "legs/m16-1457-drift-t1-cool-unpaced-fullscreen-s1.json",
+                 "legs/m16-1457-drift-t1-hot-w10-unpaced-fullscreen-s1.json": "legs/m16-1457-drift-t1-hot-unpaced-fullscreen-s1.json",
+                 "legs/m16-1457-drift-t16-w10-unpaced-fullscreen-s1.json": "legs/m16-1457-drift-t16-unpaced-fullscreen-s1.json"}
+        self.assertEqual(set(pairs), set(DRIFT_W10_LEGS))
+        for rel, twin_rel in pairs.items():
+            with self.subTest(leg=rel):
+                spec, twin = self.load(rel), self.load(twin_rel)
+                self.jsonschema.validate(spec, self.schema)
+                self.assertEqual(spec["legId"], Path(rel).stem)
+                self.assertEqual(spec["card"], "M16-1457-VENUE-BASELINE-DRIFT-1")
+                self.assertEqual(dict(spec, legId=twin["legId"], playSeconds=twin["playSeconds"]), twin)
+
+    def test_each_visual_twin_is_its_w10_arm_with_only_the_leg_id_changed_and_the_capture_on(self) -> None:
+        """r5: sol r4 BLOCKER, the arms cited by the verdict had no opened strip. A visual twin keeps every byte of its w10 arm (the same cap, mask, window, criteria)
+        except legId, and drops the capture opt-out: an absent visualCapture means on for a speed leg (Get-DvVisualCaptureRequest), so no new runner key is needed."""
+        pairs = {"legs/m16-1457-drift-t1-w10-visual-unpaced-fullscreen-s1.json": "legs/m16-1457-drift-t1-w10-unpaced-fullscreen-s1.json",
+                 "legs/m16-1457-drift-t1-cool-w10-visual-unpaced-fullscreen-s1.json": "legs/m16-1457-drift-t1-cool-w10-unpaced-fullscreen-s1.json",
+                 "legs/m16-1457-drift-t1-hot-w10-visual-unpaced-fullscreen-s1.json": "legs/m16-1457-drift-t1-hot-w10-unpaced-fullscreen-s1.json",
+                 "legs/m16-1457-drift-t16-w10-visual-unpaced-fullscreen-s1.json": "legs/m16-1457-drift-t16-w10-unpaced-fullscreen-s1.json"}
+        self.assertEqual(set(pairs), set(DRIFT_VISUAL_LEGS))
+        for rel, arm_rel in pairs.items():
+            with self.subTest(leg=rel):
+                spec, arm = self.load(rel), self.load(arm_rel)
+                self.jsonschema.validate(spec, self.schema)
+                self.assertEqual(spec["legId"], Path(rel).stem)
+                self.assertEqual(spec["card"], "M16-1457-VENUE-BASELINE-DRIFT-1")
+                self.assertEqual(spec["legType"], "speed", "the capture only exists on a speed leg")
+                self.assertNotIn("visualCapture", spec, "absent means on")
+                self.assertNotIn("visualCaptureOptOutReason", spec)
+                self.assertIs(arm["visualCapture"], False, "the untraced arm keeps its opt-out: its fps must not be perturbed by the capture tail")
+                body = {k: v for k, v in arm.items() if k not in ("visualCapture", "visualCaptureOptOutReason")}
+                self.assertEqual(dict(spec, legId=arm["legId"]), body)
+                self.assertEqual(list(spec), [k for k in arm if k not in ("visualCapture", "visualCaptureOptOutReason")], "the arm's keys in the arm's order")
+
+    def test_a_visual_twin_is_named_as_one_and_no_legset_can_report_it_as_a_speed_cell(self) -> None:
+        """r5 adversary pass 8 A1: a twin's receipt can read PASS with a bare observer-perturbed fps (the runner counts a NOT_CAPTURED leg, base behaviour shared by every
+        speed leg), and a legset's matrix table would print that fps as a measured cell. So (1) every twin says so in its legId (the reader that keeps its fps out of an arm
+        keys on '-visual-'), and (2) no legset in legsets/ lists a drift leg at all: a twin only ever runs through a lease plan whose rows are labelled by arm."""
+        for rel in DRIFT_VISUAL_LEGS:
+            with self.subTest(leg=rel):
+                self.assertIn("-w10-visual-unpaced-", self.load(rel)["legId"])
+        self.assertEqual(sorted(p.name for p in (DV / "legs").glob("*-visual-*.json")), sorted(Path(r).name for r in DRIFT_VISUAL_LEGS), "a '-visual-' leg outside the registered twins")
+        for path in sorted((DV / "legsets").glob("*.json")):
+            with self.subTest(legset=path.name):
+                self.assertEqual(self.legset_drift_violations(json.loads(path.read_text(encoding="utf-8"))), [])
+
+    @staticmethod
+    def legset_ref_key(value: str) -> str:
+        """r6 (sol r5 B1, luna r5 B1): the identity a leg reference NAMES on Windows, not the text it is written in: both separators folded, `.`, `..` and empty segments
+        resolved, case folded (the runner resolves `LEGS\\X.JSON` and `legs/./x.json` to the same file as `legs/x.json`)."""
+        import posixpath
+        return posixpath.normpath(value.replace("\\", "/")).casefold()
+
+    def legset_drift_violations(self, doc: object) -> list[str]:
+        """Every place a legset (judged as DECODED JSON, adversary pass 9 A1) names a drift leg, a visual twin above all: by the NORMALISED reference (r6), and by the spec
+        the reference resolves to (its card and its legId), never by the reference's own spelling."""
+        def walk(node):
+            if isinstance(node, str):
+                yield node
+            elif isinstance(node, dict):
+                for v in node.values():
+                    yield from walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    yield from walk(v)
+        known = {f"legs/{p.name}".casefold(): p for p in (DV / "legs").glob("*.json")}
+        bad = []
+        for value in walk(doc):
+            key = self.legset_ref_key(value)
+            if "m16-1457-drift-" in key or "-visual-" in key:
+                bad.append(f"{value!r} names a drift leg or a visual twin (its fps would print as a measured matrix cell)")
+            if key in known:
+                spec = json.loads(known[key].read_text(encoding="utf-8"))
+                if spec["card"] == "M16-1457-VENUE-BASELINE-DRIFT-1":
+                    bad.append(f"{value!r} resolves to the drift leg {spec['legId']}")
+                if "-visual-" in spec["legId"].casefold():
+                    bad.append(f"{value!r} resolves to the visual twin {spec['legId']}")
+        return bad
+
+    # r6: the spellings Windows resolves to the same twin file (sol r5 B1: the first two; luna r5 B1: the upper-case suffix)
+    TWIN_ALIAS_FORMS = ("LEGS\\{NAME}.json", "LEGS/./{NAME}.json", "legs/{name}.JSON", "LEGS\\{NAME}.JSON", "legs/../legs/{name}.json", "legs//{name}.json",
+                        "Legs\\.\\{name}.json", "legs\\{name}.json")
+
+    def twin_aliases(self) -> list[str]:
+        out = []
+        for rel in DRIFT_VISUAL_LEGS:
+            name = Path(rel).stem
+            out.extend(form.format(name=name, NAME=name.upper()) for form in self.TWIN_ALIAS_FORMS)
+        return out
+
+    def test_the_legset_guard_judges_the_normalised_reference_so_no_path_alias_of_a_twin_passes_it(self) -> None:
+        aliases = self.twin_aliases()
+        self.assertEqual(len(aliases), len(DRIFT_VISUAL_LEGS) * len(self.TWIN_ALIAS_FORMS))
+        for alias in aliases:
+            with self.subTest(alias=alias):
+                self.assertTrue(self.legset_drift_violations({"legs": [alias]}), "the guard passed a twin's path alias")
+        # the control: an ordinary matrix leg, however it is spelled, is not a violation
+        for ok in ("legs/m16-1243-display-fullscreen-s1.json", "LEGS\\M16-1243-DISPLAY-FULLSCREEN-S1.JSON"):
+            self.assertEqual(self.legset_drift_violations({"legs": [ok]}), [], ok)
+
+    @requires_windows_pwsh
+    def test_the_matrix_planner_refuses_a_visual_twin_by_the_spec_it_resolves_to_however_the_reference_is_spelled(self) -> None:
+        """r6 B1, the RUNNER half: the guard above only watches the shipped legsets; the planner (Get-DvLegSetPlan) is what a lease plan or a hand-written set goes
+        through, so it refuses by the RESOLVED spec's identity (its legId and its file leaf), not by the reference string."""
+        aliases = self.twin_aliases() + [f"legs/{Path(rel).name}" for rel in DRIFT_VISUAL_LEGS]
+        with tempfile.TemporaryDirectory(prefix="dve-twin-set-") as tmp:
+            root = Path(tmp) / "dual-venue"
+            shutil.copytree(DV, root)
+            names = []
+            for i, alias in enumerate(aliases):
+                name = f"alias-{i:02d}"
+                names.append(name)
+                (root / "legsets" / f"{name}.json").write_text(json.dumps({"schema": "mlv-app/dual-venue-legset/v1", "legSet": name, "card": "M16-1457-VENUE-BASELINE-DRIFT-1",
+                                                                          "clipId": "M16-1457", "legs": [alias]}), encoding="utf-8")
+            control = {"schema": "mlv-app/dual-venue-legset/v1", "legSet": "control", "card": "M16-1457-VENUE-BASELINE-DRIFT-1", "clipId": "M16-1457",
+                       "legs": ["legs/m16-1457-drift-t1-w10-unpaced-fullscreen-s1.json"]}
+            (root / "legsets" / "control.json").write_text(json.dumps(control), encoding="utf-8")
+            proc, got = run_pwsh_json(f"$out = foreach ($f in Get-ChildItem -LiteralPath '{root / 'legsets'}' -Filter 'alias-*.json' | Sort-Object Name) {{\n"
+                                      "  try { $p = Get-DvLegSetPlan -LegSetPath $f.FullName; [ordered]@{ set = $f.BaseName; planned = @($p.plan).Count; why = '' } }\n"
+                                      "  catch { [ordered]@{ set = $f.BaseName; planned = 0; why = $_.Exception.Message } } }\n"
+                                      f"$c = Get-DvLegSetPlan -LegSetPath '{root / 'legsets' / 'control.json'}'\n"
+                                      "[ordered]@{ results = @($out); controlPlanned = @($c.plan).Count } | ConvertTo-Json -Compress -Depth 4")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(got["controlPlanned"], len(self.load("legs/m16-1457-drift-t1-w10-unpaced-fullscreen-s1.json")["backends"]),
+                             "the control (an untraced drift arm) still plans one cell per backend: only the twin is refused")
+            self.assertEqual(len(got["results"]), len(aliases))
+            for res in got["results"]:
+                with self.subTest(alias=aliases[names.index(res["set"])]):
+                    self.assertEqual(res["planned"], 0, "the planner accepted a visual twin as a matrix cell")
+                    self.assertIn("DVE_LEGSET_INVALID", res["why"])
+                    # an upper-case `.JSON` suffix is already refused earlier, as not being a leg spec (the runner's suffix check is case-sensitive); every other spelling is a twin
+                    self.assertIn("is not a leg spec under legs/" if aliases[names.index(res["set"])].endswith(".JSON") else "visual twin", res["why"])
+
+    @staticmethod
+    def speed_backends() -> int:
+        """The control spec plans one cell per backend it lists."""
+        return len(json.loads((DV / "legs" / "m16-1243-speed.json").read_text(encoding="utf-8"))["backends"])
+
+    def plan_one_leg_set(self, root: Path, ref: str, culture: str = "") -> dict:
+        """Plan a one-leg set naming `ref` in the runner copy `root` (optionally under a thread culture); returns {planned, why}."""
+        spec = json.loads((DV / "legs" / "m16-1243-speed.json").read_text(encoding="utf-8"))
+        (root / "legsets" / "one.json").write_text(json.dumps({"schema": "mlv-app/dual-venue-legset/v1", "legSet": "one", "card": spec["card"], "clipId": spec["clipId"],
+                                                               "legs": [ref]}), encoding="utf-8")
+        set_culture = f"[Globalization.CultureInfo]::CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo('{culture}')\n" if culture else ""
+        proc = run_pwsh(["-Command", f"Import-Module '{root / 'DualVenueRunner.psm1'}' -Force\n" + set_culture +
+                         f"try {{ $p = Get-DvLegSetPlan -LegSetPath '{root / 'legsets' / 'one.json'}'; $r = [ordered]@{{ planned = @($p.plan).Count; why = '' }} }}\n"
+                         "catch { $r = [ordered]@{ planned = 0; why = $_.Exception.Message } }\n"
+                         "$r.culture = [Globalization.CultureInfo]::CurrentCulture.Name; $r | ConvertTo-Json -Compress"])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout)
+
+    @requires_windows_pwsh
+    def test_the_visual_twin_guard_is_culture_invariant(self) -> None:
+        """r10 (adversary r10 A1): `-match '(?i)-visual-'` folds case by the CURRENT culture, so under tr-TR an upper-case `VISUAL` (dotted I folds to dotless i) was not a twin:
+        LEGS\\M16-1243-SPEED-VISUAL-FULLSCREEN.json holding speed-spec bytes planned as a speed cell. The guard is now an ordinal, culture-free comparison."""
+        with tempfile.TemporaryDirectory(prefix="dve-twin-culture-") as tmp:
+            root = Path(tmp) / "dual-venue"
+            shutil.copytree(DV, root)
+            shutil.copyfile(DV / "legs" / "m16-1243-speed.json", root / "legs" / "M16-1243-SPEED-VISUAL-FULLSCREEN.json")
+            for culture in ("tr-TR", "en-US"):
+                with self.subTest(culture=culture):
+                    got = self.plan_one_leg_set(root, "LEGS\\M16-1243-SPEED-VISUAL-FULLSCREEN.json", culture)
+                    self.assertEqual(got["culture"], culture)
+                    self.assertEqual(got["planned"], 0, f"a twin file planned as a speed cell under {culture}")
+                    self.assertIn("visual twin", got["why"])
+            self.assertEqual(self.plan_one_leg_set(root, "legs/m16-1243-speed.json", "tr-TR")["planned"], self.speed_backends(), "the control still plans")
+            # the reader's row guard is the same predicate: an upper-case twin leg id carries no rate under tr-TR
+            proc = run_pwsh(["-Command", f"Import-Module '{root / 'DualVenueRunner.psm1'}' -Force\n"
+                             "[Globalization.CultureInfo]::CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo('tr-TR')\n"
+                             "$m = Get-Module DualVenueRunner\n"
+                             "@('M16-1243-SPEED-VISUAL-FULLSCREEN', 'm16-1243-speed-visual-fullscreen', 'M16-1243-SPEED-FULLSCREEN-S1') | ForEach-Object { [string](& $m { param($n) Test-DvVisualTwinName $n } $_) }"])
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.split(), ["True", "True", "False"])
+
+    @requires_windows_pwsh
+    def test_the_planner_refuses_a_leg_spec_that_is_a_link(self) -> None:
+        """r10 (adversary r10 A2): legs/capture-compat.json, a file symlink to a twin-named file, read the target's bytes but was judged by the LINK's neutral leaf. A leg a set
+        names is a committed spec FILE under legs/; a link (the file, or a directory on its way under legs/) is refused, whatever it points at."""
+        with tempfile.TemporaryDirectory(prefix="dve-twin-link-") as tmp:
+            root = Path(tmp) / "dual-venue"
+            shutil.copytree(DV, root)
+            twin = root / "legs" / "m16-1243-speed-visual-fullscreen.json"
+            shutil.copyfile(DV / "legs" / "m16-1243-speed.json", twin)
+            link = root / "legs" / "capture-compat.json"
+            try:
+                os.symlink(twin, link)
+            except OSError as exc:
+                self.skipTest(f"no symlink privilege on this host: {exc}")
+            got = self.plan_one_leg_set(root, "legs/capture-compat.json")
+            self.assertEqual(got["planned"], 0, "a link to a twin-named file planned as a speed cell")
+            self.assertIn("DVE_LEGSET_INVALID", got["why"])
+            self.assertIn("link", got["why"])
+            # a directory link under legs/ (a junction) is refused the same way
+            sub = root / "elsewhere"
+            sub.mkdir()
+            shutil.copyfile(DV / "legs" / "m16-1243-speed.json", sub / "m16-1243-speed.json")
+            mk = subprocess.run(["cmd", "/c", "mklink", "/J", str(root / "legs" / "jn"), str(sub)], capture_output=True, text=True)
+            self.assertEqual(mk.returncode, 0, mk.stdout + mk.stderr)
+            got = self.plan_one_leg_set(root, "legs/jn/m16-1243-speed.json")
+            self.assertEqual(got["planned"], 0, "a spec reached through a junction under legs/ planned")
+            self.assertIn("link", got["why"])
+            self.assertEqual(self.plan_one_leg_set(root, "legs/m16-1243-speed.json")["planned"], self.speed_backends(), "the control still plans")
+
+    @requires_windows_pwsh
+    def test_the_planner_refuses_a_legs_directory_that_is_itself_a_junction(self) -> None:
+        """r10 (adversary r10 pass 2 A1): the link walk stopped BELOW legs/, so a legs/ that is itself a junction to another directory planned the file it reached there."""
+        with tempfile.TemporaryDirectory(prefix="dve-legs-junction-") as tmp:
+            root = Path(tmp) / "dual-venue"
+            shutil.copytree(DV, root)
+            elsewhere = Path(tmp) / "elsewhere"
+            shutil.move(str(root / "legs"), str(elsewhere))
+            mk = subprocess.run(["cmd", "/c", "mklink", "/J", str(root / "legs"), str(elsewhere)], capture_output=True, text=True)
+            self.assertEqual(mk.returncode, 0, mk.stdout + mk.stderr)
+            self.assertTrue((root / "legs" / "m16-1243-speed.json").is_file(), "the junction resolves")
+            got = self.plan_one_leg_set(root, "legs/m16-1243-speed.json")
+            self.assertEqual(got["planned"], 0, "a spec reached through a junctioned legs/ planned")
+            self.assertIn("link", got["why"])
+
+    @requires_windows_pwsh
+    def test_the_planner_refuses_a_hard_link_to_a_twin_named_file_by_the_bytes_it_read(self) -> None:
+        """r11 (adversary r10 pass 3 A2): an NTFS HARD link has no reparse bit, so legs/capture-compat.json, a second name for the twin-named file, passed both link walks and was
+        judged by its neutral leaf. The planner now judges the name by the bytes it read: a committed spec's file name IS its legId, and these bytes say m16-1243-speed."""
+        with tempfile.TemporaryDirectory(prefix="dve-twin-hardlink-") as tmp:
+            root = Path(tmp) / "dual-venue"
+            shutil.copytree(DV, root)
+            twin = root / "legs" / "m16-1243-speed-visual-fullscreen.json"
+            shutil.copyfile(DV / "legs" / "m16-1243-speed.json", twin)
+            alias = root / "legs" / "capture-compat.json"
+            os.link(twin, alias)
+            self.assertTrue(os.path.samefile(twin, alias), "the fixture made a real hard link")
+            got = self.plan_one_leg_set(root, "legs/capture-compat.json")
+            self.assertEqual(got["planned"], 0, "a hard link to a twin-named file planned as a speed cell")
+            self.assertIn("DVE_LEGSET_INVALID", got["why"])
+            self.assertIn("legId", got["why"])
+            # an ordinary file under another name holding a committed spec's bytes is the same alias, with or without a link (the A1 base state)
+            shutil.copyfile(DV / "legs" / "m16-1243-speed.json", root / "legs" / "plain-alias.json")
+            self.assertEqual(self.plan_one_leg_set(root, "legs/plain-alias.json")["planned"], 0, "a renamed copy of a committed spec planned")
+            self.assertEqual(self.plan_one_leg_set(root, "legs/m16-1243-speed.json")["planned"], self.speed_backends(), "the control still plans")
+
+    @requires_windows_pwsh
+    def test_the_planner_judges_the_bytes_it_read_when_a_link_is_flipped_in_between_its_checks(self) -> None:
+        """r11 (adversary r10 pass 3 A1): check-read-check. The path is an ordinary file at the first link walk, a symlink to an external twin-named file at the read, and an
+        ordinary file again at the second walk, so both walks passed and the planner planned the linked bytes. A module-scope seam on Test-DvPathHasLinkBelow makes that
+        interleaving exact. The planner now judges identity by the bytes it read, so the flip is refused whenever it lands."""
+        with tempfile.TemporaryDirectory(prefix="dve-twin-flip-") as tmp:
+            root = Path(tmp) / "dual-venue"
+            shutil.copytree(DV, root)
+            stock = json.loads((DV / "legs" / "m16-1243-speed.json").read_text(encoding="utf-8"))
+            target = root / "legs" / "capture-compat.json"
+            target.write_text(json.dumps(dict(stock, playSeconds=30), indent=2), encoding="utf-8")
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+            twin = outside / "m16-1243-speed-visual-fullscreen.json"
+            shutil.copyfile(DV / "legs" / "m16-1243-speed.json", twin)
+            ordinary = Path(tmp) / "ordinary.json"
+            shutil.copyfile(target, ordinary)
+            try:
+                os.symlink(twin, Path(tmp) / "probe-link.json")
+            except OSError as exc:
+                self.skipTest(f"no symlink privilege on this host: {exc}")
+            spec = json.loads((DV / "legs" / "m16-1243-speed.json").read_text(encoding="utf-8"))
+            (root / "legsets" / "one.json").write_text(json.dumps({"schema": "mlv-app/dual-venue-legset/v1", "legSet": "one", "card": spec["card"], "clipId": spec["clipId"],
+                                                                   "legs": ["legs/capture-compat.json"]}), encoding="utf-8")
+            proc = run_pwsh(["-Command", f"Import-Module '{root / 'DualVenueRunner.psm1'}' -Force\n"
+                             "$m = Get-Module DualVenueRunner\n"
+                             f"& $m {{ $script:FlipCalls = 0; $script:FlipPath = '{target}'; $script:FlipTwin = '{twin}'; $script:FlipOrdinary = '{ordinary}'\n"
+                             "  function script:Test-DvPathHasLinkBelow { param($Path, $Root)\n"
+                             "    $script:FlipCalls++\n"
+                             "    if ($script:FlipCalls -eq 1) { [IO.File]::Delete($script:FlipPath); $null = [IO.File]::CreateSymbolicLink($script:FlipPath, $script:FlipTwin) }\n"
+                             "    elseif ($script:FlipCalls -eq 2) { [IO.File]::Delete($script:FlipPath); [IO.File]::Copy($script:FlipOrdinary, $script:FlipPath) }\n"
+                             "    $false } }\n"
+                             f"try {{ $p = Get-DvLegSetPlan -LegSetPath '{root / 'legsets' / 'one.json'}'; $r = [ordered]@{{ planned = @($p.plan).Count; why = ''; sha = [string]$p.plan[0].specSha256 }} }}\n"
+                             "catch { $r = [ordered]@{ planned = 0; why = $_.Exception.Message; sha = '' } }\n"
+                             "$r.calls = & $m { $script:FlipCalls }; $r | ConvertTo-Json -Compress"])
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            got = json.loads(proc.stdout)
+            self.assertGreaterEqual(got["calls"], 1, "the seam ran: the link was flipped in after the first walk")
+            self.assertEqual(got["planned"], 0, f"the planner planned the bytes of a link flipped in between its checks (planned sha {got['sha']})")
+            self.assertIn("DVE_LEGSET_INVALID", got["why"])
+            self.assertIn("legId", got["why"])
+
+    @requires_windows_pwsh
+    def test_the_planner_binds_the_whole_leaf_to_the_leg_id_ordinally(self) -> None:
+        """r11 (adversary r11 A1 on c65908cb): `EndsWith('.json')` is culture-aware and ignores a soft hyphen, so legs/m16-1243-speed.jso<U+00AD>n (a distinct file holding the
+        committed bytes) passed the suffix test, and GetFileNameWithoutExtension cut the look-alike suffix off, leaving a stem equal to the legId. The suffix test is now ordinal and
+        the WHOLE leaf must be <legId>.json."""
+        with tempfile.TemporaryDirectory(prefix="dve-leaf-ordinal-") as tmp:
+            root = Path(tmp) / "dual-venue"
+            shutil.copytree(DV, root)
+            for leaf in ("m16-1243-speed.jso­n", "m16-1243-speed­.json", "m16-1243-spee­d.json"):
+                with self.subTest(leaf=leaf.encode("unicode_escape").decode("ascii")):
+                    shutil.copyfile(DV / "legs" / "m16-1243-speed.json", root / "legs" / leaf)
+                    got = self.plan_one_leg_set(root, f"legs/{leaf}")
+                    self.assertEqual(got["planned"], 0, "a look-alike leaf of a committed spec planned")
+                    self.assertIn("DVE_LEGSET_INVALID", got["why"])
+            self.assertEqual(self.plan_one_leg_set(root, "legs/m16-1243-speed.json")["planned"], self.speed_backends(), "the control still plans")
+
+    def test_every_committed_leg_spec_is_named_by_its_leg_id(self) -> None:
+        """r11: the planner binds the name a set reaches to the bytes it read (Get-DvLegSetPlan refuses a spec whose file name is not <legId>.json). That is sound only while
+        every committed spec meets it, so a new leg whose file and legId disagree fails here, not in a venue matrix."""
+        specs = sorted((DV / "legs").glob("*.json"))
+        self.assertGreater(len(specs), 100)
+        for path in specs:
+            with self.subTest(leg=path.name):
+                self.assertEqual(json.loads(path.read_text(encoding="utf-8-sig"))["legId"], path.stem)
+
+    @requires_windows_pwsh
+    def test_the_matrix_reader_never_turns_a_visual_twins_receipt_into_a_measured_speed_cell(self) -> None:
+        """r6 B1, the READER half (sol r5: the four saved twin receipts rendered 1/1 measured): a row whose plan entry or receipt names a visual twin carries the outcome
+        and no rates, whatever path the entry came through; the same receipt under an ordinary leg id is read normally (the control)."""
+        with tempfile.TemporaryDirectory(prefix="dve-twin-row-") as tmp:
+            ev = Path(tmp) / "ev"
+            (ev / "logs").mkdir(parents=True)
+            log = "playback_smoke.summary session=1 presented_fps=19.60 avg_render_work_ms=28.5\n"
+            (ev / "logs" / "smoke-run.log").write_text(log, encoding="utf-8", newline="")
+            sha = hashlib.sha256(log.encode("utf-8")).hexdigest()
+            twin = Path(next(iter(DRIFT_VISUAL_LEGS))).stem
+            cases = {"control": ("m16-1243-display-fullscreen-s1", "m16-1243-display-fullscreen-s1"),
+                     "entry-names-twin": (twin, "m16-1243-display-fullscreen-s1"),
+                     "receipt-names-twin": ("m16-1243-display-fullscreen-s1", twin),
+                     "upper-case-twin": (twin.upper(), twin.upper()),
+                     "no-entry-leg-id": (None, twin)}
+            spec = {k: {"entry": e, "receipt": r} for k, (e, r) in cases.items()}
+            proc, got = run_pwsh_json("$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES | ConvertFrom-Json\n"
+                                      "$rows = foreach ($p in $cases.PSObject.Properties) {\n"
+                                      "  $entry = [ordered]@{ seq = 1; repeat = 1; cellId = 'x'; backend = 'cuda'; displayMode = 'fullscreen'; scaleFactor = 1 }\n"
+                                      "  if ($p.Value.entry) { $entry.legId = [string]$p.Value.entry }\n"
+                                      "  $r = [pscustomobject]@{ outcome = 'PASS'; receiptId = 'rid'; legId = [string]$p.Value.receipt; evidence = [pscustomobject]@{ localEvidenceDir = $env:DVE_EV; logSha256 = $env:DVE_SHA } }\n"
+                                      "  $row = Get-DvMatrixRow -PlanEntry ([pscustomobject]$entry) -Receipt $r\n"
+                                      "  [ordered]@{ case = $p.Name; outcome = $row.outcome; presentedFps = $row.presentedFps; renderWorkMs = $row.renderWorkMs; note = $row.note } }\n"
+                                      "@($rows) | ConvertTo-Json -Compress -Depth 4 -AsArray",
+                                      DVE_CASES=str(self.write_json(Path(tmp) / "cases.json", spec)), DVE_EV=str(ev), DVE_SHA=sha)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            by = {r["case"]: r for r in got}
+            self.assertEqual(by["control"]["presentedFps"], 19.6, "the fixture reads a rate for an ordinary leg")
+            for case in ("entry-names-twin", "receipt-names-twin", "upper-case-twin", "no-entry-leg-id"):
+                with self.subTest(case=case):
+                    self.assertEqual(by[case]["outcome"], "PASS", "the outcome stays visible")
+                    self.assertIsNone(by[case]["presentedFps"], "a visual twin's fps is observer-perturbed and is never a measured cell")
+                    self.assertIsNone(by[case]["renderWorkMs"])
+                    self.assertIn("visual twin", by[case]["note"])
+
+    @requires_windows_pwsh
+    def test_the_matrix_header_counts_measured_cells_by_the_predicate_the_table_uses(self) -> None:
+        """r7 (sol r6 INV-2): the summary header counted any PASS/FAIL receipt as `measured` while the table needs a presented-fps value, so a twin receipt (rates nulled by the
+        reader) read `1 measured` in the header and `0/1` in the table. One function (Get-DvMatrixMeasuredCount, over Test-DvMatrixRowMeasured) now serves both."""
+        with tempfile.TemporaryDirectory(prefix="dve-hdr-") as tmp:
+            ev = Path(tmp) / "ev"
+            (ev / "logs").mkdir(parents=True)
+            log = "playback_smoke.summary session=1 presented_fps=19.60 avg_render_work_ms=28.5\n"
+            (ev / "logs" / "smoke-run.log").write_text(log, encoding="utf-8", newline="")
+            sha = hashlib.sha256(log.encode("utf-8")).hexdigest()
+            twin = Path(next(iter(DRIFT_VISUAL_LEGS))).stem
+            ordinary = "m16-1243-display-fullscreen-s1"
+            # (leg id, outcome, does the run log sit in the local evidence)
+            cases = [(ordinary, "PASS", True), (ordinary, "FAIL", True), (twin, "PASS", True), (twin, "FAIL", True), (ordinary, "PASS", False)]
+            doc = [{"leg": leg, "outcome": outcome, "log": has_log} for leg, outcome, has_log in cases]
+            proc, got = run_pwsh_json("$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES | ConvertFrom-Json\n"
+                                      "$rows = foreach ($c in $cases) {\n"
+                                      "  $entry = [pscustomobject]@{ seq = 1; repeat = 1; cellId = 'cuda-fullscreen-s1'; backend = 'cuda'; displayMode = 'fullscreen'; scaleFactor = 1; legId = [string]$c.leg }\n"
+                                      "  $dir = $(if ($c.log) { $env:DVE_EV } else { Join-Path $env:DVE_EV 'absent' })\n"
+                                      "  $r = [pscustomobject]@{ outcome = [string]$c.outcome; receiptId = 'rid'; legId = [string]$c.leg; evidence = [pscustomobject]@{ localEvidenceDir = $dir; logSha256 = $env:DVE_SHA } }\n"
+                                      "  Get-DvMatrixRow -PlanEntry $entry -Receipt $r }\n"
+                                      "$cells = @([pscustomobject]@{ cellId = 'cuda-fullscreen-s1'; backend = 'cuda'; displayMode = 'fullscreen'; scaleFactor = 1 })\n"
+                                      "$t = ConvertTo-DvMatrixTable -Rows @($rows) -Cells $cells\n"
+                                      "[ordered]@{ header = (Get-DvMatrixMeasuredCount -Rows @($rows)); table = $t } | ConvertTo-Json -Compress",
+                                      DVE_CASES=str(self.write_json(Path(tmp) / "cases.json", doc)), DVE_EV=str(ev), DVE_SHA=sha)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            in_table = re.search(r"\| (\d+)/(\d+) \|", got["table"].splitlines()[2])
+            self.assertEqual((in_table.group(1), in_table.group(2)), ("2", "5"), "the table counts the two ordinary rows that carry a rate, of five that ran")
+            self.assertEqual(got["header"], 2, "the header's measured count is the table's: a twin receipt (PASS or FAIL) is not measured in either place")
+        leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("Get-DvMatrixMeasuredCount -Rows", leg, "the header calls the shared predicate")
+        self.assertNotIn("$_.outcome -cin @('PASS', 'FAIL')", leg, "the header carries no predicate of its own")
+
+    @requires_windows_pwsh
+    def test_every_planned_leg_carries_the_sha256_of_the_spec_bytes_the_planner_judged(self) -> None:
+        """r7 (sol r6 INV-3): the plan binds the child to the planned bytes, so each entry names the RAW sha256 (no line-ending normalisation: the same hash the child's
+        -ExpectSpecSha256 check takes) of the spec file it was planned from."""
+        proc, got = run_pwsh_json(f"$p = Get-DvLegSetPlan -LegSetPath '{DV / 'legsets' / 'display-matrix.json'}' -Repeats 2\n"
+                                  "@($p.plan | ForEach-Object { [ordered]@{ seq = $_.seq; specPath = $_.specPath; specSha256 = $_.specSha256 } }) | ConvertTo-Json -Compress -AsArray")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(len(got), 24)
+        for entry in got:
+            with self.subTest(seq=entry["seq"]):
+                self.assertEqual(entry["specSha256"], hashlib.sha256(Path(entry["specPath"]).read_bytes()).hexdigest())
+
+    @requires_windows_pwsh
+    def test_the_planner_still_reads_a_bom_encoded_spec_the_way_the_file_reader_does(self) -> None:
+        """adversary r7 A5: hashing the planner's read must not narrow what it decodes: a spec File.ReadAllText could read (a UTF-16 or UTF-8 byte-order mark) still plans, and
+        its entry carries the sha256 of the raw bytes."""
+        with tempfile.TemporaryDirectory(prefix="dve-bom-") as tmp:
+            root = Path(tmp) / "dual-venue"
+            shutil.copytree(DV, root)
+            target = root / "legs" / "m16-1243-display-windowed-s1.json"
+            text = target.read_text(encoding="utf-8")
+            for name, raw in (("utf16", b"\xff\xfe" + text.encode("utf-16-le")), ("utf8-bom", b"\xef\xbb\xbf" + text.encode("utf-8"))):
+                with self.subTest(encoding=name):
+                    target.write_bytes(raw)
+                    proc, got = run_pwsh_json(f"$p = Get-DvLegSetPlan -LegSetPath '{root / 'legsets' / 'display-matrix.json'}' -Backend cuda\n"
+                                              "@($p.plan | Where-Object { $_.cellId -ceq 'cuda-windowed-s1' } | ForEach-Object { [ordered]@{ legId = $_.legId; specSha256 = $_.specSha256 } }) | ConvertTo-Json -Compress -AsArray")
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertEqual(got, [{"legId": "m16-1243-display-windowed-s1", "specSha256": hashlib.sha256(raw).hexdigest()}])
+
+    @staticmethod
+    def write_json(path: Path, doc: object) -> Path:
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        return path
+
+    def test_the_pcore_arm_adds_only_the_affinity_keys_the_cap_and_the_two_partition_criteria(self) -> None:
+        rel = "legs/m16-1457-drift-pcore12-unpaced-fullscreen-s1.json"
+        spec, source = self.load(rel), self.load(DRIFT_LEGS[rel])
+        template = self.load("legs/m16-1243-partition-b1-12-pcore-unpaced-windowed-s1.json")
+        self.jsonschema.validate(spec, self.schema)
+        self.assertEqual(spec["legId"], Path(rel).stem)
+        self.assertEqual(spec["card"], "M16-1457-VENUE-BASELINE-DRIFT-1")
+        for key in ("benchAffinityMask", "corePartitionTelemetry", "corePartitionHelperMask", "playbackMaxThreads"):
+            self.assertEqual(spec["generatorArgs"].pop(key), template["generatorArgs"][key], key)
+        gates = [{"metric": "corePartitionTopologyOk", "op": "eq", "value": True}, {"metric": "benchAffinityApplied", "op": "eq", "value": True}]
+        for role in ("acceptance", "supplementary"):
+            for backend in ("cuda", "cpu"):
+                self.assertEqual(spec["criteria"][role][backend][-2:], gates, f"{role}/{backend}")
+                spec["criteria"][role][backend] = spec["criteria"][role][backend][:-2]
+        self.assertEqual(dict(spec, legId=source["legId"], card=source["card"]), source)
+        # the bench mask and the helper mask share no logical CPU (the helper is never a bench CPU)
+        self.assertEqual(int(template["generatorArgs"]["benchAffinityMask"], 16) & int(template["generatorArgs"]["corePartitionHelperMask"], 16), 0)
+
+    def test_the_single_core_legs_pin_one_physical_p_core_at_cap_one_and_differ_from_each_other_in_the_mask_alone(self) -> None:
+        """r4 serial-vs-cooling split: the cool and the hot leg are the cap-1 leg plus the P-core arm's affinity machinery (telemetry, the E-core helper
+        mask, the two partition criteria that fail a leg whose affinity did not apply), with a bench mask of exactly one physical P-core: its two logical
+        CPUs (Core Temp core k = logical CPUs 2k, 2k+1). Same mask size on both, so a speed gap between them is the core, not the mask width."""
+        pcore = self.load("legs/m16-1457-drift-pcore12-unpaced-fullscreen-s1.json")
+        for family, base_rel in ((DRIFT_T1_LEGS, "legs/m16-1457-drift-t1-unpaced-fullscreen-s1.json"),
+                                 (DRIFT_W10_LEGS, "legs/m16-1457-drift-t1-w10-unpaced-fullscreen-s1.json"),
+                                 (DRIFT_VISUAL_LEGS, "legs/m16-1457-drift-t1-w10-visual-unpaced-fullscreen-s1.json")):
+            self.assert_single_core_family(family, self.load(base_rel), pcore)
+
+    def assert_single_core_family(self, family: dict, t1: dict, pcore: dict) -> None:
+        masks = {}
+        for rel, mask in family.items():
+            if mask is None:
+                continue
+            with self.subTest(leg=rel):
+                spec = self.load(rel)
+                self.jsonschema.validate(spec, self.schema)
+                self.assertEqual(spec["legId"], Path(rel).stem)
+                self.assertEqual(spec["card"], "M16-1457-VENUE-BASELINE-DRIFT-1")
+                ga = spec["generatorArgs"]
+                self.assertEqual(ga["playbackMaxThreads"], 1)
+                self.assertEqual(ga["benchAffinityMask"], mask)
+                # r4 adversary A5: the expected value must not come from the same table the spec is checked against, or a swapped table passes. The cool leg is Core Temp c0
+                # (logical CPUs 0+1), the hot leg c2 (logical CPUs 4+5): literals, keyed by the leg's name.
+                self.assertEqual(int(ga["benchAffinityMask"], 16), 0x00003 if "-t1-cool-" in rel else 0x00030, rel)
+                self.assertIs(ga["corePartitionTelemetry"], True)
+                self.assertEqual(ga["corePartitionHelperMask"], pcore["generatorArgs"]["corePartitionHelperMask"], "the helper stays on the E-cores")
+                self.assertEqual(int(ga["benchAffinityMask"], 16) & int(ga["corePartitionHelperMask"], 16), 0, "the helper is never a bench CPU")
+                bits = int(ga["benchAffinityMask"], 16)
+                self.assertEqual(bin(bits).count("1"), 2, "one physical P-core = its two hyper-thread siblings")
+                self.assertEqual(bits & 0xFFF, bits, "a P-core logical CPU (0-11)")
+                first = (bits & -bits).bit_length() - 1
+                self.assertEqual(first % 2, 0, "the pair starts on an even logical CPU (2k, 2k+1)")
+                # r4 adversary A1: the two CPUs are ADJACENT (2k, 2k+1), the SMT-sibling layout Windows gives Bachelor's Alder Lake i9-12900HK (proved from the helper's per-CPU table
+                # against Core Temp's per-core load: correlation 0.999, the rival (k, k+6) order -0.57). {0, 2} or {0, 6} would be two cores and fail here.
+                self.assertEqual(bits >> first, 0b11, "adjacent logical CPUs only")
+                masks[rel] = bits
+                # the rest of the spec is the cap-1 leg's: only legId, the affinity keys and the two partition criteria differ
+                body = json.loads(json.dumps(spec))
+                for key in ("benchAffinityMask", "corePartitionTelemetry", "corePartitionHelperMask"):
+                    body["generatorArgs"].pop(key)
+                gates = [{"metric": "corePartitionTopologyOk", "op": "eq", "value": True}, {"metric": "benchAffinityApplied", "op": "eq", "value": True}]
+                for role in ("acceptance", "supplementary"):
+                    for backend in ("cuda", "cpu"):
+                        self.assertEqual(body["criteria"][role][backend][-2:], gates, f"{role}/{backend}: a leg whose affinity did not apply must FAIL")
+                        body["criteria"][role][backend] = body["criteria"][role][backend][:-2]
+                self.assertEqual(dict(body, legId=t1["legId"]), t1)
+        self.assertEqual(sorted(masks.values()), [0x00003, 0x00030], "one cool core (c0) and one hot core (c2), no overlap")
+
+    def test_the_sweep_names_every_cap_it_compares_and_never_leans_on_the_no_cap_headroom_leg(self) -> None:
+        """r3 adversary A2: the tracked no-cap headroom leg lets the app pick its own worker count (which depends on the host's logical CPUs; the r3 run logs
+        show 16 on Bachelor's 20, but the spec does not pin it), so it is not a pinned 16-worker arm. Every cap the sweep compares (4, 8, 12 and 16) is its
+        own spec carrying that cap; the no-cap leg stays the 'auto' arm."""
+        caps = {rel: self.load(rel)["generatorArgs"].get("playbackMaxThreads") for rel in DRIFT_LEGS
+                if re.search(r"-drift-t\d+-unpaced-", rel)}   # the pure cap legs: not the P-core arm and not the t1 affinity legs (those carry a mask too)
+        self.assertEqual(sorted(caps.values()), [1, 4, 8, 12, 16], caps)
+        self.assertNotIn("playbackMaxThreads", self.load("legs/m16-1457-headroom-unpaced-fullscreen-s1.json")["generatorArgs"])
+
+    def test_every_drift_leg_keeps_its_sources_role_on_each_venue(self) -> None:
+        """r3 adversary A1: a card absent from venues.json roles falls to defaultRole (supplementary), so a drift leg on Bachelor would be recorded
+        supplementary while its source leg (card CUDA-HEADROOM-1) is acceptance. The drift card carries the same roles as its source's card."""
+        table = json.loads((DV / "venues.json").read_text(encoding="utf-8"))
+        for rel, source_rel in DRIFT_LEGS.items():
+            with self.subTest(leg=rel):
+                card, source_card = self.load(rel)["card"], self.load(source_rel)["card"]
+                self.assertIn(card, table["roles"], f"{card} is not in venues.json roles (it would take defaultRole {table['defaultRole']!r})")
+                self.assertEqual(table["roles"][card], table["roles"][source_card])
+
+    def test_no_other_1457_headroom_leg_sets_a_cap_or_the_affinity_keys(self) -> None:
+        for path in sorted((DV / "legs").glob("m16-1457-headroom-*.json")):
+            with self.subTest(leg=path.name):
+                ga = json.loads(path.read_text(encoding="utf-8")).get("generatorArgs") or {}
+                for key in ("playbackMaxThreads", "benchAffinityMask", "corePartitionTelemetry", "corePartitionHelperMask"):
+                    self.assertNotIn(key, ga)
 
 
 class TeamPartitionLegSpecTests(unittest.TestCase):

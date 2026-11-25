@@ -662,6 +662,19 @@ inline bool stressSwitchReachesFloor( int switchAtMs, double floorSeconds )
     return switchAtMs >= std::lround( floorSeconds * 1000.0 );
 }
 
+// GUI-SMOKE-ARG-RANGE-OVERFLOW-1 (#881 pass 6 A7): main.cpp stores --seconds as GuiPlaybackSmokeOptions::durationMs, an int,
+// by qRound( seconds * 1000.0 ), which converts ms + copysign( 0.5, ms ) to int. That conversion is defined only when the value
+// lies strictly inside ( INT_MIN - 1, INT_MAX + 1 ): --seconds 2147483.648 gave 2147483648. True exactly when it is (the same
+// sum qRound forms); false for NaN and +-inf. main.cpp refuses a false (exit 2) and still calls qRound for a true.
+inline bool smokeSecondsFitDurationMs( double seconds )
+{
+    const double product = seconds * 1000.0;                             // the value main.cpp hands to qRound
+    const double rounded = product + std::copysign( 0.5, product );      // qRound's own sum, before its int conversion
+    constexpr double kIntMaxPlusOne = static_cast<double>( std::numeric_limits<int>::max() ) + 1.0;
+    constexpr double kIntMinMinusOne = static_cast<double>( std::numeric_limits<int>::min() ) - 1.0;
+    return rounded < kIntMaxPlusOne && rounded > kIntMinMinusOne;
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // PLAYBACK-CLIP-LENGTH-ENFORCE-3 (owner rule 2026-10-01): "20 s of real footage" is a SOURCE-FRAME quantity.
 //
@@ -1262,6 +1275,200 @@ inline PlayStopState evaluatePlayStop( int64_t consumed, int64_t required, bool 
     return PlayStopState::Continue;
 }
 
+// REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1: does the gui-smoke measured-play loop END on this observation? Pure.
+// A timeline Reached (the source frames were consumed) is seen BEFORE the frames still in flight have presented, so a
+// frame-pinned capture (targetPresentedFrames > 0) that broke on it stopped 2 to 3 frames short and failed the strict
+// presented == target check (exit 11, 0 frames written). While target > 0 and presented < target a Reached therefore does
+// NOT end the loop: the presented-count stop (the present path stops Play at exactly N) ends it. SafetyTimeout, EndedEarly
+// and PaceTooSlow still end it at once -- SafetyTimeout above all, so the wall-clock net still bounds the loop (Reached past
+// the deadline is already SafetyTimeout in evaluatePlayStop); a Continue is not a stop (the caller polls again).
+// target == 0 (an unpinned play) is exactly the previous decision.
+// stressPending: the clip-lifecycle stress has not run yet, so a Reached must wait for it (its own, older reason).
+// Two limits keep the wait to the case it is for (adversary pass on 7f0f6d58, A2 and A3):
+//  - requiredSourceFrames (the admitted window, MainWindow m_playRequiredSourceFrames): the loop waits only while the
+//    pinned count fits the admitted window (target <= required). A target beyond it (--seconds shorter than N / fps) was
+//    never reachable inside the admitted window; it keeps today's decision, the exit-11 mismatch, and never plays on past it.
+//  - playStillRunning (Play is still checked): presents can still arrive only while Play runs. A Play that already ended
+//    (the cut-out stop, the engine's own end) with the count short is the terminal exit-11 mismatch, not a 55 s wait for a
+//    count that is frozen and then a PLAY_SAFETY_TIMEOUT.
+// r3 (Grok G1(b) on ee8f00bc): a third limit. consumedSourceFrames (m_sourceAdvance.consumed()) is how far the timeline has
+// run. The wait is for the frames that were already IN FLIGHT at the Reached, and the render pipeline cannot hold more than
+// kMeasuredPlayMaxFramesInFlight of them, so the loop waits only while the timeline is fewer than that many source frames
+// past the admitted window (it stops at the observation that sees it that far past). Presents that stall or skip (drops) while Play still runs on a paced timeline end the wait there: the
+// exit-11 mismatch, as before this card, and never a Play that runs on past the window to the safety timeout, or that
+// makes up dropped presents with source frames from outside the pinned window. A timeline that holds at the window (the
+// unpaced isolated hold in playbackHandling) never trips it; that wait is bounded by the SafetyTimeout above.
+// RenderFrameThread::kMaxFrameSlotCount (12) + RenderFrameThread::kRenderRequestQueueDepth (4); both are private there.
+constexpr int64_t kMeasuredPlayMaxFramesInFlight = 16;
+inline bool measuredPlayLoopShouldStop( PlayStopState state, bool stressPending,
+                                        int64_t targetPresentedFrames, int64_t presentedFrames,
+                                        int64_t requiredSourceFrames, bool playStillRunning,
+                                        int64_t consumedSourceFrames )
+{
+    switch( state )
+    {
+    case PlayStopState::SafetyTimeout:
+    case PlayStopState::EndedEarly:
+    case PlayStopState::PaceTooSlow:
+        return true;
+    case PlayStopState::Reached:
+        if( stressPending ) return false;
+        // GUI-SMOKE-ARG-RANGE-OVERFLOW-1: consumed - required is formed only once consumed >= required (> 0 here), where it
+        // cannot overflow; a timeline short of the window is not past it (the same answer the signed difference gave).
+        return !( targetPresentedFrames > 0 && presentedFrames < targetPresentedFrames
+                  && targetPresentedFrames <= requiredSourceFrames && playStillRunning
+                  && ( consumedSourceFrames < requiredSourceFrames
+                       || consumedSourceFrames - requiredSourceFrames < kMeasuredPlayMaxFramesInFlight ) );
+    case PlayStopState::Continue:
+        break;
+    }
+    return false;
+}
+
+// REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r4 (Grok G4 / adversary pass 3 A1 on 38c05d4b): the presented count a
+// frame-pinned capture is judged on (the strict presented == target check, exit 11). Pure.
+// A count cannot tell a frame still in flight from a DROPPED one, so the Reached wait above may let the timeline run on and a
+// source frame PAST the admitted window complete the count (the present path then stops Play on it). A present from outside the
+// admitted window is not part of the pinned capture, so the present path ALSO counts the presents whose source frame lies inside
+// the window (sourceFrameInsideAdmittedWindow; r8: PinnedWindowPresents below, deduplicated), and the capture is met only when
+// EVERY present was inside the window and there were exactly target of them. Any present from outside the window -- the frame
+// that completed the count, or one in the middle (a seek out and back, adversary pass 6 A2 on bcac2010) -- and any raw count
+// above the target (pass 6 A1) end by the not-met path (exit 11, the unchanged `not met; target=N observed=M`), never a success.
+// The admitted window is [windowStartFrame, windowStartFrame + requiredSourceFrames - 1]: the counter's start frame (fixed when
+// the measured Play armed it; a later begin is ignored) and the admitted requirement (fixed at admission). Both are fixed before
+// the first present and NOTHING during the wait moves them -- unlike highWater, which a seek rebases (adversary pass 4 A4 on
+// 6e9145fb) -- and the window has a lower bound, so a backward seek's frame below it is outside too (pass 4 A5).
+// No admitted window (requiredSourceFrames <= 0) or an unarmed counter: nothing is inside (fail closed).
+inline bool sourceFrameInsideAdmittedWindow( int64_t sourceFrame, bool counterArmed, int64_t windowStartFrame,
+                                             int64_t requiredSourceFrames )
+{
+    // frame - start is computed only once frame >= start, so no inclusive end is formed (no overflow; pass 6 A8)
+    // GUI-SMOKE-ARG-RANGE-OVERFLOW-1 (#881 pass 7 A7): and in uint64_t, where frame - start (at most 2^64 - 1) is exact
+    // for every int64 pair; the signed form overflowed for e.g. ( 0, INT64_MIN ). Same answer for every non-overflowing input.
+    return counterArmed && requiredSourceFrames > 0 && sourceFrame >= windowStartFrame
+        && static_cast<uint64_t>( sourceFrame ) - static_cast<uint64_t>( windowStartFrame )
+               < static_cast<uint64_t>( requiredSourceFrames );
+}
+// The `observed` the strict check compares with the target: equal to it only when presented == windowPresented == target.
+// All presents inside the window: the raw count, exactly as before this card. Otherwise the window count, unless that alone
+// would equal the target (out-of-window presents on top of N in-window ones): then the raw count, which is above it.
+inline int64_t pinnedCaptureObservedFrames( int64_t targetPresentedFrames, int64_t presentedFrames,
+                                            int64_t windowPresentedFrames )
+{
+    if( windowPresentedFrames == presentedFrames ) return presentedFrames;
+    return windowPresentedFrames == targetPresentedFrames ? presentedFrames : windowPresentedFrames;
+}
+
+// REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r8 (the r7 venue run on 970ef3f9: M16-1243 from frame 120, target 480, exit 11 with
+// `observed=470` and 10 presents past the window, last presented frame 609). Two defects, both fixed here:
+//  - The window started at the counter's start frame (120), which Play never presents: it is already on screen when Play starts
+//    and Play's first tick advances off it (the venue log: 120 -> 121, first Play present 121). So a run with no fault at all
+//    topped out at 479 in-window presents, and the present path, stopping on the RAW count, stopped one frame past the window.
+//  - Every-frame Play acquired the NEWEST ready frame first (see playbackAcquiresOldestReadyFirst below).
+// PinnedWindowPresents is the ONE count the present-path stop, the measured-play loop and the exit-11 check all use: the distinct
+// source frames of the pinned window that were shown. The pinned window is the N frames Play presents,
+// [pinnedWindowFirstFrame( start ), start + N] -- so presented frame N is source frame start + N, the identity the capture script
+// documents for drop-frame-off runs. A repeated present of a window frame and a present of a frame outside the window never count.
+// Armed once, before the first present, from the counter's start frame and the admitted requirement, which nothing moves during the
+// Play (a later arm is ignored). Unarmed, nothing is inside (fail closed).
+inline int64_t pinnedWindowFirstFrame( int64_t counterStartFrame ) { return counterStartFrame + 1; }
+struct PinnedWindowPresents
+{
+    int64_t windowStart = 0;
+    int64_t windowFrames = 0;           // 0 = not armed
+    int64_t target = 0;                 // the pinned count N
+    int64_t identityFrame = -1;         // start + N: the frame a met capture ends on (the capture script's identity)
+    std::vector<unsigned char> seen;    // one flag per window source frame
+    int64_t distinct = 0;               // distinct window source frames shown: the pinned count
+    int64_t outside = 0;                // presents of a source frame outside the window (never counted)
+    int64_t repeats = 0;                // presents of a window frame already counted (never counted again)
+    int64_t lastFrame = -1;             // the source frame of the latest present, whatever it was
+    bool armed() const { return windowFrames > 0; }
+    void arm( int64_t firstFrame, int64_t frames, int64_t targetFrames )
+    {
+        if( armed() || frames <= 0 || targetFrames <= 0 ) return;
+        windowStart = firstFrame;
+        windowFrames = frames;
+        target = targetFrames;
+        identityFrame = firstFrame + ( targetFrames < frames ? targetFrames : frames ) - 1;
+        seen.assign( static_cast<size_t>( frames ), 0 );
+    }
+    void notePresent( int64_t sourceFrame )
+    {
+        lastFrame = sourceFrame;
+        // r8 fix 1 (adversary A3): the start frame is the frame already on screen when Play began; a present of it (drop-frame
+        // Play's first tick can grant under one frame, and the start refresh submits it) is a repeat, never an outside present.
+        // r9 (adversary pass 9 A3): only before the first counted present; after it, a present of the start frame is a seek back
+        // out of the window: outside (fail closed).
+        if( armed() && sourceFrame == windowStart - 1 && distinct == 0 && outside == 0 ) { ++repeats; return; }
+        if( !sourceFrameInsideAdmittedWindow( sourceFrame, armed(), windowStart, windowFrames ) ) { ++outside; return; }
+        unsigned char &shown = seen[static_cast<size_t>( sourceFrame - windowStart )];
+        if( shown ) { ++repeats; return; }
+        shown = 1;
+        ++distinct;
+    }
+};
+// r8 fix 1 (adversary A4): the distinct window frames shown, credited in full only while the latest present is the identity frame
+// (start + N). N distinct frames whose latest present is another one (a backfill after the identity frame) count one short, so the
+// capture never stops on, or saves, a frame that is not start + N.
+inline int64_t pinnedWindowShownCount( const PinnedWindowPresents &w )
+{
+    if( !w.armed() || w.distinct < w.target || w.lastFrame == w.identityFrame ) return w.distinct;
+    return w.target - 1;
+}
+// What the present-path stop and the measured-play loop count toward the target: the shown count above, never raw presents.
+// r8 fix 1 (adversary A7): once any present fell outside the window the capture can never be met (the exit-11 check fails it
+// whatever comes next), so the count is the target: the wait ends at once, on the not-met path, instead of running on while
+// consumed() (which never counts a seek) stays under kMeasuredPlayMaxFramesInFlight past the window.
+inline int64_t pinnedPresentStopCount( const PinnedWindowPresents &w )
+{
+    if( w.armed() && w.outside > 0 ) return w.target;
+    return pinnedWindowShownCount( w );
+}
+// The `observed` of the strict check (exit 11): pinnedCaptureObservedFrames over the counted presents (distinct window frames plus
+// out-of-window presents; repeats are neither) and the shown count: equal to the target only when there were exactly target
+// distinct window frames, the latest present was the identity frame, and no present fell outside the window.
+inline int64_t pinnedWindowObservedFrames( int64_t targetPresentedFrames, const PinnedWindowPresents &w )
+{
+    return pinnedCaptureObservedFrames( targetPresentedFrames, w.distinct + w.outside, pinnedWindowShownCount( w ) );
+}
+// r8 fix 1 (adversary A1): the unpaced isolated hold (playbackHandling) holds once the counter consumed the required source
+// frames. The counter counts the start frame, so that is the playhead on start + required - 1: one short of the pinned window's
+// identity frame. A pinned capture holds one frame later (consumed > required), so the identity frame is requested and presented;
+// an unpinned run holds exactly as before.
+inline bool pinnedUnpacedHoldReached( int64_t targetPresentedFrames, int64_t consumedSourceFrames, int64_t requiredSourceFrames )
+{
+    return targetPresentedFrames <= 0 || consumedSourceFrames > requiredSourceFrames;
+}
+// r8 fix 1 (adversary A2): a pinned capture is admitted only when its identity frame start + N exists and lies BEFORE the last frame
+// (lastFrameIndex, 0-based) -- the engine's end-of-clip stop can end Play before the last frame's present is credited. Refused
+// up front (exit 14) rather than played to a short count. An unpinned run (N <= 0) is never refused here.
+inline bool pinnedIdentityFrameAdmitted( int64_t startFrame, int64_t targetPresentedFrames, int64_t lastFrameIndex )
+{
+    if( targetPresentedFrames <= 0 ) return true;
+    if( startFrame < 0 || startFrame > lastFrameIndex ) return false;
+    return lastFrameIndex - startFrame > targetPresentedFrames;
+}
+// Every-frame Play (drop-frame mode off) shows every source frame, so a ready frame never overtakes an older ready one. The
+// venue log: the frame skipped by drawFrameReady's forward-only guard was already READY when the next one finished
+// (request_state rendering 0, ready slots 1), and the acquire took the newer one first. A paused redraw and unpinned drop-frame
+// Play keep the newest ready frame first (a stale frame there is rightly skipped).
+// r8 fix 1: a pinned capture's Play too, whatever the drop-frame mode. The measured venue Play ran with drop-frame mode off
+// (playback_smoke.start drop_frame=0; the `automation.pacing_isolated ... drop_frame=1` line is logged at gui-smoke-entry, before
+// the capture's drop-frame-off setting applies), so the every-frame rule above is what engaged there. Oldest-first for a pinned
+// capture in drop-frame mode is a harmless extension for that input (adversary pass 8 A3), not the venue's cause.
+inline bool playbackAcquiresOldestReadyFirst( bool playing, bool dropFrameMode, bool pinnedCapture )
+{
+    return playing && ( !dropFrameMode || pinnedCapture );
+}
+// RenderFrameThread's ready-slot choice: does the ready slot with candidateSerial replace the one chosen so far (chosenSerial)?
+// Newest first is the previous rule exactly (a later serial, or an equal one, replaces).
+inline bool readySlotPreferred( bool oldestFirst, bool haveChosen, uint64_t candidateSerial, uint64_t chosenSerial )
+{
+    if( !haveChosen ) return true;
+    return oldestFirst ? candidateSerial < chosenSerial : candidateSerial >= chosenSerial;
+}
+
 inline const char *playStopFailureReason( PlayStopState state )
 {
     switch( state )
@@ -1319,6 +1526,16 @@ inline CutRange engineCutRangeForPlay( int cutIn, int cutOut, int totalFrames, b
     raw.cutIn = std::max( 1, std::min( cutIn, totalFrames ) );
     raw.cutOut = std::max( 1, std::min( cutOut, totalFrames ) );
     return raw;
+}
+
+// REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r9 (adversary pass 9 A1): the last frame (0-based) a pinned capture's identity
+// admission (pinnedIdentityFrameAdmitted) judges against -- the last frame of the range the engine plays and the play gate
+// (checkPlayableWindow) judges, never the raw cut-out: with the collapsed-range repair on, a collapsed or inverted range plays to the
+// clip end. -1 when there is no valid range (no clip): every pinned capture is then refused (fail closed).
+inline int pinnedAdmissionLastFrame( int cutIn, int cutOut, int totalFrames, bool repairEnabled )
+{
+    const CutRange range = engineCutRangeForPlay( cutIn, cutOut, totalFrames, repairEnabled );
+    return range.valid ? range.cutOut - 1 : -1;
 }
 
 // evaluatePlayableWindow -- pure. positionFrame is the 0-based slider position; cutIn/cutOut are the raw

@@ -367,7 +367,7 @@ __global__ void k_alias_gauss(uint16_t* __restrict alias_map,
     + (AX(-2,-6)+AX(2,-6)+AX(-6,-2)+AX(6,-2)+AX(-6,2)+AX(6,2)+AX(-2,6)+AX(2,6)) * 111 / 1024
     + (AX(-2,-6)+AX(2,-6)+AX(-6,-2)+AX(6,-2)+AX(-6,2)+AX(6,2)+AX(-2,6)+AX(2,6)) * 57 / 1024;
     #undef AX
-    alias_map[x + (size_t)y*W] = (uint16_t)c;
+    alias_map[x + (size_t)y*W] = (uint16_t)imin(c, 0xFFFF);  /* saturate like the CPU, never wrap */
 }
 
 /* 2x2 grayscale-max clamp (no skip). y,x step 2 in [2,h-2)/[2,w-2). */

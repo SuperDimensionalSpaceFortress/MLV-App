@@ -7,7 +7,7 @@ What changed from round 1 (sol hardening): the allowlist is no longer "any line 
 comment". The scan strips comments and string literals with a real tokenizer (a ``//`` inside a string cannot hide
 code, a block comment cannot carry an exemption), matches over the WHOLE file (a line break between
 ``actionPlay`` and ``->trigger`` cannot split a match), and treats EVERY use of the Play / Loop action as
-unreviewed unless it is one of a short list of safe forms or sits inside one of three PINNED helper bodies whose
+unreviewed unless it is one of a short list of safe forms or sits inside one of the PINNED helper bodies whose
 exact text is compared with a pinned string. Adding an exemption therefore means editing this file, in review.
 
 ENFORCE-3 (sol r2 hardening, owner rule 2026-10-01 "20 s means 20 s of source frames"): the scan now also pins
@@ -144,11 +144,14 @@ PINNED_STOP_STATEMENTS = {
     ),
     "MainWindow::runGuiPlaybackSmoke": (
         "measuredState = programmaticPlayState( playbackClock.elapsed(), measuredSafetyMs ); "
-        "if( measuredState == playback_frame_range::PlayStopState::SafetyTimeout "
-        "|| measuredState == playback_frame_range::PlayStopState::EndedEarly "
-        "|| measuredState == playback_frame_range::PlayStopState::PaceTooSlow "
-        "|| ( measuredState == playback_frame_range::PlayStopState::Reached "
-        "&& !( options.exerciseClipLifecycleStress && !stressAttempted ) ) ) { break; }",
+        # REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1: the stop decision is the pure predicate (a frame-pinned capture's
+        # Reached waits for its presented count; the timeout, early-end and pace stops, and an unpinned play, are unchanged).
+        "if( playback_frame_range::measuredPlayLoopShouldStop( measuredState, "
+        "options.exerciseClipLifecycleStress && !stressAttempted, "
+        # r8: the count is the distinct admitted-window frames shown, the one the present path and the exit-11 check use.
+        "m_playbackSmokeTargetPresentedFrames, playback_frame_range::pinnedPresentStopCount( m_playbackSmokePinnedWindow ), "
+        # r3 (Grok G1(b)): and how far the timeline has run, so the wait never runs on past the admitted window.
+        "m_playRequiredSourceFrames, ui->actionPlay->isChecked(), m_sourceAdvance.consumed() ) ) { break; }",
         "if( measuredState != playback_frame_range::PlayStopState::Reached ) { "
         "m_playbackSmokeFullscreenLossLatchArmed = false; programmaticStop( \"gui-smoke-measured-early-end\" );",
         "&& programmaticPlayConsumed() && ( playbackClock.elapsed() >= qMax( 0, options.stressSwitchAtMs ) "
@@ -236,6 +239,30 @@ PINNED_HELPER_BODIES = {
     "void MainWindow::forceLoopOffForAutomation(":
         '{ if( !ui->actionLoop->isChecked() ) return; logInteractionEvent( QStringLiteral("automation.loop_forced_off"), '
         'QStringLiteral("site=%1").arg( QString::fromLatin1( site ) ) ); ui->actionLoop->trigger(); }',
+    # PLAYER-FULLSCREEN-CONTROL-BAR-1 r3 (reviewed; key3 owes a look): the fullscreen control bar's Play button. It is
+    # USER input like the toolbar button and the context menu (_PLAY_SAFE_BEFORE): the trigger runs only for a mouse
+    # event the bar took (the CPU bar widget's own events, or a GL-window event routed from eventFilter), mapped through
+    # hitTest / onMouse / route / actionOf. The WHOLE body is pinned, not the one statement, so a second trigger, a
+    # changed mapping or a trigger reached without a bar event changes the pin and goes back to review. The bar reads
+    # the play state only through isChecked() (no connect on the action: fullscreenBarSyncPlayState).
+    "bool MainWindow::fullscreenBarInput(":
+        "{ Qt::MouseButton button = Qt::NoButton; Qt::MouseButtons buttons = Qt::NoButton; bool pressCreatedDoubleClick = "
+        "false; if( const QMouseEvent *mouse = dynamic_cast<const QMouseEvent *>( event ) ) { button = mouse->button(); "
+        "buttons = mouse->buttons(); pressCreatedDoubleClick = mouse->flags().testFlag( Qt::MouseEventCreatedDoubleClick ); "
+        "} else if( const QWheelEvent *wheel = dynamic_cast<const QWheelEvent *>( event ) ) { buttons = wheel->buttons(); } "
+        "const fullscreen_bar::Part part = fullscreen_bar::hitTest( layout, devicePos ); fullscreen_bar::Action action = "
+        "fullscreen_bar::Action::None; if( fromWidget && event->type() == QEvent::Wheel && !fullscreen_bar::claims( "
+        "m_fullscreenBarInput, fullscreenBarShown(), event->type(), button, buttons, part ) ) return false; if( fromWidget "
+        ") action = fullscreen_bar::onMouse( &m_fullscreenBarInput, event->type(), button, buttons, part ); else if( "
+        "!fullscreen_bar::route( &m_fullscreenBarInput, fullscreenBarShown(), event->type(), button, buttons, part, "
+        "&action ) ) return false; action = fullscreen_bar::actionOf( action, event->type(), pressCreatedDoubleClick ); "
+        "switch( action ) { case fullscreen_bar::Action::TogglePlay: ui->actionPlay->trigger(); "
+        "fullscreenBarSyncPlayState(); break; case fullscreen_bar::Action::PrevFrame: ui->actionPreviousFrame->trigger(); "
+        "break; case fullscreen_bar::Action::NextFrame: ui->actionNextFrame->trigger(); break; case "
+        "fullscreen_bar::Action::ExitFullscreen: ui->actionFullscreen->trigger(); break; case fullscreen_bar::Action::Seek: "
+        "{ QSlider *slider = ui->horizontalSliderPosition; const int total = slider->maximum() - slider->minimum() + 1; "
+        "slider->setValue( slider->minimum() + fullscreen_bar::seekFrameAt( layout, devicePos.x(), total ) ); break; } "
+        "case fullscreen_bar::Action::None: break; } return true; }",
 }
 PROGRAMMATIC_PLAY_SIGNATURE = "bool MainWindow::programmaticPlay("
 
@@ -573,6 +600,10 @@ PINNED_EVENT_SITES = {
     ("platform/qt/MainWindow.cpp", "postEvent"): 1,
     ("platform/qt/FocusPixelMapManager.cpp", "notify"): 3,
     ("platform/qt/SyncDownloadWaiter.h", "notify"): 2,
+    # PLAYER-FULLSCREEN-CONTROL-BAR-1 r3 (reviewed; key3 owes a look): FullscreenControlBarWidget::forwardWheelToView
+    # hands a wheel the bar does not take (a gesture begun elsewhere) to the view's viewport: a QWheelEvent cloned from
+    # the one Qt just delivered, same global position and deltas. It makes up no event and never a key event.
+    ("platform/qt/FullscreenControlBar.cpp", "sendEvent"): 1,
 }
 
 
