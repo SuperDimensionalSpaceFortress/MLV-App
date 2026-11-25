@@ -1673,9 +1673,17 @@ function ConvertFrom-VenueSmokeHostLoad {
     whose collected is not the boolean true (2026-11-21 leg a134532e: "collection failed: CimException") reads state 'unknown', never 'quiet' and never blank,
     and a missing block reads 'unknown'. Returns { state; provisional; collected; reason }. Pure: no file access.
     #>
+    # r1 (adversary-8c2884e9.json A1): a property value is returned as it is (the comma stops the pipeline unrolling a one-element array, so [false] or [true]
+    # is never read as the boolean inside it), and an array is never an object to read a property from. A2: the state is kept only when it is a plain ASCII
+    # lower-case token (no padding, control or format character); anything else reads 'unknown', and only the exact ordinal 'quiet' is clean.
     param([AllowNull()][object]$HostLoad)
-    function Get-HlProp([object]$O, [string]$N) { if ($null -eq $O -or $O -is [string] -or $O -is [ValueType]) { return $null }; $p = $O.PSObject.Properties[$N]; if ($null -eq $p) { $null } else { $p.Value } }
-    if ($null -eq $HostLoad -or $HostLoad -is [string] -or $HostLoad -is [ValueType] -or $HostLoad -is [Array]) {
+    function Get-HlProp([object]$O, [string]$N) {
+        if ($null -eq $O -or $O -is [string] -or $O -is [ValueType] -or $O -is [Array] -or $O -is [System.Collections.IList]) { return $null }
+        $p = $O.PSObject.Properties[$N]
+        if ($null -eq $p) { return $null }
+        , $p.Value
+    }
+    if ($null -eq $HostLoad -or $HostLoad -is [string] -or $HostLoad -is [ValueType] -or $HostLoad -is [Array] -or $HostLoad -is [System.Collections.IList]) {
         return [pscustomobject]@{ state = 'unknown'; provisional = $true; collected = $false; reason = 'no hostLoad block in the smoke result' }
     }
     $errors = @()
@@ -1690,10 +1698,10 @@ function ConvertFrom-VenueSmokeHostLoad {
         }
     }
     $stateRaw = Get-HlProp $HostLoad 'state'
-    $state = $(if ($stateRaw -is [string] -and -not [string]::IsNullOrWhiteSpace($stateRaw)) { ($stateRaw.Trim() -replace '\s+', '_') } else { 'unknown' })
+    $state = $(if ($stateRaw -is [string] -and [regex]::IsMatch($stateRaw, '\A[a-z][a-z_-]{0,31}\z')) { $stateRaw } else { 'unknown' })
     if (-not $collected) { $state = 'unknown' }
     $prov = Get-HlProp $HostLoad 'provisional'
-    $provisional = (-not ($prov -is [bool] -and -not $prov)) -or ($state -cne 'quiet')
+    $provisional = (-not ($prov -is [bool] -and -not $prov)) -or (-not [string]::Equals($state, 'quiet', [StringComparison]::Ordinal))
     $why = Get-HlProp $HostLoad 'reason'
     $reason = @(@($errors) + @($(if ($why) { [string]$why }))) -join '; '
     [pscustomobject]@{ state = $state; provisional = [bool]$provisional; collected = [bool]$collected; reason = $reason }
@@ -1717,8 +1725,10 @@ function Get-VenueLegHostLoad {
         if ($isExport) { return [pscustomobject]@{ state = 'not-applicable'; provisional = $false; collected = $false; reason = 'export leg: no GUI smoke'; applies = $false } }
         $result = Join-Path $evidence 'result.json'
         if (-not (Test-Path -LiteralPath $result -PathType Leaf)) { return $unknown }
-        $doc = [IO.File]::ReadAllText($result) | ConvertFrom-Json
-        $hl = $(if ($null -ne $doc -and $doc -isnot [string] -and $doc -isnot [ValueType] -and $doc -isnot [Array] -and $doc.PSObject.Properties['hostLoad']) { $doc.hostLoad } else { $null })
+        # r1 (adversary-8c2884e9.json A1): -NoEnumerate and no $( ) around the value, so a one-element array (the root or the hostLoad block) is never unrolled
+        $doc = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($result)) -NoEnumerate
+        $hl = $null
+        if ($null -ne $doc -and $doc -isnot [string] -and $doc -isnot [ValueType] -and $doc -isnot [Array] -and $doc -isnot [System.Collections.IList] -and $doc.PSObject.Properties['hostLoad']) { $hl = $doc.PSObject.Properties['hostLoad'].Value }
         $s = ConvertFrom-VenueSmokeHostLoad -HostLoad $hl
         $s | Add-Member -NotePropertyName applies -NotePropertyValue $true
         $s
@@ -1731,13 +1741,18 @@ function Get-VenueLegHostLoad {
 function Get-VenueReferenceHostLoadRefusal {
     # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: the typed line for a leg that must not be counted as a control/reference arm, or $null when it may be.
     # REFERENCE_PROVISIONAL leg=<id> reason=hostload-<state> (hostload-provisional when the state reads quiet but the leg is provisional).
+    # r1 (adversary-8c2884e9.json A3): nothing is coerced. Only applies that is the boolean false (Get-VenueLegHostLoad's export leg) skips the rule; a leg is
+    # clean only when provisional is the boolean false, collected the boolean true and state the exact ordinal 'quiet' (A2), so a standing that says
+    # provisional=false beside an unknown state or an uncollected snapshot is still refused.
     param([AllowEmptyString()][AllowNull()][string]$LegId, [AllowNull()][object]$Standing)
-    $applies = $(if ($null -ne $Standing -and $Standing.PSObject.Properties['applies']) { [bool]$Standing.applies } else { $true })
-    if (-not $applies) { return $null }
-    $prov = $(if ($null -ne $Standing -and $Standing.PSObject.Properties['provisional']) { $Standing.provisional } else { $true })
-    if ($prov -is [bool] -and -not $prov) { return $null }
-    $state = $(if ($null -ne $Standing -and $Standing.PSObject.Properties['state'] -and $Standing.state) { [string]$Standing.state } else { 'unknown' })
-    $why = $(if ($state -ceq 'quiet') { 'provisional' } else { $state -replace '[^A-Za-z0-9_.-]', '_' })
+    function Get-StProp([object]$O, [string]$N) { if ($null -eq $O -or $O -is [string] -or $O -is [ValueType] -or $O -is [Array]) { return $null }; $p = $O.PSObject.Properties[$N]; if ($null -eq $p) { return $null }; , $p.Value }
+    $applies = Get-StProp $Standing 'applies'
+    if ($applies -is [bool] -and -not $applies) { return $null }
+    $prov = Get-StProp $Standing 'provisional'; $coll = Get-StProp $Standing 'collected'; $st = Get-StProp $Standing 'state'
+    $state = $(if ($st -is [string] -and [regex]::IsMatch($st, '\A[a-z][a-z_-]{0,31}\z')) { $st } else { 'unknown' })
+    $isQuiet = [string]::Equals($state, 'quiet', [StringComparison]::Ordinal)
+    if ($prov -is [bool] -and -not $prov -and $coll -is [bool] -and $coll -and $isQuiet) { return $null }
+    $why = $(if ($isQuiet) { 'provisional' } else { $state })
     $id = $(if ([string]::IsNullOrWhiteSpace($LegId)) { 'UNKNOWN' } else { $LegId -replace '\s', '_' })
     "REFERENCE_PROVISIONAL leg=$id reason=hostload-$why"
 }
@@ -1745,19 +1760,21 @@ function Get-VenueReferenceHostLoadRefusal {
 function Get-VenueReferenceArmVerdict {
     <#
     .SYNOPSIS
-    VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: the control/reference arm of a comparison, legs given as { legId; hostLoad } (hostLoad = the smoke result's raw block, or a
-    standing already read by Get-VenueLegHostLoad). A leg whose host load is provisional or unknown is never COUNTED as the arm: it is listed with its typed
-    REFERENCE_PROVISIONAL line, and the verdict is INCONCLUSIVE (never a pass, never a regression). Every leg stays in legs. COUNTED only when every leg is clean
-    and there is at least one. Pure.
+    VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: the control/reference arm of a comparison, legs given as { legId; hostLoad } (hostLoad = the smoke result's raw hostLoad
+    block). A leg whose host load is provisional or unknown is never COUNTED as the arm: it is listed with its typed REFERENCE_PROVISIONAL line, and the verdict
+    is INCONCLUSIVE (never a pass, never a regression). Every leg stays in legs, a null one included (A4: it is an unknown leg). COUNTED only when every leg is
+    clean and there is at least one. r1 (adversary-8c2884e9.json A3): the block is always judged by ConvertFrom-VenueSmokeHostLoad; a caller-supplied
+    standing (applies / collected fields) is never trusted. Pure.
     #>
     param([AllowNull()][AllowEmptyCollection()][object[]]$Legs)
     $all = [System.Collections.Generic.List[object]]::new(); $counted = [System.Collections.Generic.List[object]]::new(); $refusals = [System.Collections.Generic.List[string]]::new()
     foreach ($leg in @($Legs)) {
-        if ($null -eq $leg) { continue }
-        $lid = $(if ($leg.PSObject.Properties['legId']) { [string]$leg.legId } else { '' })
-        $raw = $(if ($leg.PSObject.Properties['hostLoad']) { $leg.hostLoad } else { $null })
-        $isStanding = ($null -ne $raw -and $raw -isnot [string] -and $raw -isnot [ValueType] -and $raw.PSObject.Properties['applies'] -and $raw.PSObject.Properties['collected'])
-        $s = $(if ($isStanding) { $raw } else { ConvertFrom-VenueSmokeHostLoad -HostLoad $raw })
+        $isObj = ($null -ne $leg -and $leg -isnot [string] -and $leg -isnot [ValueType] -and $leg -isnot [Array])
+        $lidP = $(if ($isObj) { $leg.PSObject.Properties['legId'] } else { $null })
+        $lid = $(if ($null -ne $lidP -and $lidP.Value -is [string]) { [string]$lidP.Value } else { '' })
+        $rawP = $(if ($isObj) { $leg.PSObject.Properties['hostLoad'] } else { $null })
+        $raw = $null; if ($null -ne $rawP) { $raw = $rawP.Value }
+        $s = ConvertFrom-VenueSmokeHostLoad -HostLoad $raw
         $line = Get-VenueReferenceHostLoadRefusal -LegId $lid -Standing $s
         $row = [pscustomobject]@{ legId = $lid; hostLoadState = [string]$s.state; hostLoadProvisional = [bool]$s.provisional; counted = ($null -eq $line) }
         $all.Add($row)

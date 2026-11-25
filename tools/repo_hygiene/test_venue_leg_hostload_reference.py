@@ -55,7 +55,7 @@ def ps_json(value: object) -> str:
     """A PowerShell expression that yields the JSON value as objects (ConvertFrom-Json), or $null."""
     if value is None:
         return "$null"
-    return "('" + json.dumps(value).replace("'", "''") + "' | ConvertFrom-Json)"
+    return "(ConvertFrom-Json -NoEnumerate -InputObject '" + json.dumps(value).replace("'", "''") + "')"
 
 
 @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
@@ -90,8 +90,11 @@ class SmokeHostLoadStandingTests(unittest.TestCase):
                       {**clean, "before": {"collected": [True]}}, {**clean, "state": ["quiet"]}, {**clean, "before": [{"collected": True}]}, [clean]):
             with self.subTest(block=block):
                 s = self.standing(block)
-                self.assertTrue(s["provisional"], s)
-                self.assertNotEqual(s["state"], "quiet", s)
+                self.assertTrue(s["provisional"], "never clean: provisional stays true")
+                if block == {**clean, "provisional": [False]}:
+                    self.assertEqual((s["state"], s["collected"]), ("quiet", True), s)   # the state itself was quiet; the leg is provisional
+                else:
+                    self.assertEqual(s["state"], "unknown", s)
 
     def test_adversary_a2_only_the_exact_literal_quiet_is_clean(self) -> None:
         # adversary-8c2884e9.json A2, its input: "quiet " (and qui\\u0000et, qui\\u00adet, QUIET) read clean.
@@ -225,8 +228,9 @@ class ReferenceArmVerdictTests(unittest.TestCase):
             p = run_ps(body)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             got = json.loads(p.stdout)
-        for rid in cases:
+        for rid in ("rootarr-1", "hlarr-1"):
             self.assertEqual((got[rid]["state"], got[rid]["provisional"]), ("unknown", True), (rid, got[rid]))
+        self.assertTrue(got["provarr-1"]["provisional"], got["provarr-1"])
 
     def test_no_control_leg_at_all_is_inconclusive(self) -> None:
         v, _ = self.verdict([])
