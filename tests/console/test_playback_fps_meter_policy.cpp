@@ -2,6 +2,7 @@
 
 #include "../../platform/qt/PlaybackFpsMeterPolicy.h"
 #include "../../platform/qt/PlaybackFrameRange.h"
+#include "../../platform/qt/PlaybackSourceAdvanceTracker.h"
 
 #include <QElapsedTimer>
 #include <QTime>
@@ -551,6 +552,83 @@ TEST(PlaybackFpsMeterPolicy, AFoldedStartKeepsItsDeltaAndTheAppliedAdvanceAccoun
     // the Loop ticks above never clamp
     ASSERT_TRUE(stale.clampedFrames == 0.0);
     ASSERT_TRUE(back.clampedFrames == 0.0);
+}
+
+// PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r9 (sol r8 blocker on 4eb1cfd5; DC-06 catalogue row "a correction of a stale start
+// counted as travelled laps"): r6 folded a stale start only at or past the tick's LAP LIMIT, so a stale start between the
+// wrap point and that limit still wrapped the base's way and its stale distance was counted as travelled laps. Sol's repro:
+// during Play, Drop Frame off, seek 100 -> 10, cut 1..50, Drop Frame and Loop on before the next eligible tick. The Drop
+// Frame position is still 100 (the normalizer keeps a position inside the clip); cut 1..50 wraps at 49 by 49. A zero
+// request moved 100 -> 2 with appliedFrames 0 and recorded two 49-frame laps, which the paint credit read as 2 + 98 - 10 =
+// 90 source frames played; an 8 ms request at 24 fps (0.192 frames) recorded the same two laps. After r9 wrapLaps counts
+// only laps the applied delta crossed from an in-cut start: ANY start outside the loop range [wrapAt - width, wrapAt) is
+// folded into it first (a correction, reported as foldedFrames, zero laps).
+TEST(PlaybackFpsMeterPolicy, AStaleLoopStartAnyDistanceOutsideTheCutIsACorrectionWithNoTravelledLaps)
+{
+    using playback_frame_range::advanceDropFrameTick;
+    using playback_frame_range::DropFrameTickResult;
+    using playback_frame_range::PlaybackWrapRecorder;
+    // sol's exact repro, zero request: folded onto its own phase (100 mod 49 = 2), no lap, nothing applied
+    const DropFrameTickResult zero = advanceDropFrameTick(100.0, 0.0, 1, 50, true, false);
+    ASSERT_EQ(0, zero.wrapLaps);                 // 4eb1cfd5: 2
+    ASSERT_TRUE(zero.position == 2.0);
+    ASSERT_TRUE(zero.foldedFrames == 98.0);      // 4eb1cfd5: 0
+    ASSERT_TRUE(zero.appliedFrames == 0.0);
+    ASSERT_TRUE(zero.wrapped);                   // the position moved back (a correction), so no forward step is counted
+    // ...and the 8 ms request at 24 fps: 0.192 frames applied from the folded start, still no lap
+    const double request = playback_fps_meter::dropFrameRequestFrames(24.0, 8);
+    const DropFrameTickResult ordinary = advanceDropFrameTick(100.0, request, 1, 50, true, false);
+    ASSERT_EQ(0, ordinary.wrapLaps);             // 4eb1cfd5: 2
+    ASSERT_TRUE(std::fabs(ordinary.position - 2.192) < 1e-12);
+    ASSERT_TRUE(ordinary.foldedFrames == 98.0);
+    ASSERT_TRUE(std::fabs(ordinary.appliedFrames - request) < 1e-12);
+    // the consumers sol cites read the laps: the wrap recorder appends none, and the paint credit for 10 then 2 is a
+    // backward move, never 2 + 98 - 10 = 90 frames
+    PlaybackWrapRecorder recorder;
+    if( zero.wrapped ) recorder.noteEngineWrap( zero.wrapWidth, zero.wrapLaps );
+    if( ordinary.wrapped ) recorder.noteEngineWrap( ordinary.wrapWidth, ordinary.wrapLaps );
+    ASSERT_EQ(0, recorder.engineWraps);
+    PlaybackSourceAdvanceTracker paint;
+    paint.notePresented( 1.000, 10, 0, 0 );
+    paint.notePresented( 1.042, 2, recorder.engineWraps, recorder.engineWrapsWidth( 0, recorder.engineWraps ) );
+    ASSERT_EQ(0LL, (long long)paint.advancedFrames());   // 4eb1cfd5: 90
+    // the same stale start under conform (cut 1..50 wraps at 50 by 50): 100 is on phase 0, no lap
+    const DropFrameTickResult conformed = advanceDropFrameTick(100.0, 0.0, 1, 50, true, true);
+    ASSERT_EQ(0, conformed.wrapLaps);            // 4eb1cfd5: 1
+    ASSERT_TRUE(conformed.position == 0.0);
+    ASSERT_TRUE(conformed.foldedFrames == 100.0);
+    // a start exactly at the wrap point (Loop turned on over a non-Loop clamp at the last frame, 49) is a correction too
+    const DropFrameTickResult atWrap = advanceDropFrameTick(49.0, request, 1, 50, true, false);
+    ASSERT_EQ(0, atWrap.wrapLaps);               // 4eb1cfd5: 1
+    ASSERT_TRUE(std::fabs(atWrap.position - request) < 1e-12);
+    ASSERT_TRUE(atWrap.foldedFrames == 49.0);
+    // a stale start BELOW the cut (seek 0, cut 41..50: loop range [40, 49), width 9) is moved onto the cut's first frame,
+    // a correction (foldedFrames 0 - 40 = -40), and only then does the delta apply; 4eb1cfd5 left it at 0.192, outside the cut
+    const DropFrameTickResult below = advanceDropFrameTick(0.0, request, 41, 50, true, false);
+    ASSERT_EQ(0, below.wrapLaps);
+    ASSERT_TRUE(below.foldedFrames == -40.0);    // 4eb1cfd5: 0
+    ASSERT_TRUE(std::fabs(below.position - (40.0 + request)) < 1e-12);
+    ASSERT_TRUE(std::fabs(below.appliedFrames - request) < 1e-12);
+    ASSERT_TRUE(below.wrapped);                  // moved by a correction, not travel: no forward step counted
+    // ...and a delta wide enough to cross the wrap point from below counts only the laps it crossed from the cut's first
+    // frame: 0 + 45 on cut 41..50 (4eb1cfd5: 45, no lap, still outside the cut) is 40 + 45 = 85, five laps of 9, to 40
+    const DropFrameTickResult belowWide = advanceDropFrameTick(0.0, 45.0, 41, 50, true, false);
+    ASSERT_EQ(5, belowWide.wrapLaps);
+    ASSERT_TRUE(belowWide.position == 40.0);
+    ASSERT_TRUE(belowWide.appliedFrames == 45.0);
+    // laps the applied delta crosses from an in-cut start ARE travel, unchanged: 48.9 + 0.192 wraps once, and r7's whole
+    // laps that land back on the start (0 + 999990 on cut 1..616: 1626 laps, 0 -> 0) still count every lap
+    const DropFrameTickResult inCut = advanceDropFrameTick(48.9, request, 1, 50, true, false);
+    ASSERT_EQ(1, inCut.wrapLaps);
+    ASSERT_TRUE(inCut.foldedFrames == 0.0);
+    const DropFrameTickResult wholeLaps = advanceDropFrameTick(0.0, 999990.0, 1, 616, true, false);
+    ASSERT_EQ(1626, wholeLaps.wrapLaps);
+    ASSERT_TRUE(wholeLaps.position == 0.0);
+    ASSERT_TRUE(wholeLaps.foldedFrames == 0.0);
+    ASSERT_TRUE(wholeLaps.appliedFrames == 999990.0);
+    // without Loop nothing is folded (the r8 clamp owns a start past the last frame; a start below the cut plays on)
+    ASSERT_TRUE(advanceDropFrameTick(100.0, 0.0, 1, 50, false, false).foldedFrames == 0.0);
+    ASSERT_TRUE(advanceDropFrameTick(0.0, request, 41, 50, false, false).foldedFrames == 0.0);
 }
 
 // r6 (sol r5 S1 on 6aaac7f5): the Drop Frame request is finite. An accepted rate the cut cannot bound (+inf: a silent MLV
