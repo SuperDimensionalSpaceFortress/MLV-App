@@ -118,6 +118,18 @@ class SmokeHostLoadStandingTests(unittest.TestCase):
                 s = self.standing({**QUIET, "during": during})
                 self.assertFalse(s["provisional"], s)
 
+    def test_adversary3_a1_a_during_member_that_is_null_is_not_collected(self) -> None:
+        # adversary-90151822.json A1, its input: during=$null beside clean before/after read collected/quiet/false and the arm COUNTED. The smoke always
+        # writes during as a list (run-release-gui-smoke.ps1 `during = @($hostLoadDuringSamples)`), so a present null is malformed, never "no samples".
+        s = self.standing({**QUIET, "during": None})
+        self.assertEqual((s["state"], s["provisional"], s["collected"]), ("unknown", True, False), s)
+        p = run_ps("$v = Get-VenueReferenceArmVerdict -Legs @(@{legId='q';hostLoad=@{state='quiet';provisional=$false;before=@{collected=$true};"
+                   "during=$null;after=@{collected=$true}}}); Write-Output ('V=' + $v.verdict + ' R=' + ($v.refusals -join '|'))")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("V=INCONCLUSIVE R=REFERENCE_PROVISIONAL leg=q reason=hostload-unknown", p.stdout)
+        s = self.standing({k: v for k, v in QUIET.items()})   # an absent during member is unchanged (older smoke results carry none)
+        self.assertEqual((s["state"], s["provisional"]), ("quiet", False), s)
+
     def test_degenerate_blocks_never_read_clean(self) -> None:
         for block in ({"state": "quiet"}, {"provisional": False}, {"state": "exceeded", "provisional": False}, {"state": "", "provisional": False,
                       "before": {"collected": True}, "after": {"collected": True}}, {"state": "quiet", "provisional": "false", "before": {"collected": True},
@@ -189,7 +201,7 @@ class LegHostLoadBindingTests(unittest.TestCase):
                     (folder / "result.json").write_bytes(result_text.encode("utf-8"))
                     sha = hashlib.sha256(result_text.encode("utf-8")).hexdigest()
                 body = receipt_body(sha) if callable(receipt_body) else receipt_body
-                receipt.write_text(json.dumps(body), encoding="utf-8")
+                receipt.write_text(body if isinstance(body, str) else json.dumps(body), encoding="utf-8")   # a str is the receipt's raw text
             p = run_ps("$r = [ordered]@{}; "
                        + "".join(f"$r['{rid}'] = Get-VenueLegHostLoad -ReceiptPath '{root / 'CARD-1' / 'leg-x' / 'bachelor' / (rid + '.json')}'; " for rid in cases)
                        + "$r | ConvertTo-Json -Compress -Depth 4")
@@ -223,6 +235,23 @@ class LegHostLoadBindingTests(unittest.TestCase):
         got = self.read({rid: (lambda sha: {"evidence": {"resultJsonSha256": sha}}, "play", t) for rid, t in texts.items()})
         for rid in texts:
             self.assertEqual((got[rid]["state"], got[rid]["provisional"]), ("unknown", True), (rid, got[rid]))
+
+    def test_adversary3_a2_a_receipt_with_a_duplicated_member_reads_unknown(self) -> None:
+        # adversary-90151822.json A2, its input: receipt {"export":null,"export":{},"evidence":{}} over a playback summary and a CIM-failed result.json
+        # read not-applicable (the last export wins), so the leg was counted. The receipt is checked for duplicates like the result (A2 of pass 2).
+        import hashlib
+        cim = json.dumps({"hostLoad": CIM_FAILED})
+        quiet = json.dumps({"hostLoad": QUIET})
+        cim_sha = hashlib.sha256(cim.encode("utf-8")).hexdigest()
+        got = self.read({
+            "dupexp-1": ('{"export":null,"export":{},"evidence":{}}', "play", cim),
+            "dupsha-1": (lambda sha: '{"evidence":{"resultJsonSha256":"' + cim_sha + '","resultJsonSha256":"' + sha + '"}}', "play", quiet),
+            "bound-1": (lambda sha: {"evidence": {"resultJsonSha256": sha}}, "play", quiet),
+        })
+        for rid in ("dupexp-1", "dupsha-1"):
+            self.assertEqual((got[rid]["state"], got[rid]["provisional"], got[rid]["applies"]), ("unknown", True, True), (rid, got[rid]))
+            self.assertIn("repeats the member", got[rid]["reason"], (rid, got[rid]))
+        self.assertEqual((got["bound-1"]["state"], got["bound-1"]["provisional"]), ("quiet", False), got["bound-1"])
 
 
 @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
