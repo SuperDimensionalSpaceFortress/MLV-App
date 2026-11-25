@@ -554,6 +554,20 @@ void llrpResetLastRunTimingForCurrentThread(void);
 void llrpSaveLastRunTimingForCurrentThread(void);
 void llrpRestoreLastRunTimingForCurrentThread(void);
 double llrpGetLastDualIsoMilliseconds(void);
+/* EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1: whether this thread's last llrawproc run applied dual-ISO.
+ * Thread-local last-run convention, the same reset and save/restore as llrpGetLastDualIsoMilliseconds:
+ * each run entry starts at NOT_ATTEMPTED, a run that enters the dual-ISO block is NOT_APPLIED until its
+ * reconstruction (or preview rowscale) succeeds, then APPLIED. UNKNOWN = no llrawproc run recorded on this
+ * thread since the last llrpResetLastRunTimingForCurrentThread (or none at all). A GPU prepare-only run
+ * counts as APPLIED (its recon state is ready) though no CPU buffer was produced. */
+typedef enum
+{
+    LLRP_DUAL_ISO_OUTCOME_UNKNOWN = 0,
+    LLRP_DUAL_ISO_OUTCOME_NOT_ATTEMPTED = 1,
+    LLRP_DUAL_ISO_OUTCOME_NOT_APPLIED = 2,
+    LLRP_DUAL_ISO_OUTCOME_APPLIED = 3
+} llrpDualIsoOutcome_t;
+int llrpGetLastDualIsoOutcome(void);
 double llrpGetLastChromaSmoothMilliseconds(void);
 /* LLRAWPROC-RESIDUAL-SUBTIMERS-1: the steps inside the llrawproc wall that the
  * seven stage timers above (dark frame .. chroma smooth) do not cover, timed

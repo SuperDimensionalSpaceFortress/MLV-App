@@ -106,6 +106,20 @@ TEST(ExportRenderPipeTimingWiring, EveryLlrawprocNoteIsFollowedByTheGuardedDualI
     ASSERT_TRUE(firstStatement(body) == QStringLiteral("if (!mlv_stage_timing_enabled()) return;"));
     ASSERT_TRUE(body.contains(QStringLiteral("mlv_stage_timing_note_elapsed(MLV_STAGE_LLRAWPROC_DUAL_ISO, frameIndex, llrpGetLastDualIsoMilliseconds());")));
     ASSERT_EQ(1, countOccurrences(source, QStringLiteral("llrpGetLastDualIsoMilliseconds()")));
+
+    // EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1: the same guarded helper reads the run's outcome once and notes one
+    // 0.000 marker for each of the three recorded outcomes (none for UNKNOWN), after the timing note.
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral("llrpGetLastDualIsoOutcome()")));
+    ASSERT_EQ(1, countOccurrences(body, QStringLiteral("llrpGetLastDualIsoOutcome()")));
+    const int timingNoteAt = body.indexOf(QStringLiteral("llrpGetLastDualIsoMilliseconds()"));
+    ASSERT_TRUE(timingNoteAt >= 0);
+    ASSERT_TRUE(body.indexOf(QStringLiteral("llrpGetLastDualIsoOutcome()")) > timingNoteAt);
+    for (const char * name : { "LLRP_DUAL_ISO_OUTCOME_APPLIED) ? MLV_STAGE_LLRAWPROC_DUAL_ISO_APPLIED",
+                               "LLRP_DUAL_ISO_OUTCOME_NOT_APPLIED) ? MLV_STAGE_LLRAWPROC_DUAL_ISO_NOT_APPLIED",
+                               "LLRP_DUAL_ISO_OUTCOME_NOT_ATTEMPTED) ? MLV_STAGE_LLRAWPROC_DUAL_ISO_NOT_ATTEMPTED" }) {
+        ASSERT_EQ(1, countOccurrences(body, QString::fromLatin1(name)));
+    }
+    ASSERT_TRUE(body.contains(QStringLiteral("if (marker) mlv_stage_timing_note_elapsed(marker, frameIndex, 0.0);")));
 }
 
 TEST(ExportRenderPipeTimingWiring, StageNamesAreTheJudgesNames)
@@ -113,6 +127,9 @@ TEST(ExportRenderPipeTimingWiring, StageNamesAreTheJudgesNames)
     const QString header = readRepoFile(QStringLiteral("src/debug/StageTiming.h"));
     const char * const pairs[][2] = {
         { "MLV_STAGE_LLRAWPROC_DUAL_ISO", "\"llrawproc_dual_iso\"" },
+        { "MLV_STAGE_LLRAWPROC_DUAL_ISO_APPLIED", "\"llrawproc_dual_iso_applied\"" },
+        { "MLV_STAGE_LLRAWPROC_DUAL_ISO_NOT_APPLIED", "\"llrawproc_dual_iso_not_applied\"" },
+        { "MLV_STAGE_LLRAWPROC_DUAL_ISO_NOT_ATTEMPTED", "\"llrawproc_dual_iso_not_attempted\"" },
         { "MLV_STAGE_EXPORT_SCALE", "\"export_scale\"" },
         { "MLV_STAGE_EXPORT_PIPE_WRITE", "\"export_pipe_write\"" },
         { "MLV_STAGE_EXPORT_PIPE_DRAIN", "\"export_pipe_drain\"" },

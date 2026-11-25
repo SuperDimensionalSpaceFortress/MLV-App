@@ -7223,6 +7223,12 @@ double llrpGetLastDualIsoMilliseconds(void)
     return g_llrawproc_last_dual_iso_ms;
 }
 
+/* EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1 RED: the getter exists, no run records an outcome yet. */
+int llrpGetLastDualIsoOutcome(void)
+{
+    return LLRP_DUAL_ISO_OUTCOME_UNKNOWN;
+}
+
 double llrpGetLastChromaSmoothMilliseconds(void)
 {
     return g_llrawproc_last_chroma_smooth_ms;

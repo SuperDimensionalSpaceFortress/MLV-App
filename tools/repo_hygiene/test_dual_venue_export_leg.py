@@ -107,7 +107,11 @@ def assert_clean_but_dual_iso_unknown(tc: unittest.TestCase, g: dict) -> None:
 
 
 def piped_stage_log(frames: int, dual_iso_ms: float = 30.0, llrawproc_ms: float = 31.0, pipe_ms: float = 10.0, drain_ms: float = 100.0, verify_ms: float = 200.0,
-                    drain_count: int = 1, verify_count: int = 1, pipe_frames=None, scale_ms: float | None = None, dual_iso: bool = True) -> str:
+                    drain_count: int = 1, verify_count: int = 1, pipe_frames=None, scale_ms: float | None = None, dual_iso: bool = True,
+                    outcome: str | dict | None = None) -> str:
+    """EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1: `outcome` is the producer's applied signal. None writes the r3 shape (no marker); a word (applied, not_applied,
+    not_attempted) writes `llrawproc_dual_iso_<word> ms=0.000` right after every llrawproc_dual_iso record, as video_mlv.c writes it; a dict {frame: word} writes it on
+    those frames only (a missing frame is unmarked)."""
     out = []
     pipe_frames = range(frames) if pipe_frames is None else pipe_frames
     for i in range(frames):
@@ -116,6 +120,9 @@ def piped_stage_log(frames: int, dual_iso_ms: float = 30.0, llrawproc_ms: float 
             out.append(f"[mlv-stage-timing] frame={i} stage={name} ms={ms:.3f}")
             if name == "llrawproc" and dual_iso:
                 out.append(f"[mlv-stage-timing] frame={i} stage=llrawproc_dual_iso ms={dual_iso_ms:.3f}")
+                word = outcome.get(i) if isinstance(outcome, dict) else outcome
+                if word is not None:
+                    out.append(f"[mlv-stage-timing] frame={i} stage=llrawproc_dual_iso_{word} ms=0.000")
         if scale_ms is not None:
             out.append(f"[mlv-stage-timing] frame={i} stage=export_scale ms={scale_ms:.3f}")
         if i in pipe_frames:
@@ -1634,14 +1641,17 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         head = self.head_sha()
         old = stage_log(480)
         only_verify_gone = "".join(l + "\n" for l in piped_stage_log(480).splitlines() if " stage=export_verify " not in l)
-        proc, got = evidence_cases([self.ctl(old, buildId=head), self.ctl(only_verify_gone, buildId=head), self.ctl(buildId=head)])
+        # (EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1 forced companion: this head also publishes the dual-ISO applied signal, so its complete log carries the outcome
+        # markers and reads PASS; the marker-free log of this head is the incomplete capture pinned in ExportRenderDualIsoAppliedSignalTests)
+        proc, got = evidence_cases([self.ctl(old, buildId=head), self.ctl(only_verify_gone, buildId=head), self.ctl(piped_stage_log(480, outcome="applied"), buildId=head)])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         for g in got[:2]:
             self.assertEqual(g["outcome"], "INVALID", g)
             self.assertTrue(any(p.startswith("EXPORT_PROFILE_ABSENT") and "incomplete" in p for p in g["problems"]), g)
             self.assertNotIn("a build before EXPORT-RENDER-PIPE-TIMING-1", json.dumps(g["metrics"]), g)
         self.assertTrue(any(head in p for p in got[0]["problems"]), got[0])
-        assert_clean_but_dual_iso_unknown(self, got[2])
+        self.assertEqual(got[2]["problems"], [], got[2])
+        self.assertEqual(got[2]["outcome"], "PASS", got[2])
 
     def test_adversary_r2_a6_distinguish_a_build_this_repo_cannot_name_keeps_the_r1_reading_and_an_older_build_cannot_carry_the_stages(self) -> None:
         """A6, the distinguished half: a build id that is no commit of this repo (the fixtures' 'e' * 40, or a venue build from another tree) cannot be classed, so a log without
@@ -1894,7 +1904,8 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             trace = Path(d) / "trace.txt"
             path = Path(d) / "cases.json"
-            path.write_text(json.dumps([self.ctl(buildId=self.head_sha())]), encoding="utf-8")
+            # (EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1 forced companion: this head publishes the applied signal, so its clean log carries the outcome markers)
+            path.write_text(json.dumps([self.ctl(piped_stage_log(480, outcome="applied"), buildId=self.head_sha())]), encoding="utf-8")
             proc, got = run_pwsh_json("$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
                                       f"@($cases | ForEach-Object {{ $c = $_; $e = {EVIDENCE_CALL}; [ordered]@{{ problems = @($e.problems) }} }}) "
                                       "| ConvertTo-Json -Compress -Depth 8 -AsArray", DVE_CASES=str(path), GIT_TRACE=str(trace), GIT_TRACE2=str(trace))
@@ -1974,7 +1985,8 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
             cfg = Path(d) / "trace.gitconfig"
             cfg.write_text(f"[trace2]\n\teventTarget = {event.as_posix()}\n\tnormalTarget = {normal.as_posix()}\n\tperfTarget = {normal.as_posix()}\n", encoding="utf-8")
             path = Path(d) / "cases.json"
-            path.write_text(json.dumps([self.ctl(buildId=self.head_sha())]), encoding="utf-8")
+            # (EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1 forced companion: this head publishes the applied signal, so its clean log carries the outcome markers)
+            path.write_text(json.dumps([self.ctl(piped_stage_log(480, outcome="applied"), buildId=self.head_sha())]), encoding="utf-8")
             proc, got = run_pwsh_json("$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
                                       f"@($cases | ForEach-Object {{ $c = $_; $e = {EVIDENCE_CALL}; [ordered]@{{ problems = @($e.problems) }} }}) "
                                       "| ConvertTo-Json -Compress -Depth 8 -AsArray", DVE_CASES=str(path), GIT_CONFIG_GLOBAL=str(cfg), GIT_TRACE2_EVENT="0",
@@ -4340,6 +4352,144 @@ ConvertTo-Json -InputObject $out -Compress -Depth 4
             self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("DUAL_VENUE_EXPORT_ARG_MISSING -ExpectReceiptSha256", proc.stdout + proc.stderr)
             self.assertFalse(out.exists())
+
+
+@requires_windows_pwsh
+class ExportRenderDualIsoAppliedSignalTests(unittest.TestCase):
+    """EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1: the rendered export's producer signal for whether dual-ISO was APPLIED. video_mlv.c writes one
+    `llrawproc_dual_iso_<applied|not_applied|not_attempted> ms=0.000` marker right after each llrawproc_dual_iso record (llrpGetLastDualIsoOutcome); the reader reads
+    applied -> active, attempted-not-applied -> the typed product failure DUALISO_NOT_APPLIED, absent -> the r3 UNKNOWN (pinned unchanged by the r3 rows above)."""
+
+    @staticmethod
+    def ctl(stage: str, **over) -> dict:
+        # the adversary control of ExportRenderPipeTimingTests: 480 frames, cutIn=1 cutOut=480, the shipped m16-1243-export-prores acceptance criteria
+        c = prores_case(maxFrames=480, dualIsoExpected=True, stage=stage, batch=ExportRenderPipeTimingTests.ctl_batch(),
+                        criteria=leg("m16-1243-export-prores")["criteria"]["acceptance"]["cpu"])
+        c.update(over)
+        return c
+
+    @staticmethod
+    def interp2(outcome="not_applied") -> str:
+        # the dualIsoInterpolation 2 shape: the attempt is timed above 0 ms and the reconstruction refused
+        return piped_stage_log(480, outcome=outcome)
+
+    def test_applied_on_every_frame_passes_dual_iso_class_agrees_under_the_shipped_criteria(self) -> None:
+        proc, got = evidence_cases([self.ctl(piped_stage_log(480, outcome="applied"))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        g = got[0]
+        self.assertEqual(g["problems"], [], g)
+        self.assertEqual(g["outcome"], "PASS", g)
+        self.assertIs(g["metrics"]["dualIsoClassAgrees"], True, g)
+        self.assertEqual(g["metrics"]["dualIsoActiveFrames"], 480, g)
+        self.assertEqual(g["metrics"]["dualIsoNotAppliedFrames"], 0, g)
+        self.assertIn("dualIsoClassAgrees", json.dumps(leg("m16-1243-export-prores")["criteria"]["acceptance"]["cpu"]))
+
+    def test_an_attempt_that_did_not_apply_fails_typed_dualiso_not_applied(self) -> None:
+        one = {i: "applied" for i in range(480)}
+        one[7] = "not_applied"
+        proc, got = evidence_cases([self.ctl(self.interp2()), self.ctl(piped_stage_log(480, outcome=one))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g, k, applied in ((got[0], 480, 0), (got[1], 1, 479)):
+            self.assertEqual(g["problems"], [], g)
+            self.assertFalse(g["classMismatch"], g)
+            self.assertEqual(g["outcome"], "FAIL", g)
+            self.assertTrue(g["detail"].startswith(f"EXPORT_CAPTURED: dualIsoClassAgrees: DUALISO_NOT_APPLIED: {k} of 480 timed frame(s) attempted dual-ISO and the reconstruction did not apply"), g)
+            self.assertNotIn("; ", g["detail"], "dualIsoClassAgrees is the only criterion that fails")
+            self.assertIs(g["metrics"]["dualIsoClassAgrees"], False, g)
+            self.assertEqual(g["metrics"]["dualIsoActiveFrames"], applied, g)
+            self.assertEqual(g["metrics"]["dualIsoNotAppliedFrames"], k, g)
+
+    def test_not_attempted_on_a_dual_iso_leg_and_applied_on_a_no_dual_iso_leg_are_class_mismatches(self) -> None:
+        proc, got = evidence_cases([self.ctl(piped_stage_log(480, dual_iso_ms=0.0, outcome="not_attempted")),
+                                    self.ctl(piped_stage_log(480, outcome="applied"), dualIsoExpected=False),
+                                    self.ctl(self.interp2(), dualIsoExpected=False),
+                                    self.ctl(piped_stage_log(480, dual_iso_ms=0.0, outcome="not_attempted"), dualIsoExpected=False)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:3]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(g["classMismatch"], g)
+            self.assertTrue(g["detail"].startswith("CLIP_CLASS_MISMATCH:"), g)
+            self.assertIs(g["metrics"]["dualIsoClassAgrees"], False, g)
+        self.assertEqual(got[0]["metrics"]["dualIsoActiveFrames"], 0)
+        self.assertIn("not_attempted", got[0]["detail"])
+        self.assertEqual(got[1]["metrics"]["dualIsoActiveFrames"], 480)
+        # (the signal also settles what r5 could not: a no-dual-ISO leg whose every frame is marked not attempted agrees)
+        self.assertIs(got[3]["metrics"]["dualIsoClassAgrees"], True, got[3])
+        self.assertEqual(got[3]["metrics"]["dualIsoActiveFrames"], 0, got[3])
+        self.assertFalse(got[3]["classMismatch"], got[3])
+
+    def test_a_malformed_marker_is_export_record_invalid(self) -> None:
+        clean = piped_stage_log(480, outcome="applied")
+        dual0 = "[mlv-stage-timing] frame=0 stage=llrawproc_dual_iso ms=30.000"
+        mark0 = "[mlv-stage-timing] frame=0 stage=llrawproc_dual_iso_applied ms=0.000"
+        self.assertIn(f"{dual0}\n{mark0}\n", clean)
+        before = clean.replace(f"{dual0}\n{mark0}\n", f"{mark0}\n{dual0}\n")
+        nonzero = clean.replace(mark0, mark0.replace("ms=0.000", "ms=0.001"))
+        twice = clean.replace(mark0, f"{mark0}\n{mark0}")
+        other_frame = clean.replace(mark0, mark0.replace("frame=0 ", "frame=1 "))
+        proc, got = evidence_cases([self.ctl(before), self.ctl(nonzero), self.ctl(twice), self.ctl(other_frame)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g, why in zip(got, ("does not directly follow", "never a timing", "after another outcome marker", "does not directly follow")):
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "outcome marker" in p and why in p for p in g["problems"]), (why, g))
+            self.assertNotEqual(g["metrics"]["dualIsoClassAgrees"], True, g)
+
+    def test_a_marker_missing_on_one_frame_is_a_typed_null(self) -> None:
+        one = {i: "applied" for i in range(480) if i != 11}
+        proc, got = evidence_cases([self.ctl(piped_stage_log(480, outcome=one))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        g = got[0]
+        self.assertEqual(g["problems"], [], g)
+        self.assertEqual(g["outcome"], "FAIL", g)
+        self.assertIsNone(g["metrics"]["dualIsoClassAgrees"], g)
+        self.assertIsNone(g["metrics"]["dualIsoActiveFrames"], g)
+        for k in ("dualIsoActiveFramesCouldNotCheck", "dualIsoClassAgreesCouldNotCheck"):
+            self.assertTrue(g["metrics"][k].startswith("DUALISO_OUTCOME_WINDOW_MISMATCH: "), g)
+            self.assertIn("marks 479 of the 480", g["metrics"][k])
+        self.assertTrue(g["detail"].startswith("EXPORT_CAPTURED: dualIsoClassAgrees: DUALISO_OUTCOME_WINDOW_MISMATCH:"), g)
+
+    def test_mixed_outcomes_never_pass(self) -> None:
+        # (a) applied frames beside not-attempted ones; (b) one frame whose two llrawproc runs disagree (two runs fit debayered_frame: 9 + 2 x 15 <= 40)
+        split = {i: ("not_attempted" if i == 3 else "applied") for i in range(480)}
+        two = piped_stage_log(480, llrawproc_ms=15.0, dual_iso_ms=10.0, outcome="applied")
+        tail5 = "[mlv-stage-timing] frame=5 stage=llrawproc_dual_iso_applied ms=0.000\n"
+        self.assertIn(tail5, two)
+        two = two.replace(tail5, tail5 + "[mlv-stage-timing] frame=5 stage=llrawproc ms=15.000\n[mlv-stage-timing] frame=5 stage=llrawproc_dual_iso ms=10.000\n"
+                                          "[mlv-stage-timing] frame=5 stage=llrawproc_dual_iso_not_attempted ms=0.000\n")
+        proc, got = evidence_cases([self.ctl(piped_stage_log(480, outcome=split)), self.ctl(two)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g, mixed in ((got[0], 0), (got[1], 1)):
+            self.assertNotEqual(g["outcome"], "PASS", g)
+            self.assertEqual(g["problems"], [], g)
+            self.assertIs(g["metrics"]["dualIsoClassAgrees"], False, g)
+            self.assertTrue(g["detail"].startswith("EXPORT_CAPTURED: dualIsoClassAgrees: DUALISO_OUTCOME_MIXED:"), g)
+            self.assertIn(f"{mixed} with disagreeing markers", g["detail"])
+
+    def test_a_signal_build_with_no_marker_is_an_incomplete_capture_and_markers_beside_an_older_build_are_foreign(self) -> None:
+        import subprocess
+        head = ExportRenderPipeTimingTests.head_sha()
+        pipe_only = "6f98e245bb8111717f3e2f9ffbcd6dbd8ef1bd33"   # the base: PR #899 merged (EXPORT-RENDER-PIPE-TIMING-1), no applied signal yet
+        cases = [self.ctl(piped_stage_log(480), buildId=head), self.ctl(self.interp2(None), buildId=head, dualIsoExpected=False),
+                 self.ctl(piped_stage_log(480, outcome="applied"), buildId=head)]
+        have_base = subprocess.run(["git", "-C", str(ROOT), "cat-file", "-t", pipe_only], capture_output=True, text=True).stdout.strip() == "commit"
+        if have_base:
+            cases += [self.ctl(piped_stage_log(480, outcome="applied"), buildId=pipe_only), self.ctl(piped_stage_log(480), buildId=pipe_only)]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:2]:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertFalse(g["classMismatch"], g)
+            self.assertTrue(any(p.startswith("EXPORT_PROFILE_ABSENT") and "incomplete" in p and "MLV_STAGE_LLRAWPROC_DUAL_ISO_APPLIED" in p and head in p
+                                for p in g["problems"]), g)
+            self.assertIsNone(g["metrics"]["dualIsoClassAgrees"], g)
+            self.assertNotIn(DUALISO_UNKNOWN, json.dumps(g["metrics"]), "never the r3 reading")
+        self.assertEqual(got[2]["outcome"], "PASS", got[2])
+        if not have_base:
+            self.skipTest("the base commit is not in this clone (a shallow checkout); the head rows ran")
+        self.assertEqual(got[3]["outcome"], "INVALID", got[3])
+        self.assertTrue(any(p.startswith("EXPORT_PROFILE_FOREIGN") and "applied signal" in p for p in got[3]["problems"]), got[3])
+        # (that build has no signal, so its marker-free log keeps the r3 reading)
+        assert_clean_but_dual_iso_unknown(self, got[4])
 
 
 if __name__ == "__main__":
