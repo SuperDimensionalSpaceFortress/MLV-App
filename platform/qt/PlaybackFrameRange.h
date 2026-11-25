@@ -309,7 +309,7 @@ struct DropFrameTickResult
 // the real step the delta made from correctedStart (stale 120 + 1.2 frames on cut 1..50: 22 -> 23.2 counted nothing).
 inline bool dropFrameTickLapped( const DropFrameTickResult & tick )
 {
-    return tick.wrapped;   // RED stub: today's reading
+    return tick.wrapLaps > 0;   // every lap branch sets wrapped with wrapLaps >= 1; only the fold sets it with none
 }
 
 // r1: the frame a corrected start sits on (the slider's frame for it), floor, held inside int; not a number reads 0.

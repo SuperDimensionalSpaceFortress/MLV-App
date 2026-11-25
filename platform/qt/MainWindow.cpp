@@ -13371,7 +13371,10 @@ void MainWindow::playbackHandling(int timeDiff)
                 // PLAYBACK-CLIP-LENGTH-ENFORCE-3: the drop-frame engine's source-frame advance (dropped frames
                 // still advance the timeline; a wrap never counts). PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: from the
                 // corrected start (a fold or clamp of a stale start is not footage; the counter rebases there).
-                m_sourceAdvance.noteEngineTick( dropFrameTick.correctedStart, dropFrameTick.position, dropFrameTick.wrapped );
+                // r1 iteration 1 (adversary pass 1 A1 on fc9e3e93): a reader that skips a wrapped tick reads whether the tick
+                // LAPPED: the r9 fold marks a zero-lap correction wrapped, and skipping it lost the real step from correctedStart.
+                const bool dropFrameLapped = playback_frame_range::dropFrameTickLapped( dropFrameTick );
+                m_sourceAdvance.noteEngineTick( dropFrameTick.correctedStart, dropFrameTick.position, dropFrameLapped );
                 // r1 (sol r9 B1 + B2): a POSITION CORRECTION is recorded BEFORE the tick's laps, so the laps count as travel
                 // from it; the presentation that lands on it rebases the paint tracker (paintCreditHandOff) instead of
                 // crediting the move.
@@ -13395,13 +13398,13 @@ void MainWindow::playbackHandling(int timeDiff)
                     // below books only its own travel; the summary's residual shows the correction under Other, as a seek
                     if( dropFrameTick.corrected ) m_playbackSlipHistogram.noteTimelineCorrection( playback_frame_range::dropFrameCorrectionFrame( dropFrameTick.correctedStart ) );
                     m_playbackSlipHistogram.noteTimelineMove(
-                        dropFrameTick.wrapped ? playback_slip::AdvancePath::LoopWrap
+                        dropFrameLapped ? playback_slip::AdvancePath::LoopWrap
                                               : playback_slip::AdvancePath::DropTick,
                         ui->horizontalSliderPosition->value(), paceNowMs,
                         grantedDropFrames, m_playbackPaceGuard.creditFrames(),
                         getPlaybackFramerate(), !paceGuardArmedBeforeTick );
                     // PLAYBACK-STARTUP-CATCHUP-BURST-1: startup_catchup_frames, the skips of the first 2 s after Play.
-                    if( !dropFrameTick.wrapped
+                    if( !dropFrameLapped
                      && paceNowMs - m_playbackSmokeStartTime * 1000.0 <= playback_native_pace::kStartupCatchupWindowMs )
                         m_playbackSmokeStartupSkippedFrames += playback_native_pace::skippedFrames(
                             dropFrameTick.correctedStart, dropFrameTick.position );
