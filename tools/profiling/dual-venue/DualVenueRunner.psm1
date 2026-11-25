@@ -1113,18 +1113,22 @@ function ConvertFrom-DvRecordKeyValues {
     passed every criterion. A conflicting key is left out of `fields`, so it reads as absent (every proof field and criterion that reads it fails closed,
     CouldNotCheck), and is named in `conflicts`. Keys compare case-insensitively (the @{} table every caller indexes), values ordinally: an identical
     repeat is the same reading and is kept. The app prints each key once (no venue log carries a repeated key).
+    r2 adversary fix 1 (A1 and A2 on 7272acb4): a key STARTS a whitespace-separated token, so `-repeats=0` or `not-repeats=0` supplies no `repeats`
+    (before, the unanchored match read one out of it); and an EMPTY occurrence is a reading too, so `repeats= repeats=0` (either order) conflicts
+    (before, `\S+` skipped the empty one and the other read clean). A key whose only readings are empty is left out, as before (absent).
     #>
     param([AllowNull()][AllowEmptyString()][string]$Record)
     $fields = @{}
     $conflicts = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     if (-not [string]::IsNullOrEmpty($Record)) {
-        foreach ($m in [regex]::Matches($Record, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) {
+        foreach ($m in [regex]::Matches($Record, '(?<!\S)(?<k>[A-Za-z0-9_]+)=(?<v>\S*)')) {
             $k = $m.Groups['k'].Value
             $v = $m.Groups['v'].Value
             if (-not $fields.ContainsKey($k)) { $fields[$k] = $v }
             elseif (-not [string]::Equals([string]$fields[$k], $v, [StringComparison]::Ordinal)) { [void]$conflicts.Add($k) }
         }
         foreach ($k in $conflicts) { $fields.Remove($k) }
+        foreach ($k in @($fields.Keys)) { if ([string]::IsNullOrEmpty([string]$fields[$k])) { $fields.Remove($k) } }
     }
     @{ fields = $fields; conflicts = @($conflicts | Sort-Object) }
 }
@@ -7712,9 +7716,12 @@ function Get-DvAcceptanceVerdict {
     #>
     param($Receipt, [AllowNull()][AllowEmptyString()][string]$VerificationStatus = '')
     $raw = [string](Get-DvProp $Receipt 'outcome')
-    $measured = ($raw -cin @('PASS', 'FAIL')) -and ($VerificationStatus -ceq 'VERIFIED')
+    # r2 adversary A3 on 7272acb4: ORDINAL comparisons. PowerShell's -ceq / -cin compare under the current culture, which ignores a zero-width
+    # character, so `VERIFIED<U+200B>` or `PASS<U+200B>` was taken for the canonical value.
+    $isSignal = [string]::Equals($raw, 'PASS', [StringComparison]::Ordinal) -or [string]::Equals($raw, 'FAIL', [StringComparison]::Ordinal)
+    $measured = $isSignal -and [string]::Equals($VerificationStatus, 'VERIFIED', [StringComparison]::Ordinal)
     $reason = $(if ($measured) { $null }
-                elseif ($raw -cnotin @('PASS', 'FAIL')) { "the receipt outcome '$raw' is no PASS/FAIL measurement" }
+                elseif (-not $isSignal) { "the receipt outcome '$raw' is no PASS/FAIL measurement" }
                 elseif ([string]::IsNullOrEmpty($VerificationStatus)) { "the raw $raw carries no verification: it is a diagnostic, never an acceptance $raw" }
                 else { "the raw $raw is verified $VerificationStatus, not VERIFIED: it is a diagnostic, never an acceptance $raw" })
     [pscustomobject]@{
