@@ -19554,6 +19554,12 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         # does not name it carries repeats=0 (no frame painted twice) unless `ends` is False. `engine_frames` is the job summary's own source count.
         if measured and ends and "repeats=" not in measured:
             measured += " repeats=0"
+        # r2 adversary fix 2 (A1 on 7c84e75a): the app prints presented on every conform line, and a line that carries repeats without it now fails
+        # closed; a measured line that does not name it carries one paint per covered frame plus the first (source_advanced + 1) unless `ends` is False.
+        if measured and ends and "presented=" not in measured:
+            m = re.search(r"source_advanced=(\d+)", measured)
+            if m:
+                measured += f" presented={int(m.group(1)) + 1}"
         pacing, conform_head = head if head is not None else (
             "interaction_trace event=automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=0 persisted_frame_rate=24.000 drop_frame=1 settings_store=run_scoped",
             "playback_smoke.conform session=3 clip_fps=59.940 playback_fps=24.000 conform_active=1 conform_enabled=1 conform_env_override=1")
@@ -20168,6 +20174,57 @@ class EveryFrameConformConflictAndAcceptanceTests(unittest.TestCase):
             with self.subTest(outcome=outcome.encode("unicode_escape"), status=status.encode("unicode_escape")):
                 self.assertEqual(row["verdict"], "NOT_MEASURED", row)
                 self.assertTrue(row["reason"], row)
+
+    @requires_windows_pwsh
+    def test_adversary_7c84e75a_a1_paints_that_cannot_cover_the_advance_fail(self) -> None:
+        """r2 adversary A1 on 7c84e75a, its literal input: 478 paints with no repeat and no seek cannot cover 478 source frames one at a time (477 steps),
+        yet max_jump=1, repeats=0 and last_frame == engine_target passed every list. The implied step (ceil(478 / 477) = 2) now stands; a line that
+        carries repeats but no presented is CouldNotCheck."""
+        line = " presented=478 source_advanced=478 max_jump=1 wraps=0 backward=0 repeats=0 first_frame=1 last_frame=479 engine_target=479"
+        for row in self.chain(line):
+            with self.subTest(case="presented=478", role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(self.failed_metrics(row), ["conformMaxJump"], row)
+                self.assertIn("actual 2", row["failures"][0], row)
+        for row in self.chain(self.SOUND.replace("presented=479 ", "")):
+            with self.subTest(case="no presented", role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(self.failed_metrics(row), ["conformMaxJump"], row)
+                self.assertIn("no readable non-negative presented", row["failures"][0], row)
+
+    @requires_windows_pwsh
+    def test_adversary_7c84e75a_a2_a_token_in_the_log_prefix_is_no_field(self) -> None:
+        """r2 adversary A2 on 7c84e75a, its literal input: `[ repeats=0 ] playback_smoke.conform session=3 ...` with no repeats in the record body. The
+        selector allows the log prefix's bracket groups, and the reader scanned them, so the absent repeats read a measured 0 and every list passed."""
+        body = self.SOUND.replace(" repeats=0", "")
+        rows = ConformMeasuredFieldsAreJudgedTests.chain(
+            self, body, ends=False, specs=tuple(EVERY_FRAME_OLDEST_FIRST_LEGS), clip="M16-1243", backends=("cuda", "cpu"), head=(self.HEAD[0], "[ repeats=0 ] " + self.HEAD[1]),
+            engine_frames=480, summary=conformed_summary_line(status='gui_fps_status_text="Playback: 23.976 fps"', native_fps="23.976", pace_fps="23.976",
+                                                              source_advanced="480", required_source_frames="480"))
+        for row in rows:
+            with self.subTest(role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(self.failed_metrics(row), ["conformRepeats"], row)
+                self.assertIn("does not carry the field", row["failures"][0], row)
+
+    @requires_windows_pwsh
+    def test_adversary_7c84e75a_a3_a6_stored_fields_are_compared_and_the_verdict_takes_scalars_only(self) -> None:
+        """r2 adversary A3 on 7c84e75a: the validator compares the playback fields this card added (conformRepeats, conformPresented and both conflict
+        lists) with the re-derived block whenever the stored block carries them. A6 (advisory): an array outcome or status is NOT_MEASURED."""
+        proc, out = run_pwsh_json(
+            "$m = Get-Module DualVenueRunner\n"
+            "$list = & $m { $script:PlaybackComparedFieldsWhenStored }\n"
+            "$a = Get-DvAcceptanceVerdict -Receipt ([ordered]@{ outcome = @('PASS') }) -VerificationStatus 'VERIFIED'\n"
+            "$b = Get-DvAcceptanceVerdict -Receipt ([ordered]@{ outcome = 'PASS' }) -VerificationStatus @('VERIFIED')\n"
+            "$c = Get-DvAcceptanceVerdict -Receipt ([ordered]@{ outcome = 'PASS' }) -VerificationStatus 'VERIFIED'\n"
+            "ConvertTo-Json -Compress -Depth 3 -InputObject ([ordered]@{ list = @($list); a = $a.verdict; b = $b.verdict; c = $c.verdict })")
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out["list"], ["conformRepeats", "conformPresented", "conformConflictingFields", "summaryConflictingFields"], out)
+        self.assertEqual((out["a"], out["b"], out["c"]), ("NOT_MEASURED", "NOT_MEASURED", "PASS"), out)
+        text = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("foreach ($f in $script:PlaybackComparedFieldsWhenStored) {\n"
+                      "                if ($storedNames -ccontains $f -and -not (Test-DvJsonEquivalent (Get-DvProp $stored $f) (Get-DvProp $derived $f))) "
+                      "{ $invalid.Add(\"PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive\") }", text)
 
     def test_the_leg_runner_prints_the_acceptance_verdict_from_the_acceptance_step(self) -> None:
         """Invoke-VenueLeg prints DVE_ACCEPTANCE (Get-DvAcceptanceVerdict over the verification Write-DvReceipt just stamped) after DVE_VERIFICATION;
