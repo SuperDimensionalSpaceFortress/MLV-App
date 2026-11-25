@@ -1442,6 +1442,9 @@ function Get-DvPlaybackEvidence {
         # r30 (Dot D2 on 71104385): how many times the painted frames stepped backward (a seek back; the conform line's backward). Get-DvCriteriaMetrics
         # judges no frozen tail across one: engine_target is the engine's high-water, not its final target. $null when the line does not carry it.
         conformBackward = (ConvertTo-DvInt64 $conformFields['backward'])
+        # EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 (adversary A1 on b56cc731): how many painted frames repeated the frame painted before them (the
+        # conform line's repeats). max_jump counts forward steps only, so a frame painted twice reads max_jump=1. $null when the line does not carry it.
+        conformRepeats = (ConvertTo-DvInt64 $conformFields['repeats'])
         fpsOverride = (ConvertTo-DvInt64 $f['fps_override'])
         wrapped = $(if ($null -eq $wrappedField) { $null } else { $wrappedField -ne 0 })
         wrapCount = (ConvertTo-DvInt64 $f['wrap_count'])
@@ -7407,7 +7410,7 @@ function Get-DvVerbatimMetrics {
 
 # HFR-NATIVE-60FPS-FULLRES-1 r19 (sol r18 B2): the measured conform fields a leg's criteria may name, and the re-derived playback block field each comes from.
 # r29 (adversary A2 on cf403dba): the frozen-tail allowance is no longer a constant (r28's 10); Get-DvCriteriaMetrics derives it from the conform line's ends.
-$script:ConformCriteriaMetrics = [ordered]@{ conformSourceFps = 'conformSourceFps'; conformMaxJump = 'conformMaxJump'; conformAudioSyncRequests = 'conformAudioSyncRequests' }
+$script:ConformCriteriaMetrics = [ordered]@{ conformSourceFps = 'conformSourceFps'; conformMaxJump = 'conformMaxJump'; conformAudioSyncRequests = 'conformAudioSyncRequests'; conformRepeats = 'conformRepeats' }
 
 function Get-DvCriteriaMetrics {
     <#
@@ -7503,6 +7506,23 @@ function Get-DvCriteriaMetrics {
             $m['conformTailAllowanceFrames'] = $allowed
         }
     }
+    # EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 (adversary A2 on b56cc731): the engine targets past the LAST painted frame (engine_target - last_frame,
+    # never below 0). conformMaxJump allows one held target (a conform never moves past an unpainted target, so a held one is no skip there), so a run whose
+    # final target was never painted reads max_jump=1; a leg that claims every measured source frame was painted judges this count directly (eq 0). Absent
+    # with a typed CouldNotCheck, so a criterion naming it FAILS, when the measured session's line is absent or another session's, its ends are absent,
+    # unreadable or negative, or it carries no readable non-negative backward or a backward step (a seek back: engine_target is the high-water target).
+    $tailName = 'conformTailUnpaintedFrames'
+    if ($m.Contains("${tailName}CouldNotCheck")) { $m.Remove("${tailName}CouldNotCheck") }
+    $m[$tailName] = $null
+    $tailWhy = $(if ($null -eq $Playback) { 'no playback block was derived from the run log' }
+                 elseif (-not $present) { 'no playback_smoke.conform line for the measured session in the run log' }
+                 elseif (-not $sameSession) { "the playback_smoke.conform line is for session $conformSession, not the measured session $summarySession" }
+                 elseif ($null -eq $ends['last_frame'] -or $null -eq $ends['engine_target']) { 'the measured session''s playback_smoke.conform line carries no readable non-negative last_frame / engine_target, so the unpainted tail cannot be counted' }
+                 elseif ($backwardMissing) { 'the measured session''s playback_smoke.conform line carries no readable non-negative backward, so a seek back cannot be ruled out and the tail cannot be counted' }
+                 elseif ($backward -gt 0) { "the painted frames stepped backward $backward time(s) (a seek back): engine_target is the engine's high-water target, not its final one, so the unpainted tail cannot be counted" }
+                 else { $null })
+    if ($null -eq $tailWhy) { $m[$tailName] = [Math]::Max([int64]$ends['engine_target'] - [int64]$ends['last_frame'], 0L) }
+    else { $m["${tailName}CouldNotCheck"] = $tailWhy }
     [pscustomobject]$m
 }
 

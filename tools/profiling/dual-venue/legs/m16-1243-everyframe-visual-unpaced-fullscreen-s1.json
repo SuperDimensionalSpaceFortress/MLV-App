@@ -47,6 +47,16 @@
           "metric": "conformMaxJump",
           "op": "eq",
           "value": 1
+        },
+        {
+          "metric": "conformRepeats",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "metric": "conformTailUnpaintedFrames",
+          "op": "eq",
+          "value": 0
         }
       ],
       "cpu": [
@@ -64,6 +74,16 @@
           "metric": "conformMaxJump",
           "op": "eq",
           "value": 1
+        },
+        {
+          "metric": "conformRepeats",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "metric": "conformTailUnpaintedFrames",
+          "op": "eq",
+          "value": 0
         }
       ]
     },
@@ -88,6 +108,16 @@
           "metric": "conformMaxJump",
           "op": "eq",
           "value": 1
+        },
+        {
+          "metric": "conformRepeats",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "metric": "conformTailUnpaintedFrames",
+          "op": "eq",
+          "value": 0
         }
       ],
       "cpu": [
@@ -105,6 +135,16 @@
           "metric": "conformMaxJump",
           "op": "eq",
           "value": 1
+        },
+        {
+          "metric": "conformRepeats",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "metric": "conformTailUnpaintedFrames",
+          "op": "eq",
+          "value": 0
         }
       ]
     }
