@@ -12,6 +12,7 @@
 #include <QString>
 #include <QTextStream>
 
+#include <cmath>
 #include <string>
 
 using playback_present_trace::Recorder;
@@ -128,6 +129,26 @@ TEST(PlaybackPresentTrace, AHoldIsNotAnAdvanceAndANewPlayStartsClean)
     ASSERT_EQ(0, trace.rows()[0].advances);
     ASSERT_NEAR(-1.0, trace.rows()[0].lastAdvanceMs, 1e-9);
     ASSERT_NEAR(0.0, trace.rows()[0].intervalMs, 1e-9);
+}
+
+// PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r9 (fable r8 PRESENT-TRACE-NONFINITE-GRANT-ROW-1): a non-finite grant is no advance.
+// Dropping std::isfinite from noteAdvance's guard (leaving appliedFrames > 0.0) would record +inf as one advance.
+TEST(PlaybackPresentTrace, ANonFiniteGrantIsNotAnAdvance)
+{
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(1000.0, 4);
+    trace.noteTick(1008.0, false, false);
+    trace.noteAdvance(1008.5, HUGE_VAL, 8);
+    trace.noteAdvance(1009.5, std::nan(""), 8);
+    trace.noteAdvance(1010.5, -HUGE_VAL, 8);
+    Row r;
+    r.presentMs = 1020.0;
+    trace.notePresent(r);
+    ASSERT_EQ(static_cast<size_t>(1), trace.rows().size());
+    ASSERT_EQ(0, trace.rows()[0].advances);
+    ASSERT_NEAR(-1.0, trace.rows()[0].lastAdvanceMs, 1e-9);
+    ASSERT_NEAR(0.0, trace.rows()[0].advancedFrames, 0.0);
 }
 
 // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r7 (sol r6 blocker on 9f3f5ebd): the trace decided "advanced" from equal endpoints,

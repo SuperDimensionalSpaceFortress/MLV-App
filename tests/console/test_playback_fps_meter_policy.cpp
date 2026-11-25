@@ -405,10 +405,12 @@ TEST(PlaybackFpsMeterPolicy, OneTickLapsStayWithinTheBoundFromAStaleStartOutside
         playback_frame_range::advanceDropFrameTick(0.0, HUGE_VAL, 1, 2, true);
     ASSERT_TRUE(endless.wrapLaps <= 1000000);
     ASSERT_TRUE(endless.position >= 0.0 && endless.position < 1.0);
-    // an ordinary tick from a stale start is unchanged: 20.1 wraps 20 laps to 0.1
+    // r9 (sol r8 on 4eb1cfd5): an ordinary tick from a stale start lands where it did (0.1) but records no lap: the 20
+    // laps 4eb1cfd5 counted were the stale distance's, a correction (foldedFrames 20), never travel
     const playback_frame_range::DropFrameTickResult ordinary =
         playback_frame_range::advanceDropFrameTick(20.0, 0.1, 1, 2, true);
-    ASSERT_EQ(20, ordinary.wrapLaps);
+    ASSERT_EQ(0, ordinary.wrapLaps);
+    ASSERT_TRUE(ordinary.foldedFrames == 20.0);
     ASSERT_TRUE(std::fabs(ordinary.position - 0.1) < 1e-9);
     // ...and so is a tick inside the cut that wraps exactly 1,000,000 laps (the bound itself is admitted)
     const playback_frame_range::DropFrameTickResult atBound =
@@ -416,23 +418,29 @@ TEST(PlaybackFpsMeterPolicy, OneTickLapsStayWithinTheBoundFromAStaleStartOutside
     ASSERT_EQ(1000000, atBound.wrapLaps);
     ASSERT_TRUE(std::fabs(atBound.position - 0.5) < 1e-6);
     // r5 (pass 8 A1 on c37d6fd5): a clipped tick stops at the LAST position whose laps are still 1e6, not the first
-    // position of that lap, so a stale start inside [lapLimit - width, lapLimit) keeps the room it had. c37d6fd5 cut
-    // 2000000 + 4.5 (conform, cut 1..2: wrapAt 2, width 2, lapLimit 2000002) to 2000000: position 0, advance 0.
+    // position of that lap, so it keeps all the room the bound allows. r9 (sol r8): a stale start is folded into the cut
+    // first, so only an in-range start with a delta past the bound reaches the clip: conform, cut 1..2 (wrapAt 2, width 2,
+    // lapLimit 2000002), 1.5 + 2000001 is cut to just below 2000002, 1e6 laps.
     const playback_frame_range::DropFrameTickResult clippedConform =
-        playback_frame_range::advanceDropFrameTick(2000000.0, 4.5, 1, 2, true, true);
+        playback_frame_range::advanceDropFrameTick(1.5, 2000001.0, 1, 2, true, true);
     ASSERT_EQ(1000000, clippedConform.wrapLaps);
     ASSERT_TRUE(clippedConform.position > 1.9999 && clippedConform.position < 2.0);
     const double clippedConformGranted =
-        clippedConform.position - 2000000.0 + (double)clippedConform.wrapWidth * clippedConform.wrapLaps;
-    ASSERT_TRUE(clippedConformGranted > 1.9999);
-    // ...and without conform (cut 1..2: wrapAt 1, width 1, lapLimit 1000001), 1000000 + 1.5 keeps almost one frame
+        clippedConform.position - 1.5 + (double)clippedConform.wrapWidth * clippedConform.wrapLaps;
+    ASSERT_TRUE(clippedConformGranted > 2000000.4999 && clippedConformGranted < 2000000.5);
+    // fable r8 DROP-FRAME-APPLIED-FRAMES-LAP-BOUND-CLIP-ROW-1: appliedFrames is the delta the bound KEPT, not the request
+    ASSERT_TRUE(clippedConform.appliedFrames < 2000000.5 && clippedConform.appliedFrames > 2000000.4999);
+    ASSERT_TRUE(std::fabs(clippedConform.appliedFrames - clippedConformGranted) < 1e-6);
+    // ...and without conform (cut 1..2: wrapAt 1, width 1, lapLimit 1000001), 0.5 + 1000001 keeps almost 1000000.5 frames
     const playback_frame_range::DropFrameTickResult clippedPlain =
-        playback_frame_range::advanceDropFrameTick(1000000.0, 1.5, 1, 2, true);
+        playback_frame_range::advanceDropFrameTick(0.5, 1000001.0, 1, 2, true);
     ASSERT_EQ(1000000, clippedPlain.wrapLaps);
     ASSERT_TRUE(clippedPlain.position >= 0.0 && clippedPlain.position < 1.0);
     const double clippedPlainGranted =
-        clippedPlain.position - 1000000.0 + (double)clippedPlain.wrapWidth * clippedPlain.wrapLaps;
-    ASSERT_TRUE(clippedPlainGranted > 0.9999 && clippedPlainGranted < 1.0);
+        clippedPlain.position - 0.5 + (double)clippedPlain.wrapWidth * clippedPlain.wrapLaps;
+    ASSERT_TRUE(clippedPlainGranted > 1000000.4999 && clippedPlainGranted < 1000000.5);
+    ASSERT_TRUE(clippedPlain.appliedFrames < 1000000.5 && clippedPlain.appliedFrames > 1000000.4999);   // the request was 1000001
+    ASSERT_TRUE(std::fabs(clippedPlain.appliedFrames - clippedPlainGranted) < 1e-6);
 }
 
 // r6 (sol r5 S2 on 6aaac7f5, fable r5 and key3 r5 hardening PLAYBACK-FRAME-RANGE-LAP-BOUND-CLAIM-WORDING-1): the comments
@@ -471,9 +479,11 @@ TEST(PlaybackFpsMeterPolicy, OneTickLapsStayWithinTheBoundFromAStartAtOrPastTheL
     const DropFrameTickResult endlessBoth = advanceDropFrameTick(1100000.0, HUGE_VAL, 1, 2, true, false);
     ASSERT_TRUE(endlessBoth.wrapLaps <= 1000000);
     ASSERT_TRUE(endlessBoth.position >= 0.0 && endlessBoth.position < 1.0);
-    // a start just below the limit is unchanged, bit for bit (the r5 rows above: 1000000 + 1.5 keeps 1e6 laps)
+    // r9 (sol r8 on 4eb1cfd5): a start just below the limit is folded too (4eb1cfd5 kept the base arithmetic and counted
+    // its 1e6 stale laps as travel); it lands where it did, with no lap
     const DropFrameTickResult below = advanceDropFrameTick(1000000.0, 0.5, 1, 2, true, false);
-    ASSERT_EQ(1000000, below.wrapLaps);
+    ASSERT_EQ(0, below.wrapLaps);
+    ASSERT_TRUE(below.foldedFrames == 1000000.0);
     ASSERT_TRUE(below.position == 1000000.0 + 0.5 - 1000000.0);
 }
 
@@ -538,9 +548,10 @@ TEST(PlaybackFpsMeterPolicy, AFoldedStartKeepsItsDeltaAndTheAppliedAdvanceAccoun
     const DropFrameTickResult huge = advanceDropFrameTick(18014398509481984.0, 0.0, 1, 4, true, false);
     ASSERT_EQ(0, huge.wrapLaps);
     ASSERT_TRUE(huge.position == 1.0);
-    // nothing is folded below the limit, inside the cut, or without Loop
-    ASSERT_TRUE(advanceDropFrameTick(1000000.0, 0.5, 1, 2, true, false).foldedFrames == 0.0);
-    ASSERT_TRUE(advanceDropFrameTick(20.0, 0.1, 1, 2, true).foldedFrames == 0.0);
+    // r9 (sol r8 on 4eb1cfd5): a stale start below the lap limit is folded as well (4eb1cfd5 did not); nothing is folded
+    // inside the cut or without Loop
+    ASSERT_TRUE(advanceDropFrameTick(1000000.0, 0.5, 1, 2, true, false).foldedFrames == 1000000.0);
+    ASSERT_TRUE(advanceDropFrameTick(20.0, 0.1, 1, 2, true).foldedFrames == 20.0);
     ASSERT_TRUE(advanceDropFrameTick(0.5, 1000000.0, 1, 2, true).foldedFrames == 0.0);
     ASSERT_TRUE(advanceDropFrameTick(1100000.0, 1.0, 1, 2, false).foldedFrames == 0.0);
     // r8 (sol r7 on 75ed5094): without Loop that stale start is CLAMPED onto the last frame (1) instead, a correction

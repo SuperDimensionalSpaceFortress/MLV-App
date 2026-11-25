@@ -272,8 +272,11 @@ struct DropFrameTickResult
     // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r6 (sol r5 S2 on 6aaac7f5): how far a stale start already at or past the tick's
     // lap limit was moved back, in whole laps, into the cut onto its own phase before the delta applied (those laps were the
     // stale position's, never travelled, so they are not counted in wrapLaps or recorded; the tick reads wrapped, with
-    // wrapLaps 0 unless the delta itself crosses the wrap point: pass 11 A1). 0 on every other tick. The applied advance is
-    // position - before + foldedFrames + clampedFrames + wrapWidth * wrapLaps (MainWindow's grantedDropFrames).
+    // wrapLaps 0 unless the delta itself crosses the wrap point: pass 11 A1). r9 (sol r8 on 4eb1cfd5): under Loop EVERY start
+    // outside the loop range [wrapAt - width, wrapAt) is folded, at any distance: one at or past wrapAt onto its own phase
+    // (positive), one below the cut's first frame onto that frame (negative). 0 on every other tick. In exact arithmetic the
+    // applied advance equals position - before + foldedFrames + clampedFrames + wrapWidth * wrapLaps, but MainWindow's
+    // grantedDropFrames reads appliedFrames below, never that endpoint sum.
     double foldedFrames = 0.0;
     // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r8 (sol r7 on 75ed5094): how far the non-Loop clamp moved a stale start PAST the
     // cut's last frame back onto it (start - lastFrame), a correction the tick never travelled; 0 on every other tick (a
@@ -335,13 +338,32 @@ inline DropFrameTickResult advanceDropFrameTick(
     // phase comes from exact fmods of the start and of the wrap point, never from a rounded difference (pass 11 A3: 2^54 lost
     // it). The fold is reported as foldedFrames and marks the tick wrapped (the position moved back) with wrapLaps 0 unless the
     // delta crosses wrapAt, so position - before + foldedFrames + wrapWidth * wrapLaps is the advance the tick applied. A +inf
-    // start has no phase and folds to the cut's first position. Every start below the limit is unchanged, bit for bit.
+    // start has no phase and folds to the cut's first position.
+    // r9 (sol r8 on 4eb1cfd5, DC-06 "a correction of a stale start counted as travelled laps"): the fold covers EVERY start
+    // outside the loop range [wrapAt - width, wrapAt), at any distance, not only one at or past the lap limit. A stale start
+    // between the wrap point and the limit kept the base arithmetic, so its stale distance was counted as travelled laps:
+    // Drop Frame position 100, cut 1..50, Loop, a zero request moved 100 -> 2 with nothing applied and recorded two 49-frame
+    // laps (the paint credit read 2 + 98 - 10 = 90 frames). A start at or past wrapAt folds onto its own phase as above (the
+    // position lands where the base's laps put it; only the laps change, to the ones the delta itself crosses). A start
+    // below the range (below the cut's first frame) has no lap to keep a phase from: it is corrected onto the cut's first
+    // position, and foldedFrames is negative. Both are reported as foldedFrames and mark the tick wrapped (the position was
+    // moved by a correction, not by travel, so no forward step is counted), with wrapLaps 0 unless the delta crosses wrapAt
+    // from the folded start. wrapLaps therefore counts only laps the applied delta crossed from an in-cut start. A start
+    // inside the range is unchanged, bit for bit; without Loop nothing is folded (the non-Loop clamp below owns that case).
     double start = currentPosition;
     const int loopWidth = cutOutValue - cutInValue + ( presentLastFrame ? 1 : 0 );
     if( loopEnabled && loopWidth > 0 )
     {
         const double width = static_cast<double>( loopWidth );
-        if( currentPosition >= wrapAt + kMaxLoopLapsPerTick * width )
+        const double firstPosition = wrapAt - width;   // the cut's first frame, cutInValue - 1
+        if( currentPosition < firstPosition )
+        {
+            start = firstPosition;
+            result.foldedFrames = currentPosition - start;
+            result.wrapped = true;
+            result.wrapWidth = loopWidth;
+        }
+        else if( currentPosition >= wrapAt )
         {
             double phase = std::fmod( currentPosition, width ) - std::fmod( wrapAt, width );
             if( phase < 0.0 ) phase += width;
@@ -356,8 +378,8 @@ inline DropFrameTickResult advanceDropFrameTick(
     result.position = start + frameDelta;
     // r8 iteration 1 (pass 14 A1): the applied advance, never recovered from the stale endpoints. r8 iteration 2 (pass 15 A1
     // on 437108e0): it is the move the position really made from the (folded) start, not the delta: a conform residue of
-    // 1.7763568394002505e-15 leaves 1024 at 1024 and applied nothing. The start is inside the cut here, so this
-    // subtraction is next to the delta's own size, never 1100000 away.
+    // 1.7763568394002505e-15 leaves 1024 at 1024 and applied nothing. Under Loop the start is inside the loop range here
+    // (r9: every start outside it was folded above), so this subtraction is next to the delta's own size, never 1100000 away.
     double applied = result.position - start;
     if( loopEnabled && result.position >= wrapAt )
     {
@@ -377,13 +399,13 @@ inline DropFrameTickResult advanceDropFrameTick(
             // more stops at the last position of the 1e6th lap (the rest of the delta is dropped, as a skipped backlog is), so
             // position - before + wrapWidth * wrapLaps is still the advance it made. A start already at or past the limit no longer
             // keeps the base arithmetic (r6, sol r5 S2: its laps were the stale start's own, unbounded); it was folded into the cut
-            // above, so the bound holds from ANY start, that one included. Every tick of up to that many laps from a start below
-            // the limit is unchanged, bit for bit. An infinite delta stops there too.
+            // above, so the bound holds from ANY start, that one included. Every tick of up to that many laps from a start inside
+            // the loop range is unchanged, bit for bit (r9: every start outside it is folded first). An infinite delta stops there too.
             // r5 (pass 8 A1 on c37d6fd5): it stops at the LAST position below lapLimit (one double step under it), not at the
-            // lap's first position lapLimit - width, so a stale start inside [lapLimit - width, lapLimit) keeps its room
-            // (2000000 + 4.5 conformed on cut 1..2 advanced 0; it now advances 2 - 2^-32 and lands just below wrapAt).
+            // lap's first position lapLimit - width, so the clipped tick keeps all the room the bound allows (r9: only an
+            // in-range start reaches here; 1.5 + 2000001 conformed on cut 1..2 advances to just below wrapAt, 1e6 laps).
             const double lapLimit = wrapAt + kMaxLoopLapsPerTick * width;   // laps <= kMaxLoopLapsPerTick iff position < lapLimit
-            // the start is below lapLimit here: a start at or past it was folded into the cut above (r6), before the delta
+            // the start is below lapLimit here: under Loop it is inside the loop range (r9 fold above), before the delta
             if( result.position >= lapLimit && start < lapLimit )
             {
                 result.position = std::max( start, std::nextafter( lapLimit, -HUGE_VAL ) );
