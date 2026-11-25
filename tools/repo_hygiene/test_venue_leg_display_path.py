@@ -1355,7 +1355,11 @@ class Successor2Tests(unittest.TestCase):
                         "  catch { $out[$k] = 'threw: ' + $_.FullyQualifiedErrorId } }\n" + cured +
                         "foreach ($k in 'no venue', 'one venue without a block') { $t = $(if ($k -eq 'no venue') { '{\"outcome\":\"PASS\",\"Outcome\":\"FAIL\"}' } else { '{\"outcome\":\"PASS\",\"Outcome\":\"FAIL\",\"venue\":{\"name\":\"b\"}}' })\n"
                         "  try { $r = ConvertFrom-DvReceiptText -Text $t; $out[$k] = 'recovered' } catch { $out[$k] = 'threw: ' + $_.FullyQualifiedErrorId } }\n"
+                        # the probe reader's recovery is the same class: a probe line the rewrite "cures" with no display block to drop stays no probe
+                        "$p = ConvertFrom-DvProbeStdout (\"DVE_PROBE=\" + '{\"hostName\":\"H\",\"PSObject\":1}' + \"`r`n\")\n"
+                        "$out['probe, nothing dropped'] = $(if ($null -eq $p) { 'probe-null' } else { 'probe-kept' })\n"
                         "$out | ConvertTo-Json -Compress -Depth 5", {"DVE_TEXTS": json.dumps(cases)})
+        self.assertEqual(got["probe, nothing dropped"], "probe-null", got)
         for label in cases:
             with self.subTest(label):
                 self.assertIsInstance(got[label], str, f"{label}: recovered and blamed on the display path: {got[label]}")
