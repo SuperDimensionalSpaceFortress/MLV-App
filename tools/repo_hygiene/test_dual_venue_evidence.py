@@ -4079,7 +4079,24 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
     # tests/**), never by file name; everything else, including a test-looking name outside the class, is still counted.
     PRODUCTION_RECEIPT_CALLERS = frozenset({"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/New-VenueSheetPair.ps1",
                                             "tools/profiling/dual-venue/New-VenueFlavorPair.ps1", "tools/profiling/dual-venue/Invoke-VenueBaseline.ps1"})
-    PRODUCTION_RECEIPT_READERS = frozenset({"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/Invoke-VenueLeg.ps1"})
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r4: VenueChain.psm1 reads a receipt in ONE place, Get-VenueLegHostLoad (its export test, Test-VenueReceiptIsExportLeg, names the
+    # receipt schema). That read only ever REFUSES a leg (host load unknown or provisional); its one non-refusing outcome, an export leg, is not-applicable, which is
+    # the pre-card behaviour, so it never admits a figure the validator would refuse and does not call Test-DvReceiptValid. The pin below keeps it to that function.
+    PRODUCTION_RECEIPT_READERS = frozenset({"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/Invoke-VenueLeg.ps1",
+                                            "tools/profiling/dual-venue/VenueChain.psm1"})
+    REFUSAL_ONLY_RECEIPT_READERS = {"tools/profiling/dual-venue/VenueChain.psm1": "Test-VenueReceiptIsExportLeg"}
+
+    @staticmethod
+    def receipt_literal_functions(text: str) -> list[str]:
+        # The function each receipt-literal line sits in (the nearest `function <Name>` above it), in order; '' for a line outside any function.
+        out, current = [], ""
+        for line in text.splitlines():
+            m = re.match(r"\s*function\s+([A-Za-z][\w-]*)", line)
+            if m:
+                current = m.group(1)
+            if "dual-venue-receipt/v1" in line or "dual-venue\\receipts" in line or "dual-venue/receipts" in line:
+                out.append(current)
+        return out
 
     @staticmethod
     def is_test_module(path: str) -> bool:
@@ -4102,6 +4119,12 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         # nothing else in the tree reads a receipt file: a new reader must call the validator (and be added to this list in review)
         self.assertEqual(readers, set(self.PRODUCTION_RECEIPT_READERS),
                          "an unknown reader of dual-venue receipts must call Test-DvReceiptValid -RepoRoot and be named here")
+        # r4: a refusal-only reader that does not call the validator keeps its receipt read inside the one named function (a second read anywhere else fails here)
+        for path, fn in self.REFUSAL_ONLY_RECEIPT_READERS.items():
+            self.assertNotIn(path, callers, path)
+            self.assertEqual(self.receipt_literal_functions(texts[path]), [fn], path)
+        self.assertEqual(self.receipt_literal_functions("function Read-X {\n  $s = 'mlv-app/dual-venue-receipt/v1'\n}\n"), ["Read-X"],
+                         "the pin sees a receipt literal in a second function, so it guards the refusal-only reader")
         mutated = texts["tools/profiling/dual-venue/New-VenueSheetPair.ps1"].replace("Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot", "Test-DvReceiptValid -Receipt $r")
         self.assertNotEqual(mutated, texts["tools/profiling/dual-venue/New-VenueSheetPair.ps1"])
         self.assertEqual(self.readers_without_repo_root({"New-VenueSheetPair.ps1": mutated}), ["New-VenueSheetPair.ps1:" + str(next(
