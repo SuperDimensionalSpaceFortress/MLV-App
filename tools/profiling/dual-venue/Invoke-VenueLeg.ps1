@@ -680,6 +680,8 @@ try {
     $probe = $null
     if ($probeRun.umOutcome -eq 'RECEIPT' -and $null -ne $probeRun.result) { $probe = ConvertFrom-DvProbeStdout ([string]$probeRun.result.stdout) }
     if ($null -eq $probe) {
+        # SUCCESSOR-2 W3 (pass-2 A4): the probe ran but printed no DVE_PROBE line (or never returned one): the block is the typed unknown, never null (absent)
+        $receipt.venue.displayPath = [ordered]@{ state = 'unknown'; reason = 'probe-did-not-report' }
         $receipt.health.outcome = 'UNHEALTHY'
         $why = if ($probeRun.umOutcome -ne 'RECEIPT') { "health probe ended $($probeRun.umOutcome): $($probeRun.message)" } else { 'health probe returned no DVE_PROBE line' }
         Stop-Leg 'VENUE_UNHEALTHY' $why

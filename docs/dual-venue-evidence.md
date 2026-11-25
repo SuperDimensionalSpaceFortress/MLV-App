@@ -678,10 +678,18 @@ that field. It never fails the leg, never delays it past the bound and never cha
 the agent's deadline. A read that never returns (a hung registry or WMI provider call ignores `-OperationTimeoutSec`) cannot hold the probe either: the job runs
 the collector in a worker runspace (`Get-DvDisplayPathBounded`) and waits for the budget and no longer. The block is then `{"state":"unknown","reason":"budget-exceeded"}`
 as a whole, and the job ends its own process after it has printed its `DVE_PROBE` line, so the abandoned read cannot keep the job alive to the agent's kill.
+The wrapper reads its clock again after the wait: a result that completed after the budget, or a budget already spent before the worker starts, is `budget-exceeded`
+too, never data. A number a provider gives outside `0..2147483647` (a negative `UBR`, a refresh rate of -1) is that leaf's typed unknown (`not-in-range`), so the
+rest of the block survives.
 
 A block or an object inside it (`os`, a table entry) that carries `state` or `reason` beside its ordinary fields is malformed: a typed unknown has those two members and
 no other. An adapter or display name that is a typed unknown still counts in the adapters/activeDisplays match. A receipt with `"venue": null` is malformed; only a
-receipt with no `venue` member, or a null or missing `displayPath`, is `displayPath=absent`.
+receipt with no `venue` member, or a null or missing `displayPath`, is `displayPath=absent`. A new receipt never carries a null block: the skeleton starts it as
+`{"state":"unknown","reason":"probe-not-run"}` (a leg refused before the health probe), and a probe that printed no `DVE_PROBE` line, or never returned, leaves
+`probe-did-not-report`. `ConvertFrom-Json` keeps only the last of two same-name keys, so a duplicate key at `venue`, at `venue.displayPath` or anywhere inside the
+block is malformed: the runner's probe-line parse checks the line's text, and a receipt reader that holds the receipt's text passes it as `-ReceiptText`
+(`New-VenueSheetPair.ps1` does). The validator judges the block before the core proof I/O, so a malformed block is reported as `DISPLAY_PATH_MALFORMED` even when
+that I/O fails (the failure is listed beside it as `EVIDENCE_VALIDATION_IO`); with a good block the I/O failure is thrown as before.
 
 **When it is sampled.** The block is a sample taken by the health probe, **before** the measurement job is submitted; the job then waits in the agent's queue and
 admission. It is not read again during the run, so it says what the venue drove at `collectedUtc`, not what it drove for every frame of the measurement. A display
@@ -691,7 +699,7 @@ describes the display path **at submit time**, never "during the run". A measure
 
 | Field | Meaning |
 |---|---|
-| `schema`, `collectedUtc` | `mlv-app/venue-display-path/v1`; when the probe read it (UTC text) |
+| `schema`, `collectedUtc` | `mlv-app/venue-display-path/v1`; when the probe finished reading it (UTC text, stamped after the last read and rounded up to the second, so it never names a time before the data existed) |
 | `sampledBefore` | always `"measurement-submit"`: the sample was taken by the health probe before the measurement job was submitted |
 | `adapters` | every `Win32_VideoController`: `name`, `driverVersion`, `driverDate` (ISO 8601 UTC), `pnpDeviceId`, `hasActiveOutput` (true when the controller reports a refresh rate or a width) |
 | `activeDisplays` | one entry per adapter with an active output: `adapterName`, `refreshHz`, `horizontalResolution`, `verticalResolution` |

@@ -1003,8 +1003,8 @@ class Successor2Tests(unittest.TestCase):
         video = [dict(BACHELOR_FIXTURE["video"][0], CurrentRefreshRate=-1), BACHELOR_FIXTURE["video"][1]]
         got = run_collector(fixture=dict(BACHELOR_FIXTURE, video=video), ubr=-1)
         block = got["block"]
-        self.assertEqual(block["os"]["ubr"], unknown("out-of-range"), block)
-        self.assertEqual(block["activeDisplays"][0]["refreshHz"], unknown("out-of-range"), block)
+        self.assertEqual(block["os"]["ubr"], unknown("not-in-range"), block)
+        self.assertEqual(block["activeDisplays"][0]["refreshHz"], unknown("not-in-range"), block)
         self.assertEqual(block["activeDisplays"][0]["horizontalResolution"], 3840, block)
         self.assertEqual(block["os"]["build"], "26100", block)
         self.assertEqual(got["state"], "present", got)

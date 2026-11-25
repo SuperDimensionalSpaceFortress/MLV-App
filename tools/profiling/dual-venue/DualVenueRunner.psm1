@@ -6123,14 +6123,33 @@ function Test-DvReceiptValid {
     probe failed included) or 'malformed' (INVALID, reason DISPLAY_PATH_MALFORMED, on every outcome: a bad block is a bad record whether or not the leg carried a signal).
     The block is collected by the venue probe and written to no hashed artifact, so a present block on a receipt that lists `unbound` claims is listed there too.
     #>
-    param([Parameter(Mandatory)]$Receipt, [string]$RepoRoot = '', [string]$EvidenceDir = '', [switch]$AllowOfflineTestMode, [byte[]]$OfflineLegSpecBytes = $null)
-    $result = Test-DvReceiptValidCore @PSBoundParameters
+    param([Parameter(Mandatory)]$Receipt, [string]$RepoRoot = '', [string]$EvidenceDir = '', [switch]$AllowOfflineTestMode, [byte[]]$OfflineLegSpecBytes = $null, [string]$ReceiptText = '')
+    # SUCCESSOR-2 W6 (pass-2 A7): the block is judged FIRST, from the receipt alone, so the core validator's proof I/O cannot hide its verdict (below)
     $venueNode = Get-DvProp $Receipt 'venue'
     # a venue that is present but not an object (an array, a number) cannot be said to carry no block: that is a malformed record, never `absent`
     # SUCCESSOR-1 W4 (r3 adversary A6): an explicit `"venue": null` is a venue that is there and is not an object (malformed); only a missing venue member is absent
     $display = $(if ($null -eq $venueNode -and (Test-DvDisplayPathHasMember $Receipt 'venue')) { [pscustomobject]@{ state = 'malformed'; problems = @('venue is null') } }
                  elseif ($null -ne $venueNode -and -not (Test-DvDisplayPathIsObject $venueNode)) { [pscustomobject]@{ state = 'malformed'; problems = @('venue is not an object') } }
                  else { Test-DvDisplayPathBlock -Block (Get-DvProp $venueNode 'displayPath') })
+    # SUCCESSOR-2 W2 (pass-2 A3): ConvertFrom-Json keeps the last of two same-name keys, so a doubled field reads as one. A caller that holds the receipt's TEXT passes it
+    # as -ReceiptText: a duplicate key at `venue`, at `venue.displayPath`, or anywhere inside the block is malformed (text that cannot be checked is malformed too).
+    if ($display.state -cne 'malformed' -and $PSBoundParameters.ContainsKey('ReceiptText')) {
+        $dups = Get-DvJsonDuplicateKeys -Text $ReceiptText
+        if ($null -eq $dups) { $display = [pscustomobject]@{ state = 'malformed'; problems = @('the receipt text cannot be read for duplicate keys') } }
+        else {
+            $hit = @($dups | Where-Object { [string]::Equals($_, '$.venue', [System.StringComparison]::Ordinal) -or (Test-DvJsonPathUnder $_ '$.venue.displayPath') })
+            if ($hit.Count -gt 0) { $display = [pscustomobject]@{ state = 'malformed'; problems = @('duplicate key ' + ($hit -join ', ')) } }
+        }
+    }
+    $coreArgs = @{}
+    foreach ($e in $PSBoundParameters.GetEnumerator()) { if (-not [string]::Equals($e.Key, 'ReceiptText', [System.StringComparison]::OrdinalIgnoreCase)) { $coreArgs[$e.Key] = $e.Value } }
+    try { $result = Test-DvReceiptValidCore @coreArgs }
+    catch {
+        # a good (or absent) block keeps the core's own throw, so the writer still types it DVE_EVIDENCE_VALIDATION_IO; a malformed one reports BOTH reasons, each its own
+        if ($display.state -cne 'malformed') { throw }
+        $io = ([string]$_.Exception.Message) -replace '\s+', ' '
+        $result = [pscustomobject]@{ valid = $false; status = 'INVALID'; reasons = @("EVIDENCE_VALIDATION_IO: the core validator could not complete: $io"); unbound = @(); evidenceDir = $null; legType = $null }
+    }
     if ($display.state -ceq 'malformed') {
         $result.reasons = @('DISPLAY_PATH_MALFORMED: venue.displayPath: ' + ($display.problems -join '; ')) + @($result.reasons)
         $result.status = 'INVALID'
@@ -6411,7 +6430,8 @@ function Get-DvDisplayPathCollectorSource {
     .SYNOPSIS
     The text of Get-DvDisplayPath, the venue-side collector, embedded verbatim in the health probe job (New-DvHealthProbeJobText) and dot-sourced by the tests.
     READ-ONLY: Get-CimInstance (each call bounded by -OperationTimeoutSec from what is left of the 15 s budget) and one Get-ItemProperty on the CurrentVersion key.
-    The slowest query (Win32_QuickFixEngineering) runs last, so a stall in it costs nothing else. No power-plan write verb, no process, no file.
+    The slowest query (Win32_QuickFixEngineering) runs last, so a stall in it that ends inside the budget costs no other field; one that outlasts the whole budget is
+    abandoned by Get-DvDisplayPathBounded and the block is its typed unknown (budget-exceeded). No power-plan write verb, no process, no file.
     #>
     @'
 function Get-DvDisplayPath {
@@ -6427,7 +6447,9 @@ function Get-DvDisplayPath {
         [ordered]@{ state = 'unknown'; reason = $r }
     }
     $text = { param($v) if ($null -eq $v -or ([string]$v).Trim().Length -eq 0) { & $unknown 'not-reported' } else { [string]$v } }
-    $int = { param($v) if ($null -eq $v) { & $unknown 'not-reported' } else { try { [int]$v } catch { & $unknown 'not-an-integer' } } }
+    # SUCCESSOR-2 W5 (pass-2 A6): a count or a measurement is 0..Int32.MaxValue; a negative or larger number from the provider is THAT leaf's typed unknown, so the block
+    # stays well formed (the validator refuses a negative int, and a refused block used to be dropped whole by the runner)
+    $int = { param($v) if ($null -eq $v) { & $unknown 'not-reported' } else { $n = $null; try { $n = [long]$v } catch { }; if ($null -eq $n) { & $unknown 'not-an-integer' } elseif ($n -lt 0 -or $n -gt [int]::MaxValue) { & $unknown 'not-in-range' } else { [int]$n } } }
     $utc = { param($d) if ($d -is [datetime]) { $d.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', $invariant) } else { & $unknown 'not-reported' } }
     $cim = {
         param([string]$Class, [string]$Namespace = '', [string]$Filter = '')
@@ -6442,7 +6464,8 @@ function Get-DvDisplayPath {
         , $got
     }
     try {
-        $block = [ordered]@{ schema = 'mlv-app/venue-display-path/v1'; sampledBefore = 'measurement-submit'; collectedUtc =[datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', $invariant); adapters = $null; activeDisplays = $null; os = $null; powerPlan = $null }
+        # SUCCESSOR-2 W4 (pass-2 A5): collectedUtc is stamped AFTER the last read (below), rounded UP to the whole second, so it never names a time before the data existed
+        $block = [ordered]@{ schema = 'mlv-app/venue-display-path/v1'; sampledBefore = 'measurement-submit'; collectedUtc = $null; adapters = $null; activeDisplays = $null; os = $null; powerPlan = $null }
 
         # video adapters, and which of them has an active output (a refresh rate or a width the controller reports)
         $rows = $null; $rowsWhy = ''
@@ -6497,6 +6520,10 @@ function Get-DvDisplayPath {
             $fixes = & $cim 'Win32_QuickFixEngineering'
             $block.os.hotfixCount = @($fixes).Count
         } catch { $block.os.hotfixCount = & $unknown $_.Exception.Message }
+        $done = [datetime]::UtcNow
+        $rem = $done.Ticks % [timespan]::TicksPerSecond
+        if ($rem -ne 0) { $done = $done.AddTicks([timespan]::TicksPerSecond - $rem) }
+        $block.collectedUtc = $done.ToString('yyyy-MM-ddTHH:mm:ssZ', $invariant)
         $block
     } catch {
         & $unknown ('collector-error: ' + $_.Exception.Message)
@@ -6509,17 +6536,22 @@ function Get-DvDisplayPathBounded {
     # flight then is abandoned: the block is its typed unknown and $script:DvDisplayPathAbandoned tells the job to end its own process once it has printed its line
     # (the abandoned pipeline would otherwise keep the process alive). -WorkerFunctions is the tests' door (name -> body of a function the worker also defines: their
     # stand-in reads); the job passes none. r1 adversary A4: the worker gets its functions as session-state entries and runs one named command, never a built script text.
-    param([int]$BudgetSec = 15, [System.Collections.IDictionary]$WorkerFunctions = $null)
+    # SUCCESSOR-2 W1 (pass-2 A2): the clock is read three times: before the worker starts (a budget already spent starts nothing), for the wait, and AFTER the wait. A result
+    # that completed, or was collected, after the budget is the typed unknown budget-exceeded, never evidence. -Clock is any object with an .Elapsed [timespan] (the tests'
+    # door to an exact late completion); by default it is a stopwatch started here.
+    param([int]$BudgetSec = 15, [System.Collections.IDictionary]$WorkerFunctions = $null, $Clock = $null)
     $BudgetSec = [math]::Max(0, [math]::Min(15, $BudgetSec))
     if ($BudgetSec -lt 1) { return (Get-DvDisplayPath -BudgetSec 0) }   # a spent budget asks nothing, so there is nothing to wait on
-    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $sw = $(if ($null -ne $Clock) { $Clock } else { [Diagnostics.Stopwatch]::StartNew() })
+    $budgetMs = $BudgetSec * 1000.0
+    if ($sw.Elapsed.TotalMilliseconds -ge $budgetMs) { return [ordered]@{ state = 'unknown'; reason = 'budget-exceeded' } }
     $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
     $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('Get-DvDisplayPath', ${function:Get-DvDisplayPath}.ToString()))
     if ($null -ne $WorkerFunctions) { foreach ($e in $WorkerFunctions.GetEnumerator()) { $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new([string]$e.Key, [string]$e.Value)) } }
     $ps = [powershell]::Create($iss)
     $null = $ps.AddCommand('Get-DvDisplayPath').AddParameter('BudgetSec', $BudgetSec)
     $handle = $ps.BeginInvoke()
-    $waitMs = [int][math]::Floor([math]::Max(0.0, $BudgetSec * 1000.0 - $sw.Elapsed.TotalMilliseconds))
+    $waitMs = [int][math]::Floor([math]::Max(0.0, $budgetMs - $sw.Elapsed.TotalMilliseconds))
     if (-not $handle.AsyncWaitHandle.WaitOne($waitMs)) {
         $script:DvDisplayPathAbandoned = $true
         try { $null = $ps.BeginStop($null, $null) } catch { }
@@ -6528,6 +6560,8 @@ function Get-DvDisplayPathBounded {
     $out = @()
     try { $out = @($ps.EndInvoke($handle)) } catch { $out = @() }
     $ps.Dispose()
+    # the wait can return true for a result that completed after the budget (a caller delayed before the wait computes a zero wait on a done handle): re-read the clock
+    if ($sw.Elapsed.TotalMilliseconds -gt $budgetMs) { return [ordered]@{ state = 'unknown'; reason = 'budget-exceeded' } }
     if ($out.Count -ne 1 -or $null -eq $out[0]) { return [ordered]@{ state = 'unknown'; reason = 'collector-error' } }
     $out[0]
 }
@@ -6582,6 +6616,46 @@ function Test-DvDisplayPathHasUnknownMember {
     param($Value)
     $names = @($(if ($Value -is [System.Collections.IDictionary]) { @($Value.GetEnumerator() | ForEach-Object { $_.Key }) } else { @($Value.PSObject.Properties | ForEach-Object { $_.Name }) }) | ForEach-Object { [string]$_ })
     @($names | Where-Object { [string]::Equals($_, 'state', [System.StringComparison]::OrdinalIgnoreCase) -or [string]::Equals($_, 'reason', [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
+}
+
+function Add-DvJsonDuplicateKeys {
+    param([System.Text.Json.JsonElement]$Element, [string]$Path, [System.Collections.Generic.List[string]]$Found)
+    if ($Element.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+        # OrdinalIgnoreCase: PowerShell reads a member without regard to case, so `Name` beside `name` is one member read twice as well
+        $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($p in $Element.EnumerateObject()) {
+            $here = $Path + '.' + $p.Name
+            if (-not $seen.Add($p.Name)) { $Found.Add($here) }
+            Add-DvJsonDuplicateKeys -Element $p.Value -Path $here -Found $Found
+        }
+    } elseif ($Element.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
+        $i = 0
+        foreach ($e in $Element.EnumerateArray()) { Add-DvJsonDuplicateKeys -Element $e -Path ($Path + '[' + $i + ']') -Found $Found; $i++ }
+    }
+}
+
+function Get-DvJsonDuplicateKeys {
+    # SUCCESSOR-2 W2 (pass-2 A3): ConvertFrom-Json keeps the last of two same-name keys and says nothing. This reads the same text with System.Text.Json (the parser this
+    # module already uses for the exposure band file; it keeps both) and returns the path of every member whose name its object already had ('$.venue.displayPath.state'),
+    # an empty array when there is none, or $null when the text is not JSON it can read (a caller then cannot say there is no duplicate).
+    param([AllowEmptyString()][string]$Text)
+    $doc = $null
+    try {
+        $opt = [System.Text.Json.JsonDocumentOptions]::new()
+        $opt.MaxDepth = 256; $opt.AllowTrailingCommas = $true; $opt.CommentHandling = [System.Text.Json.JsonCommentHandling]::Skip
+        $doc = [System.Text.Json.JsonDocument]::Parse($Text, $opt)
+    } catch { return $null }
+    try {
+        $found = [System.Collections.Generic.List[string]]::new()
+        Add-DvJsonDuplicateKeys -Element $doc.RootElement -Path '$' -Found $found
+        , $found.ToArray()
+    } finally { $doc.Dispose() }
+}
+
+function Test-DvJsonPathUnder {
+    # $Path is $Root or a member / element under it (ordinal)
+    param([string]$Path, [string]$Root)
+    [string]::Equals($Path, $Root, [System.StringComparison]::Ordinal) -or $Path.StartsWith($Root + '.', [System.StringComparison]::Ordinal) -or $Path.StartsWith($Root + '[', [System.StringComparison]::Ordinal)
 }
 
 function Test-DvDisplayPathHasMember {
@@ -6786,7 +6860,17 @@ function ConvertFrom-DvProbeStdout([string]$Stdout) {
     $raw = ($PSVersionTable.PSVersion -ge [version]'7.5')
     foreach ($line in ($Stdout -split "`r?`n")) {
         if ($line.StartsWith('DVE_PROBE=')) {
-            try { if ($raw) { return ($line.Substring('DVE_PROBE='.Length) | ConvertFrom-Json -DateKind String) } else { return ($line.Substring('DVE_PROBE='.Length) | ConvertFrom-Json) } } catch { return $null }
+            $json = $line.Substring('DVE_PROBE='.Length)
+            $probe = $null
+            try { if ($raw) { $probe = ($json | ConvertFrom-Json -DateKind String) } else { $probe = ($json | ConvertFrom-Json) } } catch { return $null }
+            # SUCCESSOR-2 W2 (pass-2 A3): a duplicate key at displayPath or anywhere inside it (or text the duplicate check cannot read) is a malformed block, never the last copy
+            if ($probe -is [System.Management.Automation.PSCustomObject]) {
+                $dups = Get-DvJsonDuplicateKeys -Text $json
+                if ($null -eq $dups -or @($dups | Where-Object { Test-DvJsonPathUnder $_ '$.displayPath' }).Count -gt 0) {
+                    Add-Member -InputObject $probe -NotePropertyName displayPath -NotePropertyValue ([ordered]@{ state = 'unknown'; reason = 'probe-block-malformed' }) -Force
+                }
+            }
+            return $probe
         }
     }
     $null
@@ -7145,8 +7229,9 @@ function New-DvReceipt {
         venue = [ordered]@{
             name = $DeclaredVenue; role = $Role; declared = $DeclaredVenue; detected = $null; hostName = $null
             gpuNames = @(); driverVersion = $null; displayDevice = $null
-            # VENUE-LEG-DISPLAY-PATH-RECEIPT-1: the display path the venue drove at leg time (adapters, active displays, OS build / boot, power plan); null on a receipt written before the probe answered
-            displayPath = $null
+            # VENUE-LEG-DISPLAY-PATH-RECEIPT-1: the display path the venue drove at leg time (adapters, active displays, OS build / boot, power plan). SUCCESSOR-2 W3 (pass-2 A4): a
+            # new receipt never says absent (that is an older receipt's report): until the health probe answers, the block is the typed unknown probe-not-run
+            displayPath = [ordered]@{ state = 'unknown'; reason = 'probe-not-run' }
             instrumentDigests = [ordered]@{ presentmon = $null; scorer = $null }
         }
         actor = $Actor
