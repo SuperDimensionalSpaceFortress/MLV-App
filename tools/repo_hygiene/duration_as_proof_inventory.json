@@ -3406,6 +3406,27 @@
       "lines": [
         143
       ]
+    },
+    {
+      "path": "tests/pipeline/test_dual_iso_applied_stage_log.cpp",
+      "anchor": "ASSERT_TRUE ( llrpGetLastDualIsoMilliseconds ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1: non-negativity check on the thread-local dual-ISO ms getter (dual_iso_ms accumulates mlv_stage_timing_now() deltas in llrawproc.c). In ReconstructionThatRunsReportsApplied the run proof is llrpGetLastDualIsoOutcome() == LLRP_DUAL_ISO_OUTCOME_APPLIED plus the rewritten decode (out != source); in AttemptedReconstructionThatFailsReportsNotAppliedAndRestoresTheDecode it is the NOT_APPLIED outcome plus the restored decode. The outcome getter exists to replace ms > 0 as the dual-ISO run proof.",
+      "lines": [
+        111,
+        131
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dual_iso_applied_stage_log.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , llrpGetLastDualIsoMilliseconds ( ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1: negative-lane check in RunWithoutDualIsoReportsNotAttempted that a run with dual-ISO off reads the run-entry reset value 0.0 ms; it never proves a stage ran, and is paired with llrpGetLastDualIsoOutcome() == LLRP_DUAL_ISO_OUTCOME_NOT_ATTEMPTED directly above it.",
+      "lines": [
+        146
+      ]
     }
   ]
 }
