@@ -11073,6 +11073,64 @@ class PlannedHashBindB3R8BoundedWaitTests(unittest.TestCase):
         self.assertLess(body.index("Identity(path, out l)"), body.index('"the end passed before the second open"'))
         self.assertLess(body.index('"the end passed before the second open"'), body.index("Resolve(path)"), "no second open once the end passed")
 
+    def test_planned_hash_bind_b3_r8_p2_a3_the_callers_stopwatch_end_bounds_the_read_whatever_the_wall_end_says(self) -> None:
+        # r8 pass 2 (adversary A3 on 61244e31, json input): the Stopwatch end was derived INSIDE the reader from a wall remainder sampled after the caller's own, so a pause (and a
+        # step back) between the two moved it later and a late result was accepted. The caller now hands its own Stopwatch end, anchored before its wall samples: a wall end 11 s
+        # away (a step back) with a Stopwatch end 1 s away is a 1 s read, TIMEOUT, for both readers.
+        lines = self._a3_probe(
+            "$b = $null; $k = $null; $e = $null; $p = $null; $key = $null; $f = [Diagnostics.Stopwatch]::Frequency\n"
+            "$sw = [Diagnostics.Stopwatch]::StartNew(); $mono = [Diagnostics.Stopwatch]::GetTimestamp() + $f\n"
+            "$rc = [VenueLeaseBatchBoundedReadR4]::ReadUntil($path, 1500, [DateTime]::UtcNow.AddSeconds(11).Ticks, $mono, [ref]$b, [ref]$k, [ref]$e)\n"
+            "\"A3READ $rc $([int]$sw.ElapsedMilliseconds)\"\n"
+            "$sw = [Diagnostics.Stopwatch]::StartNew(); $mono = [Diagnostics.Stopwatch]::GetTimestamp() + $f\n"
+            "$ok = [VenueLeaseBatchFinalPath]::LocateUntil($path, 1500, [DateTime]::UtcNow.AddSeconds(11).Ticks, $mono, [ref]$p, [ref]$key)\n"
+            "\"A3LOC $ok $([int]$sw.ElapsedMilliseconds)\"\n")
+        self.assertEqual([l.split()[:2] for l in lines], [["A3READ", "2"], ["A3LOC", "False"]], lines)
+        self.assertTrue(all(int(l.split()[2]) < 1450 for l in lines), lines)
+        text = RUNNER.read_text(encoding="utf-8")
+        # every caller anchors its Stopwatch end before its wall samples, and the guard takes its remainder and its end from ONE sample
+        for fn, anchor in (("function Read-SpecBytesWithin", "$readT0 = [Diagnostics.Stopwatch]::GetTimestamp()"), ("function Get-InputLocationWithin", "$locT0 = [Diagnostics.Stopwatch]::GetTimestamp()")):
+            body = text[text.index(fn):text.index("\nfunction ", text.index(fn) + 1)]
+            self.assertLess(body.index(anchor), body.index("[DateTime]::UtcNow.AddMilliseconds([double]$ms)"), fn)
+        self.assertIn("$guardEndSec = $guardNowSec + [double]$bound", text)
+        req = text[text.index("function Invoke-ClaimRetryRequest"):text.index("\nfunction ", text.index("function Invoke-ClaimRetryRequest") + 1)]
+        self.assertLess(req.index("$reqT0 = [Diagnostics.Stopwatch]::GetTimestamp()"), req.index("$reqEndUtc = [DateTime]::UtcNow"))
+        mod = MODULE.read_text(encoding="utf-8")
+        self.assertLess(mod.index("$dlClock = [Diagnostics.Stopwatch]::StartNew()"), mod.index("$dlMonoMs = $(if ($null -ne $dlUtc)"), "the deadline's room is held on a clock started before its sample")
+        self.assertNotIn("$dlMonoMs - $runClock", mod)
+
+    def test_planned_hash_bind_b3_r8_p2_a4_a_final_transcript_name_near_the_component_limit_still_gets_a_temp_that_fits(self) -> None:
+        # r8 pass 2 (adversary A4 on 61244e31, json input): the temp was $final + ".b2r2-<32 hex>.tmp", 42 characters past a final leaf that preflight accepted at up to the
+        # volume's 255, so a 227-character leaf (a 200-character legId, cuda) had a 269-character temp: CreateNew failed on NTFS and no transcript was written. The worker, lifted
+        # from the runner, writes that name now.
+        text = RUNNER.read_text(encoding="utf-8")
+        line = next(l for l in text.splitlines() if "$owr = try {" in l and ".b2r2-" in l)
+        worker = re.search(r"'(param\(\$a\) \$final(?:[^']|'')*)'", line).group(1).replace("''", "'")
+        final = self.case / ("leg-01-" + "a" * 200 + "-cuda-A-b01-a1.out.txt")
+        self.assertGreater(len(final.name), 220)
+        probe = self.case / "a4.ps1"
+        probe.write_text("$sb = [scriptblock]::Create([IO.File]::ReadAllText('" + psq(self.case / "worker.txt") + "'))\n"
+                         f"$r = & $sb @{{ p = '{psq(final)}'; t = 'TRANSCRIPT' }}\n\"A4 $r\"\n", encoding="utf-8")
+        (self.case / "worker.txt").write_text(worker, encoding="utf-8")
+        got = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], capture_output=True, text=True, timeout=120)
+        self.assertIn("A4 OK", got.stdout, "a long accepted transcript name got no temp that fits (old: FAILED, the temp leaf past 255)\n" + got.stdout + got.stderr)
+        self.assertEqual(final.read_text(encoding="utf-8"), "TRANSCRIPT")
+        self.assertEqual([p.name for p in self.case.iterdir() if p.suffix == ".tmp"], [], "no temp left behind")
+
+    def test_planned_hash_bind_b3_r8_p2_a1_a2_a5_the_late_and_blocked_paths_never_decide_anything(self) -> None:
+        # r8 pass 2 (adversary A1, A2, A5 on 61244e31): A1, the refusal's stdout line is written BEFORE any log step (an append that stalls, or a full stderr, held it); A2, a grant
+        # first SEEN after the retry request's wait is released and never used, however early it was decided; A5, a read fault seen past the end is TIMEOUT, never FAILED
+        text = RUNNER.read_text(encoding="utf-8")
+        fn = text[text.index("function Write-LegSpecRefusalLine"):text.index("function Format-Mean")]
+        self.assertLess(fn.index("[Console]::Out.WriteLine("), fn.index("LogBest $msg"), "stdout first")
+        self.assertIn("$null = @(try { LogBest $msg }", fn, "the log's own stdout echo is dropped: the line is said once")
+        req = text[text.index("function Invoke-ClaimRetryRequest"):text.index("\nfunction ", text.index("function Invoke-ClaimRetryRequest") + 1)]
+        self.assertIn("$seenLate = [Diagnostics.Stopwatch]::GetTimestamp() -gt $reqEndTs -or [DateTime]::UtcNow -gt $reqEndUtc", req)
+        self.assertIn("Invoke-ClaimRetryRelease -DeadlineUtc $DeadlineUtc -Nonce ([string]$state.result.claim.nonce)", req)
+        self.assertLess(req.index("$state.late = $true"), req.index("if ($state.late) {"))
+        src = _b3r8_type_source("VenueLeaseBatchBoundedReadR4")
+        self.assertIn("if (e.InnerException is TimeoutException || Past(endUtcTicks, monoEnd)) { return 2; }", src)
+
 
 @unittest.skipIf(PWSH is None or sys.platform == "win32", "needs pwsh off Windows (POSIX reparenting)")
 class PlannedHashBindB3R8PosixKillTests(unittest.TestCase):

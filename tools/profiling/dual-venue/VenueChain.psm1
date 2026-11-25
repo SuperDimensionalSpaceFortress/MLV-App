@@ -2063,6 +2063,9 @@ function Invoke-VenueBoundedProcess {
     if ($null -ne $dlUtc -and ($dlUtc - [DateTime]::UtcNow).TotalSeconds -lt [Math]::Max(0.000001, [double]$MinRoomSec)) { return [pscustomobject]@{ exit = $null; timedOut = $true; notStarted = $true; lateStart = $false; lateExit = $false; killConfirmed = $true; killAttempted = $false; killErrored = $false; stdout = ''; stderr = '' } }
     if ($null -ne $snaUtc -and [DateTime]::UtcNow -ge $snaUtc) { return [pscustomobject]@{ exit = $null; timedOut = $true; notStarted = $true; lateStart = $false; lateExit = $false; killConfirmed = $true; killAttempted = $false; killErrored = $false; stdout = ''; stderr = '' } }
     # b2 r2 (adversary pass 3 A1 on 372d1bfd): -DeadlineUtc is also held on the Stopwatch (its room at the clock's start), so a wall-clock step cannot widen the wait past it
+    # BATCH-3 r8 pass 2 (adversary A3 sibling on 61244e31): that room is held on ITS OWN Stopwatch, started before the wall sample, so a pause between the sample and the run
+    # clock's start (which used to carry it) cannot move the deadline's monotonic end later
+    $dlClock = [Diagnostics.Stopwatch]::StartNew()
     $dlMonoMs = $(if ($null -ne $dlUtc) { [double]($dlUtc - [DateTime]::UtcNow).TotalMilliseconds } else { 0.0 })
     $runClock = [Diagnostics.Stopwatch]::StartNew()
     $p = [Diagnostics.Process]::Start($psi)
@@ -2087,10 +2090,10 @@ function Invoke-VenueBoundedProcess {
     $timedOut = [bool]$lateStart
     while (-not $timedOut) {
         $waitMs = [Math]::Max(0.0, [double]$TimeoutSec * 1000.0 - $runClock.Elapsed.TotalMilliseconds)   # b2 r1 (A1): what is left of the bound, never a fresh one
-        if ($null -ne $dlUtc) { $waitMs = [Math]::Min([double]$waitMs, [Math]::Max(0.0, [Math]::Min([double]($dlUtc - [DateTime]::UtcNow).TotalMilliseconds, [double]$dlMonoMs - $runClock.Elapsed.TotalMilliseconds))) }
+        if ($null -ne $dlUtc) { $waitMs = [Math]::Min([double]$waitMs, [Math]::Max(0.0, [Math]::Min([double]($dlUtc - [DateTime]::UtcNow).TotalMilliseconds, [double]$dlMonoMs - $dlClock.Elapsed.TotalMilliseconds))) }
         if (-not $p.WaitForExit([int][Math]::Floor([Math]::Min(250.0, [double]$waitMs)))) { if ($waitMs -le 250.0) { $timedOut = $true } } else { break }
     }
-    $observedSec = $runClock.Elapsed.TotalSeconds
+    $observedSec = $runClock.Elapsed.TotalSeconds; $observedDlMs = $dlClock.Elapsed.TotalMilliseconds   # r8 pass 2: the deadline's room is read on its own clock
     if (-not $timedOut) {
         # r5 (adversary pass 7 A2): the OS exit is judged against BOTH bounds: -DeadlineUtc and the child's own start plus -TimeoutSec (a parent that resumed late and polled an
         # already-exited child read success for a child that outran its relative cap)
@@ -2100,7 +2103,7 @@ function Invoke-VenueBoundedProcess {
         # the OS instants say (r1's conjunction also asked the OS instants to agree, so a backward wall-clock step, or an exit time that would not read, accepted a child that
         # outran its bound). The Stopwatch started before Process.Start, so a parent that observed in time is never read late, by any step. The absolute bound is late on the OS
         # exit instant, or when the Stopwatch observed past the deadline's room at its start ($dlMonoMs).
-        $lateExit = ($observedSec -gt [double]$TimeoutSec) -or ($null -ne $dlUtc -and (($exitUtc -gt $dlUtc) -or ($observedSec * 1000.0 -gt [double]$dlMonoMs)))
+        $lateExit = ($observedSec -gt [double]$TimeoutSec) -or ($null -ne $dlUtc -and (($exitUtc -gt $dlUtc) -or ($observedDlMs -gt [double]$dlMonoMs)))
         if ($lateExit) { $timedOut = $true }
     }
     $killErrored = $false; $killAttempted = $false
