@@ -493,6 +493,15 @@ $rp = Join-Path $rdir "$id.json"; Set-Content -LiteralPath $rp -Value '{}'
 $edir = Join-Path (Join-Path (Split-Path -Parent $rroot) 'evidence') $id; New-Item -ItemType Directory -Force -Path $edir | Out-Null
 $pre = Pick $env:FAKE_LEG_PRELOADS $k '5'
 if ($pre -ne 'none') { Set-Content -LiteralPath (Join-Path $edir 'summary.json') -Value ('{"cpuQuiescence":{"timeMeanPercent":' + $pre + '}}') }
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: FAKE_LEG_HOSTLOADS per call = the smoke result.json's hostLoad: quiet (default) | cim (the 2026-11-21 a134532e shape:
+# before/after collected=false CimException, state unknown, provisional true) | missing (a result.json with no hostLoad block) | none (no result.json)
+$hlMode = Pick $env:FAKE_LEG_HOSTLOADS $k 'quiet'
+$hlBlock = switch ($hlMode) {
+    'cim' { '{"before":{"collected":false,"error":"collection failed: CimException"},"after":{"collected":false,"error":"collection failed: CimException"},"state":"unknown","provisional":true,"reason":"Host load telemetry could not be collected"}' }
+    'missing' { $null }
+    default { '{"before":{"collected":true},"after":{"collected":true},"state":"quiet","provisional":false,"reason":"quiet"}' }
+}
+if ($hlMode -ne 'none') { Set-Content -LiteralPath (Join-Path $edir 'result.json') -Value ('{"schema":"mlvapp-gui-smoke-result.v2"' + $(if ($hlBlock) { ',"hostLoad":' + $hlBlock }) + '}') }
 # r4 (adversary r4 A1): FAKE_LEG_TAIL_SLEEP = the leg child's own work after its agent job ended (its receipt, its evidence), before it exits
 if ($env:FAKE_LEG_TAIL_SLEEP) { Start-Sleep -Seconds ([int]$env:FAKE_LEG_TAIL_SLEEP) }
 # r6 (adversary-848f6559.json A1): FAKE_LEG_EXIT per call = the child exits with that code AFTER its agent job's result landed (a receipt write denied, Invoke-VenueLeg.ps1:314)
@@ -892,6 +901,34 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.assertEqual(list((self.share / "notafter").iterdir()), [], "the open's sidecar was left behind")
         self.assertIsNone(b["claimRenew"]["lost"], b["claimRenew"])
         self.assertIn(f" BATCH_OPEN_LIVENESS batch=1 job=lease-batch-open-", log)
+
+    # ---------------------------------------------------------------- VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1
+    def test_a_leg_whose_smoke_host_load_is_unknown_is_recorded_but_never_counted(self) -> None:
+        # The 2026-11-21 a134532e shape: pre-load 5 % (QUIET_PRELOAD_OK by the pre-load alone), but the smoke's hostLoad was not collected
+        # (CimException): state unknown, provisional true. RED: the leg counted, and no row or line said its host-load state.
+        r = self.run_batch(self.specs[:3], FAKE_LEG_HOSTLOADS="cim,quiet,missing")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        got = [(l["status"], l["class"], l["counted"], l.get("hostLoadState"), l.get("hostLoadProvisional")) for l in b["legs"]]
+        self.assertEqual(got, [("RAN", "HOSTLOAD_PROVISIONAL", False, "unknown", True), ("RAN", "QUIET_PRELOAD_OK", True, "quiet", False),
+                               ("RAN", "HOSTLOAD_PROVISIONAL", False, "unknown", True)], b["legs"])
+        self.assertEqual((b["legsRan"], b["legsCounted"]), (3, 1), "a provisional leg is recorded as run, never counted")
+        res = batch_result(r.stdout)
+        self.assertEqual((res["ran"], res["counted"]), (3, 1))
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+        rid = Path(b["legs"][0]["receipt"]).stem
+        self.assertIn(f"REFERENCE_PROVISIONAL leg={rid} reason=hostload-unknown", log)
+        self.assertIn("class=HOSTLOAD_PROVISIONAL counted=False", log)
+        self.assertIn("hostLoadState=unknown hostLoadProvisional=True", log)
+        self.assertIn("hostLoadState=quiet hostLoadProvisional=False", log)
+
+    def test_a_quiet_host_load_leaves_todays_counting_unchanged(self) -> None:
+        r = self.run_batch(self.specs[:1])
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        [l] = b["legs"]
+        self.assertEqual((l["class"], l["counted"], l["hostLoadState"], l["hostLoadProvisional"]), ("QUIET_PRELOAD_OK", True, "quiet", False), l)
+        self.assertNotIn("REFERENCE_PROVISIONAL", (self.run_dir / "batch.log").read_text(encoding="utf-8"))
 
     # ---------------------------------------------------------------- in-lease retry
     def test_a_busy_probe_is_retried_inside_the_same_lease(self) -> None:

@@ -106,6 +106,10 @@ if ($env:FAKE_LEG_PRELOADS) {
     $edir = Join-Path $root "evidence\$id"; New-Item -ItemType Directory -Force -Path $edir | Out-Null
     $v = $vals[[Math]::Min($n, $vals.Count - 1)]
     if ($v -ne 'none') { Set-Content -LiteralPath (Join-Path $edir 'summary.json') -Value ('{"cpuQuiescence":{"timeMeanPercent":' + $v + '}}') }
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: FAKE_LEG_HOSTLOADS per call = the smoke result.json's hostLoad: quiet (default) | cim (collected=false CimException) | none
+    $hls = @(([string]$env:FAKE_LEG_HOSTLOADS) -split ',' | Where-Object { $_ }); $hl = $(if ($hls.Count -gt 0) { $hls[[Math]::Min($n, $hls.Count - 1)] } else { 'quiet' })
+    $hlBlock = $(if ($hl -eq 'cim') { '{"before":{"collected":false,"error":"collection failed: CimException"},"after":{"collected":false,"error":"collection failed: CimException"},"state":"unknown","provisional":true}' } else { '{"before":{"collected":true},"after":{"collected":true},"state":"quiet","provisional":false}' })
+    if ($hl -ne 'none') { Set-Content -LiteralPath (Join-Path $edir 'result.json') -Value ('{"hostLoad":' + $hlBlock + '}') }
     "DVE_RECEIPT_PATH=$rp"
 }
 if ($env:FAKE_LEG_LOG) { Add-Content -LiteralPath $env:FAKE_LEG_LOG -Value ("END {0} {1} {2}" -f [DateTime]::UtcNow.Ticks, $leaf, $PID) }
@@ -483,6 +487,21 @@ class VenueChainRunnerTests(unittest.TestCase):
         self.assertEqual(got, [("COOLDOWN_UNMET", 29.6, "COOLDOWN_UNMET"), ("QUIET", 20.2, "QUIET_PRELOAD_OK"), ("QUIET", 43.9, "QUIET_PRELOAD_HIGH")])
         ran = [l for l in self.chain_log(rd) if " RAN " in l]
         self.assertIn("verdict=COOLDOWN_UNMET quietMean=32.0 preLoadMean=29.6 class=COOLDOWN_UNMET", ran[0])
+
+    def test_a_leg_whose_smoke_host_load_is_unknown_is_never_a_counted_class(self) -> None:
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: pre-load 5 % on every leg; the first leg's smoke hostLoad was not collected (CimException). RED: QUIET_PRELOAD_OK.
+        rd = self.case / "lane-HL"
+        env = self.env(FAKE_QUIET_MODES="QUIET,QUIET,QUIET,QUIET,QUIET,QUIET", FAKE_LEG_PRELOADS="5.0,5.0,5.0", FAKE_LEG_HOSTLOADS="cim,quiet,quiet")
+        r = self.run_chain(rd, self.specs, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        got = [(l["class"], l.get("hostLoadState"), l.get("hostLoadProvisional")) for l in res["legs"]]
+        self.assertEqual(got, [("HOSTLOAD_PROVISIONAL", "unknown", True)] + [("QUIET_PRELOAD_OK", "quiet", False)] * 2)
+        ran = [l for l in self.chain_log(rd) if " RAN " in l]
+        self.assertIn("class=HOSTLOAD_PROVISIONAL hostLoadState=unknown hostLoadProvisional=True", ran[0])
+        self.assertIn("class=QUIET_PRELOAD_OK hostLoadState=quiet hostLoadProvisional=False", ran[1])
+        rid = Path(res["legs"][0]["receipt"]).stem
+        self.assertTrue(any(f"REFERENCE_PROVISIONAL leg={rid} reason=hostload-unknown" in l for l in self.chain_log(rd)), self.chain_log(rd))
 
     # BACHELOR-VENUE-FOREIGN-FLOOR-FAST-FAIL-1: Wait-VenueQuiet's FOREIGN_FLOOR early exit prints a typed line and then the same COOLDOWN_UNMET line; the chain must
     # still classify the leg COOLDOWN_UNMET (contended, never counted), never QUIET_PRELOAD_* and never VENUE_QUIET_UNKNOWN.
