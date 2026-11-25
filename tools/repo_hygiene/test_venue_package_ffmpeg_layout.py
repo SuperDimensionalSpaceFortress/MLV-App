@@ -721,18 +721,70 @@ class HelperBehaviourTests(unittest.TestCase):
         # stdout and refused a finished install (build-release exit 9, assembler exit 28). Only the trailing top-level JSON object is
         # parsed now, for LF and CRLF startup text alike. Controls: stdout with no JSON at all still refuses.
         run_real = b'@echo off\r\npy.exe -3 -S "%FFX_BANNER%"\r\npy.exe %*\r\nexit /b %ERRORLEVEL%\r\n'
-        # r17 adversary ea86ac25-A1: startup text with NO line ending shares the report's first line (`site ready{`), also with braces.
+        # PR 862 r18 (sol r17 B1 + B2, one class: the slice was not validated as exactly ONE strict JSON object): the report opens at a
+        # line that is EXACTLY `{` (column 0) and ends at a final line that is EXACTLY `}`; the slice must pass a strict parser
+        # (System.Text.Json: no comments, no trailing commas, root an object). Controls: a banner LINE (LF or CRLF) then the report, the
+        # report alone, trailing blank lines, and no JSON at all (refuses).
         for label, eol, text in (("lf", b"\n", "site ready"), ("crlf", b"\r\n", "site ready"),
-                                 ("no-newline", b"", "site ready"), ("no-newline-braces", b"", "{site {ready{"),
-                                 ("no-newline-indented", b"", "  site ready"), ("no-newline-tab-brace", b"", "\t{")):  # r17 adversary 6548798b-A1
+                                 ("report-alone", b"", "")):
             with self.subTest(startup_text=label):
                 result, out = self._run_behind_banner_shim(label, run_real, eol, text)
                 self.assertTrue(result["ok"], result)
                 self.assertTrue((out / "ffmpeg.exe").is_file())
+        # B1: startup text with NO line ending shares the report's first line (`site ready{`), so no column-0 `{` line opens a report.
+        for label, text in (("no-newline", "site ready"), ("no-newline-braces", "{site {ready{"),
+                            ("no-newline-indented", "  site ready"), ("no-newline-tab-brace", "\t{")):
+            with self.subTest(refuses_startup_text_on_the_brace_line=label):
+                result, _ = self._run_behind_banner_shim(label, run_real, b"", text)
+                self.assertFalse(result["ok"], result)
+                self.assertIn("printed no JSON report", result["reason"])
         with self.subTest(control="no JSON on stdout"):
             result, _ = self._run_behind_banner_shim("nojson", b'@echo off\r\npy.exe -3 -S "%FFX_BANNER%"\r\nexit /b 0\r\n', b"\n")
             self.assertFalse(result["ok"], result)
             self.assertIn("printed no JSON report", result["reason"])
+
+    def _run_behind_filter_shim(self, name: str, mode: str) -> tuple[dict, Path]:
+        # A py.exe shim below the wrapper's environment scrub runs the REAL launcher, then rewrites its stdout per FFX_MODE
+        # (a startup banner line is always added first, as a printing sitecustomize would): trailing text after the report, a comment
+        # inside the body, or a trailing comma. The exit code stays the real launcher's.
+        filt = self.tmp / f"{name}-filter.py"
+        filt.write_text(
+            "import os, subprocess, sys\n"
+            "run = subprocess.run(['py.exe'] + sys.argv[1:], stdout=subprocess.PIPE)\n"
+            "lines = run.stdout.decode('utf-8').splitlines()\n"
+            "mode = os.environ['FFX_MODE']\n"
+            "if mode == 'comment-in-body': lines.insert(2, '  // note')\n"
+            "elif mode == 'block-comment-in-body': lines.insert(2, '  /* note */')\n"
+            "elif mode == 'trailing-comma': lines[-2] = lines[-2] + ','\n"
+            "post = {'line-comment-after': ['// finished'], 'block-comment-after': ['/* finished */'], 'text-after': ['all done'],\n"
+            "        'blank-lines-after': ['', '   ', '']}.get(mode, [])\n"
+            "sys.stdout.write('\\n'.join(['site ready'] + lines + post) + '\\n')\n"
+            "sys.exit(run.returncode)\n", encoding="ascii")
+        shim = self.tmp / f"{name}-shim.cmd"
+        shim.write_bytes(b'@echo off\r\npy.exe -3 -S "%FFX_FILTER%" %*\r\nexit /b %ERRORLEVEL%\r\n')
+        prelude = (
+            "function global:Get-Command { param([string]$Name, [string]$CommandType, $ErrorAction)\n"
+            "  if ($Name -eq 'py.exe') { return [pscustomobject]@{ Source = $env:FFX_SHIM } }\n"
+            "  Microsoft.PowerShell.Core\\Get-Command @PSBoundParameters\n"
+            "}\n"
+        )
+        out = self.tmp / f"{name}-out"
+        out.mkdir()
+        return self._run(str(out), extra_env={"FFX_SHIM": str(shim), "FFX_FILTER": str(filt), "FFX_MODE": mode}, prelude=prelude), out
+
+    def test_the_report_slice_must_be_exactly_one_strict_json_object(self) -> None:
+        # PR 862 r18 (sol r17 B2): ConvertFrom-Json tolerates JavaScript comments, so the r17 slice admitted a report followed by
+        # `// finished` or `/* finished */` (r16 refused the same input). Anything after the closing `}` but whitespace, a comment inside
+        # the body and a trailing comma all refuse now; trailing whitespace-only lines are fine.
+        with self.subTest(control="trailing whitespace-only lines"):
+            result, out = self._run_behind_filter_shim("blank-after", "blank-lines-after")
+            self.assertTrue(result["ok"], result)
+            self.assertTrue((out / "ffmpeg.exe").is_file())
+        for mode in ("line-comment-after", "block-comment-after", "text-after", "comment-in-body", "block-comment-in-body", "trailing-comma"):
+            with self.subTest(refuses=mode):
+                result, _ = self._run_behind_filter_shim(mode, mode)
+                self.assertFalse(result["ok"], result)
+                self.assertIn("printed no JSON report", result["reason"])
 
     def test_the_output_folder_stays_held_while_the_installed_files_are_re_read(self) -> None:
         # PR 862 r11 (adversary e9d903be-A2): the output pin was released before the wrapper parsed the report and re-read the installed

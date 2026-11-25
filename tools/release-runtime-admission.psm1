@@ -594,19 +594,28 @@ function Invoke-PinnedPayloadInstall {
     try {
         # PR 862 r17 (sol r16 A3 residual): -S does not stop a runtime whose python314._pth says `import site` from running a printing
         # sitecustomize, so startup output can precede the report on stdout. The extractor prints json.dumps(result, indent=2), whose
-        # top-level `{` is the LAST line that ends in `{` AND is followed by a line that starts with exactly two spaces and a quote (the
-        # first key at indent 2; a nested object's first key sits at indent 4 or more, so no nested line matches). Startup text written
-        # WITHOUT a newline, indented or not, sits on that same line ahead of the brace, so the report starts at that line's final `{`.
-        # Only that slice, to the end of stdout, is parsed; no such line, or a slice that is not ONE object, still refuses. LF and CRLF.
+        # top-level `{` is a line that is EXACTLY `{` (column 0, nothing else on the line) and its closing `}` is a line that is EXACTLY `}`.
+        # PR 862 r18 (sol r17 B1 + B2, one class: the child stdout slice was not validated as exactly ONE strict JSON object): the slice
+        # runs from the LAST line that is exactly `{` through the last non-blank line, which must be exactly `}` (only whitespace-only
+        # lines may follow it; so `// finished` or `/* finished */` after the report refuses, and so does startup text sharing the brace's
+        # line, as in `site ready{`). The slice is then checked with a STRICT parser, System.Text.Json.JsonDocument with default options
+        # (comments and trailing commas are errors; the root must be an object), because ConvertFrom-Json tolerates comments. Only a
+        # slice that passes is handed to ConvertFrom-Json. Any failure refuses as "printed no JSON report". LF and CRLF.
         $stdoutLines = @(([string]$result.stdout) -split "`r?`n")
+        $reportEnd = $stdoutLines.Count - 1
+        while ($reportEnd -ge 0 -and [string]::IsNullOrWhiteSpace([string]$stdoutLines[$reportEnd])) { $reportEnd-- }
+        if ($reportEnd -lt 0 -or -not [string]::Equals([string]$stdoutLines[$reportEnd], '}', [StringComparison]::Ordinal)) { throw 'the last non-blank line of stdout is not exactly "}"' }
         $reportStart = -1
-        for ($lineIndex = $stdoutLines.Count - 2; $lineIndex -ge 0; $lineIndex--) {
-            if (([string]$stdoutLines[$lineIndex]).EndsWith('{', [StringComparison]::Ordinal) -and ([string]$stdoutLines[$lineIndex + 1]).StartsWith('  "', [StringComparison]::Ordinal)) { $reportStart = $lineIndex; break }
+        for ($lineIndex = $reportEnd - 1; $lineIndex -ge 0; $lineIndex--) {
+            if ([string]::Equals([string]$stdoutLines[$lineIndex], '{', [StringComparison]::Ordinal)) { $reportStart = $lineIndex; break }
         }
-        if ($reportStart -lt 0) { throw 'no line ending in "{" and followed by an indent-2 key starts a JSON report' }
-        $reportLines = @($stdoutLines[$reportStart..($stdoutLines.Count - 1)])
-        $reportLines[0] = '{'
-        $report = ($reportLines -join "`n").Trim() | ConvertFrom-Json -ErrorAction Stop
+        if ($reportStart -lt 0) { throw 'no line that is exactly "{" opens a JSON report' }
+        $reportText = @($stdoutLines[$reportStart..$reportEnd]) -join "`n"
+        $strictDocument = [System.Text.Json.JsonDocument]::Parse($reportText, [System.Text.Json.JsonDocumentOptions]::new())
+        try {
+            if ($strictDocument.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { throw 'the JSON report is not an object' }
+        } finally { $strictDocument.Dispose() }
+        $report = $reportText | ConvertFrom-Json -ErrorAction Stop
     } catch {
         $result.reason = "the extractor exited 0 but printed no JSON report: $($_.Exception.Message)"
         return [pscustomobject]$result
