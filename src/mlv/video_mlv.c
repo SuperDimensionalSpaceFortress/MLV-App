@@ -94,11 +94,19 @@ static MLV_STAGE_THREAD_LOCAL double g_mlv_last_llrawproc_ms = 0.0;
  * export profile's name (dng.c export_profile_note_llrawproc_breakdown reads the same getter; llrawproc.c resets
  * the thread-local value at the start of each run, so it is 0.000 for a frame no dual-ISO ran on). Called right
  * after every "llrawproc" note, so the rendered export's stage-timing log can read the clip's dual-ISO class.
- * Off: no getter call and no snapshot write (mlv_stage_timing_note_elapsed writes the snapshot before its check). */
+ * Off: no getter call and no snapshot write (mlv_stage_timing_note_elapsed writes the snapshot before its check).
+ * EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1: then one 0.000 marker record naming whether that run applied dual-ISO
+ * (llrpGetLastDualIsoOutcome); an UNKNOWN outcome (no run recorded on this thread) writes no marker. */
 static inline void mlv_note_llrawproc_dual_iso(uint64_t frameIndex)
 {
     if (!mlv_stage_timing_enabled()) return;
     mlv_stage_timing_note_elapsed(MLV_STAGE_LLRAWPROC_DUAL_ISO, frameIndex, llrpGetLastDualIsoMilliseconds());
+    const int outcome = llrpGetLastDualIsoOutcome();
+    const char * const marker = (outcome == LLRP_DUAL_ISO_OUTCOME_APPLIED) ? MLV_STAGE_LLRAWPROC_DUAL_ISO_APPLIED
+                              : (outcome == LLRP_DUAL_ISO_OUTCOME_NOT_APPLIED) ? MLV_STAGE_LLRAWPROC_DUAL_ISO_NOT_APPLIED
+                              : (outcome == LLRP_DUAL_ISO_OUTCOME_NOT_ATTEMPTED) ? MLV_STAGE_LLRAWPROC_DUAL_ISO_NOT_ATTEMPTED
+                              : NULL;
+    if (marker) mlv_stage_timing_note_elapsed(marker, frameIndex, 0.0);
 }
 static MLV_STAGE_THREAD_LOCAL double g_mlv_last_raw_float_convert_ms = 0.0;
 static MLV_STAGE_THREAD_LOCAL double g_mlv_last_debayered_frame_ms = 0.0;

@@ -4432,7 +4432,9 @@ class ExportRenderDualIsoAppliedSignalTests(unittest.TestCase):
         for g, why in zip(got, ("does not directly follow", "never a timing", "after another outcome marker", "does not directly follow")):
             self.assertEqual(g["outcome"], "INVALID", g)
             self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "outcome marker" in p and why in p for p in g["problems"]), (why, g))
-            self.assertNotEqual(g["metrics"]["dualIsoClassAgrees"], True, g)
+            # (a malformed signal reads no class at all, even where the other markers would read every frame applied)
+            self.assertIsNone(g["metrics"]["dualIsoClassAgrees"], g)
+            self.assertIsNone(g["metrics"]["dualIsoActiveFrames"], g)
 
     def test_a_marker_missing_on_one_frame_is_a_typed_null(self) -> None:
         one = {i: "applied" for i in range(480) if i != 11}

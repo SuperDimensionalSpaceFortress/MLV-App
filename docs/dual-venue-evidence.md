@@ -509,12 +509,24 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
     CDNG `<frame>` (sol r2 B1) is a `uint32` padded to six digits: six digits, or seven to ten with no leading zero, at most `4294967295`.
     From r3 `RENDER_START` must also be the ProRes producer's own declaration: `codec=prores container=mov` (the strings `BatchRenderedVideoPlan.h` names for ProRes and
     Mov), source and output dimensions above 0, and an fps that is a finite decimal above 0. Anything else is `EXPORT_PROFILE_FOREIGN`.
-    **Dual-ISO fails closed (r3, KNOWN GAP).** A `llrawproc_dual_iso` time above 0 is the time of the dual-ISO *attempt*. `llrawproc.c` times the attempt, and `dualiso.c`
-    can refuse the reconstruction inside it (a receipt's `dualIsoInterpolation 2`). The rendered path publishes no producer signal that the reconstruction was *applied*.
-    So a ProRes run with any frame timed above 0 has `dualIsoActiveFrames` and `dualIsoClassAgrees` null, with `CouldNotCheck` `DUALISO_APPLIED_UNKNOWN`. On a
-    dual-ISO leg the shipped `dualIsoClassAgrees eq true` then fails on that typed reason, and no ProRes leg can PASS until successor
-    `EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1` adds the applied signal. A run timed 0 on every frame ran no reconstruction: the class is readable (a dual-ISO leg is
-    `CLIP_CLASS_MISMATCH`). A no-dual-ISO leg whose run attempted dual-ISO stays `CLIP_CLASS_MISMATCH`. The CDNG profile's `active = ms > 0` rule above is unchanged.
+    **Dual-ISO fails closed (r3) without the applied signal.** A `llrawproc_dual_iso` time above 0 is the time of the dual-ISO *attempt*. `llrawproc.c` times the attempt,
+    and `dualiso.c` can refuse the reconstruction inside it (a receipt's `dualIsoInterpolation 2`). The time alone is no proof the reconstruction was *applied*. So a
+    ProRes log with no outcome marker (below) and any frame timed above 0 has `dualIsoActiveFrames` and `dualIsoClassAgrees` null, with `CouldNotCheck`
+    `DUALISO_APPLIED_UNKNOWN`, and a dual-ISO leg's shipped `dualIsoClassAgrees eq true` fails on that typed reason. A run timed 0 on every frame ran no reconstruction: the
+    class is readable (a dual-ISO leg is `CLIP_CLASS_MISMATCH`). A no-dual-ISO leg whose run attempted dual-ISO stays `CLIP_CLASS_MISMATCH`. The CDNG profile's
+    `active = ms > 0` rule above is unchanged (successor `EXPORT-CDNG-DUALISO-APPLIED-SIGNAL-1`).
+    **The applied signal (`EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1`).** `llrawproc.c` records each run's dual-ISO outcome on its thread (`llrpGetLastDualIsoOutcome`:
+    applied, attempted and not applied, or not attempted), and `video_mlv.c` writes one marker record right after each `llrawproc_dual_iso` record:
+    `llrawproc_dual_iso_applied`, `llrawproc_dual_iso_not_applied` or `llrawproc_dual_iso_not_attempted`, always `ms=0.000`. Markers carry no share and no nesting. A
+    marker that does not directly follow a `llrawproc_dual_iso` record of its frame, a second marker after one record, or a marker figure that is not a zero is
+    `EXPORT_RECORD_INVALID`. Any marker means the log carries the signal, and then it is read instead of the time. It must mark exactly the frames `processed16_total` is
+    timed on (otherwise both metrics are null with `DUALISO_OUTCOME_WINDOW_MISMATCH`). On a dual-ISO leg: every frame applied gives `dualIsoActiveFrames` = N and
+    `dualIsoClassAgrees` true; any frame not applied is a FAIL typed `DUALISO_NOT_APPLIED` (agrees false, `dualIsoActiveFrames` = the applied count,
+    `dualIsoNotAppliedFrames` = k); a frame whose markers disagree, or applied frames beside not-attempted ones, is a FAIL typed `DUALISO_OUTCOME_MIXED`; every frame not
+    attempted is `CLIP_CLASS_MISMATCH`. On a no-dual-ISO leg any attempted frame is `CLIP_CLASS_MISMATCH`, and every frame not attempted agrees. The typed reason of a
+    read-but-failing metric is `<metric>FailReason`, which `Test-DvCriteria` puts first in the failure text. The build identity decides too: a build whose
+    `src/debug/StageTiming.h` defines `MLV_STAGE_LLRAWPROC_DUAL_ISO_APPLIED`, beside a log with `llrawproc_dual_iso` records and no marker, is an incomplete capture
+    (`EXPORT_PROFILE_ABSENT`, never the r3 reading); markers beside a build that cannot write them are `EXPORT_PROFILE_FOREIGN`.
     From r5 a run timed `0.000` on every frame is not read as agreement on a **no**-dual-ISO leg either: the figure is rounded to the microsecond (`StageTiming.h` `%.3f`),
     so an attempt under half a microsecond prints it too. That leg's `dualIsoClassAgrees` is null with `DUALISO_APPLIED_UNKNOWN`, while a dual-ISO leg's all-zero run is still
     `CLIP_CLASS_MISMATCH` (no reconstruction takes under half a microsecond).

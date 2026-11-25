@@ -78,6 +78,8 @@ static MLV_THREAD_LOCAL double g_llrawproc_last_pre_dualiso_fix_ms = 0.0;
  * mlvObject concurrently with the foreground thread. */
 static MLV_THREAD_LOCAL int g_llrawproc_last_pre_dualiso_fix_completed = 0;
 static MLV_THREAD_LOCAL double g_llrawproc_last_dual_iso_ms = 0.0;
+/* EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1: llrpDualIsoOutcome_t of this thread's last run (llrawproc.h). */
+static MLV_THREAD_LOCAL int g_llrawproc_last_dual_iso_outcome = LLRP_DUAL_ISO_OUTCOME_UNKNOWN;
 static MLV_THREAD_LOCAL double g_llrawproc_last_chroma_smooth_ms = 0.0;
 static MLV_THREAD_LOCAL dualiso_full20bit_timing_t g_llrawproc_last_dual_iso_full20bit_timing = {0};
 /* CPU-S1-DUALISO-MIX-CHROMA-LEVER-2 r3 (adversary e4160976 A1): counts the
@@ -5036,6 +5038,7 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
     g_llrawproc_last_pre_dualiso_fix_ms = 0.0;
     g_llrawproc_last_pre_dualiso_fix_completed = 0;
     g_llrawproc_last_dual_iso_ms = 0.0;
+    g_llrawproc_last_dual_iso_outcome = LLRP_DUAL_ISO_OUTCOME_NOT_ATTEMPTED;
     g_llrawproc_last_chroma_smooth_ms = 0.0;
     memset(&g_llrawproc_last_residual, 0, sizeof(g_llrawproc_last_residual));
     memset(&g_llrawproc_last_dual_iso_gpu_split, 0, sizeof(g_llrawproc_last_dual_iso_gpu_split));
@@ -5507,6 +5510,8 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
 
     if (diso_validity && dual_iso_mode)
     {
+        /* Attempted: every early return below reports NOT_APPLIED. */
+        g_llrawproc_last_dual_iso_outcome = LLRP_DUAL_ISO_OUTCOME_NOT_APPLIED;
         raw_info.width = x_res;
         raw_info.height = y_res;
         raw_info.pitch = x_res;
@@ -6036,6 +6041,7 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
             }
             else
             {
+                g_llrawproc_last_dual_iso_outcome = LLRP_DUAL_ISO_OUTCOME_APPLIED;
                 if (has_explicit_auto_match)
                 {
                     worker->diso_ev_correction = explicit_ev_correction;
@@ -6208,14 +6214,18 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
         else if (dual_iso_mode == 2)
         {
             const double dual_iso_start = mlv_stage_timing_now();
-            diso_get_preview(raw_image_buff,
-                             raw_info.width,
-                             raw_info.height,
-                             raw_info.black_level,
-                             raw_info.white_level,
-                             &worker->diso_pattern,
-                             0,
-                             &worker->diso_preview_scratch);
+            const int dual_iso_preview_ok =
+                diso_get_preview(raw_image_buff,
+                                 raw_info.width,
+                                 raw_info.height,
+                                 raw_info.black_level,
+                                 raw_info.white_level,
+                                 &worker->diso_pattern,
+                                 0,
+                                 &worker->diso_preview_scratch);
+            g_llrawproc_last_dual_iso_outcome = dual_iso_preview_ok
+                ? LLRP_DUAL_ISO_OUTCOME_APPLIED
+                : LLRP_DUAL_ISO_OUTCOME_NOT_APPLIED;
             dual_iso_ms += (mlv_stage_timing_now() - dual_iso_start) * 1000.0;
             g_llrawproc_last_preview_histogram_ms = worker->diso_preview_scratch.last_histogram_ms;
             g_llrawproc_last_preview_regression_ms = worker->diso_preview_scratch.last_regression_ms;
@@ -6622,6 +6632,7 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
     g_llrawproc_last_bad_pixels_ms = 0.0;
     g_llrawproc_last_pattern_noise_ms = 0.0;
     g_llrawproc_last_dual_iso_ms = 0.0;
+    g_llrawproc_last_dual_iso_outcome = LLRP_DUAL_ISO_OUTCOME_NOT_ATTEMPTED;
     g_llrawproc_last_chroma_smooth_ms = 0.0;
     memset(&g_llrawproc_last_residual, 0, sizeof(g_llrawproc_last_residual));
     memset(&g_llrawproc_last_dual_iso_gpu_split, 0, sizeof(g_llrawproc_last_dual_iso_gpu_split));
@@ -6839,6 +6850,8 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
 
     if (diso_validity && dual_iso_mode == 1)
     {
+        /* Attempted: every early return below reports NOT_APPLIED. */
+        g_llrawproc_last_dual_iso_outcome = LLRP_DUAL_ISO_OUTCOME_NOT_APPLIED;
         int restricted_lossless = (video->MLVI.videoClass & MLV_VIDEO_CLASS_FLAG_LJ92) && raw_info.white_level < 15000;
         uint16_t * dual_iso_failure_backup = NULL;
         if (restricted_lossless)
@@ -7001,6 +7014,7 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
             }
             return 0;
         }
+        g_llrawproc_last_dual_iso_outcome = LLRP_DUAL_ISO_OUTCOME_APPLIED;
         if (has_explicit_auto_match)
         {
             worker->diso_ev_correction = explicit_ev_correction;
@@ -7167,6 +7181,7 @@ void llrpResetLastRunTimingForCurrentThread(void)
     g_llrawproc_last_bad_pixels_ms = 0.0;
     g_llrawproc_last_pattern_noise_ms = 0.0;
     g_llrawproc_last_dual_iso_ms = 0.0;
+    g_llrawproc_last_dual_iso_outcome = LLRP_DUAL_ISO_OUTCOME_UNKNOWN;
     g_llrawproc_last_chroma_smooth_ms = 0.0;
     memset(&g_llrawproc_last_residual, 0, sizeof(g_llrawproc_last_residual));
     memset(&g_llrawproc_last_dual_iso_gpu_split, 0, sizeof(g_llrawproc_last_dual_iso_gpu_split));
@@ -7189,6 +7204,7 @@ void llrpResetLastRunTimingForCurrentThread(void)
     X(double, g_llrawproc_last_bad_pixels_ms) \
     X(double, g_llrawproc_last_pattern_noise_ms) \
     X(double, g_llrawproc_last_dual_iso_ms) \
+    X(int, g_llrawproc_last_dual_iso_outcome) \
     X(double, g_llrawproc_last_chroma_smooth_ms) \
     X(llrpResidualSubstageTiming_t, g_llrawproc_last_residual) \
     X(llrpDualIsoGpuSplitTiming_t, g_llrawproc_last_dual_iso_gpu_split) \
@@ -7223,10 +7239,9 @@ double llrpGetLastDualIsoMilliseconds(void)
     return g_llrawproc_last_dual_iso_ms;
 }
 
-/* EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1 RED: the getter exists, no run records an outcome yet. */
 int llrpGetLastDualIsoOutcome(void)
 {
-    return LLRP_DUAL_ISO_OUTCOME_UNKNOWN;
+    return g_llrawproc_last_dual_iso_outcome;
 }
 
 double llrpGetLastChromaSmoothMilliseconds(void)
