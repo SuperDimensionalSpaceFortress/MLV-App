@@ -20219,7 +20219,9 @@ class EveryFrameConformConflictAndAcceptanceTests(unittest.TestCase):
             "$c = Get-DvAcceptanceVerdict -Receipt ([ordered]@{ outcome = 'PASS' }) -VerificationStatus 'VERIFIED'\n"
             "ConvertTo-Json -Compress -Depth 3 -InputObject ([ordered]@{ list = @($list); a = $a.verdict; b = $b.verdict; c = $c.verdict })")
         self.assertIsNotNone(out, proc.stdout + proc.stderr)
-        self.assertEqual(out["list"], ["conformRepeats", "conformPresented", "conformConflictingFields", "summaryConflictingFields"], out)
+        # EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-1 r1 appended the four prep counters the in-flight tail credit reads
+        self.assertEqual(out["list"], ["conformRepeats", "conformPresented", "conformConflictingFields", "summaryConflictingFields",
+                                       "prepReplacedBefore", "prepReplacedAfter", "prepStaleDrops", "prepGenerationDrops"], out)
         self.assertEqual((out["a"], out["b"], out["c"]), ("NOT_MEASURED", "NOT_MEASURED", "PASS"), out)
         text = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
         self.assertIn("foreach ($f in $script:PlaybackComparedFieldsWhenStored) {\n"
@@ -20403,8 +20405,9 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
     def test_both_criteria_call_sites_hand_the_receipts_visual_block_to_the_reader(self) -> None:
         leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
         mod = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
-        self.assertEqual(re.findall(r"Get-DvCriteriaMetrics -Metrics (\$\w+(?:\.\w+)?) -Playback (\$\w+(?:\.\w+)?) -Visual ([^\r\n]+?)\)", leg + "\n" + mod),
-                         [("$receipt.metrics", "$receipt.playback", "$receipt.visual"), ("$metrics", "$derived", "(Get-DvProp $Receipt 'visual')")])
+        calls = re.findall(r"Get-DvCriteriaMetrics -Metrics (\$\w+(?:\.\w+)?) -Playback (\$\w+(?:\.\w+)?) -Visual ([^\r\n]+)", leg + "\n" + mod)
+        # (each is the last argument inside the call's own parentheses: the captured tail ends with that call's closing one)
+        self.assertEqual(calls, [("$receipt.metrics", "$receipt.playback", "$receipt.visual)"), ("$metrics", "$derived", "(Get-DvProp $Receipt 'visual'))")])
 
 
 class DriftLegSpecTests(unittest.TestCase):
