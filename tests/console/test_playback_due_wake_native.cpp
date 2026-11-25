@@ -4735,9 +4735,10 @@ TEST(PlaybackDueWakeSend, SEAM1_TheTimingSeamIsCompiledOutOfTheAppBuild)
                                                               QCryptographicHash::Sha256 ).toHex() );
     };
     ASSERT_EQ( std::string( "ae2cad7bc536d51b2727a890c90d0031475099768c01878126631c4f1d0eb69a" ), appDigest( cpp ).toStdString() );
-    // PLAYBACK-UNPACED-EVERY-TARGET-PAINTED-CUDA-1 re-derived the header's pin: it adds playbackEveryFrameTickMayAdvance (no seam
-    // code; the seam-name check below still holds). Master's header view was 2a6f46a2041befe951831158c9be6ada9414907bd86b415c395b1809f31bf5fd.
-    ASSERT_EQ( std::string( "32b5c9dc9ef87b31d885111bb938c408e74716f1ee216af2fa6890c50fd85c45" ), appDigest( hdr ).toStdString() );
+    // PLAYBACK-UNPACED-EVERY-TARGET-PAINTED-CUDA-1 re-derived the header's pin: it adds playbackEveryFrameTickConsultsOutstanding and
+    // playbackEveryFrameTickMayAdvance (no seam code; the seam-name check below still holds). Master's header view was
+    // 2a6f46a2041befe951831158c9be6ada9414907bd86b415c395b1809f31bf5fd (derive-seam1-hdr.py in that card's r1 run dir: the same steps).
+    ASSERT_EQ( std::string( "321f71fd53594e4c9cea0ed5430a6bde750bd979845a349d18450841057b2904" ), appDigest( hdr ).toStdString() );
     // ...so no seam name reaches the app build (the digest says it; this names the class directly)
     const QString appCode = dueWakeNoComments( dueWakeAppBuildView( cpp ) ) + dueWakeNoComments( dueWakeAppBuildView( hdr ) );
     for( const char *name : { "timingStampsForTest", "noteExit", "RunnerSleepExit", "runnerSleepExitForTest", "runnerSleepExitElapsedMsForTest",

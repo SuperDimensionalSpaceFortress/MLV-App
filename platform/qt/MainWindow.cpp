@@ -13299,10 +13299,12 @@ void MainWindow::playbackHandling(int timeDiff)
                     // moved past a target whose lookahead slot was Ready but not yet accepted (receipt a877bb17: 6 and 57 never
                     // painted). Hold until drawFrameReady accepts the target, unless no present of it is coming. Paced, drop-frame
                     // and a Play that has accepted nothing yet are unchanged; the pace credit is not spent while holding.
+                    // fix 1 (adversary A1 on 5370a8e6): the render thread (its mutex) is asked only when the verdict depends on it,
+                    // through the && short-circuit, so a paced tick never waits on it.
                     const int everyFrameTarget = ui->horizontalSliderPosition->value();
-                    if( !playbackEveryFrameTickMayAdvance( !( playbackPaceGuardFps() > 0.0 ), false, m_playbackEveryFrameAcceptedFrame,
-                                                           everyFrameTarget,
-                                                           m_playbackEveryFrameAcceptedFrame != everyFrameTarget
+                    const bool everyFrameUnpaced = !( playbackPaceGuardFps() > 0.0 );
+                    if( !playbackEveryFrameTickMayAdvance( everyFrameUnpaced, false, m_playbackEveryFrameAcceptedFrame, everyFrameTarget,
+                                                           playbackEveryFrameTickConsultsOutstanding( everyFrameUnpaced, false, m_playbackEveryFrameAcceptedFrame, everyFrameTarget )
                                                                && playbackTargetPresentOutstanding( everyFrameTarget ) ) ) return;
                     if( !m_playbackPaceGuard.grantWholeFrame( paceNowMs, playbackPaceGuardFps() ) ) return;
                     // PLAYBACK-CLIP-LENGTH-ENFORCE-3: every source frame the engine advances is counted (the

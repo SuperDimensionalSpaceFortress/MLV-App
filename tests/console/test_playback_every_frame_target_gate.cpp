@@ -40,6 +40,10 @@ namespace
 // tick()    = playbackHandling's every-frame branch (the poll tick, or drawFrameReady's early advance)
 // frameReady() = the target-aware acquire: it takes only the slot for the current target and the prune releases every
 //                slot below the target (passed over, never painted)
+// Scope (fix 1, adversary A5 on 5370a8e6): the model covers the every-frame branch's advance up to the last frame. It does NOT
+// model the outer last-frame branch (a poll at the cut-out stops or wraps before the last target is accepted: adversary A2,
+// pre-existing) or the display's paint coalescing after an accept (adversary A3, pre-existing); "presented" here means accepted
+// by drawFrameReady. Both are named follow-ups of this card, not claims of these tests.
 struct EveryFrameModel
 {
     int first = 1;
@@ -228,6 +232,28 @@ TEST( EveryFrameTargetGate, PacedPlayIsUnchanged )
     ASSERT_TRUE( playbackEveryFrameTickMayAdvance( false, true, 5, 6, true ) );
 }
 
+// fix 1 (adversary A1 on 5370a8e6): 24 fps paced CUDA, Drop Frame off, accepted 5, target 6 Ready -- the paced tick must not ask the
+// render thread (its mutex can be held for a whole speculative publish). The verdict consults "outstanding" only where it depends
+// on it, and wherever it does not, the verdict is true whatever outstanding says, so the caller's short-circuit changes nothing.
+TEST( EveryFrameTargetGate, OnlyAnUnpacedUnacceptedTargetConsultsTheRenderThread )
+{
+    ASSERT_FALSE( playbackEveryFrameTickConsultsOutstanding( false, false, 5, 6 ) );   // paced: the A1 input
+    ASSERT_FALSE( playbackEveryFrameTickConsultsOutstanding( false, true, 5, 6 ) );
+    ASSERT_FALSE( playbackEveryFrameTickConsultsOutstanding( true, true, 5, 6 ) );     // drop-frame
+    ASSERT_FALSE( playbackEveryFrameTickConsultsOutstanding( true, false, -1, 6 ) );   // nothing accepted yet
+    ASSERT_FALSE( playbackEveryFrameTickConsultsOutstanding( true, false, 6, 6 ) );    // target accepted
+    ASSERT_TRUE( playbackEveryFrameTickConsultsOutstanding( true, false, 5, 6 ) );
+    for( int unpaced = 0; unpaced < 2; ++unpaced )
+        for( int drop = 0; drop < 2; ++drop )
+            for( long long accepted = -1; accepted <= 7; ++accepted )
+                for( int target = 0; target <= 7; ++target )
+                {
+                    if( playbackEveryFrameTickConsultsOutstanding( unpaced != 0, drop != 0, accepted, target ) ) continue;
+                    ASSERT_TRUE( playbackEveryFrameTickMayAdvance( unpaced != 0, drop != 0, accepted, target, true ) );
+                    ASSERT_TRUE( playbackEveryFrameTickMayAdvance( unpaced != 0, drop != 0, accepted, target, false ) );
+                }
+}
+
 // ---- (2) simulation -------------------------------------------------------------------------------------------------
 TEST( EveryFrameTargetGate, VenueOrderPollTickBetweenEveryAcceptAndTheNextFrameReadyPaintsEveryFrame )
 {
@@ -288,11 +314,29 @@ TEST( EveryFrameTargetGate, TheHoldSitsInTheDropFrameOffBranchBeforeGrantWholeFr
     ASSERT_TRUE( grant > gate );
     ASSERT_TRUE( dropBranch > grant );
     ASSERT_EQ( 1, countOccurrences( body, kGateCall ) );
-    const QString call = body.mid( gate, grant - gate );
-    ASSERT_TRUE( call.contains( QStringLiteral( "!( playbackPaceGuardFps() > 0.0 )" ) ) );
-    ASSERT_TRUE( call.contains( QStringLiteral( "m_playbackEveryFrameAcceptedFrame" ) ) );
-    ASSERT_TRUE( call.contains( QStringLiteral( "playbackTargetPresentOutstanding( everyFrameTarget )" ) ) );
-    ASSERT_TRUE( call.contains( QStringLiteral( ") ) return;" ) ) );
+    // the hold block: from the unpaced flag to grantWholeFrame
+    const int unpacedAt = body.indexOf( QStringLiteral( "const bool everyFrameUnpaced = !( playbackPaceGuardFps() > 0.0 );" ), dropOff );
+    ASSERT_TRUE( unpacedAt > dropOff );
+    ASSERT_TRUE( unpacedAt < gate );
+    const QString span = body.mid( gate, grant - gate );
+    const int holdEnd = span.indexOf( QStringLiteral( "return;" ) );
+    ASSERT_TRUE( holdEnd > 0 );
+    const QString call = span.left( holdEnd + 7 ).simplified();   // the hold statement alone, up to its return
+    ASSERT_TRUE( call.startsWith( QStringLiteral(
+        "playbackEveryFrameTickMayAdvance( everyFrameUnpaced, false, m_playbackEveryFrameAcceptedFrame, everyFrameTarget, " ) ) );
+    // fix 1 (adversary A1 on 5370a8e6): the render thread is asked only through the && short-circuit, after the same pure
+    // consults-check the verdict uses, so a paced tick never takes the render mutex
+    const QString outstandingArg = QStringLiteral(
+        "playbackEveryFrameTickConsultsOutstanding( everyFrameUnpaced, false, m_playbackEveryFrameAcceptedFrame, everyFrameTarget ) "
+        "&& playbackTargetPresentOutstanding( everyFrameTarget ) ) ) return;" );
+    ASSERT_TRUE( call.endsWith( outstandingArg ) );
+    ASSERT_EQ( 1, countOccurrences( body, QStringLiteral( "playbackTargetPresentOutstanding(" ) ) );
+    // fix 1 (adversary A4 on 5370a8e6): the polarity -- outstanding holds, never its negation
+    ASSERT_FALSE( call.contains( QStringLiteral( "!playbackTargetPresentOutstanding" ) ) );
+    ASSERT_FALSE( call.contains( QStringLiteral( "! playbackTargetPresentOutstanding" ) ) );
+    ASSERT_TRUE( call.startsWith( QStringLiteral( "playbackEveryFrameTickMayAdvance(" ) ) );
+    const QString before = body.mid( dropOff, gate - dropOff ).simplified();
+    ASSERT_TRUE( before.endsWith( QStringLiteral( "if( !" ) ) );   // the hold returns when the verdict is false
 }
 
 TEST( EveryFrameTargetGate, TheDropFrameBranchHasNoGateCall )
@@ -353,9 +397,13 @@ TEST( EveryFrameTargetGate, ConformStillReturnsFalseWithoutConformAndDelegatesTo
                                           QStringLiteral( "bool MainWindow::playbackTargetPresentOutstanding( int target )" ),
                                           QStringLiteral( "bool MainWindow::conformTargetPresentOutstanding()" ) );
     ASSERT_FALSE( neutral.isEmpty() );
-    ASSERT_TRUE( neutral.contains( QStringLiteral( "renderThreadBusyForPlaybackAdvance( target )" ) ) );
-    ASSERT_TRUE( neutral.contains( QStringLiteral( "hasReadyFrameForPlaybackTarget(" ) ) );
-    ASSERT_TRUE( neutral.contains( QStringLiteral( "hasPlaybackLookaheadRequest(" ) ) );
+    // fix 1 (adversary A4 sibling): each check with its polarity -- each one found means a present is coming
+    ASSERT_TRUE( neutral.contains( QStringLiteral( "if( renderThreadBusyForPlaybackAdvance( target ) ) return true;" ) ) );
+    ASSERT_TRUE( neutral.contains( QStringLiteral(
+        "if( m_pRenderThread->hasReadyFrameForPlaybackTarget( static_cast<uint32_t>( target ), generation ) ) return true;" ) ) );
+    ASSERT_TRUE( neutral.contains( QStringLiteral(
+        "return m_pRenderThread->hasPlaybackLookaheadRequest( static_cast<uint32_t>( target ), generation );" ) ) );
+    ASSERT_TRUE( neutral.contains( QStringLiteral( "if( !m_pRenderThread || target < 0 ) return false;" ) ) );
     ASSERT_FALSE( neutral.contains( QStringLiteral( "playbackConformActive" ) ) );
     ASSERT_FALSE( neutral.contains( QStringLiteral( "m_newPosDropMode" ) ) );
 
