@@ -22,6 +22,7 @@
 
 #include <QFile>
 #include <QString>
+#include <QStringList>
 #include <QTextStream>
 
 #include <algorithm>
@@ -201,6 +202,122 @@ QString playbackHandlingBody( const QString & source )
     return functionBody( source,
                          QStringLiteral( "void MainWindow::playbackHandling(int timeDiff)" ),
                          QStringLiteral( "void MainWindow::showPerformanceProfilingDialog" ) );
+}
+
+// r2 (adversary A4 on 06031667): a dead guard (an `if( false )` in front of a statement, a dead block around it, an `#if 0`)
+// left the substring and order assertions true. These helpers let a test pin the comment-free code exactly and pin the path of
+// blocks that encloses a statement, so a dead guard anywhere on that path changes a pinned value.
+// The code with its // and /* */ comments removed (string and char literals kept), so neither a guard nor a pin hides in a comment.
+QString stripComments( const QString & s )
+{
+    QString out;
+    out.reserve( s.size() );
+    const int n = s.size();
+    int i = 0;
+    while( i < n )
+    {
+        const QChar c = s.at( i );
+        if( c == QLatin1Char( '"' ) || c == QLatin1Char( '\'' ) )
+        {
+            out.append( c );
+            ++i;
+            while( i < n && s.at( i ) != c && s.at( i ) != QLatin1Char( '\n' ) )
+            {
+                if( s.at( i ) == QLatin1Char( '\\' ) && i + 1 < n )
+                {
+                    out.append( s.at( i ) );
+                    out.append( s.at( i + 1 ) );
+                    i += 2;
+                    continue;
+                }
+                out.append( s.at( i ) );
+                ++i;
+            }
+            if( i < n && s.at( i ) == c )
+            {
+                out.append( c );
+                ++i;
+            }
+            continue;
+        }
+        if( c == QLatin1Char( '/' ) && i + 1 < n && s.at( i + 1 ) == QLatin1Char( '/' ) )
+        {
+            while( i < n && s.at( i ) != QLatin1Char( '\n' ) ) ++i;
+            continue;
+        }
+        if( c == QLatin1Char( '/' ) && i + 1 < n && s.at( i + 1 ) == QLatin1Char( '*' ) )
+        {
+            const int end = s.indexOf( QStringLiteral( "*/" ), i + 2 );
+            i = end < 0 ? n : end + 2;
+            out.append( QLatin1Char( ' ' ) );
+            continue;
+        }
+        out.append( c );
+        ++i;
+    }
+    return out;
+}
+
+// The headers of the blocks that enclose \a pos in comment-free \a code, outermost first. A header is the simplified text from
+// the previous ';', '{' or '}' up to the block's '{', so an unbraced guard in front of a braced statement is part of it. An
+// "else" header carries the chain it belongs to ("if( A ) / else"), so a guard in front of the chain's "if" is on the path too.
+QStringList enclosingBlockHeaders( const QString & code, int pos )
+{
+    struct OpenBlock
+    {
+        QString header;
+        QString full;
+    };
+    std::vector<OpenBlock> open;
+    std::vector<QStringList> chain( 1 );   // per depth: the if/else chain closed at that depth since its last ';'
+    const QString elseWord = QStringLiteral( "else" );
+    const QString link = QStringLiteral( " / " );
+    int lastSeparator = -1;
+    QChar inLiteral;   // null outside a string or char literal
+    for( int i = 0; i < pos && i < code.size(); ++i )
+    {
+        const QChar c = code.at( i );
+        if( !inLiteral.isNull() )
+        {
+            if( c == QLatin1Char( '\\' ) )
+            {
+                ++i;
+                continue;
+            }
+            if( c == inLiteral || c == QLatin1Char( '\n' ) ) inLiteral = QChar();
+            continue;
+        }
+        if( c == QLatin1Char( '"' ) || c == QLatin1Char( '\'' ) )
+            inLiteral = c;
+        else if( c == QLatin1Char( '{' ) )
+        {
+            const QString header = code.mid( lastSeparator + 1, i - lastSeparator - 1 ).simplified();
+            QStringList full = chain.back();
+            full << header;
+            open.push_back( { header, header.startsWith( elseWord ) ? full.join( link ) : header } );
+            chain.emplace_back();
+            lastSeparator = i;
+        }
+        else if( c == QLatin1Char( '}' ) )
+        {
+            if( !open.empty() )
+            {
+                const OpenBlock closed = open.back();
+                open.pop_back();
+                chain.pop_back();
+                chain.back() = closed.header.startsWith( elseWord ) ? closed.full.split( link ) : QStringList{ closed.header };
+            }
+            lastSeparator = i;
+        }
+        else if( c == QLatin1Char( ';' ) )
+        {
+            chain.back().clear();
+            lastSeparator = i;
+        }
+    }
+    QStringList headers;
+    for( const OpenBlock & block : open ) headers << block.full;
+    return headers;
 }
 
 const QString kEveryFrameBranchMarker = QStringLiteral( "//Normal mode: next frame" );
@@ -393,6 +510,95 @@ TEST( EveryFrameTargetGate, TheHoldSitsInTheDropFrameOffBranchBeforeGrantWholeFr
     ASSERT_TRUE( call.startsWith( QStringLiteral( "playbackEveryFrameTickMayAdvance(" ) ) );
     const QString before = body.mid( dropOff, gate - dropOff ).simplified();
     ASSERT_TRUE( before.endsWith( QStringLiteral( "if( !" ) ) );   // the hold returns when the verdict is false
+}
+
+// r2 (adversary A4 on 06031667): `if( false )` inserted right in front of the hold kept every assertion above true, while an
+// unpaced tick with accepted 5 and target 6 published would then reach the grant and advance. The every-frame branch's code
+// (comments removed) is pinned exactly from its marker to the grant, which covers a dead guard in front of the hold, a dead
+// block, an `#if 0`, and a dead guard on the Ready kick or on the drop-off block; and the path of blocks that encloses the hold
+// is pinned, which covers a dead guard further out (in front of the outer last-frame if/else chain, or a dead block around it).
+TEST( EveryFrameTargetGate, NoDeadGuardEnclosesTheHoldOrItsReadyKick )
+{
+    const QString body = playbackHandlingBody( mainWindowSource() );
+    ASSERT_FALSE( body.isEmpty() );
+    const int branch = body.indexOf( kEveryFrameBranchMarker );
+    ASSERT_TRUE( branch >= 0 );
+    const QString grantCall = QStringLiteral( "m_playbackPaceGuard.grantWholeFrame(" );
+    const int grant = body.indexOf( grantCall, branch );
+    ASSERT_TRUE( grant > branch );
+    const QString holdSpan = stripComments( body.mid( branch, grant + grantCall.length() - branch ) ).simplified();
+    ASSERT_EQ( std::string(
+                   "if( !ui->actionDropFrameMode->isChecked() ) { "
+                   "const int everyFrameTarget = ui->horizontalSliderPosition->value(); "
+                   "const bool everyFrameUnpaced = !( playbackPaceGuardFps() > 0.0 ); "
+                   "if( !playbackEveryFrameTickMayAdvance( everyFrameUnpaced, false, m_playbackEveryFrameAcceptedFrame, everyFrameTarget, "
+                   "playbackEveryFrameTickConsultsOutstanding( everyFrameUnpaced, false, m_playbackEveryFrameAcceptedFrame, everyFrameTarget ) "
+                   "&& playbackTargetPresentOutstanding( everyFrameTarget ) ) ) { "
+                   "if( m_pRenderThread && m_pRenderThread->hasReadyFrameForPlaybackTarget( static_cast<uint32_t>( everyFrameTarget ), "
+                   "m_playbackPresentationGeneration.load( std::memory_order_acquire ) ) ) "
+                   "QMetaObject::invokeMethod( this, \"drawFrameReady\", Qt::QueuedConnection ); return; } "
+                   "if( !m_playbackPaceGuard.grantWholeFrame(" ),
+               holdSpan.toStdString() );
+
+    const QString code = stripComments( body );
+    const int hold = code.indexOf( QStringLiteral( "if( !playbackEveryFrameTickMayAdvance(" ) );
+    ASSERT_TRUE( hold > 0 );
+    ASSERT_EQ( std::string(
+                   "void MainWindow::playbackHandling(int timeDiff)"
+                   " | if( ui->actionPlay->isChecked() )"
+                   " | if( playback_frame_range::outerLastFrameBranchHandlesTick( ui->horizontalSliderPosition->value(), "
+                   "ui->spinBoxCutOut->value(), ui->actionDropFrameMode->isChecked(), ui->actionLoop->isChecked(), "
+                   "playbackConformActive() ) ) / else"
+                   " | if( !ui->actionDropFrameMode->isChecked() )" ),
+               enclosingBlockHeaders( code, hold ).join( QStringLiteral( " | " ) ).toStdString() );
+}
+
+// r2 (adversary A4 sibling on 06031667): the reset proximity check (< 200 characters after the Play-start line) accepted the reset
+// behind a dead guard. The reset is the statement right after the Play-start line, directly in resetPlaybackDueWakeCounters.
+TEST( EveryFrameTargetGate, TheAcceptedFrameResetIsLiveAtPlayStart )
+{
+    const QString code = stripComments( functionBody( mainWindowSource(),
+                                                      QStringLiteral( "void MainWindow::resetPlaybackDueWakeCounters( void )" ),
+                                                      QStringLiteral( "\n}\n" ) ) );
+    ASSERT_FALSE( code.isEmpty() );
+    const QString presented = QStringLiteral( "m_playbackDueWakePresentedFrame = -1;" );
+    const QString reset = QStringLiteral( "m_playbackEveryFrameAcceptedFrame = -1;" );
+    ASSERT_EQ( 1, countOccurrences( code, reset ) );
+    const int resetAt = code.indexOf( reset );
+    const int presentedAt = code.lastIndexOf( presented, resetAt );
+    ASSERT_TRUE( presentedAt > 0 );
+    ASSERT_TRUE( code.mid( presentedAt + presented.length(), resetAt - presentedAt - presented.length() ).trimmed().isEmpty() );
+    ASSERT_EQ( std::string( "void MainWindow::resetPlaybackDueWakeCounters( void )" ),
+               enclosingBlockHeaders( code, resetAt ).join( QStringLiteral( " | " ) ).toStdString() );
+}
+
+// r2 (adversary A4 siblings on 06031667): the substring checks of the mode-neutral check and of the conform delegate accepted a
+// dead guard on the Ready check, and a dead delegate followed by `return false;`. Both bodies are pinned exactly, comments removed
+// (this also covers the same substring checks in test_playback_conform_wiring.cpp).
+TEST( EveryFrameTargetGate, TheModeNeutralChecksAndTheConformDelegateAreLive )
+{
+    const QString source = mainWindowSource();
+    const QString neutralSignature = QStringLiteral( "bool MainWindow::playbackTargetPresentOutstanding( int target )" );
+    const QString conformSignature = QStringLiteral( "bool MainWindow::conformTargetPresentOutstanding()" );
+    const QString neutral = stripComments( functionBody( source, neutralSignature, conformSignature ) ).simplified();
+    ASSERT_EQ( std::string(
+                   "bool MainWindow::playbackTargetPresentOutstanding( int target ) { "
+                   "if( !m_pRenderThread || target < 0 ) return false; "
+                   "if( renderThreadBusyForPlaybackAdvance( target ) ) return true; "
+                   "const uint64_t generation = m_playbackPresentationGeneration.load( std::memory_order_acquire ); "
+                   "if( m_pRenderThread->hasReadyFrameForPlaybackTarget( static_cast<uint32_t>( target ), generation ) ) return true; "
+                   "return m_pRenderThread->hasPlaybackLookaheadRequest( static_cast<uint32_t>( target ), generation ); }" ),
+               neutral.toStdString() );
+    const QString conform = stripComments( functionBody( source, conformSignature,
+                                                         QStringLiteral( "bool MainWindow::conformAcceptedTargetPresentPending()" ) ) )
+                                .simplified();
+    ASSERT_EQ( std::string(
+                   "bool MainWindow::conformTargetPresentOutstanding() { "
+                   "if( !m_pRenderThread || !playbackConformActive() ) return false; "
+                   "const int target = static_cast<int>( m_newPosDropMode ); "
+                   "if( target < 0 || m_lastPresentedPlaybackFrame == static_cast<long long>( target ) ) return false; "
+                   "return playbackTargetPresentOutstanding( target ); }" ),
+               conform.toStdString() );
 }
 
 TEST( EveryFrameTargetGate, TheDropFrameBranchHasNoGateCall )
