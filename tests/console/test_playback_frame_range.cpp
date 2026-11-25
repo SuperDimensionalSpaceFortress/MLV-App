@@ -3,6 +3,15 @@
 #include "../../platform/qt/PlaybackNativePaceGuard.h"
 #include "../../platform/qt/PlaybackSourceAdvanceTracker.h"
 
+#include "../common/repo_paths.h"
+
+#include <QFile>
+#include <QString>
+#include <QTextStream>
+#include <QtCore/qnumeric.h>
+// Qt's keyword macro `forever` (qforeach.h, pulled in by QString) would rewrite this file's own `forever` identifiers.
+#undef forever
+
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -5037,4 +5046,158 @@ TEST( PlaybackFrameRange, R1Iter2ConformShapesTheGrantFromTheCorrectedStart )
     ASSERT_TRUE( playback_frame_range::dropFrameCorrectedStart( 100.0, 1, 50, false, false ) == 49.0 );
     ASSERT_TRUE( playback_frame_range::dropFrameCorrectedStart( 10.5, 1, 50, true, false ) == 10.5 );
     ASSERT_TRUE( std::isnan( playback_frame_range::dropFrameCorrectedStart( std::nan( "" ), 1, 50, true, false ) ) );
+}
+
+// GUI-SMOKE-ARG-RANGE-OVERFLOW-1 (#881, Grok G7): inputs the GUI cannot produce must still give the mathematically correct
+// answer with no signed overflow. The inputs go through a volatile so the compiler cannot fold the old UB away at compile time.
+namespace
+{
+int64_t argOverflowOpaque( int64_t v )
+{
+    volatile int64_t held = v;
+    return held;
+}
+}
+
+// pass 7 A7: sourceFrameInsideAdmittedWindow( 0, true, INT64_MIN, 1 ) formed 0 - INT64_MIN.
+TEST( PlaybackFrameRangeArgOverflow, AdmittedWindowExtremeInputsNoOverflow )
+{
+    using playback_frame_range::sourceFrameInsideAdmittedWindow;
+    const int64_t kMin = std::numeric_limits<int64_t>::min();
+    const int64_t kMax = std::numeric_limits<int64_t>::max();
+    // frame - start is 2^63: far past a 1-frame window
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( 0 ), true, argOverflowOpaque( kMin ), 1 ) );   // RED: true
+    // frame - start is 2^64 - 1: past even the widest window
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( kMax ), true, argOverflowOpaque( kMin ),
+                                                   argOverflowOpaque( kMax ) ) );                                        // RED: true
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( 1 ), true, argOverflowOpaque( -kMax ),
+                                                   argOverflowOpaque( kMax ) ) );                                        // RED: true
+    // the exact edges of the widest window [INT64_MIN, INT64_MIN + INT64_MAX - 1] = [INT64_MIN, -2]
+    ASSERT_TRUE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( kMin ), true, argOverflowOpaque( kMin ), kMax ) );
+    ASSERT_TRUE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( -2 ), true, argOverflowOpaque( kMin ), kMax ) );
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( -1 ), true, argOverflowOpaque( kMin ), kMax ) );
+    // one-frame windows at both ends of the range
+    ASSERT_TRUE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( kMax ), true, argOverflowOpaque( kMax ), 1 ) );
+    ASSERT_TRUE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( kMin ), true, argOverflowOpaque( kMin ), 1 ) );
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( kMin ), true, argOverflowOpaque( kMax ), kMax ) );
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( kMax ), true, argOverflowOpaque( kMax ), 0 ) );
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( kMax ), false, argOverflowOpaque( kMax ), 1 ) );
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( argOverflowOpaque( 0 ), true, argOverflowOpaque( 0 ), kMin ) );
+
+    // in-range controls: the pinned window [121, 600] of a 480-frame requirement, unchanged
+    ASSERT_TRUE( sourceFrameInsideAdmittedWindow( 121, true, 121, 480 ) );
+    ASSERT_TRUE( sourceFrameInsideAdmittedWindow( 600, true, 121, 480 ) );
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( 601, true, 121, 480 ) );
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( 120, true, 121, 480 ) );
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( 300, false, 121, 480 ) );
+    ASSERT_FALSE( sourceFrameInsideAdmittedWindow( 300, true, 121, 0 ) );
+    // every small input where the old expression cannot overflow: the same answer as the old expression
+    for( int64_t frame = -8; frame <= 8; ++frame )
+        for( int64_t start = -6; start <= 6; ++start )
+            for( int64_t required = -2; required <= 6; ++required )
+                for( int armed = 0; armed <= 1; ++armed )
+                {
+                    const bool before = armed != 0 && required > 0 && frame >= start && frame - start < required;
+                    ASSERT_EQ( before, sourceFrameInsideAdmittedWindow( frame, armed != 0, start, required ) );
+                }
+}
+
+// SIBLING_SWEEP (same function family, same shape): measuredPlayLoopShouldStop formed consumed - required, which overflows for
+// consumed near INT64_MIN. A timeline that has not reached the window is not past it: the Reached wait still waits.
+TEST( PlaybackFrameRangeArgOverflow, MeasuredPlayLoopConsumedExtremeNoOverflow )
+{
+    using playback_frame_range::PlayStopState;
+    using playback_frame_range::measuredPlayLoopShouldStop;
+    const int64_t kMin = std::numeric_limits<int64_t>::min();
+    const int64_t kMax = std::numeric_limits<int64_t>::max();
+    ASSERT_FALSE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 480, 479, argOverflowOpaque( 480 ), true,
+                                              argOverflowOpaque( kMin ) ) );                                          // RED: true
+    ASSERT_FALSE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, kMax - 1, 0, argOverflowOpaque( kMax ), true,
+                                              argOverflowOpaque( -2 ) ) );                                            // RED: true
+    // far past the window at the top of the range: stop (consumed - required >= 16, no overflow before or after)
+    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 480, 479, 480, true, kMax ) );
+    // in-range controls, unchanged: 15 past waits, 16 past stops
+    ASSERT_FALSE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 480, 479, 480, true, 495 ) );
+    ASSERT_TRUE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 480, 479, 480, true, 496 ) );
+    ASSERT_FALSE( measuredPlayLoopShouldStop( PlayStopState::Reached, false, 480, 479, 480, true, 0 ) );
+    for( int64_t consumed = -40; consumed <= 40; ++consumed )
+        for( int64_t required = 1; required <= 24; ++required )
+        {
+            const int64_t target = required;
+            const bool before = !( target > 0 && 0 < target && target <= required && consumed - required < 16 );
+            ASSERT_EQ( before, measuredPlayLoopShouldStop( PlayStopState::Reached, false, target, 0, required, true, consumed ) );
+        }
+}
+
+// pass 6 A7: --gui-smoke-playback --seconds 2147483.648 reached qRound( 2147483648.0 ), outside int. main.cpp refuses (exit 2)
+// every --seconds whose milliseconds do not fit GuiPlaybackSmokeOptions::durationMs (an int), and NaN / inf; a value it admits
+// keeps today's qRound( seconds * 1000.0 ).
+TEST( PlaybackFrameRangeArgOverflow, SmokeSecondsFitDurationMs )
+{
+    using playback_frame_range::smokeSecondsFitDurationMs;
+    ASSERT_FALSE( smokeSecondsFitDurationMs( 2147483.648 ) );
+    ASSERT_FALSE( smokeSecondsFitDurationMs( 1e300 ) );
+    ASSERT_FALSE( smokeSecondsFitDurationMs( std::numeric_limits<double>::infinity() ) );
+    ASSERT_FALSE( smokeSecondsFitDurationMs( -std::numeric_limits<double>::infinity() ) );
+    ASSERT_FALSE( smokeSecondsFitDurationMs( std::numeric_limits<double>::quiet_NaN() ) );
+    ASSERT_FALSE( smokeSecondsFitDurationMs( -2147483.649 ) );
+    // controls: --seconds 2 -> durationMs 2000; the largest admitted value rounds to INT_MAX exactly
+    ASSERT_TRUE( smokeSecondsFitDurationMs( 2.0 ) );
+    ASSERT_EQ( 2000, qRound( 2.0 * 1000.0 ) );
+    ASSERT_TRUE( smokeSecondsFitDurationMs( 20.0 ) );
+    ASSERT_EQ( 20000, qRound( 20.0 * 1000.0 ) );
+    ASSERT_TRUE( smokeSecondsFitDurationMs( 2147483.647 ) );
+    ASSERT_EQ( std::numeric_limits<int>::max(), qRound( 2147483.647 * 1000.0 ) );
+    // r1 adversary A2: past 2147483.647 but still rounding to INT_MAX is admitted (and safe)
+    ASSERT_TRUE( smokeSecondsFitDurationMs( 2147483.6474 ) );
+    ASSERT_EQ( std::numeric_limits<int>::max(), qRound( 2147483.6474 * 1000.0 ) );
+}
+
+// r1 adversary A1: the --seconds tokens main.cpp reads, through the same QString::toDouble. Qt reports a decimal overflow
+// (1e309) as ok=false with an infinity, and -inf / -2147483.649 are also <= 0, so the "--seconds must be greater than 0" check
+// would claim them first. Every one of them must be refused as out of range, which needs the range check to run first.
+TEST( PlaybackFrameRangeArgOverflow, SmokeSecondsQtTokensOutOfRange )
+{
+    using playback_frame_range::smokeSecondsFitDurationMs;
+    const char *const outOfRange[] = { "1e309", "-1e309", "-inf", "inf", "nan", "-2147483.649", "2147483.648", " 2147483.648\n" };
+    for( const char *token : outOfRange )
+    {
+        bool ok = true;
+        const double seconds = QString::fromLatin1( token ).toDouble( &ok );
+        ASSERT_FALSE( smokeSecondsFitDurationMs( seconds ) );
+    }
+    const char *const inRange[] = { "2", "20", "0", "abc", "-5" };   // in range: left to the existing checks
+    for( const char *token : inRange )
+    {
+        bool ok = false;
+        const double seconds = QString::fromLatin1( token ).toDouble( &ok );
+        ASSERT_TRUE( smokeSecondsFitDurationMs( seconds ) );
+    }
+}
+
+// r1 adversary A1/A2/A3/A7: main.cpp needs a full GUI build, so its wiring is read as text (as
+// test_gui_smoke_display_select_wiring.cpp does). The range refusal runs after the parse and BEFORE the "> 0" check, so an
+// out-of-range token is refused by its own typed reason (A1); it prints the trimmed token (A7) and the cap it really
+// enforces (A2); and removing the call fails here (A3).
+TEST( PlaybackFrameRangeArgOverflow, MainRefusesSecondsOutOfRangeFirst )
+{
+    const QString path = repo_file_path( QStringLiteral( "platform/qt/main.cpp" ) );
+    ASSERT_FALSE( path.isEmpty() );
+    QFile file( path );
+    ASSERT_TRUE( file.open( QIODevice::ReadOnly | QIODevice::Text ) );
+    const QString source = QTextStream( &file ).readAll();
+    const int parse = source.indexOf( QStringLiteral( "const double seconds = parser.value(secondsOpt).toDouble(&ok);" ) );
+    const int range = source.indexOf( QStringLiteral( "if (!playback_frame_range::smokeSecondsFitDurationMs(seconds))" ) );
+    const int positive = source.indexOf( QStringLiteral( "ERROR: --seconds must be greater than 0." ) );
+    const int convert = source.indexOf( QStringLiteral( "options.durationMs = qRound(seconds * 1000.0);" ) );
+    ASSERT_TRUE( parse >= 0 && range >= 0 && positive >= 0 && convert >= 0 );
+    ASSERT_TRUE( parse < range );
+    ASSERT_TRUE( range < positive );                                   // RED on d9c1e61b: the range check came after
+    ASSERT_TRUE( positive < convert );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "smokeSecondsFitDurationMs(" ) ) );
+    const QString refusal = source.mid( range, source.indexOf( QStringLiteral( "return 2;" ), range ) - range );
+    ASSERT_TRUE( refusal.contains( QStringLiteral( "SECONDS_OUT_OF_RANGE" ) ) );
+    ASSERT_TRUE( refusal.contains( QStringLiteral( "parser.value(secondsOpt).trimmed()" ) ) );       // RED: raw token
+    ASSERT_TRUE( refusal.contains( QStringLiteral( "at most 2147483647" ) ) );                       // RED: 2147483.647
+    ASSERT_FALSE( source.contains( QStringLiteral( "at most 2147483.647" ) ) );
 }

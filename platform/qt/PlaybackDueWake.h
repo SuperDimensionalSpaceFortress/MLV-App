@@ -539,6 +539,20 @@ public:
     /*! Test hook, r15 (r14 adversary A1): the runner sleep is descheduled this long at its entry, before its wait starts (the
      *  window in which a caller-side origin stamp and the sleep's own clock used to disagree). 0 (production): no pause. */
     void setRunnerSleepStartDelayMsForTest( int ms );
+#ifdef MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM
+    // PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 (test seam, off by default; never called by product code). The tests judge a sleep's
+    // exit and a delivery's send time on the values the product itself compared and stamped, never on a clock read taken after
+    // the fact (a scheduler pause between the product's decision and the test's read moved every such bound). r10 (sol r9 B3):
+    // declared and compiled only where MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM is defined (console_tests.pro, never MLVApp.pro), so the
+    // app build carries no seam at all and product code naming it does not compile.
+    enum class RunnerSleepExit { None, TimedOut, ExpiredAfterDispatch, ExpiredAfterOtherWake, WaitFailed, WokenBySent };
+    void setTimingStampsForTest( bool on );                 // on: the records below are kept; off (default): nothing is recorded
+    RunnerSleepExit lastRunnerSleepExitForTest() const;     // how the last sleepForSmokeRunner left its loop (None: no recorded exit)
+    qint64 lastRunnerSleepExitElapsedMsForTest() const;     // the elapsed value that exit decided on (-1: none); for TimedOut,
+                                                            // the interval the timed-out wait was asked to cover (start + rest)
+    double lastDeliveryFirstStampMsForTest() const;         // inside onFire: the wait thread's pre-send stamp (ms, QPC clock) of
+                                                            // every stamped native delivery, split OR unsplit; -1 otherwise
+#endif
 
 private:
     struct Impl;

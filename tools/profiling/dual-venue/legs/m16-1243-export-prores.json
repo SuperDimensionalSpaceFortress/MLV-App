@@ -21,14 +21,18 @@
       "cpu": [
         { "metric": "framesExported", "op": "eq", "value": 480 },
         { "metric": "exportFramesFailed", "op": "eq", "value": 0 },
-        { "metric": "stageFramesSeen", "op": "eq", "value": 480 }
+        { "metric": "stageFramesSeen", "op": "eq", "value": 480 },
+        { "metric": "dualIsoClassAgrees", "op": "eq", "value": true },
+        { "metric": "renderPipeTimed", "op": "eq", "value": true }
       ]
     },
     "supplementary": {
       "cpu": [
         { "metric": "framesExported", "op": "eq", "value": 480 },
         { "metric": "exportFramesFailed", "op": "eq", "value": 0 },
-        { "metric": "stageFramesSeen", "op": "eq", "value": 480 }
+        { "metric": "stageFramesSeen", "op": "eq", "value": 480 },
+        { "metric": "dualIsoClassAgrees", "op": "eq", "value": true },
+        { "metric": "renderPipeTimed", "op": "eq", "value": true }
       ]
     }
   }
