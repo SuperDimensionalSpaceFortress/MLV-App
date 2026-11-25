@@ -95,10 +95,12 @@ public:
      *  A tick that granted nothing is a hold, even when the position moved without travel (r7 iteration 2, adversary pass 13
      *  A1 on 80079007: a stale start folded 1100000 -> 0 into the cut with no grant was logged as adv_frames -1100000 by an
      *  endpoint fallback). advancedFrames sums the grants ("the source frames those advances granted"), so a wrap adds what
-     *  it granted, not its net move back. A grant that is not finite is not an advance. */
+     *  it granted, not its net move back. A grant that is not finite is not an advance. r8 (sol r7 on 75ed5094): an advance
+     *  is a POSITIVE grant; a correction that moved the position with no grant (the non-Loop clamp of a stale start past the
+     *  cut's last frame, 100 -> 49 on cut 1..50, which 75ed5094 logged as adv_frames -51) never touches the advance fields. */
     void noteAdvance( double nowMs, double appliedFrames, int tickDiffMs )
     {
-        if( !active() || !( std::isfinite( appliedFrames ) && appliedFrames != 0.0 ) ) return;
+        if( !active() || !( std::isfinite( appliedFrames ) && appliedFrames > 0.0 ) ) return;
         ++m_pending.advances;
         m_pending.advancedFrames += appliedFrames;
         m_pending.lastAdvanceMs = nowMs - m_originMs;

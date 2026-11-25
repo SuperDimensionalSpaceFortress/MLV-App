@@ -13360,8 +13360,10 @@ void MainWindow::playbackHandling(int timeDiff)
                 // the clamp at the last frame without Loop reports what was actually advanced).
                 // r33 (adversary A1 on e0947e37): a tick can wrap more than one lap; each moved the position back by wrapWidth.
                 // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r6 (sol r5 S2): a stale start past the lap limit was folded back first.
+                // r8 (sol r7 on 75ed5094): without Loop, a stale start past the cut's last frame was clamped back onto it with no
+                // travel (clampedFrames), which 75ed5094 read as -51 frames advanced (start 100, cut 1..50).
                 const double grantedDropFrames = dropFrameTick.position - sourcePositionBeforeDropTick + dropFrameTick.foldedFrames
-                    + static_cast<double>( dropFrameTick.wrapWidth ) * dropFrameTick.wrapLaps;
+                    + dropFrameTick.clampedFrames + static_cast<double>( dropFrameTick.wrapWidth ) * dropFrameTick.wrapLaps;
                 // r7 (sol r6 on 9f3f5ebd): the present trace's advance, including whole laps that land back on the start
                 m_playbackTickAppliedFrames = grantedDropFrames;
                 m_newPosDropMode = dropFrameTick.position;

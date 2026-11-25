@@ -483,7 +483,8 @@ TEST(PlaybackFpsMeterPolicy, AFoldedStartKeepsItsDeltaAndTheAppliedAdvanceAccoun
     using playback_frame_range::advanceDropFrameTick;
     using playback_frame_range::DropFrameTickResult;
     const auto granted = [](const DropFrameTickResult & tick, double before) {
-        return tick.position - before + tick.foldedFrames + static_cast<double>( tick.wrapWidth ) * tick.wrapLaps;
+        return tick.position - before + tick.foldedFrames + tick.clampedFrames
+            + static_cast<double>( tick.wrapWidth ) * tick.wrapLaps;   // r8: MainWindow's grantedDropFrames, clamp term included
     };
     const DropFrameTickResult stale = advanceDropFrameTick(1100000.0, 1.0, 1, 2, true, false);
     ASSERT_TRUE(stale.foldedFrames == 1100000.0);
@@ -537,6 +538,15 @@ TEST(PlaybackFpsMeterPolicy, AFoldedStartKeepsItsDeltaAndTheAppliedAdvanceAccoun
     ASSERT_TRUE(advanceDropFrameTick(20.0, 0.1, 1, 2, true).foldedFrames == 0.0);
     ASSERT_TRUE(advanceDropFrameTick(0.5, 1000000.0, 1, 2, true).foldedFrames == 0.0);
     ASSERT_TRUE(advanceDropFrameTick(1100000.0, 1.0, 1, 2, false).foldedFrames == 0.0);
+    // r8 (sol r7 on 75ed5094): without Loop that stale start is CLAMPED onto the last frame (1) instead, a correction
+    // with no travel, so the accounting reads 0 frames applied (75ed5094: -1099999)
+    const DropFrameTickResult clamped = advanceDropFrameTick(1100000.0, 1.0, 1, 2, false);
+    ASSERT_TRUE(clamped.position == 1.0);
+    ASSERT_TRUE(clamped.clampedFrames == 1099999.0);
+    ASSERT_TRUE(granted(clamped, 1100000.0) == 0.0);
+    // the Loop ticks above never clamp
+    ASSERT_TRUE(stale.clampedFrames == 0.0);
+    ASSERT_TRUE(back.clampedFrames == 0.0);
 }
 
 // r6 (sol r5 S1 on 6aaac7f5): the Drop Frame request is finite. An accepted rate the cut cannot bound (+inf: a silent MLV

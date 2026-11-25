@@ -273,8 +273,14 @@ struct DropFrameTickResult
     // lap limit was moved back, in whole laps, into the cut onto its own phase before the delta applied (those laps were the
     // stale position's, never travelled, so they are not counted in wrapLaps or recorded; the tick reads wrapped, with
     // wrapLaps 0 unless the delta itself crosses the wrap point: pass 11 A1). 0 on every other tick. The applied advance is
-    // position - before + foldedFrames + wrapWidth * wrapLaps (MainWindow's grantedDropFrames).
+    // position - before + foldedFrames + clampedFrames + wrapWidth * wrapLaps (MainWindow's grantedDropFrames).
     double foldedFrames = 0.0;
+    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r8 (sol r7 on 75ed5094): how far the non-Loop clamp moved a stale start PAST the
+    // cut's last frame back onto it (start - lastFrame), a correction the tick never travelled; 0 on every other tick (a
+    // start at or before the last frame travels to it, and that travel is the advance). Sol's row: Drop Frame position 100,
+    // cut 1..50, Loop off, a zero or 8 ms request: the clamp returns 49, clampedFrames is 51 and the applied advance is 0,
+    // where 75ed5094 read -51. fl(position - start) and fl(start - position) are exact negatives, so the sum is exactly 0.
+    double clampedFrames = 0.0;
 };
 
 // advanceDropFrameTick mirrors MainWindow::playbackHandling's drop-frame-mode per-tick position
@@ -380,6 +386,8 @@ inline DropFrameTickResult advanceDropFrameTick(
     }
     else if( !loopEnabled && result.position >= lastFrame )
     {
+        // r8 (sol r7): a start already past the last frame is corrected back onto it, not advanced (clampedFrames above)
+        if( start > lastFrame ) result.clampedFrames = start - lastFrame;
         result.position = lastFrame;
     }
     return result;

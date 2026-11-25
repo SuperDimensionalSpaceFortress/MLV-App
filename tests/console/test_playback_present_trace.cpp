@@ -261,7 +261,58 @@ TEST(PlaybackPresentTrace, AClampedStaleNonLoopStartWithNoGrantIsNotAnAdvance)
         ASSERT_NEAR(1.0, trace.rows()[0].advancedFrames, 0.0);
         ASSERT_NEAR(8.5, trace.rows()[0].lastAdvanceMs, 1e-9);
         ASSERT_NEAR(42.0, trace.rows()[0].lastTickDiffMs, 0.0);
+
+        // r8: MainWindow's grantedDropFrames adds the clamp's correction back, so the tick granted exactly nothing
+        ASSERT_NEAR(51.0, tick.clampedFrames, 0.0);
+        const double granted = tick.position - 100.0 + tick.foldedFrames + tick.clampedFrames
+            + static_cast<double>(tick.wrapWidth) * tick.wrapLaps;
+        ASSERT_TRUE(granted == 0.0);
+        Recorder fixedTrace;
+        fixedTrace.setEnabled(true);
+        fixedTrace.begin(1000.0, 4);
+        fixedTrace.noteTick(1008.0, false, false);
+        fixedTrace.noteAdvance(1008.5, 1.0, 42);
+        fixedTrace.noteTick(1016.0, false, false);
+        fixedTrace.noteAdvance(1016.5, granted, 8);
+        fixedTrace.notePresent(r);
+        ASSERT_EQ(1, fixedTrace.rows()[0].advances);
+        ASSERT_NEAR(1.0, fixedTrace.rows()[0].advancedFrames, 0.0);
+        ASSERT_NEAR(8.5, fixedTrace.rows()[0].lastAdvanceMs, 1e-9);
+        ASSERT_NEAR(42.0, fixedTrace.rows()[0].lastTickDiffMs, 0.0);
     }
+    // a fractional stale start is corrected to exactly 0 as well (the two roundings are exact negatives)
+    const playback_frame_range::DropFrameTickResult fractional =
+        playback_frame_range::advanceDropFrameTick(100.192, 0.192, 1, 50, false, false);
+    ASSERT_TRUE(fractional.position - 100.192 + fractional.foldedFrames + fractional.clampedFrames
+                + static_cast<double>(fractional.wrapWidth) * fractional.wrapLaps == 0.0);
+}
+
+// r8 (sol r7 INV-5 row 4, kept): a start BEFORE the last frame travels to it, and that travel is the advance. Start 48,
+// a grant of 2, cut 1..50, Loop off: the clamp lands on 49 with no correction, one applied frame, one advance.
+TEST(PlaybackPresentTrace, AClampedTickFromBeforeTheLastFrameIsStillItsTravel)
+{
+    const playback_frame_range::DropFrameTickResult tick =
+        playback_frame_range::advanceDropFrameTick(48.0, 2.0, 1, 50, false, false);
+    ASSERT_NEAR(49.0, tick.position, 0.0);
+    ASSERT_NEAR(0.0, tick.clampedFrames, 0.0);
+    const double granted = tick.position - 48.0 + tick.foldedFrames + tick.clampedFrames
+        + static_cast<double>(tick.wrapWidth) * tick.wrapLaps;
+    ASSERT_NEAR(1.0, granted, 0.0);
+    // on the last frame already: a grant that would pass it is held there, a hold and no correction
+    const playback_frame_range::DropFrameTickResult onLast =
+        playback_frame_range::advanceDropFrameTick(49.0, 0.192, 1, 50, false, false);
+    ASSERT_NEAR(49.0, onLast.position, 0.0);
+    ASSERT_NEAR(0.0, onLast.clampedFrames, 0.0);
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(1000.0, 4);
+    trace.noteTick(1008.0, false, false);
+    trace.noteAdvance(1008.5, granted, 8);
+    Row r;
+    r.presentMs = 1020.0;
+    trace.notePresent(r);
+    ASSERT_EQ(1, trace.rows()[0].advances);
+    ASSERT_NEAR(1.0, trace.rows()[0].advancedFrames, 0.0);
 }
 
 TEST(PlaybackPresentTrace, ARowHasOneFieldPerHeaderColumn)
