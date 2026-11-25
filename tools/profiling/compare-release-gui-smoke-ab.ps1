@@ -40,13 +40,16 @@ function Get-SmokeFileIdentity {
     param([IO.FileStream]$Stream, [string]$ResolvedPath)
 
     if ($IsWindows -or $null -eq $IsWindows) {
-        if (-not ('MlvSmokeFileIdentity' -as [type])) {
+        # adversary-88890049.json A1: the native struct has 4-byte alignment (its FILETIMEs are two DWORDs), so it is declared Pack = 4: with the default
+        # 8-byte alignment of a long the volume serial and file index were read from the wrong offsets (VolumeSerialNumber at 32 instead of 28). The type
+        # is versioned so a session holding the old layout never reuses it.
+        if (-not ('MlvSmokeFileIdentityV2' -as [type])) {
             Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
-public static class MlvSmokeFileIdentity {
-    [StructLayout(LayoutKind.Sequential)]
+public static class MlvSmokeFileIdentityV2 {
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
     private struct BY_HANDLE_FILE_INFORMATION {
         public uint FileAttributes; public long CreationTime; public long LastAccessTime; public long LastWriteTime;
         public uint VolumeSerialNumber; public uint FileSizeHigh; public uint FileSizeLow; public uint NumberOfLinks;
@@ -59,10 +62,13 @@ public static class MlvSmokeFileIdentity {
         if (!GetFileInformationByHandle(handle, out info)) { throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()); }
         return info.VolumeSerialNumber.ToString("X8") + ":" + info.FileIndexHigh.ToString("X8") + info.FileIndexLow.ToString("X8");
     }
-}
+    public static int VolumeSerialOffset() { return (int)Marshal.OffsetOf(typeof(BY_HANDLE_FILE_INFORMATION), "VolumeSerialNumber"); }
+    public static int FileIndexHighOffset() { return (int)Marshal.OffsetOf(typeof(BY_HANDLE_FILE_INFORMATION), "FileIndexHigh"); }
+    public static int Size() { return Marshal.SizeOf(typeof(BY_HANDLE_FILE_INFORMATION)); }
+} // MlvSmokeFileIdentityV2 (never a bare column-0 brace: the function extractors end a function at one)
 '@
         }
-        return [MlvSmokeFileIdentity]::Of($Stream.SafeFileHandle)
+        return [MlvSmokeFileIdentityV2]::Of($Stream.SafeFileHandle)
     }
     $stat = & stat -L -c '%d:%i' -- $ResolvedPath 2>$null
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$stat)) { throw "the identity of $ResolvedPath could not be read" }

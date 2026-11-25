@@ -630,9 +630,16 @@ function Import-EvidencePacket {
             Add-Failure $importFailures "Evidence source worktree was dirty: $($sourceDirtyEntries -join '; ')"
         }
 
-        foreach ($file in @($manifest.files)) {
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-88890049.json A2): a manifest that did not parse (null) lists no artifact (@($null) is one null
+        # entry, whose empty relativePath named the extraction directory and threw at the hash), and an entry with no relativePath, or one that names a
+        # directory, is a recorded failure, never a throw that loses the import result
+        foreach ($file in @(@($manifest.files) | Where-Object { $null -ne $_ })) {
+            if ([string]::IsNullOrWhiteSpace([string]$file.relativePath)) {
+                Add-Failure $importFailures "The manifest lists an artifact with no relativePath."
+                continue
+            }
             $artifactPath = Join-Path $extractRoot ([string]$file.relativePath)
-            if (!(Test-Path -LiteralPath $artifactPath)) {
+            if (!(Test-Path -LiteralPath $artifactPath -PathType Leaf)) {
                 Add-Failure $importFailures "Packet missing artifact listed in manifest: $($file.relativePath)"
                 continue
             }

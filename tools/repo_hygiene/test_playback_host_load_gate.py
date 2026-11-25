@@ -3909,6 +3909,28 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
         self.assertIn("Get-SmokeFileIdentity -Stream $stream", once)
         self.assertNotIn("OrdinalIgnoreCase", once)
 
+    @unittest.skipIf(os.name != "nt", "the handle identity is GetFileInformationByHandle on Windows")
+    def test_r2_pass3_a1_the_identity_reads_the_native_volume_serial_and_file_index(self) -> None:
+        # adversary-88890049.json A1: the struct was declared with default alignment, so VolumeSerialNumber was read at offset 32 (SizeHigh: 0) and the index
+        # from the wrong words; two distinct files on two volumes with the same low index collided. RED: the volume part read 00000000, not the volume's serial.
+        with tempfile.TemporaryDirectory(prefix="residue-r2-id-") as tmp:
+            probe = Path(tmp) / "probe.ps1"
+            target = Path(tmp) / "f.json"
+            target.write_text("{}", encoding="utf-8")
+            probe.write_text(_extract_functions(COMPARE_SCRIPT, ["Get-SmokeFileIdentity"]) +
+                             f"$s = [IO.FileStream]::new('{target}', [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)\n"
+                             f"try {{ Write-Output ('ID=' + (Get-SmokeFileIdentity -Stream $s -ResolvedPath '{target}')) }} finally {{ $s.Dispose() }}\n"
+                             "Write-Output ('L=' + [MlvSmokeFileIdentityV2]::VolumeSerialOffset() + ',' + [MlvSmokeFileIdentityV2]::FileIndexHighOffset() + ',' + [MlvSmokeFileIdentityV2]::Size())\n",
+                             encoding="utf-8")
+            proc = _run_ps_file(probe)
+            vol = subprocess.run(["cmd", "/c", "vol", str(target)[:2]], capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=60)
+        ident = [l[3:] for l in proc.stdout.splitlines() if l.startswith("ID=")]
+        self.assertTrue(ident, proc.stdout + proc.stderr)
+        self.assertIn("L=28,44,52", proc.stdout, "the declared layout is the native BY_HANDLE_FILE_INFORMATION layout")
+        serial = re.search(r"([0-9A-F]{4})-([0-9A-F]{4})", vol.stdout)
+        self.assertIsNotNone(serial, vol.stdout + vol.stderr)
+        self.assertEqual(ident[0].split(":")[0], serial.group(1) + serial.group(2), (ident, vol.stdout))
+
     def test_a6_sibling_an_output_that_is_a_hard_link_to_an_input_is_refused(self) -> None:
         # A6 sibling (the output-overwrite guard compared spellings too): -Output names a hard link to -Before. RED: the report overwrote the before input.
         with tempfile.TemporaryDirectory(prefix="residue-r2-a6o-") as tmp:
@@ -3953,6 +3975,22 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
         # (A9 sibling: the packet manifest's parse is a recorded import failure too)
         self.assertIn("try { $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json }", p3)
         self.assertNotIn("        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json\n", p3)
+        # adversary-88890049.json A2: a null manifest lists no artifact (@($null) is one null entry whose empty path named the extraction directory)
+        self.assertIn("foreach ($file in @(@($manifest.files) | Where-Object { $null -ne $_ })) {", p3)
+        self.assertIn("if (!(Test-Path -LiteralPath $artifactPath -PathType Leaf)) {", p3)
+        self.assertNotIn("foreach ($file in @($manifest.files)) {", p3)
+        # the reduced execution of that loop: a null manifest and an entry with no relativePath record failures and never throw
+        loop = _extract_block(p3, "        foreach ($file in @(@($manifest.files) | Where-Object { $null -ne $_ })) {", "Add-Failure $importFailures \"Artifact hash mismatch", trailing_lines=3)
+        with tempfile.TemporaryDirectory(prefix="residue-r2-p3m-") as tmp:
+            script = Path(tmp) / "loop.ps1"
+            script.write_text("$ErrorActionPreference = 'Stop'\n$importFailures = [System.Collections.Generic.List[string]]::new()\n"
+                              "function Add-Failure($List, [string]$Message) { $List.Add($Message) }\nfunction Get-FileSha256([string]$Path) { throw 'hash of a directory' }\n"
+                              f"$extractRoot = '{tmp}'\n"
+                              "foreach ($m in @($null, ('{\"files\":[{}]}' | ConvertFrom-Json))) { $manifest = $m\n" + loop + "}\n"
+                              "Write-Output ('F=' + ($importFailures -join '|'))\n", encoding="utf-8")
+            proc = _run_ps_file(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("F=The manifest lists an artifact with no relativePath.", proc.stdout, proc.stdout + proc.stderr)
         self.assertLess(p3.index("$summaryDuplicate = try { Find-VenueJsonDuplicateMember -Text $summaryText -All }"), p3.index("try { $summary = $summaryText | ConvertFrom-Json }"))
         self.assertLess(p3.index("$resultTextStanding = ConvertFrom-VenueSmokeResultText -Text $resultText"), p3.index("try { $result = ConvertFrom-Json -InputObject $resultText -NoEnumerate }"))
 
