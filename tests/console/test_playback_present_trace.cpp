@@ -188,6 +188,33 @@ TEST(PlaybackPresentTrace, AZeroGrantOnEqualEndpointsIsStillAHold)
     ASSERT_NEAR(0.0, trace.rows()[0].advancedFrames, 0.0);
 }
 
+// r7 iteration 2 (adversary pass 13 A1 on 80079007): a stale start past the lap limit is folded into the cut with zero
+// laps (r6), so a zero-grant tick moves the drop position 1100000 -> 0 without travelling a frame. The trace fell back to
+// the endpoint displacement and logged adv=1, adv_frames=-1100000. The fold's stale distance is never an advance.
+TEST(PlaybackPresentTrace, AFoldedStaleStartWithNoGrantIsNotAnAdvance)
+{
+    const playback_frame_range::DropFrameTickResult tick =
+        playback_frame_range::advanceDropFrameTick(1100000.0, 0.0, 1, 2, true, false);
+    ASSERT_TRUE(tick.wrapped);
+    ASSERT_EQ(0, tick.wrapLaps);
+    ASSERT_NEAR(0.0, tick.position, 0.0);
+    ASSERT_NEAR(1100000.0, tick.foldedFrames, 0.0);
+    const double granted = tick.position - 1100000.0 + tick.foldedFrames + static_cast<double>(tick.wrapWidth) * tick.wrapLaps;
+    ASSERT_NEAR(0.0, granted, 0.0);
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(1000.0, 4);
+    trace.noteTick(1008.0, false, false);
+    trace.noteAdvance(1008.5, 1100000.0, tick.position, granted, 1);
+    Row r;
+    r.presentMs = 1020.0;
+    trace.notePresent(r);
+    ASSERT_EQ(static_cast<size_t>(1), trace.rows().size());
+    ASSERT_EQ(0, trace.rows()[0].advances);
+    ASSERT_NEAR(-1.0, trace.rows()[0].lastAdvanceMs, 1e-9);
+    ASSERT_NEAR(0.0, trace.rows()[0].advancedFrames, 0.0);
+}
+
 TEST(PlaybackPresentTrace, ARowHasOneFieldPerHeaderColumn)
 {
     Recorder trace;
