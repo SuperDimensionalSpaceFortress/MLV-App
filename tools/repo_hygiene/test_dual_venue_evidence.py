@@ -312,6 +312,13 @@ DRIFT_VISUAL_LEGS = {"legs/m16-1457-drift-t1-w10-visual-unpaced-fullscreen-s1.js
                      "legs/m16-1457-drift-t16-w10-visual-unpaced-fullscreen-s1.json": None}
 DRIFT_LEGS = {**DRIFT_LEGS, **{rel: "legs/m16-1457-headroom-unpaced-fullscreen-s1.json" for rel in (*DRIFT_T1_LEGS, *DRIFT_W10_LEGS, *DRIFT_VISUAL_LEGS)}}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *DRIFT_LEGS)
+# EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1: the unpinned every-frame leg, keyed to the leg it copies. Master's oldest-ready-first rule
+# (PlaybackFrameRange.h playbackAcquiresOldestReadyFirst = playing && (!dropFrameMode || pinnedCapture)) covers every drop-frame-off Play, pinned or not;
+# a venue leg never passes --presented-frames, so it is the unpinned case. The 1243 unpaced swap-interval-0 headroom leg with the capture on (a '-visual-'
+# twin: its fps is observer-perturbed, never a matrix speed cell) and conformMaxJump eq 1 (no skipped source frame) appended to each criteria list.
+# Fix iteration 1 appended conformRepeats eq 0 and conformTailUnpaintedFrames eq 0 too: max_jump alone counts forward steps and allows one held target,
+# so it misses a frame painted twice and a final target unpainted at the measured close. EveryFrameOldestFirstLegSpecTests pins the shape.
+EVERY_FRAME_OLDEST_FIRST_LEGS = {"legs/m16-1243-everyframe-visual-unpaced-fullscreen-s1.json": "legs/m16-1243-headroom-unpaced-fullscreen-s1.json"}
 # CPU-S1-1457-HEAVY-SPEC-AND-STALE-FIELDS-1: the two cpu-only fullscreen s1 HEAVY legs with Look Assist ON, keyed to the tracked spec each one mirrors (UFI-1 successor C2):
 # the M16-1457 paced cuda s1 HEAVY leg with backend cpu, and the M16-1243 unpaced stage leg with backend cpu (the untracked X7 shape). Each differs from its source only in
 # legId, card, backends and the cpu criteria list; test_the_cpu_s1_heavy_legs_mirror_their_cuda_sources pins that.
@@ -319,6 +326,7 @@ CPU_S1_HEAVY_LEGS = {"legs/m16-1457-native-cpu-fullscreen-s1-heavy.json": "legs/
                      "legs/m16-1243-headroom-stage-cpu-fullscreen-s1.json": "legs/m16-1243-headroom-stage-fullscreen-s1.json"}
 CPU_S1_HEAVY_UNPACED_LEG = "legs/m16-1243-headroom-stage-cpu-fullscreen-s1.json"   # the one unpaced (swap interval 0) leg of the pair: it carries presentTearingExpectedReason
 SHIPPED_LEGS = (*SHIPPED_LEGS, *CPU_S1_HEAVY_LEGS)
+SHIPPED_LEGS = (*SHIPPED_LEGS, *EVERY_FRAME_OLDEST_FIRST_LEGS)
 assert len(set(SHIPPED_LEGS)) == len(SHIPPED_LEGS), "a shipped leg is listed twice"
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
@@ -8326,12 +8334,14 @@ class LegSpecSchemaTests(unittest.TestCase):
         """CUDA-HEADROOM-1 r2: an unpaced leg at swap interval 0 presents with SyncInterval 0, so PresentMon reports AllowsTearing=1 (the hub's
         TEARING flag). Every headroom leg says so in presentTearingExpectedReason; no other leg carries it, and the schema refuses it on any leg
         that is not unpaced at swap interval 0, so the exemption can never reach a paced or vsync leg."""
-        for rel in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS, *DRIFT_LEGS, CPU_S1_HEAVY_UNPACED_LEG):
+        tearing = (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS, *DRIFT_LEGS,
+                   CPU_S1_HEAVY_UNPACED_LEG, *EVERY_FRAME_OLDEST_FIRST_LEGS)
+        for rel in tearing:
             spec = json.loads((DV / rel).read_text(encoding="utf-8"))
             self.jsonschema.validate(spec, self.schema)
             self.assertGreaterEqual(len(spec.get("presentTearingExpectedReason", "")), 12, rel)
         for path in sorted((DV / "legs").glob("*.json")):
-            if "legs/" + path.name not in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS, *DRIFT_LEGS, CPU_S1_HEAVY_UNPACED_LEG):
+            if "legs/" + path.name not in tearing:
                 self.assertNotIn("presentTearingExpectedReason", json.loads(path.read_text(encoding="utf-8")), path.name)
         leg = json.loads((DV / HEADROOM_LEGS[0]).read_text(encoding="utf-8"))
         paced = {k: v for k, v in leg["generatorArgs"].items() if k != "unpaced"}
@@ -8436,6 +8446,12 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertIn("legs/" + path.name, DRIFT_LEGS, path.name)
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1457-drift-(t(1|4|8|12|16)|t1-cool|t1-hot|pcore12|(t1|t1-cool|t1-hot|t16)-w10(-visual)?)-unpaced-fullscreen-s1$", path.name)
+                self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
+                self.assertEqual(spec["generatorArgs"]["swapInterval"], 0, path.name)
+            elif spec["card"] == "EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1":   # the unpinned every-frame visual twin of the 1243 unpaced headroom leg
+                self.assertIn("legs/" + path.name, EVERY_FRAME_OLDEST_FIRST_LEGS, path.name)
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-everyframe-visual-unpaced-fullscreen-s1$", path.name)
                 self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
                 self.assertEqual(spec["generatorArgs"]["swapInterval"], 0, path.name)
             elif spec["card"] == "CUDA-HEADROOM-UTIL-SAMPLER-1":   # the unpaced Cinematic utilisation-sampler leg (Look Assist forced on, the owner shape), named by cell
@@ -19513,7 +19529,13 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
     CLIP = "M16-1457"
     SPECS = tuple(f"legs/m16-{clip}-conform-{mode}-s1.json" for clip in ("1456", "1457") for mode in ("windowed", "fullscreen"))
 
-    def chain(self, measured: str, coverage: str | None = "1498", ends: bool = True) -> list[dict]:
+    def chain(self, measured: str, coverage: str | None = "1498", ends: bool = True, *, specs: tuple[str, ...] | None = None, clip: str | None = None,
+              backends: tuple[str, ...] = ("cuda",), head: tuple[str, str] | None = None, summary: str | None = None,
+              engine_frames: int = 1499) -> list[dict]:
+        # EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1: the same chain judges any committed spec (`specs`, `clip`) on each of its `backends`; `head`
+        # (the pacing-isolation line, the conform line's head) and `summary` replace the conformed 59.94 -> 24 run's lines for a run of another shape.
+        specs = self.SPECS if specs is None else specs
+        clip = self.CLIP if clip is None else clip
         # r28 fix iteration 2 (adversary A4 on 4201a437): the app prints source_advanced (the presented coverage) on every conform line, and a line
         # without it now fails closed; a measured line that does not name it carries the in-step coverage unless `coverage` is None.
         if measured and coverage is not None and "source_advanced=" not in measured:
@@ -19528,15 +19550,26 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         # fails closed; a measured line that does not name it carries backward=0 (no seek) unless `ends` is False.
         if measured and ends and "backward=" not in measured:
             measured += " backward=0"
-        log = "\n".join([
+        # EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 (adversary A1 on b56cc731): the app prints repeats on every conform line; a measured line that
+        # does not name it carries repeats=0 (no frame painted twice) unless `ends` is False. `engine_frames` is the job summary's own source count.
+        if measured and ends and "repeats=" not in measured:
+            measured += " repeats=0"
+        # r2 adversary fix 2 (A1 on 7c84e75a): the app prints presented on every conform line, and a line that carries repeats without it now fails
+        # closed; a measured line that does not name it carries one paint per covered frame plus the first (source_advanced + 1) unless `ends` is False.
+        if measured and ends and "presented=" not in measured:
+            m = re.search(r"source_advanced=(\d+)", measured)
+            if m:
+                measured += f" presented={int(m.group(1)) + 1}"
+        pacing, conform_head = head if head is not None else (
             "interaction_trace event=automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=0 persisted_frame_rate=24.000 drop_frame=1 settings_store=run_scoped",
-            "playback_smoke.measured_session id=3",
-            "playback_smoke.conform session=3 clip_fps=59.940 playback_fps=24.000 conform_active=1 conform_enabled=1 conform_env_override=1" + measured,
-            conformed_summary_line()]) + "\n"
+            "playback_smoke.conform session=3 clip_fps=59.940 playback_fps=24.000 conform_active=1 conform_enabled=1 conform_env_override=1")
+        log = "\n".join([pacing, "playback_smoke.measured_session id=3", conform_head + measured,
+                         conformed_summary_line() if summary is None else summary]) + "\n"
         sha = hashlib.sha256(log.encode("utf-8")).hexdigest()
         script = (
-            "$summary = [pscustomobject]@{ sourceFrames = [pscustomobject]@{ sourceAdvanced = 1499; requiredSourceFrames = 1499; failures = @() }; fixtureRehearsal = $false;"
-            " clipId = $env:DVE_CLIP; lookAssistForced = $true; gpuFramesTotal = 1499; lookFlavorReported = 'cinematic' }\n"
+            "$frames = [int64]$env:DVE_FRAMES\n"
+            "$summary = [pscustomobject]@{ sourceFrames = [pscustomobject]@{ sourceAdvanced = $frames; requiredSourceFrames = $frames; failures = @() }; fixtureRehearsal = $false;"
+            " clipId = $env:DVE_CLIP; lookAssistForced = $true; gpuFramesTotal = $frames; lookFlavorReported = 'cinematic' }\n"
             "$manifest = [pscustomobject]@{ smokeRunLog = [pscustomobject]@{ runNonce = $env:DVE_NONCE; sha256 = $env:DVE_SHA } }\n"
             "$result = [pscustomobject]@{ evidence = [pscustomobject]@{ runNonce = $env:DVE_NONCE; runLogSnapshot = [pscustomobject]@{ sha256 = $env:DVE_SHA } } }\n"
             "$out = foreach ($rel in ($env:DVE_SPECS -split ';')) {\n"
@@ -19545,16 +19578,17 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
             " -ExpectedClipId $env:DVE_CLIP -RequestedConform ([string]$spec.generatorArgs.playbackConform)\n"
             "  $arm = Get-DvConformArmVerdict -Spec $spec -Playback $pb\n"
             "  $m = Get-DvCriteriaMetrics -Metrics (Get-DvVerbatimMetrics -Summary $summary -EvidenceManifest $manifest) -Playback $pb\n"
-            "  foreach ($role in 'acceptance', 'supplementary') {\n"
-            "    $v = Test-DvCriteria -Criteria $spec.criteria.$role.cuda -Metrics $m\n"
-            "    [ordered]@{ spec = $rel; role = $role; valid = $pb.valid; honoured = $arm.honoured; blocks = $arm.blocks; pass = $v.pass; failures = @($v.failures);"
-            " sourceFps = $pb.conformSourceFps; maxJump = $pb.conformMaxJump; audioSync = $pb.conformAudioSyncRequests }\n"
-            "  }\n"
+            "  foreach ($role in 'acceptance', 'supplementary') { foreach ($backend in ($env:DVE_BACKENDS -split ';')) {\n"
+            "    $v = Test-DvCriteria -Criteria $spec.criteria.$role.$backend -Metrics $m\n"
+            "    [ordered]@{ spec = $rel; role = $role; backend = $backend; valid = $pb.valid; honoured = $arm.honoured; blocks = $arm.blocks; pass = $v.pass;"
+            " failures = @($v.failures); sourceFps = $pb.conformSourceFps; maxJump = $pb.conformMaxJump; audioSync = $pb.conformAudioSyncRequests }\n"
+            "  } }\n"
             "}\n"
             "ConvertTo-Json -InputObject @($out) -Compress -Depth 5")
-        proc, out = run_pwsh_json(script, DVE_LOG=log, DVE_SHA=sha, DVE_NONCE=NONCE, DVE_CLIP=self.CLIP, DVE_DV=str(DV), DVE_SPECS=";".join(self.SPECS))
+        proc, out = run_pwsh_json(script, DVE_LOG=log, DVE_SHA=sha, DVE_NONCE=NONCE, DVE_CLIP=clip, DVE_DV=str(DV), DVE_SPECS=";".join(specs),
+                                  DVE_BACKENDS=";".join(backends), DVE_FRAMES=str(engine_frames))
         self.assertIsNotNone(out, proc.stdout + proc.stderr)
-        self.assertEqual(len(out), 2 * len(self.SPECS), out)
+        self.assertEqual(len(out), 2 * len(specs) * len(backends), out)
         for row in out:
             # the run itself is sound and honoured: only the criteria decide
             self.assertEqual((row["valid"], row["honoured"], row["blocks"]), (True, True, False), row)
@@ -19761,6 +19795,449 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
                                  "(Get-DvCriteriaMetrics -Metrics $metrics -Playback $derived)"], calls)
 
 
+class EveryFrameOldestFirstLegSpecTests(unittest.TestCase):
+    """EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1: the unpinned every-frame leg. Master acquires the oldest ready frame first on every drop-frame-off Play,
+    pinned or not (PlaybackFrameRange.h playbackAcquiresOldestReadyFirst; the call site's pinned flag is m_playbackSmokeTargetPresentedFrames > 0, which no venue
+    leg sets). The leg is the 1243 unpaced (drop-frame off, fail closed UNPACED_NOT_HONOURED) swap-interval-0 fullscreen s1 headroom leg, the most frames ready at
+    once, with the visual capture on and the app's own conform line judged: conformMaxJump eq 1 (no skipped source frame), conformRepeats eq 0 (none painted
+    twice) and conformTailUnpaintedFrames eq 0 (no engine target unpainted at the measured close) together mean every source frame was shown, once, in order."""
+
+    CARD = "EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1"
+    MAX_JUMP = {"metric": "conformMaxJump", "op": "eq", "value": 1}
+    # Fix iteration 1 (adversary on b56cc731): max_jump counts forward steps and allows one held target, so a frame painted twice (A1) and an engine target
+    # never painted at the tail (A2) both read max_jump=1. The leg judges them directly: no repeat, and the last engine target painted.
+    APPENDED = [MAX_JUMP, {"metric": "conformRepeats", "op": "eq", "value": 0}, {"metric": "conformTailUnpaintedFrames", "op": "eq", "value": 0}]
+    OPT_OUT = ("visualCapture", "visualCaptureOptOutReason")
+    # A native-pace (unconformed) 23.976 fps run: the pacing line with drop-frame off, the conform line the app prints on every session (conform_active=0),
+    # and a summary paced at the native rate. The source counts stay the chain's (1499 from frame 0), so its coverage and ends defaults hold.
+    HEAD = ("interaction_trace event=automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=0 persisted_frame_rate=23.976 drop_frame=0 settings_store=run_scoped",
+            "playback_smoke.conform session=3 clip_fps=23.976 playback_fps=23.976 conform_active=0 conform_enabled=1 conform_env_override=0 audio_sync_requests=0")
+
+    def setUp(self) -> None:
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema is required")
+        self.jsonschema = jsonschema
+        self.schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+
+    def load(self, rel: str) -> dict:
+        return json.loads((DV / rel).read_text(encoding="utf-8"))
+
+    def test_the_leg_is_its_source_except_the_leg_id_the_card_the_capture_and_the_appended_max_jump(self) -> None:
+        for rel, source_rel in EVERY_FRAME_OLDEST_FIRST_LEGS.items():
+            with self.subTest(leg=rel):
+                text = (DV / rel).read_text(encoding="utf-8")
+                spec, source = json.loads(text), self.load(source_rel)
+                self.assertIs(source["visualCapture"], False, "the source keeps its opt-out: its fps must not be perturbed by the capture tail")
+                self.assertEqual(sorted(source["criteria"]), ["acceptance", "supplementary"])
+                for role, per in source["criteria"].items():
+                    self.assertEqual(sorted(per), ["cpu", "cuda"], role)
+                    for item in self.APPENDED:
+                        self.assertNotIn(item, [*per["cuda"], *per["cpu"]], "the source does not judge the every-frame criteria")
+                expected = {k: v for k, v in source.items() if k not in self.OPT_OUT}
+                expected.update(legId=Path(rel).stem, card=self.CARD,
+                                criteria={role: {b: [*items, *self.APPENDED] for b, items in per.items()} for role, per in source["criteria"].items()})
+                self.assertEqual(spec, expected, "only legId, card, the removed opt-out and the appended every-frame criteria differ")
+                self.assertEqual(list(spec), [k for k in source if k not in self.OPT_OUT], "the source's keys in the source's order")
+                for role in ("acceptance", "supplementary"):
+                    for backend in ("cuda", "cpu"):
+                        self.assertEqual(spec["criteria"][role][backend][-len(self.APPENDED):], self.APPENDED, (role, backend))
+                        for item in self.APPENDED:
+                            self.assertEqual(spec["criteria"][role][backend].count(item), 1, (role, backend, item))
+                self.assertEqual(text, json.dumps(spec, indent=2, ensure_ascii=False) + "\n", "the source's formatting")
+                self.assertEqual((DV / source_rel).read_text(encoding="utf-8"), json.dumps(source, indent=2, ensure_ascii=False) + "\n")
+
+    def test_the_leg_validates_and_is_an_unpaced_unpinned_visual_twin(self) -> None:
+        for rel in EVERY_FRAME_OLDEST_FIRST_LEGS:
+            with self.subTest(leg=rel):
+                spec = self.load(rel)
+                self.jsonschema.validate(spec, self.schema)
+                self.assertEqual(spec["legId"], Path(rel).stem)
+                self.assertIn("-visual-", spec["legId"], "a twin's fps is observer-perturbed: the name keeps it out of a matrix speed cell")
+                self.assertEqual(spec["legType"], "speed", "the capture only exists on a speed leg")
+                self.assertNotIn("visualCapture", spec, "absent means on")
+                self.assertNotIn("visualCaptureOptOutReason", spec)
+                ga = spec["generatorArgs"]
+                for key in ("unpaced", "forceLookAssist", "presentTrace"):
+                    self.assertIs(ga[key], True, key)
+                self.assertEqual(ga["swapInterval"], 0, "the most frames ready at once: the worst case for oldest-ready-first")
+                self.assertNotIn("playbackConform", ga, "a native-pace Play, not a conform arm")
+                self.assertEqual((spec["clipId"], spec["playSeconds"], spec["backends"], spec["scaleFactor"], spec["displayMode"]),
+                                 ("M16-1243", 20, ["cuda", "cpu"], 1, "fullscreen"))
+
+    def test_the_card_takes_its_sources_role_on_each_venue(self) -> None:
+        """Bachelor is acceptance for the source's card (CUDA-HEADROOM-1); an unlisted card would take defaultRole (supplementary) there."""
+        table = json.loads((DV / "venues.json").read_text(encoding="utf-8"))
+        self.assertEqual(table["roles"].get(self.CARD), {"bachelor": "acceptance", "ultra-magnus": "supplementary"})
+        for rel, source_rel in EVERY_FRAME_OLDEST_FIRST_LEGS.items():
+            with self.subTest(leg=rel):
+                self.assertEqual(table["roles"][self.load(rel)["card"]], table["roles"][self.load(source_rel)["card"]])
+
+    @requires_windows_pwsh
+    def test_the_runner_reads_the_leg_as_a_visual_twin(self) -> None:
+        names = [self.load(rel)["legId"] for rel in EVERY_FRAME_OLDEST_FIRST_LEGS]
+        proc = run_pwsh(["-Command", f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n$m = Get-Module DualVenueRunner\n"
+                         f"@({', '.join(repr(n) for n in names)}) | ForEach-Object {{ [string](& $m {{ param($n) Test-DvVisualTwinName $n }} $_) }}"])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.split(), ["True"] * len(names))
+
+    def chain(self, measured: str, ends: bool = True, frames: int = 1499) -> list[dict]:
+        """The shipped criteria chain (ConformMeasuredFieldsAreJudgedTests.chain: Get-DvPlaybackEvidence -> Get-DvConformArmVerdict -> Get-DvCriteriaMetrics ->
+        Test-DvCriteria) on THIS spec, cuda and cpu, both roles, over a native-pace run's log whose engine advanced `frames` source frames from frame 0."""
+        return ConformMeasuredFieldsAreJudgedTests.chain(
+            self, measured, ends=ends, specs=tuple(EVERY_FRAME_OLDEST_FIRST_LEGS), clip="M16-1243", backends=("cuda", "cpu"), head=self.HEAD, engine_frames=frames,
+            summary=conformed_summary_line(status='gui_fps_status_text="Playback: 23.976 fps"', native_fps="23.976", pace_fps="23.976",
+                                           source_advanced=str(frames), required_source_frames=str(frames)))
+
+    @staticmethod
+    def failed_metrics(row: dict) -> list[str]:
+        return [f.split(" ")[0].rstrip(":") for f in row["failures"]]
+
+    @requires_windows_pwsh
+    def test_the_criteria_pass_only_a_run_that_showed_every_source_frame(self) -> None:
+        cases = {
+            "sound": (" max_jump=1", []),
+            "a skipped source frame": (" max_jump=2", ["conformMaxJump"]),
+            "no frame advanced": (" max_jump=0", ["conformMaxJump"]),
+            "a frozen presentation tail": (" presented=1401 source_advanced=1400 max_jump=1", ["conformMaxJump", "conformTailUnpaintedFrames"]),
+        }
+        for name, (measured, failing) in cases.items():
+            for row in self.chain(measured):
+                with self.subTest(case=name, role=row["role"], backend=row["backend"]):
+                    self.assertEqual(row["pass"], not failing, row)
+                    self.assertEqual(self.failed_metrics(row), failing, row)
+        seen = {(row["role"], row["backend"]) for row in self.chain(" max_jump=1")}
+        self.assertEqual(seen, {(r, b) for r in ("acceptance", "supplementary") for b in ("cuda", "cpu")})
+
+    @requires_windows_pwsh
+    def test_adversary_b56cc731_a1_a_repeated_frame_fails(self) -> None:
+        """Fix iteration 1 (adversary A1 on b56cc731), its literal input: engine source_advanced=480, painted 1..240,240,241..479. max_jump counts forward
+        steps, so the repeat read max_jump=1 and every criteria list passed; the line's repeats=1 now fails conformRepeats alone."""
+        line = " presented=480 source_advanced=478 max_jump=1 wraps=0 backward=0 repeats=1 first_frame=1 last_frame=479 engine_target=479"
+        for row in self.chain(line, ends=False, frames=480):
+            with self.subTest(role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(self.failed_metrics(row), ["conformRepeats"], row)
+
+    @requires_windows_pwsh
+    def test_adversary_b56cc731_a2_an_unpainted_final_target_fails(self) -> None:
+        """Fix iteration 1 (adversary A2 on b56cc731), its literal input: the engine reached target 479 and the last painted frame is 478 (never submitted).
+        conformMaxJump's one held-target allowance absorbs it, so every list passed; conformTailUnpaintedFrames = 479 - 478 = 1 now fails alone."""
+        line = (" presented=478 source_advanced=477 max_jump=1 wraps=0 backward=0 repeats=0 first_frame=1 last_frame=478 engine_target=479 paint_submitted=478"
+                " paint_superseded=0 paint_unverified=0 paint_waiting=0")
+        for row in self.chain(line, ends=False, frames=480):
+            with self.subTest(role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(self.failed_metrics(row), ["conformTailUnpaintedFrames"], row)
+
+    @requires_windows_pwsh
+    def test_a_run_painted_through_its_last_target_once_each_passes(self) -> None:
+        """The control, in the shape the venue logs show for a sound unpaced 20 s run (the start frame on screen before Play, so first_frame=1): every
+        target 1..479 painted once, in order, through engine_target. It passes every list."""
+        line = " presented=479 source_advanced=478 max_jump=1 wraps=0 backward=0 repeats=0 first_frame=1 last_frame=479 engine_target=479"
+        for row in self.chain(line, ends=False, frames=480):
+            with self.subTest(role=row["role"], backend=row["backend"]):
+                self.assertTrue(row["pass"], row)
+
+    @requires_windows_pwsh
+    def test_a_seek_back_or_an_absent_field_is_could_not_check_never_a_pass(self) -> None:
+        """backward > 0 is not judged (engine_target is the engine's high-water), and a line without max_jump or repeats is a missing number: each FAILS."""
+        seek = " presented=1550 source_advanced=1548 max_jump=1 wraps=0 backward=1 repeats=0 first_frame=0 last_frame=1448 engine_target=1498"
+        for row in self.chain(seek, ends=False):
+            with self.subTest(case="backward=1", role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(self.failed_metrics(row), ["conformMaxJump", "conformTailUnpaintedFrames"], row)
+                self.assertIn("a seek back", row["failures"][0], row)
+                self.assertIn("a seek back", row["failures"][1], row)
+        for case, line, metric in (("no max_jump", " presented=1499", "conformMaxJump"),
+                                   ("no repeats", " presented=1499 source_advanced=1498 max_jump=1 wraps=0 backward=0 first_frame=0 last_frame=1498 engine_target=1498",
+                                    "conformRepeats")):
+            for row in self.chain(line, ends=(case != "no repeats")):
+                with self.subTest(case=case, role=row["role"], backend=row["backend"]):
+                    self.assertFalse(row["pass"], row)
+                    self.assertEqual(self.failed_metrics(row), [metric], row)
+                    self.assertIn("does not carry the field", row["failures"][0], row)
+
+    @requires_windows_pwsh
+    def test_the_every_frame_metrics_never_trust_a_summary_key_of_the_same_name(self) -> None:
+        """A summary.json that says conformRepeats=0 / conformTailUnpaintedFrames=0 cannot stand in for the run log's own line (absent here)."""
+        proc, out = run_pwsh_json(
+            "$m = [pscustomobject]@{ conformRepeats = 0; conformTailUnpaintedFrames = 0; rows = 5 }\n"
+            "Get-DvCriteriaMetrics -Metrics $m -Playback ([ordered]@{ conformLinePresent = $false }) | ConvertTo-Json -Compress -Depth 4")
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for metric in ("conformRepeats", "conformTailUnpaintedFrames"):
+            self.assertIsNone(out[metric], out)
+            self.assertIn("no playback_smoke.conform line", out[metric + "CouldNotCheck"], out)
+
+
+class EveryFrameConformConflictAndAcceptanceTests(unittest.TestCase):
+    """EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 r2 (sol r1 on f774d3a3).
+    B2: the conform-line reader kept the LAST occurrence of a key, so `repeats=1 repeats=0`, `last_frame=478 last_frame=479` and `backward=1 backward=0`
+    each passed all four criteria lists of the every-frame leg. A key carried twice with DIFFERENT values is now left out (ConvertFrom-DvRecordKeyValues),
+    so every criterion that reads it is CouldNotCheck and FAILS, through the public reader and the criteria path the live runner (Invoke-VenueLeg) and
+    receipt revalidation (Test-DvReceiptValid) share; the summary line's reader (the same parse) refuses a conflicting key too. An identical repeat is
+    the same reading and is kept.
+    B1: the PR #910 readout reported two ADVISORY (VENUE_ANCHOR_ABSENT) Bachelor receipts as acceptance FAILs. Get-DvAcceptanceVerdict is the acceptance
+    step: a raw PASS/FAIL is an acceptance verdict only when the validator says VERIFIED; anything else is NOT_MEASURED, the raw outcome a diagnostic."""
+
+    HEAD = EveryFrameOldestFirstLegSpecTests.HEAD
+    # the control: every target 1..479 painted once, in order, through engine_target (EveryFrameOldestFirstLegSpecTests passes it on every list)
+    SOUND = " presented=479 source_advanced=478 max_jump=1 wraps=0 backward=0 repeats=0 first_frame=1 last_frame=479 engine_target=479"
+    CONFLICT = "more than once with different values"
+
+    def chain(self, measured: str) -> list[dict]:
+        return EveryFrameOldestFirstLegSpecTests.chain(self, measured, ends=False, frames=480)
+
+    @staticmethod
+    def failed_metrics(row: dict) -> list[str]:
+        return EveryFrameOldestFirstLegSpecTests.failed_metrics(row)
+
+    @requires_windows_pwsh
+    def test_sol_r1_b2_a_conflicting_conform_field_fails_every_list(self) -> None:
+        """sol r1 B2, its literal inputs, each on the sound control: the repeat, the painted end and the seek-back count each carried twice."""
+        cases = {
+            "repeats=1 repeats=0": (self.SOUND.replace("repeats=0", "repeats=1 repeats=0"), ["conformRepeats"]),
+            "last_frame=478 last_frame=479": (self.SOUND.replace("last_frame=479", "last_frame=478 last_frame=479"),
+                                              ["conformMaxJump", "conformTailUnpaintedFrames"]),
+            "backward=1 backward=0": (self.SOUND.replace("backward=0", "backward=1 backward=0"), ["conformMaxJump", "conformTailUnpaintedFrames"]),
+        }
+        for name, (line, failing) in cases.items():
+            self.assertEqual(line.count(name.split("=")[0] + "="), 2, line)
+            rows = self.chain(line)
+            self.assertEqual({(r["role"], r["backend"]) for r in rows}, {(r, b) for r in ("acceptance", "supplementary") for b in ("cuda", "cpu")})
+            for row in rows:
+                with self.subTest(case=name, role=row["role"], backend=row["backend"]):
+                    self.assertFalse(row["pass"], row)
+                    self.assertEqual(self.failed_metrics(row), failing, row)
+                    for failure in row["failures"]:
+                        self.assertIn(self.CONFLICT, failure, row)
+                        self.assertIn(name.split("=")[0], failure, row)
+
+    @requires_windows_pwsh
+    def test_an_identical_repeat_is_the_same_reading_and_the_control_passes(self) -> None:
+        for name, line in (("control", self.SOUND), ("repeats=0 repeats=0", self.SOUND.replace("repeats=0", "repeats=0 repeats=0"))):
+            for row in self.chain(line):
+                with self.subTest(case=name, role=row["role"], backend=row["backend"]):
+                    self.assertTrue(row["pass"], row)
+
+    @requires_windows_pwsh
+    def test_fable_r1_h4_ends_that_contradict_each_other_are_could_not_check(self) -> None:
+        """fable r1 H4 (the B2 class: an ambiguous reading that read clean): last_frame=480 past engine_target=479 was clamped to a tail of 0 and passed."""
+        line = self.SOUND.replace("last_frame=479", "last_frame=480")
+        for row in self.chain(line):
+            with self.subTest(role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertIn("conformTailUnpaintedFrames", self.failed_metrics(row), row)
+                self.assertTrue(any("contradict each other" in f for f in row["failures"]), row)
+
+    @requires_windows_pwsh
+    def test_the_public_reader_leaves_a_conflicting_key_out_and_refuses_a_conflicting_summary(self) -> None:
+        """Get-DvPlaybackEvidence (the reader Invoke-VenueLeg and Test-DvReceiptValid both call): a conflicting conform key reads absent and is named; a
+        summary line that carries source_advanced twice (the last value would satisfy the floor) is SUMMARY_FIELD_CONFLICT, never valid."""
+        summary = conformed_summary_line(status='gui_fps_status_text="Playback: 23.976 fps"', native_fps="23.976", pace_fps="23.976",
+                                         source_advanced="480", required_source_frames="480")
+        script = (
+            "$summary = [pscustomobject]@{ sourceFrames = [pscustomobject]@{ sourceAdvanced = 480; requiredSourceFrames = 480; failures = @() }; fixtureRehearsal = $false; clipId = 'M16-1243' }\n"
+            "$manifest = [pscustomobject]@{ smokeRunLog = [pscustomobject]@{ runNonce = $env:DVE_NONCE; sha256 = '' } }\n"
+            "$out = foreach ($log in ($env:DVE_LOGS -split '\\|\\|')) {\n"
+            "  $sha = Get-DvSha256OfText $log\n"
+            "  $result = [pscustomobject]@{ evidence = [pscustomobject]@{ runNonce = $env:DVE_NONCE; runLogSnapshot = [pscustomobject]@{ sha256 = $sha } } }\n"
+            "  $pb = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ResultJson $result -LogText $log -LogSha256 $sha -ExpectedClipId 'M16-1243'\n"
+            "  [ordered]@{ valid = $pb.valid; reasons = @($pb.invalidReasons); repeats = $pb.conformRepeats; lastFrame = $pb.conformLastFrame; backward = $pb.conformBackward;"
+            " conformConflicts = @($pb.conformConflictingFields); summaryConflicts = @($pb.summaryConflictingFields); sourceAdvanced = $pb.sourceAdvanced }\n"
+            "}\n"
+            "ConvertTo-Json -InputObject @($out) -Compress -Depth 5")
+        conform = self.HEAD[1] + self.SOUND.replace("repeats=0", "repeats=1 repeats=0").replace("last_frame=479", "last_frame=478 last_frame=479")
+        logs = ["\n".join([self.HEAD[0], "playback_smoke.measured_session id=3", conform, summary]) + "\n",
+                "\n".join([self.HEAD[0], "playback_smoke.measured_session id=3", self.HEAD[1] + self.SOUND, summary + " source_advanced=9999"]) + "\n"]
+        proc, out = run_pwsh_json(script, DVE_LOGS="||".join(logs), DVE_NONCE=NONCE)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), 2, out)
+        conflicting_conform, conflicting_summary = out
+        self.assertEqual((conflicting_conform["repeats"], conflicting_conform["lastFrame"], conflicting_conform["backward"]), (None, None, 0), conflicting_conform)
+        self.assertEqual(conflicting_conform["conformConflicts"], ["last_frame", "repeats"], conflicting_conform)
+        self.assertEqual(conflicting_conform["summaryConflicts"], [], conflicting_conform)
+        self.assertTrue(conflicting_conform["valid"], conflicting_conform)
+        self.assertFalse(conflicting_summary["valid"], conflicting_summary)
+        self.assertIsNone(conflicting_summary["sourceAdvanced"], conflicting_summary)
+        self.assertEqual(conflicting_summary["summaryConflicts"], ["source_advanced"], conflicting_summary)
+        self.assertTrue(any(r.startswith("SUMMARY_FIELD_CONFLICT:") and "source_advanced" in r for r in conflicting_summary["reasons"]), conflicting_summary)
+
+    @requires_windows_pwsh
+    def test_sol_r1_b1_an_advisory_receipt_is_not_measured_never_fail_or_pass(self) -> None:
+        """sol r1 B1 and its INV-3 rows: the two Bachelor receipts (raw FAIL, verification ADVISORY, VENUE_ANCHOR_ABSENT) and a raw PASS with an advisory
+        verification are NOT_MEASURED; only a VERIFIED PASS/FAIL is an acceptance verdict. The raw outcome and its detail stay as diagnostics."""
+        detail = ("ADVISORY (VENUE_ANCHOR_ABSENT; never a usable FAIL): CAPTURED; criteria failed: conformMaxJump eq 1 failed (actual 2); "
+                  "conformTailUnpaintedFrames eq 0 failed (actual 2)")
+        cases = [("a877bb17 cuda", "FAIL", "ADVISORY", "NOT_MEASURED"), ("231ea06e cpu", "FAIL", "ADVISORY", "NOT_MEASURED"),
+                 ("raw PASS advisory", "PASS", "ADVISORY", "NOT_MEASURED"), ("offline stub", "PASS", "VERIFIED_OFFLINE_TEST", "NOT_MEASURED"),
+                 ("invalid", "FAIL", "INVALID", "NOT_MEASURED"), ("incomplete", "PASS", "INCOMPLETE", "NOT_MEASURED"), ("no verification", "FAIL", "", "NOT_MEASURED"),
+                 ("not a measurement", "UNRESOLVED", "VERIFIED", "NOT_MEASURED"), ("lowercase status", "PASS", "verified", "NOT_MEASURED"),
+                 ("verified PASS", "PASS", "VERIFIED", "PASS"), ("verified FAIL", "FAIL", "VERIFIED", "FAIL")]
+        script = (
+            "$cases = $env:DVE_CASES | ConvertFrom-Json\n"
+            "$out = foreach ($c in $cases) { $r = [ordered]@{ outcome = $c.outcome; outcomeDetail = $env:DVE_DETAIL; verification = [ordered]@{ status = $c.status } }\n"
+            "  $v = Get-DvAcceptanceVerdict -Receipt $r -VerificationStatus $c.status\n"
+            "  [ordered]@{ verdict = $v.verdict; raw = $v.rawOutcome; status = $v.verificationStatus; reason = $v.reason; detail = $v.outcomeDetail } }\n"
+            "ConvertTo-Json -InputObject @($out) -Compress -Depth 4")
+        proc, out = run_pwsh_json(script, DVE_CASES=json.dumps([{"outcome": o, "status": s} for _, o, s, _ in cases]), DVE_DETAIL=detail)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), len(cases), out)
+        for (name, outcome, status, expected), row in zip(cases, out):
+            with self.subTest(case=name):
+                self.assertEqual(row["verdict"], expected, row)
+                self.assertEqual(row["raw"], outcome, "the raw outcome is kept as a diagnostic")
+                self.assertEqual(row["detail"], detail, "the criteria failures are kept as diagnostics")
+                if expected == "NOT_MEASURED":
+                    self.assertTrue(row["reason"], row)
+                else:
+                    self.assertIsNone(row["reason"], row)
+
+    def reader(self, logs: list[str]) -> list[dict]:
+        """Get-DvPlaybackEvidence over each log (a 23.976 fps native-pace run, 480 source frames), as Invoke-VenueLeg and Test-DvReceiptValid call it."""
+        script = (
+            "$summary = [pscustomobject]@{ sourceFrames = [pscustomobject]@{ sourceAdvanced = 480; requiredSourceFrames = 480; failures = @() }; fixtureRehearsal = $false; clipId = 'M16-1243' }\n"
+            "$manifest = [pscustomobject]@{ smokeRunLog = [pscustomobject]@{ runNonce = $env:DVE_NONCE; sha256 = '' } }\n"
+            "$out = foreach ($log in ($env:DVE_LOGS -split '\\|\\|')) {\n"
+            "  $sha = Get-DvSha256OfText $log\n"
+            "  $result = [pscustomobject]@{ evidence = [pscustomobject]@{ runNonce = $env:DVE_NONCE; runLogSnapshot = [pscustomobject]@{ sha256 = $sha } } }\n"
+            "  $pb = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ResultJson $result -LogText $log -LogSha256 $sha -ExpectedClipId 'M16-1243'\n"
+            "  $fields = (Get-DvSmokeSummaryFields -LogText $log).fields\n"
+            "  [ordered]@{ valid = $pb.valid; reasons = @($pb.invalidReasons); repeats = $pb.conformRepeats; summaryConflicts = @($pb.summaryConflictingFields);"
+            " conformConflicts = @($pb.conformConflictingFields); summaryKeys = @($fields.Keys | Sort-Object) }\n"
+            "}\n"
+            "ConvertTo-Json -InputObject @($out) -Compress -Depth 5")
+        proc, out = run_pwsh_json(script, DVE_LOGS="||".join(logs), DVE_NONCE=NONCE)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), len(logs), out)
+        return out
+
+    def log(self, conform: str, summary_tail: str = "") -> str:
+        summary = conformed_summary_line(status='gui_fps_status_text="Playback: 23.976 fps"', native_fps="23.976", pace_fps="23.976",
+                                         source_advanced="480", required_source_frames="480")
+        return "\n".join([self.HEAD[0], "playback_smoke.measured_session id=3", self.HEAD[1] + conform, summary + summary_tail]) + "\n"
+
+    @requires_windows_pwsh
+    def test_adversary_7272acb4_a1_an_empty_occurrence_is_a_conflicting_reading(self) -> None:
+        """r2 adversary A1 on 7272acb4, its literal inputs: `\\S+` skipped an EMPTY occurrence, so `repeats= repeats=0` (either order), `last_frame=479
+        last_frame=`, `backward= backward=0` read one clean value and passed every list, and a summary `source_advanced= source_advanced=480` read valid.
+        An empty occurrence is a reading that differs from any non-empty one: the key conflicts and is left out."""
+        cases = {
+            "repeats= repeats=0": (self.SOUND.replace("repeats=0", "repeats= repeats=0"), ["conformRepeats"]),
+            "repeats=0 repeats=": (self.SOUND.replace("repeats=0", "repeats=0 repeats="), ["conformRepeats"]),
+            "last_frame=479 last_frame=": (self.SOUND.replace("last_frame=479", "last_frame=479 last_frame="), ["conformMaxJump", "conformTailUnpaintedFrames"]),
+            "backward= backward=0": (self.SOUND.replace("backward=0", "backward= backward=0"), ["conformMaxJump", "conformTailUnpaintedFrames"]),
+        }
+        for name, (line, failing) in cases.items():
+            for row in self.chain(line):
+                with self.subTest(case=name, role=row["role"], backend=row["backend"]):
+                    self.assertFalse(row["pass"], row)
+                    self.assertEqual(self.failed_metrics(row), failing, row)
+                    for failure in row["failures"]:
+                        self.assertIn(self.CONFLICT, failure, row)
+        summary = self.reader([self.log(self.SOUND, " source_advanced= source_advanced=480")])[0]
+        self.assertFalse(summary["valid"], summary)
+        self.assertEqual(summary["summaryConflicts"], ["source_advanced"], summary)
+        self.assertTrue(any(r.startswith("SUMMARY_FIELD_CONFLICT:") for r in summary["reasons"]), summary)
+
+    @requires_windows_pwsh
+    def test_adversary_7272acb4_a2_a_key_glued_inside_another_token_is_no_key(self) -> None:
+        """r2 adversary A2 on 7272acb4, its literal inputs: the unanchored regex read `repeats=0` out of `-repeats=0` and `not-repeats=0`. A key starts a
+        whitespace-separated token; a glued one is no field, so the absent repeats is CouldNotCheck and the summary carries no `repeats` key."""
+        for row in self.chain(self.SOUND.replace("repeats=0", "-repeats=0")):
+            with self.subTest(role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(self.failed_metrics(row), ["conformRepeats"], row)
+                self.assertIn("does not carry the field", row["failures"][0], row)
+        out = self.reader([self.log(self.SOUND.replace("repeats=0", "-repeats=0"), " not-repeats=0 x-y=1")])[0]
+        self.assertIsNone(out["repeats"], out)
+        self.assertNotIn("repeats", out["summaryKeys"], out)
+        self.assertNotIn("y", out["summaryKeys"], out)
+        self.assertIn("source_advanced", out["summaryKeys"], out)
+        self.assertTrue(out["valid"], out)
+
+    @requires_windows_pwsh
+    def test_adversary_7272acb4_a3_a_malformed_status_or_outcome_is_not_measured(self) -> None:
+        """r2 adversary A3 on 7272acb4 (advisory, in scope), its literal inputs: a zero-width space after VERIFIED, or after the raw PASS, compared equal
+        under PowerShell's culture-sensitive -ceq / -cin. The acceptance step compares ordinally, so either is NOT_MEASURED."""
+        zw = "​"
+        cases = [("PASS", "VERIFIED" + zw), ("PASS" + zw, "VERIFIED"), ("FAIL" + zw, "VERIFIED"), ("PASS", zw + "VERIFIED")]
+        script = (
+            "$out = foreach ($c in ($env:DVE_CASES | ConvertFrom-Json)) { $v = Get-DvAcceptanceVerdict -Receipt ([ordered]@{ outcome = $c.outcome }) -VerificationStatus $c.status\n"
+            "  [ordered]@{ verdict = $v.verdict; reason = $v.reason } }\n"
+            "ConvertTo-Json -InputObject @($out) -Compress -Depth 3")
+        proc, out = run_pwsh_json(script, DVE_CASES=json.dumps([{"outcome": o, "status": s} for o, s in cases]))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), len(cases), out)
+        for (outcome, status), row in zip(cases, out):
+            with self.subTest(outcome=outcome.encode("unicode_escape"), status=status.encode("unicode_escape")):
+                self.assertEqual(row["verdict"], "NOT_MEASURED", row)
+                self.assertTrue(row["reason"], row)
+
+    @requires_windows_pwsh
+    def test_adversary_7c84e75a_a1_paints_that_cannot_cover_the_advance_fail(self) -> None:
+        """r2 adversary A1 on 7c84e75a, its literal input: 478 paints with no repeat and no seek cannot cover 478 source frames one at a time (477 steps),
+        yet max_jump=1, repeats=0 and last_frame == engine_target passed every list. The implied step (ceil(478 / 477) = 2) contradicts the line's
+        max_jump=1, so conformMaxJump is CouldNotCheck; a line that carries repeats but no presented is CouldNotCheck too."""
+        line = " presented=478 source_advanced=478 max_jump=1 wraps=0 backward=0 repeats=0 first_frame=1 last_frame=479 engine_target=479"
+        for row in self.chain(line):
+            with self.subTest(case="presented=478", role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(self.failed_metrics(row), ["conformMaxJump"], row)
+                self.assertIn("at least one painted step is 2 frames long", row["failures"][0], row)
+        for row in self.chain(self.SOUND.replace("presented=479 ", "")):
+            with self.subTest(case="no presented", role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(self.failed_metrics(row), ["conformMaxJump"], row)
+                self.assertIn("no readable non-negative presented", row["failures"][0], row)
+
+    @requires_windows_pwsh
+    def test_adversary_7c84e75a_a2_a_token_in_the_log_prefix_is_no_field(self) -> None:
+        """r2 adversary A2 on 7c84e75a, its literal input: `[ repeats=0 ] playback_smoke.conform session=3 ...` with no repeats in the record body. The
+        selector allows the log prefix's bracket groups, and the reader scanned them, so the absent repeats read a measured 0 and every list passed."""
+        body = self.SOUND.replace(" repeats=0", "")
+        rows = ConformMeasuredFieldsAreJudgedTests.chain(
+            self, body, ends=False, specs=tuple(EVERY_FRAME_OLDEST_FIRST_LEGS), clip="M16-1243", backends=("cuda", "cpu"), head=(self.HEAD[0], "[ repeats=0 ] " + self.HEAD[1]),
+            engine_frames=480, summary=conformed_summary_line(status='gui_fps_status_text="Playback: 23.976 fps"', native_fps="23.976", pace_fps="23.976",
+                                                              source_advanced="480", required_source_frames="480"))
+        for row in rows:
+            with self.subTest(role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(self.failed_metrics(row), ["conformRepeats"], row)
+                self.assertIn("does not carry the field", row["failures"][0], row)
+
+    @requires_windows_pwsh
+    def test_adversary_7c84e75a_a3_a6_stored_fields_are_compared_and_the_verdict_takes_scalars_only(self) -> None:
+        """r2 adversary A3 on 7c84e75a: the validator compares the playback fields this card added (conformRepeats, conformPresented and both conflict
+        lists) with the re-derived block whenever the stored block carries them. A6 (advisory): an array outcome or status is NOT_MEASURED."""
+        proc, out = run_pwsh_json(
+            "$m = Get-Module DualVenueRunner\n"
+            "$list = & $m { $script:PlaybackComparedFieldsWhenStored }\n"
+            "$a = Get-DvAcceptanceVerdict -Receipt ([ordered]@{ outcome = @('PASS') }) -VerificationStatus 'VERIFIED'\n"
+            "$b = Get-DvAcceptanceVerdict -Receipt ([ordered]@{ outcome = 'PASS' }) -VerificationStatus @('VERIFIED')\n"
+            "$c = Get-DvAcceptanceVerdict -Receipt ([ordered]@{ outcome = 'PASS' }) -VerificationStatus 'VERIFIED'\n"
+            "ConvertTo-Json -Compress -Depth 3 -InputObject ([ordered]@{ list = @($list); a = $a.verdict; b = $b.verdict; c = $c.verdict })")
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out["list"], ["conformRepeats", "conformPresented", "conformConflictingFields", "summaryConflictingFields"], out)
+        self.assertEqual((out["a"], out["b"], out["c"]), ("NOT_MEASURED", "NOT_MEASURED", "PASS"), out)
+        text = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("foreach ($f in $script:PlaybackComparedFieldsWhenStored) {\n"
+                      "                if ($storedNames -ccontains $f -and -not (Test-DvJsonEquivalent (Get-DvProp $stored $f) (Get-DvProp $derived $f))) "
+                      "{ $invalid.Add(\"PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive\") }", text)
+
+    def test_the_leg_runner_prints_the_acceptance_verdict_from_the_acceptance_step(self) -> None:
+        """Invoke-VenueLeg prints DVE_ACCEPTANCE (Get-DvAcceptanceVerdict over the verification Write-DvReceipt just stamped) after DVE_VERIFICATION;
+        DVE_OUTCOME stays the raw outcome the chain records."""
+        text = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        verification = text.index('Write-Output "DVE_VERIFICATION=')
+        call = text.index("$acceptance = Get-DvAcceptanceVerdict -Receipt $receipt -VerificationStatus", verification)
+        printed = text.index('Write-Output "DVE_ACCEPTANCE=$($acceptance.verdict)"', call)
+        self.assertLess(text.index('Write-Output "DVE_OUTCOME=$Outcome"'), verification)
+        self.assertLess(printed, text.index('Write-Output "DVE_RECEIPT_PATH=$path"'))
+        self.assertEqual(text.count("DVE_ACCEPTANCE="), 1)
+
+
 class DriftLegSpecTests(unittest.TestCase):
     """M16-1457-VENUE-BASELINE-DRIFT-1 r3: each drift leg is the tracked 1457 fullscreen s1 headroom leg with only legId, card and generatorArgs.playbackMaxThreads
     changed (the P-core arm also carries the 1243 b1-12-pcore arm's affinity keys and its two partition criteria), so a worker-cap sweep on the Bachelor
@@ -19869,7 +20346,8 @@ class DriftLegSpecTests(unittest.TestCase):
         for rel in DRIFT_VISUAL_LEGS:
             with self.subTest(leg=rel):
                 self.assertIn("-w10-visual-unpaced-", self.load(rel)["legId"])
-        self.assertEqual(sorted(p.name for p in (DV / "legs").glob("*-visual-*.json")), sorted(Path(r).name for r in DRIFT_VISUAL_LEGS), "a '-visual-' leg outside the registered twins")
+        self.assertEqual(sorted(p.name for p in (DV / "legs").glob("*-visual-*.json")), sorted(Path(r).name for r in (*DRIFT_VISUAL_LEGS, *EVERY_FRAME_OLDEST_FIRST_LEGS)),
+                         "a '-visual-' leg outside the registered twins")
         for path in sorted((DV / "legsets").glob("*.json")):
             with self.subTest(legset=path.name):
                 self.assertEqual(self.legset_drift_violations(json.loads(path.read_text(encoding="utf-8"))), [])
