@@ -1312,3 +1312,38 @@ TEST(PlaybackSlipHistogram, R3APinnedStopKeepsTheFirstPresentsCorrectionCountInR
     ASSERT_EQ( 4LL, s.slipsTotal );                                      // green on 2a3371ff; the r3 rule without the pin clamp: 0
     ASSERT_EQ( 4, s.startupCatchupFrames );
 }
+
+// r3 iteration 1 (adversary pass 6 A2 on f8d80862, its input verbatim): the jump covers only the frames it passed AFTER the landed
+// correction. 10 -> 15 is travelled, 15 is corrected to 40 and 0.2 is granted, the first present shows 10 with the timeline at 40:
+// its jump 11..14 was passed BEFORE the correction, so it never covers 41..44, which the second present (45, landing rebase 40)
+// skips: four slips, one event, and the jump's four frames are startup catch-up.
+TEST(PlaybackSlipHistogram, R3Iter1TheJumpCoversOnlyTheTravelAfterTheLandedCorrection)
+{
+    SlipHistogram h;
+    h.reset( 10, 25.0 );
+    h.setPlayStart( 0.0 );
+    h.noteTimelineMove( AdvancePath::DropTick, 15, 200.0, 5.0, 0.0 );
+    h.noteTimelineCorrection( 40 );
+    h.noteTimelineMove( AdvancePath::DropTick, 40, 208.0, 0.2, 0.0 );
+    h.notePresent( r2Present( 10, 210.0, 40 ) );
+    h.noteTimelineMove( AdvancePath::DropTick, 45, 408.0, 5.0, 0.0 );
+    h.notePresent( r2Present( 45, 440.0, 45, 1, true, 40 ) );
+    const Summary s = h.finish( 450.0, 45 );
+    ASSERT_EQ( 4LL, s.slipsTotal );                                      // f8d80862: 0
+    ASSERT_EQ( 1, s.slipEvents );                                        // f8d80862: 0
+    ASSERT_EQ( 4, s.startupCatchupFrames );
+    // split travel: 10 -> 12 before the correction to 40, 40 -> 43 after it; first present 10 at timeline 43. The jump (11, 12 and
+    // 41, 42: four frames) covers only the two passed after the correction: 45 landing rebase 40 skips 41..44, two of them slips.
+    SlipHistogram split;
+    split.reset( 10, 25.0 );
+    split.setPlayStart( 0.0 );
+    split.noteTimelineMove( AdvancePath::DropTick, 12, 100.0, 2.0, 0.0 );
+    split.noteTimelineCorrection( 40 );
+    split.noteTimelineMove( AdvancePath::DropTick, 43, 200.0, 3.0, 0.0 );
+    split.notePresent( r2Present( 10, 210.0, 43 ) );
+    split.noteTimelineMove( AdvancePath::DropTick, 45, 408.0, 2.0, 0.0 );
+    split.notePresent( r2Present( 45, 440.0, 45, 1, true, 40 ) );
+    const Summary t = split.finish( 450.0, 45 );
+    ASSERT_EQ( 2LL, t.slipsTotal );
+    ASSERT_EQ( 4, t.startupCatchupFrames );
+}

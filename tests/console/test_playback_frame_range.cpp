@@ -5236,3 +5236,32 @@ TEST( PlaybackFrameRange, R3AOneFrameLoopCutCorrectsAStartOutsideItsFrame )
     // a width-1 cut is unchanged: the r1 below-cut fold already owned it (conformed 41..41 with presentLastFrame)
     ASSERT_TRUE( advanceDropFrameTick( 10.0, 0.0, 41, 41, true, true ).correctedStart == 40.0 );
 }
+
+// r3 iteration 1 (adversary pass 6 A1 on f8d80862): a zero-width Loop cut has no lap. A correction with nothing applied records no
+// lap (10 + 0 on cut 41..41 corrected onto 40 recorded one zero-width lap, and MainWindow an engine wrap), and neither does any
+// tick on that cut: a zero-width lap moves nothing back, so the base's one per tick from 40 was never a wrap
+// (DROP-FRAME-ZERO-WIDTH-LOOP-STALE-LAP-1).
+TEST( PlaybackFrameRange, R3Iter1AZeroWidthLoopCutNeverLaps )
+{
+    using playback_frame_range::advanceDropFrameTick;
+    const playback_frame_range::DropFrameTickResult corrected = advanceDropFrameTick( 10.0, 0.0, 41, 41, true, false );
+    ASSERT_TRUE( corrected.corrected );
+    ASSERT_TRUE( corrected.position == 40.0 );
+    ASSERT_TRUE( corrected.appliedFrames == 0.0 );
+    ASSERT_EQ( 0, corrected.wrapLaps );                                  // f8d80862: 1
+    ASSERT_FALSE( corrected.wrapped );                                   // f8d80862: true
+    ASSERT_FALSE( playback_frame_range::dropFrameTickLapped( corrected ) );
+    const playback_frame_range::DropFrameTickResult stale = advanceDropFrameTick( 100.0, 0.192, 41, 41, true, false );
+    ASSERT_EQ( 0, stale.wrapLaps );                                      // f8d80862: 1
+    ASSERT_FALSE( stale.wrapped );
+    ASSERT_NEAR( 40.192, stale.position, 1e-12 );
+    ASSERT_NEAR( 0.192, stale.appliedFrames, 1e-12 );
+    const playback_frame_range::DropFrameTickResult onFrame = advanceDropFrameTick( 40.0, 0.192, 41, 41, true, false );
+    ASSERT_EQ( 0, onFrame.wrapLaps );                                    // 2a3371ff and f8d80862: 1
+    ASSERT_FALSE( onFrame.wrapped );
+    ASSERT_NEAR( 40.192, onFrame.position, 1e-12 );
+    // a width-1 cut still laps (control: conformed 41..41 from its one position 40 plus one frame)
+    const playback_frame_range::DropFrameTickResult one = advanceDropFrameTick( 40.0, 1.0, 41, 41, true, true );
+    ASSERT_EQ( 1, one.wrapLaps );
+    ASSERT_TRUE( one.position == 40.0 );
+}
