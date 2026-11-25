@@ -4986,3 +4986,29 @@ TEST( PlaybackFrameRange, R1Iter1AZeroLapFoldIsNotALapForTheTicksReaders )
     ASSERT_TRUE( playback_frame_range::dropFrameTickLapped( playback_frame_range::advanceDropFrameTick( 48.9, 0.192, 1, 50, true ) ) );
     ASSERT_FALSE( playback_frame_range::dropFrameTickLapped( playback_frame_range::advanceDropFrameTick( 10.0, 0.192, 1, 50, true ) ) );
 }
+
+// r1 iteration 2 (adversary pass 2 A2 on 7de55386, introduced major): 60 fps conformed to 25, Drop Frame and Loop on, stale position
+// 10.75, slider and displayed frame 10, no pending present or debt; Cut In raised to 41 (Cut Out 50); a 60 ms tick with 1.5 frames.
+// MainWindow's route: the conform shaping and its target gate read the start the delta moves from. From the corrected 40 the grant
+// crosses one integer, so it is applied whole: 41.5, no debt. 7de55386 shaped it from 10.75 (two integers: 0.5 now, 1.0 debt) and
+// the fold then landed on 40.5.
+TEST( PlaybackFrameRange, R1Iter2ConformShapesTheGrantFromTheCorrectedStart )
+{
+    const double stale = 10.75;
+    const double start = playback_frame_range::dropFrameCorrectedStart( stale, 41, 50, true, true );
+    ASSERT_TRUE( start == 40.0 );                                       // 7de55386 (MainWindow read m_newPosDropMode): 10.75
+    double debt = 0.0;
+    const bool shown = playback_frame_range::conformTargetShown( 10, 10, start, false, false );
+    ASSERT_TRUE( shown );
+    const double delta = playback_frame_range::conformDropFrameDelta( start, 1.5, true, debt, shown );
+    const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick( stale, delta, 41, 50, true, true );
+    ASSERT_TRUE( tick.corrected );
+    ASSERT_TRUE( tick.correctedStart == start );
+    ASSERT_NEAR( 41.5, tick.position, 1e-12 );                          // 7de55386: 40.5
+    ASSERT_NEAR( 0.0, debt, 1e-12 );                                    // 7de55386: 1.0
+    // the helper is the tick's own corrected start for every kind: above-cut fold, clamp, in-cut and NaN
+    ASSERT_TRUE( playback_frame_range::dropFrameCorrectedStart( 120.0, 1, 50, true, false ) == 22.0 );
+    ASSERT_TRUE( playback_frame_range::dropFrameCorrectedStart( 100.0, 1, 50, false, false ) == 49.0 );
+    ASSERT_TRUE( playback_frame_range::dropFrameCorrectedStart( 10.5, 1, 50, true, false ) == 10.5 );
+    ASSERT_TRUE( std::isnan( playback_frame_range::dropFrameCorrectedStart( std::nan( "" ), 1, 50, true, false ) ) );
+}

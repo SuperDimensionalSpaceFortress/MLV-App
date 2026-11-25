@@ -158,17 +158,26 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
 {
     const QString body = playbackHandlingBody(mainWindowSource());
     ASSERT_FALSE(body.isEmpty());
+    // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1 iteration 2 (adversary pass 2 A2 on 7de55386): the conform shaping and its target
+    // gate read the CORRECTED start (dropFrameCorrectedStart), the position the delta moves from; the tick still reads the stale
+    // position, so it reports (and MainWindow records) the correction
     const QString call = QStringLiteral(
         "playback_frame_range::advanceDropFrameTick(\n"
         "                        m_newPosDropMode,\n"
         "                        playback_frame_range::conformDropFrameDelta(\n"
-        "                            m_newPosDropMode,\n"
+        "                            dropFrameStart,\n"
         "                            m_playbackPaceGuard.grant( playback_fps_meter::dropFrameRequestFrames( getPlaybackFramerate(), timeDiff ), paceNowMs, playbackPaceGuardFps() ),\n"
         "                            playbackConformActive(), m_conformDropDebtFrames,\n"
         "                            playback_frame_range::conformTargetShown(\n"
-        "                                m_lastPresentedPlaybackFrame, conformDisplayedPlaybackFrame(), m_newPosDropMode,\n"
+        "                                m_lastPresentedPlaybackFrame, conformDisplayedPlaybackFrame(), dropFrameStart,\n"
         "                                conformAcceptedTargetPresentPending(), conformTargetPresentOutstanding() ) ),");
     ASSERT_EQ(1, countOccurrences(body, call));
+    const int startAt = body.indexOf(QStringLiteral(
+        "const double dropFrameStart = playback_frame_range::dropFrameCorrectedStart(\n"
+        "                    m_newPosDropMode, ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(), ui->actionLoop->isChecked(),\n"
+        "                    playbackConformActive() );"));
+    ASSERT_TRUE(startAt >= 0);
+    ASSERT_TRUE(body.indexOf(call) > startAt);
     // r32 (adversary A1 on 2e0a3985): under conform a Loop wrap waits until the cut's last frame was presented
     // (advanceDropFrameTick's presentLastFrame; PlaybackConformDropFrame.R32* pin the arithmetic)
     ASSERT_EQ(1, countOccurrences(body, QStringLiteral(

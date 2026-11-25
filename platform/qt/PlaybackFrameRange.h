@@ -312,6 +312,20 @@ inline bool dropFrameTickLapped( const DropFrameTickResult & tick )
     return tick.wrapLaps > 0;   // every lap branch sets wrapped with wrapLaps >= 1; only the fold sets it with none
 }
 
+// r1 iteration 2 (adversary pass 2 A2 on 7de55386, introduced major): the start the coming tick's delta will be applied from,
+// computed before the delta is shaped. Conform's whole-frame shaping (conformDropFrameDelta) and its target gate
+// (conformTargetShown) read the position the delta moves FROM, so they must read the corrected start, never the stale one:
+// conformed 60 -> 25, Loop, cut 41..50, stale 10.75, 1.5 frames granted was shaped from 10.75 (two integers crossed: delta 0.5,
+// debt 1.0) and landed on 40.5, where from 40 it crosses one integer and lands on 41.5 with no debt.
+inline DropFrameTickResult advanceDropFrameTick( double currentPosition, double frameDelta, int cutInValue, int cutOutValue,
+                                                 bool loopEnabled, bool presentLastFrame );
+inline double dropFrameCorrectedStart( double currentPosition, int cutInValue, int cutOutValue, bool loopEnabled,
+                                       bool presentLastFrame )
+{
+    (void)cutInValue; (void)cutOutValue; (void)loopEnabled; (void)presentLastFrame;
+    return currentPosition;   // RED stub: today's reading (the stale start)
+}
+
 // r1: the frame a corrected start sits on (the slider's frame for it), floor, held inside int; not a number reads 0.
 inline int dropFrameCorrectionFrame( double position )
 {
