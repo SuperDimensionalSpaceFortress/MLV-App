@@ -852,7 +852,8 @@ class SharedReaderGapTests(EvidenceFactory, unittest.TestCase):
     def test_every_reader_gates_figures_on_the_validator_status(self) -> None:
         dv = ROOT / "tools" / "profiling" / "dual-venue"
         baseline = (dv / "Invoke-VenueBaseline.ps1").read_text(encoding="utf-8")
-        self.assertIn("else { Test-DvReceiptValid -Receipt $rc -RepoRoot $repo }", baseline)
+        # VENUE-LEG-DISPLAY-PATH-RECEIPT-1-SUCCESSOR-3 W3: the call also hands the validator the receipt's text (its duplicate-key check)
+        self.assertIn("else { Test-DvReceiptValid -Receipt $rc -RepoRoot $repo -ReceiptText $rcText }", baseline)
         self.assertIn("if ($f.verification.status -cnotin @('ADVISORY', 'NO_SIGNAL', 'VERIFIED', 'VERIFIED_OFFLINE_TEST')) { $f.rejected = $f.verification.status; return $f }", baseline)
         for name in ("New-VenueSheetPair.ps1", "New-VenueFlavorPair.ps1"):
             text = (dv / name).read_text(encoding="utf-8")
