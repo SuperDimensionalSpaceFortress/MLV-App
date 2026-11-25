@@ -698,6 +698,39 @@ class HelperBehaviourTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertTrue((out / "ffmpeg.exe").is_file())
 
+    def _run_behind_banner_shim(self, name: str, shim_body: bytes, eol: bytes) -> tuple[dict, Path]:
+        # A py.exe shim below the wrapper's environment scrub prints one banner line (LF or CRLF) to the child's stdout, as a printing
+        # sitecustomize would, then runs the real launcher with the wrapper's own arguments (or, for the control, nothing at all).
+        banner = self.tmp / f"{name}-banner.py"
+        banner.write_text(f"import sys\nsys.stdout.buffer.write(b'site ready' + {eol!r})\n", encoding="ascii")
+        shim = self.tmp / f"{name}-shim.cmd"
+        shim.write_bytes(shim_body)
+        prelude = (
+            "function global:Get-Command { param([string]$Name, [string]$CommandType, $ErrorAction)\n"
+            "  if ($Name -eq 'py.exe') { return [pscustomobject]@{ Source = $env:FFX_SHIM } }\n"
+            "  Microsoft.PowerShell.Core\\Get-Command @PSBoundParameters\n"
+            "}\n"
+        )
+        out = self.tmp / f"{name}-out"
+        out.mkdir()
+        return self._run(str(out), extra_env={"FFX_SHIM": str(shim), "FFX_BANNER": str(banner)}, prelude=prelude), out
+
+    def test_startup_output_ahead_of_the_report_never_refuses_a_finished_install(self) -> None:
+        # PR 862 r17 (sol r16 A3 residual): a runtime configured with `import site` in its python314._pth runs a printing sitecustomize
+        # even under -S, so startup text precedes the extractor's JSON report after the install committed. The wrapper parsed the whole
+        # stdout and refused a finished install (build-release exit 9, assembler exit 28). Only the trailing top-level JSON object is
+        # parsed now, for LF and CRLF startup text alike. Controls: stdout with no JSON at all still refuses.
+        run_real = b'@echo off\r\npy.exe -3 -S "%FFX_BANNER%"\r\npy.exe %*\r\nexit /b %ERRORLEVEL%\r\n'
+        for label, eol in (("lf", b"\n"), ("crlf", b"\r\n")):  # real line-ending bytes
+            with self.subTest(startup_text=label):
+                result, out = self._run_behind_banner_shim(label, run_real, eol)
+                self.assertTrue(result["ok"], result)
+                self.assertTrue((out / "ffmpeg.exe").is_file())
+        with self.subTest(control="no JSON on stdout"):
+            result, _ = self._run_behind_banner_shim("nojson", b'@echo off\r\npy.exe -3 -S "%FFX_BANNER%"\r\nexit /b 0\r\n', b"\n")
+            self.assertFalse(result["ok"], result)
+            self.assertIn("printed no JSON report", result["reason"])
+
     def test_the_output_folder_stays_held_while_the_installed_files_are_re_read(self) -> None:
         # PR 862 r11 (adversary e9d903be-A2): the output pin was released before the wrapper parsed the report and re-read the installed
         # files by pathname, so the folder could be renamed and replaced in between (an empty one refused a completed install; one with

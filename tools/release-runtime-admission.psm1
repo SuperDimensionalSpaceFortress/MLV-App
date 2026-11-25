@@ -592,7 +592,17 @@ function Invoke-PinnedPayloadInstall {
         return [pscustomobject]$result
     }
     try {
-        $report = $result.stdout | ConvertFrom-Json -ErrorAction Stop
+        # PR 862 r17 (sol r16 A3 residual): -S does not stop a runtime whose python314._pth says `import site` from running a printing
+        # sitecustomize, so startup output can precede the report on stdout. The extractor prints json.dumps(result, indent=2), whose
+        # top-level `{` is the LAST line that is exactly `{` at column 0 (nested braces are indented). Only that slice, to the end of
+        # stdout, is parsed; no such line, or a slice that is not ONE object, still refuses. LF and CRLF both split.
+        $stdoutLines = @(([string]$result.stdout) -split "`r?`n")
+        $reportStart = -1
+        for ($lineIndex = $stdoutLines.Count - 1; $lineIndex -ge 0; $lineIndex--) {
+            if ($stdoutLines[$lineIndex] -ceq '{') { $reportStart = $lineIndex; break }
+        }
+        if ($reportStart -lt 0) { throw 'no line that is exactly "{" at column 0 starts a JSON report' }
+        $report = (($stdoutLines[$reportStart..($stdoutLines.Count - 1)]) -join "`n").Trim() | ConvertFrom-Json -ErrorAction Stop
     } catch {
         $result.reason = "the extractor exited 0 but printed no JSON report: $($_.Exception.Message)"
         return [pscustomobject]$result
