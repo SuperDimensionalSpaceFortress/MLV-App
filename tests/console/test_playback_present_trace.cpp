@@ -360,6 +360,35 @@ TEST(PlaybackPresentTrace, AFoldedStartsGrantIsTheAppliedDeltaNotAReconstruction
     ASSERT_TRUE(trace.rows()[0].advancedFrames == tiny);
 }
 
+// r8 iteration 2 (adversary pass 15 A1 on 437108e0, introduced major): the delta is not the travel when the position cannot
+// hold it. 120 fps clip conformed at 100 fps, cut 1..2048, Drop Frame on, Loop off, position 1024, a held target: the
+// conform grants 2.1, 2.2, 1.9 and 1.8 total 8.000000000000002, so the fourth tick hands the engine a residue of
+// 1.7763568394002505e-15, and 1024 plus it is 1024. 437108e0 reported the residue as applied and the trace logged an
+// advance (moving last_adv and last_tick_diff); the base read 0. A tick that did not move the position applied nothing.
+TEST(PlaybackPresentTrace, AResidueThePositionCannotHoldIsNotAnAdvance)
+{
+    const double residue = 2.1 + 2.2 + 1.9 + 1.8 - 8.0;
+    ASSERT_TRUE(residue == 1.7763568394002505e-15);
+    const playback_frame_range::DropFrameTickResult tick =
+        playback_frame_range::advanceDropFrameTick(1024.0, residue, 1, 2048, false, true);
+    ASSERT_TRUE(tick.position == 1024.0);
+    ASSERT_FALSE(tick.wrapped);
+    ASSERT_TRUE(tick.appliedFrames == 0.0);
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(1000.0, 4);
+    trace.noteTick(1008.0, false, false);
+    trace.noteAdvance(1008.5, 1.0, 21);   // a real advance first
+    trace.noteTick(1016.0, false, false);
+    trace.noteAdvance(1016.5, mainWindowGrantedDropFrames(tick, 1024.0), 18);
+    Row r;
+    r.presentMs = 1020.0;
+    trace.notePresent(r);
+    ASSERT_EQ(1, trace.rows()[0].advances);
+    ASSERT_NEAR(8.5, trace.rows()[0].lastAdvanceMs, 1e-9);
+    ASSERT_NEAR(21.0, trace.rows()[0].lastTickDiffMs, 0.0);
+}
+
 TEST(PlaybackPresentTrace, ARowHasOneFieldPerHeaderColumn)
 {
     Recorder trace;
@@ -453,4 +482,10 @@ TEST(PlaybackPresentTraceWiring, TheDropFrameGrantIsTheTicksAppliedDelta)
     ASSERT_EQ(1, source.count(QStringLiteral(
         "                const double grantedDropFrames = dropFrameTick.appliedFrames;\n")));
     ASSERT_FALSE(source.contains(QStringLiteral("dropFrameTick.position - sourcePositionBeforeDropTick")));
+    // r8 iteration 2 (pass 15 A3 on 437108e0): the store is pinned to the grant statement above it, so an `if( false )`
+    // line inserted before the comment (an unbraced dead guard) breaks the pin
+    ASSERT_EQ(1, source.count(QStringLiteral(
+        "                const double grantedDropFrames = dropFrameTick.appliedFrames;\n"
+        "                // r7 (sol r6 on 9f3f5ebd): the present trace's advance, including whole laps that land back on the start\n"
+        "                m_playbackTickAppliedFrames = grantedDropFrames;\n")));
 }
