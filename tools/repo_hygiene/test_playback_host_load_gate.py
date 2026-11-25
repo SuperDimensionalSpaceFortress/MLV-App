@@ -2603,7 +2603,15 @@ class HostLoadReaderPredicateCensusTests(unittest.TestCase):
         "run-ultramagnus-p3-validation.ps1": P3_VALIDATION_SCRIPT,
         "summarize-local-cuda-proof.ps1": CUDA_PROOF_SUMMARIZER_SCRIPT,
     }
-    EXPECTED_SITE_COUNT = 6
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (sol r5 B1): compare-release-gui-smoke-ab.ps1 no longer defines its own predicate; it judges each block with
+    # VenueChain.psm1's ConvertFrom-VenueSmokeHostLoad (the stricter venue rule: collected snapshots too). Five sites remain; the comparator stays in the
+    # scanned set, so a loose predicate re-added there makes the count six and fails here (test_the_gui_ab_comparator_defines_no_predicate_of_its_own).
+    EXPECTED_SITE_COUNT = 5
+
+    def test_the_gui_ab_comparator_defines_no_predicate_of_its_own(self) -> None:
+        code_only = self._strip_comments(COMPARE_SCRIPT.read_text(encoding="utf-8"))
+        self.assertEqual(self._LOOSE_LOCATOR_PATTERN.findall(code_only), [])
+        self.assertIn("ConvertFrom-VenueSmokeHostLoad -HostLoad $legHostLoad", code_only)
 
     # A predicate-DEFINING line: mentions a provisional-named identifier, an "-or", and an
     # "-eq"/"-ne" comparison against one of the three host-load state literals, all on the same
