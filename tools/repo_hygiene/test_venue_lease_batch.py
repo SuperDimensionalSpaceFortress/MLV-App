@@ -428,6 +428,8 @@ $jobId = "dve-$leaf-$Venue-cpu-2026102300000$k$(if ($LeaseBatch) { "-lb$LeaseBat
 # BATCH-3 r5 (sol r4 B2): FAKE_LEG_MODES specrefused | specunreadable | specrefusedhang = the real leg's own typed refusal (Invoke-VenueLeg.ps1: the anchored STDOUT record for
 # the planned hash it was handed) BEFORE any job id, submission or receipt; exit 6 (specrefusedhang: the record, then still running at the lease's end)
 $specMode = Pick $env:FAKE_LEG_MODES $k 'ok'
+# BATCH-3 r8 (adversary r7 A4): FAKE_LEG_LINK_OUT '<name>|<target>' = while the FIRST leg child runs (after the batch's pre-launch guard), its transcript name becomes a hard link to target
+if ($env:FAKE_LEG_LINK_OUT -and $k -eq 0) { $ln = $env:FAKE_LEG_LINK_OUT -split '\|', 2; $null = New-Item -ItemType HardLink -Path $ln[0] -Target $ln[1] }
 if ($specMode -eq 'specrefused') { [Console]::Out.WriteLine("DVE_LEG_SPEC_REFUSED planned_sha256=$ExpectSpecSha256 read_sha256=$('b' * 64)"); [Console]::Out.Flush(); exit 6 }
 if ($specMode -eq 'specunreadable') { [Console]::Out.WriteLine("DVE_LEG_SPEC_UNREADABLE planned_sha256=$ExpectSpecSha256"); [Console]::Out.Flush(); exit 6 }
 # r5 (adversary pass 6 A5): the record on stdout with a receipt line that names none: on stderr only, or blank on stdout
@@ -9444,6 +9446,68 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         r, planned = self.b3r5_batch_refusal_run("specrefusedhang", FAKE_LEASE_REMAIN="72")
         self.assert_b3r5_batch_row_typed(r, planned, "LEASE_EXPIRED", "DVE_BATCH_SPEC_CHANGED")
 
+    def test_planned_hash_bind_b3_r8_a1_an_inherited_start_bound_default_never_turns_a_leg_never_started_into_lease_expired(self) -> None:
+        # BATCH-3 r8 (adversary r7 A1, json input): a session whose $PSDefaultParameterValues names 'Invoke-VenueBoundedProcess:StartNotAfterUtc' (2000-01-01) runs the REAL runner on
+        # a quiet two-leg CPU plan. The leg launch passes no start bound, so the inherited default bound it: the helper started no child (notStarted + timedOut) and the batch
+        # removed the leg as LEASE_EXPIRED, exit 7 (old). The runner shadows the caller's defaults: both legs run, exit 0, nothing reads LEASE_EXPIRED.
+        a = self.commit_a
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", a), self.item(self.specs[1], "A", a)]))
+        i = args.index("-File")
+        call = " ".join(x if re.fullmatch(r"-[A-Za-z]\w*", x) else "'" + psq(x) + "'" for x in args[i + 2:])
+        ps = ("$PSDefaultParameterValues['Invoke-VenueBoundedProcess:StartNotAfterUtc'] = [datetime]::new(2000, 1, 1, 0, 0, 0, [DateTimeKind]::Utc); "
+              f"& '{psq(args[i + 1])}' {call}; exit $LASTEXITCODE")
+        r = subprocess.run([*args[:i], "-Command", ps], capture_output=True, text=True, timeout=600, env=e)
+        self.assertEqual(r.returncode, 0, "an inherited start bound consumed a leg (old: LEASE_EXPIRED, exit 7)\n" + r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual([(l["name"], l["status"]) for l in res["legs"]], [("01-fx-a-cpu-A", "RAN"), ("02-fx-b-cpu-A", "RAN")], res["legs"])
+        self.assertEqual(len(self.leg_calls()), 2, "both legs' children ran")
+        self.assertNotIn("LEASE_EXPIRED", r.stdout)
+
+    def test_planned_hash_bind_b3_r8_a1_a_launch_that_started_no_child_is_never_lease_expired(self) -> None:
+        # the defence behind the shadowing: a bounded launch that reports .notStarted (whatever bound refused it) leaves the leg pending, never LEASE_EXPIRED or in flight
+        text = RUNNER.read_text(encoding="utf-8")
+        launch = text.index("try { $lp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $lArgs -TimeoutSec $legBoundSec } catch {")
+        guard = text.index("if ($lp.notStarted) {", launch)
+        self.assertLess(guard, text.index("if ($lp.timedOut) {", launch), "the notStarted check comes before the LEASE_EXPIRED branch")
+        body = text[guard:text.index("break", guard)]
+        self.assertIn("$inFlightLeg = $null", body)
+        self.assertNotIn("$pending.RemoveAt", body)
+        self.assertIn("$PSDefaultParameterValues = @{}", text[:text.index("$here = $PSScriptRoot")])
+        chain = (DV / "Invoke-VenueChain.ps1").read_text(encoding="utf-8")
+        self.assertIn("$PSDefaultParameterValues = @{}", chain[:chain.index("$here = $PSScriptRoot")], "the chain runner (A1 siblings :513 :708) shadows them too")
+
+    def test_planned_hash_bind_b3_r8_a4_a_refusal_reaches_stdout_when_the_transcript_name_became_another_accepted_input(self) -> None:
+        # BATCH-3 r8 (adversary r7 A4, json input): two valid CPU items; while the first leg child runs (it refuses its spec, exit 6) its transcript name becomes another name for
+        # the accepted fx-b spec. The post-child guard refuses the write and turns the suppression on, so LogBest said the typed refusal on stderr ONLY (old). It reaches stdout
+        # exactly once, the row carries it, and fx-b's bytes are untouched.
+        import hashlib
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        out = self.run_dir / "leg-01-fx-a-cpu-A-b01-a1.out.txt"
+        before = self.specs[1].read_bytes()
+        planned = hashlib.sha256(self.specs[0].read_bytes()).hexdigest()
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a), self.item(self.specs[1], "A", self.commit_a)]),
+                          FAKE_LEG_MODES="specrefused,ok", FAKE_LEG_LINK_OUT=f"{out}|{self.specs[1]}")
+        self.assertTrue(out.exists(), "the fixture made the transcript name a link\n" + r.stdout + r.stderr)
+        typed = [l for l in r.stdout.splitlines() if " DVE_BATCH_SPEC_CHANGED " in l]
+        self.assertEqual(len(typed), 1, "the typed refusal never reached stdout (old: stderr only, through the suppressed log)\nSTDOUT:\n" + r.stdout + "\nSTDERR:\n" + r.stderr)
+        self.assertIn(f" DVE_BATCH_SPEC_CHANGED leg=01-fx-a-cpu-A planned_sha256={planned}", typed[0])
+        self.assertEqual(self.specs[1].read_bytes(), before, "the accepted fx-b spec was written through its other name")
+        res = batch_result(r.stdout)
+        self.assertEqual([(l["name"], l.get("specRefusal")) for l in res["legs"]][:1], [("01-fx-a-cpu-A", "DVE_BATCH_SPEC_CHANGED")], res["legs"])
+
+    def test_planned_hash_bind_b3_r8_a2_the_transcript_worker_writes_only_through_the_handle_it_created(self) -> None:
+        # BATCH-3 r8 (adversary r7 A2, blocker): after CreateNew and Dispose, WriteAllText reopened the fresh name BY NAME, so a hard link made there in between to an accepted spec
+        # was opened and overwritten. The worker now opens its name ONCE (CreateNew) and writes through that handle; nothing in it reopens a name.
+        text = RUNNER.read_text(encoding="utf-8")
+        line = next(l for l in text.splitlines() if "$owr = try {" in l and ".b2r2-" in l)
+        worker = re.search(r"'(param\(\$a\) \$final(?:[^']|'')*)'", line).group(1)
+        for reopen in ("WriteAllText", "WriteAllBytes", "AppendAllText", "OpenWrite", "Set-Content", "Out-File", "Add-Content", "[IO.FileMode]::Create,", "[IO.FileMode]::Open", "OpenOrCreate", "Truncate"):
+            self.assertNotIn(reopen, worker, f"the transcript worker reopens a name ({reopen})")
+        self.assertEqual(worker.count("[IO.File]::Open("), 1, worker)
+        self.assertIn("[IO.File]::Open($out, [IO.FileMode]::CreateNew,", worker)
+        self.assertIn("$fs.Write($bytes, 0, $bytes.Length)", worker)
+        self.assertLess(worker.index("$fs.Write("), worker.index("$fs.Dispose()"), "the bytes go through the CreateNew handle before it is closed")
+
     def test_r5_adv_a2_a_staged_build_the_leg_job_would_reject_is_refused_before_the_claim_and_the_lease(self) -> None:
         # adversary r5 A2: preflight read the staged manifest's sha256 only. The leg job's validator (Assert-AttrCudaBuildManifest) also needs the manifest to declare
         # the same sourceCommit, a well-formed dllPairManifestSha256 and a boolean pendingSymbolPresence, so a hash-matching manifest that fails any of them opened a lease first.
@@ -10906,6 +10970,139 @@ class LeaseEndUtcTimezoneTests(unittest.TestCase):
         for shape in ("null", "garbage", "number", "array"):
             with self.subTest(shape=shape):
                 self.assertIsNone(got[shape], f"{shape} is no instant: {got}")
+
+
+def _b3r8_type_source(class_name: str) -> str:
+    """The C# source of one runner type, lifted from the runner's own Add-Type here-string, so the test runs exactly what the runner compiles."""
+    text = RUNNER.read_text(encoding="utf-8")
+    at = text.index(f"public static class {class_name} {{")
+    start = text.rindex("Add-Type -TypeDefinition @'\n", 0, at) + len("Add-Type -TypeDefinition @'\n")
+    return text[start:text.index("\n'@", at)]
+
+
+_B3R8_STEPPER = r"""
+public static class B3R8Step {
+    // sets the named type's TestUtcStepTicks after ms on a pool thread: a wall-clock step in the middle of a bounded read
+    public static System.Threading.Tasks.Task Later(int ms, System.Type t, long ticks) {
+        return System.Threading.Tasks.Task.Run(() => { System.Threading.Thread.Sleep(ms); t.GetField("TestUtcStepTicks").SetValue(null, ticks); });
+    }
+}
+"""
+
+
+@requires_windows_pwsh
+class PlannedHashBindB3R8BoundedWaitTests(unittest.TestCase):
+    """DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r8: a bounded wait never acts on an answer seen after its bound (adversary r7 A5), and a bounded preflight read is held on the
+    Stopwatch, so a wall clock stepped back cannot widen it (A3). Each case runs the code the runner or module ships, with a test-only seam."""
+
+    def setUp(self) -> None:
+        self.case = Path(tempfile.mkdtemp(prefix="b3r8-"))
+        self.addCleanup(shutil.rmtree, self.case, True)
+
+    def test_planned_hash_bind_b3_r8_a5_an_answer_seen_after_the_relative_bound_is_never_acted_on(self) -> None:
+        # json input: TimeoutSec 1, the worker finds its answer at 1.10 s, and the parent resumes after its final wait expired. IsCompleted was then true and the answer was acted
+        # on (old: answered True, FOUND); only -Clock was asked after it. The parent's pause is the fixture line placed right after the wait loop.
+        anchor = "        if (-not $async.IsCompleted) {\n            $abandoned = $true\n            $script:VenueAbandonedReads++"
+        text = MODULE.read_text(encoding="utf-8")
+        self.assertEqual(text.count(anchor), 1, "A5 anchor moved")
+        mod = copy_with_siblings(MODULE, self.case / "dv", text=text.replace(anchor, "        if ($env:DVT_B3R8_POSTWAIT_MS) { [Threading.Thread]::Sleep([int]$env:DVT_B3R8_POSTWAIT_MS) }   # TEST FIXTURE\n" + anchor))
+        script = (f"Import-Module '{psq(mod)}' -Force -DisableNameChecking\n"
+                  "$late = & (Get-Module VenueChain) { Invoke-VenueBoundedRead -ScriptText 'Start-Sleep -Milliseconds 1100; \"FOUND\"' -Argument 1 -TimeoutSec 1 }\n"
+                  "\"A5 $($late.answered) [$(@($late.value) -join ',')] $($late.error)\"\n")
+        e = dict(os.environ, DVT_B3R8_POSTWAIT_MS="1500")
+        got = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120, env=e)
+        line = [l for l in got.stdout.splitlines() if l.startswith("A5 ")]
+        self.assertEqual(len(line), 1, got.stdout + got.stderr)
+        self.assertTrue(line[0].startswith("A5 False []"), "an answer seen after the 1 s bound was acted on (old: A5 True [FOUND])\n" + line[0])
+        self.assertIn("after the 1 s bound is never acted on", line[0])
+        # control: the same module, no pause, an answer inside the bound is acted on
+        ctl = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script.replace("Start-Sleep -Milliseconds 1100; ", "")], capture_output=True, text=True, timeout=120)
+        self.assertIn("A5 True [FOUND]", ctl.stdout, ctl.stdout + ctl.stderr)
+
+    def test_planned_hash_bind_b3_r8_a5_every_batch_wait_loop_judges_its_answer_once_after_the_wait(self) -> None:
+        # the siblings with a loop of their own (:752 :900 :1000 :1121): IsCompleted is read ONCE after the wait and an answer seen past the end is refused; the claim request's
+        # worker judges its grant against the wait's Stopwatch end, so a grant decided after it is released, never used
+        text = RUNNER.read_text(encoding="utf-8")
+        for marker in ("$hDone = $h.IsCompleted", "$relDone = $async.IsCompleted", "$guardDone = $async.IsCompleted"):
+            self.assertEqual(text.count(marker), 1, marker)
+        self.assertIn("[Diagnostics.Stopwatch]::GetTimestamp() -ge [long]$A.waitEndTs", text)
+        self.assertIn("waitEndTs = $reqEndTs", text)
+
+    def _a3_probe(self, read: str) -> list[str]:
+        (self.case / "types.cs").write_text(_b3r8_type_source("VenueLeaseBatchFinalPath"), encoding="utf-8")
+        (self.case / "types-r4.cs").write_text(_b3r8_type_source("VenueLeaseBatchBoundedReadR4"), encoding="utf-8")
+        (self.case / "step.cs").write_text(_B3R8_STEPPER, encoding="utf-8")
+        spec = self.case / "fx-a.json"
+        spec.write_text('{"legId": "fx-a"}', encoding="utf-8")
+        script = self.case / "a3.ps1"
+        script.write_text(
+            f"Add-Type -TypeDefinition ([IO.File]::ReadAllText('{psq(self.case / 'types.cs')}'))\n"
+            f"Add-Type -TypeDefinition ([IO.File]::ReadAllText('{psq(self.case / 'types-r4.cs')}'))\n"
+            f"Add-Type -TypeDefinition ([IO.File]::ReadAllText('{psq(self.case / 'step.cs')}'))\n"
+            f"$path = '{psq(spec)}'\n" + read, encoding="utf-8")
+        got = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=120)
+        self.assertEqual(got.returncode, 0, got.stdout + got.stderr)
+        return [l for l in got.stdout.splitlines() if l.startswith("A3")]
+
+    def test_planned_hash_bind_b3_r8_a3_a_wall_clock_stepped_back_never_widens_the_bounded_spec_read(self) -> None:
+        # json input: the read's end is 1 s away, the read takes 1.5 s, and 0.3 s in the wall clock steps back 10 s. On the wall clock alone the read then had 11 s and
+        # answered OK past its original allowance (old); on the Stopwatch it ends at its 1 s: TIMEOUT.
+        lines = self._a3_probe(
+            "$b = $null; $k = $null; $e = $null; $sw = [Diagnostics.Stopwatch]::StartNew()\n"
+            "$step = [B3R8Step]::Later(300, [VenueLeaseBatchBoundedReadR4], -100000000L)\n"
+            "$rc = [VenueLeaseBatchBoundedReadR4]::ReadUntil($path, 1500, [DateTime]::UtcNow.AddMilliseconds(1000).Ticks, [ref]$b, [ref]$k, [ref]$e)\n"
+            "$null = $step.Wait(5000)\n"
+            "\"A3READ $rc $([int]$sw.ElapsedMilliseconds) step=$([VenueLeaseBatchBoundedReadR4]::TestUtcStepTicks)\"\n")
+        self.assertEqual(len(lines), 1, lines)
+        rc, ms, step = lines[0].split()[1:]
+        self.assertEqual(step, "step=-100000000", "the wall-clock step really happened (old: no seam, no Stopwatch end)")
+        self.assertEqual(rc, "2", f"a read past its 1 s allowance answered after a backward wall-clock step (old: 0 = OK): {lines[0]}")
+        self.assertLess(int(ms), 1450, f"the wait outran its 1 s end: {lines[0]}")
+
+    def test_planned_hash_bind_b3_r8_a3_a_wall_clock_stepped_back_never_widens_the_location_read(self) -> None:
+        # the same input for the location worker (LocateUntil, :515 :527): no answer past the Stopwatch end, and the end is asked again between its two opens
+        lines = self._a3_probe(
+            "$p = $null; $key = $null\n"
+            "$step = [B3R8Step]::Later(300, [VenueLeaseBatchFinalPath], -100000000L)\n"
+            "$ok = [VenueLeaseBatchFinalPath]::LocateUntil($path, 1500, [DateTime]::UtcNow.AddMilliseconds(1000).Ticks, [ref]$p, [ref]$key)\n"
+            "$null = $step.Wait(5000)\n"
+            "\"A3LOC $ok step=$([VenueLeaseBatchFinalPath]::TestUtcStepTicks)\"\n")
+        self.assertEqual(lines, ["A3LOC False step=-100000000"], "a location read past its end answered after a backward wall-clock step (old: True)")
+        src = _b3r8_type_source("VenueLeaseBatchFinalPath")
+        body = src[src.index("StartLocate(string path, int delayMs, long endUtcTicks, long monoEnd)"):]
+        self.assertLess(body.index("Identity(path, out l)"), body.index('"the end passed before the second open"'))
+        self.assertLess(body.index('"the end passed before the second open"'), body.index("Resolve(path)"), "no second open once the end passed")
+
+
+@unittest.skipIf(PWSH is None or sys.platform == "win32", "needs pwsh off Windows (POSIX reparenting)")
+class PlannedHashBindB3R8PosixKillTests(unittest.TestCase):
+    """DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r8 (adversary r7 A6): killConfirmed on a timed-out child proves its tree gone. Off Windows a root that exited before any kill
+    leaves a reparented descendant Kill($true) cannot find."""
+
+    def test_planned_hash_bind_b3_r8_a6_a_reparented_posix_grandchild_never_reads_kill_confirmed(self) -> None:
+        case = Path(tempfile.mkdtemp(prefix="b3r8-a6-"))
+        self.addCleanup(shutil.rmtree, case, True)
+        anchor = "    $timedOut = [bool]$lateStart\n"
+        text = MODULE.read_text(encoding="utf-8")
+        self.assertEqual(text.count(anchor), 1, "A6 anchor moved")
+        mod = copy_with_siblings(MODULE, case / "dv", text=text.replace(anchor, "    if ($env:DVT_B3R8_PREWAIT_MS) { Start-Sleep -Milliseconds ([int]$env:DVT_B3R8_PREWAIT_MS) }   # TEST FIXTURE\n" + anchor))
+        pidf = case / "orphan.pid"
+        probe = case / "a6.ps1"
+        probe.write_text(
+            f"Import-Module '{psq(mod)}' -Force -DisableNameChecking\n"
+            f"$r = Invoke-VenueBoundedProcess -FilePath '/bin/sh' -ArgumentList @('-c', 'sleep 60 </dev/null >/dev/null 2>&1 & echo $! > \"{pidf}\"; sleep 2') -TimeoutSec 1 -CleanupWaitMs 100\n"
+            f"$opid = [int]([IO.File]::ReadAllText('{psq(pidf)}').Trim())\n"
+            "$alive = $null -ne (Get-Process -Id $opid -ErrorAction Ignore)\n"
+            "\"A6 $($r.timedOut) $($r.killConfirmed) $alive\"\n"
+            "if ($alive) { Stop-Process -Id $opid -Force -ErrorAction Ignore }\n", encoding="utf-8")
+        got = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], capture_output=True, text=True, timeout=120,
+                             env=dict(os.environ, DVT_B3R8_PREWAIT_MS="3000"))
+        line = [l for l in got.stdout.splitlines() if l.startswith("A6 ")]
+        self.assertEqual(len(line), 1, got.stdout + got.stderr)
+        timed_out, confirmed, alive = line[0].split()[1:]
+        self.assertEqual(timed_out, "True", line[0])
+        self.assertFalse(confirmed == "True" and alive == "True", f"killConfirmed with a reparented grandchild alive (old: True True): {line[0]}")
+        self.assertEqual(confirmed, "False", line[0])
 
 
 if __name__ == "__main__":

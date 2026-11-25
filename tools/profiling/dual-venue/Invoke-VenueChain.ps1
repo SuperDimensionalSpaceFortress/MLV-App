@@ -116,6 +116,10 @@ $ErrorActionPreference = 'Stop'
 # leg's or quiet probe's documented non-zero exit (a spec refusal, exit 6) into a terminating error before the typed result and the next leg. The raw launches below read
 # $LASTEXITCODE themselves, as Invoke-VenueLeg's matrix walk does.
 $PSNativeCommandUseErrorActionPreference = $false
+# BATCH-3 r8 (adversary r7 A1 siblings :513 :708): a caller's $PSDefaultParameterValues is inherited by `& script`; an entry naming one of Invoke-VenueBoundedProcess's bounds
+# (StartNotAfterUtc, DeadlineUtc, MinRoomSec) bound the supplementary child's call that passes none, and a leg call's -MinRoomSec, so a child never started read as DEADLINE_NEAR.
+# Shadowed once, here, for every call this script and its functions make.
+$PSDefaultParameterValues = @{}
 $here = $PSScriptRoot
 # b3 r1 (adversary pass 5 A8 sibling on a73430b2): the VenueChain module object is bound once, here, as Invoke-VenueLeaseBatch.ps1 does; by name, `Get-Module VenueChain` answers
 # every same-name module in the session (-Force keeps one imported from another path) and `& (Get-Module VenueChain) { }` throws. A harness that lifts one function and never

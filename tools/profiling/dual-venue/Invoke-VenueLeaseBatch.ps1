@@ -262,6 +262,10 @@ $ErrorActionPreference = 'Stop'
 # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r2 (adversary A3 sibling): a caller's $PSNativeCommandUseErrorActionPreference = $true is inherited by `& script`; with Stop it would turn the
 # raw quiet launch's documented non-zero exits into a terminating error. Every raw launch here reads $LASTEXITCODE itself.
 $PSNativeCommandUseErrorActionPreference = $false
+# BATCH-3 r8 (adversary r7 A1): a caller's $PSDefaultParameterValues is inherited by `& script` too, and an entry naming a bound of ours
+# ('Invoke-VenueBoundedProcess:StartNotAfterUtc', ...:DeadlineUtc, ...:MinRoomSec) bound every call that does not pass it: a leg never started read as LEASE_EXPIRED (exit 7).
+# Shadowed once, here, for every call this script and its functions make (the r4 Add-Type clears below stay: they are the same rule, kept local to their compile).
+$PSDefaultParameterValues = @{}
 $here = $PSScriptRoot
 # b3 r1 (adversary pass 5 A8 on a73430b2): the VenueChain module object is bound once, here, and every call into its own scope goes through $script:VenueChainModule. By name,
 # `Get-Module VenueChain` answers EVERY same-name module in the session (-Force keeps one imported from another path, another worktree's copy), and `& ($script:VenueChainModule ?? (Get-Module VenueChain)) { }`
@@ -512,24 +516,43 @@ public static class VenueLeaseBatchFinalPath {
     }
     // DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r2 (adversary pass 3 A3 on 372d1bfd): the same read ended at ONE absolute instant (UTC ticks) instead of a relative allowance the
     // caller sampled earlier: it starts nothing at or past it, the task itself opens nothing once it passed (a queued task that runs late), and the wait is sliced (250 ms) against it.
-    static System.Threading.Tasks.Task<string[]> StartLocate(string path, int delayMs, long endUtcTicks) {
-        return System.Threading.Tasks.Task.Run(() => { if (DateTime.UtcNow.Ticks >= endUtcTicks) { throw new TimeoutException("the end passed before the read started"); } if (delayMs > 0) { System.Threading.Thread.Sleep(delayMs); } uint l; string k = Identity(path, out l); return new string[] { Resolve(path), k }; });
+    // BATCH-3 r8 (adversary r7 A3): that end is ALSO held on the Stopwatch, its room taken once when the call starts (MonoEnd), so a wall clock stepped back cannot widen the
+    // read or its wait; the end is asked again between the two opens (no second open once it passed), and after the answer arrives (a late answer is no answer).
+    public static long TestUtcStepTicks = 0;   // test seam only (0 in production): added to every wall-clock read here, as an NTP/VM-resume step is
+    static long UtcTicks() { return DateTime.UtcNow.Ticks + TestUtcStepTicks; }
+    public static long MonoEnd(long endUtcTicks) {
+        if (endUtcTicks == long.MaxValue) { return long.MaxValue; }
+        double leftSec = (endUtcTicks - UtcTicks()) / (double)TimeSpan.TicksPerSecond;
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        return leftSec <= 0 ? now : now + (long)(Math.Min(leftSec, 86400.0) * System.Diagnostics.Stopwatch.Frequency);
+    }
+    public static bool Past(long endUtcTicks, long monoEnd) { return UtcTicks() >= endUtcTicks || System.Diagnostics.Stopwatch.GetTimestamp() >= monoEnd; }
+    static long LeftMs(long endUtcTicks, long monoEnd) {
+        long w = (endUtcTicks - UtcTicks()) / TimeSpan.TicksPerMillisecond;
+        if (monoEnd == long.MaxValue) { return w; }
+        return Math.Min(w, (long)((monoEnd - System.Diagnostics.Stopwatch.GetTimestamp()) * 1000.0 / System.Diagnostics.Stopwatch.Frequency));
+    }
+    static System.Threading.Tasks.Task<string[]> StartLocate(string path, int delayMs, long endUtcTicks) { return StartLocate(path, delayMs, endUtcTicks, MonoEnd(endUtcTicks)); }
+    static System.Threading.Tasks.Task<string[]> StartLocate(string path, int delayMs, long endUtcTicks, long monoEnd) {
+        return System.Threading.Tasks.Task.Run(() => { if (Past(endUtcTicks, monoEnd)) { throw new TimeoutException("the end passed before the read started"); } if (delayMs > 0) { System.Threading.Thread.Sleep(delayMs); } uint l; string k = Identity(path, out l); if (Past(endUtcTicks, monoEnd)) { throw new TimeoutException("the end passed before the second open"); } return new string[] { Resolve(path), k }; });
     }
     public static bool LocateUntil(string path, int delayMs, long endUtcTicks, out string physical, out string key) {
         physical = null; key = null;
-        if (DateTime.UtcNow.Ticks >= endUtcTicks) { return false; }
-        System.Threading.Tasks.Task<string[]> t = StartLocate(path, delayMs, endUtcTicks);
-        if (!WaitUntil(t, endUtcTicks)) { return false; }
+        long monoEnd = MonoEnd(endUtcTicks);
+        if (Past(endUtcTicks, monoEnd)) { return false; }
+        System.Threading.Tasks.Task<string[]> t = StartLocate(path, delayMs, endUtcTicks, monoEnd);
+        if (!WaitUntil(t, endUtcTicks, monoEnd)) { return false; }
         physical = t.Result[0]; key = t.Result[1];
         return true;
     }
     // true only when t completed without a fault before endUtcTicks; each slice re-reads the clock, so a caller paused before a slice waits at most one slice past the end
-    public static bool WaitUntil(System.Threading.Tasks.Task t, long endUtcTicks) {
+    public static bool WaitUntil(System.Threading.Tasks.Task t, long endUtcTicks) { return WaitUntil(t, endUtcTicks, MonoEnd(endUtcTicks)); }
+    public static bool WaitUntil(System.Threading.Tasks.Task t, long endUtcTicks, long monoEnd) {
         try {
             while (true) {
-                long left = (endUtcTicks - DateTime.UtcNow.Ticks) / TimeSpan.TicksPerMillisecond;
+                long left = LeftMs(endUtcTicks, monoEnd);
                 if (left <= 0) { return false; }
-                if (t.Wait((int)Math.Min(250L, left))) { return true; }
+                if (t.Wait((int)Math.Min(250L, left))) { return !Past(endUtcTicks, monoEnd); }   // BATCH-3 r8: an answer seen past the end is never acted on
             }
         } catch (AggregateException) { return false; }
     }
@@ -748,13 +771,18 @@ function Get-InputUnresolvedCodeWithin([string]$Path, [switch]$SkipRead) {
         # BATCH-3 r2 (p6 A4 sibling, same expression): the room is clamped to [0, 3600] s before it is added to now (no un-representable DateTime)
         if ($dlU -is [datetime]) { $dlEnd = [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, [Math]::Min(3600.0, ($dlU - [DateTime]::UtcNow).TotalSeconds - 2.0))); if ($dlEnd -lt $endUtc) { $endUtc = $dlEnd } }
         if ([DateTime]::UtcNow -ge $endUtc) { return 'INPUT_UNREADABLE' }
+        # BATCH-3 r8 (adversary r7 A3 sibling :746, A5 sibling :752): the same end is also held on a Stopwatch (its room now), so a wall clock stepped back cannot widen the wait,
+        # and the answer is judged AFTER it is seen: one seen past either end is never acted on (IsCompleted read once)
+        $endSw = [Diagnostics.Stopwatch]::StartNew(); $endRoomMs = ($endUtc - [DateTime]::UtcNow).TotalMilliseconds
         $h = $ps.BeginInvoke()
         while (-not $h.IsCompleted) {
-            $leftMs = ($endUtc - [DateTime]::UtcNow).TotalMilliseconds
+            $leftMs = [Math]::Min([double]($endUtc - [DateTime]::UtcNow).TotalMilliseconds, [double]$endRoomMs - $endSw.Elapsed.TotalMilliseconds)
             if ($leftMs -le 0) { break }
             [void]$h.AsyncWaitHandle.WaitOne([int][Math]::Ceiling([Math]::Min(250.0, [double]$leftMs)))
         }
-        if (-not $h.IsCompleted) {
+        $hDone = $h.IsCompleted
+        if ($hDone -and ([DateTime]::UtcNow -gt $endUtc -or $endSw.Elapsed.TotalMilliseconds -gt $endRoomMs)) { return 'INPUT_UNREADABLE' }   # a late answer (disposed normally, not abandoned)
+        if (-not $hDone) {
             $abandoned = $true
             try { & ($script:VenueChainModule ?? (Get-Module VenueChain)) { $script:VenueAbandonedReads++ } } catch { $null = $_ }
             try { $null = $ps.BeginStop($null, $null) } catch { $null = $_ }
@@ -888,16 +916,19 @@ function Invoke-ClaimRetryRequest {
     }
     $timeoutSec = [Math]::Min([double]($room - $script:ClaimRetryRequestReserveSec), [double]$script:ClaimRetryRequestMaxSec)
     $reqEndUtc = [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, [double]$timeoutSec))   # b2 r2 (A3 class): the wait's one end
+    # BATCH-3 r8 (adversary r7 A3/A5 class): the same end on the Stopwatch (no wall-clock step widens the wait), and handed to the worker, which judges its grant against it
+    $reqEndTs = [Diagnostics.Stopwatch]::GetTimestamp() + [long]([Math]::Max(0.0, [double]$timeoutSec) * [double][Diagnostics.Stopwatch]::Frequency)
     $boundWhat = $(if ($timeoutSec -lt $room - $script:ClaimRetryRequestReserveSec) { "the most a retry's request is waited for" } else { "the time left before -DeadlineUtc less $($script:ClaimRetryRequestReserveSec) s" })
     $state = [hashtable]::Synchronized(@{ lock = [object]::new(); decided = $false; abandoned = $false; late = $false; result = $null; error = $null; release = $null })
     $ps = $null; $started = $false; $ended = $false; $decided = $false
     try {
         $ps = [powershell]::Create()
         [void]$ps.AddScript($script:ClaimRetryRequestWorker.ToString())
-        [void]$ps.AddArgument(@{ chainModule = (Join-Path $here 'VenueChain.psm1'); request = $RequestArgs; lateAfterUtc = $DeadlineUtc; state = $state })
+        [void]$ps.AddArgument(@{ chainModule = (Join-Path $here 'VenueChain.psm1'); request = $RequestArgs; lateAfterUtc = $DeadlineUtc; state = $state; waitEndTs = $reqEndTs })
         $async = $ps.BeginInvoke(); $started = $true
         # b2 r2 (adversary pass 3 A3 class): sliced against ONE end fixed when $timeoutSec was sampled, so a pause before the wait never waits the stale bound past it
-        while (-not $async.IsCompleted) { $reqLeft = $reqEndUtc - [DateTime]::UtcNow; if ($reqLeft.TotalSeconds -le 0) { break }; [void]$async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds([Math]::Min(0.25, [double]$reqLeft.TotalSeconds))) }
+        # BATCH-3 r8: what is left is the lesser of the wall clock's and the Stopwatch's
+        while (-not $async.IsCompleted) { $reqLeftSec = [Math]::Min([double]($reqEndUtc - [DateTime]::UtcNow).TotalSeconds, [double]($reqEndTs - [Diagnostics.Stopwatch]::GetTimestamp()) / [double][Diagnostics.Stopwatch]::Frequency); if ($reqLeftSec -le 0) { break }; [void]$async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds([Math]::Min(0.25, [double]$reqLeftSec))) }
         $ended = $async.IsCompleted
     } finally {
         if ($started) {
@@ -914,7 +945,7 @@ function Invoke-ClaimRetryRequest {
     }
     if ($state.late) {
         return [pscustomobject]@{ granted = $false; state = 'REQUEST_LATE_GRANT'; broken = @(); claim = $null
-            why = "the claim request was granted at or after -DeadlineUtc; that claim is released ($(if ($state.release) { $state.release } else { 'by the request''s worker' })), never used" }
+            why = "the claim request was granted at or after -DeadlineUtc, or after its $([Math]::Round($timeoutSec, 2)) s wait ended; that claim is released ($(if ($state.release) { $state.release } else { 'by the request''s worker' })), never used" }
     }
     if ($state.error) { throw $state.error }
     $state.result
@@ -995,10 +1026,13 @@ function Invoke-ClaimRetryRelease([DateTime]$DeadlineUtc, [string]$Nonce) {
             $ps = [powershell]::Create()
             [void]$ps.AddScript($script:ClaimRetryReleaseWorker.ToString())
             [void]$ps.AddArgument(@{ chainModule = (Join-Path $here 'VenueChain.psm1'); venue = $Venue; nonce = $Nonce; claimDir = $ClaimDir })
+            $relSw = [Diagnostics.Stopwatch]::StartNew(); $relRoomSec = ($relEndUtc - [DateTime]::UtcNow).TotalSeconds   # BATCH-3 r8 (A3 class): the same end on the Stopwatch
             $async = $ps.BeginInvoke()
             # b2 r2 (adversary pass 3 A3 class): sliced against ONE end fixed at the sample above, so a pause before the wait never waits the stale $sec past it
-            while (-not $async.IsCompleted) { $relLeft = $relEndUtc - [DateTime]::UtcNow; if ($relLeft.TotalSeconds -le 0) { break }; [void]$async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds([Math]::Min(0.25, [double]$relLeft.TotalSeconds))) }
-            if (-not $async.IsCompleted) {
+            while (-not $async.IsCompleted) { $relLeftSec = [Math]::Min([double]($relEndUtc - [DateTime]::UtcNow).TotalSeconds, [double]$relRoomSec - $relSw.Elapsed.TotalSeconds); if ($relLeftSec -le 0) { break }; [void]$async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds([Math]::Min(0.25, [double]$relLeftSec))) }
+            $relDone = $async.IsCompleted   # BATCH-3 r8 (adversary r7 A5 sibling :1000): read once, and an answer seen past either end is never acted on (its worker ended: disposed as usual)
+            if ($relDone -and ([DateTime]::UtcNow -gt $relEndUtc -or $relSw.Elapsed.TotalSeconds -gt $relRoomSec)) { $why = "answered only after its $([Math]::Round($sec, 2)) s wait ended"; return "NO_ANSWER (an answer seen after the $([Math]::Round($sec, 2)) s wait is never acted on)" }
+            if (-not $relDone) {
                 # a worker still running is a live thread the host would wait for at exit: counted, asked to stop, never joined or disposed (Dispose() would wait for it)
                 $abandoned = $true
                 & ($script:VenueChainModule ?? (Get-Module VenueChain)) { $script:VenueAbandonedReads++ }
@@ -1065,7 +1099,9 @@ $script:ClaimRetryRequestWorker = {
     try { Import-Module $A.chainModule -Force -DisableNameChecking; $rq = $A.request; $r = Request-VenueClaim @rq } catch { $err = $_.Exception.Message -replace '\s+', ' ' }
     $late = $false
     [Threading.Monitor]::Enter($S.lock)
-    try { $S.decided = $true; $late = $S.abandoned -or ($null -ne $r -and $r.granted -and [DateTime]::UtcNow -ge $A.lateAfterUtc); $S.late = $late; $S.result = $r; $S.error = $err }
+    # BATCH-3 r8 (adversary r7 A5 sibling :900): the grant is judged when it is DECIDED, here, against the caller's wait end too (a Stopwatch timestamp, so no wall-clock step
+    # moves it): a grant decided after the caller's wait ended is late, released by this worker, never used, whenever the caller looks
+    try { $S.decided = $true; $late = $S.abandoned -or ($null -ne $r -and $r.granted -and ([DateTime]::UtcNow -ge $A.lateAfterUtc -or ($null -ne $A.waitEndTs -and [Diagnostics.Stopwatch]::GetTimestamp() -ge [long]$A.waitEndTs))); $S.late = $late; $S.result = $r; $S.error = $err }
     finally { [Threading.Monitor]::Exit($S.lock) }
     if ($late -and $null -ne $r -and $r.granted) { try { $S.release = [string](Release-VenueClaim -Venue $A.request.Venue -Nonce $r.claim.nonce -ClaimDir $A.request.ClaimDir) } catch { $S.release = "THREW $($_.Exception.Message -replace '\s+', ' ')" } }
 }
@@ -1123,10 +1159,17 @@ function Invoke-InputGuard {
             if ($guardLeft -le 0) { break }
             [void]$async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds([Math]::Min(0.25, [double]$guardLeft)))
         }
-        if (-not $async.IsCompleted) {
-            $abandoned = $true
-            & ($script:VenueChainModule ?? (Get-Module VenueChain)) { $script:VenueAbandonedReads++ }
-            try { [void]$ps.BeginStop($null, $null) } catch { }
+        # BATCH-3 r8 (adversary r7 A5 sibling :1121): an answer seen only after the guard's end on its own clock (a worker that finished after the last slice, a parent that resumed
+        # late) is never acted on: refused exactly as one not answered, its worker disposed normally (its own given-up reads still counted)
+        $guardDone = $async.IsCompleted   # read ONCE: a worker that completes after this read is one not answered, never acted on
+        $guardLate = $guardDone -and ($gb.clock.Elapsed.TotalSeconds -gt $guardEndSec)
+        if ($guardLate) { $lateOut = try { @($ps.EndInvoke($async)) } catch { @() }; $n = $(if ($lateOut.Count -gt 0) { [int]$lateOut[-1].abandoned } else { 0 }); if ($n -gt 0) { & ($script:VenueChainModule ?? (Get-Module VenueChain)) { param($k) $script:VenueAbandonedReads += $k } $n } }
+        if (-not $guardDone -or $guardLate) {
+            if (-not $guardDone) {
+                $abandoned = $true
+                & ($script:VenueChainModule ?? (Get-Module VenueChain)) { $script:VenueAbandonedReads++ }
+                try { [void]$ps.BeginStop($null, $null) } catch { }
+            }
             # r3 (adversary r3 A2): a pass that had already been answered with a failure is that failure, refused on this poll as ever, not a read to try again: noAnswer stays off
             # #705 r14 (adversary r14 A1): a worker given up on is still in a read of an input's share (a spec, a manifest or its artifacts, all on the shares the inputs live on), so where
             # that input is cannot be read again on this thread inside the room either, even when its location was verified first: every location is left unknown, and nothing more is
@@ -1569,13 +1612,24 @@ public static class VenueLeaseBatchBoundedReadR4 {
     }
     // DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r2 (adversary pass 3 A3 on 372d1bfd): the read ends at ONE absolute instant (UTC ticks), never a relative allowance the caller sampled
     // before a pause: nothing starts at or past it, the task opens nothing once it passed, and the wait is sliced (250 ms) against it. 0 OK, 1 FAILED (the read threw), 2 TIMEOUT.
+    // BATCH-3 r8 (adversary r7 A3, :1578): the end is ALSO held on the Stopwatch (its room taken once, at the call's start), so a wall clock stepped back cannot widen the read or
+    // its wait, and the answer is judged after it arrives: one seen past either end is TIMEOUT, never OK. TestUtcStepTicks is a test seam only (0 in production).
+    public static long TestUtcStepTicks = 0;
+    static long UtcTicks() { return DateTime.UtcNow.Ticks + TestUtcStepTicks; }
+    static long MonoEnd(long endUtcTicks) {
+        double leftSec = (endUtcTicks - UtcTicks()) / (double)TimeSpan.TicksPerSecond;
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        return leftSec <= 0 ? now : now + (long)(Math.Min(leftSec, 86400.0) * System.Diagnostics.Stopwatch.Frequency);
+    }
+    static bool Past(long endUtcTicks, long monoEnd) { return UtcTicks() >= endUtcTicks || System.Diagnostics.Stopwatch.GetTimestamp() >= monoEnd; }
     public static int ReadUntil(string path, int delayMs, long endUtcTicks, out byte[] bytes, out string key, out string error) {
         bytes = null; key = null; error = null;
-        if (DateTime.UtcNow.Ticks >= endUtcTicks) { return 2; }
-        System.Threading.Tasks.Task<object[]> t = System.Threading.Tasks.Task.Run(() => { if (DateTime.UtcNow.Ticks >= endUtcTicks) { throw new TimeoutException("the end passed before the read started"); } if (delayMs > 0) { System.Threading.Thread.Sleep(delayMs); } return ReadWithKey(path); });
+        long monoEnd = MonoEnd(endUtcTicks);
+        if (Past(endUtcTicks, monoEnd)) { return 2; }
+        System.Threading.Tasks.Task<object[]> t = System.Threading.Tasks.Task.Run(() => { if (Past(endUtcTicks, monoEnd)) { throw new TimeoutException("the end passed before the read started"); } if (delayMs > 0) { System.Threading.Thread.Sleep(delayMs); } if (Past(endUtcTicks, monoEnd)) { throw new TimeoutException("the end passed before the open"); } return ReadWithKey(path); });
         try {
             while (true) {
-                long left = (endUtcTicks - DateTime.UtcNow.Ticks) / TimeSpan.TicksPerMillisecond;
+                long left = Math.Min((endUtcTicks - UtcTicks()) / TimeSpan.TicksPerMillisecond, (long)((monoEnd - System.Diagnostics.Stopwatch.GetTimestamp()) * 1000.0 / System.Diagnostics.Stopwatch.Frequency));
                 if (left <= 0) { return 2; }
                 if (t.Wait((int)Math.Min(250L, left))) { break; }
             }
@@ -1583,6 +1637,7 @@ public static class VenueLeaseBatchBoundedReadR4 {
             if (e.InnerException is TimeoutException) { return 2; }
             error = e.InnerException != null ? e.InnerException.Message : e.Message; return 1;
         }
+        if (Past(endUtcTicks, monoEnd)) { return 2; }   // an answer seen past the end is never acted on
         bytes = (byte[])t.Result[0]; key = (string)t.Result[1];
         return 0;
     }
@@ -2041,6 +2096,17 @@ function Add-LegSpecRefusal([object]$Batch, [object]$Refusal) {
     # r5 (sol r4 B2): the refusal's typed code on the leg's persisted rows (the batch receipt's and the run result's), set before any log append of that leg's end
     if ($null -eq $Refusal) { return }
     foreach ($r in @($Batch.legs[$Batch.legs.Count - 1], $results[$results.Count - 1])) { $r | Add-Member -NotePropertyName specRefusal -NotePropertyValue ([string]$Refusal.code) -Force }
+}
+
+function Write-LegSpecRefusalLine([object]$Refusal) {
+    # BATCH-3 r8 (adversary r7 A4): the typed refusal line reaches STDOUT exactly once whatever happens to the log. LogBest puts it on stdout only through a batch.log append; with
+    # the write suppression on (a transcript or batch.log name that became another input's), L says it on stderr alone. What LogBest emitted is passed on; when that holds no
+    # line of the refusal, the line is said on stdout here. Never throws (the row already carries the code: Add-LegSpecRefusal).
+    if ($null -eq $Refusal) { return }
+    $msg = "$($Refusal.line) (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)"
+    $said = @(try { LogBest $msg } catch { $null = $_ })
+    if (@($said | Where-Object { ([string]$_).EndsWith($msg, [StringComparison]::Ordinal) }).Count -eq 0) { $said += "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $msg" }
+    $said
 }
 
 function Format-Mean($m) { if ($null -eq $m) { 'UNKNOWN' } else { '{0:0.0}' -f $m } }
@@ -3201,6 +3267,13 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     if ($_.Exception -is [ComponentModel.Win32Exception] -or $_.Exception.InnerException -is [ComponentModel.Win32Exception]) { $inFlightLeg = $null }
                     throw
                 }
+                # BATCH-3 r8 (adversary r7 A1): a launch that started no child (.notStarted: a start bound the helper refused at its last clock read) ran nothing: the leg is not in
+                # flight, stays pending (NOT_RUN unless a later batch runs it) and is never LEASE_EXPIRED; the batch ends room-short at the launch, as the room check above does
+                if ($lp.notStarted) {
+                    $inFlightLeg = $null; $b.legsAttempted--; $launchShort = $true
+                    $b.endReason = 'LEASE_REMAINING_SHORT'; $b.endDetail = "at the launch of leg $($leg.name): the bounded launch started no child (notStarted): it goes to the next batch"
+                    break
+                }
                 $legReturnTs = [Diagnostics.Stopwatch]::GetTimestamp()   # r6 (adversary-848f6559.json A1): the child's return; the idle anchor is placed from the leg job's own result below
                 $text =[string]$lp.stdout + [string]$lp.stderr   # r7: read from the child, never back from the file, whose write the guard may refuse
                 # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A4 sibling :2963): evidence only; a write that throws is said on stderr and never replaces the leg's classification
@@ -3212,8 +3285,10 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # which replaces that directory entry only, never the file another name still reaches
                 # b2 r3 (adversary pass 4 A1 on 8b4b6d8c): Invoke-VenueBoundedRead is VenueChain's own (not exported), so it is called in the module's scope as :958 does; called
                 # by name from here it never resolved, and every transcript landed in the catch below (LEG_OUT_WRITE_FAILED, no .out.txt)
+                # BATCH-3 r8 (adversary r7 A2, blocker): the bytes go through the ONE handle CreateNew opened, never a second open by name (WriteAllText reopened the fresh name after
+                # Dispose, and a hard link made there in between to an accepted spec was opened and overwritten); the rename then moves a directory entry only
                 if (Test-RunDirWrite $out) {
-                    $owr = try { & ($script:VenueChainModule ?? (Get-Module VenueChain)) { param($t, $a, $s) Invoke-VenueBoundedRead -ScriptText $t -Argument $a -TimeoutSec $s } 'param($a) $final = $a.p; $out = $final + ".b2r2-" + [Guid]::NewGuid().ToString("N") + ".tmp"; $text = $a.t; try { $fs = [IO.File]::Open($out, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None); $fs.Dispose(); [IO.File]::WriteAllText($out, $text, [Text.UTF8Encoding]::new($false)); [IO.File]::Move($out, $final, $true); "OK" } catch { $m = $_.Exception.Message; try { [IO.File]::Delete($out) } catch { $null = $_ }; "FAILED " + $m }' @{ p = $out; t = $text } 2 } catch { [pscustomobject]@{ answered = $true; value = @(); error = ($_.Exception.Message -replace '\s+', ' ') } }
+                    $owr = try { & ($script:VenueChainModule ?? (Get-Module VenueChain)) { param($t, $a, $s) Invoke-VenueBoundedRead -ScriptText $t -Argument $a -TimeoutSec $s } 'param($a) $final = $a.p; $out = $final + ".b2r2-" + [Guid]::NewGuid().ToString("N") + ".tmp"; $bytes = [Text.UTF8Encoding]::new($false).GetBytes([string]$a.t); try { $fs = [IO.File]::Open($out, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None); try { $fs.Write($bytes, 0, $bytes.Length); $fs.Flush() } finally { $fs.Dispose() }; [IO.File]::Move($out, $final, $true); "OK" } catch { $m = $_.Exception.Message; try { [IO.File]::Delete($out) } catch { $null = $_ }; "FAILED " + $m }' @{ p = $out; t = $text } 2 } catch { [pscustomobject]@{ answered = $true; value = @(); error = ($_.Exception.Message -replace '\s+', ' ') } }
                     $owv = @($owr.value | ForEach-Object { [string]$_ })
                     $wfLine = $(if (-not $owr.answered) { "LEG_OUT_WRITE_TIMEOUT leg=$($leg.name) path=$out (no answer in 2 s; evidence only: the leg is classified from its own captured output)" }
                         elseif ($owv -notcontains 'OK') { "LEG_OUT_WRITE_FAILED leg=$($leg.name) path=$out reason=$((($owv -join ' ') + ' ' + [string]$owr.error).Trim() -replace '^FAILED ', '' -replace '\s+', ' ') (evidence only: the leg is classified from its own captured output)" } else { '' })
@@ -3245,7 +3320,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     # b2 r1 (pass 8 A4): what happened to the child is said as it happened (a late self-exit was not killed; a kill that threw is not confirmed)
                     $legEnd = Format-VenueBoundedChildEnd $lp $legBoundSec
                     $b.endReason = 'LEASE_EXPIRED'; $b.endDetail = "leg $($leg.name) did not finish inside the lease ($legSec s, bound $legBoundSec s): it $legEnd; job $legJobId cancel=$($cx.state)$(if ($cx.error) { " ($($cx.error))" })"
-                    if ($legSpecRefusal) { LogBest "$($legSpecRefusal.line) (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)" }   # best effort: the row already carries it
+                    Write-LegSpecRefusalLine $legSpecRefusal   # BATCH-3 r8 (adversary r7 A4 sibling :3248): on stdout whatever the log does; the row already carries it
                     L "LEG $($leg.name) LEASE_EXPIRED batch=$batchNo legSec=$legSec boundSec=$legBoundSec outcome=INVALID counted=False jobId=$legJobId cancel=$($cx.state) (at the lease's end it $legEnd)"
                     if ($exitCode -eq 0) { $exitCode = 7 }
                     break
@@ -3265,7 +3340,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     $b.legs.Add([pscustomobject]$row); Add-Result $leg 'LEG_FAILED' $row; $pending.RemoveAt(0)
                     Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                     Add-LegSpecRefusal $b $legSpecRefusal   # r5 (sol r4 B2): on the persisted rows before any append
-                    if ($legSpecRefusal) { LogBest "$($legSpecRefusal.line) (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)" }   # best effort: the row already carries it
+                    Write-LegSpecRefusalLine $legSpecRefusal   # BATCH-3 r8 (adversary r7 A4): on stdout whatever the log does; the row already carries it
                     L "LEG $($leg.name) LEG_FAILED batch=$batchNo exit=$legCode outcome=INVALID printedOutcome=$outcome (the leg exited non-zero: no usable receipt)"
                     if ($exitCode -eq 0) { $exitCode = 7 }
                     continue
@@ -3383,7 +3458,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $b.legs.Add([pscustomobject]$row); Add-Result $inFlightLeg 'LEG_FAILED' $row; $null = $pending.Remove($inFlightLeg)
                 Add-PlanIdentity $b.legs[$b.legs.Count - 1] $inFlightLeg
                 # BATCH-3 r5 (sol r4 B2 sibling): a child that returned its typed spec refusal before the throw keeps it on this row too
-                if ($null -ne $lp) { Add-LegSpecRefusal $b (Get-BatchLegSpecRefusal ([string]$lp.stdout) $inFlightLeg) }
+                # BATCH-3 r8 (adversary r7 A4 sibling :3386): and its typed line on stdout, as on the two exit branches
+                if ($null -ne $lp) { $ifRefusal = Get-BatchLegSpecRefusal ([string]$lp.stdout) $inFlightLeg; Add-LegSpecRefusal $b $ifRefusal; Write-LegSpecRefusalLine $ifRefusal }
             }
         } catch { }
         LogBest "BATCH_ERROR batch=$batchNo $($b.endDetail)"   # a batch.log another process holds must not turn the typed stop back into an unhandled throw

@@ -7985,7 +7985,7 @@ exit 0
         # A6: the post-child guard asked about an absent transcript name; a hard link to an accepted spec made at that name before the worker opened it was written THROUGH
         # (WriteAllText opens the existing file). The worker's own text is lifted from the runner and run against exactly that name.
         body = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
-        at = body.index("[IO.File]::WriteAllText($out, $text, [Text.UTF8Encoding]::new($false))")
+        at = body.index("$fs.Write($bytes, 0, $bytes.Length)")   # BATCH-3 r8 (adversary r7 A2): the worker writes through its CreateNew handle
         line = body[body.rindex("\n", 0, at) + 1:body.index("\n", at)]
         # b2 r3 (forced companion of the A1 fix): the worker text is now the first single-quoted argument of the module-scope call, not a -ScriptText literal
         m = re.search(r"'(param\(\$a\) \$final(?:[^']|'')*)'", line)

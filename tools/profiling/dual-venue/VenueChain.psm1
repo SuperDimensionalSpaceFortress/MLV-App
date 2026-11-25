@@ -1294,6 +1294,11 @@ function Invoke-VenueBoundedRead {
         if ($null -ne $Clock -and ($late = $Clock.Elapsed.TotalSeconds - $EndSec) -gt 0) {
             return [pscustomobject]@{ answered = $false; value = @(); error = "an answer seen $([Math]::Round($late, 2)) s after the call's end is never acted on" }
         }
+        # BATCH-3 r8 (adversary r7 A5): the RELATIVE bound is asked after the answer too. A worker that finished after the last slice expired, seen by a parent that resumed
+        # late, made IsCompleted true and was acted on past -TimeoutSec (only -Clock was asked here). Seen after the bound on the wait's own Stopwatch: never acted on.
+        if (($lateRel = $waitClock.Elapsed.TotalSeconds - [double]$TimeoutSec) -gt 0) {
+            return [pscustomobject]@{ answered = $false; value = @(); error = "an answer seen $([Math]::Round($lateRel, 2)) s after the $([Math]::Round($TimeoutSec, 2)) s bound is never acted on" }
+        }
         [pscustomobject]@{ answered = $true; value = @($ps.EndInvoke($async)); error = $null }
     } catch {
         [pscustomobject]@{ answered = $false; value = @(); error = $_.Exception.Message }
@@ -2107,7 +2112,10 @@ function Invoke-VenueBoundedProcess {
     if ($timedOut -and -not $killAttempted) { try { $p.Kill($true) } catch { $null = $_ } }
     [void]$outTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds)); [void]$errTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds))
     # b2 r2 (A14): .killConfirmed is read from the TREE: no kill error, the root gone AND both of its streams at end of file (no live process still holds the child's stdout or stderr)
-    [pscustomobject]@{ exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut; notStarted = $false; lateStart = $lateStart; lateExit = $lateExit; killAttempted = $killAttempted; killErrored = $killErrored; killConfirmed = $(if ($timedOut) { (-not $killErrored) -and [bool]$p.HasExited -and $outTask.IsCompleted -and $errTask.IsCompleted } else { $true })
+    # BATCH-3 r8 (adversary r7 A6): off Windows, a root that exited BEFORE any kill leaves its descendants reparented (to init or a subreaper), where Kill($true) no longer finds
+    # them, and one that closed its streams (sh -c 'sleep 60 </dev/null >/dev/null 2>&1 &') leaves both at end of file: nothing proves that tree gone, so it is never confirmed
+    $treeReached = $IsWindows -or $killAttempted
+    [pscustomobject]@{ exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut; notStarted = $false; lateStart = $lateStart; lateExit = $lateExit; killAttempted = $killAttempted; killErrored = $killErrored; killConfirmed = $(if ($timedOut) { $treeReached -and (-not $killErrored) -and [bool]$p.HasExited -and $outTask.IsCompleted -and $errTask.IsCompleted } else { $true })
         stdout = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' }); stderr = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' }) }
 }
 
