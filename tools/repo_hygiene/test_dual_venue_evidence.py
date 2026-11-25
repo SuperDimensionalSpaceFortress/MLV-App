@@ -19640,7 +19640,8 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         (adversary A4 on 4201a437): a line without source_advanced, or with an unreadable one, fails closed."""
         cases = {"in step": ("1498", True), "one target held": ("1497", True), "one past it": ("1496", False), "r28's tolerance": ("1489", False)}
         for name, (coverage, passes) in cases.items():
-            for row in self.chain(f" audio_sync_requests=0 presented=1499 source_advanced={coverage} source_fps=24.000 max_jump=1"):
+            # (presented = coverage + 1, as the app prints it: forward steps of at least one frame each cannot cover fewer frames than steps, adversary A5 on cbf6cdba)
+            for row in self.chain(f" audio_sync_requests=0 presented={int(coverage) + 1} source_advanced={coverage} source_fps=24.000 max_jump=1"):
                 with self.subTest(case=name, spec=row["spec"], role=row["role"]):
                     self.assertEqual(row["pass"], passes, row)
         for case, measured in (("no source_advanced", " audio_sync_requests=0 source_fps=24.000 max_jump=1"),
