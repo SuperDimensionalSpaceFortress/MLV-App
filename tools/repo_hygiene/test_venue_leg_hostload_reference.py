@@ -83,6 +83,24 @@ class SmokeHostLoadStandingTests(unittest.TestCase):
         s = self.standing(None)
         self.assertEqual((s["state"], s["provisional"], s["collected"]), ("unknown", True, False), s)
 
+    def test_adversary_a1_array_wrapped_values_never_unroll_to_clean(self) -> None:
+        # adversary-8c2884e9.json A1, its input: provisional [false] and before.collected [true] read quiet / provisional false / collected true.
+        clean = {"state": "quiet", "provisional": False, "before": {"collected": True}, "after": {"collected": True}}
+        for block in ({**clean, "provisional": [False], "before": {"collected": [True]}}, {**clean, "provisional": [False]},
+                      {**clean, "before": {"collected": [True]}}, {**clean, "state": ["quiet"]}, {**clean, "before": [{"collected": True}]}, [clean]):
+            with self.subTest(block=block):
+                s = self.standing(block)
+                self.assertTrue(s["provisional"], s)
+                self.assertNotEqual(s["state"], "quiet", s)
+
+    def test_adversary_a2_only_the_exact_literal_quiet_is_clean(self) -> None:
+        # adversary-8c2884e9.json A2, its input: "quiet " (and qui\\u0000et, qui\\u00adet, QUIET) read clean.
+        for state in ("quiet ", " quiet", "qui\u0000et", "qui­et", "QUIET", "Quiet", "quiet\n"):
+            with self.subTest(state=state):
+                s = self.standing({"state": state, "provisional": False, "before": {"collected": True}, "after": {"collected": True}})
+                self.assertTrue(s["provisional"], s)
+                self.assertNotEqual(s["state"], "quiet", s)
+
     def test_degenerate_blocks_never_read_clean(self) -> None:
         for block in ({"state": "quiet"}, {"provisional": False}, {"state": "exceeded", "provisional": False}, {"state": "", "provisional": False,
                       "before": {"collected": True}, "after": {"collected": True}}, {"state": "quiet", "provisional": "false", "before": {"collected": True},
@@ -162,6 +180,53 @@ class ReferenceArmVerdictTests(unittest.TestCase):
         v, out = self.verdict([("old-1", None)])
         self.assertEqual(v["verdict"], "INCONCLUSIVE", v)
         self.assertIn("REFERENCE_PROVISIONAL leg=old-1 reason=hostload-unknown", out)
+
+    def test_adversary_a3_a_supplied_standing_is_never_trusted(self) -> None:
+        # adversary-8c2884e9.json A3, its input: a hostLoad carrying applies/collected took the trusted-standing branch and counted an unknown leg.
+        for hl in ({"state": "unknown", "provisional": True, "collected": False, "applies": False},
+                   {"state": "unknown", "provisional": False, "collected": False, "applies": True},
+                   {"state": "quiet", "provisional": False, "collected": False, "applies": True},
+                   {"state": "unknown", "provisional": True, "collected": False, "applies": 0},
+                   {"state": "unknown", "provisional": True, "collected": False, "applies": None},
+                   {"state": "unknown", "provisional": True, "collected": False, "applies": []}):
+            with self.subTest(hl=hl):
+                v, out = self.verdict([("x", hl)])
+                self.assertEqual(v["verdict"], "INCONCLUSIVE", v)
+                self.assertIn("REFERENCE_PROVISIONAL leg=x reason=hostload-", out)
+
+    def test_adversary_a4_a_null_leg_is_recorded_and_refused(self) -> None:
+        # adversary-8c2884e9.json A4, its input: @($null, <quiet leg>) read COUNTED with the null leg dropped.
+        p = run_ps("$q = ('" + json.dumps({"legId": "q", "hostLoad": QUIET}) + "' | ConvertFrom-Json); "
+                   "$v = Get-VenueReferenceArmVerdict -Legs @($null, $q); $v.refusals | ForEach-Object { Write-Output $_ }; "
+                   "Write-Output ('VERDICT_JSON=' + ($v | ConvertTo-Json -Compress -Depth 5))")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        v = json.loads([l for l in p.stdout.splitlines() if l.startswith("VERDICT_JSON=")][-1][len("VERDICT_JSON="):])
+        self.assertEqual(v["verdict"], "INCONCLUSIVE", v)
+        self.assertEqual(len(v["legs"]), 2, v)
+        self.assertIn("REFERENCE_PROVISIONAL leg=UNKNOWN reason=hostload-unknown", p.stdout)
+
+    def test_adversary_a1_the_reader_never_unrolls_an_array_wrapped_document_or_block(self) -> None:
+        # adversary-8c2884e9.json A1 (root-document and hostLoad singleton-array unwrapping): [ {hostLoad: clean} ] and {hostLoad: [clean]} are not clean.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "receipts"
+            ev = Path(d) / "evidence"
+            clean = {"state": "quiet", "provisional": False, "before": {"collected": True}, "after": {"collected": True}}
+            cases = {"rootarr-1": [{"hostLoad": clean}], "hlarr-1": {"hostLoad": [clean]}, "provarr-1": {"hostLoad": {**clean, "provisional": [False]}}}
+            for rid, doc in cases.items():
+                receipt = root / "CARD-1" / "leg-x" / "bachelor" / f"{rid}.json"
+                receipt.parent.mkdir(parents=True, exist_ok=True)
+                receipt.write_text("{}", encoding="utf-8")
+                (ev / rid).mkdir(parents=True, exist_ok=True)
+                (ev / rid / "summary.json").write_text(json.dumps({"cpuQuiescence": {"timeMeanPercent": 5}}), encoding="utf-8")
+                (ev / rid / "result.json").write_text(json.dumps(doc), encoding="utf-8")
+            body = ("$r = [ordered]@{}; "
+                    + "".join(f"$r['{rid}'] = Get-VenueLegHostLoad -ReceiptPath '{root / 'CARD-1' / 'leg-x' / 'bachelor' / (rid + '.json')}'; " for rid in cases)
+                    + "$r | ConvertTo-Json -Compress -Depth 4")
+            p = run_ps(body)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            got = json.loads(p.stdout)
+        for rid in cases:
+            self.assertEqual((got[rid]["state"], got[rid]["provisional"]), ("unknown", True), (rid, got[rid]))
 
     def test_no_control_leg_at_all_is_inconclusive(self) -> None:
         v, _ = self.verdict([])
