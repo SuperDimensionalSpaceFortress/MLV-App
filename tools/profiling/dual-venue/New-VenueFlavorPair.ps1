@@ -235,9 +235,13 @@ $sliders = @{}
 $reported = @{}
 foreach ($label in $sides.Keys) {
     $r = $sides[$label]
-    if ($r.outcome -ne 'PASS' -and $r.outcome -ne 'FAIL') { throw "PAIR_RECEIPT_INCOMPLETE receipt $($r.receiptId) is $($r.outcome), not PASS/FAIL" }
     # The evidence-bearing validator: admission re-derived from the committed blobs, the run from the hashed evidence. Nothing the receipt says is believed.
-    $validity = Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot -ReceiptText $receiptTexts[$label]
+    # VENUE-LEG-DISPLAY-PATH-RECEIPT-1-SUCCESSOR-3 r2 (adversary A7): it runs BEFORE the outcome gate, so a malformed venue.displayPath is refused as itself
+    # (PAIR_RECEIPT_INVALID, DISPLAY_PATH_MALFORMED) on any outcome; a receipt that is not PASS/FAIL is otherwise PAIR_RECEIPT_INCOMPLETE as before, whatever the validator did.
+    $validity = $null; $validityError = $null
+    try { $validity = Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot -ReceiptText $receiptTexts[$label] } catch { $validityError = $_ }
+    if ($r.outcome -ne 'PASS' -and $r.outcome -ne 'FAIL' -and -not ($validity -and [string]$validity.displayPath -ceq 'malformed')) { throw "PAIR_RECEIPT_INCOMPLETE receipt $($r.receiptId) is $($r.outcome), not PASS/FAIL" }
+    if ($validityError) { throw $validityError }
     if ($validity.status -cne 'ADVISORY') { throw "PAIR_RECEIPT_$($validity.status) receipt $($r.receiptId) is not valid evidence: $(@($validity.reasons) -join '; ')" }
     if ([string]$validity.legType -cne 'look') { throw "PAIR_NOT_A_LOOK_LEG receipt $($r.receiptId) is not a LOOK leg per its committed leg spec" }
     if ([string]$r.subject.clipId -cnotmatch '^[A-Za-z]\d{2}-\d{3,4}$') { throw 'PAIR_NOT_A_CONSENTED_CLIP only a consented clip id (never a fixture or a path) can be paired into a sheet' }

@@ -54,10 +54,14 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
 $evidenceDirs = @{}
 $listedFrames = @{}
 foreach ($r in $cuda, $cpu) {
-    if ($r.outcome -ne 'PASS' -and $r.outcome -ne 'FAIL') { throw "PAIR_RECEIPT_INCOMPLETE receipt $($r.receiptId) is $($r.outcome), not PASS/FAIL" }
     # The evidence-bearing validator: the receipt's admission is re-derived from the committed blobs and its run from the hashed
     # evidence files (a receipt whose evidence is absent is INCOMPLETE). Nothing the receipt says about itself is believed.
-    $validity = Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot -ReceiptText $(if ([object]::ReferenceEquals($r, $cuda)) { $cudaText } else { $cpuText })
+    # VENUE-LEG-DISPLAY-PATH-RECEIPT-1-SUCCESSOR-3 r2 (adversary A7): it runs BEFORE the outcome gate, so a malformed venue.displayPath is refused as itself
+    # (PAIR_RECEIPT_INVALID, DISPLAY_PATH_MALFORMED) on any outcome; a receipt that is not PASS/FAIL is otherwise PAIR_RECEIPT_INCOMPLETE as before, whatever the validator did.
+    $validity = $null; $validityError = $null
+    try { $validity = Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot -ReceiptText $(if ([object]::ReferenceEquals($r, $cuda)) { $cudaText } else { $cpuText }) } catch { $validityError = $_ }
+    if ($r.outcome -ne 'PASS' -and $r.outcome -ne 'FAIL' -and -not ($validity -and [string]$validity.displayPath -ceq 'malformed')) { throw "PAIR_RECEIPT_INCOMPLETE receipt $($r.receiptId) is $($r.outcome), not PASS/FAIL" }
+    if ($validityError) { throw $validityError }
     if ($validity.status -cne 'ADVISORY') { throw "PAIR_RECEIPT_$($validity.status) receipt $($r.receiptId) is not valid evidence: $(@($validity.reasons) -join '; ')" }
     # The leg type is the COMMITTED spec's (found by the validator), not a field of the receipt: only a look leg has a sheet to pair.
     if ([string]$validity.legType -cne 'look') { throw "PAIR_NOT_A_LOOK_LEG receipt $($r.receiptId) is not a LOOK leg per its committed leg spec; only a look leg's frames can be paired" }

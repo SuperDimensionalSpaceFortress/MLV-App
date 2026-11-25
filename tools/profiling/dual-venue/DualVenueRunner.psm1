@@ -6687,22 +6687,26 @@ function Get-DvJsonRootObjectWithout {
     # types such a text malformed: Test-DvJsonTextIsObject). With -Under, $Name is dropped from the root's member named -Under (any letter case) instead of from
     # the root: a receipt's block is venue.displayPath (sol r1 B2). Of two or more such members (`venue` beside `Venue`, which also stops ConvertFrom-Json) only the
     # LAST is kept, the copy ConvertFrom-Json keeps of two same-case names; the validator's duplicate check on the text still types the record malformed.
+    # r2 adversary A3: this reader accepts the depth ConvertFrom-Json accepts (its default -Depth 1024), so a deep block it must drop never stops it first.
+    # r2 adversary A2: any number of one-element array wrappers is peeled, as many as ConvertFrom-DvProbeStdout / ConvertFrom-DvReceiptText peel.
     param([AllowEmptyString()][string]$Text, [string]$Name, [string]$Under = '')
     try {
         $opt = [System.Text.Json.JsonDocumentOptions]::new()
-        $opt.MaxDepth = 256; $opt.AllowTrailingCommas = $true; $opt.CommentHandling = [System.Text.Json.JsonCommentHandling]::Skip
+        $opt.MaxDepth = 1024; $opt.AllowTrailingCommas = $true; $opt.CommentHandling = [System.Text.Json.JsonCommentHandling]::Skip
         $doc = [System.Text.Json.JsonDocument]::Parse($Text, $opt)
     } catch { return $null }
     try {
         $root = $doc.RootElement
-        if ($root.ValueKind -eq [System.Text.Json.JsonValueKind]::Array -and $root.GetArrayLength() -eq 1) { $root = $root[0] }
+        while ($root.ValueKind -eq [System.Text.Json.JsonValueKind]::Array -and $root.GetArrayLength() -eq 1) { $root = $root[0] }
         if ($root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $null }
         $c = [System.StringComparison]::OrdinalIgnoreCase
         $underCount = 0
         if ($Under) { foreach ($p in $root.EnumerateObject()) { if ([string]::Equals($p.Name, $Under, $c)) { $underCount++ } } }
         $underSeen = 0
         $ms = [System.IO.MemoryStream]::new()
-        $w = [System.Text.Json.Utf8JsonWriter]::new($ms)
+        $wopt = [System.Text.Json.JsonWriterOptions]::new()
+        $wopt.MaxDepth = 1024
+        $w = [System.Text.Json.Utf8JsonWriter]::new($ms, $wopt)
         $w.WriteStartObject()
         foreach ($p in $root.EnumerateObject()) {
             if ($Under) {
@@ -6740,10 +6744,12 @@ function ConvertFrom-DvReceiptText {
         $rest = Get-DvJsonRootObjectWithout -Text $Text -Name 'displayPath' -Under 'venue'
         if ($null -eq $rest) { throw $first }
         try { $parsed = $rest | ConvertFrom-Json } catch { throw $first }
+        while ($parsed -is [System.Array] -and $parsed.Count -eq 1) { $parsed = $parsed[0] }   # r2 adversary A2: the record inside nested one-element arrays
         $venue = Get-DvProp $parsed 'venue'
         if ($venue -isnot [System.Management.Automation.PSCustomObject]) { throw $first }
         Add-Member -InputObject $venue -NotePropertyName displayPath -NotePropertyValue $script:DisplayPathUnparsed -Force
     }
+    while ($parsed -is [System.Array] -and $parsed.Count -eq 1) { $parsed = $parsed[0] }
     $parsed
 }
 
@@ -6964,6 +6970,9 @@ function ConvertFrom-DvProbeStdout([string]$Stdout) {
                 try { if ($raw) { $probe = ($rest | ConvertFrom-Json -DateKind String) } else { $probe = ($rest | ConvertFrom-Json) } } catch { return $null }
                 $blockStoppedParse = $true
             }
+            # r2 adversary A2: ConvertFrom-Json unwraps only the outer array, so `[[probe]]` reads as a one-element array the checks below skipped and `return` unrolled.
+            # The record inside nested one-element arrays is the probe, and its root is not one object, so its block is malformed (below).
+            while ($probe -is [System.Array] -and $probe.Count -eq 1) { $probe = $probe[0] }
             # SUCCESSOR-2 W2 (pass-2 A3): a duplicate key at displayPath or anywhere inside it (or text the duplicate check cannot read) is a malformed block, never the last copy.
             # SUCCESSOR-3 W2 (A2): in any letter case (Test-DvJsonPathUnder), and a line whose root is not one object (a one-element array ConvertFrom-Json unwraps) too
             if ($probe -is [System.Management.Automation.PSCustomObject]) {
