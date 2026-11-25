@@ -348,6 +348,8 @@ function Get-RowFigures([string]$ReceiptPath, $Leg, [string]$Backend) {
     # SUCCESSOR-3 r3 (sol r2 B2): the display path (and the venue that holds it) is judged BEFORE the identity gate below, which reads the venue's name: a null or
     # non-object venue (`"Venue": null` kept after a good `venue`) or a malformed block is the validator's typed INVALID / DISPLAY_PATH_MALFORMED, rejected with no
     # figure, never RECEIPT_IDENTITY_MISMATCH. The display path ALONE (the reason Test-DvReceiptValid puts first): no core call, as a bad record is bad on every outcome.
+    # r4 (fable r3 B1): an empty, `null` or `[]` file reads as $rc = $null; the call answers `absent` (no record, no block) and the identity gate below types the row
+    # RECEIPT_IDENTITY_MISMATCH, as before this call existed. This line is outside any `try` under ErrorActionPreference Stop, so it must never throw on a $null.
     $display = Get-DvReceiptDisplayPathState -Receipt $rc -ReceiptText $rcText
     if ($display.state -ceq 'malformed') {
         $f.verification = [ordered]@{ status = 'INVALID'; valid = $false; reasons = @(Get-DvDisplayPathMalformedReason -Display $display) }

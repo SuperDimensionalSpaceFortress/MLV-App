@@ -702,7 +702,8 @@ describes the display path **at submit time**, never "during the run". A measure
 | `schema`, `collectedUtc` | `mlv-app/venue-display-path/v1`; when the probe finished reading it (UTC text, stamped after the last read and rounded up to the second, so it never names a time before the data existed) |
 | `sampledBefore` | always `"measurement-submit"`: the sample was taken by the health probe before the measurement job was submitted |
 | `adapters` | every `Win32_VideoController`: `name`, `driverVersion`, `driverDate` (ISO 8601 UTC), `pnpDeviceId`, `hasActiveOutput` (true when the controller reports a refresh rate or a width) |
-| `activeDisplays` | one entry per adapter with an active output: `adapterName`, `refreshHz`, `horizontalResolution`, `verticalResolution` |
+| `activeDisplays` | one entry per active display: `adapterName`, `refreshHz`, `horizontalResolution`, `verticalResolution`. `Win32_VideoController` reports one current mode per adapter, so the list is written only when `activeDisplayCount` equals the number of adapters with an active output; otherwise (an adapter that drives two displays, or a count that cannot be read) it is a typed unknown (`per-display-not-enumerable` / `per-display-unproven`) |
+| `activeDisplayCount` | the number of active displays (`root\wmi` `WmiMonitorBasicDisplayParams`, `Active`), or a typed unknown; a list in `activeDisplays` must have exactly this many entries |
 | `os` | `build` and `ubr` (registry `CurrentBuild` / `UBR`), `lastBootUtc` (ISO 8601 UTC), `hotfixCount` (`Win32_QuickFixEngineering`) |
 | `powerPlan` | the active power plan's name (`root\cimv2\power` `Win32_PowerPlan`, `IsActive`) |
 
@@ -714,11 +715,12 @@ changes), `present` (a well-formed block, one whose every probe failed included:
 outcome). The block is written to no hashed artifact, so it is listed under `unbound` (`DISPLAY_PATH_UNBOUND`, and `venue.displayPath` in a sheet-pair record); the validator
 adds that entry only to a receipt whose core result already lists unbound claims (a PASS / FAIL path), so a NO_SIGNAL receipt carries the block without the entry. A venue
 that is not an object, a schema that is not the exact string, a time that is not a `...Z` UTC spelling, a typed unknown with any member besides `state` and `reason`, and an
-`activeDisplays` table that does not match the adapters' `hasActiveOutput` flags are all `malformed`; so is a block without the exact `sampledBefore`.
+`activeDisplays` table that does not match the adapters' `hasActiveOutput` flags are all `malformed`; so is a block without the exact `sampledBefore`, and an
+`activeDisplays` list whose `activeDisplayCount` is not an int equal to its length (a collapsed per-adapter record never reads as per-display).
 A text leaf that looks like a time (a power plan, an adapter or a reason named `2026-11-24T00:00:00Z`) stays a text leaf: every receipt reader parses with
 `ConvertFrom-Json`, which hands such text back as a `[datetime]`, and the validator accepts that round-tripped value at a text leaf (and compares adapter names by
 it), so a reload never turns a NO_SIGNAL or valid block INVALID. The runner's own probe-line parse keeps the exact text where the host has `-DateKind String`
-(pwsh 7.5+). Moving every venue receipt reader to `-DateKind String` is successor VENUE-RECEIPT-READER-DATEKIND-STRING-1.
+(pwsh 7.5+), and so do the three receipt-file readers when they judge the block (they hand the validator the file text), so there two spellings of one instant stay two adapter names. Moving every venue receipt reader to `-DateKind String` is successor VENUE-RECEIPT-READER-DATEKIND-STRING-1.
 Read a regression across two legs by comparing these blocks first: a different active adapter, refresh rate, boot time, UBR or power plan is a venue change, not a code one.
 
 ## How to read the evidence

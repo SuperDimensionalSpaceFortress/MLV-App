@@ -6168,7 +6168,11 @@ function Get-DvReceiptDisplayPathState {
     alone: state absent | present | malformed, with problems. It calls no core validator and reads no file, so a reader can refuse a malformed block (or a venue that
     is null or not an object) BEFORE any gate that reads the venue, without wrapping the core validator in a `try` (the W0 hazard).
     #>
-    param([Parameter(Mandatory)]$Receipt, [string]$ReceiptText = '')
+    # SUCCESSOR-3 r4 (fable r3 B1): [AllowNull()]: a receipt FILE whose text is empty, `null` or `[]` reads as $null (ConvertFrom-DvReceiptText). There is no record,
+    # so there is no display path to judge: the state is `absent` and the reader's own gates (Baseline's identity gate, the pair scripts' flavor gate) type it, as
+    # they did before this pre-gate call existed. A Mandatory parameter refused $null with a raw binding error that ended Invoke-VenueBaseline.ps1 (exit 1, no rows).
+    param([Parameter(Mandatory)][AllowNull()]$Receipt, [string]$ReceiptText = '')
+    if ($null -eq $Receipt) { return [pscustomobject]@{ state = 'absent'; problems = @() } }
     # SUCCESSOR-3 r3 (adversary pass-4 A1): ConvertFrom-Json reads `2026-11-24T00:00:00Z` and `2026-11-24T00:00:00.000Z` as ONE [datetime], so an adapter name and a
     # display entry's adapterName that differ as text matched. A caller that holds the receipt's TEXT has the block judged from that text with every string kept as
     # written (the probe reader already reads its line that way). A text that does not read so (only a hand-made one) leaves the caller's object, as before.
@@ -6501,7 +6505,7 @@ function Get-DvDisplayPath {
     }
     try {
         # SUCCESSOR-2 W4 (pass-2 A5): collectedUtc is stamped AFTER the last read (below), rounded UP to the whole second, so it never names a time before the data existed
-        $block = [ordered]@{ schema = 'mlv-app/venue-display-path/v1'; sampledBefore = 'measurement-submit'; collectedUtc = $null; adapters = $null; activeDisplays = $null; os = $null; powerPlan = $null }
+        $block = [ordered]@{ schema = 'mlv-app/venue-display-path/v1'; sampledBefore = 'measurement-submit'; collectedUtc = $null; adapters = $null; activeDisplays = $null; activeDisplayCount = $null; os = $null; powerPlan = $null }
 
         # video adapters, and which of them has an active output (a refresh rate or a width the controller reports)
         $rows = $null; $rowsWhy = ''
@@ -6521,6 +6525,18 @@ function Get-DvDisplayPath {
             }
             $block.adapters = @($adapters)
             $block.activeDisplays = @($displays)
+        }
+        # SUCCESSOR-3 r4 (sol r3, card item 3 "per active display"): Win32_VideoController reports ONE current mode per adapter, so an adapter that drives two
+        # displays (3840x2400@59 and 1920x1080@144) gave one entry. The active displays are counted on their own (root\wmi WmiMonitorBasicDisplayParams, Active):
+        # the per-adapter entries are the per-display modes only when that count equals the number of entries; otherwise the list is a typed unknown, never a
+        # collapsed list that reads as present.
+        $displayCount = $null
+        try { $mons = & $cim 'WmiMonitorBasicDisplayParams' 'root\wmi'; $displayCount = @(@($mons) | Where-Object { $null -ne $_ -and $_.Active -eq $true }).Count }
+        catch { $displayCount = & $unknown ('display-count-unreadable: ' + $_.Exception.Message) }
+        $block.activeDisplayCount = $displayCount
+        if ($null -ne $rows) {
+            if ($displayCount -isnot [int]) { $block.activeDisplays = & $unknown 'per-display-unproven: the active display count is unreadable' }
+            elseif ($displayCount -ne $displays.Count) { $block.activeDisplays = & $unknown ("per-display-not-enumerable: $displayCount active display(s), $($displays.Count) adapter mode(s)") }
         }
 
         # Windows build + UBR (registry, local and instant), last boot (CIM), installed hotfix count (CIM, slowest: last)
@@ -6883,6 +6899,18 @@ function Test-DvDisplayPathBlock {
             foreach ($f in $t.fields) {
                 if (-not (Test-DvDisplayPathLeaf (Get-DvProp $list[$i] $f[0]) $f[1])) { $problems.Add("$($t.name)[$i].$($f[0]) is not a $($f[1]) or a typed unknown") }
             }
+        }
+    }
+    # SUCCESSOR-3 r4 (sol r3, card item 3 "per active display"): the collector's entries are one mode per ADAPTER; they are the per-display modes only when the
+    # active display count says so. A list is present only beside an activeDisplayCount that is an int equal to its length: a list that collapsed two displays
+    # on one adapter into one entry (count 2, one entry) or that cannot show it did not (count unknown or missing) is malformed. A typed-unknown list needs none.
+    $displayCount = Get-DvProp $Block 'activeDisplayCount'
+    if (-not (Test-DvDisplayPathLeaf $displayCount 'int')) { $problems.Add('activeDisplayCount is not an int or a typed unknown') }
+    $displaysForCount = Get-DvProp $Block 'activeDisplays'
+    if ($displaysForCount -is [System.Array]) {
+        if (Test-DvDisplayPathUnknown $displayCount) { $problems.Add('activeDisplays is a list but activeDisplayCount is a typed unknown: one entry per active display is not proven') }
+        elseif (Test-DvDisplayPathLeaf $displayCount 'int') {
+            if ([long]$displayCount -ne $displaysForCount.Count) { $problems.Add("activeDisplays lists $($displaysForCount.Count) entr(ies) but activeDisplayCount is $($displayCount): a list is one entry per active display") }
         }
     }
     # the two tables describe the same adapters: one activeDisplays entry per adapter that has an active output, under that adapter's name (when both are readable lists)

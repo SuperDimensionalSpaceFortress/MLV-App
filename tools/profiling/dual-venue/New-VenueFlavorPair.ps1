@@ -160,7 +160,9 @@ $cinematic = ConvertFrom-DvReceiptText -Text $receiptTexts.cinematic
 # receipt is read, BEFORE any gate that reads its venue or outcome, so a malformed block or a null / non-object venue (`"Venue": null` after a good `venue`) is refused
 # as itself (PAIR_RECEIPT_INVALID, DISPLAY_PATH_MALFORMED) and never as PAIR_VENUE_OR_CARD_DIFFERS or PAIR_RECEIPT_INCOMPLETE. The display path ALONE: no core call, no
 # `try` (a `try` around the validator turned the core's typed CONSENT_REVOKED into a raw throw: the W0 hazard, psm1).
-function Assert-DisplayPathNotMalformed($Receipt, [string]$Text) {
+# r4 (fable r3 B1): a receipt file whose text is empty, `null` or `[]` reads as $null; that is no record and no display path (`absent`), so the flavor gate below
+# refuses it as PAIR_FLAVORS_WRONG, as it did before this call existed, never a raw parameter-binding error.
+function Assert-DisplayPathNotMalformed([AllowNull()]$Receipt, [AllowNull()][AllowEmptyString()][string]$Text) {
     $display = Get-DvReceiptDisplayPathState -Receipt $Receipt -ReceiptText $Text
     if ($display.state -ceq 'malformed') { throw "PAIR_RECEIPT_INVALID receipt $($Receipt.receiptId) is not valid evidence: $(Get-DvDisplayPathMalformedReason -Display $display)" }
 }
