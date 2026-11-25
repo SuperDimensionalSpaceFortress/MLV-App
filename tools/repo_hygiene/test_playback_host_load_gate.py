@@ -33,8 +33,8 @@ SMOKE_SCRIPT = ROOT / "tools" / "profiling" / "run-release-gui-smoke.ps1"
 COMPARE_SCRIPT = ROOT / "tools" / "profiling" / "compare-release-gui-smoke-ab.ps1"
 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (sol r5 B1): the comparator judges a host-load block by VenueChain.psm1's strict rule; its probe imports the same module.
 VENUE_CHAIN_MODULE = ROOT / "tools" / "profiling" / "dual-venue" / "VenueChain.psm1"
-COMPARE_PREAMBLE = (f"Import-Module '{VENUE_CHAIN_MODULE}' -Function ConvertFrom-VenueSmokeHostLoad, Get-VenueReferenceHostLoadRefusal"
-                    " -DisableNameChecking\n")
+COMPARE_PREAMBLE = (f"Import-Module '{VENUE_CHAIN_MODULE}' -Function ConvertFrom-VenueSmokeHostLoad, Get-VenueReferenceHostLoadRefusal,"
+                    " ConvertFrom-VenueSmokeResultText -DisableNameChecking\n")
 # The shipped smoke writes before/after snapshots with collected = a real boolean (run-release-gui-smoke.ps1); a fully measured block carries them.
 SNAPS = "before = [pscustomobject]@{ collected = $true }; after = [pscustomobject]@{ collected = $true }"
 CUDA_AB_SCRIPT = ROOT / "tools" / "profiling" / "run-release-cuda-playback-ab.ps1"
@@ -1611,6 +1611,23 @@ class CompareGuiSmokeAbInconclusiveVerdictTests(_ProbeCase):
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertIn("VERDICT=INCONCLUSIVE", proc.stdout, proc.stdout + proc.stderr)
                 self.assertIn("REFERENCE_PROVISIONAL leg=before reason=hostload-", proc.stdout)
+
+    def test_r6_a1_an_array_wrapped_or_repeated_member_smoke_is_inconclusive(self) -> None:
+        # adversary-de8e3799.json A1, its input: before.hostLoad = [clean] (and a singleton root array, and state exceeded then quiet) read PASS.
+        clean = '{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}'
+        for text in ('{"hostLoad":[' + clean + ']}', '[{"hostLoad":' + clean + '}]',
+                     '{"hostLoad":{"state":"exceeded","state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}'):
+            with self.subTest(text=text):
+                proc = self.run_snippet(
+                    f"$t = '{text}'\n$before = $t | ConvertFrom-Json\n$after = {self.QUIET}\n"
+                    "$h = Get-HostLoadComparisonEvidence -BeforeSmoke $before -AfterSmoke $after -BeforeText $t\n"
+                    "$v = Get-GuiSmokeAbVerdict -Failures @() -HostLoadEvidence $h.evidence\n"
+                    "Write-Host \"VERDICT=$($v.verdict)\"\n")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("VERDICT=INCONCLUSIVE", proc.stdout, proc.stdout + proc.stderr)
+        # without text, a hostLoad array member is still refused (it is read as it is, never through the pipeline)
+        proc = self._verdict("('{\"hostLoad\":[" + clean + "]}' | ConvertFrom-Json)", self.QUIET)
+        self.assertIn("VERDICT=INCONCLUSIVE", proc.stdout, proc.stdout + proc.stderr)
 
     def test_r6_b1_the_comparator_uses_the_venue_readers_one_rule(self) -> None:
         # The class guard: the comparator has no second host-load parser; it imports and calls VenueChain.psm1's.

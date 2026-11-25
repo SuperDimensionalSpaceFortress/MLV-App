@@ -1763,6 +1763,30 @@ function ConvertFrom-VenueSmokeHostLoad {
     [pscustomobject]@{ state = $state; provisional = [bool]$provisional; collected = [bool]$collected; reason = $reason }
 }
 
+function ConvertFrom-VenueSmokeResultText {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (adversary-de8e3799.json A1): a smoke result.json's host-load standing from its TEXT, read the way Get-VenueLegHostLoad
+    reads it: a leading BOM is dropped; a repeated member at the root or under hostLoad reads 'unknown' (ConvertFrom-Json keeps the last one); the document is
+    parsed with -NoEnumerate, so a root or hostLoad singleton array is never unrolled into a clean object; a root that is not one object reads 'unknown'.
+    The block is then judged by ConvertFrom-VenueSmokeHostLoad. Pure.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Text)
+    $unknown = [pscustomobject]@{ state = 'unknown'; provisional = $true; collected = $false; reason = 'the smoke result could not be read' }
+    try {
+        if ([string]::IsNullOrEmpty($Text)) { return $unknown }
+        if ($Text[0] -eq [char]0xFEFF) { $Text = $Text.Substring(1) }
+        $dup = Find-VenueJsonDuplicateMember -Text $Text
+        if ($dup) { $unknown.reason = "the smoke result repeats the member $dup"; return $unknown }
+        $doc = ConvertFrom-Json -InputObject $Text -NoEnumerate
+        if (-not (Test-VenueHlObject $doc)) { $unknown.reason = 'the smoke result is not one JSON object'; return $unknown }
+        ConvertFrom-VenueSmokeHostLoad -HostLoad (Get-VenueHlMember $doc 'hostLoad')
+    } catch {
+        $unknown.reason = "the smoke result could not be read ($($_.Exception.Message -replace '\s+', ' '))"
+        $unknown
+    }
+}
+
 function Test-VenueReceiptIsExportLeg([object]$Rc) {
     # r3 (sol r2 B2): any object-valued export member exempted a playback receipt (export:{} on a playback receipt, or a leg SPEC passed as the receipt). An export
     # leg is now only a receipt shaped as the shipped writer writes one (Invoke-VenueLeg.ps1 `if ($isExport)`): the receipt schema (New-DvReceipt), scale and display
@@ -1834,11 +1858,20 @@ function Get-VenueLegHostLoad {
     # r6 (sol r5 B2): the export exemption is granted ONLY from the PLANNED leg type (-PlannedLegType, from the leg spec the driver planned: Get-VenuePlannedLegType),
     # never inferred from receipt fields. A receipt shaped like an export receipt in a leg planned as playback (or whose planned type is unreadable or not given)
     # is read as a playback leg: it must bind its smoke result, or it is 'unknown' and provisional. The receipt shape check still applies on top of the plan.
-    param([string]$ReceiptPath, [AllowNull()][AllowEmptyString()][string]$ExpectResultJsonSha256, [AllowNull()][AllowEmptyString()][string]$PlannedLegType)
+    # r6 (adversary-de8e3799.json A4): -ExpectReceiptSha256 is the sha256 of the receipt BYTES the caller took its figures from; the receipt read here must be
+    # those same bytes (so a receipt replaced between the two reads, or a duplicate-bearing receipt the figure read accepted, is 'unknown').
+    param([string]$ReceiptPath, [AllowNull()][AllowEmptyString()][string]$ExpectResultJsonSha256, [AllowNull()][AllowEmptyString()][string]$PlannedLegType,
+        [AllowNull()][AllowEmptyString()][string]$ExpectReceiptSha256)
     $unknown = [pscustomobject]@{ state = 'unknown'; provisional = $true; collected = $false; reason = 'no smoke result.json for the leg'; applies = $true }
     try {
         if (-not $ReceiptPath) { return $unknown }
-        $rcText = [IO.File]::ReadAllText($ReceiptPath)
+        $rcBytes = [IO.File]::ReadAllBytes($ReceiptPath)
+        if ($PSBoundParameters.ContainsKey('ExpectReceiptSha256')) {
+            $rcGot = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($rcBytes))
+            if ([string]::IsNullOrEmpty($ExpectReceiptSha256) -or -not [string]::Equals($rcGot, $ExpectReceiptSha256, [StringComparison]::OrdinalIgnoreCase)) { $unknown.reason = 'the receipt is not the bytes the figures were read from'; return $unknown }
+        }
+        $rcText = [Text.Encoding]::UTF8.GetString($rcBytes)
+        if ($rcText.Length -gt 0 -and $rcText[0] -eq [char]0xFEFF) { $rcText = $rcText.Substring(1) }
         # adversary-90151822.json A2: a receipt that repeats a member anywhere is 'unknown' before its export or evidence member is read (the last one would win)
         $rcDup = Find-VenueJsonDuplicateMember -Text $rcText -All
         if ($rcDup) { $unknown.reason = "the receipt repeats the member $rcDup"; return $unknown }
@@ -2320,5 +2353,5 @@ Export-ModuleMember -Function New-VenueCapsProbeId, Get-VenueDriverScriptMissing
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
     Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueStagedArtifactNames, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
-    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueInterleavedLegPlan, Get-VenueLegPreLoadMean, ConvertFrom-VenueSmokeHostLoad, Get-VenuePlannedLegType, Get-VenueLegHostLoad, Test-VenueReceiptIsExportLeg, Get-VenueReferenceHostLoadRefusal, Get-VenueReferenceArmVerdict, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait, Get-VenueRunStartCap, Get-VenueLegPlaySeconds, Get-VenuePlanPlaySeconds, ConvertTo-VenueStartCapTime,Get-VenueLeaseCaps, Resolve-VenueLeaseCaps,
+    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueInterleavedLegPlan, Get-VenueLegPreLoadMean, ConvertFrom-VenueSmokeHostLoad, ConvertFrom-VenueSmokeResultText, Get-VenuePlannedLegType, Get-VenueLegHostLoad, Test-VenueReceiptIsExportLeg, Get-VenueReferenceHostLoadRefusal, Get-VenueReferenceArmVerdict, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait, Get-VenueRunStartCap, Get-VenueLegPlaySeconds, Get-VenuePlanPlaySeconds, ConvertTo-VenueStartCapTime,Get-VenueLeaseCaps, Resolve-VenueLeaseCaps,
     Get-VenueClaimAgeSec, Update-VenueClaim, Start-VenueKeeper, Stop-VenueKeeper, Start-VenueClaimKeeper, Get-VenueClaimKeeperLoss, New-VenueJobLivenessWrite, Write-VenueJobLiveness, Test-VenueJobLivenessReadback, Start-VenueJobLiveness, Stop-VenueJobLiveness

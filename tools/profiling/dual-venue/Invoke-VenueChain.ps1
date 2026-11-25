@@ -183,7 +183,8 @@ if ($LegSet) {
     Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force
     $setPath = Join-Path $here "legsets\$LegSet.json"
     $sp = try { Get-DvLegSetPlan -LegSetPath $setPath -Repeats $Repeats -Backend $(if ($Backend) { $Backend } else { '' }) } catch { Stop-Usage $_.Exception.Message }
-    foreach ($e in $sp.plan) { $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend }) }
+    # r6 (adversary-de8e3799.json A3): the planned leg type is read HERE, at planning, before any leg runs; a spec replaced later never grants an exemption
+    foreach ($e in $sp.plan) { $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend; plannedLegType = (Get-VenuePlannedLegType -SpecPath ([string]$e.specPath)) }) }
 } else {
     $seq = 0
     foreach ($ref in $LegSpec) {
@@ -192,8 +193,9 @@ if ($LegSet) {
         $path = (Resolve-Path -LiteralPath $path).Path
         $legId = try { [string](([IO.File]::ReadAllText($path) | ConvertFrom-Json).legId) } catch { '' }
         if ($legId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$') { $legId = [IO.Path]::GetFileNameWithoutExtension($path) }
+        $plannedType = Get-VenuePlannedLegType -SpecPath $path   # r6 (adversary-de8e3799.json A3): read at planning, before any leg runs
         for ($r = 1; $r -le $Repeats; $r++) {
-            $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f ($plan.Count + 1), $legId, $(if ($Backend) { $Backend } else { 'spec' })); spec = $path; backend = $(if ($Backend) { $Backend } else { '' }) })
+            $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f ($plan.Count + 1), $legId, $(if ($Backend) { $Backend } else { 'spec' })); spec = $path; backend = $(if ($Backend) { $Backend } else { '' }); plannedLegType = $plannedType })
         }
     }
 }
@@ -553,7 +555,7 @@ foreach ($leg in $plan) {
                 $preLoad = Get-LegPreLoadMean $receipt
                 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: the smoke's own host-load verdict (VenueChain.psm1's one reader); provisional or not collected is never a counted class
                 # r6 (sol r5 B2): the export exemption comes only from the leg's PLANNED type (its spec's legType), never from the receipt's shape
-                $hl = Get-VenueLegHostLoad -ReceiptPath $receipt -PlannedLegType (Get-VenuePlannedLegType -SpecPath ([string]$leg.spec))
+                $hl = Get-VenueLegHostLoad -ReceiptPath $receipt -PlannedLegType ([string]$leg.plannedLegType)
                 $hlRefusal = Get-VenueReferenceHostLoadRefusal -LegId $(if ($receipt) { [IO.Path]::GetFileNameWithoutExtension($receipt) } else { "leg:$($leg.name)" }) -Standing $hl
                 # a FOREIGN_FLOOR early exit in ANY probe of the leg (either phase, any attempt, GATE_BUSY retries included) leaves it contended: a later QUIET reading never promotes it to a counted class
                 $class = $(if ($re.verdict -ceq 'COOLDOWN_UNMET' -or $legPreFF -or $legReFF) { 'COOLDOWN_UNMET' } elseif ($null -eq $preLoad) { 'QUIET_PRELOAD_UNKNOWN' } elseif ($preLoad -le 30.0) { $(if ($hlRefusal) { 'HOSTLOAD_PROVISIONAL' } else { 'QUIET_PRELOAD_OK' }) } else { 'QUIET_PRELOAD_HIGH' })

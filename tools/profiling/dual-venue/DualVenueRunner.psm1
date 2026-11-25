@@ -3118,7 +3118,7 @@ function Get-DvMatrixRow {
     $hlState = Get-DvProp $HostLoad 'state'; $hlProv = Get-DvProp $HostLoad 'provisional'
     if ($hlState -is [string] -and [regex]::IsMatch($hlState, '\A[a-z][a-z_-]{0,31}\z')) { $row.hostLoadState = $hlState }
     # r6 (sol r5 B3): provisional unless the standing is clean by Test-DvHostLoadRowClean's rule (state exactly 'quiet' AND provisional a real $false)
-    $row.hostLoadProvisional = -not ($hlProv -is [bool] -and -not $hlProv -and $hlState -is [string] -and $hlState -ceq 'quiet')
+    $row.hostLoadProvisional = -not ($hlProv -is [bool] -and -not $hlProv -and $hlState -is [string] -and [string]::Equals($hlState, 'quiet', [StringComparison]::Ordinal))
     if ($null -eq $Receipt) { $row.note = 'the leg wrote no receipt'; return [pscustomobject]$row }
     $row.outcome = [string](Get-DvProp $Receipt 'outcome'); $row.receiptId = [string](Get-DvProp $Receipt 'receiptId')
     # r6 (sol r5 B1): a visual twin's rates are never read, whichever path its plan entry or receipt came through (the entry's leg id and the receipt's leg id both count)
@@ -3173,7 +3173,8 @@ function Test-DvHostLoadRowClean {
     param([AllowNull()]$Row)
     if ($null -eq $Row) { return $false }
     $st = Get-DvProp $Row 'hostLoadState'; $prov = Get-DvProp $Row 'hostLoadProvisional'
-    ($st -is [string]) -and ($st -ceq 'quiet') -and ($prov -is [bool]) -and (-not $prov)
+    # adversary-de8e3799.json A5: ordinal, never -ceq (culture-aware: 'qui<soft hyphen>et' -ceq 'quiet' is true)
+    ($st -is [string]) -and [string]::Equals($st, 'quiet', [StringComparison]::Ordinal) -and ($prov -is [bool]) -and (-not $prov)
 }
 
 function ConvertTo-DvMatrixHostLoadTable {

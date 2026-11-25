@@ -164,6 +164,10 @@ if ($null -ne $setPlan) {
     $pwshExe = (Get-Process -Id $PID).Path
     $rows = [System.Collections.Generic.List[object]]::new()
     $total = @($setPlan.plan).Count
+    # r6 (adversary-de8e3799.json A3): every entry's planned leg type is read HERE, at planning, before any leg runs (a spec replaced later grants nothing)
+    Import-Module (Join-Path $here 'VenueChain.psm1') -Function Get-VenueLegHostLoad, Get-VenueReferenceHostLoadRefusal, Get-VenuePlannedLegType -DisableNameChecking -Force
+    $plannedTypes = @{}
+    foreach ($pe in $setPlan.plan) { $plannedTypes[[string]$pe.seq] = Get-VenuePlannedLegType -SpecPath ([string]$pe.specPath) }
     foreach ($entry in $setPlan.plan) {
         $childArgs = @('-NoProfile', '-File', $PSCommandPath, '-Venue', $Venue, '-LegSpec', $entry.specPath, '-SourceCommit', $SourceCommit,
             '-BuildManifestSha256', $BuildManifestSha256, '-Backend', $entry.backend, '-ReceiptRoot', $ReceiptRoot, '-Actor', $Actor)
@@ -186,7 +190,8 @@ if ($null -ne $setPlan) {
         foreach ($childLine in $childStdout) { if ($childLine -match '^DVE_RECEIPT_PATH=(?<p>.+)$') { $receiptPath = $Matches['p'].Trim() } }
         $legReceipt = $null
         if ($receiptPath -and (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
-            try { $legReceipt = [IO.File]::ReadAllText($receiptPath) | ConvertFrom-Json } catch { $legReceipt = $null }
+            # r6 (adversary-de8e3799.json A4): read the receipt bytes ONCE; the figures come from them and the host-load read is bound to their sha256
+            try { $legReceiptBytes = [IO.File]::ReadAllBytes($receiptPath); $legReceiptSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($legReceiptBytes)); $legReceipt = [Text.Encoding]::UTF8.GetString($legReceiptBytes).TrimStart([char]0xFEFF) | ConvertFrom-Json } catch { $legReceipt = $null; $legReceiptSha = '' }
         }
         # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): the leg's host-load standing, from its own hash-bound smoke result (the reader the lease batch and the chain
         # use); a provisional or unknown leg is printed as REFERENCE_PROVISIONAL, its row carries hostLoadState / hostLoadProvisional, and it is never measured.
@@ -198,11 +203,11 @@ if ($null -ne $setPlan) {
         }
         # r6 (sol r5 B2): the export exemption comes only from the PLANNED leg type (the planned spec), never from the receipt's shape. (entry.specSha256 is the
         # LF-normalised Get-DvLegSpecSha256, not a raw-byte hash, so it is not passed as the raw-byte bind; an unreadable spec reads 'unknown', never exempt.)
-        $plannedLegType = Get-VenuePlannedLegType -SpecPath ([string]$entry.specPath)
+        $plannedLegType = $(if ($plannedTypes.ContainsKey([string]$entry.seq)) { [string]$plannedTypes[[string]$entry.seq] } else { 'unknown' })
         # (adversary-01a12498.json A2: bound to the receipt the row's figures come from, so a receipt swapped between the two reads reads 'unknown')
         $legHostLoad = $(if ($null -ne $legReceipt) {
             $boundSha = Get-DvProp (Get-DvProp $legReceipt 'evidence') 'resultJsonSha256'
-            Get-VenueLegHostLoad -ReceiptPath $receiptPath -ExpectResultJsonSha256 $(if ($boundSha -is [string]) { $boundSha } elseif ($null -eq $boundSha) { '' } else { 'not-a-sha' }) -PlannedLegType $plannedLegType
+            Get-VenueLegHostLoad -ReceiptPath $receiptPath -ExpectResultJsonSha256 $(if ($boundSha -is [string]) { $boundSha } elseif ($null -eq $boundSha) { '' } else { 'not-a-sha' }) -PlannedLegType $plannedLegType -ExpectReceiptSha256 $legReceiptSha
         } else { $null })
         $row = Get-DvMatrixRow -PlanEntry $entry -Receipt $legReceipt -HostLoad $legHostLoad
         if ($null -ne $legReceipt) {

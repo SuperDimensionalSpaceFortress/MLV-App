@@ -503,12 +503,50 @@ class PlannedLegTypeExemptionTests(unittest.TestCase):
         self.assertEqual(got, {"exp": "export", "play": "playback", "none": "playback", "case": "playback", "dup": "unknown", "arr": "unknown",
                                "bad": "unknown", "arrval": "playback", "missing": "unknown", "empty": "unknown", "exp-bound": "export", "exp-changed": "unknown"})
 
+    def test_r6_a1_the_smoke_result_text_reader_never_unrolls_or_takes_a_repeated_member(self) -> None:
+        # adversary-de8e3799.json A1, its inputs: a singleton root array, a singleton hostLoad array, and state exceeded then quiet.
+        clean = {"state": "quiet", "provisional": False, "before": {"collected": True}, "after": {"collected": True}}
+        texts = {"rootarr": json.dumps([{"hostLoad": clean}]), "hlarr": json.dumps({"hostLoad": [clean]}),
+                 "dupstate": '{"hostLoad":{"state":"exceeded","state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}',
+                 "bom": "﻿" + json.dumps({"hostLoad": clean}), "plain": json.dumps({"hostLoad": clean})}
+        body = "".join(f"$s = ConvertFrom-VenueSmokeResultText -Text '{t.replace(chr(39), chr(39) * 2)}'; Write-Output ('{k}=' + $s.state + '/' + $s.provisional); "
+                       for k, t in texts.items())
+        p = run_ps(body)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+        self.assertEqual(got, {"rootarr": "unknown/True", "hlarr": "unknown/True", "dupstate": "unknown/True", "bom": "quiet/False", "plain": "quiet/False"})
+
+    def test_r6_a4_the_host_load_read_is_bound_to_the_receipt_bytes_the_figures_came_from(self) -> None:
+        # adversary-de8e3799.json A4: figures read from receipt bytes X; the receipt is replaced (same result digest) before the host-load read.
+        import hashlib
+        with tempfile.TemporaryDirectory() as d:
+            quiet = json.dumps({"hostLoad": QUIET})
+            sha = hashlib.sha256(quiet.encode("utf-8")).hexdigest()
+            rid = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+            path = self.write_leg(Path(d), rid, {"receiptId": rid, "outcome": "PASS", "evidence": {"resultJsonSha256": sha}}, {"hostLoad": QUIET})
+            first = '{"receiptId":"' + rid + '","outcome":"INVALID","outcome":"PASS","evidence":{"resultJsonSha256":"' + sha + '"}}'
+            first_sha = hashlib.sha256(first.encode("utf-8")).hexdigest()
+            now_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+            p = run_ps(f"$a = Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType 'playback' -ExpectReceiptSha256 '{first_sha}'; "
+                       f"$b = Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType 'playback' -ExpectReceiptSha256 '{now_sha}'; "
+                       "Write-Output ('A=' + $a.state + '/' + $a.provisional); Write-Output ('B=' + $b.state + '/' + $b.provisional)")
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("A=unknown/True", p.stdout, "a receipt that is not the bytes the figures came from is unknown")
+        self.assertIn("B=quiet/False", p.stdout, "the same bytes still read their own standing")
+
     def test_r6_b2_every_driver_passes_the_planned_type_to_the_reader(self) -> None:
         # The class guard: every production call of Get-VenueLegHostLoad passes -PlannedLegType from the planned spec (Get-VenuePlannedLegType).
-        drivers = {"Invoke-VenueChain.ps1": "Get-VenuePlannedLegType -SpecPath ([string]$leg.spec)",
+        # adversary-de8e3799.json A3: chain, baseline and matrix read the planned type AT PLANNING (before any leg runs); the batch binds its read to the
+        # preflight-judged bytes. A4: matrix and baseline bind the host-load read to the receipt bytes the figures came from.
+        drivers = {"Invoke-VenueChain.ps1": "plannedLegType = (Get-VenuePlannedLegType -SpecPath ([string]$e.specPath))",
                    "Invoke-VenueLeaseBatch.ps1": "Get-VenuePlannedLegType -SpecPath ([string]$leg.spec) -ExpectSpecSha256 $planSha",
-                   "Invoke-VenueBaseline.ps1": "$hlPlanned = Get-VenuePlannedLegType -SpecPath",
-                   "Invoke-VenueLeg.ps1": "$plannedLegType = Get-VenuePlannedLegType -SpecPath ([string]$entry.specPath)"}
+                   "Invoke-VenueBaseline.ps1": "plannedLegType = (Get-VenuePlannedLegType -SpecPath (Resolve-Path -LiteralPath $path).Path)",
+                   "Invoke-VenueLeg.ps1": "$plannedTypes[[string]$pe.seq] = Get-VenuePlannedLegType -SpecPath ([string]$pe.specPath)"}
+        chain = (DV_DIR / "Invoke-VenueChain.ps1").read_text(encoding="utf-8")
+        self.assertIn("-PlannedLegType ([string]$leg.plannedLegType)", chain)
+        self.assertNotIn("-PlannedLegType (Get-VenuePlannedLegType", chain, "never re-read at classification")
+        for script in ("Invoke-VenueLeg.ps1", "Invoke-VenueBaseline.ps1"):
+            self.assertIn("-ExpectReceiptSha256", (DV_DIR / script).read_text(encoding="utf-8"), script)
         for script, plan_call in drivers.items():
             with self.subTest(script=script):
                 text = (DV_DIR / script).read_text(encoding="utf-8")
@@ -543,6 +581,12 @@ class MatrixRowStrictPredicateTests(unittest.TestCase):
         for k in rows:
             with self.subTest(row=k):
                 self.assertEqual(got[k], "1,True" if k == "quiet" else "0,False", (k, got[k]))
+
+    def test_r6_a5_a_soft_hyphenated_quiet_row_is_not_clean(self) -> None:
+        # adversary-de8e3799.json A5, its input: hostLoadState 'qui<U+00AD>et' (culture-aware -ceq says equal), provisional false -> counted 1.
+        out = self.run_dv("Write-Output ('N=' + (Get-DvMatrixMeasuredCount -Rows @([pscustomobject]@{ outcome = 'PASS'; presentedFps = 59.56; "
+                          "hostLoadState = ('qui' + [char]0x00AD + 'et'); hostLoadProvisional = $false })))")
+        self.assertIn("N=0", out)
 
     def test_r6_b3_the_row_builder_and_the_medians_use_the_strict_rule(self) -> None:
         out = self.run_dv(

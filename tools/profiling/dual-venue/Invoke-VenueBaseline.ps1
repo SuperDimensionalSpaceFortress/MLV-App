@@ -209,7 +209,8 @@ foreach ($rel in $StandardLegs) {
     $path = Join-Path $here $rel
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { Stop-Baseline 'USAGE' "no standard leg spec at '$path'" }
     $spec = try { [IO.File]::ReadAllText($path) | ConvertFrom-Json } catch { Stop-Baseline 'USAGE' "leg spec '$path' is not valid JSON" }
-    $legs.Add([pscustomobject]@{ legId = [string]$spec.legId; card = [string]$spec.card; spec = (Resolve-Path -LiteralPath $path).Path; backends = @($spec.backends); role = (Get-DvVenueRole -Table $table -Card ([string]$spec.card) -Venue $Venue) })
+    # r6 (adversary-de8e3799.json A3): plannedLegType is read HERE, at planning, before any chain runs (a spec replaced later grants nothing)
+    $legs.Add([pscustomobject]@{ legId = [string]$spec.legId; card = [string]$spec.card; spec = (Resolve-Path -LiteralPath $path).Path; backends = @($spec.backends); role = (Get-DvVenueRole -Table $table -Card ([string]$spec.card) -Venue $Venue); plannedLegType = (Get-VenuePlannedLegType -SpecPath (Resolve-Path -LiteralPath $path).Path) })
 }
 
 $deadline = $startedUtc.AddSeconds($MaxTotalSec)
@@ -339,9 +340,10 @@ function Invoke-BoundedChain([string]$Backend) {
 function Get-RowFigures([string]$ReceiptPath, $Leg, [string]$Backend) {
     # The figures exactly as the receipt reports them (null when the receipt does not carry one; never a default). presentedFps / timelineFpsAfterFirstPresent come from
     # the receipt's own hashed run log through Get-DvMatrixRow, which refuses a log that no longer hashes to the receipt.
-    $f = [ordered]@{ receipt = $null; outcome = $null; fps = $null; drops = $null; stall = $null; verification = $null; rejected = $null; noFigure = $null; identity = $null; resultJsonSha256 = $null }
+    $f = [ordered]@{ receipt = $null; outcome = $null; fps = $null; drops = $null; stall = $null; verification = $null; rejected = $null; noFigure = $null; identity = $null; resultJsonSha256 = $null; receiptSha256 = $null }
     if (-not $ReceiptPath -or -not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) { return $f }
-    try { $rc = [IO.File]::ReadAllText($ReceiptPath) | ConvertFrom-Json } catch { return $f }
+    # r6 (adversary-de8e3799.json A4): the receipt bytes are read ONCE; the figures come from them and the host-load read is bound to their sha256
+    try { $rcBytes = [IO.File]::ReadAllBytes($ReceiptPath); $rc = [Text.Encoding]::UTF8.GetString($rcBytes).TrimStart([char]0xFEFF) | ConvertFrom-Json; $f.receiptSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($rcBytes)) } catch { return $f }
     # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (adversary-01a12498.json A2): the smoke binding of the receipt these figures come from; the host-load read is bound to it
     $boundSha = Get-DvProp (Get-DvProp $rc 'evidence') 'resultJsonSha256'
     $f.resultJsonSha256 = $(if ($boundSha -is [string]) { $boundSha } elseif ($null -eq $boundSha) { '' } else { 'not-a-sha' })
@@ -461,8 +463,8 @@ foreach ($b in $StandardBackends) {
             $hlReceipt = $(if ($leg.PSObject.Properties['receipt'] -and $leg.receipt) { [string]$leg.receipt } else { '' })
             # (adversary-01a12498.json A2: bound to the receipt Get-RowFigures took the figures from; no receipt read there means no figures and no expectation)
             # r6 (sol r5 B2): the export exemption comes only from the PLANNED leg type (the plan leg's spec), never from the receipt's shape
-            $hlPlanned = Get-VenuePlannedLegType -SpecPath $(if ($null -ne $planLeg -and $planLeg.spec) { [string]$planLeg.spec } else { '' })
-            $hl = $(if ($null -ne $fig.resultJsonSha256) { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -ExpectResultJsonSha256 ([string]$fig.resultJsonSha256) -PlannedLegType $hlPlanned } else { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -PlannedLegType $hlPlanned })
+            $hlPlanned = $(if ($null -ne $planLeg -and $planLeg.PSObject.Properties['plannedLegType']) { [string]$planLeg.plannedLegType } else { 'unknown' })
+            $hl = $(if ($null -ne $fig.resultJsonSha256) { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -ExpectResultJsonSha256 ([string]$fig.resultJsonSha256) -PlannedLegType $hlPlanned -ExpectReceiptSha256 ([string]$fig.receiptSha256) } else { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -PlannedLegType $hlPlanned })
             $hlLine = Get-VenueReferenceHostLoadRefusal -LegId $(if ($hlReceipt) { [IO.Path]::GetFileNameWithoutExtension($hlReceipt) } else { [string]$planLeg.legId }) -Standing $hl
             if ($hlLine -and $legStatus -ceq 'RAN') { Out-Line $hlLine }
             $rows.Add([ordered]@{

@@ -20,7 +20,7 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')
 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (sol r5 B1): the host-load block is judged by the venue reader's ONE strict rule (VenueChain.psm1
 # ConvertFrom-VenueSmokeHostLoad and Get-VenueReferenceHostLoadRefusal), never by a second, looser parser here.
-Import-Module (Join-Path $PSScriptRoot 'dual-venue\VenueChain.psm1') -Function ConvertFrom-VenueSmokeHostLoad, Get-VenueReferenceHostLoadRefusal -DisableNameChecking
+Import-Module (Join-Path $PSScriptRoot 'dual-venue\VenueChain.psm1') -Function ConvertFrom-VenueSmokeHostLoad, Get-VenueReferenceHostLoadRefusal, ConvertFrom-VenueSmokeResultText -DisableNameChecking
 
 function Read-SmokeJson {
     param([string]$Path)
@@ -402,18 +402,29 @@ function Get-HostLoadComparisonEvidence {
     # gate existed has no hostLoad field at all, which is also UNKNOWN, never "quiet"). An fps
     # number measured on a loaded host is not a property of the build, so a provisional leg is
     # never usable as a regression signal, whatever the other leg's state is.
+    # adversary-de8e3799.json A1: -BeforeText / -AfterText (the smoke result files' own text) are judged by VenueChain.psm1 ConvertFrom-VenueSmokeResultText,
+    # so a singleton root or hostLoad array is never unrolled and a repeated member is 'unknown'. Without the text, the hostLoad member is read as it is
+    # (never through the pipeline), so an array-valued hostLoad stays an array and reads 'unknown'.
     param(
         [object]$BeforeSmoke,
-        [object]$AfterSmoke
+        [object]$AfterSmoke,
+        [AllowNull()][AllowEmptyString()][string]$BeforeText,
+        [AllowNull()][AllowEmptyString()][string]$AfterText
     )
 
     $evidence = [ordered]@{}
     $failures = @()
     foreach ($leg in @(
-        [pscustomobject]@{ Name = "before"; Smoke = $BeforeSmoke },
-        [pscustomobject]@{ Name = "after"; Smoke = $AfterSmoke }
+        [pscustomobject]@{ Name = "before"; Smoke = $BeforeSmoke; HasText = $PSBoundParameters.ContainsKey('BeforeText'); Text = $BeforeText },
+        [pscustomobject]@{ Name = "after"; Smoke = $AfterSmoke; HasText = $PSBoundParameters.ContainsKey('AfterText'); Text = $AfterText }
     )) {
-        $legHostLoad = Get-NestedValue $leg.Smoke "hostLoad"
+        $legHostLoad = $null
+        $smokeObj = $leg.Smoke
+        if ($null -ne $smokeObj -and $smokeObj -isnot [Array] -and $smokeObj -isnot [string] -and $smokeObj -isnot [ValueType]) {
+            # a plain assignment keeps an array value an array (no pipeline), so ConvertFrom-VenueSmokeHostLoad sees it and refuses it
+            if ($smokeObj -is [System.Collections.IDictionary]) { if ($smokeObj.Contains('hostLoad')) { $legHostLoad = $smokeObj['hostLoad'] } }
+            else { $hlProp = $smokeObj.PSObject.Properties['hostLoad']; if ($null -ne $hlProp) { $legHostLoad = $hlProp.Value } }
+        }
         # round 3: a hostLoad block that is PRESENT but missing "provisional" (or "state") must
         # read the same as a missing block entirely -- provisional/unknown, never coerced to
         # clean. [bool]$null -eq $false is the trap: it would make a degenerate block silently
@@ -432,7 +443,7 @@ function Get-HostLoadComparisonEvidence {
         # clean only when state is exactly the string 'quiet', provisional is a real [bool] $false (not 0, not [false], not a string) and the before and after
         # snapshots (and every during sample) are collected = a real [bool] $true. A quiet/false block beside before.collected=false (a CimException), state
         # 'QUIET', provisional 0 or [false] all read state 'unknown' (or the declared state) and provisional, so the verdict is INCONCLUSIVE, never PASS.
-        $judged = ConvertFrom-VenueSmokeHostLoad -HostLoad $legHostLoad
+        $judged = if ($leg.HasText) { ConvertFrom-VenueSmokeResultText -Text $leg.Text } else { ConvertFrom-VenueSmokeHostLoad -HostLoad $legHostLoad }
         $legState = [string]$judged.state
         $legProvisional = [bool]$judged.provisional
         $legReason = if ($null -eq $legHostLoad) {
@@ -1012,7 +1023,8 @@ foreach ($leg in @(
         $failures += "$($leg.Name) smoke did not prove displayed-frame advancement."
     }
 }
-$hostLoadComparison = Get-HostLoadComparisonEvidence -BeforeSmoke $beforeSmoke -AfterSmoke $afterSmoke
+# adversary-de8e3799.json A1: the host load is judged from each smoke file's own text (no root/hostLoad unrolling, a repeated member is unknown)
+$hostLoadComparison = Get-HostLoadComparisonEvidence -BeforeSmoke $beforeSmoke -AfterSmoke $afterSmoke -BeforeText ([IO.File]::ReadAllText($beforeJsonPath)) -AfterText ([IO.File]::ReadAllText($afterJsonPath))
 $hostLoadEvidence = $hostLoadComparison.evidence
 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): a host-load refusal is no longer a failure (it read FAIL);
 # it is kept in hostLoadRefusals and makes the verdict INCONCLUSIVE (Get-GuiSmokeAbVerdict, below).
@@ -1142,6 +1154,17 @@ if ($displayComparability.status -ne 'same' -or [string]::Equals([string]$result
     foreach ($fpsField in @('visibleBottomLeftGuiFps', 'smokePresentedFps', 'smokeTimelineFps')) {
         $result.fps.$fpsField.delta = $null
         $result.fps.$fpsField.deltaPercent = $null
+    }
+}
+# adversary-de8e3799.json A2: an INCONCLUSIVE comparison publishes no cross-leg delta at all: every autoDecision delta object (averageMs,
+# averageFpsEquivalent, targetFps, ...) loses its delta and deltaPercent too, in the JSON and in the summary line below.
+if ([string]::Equals([string]$result.verdict, 'INCONCLUSIVE', [StringComparison]::Ordinal) -and $null -ne $result.autoDecision) {
+    foreach ($adProp in @($result.autoDecision.PSObject.Properties)) {
+        $adVal = $adProp.Value
+        if ($null -ne $adVal -and $adVal -isnot [string] -and $adVal -isnot [ValueType] -and $null -ne $adVal.PSObject.Properties['delta']) {
+            $adVal.delta = $null
+            if ($null -ne $adVal.PSObject.Properties['deltaPercent']) { $adVal.deltaPercent = $null }
+        }
     }
 }
 
