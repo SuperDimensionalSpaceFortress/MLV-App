@@ -2814,6 +2814,16 @@
     },
     {
       "path": "tests/console/test_playback_fps_meter_policy.cpp",
+      "anchor": "ASSERT_EQ ( 0 , cappedMs ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r6 (sol r5 S1): asserts frameBoundedTickTimeDiffMs's own contract value for an injected 8 ms tick at a +inf rate (the cut leaves 0 ms); pure arithmetic on literal inputs, no stage-ran inference and no clock read.",
+      "lines": [
+        522
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_fps_meter_policy.cpp",
       "anchor": "ASSERT_EQ ( 0 , stampAgeMs ( FakeStamp { false , 10 } , FakeStamp { true , 52 } ) ) ;",
       "class": "not_run_proof_structural",
       "clock": "other",

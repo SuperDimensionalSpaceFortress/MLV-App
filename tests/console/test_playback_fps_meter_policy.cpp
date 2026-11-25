@@ -472,3 +472,75 @@ TEST(PlaybackFpsMeterPolicy, OneTickLapsStayWithinTheBoundFromAStartAtOrPastTheL
     ASSERT_EQ(1000000, below.wrapLaps);
     ASSERT_TRUE(below.position == 1000000.0 + 0.5 - 1000000.0);
 }
+
+// r6 (sol r5 S2): the fold keeps the tick's delta and the accounting the slip histogram reads (MainWindow's
+// grantedDropFrames = position - before + foldedFrames + wrapWidth * wrapLaps) is the advance the tick applied.
+TEST(PlaybackFpsMeterPolicy, AFoldedStartKeepsItsDeltaAndTheAppliedAdvanceAccounting)
+{
+    using playback_frame_range::advanceDropFrameTick;
+    using playback_frame_range::DropFrameTickResult;
+    const auto granted = [](const DropFrameTickResult & tick, double before) {
+        return tick.position - before + tick.foldedFrames + static_cast<double>( tick.wrapWidth ) * tick.wrapLaps;
+    };
+    const DropFrameTickResult stale = advanceDropFrameTick(1100000.0, 1.0, 1, 2, true, false);
+    ASSERT_TRUE(stale.foldedFrames == 1099999.0);
+    ASSERT_TRUE(granted(stale, 1100000.0) == 1.0);
+    const DropFrameTickResult bounded = advanceDropFrameTick(1100000.0, 999990.0, 1, 2, true, false);
+    ASSERT_EQ(999991, bounded.wrapLaps);
+    ASSERT_TRUE(granted(bounded, 1100000.0) == 999990.0);
+    const DropFrameTickResult farStale = advanceDropFrameTick(1000001.0, 2.4, 1, 2, true);
+    ASSERT_TRUE(std::fabs(granted(farStale, 1000001.0) - 2.4) < 1e-6);
+    const DropFrameTickResult wide = advanceDropFrameTick(2000000000.0, 3.0, 1, 720, true, false);
+    ASSERT_TRUE(std::fabs(granted(wide, 2000000000.0) - 3.0) < 1e-6);
+    const DropFrameTickResult conformed = advanceDropFrameTick(2000002.0, 0.5, 1, 2, true, true);
+    ASSERT_EQ(2, conformed.wrapWidth);
+    ASSERT_TRUE(std::fabs(granted(conformed, 2000002.0) - 0.5) < 1e-9);
+    // a folded start whose (negative) delta ends below wrapAt made no lap: the fold was its only move back
+    const DropFrameTickResult back = advanceDropFrameTick(1100000.0, -5.5, 1, 2, true, false);
+    ASSERT_TRUE(back.wrapped);
+    ASSERT_EQ(0, back.wrapLaps);
+    ASSERT_TRUE(granted(back, 1100000.0) == -5.5);
+    // a +inf start is not a number of frames: it folds to wrapAt and reports an infinite fold
+    const DropFrameTickResult endlessStart = advanceDropFrameTick(HUGE_VAL, 1.0, 1, 2, true, false);
+    ASSERT_TRUE(std::isinf(endlessStart.foldedFrames));
+    ASSERT_TRUE(std::fabs(endlessStart.position) < 1e-9);
+    // nothing is folded below the limit, inside the cut, or without Loop
+    ASSERT_TRUE(advanceDropFrameTick(1000000.0, 0.5, 1, 2, true, false).foldedFrames == 0.0);
+    ASSERT_TRUE(advanceDropFrameTick(20.0, 0.1, 1, 2, true).foldedFrames == 0.0);
+    ASSERT_TRUE(advanceDropFrameTick(0.5, 1000000.0, 1, 2, true).foldedFrames == 0.0);
+    ASSERT_TRUE(advanceDropFrameTick(1100000.0, 1.0, 1, 2, false).foldedFrames == 0.0);
+}
+
+// r6 (sol r5 S1 on 6aaac7f5): the Drop Frame request is finite. An accepted rate the cut cannot bound (+inf: a silent MLV
+// with FPS denominator 0) left an 8 ms tick at 0 ms and the call site's expression read inf * 0 = NaN; the request now
+// fails closed to 0 frames, and every finite request is the former expression, bit for bit.
+TEST(PlaybackFpsMeterPolicy, DropFrameRequestIsTheCallSitesExpressionWhenFiniteAndNothingOtherwise)
+{
+    using playback_fps_meter::dropFrameRequestFrames;
+    using playback_fps_meter::frameBoundedTickTimeDiffMs;
+    const int cappedMs = frameBoundedTickTimeDiffMs(8, HUGE_VAL);
+    ASSERT_EQ(0, cappedMs);
+    ASSERT_TRUE(std::isnan(HUGE_VAL * (double)cappedMs / 1000.0)); // what 6aaac7f5 handed the pace guard
+    const double request = dropFrameRequestFrames(HUGE_VAL, cappedMs);
+    ASSERT_TRUE(std::isfinite(request));
+    ASSERT_TRUE(request == 0.0);
+    ASSERT_TRUE(dropFrameRequestFrames(HUGE_VAL, 8) == 0.0);
+    ASSERT_TRUE(dropFrameRequestFrames(-HUGE_VAL, 8) == 0.0);
+    ASSERT_TRUE(dropFrameRequestFrames(std::nan(""), 8) == 0.0);
+    ASSERT_TRUE(dropFrameRequestFrames(1.0e308, INT_MAX) == 0.0); // overflows to inf
+    // every finite request is unchanged, bit for bit
+    const double ntsc = 24000.0 / 1001.0;
+    ASSERT_TRUE(dropFrameRequestFrames(24.0, 8) == 24.0 * (double)8 / 1000.0);
+    ASSERT_TRUE(dropFrameRequestFrames(ntsc, 42) == ntsc * (double)42 / 1000.0);
+    ASSERT_TRUE(dropFrameRequestFrames(ntsc, -42) == ntsc * (double)-42 / 1000.0);
+    ASSERT_TRUE(dropFrameRequestFrames(24.0, 0) == 0.0);
+    const double rate = 27777500.0 / 1771.0;
+    const int keptMs = frameBoundedTickTimeDiffMs(63757, rate);
+    ASSERT_TRUE(dropFrameRequestFrames(rate, keptMs) == rate * (double)keptMs / 1000.0);
+    ASSERT_TRUE(dropFrameRequestFrames(rate, keptMs) <= playback_fps_meter::kMaxTickFrames);
+    // the drop tick sol traced (eligible 8 ms, Loop cut 1..100) now lands on a finite position
+    const playback_frame_range::DropFrameTickResult tick =
+        playback_frame_range::advanceDropFrameTick(10.0, request, 1, 100, true);
+    ASSERT_TRUE(std::isfinite(tick.position));
+    ASSERT_TRUE(tick.position == 10.0);
+}

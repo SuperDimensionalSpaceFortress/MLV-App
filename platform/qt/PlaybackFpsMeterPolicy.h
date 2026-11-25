@@ -13,6 +13,7 @@
 #define PLAYBACKFPSMETERPOLICY_H
 
 #include <climits>
+#include <cmath>
 
 namespace playback_fps_meter
 {
@@ -62,7 +63,8 @@ inline int stampAgeMs( const Stamp & then, const Stamp & now )
  *  can round up one more, so 0.9999999999999999 + 1e6 made 1,000,001 width-1 laps; conform debt adds at most
  *  kConformMaxDebtFrames = 8). 999,990 frames is more than 11 hours of catch-up at 24 fps. This bound covers a tick that
  *  starts inside the cut; a stale start outside it (r4 pass 5 A1) is bounded where the laps are counted, in
- *  playback_frame_range::advanceDropFrameTick (at most 1e6 laps from any start). */
+ *  playback_frame_range::advanceDropFrameTick (at most 1e6 laps from any start: r6, sol r5 S2, a start already at or
+ *  past that tick's lap limit is folded back to its first lap before the delta applies, DropFrameTickResult::foldedFrames). */
 inline constexpr double kMaxTickFrames = 999990.0;
 
 /*! The tick's elapsed milliseconds, cut so that \a framerate * ms / 1000 stays within +-kMaxTickFrames. An ordinary
@@ -75,7 +77,9 @@ inline constexpr double kMaxTickFrames = 999990.0;
  *  stays at least 1 ms up to exactly kMaxTickFrames * 1000 = 999,990,000 fps; past that rate even 1 ms is over the bound
  *  and the tick asks for nothing (pass 4 A3; r4 pass 5 A2 on b70f718d: the cutoff was misstated as 1e9). MainWindow passes
  *  the rate only for the Drop Frame request (Normal mode passes 0, so its tick is unchanged at any rate), and the fps
- *  meter gates on the tick shaped BEFORE this cut (r5, pass 8 A3: meterTickMs), so its gate is unchanged in either mode. */
+ *  meter gates on the tick shaped BEFORE this cut (r5, pass 8 A3: shapedTickMs in timerFrameEvent), so its gate is unchanged
+ *  in either mode. A rate this cut cannot bound at all (+inf: every positive age is inf frames) cuts the tick to 0 ms; the
+ *  request it feeds is taken through dropFrameRequestFrames below, which never hands the pace guard a non-finite value. */
 inline int frameBoundedTickTimeDiffMs( int timeDiffMs, double framerate )
 {
     if( !( framerate > 0.0 ) || timeDiffMs == 0 ) return timeDiffMs;
@@ -92,6 +96,21 @@ inline int frameBoundedTickTimeDiffMs( int timeDiffMs, double framerate )
     while( magnitude < kMaxStampAgeMs && static_cast<long long>( magnitude ) < tickMagnitude
         && framerate * static_cast<double>( magnitude + 1 ) / 1000.0 <= kMaxTickFrames ) ++magnitude;
     return timeDiffMs > 0 ? magnitude : -magnitude;
+}
+
+/*! PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r6 (sol r5 S1 on 6aaac7f5): the Drop Frame request in source frames for a tick of
+ *  \a timeDiffMs (MainWindow::playbackHandling passes the tick frameBoundedTickTimeDiffMs left). Whenever it is finite it is
+ *  the call site's former expression, framerate * (double)timeDiff / 1000.0, evaluated in the same order, so every ordinary
+ *  tick asks for the same double, bit for bit, and the cut above is still re-checked against exactly this value. A request
+ *  that is not a finite number FAILS CLOSED to 0 frames. The case sol reproduced: an accepted rate of +inf (a silent MLV whose
+ *  FPS denominator is 0, macros.h) has no finite request at any positive age, the cut leaves 0 ms, and inf * 0 = NaN passed
+ *  NativePaceGuard::grant's comparisons into the conform delta, the drop position and the slider's int. The two fallbacks
+ *  the hub ruling offered are not available: the uncapped request is +inf (not finite) and no tick keeps a previous
+ *  request; 0 is the value grant() itself gives a request it refuses (a negative one). Not a number from a NaN rate is 0 too. */
+inline double dropFrameRequestFrames( double framerate, int timeDiffMs )
+{
+    const double frames = framerate * (double)timeDiffMs / 1000.0;
+    return std::isfinite( frames ) ? frames : 0.0;
 }
 
 /*! No draw for longer than this and the meter reads 0 and restarts. */

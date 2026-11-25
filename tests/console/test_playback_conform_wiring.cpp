@@ -146,8 +146,9 @@ TEST(PlaybackConformWiring, DropFrameGrantUsesPlaybackRateForBothInputs)
 {
     const QString body = playbackHandlingBody(mainWindowSource());
     ASSERT_FALSE(body.isEmpty());
+    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r6 (sol r5 S1): the same playback rate and tick, through the finite-request helper
     ASSERT_TRUE(body.contains(QStringLiteral(
-        "m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),")));
+        "m_playbackPaceGuard.grant( playback_fps_meter::dropFrameRequestFrames( getPlaybackFramerate(), timeDiff ), paceNowMs, playbackPaceGuardFps() ),")));
 }
 
 // HFR-NATIVE-60FPS-FULLRES-1 r24 (key3 B1 M-HFR-CONFORM-SKIP): the drop-frame tick applies the grant through
@@ -162,7 +163,7 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
         "                        m_newPosDropMode,\n"
         "                        playback_frame_range::conformDropFrameDelta(\n"
         "                            m_newPosDropMode,\n"
-        "                            m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),\n"
+        "                            m_playbackPaceGuard.grant( playback_fps_meter::dropFrameRequestFrames( getPlaybackFramerate(), timeDiff ), paceNowMs, playbackPaceGuardFps() ),\n"
         "                            playbackConformActive(), m_conformDropDebtFrames,\n"
         "                            playback_frame_range::conformTargetShown(\n"
         "                                m_lastPresentedPlaybackFrame, conformDisplayedPlaybackFrame(), m_newPosDropMode,\n"

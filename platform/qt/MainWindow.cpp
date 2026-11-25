@@ -13341,7 +13341,7 @@ void MainWindow::playbackHandling(int timeDiff)
                         m_newPosDropMode,
                         playback_frame_range::conformDropFrameDelta(
                             m_newPosDropMode,
-                            m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),
+                            m_playbackPaceGuard.grant( playback_fps_meter::dropFrameRequestFrames( getPlaybackFramerate(), timeDiff ), paceNowMs, playbackPaceGuardFps() ),
                             playbackConformActive(), m_conformDropDebtFrames,
                             playback_frame_range::conformTargetShown(
                                 m_lastPresentedPlaybackFrame, conformDisplayedPlaybackFrame(), m_newPosDropMode,
@@ -13352,7 +13352,8 @@ void MainWindow::playbackHandling(int timeDiff)
                 // slip_summary: the granted share, read back from the tick (a wrap subtracted the cut range width;
                 // the clamp at the last frame without Loop reports what was actually advanced).
                 // r33 (adversary A1 on e0947e37): a tick can wrap more than one lap; each moved the position back by wrapWidth.
-                const double grantedDropFrames = dropFrameTick.position - sourcePositionBeforeDropTick
+                // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r6 (sol r5 S2): a stale start past the lap limit was folded back first.
+                const double grantedDropFrames = dropFrameTick.position - sourcePositionBeforeDropTick + dropFrameTick.foldedFrames
                     + static_cast<double>( dropFrameTick.wrapWidth ) * dropFrameTick.wrapLaps;
                 m_newPosDropMode = dropFrameTick.position;
                 // PLAYBACK-CLIP-LENGTH-ENFORCE-3: the drop-frame engine's source-frame advance (dropped frames
