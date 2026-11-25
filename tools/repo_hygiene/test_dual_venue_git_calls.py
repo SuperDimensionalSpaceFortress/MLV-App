@@ -98,18 +98,22 @@ class LegLookupCostTests(unittest.TestCase):
         repo, head = self.make_repo()
         trace = Path(tempfile.mkdtemp(prefix="dve-trace-")) / "git-trace.txt"
         self.addCleanup(shutil.rmtree, trace.parent, True)
+        # EXPORT-RENDER-PIPE-TIMING-1 r4: Invoke-DvGit drops the caller's GIT_TRACE (a read-only reader appends to no file it is handed), so the trace is
+        # named through the module-private seam $script:DvGitTraceFile instead
         script = _import(
+            f"& (Get-Module DualVenueRunner) {{ $script:DvGitTraceFile = '{trace}' }}\n"
             f"$root = '{repo}'\n"
             f"foreach ($f in Get-ChildItem -LiteralPath (Join-Path $root '{LEGS_REL}') -Filter *.json) {{\n"
             "  $sha = Get-DvLegSpecSha256 ([IO.File]::ReadAllBytes($f.FullName))\n"
             f"  $r = Find-DvCommittedLegSpec -RepoRoot $root -Commit '{head}' -LegSpecSha256 $sha\n"
             "  Write-Output ('LEG ' + $f.Name + ' found=' + $r.ok + ' path=' + $r.relativePath)\n}\n")
-        env = dict(os.environ, GIT_TRACE=str(trace))
-        proc = subprocess.run([PWSH, *PWSH_ARGS, "-Command", script], capture_output=True, text=True, timeout=300, env=env, stdin=subprocess.DEVNULL)
+        proc = subprocess.run([PWSH, *PWSH_ARGS, "-Command", script], capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         for n in range(LEG_COUNT):
             self.assertIn(f"LEG leg-{n:02d}.json found=True path={LEGS_REL}/leg-{n:02d}.json", proc.stdout)
+        self.assertTrue(trace.exists(), "the trace seam named no file: the spawn count below would be vacuous")
         spawns = [line for line in trace.read_text(encoding="utf-8", errors="replace").splitlines() if "trace: built-in:" in line]
+        self.assertGreaterEqual(len(spawns), LEG_COUNT, f"{len(spawns)} traced git runs for {LEG_COUNT} lookups: the trace does not see the lookups")
         # Linear: per lookup one commit check and one listing (2), plus each blob read once (2 each). Quadratic is ~LEG_COUNT * (2 + LEG_COUNT) = 288.
         self.assertLessEqual(len(spawns), 6 * LEG_COUNT,
                              f"{len(spawns)} git spawns to find {LEG_COUNT} legs: every lookup re-reads every blob (quadratic in the leg count)")
@@ -391,9 +395,11 @@ class GitCallsAreBoundedTests(unittest.TestCase):
             trace_dir = Path(tempfile.mkdtemp(prefix="dve-trace-"))
             self.addCleanup(shutil.rmtree, trace_dir, True)
             trace_file = trace_dir / "git-trace.txt"
-            env["GIT_TRACE"] = str(trace_file)
+        # EXPORT-RENDER-PIPE-TIMING-1 r4: Invoke-DvGit drops the caller's GIT_TRACE, so the trace is named through its module-private seam; an
+        # inherited GIT_TRACE would leave the "no git ran" checks below passing vacuously
+        trace_setup = f"$script:DvGitTraceFile = '{trace_file}'\n" if trace_file is not None else ""
         out = self.in_module(
-            f"{setup}\n"
+            f"{trace_setup}{setup}\n"
             f"try {{ $r = Invoke-DvGit -RepoRoot '{repo}' -GitArgs @({git_args}); Write-Output ('EXIT ' + $r.exitCode); Write-Output ('BYTES ' + $r.bytes.Length); Write-Output ('ERR ' + $r.stderr) }}\n"
             "catch { Write-Output ('THREW ' + $_.Exception.Message) }\n"
             f"{after}\n"

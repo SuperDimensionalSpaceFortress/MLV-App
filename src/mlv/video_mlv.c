@@ -89,6 +89,17 @@ static MLV_STAGE_THREAD_LOCAL int g_mlv_last_raw_uint16_source = 0;
 static MLV_STAGE_THREAD_LOCAL double g_mlv_last_raw_uint16_frame_lj92_ms = 0.0;
 static MLV_STAGE_THREAD_LOCAL double g_mlv_last_raw_uint16_inflight_wait_ms = 0.0;
 static MLV_STAGE_THREAD_LOCAL double g_mlv_last_llrawproc_ms = 0.0;
+
+/* EXPORT-RENDER-PIPE-TIMING-1: the llrawproc run that just finished on THIS thread, its dual-ISO share, by the CDNG
+ * export profile's name (dng.c export_profile_note_llrawproc_breakdown reads the same getter; llrawproc.c resets
+ * the thread-local value at the start of each run, so it is 0.000 for a frame no dual-ISO ran on). Called right
+ * after every "llrawproc" note, so the rendered export's stage-timing log can read the clip's dual-ISO class.
+ * Off: no getter call and no snapshot write (mlv_stage_timing_note_elapsed writes the snapshot before its check). */
+static inline void mlv_note_llrawproc_dual_iso(uint64_t frameIndex)
+{
+    if (!mlv_stage_timing_enabled()) return;
+    mlv_stage_timing_note_elapsed(MLV_STAGE_LLRAWPROC_DUAL_ISO, frameIndex, llrpGetLastDualIsoMilliseconds());
+}
 static MLV_STAGE_THREAD_LOCAL double g_mlv_last_raw_float_convert_ms = 0.0;
 static MLV_STAGE_THREAD_LOCAL double g_mlv_last_debayered_frame_ms = 0.0;
 static MLV_STAGE_THREAD_LOCAL double g_mlv_last_processing_ms = 0.0;
@@ -338,6 +349,25 @@ int mlvPlaybackFastX4HqPathMode(void)
 #else
     return g_mlv_playback_fast_x4_hq_path_mode != 0;
 #endif
+}
+
+/* DEBAYER-CAPTURE-LABEL-1: the one name table for doesMlvAlwaysUseAmaze values, keyed by the
+ * setters in macros.h and named in the app's vocabulary (MainWindow::selectedPlaybackDebayerLabel). */
+const char * getMlvDebayerName(int debayer_type)
+{
+    switch (debayer_type)
+    {
+        case 0: return "bilinear"; /* setMlvDontAlwaysUseAmaze */
+        case 1: return "amaze";    /* setMlvAlwaysUseAmaze */
+        case 2: return "none";     /* setMlvUseNoneDebayer */
+        case 3: return "simple";   /* setMlvUseSimpleDebayer */
+        case 4: return "lmmse";    /* setMlvUseLmmseDebayer */
+        case 5: return "igv";      /* setMlvUseIgvDebayer */
+        case 6: return "ahd";      /* setMlvUseAhdDebayer */
+        case 7: return "rcd";      /* setMlvUseRcdDebayer */
+        case 8: return "dcb";      /* setMlvUseDcbDebayer */
+        default: return "unknown";
+    }
 }
 
 /* Matches lj92.c's lj92_pred6_split_enabled-style truthy check: any non-empty
@@ -4684,6 +4714,7 @@ static int getMlvRawFrameProcessedUint16DirectImpl(mlvObject_t * video,
     llrpFreeWorkerState(&analysis_worker);
     const double llrawproc_ms = (mlv_stage_timing_now() - llraw_start) * 1000.0;
     mlv_stage_timing_note_elapsed("llrawproc", frameIndex, llrawproc_ms);
+    mlv_note_llrawproc_dual_iso(frameIndex);
     g_mlv_last_llrawproc_ms = llrawproc_ms;
 
     if (bit_shift)
@@ -4840,6 +4871,7 @@ int getMlvRawFrameProcessedUint16(mlvObject_t * video,
     applyLLRawProcObject(video, outputFrame, output_frame_size);
     const double llrawproc_ms = (mlv_stage_timing_now() - llraw_start) * 1000.0;
     mlv_stage_timing_note_elapsed("llrawproc", frameIndex, llrawproc_ms);
+    mlv_note_llrawproc_dual_iso(frameIndex);
     g_mlv_last_llrawproc_ms = llrawproc_ms;
 
     if (bit_shift)
@@ -5481,6 +5513,7 @@ static int mlv_render_scaled_rgb16_v3_full_xy(mlvObject_t * video,
     }
     const double llrawproc_ms = (mlv_stage_timing_now() - llraw_start) * 1000.0;
     mlv_stage_timing_note_elapsed("llrawproc", frameIndex, llrawproc_ms);
+    mlv_note_llrawproc_dual_iso(frameIndex);
     g_mlv_last_llrawproc_ms = llrawproc_ms;
 
     /* Step 4: debayer narrowed bayer → RGB16 at (mid_w, mid_h) directly
@@ -5602,6 +5635,7 @@ static int mlv_render_scaled_rgb16_x2_full_xy_core(mlvObject_t * video,
     }
     const double llrawproc_ms = (mlv_stage_timing_now() - llraw_start) * 1000.0;
     mlv_stage_timing_note_elapsed("llrawproc", frameIndex, llrawproc_ms);
+    mlv_note_llrawproc_dual_iso(frameIndex);
     g_mlv_last_llrawproc_ms = llrawproc_ms;
 
     const int bit_shift = llrpHQDualIso(video) ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel);
@@ -5776,6 +5810,7 @@ static int mlv_render_scaled_rgb16_x2_quarter_preview_core(mlvObject_t * video,
     }
     const double llrawproc_ms = (mlv_stage_timing_now() - llraw_start) * 1000.0;
     mlv_stage_timing_note_elapsed("llrawproc", frameIndex, llrawproc_ms);
+    mlv_note_llrawproc_dual_iso(frameIndex);
     g_mlv_last_llrawproc_ms = llrawproc_ms;
 
     const int bit_shift = llrpHQDualIso(video) ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel);
@@ -5940,6 +5975,7 @@ static int mlv_render_scaled_rgb16_x1_half_preview_core(mlvObject_t * video,
     }
     const double llrawproc_ms = (mlv_stage_timing_now() - llraw_start) * 1000.0;
     mlv_stage_timing_note_elapsed("llrawproc", frameIndex, llrawproc_ms);
+    mlv_note_llrawproc_dual_iso(frameIndex);
     g_mlv_last_llrawproc_ms = llrawproc_ms;
 
     const int bit_shift = llrpHQDualIso(video) ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel);
@@ -6320,6 +6356,7 @@ static int mlv_render_scaled_rgb16_v2(mlvObject_t * video,
     }
     const double llrawproc_ms = (mlv_stage_timing_now() - llraw_start) * 1000.0;
     mlv_stage_timing_note_elapsed("llrawproc", frameIndex, llrawproc_ms);
+    mlv_note_llrawproc_dual_iso(frameIndex);
     g_mlv_last_llrawproc_ms = llrawproc_ms;
 
     /* Step 4: debayer narrowed bayer → RGB16 at (mid_w, mid_h). */
@@ -6397,6 +6434,7 @@ static int mlv_render_scaled_rgb16_v3_full_xy_from_raw(mlvObject_t * video,
     }
     const double llrawproc_ms = (mlv_stage_timing_now() - llraw_start) * 1000.0;
     mlv_stage_timing_note_elapsed("llrawproc", frameIndex, llrawproc_ms);
+    mlv_note_llrawproc_dual_iso(frameIndex);
     g_mlv_last_llrawproc_ms = llrawproc_ms;
 
     const int bit_shift = llrpHQDualIso(video) ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel);
@@ -6510,6 +6548,7 @@ static int mlv_render_scaled_rgb16_v4_x8_full_xy_core(mlvObject_t * video,
     }
     const double llrawproc_ms = (mlv_stage_timing_now() - llraw_start) * 1000.0;
     mlv_stage_timing_note_elapsed("llrawproc", frameIndex, llrawproc_ms);
+    mlv_note_llrawproc_dual_iso(frameIndex);
     g_mlv_last_llrawproc_ms = llrawproc_ms;
 
     const int bit_shift = llrpHQDualIso(video) ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel);
@@ -6784,6 +6823,7 @@ static int mlv_render_scaled_rgb16_from_raw(mlvObject_t * video,
                         {
                             const double llrawproc_ms = (mlv_stage_timing_now() - llraw_start) * 1000.0;
                             mlv_stage_timing_note_elapsed("llrawproc", frameIndex, llrawproc_ms);
+                            mlv_note_llrawproc_dual_iso(frameIndex);
                             g_mlv_last_llrawproc_ms = llrawproc_ms;
                             const int bit_shift = llrpHQDualIso(video) ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel);
                             const double debayer_start = mlv_stage_timing_now();
@@ -6854,6 +6894,7 @@ static int mlv_render_scaled_rgb16_from_raw(mlvObject_t * video,
     applyLLRawProcObject(video, unpacked, (size_t)in_pixels * sizeof(uint16_t));
     g_mlv_last_llrawproc_ms = (mlv_stage_timing_now() - llraw_start) * 1000.0;
     mlv_stage_timing_note_elapsed("llrawproc", frameIndex, g_mlv_last_llrawproc_ms);
+    mlv_note_llrawproc_dual_iso(frameIndex);
 
     const double debayer_start = mlv_stage_timing_now();
     if (scaleFactor == 4)

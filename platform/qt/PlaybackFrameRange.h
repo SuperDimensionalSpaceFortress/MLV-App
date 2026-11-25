@@ -662,6 +662,19 @@ inline bool stressSwitchReachesFloor( int switchAtMs, double floorSeconds )
     return switchAtMs >= std::lround( floorSeconds * 1000.0 );
 }
 
+// GUI-SMOKE-ARG-RANGE-OVERFLOW-1 (#881 pass 6 A7): main.cpp stores --seconds as GuiPlaybackSmokeOptions::durationMs, an int,
+// by qRound( seconds * 1000.0 ), which converts ms + copysign( 0.5, ms ) to int. That conversion is defined only when the value
+// lies strictly inside ( INT_MIN - 1, INT_MAX + 1 ): --seconds 2147483.648 gave 2147483648. True exactly when it is (the same
+// sum qRound forms); false for NaN and +-inf. main.cpp refuses a false (exit 2) and still calls qRound for a true.
+inline bool smokeSecondsFitDurationMs( double seconds )
+{
+    const double product = seconds * 1000.0;                             // the value main.cpp hands to qRound
+    const double rounded = product + std::copysign( 0.5, product );      // qRound's own sum, before its int conversion
+    constexpr double kIntMaxPlusOne = static_cast<double>( std::numeric_limits<int>::max() ) + 1.0;
+    constexpr double kIntMinMinusOne = static_cast<double>( std::numeric_limits<int>::min() ) - 1.0;
+    return rounded < kIntMaxPlusOne && rounded > kIntMinMinusOne;
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // PLAYBACK-CLIP-LENGTH-ENFORCE-3 (owner rule 2026-10-01): "20 s of real footage" is a SOURCE-FRAME quantity.
 //
@@ -1300,9 +1313,12 @@ inline bool measuredPlayLoopShouldStop( PlayStopState state, bool stressPending,
         return true;
     case PlayStopState::Reached:
         if( stressPending ) return false;
+        // GUI-SMOKE-ARG-RANGE-OVERFLOW-1: consumed - required is formed only once consumed >= required (> 0 here), where it
+        // cannot overflow; a timeline short of the window is not past it (the same answer the signed difference gave).
         return !( targetPresentedFrames > 0 && presentedFrames < targetPresentedFrames
                   && targetPresentedFrames <= requiredSourceFrames && playStillRunning
-                  && consumedSourceFrames - requiredSourceFrames < kMeasuredPlayMaxFramesInFlight );
+                  && ( consumedSourceFrames < requiredSourceFrames
+                       || consumedSourceFrames - requiredSourceFrames < kMeasuredPlayMaxFramesInFlight ) );
     case PlayStopState::Continue:
         break;
     }
@@ -1327,8 +1343,11 @@ inline bool sourceFrameInsideAdmittedWindow( int64_t sourceFrame, bool counterAr
                                              int64_t requiredSourceFrames )
 {
     // frame - start is computed only once frame >= start, so no inclusive end is formed (no overflow; pass 6 A8)
+    // GUI-SMOKE-ARG-RANGE-OVERFLOW-1 (#881 pass 7 A7): and in uint64_t, where frame - start (at most 2^64 - 1) is exact
+    // for every int64 pair; the signed form overflowed for e.g. ( 0, INT64_MIN ). Same answer for every non-overflowing input.
     return counterArmed && requiredSourceFrames > 0 && sourceFrame >= windowStartFrame
-        && sourceFrame - windowStartFrame < requiredSourceFrames;
+        && static_cast<uint64_t>( sourceFrame ) - static_cast<uint64_t>( windowStartFrame )
+               < static_cast<uint64_t>( requiredSourceFrames );
 }
 // The `observed` the strict check compares with the target: equal to it only when presented == windowPresented == target.
 // All presents inside the window: the raw count, exactly as before this card. Otherwise the window count, unless that alone
