@@ -281,9 +281,9 @@ struct DropFrameTickResult
     // cut 1..50, Loop off, a zero or 8 ms request: the clamp returns 49, clampedFrames is 51 and the applied advance is 0,
     // where 75ed5094 read -51. fl(position - start) and fl(start - position) are exact negatives, so the sum is exactly 0.
     double clampedFrames = 0.0;
-    // r8 iteration 1 (adversary pass 14 A1 on a2983bf2): the advance the tick APPLIED, taken from the delta itself: the delta
-    // (after a fold), the delta cut at the lap limit, or the travel to the last frame under the non-Loop clamp (0 from a start
-    // already past it). MainWindow's grantedDropFrames (the present trace's advance and the slip histogram's granted share)
+    // r8 iteration 1 (adversary pass 14 A1 on a2983bf2): the advance the tick APPLIED, the position's own move from the start
+    // the delta was applied to (after a fold; r8 iteration 2, pass 15 A1: a delta the position cannot hold applied nothing),
+    // up to the lap limit, or the travel to the last frame under the non-Loop clamp (0 from a start already past it). MainWindow's grantedDropFrames (the present trace's advance and the slip histogram's granted share)
     // is this value. The identity position - before + foldedFrames + clampedFrames + wrapWidth * wrapLaps holds in exact
     // arithmetic but rounds next to a far stale start (1100000 + 0.18445 on cut 1..2 read 0.1844500000588596, and a grant of
     // 5e-10 from 8400000 read 0), so it is never used to recover the grant. Not a number when the position is.
@@ -354,7 +354,11 @@ inline DropFrameTickResult advanceDropFrameTick(
         }
     }
     result.position = start + frameDelta;
-    double applied = frameDelta;   // r8 iteration 1 (pass 14 A1): the applied advance, never recovered from the endpoints
+    // r8 iteration 1 (pass 14 A1): the applied advance, never recovered from the stale endpoints. r8 iteration 2 (pass 15 A1
+    // on 437108e0): it is the move the position really made from the (folded) start, not the delta: a conform residue of
+    // 1.7763568394002505e-15 leaves 1024 at 1024 and applied nothing. The start is inside the cut here, so this
+    // subtraction is next to the delta's own size, never 1100000 away.
+    double applied = result.position - start;
     if( loopEnabled && result.position >= wrapAt )
     {
         result.wrapWidth = cutOutValue - cutInValue + ( presentLastFrame ? 1 : 0 );
