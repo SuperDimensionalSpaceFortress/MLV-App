@@ -273,8 +273,9 @@ struct DropFrameTickResult
     // lap limit was moved back, in whole laps, into the cut onto its own phase before the delta applied (those laps were the
     // stale position's, never travelled, so they are not counted in wrapLaps or recorded; the tick reads wrapped, with
     // wrapLaps 0 unless the delta itself crosses the wrap point: pass 11 A1). r9 (sol r8 on 4eb1cfd5): under Loop EVERY start
-    // at or past wrapAt is folded onto its own phase, at any distance; a start below the cut is not (iteration 1, pass 17 A1 +
-    // A2: it has no phantom lap, and a forward correction reads as travel). 0 on every other tick. In exact arithmetic the
+    // at or past wrapAt is folded onto its own phase, at any distance. PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1 (sol r9 B2): a
+    // start below the cut's first position is folded onto it, and foldedFrames is then NEGATIVE (a forward correction, reported
+    // through corrected / correctedStart below, never as travel). 0 on every other tick. In exact arithmetic the
     // applied advance equals position - before + foldedFrames + clampedFrames + wrapWidth * wrapLaps, but MainWindow's
     // grantedDropFrames reads appliedFrames below, never that endpoint sum.
     double foldedFrames = 0.0;
@@ -364,13 +365,22 @@ inline DropFrameTickResult advanceDropFrameTick(
     // 1..50, Loop, a zero request moved 100 -> 2 with nothing applied and recorded two 49-frame laps (the paint credit read
     // 2 + 98 - 10 = 90 frames). It folds onto its own phase as above (the position lands where the base's laps put it; only
     // the laps change, to the ones the delta itself crosses from the folded start), so wrapLaps counts only laps the applied
-    // delta crossed. A start BELOW the cut's first frame is not folded: it has no phantom lap (every lap it records is one
-    // its applied delta crosses on the way up through wrapAt), and r9 iteration 1 (adversary pass 17 A1 + A2 on 76e554e3)
-    // showed a FORWARD correction onto the first frame reads as travel to the endpoint readers (the paint credit took
-    // 10 -> 40 as 30 frames played, and its wrapped flag hid a real 1.2-frame step from SourceFrameAdvanceCounter). A start
-    // inside [wrapAt - width, wrapAt) or below it is unchanged, bit for bit; without Loop nothing is folded (the non-Loop
-    // clamp below owns a start past the last frame).
+    // delta crossed.
+    // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1 (sol r9 B1 + B2 on 4279b9ee), THE CONTRACT: a POSITION CORRECTION is a move of the
+    // start that the tick's delta did not make. There are three: (i) the Loop fold above of a start at or past wrapAt; (ii) the
+    // Loop fold of a start BELOW the cut's first position wrapAt - width (cutIn - 1: Cut In moved past a playhead still at 0),
+    // onto that first position with no phase kept (foldedFrames negative; wrapped stays false and wrapWidth 0 unless the delta
+    // itself crosses wrapAt, and its laps are counted from the folded start); (iii) the non-Loop clamp below of a start past the
+    // last frame. Each sets corrected and correctedStart. A correction is never painted travel, never max_jump, never a wrap or
+    // lap, never consumed source frames and never slip-histogram path advance or deadlines: MainWindow hands it to the paint
+    // tracker as a rebase (PlaybackWrapRecorder::noteEngineCorrection, stamped and consumed like a wrap), and feeds
+    // correctedStart to every reader of the tick's start. Only what the delta applies FROM the corrected start is travel, as
+    // appliedFrames reports. r9 iteration 1 withdrew 76e554e3's below-cut fold because the paint credit took 10 -> 40 as 30
+    // frames played; the rebase closes that at the engine -> paint-tracker seam instead. A NaN start fails both comparisons and
+    // is not folded; a -inf start folds to the first position. A start inside [wrapAt - width, wrapAt) is unchanged, bit for
+    // bit; without Loop nothing is folded (the non-Loop clamp below owns a start past the last frame).
     double start = currentPosition;
+    result.correctedStart = currentPosition;
     const int loopWidth = cutOutValue - cutInValue + ( presentLastFrame ? 1 : 0 );
     if( loopEnabled && loopWidth > 0 )
     {
@@ -385,6 +395,15 @@ inline DropFrameTickResult advanceDropFrameTick(
             result.foldedFrames = currentPosition - start;
             result.wrapped = true;
             result.wrapWidth = loopWidth;
+            result.corrected = true;
+            result.correctedStart = start;
+        }
+        else if( currentPosition < wrapAt - width )
+        {
+            start = wrapAt - width;   // the cut's first position, no phase kept
+            result.foldedFrames = currentPosition - start;   // negative: a forward correction
+            result.corrected = true;
+            result.correctedStart = start;
         }
     }
     result.position = start + frameDelta;
@@ -411,8 +430,9 @@ inline DropFrameTickResult advanceDropFrameTick(
             // more stops at the last position of the 1e6th lap (the rest of the delta is dropped, as a skipped backlog is), so
             // position - before + wrapWidth * wrapLaps is still the advance it made. A start already at or past the limit no longer
             // keeps the base arithmetic (r6, sol r5 S2: its laps were the stale start's own, unbounded); it was folded into the cut
-            // above, so the bound holds from ANY start, that one included. Every tick of up to that many laps from a start below
-            // wrapAt is unchanged, bit for bit (r9: every start at or past it is folded first). An infinite delta stops there too.
+            // above, so the bound holds from ANY start, that one included. Every tick of up to that many laps from a start inside
+            // the cut is unchanged, bit for bit (r9: every start at or past wrapAt is folded first; r1: so is one below the cut's
+            // first position). An infinite delta stops there too.
             // r5 (pass 8 A1 on c37d6fd5): it stops at the LAST position below lapLimit (one double step under it), not at the
             // lap's first position lapLimit - width, so the clipped tick keeps all the room the bound allows (r9: only a start
             // below wrapAt reaches here; 1.5 + 2000001 conformed on cut 1..2 advances to just below wrapAt, 1e6 laps).
@@ -436,7 +456,12 @@ inline DropFrameTickResult advanceDropFrameTick(
     else if( !loopEnabled && result.position >= lastFrame )
     {
         // r8 (sol r7): a start already past the last frame is corrected back onto it, not advanced (clampedFrames above)
-        if( start > lastFrame ) result.clampedFrames = start - lastFrame;
+        if( start > lastFrame )
+        {
+            result.clampedFrames = start - lastFrame;
+            result.corrected = true;   // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: correction (iii)
+            result.correctedStart = lastFrame;
+        }
         applied = start < lastFrame ? lastFrame - start : 0.0;   // the travel to the last frame, none from past it
         result.position = lastFrame;
     }
@@ -722,7 +747,8 @@ struct PlaybackWrapRecorder
     std::vector<EngineCorrection> engineCorrectionRecords;
     void noteEngineCorrection( int rebaseFrame )
     {
-        (void)rebaseFrame;   // RED stub: records nothing
+        engineCorrectionRecords.push_back( { rebaseFrame, engineWraps } );
+        ++engineCorrections;
     }
 };
 
@@ -737,9 +763,18 @@ struct PaintCreditHandOff
 inline PaintCreditHandOff paintCreditHandOff( const PlaybackWrapRecorder & recorder, int wrapsBefore, int wrapsCrossed,
                                               int correctionsBefore, int correctionsCrossed )
 {
-    (void)correctionsBefore; (void)correctionsCrossed;   // RED stub: no rebase
     PaintCreditHandOff handOff;
     handOff.wrapsWidth = recorder.engineWrapsWidth( wrapsBefore, wrapsCrossed );
+    const int last = correctionsBefore + correctionsCrossed - 1;   // the last correction this presentation crossed
+    if( correctionsCrossed <= 0 || last < 0 || last >= static_cast<int>( recorder.engineCorrectionRecords.size() ) )
+        return handOff;
+    const PlaybackWrapRecorder::EngineCorrection &correction = recorder.engineCorrectionRecords[static_cast<size_t>( last )];
+    handOff.rebase = true;
+    handOff.rebaseFrame = correction.rebaseFrame;
+    // only the crossed wraps the engine made after that correction are travel from its rebase frame
+    const int from = std::max( wrapsBefore, correction.wrapsBefore );
+    const int end = wrapsBefore + wrapsCrossed;
+    handOff.wrapsWidth = end > from ? recorder.engineWrapsWidth( from, end - from ) : 0;
     return handOff;
 }
 

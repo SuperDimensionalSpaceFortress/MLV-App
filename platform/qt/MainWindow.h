@@ -1320,6 +1320,8 @@ private:
     int m_playbackSmokeLastPresentedFrame = -1;
     // r16 (adversary A1): engine wraps the source-advance tracker has taken (presentationLoopWraps)
     int m_playbackSmokeTrackerEngineWraps = 0;
+    // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: engine position corrections the tracker has taken (presentationLoopWraps)
+    int m_playbackSmokeTrackerEngineCorrections = 0;
     // CUDA-PLAYBACK-CONTACT-SHEET-2 (BLOCKER fix): set when a presented display_frame goes
     // backwards during the measured session -- the only way that happens is a Loop wrap
     // (cutOut back to cutIn), since playback otherwise only advances. Reset per session in

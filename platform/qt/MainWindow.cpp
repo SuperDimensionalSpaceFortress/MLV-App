@@ -7899,6 +7899,7 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
     PresentationRequestContext requestContext;
     requestContext.requestSerial = requestSerial;
     requestContext.engineWrapsAtRequest = m_playbackWrapRecorder.engineWraps;   // r17 adversary A1: see presentationLoopWraps
+    requestContext.engineCorrectionsAtRequest = m_playbackWrapRecorder.engineCorrections;   // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1
     requestContext.sceneWidth = sceneWidth;
     requestContext.sceneHeight = sceneHeight;
     requestContext.devicePixelRatioMilli = devicePixelRatioMilli;
@@ -13331,7 +13332,6 @@ void MainWindow::playbackHandling(int timeDiff)
                 //loop wraps back by the cut range width, or clamps to the last frame -- see
                 //PlaybackFrameRange.h for the BLOCKER note on why the wrapped case can never
                 //return the range's last frame)
-                const double sourcePositionBeforeDropTick = m_newPosDropMode;
                 // HFR-NATIVE-60FPS-FULLRES-1 r24 (key3 B1 M-HFR-CONFORM-SKIP): under conform the catch-up advances by whole
                 // frames, so a tick that owes less than one whole period beyond the next frame presents that frame (never
                 // N -> N + 2 from a fractional position) and carries the rest as m_conformDropDebtFrames, repaid one presented
@@ -13369,14 +13369,19 @@ void MainWindow::playbackHandling(int timeDiff)
                 m_playbackTickAppliedFrames = grantedDropFrames;
                 m_newPosDropMode = dropFrameTick.position;
                 // PLAYBACK-CLIP-LENGTH-ENFORCE-3: the drop-frame engine's source-frame advance (dropped frames
-                // still advance the timeline; a wrap never counts).
-                m_sourceAdvance.noteEngineTick( sourcePositionBeforeDropTick, dropFrameTick.position, dropFrameTick.wrapped );
+                // still advance the timeline; a wrap never counts). PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: from the
+                // corrected start (a fold or clamp of a stale start is not footage; the counter rebases there).
+                m_sourceAdvance.noteEngineTick( dropFrameTick.correctedStart, dropFrameTick.position, dropFrameTick.wrapped );
+                // r1 (sol r9 B1 + B2): a POSITION CORRECTION is recorded BEFORE the tick's laps, so the laps count as travel
+                // from it; the presentation that lands on it rebases the paint tracker (paintCreditHandOff) instead of
+                // crediting the move.
+                if( dropFrameTick.corrected ) m_playbackWrapRecorder.noteEngineCorrection( playback_frame_range::dropFrameCorrectionFrame( dropFrameTick.correctedStart ) );
                 // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: the drop-frame engine wrap, counted where it happens. r21 (key3
                 // M-HFR-DROP-WRAP-WIDTH): it is credited the width the tick subtracted (cutOut - cutIn), not the non-drop
                 // Loop wrap's cutOut - cutIn + 1, which counted one frame the timeline never travelled.
                 if( dropFrameTick.wrapped ) m_playbackWrapRecorder.noteEngineWrap( dropFrameTick.wrapWidth, dropFrameTick.wrapLaps );
-                //Sync audio
-                if( dropFrameTick.wrapped && ui->actionAudioOutput->isChecked() )
+                //Sync audio (r1: a correction moves the position too)
+                if( ( dropFrameTick.wrapped || dropFrameTick.corrected ) && ui->actionAudioOutput->isChecked() )
                 {
                     requestPlaybackAudioSync();
                 }
@@ -13386,6 +13391,9 @@ void MainWindow::playbackHandling(int timeDiff)
                 ui->horizontalSliderPosition->blockSignals( false );
                 if( m_playbackSmokeActive )
                 {
+                    // r1 (fable r9 H6 for corrections): the correction moves the histogram's timeline first, so the tick's move
+                    // below books only its own travel; the summary's residual shows the correction under Other, as a seek
+                    if( dropFrameTick.corrected ) m_playbackSlipHistogram.noteTimelineCorrection( playback_frame_range::dropFrameCorrectionFrame( dropFrameTick.correctedStart ) );
                     m_playbackSlipHistogram.noteTimelineMove(
                         dropFrameTick.wrapped ? playback_slip::AdvancePath::LoopWrap
                                               : playback_slip::AdvancePath::DropTick,
@@ -13396,7 +13404,7 @@ void MainWindow::playbackHandling(int timeDiff)
                     if( !dropFrameTick.wrapped
                      && paceNowMs - m_playbackSmokeStartTime * 1000.0 <= playback_native_pace::kStartupCatchupWindowMs )
                         m_playbackSmokeStartupSkippedFrames += playback_native_pace::skippedFrames(
-                            sourcePositionBeforeDropTick, dropFrameTick.position );
+                            dropFrameTick.correctedStart, dropFrameTick.position );
                 }
                 m_frameChanged = true;
             }
@@ -28167,6 +28175,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeConformPaintWaitEscapes = 0;
     // r16 (adversary A1): engine wraps before this measured Play are not this Play's wraps
     m_playbackSmokeTrackerEngineWraps = m_playbackWrapRecorder.engineWraps;
+    m_playbackSmokeTrackerEngineCorrections = m_playbackWrapRecorder.engineCorrections;   // r1: nor its corrections
     m_playbackSmokeStartRequestSerial = m_nextRenderRequestSerial;
     m_playbackSmokeStartDecodeRequestsIssued =
         m_pRenderThread ? m_pRenderThread->decodeRequestsIssuedCount() : 0;
@@ -28664,13 +28673,25 @@ void MainWindow::notePlaybackSmokePresentedFrame(
                                                           requestContext.engineWrapsAtRequest,
                                                           m_playbackSmokeTrackerEngineWraps,
                                                           m_playbackSmokePresentedFrames > 0 );
+    // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1 (sol r9 B1 + B2): the engine's POSITION CORRECTIONS this frame lands, stamped and
+    // consumed exactly as its wraps (presentationLoopWraps is a generic counter). A landing that crossed one rebases the paint
+    // tracker to the last one's frame, and is credited only the wraps the engine made after it (paintCreditHandOff); the wrap
+    // COUNT is still every wrap crossed.
+    const int sourceAdvanceCorrectionsBefore = m_playbackSmokeTrackerEngineCorrections;
+    const int sourceAdvanceCorrections = presentationLoopWraps( m_playbackWrapRecorder.engineCorrections,
+                                                                requestContext.engineCorrectionsAtRequest,
+                                                                m_playbackSmokeTrackerEngineCorrections,
+                                                                m_playbackSmokePresentedFrames > 0 );
+    const playback_frame_range::PaintCreditHandOff sourceAdvanceHandOff =
+        playback_frame_range::paintCreditHandOff( m_playbackWrapRecorder, sourceAdvanceWrapsBefore, sourceAdvanceWraps,
+                                                  sourceAdvanceCorrectionsBefore, sourceAdvanceCorrections );
     // r29 (adversary A1 on cf403dba, A2 on 4201a437): this is the HAND-OFF. The frame waits in the ledger for the surface's paint,
     // which credits m_playbackSmokeSourceAdvance (notePlaybackSmokePainted); replaced before that paint, it is never credited.
     m_playbackSmokePaintCredit.noteSubmitted( static_cast<uint64_t>( readyFrame.requestSerial ),
                                               static_cast<int>( displayFrame ),
                                               sourceAdvanceWraps,
-                                              m_playbackWrapRecorder.engineWrapsWidth( sourceAdvanceWrapsBefore,
-                                                                                       sourceAdvanceWraps ),
+                                              sourceAdvanceHandOff.wrapsWidth,
+                                              sourceAdvanceHandOff.rebase, sourceAdvanceHandOff.rebaseFrame,
                                               m_playbackSmokeSourceAdvance );
     // The engine's own wrap count (playbackHandling) is the authority; the inference above can only add.
     if( m_playbackWrapRecorder.replayCount() > 0 ) m_playbackSmokeWrapped = true;
@@ -36442,6 +36463,11 @@ void MainWindow::drawFrameReady()
             presentationAcceptedLookaheadStamp( requestContext.engineWrapsAtRequest,
                                                 m_playbackWrapRecorder.engineWraps );
         readyFrame.presentationContext.engineWrapsAtRequest = requestContext.engineWrapsAtRequest;
+        // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: the position-correction count, raised exactly as the wrap count is
+        requestContext.engineCorrectionsAtRequest =
+            presentationAcceptedLookaheadStamp( requestContext.engineCorrectionsAtRequest,
+                                                m_playbackWrapRecorder.engineCorrections );
+        readyFrame.presentationContext.engineCorrectionsAtRequest = requestContext.engineCorrectionsAtRequest;
     }
 
     // Forward-only present guard: during forward playback never present a frame older

@@ -406,7 +406,7 @@ public:
      *  deadline or advance-since-present; the summary's residual books the move under Other, as it does a seek. */
     void noteTimelineCorrection( int toPosition )
     {
-        (void)toPosition;   // RED stub
+        m_timelinePosition = toPosition;
     }
 
     /*! A contact-sheet grab of \a grabMs ran on the GUI thread; it is charged to the next present's interval. */
