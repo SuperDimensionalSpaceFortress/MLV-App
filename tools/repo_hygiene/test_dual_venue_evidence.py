@@ -7035,6 +7035,45 @@ exit 0
         proc, planned = self.b3r3_b1_chain_run("* CLAIM_RELEASED *")
         self.assert_b3r3_b1_refusal_and_result_survive(proc, planned, 2)
 
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r4 (sol r3 B1): r3 fixed the primary path only. The supplementary child's spec-refusal label kept the stderr-only fallback, and
+    # Write-ChainDiagnostic is silent when the compiled writer is unavailable. So with that writer unavailable and a FAILED append of the label (a sharing violation), the
+    # typed line never reached stdout and the supplementary result said FAILED / INVALID with no specRefusal. The refusal is now on the supplementary result before any log
+    # append, and the label goes through Write-ChainLineNoThrow (stdout, counted in chainLogAppendFailures), as the primary label does.
+    B3R4_WRITER_ANCHOR = "        $script:EvidenceWriterReady = [bool]('VenueChainEvidenceWriteB2' -as [type])\n"
+
+    def b3r4_supp_run(self, mode: str) -> tuple[subprocess.CompletedProcess, str, str]:
+        no_writer = (self.B3R4_WRITER_ANCHOR, "        $script:EvidenceWriterReady = $false   # TEST FIXTURE: the compiled writer is unavailable, as a failed compile leaves it\n")
+        fail = ("function Add-ChainLogLine([string]$Line) {\n",
+                "function Add-ChainLogLine([string]$Line) {\n    if ($Line -clike '* DVE_CHAIN_SPEC_* role=supplementary *') { return 'FAILED TEST FIXTURE: the process cannot access the file because it is being used by another process' }\n")
+        dv, spec, twin, um_share = self.r4_supp_fixture([("Invoke-VenueChain.ps1", *no_writer), ("Invoke-VenueChain.ps1", *fail)])
+        planned, twin_sha = hashlib.sha256(spec.read_bytes()).hexdigest(), hashlib.sha256(twin.read_bytes()).hexdigest()
+        fx = self.chain_fixture(dv, spec, twin, mode=mode, venue="ultra-magnus")   # the bytes change (or vanish) at the first ultra-magnus probe, after the Bachelor leg ran
+        return self.run_fixture_chain(dv, fx, ["-LegSpec", str(spec), "-SupplementaryAgentShare", str(um_share)]), planned, twin_sha
+
+    def assert_b3r4_supp_refusal_survives(self, proc: subprocess.CompletedProcess, want: str, planned: str) -> str:
+        out = proc.stdout.splitlines()
+        self.assertTrue(any(" CHAIN_EVIDENCE_WRITER_UNAVAILABLE " in l for l in out), "the fixture really made the compiled writer unavailable\n" + proc.stdout + proc.stderr)
+        results = [l for l in out if l.startswith("CHAIN_RESULT=")]
+        self.assertEqual(len(results), 1, proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 0, "the Bachelor leg ran; a supplementary leg never decides the exit\n" + proc.stdout + proc.stderr)
+        result = json.loads(results[0][len("CHAIN_RESULT="):])
+        self.assertEqual([(r["status"], r["outcome"], r.get("specRefusal")) for r in result["supplementary"]], [("FAILED", "INVALID", want)],
+                         "the supplementary result lost its typed refusal (old: no specRefusal)\n" + json.dumps(result["supplementary"]))
+        typed = [l for l in out if f" {want} " in l and "role=supplementary" in l]
+        self.assertEqual(len(typed), 1, "the typed supplementary refusal never reached stdout (old: the stderr-only fallback was silent)\n" + proc.stdout + proc.stderr)
+        self.assertIn(f"planned_sha256={planned}", typed[0])
+        self.assertEqual(result.get("chainLogAppendFailures"), 1, "the failed label append is counted\n" + json.dumps(result))
+        return typed[0]
+
+    def test_planned_hash_bind_b3_r4_b1_supp_a_changed_spec_label_whose_append_fails_without_the_writer_stays_typed(self) -> None:
+        proc, planned, twin_sha = self.b3r4_supp_run("copy")
+        typed = self.assert_b3r4_supp_refusal_survives(proc, "DVE_CHAIN_SPEC_CHANGED", planned)
+        self.assertIn(f"read_sha256={twin_sha}", typed)
+
+    def test_planned_hash_bind_b3_r4_b1_supp_an_unreadable_spec_label_whose_append_fails_without_the_writer_stays_typed(self) -> None:
+        proc, planned, _ = self.b3r4_supp_run("delete")
+        self.assert_b3r4_supp_refusal_survives(proc, "DVE_CHAIN_SPEC_UNREADABLE", planned)
+
     # r3 (adversary pass 2 on 5ef85bc6, A1): the chain read its leg child's outcome, receipt and spec refusal back from <RunDir>\leg-<name>.out.txt, and its probes' verdicts
     # from quiet-<name>-<phase>.out.txt. Two chains on one -RunDir (two venues) name a leg alike, so another chain's child could write that file between this child's exit
     # and this parent's read. The fixture writes it there (the other chain's transcript) right after this child exits; the chain must classify from its OWN child's output.
@@ -7688,7 +7727,10 @@ exit 0
         # pass 1 A4 on ebfde5a3: the NOT_RUN DEADLINE and spec-refusal log fallbacks wrote stderr synchronously, so a full unread pipe held the claim release and the typed result
         chain = (DV / "Invoke-VenueChain.ps1").read_text(encoding="utf-8")
         self.assertEqual(chain.count("catch { [Console]::Error.WriteLine("), 0, "a chain-log fallback writes stderr synchronously (old: :490, :638, :684)")
-        self.assertGreaterEqual(chain.count("catch { Write-ChainDiagnostic "), 4)
+        # BATCH-3 r4 (sol r3 B1): the supplementary spec-refusal label left this count for Write-ChainLineNoThrow (stdout, counted), as the primary label did in r3; the three
+        # stderr-only fallbacks left (Write-ChainLineNoThrow's own catch and the two NOT_RUN DEADLINE lines) are counted, and the moved label is pinned where it now goes
+        self.assertGreaterEqual(chain.count("catch { Write-ChainDiagnostic "), 3)
+        self.assertEqual(chain.count('Write-ChainLineNoThrow "$sSpecRefusal venue=$suppVenue role=supplementary '), 1, "the supplementary label goes through Write-ChainLineNoThrow")
 
     # (b2 r2: the location read now ends at one absolute instant (LocateUntil), so the pause sits after the allowance's sample, before the path is made full)
     W1_LOC_ANCHOR = "    $full = try { [IO.Path]::GetFullPath($Path) } catch { return $null }\n"
