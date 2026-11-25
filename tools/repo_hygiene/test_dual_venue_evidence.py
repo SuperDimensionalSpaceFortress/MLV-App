@@ -19529,7 +19529,8 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
     SPECS = tuple(f"legs/m16-{clip}-conform-{mode}-s1.json" for clip in ("1456", "1457") for mode in ("windowed", "fullscreen"))
 
     def chain(self, measured: str, coverage: str | None = "1498", ends: bool = True, *, specs: tuple[str, ...] | None = None, clip: str | None = None,
-              backends: tuple[str, ...] = ("cuda",), head: tuple[str, str] | None = None, summary: str | None = None) -> list[dict]:
+              backends: tuple[str, ...] = ("cuda",), head: tuple[str, str] | None = None, summary: str | None = None,
+              engine_frames: int = 1499) -> list[dict]:
         # EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1: the same chain judges any committed spec (`specs`, `clip`) on each of its `backends`; `head`
         # (the pacing-isolation line, the conform line's head) and `summary` replace the conformed 59.94 -> 24 run's lines for a run of another shape.
         specs = self.SPECS if specs is None else specs
@@ -19548,6 +19549,10 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         # fails closed; a measured line that does not name it carries backward=0 (no seek) unless `ends` is False.
         if measured and ends and "backward=" not in measured:
             measured += " backward=0"
+        # EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 (adversary A1 on b56cc731): the app prints repeats on every conform line; a measured line that
+        # does not name it carries repeats=0 (no frame painted twice) unless `ends` is False. `engine_frames` is the job summary's own source count.
+        if measured and ends and "repeats=" not in measured:
+            measured += " repeats=0"
         pacing, conform_head = head if head is not None else (
             "interaction_trace event=automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=0 persisted_frame_rate=24.000 drop_frame=1 settings_store=run_scoped",
             "playback_smoke.conform session=3 clip_fps=59.940 playback_fps=24.000 conform_active=1 conform_enabled=1 conform_env_override=1")
@@ -19555,8 +19560,9 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
                          conformed_summary_line() if summary is None else summary]) + "\n"
         sha = hashlib.sha256(log.encode("utf-8")).hexdigest()
         script = (
-            "$summary = [pscustomobject]@{ sourceFrames = [pscustomobject]@{ sourceAdvanced = 1499; requiredSourceFrames = 1499; failures = @() }; fixtureRehearsal = $false;"
-            " clipId = $env:DVE_CLIP; lookAssistForced = $true; gpuFramesTotal = 1499; lookFlavorReported = 'cinematic' }\n"
+            "$frames = [int64]$env:DVE_FRAMES\n"
+            "$summary = [pscustomobject]@{ sourceFrames = [pscustomobject]@{ sourceAdvanced = $frames; requiredSourceFrames = $frames; failures = @() }; fixtureRehearsal = $false;"
+            " clipId = $env:DVE_CLIP; lookAssistForced = $true; gpuFramesTotal = $frames; lookFlavorReported = 'cinematic' }\n"
             "$manifest = [pscustomobject]@{ smokeRunLog = [pscustomobject]@{ runNonce = $env:DVE_NONCE; sha256 = $env:DVE_SHA } }\n"
             "$result = [pscustomobject]@{ evidence = [pscustomobject]@{ runNonce = $env:DVE_NONCE; runLogSnapshot = [pscustomobject]@{ sha256 = $env:DVE_SHA } } }\n"
             "$out = foreach ($rel in ($env:DVE_SPECS -split ';')) {\n"
@@ -19573,7 +19579,7 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
             "}\n"
             "ConvertTo-Json -InputObject @($out) -Compress -Depth 5")
         proc, out = run_pwsh_json(script, DVE_LOG=log, DVE_SHA=sha, DVE_NONCE=NONCE, DVE_CLIP=clip, DVE_DV=str(DV), DVE_SPECS=";".join(specs),
-                                  DVE_BACKENDS=";".join(backends))
+                                  DVE_BACKENDS=";".join(backends), DVE_FRAMES=str(engine_frames))
         self.assertIsNotNone(out, proc.stdout + proc.stderr)
         self.assertEqual(len(out), 2 * len(specs) * len(backends), out)
         for row in out:
@@ -19790,6 +19796,9 @@ class EveryFrameOldestFirstLegSpecTests(unittest.TestCase):
 
     CARD = "EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1"
     MAX_JUMP = {"metric": "conformMaxJump", "op": "eq", "value": 1}
+    # Fix iteration 1 (adversary on b56cc731): max_jump counts forward steps and allows one held target, so a frame painted twice (A1) and an engine target
+    # never painted at the tail (A2) both read max_jump=1. The leg judges them directly: no repeat, and the last engine target painted.
+    APPENDED = [MAX_JUMP, {"metric": "conformRepeats", "op": "eq", "value": 0}, {"metric": "conformTailUnpaintedFrames", "op": "eq", "value": 0}]
     OPT_OUT = ("visualCapture", "visualCaptureOptOutReason")
     # A native-pace (unconformed) 23.976 fps run: the pacing line with drop-frame off, the conform line the app prints on every session (conform_active=0),
     # and a summary paced at the native rate. The source counts stay the chain's (1499 from frame 0), so its coverage and ends defaults hold.
@@ -19816,16 +19825,18 @@ class EveryFrameOldestFirstLegSpecTests(unittest.TestCase):
                 self.assertEqual(sorted(source["criteria"]), ["acceptance", "supplementary"])
                 for role, per in source["criteria"].items():
                     self.assertEqual(sorted(per), ["cpu", "cuda"], role)
-                    self.assertNotIn(self.MAX_JUMP, [*per["cuda"], *per["cpu"]], "the source does not judge max_jump yet")
+                    for item in self.APPENDED:
+                        self.assertNotIn(item, [*per["cuda"], *per["cpu"]], "the source does not judge the every-frame criteria")
                 expected = {k: v for k, v in source.items() if k not in self.OPT_OUT}
                 expected.update(legId=Path(rel).stem, card=self.CARD,
-                                criteria={role: {b: [*items, self.MAX_JUMP] for b, items in per.items()} for role, per in source["criteria"].items()})
-                self.assertEqual(spec, expected, "only legId, card, the removed opt-out and the appended conformMaxJump differ")
+                                criteria={role: {b: [*items, *self.APPENDED] for b, items in per.items()} for role, per in source["criteria"].items()})
+                self.assertEqual(spec, expected, "only legId, card, the removed opt-out and the appended every-frame criteria differ")
                 self.assertEqual(list(spec), [k for k in source if k not in self.OPT_OUT], "the source's keys in the source's order")
                 for role in ("acceptance", "supplementary"):
                     for backend in ("cuda", "cpu"):
-                        self.assertEqual(spec["criteria"][role][backend][-1], self.MAX_JUMP, (role, backend))
-                        self.assertEqual(spec["criteria"][role][backend].count(self.MAX_JUMP), 1, (role, backend))
+                        self.assertEqual(spec["criteria"][role][backend][-len(self.APPENDED):], self.APPENDED, (role, backend))
+                        for item in self.APPENDED:
+                            self.assertEqual(spec["criteria"][role][backend].count(item), 1, (role, backend, item))
                 self.assertEqual(text, json.dumps(spec, indent=2, ensure_ascii=False) + "\n", "the source's formatting")
                 self.assertEqual((DV / source_rel).read_text(encoding="utf-8"), json.dumps(source, indent=2, ensure_ascii=False) + "\n")
 
@@ -19863,44 +19874,93 @@ class EveryFrameOldestFirstLegSpecTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(proc.stdout.split(), ["True"] * len(names))
 
-    def chain(self, measured: str, ends: bool = True) -> list[dict]:
+    def chain(self, measured: str, ends: bool = True, frames: int = 1499) -> list[dict]:
         """The shipped criteria chain (ConformMeasuredFieldsAreJudgedTests.chain: Get-DvPlaybackEvidence -> Get-DvConformArmVerdict -> Get-DvCriteriaMetrics ->
-        Test-DvCriteria) on THIS spec, cuda and cpu, both roles, over a native-pace run's log."""
+        Test-DvCriteria) on THIS spec, cuda and cpu, both roles, over a native-pace run's log whose engine advanced `frames` source frames from frame 0."""
         return ConformMeasuredFieldsAreJudgedTests.chain(
-            self, measured, ends=ends, specs=tuple(EVERY_FRAME_OLDEST_FIRST_LEGS), clip="M16-1243", backends=("cuda", "cpu"), head=self.HEAD,
-            summary=conformed_summary_line(status='gui_fps_status_text="Playback: 23.976 fps"', native_fps="23.976", pace_fps="23.976"))
+            self, measured, ends=ends, specs=tuple(EVERY_FRAME_OLDEST_FIRST_LEGS), clip="M16-1243", backends=("cuda", "cpu"), head=self.HEAD, engine_frames=frames,
+            summary=conformed_summary_line(status='gui_fps_status_text="Playback: 23.976 fps"', native_fps="23.976", pace_fps="23.976",
+                                           source_advanced=str(frames), required_source_frames=str(frames)))
+
+    @staticmethod
+    def failed_metrics(row: dict) -> list[str]:
+        return [f.split(" ")[0].rstrip(":") for f in row["failures"]]
 
     @requires_windows_pwsh
     def test_the_criteria_pass_only_a_run_that_showed_every_source_frame(self) -> None:
         cases = {
-            "sound": (" max_jump=1", True),
-            "a skipped source frame": (" max_jump=2", False),
-            "no frame advanced": (" max_jump=0", False),
-            "a frozen presentation tail": (" presented=1401 source_advanced=1400 max_jump=1", False),
+            "sound": (" max_jump=1", []),
+            "a skipped source frame": (" max_jump=2", ["conformMaxJump"]),
+            "no frame advanced": (" max_jump=0", ["conformMaxJump"]),
+            "a frozen presentation tail": (" presented=1401 source_advanced=1400 max_jump=1", ["conformMaxJump", "conformTailUnpaintedFrames"]),
         }
-        for name, (measured, passes) in cases.items():
+        for name, (measured, failing) in cases.items():
             for row in self.chain(measured):
                 with self.subTest(case=name, role=row["role"], backend=row["backend"]):
-                    self.assertEqual(row["pass"], passes, row)
-                    self.assertEqual([f.split(" ")[0].rstrip(":") for f in row["failures"]], [] if passes else ["conformMaxJump"], row)
+                    self.assertEqual(row["pass"], not failing, row)
+                    self.assertEqual(self.failed_metrics(row), failing, row)
         seen = {(row["role"], row["backend"]) for row in self.chain(" max_jump=1")}
         self.assertEqual(seen, {(r, b) for r in ("acceptance", "supplementary") for b in ("cuda", "cpu")})
 
     @requires_windows_pwsh
-    def test_a_seek_back_or_an_absent_max_jump_is_could_not_check_never_a_pass(self) -> None:
-        """backward > 0 is not judged (engine_target is the engine's high-water), and a line without max_jump is a missing number: both FAIL on conformMaxJump alone."""
+    def test_adversary_b56cc731_a1_a_repeated_frame_fails(self) -> None:
+        """Fix iteration 1 (adversary A1 on b56cc731), its literal input: engine source_advanced=480, painted 1..240,240,241..479. max_jump counts forward
+        steps, so the repeat read max_jump=1 and every criteria list passed; the line's repeats=1 now fails conformRepeats alone."""
+        line = " presented=480 source_advanced=478 max_jump=1 wraps=0 backward=0 repeats=1 first_frame=1 last_frame=479 engine_target=479"
+        for row in self.chain(line, ends=False, frames=480):
+            with self.subTest(role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(self.failed_metrics(row), ["conformRepeats"], row)
+
+    @requires_windows_pwsh
+    def test_adversary_b56cc731_a2_an_unpainted_final_target_fails(self) -> None:
+        """Fix iteration 1 (adversary A2 on b56cc731), its literal input: the engine reached target 479 and the last painted frame is 478 (never submitted).
+        conformMaxJump's one held-target allowance absorbs it, so every list passed; conformTailUnpaintedFrames = 479 - 478 = 1 now fails alone."""
+        line = (" presented=478 source_advanced=477 max_jump=1 wraps=0 backward=0 repeats=0 first_frame=1 last_frame=478 engine_target=479 paint_submitted=478"
+                " paint_superseded=0 paint_unverified=0 paint_waiting=0")
+        for row in self.chain(line, ends=False, frames=480):
+            with self.subTest(role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(self.failed_metrics(row), ["conformTailUnpaintedFrames"], row)
+
+    @requires_windows_pwsh
+    def test_a_run_painted_through_its_last_target_once_each_passes(self) -> None:
+        """The control, in the shape the venue logs show for a sound unpaced 20 s run (the start frame on screen before Play, so first_frame=1): every
+        target 1..479 painted once, in order, through engine_target. It passes every list."""
+        line = " presented=479 source_advanced=478 max_jump=1 wraps=0 backward=0 repeats=0 first_frame=1 last_frame=479 engine_target=479"
+        for row in self.chain(line, ends=False, frames=480):
+            with self.subTest(role=row["role"], backend=row["backend"]):
+                self.assertTrue(row["pass"], row)
+
+    @requires_windows_pwsh
+    def test_a_seek_back_or_an_absent_field_is_could_not_check_never_a_pass(self) -> None:
+        """backward > 0 is not judged (engine_target is the engine's high-water), and a line without max_jump or repeats is a missing number: each FAILS."""
         seek = " presented=1550 source_advanced=1548 max_jump=1 wraps=0 backward=1 repeats=0 first_frame=0 last_frame=1448 engine_target=1498"
         for row in self.chain(seek, ends=False):
             with self.subTest(case="backward=1", role=row["role"], backend=row["backend"]):
                 self.assertFalse(row["pass"], row)
-                self.assertEqual(len(row["failures"]), 1, row)
-                self.assertTrue(row["failures"][0].startswith("conformMaxJump: "), row)
+                self.assertEqual(self.failed_metrics(row), ["conformMaxJump", "conformTailUnpaintedFrames"], row)
                 self.assertIn("a seek back", row["failures"][0], row)
-        for row in self.chain(" presented=1499"):
-            with self.subTest(case="no max_jump", role=row["role"], backend=row["backend"]):
-                self.assertFalse(row["pass"], row)
-                self.assertEqual(len(row["failures"]), 1, row)
-                self.assertIn("does not carry the field", row["failures"][0], row)
+                self.assertIn("a seek back", row["failures"][1], row)
+        for case, line, metric in (("no max_jump", " presented=1499", "conformMaxJump"),
+                                   ("no repeats", " presented=1499 source_advanced=1498 max_jump=1 wraps=0 backward=0 first_frame=0 last_frame=1498 engine_target=1498",
+                                    "conformRepeats")):
+            for row in self.chain(line, ends=(case != "no repeats")):
+                with self.subTest(case=case, role=row["role"], backend=row["backend"]):
+                    self.assertFalse(row["pass"], row)
+                    self.assertEqual(self.failed_metrics(row), [metric], row)
+                    self.assertIn("does not carry the field", row["failures"][0], row)
+
+    @requires_windows_pwsh
+    def test_the_every_frame_metrics_never_trust_a_summary_key_of_the_same_name(self) -> None:
+        """A summary.json that says conformRepeats=0 / conformTailUnpaintedFrames=0 cannot stand in for the run log's own line (absent here)."""
+        proc, out = run_pwsh_json(
+            "$m = [pscustomobject]@{ conformRepeats = 0; conformTailUnpaintedFrames = 0; rows = 5 }\n"
+            "Get-DvCriteriaMetrics -Metrics $m -Playback ([ordered]@{ conformLinePresent = $false }) | ConvertTo-Json -Compress -Depth 4")
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for metric in ("conformRepeats", "conformTailUnpaintedFrames"):
+            self.assertIsNone(out[metric], out)
+            self.assertIn("no playback_smoke.conform line", out[metric + "CouldNotCheck"], out)
 
 
 class DriftLegSpecTests(unittest.TestCase):
