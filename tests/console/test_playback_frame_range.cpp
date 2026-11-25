@@ -5201,3 +5201,38 @@ TEST( PlaybackFrameRangeArgOverflow, MainRefusesSecondsOutOfRangeFirst )
     ASSERT_TRUE( refusal.contains( QStringLiteral( "at most 2147483647" ) ) );                       // RED: 2147483.647
     ASSERT_FALSE( source.contains( QStringLiteral( "at most 2147483.647" ) ) );
 }
+
+// PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r3 (adversary pass 4 A1 on b30cd3a1, carried OPEN by r2): a ONE-FRAME Loop cut (Cut In =
+// Cut Out = 41, conform off: loop width 0) still corrects a start outside its frame [40, 41) onto that frame, before the delta. The
+// `loopWidth > 0` guard skipped both folds, so a playhead at 10 advanced to 10.192 and a stale 100 to 100.192 with a lap. After the
+// correction the tick is exactly the one a start ON the frame makes (its zero-width lap is the in-cut start's own, the base's,
+// DROP-FRAME-ZERO-WIDTH-LOOP-STALE-LAP-1): the stale distance adds nothing.
+TEST( PlaybackFrameRange, R3AOneFrameLoopCutCorrectsAStartOutsideItsFrame )
+{
+    using playback_frame_range::advanceDropFrameTick;
+    const playback_frame_range::DropFrameTickResult onFrame = advanceDropFrameTick( 40.0, 0.192, 41, 41, true, false );
+    ASSERT_FALSE( onFrame.corrected );                                   // control: a start on the cut's frame is not corrected
+    const playback_frame_range::DropFrameTickResult below = advanceDropFrameTick( 10.0, 0.192, 41, 41, true, false );
+    ASSERT_TRUE( below.corrected );                                      // 2a3371ff: false
+    ASSERT_TRUE( below.correctedStart == 40.0 );                         // 2a3371ff: 10
+    ASSERT_TRUE( below.foldedFrames == -30.0 );
+    ASSERT_NEAR( 40.192, below.position, 1e-12 );                        // 2a3371ff: 10.192
+    ASSERT_NEAR( 0.192, below.appliedFrames, 1e-12 );
+    ASSERT_EQ( onFrame.wrapLaps, below.wrapLaps );
+    const playback_frame_range::DropFrameTickResult stale = advanceDropFrameTick( 100.0, 0.192, 41, 41, true, false );
+    ASSERT_TRUE( stale.corrected );                                      // 2a3371ff: false
+    ASSERT_TRUE( stale.correctedStart == 40.0 );
+    ASSERT_TRUE( stale.foldedFrames == 60.0 );
+    ASSERT_NEAR( 40.192, stale.position, 1e-12 );                        // 2a3371ff: 100.192
+    ASSERT_EQ( onFrame.wrapLaps, stale.wrapLaps );
+    ASSERT_EQ( onFrame.wrapWidth, stale.wrapWidth );
+    // inside the frame (40.5) is not corrected; neither is NaN; +-inf are corrected onto the frame
+    ASSERT_FALSE( advanceDropFrameTick( 40.5, 0.192, 41, 41, true, false ).corrected );
+    ASSERT_FALSE( advanceDropFrameTick( std::nan( "" ), 0.192, 41, 41, true, false ).corrected );
+    ASSERT_TRUE( advanceDropFrameTick( -HUGE_VAL, 0.0, 41, 41, true, false ).correctedStart == 40.0 );
+    ASSERT_TRUE( advanceDropFrameTick( HUGE_VAL, 0.0, 41, 41, true, false ).correctedStart == 40.0 );
+    // the conform-side helper reads the same start
+    ASSERT_TRUE( playback_frame_range::dropFrameCorrectedStart( 10.0, 41, 41, true, false ) == 40.0 );
+    // a width-1 cut is unchanged: the r1 below-cut fold already owned it (conformed 41..41 with presentLastFrame)
+    ASSERT_TRUE( advanceDropFrameTick( 10.0, 0.0, 41, 41, true, true ).correctedStart == 40.0 );
+}

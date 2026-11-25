@@ -1240,3 +1240,75 @@ TEST(PlaybackSlipHistogram, R2Iter2APinnedStopUndoesTheCorrectionsItsFrameNeverC
     ASSERT_EQ( 520LL, (long long)landed.correctedFrames() );
     ASSERT_EQ( 480, landed.timelineTravel( 1000 ) );
 }
+
+// r3 (escalated adversary pass 5 A1 on 2a3371ff): the first present's jump is spent apart from a rebased interval only when the
+// landed correction was made AFTER the first present. Here the correction 10 -> 40 came BEFORE it: the first present's jump (the
+// timeline 45 over the display 10, with the 30-frame correction taken out: frames 41..44) IS the rebased interval's own travel, so
+// it covers the landing's four skips once, as startup catch-up, and nothing is a slip.
+TEST(PlaybackSlipHistogram, R3AJumpMeasuredAfterTheCorrectionCoversTheRebasedInterval)
+{
+    SlipHistogram h;
+    h.reset( 10, 24.0 );
+    h.setPlayStart( 0.0 );
+    h.noteTimelineCorrection( 40 );
+    h.noteTimelineMove( AdvancePath::DropTick, 45, 200.0, 5.0, 0.0 );
+    h.notePresent( r2Present( 10, 210.0, 45 ) );                          // requested before the correction: unlanded
+    h.notePresent( r2Present( 45, 250.0, 45, 1, true, 40 ) );
+    const Summary s = h.finish( 260.0, 45 );
+    ASSERT_EQ( 0LL, s.slipsTotal );                                      // 2a3371ff: 4
+    ASSERT_EQ( 0, s.slipEvents );                                        // 2a3371ff: 1
+    ASSERT_EQ( 4, s.startupCatchupFrames );                              // booked once, never twice
+    ASSERT_EQ( 0, s.timelineFramesAfterFirst );
+}
+
+// r3 sibling: two corrections, one before the first present and one after it, both landed by the second present. The rebase is to
+// the LAST one's frame, made after the first present, so the jump (measured before it) never covers the rebased interval: pass 4
+// A3's rule. Start 10; corrected to 40 and granted to 45; the first present shows 10; corrected to 60 and granted to 65; 65 lands
+// both (rebase 60): 61..64 are four slips, and the jump's four frames are startup catch-up.
+TEST(PlaybackSlipHistogram, R3TheLastLandedCorrectionDecidesWhetherTheJumpIsSpentApart)
+{
+    SlipHistogram h;
+    h.reset( 10, 24.0 );
+    h.setPlayStart( 0.0 );
+    h.noteTimelineCorrection( 40 );
+    h.noteTimelineMove( AdvancePath::DropTick, 45, 200.0, 5.0, 0.0 );
+    h.notePresent( r2Present( 10, 210.0, 45 ) );
+    h.noteTimelineCorrection( 60 );
+    h.noteTimelineMove( AdvancePath::DropTick, 65, 240.0, 5.0, 0.0 );
+    h.notePresent( r2Present( 65, 250.0, 65, 2, true, 60 ) );
+    const Summary s = h.finish( 260.0, 65 );
+    ASSERT_EQ( 4LL, s.slipsTotal );
+    ASSERT_EQ( 1, s.slipEvents );
+    ASSERT_EQ( 4, s.startupCatchupFrames );
+    // and the landing of only the EARLIER correction (stamp 1) keeps the base rule: the jump covers 41..44
+    SlipHistogram early;
+    early.reset( 10, 24.0 );
+    early.setPlayStart( 0.0 );
+    early.noteTimelineCorrection( 40 );
+    early.noteTimelineMove( AdvancePath::DropTick, 45, 200.0, 5.0, 0.0 );
+    early.notePresent( r2Present( 10, 210.0, 45 ) );
+    early.noteTimelineCorrection( 60 );
+    early.notePresent( r2Present( 45, 250.0, 60, 1, true, 40 ) );
+    const Summary e = early.finish( 260.0, 60 );
+    ASSERT_EQ( 0LL, e.slipsTotal );                                      // 2a3371ff: 4
+    ASSERT_EQ( 4, e.startupCatchupFrames );
+}
+
+// r3 sibling: a pinned stop that drops the unlanded corrections also drops them from the first present's count, so a correction
+// made after the pin (index 0 again) is still known to follow the first present. The jump is spent apart: 41..44 are slips.
+TEST(PlaybackSlipHistogram, R3APinnedStopKeepsTheFirstPresentsCorrectionCountInRange)
+{
+    SlipHistogram h;
+    h.reset( 10, 24.0 );
+    h.setPlayStart( 0.0 );
+    h.noteTimelineCorrection( 30 );
+    h.noteTimelineMove( AdvancePath::DropTick, 35, 200.0, 5.0, 0.0 );
+    h.notePresent( r2Present( 10, 210.0, 35 ) );                          // the correction to 30 is unlanded here
+    h.noteTimelinePinnedToDisplay( 10 );                                  // and dropped by the pin: the timeline is back on 10
+    h.noteTimelineCorrection( 40 );
+    h.noteTimelineMove( AdvancePath::DropTick, 45, 240.0, 5.0, 0.0 );
+    h.notePresent( r2Present( 45, 250.0, 45, 1, true, 40 ) );
+    const Summary s = h.finish( 260.0, 45 );
+    ASSERT_EQ( 4LL, s.slipsTotal );                                      // green on 2a3371ff; the r3 rule without the pin clamp: 0
+    ASSERT_EQ( 4, s.startupCatchupFrames );
+}
