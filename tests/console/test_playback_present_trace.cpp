@@ -315,6 +315,47 @@ TEST(PlaybackPresentTrace, AClampedTickFromBeforeTheLastFrameIsStillItsTravel)
     ASSERT_NEAR(1.0, trace.rows()[0].advancedFrames, 0.0);
 }
 
+namespace
+{
+// MainWindow::playbackHandling's grantedDropFrames, as written on the head under test (the wiring row below pins it)
+double mainWindowGrantedDropFrames(const playback_frame_range::DropFrameTickResult &tick, double before)
+{
+    return tick.position - before + tick.foldedFrames + tick.clampedFrames
+        + static_cast<double>(tick.wrapWidth) * tick.wrapLaps;
+}
+} // namespace
+
+// r8 iteration 1 (adversary pass 14 A1 on a2983bf2, introduced major): the grant was RECONSTRUCTED from the endpoints, and
+// next to a far stale start that subtraction rounds. MLVI rate 3689/160, an 8 ms tick, stale Drop Frame position 1100000,
+// cut 1..2, Loop on: the fold applies 0.18445 with zero laps, the reconstruction read 0.1844500000588596; from 8400000 a
+// grant of 4.999999999999999e-10 reconstructed to 0 and was logged as a hold. The grant is the delta the tick applied.
+TEST(PlaybackPresentTrace, AFoldedStartsGrantIsTheAppliedDeltaNotAReconstruction)
+{
+    const double request = playback_fps_meter::dropFrameRequestFrames(3689.0 / 160.0, 8);
+    const playback_frame_range::DropFrameTickResult tick =
+        playback_frame_range::advanceDropFrameTick(1100000.0, request, 1, 2, true, false);
+    ASSERT_TRUE(tick.wrapped);
+    ASSERT_EQ(0, tick.wrapLaps);
+    ASSERT_TRUE(tick.position == request);
+    ASSERT_TRUE(mainWindowGrantedDropFrames(tick, 1100000.0) == request);
+    const double tiny = 4.999999999999999e-10;
+    const playback_frame_range::DropFrameTickResult tinyTick =
+        playback_frame_range::advanceDropFrameTick(8400000.0, tiny, 1, 2, true, false);
+    ASSERT_EQ(0, tinyTick.wrapLaps);
+    const double tinyGranted = mainWindowGrantedDropFrames(tinyTick, 8400000.0);
+    ASSERT_TRUE(tinyGranted == tiny);
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(1000.0, 4);
+    trace.noteTick(1008.0, false, false);
+    trace.noteAdvance(1008.5, tinyGranted, 8);
+    Row r;
+    r.presentMs = 1020.0;
+    trace.notePresent(r);
+    ASSERT_EQ(1, trace.rows()[0].advances);
+    ASSERT_TRUE(trace.rows()[0].advancedFrames == tiny);
+}
+
 TEST(PlaybackPresentTrace, ARowHasOneFieldPerHeaderColumn)
 {
     Recorder trace;
@@ -398,13 +439,14 @@ TEST(PlaybackPresentTraceWiring, TheAdvanceIsTheTicksAppliedGrantNotItsEndpoints
         "                m_playbackTickAppliedFrames = grantedDropFrames;\n")));
 }
 
-// r8 (sol r7 blocker on 75ed5094): the Drop Frame grant (the trace's advance and the slip histogram's granted share) adds
-// back the distance the non-Loop clamp moved a stale start past the cut's last frame onto it, as it adds back a Loop fold,
-// so a clamp correction with no grant is 0 frames, never a negative advance.
-TEST(PlaybackPresentTraceWiring, TheDropFrameGrantAddsBackTheNonLoopClampCorrection)
+// r8 (sol r7 blocker on 75ed5094): the Drop Frame grant (the trace's advance and the slip histogram's granted share) is
+// never the clamp's correction of a stale start past the cut's last frame, so that correction is 0 frames, never a negative
+// advance. r8 iteration 1 (pass 14 A1 on a2983bf2): it is the tick's own applied delta (DropFrameTickResult::appliedFrames),
+// never reconstructed from the endpoints, which rounds next to a far stale start.
+TEST(PlaybackPresentTraceWiring, TheDropFrameGrantIsTheTicksAppliedDelta)
 {
     const QString source = mainWindowSource();
     ASSERT_EQ(1, source.count(QStringLiteral(
-        "                const double grantedDropFrames = dropFrameTick.position - sourcePositionBeforeDropTick + dropFrameTick.foldedFrames\n"
-        "                    + dropFrameTick.clampedFrames + static_cast<double>( dropFrameTick.wrapWidth ) * dropFrameTick.wrapLaps;\n")));
+        "                const double grantedDropFrames = dropFrameTick.appliedFrames;\n")));
+    ASSERT_FALSE(source.contains(QStringLiteral("dropFrameTick.position - sourcePositionBeforeDropTick")));
 }
