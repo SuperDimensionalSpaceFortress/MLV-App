@@ -17,6 +17,7 @@
 #ifndef PLAYBACKPRESENTTRACE_H
 #define PLAYBACKPRESENTTRACE_H
 
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -87,12 +88,20 @@ public:
         if( predictive ) ++m_pending.predictiveTicks;
     }
 
-    /*! A tick ran playbackHandling: the drop-frame position went from \a fromPosition to \a toPosition. */
-    void noteAdvance( double nowMs, double fromPosition, double toPosition, int tickDiffMs )
+    /*! A tick ran playbackHandling: the drop-frame position went from \a fromPosition to \a toPosition, and the tick applied
+     *  \a appliedFrames source frames (its grant: MainWindow::m_playbackTickAppliedFrames, 0 when it granted nothing).
+     *  PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r7 (sol r6 on 9f3f5ebd): the advance is the applied grant, never inferred from
+     *  the endpoints alone. A tick whose whole laps land back on its start (24 fps, cut 1..616, 999990 frames = 1626 laps of
+     *  615: 0 -> 0) is one advance with its shaped interval; equal endpoints with no grant stay a hold. advancedFrames sums
+     *  the grants ("the source frames those advances granted"), so a wrap adds what it granted, not its net move back. A
+     *  move with no finite grant (a cut normalization) still counts as on the base, by its displacement. */
+    void noteAdvance( double nowMs, double fromPosition, double toPosition, double appliedFrames, int tickDiffMs )
     {
-        if( !active() || !( toPosition != fromPosition ) ) return;
+        if( !active() ) return;
+        const bool granted = std::isfinite( appliedFrames ) && appliedFrames != 0.0;
+        if( !granted && !( toPosition != fromPosition ) ) return;
         ++m_pending.advances;
-        m_pending.advancedFrames += toPosition - fromPosition;
+        m_pending.advancedFrames += granted ? appliedFrames : toPosition - fromPosition;
         m_pending.lastAdvanceMs = nowMs - m_originMs;
         m_pending.lastTickDiffMs = tickDiffMs;
     }

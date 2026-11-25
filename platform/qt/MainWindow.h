@@ -1399,6 +1399,9 @@ private:
     // (playback_frame_range::conformDropFrameDelta), repaid one presented frame per later tick. Cleared with the pace guard.
     double m_conformDropDebtFrames = 0.0;
     playback_present_trace::Recorder m_playbackPresentTrace;   // PLAYBACK-STARTUP-CATCHUP-BURST-1 r7, opt-in
+    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r7 (sol r6 on 9f3f5ebd): the source frames the last playbackHandling() call
+    // applied (its grant; 0 when it held). Cleared on entry, set on each grant path; the present trace reads it.
+    double m_playbackTickAppliedFrames = 0.0;
     // PLAYBACK-BACHELOR-PRESENT-JITTER-1: per-present slip accounting and timeline-path reconciliation for the
     // smoke session (playback_smoke.slip_summary); fed only while m_playbackSmokeActive.
     playback_slip::SlipHistogram m_playbackSlipHistogram;

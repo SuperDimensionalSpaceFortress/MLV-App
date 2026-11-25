@@ -3059,8 +3059,9 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     const int positionBeforePlayback = ui->horizontalSliderPosition->value();
     const double tracePositionBefore = m_newPosDropMode;
     playbackHandling( timeDiff );
+    // r7 (sol r6 on 9f3f5ebd): the trace reads the tick's applied grant, so whole laps landing back on the start still advance.
     if( m_playbackPresentTrace.active() )
-        m_playbackPresentTrace.noteAdvance( mlv_stage_timing_now() * 1000.0, tracePositionBefore, m_newPosDropMode, shapedTickMs );
+        m_playbackPresentTrace.noteAdvance( mlv_stage_timing_now() * 1000.0, tracePositionBefore, m_newPosDropMode, m_playbackTickAppliedFrames, shapedTickMs );
     if( frameChangedBeforePlayback )
     {
         invalidateGpuPreviewProcessingConfigCache();
@@ -13208,6 +13209,7 @@ int MainWindow::openMlv( QString fileName )
 void MainWindow::playbackHandling(int timeDiff)
 {
     const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::PlaybackHandling );
+    m_playbackTickAppliedFrames = 0.0;   // r7 (sol r6): set below only by a path that applied a grant
     if( ui->actionPlay->isChecked() )
     {
         if( m_fileLoaded && m_pMlvObject )
@@ -13276,6 +13278,9 @@ void MainWindow::playbackHandling(int timeDiff)
                                                               1.0, m_playbackPaceGuard.creditFrames(),
                                                               getPlaybackFramerate(), !paceGuardArmedBeforeTick );
                 m_frameChanged = true;
+                // r7 (sol r6): the wrap is one granted frame transition (as the slip histogram books it), even when it lands
+                // on the frame it left (cut n..n) or leaves m_newPosDropMode where it was (no audio output).
+                m_playbackTickAppliedFrames = 1.0;
                 if( ui->actionAudioOutput->isChecked()
                  || ( repairDisabled && ui->actionDropFrameMode->isChecked() ) )
                 {
@@ -13309,6 +13314,8 @@ void MainWindow::playbackHandling(int timeDiff)
                     ui->horizontalSliderPosition->setValue( ui->horizontalSliderPosition->value() + 1 );
                     m_playbackInternalSliderAdvance = false;
                     m_sourceAdvance.noteEngineTick( sourcePositionBeforeTick, ui->horizontalSliderPosition->value(), false );
+                    // r7 (sol r6): the frame the slider really moved (0 at its maximum), whatever m_newPosDropMode held before
+                    m_playbackTickAppliedFrames = ui->horizontalSliderPosition->value() - sourcePositionBeforeTick;
                     if( m_playbackSmokeActive )
                         m_playbackSlipHistogram.noteTimelineMove( playback_slip::AdvancePath::WholeFrame,
                                                                   ui->horizontalSliderPosition->value(), paceNowMs,
@@ -13355,6 +13362,8 @@ void MainWindow::playbackHandling(int timeDiff)
                 // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r6 (sol r5 S2): a stale start past the lap limit was folded back first.
                 const double grantedDropFrames = dropFrameTick.position - sourcePositionBeforeDropTick + dropFrameTick.foldedFrames
                     + static_cast<double>( dropFrameTick.wrapWidth ) * dropFrameTick.wrapLaps;
+                // r7 (sol r6 on 9f3f5ebd): the present trace's advance, including whole laps that land back on the start
+                m_playbackTickAppliedFrames = grantedDropFrames;
                 m_newPosDropMode = dropFrameTick.position;
                 // PLAYBACK-CLIP-LENGTH-ENFORCE-3: the drop-frame engine's source-frame advance (dropped frames
                 // still advance the timeline; a wrap never counts).
