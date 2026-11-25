@@ -376,19 +376,20 @@ TEST(PlaybackFpsMeterPolicy, OneTickLapsStayWithinTheBoundFromAStaleStartOutside
     // (position - before + wrapWidth * wrapLaps is what the slip histogram and the paint tracker read) and never negative
     const double staleGranted = stale.position - 20.0 + (double)stale.wrapWidth * stale.wrapLaps;
     ASSERT_TRUE(staleGranted >= 0.0 && staleGranted <= 999990.0);
-    // a stale start already a million laps past the cut keeps the base arithmetic: 1000001 + 2.4 wraps 1000003 laps to
-    // 0.4 and grants 2.4 (7a0f5a1c landed on 0 after 1e6 laps and reported -1). The laps of the stale start ALONE are the
-    // base's on any tick (PRE-EXISTING; O(1) lap recording is PLAYBACK-WRAP-RECORDER-RUNLENGTH-1)
+    // r6 (sol r5 S2 on 6aaac7f5): a stale start already at or past the lap limit no longer keeps the base arithmetic
+    // (1000001 + 2.4 wrapped 1000003 laps). It is folded back to its first lap (the stale laps past that one are moved, not
+    // recorded: DropFrameTickResult::foldedFrames), and only then does the delta advance: 1000001 + 2.4 makes 3 laps to 0.4
+    // and still grants the whole 2.4 (OneTickLapsStayWithinTheBoundFromAStartAtOrPastTheLapLimit checks the accounting).
     const playback_frame_range::DropFrameTickResult farStale =
         playback_frame_range::advanceDropFrameTick(1000001.0, 2.4, 1, 2, true);
-    ASSERT_EQ(1000003, farStale.wrapLaps);
-    const double farGranted = farStale.position - 1000001.0 + (double)farStale.wrapWidth * farStale.wrapLaps;
-    ASSERT_TRUE(std::fabs(farGranted - 2.4) < 1e-6);
+    ASSERT_EQ(3, farStale.wrapLaps);
+    ASSERT_TRUE(farStale.wrapped);
+    ASSERT_TRUE(std::fabs(farStale.position - 0.4) < 1e-6);
     ASSERT_TRUE(farStale.position >= 0.0 && farStale.position < 1.0);
-    // PRE-EXISTING characterization: a stale start far past the cut (a long clip) with an ordinary request
+    // a stale start far past the cut (a long clip) with an ordinary request: 6aaac7f5 made 3,000,000 laps (the base's)
     const playback_frame_range::DropFrameTickResult far =
         playback_frame_range::advanceDropFrameTick(3000000.0, 0.25, 1, 2, true);
-    ASSERT_EQ(3000000, far.wrapLaps);
+    ASSERT_EQ(1, far.wrapLaps);
     ASSERT_TRUE(std::fabs(far.position - 0.25) < 1e-6);
     // conform (presentLastFrame: wrap past the last frame by the cut's frame count) with the most debt a tick carries
     const playback_frame_range::DropFrameTickResult conformed = playback_frame_range::advanceDropFrameTick(
@@ -428,4 +429,46 @@ TEST(PlaybackFpsMeterPolicy, OneTickLapsStayWithinTheBoundFromAStaleStartOutside
     const double clippedPlainGranted =
         clippedPlain.position - 1000000.0 + (double)clippedPlain.wrapWidth * clippedPlain.wrapLaps;
     ASSERT_TRUE(clippedPlainGranted > 0.9999 && clippedPlainGranted < 1.0);
+}
+
+// r6 (sol r5 S2 on 6aaac7f5, fable r5 and key3 r5 hardening PLAYBACK-FRAME-RANGE-LAP-BOUND-CLAIM-WORDING-1): the comments
+// promised at most 1e6 laps from ANY start, but a start already at or past lapLimit kept the base arithmetic, so its laps
+// (and PlaybackWrapRecorder::noteEngineWrap's appends, one per lap) were the stale distance's own. Sol's rows, plain cut
+// 1..2 (wrapAt 1, width 1, lapLimit 1000001): 1100000 + 1 made 1,100,001 laps and 1100000 + 999990 made 2,099,990.
+TEST(PlaybackFpsMeterPolicy, OneTickLapsStayWithinTheBoundFromAStartAtOrPastTheLapLimit)
+{
+    using playback_frame_range::advanceDropFrameTick;
+    using playback_frame_range::DropFrameTickResult;
+    const DropFrameTickResult stale = advanceDropFrameTick(1100000.0, 1.0, 1, 2, true, false);
+    ASSERT_TRUE(stale.wrapped);
+    ASSERT_TRUE(stale.wrapLaps <= 1000000);
+    ASSERT_EQ(2, stale.wrapLaps);
+    ASSERT_TRUE(stale.position >= 0.0 && stale.position < 1.0);
+    const DropFrameTickResult bounded = advanceDropFrameTick(1100000.0, 999990.0, 1, 2, true, false);
+    ASSERT_TRUE(bounded.wrapped);
+    ASSERT_TRUE(bounded.wrapLaps <= 1000000);
+    ASSERT_TRUE(bounded.position >= 0.0 && bounded.position < 1.0);
+    // a start exactly AT the limit, conform (cut 1..2: wrapAt 2, width 2, lapLimit 2000002): 6aaac7f5 made 1,000,001 laps
+    const DropFrameTickResult atLimitConform = advanceDropFrameTick(2000002.0, 0.5, 1, 2, true, true);
+    ASSERT_TRUE(atLimitConform.wrapped);
+    ASSERT_TRUE(atLimitConform.wrapLaps <= 1000000);
+    ASSERT_TRUE(atLimitConform.position >= 0.0 && atLimitConform.position < 2.0);
+    // a wide cut (1..720: wrapAt 719, width 719, lapLimit 719000719) and a start far past it
+    const DropFrameTickResult wide = advanceDropFrameTick(2000000000.0, 3.0, 1, 720, true, false);
+    ASSERT_TRUE(wide.wrapped);
+    ASSERT_TRUE(wide.wrapLaps <= 1000000);
+    ASSERT_TRUE(wide.position >= 0.0 && wide.position < 719.0);
+    // a start that is not a number of frames at all (+inf): 6aaac7f5 counted INT_MAX - 1 laps (8 GB of appends)
+    const DropFrameTickResult endlessStart = advanceDropFrameTick(HUGE_VAL, 1.0, 1, 2, true, false);
+    ASSERT_TRUE(endlessStart.wrapped);
+    ASSERT_TRUE(endlessStart.wrapLaps <= 1000000);
+    ASSERT_TRUE(endlessStart.position >= 0.0 && endlessStart.position < 1.0);
+    // ...and an infinite delta from a far start too
+    const DropFrameTickResult endlessBoth = advanceDropFrameTick(1100000.0, HUGE_VAL, 1, 2, true, false);
+    ASSERT_TRUE(endlessBoth.wrapLaps <= 1000000);
+    ASSERT_TRUE(endlessBoth.position >= 0.0 && endlessBoth.position < 1.0);
+    // a start just below the limit is unchanged, bit for bit (the r5 rows above: 1000000 + 1.5 keeps 1e6 laps)
+    const DropFrameTickResult below = advanceDropFrameTick(1000000.0, 0.5, 1, 2, true, false);
+    ASSERT_EQ(1000000, below.wrapLaps);
+    ASSERT_TRUE(below.position == 1000000.0 + 0.5 - 1000000.0);
 }

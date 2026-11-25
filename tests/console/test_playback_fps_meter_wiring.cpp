@@ -317,3 +317,25 @@ TEST(PlaybackFpsMeterWiring, TraceAndLogsReadTheShapedTickAndTheGatePinRejectsAD
     deadGate.replace(gateLine, QStringLiteral("        if( false )\n") + gateLine);
     ASSERT_FALSE(meterGateIsLive(deadGate));
 }
+
+// r6 (sol r5 S1 on 6aaac7f5): an accepted positive rate the cap cannot bound (+inf: a silent MLV with an FPS denominator
+// of 0, macros.h) cut an 8 ms Drop Frame tick to 0 ms, and the call site's own expression made inf * 0 = NaN, which the
+// pace guard's comparisons pass on to the drop position and the slider's int. The request is now taken through
+// playback_fps_meter::dropFrameRequestFrames, which keeps that expression when it is finite and asks for nothing
+// otherwise. S2 (same round): a start at or past the lap limit is folded, and the slip histogram's granted share adds
+// the folded distance back (DropFrameTickResult::foldedFrames), so the advance it reads is still the applied one.
+TEST(PlaybackFpsMeterWiring, DropFrameRequestIsFiniteAndTheGrantedShareCountsAFoldedStart)
+{
+    const QString handling = functionBody(readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp")),
+        QStringLiteral("void MainWindow::playbackHandling(int timeDiff)"),
+        QStringLiteral("void MainWindow::showPerformanceProfilingDialog"));
+    ASSERT_FALSE(handling.isEmpty());
+    ASSERT_EQ(1, handling.count(QStringLiteral(
+        "m_playbackPaceGuard.grant( playback_fps_meter::dropFrameRequestFrames( getPlaybackFramerate(), timeDiff ), paceNowMs, playbackPaceGuardFps() ),")));
+    ASSERT_FALSE(handling.contains(QStringLiteral("getPlaybackFramerate() * (double)timeDiff / 1000.0")));
+    const int tickAt = handling.indexOf(QStringLiteral("playback_frame_range::advanceDropFrameTick("));
+    const int grantedAt = handling.indexOf(QStringLiteral(
+        "const double grantedDropFrames = dropFrameTick.position - sourcePositionBeforeDropTick + dropFrameTick.foldedFrames\n"));
+    ASSERT_TRUE(tickAt >= 0);
+    ASSERT_TRUE(grantedAt > tickAt);
+}
