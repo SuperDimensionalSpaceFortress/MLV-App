@@ -53,6 +53,11 @@ void lj92_close(lj92 lj);
  * Starting at target, write writeLength 16bit values, then skip 16bit skipLength value before writing again
  * If linearize is not NULL, use table at linearize to convert data values from output value to target value
  * Data is only correct if LJ92_ERROR_NONE is returned
+ *
+ * Precondition (no aliasing): the compressed input passed to lj92_open and the target buffer must not share
+ * backing memory, whether through the same mapping or through two distinct mappings of the same pages.
+ * The decoder's address-range overlap check sees only same-mapping overlap (it then keeps the legacy reader); it is
+ * a defence, not part of this contract. Behaviour is undefined when the two alias through distinct mappings.
  */
 int lj92_decode(lj92 lj,
                 uint16_t* target, int writeLength, int skipLength, // The image is written to target as a tile
@@ -66,6 +71,13 @@ int lj92_get_last_pred1_fast_path_active(void);
 int lj92_get_last_pred1_fast_path_measurement_requested(void);
 int lj92_get_last_pred1_fast_path_measurement_active(void);
 int lj92_get_last_pred1_fast_path_eligible(void);
+/* Largest SSSS (Huffman symbol value) in the table of the last lj92_decode on this thread; -1 before one. */
+int lj92_get_last_huff_max_ssss(void);
+/* Test/bench only (per calling thread): non-zero forces the legacy 16-bit-pair bit reader on the predictor-1 fast
+ * path so one binary can A/B both; zero (default) takes the u64 reader whenever the Huffman table allows it. */
+void lj92_set_pred1_legacy_reader(int force_legacy);
+/* 1 when the last lj92_decode on this thread used the u64 accumulator reader, else 0. */
+int lj92_get_last_pred1_u64_reader_active(void);
 int lj92_get_last_scan_component_count(void);
 int lj92_get_last_write_length(void);
 int lj92_get_last_expected_write_length(void);

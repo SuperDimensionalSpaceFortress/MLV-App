@@ -4015,6 +4015,635 @@ namespace MlvTest {
     Assert-That ($r.Thrown -match 'our value was taken back' -and $r.Thrown -match 'cannot tell an identical value that another run wrote from ours') 'SSH-PUSHURL-1 r4 A1 setup: the take-back message says git config cannot tell an identical value another run wrote from ours' $r.Thrown
 }
 
+# ================================================================ IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 r1: a replace never goes on after its safety net failed
+# Two ways Import replaced a host file although the thing that protects it was missing or damaged: (1) the pre-import backup of ~/.claude CLAUDE.md / settings.json could not be
+# made (a write failure, a held host file, an unwritable backups folder) and the copy went on to replace the same file with no backup; (2) the bundle zip was truncated, tar
+# exited non-zero after leaving a partly written file in the expanded folder, and Import copied that partial tree. Both now refuse with a typed record and a non-zero exit, and
+# the host file stays byte for byte as it was. In-process (the dot-sourced script, scratch HOME / state / workspace), so the backup folder's name (it carries the stamp) is known.
+function Invoke-R1Import([string]$Tag, [string]$Bundle, [scriptblock]$Prepare) {
+    $ws = New-Scratch "$Tag-ws"; $st = New-Scratch "$Tag-state"; $hm = New-Scratch "$Tag-home"; $tmp = New-Scratch "$Tag-mlvtmp"
+    $hostClaude = Join-Path $hm '.claude\CLAUDE.md'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $hostClaude) | Out-Null
+    [IO.File]::WriteAllText($hostClaude, 'HOST-GOOD-CONTENT')
+    (Get-Item -LiteralPath $hostClaude).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-3)
+    $sv = @{ S = $script:StateRoot; B = $script:BundlePath; R = $script:Repo; T = $script:MlvTmp; L = $script:LogFile; E = $env:USERPROFILE; P = $script:stamp; W = $script:Workspace }
+    $script:StateRoot = $st; $StateRoot = $st; $script:BundlePath = $Bundle; $BundlePath = $Bundle; $script:Repo = (Join-Path $ws 'MLV-App'); $Repo = $script:Repo
+    $script:MlvTmp = $tmp; $MlvTmp = $tmp; $script:LogFile = Join-Path $ws 'r1.log'; $script:stamp = "r1$Tag"; $stamp = $script:stamp; $env:USERPROFILE = $hm
+    $script:Failures.Clear()
+    $out = ''
+    try {
+        if ($Prepare) { & $Prepare $st $script:stamp }
+        try { $out = (Invoke-PhaseImport *>&1 | Out-String) } catch { $out += "THROWN: $($_.Exception.Message)" }
+    } finally {
+        $script:StateRoot = $sv.S; $StateRoot = $sv.S; $script:BundlePath = $sv.B; $BundlePath = $sv.B; $script:Repo = $sv.R; $Repo = $sv.R; $script:MlvTmp = $sv.T; $MlvTmp = $sv.T
+        $script:LogFile = $sv.L; $script:stamp = $sv.P; $stamp = $sv.P; $env:USERPROFILE = $sv.E
+    }
+    return @{ Host = [IO.File]::ReadAllText($hostClaude); Failures = @($script:Failures); Out = $out }
+}
+if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r1 import backup')) {
+    Add-Type -AssemblyName System.IO.Compression
+    $r1bundle = New-Scratch 'r1-bundle'
+    [IO.File]::WriteAllText((Join-Path $r1bundle 'MANIFEST.txt'), 'mlv-migrate-bundle v1')
+    New-Item -ItemType Directory -Force -Path (Join-Path $r1bundle 'home-claude') | Out-Null
+    [IO.File]::WriteAllText((Join-Path $r1bundle 'home-claude\CLAUDE.md'), 'FROM-BUNDLE')
+    # (1a) the backup of THIS file cannot be written (a folder stands where the backup file would go): the host file is not replaced
+    $r1a = Invoke-R1Import 'a' $r1bundle { param($st, $sp) [void][IO.Directory]::CreateDirectory((Join-Path $st "backups\home-claude-$sp\CLAUDE.md")) }
+    Assert-That ($r1a.Host -ceq 'HOST-GOOD-CONTENT') 'r1 import: a host CLAUDE.md whose backup could not be written is NOT replaced (byte-identical)' "host=[$($r1a.Host)]`n$($r1a.Out)"
+    Assert-That (@($r1a.Failures | Where-Object { $_ -like 'IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED*CLAUDE.md*' }).Count -eq 1) 'r1 import: the refusal is a typed failure (IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED <path>; the run exits non-zero)' ($r1a.Failures -join ',')
+    # (1b) the backup FOLDER cannot be made at all (a file stands where backups\ should be): nothing is backed up, so no backed-up file is replaced
+    $r1b = Invoke-R1Import 'b' $r1bundle { param($st, $sp) [IO.File]::WriteAllText((Join-Path $st 'backups'), 'not a folder') }
+    Assert-That ($r1b.Host -ceq 'HOST-GOOD-CONTENT') 'r1 import: a host CLAUDE.md is NOT replaced when the backup folder cannot be made (byte-identical)' "host=[$($r1b.Host)]`n$($r1b.Out)"
+    Assert-That (@($r1b.Failures | Where-Object { $_ -like 'IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED*CLAUDE.md*' }).Count -eq 1) 'r1 import: the unmakeable backup folder gives the same typed failure' ($r1b.Failures -join ',')
+    # (1c) control: a backup that works still lets the newer bundle file replace the older host file
+    $r1c = Invoke-R1Import 'c' $r1bundle $null
+    Assert-That ($r1c.Host -ceq 'FROM-BUNDLE' -and $r1c.Failures.Count -eq 0) 'r1 import control: with a working backup the newer bundle CLAUDE.md still replaces the older host file' "host=[$($r1c.Host)] failures=$($r1c.Failures -join ',')`n$($r1c.Out)"
+    # (2) a truncated bundle zip: tar leaves a partly written CLAUDE.md and exits non-zero; nothing is copied from that tree
+    $r1zip = Join-Path (New-Scratch 'r1-zip') 'bundle.zip'
+    $r1rnd = [Text.Encoding]::ASCII.GetBytes(('plain instruction line for the claude home file' + "`n") * 8200)   # about 400 KB of plain text, stored (not compressed), so a cut lands inside it
+    $r1fs = [IO.File]::Create($r1zip)
+    try {
+        $r1za = [IO.Compression.ZipArchive]::new($r1fs, [IO.Compression.ZipArchiveMode]::Create, $true)
+        try {
+            foreach ($r1e in @(@('MANIFEST.txt', [Text.Encoding]::ASCII.GetBytes('mlv-migrate-bundle v1')), @('home-claude/CLAUDE.md', $r1rnd))) {
+                $r1en = $r1za.CreateEntry($r1e[0], [IO.Compression.CompressionLevel]::NoCompression); $r1es = $r1en.Open(); try { $r1es.Write($r1e[1], 0, $r1e[1].Length) } finally { $r1es.Dispose() }
+            }
+        } finally { $r1za.Dispose() }
+    } finally { $r1fs.Dispose() }
+    $r1all = [IO.File]::ReadAllBytes($r1zip); $r1cut = [byte[]]::new([int]($r1all.Length * 0.6)); [Array]::Copy($r1all, $r1cut, $r1cut.Length); [IO.File]::WriteAllBytes($r1zip, $r1cut)
+    $r1d = Invoke-R1Import 'd' $r1zip $null
+    Assert-That ($r1d.Host -ceq 'HOST-GOOD-CONTENT') 'r1 import: a truncated bundle zip replaces nothing (the host CLAUDE.md is byte-identical)' "host length=$($r1d.Host.Length)`n$($r1d.Out)"
+    Assert-That (@($r1d.Failures | Where-Object { $_ -like 'IMPORT_BUNDLE_EXPAND_FAILED*' }).Count -eq 1) 'r1 import: a truncated bundle zip is a typed failure (IMPORT_BUNDLE_EXPAND_FAILED <path>; the run exits non-zero)' ($r1d.Failures -join ',')
+}
+
+# ================================================================ IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 r3: the replace is tied to the backup that was made, not to a path probe
+# Sol r2 (head a78e1737): the r2 guard remembered "this path could not be backed up" from a probe made at one instant. Three ways it still let a host file be replaced without a backup,
+# or failed the run for a file Import keeps: (1) a host file whose bytes cannot be read (access denied) was credential-skipped first, so the refusal was never recorded (exit 0);
+# (2) a host file renamed away while the backup ran and put back before the copy was not remembered, so it was replaced with no backup; (3) a host file saved between the backup and
+# the copy (older than the bundle copy) was replaced and the backup held the OLD bytes; (4) a host file another process HOLDS, with a bundle copy OLDER than it, was reported as a
+# failed backup although /XO keeps it. The replace now needs the bytes of the file it replaces (read under the lock) to equal the bytes that were backed up.
+function Invoke-R3Import([string]$Tag, [int]$HostAgeDays, [int]$BundleAgeDays, [scriptblock]$Prepare, [scriptblock]$Hook, [scriptblock]$Cleanup) {
+    $ws = New-Scratch "$Tag-ws"; $st = New-Scratch "$Tag-state"; $hm = New-Scratch "$Tag-home"; $tmp = New-Scratch "$Tag-mlvtmp"; $bd = New-Scratch "$Tag-bundle"
+    [IO.File]::WriteAllText((Join-Path $bd 'MANIFEST.txt'), 'mlv-migrate-bundle v1')
+    New-Item -ItemType Directory -Force -Path (Join-Path $bd 'home-claude') | Out-Null
+    $bf = Join-Path $bd 'home-claude\CLAUDE.md'
+    [IO.File]::WriteAllText($bf, 'FROM-BUNDLE'); (Get-Item -LiteralPath $bf).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays($BundleAgeDays)
+    $hostClaude = Join-Path $hm '.claude\CLAUDE.md'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $hostClaude) | Out-Null
+    [IO.File]::WriteAllText($hostClaude, 'HOST-GOOD-CONTENT'); (Get-Item -LiteralPath $hostClaude).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays($HostAgeDays)
+    $script:R3HostPath = $hostClaude
+    $sv = @{ S = $script:StateRoot; B = $script:BundlePath; R = $script:Repo; T = $script:MlvTmp; L = $script:LogFile; E = $env:USERPROFILE; P = $script:stamp }
+    $script:StateRoot = $st; $StateRoot = $st; $script:BundlePath = $bd; $BundlePath = $bd; $script:Repo = (Join-Path $ws 'MLV-App'); $Repo = $script:Repo
+    $script:MlvTmp = $tmp; $MlvTmp = $tmp; $script:LogFile = Join-Path $ws 'r3.log'; $script:stamp = "r3$Tag"; $stamp = $script:stamp; $env:USERPROFILE = $hm
+    $script:Failures.Clear()
+    $out = ''
+    try {
+        if ($Prepare) { & $Prepare $st $script:stamp }
+        if ($Hook) { $script:ImportBeforeReplaceHook = $Hook }
+        try { $out = (Invoke-PhaseImport *>&1 | Out-String) } catch { $out += "THROWN: $($_.Exception.Message)" }
+    } finally {
+        $script:ImportBeforeReplaceHook = $null
+        if ($Cleanup) { & $Cleanup }
+        $script:StateRoot = $sv.S; $StateRoot = $sv.S; $script:BundlePath = $sv.B; $BundlePath = $sv.B; $script:Repo = $sv.R; $Repo = $sv.R; $script:MlvTmp = $sv.T; $MlvTmp = $sv.T
+        $script:LogFile = $sv.L; $script:stamp = $sv.P; $stamp = $sv.P; $env:USERPROFILE = $sv.E
+    }
+    return @{ Host = $(if (Test-Path -LiteralPath $hostClaude) { [IO.File]::ReadAllText($hostClaude) } else { '<absent>' }); Failures = @($script:Failures); Out = $out }
+}
+if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r3 import backup')) {
+    $r3Typed = { param($r) @($r.Failures | Where-Object { $_ -like 'IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED*CLAUDE.md*' }).Count }
+    # (a) the host file's bytes cannot be read (access denied; its attributes can): refused with the typed record, not credential-skipped into a silent exit 0
+    $r3a = Invoke-R3Import 'a' -3 0 { param($st, $sp) & icacls.exe $script:R3HostPath /deny '*S-1-1-0:(RD)' 2>&1 | Out-Null } $null { & icacls.exe $script:R3HostPath /remove:d '*S-1-1-0' 2>&1 | Out-Null }
+    Assert-That ($r3a.Host -ceq 'HOST-GOOD-CONTENT') 'r3 import: a read-denied host CLAUDE.md is left byte-identical' "host=[$($r3a.Host)]`n$($r3a.Out)"
+    Assert-That ((& $r3Typed $r3a) -eq 1) 'r3 import: a read-denied host CLAUDE.md that the bundle would replace is the typed failure IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED (exit 1), not a silent credential skip' ($r3a.Failures -join ',')
+    # (b) the host file is absent while the backup step looks, and is put back (same bytes, same time) before the copy: it is not replaced without a backup
+    $r3b = Invoke-R3Import 'b' -3 0 { param($st, $sp) Move-Item -LiteralPath $script:R3HostPath -Destination "$script:R3HostPath.aside" } { param($From, $To) Move-Item -LiteralPath "$script:R3HostPath.aside" -Destination $script:R3HostPath }
+    Assert-That ($r3b.Host -ceq 'HOST-GOOD-CONTENT') 'r3 import: a host CLAUDE.md that came back after the backup step looked is NOT replaced (no backup of it exists)' "host=[$($r3b.Host)]`n$($r3b.Out)"
+    Assert-That ((& $r3Typed $r3b) -eq 1) 'r3 import: that refusal is the typed failure IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED' ($r3b.Failures -join ',')
+    # (b2) the same when the backups folder cannot be made (the other handler): the file is absent at that moment and back before the copy
+    $r3b2 = Invoke-R3Import 'b2' -3 0 { param($st, $sp) [IO.File]::WriteAllText((Join-Path $st 'backups'), 'not a folder'); Move-Item -LiteralPath $script:R3HostPath -Destination "$script:R3HostPath.aside" } { param($From, $To) Move-Item -LiteralPath "$script:R3HostPath.aside" -Destination $script:R3HostPath }
+    Assert-That ($r3b2.Host -ceq 'HOST-GOOD-CONTENT' -and (& $r3Typed $r3b2) -eq 1) 'r3 import: an unmakeable backups folder plus a host file that comes back is not replaced either (typed failure)' "host=[$($r3b2.Host)] failures=$($r3b2.Failures -join ',')"
+    # (c) an editor saves the host file after the backup was made (its time stays older than the bundle copy): the replace would lose that save, so it is refused
+    $r3c = Invoke-R3Import 'c' -3 0 $null { param($From, $To) [IO.File]::WriteAllText($script:R3HostPath, 'HOST-NEW'); (Get-Item -LiteralPath $script:R3HostPath).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-2) }
+    Assert-That ($r3c.Host -ceq 'HOST-NEW') 'r3 import: a host CLAUDE.md saved after its backup was made is NOT replaced (the backup holds the older bytes)' "host=[$($r3c.Host)]`n$($r3c.Out)"
+    Assert-That ((& $r3Typed $r3c) -eq 1) 'r3 import: that refusal is the typed failure IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED' ($r3c.Failures -join ',')
+    # (d) a host file another process HOLDS (FileShare.None) with an OLDER bundle copy: /XO keeps it, so there is no failure; (e) the same hold with a NEWER bundle copy is refused
+    $r3hold = { param($st, $sp) $script:R3Held = [IO.File]::Open($script:R3HostPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+    $r3rel = { if ($script:R3Held) { $script:R3Held.Dispose(); $script:R3Held = $null } }
+    $r3d = Invoke-R3Import 'd' -3 -5 $r3hold $null $r3rel
+    Assert-That ($r3d.Host -ceq 'HOST-GOOD-CONTENT' -and $r3d.Failures.Count -eq 0) 'r3 import: a HELD host CLAUDE.md that is newer than the bundle copy is kept with no failure (the /XO keep is not turned into a failed Import)' "host=[$($r3d.Host)] failures=$($r3d.Failures -join ',')`n$($r3d.Out)"
+    $r3e = Invoke-R3Import 'e' -3 0 $r3hold $null $r3rel
+    Assert-That ($r3e.Host -ceq 'HOST-GOOD-CONTENT' -and (& $r3Typed $r3e) -eq 1) 'r3 import: a HELD host CLAUDE.md that the bundle copy would replace is refused with the typed failure' "host=[$($r3e.Host)] failures=$($r3e.Failures -join ',')"
+    # (f) controls: a host file that is absent all the way through is created; a host file backed up and unchanged is still replaced
+    $r3f = Invoke-R3Import 'f' -3 0 { param($st, $sp) Remove-Item -LiteralPath $script:R3HostPath -Force }
+    Assert-That ($r3f.Host -ceq 'FROM-BUNDLE' -and $r3f.Failures.Count -eq 0) 'r3 import control: a host CLAUDE.md that is absent throughout is created from the bundle' "host=[$($r3f.Host)] failures=$($r3f.Failures -join ',')"
+    $r3g = Invoke-R3Import 'g' -3 0
+    Assert-That ($r3g.Host -ceq 'FROM-BUNDLE' -and $r3g.Failures.Count -eq 0) 'r3 import control: a host CLAUDE.md that was backed up and not touched since is still replaced by the newer bundle copy' "host=[$($r3g.Host)] failures=$($r3g.Failures -join ',')"
+}
+
+# ================================================================ IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 r4: the gate judges the backup that EXISTS, and only a file Import would copy
+# Sol r3 (head 55d670f1): (1) the backup was removed after it was made and before the host lock: the stored hash still matched the host, the file was replaced and the rollback copy was
+# deleted, leaving no copy of the old bytes; (2) a bundle file already excluded from the copy (here: larger than the scan limit) was refused as a failed backup because the timestamp-only
+# test ran before the source skip; (3) a host file that vanished between the existence probe and the timestamp read read as 1601-01-01 (older than anything), so a creation at a now-empty
+# path was refused. The replace now re-reads the backup file under the lock, the gate ignores a source Import will not copy, and a vanished host file is a creation, not a replacement.
+if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r4 import backup')) {
+    $r4Typed = { param($r) @($r.Failures | Where-Object { $_ -like 'IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED*CLAUDE.md*' }).Count }
+    # (a) a second process tries to delete the completed backup after it was made and before the host is locked. Whatever it manages, a copy of the old host bytes must survive the import: the
+    # host file kept as it was, or the backup still on disk holding them (the backup is held open without delete sharing, so the delete is refused).
+    $r4Survives = { param($r) (($r.Host -ceq 'HOST-GOOD-CONTENT') -or ($script:R4Backup -and (Test-Path -LiteralPath $script:R4Backup) -and ([IO.File]::ReadAllText($script:R4Backup) -ceq 'HOST-GOOD-CONTENT'))) }
+    $script:R4Backup = $null
+    $r4a = Invoke-R3Import 'r4a' -3 0 $null { param($From, $To) $script:R4Backup = Join-Path $script:StateRoot "backups\home-claude-$($script:stamp)\CLAUDE.md"; Remove-Item -LiteralPath $script:R4Backup -Force -ErrorAction SilentlyContinue }
+    Assert-That (& $r4Survives $r4a) 'r4 import: after the backup is deleted behind the import, a copy of the old host CLAUDE.md bytes still exists (the host kept, or the backup that could not be deleted)' "host=[$($r4a.Host)] failures=$($r4a.Failures -join ',')`n$($r4a.Out)"
+    # (a2) the same when the backup file is overwritten with other bytes
+    $script:R4Backup = $null
+    $r4a2 = Invoke-R3Import 'r4a2' -3 0 $null { param($From, $To) $script:R4Backup = Join-Path $script:StateRoot "backups\home-claude-$($script:stamp)\CLAUDE.md"; try { [IO.File]::WriteAllText($script:R4Backup, 'SOMETHING-ELSE') } catch { } }
+    Assert-That (& $r4Survives $r4a2) 'r4 import: after the backup is overwritten behind the import, a copy of the old host CLAUDE.md bytes still exists' "host=[$($r4a2.Host)] failures=$($r4a2.Failures -join ',')"
+    # (a3) the backup step is DECLINED (-Confirm answered No) and the copy step is accepted: the protected host file has no backup, so it is not replaced
+    $r4a3 = Invoke-R3Import 'r4a3' -3 0 {
+        param($st, $sp)
+        $script:R4SaveCmdlet = $script:Cmdlet
+        $stub = [pscustomobject]@{}
+        Add-Member -InputObject $stub -MemberType ScriptMethod -Name ShouldProcess -Value { param($target, $action) -not ($action -like 'Back up existing*') }
+        $script:Cmdlet = $stub
+    } $null { $script:Cmdlet = $script:R4SaveCmdlet }
+    Assert-That ($r4a3.Host -ceq 'HOST-GOOD-CONTENT' -and (& $r4Typed $r4a3) -eq 1) 'r4 import: with the backup step declined, a host CLAUDE.md the bundle would replace is left as it is (typed failure IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED)' "host=[$($r4a3.Host)] failures=$($r4a3.Failures -join ',')"
+    # (a4) the bundle file reaches the host file through a junction (state\reference -> ~/.claude) and the backup could not be made: the physical host file is protected all the same
+    $r4a4 = Invoke-R3Import 'r4a4' -3 0 {
+        param($st, $sp)
+        Remove-Item -LiteralPath (Join-Path $script:BundlePath 'home-claude') -Recurse -Force
+        $rd = Join-Path $script:BundlePath 'reference'; [void][IO.Directory]::CreateDirectory($rd)
+        [IO.File]::WriteAllText((Join-Path $rd 'CLAUDE.md'), 'FROM-BUNDLE')
+        [IO.File]::WriteAllText((Join-Path $st 'backups'), 'not a folder')
+        [void](New-Item -ItemType Junction -Path (Join-Path $st 'reference') -Target (Split-Path -Parent $script:R3HostPath))
+    } $null { try { [IO.Directory]::Delete((Join-Path $script:StateRoot 'reference')) } catch { } }
+    Assert-That ($r4a4.Host -ceq 'HOST-GOOD-CONTENT' -and (& $r4Typed $r4a4) -eq 1) 'r4 import: a host CLAUDE.md reached through a junction is protected like the path itself (not replaced without a backup; typed failure)' "host=[$($r4a4.Host)] failures=$($r4a4.Failures -join ',')`n$($r4a4.Out)"
+    # (b) a bundle CLAUDE.md over the scan limit is not copied at all; a directory at the backup name must not turn that skip into a failed backup
+    $r4b = Invoke-R3Import 'r4b' -3 0 {
+        param($st, $sp)
+        [void][IO.Directory]::CreateDirectory((Join-Path $st "backups\home-claude-$sp\CLAUDE.md"))
+        $big = [byte[]]::new(26214401); [Array]::Fill($big, [byte]97)
+        [IO.File]::WriteAllBytes((Join-Path $script:BundlePath 'home-claude\CLAUDE.md'), $big)
+    }
+    Assert-That ($r4b.Host -ceq 'HOST-GOOD-CONTENT') 'r4 import: an oversized bundle CLAUDE.md leaves the host file byte-identical' "host length=$($r4b.Host.Length)`n$($r4b.Out)"
+    Assert-That ((& $r4Typed $r4b) -eq 0 -and $r4b.Failures.Count -eq 0) 'r4 import: a bundle file Import skips for its size is NOT a failed backup (no IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED, exit 0)' ($r4b.Failures -join ',')
+    # (c) the host file is gone by the time the gate reads its timestamps (it is moved aside right after the existence probe) and its backup could not be made: the empty path is created, not refused
+    $r4c = Invoke-R3Import 'r4c' -3 0 {
+        param($st, $sp)
+        [void][IO.Directory]::CreateDirectory((Join-Path $st "backups\home-claude-$sp\CLAUDE.md"))
+        $script:ImportAfterHostProbeHook = { param($d) if (Test-Path -LiteralPath $d -PathType Leaf) { Move-Item -LiteralPath $d -Destination "$d.aside" } }
+    } $null { $script:ImportAfterHostProbeHook = $null; Remove-Item -LiteralPath "$($script:R3HostPath).aside" -Force -ErrorAction SilentlyContinue }
+    Assert-That ($r4c.Host -ceq 'FROM-BUNDLE' -and $r4c.Failures.Count -eq 0) 'r4 import: a host CLAUDE.md that vanished between the existence probe and the timestamp read is created from the bundle, not refused as an unavailable backup' "host=[$($r4c.Host)] failures=$($r4c.Failures -join ',')`n$($r4c.Out)"
+    # (d) the same disappearance for a host file the inspection skipped as unreadable (read denied): that skip was for the host file's content, which is gone, so the bundle copy is created
+    $r4d = Invoke-R3Import 'r4d' -3 0 {
+        param($st, $sp)
+        & icacls.exe $script:R3HostPath /deny '*S-1-1-0:(RD)' 2>&1 | Out-Null
+        $script:ImportAfterHostProbeHook = { param($d) if (Test-Path -LiteralPath $d -PathType Leaf) { Move-Item -LiteralPath $d -Destination "$d.aside" } }
+    } $null {
+        $script:ImportAfterHostProbeHook = $null
+        & icacls.exe "$($script:R3HostPath).aside" /remove:d '*S-1-1-0' 2>&1 | Out-Null
+        Remove-Item -LiteralPath "$($script:R3HostPath).aside" -Force -ErrorAction SilentlyContinue
+    }
+    Assert-That ($r4d.Host -ceq 'FROM-BUNDLE' -and $r4d.Failures.Count -eq 0) 'r4 import: a read-denied host CLAUDE.md that vanished before the replace is created from the bundle (the skip for its unreadable content no longer applies)' "host=[$($r4d.Host)] failures=$($r4d.Failures -join ',')`n$($r4d.Out)"
+    # (d2) the same, with the host file moved away BEFORE the gate probes it (right after the inspection)
+    $r4d2 = Invoke-R3Import 'r4d2' -3 0 { param($st, $sp) & icacls.exe $script:R3HostPath /deny '*S-1-1-0:(RD)' 2>&1 | Out-Null } { param($From, $To) if (Test-Path -LiteralPath $script:R3HostPath -PathType Leaf) { Move-Item -LiteralPath $script:R3HostPath -Destination "$($script:R3HostPath).aside" } } {
+        & icacls.exe "$($script:R3HostPath).aside" /remove:d '*S-1-1-0' 2>&1 | Out-Null
+        Remove-Item -LiteralPath "$($script:R3HostPath).aside" -Force -ErrorAction SilentlyContinue
+    }
+    Assert-That ($r4d2.Host -ceq 'FROM-BUNDLE' -and $r4d2.Failures.Count -eq 0) 'r4 import: a read-denied host CLAUDE.md that vanished before the gate looked is created from the bundle too' "host=[$($r4d2.Host)] failures=$($r4d2.Failures -join ',')`n$($r4d2.Out)"
+    # (d3) ~/.claude is renamed away and a junction onto another folder put in its place after the backup step; the file found there was never backed up, so it is not replaced
+    $script:R4Live = $null; $script:R4Swapped = $false
+    $r4d3 = Invoke-R3Import 'r4d3' -3 0 $null {
+        param($From, $To)
+        if ($script:R4Swapped) { return }
+        $script:R4Swapped = $true
+        $cd = Split-Path -Parent $script:R3HostPath
+        $live = New-Scratch 'r4d3-live'; [IO.File]::WriteAllText((Join-Path $live 'CLAUDE.md'), 'HOST-NEW'); (Get-Item -LiteralPath (Join-Path $live 'CLAUDE.md')).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-2)
+        $script:R4Live = Join-Path $live 'CLAUDE.md'
+        Move-Item -LiteralPath $cd -Destination "$cd-old"
+        [void](New-Item -ItemType Junction -Path $cd -Target $live)
+    } {
+        $cd = Split-Path -Parent $script:R3HostPath
+        if ($script:R4Live) { $script:R4LiveAfter = [IO.File]::ReadAllText($script:R4Live) }
+        if (Test-Path -LiteralPath "$cd-old") { try { [IO.Directory]::Delete($cd) } catch { }; Move-Item -LiteralPath "$cd-old" -Destination $cd }
+    }
+    Assert-That ($script:R4LiveAfter -ceq 'HOST-NEW') 'r4 import: a host CLAUDE.md found through a junction put in place after the backup step is NOT replaced (no backup holds its bytes)' "live=[$($script:R4LiveAfter)] failures=$($r4d3.Failures -join ',')`n$($r4d3.Out)"
+    # (d4) a log that cannot be written (a folder where the log file belongs, as a full disk would do) must not turn a failed backup into a throw
+    $r4lf = $script:LogFile; $script:LogFile = (New-Scratch 'r4d4-logdir'); $r4ret = $null; $r4thrown = ''
+    try { $r4ret = Copy-CleanBackupFile -Path (Join-Path (New-Scratch 'r4d4-src') 'missing.md') -DestinationDir (New-Scratch 'r4d4-dest') } catch { $r4thrown = $_.Exception.Message } finally { $script:LogFile = $r4lf }
+    Assert-That ((-not $r4thrown) -and (@($r4ret)[-1] -eq $false)) 'r4 import: a backup that fails while the log cannot be written still returns false (it never throws past its own cleanup)' "thrown=[$r4thrown] ret=[$($r4ret -join ',')]"
+    # (e) a bundle CLAUDE.md that grows past the scan limit AFTER the inspection (before the copy) is skipped by the copy; it is not a failed backup
+    $r4e = Invoke-R3Import 'r4e' -3 0 { param($st, $sp) [void][IO.Directory]::CreateDirectory((Join-Path $st "backups\home-claude-$sp\CLAUDE.md")) } {
+        param($From, $To)
+        $f = Join-Path $From 'CLAUDE.md'
+        if (Test-Path -LiteralPath $f -PathType Leaf) { $big = [byte[]]::new(26214401); [Array]::Fill($big, [byte]97); [IO.File]::WriteAllBytes($f, $big); (Get-Item -LiteralPath $f).LastWriteTimeUtc = [DateTime]::UtcNow }
+    }
+    Assert-That ($r4e.Host -ceq 'HOST-GOOD-CONTENT' -and (& $r4Typed $r4e) -eq 0) 'r4 import: a bundle file that grew past the scan limit after the inspection is skipped by the copy, not refused as a failed backup' "host length=$($r4e.Host.Length) failures=$($r4e.Failures -join ',')"
+    # (f) a host settings.json that the role rule keeps unconditionally (it names a credential key) is not a failed backup when its backup could not be written: it was never going to be replaced
+    $script:R4Settings = $null
+    $r4f = Invoke-R3Import 'r4f' -3 0 {
+        param($st, $sp)
+        $hs = Join-Path (Split-Path -Parent $script:R3HostPath) 'settings.json'
+        [IO.File]::WriteAllText($hs, '{"api.key":""}'); (Get-Item -LiteralPath $hs).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-3)
+        $bs = Join-Path $script:BundlePath 'home-claude\settings.json'
+        [IO.File]::WriteAllText($bs, '{"theme":"light"}')
+        [void][IO.Directory]::CreateDirectory((Join-Path $st "backups\home-claude-$sp\settings.json"))
+    } $null { $script:R4Settings = [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $script:R3HostPath) 'settings.json')) }
+    Assert-That ($script:R4Settings -ceq '{"api.key":""}' -and @($r4f.Failures | Where-Object { $_ -like 'IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED*settings.json*' }).Count -eq 0) 'r4 import: a role-file skip of the host settings.json is kept (host untouched) and is not turned into a failed backup' "settings=[$($script:R4Settings)] failures=$($r4f.Failures -join ',')`n$($r4f.Out)"
+}
+
+# ================================================================ IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 r5: one probe, the failure named by its cause, a damaged settings.json refused, a record that survives its log
+# Sol r4 (head 9a303654): (1) a read-denied host file that vanished BETWEEN the gate's two existence probes kept its stale "unreadable" skip and was skipped with no record at all; (2) a bundle
+# file that could not be READ at the early gate was reported as an unavailable backup (the copy would have said IMPORT_COPY_FAILED); (3) a bundle settings.json that is empty or not JSON
+# replaced a valid host settings.json (the credential screen accepts any credential-free bytes); (4) a log append that threw while a refusal was being recorded skipped the typed failure.
+if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r5 import backup')) {
+    $r5Typed = { param($r, $name, $leaf) @($r.Failures | Where-Object { $_ -like "$name*$leaf*" }).Count }
+    $r5Unlock = { & icacls.exe $script:R3HostPath /remove:d '*S-1-1-0' 2>&1 | Out-Null; & icacls.exe "$($script:R3HostPath).aside" /remove:d '*S-1-1-0' 2>&1 | Out-Null; Remove-Item -LiteralPath "$($script:R3HostPath).aside" -Force -ErrorAction SilentlyContinue; $script:ImportExistsProbeHook = $null }
+    # (a) a read-denied host CLAUDE.md that goes away AFTER the first existence probe answered true and before the next: the bundle copy is created, not silently skipped
+    $script:R5Moved = $false
+    $r5a = Invoke-R3Import 'r5a' -3 0 {
+        param($st, $sp)
+        & icacls.exe $script:R3HostPath /deny '*S-1-1-0:(RD)' 2>&1 | Out-Null
+        $script:ImportExistsProbeHook = { param($p, $r) if ($r -and -not $script:R5Moved -and $p -like '*\.claude\CLAUDE.md') { $script:R5Moved = $true; Move-Item -LiteralPath $p -Destination "$p.aside" } }
+    } $null $r5Unlock
+    Assert-That ($script:R5Moved -and $r5a.Host -ceq 'FROM-BUNDLE' -and $r5a.Failures.Count -eq 0) 'r5 import: a read-denied host CLAUDE.md that vanished between the gate''s two existence probes is created from the bundle (never skipped with no record)' "moved=$($script:R5Moved) host=[$($r5a.Host)] failures=$($r5a.Failures -join ',')`n$($r5a.Out)"
+    # (b) the bundle file cannot be READ when the gate looks (read denied on the snapshot after the inspection) and the backup is unavailable: IMPORT_COPY_FAILED, not a backup refusal
+    $script:R5Src = $null
+    $r5b = Invoke-R3Import 'r5b' -3 0 { param($st, $sp) [void][IO.Directory]::CreateDirectory((Join-Path $st "backups\home-claude-$sp\CLAUDE.md")) } {
+        param($From, $To)
+        $script:R5Src = Join-Path $From 'CLAUDE.md'
+        & icacls.exe $script:R5Src /deny '*S-1-1-0:(RD)' 2>&1 | Out-Null
+    } { if ($script:R5Src) { & icacls.exe $script:R5Src /remove:d '*S-1-1-0' 2>&1 | Out-Null } }
+    Assert-That ($r5b.Host -ceq 'HOST-GOOD-CONTENT' -and (& $r5Typed $r5b 'IMPORT_COPY_FAILED' 'CLAUDE.md') -eq 1 -and (& $r5Typed $r5b 'IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED' 'CLAUDE.md') -eq 0) 'r5 import: a bundle file that cannot be read is IMPORT_COPY_FAILED (the host file kept), not an unavailable backup' "host=[$($r5b.Host)] failures=$($r5b.Failures -join ',')`n$($r5b.Out)"
+    # (c) a bundle settings.json that is empty, one 0xFF byte, or '{' only must not replace a valid host settings.json; valid JSON still does
+    $r5Settings = { param($Tag, [byte[]]$Bytes)
+        $script:R5SettingsBytes = $Bytes; $script:R5SettingsAfter = $null
+        $r = Invoke-R3Import $Tag -3 0 {
+            param($st, $sp)
+            $hs = Join-Path (Split-Path -Parent $script:R3HostPath) 'settings.json'
+            [IO.File]::WriteAllText($hs, '{"theme":"dark"}'); (Get-Item -LiteralPath $hs).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-3)
+            [IO.File]::WriteAllBytes((Join-Path $script:BundlePath 'home-claude\settings.json'), $script:R5SettingsBytes)
+        } $null { $script:R5SettingsAfter = [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $script:R3HostPath) 'settings.json')) }
+        return $r
+    }
+    foreach ($r5c in @(@('r5c0', 'zero bytes', [byte[]]@()), @('r5c1', 'a single 0xFF byte', [byte[]]@(255)), @('r5c2', 'only an opening brace', [byte[]]@(123)))) {
+        $r5r = & $r5Settings $r5c[0] $r5c[2]
+        Assert-That ($script:R5SettingsAfter -ceq '{"theme":"dark"}' -and (& $r5Typed $r5r 'IMPORT_SOURCE_DAMAGED_NOT_REPLACED' 'settings.json') -eq 1) "r5 import: a bundle settings.json of $($r5c[1]) leaves the valid host settings.json as it is (typed failure IMPORT_SOURCE_DAMAGED_NOT_REPLACED)" "settings=[$($script:R5SettingsAfter)] failures=$($r5r.Failures -join ',')`n$($r5r.Out)"
+    }
+    $r5v = & $r5Settings 'r5c3' ([Text.Encoding]::UTF8.GetBytes('{"theme":"light"}'))
+    Assert-That ($script:R5SettingsAfter -ceq '{"theme":"light"}' -and $r5v.Failures.Count -eq 0) 'r5 import control: a valid bundle settings.json still replaces an older host settings.json' "settings=[$($script:R5SettingsAfter)] failures=$($r5v.Failures -join ',')"
+    # (d) the log cannot be written exactly when the refusal is emitted: the typed failure is still registered (it is registered BEFORE its line is logged)
+    $r5d = Invoke-R3Import 'r5d' -3 0 { param($st, $sp) [void][IO.Directory]::CreateDirectory((Join-Path $st "backups\home-claude-$sp\CLAUDE.md")) } { param($From, $To) $script:LogFile = (New-Scratch 'r5d-logdir') }
+    Assert-That ($r5d.Host -ceq 'HOST-GOOD-CONTENT' -and (& $r5Typed $r5d 'IMPORT_BACKUP_UNAVAILABLE_NOT_REPLACED' 'CLAUDE.md') -eq 1) 'r5 import: a log that cannot be written as a backup refusal is emitted still leaves the typed failure registered (the run fails with its precise cause)' "host=[$($r5d.Host)] failures=$($r5d.Failures -join ',')`n$($r5d.Out)"
+    # (e) the same for the generic step failure: Invoke-Step registers the failure before it tries to log it
+    $r5sv = $script:Cmdlet; $r5lf = $script:LogFile; $r5stub = [pscustomobject]@{}
+    Add-Member -InputObject $r5stub -MemberType ScriptMethod -Name ShouldProcess -Value { param($target, $action) $true }
+    $script:Cmdlet = $r5stub; $script:LogFile = Join-Path (New-Scratch 'r5e-log') 'r5e.log'; $script:R5LogDir = New-Scratch 'r5e-logdir'; $script:Failures.Clear(); $r5eThrown = ''
+    try { Invoke-Step 'r5 failing step' { $script:LogFile = $script:R5LogDir; throw 'boom' } } catch { $r5eThrown = $_.Exception.Message } finally { $script:Cmdlet = $r5sv; $script:LogFile = $r5lf }
+    Assert-That ((-not $r5eThrown) -and @($script:Failures | Where-Object { $_ -eq 'r5 failing step' }).Count -eq 1) 'r5 import: a failing step whose failure line cannot be logged is still registered as a failure and does not throw past Invoke-Step' "thrown=[$r5eThrown] failures=$($script:Failures -join ',')"
+    $script:Failures.Clear()
+}
+
+# ================================================================ IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 r6: the same guarantees under the COMBINED conditions r5 left open
+# Sol r5 (head 646a7349): (1) a settings.json holding bytes that are not UTF-8 parsed after the lossy decode and replaced the live file; (2) the damaged-source class stopped at the name settings.json
+# (a zero-byte CLAUDE.md or a cut-off settings.local.json replaced a good host file); (3) an unreadable-host skip hid a damaged or unreadable bundle file; (4) a host file that vanished during the early
+# source read was refused as an unavailable backup instead of created; (5) a snapshot that failed part way still fed the copy; (6) the log lines around the Import steps could throw before a failure was
+# registered; (7) a second Import phase of one run overwrote the first phase's backup. Hardening: a stalled native expansion has a bound, and a failure line that cannot be logged is still registered.
+if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r6 import backup')) {
+    $r6Typed = { param($r, $name, $leaf) @($r.Failures | Where-Object { $_ -like "$name*$leaf*" }).Count }
+    $r6Dir = { Split-Path -Parent $script:R3HostPath }
+    $script:R6After = $null
+    # a bundle file of the given bytes (newer than the host file) against a host file holding $HostText (3 days older); $script:R6After is the host file once the import has ended
+    $r6Run = { param($Tag, $Leaf, [byte[]]$Bytes, [string]$HostText, [scriptblock]$Extra, [scriptblock]$ExtraCleanup, [int]$HostAge = -3, [int]$BundleAge = 0)
+        $script:R6Leaf = $Leaf; $script:R6Bytes = $Bytes; $script:R6HostText = $HostText; $script:R6Extra = $Extra; $script:R6ExtraCleanup = $ExtraCleanup; $script:R6After = $null
+        $script:R6HostAge = $HostAge; $script:R6BundleAge = $BundleAge
+        return (Invoke-R3Import $Tag -3 0 {
+            param($st, $sp)
+            $hf = Join-Path (& $r6Dir) $script:R6Leaf
+            if ($null -ne $script:R6HostText) { [IO.File]::WriteAllText($hf, $script:R6HostText); (Get-Item -LiteralPath $hf).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays($script:R6HostAge) }
+            $bf = Join-Path $script:BundlePath "home-claude\$($script:R6Leaf)"
+            [IO.File]::WriteAllBytes($bf, $script:R6Bytes); (Get-Item -LiteralPath $bf).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays($script:R6BundleAge)
+            if ($script:R6Extra) { & $script:R6Extra $st $sp }
+        } $null {
+            if ($script:R6ExtraCleanup) { & $script:R6ExtraCleanup }
+            $hf = Join-Path (& $r6Dir) $script:R6Leaf
+            $script:R6After = $(if (Test-Path -LiteralPath $hf) { [IO.File]::ReadAllText($hf) } else { '<absent>' })
+        })
+    }
+    $r6Utf8 = [Text.Encoding]::UTF8
+    # (1) bytes that are not UTF-8 inside an otherwise parseable settings.json: refused, the live file untouched
+    $r6a = & $r6Run 'r6a' 'settings.json' ([byte[]](@(0x7B) + $r6Utf8.GetBytes('"theme":"') + @(0xFF) + $r6Utf8.GetBytes('"}'))) '{"theme":"dark"}'
+    Assert-That ($script:R6After -ceq '{"theme":"dark"}' -and (& $r6Typed $r6a 'IMPORT_SOURCE_DAMAGED_NOT_REPLACED' 'settings.json') -eq 1) 'r6 import: a bundle settings.json holding a byte that is not UTF-8 is a damaged source (the live settings.json is byte-identical, typed failure)' "settings=[$($script:R6After)] failures=$($r6a.Failures -join ',')`n$($r6a.Out)"
+    # (2) the same class for the other copied files: a zero-byte CLAUDE.md over a non-empty host file, and a cut-off settings.local.json
+    $r6b1 = & $r6Run 'r6b1' 'CLAUDE.md' ([byte[]]@()) 'HOST-GOOD-CONTENT'
+    Assert-That ($script:R6After -ceq 'HOST-GOOD-CONTENT' -and (& $r6Typed $r6b1 'IMPORT_SOURCE_DAMAGED_NOT_REPLACED' 'CLAUDE.md') -eq 1) 'r6 import: a zero-byte bundle CLAUDE.md never replaces a non-empty host CLAUDE.md (typed failure IMPORT_SOURCE_DAMAGED_NOT_REPLACED)' "claude=[$($script:R6After)] failures=$($r6b1.Failures -join ',')`n$($r6b1.Out)"
+    $r6b2 = & $r6Run 'r6b2' 'settings.local.json' ([byte[]]@(0x7B)) '{"theme":"dark"}'
+    Assert-That ($script:R6After -ceq '{"theme":"dark"}' -and (& $r6Typed $r6b2 'IMPORT_SOURCE_DAMAGED_NOT_REPLACED' 'settings.local.json') -eq 1) 'r6 import: a cut-off bundle settings.local.json never replaces a valid host copy (both Claude settings files are judged, not only settings.json)' "settings.local=[$($script:R6After)] failures=$($r6b2.Failures -join ',')`n$($r6b2.Out)"
+    $r6b3 = & $r6Run 'r6b3' 'settings.local.json' ($r6Utf8.GetBytes('{"theme":"light"}')) '{"theme":"dark"}'
+    Assert-That ($script:R6After -ceq '{"theme":"light"}' -and $r6b3.Failures.Count -eq 0) 'r6 import control: a valid newer bundle settings.local.json still replaces the older host copy' "settings.local=[$($script:R6After)] failures=$($r6b3.Failures -join ',')"
+    $r6b4 = & $r6Run 'r6b4' 'empty-note.txt' ([byte[]]@()) $null
+    Assert-That ($script:R6After -ceq '' -and $r6b4.Failures.Count -eq 0) 'r6 import control: a zero-byte bundle file whose host counterpart is absent is still created (an empty file is damaged only against a non-empty host file)' "after=[$($script:R6After)] failures=$($r6b4.Failures -join ',')"
+    # (2b) adversary pass 1 A1: UTF-16 bytes with a byte order mark read as valid text through a BOM-detecting reader: both settings files must be UTF-8
+    $r6b5 = & $r6Run 'r6b5' 'settings.local.json' ([byte[]]@(0xFF, 0xFE, 0x7B, 0x00, 0x7D, 0x00)) '{"theme":"dark"}'
+    Assert-That ($script:R6After -ceq '{"theme":"dark"}' -and (& $r6Typed $r6b5 'IMPORT_SOURCE_DAMAGED_NOT_REPLACED' 'settings.local.json') -eq 1) 'r6 import (adversary A1): a bundle settings.local.json that is UTF-16 (byte order mark FF FE) is not valid UTF-8 and never replaces the host copy' "settings.local=[$($script:R6After)] failures=$($r6b5.Failures -join ',')`n$($r6b5.Out)"
+    $r6b6 = & $r6Run 'r6b6' 'settings.local.json' ([byte[]]@(0xEF, 0xBB, 0xBF) + $r6Utf8.GetBytes('{"theme":"light"}')) '{"theme":"dark"}'
+    Assert-That ($script:R6After.TrimStart([char]0xFEFF) -ceq '{"theme":"light"}' -and $r6b6.Failures.Count -eq 0) 'r6 import control (adversary A1): a UTF-8 settings.local.json with a byte order mark still replaces the older host copy' "settings.local=[$($script:R6After)] failures=$($r6b6.Failures -join ',')"
+    # (2c) adversary pass 1 A4: a damaged bundle file that the copy rules KEEP anyway (/XO: the host copy is newer) is a failure-free keep, as before
+    $r6b7 = & $r6Run 'r6b7' 'settings.local.json' ([byte[]]@(0x7B)) '{"theme":"dark"}' $null $null 0 -1
+    Assert-That ($script:R6After -ceq '{"theme":"dark"}' -and $r6b7.Failures.Count -eq 0) 'r6 import (adversary A4): a damaged bundle settings.local.json that is OLDER than the host copy is kept with no failure (the /XO keep is judged first)' "settings.local=[$($script:R6After)] failures=$($r6b7.Failures -join ',')"
+    # (3c) adversary pass 1 A2: a zero-byte bundle file over a read-denied, non-empty host file that no backup protects (not CLAUDE.md or settings.json): the typed source failure
+    $r6Deny0 = { & icacls.exe (Join-Path (& $r6Dir) $script:R6Leaf) /deny '*S-1-1-0:(RD)' 2>&1 | Out-Null }
+    $r6Undeny0 = { & icacls.exe (Join-Path (& $r6Dir) $script:R6Leaf) /remove:d '*S-1-1-0' 2>&1 | Out-Null }
+    $r6b8 = & $r6Run 'r6b8' 'ROTATION.md' ([byte[]]@()) 'HOST-GOOD-CONTENT' $r6Deny0 $r6Undeny0
+    Assert-That ($script:R6After -ceq 'HOST-GOOD-CONTENT' -and (& $r6Typed $r6b8 'IMPORT_SOURCE_DAMAGED_NOT_REPLACED' 'ROTATION.md') -eq 1) 'r6 import (adversary A2): a zero-byte bundle file over a read-denied non-empty host file is the typed source failure (not a silent skip)' "rotation=[$($script:R6After)] failures=$($r6b8.Failures -join ',')`n$($r6b8.Out)"
+    # (2d) adversary pass 2 A3: TWO leading byte order marks are one too many (a reader consumes one; the other is a character before the JSON)
+    $r6b9 = & $r6Run 'r6b9' 'settings.local.json' ([byte[]]@(0xEF, 0xBB, 0xBF, 0xEF, 0xBB, 0xBF, 0x7B, 0x7D)) '{"theme":"dark"}'
+    Assert-That ($script:R6After -ceq '{"theme":"dark"}' -and (& $r6Typed $r6b9 'IMPORT_SOURCE_DAMAGED_NOT_REPLACED' 'settings.local.json') -eq 1) 'r6 import (adversary pass 2 A3): a bundle settings.local.json with TWO UTF-8 byte order marks is a damaged source (at most one is accepted)' "settings.local=[$($script:R6After)] failures=$($r6b9.Failures -join ',')`n$($r6b9.Out)"
+    # (2e) adversary pass 2 A4: the host file is SAVED (newer than the bundle copy) while the gate reads the bundle file and its backup is unavailable: the copy keeps it, so the run has no failure
+    $r6k = Invoke-R3Import 'r6k' -3 0 {
+        param($st, $sp)
+        [void][IO.Directory]::CreateDirectory((Join-Path $st "backups\home-claude-$sp\CLAUDE.md"))
+        $script:ImportAfterEarlySourceReadHook = { param($p) [IO.File]::WriteAllText($script:R3HostPath, 'HOST-NEW'); (Get-Item -LiteralPath $script:R3HostPath).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(1) }
+    } $null { $script:ImportAfterEarlySourceReadHook = $null }
+    Assert-That ($r6k.Host -ceq 'HOST-NEW' -and $r6k.Failures.Count -eq 0) 'r6 import (adversary pass 2 A4): a host file saved newer than the bundle copy while the gate read it is a failure-free keep (the rules are judged again after the read)' "host=[$($r6k.Host)] failures=$($r6k.Failures -join ',')`n$($r6k.Out)"
+    # (2f) adversary pass 2 A5: a bundle file the inspection could not read (here held with no sharing) is not a silent skip: the copy names it (IMPORT_COPY_FAILED)
+    $r6lSrc = New-Scratch 'r6l-src'; $r6lDst = New-Scratch 'r6l-dst'; [IO.File]::WriteAllText((Join-Path $r6lSrc 'CLAUDE.md'), 'FROM-BUNDLE')
+    $r6lHold = [IO.File]::Open((Join-Path $r6lSrc 'CLAUDE.md'), [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try { $r6lSkips = @(Get-ImportCredentialSkips -SourceDir $r6lSrc -DestDir $r6lDst) } finally { $r6lHold.Dispose() }
+    Assert-That ($r6lSkips.Count -eq 1 -and $r6lSkips[0].Reason -ceq 'bundle file unreadable' -and $r6lSkips[0].NeverReplaced -eq $false) 'r6 import (adversary pass 2 A5): a bundle file the inspection could not read is not a deliberate never-replace skip (the copy reads it again and reports IMPORT_COPY_FAILED)' "skips=$($r6lSkips.Count) neverReplaced=$(if ($r6lSkips.Count) { $r6lSkips[0].NeverReplaced })"
+    # (2g) adversary pass 2 A1: a snapshot step that is DECLINED (-Confirm answered No) leaves no snapshot of this run; a leftover folder of that name (an earlier phase of the run) is not one
+    $script:R6Stale = $null
+    $r6m = Invoke-R3Import 'r6m' -3 0 {
+        param($st, $sp)
+        $script:R6SaveCmdlet = $script:Cmdlet
+        $stub = [pscustomobject]@{}
+        Add-Member -InputObject $stub -MemberType ScriptMethod -Name ShouldProcess -Value { param($target, $action) -not ($action -like 'Snapshot the bundle*') }
+        $script:Cmdlet = $stub
+        $stale = Join-Path $st "import-snapshot-$sp\home-claude"; [void][IO.Directory]::CreateDirectory($stale)
+        [IO.File]::WriteAllText((Join-Path $stale 'CLAUDE.md'), 'STALE-SNAPSHOT'); [IO.File]::WriteAllText((Join-Path (Split-Path -Parent $stale) 'MANIFEST.txt'), 'mlv-migrate-bundle v1')
+    } $null { $script:Cmdlet = $script:R6SaveCmdlet }
+    Assert-That ($r6m.Host -ceq 'HOST-GOOD-CONTENT' -and (& $r6Typed $r6m 'IMPORT_SNAPSHOT_FAILED' '') -eq 1) 'r6 import (adversary pass 2 A1): a declined snapshot step never lets a leftover snapshot folder supply host replacements (typed IMPORT_SNAPSHOT_FAILED)' "host=[$($r6m.Host)] failures=$($r6m.Failures -join ',')`n$($r6m.Out)"
+    # (2h) adversary pass 2 A7 (DISTINGUISHed: the close-and-reopen is the r4 design and fails closed; a writer handle would block every reader): a held backup stays READABLE by others and cannot be deleted
+    $r6nSrc = Join-Path (New-Scratch 'r6n-src') 'CLAUDE.md'; [IO.File]::WriteAllText($r6nSrc, 'HOST-GOOD-CONTENT')
+    Close-ImportBackupHandles; $script:ImportBackupHash.Clear(); $script:ImportBackupProtected.Clear()
+    $r6nDest = New-Scratch 'r6n-dest'; $r6nOk = Copy-CleanBackupFile -Path $r6nSrc -DestinationDir $r6nDest
+    $r6nRead = ''; $r6nDelThrown = ''
+    try { $r6nRead = [IO.File]::ReadAllText((Join-Path $r6nDest 'CLAUDE.md')) } catch { $r6nRead = "THROWN: $($_.Exception.Message)" }
+    try { [IO.File]::Delete((Join-Path $r6nDest 'CLAUDE.md')) } catch { $r6nDelThrown = $_.Exception.Message }
+    Assert-That (@($r6nOk)[-1] -eq $true -and $r6nRead -ceq 'HOST-GOOD-CONTENT' -and $r6nDelThrown -and (Test-Path -LiteralPath (Join-Path $r6nDest 'CLAUDE.md'))) 'r6 import (adversary pass 2 A7, distinguished): a held backup is readable by other processes and cannot be deleted while the copy step runs' "ok=[$($r6nOk -join ',')] read=[$r6nRead] delete=[$r6nDelThrown]"
+    Close-ImportBackupHandles; $script:ImportBackupHash.Clear()
+    # (2i) adversary pass 2 A14: the IMPORT_BACKUP_FAILED line names the cause (a denied read of the host file), not only 'could not be written'
+    $r6o = Invoke-R3Import 'r6o' -3 0 { param($st, $sp) & icacls.exe $script:R3HostPath /deny '*S-1-1-0:(RD)' 2>&1 | Out-Null } $null { & icacls.exe $script:R3HostPath /remove:d '*S-1-1-0' 2>&1 | Out-Null }
+    Assert-That ($r6o.Out -match 'IMPORT_BACKUP_FAILED[^\r\n]*denied') 'r6 import (adversary pass 2 A14): the IMPORT_BACKUP_FAILED record names the cause of the failure' "out=$($r6o.Out)"
+    # (2j) adversary pass 2 A2: a path reached through a SUBST drive is the physical file (the protected set is keyed by the physical path)
+    $r6sLetter = $null; foreach ($r6c in 'Y', 'X', 'W', 'V', 'U') { if (-not (Test-Path -LiteralPath "${r6c}:\")) { $r6sLetter = $r6c; break } }
+    if ($r6sLetter) {
+        $r6sDir = New-Scratch 'r6s-physical'; [void][IO.Directory]::CreateDirectory((Join-Path $r6sDir 'a'))
+        & subst.exe "${r6sLetter}:" $r6sDir 2>&1 | Out-Null
+        try {
+            $r6sGot = Get-ImportRealPath "${r6sLetter}:\a\CLAUDE.md"; $r6sWant = Get-ImportRealPath (Join-Path $r6sDir 'a\CLAUDE.md')
+        } finally { & subst.exe "${r6sLetter}:" /d 2>&1 | Out-Null }
+        Assert-That ($r6sGot -ieq $r6sWant) 'r6 import (adversary pass 2 A2): a path through a SUBST drive resolves to the physical file it names (a protected file is not reachable through an alias drive)' "got=[$r6sGot] want=[$r6sWant]"
+    } else { Write-Host 'SKIP r6 import (adversary pass 2 A2): no free drive letter for a SUBST drive' }
+    # (3a) the host settings.json denies reads (its backup cannot be made, the inspection skips it) and the bundle settings.json is cut off: the typed source failure, not a silent skip
+    $r6Deny = { & icacls.exe (Join-Path (& $r6Dir) $script:R6Leaf) /deny '*S-1-1-0:(RD)' 2>&1 | Out-Null }
+    $r6Undeny = { & icacls.exe (Join-Path (& $r6Dir) $script:R6Leaf) /remove:d '*S-1-1-0' 2>&1 | Out-Null }
+    $r6c1 = & $r6Run 'r6c1' 'settings.json' ([byte[]]@(0x7B)) '{"theme":"dark"}' $r6Deny $r6Undeny
+    Assert-That ($script:R6After -ceq '{"theme":"dark"}' -and (& $r6Typed $r6c1 'IMPORT_SOURCE_DAMAGED_NOT_REPLACED' 'settings.json') -eq 1) 'r6 import: a read-denied host settings.json no longer hides a damaged bundle settings.json (typed failure, host kept)' "settings=[$($script:R6After)] failures=$($r6c1.Failures -join ',')`n$($r6c1.Out)"
+    # (3b) the host CLAUDE.md denies reads and the bundle CLAUDE.md becomes unreadable after the inspection: IMPORT_COPY_FAILED, not a silent skip
+    $script:R6Src = $null
+    $r6c2 = Invoke-R3Import 'r6c2' -3 0 { param($st, $sp) & icacls.exe $script:R3HostPath /deny '*S-1-1-0:(RD)' 2>&1 | Out-Null } {
+        param($From, $To)
+        $script:R6Src = Join-Path $From 'CLAUDE.md'
+        & icacls.exe $script:R6Src /deny '*S-1-1-0:(RD)' 2>&1 | Out-Null
+    } { if ($script:R6Src) { & icacls.exe $script:R6Src /remove:d '*S-1-1-0' 2>&1 | Out-Null }; & icacls.exe $script:R3HostPath /remove:d '*S-1-1-0' 2>&1 | Out-Null }
+    Assert-That ((& $r6Typed $r6c2 'IMPORT_COPY_FAILED' 'CLAUDE.md') -eq 1) 'r6 import: a read-denied host CLAUDE.md no longer hides a bundle file that became unreadable after the inspection (typed IMPORT_COPY_FAILED)' "host=[$($r6c2.Host)] failures=$($r6c2.Failures -join ',')`n$($r6c2.Out)"
+    # (4) the host file vanishes while the gate reads the bundle file and its backup cannot be made: a creation, not an unavailable backup
+    $script:ImportAfterEarlySourceReadHook = $null
+    $r6d = Invoke-R3Import 'r6d' -3 0 {
+        param($st, $sp)
+        [void][IO.Directory]::CreateDirectory((Join-Path $st "backups\home-claude-$sp\CLAUDE.md"))
+        $script:ImportAfterEarlySourceReadHook = { param($p) if (Test-Path -LiteralPath $script:R3HostPath -PathType Leaf) { Move-Item -LiteralPath $script:R3HostPath -Destination "$($script:R3HostPath).aside" } }
+    } $null { $script:ImportAfterEarlySourceReadHook = $null; Remove-Item -LiteralPath "$($script:R3HostPath).aside" -Force -ErrorAction SilentlyContinue }
+    Assert-That ($r6d.Host -ceq 'FROM-BUNDLE' -and $r6d.Failures.Count -eq 0) 'r6 import: a host CLAUDE.md that vanished while the gate read the bundle file is created from the bundle, not refused as an unavailable backup' "host=[$($r6d.Host)] failures=$($r6d.Failures -join ',')`n$($r6d.Out)"
+    # (5) a snapshot that fails part way (one bundle file denies reads, robocopy exits 8) feeds nothing to the copy
+    $r6e = Invoke-R3Import 'r6e' -3 0 {
+        param($st, $sp)
+        $lk = Join-Path $script:BundlePath 'home-claude\zz-locked.txt'
+        [IO.File]::WriteAllText($lk, 'LOCKED'); & icacls.exe $lk /deny '*S-1-1-0:(RD)' 2>&1 | Out-Null
+    } $null { & icacls.exe (Join-Path $script:BundlePath 'home-claude\zz-locked.txt') /remove:d '*S-1-1-0' 2>&1 | Out-Null }
+    Assert-That ($r6e.Host -ceq 'HOST-GOOD-CONTENT' -and (& $r6Typed $r6e 'IMPORT_SNAPSHOT_FAILED' '') -eq 1) 'r6 import: a bundle snapshot that failed part way supplies no host replacement (host CLAUDE.md untouched, typed IMPORT_SNAPSHOT_FAILED)' "host=[$($r6e.Host)] failures=$($r6e.Failures -join ',')`n$($r6e.Out)"
+    # (6a) the log cannot be written when the missing-bundle notice is emitted: the failure is registered, nothing throws
+    $script:R6LogDir = New-Scratch 'r6f-logdir'
+    $r6f = Invoke-R3Import 'r6f' -3 0 { param($st, $sp) Remove-Item -LiteralPath $script:BundlePath -Recurse -Force; $script:LogFile = $script:R6LogDir }
+    Assert-That (($r6f.Out -notmatch 'THROWN') -and (& $r6Typed $r6f 'IMPORT_BUNDLE_MISSING' '') -eq 1) 'r6 import: a missing bundle whose notice cannot be logged is still the registered failure IMPORT_BUNDLE_MISSING and does not throw' "failures=$($r6f.Failures -join ',')`n$($r6f.Out)"
+    # (6b) the log cannot be written when the copy step opens: the step still runs to its end
+    $script:R6LogDir2 = New-Scratch 'r6g-logdir'
+    $r6g = Invoke-R3Import 'r6g' -3 0 {
+        param($st, $sp)
+        $script:R6SaveCmdlet = $script:Cmdlet
+        $stub = [pscustomobject]@{}
+        $script:R6GoodLog = $script:LogFile
+        # the log is a folder exactly while the copy step opens, and is writable again from the next step
+        Add-Member -InputObject $stub -MemberType ScriptMethod -Name ShouldProcess -Value { param($target, $action) if ($action -like 'Copy bundle*') { $script:LogFile = $script:R6LogDir2 } elseif ($action -like 'Quarantine*') { $script:LogFile = $script:R6GoodLog }; $true }
+        $script:Cmdlet = $stub
+    } $null { $script:Cmdlet = $script:R6SaveCmdlet }
+    Assert-That (($r6g.Out -notmatch 'THROWN') -and $r6g.Host -ceq 'FROM-BUNDLE' -and $r6g.Failures.Count -eq 0) 'r6 import: a log that cannot be written as the copy step opens does not stop the copy (no throw, the bundle file is applied)' "host=[$($r6g.Host)] failures=$($r6g.Failures -join ',')`n$($r6g.Out)"
+    # (7) -Phase Import,Import: the second phase backs up the file the first phase wrote; the first phase's backup (the only copy of the old host bytes) must survive
+    $script:R6Backups = @()
+    $r6h = Invoke-R3Import 'r6h' -3 0 $null $null {
+        $null = (Invoke-PhaseImport *>&1 | Out-String)
+        $script:R6Backups = @(Get-ChildItem -LiteralPath (Join-Path $script:StateRoot 'backups') -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object { [IO.File]::ReadAllText($_.FullName) })
+    }
+    Assert-That (($script:R6Backups -contains 'HOST-GOOD-CONTENT') -and $r6h.Failures.Count -eq 0) 'r6 import: a repeated Import phase keeps the first phase''s backup of the original host CLAUDE.md (a backup is never overwritten)' "backups=[$($script:R6Backups -join '|')] failures=$($r6h.Failures -join ',')"
+    # hardening: a failure line that cannot be logged is still registered (a prerequisite failure outside Import)
+    $r6lf = $script:LogFile; $r6repo = $script:Repo; $script:LogFile = (New-Scratch 'r6i-logdir'); $script:Repo = (New-Scratch 'r6i-repo'); $script:Failures.Clear(); $r6iThrown = ''
+    $r6qt = $script:QtRoot; $r6mg = $script:MingwDir; $script:QtRoot = (New-Scratch 'r6i-qt'); $script:MingwDir = (New-Scratch 'r6i-mingw')
+    try { Invoke-PhaseQt } catch { $r6iThrown = $_.Exception.Message } finally { $script:LogFile = $r6lf; $script:Repo = $r6repo; $script:QtRoot = $r6qt; $script:MingwDir = $r6mg }
+    Assert-That ((-not $r6iThrown) -and @($script:Failures | Where-Object { $_ -like 'QT_PREREQ_MISSING*' }).Count -eq 1) 'r6 hardening: a prerequisite failure whose ERROR line cannot be logged is still registered and does not throw' "thrown=[$r6iThrown] failures=$($script:Failures -join ',')"
+    $script:Failures.Clear()
+    # hardening: a native child that stalls has a bound (the tar expansion is run with it)
+    $r6pw = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
+    $r6nThrown = ''; $r6nSw = [Diagnostics.Stopwatch]::StartNew()
+    try { [void](Invoke-Native -Exe $r6pw -Arguments @('-NoProfile', '-Command', 'Start-Sleep -Seconds 60') -TimeoutSec 3) } catch { $r6nThrown = $_.Exception.Message }
+    Assert-That ($r6nThrown -match 'did not finish within 3' -and $r6nSw.Elapsed.TotalSeconds -lt 30) 'r6 hardening: a native child that outlives its time bound is killed and reported (Invoke-Native -TimeoutSec)' "thrown=[$r6nThrown] seconds=$([int]$r6nSw.Elapsed.TotalSeconds)"
+    # adversary pass 2 A11: a time bound too large for the wait's millisecond argument is clamped, not a conversion error after the child started
+    $r6qCode = $null; $r6qThrown = ''
+    try { $r6qCode = Invoke-Native -Exe $r6pw -Arguments @('-NoProfile', '-Command', 'exit 0') -TimeoutSec 2147484 } catch { $r6qThrown = $_.Exception.Message }
+    Assert-That ((-not $r6qThrown) -and @($r6qCode)[-1] -eq 0) 'r6 hardening (adversary pass 2 A11): an enormous -TimeoutSec is clamped and the call still returns the exit code' "thrown=[$r6qThrown] code=[$($r6qCode -join ',')]"
+    # adversary pass 1 A3 (pre-existing): a native call whose command line cannot be logged still runs (the expansion's logging used to throw before tar started)
+    $r6jlf = $script:LogFile; $script:LogFile = (New-Scratch 'r6j-logdir'); $r6jThrown = ''; $r6jCode = $null
+    try { $r6jCode = Invoke-Native -Exe $r6pw -Arguments @('-NoProfile', '-Command', 'exit 0') } catch { $r6jThrown = $_.Exception.Message } finally { $script:LogFile = $r6jlf }
+    Assert-That ((-not $r6jThrown) -and @($r6jCode)[-1] -eq 0) 'r6 hardening (adversary A3): a native call whose log lines cannot be written still runs and returns its exit code' "thrown=[$r6jThrown] code=[$($r6jCode -join ',')]"
+    Assert-That ([IO.File]::ReadAllText($setup) -match 'tar\.exe''\) -Arguments @\(''-x'', ''-f'', \$BundlePath, ''-C'', \$src\) -TimeoutSec') 'r6 hardening: the bundle expansion runs tar.exe with a time bound' ''
+    $script:Failures.Clear()
+}
+
+# ================================================================ IMPORT-BACKUP-UNREADABLE-MUST-NOT-REPLACE-1 r7: a staging folder is FRESH for the attempt that reads it
+# Sol r6 (head 767e51b1): the r6 completion flags prove that the latest expansion / snapshot FINISHED, not that its folder holds only that attempt's files. -Phase Import,Import (or a
+# retry after a snapshot whose cleanup was denied) shares one stamp, so the folder name is the same: tar and robocopy /E add to it and never remove what a failed earlier attempt left,
+# and a partial CLAUDE.md from the failed attempt was copied over the good host file. Each attempt now reads a folder no earlier attempt of the run touched.
+# Hardening (same review): the bounded native launch scrubs GIT_TRACE*, says truthfully whether the child was stopped, and bounds its output collection.
+function New-R7Zip([string]$Path, $Entries) {
+    Add-Type -AssemblyName System.IO.Compression
+    $fs = [IO.File]::Create($Path)
+    try {
+        $za = [IO.Compression.ZipArchive]::new($fs, [IO.Compression.ZipArchiveMode]::Create, $true)
+        try {
+            foreach ($k in $Entries.Keys) {
+                $b = $Entries[$k]; $en = $za.CreateEntry($k, [IO.Compression.CompressionLevel]::NoCompression); $es = $en.Open(); try { $es.Write($b, 0, $b.Length) } finally { $es.Dispose() }
+            }
+        } finally { $za.Dispose() }
+    } finally { $fs.Dispose() }
+}
+if ($fnLoaded -and (Test-Has 'Invoke-PhaseImport' 'r7 import staging')) {
+    $r7Typed = { param($r, $name) @($r.Failures | Where-Object { $_ -like "$name*" }).Count }
+    $r7Ascii = [Text.Encoding]::ASCII
+    $r7Manifest = $r7Ascii.GetBytes('mlv-migrate-bundle v1')
+    # (1) the repro of the review: phase 1 expands a ZIP truncated inside CLAUDE.md (tar leaves a partial member and exits non-zero); before phase 2 the ZIP is replaced by a valid bundle that omits CLAUDE.md
+    $script:R7Zip = Join-Path (New-Scratch 'r7a-zip') 'bundle.zip'; $script:R7Partial = -1; $script:R7Entries = $null
+    $r7Big = $r7Ascii.GetBytes(('plain instruction line for the claude home file' + "`n") * 8200)
+    $r7a = Invoke-R3Import 'r7a' -3 0 {
+        param($st, $sp)
+        New-R7Zip $script:R7Zip ([ordered]@{ 'MANIFEST.txt' = $r7Manifest; 'home-claude/CLAUDE.md' = $r7Big })
+        $all = [IO.File]::ReadAllBytes($script:R7Zip); $cut = [byte[]]::new([int]($all.Length * 0.6)); [Array]::Copy($all, $cut, $cut.Length); [IO.File]::WriteAllBytes($script:R7Zip, $cut)
+        $script:BundlePath = $script:R7Zip; Set-Variable -Name BundlePath -Scope 1 -Value $script:R7Zip
+    } $null {
+        # the expansion folder carries a random suffix since adversary pass 1 A3: every folder of this run's expansions
+        $kept = @(Get-ChildItem -LiteralPath (Join-Path $script:MlvTmp 'migrate-in') -Directory -Filter "bundle-$($script:stamp)*" -ErrorAction SilentlyContinue | ForEach-Object { Join-Path $_.FullName 'home-claude\CLAUDE.md' } | Where-Object { Test-Path -LiteralPath $_ })
+        $script:R7Partial = $(if ($kept.Count -eq 1) { (Get-Item -LiteralPath $kept[0]).Length } else { -1 })
+        New-R7Zip $script:R7Zip ([ordered]@{ 'MANIFEST.txt' = $r7Manifest; 'home-claude/other-note.txt' = $r7Ascii.GetBytes('only note') })
+        $null = (Invoke-PhaseImport *>&1 | Out-String)
+    }
+    Assert-That ($script:R7Partial -gt 0) 'r7 import precondition: the failed first expansion left a partial, non-empty CLAUDE.md in its folder' "partial length=$($script:R7Partial)"
+    Assert-That ($r7a.Host -ceq 'HOST-GOOD-CONTENT') 'r7 import (sol r6 blocker): a second phase that expands a valid bundle without CLAUDE.md never copies the partial CLAUDE.md the failed first expansion left (host byte-identical)' "hostLength=$($r7a.Host.Length) failures=$($r7a.Failures -join ',')"
+    Assert-That ((& $r7Typed $r7a 'IMPORT_BUNDLE_EXPAND_FAILED') -eq 1) 'r7 import: the failed first expansion stays the one typed failure of the run (exit 1)' ($r7a.Failures -join ',')
+    # (2) the retained folder as a fact (no tar involved): a folder of this run's expansion name already holds a newer CLAUDE.md the valid bundle lacks
+    $script:R7ZipB = Join-Path (New-Scratch 'r7b-zip') 'bundle.zip'
+    $r7b = Invoke-R3Import 'r7b' -3 0 {
+        param($st, $sp)
+        New-R7Zip $script:R7ZipB ([ordered]@{ 'MANIFEST.txt' = $r7Manifest; 'home-claude/other-note.txt' = $r7Ascii.GetBytes('only note') })
+        $script:BundlePath = $script:R7ZipB; Set-Variable -Name BundlePath -Scope 1 -Value $script:R7ZipB
+        $old = Join-Path $script:MlvTmp "migrate-in\bundle-$sp\home-claude"; [void][IO.Directory]::CreateDirectory($old)
+        [IO.File]::WriteAllText((Join-Path $old 'CLAUDE.md'), 'RETAINED-PARTIAL')
+    } $null $null
+    Assert-That ($r7b.Host -ceq 'HOST-GOOD-CONTENT' -and $r7b.Failures.Count -eq 0) 'r7 import: files an earlier attempt left in the expansion folder never reach the host (the valid bundle has no CLAUDE.md, so the host keeps its own, with no failure)' "host=[$($r7b.Host)] failures=$($r7b.Failures -join ',')`n$($r7b.Out)"
+    # (3) the sibling: the import snapshot's folder was left by a failed snapshot whose removal was denied; the retry's bundle lacks that member
+    $r7c = Invoke-R3Import 'r7c' -3 0 {
+        param($st, $sp)
+        Remove-Item -LiteralPath (Join-Path $script:BundlePath 'home-claude\CLAUDE.md') -Force
+        [IO.File]::WriteAllText((Join-Path $script:BundlePath 'home-claude\other-note.txt'), 'only note')
+        $old = Join-Path $st "import-snapshot-$sp\home-claude"; [void][IO.Directory]::CreateDirectory($old)
+        [IO.File]::WriteAllText((Join-Path $old 'CLAUDE.md'), 'RETAINED-SNAPSHOT'); [IO.File]::WriteAllText((Join-Path (Split-Path -Parent $old) 'MANIFEST.txt'), 'mlv-migrate-bundle v1')
+    } $null $null
+    Assert-That ($r7c.Host -ceq 'HOST-GOOD-CONTENT' -and $r7c.Failures.Count -eq 0) 'r7 import (sibling): a snapshot folder an earlier attempt left behind never supplies a member the bundle lacks (host keeps its own CLAUDE.md, no failure)' "host=[$($r7c.Host)] failures=$($r7c.Failures -join ',')`n$($r7c.Out)"
+    # control: with nothing left behind the newer bundle CLAUDE.md still replaces the older host file
+    $r7d = Invoke-R3Import 'r7d' -3 0 $null $null $null
+    Assert-That ($r7d.Host -ceq 'FROM-BUNDLE' -and $r7d.Failures.Count -eq 0) 'r7 import control: a clean run still applies the newer bundle CLAUDE.md' "host=[$($r7d.Host)] failures=$($r7d.Failures -join ',')"
+    $script:Failures.Clear()
+    # hardening T-01: the BOUNDED native launch hands the child no GIT_TRACE* variable (the unbounded launch already scrubs them), and restores the parent's value
+    $r7pw = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
+    $r7env = Join-Path (New-Scratch 'r7-env') 'child-env.txt'; $r7sv = $env:GIT_TRACE; $env:GIT_TRACE = 'C:\r7-trace-destination.log'
+    $r7eThrown = ''
+    try { [void](Invoke-Native -Exe $r7pw -Arguments @('-NoProfile', '-Command', "[IO.File]::WriteAllText('$r7env', [string]`$env:GIT_TRACE)") -TimeoutSec 60) } catch { $r7eThrown = $_.Exception.Message }
+    $r7after = $env:GIT_TRACE; $env:GIT_TRACE = $r7sv
+    $r7childSaw = $(if (Test-Path -LiteralPath $r7env) { [IO.File]::ReadAllText($r7env) } else { '<child did not run>' })
+    Assert-That ($r7childSaw -ceq '' -and $r7after -ceq 'C:\r7-trace-destination.log' -and -not $r7eThrown) 'r7 hardening (sol r6 T-01): a bounded native child inherits no GIT_TRACE* destination and the parent keeps its own value' "child=[$r7childSaw] parent=[$r7after] thrown=[$r7eThrown]"
+    # hardening F-02: a kill that fails must not be reported as 'it was stopped'
+    $script:NativeKillHook = { param($child) throw 'access denied (test)' }; $script:NativeStopWaitSec = 2
+    $r7fThrown = ''
+    try { [void](Invoke-Native -Exe $r7pw -Arguments @('-NoProfile', '-Command', 'Start-Sleep -Seconds 8') -TimeoutSec 2) } catch { $r7fThrown = $_.Exception.Message }
+    $script:NativeKillHook = $null; $script:NativeStopWaitSec = $null
+    Assert-That ($r7fThrown -match 'did not finish within 2' -and $r7fThrown -match 'could NOT be stopped' -and $r7fThrown -notmatch '\(it was stopped\)') 'r7 hardening (sol r6 F-02): a timeout whose kill failed says the child could not be stopped, not that it was' "thrown=[$r7fThrown]"
+    # hardening F-02: a child that exits while a descendant holds its output pipe does not hold the run for ever
+    $script:NativeOutputGraceSec = 3
+    $r7gThrown = ''; $r7gSw = [Diagnostics.Stopwatch]::StartNew()
+    $r7gCmd = '$p = [Diagnostics.ProcessStartInfo]::new("' + $r7pw + '"); $p.ArgumentList.Add("-NoProfile"); $p.ArgumentList.Add("-Command"); $p.ArgumentList.Add("Start-Sleep -Seconds 25"); $p.UseShellExecute = $false; [void][Diagnostics.Process]::Start($p); exit 0'
+    try { [void](Invoke-Native -Exe $r7pw -Arguments @('-NoProfile', '-Command', $r7gCmd) -TimeoutSec 60) } catch { $r7gThrown = $_.Exception.Message }
+    $r7gSec = [int]$r7gSw.Elapsed.TotalSeconds; $script:NativeOutputGraceSec = $null
+    Assert-That ($r7gThrown -match 'output' -and $r7gSec -lt 20) 'r7 hardening (sol r6 F-02): output collection is bounded once the child has exited (a descendant that keeps the pipe open fails the call)' "thrown=[$r7gThrown] seconds=$r7gSec"
+    $script:Failures.Clear()
+    # ---- adversary pass 1 (head 15d0e2d0)
+    # A1: a bounded child runs in PowerShell's location (a relative -BundlePath is read from there), not in the process directory
+    $r7wd = New-Scratch 'r7-wd'; $r7wdOut = Join-Path (New-Scratch 'r7-wdout') 'cwd.txt'; $r7wdThrown = ''
+    Push-Location -LiteralPath $r7wd
+    try { [void](Invoke-Native -Exe $r7pw -Arguments @('-NoProfile', '-Command', "[IO.File]::WriteAllText('$r7wdOut', (Get-Location).Path)") -TimeoutSec 60) } catch { $r7wdThrown = $_.Exception.Message } finally { Pop-Location }
+    $r7wdSaw = $(if (Test-Path -LiteralPath $r7wdOut) { [IO.File]::ReadAllText($r7wdOut) } else { '<child did not run>' })
+    Assert-That ($r7wdSaw -ieq [IO.Path]::GetFullPath($r7wd) -and -not $r7wdThrown) 'r7 hardening (adversary A1): a bounded native child starts in PowerShell''s current location' "child=[$r7wdSaw] want=[$r7wd] thrown=[$r7wdThrown]"
+    # A7: a failed kill is reported even when the child then exits by itself during the wait
+    $script:NativeKillHook = { param($child) throw 'access denied (test)' }
+    $r7kThrown = ''
+    try { [void](Invoke-Native -Exe $r7pw -Arguments @('-NoProfile', '-Command', 'Start-Sleep -Milliseconds 3500') -TimeoutSec 2) } catch { $r7kThrown = $_.Exception.Message }
+    $script:NativeKillHook = $null
+    Assert-That ($r7kThrown -match 'kill failed' -and $r7kThrown -notmatch '\(it was stopped\)') 'r7 hardening (adversary A7): a kill that failed is named even when the child exited during the wait' "thrown=[$r7kThrown]"
+    # A3: two attempts never share a staging name
+    $r7base = Join-Path (New-Scratch 'r7-names') 'import-snapshot-x'
+    Assert-That ((Get-FreshImportStagingPath $r7base) -cne (Get-FreshImportStagingPath $r7base) -and -not (Test-Path -LiteralPath (Get-FreshImportStagingPath $r7base))) 'r7 import (adversary A3): every staging attempt gets its own folder name (no name is picked twice, so no check-then-create window on a shared name)'
+    $r7exist = New-Scratch 'r7-exist-snap'; $r7src = New-Scratch 'r7-exist-src'; [IO.File]::WriteAllText((Join-Path $r7src 'a.txt'), 'x'); $r7exThrown = ''
+    try { [void](New-ImportSnapshot -From $r7src -To $r7exist) } catch { $r7exThrown = $_.Exception.Message }
+    Assert-That ($r7exThrown -match 'already exists') 'r7 import (adversary A3): a snapshot is never made into a folder that already exists' "thrown=[$r7exThrown]"
+    # A2: a declined snapshot step removes nothing: a folder another process published at the displayed path is not this step's
+    $script:R7Keep = $null
+    $r7i = Invoke-R3Import 'r7i' -3 0 {
+        param($st, $sp)
+        $script:R7SaveCmdlet = $script:Cmdlet
+        $stub = [pscustomobject]@{}
+        Add-Member -InputObject $stub -MemberType ScriptMethod -Name ShouldProcess -Value {
+            param($target, $action)
+            if ($action -like 'Snapshot the bundle*') {
+                if ($action -match 'Snapshot the bundle to (.+?) \(the scan') { $d = $Matches[1]; [void][IO.Directory]::CreateDirectory($d); $script:R7Keep = Join-Path $d 'keep.txt'; [IO.File]::WriteAllText($script:R7Keep, 'KEEP') }
+                return $false
+            }
+            return $true
+        }
+        $script:Cmdlet = $stub
+    } $null { $script:Cmdlet = $script:R7SaveCmdlet }
+    Assert-That ($script:R7Keep -and (Test-Path -LiteralPath $script:R7Keep) -and (& $r7Typed $r7i 'IMPORT_SNAPSHOT_FAILED') -eq 1 -and $r7i.Host -ceq 'HOST-GOOD-CONTENT') 'r7 import (adversary A2): a declined snapshot step never deletes a folder it did not create (the typed failure stands, the other folder is intact)' "keep=[$script:R7Keep] failures=$($r7i.Failures -join ',')`n$($r7i.Out)"
+    # A4: a bundle folder that disappears at the snapshot prompt is a failed snapshot, not a 'done' empty one
+    $r7h = Invoke-R3Import 'r7h' -3 0 {
+        param($st, $sp)
+        $script:R7SaveCmdlet = $script:Cmdlet
+        $stub = [pscustomobject]@{}
+        Add-Member -InputObject $stub -MemberType ScriptMethod -Name ShouldProcess -Value { param($target, $action) if ($action -like 'Snapshot the bundle*') { Move-Item -LiteralPath $script:BundlePath -Destination "$($script:BundlePath).away" }; return $true }
+        $script:Cmdlet = $stub
+    } $null { $script:Cmdlet = $script:R7SaveCmdlet; if (Test-Path -LiteralPath "$($script:BundlePath).away") { Move-Item -LiteralPath "$($script:BundlePath).away" -Destination $script:BundlePath } }
+    Assert-That ((& $r7Typed $r7h 'IMPORT_SNAPSHOT_FAILED') -eq 1 -and $r7h.Host -ceq 'HOST-GOOD-CONTENT') 'r7 import (adversary A4): a bundle folder that vanished before the snapshot is the typed failure IMPORT_SNAPSHOT_FAILED, not a completed empty snapshot' "failures=$($r7h.Failures -join ',')`n$($r7h.Out)"
+    # A5: a path through a loopback share of this machine resolves to the physical file (the protected set is keyed by it); the administrative C$ share exists on a default Windows install
+    $r7cShare = @(Get-CimInstance -ClassName Win32_Share -Filter 'Name=''C$''' -ErrorAction SilentlyContinue)
+    if ($r7cShare.Count -eq 1 -and $r7cShare[0].Path) {
+        $r7uWant = Get-ImportRealPath 'C:\Windows\r7-share-probe\CLAUDE.md'
+        $r7uA = Get-ImportRealPath '\\localhost\C$\Windows\r7-share-probe\CLAUDE.md'; $r7uB = Get-ImportRealPath "\\$env:COMPUTERNAME\C`$\Windows\r7-share-probe\CLAUDE.md"
+        Assert-That ($r7uA -ieq $r7uWant -and $r7uB -ieq $r7uWant) 'r7 import (adversary A5): a path through a loopback share (\\localhost\C$ or \\<this machine>\C$) resolves to the physical file, so a protected file is not reachable through the share' "localhost=[$r7uA] computer=[$r7uB] want=[$r7uWant]"
+        Assert-That ((Get-ImportRealPath '\\some-other-machine\share\a\CLAUDE.md') -ieq '\\some-other-machine\share\a\CLAUDE.md') 'r7 import (adversary A5): a share of another machine stays as it is' ''
+    } else { Write-Host 'SKIP r7 import (adversary A5): no administrative C$ share on this machine' }
+    # pass 2 A1: a staging folder is created EXCLUSIVELY (a name that exists, whoever made it, is refused: no 'absent a moment ago, then create' window)
+    $r7xDir = Join-Path (New-Scratch 'r7-excl') 'fresh'; $r7xFirst = ''; $r7xSecond = ''
+    try { New-ExclusiveDirectory $r7xDir } catch { $r7xFirst = $_.Exception.Message }
+    $r7xMarker = Join-Path $r7xDir 'foreign.txt'; if (Test-Path -LiteralPath $r7xDir) { [IO.File]::WriteAllText($r7xMarker, 'FOREIGN') }
+    try { New-ExclusiveDirectory $r7xDir } catch { $r7xSecond = $_.Exception.Message }
+    Assert-That ((-not $r7xFirst) -and (Test-Path -LiteralPath $r7xDir -PathType Container) -and $r7xSecond -match '183' -and (Test-Path -LiteralPath $r7xMarker)) 'r7 import (adversary pass 2 A1): a staging folder is created exclusively (a folder that exists is refused with Win32 error 183 and left untouched)' "first=[$r7xFirst] second=[$r7xSecond]"
+    # pass 2 A2 (DISTINGUISHED, not reproduced: [IO.Path]::GetFullPath, the first step of Get-ImportRealPath, already expands an 8.3 short name; probe-a2.ps1 gave equal=True on the previous head). Kept as a regression guard:
+    # a protected file reached through its 8.3 short name resolves to the long-name path it is registered under
+    $r7sDir = New-Scratch 'r7-short'; $r7sLong = Join-Path $r7sDir 'settings-long-name-r7.json'; [IO.File]::WriteAllText($r7sLong, '{}')
+    $r7sShortName = ''
+    try { $r7sShortName = (New-Object -ComObject Scripting.FileSystemObject).GetFile($r7sLong).ShortName } catch { }
+    if ($r7sShortName -and $r7sShortName -ine 'settings-long-name-r7.json') {
+        $r7sGot = Get-ImportRealPath (Join-Path $r7sDir $r7sShortName); $r7sWant = Get-ImportRealPath $r7sLong
+        Assert-That ($r7sGot -ieq $r7sWant -and $r7sWant -like '*settings-long-name-r7.json') 'r7 import (adversary pass 2 A2): a path spelled with an 8.3 short name resolves to the long-name path, so a protected file is not reachable through it' "got=[$r7sGot] want=[$r7sWant] short=[$r7sShortName]"
+    } else { Write-Host 'SKIP r7 import (adversary pass 2 A2): this volume has no 8.3 short names' }
+    # A6: a host file whose bytes cannot be read, renamed away while the gate reads the bundle file, is a creation (no silent skip)
+    $script:R7Rot = $null
+    $r7f = & $r6Run 'r7f' 'ROTATION.md' ($r6Utf8.GetBytes('FROM-BUNDLE')) 'HOST-OLD' {
+        param($st, $sp)
+        $script:R7Rot = Join-Path (& $r6Dir) 'ROTATION.md'
+        & icacls.exe $script:R7Rot /deny '*S-1-1-0:(RD)' 2>&1 | Out-Null
+        $script:ImportAfterEarlySourceReadHook = { param($p) if ((Split-Path -Leaf $p) -ceq 'ROTATION.md' -and (Test-Path -LiteralPath $script:R7Rot -PathType Leaf)) { Move-Item -LiteralPath $script:R7Rot -Destination "$($script:R7Rot).aside" } }
+    } {
+        $script:ImportAfterEarlySourceReadHook = $null
+        & icacls.exe "$($script:R7Rot).aside" /remove:d '*S-1-1-0' 2>&1 | Out-Null
+        Remove-Item -LiteralPath "$($script:R7Rot).aside" -Force -ErrorAction SilentlyContinue
+    }
+    Assert-That ($script:R6After -ceq 'FROM-BUNDLE') 'r7 import (adversary A6): an unreadable host file that went away while the gate read the bundle file is created from the bundle, not skipped' "rotation=[$($script:R6After)] failures=$($r7f.Failures -join ',')`n$($r7f.Out)"
+    $script:Failures.Clear()
+}
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 

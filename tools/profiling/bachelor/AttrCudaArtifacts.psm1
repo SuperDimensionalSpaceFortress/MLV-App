@@ -7412,6 +7412,387 @@ function Get-AttrCudaForegroundVerification {
     [pscustomobject]@{ verified = $true; reason = $null }
 }
 
+function Get-AttrCudaWindowToggleEvidence {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1: did each mid-play window toggle of a -MidPlayWindowToggles leg keep Play going, and did the
+    picture keep advancing? Pure over the raw run log; self-contained (embedded verbatim into the job, like Get-AttrCudaForegroundVerification).
+    .DESCRIPTION
+    Reads the measured session's records:
+      gui_smoke.window_toggle phase=begin|end index= kind= elapsed_ms= play_checked= position= presented_serial= window=WxH fullscreen= maximized=
+      gui_smoke.window_toggles requested= driven= reason=            (exactly one, after the loop)
+      interaction_trace event=resize.keep_playing ...
+    The measured session is the one -MeasuredSessionId names (the job's own measured-session read): its records are the lines from that session's FIRST
+    playback_smoke.measured_session marker up to the next marker of ANOTHER session. With no id, the log must carry markers of ONE session only (more is
+    ambiguous, none is absent: reason names either) and its first marker starts the window. The app writes the marker once per process, so a second marker of
+    the window's id (anywhere in the log, before or after a foreign marker) is a broken session: reason names measured-session-marker-repeated and the proof is
+    never ok; the repeat neither reopens a window a foreign marker closed nor moves the window's start past earlier records.
+    The job's schedule is fixed (fs_on, fs_off, restore, maximize at indexes 0..3). Toggle i is DRIVEN when it has exactly one begin and one end, in log
+    order, parseable (a key repeated inside one record is not), the same kind, a kind of the schedule at its index, and after the previous toggle's end.
+    It KEPT PLAYING when it is driven, has at least one resize.keep_playing record strictly between its begin and end, play_checked=1 on both, the
+    window size changed (end != begin; an fs_off must also end at a size other than the preceding fs_on's end, the fullscreen size), the end state is its
+    kind's (fs_on: fullscreen at the end, not at the begin; fs_off: the reverse; restore: neither fullscreen nor maximized; maximize: maximized, not
+    fullscreen) and the end was logged at least 2000 ms after the begin, and (r10) its begin's at_ms is the schedule's for its index (4000, 8000, 12000, 16000) and
+    its begin elapsed_ms is no earlier than that at_ms (a begin record needs one canonical decimal at_ms=, an end record carries none). It ADVANCED when it is driven and position_end > position_begin and
+    presented_serial_end > presented_serial_begin. The one summary record must be present, whole, with requested= and driven= whole numbers (driven
+    equal to what the records show) and reason= ok or incomplete (its own reason is carried through: incomplete names itself in the result, and ok over a
+    driven short of requested contradicts itself), and it must come after the last toggle record. A key repeated in a record, even with an empty value, makes
+    it unusable. A duplicate, unordered, missing, contradictory or unparseable record makes that
+    toggle (or the summary) count for NOTHING more and names itself in reason. Records are read from the app's record body only: the log prefix and the
+    Qt location suffix are cut first. Returns requested / driven / keptPlaying / advanced / reason (reason = ok only when every requested toggle was
+    driven, kept playing and advanced and nothing above was anomalous).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$LogText,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$MeasuredSessionId = ''
+    )
+
+    # Each run-log line is reduced to the record body the app wrote: the optional `[utc] [LEVEL] [0x<thread>] ` prefix is dropped and the Qt location suffix
+    # (` (<file>:<line>)`, written last) is cut at its first ` (` that lies OUTSIDE a quoted `key="..."` value, so a path in the suffix can never
+    # supply a field or a marker. A record counts only where it STARTS the body. A key that repeats inside one record makes that record unusable.
+    # r5 (key3 r4 B1 on 292d4279): the app's own record bodies DO hold ` (` in free text, always inside a double-quoted value (session_reason="preview scale 1 (full
+    # resolution)", gui_fps_status_text="Playback: 24 fps (59.94 -> 24)", fallback_reason_last="..."), and a venue build writes no location at all, so a first-` (` cut
+    # read every healthy record of that shape as a bad tail. The location is therefore found the way DualVenueRunner.psm1's Get-DvLocationOpenIndex finds it (this
+    # function is embedded in the job and cannot call it): a quoted value opens at `="` whose key ([A-Za-z0-9_]+) starts the line or follows a space, and it is stepped
+    # over only when it closes at the first `"` that ends the line or is followed by a space and holds no `=`; a span that holds an `=` is no quoted value, so its
+    # ` (` stays a location candidate and its tail (not a location) makes the record unreadable, as before.
+    # r3 (adversary A1 on 1f00a482): the cut tail must BE a location, ` (<path>:<digits>)` to the very end of the line with a path of at least one character (the
+    # runner's Get-DvLogRecordBody rule); any other tail (`(reason=incomplete)`, text after the `)`, no line number) is no location, so its record is unreadable
+    # ($badTail) and a keep_playing line carrying it counts for nothing. It may refuse; it never forges.
+    # r8 (keys sol / fable / opus key3 r7 B1 on 152845be, inputs: `gui_smoke.window_toggles<U+212A> requested=4 driven=0 reason=incomplete` and U+0130): the ONE name
+    # character of every record-name class and terminator below, ASCII [A-Za-z0-9_] matched CASE-SENSITIVELY even inside a -match (DualVenueRunner.psm1's
+    # $script:DvNameChar; this function is embedded in the job, so it holds its own copy). Under IgnoreCase .NET folds U+212A (Kelvin sign) and U+0130 into [A-Za-z],
+    # so a record name glued to one of them was skipped instead of counted; with (?-i:...) every non-ASCII neighbour ends the name and the record is counted
+    $nameChar = '(?-i:[A-Za-z0-9_])'
+    $badTail = [System.Collections.Generic.HashSet[int]]::new()
+    $lines = [System.Collections.Generic.List[string]]::new()
+    # r5 (adversary A1 on 129eb94b): a line ends at CRLF, a bare CR or a bare LF, so a lone CR never hides a second record inside one line
+    foreach ($rawLine in @($LogText -split '\r\n|\r|\n')) {
+        $body = [regex]::Replace($rawLine, '^\s*(?:\[[^\]]*\]\s*)*', '')
+        $cut = -1
+        $scanAt = 0
+        $parenAt = -2
+        $quoteAt = -2
+        while ($scanAt -lt $body.Length) {
+            if ($parenAt -ne -1 -and $parenAt -lt $scanAt) { $parenAt = $body.IndexOf(' (', $scanAt, [StringComparison]::Ordinal) }
+            if ($parenAt -lt 0) { break }
+            if ($quoteAt -ne -1 -and $quoteAt -lt $scanAt) { $quoteAt = $body.IndexOf('="', $scanAt, [StringComparison]::Ordinal) }
+            if ($quoteAt -ge 0 -and $quoteAt -lt $parenAt) {
+                # is `="` a value opener: a non-empty ASCII key that starts the line or follows a space
+                $keyAt = $quoteAt - 1
+                while ($keyAt -ge 0 -and (($body[$keyAt] -ge [char]'A' -and $body[$keyAt] -le [char]'Z') -or ($body[$keyAt] -ge [char]'a' -and $body[$keyAt] -le [char]'z') -or ($body[$keyAt] -ge [char]'0' -and $body[$keyAt] -le [char]'9') -or $body[$keyAt] -ceq [char]'_')) { $keyAt-- }
+                if ($keyAt -lt $quoteAt - 1 -and ($keyAt -lt 0 -or $body[$keyAt] -ceq [char]' ')) {
+                    $closeAt = $body.IndexOf('"', $quoteAt + 2, [StringComparison]::Ordinal)
+                    if ($closeAt -ge 0 -and ($closeAt -eq $body.Length - 1 -or $body[$closeAt + 1] -ceq [char]' ') -and $body.IndexOf('=', $quoteAt + 2, $closeAt - $quoteAt - 2, [StringComparison]::Ordinal) -lt 0) { $scanAt = $closeAt + 1; continue }
+                }
+                $scanAt = $quoteAt + 2
+                continue
+            }
+            $cut = $parenAt
+            break
+        }
+        if ($cut -ge 0) {
+            $tail = $body.Substring($cut)
+            $digitAt = $tail.Length - 2
+            while ($digitAt -gt 2 -and $tail[$digitAt] -ge [char]'0' -and $tail[$digitAt] -le [char]'9') { $digitAt-- }
+            if (-not (($tail[$tail.Length - 1] -ceq [char]')') -and $digitAt -lt $tail.Length - 2 -and $digitAt -gt 2 -and $tail[$digitAt] -ceq [char]':')) { [void]$badTail.Add($lines.Count) }
+            $body = $body.Substring(0, $cut)
+        }
+        $lines.Add($body)
+    }
+    $anomalies = [System.Collections.Generic.List[string]]::new()
+    $markerIds = @{}
+    $start = 0
+    $end = $lines.Count
+    $wanted = [string]$MeasuredSessionId
+    # r7 (r6 adversary A2 on 1ee5e122, its input: `playback_smoke.measured_session  id=3 id=3`, and a TAB for the doubled space): ONE marker reader, used by the marker
+    # loop and the window loop below. Before r7 the marker loop read an exact one-space `id=` and the window loop a loose name, so a marker spaced otherwise skipped the
+    # duplicate check in both. Every record that starts with the marker's name is read here by its tokens, split on any run of spaces or TABs; its id is the first
+    # `id=` token's value (any case), and it is a CLEAN marker only when its cut tail is a location (or absent), it holds no character outside printable ASCII but the TAB,
+    # its tokens are separated by one plain space each (the app writes `playback_smoke.measured_session id=<n>`, MainWindow.cpp), every token is one `<key>=<value>` with an
+    # ASCII name key and a value holding no `=` and no quote, no key is stated twice in any case or spacing (`id=3 id=3`, `id=3  ID=3`, `x=1 x=1`), the id is stated with a
+    # non-empty value and no session key is stated. Anything else is session-boundary-unreadable, however it is spaced.
+    # r4 (adversary A2 on 0b915c19): the letter i of a boundary pattern is the class [Ii] and the keys are compared as ASCII lower case, so neither the host culture (tr-TR does
+    # not fold an upper-case I) nor ignore-case folding (the Kelvin sign folds to k) decides what is read; a non-ASCII key character makes the token no key, so the marker unclean
+    # r4 (adversary A1 on 16530f5b): a marker whose cut tail is no location is unreadable (`id=3 (id=4)` hides an id=), never a clean marker of its id
+    # r5 (adversary A1 on 732bcb96): and so is a marker that also names a session= (`id=3 session=4`): the app's marker is `id=<n>` alone
+    $markerId = @{}
+    $markerClean = @{}
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        # r7 (r7 adversary A2 on be8fb7b6, its input: `playback_smoke.measured_session:id=4`): the name ends at ANY non-name character, never only at whitespace, so a
+        # name glued to a colon (or any other character) is a marker candidate, read here, and unclean unless one plain space or the line end follows the name
+        if ($lines[$i] -notmatch ('^playback_smoke\.measured_sess[Ii]on(?!' + $nameChar + ')')) { continue }
+        $clean = -not $badTail.Contains($i)
+        if ($lines[$i] -cmatch '[^\t\x20-\x7E]' -or $lines[$i] -cnotmatch '^[^ \t]+(?: [^ \t]+)*$' -or $lines[$i] -notmatch '^playback_smoke\.measured_sess[Ii]on( |$)') { $clean = $false }
+        $keysSeen = @{}
+        $firstId = $null
+        foreach ($token in ($lines[$i] -split '[ \t]+' | Select-Object -Skip 1)) {
+            if ($token -ceq '') { continue }
+            $eq = $token.IndexOf('=')
+            if ($eq -lt 1 -or $token.Substring(0, $eq) -cnotmatch '^[A-Za-z0-9_]+$' -or $token.Substring($eq + 1) -match '[=\x22\x27\x60\p{Pi}\p{Pf}]') { $clean = $false; continue }
+            $markerKey = $token.Substring(0, $eq).ToLowerInvariant()
+            if ($keysSeen.ContainsKey($markerKey)) { $clean = $false }
+            $keysSeen[$markerKey] = $true
+            if ($markerKey -ceq 'id' -and $null -eq $firstId) { $firstId = $token.Substring($eq + 1) }
+        }
+        if ($null -eq $firstId -or $firstId -ceq '' -or $keysSeen.ContainsKey('session')) { $clean = $false }
+        $markerId[$i] = $firstId
+        $markerClean[$i] = $clean
+    }
+    # r11 (sol r10 A1 and opus key3 r10 B1 on 7fc447b9, inputs: marker + toggle(0,begin) + marker + rest, and `id=3`, `id=4`, `id=3` + the healthy log): the window
+    # starts at the FIRST marker of the session (before r11 the LAST one, so a repeated marker erased a duplicate record before it, or reopened a window a foreign marker
+    # had closed), and every marker of an id is counted ($markerCount): a second marker of the window's id is a broken session (the app writes the marker once per
+    # process, MainWindow.h m_playbackSmokeMeasuredSessionLogged), so it names itself (measured-session-marker-repeated), never a reopened or replaced window
+    $markerCount = @{}
+    $firstMatch = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if (-not $markerId.ContainsKey($i)) { continue }
+        if ($null -ne $markerId[$i] -and $markerId[$i] -cne '') {
+            $markerIds[$markerId[$i]] = $true
+            $markerCount[$markerId[$i]] = 1 + $(if ($markerCount.ContainsKey($markerId[$i])) { [int]$markerCount[$markerId[$i]] } else { 0 })
+            if ($firstMatch -lt 0 -and ($wanted -eq '' -or $markerId[$i] -ceq $wanted)) { $firstMatch = $i }
+        }
+        if (-not $markerClean[$i]) { $anomalies.Add('session-boundary-unreadable') }
+    }
+    if ($firstMatch -ge 0) { $start = $firstMatch }
+    # r3 (A5 of the first r3 round): with no id the log must carry exactly ONE session's marker; none is no measured session at all, never "read the whole log"
+    $windowId = $wanted
+    if ($wanted -eq '') {
+        if ($markerIds.Count -gt 1) { $anomalies.Add('measured-session-ambiguous') }
+        elseif ($markerIds.Count -eq 0) { $anomalies.Add('measured-session-marker-absent') }
+        else { $windowId = [string]@($markerIds.Keys)[0] }
+    } elseif (-not $markerIds.ContainsKey($wanted)) { $anomalies.Add('measured-session-marker-absent'); $start = $lines.Count }
+    if ($windowId -ne '' -and $markerCount.ContainsKey($windowId) -and [int]$markerCount[$windowId] -gt 1) { $anomalies.Add('measured-session-marker-repeated') }
+    # r3 (adversary A4 on 1f00a482): the window closes at the next marker of ANOTHER session AND at any playback_smoke record that names another session
+    # (`playback_smoke.start session=4 ...`), as the runner's own due-wake reader closes its window, so a foreign Play's toggles are never credited here
+    # r3 (adversary A2 on 90451806): EVERY `session=` of such a record is read (a greedy match let a later `session=3` hide `session=4`, and a quoted `session=3`
+    # likewise), and the record closes the window when any of them is not this session; a marker is read the same way by every `id=`
+    if ($windowId -ne '') {
+        for ($i = $start + 1; $i -lt $lines.Count; $i++) {
+            # r4 (adversary A1 on 16530f5b): a playback_smoke record whose cut tail is no location is an unreadable boundary (`session=3 (session=4)` hides a session=), so it
+            # closes the window and names itself; the keys are read in any case (`SESSION=4` is a declaration too)
+            # r7 (r7 adversary A2 on be8fb7b6): a playback_smoke record name ends at ANY non-name character (`playback_smoke.start:session=4` is a record), and one whose name
+            # is not followed by one plain space or the line end is an unreadable boundary: it closes the window and names itself
+            # r8 (keys r7 B1, input: `playback_smoke.frame<U+212A> n=1`): the name is $nameChar+ (case-sensitive ASCII), so a U+212A / U+0130 glued to it ends the name and
+            # the record is unreadable; and ANY record that starts `playback_smoke.` is a candidate, so a name that begins with such a character is unreadable too, never skipped
+            if ($lines[$i] -match '^playback_smoke\.' -and ($badTail.Contains($i) -or $lines[$i] -notmatch ('^playback_smoke\.' + $nameChar + '+( |$)'))) { $anomalies.Add('session-boundary-unreadable'); $end = $i }
+            elseif ($markerId.ContainsKey($i)) {
+                # r5 (adversary A1 on 732bcb96): a marker is read by its id= AND its session=; one with no id= (`playback_smoke.measured_session session=4`, or the bare name) or with any
+                # session= is no clean marker of this session, so it closes the window and names itself, as every other playback_smoke record that names a session does
+                # r7 (r6 adversary A2): by the ONE marker reader above, so a key stated twice (any spacing) or a marker spaced otherwise closes it and names itself too
+                # r11 (sol r10 A1): a clean marker of the window's OWN id neither closes nor restarts the window (it was counted above as
+                # measured-session-marker-repeated, so the proof is not ok); the window started at the first marker and runs to the next marker of another id
+                if (-not $markerClean[$i]) { $anomalies.Add('session-boundary-unreadable'); $end = $i }
+                elseif ($markerId[$i] -cne $windowId) { $end = $i }
+            }
+            elseif ($lines[$i] -match ('^playback_smoke\.' + $nameChar + '+( |$)')) {
+                # r14 (keys opus / sol r13 B1 on 5e0fa99f, input: `playback_smoke.start note=session=3` after the measured marker, which read 4/4/4/4/ok; hub ruling
+                # 20261120T1007Z): a WHITELIST, never another lexer. r13 (`session =4`) and r13b (word count = key count) each read a spelling and each left one open (a
+                # `session=` nested in another key's value counted as a key). Now a playback_smoke record that holds the text `session` ANYWHERE (any case, inside any key or
+                # value), and every `playback_smoke.start` (the Play's own start record, MainWindow.cpp `playback_smoke.start session=%1`, must declare its session), is
+                # readable ONLY in the anchored grammar of the runner's own session readers (DualVenueRunner.psm1 summary selector and due-wake reader; the job's
+                # first-summary selector): the record name, one space, `session=<digits>` as the FIRST key (case-sensitive), then a space or the line end, with the word
+                # `session` (bounded by non-name characters, any case) stated exactly once. Its session is those digits: another one closes the window; any other record
+                # holding `session` closes it and names itself, as every other unreadable boundary does. Every playback_smoke record the app writes has that shape
+                # (`session=%1` first; `session_scale=` / `session_reason=` are other keys, not the word)
+                if ([regex]::Matches($lines[$i], '[Ss][Ee][Ss][Ss][Ii][Oo][Nn]', 'IgnoreCase, CultureInvariant').Count -gt 0 -or $lines[$i] -match ('^playback_smoke\.start(?!' + $nameChar + ')')) {
+                    $declared = $null
+                    if ([regex]::Matches($lines[$i], ('(?<!' + $nameChar + ')session(?!' + $nameChar + ')'), 'IgnoreCase, CultureInvariant').Count -eq 1 -and $lines[$i] -cmatch ('^playback_smoke\.' + $nameChar + '+ session=(?<v>[0-9]+)(?: |$)')) { $declared = $Matches['v'] }
+                    if ($null -eq $declared) { $anomalies.Add('session-boundary-unreadable'); $end = $i }
+                    elseif ($declared -cne $windowId) { $end = $i }
+                }
+            }
+            if ($end -le $i) { break }
+        }
+    }
+
+    $expectedKinds = @('fs_on', 'fs_off', 'restore', 'maximize')
+    # r10 (r9 adversary A1 on 373dcb57, its input: the four begin/end elapsed_ms pairs (0,2000),(2000,4000),(4000,6000),(6000,8000) under at_ms 4000/8000/12000/16000,
+    # which read 4/4/4/4/ok): the SCHEDULE is the job's own mid-play window-toggle env value, fs_on@4000,fs_off@8000,restore@12000,maximize@16000 (the one value
+    # playback-attr-3-cuda-job.ps1 adds; a test pins the two equal; the env name is not spelled here because this source is embedded into that job), and the app's stepper (MainWindow.cpp stepWindowToggles) begins toggle i only once its clock reaches
+    # the entry's at_ms and writes that at_ms on the BEGIN record alone. So a begin record is usable only with exactly one canonical decimal at_ms= (no sign, no leading
+    # zero, at most 9 digits: SmokeWindowToggleSchedule.h), an end record carries none, and a toggle KEPT its schedule only when its at_ms is its index's and its begin
+    # elapsed_ms is no earlier than that at_ms. A toggle that began early, or at another time than the schedule states, is not kept playing (it names itself).
+    $expectedAtMs = @(4000, 8000, 12000, 16000)
+    $records = @{}
+    $poisoned = @{}
+    $keepLines = @()
+    $summaries = @()
+    $maxIndex = -1
+    $lastToggleLine = -1
+    # r3 (adversary A1 on 90451806, and A1/A5 on 1f00a482): ONE record reader for every record this function counts. A record is WELL FORMED only when its tail is a
+    # location (or absent) and every token after the record name is one `<key>=<value>` with no quote in the value; a key repeated in it (an empty value counts) makes
+    # it unusable too. A quoted field value, a bare word, a stray tail or a repeated key makes the whole record unusable (the app writes none of these in a record
+    # here), so a `<key>=` inside quoted text is never a field. The quote characters are the regex class below: the straight double and single quote and the backtick by hex
+    # escape, and every initial or final Unicode quote (the typographic quotes among them) by category, so this file stays ASCII.
+    # r4 (CI R3/R4 on f1def3c8): the reader is INLINE in the one loop below (no scriptblock called with &, no .EndsWith / .IndexOfAny), so the spliced-body scan
+    # admits it with no allowlist row.
+    for ($i = $start; $i -lt $end; $i++) {
+        $line = $lines[$i]
+        # r5 (adversary A3 on 732bcb96): the letter i of each record name is the class [Ii], so a host culture that does not fold an upper-case I (tr-TR) still reads
+        # `guI_smoke.wIndow_toggle` as a toggle record (a duplicate or a post-summary record is counted, never skipped)
+        $isKeep = $line -match '^[Ii]nteract[Ii]on_trace event=resize\.keep_play[Ii]ng(\s|$)'
+        # r3 (adversary A2 on 1f00a482): a toggle record is any record that starts with the name (phase= need not come first), so a record with index= before
+        # phase= is read, ordered and counted like the rest, never skipped
+        # r7 (r7 adversary A2 on be8fb7b6, its inputs: `gui_smoke.window_toggles: requested=4 ...`, `gui_smoke.window_toggle: phase=begin ...`): a record name ends at ANY
+        # non-name character, never only at whitespace, so a name glued to a colon (or a TAB, or the line end) is still a summary / toggle record: counted, ordered and checked
+        # r8 (keys r7 B1, input: `gui_smoke.window_toggles<U+212A> requested=4 driven=0 reason=incomplete`): the terminator is (?!$nameChar), case-sensitive ASCII, so a
+        # U+212A / U+0130 glued to the name ends it: the record is a summary / toggle record, unusable for its non-ASCII character, and counted (a duplicate is seen)
+        $isSummary = $line -match ('^gu[Ii]_smoke\.w[Ii]ndow_toggles(?!' + $nameChar + ')')
+        $isToggle = (-not $isSummary) -and ($line -match ('^gu[Ii]_smoke\.w[Ii]ndow_toggle(?!' + $nameChar + ')'))
+        if (-not ($isKeep -or $isSummary -or $isToggle)) { continue }
+        if ($isToggle -and $i -gt $lastToggleLine) { $lastToggleLine = $i }
+        # (r3 B2: the value may be EMPTY, so a key repeated with no value, ` position=` or ` requested=`, is repeated and the record unusable)
+        $values = @{}
+        $repeatedKey = $badTail.Contains($i)
+        # r5 (adversary A1 on 129eb94b): the tokens are split on the plain space only, so a TAB or any other character outside printable ASCII inside a value would hide a
+        # `<key>=` (`extra=x<TAB>requested=5`); the app writes none in a record here (log_line_field::fieldValue maps every control and every space), so such a record is unusable
+        if ($line -cmatch '[^\x20-\x7E]') { $repeatedKey = $true }
+        # r7 (r7 adversary A2 on be8fb7b6): and so is one whose record name is not followed by one plain space or the line end (`gui_smoke.window_toggles: ...`)
+        if (-not $isKeep -and $line -notmatch '^gu[Ii]_smoke\.w[Ii]ndow_toggles?( |$)') { $repeatedKey = $true }
+        foreach ($token in ($line -split ' ' | Select-Object -Skip 1)) {
+            $eq = $token.IndexOf('=')
+            if ($eq -lt 1 -or $token -match '[\x22\x27\x60\p{Pi}\p{Pf}]' -or $token.Substring(0, $eq) -cnotmatch '^[A-Za-z0-9_]+$') { $repeatedKey = $true; continue }
+            $fieldKey = $token.Substring(0, $eq)
+            if ($values.ContainsKey($fieldKey)) { $repeatedKey = $true }
+            $values[$fieldKey] = $token.Substring($eq + 1)
+        }
+        if ($isKeep) {
+            if (-not $repeatedKey -and $values['event'] -ceq 'resize.keep_playing') { $keepLines += $i }
+            continue
+        }
+        if ($isSummary) { $summaries += , @{ values = $values; repeated = $repeatedKey; line = $i }; continue }
+        [int]$index = -1
+        if (-not ($values.ContainsKey('index') -and [int]::TryParse([string]$values['index'], [ref]$index) -and $index -ge 0 -and $index -lt 1000)) {
+            $anomalies.Add('unparseable-record-without-index')
+            continue
+        }
+        if ($index -gt $maxIndex) { $maxIndex = $index }
+        [int]$playChecked = -1
+        [int]$position = -1
+        [int]$fullscreen = -1
+        [int]$maximized = -1
+        [long]$serial = -1
+        [long]$elapsed = -1
+        $window = $null
+        # r3 (adversary A3 on 1f00a482): the size is canonical decimal (no leading zero, no sign), so `01920x01080` is neither a size nor a changed one; the
+        # numeric parts are compared as the strings they canonically are
+        if ($values.ContainsKey('window') -and ([string]$values['window']) -cmatch '^(?<w>[1-9][0-9]{0,5})x(?<h>[1-9][0-9]{0,5})$') { $window = $Matches['w'] + 'x' + $Matches['h'] }
+        $usable = (-not $repeatedKey) -and ($values['phase'] -eq 'begin' -or $values['phase'] -eq 'end') -and
+            $values.ContainsKey('kind') -and ($expectedKinds -contains [string]$values['kind']) -and
+            $values.ContainsKey('play_checked') -and [int]::TryParse([string]$values['play_checked'], [ref]$playChecked) -and ($playChecked -eq 0 -or $playChecked -eq 1) -and
+            $values.ContainsKey('fullscreen') -and [int]::TryParse([string]$values['fullscreen'], [ref]$fullscreen) -and ($fullscreen -eq 0 -or $fullscreen -eq 1) -and
+            $values.ContainsKey('maximized') -and [int]::TryParse([string]$values['maximized'], [ref]$maximized) -and ($maximized -eq 0 -or $maximized -eq 1) -and
+            $values.ContainsKey('position') -and [int]::TryParse([string]$values['position'], [ref]$position) -and
+            $values.ContainsKey('presented_serial') -and ([string]$values['presented_serial'] -cmatch '^[0-9]{1,15}$') -and
+            $values.ContainsKey('elapsed_ms') -and ([string]$values['elapsed_ms'] -cmatch '^[0-9]{1,15}$') -and
+            (($values['phase'] -eq 'begin' -and $values.ContainsKey('at_ms') -and ([string]$values['at_ms'] -cmatch '^(?:0|[1-9][0-9]{0,8})$')) -or
+                ($values['phase'] -eq 'end' -and -not $values.ContainsKey('at_ms'))) -and
+            ($null -ne $window)
+        if (-not $usable) { $poisoned[$index] = $true; continue }
+        $serial = [long]$values['presented_serial']
+        $elapsed = [long]$values['elapsed_ms']
+        [long]$atMs = -1
+        if ($values['phase'] -eq 'begin') { $atMs = [long]$values['at_ms'] }
+        if (-not $records.ContainsKey($index)) { $records[$index] = @{ begin = @(); end = @() } }
+        $phaseName = [string]$values['phase']
+        $entry = $records[$index]
+        $entry[$phaseName] += , [pscustomobject]@{
+            line = $i; kind = [string]$values['kind']; playChecked = $playChecked; position = $position; serial = $serial; elapsed = $elapsed; window = $window
+            fullscreen = $fullscreen; maximized = $maximized; atMs = $atMs
+        }
+    }
+
+    # The one summary record: whole and not contradicted by the records above.
+    [int]$summaryRequested = -1
+    [int]$summaryDriven = -1
+    if ($summaries.Count -eq 0) { $anomalies.Add('no-window-toggles-summary') }
+    elseif ($summaries.Count -gt 1) { $anomalies.Add('duplicate-window-toggles-summary') }
+    else {
+        $sv = $summaries[0].values
+        $sumOk = (-not $summaries[0].repeated) -and
+            $sv.ContainsKey('requested') -and ([string]$sv['requested'] -cmatch '^[0-9]{1,6}$') -and
+            $sv.ContainsKey('driven') -and ([string]$sv['driven'] -cmatch '^[0-9]{1,6}$') -and
+            $sv.ContainsKey('reason') -and ($sv['reason'] -ceq 'ok' -or $sv['reason'] -ceq 'incomplete')
+        if (-not $sumOk) { $anomalies.Add('window-toggles-summary-unreadable') }
+        else {
+            $summaryRequested = [int]$sv['requested']
+            $summaryDriven = [int]$sv['driven']
+            # r3 (B1): the summary's OWN reason is carried through, never rebuilt from the counts: `incomplete` over healthy records names itself, and `ok`
+            # over a short driven count contradicts itself
+            if ($sv['reason'] -ceq 'incomplete') { $anomalies.Add('summary-reason-incomplete') }
+            elseif ($summaryDriven -ne $summaryRequested) { $anomalies.Add("summary-ok-but-driven-$summaryDriven-of-$summaryRequested") }
+        }
+        # r3 (B3): the one summary is written AFTER the loop, so it must come after the last toggle record
+        if ($lastToggleLine -ge 0 -and $summaries[0].line -lt $lastToggleLine) { $anomalies.Add('summary-before-toggle-records') }
+    }
+    $requested = $maxIndex + 1
+    if ($summaryRequested -ge 0) { $requested = $summaryRequested }
+    if ($maxIndex -ge $requested) { $anomalies.Add('toggle-index-beyond-requested'); $requested = $maxIndex + 1 }
+    if ($requested -le 0) { $anomalies.Add('no-window-toggle-records') }
+
+    $driven = 0
+    $kept = 0
+    $advanced = 0
+    $previousEndLine = -1
+    [long]$previousEndElapsed = -1
+    $previousEnd = $null
+    $previousKind = ''
+    for ($t = 0; $t -lt $requested; $t++) {
+        $rec = $null
+        if ($records.ContainsKey($t)) { $rec = $records[$t] }
+        if ($null -eq $rec -and -not $poisoned.ContainsKey($t)) { $anomalies.Add("toggle-${t}:no-records"); $previousEnd = $null; continue }
+        if ($poisoned.ContainsKey($t)) { $anomalies.Add("toggle-${t}:unparseable-record"); $previousEnd = $null; continue }
+        if ($rec.begin.Count -ne 1 -or $rec.end.Count -ne 1) { $anomalies.Add("toggle-${t}:duplicate-or-missing-phase"); $previousEnd = $null; continue }
+        $b = $rec.begin[0]
+        $e = $rec.end[0]
+        # r5 (adversary A2 on 732bcb96): the elapsed_ms of every record is read off the producer's ONE clock, so a toggle also begins no earlier than the previous driven toggle's
+        # end (`$previousEndElapsed`), not only after it in log order and within its own pair
+        if ($e.line -le $b.line -or $e.kind -ne $b.kind -or $e.elapsed -lt $b.elapsed -or $b.line -le $previousEndLine -or $b.elapsed -lt $previousEndElapsed) {
+            $anomalies.Add("toggle-${t}:unordered"); $previousEnd = $null; continue
+        }
+        if ($t -ge $expectedKinds.Count -or $b.kind -ne $expectedKinds[$t]) { $anomalies.Add("toggle-${t}:unexpected-kind"); $previousEnd = $null; continue }
+        $driven++
+        $keepBetween = 0
+        foreach ($k in $keepLines) { if ($k -gt $b.line -and $k -lt $e.line) { $keepBetween++ } }
+        $problems = [System.Collections.Generic.List[string]]::new()
+        if ($keepBetween -lt 1) { $problems.Add('no-keep-playing-between') }
+        if ($b.playChecked -ne 1 -or $e.playChecked -ne 1) { $problems.Add('play-not-checked') }
+        # the window must end at a size other than it began at; an fs_off must also LEAVE the size the preceding fs_on ended at (the fullscreen size)
+        if ($e.window -eq $b.window) { $problems.Add('window-size-unchanged') }
+        if ($b.kind -eq 'fs_off' -and $null -ne $previousEnd -and $previousKind -eq 'fs_on' -and $e.window -eq $previousEnd.window) { $problems.Add('window-still-fullscreen-size') }
+        # the end state is the kind's own, and the end came at least the 2000 ms settle window after the begin
+        $stateOk = $false
+        if ($b.kind -eq 'fs_on') { $stateOk = ($b.fullscreen -eq 0 -and $e.fullscreen -eq 1) }
+        elseif ($b.kind -eq 'fs_off') { $stateOk = ($b.fullscreen -eq 1 -and $e.fullscreen -eq 0) }
+        elseif ($b.kind -eq 'restore') { $stateOk = ($e.fullscreen -eq 0 -and $e.maximized -eq 0) }
+        elseif ($b.kind -eq 'maximize') { $stateOk = ($e.fullscreen -eq 0 -and $e.maximized -eq 1) }
+        if (-not $stateOk) { $problems.Add('end-state-not-the-kinds') }
+        if (($e.elapsed - $b.elapsed) -lt 2000) { $problems.Add('settle-interval-short') }
+        # r10 (r9 adversary A1): the toggle kept the job's schedule: its at_ms is its index's, and it began no earlier than that at_ms on the producer's one clock
+        if ($b.atMs -ne [long]$expectedAtMs[$t]) { $problems.Add('off-schedule-at-ms') }
+        if ($b.elapsed -lt $b.atMs) { $problems.Add('began-before-at-ms') }
+        if ($problems.Count -eq 0) { $kept++ } else { $anomalies.Add("toggle-${t}:" + ($problems -join '+')) }
+        if ($e.position -gt $b.position -and $e.serial -gt $b.serial) { $advanced++ } else { $anomalies.Add("toggle-${t}:not-advanced") }
+        $previousEndLine = $e.line
+        $previousEndElapsed = $e.elapsed
+        $previousEnd = $e
+        $previousKind = $b.kind
+    }
+    if ($summaryDriven -ge 0 -and $summaryDriven -ne $driven) { $anomalies.Add("summary-driven-$summaryDriven-but-records-show-$driven") }
+    $reason = 'ok'
+    if ($anomalies.Count -gt 0 -or $driven -ne $requested -or $kept -ne $requested -or $advanced -ne $requested) {
+        $reason = if ($anomalies.Count -gt 0) { ($anomalies -join ';') } else { 'incomplete' }
+    }
+    [pscustomobject]@{ requested = $requested; driven = $driven; keptPlaying = $kept; advanced = $advanced; reason = $reason }
+}
+
 function Get-AttrCudaTemporalCoverage {
     <#
     .SYNOPSIS
@@ -8302,6 +8683,7 @@ Export-ModuleMember -Function `
     Get-AttrCudaPresentMonDisplayReport, `
     Get-AttrCudaAppSwapTelemetry, `
     Get-AttrCudaForegroundVerification, `
+    Get-AttrCudaWindowToggleEvidence, `
     Get-AttrCudaTemporalCoverage, `
     Get-AttrCudaPlaybackTemporalCoverage, `
     ConvertFrom-AttrCudaSwapStampUtc, `

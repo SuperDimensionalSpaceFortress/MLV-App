@@ -47,6 +47,16 @@ enum { MLV_STAGE_TIMING_SNAPSHOT_CAPACITY = 32 };
 #define MLV_STAGE_RECON    "recon"
 #define MLV_STAGE_PROCESS  "process"
 #define MLV_STAGE_DISPLAY  "display"
+/* EXPORT-RENDER-PIPE-TIMING-1: the rendered (ProRes) batch export's stages. llrawproc_dual_iso is the CDNG export
+ * profile's llrawproc_dual_iso_ms (dng.c) by the same name, noted after every llrawproc note in video_mlv.c;
+ * export_scale (scaled frame plans only) and export_pipe_write are per frame, export_pipe_drain and export_verify
+ * once per clip on its last frame (src/batch/BatchRunner.cpp). Every caller notes them only while
+ * mlv_stage_timing_enabled(): the note functions below write the snapshot before they check the flag. */
+#define MLV_STAGE_LLRAWPROC_DUAL_ISO  "llrawproc_dual_iso"
+#define MLV_STAGE_EXPORT_SCALE        "export_scale"
+#define MLV_STAGE_EXPORT_PIPE_WRITE   "export_pipe_write"
+#define MLV_STAGE_EXPORT_PIPE_DRAIN   "export_pipe_drain"
+#define MLV_STAGE_EXPORT_VERIFY       "export_verify"
 
 typedef struct
 {

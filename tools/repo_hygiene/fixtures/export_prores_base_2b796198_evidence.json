@@ -1,0 +1,79 @@
+{
+ "metrics": {
+  "framesRequested": 30,
+  "framesExported": 30,
+  "exportFramesSkipped": 0,
+  "exportFramesFailed": 0,
+  "profileFramesSucceeded": null,
+  "profileFramesFailed": null,
+  "stageFramesSeen": 30,
+  "dualIsoActiveFrames": null,
+  "dualIsoClassAgrees": null,
+  "outputFileCount": 1,
+  "outputBytes": 1000,
+  "wallSeconds": 20.0,
+  "exportFps": 1.5,
+  "largestStage": "debayered_frame",
+  "largestStageShare": 0.714286,
+  "profileFramesSucceededCouldNotCheck": "a ProRes export is timed by the stage-timing log, not the export stage profiler",
+  "dualIsoActiveFramesCouldNotCheck": "EXPORT-RENDER-PIPE-TIMING-1: the rendered export path records no dual-ISO stage, so a ProRes leg cannot read its clip's dual-ISO class",
+  "dualIsoClassAgreesCouldNotCheck": "EXPORT-RENDER-PIPE-TIMING-1: the rendered export path records no dual-ISO stage, so a ProRes leg cannot read its clip's dual-ISO class"
+ },
+ "stages": {
+  "denominator": "processed16_total",
+  "denominatorMeanMs": 56.0,
+  "denominatorMedianMs": 56.0,
+  "rows": {
+   "raw_uint16": {
+    "samples": 30,
+    "meanMs": 9.0,
+    "medianMs": 9.0,
+    "share": 0.160714
+   },
+   "raw_uint16_disk_read": {
+    "samples": 30,
+    "meanMs": 3.0,
+    "medianMs": 3.0,
+    "share": 0.053571
+   },
+   "raw_uint16_decompress": {
+    "samples": 30,
+    "meanMs": 5.0,
+    "medianMs": 5.0,
+    "share": 0.089286
+   },
+   "llrawproc": {
+    "samples": 30,
+    "meanMs": 20.0,
+    "medianMs": 20.0,
+    "share": 0.357143
+   },
+   "debayered_frame": {
+    "samples": 30,
+    "meanMs": 40.0,
+    "medianMs": 40.0,
+    "share": 0.714286
+   },
+   "processing": {
+    "samples": 30,
+    "meanMs": 15.0,
+    "medianMs": 15.0,
+    "share": 0.267857
+   },
+   "processed16_total": {
+    "samples": 30,
+    "meanMs": 56.0,
+    "medianMs": 56.0,
+    "share": 1.0
+   }
+  },
+  "nesting": "raw_uint16 (and its disk_read, decompress) and llrawproc nest inside debayered_frame; debayered_frame and processing are disjoint children of processed16_total, the share denominator",
+  "disjointSumMs": 55.0,
+  "disjointWithin5Percent": true,
+  "batchWallPerFrameMs": 666.666667,
+  "untimedPerFrameMs": 610.666667,
+  "untimed": "EXPORT-RENDER-PIPE-TIMING-1: batch wall per frame minus processed16_total (clip open, pipe write, ffmpeg back-pressure, finish and verify) is not timed per stage by the app",
+  "drainVerify": "EXPORT-RENDER-PIPE-TIMING-1: the rendered path times no drain or verify stage",
+  "largestStage": "debayered_frame"
+ }
+}
