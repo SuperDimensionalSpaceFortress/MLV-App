@@ -645,8 +645,18 @@ class HelperBehaviourTests(unittest.TestCase):
         result = self._run(str(out), extra_env={"PYTHONUSERBASE": str(userbase)})
         self.assertTrue(result["ok"], result)
         text = _normalised(HELPER_MODULE)
-        self.assertIn("if ([string]$name -like 'PYTHON*') { [void]$psi.Environment.Remove([string]$name) }", text)
+        self.assertIn("if ([string]$name -like 'PYTHON*' -or [string]$name -like 'PYLAUNCHER*') { [void]$psi.Environment.Remove([string]$name) }", text)
         self.assertIn("$psi.Environment['PYTHONNOUSERSITE'] = '1'", text)
+
+    def test_an_inherited_launcher_dry_run_still_runs_the_extractor(self) -> None:
+        # PR 862 r16 (adversary d92aff88-A2): PYLAUNCHER_DRYRUN=1 makes py.exe print the command it would run and exit 0 without starting
+        # Python, so a valid install got no JSON report and the callers refused it. No PYLAUNCHER_* variable reaches the child now.
+        out = self.tmp / "out"
+        out.mkdir()
+        # (A launcher too old to know PYLAUNCHER_DRYRUN passes this trivially; the dry-run launcher is what makes the old code fail.)
+        result = self._run(str(out), extra_env={"PYLAUNCHER_DRYRUN": "1"})
+        self.assertTrue(result["ok"], result)
+        self.assertTrue((out / "ffmpeg.exe").is_file())
 
     def test_a_system_sitecustomize_that_prints_never_corrupts_the_report(self) -> None:
         # PR 862 r16 (sol r15 A3, the class of e9d903be-A5 one layer down): a SYSTEM sitecustomize prints even with PYTHONNOUSERSITE=1 and

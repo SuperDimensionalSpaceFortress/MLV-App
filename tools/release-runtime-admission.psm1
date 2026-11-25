@@ -517,8 +517,11 @@ function Invoke-PinnedPayloadInstall {
     # PR 862 r11 (adversary e9d903be-A5, same class as bf1ac39c-A6: inherited Python startup state corrupting the child's report): NO
     # inherited PYTHON* variable reaches the child (PYTHONUSERBASE aiming at a usercustomize that prints, PYTHONINSPECT, PYTHONVERBOSE,
     # ...), and the user site is off, so the child's stdout carries the extractor's report alone. Only the values set below remain.
+    # PR 862 r16 (adversary d92aff88-A2, the launcher layer of sol r15 A3): the py.exe launcher has its own startup variables.
+    # PYLAUNCHER_DRYRUN=1 makes it print the command it would run and exit 0 BEFORE Python starts, so an inherited one gave a valid
+    # install no child at all and a report-less exit 0. No PYLAUNCHER_* variable reaches the child either.
     foreach ($name in @($psi.Environment.Keys)) {
-        if ([string]$name -like 'PYTHON*') { [void]$psi.Environment.Remove([string]$name) }
+        if ([string]$name -like 'PYTHON*' -or [string]$name -like 'PYLAUNCHER*') { [void]$psi.Environment.Remove([string]$name) }
     }
     $psi.Environment['PYTHONNOUSERSITE'] = '1'
     $psi.Environment['PYTHONDONTWRITEBYTECODE'] = '1'
