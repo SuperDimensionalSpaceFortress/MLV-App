@@ -692,5 +692,32 @@ class MatrixRowStrictPredicateTests(unittest.TestCase):
         self.assertIn("hostLoadCollected = ($hl.collected -is [bool] -and $hl.collected)", baseline, "the baseline row keeps the standing's collected too")
 
 
+@unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+class VenueChainImportResolvesTests(unittest.TestCase):
+    """adversary-07b6a932.json A1: every `Import-Module ...VenueChain.psm1 -Function <names>` in tools/profiling imports names
+    the module actually exports. A name the module does not export imports nothing and fails only at call time (CommandNotFound),
+    which a caller's catch then mistakes for a parse failure."""
+
+    def test_adversary_r1b_a1_every_profiling_import_of_venuechain_resolves_each_named_function(self) -> None:
+        import re
+        pattern = re.compile(r"Import-Module \(Join-Path \$PSScriptRoot 'dual-venue\\VenueChain\.psm1'\) -Function (.+?) -DisableNameChecking")
+        sites = []
+        for script in sorted((ROOT / "tools" / "profiling").glob("*.ps1")):
+            for m in pattern.finditer(script.read_text(encoding="utf-8")):
+                sites.append((script.name, [n.strip() for n in m.group(1).split(",")]))
+        self.assertGreaterEqual(len(sites), 5, sites)
+        names = sorted({n for _, ns in sites for n in ns})
+        body = ("Remove-Module VenueChain -ErrorAction SilentlyContinue; Import-Module '" + str(MODULE) + "' -Function " + ", ".join(names)
+                + " -DisableNameChecking -Force; foreach ($n in @(" + ", ".join("'" + n + "'" for n in names) + ")) {"
+                " Write-Output ($n + '=' + [bool](Get-Command $n -ErrorAction SilentlyContinue)) }")
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", body],
+                           capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        for script, ns in sites:
+            for n in ns:
+                with self.subTest(script=script, name=n):
+                    self.assertIn(n + "=True", p.stdout, f"{script} imports {n} from VenueChain.psm1, which does not export it")
+
+
 if __name__ == "__main__":
     unittest.main()
