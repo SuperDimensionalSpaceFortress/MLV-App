@@ -445,19 +445,18 @@ function Get-PlaybackAbLegHostLoadProvisional {
     if ($null -eq $Leg) {
         return $true
     }
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B1): the ONE strict predicate (state exactly 'quiet' ordinal, provisional a real [bool]
+    # $false, hostLoadCollected a real [bool] $true); [bool] coercion read provisional 0 / [false] as clean, -ne read 'QUIET' as quiet, and an
+    # uncollected leg was never checked. Values are assigned directly from PSObject.Properties, never coerced.
+    if ($Leg -is [System.Collections.IList]) { return $true }
+    $legProvisionalRaw = $null; $legStateRaw = $null; $legCollectedRaw = $null
     $provisionalProperty = $Leg.PSObject.Properties["hostLoadProvisional"]
-    $provisionalDeclared = if ($null -eq $provisionalProperty -or $null -eq $provisionalProperty.Value) {
-        $true
-    } else {
-        [bool]$provisionalProperty.Value
-    }
+    if ($null -ne $provisionalProperty) { $legProvisionalRaw = $provisionalProperty.Value }
     $stateProperty = $Leg.PSObject.Properties["hostLoadState"]
-    $state = if ($null -eq $stateProperty -or [string]::IsNullOrWhiteSpace([string]$stateProperty.Value)) {
-        "unknown"
-    } else {
-        [string]$stateProperty.Value
-    }
-    ($provisionalDeclared -or $state -ne "quiet")
+    if ($null -ne $stateProperty) { $legStateRaw = $stateProperty.Value }
+    $collectedProperty = $Leg.PSObject.Properties["hostLoadCollected"]
+    if ($null -ne $collectedProperty) { $legCollectedRaw = $collectedProperty.Value }
+    -not ($legProvisionalRaw -is [bool] -and -not $legProvisionalRaw -and $legStateRaw -is [string] -and [string]::Equals($legStateRaw, 'quiet', [StringComparison]::Ordinal) -and $legCollectedRaw -is [bool] -and $legCollectedRaw)
 }
 
 function Get-PlaybackAbHostLoadRefusal {

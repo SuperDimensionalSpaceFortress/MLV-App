@@ -32,6 +32,41 @@ function Read-SmokeJson {
     Get-Content -LiteralPath $resolved -Raw | ConvertFrom-Json -Depth 100
 }
 
+function Read-SmokeSourceOnce {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B2): the comparator's ONE read of a smoke file. One ReadAllBytes feeds both the parse (the
+    # figures) and the strict host-load reader (the text). A text the parser refuses (keys differing only in case, malformed JSON) does not throw: the
+    # figures object is empty and parseError says why, so the caller records a typed failure and the host-load reader still judges the same text.
+    param([string]$Path)
+
+    $resolved = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+        throw "Smoke JSON not found: $resolved"
+    }
+    $bytes = [IO.File]::ReadAllBytes($resolved)
+    $text = [Text.Encoding]::UTF8.GetString($bytes)
+    $parseText = if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text.Substring(1) } else { $text }
+    $smoke = $null
+    $parseError = $null
+    try {
+        $smoke = ConvertFrom-Json -InputObject $parseText -Depth 100
+    }
+    catch {
+        $parseError = ($_.Exception.Message -replace '\s+', ' ')
+    }
+    if ($null -eq $smoke -or $smoke -is [System.Collections.IList]) {
+        if ($null -eq $parseError) { $parseError = 'the smoke JSON is not one object' }
+        $smoke = [pscustomobject]@{}
+    }
+    [pscustomobject]@{
+        path = $resolved
+        text = $text
+        smoke = $smoke
+        parseError = $parseError
+        sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+        length = [int64]$bytes.Length
+    }
+}
+
 function Resolve-ExistingFileBinding {
     param(
         [object]$Path,
@@ -227,10 +262,17 @@ function Get-LegEvidenceBinding {
     param(
         [string]$Name,
         [object]$Smoke,
-        [string]$JsonPath
+        [string]$JsonPath,
+        [object]$JsonSource
     )
 
-    $json = Resolve-ExistingFileBinding -Path $JsonPath -Label "$Name smoke JSON"
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B2): the smoke JSON's binding comes from the comparator's one read (Read-SmokeSourceOnce) when
+    # given, so the file is not opened a second time to hash it.
+    $json = if ($null -ne $JsonSource) {
+        [pscustomobject]@{ path = [string]$JsonSource.path; sha256 = [string]$JsonSource.sha256; length = [int64]$JsonSource.length }
+    } else {
+        Resolve-ExistingFileBinding -Path $JsonPath -Label "$Name smoke JSON"
+    }
     if ([string](Get-NestedValue $Smoke "schema") -ne "mlvapp-gui-smoke-result.v2") {
         throw "$Name smoke result schema is not mlvapp-gui-smoke-result.v2."
     }
@@ -873,16 +915,18 @@ function Compare-SmokeScreenshots {
     }
 }
 
-$beforeSmoke = Read-SmokeJson -Path $Before
-$afterSmoke = Read-SmokeJson -Path $After
-$beforeJsonPath = (Resolve-Path -LiteralPath $Before).Path
-$afterJsonPath = (Resolve-Path -LiteralPath $After).Path
-# adversary-fa329743.json A1: each smoke file's text is read ONCE, and both the figures and the host-load verdict come from that one text. A file
-# replaced (or locked) after this read changes nothing below; the object read above is re-derived from the same text.
-$beforeSmokeText = [IO.File]::ReadAllText($beforeJsonPath)
-$afterSmokeText = [IO.File]::ReadAllText($afterJsonPath)
-$beforeSmoke = $beforeSmokeText | ConvertFrom-Json -Depth 100
-$afterSmoke = $afterSmokeText | ConvertFrom-Json -Depth 100
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B2): each smoke file is opened ONCE (Read-SmokeSourceOnce: one ReadAllBytes); the figures and the
+# host-load verdict both come from that one text, so a file locked or replaced after the read changes nothing. A text ConvertFrom-Json refuses
+# (hostLoad beside HostLoad: KeysWithDifferentCasingInJsonString) is no throw: its figures read empty, a typed failure names it, and the strict host-load
+# reader judges the same text unknown (a repeated member), so the comparison is INCONCLUSIVE with REFERENCE_PROVISIONAL, never an abort.
+$beforeSource = Read-SmokeSourceOnce -Path $Before
+$afterSource = Read-SmokeSourceOnce -Path $After
+$beforeJsonPath = $beforeSource.path
+$afterJsonPath = $afterSource.path
+$beforeSmokeText = $beforeSource.text
+$afterSmokeText = $afterSource.text
+$beforeSmoke = $beforeSource.smoke
+$afterSmoke = $afterSource.smoke
 $resolvedOutput = $null
 if (-not [string]::IsNullOrWhiteSpace($Output)) {
     $resolvedOutput = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Output)
@@ -899,6 +943,13 @@ $screenshotCompare = Compare-SmokeScreenshots `
     -RequestedSampleStep $SampleStep
 
 $failures = @()
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B2): a smoke text the parser refused is a typed failure (its figures read empty); the host-load
+# reader below judges the same text, and an ambiguous hostLoad/HostLoad member reads unknown, so the verdict is INCONCLUSIVE.
+foreach ($sourceLeg in @([pscustomobject]@{ Name = 'before'; Source = $beforeSource }, [pscustomobject]@{ Name = 'after'; Source = $afterSource })) {
+    if ($null -ne $sourceLeg.Source.parseError) {
+        $failures += "$($sourceLeg.Name) smoke JSON could not be parsed (ambiguous or malformed member): $($sourceLeg.Source.parseError)"
+    }
+}
 $declaredBeforeCommit = [string](Get-NestedValue $beforeSmoke "log.runMetadata.build_sha")
 $declaredAfterCommit = [string](Get-NestedValue $afterSmoke "log.runMetadata.build_sha")
 if (-not [string]::IsNullOrWhiteSpace($declaredBeforeCommit) -and
@@ -920,9 +971,9 @@ catch {
 $evidenceBindings = $null
 try {
     $beforeBinding = Get-LegEvidenceBinding `
-        -Name "before" -Smoke $beforeSmoke -JsonPath $beforeJsonPath
+        -Name "before" -Smoke $beforeSmoke -JsonPath $beforeJsonPath -JsonSource $beforeSource
     $afterBinding = Get-LegEvidenceBinding `
-        -Name "after" -Smoke $afterSmoke -JsonPath $afterJsonPath
+        -Name "after" -Smoke $afterSmoke -JsonPath $afterJsonPath -JsonSource $afterSource
     $evidenceBindings = [pscustomobject]@{
         before = $beforeBinding
         after = $afterBinding

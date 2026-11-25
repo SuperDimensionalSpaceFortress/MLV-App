@@ -583,7 +583,12 @@ class MatrixRowStrictPredicateTests(unittest.TestCase):
                 "exceeded": "hostLoadState = 'exceeded'; hostLoadProvisional = $false", "upper": "hostLoadState = 'QUIET'; hostLoadProvisional = $false",
                 "na": "hostLoadState = 'not-applicable'; hostLoadProvisional = $false", "zero": "hostLoadState = 'quiet'; hostLoadProvisional = 0",
                 "arr": "hostLoadState = 'quiet'; hostLoadProvisional = @($false)", "str": "hostLoadState = 'quiet'; hostLoadProvisional = 'false'",
-                "quiet": "hostLoadState = 'quiet'; hostLoadProvisional = $false"}
+                # residue r1 (sol r6 B3): collected is part of the one rule; only the collected quiet row is clean
+                "uncollected": "hostLoadState = 'quiet'; hostLoadProvisional = $false; hostLoadCollected = $false",
+                "nocollected": "hostLoadState = 'quiet'; hostLoadProvisional = $false",
+                "collected1": "hostLoadState = 'quiet'; hostLoadProvisional = $false; hostLoadCollected = 1",
+                "collectedarr": "hostLoadState = 'quiet'; hostLoadProvisional = $false; hostLoadCollected = @($true)",
+                "quiet": "hostLoadState = 'quiet'; hostLoadProvisional = $false; hostLoadCollected = $true"}
         body = "".join(f"Write-Output ('{k}=' + (Get-DvMatrixMeasuredCount -Rows @([pscustomobject]@{{ outcome = 'PASS'; presentedFps = 59.56; {v} }})) + ',' + "
                        f"(Test-DvHostLoadRowClean -Row ([ordered]@{{ status = 'RAN'; fps = 42; {v} }}))); " for k, v in rows.items())
         got = dict(l.split("=", 1) for l in self.run_dv(body).splitlines() if "=" in l)
@@ -613,6 +618,37 @@ class MatrixRowStrictPredicateTests(unittest.TestCase):
         self.assertNotIn("59.56", table, "an unknown row never reaches the median")
         baseline = (DV_DIR / "Invoke-VenueBaseline.ps1").read_text(encoding="utf-8")
         self.assertIn("$_.status -ceq 'RAN' -and $null -ne $_.fps -and (Test-DvHostLoadRowClean -Row $_)", baseline)
+
+    def test_residue_b3_the_row_builder_keeps_collected_false_and_the_row_is_never_measured(self) -> None:
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B3, its catalogue addition): -HostLoad @{state='quiet'; provisional=$false; collected=$false;
+        # applies=$true} gave a row with provisional false and a measured count of 1 (the builder dropped collected); Get-VenueReferenceHostLoadRefusal
+        # refused the identical standing. The row now keeps hostLoadCollected=false, reads provisional, and is never counted or in a median.
+        for name, standing in (("pscustomobject", "[pscustomobject]@{ state = 'quiet'; provisional = $false; collected = $false; applies = $true }"),
+                               ("hashtable", "@{ state = 'quiet'; provisional = $false; collected = $false; applies = $true }"),
+                               ("collected-array", "[pscustomobject]@{ state = 'quiet'; provisional = $false; collected = @($true); applies = $true }")):
+            with self.subTest(standing=name):
+                out = self.run_dv(
+                    "$e = [pscustomobject]@{ seq = 1; repeat = 1; cellId = 'c1'; backend = 'cuda'; displayMode = 'fullscreen'; scaleFactor = 1; legId = 'l' }; "
+                    f"$r = Get-DvMatrixRow -PlanEntry $e -Receipt $null -HostLoad ({standing}); "
+                    "Write-Output ('ROWPROV=' + $r.hostLoadProvisional + ' ROWCOLL=' + $r.hostLoadCollected); "
+                    "$full = [ordered]@{}; foreach ($p in $r.PSObject.Properties) { $full[$p.Name] = $p.Value }; "
+                    "$full.outcome = 'PASS'; $full.presentedFps = 59.56; $full.timelineFpsAfterFirstPresent = 59.0; $full.hostLoadProvisional = $false; "
+                    "$rows = @([pscustomobject]$full); "
+                    "Write-Output ('N=' + (Get-DvMatrixMeasuredCount -Rows $rows)); "
+                    "$t = ConvertTo-DvMatrixTable -Rows $rows -Cells @([pscustomobject]@{ cellId = 'c1'; backend = 'cuda'; displayMode = 'fullscreen'; scaleFactor = 1 }); "
+                    "Write-Output ('TABLE=' + (@(@($t) -join \"`n\" -split \"`r?`n\") | Where-Object { $_ -like '| c1 |*' }))")
+                self.assertIn("ROWPROV=True ROWCOLL=False", out, out)
+                self.assertIn("N=0", out, "a row whose standing said collected=false is never measured, even when its provisional is later read false")
+                table = [l for l in out.splitlines() if l.startswith("TABLE=")][-1]
+                self.assertIn("| 0/1 |", table, table)
+                self.assertNotIn("59.56", table, "an uncollected row never reaches the median")
+        # the collected quiet standing is still a clean row (the regression guard)
+        out = self.run_dv("$e = [pscustomobject]@{ seq = 1; repeat = 1; cellId = 'c1'; backend = 'cuda'; displayMode = 'fullscreen'; scaleFactor = 1; legId = 'l' }; "
+                          "$r = Get-DvMatrixRow -PlanEntry $e -Receipt $null -HostLoad ([pscustomobject]@{ state = 'quiet'; provisional = $false; collected = $true; applies = $true }); "
+                          "Write-Output ('ROWPROV=' + $r.hostLoadProvisional + ' ROWCOLL=' + $r.hostLoadCollected)")
+        self.assertIn("ROWPROV=False ROWCOLL=True", out)
+        baseline = (DV_DIR / "Invoke-VenueBaseline.ps1").read_text(encoding="utf-8")
+        self.assertIn("hostLoadCollected = ($hl.collected -is [bool] -and $hl.collected)", baseline, "the baseline row keeps the standing's collected too")
 
 
 if __name__ == "__main__":

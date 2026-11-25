@@ -217,10 +217,11 @@ function Get-SmokeSummaryHostLoadFields {
     # standalone .ps1 with no shared module, hence the duplicate rather than an import).
     param([object]$HostLoad)
 
-    if ($null -eq $HostLoad) {
+    if ($null -eq $HostLoad -or $HostLoad -is [System.Collections.IList] -or $HostLoad -is [string] -or $HostLoad -is [ValueType]) {
         return [pscustomobject]@{
             provisional = $true
             state = "unknown"
+            collected = $false
             reason = "no hostLoad telemetry recorded in the smoke result"
         }
     }
@@ -234,25 +235,32 @@ function Get-SmokeSummaryHostLoadFields {
     # compare-machine-perf.ps1's Get-PlaybackAbLegHostLoadProvisional for the full cross-file
     # note): clean iff state=="quiet" AND provisional==false; every other combination is
     # provisional.
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B1): THE ONE STRICT PREDICATE (VenueChain.psm1 Get-VenueReferenceHostLoadRefusal's rule):
+    # clean iff state is exactly 'quiet' (ordinal), provisional a real [bool] $false, and before.collected and after.collected both a real [bool] $true.
+    # Values are assigned directly from PSObject.Properties (never through a function return or an if-expression, which unroll a one-element array).
+    $provisionalRaw = $null; $stateRaw = $null; $beforeCollectedRaw = $null; $afterCollectedRaw = $null
     $provisionalProperty = $HostLoad.PSObject.Properties["provisional"]
-    $provisionalDeclared = if ($null -eq $provisionalProperty -or $null -eq $provisionalProperty.Value) {
-        $true
-    } else {
-        [bool]$provisionalProperty.Value
-    }
+    if ($null -ne $provisionalProperty) { $provisionalRaw = $provisionalProperty.Value }
     $stateProperty = $HostLoad.PSObject.Properties["state"]
-    $state = if ($null -eq $stateProperty -or [string]::IsNullOrWhiteSpace([string]$stateProperty.Value)) {
-        "unknown"
-    } else {
-        [string]$stateProperty.Value
+    if ($null -ne $stateProperty) { $stateRaw = $stateProperty.Value }
+    foreach ($side in 'before', 'after') {
+        $snapProperty = $HostLoad.PSObject.Properties[$side]
+        $snap = $null; if ($null -ne $snapProperty) { $snap = $snapProperty.Value }
+        if ($null -eq $snap -or $snap -is [System.Collections.IList] -or $snap -is [string] -or $snap -is [ValueType]) { continue }
+        $collectedProperty = $snap.PSObject.Properties["collected"]
+        if ($null -eq $collectedProperty) { continue }
+        if ($side -eq 'before') { $beforeCollectedRaw = $collectedProperty.Value } else { $afterCollectedRaw = $collectedProperty.Value }
     }
-    $provisional = ($provisionalDeclared -or $state -ne "quiet")
+    $collectedRaw = ($beforeCollectedRaw -is [bool] -and $beforeCollectedRaw -and $afterCollectedRaw -is [bool] -and $afterCollectedRaw)
+    $provisional = -not ($provisionalRaw -is [bool] -and -not $provisionalRaw -and $stateRaw -is [string] -and [string]::Equals($stateRaw, 'quiet', [StringComparison]::Ordinal) -and $collectedRaw -is [bool] -and $collectedRaw)
+    $state = if ($stateRaw -is [string] -and -not [string]::IsNullOrWhiteSpace($stateRaw)) { $stateRaw } else { "unknown" }
     $reasonProperty = $HostLoad.PSObject.Properties["reason"]
     $reason = if ($null -eq $reasonProperty) { $null } else { [string]$reasonProperty.Value }
 
     [pscustomobject]@{
         provisional = $provisional
         state = $state
+        collected = $collectedRaw
         reason = $reason
     }
 }
@@ -677,21 +685,16 @@ function Import-EvidencePacket {
                 # (identical at every one of this card's readers -- see compare-machine-perf.ps1's
                 # Get-PlaybackAbLegHostLoadProvisional for the full cross-file note): clean iff
                 # state=="quiet" AND provisional==false; every other combination is provisional.
+                # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B1): the ONE strict predicate on the clip row (hostLoadState exactly 'quiet',
+                # hostLoadProvisional a real [bool] $false, hostLoadCollected a real [bool] $true); values assigned directly, never coerced.
+                $clipHostLoadProvisionalRaw = $null; $clipHostLoadStateRaw = $null; $clipHostLoadCollectedRaw = $null
                 $clipHostLoadProvisionalProperty = $clip.PSObject.Properties["hostLoadProvisional"]
-                $clipHostLoadProvisionalDeclared = if ($null -eq $clipHostLoadProvisionalProperty -or
-                    $null -eq $clipHostLoadProvisionalProperty.Value) {
-                    $true
-                } else {
-                    [bool]$clipHostLoadProvisionalProperty.Value
-                }
+                if ($null -ne $clipHostLoadProvisionalProperty) { $clipHostLoadProvisionalRaw = $clipHostLoadProvisionalProperty.Value }
                 $clipHostLoadStateProperty = $clip.PSObject.Properties["hostLoadState"]
-                $clipHostLoadState = if ($null -eq $clipHostLoadStateProperty -or
-                    [string]::IsNullOrWhiteSpace([string]$clipHostLoadStateProperty.Value)) {
-                    "unknown"
-                } else {
-                    [string]$clipHostLoadStateProperty.Value
-                }
-                $clipHostLoadProvisional = ($clipHostLoadProvisionalDeclared -or $clipHostLoadState -ne "quiet")
+                if ($null -ne $clipHostLoadStateProperty) { $clipHostLoadStateRaw = $clipHostLoadStateProperty.Value }
+                $clipHostLoadCollectedProperty = $clip.PSObject.Properties["hostLoadCollected"]
+                if ($null -ne $clipHostLoadCollectedProperty) { $clipHostLoadCollectedRaw = $clipHostLoadCollectedProperty.Value }
+                $clipHostLoadProvisional = -not ($clipHostLoadProvisionalRaw -is [bool] -and -not $clipHostLoadProvisionalRaw -and $clipHostLoadStateRaw -is [string] -and [string]::Equals($clipHostLoadStateRaw, 'quiet', [StringComparison]::Ordinal) -and $clipHostLoadCollectedRaw -is [bool] -and $clipHostLoadCollectedRaw)
                 if ($clipHostLoadProvisional) {
                     Add-Failure $importFailures "$clipName host load was PROVISIONAL or unrecorded (hostLoadProvisional=$clipHostLoadProvisional); an fps number measured under provisional host load is not proof of speed, regardless of the floor."
                 }
@@ -1264,7 +1267,7 @@ exit `$LASTEXITCODE
         # that dragged presented_fps under the hard floor was recorded as a genuine clipFailures
         # entry, conflating "we couldn't get a clean signal" with "the build is broken", exactly
         # backwards from this card's own rule that host load MARKS, never fails, a run.
-        $hostLoadFields = Get-SmokeSummaryHostLoadFields -HostLoad $(if ($result) { $result.hostLoad } else { $null })
+        $hostLoadFields = Get-SmokeSummaryHostLoadFields -HostLoad $(if ($result) { , $result.hostLoad } else { $null })
 
         if ($receiptRawFixesEnabled) {
             if ($noReadbackFrames -le 0) {
@@ -1394,6 +1397,7 @@ exit `$LASTEXITCODE
             timelineFps = if ($result) { $result.log.summary.timeline_fps } else { $null }
             hostLoadProvisional = $hostLoadFields.provisional
             hostLoadState = $hostLoadFields.state
+            hostLoadCollected = $hostLoadFields.collected
             hostLoadReason = $hostLoadFields.reason
             gpuTextureNoReadbackFrames = $noReadbackFrames
             gpuTextureReadbackFrames = $textureReadbackFrames

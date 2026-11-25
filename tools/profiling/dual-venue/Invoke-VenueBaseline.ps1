@@ -475,6 +475,8 @@ foreach ($b in $StandardBackends) {
                 outcome = $legOutcome; fps = $fig.fps; drops = $fig.drops; stall = $fig.stall; receiptVerification = $fig.verification
                 receiptPath = $(if ($leg.PSObject.Properties['receipt'] -and $leg.receipt) { [string]$leg.receipt } else { $null }); buildManifestSha256 = $manifest; runDir = $RunDir; hubLoad = $null
                 hostLoadState = [string]$hl.state; hostLoadProvisional = [bool]$hl.provisional
+                # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B3): the row keeps the standing's collected (Test-DvHostLoadRowClean requires a real $true)
+                hostLoadCollected = ($hl.collected -is [bool] -and $hl.collected)
             })
         }
     }
@@ -522,7 +524,8 @@ if ($rows.Count -gt 0) {
 }
 # I3: a run in which no row carries a figure is never OK. It keeps exit 0 (the BASELINE-EXIT-NO-MEASUREMENT-1 behaviour) under its own token.
 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): a row is measured only when its hostLoadProvisional is the boolean false (a provisional or unknown leg is never counted).
-# r6 (sol r5 B3): the same strict row predicate as the matrix (DualVenueRunner.psm1 Test-DvHostLoadRowClean: state exactly 'quiet' AND provisional a real $false).
+# r6 (sol r5 B3): the same strict row predicate as the matrix (DualVenueRunner.psm1 Test-DvHostLoadRowClean: state exactly 'quiet' AND provisional a real $false,
+# and since residue r1 (sol r6 B3) hostLoadCollected a real $true).
 $measuredRows = @($rows | Where-Object { $_.status -ceq 'RAN' -and $null -ne $_.fps -and (Test-DvHostLoadRowClean -Row $_) }).Count
 $reason = $(if ($typed) { $typed.reason } elseif ($measuredRows -eq 0) { 'NO_MEASUREMENT' } else { 'OK' })
 $code = [int]$ExitCodes[$reason]

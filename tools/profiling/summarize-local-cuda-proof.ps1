@@ -670,15 +670,16 @@ else {
     # provisional.
     $playbackAbHostLoadProvisional = $false
     foreach ($legEntry in $playbackAbHostLoadLegs) {
-        $legProvisionalValue = Get-Field $legEntry.Leg "hostLoadProvisional"
-        $legProvisionalDeclared = if ($null -eq $legProvisionalValue) { $true } else { [bool]$legProvisionalValue }
-        $legStateValue = Get-Field $legEntry.Leg "hostLoadState"
-        $legState = if ($null -eq $legStateValue -or [string]::IsNullOrWhiteSpace([string]$legStateValue)) {
-            "unknown"
-        } else {
-            [string]$legStateValue
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B1): the ONE strict predicate (hostLoadState exactly 'quiet' ordinal, hostLoadProvisional
+        # a real [bool] $false, hostLoadCollected a real [bool] $true). Members are assigned directly from PSObject.Properties (Get-Field's return
+        # would unroll [false] into $false), and nothing is coerced.
+        $legProvisionalRaw = $null; $legStateRaw = $null; $legCollectedRaw = $null
+        if ($null -ne $legEntry.Leg -and $legEntry.Leg -isnot [System.Collections.IList]) {
+            $legProperty = $legEntry.Leg.PSObject.Properties["hostLoadProvisional"]; if ($null -ne $legProperty) { $legProvisionalRaw = $legProperty.Value }
+            $legProperty = $legEntry.Leg.PSObject.Properties["hostLoadState"]; if ($null -ne $legProperty) { $legStateRaw = $legProperty.Value }
+            $legProperty = $legEntry.Leg.PSObject.Properties["hostLoadCollected"]; if ($null -ne $legProperty) { $legCollectedRaw = $legProperty.Value }
         }
-        $legProvisional = ($legProvisionalDeclared -or $legState -ne "quiet")
+        $legProvisional = -not ($legProvisionalRaw -is [bool] -and -not $legProvisionalRaw -and $legStateRaw -is [string] -and [string]::Equals($legStateRaw, 'quiet', [StringComparison]::Ordinal) -and $legCollectedRaw -is [bool] -and $legCollectedRaw)
         if ($legProvisional) {
             $playbackAbHostLoadProvisional = $true
             [void]$playbackAbBlockers.Add("playback A/B $($legEntry.Name) leg host load was PROVISIONAL or unrecorded")

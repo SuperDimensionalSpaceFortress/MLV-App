@@ -3113,12 +3113,24 @@ function Get-DvMatrixRow {
         requestedDisplay = $PlanEntry.displayMode; observedDisplay = 'UNKNOWN'; requestedScale = $PlanEntry.scaleFactor; effectiveScale = 'UNKNOWN'
         windowSize = $null; previewSize = $null; outcome = 'NO_RECEIPT'; receiptId = $null
         presentedFps = $null; timelineFpsAfterFirstPresent = $null; renderWorkMs = $null; dualIsoMs = $null; note = $null
-        hostLoadState = 'unknown'; hostLoadProvisional = $true
+        hostLoadState = 'unknown'; hostLoadProvisional = $true; hostLoadCollected = $false
     }
-    $hlState = Get-DvProp $HostLoad 'state'; $hlProv = Get-DvProp $HostLoad 'provisional'
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B3): the standing's members are read without unrolling (Get-DvProp returns through the pipeline)
+    $hlState = $null; $hlProv = $null; $hlColl = $null
+    if ($null -ne $HostLoad -and $HostLoad -isnot [System.Collections.IList]) {
+        foreach ($hlName in 'state', 'provisional', 'collected') {
+            $hlVal = $null
+            if ($HostLoad -is [System.Collections.IDictionary]) { if ($HostLoad.Contains($hlName)) { $hlVal = $HostLoad[$hlName] } }
+            else { $hlP = $HostLoad.PSObject.Properties[$hlName]; if ($null -ne $hlP) { $hlVal = $hlP.Value } }
+            switch ($hlName) { 'state' { $hlState = $hlVal } 'provisional' { $hlProv = $hlVal } 'collected' { $hlColl = $hlVal } }
+        }
+    }
     if ($hlState -is [string] -and [regex]::IsMatch($hlState, '\A[a-z][a-z_-]{0,31}\z')) { $row.hostLoadState = $hlState }
-    # r6 (sol r5 B3): provisional unless the standing is clean by Test-DvHostLoadRowClean's rule (state exactly 'quiet' AND provisional a real $false)
-    $row.hostLoadProvisional = -not ($hlProv -is [bool] -and -not $hlProv -and $hlState -is [string] -and [string]::Equals($hlState, 'quiet', [StringComparison]::Ordinal))
+    # r1 (sol r6 B3): the row keeps the standing's collected (only a real $true is collected), so collected=false is never dropped on the way to the count
+    $row.hostLoadCollected = ($hlColl -is [bool] -and $hlColl)
+    # r6 (sol r5 B3) + residue r1 (sol r6 B3): provisional unless the standing is clean by Test-DvHostLoadRowClean's rule (state exactly 'quiet', provisional
+    # a real $false AND collected a real $true): the rule Get-VenueReferenceHostLoadRefusal applies to the same standing
+    $row.hostLoadProvisional = -not ($hlProv -is [bool] -and -not $hlProv -and $hlState -is [string] -and [string]::Equals($hlState, 'quiet', [StringComparison]::Ordinal) -and $hlColl -is [bool] -and $hlColl)
     if ($null -eq $Receipt) { $row.note = 'the leg wrote no receipt'; return [pscustomobject]$row }
     $row.outcome = [string](Get-DvProp $Receipt 'outcome'); $row.receiptId = [string](Get-DvProp $Receipt 'receiptId')
     # r6 (sol r5 B1): a visual twin's rates are never read, whichever path its plan entry or receipt came through (the entry's leg id and the receipt's leg id both count)
@@ -3170,11 +3182,20 @@ function Test-DvHostLoadRowClean {
     hostLoadState is exactly the string 'quiet' (ordinal) AND hostLoadProvisional is a real [bool] $false. Anything else (unknown, exceeded, not-applicable,
     missing, 'QUIET', provisional 0, 'false', [false] or absent) is not clean. Pure.
     #>
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B3): and hostLoadCollected a real [bool] $true (Get-DvMatrixRow and the baseline row carry it), so a
+    # row whose standing said collected=false is never measured and never in a median, the same refusal as VenueChain.psm1 Get-VenueReferenceHostLoadRefusal.
+    # Members are read without unrolling (a [false] is an array, never the boolean inside it).
     param([AllowNull()]$Row)
-    if ($null -eq $Row) { return $false }
-    $st = Get-DvProp $Row 'hostLoadState'; $prov = Get-DvProp $Row 'hostLoadProvisional'
+    if ($null -eq $Row -or $Row -is [System.Collections.IList]) { return $false }
+    $st = $null; $prov = $null; $coll = $null
+    foreach ($rn in 'hostLoadState', 'hostLoadProvisional', 'hostLoadCollected') {
+        $rv = $null
+        if ($Row -is [System.Collections.IDictionary]) { if ($Row.Contains($rn)) { $rv = $Row[$rn] } }
+        else { $rp = $Row.PSObject.Properties[$rn]; if ($null -ne $rp) { $rv = $rp.Value } }
+        switch ($rn) { 'hostLoadState' { $st = $rv } 'hostLoadProvisional' { $prov = $rv } 'hostLoadCollected' { $coll = $rv } }
+    }
     # adversary-de8e3799.json A5: ordinal, never -ceq (culture-aware: 'qui<soft hyphen>et' -ceq 'quiet' is true)
-    ($st -is [string]) -and [string]::Equals($st, 'quiet', [StringComparison]::Ordinal) -and ($prov -is [bool]) -and (-not $prov)
+    ($st -is [string]) -and [string]::Equals($st, 'quiet', [StringComparison]::Ordinal) -and ($prov -is [bool]) -and (-not $prov) -and ($coll -is [bool]) -and $coll
 }
 
 function ConvertTo-DvMatrixHostLoadTable {

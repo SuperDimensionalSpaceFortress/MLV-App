@@ -1640,8 +1640,51 @@ class CompareGuiSmokeAbInconclusiveVerdictTests(_ProbeCase):
         # fable key3 r5 (GUI-SMOKE-AB-INCONCLUSIVE-WITHHOLD-DELTA-1): an INCONCLUSIVE verdict withholds the cross-leg fps deltas
         self.assertIn("if ($displayComparability.status -ne 'same' -or [string]::Equals([string]$result.verdict, 'INCONCLUSIVE', [StringComparison]::Ordinal)) {", text)
 
+    def _run_comparator(self, before_text: str, after_text: str) -> tuple[subprocess.CompletedProcess, dict | None]:
+        with tempfile.TemporaryDirectory(prefix="gui-ab-entry-") as tmp:
+            before, after, out = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "out" / "compare.json"
+            before.write_text(before_text, encoding="utf-8", newline="")
+            after.write_text(after_text, encoding="utf-8", newline="")
+            proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(COMPARE_SCRIPT),
+                                   "-Before", str(before), "-After", str(after), "-Output", str(out)],
+                                  capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=300)
+            report = json.loads(out.read_text(encoding="utf-8-sig")) if out.is_file() else None
+        return proc, report
+
+    def test_residue_b2_a_case_ambiguous_host_load_member_is_a_typed_inconclusive_not_a_throw(self) -> None:
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B2, its catalogue addition): a control JSON object with both hostLoad and HostLoad threw
+        # KeysWithDifferentCasingInJsonString at the entry point's first parse, before the strict reader (which reads those bytes unknown) ran, so the
+        # comparison aborted with no verdict and no report. Now: a typed failure, REFERENCE_PROVISIONAL leg=before, verdict INCONCLUSIVE, exit 1.
+        quiet = '{"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}'
+        for name, control in (("null-and-object", '{"hostLoad":null,"HostLoad":{}}'),
+                              ("two-quiet-spellings", '{"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}},'
+                                                      '"HostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}')):
+            with self.subTest(control=name):
+                proc, report = self._run_comparator(control, quiet)
+                self.assertNotIn("KeysWithDifferentCasing", proc.stderr, proc.stdout + proc.stderr)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("REFERENCE_PROVISIONAL leg=before reason=hostload-unknown", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIn("GUI-SMOKE-AB verdict=INCONCLUSIVE", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIsNotNone(report, "the report is written, not aborted")
+                self.assertEqual(report["verdict"], "INCONCLUSIVE")
+                self.assertTrue(any("before smoke JSON could not be parsed" in f for f in report["failures"]), report["failures"])
+
+    def test_residue_b2_the_entry_point_reads_each_smoke_file_once(self) -> None:
+        # sol r6 B2: the entry point opened each smoke file twice (Read-SmokeJson, then ReadAllText), and the evidence binding hashed it a third time,
+        # so a lock taken between the reads aborted the report. One ReadAllBytes (Read-SmokeSourceOnce) now feeds the parse, the strict host-load
+        # reader and the JSON's evidence binding.
+        text = COMPARE_SCRIPT.read_text(encoding="utf-8")
+        main = text[text.index("$beforeSource = Read-SmokeSourceOnce -Path $Before"):]
+        self.assertEqual(main.count("Read-SmokeSourceOnce -Path"), 2)
+        for reread in ("Read-SmokeJson -Path", "[IO.File]::ReadAllText(", "Get-Content -LiteralPath $before", "ConvertFrom-Json -Depth 100"):
+            self.assertNotIn(reread, main, f"the entry point re-reads a smoke file: {reread}")
+        self.assertIn("-JsonPath $beforeJsonPath -JsonSource $beforeSource", main)
+        self.assertIn("-JsonPath $afterJsonPath -JsonSource $afterSource", main)
+        once = _extract_functions(COMPARE_SCRIPT, ["Read-SmokeSourceOnce"])
+        self.assertEqual(once.count("[IO.File]::ReadAllBytes("), 1)
+
     def test_a_missing_or_exceeded_block_is_inconclusive_even_beside_other_failures(self) -> None:
-        exceeded = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $true; state = 'exceeded'; reason = 'loaded'; " + SNAPS + " } }"
+        exceeded ="[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $true; state = 'exceeded'; reason = 'loaded'; " + SNAPS + " } }"
         proc = self._verdict("[pscustomobject]@{ }", exceeded, failures="@('before smoke did not independently pass validation.')")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("VERDICT=INCONCLUSIVE", proc.stdout, "never FAIL: a provisional comparison is no regression signal")
@@ -1784,8 +1827,9 @@ class SmokeSummaryHostLoadFieldsTests(_ProbeCase):
         self.assertIn("STATE=unknown", proc.stdout)
 
     def test_well_formed_quiet_hostload_reads_through_untouched(self) -> None:
+        # residue r1 (sol r6 B1): a well-formed quiet block carries its collected snapshots (the smoke always writes them)
         proc = self._fields(
-            "[pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null }"
+            "[pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null; " + SNAPS + " }"
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("PROVISIONAL=False STATE=quiet", proc.stdout)
@@ -1805,6 +1849,76 @@ class SmokeSummaryHostLoadFieldsTests(_ProbeCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("PROVISIONAL=True STATE=exceeded", proc.stdout)
 
+    def test_residue_b1_uncollected_coerced_and_case_folded_blocks_are_provisional(self) -> None:
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B1, its catalogue addition): state quiet, provisional false, before.collected=false
+        # (CimException), after.collected=true read quiet/false here, so the A/B control produced no host-load refusal and its speed was evaluated.
+        # Also provisional 0 / [false] / 'false' and state 'QUIET'. Each is provisional; only the strict quiet block (SNAPS) is clean.
+        cases = {
+            "uncollected": "[pscustomobject]@{ provisional = $false; state = 'quiet'; before = [pscustomobject]@{ collected = $false; error = 'collection failed: CimException' }; after = [pscustomobject]@{ collected = $true } }",
+            "no-snapshots": "[pscustomobject]@{ provisional = $false; state = 'quiet' }",
+            "collected-1": "[pscustomobject]@{ provisional = $false; state = 'quiet'; before = [pscustomobject]@{ collected = 1 }; after = [pscustomobject]@{ collected = $true } }",
+            "zero": "[pscustomobject]@{ provisional = 0; state = 'quiet'; " + SNAPS + " }",
+            "array": "[pscustomobject]@{ provisional = @($false); state = 'quiet'; " + SNAPS + " }",
+            "string": "[pscustomobject]@{ provisional = 'false'; state = 'quiet'; " + SNAPS + " }",
+            "upper": "[pscustomobject]@{ provisional = $false; state = 'QUIET'; " + SNAPS + " }",
+        }
+        for name, block in cases.items():
+            with self.subTest(case=name):
+                proc = self._fields(block)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("PROVISIONAL=True", proc.stdout, (name, proc.stdout))
+
+
+@requires_pwsh
+class CudaAbHostLoadProofFailuresStrictTests(_ProbeCase):
+    """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B1): run-release-cuda-playback-ab.ps1's Get-HostLoadProofFailures (the A/B proof's host-load
+    refusal, and since r1 the guard in front of the -RequireCandidateImprovesPresentedFps comparison) reads each leg summary through the ONE strict
+    predicate: hostLoadState exactly 'quiet', hostLoadProvisional a real [bool] $false, hostLoadCollected a real [bool] $true. A truthy test of the flag
+    let provisional 0 / [false] and an uncollected control through, and the speed comparison was evaluated on it."""
+
+    script = CUDA_AB_SCRIPT
+    functions = ["Get-HostLoadProofFailures"]
+    CLEAN = "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }"
+
+    def _failures(self, baseline: str) -> subprocess.CompletedProcess:
+        return self.run_snippet(
+            f"$b = {baseline}\n$c = {self.CLEAN}\n"
+            "$f = @(Get-HostLoadProofFailures -BaselineSummary $b -CandidateSummary $c)\n"
+            "Write-Host \"COUNT=$($f.Count)\"\n"
+            "$f | ForEach-Object { Write-Host $_ }\n"
+        )
+
+    def test_a_clean_pair_has_no_refusal(self) -> None:
+        proc = self._failures(self.CLEAN)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("COUNT=0", proc.stdout)
+
+    def test_residue_b1_an_uncollected_coerced_or_case_folded_control_is_refused(self) -> None:
+        cases = {
+            "uncollected": "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $false }",
+            "no-collected": "[pscustomobject]@{ hostLoadState = 'quiet'; hostLoadProvisional = $false }",
+            "upper": "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'QUIET'; hostLoadCollected = $true }",
+            "zero": "[pscustomobject]@{ hostLoadProvisional = 0; hostLoadState = 'quiet'; hostLoadCollected = $true }",
+            "array": "[pscustomobject]@{ hostLoadProvisional = @($false); hostLoadState = 'quiet'; hostLoadCollected = $true }",
+        }
+        for name, leg in cases.items():
+            with self.subTest(case=name):
+                proc = self._failures(leg)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("COUNT=1", proc.stdout, (name, proc.stdout))
+                self.assertIn("baseline-host-load-provisional", proc.stdout)
+
+    def test_residue_b1_the_speed_comparison_is_guarded_by_the_same_strict_refusal(self) -> None:
+        source = CUDA_AB_SCRIPT.read_text(encoding="utf-8")
+        block_start = source.index("if ($RequireCandidateImprovesPresentedFps) {")
+        block = source[block_start:source.index("\n}\n", block_start)]
+        guard = block.index("Get-HostLoadProofFailures -BaselineSummary $baselineSummary -CandidateSummary $candidateForSpeed")
+        self.assertLess(guard, block.index("$candidateFps -le $baselineFps"))
+        self.assertNotIn("if ($baselineSummary.hostLoadProvisional -or", block, "no truthy test of the flag guards the comparison")
+        # the summary carries the collected bit the strict predicate needs
+        self.assertIn("hostLoadCollected = $hostLoadCollected", source)
+        self.assertIn("$hostLoadCollected = $hostLoadFields.collected", source)
+
 
 @requires_pwsh
 class CudaPlaybackAbHostLoadGateTests(_ProbeCase):
@@ -1818,7 +1932,9 @@ class CudaPlaybackAbHostLoadGateTests(_ProbeCase):
         provisional_literal = "$true" if provisional else "$false"
         return (
             "[pscustomobject]@{ hostLoadProvisional = " + provisional_literal +
-            "; hostLoadState = '" + state + "'; hostLoadReason = " + reason_literal + " }"
+            "; hostLoadState = '" + state + "'; hostLoadReason = " + reason_literal +
+            # residue r1 (sol r6 B1): Read-SmokeSummary now carries the collected bit the strict predicate needs
+            "; hostLoadCollected = $true }"
         )
 
     def test_all_quiet_legs_pass_the_gate(self) -> None:
@@ -1948,7 +2064,7 @@ class CompareMachinePerfPlaybackAbHostLoadRefusalTests(_ProbeCase):
         provisional_literal = "$true" if provisional else "$false"
         return (
             "[pscustomobject]@{ hostLoadProvisional = " + provisional_literal +
-            "; hostLoadState = '" + resolved_state + "' }"
+            "; hostLoadState = '" + resolved_state + "'; hostLoadCollected = $true }"
         )
 
     def _record(self, baseline_provisional: bool, candidate_provisional: bool, fps_delta_pct: float = -40.0) -> str:
@@ -2089,7 +2205,7 @@ class CompareMachinePerfPlaybackAbFpsDeltaRefusalTests(_ProbeCase):
         provisional_literal = "$true" if provisional else "$false"
         return (
             "[pscustomobject]@{ hostLoadProvisional = " + provisional_literal +
-            "; hostLoadState = '" + resolved_state + "' }"
+            "; hostLoadState = '" + resolved_state + "'; hostLoadCollected = $true }"
         )
 
     def _record(
@@ -2623,7 +2739,40 @@ class HostLoadReaderPredicateCensusTests(unittest.TestCase):
     # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (sol r5 B1): compare-release-gui-smoke-ab.ps1 no longer defines its own predicate; it judges each block with
     # VenueChain.psm1's ConvertFrom-VenueSmokeHostLoad (the stricter venue rule: collected snapshots too). Five sites remain; the comparator stays in the
     # scanned set, so a loose predicate re-added there makes the count six and fails here (test_the_gui_ab_comparator_defines_no_predicate_of_its_own).
-    EXPECTED_SITE_COUNT = 5
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B1): the five loose sites are gone. Every reader site is now the ONE strict predicate
+    # (STRICT_PREDICATE_PATTERN: state ordinal 'quiet', provisional a real [bool] $false, collected a real [bool] $true), and the loose shape is
+    # located nowhere. Six strict sites: compare-machine-perf.ps1 (1), run-release-cuda-playback-ab.ps1 (2: Get-HostLoadProofFailures and
+    # Get-SmokeSummaryHostLoadFields), run-ultramagnus-p3-validation.ps1 (2: Get-SmokeSummaryHostLoadFields and the per-clip guard),
+    # summarize-local-cuda-proof.ps1 (1); the GUI comparator still defines none of its own.
+    EXPECTED_SITE_COUNT = 6
+    # A predicate-site line (comment-stripped): mentions a provisional-named identifier and the 'quiet' literal (either quote).
+    _SITE_LOCATOR_PATTERN = re.compile(r"""^(?=.*[Pp]rovisional)(?=.*['"]quiet['"]).+$""", re.MULTILINE)
+    STRICT_PREDICATE_PATTERN = re.compile(
+        r"-not \(\$(?P<p>[A-Za-z0-9_]*[Pp]rovisional[A-Za-z0-9_]*) -is \[bool\] -and -not \$(?P=p) -and "
+        r"\$(?P<s>[A-Za-z0-9_]*[Ss]tate[A-Za-z0-9_]*) -is \[string\] -and \[string\]::Equals\(\$(?P=s), 'quiet', \[StringComparison\]::Ordinal\) -and "
+        r"\$(?P<c>[A-Za-z0-9_]*[Cc]ollected[A-Za-z0-9_]*) -is \[bool\] -and \$(?P=c)\)"
+    )
+
+    def test_residue_b1_no_reader_keeps_the_loose_predicate_and_every_site_is_strict(self) -> None:
+        sites: list[tuple[str, str]] = []
+        for name, path in self.READER_SCRIPTS.items():
+            code_only = self._strip_comments(path.read_text(encoding="utf-8"))
+            self.assertEqual(self._LOOSE_LOCATOR_PATTERN.findall(code_only), [], f"{name} still has a loose host-load predicate")
+            sites += [(name, line.strip()) for line in self._SITE_LOCATOR_PATTERN.findall(code_only)]
+        self.assertEqual(len(sites), self.EXPECTED_SITE_COUNT, sites)
+        self.assertEqual([s for s in sites if not self.STRICT_PREDICATE_PATTERN.search(s[1])], [], "every reader site is the strict predicate verbatim")
+
+    def test_residue_b1_the_strict_pattern_refuses_each_loose_variant(self) -> None:
+        strict = ("$xProvisional = -not ($xProvisionalRaw -is [bool] -and -not $xProvisionalRaw -and $xStateRaw -is [string] -and "
+                  "[string]::Equals($xStateRaw, 'quiet', [StringComparison]::Ordinal) -and $xCollectedRaw -is [bool] -and $xCollectedRaw)")
+        self.assertRegex(strict, self.STRICT_PREDICATE_PATTERN)
+        self.assertRegex(strict, self._SITE_LOCATOR_PATTERN)
+        for loose in (strict.replace(" -and $xCollectedRaw -is [bool] -and $xCollectedRaw", ""),
+                      strict.replace("[StringComparison]::Ordinal", "[StringComparison]::OrdinalIgnoreCase"),
+                      strict.replace("$xProvisionalRaw -is [bool] -and ", ""),
+                      '$xProvisional = ($xProvisionalDeclared -or $xState -ne "quiet")'):
+            with self.subTest(loose=loose):
+                self.assertIsNone(self.STRICT_PREDICATE_PATTERN.search(loose))
 
     def test_the_gui_ab_comparator_defines_no_predicate_of_its_own(self) -> None:
         code_only = self._strip_comments(COMPARE_SCRIPT.read_text(encoding="utf-8"))
@@ -2656,7 +2805,9 @@ class HostLoadReaderPredicateCensusTests(unittest.TestCase):
         matches: list[tuple[str, str]] = []
         for name, path in self.READER_SCRIPTS.items():
             code_only = self._strip_comments(path.read_text(encoding="utf-8"))
-            for line in self._LOOSE_LOCATOR_PATTERN.findall(code_only):
+            # residue r1 (sol r6 B1): the loose round-8 shape is located nowhere; every site is the strict predicate
+            self.assertEqual(self._LOOSE_LOCATOR_PATTERN.findall(code_only), [], name)
+            for line in self._SITE_LOCATOR_PATTERN.findall(code_only):
                 matches.append((name, line.strip()))
         self.assertEqual(
             len(matches), self.EXPECTED_SITE_COUNT,
@@ -2667,7 +2818,7 @@ class HostLoadReaderPredicateCensusTests(unittest.TestCase):
         )
         non_canonical = [
             (name, line) for name, line in matches
-            if not self.CANONICAL_PREDICATE_PATTERN.search(line)
+            if not self.STRICT_PREDICATE_PATTERN.search(line)
         ]
         self.assertEqual(
             non_canonical, [],
@@ -2685,14 +2836,20 @@ class HostLoadReaderPredicateCensusTests(unittest.TestCase):
         drifted = '$provisional = ($provisionalDeclared -or $state -eq "unknown")'
         self.assertRegex(drifted, self._LOOSE_LOCATOR_PATTERN)
         self.assertIsNone(self.CANONICAL_PREDICATE_PATTERN.search(drifted))
+        self.assertIsNone(self.STRICT_PREDICATE_PATTERN.search(drifted))
 
     def test_a_seventh_reader_with_a_fresh_variable_prefix_would_still_be_recognized_as_canonical(self) -> None:
         # Sanity check on the patterns themselves: a synthetic seventh site using a variable-name
-        # prefix that appears nowhere in the real six sites still matches both patterns, proving
-        # this census is not accidentally keyed to the six existing identifier names.
-        synthetic = '$xProvisional = ($xProvisionalDeclared -or $xState -ne "quiet")'
-        self.assertRegex(synthetic, self._LOOSE_LOCATOR_PATTERN)
-        self.assertRegex(synthetic, self.CANONICAL_PREDICATE_PATTERN)
+        # prefix that appears nowhere in the real sites still matches the locator and the strict pattern,
+        # proving this census is not accidentally keyed to the existing identifier names.
+        # residue r1 (sol r6 B1): the round-8 loose shape is still LOCATED (and refused); the strict shape is the canonical one.
+        loose = '$xProvisional = ($xProvisionalDeclared -or $xState -ne "quiet")'
+        self.assertRegex(loose, self._LOOSE_LOCATOR_PATTERN)
+        self.assertIsNone(self.STRICT_PREDICATE_PATTERN.search(loose))
+        synthetic = ("$yProvisional = -not ($yProvisionalRaw -is [bool] -and -not $yProvisionalRaw -and $yStateRaw -is [string] -and "
+                     "[string]::Equals($yStateRaw, 'quiet', [StringComparison]::Ordinal) -and $yCollectedRaw -is [bool] -and $yCollectedRaw)")
+        self.assertRegex(synthetic, self._SITE_LOCATOR_PATTERN)
+        self.assertRegex(synthetic, self.STRICT_PREDICATE_PATTERN)
 
     def test_a_comment_only_mention_is_not_located_as_a_site(self) -> None:
         # Mirrors the row census's comment-stripping guard: a mention of provisional/state/quiet
@@ -2819,6 +2976,8 @@ class CompareMachinePerfP3HostLoadRowTests(_ProbeCase):
             resolved_state = host_load_state if host_load_state is not None else (
                 "exceeded" if host_load_provisional else "quiet")
             extra += f"; hostLoadState = '{resolved_state}'"
+            # residue r1 (sol r6 B1): a P3 clip row carries hostLoadCollected (run-ultramagnus-p3-validation.ps1 writes it)
+            extra += "; hostLoadCollected = $true"
         return (
             "[pscustomobject]@{ "
             f"presentedFps = {presented_fps}; gpuTextureNoReadbackFrames = 10; "
@@ -2908,11 +3067,29 @@ class P3ValidationSmokeSummaryHostLoadFieldsTests(_ProbeCase):
         self.assertIn("PROVISIONAL=True", proc.stdout)
 
     def test_well_formed_quiet_hostload_reads_through_untouched(self) -> None:
+        # residue r1 (sol r6 B1): a well-formed quiet block carries its collected snapshots (the smoke always writes them)
         proc = self._fields(
-            "[pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null }"
+            "[pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null; " + SNAPS + " }"
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("PROVISIONAL=False STATE=quiet", proc.stdout)
+
+    def test_residue_b1_uncollected_coerced_and_case_folded_blocks_are_provisional(self) -> None:
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B1, sibling run-ultramagnus-p3-validation.ps1:237-249): the same strict predicate as the
+        # CUDA A/B reader. A singleton-array block is not an object and reads provisional too.
+        cases = {
+            "uncollected": "[pscustomobject]@{ provisional = $false; state = 'quiet'; before = [pscustomobject]@{ collected = $false }; after = [pscustomobject]@{ collected = $true } }",
+            "no-snapshots": "[pscustomobject]@{ provisional = $false; state = 'quiet' }",
+            "zero": "[pscustomobject]@{ provisional = 0; state = 'quiet'; " + SNAPS + " }",
+            "array": "[pscustomobject]@{ provisional = @($false); state = 'quiet'; " + SNAPS + " }",
+            "upper": "[pscustomobject]@{ provisional = $false; state = 'QUIET'; " + SNAPS + " }",
+            "singleton-block": ", @([pscustomobject]@{ provisional = $false; state = 'quiet'; " + SNAPS + " })",
+        }
+        for name, block in cases.items():
+            with self.subTest(case=name):
+                proc = self._fields(block)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("PROVISIONAL=True", proc.stdout, (name, proc.stdout))
 
     def test_provisional_false_with_missing_state_reads_as_provisional_not_clean_unknown(self) -> None:
         # round 4 (sol major): an explicit provisional=false paired with a missing state used to
@@ -2958,7 +3135,8 @@ class P3ValidationSpeedValidatedWiringTests(unittest.TestCase):
             # executed by PowerShell as an attempt to invoke a command literally named "if"
             # (CommandNotFoundException) -- the fix wraps it as a subexpression, "$(if ...)". See
             # P3ValidationHostLoadFieldsAssignmentExecutesTests below for the executable regression.
-            "$(if ($result) { $result.hostLoad } else { $null })"
+            # residue r1 (sol r6 B1): ", $result.hostLoad" so a one-element hostLoad array is passed as it is (not unrolled into a clean object)
+            "$(if ($result) { , $result.hostLoad } else { $null })"
         )
         floor_check_index = source.index('was below hard floor {1:N3} fps."')
         self.assertLess(
@@ -3064,7 +3242,8 @@ class P3ValidationImportIndependentlyChecksHostLoadTests(unittest.TestCase):
         import_speed_start = source.index('if ($isSpeedProof) {\n                $minSpeedFps')
         # round 5: widened from 1800 to fit the state-check addition below the flag-only read.
         # round 8: widened again from 3200 to fit the item-3 canonical-predicate comment.
-        import_speed_block = source[import_speed_start:import_speed_start + 3600]
+        # residue r1: widened from 3600 to fit the strict-predicate lines (sol r6 B1)
+        import_speed_block = source[import_speed_start:import_speed_start + 5200]
         self.assertIn('$clip.PSObject.Properties["hostLoadProvisional"]', import_speed_block)
         self.assertIn("host load was PROVISIONAL or unrecorded", import_speed_block)
         # round 5 (sol BLOCKER): the flag alone is not enough -- hostLoadState must also gate.
@@ -3144,7 +3323,7 @@ class P3ValidationImportSpeedFloorGuardExecutesTests(_ProbeCase):
 
     def test_provisional_false_with_quiet_state_is_accepted(self) -> None:
         # Regression guard: the fix must not turn every clean clip provisional.
-        proc = self._run("[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet' }")
+        proc = self._run("[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("REFUSED=False", proc.stdout)
 
@@ -3240,8 +3419,9 @@ class RequireCandidateImprovesPresentedFpsHostLoadGuardTests(unittest.TestCase):
         block = source[block_start:block_end]
         self.assertIn("hostLoadProvisional", block)
         self.assertIn("candidate-presented-fps-improvement-not-evaluated", block)
+        # residue r1 (sol r6 B1): the guard is the strict Get-HostLoadProofFailures refusal, not a truthy test of the flag
         guard_index = block.index(
-            "if ($baselineSummary.hostLoadProvisional -or $candidateForSpeed.hostLoadProvisional)"
+            "Get-HostLoadProofFailures -BaselineSummary $baselineSummary -CandidateSummary $candidateForSpeed"
         )
         comparison_index = block.index("$candidateFps -le $baselineFps")
         self.assertLess(
@@ -3258,7 +3438,8 @@ class LocalCudaProofSummarizerHostLoadGuardTests(unittest.TestCase):
 
     def test_summarizer_checks_host_load_provisional_independently_of_proof_failures(self) -> None:
         source = CUDA_PROOF_SUMMARIZER_SCRIPT.read_text(encoding="utf-8")
-        self.assertIn('Get-Field $legEntry.Leg "hostLoadProvisional"', source)
+        # residue r1 (sol r6 B1): read with PSObject.Properties (Get-Field's return unrolled [false])
+        self.assertIn('$legEntry.Leg.PSObject.Properties["hostLoadProvisional"]', source)
         self.assertIn("PLAYBACK_AB_HOST_LOAD_PROVISIONAL", source)
         host_load_guard_index = source.index("$playbackAbHostLoadLegs = @(")
         # "PLAYBACK_PRESENTED_FPS_NOT_IMPROVED" also appears earlier in the file as a reason-code
@@ -3279,9 +3460,11 @@ class LocalCudaProofSummarizerHostLoadGuardTests(unittest.TestCase):
         # LocalCudaProofSummarizerGuardExecutesTests for the executable exceeded/false repro.
         source = CUDA_PROOF_SUMMARIZER_SCRIPT.read_text(encoding="utf-8")
         host_load_guard_index = source.index("$playbackAbHostLoadLegs = @(")
-        guard_block = source[host_load_guard_index:host_load_guard_index + 1900]
-        self.assertIn('Get-Field $legEntry.Leg "hostLoadState"', guard_block)
-        self.assertIn('$legState -ne "quiet"', guard_block)
+        guard_block = source[host_load_guard_index:host_load_guard_index + 3200]
+        # residue r1 (sol r6 B1): the strict predicate (ordinal 'quiet', real bools, collected)
+        self.assertIn('$legEntry.Leg.PSObject.Properties["hostLoadState"]', guard_block)
+        self.assertIn("[string]::Equals($legStateRaw, 'quiet', [StringComparison]::Ordinal)", guard_block)
+        self.assertIn('$legEntry.Leg.PSObject.Properties["hostLoadCollected"]', guard_block)
 
     def test_fps_not_improved_diagnostic_is_skipped_when_host_load_is_provisional(self) -> None:
         source = CUDA_PROOF_SUMMARIZER_SCRIPT.read_text(encoding="utf-8")
@@ -3345,15 +3528,15 @@ class LocalCudaProofSummarizerGuardExecutesTests(_ProbeCase):
         # for as source text.
         proc = self._run(
             "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'unknown' }",
-            "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet' }",
+            "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }",
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("REFUSED=True BLOCKERS=1", proc.stdout)
 
     def test_both_legs_quiet_and_non_provisional_are_accepted(self) -> None:
         proc = self._run(
-            "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet' }",
-            "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet' }",
+            "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }",
+            "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }",
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("REFUSED=False BLOCKERS=0", proc.stdout)
@@ -3361,7 +3544,7 @@ class LocalCudaProofSummarizerGuardExecutesTests(_ProbeCase):
     def test_missing_state_property_on_either_leg_is_refused(self) -> None:
         proc = self._run(
             "[pscustomobject]@{ hostLoadProvisional = $false }",
-            "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet' }",
+            "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }",
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("REFUSED=True BLOCKERS=1", proc.stdout)
@@ -3372,7 +3555,7 @@ class LocalCudaProofSummarizerGuardExecutesTests(_ProbeCase):
         # hostLoadState=="quiet" AND hostLoadProvisional==false.
         proc = self._run(
             "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'exceeded' }",
-            "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet' }",
+            "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }",
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("REFUSED=True BLOCKERS=1", proc.stdout)

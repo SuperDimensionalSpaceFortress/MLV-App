@@ -699,20 +699,33 @@ function Get-HostLoadProofFailures {
         [switch]$SeparateCandidateSpeedRun
     )
 
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B1): a leg is clean only by the ONE strict predicate (state exactly 'quiet' ordinal,
+    # provisional a real [bool] $false, hostLoadCollected a real [bool] $true); a truthy test let provisional=0, [false] or an uncollected leg through.
+    # Members are read with PSObject.Properties and assigned directly, so a one-element array is never unrolled into the value inside it.
+    $legIsProvisional = {
+        param([object]$Leg)
+        $legProvisionalRaw = $null; $legStateRaw = $null; $legCollectedRaw = $null
+        if ($null -ne $Leg -and $Leg -isnot [System.Collections.IList]) {
+            $p = $Leg.PSObject.Properties['hostLoadProvisional']; if ($null -ne $p) { $legProvisionalRaw = $p.Value }
+            $p = $Leg.PSObject.Properties['hostLoadState']; if ($null -ne $p) { $legStateRaw = $p.Value }
+            $p = $Leg.PSObject.Properties['hostLoadCollected']; if ($null -ne $p) { $legCollectedRaw = $p.Value }
+        }
+        -not ($legProvisionalRaw -is [bool] -and -not $legProvisionalRaw -and $legStateRaw -is [string] -and [string]::Equals($legStateRaw, 'quiet', [StringComparison]::Ordinal) -and $legCollectedRaw -is [bool] -and $legCollectedRaw)
+    }
     $failures = @()
-    if ($BaselineSummary.hostLoadProvisional) {
+    if (& $legIsProvisional $BaselineSummary) {
         $failures += (
             "baseline-host-load-provisional state=$($BaselineSummary.hostLoadState) " +
             "reason=$($BaselineSummary.hostLoadReason)"
         )
     }
-    if ($CandidateSummary.hostLoadProvisional) {
+    if (& $legIsProvisional $CandidateSummary) {
         $failures += (
             "candidate-host-load-provisional state=$($CandidateSummary.hostLoadState) " +
             "reason=$($CandidateSummary.hostLoadReason)"
         )
     }
-    if ($SeparateCandidateSpeedRun -and $CandidateSpeedSummary.hostLoadProvisional) {
+    if ($SeparateCandidateSpeedRun -and (& $legIsProvisional $CandidateSpeedSummary)) {
         $failures += (
             "candidate-speed-host-load-provisional state=$($CandidateSpeedSummary.hostLoadState) " +
             "reason=$($CandidateSpeedSummary.hostLoadReason)"
@@ -741,20 +754,33 @@ function Get-SmokeSummaryHostLoadFields {
     # compare-machine-perf.ps1's Get-PlaybackAbLegHostLoadProvisional for the full cross-file
     # note): clean iff state=="quiet" AND provisional==false; every other combination is
     # provisional.
-    $provisionalRaw = if ($null -eq $HostLoad) { $null } else { Get-NestedValue $HostLoad "provisional" }
-    $provisionalDeclared = if ($null -eq $HostLoad -or $null -eq $provisionalRaw) { $true } else { [bool]$provisionalRaw }
-    $stateRaw = if ($null -eq $HostLoad) { $null } else { Get-NestedValue $HostLoad "state" }
-    $state = if ($null -eq $HostLoad -or [string]::IsNullOrWhiteSpace([string]$stateRaw)) { "unknown" } else { [string]$stateRaw }
-    $provisional = ($provisionalDeclared -or $state -ne "quiet")
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B1): THE ONE STRICT PREDICATE (VenueChain.psm1 Get-VenueReferenceHostLoadRefusal's rule):
+    # clean iff state is exactly the string 'quiet' (ordinal), provisional is a real [bool] $false, and before.collected and after.collected are
+    # both a real [bool] $true. 'QUIET', provisional 0 / [false] / 'false' and a failed snapshot (2026-11-21 a134532e: CimException) are provisional.
+    # A member is read with PSObject.Properties and assigned directly (a one-element array is never unrolled into the value inside it).
+    $readMember = {
+        param([object]$Object, [string]$Name)
+        if ($null -eq $Object -or $Object -is [System.Collections.IList] -or $Object -is [string] -or $Object -is [ValueType]) { return }
+        $p = $Object.PSObject.Properties[$Name]
+        if ($null -ne $p) { , $p.Value }
+    }
+    $provisionalRaw = & $readMember $HostLoad 'provisional'
+    $stateRaw = & $readMember $HostLoad 'state'
+    $beforeCollectedRaw = & $readMember (& $readMember $HostLoad 'before') 'collected'
+    $afterCollectedRaw = & $readMember (& $readMember $HostLoad 'after') 'collected'
+    $collectedRaw = ($beforeCollectedRaw -is [bool] -and $beforeCollectedRaw -and $afterCollectedRaw -is [bool] -and $afterCollectedRaw)
+    $provisional = -not ($provisionalRaw -is [bool] -and -not $provisionalRaw -and $stateRaw -is [string] -and [string]::Equals($stateRaw, 'quiet', [StringComparison]::Ordinal) -and $collectedRaw -is [bool] -and $collectedRaw)
+    $state = if ($stateRaw -is [string] -and -not [string]::IsNullOrWhiteSpace($stateRaw)) { $stateRaw } else { "unknown" }
     $reason = if ($null -eq $HostLoad) {
         "no hostLoad telemetry recorded in the smoke result"
     } else {
-        [string](Get-NestedValue $HostLoad "reason")
+        [string](& $readMember $HostLoad 'reason')
     }
 
     [pscustomobject]@{
         provisional = $provisional
         state = $state
+        collected = $collectedRaw
         reason = $reason
     }
 }
@@ -774,15 +800,22 @@ function Read-SmokeSummary {
             validationOk = $false
             hostLoadProvisional = $true
             hostLoadState = "unknown"
+            hostLoadCollected = $false
             hostLoadReason = "smoke result JSON does not exist"
         }
     }
 
     $json = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -Depth 100
-    $hostLoad = Get-NestedValue $json "hostLoad"
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B1): the block is taken as it is (a function return would unroll a one-element array)
+    $hostLoad = $null
+    if ($null -ne $json -and $json -isnot [System.Collections.IList]) {
+        $hostLoadProperty = $json.PSObject.Properties['hostLoad']
+        if ($null -ne $hostLoadProperty) { $hostLoad = $hostLoadProperty.Value }
+    }
     $hostLoadFields = Get-SmokeSummaryHostLoadFields -HostLoad $hostLoad
     $hostLoadProvisional = $hostLoadFields.provisional
     $hostLoadState = $hostLoadFields.state
+    $hostLoadCollected = $hostLoadFields.collected
     $hostLoadReason = $hostLoadFields.reason
     $summary = Get-NestedValue $json "log.summary"
     $glProof = Get-NestedValue $json "visualQuality.glOutputProof"
@@ -894,6 +927,7 @@ function Read-SmokeSummary {
         validationOk = $validationOk
         hostLoadProvisional = $hostLoadProvisional
         hostLoadState = $hostLoadState
+        hostLoadCollected = $hostLoadCollected
         hostLoadReason = $hostLoadReason
         runMetadata = Get-NestedValue $json "log.runMetadata"
         validationFailures = @(Get-NestedValue $json "validation.failures")
@@ -1668,7 +1702,10 @@ if ($RequireCandidateImprovesPresentedFps) {
     # emitted a "candidate-presented-fps-not-improved" line computed from noisy data, which
     # misrepresents a host-load problem as an fps regression. Refuse the fps comparison itself
     # when either leg is provisional instead of computing it from untrustworthy numbers.
-    if ($baselineSummary.hostLoadProvisional -or $candidateForSpeed.hostLoadProvisional) {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B1): the same strict predicate as Get-HostLoadProofFailures (no truthy test of the flag), so
+    # a leg with provisional 0, [false], a non-'quiet' state or an uncollected snapshot never reaches the fps comparison below.
+    $speedHostLoadRefusals = @(Get-HostLoadProofFailures -BaselineSummary $baselineSummary -CandidateSummary $candidateForSpeed)
+    if ($speedHostLoadRefusals.Count -gt 0) {
         $proofFailures += (
             "candidate-presented-fps-improvement-not-evaluated host-load-provisional " +
             "baseline=$($baselineSummary.hostLoadProvisional) candidate=$($candidateForSpeed.hostLoadProvisional)"

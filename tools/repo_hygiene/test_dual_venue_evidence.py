@@ -28,6 +28,7 @@ Windows-only: the job generator and runner are PowerShell-on-Windows tools (the 
 from __future__ import annotations
 
 import ast
+import base64
 import concurrent.futures
 import contextlib
 import hashlib
@@ -4086,21 +4087,47 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
                                             "tools/profiling/dual-venue/VenueChain.psm1"})
     REFUSAL_ONLY_RECEIPT_READERS = {"tools/profiling/dual-venue/VenueChain.psm1": "Test-VenueReceiptIsExportLeg"}
 
+    RECEIPT_LITERALS = ("dual-venue-receipt/v1", "dual-venue\\receipts", "dual-venue/receipts")
+
     @staticmethod
-    def receipt_literal_functions(text: str) -> list[str]:
-        # The function each receipt-literal line sits in, in order; '' for a line outside any function. r6 (sol r5 H1): bounded by the function's own
-        # closing brace, never by "the next function name": a top-level PowerShell function opens at a column-0 `function <Name>` and closes at its column-0
-        # `}` line (a one-line function closes on its own line), so a literal moved below that closing brace is no longer attributed to it. (Brace counting
-        # is not used: here-strings and quoted braces in these modules make it drift.)
-        out, current = [], ""
-        for line in text.splitlines():
-            m = re.match(r"function\s+([A-Za-z][\w-]*)", line)
-            if m:
-                current = m.group(1)
-            if "dual-venue-receipt/v1" in line or "dual-venue\\receipts" in line or "dual-venue/receipts" in line:
-                out.append(current)
-            if re.fullmatch(r"\}\s*", line) or (m and line.rstrip().endswith("}") and line.count("{") == line.count("}")):
-                current = ""
+    def powershell_function_extents(text: str) -> list[tuple[int, int, str]]:
+        """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 H1): every function's extent as the PowerShell PARSER sees it (FunctionDefinitionAst
+        Extent.StartOffset / EndOffset, UTF-16 offsets into the text, nested functions included). The text goes over stdin as base64, so no console code page
+        can change it."""
+        pwsh = shutil.which("pwsh")
+        if pwsh is None:
+            raise unittest.SkipTest("pwsh is not on PATH (the receipt-reader pin needs the PowerShell parser)")
+        script = ("$t = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd())); "
+                  "$e = $null; $k = $null; $ast = [System.Management.Automation.Language.Parser]::ParseInput($t, [ref]$k, [ref]$e); "
+                  "foreach ($f in $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) { "
+                  "[Console]::Out.WriteLine([string]::Join([char]9, @([string]$f.Extent.StartOffset, [string]$f.Extent.EndOffset, $f.Name))) }")
+        p = subprocess.run([pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                           input=base64.b64encode(text.encode("utf-8")).decode("ascii"), capture_output=True, text=True, timeout=120,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0)
+        if p.returncode != 0:
+            raise AssertionError("the PowerShell parser did not run: " + p.stdout + p.stderr)
+        out = []
+        for row in p.stdout.splitlines():
+            if row.strip():
+                start, end, name = row.split("\t", 2)
+                out.append((int(start), int(end), name.strip()))
+        return out
+
+    @classmethod
+    def receipt_literal_functions(cls, text: str) -> list[str]:
+        # The function each receipt-literal line sits in, in order; '' for a line outside any function. r6 (sol r5 H1) bounded a function by its column-0
+        # closing brace; sol r6 H1: an indented closing brace defeated that. Residue r1: the boundaries are the PARSED function extents
+        # (powershell_function_extents: the AST), so a literal below the function's real closing brace, however that brace is indented, is outside it;
+        # a literal inside a nested function is attributed to the innermost one.
+        extents = cls.powershell_function_extents(text)
+        out, offset = [], 0  # offset: UTF-16 code units, as the parser counts them
+        for line in text.split("\n"):
+            hits = [line.find(lit) for lit in cls.RECEIPT_LITERALS if lit in line]
+            if hits:
+                pos = offset + len(line[:min(hits)].encode("utf-16-le")) // 2
+                inside = [e for e in extents if e[0] <= pos < e[1]]
+                out.append(max(inside, key=lambda e: e[0])[2] if inside else "")
+            offset += len(line.encode("utf-16-le")) // 2 + 1
         return out
 
     @staticmethod
@@ -4133,7 +4160,12 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         # r6 (sol r5 H1): function boundaries are the function's own braces. A literal moved below the closing brace of Test-VenueReceiptIsExportLeg (module
         # scope, before the next function) is no longer attributed to it, so the pin above fails on that mutation.
         self.assertEqual(self.receipt_literal_functions("function Test-A {\n  if ($x) { 'a' }\n}\n$s = 'mlv-app/dual-venue-receipt/v1'\nfunction Test-B { }\n"), [""])
-        self.assertEqual(self.receipt_literal_functions("function Test-A {\n  # a } in a comment\n  $q = '}'\n  }\n  $s = 'mlv-app/dual-venue-receipt/v1'\n}\n"), ["Test-A"])
+        # residue r1 (sol r6 H1): a brace in a comment or a string is not a boundary, a nested block's brace is not the function's, and an INDENTED closing
+        # brace still closes the function (the parser decides, not the column)
+        self.assertEqual(self.receipt_literal_functions("function Test-A {\n  # a } in a comment\n  $q = '}'\n  if ($x) {\n  }\n  $s = 'mlv-app/dual-venue-receipt/v1'\n}\n"), ["Test-A"])
+        self.assertEqual(self.receipt_literal_functions("function Test-A {\n  $q = '}'\n  }\n$s = 'mlv-app/dual-venue-receipt/v1'\n"), [""],
+                         "an indented closing brace closes the function: the literal after it is at module scope")
+        self.assertEqual(self.receipt_literal_functions("function Test-A {\n  function Test-In {\n    $s = 'mlv-app/dual-venue-receipt/v1'\n  }\n}\n"), ["Test-In"])
         self.assertEqual(self.receipt_literal_functions("function Test-A { $x }\n$s = 'mlv-app/dual-venue-receipt/v1'\n"), [""], "a one-line function closes on its line")
         live = texts["tools/profiling/dual-venue/VenueChain.psm1"]
         lines = live.splitlines(keepends=True)
@@ -4144,6 +4176,11 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         self.assertNotEqual(self.receipt_literal_functions(moved), ["Test-VenueReceiptIsExportLeg"],
                             "a schema literal moved below the function's closing brace is not attributed to it")
         self.assertEqual(self.receipt_literal_functions(moved), [""])
+        # residue r1 (sol r6 H1, its mutation): the function's actual closing brace indented two spaces and the schema literal placed after it is at
+        # module scope, so the live function no longer owns it and the pin above fails on that mutation
+        indented = "".join(lines[:hit] + lines[hit + 1:end] + ["  }\n", lines[hit]] + lines[end + 1:])
+        self.assertNotEqual(indented, live)
+        self.assertEqual(self.receipt_literal_functions(indented), [""], "a literal after an indented closing brace is not attributed to the function")
         mutated = texts["tools/profiling/dual-venue/New-VenueSheetPair.ps1"].replace("Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot", "Test-DvReceiptValid -Receipt $r")
         self.assertNotEqual(mutated, texts["tools/profiling/dual-venue/New-VenueSheetPair.ps1"])
         self.assertEqual(self.readers_without_repo_root({"New-VenueSheetPair.ps1": mutated}), ["New-VenueSheetPair.ps1:" + str(next(
@@ -6389,7 +6426,8 @@ class DisplayMatrixLegSetTests(unittest.TestCase):
         base = {"cellId": cell, "backend": backend, "outcome": outcome, "observedDisplay": mode, "effectiveScale": 1 if backend == "cuda" else int(scale[1:]),
                 "windowSize": "2560x1529" if mode == "windowed" else "2560x1600", "previewSize": "2380x1373" if mode == "windowed" else "2560x1600",
                 "presentedFps": fps, "timelineFpsAfterFirstPresent": 19.5, "renderWorkMs": 28.0, "dualIsoMs": 25.0,
-                "hostLoadState": "quiet", "hostLoadProvisional": False}   # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3: a quiet leg (a provisional one is never measured)
+                "hostLoadState": "quiet", "hostLoadProvisional": False,   # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3: a quiet leg (a provisional one is never measured)
+                "hostLoadCollected": True}   # residue r1 (sol r6 B3): and collected (a collected=false row is never measured)
         base.update(over)
         return base
 
@@ -6455,6 +6493,16 @@ class DisplayMatrixLegSetTests(unittest.TestCase):
                 self.row("cuda-windowed-s1", fps=31.0, hostLoadProvisional="false"), self.row("cuda-windowed-s1", fps=32.0, hostLoadProvisional=[False])]
         line = self.table(rows, cells).splitlines()[2]
         self.assertIn("| 1/5 | 12.00 (12.00-12.00) |", line, "only the quiet row is in the median")
+
+    def test_residue_b3_a_collected_false_row_is_ran_but_never_measured(self) -> None:
+        """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B3): a row whose standing said collected=false (or whose collected is not the boolean true)
+        is ran, never measured and never in the median, beside state quiet and provisional false."""
+        cells = [{"cellId": "cuda-windowed-s1", "backend": "cuda", "displayMode": "windowed", "scaleFactor": 1}]
+        absent = self.row("cuda-windowed-s1", fps=30.0); del absent["hostLoadCollected"]
+        rows = [self.row("cuda-windowed-s1", fps=12.0), self.row("cuda-windowed-s1", fps=59.56, hostLoadCollected=False), absent,
+                self.row("cuda-windowed-s1", fps=31.0, hostLoadCollected="true"), self.row("cuda-windowed-s1", fps=32.0, hostLoadCollected=[True])]
+        line = self.table(rows, cells).splitlines()[2]
+        self.assertIn("| 1/5 | 12.00 (12.00-12.00) |", line, "only the collected quiet row is in the median")
 
     def test_a_cell_with_no_measurement_shows_dashes_and_its_outcome(self) -> None:
         cells = [{"cellId": "cpu-windowed-s1", "backend": "cpu", "displayMode": "windowed", "scaleFactor": 1}]
@@ -20287,7 +20335,7 @@ class DriftLegSpecTests(unittest.TestCase):
                                       "  $entry = [pscustomobject]@{ seq = 1; repeat = 1; cellId = 'cuda-fullscreen-s1'; backend = 'cuda'; displayMode = 'fullscreen'; scaleFactor = 1; legId = [string]$c.leg }\n"
                                       "  $dir = $(if ($c.log) { $env:DVE_EV } else { Join-Path $env:DVE_EV 'absent' })\n"
                                       "  $r = [pscustomobject]@{ outcome = [string]$c.outcome; receiptId = 'rid'; legId = [string]$c.leg; evidence = [pscustomobject]@{ localEvidenceDir = $dir; logSha256 = $env:DVE_SHA } }\n"
-                                      "  Get-DvMatrixRow -PlanEntry $entry -Receipt $r -HostLoad ([pscustomobject]@{ state = 'quiet'; provisional = $false }) }\n"
+                                      "  Get-DvMatrixRow -PlanEntry $entry -Receipt $r -HostLoad ([pscustomobject]@{ state = 'quiet'; provisional = $false; collected = $true }) }\n"
                                       "$cells = @([pscustomobject]@{ cellId = 'cuda-fullscreen-s1'; backend = 'cuda'; displayMode = 'fullscreen'; scaleFactor = 1 })\n"
                                       "$t = ConvertTo-DvMatrixTable -Rows @($rows) -Cells $cells\n"
                                       "[ordered]@{ header = (Get-DvMatrixMeasuredCount -Rows @($rows)); table = $t } | ConvertTo-Json -Compress",
