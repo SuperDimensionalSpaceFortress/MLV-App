@@ -234,9 +234,13 @@ ROUTE_DELETE_ALLOWED = {
         "DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r2 (adversary pass 3 A6), listed in BATCH-3 r2 (CI 45506989386): the lease batch's per-leg evidence transcript writer. "
         "The destination $final = $a.p is the batch's $out, assigned once just before the leg as Join-Path $RunDir \"leg-<leg name>-b<NN>-a<N>.out.txt\" (this run's own "
         "-RunDir, never a venue share or a clip folder) and asked about by Test-RunDirWrite right before this line; the leaf always ends in .out.txt, so it can never be the "
-        "name of an .MLV clip. The Move's source and the Delete's only target are $final + \".b2r2-<32 hex>.tmp\", a fresh GUID name this worker opened with FileMode.CreateNew "
-        "a moment earlier (nothing can already be there), removed only when the write or the rename failed. Fixed-name leaves, no wildcard, no -Recurse; the leg's clip is "
-        "never an argument here (the batch reads only the leg child's captured stdout and stderr).",
+        "name of an .MLV clip. The Move's source and the Delete's only target are $final + \".b2r2-<32 hex>.tmp\", a GUID name this worker generated one statement before "
+        "it opened it with FileMode.CreateNew; the Delete runs in the catch for ANY failure of the try (CreateNew, the write or the rename), so with CreateNew refused it "
+        "names a leaf that only an actor who created that unguessable name in this run's -RunDir within the same statement could own. Fixed-name leaves, no wildcard, "
+        "no -Recurse; the leg's clip is never an argument here (the batch reads only the leg child's captured stdout and stderr). RESIDUAL, carried (adversary BATCH-3 r2 "
+        "A5 = pass 6 A5): WriteAllText reopens the temp BY NAME after the CreateNew handle is closed, so a concurrent writer inside the -RunDir that swaps the temp leaf "
+        "for a hard link between those two statements gets the transcript written through the link; writing through the CreateNew handle and deleting only a temp this "
+        "worker proved it made is LEASE-BATCH-TRANSCRIPT-TEMP-NAME-1 (Guard: tools/repo_hygiene/test_venue_lease_batch.py).",
 }
 
 TRAILING_COMMENT = re.compile(r"\s+#\s.*$")
