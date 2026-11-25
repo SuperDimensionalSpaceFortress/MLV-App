@@ -6657,7 +6657,7 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
 param([string]$Venue, [string]$WorkDir, [string]$GateLog, [double]$ThresholdPercent = 20, [int]$MaxWaitSec = 1800, [int]$RecheckSec = 90, [int]$MaxAdmissionWaitSec = 0)
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 if ($env:DVT_SWAP_TO -and -not (Test-Path -LiteralPath $env:DVT_SWAP_DONE) -and (-not $env:DVT_SWAP_VENUE -or $env:DVT_SWAP_VENUE -eq $Venue)) {
-    if ($env:DVT_SWAP_MODE -eq 'touch') { [IO.File]::SetLastWriteTimeUtc($env:DVT_SWAP_TO, [DateTime]::UtcNow.AddMinutes(7)) } else { [IO.File]::Copy($env:DVT_SWAP_FROM, $env:DVT_SWAP_TO, $true) }
+    if ($env:DVT_SWAP_MODE -eq 'touch') { [IO.File]::SetLastWriteTimeUtc($env:DVT_SWAP_TO, [DateTime]::UtcNow.AddMinutes(7)) } elseif ($env:DVT_SWAP_MODE -eq 'delete') { [IO.File]::Delete($env:DVT_SWAP_TO) } else { [IO.File]::Copy($env:DVT_SWAP_FROM, $env:DVT_SWAP_TO, $true) }
     Set-Content -LiteralPath $env:DVT_SWAP_DONE -Value $Venue
 }
 "QUIET mean=5.0% threshold=$ThresholdPercent% waitedSec=1"; exit 0
@@ -6668,12 +6668,20 @@ if ($env:DVT_SWAP_TO -and -not (Test-Path -LiteralPath $env:DVT_SWAP_DONE) -and 
     # Logs what it READ (the legId inside the bytes) and the hash it was handed; a leg that runs writes a receipt naming the legId it read.
     CHAIN_FAKE_LEG = r"""
 param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '', [string]$ExpectSpecSha256 = '')
-$bytes = [IO.File]::ReadAllBytes($LegSpec)
+$bytes = $null
+try { $bytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $LegSpec).Path) }
+catch {
+    if (-not $ExpectSpecSha256) { throw }
+    Add-Content -LiteralPath $env:DVT_LEG_LOG -Value ("LEG venue={0} leaf={1} read=UNREADABLE expect={2} legId=none" -f $Venue, (Split-Path -Leaf $LegSpec), $ExpectSpecSha256)
+    Write-Output "DVE_LEG_SPEC_UNREADABLE planned_sha256=$ExpectSpecSha256"
+    throw "DVE_LEG_SPEC_UNREADABLE the leg spec '$LegSpec' could not be read after planning ($($_.Exception.Message)); nothing is generated or submitted"
+}
 $readSpecSha = ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData($bytes)) -replace '-', '').ToLowerInvariant()
-$legId = [string](([Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json).legId)
+$legId = try { [string](([Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json).legId) } catch { 'unparsed' }
 Add-Content -LiteralPath $env:DVT_LEG_LOG -Value ("LEG venue={0} leaf={1} read={2} expect={3} legId={4}" -f $Venue, (Split-Path -Leaf $LegSpec), $readSpecSha, $(if ($ExpectSpecSha256) { $ExpectSpecSha256 } else { 'none' }), $legId)
 if ($ExpectSpecSha256) {
     if ($readSpecSha -cne $ExpectSpecSha256) { Write-Output "DVE_LEG_SPEC_REFUSED planned_sha256=$ExpectSpecSha256 read_sha256=$readSpecSha" }
+    if ($readSpecSha -cne $ExpectSpecSha256 -and $env:DVT_HANG_AFTER_REFUSAL -and $Venue -eq $env:DVT_HANG_AFTER_REFUSAL) { Start-Sleep -Seconds 90 }   # outlives the supplementary cap: a TIMEOUT that printed its refusal
     if ($readSpecSha -cne $ExpectSpecSha256) { throw "DVE_LEG_SPEC_CHANGED the leg spec '$LegSpec' read as sha256 $readSpecSha, not $ExpectSpecSha256; nothing is generated or submitted" }
 }
 $rdir = Join-Path $env:DVT_LEG_ROOT ('receipts\' + $Venue); New-Item -ItemType Directory -Force -Path $rdir | Out-Null
@@ -6979,6 +6987,80 @@ exit 0
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         bound = [l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ")]
         self.assertEqual(bound, [f"DVT_PLANNED spec=A.json bound={fsha} own={fsha}", f"DVT_PLANNED spec=a.json bound={wsha} own={wsha}"], proc.stdout + proc.stderr)
+
+    # BATCH-3 r9 (adversary pass 11 on f42e44a8, A2): the batch's -LegSet loop parsed the shape check's bytes BEFORE comparing them with the planner's sha256, so bytes that
+    # changed after planning into something that is not JSON were refused as LEG_SPEC_INVALID and never named as SPEC_CHANGED_AFTER_PREFLIGHT with the planned hash.
+    def test_planned_hash_bind_b3_r9_a2_batch_legset_bytes_cut_to_one_brace_after_planning_are_spec_changed_not_spec_invalid(self) -> None:
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.BATCH_PLAN_ANCHOR, self.BATCH_PLAN_ANCHOR + self.BATCH_SWAP),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_STOP_ANCHOR, self.BATCH_STOP)])
+        target = dv / "legs" / self.SWAP_TARGET
+        planned = hashlib.sha256(target.read_bytes()).hexdigest()
+        brace = self.tmp / "one-brace.json"
+        brace.write_bytes(b"{")
+        from datetime import datetime, timedelta, timezone
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fake = self.tmp / "batch-fake-script.ps1"
+        fake.write_text("exit 0\n", encoding="utf-8")
+        proc = run_pwsh(["-File", str(dv / "Invoke-VenueLeaseBatch.ps1"), "-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-RunDir", str(self.tmp / "batch-run"),
+                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake),
+                         "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline],
+                        env_extra={"DVT_SWAP_TO": str(target), "DVT_SWAP_FROM": str(brace), "DVT_SWAP_MODE": "copy"}, timeout=420)
+        self.assertEqual(target.read_bytes(), b"{", "the fixture really cut the planned spec to one brace")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        refusal = [l for l in proc.stderr.splitlines() if l.startswith("BATCH_USAGE SPEC_CHANGED_AFTER_PREFLIGHT ")]
+        self.assertEqual(len(refusal), 1, "old: BATCH_USAGE LEG_SPEC_INVALID (the shape check parsed the new bytes first)\n" + proc.stderr)
+        self.assertIn(f"read as sha256 {hashlib.sha256(b'{').hexdigest()} after the leg-set planner judged sha256 {planned} (planned_sha256={planned})", refusal[0])
+        self.assertFalse((self.tmp / "claims").exists() and any((self.tmp / "claims").iterdir()), "no claim is taken")
+
+    # BATCH-3 r9 (adversary pass 11 on f42e44a8, A4): the supplementary child's refusal was logged but its result row carried no specRefusal, and a supplementary child that
+    # printed its refusal and was then cut at the cap (TIMEOUT) was never read for one at all.
+    def supp_swap_run(self, *extra: str, hang: bool = False):
+        dv = self.mutated_runner([])
+        spec = self.tmp / "supp-leg.json"
+        spec.write_text(json.dumps({"legId": "supp-leg", "backends": ["cpu"], "criteria": {"acceptance": {"cpu": []}, "supplementary": {"cpu": []}}}), encoding="utf-8")
+        twin = self.tmp / "supp-leg-visual-twin.json"
+        twin.write_text(json.dumps({"legId": "supp-leg-visual-twin", "backends": ["cpu"], "criteria": {"acceptance": {"cpu": []}, "supplementary": {"cpu": []}}}), encoding="utf-8")
+        um_share = self.tmp / "um-share"
+        (um_share / "cache").mkdir(parents=True)
+        (um_share / "cache" / f"playback-attr-3-cuda-{self.sha[:12]}-build.json").write_text('{"fixture":"staged-on-ultra-magnus"}', encoding="utf-8")
+        fx = self.chain_fixture(dv, spec, twin, venue="ultra-magnus")
+        if hang:
+            fx["env"]["DVT_HANG_AFTER_REFUSAL"] = "ultra-magnus"
+        proc = self.run_fixture_chain(dv, fx, ["-LegSpec", str(spec), "-SupplementaryAgentShare", str(um_share), *extra])
+        result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
+        return proc, result
+
+    def test_planned_hash_bind_b3_r9_a4_a_failed_supplementary_refusal_is_on_its_result_row(self) -> None:
+        proc, result = self.supp_swap_run()
+        rows = [r for r in result["supplementary"] if r.get("status") in ("FAILED", "TIMEOUT", "RAN")]
+        self.assertEqual([(r["status"], r.get("specRefusal")) for r in rows], [("FAILED", "DVE_CHAIN_SPEC_CHANGED")], "old: the FAILED row had no specRefusal\n" + proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 0, "a supplementary result never moves the chain's exit\n" + proc.stdout + proc.stderr)
+
+    def test_planned_hash_bind_b3_r9_a4_a_timed_out_supplementary_child_that_printed_its_refusal_keeps_it(self) -> None:
+        proc, result = self.supp_swap_run("-TestSupplementaryCapSec", "8", hang=True)
+        rows = [r for r in result["supplementary"] if r.get("status") in ("FAILED", "TIMEOUT", "RAN")]
+        self.assertEqual([(r["status"], r.get("specRefusal")) for r in rows], [("TIMEOUT", "DVE_CHAIN_SPEC_CHANGED")], "old: a TIMEOUT was never read for its refusal\n" + proc.stdout + proc.stderr)
+        self.assertTrue(any(" DVE_CHAIN_SPEC_CHANGED " in l and "role=supplementary" in l for l in proc.stdout.splitlines()), proc.stdout)
+
+    # BATCH-3 r9 (adversary pass 11 on f42e44a8, A10): the stand-in leg had no DVE_LEG_SPEC_UNREADABLE path, so the chain's SPEC_UNREADABLE label was never exercised end to end.
+    def test_planned_hash_bind_b3_r9_a10_a_planned_spec_deleted_before_its_leg_is_spec_unreadable(self) -> None:
+        dv = self.mutated_runner([])
+        target = dv / "legs" / self.SWAP_TARGET
+        planned = hashlib.sha256(target.read_bytes()).hexdigest()
+        fx = self.chain_fixture(dv, target, None, mode="delete")
+        proc = self.run_fixture_chain(dv, fx, ["-LegSpec", str(target), "-Backend", "cuda", "-NoSupplementary"])
+        self.assertFalse(target.exists(), "the fixture really deleted the planned spec")
+        self.assertEqual(proc.returncode, 7, proc.stdout + proc.stderr)
+        result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
+        self.assertEqual([(r["status"], r.get("specRefusal")) for r in result["legs"]], [("LEG_FAILED", "DVE_CHAIN_SPEC_UNREADABLE")], proc.stdout + proc.stderr)
+        self.assertTrue(any(f" DVE_CHAIN_SPEC_UNREADABLE leg=01-m16-1457-native-windowed-s1-cuda planned_sha256={planned}" in l for l in proc.stdout.splitlines()), proc.stdout)
+
+    def test_planned_hash_bind_b3_r9_a10_the_fixture_leg_mirrors_the_real_legs_unreadable_record(self) -> None:
+        leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("try { $specBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $LegSpec).Path) }", leg)
+        self.assertIn('Write-Output "DVE_LEG_SPEC_UNREADABLE planned_sha256=$ExpectSpecSha256"', leg)
+        self.assertIn("try { $bytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $LegSpec).Path) }", self.CHAIN_FAKE_LEG)
+        self.assertIn('Write-Output "DVE_LEG_SPEC_UNREADABLE planned_sha256=$ExpectSpecSha256"', self.CHAIN_FAKE_LEG)
 
 
 # ---------------------------------------------------------------------------------------------------

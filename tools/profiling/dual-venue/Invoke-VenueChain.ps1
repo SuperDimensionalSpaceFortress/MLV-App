@@ -412,13 +412,15 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
         try { if ($sReceipt -and (Test-Path -LiteralPath $sReceipt -PathType Leaf)) { $sRole = [string](([IO.File]::ReadAllText($sReceipt) | ConvertFrom-Json).venue.role) } } catch { }
         $sStatus = $(if ($sr.timedOut) { 'TIMEOUT' } elseif ($sr.exit -ne 0) { 'FAILED' } else { 'RAN' })
         # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1: a supplementary child that refused other bytes than the planned ones says so on its own typed line (classified from its stdout only)
-        $sSpecRefusal = $(if ($sStatus -ceq 'FAILED' -and -not $sReceipt) { Get-LegSpecRefusalLine $sLines $Leg } else { '' })
+        # (BATCH-3 r9, adversary pass 11 A4: on every status but RAN, a TIMEOUT included: a child that printed its refusal and was then cut at the cap still refused the bytes)
+        $sSpecRefusal = $(if ($sStatus -cne 'RAN' -and -not $sReceipt) { Get-LegSpecRefusalLine $sLines $Leg } else { '' })
         # (r2, adversary A5: the label's log write may fail; it never replaces the observed child failure recorded by Add-SuppResult below)
         if ($sSpecRefusal) { try { L "$sSpecRefusal venue=$suppVenue role=supplementary (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)" } catch { [Console]::Error.WriteLine("$sSpecRefusal venue=$suppVenue role=supplementary (chain log write failed: $($_.Exception.Message -replace '\s+', ' '))") } }
         # Whatever the leg printed, a leg that died or timed out is INVALID evidence, never a measurement (the Bachelor rule); and nothing here is read as a timing verdict.
         $shownOutcome = $(if ($sStatus -ceq 'RAN') { $sOutcome } else { 'INVALID' })
         $extra = @{ quietVerdict = $sq.verdict; quietMean = $sq.mean; outcome = $shownOutcome; printedOutcome = $sOutcome; legExit = $sr.exit; timedOut = $sr.timedOut; receipt = $sReceipt; receiptRole = $sRole
             umManifestSha256 = $built.sha256; elapsedSec = [int]([DateTime]::UtcNow - $t0s).TotalSeconds; outcomeDetail = $sDetail }
+        if ($sSpecRefusal) { $extra.specRefusal = ($sSpecRefusal -split ' ', 2)[0] }   # BATCH-3 r9 (adversary pass 11 A4): on the row, as the primary leg's LEG_FAILED carries it
         if ($sr.timedOut) {
             # The client was killed, the job it submitted was not: keep the job's identity (what the client printed before it went silent) and reconcile it BEFORE the venue is read as idle.
             # No id printed = nothing to look up = the venue is busy-or-unknown, never open. The claim is still released below; it is not the proof.
