@@ -13305,7 +13305,18 @@ void MainWindow::playbackHandling(int timeDiff)
                     const bool everyFrameUnpaced = !( playbackPaceGuardFps() > 0.0 );
                     if( !playbackEveryFrameTickMayAdvance( everyFrameUnpaced, false, m_playbackEveryFrameAcceptedFrame, everyFrameTarget,
                                                            playbackEveryFrameTickConsultsOutstanding( everyFrameUnpaced, false, m_playbackEveryFrameAcceptedFrame, everyFrameTarget )
-                                                               && playbackTargetPresentOutstanding( everyFrameTarget ) ) ) return;
+                                                               && playbackTargetPresentOutstanding( everyFrameTarget ) ) )
+                    {
+                        // fix 2 (adversary A1 on 06031667): a target already published Ready whose frameReady was handled while the
+                        // slider was still on the frame before gets no further callback, so the hold would wait forever. Ask
+                        // drawFrameReady to take it (queued; at most one per held tick); with nothing to take it is the empty path.
+                        if( m_pRenderThread
+                         && m_pRenderThread->hasReadyFrameForPlaybackTarget(
+                                static_cast<uint32_t>( everyFrameTarget ),
+                                m_playbackPresentationGeneration.load( std::memory_order_acquire ) ) )
+                            QMetaObject::invokeMethod( this, "drawFrameReady", Qt::QueuedConnection );
+                        return;
+                    }
                     if( !m_playbackPaceGuard.grantWholeFrame( paceNowMs, playbackPaceGuardFps() ) ) return;
                     // PLAYBACK-CLIP-LENGTH-ENFORCE-3: every source frame the engine advances is counted (the
                     // slider value AFTER setValue, so a clamp at the slider maximum is not counted as footage).

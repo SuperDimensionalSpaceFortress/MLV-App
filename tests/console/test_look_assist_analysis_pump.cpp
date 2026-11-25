@@ -587,10 +587,13 @@ TEST(LookAssistAnalysisPumpWiring, ATogglePutsAPendingResultOutOfDate)
 TEST(LookAssistAnalysisPumpWiring, TheQueuedDeliveriesToMainWindowAreTheOnesInTheCensus)
 {
     const QString source = mainWindowSource();
-    // The async result. Its one other mention is in a comment.
-    ASSERT_EQ( 1, static_cast<int>( source.count( QStringLiteral( "QMetaObject::invokeMethod( this," ) ) ) );
-    // The async result, and playbackPrepResultReady -> onPlaybackPrepResultReady, which holds itself.
-    ASSERT_EQ( 2, static_cast<int>( source.count( QStringLiteral( "Qt::QueuedConnection" ) ) ) );
+    // The async result (its one other mention is in a comment), and PLAYBACK-UNPACED-EVERY-TARGET-PAINTED-CUDA-1's held-tick
+    // drawFrameReady: posted by the GUI thread to itself, to the slot the render thread's queued frameReady already reaches, so a pump
+    // turn can deliver nothing it could not deliver before (classified: same delivery class as frameReady).
+    ASSERT_EQ( 2, static_cast<int>( source.count( QStringLiteral( "QMetaObject::invokeMethod( this," ) ) ) );
+    ASSERT_EQ( 1, static_cast<int>( source.count( QStringLiteral( "QMetaObject::invokeMethod( this, \"drawFrameReady\", Qt::QueuedConnection );" ) ) ) );
+    // The async result, playbackPrepResultReady -> onPlaybackPrepResultReady (which holds itself), and the held-tick drawFrameReady.
+    ASSERT_EQ( 3, static_cast<int>( source.count( QStringLiteral( "Qt::QueuedConnection" ) ) ) );
 }
 
 // Adversary A1 on c9759a07: QEvent::clone is Qt 6, and Qt 5 is still a documented kit (macOS-Intel.yml installs it). No code

@@ -56,6 +56,11 @@ struct EveryFrameModel
     std::vector<int> presented;
     int maxLeadPastAccepted = 0;
     int heldTicks = 0;
+    // fix 2 (adversary A1 on 06031667): with notifyModel, frameReady runs only on a pending notification (one per publish), as
+    // the frameReady signal does; kickOnHold is MainWindow's queued drawFrameReady for a held target already published Ready
+    bool notifyModel = false;
+    bool kickOnHold = true;
+    int notifications = 0;
 
     EveryFrameModel( int firstFrame, int lastFrame ) : first( firstFrame ), last( lastFrame ), target( firstFrame )
     {
@@ -80,6 +85,7 @@ struct EveryFrameModel
         if( !playbackEveryFrameTickMayAdvance( true, false, accepted, target, outstanding ) )
         {
             ++heldTicks;
+            if( kickOnHold && ready.count( target ) ) ++notifications;
             return;
         }
         ++target;
@@ -112,6 +118,11 @@ struct EveryFrameModel
 
     bool frameReady()
     {
+        if( notifyModel )
+        {
+            if( notifications == 0 ) return false;
+            --notifications;
+        }
         // prune: a slot below the target is released unpainted
         while( !ready.empty() && *ready.begin() < target ) ready.erase( ready.begin() );
         if( !ready.count( target ) ) return false;
@@ -298,6 +309,43 @@ TEST( EveryFrameTargetGate, SeededRandomEventMixPaintsEveryFrameOnceInOrder )
     }
 }
 
+// fix 2 (adversary A1 on 06031667): frames 6 and 7 (the cut-out) were published Ready and their frameReady callbacks handled while
+// the slider was still on 5, so no callback is left and no new lookahead is requested. Without the held tick's queued
+// drawFrameReady the hold waits forever; with it every frame is taken, in order.
+TEST( EveryFrameTargetGate, AHeldTargetWhoseCallbackWasAlreadyHandledIsStillTaken )
+{
+    for( int kick = 0; kick < 2; ++kick )
+    {
+        // last = 8 so frame 7 is taken by the every-frame branch (the cut-out's own branch is adversary A2, outside this model);
+        // 8 is requested but never published here
+        EveryFrameModel model( 1, 8 );
+        model.notifyModel = true;
+        model.kickOnHold = kick != 0;
+        model.requested.clear();
+        model.target = 5;
+        model.accepted = 5;
+        model.presented = { 1, 2, 3, 4, 5 };
+        model.ready = { 6, 7 };
+        model.notifications = 0;
+        for( int step = 0; step < 100 && model.presented.back() != 7; ++step )
+        {
+            model.pollTick();
+            model.frameReady();
+        }
+        if( kick == 0 )
+        {
+            ASSERT_EQ( 5, model.presented.back() );   // the stall the adversary traced: held at 6 with 6 Ready and no callback
+            ASSERT_EQ( 6, model.target );
+            ASSERT_TRUE( model.heldTicks > 50 );
+        }
+        else
+        {
+            ASSERT_TRUE( ( model.presented == std::vector<int>{ 1, 2, 3, 4, 5, 6, 7 } ) );
+            ASSERT_TRUE( model.maxLeadPastAccepted <= 1 );
+        }
+    }
+}
+
 // ---- (3) wiring -----------------------------------------------------------------------------------------------------
 TEST( EveryFrameTargetGate, TheHoldSitsInTheDropFrameOffBranchBeforeGrantWholeFrameAndPassesUnpaced )
 {
@@ -328,8 +376,16 @@ TEST( EveryFrameTargetGate, TheHoldSitsInTheDropFrameOffBranchBeforeGrantWholeFr
     // consults-check the verdict uses, so a paced tick never takes the render mutex
     const QString outstandingArg = QStringLiteral(
         "playbackEveryFrameTickConsultsOutstanding( everyFrameUnpaced, false, m_playbackEveryFrameAcceptedFrame, everyFrameTarget ) "
-        "&& playbackTargetPresentOutstanding( everyFrameTarget ) ) ) return;" );
-    ASSERT_TRUE( call.endsWith( outstandingArg ) );
+        "&& playbackTargetPresentOutstanding( everyFrameTarget ) ) ) {" );
+    ASSERT_TRUE( call.contains( outstandingArg ) );
+    // fix 2 (adversary A1 on 06031667): the held tick asks drawFrameReady to take a target already published Ready (its frameReady
+    // may have been handled while the slider was on the frame before), then returns
+    const QString kick = call.mid( call.indexOf( outstandingArg ) + outstandingArg.length() );
+    ASSERT_TRUE( kick.contains( QStringLiteral( "if( m_pRenderThread && m_pRenderThread->hasReadyFrameForPlaybackTarget( "
+                                                "static_cast<uint32_t>( everyFrameTarget ), " ) ) );
+    ASSERT_EQ( 1, countOccurrences( kick, QStringLiteral( "invokeMethod" ) ) );
+    ASSERT_TRUE( kick.endsWith( QStringLiteral(
+        "QMetaObject::invokeMethod( this, \"drawFrameReady\", Qt::QueuedConnection ); return;" ) ) );
     ASSERT_EQ( 1, countOccurrences( body, QStringLiteral( "playbackTargetPresentOutstanding(" ) ) );
     // fix 1 (adversary A4 on 5370a8e6): the polarity -- outstanding holds, never its negation
     ASSERT_FALSE( call.contains( QStringLiteral( "!playbackTargetPresentOutstanding" ) ) );
