@@ -429,6 +429,8 @@ public:
         const long long moved = static_cast<long long>( toPosition ) - m_timelinePosition;
         m_correctedFrames += moved;
         m_correctionMoves.push_back( moved );
+        // r3 iteration 1 (adversary pass 6 A2): the timeline's travel (corrections out) where this correction lands it
+        m_correctionTravel.push_back( static_cast<long long>( toPosition ) - m_startPosition - m_correctedFrames );
         m_timelinePosition = toPosition;
     }
 
@@ -440,6 +442,7 @@ public:
     {
         m_correctedFrames = m_displayCorrectedFrames;
         m_correctionMoves.resize( m_correctionMovesLanded );
+        m_correctionTravel.resize( m_correctionMovesLanded );
         // r3: the first present's count of corrections loses the dropped ones too, so a later correction (it reuses their FIFO
         // index) is still known to have been made after the first present
         m_correctionMovesAtFirstPresent = std::min( m_correctionMovesAtFirstPresent, m_correctionMovesLanded );
@@ -518,11 +521,24 @@ public:
         // FIFO order) was made AFTER the first present. One made before it was already taken out of the jump, which is then the
         // rebased interval's own travel (10 corrected to 40, granted to 45, first present 10, 45 lands it: the jump 41..44 IS the
         // interval), so the base rule below spends it once against the interval's skips, never as catch-up AND slips.
-        if( s.rebase && m_presents == 2 && m_firstPresentJumpFrames > 0
-         && m_correctionMovesLanded > m_correctionMovesAtFirstPresent )
+        // r3 iteration 1 (adversary pass 6 A2 on f8d80862): and only the part of the jump passed AFTER that correction. The jump
+        // is the net positions ( displayTravel, T1 ) exclusive, T1 the first present's travel with the corrections out; the
+        // correction left the timeline at net travel C, so the interval's frames in the jump are the last min( jump, T1 - C - 1 ).
+        // The rest was passed before the correction (10 -> 15, corrected to 40, first present 10 at 40: all four of 11..14) and
+        // is startup catch-up of its own, never cover for the interval's skips 41..44.
+        if( s.rebase && m_presents == 2 && m_firstPresentJumpFrames > 0 )
         {
-            m_startupCatchupFrames += m_firstPresentJumpFrames;
-            m_firstPresentJumpFrames = 0;
+            long long cover = 0;
+            if( m_correctionMovesLanded > 0 && m_correctionMovesLanded <= m_correctionMovesAtFirstPresent
+             && m_correctionMovesLanded <= m_correctionTravel.size() )
+            {
+                const long long firstTravel =
+                    static_cast<long long>( m_timelineAtFirstPresent ) - m_startPosition - m_correctedAtFirstPresent;
+                const long long after = firstTravel - m_correctionTravel[m_correctionMovesLanded - 1] - 1;
+                cover = std::max( 0LL, std::min( static_cast<long long>( m_firstPresentJumpFrames ), after ) );
+            }
+            m_startupCatchupFrames += m_firstPresentJumpFrames - static_cast<int>( cover );
+            m_firstPresentJumpFrames = static_cast<int>( cover );
         }
         int slip = 0;
         if( ( s.rebase && s.rebaseLapped ) || s.displayFrame < m_lastDisplayFrame )
@@ -873,6 +889,7 @@ private:
     long long m_displayCorrectedFrames = 0;     // r2: the signed sum of the landed ones (the display side of m_correctedFrames)
     long long m_correctedAtFirstPresent = 0;    // r2: m_correctedFrames when the first present was recorded
     size_t m_correctionMovesAtFirstPresent = 0; // r3: how many corrections were made before the first present (pass 5 A1)
+    std::vector<long long> m_correctionTravel;  // r3 iteration 1: the net timeline travel each correction left (pass 6 A2)
     double m_paceFps = 0.0;
     double m_periodMs = 0.0;
 

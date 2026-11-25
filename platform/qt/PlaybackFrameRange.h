@@ -435,8 +435,8 @@ inline DropFrameTickResult advanceDropFrameTick(
         // conform off: width 0) has no phase to keep, but a start outside its one frame [wrapAt, wrapAt + 1) is still corrected
         // onto that frame (wrapAt = cutIn - 1) before the delta: corrections (i) and (ii) for width 0. The `loopWidth > 0` guard
         // above skipped them, so a playhead at 10 advanced to 10.192 and a stale 100 to 100.192 with a lap. A start inside the
-        // frame is unchanged, bit for bit (its zero-width lap below is the base's, DROP-FRAME-ZERO-WIDTH-LOOP-STALE-LAP-1); a NaN
-        // start fails both comparisons and is not corrected; +-inf are corrected onto the frame.
+        // frame is not corrected (and, iteration 1, no tick on a zero-width cut laps: see the lap branch below); a NaN start
+        // fails both comparisons and is not corrected; +-inf are corrected onto the frame.
         if( currentPosition < wrapAt || currentPosition >= wrapAt + 1.0 )
         {
             start = wrapAt;
@@ -451,7 +451,10 @@ inline DropFrameTickResult advanceDropFrameTick(
     // 1.7763568394002505e-15 leaves 1024 at 1024 and applied nothing. Under Loop the start is below wrapAt here (r9: every
     // start at or past it was folded above), so this subtraction is never 1100000 away from a stale start past the cut.
     double applied = result.position - start;
-    if( loopEnabled && result.position >= wrapAt )
+    // r3 iteration 1 (adversary pass 6 A1 on f8d80862): a zero-width Loop cut has no lap. A zero-width lap moves nothing back,
+    // so it was never a wrap: the base recorded one per tick from the cut's one frame (DROP-FRAME-ZERO-WIDTH-LOOP-STALE-LAP-1),
+    // and r3's correction onto that frame turned a 10 + 0 tick, which applies nothing, into one. Every other width is unchanged.
+    if( loopEnabled && loopWidth != 0 && result.position >= wrapAt )
     {
         result.wrapWidth = cutOutValue - cutInValue + ( presentLastFrame ? 1 : 0 );
         // r33 (adversary A1 on e0947e37): wrap by as many whole laps as the applied delta crossed, so the position lands back
