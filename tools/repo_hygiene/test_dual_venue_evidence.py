@@ -312,6 +312,12 @@ DRIFT_VISUAL_LEGS = {"legs/m16-1457-drift-t1-w10-visual-unpaced-fullscreen-s1.js
                      "legs/m16-1457-drift-t16-w10-visual-unpaced-fullscreen-s1.json": None}
 DRIFT_LEGS = {**DRIFT_LEGS, **{rel: "legs/m16-1457-headroom-unpaced-fullscreen-s1.json" for rel in (*DRIFT_T1_LEGS, *DRIFT_W10_LEGS, *DRIFT_VISUAL_LEGS)}}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *DRIFT_LEGS)
+# EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1: the unpinned every-frame leg, keyed to the leg it copies. Master's oldest-ready-first rule
+# (PlaybackFrameRange.h playbackAcquiresOldestReadyFirst = playing && (!dropFrameMode || pinnedCapture)) covers every drop-frame-off Play, pinned or not;
+# a venue leg never passes --presented-frames, so it is the unpinned case. The 1243 unpaced swap-interval-0 headroom leg with the capture on (a '-visual-'
+# twin: its fps is observer-perturbed, never a matrix speed cell) and conformMaxJump eq 1 (no skipped source frame) appended to each criteria list.
+# EveryFrameOldestFirstLegSpecTests pins the shape.
+EVERY_FRAME_OLDEST_FIRST_LEGS = {"legs/m16-1243-everyframe-visual-unpaced-fullscreen-s1.json": "legs/m16-1243-headroom-unpaced-fullscreen-s1.json"}
 # CPU-S1-1457-HEAVY-SPEC-AND-STALE-FIELDS-1: the two cpu-only fullscreen s1 HEAVY legs with Look Assist ON, keyed to the tracked spec each one mirrors (UFI-1 successor C2):
 # the M16-1457 paced cuda s1 HEAVY leg with backend cpu, and the M16-1243 unpaced stage leg with backend cpu (the untracked X7 shape). Each differs from its source only in
 # legId, card, backends and the cpu criteria list; test_the_cpu_s1_heavy_legs_mirror_their_cuda_sources pins that.
@@ -319,6 +325,7 @@ CPU_S1_HEAVY_LEGS = {"legs/m16-1457-native-cpu-fullscreen-s1-heavy.json": "legs/
                      "legs/m16-1243-headroom-stage-cpu-fullscreen-s1.json": "legs/m16-1243-headroom-stage-fullscreen-s1.json"}
 CPU_S1_HEAVY_UNPACED_LEG = "legs/m16-1243-headroom-stage-cpu-fullscreen-s1.json"   # the one unpaced (swap interval 0) leg of the pair: it carries presentTearingExpectedReason
 SHIPPED_LEGS = (*SHIPPED_LEGS, *CPU_S1_HEAVY_LEGS)
+SHIPPED_LEGS = (*SHIPPED_LEGS, *EVERY_FRAME_OLDEST_FIRST_LEGS)
 assert len(set(SHIPPED_LEGS)) == len(SHIPPED_LEGS), "a shipped leg is listed twice"
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
@@ -19513,7 +19520,12 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
     CLIP = "M16-1457"
     SPECS = tuple(f"legs/m16-{clip}-conform-{mode}-s1.json" for clip in ("1456", "1457") for mode in ("windowed", "fullscreen"))
 
-    def chain(self, measured: str, coverage: str | None = "1498", ends: bool = True) -> list[dict]:
+    def chain(self, measured: str, coverage: str | None = "1498", ends: bool = True, *, specs: tuple[str, ...] | None = None, clip: str | None = None,
+              backends: tuple[str, ...] = ("cuda",), head: tuple[str, str] | None = None, summary: str | None = None) -> list[dict]:
+        # EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1: the same chain judges any committed spec (`specs`, `clip`) on each of its `backends`; `head`
+        # (the pacing-isolation line, the conform line's head) and `summary` replace the conformed 59.94 -> 24 run's lines for a run of another shape.
+        specs = self.SPECS if specs is None else specs
+        clip = self.CLIP if clip is None else clip
         # r28 fix iteration 2 (adversary A4 on 4201a437): the app prints source_advanced (the presented coverage) on every conform line, and a line
         # without it now fails closed; a measured line that does not name it carries the in-step coverage unless `coverage` is None.
         if measured and coverage is not None and "source_advanced=" not in measured:
@@ -19528,11 +19540,11 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         # fails closed; a measured line that does not name it carries backward=0 (no seek) unless `ends` is False.
         if measured and ends and "backward=" not in measured:
             measured += " backward=0"
-        log = "\n".join([
+        pacing, conform_head = head if head is not None else (
             "interaction_trace event=automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=0 persisted_frame_rate=24.000 drop_frame=1 settings_store=run_scoped",
-            "playback_smoke.measured_session id=3",
-            "playback_smoke.conform session=3 clip_fps=59.940 playback_fps=24.000 conform_active=1 conform_enabled=1 conform_env_override=1" + measured,
-            conformed_summary_line()]) + "\n"
+            "playback_smoke.conform session=3 clip_fps=59.940 playback_fps=24.000 conform_active=1 conform_enabled=1 conform_env_override=1")
+        log = "\n".join([pacing, "playback_smoke.measured_session id=3", conform_head + measured,
+                         conformed_summary_line() if summary is None else summary]) + "\n"
         sha = hashlib.sha256(log.encode("utf-8")).hexdigest()
         script = (
             "$summary = [pscustomobject]@{ sourceFrames = [pscustomobject]@{ sourceAdvanced = 1499; requiredSourceFrames = 1499; failures = @() }; fixtureRehearsal = $false;"
@@ -19545,16 +19557,17 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
             " -ExpectedClipId $env:DVE_CLIP -RequestedConform ([string]$spec.generatorArgs.playbackConform)\n"
             "  $arm = Get-DvConformArmVerdict -Spec $spec -Playback $pb\n"
             "  $m = Get-DvCriteriaMetrics -Metrics (Get-DvVerbatimMetrics -Summary $summary -EvidenceManifest $manifest) -Playback $pb\n"
-            "  foreach ($role in 'acceptance', 'supplementary') {\n"
-            "    $v = Test-DvCriteria -Criteria $spec.criteria.$role.cuda -Metrics $m\n"
-            "    [ordered]@{ spec = $rel; role = $role; valid = $pb.valid; honoured = $arm.honoured; blocks = $arm.blocks; pass = $v.pass; failures = @($v.failures);"
-            " sourceFps = $pb.conformSourceFps; maxJump = $pb.conformMaxJump; audioSync = $pb.conformAudioSyncRequests }\n"
-            "  }\n"
+            "  foreach ($role in 'acceptance', 'supplementary') { foreach ($backend in ($env:DVE_BACKENDS -split ';')) {\n"
+            "    $v = Test-DvCriteria -Criteria $spec.criteria.$role.$backend -Metrics $m\n"
+            "    [ordered]@{ spec = $rel; role = $role; backend = $backend; valid = $pb.valid; honoured = $arm.honoured; blocks = $arm.blocks; pass = $v.pass;"
+            " failures = @($v.failures); sourceFps = $pb.conformSourceFps; maxJump = $pb.conformMaxJump; audioSync = $pb.conformAudioSyncRequests }\n"
+            "  } }\n"
             "}\n"
             "ConvertTo-Json -InputObject @($out) -Compress -Depth 5")
-        proc, out = run_pwsh_json(script, DVE_LOG=log, DVE_SHA=sha, DVE_NONCE=NONCE, DVE_CLIP=self.CLIP, DVE_DV=str(DV), DVE_SPECS=";".join(self.SPECS))
+        proc, out = run_pwsh_json(script, DVE_LOG=log, DVE_SHA=sha, DVE_NONCE=NONCE, DVE_CLIP=clip, DVE_DV=str(DV), DVE_SPECS=";".join(specs),
+                                  DVE_BACKENDS=";".join(backends))
         self.assertIsNotNone(out, proc.stdout + proc.stderr)
-        self.assertEqual(len(out), 2 * len(self.SPECS), out)
+        self.assertEqual(len(out), 2 * len(specs) * len(backends), out)
         for row in out:
             # the run itself is sound and honoured: only the criteria decide
             self.assertEqual((row["valid"], row["honoured"], row["blocks"]), (True, True, False), row)
@@ -19761,8 +19774,129 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
                                  "(Get-DvCriteriaMetrics -Metrics $metrics -Playback $derived)"], calls)
 
 
+class EveryFrameOldestFirstLegSpecTests(unittest.TestCase):
+    """EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1: the unpinned every-frame leg. Master acquires the oldest ready frame first on every drop-frame-off Play,
+    pinned or not (PlaybackFrameRange.h playbackAcquiresOldestReadyFirst; the call site's pinned flag is m_playbackSmokeTargetPresentedFrames > 0, which no venue
+    leg sets). The leg is the 1243 unpaced (drop-frame off, fail closed UNPACED_NOT_HONOURED) swap-interval-0 fullscreen s1 headroom leg, the most frames ready at
+    once, with the visual capture on and the app's own conform max_jump judged: conformMaxJump eq 1 means every source frame was shown, once, in order."""
+
+    CARD = "EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1"
+    MAX_JUMP = {"metric": "conformMaxJump", "op": "eq", "value": 1}
+    OPT_OUT = ("visualCapture", "visualCaptureOptOutReason")
+    # A native-pace (unconformed) 23.976 fps run: the pacing line with drop-frame off, the conform line the app prints on every session (conform_active=0),
+    # and a summary paced at the native rate. The source counts stay the chain's (1499 from frame 0), so its coverage and ends defaults hold.
+    HEAD = ("interaction_trace event=automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=0 persisted_frame_rate=23.976 drop_frame=0 settings_store=run_scoped",
+            "playback_smoke.conform session=3 clip_fps=23.976 playback_fps=23.976 conform_active=0 conform_enabled=1 conform_env_override=0 audio_sync_requests=0")
+
+    def setUp(self) -> None:
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema is required")
+        self.jsonschema = jsonschema
+        self.schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+
+    def load(self, rel: str) -> dict:
+        return json.loads((DV / rel).read_text(encoding="utf-8"))
+
+    def test_the_leg_is_its_source_except_the_leg_id_the_card_the_capture_and_the_appended_max_jump(self) -> None:
+        for rel, source_rel in EVERY_FRAME_OLDEST_FIRST_LEGS.items():
+            with self.subTest(leg=rel):
+                text = (DV / rel).read_text(encoding="utf-8")
+                spec, source = json.loads(text), self.load(source_rel)
+                self.assertIs(source["visualCapture"], False, "the source keeps its opt-out: its fps must not be perturbed by the capture tail")
+                self.assertEqual(sorted(source["criteria"]), ["acceptance", "supplementary"])
+                for role, per in source["criteria"].items():
+                    self.assertEqual(sorted(per), ["cpu", "cuda"], role)
+                    self.assertNotIn(self.MAX_JUMP, [*per["cuda"], *per["cpu"]], "the source does not judge max_jump yet")
+                expected = {k: v for k, v in source.items() if k not in self.OPT_OUT}
+                expected.update(legId=Path(rel).stem, card=self.CARD,
+                                criteria={role: {b: [*items, self.MAX_JUMP] for b, items in per.items()} for role, per in source["criteria"].items()})
+                self.assertEqual(spec, expected, "only legId, card, the removed opt-out and the appended conformMaxJump differ")
+                self.assertEqual(list(spec), [k for k in source if k not in self.OPT_OUT], "the source's keys in the source's order")
+                for role in ("acceptance", "supplementary"):
+                    for backend in ("cuda", "cpu"):
+                        self.assertEqual(spec["criteria"][role][backend][-1], self.MAX_JUMP, (role, backend))
+                        self.assertEqual(spec["criteria"][role][backend].count(self.MAX_JUMP), 1, (role, backend))
+                self.assertEqual(text, json.dumps(spec, indent=2, ensure_ascii=False) + "\n", "the source's formatting")
+                self.assertEqual((DV / source_rel).read_text(encoding="utf-8"), json.dumps(source, indent=2, ensure_ascii=False) + "\n")
+
+    def test_the_leg_validates_and_is_an_unpaced_unpinned_visual_twin(self) -> None:
+        for rel in EVERY_FRAME_OLDEST_FIRST_LEGS:
+            with self.subTest(leg=rel):
+                spec = self.load(rel)
+                self.jsonschema.validate(spec, self.schema)
+                self.assertEqual(spec["legId"], Path(rel).stem)
+                self.assertIn("-visual-", spec["legId"], "a twin's fps is observer-perturbed: the name keeps it out of a matrix speed cell")
+                self.assertEqual(spec["legType"], "speed", "the capture only exists on a speed leg")
+                self.assertNotIn("visualCapture", spec, "absent means on")
+                self.assertNotIn("visualCaptureOptOutReason", spec)
+                ga = spec["generatorArgs"]
+                for key in ("unpaced", "forceLookAssist", "presentTrace"):
+                    self.assertIs(ga[key], True, key)
+                self.assertEqual(ga["swapInterval"], 0, "the most frames ready at once: the worst case for oldest-ready-first")
+                self.assertNotIn("playbackConform", ga, "a native-pace Play, not a conform arm")
+                self.assertEqual((spec["clipId"], spec["playSeconds"], spec["backends"], spec["scaleFactor"], spec["displayMode"]),
+                                 ("M16-1243", 20, ["cuda", "cpu"], 1, "fullscreen"))
+
+    def test_the_card_takes_its_sources_role_on_each_venue(self) -> None:
+        """Bachelor is acceptance for the source's card (CUDA-HEADROOM-1); an unlisted card would take defaultRole (supplementary) there."""
+        table = json.loads((DV / "venues.json").read_text(encoding="utf-8"))
+        self.assertEqual(table["roles"].get(self.CARD), {"bachelor": "acceptance", "ultra-magnus": "supplementary"})
+        for rel, source_rel in EVERY_FRAME_OLDEST_FIRST_LEGS.items():
+            with self.subTest(leg=rel):
+                self.assertEqual(table["roles"][self.load(rel)["card"]], table["roles"][self.load(source_rel)["card"]])
+
+    @requires_windows_pwsh
+    def test_the_runner_reads_the_leg_as_a_visual_twin(self) -> None:
+        names = [self.load(rel)["legId"] for rel in EVERY_FRAME_OLDEST_FIRST_LEGS]
+        proc = run_pwsh(["-Command", f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n$m = Get-Module DualVenueRunner\n"
+                         f"@({', '.join(repr(n) for n in names)}) | ForEach-Object {{ [string](& $m {{ param($n) Test-DvVisualTwinName $n }} $_) }}"])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.split(), ["True"] * len(names))
+
+    def chain(self, measured: str, ends: bool = True) -> list[dict]:
+        """The shipped criteria chain (ConformMeasuredFieldsAreJudgedTests.chain: Get-DvPlaybackEvidence -> Get-DvConformArmVerdict -> Get-DvCriteriaMetrics ->
+        Test-DvCriteria) on THIS spec, cuda and cpu, both roles, over a native-pace run's log."""
+        return ConformMeasuredFieldsAreJudgedTests.chain(
+            self, measured, ends=ends, specs=tuple(EVERY_FRAME_OLDEST_FIRST_LEGS), clip="M16-1243", backends=("cuda", "cpu"), head=self.HEAD,
+            summary=conformed_summary_line(status='gui_fps_status_text="Playback: 23.976 fps"', native_fps="23.976", pace_fps="23.976"))
+
+    @requires_windows_pwsh
+    def test_the_criteria_pass_only_a_run_that_showed_every_source_frame(self) -> None:
+        cases = {
+            "sound": (" max_jump=1", True),
+            "a skipped source frame": (" max_jump=2", False),
+            "no frame advanced": (" max_jump=0", False),
+            "a frozen presentation tail": (" presented=1401 source_advanced=1400 max_jump=1", False),
+        }
+        for name, (measured, passes) in cases.items():
+            for row in self.chain(measured):
+                with self.subTest(case=name, role=row["role"], backend=row["backend"]):
+                    self.assertEqual(row["pass"], passes, row)
+                    self.assertEqual([f.split(" ")[0].rstrip(":") for f in row["failures"]], [] if passes else ["conformMaxJump"], row)
+        seen = {(row["role"], row["backend"]) for row in self.chain(" max_jump=1")}
+        self.assertEqual(seen, {(r, b) for r in ("acceptance", "supplementary") for b in ("cuda", "cpu")})
+
+    @requires_windows_pwsh
+    def test_a_seek_back_or_an_absent_max_jump_is_could_not_check_never_a_pass(self) -> None:
+        """backward > 0 is not judged (engine_target is the engine's high-water), and a line without max_jump is a missing number: both FAIL on conformMaxJump alone."""
+        seek = " presented=1550 source_advanced=1548 max_jump=1 wraps=0 backward=1 repeats=0 first_frame=0 last_frame=1448 engine_target=1498"
+        for row in self.chain(seek, ends=False):
+            with self.subTest(case="backward=1", role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(len(row["failures"]), 1, row)
+                self.assertTrue(row["failures"][0].startswith("conformMaxJump: "), row)
+                self.assertIn("a seek back", row["failures"][0], row)
+        for row in self.chain(" presented=1499"):
+            with self.subTest(case="no max_jump", role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(len(row["failures"]), 1, row)
+                self.assertIn("does not carry the field", row["failures"][0], row)
+
+
 class DriftLegSpecTests(unittest.TestCase):
-    """M16-1457-VENUE-BASELINE-DRIFT-1 r3: each drift leg is the tracked 1457 fullscreen s1 headroom leg with only legId, card and generatorArgs.playbackMaxThreads
+    """M16-1457-VENUE-BASELINE-DRIFT-1 r3:each drift leg is the tracked 1457 fullscreen s1 headroom leg with only legId, card and generatorArgs.playbackMaxThreads
     changed (the P-core arm also carries the 1243 b1-12-pcore arm's affinity keys and its two partition criteria), so a worker-cap sweep on the Bachelor
     venue differs from the 16-thread baseline leg in the cap alone."""
 
@@ -19869,7 +20003,8 @@ class DriftLegSpecTests(unittest.TestCase):
         for rel in DRIFT_VISUAL_LEGS:
             with self.subTest(leg=rel):
                 self.assertIn("-w10-visual-unpaced-", self.load(rel)["legId"])
-        self.assertEqual(sorted(p.name for p in (DV / "legs").glob("*-visual-*.json")), sorted(Path(r).name for r in DRIFT_VISUAL_LEGS), "a '-visual-' leg outside the registered twins")
+        self.assertEqual(sorted(p.name for p in (DV / "legs").glob("*-visual-*.json")), sorted(Path(r).name for r in (*DRIFT_VISUAL_LEGS, *EVERY_FRAME_OLDEST_FIRST_LEGS)),
+                         "a '-visual-' leg outside the registered twins")
         for path in sorted((DV / "legsets").glob("*.json")):
             with self.subTest(legset=path.name):
                 self.assertEqual(self.legset_drift_violations(json.loads(path.read_text(encoding="utf-8"))), [])
