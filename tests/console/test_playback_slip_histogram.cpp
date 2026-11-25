@@ -1187,3 +1187,56 @@ TEST(PlaybackSlipHistogram, R2Iter1TheCorrectionSumIsSixtyFourBit)
     ASSERT_EQ( 0, s.timelineFramesAfterFirst );
     ASSERT_EQ( 0, s.startupCatchupFrames );
 }
+
+// r2 iteration 2 (adversary pass 4 A3 on b30cd3a1): real skips after a correction belong to the rebased interval; the first present's
+// earlier jump (timeline 15 over display 10: frames 11..14) cannot cover them. Play at 0 ms, start 10, 24 fps; the first present at
+// 210 ms shows 10 with the timeline at 15; 15 is corrected to 40, five frames are granted, and 45 lands the correction. The four
+// frames 41..44 are slips; the jump's four frames are startup catch-up passed before the correction.
+TEST(PlaybackSlipHistogram, R2Iter2TheFirstPresentsJumpNeverCoversARebasedInterval)
+{
+    SlipHistogram h;
+    h.reset( 10, 24.0 );
+    h.setPlayStart( 0.0 );
+    h.noteTimelineMove( AdvancePath::DropTick, 15, 200.0, 5.0, 0.0 );
+    h.notePresent( r2Present( 10, 210.0, 15 ) );
+    h.noteTimelineCorrection( 40 );
+    h.noteTimelineMove( AdvancePath::DropTick, 45, 240.0, 5.0, 0.0 );
+    h.notePresent( r2Present( 45, 250.0, 45, 1, true, 40 ) );
+    const Summary s = h.finish( 260.0, 45 );
+    ASSERT_EQ( 4LL, s.slipsTotal );                                      // b30cd3a1: 0
+    ASSERT_EQ( 1, s.slipEvents );
+    ASSERT_EQ( 4, s.startupCatchupFrames );                              // the jump's own frames, passed before the correction
+}
+
+// r2 iteration 2 (adversary pass 4 A2 on b30cd3a1): a pinned measured Play stops by writing the PRESENTED frame back to the slider. A
+// correction its request never crossed leaves the timeline with that write: request 480 at correction stamp 0, Cut In raised so the
+// early advance corrects 480 to 1000, then the pinned stop writes 480 back. The travel is 480 (the base's), never 480 - 520 = -40.
+TEST(PlaybackSlipHistogram, R2Iter2APinnedStopUndoesTheCorrectionsItsFrameNeverCrossed)
+{
+    SlipHistogram h;
+    h.reset( 0, 24.0 );
+    h.noteTimelineMove( AdvancePath::DropTick, 1, 40.0, 1.0, 0.0 );
+    h.notePresent( r2Present( 0, 40.0, 1 ) );
+    h.noteTimelineMove( AdvancePath::DropTick, 480, 20000.0, 479.0, 0.0 );
+    h.notePresent( r2Present( 480, 20000.0, 480 ) );                      // requested before the correction
+    h.noteTimelineCorrection( 1000 );
+    h.noteTimelineMove( AdvancePath::DropTick, 1000, 20008.0, 0.192, 0.0 );
+    h.noteTimelinePinnedToDisplay( 480 );
+    ASSERT_EQ( 0LL, (long long)h.correctedFrames() );                    // b30cd3a1: 520
+    ASSERT_EQ( 480, h.timelineTravel( 480 ) );                           // b30cd3a1: -40
+    const Summary s = h.finish( 20010.0, 480 );
+    ASSERT_EQ( 479, s.timelineFramesAfterFirst );                        // b30cd3a1: 39
+    // a correction the presented frame DID cross stays out: the same run where 1000 was presented before the pin
+    SlipHistogram landed;
+    landed.reset( 0, 24.0 );
+    landed.noteTimelineMove( AdvancePath::DropTick, 1, 40.0, 1.0, 0.0 );
+    landed.notePresent( r2Present( 0, 40.0, 1 ) );
+    landed.noteTimelineMove( AdvancePath::DropTick, 480, 20000.0, 479.0, 0.0 );
+    landed.notePresent( r2Present( 480, 20000.0, 480 ) );
+    landed.noteTimelineCorrection( 1000 );
+    landed.noteTimelineMove( AdvancePath::DropTick, 1000, 20008.0, 0.192, 0.0 );
+    landed.notePresent( r2Present( 1000, 20040.0, 1000, 1, true, 1000 ) );
+    landed.noteTimelinePinnedToDisplay( 1000 );
+    ASSERT_EQ( 520LL, (long long)landed.correctedFrames() );
+    ASSERT_EQ( 480, landed.timelineTravel( 1000 ) );
+}

@@ -432,6 +432,13 @@ public:
         m_timelinePosition = toPosition;
     }
 
+    /*! r2 iteration 2 (adversary pass 4 A2 on b30cd3a1): the measured Play's stop pinned the slider back to the presented frame
+     *  \a frame. (RED stub: inert.) */
+    void noteTimelinePinnedToDisplay( int frame )
+    {
+        (void)frame;
+    }
+
     /*! A contact-sheet grab of \a grabMs ran on the GUI thread; it is charged to the next present's interval. */
     void noteGrab( double grabMs )
     {

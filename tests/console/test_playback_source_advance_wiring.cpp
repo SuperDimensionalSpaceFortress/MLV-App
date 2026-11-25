@@ -189,6 +189,13 @@ TEST(PlaybackSourceAdvanceWiring, R2TheSlipSampleCarriesTheLandingAndTheTimeline
     ASSERT_TRUE(finish.contains(QStringLiteral(
         "const int timelineDelta = m_playbackSlipHistogram.timelineTravel( currentPosition );")));
     ASSERT_FALSE(source.contains(QStringLiteral("- m_playbackSlipHistogram.correctedFrames()")));
+    // iteration 2 (adversary pass 4 A2 on b30cd3a1): the pinned stop's write-back of the presented frame tells the histogram first, so
+    // the corrections that frame never crossed leave the timeline with it
+    const int pin = presented.indexOf(QStringLiteral("m_playbackSlipHistogram.noteTimelinePinnedToDisplay( static_cast<int>( displayFrame ) );"));
+    const int pinWrite = presented.indexOf(QStringLiteral("        ui->horizontalSliderPosition->setValue(\n            static_cast<int>( displayFrame ) );"));
+    ASSERT_TRUE(pin > note);
+    ASSERT_TRUE(pinWrite > pin);
+    ASSERT_TRUE(pinWrite - pin < 400);
     ASSERT_FALSE(finish.contains(QStringLiteral("const int timelineDelta = currentPosition - m_playbackSmokeStartPosition;")));
     // the slip summary and pace_summary read the same corrected timeline delta (finish() subtracts the sum itself)
     ASSERT_TRUE(finish.indexOf(QStringLiteral("const int timelineDeltaAbs = timelineDelta >= 0")) > finish.indexOf(QStringLiteral("const int timelineDelta =")));
