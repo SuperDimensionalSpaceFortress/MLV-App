@@ -348,7 +348,8 @@ class ScriptsInstallUnconditionallyTests(unittest.TestCase):
         self.assertIsNotNone(argv, "the helper's extractor argv is no longer one literal list")
         items = re.findall(r"'([^']*)'|(\$\w+)", argv.group(1))
         flat = [a or b for a, b in items]
-        self.assertEqual(flat[:3], ["-3", "-m", "tools.repo_hygiene.extract_vendored_native_payload"])
+        # PR 862 r16 (sol r15 A3): -S keeps `site` (and so any system sitecustomize) from printing ahead of the JSON report.
+        self.assertEqual(flat[:4], ["-3", "-S", "-m", "tools.repo_hygiene.extract_vendored_native_payload"])
         self.assertNotIn("-I", flat, "-I drops the working directory from sys.path and with it the tools package")
         # PR 862 r11 re-baseline (adversary fa89f1b3-A1): the extractor is given the HELD output folder's own resolved path.
         for flag, value in (("--repo-root", "$RepoRoot"), ("--payload-id", "$PayloadId"), ("--archive-reference", "$ArchiveReference"), ("--output-dir", "$pinnedOutputDir")):
@@ -374,7 +375,10 @@ class ScriptsInstallUnconditionallyTests(unittest.TestCase):
         # adversary ae560106-A1: ffmpeg.exe deleted after its readback zipped without it, the zip hash validated that incomplete zip,
         # and build.json still said ffmpegExeDeployed. The entry inside the zip is checked and the published zip hash is the checked one.
         commands = _commands(ASSEMBLER)
-        checks = [c for c in commands if (c["name"] or "") == "Test-PinnedZipMember"]
+        # PR 862 r16 (sol r15 A1): the same zip is also checked for the app's own entry, so there are two checks, one per member.
+        all_checks = [c for c in commands if (c["name"] or "") == "Test-PinnedZipMember"]
+        checks = [c for c in all_checks if c["named"].get("MemberName", {}).get("value") == "ffmpeg.exe"]
+        self.assertEqual(len(all_checks), 2, "the assembler checks the staged zip for exactly two members: ffmpeg.exe and the app")
         self.assertEqual(len(checks), 1, "the assembler must check the staged zip's ffmpeg.exe entry exactly once")
         named = checks[0]["named"]
         self.assertEqual(named.get("ZipPath", {}).get("variable"), "stagedPkgPath")
@@ -643,6 +647,34 @@ class HelperBehaviourTests(unittest.TestCase):
         text = _normalised(HELPER_MODULE)
         self.assertIn("if ([string]$name -like 'PYTHON*') { [void]$psi.Environment.Remove([string]$name) }", text)
         self.assertIn("$psi.Environment['PYTHONNOUSERSITE'] = '1'", text)
+
+    def test_a_system_sitecustomize_that_prints_never_corrupts_the_report(self) -> None:
+        # PR 862 r16 (sol r15 A3, the class of e9d903be-A5 one layer down): a SYSTEM sitecustomize prints even with PYTHONNOUSERSITE=1 and
+        # every PYTHON* variable scrubbed. The line preceded the extractor's JSON after the install had committed, so the wrapper returned
+        # a failure for a finished install. A system sitecustomize cannot be written here, so a py.exe shim stands BELOW the wrapper's
+        # environment scrub: it sets PYTHONPATH to a dir whose sitecustomize.py prints, then runs the real launcher with the wrapper's
+        # own arguments. The child runs with -S, so `site` (and with it sitecustomize) is never imported.
+        hook = self.tmp / "sitehook"
+        hook.mkdir()
+        (hook / "sitecustomize.py").write_text("print('site ready')\n", encoding="ascii")
+        shim = self.tmp / "pyshim.cmd"
+        shim.write_bytes(b'@echo off\r\nset "PYTHONPATH=%FFX_HOOK%"\r\npy.exe %*\r\n')
+        env = dict(os.environ, FFX_HOOK=str(hook))
+        self.assertIn("site ready", subprocess.run([str(shim), "-3", "-c", "pass"], capture_output=True, text=True, timeout=60, env=env).stdout,
+                      "precondition: the shimmed interpreter runs the sitecustomize")
+        self.assertNotIn("site ready", subprocess.run([str(shim), "-3", "-S", "-c", "pass"], capture_output=True, text=True, timeout=60, env=env).stdout,
+                         "precondition: -S keeps it from running")
+        prelude = (
+            "function global:Get-Command { param([string]$Name, [string]$CommandType, $ErrorAction)\n"
+            "  if ($Name -eq 'py.exe') { return [pscustomobject]@{ Source = $env:FFX_SHIM } }\n"
+            "  Microsoft.PowerShell.Core\\Get-Command @PSBoundParameters\n"
+            "}\n"
+        )
+        out = self.tmp / "out"
+        out.mkdir()
+        result = self._run(str(out), extra_env={"FFX_SHIM": str(shim), "FFX_HOOK": str(hook)}, prelude=prelude)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue((out / "ffmpeg.exe").is_file())
 
     def test_the_output_folder_stays_held_while_the_installed_files_are_re_read(self) -> None:
         # PR 862 r11 (adversary e9d903be-A2): the output pin was released before the wrapper parsed the report and re-read the installed
@@ -1139,6 +1171,52 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
             "$r = Test-PinnedZipMember -ZipPath $env:FFX_ZIP -MemberName 'ffmpeg.exe' -ExpectedSha256 $env:FFX_SHA -ExpectedBytes ([long]$env:FFX_LEN)\n"
             "$r | ConvertTo-Json -Compress\n",
             FFX_ZIP=str(zip_path), FFX_SHA=hashlib.sha256(expected).hexdigest(), FFX_LEN=str(len(expected)))
+
+    def _run_assembler_package_block(self, *, hidden_app: bool) -> dict:
+        # PR 862 r16 (sol r15 A1): the assembler's OWN package block (from the zip path to the published zip hash) runs against a release
+        # dir; only the helpers it calls are stubbed. Complete-Failed prints a typed refusal and exits, as the assembler's does.
+        text = _normalised(ASSEMBLER)
+        start = text.index("$stagedPkgPath = Join-Path $Scratch $names.packageZipName")
+        end_marker = "$stagedPkgSha = $pkgFfmpegCheck.zipSha256"
+        block = text[start: text.index(end_marker) + len(end_marker)]
+        release = self.tmp / "release"
+        release.mkdir()
+        scratch = self.tmp / "scratch"
+        scratch.mkdir()
+        ffmpeg = b"MZ pinned ffmpeg bytes" * 100
+        (release / "MLVApp.exe").write_bytes(b"MZ the app" * 50)
+        (release / "igpu_recon_cuda.dll").write_bytes(b"dll")
+        (release / "ffmpeg.exe").write_bytes(ffmpeg)
+        if hidden_app:
+            subprocess.run(["attrib", "+H", str(release / "MLVApp.exe")], check=True, capture_output=True, timeout=60)
+        body = (
+            "$ProgressPreference = 'SilentlyContinue'\n"
+            "$releaseDir = $env:FFX_REL; $Scratch = $env:FFX_SCR\n"
+            "$names = @{ packageZipName = 'pkg.zip'; exeName = 'staged.exe'; reconName = 'staged.dll'; packageExeName = 'MLVApp.exe' }\n"
+            "$releaseExe = Join-Path $releaseDir 'MLVApp.exe'\n"
+            "$ffmpegExe = [pscustomobject]@{ sha256 = $env:FFX_SHA; bytes = [long]$env:FFX_LEN }\n"
+            "function Get-ShaLower([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }\n"
+            "function Complete-Failed([int]$Code, [string]$Step, [string]$Message) {\n"
+            "  [ordered]@{ refused = $true; code = $Code; step = $Step; message = $Message } | ConvertTo-Json -Compress; exit 0 }\n"
+            + block + "\n"
+            "[ordered]@{ refused = $false; sha = $stagedPkgSha } | ConvertTo-Json -Compress\n"
+        )
+        return self._ps(body, FFX_REL=str(release), FFX_SCR=str(scratch), FFX_SHA=hashlib.sha256(ffmpeg).hexdigest(), FFX_LEN=str(len(ffmpeg)))
+
+    def test_the_assembler_refuses_a_package_whose_zip_lacks_the_app(self) -> None:
+        # sol r15 A1: Compress-Archive -Path dir\* omits a file with the Hidden attribute; the FFmpeg-only zip check passed and the
+        # assembler published ASSEMBLE_OK for a package the export stage cannot launch. The app entry is now checked like ffmpeg.exe.
+        control = self._run_assembler_package_block(hidden_app=False)
+        self.assertFalse(control["refused"], control)
+        hidden = self.tmp / "hidden-case"
+        hidden.mkdir()
+        # a second, separate fixture tree so the control's files do not leak into this case
+        self.tmp = hidden
+        result = self._run_assembler_package_block(hidden_app=True)
+        self.assertTrue(result["refused"], f"a zip without MLVApp.exe must be refused before publication: {result}")
+        self.assertEqual((result["code"], result["step"]), (20, "package"))
+        self.assertIn("MLVApp.exe", result["message"])
+        self.assertIn("0 root entries named MLVApp.exe", result["message"])
 
     def test_the_zip_check_passes_only_when_the_entry_carries_the_recorded_bytes(self) -> None:
         payload = b"MZ pinned ffmpeg bytes" * 100

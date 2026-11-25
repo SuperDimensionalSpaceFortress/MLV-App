@@ -406,7 +406,13 @@ $StepLog['launchProbe'] = 0
 $stagedPkgPath = Join-Path $Scratch $names.packageZipName
 $stagedExePath = Join-Path $Scratch $names.exeName
 $stagedDllPath = Join-Path $Scratch $names.reconName
+$releaseExeSha = ''
+$releaseExeBytes = -1L
 try {
+    # PR 862 r16 (sol r15 A1): the app's own bytes are recorded BEFORE the archive step, so the zip's MLVApp.exe entry is checked below
+    # against what was in the release dir (Compress-Archive -Path dir\* omits a file with the Hidden attribute).
+    $releaseExeSha = Get-ShaLower $releaseExe
+    $releaseExeBytes = ([System.IO.FileInfo]::new($releaseExe)).Length
     if (Test-Path -LiteralPath $stagedPkgPath) { Remove-Item -LiteralPath $stagedPkgPath -Force }
     Compress-Archive -Path (Join-Path $releaseDir '*') -DestinationPath $stagedPkgPath -Force
     Copy-Item -LiteralPath $releaseExe -Destination $stagedExePath -Force
@@ -420,6 +426,12 @@ try {
 # hash of the zip whose entry was verified.
 $pkgFfmpegCheck = Test-PinnedZipMember -ZipPath $stagedPkgPath -MemberName 'ffmpeg.exe' -ExpectedSha256 $ffmpegExe.sha256 -ExpectedBytes $ffmpegExe.bytes
 if (-not $pkgFfmpegCheck.ok) { Complete-Failed 28 'ffmpegExeInstall' "the staged package does not carry the installed ffmpeg.exe: $($pkgFfmpegCheck.reason)" }
+# PR 862 r16 (sol r15 A1): the app is checked the same way. A Hidden or missing MLVApp.exe left the zip without the app while the
+# FFmpeg-only check passed, and the export stage later found no app in the expanded package. The entry must be exactly the release
+# dir's bytes, and both checks must have read the same zip bytes (the published zip hash is the one whose entries were verified).
+$pkgAppCheck = Test-PinnedZipMember -ZipPath $stagedPkgPath -MemberName $names.packageExeName -ExpectedSha256 $releaseExeSha -ExpectedBytes $releaseExeBytes
+if (-not $pkgAppCheck.ok) { Complete-Failed 20 'package' "the staged package does not carry $($names.packageExeName) from the release dir: $($pkgAppCheck.reason)" }
+if ($pkgAppCheck.zipSha256 -cne $pkgFfmpegCheck.zipSha256) { Complete-Failed 20 'package' 'the staged package zip changed between its ffmpeg.exe check and its app check' }
 $stagedPkgSha = $pkgFfmpegCheck.zipSha256
 $stagedExeSha = Get-ShaLower $stagedExePath
 $stagedDllSha = Get-ShaLower $stagedDllPath

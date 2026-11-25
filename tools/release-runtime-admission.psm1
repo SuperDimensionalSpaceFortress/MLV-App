@@ -499,7 +499,11 @@ function Invoke-PinnedPayloadInstall {
     # --transaction-id (adversary 78d626ed-A1): this child's publication transaction folder is named by this call, so a timeout
     # recovery below restores exactly this child's originals and never another install's sharing the folder.
     $transactionId = [guid]::NewGuid().ToString('N')
-    foreach ($argument in @('-3', '-m', 'tools.repo_hygiene.extract_vendored_native_payload', '--repo-root', $RepoRoot, '--payload-id', $PayloadId, '--archive-reference', $ArchiveReference, '--output-dir', $pinnedOutputDir, '--transaction-id', $transactionId, '--record-only', '--verify-installed')) {
+    # PR 862 r16 (sol r15 A3): -S, so the interpreter never imports `site` and a SYSTEM sitecustomize (or any .pth / usercustomize hook) cannot print
+    # ahead of the extractor's JSON report after the install has committed. PYTHONNOUSERSITE below only covers the user site. The extractor
+    # and everything it imports (tools.repo_hygiene.*) use the standard library alone, so nothing needs site-packages; -S keeps the working
+    # directory on sys.path for -m, which is why -I stays out.
+    foreach ($argument in @('-3', '-S', '-m', 'tools.repo_hygiene.extract_vendored_native_payload', '--repo-root', $RepoRoot, '--payload-id', $PayloadId, '--archive-reference', $ArchiveReference, '--output-dir', $pinnedOutputDir, '--transaction-id', $transactionId, '--record-only', '--verify-installed')) {
         [void]$psi.ArgumentList.Add([string]$argument)
     }
     $psi.WorkingDirectory = $RepoRoot
