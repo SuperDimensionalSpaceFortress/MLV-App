@@ -6683,22 +6683,68 @@ function Test-DvJsonTextIsObject {
 function Get-DvJsonRootObjectWithout {
     # SUCCESSOR-3 W1 (SUCCESSOR-2 adversary A4): the JSON text of a root OBJECT without its members named $Name in any letter case, or $null when the text is not one
     # JSON object. The probe line's own fields are read from this when only its displayPath stops ConvertFrom-Json (two casings, a member named PSObject).
-    param([AllowEmptyString()][string]$Text, [string]$Name)
+    # SUCCESSOR-3 r2 (sol r1 B1): the record inside a one-element root array is read too, because ConvertFrom-Json unwraps that array to its record (the caller still
+    # types such a text malformed: Test-DvJsonTextIsObject). With -Under, $Name is dropped from the root's member named -Under (any letter case) instead of from
+    # the root: a receipt's block is venue.displayPath (sol r1 B2). Of two or more such members (`venue` beside `Venue`, which also stops ConvertFrom-Json) only the
+    # LAST is kept, the copy ConvertFrom-Json keeps of two same-case names; the validator's duplicate check on the text still types the record malformed.
+    param([AllowEmptyString()][string]$Text, [string]$Name, [string]$Under = '')
     try {
         $opt = [System.Text.Json.JsonDocumentOptions]::new()
         $opt.MaxDepth = 256; $opt.AllowTrailingCommas = $true; $opt.CommentHandling = [System.Text.Json.JsonCommentHandling]::Skip
         $doc = [System.Text.Json.JsonDocument]::Parse($Text, $opt)
     } catch { return $null }
     try {
-        if ($doc.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $null }
+        $root = $doc.RootElement
+        if ($root.ValueKind -eq [System.Text.Json.JsonValueKind]::Array -and $root.GetArrayLength() -eq 1) { $root = $root[0] }
+        if ($root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $null }
+        $c = [System.StringComparison]::OrdinalIgnoreCase
+        $underCount = 0
+        if ($Under) { foreach ($p in $root.EnumerateObject()) { if ([string]::Equals($p.Name, $Under, $c)) { $underCount++ } } }
+        $underSeen = 0
         $ms = [System.IO.MemoryStream]::new()
         $w = [System.Text.Json.Utf8JsonWriter]::new($ms)
         $w.WriteStartObject()
-        foreach ($p in $doc.RootElement.EnumerateObject()) { if (-not [string]::Equals($p.Name, $Name, [System.StringComparison]::OrdinalIgnoreCase)) { $p.WriteTo($w) } }
+        foreach ($p in $root.EnumerateObject()) {
+            if ($Under) {
+                if ([string]::Equals($p.Name, $Under, $c)) { $underSeen++ }
+                if ([string]::Equals($p.Name, $Under, $c) -and $underSeen -lt $underCount) { continue }
+                if ([string]::Equals($p.Name, $Under, $c) -and $p.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+                    $w.WritePropertyName($p.Name)
+                    $w.WriteStartObject()
+                    foreach ($q in $p.Value.EnumerateObject()) { if (-not [string]::Equals($q.Name, $Name, $c)) { $q.WriteTo($w) } }
+                    $w.WriteEndObject()
+                } else { $p.WriteTo($w) }
+            } elseif (-not [string]::Equals($p.Name, $Name, $c)) { $p.WriteTo($w) }
+        }
         $w.WriteEndObject()
         $w.Flush()
         [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
     } finally { $doc.Dispose() }
+}
+
+# SUCCESSOR-3 r2 (sol r1 B2): what a receipt's venue.displayPath reads as when the block itself stopped ConvertFrom-Json; Test-DvDisplayPathBlock types it malformed
+$script:DisplayPathUnparsed = 'DVE_DISPLAY_PATH_STOPPED_THE_RECEIPT_PARSE'
+
+function ConvertFrom-DvReceiptText {
+    <#
+    .SYNOPSIS
+    SUCCESSOR-3 r2 (sol r1 B2): a receipt FILE's text as the object every receipt reader judges. ConvertFrom-Json throws on two letter cases of one member name and on
+    a member named PSObject; when only venue.displayPath does that, the receipt is read without the block and its venue.displayPath is the unparsed marker, so the
+    validator (Test-DvReceiptValid, given -ReceiptText) types it INVALID with DISPLAY_PATH_MALFORMED instead of the reader dying on the parser's exception or reading
+    the receipt as missing. Any other parse failure is the parser's own exception, unchanged.
+    #>
+    param([AllowEmptyString()][string]$Text)
+    try { $parsed = $Text | ConvertFrom-Json }
+    catch {
+        $first = $_
+        $rest = Get-DvJsonRootObjectWithout -Text $Text -Name 'displayPath' -Under 'venue'
+        if ($null -eq $rest) { throw $first }
+        try { $parsed = $rest | ConvertFrom-Json } catch { throw $first }
+        $venue = Get-DvProp $parsed 'venue'
+        if ($venue -isnot [System.Management.Automation.PSCustomObject]) { throw $first }
+        Add-Member -InputObject $venue -NotePropertyName displayPath -NotePropertyValue $script:DisplayPathUnparsed -Force
+    }
+    $parsed
 }
 
 function Test-DvDisplayPathHasMember {
@@ -6737,6 +6783,8 @@ function Test-DvDisplayPathBlock {
     param($Block)
     $result = { param($state, $problems) [pscustomobject]@{ state = $state; problems = @($problems) } }
     if ($null -eq $Block) { return (& $result 'absent' @()) }
+    # SUCCESSOR-3 r2 (sol r1 B2): ConvertFrom-DvReceiptText read the receipt without a block that stopped ConvertFrom-Json (two letter cases of one name, a member named PSObject)
+    if (Test-DvDisplayPathText $Block $script:DisplayPathUnparsed) { return (& $result 'malformed' @('the block, or the venue that holds it, stopped the receipt''s JSON parse (two letter cases of one member name, or a member named PSObject)')) }
     if (Test-DvDisplayPathUnknown $Block) { return (& $result 'present' @()) }
     $problems = [System.Collections.Generic.List[string]]::new()
     if (-not (Test-DvDisplayPathIsObject $Block)) { return (& $result 'malformed' @('the block is neither an object nor a typed unknown')) }
@@ -7384,5 +7432,5 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Test-DvMatrixRowMeasured, Get-DvMatrixMeasuredCount, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
-    New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout, Get-DvDisplayPathCollectorSource, Test-DvDisplayPathBlock, ConvertTo-DvDisplayPath,
+    New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout, Get-DvDisplayPathCollectorSource, Test-DvDisplayPathBlock, ConvertTo-DvDisplayPath, ConvertFrom-DvReceiptText,
     Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt

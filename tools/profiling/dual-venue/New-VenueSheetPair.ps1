@@ -38,8 +38,9 @@ Import-Module (Join-Path $PSScriptRoot 'DualVenueRunner.psm1') -Force
 # VENUE-LEG-DISPLAY-PATH-RECEIPT-1-SUCCESSOR-2 W2: each receipt's text is kept for the validator, which refuses a duplicate key in venue.displayPath (ConvertFrom-Json keeps only the last)
 $cudaText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $CudaReceipt).Path)
 $cpuText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $CpuReceipt).Path)
-$cuda = $cudaText | ConvertFrom-Json
-$cpu = $cpuText | ConvertFrom-Json
+# SUCCESSOR-3 r2 (sol r1 B2): ConvertFrom-DvReceiptText, so a venue.displayPath that alone stops the parse reaches the validator's typed DISPLAY_PATH_MALFORMED
+$cuda = ConvertFrom-DvReceiptText -Text $cudaText
+$cpu = ConvertFrom-DvReceiptText -Text $cpuText
 
 if ($cuda.subject.backend -ne 'cuda' -or $cpu.subject.backend -ne 'cpu') { throw 'PAIR_BACKENDS_WRONG the first receipt must be the cuda backend and the second the cpu backend' }
 # The sheet is owner footage: it may only be written where it stays local.

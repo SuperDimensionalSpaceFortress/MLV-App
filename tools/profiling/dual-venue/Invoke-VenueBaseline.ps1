@@ -343,7 +343,8 @@ function Get-RowFigures([string]$ReceiptPath, $Leg, [string]$Backend) {
     if (-not $ReceiptPath -or -not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) { return $f }
     # VENUE-LEG-DISPLAY-PATH-RECEIPT-1-SUCCESSOR-3 W3 (SUCCESSOR-2 adversary A5): the text is kept for the validator's duplicate-key check on venue.displayPath
     $rcText = $null
-    try { $rcText = [IO.File]::ReadAllText($ReceiptPath); $rc = $rcText | ConvertFrom-Json } catch { return $f }
+    # SUCCESSOR-3 r2 (sol r1 B2): ConvertFrom-DvReceiptText, so a venue.displayPath that alone stops the parse reaches the validator (INVALID) instead of reading as missing
+    try { $rcText = [IO.File]::ReadAllText($ReceiptPath); $rc = ConvertFrom-DvReceiptText -Text $rcText } catch { return $f }
     # The receipt must be the one THIS run's leg wrote, not a stale or foreign file the chain's path happens to name: its receiptId is its file name, its legId / venue /
     # buildManifestSha256 are the planned ones, and it started after this run did (the hub VM stamps it on the same clock). Anything else is `identity`: not validated, no figure.
     $idProblems = [System.Collections.Generic.List[string]]::new()

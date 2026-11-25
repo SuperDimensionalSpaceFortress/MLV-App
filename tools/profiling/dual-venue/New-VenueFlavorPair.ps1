@@ -153,8 +153,9 @@ if (-not $stageParent) {
 $receiptTexts = @{}
 $receiptTexts.classic = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $ClassicReceipt).Path)
 $receiptTexts.cinematic = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $CinematicReceipt).Path)
-$classic = $receiptTexts.classic | ConvertFrom-Json
-$cinematic = $receiptTexts.cinematic | ConvertFrom-Json
+# SUCCESSOR-3 r2 (sol r1 B2): ConvertFrom-DvReceiptText, so a venue.displayPath that alone stops the parse reaches the validator's typed DISPLAY_PATH_MALFORMED
+$classic = ConvertFrom-DvReceiptText -Text $receiptTexts.classic
+$cinematic = ConvertFrom-DvReceiptText -Text $receiptTexts.cinematic
 
 # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r26 (sol r25 B2 sibling): receipt flavors compare ordinally and canonically (Test-DvLookFlavorSame), never the linguistic -cne
 if (-not (Test-DvLookFlavorSame 'classic' ([string]$classic.subject.lookFlavor)) -or -not (Test-DvLookFlavorSame 'cinematic' ([string]$cinematic.subject.lookFlavor))) {
@@ -170,7 +171,7 @@ if ([string]$classic.scale.effectiveScale -cne [string]$cinematic.scale.effectiv
 $film = $null
 if ($trio) {
     $receiptTexts.film = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $FilmReceipt).Path)
-    $film = $receiptTexts.film | ConvertFrom-Json
+    $film = ConvertFrom-DvReceiptText -Text $receiptTexts.film
     if (-not (Test-DvLookFlavorSame ([string]$ThirdFlavor) ([string]$film.subject.lookFlavor))) { throw "PAIR_FLAVORS_WRONG the third receipt must be the $ThirdFlavor flavor (got '$($film.subject.lookFlavor)')" }
     foreach ($f in 'buildManifestSha256', 'clipId', 'backend') {
         if ([string]$classic.subject.$f -cne [string]$film.subject.$f) { throw "PAIR_SUBJECT_DIFFERS the film receipt differs in subject.$f" }
