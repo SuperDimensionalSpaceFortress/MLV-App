@@ -32,6 +32,7 @@ extern "C" {
 #include <cstring>
 #include <initializer_list>
 #include <thread>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -8495,6 +8496,79 @@ TEST(DualIsoPipeline, S3DebayerCaptureLabelComesFromTheSingleDebayerName)
         }
         ASSERT_FALSE(block.contains(QString::fromLatin1(literal)));
     }
+}
+
+// DEBAYER-CAPTURE-LABEL-1: each macros.h setter, and the kernel frame_caching.c dispatches for
+// its value, has one name. Keyed by setter, not by integer, so a renumbered setter fails here.
+TEST(DualIsoPipeline, DebayerNameMatchesEveryDebayerSetter)
+{
+    MlvPipelineFixture fixture;
+    QString error;
+    ASSERT_TRUE(fixture.openTinyDualIso(&error));
+    ASSERT_TRUE(error.isEmpty());
+    mlvObject_t * video = fixture.video();
+    struct SetterCase
+    {
+        const char * setter;
+        void (*apply)(mlvObject_t *);
+        const char * expected;
+    };
+    const SetterCase cases[] = {
+        { "setMlvDontAlwaysUseAmaze", [](mlvObject_t * v) { setMlvDontAlwaysUseAmaze(v); }, "bilinear" },
+        { "setMlvAlwaysUseAmaze",     [](mlvObject_t * v) { setMlvAlwaysUseAmaze(v); },     "amaze" },
+        { "setMlvUseNoneDebayer",     [](mlvObject_t * v) { setMlvUseNoneDebayer(v); },     "none" },
+        { "setMlvUseSimpleDebayer",   [](mlvObject_t * v) { setMlvUseSimpleDebayer(v); },   "simple" },
+        { "setMlvUseLmmseDebayer",    [](mlvObject_t * v) { setMlvUseLmmseDebayer(v); },    "lmmse" },
+        { "setMlvUseIgvDebayer",      [](mlvObject_t * v) { setMlvUseIgvDebayer(v); },      "igv" },
+        { "setMlvUseAhdDebayer",      [](mlvObject_t * v) { setMlvUseAhdDebayer(v); },      "ahd" },
+        { "setMlvUseRcdDebayer",      [](mlvObject_t * v) { setMlvUseRcdDebayer(v); },      "rcd" },
+        { "setMlvUseDcbDebayer",      [](mlvObject_t * v) { setMlvUseDcbDebayer(v); },      "dcb" },
+    };
+    for (const SetterCase & c : cases)
+    {
+        c.apply(video);
+        const char * name = getMlvDebayerName(doesMlvAlwaysUseAmaze(video));
+        ASSERT_TRUE(name != nullptr);
+        std::fprintf(stderr, "[debayer-name] %s -> use_amaze=%d -> %s (expected %s)\n",
+                     c.setter, doesMlvAlwaysUseAmaze(video), name, c.expected);
+        ASSERT_EQ(std::string(c.expected), std::string(name));
+    }
+    ASSERT_EQ(std::string("unknown"), std::string(getMlvDebayerName(-1)));
+    ASSERT_EQ(std::string("unknown"), std::string(getMlvDebayerName(9)));
+}
+
+// DEBAYER-CAPTURE-LABEL-1 parity: the nine core names are exactly the debayer vocabulary the app
+// already writes (MainWindow::selectedPlaybackDebayerLabel), minus its two non-kernel labels.
+TEST(DualIsoPipeline, DebayerNamesMatchTheAppDebayerVocabulary)
+{
+    QFile file(repo_file_path(QStringLiteral("platform/qt/MainWindow.cpp")));
+    ASSERT_TRUE(file.open(QIODevice::ReadOnly | QIODevice::Text));
+    const QString source = QString::fromUtf8(file.readAll());
+    const qsizetype begin =
+        source.indexOf(QStringLiteral("QString MainWindow::selectedPlaybackDebayerLabel( void ) const"));
+    ASSERT_TRUE(begin >= 0);
+    const qsizetype end = source.indexOf(QStringLiteral("QString MainWindow::playbackDebayerLabel"), begin);
+    ASSERT_TRUE(end > begin);
+    const QString body = source.mid(begin, end - begin);
+
+    std::set<std::string> app_names;
+    const QString open = QStringLiteral("return QStringLiteral(\"");
+    for (qsizetype at = body.indexOf(open); at >= 0; at = body.indexOf(open, at + 1))
+    {
+        const qsizetype name_begin = at + open.size();
+        const qsizetype name_end = body.indexOf(QLatin1Char('"'), name_begin);
+        ASSERT_TRUE(name_end > name_begin);
+        const std::string name = body.mid(name_begin, name_end - name_begin).toStdString();
+        if (name != "receipt" && name != "amaze-cached") app_names.insert(name);
+    }
+
+    std::set<std::string> core_names;
+    for (int value = 0; value <= 8; ++value) core_names.insert(getMlvDebayerName(value));
+
+    for (const std::string & name : app_names) std::fprintf(stderr, "[debayer-vocab] app=%s\n", name.c_str());
+    ASSERT_EQ(static_cast<size_t>(9), app_names.size());
+    ASSERT_EQ(static_cast<size_t>(9), core_names.size());
+    ASSERT_TRUE(app_names == core_names);
 }
 
 TEST(DualIsoPipeline, CacheWorkerClaimsLifetimeBeforeAsyncStart)
