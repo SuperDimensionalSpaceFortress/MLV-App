@@ -1708,7 +1708,7 @@ function Find-VenueJsonDuplicateMember {
 function ConvertFrom-VenueSmokeHostLoad {
     <#
     .SYNOPSIS
-    VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: a leg's standing from its smoke result's hostLoad block (run-release-gui-smoke.ps1 writes it: state, provisional, before/after
+    VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: a leg's standing from its smoke result's hostLoad block (the release GUI smoke writes it: state, provisional, before/after
     snapshots with collected=). The canonical predicate of PLAYBACK-MEASURE-HOST-LOAD-GATE-1 (compare-release-gui-smoke-ab.ps1 Get-HostLoadComparisonEvidence):
     clean iff state is exactly 'quiet' AND provisional is the boolean false; every other combination is provisional. Added here: a before or after snapshot
     whose collected is not the boolean true (2026-11-21 leg a134532e: "collection failed: CimException") reads state 'unknown', never 'quiet' and never blank,

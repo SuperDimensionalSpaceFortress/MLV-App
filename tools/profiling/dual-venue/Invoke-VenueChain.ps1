@@ -561,7 +561,8 @@ foreach ($leg in $plan) {
                 Add-Result $leg 'RAN' $ranExtra
                 L "LEG $($leg.name) RAN exit=$legCode outcome=$outcome verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) preLoadMean=$(Format-Mean $preLoad) class=$class hostLoadState=$($hl.state) hostLoadProvisional=$([bool]$hl.provisional) receipt=$receipt$(if ($legPreFF) { ' preClaimForeignFloor=1' })$(if ($legReFF) { ' underClaimForeignFloor=1' })$(if ($detail) { " detail=$detail" })"
                 # r1 (adversary-b0c05520.json A5): whatever the class; A4: this added append never ends the chain (a held chain.log still gets the line on stdout)
-                if ($hlRefusal) { try { L $hlRefusal } catch { Write-Output $hlRefusal } }
+                # (a leg that printed no receipt measured nothing: its pre-load is QUIET_PRELOAD_UNKNOWN and it has no host load to name)
+                if ($hlRefusal -and $receipt) { try { L $hlRefusal } catch { Write-Output $hlRefusal } }
                 # VENUE-CHAIN-UNHEALTHY-STREAK-STOP-1: only a RAN leg counts or resets (LEG_FAILED / NOT_RUN never reach here). VENUE_UNHEALTHY with a detail extends the
                 # streak when the detail KEY is the same (Get-UnhealthyDetailKey), otherwise starts it at 1; anything else (a different outcome, or no detail to compare) resets it.
                 # -UnhealthyStreakStop 0 switches off the count only: the owner-only first occurrence stops the chain whatever N is.
