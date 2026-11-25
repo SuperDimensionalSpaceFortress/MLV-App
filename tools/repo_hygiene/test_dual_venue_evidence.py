@@ -20088,6 +20088,87 @@ class EveryFrameConformConflictAndAcceptanceTests(unittest.TestCase):
                 else:
                     self.assertIsNone(row["reason"], row)
 
+    def reader(self, logs: list[str]) -> list[dict]:
+        """Get-DvPlaybackEvidence over each log (a 23.976 fps native-pace run, 480 source frames), as Invoke-VenueLeg and Test-DvReceiptValid call it."""
+        script = (
+            "$summary = [pscustomobject]@{ sourceFrames = [pscustomobject]@{ sourceAdvanced = 480; requiredSourceFrames = 480; failures = @() }; fixtureRehearsal = $false; clipId = 'M16-1243' }\n"
+            "$manifest = [pscustomobject]@{ smokeRunLog = [pscustomobject]@{ runNonce = $env:DVE_NONCE; sha256 = '' } }\n"
+            "$out = foreach ($log in ($env:DVE_LOGS -split '\\|\\|')) {\n"
+            "  $sha = Get-DvSha256OfText $log\n"
+            "  $result = [pscustomobject]@{ evidence = [pscustomobject]@{ runNonce = $env:DVE_NONCE; runLogSnapshot = [pscustomobject]@{ sha256 = $sha } } }\n"
+            "  $pb = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ResultJson $result -LogText $log -LogSha256 $sha -ExpectedClipId 'M16-1243'\n"
+            "  $fields = (Get-DvSmokeSummaryFields -LogText $log).fields\n"
+            "  [ordered]@{ valid = $pb.valid; reasons = @($pb.invalidReasons); repeats = $pb.conformRepeats; summaryConflicts = @($pb.summaryConflictingFields);"
+            " conformConflicts = @($pb.conformConflictingFields); summaryKeys = @($fields.Keys | Sort-Object) }\n"
+            "}\n"
+            "ConvertTo-Json -InputObject @($out) -Compress -Depth 5")
+        proc, out = run_pwsh_json(script, DVE_LOGS="||".join(logs), DVE_NONCE=NONCE)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), len(logs), out)
+        return out
+
+    def log(self, conform: str, summary_tail: str = "") -> str:
+        summary = conformed_summary_line(status='gui_fps_status_text="Playback: 23.976 fps"', native_fps="23.976", pace_fps="23.976",
+                                         source_advanced="480", required_source_frames="480")
+        return "\n".join([self.HEAD[0], "playback_smoke.measured_session id=3", self.HEAD[1] + conform, summary + summary_tail]) + "\n"
+
+    @requires_windows_pwsh
+    def test_adversary_7272acb4_a1_an_empty_occurrence_is_a_conflicting_reading(self) -> None:
+        """r2 adversary A1 on 7272acb4, its literal inputs: `\\S+` skipped an EMPTY occurrence, so `repeats= repeats=0` (either order), `last_frame=479
+        last_frame=`, `backward= backward=0` read one clean value and passed every list, and a summary `source_advanced= source_advanced=480` read valid.
+        An empty occurrence is a reading that differs from any non-empty one: the key conflicts and is left out."""
+        cases = {
+            "repeats= repeats=0": (self.SOUND.replace("repeats=0", "repeats= repeats=0"), ["conformRepeats"]),
+            "repeats=0 repeats=": (self.SOUND.replace("repeats=0", "repeats=0 repeats="), ["conformRepeats"]),
+            "last_frame=479 last_frame=": (self.SOUND.replace("last_frame=479", "last_frame=479 last_frame="), ["conformMaxJump", "conformTailUnpaintedFrames"]),
+            "backward= backward=0": (self.SOUND.replace("backward=0", "backward= backward=0"), ["conformMaxJump", "conformTailUnpaintedFrames"]),
+        }
+        for name, (line, failing) in cases.items():
+            for row in self.chain(line):
+                with self.subTest(case=name, role=row["role"], backend=row["backend"]):
+                    self.assertFalse(row["pass"], row)
+                    self.assertEqual(self.failed_metrics(row), failing, row)
+                    for failure in row["failures"]:
+                        self.assertIn(self.CONFLICT, failure, row)
+        summary = self.reader([self.log(self.SOUND, " source_advanced= source_advanced=480")])[0]
+        self.assertFalse(summary["valid"], summary)
+        self.assertEqual(summary["summaryConflicts"], ["source_advanced"], summary)
+        self.assertTrue(any(r.startswith("SUMMARY_FIELD_CONFLICT:") for r in summary["reasons"]), summary)
+
+    @requires_windows_pwsh
+    def test_adversary_7272acb4_a2_a_key_glued_inside_another_token_is_no_key(self) -> None:
+        """r2 adversary A2 on 7272acb4, its literal inputs: the unanchored regex read `repeats=0` out of `-repeats=0` and `not-repeats=0`. A key starts a
+        whitespace-separated token; a glued one is no field, so the absent repeats is CouldNotCheck and the summary carries no `repeats` key."""
+        for row in self.chain(self.SOUND.replace("repeats=0", "-repeats=0")):
+            with self.subTest(role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(self.failed_metrics(row), ["conformRepeats"], row)
+                self.assertIn("does not carry the field", row["failures"][0], row)
+        out = self.reader([self.log(self.SOUND.replace("repeats=0", "-repeats=0"), " not-repeats=0 x-y=1")])[0]
+        self.assertIsNone(out["repeats"], out)
+        self.assertNotIn("repeats", out["summaryKeys"], out)
+        self.assertNotIn("y", out["summaryKeys"], out)
+        self.assertIn("source_advanced", out["summaryKeys"], out)
+        self.assertTrue(out["valid"], out)
+
+    @requires_windows_pwsh
+    def test_adversary_7272acb4_a3_a_malformed_status_or_outcome_is_not_measured(self) -> None:
+        """r2 adversary A3 on 7272acb4 (advisory, in scope), its literal inputs: a zero-width space after VERIFIED, or after the raw PASS, compared equal
+        under PowerShell's culture-sensitive -ceq / -cin. The acceptance step compares ordinally, so either is NOT_MEASURED."""
+        zw = "​"
+        cases = [("PASS", "VERIFIED" + zw), ("PASS" + zw, "VERIFIED"), ("FAIL" + zw, "VERIFIED"), ("PASS", zw + "VERIFIED")]
+        script = (
+            "$out = foreach ($c in ($env:DVE_CASES | ConvertFrom-Json)) { $v = Get-DvAcceptanceVerdict -Receipt ([ordered]@{ outcome = $c.outcome }) -VerificationStatus $c.status\n"
+            "  [ordered]@{ verdict = $v.verdict; reason = $v.reason } }\n"
+            "ConvertTo-Json -InputObject @($out) -Compress -Depth 3")
+        proc, out = run_pwsh_json(script, DVE_CASES=json.dumps([{"outcome": o, "status": s} for o, s in cases]))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), len(cases), out)
+        for (outcome, status), row in zip(cases, out):
+            with self.subTest(outcome=outcome.encode("unicode_escape"), status=status.encode("unicode_escape")):
+                self.assertEqual(row["verdict"], "NOT_MEASURED", row)
+                self.assertTrue(row["reason"], row)
+
     def test_the_leg_runner_prints_the_acceptance_verdict_from_the_acceptance_step(self) -> None:
         """Invoke-VenueLeg prints DVE_ACCEPTANCE (Get-DvAcceptanceVerdict over the verification Write-DvReceipt just stamped) after DVE_VERIFICATION;
         DVE_OUTCOME stays the raw outcome the chain records."""
