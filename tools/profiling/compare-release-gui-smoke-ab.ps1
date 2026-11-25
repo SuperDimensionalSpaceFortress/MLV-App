@@ -1003,6 +1003,15 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
         [string]::Equals($resolvedOutput, $afterJsonPath, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Output must not overwrite either smoke JSON input."
     }
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A6 sibling): an existing output that IS an input under another spelling (a hard
+    # link) is that input too, judged by the same handle identity the inputs were read by
+    if (Test-Path -LiteralPath $resolvedOutput -PathType Leaf) {
+        $outputStream = [IO.FileStream]::new($resolvedOutput, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        try { $outputIdentity = Get-SmokeFileIdentity -Stream $outputStream -ResolvedPath $resolvedOutput } finally { $outputStream.Dispose() }
+        foreach ($inputIdentity in @($beforeSource.identity, $afterSource.identity)) {
+            if ($null -ne $inputIdentity -and [string]::Equals([string]$inputIdentity, $outputIdentity, [StringComparison]::Ordinal)) { throw "Output must not overwrite either smoke JSON input." }
+        }
+    }
 }
 $beforeScreenshot = Resolve-SmokeScreenshotPath -Smoke $beforeSmoke
 $afterScreenshot = Resolve-SmokeScreenshotPath -Smoke $afterSmoke

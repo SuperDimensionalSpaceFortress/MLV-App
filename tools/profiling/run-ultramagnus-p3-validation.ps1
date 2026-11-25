@@ -584,7 +584,10 @@ function Import-EvidencePacket {
     }
 
     if ($importFailures.Count -eq 0) {
-        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A9 sibling): a manifest the parser refuses is a recorded import failure, never a throw
+        $manifest = $null
+        try { $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json }
+        catch { Add-Failure $importFailures ("evidence-packet-manifest.json could not be parsed: " + ($_.Exception.Message -replace '\s+', ' ')) }
         $summaryText = Get-Content -LiteralPath $summaryPath -Raw
         # adversary-ac6205bd.json A2: a repeated member anywhere (e.g. "hostLoadCollected":false,"hostLoadCollected":true in a clip record) keeps the last
         # value in the parsed object, so the packet is refused rather than read

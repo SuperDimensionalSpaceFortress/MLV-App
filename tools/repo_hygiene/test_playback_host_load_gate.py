@@ -3909,6 +3909,18 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
         self.assertIn("Get-SmokeFileIdentity -Stream $stream", once)
         self.assertNotIn("OrdinalIgnoreCase", once)
 
+    def test_a6_sibling_an_output_that_is_a_hard_link_to_an_input_is_refused(self) -> None:
+        # A6 sibling (the output-overwrite guard compared spellings too): -Output names a hard link to -Before. RED: the report overwrote the before input.
+        with tempfile.TemporaryDirectory(prefix="residue-r2-a6o-") as tmp:
+            before, after, alias = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "out-alias.json"
+            before.write_text(QUIET_SMOKE, encoding="utf-8", newline="")
+            after.write_text(QUIET_SMOKE, encoding="utf-8", newline="")
+            os.link(before, alias)
+            proc = _run_ps_file(COMPARE_SCRIPT, "-Before", str(before), "-After", str(after), "-Output", str(alias))
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("Output must not overwrite either smoke JSON input.", proc.stdout + proc.stderr)
+            self.assertEqual(before.read_text(encoding="utf-8"), QUIET_SMOKE, "the before input is untouched")
+
     def test_a7_an_inconclusive_comparison_publishes_no_screenshot_delta(self) -> None:
         # A7, its input: 1x1 screenshots RGB (0,0,0) before and (255,255,255) after, the before host load uncollected, default SampleStep, no FailOnScreenshotDelta.
         # RED: verdict INCONCLUSIVE but the report kept meanAbsRgbDelta=255 / changedSampleRatio=1 and the summary line printed them.
@@ -3938,6 +3950,9 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
         self.assertNotIn("collected = $false; reason = \"smoke result text:", p3)
         self.assertIn("try { $result = ConvertFrom-Json -InputObject $resultText -NoEnumerate }", p3)
         self.assertIn("try { $summary = $summaryText | ConvertFrom-Json }", p3)
+        # (A9 sibling: the packet manifest's parse is a recorded import failure too)
+        self.assertIn("try { $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json }", p3)
+        self.assertNotIn("        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json\n", p3)
         self.assertLess(p3.index("$summaryDuplicate = try { Find-VenueJsonDuplicateMember -Text $summaryText -All }"), p3.index("try { $summary = $summaryText | ConvertFrom-Json }"))
         self.assertLess(p3.index("$resultTextStanding = ConvertFrom-VenueSmokeResultText -Text $resultText"), p3.index("try { $result = ConvertFrom-Json -InputObject $resultText -NoEnumerate }"))
 
