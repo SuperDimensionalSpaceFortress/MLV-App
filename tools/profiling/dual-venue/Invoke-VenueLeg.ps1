@@ -167,7 +167,12 @@ if ($null -ne $setPlan) {
     # r6 (adversary-de8e3799.json A3): every entry's planned leg type is read HERE, at planning, before any leg runs (a spec replaced later grants nothing)
     Import-Module (Join-Path $here 'VenueChain.psm1') -Function Get-VenueLegHostLoad, Get-VenueReferenceHostLoadRefusal, Get-VenuePlannedLegType -DisableNameChecking -Force
     $plannedTypes = @{}
-    foreach ($pe in $setPlan.plan) { $plannedTypes[[string]$pe.seq] = Get-VenuePlannedLegType -SpecPath ([string]$pe.specPath) }
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A3): no re-read of the path. The type is the planner's (Get-DvLegSetPlan judged it from the
+    # bytes the child is pinned to by -ExpectSpecSha256); an entry without one reads 'unknown' (never exempt)
+    foreach ($pe in $setPlan.plan) {
+        $pePlanned = $(if ($null -ne $pe.PSObject.Properties['plannedLegType']) { $pe.PSObject.Properties['plannedLegType'].Value } else { $null })
+        $plannedTypes[[string]$pe.seq] = $(if ($pePlanned -is [string] -and ($pePlanned -ceq 'export' -or $pePlanned -ceq 'playback')) { $pePlanned } else { 'unknown' })
+    }
     foreach ($entry in $setPlan.plan) {
         $childArgs = @('-NoProfile', '-File', $PSCommandPath, '-Venue', $Venue, '-LegSpec', $entry.specPath, '-SourceCommit', $SourceCommit,
             '-BuildManifestSha256', $BuildManifestSha256, '-Backend', $entry.backend, '-ReceiptRoot', $ReceiptRoot, '-Actor', $Actor)
@@ -188,10 +193,15 @@ if ($null -ne $setPlan) {
         $childStdout = @($childRaw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { [string]$_ })
         $receiptPath = $null
         foreach ($childLine in $childStdout) { if ($childLine -match '^DVE_RECEIPT_PATH=(?<p>.+)$') { $receiptPath = $Matches['p'].Trim() } }
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A5 sibling): the sha256 of the receipt bytes the child wrote; the bytes read below must be those
+        $childReceiptSha = ''
+        foreach ($childLine in $childStdout) { if ($childLine -cmatch '^DVE_RECEIPT_SHA256=(?<s>[0-9A-Fa-f]{64})$') { $childReceiptSha = $Matches['s'] } }
         $legReceipt = $null
         if ($receiptPath -and (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
             # r6 (adversary-de8e3799.json A4): read the receipt bytes ONCE; the figures come from them and the host-load read is bound to their sha256
             try { $legReceiptBytes = [IO.File]::ReadAllBytes($receiptPath); $legReceiptSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($legReceiptBytes)); $legReceipt = [IO.StreamReader]::new([IO.MemoryStream]::new($legReceiptBytes), [Text.UTF8Encoding]::new($false), $true).ReadToEnd().TrimStart([char]0xFEFF) | ConvertFrom-Json } catch { $legReceipt = $null; $legReceiptSha = '' }
+            # (a receipt that is not the bytes the child wrote binds no host load: the read below gets '' and is unknown)
+            if (-not [string]::Equals($legReceiptSha, $childReceiptSha, [StringComparison]::OrdinalIgnoreCase)) { $legReceiptSha = '' }
         }
         # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): the leg's host-load standing, from its own hash-bound smoke result (the reader the lease batch and the chain
         # use); a provisional or unknown leg is printed as REFERENCE_PROVISIONAL, its row carries hostLoadState / hostLoadProvisional, and it is never measured.
@@ -413,6 +423,9 @@ function Complete-Receipt([string]$Outcome, [string]$Detail) {
     # PLAYBACK-VISUAL-INSPECTION-1: the visual verdict and the strip a reviewer opens.
     if ($null -ne $receipt['visual']) { Write-Output "DVE_VISUAL=$($receipt['visual'].verdict) STRIP=$(if ($receipt['visual'].stripCopyPath) { $receipt['visual'].stripCopyPath } elseif ($receipt['visual'].stripPath) { $receipt['visual'].stripPath } else { 'none' })" }
     Write-Output "DVE_RECEIPT_PATH=$path"
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A5): the sha256 of the receipt bytes this run wrote; the chain and the batch read the
+    # leg's host load only from those bytes (Get-VenueLegHostLoad -ExpectReceiptSha256), so a receipt and result.json swapped in together read unknown.
+    Write-Output "DVE_RECEIPT_SHA256=$(Get-DvLastWrittenReceiptSha256)"
     exit 0
 }
 

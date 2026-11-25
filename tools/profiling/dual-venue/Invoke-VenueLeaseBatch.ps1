@@ -2928,6 +2928,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $outcome = $(if ($o -and $o -match '^DVE_OUTCOME=(\S+)') { $Matches[1] } else { 'NONE' })
                 $pl = $legLines | Where-Object { $_ -match '^DVE_RECEIPT_PATH=(.+)$' } | Select-Object -Last 1
                 $receipt = $(if ($pl -and $pl -match '^DVE_RECEIPT_PATH=(.+)$') { $Matches[1].Trim() } else { $null })
+                # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A5): the sha256 of the receipt bytes the child wrote ('' when it printed none: the read is unknown)
+                $rs = $legLines | Where-Object { $_ -cmatch '^DVE_RECEIPT_SHA256=[0-9A-Fa-f]{64}$' } | Select-Object -Last 1
+                $receiptSha = $(if ($rs) { $rs.Substring('DVE_RECEIPT_SHA256='.Length) } else { '' })
                 $dl = $legLines | Where-Object { $_ -match '^DVE_DETAIL=' } | Select-Object -Last 1
                 $detail = $(if ($dl) { ($dl -replace '^DVE_DETAIL=', '').Trim() } else { '' })
                 $legJobId = @(Get-VenueRemoteJobIds -Text $text | Where-Object { $_ -and $_ -cnotmatch '-health$' }) | Select-Object -Last 1
@@ -3009,7 +3012,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # r6 (sol r5 B2): the export exemption comes only from the leg's PLANNED type (its spec's legType, bound to the bytes the preflight judged when it
                 # recorded them), never from the receipt's shape
                 $plannedType = $(if ($script:SpecPlannedLegType.ContainsKey([string]$leg.spec)) { [string]$script:SpecPlannedLegType[[string]$leg.spec] } else { 'unknown' })
-                $hl = Get-VenueLegHostLoad -ReceiptPath $receipt -PlannedLegType $plannedType
+                # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A5): read only from the receipt bytes the child wrote (a receipt and result.json swapped in together read unknown)
+                $hl = Get-VenueLegHostLoad -ReceiptPath $receipt -PlannedLegType $plannedType -ExpectReceiptSha256 $receiptSha
                 $hlRefusal = Get-VenueReferenceHostLoadRefusal -LegId $(if ($receipt) { [IO.Path]::GetFileNameWithoutExtension($receipt) } else { "leg:$($leg.name)" }) -Standing $hl
                 $class = $(if ($leaseClass) { $leaseClass } elseif ($legFF) { 'COOLDOWN_UNMET' } elseif ($null -eq $preLoad) { 'QUIET_PRELOAD_UNKNOWN' } elseif ($preLoad -le 30.0) { $(if ($hlRefusal) { 'HOSTLOAD_PROVISIONAL' } else { 'QUIET_PRELOAD_OK' }) } else { 'QUIET_PRELOAD_HIGH' })
                 $counted = ($class -ceq 'QUIET_PRELOAD_OK')

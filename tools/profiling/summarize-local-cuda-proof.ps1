@@ -479,7 +479,9 @@ $summaryText = Get-Content -LiteralPath $summaryFullPath -Raw
 # adversary-ac6205bd.json A2: ConvertFrom-Json keeps the LAST of two same-named members ("hostLoadCollected":false,"hostLoadCollected":true reads true),
 # so a summary that repeats a member anywhere is refused, never summarized
 Import-Module (Join-Path $PSScriptRoot 'dual-venue\VenueChain.psm1') -Function Find-VenueJsonDuplicateMember -DisableNameChecking
-$summaryDuplicate = try { Find-VenueJsonDuplicateMember -Text $summaryText -All } catch { $null }
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A2): a summary the strict scanner cannot read (a comment between two repeated
+# members: ConvertFrom-Json accepts it and keeps the LAST value) is refused, never summarized by the looser reader.
+$summaryDuplicate = try { Find-VenueJsonDuplicateMember -Text $summaryText -All } catch { throw "Summary JSON is not strict JSON ($summaryFullPath), so its members cannot be proved unique: $($_.Exception.Message -replace '\s+', ' ')" }
 if ($summaryDuplicate) { throw "Summary JSON repeats the member $summaryDuplicate ($summaryFullPath); a repeated member is never read as evidence." }
 $summary = $summaryText | ConvertFrom-Json -Depth 100
 $failures = @($summary.failures | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })

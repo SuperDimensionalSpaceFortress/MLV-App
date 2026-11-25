@@ -44,9 +44,11 @@ CIM_FAILED = {
 }
 QUIET = {"before": {"collected": True}, "after": {"collected": True}, "state": "quiet", "provisional": False, "reason": "peak 18% <= 75%"}
 # r3 (sol r2 B2): an export receipt as the shipped writer writes one (Invoke-VenueLeg.ps1 `if ($isExport)`: scale/display nulled, the export block binds its spec).
-REAL_EXPORT_RECEIPT = {"schema": "mlv-app/dual-venue-receipt/v1", "scale": None, "display": None, "evidence": {},
+# residue r2 (adversary-07b6a932.json A4): the writer always stamps a typed outcome (Write-DvReceipt validates it against the enum) and sets export.verdict before it
+# completes a PASS/FAIL, so the completed shipped receipt carries outcome PASS beside verdict PASS (a null verdict is the pre-export receipt's, never a PASS's).
+REAL_EXPORT_RECEIPT = {"schema": "mlv-app/dual-venue-receipt/v1", "scale": None, "display": None, "evidence": {}, "outcome": "PASS",
                        "export": {"format": "prores", "maxFrames": 480, "dualIsoExpected": True, "receiptSha256": "2f57f11f95fa9a0eac428f256ad596b1706fe9c9a2f9dfef8411815f970bab6a",
-                                  "files": None, "stages": None, "problems": [], "containmentAdvisory": [], "verdict": None}}
+                                  "files": None, "stages": None, "problems": [], "containmentAdvisory": [], "verdict": "PASS"}}
 
 
 def run_ps(body: str) -> subprocess.CompletedProcess:
@@ -571,7 +573,8 @@ class PlannedLegTypeExemptionTests(unittest.TestCase):
         drivers = {"Invoke-VenueChain.ps1": "$plannedType = Get-VenuePlannedLegType -SpecText $specText",
                    "Invoke-VenueLeaseBatch.ps1": "$script:SpecPlannedLegType[$Path] = Get-VenuePlannedLegType -SpecText",
                    "Invoke-VenueBaseline.ps1": "plannedLegType = (Get-VenuePlannedLegType -SpecText $specText)",
-                   "Invoke-VenueLeg.ps1": "$plannedTypes[[string]$pe.seq] = Get-VenuePlannedLegType -SpecPath ([string]$pe.specPath)"}
+                   # residue r2 (adversary-07b6a932.json A3): the matrix parent takes the planner's type (judged from the bytes the child is pinned to), never a re-read
+                   "Invoke-VenueLeg.ps1": "$pePlanned = $(if ($null -ne $pe.PSObject.Properties['plannedLegType'])"}
         chain = (DV_DIR / "Invoke-VenueChain.ps1").read_text(encoding="utf-8")
         self.assertIn("-PlannedLegType ([string]$leg.plannedLegType)", chain)
         self.assertNotIn("-PlannedLegType (Get-VenuePlannedLegType", chain, "never re-read at classification")
@@ -584,6 +587,12 @@ class PlannedLegTypeExemptionTests(unittest.TestCase):
         self.assertIn("E=export", p.stdout); self.assertIn("Z=unknown", p.stdout); self.assertIn("P=playback", p.stdout)
         for script in ("Invoke-VenueLeg.ps1", "Invoke-VenueBaseline.ps1"):
             self.assertIn("-ExpectReceiptSha256", (DV_DIR / script).read_text(encoding="utf-8"), script)
+        # residue r2 (adversary-07b6a932.json A5): the chain and the batch bind their read to the receipt bytes the child wrote (its DVE_RECEIPT_SHA256 line)
+        for script in ("Invoke-VenueChain.ps1", "Invoke-VenueLeaseBatch.ps1"):
+            text = (DV_DIR / script).read_text(encoding="utf-8")
+            self.assertIn("-ExpectReceiptSha256 $receiptSha", text, script)
+            self.assertIn("'^DVE_RECEIPT_SHA256=[0-9A-Fa-f]{64}$'", text, script)
+        self.assertIn('Write-Output "DVE_RECEIPT_SHA256=$(Get-DvLastWrittenReceiptSha256)"', (DV_DIR / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8"))
         for script, plan_call in drivers.items():
             with self.subTest(script=script):
                 text = (DV_DIR / script).read_text(encoding="utf-8")

@@ -117,6 +117,13 @@ if ($env:FAKE_LEG_PRELOADS) {
     }
     if ($hl -eq 'expshape') { Set-Content -LiteralPath $rp -Value ('{"schema":"mlv-app/dual-venue-receipt/v1","scale":null,"display":null,"evidence":{},"export":{"format":"prores","receiptSha256":"' + ('0' * 64) + '","verdict":null}}') }
     "DVE_RECEIPT_PATH=$rp"
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (A5): like the real leg, the sha256 of the receipt bytes it wrote. FAKE_LEG_SWAP_RECEIPT=1 then swaps in a quiet
+    # receipt + result.json pair that binds itself (the adversary's input): the chain must read it unknown.
+    "DVE_RECEIPT_SHA256=$((Get-FileHash -LiteralPath $rp -Algorithm SHA256).Hash)"
+    if ($env:FAKE_LEG_SWAP_RECEIPT -eq '1') {
+        $swapRes = Join-Path $edir 'result.json'; Set-Content -LiteralPath $swapRes -Value '{"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}'
+        Set-Content -LiteralPath $rp -Value ('{"evidence":{"resultJsonSha256":"' + (Get-FileHash -LiteralPath $swapRes -Algorithm SHA256).Hash.ToLowerInvariant() + '"}}')
+    }
 }
 if ($env:FAKE_LEG_LOG) { Add-Content -LiteralPath $env:FAKE_LEG_LOG -Value ("END {0} {1} {2}" -f [DateTime]::UtcNow.Ticks, $leaf, $PID) }
 # r2: the leg whose spec file name equals FAKE_LEG_FAIL_LEAF dies with FAKE_LEG_FAIL_CODE AFTER printing DVE_OUTCOME=PASS (a crash that leaves a stale verdict line).
@@ -522,6 +529,17 @@ class VenueChainRunnerTests(unittest.TestCase):
         self.assertEqual(got, [("HOSTLOAD_PROVISIONAL", "unknown", True)] + [("QUIET_PRELOAD_OK", "quiet", False)] * 2)
         rid = Path(res["legs"][0]["receipt"]).stem
         self.assertTrue(any(f"REFERENCE_PROVISIONAL leg={rid} reason=hostload-unknown" in l for l in self.chain_log(rd)), self.chain_log(rd))
+
+    def test_residue_r2_a5_a_receipt_and_result_swapped_in_together_after_the_leg_read_unknown(self) -> None:
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2, adversary-07b6a932.json A5, its input: a playback leg with pre-load 5 and an uncollected smoke result prints its
+        # receipt path; then the receipt and result.json are replaced by a quiet pair that binds itself. RED: QUIET_PRELOAD_OK (the chain read the swapped pair).
+        rd = self.case / "lane-SWAP"
+        env = self.env(FAKE_QUIET_MODES="QUIET,QUIET,QUIET,QUIET,QUIET,QUIET", FAKE_LEG_PRELOADS="5.0,5.0,5.0", FAKE_LEG_HOSTLOADS="cim,cim,cim", FAKE_LEG_SWAP_RECEIPT="1")
+        r = self.run_chain(rd, self.specs, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        got = [(l["class"], l.get("hostLoadState"), l.get("hostLoadProvisional")) for l in res["legs"]]
+        self.assertEqual(got, [("HOSTLOAD_PROVISIONAL", "unknown", True)] * 3)
 
     # BACHELOR-VENUE-FOREIGN-FLOOR-FAST-FAIL-1: Wait-VenueQuiet's FOREIGN_FLOOR early exit prints a typed line and then the same COOLDOWN_UNMET line; the chain must
     # still classify the leg COOLDOWN_UNMET (contended, never counted), never QUIET_PRELOAD_* and never VENUE_QUIET_UNKNOWN.

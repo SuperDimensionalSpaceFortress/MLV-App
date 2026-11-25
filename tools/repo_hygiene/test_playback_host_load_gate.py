@@ -1682,7 +1682,8 @@ class CompareGuiSmokeAbInconclusiveVerdictTests(_ProbeCase):
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
             report = json.loads(out.read_text(encoding="utf-8-sig"))
         self.assertTrue(any("same smoke JSON file" in f for f in report["failures"]), report["failures"])
-        self.assertIn("$beforeSource\n} else {\n    Read-SmokeSourceOnce -Path $After", COMPARE_SCRIPT.read_text(encoding="utf-8"))
+        # residue r2 (adversary-07b6a932.json A6): "the same file" is the open handle's identity, never the path spelling
+        self.assertIn("$afterSource = Read-SmokeSourceOnce -Path $After -SameFileAs $beforeSource", COMPARE_SCRIPT.read_text(encoding="utf-8"))
 
     def test_adversary_a5_a_utf16_smoke_result_is_read_by_its_bom(self) -> None:
         # adversary-ac6205bd.json A5: a valid quiet result saved as UTF-16LE with its BOM was force-decoded as UTF-8 (replacement characters and NULs) and the
@@ -1725,7 +1726,10 @@ class CompareGuiSmokeAbInconclusiveVerdictTests(_ProbeCase):
         self.assertIn("-JsonPath $beforeJsonPath -JsonSource $beforeSource", main)
         self.assertIn("-JsonPath $afterJsonPath -JsonSource $afterSource", main)
         once = _extract_functions(COMPARE_SCRIPT, ["Read-SmokeSourceOnce"])
-        self.assertEqual(once.count("[IO.File]::ReadAllBytes("), 1)
+        # residue r2 (A6): the one read is the open handle whose identity was judged (FileStream + CopyTo), never a second open by path
+        self.assertEqual(once.count("[IO.FileStream]::new("), 1)
+        self.assertEqual(once.count("$stream.CopyTo("), 1)
+        self.assertNotIn("[IO.File]::ReadAllBytes(", once)
 
     def test_a_missing_or_exceeded_block_is_inconclusive_even_beside_other_failures(self) -> None:
         exceeded ="[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $true; state = 'exceeded'; reason = 'loaded'; " + SNAPS + " } }"
@@ -3746,6 +3750,196 @@ class ConsumerSweepUltraMagnusAndLocalGpuCapabilityRowsTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("host_load_provisional", proc.stdout)
         self.assertIn("fps", proc.stdout)
+
+
+def _one_pixel_png(rgb: tuple[int, int, int]) -> bytes:
+    import struct
+    import zlib
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"\x00" + bytes(rgb))) + chunk(b"IEND", b""))
+
+
+def _run_ps_file(script: Path, *args: str, timeout: int = 300) -> subprocess.CompletedProcess:
+    return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script), *args],
+                          capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=timeout)
+
+
+def _run_ps_command(command: str, timeout: int = 120) -> subprocess.CompletedProcess:
+    return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+                          capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=timeout)
+
+
+QUIET_SMOKE = '{"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}'
+
+
+@requires_pwsh
+class ResidueR2CudaAbReadSmokeSummaryTests(_ProbeCase):
+    """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2: adversary-07b6a932.json A8 and A9, each fed its own `input`, through the real Read-SmokeSummary."""
+
+    script = CUDA_AB_SCRIPT
+    functions = ["Convert-PlaybackLogLineToObject", "Get-ScopedPlaybackLogLines", "Add-NullableDouble", "Get-AverageOrNull", "Convert-ToNullableDouble",
+                 "Convert-ToNullableInt64", "Get-NestedValue", "Get-SmokeSummaryHostLoadFields", "Read-SmokeSummary"]
+    preamble = f"Import-Module '{VENUE_CHAIN_MODULE}' -Function ConvertFrom-VenueSmokeResultText, Find-VenueJsonDuplicateMember -DisableNameChecking\n"
+
+    def _summary(self, text: str) -> subprocess.CompletedProcess:
+        smoke = self.tmp / "smoke.json"
+        smoke.write_text(text, encoding="utf-8", newline="")
+        return self.run_snippet(
+            f"$s = Read-SmokeSummary -Path '{smoke}' -ExitCode 0\n"
+            "Write-Host \"PROVISIONAL=$($s.hostLoadProvisional) STATE=$($s.hostLoadState) COLLECTED=$($s.hostLoadCollected) VALID=$($s.validationOk)\"\n"
+            "Write-Host \"REASON=$($s.hostLoadReason)\"\n")
+
+    def test_a8_an_exceeded_fully_collected_run_keeps_collected_true(self) -> None:
+        # A8, its input: an exceeded (provisional) but fully collected host load. RED: collected was overwritten to false because the text was provisional.
+        proc = self._summary('{"hostLoad":{"state":"exceeded","provisional":true,"before":{"collected":true},"during":[],"after":{"collected":true}}}')
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("PROVISIONAL=True STATE=exceeded COLLECTED=True", proc.stdout, proc.stdout + proc.stderr)
+        # an uncollected snapshot still reads collected false, and the strict quiet block stays clean
+        proc = self._summary('{"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":false},"after":{"collected":true}}}')
+        self.assertIn("PROVISIONAL=True", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("COLLECTED=False", proc.stdout, proc.stdout + proc.stderr)
+        proc = self._summary(QUIET_SMOKE)
+        self.assertIn("PROVISIONAL=False STATE=quiet COLLECTED=True", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_a9_a_case_ambiguous_smoke_result_is_a_recorded_refusal_not_a_throw(self) -> None:
+        # A9, its input: hostLoad beside HostLoad. RED: ConvertFrom-Json threw KeysWithDifferentCasingInJsonString before the text reader's refusal was recorded.
+        proc = self._summary('{"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}},"HostLoad":{}}')
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("PROVISIONAL=True STATE=unknown COLLECTED=False VALID=False", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("could not be parsed", proc.stdout, proc.stdout + proc.stderr)
+
+
+@requires_pwsh
+class ResidueR2SiblingReaderTests(unittest.TestCase):
+    """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2: adversary-07b6a932.json A2, A3, A4, A6, A7 and the P3 siblings of A8/A9, each fed its own `input`."""
+
+    def test_a2_a_comment_between_repeated_members_is_refused_by_machine_perf_and_the_summarizer(self) -> None:
+        # A2, its input: hostLoadCollected false, a comment, hostLoadCollected true. ConvertFrom-Json accepts it and keeps true; the strict scanner cannot
+        # read it, and that scanner error was swallowed. RED: machine-perf accepted the row, the summarizer summarized it.
+        baseline = '{"hostLoadState":"quiet","hostLoadProvisional":false,"hostLoadCollected":false,/* imported note */"hostLoadCollected":true}'
+        clean = '{"hostLoadState":"quiet","hostLoadProvisional":false,"hostLoadCollected":true}'
+        with tempfile.TemporaryDirectory(prefix="residue-r2-a2-") as tmp:
+            record = Path(tmp) / "ab.json"
+            record.write_text('{"schema":"release-cuda-playback-ab.v1","baseline":' + baseline + ',"candidate":' + clean + '}', encoding="utf-8", newline="")
+            proc = _run_ps_file(COMPARE_MACHINE_PERF_SCRIPT, str(record))
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("is not strict JSON", proc.stdout + proc.stderr)
+            summary = Path(tmp) / "summary.json"
+            summary.write_text('{"status":"PASS","proof":{"playbackAb":{"baseline":' + baseline + ',"candidate":' + clean + '}}}', encoding="utf-8", newline="")
+            proc = _run_ps_file(CUDA_PROOF_SUMMARIZER_SCRIPT, "-SummaryPath", str(summary))
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("is not strict JSON", proc.stdout + proc.stderr)
+
+    def test_a3_the_planned_leg_type_comes_from_the_planner_never_a_second_read(self) -> None:
+        # A3: the matrix parent and the chain re-read each spec path for its type (a spec swapped between the plan and that read changed it), and the chain sent
+        # its LegSet child no -ExpectSpecSha256. The planner now records plannedLegType from the bytes it hashed; nobody re-reads the path.
+        runner = ROOT / "tools" / "profiling" / "dual-venue" / "DualVenueRunner.psm1"
+        proc = _run_ps_command(f"Import-Module '{runner}' -Force -DisableNameChecking; "
+                               f"$p = Get-DvLegSetPlan -LegSetPath '{ROOT / 'tools' / 'profiling' / 'dual-venue' / 'legsets' / 'display-matrix.json'}' -Repeats 1 -Backend ''; "
+                               "foreach ($e in $p.plan) { Write-Output ('T=' + $e.plannedLegType + ' H=' + $e.specSha256.Length) }")
+        types = [l for l in proc.stdout.splitlines() if l.startswith("T=")]
+        self.assertTrue(types, proc.stdout + proc.stderr)
+        self.assertEqual(set(types), {"T=playback H=64"}, proc.stdout + proc.stderr)
+        leg = (ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        chain = (ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueChain.ps1").read_text(encoding="utf-8")
+        self.assertNotIn("Get-VenuePlannedLegType -SpecPath ([string]$pe.specPath)", leg)
+        self.assertNotIn("Get-VenuePlannedLegType -SpecPath ([string]$e.specPath)", chain)
+        self.assertIn("$lArgs += @('-ExpectSpecSha256', [string]$leg.specSha256)", chain)
+
+    def test_a4_an_export_receipt_with_invented_tokens_or_playback_bindings_is_not_an_export_leg(self) -> None:
+        # A4, its inputs: outcome NONEXISTENT with export.verdict NONEXISTENT, visual {requested:true}, a smoke stderr binding; and outcome PASS with a null verdict.
+        # RED: both returned true. The writer's own shapes (a PASS verdict on a PASS receipt; a null verdict on a pre-export INVALID) still do.
+        base = ('"schema":"mlv-app/dual-venue-receipt/v1","scale":null,"display":null,"export":{"format":"prores","receiptSha256":"' + "0" * 64 + '","verdict":%s}')
+        cases = {
+            "invented": '{' + base % '"NONEXISTENT"' + ',"outcome":"NONEXISTENT","visual":{"requested":true},"evidence":{"smokeStderrSha256":"' + "1" * 64 + '"}}',
+            "invented-no-bindings": '{' + base % '"NONEXISTENT"' + ',"outcome":"NONEXISTENT","evidence":{}}',
+            "visual": '{' + base % '"PASS"' + ',"outcome":"PASS","visual":{"requested":true},"evidence":{}}',
+            "stderr": '{' + base % '"PASS"' + ',"outcome":"PASS","evidence":{"smokeStderrSha256":"' + "1" * 64 + '"}}',
+            "pass-null-verdict": '{' + base % 'null' + ',"outcome":"PASS","evidence":{}}',
+            "writer-pass": '{' + base % '"PASS"' + ',"outcome":"PASS","evidence":{}}',
+            "writer-pre-export": '{' + base % 'null' + ',"outcome":"INVALID","evidence":{}}',
+            "writer-downgraded": '{' + base % '"PASS"' + ',"outcome":"INVALID","evidence":{}}',
+        }
+        with tempfile.TemporaryDirectory(prefix="residue-r2-a4-") as tmp:
+            lines = []
+            for name, text in cases.items():
+                (Path(tmp) / f"{name}.json").write_text(text, encoding="utf-8", newline="")
+                lines.append(f"$rc = Get-Content -Raw -LiteralPath '{Path(tmp) / f'{name}.json'}' | ConvertFrom-Json; Write-Output ('{name}=' + (& $m {{ param($r) Test-VenueReceiptIsExportLeg $r }} $rc))")
+            proc = _run_ps_command(f"$m = Import-Module '{VENUE_CHAIN_MODULE}' -DisableNameChecking -PassThru; " + "; ".join(lines))
+        got = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+        self.assertEqual(got, {"invented": "False", "invented-no-bindings": "False", "visual": "False", "stderr": "False", "pass-null-verdict": "False",
+                               "writer-pass": "True", "writer-pre-export": "True", "writer-downgraded": "True"}, proc.stdout + proc.stderr)
+
+    def test_a4_the_outcome_list_is_the_writers(self) -> None:
+        runner = ROOT / "tools" / "profiling" / "dual-venue" / "DualVenueRunner.psm1"
+        proc = _run_ps_command(f"Import-Module '{runner}' -Force -DisableNameChecking; $v = Import-Module '{VENUE_CHAIN_MODULE}' -DisableNameChecking -PassThru; "
+                               "Write-Output ('W=' + ((Get-DvOutcomeEnum) -join ',')); Write-Output ('V=' + ((& $v { $script:VenueReceiptOutcomeEnum }) -join ','))")
+        w = [l[2:] for l in proc.stdout.splitlines() if l.startswith("W=")]
+        v = [l[2:] for l in proc.stdout.splitlines() if l.startswith("V=")]
+        self.assertTrue(w and v, proc.stdout + proc.stderr)
+        self.assertEqual(v, w, "HostLoadReceiptOutcomeEnumParityTests: VenueChain.psm1's outcome list is DualVenueRunner.psm1's $script:OutcomeEnum")
+
+    def _compare(self, before: Path, after: Path, out: Path) -> tuple[subprocess.CompletedProcess, dict | None]:
+        proc = _run_ps_file(COMPARE_SCRIPT, "-Before", str(before), "-After", str(after), "-Output", str(out))
+        return proc, (json.loads(out.read_text(encoding="utf-8-sig")) if out.is_file() else None)
+
+    def test_a6_a_hard_link_to_the_before_file_is_the_same_file(self) -> None:
+        # A6, its input: -After is a hard link to -Before. RED: the paths differ in spelling, so the one file was opened twice and no same-input refusal fired.
+        with tempfile.TemporaryDirectory(prefix="residue-r2-a6-") as tmp:
+            before, alias, out = Path(tmp) / "before.json", Path(tmp) / "alias.json", Path(tmp) / "compare.json"
+            before.write_text(QUIET_SMOKE, encoding="utf-8", newline="")
+            os.link(before, alias)
+            proc, report = self._compare(before, alias, out)
+            self.assertIsNotNone(report, proc.stdout + proc.stderr)
+            self.assertTrue(any("same smoke JSON file" in f for f in report["failures"]), report["failures"])
+            # a case variant of one file on a case-insensitive directory is that same file too
+            out2 = Path(tmp) / "compare2.json"
+            proc, report = self._compare(before, Path(tmp) / "BEFORE.JSON", out2)
+            self.assertTrue(any("same smoke JSON file" in f for f in report["failures"]), report["failures"])
+            # two distinct files are read independently: no same-input refusal and no "paths must be distinct"
+            other, out3 = Path(tmp) / "other.json", Path(tmp) / "compare3.json"
+            other.write_text(QUIET_SMOKE, encoding="utf-8", newline="")
+            proc, report = self._compare(before, other, out3)
+            self.assertFalse(any("same smoke JSON file" in f or "paths must be distinct" in f for f in report["failures"]), report["failures"])
+        once = _extract_functions(COMPARE_SCRIPT, ["Read-SmokeSourceOnce"])
+        self.assertIn("Get-SmokeFileIdentity -Stream $stream", once)
+        self.assertNotIn("OrdinalIgnoreCase", once)
+
+    def test_a7_an_inconclusive_comparison_publishes_no_screenshot_delta(self) -> None:
+        # A7, its input: 1x1 screenshots RGB (0,0,0) before and (255,255,255) after, the before host load uncollected, default SampleStep, no FailOnScreenshotDelta.
+        # RED: verdict INCONCLUSIVE but the report kept meanAbsRgbDelta=255 / changedSampleRatio=1 and the summary line printed them.
+        with tempfile.TemporaryDirectory(prefix="residue-r2-a7-") as tmp:
+            black, white = Path(tmp) / "black.png", Path(tmp) / "white.png"
+            black.write_bytes(_one_pixel_png((0, 0, 0)))
+            white.write_bytes(_one_pixel_png((255, 255, 255)))
+            uncollected = '{"state":"quiet","provisional":false,"before":{"collected":false},"after":{"collected":true}}'
+            before, after, out = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "compare.json"
+            before.write_text(json.dumps({"hostLoad": json.loads(uncollected), "screenshot": {"path": str(black)}}), encoding="utf-8", newline="")
+            after.write_text(json.dumps({"hostLoad": json.loads(QUIET_SMOKE)["hostLoad"], "screenshot": {"path": str(white)}}), encoding="utf-8", newline="")
+            proc, report = self._compare(before, after, out)
+        self.assertIsNotNone(report, proc.stdout + proc.stderr)
+        self.assertEqual(report["verdict"], "INCONCLUSIVE")
+        shot = report["screenshot"]
+        self.assertEqual(shot["status"], "withheld-inconclusive", shot)
+        for field in ("meanAbsRgbDelta", "maxAbsRgbDelta", "changedSampleRatio", "sameSha256", "sampledPixels"):
+            self.assertIsNone(shot[field], (field, shot))
+        line = [l for l in proc.stdout.splitlines() if l.startswith("GUI-SMOKE-AB verdict=")]
+        self.assertTrue(line, proc.stdout)
+        self.assertIn("screenshot_status=withheld-inconclusive mean_abs_rgb_delta= changed_sample_ratio= ", line[0])
+
+    def test_p3_siblings_of_a8_and_a9(self) -> None:
+        # A8 (P3 :1308): collected was replaced by false when the text was provisional. A9 (P3 :589, :1182): the object parse threw before the refusal was recorded.
+        p3 = P3_VALIDATION_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("collected = $bothCollected; reason = \"smoke result text: $($resultTextStanding.reason)\"", p3)
+        self.assertNotIn("collected = $false; reason = \"smoke result text:", p3)
+        self.assertIn("try { $result = ConvertFrom-Json -InputObject $resultText -NoEnumerate }", p3)
+        self.assertIn("try { $summary = $summaryText | ConvertFrom-Json }", p3)
+        self.assertLess(p3.index("$summaryDuplicate = try { Find-VenueJsonDuplicateMember -Text $summaryText -All }"), p3.index("try { $summary = $summaryText | ConvertFrom-Json }"))
+        self.assertLess(p3.index("$resultTextStanding = ConvertFrom-VenueSmokeResultText -Text $resultText"), p3.index("try { $result = ConvertFrom-Json -InputObject $resultText -NoEnumerate }"))
 
 
 @requires_pwsh

@@ -1795,6 +1795,10 @@ function ConvertFrom-VenueSmokeResultText {
     }
 }
 
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A4): the typed receipt outcomes, the same list as DualVenueRunner.psm1
+# $script:OutcomeEnum (this module does not import the runner); HostLoadReceiptOutcomeEnumParityTests pins the two lists equal.
+$script:VenueReceiptOutcomeEnum = @('PASS', 'FAIL', 'VENUE_UNHEALTHY', 'VENUE_NOT_QUIESCENT', 'VENUE_HOST_MISMATCH', 'DEVICE_UNAVAILABLE', 'UNRESOLVED', 'RETRACTED', 'INVALID', 'VENUE_TOOLING', 'SCALE_NOT_HONOURED')
+
 function Test-VenueReceiptIsExportLeg([object]$Rc) {
     # r3 (sol r2 B2): any object-valued export member exempted a playback receipt (export:{} on a playback receipt, or a leg SPEC passed as the receipt). An export
     # leg is now only a receipt shaped as the shipped writer writes one (Invoke-VenueLeg.ps1 `if ($isExport)`): the receipt schema (New-DvReceipt), scale and display
@@ -1815,6 +1819,11 @@ function Test-VenueReceiptIsExportLeg([object]$Rc) {
     # binding is a playback receipt's, never the export writer's, so a receipt carrying either is not an export leg whatever its export block says
     if ($null -ne (Get-VenueHlMember $Rc 'playback')) { return $false }
     if ($null -ne (Get-VenueHlMember $evd 'contactFramesJsonSha256')) { return $false }
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A4): the visual capture block and the smoke stdout/stderr bindings are playback
+    # evidence too (Invoke-VenueLeg.ps1 sets receipt.visual only when Get-DvVisualCaptureRequest applies, never for an export leg, and the export branch
+    # completes its receipt before the smoke streams are collected), so a receipt carrying any of them is not an export leg.
+    if ($null -ne (Get-VenueHlMember $Rc 'visual')) { return $false }
+    foreach ($n in 'smokeStderrSha256', 'smokeStdoutSha256') { if ($null -ne (Get-VenueHlMember $evd $n)) { return $false } }
     $ex = Get-VenueHlMember $Rc 'export'
     if (-not (Test-VenueHlObject $ex)) { return $false }
     $fmt = Get-VenueHlMember $ex 'format'
@@ -1826,9 +1835,14 @@ function Test-VenueReceiptIsExportLeg([object]$Rc) {
     # adversary-ac6205bd.json A6: a non-null verdict is the receipt's own outcome (Invoke-VenueLeg.ps1 writes export.verdict = the export outcome), so an
     # invented token ('NONEXISTENT' beside outcome PASS) is not an export verdict
     # (Complete-Receipt may downgrade a PASS/FAIL outcome to INVALID or UNRESOLVED after the verdict is written, so that pair is the writer's too.)
-    if ($null -eq $verdict) { return $true }
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A4): the outcome and a non-null verdict must be typed receipt outcomes (the
+    # writer's enum, DualVenueRunner.psm1 $script:OutcomeEnum; Write-DvReceipt refuses anything else), never any upper-case token. A null verdict is the
+    # writer's only before the export ran, and that receipt's outcome is never PASS or FAIL (the export branch sets the verdict before it completes a
+    # PASS/FAIL), so a PASS or FAIL beside a null verdict is not the writer's.
     $outcome = Get-VenueHlMember $Rc 'outcome'
-    if (-not ($verdict -is [string] -and [regex]::IsMatch($verdict, '\A[A-Z][A-Z_]{1,31}\z') -and $outcome -is [string])) { return $false }
+    if (-not ($outcome -is [string] -and $outcome -cin $script:VenueReceiptOutcomeEnum)) { return $false }
+    if ($null -eq $verdict) { return -not ($outcome -ceq 'PASS' -or $outcome -ceq 'FAIL') }
+    if (-not ($verdict -is [string] -and $verdict -cin $script:VenueReceiptOutcomeEnum)) { return $false }
     [string]::Equals($verdict, $outcome, [StringComparison]::Ordinal) -or (($outcome -ceq 'INVALID' -or $outcome -ceq 'UNRESOLVED') -and ($verdict -ceq 'PASS' -or $verdict -ceq 'FAIL'))
 }
 

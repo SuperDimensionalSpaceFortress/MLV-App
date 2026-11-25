@@ -586,11 +586,15 @@ function Import-EvidencePacket {
     if ($importFailures.Count -eq 0) {
         $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
         $summaryText = Get-Content -LiteralPath $summaryPath -Raw
-        $summary = $summaryText | ConvertFrom-Json
         # adversary-ac6205bd.json A2: a repeated member anywhere (e.g. "hostLoadCollected":false,"hostLoadCollected":true in a clip record) keeps the last
         # value in the parsed object, so the packet is refused rather than read
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A9): the scanner adjudicates BEFORE the object parse, and a parse refusal
+        # (case-variant keys: KeysWithDifferentCasingInJsonString) is a recorded import failure, never a throw that loses the import result.
         $summaryDuplicate = try { Find-VenueJsonDuplicateMember -Text $summaryText -All } catch { '<unparsable>' }
         if ($summaryDuplicate) { Add-Failure $importFailures "summary.json repeats the member $summaryDuplicate; a repeated member is never read as evidence." }
+        $summary = $null
+        try { $summary = $summaryText | ConvertFrom-Json }
+        catch { Add-Failure $importFailures ("summary.json could not be parsed: " + ($_.Exception.Message -replace '\s+', ' ')) }
 
         if ($manifest.schema -ne "mlvapp-ultramagnus-p3-evidence-packet.v1") {
             Add-Failure $importFailures "Unexpected evidence manifest schema: $($manifest.schema)"
@@ -1179,7 +1183,11 @@ exit `$LASTEXITCODE
             $resultBytes = [IO.File]::ReadAllBytes($clipOutput)
             $resultText = [IO.StreamReader]::new([IO.MemoryStream]::new($resultBytes), [Text.UTF8Encoding]::new($false), $true).ReadToEnd()
             $resultTextStanding = ConvertFrom-VenueSmokeResultText -Text $resultText
-            $result = ConvertFrom-Json -InputObject $resultText -NoEnumerate
+            # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A9): a text the object parser refuses (hostLoad beside HostLoad,
+            # malformed JSON) is a recorded clip failure, never a throw: the object reads null and the text reader's refusal still reaches the row.
+            $result = $null
+            try { $result = ConvertFrom-Json -InputObject $resultText -NoEnumerate }
+            catch { Add-Failure $clipFailures ("The smoke result JSON could not be parsed: " + ($_.Exception.Message -replace '\s+', ' ')) }
             if ($result -is [System.Collections.IList]) { Add-Failure $clipFailures "The smoke result JSON is not one object."; $result = $null }
             if (-not $result.validation.ok) {
                 Add-Failure $clipFailures ("Wrapper validation failed: " + (($result.validation.failures | ForEach-Object { [string]$_ }) -join "; "))
@@ -1304,8 +1312,14 @@ exit `$LASTEXITCODE
         if ($null -ne $resultTextStanding) {
             $textProvisionalRaw = $resultTextStanding.provisional; $textStateRaw = $resultTextStanding.state; $textCollectedRaw = $resultTextStanding.collected
             $textProvisional = -not ($textProvisionalRaw -is [bool] -and -not $textProvisionalRaw -and $textStateRaw -is [string] -and [string]::Equals($textStateRaw, 'quiet', [StringComparison]::Ordinal) -and $textCollectedRaw -is [bool] -and $textCollectedRaw)
+            # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A8): collected reports snapshot collection only (both readers must see
+            # every snapshot collected), never forced false because the run was provisional: an exceeded, fully collected clip keeps collected=true.
+            $bothCollected = ($hostLoadFields.collected -is [bool] -and $hostLoadFields.collected -and $textCollectedRaw -is [bool] -and $textCollectedRaw)
             if ($textProvisional) {
-                $hostLoadFields = [pscustomobject]@{ provisional = $true; state = $(if ([string]$textStateRaw) { [string]$textStateRaw } else { 'unknown' }); collected = $false; reason = "smoke result text: $($resultTextStanding.reason)" }
+                $hostLoadFields = [pscustomobject]@{ provisional = $true; state = $(if ([string]$textStateRaw) { [string]$textStateRaw } else { 'unknown' }); collected = $bothCollected; reason = "smoke result text: $($resultTextStanding.reason)" }
+            }
+            else {
+                $hostLoadFields = [pscustomobject]@{ provisional = $hostLoadFields.provisional; state = $hostLoadFields.state; collected = $bothCollected; reason = $hostLoadFields.reason }
             }
         }
 

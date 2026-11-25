@@ -184,7 +184,13 @@ if ($LegSet) {
     $setPath = Join-Path $here "legsets\$LegSet.json"
     $sp = try { Get-DvLegSetPlan -LegSetPath $setPath -Repeats $Repeats -Backend $(if ($Backend) { $Backend } else { '' }) } catch { Stop-Usage $_.Exception.Message }
     # r6 (adversary-de8e3799.json A3): the planned leg type is read HERE, at planning, before any leg runs; a spec replaced later never grants an exemption
-    foreach ($e in $sp.plan) { $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend; plannedLegType = (Get-VenuePlannedLegType -SpecPath ([string]$e.specPath)) }) }
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A3): no second read of the path. The type is the planner's own (Get-DvLegSetPlan judged it from the
+    # bytes it hashed), and the planner's raw sha256 goes to the child as -ExpectSpecSha256, so the leg runs the planned bytes or refuses DVE_LEG_SPEC_CHANGED
+    foreach ($e in $sp.plan) {
+        $ePlanned = $(if ($null -ne $e.PSObject.Properties['plannedLegType']) { $e.PSObject.Properties['plannedLegType'].Value } else { $null })
+        $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend; specSha256 = [string]$e.specSha256
+            plannedLegType = $(if ($ePlanned -is [string] -and ($ePlanned -ceq 'export' -or $ePlanned -ceq 'playback')) { $ePlanned } else { 'unknown' }) })
+    }
 } else {
     $seq = 0
     foreach ($ref in $LegSpec) {
@@ -536,6 +542,8 @@ foreach ($leg in $plan) {
             $out = Join-Path $RunDir "leg-$($leg.name).out.txt"
             $lArgs = @('-NoProfile', '-NonInteractive', '-File', $LegScript, '-Venue', $Venue, '-LegSpec', $leg.spec, '-SourceCommit', $SourceCommit, '-BuildManifestSha256', $BuildManifestSha256)
             if ($leg.backend) { $lArgs += @('-Backend', $leg.backend) }
+            # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A3): a LegSet leg runs the bytes its planner hashed, or the child refuses
+            if ($null -ne $leg.PSObject.Properties['specSha256'] -and -not [string]::IsNullOrEmpty([string]$leg.specSha256)) { $lArgs += @('-ExpectSpecSha256', [string]$leg.specSha256) }
             if ($SheetCopyDir) { $lArgs += @('-SheetCopyDir', $SheetCopyDir) }
             L "LEG $($leg.name) RUN verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) spec=$($leg.spec) backend=$(if ($leg.backend) { $leg.backend } else { 'spec' })"
             & $pwshExe @lArgs *> $out
@@ -545,6 +553,9 @@ foreach ($leg in $plan) {
             $outcome = $(if ($o -and $o -match '^DVE_OUTCOME=(\S+)') { $Matches[1] } else { 'NONE' })
             $p = $legLines | Where-Object { $_ -match '^DVE_RECEIPT_PATH=(.+)$' } | Select-Object -Last 1
             $receipt = $(if ($p -and $p -match '^DVE_RECEIPT_PATH=(.+)$') { $Matches[1].Trim() } else { $null })
+            # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A5): the sha256 of the receipt bytes the child wrote ('' when it printed none: the read is unknown)
+            $rs = $legLines | Where-Object { $_ -cmatch '^DVE_RECEIPT_SHA256=[0-9A-Fa-f]{64}$' } | Select-Object -Last 1
+            $receiptSha = $(if ($rs) { $rs.Substring('DVE_RECEIPT_SHA256='.Length) } else { '' })
             $dl = $legLines | Where-Object { $_ -match '^DVE_DETAIL=' } | Select-Object -Last 1
             $detail = $(if ($dl) { ($dl -replace '^DVE_DETAIL=', '').Trim() } else { '' })
             if ($legCode -ne 0) {
@@ -557,7 +568,8 @@ foreach ($leg in $plan) {
                 $preLoad = Get-LegPreLoadMean $receipt
                 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: the smoke's own host-load verdict (VenueChain.psm1's one reader); provisional or not collected is never a counted class
                 # r6 (sol r5 B2): the export exemption comes only from the leg's PLANNED type (its spec's legType), never from the receipt's shape
-                $hl = Get-VenueLegHostLoad -ReceiptPath $receipt -PlannedLegType ([string]$leg.plannedLegType)
+                # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A5): read only from the receipt bytes the child wrote (a receipt and result.json swapped in together read unknown)
+                $hl = Get-VenueLegHostLoad -ReceiptPath $receipt -PlannedLegType ([string]$leg.plannedLegType) -ExpectReceiptSha256 $receiptSha
                 $hlRefusal = Get-VenueReferenceHostLoadRefusal -LegId $(if ($receipt) { [IO.Path]::GetFileNameWithoutExtension($receipt) } else { "leg:$($leg.name)" }) -Standing $hl
                 # a FOREIGN_FLOOR early exit in ANY probe of the leg (either phase, any attempt, GATE_BUSY retries included) leaves it contended: a later QUIET reading never promotes it to a counted class
                 $class = $(if ($re.verdict -ceq 'COOLDOWN_UNMET' -or $legPreFF -or $legReFF) { 'COOLDOWN_UNMET' } elseif ($null -eq $preLoad) { 'QUIET_PRELOAD_UNKNOWN' } elseif ($preLoad -le 30.0) { $(if ($hlRefusal) { 'HOSTLOAD_PROVISIONAL' } else { 'QUIET_PRELOAD_OK' }) } else { 'QUIET_PRELOAD_HIGH' })

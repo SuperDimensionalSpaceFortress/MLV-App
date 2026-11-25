@@ -32,11 +32,52 @@ function Read-SmokeJson {
     Get-Content -LiteralPath $resolved -Raw | ConvertFrom-Json -Depth 100
 }
 
+function Get-SmokeFileIdentity {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A6): the physical identity of an OPEN file: on Windows the volume serial
+    # number and the 64-bit file index of the handle (GetFileInformationByHandle), equal for every hard link and every spelling of one file and
+    # different for two files; elsewhere the device and inode the runtime reports for the path. A handle whose identity cannot be read throws, so the
+    # caller records a typed read failure rather than guessing.
+    param([IO.FileStream]$Stream, [string]$ResolvedPath)
+
+    if ($IsWindows -or $null -eq $IsWindows) {
+        if (-not ('MlvSmokeFileIdentity' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class MlvSmokeFileIdentity {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BY_HANDLE_FILE_INFORMATION {
+        public uint FileAttributes; public long CreationTime; public long LastAccessTime; public long LastWriteTime;
+        public uint VolumeSerialNumber; public uint FileSizeHigh; public uint FileSizeLow; public uint NumberOfLinks;
+        public uint FileIndexHigh; public uint FileIndexLow;
+    }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out BY_HANDLE_FILE_INFORMATION info);
+    public static string Of(SafeFileHandle handle) {
+        BY_HANDLE_FILE_INFORMATION info;
+        if (!GetFileInformationByHandle(handle, out info)) { throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()); }
+        return info.VolumeSerialNumber.ToString("X8") + ":" + info.FileIndexHigh.ToString("X8") + info.FileIndexLow.ToString("X8");
+    }
+}
+'@
+        }
+        return [MlvSmokeFileIdentity]::Of($Stream.SafeFileHandle)
+    }
+    $stat = & stat -L -c '%d:%i' -- $ResolvedPath 2>$null
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$stat)) { throw "the identity of $ResolvedPath could not be read" }
+    return ([string]$stat).Trim()
+}
+
 function Read-SmokeSourceOnce {
     # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B2): the comparator's ONE read of a smoke file. One ReadAllBytes feeds both the parse (the
     # figures) and the strict host-load reader (the text). A text the parser refuses (keys differing only in case, malformed JSON) does not throw: the
     # figures object is empty and parseError says why, so the caller records a typed failure and the host-load reader still judges the same text.
-    param([string]$Path)
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A6): -SameFileAs is the source already read for the other leg. Whether two
+    # inputs are one physical file is decided by the file system's identity of the OPEN handle (volume serial + file index), never by path spelling:
+    # a hard link or a case variant of one file is that same file (returned as-is, so it is read once and the same-input refusal fires), and two
+    # paths that differ only in case in a case-sensitive directory are two files, each read independently.
+    param([string]$Path, [object]$SameFileAs = $null)
 
     $resolved = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
     if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
@@ -48,8 +89,21 @@ function Read-SmokeSourceOnce {
     $text = ''
     $smoke = $null
     $parseError = $null
+    $identity = $null
     try {
-        $bytes = [IO.File]::ReadAllBytes($resolved)
+        $stream = [IO.FileStream]::new($resolved, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        try {
+            $identity = Get-SmokeFileIdentity -Stream $stream -ResolvedPath $resolved
+            if ($null -ne $SameFileAs -and $null -ne $SameFileAs.identity -and [string]::Equals($identity, [string]$SameFileAs.identity, [StringComparison]::Ordinal)) {
+                return $SameFileAs
+            }
+            $buffer = [IO.MemoryStream]::new()
+            $stream.CopyTo($buffer)
+            $bytes = $buffer.ToArray()
+        }
+        finally {
+            $stream.Dispose()
+        }
         $text = [IO.StreamReader]::new([IO.MemoryStream]::new($bytes), [Text.UTF8Encoding]::new($false), $true).ReadToEnd()
     }
     catch {
@@ -73,6 +127,7 @@ function Read-SmokeSourceOnce {
         text = $text
         smoke = $smoke
         parseError = $parseError
+        identity = $identity
         sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
         length = [int64]$bytes.Length
     }
@@ -931,12 +986,10 @@ function Compare-SmokeScreenshots {
 # (hostLoad beside HostLoad: KeysWithDifferentCasingInJsonString) is no throw: its figures read empty, a typed failure names it, and the strict host-load
 # reader judges the same text unknown (a repeated member), so the comparison is INCONCLUSIVE with REFERENCE_PROVISIONAL, never an abort.
 $beforeSource = Read-SmokeSourceOnce -Path $Before
-# adversary-ac6205bd.json A4: the same path given twice is the same physical file: it is read once (the distinct-path refusal below then records it)
-$afterSource = if ([string]::Equals($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($After), $beforeSource.path, [StringComparison]::OrdinalIgnoreCase)) {
-    $beforeSource
-} else {
-    Read-SmokeSourceOnce -Path $After
-}
+# adversary-ac6205bd.json A4: the same physical file given twice is read once (the same-input refusal below then records it).
+# adversary-07b6a932.json A6: "the same file" is the open handle's file-system identity (a hard link or a case variant is the same file; two
+# case-distinct files in a case-sensitive directory are two files), never path spelling.
+$afterSource = Read-SmokeSourceOnce -Path $After -SameFileAs $beforeSource
 $beforeJsonPath = $beforeSource.path
 $afterJsonPath = $afterSource.path
 $beforeSmokeText = $beforeSource.text
@@ -997,7 +1050,9 @@ try {
         before = $beforeBinding
         after = $afterBinding
     }
-    if ([string]::Equals($beforeBinding.json.path, $afterBinding.json.path, [StringComparison]::OrdinalIgnoreCase)) {
+    # adversary-07b6a932.json A6: distinct means distinct physical files (the handle identity Read-SmokeSourceOnce recorded), not distinct spellings.
+    if ([object]::ReferenceEquals($afterSource, $beforeSource) -or $null -eq $beforeSource.identity -or $null -eq $afterSource.identity -or
+        [string]::Equals([string]$beforeSource.identity, [string]$afterSource.identity, [StringComparison]::Ordinal)) {
         $failures += "Before and after smoke JSON paths must be distinct."
     }
     if ([string]::Equals($beforeBinding.executable.path, $afterBinding.executable.path, [StringComparison]::OrdinalIgnoreCase)) {
@@ -1241,6 +1296,23 @@ if ([string]::Equals([string]$result.verdict, 'INCONCLUSIVE', [StringComparison]
             $adVal.delta = $null
             if ($null -ne $adVal.PSObject.Properties['deltaPercent']) { $adVal.deltaPercent = $null }
         }
+    }
+}
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A7): the screenshot comparison is a cross-leg delta too. An INCONCLUSIVE
+# comparison keeps each leg's own image metadata but withholds every before-vs-after figure (sameSha256, meanAbsRgbDelta, maxAbsRgbDelta,
+# changedSampleRatio, sampledPixels), in the JSON and in the summary line below; status reads withheld-inconclusive.
+if ([string]::Equals([string]$result.verdict, 'INCONCLUSIVE', [StringComparison]::Ordinal) -and $null -ne $result.screenshot) {
+    $result.screenshot = [pscustomobject]@{
+        status = 'withheld-inconclusive'
+        reason = 'verdict-inconclusive'
+        comparedStatus = [string]$result.screenshot.status
+        before = $result.screenshot.before
+        after = $result.screenshot.after
+        sameSha256 = $null
+        sampledPixels = $null
+        meanAbsRgbDelta = $null
+        maxAbsRgbDelta = $null
+        changedSampleRatio = $null
     }
 }
 

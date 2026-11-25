@@ -2781,7 +2781,11 @@ function Get-DvLegSetPlan {
         if ($specLegId -cnotmatch '^[a-z0-9][a-z0-9-]{1,62}$' -or -not [string]::Equals([IO.Path]::GetFileName($full), "$specLegId.json", [StringComparison]::OrdinalIgnoreCase)) {
             throw "DVE_LEGSET_INVALID '$ref' read as legId '$($spec.legId)': a committed leg spec is named <legId>.json, so a spec reached under another name (an alias, a hard link, a link swapped in) is refused"
         }
-        $specs.Add([pscustomobject]@{ path = $full; spec = $spec; sha256 = $specSha256 })
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A3): the PLANNED leg type comes from THESE bytes (the ones the child is pinned to by
+        # specSha256), by the child's own rule (Invoke-VenueLeg.ps1 $isExport: legType exactly the string 'export'), so no caller re-reads the path to learn it
+        $specLegTypeRaw = Get-DvProp $spec 'legType'
+        $specPlannedLegType = $(if ($specLegTypeRaw -is [string] -and [string]::Equals($specLegTypeRaw, 'export', [StringComparison]::Ordinal)) { 'export' } else { 'playback' })
+        $specs.Add([pscustomobject]@{ path = $full; spec = $spec; sha256 = $specSha256; plannedLegType = $specPlannedLegType })
     }
     $backends = [System.Collections.Generic.List[string]]::new()
     foreach ($s in $specs) { foreach ($b in @($s.spec.backends)) { if ($b -notin $backends) { $backends.Add([string]$b) } } }
@@ -2795,7 +2799,7 @@ function Get-DvLegSetPlan {
             $cellId = $(if ([string](Get-DvProp $s.spec 'legType') -ceq 'export') { "$b-export-$([string]$s.spec.export.format)" } else { "$b-$mode-s$([int]$s.spec.scaleFactor)" })
             if ($seen.ContainsKey($cellId)) { throw "DVE_LEGSET_INVALID two legs of the set make the cell $cellId" }
             $seen[$cellId] = $true
-            $cells.Add([pscustomobject]@{ cellId = $cellId; legId = [string]$s.spec.legId; specPath = $s.path; specSha256 = $s.sha256; backend = $b; displayMode = $mode; scaleFactor = [int]$s.spec.scaleFactor })
+            $cells.Add([pscustomobject]@{ cellId = $cellId; legId = [string]$s.spec.legId; specPath = $s.path; specSha256 = $s.sha256; backend = $b; displayMode = $mode; scaleFactor = [int]$s.spec.scaleFactor; plannedLegType = $s.plannedLegType })
         }
     }
     $cellList = @($cells | Where-Object { [string]::IsNullOrEmpty($Backend) -or $_.backend -ceq $Backend })
@@ -2806,7 +2810,7 @@ function Get-DvLegSetPlan {
         $walk = $(if ($r % 2 -eq 1) { $cellList } else { @($cellList[($cellList.Count - 1)..0]) })
         foreach ($c in $walk) {
             $seq++
-            $plan.Add([pscustomobject]@{ seq = $seq; repeat = $r; cellId = $c.cellId; legId = $c.legId; specPath = $c.specPath; specSha256 = $c.specSha256; backend = $c.backend; displayMode = $c.displayMode; scaleFactor = $c.scaleFactor })
+            $plan.Add([pscustomobject]@{ seq = $seq; repeat = $r; cellId = $c.cellId; legId = $c.legId; specPath = $c.specPath; specSha256 = $c.specSha256; backend = $c.backend; displayMode = $c.displayMode; scaleFactor = $c.scaleFactor; plannedLegType = $c.plannedLegType })
         }
     }
     [pscustomobject]@{ legSet = $setName; card = $card; clipId = $clipId; repeats = $Repeats; cells = @($cellList); plan = @($plan) }
@@ -6933,10 +6937,18 @@ function Write-DvReceipt {
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json + "`n")
     $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)   # CreateNew: never overwrite
     try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A5): the sha256 of the exact bytes just written, so the runner can print it
+    # (DVE_RECEIPT_SHA256=) and its parent binds every later read of the receipt to the receipt this run wrote, never to one swapped in afterwards.
+    $script:DvLastWrittenReceiptSha256 = Get-DvSha256OfBytes $bytes
     $path
 }
 
-Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
+function Get-DvLastWrittenReceiptSha256 {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A5): the sha256 of the receipt bytes Write-DvReceipt last wrote in this session ('' when none).
+    [string]$script:DvLastWrittenReceiptSha256
+}
+
+Export-ModuleMember -Function Get-DvLastWrittenReceiptSha256, Get-DvOutcomeEnum,ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,

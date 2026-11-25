@@ -68,7 +68,10 @@ function Read-JsonRecords {
                 continue
             }
             $lineDuplicate = $null
-            try { $lineDuplicate = Find-VenueJsonDuplicateMember -Text $line -All } catch { $lineDuplicate = $null }
+            # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A2): a line the strict scanner cannot read (a comment between two
+            # repeated members, a trailing comma: ConvertFrom-Json accepts both and keeps the LAST value) is refused, never parsed by the looser reader.
+            try { $lineDuplicate = Find-VenueJsonDuplicateMember -Text $line -All }
+            catch { throw "Input JSONL line ${lineNumber} in ${resolved} is not strict JSON, so its members cannot be proved unique: $($_.Exception.Message -replace '\s+', ' ')" }
             if ($lineDuplicate) { throw "Input JSONL repeats the member $lineDuplicate in ${resolved} at line ${lineNumber}; a repeated member is never read as evidence." }
             try {
                 $records += [pscustomobject]@{

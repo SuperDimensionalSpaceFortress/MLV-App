@@ -515,6 +515,13 @@ if ($env:FAKE_LEG_TAIL_SLEEP) { Start-Sleep -Seconds ([int]$env:FAKE_LEG_TAIL_SL
 $legExit = [int](Pick $env:FAKE_LEG_EXIT $k '0'); if ($legExit -ne 0) { exit $legExit }
 "DVE_OUTCOME=$(if ($legMode -eq 'unresolved') { 'UNRESOLVED' } else { Pick $env:FAKE_LEG_OUTCOMES $k 'PASS' })"
 "DVE_RECEIPT_PATH=$rp"
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (A5): like the real leg, the sha256 of the receipt bytes it wrote; FAKE_LEG_SWAP_RECEIPT per call = 1 then swaps in a
+# quiet receipt + result.json pair that binds itself (the adversary's input), which the batch must read unknown
+"DVE_RECEIPT_SHA256=$((Get-FileHash -LiteralPath $rp -Algorithm SHA256).Hash)"
+if ((Pick $env:FAKE_LEG_SWAP_RECEIPT $k '0') -eq '1') {
+    $swapRes = Join-Path $edir 'result.json'; Set-Content -LiteralPath $swapRes -Value '{"schema":"mlvapp-gui-smoke-result.v2","hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}'
+    Set-Content -LiteralPath $rp -Value ('{"evidence":{"resultJsonSha256":"' + (Get-FileHash -LiteralPath $swapRes -Algorithm SHA256).Hash.ToLowerInvariant() + '"}}')
+}
 exit 0
 """
 
@@ -948,6 +955,15 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         [l] = b["legs"]
         self.assertEqual((l["class"], l["counted"], l["hostLoadState"], l["hostLoadProvisional"]), ("HOSTLOAD_PROVISIONAL", False, "unknown", True), l)
         self.assertIn(f"REFERENCE_PROVISIONAL leg={Path(l['receipt']).stem} reason=hostload-unknown", (self.run_dir / "batch.log").read_text(encoding="utf-8"))
+
+    def test_residue_r2_a5_a_receipt_and_result_swapped_in_together_after_the_leg_is_never_counted(self) -> None:
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2, adversary-07b6a932.json A5, its input: an uncollected smoke result, pre-load 5, and after the child printed its
+        # receipt path a quiet receipt + result.json pair that binds itself replaces both. RED: QUIET_PRELOAD_OK, counted.
+        r = self.run_batch(self.specs[:1], FAKE_LEG_HOSTLOADS="cim", FAKE_LEG_SWAP_RECEIPT="1")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        [l] = b["legs"]
+        self.assertEqual((l["class"], l["counted"], l["hostLoadState"], l["hostLoadProvisional"]), ("HOSTLOAD_PROVISIONAL", False, "unknown", True), l)
 
     def test_a_quiet_host_load_leaves_todays_counting_unchanged(self) -> None:
         r = self.run_batch(self.specs[:1])

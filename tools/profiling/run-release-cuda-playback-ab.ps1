@@ -820,8 +820,18 @@ function Read-SmokeSummary {
     # that is not one object, an uncollected sample) and anything it does not read clean makes the leg provisional.
     $smokeBytes = [IO.File]::ReadAllBytes($Path)
     $smokeText = [IO.StreamReader]::new([IO.MemoryStream]::new($smokeBytes), [Text.UTF8Encoding]::new($false), $true).ReadToEnd()
-    $json = ConvertFrom-Json -InputObject $smokeText -Depth 100 -NoEnumerate
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A9): the venue text reader adjudicates FIRST, and a text the object parser
+    # refuses (hostLoad beside HostLoad: KeysWithDifferentCasingInJsonString; malformed JSON) is no throw: the object reads empty (no figures,
+    # validation not ok), the leg is provisional, and the reason names both the reader's refusal and the parse error.
     $textStanding = ConvertFrom-VenueSmokeResultText -Text $smokeText
+    $smokeParseError = $null
+    $json = $null
+    try {
+        $json = ConvertFrom-Json -InputObject $smokeText -Depth 100 -NoEnumerate
+    }
+    catch {
+        $smokeParseError = "smoke result JSON could not be parsed: $($_.Exception.Message -replace '\s+', ' ')"
+    }
     # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B1): the block is taken as it is (a function return would unroll a one-element array)
     $hostLoad = $null
     if ($null -ne $json -and $json -isnot [System.Collections.IList]) {
@@ -835,11 +845,20 @@ function Read-SmokeSummary {
     $hostLoadReason = $hostLoadFields.reason
     $textProvisionalRaw = $textStanding.provisional; $textStateRaw = $textStanding.state; $textCollectedRaw = $textStanding.collected
     $textProvisional = -not ($textProvisionalRaw -is [bool] -and -not $textProvisionalRaw -and $textStateRaw -is [string] -and [string]::Equals($textStateRaw, 'quiet', [StringComparison]::Ordinal) -and $textCollectedRaw -is [bool] -and $textCollectedRaw)
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A8): collected reports snapshot collection only (both readers must see every
+    # snapshot collected); it is never overwritten because the run was provisional. An exceeded, fully collected run reads provisional=true,
+    # collected=true.
+    $hostLoadCollected = ($hostLoadCollected -is [bool] -and $hostLoadCollected -and $textCollectedRaw -is [bool] -and $textCollectedRaw)
     if ($textProvisional) {
         $hostLoadProvisional = $true
-        $hostLoadCollected = $false
         if ([string]::Equals([string]$textStanding.state, 'unknown', [StringComparison]::Ordinal)) { $hostLoadState = 'unknown' }
         $hostLoadReason = (@(@($hostLoadReason) + @("smoke result text: $($textStanding.reason)")) | Where-Object { $_ }) -join '; '
+    }
+    if ($null -ne $smokeParseError) {
+        $hostLoadProvisional = $true
+        $hostLoadState = 'unknown'
+        $hostLoadCollected = $false
+        $hostLoadReason = (@(@($hostLoadReason) + @($smokeParseError)) | Where-Object { $_ }) -join '; '
     }
     $summary = Get-NestedValue $json "log.summary"
     $glProof = Get-NestedValue $json "visualQuality.glOutputProof"
