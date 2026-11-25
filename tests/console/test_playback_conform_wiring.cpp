@@ -297,7 +297,8 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
     ASSERT_EQ(1, countOccurrences(body, QStringLiteral("playback_frame_range::conformDropFrameDelta(")));
     // the recorders read the tick's own position, after the quantisation
     const int at = body.indexOf(call);
-    ASSERT_TRUE(body.indexOf(QStringLiteral("const double grantedDropFrames = dropFrameTick.position - sourcePositionBeforeDropTick"), at) > at);
+    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r8 iteration 1 (pass 14 A1 on a2983bf2): the granted share is the tick's applied delta
+    ASSERT_TRUE(body.indexOf(QStringLiteral("const double grantedDropFrames = dropFrameTick.appliedFrames;"), at) > at);
     ASSERT_TRUE(body.indexOf(QStringLiteral("m_sourceAdvance.noteEngineTick( sourcePositionBeforeDropTick, dropFrameTick.position, dropFrameTick.wrapped );"), at) > at);
 }
 
