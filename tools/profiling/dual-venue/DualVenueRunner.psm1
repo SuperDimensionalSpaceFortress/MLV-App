@@ -6169,6 +6169,12 @@ function Get-DvReceiptDisplayPathState {
     is null or not an object) BEFORE any gate that reads the venue, without wrapping the core validator in a `try` (the W0 hazard).
     #>
     param([Parameter(Mandatory)]$Receipt, [string]$ReceiptText = '')
+    # SUCCESSOR-3 r3 (adversary pass-4 A1): ConvertFrom-Json reads `2026-11-24T00:00:00Z` and `2026-11-24T00:00:00.000Z` as ONE [datetime], so an adapter name and a
+    # display entry's adapterName that differ as text matched. A caller that holds the receipt's TEXT has the block judged from that text with every string kept as
+    # written (the probe reader already reads its line that way). A text that does not read so (only a hand-made one) leaves the caller's object, as before.
+    if ($PSBoundParameters.ContainsKey('ReceiptText')) {
+        try { $asWritten = ConvertFrom-DvReceiptText -Text $ReceiptText -TextDates; if ($null -ne $asWritten) { $Receipt = $asWritten } } catch { }
+    }
     $venueNode = Get-DvProp $Receipt 'venue'
     # a venue that is present but not an object (an array, a number) cannot be said to carry no block: that is a malformed record, never `absent`
     # SUCCESSOR-1 W4 (r3 adversary A6): an explicit `"venue": null` is a venue that is there and is not an object (malformed); only a missing venue member is absent
@@ -6654,7 +6660,9 @@ function Add-DvJsonDuplicateKeys {
         # OrdinalIgnoreCase: PowerShell reads a member without regard to case, so `Name` beside `name` is one member read twice as well
         $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         foreach ($p in $Element.EnumerateObject()) {
-            $here = $Path + '.' + $p.Name
+            # SUCCESSOR-3 r3 (adversary pass-4 A2): a name that is not a plain identifier (`venue.displayPath` as ONE member name, a bracket, a quote) is written in
+            # bracket form, so it can never read as a path under venue.displayPath (or under a probe's displayPath)
+            $here = $Path + $(if ($p.Name -cmatch '\A[A-Za-z_][A-Za-z0-9_]*\z') { '.' + $p.Name } else { "['" + $p.Name.Replace('\', '\\').Replace("'", "\'") + "']" })
             if (-not $seen.Add($p.Name)) { $Found.Add($here) }
             Add-DvJsonDuplicateKeys -Element $p.Value -Path $here -Found $Found
         }
@@ -6776,13 +6784,16 @@ function ConvertFrom-DvReceiptText {
     validator (Test-DvReceiptValid, given -ReceiptText) types it INVALID with DISPLAY_PATH_MALFORMED instead of the reader dying on the parser's exception or reading
     the receipt as missing. Any other parse failure is the parser's own exception, unchanged.
     #>
-    param([AllowEmptyString()][string]$Text)
-    try { $parsed = $Text | ConvertFrom-Json }
+    # SUCCESSOR-3 r3 (adversary pass-4 A1): -TextDates reads every date-looking string as its TEXT (ConvertFrom-Json -DateKind String, pwsh 7.5+), for the display-path
+    # judgement: two different spellings of one instant must stay two names. The objects the core validator and the readers' gates judge are read as before.
+    param([AllowEmptyString()][string]$Text, [switch]$TextDates)
+    $asText = $TextDates -and ($PSVersionTable.PSVersion -ge [version]'7.5')
+    try { $parsed = $(if ($asText) { $Text | ConvertFrom-Json -DateKind String } else { $Text | ConvertFrom-Json }) }
     catch {
         $first = $_
         $rest = Get-DvJsonRootObjectWithout -Text $Text -Name 'displayPath' -Under 'venue'
         if ($null -eq $rest) { throw $first }
-        try { $parsed = $rest | ConvertFrom-Json } catch { throw $first }
+        try { $parsed = $(if ($asText) { $rest | ConvertFrom-Json -DateKind String } else { $rest | ConvertFrom-Json }) } catch { throw $first }
         $copies = @(Get-DvJsonRootMemberTexts -Text $Text -Name 'venue')
         # r3 (key3 r2 H3, the class of sol r2 B1): the recovery must be what cured the parse. With no venue there was no block to drop; with one venue, the same
         # rewrite that KEEPS its displayPath must still fail, or the failure was not the display path's (a reader difference cured it) and stays the parser's own.
@@ -6826,7 +6837,8 @@ function Test-DvDisplayPathLeaf {
     if ($Kind -cne 'bool' -and (Test-DvDisplayPathUnknown $Value)) { return $true }
     switch ($Kind) {
         'string' { $t = Get-DvDisplayPathTextValue $Value; return (($t -is [string]) -and ($t.Trim().Length -gt 0) -and ($t.Length -le 500)) }
-        'int' { return ((($Value -is [int]) -or ($Value -is [long])) -and ($Value -ge 0)) }
+        # SUCCESSOR-3 r3 (adversary pass-4 A3): 0..[int]::MaxValue, the collector's own bound (its $int reader); a JSON number above it reads back as a [long]
+        'int' { return ((($Value -is [int]) -or ($Value -is [long])) -and ($Value -ge 0) -and ($Value -le [int]::MaxValue)) }
         'bool' { return ($Value -is [bool]) }
         'utc' {
             # ConvertFrom-Json reads an ISO date as a DateTime: only a UTC one (a `...Z` spelling) is a UTC time; a zone-less (Unspecified) or offset (Local) one is the reader's clock
