@@ -270,8 +270,9 @@ struct DropFrameTickResult
     // position moved back by wrapWidth * wrapLaps, and MainWindow records every lap.
     int wrapLaps = 0;
     // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r6 (sol r5 S2 on 6aaac7f5): how far a stale start already at or past the tick's
-    // lap limit was moved back, in whole laps, before the delta applied (those laps were the stale position's, never
-    // travelled, so they are not counted in wrapLaps or recorded). 0 on every other tick. The applied advance is
+    // lap limit was moved back, in whole laps, into the cut onto its own phase before the delta applied (those laps were the
+    // stale position's, never travelled, so they are not counted in wrapLaps or recorded; the tick reads wrapped, with
+    // wrapLaps 0 unless the delta itself crosses the wrap point: pass 11 A1). 0 on every other tick. The applied advance is
     // position - before + foldedFrames + wrapWidth * wrapLaps (MainWindow's grantedDropFrames).
     double foldedFrames = 0.0;
 };
@@ -308,9 +309,38 @@ inline DropFrameTickResult advanceDropFrameTick(
     bool loopEnabled, bool presentLastFrame = false )
 {
     DropFrameTickResult result;
-    result.position = currentPosition + frameDelta;
     const double lastFrame = static_cast<double>( cutOutValue - 1 );
     const double wrapAt = dropFrameLoopWrapAt( cutOutValue, presentLastFrame );
+    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1: at most kMaxLoopLapsPerTick laps per tick (see the lap branch below).
+    constexpr double kMaxLoopLapsPerTick = 1000000.0;
+    // r6 (sol r5 S2 on 6aaac7f5): the bound holds from a start already AT or PAST the tick's lap limit too. Such a start kept
+    // the base arithmetic, so its laps were the stale distance's own (1100000 + 1 on cut 1..2: 1,100,001 laps, one recorder
+    // append each; a +inf start, INT_MAX - 1). r6 iteration 2 (pass 11 A1 on 4c41c80b): it is folded INTO THE CUT, onto its
+    // own phase in [wrapAt - width, wrapAt), where the base's laps would have landed it, so the stale distance records no lap
+    // at all (folding it onto [wrapAt, wrapAt + width) made 1100000 + 0.192, or + 0, record one), and only the delta can wrap.
+    // The fold is taken before the wrap test (pass 11 A2: a negative delta that ended inside the cut skipped it), and the
+    // phase comes from exact fmods of the start and of the wrap point, never from a rounded difference (pass 11 A3: 2^54 lost
+    // it). The fold is reported as foldedFrames and marks the tick wrapped (the position moved back) with wrapLaps 0 unless the
+    // delta crosses wrapAt, so position - before + foldedFrames + wrapWidth * wrapLaps is the advance the tick applied. A +inf
+    // start has no phase and folds to the cut's first position. Every start below the limit is unchanged, bit for bit.
+    double start = currentPosition;
+    const int loopWidth = cutOutValue - cutInValue + ( presentLastFrame ? 1 : 0 );
+    if( loopEnabled && loopWidth > 0 )
+    {
+        const double width = static_cast<double>( loopWidth );
+        if( currentPosition >= wrapAt + kMaxLoopLapsPerTick * width )
+        {
+            double phase = std::fmod( currentPosition, width ) - std::fmod( wrapAt, width );
+            if( phase < 0.0 ) phase += width;
+            if( !( phase >= 0.0 && phase < width ) ) phase = 0.0;
+            start = ( wrapAt - width ) + phase;
+            if( !( start < wrapAt ) ) start = wrapAt - width;
+            result.foldedFrames = currentPosition - start;
+            result.wrapped = true;
+            result.wrapWidth = loopWidth;
+        }
+    }
+    result.position = start + frameDelta;
     if( loopEnabled && result.position >= wrapAt )
     {
         result.wrapWidth = cutOutValue - cutInValue + ( presentLastFrame ? 1 : 0 );
@@ -328,36 +358,18 @@ inline DropFrameTickResult advanceDropFrameTick(
             // pass 7 A2 on 7a0f5a1c: cutting the position made a negative advance from a far stale start): a tick that would wrap
             // more stops at the last position of the 1e6th lap (the rest of the delta is dropped, as a skipped backlog is), so
             // position - before + wrapWidth * wrapLaps is still the advance it made. A start already at or past the limit no longer
-            // keeps the base arithmetic (r6, sol r5 S2: its laps were the stale start's own, unbounded); it is folded first (below),
-            // so the bound holds from ANY start, that one included. Every tick of up to that many laps from a start below the
-            // limit is unchanged, bit for bit. An infinite delta stops there too.
+            // keeps the base arithmetic (r6, sol r5 S2: its laps were the stale start's own, unbounded); it was folded into the cut
+            // above, so the bound holds from ANY start, that one included. Every tick of up to that many laps from a start below
+            // the limit is unchanged, bit for bit. An infinite delta stops there too.
             // r5 (pass 8 A1 on c37d6fd5): it stops at the LAST position below lapLimit (one double step under it), not at the
             // lap's first position lapLimit - width, so a stale start inside [lapLimit - width, lapLimit) keeps its room
             // (2000000 + 4.5 conformed on cut 1..2 advanced 0; it now advances 2 - 2^-32 and lands just below wrapAt).
-            constexpr double kMaxLoopLapsPerTick = 1000000.0;
             const double lapLimit = wrapAt + kMaxLoopLapsPerTick * width;   // laps <= kMaxLoopLapsPerTick iff position < lapLimit
-            // r6 (sol r5 S2 on 6aaac7f5): the bound now holds from a start already AT or PAST lapLimit too. Such a start kept
-            // the base arithmetic, so its laps were the stale distance's own (1100000 + 1 on cut 1..2: 1,100,001 laps, one
-            // recorder append each; a +inf start, INT_MAX - 1). It is folded back to its first lap, [wrapAt, wrapAt + width),
-            // by whole widths (std::fmod is exact), and only then does the delta apply; the fold is reported as foldedFrames,
-            // so position - before + foldedFrames + wrapWidth * wrapLaps is still the advance the tick made and the delta is
-            // kept. A +inf start has no remainder and folds to wrapAt. Every start below lapLimit is unchanged, bit for bit.
-            double start = currentPosition;
-            if( currentPosition >= lapLimit )
-            {
-                double remainder = std::fmod( currentPosition - wrapAt, width );
-                if( !( remainder >= 0.0 && remainder < width ) ) remainder = 0.0;
-                start = wrapAt + remainder;
-                if( !( start < lapLimit ) ) start = wrapAt;
-                result.foldedFrames = currentPosition - start;
-                result.position = start + frameDelta;
-            }
+            // the start is below lapLimit here: a start at or past it was folded into the cut above (r6), before the delta
             if( result.position >= lapLimit && start < lapLimit )
                 result.position = std::max( start, std::nextafter( lapLimit, -HUGE_VAL ) );
-            // a folded start with a negative delta can end below wrapAt: that tick made no lap (the fold was its only move back)
-            const double fewestLaps = result.position < wrapAt ? 0.0 : 1.0;
             laps = std::floor( ( result.position - wrapAt ) / width ) + 1.0;
-            laps = std::min( std::max( laps, fewestLaps ), static_cast<double>( std::numeric_limits<int>::max() - 1 ) );
+            laps = std::min( std::max( laps, 1.0 ), static_cast<double>( std::numeric_limits<int>::max() - 1 ) );
             // the division's rounding: never one lap too many, never one too few
             if( laps > 1.0 && result.position - ( laps - 1.0 ) * width < wrapAt ) laps -= 1.0;
             if( result.position - laps * width >= wrapAt ) laps += 1.0;

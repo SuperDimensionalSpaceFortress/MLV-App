@@ -64,7 +64,8 @@ inline int stampAgeMs( const Stamp & then, const Stamp & now )
  *  kConformMaxDebtFrames = 8). 999,990 frames is more than 11 hours of catch-up at 24 fps. This bound covers a tick that
  *  starts inside the cut; a stale start outside it (r4 pass 5 A1) is bounded where the laps are counted, in
  *  playback_frame_range::advanceDropFrameTick (at most 1e6 laps from any start: r6, sol r5 S2, a start already at or
- *  past that tick's lap limit is folded back to its first lap before the delta applies, DropFrameTickResult::foldedFrames). */
+ *  past that tick's lap limit is folded into the cut, onto its own phase, before the delta applies, so the stale distance
+ *  records no lap: DropFrameTickResult::foldedFrames). */
 inline constexpr double kMaxTickFrames = 999990.0;
 
 /*! The tick's elapsed milliseconds, cut so that \a framerate * ms / 1000 stays within +-kMaxTickFrames. An ordinary
