@@ -215,6 +215,55 @@ TEST(PlaybackPresentTrace, AFoldedStaleStartWithNoGrantIsNotAnAdvance)
     ASSERT_NEAR(0.0, trace.rows()[0].advancedFrames, 0.0);
 }
 
+// PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r8 (sol r7 blocker on 75ed5094, DC-06 catalogue row "a non-Loop clamp correction is
+// not an advance"): during Play, Drop Frame off, seek 100 -> 10, cut 1..50, Drop Frame back on before the next tick, Loop
+// off. The slider handler leaves the Drop Frame position at 100 and the normalizer keeps it (it is inside the clip); the
+// slider at 10 bypasses the outer last-frame branch, and the non-Loop clamp returns 49 with no fold and no lap. 75ed5094's
+// grantedDropFrames (position - before + foldedFrames + wrapWidth * wrapLaps) read that correction as -51 frames of travel
+// and the trace logged adv=1, adv_frames=-51 and moved last_adv / last_tick_diff. A correction with zero grant is no
+// advance: the advance fields keep the previous real advance, for a zero request and for an ordinary 8 ms request.
+TEST(PlaybackPresentTrace, AClampedStaleNonLoopStartWithNoGrantIsNotAnAdvance)
+{
+    ASSERT_FALSE(playback_frame_range::outerLastFrameBranchHandlesTick(10, 50, true, false, false));
+    playback_frame_range::CutRange cut;
+    cut.cutIn = 1;
+    cut.cutOut = 50;
+    cut.valid = true;
+    ASSERT_NEAR(100.0, playback_frame_range::normalizeDropFramePosition(100.0, cut, 200, false), 0.0);
+    const double eightMsRequest = playback_fps_meter::dropFrameRequestFrames(24.0, 8);
+    ASSERT_NEAR(0.192, eightMsRequest, 1e-12);
+    const double requests[] = { 0.0, eightMsRequest };
+    for (const double request : requests)
+    {
+        const playback_frame_range::DropFrameTickResult tick =
+            playback_frame_range::advanceDropFrameTick(100.0, request, 1, 50, false, false);
+        ASSERT_FALSE(tick.wrapped);
+        ASSERT_EQ(0, tick.wrapLaps);
+        ASSERT_NEAR(0.0, tick.foldedFrames, 0.0);
+        ASSERT_NEAR(49.0, tick.position, 0.0);
+        // the value 75ed5094 handed the trace (its grantedDropFrames had no clamp term)
+        const double reconstructed = tick.position - 100.0 + tick.foldedFrames
+            + static_cast<double>(tick.wrapWidth) * tick.wrapLaps;
+        ASSERT_NEAR(-51.0, reconstructed, 0.0);
+        Recorder trace;
+        trace.setEnabled(true);
+        trace.begin(1000.0, 4);
+        trace.noteTick(1008.0, false, false);
+        trace.noteAdvance(1008.5, 1.0, 42);            // a real advance first
+        trace.noteTick(1016.0, false, false);
+        trace.noteAdvance(1016.5, reconstructed, 8);   // 100 -> 49: the clamp's correction, nothing granted
+        Row r;
+        r.presentMs = 1020.0;
+        trace.notePresent(r);
+        ASSERT_EQ(static_cast<size_t>(1), trace.rows().size());
+        ASSERT_EQ(2, trace.rows()[0].ticks);
+        ASSERT_EQ(1, trace.rows()[0].advances);
+        ASSERT_NEAR(1.0, trace.rows()[0].advancedFrames, 0.0);
+        ASSERT_NEAR(8.5, trace.rows()[0].lastAdvanceMs, 1e-9);
+        ASSERT_NEAR(42.0, trace.rows()[0].lastTickDiffMs, 0.0);
+    }
+}
+
 TEST(PlaybackPresentTrace, ARowHasOneFieldPerHeaderColumn)
 {
     Recorder trace;
@@ -296,4 +345,15 @@ TEST(PlaybackPresentTraceWiring, TheAdvanceIsTheTicksAppliedGrantNotItsEndpoints
     ASSERT_EQ(1, handling.count(QStringLiteral(
         "including whole laps that land back on the start\n"
         "                m_playbackTickAppliedFrames = grantedDropFrames;\n")));
+}
+
+// r8 (sol r7 blocker on 75ed5094): the Drop Frame grant (the trace's advance and the slip histogram's granted share) adds
+// back the distance the non-Loop clamp moved a stale start past the cut's last frame onto it, as it adds back a Loop fold,
+// so a clamp correction with no grant is 0 frames, never a negative advance.
+TEST(PlaybackPresentTraceWiring, TheDropFrameGrantAddsBackTheNonLoopClampCorrection)
+{
+    const QString source = mainWindowSource();
+    ASSERT_EQ(1, source.count(QStringLiteral(
+        "                const double grantedDropFrames = dropFrameTick.position - sourcePositionBeforeDropTick + dropFrameTick.foldedFrames\n"
+        "                    + dropFrameTick.clampedFrames + static_cast<double>( dropFrameTick.wrapWidth ) * dropFrameTick.wrapLaps;\n")));
 }
