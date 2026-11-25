@@ -1664,6 +1664,111 @@ function Get-VenueLegPreLoadMean {
     } catch { $null }
 }
 
+function ConvertFrom-VenueSmokeHostLoad {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: a leg's standing from its smoke result's hostLoad block (run-release-gui-smoke.ps1 writes it: state, provisional, before/after
+    snapshots with collected=). The canonical predicate of PLAYBACK-MEASURE-HOST-LOAD-GATE-1 (compare-release-gui-smoke-ab.ps1 Get-HostLoadComparisonEvidence):
+    clean iff state is exactly 'quiet' AND provisional is the boolean false; every other combination is provisional. Added here: a before or after snapshot
+    whose collected is not the boolean true (2026-11-21 leg a134532e: "collection failed: CimException") reads state 'unknown', never 'quiet' and never blank,
+    and a missing block reads 'unknown'. Returns { state; provisional; collected; reason }. Pure: no file access.
+    #>
+    param([AllowNull()][object]$HostLoad)
+    function Get-HlProp([object]$O, [string]$N) { if ($null -eq $O -or $O -is [string] -or $O -is [ValueType]) { return $null }; $p = $O.PSObject.Properties[$N]; if ($null -eq $p) { $null } else { $p.Value } }
+    if ($null -eq $HostLoad -or $HostLoad -is [string] -or $HostLoad -is [ValueType] -or $HostLoad -is [Array]) {
+        return [pscustomobject]@{ state = 'unknown'; provisional = $true; collected = $false; reason = 'no hostLoad block in the smoke result' }
+    }
+    $errors = @()
+    $collected = $true
+    foreach ($side in 'before', 'after') {
+        $snap = Get-HlProp $HostLoad $side
+        $c = Get-HlProp $snap 'collected'
+        if (-not ($c -is [bool] -and $c)) {
+            $collected = $false
+            $err = Get-HlProp $snap 'error'
+            $errors += "$side not collected$(if ($err) { " ($([string]$err))" })"
+        }
+    }
+    $stateRaw = Get-HlProp $HostLoad 'state'
+    $state = $(if ($stateRaw -is [string] -and -not [string]::IsNullOrWhiteSpace($stateRaw)) { ($stateRaw.Trim() -replace '\s+', '_') } else { 'unknown' })
+    if (-not $collected) { $state = 'unknown' }
+    $prov = Get-HlProp $HostLoad 'provisional'
+    $provisional = (-not ($prov -is [bool] -and -not $prov)) -or ($state -cne 'quiet')
+    $why = Get-HlProp $HostLoad 'reason'
+    $reason = @(@($errors) + @($(if ($why) { [string]$why }))) -join '; '
+    [pscustomobject]@{ state = $state; provisional = [bool]$provisional; collected = [bool]$collected; reason = $reason }
+}
+
+function Get-VenueLegHostLoad {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: the leg's host-load standing, read from the run's own smoke result (<evidence>\<receiptId>\result.json, which Invoke-VenueLeg
+    copies beside summary.json; the same evidence folder Get-VenueLegPreLoadMean reads), never from the receipt file. A playback leg (summary.json at the evidence
+    root) with no result.json, an unreadable one or no hostLoad block is 'unknown' and provisional. An export leg (export\summary.json only) runs no GUI smoke:
+    state 'not-applicable', provisional false, applies false, so its counting is unchanged. Returns ConvertFrom-VenueSmokeHostLoad's object plus applies.
+    #>
+    param([string]$ReceiptPath)
+    $unknown = [pscustomobject]@{ state = 'unknown'; provisional = $true; collected = $false; reason = 'no smoke result.json for the leg'; applies = $true }
+    try {
+        if (-not $ReceiptPath) { return $unknown }
+        $root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $ReceiptPath)))
+        $evidence = Join-Path (Join-Path (Split-Path -Parent $root) 'evidence') ([IO.Path]::GetFileNameWithoutExtension($ReceiptPath))
+        $isExport = (-not (Test-Path -LiteralPath (Join-Path $evidence 'summary.json') -PathType Leaf)) -and (Test-Path -LiteralPath (Join-Path (Join-Path $evidence 'export') 'summary.json') -PathType Leaf)
+        if ($isExport) { return [pscustomobject]@{ state = 'not-applicable'; provisional = $false; collected = $false; reason = 'export leg: no GUI smoke'; applies = $false } }
+        $result = Join-Path $evidence 'result.json'
+        if (-not (Test-Path -LiteralPath $result -PathType Leaf)) { return $unknown }
+        $doc = [IO.File]::ReadAllText($result) | ConvertFrom-Json
+        $hl = $(if ($null -ne $doc -and $doc -isnot [string] -and $doc -isnot [ValueType] -and $doc -isnot [Array] -and $doc.PSObject.Properties['hostLoad']) { $doc.hostLoad } else { $null })
+        $s = ConvertFrom-VenueSmokeHostLoad -HostLoad $hl
+        $s | Add-Member -NotePropertyName applies -NotePropertyValue $true
+        $s
+    } catch {
+        $unknown.reason = "the smoke result.json could not be read ($($_.Exception.Message -replace '\s+', ' '))"
+        $unknown
+    }
+}
+
+function Get-VenueReferenceHostLoadRefusal {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: the typed line for a leg that must not be counted as a control/reference arm, or $null when it may be.
+    # REFERENCE_PROVISIONAL leg=<id> reason=hostload-<state> (hostload-provisional when the state reads quiet but the leg is provisional).
+    param([AllowEmptyString()][AllowNull()][string]$LegId, [AllowNull()][object]$Standing)
+    $applies = $(if ($null -ne $Standing -and $Standing.PSObject.Properties['applies']) { [bool]$Standing.applies } else { $true })
+    if (-not $applies) { return $null }
+    $prov = $(if ($null -ne $Standing -and $Standing.PSObject.Properties['provisional']) { $Standing.provisional } else { $true })
+    if ($prov -is [bool] -and -not $prov) { return $null }
+    $state = $(if ($null -ne $Standing -and $Standing.PSObject.Properties['state'] -and $Standing.state) { [string]$Standing.state } else { 'unknown' })
+    $why = $(if ($state -ceq 'quiet') { 'provisional' } else { $state -replace '[^A-Za-z0-9_.-]', '_' })
+    $id = $(if ([string]::IsNullOrWhiteSpace($LegId)) { 'UNKNOWN' } else { $LegId -replace '\s', '_' })
+    "REFERENCE_PROVISIONAL leg=$id reason=hostload-$why"
+}
+
+function Get-VenueReferenceArmVerdict {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: the control/reference arm of a comparison, legs given as { legId; hostLoad } (hostLoad = the smoke result's raw block, or a
+    standing already read by Get-VenueLegHostLoad). A leg whose host load is provisional or unknown is never COUNTED as the arm: it is listed with its typed
+    REFERENCE_PROVISIONAL line, and the verdict is INCONCLUSIVE (never a pass, never a regression). Every leg stays in legs. COUNTED only when every leg is clean
+    and there is at least one. Pure.
+    #>
+    param([AllowNull()][AllowEmptyCollection()][object[]]$Legs)
+    $all = [System.Collections.Generic.List[object]]::new(); $counted = [System.Collections.Generic.List[object]]::new(); $refusals = [System.Collections.Generic.List[string]]::new()
+    foreach ($leg in @($Legs)) {
+        if ($null -eq $leg) { continue }
+        $lid = $(if ($leg.PSObject.Properties['legId']) { [string]$leg.legId } else { '' })
+        $raw = $(if ($leg.PSObject.Properties['hostLoad']) { $leg.hostLoad } else { $null })
+        $isStanding = ($null -ne $raw -and $raw -isnot [string] -and $raw -isnot [ValueType] -and $raw.PSObject.Properties['applies'] -and $raw.PSObject.Properties['collected'])
+        $s = $(if ($isStanding) { $raw } else { ConvertFrom-VenueSmokeHostLoad -HostLoad $raw })
+        $line = Get-VenueReferenceHostLoadRefusal -LegId $lid -Standing $s
+        $row = [pscustomobject]@{ legId = $lid; hostLoadState = [string]$s.state; hostLoadProvisional = [bool]$s.provisional; counted = ($null -eq $line) }
+        $all.Add($row)
+        if ($null -eq $line) { $counted.Add($row) } else { $refusals.Add($line) }
+    }
+    [pscustomobject]@{
+        verdict = $(if ($refusals.Count -eq 0 -and $all.Count -gt 0) { 'COUNTED' } else { 'INCONCLUSIVE' })
+        refusals = [string[]]$refusals.ToArray(); counted = [object[]]$counted.ToArray(); legs = [object[]]$all.ToArray()
+    }
+}
+
 function Get-VenueLeaseLedgerPath {
     # BACHELOR-LEASE-BATCH-LEGS-1 r2: <ClaimDir>\<venue>.lease-ledger.jsonl, one line per quiet lease a lease-batch run took (any run on this host), beside the claim.
     param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '')
@@ -2056,5 +2161,5 @@ Export-ModuleMember -Function New-VenueCapsProbeId, Get-VenueDriverScriptMissing
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
     Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueStagedArtifactNames, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
-    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueInterleavedLegPlan, Get-VenueLegPreLoadMean, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait, Get-VenueRunStartCap, Get-VenueLegPlaySeconds, Get-VenuePlanPlaySeconds, ConvertTo-VenueStartCapTime,Get-VenueLeaseCaps, Resolve-VenueLeaseCaps,
+    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueInterleavedLegPlan, Get-VenueLegPreLoadMean, ConvertFrom-VenueSmokeHostLoad, Get-VenueLegHostLoad, Get-VenueReferenceHostLoadRefusal, Get-VenueReferenceArmVerdict, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait, Get-VenueRunStartCap, Get-VenueLegPlaySeconds, Get-VenuePlanPlaySeconds, ConvertTo-VenueStartCapTime,Get-VenueLeaseCaps, Resolve-VenueLeaseCaps,
     Get-VenueClaimAgeSec, Update-VenueClaim, Start-VenueKeeper, Stop-VenueKeeper, Start-VenueClaimKeeper, Get-VenueClaimKeeperLoss, New-VenueJobLivenessWrite, Write-VenueJobLiveness, Test-VenueJobLivenessReadback, Start-VenueJobLiveness, Stop-VenueJobLiveness

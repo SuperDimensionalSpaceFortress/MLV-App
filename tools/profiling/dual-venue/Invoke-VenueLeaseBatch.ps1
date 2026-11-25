@@ -22,7 +22,8 @@
 #         The lease is never released and re-requested on a busy desktop. The lease's own end bounds the retries;
 #      c. the leg's agent result is read BY NAME (outbox\<jobId>.result.json). The leg counts only if it ran on THIS batch's lease (admission.leaseBatch
 #         .leaseId) and kept it (slotContinuity). Class: QUIET_PRELOAD_OK (counted) when its own pre-load mean is <= 30 %; otherwise QUIET_PRELOAD_HIGH,
-#         QUIET_PRELOAD_UNKNOWN or LEASE_LOST (uncounted). r5 (V-01): a FOREIGN_FLOOR line from ANY probe of the leg (an earlier attempt or batch included)
+#         QUIET_PRELOAD_UNKNOWN or LEASE_LOST (uncounted); a quiet pre-load whose smoke host load (result.json hostLoad) is provisional or was not collected is
+#         HOSTLOAD_PROVISIONAL (uncounted, line REFERENCE_PROVISIONAL leg=<id> reason=hostload-<state>; VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1). r5 (V-01): a FOREIGN_FLOOR line from ANY probe of the leg (an earlier attempt or batch included)
 #         sticks: the leg is COOLDOWN_UNMET (uncounted) whatever a later QUIET probe reads, as in Invoke-VenueChain. It never carries into the next leg.
 #   4. END. A batch ends when its legs are done (ALL_LEGS_DONE), the claim is lost (CLAIM_LOST, 8b), the open's sidecar cannot be written (LIVENESS_UNAVAILABLE,
 #      8a), the next leg would outlive the lease (LEASE_REMAINING_SHORT: the rest go to the next batch; also
@@ -2997,9 +2998,14 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # Only a QUIET probe reaches here, so the class is the lease, then the leg's sticky foreign floor (r5, V-01: a FOREIGN_FLOOR in ANY probe of this
                 # leg, an earlier attempt or batch included, leaves it contended: COOLDOWN_UNMET, never counted), then the pre-load.
                 $legFF = $legForeign.ContainsKey($leg.name)
-                $class = $(if ($leaseClass) { $leaseClass } elseif ($legFF) { 'COOLDOWN_UNMET' } elseif ($null -eq $preLoad) { 'QUIET_PRELOAD_UNKNOWN' } elseif ($preLoad -le 30.0) { 'QUIET_PRELOAD_OK' } else { 'QUIET_PRELOAD_HIGH' })
+                # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: the smoke's own host-load verdict (result.json hostLoad). A leg whose host load was provisional or not collected
+                # (2026-11-21 a134532e: CimException, state unknown) is recorded as RAN but is never a counted class: HOSTLOAD_PROVISIONAL, with its typed line.
+                $hl = Get-VenueLegHostLoad -ReceiptPath $receipt
+                $hlRefusal = Get-VenueReferenceHostLoadRefusal -LegId $(if ($receipt) { [IO.Path]::GetFileNameWithoutExtension($receipt) } else { "leg:$($leg.name)" }) -Standing $hl
+                $class = $(if ($leaseClass) { $leaseClass } elseif ($legFF) { 'COOLDOWN_UNMET' } elseif ($null -eq $preLoad) { 'QUIET_PRELOAD_UNKNOWN' } elseif ($preLoad -le 30.0) { $(if ($hlRefusal) { 'HOSTLOAD_PROVISIONAL' } else { 'QUIET_PRELOAD_OK' }) } else { 'QUIET_PRELOAD_HIGH' })
                 $counted = ($class -ceq 'QUIET_PRELOAD_OK')
                 $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'RAN'; outcome = $outcome; class = $class; counted = $counted; quietVerdict = $q.verdict; quietMean = $q.mean; preLoadMean = $preLoad
+                    hostLoadState = [string]$hl.state; hostLoadProvisional = [bool]$hl.provisional
                     receipt = $receipt; jobId = $legJobId; jobLease = $jobLease; onLease = $onLease; renewOkMaxGapSec = $gap; legSec = $legSec; legExit = $legCode; exit75Refusals = $legRef; foreignFloor = $legFF }
                 if ($legFF) { $row['foreignFloorLine'] = $legForeign[$leg.name] }
                 if ($detail) { $row['outcomeDetail'] = $detail }
@@ -3015,7 +3021,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $b.legs.Add([pscustomobject]$row); Add-Result $leg 'RAN' $row; $pending.RemoveAt(0)
                 Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                 $b.legsRan++; if ($counted) { $b.legsCounted++ }
-                LogBest "LEG $($leg.name) RAN batch=$batchNo exit=$legCode outcome=$outcome class=$class counted=$counted quietMean=$(Format-Mean $q.mean) preLoadMean=$(Format-Mean $preLoad) legSec=$legSec receipt=$receipt $leaseWhy$(if ($legFF) { ' foreignFloor=1' })"
+                LogBest "LEG $($leg.name) RAN batch=$batchNo exit=$legCode outcome=$outcome class=$class counted=$counted quietMean=$(Format-Mean $q.mean) preLoadMean=$(Format-Mean $preLoad) hostLoadState=$($hl.state) hostLoadProvisional=$([bool]$hl.provisional) legSec=$legSec receipt=$receipt $leaseWhy$(if ($legFF) { ' foreignFloor=1' })"
+                if ($class -ceq 'HOSTLOAD_PROVISIONAL') { LogBest $hlRefusal }
                 if ($leaseClass -ceq 'LEASE_IDLE_ENDED') { $b.endDetail = $leaseWhy; Set-BatchLeaseIdleEnded $b $legIe $leg.name "before leg $($leg.name)'s job was admitted: it ran off the lease, uncounted" 'a leg ran off the lease: uncounted' -AppendDetail; break }
                 if ($leaseClass) { $b.endReason = $leaseClass; $b.endDetail = $leaseWhy; break }
                 if ($pending.Count -gt 0 -and $CooldownSec -gt 0) {

@@ -547,14 +547,18 @@ foreach ($leg in $plan) {
                 if ($exitCode -eq 0) { $exitCode = 7 }
             } else {
                 $preLoad = Get-LegPreLoadMean $receipt
+                # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: the smoke's own host-load verdict (VenueChain.psm1's one reader); provisional or not collected is never a counted class
+                $hl = Get-VenueLegHostLoad -ReceiptPath $receipt
+                $hlRefusal = Get-VenueReferenceHostLoadRefusal -LegId $(if ($receipt) { [IO.Path]::GetFileNameWithoutExtension($receipt) } else { "leg:$($leg.name)" }) -Standing $hl
                 # a FOREIGN_FLOOR early exit in ANY probe of the leg (either phase, any attempt, GATE_BUSY retries included) leaves it contended: a later QUIET reading never promotes it to a counted class
-                $class = $(if ($re.verdict -ceq 'COOLDOWN_UNMET' -or $legPreFF -or $legReFF) { 'COOLDOWN_UNMET' } elseif ($null -eq $preLoad) { 'QUIET_PRELOAD_UNKNOWN' } elseif ($preLoad -le 30.0) { 'QUIET_PRELOAD_OK' } else { 'QUIET_PRELOAD_HIGH' })
-                $ranExtra = @{ verdict = $re.verdict; quietMean = $re.mean; preClaimVerdict = $pre.verdict; preClaimMean = $pre.mean; preLoadMean = $preLoad; class = $class; preClaimForeignFloor = $legPreFF; underClaimForeignFloor = $legReFF; outcome = $outcome; legExit = $legCode; receipt = $receipt }
+                $class = $(if ($re.verdict -ceq 'COOLDOWN_UNMET' -or $legPreFF -or $legReFF) { 'COOLDOWN_UNMET' } elseif ($null -eq $preLoad) { 'QUIET_PRELOAD_UNKNOWN' } elseif ($preLoad -le 30.0) { $(if ($hlRefusal) { 'HOSTLOAD_PROVISIONAL' } else { 'QUIET_PRELOAD_OK' }) } else { 'QUIET_PRELOAD_HIGH' })
+                $ranExtra = @{ verdict = $re.verdict; quietMean = $re.mean; preClaimVerdict = $pre.verdict; preClaimMean = $pre.mean; preLoadMean = $preLoad; class = $class; hostLoadState = [string]$hl.state; hostLoadProvisional = [bool]$hl.provisional; preClaimForeignFloor = $legPreFF; underClaimForeignFloor = $legReFF; outcome = $outcome; legExit = $legCode; receipt = $receipt }
                 if ($legPreFF) { $ranExtra['preClaimForeignFloorLine'] = $legPreFFLine }
                 if ($legReFF) { $ranExtra['underClaimForeignFloorLine'] = $legReFFLine }
                 if ($detail) { $ranExtra['outcomeDetail'] = $detail }
                 Add-Result $leg 'RAN' $ranExtra
-                L "LEG $($leg.name) RAN exit=$legCode outcome=$outcome verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) preLoadMean=$(Format-Mean $preLoad) class=$class receipt=$receipt$(if ($legPreFF) { ' preClaimForeignFloor=1' })$(if ($legReFF) { ' underClaimForeignFloor=1' })$(if ($detail) { " detail=$detail" })"
+                L "LEG $($leg.name) RAN exit=$legCode outcome=$outcome verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) preLoadMean=$(Format-Mean $preLoad) class=$class hostLoadState=$($hl.state) hostLoadProvisional=$([bool]$hl.provisional) receipt=$receipt$(if ($legPreFF) { ' preClaimForeignFloor=1' })$(if ($legReFF) { ' underClaimForeignFloor=1' })$(if ($detail) { " detail=$detail" })"
+                if ($class -ceq 'HOSTLOAD_PROVISIONAL') { L $hlRefusal }
                 # VENUE-CHAIN-UNHEALTHY-STREAK-STOP-1: only a RAN leg counts or resets (LEG_FAILED / NOT_RUN never reach here). VENUE_UNHEALTHY with a detail extends the
                 # streak when the detail KEY is the same (Get-UnhealthyDetailKey), otherwise starts it at 1; anything else (a different outcome, or no detail to compare) resets it.
                 # -UnhealthyStreakStop 0 switches off the count only: the owner-only first occurrence stops the chain whatever N is.
