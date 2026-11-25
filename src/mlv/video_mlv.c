@@ -359,6 +359,25 @@ int mlvPlaybackFastX4HqPathMode(void)
 #endif
 }
 
+/* DEBAYER-CAPTURE-LABEL-1: the one name table for doesMlvAlwaysUseAmaze values, keyed by the
+ * setters in macros.h and named in the app's vocabulary (MainWindow::selectedPlaybackDebayerLabel). */
+const char * getMlvDebayerName(int debayer_type)
+{
+    switch (debayer_type)
+    {
+        case 0: return "bilinear"; /* setMlvDontAlwaysUseAmaze */
+        case 1: return "amaze";    /* setMlvAlwaysUseAmaze */
+        case 2: return "none";     /* setMlvUseNoneDebayer */
+        case 3: return "simple";   /* setMlvUseSimpleDebayer */
+        case 4: return "lmmse";    /* setMlvUseLmmseDebayer */
+        case 5: return "igv";      /* setMlvUseIgvDebayer */
+        case 6: return "ahd";      /* setMlvUseAhdDebayer */
+        case 7: return "rcd";      /* setMlvUseRcdDebayer */
+        case 8: return "dcb";      /* setMlvUseDcbDebayer */
+        default: return "unknown";
+    }
+}
+
 /* Matches lj92.c's lj92_pred6_split_enabled-style truthy check: any non-empty
  * value other than literal "0" enables the feature. Broader than
  * mlv_env_value_is_truthy so the prefetch disable here tracks whatever lj92
