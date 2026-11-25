@@ -723,7 +723,8 @@ class HelperBehaviourTests(unittest.TestCase):
         run_real = b'@echo off\r\npy.exe -3 -S "%FFX_BANNER%"\r\npy.exe %*\r\nexit /b %ERRORLEVEL%\r\n'
         # r17 adversary ea86ac25-A1: startup text with NO line ending shares the report's first line (`site ready{`), also with braces.
         for label, eol, text in (("lf", b"\n", "site ready"), ("crlf", b"\r\n", "site ready"),
-                                 ("no-newline", b"", "site ready"), ("no-newline-braces", b"", "{site {ready{")):
+                                 ("no-newline", b"", "site ready"), ("no-newline-braces", b"", "{site {ready{"),
+                                 ("no-newline-indented", b"", "  site ready"), ("no-newline-tab-brace", b"", "\t{")):  # r17 adversary 6548798b-A1
             with self.subTest(startup_text=label):
                 result, out = self._run_behind_banner_shim(label, run_real, eol, text)
                 self.assertTrue(result["ok"], result)

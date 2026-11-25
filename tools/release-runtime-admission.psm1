@@ -594,16 +594,16 @@ function Invoke-PinnedPayloadInstall {
     try {
         # PR 862 r17 (sol r16 A3 residual): -S does not stop a runtime whose python314._pth says `import site` from running a printing
         # sitecustomize, so startup output can precede the report on stdout. The extractor prints json.dumps(result, indent=2), whose
-        # top-level `{` is the LAST line that starts at column 0 and ends in `{` (every nested line is indented). Startup text written
-        # WITHOUT a newline sits on that same line ahead of the brace, so the report starts at that line's final `{`. Only that slice,
-        # to the end of stdout, is parsed; no such line, or a slice that is not ONE object, still refuses. LF and CRLF both split.
+        # top-level `{` is the LAST line that ends in `{` AND is followed by a line that starts with exactly two spaces and a quote (the
+        # first key at indent 2; a nested object's first key sits at indent 4 or more, so no nested line matches). Startup text written
+        # WITHOUT a newline, indented or not, sits on that same line ahead of the brace, so the report starts at that line's final `{`.
+        # Only that slice, to the end of stdout, is parsed; no such line, or a slice that is not ONE object, still refuses. LF and CRLF.
         $stdoutLines = @(([string]$result.stdout) -split "`r?`n")
         $reportStart = -1
-        for ($lineIndex = $stdoutLines.Count - 1; $lineIndex -ge 0; $lineIndex--) {
-            $candidateLine = [string]$stdoutLines[$lineIndex]
-            if ($candidateLine.Length -gt 0 -and -not [char]::IsWhiteSpace($candidateLine[0]) -and $candidateLine.EndsWith('{', [StringComparison]::Ordinal)) { $reportStart = $lineIndex; break }
+        for ($lineIndex = $stdoutLines.Count - 2; $lineIndex -ge 0; $lineIndex--) {
+            if (([string]$stdoutLines[$lineIndex]).EndsWith('{', [StringComparison]::Ordinal) -and ([string]$stdoutLines[$lineIndex + 1]).StartsWith('  "', [StringComparison]::Ordinal)) { $reportStart = $lineIndex; break }
         }
-        if ($reportStart -lt 0) { throw 'no line at column 0 ending in "{" starts a JSON report' }
+        if ($reportStart -lt 0) { throw 'no line ending in "{" and followed by an indent-2 key starts a JSON report' }
         $reportLines = @($stdoutLines[$reportStart..($stdoutLines.Count - 1)])
         $reportLines[0] = '{'
         $report = ($reportLines -join "`n").Trim() | ConvertFrom-Json -ErrorAction Stop
