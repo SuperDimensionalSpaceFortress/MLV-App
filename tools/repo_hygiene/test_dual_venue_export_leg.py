@@ -4376,6 +4376,10 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
             script.write_text(
                 "$ErrorActionPreference = 'Stop'\n"
                 f"Import-Module '{ARTIFACTS_MODULE}' -Force -DisableNameChecking\n"
+                # r8 (merge of fork/master c6ec83ae): the sliced block now reads batch.log through the central reader's one line grammar and binding verdict
+                # (ConvertFrom-DvBatchExportLog, Get-DvBatchExportBindingProblems; EXPORT-RENDER-PIPE-TIMING-2/-3). The job embeds that text from DualVenueRunner.psm1,
+                # so the harness loads the same embedded text the generator describes (never a re-typed copy).
+                f"$described = & '{EXPORT_JOB}' -DescribeTemplate; . ([scriptblock]::Create([string]$described.batchLineGrammar))\n"
                 "$traceLines = [System.Collections.Generic.List[string]]::new()\n"
                 "function Write-JobTrace([string]$Message) { $traceLines.Add($Message) }\n"
                 "function Get-AttrCudaFileSha256Blocks { param($Path, $TracePath, $Label) [pscustomobject]@{ sha256 = 'stub' } }\n"
