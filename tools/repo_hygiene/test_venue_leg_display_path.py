@@ -1539,6 +1539,67 @@ class Successor2Tests(unittest.TestCase):
         self.assertEqual(block_state(base)["state"], "present")
         self.assertEqual(block_state(dict(base, activeDisplays=unknown("per-display-not-enumerable: 2 active display(s), 1 adapter mode(s)"), activeDisplayCount=2))["state"], "present")
 
+    def test_successor3_r4_adversary_a3_a_malformed_side_is_refused_as_itself_before_any_other_sides_gate(self) -> None:
+        """adversary pass-5 A3: in a trio whose classic and cinematic name different venues, the film receipt (venue null) was read only after the pair's
+        PAIR_VENUE_OR_CARD_DIFFERS gate; the sheet pair's backend gate ran before its display pre-gate. Every side's display path is judged before any gate."""
+        good = '"displayPath": ' + json.dumps(good_block())
+        null_venue = 'ROOT:"Venue": null'
+        with tempfile.TemporaryDirectory(prefix="dv-r4-a3-flavor-") as d:
+            base = Path(d) / ".claude-state"
+            base.mkdir()
+            paths = {f: base / f"{f}.json" for f in ("classic", "cinematic", "film")}
+            paths["classic"].write_text(self._b2_receipt_text(good, receiptId="rc-classic", lookFlavor="classic"), encoding="utf-8")
+            paths["cinematic"].write_text(self._b2_receipt_text(good, receiptId="rc-cinematic", lookFlavor="cinematic").replace('"name": "bachelor"', '"name": "ultra-magnus"'), encoding="utf-8")
+            paths["film"].write_text(self._b2_receipt_text(null_venue, receiptId="rc-film", lookFlavor="film"), encoding="utf-8")
+            proc = self._pair_run("flavor", paths, base, trio=True)
+            self.assertNotIn("PAIR_VENUE_OR_CARD_DIFFERS", proc.stdout + proc.stderr)
+            self._assert_typed_display_refusal(proc, "trio: venues differ, film venue null")
+        with tempfile.TemporaryDirectory(prefix="dv-r4-a3-sheet-") as d:
+            base = Path(d) / ".claude-state"
+            base.mkdir()
+            paths = {"cuda": base / "cuda.json", "cpu": base / "cpu.json"}
+            paths["cuda"].write_text(self._b2_receipt_text(null_venue, receiptId="rc-cuda"), encoding="utf-8")   # backend cpu: the backend gate would refuse it first
+            paths["cpu"].write_text(self._b2_receipt_text(good, receiptId="rc-cpu"), encoding="utf-8")
+            proc = self._pair_run("sheet", paths, base)
+            self.assertNotIn("PAIR_BACKENDS_WRONG", proc.stdout + proc.stderr)
+            self._assert_typed_display_refusal(proc, "sheet: wrong backend, venue null")
+
+    def test_successor3_r4_adversary_a4_a_deep_unrelated_member_never_spoils_the_display_path(self) -> None:
+        """adversary pass-5 A4: the duplicate-key scan read at most 256 levels, so an unrelated member nested deeper (ConvertFrom-Json reads 1024) made the text
+        "unreadable" and turned an absent block malformed (receipt) or dropped a good block (probe). The scan reads as deep as the parser and never recurses."""
+        texts = {}
+        for depth in (256, 1000):
+            deep = "[" * depth + "0" + "]" * depth
+            texts[f"receipt absent {depth}"] = '{"outcome": "UNRESOLVED", "venue": {}, "future": ' + deep + '}'
+            texts[f"receipt present {depth}"] = json.dumps(receipt_with(good_block()))[:-1] + ', "future": ' + deep + '}'
+            texts[f"probe {depth}"] = json.dumps(dict(HEALTHY_PROBE, displayPath=good_block()))[:-1] + ', "future": ' + deep + '}'
+        got = pwsh_json("$in = [IO.File]::ReadAllText($env:DVE_TEXTS_FILE) | ConvertFrom-Json -AsHashtable\n$out = [ordered]@{}\n"
+                        "foreach ($k in @($in.Keys)) {\n"
+                        "  if ($k.StartsWith('probe')) { $p = ConvertFrom-DvProbeStdout ('DVE_PROBE=' + $in[$k]); $out[$k] = [ordered]@{ state = (Test-DvDisplayPathBlock -Block $p.displayPath).state; unknown = [bool](Test-DvDisplayPathUnknown $p.displayPath) } }\n"
+                        "  else { $r = ConvertFrom-DvReceiptText -Text $in[$k]; $v = Test-DvReceiptValid -Receipt $r -ReceiptText $in[$k]; $out[$k] = [ordered]@{ status = $v.status; displayPath = $v.displayPath } } }\n"
+                        "$out | ConvertTo-Json -Compress -Depth 5", {"DVE_TEXTS_FILE": self._write_texts(texts)})
+        for depth in (256, 1000):
+            with self.subTest(depth=depth):
+                self.assertEqual(got[f"receipt absent {depth}"], {"status": "NO_SIGNAL", "displayPath": "absent"}, got)
+                self.assertEqual(got[f"receipt present {depth}"], {"status": "NO_SIGNAL", "displayPath": "present"}, got)
+                self.assertEqual(got[f"probe {depth}"], {"state": "present", "unknown": False}, got)
+
+    def _write_texts(self, texts: dict) -> str:
+        d = tempfile.mkdtemp(prefix="dv-r4-a4-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        path = Path(d) / "texts.json"
+        path.write_text(json.dumps(texts), encoding="utf-8")
+        return str(path)
+
+    def test_successor3_r4_adversary_a8_collected_utc_has_a_monotonic_floor(self) -> None:
+        """adversary pass-5 A8: a wall clock stepped back between the last read and the stamp named a time before the reads. The stamp is never earlier than the
+        collector's start plus its stopwatch's elapsed time. (The wall clock cannot be stepped from a test: the collector's source is pinned.)"""
+        text = source()
+        body = text[text.index("function Get-DvDisplayPath {"):]
+        self.assertRegex(body, r"\$startUtc = \[datetime\]::UtcNow")
+        self.assertRegex(body, r"\$floor = \$startUtc\.AddTicks\(\$sw\.Elapsed\.Ticks\)\s*\n\s*if \(\$done -lt \$floor\) \{ \$done = \$floor \}")
+        self.assertLess(body.index("$floor = $startUtc"), body.index("$block.collectedUtc ="))
+
     def _stubbed_core_tree(self, d: str) -> Path:
         """The two pair scripts beside a copy of the module whose core validator is the W0 shape of the blanket revocation filter at HEAD (an empty blanket list
         under StrictMode: a statement error the core survives, then its own CONSENT_REVOKED), at the same relative path so the scripts' repo root resolves."""
