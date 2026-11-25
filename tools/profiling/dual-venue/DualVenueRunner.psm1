@@ -1116,11 +1116,14 @@ function ConvertFrom-DvRecordKeyValues {
     r2 adversary fix 1 (A1 and A2 on 7272acb4): a key STARTS a whitespace-separated token, so `-repeats=0` or `not-repeats=0` supplies no `repeats`
     (before, the unanchored match read one out of it); and an EMPTY occurrence is a reading too, so `repeats= repeats=0` (either order) conflicts
     (before, `\S+` skipped the empty one and the other read clean). A key whose only readings are empty is left out, as before (absent).
+    r2 adversary fix 2 (A2 on 7c84e75a, its input `[ repeats=0 ] playback_smoke.conform session=3 ...`): the log prefix's bracket groups before the
+    record marker ($script:DvRecordStart, which the record selectors allow) are no part of the record, so a token inside them is never a field.
     #>
     param([AllowNull()][AllowEmptyString()][string]$Record)
     $fields = @{}
     $conflicts = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     if (-not [string]::IsNullOrEmpty($Record)) {
+        $Record = [regex]::Replace($Record, $script:DvRecordStart, '')
         foreach ($m in [regex]::Matches($Record, '(?<!\S)(?<k>[A-Za-z0-9_]+)=(?<v>\S*)')) {
             $k = $m.Groups['k'].Value
             $v = $m.Groups['v'].Value
@@ -1487,6 +1490,9 @@ function Get-DvPlaybackEvidence {
         # EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 (adversary A1 on b56cc731): how many painted frames repeated the frame painted before them (the
         # conform line's repeats). max_jump counts forward steps only, so a frame painted twice reads max_jump=1. $null when the line does not carry it.
         conformRepeats = (ConvertTo-DvInt64 $conformFields['repeats'])
+        # r2 adversary fix 2 (A1 on 7c84e75a): how many frames the measured session painted (the conform line's presented); Get-DvCriteriaMetrics checks
+        # the painted steps can cover source_advanced at the line's max_jump. $null when the line does not carry it.
+        conformPresented = (ConvertTo-DvInt64 $conformFields['presented'])
         # r2 (sol r1 B2): the keys the measured conform line / summary line carry more than once with different values (left out above, so absent);
         # Get-DvCriteriaMetrics names them in its CouldNotCheck reasons and Get-DvPlaybackProblems refuses a summary that carries one.
         conformConflictingFields = @($conformConflicts)
@@ -3278,6 +3284,10 @@ $script:UmRunSchema = 'mlv-app/dual-venue-um-run/v1'
 # The receipt's playback block fields that must equal what is re-derived from the files (a stored valid / invalidReasons is not one).
 $script:PlaybackComparedFields = @('sourceAdvanced', 'requiredSourceFrames', 'nativeFps', 'paceFps', 'fpsOverride', 'wrapped', 'wrapCount',
     'expectedRunNonce', 'observedRunNonce', 'manifestRunNonce', 'logSha256', 'logShaBound', 'settingsIsolated', 'fixtureRehearsal', 'clipId')
+# EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 r2 adversary fix 2 (A3 on 7c84e75a): the playback fields this card added must equal what the hashed run
+# log re-derives WHENEVER the stored block carries them (a stored conformRepeats=0 over a log that says repeats=1 is PLAYBACK_NOT_FROM_EVIDENCE). A receipt
+# written before a field existed does not carry it and is not re-judged for it. The older conform fields are not compared (OPEN in PR #910).
+$script:PlaybackComparedFieldsWhenStored = @('conformRepeats', 'conformPresented', 'conformConflictingFields', 'summaryConflictingFields')
 
 function Test-DvNumber($Value) {
     ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal] -or $Value -is [single] -or $Value -is [int16] -or $Value -is [byte] -or $Value -is [uint32] -or $Value -is [uint64])
@@ -6660,6 +6670,10 @@ function Test-DvReceiptValid {
             foreach ($f in $script:PlaybackComparedFields) {
                 if (-not (Test-DvJsonEquivalent (Get-DvProp $stored $f) (Get-DvProp $derived $f))) { $invalid.Add("PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive") }
             }
+            $storedNames = $(if ($stored -is [System.Collections.IDictionary]) { @($stored.Keys) } else { @($stored.PSObject.Properties.Name) })
+            foreach ($f in $script:PlaybackComparedFieldsWhenStored) {
+                if ($storedNames -ccontains $f -and -not (Test-DvJsonEquivalent (Get-DvProp $stored $f) (Get-DvProp $derived $f))) { $invalid.Add("PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive") }
+            }
         }
         foreach ($p in @($derived.invalidReasons)) { if ($null -ne $p -and [string]$p -ne '') { $invalid.Add([string]$p) } }
         # the evidence's own identity: the clip, the venue and the build the receipt says it is about
@@ -7556,6 +7570,34 @@ function Get-DvCriteriaMetrics {
             $m['conformFrozenTailFrames'] = $unshown
             $m['conformTailAllowanceFrames'] = $allowed
         }
+        # r2 adversary fix 2 (A1 on 7c84e75a, its input: presented=478 source_advanced=478 max_jump=1 repeats=0 first_frame=1 last_frame=479
+        # engine_target=479): with no backward step, the painted frames make presented - 1 - repeats forward steps, and those steps cover the
+        # line's source_advanced, so at least one step is ceil(source_advanced / steps) long. 478 paints cannot cover 478 frames one at a time: a
+        # step the line's max_jump did not report, so the line contradicts itself and conformMaxJump is CouldNotCheck (conformPaintStepsImpliedMaxJump
+        # names the step). A line that carries
+        # repeats (every build that does also prints presented; 140 venue conform lines checked, none breaks the bound) but no readable presented,
+        # or a forward advance with no forward step, is a missing number: conformMaxJump is left absent with a typed CouldNotCheck.
+        $presentedRead = $(if ($null -ne $Playback -and $present -and $sameSession) { ConvertTo-DvInt64 (Get-DvProp $Playback 'conformPresented') } else { $null })
+        $repeatsRead = $(if ($null -ne $Playback -and $present -and $sameSession) { ConvertTo-DvInt64 (Get-DvProp $Playback 'conformRepeats') } else { $null })
+        $currentJump = ConvertTo-DvInt64 $m['conformMaxJump']
+        if ($null -ne $repeatsRead -and $null -ne $currentJump) {
+            $steps = $(if ($null -ne $presentedRead -and $presentedRead -ge 0 -and $repeatsRead -ge 0) { $presentedRead - 1 - $repeatsRead } else { $null })
+            if ($null -eq $steps -or ($steps -lt 1 -and [int64]$coverage -gt 0)) {
+                $m['conformMaxJump'] = $null
+                $m['conformMaxJumpCouldNotCheck'] = $(if ($null -eq $steps) { 'the measured session''s playback_smoke.conform line carries repeats but no readable non-negative presented (or a negative repeats), so the painted steps cannot be checked against source_advanced' }
+                                                      else { "the measured session's playback_smoke.conform line says presented=$presentedRead repeats=$repeatsRead (no forward step) but source_advanced=$coverage, so its fields contradict each other" }) + $conflictNote
+            }
+            elseif ($steps -ge 1) {
+                $implied = [int64][Math]::Ceiling([double]$coverage / [double]$steps)
+                if ($implied -gt $currentJump) {
+                    # the line's own max_jump is below the step its counts force: its fields contradict each other (a max_jump=0 line that advanced must
+                    # not be raised into a passing 1), so it is a missing number, never a measured jump
+                    $m['conformMaxJump'] = $null
+                    $m['conformPaintStepsImpliedMaxJump'] = $implied
+                    $m['conformMaxJumpCouldNotCheck'] = "the measured session's playback_smoke.conform line says presented=$presentedRead repeats=$repeatsRead source_advanced=$coverage, so at least one painted step is $implied frames long, but its max_jump reads ${currentJump}, so its fields contradict each other" + $conflictNote
+                }
+            }
+        }
     }
     # EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 (adversary A2 on b56cc731): the engine targets past the LAST painted frame (engine_target - last_frame,
     # never below 0). conformMaxJump allows one held target (a conform never moves past an unpainted target, so a held one is no skip there), so a run whose
@@ -7714,12 +7756,15 @@ function Get-DvAcceptanceVerdict {
     -VerificationStatus: the validator's status for this receipt. A reader that has not just validated it re-runs Test-DvReceiptValid; Invoke-VenueLeg
     passes the status Write-DvReceipt stamped from the validation it ran a moment before.
     #>
-    param($Receipt, [AllowNull()][AllowEmptyString()][string]$VerificationStatus = '')
-    $raw = [string](Get-DvProp $Receipt 'outcome')
+    param($Receipt, $VerificationStatus = '')
+    $rawValue = Get-DvProp $Receipt 'outcome'
+    $raw = [string]$rawValue
     # r2 adversary A3 on 7272acb4: ORDINAL comparisons. PowerShell's -ceq / -cin compare under the current culture, which ignores a zero-width
-    # character, so `VERIFIED<U+200B>` or `PASS<U+200B>` was taken for the canonical value.
-    $isSignal = [string]::Equals($raw, 'PASS', [StringComparison]::Ordinal) -or [string]::Equals($raw, 'FAIL', [StringComparison]::Ordinal)
-    $measured = $isSignal -and [string]::Equals($VerificationStatus, 'VERIFIED', [StringComparison]::Ordinal)
+    # character, so `VERIFIED<U+200B>` or `PASS<U+200B>` was taken for the canonical value. r2 adversary A6 on 7c84e75a: both must BE strings; an
+    # array (@('PASS'), @('VERIFIED')) is no canonical value, never coerced into one.
+    $isSignal = ($rawValue -is [string]) -and ([string]::Equals($raw, 'PASS', [StringComparison]::Ordinal) -or [string]::Equals($raw, 'FAIL', [StringComparison]::Ordinal))
+    $measured = $isSignal -and ($VerificationStatus -is [string]) -and [string]::Equals([string]$VerificationStatus, 'VERIFIED', [StringComparison]::Ordinal)
+    $VerificationStatus = $(if ($VerificationStatus -is [string]) { $VerificationStatus } elseif ($null -eq $VerificationStatus) { '' } else { "$(@($VerificationStatus) -join ',') (not a string)" })
     $reason = $(if ($measured) { $null }
                 elseif (-not $isSignal) { "the receipt outcome '$raw' is no PASS/FAIL measurement" }
                 elseif ([string]::IsNullOrEmpty($VerificationStatus)) { "the raw $raw carries no verification: it is a diagnostic, never an acceptance $raw" }

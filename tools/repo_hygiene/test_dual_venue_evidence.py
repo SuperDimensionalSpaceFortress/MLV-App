@@ -20178,14 +20178,14 @@ class EveryFrameConformConflictAndAcceptanceTests(unittest.TestCase):
     @requires_windows_pwsh
     def test_adversary_7c84e75a_a1_paints_that_cannot_cover_the_advance_fail(self) -> None:
         """r2 adversary A1 on 7c84e75a, its literal input: 478 paints with no repeat and no seek cannot cover 478 source frames one at a time (477 steps),
-        yet max_jump=1, repeats=0 and last_frame == engine_target passed every list. The implied step (ceil(478 / 477) = 2) now stands; a line that
-        carries repeats but no presented is CouldNotCheck."""
+        yet max_jump=1, repeats=0 and last_frame == engine_target passed every list. The implied step (ceil(478 / 477) = 2) contradicts the line's
+        max_jump=1, so conformMaxJump is CouldNotCheck; a line that carries repeats but no presented is CouldNotCheck too."""
         line = " presented=478 source_advanced=478 max_jump=1 wraps=0 backward=0 repeats=0 first_frame=1 last_frame=479 engine_target=479"
         for row in self.chain(line):
             with self.subTest(case="presented=478", role=row["role"], backend=row["backend"]):
                 self.assertFalse(row["pass"], row)
                 self.assertEqual(self.failed_metrics(row), ["conformMaxJump"], row)
-                self.assertIn("actual 2", row["failures"][0], row)
+                self.assertIn("at least one painted step is 2 frames long", row["failures"][0], row)
         for row in self.chain(self.SOUND.replace("presented=479 ", "")):
             with self.subTest(case="no presented", role=row["role"], backend=row["backend"]):
                 self.assertFalse(row["pass"], row)
