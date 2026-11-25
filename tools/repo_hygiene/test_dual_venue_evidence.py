@@ -316,7 +316,8 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *DRIFT_LEGS)
 # (PlaybackFrameRange.h playbackAcquiresOldestReadyFirst = playing && (!dropFrameMode || pinnedCapture)) covers every drop-frame-off Play, pinned or not;
 # a venue leg never passes --presented-frames, so it is the unpinned case. The 1243 unpaced swap-interval-0 headroom leg with the capture on (a '-visual-'
 # twin: its fps is observer-perturbed, never a matrix speed cell) and conformMaxJump eq 1 (no skipped source frame) appended to each criteria list.
-# EveryFrameOldestFirstLegSpecTests pins the shape.
+# Fix iteration 1 appended conformRepeats eq 0 and conformTailUnpaintedFrames eq 0 too: max_jump alone counts forward steps and allows one held target,
+# so it misses a frame painted twice and a final target unpainted at the measured close. EveryFrameOldestFirstLegSpecTests pins the shape.
 EVERY_FRAME_OLDEST_FIRST_LEGS = {"legs/m16-1243-everyframe-visual-unpaced-fullscreen-s1.json": "legs/m16-1243-headroom-unpaced-fullscreen-s1.json"}
 # CPU-S1-1457-HEAVY-SPEC-AND-STALE-FIELDS-1: the two cpu-only fullscreen s1 HEAVY legs with Look Assist ON, keyed to the tracked spec each one mirrors (UFI-1 successor C2):
 # the M16-1457 paced cuda s1 HEAVY leg with backend cpu, and the M16-1243 unpaced stage leg with backend cpu (the untracked X7 shape). Each differs from its source only in
@@ -19792,7 +19793,8 @@ class EveryFrameOldestFirstLegSpecTests(unittest.TestCase):
     """EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1: the unpinned every-frame leg. Master acquires the oldest ready frame first on every drop-frame-off Play,
     pinned or not (PlaybackFrameRange.h playbackAcquiresOldestReadyFirst; the call site's pinned flag is m_playbackSmokeTargetPresentedFrames > 0, which no venue
     leg sets). The leg is the 1243 unpaced (drop-frame off, fail closed UNPACED_NOT_HONOURED) swap-interval-0 fullscreen s1 headroom leg, the most frames ready at
-    once, with the visual capture on and the app's own conform max_jump judged: conformMaxJump eq 1 means every source frame was shown, once, in order."""
+    once, with the visual capture on and the app's own conform line judged: conformMaxJump eq 1 (no skipped source frame), conformRepeats eq 0 (none painted
+    twice) and conformTailUnpaintedFrames eq 0 (no engine target unpainted at the measured close) together mean every source frame was shown, once, in order."""
 
     CARD = "EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1"
     MAX_JUMP = {"metric": "conformMaxJump", "op": "eq", "value": 1}
@@ -19963,8 +19965,143 @@ class EveryFrameOldestFirstLegSpecTests(unittest.TestCase):
             self.assertIn("no playback_smoke.conform line", out[metric + "CouldNotCheck"], out)
 
 
+class EveryFrameConformConflictAndAcceptanceTests(unittest.TestCase):
+    """EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 r2 (sol r1 on f774d3a3).
+    B2: the conform-line reader kept the LAST occurrence of a key, so `repeats=1 repeats=0`, `last_frame=478 last_frame=479` and `backward=1 backward=0`
+    each passed all four criteria lists of the every-frame leg. A key carried twice with DIFFERENT values is now left out (ConvertFrom-DvRecordKeyValues),
+    so every criterion that reads it is CouldNotCheck and FAILS, through the public reader and the criteria path the live runner (Invoke-VenueLeg) and
+    receipt revalidation (Test-DvReceiptValid) share; the summary line's reader (the same parse) refuses a conflicting key too. An identical repeat is
+    the same reading and is kept.
+    B1: the PR #910 readout reported two ADVISORY (VENUE_ANCHOR_ABSENT) Bachelor receipts as acceptance FAILs. Get-DvAcceptanceVerdict is the acceptance
+    step: a raw PASS/FAIL is an acceptance verdict only when the validator says VERIFIED; anything else is NOT_MEASURED, the raw outcome a diagnostic."""
+
+    HEAD = EveryFrameOldestFirstLegSpecTests.HEAD
+    # the control: every target 1..479 painted once, in order, through engine_target (EveryFrameOldestFirstLegSpecTests passes it on every list)
+    SOUND = " presented=479 source_advanced=478 max_jump=1 wraps=0 backward=0 repeats=0 first_frame=1 last_frame=479 engine_target=479"
+    CONFLICT = "more than once with different values"
+
+    def chain(self, measured: str) -> list[dict]:
+        return EveryFrameOldestFirstLegSpecTests.chain(self, measured, ends=False, frames=480)
+
+    @staticmethod
+    def failed_metrics(row: dict) -> list[str]:
+        return EveryFrameOldestFirstLegSpecTests.failed_metrics(row)
+
+    @requires_windows_pwsh
+    def test_sol_r1_b2_a_conflicting_conform_field_fails_every_list(self) -> None:
+        """sol r1 B2, its literal inputs, each on the sound control: the repeat, the painted end and the seek-back count each carried twice."""
+        cases = {
+            "repeats=1 repeats=0": (self.SOUND.replace("repeats=0", "repeats=1 repeats=0"), ["conformRepeats"]),
+            "last_frame=478 last_frame=479": (self.SOUND.replace("last_frame=479", "last_frame=478 last_frame=479"),
+                                              ["conformMaxJump", "conformTailUnpaintedFrames"]),
+            "backward=1 backward=0": (self.SOUND.replace("backward=0", "backward=1 backward=0"), ["conformMaxJump", "conformTailUnpaintedFrames"]),
+        }
+        for name, (line, failing) in cases.items():
+            self.assertEqual(line.count(name.split("=")[0] + "="), 2, line)
+            rows = self.chain(line)
+            self.assertEqual({(r["role"], r["backend"]) for r in rows}, {(r, b) for r in ("acceptance", "supplementary") for b in ("cuda", "cpu")})
+            for row in rows:
+                with self.subTest(case=name, role=row["role"], backend=row["backend"]):
+                    self.assertFalse(row["pass"], row)
+                    self.assertEqual(self.failed_metrics(row), failing, row)
+                    for failure in row["failures"]:
+                        self.assertIn(self.CONFLICT, failure, row)
+                        self.assertIn(name.split("=")[0], failure, row)
+
+    @requires_windows_pwsh
+    def test_an_identical_repeat_is_the_same_reading_and_the_control_passes(self) -> None:
+        for name, line in (("control", self.SOUND), ("repeats=0 repeats=0", self.SOUND.replace("repeats=0", "repeats=0 repeats=0"))):
+            for row in self.chain(line):
+                with self.subTest(case=name, role=row["role"], backend=row["backend"]):
+                    self.assertTrue(row["pass"], row)
+
+    @requires_windows_pwsh
+    def test_fable_r1_h4_ends_that_contradict_each_other_are_could_not_check(self) -> None:
+        """fable r1 H4 (the B2 class: an ambiguous reading that read clean): last_frame=480 past engine_target=479 was clamped to a tail of 0 and passed."""
+        line = self.SOUND.replace("last_frame=479", "last_frame=480")
+        for row in self.chain(line):
+            with self.subTest(role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertIn("conformTailUnpaintedFrames", self.failed_metrics(row), row)
+                self.assertTrue(any("contradict each other" in f for f in row["failures"]), row)
+
+    @requires_windows_pwsh
+    def test_the_public_reader_leaves_a_conflicting_key_out_and_refuses_a_conflicting_summary(self) -> None:
+        """Get-DvPlaybackEvidence (the reader Invoke-VenueLeg and Test-DvReceiptValid both call): a conflicting conform key reads absent and is named; a
+        summary line that carries source_advanced twice (the last value would satisfy the floor) is SUMMARY_FIELD_CONFLICT, never valid."""
+        summary = conformed_summary_line(status='gui_fps_status_text="Playback: 23.976 fps"', native_fps="23.976", pace_fps="23.976",
+                                         source_advanced="480", required_source_frames="480")
+        script = (
+            "$summary = [pscustomobject]@{ sourceFrames = [pscustomobject]@{ sourceAdvanced = 480; requiredSourceFrames = 480; failures = @() }; fixtureRehearsal = $false; clipId = 'M16-1243' }\n"
+            "$manifest = [pscustomobject]@{ smokeRunLog = [pscustomobject]@{ runNonce = $env:DVE_NONCE; sha256 = '' } }\n"
+            "$out = foreach ($log in ($env:DVE_LOGS -split '\\|\\|')) {\n"
+            "  $sha = Get-DvSha256OfText $log\n"
+            "  $result = [pscustomobject]@{ evidence = [pscustomobject]@{ runNonce = $env:DVE_NONCE; runLogSnapshot = [pscustomobject]@{ sha256 = $sha } } }\n"
+            "  $pb = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ResultJson $result -LogText $log -LogSha256 $sha -ExpectedClipId 'M16-1243'\n"
+            "  [ordered]@{ valid = $pb.valid; reasons = @($pb.invalidReasons); repeats = $pb.conformRepeats; lastFrame = $pb.conformLastFrame; backward = $pb.conformBackward;"
+            " conformConflicts = @($pb.conformConflictingFields); summaryConflicts = @($pb.summaryConflictingFields); sourceAdvanced = $pb.sourceAdvanced }\n"
+            "}\n"
+            "ConvertTo-Json -InputObject @($out) -Compress -Depth 5")
+        conform = self.HEAD[1] + self.SOUND.replace("repeats=0", "repeats=1 repeats=0").replace("last_frame=479", "last_frame=478 last_frame=479")
+        logs = ["\n".join([self.HEAD[0], "playback_smoke.measured_session id=3", conform, summary]) + "\n",
+                "\n".join([self.HEAD[0], "playback_smoke.measured_session id=3", self.HEAD[1] + self.SOUND, summary + " source_advanced=9999"]) + "\n"]
+        proc, out = run_pwsh_json(script, DVE_LOGS="||".join(logs), DVE_NONCE=NONCE)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), 2, out)
+        conflicting_conform, conflicting_summary = out
+        self.assertEqual((conflicting_conform["repeats"], conflicting_conform["lastFrame"], conflicting_conform["backward"]), (None, None, 0), conflicting_conform)
+        self.assertEqual(conflicting_conform["conformConflicts"], ["last_frame", "repeats"], conflicting_conform)
+        self.assertEqual(conflicting_conform["summaryConflicts"], [], conflicting_conform)
+        self.assertTrue(conflicting_conform["valid"], conflicting_conform)
+        self.assertFalse(conflicting_summary["valid"], conflicting_summary)
+        self.assertIsNone(conflicting_summary["sourceAdvanced"], conflicting_summary)
+        self.assertEqual(conflicting_summary["summaryConflicts"], ["source_advanced"], conflicting_summary)
+        self.assertTrue(any(r.startswith("SUMMARY_FIELD_CONFLICT:") and "source_advanced" in r for r in conflicting_summary["reasons"]), conflicting_summary)
+
+    @requires_windows_pwsh
+    def test_sol_r1_b1_an_advisory_receipt_is_not_measured_never_fail_or_pass(self) -> None:
+        """sol r1 B1 and its INV-3 rows: the two Bachelor receipts (raw FAIL, verification ADVISORY, VENUE_ANCHOR_ABSENT) and a raw PASS with an advisory
+        verification are NOT_MEASURED; only a VERIFIED PASS/FAIL is an acceptance verdict. The raw outcome and its detail stay as diagnostics."""
+        detail = ("ADVISORY (VENUE_ANCHOR_ABSENT; never a usable FAIL): CAPTURED; criteria failed: conformMaxJump eq 1 failed (actual 2); "
+                  "conformTailUnpaintedFrames eq 0 failed (actual 2)")
+        cases = [("a877bb17 cuda", "FAIL", "ADVISORY", "NOT_MEASURED"), ("231ea06e cpu", "FAIL", "ADVISORY", "NOT_MEASURED"),
+                 ("raw PASS advisory", "PASS", "ADVISORY", "NOT_MEASURED"), ("offline stub", "PASS", "VERIFIED_OFFLINE_TEST", "NOT_MEASURED"),
+                 ("invalid", "FAIL", "INVALID", "NOT_MEASURED"), ("incomplete", "PASS", "INCOMPLETE", "NOT_MEASURED"), ("no verification", "FAIL", "", "NOT_MEASURED"),
+                 ("not a measurement", "UNRESOLVED", "VERIFIED", "NOT_MEASURED"), ("lowercase status", "PASS", "verified", "NOT_MEASURED"),
+                 ("verified PASS", "PASS", "VERIFIED", "PASS"), ("verified FAIL", "FAIL", "VERIFIED", "FAIL")]
+        script = (
+            "$cases = $env:DVE_CASES | ConvertFrom-Json\n"
+            "$out = foreach ($c in $cases) { $r = [ordered]@{ outcome = $c.outcome; outcomeDetail = $env:DVE_DETAIL; verification = [ordered]@{ status = $c.status } }\n"
+            "  $v = Get-DvAcceptanceVerdict -Receipt $r -VerificationStatus $c.status\n"
+            "  [ordered]@{ verdict = $v.verdict; raw = $v.rawOutcome; status = $v.verificationStatus; reason = $v.reason; detail = $v.outcomeDetail } }\n"
+            "ConvertTo-Json -InputObject @($out) -Compress -Depth 4")
+        proc, out = run_pwsh_json(script, DVE_CASES=json.dumps([{"outcome": o, "status": s} for _, o, s, _ in cases]), DVE_DETAIL=detail)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), len(cases), out)
+        for (name, outcome, status, expected), row in zip(cases, out):
+            with self.subTest(case=name):
+                self.assertEqual(row["verdict"], expected, row)
+                self.assertEqual(row["raw"], outcome, "the raw outcome is kept as a diagnostic")
+                self.assertEqual(row["detail"], detail, "the criteria failures are kept as diagnostics")
+                if expected == "NOT_MEASURED":
+                    self.assertTrue(row["reason"], row)
+                else:
+                    self.assertIsNone(row["reason"], row)
+
+    def test_the_leg_runner_prints_the_acceptance_verdict_from_the_acceptance_step(self) -> None:
+        """Invoke-VenueLeg prints DVE_ACCEPTANCE (Get-DvAcceptanceVerdict over the verification Write-DvReceipt just stamped) after DVE_VERIFICATION;
+        DVE_OUTCOME stays the raw outcome the chain records."""
+        text = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        verification = text.index('Write-Output "DVE_VERIFICATION=')
+        call = text.index("$acceptance = Get-DvAcceptanceVerdict -Receipt $receipt -VerificationStatus", verification)
+        printed = text.index('Write-Output "DVE_ACCEPTANCE=$($acceptance.verdict)"', call)
+        self.assertLess(text.index('Write-Output "DVE_OUTCOME=$Outcome"'), verification)
+        self.assertLess(printed, text.index('Write-Output "DVE_RECEIPT_PATH=$path"'))
+        self.assertEqual(text.count("DVE_ACCEPTANCE="), 1)
+
+
 class DriftLegSpecTests(unittest.TestCase):
-    """M16-1457-VENUE-BASELINE-DRIFT-1 r3:each drift leg is the tracked 1457 fullscreen s1 headroom leg with only legId, card and generatorArgs.playbackMaxThreads
+    """M16-1457-VENUE-BASELINE-DRIFT-1 r3: each drift leg is the tracked 1457 fullscreen s1 headroom leg with only legId, card and generatorArgs.playbackMaxThreads
     changed (the P-core arm also carries the 1243 b1-12-pcore arm's affinity keys and its two partition criteria), so a worker-cap sweep on the Bachelor
     venue differs from the 16-thread baseline leg in the cap alone."""
 
