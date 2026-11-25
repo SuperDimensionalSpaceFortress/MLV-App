@@ -7081,10 +7081,10 @@ exit 0
     B3R5_SUPP_TIMEOUT_ANCHOR = ("        $sr = $(if ($null -ne $suppDeadline) { Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $sArgs -TimeoutSec $capSec -DeadlineUtc $suppDeadline -MinRoomSec 60 }"
                                 " else { Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $sArgs -TimeoutSec $capSec })\n")
 
-    def b3r5_supp_timeout_run(self, mode: str) -> tuple[subprocess.CompletedProcess, str, str]:
+    def b3r5_supp_timeout_run(self, mode: str, more: list[tuple[str, str, str]] | None = None) -> tuple[subprocess.CompletedProcess, str, str]:
         late = (self.B3R5_SUPP_TIMEOUT_ANCHOR, self.B3R5_SUPP_TIMEOUT_ANCHOR
                 + "        if (-not $sr.notStarted -and $sr.exit -ne 0) { $sr.timedOut = $true; $sr.lateExit = $true; $sr.exit = $null }   # TEST FIXTURE: observed past its bound, stdout complete\n")
-        dv, spec, twin, um_share = self.r4_supp_fixture([("Invoke-VenueChain.ps1", *late)])
+        dv, spec, twin, um_share = self.r4_supp_fixture([("Invoke-VenueChain.ps1", *late), *(more or [])])
         planned, twin_sha = hashlib.sha256(spec.read_bytes()).hexdigest(), hashlib.sha256(twin.read_bytes()).hexdigest()
         fx = self.chain_fixture(dv, spec, twin, mode=mode, venue="ultra-magnus")   # the bytes change (or vanish) at the first ultra-magnus probe, after the Bachelor leg ran
         return self.run_fixture_chain(dv, fx, ["-LegSpec", str(spec), "-SupplementaryAgentShare", str(um_share)]), planned, twin_sha
@@ -7112,6 +7112,19 @@ exit 0
         proc, planned, _ = self.b3r5_supp_timeout_run("delete")
         self.assert_b3r5_supp_timeout_refusal_survives(proc, "DVE_CHAIN_SPEC_UNREADABLE", planned)
 
+    def test_planned_hash_bind_b3_r5_a1_supp_terminal_appends_that_fail_keep_the_typed_timeout_row_and_chain_result(self) -> None:
+        """r5 adversary pass 6 A1: with the ChainLog held exclusively from the supplementary's terminal appends on, the throwing L of SUPPLEMENTARY_REMOTE_JOB, then of the
+        claim release in the finally, then of Write-SuppSkip's SUPPLEMENTARY_ERROR line inside the catch, ended the chain before CHAIN_RESULT. Each is now said, counted
+        and still on stdout; the typed TIMEOUT row is the only supplementary row and CHAIN_RESULT goes out."""
+        fail = ("function Add-ChainLogLine([string]$Line) {\n",
+                "function Add-ChainLogLine([string]$Line) {\n    if ($Line -clike '* SUPPLEMENTARY_REMOTE_JOB *' -or $Line -clike '* SUPPLEMENTARY_TIMEOUT *' -or $Line -clike '* SUPPLEMENTARY_CLAIM_RELEASED *' -or "
+                "$Line -clike '* SUPPLEMENTARY_SKIPPED *') { return 'FAILED TEST FIXTURE: the process cannot access the file because it is being used by another process' }\n")
+        proc, planned, _ = self.b3r5_supp_timeout_run("copy", [("Invoke-VenueChain.ps1", *fail)])
+        self.assert_b3r5_supp_timeout_refusal_survives(proc, "DVE_CHAIN_SPEC_CHANGED", planned)
+        result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
+        self.assertEqual(result.get("chainLogAppendFailures"), 3, "the remote-job, SUPPLEMENTARY_TIMEOUT and claim-release appends failed and were counted\n" + json.dumps(result))
+        self.assertEqual(len([l for l in proc.stdout.splitlines() if " SUPPLEMENTARY_CLAIM_RELEASED " in l]), 1, proc.stdout)
+
     def test_planned_hash_bind_b3_r5_b1_supp_control_an_unchanged_spec_under_the_timeout_fixture_is_not_a_refusal(self) -> None:
         """Control: under the same fixture, a supplementary child on unchanged bytes (mtime only) prints no refusal record and exits 0, so it stays RAN: no specRefusal."""
         proc, _, _ = self.b3r5_supp_timeout_run("touch")
@@ -7126,7 +7139,7 @@ exit 0
         start = text.index("function Invoke-SupplementaryCore")
         body = text[start:text.index("function Invoke-Supplementary(", start)]
         self.assertNotIn('L "SUPPLEMENTARY_REMOTE_JOB leg=', body, "the remote-job line is appended only after the result (old: appended inside the TIMEOUT block, before it)")
-        self.assertLess(body.index("Add-SuppResult $Leg $Trigger $sStatus $extra"), body.index("if ($rjLine) { L $rjLine }"), "the result is recorded before the remote-job append")
+        self.assertLess(body.index("Add-SuppResult $Leg $Trigger $sStatus $extra"), body.index("if ($rjLine) { Write-ChainLineNoThrow $rjLine }"), "the result is recorded before the remote-job append")
 
     # r3 (adversary pass 2 on 5ef85bc6, A1): the chain read its leg child's outcome, receipt and spec refusal back from <RunDir>\leg-<name>.out.txt, and its probes' verdicts
     # from quiet-<name>-<phase>.out.txt. Two chains on one -RunDir (two venues) name a leg alike, so another chain's child could write that file between this child's exit

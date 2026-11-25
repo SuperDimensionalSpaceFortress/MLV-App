@@ -443,7 +443,7 @@ function Format-RemoteJobIds($Ids) { $v = @($Ids | ForEach-Object { if ($_) { $_
 
 function Write-SuppSkip([object]$Leg, [string]$Trigger, [string]$Reason, [string]$Detail, [bool]$Final) {
     Add-SuppResult $Leg $Trigger 'SKIPPED' @{ reason = $Reason; detail = $Detail }
-    L "SUPPLEMENTARY_SKIPPED leg=$($Leg.name) trigger=$Trigger reason=$Reason venue=$suppVenue role=supplementary$(if ($Detail) { " detail=$Detail" })"
+    Write-ChainLineNoThrow "SUPPLEMENTARY_SKIPPED leg=$($Leg.name) trigger=$Trigger reason=$Reason venue=$suppVenue role=supplementary$(if ($Detail) { " detail=$Detail" })"   # r5 pass 6 A1: it also runs inside Invoke-Supplementary's catch, where a throw ended the chain before CHAIN_RESULT
     $st = $suppState[$Leg.name]
     if ($Final) { $st.done = $true } else { $st.nextUtc = [DateTime]::UtcNow.AddSeconds($suppRetrySec) }
 }
@@ -558,10 +558,13 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
         }
         Add-SuppResult $Leg $Trigger $sStatus $extra
         if ($sSpecRefusal) { Write-ChainLineNoThrow "$sSpecRefusal venue=$suppVenue role=supplementary (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)" }   # r4: stdout, counted
-        if ($rjLine) { L $rjLine }   # r5 (sol r4 B1): after the result and the typed refusal, never before them
-        L "LEG $($Leg.name) SUPPLEMENTARY_$sStatus venue=$suppVenue role=supplementary trigger=$Trigger exit=$($sr.exit) outcome=$shownOutcome printedOutcome=$sOutcome receipt=$sReceipt receiptRole=$sRole quietVerdict=$($sq.verdict) quietMean=$(Format-Mean $sq.mean)$(if ($sDetail) { " detail=$sDetail" }) (supplementary: no timing verdict, no effect on the chain result)"
+        # r5 (sol r4 B1): after the result and the typed refusal, never before them. r5 adversary pass 6 A1: these two lines and the claim release below go through
+        # Write-ChainLineNoThrow (said on stderr, counted, still on stdout): a throwing L here, then in the finally, then in Write-SuppSkip's SUPPLEMENTARY_ERROR line inside the
+        # catch, ended the chain before CHAIN_RESULT when the ChainLog was held exclusively
+        if ($rjLine) { Write-ChainLineNoThrow $rjLine }
+        Write-ChainLineNoThrow "LEG $($Leg.name) SUPPLEMENTARY_$sStatus venue=$suppVenue role=supplementary trigger=$Trigger exit=$($sr.exit) outcome=$shownOutcome printedOutcome=$sOutcome receipt=$sReceipt receiptRole=$sRole quietVerdict=$($sq.verdict) quietMean=$(Format-Mean $sq.mean)$(if ($sDetail) { " detail=$sDetail" }) (supplementary: no timing verdict, no effect on the chain result)"
         $st.done = $true
-    } finally { L "SUPPLEMENTARY_CLAIM_RELEASED leg=$($Leg.name) venue=$suppVenue result=$(Release-VenueClaim -Venue $suppVenue -Nonce $req.claim.nonce -ClaimDir $ClaimDir)" }
+    } finally { Write-ChainLineNoThrow "SUPPLEMENTARY_CLAIM_RELEASED leg=$($Leg.name) venue=$suppVenue result=$(Release-VenueClaim -Venue $suppVenue -Nonce $req.claim.nonce -ClaimDir $ClaimDir)" }   # r5 pass 6 A1
 }
 
 function Invoke-Supplementary([object]$Leg, [string]$Trigger) {
@@ -779,7 +782,7 @@ foreach ($leg in $plan) {
     Close-LegTicket $leg.name 'TICKET_ENDED' 'leg-given-up'
     if ($ran) { Invoke-Supplementary $leg 'after-leg' }   # the Bachelor leg is done and its claim released; the cooldown below is unchanged and still runs in full
     if ($ran -and $legIndex -lt $plan.Count -and $null -eq $stopReason -and $CooldownSec -gt 0) {
-        L "COOLDOWN ${CooldownSec} s (no claim held)"
+        Write-ChainLineNoThrow "COOLDOWN ${CooldownSec} s (no claim held)"   # r5 pass 6 A1 sibling: after the leg's result, never able to end the chain before CHAIN_RESULT
         Start-Sleep -Seconds $CooldownSec
     }
 }

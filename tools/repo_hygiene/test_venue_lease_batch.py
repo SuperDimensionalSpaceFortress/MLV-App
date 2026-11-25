@@ -430,6 +430,9 @@ $jobId = "dve-$leaf-$Venue-cpu-2026102300000$k$(if ($LeaseBatch) { "-lb$LeaseBat
 $specMode = Pick $env:FAKE_LEG_MODES $k 'ok'
 if ($specMode -eq 'specrefused') { [Console]::Out.WriteLine("DVE_LEG_SPEC_REFUSED planned_sha256=$ExpectSpecSha256 read_sha256=$('b' * 64)"); [Console]::Out.Flush(); exit 6 }
 if ($specMode -eq 'specunreadable') { [Console]::Out.WriteLine("DVE_LEG_SPEC_UNREADABLE planned_sha256=$ExpectSpecSha256"); [Console]::Out.Flush(); exit 6 }
+# r5 (adversary pass 6 A5): the record on stdout with a receipt line that names none: on stderr only, or blank on stdout
+if ($specMode -eq 'specrefusedstderrreceipt') { [Console]::Out.WriteLine("DVE_LEG_SPEC_REFUSED planned_sha256=$ExpectSpecSha256 read_sha256=$('b' * 64)"); [Console]::Out.Flush(); [Console]::Error.WriteLine('DVE_RECEIPT_PATH=C:\review\diagnostic.json'); exit 6 }
+if ($specMode -eq 'specrefusedblankreceipt') { [Console]::Out.WriteLine("DVE_LEG_SPEC_REFUSED planned_sha256=$ExpectSpecSha256 read_sha256=$('b' * 64)"); [Console]::Out.WriteLine('DVE_RECEIPT_PATH='); [Console]::Out.Flush(); exit 6 }
 if ($specMode -eq 'specrefusedhang') { [Console]::Out.WriteLine("DVE_LEG_SPEC_REFUSED planned_sha256=$ExpectSpecSha256 read_sha256=$('b' * 64)"); [Console]::Out.Flush(); Start-Sleep -Seconds 150; exit 6 }
 [Console]::Out.WriteLine("DVE_JOB_ID=$jobId-health"); [Console]::Out.WriteLine("DVE_JOB_ID=$jobId"); [Console]::Out.Flush()
 # r3: FAKE_LEG_MODES per call: ok | exit3 (died without a receipt) | hang (still running at lease end: it starts a grandchild, records both pids, and sleeps)
@@ -9423,6 +9426,14 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     def test_planned_hash_bind_b3_r5_b2_batch_an_unreadable_spec_refusal_survives_a_failed_transcript_write(self) -> None:
         r, planned = self.b3r5_batch_refusal_run("specunreadable")
         self.assert_b3r5_batch_row_typed(r, planned, "LEG_FAILED", "DVE_BATCH_SPEC_UNREADABLE")
+
+    def test_planned_hash_bind_b3_r5_a5_batch_a_receipt_line_on_stderr_does_not_hide_the_stdout_refusal(self) -> None:
+        r, planned = self.b3r5_batch_refusal_run("specrefusedstderrreceipt")
+        self.assert_b3r5_batch_row_typed(r, planned, "LEG_FAILED", "DVE_BATCH_SPEC_CHANGED")
+
+    def test_planned_hash_bind_b3_r5_a5_batch_a_blank_stdout_receipt_line_does_not_hide_the_refusal(self) -> None:
+        r, planned = self.b3r5_batch_refusal_run("specrefusedblankreceipt")
+        self.assert_b3r5_batch_row_typed(r, planned, "LEG_FAILED", "DVE_BATCH_SPEC_CHANGED")
 
     def test_planned_hash_bind_b3_r5_b2_batch_control_a_child_that_dies_with_no_record_is_not_a_refusal(self) -> None:
         r, planned = self.b3r5_batch_refusal_run("exit3")

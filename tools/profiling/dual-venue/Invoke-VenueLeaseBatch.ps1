@@ -2028,7 +2028,8 @@ function Get-BatchLegSpecRefusal([string]$Stdout, [object]$Leg) {
     $planned = [string]$Leg.specSha256
     if ($planned -cnotmatch '^[0-9a-f]{64}$') { return $null }
     $lines = @($Stdout -split "`r?`n")
-    if (@($lines | Where-Object { $_ -cmatch '^DVE_RECEIPT_PATH=' }).Count -gt 0) { return $null }   # a child that wrote a receipt ran: never a refusal
+    # a child that named a receipt on its own STDOUT ran: never a refusal (r5 adversary pass 6 A5: a stderr receipt line, or a blank DVE_RECEIPT_PATH=, names none)
+    if (@($lines | Where-Object { $_ -cmatch '^DVE_RECEIPT_PATH=\s*\S' }).Count -gt 0) { return $null }
     foreach ($l in $lines) {
         if ($l -cmatch '^DVE_LEG_SPEC_REFUSED planned_sha256=(?<p>[0-9a-f]{64}) read_sha256=(?<r>[0-9a-f]{64})$' -and $Matches['p'] -ceq $planned) { return [pscustomobject]@{ code = 'DVE_BATCH_SPEC_CHANGED'; line = "DVE_BATCH_SPEC_CHANGED leg=$($Leg.name) planned_sha256=$($Matches['p']) read_sha256=$($Matches['r'])" } }
         if ($l -cmatch '^DVE_LEG_SPEC_UNREADABLE planned_sha256=(?<p>[0-9a-f]{64})$' -and $Matches['p'] -ceq $planned) { return [pscustomobject]@{ code = 'DVE_BATCH_SPEC_UNREADABLE'; line = "DVE_BATCH_SPEC_UNREADABLE leg=$($Leg.name) planned_sha256=$($Matches['p'])" } }
@@ -3231,7 +3232,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $legJobId = @(Get-VenueRemoteJobIds -Text $text | Where-Object { $_ -and $_ -cnotmatch '-health$' }) | Select-Object -Last 1
                 # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r5 (sol r4 B2): a child that wrote no receipt may have refused its spec on its own typed STDOUT record; read here, from the
                 # child's captured stdout, for BOTH exit branches below (timed out at the lease's end, or exited non-zero), and carried in the persisted row (Add-LegSpecRefusal)
-                $legSpecRefusal = $(if (-not $receipt) { Get-BatchLegSpecRefusal ([string]$lp.stdout) $leg } else { $null })
+                # (r5 adversary pass 6 A5: the receipt gate is the helper's own, on stdout only; $receipt above is read from stdout AND stderr)
+                $legSpecRefusal = Get-BatchLegSpecRefusal ([string]$lp.stdout) $leg
                 if ($lp.timedOut) {
                     # Still running at the lease's end: killed with its tree. Never counted and never re-run (a leg that outlives a whole lease is not retried lease
                     # after lease). Its agent job is asked to cancel too, in case the agent's own bound has not stopped it yet. The batch ends: its lease is over.
