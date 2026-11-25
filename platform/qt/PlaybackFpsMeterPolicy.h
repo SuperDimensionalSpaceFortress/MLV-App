@@ -73,8 +73,8 @@ inline constexpr double kMaxTickFrames = 999990.0;
  *  reciprocal rounds (pass 4 A2: 781250000/821 fps made 1,050,880 ms, one double step over the bound). A positive age
  *  stays at least 1 ms up to exactly kMaxTickFrames * 1000 = 999,990,000 fps; past that rate even 1 ms is over the bound
  *  and the tick asks for nothing (pass 4 A3; r4 pass 5 A2 on b70f718d: the cutoff was misstated as 1e9). MainWindow passes
- *  the rate only for the Drop Frame request (Normal mode passes 0, so its tick and the fps meter's `timeDiff != 0` gate
- *  are unchanged at any rate). */
+ *  the rate only for the Drop Frame request (Normal mode passes 0, so its tick is unchanged at any rate), and the fps
+ *  meter gates on the tick shaped BEFORE this cut (r5, pass 8 A3: meterTickMs), so its gate is unchanged in either mode. */
 inline int frameBoundedTickTimeDiffMs( int timeDiffMs, double framerate )
 {
     if( !( framerate > 0.0 ) || timeDiffMs == 0 ) return timeDiffMs;

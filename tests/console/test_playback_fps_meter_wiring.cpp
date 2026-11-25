@@ -165,7 +165,8 @@ TEST(PlaybackFpsMeterWiring, MonotonicClockAndResetWiringRejectTheirMutations)
         "            //On setup slider priority\n")));
     // adversary r2 A1 (894b938d): the shaped tick is bounded in frames before playbackHandling reads it, exactly once.
     // r4 (pass 5 A2 on b70f718d): only the Drop Frame request reads the tick as frames, so Normal mode passes no rate and
-    // keeps its whole tick (the fps meter's `timeDiff != 0` gate stays open at any source rate, as on the base).
+    // keeps its whole tick; r5 (pass 8 A3): the fps meter's gate reads the shaped meterTickMs taken before the cap, so it
+    // stays open at any source rate in either mode, as on the base.
     const QString boundLine = QStringLiteral(
         "    timeDiff = playback_fps_meter::frameBoundedTickTimeDiffMs( timeDiff, ui->actionDropFrameMode->isChecked() ? getPlaybackFramerate() : 0.0 );\n");
     const int boundAt = body.indexOf(boundLine);

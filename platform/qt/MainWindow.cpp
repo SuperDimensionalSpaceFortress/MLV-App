@@ -3046,6 +3046,8 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     // m_playbackPaceGuard is the ceiling (PlaybackNativePaceGuard.h).
     timeDiff = playback_native_pace::shapedTickTimeDiffMs( timeDiff, getPlaybackFramerate(), predictivePlaybackAdvance,
                                                            ui->actionPlay->isChecked(), hadPendingAdvance );
+    // r5 (pass 8 A3 on c37d6fd5): the fps meter gates on the shaped tick; the cap below bounds only the frame request.
+    const int meterTickMs = timeDiff;
     // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 (adversary r2 A1): one tick never asks the drop-frame loop for more frames than
     // it can count (a long suspension at a high source rate); every ordinary tick is unchanged.
     // r4 (pass 5 A2): only the Drop Frame request reads the tick as frames, so Normal mode keeps its whole tick (fps meter).
@@ -3130,7 +3132,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
         //feeds the drop-frame elapsed time), so it cannot serve here -- see playback_fps_meter::smoothedFrameMs.
         const int measuredFrameMs = playback_fps_meter::stampAgeMs( lastDrawTime, nowTime );
         lastDrawTime = nowTime;
-        if( timeDiff != 0 )
+        if( meterTickMs != 0 )
         {
             m_playbackFpsEmaFrameMs =
                 playback_fps_meter::smoothedFrameMs( m_playbackFpsEmaFrameMs, measuredFrameMs );

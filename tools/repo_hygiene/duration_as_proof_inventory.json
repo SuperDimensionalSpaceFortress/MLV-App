@@ -1965,9 +1965,9 @@
       "anchor": "if ( msSinceLastDraw <= 0 ) return emaFrameMs ;",
       "class": "value_fallback_select",
       "clock": "other",
-      "justification": "STATUS-FPS-METER-1: smoothedFrameMs() input-validity guard. msSinceLastDraw is a Qt QTime::msecsTo() draw-to-draw wall-clock delta; a non-positive value (first draw with no prior timestamp, or a clock step) leaves the FPS EMA unchanged instead of blending a bogus sample. A display smoothing guard for the status-bar FPS meter, not proof that any stage ran or a frame rendered.",
+      "justification": "STATUS-FPS-METER-1: smoothedFrameMs() input-validity guard. msSinceLastDraw is the draw-to-draw age from playback_fps_meter::stampAgeMs() on monotonic QElapsedTimer stamps (PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 replaced the wall clock); a non-positive value (first draw with no prior stamp, or two draws in the same millisecond) leaves the FPS EMA unchanged instead of blending a bogus sample. A display smoothing guard for the status-bar FPS meter, not proof that any stage ran or a frame rendered.",
       "lines": [
-        34
+        120
       ]
     },
     {
@@ -1977,7 +1977,7 @@
       "clock": "other",
       "justification": "STATUS-FPS-METER-1: smoothedFrameMs() seed-or-reset select. emaFrameMs <= 0.0 is the EMA's uninitialized sentinel (seed with the raw sample rather than blend); fpsMeterStalled() re-seeds after a long gap between draws. Both choose how the displayed FPS smooths a measured interval, never whether work ran; the value feeds only the status-bar FPS text.",
       "lines": [
-        35
+        121
       ]
     },
     {
@@ -2911,6 +2911,26 @@
       "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r4 iteration 2 (adversary pass 7 A1) frameBoundedTickTimeDiffMs: the tick's magnitude in 64 bits (so INT_MIN negates safely), the ceiling the step-up to the largest accepted age never passes. An absolute-value select on the drop-frame request; never a run-proof.",
       "lines": [
         90
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "if ( meterTickMs != 0 )",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r5 (adversary pass 8 A3) timerFrameEvent (clock: a QElapsedTimer monotonic stamp age): the status-bar fps meter folds a draw-to-draw sample into its EMA only on a tick whose SHAPED elapsed time (monotonic stampAgeMs, taken before the Drop Frame request cap) is nonzero, as the base gated on the shaped tick. It selects whether a display sample is smoothed in; the draw itself already happened, and it never proves a stage ran or a frame rendered.",
+      "lines": [
+        3135
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_fps_meter_wiring.cpp",
+      "anchor": "const QString gateLine = QStringLiteral ( \"        if( meterTickMs != 0 )\\n\" ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r5 (adversary pass 8 A3): a source-text pin string for the meter gate in timerFrameEvent; the wiring test counts and orders it in the source. No duration is compared at runtime and nothing is proven to have run.",
+      "lines": [
+        258
       ]
     },
     {

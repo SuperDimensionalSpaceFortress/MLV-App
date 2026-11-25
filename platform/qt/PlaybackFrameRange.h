@@ -325,10 +325,13 @@ inline DropFrameTickResult advanceDropFrameTick(
             // position - before + wrapWidth * wrapLaps is still the advance it made. A start already past the limit keeps the base
             // arithmetic (its laps are the stale start's own on any tick: PLAYBACK-WRAP-RECORDER-RUNLENGTH-1). Every tick of up to
             // that many laps is unchanged, bit for bit. An infinite delta stops there too.
+            // r5 (pass 8 A1 on c37d6fd5): it stops at the LAST position below lapLimit (one double step under it), not at the
+            // lap's first position lapLimit - width, so a stale start inside [lapLimit - width, lapLimit) keeps its room
+            // (2000000 + 4.5 conformed on cut 1..2 advanced 0; it now advances 2 - 2^-32 and lands just below wrapAt).
             constexpr double kMaxLoopLapsPerTick = 1000000.0;
             const double lapLimit = wrapAt + kMaxLoopLapsPerTick * width;   // laps <= kMaxLoopLapsPerTick iff position < lapLimit
             if( result.position >= lapLimit && currentPosition < lapLimit )
-                result.position = std::max( currentPosition, lapLimit - width );
+                result.position = std::max( currentPosition, std::nextafter( lapLimit, -HUGE_VAL ) );
             laps = std::floor( ( result.position - wrapAt ) / width ) + 1.0;
             laps = std::min( std::max( laps, 1.0 ), static_cast<double>( std::numeric_limits<int>::max() - 1 ) );
             // the division's rounding: never one lap too many, never one too few
