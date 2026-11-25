@@ -853,6 +853,21 @@ class VenueLegReceiptTests(RunnerHarness, unittest.TestCase):
                 self.assertEqual(receipt["venue"]["displayPath"], unknown("probe-block-malformed"))
                 self.assertEqual((receipt["outcome"], receipt["outcomeDetail"]), (plain["outcome"], plain["outcomeDetail"]))
 
+    def test_successor3_r2_b1_a_one_element_array_probe_with_a_display_only_parse_failure_keeps_the_leg_verdict(self) -> None:
+        """SUCCESSOR-3 r1 sol B1, end to end (Invoke-VenueLeg.ps1:681-687): the probe line is a one-element array whose displayPath stops ConvertFrom-Json. The
+        leg keeps the probe's own health verdict and the block is the typed probe-block-malformed, never `health probe returned no DVE_PROBE line`."""
+        _, plain, _ = self.run_leg("ultra-magnus", self.write_spec(), probe=self.sick())
+        head = json.dumps(self.sick())[:-1]
+        for label, raw in (("two casings", "[" + head + ', "displayPath": 5, "DisplayPath": {}}]'), ("reserved member", "[" + head + ', "displayPath": {"PSObject": 1}}]')):
+            with self.subTest(label):
+                self.um.write_text(STUB_UM_RUN.replace("('DVE_PROBE=' + ($cfg.probe | ConvertTo-Json -Compress))", "('DVE_PROBE=' + '" + raw.replace("'", "''") + "')"),
+                                   encoding="utf-8")
+                proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), probe=self.sick())
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(receipt["venue"]["displayPath"], unknown("probe-block-malformed"), receipt["venue"])
+                self.assertEqual((receipt["outcome"], receipt["outcomeDetail"]), (plain["outcome"], plain["outcomeDetail"]), receipt)
+                self.assertEqual(receipt["health"]["pwshColdStartMs"], 9000, receipt["health"])
+
     def test_a_host_mismatch_terminal_still_carries_the_block(self) -> None:
         wrong = dict(HEALTHY_PROBE, hostName="BACHELOR", displayPath=good_block())
         _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), probe=wrong)
@@ -1119,6 +1134,146 @@ class Successor2Tests(unittest.TestCase):
                 self.assertTrue(calls, name)
                 for call in calls:
                     self.assertIn("-ReceiptText", call, f"{name}: {call.strip()}")
+
+    def test_successor3_r2_b1_a_one_element_root_array_with_a_display_only_parse_failure_keeps_the_probe(self) -> None:
+        """SUCCESSOR-3 r1 sol B1: the W1 recovery read only a root OBJECT, so the same display-only parse failure inside a one-element root array (which
+        ConvertFrom-Json unwraps to its record) dropped the probe, and a healthy leg became VENUE_UNHEALTHY. The literal inputs of the verdict."""
+        head = json.dumps(dict(HEALTHY_PROBE))[:-1]
+        lines = {
+            "array, two casings": "[" + head + ', "displayPath": 5, "DisplayPath": {}}]',
+            "array, reserved member": "[" + head + ', "displayPath": {"PSObject": 1}}]',
+        }
+        controls = {"array, reserved member outside the block": "[" + head + ', "PSObject": 1}]',
+                    "array of two probes, two casings": "[" + head + ', "displayPath": 5, "DisplayPath": {}}, ' + json.dumps(dict(HEALTHY_PROBE)) + "]"}
+        got = pwsh_json("$in = $env:DVE_LINES | ConvertFrom-Json -AsHashtable\n$out = [ordered]@{}\n"
+                        "foreach ($k in @($in.Keys)) { $p = ConvertFrom-DvProbeStdout (\"noise`r`nDVE_PROBE=\" + $in[$k] + \"`r`n\")\n"
+                        "  $out[$k] = $(if ($null -eq $p) { 'probe-null' } else { [ordered]@{ hostName = [string]$p.hostName; sessionLocked = $p.sessionLocked; pwshColdStartMs = $p.pwshColdStartMs;\n"
+                        "    freeDiskGiB = $p.freeDiskGiB; block = (ConvertTo-DvDisplayPath -Probe $p) } }) }\n"
+                        "$out | ConvertTo-Json -Compress -Depth 10",
+                        {"DVE_LINES": json.dumps(dict(lines, **controls))})
+        for label in lines:
+            with self.subTest(label):
+                self.assertNotEqual(got[label], "probe-null", label)
+                self.assertEqual((got[label]["hostName"], got[label]["sessionLocked"], got[label]["pwshColdStartMs"], got[label]["freeDiskGiB"]),
+                                 ("ULTRA-MAGNUS", False, 500, 600.0), got[label])
+                self.assertEqual(got[label]["block"], unknown("probe-block-malformed"), got[label])
+        # the probe's own fields still decide: a reserved member outside the block, or a line that is not one probe, is still no probe
+        self.assertEqual(got["array, reserved member outside the block"], "probe-null", got)
+        self.assertEqual(got["array of two probes, two casings"], "probe-null", got)
+
+    def _b2_receipt_text(self, venue_tail: str, **over) -> str:
+        """A receipt FILE's text whose venue ends in `venue_tail` (raw JSON members: a case collision or a reserved member json.dumps cannot write)."""
+        r = {"schema": "mlv-app/dual-venue-receipt/v1", "receiptId": over.pop("receiptId", "rcpt-b2"), "legId": "m16-1243-look-scale2", "card": "DUAL-VENUE-EVIDENCE-1",
+             "outcome": "PASS", "startedUtc": over.pop("startedUtc", "2026-11-25T00:00:00Z"),
+             "subject": {"backend": "cpu", "buildManifestSha256": "ab" * 32, "clipId": "M16-1243", "lookFlavor": "classic"},
+             "metrics": {"sourceCommit": "c" * 40}, "scale": {"requestedScale": 2, "effectiveScale": 2},
+             "venue": {"name": "bachelor", "role": "supplementary", "declared": "bachelor", "hostName": "BACHELOR", "gpuNames": ["Intel(R) Iris(R) Xe Graphics"]}}
+        for k, v in over.items():
+            r["subject"][k] = v
+        if venue_tail.startswith("ROOT:"):   # a second venue member, in another letter case, after the first (the sweep's sibling: `venue` beside `Venue`)
+            return json.dumps(r)[:-1] + ", " + venue_tail[len("ROOT:"):] + "}"
+        return json.dumps(r)[:-2] + ", " + venue_tail + "}}"
+
+    B2_TAILS = {"two casings": '"displayPath": 5, "DisplayPath": {"state": "unknown", "reason": "x"}',
+                "reserved member": '"displayPath": {"PSObject": 1}',
+                "venue and Venue": 'ROOT:"Venue": {"name": "bachelor", "role": "supplementary", "declared": "bachelor", "hostName": "BACHELOR", '
+                                   '"displayPath": {"state": "unknown", "reason": "x"}}'}
+
+    def _assert_typed_display_refusal(self, proc, label: str) -> None:
+        out = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, out)
+        self.assertIn("PAIR_RECEIPT_INVALID", out, f"{label}: {out}")
+        self.assertIn("DISPLAY_PATH_MALFORMED", out, f"{label}: {out}")
+        self.assertNotIn("KeysWithDifferentCasing", out, f"{label}: {out}")
+        self.assertNotIn("different casing", out.lower(), f"{label}: {out}")
+
+    def test_successor3_r2_b2_sheet_pair_reads_a_case_colliding_receipt_file_to_the_typed_validator(self) -> None:
+        """SUCCESSOR-3 r1 sol B2 (New-VenueSheetPair.ps1:41-42): the initial ConvertFrom-Json threw on a case collision inside venue.displayPath before the
+        validator ran. End to end through the script and the receipt FILES: the receipt is INVALID with DISPLAY_PATH_MALFORMED."""
+        for label, tail in self.B2_TAILS.items():
+            with self.subTest(label), tempfile.TemporaryDirectory(prefix="dv-b2-sheet-") as d:
+                base = Path(d) / ".claude-state"
+                base.mkdir()
+                cuda = base / "cuda.json"
+                cpu = base / "cpu.json"
+                cuda.write_text(self._b2_receipt_text(tail, receiptId="rc-cuda", backend="cuda"), encoding="utf-8")
+                cpu.write_text(self._b2_receipt_text(tail, receiptId="rc-cpu"), encoding="utf-8")
+                proc = run_pwsh(["-File", str(DV / "New-VenueSheetPair.ps1"), "-CudaReceipt", str(cuda), "-CpuReceipt", str(cpu), "-OutDir", str(base / "sheets")])
+                self._assert_typed_display_refusal(proc, label)
+
+    def test_successor3_r2_b2_flavor_pair_and_trio_read_a_case_colliding_receipt_file_to_the_typed_validator(self) -> None:
+        """SUCCESSOR-3 r1 sol B2 (New-VenueFlavorPair.ps1:156-157, :173 for the trio's third receipt): the same, end to end through the script."""
+        for label, tail in self.B2_TAILS.items():
+            for trio in (False, True):
+                with self.subTest(label=label, trio=trio), tempfile.TemporaryDirectory(prefix="dv-b2-flavor-") as d:
+                    base = Path(d) / ".claude-state"
+                    base.mkdir()
+                    paths = {}
+                    for flavor in ("classic", "cinematic", "film"):
+                        paths[flavor] = base / f"{flavor}.json"
+                        paths[flavor].write_text(self._b2_receipt_text(tail, receiptId=f"rc-{flavor}", lookFlavor=flavor), encoding="utf-8")
+                    args = ["-File", str(DV / "New-VenueFlavorPair.ps1"), "-ClassicReceipt", str(paths["classic"]), "-CinematicReceipt", str(paths["cinematic"]),
+                            "-OutDir", str(base / "pair")]
+                    if trio:
+                        args += ["-FilmReceipt", str(paths["film"])]
+                    self._assert_typed_display_refusal(run_pwsh(args), label)
+
+    def test_successor3_r2_b2_baseline_reads_a_case_colliding_receipt_file_to_the_typed_validator(self) -> None:
+        """SUCCESSOR-3 r1 sol B2 (Invoke-VenueBaseline.ps1:346): Get-RowFigures caught the parse exception and returned its empty row, so the receipt read as
+        missing or unreadable. The shipped function, run on a receipt FILE: the row's verification is INVALID with DISPLAY_PATH_MALFORMED and the figures are rejected."""
+        for label, tail in dict(self.B2_TAILS, control="\"displayPath\": " + json.dumps(good_block())).items():
+            with self.subTest(label), tempfile.TemporaryDirectory(prefix="dv-b2-baseline-") as d:
+                path = Path(d) / "rc-base.json"
+                path.write_text(self._b2_receipt_text(tail, receiptId="rc-base", startedUtc="__NOW__"), encoding="utf-8")
+                script = (f"Import-Module '{MODULE}' -Force\n"
+                          f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{DV / 'Invoke-VenueBaseline.ps1'}', [ref]$null, [ref]$null)\n"
+                          "$fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Get-RowFigures' }, $true)\n"
+                          ". ([scriptblock]::Create($fn.Extent.Text))\n"
+                          f"$Venue = 'bachelor'; $manifest = '{'ab' * 32}'; $repo = '{ROOT}'; $ValidatorScript = ''; $startedUtc = [DateTime]::UtcNow.AddSeconds(-2)\n"
+                          "$p = $env:DVE_RECEIPT_FILE\n"
+                          "[IO.File]::WriteAllText($p, [IO.File]::ReadAllText($p).Replace('__NOW__', [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')))\n"
+                          "$f = Get-RowFigures $p ([pscustomobject]@{ legId = 'm16-1243-look-scale2' }) 'cpu'\n"
+                          "Write-Output ('DVE_OUT=' + ([ordered]@{ identity = $f.identity; rejected = $f.rejected; verification = $f.verification } | ConvertTo-Json -Compress -Depth 5))\n")
+                proc = run_pwsh(["-Command", script], env_extra={"DVE_RECEIPT_FILE": str(path)})
+                line = next((l for l in proc.stdout.splitlines() if l.startswith("DVE_OUT=")), None)
+                self.assertIsNotNone(line, proc.stdout + proc.stderr)
+                got = json.loads(line[len("DVE_OUT="):])
+                self.assertIsNone(got["identity"], got)
+                self.assertIsNotNone(got["verification"], f"{label}: the receipt read as missing: {got}")
+                self.assertEqual((got["verification"]["status"], got["rejected"]), ("INVALID", "INVALID"), got)
+                if label == "control":
+                    self.assertFalse(any(r.startswith("DISPLAY_PATH_MALFORMED") for r in got["verification"]["reasons"]), got)
+                else:
+                    self.assertTrue(got["verification"]["reasons"][0].startswith("DISPLAY_PATH_MALFORMED"), got)
+
+    def test_successor3_r2_b2_the_receipt_text_reader_recovers_only_the_display_path(self) -> None:
+        """ConvertFrom-DvReceiptText: a parse failure anywhere but venue.displayPath (or the venue that holds it) stays the parser's own exception, and a good
+        receipt reads exactly as ConvertFrom-Json reads it."""
+        cases = {
+            "outcome twice": self._b2_receipt_text('"displayPath": ' + json.dumps(good_block())).replace('"outcome": "PASS"', '"outcome": "PASS", "Outcome": "FAIL"'),
+            "venue name twice": self._b2_receipt_text('"Name": "x"'),
+            "both": self._b2_receipt_text('"displayPath": 5, "DisplayPath": {}').replace('"outcome": "PASS"', '"outcome": "PASS", "Outcome": "FAIL"'),
+            "good": self._b2_receipt_text('"displayPath": ' + json.dumps(good_block())),
+            "two casings": self._b2_receipt_text(self.B2_TAILS["two casings"]),
+        }
+        got = pwsh_json("$in = $env:DVE_TEXTS | ConvertFrom-Json -AsHashtable\n$out = [ordered]@{}\n"
+                        "foreach ($k in @($in.Keys)) { try { $r = ConvertFrom-DvReceiptText -Text $in[$k]; $v = Test-DvReceiptValid -Receipt $r -ReceiptText $in[$k]\n"
+                        "  $out[$k] = [ordered]@{ outcome = [string]$r.outcome; venue = [string]$r.venue.name; displayPath = $v.displayPath } } catch { $out[$k] = 'threw' } }\n"
+                        "$out | ConvertTo-Json -Compress -Depth 5", {"DVE_TEXTS": json.dumps(cases)})
+        for label in ("outcome twice", "venue name twice", "both"):
+            self.assertEqual(got[label], "threw", f"{label}: {got[label]}")
+        self.assertEqual(got["good"], {"outcome": "PASS", "venue": "bachelor", "displayPath": "present"}, got)
+        self.assertEqual(got["two casings"], {"outcome": "PASS", "venue": "bachelor", "displayPath": "malformed"}, got)
+
+    def test_successor3_r2_b2_no_receipt_file_reader_parses_the_text_outside_the_display_path_reader(self) -> None:
+        """SUCCESSOR-3 r1 sol B2, the class: every receipt file the three validating readers read is parsed by ConvertFrom-DvReceiptText, never piped straight
+        into ConvertFrom-Json, so a display-only parse failure always reaches the validator."""
+        pattern = re.compile(r"(rcText|receiptTexts\.\w+|cudaText|cpuText)\s*\|\s*ConvertFrom-Json")
+        for name in ("New-VenueFlavorPair.ps1", "Invoke-VenueBaseline.ps1", "New-VenueSheetPair.ps1"):
+            text = (DV / name).read_text(encoding="utf-8")
+            with self.subTest(name):
+                self.assertEqual(pattern.findall(text), [], name)
+                self.assertIn("ConvertFrom-DvReceiptText", text, name)
 
 
 @requires_windows_pwsh
