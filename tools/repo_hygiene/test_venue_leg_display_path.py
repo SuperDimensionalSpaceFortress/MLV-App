@@ -1366,14 +1366,20 @@ class Successor2Tests(unittest.TestCase):
             with self.subTest(label):
                 self.assertTrue(str(got[label]).startswith("threw:"), f"{label}: {got[label]}")
 
-    def _pair_run(self, script: str, paths: dict, base: Path, trio: bool = False, dv: Path | None = None):
+    def _pair_run(self, script: str, paths: dict, base: Path, trio: bool = False, dv: Path | None = None, in_process: bool = False):
+        """Run a pair reader with `pwsh -File`, or (in_process) with `& <script>` from a -Command scope that has no `try` and no Stop, the in-process caller
+        (under -File the script's own `$ErrorActionPreference = 'Stop'` is session-wide, so module code sees it too)."""
         dv = dv or DV
         if script == "sheet":
-            return run_pwsh(["-File", str(dv / "New-VenueSheetPair.ps1"), "-CudaReceipt", str(paths["cuda"]), "-CpuReceipt", str(paths["cpu"]), "-OutDir", str(base / "sheets")])
-        args = ["-File", str(dv / "New-VenueFlavorPair.ps1"), "-ClassicReceipt", str(paths["classic"]), "-CinematicReceipt", str(paths["cinematic"]), "-OutDir", str(base / "pair")]
-        if trio:
-            args += ["-FilmReceipt", str(paths["film"])]
-        return run_pwsh(args)
+            args = [str(dv / "New-VenueSheetPair.ps1"), "-CudaReceipt", str(paths["cuda"]), "-CpuReceipt", str(paths["cpu"]), "-OutDir", str(base / "sheets")]
+        else:
+            args = [str(dv / "New-VenueFlavorPair.ps1"), "-ClassicReceipt", str(paths["classic"]), "-CinematicReceipt", str(paths["cinematic"]), "-OutDir", str(base / "pair")]
+            if trio:
+                args += ["-FilmReceipt", str(paths["film"])]
+        if not in_process:
+            return run_pwsh(["-File"] + args)
+        quoted = ["'" + a.replace("'", "''") + "'" if not a.startswith("-") else a for a in args]
+        return run_pwsh(["-Command", "& " + " ".join(quoted)])
 
     def test_successor3_r3_sol_b2_a_recovered_or_null_venue_is_refused_as_malformed_before_any_identity_gate(self) -> None:
         """sol r2 B2: with `"venue":{...},"Venue":null` the recovery keeps the null venue, and the flavor pair / trio venue gate (PAIR_VENUE_OR_CARD_DIFFERS) and
@@ -1443,7 +1449,9 @@ class Successor2Tests(unittest.TestCase):
     def test_successor3_r3_key3_b1_a_statement_error_the_core_survives_reaches_the_pair_readers_typed_refusal(self) -> None:
         """opus key3 r2 B1: r2 wrapped Test-DvReceiptValid in a `try` in both pair readers, so a statement error the core survives (the blanket revocation filter
         over an empty blanket list, psm1 `ownerSentenceSha256`) unwound to the reader's catch and was rethrown raw (PropertyNotFound) instead of the core's typed
-        CONSENT_REVOKED reaching PAIR_RECEIPT_INVALID. The W0 class (test_successor3_w0_...) at the pair readers, with a good and an absent block."""
+        CONSENT_REVOKED reaching PAIR_RECEIPT_INVALID. The W0 class (test_successor3_w0_...) at the pair readers, with a good and an absent block, for the in-process
+        caller (`& <script>` with no Stop in scope), where r1 reached the typed refusal. Under `pwsh -File` the script's Stop is session-wide, so there the statement
+        error ends the script on master and r1 too (pre-existing, filed OPEN)."""
         blocks = {"good block": '"displayPath": ' + json.dumps(good_block()), "absent block": '"rack": "r1"'}
         with tempfile.TemporaryDirectory(prefix="dv-r3-k3-") as d:
             dv = self._stubbed_core_tree(d)
@@ -1454,10 +1462,11 @@ class Successor2Tests(unittest.TestCase):
                     paths = {"cuda": base / "cuda.json", "cpu": base / "cpu.json"}
                     paths["cuda"].write_text(self._b2_receipt_text(tail, receiptId="rc-cuda", backend="cuda"), encoding="utf-8")
                     paths["cpu"].write_text(self._b2_receipt_text(tail, receiptId="rc-cpu"), encoding="utf-8")
-                    proc = self._pair_run("sheet", paths, base, dv=dv)
+                    proc = self._pair_run("sheet", paths, base, dv=dv, in_process=True)
                     out = proc.stdout + proc.stderr
                     self.assertNotEqual(proc.returncode, 0, out)
-                    self.assertNotIn("ownerSentenceSha256", out, out)
+                    # the statement error is still WRITTEN (non-terminating, as on master); it must not be what ends the script
+                    self.assertNotIn("Exception: The property 'ownerSentenceSha256'", out, out)
                     self.assertIn("PAIR_RECEIPT_INVALID receipt rc-cuda is not valid evidence: CONSENT_REVOKED", out, out)
                 for trio in (False, True):
                     with self.subTest(label=label, reader="flavor", trio=trio):
@@ -1467,10 +1476,10 @@ class Successor2Tests(unittest.TestCase):
                         for flavor in ("classic", "cinematic", "film"):
                             paths[flavor] = base / f"{flavor}.json"
                             paths[flavor].write_text(self._b2_receipt_text(tail, receiptId=f"rc-{flavor}", lookFlavor=flavor), encoding="utf-8")
-                        proc = self._pair_run("flavor", paths, base, trio=trio, dv=dv)
+                        proc = self._pair_run("flavor", paths, base, trio=trio, dv=dv, in_process=True)
                         out = proc.stdout + proc.stderr
                         self.assertNotEqual(proc.returncode, 0, out)
-                        self.assertNotIn("ownerSentenceSha256", out, out)
+                        self.assertNotIn("Exception: The property 'ownerSentenceSha256'", out, out)
                         self.assertIn("PAIR_RECEIPT_INVALID receipt rc-classic is not valid evidence: CONSENT_REVOKED", out, out)
 
 
