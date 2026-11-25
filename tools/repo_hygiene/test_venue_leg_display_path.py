@@ -1034,6 +1034,92 @@ class Successor2Tests(unittest.TestCase):
         self.assertTrue(any(r.startswith("EVIDENCE_VALIDATION_IO") for r in bad["reasons"]), bad)
         self.assertIn("threw", got["good"], got["good"])
 
+    # -- SUCCESSOR-3 (one class, no new shard-weight row) --------------------------------------------------------------------------------------------------------
+    def test_successor3_w0_a_statement_error_the_core_survives_is_not_turned_into_a_throw(self) -> None:
+        """SUCCESSOR-3 W0 (hosted heavy 3/14 on 4d4db9cd, NarrowedProductionReceiptsAndBoundBackendTests blanket revocation): a statement inside the core validator that
+        fails without ending it (on master, the blanket filter over an empty blanket list: `Get-DvProp` gives `,@()`, so `$_` is an empty array) leaves the core's own
+        result, CONSENT_REVOKED. The wrapper's `try` made that statement error unwind to its catch and re-throw. No `try` and no `Stop` here, exactly as that test's caller."""
+        script = (f"Import-Module '{MODULE}' -Force\n"
+                  "& (Get-Module DualVenueRunner) { function script:Test-DvReceiptValidCore { param($Receipt, $RepoRoot, $EvidenceDir, [switch]$AllowOfflineTestMode, $OfflineLegSpecBytes)\n"
+                  "  Set-StrictMode -Version Latest\n  $kept = $false\n"
+                  "  $kept = (@(@(, @()) | Where-Object { $null -ne $_ -and [string]$_.ownerSentenceSha256 -ceq 'x' }).Count -gt 0)\n"
+                  "  [pscustomobject]@{ valid = $false; status = 'INVALID'; reasons = @('CONSENT_REVOKED: stub'); unbound = @(); evidenceDir = $null; legType = $null } } }\n"
+                  "$out = [ordered]@{}\n"
+                  "$v = Test-DvReceiptValid -Receipt ($env:DVE_GOOD | ConvertFrom-Json)\n$out.good = [ordered]@{ status = $v.status; displayPath = $v.displayPath; reasons = @($v.reasons) }\n"
+                  "$v = Test-DvReceiptValid -Receipt ($env:DVE_ABSENT | ConvertFrom-Json)\n$out.absent = [ordered]@{ status = $v.status; displayPath = $v.displayPath; reasons = @($v.reasons) }\n"
+                  "Write-Output ('DVE_OUT=' + ($out | ConvertTo-Json -Compress -Depth 5))\n")
+        proc = run_pwsh(["-Command", script], env_extra={"DVE_GOOD": json.dumps(receipt_with(good_block(), outcome="PASS")),
+                                                         "DVE_ABSENT": json.dumps(receipt_with(None, outcome="PASS"))})
+        line = next((l for l in proc.stdout.splitlines() if l.startswith("DVE_OUT=")), None)
+        self.assertIsNotNone(line, proc.stdout + proc.stderr)
+        got = json.loads(line[len("DVE_OUT="):])
+        self.assertEqual(got["good"], {"status": "INVALID", "displayPath": "present", "reasons": ["CONSENT_REVOKED: stub"]}, got)
+        self.assertEqual(got["absent"], {"status": "INVALID", "displayPath": "absent", "reasons": ["CONSENT_REVOKED: stub"]}, got)
+
+    def test_successor3_w1_case_variant_or_reserved_members_in_the_probe_block_are_the_malformed_block_not_a_lost_probe(self) -> None:
+        """SUCCESSOR-2 adversary A4: two casings of displayPath, or a member named PSObject inside it, make ConvertFrom-Json throw; the probe was dropped and a good leg
+        turned VENUE_UNHEALTHY. The probe's own fields are kept and the block is the typed `probe-block-malformed`."""
+        head = json.dumps(dict(HEALTHY_PROBE))[:-1]
+        lines = {
+            "two casings": head + ', "displayPath": 5, "DisplayPath": {"state": "unknown", "reason": "x"}}',
+            "reserved member": head + ', "displayPath": {"PSObject": "x"}}',
+            "reserved member deep": json.dumps(dict(HEALTHY_PROBE, displayPath=good_block())).replace('"powerPlan": "Balanced"', '"powerPlan": "Balanced", "os2": {"PSObject": 1}'),
+            "capital exact duplicate": head + ', "DisplayPath": 5, "DisplayPath": {"state": "unknown", "reason": "x"}}',
+            "one-element root array": "[" + dup_key_text(dict(HEALTHY_PROBE), [], "displayPath", 5, unknown("x")) + "]",
+        }
+        controls = {"good": json.dumps(dict(HEALTHY_PROBE, displayPath=good_block())),
+                    "reserved member outside the block": head + ', "PSObject": 1}'}
+        got = pwsh_json("$in = $env:DVE_LINES | ConvertFrom-Json -AsHashtable\n$out = [ordered]@{}\n"
+                        "foreach ($k in @($in.Keys)) { $p = ConvertFrom-DvProbeStdout (\"noise`r`nDVE_PROBE=\" + $in[$k] + \"`r`n\")\n"
+                        "  $out[$k] = $(if ($null -eq $p) { 'probe-null' } else { [ordered]@{ hostName = [string]$p.hostName; sessionLocked = $p.sessionLocked; block = (ConvertTo-DvDisplayPath -Probe $p) } }) }\n"
+                        "$out | ConvertTo-Json -Compress -Depth 10",
+                        {"DVE_LINES": json.dumps(dict(lines, **controls))})
+        for label in lines:
+            with self.subTest(label):
+                self.assertNotEqual(got[label], "probe-null", label)
+                self.assertEqual((got[label]["hostName"], got[label]["sessionLocked"]), ("ULTRA-MAGNUS", False), got[label])
+                self.assertEqual(got[label]["block"], unknown("probe-block-malformed"), got[label])
+        self.assertEqual(got["good"]["block"]["powerPlan"], "Balanced", got["good"])
+        # outside the block nothing changes: a probe ConvertFrom-Json cannot read is still no probe
+        self.assertEqual(got["reserved member outside the block"], "probe-null", got)
+
+    def test_successor3_w2_a_case_variant_duplicate_or_a_one_element_root_array_is_malformed_in_the_receipt_text(self) -> None:
+        """SUCCESSOR-2 adversary A2: the duplicate scope was ordinal and lowercase, so `Venue` / `DisplayPath` duplicates, or the record inside a one-element root array
+        (which ConvertFrom-Json unwraps), escaped it and read as the last copy."""
+        venue = {"name": "bachelor", "role": "supplementary", "declared": "bachelor", "hostName": "BACHELOR", "gpuNames": ["Intel(R) Iris(R) Xe Graphics"]}
+        head = '{"schema": "mlv-app/dual-venue-receipt/v1", "outcome": "UNRESOLVED", "subject": {}, '
+        vfields = json.dumps(venue)[1:-1]
+        cases = {
+            "Venue twice": head + '"Venue": null, "Venue": {' + vfields + ', "DisplayPath": {"state": "unknown", "reason": "x"}}}',
+            "DisplayPath state twice": head + '"Venue": {' + vfields + ', "DisplayPath": {"state": "bad", "state": "unknown", "reason": "x"}}}',
+            "venue and Venue": head + '"venue": {' + vfields + '}, "VENUE": {' + vfields + ', "displayPath": {"state": "unknown", "reason": "x"}}}',
+            "one-element root array with a duplicate": "[" + dup_key_text(receipt_with(good_block()), ["venue", "displayPath"], "sampledBefore", "during-measurement", SAMPLED_BEFORE) + "]",
+            "one-element root array": "[" + json.dumps(receipt_with(good_block())) + "]",
+        }
+        control = json.dumps(receipt_with(good_block()))
+        with tempfile.TemporaryDirectory(prefix="dv-displaypath-dup3-") as d:
+            path = Path(d) / "texts.json"
+            path.write_text(json.dumps(dict(cases, control=control)), encoding="utf-8")
+            got = pwsh_json("$in = [IO.File]::ReadAllText($env:DVE_TEXTS_FILE) | ConvertFrom-Json -AsHashtable\n$out = [ordered]@{}\n"
+                            "foreach ($k in @($in.Keys)) { try { $r = $(try { $in[$k] | ConvertFrom-Json } catch { $in[$k] | ConvertFrom-Json -AsHashtable }); $v = Test-DvReceiptValid -Receipt $r -ReceiptText $in[$k]\n"
+                            "  $out[$k] = [ordered]@{ valid = $v.valid; displayPath = $v.displayPath; reasons = @($v.reasons) } } catch { $out[$k] = [ordered]@{ threw = [string]$_.Exception.Message } } }\n"
+                            "$out | ConvertTo-Json -Compress -Depth 5", {"DVE_TEXTS_FILE": str(path)})
+        for label in cases:
+            with self.subTest(label):
+                self.assertEqual((got[label].get("valid"), got[label].get("displayPath")), (False, "malformed"), got[label])
+                self.assertTrue(any(r.startswith("DISPLAY_PATH_MALFORMED") for r in got[label]["reasons"]), got[label])
+        self.assertEqual((got["control"]["valid"], got["control"]["displayPath"]), (True, "present"), got["control"])
+
+    def test_successor3_w3_every_reader_that_holds_a_receipts_text_passes_it_to_the_validator(self) -> None:
+        """SUCCESSOR-2 adversary A5: New-VenueFlavorPair and Invoke-VenueBaseline read each receipt from its file and called Test-DvReceiptValid without -ReceiptText, so
+        the duplicate-key check never ran there. Every call in a script that reads the receipt file carries the text (the writer, New-DvReceipt, holds an object only)."""
+        for name in ("New-VenueFlavorPair.ps1", "Invoke-VenueBaseline.ps1", "New-VenueSheetPair.ps1"):
+            calls = [l for l in (DV / name).read_text(encoding="utf-8").splitlines() if "Test-DvReceiptValid " in l and not l.lstrip().startswith("#")]
+            with self.subTest(name):
+                self.assertTrue(calls, name)
+                for call in calls:
+                    self.assertIn("-ReceiptText", call, f"{name}: {call.strip()}")
+
 
 @requires_windows_pwsh
 class Successor2VenueLegTests(RunnerHarness, unittest.TestCase):
