@@ -6125,6 +6125,50 @@ function Test-DvReceiptValid {
     #>
     param([Parameter(Mandatory)]$Receipt, [string]$RepoRoot = '', [string]$EvidenceDir = '', [switch]$AllowOfflineTestMode, [byte[]]$OfflineLegSpecBytes = $null, [string]$ReceiptText = '')
     # SUCCESSOR-2 W6 (pass-2 A7): the block is judged FIRST, from the receipt alone, so the core validator's proof I/O cannot hide its verdict (below)
+    # SUCCESSOR-3 r3 (opus key3 r2 B1): that judgement is Get-DvReceiptDisplayPathState, which a reader also calls on its own (no core call, no `try`)
+    $displayArgs = @{ Receipt = $Receipt }
+    if ($PSBoundParameters.ContainsKey('ReceiptText')) { $displayArgs.ReceiptText = $ReceiptText }
+    $display = Get-DvReceiptDisplayPathState @displayArgs
+    $coreArgs = @{}
+    foreach ($e in $PSBoundParameters.GetEnumerator()) { if (-not [string]::Equals($e.Key, 'ReceiptText', [System.StringComparison]::OrdinalIgnoreCase)) { $coreArgs[$e.Key] = $e.Value } }
+    # SUCCESSOR-3 W0 (hosted heavy 3/14 on 4d4db9cd): a `try` changes what a statement error inside the core does. Without one up the stack, a failing statement (the blanket
+    # revocation filter over an empty blanket list) writes its error and the core goes on to its own verdict (CONSENT_REVOKED); inside one, it unwinds to the catch. So a
+    # good (or absent) block calls the core exactly as a caller did before this wrapper existed: no `try` here, and the core's own throw still reaches the caller.
+    if ($display.state -cne 'malformed') { $result = Test-DvReceiptValidCore @coreArgs }
+    else {
+        # a malformed block reports BOTH reasons, each its own, when the core's proof I/O cannot complete (SUCCESSOR-2 W6)
+        try { $result = Test-DvReceiptValidCore @coreArgs }
+        catch {
+            $io = ([string]$_.Exception.Message) -replace '\s+', ' '
+            $result = [pscustomobject]@{ valid = $false; status = 'INVALID'; reasons = @("EVIDENCE_VALIDATION_IO: the core validator could not complete: $io"); unbound = @(); evidenceDir = $null; legType = $null }
+        }
+    }
+    if ($display.state -ceq 'malformed') {
+        $result.reasons = @(Get-DvDisplayPathMalformedReason -Display $display) + @($result.reasons)
+        $result.status = 'INVALID'
+        $result.valid = $false
+    }
+    elseif ($display.state -ceq 'present' -and @($result.unbound).Count -gt 0) {
+        $result.unbound = @($result.unbound) + 'DISPLAY_PATH_UNBOUND: venue.displayPath is collected by the venue probe and written to no hashed artifact; it is recorded, never trusted'
+    }
+    Add-Member -InputObject $result -NotePropertyName displayPath -NotePropertyValue $display.state -Force
+    $result
+}
+
+function Get-DvDisplayPathMalformedReason {
+    # SUCCESSOR-3 r3: the ONE spelling of the malformed-block reason, used by the validator and by a reader that refuses on Get-DvReceiptDisplayPathState alone
+    param([Parameter(Mandatory)]$Display)
+    'DISPLAY_PATH_MALFORMED: venue.displayPath: ' + (@($Display.problems) -join '; ')
+}
+
+function Get-DvReceiptDisplayPathState {
+    <#
+    .SYNOPSIS
+    SUCCESSOR-3 r3 (opus key3 r2 B1, sol r2 B2): the display-path judgement of Test-DvReceiptValid ON ITS OWN, from the receipt (and its text, when the caller holds it)
+    alone: state absent | present | malformed, with problems. It calls no core validator and reads no file, so a reader can refuse a malformed block (or a venue that
+    is null or not an object) BEFORE any gate that reads the venue, without wrapping the core validator in a `try` (the W0 hazard).
+    #>
+    param([Parameter(Mandatory)]$Receipt, [string]$ReceiptText = '')
     $venueNode = Get-DvProp $Receipt 'venue'
     # a venue that is present but not an object (an array, a number) cannot be said to carry no block: that is a malformed record, never `absent`
     # SUCCESSOR-1 W4 (r3 adversary A6): an explicit `"venue": null` is a venue that is there and is not an object (malformed); only a missing venue member is absent
@@ -6145,30 +6189,7 @@ function Test-DvReceiptValid {
             if ($hit.Count -gt 0) { $display = [pscustomobject]@{ state = 'malformed'; problems = @('duplicate key ' + ($hit -join ', ')) } }
         }
     }
-    $coreArgs = @{}
-    foreach ($e in $PSBoundParameters.GetEnumerator()) { if (-not [string]::Equals($e.Key, 'ReceiptText', [System.StringComparison]::OrdinalIgnoreCase)) { $coreArgs[$e.Key] = $e.Value } }
-    # SUCCESSOR-3 W0 (hosted heavy 3/14 on 4d4db9cd): a `try` changes what a statement error inside the core does. Without one up the stack, a failing statement (the blanket
-    # revocation filter over an empty blanket list) writes its error and the core goes on to its own verdict (CONSENT_REVOKED); inside one, it unwinds to the catch. So a
-    # good (or absent) block calls the core exactly as a caller did before this wrapper existed: no `try` here, and the core's own throw still reaches the caller.
-    if ($display.state -cne 'malformed') { $result = Test-DvReceiptValidCore @coreArgs }
-    else {
-        # a malformed block reports BOTH reasons, each its own, when the core's proof I/O cannot complete (SUCCESSOR-2 W6)
-        try { $result = Test-DvReceiptValidCore @coreArgs }
-        catch {
-            $io = ([string]$_.Exception.Message) -replace '\s+', ' '
-            $result = [pscustomobject]@{ valid = $false; status = 'INVALID'; reasons = @("EVIDENCE_VALIDATION_IO: the core validator could not complete: $io"); unbound = @(); evidenceDir = $null; legType = $null }
-        }
-    }
-    if ($display.state -ceq 'malformed') {
-        $result.reasons = @('DISPLAY_PATH_MALFORMED: venue.displayPath: ' + ($display.problems -join '; ')) + @($result.reasons)
-        $result.status = 'INVALID'
-        $result.valid = $false
-    }
-    elseif ($display.state -ceq 'present' -and @($result.unbound).Count -gt 0) {
-        $result.unbound = @($result.unbound) + 'DISPLAY_PATH_UNBOUND: venue.displayPath is collected by the venue probe and written to no hashed artifact; it is recorded, never trusted'
-    }
-    Add-Member -InputObject $result -NotePropertyName displayPath -NotePropertyValue $display.state -Force
-    $result
+    $display
 }
 
 # --- the job's notAfterUtc (LEASE-NOT-AFTER-SINGLE-LEG-SUBMITTERS-1) --------------------------------
@@ -6689,7 +6710,8 @@ function Get-DvJsonRootObjectWithout {
     # LAST is kept, the copy ConvertFrom-Json keeps of two same-case names; the validator's duplicate check on the text still types the record malformed.
     # r2 adversary A3: this reader accepts the depth ConvertFrom-Json accepts (its default -Depth 1024), so a deep block it must drop never stops it first.
     # r2 adversary A2: any number of one-element array wrappers is peeled, as many as ConvertFrom-DvProbeStdout / ConvertFrom-DvReceiptText peel.
-    param([AllowEmptyString()][string]$Text, [string]$Name, [string]$Under = '')
+    # r3 (sol r2 B1): -NoUnwrap reads a root OBJECT only (no array is peeled): a member's value is judged as it is, never as the record inside an array.
+    param([AllowEmptyString()][string]$Text, [string]$Name, [string]$Under = '', [switch]$NoUnwrap)
     try {
         $opt = [System.Text.Json.JsonDocumentOptions]::new()
         $opt.MaxDepth = 1024; $opt.AllowTrailingCommas = $true; $opt.CommentHandling = [System.Text.Json.JsonCommentHandling]::Skip
@@ -6697,7 +6719,7 @@ function Get-DvJsonRootObjectWithout {
     } catch { return $null }
     try {
         $root = $doc.RootElement
-        while ($root.ValueKind -eq [System.Text.Json.JsonValueKind]::Array -and $root.GetArrayLength() -eq 1) { $root = $root[0] }
+        while (-not $NoUnwrap -and $root.ValueKind -eq [System.Text.Json.JsonValueKind]::Array -and $root.GetArrayLength() -eq 1) { $root = $root[0] }
         if ($root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $null }
         $c = [System.StringComparison]::OrdinalIgnoreCase
         $underCount = 0
@@ -6761,11 +6783,23 @@ function ConvertFrom-DvReceiptText {
         $rest = Get-DvJsonRootObjectWithout -Text $Text -Name 'displayPath' -Under 'venue'
         if ($null -eq $rest) { throw $first }
         try { $parsed = $rest | ConvertFrom-Json } catch { throw $first }
+        $copies = @(Get-DvJsonRootMemberTexts -Text $Text -Name 'venue')
+        # r3 (key3 r2 H3, the class of sol r2 B1): the recovery must be what cured the parse. With no venue there was no block to drop; with one venue, the same
+        # rewrite that KEEPS its displayPath must still fail, or the failure was not the display path's (a reader difference cured it) and stays the parser's own.
+        # (Two or more venue copies: the dropped copies are judged below; the collision itself is `the venue that holds it`.)
+        if ($copies.Count -eq 0) { throw $first }
+        if ($copies.Count -eq 1) {
+            $same = Get-DvJsonRootObjectWithout -Text $Text -Name ([string][char]0) -Under 'venue'
+            $sameParses = $false
+            if ($null -ne $same) { try { $null = ($same | ConvertFrom-Json); $sameParses = $true } catch { $sameParses = $false } }
+            if ($null -eq $same -or $sameParses) { throw $first }
+        }
         # r2 pass-3 adversary A7: a venue copy the recovery dropped (`venue` beside `Venue`) must itself read without its block, or the failure was not the
         # display path's and stays the parser's own
-        $copies = @(Get-DvJsonRootMemberTexts -Text $Text -Name 'venue')
+        # r3 (sol r2 B1): a dropped copy is judged AS IT IS: only an object copy is read without its displayPath. A copy that is an array (`[{"displayPath":...}]`,
+        # nested or not) is parsed unchanged, so a failure under venue[0] is never blamed on venue.displayPath.
         for ($i = 0; $i -lt $copies.Count - 1; $i++) {
-            $copy = Get-DvJsonRootObjectWithout -Text $copies[$i] -Name 'displayPath'
+            $copy = Get-DvJsonRootObjectWithout -Text $copies[$i] -Name 'displayPath' -NoUnwrap
             if ($null -eq $copy) { $copy = $copies[$i] }
             try { $null = ($copy | ConvertFrom-Json) } catch { throw $first }
         }
@@ -6993,6 +7027,12 @@ function ConvertFrom-DvProbeStdout([string]$Stdout) {
                 $rest = Get-DvJsonRootObjectWithout -Text $json -Name 'displayPath'
                 if ($null -eq $rest) { return $null }
                 try { if ($raw) { $probe = ($rest | ConvertFrom-Json -DateKind String) } else { $probe = ($rest | ConvertFrom-Json) } } catch { return $null }
+                # SUCCESSOR-3 r3 (the class of sol r2 B1 / key3 r2 H3): the drop must be what cured the parse. The same rewrite that KEEPS displayPath must still fail;
+                # when it reads (no displayPath at all, or a reader difference cured the line), the failure was not the block's and the probe stays unread, as before.
+                $same = Get-DvJsonRootObjectWithout -Text $json -Name ([string][char]0)
+                $sameParses = $false
+                if ($null -ne $same) { try { $null = ($same | ConvertFrom-Json); $sameParses = $true } catch { $sameParses = $false } }
+                if ($sameParses) { return $null }
                 $blockStoppedParse = $true
             }
             # r2 adversary A2: ConvertFrom-Json unwraps only the outer array, so `[[probe]]` reads as a one-element array the checks below skipped and `return` unrolled.
@@ -7466,5 +7506,5 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Test-DvMatrixRowMeasured, Get-DvMatrixMeasuredCount, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
-    New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout, Get-DvDisplayPathCollectorSource, Test-DvDisplayPathBlock, ConvertTo-DvDisplayPath, ConvertFrom-DvReceiptText,
+    New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout, Get-DvDisplayPathCollectorSource, Test-DvDisplayPathBlock, ConvertTo-DvDisplayPath, ConvertFrom-DvReceiptText, Get-DvReceiptDisplayPathState, Get-DvDisplayPathMalformedReason,
     Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt

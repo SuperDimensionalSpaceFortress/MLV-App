@@ -156,6 +156,16 @@ $receiptTexts.cinematic = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $Cin
 # SUCCESSOR-3 r2 (sol r1 B2): ConvertFrom-DvReceiptText, so a venue.displayPath that alone stops the parse reaches the validator's typed DISPLAY_PATH_MALFORMED
 $classic = ConvertFrom-DvReceiptText -Text $receiptTexts.classic
 $cinematic = ConvertFrom-DvReceiptText -Text $receiptTexts.cinematic
+# VENUE-LEG-DISPLAY-PATH-RECEIPT-1-SUCCESSOR-3 r3 (sol r2 B2; opus key3 r2 B1): each receipt's venue.displayPath (and the venue that holds it) is judged right after the
+# receipt is read, BEFORE any gate that reads its venue or outcome, so a malformed block or a null / non-object venue (`"Venue": null` after a good `venue`) is refused
+# as itself (PAIR_RECEIPT_INVALID, DISPLAY_PATH_MALFORMED) and never as PAIR_VENUE_OR_CARD_DIFFERS or PAIR_RECEIPT_INCOMPLETE. The display path ALONE: no core call, no
+# `try` (a `try` around the validator turned the core's typed CONSENT_REVOKED into a raw throw: the W0 hazard, psm1).
+function Assert-DisplayPathNotMalformed($Receipt, [string]$Text) {
+    $display = Get-DvReceiptDisplayPathState -Receipt $Receipt -ReceiptText $Text
+    if ($display.state -ceq 'malformed') { throw "PAIR_RECEIPT_INVALID receipt $($Receipt.receiptId) is not valid evidence: $(Get-DvDisplayPathMalformedReason -Display $display)" }
+}
+Assert-DisplayPathNotMalformed $classic $receiptTexts.classic
+Assert-DisplayPathNotMalformed $cinematic $receiptTexts.cinematic
 
 # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r26 (sol r25 B2 sibling): receipt flavors compare ordinally and canonically (Test-DvLookFlavorSame), never the linguistic -cne
 if (-not (Test-DvLookFlavorSame 'classic' ([string]$classic.subject.lookFlavor)) -or -not (Test-DvLookFlavorSame 'cinematic' ([string]$cinematic.subject.lookFlavor))) {
@@ -172,6 +182,7 @@ $film = $null
 if ($trio) {
     $receiptTexts.film = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $FilmReceipt).Path)
     $film = ConvertFrom-DvReceiptText -Text $receiptTexts.film
+    Assert-DisplayPathNotMalformed $film $receiptTexts.film   # r3 (sol r2 B2): before the film gates read its venue
     if (-not (Test-DvLookFlavorSame ([string]$ThirdFlavor) ([string]$film.subject.lookFlavor))) { throw "PAIR_FLAVORS_WRONG the third receipt must be the $ThirdFlavor flavor (got '$($film.subject.lookFlavor)')" }
     foreach ($f in 'buildManifestSha256', 'clipId', 'backend') {
         if ([string]$classic.subject.$f -cne [string]$film.subject.$f) { throw "PAIR_SUBJECT_DIFFERS the film receipt differs in subject.$f" }
@@ -233,22 +244,13 @@ $evidenceDirs = @{}
 $listedFrames = @{}
 $sliders = @{}
 $reported = @{}
-# The evidence-bearing validator: admission re-derived from the committed blobs, the run from the hashed evidence. Nothing the receipt says is believed.
-# VENUE-LEG-DISPLAY-PATH-RECEIPT-1-SUCCESSOR-3 r2 (adversary A7, A8): EVERY side is validated before any side's outcome gate, so a malformed venue.displayPath on
-# any side is refused as itself (PAIR_RECEIPT_INVALID, DISPLAY_PATH_MALFORMED) on any outcome; otherwise each side's gates below run in order, as before.
-$validities = @{}
+# VENUE-LEG-DISPLAY-PATH-RECEIPT-1-SUCCESSOR-3 r2 (adversary A7, A8) / r3 (opus key3 r2 B1): every side's venue.displayPath was judged when it was read (above), so a
+# malformed block on any side is refused as itself on any outcome; each side's gates below run in order, as before, and the validator is called with no `try`.
 foreach ($label in $sides.Keys) {
     $r = $sides[$label]
-    $validity = $null; $validityError = $null
-    try { $validity = Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot -ReceiptText $receiptTexts[$label] } catch { $validityError = $_ }
-    if ($validity -and [string]$validity.displayPath -ceq 'malformed') { throw "PAIR_RECEIPT_INVALID receipt $($r.receiptId) is not valid evidence: $(@($validity.reasons) -join '; ')" }
-    $validities[$label] = [pscustomobject]@{ validity = $validity; error = $validityError }
-}
-foreach ($label in $sides.Keys) {
-    $r = $sides[$label]
-    $validity = $validities[$label].validity; $validityError = $validities[$label].error
     if ($r.outcome -ne 'PASS' -and $r.outcome -ne 'FAIL') { throw "PAIR_RECEIPT_INCOMPLETE receipt $($r.receiptId) is $($r.outcome), not PASS/FAIL" }
-    if ($validityError) { throw $validityError }
+    # The evidence-bearing validator: admission re-derived from the committed blobs, the run from the hashed evidence. Nothing the receipt says is believed.
+    $validity = Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot -ReceiptText $receiptTexts[$label]
     if ($validity.status -cne 'ADVISORY') { throw "PAIR_RECEIPT_$($validity.status) receipt $($r.receiptId) is not valid evidence: $(@($validity.reasons) -join '; ')" }
     if ([string]$validity.legType -cne 'look') { throw "PAIR_NOT_A_LOOK_LEG receipt $($r.receiptId) is not a LOOK leg per its committed leg spec" }
     if ([string]$r.subject.clipId -cnotmatch '^[A-Za-z]\d{2}-\d{3,4}$') { throw 'PAIR_NOT_A_CONSENTED_CLIP only a consented clip id (never a fixture or a path) can be paired into a sheet' }

@@ -345,6 +345,15 @@ function Get-RowFigures([string]$ReceiptPath, $Leg, [string]$Backend) {
     $rcText = $null
     # SUCCESSOR-3 r2 (sol r1 B2): ConvertFrom-DvReceiptText, so a venue.displayPath that alone stops the parse reaches the validator (INVALID) instead of reading as missing
     try { $rcText = [IO.File]::ReadAllText($ReceiptPath); $rc = ConvertFrom-DvReceiptText -Text $rcText } catch { return $f }
+    # SUCCESSOR-3 r3 (sol r2 B2): the display path (and the venue that holds it) is judged BEFORE the identity gate below, which reads the venue's name: a null or
+    # non-object venue (`"Venue": null` kept after a good `venue`) or a malformed block is the validator's typed INVALID / DISPLAY_PATH_MALFORMED, rejected with no
+    # figure, never RECEIPT_IDENTITY_MISMATCH. The display path ALONE (the reason Test-DvReceiptValid puts first): no core call, as a bad record is bad on every outcome.
+    $display = Get-DvReceiptDisplayPathState -Receipt $rc -ReceiptText $rcText
+    if ($display.state -ceq 'malformed') {
+        $f.verification = [ordered]@{ status = 'INVALID'; valid = $false; reasons = @(Get-DvDisplayPathMalformedReason -Display $display) }
+        $f.rejected = 'INVALID'
+        return $f
+    }
     # The receipt must be the one THIS run's leg wrote, not a stale or foreign file the chain's path happens to name: its receiptId is its file name, its legId / venue /
     # buildManifestSha256 are the planned ones, and it started after this run did (the hub VM stamps it on the same clock). Anything else is `identity`: not validated, no figure.
     $idProblems = [System.Collections.Generic.List[string]]::new()

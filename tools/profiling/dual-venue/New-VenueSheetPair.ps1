@@ -55,20 +55,17 @@ $evidenceDirs = @{}
 $listedFrames = @{}
 # The evidence-bearing validator: the receipt's admission is re-derived from the committed blobs and its run from the hashed
 # evidence files (a receipt whose evidence is absent is INCOMPLETE). Nothing the receipt says about itself is believed.
-# VENUE-LEG-DISPLAY-PATH-RECEIPT-1-SUCCESSOR-3 r2 (adversary A7, A8): EVERY side is validated before any side's outcome gate, so a malformed venue.displayPath on
-# either side is refused as itself (PAIR_RECEIPT_INVALID, DISPLAY_PATH_MALFORMED) on any outcome; otherwise each side's gates below run in order, as before.
-$validities = [System.Collections.Generic.List[object]]::new()
+# VENUE-LEG-DISPLAY-PATH-RECEIPT-1-SUCCESSOR-3 r2 (adversary A7, A8): EVERY side's venue.displayPath is judged before any side's outcome gate, so a malformed block
+# on either side is refused as itself (PAIR_RECEIPT_INVALID, DISPLAY_PATH_MALFORMED) on any outcome; otherwise each side's gates below run in order, as before.
+# r3 (opus key3 r2 B1): that judgement is the display path ALONE (Get-DvReceiptDisplayPathState: no core call, no `try`). Wrapping the validator in a `try` here
+# turned a statement error the core survives (the blanket revocation filter) into a raw throw instead of its typed CONSENT_REVOKED (the W0 hazard, psm1).
 foreach ($r in $cuda, $cpu) {
-    $validity = $null; $validityError = $null
-    try { $validity = Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot -ReceiptText $(if ([object]::ReferenceEquals($r, $cuda)) { $cudaText } else { $cpuText }) } catch { $validityError = $_ }
-    if ($validity -and [string]$validity.displayPath -ceq 'malformed') { throw "PAIR_RECEIPT_INVALID receipt $($r.receiptId) is not valid evidence: $(@($validity.reasons) -join '; ')" }
-    $validities.Add([pscustomobject]@{ validity = $validity; error = $validityError })
+    $display = Get-DvReceiptDisplayPathState -Receipt $r -ReceiptText $(if ([object]::ReferenceEquals($r, $cuda)) { $cudaText } else { $cpuText })
+    if ($display.state -ceq 'malformed') { throw "PAIR_RECEIPT_INVALID receipt $($r.receiptId) is not valid evidence: $(Get-DvDisplayPathMalformedReason -Display $display)" }
 }
-$side = 0
 foreach ($r in $cuda, $cpu) {
-    $validity = $validities[$side].validity; $validityError = $validities[$side].error; $side++
     if ($r.outcome -ne 'PASS' -and $r.outcome -ne 'FAIL') { throw "PAIR_RECEIPT_INCOMPLETE receipt $($r.receiptId) is $($r.outcome), not PASS/FAIL" }
-    if ($validityError) { throw $validityError }
+    $validity = Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot -ReceiptText $(if ([object]::ReferenceEquals($r, $cuda)) { $cudaText } else { $cpuText })
     if ($validity.status -cne 'ADVISORY') { throw "PAIR_RECEIPT_$($validity.status) receipt $($r.receiptId) is not valid evidence: $(@($validity.reasons) -join '; ')" }
     # The leg type is the COMMITTED spec's (found by the validator), not a field of the receipt: only a look leg has a sheet to pair.
     if ([string]$validity.legType -cne 'look') { throw "PAIR_NOT_A_LOOK_LEG receipt $($r.receiptId) is not a LOOK leg per its committed leg spec; only a look leg's frames can be paired" }
