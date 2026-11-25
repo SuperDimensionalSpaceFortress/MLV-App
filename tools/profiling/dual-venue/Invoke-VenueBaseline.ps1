@@ -208,9 +208,11 @@ $legs = [System.Collections.Generic.List[object]]::new()
 foreach ($rel in $StandardLegs) {
     $path = Join-Path $here $rel
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { Stop-Baseline 'USAGE' "no standard leg spec at '$path'" }
-    $spec = try { [IO.File]::ReadAllText($path) | ConvertFrom-Json } catch { Stop-Baseline 'USAGE' "leg spec '$path' is not valid JSON" }
+    # r6 (adversary-fa329743.json A4): the spec is read ONCE; its plan fields and its planned leg type come from that one text
+    $specText = try { [IO.File]::ReadAllText($path) } catch { Stop-Baseline 'USAGE' "leg spec '$path' could not be read" }
+    $spec = try { $specText | ConvertFrom-Json } catch { Stop-Baseline 'USAGE' "leg spec '$path' is not valid JSON" }
     # r6 (adversary-de8e3799.json A3): plannedLegType is read HERE, at planning, before any chain runs (a spec replaced later grants nothing)
-    $legs.Add([pscustomobject]@{ legId = [string]$spec.legId; card = [string]$spec.card; spec = (Resolve-Path -LiteralPath $path).Path; backends = @($spec.backends); role = (Get-DvVenueRole -Table $table -Card ([string]$spec.card) -Venue $Venue); plannedLegType = (Get-VenuePlannedLegType -SpecPath (Resolve-Path -LiteralPath $path).Path) })
+    $legs.Add([pscustomobject]@{ legId = [string]$spec.legId; card = [string]$spec.card; spec = (Resolve-Path -LiteralPath $path).Path; backends = @($spec.backends); role = (Get-DvVenueRole -Table $table -Card ([string]$spec.card) -Venue $Venue); plannedLegType = (Get-VenuePlannedLegType -SpecText $specText) })
 }
 
 $deadline = $startedUtc.AddSeconds($MaxTotalSec)

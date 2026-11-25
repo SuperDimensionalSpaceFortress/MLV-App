@@ -1822,8 +1822,14 @@ function Get-VenuePlannedLegType {
     'unknown' when the spec path is empty, unreadable or not one JSON object, or (with -ExpectSpecSha256) its bytes are not the planned bytes. Only 'export'
     grants Get-VenueLegHostLoad's export exemption, so an unreadable plan is never exempt.
     #>
-    param([AllowNull()][AllowEmptyString()][string]$SpecPath, [AllowNull()][AllowEmptyString()][string]$ExpectSpecSha256)
+    # adversary-fa329743.json A3/A4: -SpecText judges the spec text the caller ALREADY read for its plan (its legId, its budget), so no second read can see
+    # other bytes and no extra (unbounded) file read happens; -SpecPath reads the file itself.
+    param([AllowNull()][AllowEmptyString()][string]$SpecPath, [AllowNull()][AllowEmptyString()][string]$ExpectSpecSha256, [AllowNull()][string]$SpecText)
     try {
+        if ($PSBoundParameters.ContainsKey('SpecText')) {
+            if ([string]::IsNullOrEmpty($SpecText)) { return 'unknown' }
+            $text = $SpecText
+        } else {
         if ([string]::IsNullOrWhiteSpace($SpecPath) -or -not (Test-Path -LiteralPath $SpecPath -PathType Leaf)) { return 'unknown' }
         $bytes = [IO.File]::ReadAllBytes($SpecPath)
         if (-not [string]::IsNullOrEmpty($ExpectSpecSha256)) {
@@ -1831,6 +1837,7 @@ function Get-VenuePlannedLegType {
             if (-not [string]::Equals($got, $ExpectSpecSha256, [StringComparison]::OrdinalIgnoreCase)) { return 'unknown' }
         }
         $text = [Text.Encoding]::UTF8.GetString($bytes)
+        }
         if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
         if (Find-VenueJsonDuplicateMember -Text $text -All) { return 'unknown' }
         $spec = ConvertFrom-Json -InputObject $text -NoEnumerate

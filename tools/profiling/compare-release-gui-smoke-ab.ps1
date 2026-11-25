@@ -877,6 +877,12 @@ $beforeSmoke = Read-SmokeJson -Path $Before
 $afterSmoke = Read-SmokeJson -Path $After
 $beforeJsonPath = (Resolve-Path -LiteralPath $Before).Path
 $afterJsonPath = (Resolve-Path -LiteralPath $After).Path
+# adversary-fa329743.json A1: each smoke file's text is read ONCE, and both the figures and the host-load verdict come from that one text. A file
+# replaced (or locked) after this read changes nothing below; the object read above is re-derived from the same text.
+$beforeSmokeText = [IO.File]::ReadAllText($beforeJsonPath)
+$afterSmokeText = [IO.File]::ReadAllText($afterJsonPath)
+$beforeSmoke = $beforeSmokeText | ConvertFrom-Json -Depth 100
+$afterSmoke = $afterSmokeText | ConvertFrom-Json -Depth 100
 $resolvedOutput = $null
 if (-not [string]::IsNullOrWhiteSpace($Output)) {
     $resolvedOutput = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Output)
@@ -1024,7 +1030,7 @@ foreach ($leg in @(
     }
 }
 # adversary-de8e3799.json A1: the host load is judged from each smoke file's own text (no root/hostLoad unrolling, a repeated member is unknown)
-$hostLoadComparison = Get-HostLoadComparisonEvidence -BeforeSmoke $beforeSmoke -AfterSmoke $afterSmoke -BeforeText ([IO.File]::ReadAllText($beforeJsonPath)) -AfterText ([IO.File]::ReadAllText($afterJsonPath))
+$hostLoadComparison = Get-HostLoadComparisonEvidence -BeforeSmoke $beforeSmoke -AfterSmoke $afterSmoke -BeforeText $beforeSmokeText -AfterText $afterSmokeText
 $hostLoadEvidence = $hostLoadComparison.evidence
 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): a host-load refusal is no longer a failure (it read FAIL);
 # it is kept in hostLoadRefusals and makes the verdict INCONCLUSIVE (Get-GuiSmokeAbVerdict, below).

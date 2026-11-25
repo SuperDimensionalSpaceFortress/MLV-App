@@ -191,9 +191,11 @@ if ($LegSet) {
         $seq++
         $path = $(if (Test-Path -LiteralPath $ref -PathType Leaf) { $ref } elseif (Test-Path -LiteralPath (Join-Path $here "legs\$ref") -PathType Leaf) { Join-Path $here "legs\$ref" } else { Stop-Usage "no leg spec at '$ref'" })
         $path = (Resolve-Path -LiteralPath $path).Path
-        $legId = try { [string](([IO.File]::ReadAllText($path) | ConvertFrom-Json).legId) } catch { '' }
+        # r6 (adversary-fa329743.json A4): the spec is read ONCE at planning; its legId and its planned leg type both come from that one text
+        $specText = try { [IO.File]::ReadAllText($path) } catch { '' }
+        $legId = try { [string](($specText | ConvertFrom-Json).legId) } catch { '' }
         if ($legId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$') { $legId = [IO.Path]::GetFileNameWithoutExtension($path) }
-        $plannedType = Get-VenuePlannedLegType -SpecPath $path   # r6 (adversary-de8e3799.json A3): read at planning, before any leg runs
+        $plannedType = Get-VenuePlannedLegType -SpecText $specText   # r6 (adversary-de8e3799.json A3): read at planning, before any leg runs
         for ($r = 1; $r -le $Repeats; $r++) {
             $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f ($plan.Count + 1), $legId, $(if ($Backend) { $Backend } else { 'spec' })); spec = $path; backend = $(if ($Backend) { $Backend } else { '' }); plannedLegType = $plannedType })
         }

@@ -538,13 +538,22 @@ class PlannedLegTypeExemptionTests(unittest.TestCase):
         # The class guard: every production call of Get-VenueLegHostLoad passes -PlannedLegType from the planned spec (Get-VenuePlannedLegType).
         # adversary-de8e3799.json A3: chain, baseline and matrix read the planned type AT PLANNING (before any leg runs); the batch binds its read to the
         # preflight-judged bytes. A4: matrix and baseline bind the host-load read to the receipt bytes the figures came from.
-        drivers = {"Invoke-VenueChain.ps1": "plannedLegType = (Get-VenuePlannedLegType -SpecPath ([string]$e.specPath))",
-                   "Invoke-VenueLeaseBatch.ps1": "Get-VenuePlannedLegType -SpecPath ([string]$leg.spec) -ExpectSpecSha256 $planSha",
-                   "Invoke-VenueBaseline.ps1": "plannedLegType = (Get-VenuePlannedLegType -SpecPath (Resolve-Path -LiteralPath $path).Path)",
+        # adversary-fa329743.json A3/A4: the chain's scalar branch and the baseline judge the text they read for the plan; the batch records the type
+        # judged from the preflight's bytes and never reopens the spec after the leg.
+        drivers = {"Invoke-VenueChain.ps1": "$plannedType = Get-VenuePlannedLegType -SpecText $specText",
+                   "Invoke-VenueLeaseBatch.ps1": "$script:SpecPlannedLegType[$Path] = Get-VenuePlannedLegType -SpecText",
+                   "Invoke-VenueBaseline.ps1": "plannedLegType = (Get-VenuePlannedLegType -SpecText $specText)",
                    "Invoke-VenueLeg.ps1": "$plannedTypes[[string]$pe.seq] = Get-VenuePlannedLegType -SpecPath ([string]$pe.specPath)"}
         chain = (DV_DIR / "Invoke-VenueChain.ps1").read_text(encoding="utf-8")
         self.assertIn("-PlannedLegType ([string]$leg.plannedLegType)", chain)
         self.assertNotIn("-PlannedLegType (Get-VenuePlannedLegType", chain, "never re-read at classification")
+        batch = (DV_DIR / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
+        self.assertNotIn("Get-VenuePlannedLegType -SpecPath", batch, "the batch never reopens the spec (adversary-fa329743.json A3)")
+        self.assertIn("-PlannedLegType $plannedType", batch)
+        p = run_ps("Write-Output ('E=' + (Get-VenuePlannedLegType -SpecText '{\"legType\":\"export\"}')); Write-Output ('Z=' + (Get-VenuePlannedLegType -SpecText ''));"
+                   " Write-Output ('P=' + (Get-VenuePlannedLegType -SpecText '{\"legType\":\"playback\"}'))")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("E=export", p.stdout); self.assertIn("Z=unknown", p.stdout); self.assertIn("P=playback", p.stdout)
         for script in ("Invoke-VenueLeg.ps1", "Invoke-VenueBaseline.ps1"):
             self.assertIn("-ExpectReceiptSha256", (DV_DIR / script).read_text(encoding="utf-8"), script)
         for script, plan_call in drivers.items():

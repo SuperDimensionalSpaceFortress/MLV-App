@@ -301,6 +301,7 @@ $script:ExportBudgetPreflightCleanupMs = 1500   # (adversary r11 A6: the one bud
 # r19 (sol r18 B1): the sha256 of the leg spec bytes the export-budget preflight judged, by spec path (Get-ExportBudgetRefusal records it). Every later read of that spec before a
 # lease or a leg is compared with it (Get-InputContentRefusal, and the leg itself through -ExpectSpecSha256), so a lease is never spent on bytes the budget did not judge.
 $script:SpecBudgetSha256 = @{}
+$script:SpecPlannedLegType = @{}   # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6: spec path -> planned leg type judged from the preflight's bytes
 $script:SpecShapeSha256 = @{}   # (and of the bytes the preflight's shape check judged, which the budget's read must equal)
 foreach ($s in @($StagedBuildProbeScript, $ArtifactProbeScript) | Where-Object { $_ }) { if (-not (Test-Path -LiteralPath $s -PathType Leaf)) { Stop-Usage "no script at '$s'" } }
 $stagedBuildProbe = $(if ($StagedBuildProbeScript) { [scriptblock]::Create([IO.File]::ReadAllText($StagedBuildProbeScript)) } else { $null })
@@ -1527,6 +1528,9 @@ function Get-ExportBudgetRefusal([string]$Path) {
         return 'SPEC_CHANGED_AFTER_PREFLIGHT', "'$Path' cannot be run: the leg spec changed between the preflight's shape check (sha256 $($script:SpecShapeSha256[$Path])) and its export budget read (sha256 $judgedSha); no claim or lease is taken on bytes no single check judged"
     }
     $script:SpecBudgetSha256[$Path] = $judgedSha
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (adversary-fa329743.json A3/A4): the planned leg type is judged HERE, from the judged bytes, and recorded; the
+    # host-load read after the leg uses the record and never reopens the spec (no unbounded read at classification, no later file change can grant or revoke)
+    $script:SpecPlannedLegType[$Path] = Get-VenuePlannedLegType -SpecText ([Text.Encoding]::UTF8.GetString($specBytes).TrimStart([char]0xFEFF))
     try { $spec = [Text.Encoding]::UTF8.GetString($specBytes) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop }
     catch { return 'SPEC_READ_FAILED', "'$Path' cannot be run: the leg spec no longer parses on the export budget preflight's read ($($_.Exception.Message -replace '\s+', ' ')), so its job budget is unchecked; no claim or lease is taken on it" }
     if ($spec -isnot [System.Management.Automation.PSCustomObject]) { return 'SPEC_READ_FAILED', "'$Path' cannot be run: the leg spec is no longer one JSON object on the export budget preflight's read, so its job budget is unchecked; no claim or lease is taken on it" }
@@ -3004,8 +3008,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # (2026-11-21 a134532e: CimException, state unknown) is recorded as RAN but is never a counted class: HOSTLOAD_PROVISIONAL, with its typed line.
                 # r6 (sol r5 B2): the export exemption comes only from the leg's PLANNED type (its spec's legType, bound to the bytes the preflight judged when it
                 # recorded them), never from the receipt's shape
-                $planSha = $(if ($script:SpecBudgetSha256.ContainsKey([string]$leg.spec)) { [string]$script:SpecBudgetSha256[[string]$leg.spec] } else { '' })
-                $hl = Get-VenueLegHostLoad -ReceiptPath $receipt -PlannedLegType (Get-VenuePlannedLegType -SpecPath ([string]$leg.spec) -ExpectSpecSha256 $planSha)
+                $plannedType = $(if ($script:SpecPlannedLegType.ContainsKey([string]$leg.spec)) { [string]$script:SpecPlannedLegType[[string]$leg.spec] } else { 'unknown' })
+                $hl = Get-VenueLegHostLoad -ReceiptPath $receipt -PlannedLegType $plannedType
                 $hlRefusal = Get-VenueReferenceHostLoadRefusal -LegId $(if ($receipt) { [IO.Path]::GetFileNameWithoutExtension($receipt) } else { "leg:$($leg.name)" }) -Standing $hl
                 $class = $(if ($leaseClass) { $leaseClass } elseif ($legFF) { 'COOLDOWN_UNMET' } elseif ($null -eq $preLoad) { 'QUIET_PRELOAD_UNKNOWN' } elseif ($preLoad -le 30.0) { $(if ($hlRefusal) { 'HOSTLOAD_PROVISIONAL' } else { 'QUIET_PRELOAD_OK' }) } else { 'QUIET_PRELOAD_HIGH' })
                 $counted = ($class -ceq 'QUIET_PRELOAD_OK')
