@@ -912,14 +912,15 @@ function Invoke-ClaimRetryRequest {
     # The first request of a run is master's inline call, untouched; so are Invoke-VenueChain.ps1's two callers. A worker that threw rethrows here (the caller's REQUEST_THREW).
     # .OUTPUTS Request-VenueClaim's object, or { granted = $false; state = REQUEST_NO_ROOM | REQUEST_NO_ANSWER | REQUEST_LATE_GRANT; why; broken = @(); claim = $null }
     param([Parameter(Mandatory)][DateTime]$DeadlineUtc, [Parameter(Mandatory)][hashtable]$RequestArgs)
+    # BATCH-3 r8 pass 3 (adversary A1 on eee05a6b): the Stopwatch anchor is the FIRST read, before the room is sampled, so a pause after that sample is spent from the wait
+    $reqT0 = [Diagnostics.Stopwatch]::GetTimestamp()
     $room = ($DeadlineUtc - [DateTime]::UtcNow).TotalSeconds
     if ($room -lt $script:ClaimRetryRequestMinSec) {
         return [pscustomobject]@{ granted = $false; state = 'REQUEST_NO_ROOM'; broken = @(); claim = $null
             why = "no claim request was made: $([Math]::Round([Math]::Max(0.0, $room), 2)) s were left before -DeadlineUtc, under the $($script:ClaimRetryRequestMinSec) s a retry's request starts with" }
     }
     # BATCH-3 r8 (adversary r7 A3/A5 class): the same end on the Stopwatch (no wall-clock step widens the wait), and handed to the worker, which judges its grant against it.
-    # r8 pass 2 (A3 on 61244e31): anchored BEFORE the wall samples, so a pause between them can only shorten it
-    $reqT0 = [Diagnostics.Stopwatch]::GetTimestamp()
+    # r8 pass 2 (A3 on 61244e31): anchored BEFORE the wall samples ($reqT0, the function's first read), so a pause between them can only shorten it
     $timeoutSec = [Math]::Min([double]($room - $script:ClaimRetryRequestReserveSec), [double]$script:ClaimRetryRequestMaxSec)
     $reqEndUtc = [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, [double]$timeoutSec))   # b2 r2 (A3 class): the wait's one end
     $reqEndTs = $reqT0 + [long]([Math]::Max(0.0, [double]$timeoutSec) * [double][Diagnostics.Stopwatch]::Frequency)
@@ -955,6 +956,12 @@ function Invoke-ClaimRetryRequest {
         # (Invoke-ClaimRetryRelease), and never used
         $state.release = try { [string](Invoke-ClaimRetryRelease -DeadlineUtc $DeadlineUtc -Nonce ([string]$state.result.claim.nonce)) } catch { "THREW $($_.Exception.Message -replace '\s+', ' ')" }
         $state.late = $true
+    }
+    if (-not $state.late -and $seenLate) {
+        # r8 pass 3 (adversary A2 on eee05a6b): ANY answer first seen after the wait (a denial, a LIVE holder, a worker error) is no answer: the saved unfinished-pass refusal
+        # stands, never a fresh poll or a rethrow decided by it
+        return [pscustomobject]@{ granted = $false; state = 'REQUEST_NO_ANSWER'; broken = @(); claim = $null
+            why = "the claim request answered only after its $([Math]::Round($timeoutSec, 2)) s wait, $boundWhat; an answer seen after the wait is never acted on" }
     }
     if ($state.late) {
         return [pscustomobject]@{ granted = $false; state = 'REQUEST_LATE_GRANT'; broken = @(); claim = $null
@@ -1110,7 +1117,10 @@ $script:ClaimRetryRequestWorker = {
     param($A)
     $ErrorActionPreference = 'Stop'
     $S = $A.state; $r = $null; $err = $null
-    try { Import-Module $A.chainModule -Force -DisableNameChecking; $rq = $A.request; $r = Request-VenueClaim @rq } catch { $err = $_.Exception.Message -replace '\s+', ' ' }
+    # BATCH-3 r8 pass 3 (adversary A1 sibling :1113 on eee05a6b): no request starts once the caller's wait has ended (the import above it can stall): nothing was asked, no claim
+    try { Import-Module $A.chainModule -Force -DisableNameChecking; $rq = $A.request
+        if ($null -ne $A.waitEndTs -and [Diagnostics.Stopwatch]::GetTimestamp() -ge [long]$A.waitEndTs) { $r = [pscustomobject]@{ granted = $false; state = 'REQUEST_NO_ROOM'; broken = @(); claim = $null; why = "no claim request was made: the request's wait had ended before it could start" } }
+        else { $r = Request-VenueClaim @rq } } catch { $err = $_.Exception.Message -replace '\s+', ' ' }
     $late = $false
     [Threading.Monitor]::Enter($S.lock)
     # BATCH-3 r8 (adversary r7 A5 sibling :900): the grant is judged when it is DECIDED, here, against the caller's wait end too (a Stopwatch timestamp, so no wall-clock step
@@ -1473,17 +1483,19 @@ function Get-InputContentRefusal {
             # SPEC_CHANGED_AFTER_PREFLIGHT before the lease opens (the claim guard) and before any leg runs (the open guard); a read with no answer in the budget is SHARE_UNREACHABLE
             # (no answer: a claim-wait pass is read again next poll), as a manifest read is.
             $specBound = $(if ($null -ne $script:guardBudget) { $script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds } else { Get-SpecReadBoundSec })
+            # BATCH-3 r8 pass 3 (adversary A5 on eee05a6b): the read is ALSO cut to the guard budget's own end on its own clock (a pause after the sample above gives no time back)
+            $specClock = $(if ($null -ne $script:guardBudget) { $script:guardBudget.clock } else { $null }); $specEndSec = $(if ($null -ne $script:guardBudget) { [double]$script:guardBudget.sec } else { 0.0 })
             $noAnswerHit = [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; noAnswer = $true; readAbandoned = $true; locationUnknown = $true; why = "the leg spec $($g.path) did not answer within $([Math]::Round([Math]::Max(0.0, $specBound), 2)) s of the guard's budget, so its bytes cannot be compared with the ones the export budget judged; no leg runs on it" }
             if ($legPlanMode) {
                 # r20 (hosted CI on 41f4ffd9, test_r12_a2b_a_leg_spec_the_leg_would_throw_on_after_the_wait_is_refused_before_the_lease): master's typed refusals come FIRST, so a spec
                 # changed in the wait into one the leg would throw on is LEG_SPEC_INVALID (or BAD_BACKEND) as on master; only a spec that is still runnable but is not the judged bytes
                 # is SPEC_CHANGED_AFTER_PREFLIGHT. Both come from ONE bounded read (Get-LegSpecRefusal answers '' with the sha256 of the bytes it judged), so no second read can differ.
-                $sr = @(Get-LegSpecRefusal $g.path $g.backend $specBound)
+                $sr = @(Get-LegSpecRefusal $g.path $g.backend $specBound -Clock $specClock -EndSec $specEndSec)
                 if ([string]$sr[0] -ceq 'SPEC_READ_TIMEOUT') { return $noAnswerHit }
                 if ($sr[0]) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = [string]$sr[0]; why = [string]$sr[1] } }
                 if ($g.specSha256 -and [string]$sr[2] -cne [string]$g.specSha256) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SPEC_CHANGED_AFTER_PREFLIGHT'; why = "the leg spec $($g.path) changed after the export budget preflight judged it (sha256 $($sr[2]), judged $($g.specSha256)); no lease is spent on bytes the budget did not judge" } }
             } elseif ($g.specSha256) {
-                $specRead = Read-SpecBytesWithin $g.path $specBound
+                $specRead = Read-SpecBytesWithin $g.path $specBound -Clock $specClock -EndSec $specEndSec
                 if ($specRead.state -ceq 'TIMEOUT') { return $noAnswerHit }
                 if ($specRead.state -cne 'OK') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SPEC_READ_FAILED'; why = "the leg spec $($g.path) could not be read again after the preflight ($($specRead.error -replace '\s+', ' ')), so its bytes cannot be compared with the ones the export budget judged; no leg runs on it" } }
                 $nowSha = Get-BytesSha256 $specRead.bytes
@@ -1589,7 +1601,9 @@ function Get-SpecReadBoundSec {
 # Get-InputUnresolvedCodeWithin judge the ARRIVAL inline ($deadline a [datetime] with less than 2.0 s left: no answer). Inline on purpose (pass 1 A1 on ebfde5a3): the guard worker
 # ($script:GuardWorkerFunctions) and the AST-lifting harnesses hand over a fixed list of functions, so a helper of its own was a missing command there.
 
-function Read-SpecBytesWithin([string]$Path, [double]$BoundSec, [int]$DelayMs = 0) {
+function Read-SpecBytesWithin([string]$Path, [double]$BoundSec, [int]$DelayMs = 0, [Diagnostics.Stopwatch]$Clock = $null, [double]$EndSec = 0) {
+    # BATCH-3 r8 pass 3 (adversary A5 on eee05a6b): -Clock/-EndSec, the caller's own budget end on its own clock (the guard's), as Get-VenueStagedBuildManifest takes it: the
+    # allowance is cut to what is left of it, read AFTER this call's own anchor, so a pause between the caller's remainder sample and this read never restores that time
     # r19 (sol r18 B2): a leg spec's bytes read on a pool thread and given up on after $BoundSec, so a share that stopped answering cannot hold the caller past -DeadlineUtc (a
     # synchronous ReadAllBytes could, before any remaining-room check ran). state OK (bytes), FAILED (error: the read threw) or TIMEOUT (no answer in the bound, or no bound left).
     # $DelayMs is the offline -ExportBudgetSpecReadDelaySec seam (0 in production).
@@ -1674,6 +1688,7 @@ public static class VenueLeaseBatchBoundedReadR4 {
     # last step before the read starts, so a caller descheduled after sampling never waits on its old allowance
     $dlR = Get-Variable -Name deadline -ValueOnly -ErrorAction Ignore
     if ($dlR -is [datetime]) { $ms = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min([double]$ms, (($dlR - [DateTime]::UtcNow).TotalSeconds - 2.0) * 1000.0))) }
+    if ($null -ne $Clock) { $ms = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min([double]$ms, ([double]$EndSec - $Clock.Elapsed.TotalSeconds) * 1000.0))) }   # r8 pass 3 (A5): the caller's own end
     # b2 r2 (adversary pass 3 A3 on 372d1bfd): the allowance above is turned into ONE absolute end here (the room before -DeadlineUtc less the reserve is read again, now), and
     # the read and its wait end at it (ReadUntil), so a pause after any sample costs no wait past the deadline's reserve. A type an older copy of this script loaded in this
     # process (no ReadUntil) is no answer: TIMEOUT, never an unbounded read.
@@ -1718,7 +1733,8 @@ function Get-BytesSha256([byte[]]$Bytes) {
     try { ([BitConverter]::ToString($h.ComputeHash($Bytes)) -replace '-', '').ToLowerInvariant() } finally { $h.Dispose() }
 }
 
-function Get-LegSpecRefusal([string]$Path, [string]$Backend, [double]$BoundSec = -1) {
+function Get-LegSpecRefusal([string]$Path, [string]$Backend, [double]$BoundSec = -1, [Diagnostics.Stopwatch]$Clock = $null, [double]$EndSec = 0) {
+    # BATCH-3 r8 pass 3 (adversary A5 sibling :1733 on eee05a6b): -Clock/-EndSec, the guard's own budget end, forwarded to the bounded read
     # sol r3 A4: the refusal Invoke-VenueLeg would throw (DVE_LEG_SPEC_INVALID) AFTER the lease is open, found before it. '' when the leg can take this backend.
     # Same reads as Invoke-VenueLeg: the file's bytes as UTF-8, ConvertFrom-Json, the schema, then the backend against the spec's own list.
     # sol r3 second pass A1: then the spec fields Invoke-VenueLeg casts or validates BEFORE its terminal try (playSeconds, visualCapture and its opt-out reason,
@@ -1730,7 +1746,7 @@ function Get-LegSpecRefusal([string]$Path, [string]$Backend, [double]$BoundSec =
     # r19 (sol r18 B2 sibling :1340): the read is bounded (Read-SpecBytesWithin), by what is left before -DeadlineUtc or by the caller's guard budget; no answer in it is the typed
     # SPEC_READ_TIMEOUT, never a read that holds the batch past its deadline. A read that threw stays what it was (not a JSON object).
     # r20: the read's result is $specRead, never $rd (rd is the rmdir alias the owner-footage route census refuses as a delete primitive, test_dual_venue_owner_footage_gate.py)
-    $specRead = Read-SpecBytesWithin $Path $(if ($BoundSec -ge 0) { $BoundSec } else { Get-SpecReadBoundSec })
+    $specRead = Read-SpecBytesWithin $Path $(if ($BoundSec -ge 0) { $BoundSec } else { Get-SpecReadBoundSec }) -Clock $Clock -EndSec $EndSec
     if ($specRead.state -ceq 'TIMEOUT') { return 'SPEC_READ_TIMEOUT', "'$Path' cannot be run: the leg spec could not be read within the time left before -DeadlineUtc (or the guard's budget); no claim or lease is taken on it" }
     $spec = $(if ($specRead.state -ceq 'OK') { try { [Text.Encoding]::UTF8.GetString($specRead.bytes) | ConvertFrom-Json -NoEnumerate } catch { $null } } else { $null })
     if ($null -eq $spec -or $spec -isnot [System.Management.Automation.PSCustomObject]) { return 'LEG_SPEC_INVALID', "'$Path' is not a JSON object" }
@@ -2126,9 +2142,21 @@ function Write-LegSpecRefusalLine([object]$Refusal) {
     # r8 pass 2 (adversary A1 on 61244e31): the stdout line goes FIRST, before any log step: an append that stalls, or a stderr that is full, held the line behind it. The log
     # append comes after, best effort, and what it would echo on stdout is dropped (the line is already there once).
     if ($null -eq $Refusal) { return }
-    $msg = "$($Refusal.line) (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)"
-    try { [Console]::Out.WriteLine("$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $msg"); [Console]::Out.Flush() } catch { $null = $_ }
+    $msg = Write-LegSpecRefusalStdout $Refusal
     $null = @(try { LogBest $msg } catch { $null = $_ })
+}
+
+$script:refusalStdoutSaid = $null
+function Write-LegSpecRefusalStdout([object]$Refusal) {
+    # r8 pass 3 (adversary A3 on eee05a6b): the stdout half alone, called right after the leg child returns, BEFORE the transcript's guard and write (a -RunDir that stops
+    # answering held them, and with them the line). Said once per refusal: a later call for the same line (the branch's log step, the BATCH_ERROR catch) skips stdout.
+    # Returns the message, for the log step.
+    $msg = "$($Refusal.line) (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)"
+    if ($script:refusalStdoutSaid -cne [string]$Refusal.line) {
+        $script:refusalStdoutSaid = [string]$Refusal.line
+        try { [Console]::Out.WriteLine("$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $msg"); [Console]::Out.Flush() } catch { $null = $_ }
+    }
+    $msg
 }
 
 function Format-Mean($m) { if ($null -eq $m) { 'UNKNOWN' } else { '{0:0.0}' -f $m } }
@@ -3300,6 +3328,12 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $text =[string]$lp.stdout + [string]$lp.stderr   # r7: read from the child, never back from the file, whose write the guard may refuse
                 # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A4 sibling :2963): evidence only; a write that throws is said on stderr and never replaces the leg's classification
                 $legCode = $lp.exit   # b2 r1 (pass 8 A7): the child's own return is read FIRST, before any evidence write
+                # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r5 (sol r4 B2): a child that wrote no receipt may have refused its spec on its own typed STDOUT record; read here, from the
+                # child's captured stdout, for BOTH exit branches below (timed out at the lease's end, or exited non-zero), and carried in the persisted row (Add-LegSpecRefusal)
+                # (r5 adversary pass 6 A5: the receipt gate is the helper's own, on stdout only; $receipt below is read from stdout AND stderr)
+                # r8 pass 3 (adversary A3 on eee05a6b): read, and said on stdout, BEFORE the transcript's guard and write below, which can stall on -RunDir
+                $legSpecRefusal = Get-BatchLegSpecRefusal ([string]$lp.stdout) $leg
+                if ($legSpecRefusal) { $null = Write-LegSpecRefusalStdout $legSpecRefusal }
                 # b2 r1 (pass 8 A7; pass 2 A5 on bf5ebeb2): the .out.txt is evidence only and is written on VenueChain's bounded read (a worker given up on after 2 s, counted as every
                 # abandoned read is), so a -RunDir share that stalls the write holds neither the classification nor the cleanup
                 # b2 r2 (adversary pass 3 A6 on 372d1bfd): the worker never writes THROUGH the name the guard asked about (a hard link or a file made there after the guard, during the
@@ -3327,10 +3361,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $dl = $legLines | Where-Object { $_ -match '^DVE_DETAIL=' } | Select-Object -Last 1
                 $detail = $(if ($dl) { ($dl -replace '^DVE_DETAIL=', '').Trim() } else { '' })
                 $legJobId = @(Get-VenueRemoteJobIds -Text $text | Where-Object { $_ -and $_ -cnotmatch '-health$' }) | Select-Object -Last 1
-                # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r5 (sol r4 B2): a child that wrote no receipt may have refused its spec on its own typed STDOUT record; read here, from the
-                # child's captured stdout, for BOTH exit branches below (timed out at the lease's end, or exited non-zero), and carried in the persisted row (Add-LegSpecRefusal)
-                # (r5 adversary pass 6 A5: the receipt gate is the helper's own, on stdout only; $receipt above is read from stdout AND stderr)
-                $legSpecRefusal = Get-BatchLegSpecRefusal ([string]$lp.stdout) $leg
+                # ($legSpecRefusal was read, and said on stdout, right after the child returned: r5 sol r4 B2, r8 pass 3 A3)
                 if ($lp.timedOut) {
                     # Still running at the lease's end: killed with its tree. Never counted and never re-run (a leg that outlives a whole lease is not retried lease
                     # after lease). Its agent job is asked to cancel too, in case the agent's own bound has not stopped it yet. The batch ends: its lease is over.

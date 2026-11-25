@@ -2067,6 +2067,10 @@ function Invoke-VenueBoundedProcess {
     # clock's start (which used to carry it) cannot move the deadline's monotonic end later
     $dlClock = [Diagnostics.Stopwatch]::StartNew()
     $dlMonoMs = $(if ($null -ne $dlUtc) { [double]($dlUtc - [DateTime]::UtcNow).TotalMilliseconds } else { 0.0 })
+    # BATCH-3 r8 pass 3 (adversary A4 on eee05a6b): that fresh sample IS the last clock read before the start, so the floor is asked of it too: a caller descheduled after the
+    # check above, with less room than -MinRoomSec (or none) now, starts nothing
+    if ($null -ne $dlUtc -and $dlMonoMs -lt [Math]::Max(0.001, [double]$MinRoomSec * 1000.0)) { return [pscustomobject]@{ exit = $null; timedOut = $true; notStarted = $true; lateStart = $false; lateExit = $false; killConfirmed = $true; killAttempted = $false; killErrored = $false; stdout = ''; stderr = '' } }
+    if ($null -ne $snaUtc -and [DateTime]::UtcNow -ge $snaUtc) { return [pscustomobject]@{ exit = $null; timedOut = $true; notStarted = $true; lateStart = $false; lateExit = $false; killConfirmed = $true; killAttempted = $false; killErrored = $false; stdout = ''; stderr = '' } }
     $runClock = [Diagnostics.Stopwatch]::StartNew()
     $p = [Diagnostics.Process]::Start($psi)
     $p.StandardInput.Close()
@@ -2133,8 +2137,11 @@ function Format-VenueBoundedChildEnd {
     $what = $(if ($Run.lateStart) { 'started after its room ended' } else { "did not answer in $BoundSec s" })
     if ($Run.killErrored) { return "$what and the kill failed (not confirmed)" }
     if (-not $Run.killAttempted) {
-        if ($Run.lateExit) { return "exited on its own after its $BoundSec s bound (late; no kill was needed)" }
-        return "$what, then exited on its own before the kill (no kill was needed)"
+        # BATCH-3 r8 pass 3 (adversary A6 on eee05a6b): a root that exited on its own says nothing of its tree; an unconfirmed tree (killConfirmed false: off Windows, a
+        # descendant reparented out of reach) is said, never covered by "no kill was needed"
+        $treeNote = $(if ($Run.killConfirmed) { '' } else { '; its process tree is UNCONFIRMED: a descendant may still be running' })
+        if ($Run.lateExit) { return "exited on its own after its $BoundSec s bound (late; no kill was needed)$treeNote" }
+        return "$what, then exited on its own before the kill (no kill was needed)$treeNote"
     }
     "$what and was killed$(if ($Run.lateStart) { ' at once' }) ($(if ($Run.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))"
 }

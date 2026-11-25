@@ -11122,7 +11122,9 @@ class PlannedHashBindB3R8BoundedWaitTests(unittest.TestCase):
         # first SEEN after the retry request's wait is released and never used, however early it was decided; A5, a read fault seen past the end is TIMEOUT, never FAILED
         text = RUNNER.read_text(encoding="utf-8")
         fn = text[text.index("function Write-LegSpecRefusalLine"):text.index("function Format-Mean")]
-        self.assertLess(fn.index("[Console]::Out.WriteLine("), fn.index("LogBest $msg"), "stdout first")
+        line_fn = fn[:fn.index("function Write-LegSpecRefusalStdout")]
+        self.assertLess(line_fn.index("Write-LegSpecRefusalStdout $Refusal"), line_fn.index("LogBest $msg"), "stdout first")
+        self.assertIn("[Console]::Out.WriteLine(", fn[fn.index("function Write-LegSpecRefusalStdout"):])
         self.assertIn("$null = @(try { LogBest $msg }", fn, "the log's own stdout echo is dropped: the line is said once")
         req = text[text.index("function Invoke-ClaimRetryRequest"):text.index("\nfunction ", text.index("function Invoke-ClaimRetryRequest") + 1)]
         self.assertIn("$seenLate = [Diagnostics.Stopwatch]::GetTimestamp() -gt $reqEndTs -or [DateTime]::UtcNow -gt $reqEndUtc", req)
@@ -11130,6 +11132,44 @@ class PlannedHashBindB3R8BoundedWaitTests(unittest.TestCase):
         self.assertLess(req.index("$state.late = $true"), req.index("if ($state.late) {"))
         src = _b3r8_type_source("VenueLeaseBatchBoundedReadR4")
         self.assertIn("if (e.InnerException is TimeoutException || Past(endUtcTicks, monoEnd)) { return 2; }", src)
+
+    def test_planned_hash_bind_b3_r8_p3_a6_an_unconfirmed_tree_is_never_covered_by_no_kill_was_needed(self) -> None:
+        # r8 pass 3 (adversary A6 on eee05a6b, json input): a timed-out root that exited on its own with killConfirmed false (off Windows, a reparented descendant) was
+        # formatted "no kill was needed" and nothing more (old); the unconfirmed tree is now said. The kc=true texts are unchanged (test_dual_venue_evidence pins them).
+        rec = "([pscustomobject]@{{ timedOut = $true; lateStart = $false; lateExit = {le}; killAttempted = $false; killErrored = $false; killConfirmed = {kc} }})"
+        script = (f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
+                  + "".join(f"\"P3A6 {n} \" + (Format-VenueBoundedChildEnd -Run {rec.format(le=le, kc=kc)} -BoundSec 60)\n"
+                            for n, le, kc in (("early-unconf", "$false", "$false"), ("late-unconf", "$true", "$false"), ("early-conf", "$false", "$true"))))
+        got = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        lines = {l.split()[1]: l.split(" ", 2)[2] for l in got.stdout.splitlines() if l.startswith("P3A6 ")}
+        self.assertEqual(set(lines), {"early-unconf", "late-unconf", "early-conf"}, got.stdout + got.stderr)
+        for n in ("early-unconf", "late-unconf"):
+            self.assertIn("its process tree is UNCONFIRMED", lines[n], f"an unconfirmed tree read as settled (old: no note): {lines[n]}")
+        self.assertEqual(lines["early-conf"], "did not answer in 60 s, then exited on its own before the kill (no kill was needed)")
+
+    def test_planned_hash_bind_b3_r8_p3_a1_to_a5_pins(self) -> None:
+        # r8 pass 3 (adversary A1-A5 on eee05a6b):
+        # A1 the claim worker makes no request once the wait's end has passed (a worker scheduled late never asks the broker);
+        # A2 ANY answer first seen after the wait is not acted on (only a grant needed a release; a refusal or a broken list seen late decides nothing);
+        # A3 the refusal reaches stdout as soon as the leg's stdout is read, before the transcript guard (Test-RunDirWrite) and the transcript worker can hold it;
+        # A4 Invoke-VenueBoundedProcess asks the -MinRoomSec floor of its LAST clock sample, right before the start;
+        # A5 the guard's spec reads are cut to the guard budget's own end on its own clock, not only to a remainder sampled before the call.
+        text = RUNNER.read_text(encoding="utf-8")
+        worker = text[text.index("$script:ClaimRetryRequestWorker = {"):]
+        self.assertLess(worker.index("[Diagnostics.Stopwatch]::GetTimestamp() -ge [long]$A.waitEndTs) { $r = [pscustomobject]@{ granted = $false; state = 'REQUEST_NO_ROOM'"),
+                        worker.index("Request-VenueClaim"), "A1: the request is skipped once its wait has ended")
+        req = text[text.index("function Invoke-ClaimRetryRequest"):text.index("\nfunction ", text.index("function Invoke-ClaimRetryRequest") + 1)]
+        self.assertIn("the claim request answered only after its", req, "A2")
+        leg = text[text.index("$legCode = $lp.exit"):]
+        self.assertLess(leg.index("if ($legSpecRefusal) { $null = Write-LegSpecRefusalStdout $legSpecRefusal }"), leg.index("if (Test-RunDirWrite $out)"), "A3")
+        mod = MODULE.read_text(encoding="utf-8")
+        floor = "if ($null -ne $dlUtc -and $dlMonoMs -lt [Math]::Max(0.001, [double]$MinRoomSec * 1000.0))"
+        self.assertLess(mod.index("$dlMonoMs = $(if ($null -ne $dlUtc)"), mod.index(floor), "A4")
+        self.assertLess(mod.index(floor), mod.index("$runClock = [Diagnostics.Stopwatch]::StartNew()"), "A4: asked before the start")
+        rs = text[text.index("function Read-SpecBytesWithin"):text.index("\nfunction ", text.index("function Read-SpecBytesWithin") + 1)]
+        self.assertLess(rs.index("([double]$EndSec - $Clock.Elapsed.TotalSeconds)"), rs.index("$readMonoEnd = $readT0"), "A5")
+        self.assertIn("Get-LegSpecRefusal $g.path $g.backend $specBound -Clock $specClock -EndSec $specEndSec", text)
+        self.assertIn("Read-SpecBytesWithin $g.path $specBound -Clock $specClock -EndSec $specEndSec", text)
 
 
 @unittest.skipIf(PWSH is None or sys.platform == "win32", "needs pwsh off Windows (POSIX reparenting)")
