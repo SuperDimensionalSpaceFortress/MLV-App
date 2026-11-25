@@ -2078,7 +2078,8 @@ class CompareMachinePerfHostLoadWiringTests(unittest.TestCase):
         source = COMPARE_MACHINE_PERF_SCRIPT.read_text(encoding="utf-8")
         self.assertIn("rerun_playback_ab_with_quiet_host", source)
         refusal_check = source.index("(Get-PlaybackAbHostLoadRefusal -Record $playbackAb).provisional")
-        trusts_embedded_analysis = source.index("$playbackAb.analysis -and $playbackAb.analysis.suggestedOptimization")
+        # BENCH-LIGHT-ARM-GAIN-GATES-1 r15 (adversary r14 pass 18 A7): the cached analysis is trusted only through Test-FpsCachedAnalysisBound (bound to the gated pair); still after the refusal
+        trusts_embedded_analysis = source.index("(Test-FpsCachedAnalysisBound -Analysis $playbackAb.analysis")
         self.assertLess(
             refusal_check, trusts_embedded_analysis,
             "the host-load refusal must be checked before trusting the record's own cached analysis",
