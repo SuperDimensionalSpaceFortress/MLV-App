@@ -77,6 +77,16 @@ public:
         ++m_presented;
     }
 
+    /*! PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1 (sol r9 B1 + B2): the engine CORRECTED the timeline's position to \a frame (a
+     *  stale drop-frame start folded into the Loop cut, or clamped onto the cut's last frame) before the presentation that comes
+     *  next. That move is not playback: the baseline resets to \a frame, and the next presentation credits only its travel from
+     *  there. Before the first presentation there is no baseline to move, and nothing happens. */
+    void noteRebase( int frame )
+    {
+        (void)frame;   // RED stub
+    }
+    uint64_t rebases() const { return m_rebases; }
+
     uint64_t presented() const { return m_presented; }
     int64_t advancedFrames() const { return m_advanced; }
     /*! HFR-NATIVE-60FPS-FULLRES-1 r29 (adversary A2 on cf403dba): the first and the last frame credited, -1 before any. The
@@ -107,6 +117,8 @@ private:
     uint64_t m_wraps = 0;
     uint64_t m_backward = 0;
     uint64_t m_repeats = 0;
+    uint64_t m_rebases = 0;
+    bool m_rebasePending = false;
     int m_lastFrame = 0;
     int m_firstFrame = 0;
     double m_firstTime = 0.0;
@@ -136,6 +148,15 @@ public:
     void noteSubmitted( uint64_t serial, int frame, int wrapsCrossed, int64_t wrapsCrossedWidth,
                         PlaybackSourceAdvanceTracker &tracker )
     {
+        noteSubmitted( serial, frame, wrapsCrossed, wrapsCrossedWidth, false, 0, tracker );
+    }
+
+    /*! PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: the same, where \a rebase says the engine corrected the position to
+     *  \a rebaseFrame before this frame (playback_frame_range::paintCreditHandOff); the credit rebases the tracker there first. */
+    void noteSubmitted( uint64_t serial, int frame, int wrapsCrossed, int64_t wrapsCrossedWidth, bool rebase, int rebaseFrame,
+                        PlaybackSourceAdvanceTracker &tracker )
+    {
+        (void)rebase; (void)rebaseFrame;   // RED stub
         if( m_waiting ) supersede();
         m_frame = frame;
         m_wraps = wrapsCrossed + m_carriedWraps;

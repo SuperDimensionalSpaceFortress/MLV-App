@@ -4892,3 +4892,69 @@ TEST( PlaybackMeasuredLoopExit, R9TheAdmissionJudgesThePlayedCutRangeAndTheStart
     ASSERT_EQ( 2, outsideFirst.outside );                              // RED on eaa5c9e0: 1
     ASSERT_EQ( 0, outsideFirst.repeats );
 }
+
+// PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: the engine records a position correction beside its wraps, but a correction is not a
+// replay: replayCount() and wrapped() never read it.
+TEST( PlaybackFrameRange, R1AnEngineCorrectionIsRecordedButIsNotAReplay )
+{
+    playback_frame_range::PlaybackWrapRecorder recorder;
+    recorder.noteEngineCorrection( 22 );
+    ASSERT_EQ( 1, recorder.engineCorrections );                         // 4279b9ee stub: 0
+    ASSERT_EQ( 1, static_cast<int>( recorder.engineCorrectionRecords.size() ) );
+    ASSERT_EQ( 22, recorder.engineCorrectionRecords[0].rebaseFrame );
+    ASSERT_EQ( 0, recorder.engineCorrectionRecords[0].wrapsBefore );
+    ASSERT_EQ( 0, recorder.replayCount() );
+    ASSERT_FALSE( recorder.wrapped() );
+    recorder.noteEngineWrap( 49, 2 );
+    recorder.noteEngineCorrection( 2 );
+    ASSERT_EQ( 2, recorder.engineCorrections );
+    ASSERT_EQ( 2, recorder.engineCorrectionRecords[1].wrapsBefore );   // wraps 0 and 1 came before it
+    ASSERT_EQ( 2, recorder.replayCount() );                             // the two laps only
+}
+
+// r1: the correction count is stamped and consumed like the wrap count (presentationLoopWraps is a generic counter). A frame requested
+// before the correction and presented after it does not take it; the landing requested after it does, once.
+TEST( PlaybackFrameRange, R1ACorrectionBelongsToTheLandingRequestedAfterIt )
+{
+    playback_frame_range::PlaybackWrapRecorder recorder;
+    int consumed = 0;
+    const int stampBefore = recorder.engineCorrections;                 // 0: in flight before the correction
+    recorder.noteEngineCorrection( 40 );
+    const int stampAfter = recorder.engineCorrections;
+    ASSERT_EQ( 1, stampAfter );
+    ASSERT_EQ( 0, presentationLoopWraps( recorder.engineCorrections, stampBefore, consumed, true ) );
+    ASSERT_EQ( 1, presentationLoopWraps( recorder.engineCorrections, stampAfter, consumed, true ) );
+    ASSERT_EQ( 0, presentationLoopWraps( recorder.engineCorrections, stampAfter, consumed, true ) );
+    // the hand-off of that landing rebases to 40 and keeps only the wraps made after the correction
+    recorder.noteEngineWrap( 9, 1 );                                    // a lap before a second correction
+    recorder.noteEngineCorrection( 2 );
+    recorder.noteEngineWrap( 49, 1 );                                   // a lap after it
+    const playback_frame_range::PaintCreditHandOff handOff = playback_frame_range::paintCreditHandOff( recorder, 0, 2, 1, 1 );
+    ASSERT_TRUE( handOff.rebase );                                      // stub: false
+    ASSERT_EQ( 2, handOff.rebaseFrame );
+    ASSERT_EQ( 49LL, (long long)handOff.wrapsWidth );                   // stub: 58
+    // two corrections crossed: the last one wins
+    const playback_frame_range::PaintCreditHandOff both = playback_frame_range::paintCreditHandOff( recorder, 0, 2, 0, 2 );
+    ASSERT_EQ( 2, both.rebaseFrame );
+    ASSERT_EQ( 49LL, (long long)both.wrapsWidth );
+    // none crossed: no rebase, every crossed wrap's width
+    const playback_frame_range::PaintCreditHandOff none = playback_frame_range::paintCreditHandOff( recorder, 0, 2, 2, 0 );
+    ASSERT_FALSE( none.rebase );
+    ASSERT_EQ( 58LL, (long long)none.wrapsWidth );
+}
+
+// r1 (pass 17 A2 control): the source-frame counter is fed the CORRECTED start. Cut 41..1000, Loop, armed at 10, a 1.2-frame tick:
+// the start folds to 40, the counter rebases its high-water mark there and counts the real step 40 -> 41.2 (one frame), never 30.
+TEST( PlaybackFrameRange, R1TheSourceFrameCounterRebasesAtTheCorrectedStart )
+{
+    const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick( 10.0, 1.2, 41, 1000, true );
+    ASSERT_TRUE( tick.corrected );                                      // 4279b9ee: false
+    ASSERT_TRUE( tick.correctedStart == 40.0 );
+    playback_frame_range::SourceFrameAdvanceCounter counter;
+    counter.begin( 10 );
+    counter.noteEngineTick( tick.correctedStart, tick.position, tick.wrapped );
+    ASSERT_EQ( 41LL, (long long)counter.highWater );
+    ASSERT_EQ( 1LL, (long long)counter.forwardSteps );
+    ASSERT_EQ( 1, counter.externalJumpRebases );
+    ASSERT_EQ( 2LL, (long long)counter.consumed() );
+}

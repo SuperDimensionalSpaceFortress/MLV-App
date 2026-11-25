@@ -63,7 +63,8 @@ TEST(PlaybackSourceAdvanceWiring, TheTrackerReadsTheFramesOwnStampNotAnEngineRec
     ASSERT_TRUE(call >= 0);
     ASSERT_TRUE(body.indexOf(QStringLiteral("requestContext.engineWrapsAtRequest,"), call) > call);
     // and a landing is credited the cut width each wrap had when the engine made it, not the cut range as it stands now
-    ASSERT_TRUE(body.indexOf(QStringLiteral("m_playbackWrapRecorder.engineWrapsWidth( sourceAdvanceWrapsBefore,"), call) > call);
+    // (PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: through paintCreditHandOff, which reads engineWrapsWidth from the first crossed wrap)
+    ASSERT_TRUE(body.indexOf(QStringLiteral("paintCreditHandOff( m_playbackWrapRecorder, sourceAdvanceWrapsBefore,"), call) > call);
     ASSERT_FALSE(readRepoFile(QStringLiteral("platform/qt/MainWindow.h")).contains(QStringLiteral("m_playbackEngineRequest")));
 }
 
@@ -94,4 +95,56 @@ TEST(PlaybackSourceAdvanceWiring, AnEngineWrapIsNotedBeforeTheFrameItLandsOnIsRe
     ASSERT_FALSE(body.contains(QStringLiteral("noteEngineWrap( ui->spinBoxCutOut->value()")));
     // playbackHandling only moves the target; the request and its stamp come after it, in drawFrame
     ASSERT_EQ(-1, body.indexOf(QStringLiteral("drawFrame(")));
+}
+
+// PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: a POSITION CORRECTION travels the engine -> paint-tracker seam the wraps take. The drop
+// tick records it before its own laps (so they count as travel after it), every reader of the tick's start reads the corrected
+// start, the audio resyncs on it, and the slip histogram is told of it before the tick's move.
+TEST(PlaybackSourceAdvanceWiring, R1ACorrectionIsRecordedBeforeTheTicksLapsAndEveryStartReaderReadsTheCorrectedStart)
+{
+    const QString body = functionBody(readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp")),
+                                      QStringLiteral("void MainWindow::playbackHandling(int timeDiff)"));
+    const int correction = body.indexOf(QStringLiteral(
+        "if( dropFrameTick.corrected ) m_playbackWrapRecorder.noteEngineCorrection( playback_frame_range::dropFrameCorrectionFrame( dropFrameTick.correctedStart ) );"));
+    const int dropWrap = body.indexOf(QStringLiteral("if( dropFrameTick.wrapped ) m_playbackWrapRecorder.noteEngineWrap( dropFrameTick.wrapWidth, dropFrameTick.wrapLaps );"));
+    ASSERT_TRUE(correction >= 0);
+    ASSERT_TRUE(dropWrap > correction);
+    ASSERT_EQ(1, body.count(QStringLiteral("m_playbackWrapRecorder.noteEngineCorrection(")));
+    ASSERT_TRUE(body.contains(QStringLiteral("m_sourceAdvance.noteEngineTick( dropFrameTick.correctedStart, dropFrameTick.position, dropFrameTick.wrapped );")));
+    ASSERT_TRUE(body.contains(QStringLiteral("playback_native_pace::skippedFrames(\n                            dropFrameTick.correctedStart, dropFrameTick.position );")));
+    ASSERT_FALSE(body.contains(QStringLiteral("sourcePositionBeforeDropTick")));
+    ASSERT_TRUE(body.contains(QStringLiteral("if( ( dropFrameTick.wrapped || dropFrameTick.corrected ) && ui->actionAudioOutput->isChecked() )")));
+    const int slipCorrection = body.indexOf(QStringLiteral(
+        "if( dropFrameTick.corrected ) m_playbackSlipHistogram.noteTimelineCorrection( playback_frame_range::dropFrameCorrectionFrame( dropFrameTick.correctedStart ) );"));
+    ASSERT_TRUE(slipCorrection > dropWrap);
+    ASSERT_TRUE(body.indexOf(QStringLiteral("m_playbackSlipHistogram.noteTimelineMove("), slipCorrection) > slipCorrection);
+}
+
+// r1: both stamp sites stamp the correction count beside the wrap count, and the hand-off passes the rebase to the ledger.
+TEST(PlaybackSourceAdvanceWiring, R1TheCorrectionCountIsStampedAndTheHandOffPassesTheRebase)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString draw = functionBody(source, QStringLiteral("void MainWindow::drawFrame( bool updateTimecodeLabel )"));
+    const int wrapStamp = draw.indexOf(QStringLiteral("requestContext.engineWrapsAtRequest = m_playbackWrapRecorder.engineWraps;"));
+    ASSERT_TRUE(wrapStamp >= 0);
+    ASSERT_TRUE(draw.indexOf(QStringLiteral("requestContext.engineCorrectionsAtRequest = m_playbackWrapRecorder.engineCorrections;"), wrapStamp) > wrapStamp);
+    const QString ready = functionBody(source, QStringLiteral("void MainWindow::drawFrameReady()"));
+    const int lookahead = ready.indexOf(QStringLiteral("presentationAcceptedLookaheadStamp( requestContext.engineWrapsAtRequest,"));
+    ASSERT_TRUE(lookahead >= 0);
+    const int correctionStamp = ready.indexOf(QStringLiteral("presentationAcceptedLookaheadStamp( requestContext.engineCorrectionsAtRequest,"));
+    ASSERT_TRUE(correctionStamp > lookahead);
+    ASSERT_TRUE(ready.indexOf(QStringLiteral("m_playbackWrapRecorder.engineCorrections );"), correctionStamp) > correctionStamp);
+    ASSERT_TRUE(ready.indexOf(QStringLiteral("readyFrame.presentationContext.engineCorrectionsAtRequest = requestContext.engineCorrectionsAtRequest;"), correctionStamp) > correctionStamp);
+    ASSERT_TRUE(ready.indexOf(QStringLiteral("timerFrameEvent( predictiveGpuTexNrEarlyAdvance )")) > correctionStamp);
+    const QString presented = functionBody(source, QStringLiteral("void MainWindow::notePlaybackSmokePresentedFrame("));
+    const int crossed = presented.indexOf(QStringLiteral("presentationLoopWraps( m_playbackWrapRecorder.engineCorrections,"));
+    ASSERT_TRUE(crossed >= 0);
+    ASSERT_TRUE(presented.indexOf(QStringLiteral("requestContext.engineCorrectionsAtRequest,"), crossed) > crossed);
+    const int handOff = presented.indexOf(QStringLiteral("paintCreditHandOff( m_playbackWrapRecorder, sourceAdvanceWrapsBefore,"));
+    ASSERT_TRUE(handOff > crossed);
+    ASSERT_TRUE(presented.indexOf(QStringLiteral("sourceAdvanceHandOff.rebase, sourceAdvanceHandOff.rebaseFrame,"), handOff) > handOff);
+    ASSERT_TRUE(presented.indexOf(QStringLiteral("sourceAdvanceHandOff.wrapsWidth,"), handOff) > handOff);
+    // the live count is taken at the measured Play's start, like the wraps
+    ASSERT_TRUE(source.contains(QStringLiteral("m_playbackSmokeTrackerEngineCorrections = m_playbackWrapRecorder.engineCorrections;")));
+    ASSERT_TRUE(readRepoFile(QStringLiteral("platform/qt/RenderFrameThread.h")).contains(QStringLiteral("int engineCorrectionsAtRequest = 0;")));
 }

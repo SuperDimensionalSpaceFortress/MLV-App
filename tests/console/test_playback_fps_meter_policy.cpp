@@ -613,23 +613,23 @@ TEST(PlaybackFpsMeterPolicy, AStaleLoopStartAnyDistanceOutsideTheCutIsACorrectio
     ASSERT_EQ(0, atWrap.wrapLaps);               // 4eb1cfd5: 1
     ASSERT_TRUE(std::fabs(atWrap.position - request) < 1e-12);
     ASSERT_TRUE(atWrap.foldedFrames == 49.0);
-    // A stale start BELOW the cut has no phantom lap to remove: every lap it records is one its applied delta crosses on the
-    // way up through wrapAt. r9 iteration 1 (adversary pass 17 A1 + A2 on 76e554e3) withdrew 76e554e3's forward fold onto the
-    // cut's first frame: a FORWARD correction cannot read as zero travel to the endpoint readers (the paint credit took
-    // 10 -> 40 as 30 frames played, and its wrapped flag hid a real 1.2-frame step from SourceFrameAdvanceCounter). It plays
-    // on, unfolded, as 4eb1cfd5 did: seek 0, cut 41..50 (loop range [40, 49), width 9), 0.192 frames lands on 0.192.
+    // A stale start BELOW the cut: PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1 (sol r9 B2) folds it onto the cut's first position
+    // as a POSITION CORRECTION (corrected, correctedStart), never a wrap, and the delta applies from there: seek 0, cut 41..50
+    // (loop range [40, 49), width 9), 0.192 frames lands on 40.192. r9 iteration 1 withdrew 76e554e3's version of this fold
+    // because the endpoint readers took the forward move as travel; r1 hands the correction to them as a rebase instead.
     const DropFrameTickResult below = advanceDropFrameTick(0.0, request, 41, 50, true, false);
     ASSERT_EQ(0, below.wrapLaps);
-    ASSERT_TRUE(below.foldedFrames == 0.0);      // 76e554e3: -40
-    ASSERT_TRUE(below.position == request);
-    ASSERT_TRUE(below.appliedFrames == request);
-    ASSERT_FALSE(below.wrapped);                 // 76e554e3: true
-    // ...and a delta that crosses the wrap point from below counts the one lap it crossed: 0 + 50 reaches 49 and wraps by 9
+    ASSERT_TRUE(below.foldedFrames == -40.0);    // 4279b9ee: 0
+    ASSERT_TRUE(below.position == 40.0 + request);
+    ASSERT_TRUE(below.appliedFrames == ( 40.0 + request ) - 40.0);
+    ASSERT_FALSE(below.wrapped);
+    ASSERT_TRUE(below.corrected);
+    // ...and a delta that crosses the wrap point counts the laps it crossed from the folded start: 40 + 50 = 90 wraps 5 x 9 to 45
     const DropFrameTickResult belowWide = advanceDropFrameTick(0.0, 50.0, 41, 50, true, false);
-    ASSERT_EQ(1, belowWide.wrapLaps);
-    ASSERT_TRUE(belowWide.position == 41.0);
+    ASSERT_EQ(5, belowWide.wrapLaps);            // 4279b9ee: 1 (laps counted from the stale 0)
+    ASSERT_TRUE(belowWide.position == 45.0);
     ASSERT_TRUE(belowWide.appliedFrames == 50.0);
-    ASSERT_TRUE(belowWide.foldedFrames == 0.0);
+    ASSERT_TRUE(belowWide.foldedFrames == -40.0);
     // laps the applied delta crosses from an in-cut start ARE travel, unchanged: 48.9 + 0.192 wraps once, and r7's whole
     // laps that land back on the start (0 + 999990 on cut 1..616: 1626 laps, 0 -> 0) still count every lap
     const DropFrameTickResult inCut = advanceDropFrameTick(48.9, request, 1, 50, true, false);
@@ -645,6 +645,81 @@ TEST(PlaybackFpsMeterPolicy, AStaleLoopStartAnyDistanceOutsideTheCutIsACorrectio
     ASSERT_TRUE(advanceDropFrameTick(0.0, request, 41, 50, false, false).foldedFrames == 0.0);
 }
 
+// PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1 (sol r9 B2 on 4279b9ee): Loop and Drop Frame on, cut 41..50, the playhead still at 0
+// after Cut In moved, an 8 ms tick at 24 fps (0.192 frames). 4279b9ee returned 0.192 with foldedFrames 0 and left the slider at
+// frame 0, below the cut. The start is folded onto the cut's first position 40 first (a forward correction, no phase kept), and
+// the delta applies from there.
+TEST(PlaybackFpsMeterPolicy, R1AStaleStartBelowTheCutIsFoldedOntoTheCutsFirstPositionAsACorrection)
+{
+    using playback_frame_range::advanceDropFrameTick;
+    using playback_frame_range::DropFrameTickResult;
+    const double request = playback_fps_meter::dropFrameRequestFrames(24.0, 8);
+    ASSERT_TRUE(std::fabs(request - 0.192) < 1e-12);
+    const DropFrameTickResult b2 = advanceDropFrameTick(0.0, request, 41, 50, true, false);
+    ASSERT_TRUE(b2.position >= 40.0 && b2.position < 49.0);   // 4279b9ee: 0.192
+    ASSERT_TRUE(b2.position == 40.0 + request);
+    ASSERT_TRUE(b2.foldedFrames == -40.0);
+    ASSERT_TRUE(b2.corrected);                               // 4279b9ee: false
+    ASSERT_TRUE(b2.correctedStart == 40.0);
+    ASSERT_FALSE(b2.wrapped);
+    ASSERT_EQ(0, b2.wrapLaps);
+    ASSERT_EQ(0, b2.wrapWidth);
+    ASSERT_TRUE(b2.appliedFrames == ( 40.0 + request ) - 40.0);
+    // a zero grant lands on the first position and applies nothing
+    const DropFrameTickResult zero = advanceDropFrameTick(0.0, 0.0, 41, 50, true, false);
+    ASSERT_TRUE(zero.position == 40.0);
+    ASSERT_TRUE(zero.appliedFrames == 0.0);
+    ASSERT_TRUE(zero.corrected);
+    // conform (presentLastFrame): the cut's first position is still 40 (wrapAt 50, width 10)
+    const DropFrameTickResult conformed = advanceDropFrameTick(0.0, 0.0, 41, 50, true, true);
+    ASSERT_TRUE(conformed.position == 40.0);
+    ASSERT_TRUE(conformed.corrected);
+    ASSERT_TRUE(conformed.foldedFrames == -40.0);
+    // a delta past the wrap point counts its laps from the folded start: 40 + 50 = 90, five 9-frame laps to 45
+    const DropFrameTickResult wide = advanceDropFrameTick(0.0, 50.0, 41, 50, true, false);
+    ASSERT_EQ(5, wide.wrapLaps);
+    ASSERT_TRUE(wide.wrapped);
+    ASSERT_TRUE(wide.appliedFrames == 50.0);
+    ASSERT_TRUE(wide.correctedStart == 40.0);
+    // a -inf start folds to the first position; a NaN start is not folded and is not a correction
+    const DropFrameTickResult negInf = advanceDropFrameTick(-HUGE_VAL, 0.0, 41, 50, true, false);
+    ASSERT_TRUE(negInf.position == 40.0);
+    ASSERT_TRUE(negInf.corrected);
+    const DropFrameTickResult nan = advanceDropFrameTick(std::nan(""), 0.192, 41, 50, true, false);
+    ASSERT_FALSE(nan.corrected);
+    ASSERT_TRUE(nan.foldedFrames == 0.0);
+}
+
+// r1: the r9 above-cut fold and the r8 non-Loop clamp are corrections too, reporting the start the delta applied from; an in-cut
+// start, a Loop-off start below the cut and a NaN start are not.
+TEST(PlaybackFpsMeterPolicy, R1EveryPositionCorrectionReportsTheStartTheDeltaAppliedFrom)
+{
+    using playback_frame_range::advanceDropFrameTick;
+    using playback_frame_range::DropFrameTickResult;
+    const DropFrameTickResult above = advanceDropFrameTick(120.0, 0.0, 1, 50, true, false);
+    ASSERT_TRUE(above.corrected);                      // 4279b9ee: false
+    ASSERT_TRUE(above.correctedStart == 22.0);
+    ASSERT_EQ(0, above.wrapLaps);
+    ASSERT_TRUE(above.position == 22.0);
+    const DropFrameTickResult clamp = advanceDropFrameTick(100.0, 0.0, 1, 50, false, false);
+    ASSERT_TRUE(clamp.corrected);                      // 4279b9ee: false
+    ASSERT_TRUE(clamp.correctedStart == 49.0);
+    ASSERT_TRUE(clamp.appliedFrames == 0.0);
+    const DropFrameTickResult inCut = advanceDropFrameTick(10.0, 0.192, 1, 50, true, false);
+    ASSERT_FALSE(inCut.corrected);
+    ASSERT_TRUE(inCut.correctedStart == 10.0);
+    const DropFrameTickResult loopOffBelow = advanceDropFrameTick(0.0, 0.192, 41, 50, false, false);
+    ASSERT_FALSE(loopOffBelow.corrected);
+    ASSERT_TRUE(loopOffBelow.correctedStart == 0.0);
+    ASSERT_FALSE(advanceDropFrameTick(std::nan(""), 0.192, 1, 50, true, false).corrected);
+    // the frame each correction rebases the paint tracker to
+    ASSERT_EQ(22, playback_frame_range::dropFrameCorrectionFrame(above.correctedStart));
+    ASSERT_EQ(49, playback_frame_range::dropFrameCorrectionFrame(clamp.correctedStart));
+    ASSERT_EQ(40, playback_frame_range::dropFrameCorrectionFrame(40.0));
+    ASSERT_EQ(0, playback_frame_range::dropFrameCorrectionFrame(std::nan("")));
+    ASSERT_EQ(INT_MAX, playback_frame_range::dropFrameCorrectionFrame(HUGE_VAL));
+}
+
 // r9 iteration 1 (adversary pass 17 A1 on 76e554e3, introduced blocker): a measured Play on a 1,000-frame 24 fps clip, Loop
 // and Drop Frame on, conform off, frame 10 painted with slider and drop position 10; Cut In moves to 41 (Cut Out 1000). The
 // next eligible tick grants 0, 0.192 or 1.2 frames. 76e554e3 folded 10 forward onto 40 with no lap, so frame 40 was painted
@@ -657,18 +732,28 @@ TEST(PlaybackFpsMeterPolicy, AStaleStartBelowTheCutIsNeverCreditedAsTravelledFra
     using playback_frame_range::PlaybackWrapRecorder;
     const double grants[] = { 0.0, playback_fps_meter::dropFrameRequestFrames(24.0, 8), 1.2 };
     const long long expected[] = { 0, 0, 1 };
+    // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: the start IS folded onto 40 now (sol r9 B2), and the fold reaches the paint
+    // tracker as a rebase (MainWindow's route: noteEngineCorrection, the request stamp, paintCreditHandOff, the ledger), so the
+    // paint still books only the travel.
     for (int i = 0; i < 3; ++i)
     {
         const DropFrameTickResult tick = advanceDropFrameTick(10.0, grants[i], 41, 1000, true, false);
+        ASSERT_TRUE(tick.corrected);
         PlaybackWrapRecorder recorder;
+        if( tick.corrected ) recorder.noteEngineCorrection( playback_frame_range::dropFrameCorrectionFrame( tick.correctedStart ) );
         if( tick.wrapped ) recorder.noteEngineWrap( tick.wrapWidth, tick.wrapLaps );
+        const playback_frame_range::PaintCreditHandOff handOff =
+            playback_frame_range::paintCreditHandOff( recorder, 0, recorder.engineWraps, 0, recorder.engineCorrections );
         PlaybackSourceAdvanceTracker paint;
-        paint.notePresented( 1.000, 10, 0, 0 );
-        paint.notePresented( 1.042, static_cast<int>( tick.position ), recorder.engineWraps,
-                             recorder.engineWrapsWidth( 0, recorder.engineWraps ) );
+        PlaybackPaintCreditLedger ledger;
+        ledger.noteSubmitted( 1, 10, 0, 0, paint );
+        ledger.notePainted( 1, 1.000, paint );
+        ledger.noteSubmitted( 2, static_cast<int>( tick.position ), recorder.engineWraps, handOff.wrapsWidth,
+                              handOff.rebase, handOff.rebaseFrame, paint );
+        ledger.notePainted( 2, 1.042, paint );
         ASSERT_EQ(expected[i], (long long)paint.advancedFrames());   // 76e554e3: 30, 30, 31
         ASSERT_TRUE(paint.maxJump() <= 1);                            // 76e554e3: 30
-        ASSERT_TRUE(tick.appliedFrames == tick.position - 10.0);
+        ASSERT_TRUE(tick.appliedFrames == tick.position - tick.correctedStart);
     }
 }
 
@@ -684,7 +769,11 @@ TEST(PlaybackFpsMeterPolicy, AStaleStartBelowTheCutKeepsItsRealForwardStepInTheS
     counter.begin( 10 );
     const DropFrameTickResult first = advanceDropFrameTick(10.0, 1.2, 41, 1000, true, false);
     ASSERT_FALSE(first.wrapped);                                      // 76e554e3: true (a correction read as a wrap)
-    counter.noteEngineTick( 10.0, first.position, first.wrapped );
+    // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: MainWindow feeds the counter the corrected start (40), so the counter rebases its
+    // high-water mark there and counts the real step 40 -> 41.2 (one frame), never 10 -> 41.2 (31)
+    ASSERT_TRUE(first.correctedStart == 40.0);
+    counter.noteEngineTick( first.correctedStart, first.position, first.wrapped );
+    ASSERT_EQ(1, counter.externalJumpRebases);
     const DropFrameTickResult second =
         advanceDropFrameTick(first.position, playback_fps_meter::dropFrameRequestFrames(24.0, 8), 41, 1000, true, false);
     counter.noteEngineTick( first.position, second.position, second.wrapped );

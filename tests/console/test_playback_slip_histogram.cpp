@@ -972,3 +972,26 @@ TEST(GpuPresentTailWindow, AnUnswappedPaintNeverPairsWithALaterWindowsSwap)
     ASSERT_EQ( 0, dropped.qt_paint_swaps );
     ASSERT_NEAR( 0.0, dropped.qt_paint_swap_max_ms, 1e-12 );
 }
+
+// PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1 (fable r9 H6 for corrections): a stale drop-frame start folded from 0 onto the cut's
+// first position 40 is a correction, not an advance. MainWindow notes it before the tick's own move, so the DropTick path books
+// only the tick's travel (0 here), frames 0..39 get no deadline, and advance-since-present stays 0. The summary's residual books
+// the 40-frame move under Other, as it books a seek.
+TEST(PlaybackSlipHistogram, R1ATimelineCorrectionIsNotAnAdvance)
+{
+    SlipHistogram h;
+    h.reset( 0, 24.0 );
+    h.setPlayStart( 0.0 );
+    h.noteTimelineCorrection( 40 );
+    ASSERT_EQ( 40, h.timelinePosition() );
+    h.noteTimelineMove( AdvancePath::DropTick, 40, 100.0, 0.0, 0.0 );
+    ASSERT_EQ( 0, h.timelineAdvanceSincePresent() );                   // 4279b9ee: 40
+    for( int f = 0; f < 40; ++f ) ASSERT_FALSE( h.frameHasDeadline( f ) );
+    const Summary s = h.finish( 200.0, 40 );
+    ASSERT_EQ( 0LL, (long long)s.advanceByPath[static_cast<int>( AdvancePath::DropTick )] );   // 4279b9ee: 40
+    ASSERT_EQ( 40LL, (long long)s.advanceByPath[static_cast<int>( AdvancePath::Other )] );
+    // real travel after the correction is still an advance: 40 -> 41 books 1 and sets frame 40's deadline
+    h.noteTimelineMove( AdvancePath::DropTick, 41, 140.0, 1.0, 0.0 );
+    ASSERT_EQ( 1, h.timelineAdvanceSincePresent() );
+    ASSERT_TRUE( h.frameHasDeadline( 40 ) );
+}

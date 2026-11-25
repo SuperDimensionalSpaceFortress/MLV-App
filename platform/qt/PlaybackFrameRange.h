@@ -291,7 +291,26 @@ struct DropFrameTickResult
     // arithmetic but rounds next to a far stale start (1100000 + 0.18445 on cut 1..2 read 0.1844500000588596, and a grant of
     // 5e-10 from 8400000 read 0), so it is never used to recover the grant. Not a number when the position is.
     double appliedFrames = 0.0;
+    // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1 (sol r9 B1 + B2 on 4279b9ee): the tick made a POSITION CORRECTION, a move of the
+    // start that its delta did not make: the Loop fold of a start at or past wrapAt (foldedFrames > 0), the Loop fold of a start
+    // below the cut's first position (foldedFrames < 0), or the non-Loop clamp of a start past the last frame (clampedFrames > 0).
+    // A correction is never travel, never a jump, never a lap and never consumed source frames: MainWindow hands it to the paint
+    // tracker as a REBASE (PlaybackWrapRecorder::noteEngineCorrection), the source-frame counter and the slip histogram read the
+    // corrected start, and only what the delta applies from there (appliedFrames) is travel.
+    bool corrected = false;
+    // The position the delta was applied from: the folded start, or the clamp's lastFrame. currentPosition on an uncorrected tick.
+    double correctedStart = 0.0;
 };
+
+// r1: the frame a corrected start sits on (the slider's frame for it), floor, held inside int; not a number reads 0.
+inline int dropFrameCorrectionFrame( double position )
+{
+    if( std::isnan( position ) ) return 0;
+    const double frame = std::floor( position );
+    if( frame <= static_cast<double>( std::numeric_limits<int>::min() ) ) return std::numeric_limits<int>::min();
+    if( frame >= static_cast<double>( std::numeric_limits<int>::max() ) ) return std::numeric_limits<int>::max();
+    return static_cast<int>( frame );
+}
 
 // advanceDropFrameTick mirrors MainWindow::playbackHandling's drop-frame-mode per-tick position
 // update exactly (MainWindow.cpp ~10432-10447): add this tick's frame delta, then either wrap
@@ -693,7 +712,36 @@ struct PlaybackWrapRecorder
     void noteInferredWrap() { inferredWrap = true; }
     int replayCount() const { return engineWraps + jumpToFirstCount + restartCount; }
     bool wrapped() const { return replayCount() > 0 || inferredWrap; }
+
+    // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: a POSITION CORRECTION the engine made (DropFrameTickResult::corrected), counted and
+    // stamped like a wrap (RenderFrameThread's engineCorrectionsAtRequest, presentationLoopWraps), so the presentation that lands on
+    // it rebases the paint tracker to rebaseFrame instead of crediting the move. wrapsBefore is engineWraps when it was made: only
+    // wraps from that index on are travel after it. A correction is not a replay: replayCount() and wrapped() never read it.
+    struct EngineCorrection { int rebaseFrame; int wrapsBefore; };
+    int engineCorrections = 0;
+    std::vector<EngineCorrection> engineCorrectionRecords;
+    void noteEngineCorrection( int rebaseFrame )
+    {
+        (void)rebaseFrame;   // RED stub: records nothing
+    }
 };
+
+// r1: what notePlaybackSmokePresentedFrame hands the paint ledger for a presentation that crossed \a wrapsCrossed wraps from
+// wrap \a wrapsBefore and \a correctionsCrossed corrections from correction \a correctionsBefore.
+struct PaintCreditHandOff
+{
+    bool rebase = false;
+    int rebaseFrame = 0;
+    int64_t wrapsWidth = 0;   // the crossed wraps' width; with a rebase, only those made after the last crossed correction
+};
+inline PaintCreditHandOff paintCreditHandOff( const PlaybackWrapRecorder & recorder, int wrapsBefore, int wrapsCrossed,
+                                              int correctionsBefore, int correctionsCrossed )
+{
+    (void)correctionsBefore; (void)correctionsCrossed;   // RED stub: no rebase
+    PaintCreditHandOff handOff;
+    handOff.wrapsWidth = recorder.engineWrapsWidth( wrapsBefore, wrapsCrossed );
+    return handOff;
+}
 
 // ---------------------------------------------------------------------------------------------------------
 // PLAYBACK-CLIP-LENGTH-ENFORCE-2 (owner rule 2026-09-30): THE APP IS THE GATE.

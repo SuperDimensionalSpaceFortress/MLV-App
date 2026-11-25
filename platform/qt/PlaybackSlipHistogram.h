@@ -401,6 +401,14 @@ public:
         m_timelinePosition = toPosition;
     }
 
+    /*! PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: the engine CORRECTED the timeline to \a toPosition (a stale drop-frame start
+     *  folded into the Loop cut or clamped onto its last frame, DropFrameTickResult::corrected). Not an advance: no path, grant,
+     *  deadline or advance-since-present; the summary's residual books the move under Other, as it does a seek. */
+    void noteTimelineCorrection( int toPosition )
+    {
+        (void)toPosition;   // RED stub
+    }
+
     /*! A contact-sheet grab of \a grabMs ran on the GUI thread; it is charged to the next present's interval. */
     void noteGrab( double grabMs )
     {
@@ -672,6 +680,9 @@ public:
 
     double periodMs() const { return m_periodMs; }
     int timelinePosition() const { return m_timelinePosition; }
+    // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: read-only views for the correction rows (a correction sets neither)
+    int timelineAdvanceSincePresent() const { return m_timelineAdvanceSincePresent; }
+    bool frameHasDeadline( int frame ) const { double ms = 0.0; return deadlineOf( frame, &ms ); }
 
 private:
     struct Deadline

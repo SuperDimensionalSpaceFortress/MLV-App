@@ -299,7 +299,8 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
     const int at = body.indexOf(call);
     // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r8 iteration 1 (pass 14 A1 on a2983bf2): the granted share is the tick's applied delta
     ASSERT_TRUE(body.indexOf(QStringLiteral("const double grantedDropFrames = dropFrameTick.appliedFrames;"), at) > at);
-    ASSERT_TRUE(body.indexOf(QStringLiteral("m_sourceAdvance.noteEngineTick( sourcePositionBeforeDropTick, dropFrameTick.position, dropFrameTick.wrapped );"), at) > at);
+    // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: the counter reads the start the delta applied from (a correction is not footage)
+    ASSERT_TRUE(body.indexOf(QStringLiteral("m_sourceAdvance.noteEngineTick( dropFrameTick.correctedStart, dropFrameTick.position, dropFrameTick.wrapped );"), at) > at);
 }
 
 TEST(PlaybackConformWiring, SlipHistogramMovesUsePlaybackRate)
