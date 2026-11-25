@@ -239,7 +239,7 @@ TEST(PlaybackPresentTraceWiring, TheAdvanceIsTheTicksAppliedGrantNotItsEndpoints
     const QString handling = source.mid(handlingAt, handlingEnd - handlingAt);
     // cleared first, before any early return
     ASSERT_TRUE(handling.contains(QStringLiteral(
-        "gui_present_gap::OtherBusySpan::PlaybackHandling );\n    m_playbackTickAppliedFrames = 0.0;\n")));
+        "gui_present_gap::OtherBusySpan::PlaybackHandling );\n    m_playbackTickAppliedFrames = 0.0;   // r7 (sol r6)")));
     ASSERT_EQ(4, handling.count(QStringLiteral("m_playbackTickAppliedFrames = ")));
     const int wrapGrantAt = handling.indexOf(QStringLiteral(
         "if( !m_playbackPaceGuard.grantLoopWrap( paceNowMs, playbackPaceGuardFps() ) ) return;"));
