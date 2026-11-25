@@ -4654,8 +4654,15 @@ function Read-DvVisualCaptures {
         return (& $finish)
     }
     Copy-Item -LiteralPath $appJsonShare -Destination (Join-Path $dir 'app-visual.json') -Force
-    $block.appVisualJsonSha256 = Get-DvSha256OfFile (Join-Path $dir 'app-visual.json')
-    try { $app = [IO.File]::ReadAllText((Join-Path $dir 'app-visual.json')) | ConvertFrom-Json -ErrorAction Stop } catch { $block.reason = 'the app''s visual.json is not valid JSON'; return (& $finish) }
+    # r2 (sol r1 finding 6, sibling): ONE read; the stored digest and this parse are of the same bytes (a file swapped between a hash read and a parse read
+    # bound one file's digest to another's content). The parse here stays ConvertFrom-Json (the capture verdict's contract); the tail credit re-reads strictly.
+    $appBytes = [IO.File]::ReadAllBytes((Join-Path $dir 'app-visual.json'))
+    $block.appVisualJsonSha256 = Get-DvSha256OfBytes $appBytes
+    try {
+        $appReader = [IO.StreamReader]::new([IO.MemoryStream]::new($appBytes), [Text.UTF8Encoding]::new($false), $true)
+        try { $appText = $appReader.ReadToEnd() } finally { $appReader.Dispose() }
+        $app = $appText | ConvertFrom-Json -ErrorAction Stop
+    } catch { $block.reason = 'the app''s visual.json is not valid JSON'; return (& $finish) }
     $block.method = [string](Get-DvProp $app 'method'); $block.appError = [string](Get-DvProp $app 'error')
     # Whether the source frames differ: only the app's own records say so -- never a guess. Its top-level source_difference (differ | identical, exactly that
     # case: `identical` waives the gate, so `IDENTICAL` is not the app's word; anything else, or nothing, is unknown) covers EVERY play capture, a usable
@@ -7515,6 +7522,45 @@ $script:ConformCriteriaMetrics = [ordered]@{ conformSourceFps = 'conformSourceFp
 # (231ea06e: 479 rendering, 478 in prep, 477 presented), so 2 is the pipeline's own depth; a longer unpainted tail is a frozen presentation, never in flight.
 $script:TailInFlightCapFrames = 2L
 
+function ConvertFrom-DvStrictJsonBytes {
+    <#
+    .SYNOPSIS
+    EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-1 r2 (sol r1 findings 6 and 7). The parsed JSON OBJECT these exact bytes hold, or $null. The caller hashes the same
+    byte array it passes here, so the parsed document is the one the digest binds (a separate hash read and parse read let a file swapped between them lend its
+    content to another file's digest). Refused ($null): bytes that are not UTF-8 (a BOM is allowed), text System.Text.Json does not accept, a root that is not an
+    object (ConvertFrom-Json unwraps a one-element root array into its element), and any object, at any depth, with two members whose names are equal ignoring
+    case (ConvertFrom-Json keeps the last of `"display_frame":478,"display_frame":479`, and Get-DvProp reads names case-insensitively). Pure; never throws.
+    #>
+    param([AllowNull()][byte[]]$Bytes)
+    try {
+        if ($null -eq $Bytes -or $Bytes.Length -eq 0) { return $null }
+        $reader = [IO.StreamReader]::new([IO.MemoryStream]::new($Bytes), [Text.UTF8Encoding]::new($false, $true), $true)
+        try { $text = $reader.ReadToEnd() } finally { $reader.Dispose() }
+        $doc = [System.Text.Json.JsonDocument]::Parse($text)
+        try {
+            if ($doc.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $null }
+            $pending = [System.Collections.Generic.Stack[System.Text.Json.JsonElement]]::new()
+            $pending.Push($doc.RootElement)
+            while ($pending.Count -gt 0) {
+                $el = $pending.Pop()
+                if ($el.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+                    $names = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                    foreach ($p in $el.EnumerateObject()) {
+                        if (-not $names.Add($p.Name)) { return $null }
+                        $pending.Push($p.Value)
+                    }
+                }
+                elseif ($el.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) { foreach ($item in $el.EnumerateArray()) { $pending.Push($item) } }
+            }
+        }
+        finally { $doc.Dispose() }
+        $parsed = $text | ConvertFrom-Json -ErrorAction Stop
+        if ($parsed -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+        return $parsed
+    }
+    catch { return $null }
+}
+
 function Get-DvTailVisualEvidence {
     <#
     .SYNOPSIS
@@ -7523,6 +7569,10 @@ function Get-DvTailVisualEvidence {
     block: the file must hash to -ExpectedSha256 (the digest the receipt's visual block stores), carry the app's schema and no error, and name the measured
     session. Each capture row is typed strictly (a JSON boolean is the only boolean, a JSON number the only number, a kind is compared ordinally, `frames` must
     be an array) and counts only when its leg-named PNG exists in the evidence directory. Returns $null when any of that fails: no tail evidence is no credit.
+    r2 (sol r1 findings 2, 3, 6 and 7): the file is read ONCE and the digest and the parse are taken from those same bytes (ConvertFrom-DvStrictJsonBytes: a
+    root object, no duplicate member names); a row is labelBound only when the app's label_bound is a JSON true AND its own painted_serial_valid is true AND
+    serial and painted_serial are JSON integers that are equal (the capture's paint is the presentation the row labels: a play_unbound row with serial 484 and
+    painted_serial 483 is not); its pngSha256 is set only when the PNG's bytes decode as a PNG (Get-DvPngImageProblem, the paired-seek reader's check).
     Pure apart from reading files; never throws.
     #>
     param([AllowNull()][AllowEmptyString()][string]$EvidenceDir, [AllowNull()][AllowEmptyString()][string]$LegId, [AllowNull()][AllowEmptyString()][string]$ExpectedSha256)
@@ -7531,8 +7581,9 @@ function Get-DvTailVisualEvidence {
         $dir = Join-Path $EvidenceDir 'visual'
         $jsonPath = Join-Path $dir 'app-visual.json'
         if (-not (Test-Path -LiteralPath $jsonPath -PathType Leaf)) { return $null }
-        if ((Get-DvSha256OfFile $jsonPath) -cne $ExpectedSha256.ToLowerInvariant()) { return $null }
-        $app = [IO.File]::ReadAllText($jsonPath) | ConvertFrom-Json -ErrorAction Stop
+        $jsonBytes = [IO.File]::ReadAllBytes($jsonPath)
+        if ((Get-DvSha256OfBytes $jsonBytes) -cne $ExpectedSha256.ToLowerInvariant()) { return $null }
+        $app = ConvertFrom-DvStrictJsonBytes -Bytes $jsonBytes
         if ($null -eq $app -or [string](Get-DvProp $app 'schema') -cne 'mlv-app/visual-capture/v1') { return $null }
         $appError = Get-DvProp $app 'error'
         if ($appError -isnot [string] -or $appError -ne '') { return $null }
@@ -7556,9 +7607,17 @@ function Get-DvTailVisualEvidence {
             $tail = Get-DvProp $row 'tail_elapsed_ms'
             $tailOk = ($tail -is [int] -or $tail -is [long] -or $tail -is [double]) -and -not [double]::IsNaN([double]$tail) -and -not [double]::IsInfinity([double]$tail) -and [double]$tail -ge 0
             $png = Join-Path $dir "$LegId-$($kind.Replace('_', '-'))-$index.png"
-            $pngSha = $(if ((($saved -is [bool]) -and $saved) -and (Test-Path -LiteralPath $png -PathType Leaf)) { Get-DvSha256OfFile $png } else { $null })
+            $pngSha = $null
+            if ((($saved -is [bool]) -and $saved) -and (Test-Path -LiteralPath $png -PathType Leaf)) {
+                $pngBytes = [IO.File]::ReadAllBytes($png)
+                if ($null -eq (Get-DvPngImageProblem -Bytes $pngBytes)) { $pngSha = Get-DvSha256OfBytes $pngBytes }
+            }
+            $bound = Get-DvProp $row 'label_bound'; $serialValid = Get-DvProp $row 'painted_serial_valid'
+            $serial = Get-DvProp $row 'serial'; $paintedSerial = Get-DvProp $row 'painted_serial'
+            $serialsOk = (($serial -is [int]) -or ($serial -is [long])) -and (($paintedSerial -is [int]) -or ($paintedSerial -is [long])) -and ([int64]$serial -eq [int64]$paintedSerial)
+            $labelBound = (($bound -is [bool]) -and $bound) -and (($serialValid -is [bool]) -and $serialValid) -and $serialsOk
             $frames.Add([pscustomobject]@{ kind = $kind; index = [int64]$index; saved = (($saved -is [bool]) -and $saved); playActive = (($active -is [bool]) -and $active)
-                                           displayFrame = $display; tailElapsedMs = $(if ($tailOk) { [double]$tail } else { $null }); pngSha256 = $pngSha })
+                                           displayFrame = $display; tailElapsedMs = $(if ($tailOk) { [double]$tail } else { $null }); pngSha256 = $pngSha; labelBound = $labelBound })
         }
         return [pscustomobject]@{ measuredSession = [string]$sessionNumber; frames = @($frames) }
     }
@@ -7571,16 +7630,18 @@ function Get-DvTailInFlightCredit {
     EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-1 r1. How many of the targets the engine had reached but the presentation had not painted AT THE MEASURED CLOSE does
     the post-close tail PROVE painted? The conform line is written when the measured window closes, which an unpinned run does on the engine's consumption of its
     last target, so the pipeline's last targets are still in flight: the line's max_jump (1) never saw them, and the ends-derived reading counted them as a skip.
-    Returns creditedFrames=1 (the engine's LAST target, and only it) when ALL of these hold; otherwise 0 with `reason` naming the first that failed:
+    Returns creditedFrames = the number of in-flight targets (last painted + 1 .. Target) the tail SHOWS, when ALL of these hold; otherwise 0 with `reason`
+    naming the first that failed:
       1. 1 <= Unpainted <= TailInFlightCapFrames (the pipeline's own depth, not a frozen tail);
       2. the measured summary's prep counters are readable and show no prepared result replaced (prep_replaced_before = prep_replaced_after = 0) and no drop but a
          presentation-generation change (prep_stale_drops = prep_generation_drops: Play's own start), so no in-flight target was discarded BEFORE the close;
-      3. Visual (Get-DvTailVisualEvidence) is the measured session's capture, and one of its play captures (saved, its PNG on disk, Play still active) shows a display
-         frame at or past the engine's last target. display_frame is the app's presentation record (MainWindow.cpp m_lastPresentedRequestContext, set when
-         drawFrameReady presents a request): a capture's own repaint never sets it, so it does not matter whether that capture forced a paint.
-    One target only: an endpoint sample cannot show that an EARLIER in-flight target (478 when the engine is at 479) was presented rather than superseded after the
-    close (a prepared task that no longer matches the latest request is dropped, MainWindow.cpp playbackPrepTaskShouldCompute), so it is not credited; it stays
-    inside conformMaxJump's one held-target allowance and counts in conformTailUnpaintedFrames until the app itself reports it.
+      3. Visual (Get-DvTailVisualEvidence) is the measured session's capture, and a play capture (saved, label-bound: its paint serial is the presentation it
+         labels, its PNG on disk and decodable, Play still active) shows a display frame EQUAL to that target. display_frame is the app's presentation record
+         (MainWindow.cpp m_lastPresentedRequestContext, set when drawFrameReady presents a request).
+    r2 (fable r1 blocker, sol r1 findings 2-5): r1 credited the LAST target on any capture at or PAST it, unbound or not, with any non-empty PNG; a later frame
+    (480) proves nothing about 479, an unbound capture (serial 484, painted_serial 483) does not show the frame it is labelled with, and a 5-byte "PNG" is no
+    picture. A target the tail never shows exactly stays unpainted: an endpoint sample showing 479 still does not credit 478 (superseded after the close is
+    possible: MainWindow.cpp playbackPrepTaskShouldCompute), and it counts in conformTailUnpaintedFrames until a capture or the app itself shows it.
     Pure: no I/O; a missing or malformed input is a reason, never a credit.
     #>
     param([Parameter(Mandatory)][int64]$Unpainted, [Parameter(Mandatory)][int64]$Target, $Playback, $Visual)
@@ -7594,22 +7655,44 @@ function Get-DvTailInFlightCredit {
         $counts[$k] = $v
     }
     if ($counts['prepReplacedBefore'] -ne 0 -or $counts['prepReplacedAfter'] -ne 0) { return (& $no "a prepared result was replaced (prep_replaced_before=$($counts['prepReplacedBefore']) prep_replaced_after=$($counts['prepReplacedAfter'])): an in-flight target may never have been painted") }
-    if ($counts['prepStaleDrops'] -ne $counts['prepGenerationDrops']) { return (& $no "prep_stale_drops=$($counts['prepStaleDrops']) exceeds prep_generation_drops=$($counts['prepGenerationDrops']): a prepared result was dropped for a reason other than a presentation-generation change") }
+    # r2 (fable r1 note): the counters differ (either way), so the wording says "differs from", never "exceeds"
+    if ($counts['prepStaleDrops'] -ne $counts['prepGenerationDrops']) { return (& $no "prep_stale_drops=$($counts['prepStaleDrops']) differs from prep_generation_drops=$($counts['prepGenerationDrops']): a prepared result was dropped for a reason other than a presentation-generation change") }
     if ($null -eq $Visual) { return (& $no 'there is no post-close visual tail the reader can trust (visual.json absent, unbound to the receipt, errored, or malformed)') }
     $summarySession = $(if ($null -ne $Playback) { [string](Get-DvProp $Playback 'summarySession') } else { '' })
     if ($summarySession -eq '' -or [string](Get-DvProp $Visual 'measuredSession') -cne $summarySession) { return (& $no "the visual capture is of another session (measured_session=$([string](Get-DvProp $Visual 'measuredSession'))), not the measured session $summarySession") }
+    # r2 (fable r1 blocker, sol r1 findings 2, 4 and 5): each in-flight target (last painted + 1 .. Target) is credited only by a qualifying capture showing
+    # EXACTLY that frame (a later frame proves nothing about it), and every such target shown is credited (478 at 126 ms and 479 at 376 ms are two).
+    $shown = [System.Collections.Generic.SortedSet[int64]]::new()
     $tailFrames = Get-DvProp $Visual 'frames'   # (assigned, then @()-wrapped: Get-DvProp returns `, $value`, see Read-DvContactFrames)
     foreach ($f in @($tailFrames)) {
         if ($null -eq $f) { continue }
         $display = Get-DvProp $f 'displayFrame'
         $tailMs = Get-DvProp $f 'tailElapsedMs'
-        if ((Get-DvProp $f 'saved') -eq $true -and (Get-DvProp $f 'playActive') -eq $true -and -not [string]::IsNullOrEmpty([string](Get-DvProp $f 'pngSha256')) -and
-            $null -ne $tailMs -and $null -ne $display -and [int64]$display -ge $Target) {
-            $others = $(if ($Unpainted -gt 1) { "; the other $($Unpainted - 1) in-flight target(s) are not shown by it and stay unpainted" } else { '' })
-            return [pscustomobject]@{ credited = $true; creditedFrames = 1L; reason = "the post-close visual tail shows display frame $display (the engine's last target is $Target) on a saved play capture with Play active, and no prepared result was replaced or dropped$others" }
+        if ((Get-DvProp $f 'saved') -eq $true -and (Get-DvProp $f 'playActive') -eq $true -and (Get-DvProp $f 'labelBound') -eq $true -and
+            -not [string]::IsNullOrEmpty([string](Get-DvProp $f 'pngSha256')) -and $null -ne $tailMs -and $null -ne $display) {
+            $d = [int64]$display
+            if ($d -gt ($Target - $Unpainted) -and $d -le $Target) { [void]$shown.Add($d) }
         }
     }
-    & $no "no play capture (saved, its PNG on disk, Play active) in the post-close tail shows a display frame at or past the engine's last target $Target"
+    if ($shown.Count -eq 0) { return (& $no "no play capture (saved, label-bound, its PNG on disk and decodable, Play active) in the post-close tail shows exactly an in-flight target ($(($Target - $Unpainted + 1))..$Target)") }
+    $unproven = @(for ($t = $Target - $Unpainted + 1; $t -le $Target; $t++) { if (-not $shown.Contains($t)) { $t } })
+    $others = $(if ($unproven.Count -gt 0) { "; in-flight target(s) $($unproven -join ', ') are not shown by it and stay unpainted" } else { '' })
+    [pscustomobject]@{ credited = $true; creditedFrames = [int64]$shown.Count
+                       reason = "the post-close visual tail shows display frame(s) $(@($shown) -join ', ') (the engine's last target is $Target) on saved, label-bound play captures with Play active and a decodable PNG, and no prepared result was replaced or dropped$others" }
+}
+
+function Get-DvTailCreditDetail {
+    <#
+    .SYNOPSIS
+    EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-1 r2 (fable r1 H2, TAIL-CREDIT-RECORDED-IN-RECEIPT-1). The outcomeDetail suffix that records an in-flight tail credit
+    Get-DvCriteriaMetrics applied ('' when none was applied), so a PASS that a credit made is never the fixed "every criterion held" string alone. Pure.
+    #>
+    param($CriteriaMetrics)
+    if ($null -eq $CriteriaMetrics) { return '' }
+    $credited = ConvertTo-DvInt64 (Get-DvProp $CriteriaMetrics 'conformTailInFlightCreditedFrames')
+    if ($null -eq $credited -or $credited -lt 1) { return '' }
+    $atClose = ConvertTo-DvInt64 (Get-DvProp $CriteriaMetrics 'conformTailUnpaintedAtCloseFrames')
+    "; tail in-flight credit: $credited of $atClose target(s) unpainted at the measured close shown painted by the post-close visual tail ($([string](Get-DvProp $CriteriaMetrics 'conformTailInFlightCreditNote')))"
 }
 
 function Get-DvCriteriaMetrics {
@@ -7687,9 +7770,10 @@ function Get-DvCriteriaMetrics {
     # EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-1 r1 (design opus-001 F1 on 231ea06e): an UNPINNED every-frame run closes its measured window when the engine
     # consumes its last target, so the pipeline's last targets (479 rendering, 478 in prep, 477 painted) are in flight at that close. The app's own line says
     # max_jump=1, but the ends read as one skipped frame (conformMaxJump=2) and the tail as 2 unpainted. When the post-close visual tail paints them
-    # (Get-DvTailInFlightCredit: bounded depth, no prepared result dropped, a play capture showing the engine's last target) THAT target is credited as painted:
-    # the ends are read with it painted. A target the tail never shows (an earlier in-flight one included), a deeper tail, or a dropped prepared result is credited NOTHING.
-    # conformTailUnpaintedAtCloseFrames keeps the at-close figure and conformTailInFlightCreditedFrames the credit, so the receipt of a credit is visible.
+    # (Get-DvTailInFlightCredit: bounded depth, no prepared result dropped, a bound play capture showing EXACTLY an in-flight target) each target shown is credited
+    # as painted: the ends are read with them painted. A target the tail never shows exactly, a deeper tail, or a dropped prepared result is credited NOTHING.
+    # conformTailUnpaintedAtCloseFrames keeps the at-close figure and conformTailInFlightCreditedFrames the credit; r2 (fable r1 H2): the leg runner writes both
+    # and the credit note into the receipt's outcomeDetail (Invoke-VenueLeg.ps1, Get-DvTailCreditDetail), so a credit that turns a FAIL into a PASS is on record.
     $tailCredit = 0L
     if ($null -ne $Playback -and $present -and $sameSession -and -not $backwardMissing -and $backward -eq 0 -and $null -ne $ends['last_frame'] -and $null -ne $ends['engine_target'] -and
         [int64]$ends['engine_target'] -gt [int64]$ends['last_frame']) {
@@ -7951,4 +8035,4 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Test-DvMatrixRowMeasured, Get-DvMatrixMeasuredCount, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
-    Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, Get-DvTailVisualEvidence, New-DvReceipt, Write-DvReceipt, Get-DvAcceptanceVerdict, Get-DvStoredPlaybackFieldProblems
+    Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, Get-DvTailVisualEvidence, ConvertFrom-DvStrictJsonBytes, Get-DvTailCreditDetail, New-DvReceipt, Write-DvReceipt, Get-DvAcceptanceVerdict, Get-DvStoredPlaybackFieldProblems
