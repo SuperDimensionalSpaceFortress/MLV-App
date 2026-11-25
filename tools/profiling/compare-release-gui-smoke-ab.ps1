@@ -42,16 +42,27 @@ function Read-SmokeSourceOnce {
     if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
         throw "Smoke JSON not found: $resolved"
     }
-    $bytes = [IO.File]::ReadAllBytes($resolved)
-    $text = [Text.Encoding]::UTF8.GetString($bytes)
-    $parseText = if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text.Substring(1) } else { $text }
+    # adversary-ac6205bd.json A4: a read that fails (a lock taken by another process, a sharing violation) is a typed parse error, never a throw that
+    # aborts the report. A5: the bytes are decoded by their BOM (UTF-8, UTF-16 LE/BE), as Get-Content did; no BOM reads UTF-8.
+    $bytes = [byte[]]@()
+    $text = ''
     $smoke = $null
     $parseError = $null
     try {
-        $smoke = ConvertFrom-Json -InputObject $parseText -Depth 100
+        $bytes = [IO.File]::ReadAllBytes($resolved)
+        $text = [IO.StreamReader]::new([IO.MemoryStream]::new($bytes), [Text.UTF8Encoding]::new($false), $true).ReadToEnd()
     }
     catch {
-        $parseError = ($_.Exception.Message -replace '\s+', ' ')
+        $parseError = "the smoke JSON could not be read: $($_.Exception.Message -replace '\s+', ' ')"
+    }
+    $parseText = if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text.Substring(1) } else { $text }
+    if ($null -eq $parseError) {
+        try {
+            $smoke = ConvertFrom-Json -InputObject $parseText -Depth 100
+        }
+        catch {
+            $parseError = ($_.Exception.Message -replace '\s+', ' ')
+        }
     }
     if ($null -eq $smoke -or $smoke -is [System.Collections.IList]) {
         if ($null -eq $parseError) { $parseError = 'the smoke JSON is not one object' }
@@ -920,7 +931,12 @@ function Compare-SmokeScreenshots {
 # (hostLoad beside HostLoad: KeysWithDifferentCasingInJsonString) is no throw: its figures read empty, a typed failure names it, and the strict host-load
 # reader judges the same text unknown (a repeated member), so the comparison is INCONCLUSIVE with REFERENCE_PROVISIONAL, never an abort.
 $beforeSource = Read-SmokeSourceOnce -Path $Before
-$afterSource = Read-SmokeSourceOnce -Path $After
+# adversary-ac6205bd.json A4: the same path given twice is the same physical file: it is read once (the distinct-path refusal below then records it)
+$afterSource = if ([string]::Equals($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($After), $beforeSource.path, [StringComparison]::OrdinalIgnoreCase)) {
+    $beforeSource
+} else {
+    Read-SmokeSourceOnce -Path $After
+}
 $beforeJsonPath = $beforeSource.path
 $afterJsonPath = $afterSource.path
 $beforeSmokeText = $beforeSource.text
@@ -946,6 +962,9 @@ $failures = @()
 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B2): a smoke text the parser refused is a typed failure (its figures read empty); the host-load
 # reader below judges the same text, and an ambiguous hostLoad/HostLoad member reads unknown, so the verdict is INCONCLUSIVE.
 foreach ($sourceLeg in @([pscustomobject]@{ Name = 'before'; Source = $beforeSource }, [pscustomobject]@{ Name = 'after'; Source = $afterSource })) {
+    if ($sourceLeg.Name -ceq 'after' -and [object]::ReferenceEquals($afterSource, $beforeSource)) {
+        $failures += "Before and after name the same smoke JSON file ($($beforeSource.path)); same-input A/B is refused."
+    }
     if ($null -ne $sourceLeg.Source.parseError) {
         $failures += "$($sourceLeg.Name) smoke JSON could not be parsed (ambiguous or malformed member): $($sourceLeg.Source.parseError)"
     }

@@ -345,7 +345,7 @@ function Get-RowFigures([string]$ReceiptPath, $Leg, [string]$Backend) {
     $f = [ordered]@{ receipt = $null; outcome = $null; fps = $null; drops = $null; stall = $null; verification = $null; rejected = $null; noFigure = $null; identity = $null; resultJsonSha256 = $null; receiptSha256 = $null }
     if (-not $ReceiptPath -or -not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) { return $f }
     # r6 (adversary-de8e3799.json A4): the receipt bytes are read ONCE; the figures come from them and the host-load read is bound to their sha256
-    try { $rcBytes = [IO.File]::ReadAllBytes($ReceiptPath); $rc = [Text.Encoding]::UTF8.GetString($rcBytes).TrimStart([char]0xFEFF) | ConvertFrom-Json; $f.receiptSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($rcBytes)) } catch { return $f }
+    try { $rcBytes = [IO.File]::ReadAllBytes($ReceiptPath); $rc = [IO.StreamReader]::new([IO.MemoryStream]::new($rcBytes), [Text.UTF8Encoding]::new($false), $true).ReadToEnd().TrimStart([char]0xFEFF) | ConvertFrom-Json; $f.receiptSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($rcBytes)) } catch { return $f }
     # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (adversary-01a12498.json A2): the smoke binding of the receipt these figures come from; the host-load read is bound to it
     $boundSha = Get-DvProp (Get-DvProp $rc 'evidence') 'resultJsonSha256'
     $f.resultJsonSha256 = $(if ($boundSha -is [string]) { $boundSha } elseif ($null -eq $boundSha) { '' } else { 'not-a-sha' })
@@ -462,7 +462,8 @@ foreach ($b in $StandardBackends) {
             if ($fig.rejected -ceq 'INVALID' -and $legStatus -ceq 'EVIDENCE_INCOMPLETE') { $legStatus = 'EVIDENCE_INVALID' }
             # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): the leg's host-load standing from its own hash-bound smoke result (VenueChain.psm1 Get-VenueLegHostLoad).
             # A provisional or unknown RAN row keeps its figures for the trend file but is never a measured reference row (the $measuredRows predicate below).
-            $hlReceipt = $(if ($leg.PSObject.Properties['receipt'] -and $leg.receipt) { [string]$leg.receipt } else { '' })
+            # adversary-ac6205bd.json A7: an unclean chain's receipts are never read (the same rule as Get-RowFigures above): no path, so the standing is unknown unread
+            $hlReceipt = $(if ($chainClean -and $leg.PSObject.Properties['receipt'] -and $leg.receipt) { [string]$leg.receipt } else { '' })
             # (adversary-01a12498.json A2: bound to the receipt Get-RowFigures took the figures from; no receipt read there means no figures and no expectation)
             # r6 (sol r5 B2): the export exemption comes only from the PLANNED leg type (the plan leg's spec), never from the receipt's shape
             $hlPlanned = $(if ($null -ne $planLeg -and $planLeg.PSObject.Properties['plannedLegType']) { [string]$planLeg.plannedLegType } else { 'unknown' })

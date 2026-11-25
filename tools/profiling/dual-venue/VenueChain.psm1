@@ -1687,6 +1687,14 @@ function Test-VenueHlHasMember([object]$O, [string]$N) {
     $null -ne $O.PSObject.Properties[$N]
 }
 
+function ConvertFrom-VenueBomBytes([byte[]]$Bytes) {
+    # adversary-ac6205bd.json A5: file bytes decoded by their byte-order mark (UTF-8, UTF-16 LE/BE, UTF-32), as Get-Content and ReadAllText do; no BOM reads
+    # UTF-8. A forced UTF-8 decode turned a UTF-16 smoke result, receipt or spec into replacement characters and NULs (unknown, never its real standing).
+    if ($null -eq $Bytes -or $Bytes.Length -eq 0) { return '' }
+    $reader = [IO.StreamReader]::new([IO.MemoryStream]::new($Bytes), [Text.UTF8Encoding]::new($false), $true)
+    try { $reader.ReadToEnd() } finally { $reader.Dispose() }
+}
+
 function Find-VenueJsonDuplicateMember {
     # adversary-b0c05520.json A2: ConvertFrom-Json keeps the LAST of two same-named members, so a duplicate could pick a clean value. The first duplicated member
     # name (case-insensitive, as PowerShell property lookup is) at the root or anywhere under a root hostLoad member, or $null when there is none.
@@ -1803,6 +1811,10 @@ function Test-VenueReceiptIsExportLeg([object]$Rc) {
     $evd = Get-VenueHlMember $Rc 'evidence'
     if ($null -ne $evd -and -not (Test-VenueHlObject $evd)) { return $false }
     foreach ($n in 'resultJsonSha256', 'logSha256') { if ($null -ne (Get-VenueHlMember $evd $n)) { return $false } }
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (adversary-ac6205bd.json A6): NO playback evidence of any kind: a playback block (presentedFps) or a contact-frames
+    # binding is a playback receipt's, never the export writer's, so a receipt carrying either is not an export leg whatever its export block says
+    if ($null -ne (Get-VenueHlMember $Rc 'playback')) { return $false }
+    if ($null -ne (Get-VenueHlMember $evd 'contactFramesJsonSha256')) { return $false }
     $ex = Get-VenueHlMember $Rc 'export'
     if (-not (Test-VenueHlObject $ex)) { return $false }
     $fmt = Get-VenueHlMember $ex 'format'
@@ -1811,7 +1823,13 @@ function Test-VenueReceiptIsExportLeg([object]$Rc) {
     if (-not ($bind -is [string] -and [regex]::IsMatch($bind, '\A[0-9a-f]{64}\z'))) { return $false }
     if (-not (Test-VenueHlHasMember $ex 'verdict')) { return $false }
     $verdict = Get-VenueHlMember $ex 'verdict'
-    ($null -eq $verdict) -or ($verdict -is [string] -and [regex]::IsMatch($verdict, '\A[A-Z][A-Z_]{1,31}\z'))
+    # adversary-ac6205bd.json A6: a non-null verdict is the receipt's own outcome (Invoke-VenueLeg.ps1 writes export.verdict = the export outcome), so an
+    # invented token ('NONEXISTENT' beside outcome PASS) is not an export verdict
+    # (Complete-Receipt may downgrade a PASS/FAIL outcome to INVALID or UNRESOLVED after the verdict is written, so that pair is the writer's too.)
+    if ($null -eq $verdict) { return $true }
+    $outcome = Get-VenueHlMember $Rc 'outcome'
+    if (-not ($verdict -is [string] -and [regex]::IsMatch($verdict, '\A[A-Z][A-Z_]{1,31}\z') -and $outcome -is [string])) { return $false }
+    [string]::Equals($verdict, $outcome, [StringComparison]::Ordinal) -or (($outcome -ceq 'INVALID' -or $outcome -ceq 'UNRESOLVED') -and ($verdict -ceq 'PASS' -or $verdict -ceq 'FAIL'))
 }
 
 function Get-VenuePlannedLegType {
@@ -1836,7 +1854,7 @@ function Get-VenuePlannedLegType {
             $got = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
             if (-not [string]::Equals($got, $ExpectSpecSha256, [StringComparison]::OrdinalIgnoreCase)) { return 'unknown' }
         }
-        $text = [Text.Encoding]::UTF8.GetString($bytes)
+        $text = ConvertFrom-VenueBomBytes $bytes
         }
         if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
         if (Find-VenueJsonDuplicateMember -Text $text -All) { return 'unknown' }
@@ -1877,7 +1895,7 @@ function Get-VenueLegHostLoad {
             $rcGot = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($rcBytes))
             if ([string]::IsNullOrEmpty($ExpectReceiptSha256) -or -not [string]::Equals($rcGot, $ExpectReceiptSha256, [StringComparison]::OrdinalIgnoreCase)) { $unknown.reason = 'the receipt is not the bytes the figures were read from'; return $unknown }
         }
-        $rcText = [Text.Encoding]::UTF8.GetString($rcBytes)
+        $rcText = ConvertFrom-VenueBomBytes $rcBytes
         if ($rcText.Length -gt 0 -and $rcText[0] -eq [char]0xFEFF) { $rcText = $rcText.Substring(1) }
         # adversary-90151822.json A2: a receipt that repeats a member anywhere is 'unknown' before its export or evidence member is read (the last one would win)
         $rcDup = Find-VenueJsonDuplicateMember -Text $rcText -All
@@ -1905,7 +1923,7 @@ function Get-VenueLegHostLoad {
         $bytes = [IO.File]::ReadAllBytes($result)
         $got = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
         if (-not [string]::Equals($got, $want, [StringComparison]::OrdinalIgnoreCase)) { $unknown.reason = "result.json does not match the receipt's evidence.resultJsonSha256"; return $unknown }
-        $text = [Text.Encoding]::UTF8.GetString($bytes)
+        $text = ConvertFrom-VenueBomBytes $bytes
         if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
         $dup = Find-VenueJsonDuplicateMember -Text $text
         if ($dup) { $unknown.reason = "result.json repeats the member $dup"; return $unknown }

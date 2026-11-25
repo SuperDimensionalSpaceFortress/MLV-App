@@ -288,7 +288,8 @@ class LegHostLoadBindingTests(unittest.TestCase):
             "a1bound-1": (bound({k: v for k, v in real.items() if k != "evidence"}), "play", cim),
             "a1verdictonly-1": ({**real, "export": {**real["export"], "receiptSha256": None, "verdict": "PASS"}}, "export", None),
             "realexp-1": (real, "export", None),
-            "verdictexp-1": ({**real, "export": {**real["export"], "verdict": "PASS"}}, "export", None),
+            # residue r1 (adversary-ac6205bd.json A6): a non-null verdict is the receipt's own outcome, as Invoke-VenueLeg.ps1 writes both
+            "verdictexp-1": ({**real, "outcome": "PASS", "export": {**real["export"], "verdict": "PASS"}}, "export", None),
         })
         for rid in ("emptyexp-1", "specasrc-1", "noschema-1", "withscale-1", "withdisplay-1", "noformat-1", "noevidence-1", "arrexp-1",
                     "a1arr-1", "a1fake-1", "a1bound-1", "a1verdictonly-1"):
@@ -460,6 +461,33 @@ class PlannedLegTypeExemptionTests(unittest.TestCase):
         path.write_text(json.dumps(receipt), encoding="utf-8")
         return path
 
+    def test_adversary_a6_a_planned_export_with_playback_evidence_or_an_invented_verdict_is_not_exempt(self) -> None:
+        # adversary-ac6205bd.json A6, its input: a leg planned as export whose receipt carries outcome PASS, playback {presentedFps 59}, a contact-frames
+        # binding and export.verdict 'NONEXISTENT' (digest zeros) was exempt (not-applicable, applies false). Each of those marks a non-export receipt now.
+        zeros, ones = "0" * 64, "1" * 64
+        base = {**json.loads(json.dumps(REAL_EXPORT_RECEIPT)), "outcome": "PASS"}
+        base["export"]["receiptSha256"] = zeros
+        cases = {
+            "adversary": {**base, "playback": {"presentedFps": 59}, "evidence": {"contactFramesJsonSha256": ones}, "export": {**base["export"], "verdict": "NONEXISTENT"}},
+            "playback-block": {**base, "playback": {"presentedFps": 59}},
+            "contact-frames": {**base, "evidence": {"contactFramesJsonSha256": ones}},
+            "invented-verdict": {**base, "export": {**base["export"], "verdict": "NONEXISTENT"}},
+        }
+        accepted = {"verdict-is-outcome": {**base, "export": {**base["export"], "verdict": "PASS"}},
+                    "downgraded": {**base, "outcome": "INVALID", "export": {**base["export"], "verdict": "PASS"}},
+                    "real": REAL_EXPORT_RECEIPT}
+        with tempfile.TemporaryDirectory() as d:
+            for name, rc in {**cases, **accepted}.items():
+                with self.subTest(receipt=name):
+                    path = self.write_leg(Path(d), f"{name}-1", rc, None)
+                    p = run_ps(f"$s = Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType 'export'; Write-Output ('J=' + ($s | ConvertTo-Json -Compress))")
+                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                    j = json.loads([l for l in p.stdout.splitlines() if l.startswith("J=")][-1][2:])
+                    if name in cases:
+                        self.assertEqual((j["state"], j["applies"]), ("unknown", True), (name, j))
+                    else:
+                        self.assertEqual((j["state"], j["applies"]), ("not-applicable", False), (name, j))
+
     def test_r6_b2_an_export_shaped_receipt_in_a_playback_leg_is_provisional_and_refused(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             receipt = self.write_leg(Path(d), "shaped-1", EXPORT_SHAPED, {"hostLoad": CIM_FAILED})
@@ -618,6 +646,19 @@ class MatrixRowStrictPredicateTests(unittest.TestCase):
         self.assertNotIn("59.56", table, "an unknown row never reaches the median")
         baseline = (DV_DIR / "Invoke-VenueBaseline.ps1").read_text(encoding="utf-8")
         self.assertIn("$_.status -ceq 'RAN' -and $null -ne $_.fps -and (Test-DvHostLoadRowClean -Row $_)", baseline)
+
+    def test_adversary_a8_a_soft_hyphenated_leg_type_is_refused_by_the_spec_validator(self) -> None:
+        # adversary-ac6205bd.json A8, its input: the shipped ProRes export spec with legType "ex<U+00AD>port". -cin (culture-aware) accepted it and every later
+        # -ceq 'export' dispatched it as an export while the ordinal planned-type reader read playback. The validator's membership is ordinal now.
+        spec = json.loads((DV_DIR / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8-sig"))
+        out = []
+        for name, lt in (("soft-hyphen", "ex­port"), ("real", "export")):
+            spec["legType"] = lt
+            text = json.dumps(spec).replace("'", "''")
+            out.append((name, self.run_dv(f"$s = ConvertFrom-Json -InputObject '{text}'; $r = Get-DvLegSpecShapeRefusal -Spec $s; "
+                                          "Write-Output ('REFUSAL=' + $(if ($r) { [string]$r } else { '<none>' }))")))
+        self.assertIn("REFUSAL=legType must be one of", out[0][1], out[0][1])
+        self.assertNotIn("legType must be one of", out[1][1], "the real export legType is still accepted")
 
     def test_residue_b3_the_row_builder_keeps_collected_false_and_the_row_is_never_measured(self) -> None:
         # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B3, its catalogue addition): -HostLoad @{state='quiet'; provisional=$false; collected=$false;

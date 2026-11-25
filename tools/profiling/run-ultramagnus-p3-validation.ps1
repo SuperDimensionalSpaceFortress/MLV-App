@@ -209,6 +209,10 @@ function Get-AdapterCheckVerdict {
     }
 }
 
+# adversary-ac6205bd.json A2: each smoke result's TEXT is also judged by the venue reader (a repeated member or a singleton root array), and an imported
+# packet's summary.json is refused when it repeats a member
+Import-Module (Join-Path $PSScriptRoot 'dual-venue\VenueChain.psm1') -Function ConvertFrom-VenueSmokeResultText, Find-VenueJsonDuplicateMember -DisableNameChecking
+
 function Get-SmokeSummaryHostLoadFields {
     # PLAYBACK-MEASURE-HOST-LOAD-GATE-1 round 3: this script invokes run-release-gui-smoke.ps1
     # per clip and already parses its JSON output ($result below) for presentedFps etc; that JSON
@@ -252,6 +256,22 @@ function Get-SmokeSummaryHostLoadFields {
         if ($side -eq 'before') { $beforeCollectedRaw = $collectedProperty.Value } else { $afterCollectedRaw = $collectedProperty.Value }
     }
     $collectedRaw = ($beforeCollectedRaw -is [bool] -and $beforeCollectedRaw -and $afterCollectedRaw -is [bool] -and $afterCollectedRaw)
+    # adversary-ac6205bd.json A1: every interior (during) sample must be collected too (a present during, null included, must be a list of collected samples)
+    $duringProperty = $HostLoad.PSObject.Properties["during"]
+    if ($null -ne $duringProperty) {
+        $duringRaw = $duringProperty.Value
+        if ($null -eq $duringRaw -or $duringRaw -is [string] -or $duringRaw -isnot [System.Collections.IList]) { $collectedRaw = $false }
+        else {
+            foreach ($duringSample in $duringRaw) {
+                $duringCollected = $null
+                if ($null -ne $duringSample -and $duringSample -isnot [System.Collections.IList] -and $duringSample -isnot [string] -and $duringSample -isnot [ValueType]) {
+                    $duringCollectedProperty = $duringSample.PSObject.Properties["collected"]
+                    if ($null -ne $duringCollectedProperty) { $duringCollected = $duringCollectedProperty.Value }
+                }
+                if (-not ($duringCollected -is [bool] -and $duringCollected)) { $collectedRaw = $false }
+            }
+        }
+    }
     $provisional = -not ($provisionalRaw -is [bool] -and -not $provisionalRaw -and $stateRaw -is [string] -and [string]::Equals($stateRaw, 'quiet', [StringComparison]::Ordinal) -and $collectedRaw -is [bool] -and $collectedRaw)
     $state = if ($stateRaw -is [string] -and -not [string]::IsNullOrWhiteSpace($stateRaw)) { $stateRaw } else { "unknown" }
     $reasonProperty = $HostLoad.PSObject.Properties["reason"]
@@ -565,7 +585,12 @@ function Import-EvidencePacket {
 
     if ($importFailures.Count -eq 0) {
         $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-        $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
+        $summaryText = Get-Content -LiteralPath $summaryPath -Raw
+        $summary = $summaryText | ConvertFrom-Json
+        # adversary-ac6205bd.json A2: a repeated member anywhere (e.g. "hostLoadCollected":false,"hostLoadCollected":true in a clip record) keeps the last
+        # value in the parsed object, so the packet is refused rather than read
+        $summaryDuplicate = try { Find-VenueJsonDuplicateMember -Text $summaryText -All } catch { '<unparsable>' }
+        if ($summaryDuplicate) { Add-Failure $importFailures "summary.json repeats the member $summaryDuplicate; a repeated member is never read as evidence." }
 
         if ($manifest.schema -ne "mlvapp-ultramagnus-p3-evidence-packet.v1") {
             Add-Failure $importFailures "Unexpected evidence manifest schema: $($manifest.schema)"
@@ -1147,8 +1172,15 @@ exit `$LASTEXITCODE
         $textureAmazeWallMsValues = [System.Collections.Generic.List[double]]::new()
         $texturePostMsValues = [System.Collections.Generic.List[double]]::new()
 
+        $resultTextStanding = $null
         if (Test-Path -LiteralPath $clipOutput) {
-            $result = Get-Content -LiteralPath $clipOutput -Raw | ConvertFrom-Json
+            # adversary-ac6205bd.json A2/A5: one BOM-aware read, parsed with -NoEnumerate (a singleton root stays an array); the same text is judged by
+            # VenueChain.psm1 ConvertFrom-VenueSmokeResultText (repeated member, root not one object, uncollected sample) below, beside the block reader
+            $resultBytes = [IO.File]::ReadAllBytes($clipOutput)
+            $resultText = [IO.StreamReader]::new([IO.MemoryStream]::new($resultBytes), [Text.UTF8Encoding]::new($false), $true).ReadToEnd()
+            $resultTextStanding = ConvertFrom-VenueSmokeResultText -Text $resultText
+            $result = ConvertFrom-Json -InputObject $resultText -NoEnumerate
+            if ($result -is [System.Collections.IList]) { Add-Failure $clipFailures "The smoke result JSON is not one object."; $result = $null }
             if (-not $result.validation.ok) {
                 Add-Failure $clipFailures ("Wrapper validation failed: " + (($result.validation.failures | ForEach-Object { [string]$_ }) -join "; "))
             }
@@ -1268,6 +1300,14 @@ exit `$LASTEXITCODE
         # entry, conflating "we couldn't get a clean signal" with "the build is broken", exactly
         # backwards from this card's own rule that host load MARKS, never fails, a run.
         $hostLoadFields = Get-SmokeSummaryHostLoadFields -HostLoad $(if ($result) { , $result.hostLoad } else { $null })
+        # adversary-ac6205bd.json A2: the smoke result's TEXT must read clean too (a repeated member keeps the last value in the parsed object)
+        if ($null -ne $resultTextStanding) {
+            $textProvisionalRaw = $resultTextStanding.provisional; $textStateRaw = $resultTextStanding.state; $textCollectedRaw = $resultTextStanding.collected
+            $textProvisional = -not ($textProvisionalRaw -is [bool] -and -not $textProvisionalRaw -and $textStateRaw -is [string] -and [string]::Equals($textStateRaw, 'quiet', [StringComparison]::Ordinal) -and $textCollectedRaw -is [bool] -and $textCollectedRaw)
+            if ($textProvisional) {
+                $hostLoadFields = [pscustomobject]@{ provisional = $true; state = $(if ([string]$textStateRaw) { [string]$textStateRaw } else { 'unknown' }); collected = $false; reason = "smoke result text: $($resultTextStanding.reason)" }
+            }
+        }
 
         if ($receiptRawFixesEnabled) {
             if ($noReadbackFrames -le 0) {

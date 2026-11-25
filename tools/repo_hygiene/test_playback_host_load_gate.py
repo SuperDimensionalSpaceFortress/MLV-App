@@ -1669,6 +1669,50 @@ class CompareGuiSmokeAbInconclusiveVerdictTests(_ProbeCase):
                 self.assertEqual(report["verdict"], "INCONCLUSIVE")
                 self.assertTrue(any("before smoke JSON could not be parsed" in f for f in report["failures"]), report["failures"])
 
+    def test_adversary_a4_the_same_file_twice_is_read_once_and_refused_in_the_report(self) -> None:
+        # adversary-ac6205bd.json A4: -Before X -After X opened X twice (a lock between the reads aborted the report) and the distinct-path refusal was
+        # never reached. The same path is read once and the report records the same-input refusal.
+        quiet = '{"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}'
+        with tempfile.TemporaryDirectory(prefix="gui-ab-same-") as tmp:
+            smoke, out = Path(tmp) / "smoke.json", Path(tmp) / "compare.json"
+            smoke.write_text(quiet, encoding="utf-8", newline="")
+            proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(COMPARE_SCRIPT),
+                                   "-Before", str(smoke), "-After", str(smoke), "-Output", str(out)],
+                                  capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=300)
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            report = json.loads(out.read_text(encoding="utf-8-sig"))
+        self.assertTrue(any("same smoke JSON file" in f for f in report["failures"]), report["failures"])
+        self.assertIn("$beforeSource\n} else {\n    Read-SmokeSourceOnce -Path $After", COMPARE_SCRIPT.read_text(encoding="utf-8"))
+
+    def test_adversary_a5_a_utf16_smoke_result_is_read_by_its_bom(self) -> None:
+        # adversary-ac6205bd.json A5: a valid quiet result saved as UTF-16LE with its BOM was force-decoded as UTF-8 (replacement characters and NULs) and the
+        # before arm read unknown. It is decoded by its BOM now, as Get-Content did, so its host load reads quiet.
+        quiet = '{"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}'
+        with tempfile.TemporaryDirectory(prefix="gui-ab-utf16-") as tmp:
+            before, after, out = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "compare.json"
+            before.write_bytes(b"\xff\xfe" + quiet.encode("utf-16-le"))
+            after.write_text(quiet, encoding="utf-8", newline="")
+            proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(COMPARE_SCRIPT),
+                                   "-Before", str(before), "-After", str(after), "-Output", str(out)],
+                                  capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=300)
+            report = json.loads(out.read_text(encoding="utf-8-sig"))
+        self.assertEqual(report["hostLoadEvidence"]["before"]["state"], "quiet", proc.stdout + proc.stderr)
+        self.assertNotIn("REFERENCE_PROVISIONAL leg=before", proc.stdout)
+        self.assertFalse(any("before smoke JSON could not be parsed" in f for f in report["failures"]), report["failures"])
+        # the venue readers decode receipts, specs and results by their BOM too (ConvertFrom-VenueBomBytes)
+        probe = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+                                f"$m = Import-Module '{ROOT / 'tools' / 'profiling' / 'dual-venue' / 'VenueChain.psm1'}' -DisableNameChecking -PassThru; "
+                                "$b = [byte[]](@(0xFF, 0xFE) + [Text.Encoding]::Unicode.GetBytes('{\"legType\":\"export\"}')); "
+                                "Write-Output ('T=' + (& $m { param($x) ConvertFrom-VenueBomBytes $x } $b))"],
+                               capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=120)
+        self.assertIn('T={"legType":"export"}', probe.stdout, probe.stdout + probe.stderr)
+        venue = (ROOT / "tools" / "profiling" / "dual-venue" / "VenueChain.psm1").read_text(encoding="utf-8")
+        self.assertNotIn("[Text.Encoding]::UTF8.GetString($bytes)", venue)
+        self.assertNotIn("[Text.Encoding]::UTF8.GetString($rcBytes)", venue)
+        baseline = (ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueBaseline.ps1").read_text(encoding="utf-8")
+        # adversary-ac6205bd.json A7: an unclean chain's receipt is never opened for its host load either
+        self.assertIn("$hlReceipt = $(if ($chainClean -and $leg.PSObject.Properties['receipt'] -and $leg.receipt)", baseline)
+
     def test_residue_b2_the_entry_point_reads_each_smoke_file_once(self) -> None:
         # sol r6 B2: the entry point opened each smoke file twice (Read-SmokeJson, then ReadAllText), and the evidence binding hashed it a third time,
         # so a lock taken between the reads aborted the report. One ReadAllBytes (Read-SmokeSourceOnce) now feeds the parse, the strict host-load
@@ -1861,12 +1905,43 @@ class SmokeSummaryHostLoadFieldsTests(_ProbeCase):
             "array": "[pscustomobject]@{ provisional = @($false); state = 'quiet'; " + SNAPS + " }",
             "string": "[pscustomobject]@{ provisional = 'false'; state = 'quiet'; " + SNAPS + " }",
             "upper": "[pscustomobject]@{ provisional = $false; state = 'QUIET'; " + SNAPS + " }",
+            # adversary-ac6205bd.json A1: an uncollected interior sample, a null during and a during that is not a list
+            "during-uncollected": "[pscustomobject]@{ provisional = $false; state = 'quiet'; " + SNAPS + "; during = @([pscustomobject]@{ collected = $false }) }",
+            "during-null": "[pscustomobject]@{ provisional = $false; state = 'quiet'; " + SNAPS + "; during = $null }",
+            "during-object": "[pscustomobject]@{ provisional = $false; state = 'quiet'; " + SNAPS + "; during = [pscustomobject]@{ collected = $true } }",
         }
         for name, block in cases.items():
             with self.subTest(case=name):
                 proc = self._fields(block)
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertIn("PROVISIONAL=True", proc.stdout, (name, proc.stdout))
+        proc = self._fields("[pscustomobject]@{ provisional = $false; state = 'quiet'; " + SNAPS + "; during = @([pscustomobject]@{ collected = $true }) }")
+        self.assertIn("PROVISIONAL=False", proc.stdout, "a collected during list is still clean")
+
+    def test_adversary_a2_the_smoke_text_is_judged_by_the_venue_reader_and_read_without_unrolling(self) -> None:
+        # adversary-ac6205bd.json A2: a singleton root array or a repeated member (before {"collected":false,"collected":true}) was parsed into a clean
+        # object (ConvertFrom-Json unrolls the root and keeps the last duplicate). Read-SmokeSummary now parses with -NoEnumerate and also judges the TEXT
+        # with VenueChain.psm1 ConvertFrom-VenueSmokeResultText; a standing it does not read clean makes the leg provisional and uncollected.
+        source = CUDA_AB_SCRIPT.read_text(encoding="utf-8")
+        body = _extract_functions(CUDA_AB_SCRIPT, ["Read-SmokeSummary"])
+        self.assertIn("$json = ConvertFrom-Json -InputObject $smokeText -Depth 100 -NoEnumerate", body)
+        self.assertIn("$textStanding = ConvertFrom-VenueSmokeResultText -Text $smokeText", body)
+        self.assertIn("if ($textProvisional) {", body)
+        self.assertNotIn("Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json", body)
+        self.assertIn("-Function ConvertFrom-VenueSmokeResultText, Find-VenueJsonDuplicateMember", source)
+        clean = '{"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}'
+        dup = '{"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":false,"collected":true},"after":{"collected":true}}}'
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+                               f"Import-Module '{ROOT / 'tools' / 'profiling' / 'dual-venue' / 'VenueChain.psm1'}' -DisableNameChecking; "
+                               f"foreach ($t in @('[{clean}]', '{dup}', '{clean}')) {{ $s = ConvertFrom-VenueSmokeResultText -Text $t; Write-Output ('S=' + $s.state + ',' + $s.provisional) }}"],
+                              capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=120)
+        self.assertEqual([l for l in proc.stdout.splitlines() if l.startswith("S=")], ["S=unknown,True", "S=unknown,True", "S=quiet,False"], proc.stdout + proc.stderr)
+        p3 = P3_VALIDATION_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("$resultTextStanding = ConvertFrom-VenueSmokeResultText -Text $resultText", p3)
+        self.assertIn("$result = ConvertFrom-Json -InputObject $resultText -NoEnumerate", p3)
+        self.assertIn("Find-VenueJsonDuplicateMember -Text $summaryText -All", p3, "an imported P3 packet that repeats a member is refused")
+        self.assertIn("Find-VenueJsonDuplicateMember -Text $raw -All", COMPARE_MACHINE_PERF_SCRIPT.read_text(encoding="utf-8"))
+        self.assertIn("Find-VenueJsonDuplicateMember -Text $summaryText -All", CUDA_PROOF_SUMMARIZER_SCRIPT.read_text(encoding="utf-8"))
 
 
 @requires_pwsh
@@ -2744,7 +2819,9 @@ class HostLoadReaderPredicateCensusTests(unittest.TestCase):
     # located nowhere. Six strict sites: compare-machine-perf.ps1 (1), run-release-cuda-playback-ab.ps1 (2: Get-HostLoadProofFailures and
     # Get-SmokeSummaryHostLoadFields), run-ultramagnus-p3-validation.ps1 (2: Get-SmokeSummaryHostLoadFields and the per-clip guard),
     # summarize-local-cuda-proof.ps1 (1); the GUI comparator still defines none of its own.
-    EXPECTED_SITE_COUNT = 6
+    # adversary-ac6205bd.json A2: +2, the smoke-TEXT standing (VenueChain.psm1 ConvertFrom-VenueSmokeResultText) judged by the same strict line in
+    # run-release-cuda-playback-ab.ps1 Read-SmokeSummary and run-ultramagnus-p3-validation.ps1's per-clip read.
+    EXPECTED_SITE_COUNT = 8
     # A predicate-site line (comment-stripped): mentions a provisional-named identifier and the 'quiet' literal (either quote).
     _SITE_LOCATOR_PATTERN = re.compile(r"""^(?=.*[Pp]rovisional)(?=.*['"]quiet['"]).+$""", re.MULTILINE)
     STRICT_PREDICATE_PATTERN = re.compile(
@@ -3084,6 +3161,10 @@ class P3ValidationSmokeSummaryHostLoadFieldsTests(_ProbeCase):
             "array": "[pscustomobject]@{ provisional = @($false); state = 'quiet'; " + SNAPS + " }",
             "upper": "[pscustomobject]@{ provisional = $false; state = 'QUIET'; " + SNAPS + " }",
             "singleton-block": ", @([pscustomobject]@{ provisional = $false; state = 'quiet'; " + SNAPS + " })",
+            # adversary-ac6205bd.json A1 (sibling run-ultramagnus-p3-validation.ps1:252)
+            "during-uncollected": "[pscustomobject]@{ provisional = $false; state = 'quiet'; " + SNAPS + "; during = @([pscustomobject]@{ collected = $false }) }",
+            "during-null": "[pscustomobject]@{ provisional = $false; state = 'quiet'; " + SNAPS + "; during = $null }",
+            "during-object": "[pscustomobject]@{ provisional = $false; state = 'quiet'; " + SNAPS + "; during = [pscustomobject]@{ collected = $true } }",
         }
         for name, block in cases.items():
             with self.subTest(case=name):

@@ -686,6 +686,9 @@ function Invoke-ChildPowerShell {
     }
 }
 
+# adversary-ac6205bd.json A2: Read-SmokeSummary judges each smoke result's TEXT with the venue reader too (a repeated member or a singleton root array)
+Import-Module (Join-Path $PSScriptRoot 'dual-venue\VenueChain.psm1') -Function ConvertFrom-VenueSmokeResultText, Find-VenueJsonDuplicateMember -DisableNameChecking
+
 function Get-HostLoadProofFailures {
     # PLAYBACK-MEASURE-HOST-LOAD-GATE-1: this proof's presentedFps comparison is exactly the kind
     # of cross-run fps comparison a PROVISIONAL leg must never enter -- an fps number measured on
@@ -769,6 +772,13 @@ function Get-SmokeSummaryHostLoadFields {
     $beforeCollectedRaw = & $readMember (& $readMember $HostLoad 'before') 'collected'
     $afterCollectedRaw = & $readMember (& $readMember $HostLoad 'after') 'collected'
     $collectedRaw = ($beforeCollectedRaw -is [bool] -and $beforeCollectedRaw -and $afterCollectedRaw -is [bool] -and $afterCollectedRaw)
+    # adversary-ac6205bd.json A1: every interior (during) sample must be collected too, as in VenueChain.psm1 ConvertFrom-VenueSmokeHostLoad: a during
+    # member that is present (null included) must be a list whose every element has collected a real [bool] $true.
+    if ($null -ne $HostLoad -and $HostLoad -isnot [System.Collections.IList] -and $null -ne $HostLoad.PSObject.Properties['during']) {
+        $duringRaw = $HostLoad.PSObject.Properties['during'].Value
+        if ($null -eq $duringRaw -or $duringRaw -is [string] -or $duringRaw -isnot [System.Collections.IList]) { $collectedRaw = $false }
+        else { foreach ($duringSample in $duringRaw) { $duringCollected = & $readMember $duringSample 'collected'; if (-not ($duringCollected -is [bool] -and $duringCollected)) { $collectedRaw = $false } } }
+    }
     $provisional = -not ($provisionalRaw -is [bool] -and -not $provisionalRaw -and $stateRaw -is [string] -and [string]::Equals($stateRaw, 'quiet', [StringComparison]::Ordinal) -and $collectedRaw -is [bool] -and $collectedRaw)
     $state = if ($stateRaw -is [string] -and -not [string]::IsNullOrWhiteSpace($stateRaw)) { $stateRaw } else { "unknown" }
     $reason = if ($null -eq $HostLoad) {
@@ -805,7 +815,13 @@ function Read-SmokeSummary {
         }
     }
 
-    $json = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -Depth 100
+    # adversary-ac6205bd.json A2/A5: one byte read, decoded by its BOM (a UTF-16 result is not mangled), parsed with -NoEnumerate (a singleton root array
+    # stays an array, never a clean object); the same text is judged by VenueChain.psm1 ConvertFrom-VenueSmokeResultText (a repeated member, a root
+    # that is not one object, an uncollected sample) and anything it does not read clean makes the leg provisional.
+    $smokeBytes = [IO.File]::ReadAllBytes($Path)
+    $smokeText = [IO.StreamReader]::new([IO.MemoryStream]::new($smokeBytes), [Text.UTF8Encoding]::new($false), $true).ReadToEnd()
+    $json = ConvertFrom-Json -InputObject $smokeText -Depth 100 -NoEnumerate
+    $textStanding = ConvertFrom-VenueSmokeResultText -Text $smokeText
     # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B1): the block is taken as it is (a function return would unroll a one-element array)
     $hostLoad = $null
     if ($null -ne $json -and $json -isnot [System.Collections.IList]) {
@@ -817,6 +833,14 @@ function Read-SmokeSummary {
     $hostLoadState = $hostLoadFields.state
     $hostLoadCollected = $hostLoadFields.collected
     $hostLoadReason = $hostLoadFields.reason
+    $textProvisionalRaw = $textStanding.provisional; $textStateRaw = $textStanding.state; $textCollectedRaw = $textStanding.collected
+    $textProvisional = -not ($textProvisionalRaw -is [bool] -and -not $textProvisionalRaw -and $textStateRaw -is [string] -and [string]::Equals($textStateRaw, 'quiet', [StringComparison]::Ordinal) -and $textCollectedRaw -is [bool] -and $textCollectedRaw)
+    if ($textProvisional) {
+        $hostLoadProvisional = $true
+        $hostLoadCollected = $false
+        if ([string]::Equals([string]$textStanding.state, 'unknown', [StringComparison]::Ordinal)) { $hostLoadState = 'unknown' }
+        $hostLoadReason = (@(@($hostLoadReason) + @("smoke result text: $($textStanding.reason)")) | Where-Object { $_ }) -join '; '
+    }
     $summary = Get-NestedValue $json "log.summary"
     $glProof = Get-NestedValue $json "visualQuality.glOutputProof"
     if ($null -eq $glProof) {

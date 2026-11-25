@@ -475,7 +475,13 @@ if (!(Test-Path -LiteralPath $SummaryPath -PathType Leaf)) {
 }
 
 $summaryFullPath = (Resolve-Path -LiteralPath $SummaryPath).Path
-$summary = Get-Content -LiteralPath $summaryFullPath -Raw | ConvertFrom-Json -Depth 100
+$summaryText = Get-Content -LiteralPath $summaryFullPath -Raw
+# adversary-ac6205bd.json A2: ConvertFrom-Json keeps the LAST of two same-named members ("hostLoadCollected":false,"hostLoadCollected":true reads true),
+# so a summary that repeats a member anywhere is refused, never summarized
+Import-Module (Join-Path $PSScriptRoot 'dual-venue\VenueChain.psm1') -Function Find-VenueJsonDuplicateMember -DisableNameChecking
+$summaryDuplicate = try { Find-VenueJsonDuplicateMember -Text $summaryText -All } catch { $null }
+if ($summaryDuplicate) { throw "Summary JSON repeats the member $summaryDuplicate ($summaryFullPath); a repeated member is never read as evidence." }
+$summary = $summaryText | ConvertFrom-Json -Depth 100
 $failures = @($summary.failures | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
 $warnings = @($summary.warnings | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
 

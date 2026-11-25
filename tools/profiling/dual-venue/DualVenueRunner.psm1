@@ -3616,7 +3616,10 @@ function Get-DvLegSpecShapeRefusal {
     # leg's -eq against the array was truthy and indexed the absent look before any receipt. An array, object, number, null, empty or other-case value is
     # refused here, for the leg and every batch preflight alike. An ABSENT legType stays a speed leg, as the runner has always read it.
     $legTypeProp = $Spec.PSObject.Properties['legType']
-    if ($null -ne $legTypeProp -and -not ($legTypeProp.Value -is [string] -and $legTypeProp.Value -cin $script:LegTypes)) {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (adversary-ac6205bd.json A8): ORDINAL membership. -cin is culture-aware and ignores a soft hyphen, so
+    # "ex<U+00AD>port" passed here and every later -ceq 'export' dispatched it as an export, while the ordinal planned-type reader (VenueChain.psm1
+    # Get-VenuePlannedLegType) read playback. Refusing it here makes the validator, the dispatch and the exemption agree.
+    if ($null -ne $legTypeProp -and -not ($legTypeProp.Value -is [string] -and @($script:LegTypes | Where-Object { [string]::Equals($_, [string]$legTypeProp.Value, [StringComparison]::Ordinal) }).Count -eq 1)) {
         return "legType must be one of $(($script:LegTypes | ForEach-Object { '"' + $_ + '"' }) -join ', ') (one JSON string; it is $(ConvertTo-Json -InputObject $legTypeProp.Value -Compress -Depth 3))"
     }
     $exportRefusal = Get-DvExportShapeRefusal -Spec $Spec -IsExportLeg ($null -ne $legTypeProp -and $legTypeProp.Value -ceq 'export')

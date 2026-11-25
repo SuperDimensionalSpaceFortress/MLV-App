@@ -30,6 +30,9 @@ if (@($InputPath).Count -eq 0) {
     throw "At least one input JSON/profile/field-log path is required."
 }
 
+# adversary-ac6205bd.json A2: the venue reader's duplicate-member scan (System.Text.Json)
+Import-Module (Join-Path $PSScriptRoot 'dual-venue\VenueChain.psm1') -Function Find-VenueJsonDuplicateMember -DisableNameChecking
+
 function Read-JsonRecords {
     param([string]$Path)
 
@@ -43,7 +46,14 @@ function Read-JsonRecords {
         throw "Input JSON is empty: $resolved"
     }
 
+    # adversary-ac6205bd.json A2: ConvertFrom-Json keeps the LAST of two same-named members ("hostLoadCollected":false,"hostLoadCollected":true reads
+    # true), so a record that repeats a member anywhere is refused, never compared (a JSONL file is checked line by line below)
+    $wholeDuplicate = $null
+    $wholeParses = $true
+    try { $wholeDuplicate = Find-VenueJsonDuplicateMember -Text $raw -All } catch { $wholeParses = $false }
+    if ($wholeDuplicate) { throw "Input JSON repeats the member $wholeDuplicate in ${resolved}; a repeated member is never read as evidence." }
     try {
+        if (-not $wholeParses) { throw "not one JSON document" }
         return @([pscustomobject]@{
             source = $resolved
             json = ($raw | ConvertFrom-Json -Depth 100)
@@ -57,6 +67,9 @@ function Read-JsonRecords {
             if ([string]::IsNullOrWhiteSpace($line)) {
                 continue
             }
+            $lineDuplicate = $null
+            try { $lineDuplicate = Find-VenueJsonDuplicateMember -Text $line -All } catch { $lineDuplicate = $null }
+            if ($lineDuplicate) { throw "Input JSONL repeats the member $lineDuplicate in ${resolved} at line ${lineNumber}; a repeated member is never read as evidence." }
             try {
                 $records += [pscustomobject]@{
                     source = "${resolved}:$lineNumber"

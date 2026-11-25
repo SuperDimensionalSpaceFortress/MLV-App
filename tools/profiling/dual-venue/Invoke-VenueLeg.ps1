@@ -191,7 +191,7 @@ if ($null -ne $setPlan) {
         $legReceipt = $null
         if ($receiptPath -and (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
             # r6 (adversary-de8e3799.json A4): read the receipt bytes ONCE; the figures come from them and the host-load read is bound to their sha256
-            try { $legReceiptBytes = [IO.File]::ReadAllBytes($receiptPath); $legReceiptSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($legReceiptBytes)); $legReceipt = [Text.Encoding]::UTF8.GetString($legReceiptBytes).TrimStart([char]0xFEFF) | ConvertFrom-Json } catch { $legReceipt = $null; $legReceiptSha = '' }
+            try { $legReceiptBytes = [IO.File]::ReadAllBytes($receiptPath); $legReceiptSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($legReceiptBytes)); $legReceipt = [IO.StreamReader]::new([IO.MemoryStream]::new($legReceiptBytes), [Text.UTF8Encoding]::new($false), $true).ReadToEnd().TrimStart([char]0xFEFF) | ConvertFrom-Json } catch { $legReceipt = $null; $legReceiptSha = '' }
         }
         # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): the leg's host-load standing, from its own hash-bound smoke result (the reader the lease batch and the chain
         # use); a provisional or unknown leg is printed as REFERENCE_PROVISIONAL, its row carries hostLoadState / hostLoadProvisional, and it is never measured.
