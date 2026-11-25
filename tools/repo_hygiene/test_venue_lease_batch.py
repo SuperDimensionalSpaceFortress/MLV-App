@@ -501,7 +501,12 @@ $hlBlock = switch ($hlMode) {
     'missing' { $null }
     default { '{"before":{"collected":true},"after":{"collected":true},"state":"quiet","provisional":false,"reason":"quiet"}' }
 }
-if ($hlMode -ne 'none') { Set-Content -LiteralPath (Join-Path $edir 'result.json') -Value ('{"schema":"mlvapp-gui-smoke-result.v2"' + $(if ($hlBlock) { ',"hostLoad":' + $hlBlock }) + '}') }
+if ($hlMode -ne 'none') {
+    $resPath = Join-Path $edir 'result.json'
+    Set-Content -LiteralPath $resPath -Value ('{"schema":"mlvapp-gui-smoke-result.v2"' + $(if ($hlBlock) { ',"hostLoad":' + $hlBlock }) + '}')
+    # like the real leg, the receipt binds the smoke result it was written from (evidence.resultJsonSha256; adversary-b0c05520.json A1)
+    Set-Content -LiteralPath $rp -Value ('{"evidence":{"resultJsonSha256":"' + (Get-FileHash -LiteralPath $resPath -Algorithm SHA256).Hash.ToLowerInvariant() + '"}}')
+}
 # r4 (adversary r4 A1): FAKE_LEG_TAIL_SLEEP = the leg child's own work after its agent job ended (its receipt, its evidence), before it exits
 if ($env:FAKE_LEG_TAIL_SLEEP) { Start-Sleep -Seconds ([int]$env:FAKE_LEG_TAIL_SLEEP) }
 # r6 (adversary-848f6559.json A1): FAKE_LEG_EXIT per call = the child exits with that code AFTER its agent job's result landed (a receipt write denied, Invoke-VenueLeg.ps1:314)
@@ -921,6 +926,16 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.assertIn("class=HOSTLOAD_PROVISIONAL counted=False", log)
         self.assertIn("hostLoadState=unknown hostLoadProvisional=True", log)
         self.assertIn("hostLoadState=quiet hostLoadProvisional=False", log)
+
+    def test_a_provisional_host_load_is_named_whatever_the_preload_class(self) -> None:
+        # adversary-b0c05520.json A5, its input: pre-load 31 % (QUIET_PRELOAD_HIGH) and a CIM-failed smoke host load. The class stays the pre-load's
+        # (already uncounted), and the typed REFERENCE_PROVISIONAL line is still printed. RED: the line was printed only for HOSTLOAD_PROVISIONAL.
+        r = self.run_batch(self.specs[:1], FAKE_LEG_PRELOADS="31", FAKE_LEG_HOSTLOADS="cim")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        [l] = b["legs"]
+        self.assertEqual((l["class"], l["counted"], l["hostLoadState"], l["hostLoadProvisional"]), ("QUIET_PRELOAD_HIGH", False, "unknown", True), l)
+        self.assertIn(f"REFERENCE_PROVISIONAL leg={Path(l['receipt']).stem} reason=hostload-unknown", (self.run_dir / "batch.log").read_text(encoding="utf-8"))
 
     def test_a_quiet_host_load_leaves_todays_counting_unchanged(self) -> None:
         r = self.run_batch(self.specs[:1])

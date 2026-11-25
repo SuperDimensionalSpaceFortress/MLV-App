@@ -104,6 +104,20 @@ class SmokeHostLoadStandingTests(unittest.TestCase):
                 self.assertTrue(s["provisional"], s)
                 self.assertNotEqual(s["state"], "quiet", s)
 
+    def test_adversary2_a3_an_uncollected_interior_sample_is_not_collected(self) -> None:
+        # adversary-b0c05520.json A3, its input: a during[] sample collected=false under a quiet/false block read clean.
+        s = self.standing({"state": "quiet", "provisional": False, "before": {"collected": True},
+                           "during": [{"collected": False, "error": "collection failed: CimException"}], "after": {"collected": True}})
+        self.assertEqual((s["state"], s["provisional"], s["collected"]), ("unknown", True, False), s)
+        for during in ([{"collected": [True]}], [{"collected": True}, None], "x", [{"error": "no collected field"}]):
+            with self.subTest(during=during):
+                s = self.standing({**QUIET, "during": during})
+                self.assertTrue(s["provisional"], s)
+        for during in ([], [{"collected": True}, {"collected": True}]):
+            with self.subTest(during=during):
+                s = self.standing({**QUIET, "during": during})
+                self.assertFalse(s["provisional"], s)
+
     def test_degenerate_blocks_never_read_clean(self) -> None:
         for block in ({"state": "quiet"}, {"provisional": False}, {"state": "exceeded", "provisional": False}, {"state": "", "provisional": False,
                       "before": {"collected": True}, "after": {"collected": True}}, {"state": "quiet", "provisional": "false", "before": {"collected": True},
@@ -125,15 +139,19 @@ class LegHostLoadReaderTests(unittest.TestCase):
             for rid, (kind, block) in cases.items():
                 receipt = root / "CARD-1" / "leg-x" / "bachelor" / f"{rid}.json"
                 receipt.parent.mkdir(parents=True, exist_ok=True)
-                receipt.write_text("{}", encoding="utf-8")
                 folder = ev / rid / ("export" if kind == "export" else "")
                 folder.mkdir(parents=True, exist_ok=True)
                 (folder / "summary.json").write_text(json.dumps({"cpuQuiescence": {"timeMeanPercent": 5}}), encoding="utf-8")
+                rbody: dict = {"export": {"frames": 480}, "evidence": {}} if kind == "export" else {"evidence": {}}
                 if kind == "play" and block != "absent":
                     body = {"schema": "mlvapp-gui-smoke-result.v2"}
                     if block is not None:
                         body["hostLoad"] = block
-                    (ev / rid / "result.json").write_text(json.dumps(body), encoding="utf-8")
+                    raw = json.dumps(body).encode("utf-8")
+                    (ev / rid / "result.json").write_bytes(raw)
+                    import hashlib
+                    rbody["evidence"]["resultJsonSha256"] = hashlib.sha256(raw).hexdigest()   # the receipt binds its smoke result (adversary-b0c05520.json A1)
+                receipt.write_text(json.dumps(rbody), encoding="utf-8")
             body = ("$r = [ordered]@{}; "
                     + "".join(f"$r['{rid}'] = Get-VenueLegHostLoad -ReceiptPath '{root / 'CARD-1' / 'leg-x' / 'bachelor' / (rid + '.json')}'; " for rid in cases)
                     + "$r | ConvertTo-Json -Compress -Depth 4")
@@ -147,6 +165,64 @@ class LegHostLoadReaderTests(unittest.TestCase):
         self.assertEqual((got["exp-1"]["state"], got["exp-1"]["provisional"], got["exp-1"]["applies"]), ("not-applicable", False, False),
                          "an export leg runs no GUI smoke: its counting is unchanged")
         self.assertTrue(all(got[k]["applies"] for k in ("cim-1", "quiet-1", "nohl-1", "noresult-1")), got)
+
+
+@unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+class LegHostLoadBindingTests(unittest.TestCase):
+    """adversary-b0c05520.json A1 (the standing comes from the receipt's own smoke result; only a receipt that is an export skips it) and A2
+    (duplicate members never pick a clean value)."""
+
+    def read(self, cases: dict) -> dict:
+        import hashlib
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "receipts"
+            ev = Path(d) / "evidence"
+            for rid, (receipt_body, layout, result_text) in cases.items():
+                receipt = root / "CARD-1" / "leg-x" / "bachelor" / f"{rid}.json"
+                receipt.parent.mkdir(parents=True, exist_ok=True)
+                folder = ev / rid
+                (folder / "export").mkdir(parents=True, exist_ok=True)
+                summary = folder / ("export" if layout == "export" else "") / "summary.json"
+                summary.write_text(json.dumps({"cpuQuiescence": {"timeMeanPercent": 5}}), encoding="utf-8")
+                sha = None
+                if result_text is not None:
+                    (folder / "result.json").write_bytes(result_text.encode("utf-8"))
+                    sha = hashlib.sha256(result_text.encode("utf-8")).hexdigest()
+                body = receipt_body(sha) if callable(receipt_body) else receipt_body
+                receipt.write_text(json.dumps(body), encoding="utf-8")
+            p = run_ps("$r = [ordered]@{}; "
+                       + "".join(f"$r['{rid}'] = Get-VenueLegHostLoad -ReceiptPath '{root / 'CARD-1' / 'leg-x' / 'bachelor' / (rid + '.json')}'; " for rid in cases)
+                       + "$r | ConvertTo-Json -Compress -Depth 4")
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            return json.loads(p.stdout)
+
+    def test_a1_a_result_json_that_no_longer_matches_the_receipt_reads_unknown(self) -> None:
+        cim = json.dumps({"hostLoad": CIM_FAILED})
+        quiet = json.dumps({"hostLoad": QUIET})
+        import hashlib
+        cim_sha = hashlib.sha256(cim.encode("utf-8")).hexdigest()
+        got = self.read({
+            "bound-1": (lambda sha: {"evidence": {"resultJsonSha256": sha}}, "play", quiet),
+            "swapped-1": ({"evidence": {"resultJsonSha256": cim_sha}}, "play", quiet),   # the receipt bound the CIM result; the bytes now say quiet
+            "unbound-1": ({"evidence": {}}, "play", quiet),
+            "spoofexp-1": (lambda sha: {"evidence": {"resultJsonSha256": sha}}, "export", cim),   # root summary moved to export\: still a playback receipt
+            "realexp-1": ({"export": {"frames": 480}, "evidence": {}}, "export", None),
+        })
+        self.assertEqual((got["bound-1"]["state"], got["bound-1"]["provisional"]), ("quiet", False), got["bound-1"])
+        for rid in ("swapped-1", "unbound-1", "spoofexp-1"):
+            self.assertEqual((got[rid]["state"], got[rid]["provisional"], got[rid]["applies"]), ("unknown", True, True), (rid, got[rid]))
+        self.assertEqual((got["realexp-1"]["state"], got["realexp-1"]["applies"]), ("not-applicable", False), got["realexp-1"])
+
+    def test_a2_duplicate_members_read_unknown(self) -> None:
+        base = '"before":{"collected":true},"after":{"collected":true}'
+        texts = {
+            "dupprov-1": '{"hostLoad":{"state":"quiet","provisional":true,"provisional":false,' + base + '}}',
+            "duphl-1": '{"hostLoad":{"state":"unknown","provisional":true},"hostLoad":{"state":"quiet","provisional":false,' + base + '}}',
+            "dupcoll-1": '{"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":false,"collected":true},"after":{"collected":true}}}',
+        }
+        got = self.read({rid: (lambda sha: {"evidence": {"resultJsonSha256": sha}}, "play", t) for rid, t in texts.items()})
+        for rid in texts:
+            self.assertEqual((got[rid]["state"], got[rid]["provisional"]), ("unknown", True), (rid, got[rid]))
 
 
 @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
@@ -231,6 +307,15 @@ class ReferenceArmVerdictTests(unittest.TestCase):
         for rid in ("rootarr-1", "hlarr-1"):
             self.assertEqual((got[rid]["state"], got[rid]["provisional"]), ("unknown", True), (rid, got[rid]))
         self.assertTrue(got["provarr-1"]["provisional"], got["provarr-1"])
+
+    def test_adversary2_a8_a_hashtable_leg_and_block_are_read(self) -> None:
+        # adversary-b0c05520.json A8, its input: @{legId='q'; hostLoad=$quiet} read a blank id; an -AsHashtable block read unknown.
+        q = json.dumps(QUIET).replace("'", "''")
+        p = run_ps(f"$quiet = ConvertFrom-Json -InputObject '{q}'; $v = Get-VenueReferenceArmVerdict -Legs @(@{{ legId = 'q'; hostLoad = $quiet }}); "
+                   f"$h = ConvertFrom-VenueSmokeHostLoad -HostLoad (ConvertFrom-Json -InputObject '{q}' -AsHashtable); "
+                   "Write-Output ('V=' + $v.verdict + ' ID=' + $v.legs[0].legId + ' H=' + $h.state + '/' + $h.provisional)")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("V=COUNTED ID=q H=quiet/False", p.stdout)
 
     def test_no_control_leg_at_all_is_inconclusive(self) -> None:
         v, _ = self.verdict([])

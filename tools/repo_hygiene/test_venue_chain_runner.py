@@ -109,7 +109,11 @@ if ($env:FAKE_LEG_PRELOADS) {
     # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: FAKE_LEG_HOSTLOADS per call = the smoke result.json's hostLoad: quiet (default) | cim (collected=false CimException) | none
     $hls = @(([string]$env:FAKE_LEG_HOSTLOADS) -split ',' | Where-Object { $_ }); $hl = $(if ($hls.Count -gt 0) { $hls[[Math]::Min($n, $hls.Count - 1)] } else { 'quiet' })
     $hlBlock = $(if ($hl -eq 'cim') { '{"before":{"collected":false,"error":"collection failed: CimException"},"after":{"collected":false,"error":"collection failed: CimException"},"state":"unknown","provisional":true}' } else { '{"before":{"collected":true},"after":{"collected":true},"state":"quiet","provisional":false}' })
-    if ($hl -ne 'none') { Set-Content -LiteralPath (Join-Path $edir 'result.json') -Value ('{"hostLoad":' + $hlBlock + '}') }
+    if ($hl -ne 'none') {
+        $resPath = Join-Path $edir 'result.json'; Set-Content -LiteralPath $resPath -Value ('{"hostLoad":' + $hlBlock + '}')
+        # like the real leg, the receipt binds the smoke result (evidence.resultJsonSha256; adversary-b0c05520.json A1)
+        Set-Content -LiteralPath $rp -Value ('{"evidence":{"resultJsonSha256":"' + (Get-FileHash -LiteralPath $resPath -Algorithm SHA256).Hash.ToLowerInvariant() + '"}}')
+    }
     "DVE_RECEIPT_PATH=$rp"
 }
 if ($env:FAKE_LEG_LOG) { Add-Content -LiteralPath $env:FAKE_LEG_LOG -Value ("END {0} {1} {2}" -f [DateTime]::UtcNow.Ticks, $leaf, $PID) }
