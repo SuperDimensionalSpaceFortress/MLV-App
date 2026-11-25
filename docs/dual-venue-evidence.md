@@ -465,14 +465,69 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
     worker call** (inside `producer_frame_ms` when there is no bracket): `EXPORT_STAGE_CONTAINMENT_MISMATCH`. Every containment comparison (means, disjoint groups, pairs, the wall, each frame) is made in
     unrounded decimal arithmetic on exact decimal means against the exact limit (5 % + 1 ms) plus ONE epsilon of 4e-7 ms, four tenths of the 1e-6 ms the writers emit (the published rows keep their
     6-place means and the 6-place `wallSeconds`, but the gate never rounds the limit and the figure to that precision first: that let an overrun of a full emitted increment read PASS; the wall limit is
-    built from the DONE `elapsed` exactly as the log wrote it, up to 9 decimals, never from the rounded `wallSeconds`; the epsilon is a policy choice, not a correction of decimal arithmetic), so a figure exactly at the documented tolerance
+    built from the DONE `elapsed` exactly as the log wrote it, up to 9 decimals, plus half its last printed place (r5 of `EXPORT-RENDER-PIPE-TIMING-1`), never from the rounded `wallSeconds`; the epsilon is a policy choice, not a correction of decimal arithmetic), so a figure exactly at the documented tolerance
     is accepted at any magnitude and a mean a sub-precision hair (under four tenths of an increment) past it is not refused, while an overrun of half an increment or more is. Writer, receipt re-derivation and the reader share `Get-DvExportEvidence`, so all three apply it under empty and shipped criteria.
   * ProRes: the denominator is the mean `processed16_total`, the timed per-frame work. The top-level stages are `debayered_frame` and `processing`.
-    `raw_uint16` and `llrawproc` nest inside `debayered_frame`. The batch's `DONE elapsed` starts before the clip opens and also times finish, verify and
-    probe, so it is never a denominator. `batchWallPerFrameMs` and `untimedPerFrameMs` (wall per frame minus `processed16_total`: open, pipe write,
-    ffmpeg back-pressure, finish, verify) are reported beside the table, not as a stage.
-  * The app does not time the untimed part per stage, and the rendered path has no dual-ISO stage. For that reason ProRes legs carry no
-    `dualIsoClassAgrees` criterion. Both gaps belong to successor `EXPORT-RENDER-PIPE-TIMING-1` (product code).
+    `raw_uint16` and `llrawproc` nest inside `debayered_frame`, and `llrawproc_dual_iso` nests inside `llrawproc`. The batch's `DONE elapsed` starts before the clip opens
+    and also times finish, verify and probe, so it is never a denominator.
+  * **ProRes pipe, drain and verify (`EXPORT-RENDER-PIPE-TIMING-1`).** Under `MLVAPP_STAGE_TIMING` the rendered path also emits `llrawproc_dual_iso` per frame (the CDNG
+    profile's `llrawproc_dual_iso_ms` by the same name, `0.000` on a frame no dual-ISO ran on), `export_pipe_write` per frame (and `export_scale` when the frame plan is scaled),
+    and `export_pipe_drain` and `export_verify` once per clip on its last frame. The per-frame stages are held to `processed16_total`'s frames like every other stage
+    (`EXPORT_STAGE_WINDOW_MISMATCH`); the pipe stages follow `processed16_total`, so they are published with no share of it (`largestStage` is unchanged). A once-per-clip stage
+    recorded twice is `EXPORT_RECORD_INVALID`, and one on another frame is `EXPORT_STAGE_WINDOW_MISMATCH`; both are listed under `clipRows`. `processed16_total`, plus
+    `export_scale` and `export_pipe_write`, plus (drain + verify) / frames exported, must fit inside the batch wall per frame. `untimedPerFrameMs` is the wall per frame minus that
+    sum, so what is left is clip open, receipt apply, frame plan and ffmpeg start, the diagnostics read and teardown between the drain and the verify, and the publish.
+    `dualIsoClassAgrees` / `dualIsoActiveFrames` are read over `llrawproc_dual_iso` (from r3 they fail closed, see below), and `renderPipeTimed` is true when the pipe write is on every timed frame with one drain and one verify. Both ProRes legs gate
+    `dualIsoClassAgrees eq true` and `renderPipeTimed eq true`. A stage log from a build before that card has none of these stages: both metrics are null with a
+    `CouldNotCheck` naming that, no problem is added, and `untimedPerFrameMs` is the wall per frame minus `processed16_total` as before. **One exception
+    (`EXPORT-RENDER-PIPE-TIMING-2` r4, sol r4 H-DOC):** a PRESENT `RENDER_START` is read by the line grammar and its bindings on every ProRes route, an older or unnamed
+    build included (`DualVenueRunner.psm1`, `if ($pipeRoute -or $batch.start.count -gt 0)`), and the capture is `INVALID` when it fails; an absent one adds nothing there.
+    From r2 the reader also holds the log to the producer's own sequence and declaration: each `llrawproc_dual_iso` record on a frame that carries `llrawproc` is the record
+    right after an `llrawproc` record of that frame and fits inside it; the drain follows every per-frame record and the verify follows the drain (`EXPORT_RECORD_INVALID`);
+    `RENDER_START` is read whole, once, for the clip `DONE` names, before `RENDER_VERIFIED` and `DONE`, and its cut is the frame window (the loop times frames
+    `cutIn - 1 .. cutOut - 1`, `EXPORT_STAGE_WINDOW_MISMATCH` otherwise). The build identity (the job summary's `sourceCommit`) is classed from that commit's own
+    `src/debug/StageTiming.h`: a build that defines these stages with a log carrying none of them is an incomplete capture (`EXPORT_PROFILE_ABSENT`), a build that does not
+    with a log carrying them is `EXPORT_PROFILE_FOREIGN`, and a build this repository cannot name keeps the reading above (with the same exception: a present
+    `RENDER_START` that fails the grammar or its bindings is `INVALID` on an older or unnamed build too).
+    **Batch-line rule G and one verdict (`EXPORT-RENDER-PIPE-TIMING-3` r1, sol r4 B1-B4).** The producer prints the clip, `out=` and `container_probe=` unescaped, so a
+    line alone is ambiguous; the writer is not changed. *G1:* `DONE`'s clip is positional (the text between the tag and the right-peeled `exported= skipped= elapsed=`), never
+    field-parsed, so `take elapsed=1.0` is a legal clip. It is bound to a witness per format: on ProRes, `RENDER_START` and `RENDER_VERIFIED` must start with
+    `<tag> <clip> ` (every ProRes route requires `RENDER_VERIFIED`); on CDNG, every DNG leaf the manifest names (`first.name`, `last.name`) is `<clip>_<frame>.dng`, the
+    one form the batch route writes (r2: `BatchRunner.cpp:1393` passes `CODEC_CNDG_DEFAULT`, so `CdngSequenceExport.cpp:269-271` names the frames; the dated form at
+    `:275-280` is never written on this route and is refused, since it let a foreign clip's standard leaves certify `DONE view-0`), and both endpoints' stems (the leaf
+    less its trailing `_<frame>.dng`) are that clip, or the capture is `EXPORT_BATCH_LOG_UNREADABLE`. No output to bind (no manifest, count 0) adds nothing. *G2:*
+    every field key appears at most once per line. A space-delimited token of the verbatim `out=` / `container_probe=` value that starts with that key's `=`, or with another
+    key of the line followed by a value of that field's shape, is that field named again (`INVALID`). The domain is fail-closed: a real path whose space-delimited component
+    reads as a field of its line in that field's shape is refused, never read as PASS (`C:/kit dimensions=archive/ffprobe.exe` is still clean). The job builds both paths
+    under its scratch root from validated tokens. *G3:* the no-probe sentinel rule is unchanged and runs first. *One verdict:* the line order, the `out=` leaf, the verified
+    dimensions and the CDNG clip witness are one module function, `Get-DvBatchExportBindingProblems`. The central reader and the Bachelor job
+    (`export-stage-job.ps1`, which embeds it verbatim with the declaration reader and its tables) both call it, so a run whose shared bindings fail is
+    `EXPORT_OUTPUT_MISMATCH` at the venue, never `EXPORT_CAPTURED`. Parity covers those bindings only (READER-HARDENING-1 r1, sol r2 B2). Three checks are
+    central-only, so the job can print `EXPORT_CAPTURED` where the central reader returns `INVALID`: an absent `RENDER_START` (the job reads it only when present,
+    key3 r1 row 1), `scaled=true` with no `export_scale` timed (`EXPORT_PROFILE_ABSENT`), and timing outside `cutIn` / `cutOut` (`EXPORT_STAGE_WINDOW_MISMATCH`;
+    the last two are pinned by a test). The receipt still reads `INVALID`: the leg's verdict is the central re-derivation (`Invoke-VenueLeg.ps1:760`, `:780`).
+    CDNG `<frame>` (sol r2 B1) is a `uint32` padded to six digits: six digits, or seven to ten with no leading zero, at most `4294967295`.
+    From r3 `RENDER_START` must also be the ProRes producer's own declaration: `codec=prores container=mov` (the strings `BatchRenderedVideoPlan.h` names for ProRes and
+    Mov), source and output dimensions above 0, and an fps that is a finite decimal above 0. Anything else is `EXPORT_PROFILE_FOREIGN`.
+    **Dual-ISO fails closed (r3, KNOWN GAP).** A `llrawproc_dual_iso` time above 0 is the time of the dual-ISO *attempt*. `llrawproc.c` times the attempt, and `dualiso.c`
+    can refuse the reconstruction inside it (a receipt's `dualIsoInterpolation 2`). The rendered path publishes no producer signal that the reconstruction was *applied*.
+    So a ProRes run with any frame timed above 0 has `dualIsoActiveFrames` and `dualIsoClassAgrees` null, with `CouldNotCheck` `DUALISO_APPLIED_UNKNOWN`. On a
+    dual-ISO leg the shipped `dualIsoClassAgrees eq true` then fails on that typed reason, and no ProRes leg can PASS until successor
+    `EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1` adds the applied signal. A run timed 0 on every frame ran no reconstruction: the class is readable (a dual-ISO leg is
+    `CLIP_CLASS_MISMATCH`). A no-dual-ISO leg whose run attempted dual-ISO stays `CLIP_CLASS_MISMATCH`. The CDNG profile's `active = ms > 0` rule above is unchanged.
+    From r5 a run timed `0.000` on every frame is not read as agreement on a **no**-dual-ISO leg either: the figure is rounded to the microsecond (`StageTiming.h` `%.3f`),
+    so an attempt under half a microsecond prints it too. That leg's `dualIsoClassAgrees` is null with `DUALISO_APPLIED_UNKNOWN`, while a dual-ISO leg's all-zero run is still
+    `CLIP_CLASS_MISMATCH` (no reconstruction takes under half a microsecond).
+    From r6 that mismatch's detail reports the observed rounded figure (`0.000 ms on every one of N timed frame(s)`) and what it shows (no frame was reconstructed). It
+    makes no claim that no attempt ran, since the rounded timer cannot show that.
+    **r5 evidence binding.** The frame loop's order now also refuses a second `processed16_total` on one frame and a frame that is recorded but never written
+    (`EXPORT_RECORD_INVALID`). `RENDER_START` `out=` must name the `.mov` the output manifest lists (the file leaf of the path), and `RENDER_VERIFIED` `dimensions=` must be
+    the declared `output=`; otherwise `EXPORT_OUTPUT_MISMATCH`. From r6 `dimensions=` is a required field, read at the producer's token position (between
+    `decoded_frame_bytes=` and `bytes=`, `BatchRunner.cpp`). A line without it there is `EXPORT_OUTPUT_MISMATCH`. Text later on the line, such as a
+    `container_probe=` path that contains ` dimensions=`, never counts as the field. The declared fps lies inside the producer's uint32-over-uint32 range as QLocale prints it
+    (`2.32831e-10 .. 4.29497e+09`); otherwise `EXPORT_PROFILE_FOREIGN`. The wall gates (CDNG and ProRes) build their limit from the largest wall the printed `DONE elapsed`
+    rounds from, the figure plus half its last printed place (`elapsed=0.3` is a wall up to 0.35 s; the producer prints tenths), and the ProRes means are taken over each
+    record's exact decimal figure, never a double. `export_scale` is stamped after the avir worker pool's scope closes, so it includes the pool's join.
 * **Time budget** (`Get-ExportJobTimeBudget`): the job timeout is one margined identity read of the clip (at the measured cold rate), plus the quiescence
   samples (3 x 12 + 30 = 66 s), plus the export wait, plus a fixed 600 s margin. The export wait is `max(900, 4 x maxFrames)` s plus another identity-read
   allowance, for the app's own re-read. The export wait is the job's own `WaitForExit`, so the smoke runner's 3600 s process ceiling does not cap it.
