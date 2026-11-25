@@ -451,6 +451,15 @@ inline DropFrameTickResult advanceDropFrameTick(
     // 1.7763568394002505e-15 leaves 1024 at 1024 and applied nothing. Under Loop the start is below wrapAt here (r9: every
     // start at or past it was folded above), so this subtraction is never 1100000 away from a stale start past the cut.
     double applied = result.position - start;
+    // r3 iteration 2 (adversary pass 7 A2 on 506b35d4): a zero-width Loop cut HOLDS its one source frame. It has no room to
+    // advance into and no lap to wrap by, so the delta is dropped: a cut edited to 41..41 under a playhead at 10 with three frames
+    // granted went 10 -> 40 -> 43, past a 41-frame clip's last frame, and credited three frames of source, trace and histogram
+    // travel. The tick applies nothing (a NaN start stays NaN, as the base's).
+    if( loopEnabled && loopWidth == 0 )
+    {
+        result.position = start;
+        applied = 0.0;
+    }
     // r3 iteration 1 (adversary pass 6 A1 on f8d80862): a zero-width Loop cut has no lap. A zero-width lap moves nothing back,
     // so it was never a wrap: the base recorded one per tick from the cut's one frame (DROP-FRAME-ZERO-WIDTH-LOOP-STALE-LAP-1),
     // and r3's correction onto that frame turned a 10 + 0 tick, which applies nothing, into one. Every other width is unchanged.
