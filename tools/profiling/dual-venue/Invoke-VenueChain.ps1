@@ -193,12 +193,9 @@ function Write-ChainLineNoThrow([string]$Message) {
     # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r3 (sol r2 B1): L for the lines of a leg's result path (LEG_FAILED, its spec-refusal label) and of the claim's release in the
     # finally. L throws on a FAILED append (as Add-Content did), and from there that throw ended the chain before CHAIN_RESULT. Here a failed append is said on stderr
     # (bounded), counted in CHAIN_RESULT (chainLogAppendFailures), and the line still goes to stdout; the chain's result, exit code and next leg are never decided by it.
+    # (the catch is one line, as every chain-log fallback here is, pinned by test_planned_hash_bind_b2_r1_p1_a4: the bounded diagnostic first, then the count, then the line on stdout)
     try { L $Message }
-    catch {
-        $script:ChainLogAppendFailures++
-        Write-ChainDiagnostic "$Message (chain log write failed: $($_.Exception.Message -replace '\s+', ' '))"
-        Write-Output "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $Message"
-    }
+    catch { Write-ChainDiagnostic "$Message (chain log write failed: $($_.Exception.Message -replace '\s+', ' '))"; $script:ChainLogAppendFailures++; Write-Output "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $Message" }
 }
 
 $script:ChainLogAppendDelayMs = 0   # offline test seam only (the bounded append's pool thread waits this long first, as a stalled share does); production leaves it 0
