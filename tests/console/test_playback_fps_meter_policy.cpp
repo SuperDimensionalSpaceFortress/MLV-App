@@ -572,8 +572,8 @@ TEST(PlaybackFpsMeterPolicy, AFoldedStartKeepsItsDeltaAndTheAppliedAdvanceAccoun
 // Frame position is still 100 (the normalizer keeps a position inside the clip); cut 1..50 wraps at 49 by 49. A zero
 // request moved 100 -> 2 with appliedFrames 0 and recorded two 49-frame laps, which the paint credit read as 2 + 98 - 10 =
 // 90 source frames played; an 8 ms request at 24 fps (0.192 frames) recorded the same two laps. After r9 wrapLaps counts
-// only laps the applied delta crossed from an in-cut start: ANY start outside the loop range [wrapAt - width, wrapAt) is
-// folded into it first (a correction, reported as foldedFrames, zero laps).
+// only laps the applied delta crossed: ANY start at or past wrapAt is folded into the cut first (a correction, reported as
+// foldedFrames, zero laps); a start below the cut keeps its own travel (iteration 1, adversary pass 17 A1 + A2).
 TEST(PlaybackFpsMeterPolicy, AStaleLoopStartAnyDistanceOutsideTheCutIsACorrectionWithNoTravelledLaps)
 {
     using playback_frame_range::advanceDropFrameTick;
