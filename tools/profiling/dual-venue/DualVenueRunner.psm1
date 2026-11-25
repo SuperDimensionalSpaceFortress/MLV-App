@@ -6945,7 +6945,7 @@ function Test-DvReceiptValid {
                 # the criteria are selected by the backend the HASHED run used (== the receipt's, or this receipt is already INVALID above)
                 $criteria = Get-DvProp (Get-DvProp (Get-DvProp $spec 'criteria') $role) $derivedBackend
                 # r19 (sol r18 B2): the criteria also see the measured conform fields re-derived from the hashed run log; the receipt's metrics stay verbatim
-                $verdict = Test-DvCriteria -Criteria $criteria -Metrics (Get-DvCriteriaMetrics -Metrics $metrics -Playback $derived -Visual (Get-DvTailVisualEvidence -EvidenceDir $ev.dir -LegId ([string]$spec.legId) -ExpectedSha256 ([string](Get-DvProp (Get-DvProp $Receipt 'visual') 'appVisualJsonSha256'))))
+                $verdict = Test-DvCriteria -Criteria $criteria -Metrics (Get-DvCriteriaMetrics -Metrics $metrics -Playback $derived -Visual (Get-DvTailVisualEvidence -EvidenceDir $ev.dir -LegId ([string]$spec.legId) -ExpectedSha256 ([string](Get-DvProp (Get-DvProp $Receipt 'visual') 'appVisualJsonSha256')) -RecordedFrames (Get-DvProp (Get-DvProp $Receipt 'visual') 'frames')))
                 $sheetOk = $true
                 if ([string](Get-DvProp $spec 'legType') -ceq 'look') {
                     $sheet = Join-Path $ev.dir 'contact-sheet\sheet.png'
@@ -7521,6 +7521,9 @@ $script:ConformCriteriaMetrics = [ordered]@{ conformSourceFps = 'conformSourceFp
 # engine reaches its last target before the pipeline has presented it). The CPU route holds one target in prep and one rendering behind the last presented frame
 # (231ea06e: 479 rendering, 478 in prep, 477 presented), so 2 is the pipeline's own depth; a longer unpainted tail is a frozen presentation, never in flight.
 $script:TailInFlightCapFrames = 2L
+# r2 (adversary A4 on 9f327333): the diagnostics only Get-DvCriteriaMetrics derives; a verbatim summary.json key of one of these names is dropped, never trusted
+$script:CriteriaDerivedOnlyMetrics = @('conformTailUnpaintedAtCloseFrames', 'conformTailInFlightCreditedFrames', 'conformTailInFlightCreditNote',
+    'conformFrozenTailFrames', 'conformTailAllowanceFrames', 'conformPaintStepsImpliedMaxJump')
 
 function ConvertFrom-DvStrictJsonBytes {
     <#
@@ -7534,8 +7537,9 @@ function ConvertFrom-DvStrictJsonBytes {
     param([AllowNull()][byte[]]$Bytes)
     try {
         if ($null -eq $Bytes -or $Bytes.Length -eq 0) { return $null }
-        $reader = [IO.StreamReader]::new([IO.MemoryStream]::new($Bytes), [Text.UTF8Encoding]::new($false, $true), $true)
-        try { $text = $reader.ReadToEnd() } finally { $reader.Dispose() }
+        # adversary A6 on 9f327333: UTF-8 only. Byte-order-mark detection read a UTF-16 document; only a UTF-8 BOM is skipped, and invalid UTF-8 throws.
+        $skip = $(if ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF) { 3 } else { 0 })
+        $text = [Text.UTF8Encoding]::new($false, $true).GetString($Bytes, $skip, $Bytes.Length - $skip)
         $doc = [System.Text.Json.JsonDocument]::Parse($text)
         try {
             if ($doc.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $null }
@@ -7573,26 +7577,45 @@ function Get-DvTailVisualEvidence {
     root object, no duplicate member names); a row is labelBound only when the app's label_bound is a JSON true AND its own painted_serial_valid is true AND
     serial and painted_serial are JSON integers that are equal (the capture's paint is the presentation the row labels: a play_unbound row with serial 484 and
     painted_serial 483 is not); its pngSha256 is set only when the PNG's bytes decode as a PNG (Get-DvPngImageProblem, the paired-seek reader's check).
+    Adversary A1 on 9f327333: the PNG must also hash to the sha256 the receipt's visual block recorded for that kind and index at collection (-RecordedFrames,
+    the receipt's visual.frames); a PNG replaced since, a capture with no single recorded hash, or no recorded frames at all is not counted. Adversary A2: two
+    play rows with the same kind and index (one PNG on disk for two labels) make the document ambiguous: no tail evidence. A5: schema must be a JSON string
+    and measured_session a JSON integer (an array is not coerced).
     Pure apart from reading files; never throws.
     #>
-    param([AllowNull()][AllowEmptyString()][string]$EvidenceDir, [AllowNull()][AllowEmptyString()][string]$LegId, [AllowNull()][AllowEmptyString()][string]$ExpectedSha256)
+    param([AllowNull()][AllowEmptyString()][string]$EvidenceDir, [AllowNull()][AllowEmptyString()][string]$LegId, [AllowNull()][AllowEmptyString()][string]$ExpectedSha256,
+          $RecordedFrames = $null)
     try {
         if ([string]::IsNullOrWhiteSpace($EvidenceDir) -or [string]::IsNullOrWhiteSpace($LegId) -or [string]::IsNullOrWhiteSpace($ExpectedSha256)) { return $null }
+        # the PNG hashes the receipt recorded, by "kind|index"; a key recorded twice is ambiguous ($null), never either hash
+        $recorded = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+        foreach ($r in @($RecordedFrames)) {
+            if ($null -eq $r) { continue }
+            $rk = Get-DvProp $r 'kind'; $ri = Get-DvProp $r 'index'; $rs = Get-DvProp $r 'sha256'
+            if ($rk -isnot [string] -or -not (($ri -is [int]) -or ($ri -is [long]))) { continue }
+            $key = "$rk|$([int64]$ri)"
+            $value = $(if ($rs -is [string] -and $rs -cmatch '^[0-9a-f]{64}$') { $rs } else { $null })
+            if ($recorded.ContainsKey($key)) { $recorded[$key] = $null } else { $recorded[$key] = $value }
+        }
         $dir = Join-Path $EvidenceDir 'visual'
         $jsonPath = Join-Path $dir 'app-visual.json'
         if (-not (Test-Path -LiteralPath $jsonPath -PathType Leaf)) { return $null }
         $jsonBytes = [IO.File]::ReadAllBytes($jsonPath)
         if ((Get-DvSha256OfBytes $jsonBytes) -cne $ExpectedSha256.ToLowerInvariant()) { return $null }
         $app = ConvertFrom-DvStrictJsonBytes -Bytes $jsonBytes
-        if ($null -eq $app -or [string](Get-DvProp $app 'schema') -cne 'mlv-app/visual-capture/v1') { return $null }
+        if ($null -eq $app) { return $null }
+        $schema = Get-DvProp $app 'schema'
+        if ($schema -isnot [string] -or $schema -cne 'mlv-app/visual-capture/v1') { return $null }
         $appError = Get-DvProp $app 'error'
         if ($appError -isnot [string] -or $appError -ne '') { return $null }
         $session = Get-DvProp $app 'measured_session'
-        $sessionNumber = ConvertTo-DvInt64 $session
-        if ($null -eq $sessionNumber -or $sessionNumber -lt 0 -or $session -is [string]) { return $null }
+        if (-not (($session -is [int]) -or ($session -is [long]))) { return $null }
+        $sessionNumber = [int64]$session
+        if ($sessionNumber -lt 0) { return $null }
         $rows = Get-DvProp $app 'frames'
         if ($rows -isnot [array]) { return $null }
         $frames = [System.Collections.Generic.List[object]]::new()
+        $seenPlay = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         foreach ($row in $rows) {
             if ($null -eq $row -or $row -isnot [System.Management.Automation.PSCustomObject]) { continue }
             $kind = Get-DvProp $row 'kind'
@@ -7602,6 +7625,7 @@ function Get-DvTailVisualEvidence {
             if ([int64]$index -lt 0) { continue }
             $isPlay = [string]::Equals($kind, 'play', [StringComparison]::Ordinal) -or [string]::Equals($kind, 'play_unbound', [StringComparison]::Ordinal)
             if (-not $isPlay) { continue }
+            if (-not $seenPlay.Add("$kind|$([int64]$index)")) { return $null }   # adversary A2: one PNG cannot carry two rows' labels
             $saved = Get-DvProp $row 'saved'; $active = Get-DvProp $row 'play_active'
             $display = Get-DvFrameNumber (Get-DvProp $row 'display_frame')
             $tail = Get-DvProp $row 'tail_elapsed_ms'
@@ -7610,7 +7634,11 @@ function Get-DvTailVisualEvidence {
             $pngSha = $null
             if ((($saved -is [bool]) -and $saved) -and (Test-Path -LiteralPath $png -PathType Leaf)) {
                 $pngBytes = [IO.File]::ReadAllBytes($png)
-                if ($null -eq (Get-DvPngImageProblem -Bytes $pngBytes)) { $pngSha = Get-DvSha256OfBytes $pngBytes }
+                $recordedSha = $null
+                [void]$recorded.TryGetValue("$kind|$([int64]$index)", [ref]$recordedSha)
+                $actualSha = Get-DvSha256OfBytes $pngBytes
+                # adversary A1 on 9f327333: the bytes the receipt recorded at collection, and a decodable PNG
+                if ($null -ne $recordedSha -and $actualSha -ceq $recordedSha -and $null -eq (Get-DvPngImageProblem -Bytes $pngBytes)) { $pngSha = $actualSha }
             }
             $bound = Get-DvProp $row 'label_bound'; $serialValid = Get-DvProp $row 'painted_serial_valid'
             $serial = Get-DvProp $row 'serial'; $paintedSerial = Get-DvProp $row 'painted_serial'
@@ -7709,6 +7737,10 @@ function Get-DvCriteriaMetrics {
     param($Metrics, $Playback, $Visual = $null)   # EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-1 r1: -Visual is the receipt's post-close visual block
     $m = [ordered]@{}
     if ($null -ne $Metrics) { foreach ($p in $Metrics.PSObject.Properties) { $m[$p.Name] = $p.Value } }
+    # EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-1 r2 (adversary A4 on 9f327333, and its siblings): the fields only THIS function derives are never taken from the
+    # verbatim metrics (Get-DvVerbatimMetrics admits any scalar summary.json key), so a summary claiming conformTailInFlightCreditedFrames=2 is no credit and
+    # never reaches the receipt's detail (Get-DvTailCreditDetail). [ordered] keys compare ignoring case, so every casing is removed.
+    foreach ($derivedOnly in $script:CriteriaDerivedOnlyMetrics) { if ($m.Contains($derivedOnly)) { $m.Remove($derivedOnly) } }
     # HFR-NATIVE-60FPS-FULLRES-1 r24 (r23 adversary A1, DV-CONFORM-CRITERIA-METRICS-PRESENCE-GUARD-1): a conform value counts only when the block
     # says its conform line is PRESENT (a real boolean $true, as Get-DvConformPaceProof requires) and is the MEASURED session's (conformSession
     # equals summarySession, both non-empty). Before r24 a block with conformLinePresent=$false or another session's line still passed its values.

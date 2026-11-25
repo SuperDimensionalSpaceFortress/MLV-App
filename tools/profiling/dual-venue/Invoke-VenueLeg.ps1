@@ -1102,7 +1102,7 @@ $outcome = $resolved.outcome; $detail = $resolved.detail
 if ($outcome -eq 'CAPTURED') {
     $criteria = $spec.criteria.$role.$Backend
     # r19 (sol r18 B2): the criteria also see the run log's measured conform fields (Get-DvCriteriaMetrics); receipt.metrics stays verbatim
-    $criteriaMetrics = (Get-DvCriteriaMetrics -Metrics $receipt.metrics -Playback $receipt.playback -Visual (Get-DvTailVisualEvidence -EvidenceDir $evidenceDir -LegId ([string]$spec.legId) -ExpectedSha256 ([string](Get-DvProp $receipt.visual 'appVisualJsonSha256'))))
+    $criteriaMetrics = (Get-DvCriteriaMetrics -Metrics $receipt.metrics -Playback $receipt.playback -Visual (Get-DvTailVisualEvidence -EvidenceDir $evidenceDir -LegId ([string]$spec.legId) -ExpectedSha256 ([string](Get-DvProp $receipt.visual 'appVisualJsonSha256')) -RecordedFrames (Get-DvProp $receipt.visual 'frames')))
     $verdictCriteria = Test-DvCriteria -Criteria $criteria -Metrics $criteriaMetrics
     $sheetMissing = $isLook -and ($null -eq $receipt.look -or $null -eq $receipt.look.contactSheet)
     # (a capture that published NO run log has no proof at all -- no rendered scale to read, no source frames -- and ends INVALID below, not here)
