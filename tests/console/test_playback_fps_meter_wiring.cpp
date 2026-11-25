@@ -189,6 +189,8 @@ bool frameCapIsLive(const QString & body)
 {
     return body.contains(QStringLiteral(
         "ui->actionPlay->isChecked(), hadPendingAdvance );\n"
+        "    // r5 (pass 8 A3 on c37d6fd5): the fps meter gates on the shaped tick; the cap below bounds only the frame request.\n"
+        "    const int meterTickMs = timeDiff;\n"
         "    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 (adversary r2 A1): one tick never asks the drop-frame loop for more frames than\n"
         "    // it can count (a long suspension at a high source rate); every ordinary tick is unchanged.\n"
         "    // r4 (pass 5 A2): only the Drop Frame request reads the tick as frames, so Normal mode keeps its whole tick (fps meter).\n"
@@ -233,4 +235,35 @@ TEST(PlaybackFpsMeterWiring, CapAndResetPinsRejectADeadCapAndAnUnconditionalRese
     alwaysResetFront.replace(QStringLiteral("if( playback_fps_meter::fpsMeterShouldReset("),
                              QStringLiteral("if( true || playback_fps_meter::fpsMeterShouldReset("));
     ASSERT_FALSE(fpsResetIsConditional(alwaysResetFront));
+}
+
+// r5 (pass 8 A3 on c37d6fd5): in Drop Frame mode at >= 999,990,001 fps the request cap zeroed the shared timeDiff, so a
+// scrub draw on an ordinary 8 ms tick skipped the meter (the label stayed at 0.0 fps; the base seeded 25 fps). The meter's
+// gate reads the SHAPED tick, stamped right after shaping and before the cap; the cap bounds only the frame request.
+TEST(PlaybackFpsMeterWiring, FpsMeterGateReadsTheShapedTickNotTheCappedRequest)
+{
+    const QString body = timerFrameEventBody();
+    ASSERT_FALSE(body.isEmpty());
+    const QString meterLine = QStringLiteral("    const int meterTickMs = timeDiff;\n");
+    ASSERT_EQ(1, body.count(meterLine));
+    ASSERT_EQ(1, body.count(QStringLiteral("meterTickMs =")));
+    const int shapedAt = body.indexOf(QStringLiteral("timeDiff = playback_native_pace::shapedTickTimeDiffMs( timeDiff,"));
+    const int meterAt = body.indexOf(meterLine);
+    const int capAt = body.indexOf(QStringLiteral("timeDiff = playback_fps_meter::frameBoundedTickTimeDiffMs( timeDiff,"));
+    ASSERT_TRUE(shapedAt >= 0);
+    ASSERT_TRUE(meterAt > shapedAt);
+    ASSERT_TRUE(capAt > meterAt);
+    // the gate: exactly one, on the shaped tick, between the draw-to-draw sample and the EMA step
+    const QString gateLine = QStringLiteral("        if( meterTickMs != 0 )\n");
+    ASSERT_EQ(1, body.count(gateLine));
+    ASSERT_FALSE(body.contains(QStringLiteral("if( timeDiff != 0 )")));
+    const int sampleAt = body.indexOf(QStringLiteral("const int measuredFrameMs = playback_fps_meter::stampAgeMs( lastDrawTime, nowTime );"));
+    const int gateAt = body.indexOf(gateLine);
+    const int emaAt = body.indexOf(QStringLiteral("playback_fps_meter::smoothedFrameMs( m_playbackFpsEmaFrameMs, measuredFrameMs );"));
+    ASSERT_TRUE(sampleAt >= 0);
+    ASSERT_TRUE(gateAt > sampleAt);
+    ASSERT_TRUE(emaAt > gateAt);
+    // the cap still owns the request: playbackHandling reads the capped timeDiff, never meterTickMs
+    ASSERT_TRUE(body.contains(QStringLiteral("    playbackHandling( timeDiff );")));
+    ASSERT_FALSE(body.contains(QStringLiteral("playbackHandling( meterTickMs )")));
 }

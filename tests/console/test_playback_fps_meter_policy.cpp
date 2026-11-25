@@ -410,4 +410,22 @@ TEST(PlaybackFpsMeterPolicy, OneTickLapsStayWithinTheBoundFromAStaleStartOutside
         playback_frame_range::advanceDropFrameTick(0.5, 1000000.0, 1, 2, true);
     ASSERT_EQ(1000000, atBound.wrapLaps);
     ASSERT_TRUE(std::fabs(atBound.position - 0.5) < 1e-6);
+    // r5 (pass 8 A1 on c37d6fd5): a clipped tick stops at the LAST position whose laps are still 1e6, not the first
+    // position of that lap, so a stale start inside [lapLimit - width, lapLimit) keeps the room it had. c37d6fd5 cut
+    // 2000000 + 4.5 (conform, cut 1..2: wrapAt 2, width 2, lapLimit 2000002) to 2000000: position 0, advance 0.
+    const playback_frame_range::DropFrameTickResult clippedConform =
+        playback_frame_range::advanceDropFrameTick(2000000.0, 4.5, 1, 2, true, true);
+    ASSERT_EQ(1000000, clippedConform.wrapLaps);
+    ASSERT_TRUE(clippedConform.position > 1.9999 && clippedConform.position < 2.0);
+    const double clippedConformGranted =
+        clippedConform.position - 2000000.0 + (double)clippedConform.wrapWidth * clippedConform.wrapLaps;
+    ASSERT_TRUE(clippedConformGranted > 1.9999);
+    // ...and without conform (cut 1..2: wrapAt 1, width 1, lapLimit 1000001), 1000000 + 1.5 keeps almost one frame
+    const playback_frame_range::DropFrameTickResult clippedPlain =
+        playback_frame_range::advanceDropFrameTick(1000000.0, 1.5, 1, 2, true);
+    ASSERT_EQ(1000000, clippedPlain.wrapLaps);
+    ASSERT_TRUE(clippedPlain.position >= 0.0 && clippedPlain.position < 1.0);
+    const double clippedPlainGranted =
+        clippedPlain.position - 1000000.0 + (double)clippedPlain.wrapWidth * clippedPlain.wrapLaps;
+    ASSERT_TRUE(clippedPlainGranted > 0.9999 && clippedPlainGranted < 1.0);
 }
