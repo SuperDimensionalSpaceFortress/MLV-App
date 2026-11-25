@@ -276,6 +276,11 @@ void debayerBasic(uint16_t *, float *, int, int, int) {}
 
 int getMlvLastProcessed8DirectPathActive(void) { return 0; }
 
+/* DEBAYER-CAPTURE-LABEL-1: frame_caching.c's S3_debayer capture names its debayer through
+ * getMlvDebayerName (video_mlv.c, not linked here). No console test enables the capture
+ * harness; the real table is pinned by the pipeline tests that link video_mlv.c. */
+const char * getMlvDebayerName(int) { return "unknown"; }
+
 /*
  * console_tests links frame_caching.c without the production video_mlv.c
  * implementation. Mirror only the synchronous current/slot bookkeeping that
