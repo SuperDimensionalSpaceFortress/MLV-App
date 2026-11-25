@@ -2763,6 +2763,102 @@ bool r3a3LiteralCredited( bool literalRow, bool fixtureWithheld, double tagSeenM
     if( dueWakeRedR1Gate() ) return literalRow && tagSeenMs >= 0.0 && wokenOtherDelta > 0 && !spansS.empty();
     return literalRow && !fixtureWithheld && wokenOtherDelta > 0 && r3a3LiteralRecord( tagSeenMs, spansS ) == R3A3LiteralRecord::Recorded;
 }
+
+// CI-FLAKE-R17A1-SPAN-LOSS-TYPED-VERDICT-1 r1 (sol r2 B1): the RED seam MLV_R17A1_RED_SPAN_LOSS_ORDER=1 replays c52f385c's R3A3
+// accounting order (the count == spans length check BEFORE the typed loss check), so a tag the hook saw, whose count survived and
+// whose span was lost, failed the generic length assert and skipped the typed verdict and its cleanup. Only ever fails more.
+bool dueWakeRedSpanLossOrder()
+{
+    const char *value = std::getenv( "MLV_R17A1_RED_SPAN_LOSS_ORDER" );
+    return value && std::string( value ) == "1";
+}
+
+// One R3A3 sample's dispatch record, as the live accounting reads it: the hook's read of the literal tag (ms, -1 unseen), the
+// product's count delta, the fixture handler's call count and its own two reads (ms, -1 unset), and the product's span record (s).
+struct R3A3RecordSample
+{
+    int attempt = 0;
+    double tagSeenMs = -1.0;
+    size_t counted = 0;
+    int calls = 0;
+    double handlerStartMs = -1.0;
+    double handlerEndMs = -1.0;
+    std::vector<std::pair<double, double>> spansS;
+};
+
+// CI-FLAKE-R17A1-SPAN-LOSS-TYPED-VERDICT-1 r1 (sol r2 B1): the live R3A3 accounting of one sample, called by the live loop and by
+// the native REDs below. An observed tag no recorded span contains reaches R3A3_LITERAL_DISPATCH_RECORD_LOST (and onLoss, the
+// live dispatch cleanup) FIRST, whatever the count is: tag=8.2, count=1, spans=[] and tag=8.2, count=2, spans=[[22,22.2]] both
+// reached the generic count == spans assert on c52f385c, before the typed branch and its cleanup. Only after that typed check
+// is the record held to its count, its chronological order, and (when the fixture handler ran) a span holding both its reads.
+void r3a3AccountDispatchRecord( const R3A3RecordSample &s, const std::function<void()> &onLoss )
+{
+    const auto accountRecord = [&s]() {
+        if( s.calls == 0 && s.counted == 0 && s.spansS.empty() ) return;
+        ASSERT_EQ( s.counted, s.spansS.size() );
+        // adversary pass 2 A5 on e1b2051f: and in the product's chronological order, each span on ordered reads (the R17A1
+        // sibling r17A1DispatchRecordGap already rejects a backwards record): [[19.9, 50.1], [8.1, 8.2]] ms fails here
+        for( size_t i = 0; i < s.spansS.size(); ++i )
+        {
+            ASSERT_TRUE( s.spansS[i].first <= s.spansS[i].second );
+            if( i > 0 ) ASSERT_TRUE( s.spansS[i - 1].second <= s.spansS[i].first );
+        }
+        if( s.calls != 0 )
+        {
+            constexpr double kRoundTripMs = 0.00005;                  // assertChargedBeforeHandler's tolerance
+            bool inOneSpan = false;
+            for( const auto &span : s.spansS )
+                if( span.first * 1000.0 <= s.handlerStartMs + kRoundTripMs && s.handlerEndMs <= span.second * 1000.0 + kRoundTripMs )
+                    inOneSpan = true;
+            ASSERT_TRUE( inOneSpan );
+        }
+    };
+    const bool lengthFirst = dueWakeRedSpanLossOrder();               // c52f385c's order, opt-in RED replay only
+    if( lengthFirst ) accountRecord();
+    if( r3a3LiteralRecord( s.tagSeenMs, s.spansS ) == R3A3LiteralRecord::Lost )
+    {
+        std::string spansText;
+        for( const auto &span : s.spansS )
+            spansText += "[" + std::to_string( span.first * 1000.0 ) + "," + std::to_string( span.second * 1000.0 ) + "]";
+        const std::string detail = "attempt=" + std::to_string( s.attempt ) + " tag_seen_ms=" + std::to_string( s.tagSeenMs )
+                                   + " counted=" + std::to_string( s.counted ) + " calls=" + std::to_string( s.calls )
+                                   + " spans_ms=" + spansText;
+        onLoss();
+        ::minitest::fail( __FILE__, __LINE__, "R3A3_LITERAL_DISPATCH_RECORD_LOST", detail );
+    }
+    if( !lengthFirst ) accountRecord();
+}
+
+// What r3a3AccountDispatchRecord did with one literal row: whether it failed, its message, and whether the dispatch cleanup ran.
+struct R3A3AccountOutcome
+{
+    bool failed = false;
+    std::string message;
+    bool cleanedUp = false;
+};
+R3A3AccountOutcome r3a3AccountRow( double tagSeenMs, size_t counted, int calls, const std::vector<std::pair<double, double>> &spansS )
+{
+    R3A3RecordSample sample;
+    sample.tagSeenMs = tagSeenMs;
+    sample.counted = counted;
+    sample.calls = calls;
+    sample.spansS = spansS;
+    R3A3AccountOutcome outcome;
+    try
+    {
+        r3a3AccountDispatchRecord( sample, [&outcome]() { outcome.cleanedUp = true; } );
+    }
+    catch( const ::minitest::Failure &failure )
+    {
+        outcome.failed = true;
+        outcome.message = failure.message;
+    }
+    return outcome;
+}
+bool r3a3TypedLoss( const R3A3AccountOutcome &outcome )
+{
+    return outcome.failed && outcome.cleanedUp && outcome.message.find( "R3A3_LITERAL_DISPATCH_RECORD_LOST" ) != std::string::npos;
+}
 }
 
 TEST(PlaybackDueWakeSend, R3A3_TheLiteralDispatchIsCreditedOnlyFromASpanThatContainsTheHooksOwnRead)
@@ -2793,6 +2889,72 @@ TEST(PlaybackDueWakeSend, R3A3_TheLiteralDispatchIsCreditedOnlyFromASpanThatCont
     ASSERT_FALSE( r3a3LiteralCredited( false, false, tagMs, 1, { { 0.0081, 0.0083 } } ) );
     // a product that recorded the span but did not count the dispatch is not credited either
     ASSERT_FALSE( r3a3LiteralCredited( true, false, tagMs, 0, { { 0.0081, 0.0083 } } ) );
+}
+
+// CI-FLAKE-R17A1-SPAN-LOSS-TYPED-VERDICT-1 r1 (sol r2 B1/H1): each literal loss row through the live R3A3 accounting
+// (r3a3AccountDispatchRecord, the function the live loop calls), one registration per row so one failing row never masks another.
+// Each must reach R3A3_LITERAL_DISPATCH_RECORD_LOST AND run the dispatch cleanup. MLV_R17A1_RED_SPAN_LOSS_ORDER=1 replays c52f385c.
+TEST(PlaybackDueWakeSend, R3A3_SpanLoss_TagSeenCount1NoSpansReachesTheTypedLossAndItsCleanup)
+{
+    // sol r2 INV-1: tag=8.2, count=1, spans=[], calls=0 (the span append dropped, the count kept)
+    const R3A3AccountOutcome outcome = r3a3AccountRow( 8.2, 1, 0, {} );
+    ASSERT_TRUE( outcome.failed );
+    ASSERT_TRUE( outcome.message.find( "R3A3_LITERAL_DISPATCH_RECORD_LOST" ) != std::string::npos );
+    ASSERT_TRUE( outcome.cleanedUp );
+    ASSERT_TRUE( outcome.message.find( "counted=1 calls=0 spans_ms=)" ) != std::string::npos );
+}
+
+TEST(PlaybackDueWakeSend, R3A3_SpanLoss_TagSeenCount2OneUnrelatedSpanReachesTheTypedLossAndItsCleanup)
+{
+    // sol r2 INV-1: tag=8.2, count=2, spans=[[22,22.2]], calls=0 (the tagged dispatch's span dropped, both counts kept)
+    const R3A3AccountOutcome outcome = r3a3AccountRow( 8.2, 2, 0, { { 0.022, 0.0222 } } );
+    ASSERT_TRUE( outcome.failed );
+    ASSERT_TRUE( outcome.message.find( "R3A3_LITERAL_DISPATCH_RECORD_LOST" ) != std::string::npos );
+    ASSERT_TRUE( outcome.cleanedUp );
+    ASSERT_TRUE( outcome.message.find( "counted=2 calls=0 spans_ms=[" ) != std::string::npos );
+}
+
+TEST(PlaybackDueWakeSend, R3A3_SpanLoss_TheRowsThatAlreadyReachedTheTypedLossStillDo)
+{
+    // sol r2 INV-1 passing rows: tag=8.2, count=1, spans=[[22,22.2]] and tag=8.2, count=0, spans=[] (calls=0 both)
+    ASSERT_TRUE( r3a3TypedLoss( r3a3AccountRow( 8.2, 1, 0, { { 0.022, 0.0222 } } ) ) );
+    ASSERT_TRUE( r3a3TypedLoss( r3a3AccountRow( 8.2, 0, 0, {} ) ) );
+}
+
+TEST(PlaybackDueWakeSend, R3A3_SpanLoss_ARecordedOrUnseenTagStillFacesTheCountOrderAndHandlerChecks)
+{
+    // the typed check runs first, and the record checks still run after it: a healthy literal row passes with no cleanup...
+    const R3A3AccountOutcome healthy = r3a3AccountRow( 8.2, 1, 0, { { 0.0081, 0.0083 } } );
+    ASSERT_FALSE( healthy.failed );
+    ASSERT_FALSE( healthy.cleanedUp );
+    // ...an unseen tag with nothing recorded passes too (the retry gate handles it)...
+    ASSERT_FALSE( r3a3AccountRow( -1.0, 0, 0, {} ).failed );
+    // ...while a recorded tag with a count the spans do not match, an unseen tag with a stray count, a backwards record, and a
+    // handler that ran outside every span each fail the record checks (never the typed loss, and no cleanup)
+    const R3A3AccountOutcome overCounted = r3a3AccountRow( 8.2, 2, 0, { { 0.0081, 0.0083 } } );
+    ASSERT_TRUE( overCounted.failed && !overCounted.cleanedUp );
+    ASSERT_TRUE( overCounted.message.find( "R3A3_LITERAL_DISPATCH_RECORD_LOST" ) == std::string::npos );
+    const R3A3AccountOutcome strayCount = r3a3AccountRow( -1.0, 1, 0, {} );
+    ASSERT_TRUE( strayCount.failed && !strayCount.cleanedUp );
+    const R3A3AccountOutcome backwards = r3a3AccountRow( -1.0, 2, 0, { { 0.0199, 0.0501 }, { 0.0081, 0.0082 } } );
+    ASSERT_TRUE( backwards.failed && !backwards.cleanedUp );
+    R3A3RecordSample outside;
+    outside.counted = 1;
+    outside.calls = 1;
+    outside.handlerStartMs = 20.0;
+    outside.handlerEndMs = 50.0;
+    outside.spansS = { { 0.0081, 0.0083 } };
+    bool outsideCleanedUp = false;
+    bool outsideFailed = false;
+    try
+    {
+        r3a3AccountDispatchRecord( outside, [&outsideCleanedUp]() { outsideCleanedUp = true; } );
+    }
+    catch( const ::minitest::Failure & )
+    {
+        outsideFailed = true;
+    }
+    ASSERT_TRUE( outsideFailed && !outsideCleanedUp );
 }
 
 #ifdef Q_OS_WIN
@@ -2978,48 +3140,28 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
         // count or span record shows a dispatch, has its dispatch record accounted BEFORE any retry gate below may discard it (the
         // ExpiredAfterDispatch and short-rest gates retried a handler-ran sample with spans []): the spans are exactly the product's
         // count, and the handler's own two reads lie inside one recorded span (an unrelated span cannot stand in for its dispatch)
+        // r2 (sol r1 B1): the hook's own read of this attempt's tagged WM_NULL (taken before the drain below can dispatch a late
+        // one) takes part too: a span is the tagged dispatch's only when it contains that read, and an observed dispatch no span
+        // contains (an unrelated span elsewhere, or count 0 and spans []) is a lost record -- typed, never retried away.
+        // CI-FLAKE-R17A1-SPAN-LOSS-TYPED-VERDICT-1 r1 (sol r2 B1): that typed check runs BEFORE the count == spans check, so a lost
+        // span whose count survived (count=1, spans=[]; count=2, spans=[[22,22.2]]) reaches the typed verdict and this cleanup too
         {
-            const std::vector<std::pair<double, double>> recordSpans = wake.lastRunnerSleepDispatchSpansS();
-            const size_t counted = static_cast<size_t>( ( wake.runnerSleepsWokenOther() - wokenOtherBefore )
-                                                        + ( wake.runnerSleepsWokenBySent() - wokenBySentBefore ) );
-            if( foreign.calls != 0 || counted != 0 || !recordSpans.empty() )
-            {
-                ASSERT_EQ( counted, recordSpans.size() );
-                // adversary pass 2 A5 on e1b2051f: and in the product's chronological order, each span on ordered reads (the
-                // R17A1 sibling r17A1DispatchRecordGap already rejects a backwards record): [[19.9, 50.1], [8.1, 8.2]] ms fails here
-                for( size_t i = 0; i < recordSpans.size(); ++i )
-                {
-                    ASSERT_TRUE( recordSpans[i].first <= recordSpans[i].second );
-                    if( i > 0 ) ASSERT_TRUE( recordSpans[i - 1].second <= recordSpans[i].first );
-                }
-                if( foreign.calls != 0 )
-                {
-                    constexpr double kRoundTripMs = 0.00005;              // assertChargedBeforeHandler's tolerance
-                    bool inOneSpan = false;
-                    for( const auto &span : recordSpans )
-                        if( span.first * 1000.0 <= foreign.handlerStartMs + kRoundTripMs && foreign.handlerEndMs <= span.second * 1000.0 + kRoundTripMs )
-                            inOneSpan = true;
-                    ASSERT_TRUE( inOneSpan );
-                }
-            }
-            // r2 (sol r1 B1): the hook's own read of this attempt's tagged WM_NULL (taken before the drain below can dispatch a late
-            // one) takes part too: a span is the tagged dispatch's only when it contains that read, and an observed dispatch no span
-            // contains (an unrelated span elsewhere, or count 0 and spans []) is a lost record -- typed, never retried away
-            if( r3a3LiteralRecord( g_r3a3LiteralSeenMs, recordSpans ) == R3A3LiteralRecord::Lost )
-            {
+            R3A3RecordSample record;
+            record.attempt = attempt;
+            record.tagSeenMs = g_r3a3LiteralSeenMs;
+            record.counted = static_cast<size_t>( ( wake.runnerSleepsWokenOther() - wokenOtherBefore )
+                                                  + ( wake.runnerSleepsWokenBySent() - wokenBySentBefore ) );
+            record.calls = foreign.calls;
+            record.handlerStartMs = foreign.handlerStartMs;
+            record.handlerEndMs = foreign.handlerEndMs;
+            record.spansS = wake.lastRunnerSleepDispatchSpansS();
+            r3a3AccountDispatchRecord( record, [&wake]() {
                 wake.setGuiTraceActive( false );
-                std::string spansText;
-                for( const auto &span : recordSpans )
-                    spansText += "[" + std::to_string( span.first * 1000.0 ) + "," + std::to_string( span.second * 1000.0 ) + "]";
-                const std::string detail = "attempt=" + std::to_string( attempt ) + " tag_seen_ms=" + std::to_string( g_r3a3LiteralSeenMs )
-                                           + " counted=" + std::to_string( counted ) + " calls=" + std::to_string( foreign.calls )
-                                           + " spans_ms=" + spansText;
                 MSG drain;                                            // the missed send, so it reaches no later sleep
                 PeekMessageW( &drain, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );
                 g_r3a3Foreign = nullptr;
                 wake.setTimingStampsForTest( false );
-                ::minitest::fail( __FILE__, __LINE__, "R3A3_LITERAL_DISPATCH_RECORD_LOST", detail );
-            }
+            } );
         }
         // CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1 (sol r5 B1): admitted on the fixture's OWN handler witness only. The record
         // was accounted just above (count == spans, every handler inside one span), so a span or count left here with calls == 0 is
