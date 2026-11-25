@@ -35,8 +35,17 @@
 # Exit codes: 2 source, 3 DLL-pair manifest missing, 4 DLL-pair manifest does not bind,
 # 12 qmake discovery, 13 qmake, 14 mingw32-make discovery, 15 make, 16 release exe missing,
 # 17 windeployqt discovery, 18 windeployqt, 19 DLL-pair deploy, 21 MinGW runtime deploy,
+# 22 runtime donor dir, 28 ffmpeg.exe install (step ffmpegExeInstall: the pinned payload did not install and verify, or the
+#   staged package zip does not carry that exact ffmpeg.exe),
 # 23 launch probe, 20 packaging, 24 publish partials, 25 publish rename, 26 publish manifest,
 # 27 no heavy-slot deadline (STAGE_NO_HEAVY_SLOT_DEADLINE: MLV_HEAVY_SLOT_DEADLINE_UTC absent or blank; nothing written, no ticket taken).
+#
+# FFMPEG.EXE. Every package carries ffmpeg.exe beside MLVApp.exe, installed from the pinned in-repo payload
+# (tools/gates/vendored-native-payloads.json id ffmpeg-windows-x86_64, platform/qt/FFmpeg/ffmpegWin64.zip) by
+# tools/repo_hygiene/extract_vendored_native_payload --verify-installed (--record-only: that record alone is validated), the
+# install the hosted Windows release runs. The ffmpeg.exe entry inside the staged zip is re-checked against the recorded hash.
+# build.json records it as ffmpegExeDeployed plus ffmpegExe { payloadId, bytes, sha256 }. The FFmpeg av*/sw* DLLs still
+# come only from the optional -RuntimeDonorDir (ffmpegRuntimeDeployed).
 #
 # Usage (MLV_HEAVY_SLOT_DEADLINE_UTC must be set: Invoke-VenueStageChain.ps1 and the nightly set it; for a manual run set it yourself, ISO-8601):
 #   pwsh -NoProfile -File tools\profiling\bachelor\playback-attr-3-cuda-assemble.ps1 `
@@ -79,6 +88,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'AttrCudaArtifacts.psm1') -Force
+# Install-PinnedVendoredPayload (the bounded ffmpeg.exe install below), shared with tools/build-release.ps1.
+Import-Module (Join-Path $PSScriptRoot '..\..\release-runtime-admission.psm1') -Force
 
 $StepLog = [System.Collections.Specialized.OrderedDictionary]::new()
 function Say([string]$Message) { Write-Host "[attr3-assemble] $Message" }
@@ -313,6 +324,48 @@ if (-not [string]::IsNullOrWhiteSpace($RuntimeDonorDir)) {
 }
 $StepLog['runtimeDonor'] = 0
 
+# --- ffmpeg.exe from the pinned in-repo payload --------------------------------------------------
+# EXPORT-PRORES-FFMPEG-EXE-PACKAGE-1: a ProRes export leg runs the package's own ffmpeg.exe, found beside MLVApp.exe
+# (export-stage-job.ps1 refuses EXPORT_TOOLING_ABSENT without it), and no donor dir ever carried one. So it is installed
+# here on EVERY assemble, outside the optional donor step above, by the extractor and flags the hosted Windows release
+# uses: platform/qt/FFmpeg/ffmpegWin64.zip, member ffmpeg.exe, both sha-pinned in tools/gates/vendored-native-payloads.json
+# and re-verified after the atomic install. $RepoRoot is the git checkout (the archive's Git tracking is checked with git
+# ls-files on that one path; the git-archive $SourceTree has no .git); the pins, not that checkout's revision, decide the bytes.
+# The helper validates ONLY this record (--record-only, adversary ae560106-A2): no tracked-file census, so no media file is
+# opened, which keeps the NO FOOTAGE promise above.
+$ffmpegPayloadId = 'ffmpeg-windows-x86_64'
+$ffmpegInstall = Install-PinnedVendoredPayload -RepoRoot $RepoRoot -PayloadId 'ffmpeg-windows-x86_64' -ArchiveReference 'ffmpegWin64.zip' -OutputDir $releaseDir -TimeoutSec 600
+# The log is evidence, not a gate: a log that cannot be written (locked) is said and never throws past the typed
+# failure below (adversary 32bf39a9-A2).
+try {
+    @("exitCode=$($ffmpegInstall.exitCode) timedOut=$($ffmpegInstall.timedOut) killConfirmed=$($ffmpegInstall.killConfirmed) ok=$($ffmpegInstall.ok) reason=$($ffmpegInstall.reason)", '--- stdout', $ffmpegInstall.stdout, '--- stderr', $ffmpegInstall.stderr) |
+        Set-Content -LiteralPath (Join-Path $logDir 'ffmpeg-exe-install.log') -Encoding UTF8
+} catch {
+    Say "LOG logs\ffmpeg-exe-install.log not written: $($_.Exception.Message)"
+}
+if (-not $ffmpegInstall.ok) { Complete-Failed 28 'ffmpegExeInstall' "ffmpeg.exe was not installed from the pinned payload $ffmpegPayloadId : $($ffmpegInstall.reason) (see logs\ffmpeg-exe-install.log)" }
+$ffmpegExePath = Join-Path $releaseDir 'ffmpeg.exe'
+# PR 862 r11 (adversary fa89f1b3-A1 sibling :337): the helper installs into the output folder it HELD, and reports each file under
+# that folder's own resolved path (.outputDir), which need not be this spelling (8.3, junction); the row is matched by its name.
+$ffmpegRows = @($ffmpegInstall.installed | Where-Object { [string]::Equals([string]$_.name, 'ffmpeg.exe', [StringComparison]::OrdinalIgnoreCase) })
+if ($ffmpegRows.Count -ne 1 -or -not (Test-Path -LiteralPath $ffmpegExePath -PathType Leaf)) {
+    Complete-Failed 28 'ffmpegExeInstall' "the pinned payload $ffmpegPayloadId did not install $ffmpegExePath (installed: $(@($ffmpegInstall.installed | ForEach-Object { $_.path }) -join ', '))"
+}
+try {
+    $ffmpegExe = [ordered]@{
+        payloadId = $ffmpegPayloadId
+        bytes = [long](Get-Item -LiteralPath $ffmpegExePath -Force).Length
+        sha256 = Get-ShaLower $ffmpegExePath
+    }
+} catch {
+    Complete-Failed 28 'ffmpegExeInstall' "the installed $ffmpegExePath could not be read back: $($_.Exception.Message)"
+}
+if ($ffmpegExe.sha256 -cne [string]$ffmpegRows[0].sha256 -or $ffmpegExe.bytes -ne [long]$ffmpegRows[0].bytes) {
+    Complete-Failed 28 'ffmpegExeInstall' "$ffmpegExePath changed after the extractor verified it"
+}
+Say "FFMPEG.EXE installed from $ffmpegPayloadId bytes=$($ffmpegExe.bytes) sha256=$($ffmpegExe.sha256)"
+$StepLog['ffmpegExeInstall'] = 0
+
 # --- prove the package launches ----------------------------------------------------------------
 # Sanitized PATH so the ONLY DLLs that can resolve are the ones just deployed beside the exe;
 # the Qt/MinGW bins still on this process's PATH would otherwise mask an incomplete deploy.
@@ -327,10 +380,16 @@ if (-not $SkipLaunchProbe) {
             $env:SystemRoot,
             (Join-Path $env:SystemRoot 'System32\Wbem')
         ) -join ';'
+        # PR 862 r8 (adversary 500e2892-A1): listed before the probe exists, so a timeout's kill can place other processes outside its tree.
+        $probeBaseline = Get-PinnedPayloadBaseline
         $probe = Start-Process -FilePath $releaseExe -ArgumentList '--batch', '--help' `
             -WorkingDirectory $probeDir -PassThru -WindowStyle Hidden
         if (-not $probe.WaitForExit(120000)) {
-            try { $probe.Kill() } catch { }
+            # The kill is confirmed or the failure says it is not (adversary 32bf39a9-A3, sibling of the ffmpeg install's). PR 862 r10 (sol r9
+            # B1 caller :387, the split): the stop kills the probe's ROOT only; any probe timeout, confirmed or not, ends in Complete-Failed 23.
+            $probeStop = Stop-PinnedPayloadChild -Process $probe -Baseline $probeBaseline
+            # PR 862 r11 (Grok G8): confirmed means no tree member was still LISTED, not that no descendant runs (PINNED-PAYLOAD-KILL-TREE-DST-1).
+            $probeKillNote = if ($probeStop.confirmed) { 'root killed, no tree member still listed (not proof that no descendant runs)' } else { "kill NOT confirmed, pid $($probe.Id) may still run$(if ($probeStop.killError) { ": $($probeStop.killError)" })" }
             $launchProbe.timedOut = $true
         } else {
             $launchProbe.exitCode = $probe.ExitCode
@@ -338,7 +397,7 @@ if (-not $SkipLaunchProbe) {
         $launchProbe.ran = $true
     } finally { $env:PATH = $savedPath }
     if ($launchProbe.timedOut -or [int]$launchProbe.exitCode -ne 0) {
-        Complete-Failed 23 'launchProbe' "the deployed exe did not run standalone (exit=$($launchProbe.exitCode) timedOut=$($launchProbe.timedOut)); a DLL-load status here means the package is not self-contained"
+        Complete-Failed 23 'launchProbe' "the deployed exe did not run standalone (exit=$($launchProbe.exitCode) timedOut=$($launchProbe.timedOut)$(if ($launchProbe.timedOut) { " $probeKillNote" })); a DLL-load status here means the package is not self-contained"
     }
 }
 $StepLog['launchProbe'] = 0
@@ -347,7 +406,13 @@ $StepLog['launchProbe'] = 0
 $stagedPkgPath = Join-Path $Scratch $names.packageZipName
 $stagedExePath = Join-Path $Scratch $names.exeName
 $stagedDllPath = Join-Path $Scratch $names.reconName
+$releaseExeSha = ''
+$releaseExeBytes = -1L
 try {
+    # PR 862 r16 (sol r15 A1): the app's own bytes are recorded BEFORE the archive step, so the zip's MLVApp.exe entry is checked below
+    # against what was in the release dir (Compress-Archive -Path dir\* omits a file with the Hidden attribute).
+    $releaseExeSha = Get-ShaLower $releaseExe
+    $releaseExeBytes = ([System.IO.FileInfo]::new($releaseExe)).Length
     if (Test-Path -LiteralPath $stagedPkgPath) { Remove-Item -LiteralPath $stagedPkgPath -Force }
     Compress-Archive -Path (Join-Path $releaseDir '*') -DestinationPath $stagedPkgPath -Force
     Copy-Item -LiteralPath $releaseExe -Destination $stagedExePath -Force
@@ -355,7 +420,19 @@ try {
 } catch {
     Complete-Failed 20 'package' $_.Exception.Message
 }
-$stagedPkgSha = Get-ShaLower $stagedPkgPath
+# Adversary ae560106-A1: ffmpeg.exe deleted or rewritten after its readback zipped without it while build.json still said
+# ffmpegExeDeployed. The ffmpeg.exe entry INSIDE the staged zip is checked against the recorded sha256 and size, and the zip's
+# own sha256 is read through the same handle, so the hash published below (and round-tripped by every .partial copy) is the
+# hash of the zip whose entry was verified.
+$pkgFfmpegCheck = Test-PinnedZipMember -ZipPath $stagedPkgPath -MemberName 'ffmpeg.exe' -ExpectedSha256 $ffmpegExe.sha256 -ExpectedBytes $ffmpegExe.bytes
+if (-not $pkgFfmpegCheck.ok) { Complete-Failed 28 'ffmpegExeInstall' "the staged package does not carry the installed ffmpeg.exe: $($pkgFfmpegCheck.reason)" }
+# PR 862 r16 (sol r15 A1): the app is checked the same way. A Hidden or missing MLVApp.exe left the zip without the app while the
+# FFmpeg-only check passed, and the export stage later found no app in the expanded package. The entry must be exactly the release
+# dir's bytes, and both checks must have read the same zip bytes (the published zip hash is the one whose entries were verified).
+$pkgAppCheck = Test-PinnedZipMember -ZipPath $stagedPkgPath -MemberName $names.packageExeName -ExpectedSha256 $releaseExeSha -ExpectedBytes $releaseExeBytes
+if (-not $pkgAppCheck.ok) { Complete-Failed 20 'package' "the staged package does not carry $($names.packageExeName) from the release dir: $($pkgAppCheck.reason)" }
+if ($pkgAppCheck.zipSha256 -cne $pkgFfmpegCheck.zipSha256) { Complete-Failed 20 'package' 'the staged package zip changed between its ffmpeg.exe check and its app check' }
+$stagedPkgSha = $pkgFfmpegCheck.zipSha256
 $stagedExeSha = Get-ShaLower $stagedExePath
 $stagedDllSha = Get-ShaLower $stagedDllPath
 $StepLog['package'] = 0
@@ -421,6 +498,9 @@ $buildManifest = [ordered]@{
     }
     ffmpegRuntimeDeployed = $ffmpegRuntimeDeployed
     ffmpegRuntimeFiles = @($ffmpegNames)
+    # ffmpeg.exe beside the exe, from the pinned payload; the bytes and sha256 are read from the installed file.
+    ffmpegExeDeployed = $true
+    ffmpegExe = $ffmpegExe
     launchProbe = $launchProbe
     identity = [ordered]@{ injectedFromPinnedSourceCommit = $true; sha = $SourceCommit; dirty = 0 }
     # The verified archive the exe was compiled from; its zip comment declared $SourceCommit.

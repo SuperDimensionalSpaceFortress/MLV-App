@@ -17,10 +17,13 @@
 #include "../../platform/qt/GpuPresentTailWindow.h"
 
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QRegularExpression>
 #include <QEventLoop>
 #include <QFile>
+#include <QMap>
 #include <QString>
+#include <QStringList>
 #include <QTextStream>
 #include <QElapsedTimer>
 #include <QTimer>
@@ -29,24 +32,91 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
+#include <limits>
+#include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifdef Q_OS_WIN
 #include <windows.h>
 #endif
 
+// PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 r10 (sol r9 B3 / luna key3 r9 B1): the timing-stamp seam is compiled only in this test
+// build (console_tests.pro DEFINES); the app build has none of it (SEAM1_TheTimingSeamIsCompiledOutOfTheAppBuild)
+#ifndef MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM
+#error "console_tests.pro must define MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM: these tests judge the PlaybackDueWake timing-stamp seam"
+#endif
+
 namespace
 {
+// CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1 (adversary pass A1 on e60d41b6): translation phase 2 -- every backslash that ends a
+// physical line (GCC also splices across trailing blanks after it) joins that line to the next, before any comment or directive
+// exists. A `// \` line before an `#else` therefore comments that `#else` out in the compiled source, yet every pin that read
+// the physical lines still saw the directive. Every source pin reads through dueWakeRepoSource, so each one now sees the
+// compiler's logical lines. The pinned production files contain no line splice, so this changes no pinned text.
+QString dueWakeSpliceLines( const QString & text )
+{
+    static const QRegularExpression splice( QStringLiteral( "\\\\[ \\t\\f\\v]*\\n" ) );
+    QString out = text;
+    out.remove( splice );
+    return out;
+}
 QString dueWakeRepoSource( const QString & relative )
 {
     const QString path = repo_file_path( relative );
     QFile file( path );
     if( path.isEmpty() || !file.open( QIODevice::ReadOnly | QIODevice::Text ) ) return QString();
     QTextStream stream( &file );
-    return stream.readAll();
+    return dueWakeSpliceLines( stream.readAll() );
+}
+
+// CI-FLAKE-PLAYBACK-DUE-WAKE-R17A1-TIMING-1 r5 (20x run on a loaded host: the R17A1 sink test read 76.1-79.2 ms for an 80 ms
+// sleep in 9 of 20 runs, and R3A3 read under 140 ms for 150 ms once): the sleep's wait is MsgWaitForMultipleObjectsEx with a
+// whole-ms timeout, whose expiry is tick-granular, and the product does not re-read the clock on a timeout, so a sleep may end
+// up to one timer tick (15.625 ms by default; 16 with margin) before its requested time. The floor a sleep must reach is
+// therefore its request less that tick, never less than 1 ms: it still fails a sleep cut short at a dispatch or ended at ~0 ms,
+// and what pins the sleep not being cut short mid-way is the product's own exit record (dueWakeSleepExitMet), not the wall floor.
+constexpr double kSleepTimerTickSlackMs = 16.0;
+double dueWakeSleepFloorMs( double requestedMs )
+{
+    return std::max( 1.0, requestedMs - kSleepTimerTickSlackMs );
+}
+
+// CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1: the RED seam MLV_R17A1_RED_R5_ORDER=1 replays 303c7191's (r5's) judgement order
+// at the two sites sol r5 blocked (the R3A3 admission gate and judgeSentWait's length-before-record read), so either literal row
+// shows its r5 failure on the exact head with no rebuild. Each replay only fails more samples than the fix does, never fewer.
+bool dueWakeRedR5Order()
+{
+    const char *value = std::getenv( "MLV_R17A1_RED_R5_ORDER" );
+    return value && std::string( value ) == "1";
+}
+
+// PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 (r7 adversary pass 12 A1/A3): a sleep's exit is judged on the value the product itself
+// compared when it left its loop (PlaybackDueWake::setTimingStampsForTest), never on a clock read taken after the fact: a
+// scheduler pause between the product's decision and a later read (the sleep's final caller-clock read, a sender's post-call
+// stamp) let a sleep cut short at a dispatch read as having run on. An expiry check left the loop only when its own elapsed
+// value was past the request. Any other exit (none recorded, a failed wait, a wake) is not a full interval.
+// SEAM-1 adversary pass A1 (cd623269): a timeout used to be recorded as a clock read AFTER the wait returned and judged with one
+// timer tick of slack, so a wait the product cut short (asked to cover 49 ms) and a GUI paused until 65 ms read as a full 80 ms
+// sleep less one tick. A timeout now records the interval the timed-out wait was ASKED to cover (its own start read plus the rest
+// it requested), and that plan must reach the whole request, with no slack: the kernel's tick-early expiry is not in the plan.
+bool dueWakeSleepExitMet( PlaybackDueWake::RunnerSleepExit exit, qint64 exitMs, double requestedMs )
+{
+    switch( exit )
+    {
+    case PlaybackDueWake::RunnerSleepExit::ExpiredAfterDispatch:
+    case PlaybackDueWake::RunnerSleepExit::ExpiredAfterOtherWake:
+        return static_cast<double>( exitMs ) > requestedMs;
+    case PlaybackDueWake::RunnerSleepExit::TimedOut:
+        return static_cast<double>( exitMs ) >= requestedMs;
+    default:
+        return false;
+    }
 }
 
 QString functionBody( const QString & source, const QString & signature, const QString & nextSignature )
@@ -55,6 +125,93 @@ QString functionBody( const QString & source, const QString & signature, const Q
     const int end = source.indexOf( nextSignature, begin + 1 );
     if( begin < 0 || end <= begin ) return QString();
     return source.mid( begin, end - begin );
+}
+
+// SEAM-1 adversary pass A4/A5 (cd623269): the code of a body with every line cut at its first `//`, so a token pin counts code,
+// never a comment's wording
+QString dueWakeCodeOnly( const QString & body )
+{
+    QStringList lines = body.split( QLatin1Char( '\n' ) );
+    for( QString &line : lines )
+    {
+        const int comment = line.indexOf( QStringLiteral( "//" ) );
+        if( comment >= 0 ) line.truncate( comment );
+    }
+    return lines.join( QLatin1Char( '\n' ) );
+}
+// PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 r4 (adversary pass 3 A1 on 91820e1e): the code of a body with every `//` tail cut first
+// (so a `/*` inside a line comment opens nothing) and then every /* ... */ span cut (an unclosed one runs to the end), so a
+// token or digest pin counts code only, never a doc comment's wording (derive-closure.py in the r4 run dir: the same steps)
+QString dueWakeNoComments( const QString & body )
+{
+    const QString code = dueWakeCodeOnly( body );
+    QString out;
+    int at = 0;
+    for( ;; )
+    {
+        const int open = code.indexOf( QStringLiteral( "/*" ), at );
+        if( open < 0 ) { out += code.mid( at ); break; }
+        out += code.mid( at, open - at );
+        const int close = code.indexOf( QStringLiteral( "*/" ), open + 2 );
+        if( close < 0 ) break;
+        at = close + 2;
+    }
+    return out;
+}
+// each clock-read call in a body, by name (the same vocabulary as derive-clock-tokens.py in the round's run dir)
+QMap<QString, int> dueWakeClockCalls( const QString & code )
+{
+    static const QRegularExpression clock( QStringLiteral(
+        "\\b(elapsed|nsecsElapsed|msecsSinceReference|hasExpired|restart|start|nowNs|spanNowS|nowS|QueryPerformanceCounter|"
+        "GetTickCount64|GetTickCount|timeGetTime|clock|steady_clock|high_resolution_clock|system_clock|currentMSecsSinceEpoch)\\b\\s*\\(" ) );
+    QMap<QString, int> calls;
+    QRegularExpressionMatchIterator it = clock.globalMatch( code );
+    while( it.hasNext() ) ++calls[it.next().captured( 1 )];
+    return calls;
+}
+
+// PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 r10 (sol r9 B3): the source as the APP build compiles it, where the seam macro is not
+// defined: each `#ifdef MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM` branch is cut (its own directives too) and its `#else` branch kept;
+// every other line, directive or not, is kept as it is (derive-r10.py in the r10 run dir: the same steps)
+QString dueWakeAppBuildView( const QString & source )
+{
+    struct Frame
+    {
+        bool seam;
+        bool inElse;
+    };
+    std::vector<Frame> frames;
+    QStringList kept;
+    for( const QString &line : source.split( QLatin1Char( '\n' ) ) )
+    {
+        const QString t = line.trimmed();
+        bool seamDirective = false;
+        if( t.startsWith( QLatin1Char( '#' ) ) )
+        {
+            const QString directive = t.mid( 1 ).trimmed();
+            if( directive.startsWith( QStringLiteral( "ifdef MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM" ) ) )
+            {
+                frames.push_back( { true, false } );
+                seamDirective = true;
+            }
+            else if( directive.startsWith( QStringLiteral( "if" ) ) ) frames.push_back( { false, false } );
+            else if( directive.startsWith( QStringLiteral( "el" ) ) && !frames.empty() && frames.back().seam )
+            {
+                frames.back().inElse = true;
+                seamDirective = true;
+            }
+            else if( directive.startsWith( QStringLiteral( "endif" ) ) && !frames.empty() )
+            {
+                seamDirective = frames.back().seam;
+                frames.pop_back();
+            }
+        }
+        if( seamDirective ) continue;
+        bool cut = false;
+        for( const Frame &frame : frames ) cut = cut || ( frame.seam && !frame.inElse );
+        if( !cut ) kept << line;
+    }
+    return kept.join( QLatin1Char( '\n' ) );
 }
 
 #ifdef Q_OS_WIN
@@ -1327,6 +1484,99 @@ bool waitWithoutPumping( const std::function<bool()> & done, DWORD waitMs )
     while( !done() && GetTickCount64() < deadline ) Sleep( 2 );
     return done();
 }
+// CI-FLAKE-PLAYBACK-DUE-WAKE-R17A1-TIMING-1 r3 (adversary pass 4 A1): a replacement arm's own due time is asserted on EVERY attempt
+// that is judged, never skipped. The timer starts BEFORE arm(), so the replacement's due time is inside what it measures whatever
+// the scheduler did after the arm (late only lengthens it); the arm's own cost is bracketed. A pause before the arm would let a
+// shortened replacement still read long, so an attempt whose arm cost reached kReplacementMaxArmCostNs is not judged (it is
+// drained and the observation retried, keyed on that flag); every judged attempt runs the full bound, and no attempt passes by
+// skipping it.
+// r4 (sol review r3, blocker 1; adversary pass 1 A2/A3/A7): the credit for time spent before the timer started is the arm cost
+// itself, so it is capped at 2 ms (was 20 ms: an 18 ms pause before the arm let a replacement shortened to 18 ms read 36 ms and
+// pass), and the floor is the 40 ms due less 2 ms of timer slack. A replacement is therefore rejected below 36 ms of due time
+// (38 ms floor - 2 ms credit); one between 36 and 40 ms is inside the stated tolerance. The bound has a ceiling too (a delivery 40
+// ms late is not the replacement's due time, whatever the lower bound says), judged on the wait thread's RETURN stamp of the post:
+// the first stamp only bounds the send from below, and a wait thread paused before its send would read on time there. A delivery
+// past the ceiling is a scheduler fact, not a verdict: it is observed again, and only five late ones in a row (a product that is
+// consistently late) leave the test without a judged attempt and fail it.
+// r7 (sol review r6, blocker 2): two scheduler facts the r4 classifier read as verdicts. (1) The wait thread's first stamp is taken
+// when IT wakes: a thread paused 22 ms before that stamp stamps a timer shortened 40 -> 18 ms at 40.2 ms, which no single attempt
+// can tell from a healthy one (nothing the test can observe separates "the timer fired late" from "the thread ran late"). A
+// shortened timer is a systematic defect, though: it reads early in every attempt whose worker is not paused, so ONE judged attempt
+// proves nothing and kReplacementProofsNeeded of them, each a fresh arm, must all clear the floor (any early one fails at once).
+// (2) A delivery the GUI thread took before the wait thread published its return stamp is "unsplit" (no first/return stamps at
+// all): five healthy wakes in a row can land that way. It is no longer retried away; the GUI thread's own receive time bounds it
+// from BOTH sides (a delivery cannot be received before it is posted, so a receive time under the floor is early, and one over
+// the ceiling is late: observed again, never a proof; r7 adversary pass 1 A2: an 80 ms unsplit delivery counted toward all three
+// proofs when only the floor was judged). Only a split on-time or an unsplit on-time delivery counts toward the proofs.
+// PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 (r7 adversary pass 12 A2): the unsplit floor was the GUI thread's RECEIVE time, which a
+// wait thread paused between its send and the return-stamp publication (with the GUI not pumping until 40 ms) pushes past the
+// floor: an 18 ms send received at 40.4 ms was credited OnTimeUnsplit. The floor is now the wait thread's own PRE-SEND stamp,
+// which the product records for every stamped delivery, split or unsplit (PlaybackDueWake::lastDeliveryFirstStampMsForTest);
+// the receive time still bounds the ceiling. An unsplit delivery that carries no pre-send stamp is a failure (UnsplitUnstamped),
+// never NotJudgeable: the stamp is taken before every send, so its absence is a product defect, not a scheduler fact.
+constexpr int kReplacementAttempts = 8;
+constexpr int kReplacementProofsNeeded = 3;
+constexpr qint64 kReplacementMaxArmCostNs = 2000000;
+constexpr qint64 kReplacementMinElapsedNs = 38000000;                 // the 40 ms replacement due, less 2 ms of timer slack
+constexpr qint64 kReplacementMaxElapsedNs = 70000000;                 // the 40 ms replacement due, plus 30 ms of scheduling
+enum class ReplacementAttempt { NotJudgeable, TooEarly, TooLate, OnTime, OnTimeUnsplit, UnsplitUnstamped };
+enum class ReplacementStamps { None, Unsplit, UnsplitUnstamped, Split };
+ReplacementStamps replacementStampsOf( bool split, bool unsplit, bool firstStamped )
+{
+    if( split ) return ReplacementStamps::Split;
+    if( !unsplit ) return ReplacementStamps::None;
+    return firstStamped ? ReplacementStamps::Unsplit : ReplacementStamps::UnsplitUnstamped;
+}
+// One replacement attempt, from the arm's own cost, which stamps the delivery carried, and the time (ns) from before the arm to the
+// FIRST stamp (the earliest the post can have been), to the RETURN stamp (the latest) and to the GUI thread's own receive of it.
+// Early is a verdict on any delivery from a cheap arm; late and unstamped are not. The comparisons are written so that an
+// unordered (NaN) elapsed time fails them: it reads as early, never as on time. A split pair whose return precedes its first
+// stamp is not a measurement (r7, sol review r6 hardening; adversary pass 1 A8: checked FIRST, so 37/36 ms is not "early") and is
+// not judged. An unordered pair (NaN) is not an inversion: it falls through to the early / late verdicts above.
+// SEAM-1 A2: for an unsplit delivery firstElapsedNs is the seam's pre-send stamp (the floor) and receiveElapsedNs the ceiling; an
+// unsplit delivery with no pre-send stamp fails FIRST, before the arm cost could make it NotJudgeable.
+ReplacementAttempt classifyReplacementAttempt( qint64 armCostNs, ReplacementStamps stamps, double firstElapsedNs, double returnElapsedNs, double receiveElapsedNs )
+{
+    if( stamps == ReplacementStamps::UnsplitUnstamped ) return ReplacementAttempt::UnsplitUnstamped;
+    if( armCostNs >= kReplacementMaxArmCostNs || stamps == ReplacementStamps::None ) return ReplacementAttempt::NotJudgeable;
+    if( stamps == ReplacementStamps::Unsplit )
+    {
+        // SEAM-1 adversary pass A9 (cd623269): a receive before its own pre-send stamp is no measurement (as an inverted split
+        // pair below), never a proof
+        if( firstElapsedNs > receiveElapsedNs ) return ReplacementAttempt::NotJudgeable;
+        if( !( firstElapsedNs >= static_cast<double>( kReplacementMinElapsedNs ) ) ) return ReplacementAttempt::TooEarly;
+        if( !( receiveElapsedNs <= static_cast<double>( kReplacementMaxElapsedNs ) ) ) return ReplacementAttempt::TooLate;
+        return ReplacementAttempt::OnTimeUnsplit;
+    }
+    if( firstElapsedNs > returnElapsedNs ) return ReplacementAttempt::NotJudgeable;
+    if( !( firstElapsedNs >= static_cast<double>( kReplacementMinElapsedNs ) ) ) return ReplacementAttempt::TooEarly;
+    if( !( returnElapsedNs <= static_cast<double>( kReplacementMaxElapsedNs ) ) ) return ReplacementAttempt::TooLate;
+    return ReplacementAttempt::OnTime;
+}
+// An attempt that clears the floor and the ceiling: the replacement was on time (by the wait thread's stamps, or by the GUI thread's
+// own receive time when the delivery carried none)
+bool replacementAttemptProves( ReplacementAttempt verdict )
+{
+    return verdict == ReplacementAttempt::OnTime || verdict == ReplacementAttempt::OnTimeUnsplit;
+}
+// SEAM-1 A2: the verdicts that fail a live attempt at once (an early send, or an unsplit delivery with no pre-send stamp)
+bool replacementAttemptFails( ReplacementAttempt verdict )
+{
+    return verdict == ReplacementAttempt::TooEarly || verdict == ReplacementAttempt::UnsplitUnstamped;
+}
+// r3 (adversary pass 4 A5): a helper window is destroyed on every exit, an ASSERT or a throw included (same thread that created it)
+struct HelperWindowGuard
+{
+    HWND window;
+    ~HelperWindowGuard() { if( window ) DestroyWindow( window ); }
+};
+// r4 (adversary pass 2 A3, and pass 1 A8): a sender thread is joined on every exit. An ASSERT that returns, or a throw, between
+// its creation and its join would otherwise destroy a joinable std::thread (std::terminate) before the window guard above runs
+struct ThreadJoinGuard
+{
+    std::thread &thread;
+    ~ThreadJoinGuard() { if( thread.joinable() ) thread.join(); }
+};
 }
 #endif
 
@@ -1920,6 +2170,30 @@ double dueWakeQpcNowMs()
     QueryPerformanceCounter( &now );
     return static_cast<double>( now.QuadPart ) * 1000.0 / static_cast<double>( frequency.QuadPart );
 }
+
+// PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 (r7 adversary pass 12 A3; replaces r7's entry/final-read observation): the sibling floors
+// (G1, R3A3, R2A1, A_) were read on the sleep's own entry and FINAL clock reads, and a scheduler pause between the loop's exit
+// decision and that final read (a break after a dispatch, the final read paused until the floor) met every floor. A sleep is now
+// judged on the product's own exit record (PlaybackDueWake::setTimingStampsForTest): how it left its loop and the elapsed value
+// that very decision compared (dueWakeSleepExitMet). No observation is gated on when the last dispatch ended: every sample whose
+// preconditions held (the foreign send reached the sleep) is judged. kSleepObservationAttempts bounds only those preconditions.
+constexpr int kSleepObservationAttempts = 3;
+double dueWakeQpcNowS()
+{
+    return dueWakeQpcNowMs() / 1000.0;
+}
+struct DueWakeSleepObservation
+{
+    PlaybackDueWake::RunnerSleepExit exit;   // how the product's last runner sleep left its loop
+    qint64 exitMs;                           // the elapsed value that exit decision compared (-1: none recorded)
+    bool met;                                // dueWakeSleepExitMet against the requested interval
+};
+DueWakeSleepObservation dueWakeObserveSleep( const PlaybackDueWake & wake, double requestedMs )
+{
+    const PlaybackDueWake::RunnerSleepExit exit = wake.lastRunnerSleepExitForTest();
+    const qint64 exitMs = wake.lastRunnerSleepExitElapsedMsForTest();
+    return DueWakeSleepObservation { exit, exitMs, dueWakeSleepExitMet( exit, exitMs, requestedMs ) };
+}
 }
 #endif
 
@@ -1978,8 +2252,11 @@ TEST(PlaybackDueWakeSend, A_ARunnerSleepEndsForASentWakeButNotForAPostedOne)
     ASSERT_EQ( 2, fired );
     // a sleep no sent message interrupts runs its whole length
     const double before = dueWakeQpcNowMs();
+    wake.setTimingStampsForTest( true );
     ASSERT_TRUE( wake.sleepForSmokeRunner( 30 ) == PlaybackDueWake::RunnerSleep::Slept );
-    ASSERT_TRUE( dueWakeQpcNowMs() - before >= 25.0 );
+    ASSERT_TRUE( dueWakeQpcNowMs() - before >= dueWakeSleepFloorMs( 30.0 ) );   // 30 ms less one timer tick (a dispatch-free sleep; r7: was 25.0)
+    ASSERT_TRUE( dueWakeObserveSleep( wake, 30.0 ).met );            // SEAM-1 A3: judged on the product's own exit record
+    wake.setTimingStampsForTest( false );
     ASSERT_EQ( 2, fired );
 #else
     SKIP_TEST( "native-message delivery is Windows-only" );
@@ -2078,18 +2355,83 @@ TEST(PlaybackDueWakeSend, D_AStaleSentWakeThroughTheWindowProcedureIsDroppedByTh
 {
 #ifdef Q_OS_WIN
     int fired = 0;
-    PlaybackDueWake wake( nullptr, [&fired]() { ++fired; }, PlaybackDueWakeDeliveryMode::SendNotify );
-    wake.arm( 0.5 );
-    ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
-    wake.arm( 40.0 );                                             // re-armed before the GUI thread took the sent wake
-    ASSERT_EQ( 1u, wake.strandedCounts().total );
-    wake.dispatchSentMessages();                                  // dueWakeWindowProc -> handleNativeMessage -> the gate
-    ASSERT_EQ( 0, fired );                                        // the old generation: dropped
-    ASSERT_TRUE( wake.armed() );                                  // ...and the replacement is still armed
-    ASSERT_TRUE( wake.sleepForSmokeRunner( 1000 ) == PlaybackDueWake::RunnerSleep::WokenBySent );
-    wake.dispatchSentMessages();
-    ASSERT_EQ( 1, fired );                                        // the replacement fires once, at its own due time
-    ASSERT_FALSE( wake.armed() );
+    double firedPostFirstMs = -1.0;                                   // the wait thread's own stamp of the delivery that fired
+    double firedPostReturn = -1.0;                                    // ...and its stamp of when the post returned (the latest the post can have been)
+    bool firedStamped = false;                                        // ...and whether that delivery carried them
+    bool firedUnsplit = false;                                        // ...or was taken before the return stamp was published
+    double firedReceiveMs = -1.0;                                     // the GUI thread's own receive time (QPC ms)
+    double firedPreSendStamp = -1.0;                                  // SEAM-1 A2: the wait thread's pre-send stamp, split or unsplit
+    int firedStampMismatches = 0;                                     // a split delivery whose pre-send stamp is not its first stamp
+    PlaybackDueWake *self = nullptr;
+    PlaybackDueWake wake( nullptr, [&]() {
+        ++fired;
+        firedReceiveMs = dueWakeQpcNowMs();
+        const double stamp = self->lastDeliveryPostFirstMs();
+        firedPostReturn = self->lastDeliveryPostMs();
+        firedStamped = stamp >= 0.0 && firedPostReturn >= 0.0;
+        firedUnsplit = self->lastDeliveryUnsplit();
+        firedPostFirstMs = stamp;
+        firedPreSendStamp = self->lastDeliveryFirstStampMsForTest();
+        if( firedStamped && firedPreSendStamp != stamp ) ++firedStampMismatches;
+    }, PlaybackDueWakeDeliveryMode::SendNotify );
+    self = &wake;
+    wake.setTimingStampsForTest( true );
+    // r3 (adversary pass 4 A1 sibling): the replacement's own due time is asserted on every judged attempt (see kReplacementMax*)
+    // r7 (sol review r6, blocker 2): kReplacementProofsNeeded attempts must clear the floor (see kReplacementProofsNeeded)
+    int proofs = 0;
+    for( int attempt = 0; attempt < kReplacementAttempts && proofs < kReplacementProofsNeeded; ++attempt )
+    {
+        fired = 0;
+        firedPostFirstMs = -1.0;
+        firedPostReturn = -1.0;
+        firedStamped = false;
+        firedUnsplit = false;
+        firedReceiveMs = -1.0;
+        firedPreSendStamp = -1.0;
+        wake.resetStrandedCounts();
+        wake.arm( 0.5 );
+        ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
+        QElapsedTimer t;
+        t.start();
+        const double preArmMs = dueWakeQpcNowMs();
+        wake.arm( 40.0 );                                         // re-armed before the GUI thread took the sent wake
+        const qint64 armCostNs = t.nsecsElapsed();
+        if( armCostNs >= kReplacementMaxArmCostNs )
+        {
+            // not judgeable (a pause before the arm could hide a shortened replacement): drain it, observe again
+            wake.sleepForSmokeRunner( 1000 );
+            wake.dispatchSentMessages();
+            // SEAM-1 adversary pass A2 (cd623269): the arm cost makes the TIMING unjudgeable, never the stamps: a delivery that
+            // fired here still carries its pre-send stamp (unsplit) and one equal to its first stamp (split)
+            ASSERT_EQ( 0, firedStampMismatches );
+            ASSERT_FALSE( fired > 0 && replacementStampsOf( firedStamped, firedUnsplit, firedPreSendStamp >= 0.0 ) == ReplacementStamps::UnsplitUnstamped );
+            continue;
+        }
+        ASSERT_EQ( 1u, wake.strandedCounts().total );
+        wake.dispatchSentMessages();                              // dueWakeWindowProc -> handleNativeMessage -> the gate
+        ASSERT_EQ( 0, fired );                                    // the old generation: dropped
+        ASSERT_TRUE( wake.armed() );                              // ...and the replacement is still armed
+        ASSERT_TRUE( wake.sleepForSmokeRunner( 1000 ) == PlaybackDueWake::RunnerSleep::WokenBySent );
+        wake.dispatchSentMessages();
+        ASSERT_EQ( 1, fired );                                    // the replacement fires once, at its own due time
+        ASSERT_FALSE( wake.armed() );
+        // the wait thread stamped the replacement's delivery on its own clock, so a pause of THIS thread after the wake cannot
+        // lengthen what is measured: from before the arm to that stamp is >= the 40 ms due (less slack), never the stale wake's ~0.5 ms
+        // r4 (sol review r3, blocker 1): early is a failure, late (past kReplacementMaxElapsedNs) or unstamped is observed again
+        // r7: a delivery the GUI took before the wait thread published its return stamp carries no split (PlaybackDueWake.h
+        // lastDeliveryPostFirstMs, "unsplit"); it is judged on the GUI thread's receive time (neither early nor late) and counts as a proof,
+        // never retried away, so five healthy wakes landing that way no longer fail the test
+        // SEAM-1 A2: an unsplit delivery's floor is the wait thread's own pre-send stamp, never the GUI's receive time
+        ASSERT_EQ( 0, firedStampMismatches );                    // a split delivery's pre-send stamp IS its first stamp
+        const ReplacementAttempt verdict = classifyReplacementAttempt( armCostNs,
+            replacementStampsOf( firedStamped, firedUnsplit, firedPreSendStamp >= 0.0 ),
+            ( ( firedUnsplit ? firedPreSendStamp : firedPostFirstMs ) - preArmMs ) * 1000000.0, ( firedPostReturn - preArmMs ) * 1000000.0,
+            ( firedReceiveMs - preArmMs ) * 1000000.0 );
+        ASSERT_FALSE( replacementAttemptFails( verdict ) );
+        if( replacementAttemptProves( verdict ) ) ++proofs;
+    }
+    ASSERT_TRUE( proofs >= kReplacementProofsNeeded );            // never passes by skipping the bound
+    wake.setTimingStampsForTest( false );
     // cancelled after the send: dropped too
     wake.arm( 0.5 );
     ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
@@ -2097,6 +2439,98 @@ TEST(PlaybackDueWakeSend, D_AStaleSentWakeThroughTheWindowProcedureIsDroppedByTh
     wake.dispatchSentMessages();
     ASSERT_EQ( 1, fired );
     ASSERT_EQ( 2u, wake.strandedCounts().total );
+#else
+    SKIP_TEST( "native-message delivery is Windows-only" );
+#endif
+}
+
+// r4 (sol review r3, blocker 1), its inputs verbatim: pre-arm pause 18 ms with the replacement mapped 40 -> 18 ms (arm returns at
+// 18.2 ms, delivery stamped at 36.2 ms) passed both bounds at r3; so did the replacement mapped 40 -> 80 ms (stamped at 80.2 ms).
+TEST(PlaybackDueWakeSend, R4A1_TheReplacementBoundRejectsAnEarlyDeliveryAndNeverCreditsAPauseBeforeTheArm)
+{
+#ifdef Q_OS_WIN
+    // a delivery that carried the wait thread's first and return stamps (split), received by the GUI thread at the return stamp
+    const auto classifySplit = []( qint64 armCostNs, bool stamped, double firstElapsedNs, double returnElapsedNs ) {
+        return classifyReplacementAttempt( armCostNs, replacementStampsOf( stamped, false, stamped ), firstElapsedNs, returnElapsedNs, returnElapsedNs );
+    };
+    // a healthy replacement: 0.2 ms arm, first stamp 40.2 ms and return stamp 40.3 ms after the pre-arm read
+    ASSERT_TRUE( classifySplit(200000, true, 40200000.0, 40300000.0 ) == ReplacementAttempt::OnTime );
+    // 40 -> 18 ms with an 18 ms pause before the arm: the arm cost is 18.2 ms, so the attempt is not judged (never credited 18 ms)
+    ASSERT_TRUE( classifySplit(18200000, true, 36200000.0, 36300000.0 ) == ReplacementAttempt::NotJudgeable );
+    // the same shortened replacement with no pause is judged, and is early
+    ASSERT_TRUE( classifySplit(200000, true, 18200000.0, 18300000.0 ) == ReplacementAttempt::TooEarly );
+    // 40 -> 8 ms: early with no pause, not judged with a 6 ms pause (6.2 ms of arm cost)
+    ASSERT_TRUE( classifySplit(200000, true, 8200000.0, 8300000.0 ) == ReplacementAttempt::TooEarly );
+    ASSERT_TRUE( classifySplit(6200000, true, 14200000.0, 14300000.0 ) == ReplacementAttempt::NotJudgeable );
+    // adversary pass 1 A2: 40 -> 31 ms with a 4.3 ms pause inside the arm (4.4 ms of arm cost, first stamp 35.4 ms) passed at the
+    // 5 ms cap and the 35 ms floor; the 2 ms cap leaves it unjudged, and the 38 ms floor rejects the same shortening without a pause
+    ASSERT_TRUE( classifySplit(4400000, true, 35400000.0, 35500000.0 ) == ReplacementAttempt::NotJudgeable );
+    ASSERT_TRUE( classifySplit(200000, true, 31200000.0, 31300000.0 ) == ReplacementAttempt::TooEarly );
+    // 40 -> 80 ms: a delivery 40 ms late is not the replacement's due time (never OnTime, so the test cannot pass on it)
+    ASSERT_TRUE( classifySplit(200000, true, 80200000.0, 80300000.0 ) == ReplacementAttempt::TooLate );
+    // adversary pass 1 A3: a wait thread paused after its first stamp (40.2 ms) and before its send read on time by the first
+    // stamp alone; the return stamp (120.3 ms) is the latest the post can have been
+    ASSERT_TRUE( classifySplit(200000, true, 40200000.0, 120300000.0 ) == ReplacementAttempt::TooLate );
+    // a delivery with no wait-thread stamp has nothing to measure
+    ASSERT_TRUE( classifySplit(200000, false, 40200000.0, 40300000.0 ) == ReplacementAttempt::NotJudgeable );
+    // the edges: 38 ms (first stamp) and 70 ms (return stamp) are in, a cheap arm just under the cap is judged
+    ASSERT_TRUE( classifySplit(1900000, true, 38000000.0, 38100000.0 ) == ReplacementAttempt::OnTime );
+    ASSERT_TRUE( classifySplit(1900000, true, 69900000.0, 70000000.0 ) == ReplacementAttempt::OnTime );
+    ASSERT_TRUE( classifySplit(2000000, true, 40000000.0, 40100000.0 ) == ReplacementAttempt::NotJudgeable );
+    // adversary pass 1 A7: an unordered (NaN) elapsed time is never on time
+    ASSERT_TRUE( classifySplit(200000, true, std::nan( "" ), 40300000.0 ) == ReplacementAttempt::TooEarly );
+    ASSERT_TRUE( classifySplit(200000, true, 40200000.0, std::nan( "" ) ) == ReplacementAttempt::TooLate );
+    // r7 (sol review r6, hardening): a split pair whose return stamp precedes its first stamp is no measurement
+    ASSERT_TRUE( classifySplit(200000, true, 60000000.0, 50000000.0 ) == ReplacementAttempt::NotJudgeable );
+    ASSERT_TRUE( classifySplit(200000, true, 40200000.0, 40100000.0 ) == ReplacementAttempt::NotJudgeable );
+    // r7 (sol review r6, blocker 2): a delivery the GUI thread took before the return stamp was published (unsplit) is judged, on
+    // time is a proof (never retried away), early is a verdict, a pause before the arm is still not judged.
+    // SEAM-1 (r7 adversary pass 12 A2): its floor is the wait thread's own pre-send stamp (firstElapsedNs, the seam's
+    // lastDeliveryFirstStampMsForTest), its ceiling the GUI thread's receive time; an unordered value reads early / late
+    ASSERT_TRUE( classifyReplacementAttempt( 200000, ReplacementStamps::Unsplit, 40300000.0, -1.0, 40400000.0 ) == ReplacementAttempt::OnTimeUnsplit );
+    // adversary pass 1 A2: an unsplit delivery received at 80 or 150 ms is late (observed again), never a proof
+    ASSERT_TRUE( classifyReplacementAttempt( 200000, ReplacementStamps::Unsplit, 40300000.0, -1.0, 80400000.0 ) == ReplacementAttempt::TooLate );
+    ASSERT_TRUE( classifyReplacementAttempt( 200000, ReplacementStamps::Unsplit, 40300000.0, -1.0, 150000000.0 ) == ReplacementAttempt::TooLate );
+    ASSERT_TRUE( classifyReplacementAttempt( 200000, ReplacementStamps::Unsplit, 69900000.0, -1.0, 70000000.0 ) == ReplacementAttempt::OnTimeUnsplit );
+    ASSERT_TRUE( classifyReplacementAttempt( 200000, ReplacementStamps::Unsplit, 38000000.0, -1.0, 38100000.0 ) == ReplacementAttempt::OnTimeUnsplit );
+    // adversary pass 1 A8: an inverted split pair is not judged even when its first stamp is under the floor
+    ASSERT_TRUE( classifySplit(200000, true, 37000000.0, 36000000.0 ) == ReplacementAttempt::NotJudgeable );
+    ASSERT_TRUE( classifyReplacementAttempt( 200000, ReplacementStamps::Unsplit, 18300000.0, -1.0, 18400000.0 ) == ReplacementAttempt::TooEarly );
+    ASSERT_TRUE( classifyReplacementAttempt( 18200000, ReplacementStamps::Unsplit, 40300000.0, -1.0, 40400000.0 ) == ReplacementAttempt::NotJudgeable );
+    ASSERT_TRUE( classifyReplacementAttempt( 200000, ReplacementStamps::Unsplit, std::nan( "" ), -1.0, 40400000.0 ) == ReplacementAttempt::TooEarly );
+    ASSERT_TRUE( classifyReplacementAttempt( 200000, ReplacementStamps::Unsplit, 40300000.0, -1.0, std::nan( "" ) ) == ReplacementAttempt::TooLate );
+    ASSERT_TRUE( classifyReplacementAttempt( 200000, ReplacementStamps::None, -1.0, -1.0, 40400000.0 ) == ReplacementAttempt::NotJudgeable );
+    // SEAM-1 A2, the adversary's input verbatim: a timer shortened 40 -> 18 ms sends at 18.2 ms, the wait thread is paused 32 ms
+    // before it publishes the return stamp, and the GUI does not pump until 40 ms: received at 40.4 ms, unsplit. It is early.
+    ASSERT_TRUE( classifyReplacementAttempt( 200000, ReplacementStamps::Unsplit, 18200000.0, -1.0, 40400000.0 ) == ReplacementAttempt::TooEarly );
+    // adversary pass A9 (cd623269): a receive before the pre-send stamp (or an unset receive) is no measurement, never a proof
+    ASSERT_TRUE( classifyReplacementAttempt( 200000, ReplacementStamps::Unsplit, 90000000.0, -1.0, 40400000.0 ) == ReplacementAttempt::NotJudgeable );
+    ASSERT_TRUE( classifyReplacementAttempt( 200000, ReplacementStamps::Unsplit, 40300000.0, -1.0, -1.0 ) == ReplacementAttempt::NotJudgeable );
+    // an unsplit delivery that carries no pre-send stamp fails, whatever its arm cost (never NotJudgeable)
+    ASSERT_TRUE( classifyReplacementAttempt( 200000, ReplacementStamps::UnsplitUnstamped, -1.0, -1.0, 40400000.0 ) == ReplacementAttempt::UnsplitUnstamped );
+    ASSERT_TRUE( classifyReplacementAttempt( 18200000, ReplacementStamps::UnsplitUnstamped, -1.0, -1.0, 40400000.0 ) == ReplacementAttempt::UnsplitUnstamped );
+    ASSERT_TRUE( replacementStampsOf( false, true, false ) == ReplacementStamps::UnsplitUnstamped );
+    ASSERT_TRUE( replacementStampsOf( false, true, true ) == ReplacementStamps::Unsplit );
+    ASSERT_TRUE( replacementStampsOf( true, false, true ) == ReplacementStamps::Split );
+    ASSERT_TRUE( replacementStampsOf( false, false, false ) == ReplacementStamps::None );
+    ASSERT_FALSE( replacementAttemptProves( ReplacementAttempt::UnsplitUnstamped ) );
+    ASSERT_TRUE( replacementAttemptFails( ReplacementAttempt::UnsplitUnstamped ) );
+    ASSERT_TRUE( replacementAttemptFails( ReplacementAttempt::TooEarly ) );
+    ASSERT_FALSE( replacementAttemptFails( ReplacementAttempt::TooLate ) );
+    ASSERT_FALSE( replacementAttemptFails( ReplacementAttempt::NotJudgeable ) );
+    ASSERT_FALSE( replacementAttemptFails( ReplacementAttempt::OnTimeUnsplit ) );
+    // only a split on-time or an unsplit on-time delivery proves; a late, unjudged or early one does not
+    ASSERT_TRUE( replacementAttemptProves( ReplacementAttempt::OnTime ) );
+    ASSERT_TRUE( replacementAttemptProves( ReplacementAttempt::OnTimeUnsplit ) );
+    ASSERT_FALSE( replacementAttemptProves( ReplacementAttempt::TooLate ) );
+    ASSERT_FALSE( replacementAttemptProves( ReplacementAttempt::TooEarly ) );
+    ASSERT_FALSE( replacementAttemptProves( ReplacementAttempt::NotJudgeable ) );
+    // the property a single attempt cannot have (a worker paused 22 ms before its first stamp reads a timer shortened 40 -> 18 ms
+    // as 40.2 ms): the attempts that are not paused read it early, and one early attempt fails the test (the callers assert
+    // every attempt's verdict is not TooEarly, and need kReplacementProofsNeeded proofs from fresh arms)
+    ASSERT_TRUE( classifySplit(200000, true, 40200000.0, 40300000.0 ) == ReplacementAttempt::OnTime );
+    ASSERT_TRUE( classifySplit(200000, true, 18200000.0, 18300000.0 ) == ReplacementAttempt::TooEarly );
+    ASSERT_TRUE( kReplacementProofsNeeded >= 3 && kReplacementAttempts > kReplacementProofsNeeded );
 #else
     SKIP_TEST( "native-message delivery is Windows-only" );
 #endif
@@ -2155,6 +2589,10 @@ TEST(PlaybackDueWakeSend, TheRunnerSleepIsTheSentWaitWithTheMsleepKeptForEveryOt
     ASSERT_EQ( 1, wakeSource.count( QStringLiteral(
         "const DWORD waitMs = ms >= static_cast<unsigned long>( INFINITE ) ? INFINITE - 1 : static_cast<DWORD>( ms );" ) ) );
     ASSERT_EQ( 1, wakeSource.count( QStringLiteral( "PeekMessageW( &msg, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );" ) ) );
+    // SEAM-1 r4 (adversary pass 3 A1 on 91820e1e): the exact text above is matched by that one spelling only, so a second pump
+    // spelled `PeekMessageW( &pending, ...` passed it. By TOKEN (code only, comments cut): the file names PeekMessage* once, in
+    // dispatchPendingSentMessages (the closure pin in SEAM1_TheRunnerSleepCallClosure... covers every other pump spelling)
+    ASSERT_EQ( 1, dueWakeNoComments( wakeSource ).count( QRegularExpression( QStringLiteral( "\\bPeekMessage\\w*\\b" ) ) ) );
 }
 
 TEST(PlaybackDueWakeSend, DeliveryKindIsTheSelectionAndDeliveryIsWhatTheArmsUsed)
@@ -2196,7 +2634,7 @@ TEST(PlaybackDueWakeSend, OnlyAQueuedSentMessageEndsTheRunnerSleepAndAConsumedPo
     QElapsedTimer t;
     t.start();
     ASSERT_TRUE( wake.sleepForSmokeRunner( 20 ) == PlaybackDueWake::RunnerSleep::Slept );
-    ASSERT_TRUE( t.elapsed() >= 15 );
+    ASSERT_TRUE( static_cast<double>( t.elapsed() ) >= dueWakeSleepFloorMs( 20.0 ) );   // a 20 ms sleep, less one timer tick
     ASSERT_EQ( static_cast<quint64>( 0 ), wake.runnerSleepsWokenBySent() );
 #endif
 }
@@ -2218,25 +2656,61 @@ TEST(PlaybackDueWakeSend, G1_AForeignSentMessageInTheRunnerSleepIsNotAWakeAndThe
     const HWND window = reinterpret_cast<HWND>( wake.nativeWindow() );
     ASSERT_TRUE( window != nullptr );
     // a foreign sent message (not kNativeWakeMessage) to the GUI-thread window, 15 ms into a 150 ms runner sleep
-    std::atomic<bool> sent { false };
-    std::thread sender( [window, &sent]() {
-        Sleep( 15 );
-        sent = SendNotifyMessageW( window, WM_USER + 0x51, 0, 0 ) != 0;
-    } );
-    QElapsedTimer t;
-    t.start();
-    const PlaybackDueWake::RunnerSleep slept = wake.sleepForSmokeRunner( 150 );
-    const qint64 sleptMs = t.elapsed();
-    sender.join();
-    ASSERT_TRUE( sent.load() );
-    ASSERT_TRUE( slept == PlaybackDueWake::RunnerSleep::Slept );      // not WokenBySent
-    ASSERT_TRUE( sleptMs >= 140 );                                     // the full interval, never cut short at ~15 ms
-    ASSERT_EQ( static_cast<quint64>( 0 ), wake.runnerSleepsWokenBySent() );
-    ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenOther() );
-    ASSERT_EQ( 0, fired );
+    // SEAM-1 (r7 adversary pass 12 A3): the full interval is judged on the product's own exit record (dueWakeObserveSleep), on
+    // every sample the foreign send reached; the observation is repeated only for a send that missed the sleep, and a card with
+    // no judged sample fails
+    wake.setTimingStampsForTest( true );
+    DueWakeSleepObservation foreignObservation { PlaybackDueWake::RunnerSleepExit::None, -1, false };
+    bool judged = false;
+    for( int attempt = 0; attempt < kSleepObservationAttempts && !judged; ++attempt )
+    {
+        wake.resetStrandedCounts();
+        std::atomic<bool> sent { false };
+        std::thread sender( [window, &sent]() {
+            Sleep( 15 );
+            sent = SendNotifyMessageW( window, WM_USER + 0x51, 0, 0 ) != 0;
+        } );
+        const ThreadJoinGuard senderGuard { sender };
+        const double beforeSleepMs = dueWakeQpcNowMs();
+        const PlaybackDueWake::RunnerSleep slept = wake.sleepForSmokeRunner( 150, &dueWakeQpcNowS );
+        const double afterSleepMs = dueWakeQpcNowMs();
+        sender.join();
+        // SEAM-1 adversary pass A3 (cd623269): every sample's exit is judged before the retry filter below (which keys on a
+        // product counter a defective product can leave at zero): a sleep the send missed still runs its whole interval
+        ASSERT_TRUE( dueWakeObserveSleep( wake, 150.0 ).met );
+        // SEAM-1 adversary pass 2 A1 (48ad052b): and, independently of the product's record, this thread's own bracket of the call
+        // (one-sided: a pause only lengthens it), so a wait shortened below what the product recorded still fails
+        ASSERT_TRUE( afterSleepMs - beforeSleepMs >= dueWakeSleepFloorMs( 150.0 ) );
+        // CI-FLAKE-R17A1-FOREIGN-FIRST-FLOOR-1 r5 (pass 9 A1 sibling): retried only when NEITHER the product's count NOR its span
+        // record shows a dispatch: a product that recorded the dispatch's span but lost its count fails the counts below instead
+        if( wake.runnerSleepsWokenOther() == 0 && wake.lastRunnerSleepDispatchSpansS().empty() )
+        {
+            // adversary pass 1 A4/A7: a sender that missed the whole sleep (its message queued after the sleep returned) left
+            // nothing to judge and a pending sent message behind; take it now (it must not reach the next attempt's sleep) and
+            // observe again -- never fail the counts below on a sample the sleep never dispatched in. Keyed on the product's own
+            // count of the dispatch, not on the span record (pass 2 A3): a product that dropped the span still counted the
+            // dispatch, so it fails the observation below instead of being retried away
+            MSG drain;
+            PeekMessageW( &drain, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );
+            continue;
+        }
+        ASSERT_TRUE( sent.load() );
+        ASSERT_TRUE( slept == PlaybackDueWake::RunnerSleep::Slept );      // not WokenBySent
+        ASSERT_EQ( static_cast<quint64>( 0 ), wake.runnerSleepsWokenBySent() );
+        ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenOther() );
+        ASSERT_EQ( 0, fired );
+        // r5 adversary pass 10 A1: the admitted dispatch has its span record too (the product's count alone admitted spans [])
+        ASSERT_EQ( static_cast<size_t>( wake.runnerSleepsWokenOther() ), wake.lastRunnerSleepDispatchSpansS().size() );
+        foreignObservation = dueWakeObserveSleep( wake, 150.0 );
+        judged = true;
+    }
+    ASSERT_TRUE( judged );
+    ASSERT_TRUE( foreignObservation.met );   // the full interval on the product's own exit decision, never cut short at ~15 ms
+    wake.setTimingStampsForTest( false );
     // the wake itself still ends a sleep at once, is held inside it, and fires only when dispatched after it
+    QElapsedTimer t;
     wake.arm( 2.0 );
-    t.restart();
+    t.start();
     ASSERT_TRUE( wake.sleepForSmokeRunner( 500 ) == PlaybackDueWake::RunnerSleep::WokenBySent );
     ASSERT_TRUE( t.elapsed() < 250 );
     ASSERT_EQ( 0, fired );
@@ -2252,6 +2726,282 @@ TEST(PlaybackDueWakeSend, G1_AForeignSentMessageInTheRunnerSleepIsNotAWakeAndThe
 #endif
 }
 
+namespace {
+// CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r2 (sol r1 B1/B2): the RED seam MLV_R17A1_RED_R1_GATE=1 replays bebd354c's R3A3
+// literal-attempt gate (a boolean hook witness, credited on any non-empty record, never checked against it) and its literal sender
+// (it sent the fixture message at its cutoff even when the sleep had not returned). Each replay only fails more, never fewer.
+bool dueWakeRedR1Gate()
+{
+    const char *value = std::getenv( "MLV_R17A1_RED_R1_GATE" );
+    return value && std::string( value ) == "1";
+}
+
+// r2 (sol r1 B1): the literal attempt's tagged WM_NULL is witnessed by the hook's own QPC read (ms on the caller clock the spans
+// come back on, seconds), taken as the window procedure is about to take it. NotSeen: the hook never saw it (the send missed the
+// sleep, so the product could not record it). Recorded: one recorded dispatch span contains the read. Lost: the hook saw the
+// dispatch and no span contains it -- a span elsewhere ([22, 22.2] ms for a read at 8.2 ms) or no span at all is a lost record,
+// never a sample to retry.
+enum class R3A3LiteralRecord { NotSeen, Recorded, Lost };
+R3A3LiteralRecord r3a3LiteralRecord( double tagSeenMs, const std::vector<std::pair<double, double>> &spansS )
+{
+    const bool seen = tagSeenMs >= 0.0;                               // -1 is the hook's "never saw it" sentinel
+    if( dueWakeRedR1Gate() ) return seen ? R3A3LiteralRecord::Recorded : R3A3LiteralRecord::NotSeen;
+    if( !seen ) return R3A3LiteralRecord::NotSeen;
+    constexpr double kRoundTripMs = 0.00005;                          // assertChargedBeforeHandler's tolerance
+    for( const auto &span : spansS )
+        if( span.first * 1000.0 <= tagSeenMs + kRoundTripMs && tagSeenMs <= span.second * 1000.0 + kRoundTripMs )
+            return R3A3LiteralRecord::Recorded;
+    return R3A3LiteralRecord::Lost;
+}
+
+// r2 (sol r1 B1/B2): a literal attempt the fixture handler missed is credited as the literal row only when its OWN tagged dispatch
+// is in the record (the hook's read inside a recorded span, counted by the product) and the fixture's send really followed the
+// sleep's return. A send the literal sender withheld at its cutoff (the sleep had not returned) is retried, never credited.
+bool r3a3LiteralCredited( bool literalRow, bool fixtureWithheld, double tagSeenMs, quint64 wokenOtherDelta,
+                          const std::vector<std::pair<double, double>> &spansS )
+{
+    if( dueWakeRedR1Gate() ) return literalRow && tagSeenMs >= 0.0 && wokenOtherDelta > 0 && !spansS.empty();
+    return literalRow && !fixtureWithheld && wokenOtherDelta > 0 && r3a3LiteralRecord( tagSeenMs, spansS ) == R3A3LiteralRecord::Recorded;
+}
+
+// CI-FLAKE-R17A1-SPAN-LOSS-TYPED-VERDICT-1 r1 (sol r2 B1): the RED seam MLV_R17A1_RED_SPAN_LOSS_ORDER=1 replays c52f385c's R3A3
+// accounting order (the count == spans length check BEFORE the typed loss check), so a tag the hook saw, whose count survived and
+// whose span was lost, failed the generic length assert and skipped the typed verdict and its cleanup. Only ever fails more.
+bool dueWakeRedSpanLossOrder()
+{
+    const char *value = std::getenv( "MLV_R17A1_RED_SPAN_LOSS_ORDER" );
+    return value && std::string( value ) == "1";
+}
+
+// One R3A3 sample's dispatch record, as the live accounting reads it: the hook's read of the literal tag (ms, -1 unseen), the
+// product's count delta, the fixture handler's call count and its own two reads (ms, -1 unset), and the product's span record (s).
+struct R3A3RecordSample
+{
+    int attempt = 0;
+    double tagSeenMs = -1.0;
+    size_t counted = 0;
+    int calls = 0;
+    double handlerStartMs = -1.0;
+    double handlerEndMs = -1.0;
+    std::vector<std::pair<double, double>> spansS;
+    // adversary pass 1 A1 on aa2d1ab8: the sample's cadence (the product's own exit record met the 150 ms, and this thread's own
+    // one-sided bracket of the call), judged AFTER the record: a lost tag on a sleep whose exit also failed is the typed loss
+    bool cadenceMet = true;
+    qint64 sleptMs = 150;
+};
+
+// The R3A3 sample's cadence: on the product's own exit record (SEAM-1 adversary pass A3) and on this thread's own one-sided bracket
+// of the call (pass 2 A1: a pause only lengthens it). Judged on every sample, before the retry filter, after the dispatch record.
+void r3a3JudgeCadence( bool observedMet, qint64 sleptMs )
+{
+    ASSERT_TRUE( observedMet );
+    ASSERT_TRUE( static_cast<double>( sleptMs ) >= dueWakeSleepFloorMs( 150.0 ) );
+}
+
+// CI-FLAKE-R17A1-SPAN-LOSS-TYPED-VERDICT-1 r1 (sol r2 B1): the live R3A3 accounting of one sample, called by the live loop and by
+// the native REDs below. An observed tag no recorded span contains reaches R3A3_LITERAL_DISPATCH_RECORD_LOST (and onLoss, the
+// live dispatch cleanup) FIRST, whatever the count is: tag=8.2, count=1, spans=[] and tag=8.2, count=2, spans=[[22,22.2]] both
+// reached the generic count == spans assert on c52f385c, before the typed branch and its cleanup. Only after that typed check
+// is the record held to its count, its chronological order, and (when the fixture handler ran) a span holding both its reads.
+void r3a3AccountDispatchRecord( const R3A3RecordSample &s, const std::function<void()> &onLoss )
+{
+    const auto accountRecord = [&s]() {
+        if( s.calls == 0 && s.counted == 0 && s.spansS.empty() ) return;
+        ASSERT_EQ( s.counted, s.spansS.size() );
+        // adversary pass 2 A5 on e1b2051f: and in the product's chronological order, each span on ordered reads (the R17A1
+        // sibling r17A1DispatchRecordGap already rejects a backwards record): [[19.9, 50.1], [8.1, 8.2]] ms fails here
+        for( size_t i = 0; i < s.spansS.size(); ++i )
+        {
+            ASSERT_TRUE( s.spansS[i].first <= s.spansS[i].second );
+            if( i > 0 ) ASSERT_TRUE( s.spansS[i - 1].second <= s.spansS[i].first );
+        }
+        if( s.calls != 0 )
+        {
+            constexpr double kRoundTripMs = 0.00005;                  // assertChargedBeforeHandler's tolerance
+            bool inOneSpan = false;
+            for( const auto &span : s.spansS )
+                if( span.first * 1000.0 <= s.handlerStartMs + kRoundTripMs && s.handlerEndMs <= span.second * 1000.0 + kRoundTripMs )
+                    inOneSpan = true;
+            ASSERT_TRUE( inOneSpan );
+        }
+    };
+    // c52f385c's order, opt-in RED replay only: the cadence, then the record, then the typed loss
+    const bool lengthFirst = dueWakeRedSpanLossOrder();
+    if( lengthFirst )
+    {
+        r3a3JudgeCadence( s.cadenceMet, s.sleptMs );
+        accountRecord();
+    }
+    if( r3a3LiteralRecord( s.tagSeenMs, s.spansS ) == R3A3LiteralRecord::Lost )
+    {
+        std::string spansText;
+        for( const auto &span : s.spansS )
+            spansText += "[" + std::to_string( span.first * 1000.0 ) + "," + std::to_string( span.second * 1000.0 ) + "]";
+        const std::string detail = "attempt=" + std::to_string( s.attempt ) + " tag_seen_ms=" + std::to_string( s.tagSeenMs )
+                                   + " counted=" + std::to_string( s.counted ) + " calls=" + std::to_string( s.calls )
+                                   + " spans_ms=" + spansText;
+        onLoss();
+        ::minitest::fail( __FILE__, __LINE__, "R3A3_LITERAL_DISPATCH_RECORD_LOST", detail );
+    }
+    if( !lengthFirst )
+    {
+        accountRecord();
+        r3a3JudgeCadence( s.cadenceMet, s.sleptMs );                  // pass 1 A1: after the typed loss and the record
+    }
+}
+
+// What r3a3AccountDispatchRecord did with one literal row: whether it failed, its message, and whether the dispatch cleanup ran.
+struct R3A3AccountOutcome
+{
+    bool failed = false;
+    std::string message;
+    bool cleanedUp = false;
+};
+R3A3AccountOutcome r3a3AccountRow( double tagSeenMs, size_t counted, int calls, const std::vector<std::pair<double, double>> &spansS,
+                                   bool cadenceMet = true, qint64 sleptMs = 150 )
+{
+    R3A3RecordSample sample;
+    sample.tagSeenMs = tagSeenMs;
+    sample.counted = counted;
+    sample.calls = calls;
+    sample.spansS = spansS;
+    sample.cadenceMet = cadenceMet;
+    sample.sleptMs = sleptMs;
+    R3A3AccountOutcome outcome;
+    try
+    {
+        r3a3AccountDispatchRecord( sample, [&outcome]() { outcome.cleanedUp = true; } );
+    }
+    catch( const ::minitest::Failure &failure )
+    {
+        outcome.failed = true;
+        outcome.message = failure.message;
+    }
+    return outcome;
+}
+bool r3a3TypedLoss( const R3A3AccountOutcome &outcome )
+{
+    return outcome.failed && outcome.cleanedUp && outcome.message.find( "R3A3_LITERAL_DISPATCH_RECORD_LOST" ) != std::string::npos;
+}
+// A row that must reach the typed loss and its cleanup; otherwise it fails naming what the accounting did instead (its own message).
+void r3a3RequireTypedLoss( const R3A3AccountOutcome &outcome )
+{
+    if( r3a3TypedLoss( outcome ) ) return;
+    ::minitest::fail( __FILE__, __LINE__, "R3A3_ROW_MISSED_THE_TYPED_LOSS",
+                      std::string( "failed=" ) + ( outcome.failed ? "1" : "0" ) + " cleaned_up=" + ( outcome.cleanedUp ? "1" : "0" )
+                          + " accounting_said=" + outcome.message );
+}
+}
+
+TEST(PlaybackDueWakeSend, R3A3_TheLiteralDispatchIsCreditedOnlyFromASpanThatContainsTheHooksOwnRead)
+{
+    // sol r1 B1, its literal rows (hook read at 8.2 ms, the fixture handler never ran, so foreign.calls = 0): the record must
+    // contain the read before the attempt may be retried or credited as the literal row
+    const double tagMs = 8.2;
+    // literal 1: count = 1, the only span is [22, 22.2] ms -- it excludes the read, so the dispatch record is lost
+    ASSERT_TRUE( r3a3LiteralRecord( tagMs, { { 0.022, 0.0222 } } ) == R3A3LiteralRecord::Lost );
+    ASSERT_FALSE( r3a3LiteralCredited( true, false, tagMs, 1, { { 0.022, 0.0222 } } ) );
+    // literal 2: count = 0, spans [] -- an observed dispatch with no record is a typed loss, never a retry
+    ASSERT_TRUE( r3a3LiteralRecord( tagMs, {} ) == R3A3LiteralRecord::Lost );
+    ASSERT_FALSE( r3a3LiteralCredited( true, false, tagMs, 0, {} ) );
+    // the healthy row: a span that contains the read is the tagged dispatch, and it is credited
+    ASSERT_TRUE( r3a3LiteralRecord( tagMs, { { 0.0081, 0.0083 } } ) == R3A3LiteralRecord::Recorded );
+    ASSERT_TRUE( r3a3LiteralCredited( true, false, tagMs, 1, { { 0.0081, 0.0083 } } ) );
+    // ...and one of two chronological spans may hold it
+    ASSERT_TRUE( r3a3LiteralRecord( tagMs, { { 0.0081, 0.0083 }, { 0.022, 0.0222 } } ) == R3A3LiteralRecord::Recorded );
+    // a span ending just before the read, or starting just after it, does not contain it
+    ASSERT_TRUE( r3a3LiteralRecord( tagMs, { { 0.0080, 0.0081 } } ) == R3A3LiteralRecord::Lost );
+    ASSERT_TRUE( r3a3LiteralRecord( tagMs, { { 0.0083, 0.0090 } } ) == R3A3LiteralRecord::Lost );
+    // a hook that never saw the tag has nothing to account: the attempt is retried, uncredited
+    ASSERT_TRUE( r3a3LiteralRecord( -1.0, {} ) == R3A3LiteralRecord::NotSeen );
+    ASSERT_FALSE( r3a3LiteralCredited( true, false, -1.0, 1, { { 0.0081, 0.0083 } } ) );
+    // sol r1 B2: a fixture send the literal sender withheld at its cutoff is never the literal row, however healthy the record
+    ASSERT_FALSE( r3a3LiteralCredited( true, true, tagMs, 1, { { 0.0081, 0.0083 } } ) );
+    // a non-literal attempt (the fixture's own observation) is never credited as the literal row
+    ASSERT_FALSE( r3a3LiteralCredited( false, false, tagMs, 1, { { 0.0081, 0.0083 } } ) );
+    // a product that recorded the span but did not count the dispatch is not credited either
+    ASSERT_FALSE( r3a3LiteralCredited( true, false, tagMs, 0, { { 0.0081, 0.0083 } } ) );
+}
+
+// CI-FLAKE-R17A1-SPAN-LOSS-TYPED-VERDICT-1 r1 (sol r2 B1/H1): each literal loss row through the live R3A3 accounting
+// (r3a3AccountDispatchRecord, the function the live loop calls), one registration per row so one failing row never masks another.
+// Each must reach R3A3_LITERAL_DISPATCH_RECORD_LOST AND run the dispatch cleanup. MLV_R17A1_RED_SPAN_LOSS_ORDER=1 replays c52f385c.
+TEST(PlaybackDueWakeSend, R3A3_SpanLoss_TagSeenCount1NoSpansReachesTheTypedLossAndItsCleanup)
+{
+    // sol r2 INV-1: tag=8.2, count=1, spans=[], calls=0 (the span append dropped, the count kept)
+    const R3A3AccountOutcome outcome = r3a3AccountRow( 8.2, 1, 0, {} );
+    r3a3RequireTypedLoss( outcome );
+    ASSERT_TRUE( outcome.message.find( "counted=1 calls=0 spans_ms=)" ) != std::string::npos );
+}
+
+TEST(PlaybackDueWakeSend, R3A3_SpanLoss_TagSeenCount2OneUnrelatedSpanReachesTheTypedLossAndItsCleanup)
+{
+    // sol r2 INV-1: tag=8.2, count=2, spans=[[22,22.2]], calls=0 (the tagged dispatch's span dropped, both counts kept)
+    const R3A3AccountOutcome outcome = r3a3AccountRow( 8.2, 2, 0, { { 0.022, 0.0222 } } );
+    r3a3RequireTypedLoss( outcome );
+    ASSERT_TRUE( outcome.message.find( "counted=2 calls=0 spans_ms=[" ) != std::string::npos );
+}
+
+// adversary pass 1 A1 on aa2d1ab8, its input (RED flags unset, request 150 ms, tag 8.2, count 1, calls 0, spans [], exit
+// WaitFailed so the product's exit record misses the 150 ms): the cadence assert threw before the typed loss and its cleanup.
+// Its two cadence checks, one registration each: the exit record not met, and this thread's bracket short (120 ms < 134 ms).
+TEST(PlaybackDueWakeSend, R3A3_SpanLoss_ALostTagOnASleepWhoseExitRecordFailedStillReachesTheTypedLoss)
+{
+    r3a3RequireTypedLoss( r3a3AccountRow( 8.2, 1, 0, {}, false, 150 ) );
+}
+
+TEST(PlaybackDueWakeSend, R3A3_SpanLoss_ALostTagOnAShortBracketStillReachesTheTypedLoss)
+{
+    r3a3RequireTypedLoss( r3a3AccountRow( 8.2, 1, 0, {}, true, 120 ) );
+}
+
+TEST(PlaybackDueWakeSend, R3A3_SpanLoss_TheRowsThatAlreadyReachedTheTypedLossStillDo)
+{
+    // sol r2 INV-1 passing rows: tag=8.2, count=1, spans=[[22,22.2]] and tag=8.2, count=0, spans=[] (calls=0 both)
+    r3a3RequireTypedLoss( r3a3AccountRow( 8.2, 1, 0, { { 0.022, 0.0222 } } ) );
+    r3a3RequireTypedLoss( r3a3AccountRow( 8.2, 0, 0, {} ) );
+    // pass 1 A1: a whole record still faces the cadence after it: a healthy record on a failed exit or a short bracket fails
+    ASSERT_TRUE( r3a3AccountRow( 8.2, 1, 0, { { 0.0081, 0.0083 } }, false, 150 ).failed );
+    ASSERT_TRUE( r3a3AccountRow( 8.2, 1, 0, { { 0.0081, 0.0083 } }, true, 120 ).failed );
+    ASSERT_FALSE( r3a3AccountRow( 8.2, 1, 0, { { 0.0081, 0.0083 } }, true, 150 ).failed );
+}
+
+TEST(PlaybackDueWakeSend, R3A3_SpanLoss_ARecordedOrUnseenTagStillFacesTheCountOrderAndHandlerChecks)
+{
+    // the typed check runs first, and the record checks still run after it: a healthy literal row passes with no cleanup...
+    const R3A3AccountOutcome healthy = r3a3AccountRow( 8.2, 1, 0, { { 0.0081, 0.0083 } } );
+    ASSERT_FALSE( healthy.failed );
+    ASSERT_FALSE( healthy.cleanedUp );
+    // ...an unseen tag with nothing recorded passes too (the retry gate handles it)...
+    ASSERT_FALSE( r3a3AccountRow( -1.0, 0, 0, {} ).failed );
+    // ...while a recorded tag with a count the spans do not match, an unseen tag with a stray count, a backwards record, and a
+    // handler that ran outside every span each fail the record checks (never the typed loss, and no cleanup)
+    const R3A3AccountOutcome overCounted = r3a3AccountRow( 8.2, 2, 0, { { 0.0081, 0.0083 } } );
+    ASSERT_TRUE( overCounted.failed && !overCounted.cleanedUp );
+    ASSERT_TRUE( overCounted.message.find( "R3A3_LITERAL_DISPATCH_RECORD_LOST" ) == std::string::npos );
+    const R3A3AccountOutcome strayCount = r3a3AccountRow( -1.0, 1, 0, {} );
+    ASSERT_TRUE( strayCount.failed && !strayCount.cleanedUp );
+    const R3A3AccountOutcome backwards = r3a3AccountRow( -1.0, 2, 0, { { 0.0199, 0.0501 }, { 0.0081, 0.0082 } } );
+    ASSERT_TRUE( backwards.failed && !backwards.cleanedUp );
+    R3A3RecordSample outside;
+    outside.counted = 1;
+    outside.calls = 1;
+    outside.handlerStartMs = 20.0;
+    outside.handlerEndMs = 50.0;
+    outside.spansS = { { 0.0081, 0.0083 } };
+    bool outsideCleanedUp = false;
+    bool outsideFailed = false;
+    try
+    {
+        r3a3AccountDispatchRecord( outside, [&outsideCleanedUp]() { outsideCleanedUp = true; } );
+    }
+    catch( const ::minitest::Failure & )
+    {
+        outsideFailed = true;
+    }
+    ASSERT_TRUE( outsideFailed && !outsideCleanedUp );
+}
+
 #ifdef Q_OS_WIN
 namespace {
 // r3 A3: a GUI-thread window whose handler does real work, so the runner sleep's dispatch of its sent message takes time
@@ -2261,9 +3011,39 @@ struct R3A3Foreign
     int calls = 0;
     PlaybackGuiSleepTrace::At at { PlaybackGuiSleepTrace::State::Unknown, false, 0.0 };
     double handlerStartMs = -1.0;
+    double handlerEndMs = -1.0;                                       // r10 (sol r9 B2): the handler's own read as it returns
+    qint64 busyMs = 30;                                               // r10 (sol r9 B2): how long the handler works
 };
 R3A3Foreign *g_r3a3Foreign = nullptr;
 constexpr UINT kR3A3ForeignMessage = WM_USER + 0x52;
+// CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1 (adversary pass 2 A1 on e1b2051f): the literal attempt's OWN WM_NULL carries this
+// tag, and a thread-local WH_CALLWNDPROC hook (called before a window procedure takes a message sent to this thread) witnesses
+// it reaching the wake's window. A WM_NULL from any other sender, or to any other window, is not the literal attempt's dispatch.
+constexpr LPARAM kR3A3LiteralNullTag = 0x52A31;
+HWND g_r3a3LiteralWindow = nullptr;
+// r2 (sol r1 B1): the hook's own QPC read (ms) of the tagged WM_NULL reaching the window, -1 until it sees it. A timestamp, not a
+// boolean: the read takes part in record validation (r3a3LiteralRecord), so a span that excludes it is never its dispatch.
+double g_r3a3LiteralSeenMs = -1.0;
+LRESULT CALLBACK r3a3LiteralHook( int code, WPARAM wParam, LPARAM lParam )
+{
+    if( code == HC_ACTION )
+    {
+        const CWPSTRUCT *cwp = reinterpret_cast<const CWPSTRUCT *>( lParam );
+        if( cwp && g_r3a3LiteralWindow && cwp->hwnd == g_r3a3LiteralWindow && cwp->message == WM_NULL && cwp->lParam == kR3A3LiteralNullTag
+            && g_r3a3LiteralSeenMs < 0.0 )
+            g_r3a3LiteralSeenMs = dueWakeQpcNowMs();
+    }
+    return CallNextHookEx( nullptr, code, wParam, lParam );
+}
+struct R3A3HookGuard
+{
+    HHOOK hook;
+    ~R3A3HookGuard()
+    {
+        if( hook ) UnhookWindowsHookEx( hook );
+        g_r3a3LiteralWindow = nullptr;
+    }
+};
 LRESULT CALLBACK r3a3ForeignProc( HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam )
 {
     if( message == kR3A3ForeignMessage && g_r3a3Foreign )
@@ -2275,7 +3055,8 @@ LRESULT CALLBACK r3a3ForeignProc( HWND hwnd, UINT message, WPARAM wParam, LPARAM
         QElapsedTimer busy;
         busy.start();
         volatile quint64 spin = 0;
-        while( busy.elapsed() < 30 ) ++spin;                      // >= 20 ms of real handler work
+        while( busy.elapsed() < g_r3a3Foreign->busyMs ) ++spin;   // >= 20 ms of real handler work
+        g_r3a3Foreign->handlerEndMs = dueWakeQpcNowMs();
         return 0;
     }
     return DefWindowProcW( hwnd, message, wParam, lParam );
@@ -2308,26 +3089,214 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
     RegisterClassW( &wc );
     const HWND window = CreateWindowExW( 0, kClass, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr );
     ASSERT_TRUE( window != nullptr );
-    wake.setGuiTraceActive( true );
-    std::atomic<bool> sent { false };
-    std::thread sender( [window, &sent]() {
-        Sleep( 5 );
-        sent = SendNotifyMessageW( window, kR3A3ForeignMessage, 0, 0 ) != 0;
-    } );
-    QElapsedTimer t;
-    t.start();
-    const PlaybackDueWake::RunnerSleep slept = wake.sleepForSmokeRunner( 150 );
-    const qint64 sleptMs = t.elapsed();
-    sender.join();
-    // after the sleep: the trace is back in RunnerSleep only while the runner really slept
-    const PlaybackGuiSleepTrace::At afterHandler = wake.guiStateAt( foreign.handlerStartMs + 60.0 );
-    wake.setGuiTraceActive( false );
-    g_r3a3Foreign = nullptr;
-    DestroyWindow( window );
-    ASSERT_TRUE( sent.load() );
+    const HelperWindowGuard windowGuard { window };
+    // SEAM-1 (r7 adversary pass 12 A3): the cadence is judged on the product's own exit record (dueWakeObserveSleep) on every
+    // sample the foreign send reached; the observation is repeated only for a send that missed the sleep
+    wake.setTimingStampsForTest( true );
+    // r10 (sol r9 B2): the handler works 30 ms, and 72 ms (the catalogue's handler descheduled from ~10 to ~82 ms, the sleep
+    // running on to 150): the trace after the handler is read between the handler's OWN return and the sleep's return, never
+    // at a fixed offset from its start (handlerStartMs + 60 read Running inside a healthy 72 ms handler)
+    const auto observeForeign = [&]( qint64 busyMs ) {
+    DueWakeSleepObservation foreignObservation { PlaybackDueWake::RunnerSleepExit::None, -1, false };
+    bool judged = false;
+    PlaybackGuiSleepTrace::At afterHandler { PlaybackGuiSleepTrace::State::Unknown, false, 0.0 };
+    PlaybackDueWake::RunnerSleep slept = PlaybackDueWake::RunnerSleep::NotHandled;
+    qint64 sleptMs = 0;
+    bool sentOk = false;
+    int unrelatedRetried = 0;                                         // r1 (sol r5 B1): literal attempts whose unrelated dispatch was witnessed, then retried
+    int unrelatedTried = 0;
+    // CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1 (sol r5 B1), its literal row as a standing first attempt: an unrelated WM_NULL to
+    // the wake's own window ~8 ms into the 150 ms sleep (one healthy dispatch the product counts and records), and the fixture's
+    // send held until the sleep has returned (it queues after the return: calls=0, count=1, spans=1, TimedOut). That sample must be
+    // accounted, then retried on the fixture's own witness; r5 admitted it to the trace scan with both handler reads still -1.
+    // Adversary pass A2 on e60d41b6: the literal attempt counts only when its unrelated dispatch was witnessed in the sleep (the
+    // product counted and recorded it), and it is tried at most twice; the two extra attempts keep the real observation's budget.
+    const HWND wakeWindow = reinterpret_cast<HWND>( wake.nativeWindow() );
+    const R3A3HookGuard literalHook { SetWindowsHookExW( WH_CALLWNDPROC, r3a3LiteralHook, nullptr, GetCurrentThreadId() ) };
+    ASSERT_TRUE( literalHook.hook != nullptr );                       // pass 2 A1: the literal WM_NULL's own witness
+    g_r3a3LiteralWindow = wakeWindow;
+    // r2 (sol r1 B2): the literal sender's cutoff WITHHOLDS the fixture send while the sleep has not returned (as judgeSentWait's
+    // entry cutoff does), so a GUI thread paused before sleep entry past the cutoff never lets both messages land inside the sleep.
+    // Its literal row is a standing first attempt: the GUI thread holds off sleep entry until the sender has decided (its cutoff is
+    // kR3A3PausedCutoffMs here, the 5 s one otherwise, the same code path). That attempt must be withheld and retried, never admitted.
+    // A withheld attempt gives back its literal budget and adds one observation, at most kR3A3WithheldRetries times.
+    constexpr ULONGLONG kR3A3PausedCutoffMs = 30;
+    constexpr int kR3A3WithheldRetries = 3;                           // the standing paused row plus two real >5 s stalls
+    int withheldRetried = 0;
+    bool pausedRowWithheld = false;
+    for( int attempt = 0; attempt < kSleepObservationAttempts + 2 + withheldRetried && !judged; ++attempt )
+    {
+        g_r3a3LiteralSeenMs = -1.0;
+        foreign = R3A3Foreign();
+        foreign.wake = &wake;
+        foreign.busyMs = busyMs;
+        wake.setGuiTraceActive( true );
+        std::atomic<bool> sent { false };
+        std::atomic<bool> sleepReturned { false };
+        std::atomic<bool> withheld { false };
+        std::atomic<bool> senderDecided { false };
+        const bool pausedRow = attempt == 0;                          // r2 (sol r1 B2): the GUI paused past the sender's cutoff
+        const bool unrelatedFirst = !pausedRow && unrelatedRetried == 0 && unrelatedTried < 2;
+        if( unrelatedFirst ) ++unrelatedTried;
+        const bool literalSender = pausedRow || unrelatedFirst;
+        const ULONGLONG cutoffMs = pausedRow ? kR3A3PausedCutoffMs : 5000;
+        const bool redR1Gate = dueWakeRedR1Gate();
+        std::thread sender( [window, wakeWindow, literalSender, cutoffMs, redR1Gate, &sent, &sleepReturned, &withheld, &senderDecided]() {
+            if( literalSender )
+            {
+                Sleep( 8 );
+                SendNotifyMessageW( wakeWindow, WM_NULL, 0, kR3A3LiteralNullTag );   // the unrelated dispatch, inside the sleep
+                const ULONGLONG giveUp = GetTickCount64() + cutoffMs;
+                while( !sleepReturned.load() && GetTickCount64() < giveUp ) Sleep( 1 );   // the fixture send misses the sleep
+                // r2 (sol r1 B2): at the cutoff with the sleep still running, the fixture message is never sent (it would land
+                // inside the sleep beside the tagged one); the attempt is retried. MLV_R17A1_RED_R1_GATE=1 replays bebd354c's send.
+                if( !sleepReturned.load() && !redR1Gate )
+                {
+                    withheld = true;
+                    senderDecided = true;
+                    return;
+                }
+            }
+            else Sleep( 5 );
+            sent = SendNotifyMessageW( window, kR3A3ForeignMessage, 0, 0 ) != 0;
+            senderDecided = true;
+        } );
+        const ThreadJoinGuard senderGuard { sender };
+        if( pausedRow )
+        {
+            // the GUI thread paused after the sender's creation and before sleep entry, past the sender's cutoff: Sleep takes no
+            // sent message, so the tagged WM_NULL (and, on bebd354c, the fixture's) waits for the sleep's own dispatch
+            const ULONGLONG pauseGiveUp = GetTickCount64() + 10000;
+            while( !senderDecided.load() && GetTickCount64() < pauseGiveUp ) Sleep( 1 );
+            ASSERT_TRUE( senderDecided.load() );
+        }
+        const quint64 wokenOtherBefore = wake.runnerSleepsWokenOther();   // r5 class sweep (pass 11 A1): the product's own count, as a delta
+        const quint64 wokenBySentBefore = wake.runnerSleepsWokenBySent();
+        QElapsedTimer t;
+        t.start();
+        slept = wake.sleepForSmokeRunner( 150, &dueWakeQpcNowS );
+        const double returnedMs = dueWakeQpcNowMs();                  // r10 (sol r9 B2): after the sleep's last trace note
+        sleepReturned = true;
+        sleptMs = t.elapsed();
+        sender.join();
+        // SEAM-1 adversary pass A3: every sample's cadence, before the retry filter; pass 2 A1: this thread's own one-sided bracket
+        // too. Adversary pass 1 A1 on aa2d1ab8: both are judged inside r3a3AccountDispatchRecord, AFTER the typed loss and the record
+        const bool cadenceMet = dueWakeObserveSleep( wake, 150.0 ).met;
+        // CI-FLAKE-R17A1-FOREIGN-FIRST-FLOOR-1 r5 class sweep (adversary pass 11 A1): a sample whose handler ran, or whose product
+        // count or span record shows a dispatch, has its dispatch record accounted BEFORE any retry gate below may discard it (the
+        // ExpiredAfterDispatch and short-rest gates retried a handler-ran sample with spans []): the spans are exactly the product's
+        // count, and the handler's own two reads lie inside one recorded span (an unrelated span cannot stand in for its dispatch)
+        // r2 (sol r1 B1): the hook's own read of this attempt's tagged WM_NULL (taken before the drain below can dispatch a late
+        // one) takes part too: a span is the tagged dispatch's only when it contains that read, and an observed dispatch no span
+        // contains (an unrelated span elsewhere, or count 0 and spans []) is a lost record -- typed, never retried away.
+        // CI-FLAKE-R17A1-SPAN-LOSS-TYPED-VERDICT-1 r1 (sol r2 B1): that typed check runs BEFORE the count == spans check, so a lost
+        // span whose count survived (count=1, spans=[]; count=2, spans=[[22,22.2]]) reaches the typed verdict and this cleanup too
+        {
+            R3A3RecordSample record;
+            record.attempt = attempt;
+            record.tagSeenMs = g_r3a3LiteralSeenMs;
+            record.counted = static_cast<size_t>( ( wake.runnerSleepsWokenOther() - wokenOtherBefore )
+                                                  + ( wake.runnerSleepsWokenBySent() - wokenBySentBefore ) );
+            record.calls = foreign.calls;
+            record.handlerStartMs = foreign.handlerStartMs;
+            record.handlerEndMs = foreign.handlerEndMs;
+            record.spansS = wake.lastRunnerSleepDispatchSpansS();
+            record.cadenceMet = cadenceMet;
+            record.sleptMs = sleptMs;
+            r3a3AccountDispatchRecord( record, [&wake]() {
+                wake.setGuiTraceActive( false );
+                MSG drain;                                            // the missed send, so it reaches no later sleep
+                PeekMessageW( &drain, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );
+                g_r3a3Foreign = nullptr;
+                wake.setTimingStampsForTest( false );
+            } );
+        }
+        // CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1 (sol r5 B1): admitted on the fixture's OWN handler witness only. The record
+        // was accounted just above (count == spans, every handler inside one span), so a span or count left here with calls == 0 is
+        // an unrelated dispatch (a WM_NULL to the wake's own window) the product correctly recorded, and the fixture's send missed
+        // the sleep: it is drained and observed again. r5 admitted on "calls OR spans", which an unrelated dispatch satisfies, and
+        // scanned the trace from the fixture's unset -1 read. A fixture handler that never runs in any attempt exhausts the loop
+        // and fails `judged`. MLV_R17A1_RED_R5_ORDER=1 replays r5's gate (the guard before the scan then fails the sample).
+        const bool r3a3Retry = dueWakeRedR5Order() ? ( foreign.calls == 0 && wake.lastRunnerSleepDispatchSpansS().empty() )
+                                                   : foreign.calls == 0;
+        if( r3a3Retry )
+        {
+            // pass A2: the unrelated dispatch was witnessed in the sleep; pass 2 A1: and it was THIS attempt's own tagged WM_NULL to
+            // the wake's window (the hook's read, taken before the drain below can dispatch a late one). r2 (sol r1 B1): credited
+            // only from a recorded span that contains that read; r2 (sol r1 B2): never when the sender withheld the fixture send
+            if( r3a3LiteralCredited( unrelatedFirst, withheld.load(), g_r3a3LiteralSeenMs, wake.runnerSleepsWokenOther() - wokenOtherBefore,
+                                     wake.lastRunnerSleepDispatchSpansS() ) )
+                ++unrelatedRetried;
+            // r2 (sol r1 B2): a withheld fixture send is the literal observation retried: it gives back its literal budget and
+            // adds one observation (bounded), so a GUI stall past the 5 s cutoff never spends the real observation's attempts
+            if( withheld.load() )
+            {
+                if( pausedRow ) pausedRowWithheld = true;
+                if( withheldRetried < kR3A3WithheldRetries )
+                {
+                    ++withheldRetried;
+                    if( unrelatedFirst ) --unrelatedTried;
+                }
+            }
+            // adversary pass 1 A4/A7: a sender that missed the whole sleep (its message queued after the sleep returned) left
+            // nothing to judge and a pending sent message behind. Take it now, so it cannot reach the next attempt's sleep and
+            // double that attempt's handler calls, and observe again. Keyed on the handler's own call count, not on the span
+            // record (pass 2 A3): a product that dropped the span still ran the handler, so it fails the observation instead
+            wake.setGuiTraceActive( false );
+            MSG drain;
+            PeekMessageW( &drain, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );
+            continue;
+        }
+        // r10 (sol r9 B2): the property "the sleep went back to RunnerSleep after the handler" exists only when the sleep had time
+        // left after its dispatch. On the product's own exit record, a dispatch that ran past the 150 ms left the loop at once
+        // (ExpiredAfterDispatch): no rest, nothing to observe, so that sample is observed again (its cadence was judged above).
+        // A sleep that did go on is judged on its trace between the handler's own return and the sleep's return (2 ms at least,
+        // so a rest of a few microseconds is not searched for at 10 us steps): somewhere in there it must read RunnerSleep.
+        // r1 (sol r5 B1): a -1 handler read never reaches the trace scan below. Past the witness gate the handler ran (on this
+        // thread, inside the sleep), so it wrote both reads; a sample admitted without them fails here, typed, instead of scanning
+        // from -1 ms on the QPC coordinate (hundreds of millions of trace queries) and failing calls == 1 after the loop
+        if( !( foreign.calls >= 1 && foreign.handlerStartMs >= 0.0 && foreign.handlerEndMs >= foreign.handlerStartMs ) )
+        {
+            wake.setGuiTraceActive( false );
+            const std::string detail = "attempt=" + std::to_string( attempt ) + " calls=" + std::to_string( foreign.calls )
+                                       + " handler_start_ms=" + std::to_string( foreign.handlerStartMs ) + " handler_end_ms="
+                                       + std::to_string( foreign.handlerEndMs ) + " spans="
+                                       + std::to_string( wake.lastRunnerSleepDispatchSpansS().size() );
+            MSG drain;                                                // the missed send, so it reaches no later sleep
+            PeekMessageW( &drain, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );
+            g_r3a3Foreign = nullptr;
+            wake.setTimingStampsForTest( false );
+            ::minitest::fail( __FILE__, __LINE__, "R3A3_ADMITTED_WITHOUT_HANDLER_WITNESS", detail );
+        }
+        const PlaybackDueWake::RunnerSleepExit sleepExit = wake.lastRunnerSleepExitForTest();
+        if( sleepExit == PlaybackDueWake::RunnerSleepExit::ExpiredAfterDispatch || !( foreign.handlerEndMs >= foreign.handlerStartMs )
+            || returnedMs - foreign.handlerEndMs < 2.0 )
+        {
+            wake.setGuiTraceActive( false );
+            continue;
+        }
+        afterHandler = wake.guiStateAt( ( foreign.handlerEndMs + returnedMs ) / 2.0 );   // reported if no RunnerSleep is found
+        for( double atMs = foreign.handlerEndMs; atMs <= returnedMs; atMs += 0.01 )
+        {
+            const PlaybackGuiSleepTrace::At at = wake.guiStateAt( atMs );
+            if( at.state != PlaybackGuiSleepTrace::State::RunnerSleep ) continue;
+            afterHandler = at;
+            break;
+        }
+        wake.setGuiTraceActive( false );
+        sentOk = sent.load();
+        // r5 adversary pass 10 A1 (sibling): the handler ran inside the sleep, so its dispatch has a span record (calls=1 admitted spans [])
+        ASSERT_FALSE( wake.lastRunnerSleepDispatchSpansS().empty() );
+        foreignObservation = dueWakeObserveSleep( wake, 150.0 );
+        judged = true;
+    }
+    ASSERT_TRUE( judged );
+    ASSERT_EQ( 1, unrelatedRetried );                                 // r1 (sol r5 B1): the literal row ran, was accounted, and was retried
+    ASSERT_TRUE( pausedRowWithheld );                                 // r2 (sol r1 B2): the paused row withheld its fixture send, then retried
+    ASSERT_TRUE( sentOk );
     ASSERT_EQ( 1, foreign.calls );
     ASSERT_TRUE( slept == PlaybackDueWake::RunnerSleep::Slept );
-    ASSERT_TRUE( sleptMs >= 140 );                                     // the cadence is unchanged: the full interval
+    ASSERT_TRUE( foreignObservation.met );   // the cadence is unchanged: the full interval on the product's own exit decision
     // the handler ran as GUI work: a wake posted from it is not classed asleep, nor as a runner-sleep post
     ASSERT_TRUE( foreign.at.state == PlaybackGuiSleepTrace::State::Running );
     const PlaybackDueWakePostClass c = playbackDueWakeClassifyPost( foreign.at, foreign.handlerStartMs, foreign.handlerStartMs + 1.0 );
@@ -2337,9 +3306,14 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
     ASSERT_TRUE( afterHandler.state == PlaybackGuiSleepTrace::State::RunnerSleep );
     // the handler's time is returned, so the caller's runner-sleep account excludes it
     const qint64 dispatchMs = wake.lastRunnerSleepDispatchNs() / 1000000;
-    ASSERT_TRUE( dispatchMs >= 28 );
+    ASSERT_TRUE( dispatchMs >= busyMs - 2 );
     ASSERT_TRUE( dispatchMs <= sleptMs );
     ASSERT_TRUE( sleptMs - dispatchMs <= 150 );
+    };
+    observeForeign( 30 );
+    observeForeign( 72 );                                              // r10 (sol r9 B2): the catalogue's long handler
+    g_r3a3Foreign = nullptr;
+    wake.setTimingStampsForTest( false );
     // a sleep that dispatched nothing returns 0
     ASSERT_TRUE( wake.sleepForSmokeRunner( 5 ) == PlaybackDueWake::RunnerSleep::Slept );
     ASSERT_EQ( static_cast<qint64>( 0 ), wake.lastRunnerSleepDispatchNs() );
@@ -2367,6 +3341,7 @@ TEST(PlaybackDueWakeSend, R15A1_ADescheduleBeforeTheSleepStartsNeverShiftsTheDis
     RegisterClassW( &wc );
     const HWND window = CreateWindowExW( 0, kClass, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr );
     ASSERT_TRUE( window != nullptr );
+    const HelperWindowGuard windowGuard { window };
     wake.setGuiTraceActive( true );
     wake.setRunnerSleepStartDelayMsForTest( 20 );
     std::atomic<bool> sent { false };
@@ -2374,13 +3349,13 @@ TEST(PlaybackDueWakeSend, R15A1_ADescheduleBeforeTheSleepStartsNeverShiftsTheDis
         Sleep( 50 );
         sent = SendNotifyMessageW( window, kR3A3ForeignMessage, 0, 0 ) != 0;
     } );
+    const ThreadJoinGuard senderGuard { sender };
     // r15: the caller hands the sleep its own clock (seconds); the spans come back on it, with no origin of the caller's
     const PlaybackDueWake::RunnerSleep slept = wake.sleepForSmokeRunner( 150, []() { return dueWakeQpcNowMs() / 1000.0; } );
     sender.join();
     wake.setRunnerSleepStartDelayMsForTest( 0 );
     wake.setGuiTraceActive( false );
     g_r3a3Foreign = nullptr;
-    DestroyWindow( window );
     ASSERT_TRUE( sent.load() );
     ASSERT_EQ( 1, foreign.calls );
     ASSERT_TRUE( slept == PlaybackDueWake::RunnerSleep::Slept );
@@ -2441,6 +3416,7 @@ TEST(PlaybackDueWakeSend, R15A3_TheDurationAccountIsTheDispatchSpansLength)
     RegisterClassW( &wc );
     const HWND window = CreateWindowExW( 0, kClass, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr );
     ASSERT_TRUE( window != nullptr );
+    const HelperWindowGuard windowGuard { window };
     g_r15A3SkewMs = 0;
     g_r15A3Calls = 0;
     std::atomic<bool> sent { false };
@@ -2448,9 +3424,9 @@ TEST(PlaybackDueWakeSend, R15A3_TheDurationAccountIsTheDispatchSpansLength)
         Sleep( 10 );
         sent = SendNotifyMessageW( window, kR15A3ForeignMessage, 0, 0 ) != 0;
     } );
+    const ThreadJoinGuard senderGuard { sender };
     const PlaybackDueWake::RunnerSleep slept = wake.sleepForSmokeRunner( 120, &r15A3CallerNowS );
     sender.join();
-    DestroyWindow( window );
     ASSERT_TRUE( sent.load() );
     ASSERT_EQ( 1, g_r15A3Calls );
     ASSERT_TRUE( slept == PlaybackDueWake::RunnerSleep::Slept );
@@ -2472,32 +3448,103 @@ TEST(PlaybackDueWakeSend, R2A1_AStaleSentWakeInTheRunnerSleepIsNotHeldCountedOrA
     // or fire; the replacement (variant) still ends it at its own due time. (The live part runs first, so RED shows the behaviour.)
 #ifdef Q_OS_WIN
     int fired = 0;
-    PlaybackDueWake wake( nullptr, [&fired]() { ++fired; }, PlaybackDueWakeDeliveryMode::SendNotify );
+    double firedPostFirstMs = -1.0;                                   // the wait thread's own stamp of the delivery that fired
+    double firedPostReturn = -1.0;                                    // ...and its stamp of when the post returned (the latest the post can have been)
+    bool firedStamped = false;                                        // ...and whether that delivery carried them
+    bool firedUnsplit = false;                                        // ...or was taken before the return stamp was published
+    double firedReceiveMs = -1.0;                                     // the GUI thread's own receive time (QPC ms)
+    double firedPreSendStamp = -1.0;                                  // SEAM-1 A2: the wait thread's pre-send stamp, split or unsplit
+    int firedStampMismatches = 0;                                     // a split delivery whose pre-send stamp is not its first stamp
+    PlaybackDueWake *self = nullptr;
+    PlaybackDueWake wake( nullptr, [&]() {
+        ++fired;
+        firedReceiveMs = dueWakeQpcNowMs();
+        const double stamp = self->lastDeliveryPostFirstMs();
+        firedPostReturn = self->lastDeliveryPostMs();
+        firedStamped = stamp >= 0.0 && firedPostReturn >= 0.0;
+        firedUnsplit = self->lastDeliveryUnsplit();
+        firedPostFirstMs = stamp;
+        firedPreSendStamp = self->lastDeliveryFirstStampMsForTest();
+        if( firedStamped && firedPreSendStamp != stamp ) ++firedStampMismatches;
+    }, PlaybackDueWakeDeliveryMode::SendNotify );
+    self = &wake;
+    // SEAM-1 (r7 adversary pass 12 A3): the stale wake is dispatched at the sleep's entry, and the sleep is judged on the product's
+    // own exit record (dueWakeObserveSleep), never on a clock read after its loop decided to leave. One sample: no precondition
+    // can miss (the stale wake is pending at the sleep's entry), so there is nothing to retry
+    wake.setTimingStampsForTest( true );
+    fired = 0;
+    wake.resetStrandedCounts();
     wake.arm( 0.5 );
     ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
     wake.cancel();
-    QElapsedTimer t;
-    t.start();
-    ASSERT_TRUE( wake.sleepForSmokeRunner( 60 ) == PlaybackDueWake::RunnerSleep::Slept );
-    ASSERT_TRUE( t.elapsed() >= 50 );                                  // the stale wake did not cut it short
+    const double beforeStaleSleepMs = dueWakeQpcNowMs();
+    ASSERT_TRUE( wake.sleepForSmokeRunner( 60, &dueWakeQpcNowS ) == PlaybackDueWake::RunnerSleep::Slept );
+    // SEAM-1 adversary pass 2 A1 (48ad052b): this thread's own one-sided bracket of the call too (a pause only lengthens it), so a
+    // wait shortened below what the product recorded still fails
+    ASSERT_TRUE( dueWakeQpcNowMs() - beforeStaleSleepMs >= dueWakeSleepFloorMs( 60.0 ) );
+    const DueWakeSleepObservation stale = dueWakeObserveSleep( wake, 60.0 );
     ASSERT_EQ( static_cast<quint64>( 0 ), wake.runnerSleepsWokenBySent() );
     ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenOther() );
     wake.dispatchSentMessages();
     ASSERT_EQ( 0, fired );
+    ASSERT_TRUE( stale.met );                                         // the stale wake did not cut it short (the product's own exit)
+    QElapsedTimer t;
+    t.start();
     // variant: replaced by arm(40) -- the old generation's wake goes on to sleep, the replacement ends it and fires once
-    wake.resetStrandedCounts();
-    wake.arm( 0.5 );
-    ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
-    wake.arm( 40.0 );
-    t.restart();
-    ASSERT_TRUE( wake.sleepForSmokeRunner( 500 ) == PlaybackDueWake::RunnerSleep::WokenBySent );
-    ASSERT_TRUE( t.elapsed() >= 30 );                                  // not at the stale wake (~0 ms), at the replacement
-    ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenBySent() );
-    ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenOther() );
-    ASSERT_EQ( 0, fired );
-    wake.dispatchSentMessages();
-    ASSERT_EQ( 1, fired );
-    ASSERT_FALSE( wake.armed() );
+    // r3 (adversary pass 4 A1): the replacement's own due time is asserted on EVERY judged attempt, never skipped. It is measured
+    // from before the arm to the wait thread's OWN stamp of the delivery that fired (not to when this thread looks), so a pause of
+    // this thread after the wake cannot lengthen it; an attempt whose arm cost reached kReplacementMaxArmCostNs is not judgeable
+    // (a pause before the arm could hide a shortened replacement): it is drained and observed again, keyed on that flag, and the
+    // test fails if no attempt could be judged
+    // r7 (sol review r6, blocker 2): kReplacementProofsNeeded attempts must clear the floor (see kReplacementProofsNeeded)
+    int proofs = 0;
+    for( int attempt = 0; attempt < kReplacementAttempts && proofs < kReplacementProofsNeeded; ++attempt )
+    {
+        fired = 0;
+        firedPostFirstMs = -1.0;
+        firedPostReturn = -1.0;
+        firedStamped = false;
+        firedUnsplit = false;
+        firedReceiveMs = -1.0;
+        firedPreSendStamp = -1.0;
+        wake.resetStrandedCounts();
+        wake.arm( 0.5 );
+        ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
+        t.restart();
+        const double preArmMs = dueWakeQpcNowMs();
+        wake.arm( 40.0 );
+        const qint64 armCostNs = t.nsecsElapsed();
+        if( armCostNs >= kReplacementMaxArmCostNs )
+        {
+            wake.sleepForSmokeRunner( 500 );
+            wake.dispatchSentMessages();
+            // SEAM-1 adversary pass A2 (cd623269): the arm cost makes the timing unjudgeable, never the stamps (see D_)
+            ASSERT_EQ( 0, firedStampMismatches );
+            ASSERT_FALSE( fired > 0 && replacementStampsOf( firedStamped, firedUnsplit, firedPreSendStamp >= 0.0 ) == ReplacementStamps::UnsplitUnstamped );
+            continue;
+        }
+        ASSERT_TRUE( wake.sleepForSmokeRunner( 500 ) == PlaybackDueWake::RunnerSleep::WokenBySent );
+        ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenBySent() );
+        ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenOther() );
+        ASSERT_EQ( 0, fired );
+        wake.dispatchSentMessages();
+        ASSERT_EQ( 1, fired );
+        ASSERT_FALSE( wake.armed() );
+        // not at the stale wake (~0.5 ms), at the replacement's due time: early is a failure, late (past
+        // kReplacementMaxElapsedNs) or unstamped is observed again (r4, sol review r3, blocker 1)
+        // r7: a delivery the GUI took before the wait thread published its return stamp carries no split (PlaybackDueWake.h
+        // lastDeliveryPostFirstMs, "unsplit"); it is judged on the GUI thread's receive time (neither early nor late) and counts as a proof
+        // SEAM-1 A2: an unsplit delivery's floor is the wait thread's own pre-send stamp, never the GUI's receive time
+        ASSERT_EQ( 0, firedStampMismatches );                         // a split delivery's pre-send stamp IS its first stamp
+        const ReplacementAttempt verdict = classifyReplacementAttempt( armCostNs,
+            replacementStampsOf( firedStamped, firedUnsplit, firedPreSendStamp >= 0.0 ),
+            ( ( firedUnsplit ? firedPreSendStamp : firedPostFirstMs ) - preArmMs ) * 1000000.0, ( firedPostReturn - preArmMs ) * 1000000.0,
+            ( firedReceiveMs - preArmMs ) * 1000000.0 );
+        ASSERT_FALSE( replacementAttemptFails( verdict ) );
+        if( replacementAttemptProves( verdict ) ) ++proofs;
+    }
+    ASSERT_TRUE( proofs >= kReplacementProofsNeeded );                // never passes by skipping the bound
+    wake.setTimingStampsForTest( false );
 #endif
     const QString wakeSource = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
     const QString hold = functionBody( wakeSource, QStringLiteral( "bool PlaybackDueWake::holdWindowProcWake( const void *message )" ),
@@ -2515,7 +3562,8 @@ TEST(PlaybackDueWakeSend, G3_AFailedRunnerSleepWaitSleepsTheRestOfTheIntervalAnd
     const int failed = wakeSource.indexOf( QStringLiteral( "if( result == WAIT_FAILED )" ) );
     const int counted = wakeSource.indexOf( QStringLiteral( "++d->runnerSleepWaitFailed;" ), failed );
     const int msleep = wakeSource.indexOf( QStringLiteral( "QThread::msleep( static_cast<unsigned long>( leftMs ) );" ), counted );
-    const int timeout = wakeSource.indexOf( QStringLiteral( "if( result != WAIT_OBJECT_0 ) break;   // the timeout" ), msleep );
+    // SEAM-1: the timeout's break is now a braced block that records the exit for the test seam
+    const int timeout = wakeSource.indexOf( QStringLiteral( "if( result != WAIT_OBJECT_0 )   // the timeout" ), msleep );
     ASSERT_TRUE( failed > 0 && counted > failed && msleep > counted && timeout > msleep );
 #ifdef Q_OS_WIN
     PlaybackDueWake wake( nullptr, []() {}, PlaybackDueWakeDeliveryMode::SendNotify );
@@ -2523,7 +3571,7 @@ TEST(PlaybackDueWakeSend, G3_AFailedRunnerSleepWaitSleepsTheRestOfTheIntervalAnd
     QElapsedTimer t;
     t.start();
     ASSERT_TRUE( wake.sleepForSmokeRunner( 60 ) == PlaybackDueWake::RunnerSleep::Slept );
-    ASSERT_TRUE( t.elapsed() >= 50 );                                  // never ~0 ms
+    ASSERT_TRUE( static_cast<double>( t.elapsed() ) >= dueWakeSleepFloorMs( 60.0 ) );   // never ~0 ms (60 ms less one timer tick)
     ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepWaitFailures() );
     ASSERT_EQ( static_cast<quint64>( 0 ), wake.runnerSleepsWokenBySent() );
     wake.setRunnerSleepWaitFailsForTest( false );
@@ -2552,12 +3600,30 @@ struct R17A1Windows
     int open = 0;
     double chargedS[2] = { 0.0, 0.0 };
     int segments[2] = { 0, 0 };
+    double firstStartS[2] = { 0.0, 0.0 };                              // the endpoints the sink was handed, not only their difference
+    double lastEndS[2] = { 0.0, 0.0 };
+    // r4 (adversary pass 1 A5): every segment the sink was handed, in order, with the window it was charged to -- so a segment
+    // shifted at a SECOND dispatch is seen even when the totals and the outer endpoints still match. Reserved up front: the
+    // sink runs inside the sleep and must not allocate (a push past the capacity is dropped, so the count assertion fails)
+    // r7 (sol review r6, blocker 4): chargedAtMs is the time (QPC ms, the clock the handlers stamp with) the sink was called, so the
+    // test can prove each segment was charged BEFORE the handlers of the dispatch that closes it ran, for every dispatch
+    struct Segment { int window; double startS; double endS; double chargedAtMs; };
+    std::vector<Segment> segs;
+    R17A1Windows() { segs.reserve( 64 ); }
     gui_hop_wait::Recorder hop;
 };
 void r17A1Charge( void *context, double startS, double endS )
 {
     R17A1Windows *w = static_cast<R17A1Windows *>( context );
+#ifdef Q_OS_WIN
+    const double chargedAtMs = dueWakeQpcNowMs();                      // no allocation: the sink runs inside the sleep
+#else
+    const double chargedAtMs = 0.0;
+#endif
+    if( w->segs.size() < w->segs.capacity() ) w->segs.push_back( { w->open, startS, endS, chargedAtMs } );
     w->chargedS[w->open] += endS - startS;
+    if( w->segments[w->open] == 0 ) w->firstStartS[w->open] = startS;
+    w->lastEndS[w->open] = endS;
     ++w->segments[w->open];
     w->hop.push( gui_hop_wait::Kind::RunnerSleep, startS, endS );
 }
@@ -2608,14 +3674,240 @@ TEST(PlaybackDueWakeSend, R17A1_EachRunnerSleepSegmentIsChargedToTheWindowItRanI
     ASSERT_TRUE( std::fabs( newTiming.runner_sleep_ms - 4.0 ) < 1e-9 );
 }
 
+namespace {
+// CI-FLAKE-R17A1-FOREIGN-FIRST-FLOOR-1 r5 (sol r4 B1): the dispatch-record accounting of ONE sleep, checked on every attempt that
+// proves a dispatch ran BEFORE any admission gate may discard it. The sleep reads the caller clock at its entry, at each
+// dispatch's begin and end, and at its return, and records one span per dispatch on those very reads; every handler that ran
+// inside the sleep ran inside one of those spans. Returns "" when the record accounts for every dispatch, otherwise why not.
+// An admission gate that skipped such a sample first (the r4 one-span and separate-stray gates did) let a clean retry hide a
+// product that dropped a span record.
+// r5 adversary pass 9 A1: and the product's OWN count of the sleep's dispatches (runnerSleepsWokenOther + runnerSleepsWokenBySent,
+// counted beside each span at PlaybackDueWake.cpp's dispatch, by the fixture as a delta across the sleep) must equal the spans: an
+// uninstrumented dispatch (a WM_NULL to the wake's own window, no fixture witness) lost with its two reads left every count above
+// agreeing. Pass 9 A6: the reads are in order (so the spans are), and each handler's reads are given as ONE interval, which must
+// lie inside one recorded span (a point is an interval with equal ends).
+std::string r17A1DispatchRecordGap( const std::vector<double> &stampsS, const std::vector<std::pair<double, double>> &spansS,
+                                    const std::vector<std::pair<double, double>> &handlerReadsMs, size_t countedDispatches )
+{
+    if( spansS.empty() ) return "spans=0 (a dispatch ran, none recorded)";
+    if( countedDispatches != spansS.size() )
+        return "spans=" + std::to_string( spansS.size() ) + " counted_dispatches=" + std::to_string( countedDispatches ) + " (the product counted another dispatch)";
+    if( stampsS.size() != 2 + 2 * spansS.size() )
+        return "stamps=" + std::to_string( stampsS.size() ) + " spans=" + std::to_string( spansS.size() ) + " (expected stamps=2+2*spans)";
+    for( size_t i = 1; i < stampsS.size(); ++i )
+        if( !( stampsS[i - 1] <= stampsS[i] ) ) return "stamp " + std::to_string( i ) + " is before the read it follows";
+    for( size_t i = 0; i < spansS.size(); ++i )
+        if( !( std::fabs( spansS[i].first - stampsS[2 * i + 1] ) < 1e-9 ) || !( std::fabs( spansS[i].second - stampsS[2 * i + 2] ) < 1e-9 ) )
+            return "span " + std::to_string( i ) + " is not the reads around its dispatch";
+    constexpr double kRoundTripMs = 0.00005;                          // assertChargedBeforeHandler's tolerance
+    for( const auto &read : handlerReadsMs )
+    {
+        bool inSpan = false;
+        for( const auto &span : spansS )
+            if( span.first * 1000.0 <= read.first + kRoundTripMs && read.second <= span.second * 1000.0 + kRoundTripMs ) inSpan = true;
+        if( !inSpan ) return "a handler's reads [" + std::to_string( read.first ) + ", " + std::to_string( read.second ) + "] ms lie in no one recorded span";
+    }
+    return std::string();
+}
+
+// CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1 (sol r5 B2): ONE sample's record, THEN its length, in that order. r5 judged the
+// length first, on stamps.back() - stamps.front(), so a sample whose return read was lost (stamps [0, 8.1, 59] ms, one span
+// [8.1, 59], count 1, a real 80 ms sleep) failed the 64 ms floor as a "short sleep" and never reached R17A1_DISPATCH_RECORD_LOST.
+// Now: a sample that proves a dispatch ran is accounted first (r17A1DispatchRecordGap); any caller-clock record that is not whole
+// (stamps != 2 + 2 * spans, proven or not) is a lost read, typed as such; the length is read off the caller clock only from a
+// whole record (its first and last reads are the entry and the return), and from the test's own bracket when there are no reads.
+// Returns { tag, detail }; an empty tag means the record is whole and the sleep ran at least floorMs.
+struct R17A1SampleJudgement
+{
+    std::string tag;
+    std::string detail;
+};
+R17A1SampleJudgement r17A1JudgeRecordThenLength( const std::vector<double> &stampsS, const std::vector<std::pair<double, double>> &spansS,
+                                                 const std::vector<std::pair<double, double>> &handlerReadsMs, size_t countedDispatches,
+                                                 bool dispatchProven, double bracketMs, double floorMs, bool clockSupplied = false )
+{
+    // adversary pass 2 A3 on e1b2051f: a sleep handed a caller clock reads it at least at its entry and its return, so an EMPTY
+    // record from such a sleep lost both reads; it is never judged on the bracket (which a dispatch-free 80 ms timeout passes)
+    if( clockSupplied && stampsS.empty() ) return { "R17A1_DISPATCH_RECORD_LOST", "stamps=0 (the supplied caller clock was never read)" };
+    if( dispatchProven )
+    {
+        const std::string gap = r17A1DispatchRecordGap( stampsS, spansS, handlerReadsMs, countedDispatches );
+        if( !gap.empty() ) return { "R17A1_DISPATCH_RECORD_LOST", gap };
+    }
+    if( !stampsS.empty() && stampsS.size() != 2 + 2 * spansS.size() )
+        return { "R17A1_DISPATCH_RECORD_LOST", "stamps=" + std::to_string( stampsS.size() ) + " spans=" + std::to_string( spansS.size() )
+                                                   + " (expected stamps=2+2*spans; a lost read is never a short sleep)" };
+    const bool callerClock = !stampsS.empty();
+    const double lengthMs = callerClock ? ( stampsS.back() - stampsS.front() ) * 1000.0 : bracketMs;
+    if( !( lengthMs >= floorMs ) )
+        return { "R17A1_SLEEP_SHORT", "length_ms=" + std::to_string( lengthMs ) + " floor_ms=" + std::to_string( floorMs )
+                                          + ( callerClock ? " (entry to return on the caller clock)" : " (the test's own bracket)" ) };
+    return {};
+}
+}
+
+TEST(PlaybackDueWakeSend, R17A1_ALostReadIsARecordLossNeverAShortSleep)
+{
+    // CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1, sol r5 B2's literal row: a real 80 ms sleep, the recorded dispatch [8.1, 59] ms,
+    // the present's handler [20, 22] ms, count 1, caller stamps [0, 8.1, 59] ms with the return read missing. Expected
+    // R17A1_DISPATCH_RECORD_LOST; r5's order read 59 ms as the sleep's length and failed the 64 ms floor first.
+    using Reads = std::vector<std::pair<double, double>>;
+    const double floorMs = dueWakeSleepFloorMs( 80.0 );
+    const Reads heldReads { { 20.0, 22.0 } };
+    const R17A1SampleJudgement lostReturn = r17A1JudgeRecordThenLength( { 0.0, 0.0081, 0.059 }, { { 0.0081, 0.059 } }, heldReads, 1, true, 80.0, floorMs );
+    ASSERT_EQ( std::string( "R17A1_DISPATCH_RECORD_LOST" ), lostReturn.tag );
+    // the healthy record of the same sleep, and a whole record of a sleep that really was short
+    ASSERT_TRUE( r17A1JudgeRecordThenLength( { 0.0, 0.0081, 0.059, 0.080 }, { { 0.0081, 0.059 } }, heldReads, 1, true, 80.0, floorMs ).tag.empty() );
+    ASSERT_EQ( std::string( "R17A1_SLEEP_SHORT" ),
+               r17A1JudgeRecordThenLength( { 0.0, 0.0081, 0.059, 0.060 }, { { 0.0081, 0.059 } }, heldReads, 1, true, 80.0, floorMs ).tag );
+    // the same loss on a sample with no dispatch witnessed (entry read only): still a lost read, never a short sleep
+    ASSERT_EQ( std::string( "R17A1_DISPATCH_RECORD_LOST" ), r17A1JudgeRecordThenLength( { 0.0 }, {}, {}, 0, false, 80.0, floorMs ).tag );
+    // [entry, return] of a sleep that dispatched nothing; and no caller-clock reads at all, judged on the test's own bracket
+    ASSERT_TRUE( r17A1JudgeRecordThenLength( { 0.0, 0.080 }, {}, {}, 0, false, 80.0, floorMs ).tag.empty() );
+    ASSERT_TRUE( r17A1JudgeRecordThenLength( {}, {}, {}, 0, false, 80.0, floorMs ).tag.empty() );
+    ASSERT_EQ( std::string( "R17A1_SLEEP_SHORT" ), r17A1JudgeRecordThenLength( {}, {}, {}, 0, false, 20.0, floorMs ).tag );
+    // adversary pass 2 A3, its input: the live clock was supplied, a dispatch-free timeout, an 80 ms bracket, and both reads lost
+    ASSERT_EQ( std::string( "R17A1_DISPATCH_RECORD_LOST" ), r17A1JudgeRecordThenLength( {}, {}, {}, 0, false, 80.0, floorMs, true ).tag );
+    ASSERT_TRUE( r17A1JudgeRecordThenLength( { 0.0, 0.080 }, {}, {}, 0, false, 80.0, floorMs, true ).tag.empty() );
+    // the record is judged before the length even when both fail: spans [] after a proven dispatch, and the sleep short too
+    ASSERT_EQ( std::string( "R17A1_DISPATCH_RECORD_LOST" ),
+               r17A1JudgeRecordThenLength( { 0.0, 0.0081, 0.059, 0.060 }, {}, heldReads, 1, true, 60.0, floorMs ).tag );
+}
+
+TEST(PlaybackDueWakeSend, R17A1_ADispatchThatRanIsAccountedBeforeAnyAdmissionMayDiscardIt)
+{
+    // sol r4 B1, the literal rows (caller stamps and spans in seconds, handler reads in ms)
+    // (a) the no-stray arm: the held dispatch [8.1, 59] ran (stamps [0, 8.1, 59, 80], the present's handler inside it), spans []
+    using Reads = std::vector<std::pair<double, double>>;
+    const std::vector<double> heldStamps { 0.0, 0.0081, 0.059, 0.080 };
+    const Reads heldReads { { 20.0, 22.0 } };                          // the present's handler: its start and end read
+    ASSERT_FALSE( r17A1DispatchRecordGap( heldStamps, {}, heldReads, 1 ).empty() );
+    ASSERT_FALSE( r17A1DispatchRecordGap( heldStamps, {}, heldReads, 0 ).empty() );
+    ASSERT_TRUE( r17A1DispatchRecordGap( heldStamps, { { 0.0081, 0.059 } }, heldReads, 1 ).empty() );   // the healthy record
+    // (b) the stray at 60.2 ms in its own dispatch [60.1, 60.3]: all six stamps kept, its returned span omitted
+    const std::vector<double> strayStamps { 0.0, 0.0081, 0.059, 0.0601, 0.0603, 0.080 };
+    const Reads strayReads { { 20.0, 22.0 }, { 60.2, 60.2 } };
+    ASSERT_FALSE( r17A1DispatchRecordGap( strayStamps, { { 0.0081, 0.059 } }, strayReads, 2 ).empty() );
+    ASSERT_FALSE( r17A1DispatchRecordGap( strayStamps, { { 0.0081, 0.059 } }, strayReads, 1 ).empty() );
+    ASSERT_TRUE( r17A1DispatchRecordGap( strayStamps, { { 0.0081, 0.059 }, { 0.0601, 0.0603 } }, strayReads, 2 ).empty() );
+    // the same loss with the stray's two stamps dropped too: the counts agree, but the stray's read lies in no recorded span
+    ASSERT_FALSE( r17A1DispatchRecordGap( heldStamps, { { 0.0081, 0.059 } }, strayReads, 1 ).empty() );
+    // a span shifted off the reads around its dispatch
+    ASSERT_FALSE( r17A1DispatchRecordGap( heldStamps, { { 0.0082, 0.059 } }, heldReads, 1 ).empty() );
+    // r5 adversary pass 9 A1, its literal row: an inherited row's present and probes batched in [20.1, 59] (present reads [55, 57],
+    // probes 57.1..57.5), a WM_NULL to the wake's own window in a second dispatch [60.1, 60.3] lost with its two reads; the product
+    // still counted both dispatches. Every witnessed read fits the kept span, so only the product's count shows the loss.
+    const std::vector<double> lostStamps { 0.0, 0.0201, 0.059, 0.080 };
+    const Reads batchReads { { 55.0, 57.0 }, { 57.1, 57.1 }, { 57.2, 57.2 }, { 57.3, 57.3 }, { 57.4, 57.4 }, { 57.5, 57.5 } };
+    ASSERT_FALSE( r17A1DispatchRecordGap( lostStamps, { { 0.0201, 0.059 } }, batchReads, 2 ).empty() );
+    ASSERT_TRUE( r17A1DispatchRecordGap( lostStamps, { { 0.0201, 0.059 } }, batchReads, 1 ).empty() );
+    // pass 9 A6, its literal rows: one present handler whose reads [20, 22] straddle two spans (no one span holds the handler)...
+    const std::vector<double> splitStamps { 0.0, 0.0081, 0.021, 0.0215, 0.059, 0.080 };
+    ASSERT_FALSE( r17A1DispatchRecordGap( splitStamps, { { 0.0081, 0.021 }, { 0.0215, 0.059 } }, heldReads, 2 ).empty() );
+    // ...and a record in backwards dispatch order
+    const std::vector<double> backwardsStamps { 0.0, 0.0601, 0.0603, 0.0081, 0.059, 0.080 };
+    ASSERT_FALSE( r17A1DispatchRecordGap( backwardsStamps, { { 0.0601, 0.0603 }, { 0.0081, 0.059 } }, strayReads, 2 ).empty() );
+}
+
 #ifdef Q_OS_WIN
 namespace {
 R17A1Windows *g_r17A1Windows = nullptr;
 double g_r17A1HandlerStartMs = 0.0;
 double g_r17A1HandlerEndMs = 0.0;
+bool g_r17A1HandlerRan = false;                                        // set by the handler itself: the observation landed
 constexpr UINT kR17A1ForeignMessage = WM_USER + 0x53;
+// PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 (r7 adversary pass 12 A1): the probes are DISPATCH SOURCES only. They used to be liveness
+// probes, judged on the sender's post-call stamp; a sender paused between its send and that stamp let a sleep cut short after
+// its fifth dispatch read as having run on. The sleep's early exit is now judged on the product's own exit record
+// (dueWakeSleepExitMet), and each probe dispatch feeds only the per-dispatch charge-order proof (assertChargedBeforeHandler).
+// The handler records which probe (its wParam) ran and when, nothing else.
+constexpr UINT kR17A1ProbeMessage = WM_USER + 0x54;
+constexpr int kR17A1MaxProbes = 8;
+// when the sender queues each probe, from its own entry read: dispatches spread across the sleep
+constexpr double kR17A1ProbeOffsetsMs[] = { 30.0, 36.0, 42.0, 48.0, 54.0 };
+unsigned g_r17A1ProbeRanMask = 0;
+double g_r17A1ProbeRunMs[kR17A1MaxProbes] = {};                        // when each probe's handler ran (QPC ms); read after the sleep returned
+// CI-FLAKE-R17A1-FOREIGN-FIRST-FLOOR-1 (sol r10 B1, fable r10 B1): the GUI paused INSIDE the foreign WM_NULL dispatch. While set,
+// the WM_NULL handler holds the GUI thread until the sender has queued the present, so the present is taken in that same
+// PeekMessageW (or the next dispatch, microseconds later): the old window is charged only the ~8 ms before the WM_NULL, which is
+// a correct charge. Bounded by the sender's own 5 s cutoff, so a sender that never sends the present cannot hang the test.
+bool g_r17A1PauseInForeign = false;
+std::atomic<bool> g_r17A1PresentSent { false };
+// FOREIGN-FIRST-FLOOR-1 adversary pass 1 A1: the handler records whether it really held the GUI, i.e. the present was NOT yet
+// queued when the WM_NULL dispatch reached it. A GUI that reached it only after the present was queued paused nothing inside the
+// dispatch, so that sample is not the paused row and is observed again.
+// r2 (bite check): "held" is BOTH ends of the wait, never the entry read alone: the present was not queued when the handler began
+// AND was queued when it returned, so the present was queued while this dispatch held the GUI. An entry-only read stayed true for
+// a handler that returned at once (the pause removed), and that row passed without ever pausing.
+// r2 adversary pass 2 A2: the entry read is of a flag the sender raises BEFORE the present's send (g_r17A1PresentSending), never
+// of g_r17A1PresentSent, which it publishes only AFTER the send returned: a sender paused between the two left the present queued
+// while the entry read still said "not queued", and the row admitted a sample whose present was queued before the handler began.
+std::atomic<bool> g_r17A1PresentSending { false };
+bool g_r17A1PauseHeld = false;
+// CI-FLAKE-R17A1-FOREIGN-FIRST-FLOOR-1 r3 (sol r2 B1): sol's literal coalescing schedule, driven by the test's own handler, never
+// by the scheduler: while set, the paused WM_NULL handler holds the GUI until the sender has queued the present (20 ms) AND every
+// probe (30..54 ms) and reached 56 ms, so one PeekMessageW takes the WM_NULL, the present and all five probes: ONE recorded span.
+// That healthy sleep is correctly charged (the old window holds the ~8 ms before the WM_NULL) and must be judged, never discarded.
+bool g_r17A1CoalesceInForeign = false;
+std::atomic<bool> g_r17A1ProbesSent { false };                        // published by the sender at 56 ms, after its last probe's send
+// r3 adversary pass 4 A1: the paused WM_NULL handler's own entry read, so the coalesced row proves the present and every probe ran in
+// the HELD dispatch (the span holding this read), never "exactly one span": a later sent message from any source adds a span
+double g_r17A1NullEnterMs = 0.0;
+// r3 adversary pass 4 A5 (advisory): only the FIRST WM_NULL of an attempt is the paused one and writes the witness; a later WM_NULL
+// (sent while the first held the GUI, so its entry reads the present's send begun) returns at once and cannot overwrite it
+bool g_r17A1NullSeen = false;
+// r3 adversary pass 4 A7 (advisory): the hold is bounded by the SENDER's own 5 s cutoff (published before its first send), never a
+// second cutoff taken at the handler's entry; 0 (no sender) credits nothing
+std::atomic<ULONGLONG> g_r17A1SenderGiveUp { 0 };
+constexpr UINT kR17A1StrayMessage = WM_USER + 0x55;                  // A1 input: a sent message the fixture only stamps
+// r3 adversary pass 5 A2 (and sol r2 H2): the first WM_NULL's and the stray's handlers record when they ran, so the charge-before-
+// handler proof covers THEIR dispatches too (a WM_NULL-only dispatch, the held one, the stray's), not only the present's and probes'
+bool g_r17A1StrayRan = false;
+double g_r17A1StrayRunMs = 0.0;
+// r3 (sol r2 H1): the hold's completion is read ONCE per pass, and credited only when a cutoff check taken AFTER that read still
+// places it before giveUp (the sender's own admission rule, :entered): a flag published after the 5 s cutoff, before a separate
+// final load, is never credited as held
+bool r17A1HoldUntil( const std::atomic<bool> &flag, ULONGLONG giveUp )
+{
+    for( ;; )
+    {
+        const bool seen = flag.load();
+        const bool beforeCutoff = GetTickCount64() < giveUp;           // read after the flag: true means the flag read came before the cutoff
+        if( seen ) return beforeCutoff;
+        if( !beforeCutoff ) return false;
+        Sleep( 0 );
+    }
+}
 LRESULT CALLBACK r17A1ForeignProc( HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam )
 {
+    if( message == kR17A1StrayMessage )
+    {
+        g_r17A1StrayRunMs = dueWakeQpcNowMs();                         // pass 5 A2: its dispatch's charge order is proved too
+        g_r17A1StrayRan = true;
+        return 0;
+    }
+    if( message == WM_NULL )
+    {
+        if( g_r17A1NullSeen ) return 0;                                // A5: a later WM_NULL holds nothing and writes no witness
+        g_r17A1NullSeen = true;
+        g_r17A1NullEnterMs = dueWakeQpcNowMs();                        // A1: inside the held dispatch, before the hold; pass 5 A2/H2: every row's first WM_NULL
+        if( !g_r17A1PauseInForeign ) return 0;                         // an unpaused foreign row: the WM_NULL is only stamped
+        const bool sendingAtEntry = g_r17A1PresentSending.load();     // false: the present's send had not begun when this dispatch did
+        const ULONGLONG giveUp = g_r17A1SenderGiveUp.load();          // A7: the sender's own cutoff
+        // the sender publishes g_r17A1ProbesSent only after g_r17A1PresentSent (seq_cst), so holding for the probes also held the present
+        g_r17A1PauseHeld = !sendingAtEntry && r17A1HoldUntil( g_r17A1CoalesceInForeign ? g_r17A1ProbesSent : g_r17A1PresentSent, giveUp );        return 0;
+    }
+    if( message == kR17A1ProbeMessage )
+    {
+        // r7 (sol review r6, hardening): a direct message with an index past the probe table is no probe (and a shift by >= the
+        // mask's width is undefined behaviour)
+        if( wParam < static_cast<WPARAM>( kR17A1MaxProbes ) )
+        {
+            g_r17A1ProbeRunMs[static_cast<unsigned>( wParam )] = dueWakeQpcNowMs();
+            g_r17A1ProbeRanMask |= 1u << static_cast<unsigned>( wParam );
+        }
+        return 0;
+    }
     if( message == kR17A1ForeignMessage )
     {
         // the handler presents: the gap/tail the sleep began in closes and the next one opens
@@ -2623,6 +3915,7 @@ LRESULT CALLBACK r17A1ForeignProc( HWND hwnd, UINT message, WPARAM wParam, LPARA
         Sleep( 2 );
         if( g_r17A1Windows ) g_r17A1Windows->open = 1;
         g_r17A1HandlerEndMs = dueWakeQpcNowMs();
+        g_r17A1HandlerRan = true;
         return 0;
     }
     return DefWindowProcW( hwnd, message, wParam, lParam );
@@ -2630,6 +3923,20 @@ LRESULT CALLBACK r17A1ForeignProc( HWND hwnd, UINT message, WPARAM wParam, LPARA
 double r17A1NowS()
 {
     return dueWakeQpcNowMs() / 1000.0;
+}
+// CI-FLAKE-PLAYBACK-DUE-WAKE-R17A1-TIMING-1: the caller clock the sleep is handed, recording every read it makes. Whatever the
+// scheduler did, the sleep's segments are differences of these reads, so the test measures the times it then compares against.
+std::vector<double> g_r17A1Stamps;
+std::atomic<bool> g_r17A1Entered { false };
+std::atomic<int> g_r17A1ClockReads { 0 };                              // r3 pass 4 A1: 3 = the first dispatch's END was read
+double r17A1RecordingNowS()
+{
+    const double s = dueWakeQpcNowMs() / 1000.0;
+    // never grows: capacity is reserved up front, and a read past it is dropped so the stamp-count assertion fails instead
+    if( g_r17A1Stamps.size() < g_r17A1Stamps.capacity() ) g_r17A1Stamps.push_back( s );
+    g_r17A1Entered = true;
+    ++g_r17A1ClockReads;
+    return s;
 }
 }
 #endif
@@ -2647,38 +3954,505 @@ TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDis
     RegisterClassW( &wc );
     const HWND window = CreateWindowExW( 0, kClass, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr );
     ASSERT_TRUE( window != nullptr );
-    R17A1Windows w;
-    g_r17A1Windows = &w;
-    std::atomic<bool> sent { false };
-    std::thread sender( [window, &sent]() {
-        Sleep( 20 );
-        sent = SendNotifyMessageW( window, kR17A1ForeignMessage, 0, 0 ) != 0;
-    } );
-    const double enteredMs = dueWakeQpcNowMs();
-    const PlaybackDueWake::RunnerSleep slept = wake.sleepForSmokeRunner( 80, &r17A1NowS, &r17A1Charge, &w );
-    const double returnedMs = dueWakeQpcNowMs();
-    sender.join();
-    g_r17A1Windows = nullptr;
-    DestroyWindow( window );
-    ASSERT_TRUE( sent.load() );
+    const HelperWindowGuard windowGuard { window };
+    // CI-FLAKE-PLAYBACK-DUE-WAKE-R17A1-TIMING-1 (hosted run 44998377370: `w.chargedS[1] * 1000.0 >= 30.0` failed, the sender
+    // thread woke at ~55 ms of the 80). Every bound below follows from a clock read the test or the sleep made, never from the
+    // scheduler running a thread on time. The sender starts its 20 ms only once the sleep has stamped its entry, so a main
+    // thread descheduled before the sleep cannot eat the segment before the send. The send itself must land inside the sleep
+    // for the property to be observable at all; when the sender is so late that it misses the whole 80 ms (the handler never
+    // ran, so there is nothing to measure), the observation is retried. The retry keys on the HANDLER's own stamps, never on
+    // the sleep's span record: an attempt whose handler ran is judged in full below, so a product that dropped the span (or a
+    // stamp, or a segment) fails here instead of being retried away. A pass can never come from a missed send.
+    // r5 (sol r4 B1): that holds for EVERY admission gate, not only the handler's: an attempt that proves a dispatch ran has its
+    // dispatch record accounted before any gate may discard it (r17A1DispatchRecordGap, in the loop below).
+    // r4 (sol review r3, blocker 2; adversary pass 1 A1/A4, pass 2 A1/A2): after the first send the sender puts out probes at
+    // fixed offsets (kR17A1ProbeOffsetsMs: every 6 ms from 30 to 54 ms), so the sleep dispatches more than once and the charge
+    // order is proved for every dispatch. Two sends taken in one dispatch (a GUI pause) are no failure: the assertions below
+    // follow the dispatches the sleep recorded, however many.
+    // PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 (r7 adversary pass 12 A1): the caller clock cannot tell a sleep that ran its 80 ms
+    // from one that returned after a dispatch and was then paused before its final read, and a probe's sender-side stamp cannot
+    // either (a sender paused before it). The verdict is the product's own exit record: how the loop was left and the elapsed
+    // value that decision compared (dueWakeSleepExitMet). No sample is gated on sender timing any more.
+    // SEAM-1 A4: the judged sleep runs both with the wake idle and with it ARMED (a 60 s arm that cannot fire inside the sleep), so
+    // a product that charges a segment after its dispatch only while armed is caught on the clock too, not only by the token pin.
+    constexpr int kAttempts = 10;
+    g_r17A1Stamps.reserve( 256 );                                     // the clock callback must never allocate (a throw there would std::terminate the sender's join)
+    // SEAM-1 adversary pass 2 A2 (48ad052b): and with the GUI trace on (the smoke runner's real configuration: a dispatch hidden
+    // behind the trace flag ran in no live case, since the trace-on fixtures pass a null sink)
+    // SEAM-1 r4 (adversary pass 3 A1 on 91820e1e): and with the timing-stamp seam OFF (`stamped` false), the production
+    // configuration: a pump added only while the seam is off (a PeekMessageW in noteRunnerSleep( false ), armed and traced) ran
+    // the handler before the old window's charge in no live case, since every judged sleep ran with the seam on. Off, the exit
+    // record stays the setter's None / -1 (the seam records nothing) and every charge-order, window and span assertion is kept.
+    // r10 (sol r9 B1): and with a FOREIGN sent message first (`foreignFirst`: SendNotifyMessageW( window, WM_NULL ) at 8 ms, before
+    // the present at 20 ms), so the first dispatch is not the present's: the windows and the present's span are keyed on the
+    // dispatch the present's handler really ran in, never on dispatch 0
+    // CI-FLAKE-R17A1-FOREIGN-FIRST-FLOOR-1 (sol r10 B1, fable r10 B1): and with the GUI PAUSED inside that WM_NULL dispatch
+    // (`pausedInForeign`, foreignFirst only): the present queued during the pause runs in the same dispatch, and the old window's
+    // correct charge is the ~8 ms before the WM_NULL
+    // r3 (sol r2 B1): and with that pause held past every send (`coalesceInForeign`, pausedInForeign only): the WM_NULL, the present
+    // and all five probes run in ONE dispatch, the sample the r2 admission discarded on every attempt
+    // r4 (sol r3 B1): `strayAfterHeld` (coalesceInForeign only) adds the pass 4 A1 stray after the held dispatch. Without it the
+    // coalesced row is the ONE-SPAN row: it admits only a one-span sample and asserts one span on the judged one, so the r2 gate
+    // (`spans.size() != 1`) restored can never pass it. The stray row alone could: its stray is a second span the old gate admits.
+    const auto judgeSentWait = [&]( bool armed, bool traced, bool stamped, bool foreignFirst, bool pausedInForeign, bool coalesceInForeign,
+                                    bool strayAfterHeld ) {
+    const bool floorRow = foreignFirst && pausedInForeign;             // r3: the paused floor row, admitted on its own predicate below
+    const bool oneSpanRow = floorRow && coalesceInForeign && !strayAfterHeld;   // r4 (sol r3 B1): the coalesced row with no stray
+    const bool strayRow = floorRow && coalesceInForeign && strayAfterHeld;      // r4 adversary pass 7 A1: the coalesced row with the stray
+    wake.setTimingStampsForTest( stamped );                           // also resets the exit record to None / -1
+    std::unique_ptr<R17A1Windows> wp;
+    std::vector<std::pair<double, double>> spans;
+    std::vector<double> stamps;
+    double handlerStartMs = 0.0;
+    double handlerEndMs = 0.0;
+    double enteredMs = 0.0;
+    double returnedMs = 0.0;
+    unsigned ranProbes = 0;                                           // bit i: probe i's handler ran inside the sleep
+    double probeRunMs[kR17A1MaxProbes] = {};                          // when probe i's handler ran (valid where ranProbes has bit i)
+    PlaybackDueWake::RunnerSleep slept = PlaybackDueWake::RunnerSleep::NotHandled;
+    PlaybackDueWake::RunnerSleepExit sleepExit = PlaybackDueWake::RunnerSleepExit::None;
+    qint64 exitMs = -1;
+    bool armedDuringSleep = false;
+    bool sentOk = false;
+    bool landed = false;
+    double foreignSentMs = 0.0;                                       // FOREIGN-FIRST-FLOOR-1: the sender's read just before the WM_NULL send
+    double nullEnterMs = 0.0;                                         // r3 pass 4 A1: the first WM_NULL handler's entry read
+    bool nullRan = false;                                             // pass 5 A2: that handler ran inside the sleep
+    bool strayRan = false;                                            // pass 5 A2: the coalesced row's stray ran inside the sleep
+    double strayRunMs = 0.0;
+    // r3 (sol r2 B1): why each discarded attempt was discarded, so a row that discards all ten fails with a typed reason
+    int missedSend = 0;                                               // the present's handler never ran inside the sleep
+    int noStamps = 0;                                                 // the sleep made no caller-clock read
+    int oneSpanInherited = 0;                                         // an inherited arm saw exactly one span: no second dispatch to witness
+    int holdNotWitnessed = 0;                                         // the floor row's WM_NULL handler did not hold the GUI while the present was queued
+    // r4 (sol r3 B2): an attempt whose present was never sent (the sender's entry cutoff, or a failed SendNotifyMessageW) is its own
+    // reason, and the typed report below runs BEFORE any assertion on the send, so ten unsent attempts still name their reason
+    int notSent = 0;
+    int notOneSpan = 0;                                               // r4 (sol r3 B1): the one-span row saw more than one span
+    int strayNotSeparate = 0;                                         // r4 pass 7 A1: the stray row's stray ran in no dispatch after the held one
+    bool redDropped = false;                                          // r5 RED seam: at most one record dropped per row
+    for( int attempt = 0; attempt < kAttempts && !landed; ++attempt )
+    {
+        wp.reset( new R17A1Windows );
+        g_r17A1Windows = wp.get();
+        g_r17A1Stamps.clear();
+        g_r17A1Entered = false;
+        g_r17A1ClockReads = 0;
+        g_r17A1HandlerStartMs = 0.0;
+        g_r17A1HandlerEndMs = 0.0;
+        g_r17A1HandlerRan = false;
+        g_r17A1ProbeRanMask = 0;
+        std::fill( g_r17A1ProbeRunMs, g_r17A1ProbeRunMs + kR17A1MaxProbes, 0.0 );
+        g_r17A1PresentSent = false;
+        g_r17A1PresentSending = false;
+        g_r17A1PauseHeld = false;
+        g_r17A1ProbesSent = false;
+        g_r17A1NullEnterMs = 0.0;
+        g_r17A1NullSeen = false;
+        g_r17A1StrayRan = false;
+        g_r17A1StrayRunMs = 0.0;
+        g_r17A1SenderGiveUp = 0;
+        g_r17A1PauseInForeign = floorRow;
+        g_r17A1CoalesceInForeign = floorRow && coalesceInForeign;
+        foreignSentMs = 0.0;
+        std::atomic<bool> sent { false };
+        const bool hostileExtras = g_r17A1CoalesceInForeign;          // r3 pass 4 A5 input: the coalesced rows also get a second WM_NULL
+        const bool strayExtra = hostileExtras && strayAfterHeld;      // r4 (sol r3 B1): the pass 4 A1 stray, in the stray row only
+        std::thread sender( [window, &sent, &foreignSentMs, foreignFirst, hostileExtras, strayExtra]() {   // foreignSentMs is read only after the join
+            const ULONGLONG giveUp = GetTickCount64() + 5000;
+            g_r17A1SenderGiveUp = giveUp;                              // A7: published before any send, so the paused handler reads it
+            bool entered = false;
+            while( !entered && GetTickCount64() < giveUp )
+            {
+                entered = g_r17A1Entered.load();
+                if( !entered ) Sleep( 0 );
+            }
+            // r4 (sol review r3, hardening): the observed entry is checked against the cutoff at admission, so a flag that turned
+            // true after it (read false at 4,999 ms, true at 5,005 ms) is not admitted either
+            if( !entered || GetTickCount64() >= giveUp ) return;       // the sleep never started: no send, so the attempt reads as missed
+            const double seenMs = dueWakeQpcNowMs();
+            // each send at an offset from the sender's own entry read, waited out on its clock (not a Sleep, whose granularity
+            // could leave no probe near the end of the sleep)
+            const auto waitUntil = []( double targetMs ) { while( dueWakeQpcNowMs() < targetMs ) Sleep( 0 ); };
+            if( foreignFirst )
+            {
+                waitUntil( seenMs + 8.0 );
+                foreignSentMs = dueWakeQpcNowMs();                          // FOREIGN-FIRST-FLOOR-1: read BEFORE the send, so no dispatch of it began earlier
+                SendNotifyMessageW( window, WM_NULL, 0, 0 );                // r10 (sol r9 B1): a foreign dispatch before the present
+            }
+            waitUntil( seenMs + 20.0 );
+            g_r17A1PresentSending = true;                              // r2 pass 2 A2: raised BEFORE the send (a paused handler's entry reads it)
+            sent = SendNotifyMessageW( window, kR17A1ForeignMessage, 0, 0 ) != 0;
+            g_r17A1PresentSent = true;                                 // the present is queued: a paused WM_NULL handler may return
+            if( hostileExtras )
+            {
+                waitUntil( seenMs + 25.0 );                            // pass 4 A5 input: a second WM_NULL, queued while the first holds the GUI
+                SendNotifyMessageW( window, WM_NULL, 0, 0 );
+            }
+            WPARAM i = 0;
+            for( const double offsetMs : kR17A1ProbeOffsetsMs )
+            {
+                waitUntil( seenMs + offsetMs );
+                SendNotifyMessageW( window, kR17A1ProbeMessage, i++, 0 );   // a dispatch source only: no stamp is judged
+            }
+            waitUntil( seenMs + 56.0 );                                // r3 (sol r2 B1): the coalescing row's GUI resumes at 56 ms
+            g_r17A1ProbesSent = true;                                  // after the present's publication and every probe's send
+            if( strayExtra )
+            {
+                // pass 4 A1 input: a stray sent message after the held batch's dispatch ENDED (the sleep's third clock read), so it
+                // is its own dispatch inside the sleep (sent by 75 ms at the latest; a stray that misses the sleep is drained)
+                while( g_r17A1ClockReads.load() < 3 && dueWakeQpcNowMs() < seenMs + 75.0 ) Sleep( 0 );
+                SendNotifyMessageW( window, kR17A1StrayMessage, 0, 0 );
+            }
+        } );
+        const ThreadJoinGuard senderGuard { sender };               // pass 1 A8: an exception inside the sleep unwinds through a joined thread
+        if( armed ) wake.arm( 60000.0 );                              // SEAM-1 A4: armed for the whole sleep, never due inside it
+        if( traced ) wake.setGuiTraceActive( true );
+        const quint64 wokenOtherBefore = wake.runnerSleepsWokenOther();   // pass 9 A1: the product's own dispatch count, as a delta
+        const quint64 wokenBySentBefore = wake.runnerSleepsWokenBySent();
+        enteredMs = dueWakeQpcNowMs();
+        slept = wake.sleepForSmokeRunner( 80, &r17A1RecordingNowS, &r17A1Charge, wp.get() );
+        returnedMs = dueWakeQpcNowMs();
+        const size_t countedDispatches = static_cast<size_t>( ( wake.runnerSleepsWokenOther() - wokenOtherBefore )
+                                                              + ( wake.runnerSleepsWokenBySent() - wokenBySentBefore ) );
+        armedDuringSleep = wake.armed();
+        sleepExit = wake.lastRunnerSleepExitForTest();                // the product's own exit decision and the value it compared
+        exitMs = wake.lastRunnerSleepExitElapsedMsForTest();
+        sender.join();
+        if( traced ) wake.setGuiTraceActive( false );
+        // SEAM-1 adversary pass A3 (cd623269): EVERY sample's exit is judged, before any retry filter below: a sleep the send
+        // missed still runs its whole 80 ms (it times out), so no sample -- batched, missed or landed -- can drop a cut-short exit
+        // SEAM-1 r4: with the seam off the record is exactly the setter's None / -1 (the floor on the caller clock below judges the length)
+        // adversary pass 2 A4 on e1b2051f: that exit judgement is a duration floor too, so it now runs right AFTER the dispatch
+        // record's judgement below (still before every retry gate): a lost read with exitMs=59 is R17A1_DISPATCH_RECORD_LOST first
+        if( armed ) wake.cancel();
+        g_r17A1Windows = nullptr;
+        // the handler's own stamps, taken BEFORE the drain below (which runs the handler too, when the send missed the sleep)
+        handlerStartMs = g_r17A1HandlerStartMs;
+        handlerEndMs = g_r17A1HandlerEndMs;
+        const bool handlerRan = g_r17A1HandlerRan;                     // also before the drain, which runs the handler too when a send missed
+        const bool pauseHeld = g_r17A1PauseHeld;                       // A1: also before the drain (a WM_NULL drained after the join holds nothing)
+        nullEnterMs = g_r17A1NullEnterMs;                              // r3 pass 4 A1: also before the drain
+        nullRan = g_r17A1NullSeen;                                     // pass 5 A2: before the drain (a WM_NULL drained after the sleep is not judged)
+        strayRan = g_r17A1StrayRan;
+        strayRunMs = g_r17A1StrayRunMs;
+        ranProbes = g_r17A1ProbeRanMask;
+        std::copy( g_r17A1ProbeRunMs, g_r17A1ProbeRunMs + kR17A1MaxProbes, probeRunMs );   // also before the drain
+        // a send that missed the sleep is still queued: take it now (its handler sees no windows), so it cannot cut the next try
+        MSG drain;
+        PeekMessageW( &drain, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );
+        g_r17A1PauseInForeign = false;                                 // after the drain: a missed WM_NULL returns at once (the sender has joined)
+        sentOk = sent.load();
+        spans = wake.lastRunnerSleepDispatchSpansS();
+        stamps = g_r17A1Stamps;
+        // r5 RED seam (sol r4 B1's literal rows, replayable on the exact head with no rebuild): MLV_R17A1_RED_DROP_RECORD=held drops
+        // the one-span row's span record on its first held one-span attempt (stamps [entry, begin, end, return], spans []), =stray
+        // drops the stray row's own stray span (all six stamps kept). It only ever REMOVES a record, so set it can only fail the
+        // row (R17A1_DISPATCH_RECORD_LOST below), never pass one; unset, nothing changes.
+        // CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1 (sol r5 B2): =return drops the RETURN read of that same held one-span
+        // attempt (stamps [entry, begin, end], the span kept): sol r5 B2's literal row. It runs before the record and the length are
+        // judged, so it replays the order r5 got wrong (r5 read the held dispatch's end as the sleep's return: a "short sleep")
+        if( !redDropped )
+        {
+            const char *redDrop = std::getenv( "MLV_R17A1_RED_DROP_RECORD" );
+            const std::string redMode = redDrop ? redDrop : "";
+            if( redMode == "held" && oneSpanRow && handlerRan && pauseHeld && spans.size() == 1 && stamps.size() == 4 )
+            {
+                spans.clear();
+                redDropped = true;
+            }
+            if( redMode == "return" && oneSpanRow && handlerRan && pauseHeld && spans.size() == 1 && stamps.size() == 4 )
+            {
+                stamps.pop_back();
+                redDropped = true;
+            }
+            if( redMode == "stray" && strayRow && strayRan && pauseHeld )
+            {
+                for( size_t k = 0; k < spans.size() && !redDropped; ++k )
+                    if( spans[k].first * 1000.0 > nullEnterMs && spans[k].first * 1000.0 <= strayRunMs + 0.00005 && strayRunMs <= spans[k].second * 1000.0 + 0.00005 )
+                    {
+                        spans.erase( spans.begin() + static_cast<std::ptrdiff_t>( k ) );
+                        redDropped = true;
+                    }
+            }
+            if( redDropped ) std::fprintf( stderr, "R17A1_RED_DROP_RECORD mode=%s attempt=%d stamps=%zu spans=%zu\n", redMode.c_str(), attempt, stamps.size(), spans.size() );
+        }
+        // r5 (sol r4 B1): an attempt that PROVES a dispatch ran inside the sleep (a handler ran before the drain, or the caller
+        // clock or the span record shows one) has its dispatch record accounted HERE, before any admission gate below may discard
+        // it: the r4 one-span and separate-stray gates skipped a sample whose record had lost a span (stamps [0, 8.1, 59, 80] with
+        // spans [], or the stray's own span omitted), and a clean retry passed the row. Admission may skip only an attempt that
+        // proves no dispatch ran, or one whose record is whole. The landed attempt is judged in full again after the loop.
+        // pass 9 A1: the product's own count of the dispatches proves one too (an uninstrumented dispatch has no fixture witness)
+        // r5 class sweep (adversary pass 11 A4): EVERY sample's length is judged before any retry gate, not only the landed one's:
+        // with the seam off the exit record is None / -1 and judges nothing, so a short sleep retried away hid.
+        // CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1 (sol r5 B2): and the length is judged AFTER the record, by
+        // r17A1JudgeRecordThenLength: r5 read stamps.back() - stamps.front() first, so a lost return read (stamps [0, 8.1, 59])
+        // failed as a 59 ms "short sleep" before the record check could name it. The length is read on the caller clock only
+        // off a whole record; a record that is not whole is a lost read (R17A1_DISPATCH_RECORD_LOST), proven dispatch or not.
+        // RED seam MLV_R17A1_RED_R5_ORDER=1 (test only): replays r5's length-first read on this head, so sol r5 B2's row
+        // (MLV_R17A1_RED_DROP_RECORD=return) shows its r5 failure. It only ADDS a check ahead of the judgement, so set it can only
+        // fail a row, never pass one; unset, nothing changes.
+        if( dueWakeRedR5Order() && stamps.size() >= 2 )
+            ASSERT_TRUE( ( stamps.back() - stamps.front() ) * 1000.0 >= dueWakeSleepFloorMs( 80.0 ) );
+        const bool dispatchProven = handlerRan || nullRan || strayRan || ranProbes != 0u || stamps.size() > 2 || !spans.empty()
+                                    || countedDispatches != 0;
+        {
+            std::vector<std::pair<double, double>> ranReadsMs;
+            if( handlerRan ) ranReadsMs.emplace_back( handlerStartMs, handlerEndMs );   // pass 9 A6: the whole handler, in one span
+            if( nullRan ) ranReadsMs.emplace_back( nullEnterMs, nullEnterMs );
+            if( strayRan ) ranReadsMs.emplace_back( strayRunMs, strayRunMs );
+            for( int i = 0; i < kR17A1MaxProbes; ++i )
+                if( ( ranProbes & ( 1u << static_cast<unsigned>( i ) ) ) != 0u ) ranReadsMs.emplace_back( probeRunMs[i], probeRunMs[i] );
+            const R17A1SampleJudgement judged = r17A1JudgeRecordThenLength( stamps, spans, ranReadsMs, countedDispatches, dispatchProven,
+                                                                            returnedMs - enteredMs, dueWakeSleepFloorMs( 80.0 ), true );
+            if( !judged.tag.empty() )
+            {
+                ::minitest::fail( __FILE__, __LINE__, judged.tag, "attempt=" + std::to_string( attempt ) + " " + judged.detail );
+                return;
+            }
+        }
+        // the product's own exit record, judged on EVERY sample (SEAM-1 adversary pass A3), after its dispatch record (pass 2 A4)
+        if( stamped ) ASSERT_TRUE( dueWakeSleepExitMet( sleepExit, exitMs, 80.0 ) );
+        else ASSERT_TRUE( sleepExit == PlaybackDueWake::RunnerSleepExit::None && exitMs == -1 );
+        // judged when the first handler ran in the sleep; otherwise the sender missed the sleep and it is retried -- never passed.
+        // adversary pass 1 A5: and the sleep dispatched at least TWICE: with every send taken in one batch (a GUI pause before the
+        // first dispatch) there is no second dispatch whose charge-before-handler order could be observed, so it is observed again
+        // pass 2 A3: only a record of exactly ONE dispatch is the batched sample; an EMPTY record with the handler run is a product
+        // that dropped its span, which is judged (and fails at dispatches >= 1 below), never retried away
+        // SEAM-1 A1: no sender-side stamp gates the sample (the probe-liveness gates are gone; the exit record judges the sleep)
+        // FOREIGN-FIRST-FLOOR-1 adversary pass 1 A1: the paused row is judged only on a sample whose WM_NULL handler held the GUI
+        // while the present was queued (the handler's own observation, never the product's span record); otherwise it is retried
+        // r3 (sol r2 B1): the two admissions are SPLIT, and the shared one is not loosened. An inherited arm still needs a second
+        // dispatch to witness (exactly one span is its batched sample, observed again). The paused floor row needs only the
+        // witnessed hold: the present and every probe coalescing into the held dispatch is a healthy, correctly charged sleep, and
+        // one span is judged in full below like any other count (an empty record still reaches dispatches >= 1 and fails there)
+        // r4 (sol r3 B1): the one-span row admits only the one-span sample it exists to judge (a span from any other source is
+        // observed again), so a restored `spans.size() != 1` gate discards every attempt and fails it with a typed reason
+        // r4 adversary pass 7 A1: the stray row admits only a sample whose stray ran inside the sleep in its OWN dispatch, one that
+        // began after the held WM_NULL's entry read: a stray that missed the sleep (the sender descheduled past 80 ms) or one the
+        // held batch took witnessed no separate dispatch, and is observed again
+        bool straySeparate = false;
+        if( strayRow && strayRan )
+        {
+            constexpr double kStrayRoundTripMs = 0.00005;              // assertChargedBeforeHandler's tolerance
+            for( const auto &span : spans )
+                if( span.first * 1000.0 <= strayRunMs + kStrayRoundTripMs && strayRunMs <= span.second * 1000.0 + kStrayRoundTripMs
+                    && span.first * 1000.0 > nullEnterMs )
+                    straySeparate = true;
+        }
+        const bool inheritedAdmits = spans.size() != 1;
+        const bool floorAdmits = pauseHeld && ( !oneSpanRow || spans.size() == 1 ) && ( !strayRow || straySeparate );
+        if( !handlerRan )
+        {
+            if( sentOk ) ++missedSend;                                 // sent, but its handler ran only after the sleep returned
+            else ++notSent;                                            // r4 (sol r3 B2): never sent at all
+        }
+        else if( stamps.empty() ) ++noStamps;
+        else if( floorRow && !pauseHeld ) ++holdNotWitnessed;
+        else if( oneSpanRow && spans.size() != 1 ) ++notOneSpan;
+        else if( strayRow && !straySeparate ) ++strayNotSeparate;
+        else if( !floorRow && !inheritedAdmits ) ++oneSpanInherited;
+        landed = handlerRan && !stamps.empty() && ( floorRow ? floorAdmits : inheritedAdmits );
+    }
+    // r3 (sol r2 B1): every attempt discarded is a loud failure naming why, never a vacuous pass
+    // r4 (sol r3 B2): and it is the FIRST check after the loop: the send assertion used to run before it, so a last attempt that
+    // never sent the present threw there and every count was lost. The send is asserted only on the landed attempt, below.
+    if( !landed )
+        ::minitest::fail( __FILE__, __LINE__, floorRow ? "R17A1_FLOOR_ROW_NOT_LANDED" : "R17A1_INHERITED_ARM_NOT_LANDED",
+                          "attempts=" + std::to_string( kAttempts ) + " not_sent=" + std::to_string( notSent )
+                              + " missed_send=" + std::to_string( missedSend ) + " no_stamps=" + std::to_string( noStamps )
+                              + " hold_not_witnessed=" + std::to_string( holdNotWitnessed )
+                              + " not_one_span=" + std::to_string( notOneSpan )
+                              + " stray_not_separate=" + std::to_string( strayNotSeparate )
+                              + " one_span_inherited=" + std::to_string( oneSpanInherited ) );
+    ASSERT_TRUE( landed );                                             // the send fell inside one of the sleeps
+    ASSERT_TRUE( sentOk );                                             // the landed attempt's present was sent (its handler ran)
+    ASSERT_TRUE( armed == armedDuringSleep );                         // SEAM-1 A4: the judged sleep ran with the wake as intended
+    // SEAM-1 A1: the sleep was never cut short at a dispatch, on the product's own exit decision: an expiry check left the loop
+    // only past the 80 ms on the elapsed value it compared, or the wait timed out (at most one timer tick early); no recorded
+    // exit, a failed wait or a wake is not a full interval
+    if( stamped ) ASSERT_TRUE( dueWakeSleepExitMet( sleepExit, exitMs, 80.0 ) );
+    else ASSERT_TRUE( sleepExit == PlaybackDueWake::RunnerSleepExit::None && exitMs == -1 );
     ASSERT_TRUE( slept == PlaybackDueWake::RunnerSleep::Slept );
-    // one segment per window: the old one was charged before the handler closed it, the new one only after it opened
-    ASSERT_EQ( 1, w.segments[0] );
-    ASSERT_EQ( 1, w.segments[1] );
-    ASSERT_TRUE( w.chargedS[0] * 1000.0 <= g_r17A1HandlerStartMs - enteredMs + 0.5 );
-    ASSERT_TRUE( w.chargedS[0] * 1000.0 >= 10.0 );                     // the ~20 ms before the send
-    ASSERT_TRUE( w.chargedS[1] * 1000.0 <= returnedMs - g_r17A1HandlerEndMs + 0.5 );
-    ASSERT_TRUE( w.chargedS[1] * 1000.0 >= 30.0 );                     // the rest of the 80 ms
-    // the two segments and the dispatch tile the sleep: the dispatch account is exactly what the segments leave out
-    const std::vector<std::pair<double, double>> spans = wake.lastRunnerSleepDispatchSpansS();
-    ASSERT_EQ( static_cast<size_t>( 1 ), spans.size() );
-    ASSERT_TRUE( spans[0].first * 1000.0 <= g_r17A1HandlerStartMs + 0.5 );
-    ASSERT_TRUE( spans[0].second * 1000.0 >= g_r17A1HandlerEndMs - 0.5 );
+    R17A1Windows &w = *wp;
+    // the dispatches the sleep recorded: the first send's, then each probe dispatch that was not taken in the same batch
+    const size_t dispatches = spans.size();
+    ASSERT_TRUE( dispatches >= 1 );
+    // the reads the sleep made on the caller clock: its entry, each dispatch's begin and end, and its return
+    ASSERT_EQ( 2 + 2 * dispatches, stamps.size() );
+    const double entryS = stamps[0];
+    const double dispatchStartS = stamps[1];
+    const double returnS = stamps[stamps.size() - 1];
+    ASSERT_TRUE( entryS * 1000.0 >= enteredMs - 1e-6 );                // the sleep ran between the test's own two reads (1e-6: the /1000 then *1000 round trip)
+    ASSERT_TRUE( returnS * 1000.0 <= returnedMs + 1e-6 );
+    ASSERT_TRUE( entryS < dispatchStartS );
+    for( size_t i = 1; i < stamps.size(); ++i ) ASSERT_TRUE( stamps[i - 1] <= stamps[i] );
+    // r4 (adversary pass 1 A5): EVERY segment is exactly [previous dispatch end, next dispatch begin] on the caller clock (the
+    // last one ends at the return), in order and in the right window, so a segment shifted at the second dispatch is caught even
+    // when the totals and the outer endpoints still match; a late sender moves the dispatches, never the identity. The one in the
+    // old window is charged before the first handler closed it, every other one in the new window. r3 (adversary pass 4 A2): the
+    // sink was handed those very endpoints, so a sink call shifted in time is caught too.
+    // r7 (sol review r6, hardening): an EMPTY segment (a dispatch ending at the read the next begins at, or at the return) is
+    // never handed out (PlaybackRunnerSleepSegments::take), so the expectation is built from the reads, not from dispatches + 1
+    // r10 (sol r9 B1): the window a segment belongs to is keyed on the dispatch the PRESENT's handler ran in -- the one recorded
+    // span that holds both of the handler's own reads -- never on dispatch 0: a foreign sent message (WM_NULL at 8 ms) dispatched
+    // before the present at 20 ms leaves window 0 open, so segments 0..presentDispatch go to window 0 and every later one to 1.
+    // The 50 ns round-trip tolerance is assertChargedBeforeHandler's below; spans are disjoint, so a ~2 ms handler fits one only.
+    constexpr double kPresentRoundTripMs = 0.00005;
+    size_t presentDispatch = dispatches;
+    size_t presentMatches = 0;
+    for( size_t k = 0; k < dispatches; ++k )
+    {
+        if( spans[k].first * 1000.0 <= handlerStartMs + kPresentRoundTripMs && handlerEndMs <= spans[k].second * 1000.0 + kPresentRoundTripMs )
+        {
+            presentDispatch = k;
+            ++presentMatches;
+        }
+    }
+    ASSERT_EQ( static_cast<size_t>( 1 ), presentMatches );            // the present ran inside exactly one dispatch the sleep recorded
+    // r3 (sol r2 B1; adversary pass 4 A1): the coalescing row really judges the coalesced sample: its handler held the GUI past
+    // every send, so the WM_NULL, the present and all five probes ran in ONE PeekMessageW -- the present's span holds the WM_NULL
+    // handler's entry read and every probe's read. Keyed on that span, never on the span COUNT: a later sent message from any
+    // source (the row's own stray at the held dispatch's end) is a further dispatch the row judges like any other
+    if( floorRow && coalesceInForeign )
+    {
+        const auto inPresentSpan = [&]( double ms ) {
+            return spans[presentDispatch].first * 1000.0 <= ms + kPresentRoundTripMs && ms <= spans[presentDispatch].second * 1000.0 + kPresentRoundTripMs;
+        };
+        ASSERT_TRUE( inPresentSpan( nullEnterMs ) );                   // the held WM_NULL ran in the present's dispatch
+        ASSERT_EQ( ( 1u << 5 ) - 1u, ranProbes );                     // all five probes ran...
+        for( int i = 0; i < 5; ++i ) ASSERT_TRUE( inPresentSpan( probeRunMs[i] ) );   // ...inside the held dispatch
+        // r4 (sol r3 B1): the one-span row judged a ONE-span sample (its admission took no other), so it is exactly the sample the
+        // r2 gate discarded: any admission that lets a two-span sample through to here fails, whichever line it is restored on
+        if( !strayAfterHeld ) ASSERT_EQ( static_cast<size_t>( 1 ), dispatches );
+        // r4 adversary pass 7 A1: the stray row judged a sample whose stray ran in exactly one dispatch AFTER the held one, so the
+        // stray's own dispatch (and its charge order, below) is really witnessed
+        if( strayAfterHeld )
+        {
+            ASSERT_TRUE( strayRan );
+            size_t strayMatches = 0;
+            for( size_t k = presentDispatch + 1; k < dispatches; ++k )
+                if( spans[k].first * 1000.0 <= strayRunMs + kPresentRoundTripMs && strayRunMs <= spans[k].second * 1000.0 + kPresentRoundTripMs )
+                    ++strayMatches;
+            ASSERT_EQ( static_cast<size_t>( 1 ), strayMatches );
+        }
+    }
+    const size_t kNoSegment = static_cast<size_t>( -1 );
+    std::vector<size_t> segmentOfDispatch( dispatches, kNoSegment );   // the segment the sink was handed when dispatch k began
+    double chargedOld = 0.0;
+    double chargedNew = 0.0;
+    size_t handed = 0;
+    for( size_t i = 0; i <= dispatches; ++i )
+    {
+        const double segmentStartS = stamps[2 * i];
+        const double segmentEndS = stamps[2 * i + 1];
+        if( !( segmentEndS > segmentStartS ) ) continue;               // empty: never handed out
+        ASSERT_TRUE( handed < w.segs.size() );
+        const R17A1Windows::Segment &seg = w.segs[handed];
+        ASSERT_EQ( i <= presentDispatch ? 0 : 1, seg.window );          // r10 (sol r9 B1): before the present's dispatch, window 0
+        ASSERT_TRUE( std::fabs( seg.startS - segmentStartS ) < 1e-9 );
+        ASSERT_TRUE( std::fabs( seg.endS - segmentEndS ) < 1e-9 );
+        if( i < dispatches ) segmentOfDispatch[i] = handed;
+        if( i <= presentDispatch ) chargedOld += segmentEndS - segmentStartS;
+        else chargedNew += segmentEndS - segmentStartS;
+        ++handed;
+    }
+    ASSERT_EQ( handed, w.segs.size() );
+    ASSERT_TRUE( std::fabs( w.chargedS[0] - chargedOld ) < 1e-9 );
+    ASSERT_TRUE( std::fabs( w.chargedS[1] - chargedNew ) < 1e-9 );
+    // r7 (sol review r6, blocker 4): every segment was charged BEFORE the handlers of the dispatch that closes it ran -- for EVERY
+    // dispatch, not the first alone. A probe handler leaves the windows as they are, so the windows prove the order for the first
+    // dispatch only; a charge moved to after a later dispatch kept every value observed. The proof is the clock: a handler's own
+    // QPC read (taken before the drain) lies inside exactly one recorded dispatch span, and the segment the sink was handed when
+    // that dispatch began must have been handed at or before that read. A charge after its dispatch is later than every handler in it.
+    // SEAM-1 adversary pass A10 (cd623269): the 1 us tolerance can match a handler to TWO adjacent spans; the first match used to
+    // end the search, so the segment of the dispatch the handler really ran in was never checked. Every matching span's segment
+    // must have been charged at or before the handler's read. The tolerance is 50 ns, not 1 us: the /1000 round trip of a
+    // QPC-ms value costs a few ulps (~1e-5 ms even after a year of uptime), and 50 ns is under one QPC tick (100 ns), so a handler
+    // read never matches the span of a dispatch that began on a later tick.
+    const auto assertChargedBeforeHandler = [&]( double handlerMs ) {
+        constexpr double kRoundTripMs = 0.00005;
+        size_t matched = 0;
+        for( size_t k = 0; k < dispatches; ++k )
+        {
+            if( !( spans[k].first * 1000.0 <= handlerMs + kRoundTripMs && handlerMs <= spans[k].second * 1000.0 + kRoundTripMs ) ) continue;
+            ++matched;
+            if( segmentOfDispatch[k] == kNoSegment ) continue;           // nothing was slept before this dispatch: nothing to charge
+            ASSERT_TRUE( w.segs[segmentOfDispatch[k]].chargedAtMs <= handlerMs );
+        }
+        ASSERT_TRUE( matched >= 1 );                                    // the handler ran inside a dispatch the sleep recorded
+    };
+    assertChargedBeforeHandler( handlerStartMs );
+    for( int i = 0; i < kR17A1MaxProbes; ++i )
+        if( ( ranProbes & ( 1u << static_cast<unsigned>( i ) ) ) != 0u ) assertChargedBeforeHandler( probeRunMs[i] );
+    // r3 adversary pass 5 A2 (sol r2 H2): the first WM_NULL's dispatch (a WM_NULL-only one in the unpaused foreign rows, the held
+    // one in the paused rows) and the stray's dispatch are proved the same way: a segment charged late, after the WM_NULL or the
+    // stray ran, fails here even when every later handler still sees it charged
+    if( nullRan ) assertChargedBeforeHandler( nullEnterMs );
+    if( strayRan ) assertChargedBeforeHandler( strayRunMs );
+    ASSERT_TRUE( w.chargedS[0] * 1000.0 <= handlerStartMs - enteredMs + 0.5 );
+    ASSERT_TRUE( w.chargedS[1] * 1000.0 <= returnedMs - handlerEndMs + 0.5 );
+    // CI-FLAKE-R17A1-FOREIGN-FIRST-FLOOR-1 (sol r10 B1, fable r10 B1): with a foreign WM_NULL first, the first dispatch is the
+    // WM_NULL's, and a GUI pause inside it takes the present in that same dispatch, so the old window is correctly charged only
+    // the time before the WM_NULL: a fixed 10 ms floor failed that healthy sleep. The floor follows a clock read the test took:
+    // the sender read its clock just before the WM_NULL send, so neither the WM_NULL's nor the present's dispatch began before
+    // that read, and the old window holds every slept (non-dispatch) instant between the entry stamp and that read.
+    // Adversary pass 1 A2: a sent message from ANOTHER source dispatched before the read is no sleep either, so the floor is the
+    // time from entry to the read LESS every recorded dispatch's overlap with it (dispatch time is never charged to a window).
+    // 1e-5: the /1000 then *1000 round trips and the sums taken in another order than the reads.
+    if( foreignFirst )
+    {
+        ASSERT_TRUE( foreignSentMs >= enteredMs );                      // the sender read after the sleep's entry stamp, so after the test's own entry read
+        const double entryMs = entryS * 1000.0;
+        double sleptBeforeSendMs = foreignSentMs - entryMs;
+        for( size_t k = 0; k < dispatches; ++k )
+        {
+            const double overlapMs = std::min( spans[k].second * 1000.0, foreignSentMs ) - std::max( spans[k].first * 1000.0, entryMs );
+            if( overlapMs > 0.0 ) sleptBeforeSendMs -= overlapMs;
+        }
+        ASSERT_TRUE( w.chargedS[0] * 1000.0 >= sleptBeforeSendMs - 1e-5 );
+    }
+    else ASSERT_TRUE( w.chargedS[0] * 1000.0 >= 10.0 );                // the sender waits 20 ms after the entry stamp: only later
+    // the sleep is never cut short at a dispatch: it runs the requested 80 ms (late only lengthens it)
+    // (r5: the floor is the request less one timer tick; a 20x run read 76.1-79.2 ms here, so the former 79.0 failed 9 of 20)
+    ASSERT_TRUE( ( returnS - entryS ) * 1000.0 >= dueWakeSleepFloorMs( 80.0 ) );
+    // the segments and the dispatches tile the sleep: the dispatch account is exactly what the segments leave out (1e-8: the
+    // sum is taken in another order than the reads, which costs a few ulps of a seconds-since-boot value)
+    double dispatchSpanS = 0.0;
+    for( size_t i = 0; i < dispatches; ++i )
+    {
+        ASSERT_TRUE( std::fabs( spans[i].first - stamps[2 * i + 1] ) < 1e-9 );
+        ASSERT_TRUE( std::fabs( spans[i].second - stamps[2 * i + 2] ) < 1e-9 );
+        dispatchSpanS += spans[i].second - spans[i].first;
+    }
+    ASSERT_TRUE( std::fabs( w.chargedS[0] + w.chargedS[1] + dispatchSpanS - ( returnS - entryS ) ) < 1e-8 );
+    // the present's dispatch span sits inside the handler's own reads' bracket: it began before the handler and ended after it
+    // (r10, sol r9 B1: the present's span, which is dispatch 0 only when no other sent message came first)
+    ASSERT_TRUE( spans[presentDispatch].first * 1000.0 <= handlerStartMs + 0.5 );
+    ASSERT_TRUE( spans[presentDispatch].second * 1000.0 >= handlerEndMs - 0.5 );
+    };
+    for( const bool stamped : { false, true } )                       // SEAM-1 r4 (pass 3 A1): the production seam-off configuration first
+    {
+        judgeSentWait( false, false, stamped, false, false, false, false );   // the wake idle: at least one judged attempt
+        judgeSentWait( true, false, stamped, false, false, false, false );    // SEAM-1 A4: the wake armed: at least one judged attempt
+        judgeSentWait( true, true, stamped, false, false, false, false );     // pass 2 A2: armed with the GUI trace on
+        judgeSentWait( false, false, stamped, true, false, false, false );    // r10 (sol r9 B1): a foreign WM_NULL dispatched before the present
+        judgeSentWait( true, true, stamped, true, false, false, false );      // ...armed, traced
+        judgeSentWait( false, false, stamped, true, true, false, false );     // FOREIGN-FIRST-FLOOR-1 (sol/fable r10 B1): the GUI paused inside the WM_NULL dispatch
+        judgeSentWait( false, false, stamped, true, true, true, false );      // r4 (sol r3 B1): ...paused past every send: exactly one coalesced span
+        judgeSentWait( false, false, stamped, true, true, true, true );       // r3 (sol r2 B1, pass 4 A1): ...and a stray after the held dispatch
+    }
+    wake.setTimingStampsForTest( false );
     // a sleep no dispatch cuts is one segment, charged to the window open at its end; NotHandled hands out none
     R17A1Windows plain;
-    ASSERT_TRUE( wake.sleepForSmokeRunner( 15, &r17A1NowS, &r17A1Charge, &plain ) == PlaybackDueWake::RunnerSleep::Slept );
+    g_r17A1Stamps.clear();
+    ASSERT_TRUE( wake.sleepForSmokeRunner( 15, &r17A1RecordingNowS, &r17A1Charge, &plain ) == PlaybackDueWake::RunnerSleep::Slept );
     ASSERT_EQ( 1, plain.segments[0] );
-    ASSERT_TRUE( plain.chargedS[0] * 1000.0 >= 12.0 );
+    ASSERT_EQ( static_cast<size_t>( 2 ), g_r17A1Stamps.size() );
+    ASSERT_TRUE( std::fabs( plain.chargedS[0] - ( g_r17A1Stamps[1] - g_r17A1Stamps[0] ) ) < 1e-9 );   // exactly entry to return
+    ASSERT_TRUE( std::fabs( plain.firstStartS[0] - g_r17A1Stamps[0] ) < 1e-9 );                        // ...with the clock's own endpoints
+    ASSERT_TRUE( std::fabs( plain.lastEndS[0] - g_r17A1Stamps[1] ) < 1e-9 );
+    ASSERT_TRUE( plain.chargedS[0] * 1000.0 >= dueWakeSleepFloorMs( 15.0 ) );   // the requested 15 ms less one timer tick: never ~0 ms
     PlaybackDueWake postWake( nullptr, []() {}, PlaybackDueWakeDeliveryMode::Post );
     R17A1Windows none;
     ASSERT_TRUE( postWake.sleepForSmokeRunner( 1, &r17A1NowS, &r17A1Charge, &none ) == PlaybackDueWake::RunnerSleep::NotHandled );
@@ -2702,6 +4476,57 @@ TEST(PlaybackDueWakeSend, R17A1_TheRunnerSleepChargesEverySegmentThroughOneSinkA
     const int resumed = sleep.indexOf( QStringLiteral( "segments.dispatchEnded( dispatchEndS );" ), dispatch );
     const int last = sleep.indexOf( QStringLiteral( "segmentEnded = segments.sleepEnds( spanNowS(), &segmentStartS, &segmentEndS );" ), resumed );
     ASSERT_TRUE( cut > 0 && charged > cut && dispatch > charged && resumed > dispatch && last > resumed );
+    // r7 (sol review r6, blocker 4): the order above is the FIRST textual occurrence of each; it holds for every dispatch only when
+    // there is exactly one dispatch site, one cut and one final segment, and no charge anywhere between the dispatch and the
+    // sleep's last segment (a charge of later segments moved after their dispatch is a second chargeSegment( call there). The live
+    // fixture proves the same order on the clock for every dispatch it observes (R17A1_TheSentWait...).
+    ASSERT_EQ( 1, sleep.count( QStringLiteral( "segments.dispatchBegins(" ) ) );
+    ASSERT_EQ( 1, sleep.count( QStringLiteral( "dispatchPendingSentMessages();" ) ) );
+    ASSERT_EQ( 1, sleep.count( QStringLiteral( "segments.sleepEnds(" ) ) );
+    ASSERT_EQ( 2, sleep.count( QStringLiteral( "chargeSegment( segmentEnded, segmentStartS, segmentEndS );" ) ) );
+    // adversary pass 1 A5: by TOKEN, so no spelling of a call ( `(chargeSegment)(...)`, a std::invoke, a copy of the lambda) slips
+    // past a literal `chargeSegment(`: the lambda's definition and its two calls are the only mentions, and none lies after the dispatch
+    const QRegularExpression chargeToken( QStringLiteral( "\\bchargeSegment\\b" ) );
+    ASSERT_EQ( 3, sleep.count( chargeToken ) );
+    ASSERT_EQ( 0, sleep.mid( dispatch, last - dispatch ).count( chargeToken ) );
+    // PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 (r7 adversary pass 12 A4): a charge after the dispatch need not go through
+    // chargeSegment -- a direct segmentSink( ... ) call there kept every chargeSegment count above. So the sink is pinned by token
+    // too. Derived from the source (py -3 -c: re.findall( r'\bsegmentSink\b' ) over this same body) = 5: the signature's
+    // parameter, the chargeSegment lambda's capture, `ended && segmentSink`, `segmentSink( segmentContext`, and the non-Windows
+    // `Q_UNUSED( segmentSink )`. None of them lies between the dispatch and the sleep's last segment.
+    const QRegularExpression sinkToken( QStringLiteral( "\\bsegmentSink\\b" ) );
+    ASSERT_EQ( 5, sleep.count( sinkToken ) );
+    ASSERT_EQ( 0, sleep.mid( dispatch, last - dispatch ).count( sinkToken ) );
+    // SEAM-1 adversary pass A4 (cd623269): a dispatch moved AHEAD of the charge through a wrapper defined outside this body, in a
+    // branch only some callers reach (armed, a short interval, a sink context), kept every count above. The class is a sleep
+    // whose shape depends on who calls it. So (1) the cut, the charge, the dispatch flag and the dispatch are four ADJACENT code
+    // lines, nothing between them; (2) the body calls exactly three dispatch* functions (dispatchBegins, dispatchPendingSentMessages,
+    // dispatchEnded) and sets the in-dispatch flag exactly twice; (3) the body never reads the wake's arm state or gate, and names
+    // its parameters only where it always did (derived, code only: segmentContext 4 -- signature, lambda capture, the sink call,
+    // Q_UNUSED; ms 4 -- signature, the two waitMs clamps, Q_UNUSED; waitMs 8, see below). The live fixture also judges an armed sleep.
+    const QString code = dueWakeCodeOnly( sleep );
+    QStringList codeLines;
+    for( const QString &raw : code.split( QLatin1Char( '\n' ) ) )
+        if( !raw.trimmed().isEmpty() ) codeLines << raw.trimmed();
+    const int cutLine = codeLines.indexOf( QStringLiteral( "segmentEnded = segments.dispatchBegins( dispatchStartS, &segmentStartS, &segmentEndS );" ) );
+    ASSERT_TRUE( cutLine > 0 && cutLine + 3 < codeLines.size() );
+    ASSERT_TRUE( codeLines[cutLine + 1] == QStringLiteral( "chargeSegment( segmentEnded, segmentStartS, segmentEndS );" ) );
+    ASSERT_TRUE( codeLines[cutLine + 2] == QStringLiteral( "d->inRunnerSleepDispatch = true;" ) );
+    ASSERT_TRUE( codeLines[cutLine + 3] == QStringLiteral( "dispatchPendingSentMessages();" ) );
+    ASSERT_TRUE( codeLines[cutLine - 1] == QStringLiteral( "const double dispatchStartS = spanNowS();" ) );
+    const QRegularExpression dispatchCall( QStringLiteral( "\\b(dispatch\\w*)\\s*\\(" ) );
+    QStringList dispatchCalls;
+    QRegularExpressionMatchIterator calls = dispatchCall.globalMatch( code );
+    while( calls.hasNext() ) dispatchCalls << calls.next().captured( 1 );
+    ASSERT_TRUE( dispatchCalls == ( QStringList() << QStringLiteral( "dispatchBegins" ) << QStringLiteral( "dispatchPendingSentMessages" )
+                                                  << QStringLiteral( "dispatchEnded" ) ) );
+    ASSERT_EQ( 2, code.count( QRegularExpression( QStringLiteral( "\\binRunnerSleepDispatch\\b" ) ) ) );
+    ASSERT_EQ( 0, code.count( QRegularExpression( QStringLiteral( "\\barmed\\b" ) ) ) );
+    ASSERT_EQ( 0, code.count( QRegularExpression( QStringLiteral( "\\bgate\\b" ) ) ) );
+    ASSERT_EQ( 4, code.count( QRegularExpression( QStringLiteral( "\\bsegmentContext\\b" ) ) ) );
+    ASSERT_EQ( 4, code.count( QRegularExpression( QStringLiteral( "\\bms\\b" ) ) ) );
+    // r10 (sol r9 B3): 6 in the seam build, plus master's two hasExpired( waitMs ) checks kept as the app build's #else branches
+    ASSERT_EQ( 8, code.count( QRegularExpression( QStringLiteral( "\\bwaitMs\\b" ) ) ) );
     const QString mainWindow = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
     const QString helper = functionBody( mainWindow, QStringLiteral( "void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )" ),
                                          QStringLiteral( "void MainWindow::waitGuiThreadForSmokeEvents( int maxMs )" ) );
@@ -2719,4 +4544,354 @@ TEST(PlaybackDueWakeSend, R17A1_TheRunnerSleepChargesEverySegmentThroughOneSinkA
     ASSERT_EQ( 1, segment.count( QStringLiteral( "m_guiHopWait.push( gui_hop_wait::Kind::RunnerSleep, startS, endS );" ) ) );
     ASSERT_EQ( 1, segment.count( QStringLiteral( "if( m_guiPresentGapStartNs >= 0 ) m_guiPresentGapRunnerSleepNs += segmentNs;" ) ) );
     ASSERT_EQ( 1, segment.count( QStringLiteral( "GpuDisplayWindow::noteSmokeRunnerSleepIfActive( segmentNs );" ) ) );
+}
+
+TEST(PlaybackDueWakeSend, SEAM1_TheTimingStampSeamIsOffByDefaultAndAddsNoClockReadOffItsFlag)
+{
+    // PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1: the test seam the A1-A3 verdicts read (setTimingStampsForTest) is off by default and
+    // costs the product path no clock read, store, call or allocation while off: every record is written under the one plain
+    // flag, the two rewritten expiry checks make the same single elapsed() read the former hasExpired made, and product code
+    // never turns it on.
+    const QString wakeSource = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
+    const QString sleep = functionBody( wakeSource, QStringLiteral( "PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner(" ),
+                                        QStringLiteral( "qint64 PlaybackDueWake::lastRunnerSleepDispatchNs() const" ) );
+    ASSERT_FALSE( sleep.isEmpty() );
+    const QString kSleepFlag = QStringLiteral( "if( d->timingStampsForTest )" );
+    const QString kImplFlag = QStringLiteral( "if( timingStampsForTest )" );
+    // every noteExit call is a flag branch (the lambda's own definition aside), one per way out of the loop
+    int noteExitCalls = 0;
+    int unflaggedElapsedReads = 0;
+    int unflaggedExitStores = 0;
+    for( const QString &raw : sleep.split( QLatin1Char( '\n' ) ) )
+    {
+        const QString line = raw.trimmed();
+        if( line.contains( QStringLiteral( "noteExit(" ) ) )
+        {
+            ASSERT_TRUE( line.startsWith( kSleepFlag ) );
+            ++noteExitCalls;
+        }
+        if( line.contains( QStringLiteral( "slept.elapsed()" ) ) && !line.startsWith( kSleepFlag ) ) ++unflaggedElapsedReads;
+        if( ( line.contains( QStringLiteral( "runnerSleepExitForTest =" ) ) || line.contains( QStringLiteral( "runnerSleepExitElapsedMsForTest =" ) ) )
+            && !line.startsWith( kSleepFlag ) )
+            ++unflaggedExitStores;
+    }
+    ASSERT_EQ( 5, noteExitCalls );                                      // WaitFailed, TimedOut, WokenBySent, the two expiry checks
+    // sleptMs and leftMs (pre-existing) and the two `const qint64 checkMs = slept.elapsed();` decision reads: nothing else
+    ASSERT_EQ( 4, unflaggedElapsedReads );
+    // adversary pass A1 (cd623269): the timeout records the interval its wait was asked to cover, from the two locals the wait
+    // was computed from -- no clock read after the wait returned
+    ASSERT_EQ( 1, sleep.count( QStringLiteral(
+        "if( d->timingStampsForTest ) noteExit( RunnerSleepExit::TimedOut, sleptMs + static_cast<qint64>( restMs ) );" ) ) );
+    // adversary pass A5 (cd623269): EVERY clock-read call in the sleep's code, by name, so an added read of any spelling (an
+    // extra slept.nsecsElapsed(), a second nowNs()) fails the pin, flag or no flag. Derived from the source (code only, comments
+    // cut): elapsed 6 (sleptMs, leftMs, the WaitFailed and WokenBySent notes under the flag, the two checkMs decision reads),
+    // start 1 (slept.start()), spanNowS 4 (the segments' origin, each dispatch's begin and end, the sleep's end), and the
+    // spanNowS lambda's own nowS 1 / nowNs 1
+    const QMap<QString, int> sleepClock = dueWakeClockCalls( dueWakeCodeOnly( sleep ) );
+    QMap<QString, int> expectedSleepClock;
+    expectedSleepClock[QStringLiteral( "elapsed" )] = 6;
+    expectedSleepClock[QStringLiteral( "start" )] = 1;
+    expectedSleepClock[QStringLiteral( "spanNowS" )] = 4;
+    expectedSleepClock[QStringLiteral( "nowS" )] = 1;
+    expectedSleepClock[QStringLiteral( "nowNs" )] = 1;
+    // r10 (sol r9 B3): and master's two hasExpired expiry checks, now the app build's #else branches of the two checkMs reads
+    expectedSleepClock[QStringLiteral( "hasExpired" )] = 2;
+    ASSERT_TRUE( sleepClock == expectedSleepClock );
+    // ...and in the native delivery: the gate's one nowNs() read, nothing else (the stamp records the wait thread's own stamp)
+    const QString deliver = functionBody( wakeSource, QStringLiteral( "    void deliverGeneration( quint32 generation, qint64 postTicks = 0, qint64 returnTicks = 0 )" ),
+                                          QStringLiteral( "\n    }\n" ) );
+    ASSERT_FALSE( deliver.isEmpty() );
+    const QMap<QString, int> deliverClock = dueWakeClockCalls( dueWakeCodeOnly( deliver ) );
+    ASSERT_EQ( 1, deliverClock.size() );
+    ASSERT_EQ( 1, deliverClock.value( QStringLiteral( "nowNs" ) ) );
+    // SEAM-1 adversary pass 2 A1-A3 (48ad052b): every pin above is a TEXT pattern, and each was routed around by a spelling it
+    // did not anticipate (a local lambda named MsgWaitForMultipleObjectsEx shortening the submitted timeout, a dispatch inside
+    // the charge lambda behind the GUI-trace flag, a parenthesized (::QueryPerformanceCounter)( &sample )). The class is "the
+    // off path does more than the reviewed code", so the two bodies are pinned EXACTLY: the SHA-256 of their comment-free,
+    // whitespace-collapsed code (dueWakeCodeOnly( body ).simplified()). Any added statement, call, read or branch changes it.
+    // Re-derive after a deliberate edit with derive-digests.py (PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 r2 run dir), the same
+    // normalization in Python, and re-review the off-path proof before updating these two constants.
+    const auto codeDigest = []( const QString & body ) {
+        return QString::fromLatin1( QCryptographicHash::hash( dueWakeCodeOnly( body ).simplified().toUtf8(), QCryptographicHash::Sha256 ).toHex() );
+    };
+    // r10 (sol r9 B3): re-derived with derive-r10.py (r10 run dir) after the seam lines moved under MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM
+    ASSERT_EQ( std::string( "da17a9e49544bbd04c0a1af2c1114ab6a7f7964b7c786e1ccc7f26a7354c3f76" ), codeDigest( sleep ).toStdString() );
+    ASSERT_EQ( std::string( "019ed08c0c559717f483eed8b7a95e4f03645991724d5b506061752a0b471892" ), codeDigest( deliver ).toStdString() );
+    // ...and outside the two bodies, the file-wide names a wrapper or a macro would have to reuse (code only): the one wait call,
+    // dispatchPendingSentMessages' definition and its two callers (the runner sleep, dispatchSentMessages), the three QPC reads
+    // (frequency aside) the wait thread and the clock make, and the file's one #define
+    const QString wakeCode = dueWakeCodeOnly( wakeSource );
+    ASSERT_EQ( 1, wakeCode.count( QRegularExpression( QStringLiteral( "\\bMsgWaitForMultipleObjectsEx\\b" ) ) ) );
+    ASSERT_EQ( 3, wakeCode.count( QRegularExpression( QStringLiteral( "\\bdispatchPendingSentMessages\\b" ) ) ) );
+    ASSERT_EQ( 3, wakeCode.count( QRegularExpression( QStringLiteral( "\\bQueryPerformanceCounter\\b" ) ) ) );
+    ASSERT_EQ( 1, wakeCode.count( QRegularExpression( QStringLiteral( "\\bdefine\\b" ) ) ) );
+    ASSERT_EQ( 2, sleep.count( QStringLiteral( "const qint64 checkMs = slept.elapsed();" ) ) );
+    ASSERT_EQ( 2, unflaggedExitStores );                                // the noteExit lambda's two stores, run only under the flag
+    ASSERT_EQ( 1, sleep.count( QStringLiteral( "const auto noteExit = [this]( RunnerSleepExit exit, qint64 elapsedMs )" ) ) );
+    // r10 (sol r9 B3): master's two hasExpired checks, kept verbatim as the #else (app build) branches of the two checkMs reads
+    ASSERT_EQ( 2, sleep.count( QStringLiteral( "#else\n            if( slept.hasExpired( static_cast<qint64>( waitMs ) ) ) break;\n#endif" ) )
+                  + sleep.count( QStringLiteral( "#else\n        if( slept.hasExpired( static_cast<qint64>( waitMs ) ) ) break;\n#endif" ) ) );
+    ASSERT_EQ( 2, sleep.count( QStringLiteral( "hasExpired(" ) ) );
+    ASSERT_EQ( 2, sleep.count( QStringLiteral( "if( static_cast<quint64>( checkMs ) > static_cast<quint64>( waitMs ) )" ) ) );
+    // the delivery's pre-send stamp record: written only under the Impl's flag, outside the setter and the declaration
+    int stampStores = 0;
+    for( const QString &raw : wakeSource.split( QLatin1Char( '\n' ) ) )
+    {
+        const QString line = raw.trimmed();
+        if( !line.contains( QStringLiteral( "firingFirstStampMsForTest =" ) ) ) continue;
+        if( line == QStringLiteral( "double firingFirstStampMsForTest = -1.0;" ) ) continue;              // the declaration
+        if( line == QStringLiteral( "d->firingFirstStampMsForTest = -1.0;" ) ) continue;                  // the setter's reset
+        ASSERT_TRUE( line.startsWith( kImplFlag ) );
+        ++stampStores;
+    }
+    ASSERT_EQ( 2, stampStores );                                        // set after the gate accepts, cleared after onFire
+    ASSERT_EQ( 1, wakeSource.count( QStringLiteral( "bool timingStampsForTest = false;" ) ) );
+    // product code never turns it on, nor reads it
+    for( const QString &file : { QStringLiteral( "platform/qt/MainWindow.cpp" ), QStringLiteral( "platform/qt/MainWindow.h" ) } )
+    {
+        const QString mainWindow = dueWakeRepoSource( file );
+        ASSERT_FALSE( mainWindow.isEmpty() );
+        ASSERT_FALSE( mainWindow.contains( QStringLiteral( "setTimingStampsForTest" ) ) );
+        ASSERT_FALSE( mainWindow.contains( QStringLiteral( "lastRunnerSleepExitForTest" ) ) );
+        ASSERT_FALSE( mainWindow.contains( QStringLiteral( "lastRunnerSleepExitElapsedMsForTest" ) ) );
+        ASSERT_FALSE( mainWindow.contains( QStringLiteral( "lastDeliveryFirstStampMsForTest" ) ) );
+    }
+#ifdef Q_OS_WIN
+    // live: off by default nothing is recorded; on, a plain sleep records its own exit; the setter resets the records
+    PlaybackDueWake wake( nullptr, []() {}, PlaybackDueWakeDeliveryMode::SendNotify );
+    ASSERT_TRUE( wake.sleepForSmokeRunner( 20 ) == PlaybackDueWake::RunnerSleep::Slept );
+    ASSERT_TRUE( wake.lastRunnerSleepExitForTest() == PlaybackDueWake::RunnerSleepExit::None );
+    ASSERT_EQ( static_cast<qint64>( -1 ), wake.lastRunnerSleepExitElapsedMsForTest() );
+    ASSERT_TRUE( wake.lastDeliveryFirstStampMsForTest() == -1.0 );   // the exact "none" sentinel
+    wake.setTimingStampsForTest( true );
+    ASSERT_TRUE( wake.sleepForSmokeRunner( 20 ) == PlaybackDueWake::RunnerSleep::Slept );
+    ASSERT_TRUE( wake.lastRunnerSleepExitForTest() != PlaybackDueWake::RunnerSleepExit::None );
+    ASSERT_TRUE( dueWakeSleepExitMet( wake.lastRunnerSleepExitForTest(), wake.lastRunnerSleepExitElapsedMsForTest(), 20.0 ) );
+    wake.setTimingStampsForTest( false );
+    ASSERT_TRUE( wake.lastRunnerSleepExitForTest() == PlaybackDueWake::RunnerSleepExit::None );
+    ASSERT_EQ( static_cast<qint64>( -1 ), wake.lastRunnerSleepExitElapsedMsForTest() );
+    // the exit rule itself: an expiry only past the request, a timeout at most one tick early, anything else never
+    typedef PlaybackDueWake::RunnerSleepExit X;
+    ASSERT_TRUE( dueWakeSleepExitMet( X::ExpiredAfterDispatch, 81, 80.0 ) );
+    ASSERT_FALSE( dueWakeSleepExitMet( X::ExpiredAfterDispatch, 80, 80.0 ) );
+    ASSERT_FALSE( dueWakeSleepExitMet( X::ExpiredAfterDispatch, 48, 80.0 ) );
+    ASSERT_FALSE( dueWakeSleepExitMet( X::ExpiredAfterOtherWake, 16, 150.0 ) );
+    // adversary pass A1 (cd623269): a timeout is judged on the interval its wait was asked to cover, with no tick slack: the
+    // adversary's input (a zero-rest wait asked at 49 ms, a GUI paused until 65 ms) records 49 and fails
+    ASSERT_TRUE( dueWakeSleepExitMet( X::TimedOut, 80, 80.0 ) );
+    ASSERT_FALSE( dueWakeSleepExitMet( X::TimedOut, 79, 80.0 ) );
+    ASSERT_FALSE( dueWakeSleepExitMet( X::TimedOut, 64, 80.0 ) );
+    ASSERT_FALSE( dueWakeSleepExitMet( X::TimedOut, 49, 80.0 ) );
+    ASSERT_FALSE( dueWakeSleepExitMet( X::None, 200, 80.0 ) );
+    ASSERT_FALSE( dueWakeSleepExitMet( X::WaitFailed, 200, 80.0 ) );
+    ASSERT_FALSE( dueWakeSleepExitMet( X::WokenBySent, 200, 80.0 ) );
+#endif
+}
+
+TEST(PlaybackDueWakeSend, SEAM1_ASplicedCommentCannotHideAnAppBuildDirectiveFromThePins)
+{
+    // CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1, adversary pass A1 on e60d41b6, its input: a physical line `// \` inserted
+    // just before each `#else` of PlaybackDueWake.cpp. The compiler splices it onto the `#else`, so both seam `#else` branches
+    // (the app build's expiry checks) are cut from the app build. The app-build digest view of the physical lines did not change.
+    const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
+    ASSERT_FALSE( source.isEmpty() );
+    ASSERT_TRUE( dueWakeSpliceLines( source ) == source );            // the pinned file has no line splice: its pins are unchanged
+    QStringList hostile;
+    int inserted = 0;
+    for( const QString &line : source.split( QLatin1Char( '\n' ) ) )
+    {
+        if( line.trimmed() == QStringLiteral( "#else" ) )
+        {
+            hostile << QStringLiteral( "// \\" );
+            ++inserted;
+        }
+        hostile << line;
+    }
+    ASSERT_TRUE( inserted >= 2 );
+    const QString hostileText = hostile.join( QLatin1Char( '\n' ) );
+    const auto appView = []( const QString &text ) { return dueWakeNoComments( dueWakeAppBuildView( text ) ).simplified(); };
+    ASSERT_TRUE( appView( hostileText ) == appView( source ) );        // the r5 reader's blind spot: physical lines, same view
+    ASSERT_FALSE( appView( dueWakeSpliceLines( hostileText ) ) == appView( source ) );   // read as compiled, the cut branches show
+    // trailing blanks after the backslash splice too (GCC), and a backslash that does not end its line splices nothing
+    ASSERT_EQ( std::string( "// #else" ), dueWakeSpliceLines( QStringLiteral( "// \\  \n#else" ) ).toStdString() );
+    ASSERT_EQ( std::string( "a \\ b\nc" ), dueWakeSpliceLines( QStringLiteral( "a \\ b\nc" ) ).toStdString() );
+}
+
+TEST(PlaybackDueWakeSend, SEAM1_TheTimingSeamIsCompiledOutOfTheAppBuild)
+{
+    // PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 r10 (sol r9 B3 / luna key3 r9 B1, the round-tail ruling's step 5): with the flag off the
+    // seam still ran its flag loads and branches on the production path (two per accepted native delivery, up to three per runner
+    // sleep). The off path must execute nothing beyond master's, so the seam is compiled only where MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM
+    // is defined (console_tests.pro), and the app build compiles master's source: the source as the app build sees it (each seam
+    // #ifdef branch cut, its #else kept: dueWakeAppBuildView), comment-free and whitespace-collapsed, IS fork/master's, by SHA-256
+    // (derive-r10.py in the r10 run dir, fork/master 2b796198 -- re-derive when master edits either file). The disassembly of the
+    // app build's object against master's is in the r10 run dir (disasm-*.txt).
+    const QString cpp = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
+    const QString hdr = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.h" ) );
+    ASSERT_FALSE( cpp.isEmpty() );
+    ASSERT_FALSE( hdr.isEmpty() );
+    const auto appDigest = []( const QString & source ) {
+        return QString::fromLatin1( QCryptographicHash::hash( dueWakeNoComments( dueWakeAppBuildView( source ) ).simplified().toUtf8(),
+                                                              QCryptographicHash::Sha256 ).toHex() );
+    };
+    ASSERT_EQ( std::string( "ae2cad7bc536d51b2727a890c90d0031475099768c01878126631c4f1d0eb69a" ), appDigest( cpp ).toStdString() );
+    ASSERT_EQ( std::string( "2a6f46a2041befe951831158c9be6ada9414907bd86b415c395b1809f31bf5fd" ), appDigest( hdr ).toStdString() );
+    // ...so no seam name reaches the app build (the digest says it; this names the class directly)
+    const QString appCode = dueWakeNoComments( dueWakeAppBuildView( cpp ) ) + dueWakeNoComments( dueWakeAppBuildView( hdr ) );
+    for( const char *name : { "timingStampsForTest", "noteExit", "RunnerSleepExit", "runnerSleepExitForTest", "runnerSleepExitElapsedMsForTest",
+                              "firingFirstStampMsForTest", "checkMs", "setTimingStampsForTest", "lastRunnerSleepExitForTest",
+                              "lastRunnerSleepExitElapsedMsForTest", "lastDeliveryFirstStampMsForTest" } )
+        ASSERT_EQ( 0, appCode.count( QRegularExpression( QStringLiteral( "\\b%1\\b" ).arg( QString::fromLatin1( name ) ) ) ) );
+    // the macro is named only by plain #ifdef lines (an #ifndef, #if defined(...) or #define of it is outside the view's model)
+    for( const QString *source : { &cpp, &hdr } )
+    {
+        for( const QString &raw : source->split( QLatin1Char( '\n' ) ) )
+        {
+            const QString line = raw.trimmed();
+            if( !line.contains( QStringLiteral( "MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM" ) ) || line.startsWith( QStringLiteral( "//" ) ) ) continue;
+            ASSERT_TRUE( line == QStringLiteral( "#ifdef MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM" ) );
+        }
+    }
+    // the Impl's fields, the delivery's two stamp writes, the sleep's six (entry reset + noteExit, then one per way out of its
+    // loop), and one around the setter's and the three getters' definitions
+    ASSERT_EQ( 10, cpp.count( QStringLiteral( "\n#ifdef MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM\n" ) ) );
+    ASSERT_EQ( 1, hdr.count( QStringLiteral( "\n#ifdef MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM\n" ) ) );
+    // only the console test build defines it; the app's project never does
+    const QString appPro = dueWakeRepoSource( QStringLiteral( "platform/qt/MLVApp.pro" ) );
+    const QString testPro = dueWakeRepoSource( QStringLiteral( "tests/console/console_tests.pro" ) );
+    ASSERT_FALSE( appPro.isEmpty() );
+    ASSERT_FALSE( testPro.isEmpty() );
+    ASSERT_FALSE( appPro.contains( QStringLiteral( "MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM" ) ) );
+    ASSERT_EQ( 1, testPro.count( QStringLiteral( "\nDEFINES += MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM\n" ) ) );
+    // the view itself: a seam branch is cut with its directives, its #else kept, a nested plain #if inside it cut too
+    ASSERT_EQ( std::string( "a\nkeep\nz" ),
+               dueWakeAppBuildView( QStringLiteral( "a\n#ifdef MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM\nseam\n#ifdef Q_OS_WIN\nw\n#endif\n#else\nkeep\n#endif\nz" ) )
+                   .toStdString() );
+    ASSERT_EQ( std::string( "#ifdef Q_OS_WIN\nw\n#else\nv\n#endif" ),
+               dueWakeAppBuildView( QStringLiteral( "#ifdef Q_OS_WIN\nw\n#else\nv\n#endif" ) ).toStdString() );
+}
+
+TEST(PlaybackDueWakeSend, SEAM1_TheRunnerSleepCallClosureIsPinnedAndRunsNoMessagePumpBeforeItsCharge)
+{
+    // PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 r4 (adversary pass 3 A1 on 91820e1e): a PeekMessageW( &pending, ..., PM_QS_SENDMESSAGE )
+    // in noteRunnerSleep (seam off, armed, traced) ran a foreign handler before the old window's charge, and every pin accepted it:
+    // the two digests cover the sleep's and the delivery's bodies only, the file-wide counts named no PeekMessage*, and the exact-text
+    // Peek pin matched one spelling. The class is a pin that guards named tokens or chosen bodies, not every path that can dispatch
+    // messages before the charge. So the runner sleep's whole CALL CLOSURE in PlaybackDueWake.cpp / .h is pinned: (1) the SHA-256 of
+    // every closure body's comment-free, whitespace-collapsed code (dueWakeNoComments( body ).simplified()), so no statement, call or
+    // branch is added to any function the sleep reaches; (2) the call names of the closure are exactly the closure members, the
+    // sleep's three local lambdas, the caller's two callbacks and a fixed set of leaves; (3) each body's message-pump tokens BY NAME
+    // (so `(PeekMessageW)(`, `&PeekMessageW` or a wrapper count too): none outside the sleep's one wait and its one dispatch, and
+    // that dispatch's one PeekMessageW; (4) the file-wide pump-token maps and the leaf names a shadow definition would reuse. The live
+    // judge (R17A1_TheSentWait...) runs the same sleeps with the seam OFF too. Every value is derived with derive-closure.py in the r4
+    // run dir (the same normalization in Python); re-derive and re-review the off-path proof before changing any of them.
+    // OPEN, outside this card: the caller's callbacks (MainWindow's mlv_stage_timing_now lambda and chargeSmokeRunnerSleepSegmentSink).
+    const QString cpp = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
+    const QString hdr = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.h" ) );
+    ASSERT_FALSE( cpp.isEmpty() );
+    ASSERT_FALSE( hdr.isEmpty() );
+    struct ClosureBody
+    {
+        const char *name;
+        bool header;
+        const char *signature;
+        const char *next;
+        const char *digest;
+        const char *pumps;                                              // the body's pump tokens, "name=count" sorted, comma-joined
+    };
+    static const ClosureBody kClosure[] = {
+        { "sleepForSmokeRunner", false, "PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner(",
+          "qint64 PlaybackDueWake::lastRunnerSleepDispatchNs() const",
+          "da17a9e49544bbd04c0a1af2c1114ab6a7f7964b7c786e1ccc7f26a7354c3f76", "MsgWaitForMultipleObjectsEx=1,dispatchPendingSentMessages=1" },
+        { "sendsNotify", false, "bool PlaybackDueWake::sendsNotify() const", "PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner(",
+          "fac07298323f6e29dc2a9a25e2a8d2aab74fac1b9c68db12dc48fde59390f122", "" },
+        { "noteRunnerSleep", false, "void PlaybackDueWake::noteRunnerSleep( bool sleeping )",
+          "PlaybackGuiSleepTrace::At PlaybackDueWake::guiStateAt( double ms ) const",
+          "2a09f646a880ce271b4b0d33d0c6995b7309ecd6de2c4a72e3e67e6b7bb4d955", "" },
+        { "Impl::nowMs", false, "    double nowMs() const {", "    PlaybackGuiSleepTrace::At guiStateAt( double ms ) const",
+          "737fc66e1a686eec951a4380eef63baebeaf5404b3bd9066b6960aa2f002212b", "" },
+        { "Impl::ticksToNs+nowNs", false, "    static qint64 ticksToNs( qint64 ticks, qint64 frequency )", "    // the notifier / Qt timer paths",
+          "29d88d7d3fb7ef1431271d5f55e20ec0414a9d22d088c51c301fe7ddafaa10d3", "" },
+        { "dispatchPendingSentMessages", false, "void dispatchPendingSentMessages()", "bool registerDueWakeWindowClass()",
+          "e75f2ca0ee7ba499bef7bedf96e4cd5f1943d1a35431b226e1f4449d9162cdcb", "PeekMessageW=1,dispatchPendingSentMessages=1" },
+        { "PlaybackGuiSleepTrace::note", true, "    void note( State entered, double ms )", "    At at( double ms ) const",
+          "6aa167329468c6c2f1545818d6c2077bb941d79ccf60d998cbfcbff74ebb65f7", "" },
+        { "PlaybackGuiSleepTrace::slot", true, "    static std::size_t slot( std::size_t index )", "    std::array<Entry, kCapacity> m_ring {};",
+          "7faf3263e46c512976f61e57c76bb4d72af3c0ba6cc2bed877a4faadd57ed6b9", "" },
+        { "PlaybackRunnerSleepSegments", true, "struct PlaybackRunnerSleepSegments", "\nclass PlaybackDueWake\n",
+          "42313e0096eccc1d8bb85239e5a168b71bce4795c1b2e8999b91df095bb084fc", "" },
+    };
+    // every name that can pump or dispatch messages, Win32 or Qt, or reach this wake's own delivery (matched as a NAME, call or not)
+    static const QRegularExpression pump( QStringLiteral(
+        "\\b(PeekMessage\\w*|GetMessage\\w*|DispatchMessage\\w*|TranslateMessage\\w*|SendMessage\\w*|SendNotifyMessage\\w*|"
+        "PostMessage\\w*|PostThreadMessage\\w*|MsgWaitForMultipleObjects\\w*|WaitMessage|CallWindowProc\\w*|DefWindowProc\\w*|"
+        "DialogBox\\w*|MessageBox\\w*|processEvents|sendPostedEvents|sendEvent|QEventLoop|exec|GetProcAddress|"
+        "dispatchPendingSentMessages|dispatchSentMessages|handleNativeMessage|holdWindowProcWake|dueWakeWindowProc|"
+        "onFire|deliverGeneration|deliverCurrent|deliverLostPost)\\b" ) );
+    const auto pumpMap = [&]( const QString & code ) {
+        QMap<QString, int> counts;
+        QRegularExpressionMatchIterator it = pump.globalMatch( code );
+        while( it.hasNext() ) ++counts[it.next().captured( 1 )];
+        QStringList parts;
+        for( auto entry = counts.cbegin(); entry != counts.cend(); ++entry )
+            parts << entry.key() + QLatin1Char( '=' ) + QString::number( entry.value() );
+        return parts.join( QLatin1Char( ',' ) );
+    };
+    static const QRegularExpression call( QStringLiteral( "\\b([A-Za-z_]\\w*)\\s*\\(" ) );
+    const QStringList keywords = { QStringLiteral( "if" ), QStringLiteral( "for" ), QStringLiteral( "while" ), QStringLiteral( "switch" ),
+                                   QStringLiteral( "return" ), QStringLiteral( "sizeof" ) };
+    QStringList calls;
+    for( const ClosureBody &entry : kClosure )
+    {
+        const QString body = functionBody( entry.header ? hdr : cpp, QString::fromLatin1( entry.signature ), QString::fromLatin1( entry.next ) );
+        ASSERT_FALSE( body.isEmpty() );
+        const QString code = dueWakeNoComments( body );
+        const QString digest = QString::fromLatin1(
+            QCryptographicHash::hash( code.simplified().toUtf8(), QCryptographicHash::Sha256 ).toHex() );
+        if( digest != QString::fromLatin1( entry.digest ) ) std::fprintf( stderr, "closure body %s digest %s\n", entry.name, qPrintable( digest ) );
+        ASSERT_EQ( std::string( entry.digest ), digest.toStdString() );
+        ASSERT_EQ( std::string( entry.pumps ), pumpMap( code ).toStdString() );
+        QRegularExpressionMatchIterator it = call.globalMatch( code );
+        while( it.hasNext() )
+        {
+            const QString name = it.next().captured( 1 );
+            if( !keywords.contains( name ) ) calls << name;
+        }
+    }
+    calls.removeDuplicates();
+    calls.sort();
+    // the closure members (the bodies above, with PlaybackRunnerSleepSegments' take / dispatchBegins / dispatchEnded / sleepEnds), the
+    // sleep's local lambdas (spanNowS, noteExit, chargeSegment) and its `segments` object, the caller's callbacks (nowS, segmentSink),
+    // and the leaves: Win32 GetQueueStatus / HIWORD / MsgWaitForMultipleObjectsEx / PeekMessageW / QueryPerformanceCounter, Qt
+    // QElapsedTimer start / elapsed / nsecsElapsed and QThread::msleep, std max / llround and the vector's clear / size / emplace_back
+    ASSERT_EQ( std::string( "GetQueueStatus,HIWORD,MsgWaitForMultipleObjectsEx,PeekMessageW,PlaybackRunnerSleepSegments,Q_UNUSED,"
+                            "QueryPerformanceCounter,chargeSegment,clear,dispatchBegins,dispatchEnded,dispatchPendingSentMessages,double,"
+                            "elapsed,emplace_back,hasExpired,llround,max,msleep,note,noteExit,noteRunnerSleep,nowMs,nowNs,nowS,nsecsElapsed,"
+                            "segmentSink,segmentStartS,segments,sendsNotify,size,sleepEnds,sleepForSmokeRunner,slot,spanNowS,start,take,"
+                            "ticksToNs" ),
+               calls.join( QLatin1Char( ',' ) ).toStdString() );
+    // file-wide (code only, comments cut): every pump token by name, so a pump added anywhere in either file -- a new helper the
+    // closure would have to call, a shadow of a closure name -- changes the map; and the leaf names a shadow definition or a
+    // macro would reuse
+    const QString cppCode = dueWakeNoComments( cpp );
+    const QString hdrCode = dueWakeNoComments( hdr );
+    ASSERT_EQ( std::string( "DefWindowProcW=1,GetProcAddress=2,MsgWaitForMultipleObjectsEx=1,PeekMessageW=1,PostMessageW=1,"
+                            "SendNotifyMessageW=1,deliverCurrent=4,deliverGeneration=3,deliverLostPost=1,dispatchPendingSentMessages=3,"
+                            "dispatchSentMessages=1,dueWakeWindowProc=2,handleNativeMessage=4,holdWindowProcWake=2,onFire=10" ),
+               pumpMap( cppCode ).toStdString() );
+    ASSERT_EQ( std::string( "deliverLostPost=1,dispatchSentMessages=1,handleNativeMessage=1,holdWindowProcWake=1,onFire=2" ),
+               pumpMap( hdrCode ).toStdString() );
+    const auto tokens = []( const QString & code, const char *name ) {
+        return code.count( QRegularExpression( QStringLiteral( "\\b%1\\b" ).arg( QString::fromLatin1( name ) ) ) );
+    };
+    ASSERT_EQ( 1, tokens( cppCode, "define" ) );
+    ASSERT_EQ( 1, tokens( cppCode, "GetQueueStatus" ) );
+    ASSERT_EQ( 1, tokens( cppCode, "HIWORD" ) );
+    ASSERT_EQ( 2, tokens( cppCode, "msleep" ) );
+    ASSERT_EQ( 3, tokens( cppCode, "QueryPerformanceCounter" ) );
+    ASSERT_EQ( 1, tokens( cppCode, "nsecsElapsed" ) );
+    ASSERT_EQ( 1, tokens( cppCode, "llround" ) );
+    ASSERT_EQ( 1, tokens( hdrCode, "define" ) );
+    for( const char *leaf : { "GetQueueStatus", "HIWORD", "msleep", "QueryPerformanceCounter", "nsecsElapsed", "llround" } )
+        ASSERT_EQ( 0, tokens( hdrCode, leaf ) );
 }

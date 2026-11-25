@@ -1250,17 +1250,6 @@ int get_mlv_raw_frame_debayered_from_processed_raw_u16( mlvObject_t * video,
      * when MLVAPP_PIPELINE_CAPTURE_DIR is unset. */
     if( mlv_pipeline_capture_should_capture_frame(frame_index) )
     {
-        const char * debayer_label =
-            debayer_type == 0 ? "none"   :
-            debayer_type == 1 ? "amaze"  :
-            debayer_type == 2 ? "easy"   :
-            debayer_type == 3 ? "bilinear" :
-            debayer_type == 4 ? "ahd"    :
-            debayer_type == 5 ? "rcd"    :
-            debayer_type == 6 ? "dcb"    :
-            debayer_type == 7 ? "lmmse"  :
-            debayer_type == 8 ? "igv"    :
-            "unknown";
         mlv_pipeline_capture_meta_t meta;
         memset(&meta, 0, sizeof meta);
         meta.stage = MLV_PIPELINE_STAGE_S3_DEBAYER;
@@ -1273,7 +1262,7 @@ int get_mlv_raw_frame_debayered_from_processed_raw_u16( mlvObject_t * video,
         meta.channels = 3;
         meta.bit_depth = 16;
         meta.dual_iso_mode = NULL;
-        meta.debayer_mode = debayer_label;
+        meta.debayer_mode = getMlvDebayerName(debayer_type);
         meta.scaler = "none";
         meta.path_label = capture_path_label;
         mlv_pipeline_capture(frame_index, output_frame, &meta);
@@ -1286,7 +1275,7 @@ static int get_mlv_raw_frame_debayered_checked( mlvObject_t * video,
                                                 float * temp_memory,
                                                 uint16_t * output_frame,
                                                 int debayer_type,
-                                                int isolated_analysis ) /* 0=bilinear 1=amaze ... */
+                                                int isolated_analysis ) /* debayer_type: see getMlvDebayerName */
 {
     int width = getMlvWidth(video);
     int height = getMlvHeight(video);

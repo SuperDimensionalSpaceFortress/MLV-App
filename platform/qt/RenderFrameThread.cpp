@@ -1429,17 +1429,18 @@ bool RenderFrameThread::upstreamWorkInFlightLocked( int excludeSlotIndex ) const
     return false;
 }
 
-bool RenderFrameThread::acquireLatestReadyFrame(ReadyFrame *frame)
+bool RenderFrameThread::acquireLatestReadyFrame(ReadyFrame *frame, bool oldestFirst)
 {
     QMutexLocker locker(&m_mutex);
-    const int readySlotIndex = findLatestReadySlotLocked();
+    // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r8: every-frame Play takes the oldest ready frame and discards nothing
+    const int readySlotIndex = oldestFirst ? findOldestReadySlotLocked() : findLatestReadySlotLocked();
     if( readySlotIndex < 0 )
     {
         m_frameReady = false;
         return false;
     }
 
-    return acquireReadySlotLocked( frame, readySlotIndex, true );
+    return acquireReadySlotLocked( frame, readySlotIndex, !oldestFirst );
 }
 
 bool RenderFrameThread::acquireOldestGpuTextureNoReadbackReadyFrame(ReadyFrame *frame)
@@ -1545,13 +1546,14 @@ bool RenderFrameThread::acquireOldestGpuTextureNoReadbackReadyFrameForPlaybackTa
 bool RenderFrameThread::acquireLatestReadyFrameForPlaybackTarget(
     ReadyFrame *frame,
     int activePlaybackTarget,
-    uint64_t activeGeneration )
+    uint64_t activeGeneration,
+    bool oldestFirst )
 {
     QMutexLocker locker(&m_mutex);
     // fix 2 (adversary A1 on 4bbdcd9a): a retired generation's lookahead slot is skipped below, so it is freed here
     releaseRetiredPlaybackLookaheadSlotsLocked( activeGeneration );
     int readySlotIndex = -1;
-    uint64_t latestRequestSerial = 0;
+    uint64_t chosenRequestSerial = 0;
     for( int i = 0; i < static_cast<int>( m_frameSlots.size() ); ++i )
     {
         const FrameSlot &slot = m_frameSlots[i];
@@ -1563,10 +1565,12 @@ bool RenderFrameThread::acquireLatestReadyFrameForPlaybackTarget(
         {
             continue;
         }
-        if( readySlotIndex < 0 || slot.requestSerial >= latestRequestSerial )
+        // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r8: every-frame Play takes the OLDEST ready frame (oldestFirst), so a ready
+        // frame never overtakes an older ready one (the venue's skip_backward drops); otherwise the newest, as before
+        if( playback_frame_range::readySlotPreferred( oldestFirst, readySlotIndex >= 0, slot.requestSerial, chosenRequestSerial ) )
         {
             readySlotIndex = i;
-            latestRequestSerial = slot.requestSerial;
+            chosenRequestSerial = slot.requestSerial;
         }
     }
     if( readySlotIndex < 0 )

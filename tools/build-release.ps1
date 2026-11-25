@@ -8,7 +8,9 @@
 #    runnable standalone: windeployqt (Qt DLLs + platforms/ imageformats/ ... plugin subdirs)
 #    + the MinGW runtime DLLs (incl. libgomp-1, which --compiler-runtime misses) + the non-Qt
 #    payload (FFmpeg av*/sw*, CUDA cudart64_12 + igpu_recon_cuda, pixel_maps/releases data)
-#    admitted from a fully deployed donor release tree. Copying ONLY the exe used to leave the
+#    admitted from a fully deployed donor release tree, plus ffmpeg.exe installed on every build from the
+#    sha-pinned in-repo payload (vendored-native-payloads.json ffmpeg-windows-x86_64, via
+#    extract_vendored_native_payload --verify-installed). Copying ONLY the exe used to leave the
 #    artifact with no DLLs beside it, so launching it died in the loader with 0xC0000135
 #    (STATUS_DLL_NOT_FOUND) BEFORE main(), silently breaking any reviewer/gate pointed at it.
 #  - PROVES runnability: launches the stamped exe with a sanitized PATH (system dirs only) so
@@ -17,7 +19,9 @@
 # Usage: pwsh -NoProfile -File tools\build-release.ps1 [-AllowDirty] [-OutRoot <dir>] [-RuntimeDonorDir <dir>]
 # Exit codes: 5=dirty tree (no -AllowDirty); 6=provenance stamp sha != HEAD; 7=runtime deploy
 #   failed (windeployqt or a required MinGW runtime DLL missing); 8=artifact not self-contained
-#   (launch probe died with a DLL-load NTSTATUS, e.g. 0xC0000135).
+#   (launch probe died with a DLL-load NTSTATUS, e.g. 0xC0000135); 9=ffmpeg.exe was not installed and verified from
+#   the pinned payload, or it changed before build-manifest.json was written; 10=the launch probe timed out and its stop was NOT confirmed
+#   (PR 862 r10: the kill is root-only, so a probe descendant still running, or any unconfirmed stop, is a hard failure with no recovery).
 param(
     [string]$SourceRoot = (Resolve-Path "$PSScriptRoot\..").Path,
     [string]$QtBin      = "C:\Qt\6.10.2\mingw_64\bin",
@@ -124,6 +128,7 @@ $deploy = [ordered]@{
     mingwRuntimeDlls   = @()
     runtimeExtras      = @()
     runtimeExtrasDonor = $null
+    ffmpegExe          = $null
     selfContained      = $false
 }
 
@@ -180,8 +185,37 @@ if ($donor) {
     }
 } else {
     Write-Host "WARN: no runtime donor dir found (looked at -RuntimeDonorDir, platform/qt/build-release|build-current/release);" -ForegroundColor Yellow
-    Write-Host "      FFmpeg/CUDA/data not mirrored. The exe will START (Qt+MinGW deployed) but FFmpeg/GPU features are unavailable in this artifact." -ForegroundColor Yellow
+    Write-Host "      FFmpeg DLLs/CUDA/data not mirrored. The exe will START (Qt+MinGW deployed) but those features are unavailable in this artifact." -ForegroundColor Yellow
 }
+
+# 3b) ffmpeg.exe (EXPORT-PRORES-FFMPEG-EXE-PACKAGE-1). Rendered export (ProRes and the other ffmpeg codecs) runs an
+#     ffmpeg.exe beside the app, and no donor admission above names one. Install it on EVERY build from the pinned
+#     in-repo payload (tools/gates/vendored-native-payloads.json id ffmpeg-windows-x86_64, platform/qt/FFmpeg/ffmpegWin64.zip)
+#     with the same extractor and --verify-installed the hosted Windows release runs. Bounded; a failure stops the build.
+$ffmpegInstall = Install-PinnedVendoredPayload -RepoRoot $SourceRoot -PayloadId 'ffmpeg-windows-x86_64' -ArchiveReference 'ffmpegWin64.zip' -OutputDir $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($dest) -TimeoutSec 600
+$ffmpegExePath = Join-Path $dest 'ffmpeg.exe'
+$ffmpegRows = @($ffmpegInstall.installed | Where-Object { [string]::Equals([string]$_.name, 'ffmpeg.exe', [StringComparison]::OrdinalIgnoreCase) })
+if (-not $ffmpegInstall.ok -or $ffmpegRows.Count -ne 1 -or -not (Test-Path -LiteralPath $ffmpegExePath -PathType Leaf)) {
+    Write-Host "FAIL: ffmpeg.exe was not installed from the pinned payload ffmpeg-windows-x86_64: $($ffmpegInstall.reason)" -ForegroundColor Red
+    if ($ffmpegInstall.stderr) { Write-Host $ffmpegInstall.stderr }
+    exit 9
+}
+try {
+    $deploy.ffmpegExe = [ordered]@{
+        payloadId = 'ffmpeg-windows-x86_64'
+        bytes     = [long](Get-Item -LiteralPath $ffmpegExePath -Force).Length
+        sha256    = (Get-FileHash -LiteralPath $ffmpegExePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+} catch {
+    # A locked installed file is the typed failure, never an exception past it (adversary 32bf39a9-A2).
+    Write-Host "FAIL: the installed $ffmpegExePath could not be read back: $($_.Exception.Message)" -ForegroundColor Red
+    exit 9
+}
+if ($deploy.ffmpegExe.sha256 -cne [string]$ffmpegRows[0].sha256 -or $deploy.ffmpegExe.bytes -ne [long]$ffmpegRows[0].bytes) {
+    Write-Host "FAIL: $ffmpegExePath changed after the extractor verified it" -ForegroundColor Red
+    exit 9
+}
+Write-Host "OK: ffmpeg.exe installed from the pinned payload (sha256 $($deploy.ffmpegExe.sha256))" -ForegroundColor Green
 
 # 4) Prove runnability. Launch the stamped exe with a SANITIZED PATH (system dirs only) so the
 #    ONLY DLLs that can resolve are the ones just deployed beside it -- otherwise the Qt/MinGW
@@ -198,34 +232,56 @@ $cleanPath = @(
     $env:SystemRoot,
     (Join-Path $env:SystemRoot 'System32\Wbem')
 ) -join ';'
-$probeExit = $null; $probeTimedOut = $false
+$probeExit = $null; $probeTimedOut = $false; $probeKillConfirmed = $null; $probeKillError = ''
 $savedPath = $env:Path
 try {
     $env:Path = $cleanPath
+    # PR 862 r8 (adversary 500e2892-A1): listed before the probe exists, so a timeout's kill can place other processes outside its tree.
+    $probeBaseline = Get-PinnedPayloadBaseline
     $p = Start-Process -FilePath $destExe -ArgumentList '--batch','--help' `
         -WorkingDirectory $probeDir -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput (Join-Path $probeDir 'out.txt') `
         -RedirectStandardError  (Join-Path $probeDir 'err.txt')
     if ($p.WaitForExit(30000)) { $probeExit = $p.ExitCode }
-    else { try { $p.Kill() } catch {}; $probeTimedOut = $true }
+    else {
+        # Confirmed or said to be unconfirmed (adversary 32bf39a9-A3): a Kill that threw is never reported as killed.
+        $probeStop = Stop-PinnedPayloadChild -Process $p -Baseline $probeBaseline
+        $probeKillConfirmed = [bool]$probeStop.confirmed; $probeKillError = [string]$probeStop.killError
+        $probeTimedOut = $true
+    }
 } finally {
     $env:Path = $savedPath
     Remove-Item -LiteralPath $probeDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 $probeDllFailure = ($null -ne $probeExit -and $dllLoadFailures -contains $probeExit)
 $deploy.selfContained = (-not $probeDllFailure -and -not $probeTimedOut)
+# PR 862 r10 (sol r9 B1 caller :247, the split): the stop kills the probe's root only; a stop that is not confirmed (a descendant still
+# listed, a kill that threw, an exit not seen) is a typed FAIL with exit 10, never a WARN. A confirmed-killed timeout keeps its WARN.
+$probeStopUnconfirmed = ($probeTimedOut -and -not $probeKillConfirmed)
 $launchProbe = [ordered]@{
     mode             = '--batch --help'
     sanitizedPath    = $true
     exitCode         = $probeExit
     timedOut         = $probeTimedOut
+    killConfirmed    = $probeKillConfirmed
     dllLoadFailure   = $probeDllFailure
     statusDllNotFound = ($probeExit -eq -1073741515)
 }
 if ($probeDllFailure) {
-    Write-Host ("FAIL: artifact is NOT self-contained -- launch probe exited 0x{0:X8} (DLL load failure)" -f ([uint32]$probeExit)) -ForegroundColor Red
+    # Adversary a7bf472f-A5: an NTSTATUS such as 0xC0000135 is a NEGATIVE Int32, which [uint32] refuses (it threw before exit 8); the
+    # X8 format of the Int32 itself prints its two's-complement hex.
+    Write-Host ("FAIL: artifact is NOT self-contained -- launch probe exited 0x{0:X8} (DLL load failure)" -f ([int]$probeExit)) -ForegroundColor Red
+    # Adversary bf1ac39c-A8 (sibling of a7bf472f-A2): exit 8 is IMMEDIATE, ahead of the ffmpeg hold below (exit 9).
+    exit 8
+} elseif ($probeStopUnconfirmed) {
+    # Adversary a7bf472f-A2: exit 10 is IMMEDIATE, so neither the ffmpeg hold below (exit 9) nor a manifest write that throws can end
+    # the script first with another code.
+    Write-Host "FAIL: launch probe timed out after 30s and its stop was NOT confirmed (root-only kill; pid $($p.Id) or a descendant may still run$(if ($probeKillError) { ": $probeKillError" })); exit 10, nothing recovered" -ForegroundColor Red
+    exit 10
 } elseif ($probeTimedOut) {
-    Write-Host "WARN: launch probe timed out after 30s (killed); could not confirm self-contained launch" -ForegroundColor Yellow
+    # PR 862 r11 (Grok G8): a confirmed stop means the root was killed and no tree member was still LISTED; it does not prove that no
+    # descendant is alive (adversary bf1ac39c-A4/A5, fa89f1b3-A6; card PINNED-PAYLOAD-KILL-TREE-DST-1), so the text claims no more.
+    Write-Host "WARN: launch probe timed out after 30s (root killed, no tree member still listed; not proof that no descendant runs, see PINNED-PAYLOAD-KILL-TREE-DST-1); could not confirm self-contained launch" -ForegroundColor Yellow
 } elseif ($probeExit -ne 0) {
     Write-Host "NOTE: launch probe resolved all DLLs (no 0xC0000135) but --batch --help returned $probeExit (likely environment, e.g. no interactive desktop)" -ForegroundColor Yellow
 } else {
@@ -242,8 +298,21 @@ $manifest = [ordered]@{
     host = $env:COMPUTERNAME
     selfContained = $deploy.selfContained; deploy = $deploy; launchProbe = $launchProbe
 }
-$manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $dest "build-manifest.json") -Encoding UTF8
+# Adversary ae560106-A1: a delete or rewrite of ffmpeg.exe after the readback above (the launch probe runs in between) left the
+# manifest claiming a deploy that was gone. Re-read and re-hash it immediately before the manifest, and HOLD it open (FileShare.Read:
+# no writer, no delete) until build-manifest.json is written, so the deploy.ffmpegExe record describes the file in the artifact.
+# PR 862 r9 (sol r8 B1): the hold opens the pathname itself and refuses a symbolic link or junction (reason reparse-point), so the
+# held handle is the file entry at $ffmpegExePath, which can be neither renamed, unlinked nor rewritten until it is released.
+$ffmpegHold = Open-PinnedFileHold -Path $ffmpegExePath -ExpectedSha256 $deploy.ffmpegExe.sha256 -ExpectedBytes $deploy.ffmpegExe.bytes
+if (-not $ffmpegHold.ok) {
+    Write-Host "FAIL: ffmpeg.exe changed before build-manifest.json was written: $($ffmpegHold.reason)" -ForegroundColor Red
+    exit 9
+}
+try {
+    $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $dest "build-manifest.json") -Encoding UTF8
+} finally {
+    $ffmpegHold.stream.Dispose()
+}
 Write-Host "OK -> $destExe" -ForegroundColor Green
 Write-Host "    embedded-SHA==HEAD: $shaOk ; self-contained: $($deploy.selfContained) ; manifest written"
 if (-not $shaOk) { exit 6 }
-if ($probeDllFailure) { exit 8 }

@@ -5,6 +5,10 @@ QT += core network
 TEMPLATE = app
 TARGET = console_tests
 
+# PLAYBACK-DUE-WAKE-EXPIRY-STAMP-SEAM-1 r10 (sol r9 B3): the PlaybackDueWake timing-stamp test seam is compiled only here;
+# MLVApp.pro never defines it, so the app build carries none of the seam
+DEFINES += MLV_PLAYBACK_DUE_WAKE_TIMING_SEAM
+
 SOURCES += \
     $$REPO_ROOT/tests/console/test_fpm_name_validator.cpp \
     $$REPO_ROOT/tests/console/test_atomic_file_replace.cpp \
@@ -73,6 +77,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_display_wake_wiring.cpp \
     $$REPO_ROOT/tests/console/test_pre_dualiso_telemetry_reset_wiring.cpp \
     $$REPO_ROOT/tests/console/test_llrawproc_residual_telemetry_wiring.cpp \
+    $$REPO_ROOT/tests/console/test_export_render_pipe_timing_wiring.cpp \
     $$REPO_ROOT/tests/console/test_dualiso_gpu_split_telemetry_wiring.cpp \
     $$REPO_ROOT/tests/console/test_debayered16_recon_provenance_wiring.cpp \
     $$REPO_ROOT/tests/console/test_debayered16_honour_scale_wiring.cpp \

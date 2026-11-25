@@ -903,8 +903,14 @@ class CounterWritePinTests(unittest.TestCase):
         cases = {
             "the settle may ask for a second Play again":
                 ("&& playback_frame_range::lookAssistSettleNeedsOwnPlay( m_programmaticPlayLedger.admitted ) )", ")"),
+            # REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r2: the pace break is unchanged behaviour; it moved from an inline
+            # `|| measuredState == PaceTooSlow` into playback_frame_range::measuredPlayLoopShouldStop (PaceTooSlow -> true, held
+            # by PlaybackMeasuredLoopExit in tests/console/test_playback_frame_range.cpp). The mutation therefore hides
+            # PaceTooSlow from the call: the loop would no longer break on a too-slow pace, and the scan must still catch it.
             "the smoke loop no longer breaks on a too-slow pace":
-                ("         || measuredState == playback_frame_range::PlayStopState::PaceTooSlow\n", ""),
+                ("measuredPlayLoopShouldStop(\n                measuredState,",
+                 "measuredPlayLoopShouldStop(\n                measuredState == playback_frame_range::PlayStopState::PaceTooSlow"
+                 " ? playback_frame_range::PlayStopState::Continue : measuredState,"),
             "the autoplay verdict is no longer resolved":
                 ("m_automationVerdict.resolve( autoplayState );", ""),
             "the autoplay refusal is no longer latched":
