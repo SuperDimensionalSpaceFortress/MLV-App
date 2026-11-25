@@ -2720,32 +2720,6 @@ function Test-DvPathHasLinkBelow {
     $false
 }
 
-function Read-DvBytesWithFileKey([string]$Path, $Reader) {
-    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 fix 2 (adversary pass 6 A5): a file's bytes and its identity (volume serial + file index) from ONE handle, so the identity is the
-    # file the bytes came from (Get-DvLegSetPlan -FileKeyReader).
-    # r5 (hosted CI on 19ce35fd): r4 compiled its own kernel32 reader here. That broke two pinned contracts: test_attr3_spliced_body_scan (this module named the parameter-defaults
-    # variable around the compile, which unbinds every extractor call the splice scan reads in this file; a [powershell] compile runspace instead makes every computed member a
-    # receiver that may reach the session state, the same unproven binding), and the off-Windows read (no kernel32: the read threw). The module now compiles NOTHING: the CALLER
-    # hands over its reader, and the batch hands over its own bounded read (Read-SpecBytesWithin: one FileStream gives the bytes and the key, on a pool thread given up on at the
-    # room left before -DeadlineUtc), so the planner's read is the batch's judged read, and (adversary pass 7 A7) it is bounded by the same deadline as every other spec read.
-    # The reader answers [pscustomobject]@{ state; bytes; key; error }: state OK with bytes, else the read failed (FAILED) or did not answer in its bound (TIMEOUT).
-    # Anything else (no answer, no bytes, no key) is refused by the caller below, never read as an empty spec or an unidentified file.
-    # (the reader is checked to be a script block by its type's NAME: a [scriptblock] type literal in this file makes the splice scan read every computed member as one that may
-    # reach the session state, test_the_dual_venue_runner_scans_inside_its_runtime_pin; a command name is never invoked here)
-    if ($null -eq $Reader -or $Reader.GetType().FullName -cne 'System.Management.Automation.ScriptBlock') { throw 'the file-key reader is not a script block' }
-    $r = & $Reader ([IO.Path]::GetFullPath($Path))
-    $r = @($r)
-    if ($r.Count -ne 1 -or $null -eq $r[0]) { throw "the file-key reader gave no single answer" }
-    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r1 (adversary pass 8 A10, sol r5 hardening 2): the answer is read as it is, never coerced: state is a string 'OK' and key a string,
-    # either '' (no identity here: the caller's own refusal names it, as off Windows) or the volume:file-index form; @('OK'), ' ' or an array key is refused
-    $state = $r[0].state; $key = $r[0].key
-    if ($state -is [string] -and $state -ceq 'TIMEOUT') { throw "the read did not answer within the time left before -DeadlineUtc" }
-    if (-not ($state -is [string] -and $state -ceq 'OK')) { throw "the read failed ($([string]$r[0].error -replace '\s+', ' '))" }
-    if ($r[0].bytes -isnot [byte[]]) { throw "the read answered no bytes" }
-    if (-not ($key -is [string] -and ($key -ceq '' -or $key -cmatch '^[0-9a-f]{8}:[0-9a-f]{16}\z'))) { throw "the read answered no usable file identity" }
-    [pscustomobject]@{ bytes = [byte[]]$r[0].bytes; key = $key }
-}
-
 function Get-DvLegSetPlan {
     <#
     .SYNOPSIS
@@ -2757,11 +2731,7 @@ function Get-DvLegSetPlan {
     not be one matrix), and the cell ids must be unique.
     Returns [pscustomobject]@{ legSet; card; clipId; repeats; cells (the forward list); plan (the walk, in run order) }.
     #>
-    # -WithFileKey (DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 fix 2, adversary pass 6 A5): each spec's bytes are read through ONE handle that also gives the file's volume + index
-    # (specFileKey on every cell and plan entry), so a caller can prove its own later reads came from the file the planner judged. Without it the read is as before and specFileKey is ''.
-    # r5: -FileKeyReader is the caller's own reader (Read-DvBytesWithFileKey says why); -WithFileKey without one is refused.
-    param([Parameter(Mandatory)][string]$LegSetPath, [ValidateRange(1, 20)][int]$Repeats = 1, [string]$Backend = '', [switch]$WithFileKey, $FileKeyReader = $null)
-    if ($WithFileKey -and $null -eq $FileKeyReader) { throw 'DVE_LEGSET_INVALID -WithFileKey needs -FileKeyReader (the caller reads each spec through one handle that also identifies its file)' }
+    param([Parameter(Mandatory)][string]$LegSetPath, [ValidateRange(1, 20)][int]$Repeats = 1, [string]$Backend = '')
     if (-not (Test-Path -LiteralPath $LegSetPath -PathType Leaf)) { throw "DVE_LEGSET_INVALID no leg set at the given path" }
     $setDir = Split-Path -Parent (Resolve-Path -LiteralPath $LegSetPath).Path
     $dvDir = Split-Path -Parent $setDir
@@ -2791,9 +2761,7 @@ function Get-DvLegSetPlan {
         # (decoded exactly as File.ReadAllText does, BOM-detected, so a spec the base planner could read is still readable: adversary r7 A5)
         # r11 (adversary r10 pass 3 A1, A2; hub ruling 20261123T2147Z): every identity judged here (legId, twin, the name the set reached, planned hash) comes from THESE bytes.
         # r10's second link walk after this read is gone: a path probe cannot say what was read, and a link flipped in and out between two probes passed both.
-        $specFileKey = ''
-        if ($WithFileKey) { $kr = try { Read-DvBytesWithFileKey $full $FileKeyReader } catch { throw "DVE_LEGSET_INVALID '$ref' could not be read by the planner: $($_.Exception.Message)" }; $specBytes = [byte[]]$kr.bytes; $specFileKey = [string]$kr.key; if (-not $specFileKey) { throw "DVE_LEGSET_INVALID '$ref' was read but its file could not be identified (the planner binds each entry to the file it judged)" } }
-        else { $specBytes = [IO.File]::ReadAllBytes($full) }
+        $specBytes = [IO.File]::ReadAllBytes($full)
         $specSha256 = Get-DvSha256OfBytes $specBytes
         $specReader = [IO.StreamReader]::new([IO.MemoryStream]::new($specBytes), [Text.Encoding]::UTF8, $true)
         try { $specText = $specReader.ReadToEnd() } finally { $specReader.Dispose() }
@@ -2813,7 +2781,7 @@ function Get-DvLegSetPlan {
         if ($specLegId -cnotmatch '^[a-z0-9][a-z0-9-]{1,62}$' -or -not [string]::Equals([IO.Path]::GetFileName($full), "$specLegId.json", [StringComparison]::OrdinalIgnoreCase)) {
             throw "DVE_LEGSET_INVALID '$ref' read as legId '$($spec.legId)': a committed leg spec is named <legId>.json, so a spec reached under another name (an alias, a hard link, a link swapped in) is refused"
         }
-        $specs.Add([pscustomobject]@{ path = $full; spec = $spec; sha256 = $specSha256; fileKey = $specFileKey })
+        $specs.Add([pscustomobject]@{ path = $full; spec = $spec; sha256 = $specSha256 })
     }
     $backends = [System.Collections.Generic.List[string]]::new()
     foreach ($s in $specs) { foreach ($b in @($s.spec.backends)) { if ($b -notin $backends) { $backends.Add([string]$b) } } }
@@ -2827,7 +2795,7 @@ function Get-DvLegSetPlan {
             $cellId = $(if ([string](Get-DvProp $s.spec 'legType') -ceq 'export') { "$b-export-$([string]$s.spec.export.format)" } else { "$b-$mode-s$([int]$s.spec.scaleFactor)" })
             if ($seen.ContainsKey($cellId)) { throw "DVE_LEGSET_INVALID two legs of the set make the cell $cellId" }
             $seen[$cellId] = $true
-            $cells.Add([pscustomobject]@{ cellId = $cellId; legId = [string]$s.spec.legId; specPath = $s.path; specSha256 = $s.sha256; specFileKey = $s.fileKey; backend = $b; displayMode = $mode; scaleFactor = [int]$s.spec.scaleFactor })
+            $cells.Add([pscustomobject]@{ cellId = $cellId; legId = [string]$s.spec.legId; specPath = $s.path; specSha256 = $s.sha256; backend = $b; displayMode = $mode; scaleFactor = [int]$s.spec.scaleFactor })
         }
     }
     $cellList = @($cells | Where-Object { [string]::IsNullOrEmpty($Backend) -or $_.backend -ceq $Backend })
@@ -2838,7 +2806,7 @@ function Get-DvLegSetPlan {
         $walk = $(if ($r % 2 -eq 1) { $cellList } else { @($cellList[($cellList.Count - 1)..0]) })
         foreach ($c in $walk) {
             $seq++
-            $plan.Add([pscustomobject]@{ seq = $seq; repeat = $r; cellId = $c.cellId; legId = $c.legId; specPath = $c.specPath; specSha256 = $c.specSha256; specFileKey = $c.specFileKey; backend = $c.backend; displayMode = $c.displayMode; scaleFactor = $c.scaleFactor })
+            $plan.Add([pscustomobject]@{ seq = $seq; repeat = $r; cellId = $c.cellId; legId = $c.legId; specPath = $c.specPath; specSha256 = $c.specSha256; backend = $c.backend; displayMode = $c.displayMode; scaleFactor = $c.scaleFactor })
         }
     }
     [pscustomobject]@{ legSet = $setName; card = $card; clipId = $clipId; repeats = $Repeats; cells = @($cellList); plan = @($plan) }

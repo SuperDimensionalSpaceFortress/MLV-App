@@ -715,11 +715,9 @@ CONSUMER_FAILING_ACTION: dict[str, tuple[tuple[str, int], ...]] = {
     "tools/profiling/dual-venue/Invoke-VenueLeg.ps1": (
         (r"\$exitCode\s*=\s*\[int\]\$run\.result\.exitCode[\s\S]*?if\s*\(\$exitCode\s+-ne\s+0\s+-and\s+\$resolved\.outcome\s+-eq\s+'CAPTURED'\)\s*\{\s*"
          r"(?P<act>\$resolved\s*=\s*\[pscustomobject\]@\{\s*outcome\s*=\s*'INVALID')", 1),),
-    # VENUE-CHAIN-RUNNER-1 r3: a leg that exited non-zero is recorded LEG_FAILED / INVALID (never RAN) and the chain exits 7. DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r1 (A3):
-    # the leg is a bounded child started under -StartNotAfterUtc, so its exit code is the child's own ($lp.exit), and a timed-out leg takes the same failing branch.
+    # VENUE-CHAIN-RUNNER-1 r3: a leg that exited non-zero is recorded LEG_FAILED / INVALID (never RAN) and the chain exits 7.
     "tools/profiling/dual-venue/Invoke-VenueChain.ps1": (
-        (r"\$lp\s*=\s*Invoke-VenueBoundedProcess\s+-FilePath\s+\$pwshExe\s+-ArgumentList\s+\$lArgs\b[^\n]*-StartNotAfterUtc\s+\$deadline[^\n]*\n[\s\S]*?"
-         r"\$legCode\s*=\s*\$\(if\s*\(\$legTimedOut\)\s*\{\s*\$null\s*\}\s*else\s*\{\s*\$lp\.exit\s*\}\)[\s\S]*?if\s*\(\$legTimedOut\s+-or\s+\$legCode\s+-ne\s+0\)\s*\{\s*"
+        (r"\$legCode\s*=\s*\$LASTEXITCODE[\s\S]*?if\s*\(\$legCode\s+-ne\s+0\)\s*\{\s*"
          r"(?P<act>Add-Result\s+\$leg\s+'LEG_FAILED'\s+@\{[^\n]*outcome\s*=\s*'INVALID'[^\n]*\})", 1),),
     # BACHELOR-LEASE-BATCH-LEGS-1: the same rule inside one quiet lease per batch: a leg that exited non-zero is recorded LEG_FAILED / INVALID (never RAN, never
     # counted) in the batch and the run results, and the run exits 7. r3 (sol r2 B2): the leg is a bounded child (killed with its tree at the lease's end), so its

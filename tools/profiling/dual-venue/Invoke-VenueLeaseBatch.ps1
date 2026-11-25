@@ -262,17 +262,8 @@ $ErrorActionPreference = 'Stop'
 # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r2 (adversary A3 sibling): a caller's $PSNativeCommandUseErrorActionPreference = $true is inherited by `& script`; with Stop it would turn the
 # raw quiet launch's documented non-zero exits into a terminating error. Every raw launch here reads $LASTEXITCODE itself.
 $PSNativeCommandUseErrorActionPreference = $false
-# BATCH-3 r8 (adversary r7 A1): a caller's $PSDefaultParameterValues is inherited by `& script` too, and an entry naming a bound of ours
-# ('Invoke-VenueBoundedProcess:StartNotAfterUtc', ...:DeadlineUtc, ...:MinRoomSec) bound every call that does not pass it: a leg never started read as LEASE_EXPIRED (exit 7).
-# Shadowed once, here, for every call this script and its functions make (the r4 Add-Type clears below stay: they are the same rule, kept local to their compile).
-$PSDefaultParameterValues = @{}
 $here = $PSScriptRoot
-# b3 r1 (adversary pass 5 A8 on a73430b2): the VenueChain module object is bound once, here, and every call into its own scope goes through $script:VenueChainModule. By name,
-# `Get-Module VenueChain` answers EVERY same-name module in the session (-Force keeps one imported from another path, another worktree's copy), and `& ($script:VenueChainModule ?? (Get-Module VenueChain)) { }`
-# then throws ('VenueChain VenueChain' is not recognized). A test harness that lifts one function of this file imports VenueChain itself and never runs this line, so each call site
-# falls back to the lookup by name (`??`) only when the binding is absent.
-Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking -PassThru -OutVariable VenueChainImported | Out-Null
-$script:VenueChainModule = $VenueChainImported[0]
+Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking
 Import-Module (Join-Path $here 'VenueThermalGate.psm1') -Force
 Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force -DisableNameChecking   # LEASE-BATCH-RECEIPT-ROOT-1: Test-DvUnderClaudeState, the leg's own receipt-root rule
 # r9 (sol r8 B2): every thermal-helper call passes its optional parameters explicitly (the dispatch grace below, the Stopwatch now), so an ambient $PSDefaultParameterValues
@@ -313,11 +304,6 @@ $script:ExportBudgetPreflightCleanupMs = 1500   # (adversary r11 A6: the one bud
 # a.json shared one digest and the second read overwrote the first's (a false SPEC_CHANGED_AFTER_PREFLIGHT before the claim, and the guard and child bound to the other file's bytes).
 $script:SpecBudgetSha256 = [Collections.Hashtable]::new([StringComparer]::Ordinal)
 $script:SpecShapeSha256 = [Collections.Hashtable]::new([StringComparer]::Ordinal)   # (and of the bytes the preflight's shape check judged, which the budget's read must equal)
-# DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A1, A3): the volume + file index of the file each judged read's bytes came from, taken from the SAME open handle the
-# bytes were read through (Read-SpecBytesWithin's .key), never from a second open of the path afterwards (a name re-pointed between the two opens recorded another file, and that
-# second open was unbounded). Written by the read that judged the bytes, read by the caller right after it, so it is this entry's own.
-$script:SpecBudgetFileKey = [Collections.Hashtable]::new([StringComparer]::Ordinal)
-$script:SpecShapeFileKey = [Collections.Hashtable]::new([StringComparer]::Ordinal)
 foreach ($s in @($StagedBuildProbeScript, $ArtifactProbeScript) | Where-Object { $_ }) { if (-not (Test-Path -LiteralPath $s -PathType Leaf)) { Stop-Usage "no script at '$s'" } }
 $stagedBuildProbe = $(if ($StagedBuildProbeScript) { [scriptblock]::Create([IO.File]::ReadAllText($StagedBuildProbeScript)) } else { $null })
 $artifactProbe = $(if ($ArtifactProbeScript) { [scriptblock]::Create([IO.File]::ReadAllText($ArtifactProbeScript)) } else { $null })
@@ -447,7 +433,6 @@ function Get-PhysicalPath([string]$Path) {
     # r10 (adversary r9 A1): the path the file system opens for $Path, every junction, symlink, subst and 8.3 spelling resolved (GetFinalPathNameByHandle), so two spellings
     # of one file compare equal. THE one resolver of every comparison below. Throws when the path cannot be opened (the caller refuses: an unknown location is not a safe one).
     if (-not ('VenueLeaseBatchFinalPath' -as [type])) {
-        $PSDefaultParameterValues = @{}   # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A5 sibling :435): a caller's Add-Type defaults (OutputAssembly, ...) never reach this compile
         Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
@@ -509,53 +494,10 @@ public static class VenueLeaseBatchFinalPath {
     // delayMs is the offline -GuardReadDelay seam (0 in production). false = no answer in time, or the read failed (the path cannot be opened now).
     public static bool LocateWithin(string path, int delayMs, int timeoutMs, out string physical, out string key) {
         physical = null; key = null;
-        System.Threading.Tasks.Task<string[]> t = StartLocate(path, delayMs, long.MaxValue);
+        System.Threading.Tasks.Task<string[]> t = System.Threading.Tasks.Task.Run(() => { if (delayMs > 0) { System.Threading.Thread.Sleep(delayMs); } uint l; string k = Identity(path, out l); return new string[] { Resolve(path), k }; });
         try { if (!t.Wait(timeoutMs)) { return false; } } catch (AggregateException) { return false; }
         physical = t.Result[0]; key = t.Result[1];
         return true;
-    }
-    // DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r2 (adversary pass 3 A3 on 372d1bfd): the same read ended at ONE absolute instant (UTC ticks) instead of a relative allowance the
-    // caller sampled earlier: it starts nothing at or past it, the task itself opens nothing once it passed (a queued task that runs late), and the wait is sliced (250 ms) against it.
-    // BATCH-3 r8 (adversary r7 A3): that end is ALSO held on the Stopwatch, its room taken once when the call starts (MonoEnd), so a wall clock stepped back cannot widen the
-    // read or its wait; the end is asked again between the two opens (no second open once it passed), and after the answer arrives (a late answer is no answer).
-    public static long TestUtcStepTicks = 0;   // test seam only (0 in production): added to every wall-clock read here, as an NTP/VM-resume step is
-    static long UtcTicks() { return DateTime.UtcNow.Ticks + TestUtcStepTicks; }
-    public static long MonoEnd(long endUtcTicks) {
-        if (endUtcTicks == long.MaxValue) { return long.MaxValue; }
-        double leftSec = (endUtcTicks - UtcTicks()) / (double)TimeSpan.TicksPerSecond;
-        long now = System.Diagnostics.Stopwatch.GetTimestamp();
-        return leftSec <= 0 ? now : now + (long)(Math.Min(leftSec, 86400.0) * System.Diagnostics.Stopwatch.Frequency);
-    }
-    public static bool Past(long endUtcTicks, long monoEnd) { return UtcTicks() >= endUtcTicks || System.Diagnostics.Stopwatch.GetTimestamp() >= monoEnd; }
-    static long LeftMs(long endUtcTicks, long monoEnd) {
-        long w = (endUtcTicks - UtcTicks()) / TimeSpan.TicksPerMillisecond;
-        if (monoEnd == long.MaxValue) { return w; }
-        return Math.Min(w, (long)((monoEnd - System.Diagnostics.Stopwatch.GetTimestamp()) * 1000.0 / System.Diagnostics.Stopwatch.Frequency));
-    }
-    static System.Threading.Tasks.Task<string[]> StartLocate(string path, int delayMs, long endUtcTicks) { return StartLocate(path, delayMs, endUtcTicks, MonoEnd(endUtcTicks)); }
-    static System.Threading.Tasks.Task<string[]> StartLocate(string path, int delayMs, long endUtcTicks, long monoEnd) {
-        return System.Threading.Tasks.Task.Run(() => { if (Past(endUtcTicks, monoEnd)) { throw new TimeoutException("the end passed before the read started"); } if (delayMs > 0) { System.Threading.Thread.Sleep(delayMs); } uint l; string k = Identity(path, out l); if (Past(endUtcTicks, monoEnd)) { throw new TimeoutException("the end passed before the second open"); } return new string[] { Resolve(path), k }; });
-    }
-    public static bool LocateUntil(string path, int delayMs, long endUtcTicks, out string physical, out string key) { return LocateUntil(path, delayMs, endUtcTicks, MonoEnd(endUtcTicks), out physical, out key); }
-    // r8 pass 2 (adversary A3 on 61244e31): monoEnd is the CALLER's Stopwatch end, anchored before its wall samples, so no pause or step between them moves it later
-    public static bool LocateUntil(string path, int delayMs, long endUtcTicks, long monoEnd, out string physical, out string key) {
-        physical = null; key = null;
-        if (Past(endUtcTicks, monoEnd)) { return false; }
-        System.Threading.Tasks.Task<string[]> t = StartLocate(path, delayMs, endUtcTicks, monoEnd);
-        if (!WaitUntil(t, endUtcTicks, monoEnd)) { return false; }
-        physical = t.Result[0]; key = t.Result[1];
-        return true;
-    }
-    // true only when t completed without a fault before endUtcTicks; each slice re-reads the clock, so a caller paused before a slice waits at most one slice past the end
-    public static bool WaitUntil(System.Threading.Tasks.Task t, long endUtcTicks) { return WaitUntil(t, endUtcTicks, MonoEnd(endUtcTicks)); }
-    public static bool WaitUntil(System.Threading.Tasks.Task t, long endUtcTicks, long monoEnd) {
-        try {
-            while (true) {
-                long left = LeftMs(endUtcTicks, monoEnd);
-                if (left <= 0) { return false; }
-                if (t.Wait((int)Math.Min(250L, left))) { return !Past(endUtcTicks, monoEnd); }   // BATCH-3 r8: an answer seen past the end is never acted on
-            }
-        } catch (AggregateException) { return false; }
     }
     // r6 (sol r5 B1 = key3 r5 B1): TEMP's final path, then the identity of each folder in ancestors that exists ("" for one that does not), read on a pool thread the caller waits for
     // with Finish and gives up on at its bound, so a TEMP that reaches a -RunDir that stopped answering (a junction into it, a second name for it) cannot hold the caller.
@@ -748,57 +690,6 @@ function Get-InputUnresolvedCode([string]$Path, [switch]$SkipRead) {
     'INPUT_UNREADABLE'
 }
 
-function Get-InputUnresolvedCodeWithin([string]$Path, [switch]$SkipRead) {
-    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 fix 2 (adversary pass 6 A4): Get-InputUnresolvedCode's opens are synchronous, so the pre-claim sweep asks it on a worker runspace
-    # and gives up on it at the room left before -DeadlineUtc (Get-SpecReadBoundSec): no answer in that room is INPUT_UNREADABLE (an input that will not answer), never a wait past
-    # the deadline. The worker is abandoned, not joined, at its bound (a stopped pipeline could itself wait on the stalled open).
-    # r5 (hosted CI on 19ce35fd, test_launcher_census_*: an AddScript of a string built at run time is an unclassified launch site): the worker runs the function BY NAME
-    # (AddCommand), its four functions handed over as SessionStateFunctionEntry, as Invoke-InputGuard hands its own; no string is executed.
-    # r5 (adversary pass 7 A4): the bound is the deadline's room read AFTER the worker is set up, the last clock read before it starts, so the setup's cost is inside the bound.
-    # r5 (adversary pass 7 A5): a worker given up on is counted in VenueChain's VenueAbandonedReads, as every abandoned share read is, so Complete-VenueProcess exits the
-    # process at once instead of waiting on the stalled open at exit.
-    $ps = $null; $abandoned = $false
-    try {
-        $iss = [initialsessionstate]::CreateDefault()
-        foreach ($fn in 'Get-PhysicalPath', 'Get-FileIdentity', 'Test-NothingAtName', 'Get-InputUnresolvedCode') { $iss.Commands.Add([Management.Automation.Runspaces.SessionStateFunctionEntry]::new($fn, (Get-Item -LiteralPath "function:$fn").Definition)) }
-        $ps = [powershell]::Create($iss)
-        $null = $ps.AddCommand('Get-InputUnresolvedCode').AddParameter('Path', [string]$Path).AddParameter('SkipRead', [bool]$SkipRead)
-        $ms = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min(3600.0, (Get-SpecReadBoundSec))) * 1000.0)
-        if ($ms -le 0) { return 'INPUT_UNREADABLE' }
-        # b2 r2 (adversary pass 3 A3 on 372d1bfd): ONE absolute end (the allowance, under the room before -DeadlineUtc less the reserve read again now); nothing starts at or past it
-        # and the wait is sliced (250 ms) against it, so a pause after the sample above never waits the stale allowance
-        # BATCH-3 r8 (adversary r7 A3 sibling :746, A5 sibling :752): the same end is also held on a Stopwatch, so a wall clock stepped back cannot widen the wait, and the answer
-        # is judged AFTER it is seen: one seen past either end is never acted on (IsCompleted read once). r8 pass 2 (A3 on 61244e31): the Stopwatch starts BEFORE the wall
-        # samples and holds the allowance itself, so a pause (or a step) between the samples can only shorten it, never move its end later
-        $endSw = [Diagnostics.Stopwatch]::StartNew(); $endRoomMs = [double]$ms
-        $endUtc = [DateTime]::UtcNow.AddMilliseconds([double]$ms)
-        $dlU = Get-Variable -Name deadline -ValueOnly -ErrorAction Ignore
-        # BATCH-3 r2 (p6 A4 sibling, same expression): the room is clamped to [0, 3600] s before it is added to now (no un-representable DateTime)
-        if ($dlU -is [datetime]) { $dlEnd = [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, [Math]::Min(3600.0, ($dlU - [DateTime]::UtcNow).TotalSeconds - 2.0))); if ($dlEnd -lt $endUtc) { $endUtc = $dlEnd } }
-        if ($dlU -is [datetime]) { $endRoomMs = [Math]::Min([double]$endRoomMs, [Math]::Max(0.0, [Math]::Min(3600.0, ($dlU - [DateTime]::UtcNow).TotalSeconds - 2.0)) * 1000.0 + $endSw.Elapsed.TotalMilliseconds) }
-        if ([DateTime]::UtcNow -ge $endUtc) { return 'INPUT_UNREADABLE' }
-        $h = $ps.BeginInvoke()
-        while (-not $h.IsCompleted) {
-            $leftMs = [Math]::Min([double]($endUtc - [DateTime]::UtcNow).TotalMilliseconds, [double]$endRoomMs - $endSw.Elapsed.TotalMilliseconds)
-            if ($leftMs -le 0) { break }
-            [void]$h.AsyncWaitHandle.WaitOne([int][Math]::Ceiling([Math]::Min(250.0, [double]$leftMs)))
-        }
-        $hDone = $h.IsCompleted
-        if ($hDone -and ([DateTime]::UtcNow -gt $endUtc -or $endSw.Elapsed.TotalMilliseconds -gt $endRoomMs)) { return 'INPUT_UNREADABLE' }   # a late answer (disposed normally, not abandoned)
-        if (-not $hDone) {
-            $abandoned = $true
-            try { & ($script:VenueChainModule ?? (Get-Module VenueChain)) { $script:VenueAbandonedReads++ } } catch { $null = $_ }
-            try { $null = $ps.BeginStop($null, $null) } catch { $null = $_ }
-            return 'INPUT_UNREADABLE'
-        }
-        $r = @($ps.EndInvoke($h))
-        $dlA = Get-Variable -Name deadline -ValueOnly -ErrorAction Ignore
-        if ($dlA -is [datetime] -and ($dlA - [DateTime]::UtcNow).TotalSeconds -lt 2.0) { return 'INPUT_UNREADABLE' }   # b2 r1 (pass 8 A5): the worker answered, inside the reserve: no answer (disposed normally, not abandoned)
-        return $(if ($r.Count) { [string]$r[-1] } else { 'INPUT_UNREADABLE' })
-    } catch { return 'INPUT_UNREADABLE' }
-    finally { if ($null -ne $ps -and -not $abandoned) { try { $ps.Dispose() } catch { $null = $_ } } }
-}
-
 function Test-NothingAtName([string]$Path) {
     # r6 (adversary r6 A1): $true only when the file system says nothing is at $Path (file or folder not found). Access denied, a sharing violation or any other error is an entry
     # that is there but will not answer, never "gone" (Get-Item and Test-Path said gone for a lookup that was denied). A link is the entry itself: its target is not followed.
@@ -912,38 +803,27 @@ function Invoke-ClaimRetryRequest {
     # The first request of a run is master's inline call, untouched; so are Invoke-VenueChain.ps1's two callers. A worker that threw rethrows here (the caller's REQUEST_THREW).
     # .OUTPUTS Request-VenueClaim's object, or { granted = $false; state = REQUEST_NO_ROOM | REQUEST_NO_ANSWER | REQUEST_LATE_GRANT; why; broken = @(); claim = $null }
     param([Parameter(Mandatory)][DateTime]$DeadlineUtc, [Parameter(Mandatory)][hashtable]$RequestArgs)
-    # BATCH-3 r8 pass 3 (adversary A1 on eee05a6b): the Stopwatch anchor is the FIRST read, before the room is sampled, so a pause after that sample is spent from the wait
-    $reqT0 = [Diagnostics.Stopwatch]::GetTimestamp()
     $room = ($DeadlineUtc - [DateTime]::UtcNow).TotalSeconds
     if ($room -lt $script:ClaimRetryRequestMinSec) {
         return [pscustomobject]@{ granted = $false; state = 'REQUEST_NO_ROOM'; broken = @(); claim = $null
             why = "no claim request was made: $([Math]::Round([Math]::Max(0.0, $room), 2)) s were left before -DeadlineUtc, under the $($script:ClaimRetryRequestMinSec) s a retry's request starts with" }
     }
-    # BATCH-3 r8 (adversary r7 A3/A5 class): the same end on the Stopwatch (no wall-clock step widens the wait), and handed to the worker, which judges its grant against it.
-    # r8 pass 2 (A3 on 61244e31): anchored BEFORE the wall samples ($reqT0, the function's first read), so a pause between them can only shorten it
     $timeoutSec = [Math]::Min([double]($room - $script:ClaimRetryRequestReserveSec), [double]$script:ClaimRetryRequestMaxSec)
-    $reqEndUtc = [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, [double]$timeoutSec))   # b2 r2 (A3 class): the wait's one end
-    $reqEndTs = $reqT0 + [long]([Math]::Max(0.0, [double]$timeoutSec) * [double][Diagnostics.Stopwatch]::Frequency)
     $boundWhat = $(if ($timeoutSec -lt $room - $script:ClaimRetryRequestReserveSec) { "the most a retry's request is waited for" } else { "the time left before -DeadlineUtc less $($script:ClaimRetryRequestReserveSec) s" })
     $state = [hashtable]::Synchronized(@{ lock = [object]::new(); decided = $false; abandoned = $false; late = $false; result = $null; error = $null; release = $null })
-    $ps = $null; $started = $false; $ended = $false; $decided = $false; $seenLate = $false
+    $ps = $null; $started = $false; $ended = $false; $decided = $false
     try {
         $ps = [powershell]::Create()
         [void]$ps.AddScript($script:ClaimRetryRequestWorker.ToString())
-        [void]$ps.AddArgument(@{ chainModule = (Join-Path $here 'VenueChain.psm1'); request = $RequestArgs; lateAfterUtc = $DeadlineUtc; state = $state; waitEndTs = $reqEndTs })
+        [void]$ps.AddArgument(@{ chainModule = (Join-Path $here 'VenueChain.psm1'); request = $RequestArgs; lateAfterUtc = $DeadlineUtc; state = $state })
         $async = $ps.BeginInvoke(); $started = $true
-        # b2 r2 (adversary pass 3 A3 class): sliced against ONE end fixed when $timeoutSec was sampled, so a pause before the wait never waits the stale bound past it
-        # BATCH-3 r8: what is left is the lesser of the wall clock's and the Stopwatch's
-        while (-not $async.IsCompleted) { $reqLeftSec = [Math]::Min([double]($reqEndUtc - [DateTime]::UtcNow).TotalSeconds, [double]($reqEndTs - [Diagnostics.Stopwatch]::GetTimestamp()) / [double][Diagnostics.Stopwatch]::Frequency); if ($reqLeftSec -le 0) { break }; [void]$async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds([Math]::Min(0.25, [double]$reqLeftSec))) }
-        $ended = $async.IsCompleted
+        $ended = $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($timeoutSec))
     } finally {
         if ($started) {
             [Threading.Monitor]::Enter($state.lock)
             try { if (-not $state.decided) { $state.abandoned = $true }; $decided = $state.decided } finally { [Threading.Monitor]::Exit($state.lock) }
-            # r8 pass 2 (adversary A2 on 61244e31): the decision is first SEEN here; seen past the wait's end (either clock), a grant is never used, whenever it was decided
-            $seenLate = [Diagnostics.Stopwatch]::GetTimestamp() -gt $reqEndTs -or [DateTime]::UtcNow -gt $reqEndUtc
             # a worker still running is a live thread the host would wait for at exit: counted, never joined or disposed (Dispose() would wait for it)
-            if (-not $ended) { & ($script:VenueChainModule ?? (Get-Module VenueChain)) { $script:VenueAbandonedReads++ } }
+            if (-not $ended) { & (Get-Module VenueChain) { $script:VenueAbandonedReads++ } }
         }
         if ($null -ne $ps -and (-not $started -or $ended)) { $ps.Dispose() }
     }
@@ -951,21 +831,9 @@ function Invoke-ClaimRetryRequest {
         return [pscustomobject]@{ granted = $false; state = 'REQUEST_NO_ANSWER'; broken = @(); claim = $null
             why = "the claim request did not answer in $([Math]::Round($timeoutSec, 2)) s, $boundWhat; it was given up on, and a claim it may still be granted is released by it, never used" }
     }
-    if (-not $state.late -and $seenLate -and $null -ne $state.result -and $state.result.granted) {
-        # r8 pass 2 (A2): a grant decided in time but first seen after the wait: the worker kept it (it was not late when decided), so it is let go HERE, bounded
-        # (Invoke-ClaimRetryRelease), and never used
-        $state.release = try { [string](Invoke-ClaimRetryRelease -DeadlineUtc $DeadlineUtc -Nonce ([string]$state.result.claim.nonce)) } catch { "THREW $($_.Exception.Message -replace '\s+', ' ')" }
-        $state.late = $true
-    }
-    if (-not $state.late -and $seenLate) {
-        # r8 pass 3 (adversary A2 on eee05a6b): ANY answer first seen after the wait (a denial, a LIVE holder, a worker error) is no answer: the saved unfinished-pass refusal
-        # stands, never a fresh poll or a rethrow decided by it
-        return [pscustomobject]@{ granted = $false; state = 'REQUEST_NO_ANSWER'; broken = @(); claim = $null
-            why = "the claim request answered only after its $([Math]::Round($timeoutSec, 2)) s wait, $boundWhat; an answer seen after the wait is never acted on" }
-    }
     if ($state.late) {
         return [pscustomobject]@{ granted = $false; state = 'REQUEST_LATE_GRANT'; broken = @(); claim = $null
-            why = "the claim request was granted at or after -DeadlineUtc, or after its $([Math]::Round($timeoutSec, 2)) s wait ended; that claim is released ($(if ($state.release) { $state.release } else { 'by the request''s worker' })), never used" }
+            why = "the claim request was granted at or after -DeadlineUtc; that claim is released ($(if ($state.release) { $state.release } else { 'by the request''s worker' })), never used" }
     }
     if ($state.error) { throw $state.error }
     $state.result
@@ -1012,7 +880,7 @@ function Invoke-BatchTicketCall([string]$Body, [hashtable]$Argument, [double]$Se
     # r8 rule 5 (adversary r7 pass 3 A3): the ONE deadline gate, immediately before EACH ticket call (every create, heartbeat, end, stranded retry and retake starts here): a call is started only with more than 6 s left
     # before -DeadlineUtc (it is bounded to 5 s), so a sequence of calls in one loop turn can never carry the batch past the deadline the turn was checked against. Not started: not answered, nothing was sent.
     if (($deadline - [DateTime]::UtcNow).TotalSeconds -le 6.0) { return [pscustomobject]@{ answered = $false; value = $null; error = 'NO_ROOM less than 6 s were left before -DeadlineUtc, so the ticket call was not started' } }
-    & ($script:VenueChainModule ?? (Get-Module VenueChain)) { param($b, $a, $s) Invoke-VenueBoundedRead -ScriptText ('param($a) Import-Module $a.m -Force -DisableNameChecking; ' + $b) -Argument $a -TimeoutSec $s } $Body ($Argument + @{ m = (Join-Path $here 'VenueChain.psm1') }) $Sec
+    & (Get-Module VenueChain) { param($b, $a, $s) Invoke-VenueBoundedRead -ScriptText ('param($a) Import-Module $a.m -Force -DisableNameChecking; ' + $b) -Argument $a -TimeoutSec $s } $Body ($Argument + @{ m = (Join-Path $here 'VenueChain.psm1') }) $Sec
 }
 
 function Invoke-ClaimRetryRelease([DateTime]$DeadlineUtc, [string]$Nonce) {
@@ -1038,25 +906,18 @@ function Invoke-ClaimRetryRelease([DateTime]$DeadlineUtc, [string]$Nonce) {
     }
     $answered = $false; $why = 'ended before it answered'
     try {
-        $relSw = [Diagnostics.Stopwatch]::StartNew()   # BATCH-3 r8 pass 2 (A3 on 61244e31): the Stopwatch end is anchored BEFORE the wall samples (a pause between them only shortens it)
         $sec = [Math]::Min([double](($DeadlineUtc - [DateTime]::UtcNow).TotalSeconds - $script:ClaimRetryRefusalTailSec), [double]$script:ClaimRetryRequestReserveSec)
-        $relEndUtc = [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, [double]$sec))   # b2 r2 (A3 class): the wait's one end
-        if ($sec -le 0) { & ($script:VenueChainModule ?? (Get-Module VenueChain)) { $script:VenueAbandonedReads++ }; $why = 'had no time left before -DeadlineUtc'; return "NO_ROOM (no time was left before -DeadlineUtc to release it; the claim still names this process, so it is broken as dead-pid once the process exits)" }
+        if ($sec -le 0) { & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }; $why = 'had no time left before -DeadlineUtc'; return "NO_ROOM (no time was left before -DeadlineUtc to release it; the claim still names this process, so it is broken as dead-pid once the process exits)" }
         $ps = $null; $abandoned = $false
         try {
             $ps = [powershell]::Create()
             [void]$ps.AddScript($script:ClaimRetryReleaseWorker.ToString())
             [void]$ps.AddArgument(@{ chainModule = (Join-Path $here 'VenueChain.psm1'); venue = $Venue; nonce = $Nonce; claimDir = $ClaimDir })
-            $relRoomSec = [Math]::Max(0.0, [double]$sec)   # BATCH-3 r8 (A3 class): the same end on the Stopwatch started before $sec was sampled
             $async = $ps.BeginInvoke()
-            # b2 r2 (adversary pass 3 A3 class): sliced against ONE end fixed at the sample above, so a pause before the wait never waits the stale $sec past it
-            while (-not $async.IsCompleted) { $relLeftSec = [Math]::Min([double]($relEndUtc - [DateTime]::UtcNow).TotalSeconds, [double]$relRoomSec - $relSw.Elapsed.TotalSeconds); if ($relLeftSec -le 0) { break }; [void]$async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds([Math]::Min(0.25, [double]$relLeftSec))) }
-            $relDone = $async.IsCompleted   # BATCH-3 r8 (adversary r7 A5 sibling :1000): read once, and an answer seen past either end is never acted on (its worker ended: disposed as usual)
-            if ($relDone -and ([DateTime]::UtcNow -gt $relEndUtc -or $relSw.Elapsed.TotalSeconds -gt $relRoomSec)) { $why = "answered only after its $([Math]::Round($sec, 2)) s wait ended"; return "NO_ANSWER (an answer seen after the $([Math]::Round($sec, 2)) s wait is never acted on)" }
-            if (-not $relDone) {
+            if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($sec))) {
                 # a worker still running is a live thread the host would wait for at exit: counted, asked to stop, never joined or disposed (Dispose() would wait for it)
                 $abandoned = $true
-                & ($script:VenueChainModule ?? (Get-Module VenueChain)) { $script:VenueAbandonedReads++ }
+                & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }
                 try { [void]$ps.BeginStop($null, $null) } catch { }
                 $why = "did not answer in $([Math]::Round($sec, 2)) s"
                 return "NO_ANSWER (no answer in $([Math]::Round($sec, 2)) s)"
@@ -1117,15 +978,10 @@ $script:ClaimRetryRequestWorker = {
     param($A)
     $ErrorActionPreference = 'Stop'
     $S = $A.state; $r = $null; $err = $null
-    # BATCH-3 r8 pass 3 (adversary A1 sibling :1113 on eee05a6b): no request starts once the caller's wait has ended (the import above it can stall): nothing was asked, no claim
-    try { Import-Module $A.chainModule -Force -DisableNameChecking; $rq = $A.request
-        if ($null -ne $A.waitEndTs -and [Diagnostics.Stopwatch]::GetTimestamp() -ge [long]$A.waitEndTs) { $r = [pscustomobject]@{ granted = $false; state = 'REQUEST_NO_ROOM'; broken = @(); claim = $null; why = "no claim request was made: the request's wait had ended before it could start" } }
-        else { $r = Request-VenueClaim @rq } } catch { $err = $_.Exception.Message -replace '\s+', ' ' }
+    try { Import-Module $A.chainModule -Force -DisableNameChecking; $rq = $A.request; $r = Request-VenueClaim @rq } catch { $err = $_.Exception.Message -replace '\s+', ' ' }
     $late = $false
     [Threading.Monitor]::Enter($S.lock)
-    # BATCH-3 r8 (adversary r7 A5 sibling :900): the grant is judged when it is DECIDED, here, against the caller's wait end too (a Stopwatch timestamp, so no wall-clock step
-    # moves it): a grant decided after the caller's wait ended is late, released by this worker, never used, whenever the caller looks
-    try { $S.decided = $true; $late = $S.abandoned -or ($null -ne $r -and $r.granted -and ([DateTime]::UtcNow -ge $A.lateAfterUtc -or ($null -ne $A.waitEndTs -and [Diagnostics.Stopwatch]::GetTimestamp() -ge [long]$A.waitEndTs))); $S.late = $late; $S.result = $r; $S.error = $err }
+    try { $S.decided = $true; $late = $S.abandoned -or ($null -ne $r -and $r.granted -and [DateTime]::UtcNow -ge $A.lateAfterUtc); $S.late = $late; $S.result = $r; $S.error = $err }
     finally { [Threading.Monitor]::Exit($S.lock) }
     if ($late -and $null -ne $r -and $r.granted) { try { $S.release = [string](Release-VenueClaim -Venue $A.request.Venue -Nonce $r.claim.nonce -ClaimDir $A.request.ClaimDir) } catch { $S.release = "THREW $($_.Exception.Message -replace '\s+', ' ')" } }
 }
@@ -1147,7 +1003,7 @@ $script:GuardWorker = {
     foreach ($k in $A.vars.Keys) { Set-Variable -Name $k -Value $A.vars[$k] -Scope Global }
     $hit = Get-InputOutputRefusal
     # the share reads this worker itself gave up on: the caller adds them to its own count, so Complete-VenueProcess still exits at once
-    [pscustomobject]@{ hit = $hit; abandoned = (& ($script:VenueChainModule ?? (Get-Module VenueChain)) { $script:VenueAbandonedReads }) }
+    [pscustomobject]@{ hit = $hit; abandoned = (& (Get-Module VenueChain) { $script:VenueAbandonedReads }) }
 }
 
 function Invoke-InputGuard {
@@ -1158,15 +1014,11 @@ function Invoke-InputGuard {
     $gb = $script:guardBudget
     if ($null -eq $gb) { return Get-InputOutputRefusal }
     $script:lastGuardSeam = $gb.seam
-    $guardNowSec = $gb.clock.Elapsed.TotalSeconds   # BATCH-3 r8 pass 2 (A3 sibling on 61244e31): ONE sample: the remainder and the end below are both taken from it
-    $left = $gb.sec - $guardNowSec
+    $left = $gb.sec - $gb.clock.Elapsed.TotalSeconds
     # no room to read in (a short lease, no leg can start on it): the location checks still run, for the write suppression, inside 2 s (r4 adversary pass 2 A1: not 10, which ran
     # far past such a room); the content check then refuses with $gb.code before any content read. A location check still running then fails closed, typed $gb.code.
     $noRoom = $left -lt $script:GuardReadMinSec
     $bound = $(if ($noRoom) { 2 } else { $left + 0.5 })
-    # b2 r2 (adversary pass 3 A3 sibling :1071 on 372d1bfd): the wait ends at ONE point on the guard budget's own clock, fixed here with the sample above, and is sliced against it
-    # below, so a pause between this sample and the wait never waits the stale bound past the budget
-    $guardEndSec = $guardNowSec + [double]$bound
     $prog = [hashtable]::Synchronized(@{ locationsDone = $false; item = 0; at = 'the start of the guard'; steps = [Collections.ArrayList]::Synchronized([Collections.ArrayList]::new()) })
     $vars = @{ guardedInputs = $script:guardedInputs; guardBudget = $gb; guardProgress = $prog; GuardReadMinSec = $script:GuardReadMinSec; guardDelaySeam = $script:guardDelaySeam; legPlanMode = $legPlanMode; AgentShare = $AgentShare
         stagedBuildProbe = $stagedBuildProbe; artifactProbe = $artifactProbe; RunDir = $RunDir; Venue = $Venue; ClaimDir = $ClaimDir; here = $here; ClaimDirPath = $script:ClaimDirPath
@@ -1179,22 +1031,10 @@ function Invoke-InputGuard {
         [void]$ps.AddScript($script:GuardWorker.ToString())
         [void]$ps.AddArgument(@{ chainModule = (Join-Path $here 'VenueChain.psm1'); runnerModule = $(if ($legPlanMode) { Join-Path $here 'DualVenueRunner.psm1' } else { '' }); vars = $vars })
         $async = $ps.BeginInvoke()
-        while (-not $async.IsCompleted) {
-            $guardLeft = $guardEndSec - $gb.clock.Elapsed.TotalSeconds
-            if ($guardLeft -le 0) { break }
-            [void]$async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds([Math]::Min(0.25, [double]$guardLeft)))
-        }
-        # BATCH-3 r8 (adversary r7 A5 sibling :1121): an answer seen only after the guard's end on its own clock (a worker that finished after the last slice, a parent that resumed
-        # late) is never acted on: refused exactly as one not answered, its worker disposed normally (its own given-up reads still counted)
-        $guardDone = $async.IsCompleted   # read ONCE: a worker that completes after this read is one not answered, never acted on
-        $guardLate = $guardDone -and ($gb.clock.Elapsed.TotalSeconds -gt $guardEndSec)
-        if ($guardLate) { $lateOut = try { @($ps.EndInvoke($async)) } catch { @() }; $n = $(if ($lateOut.Count -gt 0) { [int]$lateOut[-1].abandoned } else { 0 }); if ($n -gt 0) { & ($script:VenueChainModule ?? (Get-Module VenueChain)) { param($k) $script:VenueAbandonedReads += $k } $n } }
-        if (-not $guardDone -or $guardLate) {
-            if (-not $guardDone) {
-                $abandoned = $true
-                & ($script:VenueChainModule ?? (Get-Module VenueChain)) { $script:VenueAbandonedReads++ }
-                try { [void]$ps.BeginStop($null, $null) } catch { }
-            }
+        if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($bound))) {
+            $abandoned = $true
+            & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }
+            try { [void]$ps.BeginStop($null, $null) } catch { }
             # r3 (adversary r3 A2): a pass that had already been answered with a failure is that failure, refused on this poll as ever, not a read to try again: noAnswer stays off
             # #705 r14 (adversary r14 A1): a worker given up on is still in a read of an input's share (a spec, a manifest or its artifacts, all on the shares the inputs live on), so where
             # that input is cannot be read again on this thread inside the room either, even when its location was verified first: every location is left unknown, and nothing more is
@@ -1205,7 +1045,7 @@ function Invoke-InputGuard {
         }
         $out = @($ps.EndInvoke($async))
         $n = $(if ($out.Count -gt 0) { [int]$out[-1].abandoned } else { 0 })
-        if ($n -gt 0) { & ($script:VenueChainModule ?? (Get-Module VenueChain)) { param($k) $script:VenueAbandonedReads += $k } $n }
+        if ($n -gt 0) { & (Get-Module VenueChain) { param($k) $script:VenueAbandonedReads += $k } $n }
         if ($out.Count -gt 0) {
             $h = $out[-1].hit
             # r4 (sol, fable, opus r3): the same answer as the abandon branch above, for a worker that returned: a pass already answered with a failure that then ended on no room or a read given up on
@@ -1483,19 +1323,17 @@ function Get-InputContentRefusal {
             # SPEC_CHANGED_AFTER_PREFLIGHT before the lease opens (the claim guard) and before any leg runs (the open guard); a read with no answer in the budget is SHARE_UNREACHABLE
             # (no answer: a claim-wait pass is read again next poll), as a manifest read is.
             $specBound = $(if ($null -ne $script:guardBudget) { $script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds } else { Get-SpecReadBoundSec })
-            # BATCH-3 r8 pass 3 (adversary A5 on eee05a6b): the read is ALSO cut to the guard budget's own end on its own clock (a pause after the sample above gives no time back)
-            $specClock = $(if ($null -ne $script:guardBudget) { $script:guardBudget.clock } else { $null }); $specEndSec = $(if ($null -ne $script:guardBudget) { [double]$script:guardBudget.sec } else { 0.0 })
             $noAnswerHit = [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; noAnswer = $true; readAbandoned = $true; locationUnknown = $true; why = "the leg spec $($g.path) did not answer within $([Math]::Round([Math]::Max(0.0, $specBound), 2)) s of the guard's budget, so its bytes cannot be compared with the ones the export budget judged; no leg runs on it" }
             if ($legPlanMode) {
                 # r20 (hosted CI on 41f4ffd9, test_r12_a2b_a_leg_spec_the_leg_would_throw_on_after_the_wait_is_refused_before_the_lease): master's typed refusals come FIRST, so a spec
                 # changed in the wait into one the leg would throw on is LEG_SPEC_INVALID (or BAD_BACKEND) as on master; only a spec that is still runnable but is not the judged bytes
                 # is SPEC_CHANGED_AFTER_PREFLIGHT. Both come from ONE bounded read (Get-LegSpecRefusal answers '' with the sha256 of the bytes it judged), so no second read can differ.
-                $sr = @(Get-LegSpecRefusal $g.path $g.backend $specBound -Clock $specClock -EndSec $specEndSec)
+                $sr = @(Get-LegSpecRefusal $g.path $g.backend $specBound)
                 if ([string]$sr[0] -ceq 'SPEC_READ_TIMEOUT') { return $noAnswerHit }
                 if ($sr[0]) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = [string]$sr[0]; why = [string]$sr[1] } }
                 if ($g.specSha256 -and [string]$sr[2] -cne [string]$g.specSha256) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SPEC_CHANGED_AFTER_PREFLIGHT'; why = "the leg spec $($g.path) changed after the export budget preflight judged it (sha256 $($sr[2]), judged $($g.specSha256)); no lease is spent on bytes the budget did not judge" } }
             } elseif ($g.specSha256) {
-                $specRead = Read-SpecBytesWithin $g.path $specBound -Clock $specClock -EndSec $specEndSec
+                $specRead = Read-SpecBytesWithin $g.path $specBound
                 if ($specRead.state -ceq 'TIMEOUT') { return $noAnswerHit }
                 if ($specRead.state -cne 'OK') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SPEC_READ_FAILED'; why = "the leg spec $($g.path) could not be read again after the preflight ($($specRead.error -replace '\s+', ' ')), so its bytes cannot be compared with the ones the export budget judged; no leg runs on it" } }
                 $nowSha = Get-BytesSha256 $specRead.bytes
@@ -1530,12 +1368,12 @@ function Get-InputContentRefusal {
             $verifyArtifacts = -not ($null -ne $script:guardBudget -and $script:guardBudget.artifactsOff)
             # r12 (#704 merge): nor at a receipt write (Test-ReceiptWriteSuppressed): the legs already ran, and the artifacts were hashed under the claim and after the open
             if ($script:receiptGuardActive) { $verifyArtifacts = $false }
-            $abandonedBefore = & ($script:VenueChainModule ?? (Get-Module VenueChain)) { $script:VenueAbandonedReads }; $shareClock = [Diagnostics.Stopwatch]::StartNew()
+            $abandonedBefore = & (Get-Module VenueChain) { $script:VenueAbandonedReads }; $shareClock = [Diagnostics.Stopwatch]::StartNew()
             $st = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $g.commit -TimeoutSec $share -VerifyArtifacts:$verifyArtifacts -ArtifactMinSec $script:GuardReadMinSec -ProbeScript $stagedBuildProbe -ArtifactProbeScript $artifactProbe -CallBudgetClock $shareClock0 -CallBudgetEndSec $shareEndSec
             $within = $(if ($null -ne $script:guardBudget) { "a $([Math]::Round($share, 2)) s share of $($script:guardBudget.what)" } else { "a ${share} s bound" })
             # #705 r14 (adversary r14 A1 sibling): a bounded manifest read or hash given up on under a guard budget is a read still held on the manifest's share, so its location is
             # left unknown as Invoke-InputGuard leaves it for a worker given up on (a "no time left" refusal gave up on no read, and keeps the location it verified)
-            $gaveUp = ($null -ne $script:guardBudget) -and ((& ($script:VenueChainModule ?? (Get-Module VenueChain)) { $script:VenueAbandonedReads }) -gt $abandonedBefore)
+            $gaveUp = ($null -ne $script:guardBudget) -and ((& (Get-Module VenueChain) { $script:VenueAbandonedReads }) -gt $abandonedBefore)
             # r5 adversary A1 (sol r4 B2 sibling): a manifest read that answered and left the hash no room (VenueChain: artifactsUnhashed, under 2 s left of THIS read's share, no read given up on)
             # is a no-room hit like the two above (noRoom: its refusal reads no input again). The share's own remainder, measured from before the call, never the budget's (pass 2 A1: the
             # share is capped at 330 s, so a 1000 s budget still had 671 s when the share ran out). An artifact read that ERRORED with room left stays an answered failure.
@@ -1596,135 +1434,30 @@ function Get-SpecReadBoundSec {
     [Math]::Min([double]$cap, ($dl - [DateTime]::UtcNow).TotalSeconds - 2.0)
 }
 
-# DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r1 (adversary pass 8 A5): each bounded read's allowance is sampled before it runs, so a caller descheduled after sampling could take an
-# answer that arrived inside the refusal's reserve before -DeadlineUtc (Get-SpecReadBoundSec's 2 s), or past it. Read-SpecBytesWithin, Get-InputLocationWithin and
-# Get-InputUnresolvedCodeWithin judge the ARRIVAL inline ($deadline a [datetime] with less than 2.0 s left: no answer). Inline on purpose (pass 1 A1 on ebfde5a3): the guard worker
-# ($script:GuardWorkerFunctions) and the AST-lifting harnesses hand over a fixed list of functions, so a helper of its own was a missing command there.
-
-function Read-SpecBytesWithin([string]$Path, [double]$BoundSec, [int]$DelayMs = 0, [Diagnostics.Stopwatch]$Clock = $null, [double]$EndSec = 0) {
-    # BATCH-3 r8 pass 3 (adversary A5 on eee05a6b): -Clock/-EndSec, the caller's own budget end on its own clock (the guard's), as Get-VenueStagedBuildManifest takes it: the
-    # allowance is cut to what is left of it, read AFTER this call's own anchor, so a pause between the caller's remainder sample and this read never restores that time
+function Read-SpecBytesWithin([string]$Path, [double]$BoundSec, [int]$DelayMs = 0) {
     # r19 (sol r18 B2): a leg spec's bytes read on a pool thread and given up on after $BoundSec, so a share that stopped answering cannot hold the caller past -DeadlineUtc (a
     # synchronous ReadAllBytes could, before any remaining-room check ran). state OK (bytes), FAILED (error: the read threw) or TIMEOUT (no answer in the bound, or no bound left).
     # $DelayMs is the offline -ExportBudgetSpecReadDelaySec seam (0 in production).
-    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A1, A3): ONE FileStream gives both the bytes and the identity (GetFileInformationByHandle on its own handle,
-    # before the read), inside the same bounded pool-thread task. .key is '' when the handle will not identify; the bytes are still returned (a caller that needs the key refuses).
-    # (The type name carries the r4 shape: the r19 type of the same name, with no key, may already be loaded in this process by an older copy of this script.)
-    if (-not ('VenueLeaseBatchBoundedReadR4' -as [type])) {
-        $PSDefaultParameterValues = @{}   # r4 (adversary pass 5 A5 sibling :1441): a caller's Add-Type defaults (OutputAssembly, ...) never reach this compile
+    if (-not ('VenueLeaseBatchBoundedRead' -as [type])) {
         Add-Type -TypeDefinition @'
 using System;
-using System.Runtime.InteropServices;
-using Microsoft.Win32.SafeHandles;
-public static class VenueLeaseBatchBoundedReadR4 {
-    [StructLayout(LayoutKind.Sequential)]
-    struct FileTime { public uint Low; public uint High; }
-    [StructLayout(LayoutKind.Sequential)]
-    struct ByHandleFileInformation {
-        public uint Attributes; public FileTime Created; public FileTime Accessed; public FileTime Written;
-        public uint VolumeSerial; public uint SizeHigh; public uint SizeLow; public uint Links; public uint IndexHigh; public uint IndexLow;
-    }
-    [DllImport("kernel32.dll", SetLastError = true)]
-    static extern bool GetFileInformationByHandle(SafeFileHandle handle, out ByHandleFileInformation info);
-    static object[] ReadWithKey(string path) {
-        // FileShare.Read, as File.ReadAllBytes opens: a writer holding the file refuses the read, as before
-        using (System.IO.FileStream fs = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.Read)) {
-            // r5 (hosted CI on 19ce35fd, ubuntu shards: every BatchPreflightParityTests row read 'not a JSON object'): kernel32 is Windows only. Elsewhere the call throws
-            // DllNotFoundException, which failed the whole read; the bytes are still the bytes, so off Windows the key is '' (a caller that needs the key refuses, as before)
-            string key = "";
-            if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows)) {
-                ByHandleFileInformation info;
-                key = GetFileInformationByHandle(fs.SafeFileHandle, out info) ? (info.VolumeSerial.ToString("x8") + ":" + info.IndexHigh.ToString("x8") + info.IndexLow.ToString("x8")) : "";
-            }
-            using (System.IO.MemoryStream ms = new System.IO.MemoryStream()) { fs.CopyTo(ms); return new object[] { ms.ToArray(), key }; }
-        }
-    }
-    // DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r2 (adversary pass 3 A3 on 372d1bfd): the read ends at ONE absolute instant (UTC ticks), never a relative allowance the caller sampled
-    // before a pause: nothing starts at or past it, the task opens nothing once it passed, and the wait is sliced (250 ms) against it. 0 OK, 1 FAILED (the read threw), 2 TIMEOUT.
-    // BATCH-3 r8 (adversary r7 A3, :1578): the end is ALSO held on the Stopwatch (its room taken once, at the call's start), so a wall clock stepped back cannot widen the read or
-    // its wait, and the answer is judged after it arrives: one seen past either end is TIMEOUT, never OK. TestUtcStepTicks is a test seam only (0 in production).
-    public static long TestUtcStepTicks = 0;
-    static long UtcTicks() { return DateTime.UtcNow.Ticks + TestUtcStepTicks; }
-    static long MonoEnd(long endUtcTicks) {
-        double leftSec = (endUtcTicks - UtcTicks()) / (double)TimeSpan.TicksPerSecond;
-        long now = System.Diagnostics.Stopwatch.GetTimestamp();
-        return leftSec <= 0 ? now : now + (long)(Math.Min(leftSec, 86400.0) * System.Diagnostics.Stopwatch.Frequency);
-    }
-    static bool Past(long endUtcTicks, long monoEnd) { return UtcTicks() >= endUtcTicks || System.Diagnostics.Stopwatch.GetTimestamp() >= monoEnd; }
-    public static int ReadUntil(string path, int delayMs, long endUtcTicks, out byte[] bytes, out string key, out string error) { return ReadUntil(path, delayMs, endUtcTicks, MonoEnd(endUtcTicks), out bytes, out key, out error); }
-    // r8 pass 2 (adversary A3 on 61244e31): monoEnd is the CALLER's Stopwatch end, anchored before its wall samples, so no pause or step between those samples and this call moves it later
-    public static int ReadUntil(string path, int delayMs, long endUtcTicks, long monoEnd, out byte[] bytes, out string key, out string error) {
-        bytes = null; key = null; error = null;
-        if (Past(endUtcTicks, monoEnd)) { return 2; }
-        System.Threading.Tasks.Task<object[]> t = System.Threading.Tasks.Task.Run(() => { if (Past(endUtcTicks, monoEnd)) { throw new TimeoutException("the end passed before the read started"); } if (delayMs > 0) { System.Threading.Thread.Sleep(delayMs); } if (Past(endUtcTicks, monoEnd)) { throw new TimeoutException("the end passed before the open"); } return ReadWithKey(path); });
-        try {
-            while (true) {
-                long left = Math.Min((endUtcTicks - UtcTicks()) / TimeSpan.TicksPerMillisecond, (long)((monoEnd - System.Diagnostics.Stopwatch.GetTimestamp()) * 1000.0 / System.Diagnostics.Stopwatch.Frequency));
-                if (left <= 0) { return 2; }
-                if (t.Wait((int)Math.Min(250L, left))) { break; }
-            }
-        } catch (AggregateException e) {
-            // BATCH-3 r8 pass 2 (adversary A5 on 61244e31): a fault seen past the end is no answer either (TIMEOUT), never FAILED: it cannot decide a refusal
-            if (e.InnerException is TimeoutException || Past(endUtcTicks, monoEnd)) { return 2; }
-            error = e.InnerException != null ? e.InnerException.Message : e.Message; return 1;
-        }
-        if (Past(endUtcTicks, monoEnd)) { return 2; }   // an answer seen past the end is never acted on
-        bytes = (byte[])t.Result[0]; key = (string)t.Result[1];
+public static class VenueLeaseBatchBoundedRead {
+    public static int ReadWithin(string path, int delayMs, int timeoutMs, out byte[] bytes, out string error) {
+        bytes = null; error = null;
+        if (timeoutMs <= 0) { return 2; }
+        System.Threading.Tasks.Task<byte[]> t = System.Threading.Tasks.Task.Run(() => { if (delayMs > 0) { System.Threading.Thread.Sleep(delayMs); } return System.IO.File.ReadAllBytes(path); });
+        try { if (!t.Wait(timeoutMs)) { return 2; } } catch (AggregateException e) { error = e.InnerException != null ? e.InnerException.Message : e.Message; return 1; }
+        bytes = t.Result;
         return 0;
-    }
-    // r4 fix 2 (adversary pass 6 A6 sibling): a diagnostic line on stderr, on a pool thread waited for at most timeoutMs (a full stderr pipe cannot hold the caller)
-    public static bool ErrorLineWithin(string line, int timeoutMs) {
-        System.Threading.Tasks.Task t = System.Threading.Tasks.Task.Run(() => Console.Error.WriteLine(line));
-        try { return t.Wait(timeoutMs); } catch (AggregateException) { return false; }
     }
 }
 '@
     }
-    $readT0 = [Diagnostics.Stopwatch]::GetTimestamp()   # BATCH-3 r8 pass 2 (A3 on 61244e31): the Stopwatch end is anchored HERE, before every wall sample below
     $ms = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min(3600.0, $BoundSec)) * 1000.0)
-    $b = $null; $k = $null; $e = $null
-    $full = try { [IO.Path]::GetFullPath($Path) } catch { return [pscustomobject]@{ state = 'FAILED'; bytes = $null; key = ''; error = ($_.Exception.Message -replace '\s+', ' ') } }
-    # b2 r1 (adversary pass 2 A3 on bf5ebeb2): the caller's -BoundSec was sampled before this call; the room before -DeadlineUtc (less the 2 s reserve) is asked again as the
-    # last step before the read starts, so a caller descheduled after sampling never waits on its old allowance
-    $dlR = Get-Variable -Name deadline -ValueOnly -ErrorAction Ignore
-    if ($dlR -is [datetime]) { $ms = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min([double]$ms, (($dlR - [DateTime]::UtcNow).TotalSeconds - 2.0) * 1000.0))) }
-    if ($null -ne $Clock) { $ms = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min([double]$ms, ([double]$EndSec - $Clock.Elapsed.TotalSeconds) * 1000.0))) }   # r8 pass 3 (A5): the caller's own end
-    # b2 r2 (adversary pass 3 A3 on 372d1bfd): the allowance above is turned into ONE absolute end here (the room before -DeadlineUtc less the reserve is read again, now), and
-    # the read and its wait end at it (ReadUntil), so a pause after any sample costs no wait past the deadline's reserve. A type an older copy of this script loaded in this
-    # process (no ReadUntil) is no answer: TIMEOUT, never an unbounded read.
-    $endUtc = [DateTime]::UtcNow.AddMilliseconds([double]$ms)
-    # BATCH-3 r2 (CI 45506989386, p6 A4 LEASE-BATCH-DEADLINE-MINVALUE-CLAMP-1): the room is clamped to [0, 3600] s BEFORE it is added to now, so a -DeadlineUtc near
-    # DateTime.MinValue (or MaxValue) never throws "un-representable DateTime"; a room <= 0 ends the read now (the allowance above is already 0), one > 3600 s never wins over it
-    if ($dlR -is [datetime]) { $dlEnd = [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, [Math]::Min(3600.0, ($dlR - [DateTime]::UtcNow).TotalSeconds - 2.0))); if ($dlEnd -lt $endUtc) { $endUtc = $dlEnd } }
-    $readMonoEnd = $readT0 + [long]([double]$ms / 1000.0 * [double][Diagnostics.Stopwatch]::Frequency)   # the allowance ($ms, already under the deadline's room) from the anchor
-    $rc = try { [VenueLeaseBatchBoundedReadR4]::ReadUntil($full, $DelayMs, $endUtc.Ticks, $readMonoEnd, [ref]$b, [ref]$k, [ref]$e) } catch { $b = $null; $k = ''; $e = $null; 2 }
-    $dlA = Get-Variable -Name deadline -ValueOnly -ErrorAction Ignore
-    if ($rc -ne 2 -and $dlA -is [datetime] -and ($dlA - [DateTime]::UtcNow).TotalSeconds -lt 2.0) { $rc = 2; $b = $null; $k = ''; $e = $null }   # b2 r1 (pass 8 A5): an answer inside the deadline's reserve is no answer
-    [pscustomobject]@{ state = @('OK', 'FAILED', 'TIMEOUT')[$rc]; bytes = $b; key = [string]$k; error = $e }
-}
-
-function Get-InputLocationWithin([string]$Path) {
-    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A3 siblings :1763 :1793): an input's final path and identity read on a pool thread (LocateWithin) and given up on
-    # at the room left before -DeadlineUtc (Get-SpecReadBoundSec), so a share that stopped answering cannot hold the preflight past it. $null = no answer in time, or no answer at all
-    # (the caller's refusal for an input that will not identify, unchanged).
-    if (-not ('VenueLeaseBatchFinalPath' -as [type])) { try { $null = Get-PhysicalPath $here } catch { return $null } }   # (Get-PhysicalPath loads the native type)
-    $locT0 = [Diagnostics.Stopwatch]::GetTimestamp()   # BATCH-3 r8 pass 2 (A3 on 61244e31): the Stopwatch end is anchored HERE, before every wall sample below
-    $ms = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min(3600.0, (Get-SpecReadBoundSec))) * 1000.0)
-    if ($ms -le 0) { return $null }
-    $phys = $null; $key = $null
-    $full = try { [IO.Path]::GetFullPath($Path) } catch { return $null }
-    # b2 r2 (adversary pass 3 A3 on 372d1bfd): ONE absolute end (the allowance, under the room before -DeadlineUtc less the reserve read again now); the read and its wait end at
-    # it (LocateUntil), so a pause after the sample above never waits the stale allowance. An older loaded type without LocateUntil is no answer.
-    $endUtc = [DateTime]::UtcNow.AddMilliseconds([double]$ms)
-    $dlL = Get-Variable -Name deadline -ValueOnly -ErrorAction Ignore
-    # BATCH-3 r2 (p6 A4 sibling, same expression): the room is clamped to [0, 3600] s before it is added to now (no un-representable DateTime)
-    if ($dlL -is [datetime]) { $dlEnd = [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, [Math]::Min(3600.0, ($dlL - [DateTime]::UtcNow).TotalSeconds - 2.0))); if ($dlEnd -lt $endUtc) { $endUtc = $dlEnd } }
-    $locMonoEnd = $locT0 + [long]([double]$ms / 1000.0 * [double][Diagnostics.Stopwatch]::Frequency)   # the allowance ($ms, already under the deadline's room) from the anchor
-    $located = try { [VenueLeaseBatchFinalPath]::LocateUntil($full, 0, $endUtc.Ticks, $locMonoEnd, [ref]$phys, [ref]$key) } catch { $false }
-    if (-not $located) { return $null }
-    $dlA = Get-Variable -Name deadline -ValueOnly -ErrorAction Ignore
-    if ($dlA -is [datetime] -and ($dlA - [DateTime]::UtcNow).TotalSeconds -lt 2.0) { return $null }   # b2 r1 (pass 8 A5): an answer inside the deadline's reserve is no answer
-    [pscustomobject]@{ phys = $phys; key = $key }
+    $b = $null; $e = $null
+    $full = try { [IO.Path]::GetFullPath($Path) } catch { return [pscustomobject]@{ state = 'FAILED'; bytes = $null; error = ($_.Exception.Message -replace '\s+', ' ') } }
+    $rc = [VenueLeaseBatchBoundedRead]::ReadWithin($full, $DelayMs, $ms, [ref]$b, [ref]$e)
+    [pscustomobject]@{ state = @('OK', 'FAILED', 'TIMEOUT')[$rc]; bytes = $b; error = $e }
 }
 
 function Get-BytesSha256([byte[]]$Bytes) {
@@ -1733,8 +1466,7 @@ function Get-BytesSha256([byte[]]$Bytes) {
     try { ([BitConverter]::ToString($h.ComputeHash($Bytes)) -replace '-', '').ToLowerInvariant() } finally { $h.Dispose() }
 }
 
-function Get-LegSpecRefusal([string]$Path, [string]$Backend, [double]$BoundSec = -1, [Diagnostics.Stopwatch]$Clock = $null, [double]$EndSec = 0) {
-    # BATCH-3 r8 pass 3 (adversary A5 sibling :1733 on eee05a6b): -Clock/-EndSec, the guard's own budget end, forwarded to the bounded read
+function Get-LegSpecRefusal([string]$Path, [string]$Backend, [double]$BoundSec = -1) {
     # sol r3 A4: the refusal Invoke-VenueLeg would throw (DVE_LEG_SPEC_INVALID) AFTER the lease is open, found before it. '' when the leg can take this backend.
     # Same reads as Invoke-VenueLeg: the file's bytes as UTF-8, ConvertFrom-Json, the schema, then the backend against the spec's own list.
     # sol r3 second pass A1: then the spec fields Invoke-VenueLeg casts or validates BEFORE its terminal try (playSeconds, visualCapture and its opt-out reason,
@@ -1746,7 +1478,7 @@ function Get-LegSpecRefusal([string]$Path, [string]$Backend, [double]$BoundSec =
     # r19 (sol r18 B2 sibling :1340): the read is bounded (Read-SpecBytesWithin), by what is left before -DeadlineUtc or by the caller's guard budget; no answer in it is the typed
     # SPEC_READ_TIMEOUT, never a read that holds the batch past its deadline. A read that threw stays what it was (not a JSON object).
     # r20: the read's result is $specRead, never $rd (rd is the rmdir alias the owner-footage route census refuses as a delete primitive, test_dual_venue_owner_footage_gate.py)
-    $specRead = Read-SpecBytesWithin $Path $(if ($BoundSec -ge 0) { $BoundSec } else { Get-SpecReadBoundSec }) -Clock $Clock -EndSec $EndSec
+    $specRead = Read-SpecBytesWithin $Path $(if ($BoundSec -ge 0) { $BoundSec } else { Get-SpecReadBoundSec })
     if ($specRead.state -ceq 'TIMEOUT') { return 'SPEC_READ_TIMEOUT', "'$Path' cannot be run: the leg spec could not be read within the time left before -DeadlineUtc (or the guard's budget); no claim or lease is taken on it" }
     $spec = $(if ($specRead.state -ceq 'OK') { try { [Text.Encoding]::UTF8.GetString($specRead.bytes) | ConvertFrom-Json -NoEnumerate } catch { $null } } else { $null })
     if ($null -eq $spec -or $spec -isnot [System.Management.Automation.PSCustomObject]) { return 'LEG_SPEC_INVALID', "'$Path' is not a JSON object" }
@@ -1754,7 +1486,6 @@ function Get-LegSpecRefusal([string]$Path, [string]$Backend, [double]$BoundSec =
     # r20: and the third element of a '' answer, so the content guard compares THESE bytes with the judged ones (one read, after master's own typed refusals)
     $judgedSha = Get-BytesSha256 $specRead.bytes
     if ($script:SpecShapeSha256 -is [hashtable]) { $script:SpecShapeSha256[$Path] = $judgedSha }
-    if ($script:SpecShapeFileKey -is [hashtable]) { $script:SpecShapeFileKey[$Path] = [string]$specRead.key }   # r4 (pass 5 A1): the file these bytes came from, off the same handle
     $shapeRefusal = Get-DvLegSpecShapeRefusal -Spec $spec
     if ($null -ne $shapeRefusal) { return 'LEG_SPEC_INVALID', "'$Path' cannot be run: $shapeRefusal" }
     if ($spec.schema -ne 'mlv-app/dual-venue-leg/v1') { return 'LEG_SPEC_INVALID', "'$Path' schema is '$($spec.schema)', expected mlv-app/dual-venue-leg/v1" }
@@ -1769,16 +1500,6 @@ function Get-LegSpecRefusal([string]$Path, [string]$Backend, [double]$BoundSec =
     } catch { return 'LEG_SPEC_INVALID', "'$Path' cannot be run: $($_.Exception.Message -replace '\s+', ' ')" }
     return '', '', $judgedSha
 }
-
-function Get-ExportBudgetChildDeadline {
-    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A2 siblings :1557 :1570): the ABSOLUTE end of an export-budget child, the room's own end (-DeadlineUtc less the
-    # refusal's reserve and the kill/stream cleanup budget), handed to Invoke-VenueBoundedProcess so a parent descheduled after the room was cut neither starts the child late nor
-    # waits its full relative bound past it (a child not started is .timedOut: the caller's EXPORT_BUDGET_PREFLIGHT_TIMEOUT)
-    $deadline.ToUniversalTime().AddSeconds(-$script:ExportBudgetPreflightReserveSec).AddMilliseconds(-$script:ExportBudgetPreflightCleanupMs)
-}
-
-# DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r1 (adversary pass 8 A4; pass 1 A3 on ebfde5a3): how a timed-out bounded child ended is said by VenueChain's
-# Format-VenueBoundedChildEnd (one formatter for the batch and the chain), from Invoke-VenueBoundedProcess's .lateStart, .lateExit, .killAttempted, .killErrored, .killConfirmed.
 
 function Get-ExportBudgetRefusal([string]$Path) {
     # r8 (adversary r7 A3): an export leg whose job budget the agent would refuse (DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED: the submitted timeout passes the agent's 86400 s cap) used to be
@@ -1807,15 +1528,7 @@ function Get-ExportBudgetRefusal([string]$Path) {
     if ($script:SpecShapeSha256.ContainsKey($Path) -and [string]$script:SpecShapeSha256[$Path] -cne $judgedSha) {
         return 'SPEC_CHANGED_AFTER_PREFLIGHT', "'$Path' cannot be run: the leg spec changed between the preflight's shape check (sha256 $($script:SpecShapeSha256[$Path])) and its export budget read (sha256 $judgedSha); no claim or lease is taken on bytes no single check judged"
     }
-    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A1): the file these judged bytes came from, off the handle they were read through. A read that will not identify
-    # is refused (the entries are grouped by it before the claim), and so is a budget read from another file than the shape check's (two judged reads, two files).
-    $judgedKey = [string]$specRead.key
-    if (-not $judgedKey) { return 'SPEC_READ_FAILED', "'$Path' cannot be run: the export budget preflight read the leg spec but could not identify the file its bytes came from, so it cannot be compared with the other entries; no claim or lease is taken on it" }
-    if ($script:SpecShapeFileKey.ContainsKey($Path) -and [string]$script:SpecShapeFileKey[$Path] -cne $judgedKey) {
-        return 'SPEC_CHANGED_AFTER_PREFLIGHT', "'$Path' cannot be run: the preflight's shape check read file $($script:SpecShapeFileKey[$Path]) and its export budget read file $judgedKey (the name was re-pointed between them); no claim or lease is taken on bytes no single file supplied"
-    }
     $script:SpecBudgetSha256[$Path] = $judgedSha
-    $script:SpecBudgetFileKey[$Path] = $judgedKey
     try { $spec = [Text.Encoding]::UTF8.GetString($specBytes) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop }
     catch { return 'SPEC_READ_FAILED', "'$Path' cannot be run: the leg spec no longer parses on the export budget preflight's read ($($_.Exception.Message -replace '\s+', ' ')), so its job budget is unchecked; no claim or lease is taken on it" }
     if ($spec -isnot [System.Management.Automation.PSCustomObject]) { return 'SPEC_READ_FAILED', "'$Path' cannot be run: the leg spec is no longer one JSON object on the export budget preflight's read, so its job budget is unchecked; no claim or lease is taken on it" }
@@ -1834,10 +1547,8 @@ function Get-ExportBudgetRefusal([string]$Path) {
     $boundFloor = [Math]::Floor([Math]::Min([double]$script:ExportBudgetPreflightCapSec, $room))
     if ($boundFloor -lt 1) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight was not started, $([Math]::Round([Math]::Max(0.0, $room), 1)) s were left before -DeadlineUtc (less $($script:ExportBudgetPreflightReserveSec) s)" }
     $boundSec = [int]$boundFloor   # (in range: the floor is between 1 and the 120 s cap)
-    $bp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-PreflightBudgetOnly', '-ClipId', $clipId, '-Format', $format, '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs -DeadlineUtc (Get-ExportBudgetChildDeadline) -MinRoomSec 1   # r5 (pass 7 A1): the 1 s floor, at the child's OS start
-    # r4 fix 2 (adversary pass 6 A3): a child the absolute bound never let start is said to be never started, not killed
-    if ($bp.notStarted) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight was not started (its room before -DeadlineUtc, less $($script:ExportBudgetPreflightReserveSec) s, had ended by its start); nothing was started, so nothing was killed" }
-    if ($bp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight $(Format-VenueBoundedChildEnd $bp $boundSec)" }   # b2 r1 (pass 8 A4)
+    $bp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-PreflightBudgetOnly', '-ClipId', $clipId, '-Format', $format, '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs
+    if ($bp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight did not answer in $boundSec s and was killed ($(if ($bp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))" }
     $text = (@($bp.stdout, $bp.stderr) | Where-Object { $_ }) -join "`n"
     if ($text -match '(?m)DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED[^\r\n]*') { return 'EXPORT_TIME_BUDGET_EXCEEDED', "'$Path' cannot be run: $($Matches[0] -replace '\s+', ' ')" }
     if ($bp.exit -eq 0) { return '', '' }
@@ -1849,9 +1560,8 @@ function Get-ExportBudgetRefusal([string]$Path) {
     $boundFloor = [Math]::Floor([Math]::Min([double]$script:ExportBudgetPreflightCapSec, $room))
     if ($boundFloor -lt 1) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor was not started, $([Math]::Round([Math]::Max(0.0, $room), 1)) s were left before -DeadlineUtc (less $($script:ExportBudgetPreflightReserveSec) s)" }
     $boundSec = [int]$boundFloor
-    $fp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-DescribeTimeBudgetBytes', '0', '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs -DeadlineUtc (Get-ExportBudgetChildDeadline) -MinRoomSec 1   # r5 (pass 7 A1 sibling)
-    if ($fp.notStarted) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor was not started (its room before -DeadlineUtc had ended by its start); nothing was started, so nothing was killed" }   # r4 fix 2 (A3 sibling)
-    if ($fp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor $(Format-VenueBoundedChildEnd $fp $boundSec)" }   # b2 r1 (A4 sibling)
+    $fp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-DescribeTimeBudgetBytes', '0', '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs
+    if ($fp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor did not answer in $boundSec s and was killed ($(if ($fp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))" }
     $floorText = (@($fp.stdout, $fp.stderr) | Where-Object { $_ }) -join "`n"
     if ($floorText -match '(?m)DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED[^\r\n]*') { return 'EXPORT_TIME_BUDGET_EXCEEDED', "'$Path' cannot be run: the clip did not resolve here, and the clip-independent floor alone (a 0-byte clip) is refused: $($Matches[0] -replace '\s+', ' ')" }
     # (adversary pass 19 A1: the floor reads no clip, so a floor child that ends with no answer -- a nonzero exit and no marker, e.g. its module import held without read sharing -- is
@@ -1863,7 +1573,7 @@ function Get-ExportBudgetRefusal([string]$Path) {
     return '', ''
 }
 
-function Get-ScalarLegShapeRefusal([string]$Path, [string]$ExpectSha256 = '') {
+function Get-ScalarLegShapeRefusal([string]$Path) {
     # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r8 (adversary r8 A3): the -LegSpec / -LegSet modes run the leg's SHAPE predicate (Get-DvLegSpecShapeRefusal, the one
     # the leg and Get-LegSpecRefusal call) before any claim, read the way the leg reads the spec (-NoEnumerate). A spec that does not parse is left to the
     # existing paths (unchanged); only a shape the leg would throw on after the lease opened is refused here. '' when the shape is runnable.
@@ -1873,17 +1583,9 @@ function Get-ScalarLegShapeRefusal([string]$Path, [string]$ExpectSha256 = '') {
     $specRead = Read-SpecBytesWithin $Path (Get-SpecReadBoundSec)
     if ($specRead.state -ceq 'TIMEOUT') { return "SPEC_READ_TIMEOUT '$Path' cannot be run: the leg spec could not be read within the time left before -DeadlineUtc; no claim or lease is taken on it" }
     if ($specRead.state -cne 'OK') { return "the leg spec is not valid JSON (it could not be read: $($specRead.error -replace '\s+', ' '))" }
-    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r3 (sol r2 B2): a -LegSet entry carries the sha256 the set planner judged (-ExpectSha256). The RAW bytes read here are compared with
-    # it BEFORE any parse or shape check (Invoke-VenueLeg's own order), so bytes replaced after planning are always the typed SPEC_CHANGED_AFTER_PREFLIGHT, whatever they hold
-    # ('{', null, [], a string-valued switch), never LEG_SPEC_INVALID; an unchanged spec that is invalid is still judged below and keeps LEG_SPEC_INVALID.
-    if ($ExpectSha256) {
-        $readSha = Get-BytesSha256 ([byte[]]$specRead.bytes)
-        if ($readSha -cne $ExpectSha256) { return "SPEC_CHANGED_AFTER_PREFLIGHT '$Path' cannot be run: the leg spec read as sha256 $readSha after the leg-set planner judged sha256 $ExpectSha256 (planned_sha256=$ExpectSha256); no claim or lease is taken on bytes the planner did not judge" }
-    }
     try { $spec = [Text.Encoding]::UTF8.GetString($specRead.bytes) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop }
     catch { return "the leg spec is not valid JSON ($($_.Exception.Message -replace '\s+', ' '))" }
     $script:SpecShapeSha256[$Path] = Get-BytesSha256 $specRead.bytes  # r19 (sol r18 B1 sibling): the bytes this shape check judged
-    $script:SpecShapeFileKey[$Path] = [string]$specRead.key   # r4 (pass 5 A1): and the file they came from, off the same handle
     try { $refusal = Get-DvLegSpecShapeRefusal -Spec $spec } catch { return "the leg spec cannot be shape-checked ($($_.Exception.Message -replace '\s+', ' '))" }
     $(if ($null -ne $refusal) { [string]$refusal } else { '' })
 }
@@ -1932,9 +1634,8 @@ if ($legPlanMode) {
             if ($specRefusal[0]) { Stop-PlanRefused $specRefusal[0] $n $specRefusal[1] }
             $budgetRefusal = Get-ExportBudgetRefusal $path   # r8 (adversary r7 A3): an export window the agent's job cap refuses is refused HERE, before any claim or lease
             if ($budgetRefusal[0]) { Stop-PlanRefused $budgetRefusal[0] $n $budgetRefusal[1] }
-            $judgedKey = [string]$script:SpecBudgetFileKey[$path]   # r4 (adversary pass 5 A1, A3): the file THIS item's judged bytes came from, off the handle that read them
             $items.Add([pscustomobject]@{ item = $n; legId = (Get-LegSpecId $path); spec = $path; backend = $be.ToLowerInvariant(); arm = $arm; sourceCommit = $sc.ToLowerInvariant(); buildManifestSha256 = $ms.ToLowerInvariant()
-                    specSha256 = [string]$script:SpecBudgetSha256[$path]; fileKey = $judgedKey })   # r2 (adversary A1 class): THIS item's judged bytes
+                    specSha256 = [string]$script:SpecBudgetSha256[$path] })   # r2 (adversary A1 class): THIS item's judged bytes
         }
         # Each build once (the read Invoke-VenueChain's supplementary leg makes): staged on the venue, and with exactly the manifest the item names.
         $builds = [ordered]@{}
@@ -1970,7 +1671,7 @@ if ($legPlanMode) {
         }
         foreach ($it in $ordered) {
             $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}-{3}' -f ($plan.Count + 1), $it.legId, $it.backend, $it.arm); spec = $it.spec; backend = $it.backend
-                    arm = $it.arm; sourceCommit = $it.sourceCommit; buildManifestSha256 = $it.buildManifestSha256; planItem = $it.item; specSha256 = $it.specSha256; fileKey = $it.fileKey })
+                    arm = $it.arm; sourceCommit = $it.sourceCommit; buildManifestSha256 = $it.buildManifestSha256; planItem = $it.item; specSha256 = $it.specSha256 })
         }
         $planRecord = [ordered]@{ schema = 'mlv-app/venue-lease-leg-plan-run/v1'; legPlan = $planPath; order = $PlanOrder; arms = @($plan | ForEach-Object { $_.arm } | Select-Object -Unique)
             legs = @($plan | ForEach-Object { [ordered]@{ name = $_.name; planItem = $_.planItem; arm = $_.arm; backend = $_.backend; sourceCommit = $_.sourceCommit; buildManifestSha256 = $_.buildManifestSha256; spec = $_.spec } })
@@ -1982,12 +1683,10 @@ if ($legPlanMode) {
     }
 } elseif ($LegSet) {
     Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force
-    # r5 (hosted CI on 19ce35fd; adversary pass 7 A7): the planner reads each spec through THIS script's bounded read (one FileStream gives the bytes and the key, given up on at
-    # the room left before -DeadlineUtc), so the planner's judged read is bounded like every other spec read and the module compiles nothing of its own
-    $sp = try { Get-DvLegSetPlan -LegSetPath (Join-Path $here "legsets\$LegSet.json") -Repeats $Repeats -Backend $(if ($Backend) { $Backend } else { '' }) -WithFileKey -FileKeyReader { param($p) Read-SpecBytesWithin $p (Get-SpecReadBoundSec) } } catch { Stop-Usage $_.Exception.Message }
+    $sp = try { Get-DvLegSetPlan -LegSetPath (Join-Path $here "legsets\$LegSet.json") -Repeats $Repeats -Backend $(if ($Backend) { $Backend } else { '' }) } catch { Stop-Usage $_.Exception.Message }
     foreach ($e in $sp.plan) {
-        $shapeRefusal = Get-ScalarLegShapeRefusal ([string]$e.specPath) ([string]$e.specSha256)   # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r8 (adversary r8 A3): before the lease, as -LegPlan does; BATCH-3 r3 (sol r2 B2): the planner's sha256 first
-        if ($shapeRefusal -clike 'SPEC_READ_TIMEOUT *' -or $shapeRefusal -clike 'SPEC_CHANGED_AFTER_PREFLIGHT *') { Stop-Usage $shapeRefusal }   # r19 (sol r18 B2 sibling): the read's own typed code; BATCH-3 r3 (B2): and the planner-digest refusal, typed
+        $shapeRefusal = Get-ScalarLegShapeRefusal ([string]$e.specPath)   # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r8 (adversary r8 A3): before the lease, as -LegPlan does
+        if ($shapeRefusal -clike 'SPEC_READ_TIMEOUT *') { Stop-Usage $shapeRefusal }   # r19 (sol r18 B2 sibling): the read's own typed code
         if ($shapeRefusal) { Stop-Usage "LEG_SPEC_INVALID '$($e.specPath)' cannot be run: $shapeRefusal" }
         $budgetRefusal = Get-ExportBudgetRefusal ([string]$e.specPath)   # r8 (adversary r7 A3): before the lease, as -LegPlan does
         if ($budgetRefusal[0]) { Stop-Usage "$($budgetRefusal[0]) $($budgetRefusal[1])" }
@@ -1997,12 +1696,7 @@ if ($legPlanMode) {
         if ([string]$script:SpecBudgetSha256[[string]$e.specPath] -cne [string]$e.specSha256) {
             Stop-Usage "SPEC_CHANGED_AFTER_PREFLIGHT '$($e.specPath)' cannot be run: the leg spec read as sha256 $([string]$script:SpecBudgetSha256[[string]$e.specPath]) after the leg-set planner judged sha256 $($e.specSha256) (planned_sha256=$($e.specSha256)); no claim or lease is taken on bytes the planner did not judge"
         }
-        # r4 fix 2 (adversary pass 6 A5): and the file they came from must be the one the planner judged (its own read's handle, -WithFileKey): one file judged by the planner as
-        # two specs, then replaced by two files holding those bytes, would otherwise pass both digest checks and land in two groups
-        if ([string]$script:SpecBudgetFileKey[[string]$e.specPath] -cne [string]$e.specFileKey) {
-            Stop-Usage "SPEC_CHANGED_AFTER_PREFLIGHT '$($e.specPath)' cannot be run: the leg-set planner judged its bytes from file $($e.specFileKey) but the preflight's budget read came from file $([string]$script:SpecBudgetFileKey[[string]$e.specPath]) (planned_sha256=$($e.specSha256)); no claim or lease is taken on a file the planner did not judge"
-        }
-        $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend; specSha256 = [string]$e.specSha256; fileKey = [string]$e.specFileKey })   # r4 (pass 5 A1, A3; pass 6 A5): the planner's judged file, equal to the budget read's
+        $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend; specSha256 = [string]$e.specSha256 })
     }
 } else {
     Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force
@@ -2019,11 +1713,10 @@ if ($legPlanMode) {
         if ($shapeRefusal) { Stop-Usage "LEG_SPEC_INVALID '$path' cannot be run: $shapeRefusal" }
         $budgetRefusal = Get-ExportBudgetRefusal $path   # r8 (adversary r7 A3): before any claim or lease, as -LegPlan does
         if ($budgetRefusal[0]) { Stop-Usage "$($budgetRefusal[0]) $($budgetRefusal[1])" }
-        $judgedKey = [string]$script:SpecBudgetFileKey[$path]   # r4 (adversary pass 5 A1, A3): the file THIS entry's judged bytes came from, off the handle that read them
         $legId = Get-LegSpecId $path
         $judgedSha = [string]$script:SpecBudgetSha256[$path]   # r2 (adversary A1 class): THIS entry's judged bytes
         for ($r = 1; $r -le $Repeats; $r++) {
-            $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f ($plan.Count + 1), $legId, $(if ($Backend) { $Backend } else { 'spec' })); spec = $path; backend = $(if ($Backend) { $Backend } else { '' }); specSha256 = $judgedSha; fileKey = $judgedKey })
+            $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f ($plan.Count + 1), $legId, $(if ($Backend) { $Backend } else { 'spec' })); spec = $path; backend = $(if ($Backend) { $Backend } else { '' }); specSha256 = $judgedSha })
         }
     }
 }
@@ -2049,7 +1742,7 @@ foreach ($leg in $plan) {
 # r11 (sol r10 blocker 3): the validated inputs, kept for the re-check once the claim is held (Get-InputOutputRefusal). A -LegSet's specs are inputs too, so they are checked now as well.
 $script:guardedInputs = [System.Collections.Generic.List[object]]::new()
 if ($legPlanMode) { $script:guardedInputs.Add([pscustomobject]@{ path = $planPath; kind = 'plan'; item = 0 }) }
-foreach ($p in $plan) { $script:guardedInputs.Add([pscustomobject]@{ path = $p.spec; kind = 'spec'; item = $(if ($legPlanMode) { $p.planItem } else { 0 }); backend = $p.backend; specSha256 = [string]$p.specSha256; fileKey = [string]$p.fileKey }) }   # r19 (sol r18 B1): the judged bytes' sha256; r3 (A2 class): THIS entry's own, never a path-keyed lookup
+foreach ($p in $plan) { $script:guardedInputs.Add([pscustomobject]@{ path = $p.spec; kind = 'spec'; item = $(if ($legPlanMode) { $p.planItem } else { 0 }); backend = $p.backend; specSha256 = [string]$p.specSha256 }) }   # r19 (sol r18 B1): the judged bytes' sha256; r3 (A2 class): THIS entry's own, never a path-keyed lookup
 # r12 (adversary r12 A1): and each staged build manifest the plan reads (-LegPlan only; the scalar form's one build is read inside the leg job, after the lease)
 if ($legPlanMode) { foreach ($b in $builds.GetEnumerator()) { $first = @($items | Where-Object { [string]::Equals([string]$_.sourceCommit, [string]$b.Key, [StringComparison]::Ordinal) })[0]; $script:guardedInputs.Add([pscustomobject]@{ path = $b.Value.path; kind = 'build'; item = $first.item; commit = $b.Key; sha256 = $first.buildManifestSha256 }) } }
 # r6 pass 3 (adversary r6 pass 2 A1): each input's physical path and file identity as accepted (the preflight guard just resolved it), for Get-WriteDestinationHit
@@ -2057,51 +1750,22 @@ if ($legPlanMode) { foreach ($b in $builds.GetEnumerator()) { $first = @($items 
 # is asked again (a save-as-rename's moment), at most three times, and one that still will not is refused here, before any claim, in its unresolved type.
 foreach ($g in $script:guardedInputs) {
     $acc = $null
-    $askTimedOut = $false
     for ($ask = 1; $ask -le 3 -and $null -eq $acc; $ask++) {
-        # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A3 sibling :1763): bounded by the room before -DeadlineUtc (Get-InputLocationWithin), never a synchronous open
-        $askStart = [DateTime]::UtcNow; $askBound = Get-SpecReadBoundSec
-        $acc = Get-InputLocationWithin $g.path
-        $askTimedOut = ($null -eq $acc -and ([DateTime]::UtcNow - $askStart).TotalSeconds -ge [Math]::Max(0.0, $askBound))
-        if ($askTimedOut) { break }
+        $acc = $(try { [pscustomobject]@{ phys = (Get-PhysicalPath $g.path); key = (Get-FileIdentity $g.path).key } } catch { $null })
         if ($null -eq $acc -and $ask -lt 3) { Start-Sleep -Milliseconds 200 }
     }
     $g | Add-Member -NotePropertyName accepted -NotePropertyValue $acc
     if ($null -eq $acc) {
-        # (an input that did not answer in the room left is INPUT_UNREADABLE at once: Get-InputUnresolvedCode's own opens are synchronous and would hold the preflight on it again)
-        # r4 fix 2 (adversary pass 6 A4): three FAST faults leave the diagnostic to run, and its opens are synchronous: it is bounded by the same room (Get-InputUnresolvedCodeWithin)
-        $code = $(if ($askTimedOut) { 'INPUT_UNREADABLE' } else { Get-InputUnresolvedCodeWithin $g.path -SkipRead:($g.kind -ceq 'build') }); if (-not $code) { $code = 'INPUT_UNREADABLE' }
+        $code = Get-InputUnresolvedCode $g.path -SkipRead:($g.kind -ceq 'build'); if (-not $code) { $code = 'INPUT_UNREADABLE' }
         $label = $(if ($g.kind -ceq 'plan') { 'the plan file' } elseif ($g.kind -ceq 'build') { 'the staged build manifest' } else { 'the leg spec' })
         Stop-InputIsOutput ([pscustomobject]@{ kind = 'unresolved'; input = $g.kind; item = $g.item; code = $code; path = $g.path; why = "$label '$($g.path)' could not be identified as it was accepted (no destination could be compared with it)" })
-    }
-}
-# DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r3 fix 2 (adversary pass 3 A1): the digest tables are keyed by the path STRING (ordinal, so two files on a case-sensitive directory stay
-# two), and the check after the plan compares each entry with its own string's binding. The same FILE reached by two spellings (Pace.json and pace.json on a case-insensitive
-# volume, or a hard link) is two strings, so it is compared HERE by the file identity just accepted: every entry naming one file must have been judged as the same bytes, before
-# any claim or lease (the guard's re-read after the claim would only find it once the claim was taken).
-# r3 fix 3 (adversary pass 4 A3): grouped by the identity each entry recorded with ITS judged read, not this later sweep's: a name re-pointed at another file between the two would
-# otherwise split one judged file into two groups. r4 (adversary pass 5 A1): that identity is read off the SAME handle as the judged bytes (Read-SpecBytesWithin), so no re-point
-# between a byte read and an identity open exists. An entry with no recorded identity is refused (never the sweep's later identity in its place: that is another open, maybe another file).
-$specByFile = [Collections.Hashtable]::new([StringComparer]::Ordinal)
-foreach ($g in @($script:guardedInputs | Where-Object { $_.kind -ceq 'spec' })) {
-    $fileKey = [string]$g.fileKey
-    if (-not $fileKey) {
-        $msg = "'$($g.path)' cannot be run: no file identity was recorded with its judged read, so it cannot be compared with the other entries; no claim or lease is taken on it"
-        if ($legPlanMode) { Stop-PlanRefused 'SPEC_CHANGED_AFTER_PREFLIGHT' $g.item $msg } else { Stop-Usage "SPEC_CHANGED_AFTER_PREFLIGHT $msg" }
-    }
-    if (-not $specByFile.ContainsKey($fileKey)) { $specByFile[$fileKey] = $g; continue }
-    $firstSpec = $specByFile[$fileKey]
-    if ([string]$firstSpec.specSha256 -cne [string]$g.specSha256) {
-        $msg = "'$($g.path)' cannot be run: it is the same file as '$($firstSpec.path)', which was judged as sha256 $($firstSpec.specSha256), but this entry's preflight judged sha256 $($g.specSha256) (planned_sha256=$($firstSpec.specSha256)); no claim or lease is taken on one file judged as two specs"
-        if ($legPlanMode) { Stop-PlanRefused 'SPEC_CHANGED_AFTER_PREFLIGHT' $g.item $msg } else { Stop-Usage "SPEC_CHANGED_AFTER_PREFLIGHT $msg" }
     }
 }
 if ($LegSet) { $hit = Get-InputOutputRefusal; if ($hit) { Stop-InputIsOutput $hit } }
 # r5 (sol r4 B1, key3 H-B): -RunDir's physical path and file identity as the preflight found them, read ONCE here, before any claim. A guard that gave up on a location read
 # (locationUnknown) may have given up on -RunDir itself, so Test-OpenOutputAlias then never reads -RunDir again unbounded (a stalled UNC or junction would hold it). r7 (sol r6 B2):
 # after the open these only add a spelling refusal of TEMP there; they never stand in for where -RunDir is now (a re-read that does not answer fails the redirect closed).
-# DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A3 sibling :1793): bounded by the room before -DeadlineUtc (Get-InputLocationWithin); no answer is $null, as a throw was
-$script:runDirKnown = $(try { $rdLoc = Get-InputLocationWithin $RunDir; if ($null -eq $rdLoc) { $null } else { [pscustomobject]@{ physical = $rdLoc.phys; idKey = $rdLoc.key } } } catch { $null })
+$script:runDirKnown = $(try { [pscustomobject]@{ physical = (Get-PhysicalPath $RunDir); idKey = (Get-FileIdentity $RunDir).key } } catch { $null })
 $script:tempSeamPlan = Get-TempReadSeamPlan   # r6: offline seam only ($null in production, no read)
 # The scalar form's one build rides on every leg, so each leg is launched with its own build in either form.
 if (-not $legPlanMode) { foreach ($p in $plan) { $p | Add-Member -NotePropertyName sourceCommit -NotePropertyValue $SourceCommit; $p | Add-Member -NotePropertyName buildManifestSha256 -NotePropertyValue $BuildManifestSha256 } }
@@ -2110,53 +1774,6 @@ function Add-PlanIdentity([object]$Row, [object]$Leg) {
     # LEASE-BATCH-MULTI-BUILD-1 (item 9c): a -LegPlan leg's batch row names its own leg, arm, backend and build. A scalar run's rows are left as they were.
     if (-not $legPlanMode) { return }
     foreach ($k in 'name', 'arm', 'backend', 'sourceCommit', 'buildManifestSha256') { $Row | Add-Member -NotePropertyName $k -NotePropertyValue $Leg.$k -Force }
-}
-
-function Get-BatchLegSpecRefusal([string]$Stdout, [object]$Leg) {
-    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r5 (sol r4 B2): a launched leg child that refused its spec after the final guard (bytes changed, or unreadable, after the
-    # preflight judged them) says so on the real leg's anchored whole-line STDOUT record naming THIS leg's planned sha256 (Invoke-VenueLeg.ps1, before anything is generated,
-    # submitted or receipted). Read from the child's own captured stdout only (never stderr, never the .out.txt transcript, whose write may fail), so the persisted row carries it.
-    # $null when there is none, or when the leg was bound to no planned hash.
-    $planned = [string]$Leg.specSha256
-    if ($planned -cnotmatch '^[0-9a-f]{64}$') { return $null }
-    $lines = @($Stdout -split "`r?`n")
-    # a child that named a receipt on its own STDOUT ran: never a refusal (r5 adversary pass 6 A5: a stderr receipt line, or a blank DVE_RECEIPT_PATH=, names none)
-    if (@($lines | Where-Object { $_ -cmatch '^DVE_RECEIPT_PATH=\s*\S' }).Count -gt 0) { return $null }
-    foreach ($l in $lines) {
-        if ($l -cmatch '^DVE_LEG_SPEC_REFUSED planned_sha256=(?<p>[0-9a-f]{64}) read_sha256=(?<r>[0-9a-f]{64})$' -and $Matches['p'] -ceq $planned) { return [pscustomobject]@{ code = 'DVE_BATCH_SPEC_CHANGED'; line = "DVE_BATCH_SPEC_CHANGED leg=$($Leg.name) planned_sha256=$($Matches['p']) read_sha256=$($Matches['r'])" } }
-        if ($l -cmatch '^DVE_LEG_SPEC_UNREADABLE planned_sha256=(?<p>[0-9a-f]{64})$' -and $Matches['p'] -ceq $planned) { return [pscustomobject]@{ code = 'DVE_BATCH_SPEC_UNREADABLE'; line = "DVE_BATCH_SPEC_UNREADABLE leg=$($Leg.name) planned_sha256=$($Matches['p'])" } }
-    }
-    $null
-}
-
-function Add-LegSpecRefusal([object]$Batch, [object]$Refusal) {
-    # r5 (sol r4 B2): the refusal's typed code on the leg's persisted rows (the batch receipt's and the run result's), set before any log append of that leg's end
-    if ($null -eq $Refusal) { return }
-    foreach ($r in @($Batch.legs[$Batch.legs.Count - 1], $results[$results.Count - 1])) { $r | Add-Member -NotePropertyName specRefusal -NotePropertyValue ([string]$Refusal.code) -Force }
-}
-
-function Write-LegSpecRefusalLine([object]$Refusal) {
-    # BATCH-3 r8 (adversary r7 A4): the typed refusal line reaches STDOUT exactly once whatever happens to the log. LogBest puts it on stdout only through a batch.log append; with
-    # the write suppression on (a transcript or batch.log name that became another input's), L says it on stderr alone. What LogBest emitted is passed on; when that holds no
-    # line of the refusal, the line is said on stdout here. Never throws (the row already carries the code: Add-LegSpecRefusal).
-    # r8 pass 2 (adversary A1 on 61244e31): the stdout line goes FIRST, before any log step: an append that stalls, or a stderr that is full, held the line behind it. The log
-    # append comes after, best effort, and what it would echo on stdout is dropped (the line is already there once).
-    if ($null -eq $Refusal) { return }
-    $msg = Write-LegSpecRefusalStdout $Refusal
-    $null = @(try { LogBest $msg } catch { $null = $_ })
-}
-
-$script:refusalStdoutSaid = $null
-function Write-LegSpecRefusalStdout([object]$Refusal) {
-    # r8 pass 3 (adversary A3 on eee05a6b): the stdout half alone, called right after the leg child returns, BEFORE the transcript's guard and write (a -RunDir that stops
-    # answering held them, and with them the line). Said once per refusal: a later call for the same line (the branch's log step, the BATCH_ERROR catch) skips stdout.
-    # Returns the message, for the log step.
-    $msg = "$($Refusal.line) (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)"
-    if ($script:refusalStdoutSaid -cne [string]$Refusal.line) {
-        $script:refusalStdoutSaid = [string]$Refusal.line
-        try { [Console]::Out.WriteLine("$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $msg"); [Console]::Out.Flush() } catch { $null = $_ }
-    }
-    $msg
 }
 
 function Format-Mean($m) { if ($null -eq $m) { 'UNKNOWN' } else { '{0:0.0}' -f $m } }
@@ -2773,7 +2390,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         }
         catch {
             if ($unfinished -eq 0) {
-                if ((& ($script:VenueChainModule ?? (Get-Module VenueChain)) { $script:VenueAbandonedReads }) -gt 0) { [Console]::Error.WriteLine("the claim request threw: $($_.Exception.Message -replace '\s+', ' ')"); try { Complete-VenueProcess -ExitCode 1 } catch { } }
+                if ((& (Get-Module VenueChain) { $script:VenueAbandonedReads }) -gt 0) { [Console]::Error.WriteLine("the claim request threw: $($_.Exception.Message -replace '\s+', ' ')"); try { Complete-VenueProcess -ExitCode 1 } catch { } }
                 throw
             }
             $requestThrew = $_.Exception.Message -replace '\s+', ' '
@@ -3310,47 +2927,17 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # r3 (sol r2 B2): the leg runs only while the lease does. It is a bounded child: still running at the lease's end, it is killed with its whole
                 # process tree (Kill($true), Invoke-VenueBoundedProcess) and typed LEASE_EXPIRED below. The agent stops its job at the same bound (lease-batch r3).
                 $legBoundSec = [int][Math]::Max(1, [Math]::Floor(($leaseEnd - [DateTime]::UtcNow).TotalSeconds))
-                $lp = $null   # BATCH-3 r5 (sol r4 B2 sibling): the BATCH_ERROR catch reads THIS leg's child only, never an earlier leg's return. BATCH-3 r7: reset before the in-flight mark, so the mark stays the launch's own line
                 # adversary r7 A2: Process.Start failing (a command line past 32767 characters, a missing exe) throws a Win32Exception before any child exists: the leg stays NOT_RUN.
                 $inFlightLeg = $leg   # adversary r5 pass 2 A2: marked at the launch itself, so a throw while the RUN line was logged leaves a leg that never started NOT_RUN
                 try { $lp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $lArgs -TimeoutSec $legBoundSec } catch {
                     if ($_.Exception -is [ComponentModel.Win32Exception] -or $_.Exception.InnerException -is [ComponentModel.Win32Exception]) { $inFlightLeg = $null }
                     throw
                 }
-                # BATCH-3 r8 (adversary r7 A1): a launch that started no child (.notStarted: a start bound the helper refused at its last clock read) ran nothing: the leg is not in
-                # flight, stays pending (NOT_RUN unless a later batch runs it) and is never LEASE_EXPIRED; the batch ends room-short at the launch, as the room check above does
-                if ($lp.notStarted) {
-                    $inFlightLeg = $null; $b.legsAttempted--; $launchShort = $true
-                    $b.endReason = 'LEASE_REMAINING_SHORT'; $b.endDetail = "at the launch of leg $($leg.name): the bounded launch started no child (notStarted): it goes to the next batch"
-                    break
-                }
                 $legReturnTs = [Diagnostics.Stopwatch]::GetTimestamp()   # r6 (adversary-848f6559.json A1): the child's return; the idle anchor is placed from the leg job's own result below
                 $text =[string]$lp.stdout + [string]$lp.stderr   # r7: read from the child, never back from the file, whose write the guard may refuse
-                # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A4 sibling :2963): evidence only; a write that throws is said on stderr and never replaces the leg's classification
-                $legCode = $lp.exit   # b2 r1 (pass 8 A7): the child's own return is read FIRST, before any evidence write
-                # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r5 (sol r4 B2): a child that wrote no receipt may have refused its spec on its own typed STDOUT record; read here, from the
-                # child's captured stdout, for BOTH exit branches below (timed out at the lease's end, or exited non-zero), and carried in the persisted row (Add-LegSpecRefusal)
-                # (r5 adversary pass 6 A5: the receipt gate is the helper's own, on stdout only; $receipt below is read from stdout AND stderr)
-                # r8 pass 3 (adversary A3 on eee05a6b): read, and said on stdout, BEFORE the transcript's guard and write below, which can stall on -RunDir
-                $legSpecRefusal = Get-BatchLegSpecRefusal ([string]$lp.stdout) $leg
-                if ($legSpecRefusal) { $null = Write-LegSpecRefusalStdout $legSpecRefusal }
-                # b2 r1 (pass 8 A7; pass 2 A5 on bf5ebeb2): the .out.txt is evidence only and is written on VenueChain's bounded read (a worker given up on after 2 s, counted as every
-                # abandoned read is), so a -RunDir share that stalls the write holds neither the classification nor the cleanup
-                # b2 r2 (adversary pass 3 A6 on 372d1bfd): the worker never writes THROUGH the name the guard asked about (a hard link or a file made there after the guard, during the
-                # worker's setup, was opened and overwritten): it writes a fresh, unguessable name beside it (CreateNew: nothing can already be there) and renames it over the name,
-                # which replaces that directory entry only, never the file another name still reaches
-                # b2 r3 (adversary pass 4 A1 on 8b4b6d8c): Invoke-VenueBoundedRead is VenueChain's own (not exported), so it is called in the module's scope as :958 does; called
-                # by name from here it never resolved, and every transcript landed in the catch below (LEG_OUT_WRITE_FAILED, no .out.txt)
-                # BATCH-3 r8 (adversary r7 A2, blocker): the bytes go through the ONE handle CreateNew opened, never a second open by name (WriteAllText reopened the fresh name after
-                # Dispose, and a hard link made there in between to an accepted spec was opened and overwritten); the rename then moves a directory entry only
-                if (Test-RunDirWrite $out) {
-                    $owr = try { & ($script:VenueChainModule ?? (Get-Module VenueChain)) { param($t, $a, $s) Invoke-VenueBoundedRead -ScriptText $t -Argument $a -TimeoutSec $s } 'param($a) $final = $a.p; $out = [IO.Path]::Combine([IO.Path]::GetDirectoryName($final), ".b2r2-" + [Guid]::NewGuid().ToString("N") + ".tmp"); $bytes = [Text.UTF8Encoding]::new($false).GetBytes([string]$a.t); try { $fs = [IO.File]::Open($out, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None); try { $fs.Write($bytes, 0, $bytes.Length); $fs.Flush() } finally { $fs.Dispose() }; [IO.File]::Move($out, $final, $true); "OK" } catch { $m = $_.Exception.Message; try { [IO.File]::Delete($out) } catch { $null = $_ }; "FAILED " + $m }' @{ p = $out; t = $text } 2 } catch { [pscustomobject]@{ answered = $true; value = @(); error = ($_.Exception.Message -replace '\s+', ' ') } }
-                    $owv = @($owr.value | ForEach-Object { [string]$_ })
-                    $wfLine = $(if (-not $owr.answered) { "LEG_OUT_WRITE_TIMEOUT leg=$($leg.name) path=$out (no answer in 2 s; evidence only: the leg is classified from its own captured output)" }
-                        elseif ($owv -notcontains 'OK') { "LEG_OUT_WRITE_FAILED leg=$($leg.name) path=$out reason=$((($owv -join ' ') + ' ' + [string]$owr.error).Trim() -replace '^FAILED ', '' -replace '\s+', ' ') (evidence only: the leg is classified from its own captured output)" } else { '' })
-                    if ($wfLine) { try { $null = [VenueLeaseBatchBoundedReadR4]::ErrorLineWithin($wfLine, 2000) } catch { $null = $_ } }   # r4 fix 2 (pass 6 A6): bounded
-                }
-                $legSec = [int](($legReturnTs - $tLegTs) / [Diagnostics.Stopwatch]::Frequency)   # b2 r1 (pass 8 A2 sibling): the Stopwatch, never the wall clock
+                if (Test-RunDirWrite $out) { [IO.File]::WriteAllText($out, $text, [Text.UTF8Encoding]::new($false)) }
+                $legCode = $lp.exit
+                $legSec = [int]([DateTime]::UtcNow - $tLeg).TotalSeconds
                 # a leg killed at the lease's end says nothing about how long a leg takes
                 if (-not $lp.timedOut -and $legSec -gt $legBudget) { $legBudget = [Math]::Min(2700, $legSec) }
                 $legLines = @($text -split "`r?`n")
@@ -3361,7 +2948,6 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $dl = $legLines | Where-Object { $_ -match '^DVE_DETAIL=' } | Select-Object -Last 1
                 $detail = $(if ($dl) { ($dl -replace '^DVE_DETAIL=', '').Trim() } else { '' })
                 $legJobId = @(Get-VenueRemoteJobIds -Text $text | Where-Object { $_ -and $_ -cnotmatch '-health$' }) | Select-Object -Last 1
-                # ($legSpecRefusal was read, and said on stdout, right after the child returned: r5 sol r4 B2, r8 pass 3 A3)
                 if ($lp.timedOut) {
                     # Still running at the lease's end: killed with its tree. Never counted and never re-run (a leg that outlives a whole lease is not retried lease
                     # after lease). Its agent job is asked to cancel too, in case the agent's own bound has not stopped it yet. The batch ends: its lease is over.
@@ -3369,12 +2955,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEASE_EXPIRED'; outcome = 'INVALID'; class = 'LEASE_EXPIRED'; counted = $false; printedOutcome = $outcome; jobId = $legJobId; legSec = $legSec; legBoundSec = $legBoundSec; cancel = $cx.state; heatAtProbe = $th.firstHeat; heatAtProbeText = $th.firstHeatText }   # r6 (adversary r6 A2): a launched row keeps the reading the spread measures heavy keys from
                     $b.legs.Add([pscustomobject]$row); Add-Result $leg 'LEASE_EXPIRED' $row; $pending.RemoveAt(0)
                     Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
-                    Add-LegSpecRefusal $b $legSpecRefusal   # r5 (sol r4 B2): on the persisted rows before any append
-                    # b2 r1 (pass 8 A4): what happened to the child is said as it happened (a late self-exit was not killed; a kill that threw is not confirmed)
-                    $legEnd = Format-VenueBoundedChildEnd $lp $legBoundSec
-                    $b.endReason = 'LEASE_EXPIRED'; $b.endDetail = "leg $($leg.name) did not finish inside the lease ($legSec s, bound $legBoundSec s): it $legEnd; job $legJobId cancel=$($cx.state)$(if ($cx.error) { " ($($cx.error))" })"
-                    Write-LegSpecRefusalLine $legSpecRefusal   # BATCH-3 r8 (adversary r7 A4 sibling :3248): on stdout whatever the log does; the row already carries it
-                    L "LEG $($leg.name) LEASE_EXPIRED batch=$batchNo legSec=$legSec boundSec=$legBoundSec outcome=INVALID counted=False jobId=$legJobId cancel=$($cx.state) (at the lease's end it $legEnd)"
+                    $b.endReason = 'LEASE_EXPIRED'; $b.endDetail = "leg $($leg.name) was still running at the lease's end ($legSec s, bound $legBoundSec s): killed with its process tree; job $legJobId cancel=$($cx.state)$(if ($cx.error) { " ($($cx.error))" })"
+                    L "LEG $($leg.name) LEASE_EXPIRED batch=$batchNo legSec=$legSec boundSec=$legBoundSec outcome=INVALID counted=False jobId=$legJobId cancel=$($cx.state) (killed with its process tree at the lease's end)"
                     if ($exitCode -eq 0) { $exitCode = 7 }
                     break
                 }
@@ -3392,8 +2974,6 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEG_FAILED'; outcome = 'INVALID'; printedOutcome = $outcome; legExit = $legCode; jobId = $legJobId; counted = $false; legSec = $legSec; heatAtProbe = $th.firstHeat; heatAtProbeText = $th.firstHeatText }
                     $b.legs.Add([pscustomobject]$row); Add-Result $leg 'LEG_FAILED' $row; $pending.RemoveAt(0)
                     Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
-                    Add-LegSpecRefusal $b $legSpecRefusal   # r5 (sol r4 B2): on the persisted rows before any append
-                    Write-LegSpecRefusalLine $legSpecRefusal   # BATCH-3 r8 (adversary r7 A4): on stdout whatever the log does; the row already carries it
                     L "LEG $($leg.name) LEG_FAILED batch=$batchNo exit=$legCode outcome=INVALID printedOutcome=$outcome (the leg exited non-zero: no usable receipt)"
                     if ($exitCode -eq 0) { $exitCode = 7 }
                     continue
@@ -3510,9 +3090,6 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $ith = $legThermal[$inFlightLeg.name]; if ($null -ne $ith) { $row['heatAtProbe'] = $ith.firstHeat; $row['heatAtProbeText'] = $ith.firstHeatText }   # r6 (adversary r6 A2)
                 $b.legs.Add([pscustomobject]$row); Add-Result $inFlightLeg 'LEG_FAILED' $row; $null = $pending.Remove($inFlightLeg)
                 Add-PlanIdentity $b.legs[$b.legs.Count - 1] $inFlightLeg
-                # BATCH-3 r5 (sol r4 B2 sibling): a child that returned its typed spec refusal before the throw keeps it on this row too
-                # BATCH-3 r8 (adversary r7 A4 sibling :3386): and its typed line on stdout, as on the two exit branches
-                if ($null -ne $lp) { $ifRefusal = Get-BatchLegSpecRefusal ([string]$lp.stdout) $inFlightLeg; Add-LegSpecRefusal $b $ifRefusal; Write-LegSpecRefusalLine $ifRefusal }
             }
         } catch { }
         LogBest "BATCH_ERROR batch=$batchNo $($b.endDetail)"   # a batch.log another process holds must not turn the typed stop back into an unhandled throw

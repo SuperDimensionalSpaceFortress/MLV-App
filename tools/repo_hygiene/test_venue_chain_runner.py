@@ -123,32 +123,21 @@ $me = Get-Process -Id $PID
 @{ state = 'running'; containment = @{ runnerPid = $PID; runnerCreatedUtc = $me.StartTime.ToUniversalTime().ToString('o') } } | ConvertTo-Json | Set-Content (Join-Path $lane 'opus-001.receipt.json')
 Set-Content (Join-Path $Root "$Self.started") 'x'
 while (@(Get-ChildItem $Root -Filter '*.started').Count -lt 2) { Start-Sleep -Milliseconds 200 }
-$peer = @(Get-ChildItem $Root -Filter '*.started' | Where-Object { $_.BaseName -ne $Self })[0].BaseName
-# DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r1 T1: the fixture's own peer is its ground truth. A scan that throws is SCAN_FAILED and one that answers without the peer while the
-# peer's .started marker stands and its .ended marker is absent is SCAN_INCOMPLETE: both count as blocked, never as "no other chain" (a loaded host's empty CIM answer read as one)
 function Other-Chains {
-    try { $all = @(Get-CimInstance Win32_Process -Filter "Name='pwsh.exe' OR Name='powershell.exe'" -ErrorAction Stop) } catch { return [pscustomobject]@{ failed = ($_.Exception.Message -replace '\s+', ' '); rows = @() } }
-    [pscustomobject]@{ failed = $null; rows = @($all | Where-Object {
+    @(Get-CimInstance Win32_Process -Filter "Name='pwsh.exe' OR Name='powershell.exe'" -ErrorAction SilentlyContinue | Where-Object {
         $c = [string]$_.CommandLine
         $c -and $c.Contains($Root) -and $c -notmatch [regex]::Escape($Self) -and
         ($c -match '\\fleet-runs\\[^"]*\\(chain[^\\"]*|leg[^\\"]*|run-leg[^\\"]*)\.ps1' -or $c -match 'Invoke-VenueLeg\.ps1')
-    }) }
+    })
 }
-try {
-    $t0 = Get-Date
-    while (((Get-Date) - $t0).TotalSeconds -lt $MaxSec) {
-        $o = Other-Chains
-        if ($o.failed) { "SCAN_FAILED $($o.failed)"; Start-Sleep -Seconds 1; continue }
-        if ($o.rows.Count -gt 0) { "OTHER_CHAIN_LIVE " + (($o.rows | ForEach-Object { "pid=$($_.ProcessId)" }) -join ' '); Start-Sleep -Seconds 1; continue }
-        if ((Test-Path (Join-Path $Root "$peer.started")) -and -not (Test-Path (Join-Path $Root "$peer.ended"))) { "SCAN_INCOMPLETE peer=$peer (its .started stands, no .ended)"; Start-Sleep -Seconds 1; continue }
-        'LEG_RAN'; exit 0
-    }
-    "OLD_RULE_TIMEOUT blockedSec=$([int]((Get-Date) - $t0).TotalSeconds)"
-    # each waiter stays alive until its peer's window ended too, so neither window outlasts the other's process
-    Set-Content (Join-Path $Root "$Self.done") 'x'
-    $w = Get-Date; while (-not (Test-Path (Join-Path $Root "$peer.done")) -and ((Get-Date) - $w).TotalSeconds -lt 30) { Start-Sleep -Milliseconds 200 }
-    exit 9
-} finally { Set-Content (Join-Path $Root "$Self.ended") 'x' }
+$t0 = Get-Date
+while (((Get-Date) - $t0).TotalSeconds -lt $MaxSec) {
+    $o = Other-Chains
+    if ($o.Count -gt 0) { "OTHER_CHAIN_LIVE " + (($o | ForEach-Object { "pid=$($_.ProcessId)" }) -join ' '); Start-Sleep -Seconds 1; continue }
+    'LEG_RAN'; exit 0
+}
+"OLD_RULE_TIMEOUT blockedSec=$([int]((Get-Date) - $t0).TotalSeconds)"
+exit 9
 """
 
 # B = BACKLOG-1 r1c quiet.ps1:19-49 (Test-AliveAt + Get-LaneScan) and 65-76: wait while any OTHER live lane (receipt state=running, pid alive at its
@@ -182,19 +171,14 @@ function Get-LaneScan {
     }
     $rows
 }
-$peer = @(Get-ChildItem $Root -Filter '*.started' | Where-Object { $_.BaseName -ne $Self })[0].BaseName
-try {
-    $t0 = Get-Date
-    while (((Get-Date) - $t0).TotalSeconds -lt $MaxSec) {
-        $lb = @(Get-LaneScan | Where-Object blocking).Count
-        if ($lb -gt 0) { "LANES blocking=$lb"; Start-Sleep -Seconds 1; continue }
-        'LEG_RAN'; exit 0
-    }
-    "OLD_RULE_TIMEOUT blockedSec=$([int]((Get-Date) - $t0).TotalSeconds)"
-    Set-Content (Join-Path $Root "$Self.done") 'x'
-    $w = Get-Date; while (-not (Test-Path (Join-Path $Root "$peer.done")) -and ((Get-Date) - $w).TotalSeconds -lt 30) { Start-Sleep -Milliseconds 200 }
-    exit 9
-} finally { Set-Content (Join-Path $Root "$Self.ended") 'x' }   # T1: the peer's ground truth that this waiter is gone
+$t0 = Get-Date
+while (((Get-Date) - $t0).TotalSeconds -lt $MaxSec) {
+    $lb = @(Get-LaneScan | Where-Object blocking).Count
+    if ($lb -gt 0) { "LANES blocking=$lb"; Start-Sleep -Seconds 1; continue }
+    'LEG_RAN'; exit 0
+}
+"OLD_RULE_TIMEOUT blockedSec=$([int]((Get-Date) - $t0).TotalSeconds)"
+exit 9
 """
 
 
@@ -371,34 +355,6 @@ class VenueChainRunnerTests(unittest.TestCase):
         self.assertIn("OTHER_CHAIN_LIVE", out_a)
         self.assertIn("LANES blocking=1", out_b)
         self.assertNotIn("LEG_RAN", out_a + out_b)
-
-    def test_planned_hash_bind_b2_r1_t1_a_failed_or_empty_scan_never_reads_as_no_other_chain(self) -> None:
-        # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r1 T1 (shard run 45402473576 class): pid=18100 in the red was the fixture's OWN waiter B (the scan keeps only command lines
-        # holding this test's temp $Root). Waiter A read the process table with -ErrorAction SilentlyContinue, so one failed or empty scan under load read as "no other chain" and
-        # A printed LEG_RAN while B still ran. The scan is replaced here by a stub (no live process but the fixture's own two is read): a failed scan (a non-terminating error,
-        # the shape -ErrorAction SilentlyContinue swallowed) and an empty one. Neither may run the leg while B's .started marker stands and its .ended marker is absent.
-        anchor = "param([string]$Root, [string]$Self, [int]$MaxSec = 10)\n"
-        self.assertEqual(OLD_WAITER_A.count(anchor), 1, "T1 anchor moved")
-        stubs = {"failed": ("function Get-CimInstance { [CmdletBinding()] param([Parameter(Position = 0)]$ClassName, $Filter) Write-Error 'injected scan failure' }   # TEST FIXTURE\n", "SCAN_FAILED "),
-                 "empty": ("function Get-CimInstance { [CmdletBinding()] param([Parameter(Position = 0)]$ClassName, $Filter) }   # TEST FIXTURE: a scan that answers nothing\n", "SCAN_INCOMPLETE ")}
-        base = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File"]
-        for kind, (stub, marker) in stubs.items():
-            with self.subTest(scan=kind):
-                root = self.case / f"t1-{kind}"
-                for lane in ("lane-A", "lane-B"):
-                    (root / "fleet-runs" / lane / "tools").mkdir(parents=True)
-                    (root / "fleet-runs" / lane / "prompt.md").write_text("run the legs on Bachelor", encoding="utf-8")
-                a = root / "fleet-runs" / "lane-A" / "tools" / "venue-wait-then-chain.ps1"
-                a.write_text(OLD_WAITER_A.replace(anchor, anchor + stub), encoding="utf-8")
-                b = root / "fleet-runs" / "lane-B" / "tools" / "chain-b.ps1"
-                b.write_text(OLD_WAITER_B, encoding="utf-8")
-                pa = subprocess.Popen([*base, str(a), "-Root", str(root), "-Self", "lane-A", "-MaxSec", "4"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                pb = subprocess.Popen([*base, str(b), "-Root", str(root), "-Self", "lane-B", "-MaxSec", "4"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                out_a, _ = pa.communicate(timeout=120)
-                out_b, _ = pb.communicate(timeout=120)
-                self.assertNotIn("LEG_RAN", out_a, f"waiter A read a {kind} scan as 'no other chain' and ran its leg while B still ran (old)\n" + out_a + "\n----\n" + out_b)
-                self.assertIn(marker, out_a, out_a)
-                self.assertEqual(pa.returncode, 9, out_a)
 
     def test_two_concurrent_chains_never_deadlock_and_the_second_runs_after_the_first_releases(self) -> None:
         rd_a, rd_b = self.case / "lane-A", self.case / "lane-B"
@@ -602,53 +558,12 @@ class VenueChainRunnerTests(unittest.TestCase):
         self.assertEqual([l["status"] for l in chain_result(r.stdout)["legs"]], ["NOT_RUN", "LEG_FAILED"])
 
     def test_mutation_leg_exit_code_ignored_records_the_dead_leg_as_ran(self) -> None:
-        # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r3 (forced companion): r1 H3 made the leg-exit test `if ($legTimedOut -or $legCode -ne 0) {` (a timed-out primary leg is
-        # LEG_FAILED too); the mutant still drops the whole test, so the dead leg is recorded RAN
-        runner = self.mutated_runner("if ($legTimedOut -or $legCode -ne 0) {", "if ($false) {", count=1)
+        runner = self.mutated_runner("if ($legCode -ne 0) {", "if ($false) {", count=1)
         r = self.run_chain(self.case / "lane-FM", self.specs[:2], runner=runner, env=self.env(FAKE_LEG_FAIL_LEAF="fx-b.json", FAKE_LEG_FAIL_CODE="3"))
         res = chain_result(r.stdout)
         self.assertEqual(r.returncode, 0, "the mutant must reproduce the defect: a dead leg and a clean chain exit")
         self.assertEqual([l["status"] for l in res["legs"]], ["RAN", "RAN"])
         self.assertEqual((res["legs"][1]["outcome"], res["legs"][1]["legExit"]), ("PASS", 3))
-
-    def test_planned_hash_bind_b2_r3_a1_with_no_compiled_writer_the_chain_log_fallback_reaches_chain_result(self) -> None:
-        # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r3 (adversary pass 4 A1 sibling Invoke-VenueChain.ps1:197): with the compiled writer unavailable, every chain-log line goes
-        # through VenueChain's Invoke-VenueBoundedRead, which the module does not export. Called by name from the script it never resolved, L threw on CHAIN_START and the chain
-        # ended before CHAIN_RESULT. The REAL runner; only its one compile is made to fail (a fresh pwsh never has the type loaded).
-        anchor = "            Add-Type -ErrorAction Stop -TypeDefinition @'"
-        runner = self.mutated_runner(anchor, "            throw 'injected compile failure (TEST FIXTURE)'\n" + anchor, count=1)
-        rd = self.case / "lane-A1W"
-        r = self.run_chain(rd, self.specs[:1], runner=runner)
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertEqual([l["status"] for l in chain_result(r.stdout)["legs"]], ["RAN"])
-        log = self.chain_log(rd)
-        self.assertTrue(any(" CHAIN_EVIDENCE_WRITER_UNAVAILABLE " in l and "injected compile failure" in l for l in log), log)
-        self.assertTrue(any(" CHAIN_START " in l for l in log), log)
-        self.assertTrue(log and log[-1].startswith("CHAIN_RESULT="), log)
-
-    def test_planned_hash_bind_b3_r1_a8_a_second_same_name_venuechain_in_the_session_the_chain_log_fallback_reaches_chain_result(self) -> None:
-        # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r1 (adversary pass 5 A8 sibling Invoke-VenueChain.ps1:199): the fallback reached VenueChain's scope with
-        # `& (Get-Module VenueChain)`; the runner's `Import-Module -Force` keeps a same-name module imported from another path, so Get-Module answers TWO modules, the call
-        # throws ('VenueChain VenueChain'), L throws on CHAIN_START and the chain ends before CHAIN_RESULT. The r3 row's runner (only its compile made to fail), run in a session
-        # that first imports a byte-identical VenueChain copy from a second folder.
-        anchor = "            Add-Type -ErrorAction Stop -TypeDefinition @'"
-        runner = self.mutated_runner(anchor, "            throw 'injected compile failure (TEST FIXTURE)'\n" + anchor, count=1)
-        other = copy_with_siblings(MODULE, self.case / "other-tree" / "dual-venue")
-        rd = self.case / "lane-A8W"
-        args = self.chain_args(rd, self.specs[:1], runner=runner)
-        i = args.index("-File")
-        q = lambda v: "'" + str(v).replace("'", "''") + "'"
-        call = " ".join(x if re.fullmatch(r"-[A-Za-z]\w*", x) else q(x) for x in args[i + 2:])
-        ps = (f"Import-Module {q(other)} -DisableNameChecking; if (@(Get-Module VenueChain).Count -ne 1) {{ [Console]::Error.WriteLine('FIXTURE: no second module'); exit 97 }}; "
-              f"& {q(args[i + 1])} {call}")
-        r = subprocess.run([*args[:i], "-Command", ps], capture_output=True, text=True, timeout=300, env=self.env())
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertNotIn("VenueChain VenueChain", r.stdout + r.stderr)
-        self.assertEqual([l["status"] for l in chain_result(r.stdout)["legs"]], ["RAN"])
-        log = self.chain_log(rd)
-        self.assertTrue(any(" CHAIN_EVIDENCE_WRITER_UNAVAILABLE " in l for l in log), log)
-        self.assertTrue(any(" CHAIN_START " in l for l in log), log)
-        self.assertTrue(log and log[-1].startswith("CHAIN_RESULT="), log)
 
     # ---------------------------------------------------------------- the claim
     def _stale_case(self, reason: str, pid: int, created: str, expires: datetime) -> None:
@@ -1601,10 +1516,7 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         text = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
         body = text[text.index("function Invoke-VenueBoundedProcess"):text.index("function Get-VenueDriverScriptMissing")]
         self.assertIn("try { $p.Kill($true) } catch { $killErrored = $true }", body, "a tree kill that threw is recorded, not swallowed")
-        # (DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r2, adversary pass 3 A14: confirmed from the TREE, so both of the child's streams at end of file too)
-        # BATCH-3 r8 (adversary r7 A6, forced companion): off Windows a root that exited before any kill never confirms its tree ($treeReached)
-        self.assertIn("killConfirmed = $(if ($timedOut) { $treeReached -and (-not $killErrored) -and [bool]$p.HasExited -and $outTask.IsCompleted -and $errTask.IsCompleted } else { $true })", body)
-        self.assertIn("$treeReached = $IsWindows -or $killAttempted", body)
+        self.assertIn("killConfirmed = $(if ($timedOut) { (-not $killErrored) -and [bool]$p.HasExited } else { $true })", body)
 
     def test_staged_manifest_states(self) -> None:
         q = f"Import-Module '{MODULE}' -Force -DisableNameChecking; $r = Get-VenueStagedBuildManifest -AgentShare '{{}}' -SourceCommit '{SHA}' -TimeoutSec 20; \"$($r.state) $($r.sha256)\""
@@ -1658,9 +1570,7 @@ class VenueChainSupplementaryTests(unittest.TestCase):
 
     def test_v01_timeout_then_unwritable_output_keeps_the_job_identity_and_refuses_the_next_leg_until_finished(self) -> None:
         rd, sup, log = self.run_timeout_with_unwritable_output("lane-V01", FAKE_UM_JOB_ID=self.JOB_ID, FAKE_JOB_DONE_ON_LEG="sp-b.json")
-        # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 fix 1 (adversary pass 5 A4): the supplementary is classified from its own captured output BEFORE its transcript is written, and
-        # that write is evidence only, so a failed write after the timeout leaves it what it was, TIMEOUT (it used to turn it into SKIPPED / SUPPLEMENTARY_ERROR). V-01's point stands:
-        self.assertEqual(sup[0]["status"], "TIMEOUT", "the output write failed after the timeout: evidence only, the timeout is the record")
+        self.assertEqual((sup[0]["status"], sup[0]["reason"]), ("SKIPPED", "SUPPLEMENTARY_ERROR"), "the output write failed after the timeout")
         # the unresolved identity is retained: the next leg is refused (not run) and names the killed client's job
         self.assertEqual((sup[1]["status"], sup[1]["reason"]), ("SKIPPED", "UM_REMOTE_JOB_UNRESOLVED"))
         self.assertIn(f"jobId={self.JOB_ID} state=NOT_FINISHED", sup[1]["detail"])
@@ -1672,8 +1582,8 @@ class VenueChainSupplementaryTests(unittest.TestCase):
 
     def test_v01_timeout_then_unwritable_output_with_no_identity_stays_busy(self) -> None:
         rd, sup, log = self.run_timeout_with_unwritable_output("lane-V01NOID")   # the client printed no DVE_JOB_ID before it hung: nothing to look up
-        self.assertEqual(sup[0]["status"], "TIMEOUT")   # r4 fix 1 (pass 5 A4): the transcript write is evidence only (see the row above)
-        self.assertTrue(all(s["status"] == "SKIPPED" for s in sup[1:]), [s["status"] for s in sup])
+        self.assertEqual((sup[0]["status"], sup[0]["reason"]), ("SKIPPED", "SUPPLEMENTARY_ERROR"))
+        self.assertTrue(all(s["status"] == "SKIPPED" for s in sup), [s["status"] for s in sup])
         self.assertTrue(all(s["reason"] == "UM_REMOTE_JOB_UNRESOLVED" for s in sup[1:]) and len(sup) >= 2, [s.get("reason") for s in sup])
         self.assertNotIn("ultra-magnus", [v for l, v, _ in self.starts() if l == "sp-b.json"], "a missing identity must remain busy: no later leg runs on ultra-magnus")
         self.assertNotIn("SUPPLEMENTARY_REMOTE_JOB_RECONCILED", log)

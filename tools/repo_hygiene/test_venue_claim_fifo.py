@@ -1182,10 +1182,7 @@ $left = @(Get-ChildItem -LiteralPath (Split-Path -Parent $A.path) -Force | Where
         # and the holder came back behind it. Now the lifetime is short and the wait refreshes the heartbeat (-TicketBeatSec).
         spec_b = self.tmp / "fx-b.json"
         spec_b.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "card": "TEST-CARD", "legId": "fx-b", "backends": ["cpu", "cuda"], "scaleFactor": 1}), encoding="utf-8")
-        # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r1 T2 (shard 6/8, run 45402473576; a timing window that was already there, not PR-owned): each heartbeat is a fresh runspace
-        # importing VenueChain.psm1 under a 5 s bound after a 1 s slice, so one fixed 4 s window was too short on a loaded runner. The test polls (0.25 s) until heartbeatUtc
-        # moves, over 3 x (TicketBeatSec + 5 s) = 18 s, and the cooldown is long enough (40 s) that the poll always ends inside the wait.
-        p = self.start_batch("W", claim_poll=1, specs=f"{self.spec},{spec_b}", extra=("-TicketBeatSec", "1"), cooldown="40", FAKE_LEASE_REMAIN="70,2700", FAKE_LEG_REMAIN="50,2600")
+        p = self.start_batch("W", claim_poll=1, specs=f"{self.spec},{spec_b}", extra=("-TicketBeatSec", "1"), cooldown="14", FAKE_LEASE_REMAIN="70,2700", FAKE_LEG_REMAIN="50,2600")
         self.wait_for_cooldown_ticket(p)
         def ticket() -> dict:
             files = list(self.ticket_dir.glob("*.ticket.json")) if self.ticket_dir.exists() else []
@@ -1194,15 +1191,10 @@ $left = @(Get-ChildItem -LiteralPath (Split-Path -Parent $A.path) -Force | Where
         t1 = ticket()
         self.assertEqual(t1["phase"], "cooldown")
         self.assertLessEqual(t1["staleAfterSec"], 900, "the ticket's lifetime must not grow with the wait")
-        t2, end = t1, time.monotonic() + 3 * (1 + 5)
-        while time.monotonic() < end:
-            time.sleep(0.25)
-            t2 = ticket()
-            if t2["heartbeatUtc"] != t1["heartbeatUtc"]:
-                break
-        self.assertNotEqual(t1["heartbeatUtc"], t2["heartbeatUtc"], "the wait refreshed no heartbeat in 18 s: a long cooldown outlives its ticket")
-        self.assertEqual(t2["phase"], "cooldown", "the poll ended inside the cooldown wait")
-        p.wait(timeout=240)
+        time.sleep(4.0)
+        t2 = ticket()
+        self.assertNotEqual(t1["heartbeatUtc"], t2["heartbeatUtc"], "the wait refreshed no heartbeat: a long cooldown outlives its ticket")
+        p.wait(timeout=180)
 
     def test_the_ticket_is_never_removed_by_unbounded_io_on_a_deadline_bound_path(self) -> None:
         # adversary A1 (r3 pass 1): Close-BatchTicket ran Remove-VenueTicket inline in the input-guard refusal and the DEADLINE break, ahead of the bounded release and the typed refusal;

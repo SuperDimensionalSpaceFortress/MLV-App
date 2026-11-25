@@ -1234,13 +1234,7 @@ function Complete-VenueProcess {
     stuck on a dead UNC host would hold the process for as long as it lasts. When one was abandoned, flush and exit NOW with -ExitCode (everything was already written); else return.
     #>
     param([Parameter(Mandatory)][int]$ExitCode)
-    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r2 (adversary pass 3 A7 on 372d1bfd): each flush runs on a pool thread and is waited for at most 2 s. Console.Out and Console.Error are
-    # synchronized writers, so an abandoned bounded diagnostic still blocked inside one (a full stderr pipe nobody reads) held a synchronous Flush, and with it the exit, for as
-    # long as the pipe stayed full. Both autoflush; a flush that does not return in time is left behind. No scriptblock runs off this thread: the delegate is the writer's own Flush.
-    if ($script:VenueAbandonedReads -gt 0) {
-        foreach ($w in @([Console]::Out, [Console]::Error)) { try { $null = [Threading.Tasks.Task]::Run([Action]$w.Flush).Wait(2000) } catch { $null = $_ } }
-        [Environment]::Exit($ExitCode)
-    }
+    if ($script:VenueAbandonedReads -gt 0) { [Console]::Out.Flush(); [Console]::Error.Flush(); [Environment]::Exit($ExitCode) }
 }
 
 function Invoke-VenueBoundedRead {
@@ -1273,16 +1267,7 @@ function Invoke-VenueBoundedRead {
         # r13 (Grok G20 on #814): $endCut = the caller's end, not -TimeoutSec, set the wait (as the nightly's capCut), so the message reports the wait actually given
         $waitSec = $TimeoutSec; $endCut = $false
         if ($null -ne $Clock) { $toEnd = $EndSec - $Clock.Elapsed.TotalSeconds; if ($toEnd -lt $waitSec) { $waitSec = [Math]::Max(0.0, $toEnd); $endCut = $true } }
-        # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r2 (adversary pass 3 A3 sibling :1265 on 372d1bfd): the wait is sliced (at most 250 ms) and each slice re-asks what is left of
-        # -TimeoutSec (from here) and of -EndSec on the caller's clock, so a caller paused after the sample above never waits the stale remainder past its end
-        $waitClock = [Diagnostics.Stopwatch]::StartNew()
-        while (-not $async.IsCompleted) {
-            $leftSec = [double]$TimeoutSec - $waitClock.Elapsed.TotalSeconds
-            if ($null -ne $Clock) { $leftSec = [Math]::Min([double]$leftSec, $EndSec - $Clock.Elapsed.TotalSeconds) }
-            if ($leftSec -le 0) { break }
-            [void]$async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds([Math]::Min(0.25, [double]$leftSec)))
-        }
-        if (-not $async.IsCompleted) {
+        if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($waitSec))) {
             $abandoned = $true
             $script:VenueAbandonedReads++
             try { [void]$ps.BeginStop($null, $null) } catch { }
@@ -1293,11 +1278,6 @@ function Invoke-VenueBoundedRead {
         # sees only after -EndSec is never acted on (the worker finished, so it is disposed as usual)
         if ($null -ne $Clock -and ($late = $Clock.Elapsed.TotalSeconds - $EndSec) -gt 0) {
             return [pscustomobject]@{ answered = $false; value = @(); error = "an answer seen $([Math]::Round($late, 2)) s after the call's end is never acted on" }
-        }
-        # BATCH-3 r8 (adversary r7 A5): the RELATIVE bound is asked after the answer too. A worker that finished after the last slice expired, seen by a parent that resumed
-        # late, made IsCompleted true and was acted on past -TimeoutSec (only -Clock was asked here). Seen after the bound on the wait's own Stopwatch: never acted on.
-        if (($lateRel = $waitClock.Elapsed.TotalSeconds - [double]$TimeoutSec) -gt 0) {
-            return [pscustomobject]@{ answered = $false; value = @(); error = "an answer seen $([Math]::Round($lateRel, 2)) s after the $([Math]::Round($TimeoutSec, 2)) s bound is never acted on" }
         }
         [pscustomobject]@{ answered = $true; value = @($ps.EndInvoke($async)); error = $null }
     } catch {
@@ -2039,111 +2019,22 @@ function Invoke-VenueBoundedProcess {
     must not leave a child behind reads it.
     #>
     param([Parameter(Mandatory)][string]$FilePath, [Parameter(Mandatory)][string[]]$ArgumentList, [Parameter(Mandatory)][ValidateRange(1, 86400)][int]$TimeoutSec,
-          [ValidateRange(100, 60000)][int]$CleanupWaitMs = 15000, [Nullable[datetime]]$DeadlineUtc = $null, [ValidateRange(0, 86400)][int]$MinRoomSec = 0,
-          [Nullable[datetime]]$StartNotAfterUtc = $null)
-    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r1 (adversary pass 8 A1-A4): the relative bound runs on a Stopwatch started just before Process.Start, so its elapsed is never less
-    # than the child's own runtime (A1) and a wall-clock step cannot read a child the parent saw exit in time as late (A2). -StartNotAfterUtc (A3) bounds the START only: asked at
-    # the last clock read before Process.Start (at or past it: .notStarted, no child) and against the OS StartTime (at or past it: .lateStart, killed at once); it never bounds the
-    # wait or the exit, so a child that started in time runs to -TimeoutSec. RESIDUAL, carried to VENUE-LEG-CHILD-START-NOT-AFTER-GATE-1 (Guard:
-    # tools/profiling/dual-venue/Invoke-VenueLeg.ps1): a pause between that check and Process.Start still lets a child start; it is judged late from its OS StartTime and killed
-    # at once, but anything it did in that instant is not undone. The result also says whether a kill was attempted (.killAttempted) and whether it threw (.killErrored) (A4);
-    # .killConfirmed keeps its meaning, no child left behind.
-    $snaUtc = $(if ($null -ne $StartNotAfterUtc) { ([datetime]$StartNotAfterUtc).ToUniversalTime() } else { $null })
+          [ValidateRange(100, 60000)][int]$CleanupWaitMs = 15000)
     # r11 (adversary r11 A5, A6): after the bound, the kill wait and both stream waits share ONE budget ($CleanupWaitMs: they used to add up to 3 x 15 s past a caller's deadline), and a tree kill
     # that threw is never "confirmed" because the root happened to exit: killConfirmed needs no kill error AND the root gone.
-    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A2): -DeadlineUtc, when given, is an ABSOLUTE bound on top of the relative -TimeoutSec. It is asked as the last
-    # step before Process.Start (at or past it: no child, .notStarted and .timedOut true, nothing to kill) and again at the wait (the wait ends at whichever comes first), so a caller
-    # descheduled between its own cut and the start can neither start a child late nor let one run past it. Without it the behaviour is unchanged (.notStarted false).
-    $dlUtc = $(if ($null -ne $DeadlineUtc) { ([datetime]$DeadlineUtc).ToUniversalTime() } else { $null })
     $psi = [Diagnostics.ProcessStartInfo]::new($FilePath)
     foreach ($a in $ArgumentList) { [void]$psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
-    # r4 fix 2 (adversary pass 6 A1): -MinRoomSec, the caller's own floor of room, is asked HERE, at the last clock read before the start (a caller descheduled after its own
-    # check used to start the child with less room than its floor promised)
-    if ($null -ne $dlUtc -and ($dlUtc - [DateTime]::UtcNow).TotalSeconds -lt [Math]::Max(0.000001, [double]$MinRoomSec)) { return [pscustomobject]@{ exit = $null; timedOut = $true; notStarted = $true; lateStart = $false; lateExit = $false; killConfirmed = $true; killAttempted = $false; killErrored = $false; stdout = ''; stderr = '' } }
-    if ($null -ne $snaUtc -and [DateTime]::UtcNow -ge $snaUtc) { return [pscustomobject]@{ exit = $null; timedOut = $true; notStarted = $true; lateStart = $false; lateExit = $false; killConfirmed = $true; killAttempted = $false; killErrored = $false; stdout = ''; stderr = '' } }
-    # b2 r2 (adversary pass 3 A1 on 372d1bfd): -DeadlineUtc is also held on the Stopwatch (its room at the clock's start), so a wall-clock step cannot widen the wait past it
-    # BATCH-3 r8 pass 2 (adversary A3 sibling on 61244e31): that room is held on ITS OWN Stopwatch, started before the wall sample, so a pause between the sample and the run
-    # clock's start (which used to carry it) cannot move the deadline's monotonic end later
-    $dlClock = [Diagnostics.Stopwatch]::StartNew()
-    $dlMonoMs = $(if ($null -ne $dlUtc) { [double]($dlUtc - [DateTime]::UtcNow).TotalMilliseconds } else { 0.0 })
-    # BATCH-3 r8 pass 3 (adversary A4 on eee05a6b): that fresh sample IS the last clock read before the start, so the floor is asked of it too: a caller descheduled after the
-    # check above, with less room than -MinRoomSec (or none) now, starts nothing
-    if ($null -ne $dlUtc -and $dlMonoMs -lt [Math]::Max(0.001, [double]$MinRoomSec * 1000.0)) { return [pscustomobject]@{ exit = $null; timedOut = $true; notStarted = $true; lateStart = $false; lateExit = $false; killConfirmed = $true; killAttempted = $false; killErrored = $false; stdout = ''; stderr = '' } }
-    if ($null -ne $snaUtc -and [DateTime]::UtcNow -ge $snaUtc) { return [pscustomobject]@{ exit = $null; timedOut = $true; notStarted = $true; lateStart = $false; lateExit = $false; killConfirmed = $true; killAttempted = $false; killErrored = $false; stdout = ''; stderr = '' } }
-    $runClock = [Diagnostics.Stopwatch]::StartNew()
     $p = [Diagnostics.Process]::Start($psi)
     $p.StandardInput.Close()
     $outTask = $p.StandardOutput.ReadToEndAsync(); $errTask = $p.StandardError.ReadToEndAsync()
-    # r4 fix 2 (adversary pass 6 A2): the child's OWN start and exit instants (the OS's) are compared with -DeadlineUtc, not the parent's clock reads around them: a child the
-    # OS started at or past it (a pause between the check above and the start), or one that exited after it (a parent that resumed late and polled an already-exited child),
-    # is a timeout, never a success. A child started late is killed at once.
-    # r5 (adversary pass 7 A1 on 19ce35fd): the start is judged against the caller's FLOOR, not the bare deadline: an OS start later than -DeadlineUtc less -MinRoomSec (a pause
-    # between the room check above and Process.Start) left the child less room than the floor promised, so it is a late start too, killed at once. The OS's own StartTime is the
-    # instant judged; when it will not read, the parent's clock now (later than the start, so never kinder).
-    $lateStart = $false; $lateExit = $false
-    $startUtc = [DateTime]::UtcNow
-    try { $startUtc = $p.StartTime.ToUniversalTime() } catch { $startUtc = [DateTime]::UtcNow }
-    if ($null -ne $dlUtc) { $lateStart = ($startUtc -gt $dlUtc.AddSeconds(-[double]$MinRoomSec)) -or ($startUtc -ge $dlUtc) }
-    if ($null -ne $snaUtc -and $startUtc -ge $snaUtc) { $lateStart = $true }
-    $waitMs = [double]$TimeoutSec * 1000.0
-    # b2 r2 (adversary pass 3 A1 on 372d1bfd): the wait is RE-DERIVED from both bounds before every slice of at most 250 ms: what is left of -TimeoutSec on the Stopwatch, and
-    # of -DeadlineUtc on the earlier of the wall clock and the Stopwatch. A wait computed once let a parent paused right before WaitForExit wait its old remainder past both
-    # bounds; now a pause anywhere in the loop costs at most one slice past either.
-    # (hosted CI on 19ce35fd, test_artifact_preflight_r10_no_dual_venue_math_min_or_max_rounds_a_double_through_an_integer_first_operand: the first operand is a double in its own text)
-    $timedOut = [bool]$lateStart
-    while (-not $timedOut) {
-        $waitMs = [Math]::Max(0.0, [double]$TimeoutSec * 1000.0 - $runClock.Elapsed.TotalMilliseconds)   # b2 r1 (A1): what is left of the bound, never a fresh one
-        if ($null -ne $dlUtc) { $waitMs = [Math]::Min([double]$waitMs, [Math]::Max(0.0, [Math]::Min([double]($dlUtc - [DateTime]::UtcNow).TotalMilliseconds, [double]$dlMonoMs - $dlClock.Elapsed.TotalMilliseconds))) }
-        if (-not $p.WaitForExit([int][Math]::Floor([Math]::Min(250.0, [double]$waitMs)))) { if ($waitMs -le 250.0) { $timedOut = $true } } else { break }
-    }
-    $observedSec = $runClock.Elapsed.TotalSeconds; $observedDlMs = $dlClock.Elapsed.TotalMilliseconds   # r8 pass 2: the deadline's room is read on its own clock
-    if (-not $timedOut) {
-        # r5 (adversary pass 7 A2): the OS exit is judged against BOTH bounds: -DeadlineUtc and the child's own start plus -TimeoutSec (a parent that resumed late and polled an
-        # already-exited child read success for a child that outran its relative cap)
-        $exitUtc = $null; $osExit = $true
-        try { $exitUtc = $p.ExitTime.ToUniversalTime() } catch { $exitUtc = [DateTime]::UtcNow; $osExit = $false }
-        # b2 r2 (adversary pass 3 A2 on 372d1bfd): the relative bound is read MONOTONICALLY: a parent whose own Stopwatch observed the exit past -TimeoutSec reads it late, whatever
-        # the OS instants say (r1's conjunction also asked the OS instants to agree, so a backward wall-clock step, or an exit time that would not read, accepted a child that
-        # outran its bound). The Stopwatch started before Process.Start, so a parent that observed in time is never read late, by any step. The absolute bound is late on the OS
-        # exit instant, or when the Stopwatch observed past the deadline's room at its start ($dlMonoMs).
-        $lateExit = ($observedSec -gt [double]$TimeoutSec) -or ($null -ne $dlUtc -and (($exitUtc -gt $dlUtc) -or ($observedDlMs -gt [double]$dlMonoMs)))
-        if ($lateExit) { $timedOut = $true }
-    }
-    $killErrored = $false; $killAttempted = $false
+    $timedOut = -not $p.WaitForExit($TimeoutSec * 1000)
+    $killErrored = $false
     $cleanup = [Diagnostics.Stopwatch]::StartNew()
-    if ($timedOut -and -not $p.HasExited) { $killAttempted = $true; try { $p.Kill($true) } catch { $killErrored = $true }; [void]$p.WaitForExit($CleanupWaitMs) }
-    # b2 r2 (adversary pass 3 A14 on 372d1bfd): a timed-out root that had already exited on its own (late, or between the bound and the kill) may have left a descendant holding its
-    # output, so its TREE is still killed (Kill($true) on the exited root reaches the children it started; no kill of the root itself was needed, so .killAttempted stays false). A
-    # throw there is no kill error of the child; the pipes below say whether anything was left.
-    if ($timedOut -and -not $killAttempted) { try { $p.Kill($true) } catch { $null = $_ } }
+    if ($timedOut) { try { $p.Kill($true) } catch { $killErrored = $true }; [void]$p.WaitForExit($CleanupWaitMs) }
     [void]$outTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds)); [void]$errTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds))
-    # b2 r2 (A14): .killConfirmed is read from the TREE: no kill error, the root gone AND both of its streams at end of file (no live process still holds the child's stdout or stderr)
-    # BATCH-3 r8 (adversary r7 A6): off Windows, a root that exited BEFORE any kill leaves its descendants reparented (to init or a subreaper), where Kill($true) no longer finds
-    # them, and one that closed its streams (sh -c 'sleep 60 </dev/null >/dev/null 2>&1 &') leaves both at end of file: nothing proves that tree gone, so it is never confirmed
-    $treeReached = $IsWindows -or $killAttempted
-    [pscustomobject]@{ exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut; notStarted = $false; lateStart = $lateStart; lateExit = $lateExit; killAttempted = $killAttempted; killErrored = $killErrored; killConfirmed = $(if ($timedOut) { $treeReached -and (-not $killErrored) -and [bool]$p.HasExited -and $outTask.IsCompleted -and $errTask.IsCompleted } else { $true })
+    [pscustomobject]@{ exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut; killConfirmed = $(if ($timedOut) { (-not $killErrored) -and [bool]$p.HasExited } else { $true })
         stdout = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' }); stderr = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' }) }
-}
-
-function Format-VenueBoundedChildEnd {
-    <#
-    .SYNOPSIS
-    DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-2 r1 (adversary pass 8 A4; pass 1 A3 on ebfde5a3): how a timed-out Invoke-VenueBoundedProcess child ended, as it happened. A kill that
-    threw is said first (never "killed"); a child no kill was attempted on (it exited on its own: late, or between the bound and the kill) is never "killed"; only an attempted
-    kill that did not throw is "killed", confirmed or not.
-    #>
-    param([Parameter(Mandatory)]$Run, [Parameter(Mandatory)][int]$BoundSec)
-    $what = $(if ($Run.lateStart) { 'started after its room ended' } else { "did not answer in $BoundSec s" })
-    if ($Run.killErrored) { return "$what and the kill failed (not confirmed)" }
-    if (-not $Run.killAttempted) {
-        # BATCH-3 r8 pass 3 (adversary A6 on eee05a6b): a root that exited on its own says nothing of its tree; an unconfirmed tree (killConfirmed false: off Windows, a
-        # descendant reparented out of reach) is said, never covered by "no kill was needed"
-        $treeNote = $(if ($Run.killConfirmed) { '' } else { '; its process tree is UNCONFIRMED: a descendant may still be running' })
-        if ($Run.lateExit) { return "exited on its own after its $BoundSec s bound (late; no kill was needed)$treeNote" }
-        return "$what, then exited on its own before the kill (no kill was needed)$treeNote"
-    }
-    "$what and was killed$(if ($Run.lateStart) { ' at once' }) ($(if ($Run.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))"
 }
 
 function Get-VenueDriverScriptMissing {
@@ -2161,7 +2052,7 @@ function Get-VenueDriverScriptMissing {
     return ''
 }
 
-Export-ModuleMember -Function New-VenueCapsProbeId, Get-VenueDriverScriptMissing, Format-VenueBoundedChildEnd, Get-VenueMainRoot, Get-VenueClaimPath, Get-VenueClaim, Get-VenueClaimStaleReason, Request-VenueClaim, Release-VenueClaim,
+Export-ModuleMember -Function New-VenueCapsProbeId, Get-VenueDriverScriptMissing, Get-VenueMainRoot, Get-VenueClaimPath, Get-VenueClaim, Get-VenueClaimStaleReason, Request-VenueClaim, Release-VenueClaim,
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
     Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueStagedArtifactNames, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
