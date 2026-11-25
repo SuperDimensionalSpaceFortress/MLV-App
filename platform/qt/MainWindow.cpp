@@ -3057,11 +3057,11 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     //Playback
     const bool frameChangedBeforePlayback = m_frameChanged;
     const int positionBeforePlayback = ui->horizontalSliderPosition->value();
-    const double tracePositionBefore = m_newPosDropMode;
     playbackHandling( timeDiff );
-    // r7 (sol r6 on 9f3f5ebd): the trace reads the tick's applied grant, so whole laps landing back on the start still advance.
+    // r7 (sol r6 on 9f3f5ebd): the trace reads the tick's applied grant, so whole laps landing back on the start still advance,
+    // and a stale start folded into the cut with no grant does not (r7 iteration 2, adversary pass 13 A1 on 80079007).
     if( m_playbackPresentTrace.active() )
-        m_playbackPresentTrace.noteAdvance( mlv_stage_timing_now() * 1000.0, tracePositionBefore, m_newPosDropMode, m_playbackTickAppliedFrames, shapedTickMs );
+        m_playbackPresentTrace.noteAdvance( mlv_stage_timing_now() * 1000.0, m_playbackTickAppliedFrames, shapedTickMs );
     if( frameChangedBeforePlayback )
     {
         invalidateGpuPreviewProcessingConfigCache();

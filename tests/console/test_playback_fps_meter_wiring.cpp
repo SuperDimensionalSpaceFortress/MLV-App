@@ -292,7 +292,7 @@ TEST(PlaybackFpsMeterWiring, TraceAndLogsReadTheShapedTickAndTheGatePinRejectsAD
     const QString body = timerFrameEventBody();
     ASSERT_FALSE(body.isEmpty());
     ASSERT_EQ(1, body.count(QStringLiteral(
-        "m_playbackPresentTrace.noteAdvance( mlv_stage_timing_now() * 1000.0, tracePositionBefore, m_newPosDropMode, m_playbackTickAppliedFrames, shapedTickMs );")));
+        "m_playbackPresentTrace.noteAdvance( mlv_stage_timing_now() * 1000.0, m_playbackTickAppliedFrames, shapedTickMs );")));   // r7 iter2: the applied grant only
     ASSERT_FALSE(body.contains(QStringLiteral("m_playbackTickAppliedFrames, timeDiff );")));
     // timer_frame.playback_handled and timer_frame.draw: their time_diff_ms field is the shaped tick
     ASSERT_EQ(2, body.count(QStringLiteral(".arg( shapedTickMs )")));

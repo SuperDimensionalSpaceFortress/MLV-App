@@ -25,7 +25,7 @@ void driveOnePlay(Recorder &trace)
 {
     trace.begin(1000.0, 64);
     trace.noteTick(1001.0, false, false);
-    trace.noteAdvance(1001.5, 0.0, 1.0, 1.0, 42);
+    trace.noteAdvance(1001.5, 1.0, 42);   // r7: the applied grant (0 -> 1)
     Row first;
     first.frame = 1;
     first.position = 1;
@@ -35,9 +35,9 @@ void driveOnePlay(Recorder &trace)
     trace.notePresentEnd(1012.0);
     trace.noteTick(1020.0, true, false);
     trace.noteTick(1028.0, false, true);
-    trace.noteAdvance(1028.5, 1.0, 1.4, 0.4, 42);
+    trace.noteAdvance(1028.5, 0.4, 42);   // 1.0 -> 1.4
     trace.noteTick(1036.0, false, false);
-    trace.noteAdvance(1036.5, 1.4, 2.0, 0.6, 8);
+    trace.noteAdvance(1036.5, 0.6, 8);    // 1.4 -> 2.0
     trace.noteGrab(3.5);
     trace.noteAudioSync();
     Row second;
@@ -120,7 +120,7 @@ TEST(PlaybackPresentTrace, AHoldIsNotAnAdvanceAndANewPlayStartsClean)
     driveOnePlay(trace);
     trace.begin(5000.0, 8);
     trace.noteTick(5008.0, false, false);
-    trace.noteAdvance(5008.5, 7.0, 7.0, 0.0, 8);   // granted nothing: a hold
+    trace.noteAdvance(5008.5, 0.0, 8);   // granted nothing (7.0 -> 7.0): a hold
     Row r;
     r.presentMs = 5020.0;
     trace.notePresent(r);
@@ -155,7 +155,7 @@ TEST(PlaybackPresentTrace, AWholeLapDropFrameTickIsAnAdvanceWithItsShapedInterva
     trace.setEnabled(true);
     trace.begin(1000.0, 4);
     trace.noteTick(1008.0, false, false);
-    trace.noteAdvance(1008.5, 0.0, tick.position, granted, shapedTickMs);
+    trace.noteAdvance(1008.5, granted, shapedTickMs);   // 0 -> tick.position (0), 999990 granted
     Row r;
     r.presentMs = 1020.0;
     trace.notePresent(r);
@@ -177,7 +177,7 @@ TEST(PlaybackPresentTrace, AZeroGrantOnEqualEndpointsIsStillAHold)
     trace.setEnabled(true);
     trace.begin(1000.0, 4);
     trace.noteTick(1008.0, false, false);
-    trace.noteAdvance(1008.5, 0.0, tick.position, 0.0, 8);
+    trace.noteAdvance(1008.5, 0.0, 8);   // 0 -> tick.position (0), nothing granted
     Row r;
     r.presentMs = 1020.0;
     trace.notePresent(r);
@@ -205,7 +205,7 @@ TEST(PlaybackPresentTrace, AFoldedStaleStartWithNoGrantIsNotAnAdvance)
     trace.setEnabled(true);
     trace.begin(1000.0, 4);
     trace.noteTick(1008.0, false, false);
-    trace.noteAdvance(1008.5, 1100000.0, tick.position, granted, 1);
+    trace.noteAdvance(1008.5, granted, 1);   // 1100000 -> tick.position (0), nothing granted
     Row r;
     r.presentMs = 1020.0;
     trace.notePresent(r);
@@ -240,7 +240,7 @@ TEST(PlaybackPresentTraceWiring, ReadOnceFromTheEnvironmentAndEveryHookIsGuarded
         "        m_playbackPresentTrace.noteTick( mlv_stage_timing_now() * 1000.0, m_frameStillDrawing, predictivePlaybackAdvance );")));
     ASSERT_EQ(1, source.count(QStringLiteral(
         "    if( m_playbackPresentTrace.active() )\n"
-        "        m_playbackPresentTrace.noteAdvance( mlv_stage_timing_now() * 1000.0, tracePositionBefore, m_newPosDropMode, m_playbackTickAppliedFrames, shapedTickMs );")));
+        "        m_playbackPresentTrace.noteAdvance( mlv_stage_timing_now() * 1000.0, m_playbackTickAppliedFrames, shapedTickMs );")));   // r7
     ASSERT_EQ(1, source.count(QStringLiteral("        if( m_playbackPresentTrace.active() )\n        {\n            playback_present_trace::Row traceRow;")));
     // rows are written after the Play stops, never inside the timed window
     const int stop = source.indexOf(QStringLiteral("    m_playbackSmokeActive = false;\n    m_playbackPresentTrace.end();"));
@@ -257,8 +257,9 @@ TEST(PlaybackPresentTraceWiring, TheAdvanceIsTheTicksAppliedGrantNotItsEndpoints
     const QString source = mainWindowSource();
     ASSERT_EQ(1, source.count(QStringLiteral(
         "    if( m_playbackPresentTrace.active() )\n"
-        "        m_playbackPresentTrace.noteAdvance( mlv_stage_timing_now() * 1000.0, tracePositionBefore, m_newPosDropMode, "
-        "m_playbackTickAppliedFrames, shapedTickMs );")));
+        "        m_playbackPresentTrace.noteAdvance( mlv_stage_timing_now() * 1000.0, m_playbackTickAppliedFrames, shapedTickMs );")));
+    // r7 iteration 2 (pass 13 A1 on 80079007): the endpoints are not passed at all, so no fallback can infer an advance
+    ASSERT_FALSE(source.contains(QStringLiteral("tracePositionBefore")));
     const int handlingAt = source.indexOf(QStringLiteral("void MainWindow::playbackHandling(int timeDiff)\n{\n"));
     ASSERT_TRUE(handlingAt >= 0);
     const int handlingEnd = source.indexOf(QStringLiteral("void MainWindow::showPerformanceProfilingDialog"), handlingAt);
@@ -283,4 +284,16 @@ TEST(PlaybackPresentTraceWiring, TheAdvanceIsTheTicksAppliedGrantNotItsEndpoints
     ASSERT_TRUE(wholeSetAt > wholeGrantAt);
     ASSERT_TRUE(dropGrantedAt > wholeSetAt);
     ASSERT_TRUE(dropSetAt > dropGrantedAt);
+    // r7 iteration 2 (pass 13 A3 on 80079007): each store is pinned with the line above it and its own indentation, so an
+    // `if( false )` in front of it (on its line or the line before) breaks the pin. An enclosing dead block is the open
+    // dead-block hardening row (sol r6).
+    ASSERT_EQ(1, handling.count(QStringLiteral(
+        "or leaves m_newPosDropMode where it was (no audio output).\n"
+        "                m_playbackTickAppliedFrames = 1.0;\n")));
+    ASSERT_EQ(1, handling.count(QStringLiteral(
+        "whatever m_newPosDropMode held before\n"
+        "                    m_playbackTickAppliedFrames = ui->horizontalSliderPosition->value() - sourcePositionBeforeTick;\n")));
+    ASSERT_EQ(1, handling.count(QStringLiteral(
+        "including whole laps that land back on the start\n"
+        "                m_playbackTickAppliedFrames = grantedDropFrames;\n")));
 }
