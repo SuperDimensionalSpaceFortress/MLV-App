@@ -698,11 +698,11 @@ class HelperBehaviourTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertTrue((out / "ffmpeg.exe").is_file())
 
-    def _run_behind_banner_shim(self, name: str, shim_body: bytes, eol: bytes) -> tuple[dict, Path]:
-        # A py.exe shim below the wrapper's environment scrub prints one banner line (LF or CRLF) to the child's stdout, as a printing
-        # sitecustomize would, then runs the real launcher with the wrapper's own arguments (or, for the control, nothing at all).
+    def _run_behind_banner_shim(self, name: str, shim_body: bytes, eol: bytes, text: str = "site ready") -> tuple[dict, Path]:
+        # A py.exe shim below the wrapper's environment scrub prints one banner (LF, CRLF or NO line ending) to the child's stdout, as a
+        # printing sitecustomize would, then runs the real launcher with the wrapper's own arguments (or, for the control, nothing).
         banner = self.tmp / f"{name}-banner.py"
-        banner.write_text(f"import sys\nsys.stdout.buffer.write(b'site ready' + {eol!r})\n", encoding="ascii")
+        banner.write_text(f"import sys\nsys.stdout.buffer.write({text.encode('ascii')!r} + {eol!r})\n", encoding="ascii")
         shim = self.tmp / f"{name}-shim.cmd"
         shim.write_bytes(shim_body)
         prelude = (
@@ -721,9 +721,11 @@ class HelperBehaviourTests(unittest.TestCase):
         # stdout and refused a finished install (build-release exit 9, assembler exit 28). Only the trailing top-level JSON object is
         # parsed now, for LF and CRLF startup text alike. Controls: stdout with no JSON at all still refuses.
         run_real = b'@echo off\r\npy.exe -3 -S "%FFX_BANNER%"\r\npy.exe %*\r\nexit /b %ERRORLEVEL%\r\n'
-        for label, eol in (("lf", b"\n"), ("crlf", b"\r\n")):  # real line-ending bytes
+        # r17 adversary ea86ac25-A1: startup text with NO line ending shares the report's first line (`site ready{`), also with braces.
+        for label, eol, text in (("lf", b"\n", "site ready"), ("crlf", b"\r\n", "site ready"),
+                                 ("no-newline", b"", "site ready"), ("no-newline-braces", b"", "{site {ready{")):
             with self.subTest(startup_text=label):
-                result, out = self._run_behind_banner_shim(label, run_real, eol)
+                result, out = self._run_behind_banner_shim(label, run_real, eol, text)
                 self.assertTrue(result["ok"], result)
                 self.assertTrue((out / "ffmpeg.exe").is_file())
         with self.subTest(control="no JSON on stdout"):
