@@ -3289,6 +3289,39 @@ $script:PlaybackComparedFields = @('sourceAdvanced', 'requiredSourceFrames', 'na
 # written before a field existed does not carry it and is not re-judged for it. The older conform fields are not compared (OPEN in PR #910).
 $script:PlaybackComparedFieldsWhenStored = @('conformRepeats', 'conformPresented', 'conformConflictingFields', 'summaryConflictingFields')
 
+function Get-DvStoredPlaybackFieldProblems {
+    <#
+    .SYNOPSIS
+    The INVALID reasons of a receipt's stored playback block against the block re-derived from the hashed files (Test-DvReceiptValid runs this).
+    .DESCRIPTION
+    Every PlaybackComparedFields member must equal the re-derived one; every PlaybackComparedFieldsWhenStored member must equal it whenever the
+    stored block carries it. r4 (sol r3 finding 3, opus r3 STORED-PLAYBACK-FIELD-CASE-VARIANT-1): presence was a case-sensitive -ccontains while
+    Get-DvProp reads keys case-insensitively, so a stored "ConformRepeats": 999 read 999 and was never compared. A stored field is now found by any
+    casing (OrdinalIgnoreCase) and its value read by its own stored name, and a stored key that is a case variant of ANY compared field (both
+    lists) is refused outright (PLAYBACK_FIELD_CASE_VARIANT): the writer only ever writes the canonical names.
+    #>
+    param($Stored, $Derived)
+    $problems = [System.Collections.Generic.List[string]]::new()
+    $storedNames = @($(if ($Stored -is [System.Collections.IDictionary]) { @($Stored.Keys) } else { @($Stored.PSObject.Properties.Name) }) | ForEach-Object { [string]$_ })
+    foreach ($f in @($script:PlaybackComparedFields) + @($script:PlaybackComparedFieldsWhenStored)) {
+        foreach ($n in $storedNames) {
+            if ([string]::Equals($n, $f, [StringComparison]::OrdinalIgnoreCase) -and -not [string]::Equals($n, $f, [StringComparison]::Ordinal)) {
+                $problems.Add("PLAYBACK_FIELD_CASE_VARIANT: playback.$n is a case variant of the compared field $f (the writer writes $f only)")
+            }
+        }
+    }
+    foreach ($f in $script:PlaybackComparedFields) {
+        if (-not (Test-DvJsonEquivalent (Get-DvProp $Stored $f) (Get-DvProp $Derived $f))) { $problems.Add("PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive") }
+    }
+    foreach ($f in $script:PlaybackComparedFieldsWhenStored) {
+        foreach ($n in @($storedNames | Where-Object { [string]::Equals($_, $f, [StringComparison]::OrdinalIgnoreCase) })) {
+            if (-not (Test-DvJsonEquivalent (Get-DvProp $Stored $n) (Get-DvProp $Derived $f))) { $problems.Add("PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive") }
+        }
+    }
+    # one string per problem on the pipeline (callers collect with @(...)); none when the stored block is sound
+    foreach ($p in $problems) { $p }
+}
+
 function Test-DvNumber($Value) {
     ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal] -or $Value -is [single] -or $Value -is [int16] -or $Value -is [byte] -or $Value -is [uint32] -or $Value -is [uint64])
 }
@@ -6667,13 +6700,8 @@ function Test-DvReceiptValid {
         $stored = Get-DvProp $Receipt 'playback'
         if ($null -eq $stored) { $incomplete.Add('RECEIPT_FIELD_ABSENT: the receipt carries no playback block (the source-frame verdict)') }
         else {
-            foreach ($f in $script:PlaybackComparedFields) {
-                if (-not (Test-DvJsonEquivalent (Get-DvProp $stored $f) (Get-DvProp $derived $f))) { $invalid.Add("PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive") }
-            }
-            $storedNames = $(if ($stored -is [System.Collections.IDictionary]) { @($stored.Keys) } else { @($stored.PSObject.Properties.Name) })
-            foreach ($f in $script:PlaybackComparedFieldsWhenStored) {
-                if ($storedNames -ccontains $f -and -not (Test-DvJsonEquivalent (Get-DvProp $stored $f) (Get-DvProp $derived $f))) { $invalid.Add("PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive") }
-            }
+            # r4 (sol r3 finding 3): both field lists, found by any casing, a case-variant key refused (Get-DvStoredPlaybackFieldProblems)
+            foreach ($p in @(Get-DvStoredPlaybackFieldProblems -Stored $stored -Derived $derived)) { $invalid.Add($p) }
         }
         foreach ($p in @($derived.invalidReasons)) { if ($null -ne $p -and [string]$p -ne '') { $invalid.Add([string]$p) } }
         # the evidence's own identity: the clip, the venue and the build the receipt says it is about
@@ -7587,8 +7615,20 @@ function Get-DvCriteriaMetrics {
                 $m['conformMaxJumpCouldNotCheck'] = $(if ($null -eq $steps) { 'the measured session''s playback_smoke.conform line carries repeats but no readable non-negative presented (or a negative repeats), so the painted steps cannot be checked against source_advanced' }
                                                       else { "the measured session's playback_smoke.conform line says presented=$presentedRead repeats=$repeatsRead (no forward step) but source_advanced=$coverage, so its fields contradict each other" }) + $conflictNote
             }
+            elseif ($steps -ge 1 -and $steps -gt [int64]$coverage) {
+                # r4 (sol r3 finding 1, fable r3 EVERY-FRAME-CONFORM-LINE-STEPS-EXCEED-ADVANCE-1): the bound has two sides. With no backward step and no
+                # wrap every forward step advances at least one frame, so steps can never exceed source_advanced: 480 paints with repeats=0 over 478
+                # frames make 479 forward steps and hide a repeat. Such a line contradicts itself: conformMaxJump is CouldNotCheck.
+                $m['conformMaxJump'] = $null
+                $m['conformMaxJumpCouldNotCheck'] = "the measured session's playback_smoke.conform line says presented=$presentedRead repeats=$repeatsRead, which is $steps forward step(s), more than the source_advanced=$coverage frames they cover (every forward step advances at least one frame), so its fields contradict each other" + $conflictNote
+            }
             elseif ($steps -ge 1) {
-                $implied = [int64][Math]::Ceiling([double]$coverage / [double]$steps)
+                # r4 (sol r3 finding 2, opus r3 blocker): integer arithmetic, never a cast back from [double]. [int64][Math]::Ceiling([double]x / s) cast
+                # 2^63 for x within 512 of Int64.MaxValue and threw, so the leg ended UNRESOLVED RUNNER_ERROR in place of this typed CouldNotCheck.
+                # Here 1 <= steps <= coverage, so the quotient is at most coverage and the +1 only applies when steps >= 2 (quotient <= MaxValue / 2).
+                $remainder = [int64]0
+                $quotient = [Math]::DivRem([int64]$coverage, [int64]$steps, [ref]$remainder)
+                $implied = $(if ($remainder -ne 0) { $quotient + 1 } else { $quotient })
                 if ($implied -gt $currentJump) {
                     # the line's own max_jump is below the step its counts force: its fields contradict each other (a max_jump=0 line that advanced must
                     # not be raised into a passing 1), so it is a missing number, never a measured jump
@@ -7784,4 +7824,4 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Test-DvMatrixRowMeasured, Get-DvMatrixMeasuredCount, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
-    Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt, Get-DvAcceptanceVerdict
+    Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt, Get-DvAcceptanceVerdict, Get-DvStoredPlaybackFieldProblems
