@@ -168,6 +168,14 @@ function Assert-DisplayPathNotMalformed([AllowNull()]$Receipt, [AllowNull()][All
 }
 Assert-DisplayPathNotMalformed $classic $receiptTexts.classic
 Assert-DisplayPathNotMalformed $cinematic $receiptTexts.cinematic
+# r4 (adversary pass-5 A3): the film receipt (trio) is read and its display path judged here too, BEFORE any gate of any side, so a malformed film block is refused
+# as itself even when the classic/cinematic gates below would refuse the pair for another reason first (PAIR_VENUE_OR_CARD_DIFFERS).
+$film = $null
+if ($trio) {
+    $receiptTexts.film = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $FilmReceipt).Path)
+    $film = ConvertFrom-DvReceiptText -Text $receiptTexts.film
+    Assert-DisplayPathNotMalformed $film $receiptTexts.film
+}
 
 # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r26 (sol r25 B2 sibling): receipt flavors compare ordinally and canonically (Test-DvLookFlavorSame), never the linguistic -cne
 if (-not (Test-DvLookFlavorSame 'classic' ([string]$classic.subject.lookFlavor)) -or -not (Test-DvLookFlavorSame 'cinematic' ([string]$cinematic.subject.lookFlavor))) {
@@ -180,11 +188,9 @@ if ([string]$classic.subject.backend -cne 'cpu') { throw "PAIR_BACKEND_NOT_CPU t
 if (-not [string]::Equals([string]$classic.metrics.sourceCommit, [string]$cinematic.metrics.sourceCommit, [StringComparison]::Ordinal)) { throw 'PAIR_SUBJECT_DIFFERS the receipts differ in metrics.sourceCommit' }
 if ([string]$classic.venue.name -cne [string]$cinematic.venue.name -or [string]$classic.card -cne [string]$cinematic.card) { throw 'PAIR_VENUE_OR_CARD_DIFFERS the receipts are not the same venue/card' }
 if ([string]$classic.scale.effectiveScale -cne [string]$cinematic.scale.effectiveScale) { throw "PAIR_SCALE_DIFFERS the receipts rendered at different effective scales ($(Get-DvScaleLabel -Factor $classic.scale.effectiveScale) vs $(Get-DvScaleLabel -Factor $cinematic.scale.effectiveScale))" }
-$film = $null
 if ($trio) {
-    $receiptTexts.film = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $FilmReceipt).Path)
-    $film = ConvertFrom-DvReceiptText -Text $receiptTexts.film
-    Assert-DisplayPathNotMalformed $film $receiptTexts.film   # r3 (sol r2 B2): before the film gates read its venue
+    # r3 (sol r2 B2) / r4 (adversary pass-5 A3): the film receipt was read, and its display path judged, above, before the first gate of any side
+    #   (so every gate below reads a film receipt whose venue and display path are already known to be well formed)
     if (-not (Test-DvLookFlavorSame ([string]$ThirdFlavor) ([string]$film.subject.lookFlavor))) { throw "PAIR_FLAVORS_WRONG the third receipt must be the $ThirdFlavor flavor (got '$($film.subject.lookFlavor)')" }
     foreach ($f in 'buildManifestSha256', 'clipId', 'backend') {
         if ([string]$classic.subject.$f -cne [string]$film.subject.$f) { throw "PAIR_SUBJECT_DIFFERS the film receipt differs in subject.$f" }

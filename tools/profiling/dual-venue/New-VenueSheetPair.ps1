@@ -41,6 +41,13 @@ $cpuText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $CpuReceipt).Path)
 # SUCCESSOR-3 r2 (sol r1 B2): ConvertFrom-DvReceiptText, so a venue.displayPath that alone stops the parse reaches the validator's typed DISPLAY_PATH_MALFORMED
 $cuda = ConvertFrom-DvReceiptText -Text $cudaText
 $cpu = ConvertFrom-DvReceiptText -Text $cpuText
+# r4 (adversary pass-5 A3 sibling): each side's display path is judged right after it is read, BEFORE the backend gate below, so a malformed block (or a null /
+# non-object venue) is refused as itself (PAIR_RECEIPT_INVALID, DISPLAY_PATH_MALFORMED) on any side, never as PAIR_BACKENDS_WRONG. An empty / `null` / `[]` file
+# reads as $null: no record, `absent`, and the backend gate refuses it as before. The display path ALONE: no core call, no `try` (the W0 hazard, psm1).
+foreach ($r in $cuda, $cpu) {
+    $display = Get-DvReceiptDisplayPathState -Receipt $r -ReceiptText $(if ([object]::ReferenceEquals($r, $cuda)) { $cudaText } else { $cpuText })
+    if ($display.state -ceq 'malformed') { throw "PAIR_RECEIPT_INVALID receipt $($r.receiptId) is not valid evidence: $(Get-DvDisplayPathMalformedReason -Display $display)" }
+}
 
 if ($cuda.subject.backend -ne 'cuda' -or $cpu.subject.backend -ne 'cpu') { throw 'PAIR_BACKENDS_WRONG the first receipt must be the cuda backend and the second the cpu backend' }
 # The sheet is owner footage: it may only be written where it stays local.
@@ -59,10 +66,7 @@ $listedFrames = @{}
 # on either side is refused as itself (PAIR_RECEIPT_INVALID, DISPLAY_PATH_MALFORMED) on any outcome; otherwise each side's gates below run in order, as before.
 # r3 (opus key3 r2 B1): that judgement is the display path ALONE (Get-DvReceiptDisplayPathState: no core call, no `try`). Wrapping the validator in a `try` here
 # turned a statement error the core survives (the blanket revocation filter) into a raw throw instead of its typed CONSENT_REVOKED (the W0 hazard, psm1).
-foreach ($r in $cuda, $cpu) {
-    $display = Get-DvReceiptDisplayPathState -Receipt $r -ReceiptText $(if ([object]::ReferenceEquals($r, $cuda)) { $cudaText } else { $cpuText })
-    if ($display.state -ceq 'malformed') { throw "PAIR_RECEIPT_INVALID receipt $($r.receiptId) is not valid evidence: $(Get-DvDisplayPathMalformedReason -Display $display)" }
-}
+# (r4: that per-side display-path judgement now runs right after the two receipts are read, above, before the backend gate; it is not repeated here)
 foreach ($r in $cuda, $cpu) {
     if ($r.outcome -ne 'PASS' -and $r.outcome -ne 'FAIL') { throw "PAIR_RECEIPT_INCOMPLETE receipt $($r.receiptId) is $($r.outcome), not PASS/FAIL" }
     $validity = Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot -ReceiptText $(if ([object]::ReferenceEquals($r, $cuda)) { $cudaText } else { $cpuText })

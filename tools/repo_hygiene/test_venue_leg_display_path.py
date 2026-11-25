@@ -1575,14 +1575,14 @@ class Successor2Tests(unittest.TestCase):
             texts[f"probe {depth}"] = json.dumps(dict(HEALTHY_PROBE, displayPath=good_block()))[:-1] + ', "future": ' + deep + '}'
         got = pwsh_json("$in = [IO.File]::ReadAllText($env:DVE_TEXTS_FILE) | ConvertFrom-Json -AsHashtable\n$out = [ordered]@{}\n"
                         "foreach ($k in @($in.Keys)) {\n"
-                        "  if ($k.StartsWith('probe')) { $p = ConvertFrom-DvProbeStdout ('DVE_PROBE=' + $in[$k]); $out[$k] = [ordered]@{ state = (Test-DvDisplayPathBlock -Block $p.displayPath).state; unknown = [bool](Test-DvDisplayPathUnknown $p.displayPath) } }\n"
+                        "  if ($k.StartsWith('probe')) { $p = ConvertFrom-DvProbeStdout ('DVE_PROBE=' + $in[$k]); $out[$k] = [ordered]@{ state = (Test-DvDisplayPathBlock -Block $p.displayPath).state; schema = [string]$p.displayPath.schema } }\n"
                         "  else { $r = ConvertFrom-DvReceiptText -Text $in[$k]; $v = Test-DvReceiptValid -Receipt $r -ReceiptText $in[$k]; $out[$k] = [ordered]@{ status = $v.status; displayPath = $v.displayPath } } }\n"
                         "$out | ConvertTo-Json -Compress -Depth 5", {"DVE_TEXTS_FILE": self._write_texts(texts)})
         for depth in (256, 1000):
             with self.subTest(depth=depth):
                 self.assertEqual(got[f"receipt absent {depth}"], {"status": "NO_SIGNAL", "displayPath": "absent"}, got)
                 self.assertEqual(got[f"receipt present {depth}"], {"status": "NO_SIGNAL", "displayPath": "present"}, got)
-                self.assertEqual(got[f"probe {depth}"], {"state": "present", "unknown": False}, got)
+                self.assertEqual(got[f"probe {depth}"], {"state": "present", "schema": SCHEMA}, got)   # the block itself, not the probe-block-malformed unknown
 
     def _write_texts(self, texts: dict) -> str:
         d = tempfile.mkdtemp(prefix="dv-r4-a4-")

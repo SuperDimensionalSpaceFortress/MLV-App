@@ -6478,6 +6478,7 @@ function Get-DvDisplayPath {
     param([int]$BudgetSec = 15)
     $BudgetSec = [math]::Max(0, [math]::Min(15, $BudgetSec))   # a caller can only tighten the 15 s bound, never loosen it
     $sw = [Diagnostics.Stopwatch]::StartNew()
+    $startUtc = [datetime]::UtcNow   # r4 (adversary pass-5 A8): with $sw, the monotonic floor of collectedUtc (below)
     $invariant = [Globalization.CultureInfo]::InvariantCulture
     $unknown = {
         param($why)
@@ -6573,6 +6574,9 @@ function Get-DvDisplayPath {
             $block.os.hotfixCount = @($fixes).Count
         } catch { $block.os.hotfixCount = & $unknown $_.Exception.Message }
         $done = [datetime]::UtcNow
+        # r4 (adversary pass-5 A8): a wall clock stepped back during the reads must not stamp a time before them: never earlier than the start plus the elapsed time
+        $floor = $startUtc.AddTicks($sw.Elapsed.Ticks)
+        if ($done -lt $floor) { $done = $floor }
         $rem = $done.Ticks % [timespan]::TicksPerSecond
         if ($rem -ne 0) { $done = $done.AddTicks([timespan]::TicksPerSecond - $rem) }
         $block.collectedUtc = $done.ToString('yyyy-MM-ddTHH:mm:ssZ', $invariant)
@@ -6671,20 +6675,30 @@ function Test-DvDisplayPathHasUnknownMember {
 }
 
 function Add-DvJsonDuplicateKeys {
+    # r4 (adversary pass-5 A4): a WORK STACK, never script recursion: an unrelated member nested as deep as ConvertFrom-Json reads (1024) must not overflow the
+    # call depth. Children are pushed in reverse, so the paths come out in document order, as the recursive walk gave them.
     param([System.Text.Json.JsonElement]$Element, [string]$Path, [System.Collections.Generic.List[string]]$Found)
-    if ($Element.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
-        # OrdinalIgnoreCase: PowerShell reads a member without regard to case, so `Name` beside `name` is one member read twice as well
-        $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        foreach ($p in $Element.EnumerateObject()) {
-            # SUCCESSOR-3 r3 (adversary pass-4 A2): a name that is not a plain identifier (`venue.displayPath` as ONE member name, a bracket, a quote) is written in
-            # bracket form, so it can never read as a path under venue.displayPath (or under a probe's displayPath)
-            $here = $Path + $(if ($p.Name -cmatch '\A[A-Za-z_][A-Za-z0-9_]*\z') { '.' + $p.Name } else { "['" + $p.Name.Replace('\', '\\').Replace("'", "\'") + "']" })
-            if (-not $seen.Add($p.Name)) { $Found.Add($here) }
-            Add-DvJsonDuplicateKeys -Element $p.Value -Path $here -Found $Found
+    $work = [System.Collections.Generic.Stack[object]]::new()
+    $work.Push([pscustomobject]@{ e = $Element; p = $Path })
+    while ($work.Count -gt 0) {
+        $item = $work.Pop()
+        $el = $item.e
+        $children = [System.Collections.Generic.List[object]]::new()
+        if ($el.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+            # OrdinalIgnoreCase: PowerShell reads a member without regard to case, so `Name` beside `name` is one member read twice as well
+            $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($p in $el.EnumerateObject()) {
+                # SUCCESSOR-3 r3 (adversary pass-4 A2): a name that is not a plain identifier (`venue.displayPath` as ONE member name, a bracket, a quote) is written in
+                # bracket form, so it can never read as a path under venue.displayPath (or under a probe's displayPath)
+                $here = $item.p + $(if ($p.Name -cmatch '\A[A-Za-z_][A-Za-z0-9_]*\z') { '.' + $p.Name } else { "['" + $p.Name.Replace('\', '\\').Replace("'", "\'") + "']" })
+                if (-not $seen.Add($p.Name)) { $Found.Add($here) }
+                $children.Add([pscustomobject]@{ e = $p.Value; p = $here })
+            }
+        } elseif ($el.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
+            $i = 0
+            foreach ($e in $el.EnumerateArray()) { $children.Add([pscustomobject]@{ e = $e; p = ($item.p + '[' + $i + ']') }); $i++ }
         }
-    } elseif ($Element.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
-        $i = 0
-        foreach ($e in $Element.EnumerateArray()) { Add-DvJsonDuplicateKeys -Element $e -Path ($Path + '[' + $i + ']') -Found $Found; $i++ }
+        for ($k = $children.Count - 1; $k -ge 0; $k--) { $work.Push($children[$k]) }
     }
 }
 
@@ -6696,7 +6710,8 @@ function Get-DvJsonDuplicateKeys {
     $doc = $null
     try {
         $opt = [System.Text.Json.JsonDocumentOptions]::new()
-        $opt.MaxDepth = 256; $opt.AllowTrailingCommas = $true; $opt.CommentHandling = [System.Text.Json.JsonCommentHandling]::Skip
+        # r4 (adversary pass-5 A4): the depth ConvertFrom-Json reads (its -Depth default, 1024), so text the receipt parser accepts is never "unreadable" here
+        $opt.MaxDepth = 1024; $opt.AllowTrailingCommas = $true; $opt.CommentHandling = [System.Text.Json.JsonCommentHandling]::Skip
         $doc = [System.Text.Json.JsonDocument]::Parse($Text, $opt)
     } catch { return $null }
     try {
@@ -6719,7 +6734,7 @@ function Test-DvJsonTextIsObject {
     param([AllowEmptyString()][string]$Text)
     try {
         $opt = [System.Text.Json.JsonDocumentOptions]::new()
-        $opt.MaxDepth = 256; $opt.AllowTrailingCommas = $true; $opt.CommentHandling = [System.Text.Json.JsonCommentHandling]::Skip
+        $opt.MaxDepth = 1024; $opt.AllowTrailingCommas = $true;   # r4 (adversary pass-5 A4): ConvertFrom-Json's own depth $opt.CommentHandling = [System.Text.Json.JsonCommentHandling]::Skip
         $doc = [System.Text.Json.JsonDocument]::Parse($Text, $opt)
     } catch { return $false }
     try { $doc.RootElement.ValueKind -eq [System.Text.Json.JsonValueKind]::Object } finally { $doc.Dispose() }
