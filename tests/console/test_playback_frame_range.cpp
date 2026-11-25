@@ -4943,6 +4943,32 @@ TEST( PlaybackFrameRange, R1ACorrectionBelongsToTheLandingRequestedAfterIt )
     ASSERT_EQ( 58LL, (long long)none.wrapsWidth );
 }
 
+// PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2 (r1 adversary pass 2 A1): the hand-off counts the crossed wraps the engine made AFTER the
+// rebase, which the slip histogram reads as the landing's lap (a wrap, never slips from the rebase frame).
+TEST( PlaybackFrameRange, R2TheHandOffCountsTheWrapsMadeAfterTheRebase )
+{
+    playback_frame_range::PlaybackWrapRecorder recorder;
+    recorder.noteEngineWrap( 9, 1 );                                    // a lap before the correction
+    recorder.noteEngineCorrection( 2 );
+    recorder.noteEngineWrap( 49, 1 );                                   // a lap after it
+    const playback_frame_range::PaintCreditHandOff lapped = playback_frame_range::paintCreditHandOff( recorder, 0, 2, 0, 1 );
+    ASSERT_TRUE( lapped.rebase );
+    ASSERT_EQ( 1, lapped.wrapsAfterRebase );                            // stub: 0
+    ASSERT_EQ( 49LL, (long long)lapped.wrapsWidth );
+    // a correction made after every crossed wrap: no lap after the rebase
+    playback_frame_range::PlaybackWrapRecorder after;
+    after.noteEngineWrap( 49, 1 );
+    after.noteEngineCorrection( 22 );
+    const playback_frame_range::PaintCreditHandOff flat = playback_frame_range::paintCreditHandOff( after, 0, 1, 0, 1 );
+    ASSERT_TRUE( flat.rebase );
+    ASSERT_EQ( 0, flat.wrapsAfterRebase );
+    ASSERT_EQ( 0LL, (long long)flat.wrapsWidth );
+    // no correction crossed: no rebase, nothing after it
+    const playback_frame_range::PaintCreditHandOff none = playback_frame_range::paintCreditHandOff( recorder, 0, 2, 1, 0 );
+    ASSERT_FALSE( none.rebase );
+    ASSERT_EQ( 0, none.wrapsAfterRebase );
+}
+
 // r1 (pass 17 A2 control): the source-frame counter is fed the CORRECTED start. Cut 41..1000, Loop, armed at 10, a 1.2-frame tick:
 // the start folds to 40, the counter rebases its high-water mark there and counts the real step 40 -> 41.2 (one frame), never 30.
 TEST( PlaybackFrameRange, R1TheSourceFrameCounterRebasesAtTheCorrectedStart )

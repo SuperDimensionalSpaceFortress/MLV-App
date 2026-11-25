@@ -1015,3 +1015,150 @@ TEST(PlaybackSlipHistogram, R1Iter1TheRealStepAfterAZeroLapFoldIsADropTickAdvanc
     ASSERT_EQ( 1LL, (long long)s.advanceByPath[static_cast<int>( AdvancePath::DropTick )] );   // fc9e3e93: 0
     ASSERT_EQ( 0LL, (long long)s.advanceByPath[static_cast<int>( AdvancePath::LoopWrap )] );   // fc9e3e93: 1
 }
+
+// ---- PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2 (r1 adversary pass 2 A1 on 7de55386): the PRESENT side of a correction ----
+// A position correction contributes zero playback travel, zero slips and zero startup catch-up. r1 kept it out of the timeline's
+// DropTick path; the display endpoint, the start-relative measures and the rates after the first present still counted it.
+namespace
+{
+PresentSample r2Present( int frame, double ms, int timeline, int correctionsLanded = 0, bool rebase = false, int rebaseFrame = 0,
+                         bool rebaseLapped = false )
+{
+    PresentSample p;
+    p.displayFrame = frame;
+    p.presentMs = ms;
+    p.timelinePosition = timeline;
+    p.correctionsLanded = correctionsLanded;
+    p.rebase = rebase;
+    p.rebaseFrame = rebaseFrame;
+    p.rebaseLapped = rebaseLapped;
+    return p;
+}
+} // namespace
+
+// A1's input exactly: 24 fps, Drop Frame and Loop on, cut 1..50, frame 10 presented, Cut In raised to 41, an 8 ms tick granting 0.192
+// frames, frame 40 presented (the hand-off's landing: it crossed the correction and rebases to 40).
+TEST(PlaybackSlipHistogram, R2ACorrectionLandingIsNeitherSlipsNorTimelineTravel)
+{
+    const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick( 10.0, 0.192, 41, 50, true );
+    ASSERT_TRUE( tick.corrected );
+    ASSERT_EQ( 40, static_cast<int>( tick.position ) );
+    SlipHistogram h;
+    h.reset( 10, 24.0 );
+    h.notePresent( r2Present( 10, 100.0, 10 ) );
+    h.noteTimelineCorrection( playback_frame_range::dropFrameCorrectionFrame( tick.correctedStart ) );
+    h.noteTimelineMove( AdvancePath::DropTick, static_cast<int>( tick.position ), 108.0, tick.appliedFrames, 0.0 );
+    ASSERT_EQ( 30, h.correctedFrames() );                                // 3c0290cd: 0
+    h.notePresent( r2Present( 40, 141.7, 40, 1, true, 40 ) );
+    const Summary s = h.finish( 150.0, 40 );
+    ASSERT_EQ( 0LL, s.slipsTotal );                                      // 3c0290cd: 29
+    ASSERT_EQ( 0, s.slipEvents );
+    ASSERT_EQ( 0, s.wraps );
+    ASSERT_EQ( 0, s.repeats );
+    ASSERT_EQ( 0, s.startupCatchupFrames );
+    ASSERT_EQ( 0, s.timelineFramesAfterFirst );                          // 3c0290cd: 30
+    ASSERT_NEAR( 0.0, s.timelineAfterFirstRawFps, 1e-12 );               // 3c0290cd: 30 frames over 50 ms
+    // the residual still books the move under Other, as a seek (r1's contract)
+    ASSERT_EQ( 30LL, (long long)s.advanceByPath[static_cast<int>( AdvancePath::Other )] );
+}
+
+// A correction BEFORE the first present (legacy startup on): the first present lands it (consumed-count step, no rebase on a first
+// present). Neither the startup catch-up nor the first present's timeline delta counts the 30 correction frames, and the wait credit is
+// the wall time since Play alone.
+TEST(PlaybackSlipHistogram, R2ACorrectionBeforeTheFirstPresentIsNotStartupCatchUp)
+{
+    SlipHistogram h;
+    h.reset( 10, 24.0 );
+    h.setPlayStart( 0.0 );
+    h.noteTimelineCorrection( 40 );
+    h.noteTimelineMove( AdvancePath::DropTick, 40, 8.0, 0.192, 0.0 );
+    h.notePresent( r2Present( 40, 50.0, 40, 1 ) );
+    h.noteTimelineMove( AdvancePath::DropTick, 41, 92.0, 1.0, 0.0 );
+    h.notePresent( r2Present( 41, 92.0, 41 ) );
+    const Summary s = h.finish( 100.0, 41 );
+    ASSERT_EQ( 0, s.startupCatchupFrames );                              // 3c0290cd: 30
+    ASSERT_EQ( 0, s.timelineDeltaAtFirstPresent );                       // 3c0290cd: 30
+    ASSERT_EQ( 1, s.startupWaitCreditFrames );                           // 50 ms at 24 fps; 3c0290cd: 0
+    ASSERT_EQ( 0LL, s.slipsTotal );
+    ASSERT_EQ( 1, s.timelineFramesAfterFirst );
+}
+
+// The first present shows the frame requested BEFORE the correction (it does not land it); the second present lands it. The first
+// present's timeline-ahead-of-display jump is not a 29-frame catch-up, and the landing is no slip.
+TEST(PlaybackSlipHistogram, R2AnUnlandedCorrectionIsNotTheFirstPresentsJump)
+{
+    SlipHistogram h;
+    h.reset( 10, 24.0 );
+    h.noteTimelineCorrection( 40 );
+    h.noteTimelineMove( AdvancePath::DropTick, 40, 8.0, 0.192, 0.0 );
+    h.notePresent( r2Present( 10, 50.0, 40 ) );
+    h.notePresent( r2Present( 40, 92.0, 40, 1, true, 40 ) );
+    const Summary s = h.finish( 100.0, 40 );
+    ASSERT_EQ( 0, s.startupCatchupFrames );                              // 3c0290cd: 29
+    ASSERT_EQ( 0LL, s.slipsTotal );
+    ASSERT_EQ( 0, s.timelineDeltaAtFirstPresent );                       // 3c0290cd: 30
+    ASSERT_EQ( 0, s.timelineFramesAfterFirst );
+}
+
+// A BACKWARD correction (Loop-off clamp 100 -> 49 on cut 1..50) is not a wrap, a repeat or travel.
+TEST(PlaybackSlipHistogram, R2ABackwardCorrectionLandingIsNotAWrap)
+{
+    const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick( 100.0, 0.192, 1, 50, false );
+    ASSERT_TRUE( tick.corrected );
+    SlipHistogram h;
+    h.reset( 100, 24.0 );
+    h.notePresent( r2Present( 100, 50.0, 100 ) );
+    h.noteTimelineCorrection( playback_frame_range::dropFrameCorrectionFrame( tick.correctedStart ) );
+    h.noteTimelineMove( AdvancePath::DropTick, static_cast<int>( tick.position ), 58.0, tick.appliedFrames, 0.0 );
+    ASSERT_EQ( -51, h.correctedFrames() );                               // 3c0290cd: 0
+    h.notePresent( r2Present( 49, 92.0, 49, 1, true, 49 ) );
+    const Summary s = h.finish( 100.0, 49 );
+    ASSERT_EQ( 0, s.wraps );                                             // 3c0290cd: 1
+    ASSERT_EQ( 0, s.repeats );
+    ASSERT_EQ( 0LL, s.slipsTotal );
+    ASSERT_EQ( 0, s.timelineFramesAfterFirst );                          // 3c0290cd: 51
+}
+
+// A landing whose engine LAPPED after the correction (stale 100 + 60 on cut 1..50 with Loop: rebase 2, one 49-wide lap, frame 13) is a
+// wrap, as a lap's landing is in the base, never 11 (rebased) or 2 (unrebased) slips.
+TEST(PlaybackSlipHistogram, R2ALandingThatLappedAfterTheCorrectionIsAWrap)
+{
+    const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick( 100.0, 60.0, 1, 50, true );
+    ASSERT_TRUE( tick.corrected );
+    ASSERT_EQ( 1, tick.wrapLaps );
+    ASSERT_EQ( 13, static_cast<int>( tick.position ) );
+    SlipHistogram h;
+    h.reset( 10, 24.0 );
+    h.notePresent( r2Present( 10, 50.0, 10 ) );
+    h.noteTimelineCorrection( playback_frame_range::dropFrameCorrectionFrame( tick.correctedStart ) );
+    h.noteTimelineMove( AdvancePath::LoopWrap, 13, 58.0, tick.appliedFrames, 0.0 );
+    h.notePresent( r2Present( 13, 92.0, 13, 1, true, 2, true ) );
+    const Summary s = h.finish( 100.0, 13 );
+    ASSERT_EQ( 1, s.wraps );                                             // 3c0290cd: 0
+    ASSERT_EQ( 0LL, s.slipsTotal );                                      // 3c0290cd: 2
+}
+
+// Controls: without a correction a forward step is still slips and timeline travel; a landing that also skipped real frames after the
+// correction books those (40 -> 45: 4 slips, 5 frames of travel), never the correction.
+TEST(PlaybackSlipHistogram, R2WithoutACorrectionAForwardStepIsStillSlipsAndARealSkipAfterALandingIsToo)
+{
+    SlipHistogram plain;
+    plain.reset( 10, 24.0 );
+    plain.notePresent( r2Present( 10, 50.0, 10 ) );
+    plain.noteTimelineMove( AdvancePath::DropTick, 40, 58.0, 30.0, 0.0 );
+    plain.notePresent( r2Present( 40, 92.0, 40 ) );
+    const Summary p = plain.finish( 100.0, 40 );
+    ASSERT_EQ( 29LL, p.slipsTotal );
+    ASSERT_EQ( 30, p.timelineFramesAfterFirst );
+    ASSERT_EQ( 0, plain.correctedFrames() );
+
+    SlipHistogram h;
+    h.reset( 10, 24.0 );
+    h.notePresent( r2Present( 10, 50.0, 10 ) );
+    h.noteTimelineCorrection( 40 );
+    h.noteTimelineMove( AdvancePath::DropTick, 45, 58.0, 5.0, 0.0 );
+    h.notePresent( r2Present( 45, 92.0, 45, 1, true, 40 ) );
+    const Summary s = h.finish( 100.0, 45 );
+    ASSERT_EQ( 4LL, s.slipsTotal );                                      // 3c0290cd: 34
+    ASSERT_EQ( 5, s.timelineFramesAfterFirst );                          // 3c0290cd: 35
+}

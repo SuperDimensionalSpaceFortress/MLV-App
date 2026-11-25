@@ -156,3 +156,39 @@ TEST(PlaybackSourceAdvanceWiring, R1TheCorrectionCountIsStampedAndTheHandOffPass
     ASSERT_TRUE(source.contains(QStringLiteral("m_playbackSmokeTrackerEngineCorrections = m_playbackWrapRecorder.engineCorrections;")));
     ASSERT_TRUE(readRepoFile(QStringLiteral("platform/qt/RenderFrameThread.h")).contains(QStringLiteral("int engineCorrectionsAtRequest = 0;")));
 }
+
+// PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2 (r1 adversary pass 2 A1): the slip sample carries the corrections its request crossed and
+// the hand-off's rebase, so the slip histogram rebases its display endpoint where the paint tracker rebases; the first present's timeline
+// delta and the session's timeline numerators leave out the same signed correction sum.
+TEST(PlaybackSourceAdvanceWiring, R2TheSlipSampleCarriesTheLandingAndTheTimelineNumeratorsLeaveOutTheCorrections)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString presented = functionBody(source, QStringLiteral("void MainWindow::notePlaybackSmokePresentedFrame("));
+    const int handOff = presented.indexOf(QStringLiteral("const playback_frame_range::PaintCreditHandOff sourceAdvanceHandOff ="));
+    const int sample = presented.indexOf(QStringLiteral("playback_slip::PresentSample slipSample;"));
+    const int note = presented.indexOf(QStringLiteral("m_playbackSlipHistogram.notePresent( slipSample );"));
+    ASSERT_TRUE(handOff >= 0);
+    ASSERT_TRUE(sample > handOff);
+    ASSERT_TRUE(note > sample);
+    const QString fields[] = {
+        QStringLiteral("slipSample.correctionsLanded = m_playbackSmokeTrackerEngineCorrections - sourceAdvanceCorrectionsBefore;"),
+        QStringLiteral("slipSample.rebase = sourceAdvanceHandOff.rebase;"),
+        QStringLiteral("slipSample.rebaseFrame = sourceAdvanceHandOff.rebaseFrame;"),
+        QStringLiteral("slipSample.rebaseLapped = sourceAdvanceHandOff.wrapsAfterRebase > 0;") };
+    for( const QString & field : fields )
+    {
+        const int at = presented.indexOf(field, sample);
+        ASSERT_TRUE(at > sample);
+        ASSERT_TRUE(at < note);
+        ASSERT_EQ(1, presented.count(field));
+    }
+    ASSERT_TRUE(presented.contains(QStringLiteral(
+        "            qAbs( ui->horizontalSliderPosition->value() - m_playbackSmokeStartPosition\n"
+        "                  - m_playbackSlipHistogram.correctedFrames() );")));
+    const QString finish = functionBody(source, QStringLiteral("void MainWindow::finishPlaybackSmokeTelemetry("));
+    ASSERT_TRUE(finish.contains(QStringLiteral(
+        "const int timelineDelta = currentPosition - m_playbackSmokeStartPosition - m_playbackSlipHistogram.correctedFrames();")));
+    ASSERT_FALSE(finish.contains(QStringLiteral("const int timelineDelta = currentPosition - m_playbackSmokeStartPosition;")));
+    // the slip summary and pace_summary read the same corrected timeline delta (finish() subtracts the sum itself)
+    ASSERT_TRUE(finish.indexOf(QStringLiteral("const int timelineDeltaAbs = timelineDelta >= 0")) > finish.indexOf(QStringLiteral("const int timelineDelta =")));
+}

@@ -782,6 +782,7 @@ struct PaintCreditHandOff
     bool rebase = false;
     int rebaseFrame = 0;
     int64_t wrapsWidth = 0;   // the crossed wraps' width; with a rebase, only those made after the last crossed correction
+    int wrapsAfterRebase = 0; // r2 (r1 adversary pass 2 A1): with a rebase, how many crossed wraps the engine made after that correction
 };
 inline PaintCreditHandOff paintCreditHandOff( const PlaybackWrapRecorder & recorder, int wrapsBefore, int wrapsCrossed,
                                               int correctionsBefore, int correctionsCrossed )

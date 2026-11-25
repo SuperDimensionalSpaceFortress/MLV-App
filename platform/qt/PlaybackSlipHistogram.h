@@ -244,6 +244,14 @@ struct PresentSample
     // texture presenter ran for it)
     bool textureKnown = false;
     playback_texture_split::Sample texture;
+    // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2 (r1 adversary pass 2 A1): the engine POSITION CORRECTIONS this frame's request
+    // crossed (the first present included: MainWindow's consumed-count step), and, from the second present on, the paint hand-off's
+    // rebase (paintCreditHandOff): the presentation that lands a correction rebases the display endpoint to rebaseFrame, as
+    // PlaybackSourceAdvanceTracker::noteRebase does. rebaseLapped: the engine lapped after that correction (a wrap, as in the base).
+    int correctionsLanded = 0;
+    bool rebase = false;
+    int rebaseFrame = 0;
+    bool rebaseLapped = false;
 };
 
 struct SlipRecord
@@ -683,6 +691,8 @@ public:
     // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: read-only views for the correction rows (a correction sets neither)
     int timelineAdvanceSincePresent() const { return m_timelineAdvanceSincePresent; }
     bool frameHasDeadline( int frame ) const { double ms = 0.0; return deadlineOf( frame, &ms ); }
+    // r2 (r1 adversary pass 2 A1): the signed sum of the session's timeline corrections; MainWindow's timeline numerators subtract it
+    int correctedFrames() const { return m_correctedFrames; }
 
 private:
     struct Deadline
@@ -792,6 +802,7 @@ private:
 
     int m_startPosition = 0;
     int m_timelinePosition = 0;
+    int m_correctedFrames = 0;            // r2: the signed sum of the timeline corrections (noteTimelineCorrection)
     double m_paceFps = 0.0;
     double m_periodMs = 0.0;
 
