@@ -651,10 +651,22 @@ class HelperBehaviourTests(unittest.TestCase):
     def test_an_inherited_launcher_dry_run_still_runs_the_extractor(self) -> None:
         # PR 862 r16 (adversary d92aff88-A2): PYLAUNCHER_DRYRUN=1 makes py.exe print the command it would run and exit 0 without starting
         # Python, so a valid install got no JSON report and the callers refused it. No PYLAUNCHER_* variable reaches the child now.
+        # The Python install manager's py.exe ignores PYLAUNCHER_DRYRUN while the legacy launcher honours it, so a py.exe shim stands
+        # in for the legacy behaviour on any host: with the variable set it prints the command and exits 0 without starting Python.
+        shim = self.tmp / "pyshim-dryrun.cmd"
+        shim.write_bytes(b"@echo off\r\nif defined PYLAUNCHER_DRYRUN goto dry\r\npy.exe %*\r\nexit /b %ERRORLEVEL%\r\n:dry\r\necho py.exe %*\r\nexit /b 0\r\n")
+        dry = subprocess.run([str(shim), "-3", "-c", "print('ran')"], capture_output=True, text=True, timeout=60,
+                             env=dict(os.environ, PYLAUNCHER_DRYRUN="1"))
+        self.assertTrue(dry.stdout.startswith("py.exe -3 -c"), f"precondition: the shim dry-runs and prints the command, not Python's output: {dry.stdout!r}")
+        prelude = (
+            "function global:Get-Command { param([string]$Name, [string]$CommandType, $ErrorAction)\n"
+            "  if ($Name -eq 'py.exe') { return [pscustomobject]@{ Source = $env:FFX_SHIM } }\n"
+            "  Microsoft.PowerShell.Core\\Get-Command @PSBoundParameters\n"
+            "}\n"
+        )
         out = self.tmp / "out"
         out.mkdir()
-        # (A launcher too old to know PYLAUNCHER_DRYRUN passes this trivially; the dry-run launcher is what makes the old code fail.)
-        result = self._run(str(out), extra_env={"PYLAUNCHER_DRYRUN": "1"})
+        result = self._run(str(out), extra_env={"PYLAUNCHER_DRYRUN": "1", "FFX_SHIM": str(shim)}, prelude=prelude)
         self.assertTrue(result["ok"], result)
         self.assertTrue((out / "ffmpeg.exe").is_file())
 
