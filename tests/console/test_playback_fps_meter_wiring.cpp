@@ -190,8 +190,9 @@ bool frameCapIsLive(const QString & body)
 {
     return body.contains(QStringLiteral(
         "ui->actionPlay->isChecked(), hadPendingAdvance );\n"
-        "    // r5 (pass 8 A3 on c37d6fd5): the fps meter gates on the shaped tick; the cap below bounds only the frame request.\n"
-        "    const int meterTickMs = timeDiff;\n"
+        "    // r5 (pass 8 A3 on c37d6fd5, pass 9 A1 on 22c93691): the fps meter gate, the present trace and both interaction logs\n"
+        "    // read the shaped tick, as on the base; the cap below bounds only the frame request (playbackHandling).\n"
+        "    const int shapedTickMs = timeDiff;\n"
         "    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 (adversary r2 A1): one tick never asks the drop-frame loop for more frames than\n"
         "    // it can count (a long suspension at a high source rate); every ordinary tick is unchanged.\n"
         "    // r4 (pass 5 A2): only the Drop Frame request reads the tick as frames, so Normal mode keeps its whole tick (fps meter).\n"
@@ -245,9 +246,9 @@ TEST(PlaybackFpsMeterWiring, FpsMeterGateReadsTheShapedTickNotTheCappedRequest)
 {
     const QString body = timerFrameEventBody();
     ASSERT_FALSE(body.isEmpty());
-    const QString meterLine = QStringLiteral("    const int meterTickMs = timeDiff;\n");
+    const QString meterLine = QStringLiteral("    const int shapedTickMs = timeDiff;\n");
     ASSERT_EQ(1, body.count(meterLine));
-    ASSERT_EQ(1, body.count(QStringLiteral("meterTickMs =")));
+    ASSERT_EQ(1, body.count(QStringLiteral("shapedTickMs =")));
     const int shapedAt = body.indexOf(QStringLiteral("timeDiff = playback_native_pace::shapedTickTimeDiffMs( timeDiff,"));
     const int meterAt = body.indexOf(meterLine);
     const int capAt = body.indexOf(QStringLiteral("timeDiff = playback_fps_meter::frameBoundedTickTimeDiffMs( timeDiff,"));
@@ -255,7 +256,7 @@ TEST(PlaybackFpsMeterWiring, FpsMeterGateReadsTheShapedTickNotTheCappedRequest)
     ASSERT_TRUE(meterAt > shapedAt);
     ASSERT_TRUE(capAt > meterAt);
     // the gate: exactly one, on the shaped tick, between the draw-to-draw sample and the EMA step
-    const QString gateLine = QStringLiteral("        if( meterTickMs != 0 )\n");
+    const QString gateLine = QStringLiteral("        if( shapedTickMs != 0 )\n");
     ASSERT_EQ(1, body.count(gateLine));
     ASSERT_FALSE(body.contains(QStringLiteral("if( timeDiff != 0 )")));
     const int sampleAt = body.indexOf(QStringLiteral("const int measuredFrameMs = playback_fps_meter::stampAgeMs( lastDrawTime, nowTime );"));
@@ -266,5 +267,53 @@ TEST(PlaybackFpsMeterWiring, FpsMeterGateReadsTheShapedTickNotTheCappedRequest)
     ASSERT_TRUE(emaAt > gateAt);
     // the cap still owns the request: playbackHandling reads the capped timeDiff, never meterTickMs
     ASSERT_TRUE(body.contains(QStringLiteral("    playbackHandling( timeDiff );")));
-    ASSERT_FALSE(body.contains(QStringLiteral("playbackHandling( meterTickMs )")));
+    ASSERT_FALSE(body.contains(QStringLiteral("playbackHandling( shapedTickMs )")));
+}
+
+// r5 (pass 9 A1 on 22c93691): the cap rewrote the shared timeDiff before the present trace (last_tick_diff, "that
+// advance's shaped timeDiff", PlaybackPresentTrace.h:50) and both interaction logs read it, so a 50000 ms tick at 25000 fps
+// reported 39999. Every reader except the request reads the shaped tick. A6 (pass 9): the meter gate pin is contiguous with
+// its neighbours, so a dead `if( false )` in front of the gate is rejected.
+namespace
+{
+bool meterGateIsLive(const QString & body)
+{
+    return body.contains(QStringLiteral(
+        "        lastDrawTime = nowTime;\n"
+        "        if( shapedTickMs != 0 )\n"
+        "        {\n"
+        "            m_playbackFpsEmaFrameMs =\n"
+        "                playback_fps_meter::smoothedFrameMs( m_playbackFpsEmaFrameMs, measuredFrameMs );\n"));
+}
+} // namespace
+
+TEST(PlaybackFpsMeterWiring, TraceAndLogsReadTheShapedTickAndTheGatePinRejectsADeadGate)
+{
+    const QString body = timerFrameEventBody();
+    ASSERT_FALSE(body.isEmpty());
+    ASSERT_EQ(1, body.count(QStringLiteral(
+        "m_playbackPresentTrace.noteAdvance( mlv_stage_timing_now() * 1000.0, tracePositionBefore, m_newPosDropMode, shapedTickMs );")));
+    ASSERT_FALSE(body.contains(QStringLiteral("m_newPosDropMode, timeDiff );")));
+    // timer_frame.playback_handled and timer_frame.draw: their time_diff_ms field is the shaped tick
+    ASSERT_EQ(2, body.count(QStringLiteral(".arg( shapedTickMs )")));
+    ASSERT_FALSE(body.contains(QStringLiteral(".arg( timeDiff )")));
+    const int handledAt = body.indexOf(QStringLiteral("timer_frame.playback_handled"));
+    const int drawAt = body.indexOf(QStringLiteral("timer_frame.draw"));
+    ASSERT_TRUE(handledAt >= 0);
+    ASSERT_TRUE(drawAt > handledAt);
+    const int firstArgAt = body.indexOf(QStringLiteral(".arg( shapedTickMs )"));
+    ASSERT_TRUE(firstArgAt > handledAt && firstArgAt < drawAt);
+    ASSERT_TRUE(body.indexOf(QStringLiteral(".arg( shapedTickMs )"), firstArgAt + 1) > drawAt);
+    // the stamp is taken before the cap (FpsMeterGateReadsTheShapedTickNotTheCappedRequest) and the trace follows playbackHandling
+    const int handlingAt = body.indexOf(QStringLiteral("    playbackHandling( timeDiff );"));
+    const int traceAt = body.indexOf(QStringLiteral("m_playbackPresentTrace.noteAdvance("));
+    ASSERT_TRUE(handlingAt >= 0);
+    ASSERT_TRUE(traceAt > handlingAt);
+
+    ASSERT_TRUE(meterGateIsLive(body));
+    const QString gateLine = QStringLiteral("        if( shapedTickMs != 0 )\n");
+    ASSERT_EQ(1, body.count(gateLine));
+    QString deadGate = body;
+    deadGate.replace(gateLine, QStringLiteral("        if( false )\n") + gateLine);
+    ASSERT_FALSE(meterGateIsLive(deadGate));
 }
