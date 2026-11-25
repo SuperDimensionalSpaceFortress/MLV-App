@@ -339,9 +339,12 @@ function Invoke-BoundedChain([string]$Backend) {
 function Get-RowFigures([string]$ReceiptPath, $Leg, [string]$Backend) {
     # The figures exactly as the receipt reports them (null when the receipt does not carry one; never a default). presentedFps / timelineFpsAfterFirstPresent come from
     # the receipt's own hashed run log through Get-DvMatrixRow, which refuses a log that no longer hashes to the receipt.
-    $f = [ordered]@{ receipt = $null; outcome = $null; fps = $null; drops = $null; stall = $null; verification = $null; rejected = $null; noFigure = $null; identity = $null }
+    $f = [ordered]@{ receipt = $null; outcome = $null; fps = $null; drops = $null; stall = $null; verification = $null; rejected = $null; noFigure = $null; identity = $null; resultJsonSha256 = $null }
     if (-not $ReceiptPath -or -not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) { return $f }
     try { $rc = [IO.File]::ReadAllText($ReceiptPath) | ConvertFrom-Json } catch { return $f }
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (adversary-01a12498.json A2): the smoke binding of the receipt these figures come from; the host-load read is bound to it
+    $boundSha = Get-DvProp (Get-DvProp $rc 'evidence') 'resultJsonSha256'
+    $f.resultJsonSha256 = $(if ($boundSha -is [string]) { $boundSha } elseif ($null -eq $boundSha) { '' } else { 'not-a-sha' })
     # The receipt must be the one THIS run's leg wrote, not a stale or foreign file the chain's path happens to name: its receiptId is its file name, its legId / venue /
     # buildManifestSha256 are the planned ones, and it started after this run did (the hub VM stamps it on the same clock). Anything else is `identity`: not validated, no figure.
     $idProblems = [System.Collections.Generic.List[string]]::new()
@@ -456,7 +459,8 @@ foreach ($b in $StandardBackends) {
             # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): the leg's host-load standing from its own hash-bound smoke result (VenueChain.psm1 Get-VenueLegHostLoad).
             # A provisional or unknown RAN row keeps its figures for the trend file but is never a measured reference row (the $measuredRows predicate below).
             $hlReceipt = $(if ($leg.PSObject.Properties['receipt'] -and $leg.receipt) { [string]$leg.receipt } else { '' })
-            $hl = Get-VenueLegHostLoad -ReceiptPath $hlReceipt
+            # (adversary-01a12498.json A2: bound to the receipt Get-RowFigures took the figures from; no receipt read there means no figures and no expectation)
+            $hl = $(if ($null -ne $fig.resultJsonSha256) { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -ExpectResultJsonSha256 ([string]$fig.resultJsonSha256) } else { Get-VenueLegHostLoad -ReceiptPath $hlReceipt })
             $hlLine = Get-VenueReferenceHostLoadRefusal -LegId $(if ($hlReceipt) { [IO.Path]::GetFileNameWithoutExtension($hlReceipt) } else { [string]$planLeg.legId }) -Standing $hl
             if ($hlLine -and $legStatus -ceq 'RAN') { Out-Line $hlLine }
             $rows.Add([ordered]@{

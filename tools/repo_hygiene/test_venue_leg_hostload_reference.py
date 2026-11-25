@@ -276,15 +276,56 @@ class LegHostLoadBindingTests(unittest.TestCase):
             "noformat-1": (bound({**{k: v for k, v in real.items() if k != "evidence"}, "export": {**real["export"], "format": ""}}), "play", cim),
             "noevidence-1": (bound({**{k: v for k, v in real.items() if k != "evidence"}, "export": {**real["export"], "receiptSha256": "x", "verdict": None}}), "play", cim),
             "arrexp-1": (bound({**{k: v for k, v in real.items() if k != "evidence"}, "export": [real["export"]]}), "play", cim),
+            # adversary-01a12498.json A1, its two inputs: scale/display [] with export {format prores, verdict x} over a bound playback result; and scale/display
+            # omitted with format fake and 64 zeroes. Siblings: a real export block on a receipt that still binds its smoke result; an unbound verdict-only block.
+            "a1arr-1": (bound({"schema": real["schema"], "scale": [], "display": [], "export": {"format": "prores", "verdict": "x"}}), "play", cim),
+            "a1fake-1": (bound({"schema": real["schema"], "export": {"format": "fake", "receiptSha256": "0" * 64, "verdict": None}}), "play", cim),
+            "a1bound-1": (bound({k: v for k, v in real.items() if k != "evidence"}), "play", cim),
+            "a1verdictonly-1": ({**real, "export": {**real["export"], "receiptSha256": None, "verdict": "PASS"}}, "export", None),
             "realexp-1": (real, "export", None),
-            "verdictexp-1": ({**real, "export": {**real["export"], "receiptSha256": None, "verdict": "PASS"}}, "export", None),
+            "verdictexp-1": ({**real, "export": {**real["export"], "verdict": "PASS"}}, "export", None),
         })
-        for rid in ("emptyexp-1", "specasrc-1", "noschema-1", "withscale-1", "withdisplay-1", "noformat-1", "noevidence-1", "arrexp-1"):
+        for rid in ("emptyexp-1", "specasrc-1", "noschema-1", "withscale-1", "withdisplay-1", "noformat-1", "noevidence-1", "arrexp-1",
+                    "a1arr-1", "a1fake-1", "a1bound-1", "a1verdictonly-1"):
             with self.subTest(rid=rid):
                 self.assertEqual((got[rid]["state"], got[rid]["provisional"], got[rid]["applies"]), ("unknown", True, True), (rid, got[rid]))
         for rid in ("realexp-1", "verdictexp-1"):
             with self.subTest(rid=rid):
                 self.assertEqual((got[rid]["state"], got[rid]["provisional"], got[rid]["applies"]), ("not-applicable", False, False), (rid, got[rid]))
+
+    def test_r3_a2_a_receipt_replaced_between_the_figure_read_and_the_host_load_read_reads_unknown(self) -> None:
+        # adversary-01a12498.json A2, its input: receipt A (60 fps, CIM-failed) is read for its figures; then A's receipt and result.json bytes are replaced by
+        # receipt B's (quiet). The host-load read, bound to A's evidence.resultJsonSha256 (-ExpectResultJsonSha256), must not return B's quiet standing.
+        import hashlib
+        cim = json.dumps({"hostLoad": CIM_FAILED}); quiet = json.dumps({"hostLoad": QUIET})
+        a_sha = hashlib.sha256(cim.encode("utf-8")).hexdigest()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "receipts"; ev = Path(d) / "evidence"
+            rid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            receipt = root / "CARD-1" / "leg-x" / "bachelor" / f"{rid}.json"
+            receipt.parent.mkdir(parents=True, exist_ok=True)
+            (ev / rid).mkdir(parents=True, exist_ok=True)
+            (ev / rid / "result.json").write_text(quiet, encoding="utf-8")   # B's bytes now sit at A's path
+            b_sha = hashlib.sha256(quiet.encode("utf-8")).hexdigest()
+            cases = {"swapped": ({"receiptId": rid, "evidence": {"resultJsonSha256": b_sha}}, a_sha),
+                     "same": ({"receiptId": rid, "evidence": {"resultJsonSha256": b_sha}}, b_sha),
+                     "wrongid": ({"receiptId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "evidence": {"resultJsonSha256": b_sha}}, None),
+                     "expectnone": ({"receiptId": rid, "evidence": {"resultJsonSha256": b_sha}}, "")}
+            got = {}
+            for name, (body, expect) in cases.items():
+                receipt.write_text(json.dumps(body), encoding="utf-8")
+                arg = "" if expect is None else f" -ExpectResultJsonSha256 '{expect}'"
+                p = run_ps(f"Get-VenueLegHostLoad -ReceiptPath '{receipt}'{arg} | ConvertTo-Json -Compress")
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                got[name] = json.loads(p.stdout)
+        for name in ("swapped", "wrongid", "expectnone"):
+            with self.subTest(case=name):
+                self.assertEqual((got[name]["state"], got[name]["provisional"]), ("unknown", True), (name, got[name]))
+        self.assertEqual((got["same"]["state"], got["same"]["provisional"]), ("quiet", False), "the unchanged receipt still reads its own standing")
+        for script in ("Invoke-VenueLeg.ps1", "Invoke-VenueBaseline.ps1"):
+            text = (ROOT / "tools" / "profiling" / "dual-venue" / script).read_text(encoding="utf-8")
+            self.assertIn("Get-VenueLegHostLoad -ReceiptPath", text)
+            self.assertIn("-ExpectResultJsonSha256", text, f"{script} binds the host-load read to the receipt its figures came from")
 
 
 @unittest.skipIf(PWSH is None, "pwsh is not on PATH")

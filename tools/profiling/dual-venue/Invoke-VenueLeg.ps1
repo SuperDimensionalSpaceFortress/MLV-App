@@ -193,7 +193,11 @@ if ($null -ne $setPlan) {
         if (-not (Get-Command -Name Get-VenueLegHostLoad -ErrorAction SilentlyContinue)) {
             Import-Module (Join-Path $here 'VenueChain.psm1') -Function Get-VenueLegHostLoad, Get-VenueReferenceHostLoadRefusal -DisableNameChecking
         }
-        $legHostLoad = $(if ($null -ne $legReceipt) { Get-VenueLegHostLoad -ReceiptPath $receiptPath } else { $null })
+        # (adversary-01a12498.json A2: bound to the receipt the row's figures come from, so a receipt swapped between the two reads reads 'unknown')
+        $legHostLoad = $(if ($null -ne $legReceipt) {
+            $boundSha = Get-DvProp (Get-DvProp $legReceipt 'evidence') 'resultJsonSha256'
+            Get-VenueLegHostLoad -ReceiptPath $receiptPath -ExpectResultJsonSha256 $(if ($boundSha -is [string]) { $boundSha } elseif ($null -eq $boundSha) { '' } else { 'not-a-sha' })
+        } else { $null })
         $row = Get-DvMatrixRow -PlanEntry $entry -Receipt $legReceipt -HostLoad $legHostLoad
         if ($null -ne $legReceipt) {
             $hlRefusal = Get-VenueReferenceHostLoadRefusal -LegId $(if ($row.receiptId) { [string]$row.receiptId } else { [string]$entry.legId }) -Standing $legHostLoad

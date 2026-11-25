@@ -1768,17 +1768,26 @@ function Test-VenueReceiptIsExportLeg([object]$Rc) {
     # leg is now only a receipt shaped as the shipped writer writes one (Invoke-VenueLeg.ps1 `if ($isExport)`): the receipt schema (New-DvReceipt), scale and display
     # nulled (a playback receipt always carries both objects), and an export block that names its format and carries real export evidence: the export spec
     # binding (receiptSha256, 64 hex) or an export verdict (a non-empty string). Anything else is a playback receipt and must bind its smoke result.
+    # r3 adversary-01a12498.json A1: scale:[] / display:[] (not objects) or absent members, any token-shaped format and any non-blank verdict passed. Now scale and
+    # display must be PRESENT and exactly null, the format one the runner ships (DualVenueRunner.psm1 $script:ExportFormats), the spec binding a 64-hex receiptSha256,
+    # the verdict null or an outcome token, and the receipt must bind NO playback evidence (evidence.resultJsonSha256 and logSha256 null or absent: the writer's
+    # export branch never sets them). A receipt that binds a smoke result is a playback leg and its own bound smoke result decides.
     if (-not (Test-VenueHlObject $Rc)) { return $false }
     $schema = Get-VenueHlMember $Rc 'schema'
     if (-not ($schema -is [string] -and [string]::Equals($schema, 'mlv-app/dual-venue-receipt/v1', [StringComparison]::Ordinal))) { return $false }
-    if ((Test-VenueHlObject (Get-VenueHlMember $Rc 'scale')) -or (Test-VenueHlObject (Get-VenueHlMember $Rc 'display'))) { return $false }
+    foreach ($n in 'scale', 'display') { if (-not (Test-VenueHlHasMember $Rc $n) -or $null -ne (Get-VenueHlMember $Rc $n)) { return $false } }
+    $evd = Get-VenueHlMember $Rc 'evidence'
+    if ($null -ne $evd -and -not (Test-VenueHlObject $evd)) { return $false }
+    foreach ($n in 'resultJsonSha256', 'logSha256') { if ($null -ne (Get-VenueHlMember $evd $n)) { return $false } }
     $ex = Get-VenueHlMember $Rc 'export'
     if (-not (Test-VenueHlObject $ex)) { return $false }
     $fmt = Get-VenueHlMember $ex 'format'
-    if (-not ($fmt -is [string] -and [regex]::IsMatch($fmt, '\A[A-Za-z0-9][A-Za-z0-9_.-]{0,31}\z'))) { return $false }
+    if (-not ($fmt -is [string] -and ([string]::Equals($fmt, 'prores', [StringComparison]::Ordinal) -or [string]::Equals($fmt, 'cdng-lossless', [StringComparison]::Ordinal)))) { return $false }
     $bind = Get-VenueHlMember $ex 'receiptSha256'
+    if (-not ($bind -is [string] -and [regex]::IsMatch($bind, '\A[0-9a-f]{64}\z'))) { return $false }
+    if (-not (Test-VenueHlHasMember $ex 'verdict')) { return $false }
     $verdict = Get-VenueHlMember $ex 'verdict'
-    ($bind -is [string] -and [regex]::IsMatch($bind, '\A[0-9a-fA-F]{64}\z')) -or ($verdict -is [string] -and -not [string]::IsNullOrWhiteSpace($verdict))
+    ($null -eq $verdict) -or ($verdict -is [string] -and [regex]::IsMatch($verdict, '\A[A-Z][A-Z_]{1,31}\z'))
 }
 
 function Get-VenueLegHostLoad {
@@ -1792,7 +1801,10 @@ function Get-VenueLegHostLoad {
     # r1 (adversary-b0c05520.json A1): the receipt decides, never the folder layout. A receipt whose export block is an object is an export leg; any other
     # receipt is a playback leg, and its result.json counts only when its bytes hash to the receipt's evidence.resultJsonSha256 (Invoke-VenueLeg.ps1 binds it):
     # no binding, a mismatch (bytes replaced after publication) or an unreadable receipt is 'unknown'. A2: a duplicated member is 'unknown'.
-    param([string]$ReceiptPath)
+    # r3 adversary-01a12498.json A2: a caller that read the receipt's figures earlier passes -ExpectResultJsonSha256 (the evidence.resultJsonSha256 of the receipt
+    # it took the figures from; '' when that receipt bound none). The receipt read here must bind the same value, so a receipt (and its result.json) replaced
+    # between the two reads is 'unknown', never the other receipt's quiet standing. A receiptId that is not the file name is 'unknown' too.
+    param([string]$ReceiptPath, [AllowNull()][AllowEmptyString()][string]$ExpectResultJsonSha256)
     $unknown = [pscustomobject]@{ state = 'unknown'; provisional = $true; collected = $false; reason = 'no smoke result.json for the leg'; applies = $true }
     try {
         if (-not $ReceiptPath) { return $unknown }
@@ -1802,6 +1814,16 @@ function Get-VenueLegHostLoad {
         if ($rcDup) { $unknown.reason = "the receipt repeats the member $rcDup"; return $unknown }
         $rc = ConvertFrom-Json -InputObject $rcText -NoEnumerate
         if (-not (Test-VenueHlObject $rc)) { $unknown.reason = 'the receipt is not a JSON object'; return $unknown }
+        if (Test-VenueHlHasMember $rc 'receiptId') {
+            $rid = Get-VenueHlMember $rc 'receiptId'
+            if (-not ($rid -is [string] -and [string]::Equals($rid, [IO.Path]::GetFileNameWithoutExtension($ReceiptPath), [StringComparison]::Ordinal))) { $unknown.reason = 'the receipt''s receiptId is not its file name'; return $unknown }
+        }
+        if ($PSBoundParameters.ContainsKey('ExpectResultJsonSha256')) {
+            $boundNow = Get-VenueHlMember (Get-VenueHlMember $rc 'evidence') 'resultJsonSha256'
+            $boundText = $(if ($null -eq $boundNow) { '' } elseif ($boundNow -is [string]) { $boundNow } else { $null })
+            $expectText = $(if ($null -eq $ExpectResultJsonSha256) { '' } else { $ExpectResultJsonSha256 })
+            if ($null -eq $boundText -or -not [string]::Equals($boundText, $expectText, [StringComparison]::OrdinalIgnoreCase)) { $unknown.reason = 'the receipt is not the one the figures were read from (evidence.resultJsonSha256 changed between reads)'; return $unknown }
+        }
         if (Test-VenueReceiptIsExportLeg $rc) { return [pscustomobject]@{ state = 'not-applicable'; provisional = $false; collected = $false; reason = 'export leg: no GUI smoke'; applies = $false } }
         $want = Get-VenueHlMember (Get-VenueHlMember $rc 'evidence') 'resultJsonSha256'
         if (-not ($want -is [string] -and [regex]::IsMatch($want, '\A[0-9a-fA-F]{64}\z'))) { $unknown.reason = 'the receipt binds no evidence.resultJsonSha256'; return $unknown }
