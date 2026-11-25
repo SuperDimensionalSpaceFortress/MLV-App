@@ -19639,8 +19639,10 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         count) with the exact allowance the conform line's ends give: in step and one held target pass, one frame further short fails. Fix iteration 2
         (adversary A4 on 4201a437): a line without source_advanced, or with an unreadable one, fails closed."""
         cases = {"in step": ("1498", True), "one target held": ("1497", True), "one past it": ("1496", False), "r28's tolerance": ("1489", False)}
+        # EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 r4 (sol r3 finding 1): presented is coverage + 1 (one forward step per frame, the start frame
+        # painted), the only count PlaybackSourceAdvanceTracker can print with no repeat; a fixed presented=1499 over 1497 frames made 1498 forward
+        # steps over 1497 frames, a line the tracker cannot emit and the paint-step bound now refuses. The tail allowance under test is unchanged.
         for name, (coverage, passes) in cases.items():
-            # (presented = coverage + 1, as the app prints it: forward steps of at least one frame each cannot cover fewer frames than steps, adversary A5 on cbf6cdba)
             for row in self.chain(f" audio_sync_requests=0 presented={int(coverage) + 1} source_advanced={coverage} source_fps=24.000 max_jump=1"):
                 with self.subTest(case=name, spec=row["spec"], role=row["role"]):
                     self.assertEqual(row["pass"], passes, row)
@@ -20224,10 +20226,92 @@ class EveryFrameConformConflictAndAcceptanceTests(unittest.TestCase):
         self.assertEqual(out["list"], ["conformRepeats", "conformPresented", "conformConflictingFields", "summaryConflictingFields",
                                        "prepReplacedBefore", "prepReplacedAfter", "prepStaleDrops", "prepGenerationDrops"], out)
         self.assertEqual((out["a"], out["b"], out["c"]), ("NOT_MEASURED", "NOT_MEASURED", "PASS"), out)
+        # r4 (sol r3 finding 3): the comparison moved into Get-DvStoredPlaybackFieldProblems, which finds a stored field by any casing; the
+        # behaviour is pinned by test_r3_sol_b3_a_case_variant_stored_field_is_refused_never_skipped
         text = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
-        self.assertIn("foreach ($f in $script:PlaybackComparedFieldsWhenStored) {\n"
-                      "                if ($storedNames -contains $f -and -not (Test-DvJsonEquivalent (Get-DvProp $stored $f) (Get-DvProp $derived $f))) "
-                      "{ $invalid.Add(\"PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive\") }", text)
+        self.assertIn("foreach ($f in $script:PlaybackComparedFieldsWhenStored) {", text)
+        self.assertIn("foreach ($p in @(Get-DvStoredPlaybackFieldProblems -Stored $stored -Derived $derived)) { $invalid.Add($p) }", text)
+
+    @requires_windows_pwsh
+    def test_r3_sol_b1_more_paint_steps_than_frames_advanced_fail(self) -> None:
+        """r3 sol finding 1 (fable r3 EVERY-FRAME-CONFORM-LINE-STEPS-EXCEED-ADVANCE-1), its literal input: 480 paints with no repeat, no seek and no wrap
+        make 479 forward steps, and every forward step advances at least one frame, so they cannot cover only 478 source frames: the line hides a
+        repeat. The paint-step check was one-sided (it caught too FEW paints only) and this line passed all four lists on both backends and roles.
+        Siblings of the same bound: no forward step can cover 0 or a negative advance either."""
+        cases = {
+            "presented=480 source_advanced=478": " presented=480 source_advanced=478 max_jump=1 wraps=0 backward=0 repeats=0 first_frame=1 last_frame=479 engine_target=479",
+            "presented=481 repeats=1 source_advanced=478": " presented=481 source_advanced=478 max_jump=1 wraps=0 backward=0 repeats=1 first_frame=1 last_frame=479 engine_target=479",
+        }
+        for name, line in cases.items():
+            rows = self.chain(line)
+            self.assertEqual({(r["role"], r["backend"]) for r in rows}, {(r, b) for r in ("acceptance", "supplementary") for b in ("cuda", "cpu")})
+            for row in rows:
+                with self.subTest(case=name, role=row["role"], backend=row["backend"]):
+                    self.assertFalse(row["pass"], row)
+                    self.assertIn("conformMaxJump", self.failed_metrics(row), row)
+                    self.assertTrue(any("forward step" in f and "more than the" in f for f in row["failures"]), row)
+
+    @requires_windows_pwsh
+    def test_r3_sol_b2_opus_b1_an_int64_ceiling_advance_is_could_not_check_never_a_throw(self) -> None:
+        """r3 sol finding 2 and opus r3 blocker (fable r3 DV-PAINT-STEP-IMPLIED-JUMP-INT64-OVERFLOW-TYPED-1), the literal input: source_advanced at the
+        Int64 ceiling with one painted step. [int64][Math]::Ceiling([double]...) cast 2^63 and threw, so the live leg ended UNRESOLVED RUNNER_ERROR in
+        place of a typed CouldNotCheck. The implied step is now integer arithmetic; the line is CouldNotCheck and FAILS, through the same criteria
+        path the live runner and receipt revalidation call. Siblings: every advance within 512 of the ceiling, and two and three steps."""
+        top = 9223372036854775807
+        for advance, presented in ((top, 2), (top - 511, 2), (top, 3), (top - 1, 4)):
+            line = (f" presented={presented} source_advanced={advance} max_jump=1 wraps=0 backward=0 repeats=0 first_frame=1 last_frame=479"
+                    " engine_target=479")
+            rows = self.chain(line)
+            self.assertEqual(len(rows), 4, rows)
+            for row in rows:
+                with self.subTest(advance=advance, presented=presented, role=row["role"], backend=row["backend"]):
+                    self.assertFalse(row["pass"], row)
+                    self.assertEqual(self.failed_metrics(row), ["conformMaxJump"], row)
+                    self.assertIn("contradict each other", row["failures"][0], row)
+
+    @requires_windows_pwsh
+    def test_r3_sol_b3_a_case_variant_stored_field_is_refused_never_skipped(self) -> None:
+        """r3 sol finding 3 (opus r3 STORED-PLAYBACK-FIELD-CASE-VARIANT-1): the when-stored comparison tested presence with case-sensitive -ccontains, while
+        Get-DvProp reads keys case-insensitively, so a stored "ConformRepeats": 999 read 999 yet was never compared and the receipt stayed ADVISORY.
+        Get-DvStoredPlaybackFieldProblems (the comparison Test-DvReceiptValid runs) finds a stored field by any casing and refuses a case-variant key of
+        any compared field outright (the class: the always-compared fields too), on a parsed object, a parsed hashtable and an ordinal dictionary."""
+        derived = {"sourceAdvanced": 480, "conformRepeats": 1, "conformPresented": 479, "conformConflictingFields": [], "summaryConflictingFields": []}
+        cases = [
+            ("canonical, equal", {"sourceAdvanced": 480, "conformRepeats": 1}, []),
+            ("old receipt, no new field", {"sourceAdvanced": 480}, []),
+            ("canonical conformRepeats 999", {"sourceAdvanced": 480, "conformRepeats": 999}, ["PLAYBACK_NOT_FROM_EVIDENCE: playback.conformRepeats"]),
+            ("ConformRepeats 999", {"sourceAdvanced": 480, "ConformRepeats": 999}, ["PLAYBACK_NOT_FROM_EVIDENCE: playback.conformRepeats", "PLAYBACK_FIELD_CASE_VARIANT"]),
+            ("ConformPresented 999", {"sourceAdvanced": 480, "ConformPresented": 999}, ["PLAYBACK_NOT_FROM_EVIDENCE: playback.conformPresented", "PLAYBACK_FIELD_CASE_VARIANT"]),
+            ("ConformConflictingFields", {"sourceAdvanced": 480, "ConformConflictingFields": ["repeats"]},
+             ["PLAYBACK_NOT_FROM_EVIDENCE: playback.conformConflictingFields", "PLAYBACK_FIELD_CASE_VARIANT"]),
+            ("SummaryConflictingFields", {"sourceAdvanced": 480, "SummaryConflictingFields": ["source_advanced"]},
+             ["PLAYBACK_NOT_FROM_EVIDENCE: playback.summaryConflictingFields", "PLAYBACK_FIELD_CASE_VARIANT"]),
+            ("ConformRepeats equal value", {"sourceAdvanced": 480, "ConformRepeats": 1}, ["PLAYBACK_FIELD_CASE_VARIANT"]),
+            ("SourceAdvanced (always compared)", {"SourceAdvanced": 480}, ["PLAYBACK_FIELD_CASE_VARIANT"]),
+        ]
+        script = (
+            "$derived = $env:DVE_DERIVED | ConvertFrom-Json\n"
+            "$out = foreach ($c in ($env:DVE_CASES | ConvertFrom-Json)) {\n"
+            "  $json = $c | ConvertTo-Json -Compress -Depth 4\n"
+            "  $ordinal = [hashtable]::new([StringComparer]::Ordinal)\n"
+            "  foreach ($p in $c.PSObject.Properties) { $ordinal[$p.Name] = $p.Value }\n"
+            "  foreach ($stored in @($c, ($json | ConvertFrom-Json -AsHashtable), $ordinal)) {\n"
+            "    , @(Get-DvStoredPlaybackFieldProblems -Stored $stored -Derived $derived) } }\n"
+            "ConvertTo-Json -InputObject @($out) -Compress -Depth 4")
+        proc, out = run_pwsh_json(script, DVE_DERIVED=json.dumps(derived), DVE_CASES=json.dumps([stored for _, stored, _ in cases]))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), 3 * len(cases), out)
+        for i, (name, _, expected) in enumerate(cases):
+            for j, shape in enumerate(("object", "hashtable", "ordinal dictionary")):
+                problems = out[3 * i + j] or []
+                with self.subTest(case=name, shape=shape):
+                    if not expected:
+                        self.assertEqual(problems, [], problems)
+                    for prefix in expected:
+                        self.assertTrue(any(p.startswith(prefix) for p in problems), (prefix, problems))
+        text = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("foreach ($p in @(Get-DvStoredPlaybackFieldProblems -Stored $stored -Derived $derived)) { $invalid.Add($p) }", text)
+        self.assertNotIn("$storedNames -ccontains $f", text)
 
     def test_the_leg_runner_prints_the_acceptance_verdict_from_the_acceptance_step(self) -> None:
         """Invoke-VenueLeg prints DVE_ACCEPTANCE (Get-DvAcceptanceVerdict over the verification Write-DvReceipt just stamped) after DVE_VERIFICATION;
