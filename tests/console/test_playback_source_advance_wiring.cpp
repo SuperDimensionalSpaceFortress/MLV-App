@@ -182,12 +182,13 @@ TEST(PlaybackSourceAdvanceWiring, R2TheSlipSampleCarriesTheLandingAndTheTimeline
         ASSERT_TRUE(at < note);
         ASSERT_EQ(1, presented.count(field));
     }
+    // iteration 1 (adversary pass 3 A3 on c4fa34c3): both read the histogram's 64-bit travel, clamped into int
     ASSERT_TRUE(presented.contains(QStringLiteral(
-        "            qAbs( ui->horizontalSliderPosition->value() - m_playbackSmokeStartPosition\n"
-        "                  - m_playbackSlipHistogram.correctedFrames() );")));
+        "            qAbs( m_playbackSlipHistogram.timelineTravel( ui->horizontalSliderPosition->value() ) );")));
     const QString finish = functionBody(source, QStringLiteral("void MainWindow::finishPlaybackSmokeTelemetry("));
     ASSERT_TRUE(finish.contains(QStringLiteral(
-        "const int timelineDelta = currentPosition - m_playbackSmokeStartPosition - m_playbackSlipHistogram.correctedFrames();")));
+        "const int timelineDelta = m_playbackSlipHistogram.timelineTravel( currentPosition );")));
+    ASSERT_FALSE(source.contains(QStringLiteral("- m_playbackSlipHistogram.correctedFrames()")));
     ASSERT_FALSE(finish.contains(QStringLiteral("const int timelineDelta = currentPosition - m_playbackSmokeStartPosition;")));
     // the slip summary and pace_summary read the same corrected timeline delta (finish() subtracts the sum itself)
     ASSERT_TRUE(finish.indexOf(QStringLiteral("const int timelineDeltaAbs = timelineDelta >= 0")) > finish.indexOf(QStringLiteral("const int timelineDelta =")));

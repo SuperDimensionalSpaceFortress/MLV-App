@@ -1159,6 +1159,31 @@ TEST(PlaybackSlipHistogram, R2WithoutACorrectionAForwardStepIsStillSlipsAndAReal
     h.noteTimelineMove( AdvancePath::DropTick, 45, 58.0, 5.0, 0.0 );
     h.notePresent( r2Present( 45, 92.0, 45, 1, true, 40 ) );
     const Summary s = h.finish( 100.0, 45 );
-    ASSERT_EQ( 4LL, s.slipsTotal );                                      // 3c0290cd: 34
+    ASSERT_EQ( 4LL, s.slipsTotal );                                      // 3c0290cd: 34; c4fa34c3: 5 (adversary pass 3 A1)
     ASSERT_EQ( 5, s.timelineFramesAfterFirst );                          // 3c0290cd: 35
+    // r2 iteration 1 (adversary pass 3 A1 on c4fa34c3): the landing rebases to the correction's frame itself, as the paint tracker
+    // does, and a landing ON it is neither a slip nor a repeat
+    ASSERT_EQ( 0, s.repeats );
+}
+
+// r2 iteration 1 (adversary pass 3 A3 on c4fa34c3): the correction sum is 64-bit. One Play on a 1,000,100-frame clip, Cut In alternated
+// between 1,000,001 and 1,000,002, a seek to 0 before each of 2,148 correction ticks: the sum is 2,148,001,074 (c4fa34c3's int
+// overflowed), and the travel at the first present (1,000,001 - 2,148,001,074) is exact.
+TEST(PlaybackSlipHistogram, R2Iter1TheCorrectionSumIsSixtyFourBit)
+{
+    SlipHistogram h;
+    h.reset( 0, 24.0 );
+    int position = 0;
+    for( int i = 0; i < 2148; ++i )
+    {
+        h.noteTimelineMove( AdvancePath::Other, 0, i * 8.0 );
+        position = 1000000 + ( i % 2 );
+        h.noteTimelineCorrection( position );
+    }
+    ASSERT_EQ( 2148001074LL, (long long)h.correctedFrames() );          // c4fa34c3: -2146966222 (int wrap)
+    h.notePresent( r2Present( position, 20000.0, position, 2148 ) );      // its request crossed every correction
+    const Summary s = h.finish( 20100.0, position );
+    ASSERT_EQ( 2147001073, s.timelineDeltaAtFirstPresent );
+    ASSERT_EQ( 0, s.timelineFramesAfterFirst );
+    ASSERT_EQ( 0, s.startupCatchupFrames );
 }

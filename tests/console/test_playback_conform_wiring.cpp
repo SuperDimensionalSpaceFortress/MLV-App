@@ -170,8 +170,12 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
         "                            playbackConformActive(), m_conformDropDebtFrames,\n"
         "                            playback_frame_range::conformTargetShown(\n"
         "                                m_lastPresentedPlaybackFrame, conformDisplayedPlaybackFrame(), dropFrameStart,\n"
-        "                                conformAcceptedTargetPresentPending(), conformTargetPresentOutstanding() ) ),");
+        "                                conformAcceptedTargetPresentPending( dropFrameStart ), conformTargetPresentOutstanding( dropFrameStart ) ) ),");
     ASSERT_EQ(1, countOccurrences(body, call));
+    // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2 (adversary pass 3 A2 on c4fa34c3): the two pending-present answers are asked about
+    // the corrected target too; neither reads the stale m_newPosDropMode (a fold to 40 with a ready lookahead 40 must hold the tick)
+    ASSERT_EQ(0, countOccurrences(body, QStringLiteral("conformAcceptedTargetPresentPending()")));
+    ASSERT_EQ(0, countOccurrences(body, QStringLiteral("conformTargetPresentOutstanding()")));
     const int startAt = body.indexOf(QStringLiteral(
         "const double dropFrameStart = playback_frame_range::dropFrameCorrectedStart(\n"
         "                    m_newPosDropMode, ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(), ui->actionLoop->isChecked(),\n"
@@ -249,9 +253,11 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
         ASSERT_TRUE(windowAt > acceptedAt);
         ASSERT_TRUE(src.indexOf(QStringLiteral("const bool predictiveGpuTexNrEarlyAdvance ="), acceptedAt) > windowAt);
         // the pending present: the dispatch window, or the non-inline prep queue still holding the accepted target
-        const int pending = src.indexOf(QStringLiteral("bool MainWindow::conformAcceptedTargetPresentPending()"));
+        const int pending = src.indexOf(QStringLiteral("bool MainWindow::conformAcceptedTargetPresentPending( double position )"));
         ASSERT_TRUE(pending > 0);
         const QString pendingBody = src.mid(pending, src.indexOf(QStringLiteral("\n}\n"), pending) - pending);
+        ASSERT_TRUE(pendingBody.contains(QStringLiteral("const long long target = static_cast<long long>( position );")));
+        ASSERT_FALSE(pendingBody.contains(QStringLiteral("m_newPosDropMode")));
         ASSERT_TRUE(pendingBody.contains(QStringLiteral("if( target < 0 || m_lastPresentedPlaybackFrame != target ) return false;")));
         ASSERT_TRUE(pendingBody.contains(QStringLiteral("if( m_playbackPresentDispatchFrame == target ) return true;")));
         ASSERT_TRUE(pendingBody.contains(QStringLiteral("if( m_lastDisplayedPlaybackFrame == target && conformDisplayedFramePaintPending() ) return true;")));
@@ -269,9 +275,11 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
     ASSERT_TRUE(drawReady.indexOf(QStringLiteral("const bool predictiveGpuTexNrEarlyAdvance ="), accepted) > accepted);
     // fix iteration 1 (adversary A1 on d98be193): the hold needs a present that is still coming -- a render in flight for the
     // target or a lookahead request or slot for it in the active generation; nothing outstanding never holds
-    const int outstanding = drawReady.indexOf(QStringLiteral("bool MainWindow::conformTargetPresentOutstanding()"));
+    const int outstanding = drawReady.indexOf(QStringLiteral("bool MainWindow::conformTargetPresentOutstanding( double position )"));
     ASSERT_TRUE(outstanding > 0);
     const QString outstandingBody = drawReady.mid(outstanding, drawReady.indexOf(QStringLiteral("\n}\n"), outstanding) - outstanding);
+    ASSERT_TRUE(outstandingBody.contains(QStringLiteral("const int target = static_cast<int>( position );")));
+    ASSERT_FALSE(outstandingBody.contains(QStringLiteral("m_newPosDropMode")));
     ASSERT_TRUE(outstandingBody.contains(QStringLiteral("if( !m_pRenderThread || !playbackConformActive() ) return false;")));
     ASSERT_TRUE(outstandingBody.contains(QStringLiteral("if( renderThreadBusyForPlaybackAdvance( target ) ) return true;")));
     ASSERT_TRUE(outstandingBody.contains(QStringLiteral("m_pRenderThread->hasPlaybackLookaheadRequest(")));
