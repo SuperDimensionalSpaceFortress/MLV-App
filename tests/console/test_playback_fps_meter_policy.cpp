@@ -483,8 +483,12 @@ TEST(PlaybackFpsMeterPolicy, AFoldedStartKeepsItsDeltaAndTheAppliedAdvanceAccoun
     using playback_frame_range::advanceDropFrameTick;
     using playback_frame_range::DropFrameTickResult;
     const auto granted = [](const DropFrameTickResult & tick, double before) {
-        return tick.position - before + tick.foldedFrames + tick.clampedFrames
-            + static_cast<double>( tick.wrapWidth ) * tick.wrapLaps;   // r8: MainWindow's grantedDropFrames, clamp term included
+        // r8 iteration 1 (pass 14 A1 on a2983bf2): MainWindow's grantedDropFrames is the tick's own appliedFrames; the
+        // endpoint identity agrees on every row here and is checked alongside, but it rounds next to a far stale start
+        const double identity = tick.position - before + tick.foldedFrames + tick.clampedFrames
+            + static_cast<double>( tick.wrapWidth ) * tick.wrapLaps;
+        if( std::fabs( identity - tick.appliedFrames ) > 1e-6 ) return HUGE_VAL;
+        return tick.appliedFrames;
     };
     const DropFrameTickResult stale = advanceDropFrameTick(1100000.0, 1.0, 1, 2, true, false);
     ASSERT_TRUE(stale.foldedFrames == 1100000.0);

@@ -267,6 +267,7 @@ TEST(PlaybackPresentTrace, AClampedStaleNonLoopStartWithNoGrantIsNotAnAdvance)
         const double granted = tick.position - 100.0 + tick.foldedFrames + tick.clampedFrames
             + static_cast<double>(tick.wrapWidth) * tick.wrapLaps;
         ASSERT_TRUE(granted == 0.0);
+        ASSERT_TRUE(tick.appliedFrames == 0.0);   // r8 iteration 1: what MainWindow reads
         Recorder fixedTrace;
         fixedTrace.setEnabled(true);
         fixedTrace.begin(1000.0, 4);
@@ -298,11 +299,13 @@ TEST(PlaybackPresentTrace, AClampedTickFromBeforeTheLastFrameIsStillItsTravel)
     const double granted = tick.position - 48.0 + tick.foldedFrames + tick.clampedFrames
         + static_cast<double>(tick.wrapWidth) * tick.wrapLaps;
     ASSERT_NEAR(1.0, granted, 0.0);
+    ASSERT_TRUE(tick.appliedFrames == 1.0);
     // on the last frame already: a grant that would pass it is held there, a hold and no correction
     const playback_frame_range::DropFrameTickResult onLast =
         playback_frame_range::advanceDropFrameTick(49.0, 0.192, 1, 50, false, false);
     ASSERT_NEAR(49.0, onLast.position, 0.0);
     ASSERT_NEAR(0.0, onLast.clampedFrames, 0.0);
+    ASSERT_TRUE(onLast.appliedFrames == 0.0);
     Recorder trace;
     trace.setEnabled(true);
     trace.begin(1000.0, 4);
@@ -317,11 +320,12 @@ TEST(PlaybackPresentTrace, AClampedTickFromBeforeTheLastFrameIsStillItsTravel)
 
 namespace
 {
-// MainWindow::playbackHandling's grantedDropFrames, as written on the head under test (the wiring row below pins it)
+// MainWindow::playbackHandling's grantedDropFrames, as written on the head under test (the wiring row below pins it). On
+// a2983bf2 (RED cb613101) it was position - before + foldedFrames + clampedFrames + wrapWidth * wrapLaps.
 double mainWindowGrantedDropFrames(const playback_frame_range::DropFrameTickResult &tick, double before)
 {
-    return tick.position - before + tick.foldedFrames + tick.clampedFrames
-        + static_cast<double>(tick.wrapWidth) * tick.wrapLaps;
+    (void)before;
+    return tick.appliedFrames;
 }
 } // namespace
 

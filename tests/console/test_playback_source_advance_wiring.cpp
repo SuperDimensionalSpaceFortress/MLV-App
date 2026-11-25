@@ -81,7 +81,9 @@ TEST(PlaybackSourceAdvanceWiring, AnEngineWrapIsNotedBeforeTheFrameItLandsOnIsRe
     const int dropWrap = body.indexOf(QStringLiteral("if( dropFrameTick.wrapped ) m_playbackWrapRecorder.noteEngineWrap( dropFrameTick.wrapWidth, dropFrameTick.wrapLaps );"));
     ASSERT_TRUE(dropWrap >= 0);
     ASSERT_TRUE(body.indexOf(QStringLiteral("ui->horizontalSliderPosition->setValue( m_newPosDropMode );"), dropWrap) > dropWrap);
-    ASSERT_TRUE(body.indexOf(QStringLiteral("+ static_cast<double>( dropFrameTick.wrapWidth ) * dropFrameTick.wrapLaps;")) > loopWrap);
+    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r8 iteration 1 (pass 14 A1 on a2983bf2): the granted share is the delta the tick
+    // applied, every lap included (DropFrameTickResult::appliedFrames), no longer position + wrapWidth * wrapLaps
+    ASSERT_TRUE(body.indexOf(QStringLiteral("const double grantedDropFrames = dropFrameTick.appliedFrames;")) > loopWrap);
     // and no wrap is credited the cut range as it stands (r21: neither engine moves by it once the cut changes under the playhead)
     const QString note = QStringLiteral("m_playbackWrapRecorder.noteEngineWrap(");
     const int firstNote = body.indexOf(note);

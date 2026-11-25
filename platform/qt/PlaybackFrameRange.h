@@ -281,6 +281,13 @@ struct DropFrameTickResult
     // cut 1..50, Loop off, a zero or 8 ms request: the clamp returns 49, clampedFrames is 51 and the applied advance is 0,
     // where 75ed5094 read -51. fl(position - start) and fl(start - position) are exact negatives, so the sum is exactly 0.
     double clampedFrames = 0.0;
+    // r8 iteration 1 (adversary pass 14 A1 on a2983bf2): the advance the tick APPLIED, taken from the delta itself: the delta
+    // (after a fold), the delta cut at the lap limit, or the travel to the last frame under the non-Loop clamp (0 from a start
+    // already past it). MainWindow's grantedDropFrames (the present trace's advance and the slip histogram's granted share)
+    // is this value. The identity position - before + foldedFrames + clampedFrames + wrapWidth * wrapLaps holds in exact
+    // arithmetic but rounds next to a far stale start (1100000 + 0.18445 on cut 1..2 read 0.1844500000588596, and a grant of
+    // 5e-10 from 8400000 read 0), so it is never used to recover the grant. Not a number when the position is.
+    double appliedFrames = 0.0;
 };
 
 // advanceDropFrameTick mirrors MainWindow::playbackHandling's drop-frame-mode per-tick position
@@ -347,6 +354,7 @@ inline DropFrameTickResult advanceDropFrameTick(
         }
     }
     result.position = start + frameDelta;
+    double applied = frameDelta;   // r8 iteration 1 (pass 14 A1): the applied advance, never recovered from the endpoints
     if( loopEnabled && result.position >= wrapAt )
     {
         result.wrapWidth = cutOutValue - cutInValue + ( presentLastFrame ? 1 : 0 );
@@ -373,7 +381,10 @@ inline DropFrameTickResult advanceDropFrameTick(
             const double lapLimit = wrapAt + kMaxLoopLapsPerTick * width;   // laps <= kMaxLoopLapsPerTick iff position < lapLimit
             // the start is below lapLimit here: a start at or past it was folded into the cut above (r6), before the delta
             if( result.position >= lapLimit && start < lapLimit )
+            {
                 result.position = std::max( start, std::nextafter( lapLimit, -HUGE_VAL ) );
+                applied = result.position - start;   // the delta the bound kept
+            }
             laps = std::floor( ( result.position - wrapAt ) / width ) + 1.0;
             laps = std::min( std::max( laps, 1.0 ), static_cast<double>( std::numeric_limits<int>::max() - 1 ) );
             // the division's rounding: never one lap too many, never one too few
@@ -388,8 +399,10 @@ inline DropFrameTickResult advanceDropFrameTick(
     {
         // r8 (sol r7): a start already past the last frame is corrected back onto it, not advanced (clampedFrames above)
         if( start > lastFrame ) result.clampedFrames = start - lastFrame;
+        applied = start < lastFrame ? lastFrame - start : 0.0;   // the travel to the last frame, none from past it
         result.position = lastFrame;
     }
+    result.appliedFrames = std::isnan( result.position ) ? result.position : applied;
     return result;
 }
 

@@ -334,8 +334,9 @@ TEST(PlaybackFpsMeterWiring, DropFrameRequestIsFiniteAndTheGrantedShareCountsAFo
         "m_playbackPaceGuard.grant( playback_fps_meter::dropFrameRequestFrames( getPlaybackFramerate(), timeDiff ), paceNowMs, playbackPaceGuardFps() ),")));
     ASSERT_FALSE(handling.contains(QStringLiteral("getPlaybackFramerate() * (double)timeDiff / 1000.0")));
     const int tickAt = handling.indexOf(QStringLiteral("playback_frame_range::advanceDropFrameTick("));
+    // r8 iteration 1 (pass 14 A1 on a2983bf2): the tick reports the delta it applied, a fold's included
     const int grantedAt = handling.indexOf(QStringLiteral(
-        "const double grantedDropFrames = dropFrameTick.position - sourcePositionBeforeDropTick + dropFrameTick.foldedFrames\n"));
+        "const double grantedDropFrames = dropFrameTick.appliedFrames;\n"));
     ASSERT_TRUE(tickAt >= 0);
     ASSERT_TRUE(grantedAt > tickAt);
 }
