@@ -1242,6 +1242,36 @@ class Successor2Tests(unittest.TestCase):
                         args += ["-FilmReceipt", str(paths["film"])]
                     self._assert_typed_display_refusal(run_pwsh(args), label)
 
+    def test_successor3_r2_pass3_a8_a_later_sides_malformed_block_is_not_hidden_by_an_earlier_sides_outcome_gate(self) -> None:
+        """r2 pass-3 adversary A8: every side is validated before any side's outcome gate, so a malformed block on the SECOND (or third) side of a no-signal pair
+        is refused as itself, never as the first side's PAIR_RECEIPT_INCOMPLETE."""
+        good = '"displayPath": ' + json.dumps(good_block())
+        bad = '"displayPath": 5'
+        with tempfile.TemporaryDirectory(prefix="dv-a8-sheet-") as d:
+            base = Path(d) / ".claude-state"
+            base.mkdir()
+            cuda = base / "cuda.json"
+            cpu = base / "cpu.json"
+            cuda.write_text(self._b2_receipt_text(good, receiptId="rc-cuda", backend="cuda", outcome="UNRESOLVED"), encoding="utf-8")
+            cpu.write_text(self._b2_receipt_text(bad, receiptId="rc-cpu", outcome="UNRESOLVED"), encoding="utf-8")
+            proc = run_pwsh(["-File", str(DV / "New-VenueSheetPair.ps1"), "-CudaReceipt", str(cuda), "-CpuReceipt", str(cpu), "-OutDir", str(base / "sheets")])
+            self._assert_typed_display_refusal(proc, "sheet pair, cpu side")
+        for trio in (False, True):
+            with self.subTest(trio=trio), tempfile.TemporaryDirectory(prefix="dv-a8-flavor-") as d:
+                base = Path(d) / ".claude-state"
+                base.mkdir()
+                bad_side = "film" if trio else "cinematic"
+                paths = {}
+                for flavor in ("classic", "cinematic", "film"):
+                    paths[flavor] = base / f"{flavor}.json"
+                    paths[flavor].write_text(self._b2_receipt_text(bad if flavor == bad_side else good, receiptId=f"rc-{flavor}", lookFlavor=flavor,
+                                                                   outcome="UNRESOLVED"), encoding="utf-8")
+                args = ["-File", str(DV / "New-VenueFlavorPair.ps1"), "-ClassicReceipt", str(paths["classic"]), "-CinematicReceipt", str(paths["cinematic"]),
+                        "-OutDir", str(base / "pair")]
+                if trio:
+                    args += ["-FilmReceipt", str(paths["film"])]
+                self._assert_typed_display_refusal(run_pwsh(args), f"flavor {'trio' if trio else 'pair'}, {bad_side} side")
+
     def test_successor3_r2_b2_baseline_reads_a_case_colliding_receipt_file_to_the_typed_validator(self) -> None:
         """SUCCESSOR-3 r1 sol B2 (Invoke-VenueBaseline.ps1:346): Get-RowFigures caught the parse exception and returned its empty row, so the receipt read as
         missing or unreadable. The shipped function, run on a receipt FILE: the row's verification is INVALID with DISPLAY_PATH_MALFORMED and the figures are rejected."""
@@ -1282,13 +1312,18 @@ class Successor2Tests(unittest.TestCase):
             # r2 adversary A2 / A3: nested one-element arrays, and a block deeper than 256 levels, still reach the typed verdict
             "nested arrays, reserved member": "[[" + self._b2_receipt_text(self.B2_TAILS["reserved member"]) + "]]",
             "deep reserved member": self._b2_receipt_text('"displayPath": {"PSObject": 1, "x": ' + '{"x": ' * 257 + "0" + "}" * 257 + "}"),
+            # r2 pass-3 adversary A7: a non-object Venue kept after a good venue is the validator's malformed venue, never the raw parser error; a dropped venue
+            # copy whose own fields collide is the parser's failure, never blamed on the display path
+            "Venue null after a good venue": self._b2_receipt_text('"displayPath": ' + json.dumps(good_block()))[:-1] + ', "Venue": null}',
+            "dropped venue with its own collision": self._b2_receipt_text('"Field": 1, "field": 2')[:-1] + ', "Venue": {"name": "bachelor"}}',
         }
         got = pwsh_json("$in = $env:DVE_TEXTS | ConvertFrom-Json -AsHashtable\n$out = [ordered]@{}\n"
                         "foreach ($k in @($in.Keys)) { try { $r = ConvertFrom-DvReceiptText -Text $in[$k]; $v = Test-DvReceiptValid -Receipt $r -ReceiptText $in[$k]\n"
                         "  $out[$k] = [ordered]@{ outcome = [string]$r.outcome; venue = [string]$r.venue.name; displayPath = $v.displayPath } } catch { $out[$k] = 'threw' } }\n"
                         "$out | ConvertTo-Json -Compress -Depth 5", {"DVE_TEXTS": json.dumps(cases)})
-        for label in ("outcome twice", "venue name twice", "both"):
+        for label in ("outcome twice", "venue name twice", "both", "dropped venue with its own collision"):
             self.assertEqual(got[label], "threw", f"{label}: {got[label]}")
+        self.assertEqual(got["Venue null after a good venue"], {"outcome": "PASS", "venue": "", "displayPath": "malformed"}, got)
         self.assertEqual(got["good"], {"outcome": "PASS", "venue": "bachelor", "displayPath": "present"}, got)
         for label in ("two casings", "nested arrays, reserved member", "deep reserved member"):
             self.assertEqual(got[label], {"outcome": "PASS", "venue": "bachelor", "displayPath": "malformed"}, f"{label}: {got[label]}")
