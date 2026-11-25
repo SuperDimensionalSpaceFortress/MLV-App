@@ -949,7 +949,9 @@ TEST(PlaybackUnpacedWiring, ReadOnceAndHonouredOnlyInAutomation)
     ASSERT_EQ(2, source.count(QStringLiteral("const double paceFps = playbackPaceGuardFps();")));
     ASSERT_EQ(2, source.count(QStringLiteral("if( !( paceFps > 0.0 ) || !m_playbackPaceGuard.armed()")));
     ASSERT_EQ(2, source.count(QStringLiteral("m_playbackPaceGuard.msUntilCredit( framesNeeded, ")));
-    ASSERT_EQ(6, source.count(QStringLiteral("playbackPaceGuardFps()")));   // the four calls, the due wake's two, and no other caller
+    // PLAYBACK-UNPACED-EVERY-TARGET-PAINTED-CUDA-1: the unpaced every-frame poll-tick hold reads it once, only as "unpaced"
+    ASSERT_EQ(1, source.count(QStringLiteral("if( !playbackEveryFrameTickMayAdvance( !( playbackPaceGuardFps() > 0.0 ), false, m_playbackEveryFrameAcceptedFrame,")));
+    ASSERT_EQ(7, source.count(QStringLiteral("playbackPaceGuardFps()")));   // the four calls, the due wake's two, the hold's one, and no other caller
     ASSERT_EQ(1, source.count(QStringLiteral("double MainWindow::playbackPaceGuardFps( void )")));
 }
 

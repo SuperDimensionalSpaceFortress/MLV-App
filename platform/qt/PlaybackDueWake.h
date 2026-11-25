@@ -240,8 +240,10 @@ inline bool playbackDueWakeMayAdvance( bool frameStillDrawing, bool dropFrameMod
 inline bool playbackEveryFrameTickMayAdvance( bool unpaced, bool dropFrameMode, long long acceptedFrameThisPlay,
                                               int target, bool targetPresentOutstanding )
 {
-    ( void )unpaced; ( void )dropFrameMode; ( void )acceptedFrameThisPlay; ( void )target; ( void )targetPresentOutstanding;
-    return true;
+    if( dropFrameMode || !unpaced ) return true;
+    if( acceptedFrameThisPlay < 0 ) return true;
+    if( acceptedFrameThisPlay == static_cast<long long>( target ) ) return true;
+    return !targetPresentOutstanding;
 }
 
 /*! r3 (adversary pass 6 A1): what a due wake does. A busy renderer defers the advance to the frameReady / drawFrameReady
