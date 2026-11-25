@@ -188,7 +188,17 @@ if ($null -ne $setPlan) {
         if ($receiptPath -and (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
             try { $legReceipt = [IO.File]::ReadAllText($receiptPath) | ConvertFrom-Json } catch { $legReceipt = $null }
         }
-        $row = Get-DvMatrixRow -PlanEntry $entry -Receipt $legReceipt
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): the leg's host-load standing, from its own hash-bound smoke result (the reader the lease batch and the chain
+        # use); a provisional or unknown leg is printed as REFERENCE_PROVISIONAL, its row carries hostLoadState / hostLoadProvisional, and it is never measured.
+        if (-not (Get-Command -Name Get-VenueLegHostLoad -ErrorAction SilentlyContinue)) {
+            Import-Module (Join-Path $here 'VenueChain.psm1') -Function Get-VenueLegHostLoad, Get-VenueReferenceHostLoadRefusal -DisableNameChecking
+        }
+        $legHostLoad = $(if ($null -ne $legReceipt) { Get-VenueLegHostLoad -ReceiptPath $receiptPath } else { $null })
+        $row = Get-DvMatrixRow -PlanEntry $entry -Receipt $legReceipt -HostLoad $legHostLoad
+        if ($null -ne $legReceipt) {
+            $hlRefusal = Get-VenueReferenceHostLoadRefusal -LegId $(if ($row.receiptId) { [string]$row.receiptId } else { [string]$entry.legId }) -Standing $legHostLoad
+            if ($hlRefusal) { Write-Output $hlRefusal; if (-not $row.note) { $row.note = "$hlRefusal (not a measurement)" } }
+        }
         # r7: a child that refused because its spec's bytes are no longer the planned ones wrote no receipt; say so on its own typed line and in its row (outcome SPEC_CHANGED: it did not RUN, so the
         # table's `ran` leaves it out), so it is never read as a leg that merely failed. Classified ONLY by the child's own whole-line stdout record naming THIS entry's planned hash (adversary r7 A1:
         # a path or message that merely quotes the token DVE_LEG_SPEC_CHANGED, e.g. a receipt-write failure under a receipt root of that name, is not it)
@@ -220,7 +230,9 @@ if ($null -ne $setPlan) {
         "card $($setPlan.card), clip $($setPlan.clipId), source $($SourceCommit.Substring(0, 12)), build manifest $($BuildManifestSha256.Substring(0, 12)), $Repeats repeat(s) of $(@($setPlan.cells).Count) cell(s) = $total leg(s), $measured measured.",
         'Rates are read from each leg''s hashed app run log (median over the repeats). Only a PASS or FAIL receipt is a measurement; every other outcome is no signal and shows no numbers. Production receipts are ADVISORY (docs/dual-venue-evidence.md).', '')
     $summaryPath = Join-Path $summaryDir 'summary.md'
-    [IO.File]::WriteAllText($summaryPath, (($head + $table) -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3: every leg's hostLoad.state and provisional, and whether it counted, under the cell table
+    $hostLoadTable = @('', 'Host load per leg (a provisional or unknown leg is recorded, never counted):', '') + @(ConvertTo-DvMatrixHostLoadTable -Rows $rows.ToArray())
+    [IO.File]::WriteAllText($summaryPath, (($head + $table + $hostLoadTable) -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
     $rowsJson = [ordered]@{ schema = 'mlv-app/dual-venue-legset-summary/v1'; legSet = $setPlan.legSet; venue = $Venue; sourceCommit = $SourceCommit; buildManifestSha256 = $BuildManifestSha256; repeats = $Repeats; rows = $rows.ToArray() }
     [IO.File]::WriteAllText((Join-Path $summaryDir 'summary.json'), ($rowsJson | ConvertTo-Json -Depth 6) + "`n", [Text.UTF8Encoding]::new($false))
     Write-Output $table

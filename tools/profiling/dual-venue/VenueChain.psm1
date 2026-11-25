@@ -1763,6 +1763,24 @@ function ConvertFrom-VenueSmokeHostLoad {
     [pscustomobject]@{ state = $state; provisional = [bool]$provisional; collected = [bool]$collected; reason = $reason }
 }
 
+function Test-VenueReceiptIsExportLeg([object]$Rc) {
+    # r3 (sol r2 B2): any object-valued export member exempted a playback receipt (export:{} on a playback receipt, or a leg SPEC passed as the receipt). An export
+    # leg is now only a receipt shaped as the shipped writer writes one (Invoke-VenueLeg.ps1 `if ($isExport)`): the receipt schema (New-DvReceipt), scale and display
+    # nulled (a playback receipt always carries both objects), and an export block that names its format and carries real export evidence: the export spec
+    # binding (receiptSha256, 64 hex) or an export verdict (a non-empty string). Anything else is a playback receipt and must bind its smoke result.
+    if (-not (Test-VenueHlObject $Rc)) { return $false }
+    $schema = Get-VenueHlMember $Rc 'schema'
+    if (-not ($schema -is [string] -and [string]::Equals($schema, 'mlv-app/dual-venue-receipt/v1', [StringComparison]::Ordinal))) { return $false }
+    if ((Test-VenueHlObject (Get-VenueHlMember $Rc 'scale')) -or (Test-VenueHlObject (Get-VenueHlMember $Rc 'display'))) { return $false }
+    $ex = Get-VenueHlMember $Rc 'export'
+    if (-not (Test-VenueHlObject $ex)) { return $false }
+    $fmt = Get-VenueHlMember $ex 'format'
+    if (-not ($fmt -is [string] -and [regex]::IsMatch($fmt, '\A[A-Za-z0-9][A-Za-z0-9_.-]{0,31}\z'))) { return $false }
+    $bind = Get-VenueHlMember $ex 'receiptSha256'
+    $verdict = Get-VenueHlMember $ex 'verdict'
+    ($bind -is [string] -and [regex]::IsMatch($bind, '\A[0-9a-fA-F]{64}\z')) -or ($verdict -is [string] -and -not [string]::IsNullOrWhiteSpace($verdict))
+}
+
 function Get-VenueLegHostLoad {
     <#
     .SYNOPSIS
@@ -1784,7 +1802,7 @@ function Get-VenueLegHostLoad {
         if ($rcDup) { $unknown.reason = "the receipt repeats the member $rcDup"; return $unknown }
         $rc = ConvertFrom-Json -InputObject $rcText -NoEnumerate
         if (-not (Test-VenueHlObject $rc)) { $unknown.reason = 'the receipt is not a JSON object'; return $unknown }
-        if (Test-VenueHlObject (Get-VenueHlMember $rc 'export')) { return [pscustomobject]@{ state = 'not-applicable'; provisional = $false; collected = $false; reason = 'export leg: no GUI smoke'; applies = $false } }
+        if (Test-VenueReceiptIsExportLeg $rc) { return [pscustomobject]@{ state = 'not-applicable'; provisional = $false; collected = $false; reason = 'export leg: no GUI smoke'; applies = $false } }
         $want = Get-VenueHlMember (Get-VenueHlMember $rc 'evidence') 'resultJsonSha256'
         if (-not ($want -is [string] -and [regex]::IsMatch($want, '\A[0-9a-fA-F]{64}\z'))) { $unknown.reason = 'the receipt binds no evidence.resultJsonSha256'; return $unknown }
         $root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $ReceiptPath)))
@@ -2249,5 +2267,5 @@ Export-ModuleMember -Function New-VenueCapsProbeId, Get-VenueDriverScriptMissing
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
     Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueStagedArtifactNames, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
-    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueInterleavedLegPlan, Get-VenueLegPreLoadMean, ConvertFrom-VenueSmokeHostLoad, Get-VenueLegHostLoad, Get-VenueReferenceHostLoadRefusal, Get-VenueReferenceArmVerdict, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait, Get-VenueRunStartCap, Get-VenueLegPlaySeconds, Get-VenuePlanPlaySeconds, ConvertTo-VenueStartCapTime,Get-VenueLeaseCaps, Resolve-VenueLeaseCaps,
+    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueInterleavedLegPlan, Get-VenueLegPreLoadMean, ConvertFrom-VenueSmokeHostLoad, Get-VenueLegHostLoad, Test-VenueReceiptIsExportLeg, Get-VenueReferenceHostLoadRefusal, Get-VenueReferenceArmVerdict, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait, Get-VenueRunStartCap, Get-VenueLegPlaySeconds, Get-VenuePlanPlaySeconds, ConvertTo-VenueStartCapTime,Get-VenueLeaseCaps, Resolve-VenueLeaseCaps,
     Get-VenueClaimAgeSec, Update-VenueClaim, Start-VenueKeeper, Stop-VenueKeeper, Start-VenueClaimKeeper, Get-VenueClaimKeeperLoss, New-VenueJobLivenessWrite, Write-VenueJobLiveness, Test-VenueJobLivenessReadback, Start-VenueJobLiveness, Stop-VenueJobLiveness

@@ -453,11 +453,18 @@ foreach ($b in $StandardBackends) {
             if ($fig.noFigure) { $legOutcome = $fig.outcome }      # a noFigure row keeps the receipt's own outcome (the failure text names why it carries no figure)
             if ($failure) { $fig.fps = $null; $fig.drops = $null; $fig.stall = $null }      # a typed failure never carries figures, whatever the receipt held
             if ($fig.rejected -ceq 'INVALID' -and $legStatus -ceq 'EVIDENCE_INCOMPLETE') { $legStatus = 'EVIDENCE_INVALID' }
+            # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): the leg's host-load standing from its own hash-bound smoke result (VenueChain.psm1 Get-VenueLegHostLoad).
+            # A provisional or unknown RAN row keeps its figures for the trend file but is never a measured reference row (the $measuredRows predicate below).
+            $hlReceipt = $(if ($leg.PSObject.Properties['receipt'] -and $leg.receipt) { [string]$leg.receipt } else { '' })
+            $hl = Get-VenueLegHostLoad -ReceiptPath $hlReceipt
+            $hlLine = Get-VenueReferenceHostLoadRefusal -LegId $(if ($hlReceipt) { [IO.Path]::GetFileNameWithoutExtension($hlReceipt) } else { [string]$planLeg.legId }) -Standing $hl
+            if ($hlLine -and $legStatus -ceq 'RAN') { Out-Line $hlLine }
             $rows.Add([ordered]@{
                 schema = 'mlv-app/venue-baseline-trend/v1'; utc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'); venue = $Venue; role = $planLeg.role
                 sourceCommit = $commit; leg = $planLeg.legId; card = $planLeg.card; backend = $b; status = $legStatus; failure = $failure
                 outcome = $legOutcome; fps = $fig.fps; drops = $fig.drops; stall = $fig.stall; receiptVerification = $fig.verification
                 receiptPath = $(if ($leg.PSObject.Properties['receipt'] -and $leg.receipt) { [string]$leg.receipt } else { $null }); buildManifestSha256 = $manifest; runDir = $RunDir; hubLoad = $null
+                hostLoadState = [string]$hl.state; hostLoadProvisional = [bool]$hl.provisional
             })
         }
     }
@@ -504,7 +511,8 @@ if ($rows.Count -gt 0) {
     finally { if ($held) { try { $trendMutex.ReleaseMutex() } catch { } }; $trendMutex.Dispose() }
 }
 # I3: a run in which no row carries a figure is never OK. It keeps exit 0 (the BASELINE-EXIT-NO-MEASUREMENT-1 behaviour) under its own token.
-$measuredRows = @($rows | Where-Object { $_.status -ceq 'RAN' -and $null -ne $_.fps }).Count
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): a row is measured only when its hostLoadProvisional is the boolean false (a provisional or unknown leg is never counted).
+$measuredRows = @($rows | Where-Object { $_.status -ceq 'RAN' -and $null -ne $_.fps -and $_.hostLoadProvisional -is [bool] -and -not $_.hostLoadProvisional }).Count
 $reason = $(if ($typed) { $typed.reason } elseif ($measuredRows -eq 0) { 'NO_MEASUREMENT' } else { 'OK' })
 $code = [int]$ExitCodes[$reason]
 $noMeasurementDetail = "no row carries a figure ($($rows.Count) row(s) appended, 0 measured); this is NOT an OK run"

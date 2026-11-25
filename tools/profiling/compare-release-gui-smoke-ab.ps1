@@ -455,6 +455,35 @@ function Get-HostLoadComparisonEvidence {
     }
 }
 
+function Get-GuiSmokeAbVerdict {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): a leg whose host load is provisional or unknown (the
+    # before leg is the control) is never counted in the comparison verdict. It used to join the failures and
+    # read FAIL (a regression-shaped verdict). Now each such leg prints the typed line
+    # REFERENCE_PROVISIONAL leg=<before|after> reason=hostload-<state> and the verdict is INCONCLUSIVE, never
+    # PASS and never FAIL; the other failures are still listed. Pure: -HostLoadEvidence is
+    # Get-HostLoadComparisonEvidence's evidence (its provisional is already the canonical predicate).
+    param(
+        [object[]]$Failures,
+        [object]$HostLoadEvidence
+    )
+    $refusals = @()
+    foreach ($legName in @("before", "after")) {
+        $legEvidence = if ($null -ne $HostLoadEvidence) { $HostLoadEvidence.$legName } else { $null }
+        $isClean = ($null -ne $legEvidence) -and ($legEvidence.provisional -is [bool]) -and (-not $legEvidence.provisional)
+        if ($isClean) { continue }
+        $stateText = if ($null -ne $legEvidence) { [string]$legEvidence.state } else { "" }
+        if (-not [regex]::IsMatch($stateText, '\A[a-z][a-z_-]{0,31}\z')) { $stateText = "unknown" }
+        if ([string]::Equals($stateText, "quiet", [StringComparison]::Ordinal)) { $stateText = "provisional" }
+        $refusals += "REFERENCE_PROVISIONAL leg=$legName reason=hostload-$stateText"
+    }
+    $failureList = @($Failures | Where-Object { $null -ne $_ })
+    $verdictText = if ($refusals.Count -gt 0) { "INCONCLUSIVE" } elseif ($failureList.Count -eq 0) { "PASS" } else { "FAIL" }
+    [pscustomobject]@{
+        verdict = $verdictText
+        referenceProvisional = @($refusals)
+    }
+}
+
 function Convert-ToStableValueText {
     param([object]$Value)
 
@@ -977,7 +1006,9 @@ foreach ($leg in @(
 }
 $hostLoadComparison = Get-HostLoadComparisonEvidence -BeforeSmoke $beforeSmoke -AfterSmoke $afterSmoke
 $hostLoadEvidence = $hostLoadComparison.evidence
-$failures += @($hostLoadComparison.failures)
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): a host-load refusal is no longer a failure (it read FAIL);
+# it is kept in hostLoadRefusals and makes the verdict INCONCLUSIVE (Get-GuiSmokeAbVerdict, below).
+$hostLoadRefusals = @($hostLoadComparison.failures)
 
 # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol pre-review BLOCKER 1): refuse the whole comparison
 # -- never merely note it -- when the two legs are not known to have presented on the same
@@ -1030,6 +1061,9 @@ if ($FailOnScreenshotDelta) {
         )
     }
 }
+
+$abVerdict = Get-GuiSmokeAbVerdict -Failures $failures -HostLoadEvidence $hostLoadEvidence
+foreach ($referenceLine in @($abVerdict.referenceProvisional)) { Write-Host $referenceLine }
 
 $result = [pscustomobject]@{
     schema = "gui-smoke-ab-compare.v3"
@@ -1085,7 +1119,9 @@ $result = [pscustomobject]@{
         afterColorArtifactVerdict = Get-NestedValue $afterSmoke "visualQuality.colorArtifactScan.verdict"
     }
     failures = $failures
-    verdict = if ($failures.Count -eq 0) { "PASS" } else { "FAIL" }
+    hostLoadRefusals = @($hostLoadRefusals)
+    referenceProvisional = @($abVerdict.referenceProvisional)
+    verdict = $abVerdict.verdict
 }
 
 # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol pre-review BLOCKER 1): withheld here, AFTER
@@ -1131,6 +1167,7 @@ Write-Host ((
 
 $json
 
-if ($failures.Count -gt 0) {
+# An INCONCLUSIVE comparison is not a pass: it exits 1 as the host-load refusal always did.
+if ($failures.Count -gt 0 -or $result.verdict -ne "PASS") {
     exit 1
 }

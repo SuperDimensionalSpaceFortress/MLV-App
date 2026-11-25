@@ -3104,13 +3104,20 @@ function Get-DvMatrixRow {
     One planned leg's row of the matrix summary, from the receipt the leg wrote. Rates are read only when the outcome is a measurement (PASS or FAIL: every other outcome is no signal,
     its row carries the outcome and no numbers) AND the hashed run log still hashes to receipt.evidence.logSha256 (a swapped log is no measurement: rates stay absent and `note` says so).
     #>
-    param([Parameter(Mandatory)]$PlanEntry, $Receipt)
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): -HostLoad is the leg's host-load standing (VenueChain.psm1 Get-VenueLegHostLoad, read by the caller from the leg's
+    # hash-bound smoke result). The row carries hostLoadState and hostLoadProvisional; no standing reads 'unknown' / provisional, and a provisional row is never
+    # a measurement (Test-DvMatrixRowMeasured), whatever its outcome and rates.
+    param([Parameter(Mandatory)]$PlanEntry, $Receipt, $HostLoad = $null)
     $row = [ordered]@{
         seq = $PlanEntry.seq; repeat = $PlanEntry.repeat; cellId = $PlanEntry.cellId; backend = $PlanEntry.backend
         requestedDisplay = $PlanEntry.displayMode; observedDisplay = 'UNKNOWN'; requestedScale = $PlanEntry.scaleFactor; effectiveScale = 'UNKNOWN'
         windowSize = $null; previewSize = $null; outcome = 'NO_RECEIPT'; receiptId = $null
         presentedFps = $null; timelineFpsAfterFirstPresent = $null; renderWorkMs = $null; dualIsoMs = $null; note = $null
+        hostLoadState = 'unknown'; hostLoadProvisional = $true
     }
+    $hlState = Get-DvProp $HostLoad 'state'; $hlProv = Get-DvProp $HostLoad 'provisional'
+    if ($hlState -is [string] -and [regex]::IsMatch($hlState, '\A[a-z][a-z_-]{0,31}\z')) { $row.hostLoadState = $hlState }
+    $row.hostLoadProvisional = -not ($hlProv -is [bool] -and -not $hlProv)
     if ($null -eq $Receipt) { $row.note = 'the leg wrote no receipt'; return [pscustomobject]$row }
     $row.outcome = [string](Get-DvProp $Receipt 'outcome'); $row.receiptId = [string](Get-DvProp $Receipt 'receiptId')
     # r6 (sol r5 B1): a visual twin's rates are never read, whichever path its plan entry or receipt came through (the entry's leg id and the receipt's leg id both count)
@@ -3147,8 +3154,30 @@ function Test-DvMatrixRowMeasured {
     M16-1457-VENUE-BASELINE-DRIFT-1 r7 (sol r6 INV-2): is this matrix row a MEASUREMENT? Only a PASS or FAIL row that carries a presented-fps value is (the reader leaves the rates null for a
     visual twin, a missing or swapped run log and every non-measurement outcome). The ONE predicate the table's `measured / ran` column and the summary header's `N measured` both use.
     #>
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): and only a row whose hostLoadProvisional is the boolean false (a quiet, collected host, or an export leg's
+    # not-applicable); a provisional, unknown or absent host-load standing is recorded in the row and never counted.
     param([Parameter(Mandatory)]$Row)
-    ($Row.outcome -cin @('PASS', 'FAIL')) -and ($null -ne $Row.presentedFps)
+    $prov = Get-DvProp $Row 'hostLoadProvisional'
+    ($Row.outcome -cin @('PASS', 'FAIL')) -and ($null -ne $Row.presentedFps) -and ($prov -is [bool]) -and (-not $prov)
+}
+
+function ConvertTo-DvMatrixHostLoadTable {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): the per-leg host-load table under the matrix summary: every leg's hostLoad.state and provisional, and whether
+    it was counted as a measurement (Test-DvMatrixRowMeasured), so a provisional or unknown leg is visible in the report and never silently in the medians.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Rows)
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add('| seq | repeat | cell | outcome | hostLoad.state | provisional | counted |')
+    $lines.Add('|---|---|---|---|---|---|---|')
+    foreach ($r in $Rows) {
+        $prov = Get-DvProp $r 'hostLoadProvisional'
+        $provText = $(if ($prov -is [bool]) { $(if ($prov) { 'true' } else { 'false' }) } else { 'unknown' })
+        $state = [string](Get-DvProp $r 'hostLoadState'); if (-not $state) { $state = 'unknown' }
+        $lines.Add("| $($r.seq) | $($r.repeat) | $($r.cellId) | $($r.outcome) | $state | $provText | $(if (Test-DvMatrixRowMeasured -Row $r) { 'yes' } else { 'no' }) |")
+    }
+    $lines.ToArray()
 }
 
 function Get-DvMatrixMeasuredCount {
@@ -6871,6 +6900,6 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Test-DvMatrixRowMeasured, Get-DvMatrixMeasuredCount, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Test-DvMatrixRowMeasured, Get-DvMatrixMeasuredCount, Get-DvMedian, ConvertTo-DvMatrixTable, ConvertTo-DvMatrixHostLoadTable,Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt

@@ -43,6 +43,10 @@ CIM_FAILED = {
     "reason": "Host load telemetry could not be collected for 2 of 17 snapshot(s) (before.collected=False, during=15 sample(s), after.collected=False)",
 }
 QUIET = {"before": {"collected": True}, "after": {"collected": True}, "state": "quiet", "provisional": False, "reason": "peak 18% <= 75%"}
+# r3 (sol r2 B2): an export receipt as the shipped writer writes one (Invoke-VenueLeg.ps1 `if ($isExport)`: scale/display nulled, the export block binds its spec).
+REAL_EXPORT_RECEIPT = {"schema": "mlv-app/dual-venue-receipt/v1", "scale": None, "display": None, "evidence": {},
+                       "export": {"format": "prores", "maxFrames": 480, "dualIsoExpected": True, "receiptSha256": "2f57f11f95fa9a0eac428f256ad596b1706fe9c9a2f9dfef8411815f970bab6a",
+                                  "files": None, "stages": None, "problems": [], "containmentAdvisory": [], "verdict": None}}
 
 
 def run_ps(body: str) -> subprocess.CompletedProcess:
@@ -154,7 +158,7 @@ class LegHostLoadReaderTests(unittest.TestCase):
                 folder = ev / rid / ("export" if kind == "export" else "")
                 folder.mkdir(parents=True, exist_ok=True)
                 (folder / "summary.json").write_text(json.dumps({"cpuQuiescence": {"timeMeanPercent": 5}}), encoding="utf-8")
-                rbody: dict = {"export": {"frames": 480}, "evidence": {}} if kind == "export" else {"evidence": {}}
+                rbody: dict = json.loads(json.dumps(REAL_EXPORT_RECEIPT)) if kind == "export" else {"evidence": {}}
                 if kind == "play" and block != "absent":
                     body = {"schema": "mlvapp-gui-smoke-result.v2"}
                     if block is not None:
@@ -218,7 +222,7 @@ class LegHostLoadBindingTests(unittest.TestCase):
             "swapped-1": ({"evidence": {"resultJsonSha256": cim_sha}}, "play", quiet),   # the receipt bound the CIM result; the bytes now say quiet
             "unbound-1": ({"evidence": {}}, "play", quiet),
             "spoofexp-1": (lambda sha: {"evidence": {"resultJsonSha256": sha}}, "export", cim),   # root summary moved to export\: still a playback receipt
-            "realexp-1": ({"export": {"frames": 480}, "evidence": {}}, "export", None),
+            "realexp-1": (REAL_EXPORT_RECEIPT, "export", None),
         })
         self.assertEqual((got["bound-1"]["state"], got["bound-1"]["provisional"]), ("quiet", False), got["bound-1"])
         for rid in ("swapped-1", "unbound-1", "spoofexp-1"):
@@ -252,6 +256,35 @@ class LegHostLoadBindingTests(unittest.TestCase):
             self.assertEqual((got[rid]["state"], got[rid]["provisional"], got[rid]["applies"]), ("unknown", True, True), (rid, got[rid]))
             self.assertIn("repeats the member", got[rid]["reason"], (rid, got[rid]))
         self.assertEqual((got["bound-1"]["state"], got["bound-1"]["provisional"]), ("quiet", False), got["bound-1"])
+
+
+    def test_r3_b2_an_export_shaped_object_never_exempts_a_playback_receipt(self) -> None:
+        # sol r2 B2, its input: a playback receipt with export:{} (or the committed ProRes leg SPEC passed as the receipt) and a valid hash of a CIM-failed smoke
+        # result read not-applicable / provisional false / applies false, so both drivers classed it QUIET_PRELOAD_OK and counted it. Only a receipt shaped as
+        # the shipped writer writes an export leg (receipt schema, scale/display nulled, an export block naming its format with its spec binding or verdict) skips.
+        cim = json.dumps({"hostLoad": CIM_FAILED})
+        spec = json.loads((ROOT / "tools" / "profiling" / "dual-venue" / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"))
+        real = REAL_EXPORT_RECEIPT
+        def bound(extra: dict):
+            return lambda sha: {**extra, "evidence": {"resultJsonSha256": sha}}
+        got = self.read({
+            "emptyexp-1": (bound({"export": {}}), "play", cim),
+            "specasrc-1": (lambda sha: {**spec, "evidence": {"resultJsonSha256": sha}}, "play", cim),
+            "noschema-1": (bound({k: v for k, v in real.items() if k not in ("schema", "evidence")}), "play", cim),
+            "withscale-1": (bound({**{k: v for k, v in real.items() if k != "evidence"}, "scale": {"requestedScale": 1}}), "play", cim),
+            "withdisplay-1": (bound({**{k: v for k, v in real.items() if k != "evidence"}, "display": {"requestedMode": "fullscreen"}}), "play", cim),
+            "noformat-1": (bound({**{k: v for k, v in real.items() if k != "evidence"}, "export": {**real["export"], "format": ""}}), "play", cim),
+            "noevidence-1": (bound({**{k: v for k, v in real.items() if k != "evidence"}, "export": {**real["export"], "receiptSha256": "x", "verdict": None}}), "play", cim),
+            "arrexp-1": (bound({**{k: v for k, v in real.items() if k != "evidence"}, "export": [real["export"]]}), "play", cim),
+            "realexp-1": (real, "export", None),
+            "verdictexp-1": ({**real, "export": {**real["export"], "receiptSha256": None, "verdict": "PASS"}}, "export", None),
+        })
+        for rid in ("emptyexp-1", "specasrc-1", "noschema-1", "withscale-1", "withdisplay-1", "noformat-1", "noevidence-1", "arrexp-1"):
+            with self.subTest(rid=rid):
+                self.assertEqual((got[rid]["state"], got[rid]["provisional"], got[rid]["applies"]), ("unknown", True, True), (rid, got[rid]))
+        for rid in ("realexp-1", "verdictexp-1"):
+            with self.subTest(rid=rid):
+                self.assertEqual((got[rid]["state"], got[rid]["provisional"], got[rid]["applies"]), ("not-applicable", False, False), (rid, got[rid]))
 
 
 @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
@@ -319,14 +352,19 @@ class ReferenceArmVerdictTests(unittest.TestCase):
             root = Path(d) / "receipts"
             ev = Path(d) / "evidence"
             clean = {"state": "quiet", "provisional": False, "before": {"collected": True}, "after": {"collected": True}}
-            cases = {"rootarr-1": [{"hostLoad": clean}], "hlarr-1": {"hostLoad": [clean]}, "provarr-1": {"hostLoad": {**clean, "provisional": [False]}}}
+            cases = {"rootarr-1": [{"hostLoad": clean}], "hlarr-1": {"hostLoad": [clean]}, "provarr-1": {"hostLoad": {**clean, "provisional": [False]}},
+                     "plain-1": {"hostLoad": clean}}   # the control: the same bound fixture, unwrapped, reads quiet (the read reached the parse)
+            import hashlib
             for rid, doc in cases.items():
                 receipt = root / "CARD-1" / "leg-x" / "bachelor" / f"{rid}.json"
                 receipt.parent.mkdir(parents=True, exist_ok=True)
-                receipt.write_text("{}", encoding="utf-8")
                 (ev / rid).mkdir(parents=True, exist_ok=True)
                 (ev / rid / "summary.json").write_text(json.dumps({"cpuQuiescence": {"timeMeanPercent": 5}}), encoding="utf-8")
-                (ev / rid / "result.json").write_text(json.dumps(doc), encoding="utf-8")
+                raw = json.dumps(doc).encode("utf-8")
+                (ev / rid / "result.json").write_bytes(raw)
+                # r3 (sol r2 / key3 H-ARRAY): the receipt binds these bytes, so the read reaches the -NoEnumerate parse (with receipt {} it stopped at the missing hash
+                # and removing -NoEnumerate stayed green). Mutation-checked: without -NoEnumerate rootarr-1 reads quiet and this test fails.
+                receipt.write_text(json.dumps({"evidence": {"resultJsonSha256": hashlib.sha256(raw).hexdigest()}}), encoding="utf-8")
             body = ("$r = [ordered]@{}; "
                     + "".join(f"$r['{rid}'] = Get-VenueLegHostLoad -ReceiptPath '{root / 'CARD-1' / 'leg-x' / 'bachelor' / (rid + '.json')}'; " for rid in cases)
                     + "$r | ConvertTo-Json -Compress -Depth 4")
@@ -335,7 +373,9 @@ class ReferenceArmVerdictTests(unittest.TestCase):
             got = json.loads(p.stdout)
         for rid in ("rootarr-1", "hlarr-1"):
             self.assertEqual((got[rid]["state"], got[rid]["provisional"]), ("unknown", True), (rid, got[rid]))
+            self.assertNotIn("binds no evidence", got[rid]["reason"], "the fixture must reach the smoke parse, not stop at a missing hash")
         self.assertTrue(got["provarr-1"]["provisional"], got["provarr-1"])
+        self.assertEqual((got["plain-1"]["state"], got["plain-1"]["provisional"]), ("quiet", False), got["plain-1"])
 
     def test_adversary2_a8_a_hashtable_leg_and_block_are_read(self) -> None:
         # adversary-b0c05520.json A8, its input: @{legId='q'; hostLoad=$quiet} read a blank id; an -AsHashtable block read unknown.

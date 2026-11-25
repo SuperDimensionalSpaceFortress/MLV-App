@@ -88,6 +88,18 @@ $legs = foreach ($s in $specs) {
                 playback = [ordered]@{ sourceAdvanced = 600; requiredSourceFrames = 600; nativeFps = 23.976; paceFps = 23.976 }
                 display = [ordered]@{ requestedMode = 'fullscreen' }; scale = [ordered]@{ requestedScale = 1 } }
             if ($idm -ceq 'nobackend') { $rc.subject.Remove('backend') }
+            # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3: like the real leg, the receipt binds its smoke result (<root parent>\evidence\<receiptId>\result.json). FAKE_HOSTLOAD:
+            # quiet (default) | cim (the 2026-11-21 a134532e CimException shape) | none (no smoke result bound)
+            $hlm = $(if ($env:FAKE_HOSTLOAD) { $env:FAKE_HOSTLOAD } else { 'quiet' })
+            if ($hlm -cne 'none') {
+                $hlb = $(if ($hlm -ceq 'cim') { '{"before":{"collected":false,"error":"collection failed: CimException"},"after":{"collected":false,"error":"collection failed: CimException"},"state":"unknown","provisional":true}' }
+                         else { '{"before":{"collected":true},"after":{"collected":true},"state":"quiet","provisional":false}' })
+                $ed = Join-Path $env:FAKE_ROOT "evidence\$($rc.receiptId)"
+                New-Item -ItemType Directory -Force -Path $ed | Out-Null
+                $rb = [Text.UTF8Encoding]::new($false).GetBytes('{"schema":"mlvapp-gui-smoke-result.v2","hostLoad":' + $hlb + '}')
+                [IO.File]::WriteAllBytes((Join-Path $ed 'result.json'), $rb)
+                $rc['evidence'] = [ordered]@{ resultJsonSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($rb)).ToLowerInvariant() }
+            }
             Set-Content -LiteralPath $rp -Value ($rc | ConvertTo-Json -Depth 8)
             if ($mode -ceq 'noreceipt') { Remove-Item -LiteralPath $rp -Force }
             [pscustomobject]@{ name = $name; spec = $s; backend = $Backend; status = 'RAN'; verdict = 'QUIET'; outcome = $outc; legExit = 0; receipt = $rp }
@@ -762,6 +774,29 @@ class VenueBaselineTests(unittest.TestCase):
         self.assertIn("reason=OK", p.stdout)
         res = self.result(p.stdout)
         self.assertEqual((res["reason"], res["rowsAppended"], res["measuredRows"]), ("OK", 4, 4), res)
+
+    def test_hostload_r3_a_provisional_or_unknown_ran_row_is_never_measured(self) -> None:
+        """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1, its literal): the baseline counted a RAN row with a rate whatever its host load. A row whose hash-bound
+        smoke result says CimException (or that binds none) is recorded with hostLoadState / hostLoadProvisional and a REFERENCE_PROVISIONAL line, never measured."""
+        for mode in ("cim", "none"):
+            with self.subTest(hostload=mode):
+                self.trend.unlink(missing_ok=True)
+                p = self.run_with_env(self.args(), FAKE_CHAIN_MODE="ok", FAKE_VALIDATOR_MODE="advisory", FAKE_RECEIPT_OUTCOME="PASS", FAKE_HOSTLOAD=mode)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertIn("reason=NO_MEASUREMENT", p.stdout)
+                self.assertIn("REFERENCE_PROVISIONAL leg=rcpt-", p.stdout)
+                res = self.result(p.stdout)
+                self.assertEqual((res["rowsAppended"], res["measuredRows"]), (4, 0), res)
+                rows = [json.loads(l) for l in self.trend.read_text(encoding="utf-8").splitlines() if l.strip()]
+                self.assertEqual({(r["status"], r["hostLoadState"], r["hostLoadProvisional"]) for r in rows}, {("RAN", "unknown", True)}, rows)
+        # row (c): the quiet control is still counted and says so
+        self.trend.unlink(missing_ok=True)
+        p = self.run_with_env(self.args(), FAKE_CHAIN_MODE="ok", FAKE_VALIDATOR_MODE="advisory", FAKE_RECEIPT_OUTCOME="PASS", FAKE_HOSTLOAD="quiet")
+        res = self.result(p.stdout)
+        self.assertEqual((res["reason"], res["measuredRows"]), ("OK", 4), res)
+        self.assertNotIn("REFERENCE_PROVISIONAL", p.stdout)
+        rows = [json.loads(l) for l in self.trend.read_text(encoding="utf-8").splitlines() if l.strip()]
+        self.assertEqual({(r["hostLoadState"], r["hostLoadProvisional"]) for r in rows}, {("quiet", False)}, rows)
 
     # F: the receipt read must be the one this run's leg wrote.
     def test_f_a_receipt_that_is_not_the_one_this_run_wrote_yields_no_figures(self) -> None:

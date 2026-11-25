@@ -204,7 +204,11 @@ interval shows its own queue wait, render, draw and UI latency. It is a stall di
 The leg inherits the pace legs' 95 % job quiescence threshold (`cpuQuiescenceThresholdPercent` 95, the same as its LIGHT twin
 and every pace and display-matrix leg), so at 95 the job's own gate is effectively open. The receipt's `cpuQuiescence` block
 records the load but does not label a contended run. COUNTED is decided lane-side (Wait-VenueQuiet QUIET, PASS, exe match and
-preLoad <= 30 %), so this leg is evidence-only.
+preLoad <= 30 %), so this leg is evidence-only. A leg whose own smoke host load (its hash-bound `result.json` `hostLoad` block) is
+provisional, was not collected (for example `collection failed: CimException`) or is missing is never COUNTED: with a quiet
+preLoad <= 30 % it is class `HOSTLOAD_PROVISIONAL`, and the line `REFERENCE_PROVISIONAL leg=<id> reason=hostload-<state>` is printed
+(VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1). The display-matrix summary, the venue baseline and the release GUI A/B comparator follow the same
+rule: the row carries `hostLoadState` and `hostLoadProvisional`, it is not counted as a measurement, and the A/B verdict is `INCONCLUSIVE`.
 
 The pre-registered rule `inlease-requalify-1` for bench round r7 on is available as a pure module,
 `tools/profiling/dual-venue/VenueLegCounting.psm1`. No tracked driver or analyzer imports it; the CPU-17V9-FPS-GAP-AB-1 r7 run-dir

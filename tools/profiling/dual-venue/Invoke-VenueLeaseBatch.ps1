@@ -23,7 +23,9 @@
 #      c. the leg's agent result is read BY NAME (outbox\<jobId>.result.json). The leg counts only if it ran on THIS batch's lease (admission.leaseBatch
 #         .leaseId) and kept it (slotContinuity). Class: QUIET_PRELOAD_OK (counted) when its own pre-load mean is <= 30 %; otherwise QUIET_PRELOAD_HIGH,
 #         QUIET_PRELOAD_UNKNOWN or LEASE_LOST (uncounted); a quiet pre-load whose smoke host load (result.json hostLoad) is provisional or was not collected is
-#         HOSTLOAD_PROVISIONAL (uncounted, line REFERENCE_PROVISIONAL leg=<id> reason=hostload-<state>; VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1). r5 (V-01): a FOREIGN_FLOOR line from ANY probe of the leg (an earlier attempt or batch included)
+#         HOSTLOAD_PROVISIONAL (uncounted, line REFERENCE_PROVISIONAL leg=<id> reason=hostload-<state>; VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1). The class takes that
+#         name only for a pre-load <= 30 %: a provisional leg whose pre-load is > 30 % or unknown keeps QUIET_PRELOAD_HIGH / QUIET_PRELOAD_UNKNOWN (still uncounted,
+#         the typed line still printed), and a lease or foreign-floor class keeps its own name (r3, sol r2). r5 (V-01): a FOREIGN_FLOOR line from ANY probe of the leg (an earlier attempt or batch included)
 #         sticks: the leg is COOLDOWN_UNMET (uncounted) whatever a later QUIET probe reads, as in Invoke-VenueChain. It never carries into the next leg.
 #   4. END. A batch ends when its legs are done (ALL_LEGS_DONE), the claim is lost (CLAIM_LOST, 8b), the open's sidecar cannot be written (LIVENESS_UNAVAILABLE,
 #      8a), the next leg would outlive the lease (LEASE_REMAINING_SHORT: the rest go to the next batch; also

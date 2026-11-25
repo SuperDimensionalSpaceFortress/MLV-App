@@ -1554,6 +1554,57 @@ class GuiSmokeObservedMaxSampleGapGuardExecutesTests(_ProbeCase):
 
 
 @requires_pwsh
+class CompareGuiSmokeAbInconclusiveVerdictTests(_ProbeCase):
+    """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1, its literal): a known-CIM-failed BeforeSmoke (the control) and a quiet AfterSmoke
+    made the host-load refusal join $failures and the comparator returned FAIL. A provisional or unknown leg is now never counted: the
+    verdict is INCONCLUSIVE (never PASS, never FAIL) with the typed line REFERENCE_PROVISIONAL leg=<before|after> reason=hostload-<state>.
+    Row (c): two quiet legs still PASS."""
+
+    script = COMPARE_SCRIPT
+    functions = ["Get-NestedValue", "Get-HostLoadComparisonEvidence", "Get-GuiSmokeAbVerdict"]
+    CIM = ("[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $true; state = 'unknown'; reason = 'collection failed: CimException';"
+           " before = [pscustomobject]@{ collected = $false }; after = [pscustomobject]@{ collected = $false } } }")
+    QUIET = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null } }"
+
+    def _verdict(self, before: str, after: str, failures: str = "@()") -> subprocess.CompletedProcess:
+        return self.run_snippet(
+            f"$before = {before}\n$after = {after}\n"
+            "$h = Get-HostLoadComparisonEvidence -BeforeSmoke $before -AfterSmoke $after\n"
+            f"$v = Get-GuiSmokeAbVerdict -Failures {failures} -HostLoadEvidence $h.evidence\n"
+            "Write-Host \"VERDICT=$($v.verdict)\"\n"
+            "$v.referenceProvisional | ForEach-Object { Write-Host $_ }\n"
+        )
+
+    def test_a_cim_failed_control_is_inconclusive_with_the_typed_line(self) -> None:
+        proc = self._verdict(self.CIM, self.QUIET)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("VERDICT=INCONCLUSIVE", proc.stdout)
+        self.assertIn("REFERENCE_PROVISIONAL leg=before reason=hostload-unknown", proc.stdout)
+        self.assertNotIn("leg=after", proc.stdout)
+
+    def test_a_missing_or_exceeded_block_is_inconclusive_even_beside_other_failures(self) -> None:
+        exceeded = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $true; state = 'exceeded'; reason = 'loaded' } }"
+        proc = self._verdict("[pscustomobject]@{ }", exceeded, failures="@('before smoke did not independently pass validation.')")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("VERDICT=INCONCLUSIVE", proc.stdout, "never FAIL: a provisional comparison is no regression signal")
+        self.assertIn("REFERENCE_PROVISIONAL leg=before reason=hostload-unknown", proc.stdout)
+        self.assertIn("REFERENCE_PROVISIONAL leg=after reason=hostload-exceeded", proc.stdout)
+
+    def test_c_two_quiet_legs_still_pass_and_a_real_failure_still_fails(self) -> None:
+        proc = self._verdict(self.QUIET, self.QUIET)
+        self.assertIn("VERDICT=PASS", proc.stdout, proc.stdout + proc.stderr)
+        self.assertNotIn("REFERENCE_PROVISIONAL", proc.stdout)
+        proc = self._verdict(self.QUIET, self.QUIET, failures="@('after smoke did not present at least two frames.')")
+        self.assertIn("VERDICT=FAIL", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_the_script_takes_its_verdict_from_the_shared_function_and_no_longer_fails_on_host_load(self) -> None:
+        text = COMPARE_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("$abVerdict = Get-GuiSmokeAbVerdict -Failures $failures -HostLoadEvidence $hostLoadEvidence", text)
+        self.assertIn("verdict = $abVerdict.verdict", text)
+        self.assertNotIn("$failures += @($hostLoadComparison.failures)", text, "a host-load refusal must not read FAIL")
+
+
+@requires_pwsh
 class CompareGuiSmokeAbHostLoadRefusalTests(_ProbeCase):
     """tools/profiling/compare-release-gui-smoke-ab.ps1's Get-HostLoadComparisonEvidence."""
 

@@ -23,8 +23,10 @@
 #      or goes on to the next leg (-OnUnknown Continue). A measured COOLDOWN_UNMET still runs the leg, as before, but the LEG line carries verdict=,
 #      quietMean= and the leg's preLoadMean= and class= (QUIET_PRELOAD_OK when QUIET and preLoad <= 30 %: docs/cuda-playback-present-cadence.md:206 COUNTED
 #      = QUIET plus preLoad <= 30; PASS and the exe match stay lane-side). VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: a leg whose smoke host load (result.json hostLoad,
-#      VenueChain.psm1 Get-VenueLegHostLoad) is provisional or was not collected is class=HOSTLOAD_PROVISIONAL instead (never counted; the line
-#      REFERENCE_PROVISIONAL leg=<id> reason=hostload-<state> follows), and every LEG RAN line carries hostLoadState= / hostLoadProvisional=. A FOREIGN_FLOOR line in EITHER the pre-claim or the under-claim probe keeps class=COOLDOWN_UNMET whatever the
+#      VenueChain.psm1 Get-VenueLegHostLoad) is provisional or was not collected is class=HOSTLOAD_PROVISIONAL instead of QUIET_PRELOAD_OK (never counted; the line
+#      REFERENCE_PROVISIONAL leg=<id> reason=hostload-<state> follows), and every LEG RAN line carries hostLoadState= / hostLoadProvisional=. Only a QUIET leg with a
+#      pre-load <= 30 % takes that class: one whose pre-load is > 30 % or unknown keeps QUIET_PRELOAD_HIGH / QUIET_PRELOAD_UNKNOWN (still uncounted, the typed
+#      line still printed), and a COOLDOWN_UNMET leg keeps that class (r3, sol r2). A FOREIGN_FLOOR line in EITHER the pre-claim or the under-claim probe keeps class=COOLDOWN_UNMET whatever the
 #      under-claim verdict reads (the LEG line and the result carry preClaimForeignFloor= / underClaimForeignFloor=). The quiet gate itself is unchanged: threshold and waits pass straight through.
 #   4. QUIET WINDOWS. -QuietRateTable prints the per-UTC-hour QUIET rate of the venue's PROBE lines in -GateLogPath (default every
 #      <main checkout>\.claude-state\fleet-runs\*\gate.log) and exits. -PreferQuietWindows: when the current hour's observed rate is under -PreferRatePercent
