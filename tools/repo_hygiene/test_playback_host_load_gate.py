@@ -3863,6 +3863,10 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
             "writer-pass": '{' + base % '"PASS"' + ',"outcome":"PASS","evidence":{}}',
             "writer-pre-export": '{' + base % 'null' + ',"outcome":"INVALID","evidence":{}}',
             "writer-downgraded": '{' + base % '"PASS"' + ',"outcome":"INVALID","evidence":{}}',
+            # adversary-c2bbe5f8.json A7, its input: playback-branch-only bindings (evidenceManifestSha256, artifactIndexPath) on an otherwise export-shaped PASS
+            "manifest-binding": '{' + base % '"PASS"' + ',"outcome":"PASS","evidence":{"evidenceManifestSha256":"' + "b" * 64 + '","artifactIndexPath":"C:\\\\evidence\\\\artifact-index.json"}}',
+            "unknown-binding": '{' + base % '"PASS"' + ',"outcome":"PASS","evidence":{"someNewSha256":"' + "c" * 64 + '"}}',
+            "writer-export-evidence": '{' + base % '"PASS"' + ',"outcome":"PASS","evidence":{"umRunJsonSha256":"' + "d" * 64 + '","summaryJsonSha256":"' + "e" * 64 + '","localEvidenceDir":"C:\\\\ev","umRunOutcome":"PASS","resultJsonSha256":null}}',
         }
         with tempfile.TemporaryDirectory(prefix="residue-r2-a4-") as tmp:
             lines = []
@@ -3872,7 +3876,40 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
             proc = _run_ps_command(f"$m = Import-Module '{VENUE_CHAIN_MODULE}' -DisableNameChecking -PassThru; " + "; ".join(lines))
         got = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
         self.assertEqual(got, {"invented": "False", "invented-no-bindings": "False", "visual": "False", "stderr": "False", "pass-null-verdict": "False",
-                               "writer-pass": "True", "writer-pre-export": "True", "writer-downgraded": "True"}, proc.stdout + proc.stderr)
+                               "writer-pass": "True", "writer-pre-export": "True", "writer-downgraded": "True",
+                               "manifest-binding": "False", "unknown-binding": "False", "writer-export-evidence": "True"}, proc.stdout + proc.stderr)
+
+    def test_r2_pass4_static_pins(self) -> None:
+        # adversary-c2bbe5f8.json: A1 (the failure text withholds the screenshot figures), A2 (the report is written through the identity-checked handle),
+        # A3 (a manifest with a null or no artifact is refused), A5 (an unreadable result or summary is a recorded refusal), A8 (identity from the open fd).
+        cmp = COMPARE_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("'Screenshot delta exceeded threshold (figures withheld: the verdict is INCONCLUSIVE).'", cmp)
+        self.assertIn("$outStream = [IO.FileStream]::new($resolvedOutput, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)", cmp)
+        self.assertNotIn("Set-Content -LiteralPath $resolvedOutput", cmp)
+        self.assertIn('$fdPath = "/proc/$PID/fd/$fd"', cmp)
+        p3 = P3_VALIDATION_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('Add-Failure $importFailures "The manifest lists a null artifact entry."', p3)
+        self.assertIn('Add-Failure $importFailures "The manifest lists no artifact; a packet with no checked artifact is not proof."', p3)
+        self.assertIn("try { $summaryText = [string](Get-Content -LiteralPath $summaryPath -Raw) }", p3)
+        self.assertIn('catch { Add-Failure $clipFailures ("The smoke result JSON could not be read: "', p3)
+        cuda = _extract_functions(CUDA_AB_SCRIPT, ["Read-SmokeSummary"])
+        self.assertIn("try { $smokeBytes = [IO.File]::ReadAllBytes($Path) }", cuda)
+
+    def test_r2_pass4_a1_the_inconclusive_failure_text_carries_no_screenshot_figure(self) -> None:
+        # adversary-c2bbe5f8.json A1, its input: black and white PNGs, before hostLoad null, -FailOnScreenshotDelta. RED: failures kept meanAbsRgbDelta=255.
+        with tempfile.TemporaryDirectory(prefix="residue-r2-p4a1-") as tmp:
+            black, white = Path(tmp) / "black.png", Path(tmp) / "white.png"
+            black.write_bytes(_one_pixel_png((0, 0, 0)))
+            white.write_bytes(_one_pixel_png((255, 255, 255)))
+            before, after, out = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "compare.json"
+            before.write_text(json.dumps({"hostLoad": None, "screenshot": {"path": str(black)}}), encoding="utf-8", newline="")
+            after.write_text(json.dumps({"hostLoad": json.loads(QUIET_SMOKE)["hostLoad"], "screenshot": {"path": str(white)}}), encoding="utf-8", newline="")
+            proc = _run_ps_file(COMPARE_SCRIPT, "-Before", str(before), "-After", str(after), "-Output", str(out), "-FailOnScreenshotDelta")
+            report = json.loads(out.read_text(encoding="utf-8-sig")) if out.is_file() else None
+        self.assertIsNotNone(report, proc.stdout + proc.stderr)
+        self.assertEqual(report["verdict"], "INCONCLUSIVE")
+        self.assertFalse(any("meanAbsRgbDelta=" in f or "changedSampleRatio=" in f for f in report["failures"]), report["failures"])
+        self.assertIn("Screenshot delta exceeded threshold (figures withheld: the verdict is INCONCLUSIVE).", report["failures"])
 
     def test_a4_the_outcome_list_is_the_writers(self) -> None:
         runner = ROOT / "tools" / "profiling" / "dual-venue" / "DualVenueRunner.psm1"

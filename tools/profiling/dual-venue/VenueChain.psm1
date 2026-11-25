@@ -1824,6 +1824,13 @@ function Test-VenueReceiptIsExportLeg([object]$Rc) {
     # completes its receipt before the smoke streams are collected), so a receipt carrying any of them is not an export leg.
     if ($null -ne (Get-VenueHlMember $Rc 'visual')) { return $false }
     foreach ($n in 'smokeStderrSha256', 'smokeStdoutSha256') { if ($null -ne (Get-VenueHlMember $evd $n)) { return $false } }
+    # adversary-c2bbe5f8.json A7: an ALLOW-list, not a deny-list. The export branch of Invoke-VenueLeg.ps1 sets only umRunJsonSha256, localEvidenceDir and
+    # summaryJsonSha256 (and umRunOutcome at the run); every other evidence member (evidenceManifestSha256, artifactIndexPath, any name not listed, any case
+    # variant) is a playback binding, so a receipt where one is non-null is not an export leg.
+    if ($null -ne $evd) {
+        $evdNames = $(if ($evd -is [System.Collections.IDictionary]) { @($evd.Keys | ForEach-Object { [string]$_ }) } else { @($evd.PSObject.Properties | ForEach-Object { $_.Name }) })
+        foreach ($n in $evdNames) { if ($n -cnotin @('summaryJsonSha256', 'umRunJsonSha256', 'localEvidenceDir', 'umRunOutcome') -and $null -ne (Get-VenueHlMember $evd $n)) { return $false } }
+    }
     $ex = Get-VenueHlMember $Rc 'export'
     if (-not (Test-VenueHlObject $ex)) { return $false }
     $fmt = Get-VenueHlMember $ex 'format'

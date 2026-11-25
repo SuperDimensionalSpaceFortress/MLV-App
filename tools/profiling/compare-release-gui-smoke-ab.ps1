@@ -70,7 +70,12 @@ public static class MlvSmokeFileIdentityV2 {
         }
         return [MlvSmokeFileIdentityV2]::Of($Stream.SafeFileHandle)
     }
-    $stat = & stat -L -c '%d:%i' -- $ResolvedPath 2>$null
+    # adversary-c2bbe5f8.json A8: off Windows the identity is read from the OPEN descriptor (/proc/<pid>/fd/<fd>), never by re-resolving the path, so a
+    # rename between the open and the stat cannot attribute another file's identity to these bytes; a system without /proc fails closed
+    $fd = $Stream.SafeFileHandle.DangerousGetHandle().ToInt64()
+    $fdPath = "/proc/$PID/fd/$fd"
+    if (-not (Test-Path -LiteralPath $fdPath)) { throw "the identity of $ResolvedPath could not be read from its open descriptor" }
+    $stat = & stat -L -c '%d:%i' -- $fdPath 2>$null
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$stat)) { throw "the identity of $ResolvedPath could not be read" }
     return ([string]$stat).Trim()
 }
@@ -1316,6 +1321,12 @@ if ([string]::Equals([string]$result.verdict, 'INCONCLUSIVE', [StringComparison]
 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A7): the screenshot comparison is a cross-leg delta too. An INCONCLUSIVE
 # comparison keeps each leg's own image metadata but withholds every before-vs-after figure (sameSha256, meanAbsRgbDelta, maxAbsRgbDelta,
 # changedSampleRatio, sampledPixels), in the JSON and in the summary line below; status reads withheld-inconclusive.
+# adversary-c2bbe5f8.json A1: the -FailOnScreenshotDelta failure text names the figures too, so an INCONCLUSIVE report keeps the failure but not its numbers.
+if ([string]::Equals([string]$result.verdict, 'INCONCLUSIVE', [StringComparison]::Ordinal)) {
+    $result.failures = @(@($result.failures) | ForEach-Object {
+        if (([string]$_).StartsWith('Screenshot delta exceeded threshold', [StringComparison]::Ordinal)) { 'Screenshot delta exceeded threshold (figures withheld: the verdict is INCONCLUSIVE).' } else { $_ }
+    })
+}
 if ([string]::Equals([string]$result.verdict, 'INCONCLUSIVE', [StringComparison]::Ordinal) -and $null -ne $result.screenshot) {
     $result.screenshot = [pscustomobject]@{
         status = 'withheld-inconclusive'
@@ -1337,7 +1348,19 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
     if (-not [string]::IsNullOrWhiteSpace($outputDir)) {
         New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
     }
-    Set-Content -LiteralPath $resolvedOutput -Value $json -Encoding UTF8
+    # adversary-c2bbe5f8.json A2: the report is written through the SAME handle whose identity is checked (opened without truncation, no sharing), so a
+    # hard link to an input swapped in after the earlier check is refused here and never truncated or written
+    $outBytes = [Text.UTF8Encoding]::new($false).GetBytes($json + [Environment]::NewLine)
+    $outStream = [IO.FileStream]::new($resolvedOutput, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try {
+        $outIdentity = Get-SmokeFileIdentity -Stream $outStream -ResolvedPath $resolvedOutput
+        foreach ($inputIdentity in @($beforeSource.identity, $afterSource.identity)) {
+            if ($null -ne $inputIdentity -and [string]::Equals([string]$inputIdentity, $outIdentity, [StringComparison]::Ordinal)) { throw "Output must not overwrite either smoke JSON input." }
+        }
+        $outStream.SetLength(0)
+        $outStream.Write($outBytes, 0, $outBytes.Length)
+    }
+    finally { $outStream.Dispose() }
 }
 
 Write-Host ((

@@ -588,7 +588,10 @@ function Import-EvidencePacket {
         $manifest = $null
         try { $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json }
         catch { Add-Failure $importFailures ("evidence-packet-manifest.json could not be parsed: " + ($_.Exception.Message -replace '\s+', ' ')) }
-        $summaryText = Get-Content -LiteralPath $summaryPath -Raw
+        # adversary-c2bbe5f8.json A5: a summary that cannot be read is a recorded import failure (the scanner below then reads '' as unparsable)
+        $summaryText = ''
+        try { $summaryText = [string](Get-Content -LiteralPath $summaryPath -Raw) }
+        catch { Add-Failure $importFailures ("summary.json could not be read: " + ($_.Exception.Message -replace '\s+', ' ')) }
         # adversary-ac6205bd.json A2: a repeated member anywhere (e.g. "hostLoadCollected":false,"hostLoadCollected":true in a clip record) keeps the last
         # value in the parsed object, so the packet is refused rather than read
         # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A9): the scanner adjudicates BEFORE the object parse, and a parse refusal
@@ -633,6 +636,11 @@ function Import-EvidencePacket {
         # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-88890049.json A2): a manifest that did not parse (null) lists no artifact (@($null) is one null
         # entry, whose empty relativePath named the extraction directory and threw at the hash), and an entry with no relativePath, or one that names a
         # directory, is a recorded failure, never a throw that loses the import result
+        # adversary-c2bbe5f8.json A3: skipping a null entry must never let a packet with no checked artifact succeed: a null entry is a recorded failure,
+        # and a manifest that lists no artifact at all is refused (the base could never succeed on one either: its null entry threw at the hash)
+        $manifestFiles = @($manifest.files)
+        if (@($manifestFiles | Where-Object { $null -eq $_ }).Count -gt 0) { Add-Failure $importFailures "The manifest lists a null artifact entry." }
+        if (@($manifestFiles | Where-Object { $null -ne $_ }).Count -eq 0) { Add-Failure $importFailures "The manifest lists no artifact; a packet with no checked artifact is not proof." }
         foreach ($file in @(@($manifest.files) | Where-Object { $null -ne $_ })) {
             if ([string]::IsNullOrWhiteSpace([string]$file.relativePath)) {
                 Add-Failure $importFailures "The manifest lists an artifact with no relativePath."
@@ -1190,8 +1198,13 @@ exit `$LASTEXITCODE
         if (Test-Path -LiteralPath $clipOutput) {
             # adversary-ac6205bd.json A2/A5: one BOM-aware read, parsed with -NoEnumerate (a singleton root stays an array); the same text is judged by
             # VenueChain.psm1 ConvertFrom-VenueSmokeResultText (repeated member, root not one object, uncollected sample) below, beside the block reader
-            $resultBytes = [IO.File]::ReadAllBytes($clipOutput)
-            $resultText = [IO.StreamReader]::new([IO.MemoryStream]::new($resultBytes), [Text.UTF8Encoding]::new($false), $true).ReadToEnd()
+            # adversary-c2bbe5f8.json A5: a result that cannot be read is a recorded clip failure (and reads unknown below), never a throw that loses the row
+            $resultText = ''
+            try {
+                $resultBytes = [IO.File]::ReadAllBytes($clipOutput)
+                $resultText = [IO.StreamReader]::new([IO.MemoryStream]::new($resultBytes), [Text.UTF8Encoding]::new($false), $true).ReadToEnd()
+            }
+            catch { Add-Failure $clipFailures ("The smoke result JSON could not be read: " + ($_.Exception.Message -replace '\s+', ' ')) }
             $resultTextStanding = ConvertFrom-VenueSmokeResultText -Text $resultText
             # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A9): a text the object parser refuses (hostLoad beside HostLoad,
             # malformed JSON) is a recorded clip failure, never a throw: the object reads null and the text reader's refusal still reaches the row.

@@ -818,7 +818,20 @@ function Read-SmokeSummary {
     # adversary-ac6205bd.json A2/A5: one byte read, decoded by its BOM (a UTF-16 result is not mangled), parsed with -NoEnumerate (a singleton root array
     # stays an array, never a clean object); the same text is judged by VenueChain.psm1 ConvertFrom-VenueSmokeResultText (a repeated member, a root
     # that is not one object, an uncollected sample) and anything it does not read clean makes the leg provisional.
-    $smokeBytes = [IO.File]::ReadAllBytes($Path)
+    # adversary-c2bbe5f8.json A5: a result that exists but cannot be read (held open with FileShare.None) is a recorded provisional leg, never a throw
+    try { $smokeBytes = [IO.File]::ReadAllBytes($Path) }
+    catch {
+        return [pscustomobject]@{
+            path = $Path
+            exists = $true
+            exitCode = $ExitCode
+            validationOk = $false
+            hostLoadProvisional = $true
+            hostLoadState = "unknown"
+            hostLoadCollected = $false
+            hostLoadReason = "smoke result JSON could not be read: $($_.Exception.Message -replace '\s+', ' ')"
+        }
+    }
     $smokeText = [IO.StreamReader]::new([IO.MemoryStream]::new($smokeBytes), [Text.UTF8Encoding]::new($false), $true).ReadToEnd()
     # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A9): the venue text reader adjudicates FIRST, and a text the object parser
     # refuses (hostLoad beside HostLoad: KeysWithDifferentCasingInJsonString; malformed JSON) is no throw: the object reads empty (no figures,
