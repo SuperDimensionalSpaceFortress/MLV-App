@@ -89,6 +89,8 @@ $legs = foreach ($s in $specs) {
                 display = [ordered]@{ requestedMode = 'fullscreen' }; scale = [ordered]@{ requestedScale = 1 } }
             if ($idm -ceq 'nobackend') { $rc.subject.Remove('backend') }
             Set-Content -LiteralPath $rp -Value ($rc | ConvertTo-Json -Depth 8)
+            # FAKE_RECEIPT_TEXT (VENUE-LEG-DISPLAY-PATH-RECEIPT-1-SUCCESSOR-3 r4, fable r3 B1): the receipt file's whole text instead (EMPTY: a zero-byte file)
+            if ($env:FAKE_RECEIPT_TEXT) { [IO.File]::WriteAllText($rp, $(if ($env:FAKE_RECEIPT_TEXT -ceq 'EMPTY') { '' } else { $env:FAKE_RECEIPT_TEXT })) }
             if ($mode -ceq 'noreceipt') { Remove-Item -LiteralPath $rp -Force }
             [pscustomobject]@{ name = $name; spec = $s; backend = $Backend; status = 'RAN'; verdict = 'QUIET'; outcome = $outc; legExit = 0; receipt = $rp }
         }
@@ -778,6 +780,26 @@ class VenueBaselineTests(unittest.TestCase):
                     self.assertTrue(str(r["failure"]).startswith("EVIDENCE_INCOMPLETE: receipt identity"), r)
                     self.assertTrue(r["fps"] is None and r["drops"] is None and r["stall"] is None, r)
                 self.assertEqual(self.validator_calls(), [], "a receipt of another run is never validated, let alone trusted")
+
+    # VENUE-LEG-DISPLAY-PATH-RECEIPT-1-SUCCESSOR-3 r4 (fable r3 B1): a receipt file whose text is `null`, `[]` or empty reads as no record. The display-path pre-gate
+    # (Get-DvReceiptDisplayPathState, outside any try under Stop) refused that $null with a raw binding error: exit 1, no rows, no BASELINE_RESULT. It is the
+    # identity gate's typed row, as before that call existed, and the run finishes with LEG_FAILED (25).
+    def test_r4_b1_a_null_empty_or_empty_array_receipt_file_is_a_typed_identity_row_and_the_run_finishes(self) -> None:
+        for text in ("null", "[]", "EMPTY"):
+            with self.subTest(text=text):
+                self.trend.unlink(missing_ok=True)
+                self.validator_log.unlink(missing_ok=True)
+                p = self.run_with_env(self.args(), FAKE_CHAIN_MODE="ok", FAKE_VALIDATOR_MODE="advisory", FAKE_RECEIPT_OUTCOME="PASS", FAKE_RECEIPT_TEXT=text)
+                self.assertNotIn("Cannot bind argument to parameter", p.stdout + p.stderr)
+                self.assertEqual(p.returncode, EXIT["LEG_FAILED"], p.stdout + p.stderr)
+                self.assertIn("reason=LEG_FAILED", p.stdout)
+                rows = self.trend_rows()
+                self.assertEqual(len(rows), 4, rows)
+                for r in rows:
+                    self.assertEqual((r["status"], r["outcome"]), ("EVIDENCE_INCOMPLETE", "INVALID"), r)
+                    self.assertTrue(str(r["failure"]).startswith("EVIDENCE_INCOMPLETE: receipt identity"), r)
+                    self.assertTrue(r["fps"] is None and r["drops"] is None and r["stall"] is None, r)
+                self.assertEqual(self.validator_calls(), [], "no record is never validated, let alone trusted")
 
     # F r2 (sol blocker): the receipt's subject.backend must be the planned backend, so a CUDA measurement can never land in a CPU-labelled row (or the reverse).
     def test_f_r2_a_receipt_of_the_other_backend_or_naming_none_yields_no_figures(self) -> None:

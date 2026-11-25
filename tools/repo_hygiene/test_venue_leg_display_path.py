@@ -52,6 +52,7 @@ def good_block() -> dict:
         "activeDisplays": [
             {"adapterName": "Intel(R) Iris(R) Xe Graphics", "refreshHz": 59, "horizontalResolution": 3840, "verticalResolution": 2400},
         ],
+        "activeDisplayCount": 1,   # SUCCESSOR-3 r4 (sol r3): the active displays counted on their own; a list is present only when its length equals this
         "os": {"build": "26100", "ubr": 4770, "lastBootUtc": "2026-11-21T09:00:00Z", "hotfixCount": 14},
         "powerPlan": "Balanced",
     }
@@ -65,6 +66,7 @@ def all_unknown_block() -> dict:
         "collectedUtc": "2026-11-24T16:40:00Z",
         "adapters": unknown("RPC server unavailable"),
         "activeDisplays": unknown("adapters-unreadable"),
+        "activeDisplayCount": unknown("display-count-unreadable: RPC server unavailable"),
         "os": {"build": unknown("registry-unreadable"), "ubr": unknown("registry-unreadable"),
                "lastBootUtc": unknown("RPC server unavailable"), "hotfixCount": unknown("budget-exhausted")},
         "powerPlan": unknown("access denied"),
@@ -200,7 +202,7 @@ class ReceiptValidatorReportsTheDisplayPathTests(unittest.TestCase):
         for label, block in bad.items():
             with self.subTest(label):
                 self.assertEqual(block_state(block)["state"], "malformed", label)
-        headless = dict(base, adapters=[dict(intel, hasActiveOutput=False), nvidia], activeDisplays=[])
+        headless = dict(base, adapters=[dict(intel, hasActiveOutput=False), nvidia], activeDisplays=[], activeDisplayCount=0)
         self.assertEqual(block_state(headless)["state"], "present")
 
     def test_adversary_r2_a9_a_venue_that_is_not_an_object_is_malformed_not_absent(self) -> None:
@@ -417,6 +419,8 @@ function Get-CimInstance {
     if ($script:mode -eq 'deny') { throw [System.UnauthorizedAccessException]::new('Access is denied') }
     switch ($ClassName) {
         'Win32_VideoController' { return @($script:fx.video) }
+        # SUCCESSOR-3 r4 (sol r3): the active displays, counted on their own (root\wmi)
+        'WmiMonitorBasicDisplayParams' { if ($Namespace -cne 'root\wmi') { throw 'Invalid class' }; return @($script:fx.monitors) }
         'Win32_OperatingSystem' { return @([pscustomobject]@{ LastBootUpTime = [datetime]::Parse($script:fx.boot).ToLocalTime() }) }
         # DVE_PLAN, when set, is the plan name as CIM gives it (a string): the fixture's own ConvertFrom-Json would read a time-looking name as a [datetime]
         'Win32_PowerPlan' { return @([pscustomobject]@{ ElementName = $(if ($env:DVE_PLAN) { [string]$env:DVE_PLAN } else { $script:fx.plan }); IsActive = $true }) }
@@ -451,7 +455,11 @@ BACHELOR_FIXTURE = {
          "PNPDeviceID": "PCI\\VEN_10DE&DEV_2560\\4&2C0D5D9&0&0008", "CurrentRefreshRate": None, "CurrentHorizontalResolution": None, "CurrentVerticalResolution": None},
     ],
     "boot": "2026-11-21T09:00:00Z", "plan": "Balanced", "hotfixes": 14,
+    "monitors": [{"Active": True}],   # SUCCESSOR-3 r4 (sol r3): Bachelor's one display (WmiMonitorBasicDisplayParams)
 }
+
+# SUCCESSOR-3 r4 (sol r3 per-active-display): ONE GPU drives two displays, 3840x2400@59 and 1920x1080@144. Win32_VideoController reports one current mode for it.
+TWO_DISPLAYS_ONE_GPU_FIXTURE = dict(BACHELOR_FIXTURE, monitors=[{"Active": True}, {"Active": True}])
 
 
 def run_collector(mode: str = "ok", sleep_ms: int = 0, budget: int | None = None, fixture: dict | None = None, plan: str | None = None, ubr: int | None = None) -> dict:
@@ -481,6 +489,7 @@ function Get-CimInstance {
     if ($env:DVE_BLOCK_AT -eq $ClassName) { [System.Threading.Thread]::Sleep([int]$env:DVE_BLOCK_MS) }
     switch ($ClassName) {
         'Win32_VideoController' { return @([pscustomobject]@{ Name = 'Intel(R) Iris(R) Xe Graphics'; DriverVersion = '31.0.101.5186'; DriverDate = [datetime]::new(2024, 6, 12, 0, 0, 0, [DateTimeKind]::Utc); PNPDeviceID = 'PCI\VEN_8086'; CurrentRefreshRate = 59; CurrentHorizontalResolution = 3840; CurrentVerticalResolution = 2400 }) }
+        'WmiMonitorBasicDisplayParams' { return @([pscustomobject]@{ Active = $true }) }
         'Win32_OperatingSystem' { return @([pscustomobject]@{ LastBootUpTime = [datetime]::new(2026, 11, 21, 9, 0, 0, [DateTimeKind]::Utc) }) }
         'Win32_PowerPlan' { return @([pscustomobject]@{ ElementName = 'Balanced'; IsActive = $true }) }
         'Win32_QuickFixEngineering' { return @([pscustomobject]@{ HotFixID = 'KB1' }) }
@@ -577,7 +586,7 @@ class CollectorReadsTheBachelorShapeTests(unittest.TestCase):
                 self.assertEqual(got["state"], "present", got)   # after the harness's ConvertTo-Json / ConvertFrom-Json round trip
 
     def test_no_adapter_at_all_is_an_empty_list_not_a_failure(self) -> None:
-        got = run_collector(fixture=dict(BACHELOR_FIXTURE, video=[]))
+        got = run_collector(fixture=dict(BACHELOR_FIXTURE, video=[], monitors=[]))
         self.assertEqual(got["state"], "present", got)
         self.assertEqual(got["block"]["adapters"], [])
         self.assertEqual(got["block"]["activeDisplays"], [])
@@ -1378,7 +1387,7 @@ class Successor2Tests(unittest.TestCase):
             b = {"schema": SCHEMA, "sampledBefore": SAMPLED_BEFORE, "collectedUtc": "2026-11-24T16:40:00Z",
                  "adapters": [{"name": "A", "driverVersion": "x", "driverDate": unknown("x"), "pnpDeviceId": "x", "hasActiveOutput": True}],
                  "activeDisplays": [{"adapterName": "A", "refreshHz": 59, "horizontalResolution": 3840, "verticalResolution": 2400}],
-                 "os": unknown("x"), "powerPlan": "Balanced"}
+                 "activeDisplayCount": 1, "os": unknown("x"), "powerPlan": "Balanced"}
             b.update(over)
             return b
         a1 = block(adapters=[{"name": "2026-11-24T00:00:00Z", "driverVersion": "x", "driverDate": unknown("x"), "pnpDeviceId": "x", "hasActiveOutput": True}],
@@ -1476,6 +1485,59 @@ class Successor2Tests(unittest.TestCase):
                 self.assertIsNone(got["identity"], got)
                 self.assertEqual((got["verification"]["status"], got["rejected"]), ("INVALID", "INVALID"), got)
                 self.assertTrue(got["verification"]["reasons"][0].startswith("DISPLAY_PATH_MALFORMED"), got)
+
+    def test_successor3_r4_fable_b1_a_null_empty_or_empty_array_receipt_file_keeps_the_flavor_pairs_typed_refusal(self) -> None:
+        """fable r3 B1 class sibling (New-VenueFlavorPair.ps1 Assert-DisplayPathNotMalformed): a receipt file whose text is `null`, `[]` or empty reads as $null,
+        and the r3 pre-gate call refused it with a raw parameter-binding error. There is no record and no display path: the flavor gate refuses it as
+        PAIR_FLAVORS_WRONG, as it did before that call existed. The classic side (pair) and the film side (trio)."""
+        good = '"displayPath": ' + json.dumps(good_block())
+        for text in ("null", "[]", ""):
+            for trio in (False, True):
+                with self.subTest(text=text, trio=trio), tempfile.TemporaryDirectory(prefix="dv-r4-b1-flavor-") as d:
+                    base = Path(d) / ".claude-state"
+                    base.mkdir()
+                    bad_side = "film" if trio else "classic"
+                    paths = {}
+                    for flavor in ("classic", "cinematic", "film"):
+                        paths[flavor] = base / f"{flavor}.json"
+                        body = text if flavor == bad_side else self._b2_receipt_text(good, receiptId=f"rc-{flavor}", lookFlavor=flavor)
+                        paths[flavor].write_text(body, encoding="utf-8")
+                    proc = self._pair_run("flavor", paths, base, trio=trio)
+                    out = proc.stdout + proc.stderr
+                    self.assertNotEqual(proc.returncode, 0, out)
+                    self.assertNotIn("Cannot bind argument to parameter", out, out)
+                    self.assertIn("PAIR_FLAVORS_WRONG", out, out)
+                    self.assertFalse((base / "pair").exists(), "a refused pair writes nothing")
+
+    def test_successor3_r4_sol_r3_two_displays_on_one_gpu_are_never_a_collapsed_list_that_reads_present(self) -> None:
+        """sol r3 (card item 3, "per active display refresh rate and resolution"): one GPU drives 3840x2400@59 and 1920x1080@144. Win32_VideoController reports
+        ONE current mode for it, so the collector wrote one activeDisplays entry and the validator read it as present. The active displays are now counted on their
+        own: the per-adapter entries are a list only when that count equals their number; otherwise activeDisplays is a typed unknown, and the validator refuses a
+        list whose activeDisplayCount is not an int equal to its length."""
+        two = run_collector(fixture=TWO_DISPLAYS_ONE_GPU_FIXTURE)
+        self.assertEqual(two["state"], "present", two)
+        self.assertEqual(two["block"]["activeDisplayCount"], 2, two)
+        self.assertEqual(two["block"]["activeDisplays"]["state"], "unknown", two)
+        self.assertTrue(two["block"]["activeDisplays"]["reason"].startswith("per-display-not-enumerable: 2 active display(s), 1 adapter mode(s)"), two)
+        self.assertEqual(len(two["block"]["adapters"]), 2, two)   # the adapters are still recorded
+        self.assertEqual(sum(1 for c in two["calls"] if c["class"] == "WmiMonitorBasicDisplayParams" and c["ns"] == "root\\wmi"), 1, two["calls"])
+        one = run_collector()
+        self.assertEqual((one["state"], one["block"]["activeDisplayCount"], len(one["block"]["activeDisplays"])), ("present", 1, 1), one)
+        base = good_block()
+        collapsed = {
+            "a list of one entry with two active displays": dict(base, activeDisplayCount=2),
+            "a list beside an unknown display count": dict(base, activeDisplayCount=unknown("display-count-unreadable: x")),
+            "a list with no display count": {k: v for k, v in base.items() if k != "activeDisplayCount"},
+            "a display count that is not an int": dict(base, activeDisplayCount="1"),
+            "a negative display count": dict(base, activeDisplayCount=-1),
+        }
+        for label, block in collapsed.items():
+            with self.subTest(label):
+                got = block_state(block)
+                self.assertEqual(got["state"], "malformed", got)
+                self.assertTrue(any("activeDisplayCount" in p for p in got["problems"]), got)
+        self.assertEqual(block_state(base)["state"], "present")
+        self.assertEqual(block_state(dict(base, activeDisplays=unknown("per-display-not-enumerable: 2 active display(s), 1 adapter mode(s)"), activeDisplayCount=2))["state"], "present")
 
     def _stubbed_core_tree(self, d: str) -> Path:
         """The two pair scripts beside a copy of the module whose core validator is the W0 shape of the blanket revocation filter at HEAD (an empty blanket list
