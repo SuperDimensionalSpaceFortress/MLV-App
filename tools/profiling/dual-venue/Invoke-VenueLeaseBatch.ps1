@@ -3194,9 +3194,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # r3 (sol r2 B2): the leg runs only while the lease does. It is a bounded child: still running at the lease's end, it is killed with its whole
                 # process tree (Kill($true), Invoke-VenueBoundedProcess) and typed LEASE_EXPIRED below. The agent stops its job at the same bound (lease-batch r3).
                 $legBoundSec = [int][Math]::Max(1, [Math]::Floor(($leaseEnd - [DateTime]::UtcNow).TotalSeconds))
+                $lp = $null   # BATCH-3 r5 (sol r4 B2 sibling): the BATCH_ERROR catch reads THIS leg's child only, never an earlier leg's return. BATCH-3 r7: reset before the in-flight mark, so the mark stays the launch's own line
                 # adversary r7 A2: Process.Start failing (a command line past 32767 characters, a missing exe) throws a Win32Exception before any child exists: the leg stays NOT_RUN.
                 $inFlightLeg = $leg   # adversary r5 pass 2 A2: marked at the launch itself, so a throw while the RUN line was logged leaves a leg that never started NOT_RUN
-                $lp = $null   # BATCH-3 r5 (sol r4 B2 sibling): the BATCH_ERROR catch reads THIS leg's child only, never an earlier leg's return
                 try { $lp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $lArgs -TimeoutSec $legBoundSec } catch {
                     if ($_.Exception -is [ComponentModel.Win32Exception] -or $_.Exception.InnerException -is [ComponentModel.Win32Exception]) { $inFlightLeg = $null }
                     throw
