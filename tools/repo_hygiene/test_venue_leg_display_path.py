@@ -1139,9 +1139,15 @@ class Successor2Tests(unittest.TestCase):
         """SUCCESSOR-3 r1 sol B1: the W1 recovery read only a root OBJECT, so the same display-only parse failure inside a one-element root array (which
         ConvertFrom-Json unwraps to its record) dropped the probe, and a healthy leg became VENUE_UNHEALTHY. The literal inputs of the verdict."""
         head = json.dumps(dict(HEALTHY_PROBE))[:-1]
+        deep = '{"x": ' * 257 + "0" + "}" * 257
         lines = {
             "array, two casings": "[" + head + ', "displayPath": 5, "DisplayPath": {}}]',
             "array, reserved member": "[" + head + ', "displayPath": {"PSObject": 1}}]',
+            # r2 adversary A2: nested one-element arrays, with an exact duplicate (which parses, keeping the last) and with a reserved member
+            "nested arrays, exact duplicate": "[[" + head + ', "displayPath": 5, "displayPath": {"state": "unknown", "reason": "last"}}]]',
+            "nested arrays, reserved member": "[[" + head + ', "displayPath": {"PSObject": 1}}]]',
+            # r2 adversary A3: the block that stops ConvertFrom-Json is deeper than 256 levels
+            "deep reserved member": head + ', "displayPath": {"PSObject": 1, "x": ' + deep + "}}",
         }
         controls = {"array, reserved member outside the block": "[" + head + ', "PSObject": 1}]',
                     "array of two probes, two casings": "[" + head + ', "displayPath": 5, "DisplayPath": {}}, ' + json.dumps(dict(HEALTHY_PROBE)) + "]"}
@@ -1164,7 +1170,7 @@ class Successor2Tests(unittest.TestCase):
     def _b2_receipt_text(self, venue_tail: str, **over) -> str:
         """A receipt FILE's text whose venue ends in `venue_tail` (raw JSON members: a case collision or a reserved member json.dumps cannot write)."""
         r = {"schema": "mlv-app/dual-venue-receipt/v1", "receiptId": over.pop("receiptId", "rcpt-b2"), "legId": "m16-1243-look-scale2", "card": "DUAL-VENUE-EVIDENCE-1",
-             "outcome": "PASS", "startedUtc": over.pop("startedUtc", "2026-11-25T00:00:00Z"),
+             "outcome": over.pop("outcome", "PASS"), "startedUtc": over.pop("startedUtc", "2026-11-25T00:00:00Z"),
              "subject": {"backend": "cpu", "buildManifestSha256": "ab" * 32, "clipId": "M16-1243", "lookFlavor": "classic"},
              "metrics": {"sourceCommit": "c" * 40}, "scale": {"requestedScale": 2, "effectiveScale": 2},
              "venue": {"name": "bachelor", "role": "supplementary", "declared": "bachelor", "hostName": "BACHELOR", "gpuNames": ["Intel(R) Iris(R) Xe Graphics"]}}
@@ -1200,6 +1206,22 @@ class Successor2Tests(unittest.TestCase):
                 cpu.write_text(self._b2_receipt_text(tail, receiptId="rc-cpu"), encoding="utf-8")
                 proc = run_pwsh(["-File", str(DV / "New-VenueSheetPair.ps1"), "-CudaReceipt", str(cuda), "-CpuReceipt", str(cpu), "-OutDir", str(base / "sheets")])
                 self._assert_typed_display_refusal(proc, label)
+                # r2 adversary A7: on a no-signal outcome too, the malformed block is refused as itself, never PAIR_RECEIPT_INCOMPLETE first
+                cuda.write_text(self._b2_receipt_text(tail, receiptId="rc-cuda", backend="cuda", outcome="UNRESOLVED"), encoding="utf-8")
+                proc = run_pwsh(["-File", str(DV / "New-VenueSheetPair.ps1"), "-CudaReceipt", str(cuda), "-CpuReceipt", str(cpu), "-OutDir", str(base / "sheets")])
+                self._assert_typed_display_refusal(proc, label + " UNRESOLVED")
+        # control: a no-signal receipt with a good block is still PAIR_RECEIPT_INCOMPLETE
+        with tempfile.TemporaryDirectory(prefix="dv-b2-sheet-") as d:
+            base = Path(d) / ".claude-state"
+            base.mkdir()
+            cuda = base / "cuda.json"
+            cpu = base / "cpu.json"
+            good = '"displayPath": ' + json.dumps(good_block())
+            cuda.write_text(self._b2_receipt_text(good, receiptId="rc-cuda", backend="cuda", outcome="UNRESOLVED"), encoding="utf-8")
+            cpu.write_text(self._b2_receipt_text(good, receiptId="rc-cpu"), encoding="utf-8")
+            proc = run_pwsh(["-File", str(DV / "New-VenueSheetPair.ps1"), "-CudaReceipt", str(cuda), "-CpuReceipt", str(cpu), "-OutDir", str(base / "sheets")])
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("PAIR_RECEIPT_INCOMPLETE receipt rc-cuda is UNRESOLVED", proc.stdout + proc.stderr)
 
     def test_successor3_r2_b2_flavor_pair_and_trio_read_a_case_colliding_receipt_file_to_the_typed_validator(self) -> None:
         """SUCCESSOR-3 r1 sol B2 (New-VenueFlavorPair.ps1:156-157, :173 for the trio's third receipt): the same, end to end through the script."""
@@ -1211,7 +1233,9 @@ class Successor2Tests(unittest.TestCase):
                     paths = {}
                     for flavor in ("classic", "cinematic", "film"):
                         paths[flavor] = base / f"{flavor}.json"
-                        paths[flavor].write_text(self._b2_receipt_text(tail, receiptId=f"rc-{flavor}", lookFlavor=flavor), encoding="utf-8")
+                        # r2 adversary A7: the trio's classic receipt is a no-signal outcome; the malformed block is still refused as itself
+                        paths[flavor].write_text(self._b2_receipt_text(tail, receiptId=f"rc-{flavor}", lookFlavor=flavor,
+                                                                       outcome="UNRESOLVED" if trio and flavor == "classic" else "PASS"), encoding="utf-8")
                     args = ["-File", str(DV / "New-VenueFlavorPair.ps1"), "-ClassicReceipt", str(paths["classic"]), "-CinematicReceipt", str(paths["cinematic"]),
                             "-OutDir", str(base / "pair")]
                     if trio:
@@ -1255,6 +1279,9 @@ class Successor2Tests(unittest.TestCase):
             "both": self._b2_receipt_text('"displayPath": 5, "DisplayPath": {}').replace('"outcome": "PASS"', '"outcome": "PASS", "Outcome": "FAIL"'),
             "good": self._b2_receipt_text('"displayPath": ' + json.dumps(good_block())),
             "two casings": self._b2_receipt_text(self.B2_TAILS["two casings"]),
+            # r2 adversary A2 / A3: nested one-element arrays, and a block deeper than 256 levels, still reach the typed verdict
+            "nested arrays, reserved member": "[[" + self._b2_receipt_text(self.B2_TAILS["reserved member"]) + "]]",
+            "deep reserved member": self._b2_receipt_text('"displayPath": {"PSObject": 1, "x": ' + '{"x": ' * 257 + "0" + "}" * 257 + "}"),
         }
         got = pwsh_json("$in = $env:DVE_TEXTS | ConvertFrom-Json -AsHashtable\n$out = [ordered]@{}\n"
                         "foreach ($k in @($in.Keys)) { try { $r = ConvertFrom-DvReceiptText -Text $in[$k]; $v = Test-DvReceiptValid -Receipt $r -ReceiptText $in[$k]\n"
@@ -1263,7 +1290,8 @@ class Successor2Tests(unittest.TestCase):
         for label in ("outcome twice", "venue name twice", "both"):
             self.assertEqual(got[label], "threw", f"{label}: {got[label]}")
         self.assertEqual(got["good"], {"outcome": "PASS", "venue": "bachelor", "displayPath": "present"}, got)
-        self.assertEqual(got["two casings"], {"outcome": "PASS", "venue": "bachelor", "displayPath": "malformed"}, got)
+        for label in ("two casings", "nested arrays, reserved member", "deep reserved member"):
+            self.assertEqual(got[label], {"outcome": "PASS", "venue": "bachelor", "displayPath": "malformed"}, f"{label}: {got[label]}")
 
     def test_successor3_r2_b2_no_receipt_file_reader_parses_the_text_outside_the_display_path_reader(self) -> None:
         """SUCCESSOR-3 r1 sol B2, the class: every receipt file the three validating readers read is parsed by ConvertFrom-DvReceiptText, never piped straight
