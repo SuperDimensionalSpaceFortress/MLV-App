@@ -6136,19 +6136,28 @@ function Test-DvReceiptValid {
     if ($display.state -cne 'malformed' -and $PSBoundParameters.ContainsKey('ReceiptText')) {
         $dups = Get-DvJsonDuplicateKeys -Text $ReceiptText
         if ($null -eq $dups) { $display = [pscustomobject]@{ state = 'malformed'; problems = @('the receipt text cannot be read for duplicate keys') } }
+        # SUCCESSOR-3 W2 (SUCCESSOR-2 adversary A2): ConvertFrom-Json unwraps a one-element root array, so its record would be judged while every scanned path starts `$[0]`;
+        # a receipt is ONE JSON object, so any other root is malformed
+        elseif (-not (Test-DvJsonTextIsObject -Text $ReceiptText)) { $display = [pscustomobject]@{ state = 'malformed'; problems = @('the receipt text is not one JSON object') } }
         else {
-            $hit = @($dups | Where-Object { [string]::Equals($_, '$.venue', [System.StringComparison]::Ordinal) -or (Test-DvJsonPathUnder $_ '$.venue.displayPath') })
+            # SUCCESSOR-3 W2 (A2): PowerShell reads `Venue` / `DisplayPath` as venue / displayPath, so the scope is matched without regard to case (Test-DvJsonPathUnder)
+            $hit = @($dups | Where-Object { [string]::Equals($_, '$.venue', [System.StringComparison]::OrdinalIgnoreCase) -or (Test-DvJsonPathUnder $_ '$.venue.displayPath') })
             if ($hit.Count -gt 0) { $display = [pscustomobject]@{ state = 'malformed'; problems = @('duplicate key ' + ($hit -join ', ')) } }
         }
     }
     $coreArgs = @{}
     foreach ($e in $PSBoundParameters.GetEnumerator()) { if (-not [string]::Equals($e.Key, 'ReceiptText', [System.StringComparison]::OrdinalIgnoreCase)) { $coreArgs[$e.Key] = $e.Value } }
-    try { $result = Test-DvReceiptValidCore @coreArgs }
-    catch {
-        # a good (or absent) block keeps the core's own throw, so the writer still types it DVE_EVIDENCE_VALIDATION_IO; a malformed one reports BOTH reasons, each its own
-        if ($display.state -cne 'malformed') { throw }
-        $io = ([string]$_.Exception.Message) -replace '\s+', ' '
-        $result = [pscustomobject]@{ valid = $false; status = 'INVALID'; reasons = @("EVIDENCE_VALIDATION_IO: the core validator could not complete: $io"); unbound = @(); evidenceDir = $null; legType = $null }
+    # SUCCESSOR-3 W0 (hosted heavy 3/14 on 4d4db9cd): a `try` changes what a statement error inside the core does. Without one up the stack, a failing statement (the blanket
+    # revocation filter over an empty blanket list) writes its error and the core goes on to its own verdict (CONSENT_REVOKED); inside one, it unwinds to the catch. So a
+    # good (or absent) block calls the core exactly as a caller did before this wrapper existed: no `try` here, and the core's own throw still reaches the caller.
+    if ($display.state -cne 'malformed') { $result = Test-DvReceiptValidCore @coreArgs }
+    else {
+        # a malformed block reports BOTH reasons, each its own, when the core's proof I/O cannot complete (SUCCESSOR-2 W6)
+        try { $result = Test-DvReceiptValidCore @coreArgs }
+        catch {
+            $io = ([string]$_.Exception.Message) -replace '\s+', ' '
+            $result = [pscustomobject]@{ valid = $false; status = 'INVALID'; reasons = @("EVIDENCE_VALIDATION_IO: the core validator could not complete: $io"); unbound = @(); evidenceDir = $null; legType = $null }
+        }
     }
     if ($display.state -ceq 'malformed') {
         $result.reasons = @('DISPLAY_PATH_MALFORMED: venue.displayPath: ' + ($display.problems -join '; ')) + @($result.reasons)
@@ -6653,9 +6662,43 @@ function Get-DvJsonDuplicateKeys {
 }
 
 function Test-DvJsonPathUnder {
-    # $Path is $Root or a member / element under it (ordinal)
+    # $Path is $Root or a member / element under it. SUCCESSOR-3 W2 (SUCCESSOR-2 adversary A2): without regard to case, because PowerShell reads a member that way
+    # (`$.Venue.DisplayPath` is the block a reader judges); the names are compared ordinally otherwise, so no culture folds two different names together.
     param([string]$Path, [string]$Root)
-    [string]::Equals($Path, $Root, [System.StringComparison]::Ordinal) -or $Path.StartsWith($Root + '.', [System.StringComparison]::Ordinal) -or $Path.StartsWith($Root + '[', [System.StringComparison]::Ordinal)
+    $c = [System.StringComparison]::OrdinalIgnoreCase
+    [string]::Equals($Path, $Root, $c) -or $Path.StartsWith($Root + '.', $c) -or $Path.StartsWith($Root + '[', $c)
+}
+
+function Test-DvJsonTextIsObject {
+    # SUCCESSOR-3 W2 (A2): the text's root is one JSON object (ConvertFrom-Json unwraps a one-element root array to its record, so the parsed value cannot say)
+    param([AllowEmptyString()][string]$Text)
+    try {
+        $opt = [System.Text.Json.JsonDocumentOptions]::new()
+        $opt.MaxDepth = 256; $opt.AllowTrailingCommas = $true; $opt.CommentHandling = [System.Text.Json.JsonCommentHandling]::Skip
+        $doc = [System.Text.Json.JsonDocument]::Parse($Text, $opt)
+    } catch { return $false }
+    try { $doc.RootElement.ValueKind -eq [System.Text.Json.JsonValueKind]::Object } finally { $doc.Dispose() }
+}
+
+function Get-DvJsonRootObjectWithout {
+    # SUCCESSOR-3 W1 (SUCCESSOR-2 adversary A4): the JSON text of a root OBJECT without its members named $Name in any letter case, or $null when the text is not one
+    # JSON object. The probe line's own fields are read from this when only its displayPath stops ConvertFrom-Json (two casings, a member named PSObject).
+    param([AllowEmptyString()][string]$Text, [string]$Name)
+    try {
+        $opt = [System.Text.Json.JsonDocumentOptions]::new()
+        $opt.MaxDepth = 256; $opt.AllowTrailingCommas = $true; $opt.CommentHandling = [System.Text.Json.JsonCommentHandling]::Skip
+        $doc = [System.Text.Json.JsonDocument]::Parse($Text, $opt)
+    } catch { return $null }
+    try {
+        if ($doc.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $null }
+        $ms = [System.IO.MemoryStream]::new()
+        $w = [System.Text.Json.Utf8JsonWriter]::new($ms)
+        $w.WriteStartObject()
+        foreach ($p in $doc.RootElement.EnumerateObject()) { if (-not [string]::Equals($p.Name, $Name, [System.StringComparison]::OrdinalIgnoreCase)) { $p.WriteTo($w) } }
+        $w.WriteEndObject()
+        $w.Flush()
+        [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
+    } finally { $doc.Dispose() }
 }
 
 function Test-DvDisplayPathHasMember {
@@ -6862,11 +6905,22 @@ function ConvertFrom-DvProbeStdout([string]$Stdout) {
         if ($line.StartsWith('DVE_PROBE=')) {
             $json = $line.Substring('DVE_PROBE='.Length)
             $probe = $null
-            try { if ($raw) { $probe = ($json | ConvertFrom-Json -DateKind String) } else { $probe = ($json | ConvertFrom-Json) } } catch { return $null }
-            # SUCCESSOR-2 W2 (pass-2 A3): a duplicate key at displayPath or anywhere inside it (or text the duplicate check cannot read) is a malformed block, never the last copy
+            $blockStoppedParse = $false
+            try { if ($raw) { $probe = ($json | ConvertFrom-Json -DateKind String) } else { $probe = ($json | ConvertFrom-Json) } }
+            catch {
+                # SUCCESSOR-3 W1 (SUCCESSOR-2 adversary A4): two casings of displayPath, or a member named PSObject inside it, make ConvertFrom-Json throw. The block is the
+                # venue's display path and never the leg's health, so the probe's own fields are read without it and the block is malformed. A probe that still cannot be
+                # read (its own fields are bad) stays no probe, as before.
+                $rest = Get-DvJsonRootObjectWithout -Text $json -Name 'displayPath'
+                if ($null -eq $rest) { return $null }
+                try { if ($raw) { $probe = ($rest | ConvertFrom-Json -DateKind String) } else { $probe = ($rest | ConvertFrom-Json) } } catch { return $null }
+                $blockStoppedParse = $true
+            }
+            # SUCCESSOR-2 W2 (pass-2 A3): a duplicate key at displayPath or anywhere inside it (or text the duplicate check cannot read) is a malformed block, never the last copy.
+            # SUCCESSOR-3 W2 (A2): in any letter case (Test-DvJsonPathUnder), and a line whose root is not one object (a one-element array ConvertFrom-Json unwraps) too
             if ($probe -is [System.Management.Automation.PSCustomObject]) {
                 $dups = Get-DvJsonDuplicateKeys -Text $json
-                if ($null -eq $dups -or @($dups | Where-Object { Test-DvJsonPathUnder $_ '$.displayPath' }).Count -gt 0) {
+                if ($blockStoppedParse -or $null -eq $dups -or -not (Test-DvJsonTextIsObject -Text $json) -or @($dups | Where-Object { Test-DvJsonPathUnder $_ '$.displayPath' }).Count -gt 0) {
                     Add-Member -InputObject $probe -NotePropertyName displayPath -NotePropertyValue ([ordered]@{ state = 'unknown'; reason = 'probe-block-malformed' }) -Force
                 }
             }
