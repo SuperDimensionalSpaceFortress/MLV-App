@@ -5,6 +5,8 @@
 #include "../common/repo_paths.h"
 
 #include "../../platform/qt/PlaybackPresentTrace.h"
+#include "../../platform/qt/PlaybackFpsMeterPolicy.h"
+#include "../../platform/qt/PlaybackFrameRange.h"
 
 #include <QFile>
 #include <QString>
@@ -128,6 +130,64 @@ TEST(PlaybackPresentTrace, AHoldIsNotAnAdvanceAndANewPlayStartsClean)
     ASSERT_NEAR(0.0, trace.rows()[0].intervalMs, 1e-9);
 }
 
+// PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r7 (sol r6 blocker on 9f3f5ebd): the trace decided "advanced" from equal endpoints,
+// so a capped Drop Frame tick whose whole laps land back on its start lost its advance and its shaped interval. Sol's
+// literal repro: 24 fps, Drop Frame + Loop, cut 1..616, start 0, no pending advance, an unpaced (or fully credited) grant,
+// a 41666300 ms shaped tick. The cap asks for 41666250 ms = 999990 frames, which is 1626 laps of 615: position 0 -> 0.
+TEST(PlaybackPresentTrace, AWholeLapDropFrameTickIsAnAdvanceWithItsShapedInterval)
+{
+    const int shapedTickMs = 41666300;
+    const int cappedMs = playback_fps_meter::frameBoundedTickTimeDiffMs(shapedTickMs, 24.0);
+    ASSERT_EQ(41666250, cappedMs);
+    const double request = playback_fps_meter::dropFrameRequestFrames(24.0, cappedMs);
+    ASSERT_NEAR(999990.0, request, 0.0);
+    const playback_frame_range::DropFrameTickResult tick =
+        playback_frame_range::advanceDropFrameTick(0.0, request, 1, 616, true, false);
+    ASSERT_TRUE(tick.wrapped);
+    ASSERT_EQ(615, tick.wrapWidth);
+    ASSERT_EQ(1626, tick.wrapLaps);
+    ASSERT_NEAR(0.0, tick.position, 0.0);   // the endpoints are equal
+    // MainWindow's grantedDropFrames: the advance the tick applied
+    const double granted = tick.position - 0.0 + tick.foldedFrames + static_cast<double>(tick.wrapWidth) * tick.wrapLaps;
+    ASSERT_NEAR(999990.0, granted, 0.0);
+
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(1000.0, 4);
+    trace.noteTick(1008.0, false, false);
+    trace.noteAdvance(1008.5, 0.0, tick.position, shapedTickMs);
+    Row r;
+    r.presentMs = 1020.0;
+    trace.notePresent(r);
+    ASSERT_EQ(static_cast<size_t>(1), trace.rows().size());
+    ASSERT_EQ(1, trace.rows()[0].advances);
+    ASSERT_NEAR(8.5, trace.rows()[0].lastAdvanceMs, 1e-9);
+    ASSERT_NEAR(41666300.0, trace.rows()[0].lastTickDiffMs, 0.0);   // the shaped interval, never the capped request
+    ASSERT_NEAR(999990.0, trace.rows()[0].advancedFrames, 0.0);     // "the source frames those advances granted"
+}
+
+// r7 (sol r6 INV-5 row 2): equal endpoints with no grant stay a hold, the same repro shape with a zero request.
+TEST(PlaybackPresentTrace, AZeroGrantOnEqualEndpointsIsStillAHold)
+{
+    const playback_frame_range::DropFrameTickResult tick =
+        playback_frame_range::advanceDropFrameTick(0.0, 0.0, 1, 616, true, false);
+    ASSERT_FALSE(tick.wrapped);
+    ASSERT_NEAR(0.0, tick.position, 0.0);
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(1000.0, 4);
+    trace.noteTick(1008.0, false, false);
+    trace.noteAdvance(1008.5, 0.0, tick.position, 8);
+    Row r;
+    r.presentMs = 1020.0;
+    trace.notePresent(r);
+    ASSERT_EQ(static_cast<size_t>(1), trace.rows().size());
+    ASSERT_EQ(0, trace.rows()[0].advances);
+    ASSERT_NEAR(-1.0, trace.rows()[0].lastAdvanceMs, 1e-9);
+    ASSERT_NEAR(0.0, trace.rows()[0].lastTickDiffMs, 0.0);
+    ASSERT_NEAR(0.0, trace.rows()[0].advancedFrames, 0.0);
+}
+
 TEST(PlaybackPresentTrace, ARowHasOneFieldPerHeaderColumn)
 {
     Recorder trace;
@@ -160,4 +220,40 @@ TEST(PlaybackPresentTraceWiring, ReadOnceFromTheEnvironmentAndEveryHookIsGuarded
     const int dump = source.indexOf(QStringLiteral("\"playback_smoke.present_trace session=%1 row=%2\""));
     ASSERT_TRUE(stop >= 0);
     ASSERT_TRUE(dump > stop);
+}
+
+// r7 (sol r6 blocker on 9f3f5ebd): the trace is handed the tick's APPLIED grant, which playbackHandling clears on entry and
+// sets on each of its three grant paths (the outer Loop wrap, the Normal-mode whole frame, the Drop Frame tick), so an
+// advance is never inferred from equal endpoints alone.
+TEST(PlaybackPresentTraceWiring, TheAdvanceIsTheTicksAppliedGrantNotItsEndpoints)
+{
+    const QString source = mainWindowSource();
+    ASSERT_EQ(1, source.count(QStringLiteral(
+        "    if( m_playbackPresentTrace.active() )\n"
+        "        m_playbackPresentTrace.noteAdvance( mlv_stage_timing_now() * 1000.0, tracePositionBefore, m_newPosDropMode, "
+        "m_playbackTickAppliedFrames, shapedTickMs );")));
+    const int handlingAt = source.indexOf(QStringLiteral("void MainWindow::playbackHandling(int timeDiff)\n{\n"));
+    ASSERT_TRUE(handlingAt >= 0);
+    const int handlingEnd = source.indexOf(QStringLiteral("void MainWindow::showPerformanceProfilingDialog"), handlingAt);
+    ASSERT_TRUE(handlingEnd > handlingAt);
+    const QString handling = source.mid(handlingAt, handlingEnd - handlingAt);
+    // cleared first, before any early return
+    ASSERT_TRUE(handling.contains(QStringLiteral(
+        "gui_present_gap::OtherBusySpan::PlaybackHandling );\n    m_playbackTickAppliedFrames = 0.0;\n")));
+    ASSERT_EQ(4, handling.count(QStringLiteral("m_playbackTickAppliedFrames = ")));
+    const int wrapGrantAt = handling.indexOf(QStringLiteral(
+        "if( !m_playbackPaceGuard.grantLoopWrap( paceNowMs, playbackPaceGuardFps() ) ) return;"));
+    const int wrapSetAt = handling.indexOf(QStringLiteral("m_playbackTickAppliedFrames = 1.0;"));
+    const int wholeGrantAt = handling.indexOf(QStringLiteral(
+        "if( !m_playbackPaceGuard.grantWholeFrame( paceNowMs, playbackPaceGuardFps() ) ) return;"));
+    const int wholeSetAt = handling.indexOf(QStringLiteral(
+        "m_playbackTickAppliedFrames = ui->horizontalSliderPosition->value() - sourcePositionBeforeTick;"));
+    const int dropGrantedAt = handling.indexOf(QStringLiteral("const double grantedDropFrames = "));
+    const int dropSetAt = handling.indexOf(QStringLiteral("m_playbackTickAppliedFrames = grantedDropFrames;"));
+    ASSERT_TRUE(wrapGrantAt >= 0);
+    ASSERT_TRUE(wrapSetAt > wrapGrantAt);
+    ASSERT_TRUE(wholeGrantAt > wrapSetAt);
+    ASSERT_TRUE(wholeSetAt > wholeGrantAt);
+    ASSERT_TRUE(dropGrantedAt > wholeSetAt);
+    ASSERT_TRUE(dropSetAt > dropGrantedAt);
 }
