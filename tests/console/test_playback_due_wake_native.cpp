@@ -2784,7 +2784,19 @@ struct R3A3RecordSample
     double handlerStartMs = -1.0;
     double handlerEndMs = -1.0;
     std::vector<std::pair<double, double>> spansS;
+    // adversary pass 1 A1 on aa2d1ab8: the sample's cadence (the product's own exit record met the 150 ms, and this thread's own
+    // one-sided bracket of the call), judged AFTER the record: a lost tag on a sleep whose exit also failed is the typed loss
+    bool cadenceMet = true;
+    qint64 sleptMs = 150;
 };
+
+// The R3A3 sample's cadence: on the product's own exit record (SEAM-1 adversary pass A3) and on this thread's own one-sided bracket
+// of the call (pass 2 A1: a pause only lengthens it). Judged on every sample, before the retry filter, after the dispatch record.
+void r3a3JudgeCadence( bool observedMet, qint64 sleptMs )
+{
+    ASSERT_TRUE( observedMet );
+    ASSERT_TRUE( static_cast<double>( sleptMs ) >= dueWakeSleepFloorMs( 150.0 ) );
+}
 
 // CI-FLAKE-R17A1-SPAN-LOSS-TYPED-VERDICT-1 r1 (sol r2 B1): the live R3A3 accounting of one sample, called by the live loop and by
 // the native REDs below. An observed tag no recorded span contains reaches R3A3_LITERAL_DISPATCH_RECORD_LOST (and onLoss, the
@@ -2813,8 +2825,13 @@ void r3a3AccountDispatchRecord( const R3A3RecordSample &s, const std::function<v
             ASSERT_TRUE( inOneSpan );
         }
     };
-    const bool lengthFirst = dueWakeRedSpanLossOrder();               // c52f385c's order, opt-in RED replay only
-    if( lengthFirst ) accountRecord();
+    // c52f385c's order, opt-in RED replay only: the cadence, then the record, then the typed loss
+    const bool lengthFirst = dueWakeRedSpanLossOrder();
+    if( lengthFirst )
+    {
+        r3a3JudgeCadence( s.cadenceMet, s.sleptMs );
+        accountRecord();
+    }
     if( r3a3LiteralRecord( s.tagSeenMs, s.spansS ) == R3A3LiteralRecord::Lost )
     {
         std::string spansText;
@@ -2826,7 +2843,11 @@ void r3a3AccountDispatchRecord( const R3A3RecordSample &s, const std::function<v
         onLoss();
         ::minitest::fail( __FILE__, __LINE__, "R3A3_LITERAL_DISPATCH_RECORD_LOST", detail );
     }
-    if( !lengthFirst ) accountRecord();
+    if( !lengthFirst )
+    {
+        accountRecord();
+        r3a3JudgeCadence( s.cadenceMet, s.sleptMs );                  // pass 1 A1: after the typed loss and the record
+    }
 }
 
 // What r3a3AccountDispatchRecord did with one literal row: whether it failed, its message, and whether the dispatch cleanup ran.
@@ -2836,13 +2857,16 @@ struct R3A3AccountOutcome
     std::string message;
     bool cleanedUp = false;
 };
-R3A3AccountOutcome r3a3AccountRow( double tagSeenMs, size_t counted, int calls, const std::vector<std::pair<double, double>> &spansS )
+R3A3AccountOutcome r3a3AccountRow( double tagSeenMs, size_t counted, int calls, const std::vector<std::pair<double, double>> &spansS,
+                                   bool cadenceMet = true, qint64 sleptMs = 150 )
 {
     R3A3RecordSample sample;
     sample.tagSeenMs = tagSeenMs;
     sample.counted = counted;
     sample.calls = calls;
     sample.spansS = spansS;
+    sample.cadenceMet = cadenceMet;
+    sample.sleptMs = sleptMs;
     R3A3AccountOutcome outcome;
     try
     {
@@ -2858,6 +2882,14 @@ R3A3AccountOutcome r3a3AccountRow( double tagSeenMs, size_t counted, int calls, 
 bool r3a3TypedLoss( const R3A3AccountOutcome &outcome )
 {
     return outcome.failed && outcome.cleanedUp && outcome.message.find( "R3A3_LITERAL_DISPATCH_RECORD_LOST" ) != std::string::npos;
+}
+// A row that must reach the typed loss and its cleanup; otherwise it fails naming what the accounting did instead (its own message).
+void r3a3RequireTypedLoss( const R3A3AccountOutcome &outcome )
+{
+    if( r3a3TypedLoss( outcome ) ) return;
+    ::minitest::fail( __FILE__, __LINE__, "R3A3_ROW_MISSED_THE_TYPED_LOSS",
+                      std::string( "failed=" ) + ( outcome.failed ? "1" : "0" ) + " cleaned_up=" + ( outcome.cleanedUp ? "1" : "0" )
+                          + " accounting_said=" + outcome.message );
 }
 }
 
@@ -2898,9 +2930,7 @@ TEST(PlaybackDueWakeSend, R3A3_SpanLoss_TagSeenCount1NoSpansReachesTheTypedLossA
 {
     // sol r2 INV-1: tag=8.2, count=1, spans=[], calls=0 (the span append dropped, the count kept)
     const R3A3AccountOutcome outcome = r3a3AccountRow( 8.2, 1, 0, {} );
-    ASSERT_TRUE( outcome.failed );
-    ASSERT_TRUE( outcome.message.find( "R3A3_LITERAL_DISPATCH_RECORD_LOST" ) != std::string::npos );
-    ASSERT_TRUE( outcome.cleanedUp );
+    r3a3RequireTypedLoss( outcome );
     ASSERT_TRUE( outcome.message.find( "counted=1 calls=0 spans_ms=)" ) != std::string::npos );
 }
 
@@ -2908,17 +2938,32 @@ TEST(PlaybackDueWakeSend, R3A3_SpanLoss_TagSeenCount2OneUnrelatedSpanReachesTheT
 {
     // sol r2 INV-1: tag=8.2, count=2, spans=[[22,22.2]], calls=0 (the tagged dispatch's span dropped, both counts kept)
     const R3A3AccountOutcome outcome = r3a3AccountRow( 8.2, 2, 0, { { 0.022, 0.0222 } } );
-    ASSERT_TRUE( outcome.failed );
-    ASSERT_TRUE( outcome.message.find( "R3A3_LITERAL_DISPATCH_RECORD_LOST" ) != std::string::npos );
-    ASSERT_TRUE( outcome.cleanedUp );
+    r3a3RequireTypedLoss( outcome );
     ASSERT_TRUE( outcome.message.find( "counted=2 calls=0 spans_ms=[" ) != std::string::npos );
+}
+
+// adversary pass 1 A1 on aa2d1ab8, its input (RED flags unset, request 150 ms, tag 8.2, count 1, calls 0, spans [], exit
+// WaitFailed so the product's exit record misses the 150 ms): the cadence assert threw before the typed loss and its cleanup.
+// Its two cadence checks, one registration each: the exit record not met, and this thread's bracket short (120 ms < 134 ms).
+TEST(PlaybackDueWakeSend, R3A3_SpanLoss_ALostTagOnASleepWhoseExitRecordFailedStillReachesTheTypedLoss)
+{
+    r3a3RequireTypedLoss( r3a3AccountRow( 8.2, 1, 0, {}, false, 150 ) );
+}
+
+TEST(PlaybackDueWakeSend, R3A3_SpanLoss_ALostTagOnAShortBracketStillReachesTheTypedLoss)
+{
+    r3a3RequireTypedLoss( r3a3AccountRow( 8.2, 1, 0, {}, true, 120 ) );
 }
 
 TEST(PlaybackDueWakeSend, R3A3_SpanLoss_TheRowsThatAlreadyReachedTheTypedLossStillDo)
 {
     // sol r2 INV-1 passing rows: tag=8.2, count=1, spans=[[22,22.2]] and tag=8.2, count=0, spans=[] (calls=0 both)
-    ASSERT_TRUE( r3a3TypedLoss( r3a3AccountRow( 8.2, 1, 0, { { 0.022, 0.0222 } } ) ) );
-    ASSERT_TRUE( r3a3TypedLoss( r3a3AccountRow( 8.2, 0, 0, {} ) ) );
+    r3a3RequireTypedLoss( r3a3AccountRow( 8.2, 1, 0, { { 0.022, 0.0222 } } ) );
+    r3a3RequireTypedLoss( r3a3AccountRow( 8.2, 0, 0, {} ) );
+    // pass 1 A1: a whole record still faces the cadence after it: a healthy record on a failed exit or a short bracket fails
+    ASSERT_TRUE( r3a3AccountRow( 8.2, 1, 0, { { 0.0081, 0.0083 } }, false, 150 ).failed );
+    ASSERT_TRUE( r3a3AccountRow( 8.2, 1, 0, { { 0.0081, 0.0083 } }, true, 120 ).failed );
+    ASSERT_FALSE( r3a3AccountRow( 8.2, 1, 0, { { 0.0081, 0.0083 } }, true, 150 ).failed );
 }
 
 TEST(PlaybackDueWakeSend, R3A3_SpanLoss_ARecordedOrUnseenTagStillFacesTheCountOrderAndHandlerChecks)
@@ -3134,8 +3179,9 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
         sleepReturned = true;
         sleptMs = t.elapsed();
         sender.join();
-        ASSERT_TRUE( dueWakeObserveSleep( wake, 150.0 ).met );        // SEAM-1 adversary pass A3: every sample, before the retry filter
-        ASSERT_TRUE( static_cast<double>( sleptMs ) >= dueWakeSleepFloorMs( 150.0 ) );   // pass 2 A1: this thread's own one-sided bracket too
+        // SEAM-1 adversary pass A3: every sample's cadence, before the retry filter; pass 2 A1: this thread's own one-sided bracket
+        // too. Adversary pass 1 A1 on aa2d1ab8: both are judged inside r3a3AccountDispatchRecord, AFTER the typed loss and the record
+        const bool cadenceMet = dueWakeObserveSleep( wake, 150.0 ).met;
         // CI-FLAKE-R17A1-FOREIGN-FIRST-FLOOR-1 r5 class sweep (adversary pass 11 A1): a sample whose handler ran, or whose product
         // count or span record shows a dispatch, has its dispatch record accounted BEFORE any retry gate below may discard it (the
         // ExpiredAfterDispatch and short-rest gates retried a handler-ran sample with spans []): the spans are exactly the product's
@@ -3155,6 +3201,8 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
             record.handlerStartMs = foreign.handlerStartMs;
             record.handlerEndMs = foreign.handlerEndMs;
             record.spansS = wake.lastRunnerSleepDispatchSpansS();
+            record.cadenceMet = cadenceMet;
+            record.sleptMs = sleptMs;
             r3a3AccountDispatchRecord( record, [&wake]() {
                 wake.setGuiTraceActive( false );
                 MSG drain;                                            // the missed send, so it reaches no later sleep
