@@ -2020,6 +2020,28 @@ function Add-PlanIdentity([object]$Row, [object]$Leg) {
     foreach ($k in 'name', 'arm', 'backend', 'sourceCommit', 'buildManifestSha256') { $Row | Add-Member -NotePropertyName $k -NotePropertyValue $Leg.$k -Force }
 }
 
+function Get-BatchLegSpecRefusal([string]$Stdout, [object]$Leg) {
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r5 (sol r4 B2): a launched leg child that refused its spec after the final guard (bytes changed, or unreadable, after the
+    # preflight judged them) says so on the real leg's anchored whole-line STDOUT record naming THIS leg's planned sha256 (Invoke-VenueLeg.ps1, before anything is generated,
+    # submitted or receipted). Read from the child's own captured stdout only (never stderr, never the .out.txt transcript, whose write may fail), so the persisted row carries it.
+    # $null when there is none, or when the leg was bound to no planned hash.
+    $planned = [string]$Leg.specSha256
+    if ($planned -cnotmatch '^[0-9a-f]{64}$') { return $null }
+    $lines = @($Stdout -split "`r?`n")
+    if (@($lines | Where-Object { $_ -cmatch '^DVE_RECEIPT_PATH=' }).Count -gt 0) { return $null }   # a child that wrote a receipt ran: never a refusal
+    foreach ($l in $lines) {
+        if ($l -cmatch '^DVE_LEG_SPEC_REFUSED planned_sha256=(?<p>[0-9a-f]{64}) read_sha256=(?<r>[0-9a-f]{64})$' -and $Matches['p'] -ceq $planned) { return [pscustomobject]@{ code = 'DVE_BATCH_SPEC_CHANGED'; line = "DVE_BATCH_SPEC_CHANGED leg=$($Leg.name) planned_sha256=$($Matches['p']) read_sha256=$($Matches['r'])" } }
+        if ($l -cmatch '^DVE_LEG_SPEC_UNREADABLE planned_sha256=(?<p>[0-9a-f]{64})$' -and $Matches['p'] -ceq $planned) { return [pscustomobject]@{ code = 'DVE_BATCH_SPEC_UNREADABLE'; line = "DVE_BATCH_SPEC_UNREADABLE leg=$($Leg.name) planned_sha256=$($Matches['p'])" } }
+    }
+    $null
+}
+
+function Add-LegSpecRefusal([object]$Batch, [object]$Refusal) {
+    # r5 (sol r4 B2): the refusal's typed code on the leg's persisted rows (the batch receipt's and the run result's), set before any log append of that leg's end
+    if ($null -eq $Refusal) { return }
+    foreach ($r in @($Batch.legs[$Batch.legs.Count - 1], $results[$results.Count - 1])) { $r | Add-Member -NotePropertyName specRefusal -NotePropertyValue ([string]$Refusal.code) -Force }
+}
+
 function Format-Mean($m) { if ($null -eq $m) { 'UNKNOWN' } else { '{0:0.0}' -f $m } }
 
 function Get-ProbeLaunchVerdict([int]$MaxWaitSec) {
@@ -3173,6 +3195,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $legBoundSec = [int][Math]::Max(1, [Math]::Floor(($leaseEnd - [DateTime]::UtcNow).TotalSeconds))
                 # adversary r7 A2: Process.Start failing (a command line past 32767 characters, a missing exe) throws a Win32Exception before any child exists: the leg stays NOT_RUN.
                 $inFlightLeg = $leg   # adversary r5 pass 2 A2: marked at the launch itself, so a throw while the RUN line was logged leaves a leg that never started NOT_RUN
+                $lp = $null   # BATCH-3 r5 (sol r4 B2 sibling): the BATCH_ERROR catch reads THIS leg's child only, never an earlier leg's return
                 try { $lp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $lArgs -TimeoutSec $legBoundSec } catch {
                     if ($_.Exception -is [ComponentModel.Win32Exception] -or $_.Exception.InnerException -is [ComponentModel.Win32Exception]) { $inFlightLeg = $null }
                     throw
@@ -3206,6 +3229,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $dl = $legLines | Where-Object { $_ -match '^DVE_DETAIL=' } | Select-Object -Last 1
                 $detail = $(if ($dl) { ($dl -replace '^DVE_DETAIL=', '').Trim() } else { '' })
                 $legJobId = @(Get-VenueRemoteJobIds -Text $text | Where-Object { $_ -and $_ -cnotmatch '-health$' }) | Select-Object -Last 1
+                # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r5 (sol r4 B2): a child that wrote no receipt may have refused its spec on its own typed STDOUT record; read here, from the
+                # child's captured stdout, for BOTH exit branches below (timed out at the lease's end, or exited non-zero), and carried in the persisted row (Add-LegSpecRefusal)
+                $legSpecRefusal = $(if (-not $receipt) { Get-BatchLegSpecRefusal ([string]$lp.stdout) $leg } else { $null })
                 if ($lp.timedOut) {
                     # Still running at the lease's end: killed with its tree. Never counted and never re-run (a leg that outlives a whole lease is not retried lease
                     # after lease). Its agent job is asked to cancel too, in case the agent's own bound has not stopped it yet. The batch ends: its lease is over.
@@ -3213,9 +3239,11 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEASE_EXPIRED'; outcome = 'INVALID'; class = 'LEASE_EXPIRED'; counted = $false; printedOutcome = $outcome; jobId = $legJobId; legSec = $legSec; legBoundSec = $legBoundSec; cancel = $cx.state; heatAtProbe = $th.firstHeat; heatAtProbeText = $th.firstHeatText }   # r6 (adversary r6 A2): a launched row keeps the reading the spread measures heavy keys from
                     $b.legs.Add([pscustomobject]$row); Add-Result $leg 'LEASE_EXPIRED' $row; $pending.RemoveAt(0)
                     Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
+                    Add-LegSpecRefusal $b $legSpecRefusal   # r5 (sol r4 B2): on the persisted rows before any append
                     # b2 r1 (pass 8 A4): what happened to the child is said as it happened (a late self-exit was not killed; a kill that threw is not confirmed)
                     $legEnd = Format-VenueBoundedChildEnd $lp $legBoundSec
                     $b.endReason = 'LEASE_EXPIRED'; $b.endDetail = "leg $($leg.name) did not finish inside the lease ($legSec s, bound $legBoundSec s): it $legEnd; job $legJobId cancel=$($cx.state)$(if ($cx.error) { " ($($cx.error))" })"
+                    if ($legSpecRefusal) { LogBest "$($legSpecRefusal.line) (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)" }   # best effort: the row already carries it
                     L "LEG $($leg.name) LEASE_EXPIRED batch=$batchNo legSec=$legSec boundSec=$legBoundSec outcome=INVALID counted=False jobId=$legJobId cancel=$($cx.state) (at the lease's end it $legEnd)"
                     if ($exitCode -eq 0) { $exitCode = 7 }
                     break
@@ -3234,6 +3262,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEG_FAILED'; outcome = 'INVALID'; printedOutcome = $outcome; legExit = $legCode; jobId = $legJobId; counted = $false; legSec = $legSec; heatAtProbe = $th.firstHeat; heatAtProbeText = $th.firstHeatText }
                     $b.legs.Add([pscustomobject]$row); Add-Result $leg 'LEG_FAILED' $row; $pending.RemoveAt(0)
                     Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
+                    Add-LegSpecRefusal $b $legSpecRefusal   # r5 (sol r4 B2): on the persisted rows before any append
+                    if ($legSpecRefusal) { LogBest "$($legSpecRefusal.line) (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)" }   # best effort: the row already carries it
                     L "LEG $($leg.name) LEG_FAILED batch=$batchNo exit=$legCode outcome=INVALID printedOutcome=$outcome (the leg exited non-zero: no usable receipt)"
                     if ($exitCode -eq 0) { $exitCode = 7 }
                     continue
@@ -3350,6 +3380,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $ith = $legThermal[$inFlightLeg.name]; if ($null -ne $ith) { $row['heatAtProbe'] = $ith.firstHeat; $row['heatAtProbeText'] = $ith.firstHeatText }   # r6 (adversary r6 A2)
                 $b.legs.Add([pscustomobject]$row); Add-Result $inFlightLeg 'LEG_FAILED' $row; $null = $pending.Remove($inFlightLeg)
                 Add-PlanIdentity $b.legs[$b.legs.Count - 1] $inFlightLeg
+                # BATCH-3 r5 (sol r4 B2 sibling): a child that returned its typed spec refusal before the throw keeps it on this row too
+                if ($null -ne $lp) { Add-LegSpecRefusal $b (Get-BatchLegSpecRefusal ([string]$lp.stdout) $inFlightLeg) }
             }
         } catch { }
         LogBest "BATCH_ERROR batch=$batchNo $($b.endDetail)"   # a batch.log another process holds must not turn the typed stop back into an unhandled throw

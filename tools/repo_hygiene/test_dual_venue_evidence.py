@@ -7074,6 +7074,60 @@ exit 0
         proc, planned, _ = self.b3r4_supp_run("delete")
         self.assert_b3r4_supp_refusal_survives(proc, "DVE_CHAIN_SPEC_UNREADABLE", planned)
 
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r5 (sol r4 B1, DC-07): the supplementary child's refusal was read only when its status was FAILED. A child that printed its
+    # authentic refusal record on stdout, wrote no receipt and was observed past its bound (Invoke-VenueBoundedProcess: timedOut, lateExit, stdout complete) ended
+    # TIMEOUT / INVALID with no specRefusal and no typed line, while the primary leg's timeout branch keeps the same record. The fixture runs the real refusing child and
+    # marks its return as observed past the bound; the result must carry the typed refusal, recorded before any log append, and its line must reach stdout.
+    B3R5_SUPP_TIMEOUT_ANCHOR = ("        $sr = $(if ($null -ne $suppDeadline) { Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $sArgs -TimeoutSec $capSec -DeadlineUtc $suppDeadline -MinRoomSec 60 }"
+                                " else { Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $sArgs -TimeoutSec $capSec })\n")
+
+    def b3r5_supp_timeout_run(self, mode: str) -> tuple[subprocess.CompletedProcess, str, str]:
+        late = (self.B3R5_SUPP_TIMEOUT_ANCHOR, self.B3R5_SUPP_TIMEOUT_ANCHOR
+                + "        if (-not $sr.notStarted -and $sr.exit -ne 0) { $sr.timedOut = $true; $sr.lateExit = $true; $sr.exit = $null }   # TEST FIXTURE: observed past its bound, stdout complete\n")
+        dv, spec, twin, um_share = self.r4_supp_fixture([("Invoke-VenueChain.ps1", *late)])
+        planned, twin_sha = hashlib.sha256(spec.read_bytes()).hexdigest(), hashlib.sha256(twin.read_bytes()).hexdigest()
+        fx = self.chain_fixture(dv, spec, twin, mode=mode, venue="ultra-magnus")   # the bytes change (or vanish) at the first ultra-magnus probe, after the Bachelor leg ran
+        return self.run_fixture_chain(dv, fx, ["-LegSpec", str(spec), "-SupplementaryAgentShare", str(um_share)]), planned, twin_sha
+
+    def assert_b3r5_supp_timeout_refusal_survives(self, proc: subprocess.CompletedProcess, want: str, planned: str) -> str:
+        out = proc.stdout.splitlines()
+        results = [l for l in out if l.startswith("CHAIN_RESULT=")]
+        self.assertEqual(len(results), 1, proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 0, "the Bachelor leg ran; a supplementary leg never decides the exit\n" + proc.stdout + proc.stderr)
+        result = json.loads(results[0][len("CHAIN_RESULT="):])
+        self.assertEqual([(r["status"], r["outcome"], r.get("timedOut"), r.get("specRefusal")) for r in result["supplementary"]], [("TIMEOUT", "INVALID", True, want)],
+                         "the timed-out supplementary result lost its typed refusal (old: no specRefusal)\n" + json.dumps(result["supplementary"]))
+        self.assertTrue(any(" SUPPLEMENTARY_TIMEOUT " in l for l in out), "the fixture really made the supplementary child a timeout\n" + proc.stdout)
+        typed = [l for l in out if f" {want} " in l and "role=supplementary" in l]
+        self.assertEqual(len(typed), 1, "the typed supplementary refusal never reached stdout (old: zero typed lines on TIMEOUT)\n" + proc.stdout + proc.stderr)
+        self.assertIn(f"planned_sha256={planned}", typed[0])
+        return typed[0]
+
+    def test_planned_hash_bind_b3_r5_b1_supp_a_timed_out_child_with_a_changed_spec_record_stays_typed(self) -> None:
+        proc, planned, twin_sha = self.b3r5_supp_timeout_run("copy")
+        typed = self.assert_b3r5_supp_timeout_refusal_survives(proc, "DVE_CHAIN_SPEC_CHANGED", planned)
+        self.assertIn(f"read_sha256={twin_sha}", typed)
+
+    def test_planned_hash_bind_b3_r5_b1_supp_a_timed_out_child_with_an_unreadable_spec_record_stays_typed(self) -> None:
+        proc, planned, _ = self.b3r5_supp_timeout_run("delete")
+        self.assert_b3r5_supp_timeout_refusal_survives(proc, "DVE_CHAIN_SPEC_UNREADABLE", planned)
+
+    def test_planned_hash_bind_b3_r5_b1_supp_control_an_unchanged_spec_under_the_timeout_fixture_is_not_a_refusal(self) -> None:
+        """Control: under the same fixture, a supplementary child on unchanged bytes (mtime only) prints no refusal record and exits 0, so it stays RAN: no specRefusal."""
+        proc, _, _ = self.b3r5_supp_timeout_run("touch")
+        result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
+        self.assertEqual([(r["status"], r.get("specRefusal")) for r in result["supplementary"]], [("RAN", None)], json.dumps(result["supplementary"]))
+        self.assertFalse([l for l in proc.stdout.splitlines() if "DVE_CHAIN_SPEC_" in l], proc.stdout)
+
+    def test_planned_hash_bind_b3_r5_b1_supp_the_refusal_is_read_on_every_non_ran_status_before_any_log_append(self) -> None:
+        """Static pin: the supplementary refusal is read on every status but RAN (FAILED and TIMEOUT), and Add-SuppResult runs before the SUPPLEMENTARY_REMOTE_JOB append."""
+        text = (DV / "Invoke-VenueChain.ps1").read_text(encoding="utf-8")
+        self.assertIn("$sSpecRefusal = $(if ($sStatus -cne 'RAN' -and -not $sReceipt) { Get-LegSpecRefusalLine $sLines $Leg } else { '' })", text)
+        start = text.index("function Invoke-SupplementaryCore")
+        body = text[start:text.index("function Invoke-Supplementary(", start)]
+        self.assertNotIn('L "SUPPLEMENTARY_REMOTE_JOB leg=', body, "the remote-job line is appended only after the result (old: appended inside the TIMEOUT block, before it)")
+        self.assertLess(body.index("Add-SuppResult $Leg $Trigger $sStatus $extra"), body.index("if ($rjLine) { L $rjLine }"), "the result is recorded before the remote-job append")
+
     # r3 (adversary pass 2 on 5ef85bc6, A1): the chain read its leg child's outcome, receipt and spec refusal back from <RunDir>\leg-<name>.out.txt, and its probes' verdicts
     # from quiet-<name>-<phase>.out.txt. Two chains on one -RunDir (two venues) name a leg alike, so another chain's child could write that file between this child's exit
     # and this parent's read. The fixture writes it there (the other chain's transcript) right after this child exits; the chain must classify from its OWN child's output.

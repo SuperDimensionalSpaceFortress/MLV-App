@@ -529,7 +529,9 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
         try { if ($sReceipt -and (Test-Path -LiteralPath $sReceipt -PathType Leaf)) { $sRole = [string](([IO.File]::ReadAllText($sReceipt) | ConvertFrom-Json).venue.role) } } catch { }
         $sStatus = $(if ($sr.timedOut) { 'TIMEOUT' } elseif ($sr.exit -ne 0) { 'FAILED' } else { 'RAN' })
         # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1: a supplementary child that refused other bytes than the planned ones says so on its own typed line (classified from its stdout only)
-        $sSpecRefusal = $(if ($sStatus -ceq 'FAILED' -and -not $sReceipt) { Get-LegSpecRefusalLine $sLines $Leg } else { '' })
+        # BATCH-3 r5 (sol r4 B1): read on EVERY status but RAN, as the primary leg's branch reads it: a child that printed its record, wrote no receipt and was observed past its
+        # bound (TIMEOUT, its stdout complete) lost the refusal when only FAILED was read
+        $sSpecRefusal = $(if ($sStatus -cne 'RAN' -and -not $sReceipt) { Get-LegSpecRefusalLine $sLines $Leg } else { '' })
         # (r2, adversary A5: the label's log write may fail; it never replaces the observed child failure recorded by Add-SuppResult below)
         # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r4 (adversary pass 5 A4): the child is classified above from its own captured stdout BEFORE its transcript is written, and the write is
         # the bounded, non-throwing Write-ChainEvidence (a read-only or stalled file used to throw here and turn the typed refusal into SUPPLEMENTARY_ERROR, or hold the claim release)
@@ -537,23 +539,26 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
         if ($sw -cne 'OK') { Write-ChainDiagnostic "SUPPLEMENTARY_OUT_WRITE_$sw leg=$($Leg.name) path=$sOut (evidence only: the supplementary child is classified from its own captured output)" }
         # BATCH-3 r4 (sol r3 B1): the spec-refusal label is written AFTER the result below records specRefusal, through Write-ChainLineNoThrow, as the primary leg's label is. Its
         # old fallback was the stderr-only Write-ChainDiagnostic, which is silent when the compiled writer is unavailable: a FAILED append of the label then lost the typed line,
-        # and the result never carried the refusal. (A refusal comes only from a FAILED child, so the TIMEOUT block's append below never runs before it.)
+        # and the result never carried the refusal. r5 (sol r4 B1): a TIMEOUT child's refusal is read too, so the TIMEOUT block below only reads the remote job's state and keeps
+        # its SUPPLEMENTARY_REMOTE_JOB line for AFTER the result: no log append runs before the result records specRefusal, on either status.
         # Whatever the leg printed, a leg that died or timed out is INVALID evidence, never a measurement (the Bachelor rule); and nothing here is read as a timing verdict.
         $shownOutcome = $(if ($sStatus -ceq 'RAN') { $sOutcome } else { 'INVALID' })
         $extra = @{ quietVerdict = $sq.verdict; quietMean = $sq.mean; outcome = $shownOutcome; printedOutcome = $sOutcome; legExit = $sr.exit; timedOut = $sr.timedOut; receipt = $sReceipt; receiptRole = $sRole
             umManifestSha256 = $built.sha256; elapsedSec = [int]([DateTime]::UtcNow - $t0s).TotalSeconds; outcomeDetail = $sDetail }
         if ($sSpecRefusal) { $extra.specRefusal = ($sSpecRefusal -split ' ', 2)[0] }   # the typed code, as the primary result's specRefusal
+        $rjLine = ''
         if ($sr.timedOut) {
             # The client was killed, the job it submitted was not: keep the job's identity (what the client printed before it went silent) and reconcile it BEFORE the venue is read as idle.
             # No id printed = nothing to look up = the venue is busy-or-unknown, never open. The claim is still released below; it is not the proof.
             $rjIds = $script:suppRemote.jobIds   # kept above, where the guard was armed at the timeout
             $rjs = Get-VenueRemoteJobState -AgentShare $share -JobId $rjIds -TimeoutSec 30
             $extra.remoteJobIds = $rjIds; $extra.remoteJobState = $rjs.state; $extra.venueIdle = ($rjs.state -ceq 'FINISHED')
-            L "SUPPLEMENTARY_REMOTE_JOB leg=$($Leg.name) jobId=$(Format-RemoteJobIds $rjIds) state=$($rjs.state) venueIdle=$($extra.venueIdle)$(if ($rjs.error) { " reason=$($rjs.error)" }) venue=$suppVenue role=supplementary (a released claim is not proof of idleness; later offers reconcile this first)"
+            $rjLine = "SUPPLEMENTARY_REMOTE_JOB leg=$($Leg.name) jobId=$(Format-RemoteJobIds $rjIds) state=$($rjs.state) venueIdle=$($extra.venueIdle)$(if ($rjs.error) { " reason=$($rjs.error)" }) venue=$suppVenue role=supplementary (a released claim is not proof of idleness; later offers reconcile this first)"
             if ($rjs.state -ceq 'FINISHED') { $script:suppRemote = $null } else { $script:suppRemote.state = $rjs.state }
         }
         Add-SuppResult $Leg $Trigger $sStatus $extra
         if ($sSpecRefusal) { Write-ChainLineNoThrow "$sSpecRefusal venue=$suppVenue role=supplementary (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)" }   # r4: stdout, counted
+        if ($rjLine) { L $rjLine }   # r5 (sol r4 B1): after the result and the typed refusal, never before them
         L "LEG $($Leg.name) SUPPLEMENTARY_$sStatus venue=$suppVenue role=supplementary trigger=$Trigger exit=$($sr.exit) outcome=$shownOutcome printedOutcome=$sOutcome receipt=$sReceipt receiptRole=$sRole quietVerdict=$($sq.verdict) quietMean=$(Format-Mean $sq.mean)$(if ($sDetail) { " detail=$sDetail" }) (supplementary: no timing verdict, no effect on the chain result)"
         $st.done = $true
     } finally { L "SUPPLEMENTARY_CLAIM_RELEASED leg=$($Leg.name) venue=$suppVenue result=$(Release-VenueClaim -Venue $suppVenue -Nonce $req.claim.nonce -ClaimDir $ClaimDir)" }

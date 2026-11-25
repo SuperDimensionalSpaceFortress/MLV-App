@@ -425,6 +425,12 @@ $leaf = [IO.Path]::GetFileNameWithoutExtension($LegSpec)
 $held = [bool]($env:FAKE_CLAIM_PATH -and (Test-Path -LiteralPath $env:FAKE_CLAIM_PATH))
 Add-Content -LiteralPath $env:FAKE_EVENTS -Value ("{0} LEG {1} leaseBatch={2} claimHeld={3}" -f [DateTime]::UtcNow.Ticks, $leaf, $LeaseBatch, $held)
 $jobId = "dve-$leaf-$Venue-cpu-2026102300000$k$(if ($LeaseBatch) { "-lb$LeaseBatch" })"
+# BATCH-3 r5 (sol r4 B2): FAKE_LEG_MODES specrefused | specunreadable | specrefusedhang = the real leg's own typed refusal (Invoke-VenueLeg.ps1: the anchored STDOUT record for
+# the planned hash it was handed) BEFORE any job id, submission or receipt; exit 6 (specrefusedhang: the record, then still running at the lease's end)
+$specMode = Pick $env:FAKE_LEG_MODES $k 'ok'
+if ($specMode -eq 'specrefused') { [Console]::Out.WriteLine("DVE_LEG_SPEC_REFUSED planned_sha256=$ExpectSpecSha256 read_sha256=$('b' * 64)"); [Console]::Out.Flush(); exit 6 }
+if ($specMode -eq 'specunreadable') { [Console]::Out.WriteLine("DVE_LEG_SPEC_UNREADABLE planned_sha256=$ExpectSpecSha256"); [Console]::Out.Flush(); exit 6 }
+if ($specMode -eq 'specrefusedhang') { [Console]::Out.WriteLine("DVE_LEG_SPEC_REFUSED planned_sha256=$ExpectSpecSha256 read_sha256=$('b' * 64)"); [Console]::Out.Flush(); Start-Sleep -Seconds 150; exit 6 }
 [Console]::Out.WriteLine("DVE_JOB_ID=$jobId-health"); [Console]::Out.WriteLine("DVE_JOB_ID=$jobId"); [Console]::Out.Flush()
 # r3: FAKE_LEG_MODES per call: ok | exit3 (died without a receipt) | hang (still running at lease end: it starts a grandchild, records both pids, and sleeps)
 $legMode = Pick $env:FAKE_LEG_MODES $k 'ok'
@@ -9380,6 +9386,52 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         per = json.loads((self.run_dir / "batch-01.json").read_text(encoding="utf-8"))
         self.assertEqual([(l["name"], l["status"]) for l in per["legs"]], [("01-fx-a-cpu-A", "LEG_FAILED")], per["legs"])
         self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r5 (sol r4 B2, DC-07): a bound batch child that refused its spec after the final guard (the real leg's anchored STDOUT record
+    # naming the planned hash, exit 6, no receipt and no job id) was persisted as the same generic LEG_FAILED / INVALID row as an empty stdout: the record lived only in the
+    # leg's .out.txt transcript, and a transcript the writer could not write (here: a folder squatting on its name, LEG_OUT_WRITE_FAILED) lost it. The refusal is now read
+    # from the child's own captured stdout and carried in the persisted row itself (specRefusal), on both post-launch exit branches, with a typed line on stdout.
+    def b3r5_batch_refusal_run(self, mode: str, *extra: str, **env: str) -> tuple[subprocess.CompletedProcess, str]:
+        import hashlib
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        (self.run_dir / "leg-01-fx-a-cpu-A-b01-a1.out.txt").mkdir()   # the transcript writer cannot replace this name: LEG_OUT_WRITE_FAILED
+        planned = hashlib.sha256(self.specs[0].read_bytes()).hexdigest()
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), *extra, FAKE_LEG_MODES=mode, **env)
+        self.assertIn("LEG_OUT_WRITE_FAILED leg=01-fx-a-cpu-A", r.stderr, "the fixture really made the transcript write fail\n" + r.stderr)
+        return r, planned
+
+    def assert_b3r5_batch_row_typed(self, r: subprocess.CompletedProcess, planned: str, status: str, want: str | None) -> None:
+        self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual([(l["name"], l["status"], l["outcome"], l.get("specRefusal")) for l in res["legs"]], [("01-fx-a-cpu-A", status, "INVALID", want)],
+                         "the batch result row lost the typed refusal (old: the generic row of an empty stdout)\n" + json.dumps(res["legs"]))
+        per = json.loads((self.run_dir / "batch-01.json").read_text(encoding="utf-8"))
+        self.assertEqual([(l["status"], l.get("specRefusal")) for l in per["legs"]], [(status, want)], "the persisted per-batch row carries it too\n" + json.dumps(per["legs"]))
+        typed = [l for l in r.stdout.splitlines() if " DVE_BATCH_SPEC_" in l]
+        if want is None:
+            self.assertEqual(typed, [], r.stdout)
+        else:
+            self.assertEqual(len(typed), 1, "the typed refusal never reached stdout\n" + r.stdout)
+            self.assertIn(f" {want} leg=01-fx-a-cpu-A planned_sha256={planned}", typed[0])
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+
+    def test_planned_hash_bind_b3_r5_b2_batch_a_changed_spec_refusal_survives_a_failed_transcript_write(self) -> None:
+        r, planned = self.b3r5_batch_refusal_run("specrefused")
+        self.assert_b3r5_batch_row_typed(r, planned, "LEG_FAILED", "DVE_BATCH_SPEC_CHANGED")
+        self.assertIn(f"read_sha256={'b' * 64}", [l for l in r.stdout.splitlines() if " DVE_BATCH_SPEC_" in l][0])
+
+    def test_planned_hash_bind_b3_r5_b2_batch_an_unreadable_spec_refusal_survives_a_failed_transcript_write(self) -> None:
+        r, planned = self.b3r5_batch_refusal_run("specunreadable")
+        self.assert_b3r5_batch_row_typed(r, planned, "LEG_FAILED", "DVE_BATCH_SPEC_UNREADABLE")
+
+    def test_planned_hash_bind_b3_r5_b2_batch_control_a_child_that_dies_with_no_record_is_not_a_refusal(self) -> None:
+        r, planned = self.b3r5_batch_refusal_run("exit3")
+        self.assert_b3r5_batch_row_typed(r, planned, "LEG_FAILED", None)
+
+    def test_planned_hash_bind_b3_r5_b2_batch_a_refusal_from_a_child_killed_at_the_lease_end_stays_typed(self) -> None:
+        # a lease that ends while the child still runs (it sleeps 150 s), with room for the plan's re-read after the open (the 60 s leg budget, its minimum, plus 1 s)
+        r, planned = self.b3r5_batch_refusal_run("specrefusedhang", FAKE_LEASE_REMAIN="72")
+        self.assert_b3r5_batch_row_typed(r, planned, "LEASE_EXPIRED", "DVE_BATCH_SPEC_CHANGED")
 
     def test_r5_adv_a2_a_staged_build_the_leg_job_would_reject_is_refused_before_the_claim_and_the_lease(self) -> None:
         # adversary r5 A2: preflight read the staged manifest's sha256 only. The leg job's validator (Assert-AttrCudaBuildManifest) also needs the manifest to declare
