@@ -24,6 +24,7 @@ tools/profiling/run-local-cuda-playback-dng-smoke.ps1 | query-only
 tools/profiling/run-release-cuda-playback-ab.ps1 | query-only
 tools/profiling/run-release-gui-smoke.ps1 | query-only
 tools/profiling/ultra-magnus-agent.ps1 | query-only
+tools/release-runtime-admission.psm1 | query-only
 tools/testing/test-ultra-magnus-agent-heavy-slot-fifo.ps1 | query-only
 tools/testing/test-ultra-magnus-agent-quiet-lease.ps1 | query-only
 tools/testing/test-ultra-magnus-agent-timeout.ps1 | query-only

@@ -11,12 +11,15 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import stat
+import subprocess
 import sys
 import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .hidden_spawn import no_window_flags
 from .vendored_native_payloads import (
     DEFAULT_MANIFEST,
     ArchiveView,
@@ -30,8 +33,76 @@ from .vendored_native_payloads import (
     _safe_member_name,
     _sha256_file,
     _sha256_stream,
+    _validate_archive,
+    _validate_policy,
+    _validate_provenance,
     validate_manifest,
 )
+
+
+def _require_literally_tracked(repo_root: Path, relative: str, label: str) -> None:
+    """The EXACT path ``relative`` is one stage-0 regular file in the Git index (PR 862 r11, adversary fa89f1b3-A4, bf1ac39c-A3).
+
+    ``git ls-files -- <path>`` treats the path as a glob, so ``platform/qt/[F]Fmpeg/ffmpegWin64.zip`` matched the tracked
+    ``platform/qt/FFmpeg/ffmpegWin64.zip`` while an untracked copy at the literal bracket path was the file opened. The pathspec here
+    is ``:(literal)`` and the one returned row must name exactly ``relative``.
+    """
+    try:
+        tracked = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-files", "-z", "--error-unmatch", "--stage", "--", f":(literal){relative}"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=no_window_flags(),
+        )
+    except OSError as exc:
+        raise PayloadIntegrityError(f"{label} cannot verify Git tracking: {exc}") from exc
+    _require(tracked.returncode == 0, f"{label} must be Git-tracked at exactly this path: {relative}")
+    rows = [row for row in tracked.stdout.split(b"\0") if row]
+    _require(len(rows) == 1 and b"\t" in rows[0], f"{label} Git index entry is ambiguous: {relative}")
+    head, name = rows[0].split(b"\t", 1)
+    fields = head.split()
+    _require(name == relative.encode("utf-8"), f"{label} Git index entry names {name!r}, not exactly {relative!r}")
+    _require(len(fields) == 3 and fields[0] in {b"100644", b"100755"} and fields[2] == b"0",
+             f"{label} must be a stage-0 regular file in the Git index: {relative}")
+
+
+def load_record_only_snapshot(
+    repo_root: Path,
+    manifest_path: Path,
+    payload_id: str,
+    archive_reference: str,
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    """Validate ONLY the named active record, never the repository-wide tracked-file census.
+
+    EXPORT-PRORES-FFMPEG-EXE-PACKAGE-1 (adversary ae560106-A2): ``validate_manifest`` enumerates every
+    Git-tracked file and opens a 512-byte prefix of each one, owner clip fixtures included, so a local
+    packaging install that ran it read media and failed when an unrelated fixture was locked. This mode
+    reads the manifest, its policy, and the one record's archive (size, sha256, Git tracking, member
+    summary and limits) and selected members (size, sha256, binary format, machine and kind). The hosted
+    workflows keep the full validation; they never pass ``--record-only``.
+    """
+    manifest_file = manifest_path if manifest_path.is_absolute() else repo_root / manifest_path
+    try:
+        raw = manifest_file.read_bytes()
+    except OSError as exc:
+        raise PayloadIntegrityError(f"cannot read payload manifest {manifest_file}: {exc}") from exc
+    manifest_sha256 = hashlib.sha256(raw).hexdigest()
+    manifest = _parse_manifest_bytes(raw, str(manifest_file))
+    _require(manifest.get("schema_version") == 1, "payload manifest schema_version must be 1")
+    policy = _validate_policy(manifest.get("integrity_policy"))
+    record = _record_for_id(manifest, payload_id)
+    # PR 862 r11 (adversary fa89f1b3-A5): the caller's archive reference is checked BEFORE any file named by the record is read, so a
+    # record whose path names another tracked file (a clip fixture, a script) is refused without opening it. Then the exact path must
+    # be tracked (literal pathspec, fa89f1b3-A4), and only then is the archive read and validated.
+    label = str(record.get("id") or "payload")
+    relative = _manifest_path(record.get("path"), label)
+    _require(PurePosixPath(relative).name == archive_reference,
+             f"{label} archive reference mismatch: expected {PurePosixPath(relative).name!r}, got {archive_reference!r}")
+    _require_literally_tracked(repo_root, relative, f"{label} archive")
+    _validate_archive(repo_root, record, policy, selected=True, require_tracked=True)
+    _validate_provenance(record)
+    return manifest, record, manifest_sha256
 
 
 def load_validated_manifest_snapshot(
@@ -113,11 +184,23 @@ def _publish_staged_transaction(
     output_dir: Path,
     *,
     verify_installed: bool,
+    transaction_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Publish every staged file or restore every original destination."""
+    """Publish every staged file or restore every original destination (all-or-nothing, unchanged from the base).
+
+    The rollback assumes one install per output folder at a time: it has no lock against a concurrent install sharing the
+    folder (pre-existing; adversary 32501f50-A1's Python sibling, listed OPEN in PR 862 for a locking successor card).
+
+    With ``transaction_id`` the transaction folder is ``.vendored-payload-transaction-<id>``, created exclusively, so a
+    wrapper that kills this process can put back exactly its originals and no other install's (adversary 78d626ed-A1).
+    """
     label = str(record.get("id") or "payload")
     try:
-        transaction_dir = Path(tempfile.mkdtemp(prefix=".vendored-payload-transaction-", dir=output_dir))
+        if transaction_id is None:
+            transaction_dir = Path(tempfile.mkdtemp(prefix=".vendored-payload-transaction-", dir=output_dir))
+        else:
+            transaction_dir = output_dir / f".vendored-payload-transaction-{transaction_id}"
+            transaction_dir.mkdir()
     except OSError as exc:
         raise PayloadIntegrityError(f"{label} cannot create publication transaction: {exc}") from exc
 
@@ -187,6 +270,7 @@ def extract_payload_record(
     *,
     archive_reference: str,
     verify_installed: bool = False,
+    transaction_id: str | None = None,
 ) -> dict[str, Any]:
     """Revalidate, stage, and atomically replace all selected outputs."""
     label = str(record.get("id") or "payload")
@@ -266,6 +350,7 @@ def extract_payload_record(
             record,
             output_dir,
             verify_installed=verify_installed,
+            transaction_id=transaction_id,
         )
     finally:
         for temporary, _, _ in staged:
@@ -291,16 +376,24 @@ def extract_payload(
     *,
     archive_reference: str,
     verify_installed: bool = False,
+    record_only: bool = False,
+    transaction_id: str | None = None,
 ) -> dict[str, Any]:
     repo_root = repo_root.resolve()
-    manifest, manifest_sha256 = load_validated_manifest_snapshot(repo_root, manifest_path)
-    record = _record_for_id(manifest, payload_id)
+    _require(transaction_id is None or re.fullmatch(r"[0-9a-f]{32}", transaction_id) is not None,
+             f"transaction id must be 32 lowercase hex characters: {transaction_id!r}")
+    if record_only:
+        _, record, manifest_sha256 = load_record_only_snapshot(repo_root, manifest_path, payload_id, archive_reference)
+    else:
+        manifest, manifest_sha256 = load_validated_manifest_snapshot(repo_root, manifest_path)
+        record = _record_for_id(manifest, payload_id)
     result = extract_payload_record(
         repo_root,
         record,
         output_dir,
         archive_reference=archive_reference,
         verify_installed=verify_installed,
+        transaction_id=transaction_id,
     )
     result["manifest_sha256"] = manifest_sha256
     return result
@@ -316,6 +409,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--verify-installed", action="store_true",
                         help="rehash and re-identify the installed files after atomic replacement")
+    parser.add_argument("--record-only", action="store_true",
+                        help="validate only the named payload record (archive and member bytes, binary identity), "
+                             "never the repository-wide tracked-file census; for local packaging installs")
+    parser.add_argument("--transaction-id", default=None,
+                        help="32 lowercase hex characters naming the publication transaction folder, so a wrapper that "
+                             "kills this process can restore exactly its originals")
     args = parser.parse_args(argv)
     try:
         result = extract_payload(
@@ -325,6 +424,8 @@ def main(argv: list[str] | None = None) -> int:
             args.output_dir,
             archive_reference=args.archive_reference,
             verify_installed=args.verify_installed,
+            record_only=args.record_only,
+            transaction_id=args.transaction_id,
         )
     except (OSError, PayloadIntegrityError) as exc:
         print(f"vendored native payload extraction: FAIL: {exc}", file=sys.stderr)
