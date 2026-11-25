@@ -322,8 +322,8 @@ inline DropFrameTickResult advanceDropFrameTick( double currentPosition, double 
 inline double dropFrameCorrectedStart( double currentPosition, int cutInValue, int cutOutValue, bool loopEnabled,
                                        bool presentLastFrame )
 {
-    (void)cutInValue; (void)cutOutValue; (void)loopEnabled; (void)presentLastFrame;
-    return currentPosition;   // RED stub: today's reading (the stale start)
+    // the tick's own correctedStart, which depends on the start alone (the fold and the clamp never read the delta)
+    return advanceDropFrameTick( currentPosition, 0.0, cutInValue, cutOutValue, loopEnabled, presentLastFrame ).correctedStart;
 }
 
 // r1: the frame a corrected start sits on (the slider's frame for it), floor, held inside int; not a number reads 0.

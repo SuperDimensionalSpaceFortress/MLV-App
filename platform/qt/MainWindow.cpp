@@ -13343,15 +13343,21 @@ void MainWindow::playbackHandling(int timeDiff)
                 // (adversary A1 on d98be193): with no present outstanding (an invalidation, an idle renderer) nothing holds. r28
                 // (CoS B1 on c4efe7e3): the gate keys off the frame on SCREEN; an accepted frame whose present drawFrameReady has
                 // not dispatched, or that the non-inline prep still holds (pending, in flight, unconsumed), is still to come.
+                // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1 iteration 2 (adversary pass 2 A2 on 7de55386): the conform shaping
+                // and its target gate read the start the delta moves FROM, the corrected one (a stale start folded into the
+                // Loop cut or clamped onto its last frame); the tick itself reads the stale position, so it reports the correction.
+                const double dropFrameStart = playback_frame_range::dropFrameCorrectedStart(
+                    m_newPosDropMode, ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(), ui->actionLoop->isChecked(),
+                    playbackConformActive() );
                 const playback_frame_range::DropFrameTickResult dropFrameTick =
                     playback_frame_range::advanceDropFrameTick(
                         m_newPosDropMode,
                         playback_frame_range::conformDropFrameDelta(
-                            m_newPosDropMode,
+                            dropFrameStart,
                             m_playbackPaceGuard.grant( playback_fps_meter::dropFrameRequestFrames( getPlaybackFramerate(), timeDiff ), paceNowMs, playbackPaceGuardFps() ),
                             playbackConformActive(), m_conformDropDebtFrames,
                             playback_frame_range::conformTargetShown(
-                                m_lastPresentedPlaybackFrame, conformDisplayedPlaybackFrame(), m_newPosDropMode,
+                                m_lastPresentedPlaybackFrame, conformDisplayedPlaybackFrame(), dropFrameStart,
                                 conformAcceptedTargetPresentPending(), conformTargetPresentOutstanding() ) ),
                         ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
                         ui->actionLoop->isChecked(),
