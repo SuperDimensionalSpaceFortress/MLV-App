@@ -433,10 +433,14 @@ public:
     }
 
     /*! r2 iteration 2 (adversary pass 4 A2 on b30cd3a1): the measured Play's stop pinned the slider back to the presented frame
-     *  \a frame. (RED stub: inert.) */
+     *  \a frame. The corrections that frame's request never crossed leave the timeline with it: the timeline-side sum becomes the
+     *  display side's and the unlanded moves are dropped, so the end position is paired with its own corrections (a pinned 480
+     *  after an unlanded 480 -> 1000 correction is 480 frames of travel, never 480 - 520). */
     void noteTimelinePinnedToDisplay( int frame )
     {
-        (void)frame;
+        m_correctedFrames = m_displayCorrectedFrames;
+        m_correctionMoves.resize( m_correctionMovesLanded );
+        m_timelinePosition = frame;
     }
 
     /*! A contact-sheet grab of \a grabMs ran on the GUI thread; it is charged to the next present's interval. */
@@ -504,6 +508,13 @@ public:
         // 4 slips, as 10 -> 15 is): only what the engine travelled from it is slips, a landing ON it is neither a slip nor a repeat,
         // and a lap after it is a wrap.
         if( s.rebase ) m_lastDisplayFrame = s.rebaseFrame;
+        // r2 iteration 2 (adversary pass 4 A3 on b30cd3a1): the first present's jump was passed BEFORE the correction; a rebased
+        // interval's skips are after it, so the jump is startup catch-up of its own and never covers them.
+        if( s.rebase && m_presents == 2 && m_firstPresentJumpFrames > 0 )
+        {
+            m_startupCatchupFrames += m_firstPresentJumpFrames;
+            m_firstPresentJumpFrames = 0;
+        }
         int slip = 0;
         if( ( s.rebase && s.rebaseLapped ) || s.displayFrame < m_lastDisplayFrame )
         {

@@ -31297,6 +31297,9 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         // The internal-advance guard avoids a second generation invalidation;
         // the play-stop transition performs the single authoritative fence.
         m_playbackInternalSliderAdvance = true;
+        // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2 iteration 2 (adversary pass 4 A2 on b30cd3a1): the write-back takes the timeline to
+        // the PRESENTED frame, so the corrections its request never crossed leave with it (timeline_delta pairs it with its own)
+        m_playbackSlipHistogram.noteTimelinePinnedToDisplay( static_cast<int>( displayFrame ) );
         ui->horizontalSliderPosition->setValue(
             static_cast<int>( displayFrame ) );
         m_playbackInternalSliderAdvance = false;
