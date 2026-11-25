@@ -20360,10 +20360,23 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         doc.update(top)
         return doc
 
+    @staticmethod
+    def png_bytes(shade: int = 0) -> bytes:
+        """A real 2x2 RGB PNG (signature, IHDR, IDAT, IEND, each with its CRC-32): the bytes Get-DvPngImageProblem accepts (r2, sol r1 finding 3)."""
+        import struct
+        import zlib
+
+        def chunk(kind: bytes, data: bytes) -> bytes:
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+        rows = b"".join(b"\x00" + bytes([shade % 256, 64, 128]) * 2 for _ in range(2))
+        return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
     def metrics(self, pb: dict | None = None, app="default", criteria=None, *, png: str = "all", sha: str = "good", leg: str | None = None):
         """Get-DvCriteriaMetrics over a JSON playback block and the tail evidence Get-DvTailVisualEvidence reads from an evidence directory holding `app` as
-        visual\\app-visual.json (`app` None: no file) and the leg-named PNGs of its saved rows (`png` 'all' | 'none' | 'first-missing'); `sha` is the digest
-        the receipt stores ('good' | 'wrong' | 'absent'). Test-DvCriteria over `criteria` if given."""
+        visual\\app-visual.json (`app` None: no file; `app` bytes: written verbatim) and the leg-named PNGs of its saved rows (`png` 'all' | 'none' |
+        'first-missing' | 'stub' (the 5 bytes 89 50 4e 47 00) | 'empty'); `sha` is the digest the receipt stores ('good' | 'wrong' | 'absent').
+        Test-DvCriteria over `criteria` if given."""
         pb = {**self.PB, **(pb or {})}
         doc = self.app_json() if isinstance(app, str) else app
         with tempfile.TemporaryDirectory() as d:
@@ -20371,16 +20384,19 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
             vis.mkdir()
             digest = "0" * 64
             if doc is not None:
-                raw = json.dumps(doc).encode("utf-8")
+                raw = doc if isinstance(doc, bytes) else json.dumps(doc).encode("utf-8")
                 (vis / "app-visual.json").write_bytes(raw)
                 digest = hashlib.sha256(raw).hexdigest()
+                parsed = json.loads(raw.decode("utf-8-sig", errors="ignore")) if isinstance(doc, bytes) else doc
+                rows = (parsed[0] if isinstance(parsed, list) and parsed else parsed).get("frames") if isinstance(parsed, (dict, list)) and parsed else None
                 if png != "none":
-                    for row in doc["frames"] if isinstance(doc.get("frames"), list) else []:
+                    for row in rows if isinstance(rows, list) else []:
                         if not isinstance(row, dict) or row.get("kind") not in ("play", "play_unbound") or not isinstance(row.get("index"), int):
                             continue
                         if png == "first-missing" and row["index"] == 0:
                             continue
-                        (vis / f"{leg or self.LEG}-{row['kind'].replace('_', '-')}-{row['index']}.png").write_bytes(b"\x89PNG" + bytes([row["index"]]))
+                        body = {"stub": b"\x89PNG\x00", "empty": b""}.get(png, self.png_bytes(row["index"]))
+                        (vis / f"{leg or self.LEG}-{row['kind'].replace('_', '-')}-{row['index']}.png").write_bytes(body)
             stored = {"good": digest, "wrong": "f" * 64, "absent": ""}[sha]
             proc, out = run_pwsh_json(
                 "$pb = $env:DVE_PB | ConvertFrom-Json\n"
@@ -20402,7 +20418,7 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         self.assertEqual((m["conformTailUnpaintedAtCloseFrames"], m["conformTailInFlightCreditedFrames"], m["conformTailUnpaintedFrames"]), (2, 1, 1), out)
         self.assertNotIn("conformFrozenTailFrames", m, out)
         self.assertTrue(out["v"]["pass"], out)
-        self.assertIn("display frame 479", m["conformTailInFlightCreditNote"], out)
+        self.assertIn("display frame(s) 479", m["conformTailInFlightCreditNote"], out)
         self.assertIn("not shown", m["conformTailInFlightCreditNote"], out)
 
     def test_a_single_held_target_the_tail_shows_leaves_nothing_unpainted(self) -> None:
@@ -20455,14 +20471,15 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
             "play_active is the string true": ({}, self.app_json(play(0, play_active="true")), "no play capture"),
             "a paused capture": ({}, self.app_json(play(0, kind="paused")), "no play capture"),
             "a kind with a zero-width suffix": ({}, self.app_json(play(0, kind="play​")), "no play capture"),
-            "display frame short of the last target": ({}, self.app_json(play(0, display_frame=478)), "no play capture"),
+            # r2 (sol r1 finding 5): a capture showing 478 exactly now credits 478 (test_r2_...); 477 is the last painted frame, before every in-flight target
+            "display frame before every in-flight target": ({}, self.app_json(play(0, display_frame=477)), "no play capture"),
             "display frame a string": ({}, self.app_json(play(0, display_frame="479")), "no play capture"),
             "tail time a string": ({}, self.app_json(play(0, tail_elapsed_ms="Infinity")), "no play capture"),
             "no tail time": ({}, self.app_json(play(0, tail_elapsed_ms=None)), "no play capture"),
             "a negative tail time": ({}, self.app_json(play(0, tail_elapsed_ms=-1)), "no play capture"),
             "a prepared result replaced before": ({"prepReplacedBefore": 1}, "default", "was replaced"),
             "a prepared result replaced after": ({"prepReplacedAfter": 1}, "default", "was replaced"),
-            "a drop that is not a generation change": ({"prepStaleDrops": 2}, "default", "exceeds prep_generation_drops"),
+            "a drop that is not a generation change": ({"prepStaleDrops": 2}, "default", "differs from prep_generation_drops"),
             "prep counters absent": ({"prepStaleDrops": None}, "default", "no readable non-negative prepStaleDrops"),
             "negative counter": ({"prepReplacedBefore": -1}, "default", "no readable non-negative prepReplacedBefore"),
         }
@@ -20548,7 +20565,8 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         self.assertIsNotNone(stored)
         for field in ("prepReplacedBefore", "prepReplacedAfter", "prepStaleDrops", "prepGenerationDrops"):
             self.assertIn(f"'{field}'", stored.group(1))
-        self.assertIn("if ($storedNames -contains $f -and -not (Test-DvJsonEquivalent", mod)
+        # r2 (the #910 r4 merge): the when-stored comparison is Get-DvStoredPlaybackFieldProblems, which finds a stored field by any casing
+        self.assertIn("foreach ($p in @(Get-DvStoredPlaybackFieldProblems -Stored $stored -Derived $derived)) { $invalid.Add($p) }", mod)
         self.assertNotIn("$storedNames -ccontains $f", mod)
 
     def test_the_visual_block_stores_the_digest_of_the_app_json_and_both_call_sites_read_the_tail_from_the_evidence_directory(self) -> None:
@@ -20557,11 +20575,134 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
         mod = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
         self.assertIn("appVisualJsonSha256", mod)
-        self.assertIn("$block.appVisualJsonSha256 = Get-DvSha256OfFile", mod)
+        # r2 (sol r1 finding 6): the collector hashes the bytes it parses (one read)
+        self.assertIn("$block.appVisualJsonSha256 = Get-DvSha256OfBytes $appBytes", mod)
         calls = re.findall(r"Get-DvCriteriaMetrics -Metrics (\$\w+(?:\.\w+)?) -Playback (\$\w+(?:\.\w+)?) -Visual \((Get-DvTailVisualEvidence [^\r\n]+)", leg + "\n" + mod)
         self.assertEqual([c[:2] for c in calls], [("$receipt.metrics", "$receipt.playback"), ("$metrics", "$derived")], calls)
         self.assertIn("-EvidenceDir $evidenceDir -LegId ([string]$spec.legId) -ExpectedSha256 ([string](Get-DvProp $receipt.visual 'appVisualJsonSha256'))", calls[0][2])
         self.assertIn("-EvidenceDir $ev.dir -LegId ([string]$spec.legId) -ExpectedSha256 ([string](Get-DvProp (Get-DvProp $Receipt 'visual') 'appVisualJsonSha256'))", calls[1][2])
+
+    # ---- r2: the PR #913 r1 keys (sol CHANGES_REQUESTED findings 2-7, fable key3 blocker and H2). Each is RED on c0af7b49. ----
+    HELD = {"conformLastFrame": 478, "conformSourceAdvanced": 477, "conformPresented": 478}
+    BOTH = [{"metric": "conformMaxJump", "op": "eq", "value": 1}, {"metric": "conformTailUnpaintedFrames", "op": "eq", "value": 0}]
+
+    def assert_no_credit(self, out: dict, tail: int) -> None:
+        self.assertNotIn("conformTailInFlightCreditedFrames", out["m"], out)
+        self.assertEqual(out["m"]["conformTailUnpaintedFrames"], tail, out)
+        self.assertFalse(out["v"]["pass"], out)
+
+    def test_r2_fable_blocker_sol_4_a_later_frame_never_credits_the_target(self) -> None:
+        """fable key3 blocker / sol r1 finding 4, the literal input: last_frame=478 engine_target=479, prep 0/0/1/1, the only play capture shows display_frame=480.
+        r1 credited it (`-ge $Target`): tail 0, PASS. Frame 480 on screen says nothing about 479, so nothing is credited and the target stays unpainted."""
+        out = self.metrics(self.HELD, app=self.app_json(self.play(0, display_frame=480)), criteria=self.BOTH)
+        self.assert_no_credit(out, 1)
+        self.assertIn("shows exactly an in-flight target", out["m"]["conformTailInFlightCreditNote"], out)
+
+    def test_r2_sol_2_an_unbound_capture_never_credits_the_target(self) -> None:
+        """sol r1 finding 2, the literal input: last=478 target=479, the sole capture is play_unbound labelled 479 with serial=484 painted_serial=483
+        label_bound=false. r1 credited it (tail 0, PASS). The label is bound only when the app says so AND its own serials agree."""
+        cases = {
+            "play_unbound, serial 484 painted 483, label_bound false": dict(kind="play_unbound", serial=484, painted_serial=483, label_bound=False),
+            "play, label_bound false": dict(label_bound=False),
+            "label_bound true but the serials differ": dict(serial=484, painted_serial=483, label_bound=True),
+            "painted_serial_valid false": dict(painted_serial_valid=False),
+            "label_bound the string true": dict(label_bound="true"),
+            "serial a string": dict(serial="484"),
+            "no label_bound": dict(label_bound=None),
+        }
+        for name, over in cases.items():
+            with self.subTest(case=name):
+                self.assert_no_credit(self.metrics(self.HELD, app=self.app_json(self.play(0, **over)), criteria=self.BOTH), 1)
+        with self.subTest(case="a bound play_unbound capture (its own paint landed) still credits"):
+            out = self.metrics(self.HELD, app=self.app_json(self.play(0, kind="play_unbound")), criteria=self.BOTH)
+            self.assertEqual(out["m"]["conformTailInFlightCreditedFrames"], 1, out)
+            self.assertTrue(out["v"]["pass"], out)
+
+    def test_r2_sol_3_an_undecodable_png_never_credits_the_target(self) -> None:
+        """sol r1 finding 3 (catalogue E-02): last=478 target=479, a matching capture whose PNG is the 5 bytes 89 50 4e 47 00, or 0 bytes. r1 credited any
+        file on disk. The PNG must decode (Get-DvPngImageProblem, as the paired-seek reader requires); a real PNG still credits."""
+        for png in ("stub", "empty"):
+            with self.subTest(png=png):
+                self.assert_no_credit(self.metrics(self.HELD, png=png, criteria=self.BOTH), 1)
+        out = self.metrics(self.HELD, criteria=self.BOTH)
+        self.assertEqual((out["m"]["conformTailInFlightCreditedFrames"], out["m"]["conformTailUnpaintedFrames"]), (1, 0), out)
+
+    def test_r2_sol_5_both_in_flight_targets_shown_are_both_credited(self) -> None:
+        """sol r1 finding 5, the literal input: last=477 target=479, bound saved captures 478 at 126 ms and 479 at 376 ms. r1 credited 1 (tail 1, FAIL);
+        both paints are present, so credit=2, tail=0, PASS. Siblings: 478 alone credits 478 (479 stays unpainted); 479 alone credits 479 only."""
+        out = self.metrics(app=self.app_json(self.play(0, display_frame=478), self.play(1, display_frame=479)), criteria=self.BOTH)
+        m = out["m"]
+        self.assertEqual((m["conformTailInFlightCreditedFrames"], m["conformTailUnpaintedFrames"], m["conformMaxJump"]), (2, 0, 1), out)
+        self.assertTrue(out["v"]["pass"], out)
+        for shown, unproven in ((478, 479), (479, 478)):
+            with self.subTest(only=shown):
+                out = self.metrics(app=self.app_json(self.play(0, display_frame=shown)), criteria=self.BOTH)
+                m = out["m"]
+                self.assertEqual((m["conformTailInFlightCreditedFrames"], m["conformTailUnpaintedFrames"], m["conformMaxJump"]), (1, 1, 1), out)
+                self.assertIn(f"target(s) {unproven} are not shown", m["conformTailInFlightCreditNote"], out)
+                self.assertFalse(out["v"]["pass"], out)
+
+    def test_r2_sol_7_malformed_or_conflicting_json_is_no_tail_evidence(self) -> None:
+        """sol r1 finding 7 (P-02, DC-04): a qualifying document wrapped in a one-element root array, or a capture carrying display_frame twice (478 then 479;
+        ConvertFrom-Json keeps 479), or in two casings. r1 credited each. Each is now no tail evidence (Get-DvTailVisualEvidence returns $null)."""
+        good = json.dumps(self.app_json(self.play(0)))
+        dup = good.replace('"display_frame": 479', '"display_frame": 478, "display_frame": 479', 1)
+        case = good.replace('"display_frame": 479', '"Display_Frame": 478, "display_frame": 479', 1)
+        top = good.replace('"measured_session": 1', '"measured_session": 2, "measured_session": 1', 1)
+        self.assertNotEqual(dup, good)
+        self.assertNotEqual(top, good)
+        for name, raw in {"root array": f"[{good}]", "duplicate display_frame": dup, "case-variant display_frame": case, "duplicate measured_session": top,
+                          "not UTF-8": good.encode("utf-8") + b"\xff"}.items():
+            with self.subTest(case=name):
+                out = self.metrics(self.HELD, app=raw if isinstance(raw, bytes) else raw.encode("utf-8"), criteria=self.BOTH)
+                self.assertFalse(out["haveVisual"], out)
+                self.assert_no_credit(out, 1)
+        with self.subTest(case="the same document, well-formed, with a UTF-8 BOM"):
+            out = self.metrics(self.HELD, app=b"\xef\xbb\xbf" + good.encode("utf-8"), criteria=self.BOTH)
+            self.assertTrue(out["haveVisual"], out)
+            self.assertEqual(out["m"]["conformTailInFlightCreditedFrames"], 1, out)
+
+    def test_r2_sol_6_the_digest_and_the_parse_are_of_one_read(self) -> None:
+        """sol r1 finding 6: Get-DvTailVisualEvidence hashed the file (Get-DvSha256OfFile) and then re-read it to parse, so bytes swapped between the two reads
+        lent their content to the stored digest; the collector (Read-DvVisualCaptures) stored the digest and parsed with two reads the same way. Both now read the
+        bytes once and hash and parse that array. Behaviour: ConvertFrom-DvStrictJsonBytes parses the bytes it is given, nothing else."""
+        mod = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        body = mod[mod.index("function Get-DvTailVisualEvidence {"):mod.index("function Get-DvTailInFlightCredit {")]
+        self.assertEqual(body.count("ReadAllBytes($jsonPath)"), 1, body)
+        self.assertIn("(Get-DvSha256OfBytes $jsonBytes) -cne", body)
+        self.assertIn("ConvertFrom-DvStrictJsonBytes -Bytes $jsonBytes", body)
+        self.assertNotIn("Get-DvSha256OfFile $jsonPath", body)
+        self.assertNotIn("ReadAllText($jsonPath)", body)
+        collector = mod[mod.index("Copy-Item -LiteralPath $appJsonShare -Destination"):mod.index("$block.method = [string](Get-DvProp $app 'method')")]
+        self.assertIn("$appBytes = [IO.File]::ReadAllBytes(", collector)
+        self.assertIn("$block.appVisualJsonSha256 = Get-DvSha256OfBytes $appBytes", collector)
+        self.assertNotIn("ReadAllText", collector)
+        self.assertNotIn("Get-DvSha256OfFile", collector)
+        proc, out = run_pwsh_json(
+            "$a = ConvertFrom-DvStrictJsonBytes -Bytes ([Text.Encoding]::UTF8.GetBytes('{\"display_frame\":478}'))\n"
+            "$b = ConvertFrom-DvStrictJsonBytes -Bytes ([Text.Encoding]::UTF8.GetBytes('[{\"display_frame\":479}]'))\n"
+            "$c = ConvertFrom-DvStrictJsonBytes -Bytes ([byte[]]@())\n"
+            "$d = ConvertFrom-DvStrictJsonBytes -Bytes ([Text.Encoding]::UTF8.GetBytes('{\"a\":{\"b\":1,\"B\":2}}'))\n"
+            "[ordered]@{ a = $a.display_frame; b = ($null -eq $b); c = ($null -eq $c); d = ($null -eq $d) } | ConvertTo-Json -Compress")
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out, {"a": 478, "b": True, "c": True, "d": True})
+
+    def test_r2_fable_h2_a_credit_is_written_into_the_receipt_detail(self) -> None:
+        """fable key3 H2 (TAIL-CREDIT-RECORDED-IN-RECEIPT-1): a credit that turned FAIL into PASS left the receipt's detail the fixed 'every criterion ... held'.
+        Get-DvTailCreditDetail names the credit, and the leg runner appends it to the PASS/FAIL detail from the metrics the criteria were judged with."""
+        proc, out = run_pwsh_json(
+            "$m = [pscustomobject]@{ conformTailInFlightCreditedFrames = 1; conformTailUnpaintedAtCloseFrames = 2; conformTailInFlightCreditNote = 'the tail shows 479' }\n"
+            "[ordered]@{ credited = (Get-DvTailCreditDetail -CriteriaMetrics $m); none = (Get-DvTailCreditDetail -CriteriaMetrics ([pscustomobject]@{ rows = 5 }));"
+            " nil = (Get-DvTailCreditDetail -CriteriaMetrics $null) } | ConvertTo-Json -Compress")
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out["credited"], "; tail in-flight credit: 1 of 2 target(s) unpainted at the measured close shown painted by the post-close visual tail (the tail shows 479)")
+        self.assertEqual((out["none"], out["nil"]), ("", ""))
+        leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        judged = leg.index("$verdictCriteria = Test-DvCriteria -Criteria $criteria -Metrics $criteriaMetrics")
+        self.assertLess(leg.index("$criteriaMetrics = (Get-DvCriteriaMetrics -Metrics $receipt.metrics -Playback $receipt.playback -Visual (Get-DvTailVisualEvidence"), judged)
+        appended = leg.index("if ($outcome -in @('PASS', 'FAIL')) { $detail += Get-DvTailCreditDetail -CriteriaMetrics $criteriaMetrics }", judged)
+        self.assertLess(leg.index("$outcome = 'PASS'; $detail =", judged), appended)
+        self.assertLess(appended, leg.index("$scale.verdict -ceq 'DECLARED_CLAMP'", judged))
 
 
 class DriftLegSpecTests(unittest.TestCase):
