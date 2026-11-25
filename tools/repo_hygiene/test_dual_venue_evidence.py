@@ -4088,14 +4088,19 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
 
     @staticmethod
     def receipt_literal_functions(text: str) -> list[str]:
-        # The function each receipt-literal line sits in (the nearest `function <Name>` above it), in order; '' for a line outside any function.
+        # The function each receipt-literal line sits in, in order; '' for a line outside any function. r6 (sol r5 H1): bounded by the function's own
+        # closing brace, never by "the next function name": a top-level PowerShell function opens at a column-0 `function <Name>` and closes at its column-0
+        # `}` line (a one-line function closes on its own line), so a literal moved below that closing brace is no longer attributed to it. (Brace counting
+        # is not used: here-strings and quoted braces in these modules make it drift.)
         out, current = [], ""
         for line in text.splitlines():
-            m = re.match(r"\s*function\s+([A-Za-z][\w-]*)", line)
+            m = re.match(r"function\s+([A-Za-z][\w-]*)", line)
             if m:
                 current = m.group(1)
             if "dual-venue-receipt/v1" in line or "dual-venue\\receipts" in line or "dual-venue/receipts" in line:
                 out.append(current)
+            if re.fullmatch(r"\}\s*", line) or (m and line.rstrip().endswith("}") and line.count("{") == line.count("}")):
+                current = ""
         return out
 
     @staticmethod
@@ -4125,6 +4130,20 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
             self.assertEqual(self.receipt_literal_functions(texts[path]), [fn], path)
         self.assertEqual(self.receipt_literal_functions("function Read-X {\n  $s = 'mlv-app/dual-venue-receipt/v1'\n}\n"), ["Read-X"],
                          "the pin sees a receipt literal in a second function, so it guards the refusal-only reader")
+        # r6 (sol r5 H1): function boundaries are the function's own braces. A literal moved below the closing brace of Test-VenueReceiptIsExportLeg (module
+        # scope, before the next function) is no longer attributed to it, so the pin above fails on that mutation.
+        self.assertEqual(self.receipt_literal_functions("function Test-A {\n  if ($x) { 'a' }\n}\n$s = 'mlv-app/dual-venue-receipt/v1'\nfunction Test-B { }\n"), [""])
+        self.assertEqual(self.receipt_literal_functions("function Test-A {\n  # a } in a comment\n  $q = '}'\n  }\n  $s = 'mlv-app/dual-venue-receipt/v1'\n}\n"), ["Test-A"])
+        self.assertEqual(self.receipt_literal_functions("function Test-A { $x }\n$s = 'mlv-app/dual-venue-receipt/v1'\n"), [""], "a one-line function closes on its line")
+        live = texts["tools/profiling/dual-venue/VenueChain.psm1"]
+        lines = live.splitlines(keepends=True)
+        start = next(i for i, l in enumerate(lines) if l.startswith("function Test-VenueReceiptIsExportLeg"))
+        end = next(i for i in range(start + 1, len(lines)) if lines[i].rstrip("\r\n") == "}")
+        hit = next(i for i in range(start, end) if "dual-venue-receipt/v1" in lines[i])
+        moved = "".join(lines[:hit] + lines[hit + 1:end + 1] + [lines[hit]] + lines[end + 1:])
+        self.assertNotEqual(self.receipt_literal_functions(moved), ["Test-VenueReceiptIsExportLeg"],
+                            "a schema literal moved below the function's closing brace is not attributed to it")
+        self.assertEqual(self.receipt_literal_functions(moved), [""])
         mutated = texts["tools/profiling/dual-venue/New-VenueSheetPair.ps1"].replace("Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot", "Test-DvReceiptValid -Receipt $r")
         self.assertNotEqual(mutated, texts["tools/profiling/dual-venue/New-VenueSheetPair.ps1"])
         self.assertEqual(self.readers_without_repo_root({"New-VenueSheetPair.ps1": mutated}), ["New-VenueSheetPair.ps1:" + str(next(

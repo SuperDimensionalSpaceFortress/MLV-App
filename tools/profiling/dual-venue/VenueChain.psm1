@@ -1790,6 +1790,33 @@ function Test-VenueReceiptIsExportLeg([object]$Rc) {
     ($null -eq $verdict) -or ($verdict -is [string] -and [regex]::IsMatch($verdict, '\A[A-Z][A-Z_]{1,31}\z'))
 }
 
+function Get-VenuePlannedLegType {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (sol r5 B2): the PLANNED leg type of a leg, read from the leg spec the driver planned it from (never from its receipt):
+    'export' only when the spec is one JSON object, repeats no member, and its legType is exactly the string 'export'; 'playback' for any other readable spec;
+    'unknown' when the spec path is empty, unreadable or not one JSON object, or (with -ExpectSpecSha256) its bytes are not the planned bytes. Only 'export'
+    grants Get-VenueLegHostLoad's export exemption, so an unreadable plan is never exempt.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$SpecPath, [AllowNull()][AllowEmptyString()][string]$ExpectSpecSha256)
+    try {
+        if ([string]::IsNullOrWhiteSpace($SpecPath) -or -not (Test-Path -LiteralPath $SpecPath -PathType Leaf)) { return 'unknown' }
+        $bytes = [IO.File]::ReadAllBytes($SpecPath)
+        if (-not [string]::IsNullOrEmpty($ExpectSpecSha256)) {
+            $got = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+            if (-not [string]::Equals($got, $ExpectSpecSha256, [StringComparison]::OrdinalIgnoreCase)) { return 'unknown' }
+        }
+        $text = [Text.Encoding]::UTF8.GetString($bytes)
+        if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
+        if (Find-VenueJsonDuplicateMember -Text $text -All) { return 'unknown' }
+        $spec = ConvertFrom-Json -InputObject $text -NoEnumerate
+        if (-not (Test-VenueHlObject $spec)) { return 'unknown' }
+        $lt = Get-VenueHlMember $spec 'legType'
+        if ($lt -is [string] -and [string]::Equals($lt, 'export', [StringComparison]::Ordinal)) { return 'export' }
+        'playback'
+    } catch { 'unknown' }
+}
+
 function Get-VenueLegHostLoad {
     <#
     .SYNOPSIS
@@ -1804,7 +1831,10 @@ function Get-VenueLegHostLoad {
     # r3 adversary-01a12498.json A2: a caller that read the receipt's figures earlier passes -ExpectResultJsonSha256 (the evidence.resultJsonSha256 of the receipt
     # it took the figures from; '' when that receipt bound none). The receipt read here must bind the same value, so a receipt (and its result.json) replaced
     # between the two reads is 'unknown', never the other receipt's quiet standing. A receiptId that is not the file name is 'unknown' too.
-    param([string]$ReceiptPath, [AllowNull()][AllowEmptyString()][string]$ExpectResultJsonSha256)
+    # r6 (sol r5 B2): the export exemption is granted ONLY from the PLANNED leg type (-PlannedLegType, from the leg spec the driver planned: Get-VenuePlannedLegType),
+    # never inferred from receipt fields. A receipt shaped like an export receipt in a leg planned as playback (or whose planned type is unreadable or not given)
+    # is read as a playback leg: it must bind its smoke result, or it is 'unknown' and provisional. The receipt shape check still applies on top of the plan.
+    param([string]$ReceiptPath, [AllowNull()][AllowEmptyString()][string]$ExpectResultJsonSha256, [AllowNull()][AllowEmptyString()][string]$PlannedLegType)
     $unknown = [pscustomobject]@{ state = 'unknown'; provisional = $true; collected = $false; reason = 'no smoke result.json for the leg'; applies = $true }
     try {
         if (-not $ReceiptPath) { return $unknown }
@@ -1824,7 +1854,8 @@ function Get-VenueLegHostLoad {
             $expectText = $(if ($null -eq $ExpectResultJsonSha256) { '' } else { $ExpectResultJsonSha256 })
             if ($null -eq $boundText -or -not [string]::Equals($boundText, $expectText, [StringComparison]::OrdinalIgnoreCase)) { $unknown.reason = 'the receipt is not the one the figures were read from (evidence.resultJsonSha256 changed between reads)'; return $unknown }
         }
-        if (Test-VenueReceiptIsExportLeg $rc) { return [pscustomobject]@{ state = 'not-applicable'; provisional = $false; collected = $false; reason = 'export leg: no GUI smoke'; applies = $false } }
+        $plannedExport = ($PlannedLegType -is [string]) -and [string]::Equals($PlannedLegType, 'export', [StringComparison]::Ordinal)
+        if ($plannedExport -and (Test-VenueReceiptIsExportLeg $rc)) { return [pscustomobject]@{ state = 'not-applicable'; provisional = $false; collected = $false; reason = 'export leg: no GUI smoke'; applies = $false } }
         $want = Get-VenueHlMember (Get-VenueHlMember $rc 'evidence') 'resultJsonSha256'
         if (-not ($want -is [string] -and [regex]::IsMatch($want, '\A[0-9a-fA-F]{64}\z'))) { $unknown.reason = 'the receipt binds no evidence.resultJsonSha256'; return $unknown }
         $root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $ReceiptPath)))
@@ -2289,5 +2320,5 @@ Export-ModuleMember -Function New-VenueCapsProbeId, Get-VenueDriverScriptMissing
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
     Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueStagedArtifactNames, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
-    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueInterleavedLegPlan, Get-VenueLegPreLoadMean, ConvertFrom-VenueSmokeHostLoad, Get-VenueLegHostLoad, Test-VenueReceiptIsExportLeg, Get-VenueReferenceHostLoadRefusal, Get-VenueReferenceArmVerdict, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait, Get-VenueRunStartCap, Get-VenueLegPlaySeconds, Get-VenuePlanPlaySeconds, ConvertTo-VenueStartCapTime,Get-VenueLeaseCaps, Resolve-VenueLeaseCaps,
+    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueInterleavedLegPlan, Get-VenueLegPreLoadMean, ConvertFrom-VenueSmokeHostLoad, Get-VenuePlannedLegType, Get-VenueLegHostLoad, Test-VenueReceiptIsExportLeg, Get-VenueReferenceHostLoadRefusal, Get-VenueReferenceArmVerdict, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait, Get-VenueRunStartCap, Get-VenueLegPlaySeconds, Get-VenuePlanPlaySeconds, ConvertTo-VenueStartCapTime,Get-VenueLeaseCaps, Resolve-VenueLeaseCaps,
     Get-VenueClaimAgeSec, Update-VenueClaim, Start-VenueKeeper, Stop-VenueKeeper, Start-VenueClaimKeeper, Get-VenueClaimKeeperLoss, New-VenueJobLivenessWrite, Write-VenueJobLiveness, Test-VenueJobLivenessReadback, Start-VenueJobLiveness, Stop-VenueJobLiveness

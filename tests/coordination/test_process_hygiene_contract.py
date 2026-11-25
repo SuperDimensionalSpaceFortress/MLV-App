@@ -30,7 +30,10 @@ STDERR_SENTINEL = "EXCLUSIVE_STDERR_SENTINEL"
 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r4: the one clean host load the GUI A/B comparer accepts (its canonical
 # predicate: state == "quiet" AND provisional == false). A GUI A/B fixture that is not about host load
 # carries it on both legs, so its verdict is decided by what the test is about.
-QUIET_HOST_LOAD = {"state": "quiet", "provisional": False, "reason": "fixture: fully measured quiet host"}
+# r6 (sol r5 B1): the comparer now judges the block by the venue reader's strict rule, which also needs the before and after
+# snapshots collected (a real true), as the shipped smoke writes them.
+QUIET_HOST_LOAD = {"state": "quiet", "provisional": False, "reason": "fixture: fully measured quiet host",
+                   "before": {"collected": True}, "after": {"collected": True}}
 
 
 @pytest.mark.skipif(os.name != "nt", reason="MLV-App process ownership is Windows-specific")

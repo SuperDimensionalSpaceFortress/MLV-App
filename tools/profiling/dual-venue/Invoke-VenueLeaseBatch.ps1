@@ -3002,7 +3002,10 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $legFF = $legForeign.ContainsKey($leg.name)
                 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: the smoke's own host-load verdict (result.json hostLoad). A leg whose host load was provisional or not collected
                 # (2026-11-21 a134532e: CimException, state unknown) is recorded as RAN but is never a counted class: HOSTLOAD_PROVISIONAL, with its typed line.
-                $hl = Get-VenueLegHostLoad -ReceiptPath $receipt
+                # r6 (sol r5 B2): the export exemption comes only from the leg's PLANNED type (its spec's legType, bound to the bytes the preflight judged when it
+                # recorded them), never from the receipt's shape
+                $planSha = $(if ($script:SpecBudgetSha256.ContainsKey([string]$leg.spec)) { [string]$script:SpecBudgetSha256[[string]$leg.spec] } else { '' })
+                $hl = Get-VenueLegHostLoad -ReceiptPath $receipt -PlannedLegType (Get-VenuePlannedLegType -SpecPath ([string]$leg.spec) -ExpectSpecSha256 $planSha)
                 $hlRefusal = Get-VenueReferenceHostLoadRefusal -LegId $(if ($receipt) { [IO.Path]::GetFileNameWithoutExtension($receipt) } else { "leg:$($leg.name)" }) -Standing $hl
                 $class = $(if ($leaseClass) { $leaseClass } elseif ($legFF) { 'COOLDOWN_UNMET' } elseif ($null -eq $preLoad) { 'QUIET_PRELOAD_UNKNOWN' } elseif ($preLoad -le 30.0) { $(if ($hlRefusal) { 'HOSTLOAD_PROVISIONAL' } else { 'QUIET_PRELOAD_OK' }) } else { 'QUIET_PRELOAD_HIGH' })
                 $counted = ($class -ceq 'QUIET_PRELOAD_OK')

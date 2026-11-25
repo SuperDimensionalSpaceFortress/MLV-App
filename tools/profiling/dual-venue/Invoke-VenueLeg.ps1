@@ -191,12 +191,18 @@ if ($null -ne $setPlan) {
         # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): the leg's host-load standing, from its own hash-bound smoke result (the reader the lease batch and the chain
         # use); a provisional or unknown leg is printed as REFERENCE_PROVISIONAL, its row carries hostLoadState / hostLoadProvisional, and it is never measured.
         if (-not (Get-Command -Name Get-VenueLegHostLoad -ErrorAction SilentlyContinue)) {
-            Import-Module (Join-Path $here 'VenueChain.psm1') -Function Get-VenueLegHostLoad, Get-VenueReferenceHostLoadRefusal -DisableNameChecking
+            Import-Module (Join-Path $here 'VenueChain.psm1') -Function Get-VenueLegHostLoad, Get-VenueReferenceHostLoadRefusal, Get-VenuePlannedLegType -DisableNameChecking
         }
+        if (-not (Get-Command -Name Get-VenuePlannedLegType -ErrorAction SilentlyContinue)) {
+            Import-Module (Join-Path $here 'VenueChain.psm1') -Function Get-VenueLegHostLoad, Get-VenueReferenceHostLoadRefusal, Get-VenuePlannedLegType -DisableNameChecking -Force
+        }
+        # r6 (sol r5 B2): the export exemption comes only from the PLANNED leg type (the planned spec), never from the receipt's shape. (entry.specSha256 is the
+        # LF-normalised Get-DvLegSpecSha256, not a raw-byte hash, so it is not passed as the raw-byte bind; an unreadable spec reads 'unknown', never exempt.)
+        $plannedLegType = Get-VenuePlannedLegType -SpecPath ([string]$entry.specPath)
         # (adversary-01a12498.json A2: bound to the receipt the row's figures come from, so a receipt swapped between the two reads reads 'unknown')
         $legHostLoad = $(if ($null -ne $legReceipt) {
             $boundSha = Get-DvProp (Get-DvProp $legReceipt 'evidence') 'resultJsonSha256'
-            Get-VenueLegHostLoad -ReceiptPath $receiptPath -ExpectResultJsonSha256 $(if ($boundSha -is [string]) { $boundSha } elseif ($null -eq $boundSha) { '' } else { 'not-a-sha' })
+            Get-VenueLegHostLoad -ReceiptPath $receiptPath -ExpectResultJsonSha256 $(if ($boundSha -is [string]) { $boundSha } elseif ($null -eq $boundSha) { '' } else { 'not-a-sha' }) -PlannedLegType $plannedLegType
         } else { $null })
         $row = Get-DvMatrixRow -PlanEntry $entry -Receipt $legReceipt -HostLoad $legHostLoad
         if ($null -ne $legReceipt) {

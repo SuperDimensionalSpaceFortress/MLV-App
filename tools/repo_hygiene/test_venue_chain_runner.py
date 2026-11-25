@@ -108,12 +108,14 @@ if ($env:FAKE_LEG_PRELOADS) {
     if ($v -ne 'none') { Set-Content -LiteralPath (Join-Path $edir 'summary.json') -Value ('{"cpuQuiescence":{"timeMeanPercent":' + $v + '}}') }
     # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: FAKE_LEG_HOSTLOADS per call = the smoke result.json's hostLoad: quiet (default) | cim (collected=false CimException) | none
     $hls = @(([string]$env:FAKE_LEG_HOSTLOADS) -split ',' | Where-Object { $_ }); $hl = $(if ($hls.Count -gt 0) { $hls[[Math]::Min($n, $hls.Count - 1)] } else { 'quiet' })
-    $hlBlock = $(if ($hl -eq 'cim') { '{"before":{"collected":false,"error":"collection failed: CimException"},"after":{"collected":false,"error":"collection failed: CimException"},"state":"unknown","provisional":true}' } else { '{"before":{"collected":true},"after":{"collected":true},"state":"quiet","provisional":false}' })
+    # r6 (sol r5 B2): expshape = a CIM-failed result.json and, in the receipt slot, a receipt shaped like an export receipt that binds nothing
+    $hlBlock = $(if ($hl -eq 'cim' -or $hl -eq 'expshape') { '{"before":{"collected":false,"error":"collection failed: CimException"},"after":{"collected":false,"error":"collection failed: CimException"},"state":"unknown","provisional":true}' } else { '{"before":{"collected":true},"after":{"collected":true},"state":"quiet","provisional":false}' })
     if ($hl -ne 'none') {
         $resPath = Join-Path $edir 'result.json'; Set-Content -LiteralPath $resPath -Value ('{"hostLoad":' + $hlBlock + '}')
         # like the real leg, the receipt binds the smoke result (evidence.resultJsonSha256; adversary-b0c05520.json A1)
         Set-Content -LiteralPath $rp -Value ('{"evidence":{"resultJsonSha256":"' + (Get-FileHash -LiteralPath $resPath -Algorithm SHA256).Hash.ToLowerInvariant() + '"}}')
     }
+    if ($hl -eq 'expshape') { Set-Content -LiteralPath $rp -Value ('{"schema":"mlv-app/dual-venue-receipt/v1","scale":null,"display":null,"evidence":{},"export":{"format":"prores","receiptSha256":"' + ('0' * 64) + '","verdict":null}}') }
     "DVE_RECEIPT_PATH=$rp"
 }
 if ($env:FAKE_LEG_LOG) { Add-Content -LiteralPath $env:FAKE_LEG_LOG -Value ("END {0} {1} {2}" -f [DateTime]::UtcNow.Ticks, $leaf, $PID) }
@@ -504,6 +506,20 @@ class VenueChainRunnerTests(unittest.TestCase):
         ran = [l for l in self.chain_log(rd) if " RAN " in l]
         self.assertIn("class=HOSTLOAD_PROVISIONAL hostLoadState=unknown hostLoadProvisional=True", ran[0])
         self.assertIn("class=QUIET_PRELOAD_OK hostLoadState=quiet hostLoadProvisional=False", ran[1])
+        rid = Path(res["legs"][0]["receipt"]).stem
+        self.assertTrue(any(f"REFERENCE_PROVISIONAL leg={rid} reason=hostload-unknown" in l for l in self.chain_log(rd)), self.chain_log(rd))
+
+    def test_r6_b2_an_export_shaped_receipt_in_a_playback_leg_is_never_a_counted_class(self) -> None:
+        # sol r5 B2, its input: a playback leg (its spec plans no export) whose receipt slot holds the production schema shaped as an export receipt
+        # (scale/display null, prores, 64 zeroes, verdict null, no identity, no playback hashes), a CIM-failed smoke result and pre-load 5.
+        # RED: not-applicable and QUIET_PRELOAD_OK. The exemption now comes only from the planned leg type.
+        rd = self.case / "lane-EXPSHAPE"
+        env = self.env(FAKE_QUIET_MODES="QUIET,QUIET,QUIET,QUIET,QUIET,QUIET", FAKE_LEG_PRELOADS="5.0,5.0,5.0", FAKE_LEG_HOSTLOADS="expshape,quiet,quiet")
+        r = self.run_chain(rd, self.specs, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        got = [(l["class"], l.get("hostLoadState"), l.get("hostLoadProvisional")) for l in res["legs"]]
+        self.assertEqual(got, [("HOSTLOAD_PROVISIONAL", "unknown", True)] + [("QUIET_PRELOAD_OK", "quiet", False)] * 2)
         rid = Path(res["legs"][0]["receipt"]).stem
         self.assertTrue(any(f"REFERENCE_PROVISIONAL leg={rid} reason=hostload-unknown" in l for l in self.chain_log(rd)), self.chain_log(rd))
 

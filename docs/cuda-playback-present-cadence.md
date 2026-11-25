@@ -207,8 +207,11 @@ records the load but does not label a contended run. COUNTED is decided lane-sid
 preLoad <= 30 %), so this leg is evidence-only. A leg whose own smoke host load (its hash-bound `result.json` `hostLoad` block) is
 provisional, was not collected (for example `collection failed: CimException`) or is missing is never COUNTED: with a quiet
 preLoad <= 30 % it is class `HOSTLOAD_PROVISIONAL`, and the line `REFERENCE_PROVISIONAL leg=<id> reason=hostload-<state>` is printed
-(VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1). The display-matrix summary, the venue baseline and the release GUI A/B comparator follow the same
-rule: the row carries `hostLoadState` and `hostLoadProvisional`, it is not counted as a measurement, and the A/B verdict is `INCONCLUSIVE`.
+(VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1). The display-matrix summary and the venue baseline follow the same rule: the row carries
+`hostLoadState` and `hostLoadProvisional`, and it is counted only when the state is exactly `quiet` and provisional is the boolean false.
+The release GUI A/B comparator judges each leg's block by the same reader (`hostLoadEvidence.<before|after>.state`, `provisional` and
+`collected`), lists a refused leg in `referenceProvisional`, and its verdict is then `INCONCLUSIVE`. Only a leg PLANNED as an export
+leg (its spec's `legType` is `export`) is exempt as not-applicable; a receipt's shape never grants that.
 
 The pre-registered rule `inlease-requalify-1` for bench round r7 on is available as a pure module,
 `tools/profiling/dual-venue/VenueLegCounting.psm1`. No tracked driver or analyzer imports it; the CPU-17V9-FPS-GAP-AB-1 r7 run-dir

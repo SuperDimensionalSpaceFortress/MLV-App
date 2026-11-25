@@ -460,7 +460,9 @@ foreach ($b in $StandardBackends) {
             # A provisional or unknown RAN row keeps its figures for the trend file but is never a measured reference row (the $measuredRows predicate below).
             $hlReceipt = $(if ($leg.PSObject.Properties['receipt'] -and $leg.receipt) { [string]$leg.receipt } else { '' })
             # (adversary-01a12498.json A2: bound to the receipt Get-RowFigures took the figures from; no receipt read there means no figures and no expectation)
-            $hl = $(if ($null -ne $fig.resultJsonSha256) { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -ExpectResultJsonSha256 ([string]$fig.resultJsonSha256) } else { Get-VenueLegHostLoad -ReceiptPath $hlReceipt })
+            # r6 (sol r5 B2): the export exemption comes only from the PLANNED leg type (the plan leg's spec), never from the receipt's shape
+            $hlPlanned = Get-VenuePlannedLegType -SpecPath $(if ($null -ne $planLeg -and $planLeg.spec) { [string]$planLeg.spec } else { '' })
+            $hl = $(if ($null -ne $fig.resultJsonSha256) { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -ExpectResultJsonSha256 ([string]$fig.resultJsonSha256) -PlannedLegType $hlPlanned } else { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -PlannedLegType $hlPlanned })
             $hlLine = Get-VenueReferenceHostLoadRefusal -LegId $(if ($hlReceipt) { [IO.Path]::GetFileNameWithoutExtension($hlReceipt) } else { [string]$planLeg.legId }) -Standing $hl
             if ($hlLine -and $legStatus -ceq 'RAN') { Out-Line $hlLine }
             $rows.Add([ordered]@{
@@ -516,7 +518,8 @@ if ($rows.Count -gt 0) {
 }
 # I3: a run in which no row carries a figure is never OK. It keeps exit 0 (the BASELINE-EXIT-NO-MEASUREMENT-1 behaviour) under its own token.
 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): a row is measured only when its hostLoadProvisional is the boolean false (a provisional or unknown leg is never counted).
-$measuredRows = @($rows | Where-Object { $_.status -ceq 'RAN' -and $null -ne $_.fps -and $_.hostLoadProvisional -is [bool] -and -not $_.hostLoadProvisional }).Count
+# r6 (sol r5 B3): the same strict row predicate as the matrix (DualVenueRunner.psm1 Test-DvHostLoadRowClean: state exactly 'quiet' AND provisional a real $false).
+$measuredRows = @($rows | Where-Object { $_.status -ceq 'RAN' -and $null -ne $_.fps -and (Test-DvHostLoadRowClean -Row $_) }).Count
 $reason = $(if ($typed) { $typed.reason } elseif ($measuredRows -eq 0) { 'NO_MEASUREMENT' } else { 'OK' })
 $code = [int]$ExitCodes[$reason]
 $noMeasurementDetail = "no row carries a figure ($($rows.Count) row(s) appended, 0 measured); this is NOT an OK run"

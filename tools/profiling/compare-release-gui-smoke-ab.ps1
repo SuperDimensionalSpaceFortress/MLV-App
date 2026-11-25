@@ -18,6 +18,9 @@ $ErrorActionPreference = "Stop"
 # gap: this comparator's own list used to omit capture-invalid and capture-too-dark, so an
 # A/B leg with an unusable or artifacted capture could still report PASS.
 . (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (sol r5 B1): the host-load block is judged by the venue reader's ONE strict rule (VenueChain.psm1
+# ConvertFrom-VenueSmokeHostLoad and Get-VenueReferenceHostLoadRefusal), never by a second, looser parser here.
+Import-Module (Join-Path $PSScriptRoot 'dual-venue\VenueChain.psm1') -Function ConvertFrom-VenueSmokeHostLoad, Get-VenueReferenceHostLoadRefusal -DisableNameChecking
 
 function Read-SmokeJson {
     param([string]$Path)
@@ -425,19 +428,22 @@ function Get-HostLoadComparisonEvidence {
         # compare-machine-perf.ps1's Get-PlaybackAbLegHostLoadProvisional for the full cross-file
         # note): clean iff state=="quiet" AND provisional==false; every other combination is
         # provisional.
-        $legProvisionalRaw = if ($null -eq $legHostLoad) { $null } else { Get-NestedValue $legHostLoad "provisional" }
-        $legProvisionalDeclared = if ($null -eq $legHostLoad -or $null -eq $legProvisionalRaw) { $true } else { [bool]$legProvisionalRaw }
-        $legStateRaw = if ($null -eq $legHostLoad) { $null } else { Get-NestedValue $legHostLoad "state" }
-        $legState = if ($null -eq $legHostLoad -or [string]::IsNullOrWhiteSpace([string]$legStateRaw)) { "unknown" } else { [string]$legStateRaw }
-        $legProvisional = ($legProvisionalDeclared -or $legState -ne "quiet")
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (sol r5 B1): the block is judged by VenueChain.psm1's ConvertFrom-VenueSmokeHostLoad, the venue reader's own rule:
+        # clean only when state is exactly the string 'quiet', provisional is a real [bool] $false (not 0, not [false], not a string) and the before and after
+        # snapshots (and every during sample) are collected = a real [bool] $true. A quiet/false block beside before.collected=false (a CimException), state
+        # 'QUIET', provisional 0 or [false] all read state 'unknown' (or the declared state) and provisional, so the verdict is INCONCLUSIVE, never PASS.
+        $judged = ConvertFrom-VenueSmokeHostLoad -HostLoad $legHostLoad
+        $legState = [string]$judged.state
+        $legProvisional = [bool]$judged.provisional
         $legReason = if ($null -eq $legHostLoad) {
             "no hostLoad telemetry recorded in the smoke result"
         } else {
-            [string](Get-NestedValue $legHostLoad "reason")
+            [string]$judged.reason
         }
         $evidence[$leg.Name] = [pscustomobject]@{
             state = $legState
             provisional = $legProvisional
+            collected = [bool]$judged.collected
             reason = $legReason
         }
         if ($legProvisional) {
@@ -469,12 +475,14 @@ function Get-GuiSmokeAbVerdict {
     $refusals = @()
     foreach ($legName in @("before", "after")) {
         $legEvidence = if ($null -ne $HostLoadEvidence) { $HostLoadEvidence.$legName } else { $null }
-        $isClean = ($null -ne $legEvidence) -and ($legEvidence.provisional -is [bool]) -and (-not $legEvidence.provisional)
-        if ($isClean) { continue }
-        $stateText = if ($null -ne $legEvidence) { [string]$legEvidence.state } else { "" }
-        if (-not [regex]::IsMatch($stateText, '\A[a-z][a-z_-]{0,31}\z')) { $stateText = "unknown" }
-        if ([string]::Equals($stateText, "quiet", [StringComparison]::Ordinal)) { $stateText = "provisional" }
-        $refusals += "REFERENCE_PROVISIONAL leg=$legName reason=hostload-$stateText"
+        # r6 (sol r5 B1): the venue reader's own refusal rule (VenueChain.psm1 Get-VenueReferenceHostLoadRefusal): clean only for state exactly 'quiet',
+        # provisional a real $false and collected a real $true. Only those three members are passed, so no caller-supplied applies=$false can skip the rule.
+        $standing = if ($null -ne $legEvidence) {
+            [pscustomobject]@{ state = $legEvidence.state; provisional = $legEvidence.provisional; collected = $legEvidence.collected }
+        } else { $null }
+        $line = Get-VenueReferenceHostLoadRefusal -LegId $legName -Standing $standing
+        if ($null -eq $line) { continue }
+        $refusals += $line
     }
     $failureList = @($Failures | Where-Object { $null -ne $_ })
     $verdictText = if ($refusals.Count -gt 0) { "INCONCLUSIVE" } elseif ($failureList.Count -eq 0) { "PASS" } else { "FAIL" }
@@ -1128,7 +1136,9 @@ $result = [pscustomobject]@{
 # $result exists, rather than skipping New-DeltaObject above -- each leg's own raw FPS value
 # is still true regardless of the other leg, and is kept; only delta/deltaPercent (the
 # cross-leg comparison) are nulled when the legs are not known to be the same display/mode.
-if ($displayComparability.status -ne 'same') {
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (fable key3 r5, GUI-SMOKE-AB-INCONCLUSIVE-WITHHOLD-DELTA-1): an INCONCLUSIVE verdict (a leg whose host load is
+# provisional or unknown) withholds the cross-leg deltas the same way, so no fps delta is printed or stored beside it.
+if ($displayComparability.status -ne 'same' -or [string]::Equals([string]$result.verdict, 'INCONCLUSIVE', [StringComparison]::Ordinal)) {
     foreach ($fpsField in @('visibleBottomLeftGuiFps', 'smokePresentedFps', 'smokeTimelineFps')) {
         $result.fps.$fpsField.delta = $null
         $result.fps.$fpsField.deltaPercent = $null

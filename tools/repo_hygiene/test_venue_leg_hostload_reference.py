@@ -168,8 +168,10 @@ class LegHostLoadReaderTests(unittest.TestCase):
                     import hashlib
                     rbody["evidence"]["resultJsonSha256"] = hashlib.sha256(raw).hexdigest()   # the receipt binds its smoke result (adversary-b0c05520.json A1)
                 receipt.write_text(json.dumps(rbody), encoding="utf-8")
+            # r6 (sol r5 B2): the export exemption needs the PLANNED leg type; each case passes the type its leg was planned as
             body = ("$r = [ordered]@{}; "
-                    + "".join(f"$r['{rid}'] = Get-VenueLegHostLoad -ReceiptPath '{root / 'CARD-1' / 'leg-x' / 'bachelor' / (rid + '.json')}'; " for rid in cases)
+                    + "".join(f"$r['{rid}'] = Get-VenueLegHostLoad -ReceiptPath '{root / 'CARD-1' / 'leg-x' / 'bachelor' / (rid + '.json')}'"
+                              f" -PlannedLegType '{'export' if kind == 'export' else 'playback'}'; " for rid, (kind, _b) in cases.items())
                     + "$r | ConvertTo-Json -Compress -Depth 4")
             p = run_ps(body)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
@@ -188,8 +190,9 @@ class LegHostLoadBindingTests(unittest.TestCase):
     """adversary-b0c05520.json A1 (the standing comes from the receipt's own smoke result; only a receipt that is an export skips it) and A2
     (duplicate members never pick a clean value)."""
 
-    def read(self, cases: dict) -> dict:
+    def read(self, cases: dict, planned: dict | None = None) -> dict:
         import hashlib
+        planned = planned or {}
         with tempfile.TemporaryDirectory() as d:
             root = Path(d) / "receipts"
             ev = Path(d) / "evidence"
@@ -206,8 +209,10 @@ class LegHostLoadBindingTests(unittest.TestCase):
                     sha = hashlib.sha256(result_text.encode("utf-8")).hexdigest()
                 body = receipt_body(sha) if callable(receipt_body) else receipt_body
                 receipt.write_text(body if isinstance(body, str) else json.dumps(body), encoding="utf-8")   # a str is the receipt's raw text
+            # r6 (sol r5 B2): a case laid out as an export leg was PLANNED as one; every other case was planned as playback (planned= overrides)
             p = run_ps("$r = [ordered]@{}; "
-                       + "".join(f"$r['{rid}'] = Get-VenueLegHostLoad -ReceiptPath '{root / 'CARD-1' / 'leg-x' / 'bachelor' / (rid + '.json')}'; " for rid in cases)
+                       + "".join(f"$r['{rid}'] = Get-VenueLegHostLoad -ReceiptPath '{root / 'CARD-1' / 'leg-x' / 'bachelor' / (rid + '.json')}'"
+                                 f" -PlannedLegType '{planned.get(rid, 'export' if c[1] == 'export' else 'playback')}'; " for rid, c in cases.items())
                        + "$r | ConvertTo-Json -Compress -Depth 4")
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             return json.loads(p.stdout)
@@ -430,6 +435,131 @@ class ReferenceArmVerdictTests(unittest.TestCase):
     def test_no_control_leg_at_all_is_inconclusive(self) -> None:
         v, _ = self.verdict([])
         self.assertEqual(v["verdict"], "INCONCLUSIVE", v)
+
+
+DV_RUNNER = ROOT / "tools" / "profiling" / "dual-venue" / "DualVenueRunner.psm1"
+DV_DIR = ROOT / "tools" / "profiling" / "dual-venue"
+# sol r5 B2, its input: a playback leg's receipt slot holding the production schema shaped as an export receipt (scale/display null, format prores,
+# receiptSha256 64 zeroes, verdict null) with no receipt identity and no playback hashes.
+EXPORT_SHAPED = {"schema": "mlv-app/dual-venue-receipt/v1", "scale": None, "display": None, "evidence": {},
+                 "export": {"format": "prores", "receiptSha256": "0" * 64, "verdict": None}}
+
+
+@unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+class PlannedLegTypeExemptionTests(unittest.TestCase):
+    """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (sol r5 B2): the export exemption is granted only from the PLANNED leg type, never from the receipt's shape."""
+
+    def write_leg(self, d: Path, rid: str, receipt: dict, result: dict | None) -> Path:
+        root = d / "receipts"; ev = d / "evidence"
+        path = root / "CARD-1" / "leg-x" / "bachelor" / f"{rid}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        (ev / rid).mkdir(parents=True, exist_ok=True)
+        (ev / rid / "summary.json").write_text(json.dumps({"cpuQuiescence": {"timeMeanPercent": 5}}), encoding="utf-8")   # pre-load 5
+        if result is not None:
+            (ev / rid / "result.json").write_text(json.dumps(result), encoding="utf-8")
+        path.write_text(json.dumps(receipt), encoding="utf-8")
+        return path
+
+    def test_r6_b2_an_export_shaped_receipt_in_a_playback_leg_is_provisional_and_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            receipt = self.write_leg(Path(d), "shaped-1", EXPORT_SHAPED, {"hostLoad": CIM_FAILED})
+            real = self.write_leg(Path(d), "realexp-1", REAL_EXPORT_RECEIPT, None)
+            out = {}
+            for name, path, planned in (("playback", receipt, "playback"), ("unreadable", receipt, "unknown"), ("blank", receipt, ""),
+                                        ("export", real, "export"), ("realexp-as-playback", real, "playback")):
+                p = run_ps(f"$s = Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType '{planned}'; "
+                           f"$l = Get-VenueReferenceHostLoadRefusal -LegId 'L' -Standing $s; "
+                           "Write-Output ('J=' + ($s | ConvertTo-Json -Compress)); Write-Output ('LINE=' + $l)")
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                j = json.loads([l for l in p.stdout.splitlines() if l.startswith("J=")][-1][2:])
+                line = [l for l in p.stdout.splitlines() if l.startswith("LINE=")][-1][5:]
+                out[name] = (j, line)
+        for name in ("playback", "unreadable", "blank", "realexp-as-playback"):
+            with self.subTest(case=name):
+                j, line = out[name]
+                self.assertEqual((j["state"], j["provisional"], j["applies"]), ("unknown", True, True), (name, j))
+                self.assertEqual(line, "REFERENCE_PROVISIONAL leg=L reason=hostload-unknown", (name, line))
+        j, line = out["export"]
+        self.assertEqual((j["state"], j["provisional"], j["applies"]), ("not-applicable", False, False), "a leg PLANNED as export keeps its exemption")
+        self.assertEqual(line, "")
+
+    def test_r6_b2_the_planned_type_comes_from_the_spec_and_only_an_exact_export_exempts(self) -> None:
+        import hashlib
+        with tempfile.TemporaryDirectory() as d:
+            specs = {"exp": '{"legType":"export","export":{"format":"prores"}}', "play": '{"legType":"playback"}', "none": '{"clipId":"M16-1243"}',
+                     "case": '{"legType":"Export"}', "dup": '{"legType":"playback","legType":"export"}', "arr": '[{"legType":"export"}]',
+                     "bad": '{"legType":', "arrval": '{"legType":["export"]}'}
+            paths = {}
+            for k, t in specs.items():
+                paths[k] = Path(d) / f"{k}.json"; paths[k].write_text(t, encoding="utf-8")
+            exp_sha = hashlib.sha256(specs["exp"].encode("utf-8")).hexdigest()
+            calls = [(k, f"Get-VenuePlannedLegType -SpecPath '{p}'") for k, p in paths.items()]
+            calls += [("missing", f"Get-VenuePlannedLegType -SpecPath '{Path(d) / 'absent.json'}'"), ("empty", "Get-VenuePlannedLegType -SpecPath ''"),
+                      ("exp-bound", f"Get-VenuePlannedLegType -SpecPath '{paths['exp']}' -ExpectSpecSha256 '{exp_sha}'"),
+                      ("exp-changed", f"Get-VenuePlannedLegType -SpecPath '{paths['exp']}' -ExpectSpecSha256 '{'0' * 64}'")]
+            p = run_ps("".join(f"Write-Output ('{k}=' + ({c})); " for k, c in calls))
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+        self.assertEqual(got, {"exp": "export", "play": "playback", "none": "playback", "case": "playback", "dup": "unknown", "arr": "unknown",
+                               "bad": "unknown", "arrval": "playback", "missing": "unknown", "empty": "unknown", "exp-bound": "export", "exp-changed": "unknown"})
+
+    def test_r6_b2_every_driver_passes_the_planned_type_to_the_reader(self) -> None:
+        # The class guard: every production call of Get-VenueLegHostLoad passes -PlannedLegType from the planned spec (Get-VenuePlannedLegType).
+        drivers = {"Invoke-VenueChain.ps1": "Get-VenuePlannedLegType -SpecPath ([string]$leg.spec)",
+                   "Invoke-VenueLeaseBatch.ps1": "Get-VenuePlannedLegType -SpecPath ([string]$leg.spec) -ExpectSpecSha256 $planSha",
+                   "Invoke-VenueBaseline.ps1": "$hlPlanned = Get-VenuePlannedLegType -SpecPath",
+                   "Invoke-VenueLeg.ps1": "$plannedLegType = Get-VenuePlannedLegType -SpecPath ([string]$entry.specPath)"}
+        for script, plan_call in drivers.items():
+            with self.subTest(script=script):
+                text = (DV_DIR / script).read_text(encoding="utf-8")
+                self.assertIn(plan_call, text)
+                calls = [l for l in text.splitlines() if "Get-VenueLegHostLoad -ReceiptPath" in l and not l.lstrip().startswith("#")]
+                self.assertTrue(calls, script)
+                for line in calls:   # every call on the line carries its own -PlannedLegType
+                    self.assertEqual(line.count("Get-VenueLegHostLoad -ReceiptPath"), line.count("-PlannedLegType"), (script, line))
+
+
+@unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+class MatrixRowStrictPredicateTests(unittest.TestCase):
+    """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (sol r5 B3, opus r5 A4): a matrix row is measured only when hostLoadState is exactly 'quiet' AND hostLoadProvisional
+    is a real $false; the count, the medians and the baseline count all use that one predicate."""
+
+    def run_dv(self, body: str) -> str:
+        script = f"$ErrorActionPreference = 'Stop'; Import-Module '{DV_RUNNER}' -Force -DisableNameChecking; " + body
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                           capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=180)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        return p.stdout
+
+    def test_r6_b3_an_unknown_missing_or_exceeded_row_is_never_counted(self) -> None:
+        rows = {"unknown": "hostLoadState = 'unknown'; hostLoadProvisional = $false", "missing": "hostLoadProvisional = $false",
+                "exceeded": "hostLoadState = 'exceeded'; hostLoadProvisional = $false", "upper": "hostLoadState = 'QUIET'; hostLoadProvisional = $false",
+                "na": "hostLoadState = 'not-applicable'; hostLoadProvisional = $false", "zero": "hostLoadState = 'quiet'; hostLoadProvisional = 0",
+                "arr": "hostLoadState = 'quiet'; hostLoadProvisional = @($false)", "str": "hostLoadState = 'quiet'; hostLoadProvisional = 'false'",
+                "quiet": "hostLoadState = 'quiet'; hostLoadProvisional = $false"}
+        body = "".join(f"Write-Output ('{k}=' + (Get-DvMatrixMeasuredCount -Rows @([pscustomobject]@{{ outcome = 'PASS'; presentedFps = 59.56; {v} }})) + ',' + "
+                       f"(Test-DvHostLoadRowClean -Row ([ordered]@{{ status = 'RAN'; fps = 42; {v} }}))); " for k, v in rows.items())
+        got = dict(l.split("=", 1) for l in self.run_dv(body).splitlines() if "=" in l)
+        for k in rows:
+            with self.subTest(row=k):
+                self.assertEqual(got[k], "1,True" if k == "quiet" else "0,False", (k, got[k]))
+
+    def test_r6_b3_the_row_builder_and_the_medians_use_the_strict_rule(self) -> None:
+        out = self.run_dv(
+            "$e = [pscustomobject]@{ seq = 1; repeat = 1; cellId = 'c1'; backend = 'cuda'; displayMode = 'fullscreen'; scaleFactor = 1; legId = 'l' }; "
+            "$r = Get-DvMatrixRow -PlanEntry $e -Receipt $null -HostLoad ([pscustomobject]@{ state = 'unknown'; provisional = $false }); "
+            "Write-Output ('ROWPROV=' + $r.hostLoadProvisional); "
+            "$full = [ordered]@{}; foreach ($p in $r.PSObject.Properties) { $full[$p.Name] = $p.Value }; "
+            "$full.outcome = 'PASS'; $full.presentedFps = 59.56; $full.timelineFpsAfterFirstPresent = 59.0; $full.hostLoadState = 'unknown'; $full.hostLoadProvisional = $false; "
+            "$rows = @([pscustomobject]$full); "
+            "$t = ConvertTo-DvMatrixTable -Rows $rows -Cells @([pscustomobject]@{ cellId = 'c1'; backend = 'cuda'; displayMode = 'fullscreen'; scaleFactor = 1 }); "
+            "Write-Output ('TABLE=' + (@(@($t) -join \"`n\" -split \"`r?`n\") | Where-Object { $_ -like '| c1 |*' }))")
+        self.assertIn("ROWPROV=True", out, "a standing that says unknown beside provisional=false is a provisional row")
+        table = [l for l in out.splitlines() if l.startswith("TABLE=")][-1]
+        self.assertIn("| 0/1 |", table, table)
+        self.assertNotIn("59.56", table, "an unknown row never reaches the median")
+        baseline = (DV_DIR / "Invoke-VenueBaseline.ps1").read_text(encoding="utf-8")
+        self.assertIn("$_.status -ceq 'RAN' -and $null -ne $_.fps -and (Test-DvHostLoadRowClean -Row $_)", baseline)
 
 
 if __name__ == "__main__":

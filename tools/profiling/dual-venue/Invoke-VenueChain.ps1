@@ -552,7 +552,8 @@ foreach ($leg in $plan) {
             } else {
                 $preLoad = Get-LegPreLoadMean $receipt
                 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: the smoke's own host-load verdict (VenueChain.psm1's one reader); provisional or not collected is never a counted class
-                $hl = Get-VenueLegHostLoad -ReceiptPath $receipt
+                # r6 (sol r5 B2): the export exemption comes only from the leg's PLANNED type (its spec's legType), never from the receipt's shape
+                $hl = Get-VenueLegHostLoad -ReceiptPath $receipt -PlannedLegType (Get-VenuePlannedLegType -SpecPath ([string]$leg.spec))
                 $hlRefusal = Get-VenueReferenceHostLoadRefusal -LegId $(if ($receipt) { [IO.Path]::GetFileNameWithoutExtension($receipt) } else { "leg:$($leg.name)" }) -Standing $hl
                 # a FOREIGN_FLOOR early exit in ANY probe of the leg (either phase, any attempt, GATE_BUSY retries included) leaves it contended: a later QUIET reading never promotes it to a counted class
                 $class = $(if ($re.verdict -ceq 'COOLDOWN_UNMET' -or $legPreFF -or $legReFF) { 'COOLDOWN_UNMET' } elseif ($null -eq $preLoad) { 'QUIET_PRELOAD_UNKNOWN' } elseif ($preLoad -le 30.0) { $(if ($hlRefusal) { 'HOSTLOAD_PROVISIONAL' } else { 'QUIET_PRELOAD_OK' }) } else { 'QUIET_PRELOAD_HIGH' })

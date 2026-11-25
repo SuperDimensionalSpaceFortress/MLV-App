@@ -31,6 +31,12 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 
 ROOT = Path(__file__).resolve().parents[2]
 SMOKE_SCRIPT = ROOT / "tools" / "profiling" / "run-release-gui-smoke.ps1"
 COMPARE_SCRIPT = ROOT / "tools" / "profiling" / "compare-release-gui-smoke-ab.ps1"
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (sol r5 B1): the comparator judges a host-load block by VenueChain.psm1's strict rule; its probe imports the same module.
+VENUE_CHAIN_MODULE = ROOT / "tools" / "profiling" / "dual-venue" / "VenueChain.psm1"
+COMPARE_PREAMBLE = (f"Import-Module '{VENUE_CHAIN_MODULE}' -Function ConvertFrom-VenueSmokeHostLoad, Get-VenueReferenceHostLoadRefusal"
+                    " -DisableNameChecking\n")
+# The shipped smoke writes before/after snapshots with collected = a real boolean (run-release-gui-smoke.ps1); a fully measured block carries them.
+SNAPS = "before = [pscustomobject]@{ collected = $true }; after = [pscustomobject]@{ collected = $true }"
 CUDA_AB_SCRIPT = ROOT / "tools" / "profiling" / "run-release-cuda-playback-ab.ps1"
 COMPARE_MACHINE_PERF_SCRIPT = ROOT / "tools" / "profiling" / "compare-machine-perf.ps1"
 P3_VALIDATION_SCRIPT = ROOT / "tools" / "profiling" / "run-ultramagnus-p3-validation.ps1"
@@ -78,13 +84,15 @@ class _ProbeCase(unittest.TestCase):
 
     script: Path
     functions: list[str]
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6: lines run before the extracted functions (the comparator imports VenueChain.psm1's strict host-load rule at script top)
+    preamble: str = ""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="hostload-probe-")
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
         self.probe = self.tmp / "probe.ps1"
-        self.probe.write_text(_extract_functions(self.script, self.functions), encoding="utf-8")
+        self.probe.write_text(self.preamble + _extract_functions(self.script, self.functions), encoding="utf-8")
 
     def run_snippet(self, body: str) -> subprocess.CompletedProcess:
         script = self.tmp / "run.ps1"
@@ -1562,9 +1570,10 @@ class CompareGuiSmokeAbInconclusiveVerdictTests(_ProbeCase):
 
     script = COMPARE_SCRIPT
     functions = ["Get-NestedValue", "Get-HostLoadComparisonEvidence", "Get-GuiSmokeAbVerdict"]
+    preamble = COMPARE_PREAMBLE
     CIM = ("[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $true; state = 'unknown'; reason = 'collection failed: CimException';"
            " before = [pscustomobject]@{ collected = $false }; after = [pscustomobject]@{ collected = $false } } }")
-    QUIET = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null } }"
+    QUIET = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null; " + SNAPS + " } }"
 
     def _verdict(self, before: str, after: str, failures: str = "@()") -> subprocess.CompletedProcess:
         return self.run_snippet(
@@ -1582,8 +1591,40 @@ class CompareGuiSmokeAbInconclusiveVerdictTests(_ProbeCase):
         self.assertIn("REFERENCE_PROVISIONAL leg=before reason=hostload-unknown", proc.stdout)
         self.assertNotIn("leg=after", proc.stdout)
 
+    def test_r6_b1_a_quiet_false_block_beside_an_uncollected_snapshot_is_inconclusive(self) -> None:
+        # sol r5 B1, its input: BeforeSmoke hostLoad {state quiet, provisional false, before.collected=false (CimException), after.collected=true}, AfterSmoke
+        # clean, no other failure -> the comparator returned PASS. The venue reader's rule reads it unknown: INCONCLUSIVE with the typed refusal.
+        uncollected = ("[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null;"
+                       " before = [pscustomobject]@{ collected = $false; error = 'collection failed: CimException' }; after = [pscustomobject]@{ collected = $true } } }")
+        proc = self._verdict(uncollected, self.QUIET)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("VERDICT=INCONCLUSIVE", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("REFERENCE_PROVISIONAL leg=before reason=hostload-unknown", proc.stdout)
+        self.assertNotIn("leg=after", proc.stdout)
+
+    def test_r6_b1_coerced_provisional_and_case_folded_states_are_inconclusive(self) -> None:
+        # sol r5 B1 (and opus r5 H1 / fable key3 A3): provisional=0, provisional=[false], provisional='false' and state 'QUIET' / 'Quiet' read clean.
+        for prov, state in (("0", "'quiet'"), ("@($false)", "'quiet'"), ("'false'", "'quiet'"), ("$false", "'QUIET'"), ("$false", "'Quiet'")):
+            with self.subTest(provisional=prov, state=state):
+                before = f"[pscustomobject]@{{ hostLoad = [pscustomobject]@{{ provisional = {prov}; state = {state}; reason = $null; {SNAPS} }} }}"
+                proc = self._verdict(before, self.QUIET)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("VERDICT=INCONCLUSIVE", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIn("REFERENCE_PROVISIONAL leg=before reason=hostload-", proc.stdout)
+
+    def test_r6_b1_the_comparator_uses_the_venue_readers_one_rule(self) -> None:
+        # The class guard: the comparator has no second host-load parser; it imports and calls VenueChain.psm1's.
+        text = COMPARE_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("Import-Module (Join-Path $PSScriptRoot 'dual-venue\\VenueChain.psm1') -Function ConvertFrom-VenueSmokeHostLoad, Get-VenueReferenceHostLoadRefusal", text)
+        body = _extract_functions(COMPARE_SCRIPT, ["Get-HostLoadComparisonEvidence"])
+        self.assertIn("ConvertFrom-VenueSmokeHostLoad -HostLoad $legHostLoad", body)
+        self.assertNotIn("[bool]$legProvisionalRaw", body, "no [bool] coercion of a declared provisional")
+        self.assertIn("Get-VenueReferenceHostLoadRefusal -LegId $legName -Standing $standing", _extract_functions(COMPARE_SCRIPT, ["Get-GuiSmokeAbVerdict"]))
+        # fable key3 r5 (GUI-SMOKE-AB-INCONCLUSIVE-WITHHOLD-DELTA-1): an INCONCLUSIVE verdict withholds the cross-leg fps deltas
+        self.assertIn("if ($displayComparability.status -ne 'same' -or [string]::Equals([string]$result.verdict, 'INCONCLUSIVE', [StringComparison]::Ordinal)) {", text)
+
     def test_a_missing_or_exceeded_block_is_inconclusive_even_beside_other_failures(self) -> None:
-        exceeded = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $true; state = 'exceeded'; reason = 'loaded' } }"
+        exceeded = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $true; state = 'exceeded'; reason = 'loaded'; " + SNAPS + " } }"
         proc = self._verdict("[pscustomobject]@{ }", exceeded, failures="@('before smoke did not independently pass validation.')")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("VERDICT=INCONCLUSIVE", proc.stdout, "never FAIL: a provisional comparison is no regression signal")
@@ -1610,6 +1651,7 @@ class CompareGuiSmokeAbHostLoadRefusalTests(_ProbeCase):
 
     script = COMPARE_SCRIPT
     functions = ["Get-NestedValue", "Get-HostLoadComparisonEvidence"]
+    preamble = COMPARE_PREAMBLE
 
     def _compare(self, before: str, after: str) -> subprocess.CompletedProcess:
         return self.run_snippet(
@@ -1623,14 +1665,14 @@ class CompareGuiSmokeAbHostLoadRefusalTests(_ProbeCase):
         )
 
     def test_two_quiet_legs_are_compared(self) -> None:
-        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null } }"
+        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null; " + SNAPS + " } }"
         proc = self._compare(quiet, quiet)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("FAILURES=0", proc.stdout)
 
     def test_provisional_leg_vs_nonprovisional_leg_is_refused(self) -> None:
         exceeded = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $true; state = 'exceeded'; reason = 'CPU 96% on before' } }"
-        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null } }"
+        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null; " + SNAPS + " } }"
         proc = self._compare(exceeded, quiet)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertNotIn("FAILURES=0", proc.stdout)
@@ -1648,7 +1690,7 @@ class CompareGuiSmokeAbHostLoadRefusalTests(_ProbeCase):
     def test_missing_hostload_field_reads_as_unknown_not_quiet(self) -> None:
         # A run recorded before this gate existed (or an old schema) never measured load.
         legacy = "[pscustomobject]@{ schema = 'mlvapp-gui-smoke-result.v2' }"
-        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null } }"
+        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null; " + SNAPS + " } }"
         proc = self._compare(legacy, quiet)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("BEFORE_STATE=unknown", proc.stdout)
@@ -1659,7 +1701,7 @@ class CompareGuiSmokeAbHostLoadRefusalTests(_ProbeCase):
         # degenerate/partial write, or a future schema drift) must not coerce [bool]$null to
         # $false and read as clean -- that is fail-toward-clean, backwards from this gate.
         degenerate = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ state = 'exceeded' } }"
-        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null } }"
+        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null; " + SNAPS + " } }"
         proc = self._compare(degenerate, quiet)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertNotIn("FAILURES=0", proc.stdout)
@@ -1672,7 +1714,7 @@ class CompareGuiSmokeAbHostLoadRefusalTests(_ProbeCase):
         # provisional=false paired with a missing state read as an inconsistent, clean-reading
         # combination. state=unknown must now always force provisional=true.
         inconsistent = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false } }"
-        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null } }"
+        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null; " + SNAPS + " } }"
         proc = self._compare(inconsistent, quiet)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("BEFORE_STATE=unknown", proc.stdout)
@@ -1684,8 +1726,8 @@ class CompareGuiSmokeAbHostLoadRefusalTests(_ProbeCase):
         # exceeded/false leg previously read clean here -- only state=="unknown" forced
         # provisional=true, so state=="exceeded" alongside provisional=false fell through as
         # FAILURES=0. Clean now requires state=="quiet" AND provisional==false.
-        contradictory = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'exceeded'; reason = 'CPU 96%' } }"
-        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null } }"
+        contradictory = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'exceeded'; reason = 'CPU 96%'; " + SNAPS + " } }"
+        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null; " + SNAPS + " } }"
         proc = self._compare(contradictory, quiet)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("BEFORE_STATE=exceeded", proc.stdout)

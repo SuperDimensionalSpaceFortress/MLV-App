@@ -496,8 +496,9 @@ if ($pre -ne 'none') { Set-Content -LiteralPath (Join-Path $edir 'summary.json')
 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: FAKE_LEG_HOSTLOADS per call = the smoke result.json's hostLoad: quiet (default) | cim (the 2026-11-21 a134532e shape:
 # before/after collected=false CimException, state unknown, provisional true) | missing (a result.json with no hostLoad block) | none (no result.json)
 $hlMode = Pick $env:FAKE_LEG_HOSTLOADS $k 'quiet'
+# r6 (sol r5 B2): expshape = a CIM-failed result.json and, in the receipt slot, a receipt shaped like an export receipt that binds nothing
 $hlBlock = switch ($hlMode) {
-    'cim' { '{"before":{"collected":false,"error":"collection failed: CimException"},"after":{"collected":false,"error":"collection failed: CimException"},"state":"unknown","provisional":true,"reason":"Host load telemetry could not be collected"}' }
+    { $_ -in 'cim', 'expshape' } { '{"before":{"collected":false,"error":"collection failed: CimException"},"after":{"collected":false,"error":"collection failed: CimException"},"state":"unknown","provisional":true,"reason":"Host load telemetry could not be collected"}' }
     'missing' { $null }
     default { '{"before":{"collected":true},"after":{"collected":true},"state":"quiet","provisional":false,"reason":"quiet"}' }
 }
@@ -507,6 +508,7 @@ if ($hlMode -ne 'none') {
     # like the real leg, the receipt binds the smoke result it was written from (evidence.resultJsonSha256; adversary-b0c05520.json A1)
     Set-Content -LiteralPath $rp -Value ('{"evidence":{"resultJsonSha256":"' + (Get-FileHash -LiteralPath $resPath -Algorithm SHA256).Hash.ToLowerInvariant() + '"}}')
 }
+if ($hlMode -eq 'expshape') { Set-Content -LiteralPath $rp -Value ('{"schema":"mlv-app/dual-venue-receipt/v1","scale":null,"display":null,"evidence":{},"export":{"format":"prores","receiptSha256":"' + ('0' * 64) + '","verdict":null}}') }
 # r4 (adversary r4 A1): FAKE_LEG_TAIL_SLEEP = the leg child's own work after its agent job ended (its receipt, its evidence), before it exits
 if ($env:FAKE_LEG_TAIL_SLEEP) { Start-Sleep -Seconds ([int]$env:FAKE_LEG_TAIL_SLEEP) }
 # r6 (adversary-848f6559.json A1): FAKE_LEG_EXIT per call = the child exits with that code AFTER its agent job's result landed (a receipt write denied, Invoke-VenueLeg.ps1:314)
@@ -935,6 +937,16 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         [b] = self.batches()
         [l] = b["legs"]
         self.assertEqual((l["class"], l["counted"], l["hostLoadState"], l["hostLoadProvisional"]), ("QUIET_PRELOAD_HIGH", False, "unknown", True), l)
+        self.assertIn(f"REFERENCE_PROVISIONAL leg={Path(l['receipt']).stem} reason=hostload-unknown", (self.run_dir / "batch.log").read_text(encoding="utf-8"))
+
+    def test_r6_b2_an_export_shaped_receipt_in_a_playback_leg_is_never_counted(self) -> None:
+        # sol r5 B2, its input: a playback leg whose receipt slot holds the production schema shaped as an export receipt (scale/display null, prores,
+        # 64 zeroes, verdict null, no identity, no playback hashes), a CIM-failed smoke result and pre-load 5. RED: not-applicable, QUIET_PRELOAD_OK, counted.
+        r = self.run_batch(self.specs[:1], FAKE_LEG_HOSTLOADS="expshape")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        [l] = b["legs"]
+        self.assertEqual((l["class"], l["counted"], l["hostLoadState"], l["hostLoadProvisional"]), ("HOSTLOAD_PROVISIONAL", False, "unknown", True), l)
         self.assertIn(f"REFERENCE_PROVISIONAL leg={Path(l['receipt']).stem} reason=hostload-unknown", (self.run_dir / "batch.log").read_text(encoding="utf-8"))
 
     def test_a_quiet_host_load_leaves_todays_counting_unchanged(self) -> None:
