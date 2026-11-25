@@ -303,6 +303,15 @@ struct DropFrameTickResult
     double correctedStart = 0.0;
 };
 
+// r1 iteration 1 (adversary pass 1 A1 on fc9e3e93, introduced major): whether the tick's DELTA crossed a lap. The r9 fold of a start
+// at or past wrapAt marks the tick wrapped with wrapLaps 0 (the position moved back), but that move is a correction, not a wrap: a
+// reader that skips a "wrapped" tick (the source-frame counter, the slip histogram's LoopWrap path, the startup skip count) lost
+// the real step the delta made from correctedStart (stale 120 + 1.2 frames on cut 1..50: 22 -> 23.2 counted nothing).
+inline bool dropFrameTickLapped( const DropFrameTickResult & tick )
+{
+    return tick.wrapped;   // RED stub: today's reading
+}
+
 // r1: the frame a corrected start sits on (the slider's frame for it), floor, held inside int; not a number reads 0.
 inline int dropFrameCorrectionFrame( double position )
 {

@@ -4958,3 +4958,31 @@ TEST( PlaybackFrameRange, R1TheSourceFrameCounterRebasesAtTheCorrectedStart )
     ASSERT_EQ( 1, counter.externalJumpRebases );
     ASSERT_EQ( 2LL, (long long)counter.consumed() );
 }
+
+// r1 iteration 1 (adversary pass 1 A1 on fc9e3e93, introduced major): a 200-frame clip, Drop Frame and Loop on, conform off, cut 1..50,
+// slider 10, stale drop position 120, the counter begun at 10; an ordinary 50 ms tick at 24 fps grants 1.2 frames. The fold to 22 is a
+// correction with no lap, so the tick is not a lap for its readers: the counter counts the real step 22 -> 23.2 (consumed 2, fc9e3e93: 1),
+// and the startup skip count of a 134 ms tick granting 3.216 frames (22 -> 25.216) books its 2 skipped frames (fc9e3e93: 0).
+TEST( PlaybackFrameRange, R1Iter1AZeroLapFoldIsNotALapForTheTicksReaders )
+{
+    const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick( 120.0, 1.2, 1, 50, true );
+    ASSERT_TRUE( tick.corrected );
+    ASSERT_TRUE( tick.correctedStart == 22.0 );
+    ASSERT_EQ( 0, tick.wrapLaps );
+    ASSERT_FALSE( playback_frame_range::dropFrameTickLapped( tick ) );   // fc9e3e93: true (tick.wrapped)
+    playback_frame_range::SourceFrameAdvanceCounter counter;
+    counter.begin( 10 );
+    counter.noteEngineTick( tick.correctedStart, tick.position, playback_frame_range::dropFrameTickLapped( tick ) );
+    ASSERT_EQ( 0, counter.wrapOrBackwardTicks );                       // fc9e3e93: 1
+    ASSERT_EQ( 2LL, (long long)counter.consumed() );                   // fc9e3e93: 1
+    // the startup sibling: MainWindow counts a tick's skipped frames unless it lapped
+    const playback_frame_range::DropFrameTickResult burst = playback_frame_range::advanceDropFrameTick( 120.0, 3.216, 1, 50, true );
+    const int skipped = playback_frame_range::dropFrameTickLapped( burst )
+        ? 0 : playback_native_pace::skippedFrames( burst.correctedStart, burst.position );
+    ASSERT_EQ( 2, skipped );                                            // fc9e3e93: 0
+    // controls: a lap the delta crosses from the folded start IS a lap (100 + 60 on cut 1..50: one 49-frame lap), and an in-cut
+    // wrap is one, as before
+    ASSERT_TRUE( playback_frame_range::dropFrameTickLapped( playback_frame_range::advanceDropFrameTick( 100.0, 60.0, 1, 50, true ) ) );
+    ASSERT_TRUE( playback_frame_range::dropFrameTickLapped( playback_frame_range::advanceDropFrameTick( 48.9, 0.192, 1, 50, true ) ) );
+    ASSERT_FALSE( playback_frame_range::dropFrameTickLapped( playback_frame_range::advanceDropFrameTick( 10.0, 0.192, 1, 50, true ) ) );
+}

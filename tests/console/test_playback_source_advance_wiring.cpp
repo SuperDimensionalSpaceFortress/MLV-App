@@ -110,7 +110,15 @@ TEST(PlaybackSourceAdvanceWiring, R1ACorrectionIsRecordedBeforeTheTicksLapsAndEv
     ASSERT_TRUE(correction >= 0);
     ASSERT_TRUE(dropWrap > correction);
     ASSERT_EQ(1, body.count(QStringLiteral("m_playbackWrapRecorder.noteEngineCorrection(")));
-    ASSERT_TRUE(body.contains(QStringLiteral("m_sourceAdvance.noteEngineTick( dropFrameTick.correctedStart, dropFrameTick.position, dropFrameTick.wrapped );")));
+    // iteration 1 (adversary pass 1 A1 on fc9e3e93): the counter, the slip path and the startup skips read whether the tick LAPPED
+    // (dropFrameTickLapped), never the r9 fold's wrapped flag, so the real step after a zero-lap fold is counted
+    const int lapped = body.indexOf(QStringLiteral("const bool dropFrameLapped = playback_frame_range::dropFrameTickLapped( dropFrameTick );"));
+    ASSERT_TRUE(lapped >= 0);
+    ASSERT_TRUE(body.indexOf(QStringLiteral("m_sourceAdvance.noteEngineTick( dropFrameTick.correctedStart, dropFrameTick.position, dropFrameLapped );")) > lapped);
+    ASSERT_TRUE(body.indexOf(QStringLiteral("dropFrameLapped ? playback_slip::AdvancePath::LoopWrap")) > lapped);
+    ASSERT_TRUE(body.indexOf(QStringLiteral("if( !dropFrameLapped\n")) > lapped);
+    ASSERT_FALSE(body.contains(QStringLiteral("dropFrameTick.wrapped ? playback_slip::AdvancePath::LoopWrap")));
+    ASSERT_FALSE(body.contains(QStringLiteral("if( !dropFrameTick.wrapped")));
     ASSERT_TRUE(body.contains(QStringLiteral("playback_native_pace::skippedFrames(\n                            dropFrameTick.correctedStart, dropFrameTick.position );")));
     ASSERT_FALSE(body.contains(QStringLiteral("sourcePositionBeforeDropTick")));
     ASSERT_TRUE(body.contains(QStringLiteral("if( ( dropFrameTick.wrapped || dropFrameTick.corrected ) && ui->actionAudioOutput->isChecked() )")));

@@ -7,6 +7,7 @@
 #include "../../platform/qt/GpuPresentTailWindow.h"
 #include "../../platform/qt/PlaybackNativePaceGuard.h"
 #include "../../platform/qt/PlaybackSlipHistogram.h"
+#include "../../platform/qt/PlaybackFrameRange.h"
 
 #include <cmath>
 #include <string>
@@ -994,4 +995,23 @@ TEST(PlaybackSlipHistogram, R1ATimelineCorrectionIsNotAnAdvance)
     h.noteTimelineMove( AdvancePath::DropTick, 41, 140.0, 1.0, 0.0 );
     ASSERT_EQ( 1, h.timelineAdvanceSincePresent() );
     ASSERT_TRUE( h.frameHasDeadline( 40 ) );
+}
+
+// r1 iteration 1 (adversary pass 1 A1 on fc9e3e93): cut 1..50, slider 10, stale drop position 120, a 1.2-frame tick. The fold to 22 is a
+// correction with no lap, so MainWindow's path is DropTick (it picks LoopWrap only when the tick lapped): the real step 22 -> 23 books
+// 1 frame of DropTick advance, sets frame 22's deadline and leaves advance-since-present 1 (fc9e3e93 took LoopWrap: 0, no deadline).
+TEST(PlaybackSlipHistogram, R1Iter1TheRealStepAfterAZeroLapFoldIsADropTickAdvance)
+{
+    const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick( 120.0, 1.2, 1, 50, true );
+    SlipHistogram h;
+    h.reset( 10, 24.0 );
+    h.setPlayStart( 0.0 );
+    h.noteTimelineCorrection( playback_frame_range::dropFrameCorrectionFrame( tick.correctedStart ) );
+    h.noteTimelineMove( playback_frame_range::dropFrameTickLapped( tick ) ? AdvancePath::LoopWrap : AdvancePath::DropTick,
+                        static_cast<int>( tick.position ), 50.0, tick.appliedFrames, 0.0 );
+    ASSERT_EQ( 1, h.timelineAdvanceSincePresent() );                   // fc9e3e93: 0
+    ASSERT_TRUE( h.frameHasDeadline( 22 ) );                           // fc9e3e93: false
+    const Summary s = h.finish( 100.0, 23 );
+    ASSERT_EQ( 1LL, (long long)s.advanceByPath[static_cast<int>( AdvancePath::DropTick )] );   // fc9e3e93: 0
+    ASSERT_EQ( 0LL, (long long)s.advanceByPath[static_cast<int>( AdvancePath::LoopWrap )] );   // fc9e3e93: 1
 }

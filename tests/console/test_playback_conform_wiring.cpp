@@ -300,7 +300,8 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
     // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r8 iteration 1 (pass 14 A1 on a2983bf2): the granted share is the tick's applied delta
     ASSERT_TRUE(body.indexOf(QStringLiteral("const double grantedDropFrames = dropFrameTick.appliedFrames;"), at) > at);
     // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: the counter reads the start the delta applied from (a correction is not footage)
-    ASSERT_TRUE(body.indexOf(QStringLiteral("m_sourceAdvance.noteEngineTick( dropFrameTick.correctedStart, dropFrameTick.position, dropFrameTick.wrapped );"), at) > at);
+    // (iteration 1, adversary pass 1 A1 on fc9e3e93: and skips only a tick that lapped, never a zero-lap fold)
+    ASSERT_TRUE(body.indexOf(QStringLiteral("m_sourceAdvance.noteEngineTick( dropFrameTick.correctedStart, dropFrameTick.position, dropFrameLapped );"), at) > at);
 }
 
 TEST(PlaybackConformWiring, SlipHistogramMovesUsePlaybackRate)
