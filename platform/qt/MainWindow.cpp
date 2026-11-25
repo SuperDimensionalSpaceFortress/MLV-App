@@ -3046,8 +3046,9 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     // m_playbackPaceGuard is the ceiling (PlaybackNativePaceGuard.h).
     timeDiff = playback_native_pace::shapedTickTimeDiffMs( timeDiff, getPlaybackFramerate(), predictivePlaybackAdvance,
                                                            ui->actionPlay->isChecked(), hadPendingAdvance );
-    // r5 (pass 8 A3 on c37d6fd5): the fps meter gates on the shaped tick; the cap below bounds only the frame request.
-    const int meterTickMs = timeDiff;
+    // r5 (pass 8 A3 on c37d6fd5, pass 9 A1 on 22c93691): the fps meter gate, the present trace and both interaction logs
+    // read the shaped tick, as on the base; the cap below bounds only the frame request (playbackHandling).
+    const int shapedTickMs = timeDiff;
     // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 (adversary r2 A1): one tick never asks the drop-frame loop for more frames than
     // it can count (a long suspension at a high source rate); every ordinary tick is unchanged.
     // r4 (pass 5 A2): only the Drop Frame request reads the tick as frames, so Normal mode keeps its whole tick (fps meter).
@@ -3059,7 +3060,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     const double tracePositionBefore = m_newPosDropMode;
     playbackHandling( timeDiff );
     if( m_playbackPresentTrace.active() )
-        m_playbackPresentTrace.noteAdvance( mlv_stage_timing_now() * 1000.0, tracePositionBefore, m_newPosDropMode, timeDiff );
+        m_playbackPresentTrace.noteAdvance( mlv_stage_timing_now() * 1000.0, tracePositionBefore, m_newPosDropMode, shapedTickMs );
     if( frameChangedBeforePlayback )
     {
         invalidateGpuPreviewProcessingConfigCache();
@@ -3070,7 +3071,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
             QStringLiteral("timer_frame.playback_handled"),
             QStringLiteral("play_checked=%1 time_diff_ms=%2 position_before=%3 position_after=%4 frame_changed=%5 dont_draw=%6 opening=%7")
                 .arg( bool01( ui->actionPlay->isChecked() ) )
-                .arg( timeDiff )
+                .arg( shapedTickMs )
                 .arg( positionBeforePlayback )
                 .arg( ui->horizontalSliderPosition->value() )
                 .arg( bool01( m_frameChanged ) )
@@ -3121,7 +3122,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
                 QStringLiteral("play_checked=%1 position=%2 time_diff_ms=%3")
                     .arg( bool01( ui->actionPlay->isChecked() ) )
                     .arg( ui->horizontalSliderPosition->value() )
-                    .arg( timeDiff ),
+                    .arg( shapedTickMs ),
                 true );
         }
         drawFrame( !m_skipImmediateTimecodeLabel );
@@ -3132,7 +3133,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
         //feeds the drop-frame elapsed time), so it cannot serve here -- see playback_fps_meter::smoothedFrameMs.
         const int measuredFrameMs = playback_fps_meter::stampAgeMs( lastDrawTime, nowTime );
         lastDrawTime = nowTime;
-        if( meterTickMs != 0 )
+        if( shapedTickMs != 0 )
         {
             m_playbackFpsEmaFrameMs =
                 playback_fps_meter::smoothedFrameMs( m_playbackFpsEmaFrameMs, measuredFrameMs );

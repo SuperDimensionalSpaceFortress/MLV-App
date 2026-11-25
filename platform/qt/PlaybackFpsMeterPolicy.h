@@ -68,7 +68,8 @@ inline constexpr double kMaxTickFrames = 999990.0;
 /*! The tick's elapsed milliseconds, cut so that \a framerate * ms / 1000 stays within +-kMaxTickFrames. An ordinary
  *  8 ms tick is unchanged at any source rate up to 124,998,750 fps (no camera records within five orders of magnitude
  *  of it); past that rate an ordinary tick is cut to at most kMaxTickFrames, which still lands inside a Loop cut (r3 pass A2 on
- *  8743841f: 150,000,000 fps, 8 ms -> 6 ms). Below it only a long suspension is cut. The cut is re-checked with
+ *  8743841f: 150,000,000 fps, 8 ms -> 6 ms). Below it a tick is cut only when its own frames pass the bound (a long
+ *  suspension, or a longer poll near that rate: r5 pass 9 A8, 9 ms at 124,000,000 fps -> 8 ms). The cut is re-checked with
  *  the call site's own expression (MainWindow::playbackHandling: framerate * (double)timeDiff / 1000.0), because the
  *  reciprocal rounds (pass 4 A2: 781250000/821 fps made 1,050,880 ms, one double step over the bound). A positive age
  *  stays at least 1 ms up to exactly kMaxTickFrames * 1000 = 999,990,000 fps; past that rate even 1 ms is over the bound

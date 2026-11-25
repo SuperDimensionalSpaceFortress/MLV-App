@@ -1967,7 +1967,7 @@
       "clock": "other",
       "justification": "STATUS-FPS-METER-1: smoothedFrameMs() input-validity guard. msSinceLastDraw is the draw-to-draw age from playback_fps_meter::stampAgeMs() on monotonic QElapsedTimer stamps (PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 replaced the wall clock); a non-positive value (first draw with no prior stamp, or two draws in the same millisecond) leaves the FPS EMA unchanged instead of blending a bogus sample. A display smoothing guard for the status-bar FPS meter, not proof that any stage ran or a frame rendered.",
       "lines": [
-        120
+        121
       ]
     },
     {
@@ -1977,7 +1977,7 @@
       "clock": "other",
       "justification": "STATUS-FPS-METER-1: smoothedFrameMs() seed-or-reset select. emaFrameMs <= 0.0 is the EMA's uninitialized sentinel (seed with the raw sample rather than blend); fpsMeterStalled() re-seeds after a long gap between draws. Both choose how the displayed FPS smooths a measured interval, never whether work ran; the value feeds only the status-bar FPS text.",
       "lines": [
-        121
+        122
       ]
     },
     {
@@ -2890,7 +2890,7 @@
       "clock": "other",
       "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 (adversary r2 A1) frameBoundedTickTimeDiffMs: with no positive rate or a zero tick there is no frame request to bound, so the tick's milliseconds pass through unchanged. Bounds an input of the drop-frame request; never decides whether any stage ran. Normal mode passes rate 0 (r4 pass 5 A2), so its tick passes through here unchanged.",
       "lines": [
-        80
+        81
       ]
     },
     {
@@ -2900,7 +2900,7 @@
       "clock": "other",
       "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 (adversary r2 A1) frameBoundedTickTimeDiffMs: keeps the sign of an over-long tick while cutting its magnitude to the frame bound. A sign select on the drop-frame request; never a run-proof.",
       "lines": [
-        93
+        94
       ]
     },
     {
@@ -2910,27 +2910,38 @@
       "clock": "other",
       "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r4 iteration 2 (adversary pass 7 A1) frameBoundedTickTimeDiffMs: the tick's magnitude in 64 bits (so INT_MIN negates safely), the ceiling the step-up to the largest accepted age never passes. An absolute-value select on the drop-frame request; never a run-proof.",
       "lines": [
-        90
+        91
       ]
     },
     {
       "path": "platform/qt/MainWindow.cpp",
-      "anchor": "if ( meterTickMs != 0 )",
+      "anchor": "if ( shapedTickMs != 0 )",
       "class": "value_fallback_select",
       "clock": "other",
-      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r5 (adversary pass 8 A3) timerFrameEvent (clock: a QElapsedTimer monotonic stamp age): the status-bar fps meter folds a draw-to-draw sample into its EMA only on a tick whose SHAPED elapsed time (monotonic stampAgeMs, taken before the Drop Frame request cap) is nonzero, as the base gated on the shaped tick. It selects whether a display sample is smoothed in; the draw itself already happened, and it never proves a stage ran or a frame rendered.",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r5 (adversary pass 8 A3) timerFrameEvent (clock: a QElapsedTimer monotonic stamp age): the status-bar fps meter folds a draw-to-draw sample into its EMA only on a tick whose SHAPED elapsed time (monotonic stampAgeMs, taken before the Drop Frame request cap) is nonzero, as the base gated on the shaped tick. It selects whether a display sample is smoothed in; the draw itself already happened, and it never proves a stage ran or a frame rendered. Pass 9 A1: the same shaped tick feeds the present trace and both interaction logs.",
       "lines": [
-        3135
+        3136
       ]
     },
     {
       "path": "tests/console/test_playback_fps_meter_wiring.cpp",
-      "anchor": "const QString gateLine = QStringLiteral ( \"        if( meterTickMs != 0 )\\n\" ) ;",
+      "anchor": "const QString gateLine = QStringLiteral ( \"        if( shapedTickMs != 0 )\\n\" ) ;",
       "class": "not_run_proof_structural",
       "clock": "other",
-      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r5 (adversary pass 8 A3): a source-text pin string for the meter gate in timerFrameEvent; the wiring test counts and orders it in the source. No duration is compared at runtime and nothing is proven to have run.",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r5 (adversary pass 8 A3, pass 9 A6): a source-text pin string for the meter gate in timerFrameEvent; the wiring tests count and order it in the source and apply a dead-gate mutation to it in memory. No duration is compared at runtime and nothing is proven to have run.",
       "lines": [
-        258
+        259,
+        314
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_fps_meter_wiring.cpp",
+      "anchor": "\"        if( shapedTickMs != 0 )\\n\"",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r5 (adversary pass 9 A6): one line of meterGateIsLive's contiguous source-text pin (the gate with its neighbours), which rejects a dead `if( false )` in front of the gate. A string literal matched against the source; no duration is compared and nothing is proven to have run.",
+      "lines": [
+        283
       ]
     },
     {
