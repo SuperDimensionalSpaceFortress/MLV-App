@@ -377,19 +377,22 @@ TEST(PlaybackFpsMeterPolicy, OneTickLapsStayWithinTheBoundFromAStaleStartOutside
     const double staleGranted = stale.position - 20.0 + (double)stale.wrapWidth * stale.wrapLaps;
     ASSERT_TRUE(staleGranted >= 0.0 && staleGranted <= 999990.0);
     // r6 (sol r5 S2 on 6aaac7f5): a stale start already at or past the lap limit no longer keeps the base arithmetic
-    // (1000001 + 2.4 wrapped 1000003 laps). It is folded back to its first lap (the stale laps past that one are moved, not
-    // recorded: DropFrameTickResult::foldedFrames), and only then does the delta advance: 1000001 + 2.4 makes 3 laps to 0.4
-    // and still grants the whole 2.4 (OneTickLapsStayWithinTheBoundFromAStartAtOrPastTheLapLimit checks the accounting).
+    // (1000001 + 2.4 wrapped 1000003 laps). r6 iteration 2 (pass 11 A1 on 4c41c80b): it is folded into the cut onto its own
+    // phase (the stale laps are moved, never recorded: DropFrameTickResult::foldedFrames), and only then does the delta
+    // advance: 1000001 + 2.4 starts from phase 0 and makes the 2 laps the delta itself crosses, to 0.4, granting the whole
+    // 2.4 (AFoldedStartKeepsItsDeltaAndTheAppliedAdvanceAccounting checks the accounting). 4c41c80b made 3 laps.
     const playback_frame_range::DropFrameTickResult farStale =
         playback_frame_range::advanceDropFrameTick(1000001.0, 2.4, 1, 2, true);
-    ASSERT_EQ(3, farStale.wrapLaps);
+    ASSERT_EQ(2, farStale.wrapLaps);
     ASSERT_TRUE(farStale.wrapped);
     ASSERT_TRUE(std::fabs(farStale.position - 0.4) < 1e-6);
     ASSERT_TRUE(farStale.position >= 0.0 && farStale.position < 1.0);
-    // a stale start far past the cut (a long clip) with an ordinary request: 6aaac7f5 made 3,000,000 laps (the base's)
+    // a stale start far past the cut (a long clip) with an ordinary request: 6aaac7f5 made 3,000,000 laps (the base's),
+    // 4c41c80b one; 0 + 0.25 crosses no wrap point, so it records none (the tick still reads wrapped: it moved back)
     const playback_frame_range::DropFrameTickResult far =
         playback_frame_range::advanceDropFrameTick(3000000.0, 0.25, 1, 2, true);
-    ASSERT_EQ(1, far.wrapLaps);
+    ASSERT_EQ(0, far.wrapLaps);
+    ASSERT_TRUE(far.wrapped);
     ASSERT_TRUE(std::fabs(far.position - 0.25) < 1e-6);
     // conform (presentLastFrame: wrap past the last frame by the cut's frame count) with the most debt a tick carries
     const playback_frame_range::DropFrameTickResult conformed = playback_frame_range::advanceDropFrameTick(
@@ -442,7 +445,7 @@ TEST(PlaybackFpsMeterPolicy, OneTickLapsStayWithinTheBoundFromAStartAtOrPastTheL
     const DropFrameTickResult stale = advanceDropFrameTick(1100000.0, 1.0, 1, 2, true, false);
     ASSERT_TRUE(stale.wrapped);
     ASSERT_TRUE(stale.wrapLaps <= 1000000);
-    ASSERT_EQ(2, stale.wrapLaps);
+    ASSERT_EQ(1, stale.wrapLaps); // phase 0 + 1 crosses wrapAt once (4c41c80b, folded onto [wrapAt, wrapAt + 1): 2)
     ASSERT_TRUE(stale.position >= 0.0 && stale.position < 1.0);
     const DropFrameTickResult bounded = advanceDropFrameTick(1100000.0, 999990.0, 1, 2, true, false);
     ASSERT_TRUE(bounded.wrapped);
@@ -483,10 +486,10 @@ TEST(PlaybackFpsMeterPolicy, AFoldedStartKeepsItsDeltaAndTheAppliedAdvanceAccoun
         return tick.position - before + tick.foldedFrames + static_cast<double>( tick.wrapWidth ) * tick.wrapLaps;
     };
     const DropFrameTickResult stale = advanceDropFrameTick(1100000.0, 1.0, 1, 2, true, false);
-    ASSERT_TRUE(stale.foldedFrames == 1099999.0);
+    ASSERT_TRUE(stale.foldedFrames == 1100000.0);
     ASSERT_TRUE(granted(stale, 1100000.0) == 1.0);
     const DropFrameTickResult bounded = advanceDropFrameTick(1100000.0, 999990.0, 1, 2, true, false);
-    ASSERT_EQ(999991, bounded.wrapLaps);
+    ASSERT_EQ(999990, bounded.wrapLaps);
     ASSERT_TRUE(granted(bounded, 1100000.0) == 999990.0);
     const DropFrameTickResult farStale = advanceDropFrameTick(1000001.0, 2.4, 1, 2, true);
     ASSERT_TRUE(std::fabs(granted(farStale, 1000001.0) - 2.4) < 1e-6);
@@ -500,10 +503,35 @@ TEST(PlaybackFpsMeterPolicy, AFoldedStartKeepsItsDeltaAndTheAppliedAdvanceAccoun
     ASSERT_TRUE(back.wrapped);
     ASSERT_EQ(0, back.wrapLaps);
     ASSERT_TRUE(granted(back, 1100000.0) == -5.5);
-    // a +inf start is not a number of frames: it folds to wrapAt and reports an infinite fold
+    // a +inf start is not a number of frames: it folds to the cut's first position and reports an infinite fold
     const DropFrameTickResult endlessStart = advanceDropFrameTick(HUGE_VAL, 1.0, 1, 2, true, false);
     ASSERT_TRUE(std::isinf(endlessStart.foldedFrames));
     ASSERT_TRUE(std::fabs(endlessStart.position) < 1e-9);
+    // r6 iteration 2 (pass 11 A1 on 4c41c80b): the stale distance records NO lap. Sol's row: paused drop position 1100000,
+    // cut 1..2, an eligible 8 ms tick at 24 fps (0.192 frames) from phase 0 crosses no wrap point; 4c41c80b recorded one lap
+    // (it folded onto [wrapAt, wrapAt + width)), and a zero grant did too
+    const DropFrameTickResult phaseOnly = advanceDropFrameTick(1100000.0, 0.192, 1, 2, true, false);
+    ASSERT_TRUE(phaseOnly.wrapped);
+    ASSERT_EQ(0, phaseOnly.wrapLaps);
+    ASSERT_TRUE(std::fabs(phaseOnly.position - 0.192) < 1e-12);
+    ASSERT_TRUE(std::fabs(granted(phaseOnly, 1100000.0) - 0.192) < 1e-9);
+    const DropFrameTickResult zeroGrant = advanceDropFrameTick(1100000.0, 0.0, 1, 2, true, false);
+    ASSERT_EQ(0, zeroGrant.wrapLaps);
+    ASSERT_TRUE(zeroGrant.position == 0.0);
+    ASSERT_TRUE(granted(zeroGrant, 1100000.0) == 0.0);
+    // the fold keeps the start's fractional phase: 1100000.25 + 0.5 lands on 0.75
+    const DropFrameTickResult fractional = advanceDropFrameTick(1100000.25, 0.5, 1, 2, true, false);
+    ASSERT_EQ(0, fractional.wrapLaps);
+    ASSERT_TRUE(fractional.position == 0.75);
+    // pass 11 A2: a negative delta that ends inside the cut no longer skips the fold, so the fold is reported
+    const DropFrameTickResult backInside = advanceDropFrameTick(1100000.0, -1099999.5, 1, 2, true, false);
+    ASSERT_TRUE(backInside.foldedFrames == 1100000.0);
+    ASSERT_TRUE(granted(backInside, 1100000.0) == -1099999.5);
+    // pass 11 A3: the phase comes from exact fmods, not a rounded difference: 2^54 on cut 1..4 (wrapAt 3, width 3) has
+    // phase 2^54 mod 3 = 1 and a zero delta stays there (4c41c80b's rounded 2^54 - 3 lost it)
+    const DropFrameTickResult huge = advanceDropFrameTick(18014398509481984.0, 0.0, 1, 4, true, false);
+    ASSERT_EQ(0, huge.wrapLaps);
+    ASSERT_TRUE(huge.position == 1.0);
     // nothing is folded below the limit, inside the cut, or without Loop
     ASSERT_TRUE(advanceDropFrameTick(1000000.0, 0.5, 1, 2, true, false).foldedFrames == 0.0);
     ASSERT_TRUE(advanceDropFrameTick(20.0, 0.1, 1, 2, true).foldedFrames == 0.0);
