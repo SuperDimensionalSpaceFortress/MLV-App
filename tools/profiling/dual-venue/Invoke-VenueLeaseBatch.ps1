@@ -1771,7 +1771,7 @@ function Get-ExportBudgetRefusal([string]$Path) {
     return '', ''
 }
 
-function Get-ScalarLegShapeRefusal([string]$Path) {
+function Get-ScalarLegShapeRefusal([string]$Path, [string]$ExpectSha256 = '') {
     # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r8 (adversary r8 A3): the -LegSpec / -LegSet modes run the leg's SHAPE predicate (Get-DvLegSpecShapeRefusal, the one
     # the leg and Get-LegSpecRefusal call) before any claim, read the way the leg reads the spec (-NoEnumerate). A spec that does not parse is left to the
     # existing paths (unchanged); only a shape the leg would throw on after the lease opened is refused here. '' when the shape is runnable.
@@ -1781,6 +1781,13 @@ function Get-ScalarLegShapeRefusal([string]$Path) {
     $specRead = Read-SpecBytesWithin $Path (Get-SpecReadBoundSec)
     if ($specRead.state -ceq 'TIMEOUT') { return "SPEC_READ_TIMEOUT '$Path' cannot be run: the leg spec could not be read within the time left before -DeadlineUtc; no claim or lease is taken on it" }
     if ($specRead.state -cne 'OK') { return "the leg spec is not valid JSON (it could not be read: $($specRead.error -replace '\s+', ' '))" }
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r3 (sol r2 B2): a -LegSet entry carries the sha256 the set planner judged (-ExpectSha256). The RAW bytes read here are compared with
+    # it BEFORE any parse or shape check (Invoke-VenueLeg's own order), so bytes replaced after planning are always the typed SPEC_CHANGED_AFTER_PREFLIGHT, whatever they hold
+    # ('{', null, [], a string-valued switch), never LEG_SPEC_INVALID; an unchanged spec that is invalid is still judged below and keeps LEG_SPEC_INVALID.
+    if ($ExpectSha256) {
+        $readSha = Get-BytesSha256 ([byte[]]$specRead.bytes)
+        if ($readSha -cne $ExpectSha256) { return "SPEC_CHANGED_AFTER_PREFLIGHT '$Path' cannot be run: the leg spec read as sha256 $readSha after the leg-set planner judged sha256 $ExpectSha256 (planned_sha256=$ExpectSha256); no claim or lease is taken on bytes the planner did not judge" }
+    }
     try { $spec = [Text.Encoding]::UTF8.GetString($specRead.bytes) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop }
     catch { return "the leg spec is not valid JSON ($($_.Exception.Message -replace '\s+', ' '))" }
     $script:SpecShapeSha256[$Path] = Get-BytesSha256 $specRead.bytes  # r19 (sol r18 B1 sibling): the bytes this shape check judged
@@ -1887,8 +1894,8 @@ if ($legPlanMode) {
     # the room left before -DeadlineUtc), so the planner's judged read is bounded like every other spec read and the module compiles nothing of its own
     $sp = try { Get-DvLegSetPlan -LegSetPath (Join-Path $here "legsets\$LegSet.json") -Repeats $Repeats -Backend $(if ($Backend) { $Backend } else { '' }) -WithFileKey -FileKeyReader { param($p) Read-SpecBytesWithin $p (Get-SpecReadBoundSec) } } catch { Stop-Usage $_.Exception.Message }
     foreach ($e in $sp.plan) {
-        $shapeRefusal = Get-ScalarLegShapeRefusal ([string]$e.specPath)   # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r8 (adversary r8 A3): before the lease, as -LegPlan does
-        if ($shapeRefusal -clike 'SPEC_READ_TIMEOUT *') { Stop-Usage $shapeRefusal }   # r19 (sol r18 B2 sibling): the read's own typed code
+        $shapeRefusal = Get-ScalarLegShapeRefusal ([string]$e.specPath) ([string]$e.specSha256)   # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r8 (adversary r8 A3): before the lease, as -LegPlan does; BATCH-3 r3 (sol r2 B2): the planner's sha256 first
+        if ($shapeRefusal -clike 'SPEC_READ_TIMEOUT *' -or $shapeRefusal -clike 'SPEC_CHANGED_AFTER_PREFLIGHT *') { Stop-Usage $shapeRefusal }   # r19 (sol r18 B2 sibling): the read's own typed code; BATCH-3 r3 (B2): and the planner-digest refusal, typed
         if ($shapeRefusal) { Stop-Usage "LEG_SPEC_INVALID '$($e.specPath)' cannot be run: $shapeRefusal" }
         $budgetRefusal = Get-ExportBudgetRefusal ([string]$e.specPath)   # r8 (adversary r7 A3): before the lease, as -LegPlan does
         if ($budgetRefusal[0]) { Stop-Usage "$($budgetRefusal[0]) $($budgetRefusal[1])" }

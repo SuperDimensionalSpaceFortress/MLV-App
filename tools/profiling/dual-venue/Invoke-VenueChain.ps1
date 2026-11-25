@@ -188,6 +188,19 @@ function L([string]$Message) {
     Write-Output $line
 }
 
+$script:ChainLogAppendFailures = 0
+function Write-ChainLineNoThrow([string]$Message) {
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r3 (sol r2 B1): L for the lines of a leg's result path (LEG_FAILED, its spec-refusal label) and of the claim's release in the
+    # finally. L throws on a FAILED append (as Add-Content did), and from there that throw ended the chain before CHAIN_RESULT. Here a failed append is said on stderr
+    # (bounded), counted in CHAIN_RESULT (chainLogAppendFailures), and the line still goes to stdout; the chain's result, exit code and next leg are never decided by it.
+    try { L $Message }
+    catch {
+        $script:ChainLogAppendFailures++
+        Write-ChainDiagnostic "$Message (chain log write failed: $($_.Exception.Message -replace '\s+', ' '))"
+        Write-Output "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $Message"
+    }
+}
+
 $script:ChainLogAppendDelayMs = 0   # offline test seam only (the bounded append's pool thread waits this long first, as a stalled share does); production leaves it 0
 function Add-ChainLogLine([string]$Line) {
     # b2 r2 (A4): one chain-log line appended on a pool thread (the compiled writer below) and waited for at most $script:EvidenceWriteBoundMs; without the compiled writer, on a
@@ -636,7 +649,8 @@ foreach ($leg in $plan) {
             if ($re.foreignFloor) { $legReFF = $true; $legReFFLine = $re.foreignFloorLine }
             L "QUIET leg=$($leg.name) phase=under-claim exit=$($re.code) verdict=$($re.verdict) mean=$(Format-Mean $re.mean)$(if ($re.reason) { " reason=$($re.reason)" })"
             if ($re.verdict -ceq 'GATE_BUSY') {
-                L "CLAIM_RELEASED leg=$($leg.name) result=$(Release-VenueClaim -Venue $Venue -Nonce $claim.nonce -ClaimDir $ClaimDir) reason=gate-busy-under-claim (back to waiting)"; $released = $true
+                # BATCH-3 r3 (sol r2 B1 sibling): released once, marked released, then the line through Write-ChainLineNoThrow (a FAILED append here ended the chain before CHAIN_RESULT)
+                $releaseResult = Release-VenueClaim -Venue $Venue -Nonce $claim.nonce -ClaimDir $ClaimDir; $released = $true; Write-ChainLineNoThrow "CLAIM_RELEASED leg=$($leg.name) result=$releaseResult reason=gate-busy-under-claim (back to waiting)"
                 if ($ticket) {
                     # the ONE allowed keep (-TicketKeepMax) holds the place for one more quiet probe; the next GATE_BUSY under the claim gives it up and rejoins at the back
                     if ($ticketKeeps -lt $TicketKeepMax) { $ticketKeeps++; L "TICKET_KEPT leg=$($leg.name) ticket=$($ticket.name) keeps=$ticketKeeps/$TicketKeepMax (keeps its place in the line for one more quiet probe)" }
@@ -654,7 +668,8 @@ foreach ($leg in $plan) {
                 # (d1) the under-claim probe blocked in heavy-slot admission and ended not measured: same held offer as (a1), made AFTER Bachelor's claim is released (ultra-magnus is
                 # offered while Bachelor is free, never while this chain holds it) and BEFORE -OnUnknown Stop sets stopReason. The leg never ran, so no after-leg offer follows.
                 if ($suppEnabled -and ([DateTime]::UtcNow - $legWaitStart).TotalSeconds -ge $SupplementaryHeldSec) {
-                    L "CLAIM_RELEASED leg=$($leg.name) result=$(Release-VenueClaim -Venue $Venue -Nonce $claim.nonce -ClaimDir $ClaimDir) reason=not-measured-under-claim (the held offer follows)"; $released = $true
+                    # BATCH-3 r3 (sol r2 B1 sibling): released once, marked released, then the line through Write-ChainLineNoThrow
+                    $releaseResult = Release-VenueClaim -Venue $Venue -Nonce $claim.nonce -ClaimDir $ClaimDir; $released = $true; Write-ChainLineNoThrow "CLAIM_RELEASED leg=$($leg.name) result=$releaseResult reason=not-measured-under-claim (the held offer follows)"
                     Invoke-Supplementary $leg 'held'
                 }
                 Add-Result $leg 'NOT_RUN' @{ verdict = 'VENUE_QUIET_UNKNOWN'; reason = $re.reason; phase = 'under-claim' }
@@ -708,19 +723,18 @@ foreach ($leg in $plan) {
                 # Invoke-VenueLeg exits 0 whenever it wrote a receipt (any outcome, INVALID included); non-zero means it died without one. Whatever
                 # DVE_OUTCOME it printed before dying is not evidence: the leg is LEG_FAILED / INVALID, never RAN, and the chain exits 7. It goes on to the next leg.
                 Add-Result $leg 'LEG_FAILED' @{ verdict = $re.verdict; quietMean = $re.mean; outcome = 'INVALID'; printedOutcome = $outcome; legExit = $legCode; receipt = $null }
-                if ($legTimedOut) { L "LEG $($leg.name) LEG_FAILED TIMEOUT outcome=INVALID printedOutcome=$outcome verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) (the leg $(Format-VenueBoundedChildEnd $lp 86400): no usable receipt)" }
-                else { L "LEG $($leg.name) LEG_FAILED exit=$legCode outcome=INVALID printedOutcome=$outcome verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) (the leg exited non-zero: no usable receipt)" }
                 # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1: a leg that refused other bytes than the planned ones (or could not read the planned spec) is named on its own typed line and in its
                 # result (specRefusal). It stays LEG_FAILED / INVALID, exit 7, so the label never turns a leg into a measurement either way. The record is read from this child's
                 # own STDOUT only (r3), from a leg that wrote no receipt line, as a whole anchored line naming this leg's planned hash.
                 # (r2, adversary A5: the exit code is set BEFORE the label, and the label's log write may fail without costing the result, CHAIN_RESULT or the next leg)
+                # BATCH-3 r3 (sol r2 B1): and BEFORE the LEG_FAILED line too, with specRefusal: that append ran first and threw on a FAILED write, so exit stayed 0, specRefusal was
+                # never recorded and CHAIN_RESULT never went out. Both lines go through Write-ChainLineNoThrow (said on stderr, counted, still on stdout), so neither decides the result.
                 if ($exitCode -eq 0) { $exitCode = 7 }
                 $specRefusal = $(if (-not $receipt) { Get-LegSpecRefusalLine $legLines $leg } else { '' })
-                if ($specRefusal) {
-                    $results[$results.Count - 1] | Add-Member -NotePropertyName specRefusal -NotePropertyValue (($specRefusal -split ' ', 2)[0]) -Force
-                    try { L "$specRefusal (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)" }
-                    catch { Write-ChainDiagnostic "$specRefusal (chain log write failed: $($_.Exception.Message -replace '\s+', ' '))" }   # b2 r1 (pass 1 A4): bounded
-                }
+                if ($specRefusal) { $results[$results.Count - 1] | Add-Member -NotePropertyName specRefusal -NotePropertyValue (($specRefusal -split ' ', 2)[0]) -Force }
+                if ($legTimedOut) { Write-ChainLineNoThrow "LEG $($leg.name) LEG_FAILED TIMEOUT outcome=INVALID printedOutcome=$outcome verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) (the leg $(Format-VenueBoundedChildEnd $lp 86400): no usable receipt)" }
+                else { Write-ChainLineNoThrow "LEG $($leg.name) LEG_FAILED exit=$legCode outcome=INVALID printedOutcome=$outcome verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) (the leg exited non-zero: no usable receipt)" }
+                if ($specRefusal) { Write-ChainLineNoThrow "$specRefusal (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)" }   # b2 r1 (pass 1 A4): bounded
             } else {
                 $preLoad = Get-LegPreLoadMean $receipt
                 # a FOREIGN_FLOOR early exit in ANY probe of the leg (either phase, any attempt, GATE_BUSY retries included) leaves it contended: a later QUIET reading never promotes it to a counted class
@@ -751,7 +765,8 @@ foreach ($leg in $plan) {
             }
             $ran = $true
         } finally {
-            if (-not $released) { L "CLAIM_RELEASED leg=$($leg.name) result=$(Release-VenueClaim -Venue $Venue -Nonce $claim.nonce -ClaimDir $ClaimDir)" }
+            # BATCH-3 r3 (sol r2 B1): the claim is released ONCE, then its line goes through Write-ChainLineNoThrow: a FAILED append here threw out of the finally and ended the chain before CHAIN_RESULT
+            if (-not $released) { $releaseResult = Release-VenueClaim -Venue $Venue -Nonce $claim.nonce -ClaimDir $ClaimDir; Write-ChainLineNoThrow "CLAIM_RELEASED leg=$($leg.name) result=$releaseResult" }
         }
         if (-not $ran) { break }
     }
@@ -770,6 +785,7 @@ $summary = [ordered]@{
     supplementary = @($suppResults)   # ultra-magnus runs and typed skips (header item 6): never counted in legs / ran / failed / notRun, never in exitCode
 }
 if ($streakStop) { $summary['unhealthyStop'] = $streakStop }
+if ($script:ChainLogAppendFailures -gt 0) { $summary['chainLogAppendFailures'] = $script:ChainLogAppendFailures }   # BATCH-3 r3 (sol r2 B1): lines whose chain-log append failed (each also on stdout and stderr)
 $resultLine = 'CHAIN_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 6)
 # b2 r2 (adversary pass 3 A4 sibling): the typed result goes out FIRST, and its chain-log copy is the bounded append (a stalled ChainLog never holds CHAIN_RESULT)
 Write-Output $resultLine

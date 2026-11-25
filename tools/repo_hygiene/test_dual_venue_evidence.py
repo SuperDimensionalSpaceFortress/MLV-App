@@ -6936,6 +6936,105 @@ exit 0
         self.assertEqual(next(r for r in result["legs"] if r["spec"].endswith(self.SWAP_TARGET))["status"], "RAN", result["legs"])
         self.assertIn("DVE_CHAIN_SPEC_CHANGED", proc.stderr, "the label still reaches the operator when the log write fails")
 
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r3 (sol r2 B2): with -LegSet, a planned spec replaced after planning by readable but INVALID bytes was refused
+    # BATCH_USAGE LEG_SPEC_INVALID by the shape check, before the preflight compared the bytes with the planner's sha256: the typed SPEC_CHANGED_AFTER_PREFLIGHT was lost.
+    # The raw-byte digest is compared with the planned one BEFORE any parse or shape check (the leg child's own order); an UNCHANGED invalid spec keeps LEG_SPEC_INVALID.
+    def b3r3_b2_batch_run(self, dv: Path, env: dict) -> subprocess.CompletedProcess:
+        from datetime import datetime, timedelta, timezone
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fake = self.tmp / "batch-fake-script.ps1"
+        fake.write_text("exit 0\n", encoding="utf-8")
+        return run_pwsh(["-File", str(dv / "Invoke-VenueLeaseBatch.ps1"), "-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-RunDir", str(self.tmp / "batch-run"),
+                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake),
+                         "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline], env_extra=env, timeout=420)
+
+    def assert_b3r3_b2_swapped_invalid_bytes_are_refused_as_changed(self, data: bytes) -> None:
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.BATCH_PLAN_ANCHOR, self.BATCH_PLAN_ANCHOR + self.BATCH_SWAP),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_STOP_ANCHOR, self.BATCH_STOP)])
+        target = dv / "legs" / self.SWAP_TARGET
+        planned = hashlib.sha256(target.read_bytes()).hexdigest()
+        after = self.tmp / "b3r3-b2-bytes-after-planning.json"
+        after.write_bytes(data)
+        proc = self.b3r3_b2_batch_run(dv, {"DVT_SWAP_TO": str(target), "DVT_SWAP_FROM": str(after), "DVT_SWAP_MODE": "copy"})
+        self.assertEqual(target.read_bytes(), data, "the fixture really replaced the planned spec's bytes after planning")
+        swapped = hashlib.sha256(data).hexdigest()
+        lines = proc.stderr.splitlines()
+        self.assertEqual([l for l in lines if l.startswith("BATCH_USAGE LEG_SPEC_INVALID ")], [],
+                         "bytes changed after planning were refused as an invalid ORIGINAL spec (old: LEG_SPEC_INVALID before the planner-digest comparison)\n" + proc.stderr)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        refusal = [l for l in lines if l.startswith("BATCH_USAGE SPEC_CHANGED_AFTER_PREFLIGHT ")]
+        self.assertEqual(len(refusal), 1, proc.stderr)
+        self.assertIn(f"read as sha256 {swapped} after the leg-set planner judged sha256 {planned} (planned_sha256={planned})", refusal[0])
+        self.assertEqual([l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ")], [], proc.stdout)
+        self.assertFalse((self.tmp / "claims").exists() and any((self.tmp / "claims").iterdir()), "no claim is taken")
+
+    def test_planned_hash_bind_b3_r3_b2_batch_a_legset_spec_replaced_by_an_open_brace_after_planning_is_spec_changed(self) -> None:
+        self.assert_b3r3_b2_swapped_invalid_bytes_are_refused_as_changed(b"{")
+
+    def test_planned_hash_bind_b3_r3_b2_batch_a_legset_spec_replaced_by_json_null_after_planning_is_spec_changed(self) -> None:
+        self.assert_b3r3_b2_swapped_invalid_bytes_are_refused_as_changed(b"null")
+
+    def test_planned_hash_bind_b3_r3_b2_batch_a_legset_spec_replaced_by_an_empty_array_after_planning_is_spec_changed(self) -> None:
+        self.assert_b3r3_b2_swapped_invalid_bytes_are_refused_as_changed(b"[]")
+
+    def test_planned_hash_bind_b3_r3_b2_batch_a_legset_spec_replaced_by_a_string_disable_look_assist_after_planning_is_spec_changed(self) -> None:
+        self.assert_b3r3_b2_swapped_invalid_bytes_are_refused_as_changed(b'{"generatorArgs":{"disableLookAssist":"false"}}')
+
+    def test_planned_hash_bind_b3_r3_b2_batch_control_an_unchanged_invalid_legset_spec_keeps_leg_spec_invalid(self) -> None:
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.BATCH_PLAN_ANCHOR, self.BATCH_PLAN_ANCHOR + self.BATCH_SWAP),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_STOP_ANCHOR, self.BATCH_STOP)])
+        target = dv / "legs" / self.SWAP_TARGET
+        spec = json.loads(target.read_text(encoding="utf-8"))
+        if not isinstance(spec.get("generatorArgs"), dict):
+            spec["generatorArgs"] = {}
+        spec["generatorArgs"]["disableLookAssist"] = "false"   # invalid BEFORE planning: the planner judges these very bytes
+        target.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
+        proc = self.b3r3_b2_batch_run(dv, {})
+        lines = proc.stderr.splitlines()
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertEqual([l for l in lines if l.startswith("BATCH_USAGE SPEC_CHANGED_AFTER_PREFLIGHT ")], [], "unchanged bytes are not a change\n" + proc.stderr)
+        invalid = [l for l in lines if l.startswith("BATCH_USAGE LEG_SPEC_INVALID ")]
+        self.assertEqual(len(invalid), 1, proc.stderr)
+        self.assertIn(self.SWAP_TARGET, invalid[0])
+        self.assertFalse((self.tmp / "claims").exists() and any((self.tmp / "claims").iterdir()), "no claim is taken")
+
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r3 (sol r2 B1): on a refused leg the chain appended LEG_FAILED BEFORE it set exit 7 and recorded specRefusal, and the append
+    # threw on a FAILED write (a sharing violation): exit stayed 0, the refusal was never recorded and CHAIN_RESULT never went out. A FAILED append at the claim's release
+    # (the finally) also ended the chain before CHAIN_RESULT. The exit code and specRefusal are now set first, and a failed append on that path is said on stderr, counted in
+    # CHAIN_RESULT (chainLogAppendFailures) and its line still goes to stdout; it costs neither CHAIN_RESULT, the exit code nor the next leg.
+    def b3r3_b1_chain_run(self, line_pattern: str) -> tuple[subprocess.CompletedProcess, str]:
+        fail = ("function Add-ChainLogLine([string]$Line) {\n",
+                "function Add-ChainLogLine([string]$Line) {\n    if ($Line -clike '" + line_pattern + "') { return 'FAILED TEST FIXTURE: the process cannot access the file because it is being used by another process' }\n")
+        dv = self.mutated_runner([("Invoke-VenueChain.ps1", *fail)])
+        target, source = dv / "legs" / self.SWAP_FIRST, dv / "legs" / self.SWAP_SOURCE   # the first entry, so a leg runs after the refusal
+        planned = hashlib.sha256(target.read_bytes()).hexdigest()
+        fx = self.chain_fixture(dv, target, source)
+        return self.run_fixture_chain(dv, fx, ["-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-NoSupplementary"]), planned
+
+    def assert_b3r3_b1_refusal_and_result_survive(self, proc: subprocess.CompletedProcess, planned: str, failures: int) -> None:
+        results = [l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")]
+        self.assertEqual(len(results), 1, "a failed chain-log append suppressed CHAIN_RESULT\n" + proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 7, proc.stdout + proc.stderr)
+        result = json.loads(results[0][len("CHAIN_RESULT="):])
+        self.assertEqual(result["exitCode"], 7, result)
+        row = next(r for r in result["legs"] if r["spec"].endswith(self.SWAP_FIRST))
+        self.assertEqual((row["status"], row["outcome"], row.get("specRefusal")), ("LEG_FAILED", "INVALID", "DVE_CHAIN_SPEC_CHANGED"), row)
+        self.assertEqual([l["leaf"] for l in self.fixture_legs()], [self.SWAP_FIRST, self.SWAP_TARGET], "the next leg still ran")
+        self.assertEqual(next(r for r in result["legs"] if r["spec"].endswith(self.SWAP_TARGET))["status"], "RAN", result["legs"])
+        self.assertEqual(result.get("chainLogAppendFailures"), failures, result)
+        self.assertTrue(any(f"planned_sha256={planned}" in l and " DVE_CHAIN_SPEC_CHANGED " in l for l in proc.stdout.splitlines()), proc.stdout)
+        self.assertEqual(len([l for l in proc.stdout.splitlines() if " CLAIM_RELEASED leg=" in l]), 2, "each leg's claim is released once\n" + proc.stdout)
+        self.assertIn("chain log write failed", proc.stderr, "the failed append is said on stderr")
+
+    def test_planned_hash_bind_b3_r3_b1_chain_a_failed_leg_failed_append_keeps_exit_7_the_refusal_and_chain_result(self) -> None:
+        proc, planned = self.b3r3_b1_chain_run("* LEG_FAILED *")
+        self.assert_b3r3_b1_refusal_and_result_survive(proc, planned, 1)
+        self.assertTrue(any(" LEG_FAILED exit=" in l for l in proc.stdout.splitlines()), "the LEG_FAILED line still goes to stdout\n" + proc.stdout)
+
+    def test_planned_hash_bind_b3_r3_b1_chain_a_failed_claim_release_append_keeps_chain_result(self) -> None:
+        proc, planned = self.b3r3_b1_chain_run("* CLAIM_RELEASED *")
+        self.assert_b3r3_b1_refusal_and_result_survive(proc, planned, 2)
+
     # r3 (adversary pass 2 on 5ef85bc6, A1): the chain read its leg child's outcome, receipt and spec refusal back from <RunDir>\leg-<name>.out.txt, and its probes' verdicts
     # from quiet-<name>-<phase>.out.txt. Two chains on one -RunDir (two venues) name a leg alike, so another chain's child could write that file between this child's exit
     # and this parent's read. The fixture writes it there (the other chain's transcript) right after this child exits; the chain must classify from its OWN child's output.
