@@ -1680,10 +1680,18 @@ function Get-VenueHlMember([object]$O, [string]$N) {
     , $p.Value
 }
 
+function Test-VenueHlHasMember([object]$O, [string]$N) {
+    # adversary-90151822.json A1: whether the member is there at all, so a member present with a null value is told apart from an absent one.
+    if (-not (Test-VenueHlObject $O)) { return $false }
+    if ($O -is [System.Collections.IDictionary]) { return [bool]$O.Contains($N) }
+    $null -ne $O.PSObject.Properties[$N]
+}
+
 function Find-VenueJsonDuplicateMember {
     # adversary-b0c05520.json A2: ConvertFrom-Json keeps the LAST of two same-named members, so a duplicate could pick a clean value. The first duplicated member
     # name (case-insensitive, as PowerShell property lookup is) at the root or anywhere under a root hostLoad member, or $null when there is none.
-    param([Parameter(Mandatory)][string]$Text)
+    # adversary-90151822.json A2: -All walks the whole document (the receipt: a repeated export or evidence member must not pick the export branch or the hash).
+    param([Parameter(Mandatory)][string]$Text, [switch]$All)
     $doc = [System.Text.Json.JsonDocument]::Parse($Text)
     try {
         $walk = $null
@@ -1701,7 +1709,7 @@ function Find-VenueJsonDuplicateMember {
             }
             $null
         }
-        & $walk $doc.RootElement '$' $false
+        & $walk $doc.RootElement '$' ([bool]$All)
     } finally { $doc.Dispose() }
 }
 
@@ -1734,9 +1742,11 @@ function ConvertFrom-VenueSmokeHostLoad {
             $errors += "$side not collected$(if ($err) { " ($([string]$err))" })"
         }
     }
-    $during = Get-VenueHlMember $HostLoad 'during'
-    if ($null -ne $during) {
-        if ($during -is [string] -or -not ($during -is [System.Collections.IList])) { $collected = $false; $errors += 'during is not a list of snapshots' }
+    # adversary-90151822.json A1: a during member that is present is judged even when its value is null (the smoke always writes a list, so null is malformed);
+    # only an absent member (older smoke results) is skipped.
+    if (Test-VenueHlHasMember $HostLoad 'during') {
+        $during = Get-VenueHlMember $HostLoad 'during'
+        if ($null -eq $during -or $during -is [string] -or -not ($during -is [System.Collections.IList])) { $collected = $false; $errors += 'during is not a list of snapshots' }
         else {
             $bad = 0
             foreach ($el in $during) { $c = Get-VenueHlMember $el 'collected'; if (-not ($c -is [bool] -and $c)) { $bad++ } }
@@ -1768,7 +1778,11 @@ function Get-VenueLegHostLoad {
     $unknown = [pscustomobject]@{ state = 'unknown'; provisional = $true; collected = $false; reason = 'no smoke result.json for the leg'; applies = $true }
     try {
         if (-not $ReceiptPath) { return $unknown }
-        $rc = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($ReceiptPath)) -NoEnumerate
+        $rcText = [IO.File]::ReadAllText($ReceiptPath)
+        # adversary-90151822.json A2: a receipt that repeats a member anywhere is 'unknown' before its export or evidence member is read (the last one would win)
+        $rcDup = Find-VenueJsonDuplicateMember -Text $rcText -All
+        if ($rcDup) { $unknown.reason = "the receipt repeats the member $rcDup"; return $unknown }
+        $rc = ConvertFrom-Json -InputObject $rcText -NoEnumerate
         if (-not (Test-VenueHlObject $rc)) { $unknown.reason = 'the receipt is not a JSON object'; return $unknown }
         if (Test-VenueHlObject (Get-VenueHlMember $rc 'export')) { return [pscustomobject]@{ state = 'not-applicable'; provisional = $false; collected = $false; reason = 'export leg: no GUI smoke'; applies = $false } }
         $want = Get-VenueHlMember (Get-VenueHlMember $rc 'evidence') 'resultJsonSha256'
