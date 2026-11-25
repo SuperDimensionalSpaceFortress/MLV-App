@@ -185,11 +185,15 @@ if ($null -eq $proc) {
 $null = $proc.Handle   # cache the handle so ExitCode survives the process (Start-Process -PassThru quirk)
 # PLAYBACK-CLIP-LENGTH-ENFORCE-3 round 2 (fable H3): this script never ends the Play on a clock of its own either.
 # The APP ends it when its engine has consumed the source frames of the window (a pinned frame included); the
-# only wait below is the app's own wall-clock safety net (requested / 0.5 + 15 s) plus open + settle time. A process
-# still running past it is killed and the capture is INVALID (PLAY_SAFETY_TIMEOUT), never a candidate.
-$captureBudgetMs = (Get-GuiSmokePlaySafetyMs -Seconds $Seconds) + $SettleMs + 60000
+# only wait below is the app's own wall-clock safety net (max(requested / 0.5 + 15 s, ceil((frames - 1) / kGatedPaceFloorFps) + 15 s),
+# frames from the clip-length gate's native fps and the window the app requests, min(-Seconds, N / fps) for a pinned frame;
+# PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1, adversary r1 A2) plus open + settle time. A process still running past it is killed and
+# the capture is INVALID (PLAY_SAFETY_TIMEOUT), never a candidate. WaitForExit takes an Int32: a budget past it waits the Int32 maximum
+# (24.8 days) instead of throwing before the typed timeout and cleanup below.
+$captureBudgetMs = (Get-GuiSmokePlaySafetyMs -Seconds $Seconds -NativeFps $clipLengthGate.fps -TargetPresentedFrames $PresentedFrames) + $SettleMs + 60000
+$captureWaitMs = [int][Math]::Min([int64][int]::MaxValue, [int64]$captureBudgetMs)
 $captureKilled = $false
-if (-not $proc.WaitForExit($captureBudgetMs)) {
+if (-not $proc.WaitForExit($captureWaitMs)) {
     $captureKilled = $true
     try { $proc.Kill($true) } catch { try { $proc.Kill() } catch {} }
     [void]$proc.WaitForExit(5000)

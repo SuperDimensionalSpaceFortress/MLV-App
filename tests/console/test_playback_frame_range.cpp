@@ -849,13 +849,21 @@ TEST( HfrPlayFloor, AConformedPlayCannotStretchAShortHfrClipIntoALongerWindow )
 
 TEST( HfrPlayFloor, AConformTooSlowForTheSourceWindowIsRefusedBeforePlay )
 {
-    // The ruling's recorded side effect, fail closed: a 120 fps clip conformed to 24 needs 1200 source frames for its
-    // 10 s floor, 1199 / 24 = 50 s of Play, over the 10 / 0.5 + 15 = 35 s budget: PLAY_PACE_TOO_SLOW before Play.
+    // The ruling's recorded side effect, fail closed: a 120 fps clip needs 1200 source frames for its 10 s floor.
+    // PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: the Gated budget is sized from those frames at kGatedPaceFloorFps,
+    // max( 10 / 0.5, 1199 / 15 ) + 15 s = 94.934 s. A 12 fps conform needs 1199 / 12 = 99.9 s of Play, over it:
+    // PLAY_PACE_TOO_SLOW before Play. (A 24 fps conform, 50 s, was refused under the old 35 s budget and is now admitted:
+    // the floor the gate demands of a 120 fps clip is 15 fps, never 60.)
     const PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, 3000, 3000, 120.0, 10.0,
-                                                            playback_frame_range::kFloorFromNativeFps, true, 24.0 );
+                                                            playback_frame_range::kFloorFromNativeFps, true, 12.0 );
     ASSERT_FALSE( v.ok );
     ASSERT_EQ( std::string( "PLAY_PACE_TOO_SLOW" ), std::string( v.reason ) );
     ASSERT_EQ( 1200, v.requiredFrames );
+    ASSERT_EQ( 94.934, v.wallBudgetSeconds );
+    const PlayableWindowVerdict conform24 = evaluatePlayableWindow( 0, 1, 3000, 3000, 120.0, 10.0,
+                                                                    playback_frame_range::kFloorFromNativeFps, true, 24.0 );
+    ASSERT_TRUE( conform24.ok );
+    ASSERT_EQ( 1200, conform24.requiredFrames );
 }
 
 TEST( HfrPlayFloor, AnHfrClipLoopedToReachTenSecondsIsRefusedAndNeverCountsAsPlayed )
@@ -4891,4 +4899,106 @@ TEST( PlaybackMeasuredLoopExit, R9TheAdmissionJudgesThePlayedCutRangeAndTheStart
     outsideFirst.notePresent( 120 );
     ASSERT_EQ( 2, outsideFirst.outside );                              // RED on eaa5c9e0: 1
     ASSERT_EQ( 0, outsideFirst.repeats );
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: the Gated budget for 20 s of M16-1457 (59.94 fps, 1199 source frames) was
+// 20 / 0.5 + 15 s = 55 s, within 0.5-1 s of the baseline's own run time (1198 steps at 22.0 fps = 54.5 s). On 2026-11-24,
+// 10 of 14 Bachelor drift legs ended PLAY_PACE_TOO_SLOW at 17.85-20.24 fps with no stall. The budget is now also sized from
+// the ADMITTED source-frame count at kGatedPaceFloorFps (15 fps): (1199 - 1) / 15 + 15 s = 94.867 s.
+// ---------------------------------------------------------------------------------------------------------
+namespace
+{
+PlayableWindowVerdict knifeEdge1457Window()
+{
+    return evaluatePlayableWindow( 0, 1, 2859, 2859, 59.94, 20.0 );
+}
+}
+
+TEST( PlayPaceBudgetKnifeEdge, R1The1457BaselineAt21Point5FpsReachesTheWindow )
+{
+    const PlayableWindowVerdict v = knifeEdge1457Window();
+    ASSERT_TRUE( v.ok );
+    ASSERT_EQ( 1199, v.requiredFrames );
+    const int64_t budget = std::llround( v.wallBudgetSeconds * 1000.0 );
+    const EngineRun run = runStalledEngine( 260, 21.5, v.requiredFrames, budget, 10, std::vector<Stall>(), 2859 );
+    ASSERT_TRUE( run.state == PlayStopState::Reached );   // RED on 715ce467: PaceTooSlow (55 s budget)
+    ASSERT_TRUE( run.consumed >= v.requiredFrames );
+    ASSERT_TRUE( run.elapsedMs <= budget );
+}
+
+TEST( PlayPaceBudgetKnifeEdge, R2TheSlowestMeasured1457ModeAt17Point85FpsReachesTheWindow )
+{
+    const PlayableWindowVerdict v = knifeEdge1457Window();
+    const int64_t budget = std::llround( v.wallBudgetSeconds * 1000.0 );
+    const EngineRun run = runStalledEngine( 260, 17.85, v.requiredFrames, budget, 10, std::vector<Stall>(), 2859 );
+    ASSERT_TRUE( run.state == PlayStopState::Reached );   // RED on 715ce467: PaceTooSlow (55 s budget)
+    ASSERT_TRUE( run.elapsedMs <= budget );
+}
+
+TEST( PlayPaceBudgetKnifeEdge, G1ATrueStallIsNeverReachedAndEndsInsideTheBudget )
+{
+    const PlayableWindowVerdict v = knifeEdge1457Window();
+    const int64_t budget = std::llround( v.wallBudgetSeconds * 1000.0 );
+    const EngineRun run = runStalledEngine( 260, 22.0, v.requiredFrames, budget, 10, std::vector<Stall>(), 2859, 10000 );
+    ASSERT_TRUE( run.state == PlayStopState::PaceTooSlow || run.state == PlayStopState::SafetyTimeout );
+    ASSERT_TRUE( run.consumed < v.requiredFrames );
+    ASSERT_TRUE( run.elapsedMs <= budget + 10 );
+}
+
+TEST( PlayPaceBudgetKnifeEdge, G2AFarTooSlowRunStillEndsAtThePaceProbe )
+{
+    const PlayableWindowVerdict v = knifeEdge1457Window();
+    const int64_t budget = std::llround( v.wallBudgetSeconds * 1000.0 );
+    const EngineRun run = runStalledEngine( 260, 10.0, v.requiredFrames, budget, 10, std::vector<Stall>(), 2859 );
+    ASSERT_TRUE( run.state == PlayStopState::PaceTooSlow );
+    ASSERT_TRUE( run.elapsedMs >= playback_frame_range::kPaceProbeMs );
+    ASSERT_TRUE( run.elapsedMs <= playback_frame_range::kPaceProbeMs + 10 );
+}
+
+TEST( PlayPaceBudgetKnifeEdge, G3AClipAt30FpsOrBelowKeepsTodaysBudgetExactly )
+{
+    for( const double seconds : { 20.0, 25.0 } )
+    {
+        for( const double fps : { 23.976, 24.0, 25.0, 29.97, 30.0 } )
+        {
+            ASSERT_EQ( playSafetyMs( seconds ),
+                       playSafetyMs( seconds, PlayPaceMode::Gated, requiredSourceFrames( fps, seconds ) ) );
+        }
+    }
+}
+
+TEST( PlayPaceBudgetKnifeEdge, G4TheCpuCeilingAndAZeroFrameCountAreUnchanged )
+{
+    ASSERT_EQ( 765000, playSafetyMs( 25.0, PlayPaceMode::MeasuredInformational, 1499 ) );
+    ASSERT_EQ( 55000, playSafetyMs( 20.0, PlayPaceMode::Gated, 0 ) );
+    ASSERT_EQ( 55000, playSafetyMs( 20.0, PlayPaceMode::Gated, 1 ) );
+}
+
+TEST( PlayPaceBudgetKnifeEdge, TheBudgetIsSizedFromTheAdmittedFramesAtTheStatedFloor )
+{
+    ASSERT_EQ( 15.0, playback_frame_range::kGatedPaceFloorFps );
+    ASSERT_EQ( 94867, playSafetyMs( 20.0, PlayPaceMode::Gated, 1199 ) );
+    ASSERT_EQ( 54934, playSafetyMs( 10.0, PlayPaceMode::Gated, 600 ) );
+    ASSERT_EQ( 114867, playSafetyMs( 25.0, PlayPaceMode::Gated, 1499 ) );
+    // The app's admission and its wait use ONE number: the verdict's budget is the budget the waits pass on.
+    const PlayableWindowVerdict v = knifeEdge1457Window();
+    ASSERT_EQ( playSafetyMs( 20.0, PlayPaceMode::Gated, v.requiredFrames ), std::llround( v.wallBudgetSeconds * 1000.0 ) );
+    ASSERT_EQ( 94867, std::llround( v.wallBudgetSeconds * 1000.0 ) );
+}
+
+TEST( PlayPaceBudgetKnifeEdge, A3TheCpuInformationalCeilingIsNeverWidenedByTheFrameTerm )
+{
+    // adversary r1 A3 (ecfaadfb), its input: a 600 fps clip, 10 s, -CpuPlayPaceInformational -> 6000 required frames. The CPU ceiling stays
+    // requested / (1/30) + 15 s = 315 s; the frame term belongs to the Gated budget only.
+    ASSERT_EQ( 315000, playSafetyMs( 10.0, PlayPaceMode::MeasuredInformational, 6000 ) );   // RED on ecfaadfb: 414934
+    const PlayableWindowVerdict c = evaluatePlayableWindow( 0, 1, 6000, 6000, 600.0, 10.0, playback_frame_range::kFloorFromNativeFps, true,
+                                                            playback_frame_range::kPaceIsNative, PlayPaceMode::MeasuredInformational );
+    ASSERT_EQ( 6000, c.requiredFrames );
+    ASSERT_EQ( 315.0, c.wallBudgetSeconds );                                                  // RED on ecfaadfb: 414.934
+    // the observation of the finding: 5700 frames at 315000 ms while playing is the typed ceiling, not Continue
+    ASSERT_TRUE( evaluatePlayStop( 5700, c.requiredFrames, true, 315000, playSafetyMs( 10.0, PlayPaceMode::MeasuredInformational, c.requiredFrames ),
+                                   PlayPaceMode::MeasuredInformational, playback_frame_range::PlayPaceHistory() ) == PlayStopState::SafetyTimeout );
+    // the Gated budget of the same window still carries the frame term
+    ASSERT_EQ( 414934, playSafetyMs( 10.0, PlayPaceMode::Gated, 6000 ) );
 }

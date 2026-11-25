@@ -3175,14 +3175,24 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
             "the stop decision is no longer given the pace history": self._mutated("automationPlayPaceMode(), m_playPaceHistory );", "automationPlayPaceMode() );"),
             "the observation is no longer noted in the pace history": self._mutated("m_playPaceHistory.note( m_sourceAdvance.consumed(), elapsedMs );", ""),
             "the autoplay budget ignores the pace mode": self._mutated(
-                "playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() ) );\n                        if( autoplayState",
+                "playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode(), m_playRequiredSourceFrames ) );\n                        if( autoplayState",
                 "playback_frame_range::playSafetyMs( m_playRequestedSeconds ) );\n                        if( autoplayState"),
             "the settle budget ignores the pace mode": self._mutated(
-                "autoSettleSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() );",
+                "autoSettleSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode(), m_playRequiredSourceFrames );",
                 "autoSettleSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds );"),
             "the play-action budget ignores the pace mode": self._mutated(
-                "playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() );",
+                "playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode(), m_playRequiredSourceFrames );",
                 "playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds );"),
+            # PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: every wait's budget is sized from the frames the admitted Play must consume
+            "the autoplay budget ignores the admitted frames": self._mutated(
+                "playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode(), m_playRequiredSourceFrames ) );\n                        if( autoplayState",
+                "playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() ) );\n                        if( autoplayState"),
+            "the settle budget ignores the admitted frames": self._mutated(
+                "autoSettleSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode(), m_playRequiredSourceFrames );",
+                "autoSettleSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() );"),
+            "the play-action budget ignores the admitted frames": self._mutated(
+                "playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode(), m_playRequiredSourceFrames );",
+                "playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() );"),
             "the engine tick stops feeding the counter (non-drop)":
                 self._mutated("m_sourceAdvance.noteEngineTick( sourcePositionBeforeTick,", "(void)( sourcePositionBeforeTick,"),
             "the engine tick stops feeding the counter (drop-frame)":

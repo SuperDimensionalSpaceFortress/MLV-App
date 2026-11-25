@@ -146,10 +146,11 @@ $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
 # PLAYBACK-CLIP-LENGTH-ENFORCE-3 round 2 (fable BLOCKER): this script NEVER ends the Play on a clock of its own. The
 # captures are taken INSIDE a Play the APP ends when its engine has consumed the source frames of the window; after
 # the capture loop the script WAITS for the app to exit by itself and then reads the app's playback_smoke.summary.
-# The only budget below is the app's own wall-clock safety net (requested / 0.5 + 15 s) plus open + settle time: the
+# The only budget below is the app's own wall-clock safety net (max(requested / 0.5 + 15 s, ceil((frames - 1) / kGatedPaceFloorFps) + 15 s),
+# frames from the clip-length gate's native fps; PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1) plus open + settle time: the
 # app ends its Play with a typed failure inside it, and a process still running past it is killed and reported as
 # PLAY_SAFETY_TIMEOUT -- an INVALID result, never a normal one.
-$processBudgetMs = (Get-GuiSmokePlaySafetyMs -Seconds $Seconds) + 2500 + $settleCpuMaxMs + 30000
+$processBudgetMs = (Get-GuiSmokePlaySafetyMs -Seconds $Seconds -NativeFps $clipLengthGate.fps) + 2500 + $settleCpuMaxMs + 30000
 $killedByLauncher = $false
 try {
     Write-Host "[live-filmstrip] settling ${SettleMs}ms before first capture (do NOT capture during play-start)..."

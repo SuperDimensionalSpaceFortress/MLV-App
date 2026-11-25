@@ -2594,7 +2594,7 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
                     {
                         if( m_lookAssistPump.sessionOpen() ) return;
                         const playback_frame_range::PlayStopState autoplayState =
-                            programmaticPlayState( autoplayClock->elapsed(), playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() ) );
+                            programmaticPlayState( autoplayClock->elapsed(), playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode(), m_playRequiredSourceFrames ) );
                         if( autoplayState == playback_frame_range::PlayStopState::Continue ) return;
                         autoplayPoll->stop();
                         autoplayPoll->deleteLater();
@@ -9195,7 +9195,7 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
             // (programmaticPlayState), not until 20000 ms of wall clock; the wall clock is only the safety net.
             // PLAYBACK-PRESENT-TAIL-TIMING-1 r4 (ADV-A1): this pinned ENFORCE-3 stop statement's sleep is a runner sleep
             // like every other (Play presents run in it, so a GPU window's present-tail window is open across it).
-            const qint64 autoSettleSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() );
+            const qint64 autoSettleSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode(), m_playRequiredSourceFrames );
             playback_frame_range::PlayStopState autoSettleState = playback_frame_range::PlayStopState::Continue;
             while( ( autoSettleState = programmaticPlayState( autoSettleClock.elapsed(), autoSettleSafetyMs ) )
                    == playback_frame_range::PlayStopState::Continue )
@@ -9559,7 +9559,7 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
             // engine ended first is EndedEarly and the wall clock is only the safety net (a typed failure).
             // PLAYBACK-PRESENT-TAIL-TIMING-1 r4 (ADV-A1): this pinned ENFORCE-3 stop statement's sleep is a runner sleep
             // like every other (Play presents run in it, so a GPU window's present-tail window is open across it).
-            const qint64 playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() );
+            const qint64 playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode(), m_playRequiredSourceFrames );
             while( ( playActionState = programmaticPlayState( playActionClock.elapsed(), playActionSafetyMs ) )
                    == playback_frame_range::PlayStopState::Continue )
             {
@@ -11235,7 +11235,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     // admitted window required (programmaticPlayState) -- NOT when --seconds of wall clock have passed. The wall
     // clock (the window it asked for + a fixed margin, plus the stress switch time when that is requested) is only
     // the safety net, and its expiry is a typed failure below, never a pass.
-    const qint64 measuredSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() )
+    const qint64 measuredSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode(), m_playRequiredSourceFrames )
         + ( options.exerciseClipLifecycleStress ? qMax( 0, options.stressSwitchAtMs ) : 0 );
     // VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 STEP BEGIN
     // A non-blocking state machine, defined here and only CALLED from the measured loop below (the loop's wait-loop pin

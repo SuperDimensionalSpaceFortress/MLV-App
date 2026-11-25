@@ -339,15 +339,21 @@ class OwnerClipEmittedJobTests(_PwshCase):
         return out_file.read_text(encoding="utf-8"), json.loads(proc.stdout)
 
     def test_a_fixture_job_bakes_the_fixed_allowance_timeout_and_reports_the_job_timeout(self) -> None:
+        # PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: the Gated play allowance for the default 25 s is the app's frame-sized budget at the
+        # generator's 60 fps bound (115 s), not the 40 s floor.
+        from tools.repo_hygiene.test_cpu_leg_smoke_ceiling import gated_play_sec
+        play = gated_play_sec(25)
+        self.assertEqual(play, 115)
         job_text, result = self._generate()
         self.assertNotIn("__SMOKE_PROCESS_TIMEOUT_MS__", job_text)
-        self.assertIn(f"$SmokeProcessTimeoutMs = {(60 + 40 + 3 + 30) * 1000}", job_text)
-        self.assertEqual(result["smokeProcessTimeoutMs"], (60 + 40 + 3 + 30) * 1000)
-        self.assertEqual(result["recommendedJobTimeoutSec"], (60 + 40 + 3 + 30) + 1800 + 300)
+        self.assertIn(f"$SmokeProcessTimeoutMs = {(60 + play + 3 + 30) * 1000}", job_text)
+        self.assertEqual(result["smokeProcessTimeoutMs"], (60 + play + 3 + 30) * 1000)
+        self.assertEqual(result["recommendedJobTimeoutSec"], (60 + play + 3 + 30) + 1800 + 300)
 
     def test_the_fixed_allowances_are_generator_parameters_and_reach_the_recommended_timeout(self) -> None:
+        from tools.repo_hygiene.test_cpu_leg_smoke_ceiling import gated_play_sec  # PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: the Gated allowance
         _, result = self._generate("-FixedPreLaunchSeconds 100 -PostRunSeconds 50")
-        self.assertEqual(result["recommendedJobTimeoutSec"], (60 + 40 + 3 + 30) + 100 + 50)
+        self.assertEqual(result["recommendedJobTimeoutSec"], (60 + gated_play_sec(25) + 3 + 30) + 100 + 50)
 
     def test_the_generator_reports_whether_the_runner_at_the_source_commit_takes_the_verified_binding(self) -> None:
         # The fixture repo's stand-in runner declares neither parameter: the job must then not pass them

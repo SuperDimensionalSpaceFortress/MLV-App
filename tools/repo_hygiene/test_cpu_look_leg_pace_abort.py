@@ -75,7 +75,7 @@ def check_gate_text(text: str) -> list[str]:
     problems = []
     if "$script:GuiSmokeCpuInformationalMinPaceFraction = 1.0 / 30.0" not in text:
         problems.append("the gate does not mirror the C++ CPU ceiling fraction")
-    if "param([Parameter(Mandatory = $true)][double]$Seconds, [switch]$CpuPaceInformational)" not in text:
+    if "param([Parameter(Mandatory = $true)][double]$Seconds, [switch]$CpuPaceInformational, [double]$NativeFps = 0, [int]$TargetPresentedFrames = 0)" not in text:
         problems.append("Get-GuiSmokePlaySafetyMs has no -CpuPaceInformational switch")
     if "$fraction = if ($CpuPaceInformational) { $script:GuiSmokeCpuInformationalMinPaceFraction } else { $script:GuiSmokeMinSustainedPaceFraction }" not in text:
         problems.append("the CPU ceiling is not selected by the switch alone")
@@ -96,7 +96,7 @@ def check_runner_text(text: str) -> list[str]:
         problems.append("an ambient pace-mode variable is not stripped from the app's environment")
     if 'if ($CpuPlayPaceInformational) { $envBlock[$script:GuiSmokePaceModeEnvironment] = "informational" }' not in text:
         problems.append("the switch does not set the pace mode in the app's environment")
-    if "(Get-GuiSmokePlaySafetyMs -Seconds $Seconds -CpuPaceInformational:$CpuPlayPaceInformational) +" not in text:
+    if "(Get-GuiSmokePlaySafetyMs -Seconds $Seconds -NativeFps $clipNativeFpsForBudget -TargetPresentedFrames $TargetPresentedFrames -CpuPaceInformational:$CpuPlayPaceInformational) +" not in text:
         problems.append("the derived process timeout ignores the CPU ceiling")
     if "cpuPaceInformational = [bool]$CpuPlayPaceInformational" not in text:
         problems.append("the result does not record the pace mode")
@@ -188,8 +188,8 @@ def check_main_window_text(text: str) -> list[str]:
     problems = []
     if 'qgetenv( "MLVAPP_PLAY_PACE_MODE" )' not in text:
         problems.append("the app does not read the pace mode")
-    if text.count("playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() )") != 4:
-        problems.append("a safety-net budget ignores the pace mode")
+    if text.count("playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode(), m_playRequiredSourceFrames )") != 4:
+        problems.append("a safety-net budget ignores the pace mode or the admitted frames")
     if "elapsedMs, safetyMs, automationPlayPaceMode(), m_playPaceHistory );" not in text:
         problems.append("the stop decision ignores the pace mode")
     if "enginePaceFps > 0.0 ? enginePaceFps : -1.0, automationPlayPaceMode() );" not in text:
@@ -214,6 +214,11 @@ class CpuPaceLaunchers(unittest.TestCase):
     def test_the_powershell_gate_mirrors_the_cpp_cpu_ceiling(self) -> None:
         self.assertIn(f"$script:GuiSmokeCpuInformationalMinPaceFraction = {'1.0 / 30.0'}", self.gate)
         self.assertEqual(check_gate_text(self.gate), [])
+
+    def test_the_powershell_gate_mirrors_the_cpp_gated_pace_floor(self) -> None:
+        # PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: the Gated budget also sizes the admitted frames at kGatedPaceFloorFps; the twin carries the same number.
+        floor_fps = float(re.search(r"constexpr double kGatedPaceFloorFps = ([0-9.]+);", HEADER.read_text(encoding="utf-8")).group(1))
+        self.assertIn(f"$script:GuiSmokeGatedPaceFloorFps = {floor_fps}", self.gate)
 
     @requires_windows_pwsh
     def test_the_powershell_budget_is_the_formula_the_app_uses_in_both_modes(self) -> None:
@@ -253,7 +258,7 @@ class CpuPaceLaunchers(unittest.TestCase):
     def test_mutation_gate(self) -> None:
         self._assert_each_mutant_is_caught(self.gate, check_gate_text, {
             "fraction drifts": ("= 1.0 / 30.0", "= 1.0 / 2.0"),
-            "the switch is dropped": ("[double]$Seconds, [switch]$CpuPaceInformational)", "[double]$Seconds)"),
+            "the switch is dropped": ("[double]$Seconds, [switch]$CpuPaceInformational,", "[double]$Seconds,"),
             "the ceiling is always used": ("$fraction = if ($CpuPaceInformational) {", "$fraction = if ($true) {"),
             "extra environment passes": ("if ($pairKey -eq $script:GuiSmokePaceModeEnvironment) {", "if ($false) {"),
             "inherited passes": ("if (([string]$name).ToUpperInvariant() -eq $script:GuiSmokePaceModeEnvironment) {", "if ($false) {"),

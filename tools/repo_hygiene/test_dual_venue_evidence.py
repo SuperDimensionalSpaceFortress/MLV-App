@@ -662,6 +662,21 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         stripped, counts = cls.strip_regions(text)
         return stripped, counts["leg-terminals"]
 
+    @staticmethod
+    def with_gated_play_allowance(text: str, extra: list[str]) -> str:
+        """PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: the generator's Gated play allowance is the app's frame-sized budget at the 60 fps bound
+        (test_cpu_leg_smoke_ceiling.gated_play_sec), not the baseline's max(40, PlaySeconds). That moves the baseline's smoke timeout, and the PresentMon
+        window derived from it, by exactly the difference, and nothing else. Both value lines must be there exactly once; any other change still fails."""
+        from tools.repo_hygiene.test_cpu_leg_smoke_ceiling import gated_play_sec  # lazy: that module imports this one
+        play = int(extra[extra.index("-PlaySeconds") + 1]) if "-PlaySeconds" in extra else \
+            int(re.search(r"\[int\]\$PlaySeconds = (\d+),", GENERATOR.read_text(encoding="utf-8")).group(1))
+        delta_sec = gated_play_sec(play) - max(40, play)
+        for pattern, scale in ((r"^\$PresentMonTimedSeconds = (\d+)$", 1), (r"^\$SmokeProcessTimeoutMs = (\d+)$", 1000)):
+            found = re.findall(pattern, text, flags=re.MULTILINE)
+            assert len(found) == 1, f"the baseline's {pattern} value line moved: update with_gated_play_allowance"
+            text = re.sub(pattern, lambda m: m.group(0).replace(m.group(1), str(int(m.group(1)) + delta_sec * scale)), text, count=1, flags=re.MULTILINE)
+        return text
+
     def assertByteIdenticalToBaseline(self, name: str, extra: list[str]) -> None:
         if not self.baseline_available:
             self.skipTest(f"baseline commit {BASELINE_COMMIT[:12]} is not in this clone")
@@ -669,6 +684,7 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         old = self.generate(self.baseline_root / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1", f"old-{name}.job.ps1", extra)
         stripped, new_counts = self.strip_regions(new.read_text(encoding="utf-8"))
         old_stripped, old_counts = self.strip_regions(self.without_claim_shape_replaced_baseline(old.read_text(encoding="utf-8")))
+        old_stripped = self.with_gated_play_allowance(old_stripped, extra)
         self.assertEqual((new_counts["claim-shape"], old_counts["claim-shape"]), (self.CLAIM_SHAPE_REGIONS, 0), "the default job carries exactly the pinned number of bracketed VENUE-STAGE-CLAIM-SHAPE-1 regions; the baseline predates them")
         self.assertEqual(new_counts["leg-terminals"], 4, "the default job carries exactly the four bracketed DVE-LEG-TERMINALS-1 regions (the wait-failure block and its two summary fields, the smoke-failure block and its one summary field)")
         self.assertEqual(old_counts["leg-terminals"], 4, "the baseline carries the same four")
@@ -9428,6 +9444,9 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 # base generator's bytes, and the base carries the same regions as the new job (it is the pinned KEEPALIVE-FAILURE-PUBLISH-LAST-1 generator).
                 kept, new_counts = GeneratorByteIdentityAndVariantTests.strip_regions(new.decode("utf-8"))
                 old_kept, old_counts = GeneratorByteIdentityAndVariantTests.strip_regions(GeneratorByteIdentityAndVariantTests.without_claim_shape_replaced_baseline(old.decode("utf-8")))
+                # PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: a Gated (cuda) job's play allowance is the app's frame-sized budget; the cpu branch's is unchanged.
+                if not name.startswith("cpu"):
+                    old_kept = GeneratorByteIdentityAndVariantTests.with_gated_play_allowance(old_kept, extra)
                 self.assertGreater(new_counts["session-locked"], 0)
                 # PLAYBACK-VSYNC-DEFAULT-1's regions: present in the new job and in the base generator (the pinned GPU-PREF-REGISTRY-STOP-AND-PRUNE-1 commit), at their pinned count.
                 self.assertEqual((new_counts.pop("playback-vsync"), old_counts.pop("playback-vsync")),
@@ -19801,21 +19820,25 @@ class DriftLegSpecTests(unittest.TestCase):
     def pace_floor_fps(self, play_seconds: int, clip_fps: float = 59.94) -> float:
         """The steady pace the app's gate demands of a Play of `play_seconds` of a `clip_fps` clip, read from the constants in PlaybackFrameRange.h (playSafetyMs and
         required_source_frames = ceil(seconds x native fps), r4 adversary A3: whole frames, and the first present comes FIRST_PRESENT_S after the trigger):
-        frames / (seconds / kMinSustainedPaceFraction + kPlaySafetyMarginMs / 1000 - FIRST_PRESENT_S). 17.3 fps for 10 s, 21.9 fps for 20 s."""
+        (frames - 1) / (budget - FIRST_PRESENT_S), budget = max(seconds / kMinSustainedPaceFraction, ceil((frames - 1) x 1000 / kGatedPaceFloorFps) / 1000) + kPlaySafetyMarginMs / 1000
+        (PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: the budget is also sized from the admitted frames at the stated floor fps). 11.0 fps for 10 s, 12.7 fps for 20 s."""
         text = (Path(__file__).resolve().parents[2] / "platform" / "qt" / "PlaybackFrameRange.h").read_text(encoding="utf-8")
         fraction = float(re.search(r"constexpr double kMinSustainedPaceFraction = ([0-9.]+);", text).group(1))
         margin_ms = int(re.search(r"constexpr int kPlaySafetyMarginMs = (\d+);", text).group(1))
+        floor_fps = float(re.search(r"constexpr double kGatedPaceFloorFps = ([0-9.]+);", text).group(1))
         # r5 adversary pass 8 A4: the first frame is presented at FIRST_PRESENT_S and the pace then has to carry whole_frames - 1 transitions (the app counts the first frame
         # and 599 transitions for 10 s of 59.94), so the numerator is one less than the frame count.
         # (PlaybackFrameRange.h subtracts 1e-9 before the ceil, so 60.00000000001 fps x 10 s is still 600 frames; adversary pass 9 A2.)
-        return (math.ceil(play_seconds * clip_fps - 1e-9) - 1) / (play_seconds / fraction + margin_ms / 1000.0 - self.FIRST_PRESENT_S)
+        frames = math.ceil(play_seconds * clip_fps - 1e-9)
+        budget_ms = max(int(play_seconds / fraction * 1000.0), math.ceil((frames - 1) * 1000.0 / floor_fps)) + margin_ms
+        return (frames - 1) / (budget_ms / 1000.0 - self.FIRST_PRESENT_S)
 
-    def test_the_20_second_window_cannot_host_a_cap_one_leg_and_the_w10_family_can(self) -> None:
-        """r4: five of the six cap-1 20 s CUDA legs ended PaceTooSlow (INVALID, uncounted). The floor a window sets on the CUDA (gated) backend is a function of the app's
-        gate constants, so this test computes it from the header: the 20 s window's floor is above every slower cap-1 pace measured, the 10 s window's floor is below
-        all of them. (CPU-backend legs are informational and have no such floor; these specs are benched on CUDA.)"""
-        self.assertGreater(self.pace_floor_fps(20), 21.0)
-        self.assertGreater(self.pace_floor_fps(20), self.SLOWEST_MEASURED_CAP1_FPS + 3.0)
+    def test_the_20_second_window_now_hosts_a_cap_one_leg_as_the_w10_family_does(self) -> None:
+        """r4: five of the six cap-1 20 s CUDA legs ended PaceTooSlow (INVALID, uncounted) under a 20 s floor of about 21.9 fps. PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1
+        sizes the Gated budget from the admitted frames at kGatedPaceFloorFps, so the floor a window sets on the CUDA (gated) backend -- computed here from the header -- is
+        below every cap-1 pace measured for both windows. (CPU-backend legs are informational and have no such floor; these specs are benched on CUDA.)"""
+        self.assertLess(self.pace_floor_fps(20), 13.0)
+        self.assertLess(self.pace_floor_fps(20), self.SLOWEST_MEASURED_CAP1_FPS - 3.0)
         self.assertLess(self.pace_floor_fps(10), self.SLOWEST_MEASURED_CAP1_FPS)
         for rel in DRIFT_W10_LEGS:
             with self.subTest(leg=rel):

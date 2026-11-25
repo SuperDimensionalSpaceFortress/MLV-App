@@ -950,6 +950,10 @@ function Get-GuiSmokeLoopVerdict {
 # Mirrors platform/qt/PlaybackFrameRange.h (kMinSustainedPaceFraction, kPlaySafetyMarginMs); a parity test compares them.
 $script:GuiSmokeMinSustainedPaceFraction = 0.5
 $script:GuiSmokePlaySafetyMarginMs = 15000
+# PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1: mirrors platform/qt/PlaybackFrameRange.h kGatedPaceFloorFps (a parity test compares them). The
+# Gated budget never asks the engine for more than min(kMinSustainedPaceFraction x native fps, this) source fps: with -NativeFps the
+# admitted frames ceil(Seconds x native fps) are also budgeted at this floor. 20 s of a 59.94 fps clip: 94 867 ms, not 55 000 ms.
+$script:GuiSmokeGatedPaceFloorFps = 15.0
 
 # CPU-LOOK-LEG-PACE-ABORT-1: mirrors platform/qt/PlaybackFrameRange.h kCpuInformationalMinPaceFraction (a parity test compares them).
 # A CPU-backend leg's pace is MEASURED and informational: the app's pace probe never ends it, and its wall budget is this CEILING
@@ -960,13 +964,26 @@ $script:GuiSmokeCpuInformationalMinPaceFraction = 1.0 / 30.0
 $script:GuiSmokePaceModeEnvironment = 'MLVAPP_PLAY_PACE_MODE'
 
 function Get-GuiSmokePlaySafetyMs {
-    # The wall-clock safety net of an evidence Play of `Seconds` of footage: requested / 0.5 + 15 s. The app ends the
-    # Play on its own typed failure inside this; a launcher's own process budget is this plus the open/settle time.
-    # -CpuPaceInformational: the CPU leg's ceiling instead (requested / (1/30) + 15 s); the one derivation the runner, the
-    # dual-venue job's smoke timeout and its um-run timeout all read.
-    param([Parameter(Mandatory = $true)][double]$Seconds, [switch]$CpuPaceInformational)
+    # The wall-clock safety net of an evidence Play of `Seconds` of footage: max(requested / 0.5 + 15 s,
+    # ceil((frames - 1) / kGatedPaceFloorFps) + 15 s) (PLAY-PACE-BUDGET-KNIFE-EDGE-1457-UNPACED-1). frames are the source frames the app
+    # admits: ceil(max(the clip's floor, the window it requests) x NativeFps), and the window it requests is min(Seconds, N / NativeFps) when
+    # -TargetPresentedFrames N ends the Play early (smokePlayRequestSeconds; adversary r1 A2), else Seconds. Without -NativeFps, or a
+    # non-positive one, the frame term is 0 and the budget is requested / 0.5 + 15 s exactly. The app ends the Play on its own typed failure
+    # inside this; a launcher's own process budget is this plus the open/settle time.
+    # -CpuPaceInformational: the CPU leg's ceiling instead (requested / (1/30) + 15 s), never widened by the frame term (adversary r1 A3);
+    # the one derivation the runner, the dual-venue job's smoke timeout and its um-run timeout all read.
+    param([Parameter(Mandatory = $true)][double]$Seconds, [switch]$CpuPaceInformational, [double]$NativeFps = 0, [int]$TargetPresentedFrames = 0)
     $fraction = if ($CpuPaceInformational) { $script:GuiSmokeCpuInformationalMinPaceFraction } else { $script:GuiSmokeMinSustainedPaceFraction }
-    return [int64][Math]::Ceiling([Math]::Max(0.0, $Seconds) * 1000.0 / $fraction) + $script:GuiSmokePlaySafetyMarginMs
+    $byFraction = [int64][Math]::Ceiling([Math]::Max(0.0, $Seconds) * 1000.0 / $fraction) + $script:GuiSmokePlaySafetyMarginMs
+    $byFrames = [int64]0
+    if (-not $CpuPaceInformational -and $Seconds -gt 0 -and $NativeFps -gt 0) {
+        # Adversary pass 2 A3: the app takes --seconds as qRound(seconds x 1000) ms (main.cpp options.durationMs), so the frames are counted from that.
+        $appSeconds = [Math]::Round($Seconds * 1000.0, [MidpointRounding]::AwayFromZero) / 1000.0
+        $requestedSeconds = if ($TargetPresentedFrames -gt 0) { [Math]::Min($appSeconds, [double]$TargetPresentedFrames / $NativeFps) } else { $appSeconds }
+        $frames = [int64][Math]::Ceiling([Math]::Max((Get-GuiSmokeMinPlaySeconds -NativeFps $NativeFps), $requestedSeconds) * $NativeFps - 1e-9)
+        if ($frames -gt 1) { $byFrames = [int64][Math]::Ceiling(($frames - 1) * 1000.0 / $script:GuiSmokeGatedPaceFloorFps) + $script:GuiSmokePlaySafetyMarginMs }
+    }
+    return [int64][Math]::Max($byFraction, $byFrames)
 }
 
 function Read-GuiSmokePlaybackSummaryFromLogDir {
