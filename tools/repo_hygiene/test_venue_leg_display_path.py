@@ -1370,6 +1370,51 @@ class Successor2Tests(unittest.TestCase):
             with self.subTest(label):
                 self.assertTrue(str(got[label]).startswith("threw:"), f"{label}: {got[label]}")
 
+    def test_successor3_r3_adversary_pass4_a1_a2_a3(self) -> None:
+        """r3 adversary pass 4 on 7b35c43a, the literal inputs. A1: two different time-looking names read as ONE [datetime] by ConvertFrom-Json matched between the
+        tables; the block is judged from the receipt text with strings as written. A2: a root member literally named `venue.displayPath` produced the duplicate path
+        `$.venue.displayPath.x`; a non-identifier name is written in bracket form. A3: an integer above [int]::MaxValue was a known count or rate."""
+        def block(**over) -> dict:
+            b = {"schema": SCHEMA, "sampledBefore": SAMPLED_BEFORE, "collectedUtc": "2026-11-24T16:40:00Z",
+                 "adapters": [{"name": "A", "driverVersion": "x", "driverDate": unknown("x"), "pnpDeviceId": "x", "hasActiveOutput": True}],
+                 "activeDisplays": [{"adapterName": "A", "refreshHz": 59, "horizontalResolution": 3840, "verticalResolution": 2400}],
+                 "os": unknown("x"), "powerPlan": "Balanced"}
+            b.update(over)
+            return b
+        a1 = block(adapters=[{"name": "2026-11-24T00:00:00Z", "driverVersion": "x", "driverDate": unknown("x"), "pnpDeviceId": "x", "hasActiveOutput": True}],
+                   activeDisplays=[{"adapterName": "2026-11-24T00:00:00.000Z", "refreshHz": 59, "horizontalResolution": 3840, "verticalResolution": 2400}])
+        big = 2147483648
+        os_ok = {"build": "26100", "ubr": 4770, "lastBootUtc": "2026-11-21T09:00:00Z", "hotfixCount": 14}
+        texts = {
+            "A1 time-looking names that differ as text": json.dumps({"outcome": "UNRESOLVED", "venue": {"displayPath": a1}}),
+            "A3 refreshHz above int": json.dumps({"outcome": "UNRESOLVED", "venue": {"displayPath": block(activeDisplays=[{"adapterName": "A", "refreshHz": big, "horizontalResolution": 3840, "verticalResolution": 2400}])}}),
+            "A3 horizontalResolution at long max": json.dumps({"outcome": "UNRESOLVED", "venue": {"displayPath": block(activeDisplays=[{"adapterName": "A", "refreshHz": 59, "horizontalResolution": 9223372036854775807, "verticalResolution": 2400}])}}),
+            "A3 os.ubr above int": json.dumps({"outcome": "UNRESOLVED", "venue": {"displayPath": block(os=dict(os_ok, ubr=big))}}),
+            "A3 os.hotfixCount above int": json.dumps({"outcome": "UNRESOLVED", "venue": {"displayPath": block(os=dict(os_ok, hotfixCount=big))}}),
+        }
+        a2 = '{"outcome":"UNRESOLVED","venue":{"name":"bachelor"},"venue.displayPath":{"x":1,"x":2}}'
+        controls = {"control good": json.dumps({"outcome": "UNRESOLVED", "venue": {"displayPath": block(os=dict(os_ok, ubr=2147483647))}}), "A2 dotted root member": a2}
+        probes = {"A2 probe dotted member": '{"hostName":"H","displayPath":{"state":"unknown","reason":"x"},"displayPath.audit":{"x":1,"x":2}}',
+                  "A3 probe refreshHz above int": json.dumps({"hostName": "H", "displayPath": block(activeDisplays=[{"adapterName": "A", "refreshHz": big, "horizontalResolution": 3840, "verticalResolution": 2400}])})}
+        got = pwsh_json("$in = $env:DVE_TEXTS | ConvertFrom-Json -AsHashtable\n$out = [ordered]@{}\n"
+                        "foreach ($k in @($in.Keys)) { $r = ConvertFrom-DvReceiptText -Text $in[$k]; $v = Test-DvReceiptValid -Receipt $r -ReceiptText $in[$k]\n"
+                        "  $out[$k] = [ordered]@{ displayPath = $v.displayPath; status = $v.status; reasons = @($v.reasons) } }\n"
+                        "$pin = $env:DVE_PROBES | ConvertFrom-Json -AsHashtable\n"
+                        "foreach ($k in @($pin.Keys)) { $p = ConvertFrom-DvProbeStdout (\"DVE_PROBE=\" + $pin[$k] + \"`r`n\"); $out[$k] = (ConvertTo-DvDisplayPath -Probe $p) }\n"
+                        "$out['pwsh75'] = ($PSVersionTable.PSVersion -ge [version]'7.5')\n"
+                        "$out | ConvertTo-Json -Compress -Depth 8", {"DVE_TEXTS": json.dumps(dict(texts, **controls)), "DVE_PROBES": json.dumps(probes)})
+        for label in texts:
+            if label.startswith("A1") and not got["pwsh75"]:
+                continue   # ConvertFrom-Json -DateKind arrived in pwsh 7.5; before it the text cannot be read with strings kept
+            with self.subTest(label):
+                self.assertEqual((got[label]["displayPath"], got[label]["status"]), ("malformed", "INVALID"), got[label])
+                self.assertTrue(got[label]["reasons"][0].startswith("DISPLAY_PATH_MALFORMED"), got[label])
+        self.assertEqual(got["control good"]["displayPath"], "present", got["control good"])
+        self.assertEqual(got["A2 dotted root member"]["displayPath"], "absent", got["A2 dotted root member"])
+        self.assertFalse(any(r.startswith("DISPLAY_PATH_MALFORMED") for r in got["A2 dotted root member"]["reasons"]), got["A2 dotted root member"])
+        self.assertEqual(got["A2 probe dotted member"], unknown("x"), got)
+        self.assertEqual(got["A3 probe refreshHz above int"], unknown("probe-block-malformed"), got)
+
     def _pair_run(self, script: str, paths: dict, base: Path, trio: bool = False, dv: Path | None = None, in_process: bool = False):
         """Run a pair reader with `pwsh -File`, or (in_process) with `& <script>` from a -Command scope that has no `try` and no Stop, the in-process caller
         (under -File the script's own `$ErrorActionPreference = 'Stop'` is session-wide, so module code sees it too)."""
