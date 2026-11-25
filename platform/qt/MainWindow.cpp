@@ -2847,10 +2847,12 @@ bool MainWindow::renderThreadBusyForPlaybackAdvance( int activePlaybackTarget )
 // current target is still coming -- a render in flight for it (or non-speculative work) or a lookahead request or slot for it
 // in the active generation. The conformed tick holds only then (playback_frame_range::conformTargetPresented). The render
 // thread is asked only under conform and only while the target is not the frame drawFrameReady last accepted.
-bool MainWindow::conformTargetPresentOutstanding()
+// PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2 (adversary pass 3 A2 on c4fa34c3): \a position is the tick's CORRECTED start (the
+// gate's own position), never the stale m_newPosDropMode a fold or clamp is about to move off.
+bool MainWindow::conformTargetPresentOutstanding( double position )
 {
     if( !m_pRenderThread || !playbackConformActive() ) return false;
-    const int target = static_cast<int>( m_newPosDropMode );
+    const int target = static_cast<int>( position );
     if( target < 0 || m_lastPresentedPlaybackFrame == static_cast<long long>( target ) ) return false;
     if( renderThreadBusyForPlaybackAdvance( target ) ) return true;
     const uint64_t generation = m_playbackPresentationGeneration.load( std::memory_order_acquire );
@@ -2863,10 +2865,11 @@ bool MainWindow::conformTargetPresentOutstanding()
 // still to come -- drawFrameReady has not dispatched it yet (its early advance runs before the inline present or the enqueue),
 // or the non-inline prep queue still holds it. A pending task can be replaced by the next enqueue, so the engine must not move
 // past it. Nothing pending (the present happened, or the frame was dropped) means nothing is coming.
-bool MainWindow::conformAcceptedTargetPresentPending()
+// r2 (adversary pass 3 A2 on c4fa34c3): \a position is the tick's corrected start, as for conformTargetPresentOutstanding.
+bool MainWindow::conformAcceptedTargetPresentPending( double position )
 {
     if( !playbackConformActive() ) return false;
-    const long long target = static_cast<long long>( m_newPosDropMode );
+    const long long target = static_cast<long long>( position );
     if( target < 0 || m_lastPresentedPlaybackFrame != target ) return false;
     if( m_playbackPresentDispatchFrame == target ) return true;
     // fix iteration 1 (adversary A1 on e052947c): handed to a GL surface whose deferred paint has not drawn it yet
@@ -13358,7 +13361,7 @@ void MainWindow::playbackHandling(int timeDiff)
                             playbackConformActive(), m_conformDropDebtFrames,
                             playback_frame_range::conformTargetShown(
                                 m_lastPresentedPlaybackFrame, conformDisplayedPlaybackFrame(), dropFrameStart,
-                                conformAcceptedTargetPresentPending(), conformTargetPresentOutstanding() ) ),
+                                conformAcceptedTargetPresentPending( dropFrameStart ), conformTargetPresentOutstanding( dropFrameStart ) ) ),
                         ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
                         ui->actionLoop->isChecked(),
                         playbackConformActive() );   // r32 (adversary A1 on 2e0a3985): conform presents the cut's last frame before a Loop wrap
@@ -28639,9 +28642,10 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         // of dozens of frames on one tick). The paced timeline rate must not count that.
         // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2 (r1 adversary pass 2 A1): a position correction is not travel, so the
         // engine's corrections (the slip histogram's signed sum, noted under m_playbackSmokeActive) are left out.
+        // The histogram's start is m_playbackSmokeStartPosition (reset at the measured Play's start); its travel is clamped into int
+        // (adversary pass 3 A3 on c4fa34c3).
         m_playbackSmokeFirstPresentTimelineDeltaAbs =
-            qAbs( ui->horizontalSliderPosition->value() - m_playbackSmokeStartPosition
-                  - m_playbackSlipHistogram.correctedFrames() );
+            qAbs( m_playbackSlipHistogram.timelineTravel( ui->horizontalSliderPosition->value() ) );
     }
     gpuPresentEventSetContext( m_playbackSmokeSessionId, static_cast<qint64>( displayFrame ) );
 
@@ -31833,7 +31837,7 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
     const int currentPosition = ui->horizontalSliderPosition->value();
     // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2 (r1 adversary pass 2 A1): a position correction is not travel. timeline_delta and
     // every rate and count derived from it leave out the engine's corrections (start_position and current_position stay raw).
-    const int timelineDelta = currentPosition - m_playbackSmokeStartPosition - m_playbackSlipHistogram.correctedFrames();
+    const int timelineDelta = m_playbackSlipHistogram.timelineTravel( currentPosition );
     const int timelineDeltaAbs = timelineDelta >= 0
         ? timelineDelta
         : -timelineDelta;

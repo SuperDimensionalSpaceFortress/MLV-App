@@ -1426,8 +1426,8 @@ private:
     int playbackRenderLookaheadFrames() const;
     int currentPlaybackAdvanceTarget();
     bool renderThreadBusyForPlaybackAdvance( int activePlaybackTarget );
-    bool conformTargetPresentOutstanding();
-    bool conformAcceptedTargetPresentPending();
+    bool conformTargetPresentOutstanding( double position );       // r2: the tick's corrected start
+    bool conformAcceptedTargetPresentPending( double position );   // r2: the tick's corrected start
     bool conformDisplayedFramePaintPending();
     long long conformDisplayedPlaybackFrame();
     bool renderThreadIdleNoWait( int activePlaybackTarget, uint64_t *epochOut );

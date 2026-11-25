@@ -42,6 +42,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -56,6 +57,14 @@ namespace playback_slip
 inline constexpr int kSlipBucketCount = 6;        // {0, 1, 2, 3, 4-7, 8+}
 inline constexpr int kIntervalBucketCount = 6;    // {<=45, 45-62.5, 62.5-83.4, 83.4-125, 125-250, >250} ms
 inline constexpr int kMaxSlipLines = 64;          // per-slip detail lines kept per session
+
+// PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2 (adversary pass 3 A3 on c4fa34c3): a frame count summed in 64 bits, brought back into
+// int symmetrically ([-INT_MAX, INT_MAX], so std::abs of it never overflows).
+inline int clampFrames( long long frames )
+{
+    const long long limit = std::numeric_limits<int>::max();
+    return static_cast<int>( std::max( -limit, std::min( limit, frames ) ) );
+}
 inline constexpr double kGapIntervalMs = 250.0;
 inline constexpr double kClockMaxIntervalPeriods = 1.25;
 inline constexpr double kStageOverMedianFactor = 2.0;
@@ -413,10 +422,11 @@ public:
      *  folded into the Loop cut or clamped onto its last frame, DropFrameTickResult::corrected). Not an advance: no path, grant,
      *  deadline or advance-since-present; the summary's residual books the move under Other, as it does a seek.
      *  r2 (r1 adversary pass 2 A1; hub ruling widening r1's contract item 5): it also keeps the signed correction sum, which every
-     *  start-relative measure subtracts, and queues the move for the present that lands it (PresentSample::correctionsLanded). */
+     *  start-relative measure subtracts, and queues the move for the present that lands it (PresentSample::correctionsLanded).
+     *  The sums are 64-bit (adversary pass 3 A3 on c4fa34c3: 2,148 corrections of a million frames overflowed an int). */
     void noteTimelineCorrection( int toPosition )
     {
-        const int moved = toPosition - m_timelinePosition;
+        const long long moved = static_cast<long long>( toPosition ) - m_timelinePosition;
         m_correctedFrames += moved;
         m_correctionMoves.push_back( moved );
         m_timelinePosition = toPosition;
@@ -454,9 +464,11 @@ public:
             // The frames passed before the first present, plus whatever its own early advance jumped past the
             // next frame (the repaid wait for the first frame): never slips. r2: a correction is neither (both endpoints are
             // measured with the corrections they carry taken out).
-            m_startupCatchupFrames = std::max( 0, s.displayFrame - m_displayCorrectedFrames - m_startPosition );
-            m_firstPresentJumpFrames = std::max( 0, timelineTravel( s.timelinePosition )
-                                                    - ( s.displayFrame - m_displayCorrectedFrames - m_startPosition ) - 1 );
+            const long long displayTravel =
+                static_cast<long long>( s.displayFrame ) - m_displayCorrectedFrames - m_startPosition;
+            m_startupCatchupFrames = std::max( 0, clampFrames( displayTravel ) );
+            m_firstPresentJumpFrames = std::max( 0, clampFrames( static_cast<long long>( s.timelinePosition ) - m_startPosition
+                                                                 - m_correctedFrames - displayTravel - 1 ) );
             // The drop-frame engine owes the wall time since Play: what the first present's own advance did not repay
             // (the guard banks credit while no grant runs) is repaid by a burst a few presents later.
             m_waitCreditFrames = 0;
@@ -481,8 +493,10 @@ public:
         m_timelineAdvanceSincePresent = 0;
 
         // r2 (r1 adversary pass 2 A1): the presentation that lands a correction rebases the display endpoint to the correction's frame
-        // (PlaybackSourceAdvanceTracker::noteRebase's rule): only what the engine travelled from it is slips, and a lap after it is a wrap.
-        if( s.rebase ) m_lastDisplayFrame = s.rebaseFrame - 1;
+        // (PlaybackSourceAdvanceTracker::noteRebase's rule, adversary pass 3 A1 on c4fa34c3: the frame itself, so travel 40 -> 45 is
+        // 4 slips, as 10 -> 15 is): only what the engine travelled from it is slips, a landing ON it is neither a slip nor a repeat,
+        // and a lap after it is a wrap.
+        if( s.rebase ) m_lastDisplayFrame = s.rebaseFrame;
         int slip = 0;
         if( ( s.rebase && s.rebaseLapped ) || s.displayFrame < m_lastDisplayFrame )
         {
@@ -490,7 +504,7 @@ public:
         }
         else if( s.displayFrame == m_lastDisplayFrame )
         {
-            ++m_repeats;
+            if( !s.rebase ) ++m_repeats;
         }
         else
         {
@@ -604,7 +618,8 @@ public:
         out.presents = m_presents;
         out.startupCatchupFrames = m_startupCatchupFrames;
         // r2 (r1 adversary pass 2 A1): the start-relative measures leave out the corrections made by then (a correction is not travel)
-        const int travelAtFirstPresent = m_timelineAtFirstPresent - m_startPosition - m_correctedAtFirstPresent;
+        const int travelAtFirstPresent =
+            clampFrames( static_cast<long long>( m_timelineAtFirstPresent ) - m_startPosition - m_correctedAtFirstPresent );
         out.timelineDeltaAtFirstPresent = m_presents > 0 ? std::abs( travelAtFirstPresent ) : 0;
         out.histSlip = m_histSlip;
         out.histInterval = m_histInterval;
@@ -708,8 +723,14 @@ public:
     // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: read-only views for the correction rows (a correction sets neither)
     int timelineAdvanceSincePresent() const { return m_timelineAdvanceSincePresent; }
     bool frameHasDeadline( int frame ) const { double ms = 0.0; return deadlineOf( frame, &ms ); }
-    // r2 (r1 adversary pass 2 A1): the signed sum of the session's timeline corrections; MainWindow's timeline numerators subtract it
-    int correctedFrames() const { return m_correctedFrames; }
+    // r2 (r1 adversary pass 2 A1): the signed sum of the session's timeline corrections (64-bit: adversary pass 3 A3 on c4fa34c3)
+    long long correctedFrames() const { return m_correctedFrames; }
+    /*! r2: the timeline's travel from the Play's start to \a position with the corrections taken out, in int ([-INT_MAX, INT_MAX]).
+     *  Every start-relative measure here reads it, and so do MainWindow's timeline numerators (timeline_delta and its rates). */
+    int timelineTravel( int position ) const
+    {
+        return clampFrames( static_cast<long long>( position ) - m_startPosition - m_correctedFrames );
+    }
 
 private:
     struct Deadline
@@ -752,12 +773,6 @@ private:
             m_guardMaxLeadMs = nowMs - m_guardFirstGrantMs;
         }
         if( q < m_guardQMin ) m_guardQMin = q;
-    }
-
-    /*! r2 (r1 adversary pass 2 A1): the timeline's travel from the Play's start to \a position, the corrections taken out. */
-    int timelineTravel( int position ) const
-    {
-        return position - m_startPosition - m_correctedFrames;
     }
 
     /*! The wall time since Play at \a nowMs, in pace frames (never negative). */
@@ -825,11 +840,11 @@ private:
 
     int m_startPosition = 0;
     int m_timelinePosition = 0;
-    int m_correctedFrames = 0;            // r2: the signed sum of the timeline corrections (noteTimelineCorrection)
-    std::vector<int> m_correctionMoves;   // r2: each correction's signed move, in order, for the present that lands it
-    size_t m_correctionMovesLanded = 0;   // r2: how many of them a present has landed
-    int m_displayCorrectedFrames = 0;     // r2: the signed sum of the landed ones (the display side of m_correctedFrames)
-    int m_correctedAtFirstPresent = 0;    // r2: m_correctedFrames when the first present was recorded
+    long long m_correctedFrames = 0;            // r2: the signed sum of the timeline corrections (noteTimelineCorrection)
+    std::vector<long long> m_correctionMoves;   // r2: each correction's signed move, in order, for the present that lands it
+    size_t m_correctionMovesLanded = 0;         // r2: how many of them a present has landed
+    long long m_displayCorrectedFrames = 0;     // r2: the signed sum of the landed ones (the display side of m_correctedFrames)
+    long long m_correctedAtFirstPresent = 0;    // r2: m_correctedFrames when the first present was recorded
     double m_paceFps = 0.0;
     double m_periodMs = 0.0;
 
