@@ -429,6 +429,22 @@ inline DropFrameTickResult advanceDropFrameTick(
             result.correctedStart = start;
         }
     }
+    else if( loopEnabled && loopWidth == 0 )
+    {
+        // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r3 (adversary pass 4 A1 on b30cd3a1): a ONE-FRAME Loop cut (Cut In = Cut Out,
+        // conform off: width 0) has no phase to keep, but a start outside its one frame [wrapAt, wrapAt + 1) is still corrected
+        // onto that frame (wrapAt = cutIn - 1) before the delta: corrections (i) and (ii) for width 0. The `loopWidth > 0` guard
+        // above skipped them, so a playhead at 10 advanced to 10.192 and a stale 100 to 100.192 with a lap. A start inside the
+        // frame is unchanged, bit for bit (its zero-width lap below is the base's, DROP-FRAME-ZERO-WIDTH-LOOP-STALE-LAP-1); a NaN
+        // start fails both comparisons and is not corrected; +-inf are corrected onto the frame.
+        if( currentPosition < wrapAt || currentPosition >= wrapAt + 1.0 )
+        {
+            start = wrapAt;
+            result.foldedFrames = currentPosition - start;
+            result.corrected = true;
+            result.correctedStart = start;
+        }
+    }
     result.position = start + frameDelta;
     // r8 iteration 1 (pass 14 A1): the applied advance, never recovered from the stale endpoints. r8 iteration 2 (pass 15 A1
     // on 437108e0): it is the move the position really made from the (folded) start, not the delta: a conform residue of

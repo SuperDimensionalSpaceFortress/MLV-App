@@ -440,6 +440,9 @@ public:
     {
         m_correctedFrames = m_displayCorrectedFrames;
         m_correctionMoves.resize( m_correctionMovesLanded );
+        // r3: the first present's count of corrections loses the dropped ones too, so a later correction (it reuses their FIFO
+        // index) is still known to have been made after the first present
+        m_correctionMovesAtFirstPresent = std::min( m_correctionMovesAtFirstPresent, m_correctionMovesLanded );
         m_timelinePosition = frame;
     }
 
@@ -471,6 +474,7 @@ public:
             m_lastDisplayFrame = s.displayFrame;
             m_timelineAtFirstPresent = s.timelinePosition;
             m_correctedAtFirstPresent = m_correctedFrames;
+            m_correctionMovesAtFirstPresent = m_correctionMoves.size();
             m_timelineAdvanceSincePresent = 0;
             // The frames passed before the first present, plus whatever its own early advance jumped past the
             // next frame (the repaid wait for the first frame): never slips. r2: a correction is neither (both endpoints are
@@ -510,7 +514,12 @@ public:
         if( s.rebase ) m_lastDisplayFrame = s.rebaseFrame;
         // r2 iteration 2 (adversary pass 4 A3 on b30cd3a1): the first present's jump was passed BEFORE the correction; a rebased
         // interval's skips are after it, so the jump is startup catch-up of its own and never covers them.
-        if( s.rebase && m_presents == 2 && m_firstPresentJumpFrames > 0 )
+        // r3 (escalated adversary pass 5 A1 on 2a3371ff): only when the rebase's correction (the LAST one this present landed, in
+        // FIFO order) was made AFTER the first present. One made before it was already taken out of the jump, which is then the
+        // rebased interval's own travel (10 corrected to 40, granted to 45, first present 10, 45 lands it: the jump 41..44 IS the
+        // interval), so the base rule below spends it once against the interval's skips, never as catch-up AND slips.
+        if( s.rebase && m_presents == 2 && m_firstPresentJumpFrames > 0
+         && m_correctionMovesLanded > m_correctionMovesAtFirstPresent )
         {
             m_startupCatchupFrames += m_firstPresentJumpFrames;
             m_firstPresentJumpFrames = 0;
@@ -863,6 +872,7 @@ private:
     size_t m_correctionMovesLanded = 0;         // r2: how many of them a present has landed
     long long m_displayCorrectedFrames = 0;     // r2: the signed sum of the landed ones (the display side of m_correctedFrames)
     long long m_correctedAtFirstPresent = 0;    // r2: m_correctedFrames when the first present was recorded
+    size_t m_correctionMovesAtFirstPresent = 0; // r3: how many corrections were made before the first present (pass 5 A1)
     double m_paceFps = 0.0;
     double m_periodMs = 0.0;
 
