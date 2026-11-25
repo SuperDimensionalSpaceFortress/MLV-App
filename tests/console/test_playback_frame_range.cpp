@@ -3,7 +3,14 @@
 #include "../../platform/qt/PlaybackNativePaceGuard.h"
 #include "../../platform/qt/PlaybackSourceAdvanceTracker.h"
 
+#include "../common/repo_paths.h"
+
+#include <QFile>
+#include <QString>
+#include <QTextStream>
 #include <QtCore/qnumeric.h>
+// Qt's keyword macro `forever` (qforeach.h, pulled in by QString) would rewrite this file's own `forever` identifiers.
+#undef forever
 
 #include <cmath>
 #include <cstdio>
@@ -4995,4 +5002,56 @@ TEST( PlaybackFrameRangeArgOverflow, SmokeSecondsFitDurationMs )
     ASSERT_EQ( 20000, qRound( 20.0 * 1000.0 ) );
     ASSERT_TRUE( smokeSecondsFitDurationMs( 2147483.647 ) );
     ASSERT_EQ( std::numeric_limits<int>::max(), qRound( 2147483.647 * 1000.0 ) );
+    // r1 adversary A2: past 2147483.647 but still rounding to INT_MAX is admitted (and safe)
+    ASSERT_TRUE( smokeSecondsFitDurationMs( 2147483.6474 ) );
+    ASSERT_EQ( std::numeric_limits<int>::max(), qRound( 2147483.6474 * 1000.0 ) );
+}
+
+// r1 adversary A1: the --seconds tokens main.cpp reads, through the same QString::toDouble. Qt reports a decimal overflow
+// (1e309) as ok=false with an infinity, and -inf / -2147483.649 are also <= 0, so the "--seconds must be greater than 0" check
+// would claim them first. Every one of them must be refused as out of range, which needs the range check to run first.
+TEST( PlaybackFrameRangeArgOverflow, SmokeSecondsQtTokensOutOfRange )
+{
+    using playback_frame_range::smokeSecondsFitDurationMs;
+    const char *const outOfRange[] = { "1e309", "-1e309", "-inf", "inf", "nan", "-2147483.649", "2147483.648", " 2147483.648\n" };
+    for( const char *token : outOfRange )
+    {
+        bool ok = true;
+        const double seconds = QString::fromLatin1( token ).toDouble( &ok );
+        ASSERT_FALSE( smokeSecondsFitDurationMs( seconds ) );
+    }
+    const char *const inRange[] = { "2", "20", "0", "abc", "-5" };   // in range: left to the existing checks
+    for( const char *token : inRange )
+    {
+        bool ok = false;
+        const double seconds = QString::fromLatin1( token ).toDouble( &ok );
+        ASSERT_TRUE( smokeSecondsFitDurationMs( seconds ) );
+    }
+}
+
+// r1 adversary A1/A2/A3/A7: main.cpp needs a full GUI build, so its wiring is read as text (as
+// test_gui_smoke_display_select_wiring.cpp does). The range refusal runs after the parse and BEFORE the "> 0" check, so an
+// out-of-range token is refused by its own typed reason (A1); it prints the trimmed token (A7) and the cap it really
+// enforces (A2); and removing the call fails here (A3).
+TEST( PlaybackFrameRangeArgOverflow, MainRefusesSecondsOutOfRangeFirst )
+{
+    const QString path = repo_file_path( QStringLiteral( "platform/qt/main.cpp" ) );
+    ASSERT_FALSE( path.isEmpty() );
+    QFile file( path );
+    ASSERT_TRUE( file.open( QIODevice::ReadOnly | QIODevice::Text ) );
+    const QString source = QTextStream( &file ).readAll();
+    const int parse = source.indexOf( QStringLiteral( "const double seconds = parser.value(secondsOpt).toDouble(&ok);" ) );
+    const int range = source.indexOf( QStringLiteral( "if (!playback_frame_range::smokeSecondsFitDurationMs(seconds))" ) );
+    const int positive = source.indexOf( QStringLiteral( "if (!ok || seconds <= 0.0)" ) );
+    const int convert = source.indexOf( QStringLiteral( "options.durationMs = qRound(seconds * 1000.0);" ) );
+    ASSERT_TRUE( parse >= 0 && range >= 0 && positive >= 0 && convert >= 0 );
+    ASSERT_TRUE( parse < range );
+    ASSERT_TRUE( range < positive );                                   // RED on d9c1e61b: the range check came after
+    ASSERT_TRUE( positive < convert );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "smokeSecondsFitDurationMs(" ) ) );
+    const QString refusal = source.mid( range, source.indexOf( QStringLiteral( "return 2;" ), range ) - range );
+    ASSERT_TRUE( refusal.contains( QStringLiteral( "SECONDS_OUT_OF_RANGE" ) ) );
+    ASSERT_TRUE( refusal.contains( QStringLiteral( "parser.value(secondsOpt).trimmed()" ) ) );       // RED: raw token
+    ASSERT_TRUE( refusal.contains( QStringLiteral( "at most 2147483647" ) ) );                       // RED: 2147483.647
+    ASSERT_FALSE( source.contains( QStringLiteral( "at most 2147483.647" ) ) );
 }
