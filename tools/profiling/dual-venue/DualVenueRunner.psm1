@@ -6726,6 +6726,23 @@ function Get-DvJsonRootObjectWithout {
     } finally { $doc.Dispose() }
 }
 
+function Get-DvJsonRootMemberTexts {
+    # SUCCESSOR-3 r2 (pass-3 adversary A7): the raw JSON text of every member of the root object named $Name in any letter case, in order (the root peeled of one-element
+    # arrays as Get-DvJsonRootObjectWithout peels it); nothing when the text is not such an object.
+    param([AllowEmptyString()][string]$Text, [string]$Name)
+    try {
+        $opt = [System.Text.Json.JsonDocumentOptions]::new()
+        $opt.MaxDepth = 1024; $opt.AllowTrailingCommas = $true; $opt.CommentHandling = [System.Text.Json.JsonCommentHandling]::Skip
+        $doc = [System.Text.Json.JsonDocument]::Parse($Text, $opt)
+    } catch { return }
+    try {
+        $root = $doc.RootElement
+        while ($root.ValueKind -eq [System.Text.Json.JsonValueKind]::Array -and $root.GetArrayLength() -eq 1) { $root = $root[0] }
+        if ($root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return }
+        foreach ($p in $root.EnumerateObject()) { if ([string]::Equals($p.Name, $Name, [System.StringComparison]::OrdinalIgnoreCase)) { $p.Value.GetRawText() } }
+    } finally { $doc.Dispose() }
+}
+
 # SUCCESSOR-3 r2 (sol r1 B2): what a receipt's venue.displayPath reads as when the block itself stopped ConvertFrom-Json; Test-DvDisplayPathBlock types it malformed
 $script:DisplayPathUnparsed = 'DVE_DISPLAY_PATH_STOPPED_THE_RECEIPT_PARSE'
 
@@ -6744,10 +6761,18 @@ function ConvertFrom-DvReceiptText {
         $rest = Get-DvJsonRootObjectWithout -Text $Text -Name 'displayPath' -Under 'venue'
         if ($null -eq $rest) { throw $first }
         try { $parsed = $rest | ConvertFrom-Json } catch { throw $first }
+        # r2 pass-3 adversary A7: a venue copy the recovery dropped (`venue` beside `Venue`) must itself read without its block, or the failure was not the
+        # display path's and stays the parser's own
+        $copies = @(Get-DvJsonRootMemberTexts -Text $Text -Name 'venue')
+        for ($i = 0; $i -lt $copies.Count - 1; $i++) {
+            $copy = Get-DvJsonRootObjectWithout -Text $copies[$i] -Name 'displayPath'
+            if ($null -eq $copy) { $copy = $copies[$i] }
+            try { $null = ($copy | ConvertFrom-Json) } catch { throw $first }
+        }
         while ($parsed -is [System.Array] -and $parsed.Count -eq 1) { $parsed = $parsed[0] }   # r2 adversary A2: the record inside nested one-element arrays
         $venue = Get-DvProp $parsed 'venue'
-        if ($venue -isnot [System.Management.Automation.PSCustomObject]) { throw $first }
-        Add-Member -InputObject $venue -NotePropertyName displayPath -NotePropertyValue $script:DisplayPathUnparsed -Force
+        # r2 pass-3 adversary A7: a kept venue that is not an object (`"Venue": null` after a good `venue`) is left as it is: the validator types it malformed
+        if ($venue -is [System.Management.Automation.PSCustomObject]) { Add-Member -InputObject $venue -NotePropertyName displayPath -NotePropertyValue $script:DisplayPathUnparsed -Force }
     }
     while ($parsed -is [System.Array] -and $parsed.Count -eq 1) { $parsed = $parsed[0] }
     $parsed

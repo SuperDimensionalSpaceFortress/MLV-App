@@ -53,14 +53,21 @@ $OutDir = $outFull   # every write below goes to the certified path, not the raw
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
 $evidenceDirs = @{}
 $listedFrames = @{}
+# The evidence-bearing validator: the receipt's admission is re-derived from the committed blobs and its run from the hashed
+# evidence files (a receipt whose evidence is absent is INCOMPLETE). Nothing the receipt says about itself is believed.
+# VENUE-LEG-DISPLAY-PATH-RECEIPT-1-SUCCESSOR-3 r2 (adversary A7, A8): EVERY side is validated before any side's outcome gate, so a malformed venue.displayPath on
+# either side is refused as itself (PAIR_RECEIPT_INVALID, DISPLAY_PATH_MALFORMED) on any outcome; otherwise each side's gates below run in order, as before.
+$validities = [System.Collections.Generic.List[object]]::new()
 foreach ($r in $cuda, $cpu) {
-    # The evidence-bearing validator: the receipt's admission is re-derived from the committed blobs and its run from the hashed
-    # evidence files (a receipt whose evidence is absent is INCOMPLETE). Nothing the receipt says about itself is believed.
-    # VENUE-LEG-DISPLAY-PATH-RECEIPT-1-SUCCESSOR-3 r2 (adversary A7): it runs BEFORE the outcome gate, so a malformed venue.displayPath is refused as itself
-    # (PAIR_RECEIPT_INVALID, DISPLAY_PATH_MALFORMED) on any outcome; a receipt that is not PASS/FAIL is otherwise PAIR_RECEIPT_INCOMPLETE as before, whatever the validator did.
     $validity = $null; $validityError = $null
     try { $validity = Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot -ReceiptText $(if ([object]::ReferenceEquals($r, $cuda)) { $cudaText } else { $cpuText }) } catch { $validityError = $_ }
-    if ($r.outcome -ne 'PASS' -and $r.outcome -ne 'FAIL' -and -not ($validity -and [string]$validity.displayPath -ceq 'malformed')) { throw "PAIR_RECEIPT_INCOMPLETE receipt $($r.receiptId) is $($r.outcome), not PASS/FAIL" }
+    if ($validity -and [string]$validity.displayPath -ceq 'malformed') { throw "PAIR_RECEIPT_INVALID receipt $($r.receiptId) is not valid evidence: $(@($validity.reasons) -join '; ')" }
+    $validities.Add([pscustomobject]@{ validity = $validity; error = $validityError })
+}
+$side = 0
+foreach ($r in $cuda, $cpu) {
+    $validity = $validities[$side].validity; $validityError = $validities[$side].error; $side++
+    if ($r.outcome -ne 'PASS' -and $r.outcome -ne 'FAIL') { throw "PAIR_RECEIPT_INCOMPLETE receipt $($r.receiptId) is $($r.outcome), not PASS/FAIL" }
     if ($validityError) { throw $validityError }
     if ($validity.status -cne 'ADVISORY') { throw "PAIR_RECEIPT_$($validity.status) receipt $($r.receiptId) is not valid evidence: $(@($validity.reasons) -join '; ')" }
     # The leg type is the COMMITTED spec's (found by the validator), not a field of the receipt: only a look leg has a sheet to pair.

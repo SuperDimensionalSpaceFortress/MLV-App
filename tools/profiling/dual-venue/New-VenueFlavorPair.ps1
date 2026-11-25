@@ -233,14 +233,21 @@ $evidenceDirs = @{}
 $listedFrames = @{}
 $sliders = @{}
 $reported = @{}
+# The evidence-bearing validator: admission re-derived from the committed blobs, the run from the hashed evidence. Nothing the receipt says is believed.
+# VENUE-LEG-DISPLAY-PATH-RECEIPT-1-SUCCESSOR-3 r2 (adversary A7, A8): EVERY side is validated before any side's outcome gate, so a malformed venue.displayPath on
+# any side is refused as itself (PAIR_RECEIPT_INVALID, DISPLAY_PATH_MALFORMED) on any outcome; otherwise each side's gates below run in order, as before.
+$validities = @{}
 foreach ($label in $sides.Keys) {
     $r = $sides[$label]
-    # The evidence-bearing validator: admission re-derived from the committed blobs, the run from the hashed evidence. Nothing the receipt says is believed.
-    # VENUE-LEG-DISPLAY-PATH-RECEIPT-1-SUCCESSOR-3 r2 (adversary A7): it runs BEFORE the outcome gate, so a malformed venue.displayPath is refused as itself
-    # (PAIR_RECEIPT_INVALID, DISPLAY_PATH_MALFORMED) on any outcome; a receipt that is not PASS/FAIL is otherwise PAIR_RECEIPT_INCOMPLETE as before, whatever the validator did.
     $validity = $null; $validityError = $null
     try { $validity = Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot -ReceiptText $receiptTexts[$label] } catch { $validityError = $_ }
-    if ($r.outcome -ne 'PASS' -and $r.outcome -ne 'FAIL' -and -not ($validity -and [string]$validity.displayPath -ceq 'malformed')) { throw "PAIR_RECEIPT_INCOMPLETE receipt $($r.receiptId) is $($r.outcome), not PASS/FAIL" }
+    if ($validity -and [string]$validity.displayPath -ceq 'malformed') { throw "PAIR_RECEIPT_INVALID receipt $($r.receiptId) is not valid evidence: $(@($validity.reasons) -join '; ')" }
+    $validities[$label] = [pscustomobject]@{ validity = $validity; error = $validityError }
+}
+foreach ($label in $sides.Keys) {
+    $r = $sides[$label]
+    $validity = $validities[$label].validity; $validityError = $validities[$label].error
+    if ($r.outcome -ne 'PASS' -and $r.outcome -ne 'FAIL') { throw "PAIR_RECEIPT_INCOMPLETE receipt $($r.receiptId) is $($r.outcome), not PASS/FAIL" }
     if ($validityError) { throw $validityError }
     if ($validity.status -cne 'ADVISORY') { throw "PAIR_RECEIPT_$($validity.status) receipt $($r.receiptId) is not valid evidence: $(@($validity.reasons) -join '; ')" }
     if ([string]$validity.legType -cne 'look') { throw "PAIR_NOT_A_LOOK_LEG receipt $($r.receiptId) is not a LOOK leg per its committed leg spec" }
