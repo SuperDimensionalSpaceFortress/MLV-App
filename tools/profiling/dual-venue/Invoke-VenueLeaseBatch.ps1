@@ -3022,7 +3022,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                 $b.legsRan++; if ($counted) { $b.legsCounted++ }
                 LogBest "LEG $($leg.name) RAN batch=$batchNo exit=$legCode outcome=$outcome class=$class counted=$counted quietMean=$(Format-Mean $q.mean) preLoadMean=$(Format-Mean $preLoad) hostLoadState=$($hl.state) hostLoadProvisional=$([bool]$hl.provisional) legSec=$legSec receipt=$receipt $leaseWhy$(if ($legFF) { ' foreignFloor=1' })"
-                if ($class -ceq 'HOSTLOAD_PROVISIONAL') { LogBest $hlRefusal }
+                if ($hlRefusal) { LogBest $hlRefusal }   # r1 (adversary-b0c05520.json A5): whatever the class (a high or unknown pre-load too)
                 if ($leaseClass -ceq 'LEASE_IDLE_ENDED') { $b.endDetail = $leaseWhy; Set-BatchLeaseIdleEnded $b $legIe $leg.name "before leg $($leg.name)'s job was admitted: it ran off the lease, uncounted" 'a leg ran off the lease: uncounted' -AppendDetail; break }
                 if ($leaseClass) { $b.endReason = $leaseClass; $b.endDetail = $leaseWhy; break }
                 if ($pending.Count -gt 0 -and $CooldownSec -gt 0) {

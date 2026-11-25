@@ -1664,6 +1664,47 @@ function Get-VenueLegPreLoadMean {
     } catch { $null }
 }
 
+function Test-VenueHlObject([object]$O) {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: an object or a dictionary to read members from; never a scalar, a string or a list (adversary-8c2884e9.json A1).
+    if ($null -eq $O -or $O -is [string] -or $O -is [ValueType]) { return $false }
+    if ($O -is [System.Collections.IDictionary]) { return $true }
+    -not ($O -is [Array] -or $O -is [System.Collections.IList])
+}
+
+function Get-VenueHlMember([object]$O, [string]$N) {
+    # The member's value as it is (the unary comma stops the pipeline unrolling a one-element array); a dictionary is read by key (adversary-b0c05520.json A8).
+    if (-not (Test-VenueHlObject $O)) { return $null }
+    if ($O -is [System.Collections.IDictionary]) { if ($O.Contains($N)) { return , $O[$N] }; return $null }
+    $p = $O.PSObject.Properties[$N]
+    if ($null -eq $p) { return $null }
+    , $p.Value
+}
+
+function Find-VenueJsonDuplicateMember {
+    # adversary-b0c05520.json A2: ConvertFrom-Json keeps the LAST of two same-named members, so a duplicate could pick a clean value. The first duplicated member
+    # name (case-insensitive, as PowerShell property lookup is) at the root or anywhere under a root hostLoad member, or $null when there is none.
+    param([Parameter(Mandatory)][string]$Text)
+    $doc = [System.Text.Json.JsonDocument]::Parse($Text)
+    try {
+        $walk = $null
+        $walk = {
+            param($E, [string]$Path, [bool]$Deep)
+            if ($E.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+                $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                foreach ($m in $E.EnumerateObject()) {
+                    if (-not $seen.Add($m.Name)) { return "$Path.$($m.Name)" }
+                    if ($Deep -or [string]::Equals($m.Name, 'hostLoad', [StringComparison]::OrdinalIgnoreCase)) { $d = & $walk $m.Value "$Path.$($m.Name)" $true; if ($d) { return $d } }
+                }
+            } elseif ($Deep -and $E.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
+                $i = 0
+                foreach ($x in $E.EnumerateArray()) { $d = & $walk $x "$Path[$i]" $true; if ($d) { return $d }; $i++ }
+            }
+            $null
+        }
+        & $walk $doc.RootElement '$' $false
+    } finally { $doc.Dispose() }
+}
+
 function ConvertFrom-VenueSmokeHostLoad {
     <#
     .SYNOPSIS
@@ -1676,33 +1717,38 @@ function ConvertFrom-VenueSmokeHostLoad {
     # r1 (adversary-8c2884e9.json A1): a property value is returned as it is (the comma stops the pipeline unrolling a one-element array, so [false] or [true]
     # is never read as the boolean inside it), and an array is never an object to read a property from. A2: the state is kept only when it is a plain ASCII
     # lower-case token (no padding, control or format character); anything else reads 'unknown', and only the exact ordinal 'quiet' is clean.
+    # r1 (adversary-b0c05520.json A3): every interior (during) sample must be collected too; a during that is not a list, or an element that is not a collected
+    # snapshot, is not collected. A8: a dictionary block (ConvertFrom-Json -AsHashtable) is read by its keys.
     param([AllowNull()][object]$HostLoad)
-    function Get-HlProp([object]$O, [string]$N) {
-        if ($null -eq $O -or $O -is [string] -or $O -is [ValueType] -or $O -is [Array] -or $O -is [System.Collections.IList]) { return $null }
-        $p = $O.PSObject.Properties[$N]
-        if ($null -eq $p) { return $null }
-        , $p.Value
-    }
-    if ($null -eq $HostLoad -or $HostLoad -is [string] -or $HostLoad -is [ValueType] -or $HostLoad -is [Array] -or $HostLoad -is [System.Collections.IList]) {
+    if (-not (Test-VenueHlObject $HostLoad)) {
         return [pscustomobject]@{ state = 'unknown'; provisional = $true; collected = $false; reason = 'no hostLoad block in the smoke result' }
     }
     $errors = @()
     $collected = $true
     foreach ($side in 'before', 'after') {
-        $snap = Get-HlProp $HostLoad $side
-        $c = Get-HlProp $snap 'collected'
+        $snap = Get-VenueHlMember $HostLoad $side
+        $c = Get-VenueHlMember $snap 'collected'
         if (-not ($c -is [bool] -and $c)) {
             $collected = $false
-            $err = Get-HlProp $snap 'error'
+            $err = Get-VenueHlMember $snap 'error'
             $errors += "$side not collected$(if ($err) { " ($([string]$err))" })"
         }
     }
-    $stateRaw = Get-HlProp $HostLoad 'state'
+    $during = Get-VenueHlMember $HostLoad 'during'
+    if ($null -ne $during) {
+        if ($during -is [string] -or -not ($during -is [System.Collections.IList])) { $collected = $false; $errors += 'during is not a list of snapshots' }
+        else {
+            $bad = 0
+            foreach ($el in $during) { $c = Get-VenueHlMember $el 'collected'; if (-not ($c -is [bool] -and $c)) { $bad++ } }
+            if ($bad -gt 0) { $collected = $false; $errors += "$bad during sample(s) not collected" }
+        }
+    }
+    $stateRaw = Get-VenueHlMember $HostLoad 'state'
     $state = $(if ($stateRaw -is [string] -and [regex]::IsMatch($stateRaw, '\A[a-z][a-z_-]{0,31}\z')) { $stateRaw } else { 'unknown' })
     if (-not $collected) { $state = 'unknown' }
-    $prov = Get-HlProp $HostLoad 'provisional'
+    $prov = Get-VenueHlMember $HostLoad 'provisional'
     $provisional = (-not ($prov -is [bool] -and -not $prov)) -or (-not [string]::Equals($state, 'quiet', [StringComparison]::Ordinal))
-    $why = Get-HlProp $HostLoad 'reason'
+    $why = Get-VenueHlMember $HostLoad 'reason'
     $reason = @(@($errors) + @($(if ($why) { [string]$why }))) -join '; '
     [pscustomobject]@{ state = $state; provisional = [bool]$provisional; collected = [bool]$collected; reason = $reason }
 }
@@ -1715,20 +1761,33 @@ function Get-VenueLegHostLoad {
     root) with no result.json, an unreadable one or no hostLoad block is 'unknown' and provisional. An export leg (export\summary.json only) runs no GUI smoke:
     state 'not-applicable', provisional false, applies false, so its counting is unchanged. Returns ConvertFrom-VenueSmokeHostLoad's object plus applies.
     #>
+    # r1 (adversary-b0c05520.json A1): the receipt decides, never the folder layout. A receipt whose export block is an object is an export leg; any other
+    # receipt is a playback leg, and its result.json counts only when its bytes hash to the receipt's evidence.resultJsonSha256 (Invoke-VenueLeg.ps1 binds it):
+    # no binding, a mismatch (bytes replaced after publication) or an unreadable receipt is 'unknown'. A2: a duplicated member is 'unknown'.
     param([string]$ReceiptPath)
     $unknown = [pscustomobject]@{ state = 'unknown'; provisional = $true; collected = $false; reason = 'no smoke result.json for the leg'; applies = $true }
     try {
         if (-not $ReceiptPath) { return $unknown }
+        $rc = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($ReceiptPath)) -NoEnumerate
+        if (-not (Test-VenueHlObject $rc)) { $unknown.reason = 'the receipt is not a JSON object'; return $unknown }
+        if (Test-VenueHlObject (Get-VenueHlMember $rc 'export')) { return [pscustomobject]@{ state = 'not-applicable'; provisional = $false; collected = $false; reason = 'export leg: no GUI smoke'; applies = $false } }
+        $want = Get-VenueHlMember (Get-VenueHlMember $rc 'evidence') 'resultJsonSha256'
+        if (-not ($want -is [string] -and [regex]::IsMatch($want, '\A[0-9a-fA-F]{64}\z'))) { $unknown.reason = 'the receipt binds no evidence.resultJsonSha256'; return $unknown }
         $root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $ReceiptPath)))
         $evidence = Join-Path (Join-Path (Split-Path -Parent $root) 'evidence') ([IO.Path]::GetFileNameWithoutExtension($ReceiptPath))
-        $isExport = (-not (Test-Path -LiteralPath (Join-Path $evidence 'summary.json') -PathType Leaf)) -and (Test-Path -LiteralPath (Join-Path (Join-Path $evidence 'export') 'summary.json') -PathType Leaf)
-        if ($isExport) { return [pscustomobject]@{ state = 'not-applicable'; provisional = $false; collected = $false; reason = 'export leg: no GUI smoke'; applies = $false } }
         $result = Join-Path $evidence 'result.json'
         if (-not (Test-Path -LiteralPath $result -PathType Leaf)) { return $unknown }
+        $bytes = [IO.File]::ReadAllBytes($result)
+        $got = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+        if (-not [string]::Equals($got, $want, [StringComparison]::OrdinalIgnoreCase)) { $unknown.reason = "result.json does not match the receipt's evidence.resultJsonSha256"; return $unknown }
+        $text = [Text.Encoding]::UTF8.GetString($bytes)
+        if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
+        $dup = Find-VenueJsonDuplicateMember -Text $text
+        if ($dup) { $unknown.reason = "result.json repeats the member $dup"; return $unknown }
         # r1 (adversary-8c2884e9.json A1): -NoEnumerate and no $( ) around the value, so a one-element array (the root or the hostLoad block) is never unrolled
-        $doc = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($result)) -NoEnumerate
+        $doc = ConvertFrom-Json -InputObject $text -NoEnumerate
         $hl = $null
-        if ($null -ne $doc -and $doc -isnot [string] -and $doc -isnot [ValueType] -and $doc -isnot [Array] -and $doc -isnot [System.Collections.IList] -and $doc.PSObject.Properties['hostLoad']) { $hl = $doc.PSObject.Properties['hostLoad'].Value }
+        if (Test-VenueHlObject $doc) { $hl = Get-VenueHlMember $doc 'hostLoad' }
         $s = ConvertFrom-VenueSmokeHostLoad -HostLoad $hl
         $s | Add-Member -NotePropertyName applies -NotePropertyValue $true
         $s
@@ -1745,10 +1804,9 @@ function Get-VenueReferenceHostLoadRefusal {
     # clean only when provisional is the boolean false, collected the boolean true and state the exact ordinal 'quiet' (A2), so a standing that says
     # provisional=false beside an unknown state or an uncollected snapshot is still refused.
     param([AllowEmptyString()][AllowNull()][string]$LegId, [AllowNull()][object]$Standing)
-    function Get-StProp([object]$O, [string]$N) { if ($null -eq $O -or $O -is [string] -or $O -is [ValueType] -or $O -is [Array]) { return $null }; $p = $O.PSObject.Properties[$N]; if ($null -eq $p) { return $null }; , $p.Value }
-    $applies = Get-StProp $Standing 'applies'
+    $applies = Get-VenueHlMember $Standing 'applies'
     if ($applies -is [bool] -and -not $applies) { return $null }
-    $prov = Get-StProp $Standing 'provisional'; $coll = Get-StProp $Standing 'collected'; $st = Get-StProp $Standing 'state'
+    $prov = Get-VenueHlMember $Standing 'provisional'; $coll = Get-VenueHlMember $Standing 'collected'; $st = Get-VenueHlMember $Standing 'state'
     $state = $(if ($st -is [string] -and [regex]::IsMatch($st, '\A[a-z][a-z_-]{0,31}\z')) { $st } else { 'unknown' })
     $isQuiet = [string]::Equals($state, 'quiet', [StringComparison]::Ordinal)
     if ($prov -is [bool] -and -not $prov -and $coll -is [bool] -and $coll -and $isQuiet) { return $null }
@@ -1769,11 +1827,10 @@ function Get-VenueReferenceArmVerdict {
     param([AllowNull()][AllowEmptyCollection()][object[]]$Legs)
     $all = [System.Collections.Generic.List[object]]::new(); $counted = [System.Collections.Generic.List[object]]::new(); $refusals = [System.Collections.Generic.List[string]]::new()
     foreach ($leg in @($Legs)) {
-        $isObj = ($null -ne $leg -and $leg -isnot [string] -and $leg -isnot [ValueType] -and $leg -isnot [Array])
-        $lidP = $(if ($isObj) { $leg.PSObject.Properties['legId'] } else { $null })
-        $lid = $(if ($null -ne $lidP -and $lidP.Value -is [string]) { [string]$lidP.Value } else { '' })
-        $rawP = $(if ($isObj) { $leg.PSObject.Properties['hostLoad'] } else { $null })
-        $raw = $null; if ($null -ne $rawP) { $raw = $rawP.Value }
+        # r1 (adversary-b0c05520.json A8): a hashtable leg is read by its keys, as an object leg by its properties
+        $lidV = Get-VenueHlMember $leg 'legId'
+        $lid = $(if ($lidV -is [string]) { $lidV } else { '' })
+        $raw = Get-VenueHlMember $leg 'hostLoad'
         $s = ConvertFrom-VenueSmokeHostLoad -HostLoad $raw
         $line = Get-VenueReferenceHostLoadRefusal -LegId $lid -Standing $s
         $row = [pscustomobject]@{ legId = $lid; hostLoadState = [string]$s.state; hostLoadProvisional = [bool]$s.provisional; counted = ($null -eq $line) }
