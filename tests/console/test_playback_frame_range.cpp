@@ -5216,14 +5216,14 @@ TEST( PlaybackFrameRange, R3AOneFrameLoopCutCorrectsAStartOutsideItsFrame )
     ASSERT_TRUE( below.corrected );                                      // 2a3371ff: false
     ASSERT_TRUE( below.correctedStart == 40.0 );                         // 2a3371ff: 10
     ASSERT_TRUE( below.foldedFrames == -30.0 );
-    ASSERT_NEAR( 40.192, below.position, 1e-12 );                        // 2a3371ff: 10.192
-    ASSERT_NEAR( 0.192, below.appliedFrames, 1e-12 );
+    ASSERT_TRUE( below.position == 40.0 );                               // 2a3371ff: 10.192; iteration 2 holds (pass 7 A2)
+    ASSERT_TRUE( below.appliedFrames == 0.0 );
     ASSERT_EQ( onFrame.wrapLaps, below.wrapLaps );
     const playback_frame_range::DropFrameTickResult stale = advanceDropFrameTick( 100.0, 0.192, 41, 41, true, false );
     ASSERT_TRUE( stale.corrected );                                      // 2a3371ff: false
     ASSERT_TRUE( stale.correctedStart == 40.0 );
     ASSERT_TRUE( stale.foldedFrames == 60.0 );
-    ASSERT_NEAR( 40.192, stale.position, 1e-12 );                        // 2a3371ff: 100.192
+    ASSERT_TRUE( stale.position == 40.0 );                               // 2a3371ff: 100.192
     ASSERT_EQ( onFrame.wrapLaps, stale.wrapLaps );
     ASSERT_EQ( onFrame.wrapWidth, stale.wrapWidth );
     // inside the frame (40.5) is not corrected; neither is NaN; +-inf are corrected onto the frame
@@ -5254,12 +5254,36 @@ TEST( PlaybackFrameRange, R3Iter1AZeroWidthLoopCutNeverLaps )
     const playback_frame_range::DropFrameTickResult stale = advanceDropFrameTick( 100.0, 0.192, 41, 41, true, false );
     ASSERT_EQ( 0, stale.wrapLaps );                                      // f8d80862: 1
     ASSERT_FALSE( stale.wrapped );
-    ASSERT_NEAR( 40.192, stale.position, 1e-12 );
-    ASSERT_NEAR( 0.192, stale.appliedFrames, 1e-12 );
+    ASSERT_TRUE( stale.position == 40.0 );                               // iteration 2 holds (pass 7 A2)
+    ASSERT_TRUE( stale.appliedFrames == 0.0 );
     const playback_frame_range::DropFrameTickResult onFrame = advanceDropFrameTick( 40.0, 0.192, 41, 41, true, false );
     ASSERT_EQ( 0, onFrame.wrapLaps );                                    // 2a3371ff and f8d80862: 1
     ASSERT_FALSE( onFrame.wrapped );
-    ASSERT_NEAR( 40.192, onFrame.position, 1e-12 );
+    ASSERT_TRUE( onFrame.position == 40.0 );
+}
+
+// r3 iteration 2 (adversary pass 7 A2 on 506b35d4, its input verbatim): a zero-width Loop cut HOLDS its one source frame. A cut edited
+// to 41..41 under a playhead at 10 with three frames granted corrected to 40 and then advanced to 43, past the clip's last frame (41
+// frames: 0..40), with appliedFrames 3 crediting source consumption, the present trace and the histogram. The tick applies nothing.
+TEST( PlaybackFrameRange, R3Iter2AZeroWidthLoopCutHoldsItsFrame )
+{
+    using playback_frame_range::advanceDropFrameTick;
+    const playback_frame_range::DropFrameTickResult t = advanceDropFrameTick( 10.0, 3.0, 41, 41, true, false );
+    ASSERT_TRUE( t.corrected );
+    ASSERT_TRUE( t.correctedStart == 40.0 );
+    ASSERT_TRUE( t.position == 40.0 );                                   // 506b35d4: 43
+    ASSERT_TRUE( t.appliedFrames == 0.0 );                               // 506b35d4: 3
+    ASSERT_EQ( 0, t.wrapLaps );
+    ASSERT_FALSE( t.wrapped );
+    // an in-frame start holds where it is (no correction), whatever the grant, an infinite one included
+    const playback_frame_range::DropFrameTickResult in = advanceDropFrameTick( 40.5, 7.0, 41, 41, true, false );
+    ASSERT_FALSE( in.corrected );
+    ASSERT_TRUE( in.position == 40.5 );                                  // 506b35d4: 47.5
+    ASSERT_TRUE( in.appliedFrames == 0.0 );
+    ASSERT_TRUE( advanceDropFrameTick( 40.0, HUGE_VAL, 41, 41, true, false ).position == 40.0 );
+    // NaN stays NaN (the base's NaN handling), and a width-1 cut still advances (control)
+    ASSERT_TRUE( std::isnan( advanceDropFrameTick( std::nan( "" ), 1.0, 41, 41, true, false ).position ) );
+    ASSERT_NEAR( 40.5, advanceDropFrameTick( 40.0, 0.5, 41, 41, true, true ).appliedFrames + 40.0, 1e-12 );
     // a width-1 cut still laps (control: conformed 41..41 from its one position 40 plus one frame)
     const playback_frame_range::DropFrameTickResult one = advanceDropFrameTick( 40.0, 1.0, 41, 41, true, true );
     ASSERT_EQ( 1, one.wrapLaps );
