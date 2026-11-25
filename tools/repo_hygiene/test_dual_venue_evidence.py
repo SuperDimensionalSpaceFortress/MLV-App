@@ -19791,8 +19791,8 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
         mod = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
         calls = re.findall(r"Test-DvCriteria -Criteria \$criteria -Metrics ([^\r\n]+)", leg + "\n" + mod)
-        self.assertEqual(calls, ["(Get-DvCriteriaMetrics -Metrics $receipt.metrics -Playback $receipt.playback -Visual $receipt.visual)",
-                                 "(Get-DvCriteriaMetrics -Metrics $metrics -Playback $derived -Visual (Get-DvProp $Receipt 'visual'))"], calls)
+        self.assertEqual([c.split(" -Visual ")[0] for c in calls], ["(Get-DvCriteriaMetrics -Metrics $receipt.metrics -Playback $receipt.playback",
+                                                                  "(Get-DvCriteriaMetrics -Metrics $metrics -Playback $derived"], calls)   # + -Visual (Get-DvTailVisualEvidence ...): EveryFrameTailInFlightVsNeverPaintedTests
 
 
 class EveryFrameOldestFirstLegSpecTests(unittest.TestCase):
@@ -20225,7 +20225,7 @@ class EveryFrameConformConflictAndAcceptanceTests(unittest.TestCase):
         self.assertEqual((out["a"], out["b"], out["c"]), ("NOT_MEASURED", "NOT_MEASURED", "PASS"), out)
         text = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
         self.assertIn("foreach ($f in $script:PlaybackComparedFieldsWhenStored) {\n"
-                      "                if ($storedNames -ccontains $f -and -not (Test-DvJsonEquivalent (Get-DvProp $stored $f) (Get-DvProp $derived $f))) "
+                      "                if ($storedNames -contains $f -and -not (Test-DvJsonEquivalent (Get-DvProp $stored $f) (Get-DvProp $derived $f))) "
                       "{ $invalid.Add(\"PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive\") }", text)
 
     def test_the_leg_runner_prints_the_acceptance_verdict_from_the_acceptance_step(self) -> None:
