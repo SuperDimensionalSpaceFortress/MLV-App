@@ -1459,17 +1459,19 @@ static int runGuiPlaybackSmoke(QApplication &app)
 
     bool ok = false;
     const double seconds = parser.value(secondsOpt).toDouble(&ok);
+    // GUI-SMOKE-ARG-RANGE-OVERFLOW-1 (#881 pass 6 A7): durationMs below is an int; NaN, +-inf and any value whose
+    // milliseconds do not fit it are refused here instead of reaching qRound (2147483.648 gave 2147483648).
+    // r1 (adversary A1): first, so a decimal overflow (1e309: Qt gives ok=false and an infinity), -inf or
+    // -2147483.649 is refused by this typed reason, not as "must be greater than 0".
+    if (!playback_frame_range::smokeSecondsFitDurationMs(seconds))
+    {
+        err << "[GUI-SMOKE] ERROR: SECONDS_OUT_OF_RANGE (--seconds=" << parser.value(secondsOpt).trimmed()
+            << ": its milliseconds must be finite and round to an int, at most 2147483647).\n";
+        return 2;
+    }
     if (!ok || seconds <= 0.0)
     {
         err << "[GUI-SMOKE] ERROR: --seconds must be greater than 0.\n";
-        return 2;
-    }
-    // GUI-SMOKE-ARG-RANGE-OVERFLOW-1 (#881 pass 6 A7): durationMs below is an int; NaN, inf and any value whose
-    // milliseconds do not fit it are refused here instead of reaching qRound (2147483.648 gave 2147483648).
-    if (!playback_frame_range::smokeSecondsFitDurationMs(seconds))
-    {
-        err << "[GUI-SMOKE] ERROR: SECONDS_OUT_OF_RANGE (--seconds=" << parser.value(secondsOpt)
-            << " must be a finite number of at most 2147483.647; its milliseconds must fit an int).\n";
         return 2;
     }
     // PLAYBACK-CLIP-LENGTH-ENFORCE-2 round 2 (hub ruling): --seconds IS the play window (the measured Play is

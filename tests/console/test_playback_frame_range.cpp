@@ -5042,7 +5042,7 @@ TEST( PlaybackFrameRangeArgOverflow, MainRefusesSecondsOutOfRangeFirst )
     const QString source = QTextStream( &file ).readAll();
     const int parse = source.indexOf( QStringLiteral( "const double seconds = parser.value(secondsOpt).toDouble(&ok);" ) );
     const int range = source.indexOf( QStringLiteral( "if (!playback_frame_range::smokeSecondsFitDurationMs(seconds))" ) );
-    const int positive = source.indexOf( QStringLiteral( "if (!ok || seconds <= 0.0)" ) );
+    const int positive = source.indexOf( QStringLiteral( "ERROR: --seconds must be greater than 0." ) );
     const int convert = source.indexOf( QStringLiteral( "options.durationMs = qRound(seconds * 1000.0);" ) );
     ASSERT_TRUE( parse >= 0 && range >= 0 && positive >= 0 && convert >= 0 );
     ASSERT_TRUE( parse < range );
