@@ -229,6 +229,9 @@ $result = [ordered]@{
         [ordered]@{
             path = $proofReportJsonPath
             status = $proofReport.status
+            # r15 (adversary r14 pass 18 A6): speed authority is the report's claimAuthority.speed (exactly $true), never the support status; a report without it grants none
+            speedQuotable = (($proofReport.status -ceq "QUOTABLE_PASS") -and ($null -ne $proofReport.claimAuthority) -and ($proofReport.claimAuthority.speed -is [bool]) -and $proofReport.claimAuthority.speed)
+            claimAuthority = $proofReport.claimAuthority
             topLevelStatus = $proofReport.topLevelStatus
             blockers = @($proofReport.blockers)
             warnings = @($proofReport.warnings)
@@ -256,7 +259,7 @@ $result = [ordered]@{
     }
     boundaries = @(
         "Import validates packet structure and artifact hashes only.",
-        "Hardware support or speed remains quotable only when proofReport.status is QUOTABLE_PASS for the same host being claimed.",
+        "Hardware support remains quotable only when proofReport.status is QUOTABLE_PASS for the same host being claimed; playback speed only when proofReport.speedQuotable is also true.",
         "A NOT_QUOTABLE packet is an actionable diagnostic packet, not a success proof."
     )
     warnings = @($warnings)

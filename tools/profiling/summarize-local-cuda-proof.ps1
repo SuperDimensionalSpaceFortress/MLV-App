@@ -254,13 +254,32 @@ function Add-ActionStep {
     }
 }
 
+function Get-ProofSpeedClaimAuthority {
+    # r15 (adversary r14 pass 18 A6): QUOTABLE_PASS is the SUPPORT gate (a REFUSED playback-speed section keeps `passed`, so the overall status can pass); it never by itself grants SPEED
+    # authority. Speed is quotable only when the packet is QUOTABLE_PASS AND its playbackSpeed section reads exactly PASS: a REFUSED section (its presented-fps pair refused by the arm gate),
+    # a BLOCKED one or a missing one carries no authority to quote playback speed.
+    param([Parameter(Mandatory = $true)][string]$OverallStatus, [AllowNull()]$PlaybackSpeedVerdict)
+    $sectionStatus = if ($null -eq $PlaybackSpeedVerdict) { $null } else { $PlaybackSpeedVerdict.status }
+    $speed = ($OverallStatus -ceq "QUOTABLE_PASS") -and ($sectionStatus -is [string]) -and ($sectionStatus -ceq "PASS")
+    $reason = if ($speed) { "" } elseif ($OverallStatus -cne "QUOTABLE_PASS") { "packet-not-quotable" } else { "playback-speed-section-$(if ($sectionStatus -is [string] -and $sectionStatus) { $sectionStatus } else { 'missing' })" }
+    [pscustomobject]@{
+        support = ($OverallStatus -ceq "QUOTABLE_PASS")
+        speed = [bool]$speed
+        speedRefusal = $reason
+        playbackSpeedStatus = $sectionStatus
+    }
+}
+
 function New-ActionPlan {
     param(
         [Parameter(Mandatory = $true)][string]$Status,
         [object[]]$Diagnostics,
         [AllowNull()]$DiagnosticSummary,
-        [AllowNull()]$Summary
+        [AllowNull()]$Summary,
+        # r15 (adversary r14 pass 18 A6): Get-ProofSpeedClaimAuthority's verdict; absent means no speed authority
+        [AllowNull()]$ClaimAuthority
     )
+    $speedQuotable = ($null -ne $ClaimAuthority) -and ($ClaimAuthority.speed -is [bool]) -and $ClaimAuthority.speed
 
     $steps = [System.Collections.Generic.List[object]]::new()
     $clip = [string](Get-Field $Summary.inputs "clipPath")
@@ -275,14 +294,28 @@ function New-ActionPlan {
     $importCommand = "pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tools\profiling\import-local-cuda-proof-result.ps1 -RepoRoot . -PacketPath <mlvapp-local-cuda-proof.zip>"
 
     if ($Status -eq "QUOTABLE_PASS") {
-        Add-ActionStep -Steps $steps -Step (New-ActionStep `
-            -Id "QUOTE_WITH_BOUNDARIES" `
-            -Priority 10 `
-            -Area "claim-boundary" `
-            -Title "Review and quote only host-scoped support/speed claims." `
-            -Detail "The packet passed the fail-closed gate. Quote only the host, clip, receipt, codec set, max-frame count, release/backend hashes, and run order captured in this report." `
-            -Commands @($directSummaryCommand, $importCommand) `
-            -ProofBoundary "A QUOTABLE_PASS packet is still scoped evidence, not a universal GPU support claim.")
+        if ($speedQuotable) {
+            Add-ActionStep -Steps $steps -Step (New-ActionStep `
+                -Id "QUOTE_WITH_BOUNDARIES" `
+                -Priority 10 `
+                -Area "claim-boundary" `
+                -Title "Review and quote only host-scoped support/speed claims." `
+                -Detail "The packet passed the fail-closed gate. Quote only the host, clip, receipt, codec set, max-frame count, release/backend hashes, and run order captured in this report." `
+                -Commands @($directSummaryCommand, $importCommand) `
+                -ProofBoundary "A QUOTABLE_PASS packet is still scoped evidence, not a universal GPU support claim.")
+        }
+        else {
+            # r15 (adversary r14 pass 18 A6): the support gate passed but the playback-speed section did not read PASS (refused by the arm gate, or missing), so no speed claim is granted
+            Add-ActionStep -Steps $steps -Step (New-ActionStep `
+                -Id "QUOTE_SUPPORT_ONLY_SPEED_REFUSED" `
+                -Priority 10 `
+                -Area "claim-boundary" `
+                -ReasonCodes @("PLAYBACK_AB_FPS_ARM_REFUSED") `
+                -Title "Review and quote only host-scoped support claims; playback speed is not quotable from this packet." `
+                -Detail "The packet passed the fail-closed support gate, but its playbackSpeed section is $(if ($ClaimAuthority) { $ClaimAuthority.playbackSpeedStatus } else { 'not judged' }) (claimAuthority.speed=false). Quote only the support boundary (host, clip, receipt, codec set, max-frame count, release/backend hashes, run order); quote no playback speed, gain or cost." `
+                -Commands @($directSummaryCommand, $importCommand) `
+                -ProofBoundary "A refused presented-FPS pair carries no authority to quote playback speed; rerun the playback A/B with both legs on the LIGHT arm.")
+        }
         if (Test-DiagnosticCode -Diagnostics $Diagnostics -Codes @("PLAYBACK_PRESENTED_FPS_NOT_IMPROVED")) {
             Add-ActionStep -Steps $steps -Step (New-ActionStep `
                 -Id "QUOTE_PLAYBACK_SUPPORT_NOT_SPEEDUP" `
@@ -459,7 +492,7 @@ function New-ActionPlan {
         steps = $orderedSteps
         proofBoundary = @(
             "Action plans are triage guidance, not proof.",
-            "Only QUOTABLE_PASS from the same host unlocks support or speed claims.",
+            "Only QUOTABLE_PASS from the same host unlocks support claims; speed claims also need claimAuthority.speed=true (playbackSpeed.status=PASS).",
             "If multiple steps are listed, address them in priority order and rerun the packet."
         )
     }
@@ -761,7 +794,9 @@ if ($playbackAb -and $playbackAbSpeedCompare) {
         (Format-MetricDeltaLine -Label "render total" -Metric $playbackAbSpeedCompare.avgRenderTotalMs -Unit " ms" -LowerIsBetter)
     )
     # BENCH-LIGHT-ARM-GAIN-GATES-1 (adversary A9): the packet's cached suggestion is fps-delta-derived, so it is not repeated for a pair the arm gate refused.
-    if ($playbackAb.analysis -and $playbackAb.analysis.suggestedOptimization -and -not $playbackAbFpsArmRefusal.refused) {
+    # r15 (adversary r14 pass 18 A7, sol r13 B3): and only when the cached analysis is the judged pair's own (its basis and presented-fps deltaPercent match the published compare)
+    if ($playbackAb.analysis -and $playbackAb.analysis.suggestedOptimization -and -not $playbackAbFpsArmRefusal.refused -and
+        (Test-FpsCachedAnalysisBound -Analysis $playbackAb.analysis -Compare $playbackAbSpeedCompare -ComparisonBasis $playbackAbComparisonBasis)) {
         $playbackSpeedEvidence += "suggested_optimization=$($playbackAb.analysis.suggestedOptimization)"
     }
 }
@@ -1059,17 +1094,21 @@ foreach ($section in @($playbackVerdict, $playbackAbVerdict, $cdngVerdict)) {
 $overallStatus = if ($overallBlockers.Count -eq 0) { "QUOTABLE_PASS" } else { "NOT_QUOTABLE" }
 $diagnosticList = @($diagnostics)
 $diagnosticSummary = Get-DiagnosticSummary -Diagnostics $diagnosticList
+$claimAuthority = Get-ProofSpeedClaimAuthority -OverallStatus $overallStatus -PlaybackSpeedVerdict $playbackAbVerdict
 $actionPlan = New-ActionPlan `
     -Status $overallStatus `
     -Diagnostics $diagnosticList `
     -DiagnosticSummary $diagnosticSummary `
-    -Summary $summary
+    -Summary $summary `
+    -ClaimAuthority $claimAuthority
 
 $report = [pscustomobject]@{
     schema = "mlvapp-local-cuda-proof-report.v1"
     createdAtUtc = (Get-Date).ToUniversalTime().ToString("o")
     sourceSummary = $summaryFullPath
     status = $overallStatus
+    # r15 (adversary r14 pass 18 A6): the machine-readable claim gate; `status` stays the support gate
+    claimAuthority = $claimAuthority
     topLevelStatus = $topStatus
     dryRun = $dryRun
     host = [pscustomobject]@{
@@ -1090,7 +1129,8 @@ $report = [pscustomobject]@{
     diagnosticSummary = $diagnosticSummary
     actionPlan = $actionPlan
     proofBoundary = @(
-        "Quote support or speed only when status is QUOTABLE_PASS and this summary was produced on the same host being claimed.",
+        "Quote support only when status is QUOTABLE_PASS and this summary was produced on the same host being claimed.",
+        "Quote playback speed only when, in addition, claimAuthority.speed is true (playbackSpeed.status=PASS); a REFUSED playback-speed section carries no speed authority.",
         "Playback proof requires correctnessValidated=true, GPU Tex NR/no-readback frames, zero fallback frames, active GL parity probes, and zero GL mismatches.",
         "DNG proof requires CDNG PASS, DNG hash PASS, candidate GPU attempted/replaced frames for the full measured set, and trusted GPU frames when trusted export was requested.",
         "Speed deltas are scoped to this host, clip, receipt, codec set, max-frame count, release/backend hashes, and run order."
@@ -1101,6 +1141,7 @@ $lines = [System.Collections.Generic.List[string]]::new()
 [void]$lines.Add("# MLVApp Local CUDA Proof Report")
 [void]$lines.Add("")
 [void]$lines.Add("- Status: $($report.status)")
+[void]$lines.Add("- Speed claim authority: $(if ($claimAuthority.speed) { 'granted' } else { "none ($($claimAuthority.speedRefusal))" })")
 [void]$lines.Add("- Source summary: $summaryFullPath")
 [void]$lines.Add("- Host: $($report.host.name)")
 [void]$lines.Add("- NVIDIA: $(if ($nvidiaRows.Count -gt 0) { $nvidiaRows -join '; ' } else { 'not reported' })")

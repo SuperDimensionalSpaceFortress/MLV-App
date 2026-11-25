@@ -133,6 +133,46 @@ class ArmClassifierTests(_Probe):
         body = "".join(f"Write-Host ('ARM=' + ({e}).arm)\n" for e in exprs)
         return self.ok(body).split()
 
+    def test_r15_a1_a_singleton_array_root_or_envelope_is_refused_by_the_raw_check(self) -> None:
+        # r15 (adversary r14 pass 18 A1): ConvertFrom-Json unwraps a one-element array root, and member enumeration projects `.proof.playbackAb` / `.launch` through an array, so a wrapped
+        # valid LIGHT record reached the gate as the record inside it. The raw check every judged reader calls first refuses a non-object root and an array under an object envelope;
+        # ordinary lists (arguments, legs, failures) stay allowed.
+        light = '{"smokePresentedFps":55,"launch":{"environment":' + LIGHT_ENV_JSON + ',"arguments":' + PRODUCER_ARGS_JSON + '}}'
+        cases = {
+            "ROOT": "[" + light + "]",
+            "PROOF": '{"proof":[{"playbackAb":{"compare":{"presentedFps":{"delta":5}}}}]}',
+            "PLAYBACKAB": '{"proof":{"playbackAb":[{"compare":{"presentedFps":{"delta":5}}}]}}',
+            "LAUNCH": '{"launch":[{"environment":' + LIGHT_ENV_JSON + ',"arguments":' + PRODUCER_ARGS_JSON + '}]}',
+            "COMPARE": '{"speedCompare":[{"presentedFps":{"delta":5}}]}',
+            "CASE": '{"PlaybackAB":[{}]}',
+            "SCALARROOT": '"x"',
+            "OK": light,
+            "OKLIST": '{"legs":[{"spec":"a"}],"failures":[],"proof":{"playbackAb":{"proofFailures":["x"]}}}',
+        }
+        body = "".join(f"$p = Get-FpsJsonRepeatedKeyProblem '{text}'\nWrite-Host ('{label}=' + $(if ($null -eq $p) {{ 'NONE' }} else {{ 'PROBLEM' }}))\n" for label, text in cases.items())
+        body += f"try {{ Assert-FpsJsonNoRepeatedKey '[{light}]' 'x.json'; Write-Host 'ASSERT=NONE' }} catch {{ Write-Host ('ASSERT=' + $_.Exception.Message.Split(':')[0]) }}\n"
+        out = self.ok(body).split()
+        expected = [f"{label}={'NONE' if label.startswith('OK') else 'PROBLEM'}" for label in cases] + ["ASSERT=FPS_JSON_REPEATED_KEY"]
+        self.assertEqual(out, expected)
+
+    def test_r15_a1_the_readers_refuse_a_wrapped_record_before_the_parser_unwraps_it(self) -> None:
+        # r15 (adversary r14 pass 18 A1 and siblings): compare-release-gui-smoke-ab.ps1 Read-SmokeJson and compare-machine-perf.ps1 Read-JsonRecords (whole document and JSONL line) refuse
+        # a singleton-array root; the same record unwrapped is read.
+        light = '{"schema":"x","launch":{"environment":' + LIGHT_ENV_JSON + ',"arguments":' + PRODUCER_ARGS_JSON + '}}'
+        wrapped = self.tmp / "wrapped.json"
+        wrapped.write_text("[" + light + "]", encoding="utf-8")
+        jsonl = self.tmp / "wrapped.jsonl"
+        jsonl.write_text(light + "\n[" + light + "]\n", encoding="utf-8")
+        plain = self.tmp / "plain.json"
+        plain.write_text(light, encoding="utf-8")
+        funcs = _extract_functions(COMPARE_SMOKE_AB_SCRIPT, ["Read-SmokeJson"]) + "\n" + _extract_functions(COMPARE_MACHINE_PERF_SCRIPT, ["Read-JsonRecords"]) + "\n"
+        body = funcs
+        for label, call in (("SMOKE_WRAPPED", f"Read-SmokeJson '{wrapped}'"), ("PERF_WRAPPED", f"Read-JsonRecords '{wrapped}'"), ("PERF_JSONL", f"Read-JsonRecords '{jsonl}'"),
+                            ("SMOKE_PLAIN", f"Read-SmokeJson '{plain}'"), ("PERF_PLAIN", f"Read-JsonRecords '{plain}'")):
+            body += f"try {{ $null = @({call}); Write-Host '{label}=READ' }} catch {{ Write-Host '{label}=REFUSED' }}\n"
+        out = self.ok(body).split()
+        self.assertEqual(out, ["SMOKE_WRAPPED=REFUSED", "PERF_WRAPPED=REFUSED", "PERF_JSONL=REFUSED", "SMOKE_PLAIN=READ", "PERF_PLAIN=READ"])
+
     def test_a_launch_whose_arguments_are_not_a_list_is_unknown(self) -> None:
         # BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary pass 5 A2): `@($launchArgs)` turned the JSON string "--playback-smoke" (or " ") into a one-element list, so a launch with a scalar argument
         # value was LIGHT. The recorded argument list must BE a list (an empty one is a launch that passed nothing); anything else is UNKNOWN, and a list holding --stage-log is still HEAVY.
@@ -897,7 +937,9 @@ class CompareMachinePerfFpsGateTests(_Probe):
         return ("[pscustomobject]@{ schema = 'mlvapp-cuda-playback-ab.v1'; status = 'success'; " + verdict +
                 "machineFingerprint = [pscustomobject]@{ schema = 'machine-fingerprint.v1'; hostname = 'H'; cpu = 'x'; gpu = 'y'; os = 'z'; build_sha = 'abc1234' }; "
                 f"baseline = {leg(baseline_arm)}; candidate = {leg(candidate_arm)}; candidateSpeed = $null; "
-                "analysis = [pscustomobject]@{ dominantBottleneck = 'recon-bound'; suggestedOptimization = 'optimize_cuda_recon_kernel_or_state_setup' }; "
+                # r15 (adversary r14 pass 18 A7): the cached analysis is trusted only when bound to the judged pair (its basis and presented-fps deltaPercent), as the producer writes it
+                "analysis = [pscustomobject]@{ comparisonBasis = 'candidate'; dominantBottleneck = 'recon-bound'; suggestedOptimization = 'optimize_cuda_recon_kernel_or_state_setup'; "
+                "evidence = [pscustomobject]@{ presentedFpsDeltaPercent = 100.0 } }; "
                 "compare = [pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 10.0; candidate = 20.0; deltaPercent = 100.0 } } }")
 
     def row(self, record: str) -> dict:
@@ -1001,6 +1043,33 @@ class CompareMachinePerfFpsGateTests(_Probe):
                 self.assertIsNone(r["playback_fps_delta_pct"])
                 self.assertEqual(r["playback_fps_arm_verdict"], UNKNOWN_REASON)
 
+    @staticmethod
+    def a7_record(analysis_basis: str, analysis_delta: str, legacy: bool = False) -> str:
+        # adversary r14 pass 18 A7: quiet baseline LIGHT at 50, candidate HEAVY at 40, candidateSpeed LIGHT at 55; compare deltaPercent -20 (the HEAVY pair), speedCompare deltaPercent 10
+        light = f"[pscustomobject]@{{ telemetryArm = 'LIGHT'; {LIGHT_EVIDENCE}hostLoadProvisional = $false; hostLoadState = 'quiet' }}"
+        heavy = "[pscustomobject]@{ telemetryArm = 'HEAVY'; hostLoadProvisional = $false; hostLoadState = 'quiet' }"
+        fingerprint = "machineFingerprint = [pscustomobject]@{ schema = 'machine-fingerprint.v1'; hostname = 'H'; cpu = 'x'; gpu = 'y'; os = 'z'; build_sha = 'abc1234' }; "
+        analysis = ("[pscustomobject]@{ dominantBottleneck = 'render-work'; suggestedOptimization = 'optimize_playback_cuda_candidate' }" if legacy else
+                    f"[pscustomobject]@{{ comparisonBasis = '{analysis_basis}'; dominantBottleneck = 'render-work'; suggestedOptimization = 'optimize_playback_cuda_candidate'; "
+                    f"evidence = [pscustomobject]@{{ presentedFpsDeltaPercent = {analysis_delta} }} }}")
+        return (f"[pscustomobject]@{{ schema = 'mlvapp-cuda-playback-ab.v1'; status = 'success'; {fingerprint}baseline = {light}; candidate = {heavy}; candidateSpeed = {light}; "
+                "compare = [pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 50.0; candidate = 40.0; delta = -10.0; deltaPercent = -20.0 } }; "
+                "speedCompare = [pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 50.0; candidate = 55.0; delta = 5.0; deltaPercent = 10.0 } }; "
+                f"analysis = {analysis} }}")
+
+    def test_r15_a7_a_cached_diagnosis_of_the_other_pair_is_not_published(self) -> None:
+        # r15 (adversary r14 pass 18 A7, sol r13 B3): the reader gated the LIGHT speed pair, then published the cached diagnosis of the HEAVY candidate pair. It is re-derived from the gated
+        # pair now; a legacy analysis with no basis / evidence, or one whose delta differs, is not bound either. A bound analysis (the speed pair's own) is still used.
+        for label, record in (("other-basis", self.a7_record("candidate", "-20.0")), ("legacy", self.a7_record("", "", legacy=True)),
+                              ("delta-mismatch", self.a7_record("candidateSpeed", "-20.0"))):
+            with self.subTest(label):
+                r = self.row(record)
+                self.assertEqual(r["playback_fps_arm_verdict"], "allowed")
+                self.assertNotEqual(r["dominant_bottleneck"], "render-work")
+                self.assertNotEqual(r["suggested_optimization"], "optimize_playback_cuda_candidate")
+        bound = self.row(self.a7_record("candidateSpeed", "10.0"))
+        self.assertEqual((bound["dominant_bottleneck"], bound["suggested_optimization"]), ("render-work", "optimize_playback_cuda_candidate"))
+
 
 @requires_pwsh
 class CompareMachinePerfSuggestionFpsGateTests(_Probe):
@@ -1023,6 +1092,17 @@ class CompareMachinePerfSuggestionFpsGateTests(_Probe):
 
     def test_a_light_record_keeps_the_fps_delta_suggestion(self) -> None:
         self.assertEqual(self.suggestion("LIGHT"), "S=optimize_playback_cuda_candidate")
+
+    def test_r15_a7_the_cached_suggestion_of_the_other_pair_is_not_repeated(self) -> None:
+        # r15 (adversary r14 pass 18 A7 sibling compare-machine-perf.ps1:382): the speed pair (LIGHT/LIGHT, +10%) is gated, the cached suggestion belongs to the HEAVY candidate pair (-20%)
+        record = CompareMachinePerfFpsGateTests.a7_record
+        def suggestion(playback_ab: str) -> str:
+            return self.ok("$rec = [pscustomobject]@{ proof = [pscustomobject]@{ playback = [pscustomobject]@{ totalFallbackFrames = 0; totalGpuTextureNoReadbackFrames = 5 }; "
+                           f"playbackAb = {playback_ab}; cdng = $null }} }}\nWrite-Host ('S=' + (Get-ProofSummarySuggestion -Record $rec))").strip()
+        for label, playback_ab in (("other-basis", record("candidate", "-20.0")), ("legacy", record("", "", legacy=True))):
+            with self.subTest(label):
+                self.assertEqual(suggestion(playback_ab), "S=run_dng_hash_export_proof", "the gated pair's own delta (+5 fps) suggests nothing; the next proof step follows")
+        self.assertEqual(suggestion(record("candidateSpeed", "10.0")), "S=optimize_playback_cuda_candidate", "a bound cached suggestion is still repeated")
 
 
 @requires_pwsh
@@ -1161,17 +1241,69 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
 
     def test_a_refused_pair_repeats_no_cached_fps_derived_suggestion(self) -> None:
         # adversary A9 (pre-existing append, same class): the packet's analysis.suggestedOptimization is derived from the fps delta
-        analysis = "[pscustomobject]@{ suggestedOptimization = 'optimize_playback_cuda_candidate' }"
+        # r15 (adversary r14 pass 18 A7): the fixture's analysis is bound to the judged pair (basis 'candidate', deltaPercent -2), as the producer writes it
+        analysis = "[pscustomobject]@{ comparisonBasis = 'candidate'; suggestedOptimization = 'optimize_playback_cuda_candidate'; evidence = [pscustomobject]@{ presentedFpsDeltaPercent = -2 } }"
         refused = "\n".join(self.run_summarizer_block("HEAVY", "HEAVY", analysis))
         self.assertNotIn("suggested_optimization=", refused)
         allowed = "\n".join(self.run_summarizer_block("LIGHT", "LIGHT", analysis))
         self.assertIn("suggested_optimization=optimize_playback_cuda_candidate", allowed)
+
+    def test_r15_a7_an_allowed_pair_repeats_no_cached_suggestion_of_another_pair(self) -> None:
+        # r15 (adversary r14 pass 18 A7 sibling summarize-local-cuda-proof.ps1:764): an allowed pair repeated whatever suggestion the packet cached, whichever pair it came from
+        for label, analysis in (
+                ("other-basis", "[pscustomobject]@{ comparisonBasis = 'candidateSpeed'; suggestedOptimization = 'optimize_playback_cuda_candidate'; evidence = [pscustomobject]@{ presentedFpsDeltaPercent = -2 } }"),
+                ("delta-mismatch", "[pscustomobject]@{ comparisonBasis = 'candidate'; suggestedOptimization = 'optimize_playback_cuda_candidate'; evidence = [pscustomobject]@{ presentedFpsDeltaPercent = -20 } }"),
+                ("legacy", "[pscustomobject]@{ suggestedOptimization = 'optimize_playback_cuda_candidate' }"),
+                ("string-delta", "[pscustomobject]@{ comparisonBasis = 'candidate'; suggestedOptimization = 'optimize_playback_cuda_candidate'; evidence = [pscustomobject]@{ presentedFpsDeltaPercent = '-2' } }")):
+            with self.subTest(label):
+                text = "\n".join(self.run_summarizer_block("LIGHT", "LIGHT", analysis))
+                self.assertIn("presented FPS: CPU", text, "control: the pair is allowed")
+                self.assertNotIn("suggested_optimization=", text)
 
     def test_light_ab_keeps_the_verdict_and_delta_lines(self) -> None:
         text = "\n".join(self.run_summarizer_block("LIGHT", "LIGHT"))
         self.assertIn("DIAG=PLAYBACK_PRESENTED_FPS_NOT_IMPROVED", text)
         self.assertNotIn("PLAYBACK_AB_FPS_ARM_REFUSED", text)
         self.assertIn("presented FPS: CPU", text)
+
+    def test_r15_a6_a_refused_playback_speed_section_grants_no_speed_authority(self) -> None:
+        # r15 (adversary r14 pass 18 A6): an otherwise passing packet whose presented-fps pair the arm gate refused (playbackSpeed.status=REFUSED, `passed` true) read QUOTABLE_PASS and its action
+        # plan granted "support/speed" quoting (QUOTE_WITH_BOUNDARIES). Speed authority is a separate gate now: claimAuthority.speed is true only for QUOTABLE_PASS with a PASS playbackSpeed.
+        tmp = Path(tempfile.mkdtemp(prefix="fps-arm-auth-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        funcs = _extract_functions(SUMMARIZER_SCRIPT, ["Get-Field", "New-SectionVerdict", "Test-DiagnosticCode", "New-ActionStep", "Add-ActionStep", "Get-ProofSpeedClaimAuthority", "New-ActionPlan"])
+        probe = tmp / "run.ps1"
+        body = "$ErrorActionPreference = 'Stop'\n" + funcs + "\n$summary = [pscustomobject]@{ inputs = [pscustomobject]@{ clipPath = 'C:\\clip.mlv' } }\n"
+        for label, overall, section in (("REFUSED", "QUOTABLE_PASS", "REFUSED"), ("MISSING", "QUOTABLE_PASS", None), ("PASS", "QUOTABLE_PASS", "PASS"), ("NOTQ", "NOT_QUOTABLE", "PASS")):
+            verdict = "$null" if section is None else f"(New-SectionVerdict -Status '{section}' -Passed $true -Evidence @() -Blockers @())"
+            body += (f"$a = Get-ProofSpeedClaimAuthority -OverallStatus '{overall}' -PlaybackSpeedVerdict {verdict}\n"
+                     f"$plan = New-ActionPlan -Status '{overall}' -Diagnostics @() -DiagnosticSummary $null -Summary $summary -ClaimAuthority $a\n"
+                     f"Write-Host ('{label}=' + $a.speed + '|' + (@($plan.steps | ForEach-Object {{ $_.id }}) -join ','))\n")
+        probe.write_text(body, encoding="utf-8")
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(probe)], capture_output=True, text=True, creationflags=_NO_WINDOW)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rows = dict(line.split("=", 1) for line in proc.stdout.split() if "=" in line)
+        self.assertEqual(rows["REFUSED"].split("|")[0], "False")
+        self.assertNotIn("QUOTE_WITH_BOUNDARIES", rows["REFUSED"])
+        self.assertIn("QUOTE_SUPPORT_ONLY_SPEED_REFUSED", rows["REFUSED"])
+        self.assertEqual(rows["MISSING"].split("|")[0], "False")
+        self.assertNotIn("QUOTE_WITH_BOUNDARIES", rows["MISSING"])
+        self.assertEqual(rows["PASS"].split("|")[0], "True")
+        self.assertIn("QUOTE_WITH_BOUNDARIES", rows["PASS"])
+        self.assertEqual(rows["NOTQ"].split("|")[0], "False")
+
+    def test_r15_a6_the_report_package_and_import_carry_the_speed_gate(self) -> None:
+        # r15 (adversary r14 pass 18 A6 siblings): the report publishes claimAuthority, and package / import surface speedQuotable from it (never from the support status alone)
+        source = SUMMARIZER_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("claimAuthority = $claimAuthority", source)
+        self.assertIn("-ClaimAuthority $claimAuthority", source)
+        self.assertNotIn("Only QUOTABLE_PASS from the same host unlocks support or speed claims.", source)
+        for name in ("package-local-cuda-proof-result.ps1", "import-local-cuda-proof-result.ps1"):
+            text = (PROFILING / name).read_text(encoding="utf-8")
+            with self.subTest(name):
+                self.assertIn('speedQuotable = (($proofReport.status -ceq "QUOTABLE_PASS") -and ($null -ne $proofReport.claimAuthority) -and ($proofReport.claimAuthority.speed -is [bool]) -and $proofReport.claimAuthority.speed)', text)
+                self.assertNotIn("support or speed only from proofReport.status=QUOTABLE_PASS", text)
+                self.assertNotIn("support or speed remains quotable only when proofReport.status is QUOTABLE_PASS", text)
 
     def test_the_dng_smoke_packager_passes_the_fps_verdict_through(self) -> None:
         source = DNG_SMOKE_SCRIPT.read_text(encoding="utf-8")

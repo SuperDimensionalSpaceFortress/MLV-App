@@ -238,6 +238,9 @@ $manifest = [ordered]@{
         markdown = Get-FileArtifact -Path $ReportPath
         json = Get-FileArtifact -Path $jsonReportPath
         status = $proofReport.status
+        # r15 (adversary r14 pass 18 A6): speed authority is the report's claimAuthority.speed (exactly $true), never the support status; a report without it grants none
+        speedQuotable = (($proofReport.status -ceq "QUOTABLE_PASS") -and ($null -ne $proofReport.claimAuthority) -and ($proofReport.claimAuthority.speed -is [bool]) -and $proofReport.claimAuthority.speed)
+        claimAuthority = $proofReport.claimAuthority
         topLevelStatus = $proofReport.topLevelStatus
         markdownExitCode = $summarizerResult.markdownExitCode
         jsonExitCode = $summarizerResult.jsonExitCode
@@ -296,7 +299,7 @@ $manifest = [ordered]@{
         provesDngHashParity = $false
         notes = @(
             "This packet preserves the host-local CUDA proof outputs and their hashes.",
-            "Quote hardware support or speed only from proofReport.status=QUOTABLE_PASS for the same host being claimed.",
+            "Quote hardware support only from proofReport.status=QUOTABLE_PASS for the same host being claimed; quote playback speed only when proofReport.speedQuotable is also true (a REFUSED playback-speed section carries no speed authority).",
             "A NOT_QUOTABLE packet is still useful for diagnosing fallback, missing NVIDIA/GL proof, DNG hash failures, or dry-run planning."
         )
     }

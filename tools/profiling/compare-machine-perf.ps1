@@ -379,7 +379,10 @@ function Get-ProofSummarySuggestion {
     if ((Get-PlaybackAbFpsArmRefusal -Record $playbackAb).refused) {
         return "rerun_playback_ab_with_light_arm"
     }
-    if ($playbackAb.analysis -and $playbackAb.analysis.suggestedOptimization) {
+    # r15 (adversary r14 pass 18 A7, sol r13 B3): the cached suggestion is repeated only when it is the gated pair's own (Test-FpsCachedAnalysisBound); one cached from the other pair (the HEAVY
+    # candidate beside a LIGHT candidateSpeed), or with no basis / evidence, falls through to the gated compare's own delta below.
+    if ($playbackAb.speedCompare) { $playbackAbBasis = "candidateSpeed" } else { $playbackAbBasis = "candidate" }
+    if ((Test-FpsCachedAnalysisBound -Analysis $playbackAb.analysis -Compare $playbackAbCompare -ComparisonBasis $playbackAbBasis) -and $playbackAb.analysis.suggestedOptimization) {
         return [string]$playbackAb.analysis.suggestedOptimization
     }
     $fpsDelta = Convert-ToNullableDouble $playbackAbCompare.presentedFps.delta
@@ -542,7 +545,10 @@ function Get-PlaybackAbAnalysis {
         }
     }
 
-    if ($Record.analysis -and
+    # r15 (adversary r14 pass 18 A7, sol r13 B3): the cached diagnosis is trusted only when it is bound to the pair this reader gated (same basis, same presented-fps deltaPercent); otherwise it
+    # is re-derived below from that pair's own compare.
+    if ($Record.speedCompare) { $cachedBasis = "candidateSpeed"; $cachedCompare = $Record.speedCompare } else { $cachedBasis = "candidate"; $cachedCompare = $Record.compare }
+    if ((Test-FpsCachedAnalysisBound -Analysis $Record.analysis -Compare $cachedCompare -ComparisonBasis $cachedBasis) -and
         $Record.analysis.dominantBottleneck -and
         [string]$Record.analysis.dominantBottleneck -ne "cadence-bound") {
         return [pscustomobject]@{

@@ -499,6 +499,36 @@ function Get-FpsArmFromSmokeRecord {
     $arm
 }
 
+# r15 (adversary r14 pass 18 A1): the keys every judged reader walks by member access (`$x.proof.playbackAb.compare.presentedFps.delta`, `$smoke.launch.environment`, `$r.fps.smokePresentedFps`).
+# Each is a JSON object in every producer (run-release-gui-smoke.ps1, run-release-cuda-playback-ab.ps1, run-local-cuda-playback-dng-smoke.ps1, compare-release-gui-smoke-ab.ps1); an array under one of
+# these names is refused by Get-FpsJsonRepeatedKeyProblem. Names compared ignoring case, as PowerShell member access does.
+$script:FpsJsonObjectEnvelopes = [System.Collections.Generic.HashSet[string]]::new([string[]]@(
+        'proof', 'playback', 'playbackAb', 'cdng', 'compare', 'speedCompare', 'analysis', 'fpsVerdict',
+        'baseline', 'candidate', 'candidateSpeed', 'launch', 'environment', 'observerControls', 'generatorArgs',
+        'presentedFps', 'guiStatusFps', 'fps', 'smokePresentedFps', 'visibleBottomLeftGuiFps', 'smokeTimelineFps', 'autoDecision',
+        'machineFingerprint', 'inputs', 'host'), [StringComparer]::OrdinalIgnoreCase)
+# ('evidence', 'before' and 'after' are left out on purpose: section verdicts and diagnostics carry `evidence` as a list of lines, and the readers reach analysis.evidence through Get-FaProp,
+# which keeps an array whole, so an array there reads as no evidence and Test-FpsCachedAnalysisBound returns $false.)
+
+function Test-FpsCachedAnalysisBound {
+    <#
+    .SYNOPSIS
+    r15 (adversary r14 pass 18 A7, sol r13 B3): a cached playback A/B `analysis` (its dominantBottleneck / suggestedOptimization) is derived from ONE compared pair's presented-fps delta. A reader
+    that gated pair P may publish that cached diagnosis only when the analysis is provably P's own: its comparisonBasis names P's candidate leg (ordinal) AND its evidence.presentedFpsDeltaPercent
+    is the same number as P's compare.presentedFps.deltaPercent. A record whose analysis names another basis (the HEAVY candidate pair beside a LIGHT candidateSpeed pair), carries no basis or no
+    evidence (a record written before the binding), or a different delta is NOT bound: the reader re-derives from the gated compare or withholds, never repeats the cached text.
+    #>
+    param([AllowNull()]$Analysis, [AllowNull()]$Compare, [string]$ComparisonBasis)
+    if ($null -eq $Analysis -or $null -eq $Compare -or [string]::IsNullOrEmpty($ComparisonBasis)) { return $false }
+    $basis = Get-FaProp $Analysis 'comparisonBasis'
+    if ($basis -isnot [string] -or $basis -cne $ComparisonBasis) { return $false }
+    $cached = Get-FaProp (Get-FaProp $Analysis 'evidence') 'presentedFpsDeltaPercent'
+    $judged = Get-FaProp (Get-FaProp $Compare 'presentedFps') 'deltaPercent'
+    $isNumber = { param($v) $null -ne $v -and ($v -is [double] -or $v -is [single] -or $v -is [decimal] -or $v -is [int] -or $v -is [long] -or $v -is [int16] -or $v -is [byte]) }
+    if (-not (& $isNumber $cached) -or -not (& $isNumber $judged)) { return $false }
+    ([math]::Abs(([double]$cached) - ([double]$judged)) -lt 0.000001)
+}
+
 function Get-FpsJsonRepeatedKeyProblem {
     <#
     .SYNOPSIS
@@ -516,6 +546,11 @@ function Get-FpsJsonRepeatedKeyProblem {
     $doc = $null
     try { $doc = [System.Text.Json.JsonDocument]::Parse($Text, $options) } catch { return "the JSON cannot be read strictly enough to rule out a repeated key ($($_.Exception.Message))" }
     try {
+        # r15 (adversary r14 pass 18 A1): ConvertFrom-Json unwraps a one-element array root, and PowerShell member enumeration projects `.launch`, `.proof`, `.playbackAb`, `.compare` ...
+        # straight through an array, so [ { ...valid LIGHT record... } ] (or "proof": [ { ... } ]) reached the gate as the record inside it. Every judged record, smoke result, summary
+        # and plan is a JSON OBJECT, and every envelope the readers walk by member access is an object by contract: a root that is not an object, or an envelope key holding an
+        # array, is a shape problem here (this is the one raw check every judged reader already calls before it parses), never a record the parser silently unwraps.
+        if ($doc.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return "`$ is a JSON $($doc.RootElement.ValueKind), not an object (a judged record is one JSON object; an array root is unwrapped by the parser)" }
         $pending = [System.Collections.Generic.Stack[object]]::new()
         $pending.Push(@('$', $doc.RootElement))
         while ($pending.Count -gt 0) {
@@ -526,6 +561,9 @@ function Get-FpsJsonRepeatedKeyProblem {
                 $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
                 foreach ($property in $element.EnumerateObject()) {
                     if (-not $seen.Add($property.Name)) { return "$path repeats the key '$($property.Name)'" }
+                    if ($property.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::Array -and $script:FpsJsonObjectEnvelopes.Contains($property.Name)) {
+                        return "$path.$($property.Name) is an array, but '$($property.Name)' is an object envelope the readers walk by member access (member enumeration would project through it)"
+                    }
                     $kind = $property.Value.ValueKind
                     if ($kind -eq [System.Text.Json.JsonValueKind]::Object -or $kind -eq [System.Text.Json.JsonValueKind]::Array) { $pending.Push(@("$path.$($property.Name)", $property.Value)) }
                 }
@@ -634,4 +672,4 @@ function Get-FpsLegPlanRefusal {
     @('', 0, '')
 }
 
-Export-ModuleMember -Function Get-FpsObserverControls, Get-FpsLightShape, Get-FpsArmFromLegRecord, Get-FaProp, New-FpsArm, ConvertTo-FpsArmName, Get-FpsArmFromLegSpec, Get-FpsArmFromJobResult, Get-FpsArm, ConvertTo-FpsEnvMap, Get-FpsArmFromEnvironment, Get-FpsArmFromLaunch, Get-FpsArmFromSmokeRecord, Get-FpsJsonRepeatedKeyProblem, Assert-FpsJsonNoRepeatedKey, Get-FpsPairVerdict, Get-FpsArmsVerdict, Get-FpsLegPlanRefusal
+Export-ModuleMember -Function Get-FpsObserverControls, Get-FpsLightShape, Get-FpsArmFromLegRecord, Get-FaProp, New-FpsArm, ConvertTo-FpsArmName, Get-FpsArmFromLegSpec, Get-FpsArmFromJobResult, Get-FpsArm, ConvertTo-FpsEnvMap, Get-FpsArmFromEnvironment, Get-FpsArmFromLaunch, Get-FpsArmFromSmokeRecord, Get-FpsJsonRepeatedKeyProblem, Assert-FpsJsonNoRepeatedKey, Test-FpsCachedAnalysisBound, Get-FpsPairVerdict, Get-FpsArmsVerdict, Get-FpsLegPlanRefusal

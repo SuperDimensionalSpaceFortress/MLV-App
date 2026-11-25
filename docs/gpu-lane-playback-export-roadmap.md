@@ -373,7 +373,10 @@ reports, child playback/A-B/CDNG artifacts, hashes, host metadata, and the same
 quote boundaries. `RUN-CUDA-DOGFOOD.ps1` creates this packet by default after a
 proof run (`-NoProofPacket` opts out). The packet is transport/integrity
 evidence only: `proofReport.status=QUOTABLE_PASS` is still the required reader
-gate before claiming Dell/UltraMagnus support or speed.
+gate before claiming Dell/UltraMagnus support, and a playback speed claim also
+needs `proofReport.speedQuotable=true` (the report's `claimAuthority.speed`,
+true only when its `playbackSpeed` section reads `PASS`; a section the
+LIGHT-arm gate `REFUSED` carries no speed authority).
 `tools/profiling/import-local-cuda-proof-result.ps1` is the return path for
 those packets: it expands a copied `mlvapp-local-cuda-proof-*.zip`, validates
 the manifest schema, checks every listed artifact hash, optionally enforces host
@@ -388,7 +391,7 @@ A/B metrics, DNG hash/export failures, and E3-relevant compression/writer
 bottlenecks. Packet manifests and import summaries carry those diagnostics
 forward so a returned `NOT_QUOTABLE` packet immediately points at the next
 implementation slice. These diagnostics are triage metadata only; they do not
-weaken the `QUOTABLE_PASS` support/speed gate.
+weaken the `QUOTABLE_PASS` support gate or the `claimAuthority.speed` speed gate.
 The follow-up action-plan slice derives ordered `actionPlan.steps` from those
 diagnostic codes and carries the plan through proof reports, packet manifests,
 and imports. A dry-run packet now points first at a real Dell/UltraMagnus proof
