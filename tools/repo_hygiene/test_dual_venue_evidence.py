@@ -19791,8 +19791,8 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
         mod = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
         calls = re.findall(r"Test-DvCriteria -Criteria \$criteria -Metrics ([^\r\n]+)", leg + "\n" + mod)
-        self.assertEqual(calls, ["(Get-DvCriteriaMetrics -Metrics $receipt.metrics -Playback $receipt.playback)",
-                                 "(Get-DvCriteriaMetrics -Metrics $metrics -Playback $derived)"], calls)
+        self.assertEqual(calls, ["(Get-DvCriteriaMetrics -Metrics $receipt.metrics -Playback $receipt.playback -Visual $receipt.visual)",
+                                 "(Get-DvCriteriaMetrics -Metrics $metrics -Playback $derived -Visual (Get-DvProp $Receipt 'visual'))"], calls)
 
 
 class EveryFrameOldestFirstLegSpecTests(unittest.TestCase):
@@ -20236,6 +20236,175 @@ class EveryFrameConformConflictAndAcceptanceTests(unittest.TestCase):
         self.assertLess(text.index('Write-Output "DVE_OUTCOME=$Outcome"'), verification)
         self.assertLess(printed, text.index('Write-Output "DVE_RECEIPT_PATH=$path"'))
         self.assertEqual(text.count("DVE_ACCEPTANCE="), 1)
+
+
+@requires_windows_pwsh
+class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
+    """EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-1 r1 (design opus-001 F1, absorbs PLAYBACK-UNPACED-TAIL-PAINTED-CPU-1). An UNPINNED every-frame run closes its
+    measured window when the engine consumes its last target, so the pipeline's last targets are still in flight at the close. Receipt 231ea06e (CPU, Bachelor,
+    M16-1243): the app's conform line says max_jump=1 for frames 1..477 (nothing skipped), but the engine had reached 479 (479 rendering, 478 in prep, 477 painted),
+    and the reader derived conformMaxJump=2 and conformTailUnpaintedFrames=2 from the ends; the post-close visual tail shows display frame 479 on an UNFORCED play
+    capture 126 ms after the close. The reader now credits the in-flight targets the tail paints (Get-DvTailInFlightCredit) and nothing else."""
+
+    # The playback block 231ea06e carries (receipt playback.*), plus the summary's prep counters the credit reads (smoke-run.log:77 prep_stale_drops=1
+    # prep_generation_drops=1 prep_replaced_before=0 prep_replaced_after=0). conformMaxJump=1 is the APP's own line.
+    PB = {"conformLinePresent": True, "summarySession": "1", "conformSession": "1", "conformSourceFps": 11.906, "conformMaxJump": 1, "conformAudioSyncRequests": 0,
+          "conformRepeats": 0, "conformPresented": 477, "sourceAdvanced": 480, "conformSourceAdvanced": 476, "conformFirstFrame": 1, "conformLastFrame": 477,
+          "conformEngineTarget": 479, "conformBackward": 0, "prepReplacedBefore": 0, "prepReplacedAfter": 0, "prepStaleDrops": 1, "prepGenerationDrops": 1}
+
+    @staticmethod
+    def play(index: int = 0, **over) -> dict:
+        """One `play` capture as the receipt's visual block carries it (231ea06e play-0: unforced, 126 ms into the tail, display frame 479)."""
+        frame = {"kind": "play", "index": index, "displayFrame": 479, "playActive": True, "tailElapsedMs": 126 + 250 * index, "saved": True, "serial": 484,
+                 "paintedSerial": 484, "paintedSerialValid": True, "labelBound": True, "forcedPaintsBefore": index}
+        frame.update(over)
+        return frame
+
+    @classmethod
+    def visual(cls, *frames: dict, captured=True) -> dict:
+        return {"schema": "mlv-app/dual-venue-visual/v1", "requested": True, "captured": captured, "frames": list(frames or (cls.play(0), cls.play(1), cls.play(2)))}
+
+    def metrics(self, pb: dict | None = None, visual="default", criteria=None):
+        """Get-DvCriteriaMetrics over a JSON playback block and visual block (the shapes a receipt round-trips to), and Test-DvCriteria over `criteria` if given."""
+        pb = {**self.PB, **(pb or {})}
+        vis = self.visual() if isinstance(visual, str) else visual
+        proc, out = run_pwsh_json(
+            "$pb = $env:DVE_PB | ConvertFrom-Json\n"
+            "$vis = if ($env:DVE_VIS -eq 'null') { $null } else { $env:DVE_VIS | ConvertFrom-Json }\n"
+            "$m = Get-DvCriteriaMetrics -Metrics ([pscustomobject]@{ rows = 5 }) -Playback $pb -Visual $vis\n"
+            "$v = if ($env:DVE_CRIT) { Test-DvCriteria -Criteria ($env:DVE_CRIT | ConvertFrom-Json) -Metrics $m } else { $null }\n"
+            "[ordered]@{ m = $m; v = $v } | ConvertTo-Json -Compress -Depth 6",
+            DVE_PB=json.dumps(pb), DVE_VIS=json.dumps(vis) if vis is not None else "null", DVE_CRIT=json.dumps(criteria) if criteria else "")
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        return out
+
+    def test_231ea06e_in_flight_targets_painted_in_the_tail_are_not_a_jump_and_not_unpainted(self) -> None:
+        """RED at ef1f63949 + #910 (conformMaxJump=2, conformTailUnpaintedFrames=2: 'conformMaxJump eq 1 failed (actual 2); conformTailUnpaintedFrames eq 0 failed
+        (actual 2)'), GREEN after the credit: conformMaxJump equals the app line (1) and nothing is unpainted at stop."""
+        out = self.metrics(criteria=[{"metric": "conformMaxJump", "op": "eq", "value": 1}, {"metric": "conformTailUnpaintedFrames", "op": "eq", "value": 0}])
+        m = out["m"]
+        self.assertEqual((m["conformMaxJump"], m["conformTailUnpaintedFrames"]), (1, 0), out)
+        self.assertEqual((m["conformTailUnpaintedAtCloseFrames"], m["conformTailInFlightCreditedFrames"]), (2, 2), out)
+        self.assertNotIn("conformFrozenTailFrames", m, out)
+        self.assertTrue(out["v"]["pass"], out)
+        self.assertIn("display frame 479", m["conformTailInFlightCreditNote"], out)
+
+    def test_guard_a_real_skip_before_the_close_still_fails_conform_with_a_credited_tail(self) -> None:
+        """The credit forgives only the targets in flight AT the close. The app's own line saying max_jump=2 (a skipped frame), or painted coverage 8 frames short of
+        the engine's advance, still reads >= 2 and fails conformMaxJump eq 1, whatever the tail shows."""
+        crit = [{"metric": "conformMaxJump", "op": "eq", "value": 1}]
+        for name, pb in (("the app's own max_jump=2", {"conformMaxJump": 2}),
+                         ("painted coverage short of the engine's advance", {"conformSourceAdvanced": 468, "conformPresented": 469})):
+            with self.subTest(case=name):
+                out = self.metrics(pb, criteria=crit)
+                self.assertGreaterEqual(out["m"]["conformMaxJump"], 2, out)
+                self.assertFalse(out["v"]["pass"], out)
+                self.assertEqual(out["m"]["conformTailUnpaintedFrames"], 0, "the in-flight tail itself is credited; the skip is what fails")
+
+    def test_guard_a_target_never_painted_even_in_the_tail_still_counts(self) -> None:
+        """The tail shows display frame 477 (the last painted frame) for every capture: 478 and 479 were never painted, so nothing is credited."""
+        crit = [{"metric": "conformMaxJump", "op": "eq", "value": 1}, {"metric": "conformTailUnpaintedFrames", "op": "eq", "value": 0}]
+        stuck = self.visual(*(self.play(i, displayFrame=477) for i in range(3)))
+        out = self.metrics(visual=stuck, criteria=crit)
+        m = out["m"]
+        self.assertEqual((m["conformMaxJump"], m["conformTailUnpaintedFrames"], m["conformTailUnpaintedAtCloseFrames"]), (2, 2, 2), out)
+        self.assertNotIn("conformTailInFlightCreditedFrames", m, out)
+        self.assertFalse(out["v"]["pass"], out)
+        self.assertEqual(sorted(f.split(":")[0].split(" ")[0] for f in out["v"]["failures"]), ["conformMaxJump", "conformTailUnpaintedFrames"], out)
+
+    def test_every_missing_or_unsound_input_credits_nothing(self) -> None:
+        """Each case differs from the 231ea06e shape by ONE input: a tail the reader cannot trust, a deeper tail than the pipeline holds (the bound), or a prep
+        counter that says a prepared target was dropped. None is credited: the at-close figures stand (conformMaxJump=2, 2 unpainted; 3 targets: 3 / 4)."""
+        play = self.play
+        deeper_pb = {"conformLastFrame": 476, "conformSourceAdvanced": 475, "conformPresented": 476}
+        cases = {
+            "no visual block": ({}, None, "no post-close visual tail"),
+            "capture did not complete": ({}, self.visual(play(0), captured=False), "did not complete"),
+            "no frames": ({}, self.visual(captured=True) | {"frames": []}, "no unforced post-close play capture"),
+            "forced paint only": ({}, self.visual(play(1), play(2)), "no unforced post-close play capture"),
+            "Play not active": ({}, self.visual(play(0, playActive=False)), "no unforced post-close play capture"),
+            "label not bound": ({}, self.visual(play(0, labelBound=False)), "no unforced post-close play capture"),
+            "painted serial not valid": ({}, self.visual(play(0, paintedSerialValid=False)), "no unforced post-close play capture"),
+            "capture not saved": ({}, self.visual(play(0, saved=False)), "no unforced post-close play capture"),
+            "a paused capture": ({}, self.visual(play(0, kind="paused")), "no unforced post-close play capture"),
+            "string True is not a boolean": ({}, self.visual(play(0, labelBound="True")), "no unforced post-close play capture"),
+            "display frame short of the last target": ({}, self.visual(play(0, displayFrame=478)), "no unforced post-close play capture"),
+            "display frame not a number": ({}, self.visual(play(0, displayFrame="479")), "no unforced post-close play capture"),
+            "no tail time": ({}, self.visual(play(0, tailElapsedMs=None)), "no unforced post-close play capture"),
+            "a prepared result replaced before": ({"prepReplacedBefore": 1}, "default", "was replaced"),
+            "a prepared result replaced after": ({"prepReplacedAfter": 1}, "default", "was replaced"),
+            "a drop that is not a generation change": ({"prepStaleDrops": 2}, "default", "exceeds prep_generation_drops"),
+            "prep counters absent": ({"prepStaleDrops": None}, "default", "no readable non-negative prepStaleDrops"),
+            "negative counter": ({"prepReplacedBefore": -1}, "default", "no readable non-negative prepReplacedBefore"),
+        }
+        for name, (pb, visual, why) in cases.items():
+            with self.subTest(case=name):
+                out = self.metrics(pb, visual=visual)
+                m = out["m"]
+                self.assertEqual((m["conformMaxJump"], m["conformTailUnpaintedFrames"]), (2, 2), out)
+                self.assertNotIn("conformTailInFlightCreditedFrames", m, out)
+                self.assertIn(why, m["conformTailInFlightCreditNote"], out)
+        with self.subTest(case="deeper than the pipeline (3 in flight), display at the last target"):
+            out = self.metrics(deeper_pb)
+            m = out["m"]
+            self.assertEqual((m["conformTailUnpaintedFrames"], m["conformTailUnpaintedAtCloseFrames"]), (3, 3), out)
+            self.assertGreaterEqual(m["conformMaxJump"], 2, out)
+            self.assertNotIn("conformTailInFlightCreditedFrames", m, out)
+            self.assertIn("a frozen tail, not credited", m["conformTailInFlightCreditNote"], out)
+        with self.subTest(case="the bound is exactly 2: two in flight are credited, three are not"):
+            self.assertEqual(self.metrics({"conformLastFrame": 477})["m"]["conformTailInFlightCreditedFrames"], 2)
+            self.assertNotIn("conformTailInFlightCreditedFrames", self.metrics(deeper_pb)["m"])
+
+    def test_a_frozen_presentation_tail_with_a_credit_shaped_visual_is_still_a_frozen_tail(self) -> None:
+        """The r28 frozen-tail shape (engine 1499, painted through 1449; 49 frames never shown) with a tail that displays the last target: 49 are not in flight."""
+        pb = {"conformLastFrame": 1449, "conformFirstFrame": 0, "conformEngineTarget": 1498, "sourceAdvanced": 1499, "conformSourceAdvanced": 1449, "conformPresented": 1450}
+        out = self.metrics(pb, visual=self.visual(self.play(0, displayFrame=1498)))
+        self.assertEqual((out["m"]["conformMaxJump"], out["m"]["conformFrozenTailFrames"], out["m"]["conformTailUnpaintedFrames"]), (49, 48, 49), out)
+
+    def test_a_held_target_and_a_sound_run_are_unchanged(self) -> None:
+        """A run painted through its last target (no tail in flight) reads exactly as before, with no credit keys; and a held single target with no tail evidence
+        still reads unpainted=1 (the #910 A2 shape), credited only when the tail paints it."""
+        sound = {"conformLastFrame": 479, "conformSourceAdvanced": 478, "conformPresented": 479, "sourceAdvanced": 480}
+        out = self.metrics(sound, visual=None)
+        self.assertEqual((out["m"]["conformMaxJump"], out["m"]["conformTailUnpaintedFrames"]), (1, 0), out)
+        self.assertNotIn("conformTailUnpaintedAtCloseFrames", out["m"], out)
+        held = {"conformLastFrame": 478, "conformSourceAdvanced": 477, "conformPresented": 478}
+        self.assertEqual(self.metrics(held, visual=None)["m"]["conformTailUnpaintedFrames"], 1)
+        self.assertEqual(self.metrics(held)["m"]["conformTailUnpaintedFrames"], 0)
+
+    def test_a_seek_back_is_never_credited(self) -> None:
+        out = self.metrics({"conformBackward": 1})
+        self.assertIsNone(out["m"]["conformMaxJump"], out)
+        self.assertIsNone(out["m"]["conformTailUnpaintedFrames"], out)
+        self.assertNotIn("conformTailInFlightCreditedFrames", out["m"], out)
+
+    def test_the_summary_prep_counters_are_read_from_the_hashed_log_and_compared_when_stored(self) -> None:
+        """Get-DvPlaybackEvidence re-derives the four prep counters from the measured session's summary line (231ea06e smoke-run.log:77), and the receipt validator
+        compares them whenever a receipt stores them."""
+        summary = conformed_summary_line(prep_stale_drops="1", prep_generation_drops="1", prep_replaced_before="0", prep_replaced_after="0")
+        log = "\n".join(["playback_smoke.measured_session id=3", "playback_smoke.conform session=3 clip_fps=23.976 playback_fps=23.976 conform_active=0 conform_enabled=1 "
+                         "conform_env_override=0 audio_sync_requests=0", summary]) + "\n"
+        sha = hashlib.sha256(log.encode("utf-8")).hexdigest()
+        proc, out = run_pwsh_json(
+            "$summary = [pscustomobject]@{ sourceFrames = [pscustomobject]@{ sourceAdvanced = 1499; requiredSourceFrames = 1499; failures = @() }; fixtureRehearsal = $false; clipId = $env:DVE_CLIP }\n"
+            "$manifest = [pscustomobject]@{ smokeRunLog = [pscustomobject]@{ runNonce = $env:DVE_NONCE; sha256 = $env:DVE_SHA } }\n"
+            "$result = [pscustomobject]@{ evidence = [pscustomobject]@{ runNonce = $env:DVE_NONCE; runLogSnapshot = [pscustomobject]@{ sha256 = $env:DVE_SHA } } }\n"
+            "$pb = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ResultJson $result -LogText $env:DVE_LOG -LogSha256 $env:DVE_SHA -ExpectedClipId $env:DVE_CLIP\n"
+            "[ordered]@{ a = $pb.prepReplacedBefore; b = $pb.prepReplacedAfter; c = $pb.prepStaleDrops; d = $pb.prepGenerationDrops } | ConvertTo-Json -Compress",
+            DVE_LOG=log, DVE_SHA=sha, DVE_NONCE=NONCE, DVE_CLIP="M16-1243")
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out, {"a": 0, "b": 0, "c": 1, "d": 1})
+        mod = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        stored = re.search(r"\$script:PlaybackComparedFieldsWhenStored = @\(([^)]*)\)", mod, re.S)
+        self.assertIsNotNone(stored)
+        for field in ("prepReplacedBefore", "prepReplacedAfter", "prepStaleDrops", "prepGenerationDrops"):
+            self.assertIn(f"'{field}'", stored.group(1))
+
+    def test_both_criteria_call_sites_hand_the_receipts_visual_block_to_the_reader(self) -> None:
+        leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mod = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertEqual(re.findall(r"Get-DvCriteriaMetrics -Metrics (\$\w+(?:\.\w+)?) -Playback (\$\w+(?:\.\w+)?) -Visual ([^\r\n]+?)\)", leg + "\n" + mod),
+                         [("$receipt.metrics", "$receipt.playback", "$receipt.visual"), ("$metrics", "$derived", "(Get-DvProp $Receipt 'visual')")])
 
 
 class DriftLegSpecTests(unittest.TestCase):
