@@ -1,6 +1,10 @@
 /*!
  * \file test_dual_iso_applied_stage_log.cpp
- * \brief EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1: the rendered export's stage-timing log carries, right after every
+ * \brief EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1.
+ *        (1) DualIsoAppliedOutcome: llrpGetLastDualIsoOutcome() (llrawproc.h) after a run through each entry, on the tiny
+ *        dual-ISO fixture (CPU path). These live here, not in test_dual_iso_pipeline.cpp, because that file is a pinned
+ *        generator source of tests/fixtures/golden/pipeline_hashes.provenance.json and these tests add no golden.
+ *        (2) DualIsoAppliedStageLog: the rendered export's stage-timing log carries, right after every
  *        llrawproc_dual_iso record, one 0.000 marker record naming whether that llrawproc run applied dual-ISO
  *        (src/mlv/video_mlv.c mlv_note_llrawproc_dual_iso, src/debug/StageTiming.h MLV_STAGE_LLRAWPROC_DUAL_ISO_*).
  *        A child renders one processed16 frame of the tiny dual-ISO fixture; mlv_stage_timing_enabled() caches the
@@ -25,8 +29,174 @@
 #include <QStringList>
 #include <QTemporaryDir>
 
+#include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <iostream>
+#include <vector>
+
+// (1) llrpGetLastDualIsoOutcome() through both run entries (full-res applyLLRawProcObject and the scaled
+// applyLLRawProcObject_with_dims). CPU path: the GPU export / playback opt-ins stay at their defaults (off), and the
+// coordinate raw fixes are off so the scaled entry admits the run and a not-applied run restores the decode exactly.
+static void open_dual_iso_outcome_fixture(MlvPipelineFixture & fixture)
+{
+    QString error_message;
+    ASSERT_TRUE(fixture.openTinyDualIso(&error_message));
+    ASSERT_TRUE(fixture.loadReceipt(QStringLiteral("tests/fixtures/receipts/tiny_dual_iso_hq.marxml"), &error_message));
+    fixture.receipt().setFocusPixels(0);
+    fixture.receipt().setBadPixels(0);
+    fixture.receipt().setVerticalStripes(0);
+    fixture.receipt().setPatternNoise(0);
+    ASSERT_TRUE(fixture.applyReceipt(&error_message));
+    ASSERT_EQ(1, llrpGetDualIsoMode(fixture.video()));
+    ASSERT_TRUE(llrpGetDualIsoValidity(fixture.video()) != 0);
+    ASSERT_EQ(0, llrpGetDualIsoInterpolationMethod(fixture.video()));
+}
+
+static std::vector<uint16_t> decode_dual_iso_outcome_frame(MlvPipelineFixture & fixture)
+{
+    std::vector<uint16_t> raw(static_cast<std::size_t>(fixture.width()) * static_cast<std::size_t>(fixture.height()));
+    ASSERT_EQ(0, getMlvRawFrameUint16(fixture.video(), 0, raw.data()));
+    return raw;
+}
+
+// One llrawproc run on a copy of `source` through the chosen entry, from a cleared (UNKNOWN) last-run record. Returns
+// the outcome; `out` holds the run's output and `with_dims_rc` the scaled entry's return code.
+static int run_dual_iso_outcome(MlvPipelineFixture & fixture,
+                                bool with_dims,
+                                const std::vector<uint16_t> & source,
+                                std::vector<uint16_t> & out,
+                                int * with_dims_rc = nullptr)
+{
+    out = source;
+    llrpResetLastRunTimingForCurrentThread();
+    ASSERT_EQ(static_cast<int>(LLRP_DUAL_ISO_OUTCOME_UNKNOWN), llrpGetLastDualIsoOutcome());
+    if (with_dims)
+    {
+        const int rc = applyLLRawProcObject_with_dims(fixture.video(),
+                                                      out.data(),
+                                                      out.size() * sizeof(out[0]),
+                                                      fixture.width(),
+                                                      fixture.height());
+        if (with_dims_rc) *with_dims_rc = rc;
+    }
+    else
+    {
+        applyLLRawProcObject(fixture.video(), out.data(), out.size() * sizeof(out[0]));
+    }
+    return llrpGetLastDualIsoOutcome();
+}
+
+TEST(DualIsoAppliedOutcome, ReconstructionThatRunsReportsApplied)
+{
+    for (const bool with_dims : { false, true })
+    {
+        for (const int interpolation : { 0, 1 })
+        {
+            MlvPipelineFixture fixture;
+            open_dual_iso_outcome_fixture(fixture);
+            llrpSetDualIsoInterpolationMethod(fixture.video(), interpolation);
+            const std::vector<uint16_t> source = decode_dual_iso_outcome_frame(fixture);
+            std::vector<uint16_t> out;
+            int rc = -1;
+            const int outcome = run_dual_iso_outcome(fixture, with_dims, source, out, &rc);
+            if (outcome != LLRP_DUAL_ISO_OUTCOME_APPLIED)
+            {
+                std::fprintf(stderr, "with_dims=%d interpolation=%d outcome=%d\n", with_dims ? 1 : 0, interpolation, outcome);
+            }
+            ASSERT_EQ(static_cast<int>(LLRP_DUAL_ISO_OUTCOME_APPLIED), outcome);
+            if (with_dims) ASSERT_EQ(1, rc);
+            ASSERT_FALSE(out == source);   // the reconstruction rewrote the decode
+            ASSERT_TRUE(llrpGetLastDualIsoMilliseconds() > 0.0);
+        }
+    }
+}
+
+TEST(DualIsoAppliedOutcome, AttemptedReconstructionThatFailsReportsNotAppliedAndRestoresTheDecode)
+{
+    for (const bool with_dims : { false, true })
+    {
+        MlvPipelineFixture fixture;
+        open_dual_iso_outcome_fixture(fixture);
+        // diso_get_full20bit accepts interpolation 0 (AMaZE) and 1 (mean23) only: 2 fails the attempted recon.
+        llrpSetDualIsoInterpolationMethod(fixture.video(), 2);
+        const std::vector<uint16_t> source = decode_dual_iso_outcome_frame(fixture);
+        std::vector<uint16_t> out;
+        int rc = -1;
+        ASSERT_EQ(static_cast<int>(LLRP_DUAL_ISO_OUTCOME_NOT_APPLIED),
+                  run_dual_iso_outcome(fixture, with_dims, source, out, &rc));
+        if (with_dims) ASSERT_EQ(0, rc);
+        ASSERT_TRUE(out == source);   // restored to the pre-run decode
+        ASSERT_TRUE(llrpGetLastDualIsoMilliseconds() >= 0.0);
+    }
+}
+
+TEST(DualIsoAppliedOutcome, RunWithoutDualIsoReportsNotAttempted)
+{
+    for (const bool with_dims : { false, true })
+    {
+        MlvPipelineFixture fixture;
+        open_dual_iso_outcome_fixture(fixture);
+        const std::vector<uint16_t> source = decode_dual_iso_outcome_frame(fixture);
+        std::vector<uint16_t> out;
+        llrpSetDualIsoMode(fixture.video(), 0);
+        ASSERT_EQ(static_cast<int>(LLRP_DUAL_ISO_OUTCOME_NOT_ATTEMPTED),
+                  run_dual_iso_outcome(fixture, with_dims, source, out));
+        ASSERT_EQ(0.0, llrpGetLastDualIsoMilliseconds());
+
+        // Raw corrections off: the run returns before its dual-ISO block, still a recorded run.
+        llrpSetDualIsoMode(fixture.video(), 1);
+        llrpSetFixRawMode(fixture.video(), 0);
+        ASSERT_EQ(static_cast<int>(LLRP_DUAL_ISO_OUTCOME_NOT_ATTEMPTED),
+                  run_dual_iso_outcome(fixture, with_dims, source, out));
+    }
+}
+
+TEST(DualIsoAppliedOutcome, PreviewModeReportsWhetherTheRowscaleApplied)
+{
+    MlvPipelineFixture fixture;
+    open_dual_iso_outcome_fixture(fixture);
+    llrpSetDualIsoMode(fixture.video(), 2);
+    const std::vector<uint16_t> source = decode_dual_iso_outcome_frame(fixture);
+    std::vector<uint16_t> out;
+
+    // A flat frame has no interlaced exposures to detect: diso_get_preview returns 0 (with no cached pattern).
+    const int black = fixture.video()->RAWI.raw_info.black_level;
+    const int white = fixture.video()->RAWI.raw_info.white_level;
+    const std::vector<uint16_t> flat(source.size(), static_cast<uint16_t>((black + white) / 2));
+    fixture.video()->llrawproc->diso_pattern = 0;
+    ASSERT_EQ(static_cast<int>(LLRP_DUAL_ISO_OUTCOME_NOT_APPLIED), run_dual_iso_outcome(fixture, false, flat, out));
+
+    fixture.video()->llrawproc->diso_pattern = 0;
+    ASSERT_EQ(static_cast<int>(LLRP_DUAL_ISO_OUTCOME_APPLIED), run_dual_iso_outcome(fixture, false, source, out));
+
+    // The scaled entry runs the HQ reconstruction only (dual_iso == 1): preview mode is not attempted there.
+    ASSERT_EQ(static_cast<int>(LLRP_DUAL_ISO_OUTCOME_NOT_ATTEMPTED), run_dual_iso_outcome(fixture, true, source, out));
+}
+
+TEST(DualIsoAppliedOutcome, ResetIsUnknownAndSaveRestoreRoundTripsTheOutcome)
+{
+    MlvPipelineFixture fixture;
+    open_dual_iso_outcome_fixture(fixture);
+    const std::vector<uint16_t> source = decode_dual_iso_outcome_frame(fixture);
+    std::vector<uint16_t> out;
+
+    ASSERT_EQ(static_cast<int>(LLRP_DUAL_ISO_OUTCOME_APPLIED), run_dual_iso_outcome(fixture, false, source, out));
+    llrpSaveLastRunTimingForCurrentThread();
+    llrpResetLastRunTimingForCurrentThread();
+    ASSERT_EQ(static_cast<int>(LLRP_DUAL_ISO_OUTCOME_UNKNOWN), llrpGetLastDualIsoOutcome());
+    llrpRestoreLastRunTimingForCurrentThread();
+    ASSERT_EQ(static_cast<int>(LLRP_DUAL_ISO_OUTCOME_APPLIED), llrpGetLastDualIsoOutcome());
+
+    // A later run between the save and the restore does not leak through the restore.
+    llrpSetDualIsoInterpolationMethod(fixture.video(), 2);
+    ASSERT_EQ(static_cast<int>(LLRP_DUAL_ISO_OUTCOME_NOT_APPLIED), run_dual_iso_outcome(fixture, true, source, out));
+    llrpSaveLastRunTimingForCurrentThread();
+    llrpSetDualIsoMode(fixture.video(), 0);
+    ASSERT_EQ(static_cast<int>(LLRP_DUAL_ISO_OUTCOME_NOT_ATTEMPTED), run_dual_iso_outcome(fixture, false, source, out));
+    llrpRestoreLastRunTimingForCurrentThread();
+    ASSERT_EQ(static_cast<int>(LLRP_DUAL_ISO_OUTCOME_NOT_APPLIED), llrpGetLastDualIsoOutcome());
+}
 
 namespace
 {
