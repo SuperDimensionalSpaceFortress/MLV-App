@@ -799,6 +799,7 @@ inline PaintCreditHandOff paintCreditHandOff( const PlaybackWrapRecorder & recor
     const int from = std::max( wrapsBefore, correction.wrapsBefore );
     const int end = wrapsBefore + wrapsCrossed;
     handOff.wrapsWidth = end > from ? recorder.engineWrapsWidth( from, end - from ) : 0;
+    handOff.wrapsAfterRebase = end > from ? end - from : 0;   // r2: the landing's lap after the rebase (the slip histogram's wrap)
     return handOff;
 }
 

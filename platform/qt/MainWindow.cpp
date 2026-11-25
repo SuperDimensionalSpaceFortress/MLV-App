@@ -28637,8 +28637,11 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         // PLAYBACK-PACE-GUARD-THROUGHPUT-1 r2: drawFrameReady runs the first present's early advance BEFORE it
         // gets here, so the slider already holds whatever the first-frame wait was repaid with (UM r5: a jump
         // of dozens of frames on one tick). The paced timeline rate must not count that.
+        // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2 (r1 adversary pass 2 A1): a position correction is not travel, so the
+        // engine's corrections (the slip histogram's signed sum, noted under m_playbackSmokeActive) are left out.
         m_playbackSmokeFirstPresentTimelineDeltaAbs =
-            qAbs( ui->horizontalSliderPosition->value() - m_playbackSmokeStartPosition );
+            qAbs( ui->horizontalSliderPosition->value() - m_playbackSmokeStartPosition
+                  - m_playbackSlipHistogram.correctedFrames() );
     }
     gpuPresentEventSetContext( m_playbackSmokeSessionId, static_cast<qint64>( displayFrame ) );
 
@@ -29096,6 +29099,13 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         slipSample.uiLatencyMs = presentUiSignalLatencyMs;
         slipSample.timelinePosition = ui->horizontalSliderPosition->value();
         slipSample.lookaheadCovered = requestContext.playbackLookaheadDepth > 0;
+        // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2 (r1 adversary pass 2 A1): the corrections this frame's request crossed (the
+        // consumed-count step, which a first present takes too) and the hand-off's rebase, so the histogram rebases its display
+        // endpoint where the paint tracker rebases: a correction is never slips or startup catch-up.
+        slipSample.correctionsLanded = m_playbackSmokeTrackerEngineCorrections - sourceAdvanceCorrectionsBefore;
+        slipSample.rebase = sourceAdvanceHandOff.rebase;
+        slipSample.rebaseFrame = sourceAdvanceHandOff.rebaseFrame;
+        slipSample.rebaseLapped = sourceAdvanceHandOff.wrapsAfterRebase > 0;
         // HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 K1: this present's texture-present parts, from values
         // already captured (no clock read); only for a present the AMaZE texture presenter itself drew (A3).
         if( playback_texture_split::sampleEligible(
@@ -31821,7 +31831,9 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
     const double elapsedMs = ( now - m_playbackSmokeStartTime ) * 1000.0;
     const double elapsedSeconds = elapsedMs > 0.0 ? elapsedMs / 1000.0 : 0.0;
     const int currentPosition = ui->horizontalSliderPosition->value();
-    const int timelineDelta = currentPosition - m_playbackSmokeStartPosition;
+    // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2 (r1 adversary pass 2 A1): a position correction is not travel. timeline_delta and
+    // every rate and count derived from it leave out the engine's corrections (start_position and current_position stay raw).
+    const int timelineDelta = currentPosition - m_playbackSmokeStartPosition - m_playbackSlipHistogram.correctedFrames();
     const int timelineDeltaAbs = timelineDelta >= 0
         ? timelineDelta
         : -timelineDelta;

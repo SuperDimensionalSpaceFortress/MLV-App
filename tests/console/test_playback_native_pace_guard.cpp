@@ -1028,7 +1028,8 @@ TEST(PlaybackNativePaceWiring, TheFirstPresentsCatchUpIsSampledAfterItsAdvanceAn
     ASSERT_TRUE(firstPresent >= 0);
     const int sample = source.indexOf(QStringLiteral(
         "        m_playbackSmokeFirstPresentTimelineDeltaAbs =\n"
-        "            qAbs( ui->horizontalSliderPosition->value() - m_playbackSmokeStartPosition );"), firstPresent);
+        "            qAbs( ui->horizontalSliderPosition->value() - m_playbackSmokeStartPosition\n"
+        "                  - m_playbackSlipHistogram.correctedFrames() );"), firstPresent);
     ASSERT_TRUE(sample > firstPresent);
     ASSERT_TRUE(sample - firstPresent < 1200);
     ASSERT_TRUE(source.mid(firstPresent - 200, 200).contains(QStringLiteral("else")));
