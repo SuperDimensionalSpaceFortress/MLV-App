@@ -20372,13 +20372,17 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         rows = b"".join(b"\x00" + bytes([shade % 256, 64, 128]) * 2 for _ in range(2))
         return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
 
-    def metrics(self, pb: dict | None = None, app="default", criteria=None, *, png: str = "all", sha: str = "good", leg: str | None = None):
+    def metrics(self, pb: dict | None = None, app="default", criteria=None, *, png: str = "all", sha: str = "good", leg: str | None = None,
+                recorded: str = "good", verbatim: dict | None = None):
         """Get-DvCriteriaMetrics over a JSON playback block and the tail evidence Get-DvTailVisualEvidence reads from an evidence directory holding `app` as
         visual\\app-visual.json (`app` None: no file; `app` bytes: written verbatim) and the leg-named PNGs of its saved rows (`png` 'all' | 'none' |
         'first-missing' | 'stub' (the 5 bytes 89 50 4e 47 00) | 'empty'); `sha` is the digest the receipt stores ('good' | 'wrong' | 'absent').
-        Test-DvCriteria over `criteria` if given."""
+        Test-DvCriteria over `criteria` if given. r2 (adversary A1 on 9f327333): `recorded` is the receipt's visual.frames the PNGs are bound to ('good': each
+        written PNG's own sha256 | 'replaced': the sha256 of a different valid PNG, as if the file on disk was swapped after collection | 'none': no frames).
+        `verbatim` adds keys to the verbatim summary metrics (adversary A4)."""
         pb = {**self.PB, **(pb or {})}
         doc = self.app_json() if isinstance(app, str) else app
+        rec: list[dict] = []
         with tempfile.TemporaryDirectory() as d:
             vis = Path(d) / "visual"
             vis.mkdir()
@@ -20387,7 +20391,10 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
                 raw = doc if isinstance(doc, bytes) else json.dumps(doc).encode("utf-8")
                 (vis / "app-visual.json").write_bytes(raw)
                 digest = hashlib.sha256(raw).hexdigest()
-                parsed = json.loads(raw.decode("utf-8-sig", errors="ignore")) if isinstance(doc, bytes) else doc
+                try:
+                    parsed = json.loads(raw.decode("utf-8-sig", errors="ignore")) if isinstance(doc, bytes) else doc
+                except ValueError:
+                    parsed = None
                 rows = (parsed[0] if isinstance(parsed, list) and parsed else parsed).get("frames") if isinstance(parsed, (dict, list)) and parsed else None
                 if png != "none":
                     for row in rows if isinstance(rows, list) else []:
@@ -20397,14 +20404,22 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
                             continue
                         body = {"stub": b"\x89PNG\x00", "empty": b""}.get(png, self.png_bytes(row["index"]))
                         (vis / f"{leg or self.LEG}-{row['kind'].replace('_', '-')}-{row['index']}.png").write_bytes(body)
+                        bound = body if recorded == "good" else self.png_bytes(200)
+                        if recorded != "none":
+                            rec.append({"kind": row["kind"], "index": row["index"], "sha256": hashlib.sha256(bound).hexdigest()})
             stored = {"good": digest, "wrong": "f" * 64, "absent": ""}[sha]
             proc, out = run_pwsh_json(
                 "$pb = $env:DVE_PB | ConvertFrom-Json\n"
-                "$vis = Get-DvTailVisualEvidence -EvidenceDir $env:DVE_DIR -LegId $env:DVE_LEG -ExpectedSha256 $env:DVE_SHA\n"
-                "$m = Get-DvCriteriaMetrics -Metrics ([pscustomobject]@{ rows = 5 }) -Playback $pb -Visual $vis\n"
+                "$rec = @($env:DVE_REC | ConvertFrom-Json)\n"
+                # (splatted only where the reader takes it, so a RED run on a reader without the binding exercises that reader's own behaviour)
+                "$bind = @{}; if ((Get-Command Get-DvTailVisualEvidence).Parameters.ContainsKey('RecordedFrames')) { $bind['RecordedFrames'] = $rec }\n"
+                "$vis = Get-DvTailVisualEvidence -EvidenceDir $env:DVE_DIR -LegId $env:DVE_LEG -ExpectedSha256 $env:DVE_SHA @bind\n"
+                "$verb = $env:DVE_VERB | ConvertFrom-Json\n"
+                "$m = Get-DvCriteriaMetrics -Metrics $verb -Playback $pb -Visual $vis\n"
                 "$v = if ($env:DVE_CRIT) { Test-DvCriteria -Criteria ($env:DVE_CRIT | ConvertFrom-Json) -Metrics $m } else { $null }\n"
-                "[ordered]@{ m = $m; v = $v; haveVisual = ($null -ne $vis) } | ConvertTo-Json -Compress -Depth 6",
-                DVE_PB=json.dumps(pb), DVE_DIR=d, DVE_LEG=leg or self.LEG, DVE_SHA=stored, DVE_CRIT=json.dumps(criteria) if criteria else "")
+                "[ordered]@{ m = $m; v = $v; haveVisual = ($null -ne $vis); detail = (Get-DvTailCreditDetail -CriteriaMetrics $m) } | ConvertTo-Json -Compress -Depth 6",
+                DVE_PB=json.dumps(pb), DVE_DIR=d, DVE_LEG=leg or self.LEG, DVE_SHA=stored, DVE_CRIT=json.dumps(criteria) if criteria else "",
+                DVE_REC=json.dumps(rec), DVE_VERB=json.dumps({"rows": 5, **(verbatim or {})}))
         self.assertIsNotNone(out, proc.stdout + proc.stderr)
         return out
 
@@ -20703,6 +20718,77 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         appended = leg.index("if ($outcome -in @('PASS', 'FAIL')) { $detail += Get-DvTailCreditDetail -CriteriaMetrics $criteriaMetrics }", judged)
         self.assertLess(leg.index("$outcome = 'PASS'; $detail =", judged), appended)
         self.assertLess(appended, leg.index("$scale.verdict -ceq 'DECLARED_CLAMP'", judged))
+
+    # ---- r2 adversary fix 1 (pass on 9f327333: A1, A2, A4 introduced majors; A5, A6 minor). Each is RED on 9f327333. ----
+    def test_r2_adversary_a1_a_png_replaced_after_collection_never_credits(self) -> None:
+        """A1, its input: the held shape, a hash-matching app-visual.json with a bound frame-479 capture, and its leg-named PNG replaced by another valid PNG
+        while the receipt's visual.frames[].sha256 still names the original. 9f327333 hashed the new file and credited it (tail 0). The PNG must hash to the
+        recorded sha256 of its kind and index; no recorded frames is no credit. Both criteria callers pass the receipt's visual.frames."""
+        for recorded in ("replaced", "none"):
+            with self.subTest(recorded=recorded):
+                self.assert_no_credit(self.metrics(self.HELD, recorded=recorded, criteria=self.BOTH), 1)
+        out = self.metrics(self.HELD, criteria=self.BOTH)
+        self.assertEqual(out["m"]["conformTailInFlightCreditedFrames"], 1, out)
+        leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mod = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("-ExpectedSha256 ([string](Get-DvProp $receipt.visual 'appVisualJsonSha256')) -RecordedFrames (Get-DvProp $receipt.visual 'frames')", leg)
+        self.assertIn("-ExpectedSha256 ([string](Get-DvProp (Get-DvProp $Receipt 'visual') 'appVisualJsonSha256')) -RecordedFrames (Get-DvProp (Get-DvProp $Receipt 'visual') 'frames')", mod)
+        with self.subTest(case="a kind and index recorded twice is ambiguous"):
+            proc, res = run_pwsh_json(
+                "$d = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString('N')); $v = Join-Path $d 'visual'; [void](New-Item -ItemType Directory -Path $v)\n"
+                "$png = [Convert]::FromBase64String($env:DVE_PNG); [IO.File]::WriteAllBytes((Join-Path $v ($env:DVE_LEG + '-play-0.png')), $png)\n"
+                "$json = [Text.Encoding]::UTF8.GetBytes($env:DVE_APP); [IO.File]::WriteAllBytes((Join-Path $v 'app-visual.json'), $json)\n"
+                "$sha = Get-DvSha256OfBytes $png\n"
+                "$rec = @([pscustomobject]@{ kind = 'play'; index = 0; sha256 = $sha }, [pscustomobject]@{ kind = 'play'; index = 0; sha256 = $sha })\n"
+                "$vis = Get-DvTailVisualEvidence -EvidenceDir $d -LegId $env:DVE_LEG -ExpectedSha256 (Get-DvSha256OfBytes $json) -RecordedFrames $rec\n"
+                "$one = Get-DvTailVisualEvidence -EvidenceDir $d -LegId $env:DVE_LEG -ExpectedSha256 (Get-DvSha256OfBytes $json) -RecordedFrames @($rec[0])\n"
+                "Remove-Item -LiteralPath $d -Recurse -Force\n"
+                "[ordered]@{ twice = $vis.frames[0].pngSha256; once = $one.frames[0].pngSha256 } | ConvertTo-Json -Compress",
+                DVE_PNG=__import__("base64").b64encode(self.png_bytes(0)).decode(), DVE_LEG=self.LEG, DVE_APP=json.dumps(self.app_json(self.play(0))))
+            self.assertIsNotNone(res, proc.stdout + proc.stderr)
+            self.assertIsNone(res["twice"], res)
+            self.assertEqual(res["once"], hashlib.sha256(self.png_bytes(0)).hexdigest(), res)
+
+    def test_r2_adversary_a2_two_rows_on_one_kind_and_index_are_no_tail_evidence(self) -> None:
+        """A2, its input: two play rows, both kind=play index=0 (bound, saved, active), display 478 and 479, and one play-0.png. 9f327333 credited 2 (tail 0, every
+        list passes) from one picture. The document is ambiguous, so it is no tail evidence."""
+        out = self.metrics(app=self.app_json(self.play(0, display_frame=478), self.play(0, display_frame=479)), criteria=self.BOTH)
+        self.assertFalse(out["haveVisual"], out)
+        self.assert_no_credit(out, 2)
+
+    def test_r2_adversary_a4_a_verbatim_summary_key_is_never_a_credit_or_its_record(self) -> None:
+        """A4, its input: the sound shape (last 479 = target), Visual null, and verbatim metrics claiming conformTailInFlightCreditedFrames=2,
+        conformTailUnpaintedAtCloseFrames=2, conformTailInFlightCreditNote='CLAIM'. 9f327333 kept them, and the receipt detail said '2 of 2 ... (CLAIM)'.
+        Siblings: the frozen-tail diagnostics only Get-DvCriteriaMetrics derives, in any casing."""
+        sound = {"conformLastFrame": 479, "conformSourceAdvanced": 478, "conformPresented": 479}
+        claim = {"conformTailInFlightCreditedFrames": 2, "conformTailUnpaintedAtCloseFrames": 2, "conformTailInFlightCreditNote": "CLAIM",
+                 "conformFrozenTailFrames": 7, "conformTailAllowanceFrames": 9, "ConformPaintStepsImpliedMaxJump": 3}
+        out = self.metrics(sound, app=None, verbatim=claim)
+        for k in claim:
+            self.assertNotIn(k, out["m"], out)
+            self.assertNotIn(k.lower(), {x.lower() for x in out["m"]}, out)
+        self.assertEqual(out["detail"], "", out)
+        self.assertEqual(out["m"]["rows"], 5, out)
+        held = self.metrics(self.HELD, verbatim={"conformTailInFlightCreditedFrames": 9, "conformTailInFlightCreditNote": "CLAIM"})
+        self.assertEqual(held["m"]["conformTailInFlightCreditedFrames"], 1, held)
+        self.assertNotIn("CLAIM", held["detail"], held)
+        self.assertIn("tail in-flight credit: 1 of 1", held["detail"], held)
+
+    def test_r2_adversary_a5_a6_identity_shapes_and_utf16_are_refused(self) -> None:
+        """A5: schema ["mlv-app/visual-capture/v1"] and measured_session [1] were coerced to the string and to 1; A6: a UTF-16LE BOM document parsed. Each is
+        now no tail evidence / $null."""
+        for name, doc in (("schema an array", self.app_json(schema=["mlv-app/visual-capture/v1"])), ("measured_session an array", self.app_json(measured_session=[1])),
+                          ("measured_session a fraction", self.app_json(measured_session=1.5))):
+            with self.subTest(case=name):
+                out = self.metrics(self.HELD, app=doc, criteria=self.BOTH)
+                self.assertFalse(out["haveVisual"], out)
+                self.assert_no_credit(out, 1)
+        with self.subTest(case="UTF-16LE with its BOM"):
+            out = self.metrics(self.HELD, app=b"\xff\xfe" + json.dumps(self.app_json(self.play(0))).encode("utf-16-le"), criteria=self.BOTH, png="none")
+            self.assertFalse(out["haveVisual"], out)
+        proc, res = run_pwsh_json("[ordered]@{ u16 = ($null -eq (ConvertFrom-DvStrictJsonBytes -Bytes ([byte[]]@(255,254,123,0,34,0,97,0,34,0,58,0,49,0,125,0)))) } | ConvertTo-Json -Compress")
+        self.assertIsNotNone(res, proc.stdout + proc.stderr)
+        self.assertTrue(res["u16"], res)
 
 
 class DriftLegSpecTests(unittest.TestCase):
