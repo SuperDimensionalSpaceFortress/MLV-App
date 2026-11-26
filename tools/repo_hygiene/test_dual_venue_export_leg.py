@@ -4348,6 +4348,33 @@ TREE_ROOT_COMMAND = ("$c = Start-Process -FilePath (Get-Process -Id $PID).Path -
                      "Set-Content -LiteralPath '{pid_file}' -Value ('' + $c.Id + ' ' + $c.StartTime.ToFileTimeUtc()); Start-Sleep 90")
 
 
+# A1-CLOCK-FREE-ANCESTRY-1 r2 (B1): the real two-process tree still runs, but the process LISTING the job's block and the wait read is injected, so the verdict never depends on the host's
+# unrelated process churn. The proof is not widened: the module's own Get-CimInstance Win32_Process scan is shadowed by a global function that returns the real rows filtered to (a) every
+# row of the FIRST call (the listing before the root starts: same pid and stamp) and (b) the processes that descend from this harness (the root and its child), so a process another lane
+# starts on a busy host (unproven, hence fail closed in production) is simply not part of the fixture's world. A survivor of the tree stays in it, so the survivor test is unchanged.
+PROCESS_LISTING_FIXTURE = (
+    "$global:fixtureBase = $null; $global:fixtureHarnessPid = $PID; $global:fixtureScans = 0; $global:fixtureKept = @{}\n"
+    "function global:Get-CimInstance {\n"
+    "    [CmdletBinding()] param([string]$ClassName, [string[]]$Property, [uint32]$OperationTimeoutSec)\n"
+    "    $all = @(CimCmdlets\\Get-CimInstance @PSBoundParameters)\n"
+    "    if ($ClassName -ne 'Win32_Process') { return $all }\n"
+    "    $global:fixtureScans++\n"
+    "    if ($null -eq $global:fixtureBase) {\n"
+    "        $global:fixtureBase = @{}\n"
+    "        foreach ($r in $all) { $global:fixtureBase[[int64]$r.ProcessId] = ([datetime]$r.CreationDate).ToUniversalTime().Ticks }\n"
+    "        return $all\n"
+    "    }\n"
+    "    $kids = @{}\n"
+    "    foreach ($r in $all) { $k = [int64]$r.ParentProcessId; if (-not $kids.ContainsKey($k)) { $kids[$k] = [System.Collections.Generic.List[object]]::new() }; $kids[$k].Add($r) }\n"
+    # a descendant stays part of the fixture's world once seen (an orphan whose parent exited is still the harness's process), by pid AND stamp
+    "    $stamp = @{}; foreach ($r in $all) { $stamp[[int64]$r.ProcessId] = ([datetime]$r.CreationDate).ToUniversalTime().Ticks }\n"
+    "    $queue = [System.Collections.Generic.Queue[int64]]::new(); $queue.Enqueue([int64]$global:fixtureHarnessPid)\n"
+    "    foreach ($kp in @($global:fixtureKept.Keys)) { if ($stamp.ContainsKey($kp) -and $stamp[$kp] -eq $global:fixtureKept[$kp]) { $queue.Enqueue($kp) } }\n"
+    "    while ($queue.Count -gt 0) { $p = $queue.Dequeue(); if ($kids.ContainsKey($p)) { foreach ($c in $kids[$p]) { $cid = [int64]$c.ProcessId; if (-not $global:fixtureKept.ContainsKey($cid) -or $global:fixtureKept[$cid] -ne $stamp[$cid]) { $global:fixtureKept[$cid] = $stamp[$cid]; $queue.Enqueue($cid) } } } }\n"
+    "    foreach ($r in $all) { $id = [int64]$r.ProcessId; $t = $stamp[$id]; if (($global:fixtureKept.ContainsKey($id) -and $global:fixtureKept[$id] -eq $t) -or ($global:fixtureBase.ContainsKey($id) -and $global:fixtureBase[$id] -eq $t)) { $r } }\n"
+    "}\n")
+
+
 @requires_windows_pwsh
 class ExportKillDescendantConfirmTests(unittest.TestCase):
     """EXPORT-KILL-DESCENDANT-CONFIRM-1 (adversary pass 26 A1 on 559536d7, split from EXPORT-VENUE-LEG-1 r20). Kill($true) may return, and the root's wait read true,
@@ -4378,6 +4405,7 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
             script.write_text(
                 "$ErrorActionPreference = 'Stop'\n"
                 f"Import-Module '{ARTIFACTS_MODULE}' -Force -DisableNameChecking\n"
+                + PROCESS_LISTING_FIXTURE +
                 # r8 (merge of fork/master c6ec83ae): the sliced block now reads batch.log through the central reader's one line grammar and binding verdict
                 # (ConvertFrom-DvBatchExportLog, Get-DvBatchExportBindingProblems; EXPORT-RENDER-PIPE-TIMING-2/-3). The job embeds that text from DualVenueRunner.psm1,
                 # so the harness loads the same embedded text the generator describes (never a re-typed copy).
@@ -4395,7 +4423,7 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
                 f"    $childPid = try {{ [int]((Get-Content -LiteralPath '{pid_file}' -Raw).Trim() -split ' ')[0] }} catch {{ $null }}\n"
                 "    $childAlive = Test-FixtureChild $childPid\n"
                 "    [ordered]@{ result = $result; exit = $exitFor[$result]; outputs = $outputs.Count; killConfirmed = $killConfirmed; childStarted = ($null -ne $childPid);\n"
-                "                childAlive = $childAlive; trace = @($traceLines) } | ConvertTo-Json -Compress\n"
+                "                childAlive = $childAlive; listingScans = $global:fixtureScans; trace = @($traceLines) } | ConvertTo-Json -Compress\n"
                 "} finally {\n"
                 f"    if ($null -eq $childPid) {{ $childPid = try {{ [int]((Get-Content -LiteralPath '{pid_file}' -Raw).Trim() -split ' ')[0] }} catch {{ $null }} }}\n"
                 "    if (Test-FixtureChild $childPid) { Stop-Process -Id $childPid -Force -ErrorAction SilentlyContinue }\n"
@@ -4405,6 +4433,7 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             got = json.loads(proc.stdout.strip().splitlines()[-1])
             self.assertTrue(got["childStarted"], f"the tree had its descendant before the timeout: {got}")
+            self.assertGreaterEqual(got["listingScans"], 3, f"the injected process listing served the baseline, the snapshot and the wait: {got}")
             return got
 
     def test_a_descendant_that_outlives_the_root_makes_the_kill_unconfirmed_and_no_output_is_read(self) -> None:
