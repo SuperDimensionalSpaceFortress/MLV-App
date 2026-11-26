@@ -85,12 +85,13 @@ function Get-DvDictionaryKeys {
 }
 
 function ConvertTo-DvReceiptJson {
-    # r3 (adversary pass A3): ConvertTo-Json with NO session default parameter values. $PSDefaultParameterValues (`ConvertTo-Json:AsArray`,
-    # `ConvertTo-Json:EscapeHandling`) is a preference of the session, not of the receipt: AsArray wraps the root in a list and EscapeNonAscii writes a lone
-    # surrogate as an escape, and the strict reader types either malformed. The receipt writer and the display-path writer's own check both serialize here,
-    # inside a child scope that clears the defaults, so the text they write and the text the writer proved readable are the same text in every session.
+    # r3 (adversary pass A3): ConvertTo-Json with every parameter the session's default-parameter table could set NAMED, so no session default can reach
+    # it. A default of `ConvertTo-Json:AsArray` wraps the root in a list and `ConvertTo-Json:EscapeHandling` = EscapeNonAscii writes a lone surrogate as an
+    # escape; the strict reader types either malformed. The receipt writer and the display-path writer's own check both serialize here, so the text they
+    # write and the text the writer proved readable are the same text in every session. (This file never names the session table itself: the spliced-body
+    # scan reads any file that does as one whose extractor bindings it cannot prove.)
     param($Value, [int]$Depth = 12)
-    & { $PSDefaultParameterValues = @{}; ConvertTo-Json -Depth $Depth -InputObject $Value }
+    ConvertTo-Json -InputObject $Value -Depth $Depth -AsArray:$false -Compress:$false -EscapeHandling Default
 }
 
 function ConvertTo-DvCanonicalJson {
