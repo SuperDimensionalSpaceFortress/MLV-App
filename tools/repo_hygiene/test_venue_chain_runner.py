@@ -1570,7 +1570,9 @@ class VenueChainSupplementaryTests(unittest.TestCase):
 
     def test_v01_timeout_then_unwritable_output_keeps_the_job_identity_and_refuses_the_next_leg_until_finished(self) -> None:
         rd, sup, log = self.run_timeout_with_unwritable_output("lane-V01", FAKE_UM_JOB_ID=self.JOB_ID, FAKE_JOB_DONE_ON_LEG="sp-b.json")
-        self.assertEqual((sup[0]["status"], sup[0]["reason"]), ("SKIPPED", "SUPPLEMENTARY_ERROR"), "the output write failed after the timeout")
+        # R9-R2 A1: the transcript copy is best-effort now, so a copy that cannot be written no longer ends the row SKIPPED/SUPPLEMENTARY_ERROR: the timeout is recorded as what it was
+        # (TIMEOUT, with the identity kept and reconciled) and the typed refusal read from the child's stdout is never pre-empted by the failed write
+        self.assertEqual((sup[0]["status"], sup[0]["remoteJobIds"], sup[0]["remoteJobState"], sup[0]["venueIdle"]), ("TIMEOUT", [self.JOB_ID], "NOT_FINISHED", False), "the output write failed after the timeout")
         # the unresolved identity is retained: the next leg is refused (not run) and names the killed client's job
         self.assertEqual((sup[1]["status"], sup[1]["reason"]), ("SKIPPED", "UM_REMOTE_JOB_UNRESOLVED"))
         self.assertIn(f"jobId={self.JOB_ID} state=NOT_FINISHED", sup[1]["detail"])
@@ -1582,8 +1584,9 @@ class VenueChainSupplementaryTests(unittest.TestCase):
 
     def test_v01_timeout_then_unwritable_output_with_no_identity_stays_busy(self) -> None:
         rd, sup, log = self.run_timeout_with_unwritable_output("lane-V01NOID")   # the client printed no DVE_JOB_ID before it hung: nothing to look up
-        self.assertEqual((sup[0]["status"], sup[0]["reason"]), ("SKIPPED", "SUPPLEMENTARY_ERROR"))
-        self.assertTrue(all(s["status"] == "SKIPPED" for s in sup), [s["status"] for s in sup])
+        self.assertEqual(sup[0]["status"], "TIMEOUT")   # R9-R2 A1: the failed transcript copy does not turn the timeout into SUPPLEMENTARY_ERROR
+        self.assertEqual((sup[0]["remoteJobIds"], sup[0]["venueIdle"]), ([], False), "no identity printed: the venue is not read as idle")
+        self.assertTrue(all(s["status"] == "SKIPPED" for s in sup[1:]), [s["status"] for s in sup])
         self.assertTrue(all(s["reason"] == "UM_REMOTE_JOB_UNRESOLVED" for s in sup[1:]) and len(sup) >= 2, [s.get("reason") for s in sup])
         self.assertNotIn("ultra-magnus", [v for l, v, _ in self.starts() if l == "sp-b.json"], "a missing identity must remain busy: no later leg runs on ultra-magnus")
         self.assertNotIn("SUPPLEMENTARY_REMOTE_JOB_RECONCILED", log)

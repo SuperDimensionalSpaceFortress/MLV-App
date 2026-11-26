@@ -403,7 +403,9 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
             $script:suppRemote = @{ leg = $Leg.name; jobIds = @(); state = 'UNKNOWN' }
             $script:suppRemote.jobIds = @(Get-VenueRemoteJobIds -Text $sr.stdout)
         }
-        [IO.File]::WriteAllText($sOut, $sr.stdout + $(if ($sr.stderr) { "`n--- stderr ---`n$($sr.stderr)" } else { '' }))
+        # DV-PLANNED-SPEC-HASH-BIND-R9-R2-RESIDUE-1 (adversary pass 2 A1): the transcript copy is best-effort (as the primary leg's is): a write that fails (a directory squatting on the path) must not pre-empt
+        # the typed refusal read from the child's stdout below, nor turn a timeout/failure into SUPPLEMENTARY_ERROR; the armed remote-job guard above and the receipt/refusal reads do not depend on it
+        try { [IO.File]::WriteAllText($sOut, $sr.stdout + $(if ($sr.stderr) { "`n--- stderr ---`n$($sr.stderr)" } else { '' })) } catch { Write-ChainDiag "supplementary transcript write failed for $($Leg.name): $($_.Exception.Message -replace '\s+', ' ')" }
         $sLines = @($sr.stdout -split "`r?`n")
         $so = $sLines | Where-Object { $_ -match '^DVE_OUTCOME=(\S+)' } | Select-Object -Last 1
         $sOutcome = $(if ($so -and $so -match '^DVE_OUTCOME=(\S+)') { $Matches[1] } else { 'NONE' })
