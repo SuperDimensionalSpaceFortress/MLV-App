@@ -48,7 +48,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('opus', 'sonnet', 'fable', 'sol', 'luna', 'astra', 'terra')]
+    [ValidateSet('opus', 'sonnet', 'fable', 'sol', 'luna', 'astra', 'terra', 'neon', 'kimi')]
     [string]$Lane,
 
     [string]$Prompt,
@@ -251,7 +251,16 @@ $LANES = @{
     # strips (-ImagePaths) and answers a JSON verdict. Read-only like every codex row (codex-lane-never-edits),
     # high effort, tier resolved at launch to the highest listed gpt-<ver>-terra slug.
     terra  = @{ engine = 'codex';  tier = 'terra';   effort = 'high'; role = 'visual-judge' }
+    # THIRD-PARTY-PRODUCER-LANES-1 (owner ask 2026-11-25: "see if it results in less rounds of review"): trial
+    # IMPLEMENTERS next to sonnet. PRODUCERS ONLY -- never a review key, in no seat map the merge gate reads
+    # (claude = fable/opus/sonnet, codex = sol/luna stays exactly as it is). Their PRs are reviewed by the
+    # unchanged sol + opus/fable keys, which is what the A/B (GEMINI-NEON-ROUNDS-AB-1) measures. They are
+    # delegated to lane-third-party-producer.ps1 before any claude/codex code runs. Effort is high: neon's id
+    # carries it, and kimi's pinned model defaults to it (kimi 2.8.0 has no effort flag).
+    neon   = @{ engine = 'antigravity'; model = 'gemini-4-neon-high';  effort = 'high'; role = 'trial-implementer' }
+    kimi   = @{ engine = 'kimicode';    model = 'kimi-code/k3.1-pro'; effort = 'high'; role = 'trial-implementer' }
 }
+. (Join-Path $PSScriptRoot 'lane-third-party-producer.ps1')
 
 # Absolute launcher paths. NEITHER is on the Git Bash PATH on this host, and a
 # bare name resolves differently per shell - measured 2026-08-29.
@@ -1173,6 +1182,11 @@ if ($AllowEdits -and $LANES[$Lane].engine -eq 'codex') {
 # the NATIVE one (.ProviderPath: `Provider::C:/dir/x.png` would pass Test-Path but not File.Exists: A3). Hashing is NOT done
 # here: the launch copies each image into the run dir and hashes THAT copy, so the receipt names the exact bytes the
 # lane was handed even if the source is replaced after validation (A2). Keyed on ENGINE, not lane name.
+# (a3) THIRD-PARTY-PRODUCER-LANES-1: a producer lane is never retired by this launcher (its receipt records `kept`), so
+# the flag is refused rather than silently ignored. Keyed on ENGINE, before any run dir or receipt exists.
+if ($RetireWorktree -and (Test-ThirdPartyProducerEngine $LANES[$Lane].engine)) {
+    throw "producer-retire-worktree-unsupported: -Lane $Lane is a producer-only lane; -RetireWorktree is not honoured for it"
+}
 $ImageAttachments = @()
 # r4 B2: one held read handle per snapshot, kept open from the copy until the codex child has exited (never serialised into the receipt).
 $ImageHolds = [System.Collections.Generic.List[object]]::new()
@@ -2204,6 +2218,29 @@ Assert-NoLoneSurrogate -Text @($RunDir)
 
 $cfg = $LANES[$Lane].Clone()
 if ($ReasoningEffort) { $cfg.effort = $ReasoningEffort }
+
+# ---------------------------------------------------------------- THIRD-PARTY PRODUCER DELEGATION
+# THIRD-PARTY-PRODUCER-LANES-1: the `neon` (antigravity) and `kimi` (kimicode) rows never reach the claude/codex
+# launch code below. Every shared gate has already run by here (hub-host local-playback lint, the -AllowEdits
+# allowlist and worktree-hook receipt, the codex/image guards, the run dir), so the producer path inherits them.
+# Dispatch is keyed on ENGINE, never on a lane name. The helper writes the receipt and returns the exit code.
+if (Test-ThirdPartyProducerEngine $cfg.engine) {
+    $producerResult = Invoke-ThirdPartyProducerLane -Lane $Lane -Cfg $cfg -Prompt $Prompt -WorkDir $WorkDir -RunDir $RunDir `
+        -TimeoutSec $TimeoutSec -AllowEdits ([bool]$AllowEdits) -AllowedTools $AllowedTools -Card $Card `
+        -LanePromptPath ([string]$LanePromptPath) -DispatchReservationId $DispatchReservationId `
+        -BaseSha ([string]$BaseSha) -HookSha256 ([string]$WorkDirHookSha256) -ModelOverride $ModelOverride `
+        -LedgerWriter { param($row) Add-DispatchLedgerRow -Path $DispatchLedgerPath -Row $row } `
+        -SnapshotDirty { Get-TrackedDirtyContentIdentity -WorkDir $WorkDir } `
+        -ReadHead { $h = Invoke-GitCaptureUtf8 -WorkDir $WorkDir -GitArgs @('rev-parse', 'HEAD'); if (-not $h.ok) { throw $h.error }; $h.stdout }
+    Write-Host ("[{0}] {1}/{2} effort={3} exit={4} {5}s state={6} -> {7}" -f $Lane, $producerResult.Receipt.engine, $producerResult.Receipt.requestedModel,
+        $producerResult.Receipt.effort, $producerResult.Receipt.exitCode, $producerResult.Receipt.durationSec, $producerResult.Receipt.state, $producerResult.Receipt.promptPath.Replace('.prompt.txt', '.receipt.json'))
+    if ($null -ne $producerResult.Receipt.providerRefusal) {
+        Write-Host ("  PRODUCER REFUSED ({0}): {1}" -f $producerResult.Receipt.providerRefusal.kind, $producerResult.Receipt.providerRefusal.match)
+        Write-Host ("  remedy: {0}" -f $producerResult.Receipt.providerRefusal.remedy)
+    }
+    $producerResult.Receipt
+    exit $producerResult.ExitCode
+}
 
 # ---------------------------------------------------------------- model identity (LANE-MODEL-CURRENCY-1)
 # requestedModel is the lane's IDENTITY as authored in the table: an alias for a claude

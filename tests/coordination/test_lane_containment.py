@@ -296,6 +296,8 @@ def prepare(tree, mode, assignment_failure=False, editing=False, allowed_tools="
     script.write_text(text,encoding="utf-8")
     (root/"lane-provider-refusal.ps1").write_bytes((ROOT/"tools"/"coordination"/"lane-provider-refusal.ps1").read_bytes())
     (root/"lane-no-background.py").write_bytes((ROOT/"tools"/"coordination"/"lane-no-background.py").read_bytes())
+    # THIRD-PARTY-PRODUCER-LANES-1: Invoke-Lane.ps1 dot-sources this sibling right after the lane table (forced companion).
+    (root/"lane-third-party-producer.ps1").write_bytes((ROOT/"tools"/"coordination"/"lane-third-party-producer.ps1").read_bytes())
     (root/"resolve-codex-tier.py").write_bytes((ROOT/"tools"/"coordination"/"resolve-codex-tier.py").read_bytes())
     # HUB-VM-NO-LOCAL-PLAYBACK-1: Invoke-Lane.ps1 dot-sources lane-local-playback-lint.ps1 from its own folder and REFUSES every lane
     # when it is missing (fail closed), so the copy carries the real lint and the real tracked host list. The lint finds the host list

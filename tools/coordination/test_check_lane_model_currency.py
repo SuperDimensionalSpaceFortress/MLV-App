@@ -76,6 +76,34 @@ class ParseModelIdTests(unittest.TestCase):
             self.assertIsNone(check.parse_model_id(value), value)
 
 
+class ThirdPartyProducerReceiptTests(CurrencyFixture):
+    """THIRD-PARTY-PRODUCER-LANES-1: neon/kimi receipts record `resolvedModel: 'pinned, not reported'` (the CLIs
+    report no model id). That is not a currency fact, so it must not turn the hub-tick verdict INCOMPLETE."""
+
+    def producer_receipt(self, lane, engine, hours_ago, state="complete", resolved="pinned, not reported"):
+        self.count += 1
+        run = self.runs / ("run-%03d" % self.count)
+        run.mkdir()
+        body = {"lane": lane, "engine": engine, "state": state, "effort": "high", "startedUtc": _ts(hours_ago),
+                "resolvedModel": resolved, "card": "TEST"}
+        (run / ("%s-001.receipt.json" % lane)).write_text(json.dumps(body), encoding="utf-8")
+
+    def test_trial_producer_lanes_are_not_judged_for_model_currency(self):
+        self.receipt("sonnet", "claude-sonnet-5-5", 2)
+        self.producer_receipt("neon", "antigravity", 1)
+        self.producer_receipt("kimi", "kimicode", 1, state="failed", resolved="unknown")
+        self.producer_receipt("kimi", "kimicode", 0.5, state="reserved", resolved=None)
+        result = self.evaluate()
+        self.assertEqual(result["verdict"], "CURRENT", result)
+        self.assertNotIn("neon", result["lanes"])
+        self.assertNotIn("kimi", result["lanes"])
+
+    def test_the_exemption_is_keyed_on_engine_not_on_the_lane_name(self):
+        # A claude-engine receipt that merely carries the lane name 'neon' is still judged (NO-DATA here).
+        self.receipt("neon", "unknown", 1, state="failed")
+        self.assertEqual(self.evaluate()["lanes"]["neon"]["verdict"], "NO-DATA")
+
+
 class StaleModelTests(CurrencyFixture):
     def test_the_lane_s_own_latest_two_runs_decide_not_the_family_peer(self):
         self.receipt("sol", "gpt-6-sol", 30)

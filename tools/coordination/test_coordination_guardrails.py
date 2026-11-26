@@ -3634,7 +3634,7 @@ def test_astra_lane_row_is_a_read_only_high_effort_codex_judgement_lane():
     # current highest-version slug at launch by Resolve-CodexModelTier, never a pinned slug.
     body = LANE_RUNNER.read_text(encoding="utf-8")
     assert "astra  = @{ engine = 'codex';  tier = 'astra';   effort = 'high'; role = 'tie-breaker-design-arbiter' }" in body
-    assert "ValidateSet('opus', 'sonnet', 'fable', 'sol', 'luna', 'astra', 'terra')" in body
+    assert "ValidateSet('opus', 'sonnet', 'fable', 'sol', 'luna', 'astra', 'terra', 'neon', 'kimi')" in body
 
 
 def test_lanes_table_pins_no_model_id_and_every_effort_is_high():
@@ -3645,7 +3645,7 @@ def test_lanes_table_pins_no_model_id_and_every_effort_is_high():
     body = LANE_RUNNER.read_text(encoding="utf-8")
     lanes_block = body[body.index("$LANES = @{"):body.index("# Absolute launcher paths")]
     lane_lines = [ln for ln in lanes_block.splitlines() if "engine = " in ln]
-    assert len(lane_lines) == 7, "expected seven lane rows (opus, sonnet, fable, sol, luna, astra, terra)"
+    assert len(lane_lines) == 9, "expected nine lane rows (opus, sonnet, fable, sol, luna, astra, terra, neon, kimi)"
     for line in lane_lines:
         assert not re.search(r"model = 'claude-[a-z0-9.-]+'", line), (
             "a claude-engine row pins a versioned model id instead of a floating alias: %s" % line
@@ -3654,7 +3654,8 @@ def test_lanes_table_pins_no_model_id_and_every_effort_is_high():
             "a codex-engine row pins a versioned model slug instead of a tier: %s" % line
         )
         assert "effort = 'high'" in line, "every lane row must resolve to 'high' effort: %s" % line
-        if "engine = 'claude'" in line:
+        if "engine = 'claude'" in line or "engine = 'antigravity'" in line or "engine = 'kimicode'" in line:
+            # THIRD-PARTY-PRODUCER-LANES-1: the producer rows pin a `model` like the claude rows, never a tier.
             assert "model = '" in line and "tier = " not in line
         else:
             assert "tier = '" in line and "model = " not in line
