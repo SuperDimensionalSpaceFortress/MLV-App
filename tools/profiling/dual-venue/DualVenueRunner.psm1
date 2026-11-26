@@ -3374,17 +3374,19 @@ function Get-DvStoredPlaybackFieldProblems {
     }
     foreach ($f in $script:PlaybackComparedFieldsWhenStored) {
         foreach ($n in @($storedNames | Where-Object { [string]::Equals($_, $f, [StringComparison]::OrdinalIgnoreCase) })) {
-            $storedValue = Get-DvProp $Stored $n; $derivedValue = Get-DvProp $Derived $f
-            # r4: a receipt read back with ConvertFrom-Json holds an ISO time as a DateTime, so the begin time is compared as one round-trip UTC text
-            if ($f -ceq 'visualCaptureBeginUtc') { $storedValue = ConvertTo-DvVisualUtcText $storedValue; $derivedValue = ConvertTo-DvVisualUtcText $derivedValue }
-            $same = $(if ($script:PlaybackComparedFieldsExact -ccontains $f -or $f -ceq 'visualCaptureBeginUtc') {
-                          $isInt = { param($x) ($x -is [int]) -or ($x -is [long]) }
-                          if ($null -eq $storedValue -or $null -eq $derivedValue) { $null -eq $storedValue -and $null -eq $derivedValue }
-                          elseif ((& $isInt $storedValue) -and (& $isInt $derivedValue)) { [int64]$storedValue -eq [int64]$derivedValue }
-                          elseif ($storedValue -is [string] -and $derivedValue -is [string]) { [string]::Equals($storedValue, $derivedValue, [StringComparison]::Ordinal) }
-                          else { $false }
-                      } else { Test-DvJsonEquivalent $storedValue $derivedValue })
-            if (-not $same) { $problems.Add("PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive") }
+            if ($script:PlaybackComparedFieldsExact -ccontains $f -or $f -ceq 'visualCaptureBeginUtc') {
+                $storedValue = Get-DvProp $Stored $n; $derivedValue = Get-DvProp $Derived $f
+                # r4: a receipt read back with ConvertFrom-Json holds an ISO time as a DateTime, so the begin time is compared as one round-trip UTC text
+                if ($f -ceq 'visualCaptureBeginUtc') { $storedValue = ConvertTo-DvVisualUtcText $storedValue; $derivedValue = ConvertTo-DvVisualUtcText $derivedValue }
+                $isInt = { param($x) ($x -is [int]) -or ($x -is [long]) }
+                $exactSame = $(if ($null -eq $storedValue -or $null -eq $derivedValue) { $null -eq $storedValue -and $null -eq $derivedValue }
+                               elseif ((& $isInt $storedValue) -and (& $isInt $derivedValue)) { [int64]$storedValue -eq [int64]$derivedValue }
+                               elseif ($storedValue -is [string] -and $derivedValue -is [string]) { [string]::Equals($storedValue, $derivedValue, [StringComparison]::Ordinal) }
+                               else { $false })
+                if (-not $exactSame) { $problems.Add("PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive") }
+                continue
+            }
+            if (-not (Test-DvJsonEquivalent (Get-DvProp $Stored $n) (Get-DvProp $Derived $f))) { $problems.Add("PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive") }
         }
     }
     # one string per problem on the pipeline (callers collect with @(...)); none when the stored block is sound
