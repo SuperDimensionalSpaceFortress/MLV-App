@@ -499,6 +499,8 @@ class GitCallsAreBoundedTests(unittest.TestCase):
         # sol r2 A10: ONE observed membership and ONE termination result; contradictory repeats (SEEN twice, GONE True then GONE False) are not evidence
         self.assertEqual(len(re.findall(r"(?m)^SEEN pid=", out)), 1, f"the cleanup gate reported more than one membership observation: {out}")
         self.assertLessEqual(len(re.findall(r"(?m)^GONE ", out)), 1, f"more than one termination result: {out}")
+        gone = re.search(r"(?m)^GONE ", out)
+        self.assertTrue(gone is None or seen.start() < gone.start(), f"the child must be observed alive BEFORE it is reported gone: {out}")
         self.assertEqual(seen.group(2), "True", f"IsProcessInJob failed (GetLastError={seen.group(3)}), so its membership answer was never given: {out}")
         self.assertIn(seen.group(4), ("True", "False"), f"IsProcessInJob returned no 0/1 membership answer: {out}")
         return seen.group(4), seen.group(5)
@@ -511,7 +513,8 @@ class GitCallsAreBoundedTests(unittest.TestCase):
         self.assertEqual(self.read_child_probe("HITS \r\nSEEN pid=8 ok=True win32=0 injob=False alive=True\r\nGONE True"), ("False", "True"))
         for line in ("SEEN pid=0 ok=True win32=0 injob=False alive=True", "SEEN pid= ok=True win32=0 injob=False alive=True",
                      "UNSEEN pid=8 ok=True win32=0 injob=False alive=True\nGONE True", "SEEN pid=8١ ok=True win32=0 injob=False alive=True", "SEEN pid=8 ok=True win32=0 injob=False alive=True!\r\nGONE Trueish",
-                     "SEEN pid=8 ok=True win32=0 injob=False alive=True\nGONE True\nSEEN pid=8 ok=True win32=0 injob=True alive=True\nGONE False"):
+                     "SEEN pid=8 ok=True win32=0 injob=False alive=True\nGONE True\nSEEN pid=8 ok=True win32=0 injob=True alive=True\nGONE False",
+                     "GONE True\nSEEN pid=8 ok=True win32=0 injob=False alive=True"):
             with self.assertRaises(AssertionError):
                 self.read_child_probe(line)
 

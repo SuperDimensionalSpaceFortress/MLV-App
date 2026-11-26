@@ -2058,7 +2058,12 @@ function Invoke-VenueBoundedProcess {
         $script:VenueBaseline = $null
         try { $script:VenueBaseline = Get-AttrCudaProcessTreeSnapshot -BaselineOnly -OperationTimeoutSec 1 } catch { $script:VenueBaseline = $null }
         $script:VenueBaselineClock = [Diagnostics.Stopwatch]::StartNew()
+    } elseif ($TimeoutSec -lt 5 -and $null -ne $script:VenueBaselineClock -and $script:VenueBaselineClock.Elapsed.TotalSeconds -gt 30) {
+        # sol r2-b A4 on ac0d5b6d: a short grant refreshes nothing, but it never reuses a listing older than 30 s either (none: an unknown tree on a timeout)
+        $script:VenueBaseline = $null; $script:VenueBaselineClock = $null
     }
+    # sol r2-b A2: a listing that returned after the caller's whole allowance starts no child (nothing was started, so nothing is left behind)
+    if ($censusClock.Elapsed.TotalMilliseconds -ge $TimeoutSec * 1000.0) { return [pscustomobject]@{ exit = $null; timedOut = $true; killConfirmed = $true; stdout = ''; stderr = '' } }
     $p = [Diagnostics.Process]::Start($psi)
     $p.StandardInput.Close()
     $outTask = $p.StandardOutput.ReadToEndAsync(); $errTask = $p.StandardError.ReadToEndAsync()
@@ -2073,7 +2078,8 @@ function Invoke-VenueBoundedProcess {
         if ($leadWaitMs -ge 1.0) { $exitedEarly = $p.WaitForExit([int][Math]::Floor($leadWaitMs)) }
         if (-not $exitedEarly) { try { $tree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $p.Id -Baseline $script:VenueBaseline -OperationTimeoutSec 1 } catch { $tree = $null } }
     }
-    $timedOut = -not ($exitedEarly -or $p.WaitForExit([int][Math]::Max(1.0, [Math]::Floor($TimeoutSec * 1000.0 - $censusClock.Elapsed.TotalMilliseconds))))
+    # sol r2-b A2: a root seen exiting only after the call's allowance ran out is not a success: with no time left the run counts as timed out (the kill then reaches an exited root, or its tree)
+    $timedOut = $(if (($TimeoutSec * 1000.0 - $censusClock.Elapsed.TotalMilliseconds) -le 0.0) { $true } else { -not ($exitedEarly -or $p.WaitForExit([int][Math]::Max(1.0, [Math]::Floor($TimeoutSec * 1000.0 - $censusClock.Elapsed.TotalMilliseconds)))) })
     $killErrored = $false
     $treeGone = $true
     $cleanup = [Diagnostics.Stopwatch]::StartNew()

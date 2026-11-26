@@ -5053,7 +5053,8 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
             "$replWait = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys0 + @((Row 700 202 $t.AddSeconds(2)))) }\n"
             "$blind = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys0 + @([pscustomobject]@{ ProcessId = $null; ParentProcessId = $null; CreationDate = $null })) }\n"
             "$empty = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys0) }\n"
-            "[ordered]@{ aMembers = @($a.members | ForEach-Object { $_.processId }); aWait = $aWait.confirmed; aSurvivors = @($aWait.survivors); sOthers = @($s.others.Keys | Sort-Object);\n"
+            "$nullMembers = Wait-AttrCudaProcessTreeGone -Snapshot ([pscustomobject]@{ ok = $true; rootProcessId = 100; rootCreationTicks = 1; members = $null }) -WaitMs 1200 -Scan { @() }\n"
+            "[ordered]@{ nullMembers = $nullMembers.confirmed; aMembers = @($a.members | ForEach-Object { $_.processId }); aWait = $aWait.confirmed; aSurvivors = @($aWait.survivors); sOthers = @($s.others.Keys | Sort-Object);\n"
             "            sameWait = $sameWait.confirmed; replWait = $replWait.confirmed; replSurvivors = @($replWait.survivors); blind = $blind.confirmed; blindWhy = $blind.error; empty = $empty.confirmed } | ConvertTo-Json -Compress")
         self.assertEqual(got["aMembers"], [600], f"a baseline look-alike under the root is a member: {got}")
         self.assertFalse(got["aWait"], got)
@@ -5065,6 +5066,13 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         self.assertFalse(got["blind"], got)
         self.assertIn("descendant-unreadable", str(got["blindWhy"]), got)
         self.assertTrue(got["empty"], got)
+        self.assertFalse(got["nullMembers"], f"a members field that is null is an unknown tree (sol r2-b A7): {got}")
+        venue = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
+        body = venue[venue.index("function Invoke-VenueBoundedProcess"):venue.index("function Get-VenueDriverScriptMissing")]
+        # sol r2-b A4: a short grant never reuses a listing older than 30 s; A2: a listing past the whole allowance starts no child, and a root seen exiting after the allowance is a timeout
+        self.assertIn("} elseif ($TimeoutSec -lt 5 -and $null -ne $script:VenueBaselineClock -and $script:VenueBaselineClock.Elapsed.TotalSeconds -gt 30) {", body)
+        self.assertLess(body.index("if ($censusClock.Elapsed.TotalMilliseconds -ge $TimeoutSec * 1000.0) { return"), body.index("[Diagnostics.Process]::Start($psi)"))
+        self.assertIn("$timedOut = $(if (($TimeoutSec * 1000.0 - $censusClock.Elapsed.TotalMilliseconds) -le 0.0) { $true } else {", body)
 
     def test_r2_sol_a3_a4_the_tree_is_recorded_before_the_bound_so_the_kill_is_at_the_bound(self) -> None:
         """sol r2 A3 on b428e461: a call granted 5 s or more records the tree one lead (2 s) BEFORE the bound, so the kill is not held behind a slow scan; a call granted less records it

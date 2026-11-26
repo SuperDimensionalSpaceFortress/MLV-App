@@ -5220,7 +5220,8 @@ function Wait-AttrCudaProcessTreeGone {
     try {
         $recorded[[int64]$Snapshot.rootProcessId] = [int64]$Snapshot.rootCreationTicks
         # r2b (sol r2 A6): a snapshot with no members field is an unknown tree, not an empty one
-        if ($null -eq $snapProps['members']) { throw [System.InvalidOperationException]::new('snapshot members missing') }
+        # sol r2-b A7: a members field that is present but $null is as unknown as a missing one
+        if ($null -eq $snapProps['members'] -or $null -eq $snapProps['members'].Value) { throw [System.InvalidOperationException]::new('snapshot members missing') }
         foreach ($m in @($(if ($null -ne $snapProps['members']) { $snapProps['members'].Value } else { @() }))) { $recorded[[int64]$m.processId] = $(if ($null -eq $m.creationTicks) { $null } else { [int64]$m.creationTicks }) }
         # r3 fix 2 (adversary A1 on 6b788356): the outsiders the snapshot saw (pid -> creation ticks). A snapshot without them knows no outsider: every orphan is unproven.
         $othersRaw = $(if ($null -ne $snapProps['others']) { $snapProps['others'].Value } else { $null })
