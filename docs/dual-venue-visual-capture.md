@@ -83,7 +83,7 @@ Numbers are computed from the VIDEO VIEWPORT only -- the window's timecode and f
   the judged unforced frames carry two or more display frame numbers, and never beside `NOT_A_MOTION_WITNESS`: over one held display
   frame the hold, not a force-paint, explains the one unforced picture (UNPACED-VISUAL-MIDPLAY-CAPTURE-1 r2). It also needs the judged
   frames' own source ids to be KNOWN to differ (`sourceDifference` `known-differ`): over identical or unknown source frames one picture
-  may be the source's own. The visual `reason` is one line: control characters and U+2028 / U+2029 are written as `\uXXXX`. (r5:
+  may be the source's own. The visual `reason` is one line: everything outside printable ASCII (control characters, U+2028 / U+2029, and characters a legacy code page best-fits to CR / LF, such as U+25D9) is written as `\uXXXX`; the same rule prints `DVE_DETAIL`. `Get-DvVisualVerdict` never quotes a count that cannot be true for the judged frames (a distinct-picture count outside 1..PlayFrames, a repeat count over PlayFrames, ...): the verdict is unchanged and the reason leaves the number out. (r5:
   no forced-k vs unforced-k pairing is reported; under the r3 order such a pair compares two moments half a tail apart.)
 * `observerPaintedPlayFrames`: unforced play captures not judged because they record another `forced_paints_before` than the
   first (or none: an r2 build); `stopUnboundObserverClean`: whether `stop-unbound.png` also follows them with no forced paint;

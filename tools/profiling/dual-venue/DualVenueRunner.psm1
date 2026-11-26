@@ -3964,7 +3964,10 @@ function ConvertTo-DvOneLineText($Value) {
     # (Zl U+2028, Zp U+2029) is written as \uXXXX, so nothing a detail quotes can split the line into a second record, for a CR/LF reader or for
     # Python's splitlines. $null stays $null.
     if ($null -eq $Value) { return $null }
-    [regex]::Replace([string]$Value, '[\p{Cc}\p{Zl}\p{Zp}]', { param($m) '\u{0:X4}' -f [int][char]$m.Value })
+    # R3-KEY-RESIDUE-1 (fable r3 B1): by category (Cc/Zl/Zp) was not enough -- a printable character the leg's console code page best-fits to a CR or LF
+    # (cp437: U+25D9 -> 0x0A, U+266A -> 0x0D) still forged a second record. So everything outside printable ASCII is written as \uXXXX (UTF-16 unit by
+    # unit); the receipt keeps the raw text.
+    [regex]::Replace([string]$Value, '[^\x20-\x7E]', { param($m) '\u{0:X4}' -f [int][char]$m.Value })
 }
 
 function ConvertTo-DvVisualUtcText($Value) {
@@ -4337,9 +4340,11 @@ function Get-DvVisualVerdict {
           $ExposureMedianLuma = $null, $ExposureMedianNearBlackFraction = $null, $ExposureMedianClippedFraction = $null, $ExposureBand = $null, [string]$ExposureBandSource = '',
           $SoleDisplayFrame = $null, $LabelledPlayFrames = $null)
     if (-not $Requested) { return [pscustomobject]@{ verdict = 'NOT_REQUESTED'; counted = $true; reason = 'the leg spec opts out of window captures' } }
-    if ($ViewportUnavailablePlayFrames -gt 0 -and $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'VISUAL_ASSESSMENT_UNAVAILABLE'; counted = $true; reason = "$ViewportUnavailablePlayFrames play frame(s) have no usable viewport rectangle (visual.json), leaving $PlayFrames judged, so the picture cannot be told from the window's timecode and chrome: no visual assessment" } }
-    if ($ObserverPaintedPlayFrames -gt 0 -and $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'VISUAL_ASSESSMENT_UNAVAILABLE'; counted = $true; reason = "$ObserverPaintedPlayFrames unforced play frame(s) were taken after a forced paint their predecessor did not see, or do not record how many forced paints preceded them (forced_paints_before), leaving $PlayFrames judged: a forced paint stays on screen when the display's own paint is stuck, so those pictures cannot tell a moving display from a frozen one: no visual assessment" } }
-    if (-not $Captured -or $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'NOT_CAPTURED'; counted = $true; reason = "only $PlayFrames play frame(s) were captured" } }
+    # R3-KEY-RESIDUE-1: a negative judged-frame count cannot be true, so it is worded as unknown, never quoted (the verdicts below are unchanged)
+    $playText = $(if ($PlayFrames -ge 0) { "$PlayFrames" } else { 'an unknown number of' })
+    if ($ViewportUnavailablePlayFrames -gt 0 -and $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'VISUAL_ASSESSMENT_UNAVAILABLE'; counted = $true; reason = "$ViewportUnavailablePlayFrames play frame(s) have no usable viewport rectangle (visual.json), leaving $playText judged, so the picture cannot be told from the window's timecode and chrome: no visual assessment" } }
+    if ($ObserverPaintedPlayFrames -gt 0 -and $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'VISUAL_ASSESSMENT_UNAVAILABLE'; counted = $true; reason = "$ObserverPaintedPlayFrames unforced play frame(s) were taken after a forced paint their predecessor did not see, or do not record how many forced paints preceded them (forced_paints_before), leaving $playText judged: a forced paint stays on screen when the display's own paint is stuck, so those pictures cannot tell a moving display from a frozen one: no visual assessment" } }
+    if (-not $Captured -or $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'NOT_CAPTURED'; counted = $true; reason = "only $playText play frame(s) were captured" } }
     if ($FlatPlayFrames -ge $PlayFrames) { return [pscustomobject]@{ verdict = 'CAPTURE_BLANK'; counted = $true; reason = 'every play frame''s viewport is flat: the capture shows no picture, so it judges nothing' } }
     # UNPACED-VISUAL-MIDPLAY-CAPTURE-1: one display frame number (or none) across the judged play frames witnesses no motion, whatever the pictures show.
     # r1 adversary A1: the reason says only what the JUDGED frames establish -- how many carry a frame number (-LabelledPlayFrames, when the caller
@@ -4350,25 +4355,32 @@ function Get-DvVisualVerdict {
     # r2 (r1 adversary pass 3 A2): every branch speaks of the label NUMBER only, never of a timeline position: visual.json carries no clip token, so
     # clip A frame 479 and clip B frame 479 are one number and two positions. r2 (pass 3 A3): a count that contradicts -AppDistinctDisplayFrames (no
     # labelled frame while one display frame is declared) is not known either, so a caller-supplied tuple cannot make the reason say "0 of".
+    # R3-KEY-RESIDUE-1 (sol r3 blocker, opus VISUAL-GATE-DISTINCT-HASHES-RANGE-1): the CONTRACT is "omit": a count that cannot be true for the judged set
+    # (a distinct-picture count outside 1..PlayFrames, a distinct-display-frame count outside 0..PlayFrames, a repeat count over PlayFrames) is never quoted
+    # as observed evidence. The verdict is whatever it was (production derives every count from the judged set, so none of these fires there); only the
+    # reason drops the number, in words that state no more than the verdict's own condition.
     if ($AppDistinctDisplayFrames -lt 2) {
         $sole = Get-DvFrameNumber $SoleDisplayFrame
         $labelled = Get-DvFrameNumber $LabelledPlayFrames
         if ($null -ne $labelled -and ($labelled -gt $PlayFrames -or $labelled -lt 1)) { $labelled = $null }
         $numberText = $(if ($null -ne $sole) { "display frame number $sole" } else { 'one display frame number' })
-        $position = $(if ($AppDistinctDisplayFrames -le 0) { "none of the $PlayFrames judged play frames carries a valid display frame number" }
+        $pictureText = $(if ($DistinctContentHashes -ge 1 -and $DistinctContentHashes -le $PlayFrames) { " ($DistinctContentHashes distinct picture(s) among them)" } else { '' })
+        $position = $(if ($AppDistinctDisplayFrames -lt 0) { "the $PlayFrames judged play frames do not establish two distinct display frame numbers" }
+                      elseif ($AppDistinctDisplayFrames -eq 0) { "none of the $PlayFrames judged play frames carries a valid display frame number" }
                       elseif ($null -eq $labelled) { "the valid display frame numbers among the $PlayFrames judged play frames are all ${numberText}: one display frame number across them at most" }
                       elseif ($labelled -lt $PlayFrames) { "$labelled of the $PlayFrames judged play frames carry $numberText and the other $($PlayFrames - $labelled) carry no valid display frame number: one display frame number across them at most" }
                       else { "all $PlayFrames judged play frames carry ${numberText}: one display frame number across them" })
-        return [pscustomobject]@{ verdict = 'NOT_A_MOTION_WITNESS'; counted = $true; reason = "${position} ($DistinctContentHashes distinct picture(s) among them), so they cannot witness motion during playback (one known cause: an unpaced Play holds its last required frame through the capture tail)" }
+        return [pscustomobject]@{ verdict = 'NOT_A_MOTION_WITNESS'; counted = $true; reason = "${position}${pictureText}, so they cannot witness motion during playback (one known cause: an unpaced Play holds its last required frame through the capture tail)" }
     }
+    $appFramesText = $(if ($AppDistinctDisplayFrames -le $PlayFrames) { "$AppDistinctDisplayFrames distinct frames" } else { 'more than one distinct frame' })
     if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-differ') {
-        return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY'; counted = $false; reason = "the $PlayFrames play frames show ONE picture while the app presented $AppDistinctDisplayFrames distinct frames across them and the source frames are known to differ" }
+        return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY'; counted = $false; reason = "the $PlayFrames play frames show ONE picture while the app presented $appFramesText across them and the source frames are known to differ" }
     }
     if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'unknown') {
-        return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY_SUSPECTED'; counted = $true; reason = "the $PlayFrames play frames show ONE picture while the app presented $AppDistinctDisplayFrames distinct frames across them, but nothing records whether the source frames differ (a static clip shows one picture legitimately): suspected, not excluded" }
+        return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY_SUSPECTED'; counted = $true; reason = "the $PlayFrames play frames show ONE picture while the app presented $appFramesText across them, but nothing records whether the source frames differ (a static clip shows one picture legitimately): suspected, not excluded" }
     }
     if ($RepeatedPlayFrames -ge 2 -and $SourceDifference -ceq 'known-differ') {
-        return [pscustomobject]@{ verdict = 'PARTIAL_FREEZE'; counted = $true; reason = "$RepeatedPlayFrames of the $PlayFrames judged play frames repeat the picture before them while the app's label advanced and the source frames are known to differ: the display's own paint stopped landing for part of the tail" }
+        return [pscustomobject]@{ verdict = 'PARTIAL_FREEZE'; counted = $true; reason = "$(if ($RepeatedPlayFrames -le $PlayFrames) { "$RepeatedPlayFrames" } else { 'two or more' }) of the $PlayFrames judged play frames repeat the picture before them while the app's label advanced and the source frames are known to differ: the display's own paint stopped landing for part of the tail" }
     }
     if (($null -ne $LabelBound -or $null -ne $PausedLabelBound) -and -not ($LabelBound -eq $true -and $PausedLabelBound -eq $true)) {
         $unbound = @(if ($LabelBound -ne $true) { "the paused-instant capture (label_bound $(if ($null -eq $LabelBound) { 'missing' } else { 'false' }))" }

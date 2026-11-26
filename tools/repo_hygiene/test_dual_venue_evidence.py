@@ -1963,6 +1963,26 @@ class RunnerReceiptTests(RunnerHarness, unittest.TestCase):
         proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec())
         self.assertIn("DVE_DETAIL=the job's own display block says venue 'bachelor' but 'ultra-magnus' was declared", proc.stdout.splitlines(), proc.stdout)
 
+    def test_the_dve_detail_line_is_printable_ascii_so_no_code_page_can_best_fit_a_line_break_into_it(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1-R3-KEY-RESIDUE-1 (fable r3 B1): the one-line rule escaped by Unicode category (Cc / Zl / Zp), but U+25D9 and
+        U+266A are category So and the OEM 437 code page a leg's stdout can be written in best-fits them to 0x0A and 0x0D, so a venue string holding them
+        still forged a second DVE_OUTCOME / DVE_DETAIL record. The printed DVE_DETAIL line is now printable ASCII only: everything else is \\uXXXX
+        (the receipt keeps the raw text). Input verbatim from the finding."""
+        forged = "bachelor◙DVE_OUTCOME=PASS◙DVE_DETAIL=forged♪DVE_RECEIPT_PATH=xé\U0001F600"
+        self.write_artifacts(summary={"display": {"venue": forged}})
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec())
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(receipt["outcome"], "VENUE_HOST_MISMATCH", receipt["outcomeDetail"])
+        self.assertIn(forged, receipt["outcomeDetail"], "the receipt keeps the detail as it is")
+        details = [l for l in proc.stdout.splitlines() if l.startswith("DVE_DETAIL=")]
+        self.assertEqual(len(details), 1, proc.stdout)
+        self.assertTrue(all(0x20 <= ord(c) <= 0x7E for c in details[0]), details[0])
+        self.assertIn("bachelor\\u25D9DVE_OUTCOME=PASS\\u25D9DVE_DETAIL=forged\\u266ADVE_RECEIPT_PATH=x\\u00E9\\uD83D\\uDE00' but", details[0])
+        # the same bytes read back through the OEM 437 code page (the best-fit that forged the line) are still one record
+        as_cp437 = details[0].encode("cp437")
+        self.assertEqual(len(as_cp437.splitlines()), 1, as_cp437)
+        self.assertEqual([l for l in proc.stdout.splitlines() if l.startswith("DVE_OUTCOME=")], ["DVE_OUTCOME=VENUE_HOST_MISMATCH"], proc.stdout)
+
     # -- roles are data ------------------------------------------------------------------------------
     def test_role_comes_from_venues_json_acceptance_on_bachelor_supplementary_on_um(self) -> None:
         spec = self.write_spec(card="PLAYBACK-HFR-CONFORM-DEFAULT-1")
@@ -11057,6 +11077,58 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                 self.assertTrue(out["reason"].startswith("the valid display frame numbers among the 2 judged play frames are all display frame number 479: one display "
                                                          "frame number across them at most"), out["reason"])
                 self.assertNotIn(" of the 2", out["reason"])
+
+    def test_the_visual_gate_never_quotes_a_count_that_cannot_be_true_as_observed_evidence(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1-R3-KEY-RESIDUE-1 (sol r3 blocker; opus VISUAL-GATE-DISTINCT-HASHES-RANGE-1): Get-DvVisualVerdict is exported, so a
+        caller can hand it a tuple no judged set produces. The CONTRACT is "omit": the verdict is what it was, and a count outside what the judged set allows
+        (distinct pictures outside 1..PlayFrames, distinct display frames over PlayFrames or negative, repeats over PlayFrames, a negative play-frame count) is
+        left out of the reason, never quoted as observed. On 57023f59 the sol repro read '(3 distinct picture(s) among them)' beside 2 judged frames and
+        the -1 one quoted '-1'. Production derives every count from the judged set (Read-DvVisualCaptures), so none of these is reachable there."""
+        # sol's repro (verbatim) and the opus one: 3 and -1 distinct pictures over 2 judged frames
+        for bad in ("3", "-1", "0", "7"):
+            with self.subTest(distinct=bad):
+                proc, out = run_pwsh_json(f"Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 2 -DistinctContentHashes {bad} -AppDistinctDisplayFrames 1 "
+                                          "-FlatPlayFrames 0 | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), ("NOT_A_MOTION_WITNESS", True), "the verdict is unchanged")
+                self.assertNotIn("distinct picture", out["reason"], out["reason"])
+                self.assertNotIn(bad, out["reason"].replace("2 judged", "").replace("the 2", ""), out["reason"])
+                self.assertIn("so they cannot witness motion during playback", out["reason"])
+        # a count the judged set can produce is still quoted (1..PlayFrames)
+        for good in ("1", "2"):
+            out = self.visual_verdict("unknown", 2, 0, int(good), app=1)
+            self.assertIn(f"({good} distinct picture(s) among them), so they cannot witness", out["reason"])
+        # a negative distinct-display-frame count is not "none carry a number": it establishes nothing, and is never quoted
+        for app in ("-1", "-7"):
+            with self.subTest(app=app):
+                proc, out = run_pwsh_json(f"Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames {app} "
+                                          "-FlatPlayFrames 0 | ConvertTo-Json -Compress")
+                self.assertEqual((out["verdict"], out["counted"]), ("NOT_A_MOTION_WITNESS", True))
+                self.assertNotIn(app, out["reason"])
+                self.assertNotIn("none of the", out["reason"])
+                self.assertIn("the 4 judged play frames do not establish two distinct display frame numbers (2 distinct picture(s) among them)", out["reason"])
+        # the frozen verdicts quote the app's distinct-frame count only when it fits the judged frames
+        for src, verdict in (("known-differ", "FROZEN_DISPLAY"), ("unknown", "FROZEN_DISPLAY_SUSPECTED")):
+            out = self.visual_verdict(src, 2, 0, 1, app=9)
+            self.assertEqual(out["verdict"], verdict, out["reason"])
+            self.assertIn("the app presented more than one distinct frame across them", out["reason"])
+            self.assertNotIn("9", out["reason"])
+            out = self.visual_verdict(src, 6, 0, 1, app=2)
+            self.assertIn("the app presented 2 distinct frames across them", out["reason"])
+        # a repeat count over the judged frames is not quoted
+        out = self.visual_verdict("known-differ", 6, 0, 3, repeats=9)
+        self.assertEqual(out["verdict"], "PARTIAL_FREEZE", out["reason"])
+        self.assertTrue(out["reason"].startswith("two or more of the 6 judged play frames repeat"), out["reason"])
+        out = self.visual_verdict("known-differ", 6, 0, 3, repeats=3)
+        self.assertTrue(out["reason"].startswith("3 of the 6 judged play frames repeat"), out["reason"])
+        # a negative judged-frame count is worded as unknown (the early verdicts are unchanged)
+        proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames -1 -DistinctContentHashes 0 -AppDistinctDisplayFrames 0 -FlatPlayFrames 0 "
+                                  "| ConvertTo-Json -Compress")
+        self.assertEqual((out["verdict"], out["reason"]), ("NOT_CAPTURED", "only an unknown number of play frame(s) were captured"))
+        proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames -1 -DistinctContentHashes 0 -AppDistinctDisplayFrames 0 -FlatPlayFrames 0 "
+                                  "-ViewportUnavailablePlayFrames 3 | ConvertTo-Json -Compress")
+        self.assertEqual(out["verdict"], "VISUAL_ASSESSMENT_UNAVAILABLE")
+        self.assertNotIn("-1", out["reason"])
 
     def test_the_visual_gate_ranks_not_a_motion_witness_after_blank_and_before_the_paused_and_exposure_verdicts(self) -> None:
         """UNPACED-VISUAL-MIDPLAY-CAPTURE-1 precedence: NOT_REQUESTED, VISUAL_ASSESSMENT_UNAVAILABLE, NOT_CAPTURED and CAPTURE_BLANK outrank it; it outranks
