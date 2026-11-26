@@ -1705,7 +1705,9 @@ function Get-SpecPathJudgedConflict([hashtable]$Seen, [string]$Path) {
     $Seen[$Path] = $now
     ''
 }
-$specJudgedOnce = @{}
+# R3-MERGE-CI-RESIDUE-1 r2: ORDINAL, as #903's SpecBudgetSha256 / SpecShapeSha256 are (r3 A2: A.json and a.json are two files of a case-sensitive directory). `@{}` is case-INSENSITIVE, so a case twin
+# (S.JSON / s.json) or two distinct files read as one path judged twice and were refused here, ahead of the key and per-entry refusals #903 owns for them.
+$specJudgedOnce = [Collections.Hashtable]::new([StringComparer]::Ordinal)
 
 # The planned legs: name, spec path, backend ('' = whatever the spec lists). Same naming as Invoke-VenueChain.
 $plan = [System.Collections.Generic.List[object]]::new()
@@ -1855,8 +1857,8 @@ if ($legPlanMode) {
         if ($entryBoundSha -cne [string]$e.specSha256) {
             Stop-Usage "SPEC_CHANGED_AFTER_PREFLIGHT '$($e.specPath)' cannot be run: the leg spec read as sha256 $entryBoundSha after the leg-set planner judged sha256 $($e.specSha256) (planned_sha256=$($e.specSha256)); no claim or lease is taken on bytes the planner did not judge"
         }
-        $judgedConflict = Get-SpecPathJudgedConflict $specJudgedOnce ([string]$e.specPath)   # r6 (adversary A7 sibling): one judged digest per spec path (after the planner comparison above, which names planner-changed bytes first)
-        if ($judgedConflict) { Stop-Usage "SPEC_CHANGED_BETWEEN_PLAN_ITEMS $judgedConflict" }
+        # R3-MERGE-CI-RESIDUE-1 r2: no judged-once call here. A set naming one path twice whose bytes changed between the preflights is refused by #903's per-entry loop below (SPEC_CHANGED_AFTER_PREFLIGHT,
+        # before any claim, in every form); the A7 rule above is the -LegPlan arm read's own (it records an arm per item), and answering first here named the wrong code.
         $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend; specSha256 = [string]$e.specSha256 })
     }
 } else {
@@ -1874,8 +1876,8 @@ if ($legPlanMode) {
         if ($shapeRefusal) { Stop-Usage "LEG_SPEC_INVALID '$path' cannot be run: $shapeRefusal" }
         $budgetRefusal = Get-ExportBudgetRefusal $path   # r8 (adversary r7 A3): before any claim or lease, as -LegPlan does
         if ($budgetRefusal[0]) { Stop-Usage "$($budgetRefusal[0]) $($budgetRefusal[1])" }
-        $judgedConflict = Get-SpecPathJudgedConflict $specJudgedOnce $path   # r6 (adversary A7 sibling): one judged digest per spec path
-        if ($judgedConflict) { Stop-Usage "SPEC_CHANGED_BETWEEN_PLAN_ITEMS $judgedConflict" }
+        # R3-MERGE-CI-RESIDUE-1 r2: no judged-once call here either (see the -LegSet loop): #903's per-entry loop below refuses a -LegSpec path named twice, or one file under two spellings, whose
+        # bytes changed between the preflights (SPEC_CHANGED_AFTER_PREFLIGHT, or SPEC_KEY_UNRESOLVED when a key lookup got no answer), before any claim.
         $legId = Get-LegSpecId $path
         $judgedSha = [string]$script:SpecBudgetSha256[(Get-SpecDigestKey $path)]   # r2 (adversary A1 class): THIS entry's judged bytes
         for ($r = 1; $r -le $Repeats; $r++) {
