@@ -385,6 +385,23 @@ function Get-FpsCompareBindingProblem {
             return "the compare's presentedFps $($side[0]) is $compared but the judged $($side[0]) leg measured $own"
         }
     }
+    # R2-RESIDUE-1 r2 (luna r1b A1): the published delta and deltaPercent must follow from the two bound endpoints. Both legs at 40 fps with delta 40 / deltaPercent 100 bound on the endpoints alone
+    # and published a gain that no leg measured. The producer (run-release-cuda-playback-ab.ps1 New-MetricDelta) rounds delta to 6 places and deltaPercent to 3, so those are the tolerances.
+    # A present delta or deltaPercent that is not a finite number is refused; an absent one is left to the reader's own null check.
+    $base = [double](& $leaf $metric "baseline")
+    $cand = [double](& $leaf $metric "candidate")
+    if ($base -le 0.0) { return "the compare's presentedFps baseline is $base, not above zero, so no delta or deltaPercent can follow from it" }
+    $publishedDelta = & $leaf $metric "delta"
+    if ($null -ne $publishedDelta) {
+        if (-not (& $isNumber $publishedDelta)) { return "the compare's presentedFps delta is not a finite number" }
+        if ([Math]::Abs([double]$publishedDelta - ($cand - $base)) -gt 0.000002) { return "the compare's presentedFps delta is $publishedDelta but candidate $cand minus baseline $base is $($cand - $base)" }
+    }
+    $publishedPercent = & $leaf $metric "deltaPercent"
+    if ($null -ne $publishedPercent) {
+        if (-not (& $isNumber $publishedPercent)) { return "the compare's presentedFps deltaPercent is not a finite number" }
+        $expectedPercent = 100.0 * ($cand - $base) / $base
+        if ([Math]::Abs([double]$publishedPercent - $expectedPercent) -gt 0.0011) { return "the compare's presentedFps deltaPercent is $publishedPercent but 100 * (candidate $cand - baseline $base) / baseline is $expectedPercent" }
+    }
     $null
 }
 

@@ -1287,7 +1287,7 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
         self.assertRegex(source, r"-not \$playbackAbHostLoadProvisional -and\s+-not \$playbackAbFpsArmRefusal\.refused -and")
 
     def run_summarizer_block(self, baseline_arm: str, candidate_arm: str, analysis: str = "$null", candidate_extra: str = "", bare_candidate: bool = False, stale_failures: bool = False,
-                             candidate_fps: str = "49") -> list[str]:
+                             candidate_fps: str = "49", baseline_fps: str = "50", presented_compare: str = "baseline = 50; candidate = 49; delta = -1; deltaPercent = -2") -> list[str]:
         # stale_failures: what the proof-failure loop (before this block) copied from a packet written before the gate: the wrapper's own fps-regression string, and one unrelated failure
         stale_injection = ""
         if stale_failures:
@@ -1308,9 +1308,9 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
             "$ErrorActionPreference = 'Stop'\n" f"Import-Module '{MODULE}' -Force\n" + funcs +
             "\n$playbackAbComparisonBasis = 'candidate'\n"
             # R2-RESIDUE-1 r1 (adversary 698fffb1 A7): each leg records the presented fps the compare below was measured from (50 and 49), so the compare is bound to the pair the gate judged
-            f"$playbackAb = [pscustomobject]@{{ analysis = {analysis}; baseline = [pscustomobject]@{{ {_light_word(baseline_arm)}presentedFps = 50; hostLoadProvisional = $false; hostLoadState = 'quiet' }}; "
+            f"$playbackAb = [pscustomobject]@{{ analysis = {analysis}; baseline = [pscustomobject]@{{ {_light_word(baseline_arm)}presentedFps = {baseline_fps}; hostLoadProvisional = $false; hostLoadState = 'quiet' }}; "
             f"candidate = [pscustomobject]@{{ {candidate_word}{candidate_extra}presentedFps = {candidate_fps}; hostLoadProvisional = $false; hostLoadState = 'quiet' }} }}\n"
-            "$playbackAbSpeedCompare = [pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 50; candidate = 49; delta = -1; deltaPercent = -2 }; "
+            f"$playbackAbSpeedCompare = [pscustomobject]@{{ presentedFps = [pscustomobject]@{{ {presented_compare} }}; "
             "guiStatusFps = [pscustomobject]@{ baseline = 50; candidate = 49; delta = -1; deltaPercent = -2 }; "
             "avgPresentIntervalMs = [pscustomobject]@{ baseline = 20; candidate = 21; delta = 1; deltaPercent = 5 }; "
             "avgRenderTotalMs = [pscustomobject]@{ baseline = 10; candidate = 11; delta = 1; deltaPercent = 10 } }\n"
@@ -1334,6 +1334,23 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
         control = "\n".join(self.run_summarizer_block("LIGHT", "LIGHT", candidate_fps="49"))
         self.assertNotIn("compare-not-judged-pair", control)
         self.assertIn("presented FPS: CPU", control, "control: the compare was measured on the judged pair")
+
+    def test_r2_residue_r2_luna_r1b_a1_the_published_delta_must_follow_from_the_bound_endpoints(self) -> None:
+        # luna r1b A1 (input verbatim): both legs presentedFps=40, compare {baseline:40, candidate:40, delta:40, deltaPercent:100}. The endpoints bind, so da6248b1 published a +100 % gain no leg measured.
+        for label, compare in (
+                ("adversary", "baseline = 40; candidate = 40; delta = 40; deltaPercent = 100"),
+                ("percent-only", "baseline = 40; candidate = 40; delta = 0; deltaPercent = 100"),
+                ("delta-only", "baseline = 40; candidate = 40; delta = 40; deltaPercent = 0"),
+                ("delta-not-finite", "baseline = 40; candidate = 40; delta = [double]::NaN; deltaPercent = 0"),
+                ("zero-baseline", "baseline = 0; candidate = 0; delta = 0; deltaPercent = 0")):
+            text = "\n".join(self.run_summarizer_block("LIGHT", "LIGHT", candidate_fps=compare.split("candidate = ")[1].split(";")[0], baseline_fps=compare.split("baseline = ")[1].split(";")[0], presented_compare=compare))
+            self.assertIn("fps-verdict-refused:compare-not-judged-pair", text, label)
+            self.assertNotIn("presented FPS: CPU", text, label)
+        # control: the producer's own rounding (delta to 6 places, deltaPercent to 3) is not a refusal
+        control = "\n".join(self.run_summarizer_block("LIGHT", "LIGHT", candidate_fps="47.123457", baseline_fps="40",
+                                                      presented_compare="baseline = 40; candidate = 47.123457; delta = 7.123457; deltaPercent = 17.809"))
+        self.assertNotIn("compare-not-judged-pair", control)
+        self.assertIn("presented FPS: CPU", control)
 
     def test_heavy_ab_gets_a_refusal_diagnostic_and_no_fps_delta_lines(self) -> None:
         text = "\n".join(self.run_summarizer_block("HEAVY", "HEAVY"))
@@ -2644,6 +2661,37 @@ class EnvelopePreemptR1ResidueTests(_Probe):
             "foreach ($fps in 60, 40) { $r = [pscustomobject]@{ baseline = (& $leg 50); candidate = (& $leg $fps); candidateSpeed = (& $leg $fps); speedCompare = $cmp }; "
             "$v = Get-PlaybackAbFpsArmRefusal -Record $r; Write-Host ('SPEED' + $fps + '=' + $v.refused + '|' + $v.reason) }\n")
         self.assertEqual(self.ok(body).split(), ["SPEED60=False|", "SPEED40=True|fps-verdict-refused:compare-not-judged-pair"])
+
+    def test_r2_residue_r2_luna_r1b_a1_compare_machine_perf_refuses_a_delta_the_endpoints_do_not_give(self) -> None:
+        # luna r1b A1, sibling reader: both legs 40 fps, published delta 40 / deltaPercent 100 (a gain no leg measured)
+        funcs = _extract_functions(COMPARE_MACHINE_PERF_SCRIPT, ["Get-PlaybackAbFpsArmRefusal"])
+        body = funcs + (
+            "$leg = { param($fps) [pscustomobject]@{ telemetryArm = 'LIGHT'; " + RECORDED_LIGHT_LAUNCH + "; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' }; legType = 'speed'; presentedFps = $fps; hostLoadProvisional = $false; hostLoadState = 'quiet' } }\n"
+            "$cases = [ordered]@{ adversary = @(40, 40, 40, 100); percent = @(40, 40, 0, 100); delta = @(40, 40, 40, 0); zero = @(0, 0, 0, 0); honest = @(40, 40, 0, 0); gain = @(40, 50, 10, 25) }\n"
+            "foreach ($k in $cases.Keys) { $c = $cases[$k]; $cmp = [pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = $c[0]; candidate = $c[1]; delta = $c[2]; deltaPercent = $c[3] } }\n"
+            "$r = [pscustomobject]@{ baseline = (& $leg $c[0]); candidate = (& $leg $c[1]); candidateSpeed = (& $leg $c[1]); speedCompare = $cmp }\n"
+            "$v = Get-PlaybackAbFpsArmRefusal -Record $r; Write-Host ($k + '=' + $v.refused + '|' + $v.reason) }\n")
+        refused = "fps-verdict-refused:compare-not-judged-pair"
+        self.assertEqual(self.ok(body).split(), [f"adversary=True|{refused}", f"percent=True|{refused}", f"delta=True|{refused}", f"zero=True|{refused}", "honest=False|", "gain=False|"])
+
+    def test_r2_residue_r2_luna_r1b_a1_the_shared_binding_check_follows_delta_and_percent(self) -> None:
+        # the module function the two readers share, fed the adversary's input and the producer's own rounding; a value that is present and not a finite number is refused, an absent one is not this check's business
+        body = (
+            "function T($b, $c, $m) { $leg = { param($f) [pscustomobject]@{ presentedFps = $f } }; $p = Get-FpsCompareBindingProblem -Compare ([pscustomobject]@{ presentedFps = [pscustomobject]$m }) -Baseline (& $leg $b) -Candidate (& $leg $c); if ($null -eq $p) { 'OK' } else { 'REFUSED' } }\n"
+            "Write-Host ('adversary=' + (T 40 40 @{ baseline = 40; candidate = 40; delta = 40; deltaPercent = 100 }))\n"
+            "Write-Host ('rounded=' + (T 40 47.123457 @{ baseline = 40; candidate = 47.123457; delta = 7.123457; deltaPercent = 17.809 }))\n"
+            "Write-Host ('exact=' + (T 50 49 @{ baseline = 50; candidate = 49; delta = -1; deltaPercent = -2 }))\n"
+            "Write-Host ('percent-only=' + (T 10 20 @{ baseline = 10; candidate = 20; deltaPercent = 100 }))\n"
+            "Write-Host ('wrong-percent-only=' + (T 10 20 @{ baseline = 10; candidate = 20; deltaPercent = 50 }))\n"
+            "Write-Host ('wrong-delta-only=' + (T 10 20 @{ baseline = 10; candidate = 20; delta = 5 }))\n"
+            "Write-Host ('inf-delta=' + (T 10 20 @{ baseline = 10; candidate = 20; delta = [double]::PositiveInfinity; deltaPercent = 100 }))\n"
+            "Write-Host ('text-percent=' + (T 10 20 @{ baseline = 10; candidate = 20; delta = 10; deltaPercent = 'x' }))\n"
+            "Write-Host ('zero-baseline=' + (T 0 5 @{ baseline = 0; candidate = 5; delta = 5; deltaPercent = 100 }))\n"
+            "Write-Host ('negative-baseline=' + (T -5 5 @{ baseline = -5; candidate = 5; delta = 10; deltaPercent = -200 }))\n"
+        )
+        got = dict(line.split("=", 1) for line in self.ok(body).split())
+        self.assertEqual(got, {"adversary": "REFUSED", "rounded": "OK", "exact": "OK", "percent-only": "OK", "wrong-percent-only": "REFUSED", "wrong-delta-only": "REFUSED",
+                               "inf-delta": "REFUSED", "text-percent": "REFUSED", "zero-baseline": "REFUSED", "negative-baseline": "REFUSED"})
 
     def test_r2_adversary_698fffb1_a2_a_packager_publishes_and_reads_only_its_own_reports(self) -> None:
         # adversary 698fffb1 A2: two packagers on one RunRoot share the final report names, so the packager re-read the published JSON and took another run's report as its own. It now keeps its own

@@ -1843,22 +1843,28 @@ class CompareMachinePerfPlaybackAbHostLoadRefusalTests(_ProbeCase):
         "'--settle-cpu-stable-ms', '1000', '--settle-cpu-max-ms', '45000') }; hostLoadProvisional = "
     )
 
-    def _leg(self, provisional: bool, state: str = None) -> str:
+    def _leg(self, provisional: bool, state: str = None, presented_fps: float = None) -> str:
         # round 5: legs are now built WITH hostLoadState by default (as every real round-4+
         # producer emits it alongside hostLoadProvisional) -- state defaults to the value implied
         # by provisional so callers that only care about the boolean keep working unchanged.
         # BENCH-LIGHT-ARM-GAIN-GATES-1: and WITH telemetryArm LIGHT (a leg that records no arm is UNKNOWN and refused, so these host-load cases need the LIGHT arm to stay about host load).
+        # R2-RESIDUE-1 r2: and WITH the presentedFps its compare names (a compare is published only when it is measured on the judged legs).
         resolved_state = state if state is not None else ("exceeded" if provisional else "quiet")
         provisional_literal = "$true" if provisional else "$false"
-        return self._LIGHT_LEG_HEAD + provisional_literal + "; hostLoadState = '" + resolved_state + "' }"
+        fps_literal = "" if presented_fps is None else "; presentedFps = " + repr(float(presented_fps))
+        return self._LIGHT_LEG_HEAD + provisional_literal + "; hostLoadState = '" + resolved_state + "'" + fps_literal + " }"
 
     def _record(self, baseline_provisional: bool, candidate_provisional: bool, fps_delta_pct: float = -40.0) -> str:
-        baseline = self._leg(baseline_provisional)
-        candidate = self._leg(candidate_provisional)
+        # the pair the compare is measured on: 50 fps -> 30 fps is -40 % (the default); any other percent keeps baseline 50
+        baseline_fps = 50.0
+        candidate_fps = baseline_fps * (1.0 + fps_delta_pct / 100.0)
+        baseline = self._leg(baseline_provisional, presented_fps=baseline_fps)
+        candidate = self._leg(candidate_provisional, presented_fps=candidate_fps)
         return (
             "[pscustomobject]@{ "
             f"baseline = {baseline}; candidate = {candidate}; candidateSpeed = $null; "
-            f"compare = [pscustomobject]@{{ presentedFps = [pscustomobject]@{{ deltaPercent = {fps_delta_pct} }} }} "
+            f"compare = [pscustomobject]@{{ presentedFps = [pscustomobject]@{{ baseline = {baseline_fps}; candidate = {candidate_fps}; "
+            f"delta = {candidate_fps - baseline_fps}; deltaPercent = {fps_delta_pct} }} }} "
             "}"
         )
 
@@ -1889,6 +1895,8 @@ class CompareMachinePerfPlaybackAbHostLoadRefusalTests(_ProbeCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertNotIn("DOMINANT=host-load-provisional", proc.stdout)
+        # R2-RESIDUE-1 r2: the compare is measured on the two legs, so the arm gate does not refuse it either (a refusal would also pass the line above)
+        self.assertNotIn("DOMINANT=fps-arm-refused", proc.stdout)
 
     def test_leg_missing_hostloadprovisional_property_is_treated_as_provisional(self) -> None:
         # Same fail-toward-provisional stance as item 3: a leg object present but lacking the
@@ -1994,25 +2002,27 @@ class CompareMachinePerfPlaybackAbFpsDeltaRefusalTests(_ProbeCase):
         "'--settle-cpu-stable-ms', '1000', '--settle-cpu-max-ms', '45000') }; hostLoadProvisional = "
     )
 
-    def _leg(self, provisional: bool, state: str = None) -> str:
+    def _leg(self, provisional: bool, state: str = None, presented_fps: float = None) -> str:
         # BENCH-LIGHT-ARM-GAIN-GATES-1: LIGHT arm, so these cases stay about host load (an unrecorded arm is UNKNOWN and refused).
+        # R2-RESIDUE-1 r2: and WITH the presentedFps the compare names: the row publishes a delta only for a compare measured on the judged legs (a leg that records no presentedFps cannot bind it).
         resolved_state = state if state is not None else ("exceeded" if provisional else "quiet")
         provisional_literal = "$true" if provisional else "$false"
-        return self._LIGHT_LEG_HEAD + provisional_literal + "; hostLoadState = '" + resolved_state + "' }"
+        fps_literal = "" if presented_fps is None else "; presentedFps = " + repr(float(presented_fps))
+        return self._LIGHT_LEG_HEAD + provisional_literal + "; hostLoadState = '" + resolved_state + "'" + fps_literal + " }"
 
     def _record(
         self, baseline_provisional: bool, candidate_provisional: bool,
         baseline_fps: float = 10.0, candidate_fps: float = 20.0, delta_pct: float = 100.0,
     ) -> str:
-        baseline_leg = self._leg(baseline_provisional)
-        candidate_leg = self._leg(candidate_provisional)
+        baseline_leg = self._leg(baseline_provisional, presented_fps=baseline_fps)
+        candidate_leg = self._leg(candidate_provisional, presented_fps=candidate_fps)
         return (
             "[pscustomobject]@{ schema = 'mlvapp-cuda-playback-ab.v1'; status = 'success'; "
             "machineFingerprint = [pscustomobject]@{ schema = 'machine-fingerprint.v1'; "
             "hostname = 'H'; cpu = 'x'; gpu = 'y'; os = 'z'; build_sha = 'abc1234' }; "
             f"baseline = {baseline_leg}; candidate = {candidate_leg}; candidateSpeed = $null; "
             "compare = [pscustomobject]@{ presentedFps = [pscustomobject]@{ "
-            f"baseline = {baseline_fps}; candidate = {candidate_fps}; deltaPercent = {delta_pct} }} }} }}"
+            f"baseline = {baseline_fps}; candidate = {candidate_fps}; delta = {candidate_fps - baseline_fps}; deltaPercent = {delta_pct} }} }} }}"
         )
 
     def _row(self, record: str) -> subprocess.CompletedProcess:
@@ -2044,6 +2054,17 @@ class CompareMachinePerfPlaybackAbFpsDeltaRefusalTests(_ProbeCase):
         self.assertIn("REASON=", proc.stdout)
         self.assertNotIn("REASON=host_load_provisional", proc.stdout)
         self.assertIn("PROVISIONAL=False", proc.stdout)
+
+    def test_r2_residue_r2_a_compare_not_measured_on_the_judged_legs_publishes_no_delta(self) -> None:
+        # a quiet LIGHT/LIGHT pair whose legs record no presentedFps cannot bind the compare (the fixture gap that reddened hosted CI on da6248b1): the typed refusal, no delta
+        unbound = self._record(False, False).replace("; presentedFps = 10.0", "").replace("; presentedFps = 20.0", "")
+        proc = self._row(unbound)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("DELTA= REASON=fps-verdict-refused:compare-not-judged-pair:", proc.stdout)
+        # luna r1b A1 through the row: both legs 40 fps, the compare says delta 40 / +100 %
+        proc = self._row(self._record(False, False, baseline_fps=40.0, candidate_fps=40.0, delta_pct=100.0).replace("delta = 0.0;", "delta = 40.0;"))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("DELTA= REASON=fps-verdict-refused:compare-not-judged-pair:", proc.stdout)
 
     def test_exceeded_false_baseline_still_refuses_the_delta(self) -> None:
         # round 8 (sol MAJOR item 3), exact repro: "baseline hostLoadState='exceeded',
