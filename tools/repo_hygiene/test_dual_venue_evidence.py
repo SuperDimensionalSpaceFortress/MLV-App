@@ -6917,6 +6917,35 @@ exit 0
         self.assertIn(f"was judged as sha256 {planned} but a later preflight read of the same path judged sha256 {twin} (planned_sha256={planned})", refusal[0])
         self.assertFalse((self.tmp / "claims").exists() and any((self.tmp / "claims").iterdir()), "no claim is taken")
 
+    # DV-PLANNED-SPEC-HASH-BIND-R10-DIGEST-KEY-RESIDUE-1 (key r10 B1, fable + opus on ca27678b): Get-SpecDigestKey chose the file's final path or the spelled full path PER CALL. A -LegSet entry
+    # whose spec is spelled off its on-disk name (the fixture upper-cases each leaf) and whose budget-store lookup got no answer in 1 s stored the judged digest under the spelled path and read
+    # it back under the final one: the per-entry check then read an empty sha256 and refused a spec nobody changed ("read as sha256  after the leg-set planner judged ..."). -SpecDigestKeyDelay
+    # '<n>:<ms>' makes the n-th lookup answer late: 1 and 4 split the key on the old code (4 = the budget store of entry 1), and the memo makes every call of one spelling agree.
+    BATCH_UPPER_PLAN = ("    if ($env:DVT_UPPER_SPEC) { foreach ($q in $sp.plan) { $q.specPath = ([IO.Path]::Combine([IO.Path]::GetDirectoryName([string]$q.specPath), "
+                        "[IO.Path]::GetFileNameWithoutExtension([string]$q.specPath).ToUpperInvariant() + [IO.Path]::GetExtension([string]$q.specPath))) } }   # TEST FIXTURE: each spec spelled off its on-disk name\n")
+
+    def test_planned_hash_bind_r10_batch_legset_a_spec_spelled_off_its_name_whose_key_lookup_times_out_is_not_refused_as_changed_with_an_empty_hash(self) -> None:
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.BATCH_PLAN_ANCHOR, self.BATCH_PLAN_ANCHOR + self.BATCH_UPPER_PLAN),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_STOP_ANCHOR, self.BATCH_STOP_OWN)])
+        from datetime import datetime, timedelta, timezone
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fake = self.tmp / "batch-fake-script.ps1"
+        fake.write_text("exit 0\n", encoding="utf-8")
+        proc = run_pwsh(["-File", str(dv / "Invoke-VenueLeaseBatch.ps1"), "-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-RunDir", str(self.tmp / "batch-run"),
+                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake),
+                         "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline, "-SpecDigestKeyDelay", "1:1500,4:1500"],
+                        env_extra={"DVT_UPPER_SPEC": "1"}, timeout=420)
+        self.assertNotIn("SPEC_CHANGED_AFTER_PREFLIGHT", proc.stderr, "old: a false refusal naming an empty sha256 on a spec nobody changed\n" + proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rows = [l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ")]
+        self.assertGreaterEqual(len(rows), 2, proc.stdout + proc.stderr)
+        for row in rows:
+            m = re.fullmatch(r"DVT_PLANNED spec=(\S+) bound=([0-9a-f]{64}) own=([0-9a-f]{64})", row)
+            self.assertIsNotNone(m, row)
+            self.assertEqual(m.group(2), m.group(3), f"the entry is bound to its own judged bytes: {row}")
+            self.assertEqual(m.group(1), m.group(1).upper().replace(".JSON", ".json"), "the spec stayed spelled off its on-disk name, so the test is the key split's input")
+        self.assertFalse((self.tmp / "claims").exists() and any((self.tmp / "claims").iterdir()), "nothing is claimed by this stop")
+
     def test_planned_hash_bind_r2_a2_chain_a_zero_byte_legspec_is_planned_with_the_empty_bytes_hash(self) -> None:
         """A2: `$x = try { <empty byte array> }` enumerated to $null and the hash threw outside the usage catch; an empty file is bytes like any other."""
         dv = self.mutated_runner([])

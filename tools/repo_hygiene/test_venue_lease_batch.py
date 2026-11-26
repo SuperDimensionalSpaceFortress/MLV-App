@@ -5936,6 +5936,75 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r3 (adversary pass 2 A2): the entry's OWN judged sha256 (proved equal to its path's binding before any claim), never a path-keyed lookup
         self.assertIn("$lArgs += @('-ExpectSpecSha256', [string]$leg.specSha256)", batch)
 
+    # DV-PLANNED-SPEC-HASH-BIND-R10-DIGEST-KEY-RESIDUE-1 (key r10 B1, fable + opus on ca27678b): Get-SpecDigestKey picked the file's final path or the spelled full path PER CALL. A spec
+    # spelled off its on-disk name (here: another case) whose lookup got no answer in 1 s on ONE call stored its judged digest under one key and was looked up under the other: the
+    # entry's specSha256 read '' (which passed '' -cne ''), the content guard skipped its re-read and the leg was launched with no -ExpectSpecSha256. -SpecDigestKeyDelay '<n>:<ms>' makes
+    # the n-th lookup of the run answer late (its bound is 1 s). -LegSpec's lookups run in the order shape-read-remove (1), shape store (2), budget store (3), entry lookup (4), per-leg
+    # check (5); -LegPlan's in the order shape store (1), budget store (2), entry lookup (3), per-leg check (4). The seam delays the lookups that split the key on the old code.
+    R10_KEY_SEAM = {"-LegSpec": "1:1500,3:1500", "-LegPlan": "1:1500,2:1500"}
+
+    def _r10_spelled_spec(self) -> tuple[Path, Path]:
+        """(the spec on disk, the same path spelled in another case): one file, two spellings; the batch keeps the spelling it was given."""
+        spec = self.case / "r10-digest-key.json"
+        spec.write_text(self.specs[0].read_text(encoding="utf-8"), encoding="utf-8")
+        return spec, spec.with_name("R10-DIGEST-KEY.JSON")
+
+    def _r10_run(self, mode: str, spelled: Path, *extra: str, **env: str) -> subprocess.CompletedProcess:
+        for p in (self.events, self.leg_args, self.claim_path):
+            p.unlink(missing_ok=True)
+        shutil.rmtree(self.run_dir, ignore_errors=True)
+        if mode == "-LegSpec":
+            return self.run_batch([spelled], *extra, **env)
+        return self.run_plan(self.write_plan([self.item(spelled, "A", self.commit_a)]), *extra, **env)
+
+    def test_r10_a_spec_spelled_off_its_on_disk_name_whose_first_key_lookup_times_out_is_never_launched_without_its_hash(self) -> None:
+        spec, spelled = self._r10_spelled_spec()
+        want = hashlib.sha256(spec.read_bytes()).hexdigest()
+        shas = self.case / "leg-spec-sha-r10.log"
+        for mode in ("-LegSpec", "-LegPlan"):
+            with self.subTest(mode=mode):
+                shas.unlink(missing_ok=True)
+                r = self._r10_run(mode, spelled, "-SpecDigestKeyDelay", self.R10_KEY_SEAM[mode], FAKE_LEG_SPEC_SHA=str(shas))
+                out = f"{mode}: " + r.stdout[-3000:] + r.stderr[-3000:]
+                rows = shas.read_text(encoding="utf-8").splitlines() if shas.exists() else []
+                # old: the key split, the entry's digest read '' and the leg ran with 'expect=' (no -ExpectSpecSha256)
+                self.assertEqual([x for x in rows if not x.startswith(f"expect={want} ")], [], "a leg ran with no bound hash (or another one). " + out)
+                self.assertNotIn("SPEC_CHANGED_AFTER_PREFLIGHT", r.stderr, out)
+                self.assertEqual(r.returncode, 0, out)
+                self.assertTrue(rows, "the run did not reach its leg, so the test proves nothing. " + out)
+                self.assertEqual(rows[0], f"expect={want} read={want}", out)
+
+    def test_r10_an_entry_with_no_judged_digest_is_refused_before_any_claim_in_every_form(self) -> None:
+        # the second half of the fix, whatever made the digest empty: the runner's own store of the budget read's digest is removed in a mirror, so the entry has none. Old: the leg ran
+        # with no -ExpectSpecSha256 ('' -cne '' is false). New: the typed SPEC_NOT_JUDGED before any claim or lease.
+        spec, spelled = self._r10_spelled_spec()
+        for mode in ("-LegSpec", "-LegPlan"):
+            with self.subTest(mode=mode):
+                shutil.rmtree(self.case / "tree", ignore_errors=True)
+                self._mirror_with_bad_sidecar(runner_patches=(("    $script:SpecBudgetSha256[$digestKey] = $judgedSha\n", "    $null = $judgedSha   # TEST FIXTURE: the budget read's digest is never stored\n"),))
+                self.plan_runner = self.runner
+                shas = self.case / "leg-spec-sha-r10-b.log"
+                shas.unlink(missing_ok=True)
+                r = self._r10_run(mode, spelled, FAKE_LEG_SPEC_SHA=str(shas))
+                out = f"{mode}: " + r.stdout[-3000:] + r.stderr[-3000:]
+                self.assertFalse(shas.exists(), "a leg ran on bytes nothing judged. " + out)
+                self.assertEqual([k for k in self.kinds() if k.startswith("LEG")], [], out)
+                self.assertEqual(r.returncode, 2, out)
+                self.assertIn("SPEC_NOT_JUDGED", r.stderr, out)
+                self.assertFalse(self.claim_path.exists(), f"{mode}: no claim was written. " + out)
+                self.assertFalse((self.run_dir / "batches.jsonl").exists(), f"{mode}: no lease was opened. " + out)
+
+    def test_r10_the_digest_key_delay_seam_is_refused_with_the_real_um_run_and_is_checked(self) -> None:
+        spec, spelled = self._r10_spelled_spec()
+        args, e = self.batch_cmd([spec], "-SpecDigestKeyDelay", "1:5")
+        args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("-SpecDigestKeyDelay is an offline test seam", r.stderr)
+        r = self.run_batch([spec], "-SpecDigestKeyDelay", "soon")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("is not <n>:<ms>", r.stderr)
+
     def test_r19_b2_a_stalled_budget_spec_read_is_bounded_by_the_deadline_and_refused_before_the_claim(self) -> None:
         # EXPORT-VENUE-LEG-1 r19 (sol r18 B2 = pass20-A2): the budget preflight's own read of the spec was a synchronous ReadAllBytes BEFORE the remaining-room check, so a share that
         # stopped answering there (every earlier read of the spec had answered) held the batch past -DeadlineUtc. The seam -ExportBudgetSpecReadDelaySec makes only that read answer
