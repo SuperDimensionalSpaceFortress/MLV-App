@@ -230,6 +230,19 @@ class MalformedBlockTests(unittest.TestCase):
         for forbidden in ("ConvertFrom-Json", "CommentHandling", "AllowTrailingCommas", "Get-DvJsonRootObjectWithout", "Invoke-Expression"):
             self.assertNotIn(forbidden, body, f"the reader must not use {forbidden}")
 
+    def test_the_reader_s_helpers_have_no_second_grammar_either(self) -> None:
+        """sol r2 DV-DISPLAY-PATH-ONE-GRAMMAR-GUARD-HELPERS-1: the helpers the reader calls (and the validator's marker lookup) are held to the same
+        static rule as the reader body, with comments removed (a comment may NAME the cmdlet it avoids)."""
+        text = MODULE.read_text(encoding="utf-8")
+        for fn in ("Get-DvJsonMembersNamed", "Test-DvJsonTextReadable", "Test-DvMemberNameIs", "Get-DvObjectMembersNamed", "Test-DvReceiptCarriesDisplayPath"):
+            m = re.search(rf"^function {fn} \{{.*?^\}}", text, re.S | re.M)
+            with self.subTest(fn):
+                self.assertIsNotNone(m, f"{fn} is defined in DualVenueRunner.psm1")
+                code = re.sub(r"(?s)<#.*?#>", "", m.group(0))
+                code = re.sub(r"(?m)#.*$", "", code)
+                for forbidden in ("ConvertFrom-Json", "CommentHandling", "AllowTrailingCommas", "Invoke-Expression"):
+                    self.assertNotIn(forbidden, code, f"{fn} must not use {forbidden}")
+
 
 @requires_windows_pwsh
 class LegacyNoBlockTests(unittest.TestCase):
@@ -361,6 +374,18 @@ class VenueLegWritesTheBlockTests(RunnerHarness, unittest.TestCase):
         self.assertEqual(receipt["venue"]["displayPath"],
                          {"schema": SCHEMA, "source": "health-probe", "adapters": ["NVIDIA GeForce RTX 4090", "Microsoft Basic Display Adapter"],
                           "firstAdapterDriverVersion": "32.0.1", "primaryDisplayDevice": "\\\\.\\DISPLAY2"})
+        files = sorted(self.receipts.rglob("*.json"), key=lambda f: f.stat().st_mtime_ns)
+        got = read_texts([files[-1].read_text(encoding="utf-8")])[0]
+        self.assertEqual(got["state"], "present", got["reason"])
+
+    def test_a_host_mismatched_leg_still_carries_the_block(self) -> None:
+        """sol r2 VENUE-LEG-DISPLAY-PATH-HOST-MISMATCH-ROW-1: the block is attached BEFORE the host-mismatch refusal, so a refused leg records the
+        display route the venue reported (a bachelor host answering for a declared ultra-magnus)."""
+        wrong = dict(HEALTHY_PROBE, hostName="BACHELOR", gpuNames=["Intel(R) UHD Graphics 770"])
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), probe=wrong)
+        self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+        self.assertEqual(receipt["outcome"], "VENUE_HOST_MISMATCH")
+        self.assertEqual(receipt["venue"]["displayPath"]["adapters"], ["Intel(R) UHD Graphics 770"])
         files = sorted(self.receipts.rglob("*.json"), key=lambda f: f.stat().st_mtime_ns)
         got = read_texts([files[-1].read_text(encoding="utf-8")])[0]
         self.assertEqual(got["state"], "present", got["reason"])
@@ -601,7 +626,140 @@ class SolR1KeysShadowTests(unittest.TestCase):
                 self.assertNotRegex(body, r"\$\w+\.Keys\b", f"{fn} still reads a dictionary's .Keys property")
 
 
+VENUE_LOOKUP_SCRIPT = r"""
+Import-Module '__MODULE__' -Force
+$blockJson = '{"schema":"mlv-app/venue-display-path/v2","source":"health-probe","adapters":["Intel"],"firstAdapterDriverVersion":null,"primaryDisplayDevice":null}'
+function ToDict($v, $factory) {
+    # a parsed receipt (ConvertFrom-Json -AsHashtable, case-SENSITIVE keys) copied into a dictionary kind with the factory's own key comparer
+    if ($v -is [System.Collections.IDictionary]) { $d = & $factory; foreach ($k in @([System.Collections.IDictionary].GetProperty('Keys').GetValue($v))) { $d[$k] = ToDict $v[$k] $factory }; return $d }
+    return , $v
+}
+function Marker($rec) { try { @((Test-DvReceiptValid -Receipt $rec -AllowOfflineTestMode).unbound | Where-Object { $_ -like 'DISPLAY_PATH_UNBOUND*' }).Count } catch { "threw: $($_.Exception.Message)" } }
+$out = [ordered]@{}
+foreach ($outcome in 'PASS', 'FAIL') {
+    $spellings = 'Venue', 'venue', 'VENUE', 'vEnUe'
+    for ($si = 0; $si -lt $spellings.Count; $si++) {   # the result keys carry the spelling's index: a PowerShell [ordered] table folds key case
+        $spelling = $spellings[$si]
+        $text = '{"outcome":"' + $outcome + '","card":"C","legId":"L","subject":{"clipId":"x"},"' + $spelling + '":{"name":"bachelor","displayPath":' + $blockJson + '}}'
+        $reps = [ordered]@{
+            'pscustomobject' = ($text | ConvertFrom-Json)
+            'asHashtable' = (ConvertFrom-Json -AsHashtable $text)
+            'hashtable' = (ToDict (ConvertFrom-Json -AsHashtable $text) { @{} })
+            'ordered' = (ToDict (ConvertFrom-Json -AsHashtable $text) { [ordered]@{} })
+        }
+        $state = [string](Read-DvReceiptDisplayPath -ReceiptText $text).state
+        foreach ($rep in $reps.Keys) { $out["$rep|$si|$outcome"] = [ordered]@{ state = $state; marker = (Marker $reps[$rep]) } }
+    }
+}
+# a receipt that names venue in two letter cases: the reader types it malformed, and the marker is still owed when any of them carries a block
+$dup = '{"outcome":"PASS","card":"C","legId":"L","subject":{"clipId":"x"},"venue":{"name":"bachelor"},"Venue":{"name":"bachelor","displayPath":' + $blockJson + '}}'
+$out['dup|asHashtable'] = [ordered]@{ state = [string](Read-DvReceiptDisplayPath -ReceiptText $dup).state; marker = (Marker (ConvertFrom-Json -AsHashtable $dup)) }
+# a malformed block under a case-variant venue still owes the marker (the reader says malformed, the validator only asks "is a displayPath member there")
+$bad = '{"outcome":"PASS","card":"C","legId":"L","subject":{"clipId":"x"},"Venue":{"name":"bachelor","displayPath":null}}'
+$out['malformed|asHashtable'] = [ordered]@{ state = [string](Read-DvReceiptDisplayPath -ReceiptText $bad).state; marker = (Marker (ConvertFrom-Json -AsHashtable $bad)) }
+# controls: no block anywhere
+$none = '{"outcome":"PASS","card":"C","legId":"L","subject":{"clipId":"x"},"Venue":{"name":"bachelor"}}'
+$out['none|asHashtable'] = [ordered]@{ state = [string](Read-DvReceiptDisplayPath -ReceiptText $none).state; marker = (Marker (ConvertFrom-Json -AsHashtable $none)) }
+$out['none|pscustomobject'] = [ordered]@{ state = [string](Read-DvReceiptDisplayPath -ReceiptText $none).state; marker = (Marker ($none | ConvertFrom-Json)) }
+Write-Output ('CASES=' + (ConvertTo-Json -InputObject @(, $out) -Depth 6 -Compress))
+"""
+
+
+@requires_windows_pwsh
+class SolR2VenueLookupTests(unittest.TestCase):
+    """r3, sol r2 B1 on c3d22033 (DEFECT_CLASS: one fact read through two lookups with two case rules). The strict reader found the `venue` member in any
+    letter case; the validator found it with Get-DvProp, which on a case-SENSITIVE dictionary (ConvertFrom-Json -AsHashtable) misses `Venue`, so a present
+    block owed no DISPLAY_PATH_UNBOUND marker. Both now resolve the member through one name rule (Test-DvMemberNameIs, OrdinalIgnoreCase)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        proc = run_pwsh(["-Command", VENUE_LOOKUP_SCRIPT.replace("__MODULE__", psq(MODULE))])
+        cls.got = cases_line(proc, 1, "venue-lookup")[0]
+
+    def test_b1_a_present_block_owes_the_marker_in_every_representation_and_spelling(self) -> None:
+        n = 0
+        for outcome in ("PASS", "FAIL"):
+            for si, spelling in enumerate(("Venue", "venue", "VENUE", "vEnUe")):
+                for rep in ("pscustomobject", "asHashtable", "hashtable", "ordered"):
+                    key = f"{rep}|{si}|{outcome}"
+                    with self.subTest(f"{rep}|{spelling}|{outcome}"):
+                        n += 1
+                        self.assertEqual(self.got[key]["state"], "present")
+                        self.assertEqual(self.got[key]["marker"], 1, f"{key}: the reader says present, DISPLAY_PATH_UNBOUND count is {self.got[key]['marker']!r}")
+        self.assertEqual(n, 32)
+
+    def test_b1_two_letter_cases_of_venue_read_malformed_and_still_owe_the_marker(self) -> None:
+        self.assertEqual(self.got["dup|asHashtable"], {"state": "malformed", "marker": 1})
+
+    def test_b1_a_malformed_block_under_a_case_variant_venue_owes_the_marker(self) -> None:
+        self.assertEqual(self.got["malformed|asHashtable"], {"state": "malformed", "marker": 1})
+
+    def test_b1_no_block_owes_no_marker_in_any_representation(self) -> None:
+        for key in ("none|asHashtable", "none|pscustomobject"):
+            with self.subTest(key):
+                self.assertEqual(self.got[key], {"state": "NO_SIGNAL", "marker": 0})
+
+    def test_b1_the_reader_and_the_validator_share_one_name_rule(self) -> None:
+        """Static: the JsonElement lookup and the object / dictionary lookup both decide a name match through Test-DvMemberNameIs, and neither
+        compares a member name on its own."""
+        text = MODULE.read_text(encoding="utf-8")
+        rule = re.search(r"^function Test-DvMemberNameIs \{.*?^\}", text, re.S | re.M)
+        self.assertIsNotNone(rule, "Test-DvMemberNameIs is defined in DualVenueRunner.psm1")
+        self.assertIn("OrdinalIgnoreCase", rule.group(0))
+        for fn in ("Get-DvJsonMembersNamed", "Get-DvObjectMembersNamed"):
+            m = re.search(rf"^function {fn} \{{.*?^\}}", text, re.S | re.M)
+            with self.subTest(fn):
+                self.assertIsNotNone(m, f"{fn} is defined")
+                self.assertIn("Test-DvMemberNameIs", m.group(0))
+                self.assertNotIn("StringComparison", m.group(0), f"{fn} must not carry its own case rule")
+        carries = re.search(r"^function Test-DvReceiptCarriesDisplayPath \{.*?^\}", text, re.S | re.M)
+        self.assertIsNotNone(carries)
+        self.assertIn("Get-DvObjectMembersNamed", carries.group(0))
+        self.assertNotIn("Get-DvProp", carries.group(0), "the marker lookup must not use the case-sensitive Get-DvProp")
+
+
+PROBE_PICK_SCRIPT = r"""
+Import-Module '__MODULE__' -Force
+$m = Get-Module DualVenueRunner
+$soft = [string][char]0xAD
+$real = 'DVE_PROBE={"hostName":"UM","gpuNames":["Real GPU"],"driverVersion":"1","displayDevice":"D2"}'
+$fake = $soft + 'DVE_PROBE={"hostName":"UM","gpuNames":["Fake GPU"],"driverVersion":"9","displayDevice":"D9"}'
+$out = [ordered]@{}
+# a line that only LOOKS like the probe line (a soft hyphen before the prefix) is not the probe line: the next real one is picked
+$stdout = "pwsh 7`n" + $fake + "`n" + $real + "`n"
+$block = New-DvDisplayPathBlock -ProbeStdout $stdout
+$out['writer'] = if ($null -eq $block) { $null } else { @($block.adapters) -join ',' }
+$parsed = & $m { param($s) ConvertFrom-DvProbeStdout $s } $stdout
+$out['parser'] = if ($null -eq $parsed) { $null } else { @($parsed.gpuNames) -join ',' }
+# only the look-alike line: no probe line at all, so neither reads one
+$only = "pwsh 7`n" + $fake + "`n"
+$out['writer-only'] = [bool]($null -ne (New-DvDisplayPathBlock -ProbeStdout $only))
+$out['parser-only'] = [bool]($null -ne (& $m { param($s) ConvertFrom-DvProbeStdout $s } $only))
+Write-Output ('CASES=' + (ConvertTo-Json -InputObject @(, $out) -Depth 4 -Compress))
+"""
+
+
+@requires_windows_pwsh
+class SolR2ProbeLineOrdinalPickTests(unittest.TestCase):
+    """sol r2 DV-PROBE-LINE-ORDINAL-PICK-1: the writer and the existing probe parser pick the DVE_PROBE line with an ORDINAL prefix test."""
+
+    def test_a_look_alike_line_is_not_the_probe_line_in_the_writer_or_the_parser(self) -> None:
+        proc = run_pwsh(["-Command", PROBE_PICK_SCRIPT.replace("__MODULE__", psq(MODULE))])
+        got = cases_line(proc, 1, "probe-pick")[0]
+        self.assertEqual(got["writer"], "Real GPU")
+        self.assertEqual(got["parser"], "Real GPU")
+        self.assertFalse(got["writer-only"])
+        self.assertFalse(got["parser-only"])
+
+
 class DocsTests(unittest.TestCase):
+    def test_the_doc_does_not_attribute_the_historical_speed_change_to_an_adapter(self) -> None:
+        """sol r2 DV-DISPLAY-PATH-MOTIVATION-ATTRIBUTION-1: the source investigation left the cause open."""
+        text = " ".join(DOC.read_text(encoding="utf-8").split())
+        self.assertNotIn("because the venue drove its display through a different adapter", text)
+        self.assertIn("left the cause open", text)
+        self.assertIn("this block does not say an adapter caused it", text)
+
     def test_the_doc_states_the_contract(self) -> None:
         text = DOC.read_text(encoding="utf-8")
         for needle in ("VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2", "Read-DvReceiptDisplayPath", "New-DvDisplayPathBlock", SCHEMA, "NO_SIGNAL", "malformed"):

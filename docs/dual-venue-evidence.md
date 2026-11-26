@@ -720,9 +720,11 @@ pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueStageNightly.ps1 [-
 
 ## The display-path block (`venue.displayPath`, VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2)
 
-Why it exists: two legs on one venue with a byte-identical exe, clip and spec can still differ because the venue drove its display through a
-different adapter (Bachelor's 59.56 -> 38.78 fps control, BACHELOR-1457-NATIVE-GUI-LATE-ENV-DIFF-1). A receipt therefore carries ONE display-path
-block, written by ONE writer and read by ONE reader. It replaces the closed PR #904 (VENUE-LEG-DISPLAY-PATH-RECEIPT-1), whose wider collector and
+Why it exists: two legs on one venue with a byte-identical exe, clip and spec can still differ, and a receipt that does not say which video
+adapters and display device the venue reported cannot show whether its display route was the same on both (Bachelor's 59.56 -> 38.78 fps control,
+BACHELOR-1457-NATIVE-GUI-LATE-ENV-DIFF-1, is the case that raised the question; that investigation left the cause open, recorded a cadence change on
+identical app inputs and a later display-route sample, and established no earlier adapter route, so this block does not say an adapter caused it).
+A receipt therefore carries ONE display-path block, written by ONE writer and read by ONE reader. It replaces the closed PR #904 (VENUE-LEG-DISPLAY-PATH-RECEIPT-1), whose wider collector and
 timing work were not carried over: this block adds no venue read, no CIM query, no clock and no wait.
 
 **Writer.** `New-DvDisplayPathBlock -ProbeStdout <the health probe job's stdout>` (`DualVenueRunner.psm1`), called once by `Invoke-VenueLeg.ps1`

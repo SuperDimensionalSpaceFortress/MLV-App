@@ -7272,7 +7272,9 @@ try { Add-Type -AssemblyName System.Windows.Forms; `$probe.displayDevice = [stri
 
 function ConvertFrom-DvProbeStdout([string]$Stdout) {
     foreach ($line in ($Stdout -split "`r?`n")) {
-        if ($line.StartsWith('DVE_PROBE=')) {
+        # r3 (sol r2 DV-PROBE-LINE-ORDINAL-PICK-1): ORDINAL prefix test -- the culture-sensitive one ignores a soft hyphen or a NUL, so a line that only
+        # LOOKS like the probe line was picked and its Substring then cut the wrong characters. The display-path writer picks its line the same way.
+        if ($line.StartsWith('DVE_PROBE=', [System.StringComparison]::Ordinal)) {
             try { return ($line.Substring('DVE_PROBE='.Length) | ConvertFrom-Json) } catch { return $null }
         }
     }
@@ -7799,17 +7801,47 @@ $script:DisplayPathSource = 'health-probe'
 $script:DisplayPathFields = @('schema', 'source', 'adapters', 'firstAdapterDriverVersion', 'primaryDisplayDevice')
 $script:DisplayPathMaxAdapters = 64
 
+function Test-DvMemberNameIs {
+    # r3 (sol r2 B1): THE case rule for finding a receipt member by name -- ordinal, ANY letter case (PowerShell reads member names case-insensitively, so a
+    # case variant must never hide). The strict reader (Get-DvJsonMembersNamed, over a System.Text.Json element) and the validator's marker lookup
+    # (Get-DvObjectMembersNamed, over a parsed PSCustomObject / Hashtable / OrderedDictionary / ConvertFrom-Json -AsHashtable result) decide a match here
+    # and nowhere else, so "the block is present" and "the marker is owed" cannot disagree about which member is `venue`.
+    param([AllowNull()][string]$Name, [string]$Wanted)
+    [string]::Equals($Name, $Wanted, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
 function Get-DvJsonMembersNamed {
-    # The members of a System.Text.Json object element whose name equals -Name in ANY letter case (PowerShell reads member names case-insensitively, so a
-    # case variant must never hide). A name that cannot be read back (an escaped lone surrogate) throws: the caller's catch types the block malformed.
+    # The members of a System.Text.Json object element whose name matches -Name (Test-DvMemberNameIs). A name that cannot be read back (an escaped lone
+    # surrogate) throws: the caller's catch types the block malformed.
     param([System.Text.Json.JsonElement]$Element, [string]$Name)
     $hits = [System.Collections.Generic.List[object]]::new()
     foreach ($p in $Element.EnumerateObject()) {
         $n = $p.Name
         if ($null -eq $n) { throw 'a member name cannot be read back' }
-        if ([string]::Equals([string]$n, $Name, [System.StringComparison]::OrdinalIgnoreCase)) { $hits.Add($p) }
+        if (Test-DvMemberNameIs ([string]$n) $Name) { $hits.Add($p) }
     }
     $hits.ToArray()   # unrolled to the caller, which collects it with @(): zero, one or more JsonProperty values
+}
+
+function Get-DvObjectMembersNamed {
+    # r3 (sol r2 B1): the VALUES of every member of a parsed receipt object whose name matches -Name (Test-DvMemberNameIs), whatever the representation: an
+    # IDictionary (Hashtable, OrderedDictionary, ConvertFrom-Json -AsHashtable, whose keys are case-SENSITIVE) is walked by its real keys (Get-DvDictionaryKeys),
+    # any other object by its properties. Unlike Get-DvProp it never misses `Venue` beside `venue`, and every case variant is returned. Returns one
+    # [pscustomobject]@{ Name; Value } per member (a $null member value stays a member), unrolled to the caller, which collects it with @().
+    param($Object, [string]$Name)
+    $hits = [System.Collections.Generic.List[object]]::new()
+    if ($null -ne $Object) {
+        if ($Object -is [System.Collections.IDictionary]) {
+            foreach ($k in @(Get-DvDictionaryKeys $Object)) {
+                if (Test-DvMemberNameIs ([string]$k) $Name) { $hits.Add([pscustomobject]@{ Name = [string]$k; Value = $Object[$k] }) }
+            }
+        } else {
+            foreach ($p in $Object.PSObject.Properties) {
+                if (Test-DvMemberNameIs ([string]$p.Name) $Name) { $hits.Add([pscustomobject]@{ Name = [string]$p.Name; Value = $p.Value }) }
+            }
+        }
+    }
+    $hits.ToArray()
 }
 
 function Test-DvJsonTextReadable {
@@ -7838,14 +7870,14 @@ function Test-DvJsonTextReadable {
 
 function Test-DvReceiptCarriesDisplayPath {
     # r1 adversary pass-3 A5: does the receipt's venue carry a displayPath member (any letter case)? Presence only, for the validator's UNBOUND list;
-    # the block's content is read by Read-DvReceiptDisplayPath alone.
+    # the block's content is read by Read-DvReceiptDisplayPath alone. r3 (sol r2 B1): `venue` is found by the reader's own name rule
+    # (Test-DvMemberNameIs, via Get-DvObjectMembersNamed), so `Venue` in a case-sensitive dictionary owes the marker exactly as the reader's `present` says;
+    # when a receipt names venue in two letter cases the reader types it malformed, and the marker is owed if ANY of them carries a displayPath member.
     param($Receipt)
-    $venue = Get-DvProp $Receipt 'venue'
-    if ($null -eq $venue) { return $false }
-    if ($venue -is [System.Collections.IDictionary]) {
-        return (@(Get-DvDictionaryKeys $venue | Where-Object { [string]::Equals([string]$_, 'displayPath', [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0)
+    foreach ($venue in @(Get-DvObjectMembersNamed $Receipt 'venue')) {
+        if (@(Get-DvObjectMembersNamed $venue.Value 'displayPath').Count -gt 0) { return $true }
     }
-    $null -ne $venue.PSObject.Properties['displayPath']
+    $false
 }
 
 function Read-DvReceiptDisplayPath {
@@ -7857,8 +7889,11 @@ function Read-DvReceiptDisplayPath {
       present   -- block is the typed block: [ordered]@{ schema; source; adapters ([string[]]); firstAdapterDriverVersion; primaryDisplayDevice }
       malformed -- block $null, reason names why: the text is empty or not strict JSON, the root is not an object, a `venue` or `displayPath` member
                    appears twice in any letter case, venue is not an object, the block member is not spelled `displayPath`, the block is not an
-                   object, a field is missing, unknown, doubled (any letter case) or of the wrong type, schema/source is not the exact string, more
-                   than 64 adapters, or any name or string cannot be read back. Every exception inside the reader is this state.
+                   object, a field is missing, unknown, doubled (any letter case) or of the wrong type, schema/source is not the exact string, the
+                   adapter list is empty or holds more than 64, an adapter name, driver version or display device carries U+FFFD or `?` (the marks of a
+                   text that was not carried as reported), or any name or string cannot be read back. Every exception inside the reader is this state.
+                   The `venue` and `displayPath` members are found in ANY letter case by one rule (Test-DvMemberNameIs), the rule the validator's
+                   DISPLAY_PATH_UNBOUND marker lookup uses too.
       NO_SIGNAL -- block and reason $null: no `venue` member, or a venue object with no `displayPath` member (every receipt fork/master writes).
     #>
     param([AllowNull()][AllowEmptyString()][string]$ReceiptText)
@@ -7969,7 +8004,7 @@ function New-DvDisplayPathBlock {
     try {
         $json = $null
         foreach ($line in ($ProbeStdout -split "`r?`n")) {
-            if ($line.StartsWith('DVE_PROBE=')) { $json = $line.Substring('DVE_PROBE='.Length); break }   # the line ConvertFrom-DvProbeStdout reads
+            if ($line.StartsWith('DVE_PROBE=', [System.StringComparison]::Ordinal)) { $json = $line.Substring('DVE_PROBE='.Length); break }   # the line ConvertFrom-DvProbeStdout reads (same ordinal test)
         }
         if ($null -eq $json) { return $null }
         $doc = [System.Text.Json.JsonDocument]::Parse($json, [System.Text.Json.JsonDocumentOptions]::new())
