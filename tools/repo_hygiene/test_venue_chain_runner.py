@@ -1533,7 +1533,7 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         parts = got.split()
         self.assertEqual(parts[:3], ["False", "0", "True"], got)
         self.assertLess(int(parts[3]), 10, f"the cleanup waits are one 1 s budget, not 15 s each: {got}")
-        killed = pwsh_text(f"Import-Module '{MODULE}' -Force -DisableNameChecking; $r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 60') -TimeoutSec 2 -CleanupWaitMs 5000; "
+        killed = pwsh_text(f"Import-Module '{MODULE}' -Force -DisableNameChecking; $r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 60') -TimeoutSec 6 -CleanupWaitMs 5000; "   # r2: 6 s granted, so the listing before the root and the record before the bound exist (under 5 s no census runs)
                            "\"$($r.timedOut) $($r.killConfirmed)\"")
         self.assertEqual(killed, "True True")
         text = (DV / "VenueChain.psm1").read_text(encoding="utf-8")

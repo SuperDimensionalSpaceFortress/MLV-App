@@ -354,11 +354,12 @@ _allow("Get-AttrCudaEligibilityVerdict", _LOCAL_BLOCK, ("R3", "& $read", 8))
 # r6b: 5 calls; r5b (e75704ae) added the fifth, the clock-stepped-back return (a row created ahead of the clock).
 # A1-CLOCK-FREE-ANCESTRY-1 r1: 7 calls (two more returns: baseline-unknown, root-in-baseline). $inBase is the body's own pure comparison block, defined near the top of the body:
 # `{ param($BasePid, $BaseTicks) ... $baseTable.ContainsKey(...) -and ([int64]$baseTable[...] -eq [int64]$BaseTicks) }` (an identity test against the listing taken before the root started).
-_allow("Get-AttrCudaProcessTreeSnapshot", _LOCAL_BLOCK, ("R3", "& $unknown", 7), ("R3", "& $inBase", 3))
+# sol r2 on b428e461 (A1): the two walks no longer call $inBase (a child of a member is always a member), so each body holds 2 calls (late classification, direct-parent check).
+_allow("Get-AttrCudaProcessTreeSnapshot", _LOCAL_BLOCK, ("R3", "& $unknown", 7), ("R3", "& $inBase", 2))
 _allow("Wait-AttrCudaProcessTreeGone",
        "test-only seam: runs the caller's -Scan block (a stand-in for the Win32_Process scan) only when a test passed one; production passes none and reads Get-CimInstance, a read-only query",
        ("R3", "& $Scan", 1))
-_allow("Wait-AttrCudaProcessTreeGone", _LOCAL_BLOCK, ("R3", "& $inBase", 3))
+_allow("Wait-AttrCudaProcessTreeGone", _LOCAL_BLOCK, ("R3", "& $inBase", 2))
 _allow("Get-AttrCudaPresentMonDisplayReport", _LOCAL_BLOCK, ("R3", "& $buildWindow", 2), ("R3", "& $unavailable", 7))
 _allow("Get-AttrCudaSelfHealMetrics", _LOCAL_BLOCK,
        ("R3", "& $count", 4), ("R3", "& $field", 2), ("R3", "& $fps", 2), ("R3", "& $iniFlag", 2), ("R3", "& $readJson", 3),
