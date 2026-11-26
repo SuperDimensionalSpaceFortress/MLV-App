@@ -209,30 +209,32 @@ function Trip([scriptblock]$Mutate, [int]$Window = 1200) {
     $w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs $Window
     [void](Test-GuiSmokeLogProgressStalled -Watch $w)
     $held = & $Mutate $dir
-    # r4 (sol r3 H1): the loop cap is generous (a loaded runner may arm the watch late), but the trip is judged from the poll that ARMED the watch
-    $sw = [Diagnostics.Stopwatch]::StartNew(); $tripped = $false; $armedAt = -1; $sinceArm = -1
+    # r4 (sol r3 H1): the loop cap is generous (a loaded runner may arm the watch late). r7: the cap is only a hang bound; how long after arming the trip
+    # comes is not read off the real clock here (see the comment on the assertions)
+    $sw = [Diagnostics.Stopwatch]::StartNew(); $tripped = $false
     while ($sw.ElapsedMilliseconds -lt 15000 -and -not $tripped) {
         Start-Sleep -Milliseconds 150
         if (Test-GuiSmokeLogProgressStalled -Watch $w) { $tripped = $true }
-        if ($w.Armed -and $armedAt -lt 0) { $armedAt = [int]$w.LastProgressMs }
     }
-    if ($tripped) { $sinceArm = [int](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $w.LaunchTimestamp) - $armedAt }
     if ($held) { $held.Dispose() }
     Stop-GuiSmokeLogProgressWatch -Watch $w
-    [pscustomobject]@{ tripped = $tripped; sinceArmMs = $sinceArm }
+    $tripped
 }
 [pscustomobject]@{
-    deleted = (Trip { param($d) Remove-Item -LiteralPath (Join-Path $d 'mlvapp-1.log'); Remove-Item -LiteralPath (Join-Path $d 'mlvapp-2.log'); $null })
-    locked = (Trip { param($d) [IO.File]::Open((Join-Path $d 'mlvapp-1.log'), 'Open', 'ReadWrite', 'None') | Out-Null; $null })
-    shrunk = (Trip { param($d) Remove-Item -LiteralPath (Join-Path $d 'mlvapp-2.log'); $null })
+    deleted = [bool](Trip { param($d) Remove-Item -LiteralPath (Join-Path $d 'mlvapp-1.log'); Remove-Item -LiteralPath (Join-Path $d 'mlvapp-2.log'); $null })
+    locked = [bool](Trip { param($d) [IO.File]::Open((Join-Path $d 'mlvapp-1.log'), 'Open', 'ReadWrite', 'None') | Out-Null; $null })
+    shrunk = [bool](Trip { param($d) Remove-Item -LiteralPath (Join-Path $d 'mlvapp-2.log'); $null })
 } | ConvertTo-Json -Compress -Depth 4
 """)
-        self.assertTrue(out["deleted"]["tripped"], "a vanished log must not read as 'no data, so not stalled' forever")
-        self.assertTrue(out["shrunk"]["tripped"], "a total that shrinks is not progress")
-        self.assertTrue(out["locked"]["tripped"], "a log held unreadable is not progress")
-        for name in ("deleted", "shrunk", "locked"):
-            # the original liveness limit, kept: a 1200 ms window trips within 6000 ms of the watch arming, however late the arming was
-            self.assertLess(out[name]["sinceArmMs"], 6000, "%s: the watch tripped %s ms after it armed" % (name, out[name]["sinceArmMs"]))
+        self.assertTrue(out["deleted"], "a vanished log must not read as 'no data, so not stalled' forever")
+        self.assertTrue(out["shrunk"], "a total that shrinks is not progress")
+        self.assertTrue(out["locked"], "a log held unreadable is not progress")
+        # r7 (adversary dd2d6c67 A1): r4 also asserted "tripped within 6000 ms of the arming" off the real clock. A caller paused after the verdict (a 6300 ms
+        # sample) failed a correct verdict, so that bound is gone (siblings: the toggle and the locked-from-the-first-look tests below). The guarantee "the trip
+        # comes one window after the arming, whatever time the watch arms" is deterministic and lives in
+        # TheSilenceModelIsLaunchAnchored.test_the_invariant_holds_over_the_property_table (E = P + W, never past L) and in
+        # TheDeadlineIsReachedWithUnderOneMsOfItLeft / test_the_budget_left_control_is_not_spent_by_an_arming_that_lands_just_before_its_deadline (the verdict
+        # at P + W on the module's scripted launch clock)
 
     # adversary 797947a7 A2: a chunked wait longer than the window would let a one-second window permit a minute or two.
     def test_poll_chunk_is_a_fraction_of_the_window_and_the_runner_uses_it(self) -> None:
@@ -361,7 +363,7 @@ Set-Content -LiteralPath (Join-Path $dir 'mlvapp-1.log') -Value ('x' * 1000) -No
 Set-Content -LiteralPath (Join-Path $dir 'mlvapp-2.log') -Value ('y' * 1000) -NoNewline
 $w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000
 [void](Test-GuiSmokeLogProgressStalled -Watch $w)
-$held = $null; $sw = [Diagnostics.Stopwatch]::StartNew(); $tripped = $false; $flip = 0; $armedAt = -1; $sinceArm = -1
+$held = $null; $sw = [Diagnostics.Stopwatch]::StartNew(); $tripped = $false; $flip = 0
 while ($sw.ElapsedMilliseconds -lt 15000 -and -not $tripped) {
     if (([int]($sw.ElapsedMilliseconds / 400)) -ne $flip) {
         $flip = [int]($sw.ElapsedMilliseconds / 400)
@@ -369,15 +371,13 @@ while ($sw.ElapsedMilliseconds -lt 15000 -and -not $tripped) {
     }
     Start-Sleep -Milliseconds 100
     if (Test-GuiSmokeLogProgressStalled -Watch $w) { $tripped = $true }
-    if ($w.Armed -and $armedAt -lt 0) { $armedAt = [int]$w.LastProgressMs }
 }
-if ($tripped) { $sinceArm = [int](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $w.LaunchTimestamp) - $armedAt }
 if ($held) { $held.Dispose() }
 Stop-GuiSmokeLogProgressWatch -Watch $w
-[pscustomobject]@{ tripped = $tripped; sinceArmMs = $sinceArm } | ConvertTo-Json -Compress
+[pscustomobject]@{ tripped = $tripped } | ConvertTo-Json -Compress
 """)
+        # r7 (adversary dd2d6c67 A1 sibling): the 7000 ms "since the arming" bound is gone, see test_a_deleted_or_locked_or_shrinking_log_is_no_progress
         self.assertTrue(out["tripped"], "a log whose read access is toggled while its content never changes is a stalled leg")
-        self.assertLess(out["sinceArmMs"], 7000, "the original liveness limit, kept from the arming: it tripped %s ms after it armed" % out["sinceArmMs"])
 
     # adversary 57a7a5c9 A3: the first sign of a log arms the watch even when that log cannot be read at the first look.
     def test_a_log_unreadable_from_the_first_look_still_arms_the_watch(self) -> None:
@@ -387,18 +387,13 @@ $log = Join-Path $dir 'mlvapp-1.log'
 Set-Content -LiteralPath $log -Value 'first line'
 $held = [IO.File]::Open($log, 'Open', 'ReadWrite', 'None')
 $w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000
-$sw = [Diagnostics.Stopwatch]::StartNew(); $tripped = $false; $armedAt = -1; $sinceArm = -1
-while ($sw.ElapsedMilliseconds -lt 15000 -and -not $tripped) {
-    Start-Sleep -Milliseconds 150
-    if (Test-GuiSmokeLogProgressStalled -Watch $w) { $tripped = $true }
-    if ($w.Armed -and $armedAt -lt 0) { $armedAt = [int]$w.LastProgressMs }
-}
-if ($tripped) { $sinceArm = [int](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $w.LaunchTimestamp) - $armedAt }
+$sw = [Diagnostics.Stopwatch]::StartNew(); $tripped = $false
+while ($sw.ElapsedMilliseconds -lt 15000 -and -not $tripped) { Start-Sleep -Milliseconds 150; if (Test-GuiSmokeLogProgressStalled -Watch $w) { $tripped = $true } }
 $held.Dispose(); Stop-GuiSmokeLogProgressWatch -Watch $w
-[pscustomobject]@{ tripped = $tripped; sinceArmMs = $sinceArm } | ConvertTo-Json -Compress
+[pscustomobject]@{ tripped = $tripped } | ConvertTo-Json -Compress
 """)
+        # r7 (adversary dd2d6c67 A1 sibling): the 6000 ms "since the arming" bound is gone, see test_a_deleted_or_locked_or_shrinking_log_is_no_progress
         self.assertTrue(out["tripped"], "an app that logged once and is now unreadable-and-silent must not keep the whole job budget")
-        self.assertLess(out["sinceArmMs"], 6000, "the original liveness limit, kept from the arming: it tripped %s ms after it armed" % out["sinceArmMs"])
 
     # adversary 57a7a5c9 A2 (+ advisory A4): a hung probe is waited on ONCE, and never past what is left of the process budget.
     def test_probe_wait_is_bounded_by_the_remaining_budget_and_a_hung_probe_is_not_waited_on_twice(self) -> None:
@@ -1349,9 +1344,11 @@ Stop-GuiSmokeLogProgressWatch -Watch $w
         # the watch is Hung, which is the state the old control then burned its four retries in at zero wait. r6 (sol r5 H2): the miss is forced by a 50 ms
         # wait against a 4000 ms listing (3950 ms of margin; 500 ms before), and the control proves the first call really missed
         out = self._budget_left_control(4000, first_wait_ms=50)
-        # Hung is the module's own record that a bounded wait missed (adversary df44ab80 A2: a caller descheduled for 4 s inside the call may already see the
-        # listing, and arming from what landed is right; the 50 ms wait still missed)
-        self.assertTrue(out["first"]["hung"], "the forced miss never happened: the first call's bounded wait did not miss, so the retry branch was not exercised")
+        # r7 (adversary dd2d6c67 A2): r6 asserted Hung unconditionally, but a caller suspended for 4100 ms between the launch and the wait lets the 4000 ms listing
+        # land inside the call, so Hung is false on a correct module. Whether the miss happened is host scheduling; what the module must do either way is not:
+        # a first call that did not arm was a miss and must be recorded as one (Hung is what the retry loop waits on), and a first call that did arm took what
+        # landed. Both ways the control then arms and measures the quiet verdict (the three assertions below)
+        self.assertTrue(out["first"]["armed"] or out["first"]["hung"], "a first call that neither armed nor recorded a miss: the retry branch has no state to wait on")
         self._assert_the_budget_left_control(out)
 
     def test_the_budget_left_control_is_not_spent_by_an_arming_that_lands_just_before_its_deadline(self) -> None:
@@ -2078,16 +2075,18 @@ class NoSilenceExpiryIsLaterThanTheLimitWhateverTimeTheWatchArms(unittest.TestCa
     # r6 (sol r5 B1, B4): the `fits` cases take 60000 (H = 62000, L = 60000: the watch may arm up to 58000 ms after launch for the 2000 ms window, 29x what the
     # stub's own sleep needs and 4x the r4 margin, which a first observation at 14200 ms had already spent). They end at E (about P + 2000), so the
     # allowance costs them no time. The wider H would have let a late stall verdict through the old `verdict <= H - 1000` bound, so the verdict is now
-    # judged against E itself (_VERDICT_LATENCY_MS). The `cannot run out by L` pair runs to H and keeps the r4 allowance (_DERIVED_ALLOW_MS).
+    # judged against E itself, see below. The `cannot run out by L` pair runs to H and keeps the r4 allowance (_DERIVED_ALLOW_MS).
     _FITS_ALLOW_MS = 60000
     _DERIVED_ALLOW_MS = 16000
-    # The end-to-end bound on the verdict poll's start after E is a GROSS one. The tight guarantee (the chunk wait ends at E, so the poll starts there) is
-    # deterministic and lives in TheSilenceModelIsLaunchAnchored.test_the_chunk_wait_lands_on_the_expiry_and_never_passes_the_deadline (scripted launch stamps)
-    # plus the wiring pins on the runner's two chunk waits; the probe wait inside the poll in test_probe_wait_is_bounded_by_the_remaining_budget.... A real-clock
-    # bound tighter than the host's scheduling is a CI flake (adversary df44ab80 and 0f77ebcb: a caller descheduled across the last chunk for 2100 ms is a correct
-    # verdict, while sol r5 asked for 2400 ms after an E of 5000 to be rejected; no wall-clock reading separates the two). 5000 ms still rejects a loop that
-    # ends at the deadline, at L, or one chunk wait (4000 ms) past E, which is what the allowance had hidden.
-    _VERDICT_LATENCY_MS = 5000
+    # r7 (adversary dd2d6c67 A3, and the rule this card exists for): NO bound on how long after E the verdict poll began is read off the real clock. r6 tried
+    # 2000 ms, then 5000 ms, and each failed a correct verdict (a caller descheduled across the last chunk wait for 2100 ms, then for 5101 ms): a real-clock
+    # bound that rejects 2400 ms (sol r5) also rejects what a loaded host does to a correct run, and no wall-clock reading separates the two. The guarantee
+    # "the verdict poll begins at E, never after the allowance's H - 1000" is carried by deterministic tests on the module's launch clock:
+    #   - TheSilenceModelIsLaunchAnchored.test_the_chunk_wait_lands_on_the_expiry_and_never_passes_the_deadline (scripted launch stamps: the chunk wait is
+    #     min(chunk, E - now), so the poll starts at E);
+    #   - LogProgressWatchdog.test_poll_chunk_is_a_fraction_of_the_window_and_the_runner_uses_it (the runner's two chunk waits pass -ExpiryMs);
+    #   - the probe wait inside the poll in test_probe_wait_is_bounded_by_the_remaining_budget_and_a_hung_probe_is_not_waited_on_twice.
+    # What stays here is monotone in scheduling (a delay can only make an early verdict look later, never an on-time one look early): no verdict before E.
 
     def _run(self, sample_ms: int, override_ms: int = 0, allow_ms: int = 6000, setup_ms: int = 0) -> dict:
         # r3 (adversary 77606b95 A2): the override is always set ("0" is no override: the harness reads it as [int]0), so a GS_OVERRIDE_MS inherited from
@@ -2108,12 +2107,8 @@ class NoSilenceExpiryIsLaterThanTheLimitWhateverTimeTheWatchArms(unittest.TestCa
         self.assertLessEqual(out["expiryMs"], hard - margin, "%s: the expiry, in ms since launch, is later than H - M" % branch)
         # the verdict follows one probe (at most ProbeWaitMs = M - 1000) after E: it lands no later than H - 1000 ...
         self.assertLessEqual(out["loopEndMs"], hard - 1000, "%s: the stall verdict, in ms since launch, is later than H - M + ProbeWaitMs" % branch)
-        # ... and, whatever allowance widened H, the poll that returned it began no later than _VERDICT_LATENCY_MS after E itself (the loop's chunk wait ends at
-        # E). It is the poll's START that is judged: the loop's end is sampled after the verdict, where a descheduled caller would read as a late verdict
+        # (r7: how long after E the verdict poll began is NOT read here, see the comment above _FITS_ALLOW_MS)
         self.assertGreaterEqual(out["verdictPollStartMs"], 0, "%s: no poll returned the stall verdict" % branch)
-        self.assertLessEqual(out["verdictPollStartMs"] - out["expiryMs"], self._VERDICT_LATENCY_MS,
-                             "%s: the poll that returned the stall verdict began %s ms after the expiry (E = %s ms, the loop ended at %s ms since launch)"
-                             % (branch, out["verdictPollStartMs"] - out["expiryMs"], out["expiryMs"], out["loopEndMs"]))
         # (adversary df44ab80 A7) and no verdict is passed before E: the verdict's own reading is at or past it, and the loop ends after that reading
         self.assertGreaterEqual(out["loopEndMs"], out["expiryMs"] - 1, "%s: the stall verdict came before the expiry" % branch)
         self.assertTrue(out["timedOut"])
@@ -2150,27 +2145,29 @@ class NoSilenceExpiryIsLaterThanTheLimitWhateverTimeTheWatchArms(unittest.TestCa
         self._assert_fires_before_the_deadline(self._run(500, override_ms=2000, allow_ms=self._FITS_ALLOW_MS, setup_ms=self._LATE_ARMING_SETUP_MS), "host-load",
                                                hard=2000 + self._FITS_ALLOW_MS)
 
-    def test_a_late_stall_verdict_is_rejected_whatever_allowance_the_fixture_carries(self) -> None:
-        # r6 (sol r5 B4): the allowance that makes a late arming fit also widened the old `verdict by H - 1000` bound to 17000 ms, so a verdict 2400 ms
-        # after E (7400 against E = 5000), which the merge base rejected (7000), passed. The latency is now measured from E, not from the allowance.
-        # r6 (adversary df44ab80 A1, A7): the latency is the lag of the POLL THAT RETURNED THE VERDICT (when it began, read on the launch stamp just before
-        # the module call), so a host that deschedules the caller after the verdict returned (loopEndMs 7100 for a poll that began at 4600) is no late verdict;
-        # and a verdict before E is no verdict at all
-        hard = 2000 + self._FITS_ALLOW_MS
-        base = {"hardLimitMs": hard, "armed": True, "outcome": "process_no_progress", "expiryMs": 5000, "verdictPollStartMs": 5010, "loopEndMs": 5800,
-                "timedOut": True, "exitCode": 124, "alive": False}
-        self._assert_fires_before_the_deadline(dict(base), "in time", hard=hard)
-        self._assert_fires_before_the_deadline(dict(base, verdictPollStartMs=4600, loopEndMs=7100), "descheduled after the verdict", hard=hard)
-        # a caller descheduled across the last chunk (a poll that began 2100 ms, or 2500 ms, after E) is a correct verdict on a loaded host
-        for poll_start in (7100, 7500):
-            self._assert_fires_before_the_deadline(dict(base, verdictPollStartMs=poll_start, loopEndMs=poll_start + 50), "descheduled across the chunk", hard=hard)
-        # the deterministic guarantee that carries the tight sensitivity must still exist under the name this bound's comment cites
-        self.assertTrue(hasattr(TheSilenceModelIsLaunchAnchored, "test_the_chunk_wait_lands_on_the_expiry_and_never_passes_the_deadline"))
-        for poll_start in (10100, 20000, hard - 1000):
-            with self.assertRaises(AssertionError, msg="a verdict poll that began %d ms after E was accepted" % (poll_start - 5000)):
-                self._assert_fires_before_the_deadline(dict(base, verdictPollStartMs=poll_start, loopEndMs=poll_start + 100), "late", hard=hard)
+    def test_a_late_stall_verdict_is_held_to_the_deterministic_chunk_wait_not_to_a_real_clock_bound(self) -> None:
+        # r6 (sol r5 B4): the allowance that makes a late arming fit also widened the old `verdict by H - 1000` bound to 61000 ms, so a verdict 2400 ms
+        # after E, which the merge base rejected (7000 against H = 8000), passed. r6 answered with a real-clock bound on the verdict poll's start (2000 ms,
+        # then 5000 ms) and adversary df44ab80 / 0f77ebcb / dd2d6c67 showed each one fails a correct verdict on a host that deschedules the caller across
+        # the last chunk wait. r7: no real-clock bound. The tight guarantee is deterministic, in the tests this one names and pins
+        base = {"hardLimitMs": 2000 + self._FITS_ALLOW_MS, "armed": True, "outcome": "process_no_progress", "expiryMs": 5000, "verdictPollStartMs": 5010,
+                "loopEndMs": 5800, "timedOut": True, "exitCode": 124, "alive": False}
+        hard = base["hardLimitMs"]
+        # the oracle accepts whatever lag the host adds (it can only make a correct verdict look later) and still rejects a verdict before E
+        for poll_start, loop_end in ((5010, 5800), (4600, 7100), (7100, 7150), (10100, 10200), (20000, 20100)):
+            self._assert_fires_before_the_deadline(dict(base, verdictPollStartMs=poll_start, loopEndMs=loop_end), "lag %d" % (poll_start - 5000), hard=hard)
         with self.assertRaises(AssertionError, msg="a verdict a whole second before E was accepted"):
             self._assert_fires_before_the_deadline(dict(base, verdictPollStartMs=3900, loopEndMs=4000), "early", hard=hard)
+        # the guarantee that replaces the lag bound: the carriers this class cites exist (a rename or a deletion is a red here, not a silent loss) ...
+        for cls, name in ((TheSilenceModelIsLaunchAnchored, "test_the_chunk_wait_lands_on_the_expiry_and_never_passes_the_deadline"),
+                          (LogProgressWatchdog, "test_poll_chunk_is_a_fraction_of_the_window_and_the_runner_uses_it"),
+                          (TheDeadlineIsReachedWithUnderOneMsOfItLeft, "_scripted")):
+            self.assertTrue(hasattr(cls, name), "%s.%s carries the verdict-latency guarantee and is gone" % (cls.__name__, name))
+        # ... and the runner's wait region still hands the expiry to each of its two chunk waits (the wiring those tests pin, read here so the carrier of the
+        # latency guarantee cannot be satisfied by a runner that stopped using it)
+        wait = _runner_snippet(*_WAIT_REGION)
+        self.assertEqual(2, wait.count("-LaunchTimestamp $startTimestamp -DeadlineMs $effectiveProcessTimeoutMs -ExpiryMs $noProgressWatch.ExpiryMs"),
+                         "the host-load and the log-only chunk waits each end at the expiry")
 
     def test_a_late_arming_whose_window_cannot_run_out_by_l_is_left_to_the_deadline_in_the_log_only_branch(self) -> None:
         self._assert_the_deadline_decides(self._run(0, allow_ms=self._DERIVED_ALLOW_MS), "log-only", hard=2000 + self._DERIVED_ALLOW_MS)
